@@ -7,9 +7,11 @@ pub mod control_stream;
 mod controller;
 mod local;
 pub use local::LocalReservation;
+pub mod jiuwenbox;
 pub mod journal;
 pub mod managed_mounts;
 pub mod metrics;
+pub mod node_reconciliation;
 pub mod proxy;
 pub mod readiness;
 mod reconciliation;
@@ -18,6 +20,7 @@ pub mod routes;
 pub mod rpc;
 pub mod runtime_control;
 pub mod runtime_logs;
+pub mod runtime_router;
 pub mod sandboxd;
 
 use adx_core::scheduling::{validate_device_assignment, Device, DeviceAllocation, DeviceLedger};
@@ -76,10 +79,16 @@ pub struct RuntimeStatus {
 
 #[async_trait]
 pub trait RuntimeDriver: Send + Sync {
-    /// Whether a successful restore/capture keeps caller-owned checkpoint files.
+    /// Whether a successful restore keeps caller-owned checkpoint input files.
     /// Unknown drivers conservatively retain their input until execution stops.
     fn retains_checkpoint_files(&self, _runtime_class: &str) -> bool {
         true
+    }
+
+    /// Whether a running capture keeps its newly written files as runtime input.
+    /// Drivers can distinguish capture output from asynchronous restore input.
+    fn retains_capture_files(&self, runtime_class: &str) -> bool {
+        self.retains_checkpoint_files(runtime_class)
     }
 
     /// Prepare and start within the create deadline rather than the node RPC cap.
@@ -172,11 +181,25 @@ pub trait RuntimeDriver: Send + Sync {
         self.restore(spec, runtime_id, generation, devices, path)
             .await
     }
-    /// Complete inventory of managed runtimes. Failure is never an empty list.
+    /// Read-only inventory of managed runtimes. Failure is never an empty list.
     async fn inventory(&self) -> Result<Vec<RuntimeObservation>> {
         Err(Error::Unavailable(
             "runtime inventory is unsupported".into(),
         ))
+    }
+    /// Reclaim native executions whose platform identity cannot be recovered.
+    /// Called only after validating a complete current node catalog, with new
+    /// admission closed. Known executions are handled by their controller queues.
+    async fn reconcile_unowned_executions(&self) -> Result<()> {
+        Ok(())
+    }
+    /// Rediscover executions using the validated, complete current node catalog.
+    /// The caller closes admission and drains accepted operations before this call.
+    async fn reconcile_inventory(
+        &self,
+        _catalog: &[EnvironmentRecord],
+    ) -> Result<Vec<RuntimeObservation>> {
+        self.inventory().await
     }
     /// Correlate the supplied platform execution identity with a backend-generated
     /// ID. A failed Start is terminal for this execution; a late backend must be
@@ -203,13 +226,15 @@ pub trait RuntimeDriver: Send + Sync {
         _runtime_id: &str,
         _policy: Option<&adx_core::execution::NetworkPolicy>,
         _ports: &[u16],
+        _tunnel_http_port: Option<u16>,
     ) -> Result<()> {
         Err(Error::Invalid(
             "runtime does not support network policy updates".into(),
         ))
     }
-    /// Idempotent. Success means this runtime is confirmed absent and an older
-    /// in-flight start cannot materialize it later. Uncertain cleanup is an error.
+    /// Idempotent. Confirm observed resources absent and serialize accepted starts.
+    /// A transport-lost create may materialize later; such backends must collect
+    /// late resources on repeated authoritative reconciliation before reuse.
     async fn remove(&self, runtime_id: &str) -> Result<()>;
 }
 
@@ -358,14 +383,24 @@ pub(crate) struct Services {
     health_failure_threshold: Option<u32>,
 }
 
+type EnvironmentDirectory = BTreeMap<String, (EnvironmentSpec, Assignment, EnvironmentHandle)>;
+type AuthorityTasks =
+    BTreeMap<String, tokio::sync::oneshot::Receiver<Result<controller::AuthorityResult>>>;
+
+#[derive(Clone)]
 pub struct Adxlet {
     node_id: String,
-    local_holds: Mutex<BTreeMap<String, local::LocalHold>>,
-    draining: std::sync::atomic::AtomicBool,
+    local_holds: Arc<Mutex<BTreeMap<String, local::LocalHold>>>,
+    draining: Arc<std::sync::atomic::AtomicBool>,
     lifecycle_ready: Arc<tokio::sync::RwLock<bool>>,
-    retired_environments: Mutex<BTreeMap<String, RetiredEnvironment>>,
+    authority_reconciling: Arc<std::sync::atomic::AtomicBool>,
+    authority_initialized: Arc<std::sync::atomic::AtomicBool>,
+    retired_environments: Arc<Mutex<BTreeMap<String, RetiredEnvironment>>>,
     services: Arc<Services>,
-    environments: Mutex<BTreeMap<String, (EnvironmentSpec, Assignment, EnvironmentHandle)>>,
+    environments: Arc<Mutex<EnvironmentDirectory>>,
+    orphan_cleanup: Arc<Mutex<BTreeMap<String, Vec<RuntimeObservation>>>>,
+    authority_tasks: Arc<Mutex<AuthorityTasks>>,
+    authority_progress: Arc<tokio::sync::Notify>,
 }
 
 impl Adxlet {
@@ -384,10 +419,12 @@ impl Adxlet {
     ) -> Self {
         Self {
             node_id,
-            local_holds: Mutex::default(),
-            draining: std::sync::atomic::AtomicBool::new(false),
+            local_holds: Arc::default(),
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             lifecycle_ready: Arc::new(tokio::sync::RwLock::new(true)),
-            retired_environments: Mutex::default(),
+            authority_reconciling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            authority_initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            retired_environments: Arc::default(),
             services: Arc::new(Services {
                 runtime,
                 runtime_control: None,
@@ -409,7 +446,10 @@ impl Adxlet {
                 metrics: metrics::Metrics::default(),
                 health_failure_threshold: None,
             }),
-            environments: Mutex::default(),
+            environments: Arc::default(),
+            orphan_cleanup: Arc::default(),
+            authority_tasks: Arc::default(),
+            authority_progress: Arc::default(),
         }
     }
 
@@ -435,7 +475,7 @@ impl Adxlet {
 
     pub fn with_checkpointing(
         mut self,
-        store: Arc<dyn checkpoint::CheckpointStore>,
+        store: Arc<dyn checkpoint::CheckpointAccess>,
         cooperation: Arc<dyn checkpoint::CheckpointCooperation>,
     ) -> Result<Self> {
         Arc::get_mut(&mut self.services)
@@ -468,7 +508,6 @@ impl Adxlet {
     }
 
     pub fn update_capacity(&self, resources: Resources, valid_for: Duration) -> Result<()> {
-        resources.validate()?;
         if valid_for.is_zero() {
             return Err(Error::Invalid("capacity lifetime must be positive".into()));
         }
@@ -548,6 +587,13 @@ impl Adxlet {
     }
 
     pub fn accepting_allocations(&self) -> bool {
+        !self
+            .authority_reconciling
+            .load(std::sync::atomic::Ordering::Acquire)
+            && self.locally_accepting_allocations()
+    }
+
+    fn locally_accepting_allocations(&self) -> bool {
         if !self.lifecycle_ready.try_read().is_ok_and(|ready| *ready) {
             return false;
         }
@@ -707,6 +753,7 @@ impl Adxlet {
             .environments
             .lock()
             .expect("shared state lock poisoned");
+        self.ensure_not_cleaning(&spec.id)?;
         if let Some((existing, owner, handle)) = environments.get(&spec.id) {
             if *existing == spec && *owner == assignment {
                 return Ok(handle.clone());
@@ -721,6 +768,14 @@ impl Adxlet {
             }
             environments.remove(&spec.id);
         }
+        if self
+            .authority_reconciling
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Unavailable(
+                "node authority reconciliation pending".into(),
+            ));
+        }
         retired.remove(&spec.id);
         // The registry lock makes controller creation atomic across concurrent callers.
         let held = self.adopt_local(&spec, &assignment)?;
@@ -732,6 +787,22 @@ impl Adxlet {
         );
         environments.insert(spec.id.clone(), (spec, assignment, handle.clone()));
         Ok(handle)
+    }
+
+    // Call while holding the environment registry lock so orphan collection and
+    // admission cannot race for the same ID. Other IDs remain independent.
+    fn ensure_not_cleaning(&self, id: &str) -> Result<()> {
+        if self
+            .orphan_cleanup
+            .lock()
+            .expect("shared state lock poisoned")
+            .contains_key(id)
+        {
+            return Err(Error::Unavailable(
+                "environment orphan cleanup pending".into(),
+            ));
+        }
+        Ok(())
     }
 }
 

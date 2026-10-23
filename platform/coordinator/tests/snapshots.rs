@@ -40,7 +40,7 @@ fn snapshot() -> Snapshot {
 }
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
-async fn snapshot_deletion_waits_for_references_and_survives_coordinator_restart() {
+async fn snapshot_busy_delete_is_rejected_and_survives_coordinator_restart() {
     let mut rig = common::Redis::new().await;
     let db = rig.store().await;
     let first = db.begin(1).await.unwrap();
@@ -58,23 +58,14 @@ async fn snapshot_deletion_waits_for_references_and_survives_coordinator_restart
         )
         .await
         .unwrap();
-    let deleting = first.delete_snapshot(&snapshot.id, "tenant").await.unwrap();
-    assert_eq!(deleting.state, SnapshotState::Deleting);
-    assert!(!deleting.collectable());
-    assert!(first
-        .acquire_snapshot(
-            &snapshot.id,
-            "tenant",
-            Reference::Restore {
-                environment_id: "another".into()
-            }
-        )
-        .await
-        .is_err());
-    assert!(first
-        .finish_snapshot_deletion(&snapshot.id, deleting.revision)
-        .await
-        .is_err());
+    assert!(matches!(
+        first.delete_snapshot(&snapshot.id, "tenant").await,
+        Err(adx_core::Error::SnapshotInUse { .. })
+    ));
+    assert_eq!(
+        first.get_snapshot(&snapshot.id).await.unwrap().state,
+        SnapshotState::Ready
+    );
     rig.crash();
     rig.start().await;
     let second = rig.store().await.begin(1).await.unwrap();
@@ -86,7 +77,7 @@ async fn snapshot_deletion_waits_for_references_and_survives_coordinator_restart
         .release_snapshot(&snapshot.id, reference.clone())
         .await
         .unwrap();
-    assert!(ready.collectable());
+    assert_eq!(ready.state, SnapshotState::Ready);
     assert_eq!(
         second
             .release_snapshot(&snapshot.id, reference)
@@ -94,8 +85,12 @@ async fn snapshot_deletion_waits_for_references_and_survives_coordinator_restart
             .unwrap(),
         ready
     );
+    let deleting = second
+        .delete_snapshot(&snapshot.id, "tenant")
+        .await
+        .unwrap();
     second
-        .finish_snapshot_deletion(&snapshot.id, ready.revision)
+        .finish_snapshot_deletion(&snapshot.id, deleting.revision)
         .await
         .unwrap();
     assert_eq!(
@@ -163,4 +158,47 @@ async fn node_snapshot_catalog_retains_deleting_until_physical_deletion() {
         .await
         .unwrap();
     assert!(session.node_snapshots("node1").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn acquire_and_delete_race_has_one_winner_and_deletion_fences_republication() {
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    for index in 0..24 {
+        let mut s = snapshot();
+        s.id = format!("snapshot-{index}");
+        s.artifact.location = uuid::Uuid::new_v4().to_string();
+        session.publish_snapshot(s.clone()).await.unwrap();
+        let reference = Reference::Restore {
+            environment_id: format!("sandbox-{index}"),
+        };
+        let (acquired, deleted) = tokio::join!(
+            session.acquire_snapshot(&s.id, "tenant", reference.clone()),
+            session.delete_snapshot(&s.id, "tenant")
+        );
+        match (acquired, deleted) {
+            (Ok(_), Err(adx_core::Error::SnapshotInUse { sandbox_ids, .. })) => {
+                assert_eq!(sandbox_ids, vec![format!("sandbox-{index}")]);
+                assert_eq!(
+                    session.get_snapshot(&s.id).await.unwrap().state,
+                    SnapshotState::Ready
+                );
+                session.release_snapshot(&s.id, reference).await.unwrap();
+                session.delete_snapshot(&s.id, "tenant").await.unwrap();
+            }
+            (Err(_), Ok(deleted)) => assert_eq!(deleted.state, SnapshotState::Deleting),
+            pair => panic!("unexpected race result: {pair:?}"),
+        }
+        let _deletion = session
+            .claim_artifact_deletion(&s.artifact, Some(&s.id))
+            .await
+            .unwrap();
+        let mut alias = s.clone();
+        alias.id = format!("alias-{index}");
+        assert!(
+            session.publish_snapshot(alias).await.is_err(),
+            "a reclaiming identity cannot gain a new owner"
+        );
+    }
 }

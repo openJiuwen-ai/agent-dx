@@ -14,6 +14,12 @@
 //! 当前 client/session，后续复用必须失败，避免重复写或顺序错乱。
 
 #[cfg(feature = "dfs")]
+mod crc32c;
+
+#[cfg(all(feature = "dfs", feature = "rdma"))]
+use crate::node::dfs_read::ChunkTransfer;
+
+#[cfg(feature = "dfs")]
 use crate::{
     dfs::ChunkObject,
     node::{
@@ -99,6 +105,7 @@ use crate::node::vfs::{
 };
 
 const MAX_TRANSFER_BYTES: usize = crate::node::storage::MAX_TRANSFER_BYTES;
+const DFS_PEER_RECEIVE_FRAME_BYTES: u32 = 128 * 1024;
 #[cfg(feature = "ownerfs")]
 const MAX_PENDING_RELEASES: usize = 64;
 #[cfg(feature = "ownerfs")]
@@ -287,7 +294,7 @@ pub(crate) fn replica_header(
         chunk_id: staged.chunk.id.0.clone(),
         chunk_length: staged.chunk.length,
         content_digest: staged.chunk.content_digest.bytes.to_vec(),
-        content_digest_algorithm: afs_protocol::node_data::DfsDigestAlgorithm::Blake3 as i32,
+        content_digest_algorithm: wire_data_digest(staged.chunk.content_digest.algorithm),
         placement_revision: op.placement_revision,
         placement_epoch: op.placement_epoch,
         replica_group_id: op.replica_group_id.0.clone(),
@@ -317,14 +324,32 @@ pub(crate) fn replica_header(
 }
 
 #[cfg(feature = "dfs")]
+pub(super) fn wire_data_digest(algorithm: crate::dfs::DigestAlgorithm) -> i32 {
+    use afs_protocol::node_data::DfsDigestAlgorithm;
+    match algorithm {
+        crate::dfs::DigestAlgorithm::Blake3 => DfsDigestAlgorithm::Blake3 as i32,
+        crate::dfs::DigestAlgorithm::Crc32cSegmentsV1 => {
+            DfsDigestAlgorithm::Crc32cSegmentsV1 as i32
+        }
+    }
+}
+#[cfg(feature = "dfs")]
+pub(super) fn domain_data_digest(algorithm: i32) -> afs_error::Result<crate::dfs::DigestAlgorithm> {
+    use afs_protocol::node_data::DfsDigestAlgorithm;
+    match DfsDigestAlgorithm::try_from(algorithm) {
+        Ok(DfsDigestAlgorithm::Blake3) => Ok(crate::dfs::DigestAlgorithm::Blake3),
+        Ok(DfsDigestAlgorithm::Crc32cSegmentsV1) => {
+            Ok(crate::dfs::DigestAlgorithm::Crc32cSegmentsV1)
+        }
+        _ => Err(dfs_protocol_error("unsupported object digest algorithm")),
+    }
+}
+
+#[cfg(feature = "dfs")]
 fn domain_replica_ack(
     ack: afs_protocol::node_data::DfsReplicaAck,
 ) -> afs_error::Result<crate::dfs::ReplicaAck> {
-    if ack.verified_digest_algorithm != afs_protocol::node_data::DfsDigestAlgorithm::Blake3 as i32 {
-        return Err(dfs_protocol_error(
-            "replica acknowledgement digest algorithm is unsupported",
-        ));
-    }
+    let algorithm = domain_data_digest(ack.verified_digest_algorithm)?;
     let bytes: [u8; 32] = ack
         .verified_digest
         .try_into()
@@ -340,10 +365,7 @@ fn domain_replica_ack(
         device_epoch: ack.device_epoch,
         catalog_revision: ack.catalog_revision,
         persisted_bytes: ack.persisted_bytes,
-        verified_digest: crate::dfs::ContentDigest {
-            algorithm: crate::dfs::DigestAlgorithm::Blake3,
-            bytes,
-        },
+        verified_digest: crate::dfs::ContentDigest { algorithm, bytes },
     })
 }
 
@@ -988,11 +1010,14 @@ impl PeerConnectionPool {
         };
         // This bounds each incoming frame, not the message/flow-control window.
         // Smaller frames remain valid; TLS, deadlines and message limits remain.
-        let endpoint = if owner_files {
-            endpoint.max_frame_size(256 * 1024)
+        // This only changes the client's receive cap. Frames still consume the
+        // existing flow-control windows; message limits, budgets and deadlines
+        // remain unchanged. Peers may continue to send smaller frames.
+        let endpoint = endpoint.max_frame_size(if owner_files {
+            256 * 1024
         } else {
-            endpoint
-        };
+            DFS_PEER_RECEIVE_FRAME_BYTES
+        });
         let endpoint = self.security.configure_client(endpoint).map_err(|error| {
             afs_error::Error::coded(afs_error::CLIENT_ARGUMENT_INVALID, error.to_string())
         })?;
@@ -2496,6 +2521,15 @@ impl GrpcChunkTransfer {
 
 #[cfg(feature = "dfs")]
 impl crate::node::dfs_read::ChunkTransfer for GrpcChunkTransfer {
+    fn read_crc32c_range(
+        &self,
+        batch: &crate::node::dfs_read::PeerReadBatch,
+        chunk: &ChunkObject,
+        out: &mut [u8],
+    ) -> afs_error::Result<()> {
+        self.read_crc32c_impl(batch, chunk, out)
+    }
+
     fn supports_verified_object_sink(&self) -> bool {
         self.stream_sink_supported()
     }
@@ -2609,6 +2643,7 @@ fn peer_disk_test_frames(
     };
     let mut frames = vec![DfsReadRangesFrame {
         body: Some(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
+            crc32c_table: Default::default(),
             read_id: request.read_id.clone(),
             attempt_id: request.attempt_id.clone(),
             operation_index: 0,
@@ -2628,6 +2663,7 @@ fn peer_disk_test_frames(
     frames.push(DfsReadRangesFrame {
         body: Some(dfs_read_ranges_frame::Body::Completion(
             DfsReadRangesCompletion {
+                crc32c_table: Default::default(),
                 read_id: request.read_id.clone(),
                 attempt_id: request.attempt_id.clone(),
                 operation_index: 0,
@@ -3301,15 +3337,40 @@ impl crate::node::dfs_read::ChunkTransfer for RdmaChunkTransfer {
     fn verification_metrics(&self) -> Option<&ReadWorkMetrics> {
         self.pool.peers.read_work_metrics.as_ref()
     }
-
     fn read_ranges(
         &self,
         batch: &crate::node::dfs_read::PeerReadBatch,
         out: &mut [u8],
     ) -> afs_error::Result<()> {
+        self.read_ranges_integrity(batch, out, None)
+    }
+    fn read_crc32c_range(
+        &self,
+        batch: &crate::node::dfs_read::PeerReadBatch,
+        chunk: &ChunkObject,
+        out: &mut [u8],
+    ) -> afs_error::Result<()> {
+        self.read_ranges_integrity(batch, out, Some(chunk))
+    }
+}
+#[cfg(feature = "dfs")]
+impl RdmaChunkTransfer {
+    fn read_ranges_integrity(
+        &self,
+        batch: &crate::node::dfs_read::PeerReadBatch,
+        out: &mut [u8],
+        expected: Option<&ChunkObject>,
+    ) -> afs_error::Result<()> {
         #[cfg(not(feature = "rdma"))]
         {
-            let _ = (batch, out, &self.pool, &self.runtime, &self.next_read);
+            let _ = (
+                batch,
+                out,
+                expected,
+                &self.pool,
+                &self.runtime,
+                &self.next_read,
+            );
             Err(afs_error::Error::coded(
                 afs_error::NODE_TRANSFER_UNSUPPORTED,
                 "DFS RDMA is not compiled",
@@ -3318,6 +3379,7 @@ impl crate::node::dfs_read::ChunkTransfer for RdmaChunkTransfer {
         #[cfg(feature = "rdma")]
         {
             batch.validate(out.len())?;
+            let integrity = expected.cloned();
             let first = &batch.operations[0].source;
             let crate::dfs::CopyLocation::Node {
                 node_id,
@@ -3364,6 +3426,7 @@ impl crate::node::dfs_read::ChunkTransfer for RdmaChunkTransfer {
                             }
                         };
                         let cancel_guard = CancelPoisonGuard::new(lease.session.poisoned.clone());
+                        let integrity = integrity.clone();
                         let task = tokio::spawn(async move {
                             validate_open(false, &lease.session.poisoned).map_err(|error| error.0)?;
                             let mut client = lease.session.client.clone();
@@ -3387,6 +3450,7 @@ impl crate::node::dfs_read::ChunkTransfer for RdmaChunkTransfer {
                             .map_err(dfs_rdma_join_error)?
                             .map_err(dfs_rdma_error)?;
                             validate_dfs_rdma_read_reply(&request, &reply, &bytes)?;
+                            if let Some(chunk) = &integrity { crc32c::validate_rdma_crc(&request, &reply, &bytes, chunk)?; }
                             validate_open(false, &lease.session.poisoned).map_err(|error| error.0)?;
                             Ok::<_, afs_error::Error>(bytes)
                         });
@@ -3421,7 +3485,12 @@ impl crate::node::dfs_read::ChunkTransfer for RdmaChunkTransfer {
                         "dfs.rdma_read_fallback";
                         "reason" => "peer reported RDMA unsupported before dispatch"
                     );
-                    GrpcChunkTransfer::new(fallback.peers.clone(), timeout)?.read_ranges(batch, out)
+                    let grpc = GrpcChunkTransfer::new(fallback.peers.clone(), timeout)?;
+                    if let Some(chunk) = expected {
+                        grpc.read_crc32c_range(batch, chunk, out)
+                    } else {
+                        grpc.read_ranges(batch, out)
+                    }
                 }
             }
         }
@@ -3518,14 +3587,25 @@ fn validate_dfs_rdma_read_reply(
             || completion.operation_index != op.operation_index
             || completion.source_copy_id != op.source_copy_id
             || completion.transferred_bytes != op.length
-            || completion.range_checksum_algorithm
-                != afs_protocol::node_data::DfsDigestAlgorithm::Blake3 as i32
         {
             return Err(dfs_protocol_error(
                 "RDMA read completion identity/length differs",
             ));
         }
-        if completion.range_checksum.as_slice() != blake3::hash(range).as_bytes() {
+        let checksum = match afs_protocol::node_data::DfsDigestAlgorithm::try_from(
+            completion.range_checksum_algorithm,
+        ) {
+            Ok(afs_protocol::node_data::DfsDigestAlgorithm::Blake3) => {
+                blake3::hash(range).as_bytes().to_vec()
+            }
+            Ok(afs_protocol::node_data::DfsDigestAlgorithm::Crc32c) => {
+                crate::node::chunk_crc32c::checksum(range)
+                    .to_le_bytes()
+                    .to_vec()
+            }
+            _ => return Err(dfs_protocol_error("unsupported RDMA range checksum")),
+        };
+        if completion.range_checksum != checksum {
             return Err(dfs_corrupt_error("RDMA read completion checksum differs"));
         }
     }
@@ -6735,6 +6815,7 @@ mod tests {
             let full = start == 0 && operation.length == chunk.length;
             frames.push(DfsReadRangesFrame {
                 body: Some(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
+                    crc32c_table: Default::default(),
                     read_id: request.read_id.clone(),
                     attempt_id: request.attempt_id.clone(),
                     operation_index: operation.operation_index,
@@ -6757,6 +6838,7 @@ mod tests {
             frames.push(DfsReadRangesFrame {
                 body: Some(dfs_read_ranges_frame::Body::Completion(
                     DfsReadRangesCompletion {
+                        crc32c_table: Default::default(),
                         read_id: request.read_id.clone(),
                         attempt_id: request.attempt_id.clone(),
                         operation_index: operation.operation_index,
@@ -8855,6 +8937,7 @@ mod tests {
         vec![
             DfsReadRangesFrame {
                 body: Some(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
+                    crc32c_table: Default::default(),
                     read_id: request.read_id.clone(),
                     attempt_id: request.attempt_id.clone(),
                     operation_index: op.operation_index,
@@ -8873,6 +8956,7 @@ mod tests {
             DfsReadRangesFrame {
                 body: Some(dfs_read_ranges_frame::Body::Completion(
                     DfsReadRangesCompletion {
+                        crc32c_table: Default::default(),
                         read_id: request.read_id.clone(),
                         attempt_id: request.attempt_id.clone(),
                         operation_index: op.operation_index,
@@ -8885,6 +8969,143 @@ mod tests {
                 )),
             },
         ]
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dfs_peer_receive_cap_reduces_actual_http2_data_frames() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut observations = Vec::new();
+        for production in [false, true] {
+            let payload = vec![37; 128 * 1024];
+            let chunk = crate::node::chunk::StagedChunk::new(
+                crate::dfs::OperationId::new("dfs-peer-receive-frames"),
+                payload.clone(),
+            )
+            .chunk;
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let server_address = listener.local_addr().unwrap();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let fixture = DiskStreamFixture {
+                chunk: chunk.clone(),
+                body: Arc::new(payload.clone()),
+                mode: 0,
+                calls: calls.clone(),
+                fetch_objects: None,
+                fetch_gate: None,
+            };
+            let (stop_server, server_done) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(
+                Server::builder()
+                    .add_service(
+                        afs_protocol::node_data::dfs_chunks_server::DfsChunksServer::new(fixture),
+                    )
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                        let _ = server_done.await;
+                    }),
+            );
+
+            let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", proxy_listener.local_addr().unwrap());
+            let data_frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let frames = data_frames.clone();
+            let (stop_proxy, proxy_done) = tokio::sync::oneshot::channel();
+            let proxy = tokio::spawn(async move {
+                let (client, _) = proxy_listener.accept().await.unwrap();
+                let upstream = tokio::net::TcpStream::connect(server_address)
+                    .await
+                    .unwrap();
+                let (mut client_read, mut client_write) = client.into_split();
+                let (mut upstream_read, mut upstream_write) = upstream.into_split();
+                let responses = async {
+                    loop {
+                        let mut header = [0; 9];
+                        if let Err(error) = upstream_read.read_exact(&mut header).await {
+                            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+                            break;
+                        }
+                        let length = (usize::from(header[0]) << 16)
+                            | (usize::from(header[1]) << 8)
+                            | usize::from(header[2]);
+                        assert!(length <= 2 * 1024 * 1024);
+                        let mut body = vec![0; length];
+                        upstream_read.read_exact(&mut body).await.unwrap();
+                        let stream_id =
+                            u32::from_be_bytes([header[5] & 0x7f, header[6], header[7], header[8]]);
+                        if header[3] == 0 && stream_id != 0 && length != 0 {
+                            frames.lock().unwrap().push(length);
+                        }
+                        client_write.write_all(&header).await.unwrap();
+                        client_write.write_all(&body).await.unwrap();
+                    }
+                };
+                tokio::select! {
+                    result = tokio::io::copy(&mut client_read, &mut upstream_write) => { result.unwrap(); }
+                    () = responses => {}
+                    _ = proxy_done => {}
+                }
+            });
+
+            let config = afs_transport::GrpcConfig::default();
+            assert_eq!(config.initial_connection_window_size, 2 * 1024 * 1024);
+            assert_eq!(config.initial_stream_window_size, 2 * 1024 * 1024);
+            let pool =
+                PeerConnectionPool::new(config.clone(), afs_transport::TlsConfig::Disabled, 1)
+                    .unwrap();
+            let channel = if production {
+                pool.channel("node-a", 1, &endpoint).await.unwrap()
+            } else {
+                config
+                    .configure_client(Endpoint::from_shared(endpoint).unwrap())
+                    .max_frame_size(16 * 1024)
+                    .connect_lazy()
+            };
+            let mut client =
+                afs_protocol::node_data::dfs_chunks_client::DfsChunksClient::new(channel);
+            let mut request = range_request();
+            request.operations.truncate(1);
+            request.operations[0].chunk_id = chunk.id.0;
+            request.operations[0].length = payload.len() as u64;
+            let stream = client
+                .read_ranges(request.clone())
+                .await
+                .unwrap()
+                .into_inner();
+            let mut output = vec![0; payload.len()];
+            consume_peer_read_stream(&request, None, &mut output, stream, None, None)
+                .await
+                .unwrap();
+            assert_eq!(output, payload);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            observations.push(data_frames.lock().unwrap().clone());
+
+            drop(client);
+            drop(pool);
+            let _ = stop_proxy.send(());
+            tokio::time::timeout(Duration::from_secs(3), proxy)
+                .await
+                .unwrap()
+                .unwrap();
+            let _ = stop_server.send(());
+            tokio::time::timeout(Duration::from_secs(3), server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+
+        eprintln!(
+            "actual HTTP2 DATA payload lengths: control={:?}, production={:?}",
+            observations[0], observations[1]
+        );
+        assert!(observations[0].iter().all(|length| *length <= 16 * 1024));
+        assert!(observations[1].len() < observations[0].len());
+        assert!(observations[1].iter().any(|length| *length > 16 * 1024));
+        assert_eq!(
+            observations[0].iter().sum::<usize>(),
+            observations[1].iter().sum::<usize>()
+        );
     }
 
     #[cfg(feature = "dfs")]
@@ -8916,6 +9137,7 @@ mod tests {
         frames.push(DfsReadRangesFrame {
             body: Some(dfs_read_ranges_frame::Body::Completion(
                 DfsReadRangesCompletion {
+                    crc32c_table: Default::default(),
                     read_id: request.read_id.clone(),
                     attempt_id: request.attempt_id.clone(),
                     operation_index: 0,
@@ -9990,6 +10212,7 @@ mod tests {
                 attempt_id: request.attempt_id.clone(),
                 transferred_bytes: 3,
                 completions: vec![afs_protocol::node_data::DfsReadRangesCompletion {
+                    crc32c_table: Default::default(),
                     read_id: request.read_id.clone(),
                     attempt_id: request.attempt_id.clone(),
                     operation_index: 0,

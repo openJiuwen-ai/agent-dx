@@ -25,6 +25,8 @@ use tonic::{Request, Response, Status};
 
 fn record() -> EnvironmentRecord {
     EnvironmentRecord {
+        execution_artifacts: vec![],
+        snapshot_source: None,
         failure: None,
         restart_attempts: 0,
         restart_pending: false,
@@ -407,8 +409,13 @@ async fn startup_snapshot_gates_traffic_and_proxy_restart_replays_local_catalog(
     let proxy = Arc::new(Relay::new(GatewayPolicy::new(vec![])).with_route_enforcement());
     let handler = Arc::new(BindingService::new(proxy.clone()));
     assert!(!proxy.ready());
-    let (mut server, adapter) = start(Handler(handler.clone())).await;
+    let (mut server, _previous) = start(Handler(handler.clone())).await;
     assert!(proxy.ready());
+    let adapter = UdsRoutes::new(
+        server.directory.path().join("route.sock"),
+        Duration::from_secs(2),
+    )
+    .unwrap();
     adapter.begin_reconcile().await.unwrap();
     assert!(!proxy.ready());
     adapter.activate(&record()).await.unwrap();
@@ -503,4 +510,23 @@ async fn idle_admission_barrier_requires_current_idle_activity_and_can_reopen() 
     assert!(routes.quiesce(&record(), &session, revision).await.unwrap());
     routes.reopen(&record()).await.unwrap();
     assert!(routes.quiesce(&record(), &session, revision).await.unwrap());
+}
+
+#[tokio::test]
+async fn periodic_reconciliation_preserves_ready_binding_session() {
+    let proxy = Arc::new(Relay::new(GatewayPolicy::new(vec![])).with_route_enforcement());
+    let handler = Arc::new(BindingService::new(proxy.clone()));
+    let (_server, adapter) = start(Handler(handler.clone())).await;
+    adapter.activate(&record()).await.unwrap();
+    let before = handler.inspect().await;
+    for _ in 0..3 {
+        adapter.begin_reconcile().await.unwrap();
+        assert!(
+            proxy.ready(),
+            "a validated periodic cycle must not clear live bindings"
+        );
+        adapter.activate(&record()).await.unwrap();
+        adapter.finish_reconcile().await.unwrap();
+        assert_eq!(handler.inspect().await, before);
+    }
 }

@@ -55,6 +55,7 @@ class EnvironmentError(RuntimeError):
         environment_id: Optional[str] = None,
         request_forwarded: Optional[bool] = None,
         failure: Optional[Dict[str, Any]] = None,
+        scheduling_failure: Optional[Dict[str, Any]] = None,
         probe_failure: Optional[Dict[str, Any]] = None,
     ):
         super().__init__(message)
@@ -66,6 +67,7 @@ class EnvironmentError(RuntimeError):
         self.environment_id = environment_id
         self.request_forwarded = request_forwarded
         self.failure = failure
+        self.scheduling_failure = scheduling_failure
         self.probe_failure = probe_failure
 
 
@@ -113,6 +115,7 @@ class EnvironmentHTTPError(EnvironmentError):
         outcome: Optional[str] = None,
         operation_id: Optional[str] = None,
         environment_id: Optional[str] = None,
+        scheduling_failure: Optional[Dict[str, Any]] = None,
         probe_failure: Optional[Dict[str, Any]] = None,
         request_forwarded: Optional[bool] = None,
     ):
@@ -124,11 +127,16 @@ class EnvironmentHTTPError(EnvironmentError):
             outcome=outcome,
             operation_id=operation_id,
             environment_id=environment_id,
+            scheduling_failure=scheduling_failure,
             probe_failure=probe_failure,
             request_forwarded=request_forwarded,
         )
         self.status_code = status_code
         self.payload = payload
+        raw_detail = payload.get("error")
+        detail = raw_detail if isinstance(raw_detail, dict) else {}
+        self.sandbox_ids = tuple(detail.get("sandbox_ids") or ())
+        self.template_ids = tuple(detail.get("template_ids") or ())
 
 
 class _InvokeResult(dict):
@@ -153,6 +161,8 @@ class _RetryableHTTPStatus(EnvironmentHTTPError):
             outcome=error.outcome,
             operation_id=error.operation_id,
             environment_id=error.environment_id,
+            scheduling_failure=error.scheduling_failure,
+            probe_failure=error.probe_failure,
             request_forwarded=error.request_forwarded,
         )
 
@@ -353,6 +363,20 @@ class EnvironmentClient:
             self._last_create = data
             return data
 
+        if isinstance(last_error, _RetryableHTTPStatus):
+            # A complete service response remains a domain/HTTP failure even
+            # after retry exhaustion. Preserve payload, status and diagnostics.
+            raise EnvironmentHTTPError(
+                last_error.status_code, last_error.payload,
+                f"environment create service failed after {attempts} attempts: {last_error}",
+                request_id=last_error.request_id, code=last_error.code,
+                retry=last_error.retry, outcome=last_error.outcome,
+                operation_id=last_error.operation_id,
+                environment_id=last_error.environment_id,
+                scheduling_failure=last_error.scheduling_failure,
+                probe_failure=last_error.probe_failure,
+                request_forwarded=last_error.request_forwarded,
+            ) from last_error
         contract_error = last_error if isinstance(last_error, EnvironmentError) else None
         raise EnvironmentError(
             "environment create transport failed after "
@@ -450,6 +474,7 @@ class EnvironmentClient:
                     outcome=detail.get("outcome"),
                     operation_id=detail.get("operationId"),
                     environment_id=detail.get("environmentId") or environment_id,
+                    scheduling_failure=detail.get("schedulingFailure"),
                     probe_failure=detail.get("probeFailure"),
                 )
                 if error.retry == "same_operation" and error.outcome == "unknown":
@@ -1403,6 +1428,7 @@ class EnvironmentClient:
             outcome=detail.get("outcome"),
             operation_id=detail.get("operationId"),
             environment_id=detail.get("environmentId"),
+            scheduling_failure=detail.get("schedulingFailure"),
             probe_failure=detail.get("probeFailure"),
             request_forwarded=detail.get("requestForwarded") if isinstance(detail.get("requestForwarded"), bool) else None,
         )

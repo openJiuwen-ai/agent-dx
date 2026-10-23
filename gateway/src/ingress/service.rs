@@ -124,35 +124,27 @@ impl IngressService {
             None
         };
         #[cfg(feature = "agent-api")]
-        let jiuwen_api = if let Ok(path) = std::env::var("ADX_JIUWEN_CONFIG") {
-            use super::jiuwen::entrypoint::{JiuwenApi, JiuwenConfig};
-            let settings: JiuwenConfig = serde_json::from_slice(&std::fs::read(path)?)
-                .map_err(|_| "invalid Jiuwen configuration")?;
-            if let Some(domain) = &config.port_host_domain {
-                if settings
-                    .allowed_hosts
-                    .iter()
-                    .any(|host| host.ends_with(&format!(".{domain}")))
-                {
-                    return Err("Jiuwen hosts must not use the direct-port host domain".into());
-                }
-            }
+        let digitalmategateway_api = if let Ok(path) = std::env::var("ADX_JIUWEN_CONFIG") {
+            use super::digitalmategateway::entrypoint::{
+                DigitalMateGatewayApi, DigitalMateGatewayConfig,
+            };
+            let settings: DigitalMateGatewayConfig = serde_json::from_slice(&std::fs::read(path)?)
+                .map_err(|_| "invalid DigitalMateGateway configuration")?;
             let agent = agent_api
                 .as_ref()
-                .ok_or("Jiuwen requires ADX_AGENT_CONFIG")?;
+                .ok_or("DigitalMateGateway requires ADX_AGENT_CONFIG")?;
             if file_access.is_none() {
-                return Err("Jiuwen requires ADX_ENVIRONMENT_FILES_CONFIG".into());
+                return Err("DigitalMateGateway requires ADX_ENVIRONMENT_FILES_CONFIG".into());
             }
             let account_path = std::env::var("ADX_ACCOUNT_CONFIG")
-                .map_err(|_| "Jiuwen requires ADX_ACCOUNT_CONFIG")?;
+                .map_err(|_| "DigitalMateGateway requires ADX_ACCOUNT_CONFIG")?;
             let account_config: super::accounts::AccountConfig =
                 serde_json::from_slice(&std::fs::read(account_path)?)
                     .map_err(|_| "invalid account configuration")?;
-            if account_config.tenant != settings.tenant {
-                return Err("Jiuwen/account tenant mismatch".into());
-            }
-            let auth = Arc::new(super::accounts::AccountService::connect(account_config).await?);
-            Some(Arc::new(JiuwenApi::new(
+            let auth = Arc::new(
+                super::accounts::AccountService::connect(account_config, &settings.tenant).await?,
+            );
+            Some(Arc::new(DigitalMateGatewayApi::new(
                 settings,
                 agent.managed.clone(),
                 auth,
@@ -196,8 +188,8 @@ impl IngressService {
             gateway
         };
         #[cfg(feature = "agent-api")]
-        let gateway = if let Some(api) = jiuwen_api {
-            gateway.with_jiuwen_api(api)
+        let gateway = if let Some(api) = digitalmategateway_api {
+            gateway.with_digitalmategateway_api(api)
         } else {
             gateway
         };

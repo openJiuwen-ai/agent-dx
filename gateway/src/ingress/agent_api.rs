@@ -302,18 +302,39 @@ impl AgentApi {
         tenant: &str,
         access: super::agent_access::AccessRequest,
     ) -> Result<(), Error> {
+        // Keep bytes opaque until the authoritative Activator confirms a missing Binding.
+        let mut parameters = Vec::new();
+        let mut present = false;
+        for value in request
+            .headers()
+            .get_all(adx_agent_core::parameters::HEADER)
+        {
+            if present {
+                parameters.push(b'&');
+            }
+            parameters.extend_from_slice(value.as_bytes());
+            present = true;
+        }
+        request
+            .headers_mut()
+            .remove(adx_agent_core::parameters::HEADER);
         let scope = ManagedService::binding_scope(tenant, &access.target)?;
         let notice = super::agent_access::BindingNotice::new(&scope)?;
         request.extensions_mut().insert(notice);
         let context = Arc::new(RequestContext::new(self.request_timeout));
         let selection = self
             .service_access()
-            .select(
+            .select_with_parameters(
                 context,
                 scope,
                 super::agent_service::ServiceSelector {
                     protocol: access.protocol,
                     port: access.port,
+                },
+                if present {
+                    Some(parameters.as_slice())
+                } else {
+                    None
                 },
             )
             .await?;

@@ -297,6 +297,19 @@ impl Routes for UdsRoutes {
                 return Err(Error::Conflict);
             }
         }
+        if s.initialized
+            && !s.buffering
+            && remote.ready
+            && remote.controller_session_id == self.owner
+            && s.session.as_ref().is_some_and(|old| {
+                old.proxy_session_id == remote.proxy_session_id
+                    && old.sync_epoch == remote.sync_epoch
+            })
+        {
+            // A validated live session refreshes bindings by version. Starting
+            // another full synchronization would interrupt valid active streams.
+            return Ok(());
+        }
         remote.controller_session_id = self.owner.clone();
         let session = client
             .begin_bindings(self.request(remote))
@@ -311,6 +324,9 @@ impl Routes for UdsRoutes {
     async fn finish_reconcile(&self) -> Result<()> {
         let mut s = self.local.lock().await;
         let mut client = self.connect().await?;
+        if !s.buffering {
+            return self.ensure(&mut s, &mut client).await;
+        }
         self.full(&mut s, &mut client).await?;
         s.buffering = false;
         s.initialized = true;

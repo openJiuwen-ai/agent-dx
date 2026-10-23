@@ -27,11 +27,91 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
 DEFAULT_TIMEOUT = 20.0
+
+# The remote parent owns Popen.wait(); PID disappearance is not an exit code.
+# These are test-side records, not product persistence or crash-recovery logs.
+CHILD_SUPERVISOR = r"""
+import json, os, subprocess, sys, time
+from pathlib import Path
+script, log, ready_file, wait_file, token = sys.argv[1:]
+def publish(path, value):
+    temporary = path + '.tmp'
+    Path(temporary).write_text(json.dumps(value))
+    os.replace(temporary, path)
+child = None
+identity = {'token': token}
+try:
+    with open(log, 'ab', buffering=0) as output:
+        child = subprocess.Popen(['bash', '-lc', script], stdin=subprocess.DEVNULL,
+                                 stdout=output, stderr=output, start_new_session=True)
+        identity.update(pid=child.pid,
+                        start_ticks=int(Path(f'/proc/{child.pid}/stat').read_text().rsplit(')', 1)[1].split()[19]),
+                        boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip())
+        publish(ready_file, identity)
+        # Only this single-threaded parent reaps/signals this child. A child
+        # that exits after poll remains unreaped, so its PID cannot be reused.
+        stop_file = Path(wait_file + '.stop.json')
+        while child.poll() is None:
+            if stop_file.exists() and json.loads(stop_file.read_text()) == identity:
+                child.terminate()
+                stop_file.unlink()
+            time.sleep(.02)
+        returncode = child.wait()
+        publish(wait_file, dict(identity, returncode=returncode))
+except Exception as error:
+    # An error before publishing identity must not abandon a newly started child.
+    if child is not None and child.poll() is None:
+        child.terminate()
+        child.wait()
+    publish(wait_file, dict(identity, error=repr(error)))
+    raise
+"""
+
+CHILD_READY = r"""
+import json, sys, time
+from pathlib import Path
+ready, waited = map(Path, sys.argv[1:])
+deadline = time.monotonic() + 15
+while time.monotonic() < deadline:
+    if ready.exists():
+        print(ready.read_text())
+        break
+    if waited.exists():
+        raise RuntimeError(waited.read_text())
+    time.sleep(.02)
+else:
+    raise TimeoutError('child identity was not published')
+"""
+
+CHILD_WAIT = r"""
+import json, os, sys, time
+from pathlib import Path
+expected, ready_file, wait_file, stop = json.loads(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4] == 'stop'
+if stop and not wait_file.exists():
+    boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    if json.loads(ready_file.read_text()) != expected or boot != expected['boot_id']:
+        raise RuntimeError('child birth identity mismatch; no signal requested')
+    request = str(wait_file) + '.stop.json'
+    Path(request + '.tmp').write_text(json.dumps(expected))
+    os.replace(request + '.tmp', request)
+deadline = time.monotonic() + 15
+while time.monotonic() < deadline:
+    if wait_file.exists():
+        result = json.loads(wait_file.read_text())
+        if any(result.get(key) != value for key, value in expected.items()):
+            raise RuntimeError('wait record identity mismatch')
+        print(json.dumps(result))
+        break
+    time.sleep(.02)
+else:
+    raise TimeoutError('normal child exit has no actual wait record')
+"""
 
 
 @dataclass
@@ -49,6 +129,11 @@ class ProcessRef:
     name: str
     pid: int
     log: str
+    start_ticks: int
+    boot_id: str
+    token: str
+    wait_file: str
+    ready_file: str
 
 
 @dataclass
@@ -113,18 +198,32 @@ class RemoteShell:
         return result
 
     def start(self, name: str, script: str, log: str) -> ProcessRef:
-        quoted_log = shlex.quote(log)
+        token = uuid.uuid4().hex
+        ready_file, wait_file = f"{log}.{token}.pid.json", f"{log}.{token}.wait.json"
+        supervisor = shlex.join(["python3", "-c", CHILD_SUPERVISOR, script, log, ready_file, wait_file, token])
+        readiness = shlex.join(["python3", "-c", CHILD_READY, ready_file, wait_file])
         wrapped = (
             "set -euo pipefail\n"
             f"mkdir -p {shlex.quote(str(Path(log).parent))}\n"
-            f"nohup bash -lc {shlex.quote(script)} >{quoted_log} 2>&1 & echo $!"
+            f"nohup {supervisor} >{shlex.quote(log + '.supervisor.log')} 2>&1 </dev/null &\n"
+            f"{readiness}"
         )
         res = self.run(wrapped, timeout=DEFAULT_TIMEOUT, check=True)
-        pid_text = res.stdout.strip().splitlines()[-1]
-        return ProcessRef(self.role, name, int(pid_text), log)
+        identity = json.loads(res.stdout)
+        return ProcessRef(self.role, name, identity["pid"], log, identity["start_ticks"],
+                          identity["boot_id"], token, wait_file, ready_file)
 
-    def kill(self, proc: ProcessRef) -> None:
-        self.run(f"kill {proc.pid} >/dev/null 2>&1 || true", timeout=5)
+    def wait(self, proc: ProcessRef, *, stop: bool = False) -> dict[str, Any]:
+        identity = {"pid": proc.pid, "start_ticks": proc.start_ticks, "boot_id": proc.boot_id, "token": proc.token}
+        command = shlex.join(["python3", "-c", CHILD_WAIT, json.dumps(identity), proc.ready_file, proc.wait_file,
+                              "stop" if stop else "wait"])
+        result = json.loads(self.run(command, timeout=DEFAULT_TIMEOUT, check=True).stdout)
+        if result.get("error") or result.get("returncode") != 0:
+            raise RunnerError(f"{proc.role}:{proc.name} actual wait failed: {result}")
+        return result
+
+    def kill(self, proc: ProcessRef) -> dict[str, Any]:
+        return self.wait(proc, stop=True)
 
     def tail(self, log: str, lines: int = 120) -> str:
         res = self.run(f"tail -n {int(lines)} {shlex.quote(log)} 2>/dev/null || true", timeout=10)
@@ -140,6 +239,7 @@ class OwnerFsAcceptance:
         self.c = RemoteShell("C", args.host_c, args.ssh_user, args.ssh_option)
         self.roles = {"A": self.a, "B": self.b, "C": self.c}
         self.procs: list[ProcessRef] = []
+        self.prepared_roles: set[str] = set()
         self.steps: list[StepResult] = []
         self.meta_grpc = args.meta_grpc_port
         self.meta_rest = args.meta_rest_port
@@ -168,6 +268,7 @@ class OwnerFsAcceptance:
             "logs": {},
             "gaps": [],
             "cleanup_errors": [],
+            "waits": [],
         }
 
     def binary_args(self, role: str) -> str:
@@ -188,6 +289,18 @@ class OwnerFsAcceptance:
             if value:
                 parts.extend([flag, value])
         return " ".join(shlex.quote(part) for part in parts)
+
+    def meta_arguments(self, *, restart: bool = False) -> str:
+        """Use one dedicated authority directory for admission, start and restart."""
+        suffix = "-restart" if restart else ""
+        parts = [
+            "--id", f"meta-{self.run_id}{suffix}",
+            "--grpc-listen", f"0.0.0.0:{self.meta_grpc}",
+            "--rest-listen", f"0.0.0.0:{self.meta_rest}",
+            "--meta-store", "local-file",
+            "--data-dir", self.paths["C_ROOT"] + "/meta-data",
+        ]
+        return " ".join(shlex.quote(part) for part in parts) + " " + self.binary_args("meta")
 
     def endpoint(self, host: str, port: int) -> str:
         return f"{self.endpoint_scheme}://{host}:{port}"
@@ -215,25 +328,24 @@ class OwnerFsAcceptance:
             try:
                 with urllib.request.urlopen(url, timeout=2) as resp:
                     body = resp.read().decode("utf-8", errors="replace")
-                    return {"status": resp.status, "body": body[:500]}
+                    return {"status": resp.status, "body": body}
             except Exception as exc:  # noqa: BLE001 - preserve last readiness error
                 last = exc
                 time.sleep(0.25)
         raise RunnerError(f"timed out waiting for {url}: {last}")
 
     def remote_wait_http(self, role: RemoteShell, url: str, timeout: float = 20.0) -> dict[str, Any]:
-        quoted = shlex.quote(url)
         script = (
             "python3 - <<'PY'\n"
             "import sys, time, urllib.request\n"
-            f"url={quoted!r}\n"
+            f"url={url!r}\n"
             f"deadline=time.time()+{timeout!r}\n"
             "last=None\n"
             "while time.time()<deadline:\n"
             "    try:\n"
             "        with urllib.request.urlopen(url, timeout=2) as r:\n"
             "            print(r.status)\n"
-            "            print(r.read().decode('utf-8','replace')[:500])\n"
+            "            print(r.read().decode('utf-8','replace'))\n"
             "            sys.exit(0)\n"
             "    except Exception as e:\n"
             "        last=e; time.sleep(0.25)\n"
@@ -243,7 +355,7 @@ class OwnerFsAcceptance:
         )
         res = role.run(script, timeout=timeout + 5, check=True)
         lines = res.stdout.splitlines()
-        return {"status": int(lines[0]) if lines else None, "body": "\n".join(lines[1:])[:500]}
+        return {"status": int(lines[0]) if lines else None, "body": "\n".join(lines[1:])}
 
     def preflight(self) -> dict[str, Any]:
         detail: dict[str, Any] = {}
@@ -251,7 +363,7 @@ class OwnerFsAcceptance:
             linux = role.run("uname -s", check=True).stdout.strip()
             if linux != "Linux":
                 raise RunnerError(f"role {role.role} is {linux}; acceptance must run on Linux")
-            meta_extra = self.binary_args("meta")
+            meta_extra = self.meta_arguments()
             node_extra = self.binary_args(role.role) if role.role in ("A", "B") else ""
             bin_checks = [
                 f"test -x {shlex.quote(self.args.bin_dir)}/afs-meta",
@@ -265,6 +377,7 @@ class OwnerFsAcceptance:
                     f" >/dev/null"
                 ),
                 "command -v python3 >/dev/null",
+                "command -v realpath >/dev/null",
             ]
             if role.role in ("A", "B"):
                 bin_checks.extend(
@@ -272,66 +385,47 @@ class OwnerFsAcceptance:
                         "test -e /dev/fuse",
                         "command -v fusermount3 >/dev/null || command -v fusermount >/dev/null",
                         "command -v mountpoint >/dev/null",
+                        "command -v findmnt >/dev/null",
                     ]
                 )
             role.run(" && ".join(bin_checks), timeout=20, check=True)
             detail[role.role] = {"kernel": linux, "bin_dir": self.args.bin_dir}
-        if self.args.etcd_endpoint:
-            # afs-meta is responsible for the real etcd connection; this only records intent.
-            detail["etcd_endpoint"] = self.args.etcd_endpoint
-        elif self.args.allow_missing_etcd_for_scaffold:
-            self.result["gaps"].append("no --etcd-endpoint supplied; MetaStore durability cannot be accepted")
-        else:
-            raise RunnerError(
-                (
-                    "--etcd-endpoint is required for OwnerFs acceptance; use "
-                    "--allow-missing-etcd-for-scaffold only for harness debugging"
-                )
-            )
+        detail["meta_storage"] = {
+            "backend": "local-file", "data_dir": self.paths["C_ROOT"] + "/meta-data",
+        }
         if self.args.location_api == "grpcurl":
             self.c.run(f"command -v {shlex.quote(self.args.grpcurl)} >/dev/null", timeout=10, check=True)
         return detail
 
     def prepare_hosts(self) -> dict[str, Any]:
+        bindings: dict[str, dict[str, str]] = {}
         for role, root_key in ((self.a, "A_ROOT"), (self.b, "B_ROOT"), (self.c, "C_ROOT")):
             root = self.paths[root_key]
             role.run(
                 (
-                    f"set -euo pipefail\nmkdir -p "
-                    f"{shlex.quote(root)}"
-                    f" "
-                    f"{shlex.quote(root + '/logs')}"
-                    f" "
-                    f"{shlex.quote(root + '/data')}"
-                    f" "
-                    f"{shlex.quote(root + '/mnt')}"
-                    f"\nif mountpoint -q "
-                    f"{shlex.quote(root + '/mnt')}"
-                    f"; then (fusermount3 -uz "
-                    f"{shlex.quote(root + '/mnt')}"
-                    f" || fusermount -uz "
-                    f"{shlex.quote(root + '/mnt')}"
-                    f" || umount -l "
-                    f"{shlex.quote(root + '/mnt')}"
-                    f" || true); fi"
+                    f"set -euo pipefail\nmkdir -p {shlex.quote(str(Path(root).parent))}\n"
+                    f"mkdir {shlex.quote(root)}\n"
+                    f"mkdir {shlex.quote(root + '/logs')} {shlex.quote(root + '/data')} {shlex.quote(root + '/mnt')}"
                 ),
                 timeout=15,
                 check=True,
             )
-        return {"root_base": self.root_base}
+            self.prepared_roles.add(role.role)
+            canonical = role.run(
+                f"realpath -e -- {shlex.quote(root)}", timeout=10, check=True,
+            ).stdout.strip()
+            if not Path(canonical).is_absolute() or canonical == "/":
+                raise RunnerError(f"{role.role} invalid canonical run directory: {canonical!r}")
+            self.paths[root_key] = canonical
+            bindings[role.role] = {"input": root, "canonical": canonical}
+        self.mount_a = self.paths["A_ROOT"] + "/mnt"
+        self.mount_b = self.paths["B_ROOT"] + "/mnt"
+        self.owner_a, self.owner_b = self.mount_a, self.mount_b
+        return {"root_base": self.root_base, "path_bindings": bindings}
 
     def start_cluster(self) -> dict[str, Any]:
         meta_endpoint = self.endpoint(self.args.host_c, self.meta_grpc)
-        etcd = self.args.etcd_endpoint or "memory://acceptance-missing-etcd"
-        meta_extra = self.binary_args("meta")
-        meta_cmd = (
-            f"exec {shlex.quote(self.args.bin_dir)}/afs-meta "
-            f"--id meta-{shlex.quote(self.run_id)} "
-            f"--grpc-listen 0.0.0.0:{self.meta_grpc} "
-            f"--rest-listen 0.0.0.0:{self.meta_rest} "
-            f"--etcd-endpoint {shlex.quote(etcd)} "
-            f"{meta_extra}"
-        )
+        meta_cmd = f"exec {shlex.quote(self.args.bin_dir)}/afs-meta {self.meta_arguments()}"
         self.procs.append(self.c.start("afs-meta", meta_cmd, f"{self.paths['C_ROOT']}/logs/afs-meta.log"))
         self.remote_wait_http(self.c, f"http://127.0.0.1:{self.meta_rest}/health", timeout=20)
 
@@ -390,11 +484,15 @@ class OwnerFsAcceptance:
         return "/dev/null"
 
     def namespace_ready(self) -> dict[str, Any]:
-        out_a = self.a.run(f"ls -la {shlex.quote(self.mount_a)}", timeout=10, check=True).stdout
-        out_b = self.b.run(f"ls -la {shlex.quote(self.mount_b)}", timeout=10, check=True).stdout
-        if "ownerfs" not in out_a or "ownerfs" not in out_b:
-            raise RunnerError(f"/ownerfs namespace missing: A={out_a!r} B={out_b!r}")
-        return {"A_ls": out_a[:300], "B_ls": out_b[:300]}
+        result: dict[str, Any] = {}
+        for role, mount in ((self.a, self.mount_a), (self.b, self.mount_b)):
+            command = f"findmnt -J --mountpoint {shlex.quote(mount)} -o TARGET,SOURCE,FSTYPE"
+            mounts = json.loads(role.run(command, timeout=10, check=True).stdout).get("filesystems", [])
+            if len(mounts) != 1 or mounts[0].get("target") != mount or mounts[0].get("source") != "afs-ownerfs" \
+                    or mounts[0].get("fstype") not in ("fuse", "fuse.fuser"):
+                raise RunnerError(f"{role.role} exact OwnerFs FUSE root missing: {mounts}")
+            result[f"{role.role}_mount"] = mounts[0]
+        return result
 
     def install_meta_proto(self) -> None:
         proto = Path(self.args.proto_root) / "meta.proto"
@@ -411,7 +509,7 @@ class OwnerFsAcceptance:
         )
         self.c.run(script, timeout=10, check=True)
 
-    def location_lookup(self, root: str) -> dict[str, Any]:
+    def location_lookup(self, root: str, expected_home: str | None = None) -> dict[str, Any]:
         # OwnerFs names are arbitrary Linux bytes; the Meta key is the stable
         # encoded RootId, not the display name used in the mount path.
         root_id = "root-" + os.fsencode(root).hex()
@@ -421,15 +519,15 @@ class OwnerFsAcceptance:
             try:
                 response = self.remote_wait_http(self.c, url, timeout=5)
                 payload = json.loads(response["body"])
-                expected = self.args.expected_home_node_id or "node-a-" + self.run_id
+                expected = expected_home or self.args.expected_home_node_id or "node-a-" + self.run_id
                 if payload.get("root_id") != root_id or payload.get("home_node_id") != expected:
                     raise RunnerError(f"root location mismatch for {root}: {payload}")
                 return payload
             except Exception as exc:
                 raise RunnerError(f"root location REST API unavailable or not authoritative at {path}: {exc}") from exc
-        return self.location_lookup_grpcurl(root_id)
+        return self.location_lookup_grpcurl(root_id, expected_home)
 
-    def location_lookup_grpcurl(self, root: str) -> dict[str, Any]:
+    def location_lookup_grpcurl(self, root: str, expected_home: str | None = None) -> dict[str, Any]:
         self.install_meta_proto()
         remote_proto_dir = f"{self.root_base}/proto"
         remote_request = f"{self.root_base}/lookup-{uuid.uuid4().hex}.json"
@@ -476,10 +574,8 @@ class OwnerFsAcceptance:
         if not payload.get("found"):
             raise RunnerError(f"LookupRoot did not find {root}: {payload}")
         location = payload.get("location") or {}
-        if location.get("homeNodeId") not in {
-            "node-a-" + self.run_id,
-            self.args.expected_home_node_id or "node-a-" + self.run_id,
-        }:
+        expected = expected_home or self.args.expected_home_node_id or "node-a-" + self.run_id
+        if location.get("homeNodeId") != expected:
             raise RunnerError(f"LookupRoot returned unexpected home node for {root}: {payload}")
         return payload
 
@@ -553,18 +649,21 @@ class OwnerFsAcceptance:
             f"{shlex.quote(self.owner_a + '/' + root)}"
             f" && echo A || echo A_FAIL) > "
             f"{shlex.quote(self.paths['A_ROOT'] + '/logs/race.out')}"
-            f" 2>&1 &"
+            f" 2>&1"
         )
         cmd_b = (
             f"(mkdir "
             f"{shlex.quote(self.owner_b + '/' + root)}"
             f" && echo B || echo B_FAIL) > "
             f"{shlex.quote(self.paths['B_ROOT'] + '/logs/race.out')}"
-            f" 2>&1 &"
+            f" 2>&1"
         )
-        self.a.run(cmd_a, timeout=5, check=True)
-        self.b.run(cmd_b, timeout=5, check=True)
-        time.sleep(1.0)
+        # Each synchronous shell owns its command completion; do not leave
+        # detached mkdir helpers or serialize both requests via readiness waits.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            racers = [pool.submit(role.run, command, timeout=10, check=True)
+                      for role, command in ((self.a, cmd_a), (self.b, cmd_b))]
+            commands = [future.result() for future in racers]
         out_a = self.a.run(
             f"cat {shlex.quote(self.paths['A_ROOT'] + '/logs/race.out')} 2>/dev/null || true", timeout=5
         ).stdout.strip()
@@ -573,8 +672,10 @@ class OwnerFsAcceptance:
         ).stdout.strip()
         if (out_a.endswith("A")) == (out_b.endswith("B")):
             raise RunnerError(f"concurrent mkdir requires exactly one winner: A={out_a!r}, B={out_b!r}")
-        lookup = self.location_lookup(root)
-        return {"A": out_a, "B": out_b, "location": lookup}
+        winner = "node-a-" if out_a.endswith("A") else "node-b-"
+        lookup = self.location_lookup(root, winner + self.run_id)
+        return {"A": out_a, "B": out_b, "location": lookup,
+                "command_returncodes": [result.returncode for result in commands]}
 
     def step_old_fd_after_rename(self) -> dict[str, Any]:
         base_a = f"{self.owner_a}/{self.workspace}/fd"
@@ -590,15 +691,17 @@ class OwnerFsAcceptance:
             f"p={str(base_b + '/x')!r}\n"
             f"out={str(self.paths['B_ROOT'] + '/logs/oldfd.out')!r}\n"
             "fd=os.open(p, os.O_RDONLY)\n"
+            "open(out+'.opened','w').close()\n"
             "time.sleep(1.5)\n"
             "data=os.read(fd, 100)\n"
             "os.close(fd)\n"
             "open(out,'wb').write(data)\n"
             "PY\n"
-            f"nohup python3 {shlex.quote(script_path)} > {shlex.quote(script_log)} 2>&1 & echo $!"
+            f"exec python3 {shlex.quote(script_path)}"
         )
-        self.b.run(script, timeout=5, check=True)
-        time.sleep(0.4)
+        reader = self.b.start("old-fd-reader", script, script_log)
+        self.procs.append(reader)
+        self.wait_reader_open(self.paths["B_ROOT"] + "/logs/oldfd.out.opened")
         self.a.run(
             (
                 f"mv "
@@ -611,7 +714,7 @@ class OwnerFsAcceptance:
             timeout=10,
             check=True,
         )
-        time.sleep(2.0)
+        self.wait_process(reader)
         out = self.b.run(
             f"cat {shlex.quote(self.paths['B_ROOT'] + '/logs/oldfd.out')} 2>/dev/null", timeout=5, check=True
         ).stdout
@@ -633,25 +736,37 @@ class OwnerFsAcceptance:
             f"p={str(base_b + '/x')!r}\n"
             f"out={str(self.paths['B_ROOT'] + '/logs/unlinkfd.out')!r}\n"
             "fd=os.open(p, os.O_RDONLY)\n"
+            "open(out+'.opened','w').close()\n"
             "time.sleep(1.5)\n"
             "data=os.read(fd, 100)\n"
             "os.close(fd)\n"
             "open(out,'wb').write(data)\n"
             "PY\n"
-            f"nohup python3 {shlex.quote(script_path)} > {shlex.quote(script_log)} 2>&1 & echo $!"
+            f"exec python3 {shlex.quote(script_path)}"
         )
-        self.b.run(script, timeout=5, check=True)
-        time.sleep(0.4)
+        reader = self.b.start("unlinked-fd-reader", script, script_log)
+        self.procs.append(reader)
+        self.wait_reader_open(self.paths["B_ROOT"] + "/logs/unlinkfd.out.opened")
         self.a.run(
             f"rm {shlex.quote(base_a + '/x')} && printf 'reuse' > {shlex.quote(base_a + '/x')}", timeout=10, check=True
         )
-        time.sleep(2.0)
+        self.wait_process(reader)
         out = self.b.run(
             f"cat {shlex.quote(self.paths['B_ROOT'] + '/logs/unlinkfd.out')} 2>/dev/null", timeout=5, check=True
         ).stdout
         if out != "survive":
             raise RunnerError(f"unlinked fd read {out!r}")
         return {"old_fd_bytes": out}
+
+    def wait_reader_open(self, marker: str) -> None:
+        code = (
+            "import sys,time; from pathlib import Path\n"
+            "deadline=time.monotonic()+5\n"
+            "while not Path(sys.argv[1]).is_file():\n"
+            "    if time.monotonic()>=deadline: raise TimeoutError('reader did not open file')\n"
+            "    time.sleep(.02)\n"
+        )
+        self.b.run(shlex.join(["python3", "-c", code, marker]), timeout=8, check=True)
 
     def step_alternating_lengths(self) -> dict[str, Any]:
         file_a = f"{self.owner_a}/{self.workspace}/lengths.txt"
@@ -673,19 +788,8 @@ class OwnerFsAcceptance:
         metas = [p for p in self.procs if p.name == "afs-meta"]
         if not metas:
             raise RunnerError("meta process ref missing")
-        self.c.kill(metas[-1])
-        time.sleep(1.0)
-        self.procs.remove(metas[-1])
-        etcd = self.args.etcd_endpoint or "memory://acceptance-missing-etcd"
-        meta_extra = self.binary_args("meta")
-        meta_cmd = (
-            f"exec {shlex.quote(self.args.bin_dir)}/afs-meta "
-            f"--id meta-{shlex.quote(self.run_id)}-restart "
-            f"--grpc-listen 0.0.0.0:{self.meta_grpc} "
-            f"--rest-listen 0.0.0.0:{self.meta_rest} "
-            f"--etcd-endpoint {shlex.quote(etcd)} "
-            f"{meta_extra}"
-        )
+        self.wait_process(metas[-1], stop=True)
+        meta_cmd = f"exec {shlex.quote(self.args.bin_dir)}/afs-meta {self.meta_arguments(restart=True)}"
         self.procs.append(self.c.start("afs-meta", meta_cmd, f"{self.paths['C_ROOT']}/logs/afs-meta-restart.log"))
         self.remote_wait_http(self.c, f"http://127.0.0.1:{self.meta_rest}/health", timeout=20)
         lookup = self.location_lookup(self.workspace)
@@ -700,11 +804,9 @@ class OwnerFsAcceptance:
         node_a = [p for p in self.procs if p.name == "afs-node-a"]
         if not node_a:
             raise RunnerError("node A process ref missing")
-        self.a.kill(node_a[-1])
-        time.sleep(1.0)
+        self.wait_process(node_a[-1], stop=True)
         miss = self.b.run(f"cat {shlex.quote(self.owner_b + '/' + self.workspace + '/dir/file.txt')}", timeout=10)
         failure_observed = miss.returncode != 0
-        self.procs.remove(node_a[-1])
         node_a_advertise = self.args.node_a_advertise_endpoint or self.endpoint(self.args.host_a, self.node_a_grpc)
         node_a_cmd = (
             f"exec {shlex.quote(self.args.bin_dir)}/afs-node "
@@ -772,6 +874,12 @@ class OwnerFsAcceptance:
     def note_cleanup_error(self, action: str, role: str, error: str) -> None:
         self.result.setdefault("cleanup_errors", []).append({"action": action, "role": role, "error": error[-2000:]})
 
+    def wait_process(self, proc: ProcessRef, *, stop: bool = False) -> None:
+        receipt = self.roles[proc.role].wait(proc, stop=stop)
+        self.result["waits"].append({"role": proc.role, "name": proc.name, "wait_file": proc.wait_file, **receipt})
+        self.result["logs"][f"{proc.role}:{proc.name}:{Path(proc.log).name}"] = self.roles[proc.role].tail(proc.log)
+        self.procs.remove(proc)
+
     def cleanup_run(self, role: RemoteShell, action: str, script: str, timeout: float = 8.0) -> None:
         try:
             result = role.run(script, timeout=timeout, check=False)
@@ -785,33 +893,35 @@ class OwnerFsAcceptance:
             self.note_cleanup_error(action, role.role, repr(exc))
 
     def cleanup(self) -> None:
+        # Product shutdown must complete before any residual normal unmount.
+        # Restarts append new refs; reverse insertion order can stop Meta while
+        # an older Node still needs it for drain. Keep authority until last.
+        for proc in sorted(reversed(self.procs), key=lambda item: item.name == "afs-meta"):
+            try:
+                self.wait_process(proc, stop=True)
+            except Exception as exc:
+                self.note_cleanup_error(f"normal stop {proc.name}", proc.role, repr(exc))
         for role, mount in ((self.a, self.mount_a), (self.b, self.mount_b)):
+            if role.role not in self.prepared_roles:
+                continue
+            if any(proc.role == role.role for proc in self.procs):
+                self.note_cleanup_error("retain mount until actual child exit", role.role, mount)
+                continue
             self.cleanup_run(
                 role,
                 f"unmount {mount}",
                 (
-                    f"(mountpoint -q "
-                    f"{shlex.quote(mount)}"
-                    f" || grep -qs ' "
-                    f"{shlex.quote(mount)}"
-                    f" ' /proc/mounts) && (fusermount3 -uz "
-                    f"{shlex.quote(mount)}"
-                    f" || fusermount -uz "
-                    f"{shlex.quote(mount)}"
-                    f" || umount -l "
-                    f"{shlex.quote(mount)}"
-                    f" || true) || true"
+                    f"set -e\nif mountpoint -q {shlex.quote(mount)}; then\n"
+                    f"if command -v fusermount3 >/dev/null; then fusermount3 -u {shlex.quote(mount)}; "
+                    f"else fusermount -u {shlex.quote(mount)}; fi\nfi\n"
+                    f"if mountpoint -q {shlex.quote(mount)}; then exit 1; fi"
                 ),
                 timeout=8,
             )
-        for proc in reversed(self.procs):
-            try:
-                self.roles[proc.role].kill(proc)
-            except Exception as exc:
-                self.note_cleanup_error(f"kill {proc.name}", proc.role, repr(exc))
-        if not self.args.keep_tmp:
-            for role in (self.a, self.b, self.c):
-                self.cleanup_run(role, f"remove {self.root_base}", f"rm -rf {shlex.quote(self.root_base)}", timeout=8)
+        if not self.args.keep_tmp and self.result.get("status") == "PASS" and not self.result["cleanup_errors"]:
+            for role, root_key in ((self.a, "A_ROOT"), (self.b, "B_ROOT"), (self.c, "C_ROOT")):
+                if role.role in self.prepared_roles:
+                    self.cleanup_run(role, f"remove {root_key}", f"rm -rf {shlex.quote(self.paths[root_key])}", timeout=8)
 
     def collect_logs(self) -> None:
         for proc in self.procs:
@@ -822,16 +932,16 @@ class OwnerFsAcceptance:
 
     def execute(self) -> dict[str, Any]:
         try:
-            if not self.run_step("preflight binaries, Linux, FUSE, etcd intent", self.preflight):
+            if not self.run_step("preflight binaries, Linux, FUSE, local-file authority", self.preflight):
                 return self.finish(False)
-            if not self.run_step("prepare temporary dirs and stale mounts", self.prepare_hosts):
+            if not self.run_step("prepare fresh temporary dirs", self.prepare_hosts):
                 return self.finish(False)
             if self.args.preflight_only:
                 return self.finish(True)
             if not self.run_step("start persistent meta and A/B OwnerFs nodes", self.start_cluster):
                 return self.finish(False)
             for name, fn in (
-                ("/ownerfs namespace exists on A and B", self.namespace_ready),
+                ("exact OwnerFs FUSE roots exist on A and B", self.namespace_ready),
                 ("root mkdir on A and management location API", self.step_root_create_and_location),
                 ("A close then B reopen reads exact bytes", self.step_close_to_open),
                 ("A rewrite then B reopen sees new bytes", self.step_remote_reopen_after_rewrite),
@@ -856,6 +966,9 @@ class OwnerFsAcceptance:
                 self.cleanup()
             except Exception as exc:
                 self.note_cleanup_error("cleanup", "local", repr(exc))
+            # Early returns above share this dict; cleanup failures must affect
+            # the emitted result and CLI status, not just an ignored side list.
+            self.finish(self.result.get("status") == "PASS" and not self.result["cleanup_errors"])
 
     def finish(self, ok: bool) -> dict[str, Any]:
         self.result["status"] = "PASS" if ok else "FAIL"
@@ -877,16 +990,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="extra ssh option token; repeat for multiple tokens",
     )
     parser.add_argument("--bin-dir", required=True, help="directory containing afs-meta and afs-node on every host")
-    parser.add_argument(
-        "--etcd-endpoint",
-        default=os.environ.get("AFS_ETCD_ENDPOINT"),
-        help="etcd endpoint for afs-meta, e.g. http://127.0.0.1:2379",
-    )
-    parser.add_argument(
-        "--allow-missing-etcd-for-scaffold",
-        action="store_true",
-        help="only for harness debugging; full acceptance requires etcd",
-    )
     parser.add_argument(
         "--endpoint-scheme",
         choices=["http", "https"],

@@ -4,6 +4,7 @@ use super::*;
 impl Session {
     pub async fn invalidate_node(&self, id: &str, session_id: &str) -> Result<StoredSnapshot> {
         for _ in 0..ATTEMPTS {
+            let snapshots = self.retained_snapshots().await?;
             let raw = self.store.raw().await?;
             let mut header = self.header(&raw.get(HEADER).cloned())?;
             let mut saved = snapshot(&raw)?;
@@ -14,6 +15,7 @@ impl Session {
             node.node.available = false;
             node.session.as_mut().ok_or(Error::Conflict)?.routable = false;
             node.checkpoint_gc_fenced = true;
+            let mut holds = Vec::new();
             let mut writes = vec![(format!("node:{id}"), encode(node)?)];
             for (environment_id, environment) in &mut saved.environments {
                 if environment.assignment.node_id != id
@@ -29,6 +31,8 @@ impl Session {
                     .result
                     .clone()
                     .unwrap_or_else(|| EnvironmentRecord {
+                        execution_artifacts: vec![],
+                        snapshot_source: None,
                         failure: None,
                         spec: environment.spec.clone(),
                         assignment: environment.assignment.clone(),
@@ -44,6 +48,35 @@ impl Session {
                         restart_attempts: 0,
                         restart_pending: false,
                     });
+                let mut inputs = result.execution_artifacts.clone();
+                if result.resources_held {
+                    if let Some(snapshot) = snapshots
+                        .iter()
+                        .find(|s| environment.spec.snapshot_id.as_deref() == Some(s.id.as_str()))
+                    {
+                        if !inputs.contains(&snapshot.artifact) {
+                            inputs.push(snapshot.artifact.clone());
+                        }
+                    }
+                    for point in result
+                        .checkpoint
+                        .iter()
+                        .chain(result.snapshot_source.iter())
+                    {
+                        if !inputs.contains(&point.artifact) {
+                            inputs.push(point.artifact.clone());
+                        }
+                    }
+                }
+                if !inputs.is_empty() {
+                    holds.push((
+                        artifacts::hold_key(&environment.assignment),
+                        encode(&artifacts::ExecutionHold {
+                            assignment: environment.assignment.clone(),
+                            artifacts: inputs,
+                        })?,
+                    ));
+                }
                 // Losing a node retires execution ownership, not the user's
                 // dormancy intent. A paused restore point is awakened on demand.
                 let autonomous_recovery = environment.resume.is_none()
@@ -81,16 +114,22 @@ impl Session {
                 .arg(
                     r#"
                 if redis.call('HGET', KEYS[1], 'header') ~= ARGV[1] then return 0 end
-                for i = 3, #ARGV, 2 do redis.call('HSET', KEYS[1], ARGV[i], ARGV[i+1]) end
+                local count=tonumber(ARGV[3]); for i=4,3+count*2,2 do redis.call('HSET',KEYS[1],ARGV[i],ARGV[i+1]) end
+                for i=4+count*2,#ARGV,2 do redis.call('HSET',KEYS[2],ARGV[i],ARGV[i+1]) end
                 redis.call('HSET', KEYS[1], 'header', ARGV[2]); return 1
             "#,
                 )
-                .arg(1)
+                .arg(2)
                 .arg(&self.store.key)
+                .arg(format!("{}:input-holds",self.store.key))
                 .arg(raw.get(HEADER).ok_or(Error::Conflict)?)
-                .arg(encode(&header)?);
+                .arg(encode(&header)?)
+                .arg(writes.len());
             let changed = writes.iter().map(|(field, _)| field.clone()).collect();
             for (field, value) in writes {
+                command.arg(field).arg(value);
+            }
+            for (field, value) in holds {
                 command.arg(field).arg(value);
             }
             if self.store.query::<u8>(command).await? == 1 {

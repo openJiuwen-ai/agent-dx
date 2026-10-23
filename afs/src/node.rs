@@ -13,6 +13,7 @@
 
 pub mod api;
 pub mod chunk;
+pub(crate) mod chunk_crc32c;
 #[cfg(feature = "dfs")]
 mod dfs_fetch;
 #[cfg(feature = "dfs")]
@@ -20,6 +21,8 @@ pub mod dfs_read;
 #[cfg(feature = "dfs")]
 pub mod external_chunk;
 pub mod fuse;
+#[cfg(feature = "dfs")]
+pub mod gc;
 #[cfg(feature = "ownerfs")]
 mod native_workspace;
 #[cfg(feature = "dfs")]
@@ -1327,6 +1330,8 @@ async fn run_node(
     } else {
         None
     };
+    #[cfg(feature = "dfs")]
+    let dfs_shutting_down = Arc::new(AtomicBool::new(false));
     #[cfg(not(feature = "dfs"))]
     let _ = registered_node_epoch;
 
@@ -1585,13 +1590,17 @@ async fn run_node(
         dfs_external_store_for_shutdown = external_store.clone();
         let chunk_store: Arc<dyn chunk::ChunkStore> = match &external_store {
             Some(store) => store.clone(),
-            None => Arc::new(replication::DfsChunkStore::new_with_epoch(
-                cfg.id.clone(),
-                registered_node_epoch,
-                chunks.clone(),
-                meta.clone(),
-                dfs_replica_plane.clone(),
-            )),
+            None => Arc::new(
+                replication::DfsChunkStore::new_with_epoch(
+                    cfg.id.clone(),
+                    registered_node_epoch,
+                    chunks.clone(),
+                    meta.clone(),
+                    dfs_replica_plane.clone(),
+                )
+                .with_gc_control(meta.clone())
+                .with_optimistic_gc_commit(cfg.dfs_optimistic_gc_commit),
+            ),
         };
         let read_config = dfs_read::DfsReadConfig {
             max_ops_per_batch: cfg.dfs_read_max_ops_per_batch,
@@ -1641,6 +1650,25 @@ async fn run_node(
         } else {
             read_engine
         };
+        if cfg.dfs_crc32c_writes && !cfg.dfs_optimistic_gc_commit {
+            return Err(afs_error::Error::coded(
+                afs_error::CONFIG_INVALID,
+                "dfs_crc32c_writes requires dfs_optimistic_gc_commit",
+            )
+            .into());
+        }
+        if (cfg.dfs_optimistic_gc_commit || cfg.dfs_crc32c_writes)
+            && cfg.dfs_external_backend.is_some()
+        {
+            return Err(afs_error::Error::coded(
+                afs_error::CONFIG_INVALID,
+                "dfs_optimistic_gc_commit requires native storage",
+            )
+            .into());
+        }
+        let gc_references = external_store
+            .is_none()
+            .then(|| gc::GcReferences::new(meta.clone()));
         let read_engine = Arc::new(match external_store {
             Some(store) => read_engine.with_external_backend(store, meta.clone()),
             None => read_engine,
@@ -1658,6 +1686,9 @@ async fn run_node(
             chunk_store,
             read_engine,
         )
+        .with_gc_references(gc_references)
+        .with_optimistic_gc_commit(cfg.dfs_optimistic_gc_commit)
+        .with_crc32c_writes(cfg.dfs_crc32c_writes)
         .with_remote_owner_factory(remote_factory)
         .with_version_cache_capacity(cfg.dfs_version_cache_entries)
         .with_version_cache_bytes(cfg.dfs_version_cache_bytes)
@@ -1827,6 +1858,8 @@ async fn run_node(
         let readiness = readiness.clone();
         #[cfg(feature = "dfs")]
         let read_authority = dfs_read_authority.clone();
+        #[cfg(feature = "dfs")]
+        let shutting_down = Arc::clone(&dfs_shutting_down);
         services.spawn(async move {
             // The Meta lease lasts longer than one refresh interval. A brief
             // Meta restart must not tear down the FUSE mount and all open FDs
@@ -1864,9 +1897,11 @@ async fn run_node(
                                 }
                                 #[cfg(feature = "dfs")]
                                 if let Some(authority) = &read_authority
-                                    && let Err(error) = authority.refresh(
+                                    && let Err(error) = refresh_running_read_authority(
+                                        authority,
                                         registration.lease_epoch,
                                         registration.session_deadline,
+                                        &shutting_down,
                                     ) {
                                     authority.stop();
                                     return Err(error.into());
@@ -1928,6 +1963,39 @@ async fn run_node(
     }
     #[cfg(feature = "dfs")]
     if let Some(dfs) = state.dfs.clone() {
+        let gc_fs = dfs.clone();
+        let gc_stop = services.stop.subscribe();
+        services.spawn(async move {
+            let mut tick=tokio::time::interval(std::time::Duration::from_secs(5));
+            let shutdown=cancelled(gc_stop);tokio::pin!(shutdown);
+            loop {tokio::select!{_=&mut shutdown=>return Ok(()),_=tick.tick()=>{
+                let fs=gc_fs.clone();match tokio::task::spawn_blocking(move||fs.collect_garbage()).await {
+                    Ok(Ok(count)) if count>0=>afs_logging::info!("dfs.gc_collected";"chunks"=>count),
+                    Ok(Ok(_))=>{},Ok(Err(error))=>afs_logging::warn!("dfs.gc_retry";"error"=>error.to_string()),
+                    Err(error)=>afs_logging::warn!("dfs.gc_worker_failed";"error"=>error.to_string()),
+                }
+            }}}
+        });
+        let renew_fs = dfs.clone();
+        let renew_stop = services.stop.subscribe();
+        services.spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            let shutdown = cancelled(renew_stop);
+            tokio::pin!(shutdown);
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown => return Ok(()),
+                    _ = tick.tick() => {
+                        let fs = renew_fs.clone();
+                        match tokio::task::spawn_blocking(move || fs.renew_active_write_leases()).await {
+                            Ok(Ok(_)) => {},
+                            Ok(Err(error)) => afs_logging::warn!("dfs.writer_renewal_retry"; "error" => error.to_string()),
+                            Err(error) => afs_logging::warn!("dfs.writer_renewal_worker_failed"; "error" => error.to_string()),
+                        }
+                    }
+                }
+            }
+        });
         let stop = services.stop.subscribe();
         let native_notify = dfs.native_writeback_notify();
         let native_commit_period = std::time::Duration::from_millis(cfg.dfs_background_commit_ms);
@@ -2291,6 +2359,8 @@ async fn run_node(
     // shutdown. A cached object must not outlive a known Node/session stop.
     let on_shutdown = || {
         #[cfg(feature = "dfs")]
+        dfs_shutting_down.store(true, Ordering::Release);
+        #[cfg(feature = "dfs")]
         if let Some(dfs) = &state.dfs {
             dfs.close_native_write_admission();
         }
@@ -2418,6 +2488,9 @@ async fn run_node(
                     0
                 }
             };
+            if let Err(error) = dfs.flush_gc_releases() {
+                first_error.get_or_insert(error);
+            }
             if let Some(error) = first_error {
                 return Err(error);
             }
@@ -2862,6 +2935,23 @@ fn initial_registration_error_is_retryable(error: &afs_error::Error) -> bool {
     )
 }
 
+#[cfg(feature = "dfs")]
+fn refresh_running_read_authority(
+    authority: &dfs_read::LocalReadAuthority,
+    epoch: u64,
+    deadline: Instant,
+    shutting_down: &AtomicBool,
+) -> afs_error::Result<()> {
+    match authority.refresh(epoch, deadline) {
+        // SIGTERM closes read admission immediately. A heartbeat already in
+        // flight may return after that stop; it cannot reopen authority and
+        // must not turn a normal shutdown into a service failure. Epoch/expiry
+        // failures while serving remain fatal.
+        Err(_) if shutting_down.load(Ordering::Acquire) => Ok(()),
+        result => result,
+    }
+}
+
 fn remember_shutdown_error(first: &mut Option<BoxError>, error: BoxError) {
     if first.is_none() {
         *first = Some(error);
@@ -3054,6 +3144,43 @@ mod shutdown_tests {
         .unwrap_err();
         assert_eq!(error.kind(), afs_error::ErrorKind::Cancelled);
         assert!(error.to_string().contains("cancelled"));
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn normal_shutdown_late_heartbeat_does_not_fail_or_reopen_authority() {
+        use std::{
+            sync::atomic::{AtomicBool, Ordering},
+            time::Instant,
+        };
+        let authority =
+            super::dfs_read::LocalReadAuthority::new(1, Instant::now() + Duration::from_secs(30));
+        let stopping = AtomicBool::new(true);
+        authority.stop();
+        super::refresh_running_read_authority(
+            &authority,
+            1,
+            Instant::now() + Duration::from_secs(30),
+            &stopping,
+        )
+        .unwrap();
+        assert!(
+            authority
+                .refresh(1, Instant::now() + Duration::from_secs(30))
+                .is_err(),
+            "late heartbeat must not reopen stopped authority"
+        );
+        stopping.store(false, Ordering::Release);
+        assert!(
+            super::refresh_running_read_authority(
+                &authority,
+                1,
+                Instant::now() + Duration::from_secs(30),
+                &stopping
+            )
+            .is_err(),
+            "stopped authority outside normal shutdown must fail closed"
+        );
     }
 
     #[test]

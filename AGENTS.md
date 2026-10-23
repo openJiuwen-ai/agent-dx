@@ -9,6 +9,8 @@
 - Environment SDK uses adx-environment / adx_environment / ADX_ naming. Owned Agent namespaces use adx, Gateway commands use adx-, and config/headers use ADX. External runtime dependencies require functional replacement, not fabricated import renames. `docs/migration/sources.json` records exact provenance.
 - Keep the Rust API Server small: public HTTP types, validation and direct Environment RPC clients. Preserve Environment and Agent entrypoints. Do not reintroduce the removed runtime SDK, function/Job packages or metadata watchers to satisfy a helper import. Agent business logic belongs under `agent/`.
 
+- Queue-expiry diagnostics use `adx_core::scheduling::SchedulingFailure`. Only confirmed cancellation before assignment may return `never / not_started`; preserve unknown outcomes for runtime/transport ambiguity. Keep JSON, SSE and SDK error fields aligned with `platform/api/http/error-contract.md`.
+
 - Platform Environment (`adx_core::EnvironmentSpec` / `EnvironmentRecord`) owns execution identity and lifecycle. AgentBinding (`adx_agent_core::AgentBinding`) owns product metadata and binds to a public Environment; do not merge the two state machines. `RuntimeProfile` only configures rootfs/bootstrap.
 - Process names: `adx-coordinator`, `adxlet`, `adx-apiserver`, `adx-ingress`, `adx-relay`, `adx-execd`.
 

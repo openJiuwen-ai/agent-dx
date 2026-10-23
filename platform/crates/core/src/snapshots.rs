@@ -142,6 +142,29 @@ impl Snapshot {
     pub fn delete(&mut self, tenant: &str) -> Result<()> {
         self.authorize(tenant)?;
         if self.state == SnapshotState::Ready {
+            if !self.references.is_empty() {
+                return Err(Error::SnapshotInUse {
+                    sandbox_ids: self
+                        .references
+                        .iter()
+                        .filter_map(|r| match r {
+                            Reference::Restore { environment_id } => Some(environment_id.clone()),
+                            _ => None,
+                        })
+                        .collect(),
+                    template_ids: self
+                        .references
+                        .iter()
+                        .filter_map(|r| match r {
+                            Reference::Template {
+                                node_id,
+                                template_id,
+                            } => Some(format!("{node_id}/{template_id}")),
+                            _ => None,
+                        })
+                        .collect(),
+                });
+            }
             self.advance()?;
             self.state = SnapshotState::Deleting;
         }

@@ -6,14 +6,13 @@ use afs::{
     config::{Cli, Config, Role},
     runtime::{self, BoxError, Observability},
 };
-use clap::Parser;
 
 #[cfg(all(target_os = "linux", feature = "node-jemalloc"))]
 #[global_allocator]
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() -> Result<(), BoxError> {
-    let cfg = Config::resolve(Role::Node, Cli::parse())?;
+    let cfg = Config::resolve(Role::Node, Cli::parse_process())?;
     if cfg.print_config {
         println!("{}", serde_json::to_string_pretty(&cfg)?);
         return Ok(());

@@ -14,7 +14,8 @@
 | 执行清理 | 删除后移除节点控制槽位，迟到连接不能复活旧执行 |
 | 真实 Execd 进程 | 实际 gRPC、Unix `/checkpoint` 和 FIFO handoff 交互；成功应答等待 Finish |
 | adxlet 创建与 checkpoint | 真实 Execd 在 Start 返回前主动 Ready；原生命周期串行执行，状态发布阻塞时 Unix 请求不提前成功，删除释放资源 |
-| 恢复身份切换 | 真实 Execd 读取恢复环境后，按目标 generation／token 重新注册，旧执行退役 |
+| 恢复身份切换 | 真实 Execd 读取恢复环境后，在源端点已停止的条件下连接另一个节点端点，按目标 generation／token 重新注册，旧执行退役 |
+| block 与控制例外 | Start／策略更新 RPC 同时覆盖 stateful、stateless 的双向默认拒绝，控制例外仅匹配节点 IP／TCP 端口；恢复 RPC 刷新目标节点端点和执行凭证，忽略来源环境内的旧值 |
 
 adxlet 和组件检查还覆盖：控制器执行时拒绝旧 generation 的排队通知，旧 stream 的迟到应答及断开不覆盖新 stream，请求取消释放待应答槽位，节点凭据文件权限及 sandboxd 环境不泄露节点 secret。暂停确认后端停止后清理旧控制槽位；后端停止结果未知时保留该状态，后续删除对账再清理。HTTP 控制回归仍保留。
 
@@ -39,6 +40,8 @@ python3 build/docs/check.py
 - workspace Clippy（所有 targets/features，警告即失败）、fmt、文档链接及 diff 检查通过。
 
 ## 验证边界
+
+block 的 Rust 回归验证发送给 gRPC／UDS 后端夹具的策略和环境字段；数据面的真实网络执行由下方的真实后端 E2E 单独验证。
 
 上述 Rust 测试使用真实 Execd 进程和网络连接，checkpoint 后端用 FIFO 与制品夹具模拟，Coordinator 持久化由可控 StateSink 模拟。另以当前工作树构建的 Linux ARM64 发布包执行真实 Standalone 与 Firecracker 回归，记录见下节。该本地验证不代表集群升级，也不是启动性能测量。未修改 sandboxd 协议或公开 SDK 接口；本轮修正 SDK 命令订阅的连续断流预算，Unix checkpoint 空 body 仍默认 600 秒。
 

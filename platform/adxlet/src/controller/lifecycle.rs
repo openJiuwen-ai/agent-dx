@@ -86,12 +86,17 @@ impl Controller {
         if let Some(policy) = &policy {
             policy.validate()?;
         }
+        self.record
+            .spec
+            .execution
+            .validate_tunnel_network(policy.as_ref())?;
         self.services
             .runtime
             .set_network_policy(
                 &self.record.runtime.id,
                 policy.as_ref(),
                 &self.record.spec.execution.ports,
+                self.record.spec.execution.tunnel_http_port,
             )
             .await?;
         self.record.spec.execution.network = policy;
@@ -115,9 +120,6 @@ impl Controller {
         }
         // An expired restore point is no longer usable, but the live execution
         // can still read its state/memory files. Persist that reference until stop.
-        if self.held && self.recovery_files.is_some() {
-            return Ok(None);
-        }
         self.obsolete_checkpoints.push(cp.artifact);
         self.record.checkpoint = None;
         self.record.last_operation = None;
@@ -134,6 +136,13 @@ impl Controller {
         kind: LifecycleKind,
     ) -> Result<bool> {
         validate_operation(id, revision)?;
+        if let Some((op, _)) = &self.capture_preparation {
+            return if op.id == id && op.expected_revision == revision && op.kind == kind {
+                Ok(false)
+            } else {
+                Err(Error::Conflict)
+            };
+        }
         if self
             .record
             .last_operation
@@ -146,6 +155,30 @@ impl Controller {
             return Err(Error::Conflict);
         }
         Ok(false)
+    }
+    pub(super) async fn capture_directory(
+        &mut self,
+        store: &dyn crate::checkpoint::CheckpointAccess,
+        id: &str,
+        revision: u64,
+        kind: LifecycleKind,
+    ) -> Result<std::path::PathBuf> {
+        if let Some((op, path)) = &self.capture_preparation {
+            if op.id == id && op.expected_revision == revision && op.kind == kind {
+                return Ok(path.clone());
+            }
+            return Err(Error::Conflict);
+        }
+        let path = store.begin_capture().await?;
+        self.capture_preparation = Some((
+            CompletedOperation {
+                id: id.into(),
+                expected_revision: revision,
+                kind,
+            },
+            path.clone(),
+        ));
+        Ok(path)
     }
     pub(super) fn completed(&mut self, id: String, expected_revision: u64, kind: LifecycleKind) {
         self.record.last_operation = Some(CompletedOperation {
@@ -195,7 +228,14 @@ impl Controller {
             .runtime
             .checkpoint_supported(&self.record.spec.runtime_class)
             .await?;
-        let staged = services.store.allocate().await?;
+        let staged = self
+            .capture_directory(
+                services.store.as_ref(),
+                &request.operation_id,
+                request.expected_revision,
+                LifecycleKind::Pause,
+            )
+            .await?;
         // Preparation errors can be ambiguous: abort is valid only before the backend call.
         let preparation = match &self.auto_pause_guard {
             Some((stamp, _)) => {
@@ -216,6 +256,7 @@ impl Controller {
                 // A definitive idle-barrier rejection has not changed runtime
                 // state. In particular, do not abort another workload checkpoint.
                 services.store.discard_staged(&staged).await?;
+                self.capture_preparation = None;
                 return self.sync().await;
             }
             let abort = services
@@ -223,6 +264,7 @@ impl Controller {
                 .abort_unstarted(&self.record, &request.operation_id)
                 .await;
             services.store.discard_staged(&staged).await?;
+            self.capture_preparation = None;
             if let Err(abort) = abort {
                 self.transition(Event::Fail)?;
                 let retire = self.services.routes.retire(&self.record).await;
@@ -249,6 +291,7 @@ impl Controller {
                     .abort_unstarted(&self.record, &request.operation_id)
                     .await;
                 services.store.discard_staged(&staged).await?;
+                self.capture_preparation = None;
                 if let Err(error) = abort {
                     self.transition(Event::Fail)?;
                     self.services.routes.retire(&self.record).await?;
@@ -258,6 +301,32 @@ impl Controller {
                 return self.sync().await;
             }
         }
+        for reference in services
+            .store
+            .capture_references(&staged)?
+            .into_iter()
+            .filter(|a| {
+                storage != adx_core::lifecycle::CheckpointStorage::Local || a.storage == "local"
+            })
+        {
+            if !self.record.execution_artifacts.contains(&reference) {
+                self.record.execution_artifacts.push(reference);
+            }
+        }
+        self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
+        match self.sync().await {
+            Ok(result) if result.durability == Durability::Published => {}
+            _ => {
+                services
+                    .cooperation
+                    .abort_unstarted(&self.record, &request.operation_id)
+                    .await?;
+                return Err(Error::Unavailable(
+                    "capture input reservation publication pending".into(),
+                ));
+            }
+        }
+        self.capture_preparation = None;
         self.transition(Event::Pause)?;
         if let Err(error) = self.services.routes.retire(&self.record).await {
             let abort = services
@@ -265,6 +334,7 @@ impl Controller {
                 .abort_unstarted(&self.record, &request.operation_id)
                 .await;
             services.store.discard_staged(&staged).await?;
+            self.capture_preparation = None;
             if let Err(abort) = abort {
                 self.transition(Event::Fail)?;
                 self.sync().await?;
@@ -299,6 +369,7 @@ impl Controller {
             self.sync().await?;
             cleanup?;
             services.store.discard_staged(&staged).await?;
+            self.capture_preparation = None;
             return Err(error);
         }
         // Checkpoint success confirms the artifact, not completion of the backend's
@@ -313,6 +384,8 @@ impl Controller {
             control.retire(&self.record);
         }
         self.recovery_files = None;
+        self.execution_files.clear();
+        self.record.execution_artifacts.clear();
         self.release_capacity()?;
         self.record.runtime.ip = None;
         let artifact = match services.store.publish_with_policy(&staged, storage).await {
@@ -331,6 +404,7 @@ impl Controller {
                 if let Some(old) = self.record.checkpoint.take() {
                     self.obsolete_checkpoints.push(old.artifact);
                 }
+                self.record.snapshot_source = None;
                 self.record.checkpoint = Some(RestorePoint {
                     origin: None,
                     id: request.operation_id.clone(),
@@ -339,13 +413,14 @@ impl Controller {
                     source_runtime_id: self.record.runtime.id.clone(),
                 });
                 self.transition(Event::Checkpointed)?;
-                let artifact = &self
+                let artifact = self
                     .record
                     .checkpoint
                     .as_ref()
                     .ok_or(Error::Conflict)?
-                    .artifact;
-                let path = services.store.materialize(artifact).await?;
+                    .artifact
+                    .clone();
+                let path = services.store.prepare_restore(&artifact).await?;
                 let rollback = self.restore_execution(&path).await;
                 if self.held
                     && (rollback.is_err()
@@ -354,7 +429,7 @@ impl Controller {
                             .runtime
                             .retains_checkpoint_files(&self.record.spec.runtime_class))
                 {
-                    self.recovery_files = Some(path);
+                    self.hold_artifact(artifact.clone(), path);
                 }
                 if rollback.is_err() && self.record.state != EnvironmentState::Failed {
                     self.transition(Event::Fail)?;
@@ -367,6 +442,7 @@ impl Controller {
         if let Some(previous) = self.record.checkpoint.take() {
             self.obsolete_checkpoints.push(previous.artifact);
         }
+        self.record.snapshot_source = None;
         self.record.checkpoint = Some(RestorePoint {
             origin: None,
             id: request.operation_id.clone(),
@@ -400,8 +476,10 @@ impl Controller {
         } else {
             self.services.operation_timeout
         };
+        let restore_started = Instant::now();
         let attempt = tokio::time::timeout(initialization_timeout, async {
             self.services.readiness.expect_runtime(&self.record)?;
+            let runtime_started = Instant::now();
             self.record.runtime.ip = Some(
                 self.services
                     .runtime
@@ -414,12 +492,26 @@ impl Controller {
                         self.record
                             .checkpoint
                             .as_ref()
+                            .or(self.record.snapshot_source.as_ref())
                             .and_then(|cp| cp.origin.as_ref()),
                     )
                     .await?,
             );
+            let runtime_ms = runtime_started.elapsed().as_secs_f64() * 1_000.0;
+            let ready_started = Instant::now();
             self.services.readiness.wait_ready(&self.record).await?;
-            self.services.routes.activate(&self.record).await
+            let readiness_ms = ready_started.elapsed().as_secs_f64() * 1_000.0;
+            let route_started = Instant::now();
+            self.services.routes.activate(&self.record).await?;
+            adx_observability::info!(
+                event = "environment_restore_execution_stages",
+                environment_id = %self.record.spec.id, runtime_id = %self.record.runtime.id,
+                runtime_ms, readiness_ms,
+                route_activate_ms = route_started.elapsed().as_secs_f64() * 1_000.0,
+                total_ms = restore_started.elapsed().as_secs_f64() * 1_000.0,
+                "environment restore execution stages completed"
+            );
+            Ok(())
         })
         .await
         .unwrap_or_else(|_| {
@@ -448,15 +540,42 @@ impl Controller {
         self.transition(Event::Ready)?;
         Ok(())
     }
-    pub(super) async fn recover(&mut self, request: ResumeRequest) -> Result<OperationResult> {
+    pub(super) async fn recover(&mut self, mut request: ResumeRequest) -> Result<OperationResult> {
         if matches!(
             self.record.state,
             EnvironmentState::Failed | EnvironmentState::Deleted
         ) {
             return self.replay_or_sync().await;
         }
+        // A Coordinator retry can carry a newer published Paused progress
+        // revision. This generation's admitted operation keeps its original
+        // identity, including while its input hold or Running result awaits ack.
+        // Explicit resume still validates the caller's revision unchanged.
+        if let Some(operation) = self
+            .capture_preparation
+            .as_ref()
+            .map(|(operation, _)| operation)
+            .or(self.record.last_operation.as_ref())
+            .filter(|operation| {
+                operation.id == request.operation_id && operation.kind == LifecycleKind::Resume
+            })
+        {
+            if request.expected_revision != operation.expected_revision {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "checkpoint recovery operation reused",
+                        "environment_id": self.record.spec.id,
+                        "operation_id": request.operation_id,
+                        "progress_revision": request.expected_revision,
+                        "operation_expected_revision": operation.expected_revision,
+                    })
+                );
+            }
+            request.expected_revision = operation.expected_revision;
+        }
         let result = self.resume(request).await;
-        if matches!(result, Err(Error::NoCapacity)) {
+        if self.capture_preparation.is_some() || matches!(result, Err(Error::NoCapacity)) {
             return result;
         }
         if let Err(error) = &result {
@@ -485,13 +604,52 @@ impl Controller {
         if self.record.state != EnvironmentState::Paused {
             return Err(Error::Conflict);
         }
-        let cp = self.record.checkpoint.clone().ok_or(Error::Conflict)?;
+        let cp = self
+            .record
+            .checkpoint
+            .clone()
+            .or_else(|| self.record.snapshot_source.clone())
+            .ok_or(Error::Conflict)?;
         if cp.expired(now()?) {
             return Err(Error::Invalid("checkpoint expired".into()));
         }
         let services = self.services.checkpoint.clone().ok_or(Error::Conflict)?;
-        let path = services.store.materialize(&cp.artifact).await?;
+        let resume_started = Instant::now();
+        let prepare_started = Instant::now();
+        let path = services.store.prepare_restore(&cp.artifact).await?;
+        let prepare_restore_ms = prepare_started.elapsed().as_secs_f64() * 1_000.0;
+        let input_started = Instant::now();
+        let already_held = self.record.execution_artifacts.contains(&cp.artifact);
+        if !already_held {
+            self.capture_preparation = Some((
+                CompletedOperation {
+                    id: request.operation_id.clone(),
+                    expected_revision: request.expected_revision,
+                    kind: LifecycleKind::Resume,
+                },
+                path.to_path_buf(),
+            ));
+            self.record.execution_artifacts.push(cp.artifact.clone());
+            self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
+        }
+        if self.capture_preparation.is_some()
+            && self.sync().await?.durability != Durability::Published
+        {
+            return Err(Error::Unavailable(
+                "restore input publication pending".into(),
+            ));
+        }
+        self.capture_preparation = None;
+        let input_commit_ms = input_started.elapsed().as_secs_f64() * 1_000.0;
+        let execution_started = Instant::now();
         let restored = self.restore_execution(&path).await;
+        let restore_execution_ms = execution_started.elapsed().as_secs_f64() * 1_000.0;
+        if restored == Err(Error::NoCapacity) && !already_held {
+            self.record
+                .execution_artifacts
+                .retain(|a| a != &cp.artifact);
+            self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
+        }
         if self.held
             && (restored.is_err()
                 || self
@@ -499,7 +657,7 @@ impl Controller {
                     .runtime
                     .retains_checkpoint_files(&self.record.spec.runtime_class))
         {
-            self.recovery_files = Some(path);
+            self.hold_artifact(cp.artifact.clone(), path);
         }
         if let Err(error) = restored {
             if let Err(commit) = self.sync().await {
@@ -509,6 +667,16 @@ impl Controller {
             }
             return Err(error);
         }
+        if !already_held
+            && !self
+                .services
+                .runtime
+                .retains_checkpoint_files(&self.record.spec.runtime_class)
+        {
+            self.record
+                .execution_artifacts
+                .retain(|a| a != &cp.artifact);
+        }
         // Keep the artifact through commit: a lost result must never leave Redis
         // pointing at a deleted recovery point. Expiry/delete performs later cleanup.
         self.completed(
@@ -516,6 +684,17 @@ impl Controller {
             request.expected_revision,
             LifecycleKind::Resume,
         );
-        self.sync().await
+        let commit_started = Instant::now();
+        let result = self.sync().await;
+        adx_observability::info!(
+            event = "environment_resume_stages",
+            environment_id = %self.record.spec.id, runtime_id = %self.record.runtime.id,
+            prepare_restore_ms, input_commit_ms, restore_execution_ms,
+            result_commit_ms = commit_started.elapsed().as_secs_f64() * 1_000.0,
+            total_ms = resume_started.elapsed().as_secs_f64() * 1_000.0,
+            published = result.as_ref().is_ok_and(|result| result.durability == Durability::Published),
+            "environment resume stages completed"
+        );
+        result
     }
 }

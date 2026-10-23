@@ -106,7 +106,7 @@ message RegisterNodeRequest {
   string session_id = 8; // Unique for one Adxlet process lifetime.
   uint64 heartbeat_sequence = 9;
   bool reconciling = 10;
-  repeated string runtime_classes = 11; // Available classes discovered through sandboxd's UDS.
+  repeated string runtime_classes = 11; // Available classes reported by the configured runtime adapters.
   // Stable non-secret identities of configured shared checkpoint backends.
   repeated string checkpoint_scopes = 12;
 }
@@ -176,7 +176,7 @@ message CommitEnvironmentResponse { EnvironmentRecord record = 1; }
 
 message InspectNodeRequest { string node_id = 1; string session_id = 2; }
 
-message InspectNodeResponse { repeated EnvironmentRecord records = 1; uint64 coordinator_epoch = 2; repeated ReusableSnapshot snapshots = 3; repeated RestorePoint retained_checkpoints = 4; }
+message InspectNodeResponse { repeated EnvironmentRecord records = 1; uint64 coordinator_epoch = 2; repeated ReusableSnapshot snapshots = 3; repeated CheckpointArtifact retained_artifacts = 4; }
 
 message PauseEnvironmentRequest { Assignment assignment = 1; CallerContext caller = 2; string operation_id = 3; uint64 expected_revision = 4; reserved 5; uint64 timeout_seconds = 6; RetentionPolicy retention = 7; optional uint64 expiry_revision = 8; string node_session_id = 9; }
 

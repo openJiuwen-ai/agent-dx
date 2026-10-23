@@ -1,5 +1,5 @@
 #![cfg(feature = "agent-api")]
-use data_plane_gateway::ingress::jiuwen::{
+use data_plane_gateway::ingress::digitalmategateway::{
     protocol::Request,
     response::Response,
     session::{Session, SessionLimits},

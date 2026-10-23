@@ -97,4 +97,8 @@ for backend limits on files belonging to running Runtimes.
 
 Coordinator examples enable `autoscaling_listen: 127.0.0.1:19092` for direct HTTP queue, node admission and node Environment queries. This endpoint has no authentication or authorization checks. See [Coordinator autoscaling HTTP](../../../docs/deployment/coordinator-autoscaling.md) for request and shutdown semantics.
 
-For S3-compatible checkpoint storage, replace `checkpoint_dir` with the `checkpoint_storage` object in the [checkpoint storage example](../../../docs/testing/snapshot-storage.md#配置). Its optional `cache_max_entries` and `cache_budget_bytes` default to 500 and 53,687,091,200 (50 GiB). They bound reusable local copies; restore downloads and runtime-owned files can exceed those cache limits and still require real free disk space.
+For S3-compatible, AFS, or JuiceFS checkpoint storage, replace `checkpoint_dir` with the `checkpoint_storage` object in the [checkpoint storage example](../../../docs/testing/snapshot-storage.md). Its optional `cache_max_entries` and `cache_budget_bytes` default to 500 and 53,687,091,200 (50 GiB). They bound reusable local copies; restore downloads and runtime-owned files can exceed those cache limits and still require real free disk space.
+
+Configure matching `checkpoint_reclaimers` on Coordinator for every shared storage alias. Coordinator deletes shared objects/directories; adxlet only manages local files and cache eviction. AFS requires the same DFS namespace mounted on Coordinator and workers.
+
+`node-jiuwenbox.json` 是 Jiuwenbox／Conch 的 adxlet 配置示例；替换 EROFS SHA256、Conch socket、镜像绑定和证书路径后使用。Linux 前置条件、配置语义及未完成的运行时验收见 [Jiuwenbox P0](../../../docs/testing/jiuwenbox-runtime.md)。

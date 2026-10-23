@@ -24,6 +24,7 @@ macro_rules! execd_error {
 
 mod activity;
 mod bash;
+mod checkpoint_handoff;
 mod checkpoint_socket;
 pub(crate) mod child_env;
 mod cmd;
@@ -34,6 +35,7 @@ pub mod control_stream;
 mod dispatch;
 mod entrypoint;
 mod envd;
+mod file_search;
 mod fs;
 mod httpserver;
 mod probes;

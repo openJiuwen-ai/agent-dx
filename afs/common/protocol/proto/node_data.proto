@@ -79,6 +79,10 @@ message DfsPutReplicaHeader {
 enum DfsDigestAlgorithm {
   DFS_DIGEST_ALGORITHM_UNSPECIFIED = 0;
   DFS_DIGEST_ALGORITHM_BLAKE3 = 1;
+  // Descriptor binding of a versioned CRC32C segment table; not a body hash.
+  DFS_DIGEST_ALGORITHM_CRC32C_SEGMENTS_V1 = 2;
+  // CRC32C of the exact returned range, after storage segment verification.
+  DFS_DIGEST_ALGORITHM_CRC32C = 3;
 }
 
 message DfsStorageDevice {
@@ -222,6 +226,7 @@ message DfsReadRangesHeader {
   // The encoded version/length/root header and parent CVs are bounded to 8192
   // bytes for a 4MiB object. This never expands the granted body range.
   bytes blake3_outboard = 8;
+  bytes crc32c_table = 9;
 }
 
 message DfsReadRangesCompletion {
@@ -232,6 +237,8 @@ message DfsReadRangesCompletion {
   uint64 transferred_bytes = 5;
   bytes range_checksum = 6;
   DfsDigestAlgorithm range_checksum_algorithm = 7;
+  // RDMA carries the small CRC descriptor with its completion, outside the MR.
+  bytes crc32c_table = 8;
 }
 
 message DfsReadRangesFrame {

@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?,
     );
     let activator = Arc::new(Activator::with_cache(
-        AgentState::new(store).with_deployment_credentials()?,
+        AgentState::new(store),
         environment,
         settings.binding_cache,
     )?);

@@ -35,6 +35,11 @@ def has_labels(node, expected):
     return False
 
 
+def contains_expression(tree, expression):
+    expected = ast.dump(ast.parse(expression, mode='eval').body)
+    return any(ast.dump(node) == expected for node in ast.walk(tree))
+
+
 class FirecrackerEvidenceTests(unittest.TestCase):
     def test_rootfs_build_applies_envd_config_and_keeps_plain_rootfs(self):
         spec = importlib.util.spec_from_file_location('runtime_rootfs', ROOT.parent / 'runtime/rootfs.py')
@@ -138,10 +143,10 @@ class FirecrackerEvidenceTests(unittest.TestCase):
             runtime_id({'state': 'Running', 'runtime_id': 'legacy-backend'})
 
     def test_entrypoint_case_uses_the_execd_terminal_status_contract(self):
-        source = (ROOT / 'firecracker/sdk_checkpoint.py').read_text()
-        self.assertIn("entrypoint_info['status_kind'] == 'exited'", source)
-        self.assertIn("entrypoint_info['exit_code'] == 7", source)
-        self.assertNotIn("entrypoint_info['status_kind'] == 'exit_code'", source)
+        tree = ast.parse((ROOT / 'firecracker/sdk_checkpoint.py').read_text())
+        self.assertTrue(contains_expression(tree, "entrypoint_info['status_kind'] == 'exited'"))
+        self.assertTrue(contains_expression(tree, "entrypoint_info['exit_code'] == 7"))
+        self.assertFalse(contains_expression(tree, "entrypoint_info['status_kind'] == 'exit_code'"))
 
     def test_paused_restart_targets_the_selected_instance(self):
         checkpoint = (ROOT / 'firecracker/sdk_checkpoint.py').read_text()
@@ -164,7 +169,8 @@ class FirecrackerEvidenceTests(unittest.TestCase):
 
     def test_runtime_network_policy_uses_a_fresh_execution(self):
         source = (ROOT / 'firecracker/sdk_checkpoint.py').read_text()
-        assignments = [node for node in ast.walk(ast.parse(source)) if creates_environment(node)]
+        tree = ast.parse(source)
+        assignments = [node for node in ast.walk(tree) if creates_environment(node)]
         network_case = next(
             node.lineno
             for node in assignments
@@ -172,18 +178,22 @@ class FirecrackerEvidenceTests(unittest.TestCase):
         )
         checkpoint_case = next(node.lineno for node in assignments if has_labels(node, {'app': 'checkpoint-source'}))
         self.assertLess(network_case, checkpoint_case)
-        self.assertIn('networked.update_network_policy(NetworkPolicy.block())', source)
-        self.assertIn('networked.update_network_policy(None)', source)
-        self.assertIn("os.environ['ADX_FC_EGRESS_PROBE_HOST']", source)
-        self.assertIn('/bin/bash', source)
-        self.assertIn('/dev/tcp/', source)
-        self.assertIn('[[ "$line" == HTTP/* ]]', source)
-        self.assertNotIn('/bin/busybox', source)
-        self.assertNotIn('nc -z', source)
+        self.assertTrue(contains_expression(tree, 'networked.update_network_policy(NetworkPolicy.block())'))
+        self.assertTrue(contains_expression(tree, 'networked.update_network_policy(None)'))
+        self.assertTrue(contains_expression(tree, "os.environ['ADX_FC_EGRESS_PROBE_HOST']"))
+        strings = '\n'.join(
+            node.value for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        )
+        self.assertIn('/bin/bash', strings)
+        self.assertIn('/dev/tcp/', strings)
+        self.assertIn('[[ "$line" == HTTP/* ]]', strings)
+        self.assertNotIn('/bin/busybox', strings)
+        self.assertNotIn('nc -z', strings)
         fixture = (ROOT / 'firecracker/node.py').read_text()
         canonical = ast.unparse(ast.parse(fixture))
         self.assertIn("probe_namespace = 'adx-probe-' + suffix", canonical)
-        self.assertIn("'198.18.0.2/30'", fixture)
+        self.assertTrue(contains_expression(ast.parse(fixture), "'198.18.0.2/30'"))
         self.assertIn("_executable('ip'), 'netns', 'delete', probe_namespace", canonical)
 
     def test_runtime_profile_uses_local_erofs_for_vm_and_pinned_oci_for_kubernetes(self):
@@ -360,8 +370,7 @@ class FirecrackerEvidenceTests(unittest.TestCase):
             )
             orphan_checks = (
                 'passed',
-                'current_session_preserved',
-                'retired_session_removed',
+                'coordinator_collected',
                 'foreign_preserved',
                 'unmarked_preserved',
             )

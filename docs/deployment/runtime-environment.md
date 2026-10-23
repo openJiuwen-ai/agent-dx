@@ -84,3 +84,10 @@ Kata 的 PTY 同样由 guest 内的 Execd 分配。adxlet 在 Kata 创建请求�
 使用 EROFS 配置的节点必须支持从普通文件创建只读 loop 设备并实际挂载 EROFS。`/proc/filesystems` 中出现 `erofs` 只表示驱动已登记，不足以证明该内核构建和设备路径可用；对应 preflight 会对发布包内制品执行一次真实挂载和卸载。OCI 配置不要求 EROFS，仍要求 sandboxd 能访问并解析配置的 digest 引用。Buildkite K8s 验收使用 OCI 模式；本地与 standalone 验证继续覆盖 EROFS 模式。
 
 真实 runc 启动、双节点 SDK 和 PID 1 回收结果见 [本地验证记录](../testing/2026-09-17-runtime-environment.md)；OCI 三种模式及八组 Kubernetes 结果见 [Buildkite #30 正式验收](../testing/2026-09-18-runtime-environment-k8s.md)。
+
+Jiuwenbox 的 Supervisor／Conch 节点盘点只读取后端清单和 cgroup 状态，不获取沙箱操作锁，
+也不执行资源清理。Execd 身份、健康检查和已知执行的清理由各 Environment 的串行工作处理。
+底层创建、删除任务在调用方超时或取消后仍保留执行记录和操作互斥，直到实际操作结束。
+启动恢复先排空未完成执行；无法关联 Environment 的原生资源通过独立的权威恢复步骤清理。
+未知归属、后端清单不可读或不完整时仍关闭节点准入，不能以空清单代替。后端部署约束见
+[Jiuwenbox 配置](../testing/jiuwenbox-runtime.md#启动和配置)。

@@ -71,6 +71,40 @@ class OpenApiContractTests(unittest.TestCase):
                 self.assertEqual(openapi_check.payload_errors(self.data, 'InvokeResult', response), [])
         self.assertTrue(openapi_check.payload_errors(self.data, 'CommandRecord', {'command_id': 'cmd', 'pid': 'wrong'}))
 
+    def test_file_search_request_covers_defaults_and_runtime_limits(self):
+        for args in (
+            {'path': '/workspace'},
+            {'path': '/workspace', 'pattern': '*.py', 'exclude_patterns': ['*/.git/*'],
+             'depth': 64, 'max_results': 10000, 'max_entries': 1000000, 'timeout_ms': 30000},
+        ):
+            with self.subTest(args=args):
+                self.assertEqual(openapi_check.payload_errors(
+                    self.data, 'InvokeRequest', {'action': 'file.search', 'args': args}), [])
+        for change in (
+            {'path': ''}, {'pattern': 1}, {'exclude_patterns': ['*'] * 65},
+            {'exclude_patterns': [None]}, {'depth': 0}, {'depth': 65},
+            {'max_results': 10001}, {'max_entries': 1000001},
+            {'timeout_ms': 0}, {'timeout_ms': 30001},
+        ):
+            with self.subTest(change=change):
+                self.assertTrue(openapi_check.payload_errors(
+                    self.data, 'InvokeRequest',
+                    {'action': 'file.search', 'args': {'path': '/workspace', **change}}))
+
+    def test_file_search_response_preserves_scanned_count_and_atomic_errors(self):
+        for result in (
+            {'entries': [], 'scanned_entries': 0, 'error': None},
+            {'entries': [], 'error_code': 'RESOURCE_EXHAUSTED',
+             'error': 'file search max_results exceeded; narrow the search'},
+        ):
+            with self.subTest(result=result):
+                self.assertEqual(openapi_check.payload_errors(self.data, 'FileSearchResult', result), [])
+                self.assertEqual(openapi_check.payload_errors(self.data, 'InvokeResult', result), [])
+        self.assertTrue(openapi_check.payload_errors(
+            self.data, 'FileSearchResult', {'entries': [], 'scanned_entries': -1, 'error': None}))
+        self.assertTrue(openapi_check.payload_errors(
+            self.data, 'FileSearchResult', {'entries': [], 'error': None}))
+
     def test_sdk_nullable_overrides_and_shell_timeout_are_supported(self):
         for request in (
             {'action': 'process.exec', 'args': {'cmd': 'pwd', 'cwd': None, 'envs': None, 'timeout': 5}},

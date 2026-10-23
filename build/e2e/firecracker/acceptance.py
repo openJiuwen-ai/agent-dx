@@ -13,7 +13,7 @@ CASES = {
         'inherited image entrypoint reports structured exit status',
         'pause with persisted recovery point',
         'Adxlet restart while paused',
-        'remote orphan GC preserves registered checkpoint',
+        'Coordinator reclaims abandoned capture and preserves registered checkpoint',
         'SDK labels peer affinity and ordered weighted placement',
         'resume preserves process memory, PID and binary file',
         'reload restores the latest recovery point without a cold start',
@@ -23,6 +23,7 @@ CASES = {
         'reusable snapshot preserves running source',
         'snapshot remains queryable after source deletion',
         'snapshot deletion accepted for artifact collection',
+        'snapshot deletion rejected while clones use snapshot',
         'snapshot clones inherit geometry and preserve process memory',
         'snapshot clones have independent identity and writable files',
         'clones pause resume and delete after snapshot collection',
@@ -63,8 +64,7 @@ def verify(root):
     orphan = json.loads((root / 'orphan-gc.json').read_text())
     orphan_checks = (
         'passed',
-        'current_session_preserved',
-        'retired_session_removed',
+        'coordinator_collected',
         'foreign_preserved',
         'unmarked_preserved',
     )

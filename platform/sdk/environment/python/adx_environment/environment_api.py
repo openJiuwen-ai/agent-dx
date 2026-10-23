@@ -334,6 +334,8 @@ class Environment:
         create_timeout: Optional[int] = None,
         connection: Optional[ConnectionConfig] = None,
         extra_config: Optional[Dict[str, Any]] = None,
+        user: Optional[str] = None,
+        group: Optional[str] = None,
         _snapshot_resource_fields: Optional[frozenset[str]] = None,
     ):
         """Create a new environment.
@@ -345,6 +347,10 @@ class Environment:
                 ``readonly`` default. Omitting it inherits the deployment
                 setting, including when replacing the source with *image* or
                 *rootfs*.
+            user: Tool runtime POSIX user name or decimal UID; requires group.
+                Supported by Conch; unsupported runtimes fail explicitly.
+            group: Tool runtime POSIX group name or decimal GID. Cannot combine
+                with an inherited entrypoint or a snapshot identity override.
             runtime: Environment isolation runtime identifier. Defaults to
                 ``runsc`` and is validated by the runtime layer.
             cpu: CPU scheduling request in milli-cores (default 1000).
@@ -424,6 +430,19 @@ class Environment:
             raise TypeError("rootfs_readonly must be a boolean or None")
         if snapshot_id is not None and (not isinstance(snapshot_id, str) or not snapshot_id.strip()):
             raise ValueError("snapshot_id must be a non-empty string")
+        if (user is None) != (group is None):
+            raise ValueError("user and group must both be configured")
+        if user is not None:
+            identity_error = "user/group require a POSIX name or numeric ID below 4294967295"
+            for identity in (user, group):
+                if not isinstance(identity, str) or not identity or len(identity) > 256:
+                    raise ValueError(identity_error)
+                if not all(c.isascii() and (c.isalnum() or c in "_-.") for c in identity):
+                    raise ValueError(identity_error)
+                if identity.isdecimal() and int(identity) >= 4294967295:
+                    raise ValueError(identity_error)
+            if inherit_entrypoint or snapshot_id is not None:
+                raise ValueError("tool identity cannot override an inherited entrypoint or snapshot")
         if not isinstance(failover, bool):
             raise TypeError("failover must be a boolean")
         if not isinstance(inherit_entrypoint, bool):
@@ -546,6 +565,9 @@ class Environment:
             if not isinstance(restart_policy, RestartPolicy):
                 raise TypeError("restart_policy must be a RestartPolicy")
             body["restartPolicy"] = restart_policy.to_dict()
+        if user is not None:
+            body["user"] = user
+            body["group"] = group
         if cwd is not None:
             body["cwd"] = cwd
         if inherit_entrypoint:
@@ -1035,7 +1057,8 @@ class Environment:
         """Atomically replace this environment's complete network policy.
 
         Passing None or an empty NetworkPolicy clears the policy and restores
-        unrestricted networking.
+        unrestricted networking. After acknowledgement, this client's active
+        tunnel reconnects asynchronously to refresh connection tracking.
         """
         if policy is not None and not isinstance(policy, NetworkPolicy):
             raise TypeError("policy must be a NetworkPolicy or None")
@@ -1045,6 +1068,9 @@ class Environment:
         result = self._client.update_network_policy(self._sid, body)
         if not bool(result.get("success", False)):
             raise EnvironmentError("network policy update was not acknowledged")
+        tunnel = getattr(self, "_tunnel_client", None)
+        if tunnel is not None:
+            tunnel.reconnect()
 
     def _close(self, *, delete_remote: bool) -> None:
         if self._closed:

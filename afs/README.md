@@ -8,6 +8,8 @@ OwnerFs 与 DistributedFs（DFS）两种文件访问模式。`afs-meta` 管理�
 
 AFS 默认不进入普通 ADX 构建和发布包；通过 `ADX_WITH_AFS=1` 显式启用。
 当前部署必须使用 mTLS，并把每张受信节点证书精确绑定到一个 Node ID。
+DFS Peer 客户端允许接收 128 KiB HTTP/2 DATA 帧；业务消息、流控窗口、正文预算、
+并发和校验合同保持不变，对端仍可发送更小的帧。
 
 ![AFS 架构总览](../assets/architecture/afs.svg)
 
@@ -33,7 +35,13 @@ FUSE 依赖使用根工作区声明的官方固定 `fuser =0.18.0`。
 - `fs = "dfs"`：已提交数据以不可变 chunk/FileVersion 表示，适合一写多读。
 - `fs = "all"`：同一进程启用两种模式，但挂载、状态机和验收结论仍相互独立。
 
-Meta 推荐使用 `local-file` 持久后端。`memory` 仅适合一次性演示；etcd、Redis、
+本工作树 local-file 的操作日志格式、旧目录拒绝及尚未完成的回收限制见
+[Meta 部署合同](../docs/deployment/afs.md#meta-操作日志与数据目录)。
+
+历史结果／watch 有界不表示全部权威实体有界：旧 NodeSession 拒绝记录、未完成及失败
+命令仍保留；安全回收范围和限制见上述部署合同。
+
+Meta 默认使用唯一持久后端 `local-file`。`memory` 仅适合一次性演示；etcd／Redis适配已移除，
 多 Meta/HA、完整 POSIX、跨节点文件锁、复杂故障矩阵和性能达标不在当前承诺内。
 Operator 负责创建 namespace/root grant、配置挂载和回收引用；Environment 创建尚不会
 自动 provision/mount/reclaim AFS。
@@ -91,6 +99,12 @@ SHM 的 memfd、sealing 与原子 CLOEXEC FD 传递实现及对应运行测试�
 
 历史来源不自动构成当前候选版本的运行结论。所有功能、性能和交付状态必须以
 当前 Agent DX 源码、二进制和对应 Linux 证据登记。
+
+## 原生DFS CRC写入与GC保护
+
+原生DFS Node默认采用独立ID＋32KiB分段CRC32C及写入代次GC保护，保留capability本地化，省略逐chunk Meta登记。多副本写、跨节点范围读和正常副本修复保持原复制/授权/持久化合同；FullSync在相关代次有效时原子发布，无关GC变化不导致失败。CRC用于意外损坏检测，不提供Bao密码学证明或内容去重。S3仍走原路径，本次不提供旧版本兼容/迁移。
+
+限定Linux验收覆盖1GiB、两份同步副本、正常修复至三份，以及空节点远端完整读回；不等于物理故障域、RDMA硬件或HA验证。配置和复现命令见[部署说明](../docs/deployment/afs.md#原生dfs分段crc32c与写入代次保护)与[验收合同](../docs/testing/afs.md#1gib多副本跨节点读与正常修复)。下述可选BLAKE3磁盘缓存不用于CRC对象。
 
 ## 原生 DFS 可选磁盘读缓存
 

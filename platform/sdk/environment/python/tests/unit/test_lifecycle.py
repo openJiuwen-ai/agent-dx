@@ -2,7 +2,7 @@ import gc
 import inspect
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, call, patch
 
 import adx_environment
 from adx_environment import ConnectionConfig, Environment
@@ -518,6 +518,37 @@ class LifecycleTests(unittest.TestCase):
         environment._closed = True
         with self.assertRaises(RuntimeError):
             environment.update_network_policy(None)
+
+    def test_network_update_reconnects_owned_tunnel_only_after_success(self):
+        for outcome in ("success", "unacknowledged", "transport-error"):
+            with self.subTest(outcome=outcome):
+                self.check_network_update_reconnect(outcome)
+
+    def check_network_update_reconnect(self, outcome):
+        client = Mock()
+        client.create_info.return_value = {"environmentId": "environment-1", "status": "running"}
+        client.update_network_policy.return_value = {"success": outcome == "success"}
+        if outcome == "transport-error":
+            client.update_network_policy.side_effect = OSError("connection lost")
+        tunnel = Mock()
+        tunnel.start.return_value = True
+        events = Mock()
+        events.attach_mock(client.update_network_policy, "update")
+        events.attach_mock(tunnel.reconnect, "reconnect")
+        connection = ConnectionConfig(server_address="localhost:8889", token="test", use_tls=False)
+        with (
+            patch("adx_environment.environment_api.EnvironmentClient", return_value=client),
+            patch("adx_environment.tunnel_client.TunnelClient", return_value=tunnel),
+            Environment(image="test", upstream="127.0.0.1:9000", connection=connection, detached=True) as environment,
+        ):
+            if outcome == "success":
+                environment.update_network_policy(None)
+                self.assertEqual(events.mock_calls, [call.update("environment-1", {}), call.reconnect()])
+            else:
+                error = OSError if outcome == "transport-error" else adx_environment.EnvironmentError
+                with self.assertRaises(error):
+                    environment.update_network_policy(None)
+                self.assertEqual(events.mock_calls, [call.update("environment-1", {})])
 
 
 if __name__ == "__main__":

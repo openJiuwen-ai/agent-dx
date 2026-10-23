@@ -95,9 +95,16 @@ async fn proxy_one_connection(
         tokio::spawn(async move { tokio::io::copy(&mut upstream_read, &mut client_write).await });
     let mut blocked = Some(blocked);
     while let Ok((request, arguments)) = read_request(&mut client_read).await {
+        // EVAL lists its key count before KEYS and ARGV. Match ARGV[3]
+        // independently of how many keys the native CAS updates atomically.
+        let environment_argument = arguments
+            .get(2)
+            .and_then(|value| std::str::from_utf8(value).ok())
+            .and_then(|value| value.parse::<usize>().ok())
+            .and_then(|keys| keys.checked_add(5));
         let is_target = arguments.first().is_some_and(|value| value == b"EVAL")
-            && arguments
-                .get(6)
+            && environment_argument
+                .and_then(|index| arguments.get(index))
                 .is_some_and(|value| value == environment_field.as_bytes());
         if is_target && armed.swap(false, Ordering::SeqCst) {
             let _ = blocked.take().expect("one intercept").send(());

@@ -23,6 +23,7 @@ pub fn router(meta: Arc<Meta>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/v1/ping", get(ping))
+        .route("/v1/store", get(store_statistics))
         .route("/v1/roots/{root_id}", get(root_location))
         .route(
             "/v1/dfs/chunks/{chunk_id}/replication",
@@ -30,6 +31,21 @@ pub fn router(meta: Arc<Meta>) -> Router {
         )
         .route("/metrics", get(metrics))
         .with_state(meta)
+}
+async fn store_statistics(
+    State(meta): State<Arc<Meta>>,
+) -> Result<Json<Value>, crate::error::RestError> {
+    let store = meta
+        .store
+        .as_deref()
+        .ok_or_else(|| crate::error::RestError(unavailable_meta_store()))?;
+    let view = store.read_view().await?;
+    let mut statistics = view.statistics()?;
+    let snapshot = view.read(MetaRead::DfsGc).await?;
+    if let Some(MetaEntity::DfsGc(gc)) = snapshot.entity {
+        statistics["gc"] = json!({"generation":gc.generation,"pending_chunks":gc.chunks.len(),"waiting_nodes":gc.waiting_nodes});
+    }
+    Ok(Json(statistics))
 }
 async fn health(State(meta): State<Arc<Meta>>) -> Result<Json<Value>, crate::error::RestError> {
     let store = meta

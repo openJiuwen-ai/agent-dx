@@ -69,6 +69,9 @@ def build(binary, output, busybox=Path('/usr/bin/busybox'), envd=None):
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='adx-runtime-') as temporary:
         root = Path(temporary)
+        # EROFS preserves the source root mode; mkdtemp defaults to 0700.
+        # The immutable payload must also be executable by non-root workloads.
+        root.chmod(0o755)
         for name in (
             'usr/bin',
             'usr/local/bin',
@@ -127,6 +130,11 @@ def build(binary, output, busybox=Path('/usr/bin/busybox'), envd=None):
         if certs.is_file():
             (root / 'etc/ssl/certs').mkdir(parents=True)
             shutil.copyfile(certs, root / 'etc/ssl/certs/ca-certificates.crt')
+        # mkdir applies the builder's umask to intermediate directories too.
+        # Normalize the staged tree without following its absolute guest symlinks.
+        for directory, _, _ in os.walk(root, followlinks=False):
+            path = Path(directory)
+            path.chmod(0o1777 if path in (root / 'tmp', root / 'var/tmp') else 0o755)
         subprocess.run([_executable('mkfs.erofs'), '-E', 'noinline_data', str(output), str(root)], check=True)
         subprocess.run([_executable('fsck.erofs'), str(output)], check=True)
 

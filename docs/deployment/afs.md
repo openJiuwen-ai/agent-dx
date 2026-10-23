@@ -24,10 +24,111 @@ Meta 后端优先级：
 
 1. `memory`：一次性演示，重启不保留状态；
 2. `local-file`：当前可靠性基线，中心节点可正常重启恢复；
-3. `etcd`：资源和可靠性专题后置；
-4. `redis`：最低优先级，后置。
+etcd／Redis适配已移除；未来支持需重新设计和验收，不是当前可选后端。
 
-当前试用建议使用 `local-file`。发布包内 `etc/examples/afs/meta.toml` 已显式设置 `meta_store = "local-file"`，并把 Meta 状态放在 `/opt/adx/data/afs/meta`，避免因代码默认值误连 etcd。使用 `memory` 时，验收报告必须明确“Meta 重启后不保留状态”。
+当前默认使用 `local-file`。发布包内 `etc/examples/afs/meta.toml` 已显式设置 `meta_store = "local-file"`，并把 Meta 状态放在 `/opt/adx/data/afs/meta`，固定可恢复路径身份。使用 `memory` 时，验收报告必须明确“Meta 重启后不保留状态”。
+
+### Meta 操作日志与数据目录
+
+本工作树显式选择 `local-file` 时，Meta 在 `data_dir/meta-store/` 使用
+`IDENTITY`、恢复清单 `CURRENT` 及操作日志 `wal-<首记录序号>.log`；
+首段为 `wal-00000000000000000001.log`，安全回收后不要求首段仍存在。`memory` 使用同一记录合同，
+但仅驻内存，重启丢失。每笔记录保存已决定的变化和原结果，持久批次确认后才发布可见状态。
+恢复、身份／完整性检查以及恢复屏障完成前，不绑定 gRPC／REST 端口。
+
+首次初始化先持久化空 `INITIALIZING` 标记，再依次安装身份、空 WAL 和初始 CURRENT，
+最后移除标记并同步目录，完成前不接纳业务。仅可识别的未完成初始化前缀允许继续。
+已初始化目录缺 CURRENT，或目录中有清单及退休集未列出的非空 WAL，均拒绝启动；
+单个空预备段须核对身份、头校验和与恢复 tip。整目录被一致回滚且无外部见证不在检测能力内。
+
+**此格式不导入旧 JSON `snapshot`／`wal`。** 非空旧目录会明确拒绝，原文件保留；
+不得删除旧文件试图启动，也不得原地把旧格式当成新格式。试用本工作树需指定独立的新数据目录。
+
+三个有限上限可由同名 TOML 字段或 `--meta-…-bytes` CLI 配置（CLI 优先）：
+
+| TOML 字段 | 默认字节 | 边界 |
+| --- | ---: | --- |
+| `meta_record_max_bytes` | 67108864 | 含信封、结果、hash／CRC 的单帧上限，至少256、不超过u32范围 |
+| `meta_batch_max_bytes` | 134217728 | 同批完整帧总字节，不小于单帧上限 |
+| `meta_wal_max_bytes` | 1073741824 | 含4096字节头的日志总量，剩余容量须能容纳最大批次 |
+
+单记录还受独立的共享向量容量限制：实体池、变更、原结果及epoch向量共用原合计
+262144槽与按类型宽度计算的结构字节上限。写入与恢复采用同一容量规则，不能把
+可用编码字节等同于可接纳的条目数，也不能把结构额度当作进程RSS保证。
+超限整笔在追加／发布前拒绝，不拆成多个可见提交。
+已知WAL额度不足时最多等待5s并唤醒快照；
+等待期间准备结果不对外可见，超时返回不可用且不追加。真正追加后的错误仍失败关闭，
+由重启确认原结果，不能按错误码猜测是否已写入。5s不包含前方请求的队列等待。
+本工作树已有内部显式 checkpoint 安装和重启恢复：`CURRENT` 记录当前／上一恢复点、
+所需连续日志段及已退休对象。快照绑定原 store／cluster／incarnation、位置和完整摘要；
+恢复只应用后续记录。段按64MiB软目标轮转，完整批次不跨段拆开，合法大批次可超过软目标。
+WAL硬上限同时计入保留、待删除和已准备的孤立日志文件，文件数内部上限64。
+只有两个保留恢复点都不再需要的封口段，才可在CURRENT持久切换后删除；活跃段不删。
+删除中断可按退休清单接续；损坏或外来退休文件保留并继续占额度，不盲删。
+
+当前CURRENT内部格式为v2，最大64KiB；WAL记录信封为v2，状态image为schema2。
+不提供早期实验v1清单／记录或schema1 image的自动导入；格式不匹配时拒绝恢复，
+保留原目录及证据，不能手改格式或拼接目录。管理记录可推进日志位置而不改变业务revision。
+canonical路径已接入历史计账和运行时清理。请求结果及事件历史可通过
+[操作日志策略参数](#meta-操作日志有限策略)配置；下表列默认值，待处理输入与准备身份仍为内部边界：
+
+| 对象 | 内部边界 | 达界行为 |
+| --- | --- | --- |
+| 原请求结果 | 100万条、256MiB owned逻辑计账、24h | 时间／容量任一先到即确定淘汰，持久后发布；原完成时间不延长 |
+| 事件历史 | 100万条、64MiB owned逻辑计账、1h | 按完整revision前缀推进持久水位，旧游标返回Compacted |
+| 待处理Meta输入 | 1024排队槽及128MiB owned逻辑额度 | 满时在追加／发布前明确拒绝；调用者取消不提前退写者持有额度 |
+| 在途／准备／退休身份保护集 | 1088身份及4MiB逻辑额度 | 从入队保护至处理终态，取消不提前退账；退休冲突在入队前拒绝，不豁免历史总额 |
+
+历史树根另计固定64KiB结构预留；每次清理最多4096个请求身份／完整revision组。
+定时轮询默认1s，持续请求不会重置到期时间；前方持久I/O仍可能延迟实际执行，
+不承诺严格墙钟可见时限。历史字节含完整owned载荷、引用及结构预留，是逻辑上界计账，
+不是allocator统计或RSS保证，也不是Node写正文／S3预算。已淘汰身份在窗口外重试
+可能重新执行，仍受原业务条件和权限约束，不承诺永久exactly-once。未知持久结果
+触发失败关闭并禁止后续管理追加，由重启核对原记录。
+
+canonical读视图当前还有以下内部上限，尚未暴露为部署配置：
+
+| 项目 | 内部默认 | 计账／失效边界 |
+| --- | ---: | --- |
+| 同时持有视图 | 128 | 每个视图占一个槽，达界拒绝新视图，不阻塞权威提交 |
+| 固定状态持有字节 | 8GiB | 包含主实体与历史的owned容量及结构预留，按4KiB向上计费；同一State共享，跨代际保守全额计费 |
+| 视图期限／回收轮询 | 30s／100ms | 空闲过期视图主动解引用；执行中引用未结束不提前退账，过期结果报错 |
+
+8GiB是逻辑准入上限，不是预分配、RSS保证或Node正文额度。另有由视图数限制的
+有限登记元数据；不能用上述字节数代表整个Meta进程内存。过期或已知权威失败后须
+重新取视图。旧Snapshot后端已移除，不保留绕过此准入的旧读取路径。
+已返回的独立结果对象不在读视图计账内。watch取数和Meta自有响应队列还有独立内部上限：
+
+| 项目 | 内部默认 | 边界 |
+| --- | ---: | --- |
+| 单次watch响应 | 16384事件／16MiB owned计账 | 含64KiB基础预留；请求limit=0仍受限；完整revision不可拆开 |
+| Meta响应构建／流式队列 | 16槽／512MiB逻辑预留 | 每响应先预留32MiB，覆盖域批次与wire转换期间的共同持有；固定登记元数据的保守上界另为64KiB |
+| 响应期限／回收轮询 | 30s／100ms | 取数前准入；无人读取的已安装队列到期主动清空；仍在构建者退出前不退账 |
+
+响应超限时返回此前完整revision；首组本身超限返回容量错误，需恢复扫描或重新配置，
+不把容量不足伪造成Compacted。历史确实已压缩时仍按原游标重扫。过期流明确报错，
+调用者只能从最后完整处理的批次续接，不能因部分命令已收到就确认整组。
+wire计账核对实际Vec／String capacity，不采用protobuf编码长度。新建Meta不依赖运行时；
+首次异步准入才启动一个弱引用回收任务，不每响应创建计时任务。
+该额度约束Meta自有的构建和流式队列；一元poll返回值单批有界，返回后由调用方／
+公共RPC编码与流控持有。tonic/h2／socket缓冲及整个进程RSS不在此额度内。
+上表响应额度仍为内部默认；历史策略配置与固定指标已接线，最终资源及完整运行验收
+仍待完成，不能据这些软件回归宣称有界历史部署验收通过。
+LocalLog锁绑定创建进程，不能把fork继承的对象当成新写者；最后真实持有者释放锁，
+同进程clone或尚在执行的后台I/O仍保留锁。正常释放重开不改变持久化身份。
+
+内部checkpoint上限为单份编码1GiB、捕获逻辑计账2GiB、相关文件合计4GiB／8份；
+临时文件预留实际磁盘块，隔离证据至多2份。这些不是RSS保证，内部控制项尚未暴露为部署配置。
+后台初始软阈值为128MiB日志估计量、100万条记录或60s，轮询1s；段字节估计包含
+横跨快照位置的整个段，不是精确增量。观察期限30s，超过期限仍由原任务持有单飞及资源，
+不启动第二份。阈值／等待暂为内部策略，未提供管理RPC／CLI。
+
+**后台快照、有界等待、六点进程故障、运行时历史回收、canonical读视图和watch响应／队列约束已有有限回归；配置／指标已接线。正式资源及完整运行验收仍未完成，不能作为持续增长部署的完成版本。**
+安全回收删除两个保留恢复点均不再需要的封口段／退休镜像，并可在恢复链验证后回收
+未引用、身份及完整校验均有效的本库 checkpoint 镜像。损坏、未知和外来对象保留计账；
+不能通过无上限调大参数或手动删除日志解除压力。
+旧快照后端、etcd／Redis适配及其依赖已移除；不保留双写、旧格式导入或兼容feature。
+这些改动不表示已有 FUSE、物理掉电或性能验收自动适用于新格式。
 
 单机试用前先准备配置、数据、运行时、挂载目录和本机临时证书：
 
@@ -112,8 +213,8 @@ credentials_file = "/opt/adx/config/afs/s3-credentials.json"
 权限、数据同步落盘及数据库持久配置由管理员在服务端保证；HTTP 成功本身
 不能证明物理持久性。产品包不部署或打包 SeaweedFS、PostgreSQL 或 JuiceFS。
 
-Meta 的 `meta_store` 是另一项独立配置：程序默认 etcd，现有试用示例明确选择
-local-file。本接入不增加 PostgreSQL Meta，也不改变原默认或后端选择。
+Meta 的 `meta_store` 是独立配置：默认 `local-file`，也可显式选择易失的 `memory`。
+本接入不增加 PostgreSQL Meta。etcd／Redis 选项和连接字段已退役；旧数据需保留原二进制与原目录。
 对象 key 身份不允许变更后重新使用同一 Meta 数据目录；配置错误及 GET/PUT
 错误向调用方传播。正常停机仍需先排空工作负载和 FUSE 引用。
 
@@ -420,6 +521,8 @@ fsync依赖原持久副本与Meta屏障。S3原有窗口、载荷／descriptor�
 | `dfs_dirty_budget_bytes` | `67108864` | 4..64MiB，Node实际live正文capacity，含仍被持有的已上传正文 |
 | `dfs_unpublished_descriptors` | `1024` | 1..1024，且受固定4MiB元数据总额限制，不能靠增大计数绕过字节上限 |
 | `dfs_upload_inflight_chunks` | `8` | 1..8，整个Node的真实任务上限，共享live正文 |
+| `dfs_optimistic_gc_commit` | 随原生CRC新写默认`true` | 首次写入登记一次代次，省略逐chunk登记；FullSync只原子核对相关代次及session，无关GC变化不拒绝提交 |
+| `dfs_crc32c_writes` | 原生DFS Node为`true` | 独立ID＋32KiB分段CRC；支持原复制策略、跨节点读和副本修复。OwnerFs-only、Meta及外部后端缺省不启用 |
 | `dfs_background_commit_ms` | `5000` | 1..60000ms，后台发布调度周期，非严格可见时间 |
 
 优先级 CLI＞TOML＞默认，非法值启动报错；仅无外部后端的 DFS 接入此流水线。
@@ -483,8 +586,9 @@ dfs_read_diagnostics_enabled = true
 
 ## Meta 快照升级与回滚边界
 
-OwnerFs 与 DFS 共享 Meta store 的持久化机制，业务记录分开。当前每个持久化批次保存完整权威快照，
-DFS 状态增长也会增加共用 Meta 的快照处理成本；本次不改变该机制，不承诺增长成本已解决。
+OwnerFs 与 DFS 共享 canonical Meta 操作日志，业务记录分开。local-file 持久确认后才发布应答；
+后台检查点和历史退休沿用本文件的有限策略。旧 JSON/AFSD 快照、etcd、Redis 后端不再接入，
+升级／回滚必须使用匹配的二进制和完整数据目录，参见 [Meta 操作日志有限策略](#meta-操作日志有限策略)。
 
 本版本新增 DFS durability policy、外部对象回执等持久化表示。旧二进制可能无法解析新快照；
 不能把替换为旧二进制直接当成可用的回滚。升级前应正常停止相关写入、保留并核验原 Meta 和
@@ -531,3 +635,119 @@ resource_exhausted，停止后不允许等待结果生成新的响应。RPC许�
 已发送Header后的错误传播和末引用退账。同一截止不因重试、Header前回退或伪唤醒
 重置，也不作为已开始I/O、同flight结果或双帧背压的完成时限；原授权／stop／传输期限
 继续约束这些工作。大窗口／多连接后置，没有因此启用或扩大共享2MiB窗口。
+
+## Meta 操作日志有限策略
+
+`meta_store` 默认 `local-file`；`memory` 仅用于可丢弃状态。配置中的 `etcd`、`redis`、
+`etcd_endpoint`、`redis_endpoint` 不再接受，不静默回退。新二进制只打开新格式的
+`data_dir/meta-store`；旧快照目录不自动导入。回滚使用原二进制和匹配的原目录，
+不得让旧二进制打开新操作日志目录，也不得覆盖旧数据。
+
+以下参数均遵循 CLI＞TOML＞默认，CLI 将下划线改为连字符；值须大于零。
+
+| TOML 字段 | 默认值 | 含义与范围 |
+| --- | --- | --- |
+| `meta_wal_segment_bytes` | 67108864 | 软分段目标，至少4352字节且不大于`meta_wal_max_bytes`；原子批次不拆段 |
+| `meta_checkpoint_wal_bytes` | 134217728 | 后台checkpoint字节阈值，非额外硬配额 |
+| `meta_checkpoint_wal_records` | 1000000 | 后台checkpoint记录阈值 |
+| `meta_checkpoint_interval_ms` | 60000 | 时间阈值；不承诺严格完成时刻，必须可表示为有限定时器 |
+| `meta_request_retention_ms` | 86400000 | 幂等结果最长保留时间；条数／字节压力可提前清理 |
+| `meta_request_outcomes_max` | 1000000 | 幂等结果条数上限 |
+| `meta_request_bytes_max` | 268435456 | 幂等结果持有容量的逻辑字节上限 |
+| `meta_watch_events_max` | 1000000 | watch历史事件条数上限 |
+| `meta_watch_bytes_max` | 67108864 | watch历史事件持有容量的逻辑字节上限 |
+| `meta_watch_retention_ms` | 3600000 | watch历史最长保留时间；清理仍以完整revision为单位 |
+
+单记录／批次／总WAL上限仍分别使用 `meta_record_max_bytes`、`meta_batch_max_bytes`、
+`meta_wal_max_bytes`。调整总WAL时须同时核对分段目标和原子批次所需空间。
+保留策略控制历史结果与事件，不删除当前inode、版本、会话等权威状态。
+策略收紧时，恢复阶段先持久化必要清理再接纳服务；放宽策略不复活已清理历史。
+以上是逻辑预算和后台阈值，不是RSS或物理掉电验收声明。
+
+### OwnerFs 授权记录维护
+
+Meta 为新 Root 生命周期按前一水位加一持久分配不复用的 epoch，
+expected 只作约束，不能抬高分配值；水位与 reservation/原结果原子保存。
+无水位的旧状态先从尚存事实引导并持久保存水位，再退休旧结果或授权；这不恢复旧版本已删历史。
+正常恢复必须保留原数据目录中的完整身份、checkpoint 和日志链，不能单独删除或编辑水位。
+`memory` 整体重启仍按原合同丢状态，不提供跨新 store 身份的旧授权延续保证。
+此工作树新增内部水位实体；旧 Meta 不识别的新日志不能用旧程序覆盖启动。回滚沿用
+完整目录备份和配套版本规则，不提供自动降级转换。
+
+停用确认不再等待所有历史 grant 实体被删完。后台沿游标每次最多扫描128份、删除32份，
+并受原单记录、历史和持久化预算约束；除首次旧水位引导外，未产生删除就不追加管理事务。
+当前 Home grant 即使 session 到期仍保留以支持恢复；后继身份切换完成后旧记录可回收。
+普通 holder 已过期或被后继 session 替代时可回收，沿用过期 session ID 不允许续回的既有合同。
+清理批次会在原单记录字节额度内缩小，不扩大配置上限。
+清理暂缓会记录 `meta.authority_cleanup_deferred`，不会重新启用已停用 Root；
+清理 I/O 的未知结果仍按原失败关闭合同处理。
+旧授权实体清理后，旧日志的实际磁盘回收仍等待原 checkpoint/日志退休条件。
+已完成命令与成功匹配 ACK 在 watch／原结果引用退休、无 reservation 且不影响活动 Root
+屏障后由同一写者成对持久删除；每轮最多扫描128条、删除16对，另受64KiB键目标与
+原事务／历史额度约束。仍被引用、待确认、失败或不匹配的记录保留，不手动删除。
+现有 bind 消费者不会自动 ACK，不承诺此类命令均会被回收。
+NodeSession 的旧记录承担过期 session ID 不得重用的持久拒绝语义，本轮保留；
+NodeSession 与未完成命令的长期增长是剩余生命周期欠账，不把有界历史宣传成全部实体有界。
+已有 bind、native FD/mmap 的撤权与排空限制保持。
+
+### Meta操作日志指标
+
+产品Meta和测试用RootCommand启动器把同一个Store的固定指标注册到进程已有的`/metrics`。
+Registry不持有Store、State或磁盘句柄；采集不扫描全库、不读盘，不建立新的后台观测任务。
+
+| 指标组 | 计量边界 |
+| --- | --- |
+| `afs_meta_requests_retained`、`afs_meta_request_bytes`、`afs_meta_events_retained`、`afs_meta_event_bytes`、`afs_meta_history_index_bytes` | 已发布history条数和逻辑owned容量；不等于RSS或实际磁盘占用 |
+| `afs_meta_revision`、`afs_meta_log_sequence`、`afs_meta_compacted_revision` | 已发布业务revision、canonical记录sequence及watch水位 |
+| `afs_meta_request_evictions_total`、`afs_meta_watch_events_evicted_total` | 本进程启动后由成功持久ACK确认的精确历史删除量，含降额启动清理；不回填重放前历史总数 |
+| `afs_meta_wal_batches_total`、`afs_meta_wal_records_total`、`afs_meta_wal_framed_bytes_total` | 成功ACK的追加批次、记录和framed字节；不是保留的WAL磁盘字节 |
+| `afs_meta_wal_failures_total`、`afs_meta_wal_capacity_rejections_total` | 追加ACK失败（结果可能未知），以及追加前容量等待到期；不混淆二者 |
+| `afs_meta_checkpoints_total`、`afs_meta_checkpoint_failures_total`、`afs_meta_checkpoint_inflight`、`afs_meta_checkpoint_duration_seconds` | 实际owned任务成功、失败、在途及耗时；调用方或observer超时不提前结束计量 |
+| `afs_meta_checkpoint_bytes`、`afs_meta_checkpoint_sequence` | 最近成功安装或重开恢复的checkpoint载荷字节和覆盖sequence；不代表目录总占用 |
+
+counter以进程生命周期计，重启归零；恢复的当前状态会初始化gauge。指标是观测副本，
+不是canonical权威或线性化读取接口。重复注册返回错误，产品在打开监听前报告该错误。
+物理WAL／checkpoint容量仍由日志自身的有限准入和安全回收合同约束，不由counter充当配额。
+
+## 原生 DFS 回收
+
+NodeReplicated DFS 默认启动每 5 秒一次的安全回收；关闭引用有固定 60 秒保护期。
+运行中／COW／未完成上传引用仍保护数据；长期打开的 inode 会保守保留全部版本。
+失联 Node 不会被当作已删除数据；它恢复后继续确认删除批次。应答成功前本机 catalog 检查点与
+删除代次必须已同步落盘。不要在离线 Node 未完成磁盘处置时强行清空 Meta 删除屏障。
+外部对象持久化的 DFS 不执行这条物理回收协议。
+原生异步上传在接受新写入代次时取得引用，上传前登记块，直至版本发布及异步使用结束后才释放。
+本机回收先排空 catalog 安装，再独占执行检查点与 WAL 截断，避免覆盖尚未确认的写入。
+
+引用创建 RPC 使用固定期限；过期返回 `META_DFS_REFERENCE_ADMISSION_EXPIRED`。
+未知引用的释放也持久化 60 秒墓碑，阻止乱序的迟到创建。该期限不限制运行中文件／上传的寿命。
+
+## DFS 删除并发与诊断
+
+`unlink`／`rmdir` 的元数据 CAS 冲突会在 Meta 内重新读取并校验，最多尝试 64 次。
+每次仍校验调用者权限、目录项和 inode，`rmdir` 重新检查目录是否为空；同一次操作
+不会追随已被替换的名字删除另一个 inode。持续竞争或目标替换返回
+`META_DFS_NAMESPACE_RETRY`（POSIX `EAGAIN`），权限、非空目录等错误保持原语义。
+操作 ID 和请求摘要在内部重试中不变，已提交的删除可重放其原始结果。
+
+定位并发时可临时为 Meta 设置 `AFS_META_NAMESPACE_TRACE=1`。日志记录操作 ID、
+调用节点、候选事务版本，以及修改或发生冲突的 inode 版本、head、链接数和属性；
+不记录文件内容、xattr 或凭据。`meta_namespace_applied` 只表示候选批次已应用，
+不能当成持久化成功回执。默认关闭该诊断，开启后应限制日志访问并在定位后关闭。
+
+
+## 原生DFS分段CRC32C与写入代次保护
+
+原生DFS Node默认启用`dfs_crc32c_writes`及`dfs_optimistic_gc_commit`。后者在CRC路径表示写入代次保护，不再固定全局GC版本。支持既有desired/sync-required、副本分布及local-copy策略；CRC要求原生存储及代次保护，非法组合在监听服务前拒绝。OwnerFs-only、Meta和外部S3后端的缺省值为false，S3仍走原完整hash路径。本次不提供旧版本数据兼容或迁移。
+
+例如在Node的顶层配置中保留缺省值即可；需要显式选择BLAKE3新写时设置`dfs_crc32c_writes = false`，未单独配置的`dfs_optimistic_gc_commit`随之为false。关闭新写CRC不关闭按持久化算法标记的CRC读取。不要把CRC对象的描述摘要当作正文hash。
+
+新对象ID为`crc32c-v2-<32hex出生代次>-<32hex对象号>`，32KiB分段CRC表与长度、格式一起进入原catalog WAL持久化链。`Crc32cSegmentsV1`承载描述表的小BLAKE3绑定摘要，**不是正文BLAKE3根**；不生成正文Bao/proof，也不按相同正文自动去重。复制接收端重新核验CRC描述后，完成正文、目录及catalog屏障再返回durable ACK。FullSync等待原策略要求的同步收据和Meta持久事务。
+
+首次写入通过已有retain RPC登记一次代次，库存中的同代次chunk在任意副本上均被保护，无需逐chunk登记。FullSync原子核对相关代次引用与owner session，在同一事务内发布版本并退休引用。无关GC状态变化不作废写入；确切代次退休、缺失或session失效仍返回错误。准入有固定时间窗口，退休墓碑覆盖迟到窗口，延迟请求不能复活旧代次；已提交但回复丢失按原operation重放。正常GC、读引用、修复claim和删除代次屏障保持启用。
+
+跨节点读取绑定可信Meta对象及CRC表。服务端验证覆盖到的存储段，只发送获准范围；客户端检查范围CRC，对完整段额外核对Meta绑定的CRC表。非对齐边界依赖可信认证服务端的存储段验证，不扩大发给客户端的grant，也不提供针对恶意服务端的密码学内容证明。缺表、错表、坏正文、截断、错身份、缺Completion均拒绝。复制和修复保持原对象ID及描述，沿用原claim、epoch、收据和幂等重试。
+
+可选BLAKE3 Peer驻留/proof及磁盘缓存不适用于CRC对象；CRC直接走分段验证的范围传输。gRPC与RDMA协议均携带CRC描述，RDMA硬件运行单独验收，不能用全feature编译替代。S3及其缓存策略不在本次变更范围。
+
+`security.capability`在原inode映射检查后本地返回既有不支持错误，其余xattr保留Meta权限与错误语义。Meta的`afs_requests_total`提供`dfs_gc_capture/register/retain/release/collect`、`dfs_commit_file_version`和`dfs_get_xattr`标签，用于核对真实访问次数；不增加逐chunk正文扫描或详细调度采集。

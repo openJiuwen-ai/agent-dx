@@ -2,7 +2,6 @@
 use crate::*;
 use adx_agent_core::activator::{BindingList, BindingPage};
 use adx_agent_core::cache::BoundedCache;
-use adx_agent_core::launch::{CredentialCipher, LaunchConfig};
 use adx_agent_core::{limits, AgentBinding, BindingPhase, Scope, TemplateVersion};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use std::sync::Arc;
@@ -21,7 +20,6 @@ struct PageCursor {
 pub struct AgentState {
     store: Arc<dyn Repository>,
     templates: Arc<Mutex<BoundedCache<Key, TemplateCell>>>,
-    credential_cipher: Option<Arc<CredentialCipher>>,
 }
 pub(crate) fn binding_key(scope: &Scope) -> Result<Key> {
     scope.validate().map_err(Error::Invalid)?;
@@ -51,55 +49,8 @@ impl AgentState {
     pub fn new(store: Arc<dyn Repository>) -> Self {
         Self {
             store,
-            credential_cipher: None,
             templates: Arc::new(Mutex::new(BoundedCache::new(TEMPLATE_CACHE_ENTRIES))),
         }
-    }
-    pub fn with_credential_key(mut self, key: [u8; 32]) -> Self {
-        self.credential_cipher = Some(Arc::new(CredentialCipher::new(key)));
-        self
-    }
-    /// Optional for generic Agents; private model bindings fail closed when unconfigured.
-    pub fn with_deployment_credentials(self) -> Result<Self> {
-        let Some(path) = std::env::var_os("ADX_CREDENTIAL_KEY_FILE") else {
-            return Ok(self);
-        };
-        let text = std::fs::read_to_string(path)
-            .map_err(|_| Error::Unavailable("credential key file unreadable".into()))?;
-        let text = text.trim();
-        if text.len() != 64 || !text.is_ascii() {
-            return Err(Error::Invalid(
-                "credential key must be 64 hex characters".into(),
-            ));
-        }
-        let mut key = [0u8; 32];
-        for (i, byte) in key.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&text[i * 2..i * 2 + 2], 16)
-                .map_err(|_| Error::Invalid("invalid credential key".into()))?;
-        }
-        Ok(self.with_credential_key(key))
-    }
-    fn cipher(&self) -> Result<&CredentialCipher> {
-        self.credential_cipher.as_deref().ok_or_else(|| {
-            Error::Unavailable("binding credential encryption is not configured".into())
-        })
-    }
-    pub async fn launch_config(&self, binding: &AgentBinding) -> Result<Option<LaunchConfig>> {
-        let key = launch_key(&binding.scope)?;
-        let Some(record) = self.store.get(&key).await? else {
-            return Ok(None);
-        };
-        let encrypted: Vec<u8> = record.decode()?;
-        let aad = serde_json::to_vec(&(binding.scope.clone(), &binding.generation))
-            .map_err(|_| Error::Corrupt("invalid binding".into()))?;
-        let plain = self
-            .cipher()?
-            .open(&aad, &encrypted)
-            .map_err(|e| Error::Corrupt(e.into()))?;
-        let launch: LaunchConfig = serde_json::from_slice(&plain)
-            .map_err(|_| Error::Corrupt("invalid private launch configuration".into()))?;
-        launch.validate().map_err(Error::Corrupt)?;
-        Ok(Some(launch))
     }
     pub async fn publish(&self, tenant: &str, template: &TemplateVersion) -> Result<()> {
         adx_agent_core::identifier(tenant, "tenant").map_err(Error::Invalid)?;
@@ -235,33 +186,22 @@ impl AgentState {
     }
     /// Commit one stable Environment identity before any activation side effect.
     pub async fn create_binding(&self, scope: Scope) -> Result<AgentBinding> {
-        self.create_binding_with_launch(scope, None).await
-    }
-    pub async fn create_binding_with_launch(
-        &self,
-        scope: Scope,
-        launch: Option<&LaunchConfig>,
-    ) -> Result<AgentBinding> {
-        self.create_binding_with_parameters(scope, launch, &Default::default())
+        self.create_binding_with_parameters(scope, &Default::default())
             .await
     }
-    /// Create one immutable binding specification; parameter changes conflict on reuse.
+    /// First successful creation fixes the parameters; all later requests reuse it.
     pub async fn create_binding_with_parameters(
         &self,
         scope: Scope,
-        launch: Option<&LaunchConfig>,
         parameters: &adx_agent_core::mounts::Parameters,
     ) -> Result<AgentBinding> {
-        if let Some(launch) = launch {
-            launch.validate().map_err(Error::Invalid)?;
-            self.cipher()?;
-        }
         let key = binding_key(&scope)?;
         let template = self
             .template(&scope.tenant, &scope.template, &scope.version)
             .await?
             .ok_or_else(|| Error::Invalid("template version does not exist".into()))?;
         template.render_mounts(parameters).map_err(Error::Invalid)?;
+        template.render_env(parameters).map_err(Error::Invalid)?;
         let generation = uuid::Uuid::new_v4().to_string();
         let value = AgentBinding {
             scope,
@@ -270,32 +210,15 @@ impl AgentState {
             phase: BindingPhase::Active,
             parameters: parameters.clone(),
         };
-        let private_key = launch_key(&value.scope)?;
-        let mut checks = vec![
-            Check {
-                key: key.clone(),
-                expected: None,
-            },
-            Check {
-                key: private_key.clone(),
-                expected: None,
-            },
-        ];
-        let mut puts = vec![put(&key, &value)?];
-        if let Some(launch) = launch {
-            let aad = serde_json::to_vec(&(value.scope.clone(), &value.generation))
-                .map_err(|_| Error::Invalid("invalid binding".into()))?;
-            let plain = serde_json::to_vec(launch)
-                .map_err(|_| Error::Invalid("invalid launch configuration".into()))?;
-            let encrypted = self
-                .cipher()?
-                .seal(&aad, &plain)
-                .map_err(|e| Error::Unavailable(e.into()))?;
-            puts.push(put(&private_key, &encrypted)?);
-        }
         if self
             .store
-            .commit(&Transaction::new(std::mem::take(&mut checks), puts)?)
+            .commit(&Transaction::new(
+                vec![Check {
+                    key: key.clone(),
+                    expected: None,
+                }],
+                vec![put(&key, &value)?],
+            )?)
             .await?
         {
             return Ok(value);
@@ -307,16 +230,6 @@ impl AgentState {
             .ok_or_else(|| Error::Conflict("binding changed".into()))?
             .decode()?;
         if existing.phase == BindingPhase::Active {
-            if existing.parameters != *parameters {
-                return Err(Error::Conflict("binding parameters are immutable".into()));
-            }
-            if let Some(launch) = launch {
-                if self.launch_config(&existing).await?.as_ref() != Some(launch) {
-                    return Err(Error::Conflict(
-                        "binding startup configuration is immutable".into(),
-                    ));
-                }
-            }
             Ok(existing)
         } else {
             Err(Error::Conflict("binding is deleting".into()))
@@ -371,14 +284,8 @@ impl AgentState {
         {
             return Err(Error::Conflict("binding deletion identity mismatch".into()));
         }
-        let private_key = launch_key(&binding.scope)?;
-        let private = self.store.get(&private_key).await?;
-        let mut checks = vec![check(&key, &record)];
-        let mut deletes = vec![key];
-        if let Some(record) = private {
-            checks.push(check(&private_key, &record));
-            deletes.push(private_key);
-        }
+        let checks = vec![check(&key, &record)];
+        let deletes = vec![key];
         if self
             .store
             .commit(&Transaction::with_deletes(checks, vec![], deletes)?)
@@ -389,16 +296,4 @@ impl AgentState {
             Err(Error::Conflict("binding changed during deletion".into()))
         }
     }
-}
-
-fn launch_key(scope: &Scope) -> Result<Key> {
-    Key::new(
-        "binding-launch",
-        &[
-            &scope.tenant,
-            &scope.template,
-            &scope.version,
-            &scope.binding_id,
-        ],
-    )
 }

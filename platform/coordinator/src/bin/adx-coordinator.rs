@@ -20,6 +20,8 @@ struct Bootstrap {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
+    #[serde(default)]
+    checkpoint_reclaimers: Vec<adx_checkpoint_storage::reclaim::ReclaimerConfig>,
     listen: SocketAddr,
     #[serde(default)]
     metrics_listen: Option<SocketAddr>,
@@ -136,6 +138,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Duration::from_secs(config.heartbeat_timeout_seconds),
     )
     .await?;
+    let mut reclaimers = adx_checkpoint_storage::reclaim::Reclaimers::default();
+    for store in config.checkpoint_reclaimers {
+        reclaimers.insert(store.build()?)?;
+    }
+    let rpc = rpc.with_reclaimers(reclaimers);
     let metrics_listener = match config.metrics_listen {
         Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
         None => None,
@@ -214,6 +221,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
         loop {
             tick.tick().await;
+            if let Err(error) = collection_rpc.collect_shared_artifacts().await {
+                adx_observability::warn!("shared artifact collection incomplete: {error}");
+            }
             if let Err(error) = collection_rpc.collect_snapshots().await {
                 adx_observability::warn!("snapshot collection incomplete: {error}");
             }

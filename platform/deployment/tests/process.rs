@@ -109,9 +109,9 @@ async fn repeated_exits_keep_restarting_until_recovery_and_scoped_stop() {
     install_test_binary(
         root,
         "adx-coordinator",
-        "#!/bin/sh\ncounter=\"$0.attempts\"\nn=0\n[ ! -f \"$counter\" ] || n=$(cat \"$counter\")\nn=$((n+1))\necho \"$n\" > \"$counter\"\n[ \"$n\" -gt 6 ] || exit 1\nexec sleep 100\n",
+        "#!/bin/sh\ncounter=\"$0.attempts\"\nn=0\n[ ! -f \"$counter\" ] || n=$(cat \"$counter\")\nn=$((n+1))\necho \"$n\" > \"$counter\"\n[ \"$n\" -gt 6 ] || exit 1\ntrap 'exit 0' TERM\nsleep 100 &\nprintf ready > \"$0.ready\"\nwait\n",
     );
-    install_test_binary(root, "adx-apiserver", "#!/bin/sh\nexec sleep 100\n");
+    install_test_binary(root, "adx-apiserver", graceful_service_script());
     let services =
         json!([{"id":"coordinator","role":"coordinator"},{"id":"api","role":"apiserver"}]);
     let deployment = test_deployment(root, services.clone());
@@ -135,6 +135,9 @@ async fn repeated_exits_keep_restarting_until_recovery_and_scoped_stop() {
                     .get("pid")
                     .is_some_and(serde_json::Value::is_number)
             {
+                // A new PID can still belong to a failing startup attempt.
+                // Confirm the recovered fixture installed its TERM handler.
+                wait_for_graceful_services(root, &["adx-coordinator", "adx-apiserver"]).await;
                 assert_eq!(
                     coordinator.get("failed"),
                     Some(&serde_json::Value::Bool(false))
@@ -180,9 +183,10 @@ async fn spawn_failures_keep_retrying_and_clear_failure_after_recovery() {
             {
                 assert_eq!(service.get("failed"), Some(&serde_json::Value::Bool(true)));
                 assert_eq!(service.get("pid"), Some(&serde_json::Value::Null));
-                install_test_binary(root, "adx-coordinator", "#!/bin/sh\nexec sleep 100\n");
+                install_test_binary(root, "adx-coordinator", graceful_service_script());
                 repaired = true;
             } else if repaired && service.get("pid").is_some_and(serde_json::Value::is_number) {
+                wait_for_graceful_services(root, &["adx-coordinator"]).await;
                 assert_eq!(service.get("failed"), Some(&serde_json::Value::Bool(false)));
                 break;
             }

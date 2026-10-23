@@ -1,9 +1,11 @@
 //! Business accounts and sessions. Independent of ADX tenant/service authentication.
+mod credentials;
 mod providers;
 mod store;
-use adx_agent_core::launch::{CredentialCipher, LaunchConfig};
+use adx_agent_core::mounts::Parameters;
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+pub use credentials::CredentialCipher;
 use http::{header, HeaderMap, StatusCode};
 pub use providers::{Agc, AgcIdentityProvider, Huawei, IdentityProvider, LiteLlm, ModelProvider};
 use ring::rand::{SecureRandom, SystemRandom};
@@ -108,12 +110,11 @@ pub(crate) struct ScopedIdentity<'a> {
 
 #[derive(Clone)]
 pub struct Principal {
-    pub tenant: String,
     pub user_id: String,
     pub expires_at: i64,
     pub(crate) token_digest: String,
 }
-/// Called by Jiuwen only. Production has no fixed-user or anonymous implementation.
+/// Called by DigitalMateGateway only. Production has no fixed-user or anonymous implementation.
 #[async_trait]
 pub trait BusinessAuth: Send + Sync {
     async fn login(&self, request: LoginRequest) -> Result<LoginResponse>;
@@ -124,12 +125,11 @@ pub trait BusinessAuth: Send + Sync {
     async fn check(&self, principal: &Principal) -> Result<()>;
     async fn logout(&self, token: &str) -> Result<()>;
     async fn quota(&self, principal: &Principal) -> Result<QuotaResponse>;
-    async fn launch_config(&self, principal: &Principal) -> Result<LaunchConfig>;
+    async fn model_parameters(&self, principal: &Principal) -> Result<Parameters>;
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccountConfig {
-    pub tenant: String,
     pub developer_scope: String,
     pub agreement_version: String,
     pub database_url_env: String,
@@ -176,7 +176,10 @@ pub struct AccountService {
     client_id: String,
 }
 impl AccountService {
-    pub async fn connect(config: AccountConfig) -> Result<Self> {
+    /// Connect business accounts and sessions.
+    /// The supplied fixed namespace determines model owners and encryption context.
+    /// Returns Configuration for invalid configuration/schema and Unavailable for dependency failure.
+    pub async fn connect(config: AccountConfig, model_namespace: &str) -> Result<Self> {
         let client_id =
             std::env::var("HUAWEI_OAUTH_CLIENT_ID").map_err(|_| Error::Configuration)?;
         let secret =
@@ -203,19 +206,10 @@ impl AccountService {
             identity,
             agc_identity,
             models,
-            key,
+            CredentialCipher::new(key, model_namespace)?,
         )
     }
-    pub fn new(
-        config: AccountConfig,
-        client_id: String,
-        store: AccountStore,
-        identity: Arc<dyn IdentityProvider>,
-        models: Arc<dyn ModelProvider>,
-        key: [u8; 32],
-    ) -> Result<Self> {
-        Self::new_with_agc(config, client_id, store, identity, None, models, key)
-    }
+    /// Returns Configuration for invalid account settings or inconsistent provider wiring.
     pub fn new_with_agc(
         config: AccountConfig,
         client_id: String,
@@ -223,10 +217,9 @@ impl AccountService {
         identity: Arc<dyn IdentityProvider>,
         agc_identity: Option<Arc<dyn AgcIdentityProvider>>,
         models: Arc<dyn ModelProvider>,
-        key: [u8; 32],
+        cipher: CredentialCipher,
     ) -> Result<Self> {
         for value in [
-            &config.tenant,
             &config.developer_scope,
             &config.agreement_version,
             &client_id,
@@ -254,7 +247,7 @@ impl AccountService {
             identity,
             agc_identity,
             models,
-            cipher: CredentialCipher::new(key),
+            cipher,
             config,
             client_id,
         })
@@ -339,18 +332,10 @@ impl BusinessAuth for AccountService {
         if token.len() > 512 || token.len() < 32 {
             return Err(Error::Unauthorized);
         }
-        self.store
-            .authenticate(&self.config.tenant, &digest(token))
-            .await
+        self.store.authenticate(&digest(token)).await
     }
     async fn check(&self, principal: &Principal) -> Result<()> {
-        if principal.tenant != self.config.tenant {
-            return Err(Error::Unauthorized);
-        }
-        let current = self
-            .store
-            .authenticate(&principal.tenant, &principal.token_digest)
-            .await?;
+        let current = self.store.authenticate(&principal.token_digest).await?;
         if current.user_id != principal.user_id || current.expires_at != principal.expires_at {
             return Err(Error::Unauthorized);
         }
@@ -358,19 +343,21 @@ impl BusinessAuth for AccountService {
     }
     async fn logout(&self, token: &str) -> Result<()> {
         // Idempotent logout, including an already revoked/expired session.
-        self.store.logout(&self.config.tenant, &digest(token)).await
+        self.store.logout(&digest(token)).await
     }
     async fn quota(&self, principal: &Principal) -> Result<QuotaResponse> {
-        let launch = self.launch_config(principal).await?;
-        let key = launch.env.get("API_KEY").ok_or(Error::Unavailable)?;
-        let owner = litellm_user(&principal.tenant, &principal.user_id);
+        let launch = self.model_parameters(principal).await?;
+        let key = launch.get("model_api_key").ok_or(Error::Unavailable)?;
+        let owner = self.cipher.model_owner(&principal.user_id);
         let quota = self.models.quota(&owner, key).await?;
         self.check(principal).await?;
         Ok(quota)
     }
-    async fn launch_config(&self, principal: &Principal) -> Result<LaunchConfig> {
+    async fn model_parameters(&self, principal: &Principal) -> Result<Parameters> {
         self.check(principal).await?;
-        let aad = serde_json::to_vec(&("litellm", &principal.tenant, &principal.user_id))
+        let aad = self
+            .cipher
+            .associated_data(&principal.user_id)
             .map_err(|_| Error::Unavailable)?;
         let candidate = format!("sk-{}", random_token()?);
         let encrypted = self
@@ -387,20 +374,20 @@ impl BusinessAuth for AccountService {
         // Reconcile model access and account alias even for a ready credential when preparing a new
         // binding or serving quota. Warm Sandbox traffic never enters this path.
         // Persist the key BEFORE remote creation so retries cannot mint another key.
-        let owner = litellm_user(&principal.tenant, &principal.user_id);
+        let owner = self.cipher.model_owner(&principal.user_id);
         let alias = self.store.model_key_alias(principal).await?;
         self.models.ensure(&owner, &key, &alias).await?;
         if !record.ready {
             self.store.mark_ready(principal, &record.version).await?;
         }
         self.check(principal).await?;
-        Ok(LaunchConfig {
-            credential_version: record.version,
-            env: BTreeMap::from([
-                ("API_KEY".into(), key),
-                ("API_BASE".into(), self.config.litellm.api_base.clone()),
-            ]),
-        })
+        Ok(BTreeMap::from([
+            ("model_api_key".into(), key),
+            (
+                "model_api_base".into(),
+                self.config.litellm.api_base.clone(),
+            ),
+        ]))
     }
 }
 fn valid_agc_access_token(value: &str) -> bool {
@@ -425,12 +412,6 @@ pub fn bearer(headers: &HeaderMap) -> Result<&str> {
 }
 pub(crate) fn digest(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
-}
-pub(crate) fn litellm_user(tenant: &str, user_id: &str) -> String {
-    format!(
-        "adx-{}",
-        digest(&serde_json::json!([tenant, user_id]).to_string())
-    )
 }
 fn model_key_alias(provider: &str, user_id: &str, display_name: Option<&str>) -> String {
     let provider = if provider == "agc" { "agc" } else { "huawei" };

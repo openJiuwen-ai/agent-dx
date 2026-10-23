@@ -1,0 +1,56 @@
+{
+  "name": "orbit",
+  "version": "v1-workspace",
+  "image": "swr.cn-north-1.myhuaweicloud.com/openjiuwen-online-test/orbit@sha256:e6fe614ff389ab021e855c1516fe9c44b4916ff66fffba5ad825282c0195f917",
+  "isolation_runtime": "runsc",
+  "env": {
+    "ORBIT_WORKSPACE": "/data/state",
+    "ORBIT_BIND": "0.0.0.0",
+    "ORBIT_PORT": "18092",
+    "API_BASE": "${model_api_base}",
+    "API_KEY": "${model_api_key}",
+    "MODEL_NAME": "glm-5.2",
+    "MODEL_PROVIDER": "OpenAI",
+    "MODEL_CONTEXT_WINDOW": "1048576",
+    "MODEL_MAX_ITERATIONS": "8"
+  },
+  "resources": {
+    "cpu_millis": 2000,
+    "memory_mib": 4096
+  },
+  "service": [
+    {
+      "protocol": "ws",
+      "port": 18092
+    },
+    {
+      "protocol": "http",
+      "port": 18092
+    }
+  ],
+  "init_timeout_seconds": 120,
+  "readiness_probe": {
+    "tcp_socket": {
+      "port": 18092
+    },
+    "initial_delay_seconds": 3,
+    "period_seconds": 3,
+    "timeout_seconds": 2
+  },
+  "mounts": [
+    {
+      "type": "bind",
+      "host_path": "/mnt/sfs/workspaces/${workspace}",
+      "target": "/data/state",
+      "options": [
+        "rw"
+      ],
+      "create_if_missing": true,
+      "create_options": {
+        "uid": 10001,
+        "gid": 10001,
+        "mode": "0700"
+      }
+    }
+  ]
+}

@@ -98,6 +98,7 @@ impl LocalRootCatalog for LocalFsRootCatalog {
         let locked = LockedLocalFsRootCatalog {
             disk: self.disk.clone(),
             _lock: lock,
+            owner_pid: std::process::id(),
             mutation: Mutex::new(()),
         };
         locked.ensure_dir()?;
@@ -108,7 +109,20 @@ impl LocalRootCatalog for LocalFsRootCatalog {
 struct LockedLocalFsRootCatalog {
     disk: Arc<LocalFs>,
     _lock: File,
+    owner_pid: u32,
     mutation: Mutex<()>,
+}
+
+impl Drop for LockedLocalFsRootCatalog {
+    fn drop(&mut self) {
+        // fork/dup can retain the same open description after this guard closes.
+        // Only this guard owns authority; an inherited descriptor must not extend it.
+        if self.owner_pid == std::process::id()
+            && let Err(error) = self._lock.unlock()
+        {
+            afs_logging::warn!("ownerfs.catalog_unlock_failed"; "error" => error.to_string());
+        }
+    }
 }
 
 impl LockedLocalFsRootCatalog {
@@ -385,5 +399,64 @@ fn from_hex_digit(byte: u8) -> Result<u8> {
         b'a'..=b'f' => Ok(byte - b'a' + 10),
         b'A'..=b'F' => Ok(byte - b'A' + 10),
         _ => Err(Error::coded(afs_error::IO_INVALID, "invalid hex digit")),
+    }
+}
+
+#[cfg(test)]
+mod inherited_lock_tests {
+    use super::*;
+    #[test]
+    fn dropping_catalog_releases_inherited_open_description_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(temp.path().join(CATALOG_LOCK))
+            .unwrap();
+        flock_exclusive(&lock).unwrap();
+        // dup models the same open description inherited between fork and exec.
+        let inherited = lock.try_clone().unwrap();
+        let guard = LockedLocalFsRootCatalog {
+            disk: disk.clone(),
+            _lock: lock,
+            owner_pid: std::process::id(),
+            mutation: Mutex::new(()),
+        };
+        drop(guard);
+        let next = LocalFsRootCatalog::new(disk).lock_and_open();
+        assert!(
+            next.is_ok(),
+            "a child descriptor must not retain the retired catalog lock"
+        );
+        drop(inherited);
+    }
+    #[test]
+    fn inherited_guard_cannot_unlock_the_parent_process_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(temp.path().join(CATALOG_LOCK))
+            .unwrap();
+        flock_exclusive(&lock).unwrap();
+        let parent = lock.try_clone().unwrap();
+        let guard = LockedLocalFsRootCatalog {
+            disk: disk.clone(),
+            _lock: lock,
+            owner_pid: std::process::id().wrapping_add(1),
+            mutation: Mutex::new(()),
+        };
+        drop(guard);
+        assert!(
+            LocalFsRootCatalog::new(disk).lock_and_open().is_err(),
+            "a child guard must not release the parent's lock"
+        );
+        parent.unlock().unwrap();
     }
 }

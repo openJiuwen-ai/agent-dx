@@ -1,19 +1,21 @@
 use adx_process::{read_config, shutdown};
 use adx_protocol::control as pb;
+use adx_transport::rpc::{RpcChannel, RpcClient};
 use adx_transport::tls::TlsFiles;
 use adxlet::resources::{PressureGate, PressurePolicy, ResourceSource};
 use adxlet::{
+    jiuwenbox::Jiuwenbox,
     readiness::ExecdReadiness,
     routes::UdsRoutes,
     rpc::{CoordinatorStateSink, NodeRpc},
     runtime_logs::{RuntimeLogPolicy, RuntimeLogs},
-    sandboxd::{connect_when_ready, Config as RuntimeConfig, Sandboxd},
+    runtime_router::RuntimeRouter,
+    sandboxd::{connect_when_ready, Config as RuntimeConfig},
     Adxlet, RuntimeDriver,
 };
 use serde::Deserialize;
 use std::{
     collections::{HashMap, HashSet},
-    future::Future,
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
@@ -35,7 +37,10 @@ struct Config {
     tls: TlsFiles,
     #[serde(default)]
     admin_socket: Option<PathBuf>,
-    sandboxd_socket: PathBuf,
+    #[serde(default)]
+    sandboxd_socket: Option<PathBuf>,
+    #[serde(default)]
+    jiuwenbox: Option<adxlet::jiuwenbox::Config>,
     #[serde(default)]
     runtime_logs: RuntimeLogPolicy,
     proxy_socket: PathBuf,
@@ -57,8 +62,6 @@ struct Config {
     checkpoint_storage: Option<adxlet::checkpoint::StorageConfig>,
     #[serde(default)]
     degradation_journal: Option<PathBuf>,
-    #[serde(default)]
-    checkpoint_gc: adxlet::checkpoint::RemoteGcConfig,
     report_interval_seconds: u64,
     rpc_timeout_seconds: u64,
     #[serde(default = "runtime_ready_timeout")]
@@ -94,7 +97,7 @@ fn execd_ready_poll_interval() -> Duration {
 }
 async fn sample(
     source: &ResourceSource,
-    runtime: &Sandboxd,
+    runtime: &RuntimeRouter,
     timeout: Duration,
 ) -> adx_core::Result<(adxlet::resources::Observation, Duration)> {
     if matches!(source, ResourceSource::Sandboxd { .. }) {
@@ -107,46 +110,27 @@ async fn sample(
     source.sample(timeout).await
 }
 
-async fn bounded_rpc<T>(
+fn coordinator_channel(
+    transport: &RpcClient,
+    address: &str,
     timeout: Duration,
-    future: impl Future<Output = Result<T, tonic::Status>>,
-) -> Result<T, tonic::Status> {
-    tokio::time::timeout(timeout, future)
-        .await
-        .map_err(|_| tonic::Status::deadline_exceeded("control-plane RPC deadline exceeded"))?
+) -> Result<RpcChannel, std::io::Error> {
+    // ForwardCreate can wait for new capacity beyond the ordinary RPC budget.
+    // Response deadlines belong to each call; keep connection setup bounded.
+    Ok(transport.wrap(
+        transport
+            .endpoint(address)?
+            .connect_timeout(timeout)
+            .connect_lazy(),
+    ))
 }
 
-async fn register_node(
-    coordinator: &mut pb::coordinator_service_client::CoordinatorServiceClient<
-        adx_transport::rpc::RpcChannel,
-    >,
-    registration: pb::RegisterNodeRequest,
-    timeout: Duration,
-) -> Result<tonic::Response<pb::RegisterNodeResponse>, tonic::Status> {
-    let mut request = tonic::Request::new(registration);
-    request.set_timeout(timeout);
-    bounded_rpc(timeout, coordinator.register_node(request)).await
-}
-
-async fn inspect_node(
-    coordinator: &mut pb::coordinator_service_client::CoordinatorServiceClient<
-        adx_transport::rpc::RpcChannel,
-    >,
-    node_id: &str,
-    session_id: &str,
-    timeout: Duration,
-) -> Result<tonic::Response<pb::InspectNodeResponse>, tonic::Status> {
-    let mut request = tonic::Request::new(pb::InspectNodeRequest {
-        node_id: node_id.into(),
-        session_id: session_id.into(),
-    });
-    request.set_timeout(timeout);
-    bounded_rpc(timeout, coordinator.inspect_node(request)).await
-}
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config: Config = read_config()?;
-    config.checkpoint_gc.validate()?;
+    if config.sandboxd_socket.is_none() && config.jiuwenbox.is_none() {
+        return Err("configure sandboxd_socket and/or jiuwenbox".into());
+    }
     let runtime_logs = RuntimeLogs::new(config.runtime_logs.clone())?;
     // Embedded Proxy and Adxlet share this process-wide subscriber and
     // tracer provider; standalone Proxy initializes the same library itself.
@@ -201,17 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
-    let channel_for =
-        |address: String| -> Result<adx_transport::rpc::RpcChannel, Box<dyn std::error::Error>> {
-            Ok(client_tls.wrap(
-                client_tls
-                    .endpoint(&address)?
-                    .connect_timeout(timeout)
-                    .timeout(timeout)
-                    .connect_lazy(),
-            ))
-        };
-    let channel = channel_for(endpoint.clone())?;
+    let channel = coordinator_channel(&client_tls, &endpoint, timeout)?;
     let session_id = uuid::Uuid::new_v4().to_string();
     // Leave part of the operation deadline for a durable fallback after RPC timeout.
     let commit_timeout = if config.degradation_journal.is_some() {
@@ -273,15 +247,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rpc_timeout: timeout,
         runtime_logs: Some(config.runtime_logs.clone()),
     };
-    let runtime = Arc::new(tokio::select! {
-        result = connect_when_ready(
-            config.sandboxd_socket,
-            runtime_config,
-            Duration::from_secs(config.runtime_ready_timeout_seconds),
-            Duration::from_secs(config.report_interval_seconds),
-        ) => result?,
-        _ = shutdown() => return Ok(()),
-    });
+    let jiuwenbox = match config.jiuwenbox {
+        Some(backend) => Some(Jiuwenbox::connect(backend, runtime_config.clone()).await?),
+        None => None,
+    };
+    let sandboxd = match config.sandboxd_socket {
+        Some(socket) => Some(tokio::select! {
+            result = connect_when_ready(socket, runtime_config,
+                Duration::from_secs(config.runtime_ready_timeout_seconds),
+                Duration::from_secs(config.report_interval_seconds)) => result?,
+            _ = shutdown() => return Ok(()),
+        }),
+        None => None,
+    };
+    let runtime = Arc::new(RuntimeRouter::new(sandboxd, jiuwenbox)?);
     // The sandboxd network plugin may create the configured bridge during
     // initialization. Bind only after backend readiness, before admitting work.
     let stream_listener = if let Some((listen, _)) = &stream_setup {
@@ -329,11 +308,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(storage) = checkpoint_storage {
         manager = manager
             .with_checkpointing(
-                storage.build_for_node(
-                    config.node_id.clone(),
-                    session_id.clone(),
-                    config.checkpoint_gc.clone(),
-                )?,
+                storage.build_for_node(config.node_id.clone(), session_id.clone())?,
                 Arc::new(control.clone()),
             )?
             .with_snapshot_catalog(sink.clone())?;
@@ -424,36 +399,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let sample_timeout = timeout.min(Duration::from_secs(config.report_interval_seconds));
         let mut interval =
             tokio::time::interval(Duration::from_secs(config.report_interval_seconds));
-        let mut reconciled = false;
-        let mut gc_jobs = tokio::task::JoinSet::new();
-        let gc_interval = Duration::from_secs(config.checkpoint_gc.interval_seconds);
-        let mut next_gc = tokio::time::Instant::now();
         loop {
             interval.tick().await;
-            while let Some(result) = gc_jobs.try_join_next() {
-                match result {
-                    Ok(Ok(Ok(count))) => {
-                        adx_observability::warn!("remote orphan GC completed: removed={count}")
-                    }
-                    other => adx_observability::warn!("remote orphan GC incomplete: {other:?}"),
-                }
-            }
             if let Some(discovery) = &discovery {
                 match discovery.lookup().await {
                     Ok(found) if found.address != endpoint => {
-                        let channel = channel_for(found.address.clone())?;
+                        let channel = coordinator_channel(&client_tls, &found.address, timeout)?;
                         sink.reconnect(channel.clone());
                         coordinator =
                             pb::coordinator_service_client::CoordinatorServiceClient::new(channel);
                         endpoint = found.address;
-                        reconciled = false;
                     }
                     // Existing channel may remain useful while Redis is unavailable.
                     _ => (),
                 }
-            }
-            if reconciled && manager.sync_proxy().await.is_err() {
-                reconciled = false;
             }
             let mut r = last.clone();
             // A failed capability refresh closes new admission, but existing
@@ -484,138 +443,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                 manager.set_pressure(!accepting);
             }
-            r.heartbeat_sequence = r
-                .heartbeat_sequence
-                .checked_add(1)
-                .ok_or("heartbeat sequence exhausted")?;
-            r.reconciling = !reconciled;
-            r.accepting_allocations = !manager.is_draining()
-                && manager.accepting_allocations()
-                && reconciled
-                && tokio::time::Instant::now() < valid_until;
-            if !reconciled {
-                manager.pause_lifecycle().await;
-            }
-            last = r.clone();
-            match register_node(&mut coordinator, r, timeout).await {
-                Ok(_) if !reconciled => {
-                    let catalog =
-                        inspect_node(&mut coordinator, &config.node_id, &session_id, timeout).await;
-                    match catalog {
-                        Ok(snapshot) => {
-                            let mut catalog = snapshot.into_inner();
-                            if let Some(journal) = &journal {
-                                let records = catalog
-                                    .records
-                                    .iter()
-                                    .cloned()
-                                    .map(TryInto::try_into)
-                                    .collect::<adx_core::Result<Vec<_>>>()?;
-                                if let Err(error) = journal.recover(&records).await {
-                                    adx_observability::warn!(
-                                        "degradation journal recovery incomplete: {error}"
-                                    );
-                                    continue;
-                                }
-                                // Replay may change executions and checkpoint ownership. Fetch
-                                // both Environment and snapshot records from the same fresh catalog.
-                                catalog = match inspect_node(
-                                    &mut coordinator,
-                                    &config.node_id,
-                                    &session_id,
-                                    timeout,
-                                )
-                                .await
-                                {
-                                    Ok(snapshot) => snapshot.into_inner(),
-                                    Err(error) => {
-                                        adx_observability::warn!(
-                                            "fresh node catalog unavailable after journal recovery: {error}"
-                                        );
-                                        continue;
-                                    }
-                                };
-                            }
-                            let records = catalog
-                                .records
-                                .into_iter()
-                                .map(TryInto::try_into)
-                                .collect::<adx_core::Result<Vec<_>>>()?;
-                            let snapshots = catalog
-                                .snapshots
-                                .into_iter()
-                                .map(TryInto::try_into)
-                                .collect::<adx_core::Result<Vec<_>>>()?;
-                            let retained = catalog
-                                .retained_checkpoints
-                                .into_iter()
-                                .map(|cp| {
-                                    adx_core::RestorePoint::try_from(cp).map(|cp| cp.artifact)
-                                })
-                                .collect::<adx_core::Result<Vec<_>>>()?;
-                            let recovery = manager.reconcile_retained(records, snapshots, retained);
-                            tokio::pin!(recovery);
-                            // Large catalogs must not expire a healthy node while
-                            // the serial controllers restore bindings and commit results.
-                            loop {
-                                tokio::select! {
-                                    result = &mut recovery => {
-                                        match result {
-                                            Ok(()) => reconciled = true,
-                                            Err(error) => adx_observability::warn!("node reconciliation incomplete: {error}"),
-                                        }
-                                        break;
-                                    }
-                                    _ = interval.tick() => {
-                                        last.heartbeat_sequence = last.heartbeat_sequence.checked_add(1).ok_or("heartbeat sequence exhausted")?;
-                                        if register_node(&mut coordinator, last.clone(), timeout).await.is_err() {
-                                            // Cancellation leaves the gate closed. Accepted controller
-                                            // work completes independently and retries on the next catalog.
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(error) => adx_observability::warn!(
-                            "authoritative node catalog unavailable; lifecycle remains closed: {error}"
-                        ),
-                    }
-                }
-                Ok(_) => {
-                    if let Some(journal) = &journal {
-                        if let Err(error) = journal.flush().await {
-                            if matches!(
-                                error,
-                                adx_core::Error::Conflict | adx_core::Error::NotFound
-                            ) {
-                                reconciled = false;
-                                manager.pause_lifecycle().await;
-                            }
-                            adx_observability::warn!(
-                                "degradation journal publication incomplete: {error}"
-                            );
-                            continue;
-                        }
-                    }
-                    if config.checkpoint_gc.enabled
-                        && gc_jobs.is_empty()
-                        && tokio::time::Instant::now() >= next_gc
-                    {
-                        next_gc = tokio::time::Instant::now() + gc_interval;
-                        let manager = manager.clone();
-                        gc_jobs.spawn(async move {
-                            tokio::time::timeout(timeout, manager.collect_remote_orphans()).await
-                        });
-                    }
-                }
-                Err(status) => {
-                    if status.code() == tonic::Code::FailedPrecondition {
-                        reconciled = false;
-                    }
-                    adx_observability::warn!(
-                        "node heartbeat unavailable; waiting to register or reconcile"
-                    );
+            last = r;
+            // Startup and every reporting period use the same complete authority
+            // cycle for every configured runtime. The cycle publishes readiness
+            // immediately after success, before waiting for the next report tick.
+            match adxlet::node_reconciliation::reconcile_node(
+                &mut coordinator,
+                &mut last,
+                &manager,
+                journal.as_deref(),
+                timeout,
+                Duration::from_secs(config.report_interval_seconds),
+                valid_until,
+            )
+            .await
+            {
+                Ok(()) => (),
+                Err(error) => {
+                    adx_observability::warn!(accepting_allocations=manager.accepting_allocations(), %error, "authoritative node reconciliation incomplete")
                 }
             }
         }
@@ -660,7 +505,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(inventory) => inventory.into_iter().map(|item| item.runtime_id).collect(),
                 Err(error) => {
                     adx_observability::warn!(
-                        "runtime log GC skipped; sandboxd inventory unavailable: {error}"
+                        "runtime log GC skipped; backend inventory unavailable: {error}"
                     );
                     continue;
                 }
@@ -755,19 +600,91 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn execd_readiness_poll_keeps_startup_jitter_below_twenty_milliseconds() {
-        assert!(execd_ready_poll_interval() <= Duration::from_millis(20));
+    // A single-method service probes the production Coordinator channel without
+    // requiring Redis or reproducing Coordinator scheduling in this fixture.
+    struct DelayedResponse;
+
+    #[tonic::async_trait]
+    impl pb::auth_service_server::AuthService for DelayedResponse {
+        async fn verify_api_key(
+            &self,
+            _: tonic::Request<pb::VerifyApiKeyRequest>,
+        ) -> Result<tonic::Response<pb::VerifyApiKeyResponse>, tonic::Status> {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            Ok(tonic::Response::new(pb::VerifyApiKeyResponse::default()))
+        }
     }
 
     #[tokio::test]
-    async fn bounded_rpc_releases_a_stalled_heartbeat() {
-        let result = bounded_rpc(
-            Duration::from_millis(10),
-            std::future::pending::<Result<(), tonic::Status>>(),
-        )
-        .await;
+    async fn coordinator_channel_honors_long_and_short_request_deadlines() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(pb::auth_service_server::AuthServiceServer::new(
+                    DelayedResponse,
+                ))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async {
+                        let _ = stopped.await;
+                    },
+                )
+                .await
+                .unwrap();
+        });
+        let transport = RpcClient::network(adx_protocol::auth::Principal::Node("n".into()));
+        let channel =
+            coordinator_channel(&transport, &address.to_string(), Duration::from_millis(100))
+                .unwrap();
+        let mut client = pb::auth_service_client::AuthServiceClient::new(channel);
 
-        assert_eq!(result.unwrap_err().code(), tonic::Code::DeadlineExceeded);
+        // ForwardCreate already supplies its full remaining create budget.
+        // The channel must allow a response later than the ordinary RPC cap.
+        let mut long = tonic::Request::new(pb::VerifyApiKeyRequest::default());
+        long.set_timeout(Duration::from_secs(2));
+        let long_result = client.verify_api_key(long).await;
+
+        // Removing the channel cap must still respect each short RPC deadline.
+        let mut short = tonic::Request::new(pb::VerifyApiKeyRequest::default());
+        short.set_timeout(Duration::from_millis(50));
+        let short_result = client.verify_api_key(short).await;
+        let _ = stop.send(());
+        server.await.unwrap();
+
+        assert!(
+            long_result.is_ok(),
+            "long request was cut short: {long_result:?}"
+        );
+        let error = short_result.unwrap_err();
+        assert!(
+            matches!(
+                error.code(),
+                tonic::Code::Cancelled | tonic::Code::DeadlineExceeded
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn jiuwenbox_example_configures_a_node_without_sandboxd() {
+        let config: Config = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/config/examples/node-jiuwenbox.json"
+        )))
+        .unwrap();
+        assert!(config.sandboxd_socket.is_none());
+        config.jiuwenbox.as_ref().unwrap().validate().unwrap();
+        assert!(matches!(
+            config.resource_source,
+            Some(ResourceSource::Auto { .. })
+        ));
+        assert!(config.checkpoint_dir.is_none());
+    }
+
+    #[test]
+    fn execd_readiness_poll_keeps_startup_jitter_below_twenty_milliseconds() {
+        assert!(execd_ready_poll_interval() <= Duration::from_millis(20));
     }
 }

@@ -16,6 +16,10 @@ def configure(mode, node, services, redis_url, private, state):
     if mode not in MODES:
         raise ValueError('invalid Activator E2E mode')
     namespace = 'acceptance-agent'
+    sandbox_network = {
+        'sandbox_cidrs': ['10.231.16.0/20', '10.231.32.0/20'],
+        'internal_cidrs': [], 'public_egress': False, 'egress_allow': [],
+    }
     token_file = private / 'activator-key'
     if not token_file.exists():
         token_file.write_text(secrets.token_hex(32))
@@ -24,6 +28,7 @@ def configure(mode, node, services, redis_url, private, state):
         agent = {'activator': {'urls': ['http://coordinator:18091', 'http://node2:18091'], 'token_env': 'ADX_ACTIVATOR_SERVICE_TOKEN', 'allow_plaintext': True}}
         activator = {
             'listen': '0.0.0.0:18091', 'redis_url': redis_url, 'namespace': namespace,
+            'sandbox_network': sandbox_network,
             'environment_url': 'http://127.0.0.1:8888', 'environment_api_key_envs': {'e2e': 'ADX_PLATFORM_TENANT_API_KEY'},
             'environment_ca_file': None, 'allow_plaintext_transport': True, 'request_timeout_seconds': 120,
             'registration': {'instance_id': node, 'advertise_url': f'http://{"coordinator" if node == "node1" else "node2"}:18091', 'lease_seconds': 15, 'heartbeat_seconds': 5},
@@ -32,7 +37,7 @@ def configure(mode, node, services, redis_url, private, state):
         path.write_text(json.dumps(activator))
         path.chmod(0o600)
     else:
-        agent = {'embedded': {'redis_url': redis_url, 'namespace': namespace}}
+        agent = {'embedded': {'redis_url': redis_url, 'namespace': namespace, 'sandbox_network': sandbox_network}}
     agent['timeout_seconds'] = 120
     path = state / 'agent.json'
     path.write_text(json.dumps(agent))

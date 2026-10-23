@@ -354,9 +354,10 @@ impl Controller {
                 state.prepare = Some(request);
                 self.publish(&mut state);
                 let controller = self.clone();
+                let preparation_operation = operation_id.clone();
                 // Accepted preparation survives cancellation of either transport.
                 tokio::spawn(async move {
-                    controller.prepare_guest().await;
+                    controller.prepare_guest(preparation_operation).await;
                 });
             }
         }
@@ -378,7 +379,7 @@ impl Controller {
                 .map_err(|_| Error::Unavailable("control stopped".into()))?;
         }
     }
-    async fn prepare_guest(self: Arc<Self>) {
+    async fn prepare_guest(self: Arc<Self>, operation_id: String) {
         // Serialize guest preparation, rollback, and backend completion. A retained
         // reader can finish while a later operation is preparing guest services.
         let _cooperation = self.cooperation.lock().await;
@@ -387,16 +388,21 @@ impl Controller {
         }
         let open_reader = !self.status_reader_running();
         let reader = if open_reader {
-            let hooks = self.hooks.clone();
-            match tokio::task::spawn_blocking(move || hooks.open()).await {
-                Ok(Ok(reader)) => Some(reader),
-                result => {
-                    let error = match result {
-                        Ok(Err(error)) => error.to_string(),
-                        Err(error) => error.to_string(),
-                        Ok(Ok(_)) => return,
-                    };
-                    self.fail_preparation(error, RuntimePhase::Running);
+            execd_info!(
+                "[checkpoint-control] handoff_task_started operation={}",
+                operation_id
+            );
+            match super::checkpoint_handoff::open(self.hooks.clone(), operation_id.clone()).await {
+                Ok(reader) => {
+                    execd_info!(
+                        "[checkpoint-control] handoff_open_joined operation={}",
+                        operation_id
+                    );
+                    Some(reader)
+                }
+                Err(error) => {
+                    self.fail_preparation(error.to_string(), RuntimePhase::Running);
+                    super::activity::reopen();
                     return;
                 }
             }
@@ -414,7 +420,7 @@ impl Controller {
             };
             // Preserve the handoff reader even when guest preparation fails.
             if let Some(reader) = reader {
-                self.spawn_reader(reader);
+                self.spawn_reader(reader, operation_id);
             }
             self.fail_preparation(message, phase);
             return;
@@ -428,9 +434,14 @@ impl Controller {
                 checkpoint.phase = CheckpointPhase::Prepared;
             }
             self.publish(&mut state);
+            execd_info!(
+                "[checkpoint-control] prepared_published operation={} revision={}",
+                operation_id,
+                state.status.revision
+            );
         }
         if let Some(reader) = reader {
-            self.spawn_reader(reader);
+            self.spawn_reader(reader, operation_id);
         }
     }
     fn status_reader_running(&self) -> bool {
@@ -439,13 +450,13 @@ impl Controller {
             .map(|state| state.reader_running)
             .unwrap_or(true)
     }
-    fn spawn_reader(self: &Arc<Self>, reader: Handoff) {
+    fn spawn_reader(self: &Arc<Self>, reader: Handoff, operation_id: String) {
         if let Ok(mut state) = self.state.lock() {
             state.reader_running = true;
         }
         let controller = self.clone();
         tokio::spawn(async move {
-            controller.read_handoff(reader).await;
+            controller.read_handoff(reader, operation_id).await;
         });
     }
     fn fail_preparation(&self, error: String, phase: RuntimePhase) {
@@ -458,8 +469,17 @@ impl Controller {
             self.publish(&mut state);
         }
     }
-    async fn read_handoff(self: Arc<Self>, reader: Handoff) {
+    async fn read_handoff(self: Arc<Self>, reader: Handoff, operation_id: String) {
+        execd_info!(
+            "[checkpoint-control] handoff_wait_started operation={}",
+            operation_id
+        );
         let outcome = reader.await;
+        execd_info!(
+            "[checkpoint-control] handoff_wait_completed operation={} outcome={:?}",
+            operation_id,
+            outcome
+        );
         let _cooperation = self.cooperation.lock().await;
         let previous = {
             let mut state = self.state.lock().unwrap();

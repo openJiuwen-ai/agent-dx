@@ -431,7 +431,8 @@ pub async fn run(deployment: Deployment) -> Result<()> {
                                     "services": service_status,
                                 })
                             }
-                            Err(_) => {
+                            Err(error) => {
+                                eprintln!("stop cleanup incomplete: {error}");
                                 json!({"ok": false, "error": "cleanup or termination failed"})
                             }
                         }

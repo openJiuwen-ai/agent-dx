@@ -60,6 +60,8 @@ async fn embedded_file_directory_accepts_new_specs_without_legacy_credentials() 
             .contains_key("EXECD_HTTP_TOKEN"));
         records.push(pb::PublishedEnvironment {
             record: Some(pb::EnvironmentRecord {
+                execution_artifacts: vec![],
+                snapshot_source: None,
                 spec: Some(spec),
                 state: state as i32,
                 assignment: Some(pb::Assignment {

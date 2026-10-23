@@ -5,8 +5,14 @@ use tonic::{Code, Status};
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ErrorDetail<'a> {
+    #[serde(skip_serializing_if = "Vec::is_empty", rename = "sandbox_ids")]
+    pub sandbox_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", rename = "template_ids")]
+    pub template_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub probe_failure: Option<adx_core::probes::ProbeFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduling_failure: Option<adx_core::scheduling::SchedulingFailure>,
     pub code: ErrorCode,
     pub retry: RetryDirective,
     pub outcome: OperationOutcome,
@@ -27,8 +33,24 @@ impl<'a> ErrorDetail<'a> {
     ) -> Self {
         let probe_failure =
             serde_json::from_slice::<adx_core::probes::ProbeFailure>(status.details()).ok();
+        let blockers = serde_json::from_slice::<serde_json::Value>(status.details())
+            .ok()
+            .filter(|v| v["code"] == "SNAPSHOT_IN_USE");
+        let scheduling_failure = adx_protocol::scheduling_failure(status);
         let terminal_deadline = adx_protocol::deadline_failure(status).is_some();
-        let (code, retry, outcome) = if terminal_deadline {
+        let (code, retry, outcome) = if blockers.is_some() {
+            (
+                ErrorCode::SnapshotInUse,
+                RetryDirective::Never,
+                OperationOutcome::NotStarted,
+            )
+        } else if scheduling_failure.is_some() {
+            (
+                ErrorCode::DeadlineExceeded,
+                RetryDirective::Never,
+                OperationOutcome::NotStarted,
+            )
+        } else if terminal_deadline {
             (
                 ErrorCode::DeadlineExceeded,
                 RetryDirective::Never,
@@ -124,7 +146,16 @@ impl<'a> ErrorDetail<'a> {
             }
         };
         Self {
+            sandbox_ids: blockers
+                .as_ref()
+                .and_then(|v| serde_json::from_value(v["sandbox_ids"].clone()).ok())
+                .unwrap_or_default(),
+            template_ids: blockers
+                .as_ref()
+                .and_then(|v| serde_json::from_value(v["template_ids"].clone()).ok())
+                .unwrap_or_default(),
             probe_failure,
+            scheduling_failure,
             code,
             retry,
             outcome,

@@ -1,0 +1,122 @@
+{
+  "node_id": "node-1",
+  "listen": "0.0.0.0:19001",
+  "advertised_address": "node-1:19001",
+  "proxy_address": "node-1:19002",
+  "tls": {
+    "ca": "/opt/adx/config/tls/ca.pem",
+    "certificate": "/opt/adx/config/tls/node-1.pem",
+    "private_key": "/opt/adx/config/tls/node-1.key",
+    "server_name": "adx.internal",
+    "peers": {
+      "coordinator": "/opt/adx/config/tls/coordinator.der",
+      "apiserver": "/opt/adx/config/tls/apiserver.der"
+    }
+  },
+  "runtime_logs": {
+    "directory": "/opt/adx/logs/runtime"
+  },
+  "proxy_mode": "standalone",
+  "proxy_socket": "/opt/adx/run/route.sock",
+  "report_interval_seconds": 5,
+  "rpc_timeout_seconds": 30,
+  "execd_port": 50090,
+  "execd_env": {},
+  "discovery": {
+    "redis_url": "redis://127.0.0.1:6379/",
+    "namespace": "adx"
+  },
+  "resource_source": {
+    "kind": "auto",
+    "disk_path": "/opt/adx/data",
+    "valid_for_seconds": 30
+  },
+  "degradation_journal": "/opt/adx/data/degraded/results.sqlite",
+  "pressure": {
+    "disk_path": "/opt/adx/data",
+    "thresholds": {
+      "memory_high_percent": 90,
+      "memory_low_percent": 80,
+      "disk_high_percent": 90,
+      "disk_low_percent": 80
+    }
+  },
+  "metrics_listen": "127.0.0.1:19091",
+  "runtime_ready_timeout_seconds": 120,
+  "runtime_profile": {
+    "rootfs": {
+      "runtime_class": "supervisor",
+      "type": "local",
+      "path": "/opt/adx/current/runtime/adx-runtime-rootfs.img",
+      "readonly": false
+    },
+    "bootstrap": {
+      "type": "erofs",
+      "root": "/opt/adx/current/runtime/adx-runtime-rootfs.img",
+      "target": "/__adx",
+      "entrypoint": [
+        "/__adx/usr/local/bin/adx-execd"
+      ],
+      "image_process_config": "/etc/adx-image-process.json"
+    },
+    "env": {
+      "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    }
+  },
+  "jiuwenbox": {
+    "socket": "/run/jiuwenbox/jiuwenbox.sock",
+    "conch_socket": "/var/run/conch/conchd.sock",
+    "state_dir": "/opt/adx/data/jiuwenbox",
+    "bootstrap": {
+      "image": "/opt/adx/current/runtime/adx-runtime-rootfs.img",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "target": "/__adx",
+      "command": [
+        "/__adx/usr/local/bin/adx-execd"
+      ]
+    },
+    "classes": {
+      "supervisor": {
+        "images": {
+          "jiuwenswarm-agent:v1": {
+            "process": {
+              "args": [
+                "jiuwenswarm-agentserver",
+                "--port",
+                "18092"
+              ],
+              "cwd": "/home/agentos",
+              "user": "agentos"
+            }
+          }
+        },
+        "policy": {
+          "process": {
+            "run_as_user": "root",
+            "run_as_group": "root"
+          },
+          "namespace": {
+            "user": false
+          }
+        }
+      },
+      "conch": {
+        "images": {
+          "jiuwenswarm-agent:v1": {
+            "template_name": "jiuwenswarm-agent-v1",
+            "process": {
+              "args": [
+                "jiuwenswarm-agentserver",
+                "--port",
+                "18092"
+              ],
+              "cwd": "/home/agentos",
+              "user": "agentos"
+            }
+          }
+        }
+      }
+    }
+  },
+  "execd_health_failure_threshold": 3
+}

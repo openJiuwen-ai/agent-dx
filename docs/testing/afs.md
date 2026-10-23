@@ -210,7 +210,7 @@ AFS 并排空导出后再停止 collector。全采样结果用于归因，不能
 
 观测范围包括 FUSE 排队和请求大小、dirty 预算触发的准备／上传／发布、S3 worker
 排队、读端授权／缓存分支／整块装载／摘要校验／分段复制，以及 Meta 合并提交的
-fork／clone／sort／编码字节／etcd CAS。跨线程和 RPC 保留 trace 关联，合并提交通过
+历史快照候选的fork／clone／sort／编码字节／etcd CAS；当前canonical候选记录操作日志append，不混用旧阶段字段。跨线程和 RPC 保留 trace 关联，合并提交通过
 links 关联多个请求；不能把多请求共有批次、嵌套 span 或并行 PUT 时间重复相加。
 处理字节是逻辑读取／哈希／复制量，不代表物理磁盘 I/O；不同 VM 的时间戳不能直接
 相减来计算单向网络时延。
@@ -588,6 +588,13 @@ RSS允许偏差和观测窗口，完成原提交入口、释放所有引用后�
 未知 Meta ACK 精确重试、停止排空，以及受影响 OwnerFs／RN／RDMA／S3 回归。完整BLAKE3、授权、
 成功 fsync 和 close-to-open 不因这些优化放松；RDMA仍按现有独立注册 endpoint 缓冲合同验证。
 
+## Peer HTTP/2接收帧验证
+
+`dfs_peer_receive_cap_reduces_actual_http2_data_frames`用原有64KiB业务流式协议分别经
+显式16KiB控制Channel和生产PeerConnectionPool交付同一128KiB正文，先核正文、原解码器、
+EOF和单次RPC，再比较透明代理按HTTP/2头读取的非空DATA帧。代理只用于机制断言，不以其
+耗时或CPU作为产品收益；流控、消息、正文、控制和并发预算必须保持。
+
 ## Peer 完整对象唯一核根回归
 
 Header固定consumer Tree或producer/plain checksum，之后不切换。分别验证新Peer证明、
@@ -765,3 +772,233 @@ receipt安装的实际容量拒绝属于已记录的业务失败，不是外层�
 handle错误cursor与对象尝试错误分别验证；恢复后仍可能消费历史异步错误，不能规定
 任意固定重试次数必定成功。正常drain首个inode提交失败可中止后续inode发布，必须返回
 失败；该best-effort边界不降低成功fsync持久性，也不等于真实持FD dirty停止已验收。
+
+## Meta 操作日志的有限组件回归
+
+阶段功能范围、改动导航、优化前后工程摸底与未完成项见[Meta P3阶段交付报告](afs-meta-p3.md)。
+
+Linux 上复用 workspace Cargo 入口：
+
+```sh
+cargo test --locked -p afs --lib p3_initialization
+cargo test --locked -p afs --lib p3_recovery_
+cargo test --locked -p afs --lib p3_lifecycle
+cargo test --locked -p afs --lib grant_lifecycle
+cargo test --locked -p afs --lib p3_configured
+cargo test --locked -p afs --lib p3_production_recovery
+cargo test --locked -p afs --lib p3_checkpoint
+cargo test --locked -p afs --lib p3_segments
+cargo test --locked -p afs --lib p3_maintenance
+cargo test --locked -p afs --lib p3_operational
+cargo test --locked -p afs --lib p3_history
+cargo test --locked -p afs --lib p3_retention
+cargo test --locked -p afs --lib p3_views
+cargo test --locked -p afs --lib p3_lock_owner
+cargo test --locked -p afs --lib p3_watch_
+cargo test --locked -p afs --test meta_log_contract
+cargo test --locked -p afs --test config_contract
+```
+
+`p3_initialization` 覆盖初始化中断后的身份保持，以及未知／非空残留拒绝；
+`p3_recovery_` 覆盖缺 CURRENT、新非空 WAL 未列入选择集及精确空预备段。
+重复六次 image rename 后 SIGKILL 另验证孤儿镜像不会耗尽后续安装额度，
+外来／损坏镜像不被误删。`p3_lifecycle` 验证已完成命令／ACK 的有界成对回收、
+引用退休和恢复重建，保留 pending／failed／活动屏障及旧 session 拒绝记录。
+这些新增例不构成完整权威实体回收或物理掉电认证。
+
+`meta.rs` 共享启动工厂测试检查实际后端选择、原会话／原结果重开、易失 memory、
+坏完整记录及旧格式拒绝。占用端口的反例确保恢复失败先于 bind；身份策略仍先于后端访问。
+`meta_log_contract` 通过领域 API 验证 create／rename／unlink、固定读视图、watch 次序、
+重开与原结果幂等重放，确认不新增长期重试记录。配置测试覆盖默认、CLI 优先和非法上限。
+测试数据应在 guest 原生文件系统的显式 TMPDIR 中，不把容器默认 overlay 当成 ext4 证据。
+
+上述入口分别提供组件及下述进程故障证据，不等于物理掉电、FUSE A 写 B 读、完整 P3 或性能验收。
+`p3_checkpoint` 另外检查自包含状态编码、显式安装后真实 LocalLog／Store 重开、
+后续记录不重复应用、原结果／完成时间／epoch 保留、损坏快照安全回退、身份与
+CURRENT 校验拒绝、临时文件计账及调用方取消后的单飞所有权。
+`p3_checkpoint_process_crash_matrix` 在实际测试子进程中覆盖半写image、image已安装、
+CURRENT切换后、退休段删除中，以及新空段选择前／后六个SIGKILL位置；核对原ACK／结果、
+完整状态和后续追加。它是同内核进程故障验证，不能替代物理掉电或真实产品FUSE运行。
+`p3_segments` 检查小阈值轮转、三个checkpoint后
+旧段文件实际删除、最新快照损坏时从上一份补齐全部提交，以及文件数容量拒绝前
+文件内容不变、缺少必需段则拒绝恢复。此处未专项测量物理空间峰值／回收延迟。
+`p3_maintenance` 检查无手动调用的后台安装、写前等待不追加／不发布、超时后仍健康，
+与已实际写入却返回StorageFull的未知结果不重试；另检查memory移除已覆盖记录和
+CURRENT临时文件采用独立清单上限。它不替代真实磁盘满／完整资源窗口及进程故障验证。
+`p3_operational` 进一步检查真实LocalLog四槽压力下24笔确认可继续、观察期限后仍保持
+原快照任务／捕获所有权、捕获额度超限在install前拒绝且不毒化权威。四槽用例的文件数／
+字节是提交后的采样，进程故障用例记录文件分配块字节；均不等于大场景磁盘峰值或RSS。
+P3-4修改成组后已执行完整默认AFS库门禁；后续P3-5已补管理历史回收组件回归，
+完整产品及资源验收仍待完成。旧格式和失败证据保持原身份，不据组件通过提升完整验收结论。
+
+`p3_history` 的选择器回归分别检查原完成时间／条数／字节、受保护请求和每次工作上限，
+时间回退时事件仍按完整revision前缀处理。状态／实际LocalLog回归检查确定清理的精确
+代际、业务revision不变而日志位置推进、WAL重开和checkpoint＋后缀不复活旧结果，
+并核对后续事件序号、Compacted重扫及错误关联清理不部分发布业务前缀。
+`p3_retention` 检查 owned String／Vec capacity 的完整计账及独立结构预留、计数／字节
+拒绝、恢复重建索引、业务关联清理持久后可见、空闲及持续重复请求期间的定时清理，
+以及取消调用者仍由写者持有额度、未知ACK后停止后续管理记录。
+排队重试回归通过持久 ACK 门控使历史清理与待组批重试确定性交错，核对原结果不被
+再次执行；另检查同身份引用计数、末引用释放、退休冲突和身份字节上限。新事件计账只访问本次
+新增尾部，不遍历旧历史前缀；原完成时间不因查询、重试或重启而延长。
+`p3_retention_local_runtime` 在真实LocalLog上运行Store actor，检查空闲到期的管理记录
+持久后checkpoint／重开不复活结果，以及降额启动时先持久清理、再次放宽后仍保持原水位。
+这两项是同进程正常释放重开，不是产品CLI、跨进程故障或物理掉电证明。
+`p3_views` 核对主状态owned容量的增量计账／恢复、同State共享、跨代际数量／字节
+拒绝、空闲期限回收、执行中引用不提前退账、已知权威失效，以及并发快速创建／丢弃时
+登记元数据仍有界。普通写者不被旧视图准入拒绝阻塞；期限后的读不得交付成功。
+`p3_lock_owner` 用真实duplicated fd验证最后创建进程持有者解锁，不依赖额外fd关闭，
+并模拟外来进程归属，验证全部I/O在调度／改盘前拒绝、外来Drop不解开父进程的锁。
+它证明的是描述符生命周期合同，不单独证明某次历史锁失败必然由fork造成。
+`p3_watch_` 覆盖复制前的条数／owned字节拒绝、请求limit=0仍有限、超限revision整体回退
+及不伪造Compacted。响应持有回归检查独立条数／字节准入、固定登记表、取消／EOF退账、
+空闲队列主动释放、旧代际不误释新槽位，以及已过期构建者退出前不提前退账。
+真实RPC用例有意保留完全未poll的流31秒，之后必须报错且不交付旧命令；并非测试卡住。
+Root命令接口契约及受影响真实gRPC丢ACK修复用例补充核对接线与错误语义。
+这些是有限组件证据，不覆盖公共RPC／socket缓冲的整体资源、完整产品运行及资源验收，
+不等于24h长稳或新的性能结论；新记录／image不继承旧版本运行结论。
+
+P3-6有限配置回归包括默认local-file、退役选项拒绝、TOML／CLI覆盖和非法范围。
+共享启动工厂的有限运行测试另核对实际历史条数／空闲过期、恢复后不复活、
+短周期checkpoint与WAL分段；序列化配置正确不替代运行接线证据。
+旧快照StoreBackend、etcd／Redis适配和专属测试已按clean-break移除；保留现有领域、健康故障和丢ACK重放断言并改用canonical日志。旧源码与历史结论仍按原版本保留。配置／组件通过不代表真实产品或P3-6全部完成。
+
+### Meta指标与旧工具接线回归
+
+```sh
+python3 -m unittest discover -s build/e2e/afs/acceptance -p test_ownerfs_meta_storage.py -v
+cargo test --locked -p afs --test config_contract p3_cli_retired_backend_errors_explain_safe_migration
+cargo test --locked -p afs --lib p3_metrics_
+cargo test --locked -p afs --lib p3_operational_
+```
+
+纯Python只证明local-file参数／路径在准入、初启与重启一致以及旧选项拒绝；
+真实进程CLI检查迁移指引、exit2与help/version，均不等于真实OwnerFs挂载恢复。
+指标回归核对成功ACK前后计数、失败不发布、history条数／逻辑字节／删除量、独立Registry
+以及Registry不pin权威状态。原checkpoint取消、observer超时和capture拒绝用例同时核对
+在途及成败：observer超时但owned任务仍在执行时，不得提前记任务失败或退在途。
+最新有限软件门禁与此前运行分别记录身份；不据这些断言宣布RSS、性能或24h长稳通过。
+指标名称和重启口径见[部署说明](../deployment/afs.md#meta操作日志指标)。
+
+## Meta canonical 向量容量回归
+
+`p3_root_deactivation_accepts_accumulated_grants_below_byte_budget` 通过实际Store事务
+积累65537份grant，再调用Root停用入口，核对一笔revision移除活动Root，
+完整帧小于4KiB、旧grant仍可留待GC，以及MemoryLog的framed恢复／原结果。
+旧版本曾用一笔事务删除全部grant；该历史结论不能当作当前回收机制。该夹具不是65537次真实授权RPC，
+也不替代同规模LocalLog、真实FUSE或物理掉电验证。
+
+`p3_record_` 四项回归核对原四种向量的合计槽／结构字节额度不增加、
+有长度提示的分配前拒绝、无提示postcard的有界渐进分配、写者与恢复端的几何容量一致，
+以及原12字段序列与schema不变。该共享额度不包括嵌套载荷／整个进程RSS；
+完整编码仍独立受单帧字节上限约束。
+
+`p3_a27_typed_byte_limits_reject_atomically_and_reopen_controls`使用真实LocalLog，
+分别构造512项layout、64份grant和128份copy。测前固定4KiB拒绝／64KiB接纳对照，
+拒绝后核对原公开Arc／revision／所有目录文件字节不变；同一输入在接纳对照提交、
+幂等确认、释放旧句柄并重开后全字段一致。这是typed Store夹具，不是完整
+DfsService的receipt／placement验证。
+`p3_a27_ready_group_keeps_failed_requests_out_of_durable_authority`核对6个ready请求中，
+apply_txn合同错误、canonical深度错误、字节超限和false condition均不产生成功结果，
+正常首尾两笔只用一次物理追加，失败权威不泄漏，重开状态及原结果一致。
+这些回归不证明任意规模合法操作都能在固定结构额度内接纳；大事务的支持范围
+仍须与资源合同一起核对，不能以测试通过替代该交付判断。
+
+```sh
+cargo test --locked --release -p afs --lib --all-features meta::store::tests::p3_root_deactivation_accepts_accumulated_grants_below_byte_budget -- --exact
+cargo test --locked --release -p afs --lib --all-features meta::store::log::tests::p3_record_
+```
+
+
+## OwnerFs epoch 与有界 grant 清理回归
+
+```sh
+cargo test --locked --release -p afs --lib --all-features grant_lifecycle -- --nocapture
+```
+
+针对性用例覆盖：abort/reopen 后 epoch 不复用、并发不同 Root 预留、epoch 耗尽的原子拒绝，
+历史 grant 不放大停用记录，Home 恢复后精确选择新 session/generation，以及有界扫描/删除、
+同 key 重新 acquire 的两种写者顺序、过期当前 Home 的保留、过期/已替代 holder session 回收，
+以及降低单记录额度时小批继续收敛、准备失败不修改公开权威。
+真实 LocalLog 用例核对后台清理、checkpoint、释放旧写者后重开及同名 Root 重建拒绝旧凭证。
+这些用例不替代真实 FUSE/bind 运行、物理掉电、性能或完整 P3 验收；此前候选保持原证据身份。
+
+## Meta 事务资源边界与有限交付回归
+
+业务条件合法和资源可接纳分别判断。当前保持单帧64MiB、批次128MiB、
+canonical共享262144槽及由四类结构宽度计算的原向量容量预算；并不提供无界原子事务。
+Node普通本地写路径另有既存1024个未发布descriptor及4MiB元数据预算，
+外部存储路径继续使用其独立窗口／载荷和descriptor预算。
+这些不是本次回归新增的业务上限，也不能被当作整个进程RSS限制。
+
+一次DFS发布新增K个receipt、每份C_i个copy时，主要权威变更为
+`3 + Σ(2 + C_i + repair_i)`；继承及新layout的extent仍放在一个Layout值中，
+不能把它们错误地计成同数量的顶层canonical条目。字段／标识长度仍计入实际编码字节；
+Root停用只写Root删除和撤权命令，旧grant的物理回收另走有界管理事务。
+namespace、租约和单对象管理操作不因全库对象数量增长而自动变成批量删除。
+
+Linux回归入口：
+
+```sh
+cargo test --locked --release -p afs --test meta_contract --all-features p3_supported_commit_shapes_survive_local_log_reopen -- --exact --nocapture
+cargo test --locked --release -p afs --test meta_log_contract --all-features
+```
+
+前者经过实际RPC适配器、领域receipt／placement核验、canonical和真实LocalLog：
+核对1024个receipt的单副本／三副本，以及一个layout包含65537个extent，
+每次只发布一笔版本、原请求重试不追加、重开恢复inode/layout和原结果。
+ACK来自可信Node测试夹具，不声称真实TCP、正文持久化或物理三副本运行。
+字节超限整笔拒绝／组内失败使用前述`p3_a27_`回归；不能把接纳测试当作超限测试。
+
+有限交付须明确当前已验证配置和工作流。任意更大复制拓扑、长期累积的placement／inode字段、
+直接构造的超大Store事务仍须遵守帧、结构及历史预算；未证明的组合不能宣称全部支持。
+Full FSx和FUN/REL完整harness的未执行状态保持，已有标准、组件和故障证据只能按
+版本及改动影响复用；该有限出口不等于完整P3、完整POSIX或正式性能通过。
+
+
+## 原生CRC与写入代次GC定向检查
+
+原生DFS Node默认启用CRC和写入代次保护，保留capability本地处理及省略逐chunk登记。`generation_`检查覆盖库存保护、无关GC变化、确切代次退休、检查后退休竞态、回复丢失重放、迟到准入与墓碑清理，以及重试保留旧收据时所有出生代次仍须有效。`META_DFS_GC_CHANGED`在CRC路径指相关代次缺失/退休；不再把无关全局GC变化当作失败。`meta::dfs::gc_fence_tests::`同时保留显式BLAKE3对照路径的原条件事务检查。
+
+`crc32c_`检查覆盖描述及Meta wire、CRC向量/末段、独立ID、原ID复制/修复、catalog重开、跨段读取、损坏/缺表/错表/截断拒绝、局部覆盖、截短/扩容、部分成功后失败重试，以及远端Header/Completion身份和范围。all-features还核对RDMA CRC Completion与Meta绑定；这不是RDMA硬件运行。`meta_capability_`保持原inode映射及错误顺序，`pr88_fix_`保留组合开关和尾块重试检查。Rust检查只在Linux执行。
+
+```sh
+cargo test --release -p afs --lib generation_ -- --test-threads=1
+cargo test --release -p afs --lib crc32c_ --all-features -- --test-threads=1
+cargo test --release -p afs --lib meta::dfs::gc_fence_tests:: -- --test-threads=1
+cargo test --release -p afs --lib pr88_fix_ -- --test-threads=1
+cargo test --release -p afs --lib meta_capability_ -- --test-threads=1
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
+
+### 1GiB多副本、跨节点读与正常修复
+
+`build/e2e/afs/scripts/dfs/crc32c_general.py`复用现有OwnerFs TLS/生命周期和三节点DFS工具。在独立Linux网络及挂载namespace内启动Meta与A/B/C；写入1GiB单文件（1024次串行1MiB pwrite），同fd真实fsync，desired=3、sync-required=2、min-distinct-nodes=2、local-copy=required。正常GC始终启用，修复worker补齐第三份；不手工复制或停GC。随后启动空数据目录的D，完整读回1GiB及非对齐/EOF范围，核对数据面流量、内容SHA和三份物理正文/catalog。正常退出必须真实wait0并无遗留挂载。
+
+```sh
+sudo unshare --mount --net --propagation private sh -c '
+  ip link set lo up
+  exec python3 build/e2e/afs/scripts/dfs/crc32c_general.py \
+    --repo "$PWD" --binary-dir "$PWD/out/bin" \
+    --work-root /path/to/fresh-crc-general-run --require-defaults
+'
+```
+
+需预先构建Linux产品二进制，work-root必须全新，具备`/dev/fuse`、OpenSSL、iproute2和至少5GiB可用空间；运行前排除端口及已有服务冲突。证据目录包含配置、二进制身份、公共指标、实际字节、修复完成日志、物理副本内容及结果。背景提交周期在此固定60000ms以避免定时发布切分单次验收。该驱动是限定功能/持久化E2E，不是吞吐前后对照，也不证明多VM、物理故障域、断电或HA。性能收益须另有相同完整业务完成点的比较，不能引用历史单副本倍率当作本轮结果。
+
+
+### PR88审阅修复：组合开关和尾块重试
+
+`pr88_fix_`定向检查同时开启Meta最终验号和CRC新写：先写入并FullSync，再单独截短、扩容并FullSync，检查长度、已有内容、扩容补零和每代固定写入保护凭据。纯长度变更在准备提交时取得凭据，并在准备失败后的重试中保留它。
+
+尾块检查将两个小块真实持久化，模拟第二份收据丢失，再次FullSync；要求第一块不重复提交、第二块沿用原ID、最终只有两个本地对象且完整内容正确，重试不重新获取GC凭据。尾块的不可变上传状态在等待I/O前保存在冻结范围中；仍按原顺序等待，不增加后台可见范围或并行补投。这些是定向正确性检查，本轮未重跑1GiB性能实验。
+
+
+### PR93长度变更准备失败后的代次身份
+
+`pr93_fix_`在Linux复用真实Meta gRPC服务及Store事务夹具（Meta使用MemoryLog），分别覆盖截短和扩容。CRC原正文真实落盘并发布后，新代次登记成功，注入一次准备失败；重试必须使用原保护携带的operation，而不是另造代次。检查旧head在失败时保持不变、原代次引用无逐chunk登记、重试通过Meta真实验号并原子退休原引用，以及最终长度、保留内容与扩容补零。它是组件正确性检查，不是FUSE/断电或性能验收。
+
+```sh
+cargo test --release -p afs --lib pr93_fix_ -- --test-threads=1
+```

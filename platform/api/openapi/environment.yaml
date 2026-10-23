@@ -788,6 +788,16 @@ components:
           type: string
           description: Required unless snapshotId or the deployment Runtime Environment supplies the rootfs.
         runtime: {type: string}
+        user:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Tool runtime POSIX name or decimal UID. Requires group. Currently supported by Conch; other runtimes reject. Cannot combine with inheritEntrypoint or snapshotId.
+        group:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Tool runtime POSIX name or decimal GID, paired with user. Shared mounts must already grant this identity access; existing ownership is not changed.
         cwd:
           type: string
           pattern: "^/"

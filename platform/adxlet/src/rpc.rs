@@ -7,7 +7,10 @@ use adx_protocol::{
     auth::{tenant, Peers, Principal},
     control as pb, dependency_status, status,
 };
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tonic::{transport::Channel, Request, Response, Status};
 
 #[derive(Clone)]
@@ -155,17 +158,20 @@ impl pb::node_service_server::NodeService for NodeRpc {
         if owner != assignment {
             return Err(Status::failed_precondition("assignment changed"));
         }
+        let gate_started = Instant::now();
         let gate = self.manager.lifecycle_ready.read().await;
+        let gate_wait_ms = gate_started.elapsed().as_secs_f64() * 1_000.0;
         if !*gate || self.manager.is_draining() {
             return Err(Status::unavailable("node is reconciling or draining"));
         }
-        response(
-            handle
-                .ensure_running(r.operation_id)
-                .await
-                .map_err(status)?,
-        )
-        .map_err(status)
+        let controller_started = Instant::now();
+        let result = handle.ensure_running(r.operation_id).await;
+        adx_observability::info!(
+            event = "node_ensure_running_stages", environment_id = %assignment.environment_id,
+            gate_wait_ms, controller_ms = controller_started.elapsed().as_secs_f64() * 1_000.0,
+            success = result.is_ok(), "node ensure running stages completed"
+        );
+        response(result.map_err(status)?).map_err(status)
     }
     async fn create_local_environment(
         &self,

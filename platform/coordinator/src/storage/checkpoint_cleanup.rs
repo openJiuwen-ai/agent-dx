@@ -120,6 +120,15 @@ impl Session {
         if let Some(cp) = &result.checkpoint {
             artifacts.push(cp.artifact.clone());
         }
+        for record in old.result.iter().chain(std::iter::once(result)) {
+            artifacts.extend(
+                record
+                    .execution_artifacts
+                    .iter()
+                    .filter(|artifact| artifact.size_bytes == 0)
+                    .cloned(),
+            );
+        }
         artifacts.sort_by(|a, b| {
             (&a.storage, &a.scope, &a.location, a.size_bytes).cmp(&(
                 &b.storage,
@@ -158,14 +167,24 @@ impl Session {
             if retiring == Some(environment.spec.id.as_str()) {
                 continue;
             }
-            if environment
-                .result
-                .as_ref()
-                .and_then(|r| r.checkpoint.as_ref())
-                .is_some_and(|cp| task.artifacts.iter().any(|a| a.aliases(&cp.artifact)))
-            {
+            if environment.result.as_ref().is_some_and(|record| {
+                record
+                    .checkpoint
+                    .iter()
+                    .chain(record.snapshot_source.iter())
+                    .map(|point| &point.artifact)
+                    .chain(record.execution_artifacts.iter())
+                    .any(|artifact| task.artifacts.iter().any(|a| a.aliases(artifact)))
+            }) {
                 return Ok(false);
             }
+        }
+        if self.execution_holds().await?.iter().any(|hold| {
+            hold.artifacts
+                .iter()
+                .any(|artifact| task.artifacts.iter().any(|a| a.aliases(artifact)))
+        }) {
+            return Ok(false);
         }
         Ok(!self
             .retained_snapshots()

@@ -14,6 +14,7 @@ impl StoredEnvironment {
         record
             .checkpoint
             .as_ref()
+            .or(record.snapshot_source.as_ref())
             .filter(|cp| cp.artifact.storage != "local" && !cp.expired(now))
     }
     pub fn recovery_point(&self, now: u64) -> Option<&adx_core::RestorePoint> {
@@ -27,6 +28,7 @@ impl StoredEnvironment {
         record
             .checkpoint
             .as_ref()
+            .or(record.snapshot_source.as_ref())
             .filter(|cp| cp.artifact.storage != "local" && !cp.expired(now))
     }
 }
@@ -89,7 +91,14 @@ impl Session {
                     runtime_id: checkpoint.source_runtime_id.clone(),
                 });
             }
+            let source = stored_environment
+                .result
+                .as_ref()
+                .ok_or(Error::Conflict)?
+                .clone();
             stored_environment.result = Some(EnvironmentRecord {
+                execution_artifacts: vec![],
+                snapshot_source: source.snapshot_source.clone(),
                 failure: None,
                 spec: stored_environment.spec.clone(),
                 assignment: replacement.clone(),
@@ -100,7 +109,11 @@ impl Session {
                     ip: None,
                 },
                 resources_held: false,
-                checkpoint: Some(checkpoint),
+                checkpoint: if source.snapshot_source.is_some() && source.checkpoint.is_none() {
+                    None
+                } else {
+                    Some(checkpoint.clone())
+                },
                 last_operation: None,
                 restart_attempts: 0,
                 restart_pending: false,

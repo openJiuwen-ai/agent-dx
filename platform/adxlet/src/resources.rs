@@ -107,7 +107,6 @@ impl ResourceSource {
                 (sample, *valid_for_seconds)
             }
         };
-        observation.capacity.validate()?;
         if valid == 0 {
             return Err(invalid("validity must be positive"));
         }
@@ -139,7 +138,6 @@ pub fn parse_external(bytes: &[u8]) -> Result<Observation> {
         memory_bytes: source.mem,
         disk_bytes: source.storage.unwrap_or(0),
     };
-    capacity.validate()?;
     let mut devices = vec![];
     let mut seen = BTreeSet::new();
     for xpu in source.xpu {
@@ -367,7 +365,6 @@ pub fn detect(disk_path: &Path) -> Result<Observation> {
         memory_bytes: memory,
         disk_bytes: disk(disk_path)?.1,
     };
-    capacity.validate()?;
     Ok(Observation {
         capacity,
         devices: vec![],

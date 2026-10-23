@@ -88,7 +88,11 @@ preserves scalar-only behavior. See [rule semantics](../../crates/scheduling/REA
 
 RegisterNode includes the process session ID, a monotonic heartbeat sequence and
 reconciliation flag. Duplicate reports do not extend liveness. InspectNode reads
-the complete authoritative catalog only for the registered reconciling node.
+the complete authoritative catalog only for the current registered session with
+allocation admission closed. Startup uses the reconciliation flag; a validated
+live session closes allocation admission for periodic inspection while preserving
+published routes. Unchanged local bindings keep their existing synchronization
+session and active streams.
 StartAssignedEnvironment and CommitEnvironment carry the destination/source node process
 session to reject delayed requests from a superseded process. Full Assignment and
 record revision checks remain mandatory. See [recovery contract](../../../docs/testing/recovery-discovery.md).

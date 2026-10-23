@@ -1,4 +1,6 @@
 //! Local gRPC/UDS contract tests against the pinned protocol, not sandboxd E2E.
+#[path = "common/authority.rs"]
+mod authority;
 use adx_core::{Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Resources};
 use adxlet::{
     sandboxd::{connect_when_ready, proto::*, start_request, Config, Sandboxd},
@@ -291,6 +293,23 @@ async fn discovers_runtime_classes_from_sandboxd_uds() {
         ["runsc"]
     );
 }
+
+#[tokio::test]
+async fn running_runsc_retains_input_after_restore_acknowledgement() {
+    let (adapter, _server) = connect(Server::default()).await;
+    let mut source = spec();
+    source.runtime_class = "runsc".into();
+    let checkpoint = tempfile::tempdir().unwrap();
+    adapter
+        .restore(&source, "background-restore", 1, &[], checkpoint.path())
+        .await
+        .unwrap();
+    // Start may acknowledge before background page loading has finished.
+    // The controller must retain its file access and durable input reference.
+    assert!(adapter.retains_checkpoint_files(&source.runtime_class));
+    assert!(!adapter.retains_capture_files(&source.runtime_class));
+    adapter.remove("background-restore").await.unwrap();
+}
 fn spec() -> EnvironmentSpec {
     EnvironmentSpec {
         run_policy: None,
@@ -340,11 +359,37 @@ fn kata_start_prepares_guest_pty_without_privileged_guest_capabilities() {
 }
 
 #[test]
+fn local_bind_mount_includes_the_oci_bind_flag() {
+    let mut spec = spec();
+    spec.execution.mounts.push(adx_core::execution::Mount {
+        create_if_missing: false,
+        create_options: None,
+        kind: "bind".into(),
+        target: "/workspace".into(),
+        options: vec!["rw".into(), "nosuid".into()],
+        source: adx_core::execution::StorageSource::Local("/shared/workspace".into()),
+    });
+    let request = start_request(&spec, "i-1", 1, &[], &Config::default()).unwrap();
+    let mount = request
+        .mounts
+        .iter()
+        .find(|mount| mount.target == "/workspace")
+        .unwrap();
+    assert!(mount
+        .options
+        .iter()
+        .any(|option| option == "bind" || option == "rbind"));
+    assert!(mount.options.iter().any(|option| option == "rw"));
+    assert!(mount.options.iter().any(|option| option == "nosuid"));
+}
+
+#[test]
 fn kata_start_preserves_explicit_terminal_mount() {
     let mut spec = spec();
     spec.runtime_class = "kata".into();
     spec.execution.mounts.push(adx_core::execution::Mount {
         create_if_missing: false,
+        create_options: None,
         kind: "bind".into(),
         target: "/dev/pts".into(),
         options: vec!["rbind".into()],
@@ -388,6 +433,7 @@ fn start_maps_public_environment_contract_to_backend_protocol() {
         }),
         mounts: vec![model::Mount {
             create_if_missing: false,
+            create_options: None,
             kind: "bind".into(),
             target: "/workspace".into(),
             options: vec!["ro".into()],
@@ -499,11 +545,11 @@ async fn dynamic_network_policy_uses_generated_backend_identity_and_can_clear() 
         dns: None,
     };
     adapter
-        .set_network_policy("i-1", Some(&policy), &[8080])
+        .set_network_policy("i-1", Some(&policy), &[8080], None)
         .await
         .unwrap();
     adapter
-        .set_network_policy("i-1", None, &[8080])
+        .set_network_policy("i-1", None, &[8080], None)
         .await
         .unwrap();
     let updates = server.network_updates.lock().unwrap();
@@ -1151,7 +1197,7 @@ async fn stateless_policy_allows_execd_and_published_port_replies() {
     let (adapter, _harness) = connect(server.clone()).await;
     adapter.start(&spec, "i-1", 1, &[]).await.unwrap();
     adapter
-        .set_network_policy("i-1", Some(&policy), &[8080])
+        .set_network_policy("i-1", Some(&policy), &[8080], None)
         .await
         .unwrap();
     let starts = server.starts.lock().unwrap();
@@ -1181,13 +1227,23 @@ async fn stateless_policy_allows_execd_and_published_port_replies() {
 
 #[tokio::test]
 async fn blocked_policy_preserves_only_node_control_endpoint_at_start_and_update() {
+    assert_blocked_control_endpoint(adx_core::execution::TrafficMode::Stateless).await;
+}
+
+#[tokio::test]
+async fn stateful_block_preserves_only_node_control_endpoint_at_start_and_update() {
+    // NetworkPolicy.block() normalizes to stateful deny in both directions.
+    assert_blocked_control_endpoint(adx_core::execution::TrafficMode::Stateful).await;
+}
+
+async fn assert_blocked_control_endpoint(mode: adx_core::execution::TrafficMode) {
     use adx_core::execution as model;
     let policy = model::NetworkPolicy {
         traffic: Some(model::TrafficPolicy {
             ingress_default_action: model::NetworkAction::Deny,
             egress_default_action: model::NetworkAction::Deny,
             rules: vec![],
-            mode: model::TrafficMode::Stateless,
+            mode,
         }),
         dns: None,
     };
@@ -1223,15 +1279,24 @@ async fn blocked_policy_preserves_only_node_control_endpoint_at_start_and_update
     let (adapter, _harness) = connect_with_env(server.clone(), env).await;
     adapter.start(&spec, "i-1", 1, &[]).await.unwrap();
     adapter
-        .set_network_policy("i-1", Some(&policy), &[])
+        .set_network_policy("i-1", Some(&policy), &[], None)
         .await
         .unwrap();
+    let starts = server.starts.lock().unwrap();
     let updates = server.network_updates.lock().unwrap();
     for policy in [
         request.network_policy.as_ref().unwrap(),
+        starts[0].network_policy.as_ref().unwrap(),
         updates[0].network_policy.as_ref().unwrap(),
     ] {
         let traffic = policy.traffic.as_ref().unwrap();
+        assert_eq!(
+            traffic.mode,
+            match mode {
+                model::TrafficMode::Stateful => TrafficPolicyMode::Stateful as i32,
+                model::TrafficMode::Stateless => TrafficPolicyMode::Stateless as i32,
+            }
+        );
         assert_eq!(
             traffic.ingress_default_action,
             NetworkPolicyAction::Deny as i32
@@ -1263,6 +1328,11 @@ async fn blocked_policy_preserves_only_node_control_endpoint_at_start_and_update
         let port = peer.port_range.as_ref().unwrap();
         assert_eq!((port.first, port.last), (19003, 19003));
         assert!(rule.sandbox_port_range.is_none());
+        assert_eq!(
+            traffic.rules.len(),
+            2,
+            "only Execd and the control endpoint are allowed"
+        );
     }
     let request = start_request(&spec, "i-1", 1, &[], &Config::default()).unwrap();
     assert!(!request
@@ -1273,6 +1343,114 @@ async fn blocked_policy_preserves_only_node_control_endpoint_at_start_and_update
         .rules
         .iter()
         .any(|r| r.direction == NetworkDirection::Both as i32 && r.sandbox_port_range.is_none()));
+}
+
+#[tokio::test]
+async fn blocked_restore_uses_target_node_control_endpoint_and_credential() {
+    use adx_core::{execution as model, runtime::RuntimeIdentity};
+    use adx_protocol::runtime_stream::execution_token;
+
+    let mut spec = spec();
+    spec.execution.network = Some(model::NetworkPolicy {
+        traffic: Some(model::TrafficPolicy {
+            ingress_default_action: model::NetworkAction::Deny,
+            egress_default_action: model::NetworkAction::Deny,
+            rules: vec![],
+            mode: model::TrafficMode::Stateful,
+        }),
+        dns: None,
+    });
+    let source = RuntimeIdentity {
+        environment_id: spec.id.clone(),
+        runtime_id: "i-1".into(),
+        ownership_generation: 1,
+    };
+    // A checkpoint can contain the old node's callback environment. None of
+    // these values may control the target's network exception or credential.
+    spec.env.insert(
+        "ADX_RUNTIME_CONTROL_ADDRESS".into(),
+        "http://10.231.16.1:19003".into(),
+    );
+    spec.env
+        .insert("ADX_RUNTIME_CONTROL_TOKEN".into(), "old-token".into());
+    spec.env
+        .insert("ADX_RUNTIME_CONTROL_SECRET".into(), "old-secret".into());
+    let target_address = "http://10.232.16.1:19004";
+    let target_secret = "target-node-secret-0123456789abcdef";
+    let target = RuntimeIdentity {
+        environment_id: spec.id.clone(),
+        runtime_id: "i-2".into(),
+        ownership_generation: 2,
+    };
+    let server = Server::default();
+    let (adapter, _harness) = connect_with_env(
+        server.clone(),
+        HashMap::from([
+            ("ADX_RUNTIME_CONTROL_ADDRESS".into(), target_address.into()),
+            ("ADX_RUNTIME_CONTROL_SECRET".into(), target_secret.into()),
+        ]),
+    )
+    .await;
+    let checkpoint = tempfile::tempdir().unwrap();
+    adapter
+        .restore_from(
+            &spec,
+            &target.runtime_id,
+            target.ownership_generation,
+            &[],
+            checkpoint.path(),
+            Some(&source),
+        )
+        .await
+        .unwrap();
+    let starts = server.starts.lock().unwrap();
+    let request = &starts[0];
+    assert_eq!(request.envs["ADX_RUNTIME_CONTROL_ADDRESS"], target_address);
+    assert_eq!(
+        request.envs["ADX_RUNTIME_CONTROL_TOKEN"],
+        execution_token(target_secret.as_bytes(), &target).unwrap()
+    );
+    assert!(!request.envs.contains_key("ADX_RUNTIME_CONTROL_SECRET"));
+    assert_eq!(
+        request.checkpoint_info.as_ref().unwrap().checkpoint_dir,
+        checkpoint.path().to_str().unwrap()
+    );
+    assert_eq!(
+        serde_json::from_str::<RuntimeIdentity>(&request.envs["ADX_RESTORE_ORIGIN"]).unwrap(),
+        source
+    );
+    let traffic = request
+        .network_policy
+        .as_ref()
+        .unwrap()
+        .traffic
+        .as_ref()
+        .unwrap();
+    assert_eq!(traffic.mode, TrafficPolicyMode::Stateful as i32);
+    assert_eq!(
+        traffic.ingress_default_action,
+        NetworkPolicyAction::Deny as i32
+    );
+    assert_eq!(
+        traffic.egress_default_action,
+        NetworkPolicyAction::Deny as i32
+    );
+    let peer_rules: Vec<_> = traffic
+        .rules
+        .iter()
+        .filter(|rule| rule.sandbox_port_range.is_none())
+        .collect();
+    assert_eq!(peer_rules.len(), 1);
+    let rule = peer_rules[0];
+    assert_eq!(rule.action, NetworkPolicyAction::Allow as i32);
+    assert_eq!(rule.direction, NetworkDirection::Both as i32);
+    assert_eq!(rule.protocol, NetworkProtocol::Tcp as i32);
+    assert_eq!(rule.priority, u32::MAX);
+    let peer = rule.peer.as_ref().unwrap();
+    assert_eq!(peer.cidr, "10.232.16.1/32");
+    assert_eq!(peer.port_range.as_ref().unwrap().first, 19004);
+    assert_eq!(peer.port_range.as_ref().unwrap().last, 19004);
+    assert_eq!(traffic.rules.len(), 2);
 }
 
 #[tokio::test]
@@ -1293,7 +1471,7 @@ async fn stateful_policy_keeps_execd_replies_independent_of_conntrack_generation
     let (adapter, _harness) = connect(server.clone()).await;
     adapter.start(&spec, "i-1", 1, &[]).await.unwrap();
     adapter
-        .set_network_policy("i-1", Some(&policy), &[])
+        .set_network_policy("i-1", Some(&policy), &[], None)
         .await
         .unwrap();
     let starts = server.starts.lock().unwrap();
@@ -1574,4 +1752,162 @@ async fn backend_transport_failure_remains_unavailable() {
     assert_eq!(status.code(), tonic::Code::Unavailable);
     assert!(status.message().contains("sandboxd transport"));
     assert!(adx_protocol::deadline_failure(&status).is_none());
+}
+
+#[tokio::test]
+async fn mixed_router_delete_before_start_fences_jiuwenbox_too() {
+    let (sandboxd, _harness) = connect(Server::default()).await;
+    let directory = tempfile::tempdir().unwrap();
+    let config = serde_json::from_value(serde_json::json!({
+        "socket": directory.path().join("unused.sock"),
+        "state_dir": directory.path().join("journal"),
+        "bootstrap": {"image":directory.path().join("unused.erofs"),"sha256":"a".repeat(64),"target":"/__adx","command":["/__adx/usr/local/bin/adx-execd"]},
+        "classes": {"supervisor":{"images":{"execd:test":{}}}}
+    })).unwrap();
+    let jiuwenbox = adxlet::jiuwenbox::Jiuwenbox::with_host(
+        config,
+        Config::default(),
+        Arc::new(adxlet::jiuwenbox::host::LinuxHost),
+    )
+    .await
+    .unwrap();
+    let router =
+        adxlet::runtime_router::RuntimeRouter::new(Some(sandboxd), Some(jiuwenbox.clone()))
+            .unwrap();
+    router.remove("i-1").await.unwrap();
+    assert!(jiuwenbox.owns("i-1").await.unwrap());
+    let mut wanted = spec();
+    wanted.runtime_class = "supervisor".into();
+    wanted.resources.disk_bytes = 0;
+    assert!(matches!(
+        router.start(&wanted, "i-1", 1, &[]).await,
+        Err(adx_core::Error::Conflict)
+    ));
+}
+
+#[tokio::test]
+async fn public_authority_cycle_collects_sandboxd_orphan_without_local_controller() {
+    let server = Server::default();
+    let (creator, harness) = connect(server.clone()).await;
+    let adapter = Sandboxd::connect(
+        harness._directory.path().join("rpc.sock"),
+        Config::default(),
+    )
+    .await
+    .unwrap();
+    let router = adxlet::runtime_router::RuntimeRouter::new(Some(adapter), None).unwrap();
+    let node = authority::manager(Arc::new(router));
+    let mut authority = authority::Fixture::new().await;
+    authority.cycle(&node).await.unwrap();
+    // An external successful create has no corresponding node controller/catalog entry.
+    creator.start(&spec(), "i-1", 1, &[]).await.unwrap();
+    assert!(*server.running.lock().unwrap());
+    authority.cycle(&node).await.unwrap();
+    assert!(!*server.running.lock().unwrap());
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+    assert_eq!(node.used(), Resources::default());
+    assert!(node.accepting_allocations());
+    assert!(
+        authority
+            .authority
+            .reports
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .accepting_allocations
+    );
+}
+
+#[tokio::test]
+async fn public_authority_cycle_reaps_transport_lost_create_after_empty_scan() {
+    let server = Server {
+        transport_error: true,
+        ..Default::default()
+    };
+    let (creator, harness) = connect(server.clone()).await;
+    let adapter = Sandboxd::connect(
+        harness._directory.path().join("rpc.sock"),
+        Config::default(),
+    )
+    .await
+    .unwrap();
+    let node = authority::manager(Arc::new(adapter));
+    assert!(creator.start(&spec(), "i-1", 1, &[]).await.is_err());
+    let mut authority = authority::Fixture::new().await;
+    authority.cycle(&node).await.unwrap();
+    // The first complete inventory was empty; the failed create materializes later.
+    *server.running.lock().unwrap() = true;
+    authority.cycle(&node).await.unwrap();
+    assert!(!*server.running.lock().unwrap());
+    assert!(server
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r == "delete:generated-backend-id"));
+    assert_eq!(server.starts.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn blocked_tunnel_listeners_are_trusted_and_never_add_an_egress_exception() {
+    use adx_core::execution as model;
+    let policy = model::NetworkPolicy {
+        traffic: Some(model::TrafficPolicy {
+            ingress_default_action: model::NetworkAction::Deny,
+            egress_default_action: model::NetworkAction::Deny,
+            rules: vec![],
+            mode: model::TrafficMode::Stateful,
+        }),
+        dns: None,
+    };
+    for http_port in [8766, 18766] {
+        let mut spec = spec();
+        spec.execution.network = Some(policy.clone());
+        spec.execution.tunnel_http_port = Some(http_port);
+        spec.env
+            .insert("EXECD_TUNNEL_WS_PORT".into(), "12345".into());
+        let server = Server::default();
+        let (adapter, _harness) = connect(server.clone()).await;
+        adapter.start(&spec, "i-1", 1, &[]).await.unwrap();
+        let router = adxlet::runtime_router::RuntimeRouter::new(Some(adapter), None).unwrap();
+        router
+            .set_network_policy("i-1", Some(&policy), &[], Some(http_port))
+            .await
+            .unwrap();
+        let starts = server.starts.lock().unwrap();
+        let updates = server.network_updates.lock().unwrap();
+        assert_eq!(
+            starts[0].envs["EXECD_TUNNEL_WS_PORT"],
+            (http_port - 1).to_string()
+        );
+        for policy in [
+            starts[0].network_policy.as_ref().unwrap(),
+            updates[0].network_policy.as_ref().unwrap(),
+        ] {
+            let traffic = policy.traffic.as_ref().unwrap();
+            let rules: Vec<_> = traffic
+                .rules
+                .iter()
+                .filter(|rule| {
+                    rule.sandbox_port_range
+                        .as_ref()
+                        .is_some_and(|range| range.first == u32::from(http_port - 1))
+                })
+                .collect();
+            assert_eq!(rules.len(), 1);
+            assert_eq!(rules[0].direction, NetworkDirection::Ingress as i32);
+            assert_eq!(rules[0].protocol, NetworkProtocol::Tcp as i32);
+            assert_eq!(rules[0].priority, u32::MAX);
+            assert!(!traffic.rules.iter().any(|rule| rule
+                .sandbox_port_range
+                .as_ref()
+                .is_some_and(|range| range.first == u32::from(http_port) || range.first == 12345)));
+        }
+    }
+    let mut spec = spec();
+    spec.env
+        .insert("EXECD_TUNNEL_WS_PORT".into(), "12345".into());
+    let request = start_request(&spec, "i-1", 1, &[], &Config::default()).unwrap();
+    assert!(!request.envs.contains_key("EXECD_TUNNEL_WS_PORT"));
 }

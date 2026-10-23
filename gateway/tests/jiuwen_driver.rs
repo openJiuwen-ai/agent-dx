@@ -1,5 +1,5 @@
 #![cfg(feature = "agent-api")]
-use data_plane_gateway::ingress::jiuwen::{
+use data_plane_gateway::ingress::digitalmategateway::{
     driver::{run, DriverConfig, DriverError},
     protocol::Request,
     session::SessionLimits,
@@ -41,7 +41,7 @@ async fn pair() -> (WebSocketStream<DuplexStream>, WebSocketStream<DuplexStream>
         WebSocketStream::from_raw_socket(
             a,
             Role::Client,
-            Some(data_plane_gateway::ingress::jiuwen::driver::websocket_config()),
+            Some(data_plane_gateway::ingress::digitalmategateway::driver::websocket_config()),
         )
         .await,
         WebSocketStream::from_raw_socket(b, Role::Server, None).await,

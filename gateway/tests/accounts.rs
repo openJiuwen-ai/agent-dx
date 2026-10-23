@@ -198,7 +198,7 @@ async fn litellm_expands_existing_access_without_rotating_key_or_resetting_budge
         .unwrap()
         .insert(hash.clone(), original.clone());
     let (url, server) = serve_model(model.clone()).await;
-    let provider = LiteLlm::with_key(config("tenant", &url).litellm, "mock-admin".into()).unwrap();
+    let provider = LiteLlm::with_key(config(&url).litellm, "mock-admin".into()).unwrap();
     model.lose_response.store(true, Ordering::SeqCst);
     assert!(provider.ensure("owner", key, "huawei-owner").await.is_err());
     provider.ensure("owner", key, "huawei-owner").await.unwrap();
@@ -241,7 +241,7 @@ async fn litellm_updates_nickname_alias_without_changing_credentials_or_budget()
         .unwrap()
         .insert(hash.clone(), original.clone());
     let (url, server) = serve_model(model.clone()).await;
-    let provider = LiteLlm::with_key(config("tenant", &url).litellm, "mock-admin".into()).unwrap();
+    let provider = LiteLlm::with_key(config(&url).litellm, "mock-admin".into()).unwrap();
     provider
         .ensure("owner", key, "huawei-小明-12345678")
         .await
@@ -260,8 +260,8 @@ async fn litellm_updates_nickname_alias_without_changing_credentials_or_budget()
     server.abort();
 }
 
-fn config(tenant: &str, url: &str) -> AccountConfig {
-    serde_json::from_value(json!({"tenant":tenant,"developer_scope":"test-developer","agreement_version":"1","database_url_env":"UNUSED","database_allow_plaintext":true,"litellm":{"management_url":url,"api_base":format!("{url}/v1"),"admin_key_env":"UNUSED","max_budget":1.0,"budget_duration":null,"rpm_limit":10,"tpm_limit":1000,"allow_plaintext":true}})).unwrap()
+fn config(url: &str) -> AccountConfig {
+    serde_json::from_value(json!({"developer_scope":"test-developer","agreement_version":"1","database_url_env":"UNUSED","database_allow_plaintext":true,"litellm":{"management_url":url,"api_base":format!("{url}/v1"),"admin_key_env":"UNUSED","max_budget":1.0,"budget_duration":null,"rpm_limit":10,"tpm_limit":1000,"allow_plaintext":true}})).unwrap()
 }
 fn login(code: &str) -> LoginRequest {
     LoginRequest {
@@ -274,7 +274,7 @@ fn login(code: &str) -> LoginRequest {
 async fn litellm_quota_uses_key_budget_and_spend_one_to_one() {
     let model = Arc::new(ModelState::default());
     let (url, server) = serve_model(model.clone()).await;
-    let provider = LiteLlm::with_key(config("tenant", &url).litellm, "mock-admin".into()).unwrap();
+    let provider = LiteLlm::with_key(config(&url).litellm, "mock-admin".into()).unwrap();
     let key = "sk-test-user-key";
     provider.ensure("owner", key, "huawei-owner").await.unwrap();
     let digest = hex::encode(Sha256::digest(key.as_bytes()));
@@ -313,11 +313,12 @@ async fn postgres_sessions_and_litellm_credentials_survive_retries_and_replicas(
     let model = Arc::new(ModelState::default());
     model.lose_response.store(true, Ordering::SeqCst);
     let (url, server) = serve_model(model.clone()).await;
-    let tenant = format!("test-{}", uuid::Uuid::new_v4());
+    let provider_scope = format!("test-{}", uuid::Uuid::new_v4());
     let make = || async {
-        let mut cfg = config(&tenant, &url);
+        let mut cfg = config(&url);
+        cfg.developer_scope = provider_scope.clone();
         cfg.agc = Some(AgcConfig {
-            project_id: "test-project".into(),
+            project_id: format!("{provider_scope}-agc"),
             api_client_id: "test-api-client".into(),
             api_client_secret_env: "UNUSED".into(),
         });
@@ -330,7 +331,7 @@ async fn postgres_sessions_and_litellm_credentials_survive_retries_and_replicas(
                 Arc::new(Identity),
                 Some(Arc::new(AgcIdentity)),
                 model,
-                [8; 32],
+                CredentialCipher::new([8; 32], "tenant").unwrap(),
             )
             .unwrap(),
         )
@@ -370,16 +371,16 @@ async fn postgres_sessions_and_litellm_credentials_survive_retries_and_replicas(
     let bob = b.authenticate(&bob.token).await.unwrap();
     assert_ne!(bob.user_id, pa.user_id);
     assert!(
-        a.launch_config(&pa).await.is_err(),
+        a.model_parameters(&pa).await.is_err(),
         "provider response was lost after key creation"
     );
-    let alice_key = b.launch_config(&pb).await.unwrap();
+    let alice_key = b.model_parameters(&pb).await.unwrap();
     assert_eq!(model.creates.load(Ordering::SeqCst), 1);
     assert_eq!(b.quota(&pb).await.unwrap().quota.balance, 1.0);
-    let (left, right) = tokio::join!(a.launch_config(&pa), b.launch_config(&pb));
+    let (left, right) = tokio::join!(a.model_parameters(&pa), b.model_parameters(&pb));
     assert_eq!(left.unwrap(), right.unwrap());
     assert_eq!(model.creates.load(Ordering::SeqCst), 1);
-    let alice_hash = hex::encode(Sha256::digest(alice_key.env["API_KEY"].as_bytes()));
+    let alice_hash = hex::encode(Sha256::digest(alice_key["model_api_key"].as_bytes()));
     let short_id = &pa.user_id[..8];
     assert_eq!(
         model.keys.lock().unwrap()[&alice_hash]["key_alias"],
@@ -388,29 +389,40 @@ async fn postgres_sessions_and_litellm_credentials_survive_retries_and_replicas(
     let relogin = b.login(login("alice|新昵称")).await.unwrap();
     assert_eq!(relogin.user_id, pa.user_id);
     // Already-issued sessions read the latest stored nickname when reconciling.
-    assert_eq!(a.launch_config(&pa).await.unwrap(), alice_key);
+    assert_eq!(a.model_parameters(&pa).await.unwrap(), alice_key);
     assert_eq!(
         model.keys.lock().unwrap()[&alice_hash]["key_alias"],
         format!("huawei-新昵称-{short_id}")
     );
     b.login(login("alice")).await.unwrap();
-    a.launch_config(&pa).await.unwrap();
+    a.model_parameters(&pa).await.unwrap();
     assert_eq!(
         model.keys.lock().unwrap()[&alice_hash]["key_alias"],
         format!("huawei-新昵称-{short_id}")
     );
-    let bob_key = a.launch_config(&bob).await.unwrap();
-    assert_ne!(alice_key.env["API_KEY"], bob_key.env["API_KEY"]);
-    let row=client.query_one("SELECT encrypted_key FROM adx_accounts.model_credentials WHERE tenant=$1 AND user_id=$2",&[&tenant,&pa.user_id]).await.unwrap();
+    let bob_key = a.model_parameters(&bob).await.unwrap();
+    assert_ne!(alice_key["model_api_key"], bob_key["model_api_key"]);
+    let row = client
+        .query_one(
+            "SELECT encrypted_key FROM adx_accounts.model_credentials WHERE user_id=$1",
+            &[&pa.user_id],
+        )
+        .await
+        .unwrap();
     let encrypted: Vec<u8> = row.get(0);
     assert!(!encrypted
         .windows(8)
-        .any(|v| v == &alice_key.env["API_KEY"].as_bytes()[..8]));
+        .any(|v| v == &alice_key["model_api_key"].as_bytes()[..8]));
+    let user_ids = vec![
+        pa.user_id.clone(),
+        bob.user_id.clone(),
+        agc_first.user_id.clone(),
+    ];
     assert_eq!(
         client
             .query_one(
-                "SELECT count(*) FROM adx_accounts.users WHERE tenant=$1",
-                &[&tenant]
+                "SELECT count(*) FROM adx_accounts.users WHERE user_id=ANY($1)",
+                &[&user_ids]
             )
             .await
             .unwrap()
@@ -423,19 +435,19 @@ async fn postgres_sessions_and_litellm_credentials_survive_retries_and_replicas(
         Err(Error::Unauthorized)
     ));
     b.check(&pb).await.unwrap();
-    assert_eq!(b.launch_config(&pb).await.unwrap(), alice_key);
+    assert_eq!(b.model_parameters(&pb).await.unwrap(), alice_key);
     client
         .execute(
-            "UPDATE adx_accounts.sessions SET expires_at=0 WHERE tenant=$1 AND user_id=$2",
-            &[&tenant, &pa.user_id],
+            "UPDATE adx_accounts.sessions SET expires_at=0 WHERE user_id=$1",
+            &[&pa.user_id],
         )
         .await
         .unwrap();
     assert!(matches!(a.check(&pb).await, Err(Error::Unauthorized)));
     client
         .execute(
-            "UPDATE adx_accounts.users SET status='disabled' WHERE tenant=$1 AND user_id=$2",
-            &[&tenant, &bob.user_id],
+            "UPDATE adx_accounts.users SET status='disabled' WHERE user_id=$1",
+            &[&bob.user_id],
         )
         .await
         .unwrap();
@@ -447,8 +459,8 @@ async fn postgres_sessions_and_litellm_credentials_survive_retries_and_replicas(
     for table in ["model_credentials", "sessions", "users"] {
         client
             .execute(
-                &format!("DELETE FROM adx_accounts.{table} WHERE tenant=$1"),
-                &[&tenant],
+                &format!("DELETE FROM adx_accounts.{table} WHERE user_id=ANY($1)"),
+                &[&user_ids],
             )
             .await
             .unwrap();

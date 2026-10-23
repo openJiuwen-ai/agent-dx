@@ -334,7 +334,7 @@ Each mount requires exactly one nonempty `image_url`, `s3_config`, or `host_path
 {"image":"registry.example/app:v1","mounts":[{"type":"bind","host_path":"/mnt/sfs/workspaces/w-user","target":"/home/jiuwen","options":["rw"],"create_if_missing":true}]}
 ```
 
-The request maps to `StorageSource::Local`, then sandboxd HostPath, preserving mount options. The source must exist in the runtime's mount namespace with suitable permissions. This endpoint does not mount SFS, create source directories, authorize per-tenant host paths, or coordinate multiple sandboxes using the same directory. Expose arbitrary host-path creation only to trusted management callers until deployment-specific path authorization is provided. User sandboxes do not need CAP_SYS_ADMIN for this node-side operation. Component contract tests do not establish runsc/SFS writeback or SQLite recovery guarantees.
+The request maps to `StorageSource::Local`, then sandboxd HostPath, preserving mount options. The source must exist in the runtime's mount namespace with suitable permissions. This endpoint does not mount SFS, authorize per-tenant host paths, or coordinate multiple sandboxes using the same directory. Source-directory creation requires the explicit flag described below. Expose arbitrary host-path creation only to trusted management callers until deployment-specific path authorization is provided. User sandboxes do not need CAP_SYS_ADMIN for this node-side operation. Component contract tests do not establish runsc/SFS writeback or SQLite recovery guarantees.
 
 
 `create_if_missing` is an optional boolean on each mount (default `false`). It is
@@ -351,3 +351,23 @@ runtime creation. This flag is permission to recreate a missing directory on a
 later request; it is not a data-loss detector or an exclusive-access lock. Deployment
 must provision the shared parent, verify SFS before admission, and restrict Local
 mount APIs to trusted callers. No data is deleted when the sandbox is deleted.
+
+
+Local mounts with `create_if_missing: true` may also specify
+`"create_options":{"uid":10001,"gid":10001,"mode":"0700"}`. All three fields
+are required: uid/gid are integers from 0 through 4294967294, and mode is a
+four-digit octal string from `0000` through `0777`. Invalid attributes or
+`create_options` without `create_if_missing: true` return InvalidArgument (HTTP 400).
+The options pass through Environment storage and RPC to adxlet. Only newly created
+directories receive these attributes; existing data, ownership and permissions
+remain unchanged. Without these options, the default creation behavior above
+is preserved. The node creates the final directory directly and sets ownership
+and permissions through its descriptor only when this call created it. Concurrent
+mkdir calls that find an existing directory reuse it without changing attributes.
+Creation and attribute initialization are not atomic: concurrent first use or a
+process interruption can observe incomplete attributes. Permission or filesystem
+errors fail this start/restore attempt and leave the directory for operator repair;
+existing directories are never automatically repaired, removed or renamed. No
+fallback to more permissive access is applied. The shared filesystem must permit
+ownership and permission changes, with no renameat2 requirement. A node release
+supporting these options is required before templates use them; this behavior has local component coverage, not a runsc/SFS end-to-end claim.

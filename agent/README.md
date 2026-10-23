@@ -14,7 +14,7 @@ AgentBinding 对应一个稳定逻辑 Environment ID。指定 AgentBinding 的�
 
 公开 API、认证、路由和连接实现位于 Gateway。HTTP/WS/SSH 通过普通方法调用 Agent 的 `ManagedService`，共用 AgentBinding 身份选择和 service 唯一匹配规则；身份选择本身不创建元数据或 Environment。HTTP 响应头、SSH 终端提示与协议转发仍由 Gateway 处理。
 
-Gateway 对同一次 HTTP/WS 请求的内部重试固定首次选定的 generation，并强制绕过 Activator 的成功激活缓存。删除或同名重建后，旧请求的重试返回冲突，不触发重建或选择新的生命周期。
+Gateway 对同一次请求的目标失效重试强制绕过 Activator 的成功激活缓存。HTTP/SSH 固定首次选定的 generation。WS 在发送任何后端握手或业务字节前，若权威元数据确认 Binding 已删除或换代，可在原 deadline 内重新解析同一逻辑 Binding 一次；缺失时使用本次初始化参数创建，已存在时忽略参数。Deleting、鉴权失败、draining 及同 generation 的其他冲突不触发重选。已开始发送后不切换生命周期，不重放业务请求。
 
 用户 Harness 由 Execd 启动，自行定义业务接口。HTTP/WS/SSH 保持透明转发，不限制业务并发。Ingress 的 Inline 管理、exec/files 和旧 JWT/IAM 适配已移除；Environment 生命周期由 API Server 管理。
 
@@ -52,15 +52,29 @@ Paused/Pausing/Resuming 保留原 AgentBinding generation 和 Sandbox ID；Activ
 
 模板支持 `mounts: [{"type":"bind","host_path":"/mnt/sfs/workspaces/${workspace}","target":"/home/jiuwen","options":["rw"],"create_if_missing":true}]`。Agent 首版只暴露 Local bind；Sandbox API 仍支持 image/S3 等其他来源。最多 32 个挂载，目标路径不得重复；options 支持 ro、rw、nosuid、nodev、noexec，拒绝重复项及 ro/rw 同时出现。
 
-可信业务方调用内部 `bindings/prepare`，传入 `scope`、现有私有 `launch` 和通用 `parameters`，例如 `{"workspace":"w-user"}`。参数与 Binding 一起原子持久化、不可修改；同一 Scope 重复准备相同参数幂等，改变参数返回 Conflict。parameters 是非秘密的产品元数据，会出现在 Binding 查询响应中，不得放入凭据。没有参数的模板继续按需激活；需要占位符的模板必须先准备 Binding，缺参时不会创建 Binding 或 Sandbox。
+首次访问通用 `/agent/ws` 或 `/agent/http` 时，可通过 `X-ADX-Parameters: workspace=w-user&model_api_base=https%3A%2F%2Fmodel.example%2Fv1` 提供 URL 表单参数。共享解析/激活流程仅在 Binding 不存在时解析和校验，原子保存参数后激活。已有 Binding 完全忽略新参数，包括缺失、不同值和格式错误；并发创建以成功落库的 Binding 为准。删除 Binding 后再次访问重新初始化。没有独立 prepare 阶段或接口。
 
-只有 host_path 支持 `${name}`，名字为 1–64 个 ASCII 字母、数字或下划线；不得执行表达式或递归替换。最多 64 个参数，值为非空相对路径，拒绝绝对路径、空分量、`.`/`..`、反斜杠、控制字符及再次展开。模板必须保留固定绝对根目录；渲染后路径最长 4096 字节。沙箱目标为无占位符的绝对路径。路径语法检查不代表节点符号链接授权或 SFS 挂载完整性检查。
+Template 的 `mounts[].host_path` 和 `env` 值支持 `${name}` 渲染。挂载参数按相对子目录校验，环境变量参数允许普通字符串；不执行 Shell 展开或递归展开。参数仅能替换模板声明的占位符。参数当前明文保存并出现在 Binding 元数据中；模型 Key 的后续加解密由业务 Gateway/AgentServer 管理，ADX 不提供模型专用私有启动配置。参数 Header 由 Ingress 消费，不转发到业务服务。
+
+```yaml
+env:
+  API_BASE: "${model_api_base}"
+  API_KEY: "${model_api_key}"
+mounts:
+  - type: bind
+    host_path: "/mnt/users/${workspace}"
+    target: /home/agentos
+```
+
+参数名为 1–64 个 ASCII 字母、数字或下划线，最多 64 项，每个值最多 8192 字节且不能包含 NUL；编码输入最多 65536 字节，并受 HTTP Header 总大小限制。用于 host_path 的值必须是非空相对路径，拒绝绝对路径、空分量、`.`/`..`、反斜杠、控制字符及再次展开。挂载模板必须保留固定绝对根目录，渲染后路径最长 4096 字节；沙箱目标为无占位符的绝对路径。路径语法检查不代表节点符号链接授权或共享文件系统挂载完整性检查。
 
 挂载可声明 `create_if_missing`（默认 false）。为 true 时，adxlet 在创建或恢复沙箱前幂等创建缺失的源目录；父目录必须预先存在，拒绝符号链接路径，已有目录不清空或改变权限。该字段由模板经 Activator 原样传到 Platform，不需要节点目录配置。
 
+需要为非 root 应用创建目录时，可同时声明 `create_options: {"uid":10001,"gid":10001,"mode":"0700"}`。三个字段均必填，UID/GID 为 0–4294967294 的整数，mode 为 `0000`–`0777` 的四位八进制字符串。仅允许与 `create_if_missing: true` 一起使用；只对新目录设置所有权和权限，已有目录保持原状，不递归 chown。未声明时保持原有 0755（受节点 umask 影响）及节点进程所有权。节点直接创建最终源目录，再通过目录描述符设置所有权和权限；设置失败则本次启动失败并保留目录，需修正残留权限。该过程不承诺原子初始化，并发首次使用可能看到尚未设置完成的权限。需要包含该能力的 adxlet；单独更新 Ingress 或模板不能使旧节点支持它。
+
 Activator 在准备和激活时渲染 mounts；HTTP 与嵌入式 Sandbox 适配器发送相同的具体挂载，不传 parameters、user_id 或 owner_id。Jiuwen 根据认证身份的 `[tenant, template, user_id]` JSON 数组 SHA-256 生成 `w-<完整十六进制摘要>`，版本、Binding 和 Sandbox ID 不参与目录标识。
 
-[Jiuwen 模板例子](activator/examples/jiuwen-sfs-template.json)将应用数据和 HOME 收敛到 `/home/jiuwen`。当前没有 SFS 自动挂载、受管目录自动创建或跨 Binding 的工作区独占协调。使用 SQLite/WAL 的工作区必须保证旧 Sandbox 完全停止访问后才启用后继，不能同时运行新旧版本。详见[工作区设计](../docs/development/user-workspace-volumes-design.md)。
+[Jiuwen 模板例子](activator/examples/jiuwen-sfs-template.json)将应用数据和 HOME 收敛到 `/home/jiuwen`。当前没有 SFS 自动挂载或跨 Binding 的工作区独占协调；目录创建由上述挂载声明控制。使用 SQLite/WAL 的工作区必须保证旧 Sandbox 完全停止访问后才启用后继，不能同时运行新旧版本。详见[工作区设计](../docs/development/user-workspace-volumes-design.md)。
 
 ## 进程配置
 
@@ -146,7 +160,7 @@ Activator 在相同 Redis namespace 注册实例 ID 和可直达地址。Gateway
 
 注册发现与 AgentBinding 亲和用于独立 Activator 模式；嵌入式模式直接调用本进程 Activator，不注册成员、不做跨进程选路，也不保证相同 AgentBinding 总是落到同一个进程；多个 API Server 可能各自缓存同一 AgentBinding。注册发现不改变 Platform 的发现机制，也不增加 AgentBinding 生命周期控制器。独立模式全热解析为 **1 次 Gateway→Activator、0 次 Agent Redis、0 次 Environment API**；后台成员刷新与实例续租单独计费，不属于单次解析访问。
 
-受管接口使用 `/api/agent/v2/templates/{name}/versions/{version}/bindings/{binding_id}`，GET/DELETE 对应查询和删除；AgentBinding 由访问流量触发创建。`POST .../{id}/resolve` 接受 `{protocol, port?, bypasscache?}`；`bypasscache` 为布尔值，默认 false。true 强制当前 Activator 读取 Redis AgentBinding 并查询 Environment，跳过 AgentBinding 成功绑定，不绕过不可变模板缓存、租户/service 校验或 generation 隔离。平台刷新失败、不就绪或请求被取消后，本次绑定不作为成功缓存保留；较早的在途响应不能覆盖更新的刷新结果。其他 Activator 的本地缓存不接收失效广播；普通热调用可能继续返回旧绑定，目标失效通过 Gateway 发送前 bypass 重试修正。重试固定原 generation，同名重建不会使原请求切换到新环境。
+受管接口使用 `/api/agent/v2/templates/{name}/versions/{version}/bindings/{binding_id}`，GET/DELETE 对应查询和删除；AgentBinding 由访问流量触发创建。`POST .../{id}/resolve` 接受 `{protocol, port?, bypasscache?}`；`bypasscache` 为布尔值，默认 false。true 强制当前 Activator 读取 Redis AgentBinding 并查询 Environment，跳过 AgentBinding 成功绑定，不绕过不可变模板缓存、租户/service 校验或 generation 隔离。平台刷新失败、不就绪或请求被取消后，本次绑定不作为成功缓存保留；较早的在途响应不能覆盖更新的刷新结果。其他 Activator 的本地缓存不接收失效广播；普通热调用可能继续返回旧绑定，目标失效通过 Gateway 发送前 bypass 重试修正。HTTP/SSH 重试固定原 generation；WS 仅在尚未发送后端握手或业务字节时允许一次删除/换代刷新，复用原始 deadline 和初始化参数。
 
 例如强制刷新 HTTP 目标：
 
@@ -209,9 +223,9 @@ SSH 首版只提供一个连接一个交互式终端，要求 PTY 和 shell 请�
 
 Template 的 service 声明 HTTP/WS/SSH 协议及端口，例如 `[{"protocol":"http","port":8080},{"protocol":"ws","port":8080},{"protocol":"ssh","port":22}]`。受管 SSH 无端口参数时必须恰好匹配一个 SSH service。用户直接调用 Harness 自定义接口，审计轨迹能力暂缓。
 
-预装镜像、Execd 与匹配的启动 profile 仍可用于验证。删除 Environment 明确返回 NotFound 时，Activator 条件清理对应 generation 的绑定及私有启动配置；删除成功返回 Deleted 同样清理。超时、断连、权限错误或其他未知结果保留记录供重试。元数据清理不证明迟到的平台创建已被取消。pause/resume 完全由 Platform 负责，不属于 ADX 适配范围。模板可配置 `init_timeout_seconds` 和一次性 `readiness_probe`；Activator 通过 Environment 能力接口透传，Platform 在成功后才发布 Running 和绑定路由。Jiuwen 当前使用 TCP 18092 探针，只保证 AgentServer 前端监听，不保证内部 Runtime 已完成 warming；周期 healthcheck 尚未开放到 Agent 模板。
+预装镜像、Execd 与匹配的启动 profile 仍可用于验证。删除 Environment 明确返回 NotFound 时，Activator 条件清理对应 generation 的 Binding 及其 parameters；删除成功返回 Deleted 同样清理。超时、断连、权限错误或其他未知结果保留记录供重试。元数据清理不证明迟到的平台创建已被取消。pause/resume 完全由 Platform 负责，不属于 ADX 适配范围。模板可配置 `init_timeout_seconds` 和一次性 `readiness_probe`；Activator 通过 Environment 能力接口透传，Platform 在成功后才发布 Running 和绑定路由。Jiuwen 当前使用 TCP 18092 探针，只保证 AgentServer 前端监听，不保证内部 Runtime 已完成 warming；模板也可配置周期 `healthcheck`（同样的 action/timing 字段，加正整数 `failure_threshold`，默认 3），由 Platform 执行并处理失败。
 
-流量激活时会先保存稳定身份，再提交平台创建。创建失败、响应丢失或进程中断可能留下尚未激活成功的 AgentBinding；该记录供原身份重试，并非独立的创建功能。如果删除明确返回不存在，则清理绑定；如果删除结果未知，则保留 Deleting 记录并沿用原身份重试。冷启动还可能遇到 Running 与共享路由发布之间的短暂窗口；HTTP/WS 或 SSH 已返回 AgentBinding 身份后，调用方应使用该身份重试，不能把省略 env 的新请求当作原请求重试。
+流量激活时会先保存稳定身份，再提交平台创建。创建失败、响应丢失或进程中断可能留下尚未激活成功的 AgentBinding；该记录供原身份重试，并非独立的创建功能。如果删除明确返回不存在，则清理绑定；如果删除结果未知，则保留 Deleting 记录并沿用原身份重试。冷启动还可能遇到 Running 与共享路由发布之间的短暂窗口；HTTP/WS 或 SSH 已返回 AgentBinding 身份后，调用方应使用该身份重试，不能通过换用新身份重试来绕过该绑定的生命周期。
 
 ## 验证
 

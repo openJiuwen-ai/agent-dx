@@ -58,7 +58,7 @@ SSE 创建的 `final` 事件保留 `errorCode` 数值字段，并携带同一个
 | `RESOURCE_EXHAUSTED` | `ResourceExhausted` | 429 | `after_backoff` / `never` | `not_started` / `terminal` | 准入、队列或资源暂时不足可退避；后端明确返回的创建限流失败为 terminal/never |
 | `UNSUPPORTED` | `Unimplemented` | 501 | `never` | `not_started` | 当前版本不提供该能力 |
 | `UNAVAILABLE` | `Unavailable` | 503 | `after_backoff` | `not_started` | 请求尚未进入执行边界，下游暂不可用 |
-| `DEADLINE_EXCEEDED` | `DeadlineExceeded` | 504 | `never` / `same_operation` | `terminal` / `not_started` / `unknown` | 节点确认创建超时失败时为 terminal/never；单纯等待超时保留原身份查询或重试 |
+| `DEADLINE_EXCEEDED` | `DeadlineExceeded` | 504 | `never` / `same_operation` | `terminal` / `not_started` / `unknown` | 确认撤销未分配调度请求时为 not_started/never；节点确认创建失败时为 terminal/never；未确认超时保留原身份查询或重试 |
 | `OUTCOME_UNKNOWN` | `Cancelled`、`Unknown`、`Unavailable`、`Internal` | 500、503 | `same_operation` | `unknown` | 写请求已越过执行边界，但最终应答未确认 |
 | `DATA_LOSS` | `DataLoss` | 500 | `never` | `terminal` | 权威记录不完整、身份不一致或持久化数据损坏 |
 | `INTERNAL` | 其他未分类状态 | 500 | `after_backoff` | `not_started` | 服务端在进入执行边界前失败；必须记录日志并补充明确分类 |
@@ -87,6 +87,29 @@ API Server、Coordinator 和入口节点为创建错误回传预留最多 3 秒�
 节点已判定超时，但失败记录未确认写入权威存储或本地持久日志时，同样返回
 `DEADLINE_EXCEEDED` 和原阶段文案，附带发布未确认说明；此时使用
 `outcome=unknown`、`retry=same_operation`，由后续对账补写，不能宣称已确认终态。
+
+### 调度队列到期
+
+调度队列继续等待至 `scheduleTimeoutSeconds`。Coordinator 只有在同一状态锁内确认
+没有 assignment 或进行中的 local claim、成功撤销 pending 请求并完成相关引用释放后，才通过内部
+`adx-scheduling-cancelled: true` 与类型化 JSON details 返回调度失败。API Server
+对此使用 HTTP 504、`DEADLINE_EXCEEDED / never / not_started`；SSE 使用 HTTP 200，
+在 `final` 事件中携带 `errorCode=504` 和相同的结构化 `error`。
+`never` 表示本次队列等待已经结束，SDK 不自动重开等待预算；调用者可在资源或
+放置条件变化后发起新的逻辑创建。已分配、状态存储不明、普通 RPC 超时和断连
+继续遵循原有 `same_operation / unknown` 契约，不凭超时推断已取消或已清理。
+
+`error.schedulingFailure` 提供当前锁定调度快照的诊断：
+
+- `snapshotRevision`、`nodeCount`、`eligibleNodes`：快照版本、已知 worker 数、当前通过全部硬过滤器的 worker 数。
+- `requested`、`maxCapacity`、`maxAvailable`：请求资源、逐维最大 worker 总容量、逐维最大可用资源。资源字段为 `cpu_millis`、`memory_bytes`、`disk_bytes`；可用量已扣除预留，最大值可能来自不同 worker，不能拼成一台可用机器。
+- `rejections`：各失败条件的节点计数，可重叠。标量不足使用 `insufficient_cpu`、`insufficient_memory`、`insufficient_disk`；其他键为失败过滤器名的下划线形式，如 `node_available`、`runtime_fit`、`device_fit`、`node_affinity`、`placement_groups`、`environment_affinity`、`topology_spread`。没有 worker 时为 `no_workers=1`。
+
+诊断不包含节点 ID、标签、其他租户的实例或内部地址。它描述到期时的集群状态，
+不证明未来扩容后仍无法调度。`eligibleNodes>0` 时可能只是队列预算先到，不能
+伪造容量不足。过滤器自身执行失败继续报告原错误，不转成资源不足。
+已确认撤销的响应进入普通完成缓存；同一 Request ID 的重放在缓存保留期间返回
+原失败，不重新排队，也不生成运行时失败实例记录。
 
 ### 创建重放缓存
 
@@ -128,7 +151,7 @@ Healthcheck 达到连续失败阈值后，由 adxlet 清理并按既有策略处
 
 ## SDK 契约
 
-Python SDK 对结构化错误抛出 `EnvironmentHTTPError`，并公开 `status_code`、`code`、`retry`、`outcome`、`request_id`、`operation_id`、`environment_id` 和可选的 `probe_failure`。自动重试只能发生在 `same_operation` 或 `after_backoff`，且复用原身份；`never` 立即返回调用方。旧服务没有 `error` 对象时，SDK 保留原有 HTTP 状态兼容路径，但无法给出稳定码。
+Python SDK 对结构化错误抛出 `EnvironmentHTTPError`，并公开 `status_code`、`code`、`retry`、`outcome`、`request_id`、`operation_id`、`environment_id` 和可选的 `probe_failure`、`scheduling_failure`。自动重试只能发生在 `same_operation` 或 `after_backoff`，且复用原身份；`never` 立即返回调用方。创建重试耗尽若最后收到完整服务失败，仍抛出 `EnvironmentHTTPError` 并保留状态码、载荷与诊断；连接/流中断才使用传输失败文案。旧服务没有 `error` 对象时，SDK 保留原有 HTTP 状态兼容路径，但无法给出稳定码。
 
 创建请求未显式提供名称时，SDK 使用 `create-*` Request ID 中的 UUID 生成稳定名称。跨 API Server 重试因此仍得到相同 Environment ID；查询暂时返回 404 不能触发换名称或创建第二个实例。
 

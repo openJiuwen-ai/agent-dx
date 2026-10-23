@@ -140,9 +140,68 @@ fn duplicate_submission_is_idempotent_but_changed_spec_conflicts() {
 fn zero_shards_and_zero_resource_requests_are_rejected() {
     assert!(Coordinator::new(0, Placement::Pack).is_err());
     let mut coordinator = Coordinator::new(1, Placement::Pack).unwrap();
-    let mut request = spec("a", "t", 0);
-    request.resources.cpu_millis = 0;
-    assert!(coordinator.submit(request).is_err());
+    for (cpu_millis, memory_bytes) in [(0, 1024), (1, 0), (0, 0)] {
+        let mut request = spec("a", "t", 0);
+        request.resources.cpu_millis = cpu_millis;
+        request.resources.memory_bytes = memory_bytes;
+        assert!(coordinator.submit(request).is_err());
+    }
+}
+
+#[test]
+fn zero_capacity_reports_preserve_reservations_until_capacity_recovers() {
+    for (cpu_millis, memory_bytes) in [(0, 10000), (2, 0), (0, 0)] {
+        let mut coordinator = Coordinator::new(1, Placement::Pack).unwrap();
+        coordinator.register(node("n", 2)).unwrap();
+        coordinator.submit(spec("running", "t", 0)).unwrap();
+        let running = coordinator.schedule(0).unwrap().unwrap();
+        let mut zero = node("n", 2);
+        zero.capacity.cpu_millis = cpu_millis;
+        zero.capacity.memory_bytes = memory_bytes;
+        coordinator.register(zero.clone()).unwrap();
+        assert_eq!(
+            coordinator.node_resources("n").unwrap(),
+            (zero.capacity, zero.capacity.saturating_sub(resources(1)))
+        );
+        assert_eq!(coordinator.snapshot().nodes()["n"].capacity, zero.capacity);
+        coordinator.submit(spec("waiting", "t", 0)).unwrap();
+        assert!(coordinator.schedule(0).unwrap().is_none());
+        // Recovery to the occupied capacity must not erase the running reservation.
+        coordinator.register(node("n", 1)).unwrap();
+        assert!(coordinator.schedule(0).unwrap().is_none());
+        coordinator.register(node("n", 2)).unwrap();
+        let waiting = coordinator.schedule(0).unwrap().unwrap();
+        assert_eq!(waiting.environment_id, "waiting");
+        coordinator.release(&running).unwrap();
+        coordinator.release(&waiting).unwrap();
+        assert_eq!(
+            coordinator.node_resources("n").unwrap(),
+            (node("n", 2).capacity, node("n", 2).capacity)
+        );
+    }
+}
+
+#[test]
+fn capacity_below_used_blocks_placement_until_normal_release() {
+    let mut coordinator = Coordinator::new(1, Placement::Pack).unwrap();
+    coordinator.register(node("n", 3)).unwrap();
+    coordinator.submit(spec("a", "t", 0)).unwrap();
+    coordinator.submit(spec("b", "t", 0)).unwrap();
+    let a = coordinator.schedule(0).unwrap().unwrap();
+    let b = coordinator.schedule(0).unwrap().unwrap();
+    coordinator.register(node("n", 1)).unwrap();
+    let (capacity, available) = coordinator.node_resources("n").unwrap();
+    assert_eq!(capacity.cpu_millis, 1);
+    assert_eq!(available.cpu_millis, 0);
+    coordinator.submit(spec("c", "t", 0)).unwrap();
+    assert!(coordinator.schedule(0).unwrap().is_none());
+    coordinator.release(&a).unwrap();
+    assert!(coordinator.schedule(0).unwrap().is_none());
+    coordinator.release(&b).unwrap();
+    assert_eq!(
+        coordinator.schedule(0).unwrap().unwrap().environment_id,
+        "c"
+    );
 }
 
 #[test]

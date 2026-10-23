@@ -1,6 +1,6 @@
 #![cfg(feature = "agent-api")]
 use base64::{engine::general_purpose::URL_SAFE, Engine};
-use data_plane_gateway::ingress::jiuwen::download_token::{
+use data_plane_gateway::ingress::digitalmategateway::download_token::{
     DownloadVerifier, FileMetadata, TokenError,
 };
 use ring::hmac;
@@ -237,7 +237,7 @@ fn signed_malformed_claims_cannot_select_a_sidecar_outside_the_asset_root() {
 
 #[test]
 fn shared_config_uses_exact_env_key_or_trimmed_environment_file_without_generating_a_key() {
-    use data_plane_gateway::ingress::jiuwen::download_config::DownloadConfig;
+    use data_plane_gateway::ingress::digitalmategateway::download_config::DownloadConfig;
     let mut template:adx_agent_core::TemplateVersion=serde_json::from_value(json!({"name":"jiuwen","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1,"memory_mib":1},"env":{"JIUWENSWARM_WORKSPACE":"/work","JIUWENSWARM_DOWNLOAD_ASSET_ROOT":"/assets"}})).unwrap();
     let config = DownloadConfig::from_template(&template).unwrap();
     assert!(DownloadVerifier::from_config(&config, None).is_err());
@@ -261,7 +261,7 @@ fn shared_config_uses_exact_env_key_or_trimmed_environment_file_without_generati
 
 #[test]
 fn verification_buffers_are_bounded_and_final_check_enforces_the_trusted_root() {
-    use data_plane_gateway::ingress::jiuwen::download_token::{
+    use data_plane_gateway::ingress::digitalmategateway::download_token::{
         MAX_REGISTRATION_BYTES, MAX_SECRET_BYTES, MAX_TOKEN_BYTES,
     };
     assert!(matches!(

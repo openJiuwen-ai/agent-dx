@@ -228,6 +228,8 @@ mod tests {
         pb::PublishedEnvironment {
             compatibility: None,
             record: Some(pb::EnvironmentRecord {
+                execution_artifacts: vec![],
+                snapshot_source: None,
                 failure: None,
                 spec: Some(pb::EnvironmentSpec {
                     compatibility: None,

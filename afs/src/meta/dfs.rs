@@ -1,7 +1,9 @@
 //! DistributedFs namespace and FileVersion authority on the shared MetaStore.
 
+mod gc;
+
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -34,6 +36,8 @@ pub struct DfsService {
     replication: ReplicationConfig,
     durability_policy: DfsDurabilityPolicy,
     read_grant_key: Arc<Option<[u8; 32]>>,
+    gc_grace_ms: u64,
+    gc_reference_updates: Arc<[tokio::sync::Mutex<()>; GC_REFERENCE_LOCK_SHARDS]>,
 }
 
 struct MissingExternalReadContext<'a> {
@@ -51,6 +55,19 @@ struct MissingExternalReadContext<'a> {
 // timestamp churn before the next fair turn should either succeed or report
 // contention instead of spinning without a boundary.
 const CREATE_PARENT_DRIFT_RETRY_LIMIT: usize = 64;
+const FILE_COMMIT_RETRY_LIMIT: usize = 64;
+const NAMESPACE_REMOVE_RETRY_LIMIT: usize = 64;
+const GC_REFERENCE_LOCK_SHARDS: usize = 64;
+
+enum NamespaceRemoveAttempt {
+    Removed(InodeRecord),
+    Retry,
+}
+
+enum FileCommitAttempt {
+    Committed(InodeRecord),
+    Retry,
+}
 
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct CreateFileRequest {
@@ -92,6 +109,8 @@ impl DfsService {
             replication,
             durability_policy,
             read_grant_key: Arc::new(read_grant_key),
+            gc_grace_ms: 60_000,
+            gc_reference_updates: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(()))),
         }
     }
 
@@ -1825,6 +1844,28 @@ impl DfsService {
         request: UnlinkRequest,
         directory: bool,
     ) -> Result<InodeRecord> {
+        let mut target_inode = None;
+        for _ in 0..NAMESPACE_REMOVE_RETRY_LIMIT {
+            match self
+                .remove_namespace_entry_attempt(request.clone(), directory, &mut target_inode)
+                .await?
+            {
+                NamespaceRemoveAttempt::Removed(inode) => return Ok(inode),
+                NamespaceRemoveAttempt::Retry => tokio::task::yield_now().await,
+            }
+        }
+        Err(Error::coded(
+            afs_error::META_DFS_NAMESPACE_RETRY,
+            "DFS namespace changed repeatedly during bounded removal retry",
+        ))
+    }
+
+    async fn remove_namespace_entry_attempt(
+        &self,
+        request: UnlinkRequest,
+        directory: bool,
+        target_inode: &mut Option<InodeId>,
+    ) -> Result<NamespaceRemoveAttempt> {
         let request_digest = namespace_request_digest(&request)?;
         let UnlinkRequest {
             caller_id,
@@ -1847,7 +1888,7 @@ impl DfsService {
             .replayed_namespace_inode(&caller_id, &operation_id, operation, request_digest)
             .await?
         {
-            return Ok(inode);
+            return Ok(NamespaceRemoveAttempt::Removed(inode));
         }
         validate_name(&name)?;
         let parent = self
@@ -1865,6 +1906,19 @@ impl DfsService {
         let dentry = dentry_from_view(&view, key.clone())
             .await?
             .ok_or_else(|| not_found("DFS namespace entry was not found"))?;
+        // Revalidate permissions, current metadata and directory emptiness on every
+        // attempt, but never follow a replaced name to a different inode within
+        // the same operation. The original request identity/digest stays fixed.
+        if target_inode
+            .as_ref()
+            .is_some_and(|expected| expected != &dentry.inode_id)
+        {
+            return Err(Error::coded(
+                afs_error::META_DFS_NAMESPACE_RETRY,
+                "DFS removal target was replaced during retry",
+            ));
+        }
+        *target_inode = Some(dentry.inode_id.clone());
         let mut inode = inode_from_view(&view, &namespace_id, dentry.inode_id.clone()).await?;
         if directory {
             if inode.kind != InodeKind::Directory {
@@ -1913,10 +1967,15 @@ impl DfsService {
         push_parent_namespace_change(&mut txn, parent, if directory { -1 } else { 0 });
         txn.mutations
             .push(TxnMutation::RecordRequestOutcome(outcome));
-        inode_outcome(
-            validate_namespace_outcome(self.store.compare_and_commit(txn).await?, request_digest)?,
-            operation,
-        )
+        let outcome =
+            validate_namespace_outcome(self.store.compare_and_commit(txn).await?, request_digest)?;
+        match outcome {
+            TxnOutcome::ConditionFailed {
+                existing_outcome: None,
+                ..
+            } => Ok(NamespaceRemoveAttempt::Retry),
+            outcome => inode_outcome(outcome, operation).map(NamespaceRemoveAttempt::Removed),
+        }
     }
 
     pub async fn link(&self, request: LinkRequest) -> Result<InodeRecord> {
@@ -3506,6 +3565,28 @@ impl DfsService {
         caller_id: String,
         sync: SyncInodeMetadata,
     ) -> Result<InodeRecord> {
+        for _ in 0..FILE_COMMIT_RETRY_LIMIT {
+            match self
+                .sync_inode_metadata_attempt(caller_id.clone(), sync.clone())
+                .await?
+            {
+                FileCommitAttempt::Committed(inode) => return Ok(inode),
+                FileCommitAttempt::Retry => tokio::task::yield_now().await,
+            }
+        }
+        // Retain the exact operation identity on retryable contention instead
+        // of permanently poisoning the inode's write state.
+        Err(Error::coded(
+            afs_error::IO_UNAVAILABLE,
+            "DFS metadata contention; retry the same operation",
+        ))
+    }
+
+    async fn sync_inode_metadata_attempt(
+        &self,
+        caller_id: String,
+        sync: SyncInodeMetadata,
+    ) -> Result<FileCommitAttempt> {
         require_id(&caller_id, "caller_id")?;
         require_id(&sync.operation_id.0, "operation_id")?;
         require_id(&sync.inode_id.0, "inode_id")?;
@@ -3517,7 +3598,7 @@ impl DfsService {
             )
             .await?
         {
-            return Ok(inode);
+            return Ok(FileCommitAttempt::Committed(inode));
         }
         if sync.metadata_delta.mode != CommitMetadataMode::Full {
             return Err(invalid("DFS inode metadata sync requires full metadata"));
@@ -3561,10 +3642,19 @@ impl DfsService {
             TxnMutation::Put(MetaEntity::DfsInode(updated)),
             TxnMutation::RecordRequestOutcome(outcome),
         ]);
-        inode_outcome(
+        file_commit_attempt(
             self.store.compare_and_commit(txn).await?,
             StoreOperation::DfsSyncInodeMetadata,
         )
+    }
+
+    pub(crate) async fn current_gc_fence(&self) -> Result<crate::dfs::GcFence> {
+        let snapshot = self.store.read(MetaRead::DfsGc).await?;
+        Ok(if snapshot.entity.is_some() {
+            crate::dfs::GcFence::Revision(snapshot.revision.0)
+        } else {
+            crate::dfs::GcFence::Absent
+        })
     }
 
     pub async fn commit_file_version(
@@ -3572,6 +3662,28 @@ impl DfsService {
         caller_id: String,
         commit: CommitFileVersion,
     ) -> Result<InodeRecord> {
+        for _ in 0..FILE_COMMIT_RETRY_LIMIT {
+            match self
+                .commit_file_version_attempt(caller_id.clone(), commit.clone())
+                .await?
+            {
+                FileCommitAttempt::Committed(inode) => return Ok(inode),
+                FileCommitAttempt::Retry => tokio::task::yield_now().await,
+            }
+        }
+        // Retain the exact operation identity on retryable contention instead
+        // of permanently poisoning the inode's write state.
+        Err(Error::coded(
+            afs_error::IO_UNAVAILABLE,
+            "DFS metadata contention; retry the same operation",
+        ))
+    }
+
+    async fn commit_file_version_attempt(
+        &self,
+        caller_id: String,
+        commit: CommitFileVersion,
+    ) -> Result<FileCommitAttempt> {
         let request_digest = namespace_request_digest(&commit)?;
         require_id(&caller_id, "caller_id")?;
         require_id(&commit.operation_id.0, "operation_id")?;
@@ -3595,7 +3707,24 @@ impl DfsService {
             )
             .await?
         {
-            return Ok(inode);
+            return Ok(FileCommitAttempt::Committed(inode));
+        }
+        let gc_snapshot = self.store.read(MetaRead::DfsGc).await?;
+        if let Some(expected) = commit
+            .gc_fence
+            .filter(|f| *f != crate::dfs::GcFence::WriteGeneration)
+        {
+            let actual = if gc_snapshot.entity.is_some() {
+                crate::dfs::GcFence::Revision(gc_snapshot.revision.0)
+            } else {
+                crate::dfs::GcFence::Absent
+            };
+            if expected != actual {
+                return Err(Error::coded(
+                    afs_error::META_DFS_GC_CHANGED,
+                    "GC state changed during this write generation; old receipts cannot be refreshed",
+                ));
+            }
         }
         let current = self.get_inode(commit.inode_id.clone()).await?;
         if commit.write_lease.inode_id != commit.inode_id
@@ -3635,14 +3764,93 @@ impl DfsService {
         } else {
             None
         };
+        let mut generation_references = Vec::new();
+        if commit.gc_fence == Some(crate::dfs::GcFence::WriteGeneration) {
+            let session = self.current_live_session(&caller_id, now_unix_ms()).await?;
+            if session.session_id != commit.write_lease.owner_session_id {
+                return Err(conflict("write generation owner session changed"));
+            }
+            let view = self.store.read_view().await?;
+            let mut generations =
+                BTreeSet::from([ChunkObject::generation_id(&commit.operation_id)]);
+            for receipt in &commit.chunk_receipts {
+                let generation = receipt
+                    .chunk
+                    .write_generation()
+                    .ok_or_else(|| invalid("generation receipts require CRC identities"))?;
+                if generation != ChunkObject::generation_id(&receipt.operation_id) {
+                    return Err(invalid(
+                        "receipt operation differs from its birth generation",
+                    ));
+                }
+                generations.insert(generation.to_owned());
+            }
+            for generation in generations {
+                let key = MetaKey::DfsReference {
+                    node_id: caller_id.clone(),
+                    session_id: commit.write_lease.owner_session_id.clone(),
+                    reference_id: format!("write:{generation}"),
+                };
+                let Some(MetaEntity::DfsReference(reference)) = view.lookup(&key)?.entity else {
+                    return Err(Error::coded(
+                        afs_error::META_DFS_GC_CHANGED,
+                        "write generation is not admitted",
+                    ));
+                };
+                if !reference.publication
+                    || reference.retired_at_unix_ms.is_some()
+                    || reference.inode_id.as_ref() != Some(&commit.inode_id)
+                    || reference.node_id != caller_id
+                    || reference.session_id != commit.write_lease.owner_session_id
+                {
+                    return Err(Error::coded(
+                        afs_error::META_DFS_GC_CHANGED,
+                        "write generation has been retired",
+                    ));
+                }
+                generation_references.push(reference);
+            }
+        }
         let expected_base_layout = match commit.expected_head_version.as_ref() {
             Some(version_id) => Some(self.get_file_version(version_id.clone()).await?.1),
             None => None,
         };
+        // COW publishes a distinct destination version, sharing immutable chunks.
+        // A caller cannot introduce arbitrary chunk references via this path.
+        let clone_layout = if let Some(range) = &commit.clone_source {
+            let (source, layout) = self.get_file_version(range.version.clone()).await?;
+            let source_inode = self.get_inode(source.inode_id.clone()).await?;
+            let empty = LayoutRoot {
+                id: crate::dfs::LayoutRootId::new("empty"),
+                file_length: 0,
+                inline_extents: vec![],
+            };
+            let expected = crate::dfs::clone_file_layout(
+                expected_base_layout.as_ref().unwrap_or(&empty),
+                &layout,
+                range,
+                commit.layout_root.id.clone(),
+            )?;
+            if source_inode.namespace_id != current.namespace_id
+                || source_inode.kind != InodeKind::Regular
+                || source.inode_id == current.inode_id
+                || expected != commit.layout_root
+                || !commit.chunk_receipts.is_empty()
+            {
+                return Err(invalid(
+                    "COW clone must preserve the declared same-namespace source range",
+                ));
+            }
+            Some(expected)
+        } else {
+            None
+        };
         let mut accepted_copies = Vec::with_capacity(commit.chunk_receipts.len());
         let mut receipt_chunks = HashSet::new();
         for receipt in &commit.chunk_receipts {
-            if receipt.operation_id != commit.operation_id {
+            if receipt.operation_id != commit.operation_id
+                && commit.gc_fence != Some(crate::dfs::GcFence::WriteGeneration)
+            {
                 return Err(invalid("ChunkReceipt operation does not match commit"));
             }
             if !receipt_chunks.insert(receipt.chunk.id.clone()) {
@@ -3681,9 +3889,12 @@ impl DfsService {
                 if chunk_end > receipt.chunk.length {
                     return Err(invalid("DFS extent exceeds its referenced Chunk"));
                 }
-            } else if !expected_base_layout
+            } else if !clone_layout
                 .as_ref()
                 .is_some_and(|layout| extent_is_inherited(extent, layout))
+                && !expected_base_layout
+                    .as_ref()
+                    .is_some_and(|layout| extent_is_inherited(extent, layout))
             {
                 return Err(invalid(
                     "LayoutRoot references neither a newly durable Chunk nor a legal expected-base range",
@@ -3719,7 +3930,7 @@ impl DfsService {
             }
         }
 
-        let request = RequestKey::new(caller_id, commit.operation_id.0.clone());
+        let request = RequestKey::new(caller_id.clone(), commit.operation_id.0.clone());
         let outcome = RequestOutcome {
             request: request.clone(),
             operation: StoreOperation::DfsCommitFileVersion,
@@ -3734,6 +3945,52 @@ impl DfsService {
             TxnCondition::Missing(MetaKey::DfsFileVersion(commit.file_version.id.clone())),
             TxnCondition::Missing(MetaKey::DfsLayoutRoot(commit.layout_root.id.clone())),
         ]);
+        if !generation_references.is_empty() {
+            for reference in &generation_references {
+                txn.conditions
+                    .push(TxnCondition::EntityEquals(MetaEntity::DfsReference(
+                        reference.clone(),
+                    )));
+            }
+            txn.conditions.push(TxnCondition::NodeSessionCurrent {
+                node_id: caller_id.clone(),
+                session_id: commit.write_lease.owner_session_id.clone(),
+            });
+        } else if let Some(condition) = commit.gc_fence.and_then(crate::dfs::GcFence::condition) {
+            txn.conditions.push(condition);
+        } else if gc_snapshot.entity.is_some() {
+            txn.conditions.push(TxnCondition::RevisionEquals {
+                key: MetaKey::DfsGc,
+                revision: gc_snapshot.revision,
+            });
+        } else {
+            txn.conditions.push(TxnCondition::Missing(MetaKey::DfsGc));
+        }
+        if let Some(MetaEntity::DfsGc(gc)) = gc_snapshot.entity
+            && commit
+                .layout_root
+                .inline_extents
+                .iter()
+                .any(|extent| gc.chunks.contains(&extent.chunk_id))
+        {
+            return Err(conflict("commit references a chunk pending deletion"));
+        }
+        if !generation_references.is_empty() {
+            for mut reference in generation_references {
+                // The version becomes reachable in this same transaction. Retain a
+                // retirement marker through the maximum delayed-admission window.
+                reference.retired_at_unix_ms = Some(now_unix_ms());
+                txn.mutations
+                    .push(TxnMutation::Put(MetaEntity::DfsReference(reference)));
+            }
+        } else {
+            txn.mutations
+                .push(TxnMutation::Delete(MetaKey::DfsReference {
+                    node_id: caller_id.clone(),
+                    session_id: commit.write_lease.owner_session_id.clone(),
+                    reference_id: format!("publish:{}", commit.operation_id.0),
+                }));
+        }
         if let Some(session) = external_session {
             txn.conditions.extend([
                 TxnCondition::EntityEquals(MetaEntity::DfsDurabilityPolicy(durability_policy)),
@@ -3804,7 +4061,7 @@ impl DfsService {
             TxnMutation::Put(MetaEntity::DfsInode(updated)),
             TxnMutation::RecordRequestOutcome(outcome),
         ]);
-        inode_outcome(
+        file_commit_attempt(
             validate_namespace_outcome(self.store.compare_and_commit(txn).await?, request_digest)?,
             StoreOperation::DfsCommitFileVersion,
         )
@@ -4801,6 +5058,25 @@ fn root_inode(namespace_id: NamespaceId) -> InodeRecord {
         symlink_target: None,
         xattrs: Default::default(),
         revision: 1,
+    }
+}
+
+fn file_commit_attempt(
+    outcome: TxnOutcome,
+    operation: StoreOperation,
+) -> Result<FileCommitAttempt> {
+    if matches!(
+        &outcome,
+        TxnOutcome::ConditionFailed {
+            existing_outcome: None,
+            ..
+        }
+    ) {
+        // Re-read head, lease identity and every other precondition. A renewed
+        // TTL is benign; changed authority/head fails on the next validation.
+        Ok(FileCommitAttempt::Retry)
+    } else {
+        inode_outcome(outcome, operation).map(FileCommitAttempt::Committed)
     }
 }
 
@@ -5925,7 +6201,7 @@ mod read_recovery_tests {
     use crate::dfs::{
         DfsReadValidation, Extent, LayoutRootId, StorageDeviceDescriptor, ValidateDfsReadGrants,
     };
-    use crate::meta::store::{NodeSessionLease, Store, memory::MemoryBackend};
+    use crate::meta::store::{NodeSessionLease, Store, journal::MemoryLog};
     use crate::node::chunk::{ChunkStore, LocalChunkStore, StagedChunk};
 
     struct Fixture {
@@ -6015,7 +6291,7 @@ mod read_recovery_tests {
         RequestKey,
     ) {
         let store = Arc::new(
-            Store::open(Arc::new(MemoryBackend::default()))
+            Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
                 .await
                 .unwrap(),
         );
@@ -6063,6 +6339,7 @@ mod read_recovery_tests {
         layout: LayoutRoot,
     ) -> CommitFileVersion {
         CommitFileVersion {
+            gc_fence: None,
             operation_id,
             inode_id: inode.inode_id.clone(),
             write_lease: WriteLease {
@@ -6077,6 +6354,7 @@ mod read_recovery_tests {
             file_version: version,
             layout_root: layout,
             chunk_receipts: Vec::new(),
+            clone_source: None,
             metadata_delta: crate::dfs::CommitMetadataDelta {
                 mode: CommitMetadataMode::DataOnly,
                 mtime_unix_ms: None,
@@ -6094,7 +6372,7 @@ mod read_recovery_tests {
         let temp = tempfile::tempdir().unwrap();
         let local = LocalChunkStore::open(temp.path(), "receiver").unwrap();
         let store = Arc::new(
-            Store::open(Arc::new(MemoryBackend::default()))
+            Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
                 .await
                 .unwrap(),
         );
@@ -7431,7 +7709,7 @@ mod external_policy_tests {
         ChunkReceipt, CommitMetadataDelta, DfsDurabilityPolicy, Extent, ExternalCommitReceipt,
         LayoutRootId,
     };
-    use crate::meta::store::{NodeSessionLease, Store, local_file::LocalFileBackend};
+    use crate::meta::store::{NodeSessionLease, Store, local_log::LocalLog};
     use crate::node::chunk::StagedChunk;
 
     fn external_policy() -> DfsDurabilityPolicy {
@@ -7510,6 +7788,7 @@ mod external_policy_tests {
             }],
         };
         CommitFileVersion {
+            gc_fence: None,
             operation_id,
             inode_id: inode.inode_id.clone(),
             write_lease,
@@ -7525,6 +7804,7 @@ mod external_policy_tests {
             },
             layout_root: layout,
             chunk_receipts: vec![receipt],
+            clone_source: None,
             metadata_delta: CommitMetadataDelta {
                 mode: CommitMetadataMode::DataOnly,
                 mtime_unix_ms: None,
@@ -7544,8 +7824,8 @@ mod external_policy_tests {
 
     async fn current_read_fixture() -> CurrentReadFixture {
         let temp = tempfile::tempdir().unwrap();
-        let backend = Arc::new(LocalFileBackend::open(temp.path()).unwrap());
-        let store = Arc::new(Store::open(backend).await.unwrap());
+        let backend = Arc::new(LocalLog::open(temp.path(), Default::default()).unwrap());
+        let store = Arc::new(Store::open_log(backend).await.unwrap());
         register(&store, "writer").await;
         register(&store, "reader").await;
         let service = DfsService::with_durability_policy(
@@ -7998,8 +8278,8 @@ mod external_policy_tests {
     #[tokio::test]
     async fn external_receipt_rejects_wrong_store_key_length_digest_without_publication() {
         let temp = tempfile::tempdir().unwrap();
-        let backend = Arc::new(LocalFileBackend::open(temp.path()).unwrap());
-        let store = Arc::new(Store::open(backend).await.unwrap());
+        let backend = Arc::new(LocalLog::open(temp.path(), Default::default()).unwrap());
+        let store = Arc::new(Store::open_log(backend).await.unwrap());
         register(&store, "writer").await;
         let service = DfsService::with_durability_policy(
             store.clone(),
@@ -8088,8 +8368,8 @@ mod external_policy_tests {
     #[tokio::test]
     async fn external_policy_and_published_reference_survive_local_file_store_reload() {
         let temp = tempfile::tempdir().unwrap();
-        let backend = Arc::new(LocalFileBackend::open(temp.path()).unwrap());
-        let store = Arc::new(Store::open(backend.clone()).await.unwrap());
+        let backend = Arc::new(LocalLog::open(temp.path(), Default::default()).unwrap());
+        let store = Arc::new(Store::open_log(backend.clone()).await.unwrap());
         register(&store, "writer").await;
         register(&store, "reader").await;
         let service = DfsService::with_durability_policy(
@@ -8135,7 +8415,7 @@ mod external_policy_tests {
         ));
         drop(service);
         drop(store);
-        let reopened = Arc::new(Store::open(backend).await.unwrap());
+        let reopened = Arc::new(Store::open_log(backend).await.unwrap());
         let restored = DfsService::with_durability_policy(
             reopened.clone(),
             ReplicationConfig::local_single_copy(),
@@ -8242,8 +8522,8 @@ mod external_policy_tests {
     #[tokio::test]
     async fn existing_node_replication_authority_cannot_be_reclassified_as_external() {
         let store = Arc::new(
-            Store::open(Arc::new(
-                crate::meta::store::memory::MemoryBackend::default(),
+            Store::open_log(Arc::new(
+                crate::meta::store::journal::MemoryLog::new(Default::default()).unwrap(),
             ))
             .await
             .unwrap(),
@@ -8295,8 +8575,8 @@ mod external_policy_tests {
     #[tokio::test]
     async fn external_publication_has_one_external_copy_and_no_replication_debt() {
         let store = Arc::new(
-            Store::open(Arc::new(
-                crate::meta::store::memory::MemoryBackend::default(),
+            Store::open_log(Arc::new(
+                crate::meta::store::journal::MemoryLog::new(Default::default()).unwrap(),
             ))
             .await
             .unwrap(),
@@ -8357,3 +8637,6 @@ mod external_policy_tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "dfs"))]
+mod gc_fence_tests;

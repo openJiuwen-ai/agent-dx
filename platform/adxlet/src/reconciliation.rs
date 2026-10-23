@@ -1,4 +1,4 @@
-//! Restore only an authoritative complete node catalog. No local directory is required.
+//! Recover or compare a complete authoritative node catalog.
 use crate::{controller, Adxlet};
 use adx_core::{
     scheduling::{validate_device_assignment, DeviceLedger},
@@ -9,24 +9,29 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
-impl Adxlet {
-    /// Collection is permitted only after complete authoritative recovery.
-    pub async fn collect_remote_orphans(&self) -> Result<usize> {
-        let ready = self.lifecycle_ready.read().await;
-        if !*ready || self.is_draining() {
-            return Ok(0);
-        }
-        match &self.services.checkpoint {
-            Some(checkpoint) => checkpoint.store.collect_remote_orphans().await,
-            None => Ok(0),
-        }
-    }
+mod catalog;
+mod periodic;
+use catalog::{validate_inventory, Catalog};
+pub(crate) use periodic::ReconciliationOutcome;
 
+fn terminal_without_execution(record: &EnvironmentRecord) -> bool {
+    matches!(
+        record.state,
+        EnvironmentState::Failed | EnvironmentState::Deleted
+    ) && !record.resources_held
+        && !record.restart_pending
+}
+
+impl Adxlet {
     /// Called only with a Coordinator-authorized, unreferenced deletion record.
     /// A lost acknowledgement can safely repeat the same artifact removal.
     pub async fn collect_snapshot(&self, snapshot: &Snapshot, delegated: bool) -> Result<()> {
         snapshot.validate()?;
-        if !snapshot.collectable() {
+        if delegated
+            || snapshot.source_node_id != self.node_id
+            || snapshot.artifact.storage != "local"
+            || !snapshot.collectable()
+        {
             return Err(Error::Conflict);
         }
         let checkpoint = self
@@ -34,17 +39,7 @@ impl Adxlet {
             .checkpoint
             .as_ref()
             .ok_or_else(|| Error::Unavailable("checkpoint storage is not configured".into()))?;
-        if delegated {
-            let Some(scope) = checkpoint.store.shared_scope() else {
-                return Err(Error::Conflict);
-            };
-            if snapshot.artifact.scope.is_empty() || snapshot.artifact.scope != scope {
-                return Err(Error::Conflict);
-            }
-        } else if snapshot.source_node_id != self.node_id {
-            return Err(Error::Conflict);
-        }
-        checkpoint.store.remove(&snapshot.artifact).await
+        checkpoint.store.release(&snapshot.artifact).await
     }
 
     /// Remove artifacts authorized by a durable Coordinator cleanup task.
@@ -61,18 +56,17 @@ impl Adxlet {
             .checkpoint
             .as_ref()
             .ok_or_else(|| Error::Unavailable("checkpoint storage is not configured".into()))?;
-        if delegated {
-            let scope = checkpoint.store.shared_scope().ok_or(Error::Conflict)?;
-            if cleanup.artifacts.iter().any(|artifact| {
-                artifact.storage == "local" || artifact.scope.is_empty() || artifact.scope != scope
-            }) {
-                return Err(Error::Conflict);
-            }
-        } else if cleanup.assignment.node_id != self.node_id {
+        if delegated
+            || cleanup.assignment.node_id != self.node_id
+            || cleanup
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.storage != "local")
+        {
             return Err(Error::Conflict);
         }
         for artifact in &cleanup.artifacts {
-            checkpoint.store.remove(artifact).await?;
+            checkpoint.store.release(artifact).await?;
         }
         Ok(())
     }
@@ -92,80 +86,34 @@ impl Adxlet {
     ) -> Result<()> {
         self.reconcile_authority(records, snapshots, None).await
     }
-    /// `retained_checkpoints` must include all globally referenced artifacts,
+    /// `retained_artifacts` must include all globally referenced artifacts,
     /// including other nodes and pending restores. Only this complete catalog
     /// permits reclaiming checkpoints owned by retired local controllers.
     pub async fn reconcile_retained(
         &self,
         records: Vec<EnvironmentRecord>,
         snapshots: Vec<Snapshot>,
-        retained_checkpoints: Vec<adx_core::CheckpointArtifact>,
+        retained_artifacts: Vec<adx_core::CheckpointArtifact>,
     ) -> Result<()> {
-        self.reconcile_authority(records, snapshots, Some(retained_checkpoints))
+        self.reconcile_authority(records, snapshots, Some(retained_artifacts))
             .await
     }
     async fn reconcile_authority(
         &self,
         records: Vec<EnvironmentRecord>,
         snapshots: Vec<Snapshot>,
-        retained_checkpoints: Option<Vec<adx_core::CheckpointArtifact>>,
+        retained_artifacts: Option<Vec<adx_core::CheckpointArtifact>>,
     ) -> Result<()> {
         let mut ready = self.lifecycle_ready.write().await;
         if self.is_draining() {
             return Err(Error::Unavailable("node is draining".into()));
         }
         *ready = false;
-        let mut snapshot_ids = BTreeSet::new();
-        let complete_references = retained_checkpoints.is_some();
-        let mut retained = retained_checkpoints.unwrap_or_default();
-        for snapshot in snapshots {
-            snapshot.validate()?;
-            if snapshot.source_node_id != self.node_id
-                || snapshot.state == SnapshotState::Deleted
-                || !snapshot_ids.insert(snapshot.id)
-            {
-                return Err(Error::Conflict);
-            }
-            retained.push(snapshot.artifact);
-        }
-        let mut catalog = BTreeMap::new();
-        let mut scalar = ResourceLedger::new(Resources::default());
-        let mut cards = DeviceLedger::default();
-        for r in records {
-            r.spec.validate()?;
-            validate_device_assignment(&r.spec.scheduling.devices, &r.assignment.devices)?;
-            if r.assignment.node_id != self.node_id
-                || r.assignment.environment_id != r.spec.id
-                || r.assignment.generation == 0
-                || !adx_core::valid_runtime_id(&r.spec.id, r.assignment.generation, &r.runtime.id)
-                || (r.state == EnvironmentState::Running
-                    && (!r.resources_held || r.runtime.ip.is_none() || r.revision == 0))
-                || (r.state == EnvironmentState::Deleted && r.resources_held)
-                || catalog.contains_key(&r.spec.id)
-            {
-                return Err(Error::Conflict);
-            }
-            if r.resources_held {
-                scalar.restore(&r.runtime.id, r.spec.resources)?;
-                cards.restore(&r.runtime.id, &r.assignment.devices)?;
-            }
-            catalog.insert(r.spec.id.clone(), r);
-        }
-        // Only a complete global reference catalog proves that a shared point
-        // is no longer needed by a different node or a recovery in progress.
-        let references = complete_references.then(|| {
-            Arc::new(
-                retained
-                    .iter()
-                    .chain(
-                        catalog
-                            .values()
-                            .filter_map(|record| record.checkpoint.as_ref().map(|cp| &cp.artifact)),
-                    )
-                    .map(|artifact| (artifact.storage.clone(), artifact.location.clone()))
-                    .collect(),
-            )
-        });
+        let Catalog {
+            records: catalog,
+            mut retained,
+            references,
+        } = Catalog::new(&self.node_id, records, snapshots, retained_artifacts)?;
         let controllers = self
             .environments
             .lock()
@@ -180,56 +128,30 @@ impl Adxlet {
                 }
             }
         }
-        // Drain each accepted serial operation before scanning/destructive cleanup.
-        // Restore can finish after its RPC caller timed out. Align only an
-        // uncommitted execution with the durable pause point; a newer published
-        // result rejects this stale catalog so the heartbeat fetches it again.
+        // Startup owns the node barrier; drain already accepted controller work.
         for (id, (_, assignment, handle)) in &controllers {
             if let Some(record) = catalog.get(id).filter(|r| r.assignment == *assignment) {
                 handle.align_authority(record.clone()).await?;
             }
         }
+        let runtime_catalog: Vec<_> = catalog.values().cloned().collect();
         let actual = tokio::time::timeout(
             self.services.operation_timeout,
-            self.services.runtime.inventory(),
+            self.services.runtime.reconcile_inventory(&runtime_catalog),
         )
         .await
         .map_err(|_| Error::Unavailable("inventory timed out".into()))??;
-        let mut seen = BTreeSet::new();
-        for runtime in &actual {
-            if runtime.environment_id.is_empty()
-                || runtime.tenant_id.is_empty()
-                || runtime.generation == 0
-                || !adx_core::valid_runtime_id(
-                    &runtime.environment_id,
-                    runtime.generation,
-                    &runtime.runtime_id,
-                )
-                || !seen.insert(runtime.runtime_id.clone())
-            {
-                return Err(Error::Conflict);
-            }
-            if let Some(r) = catalog.get(&runtime.environment_id) {
-                if r.runtime.id == runtime.runtime_id && r.spec.tenant_id != runtime.tenant_id {
-                    return Err(Error::Conflict);
-                }
-            }
-        }
-        // Validate everything before any destructive action or partial ledger update.
+        validate_inventory(&actual, &catalog)?;
         self.services.routes.begin_reconcile().await?;
         for (id, (_, assignment, handle)) in controllers {
-            if catalog.get(&id).is_none_or(|r| {
-                r.assignment != assignment
-                    || (matches!(
-                        r.state,
-                        EnvironmentState::Failed | EnvironmentState::Deleted
-                    ) && !r.resources_held
-                        && !r.restart_pending)
-            }) {
+            let ownership_retired = catalog.get(&id).is_none_or(|r| r.assignment != assignment);
+            if ownership_retired || catalog.get(&id).is_some_and(terminal_without_execution) {
                 // Drain accepted operations, then clean locally without inventing a
                 // cluster record for an identity the authority does not own.
                 handle.discard(references.clone()).await?;
-                self.remember_retired(&assignment, None);
+                if ownership_retired {
+                    self.remember_retired(&assignment, None);
+                }
                 self.environments
                     .lock()
                     .expect("shared state lock poisoned")
@@ -239,7 +161,7 @@ impl Adxlet {
         for runtime in &actual {
             if catalog
                 .get(&runtime.environment_id)
-                .is_none_or(|r| r.runtime.id != runtime.runtime_id)
+                .is_none_or(|r| r.runtime.id != runtime.runtime_id || terminal_without_execution(r))
             {
                 tokio::time::timeout(self.services.operation_timeout, async {
                     // A stale execution under current ownership must not publish a
@@ -265,6 +187,10 @@ impl Adxlet {
                 if let Some((_, _, handle)) = environments.get(&r.spec.id) {
                     handle.clone()
                 } else {
+                    retained.extend(r.execution_artifacts.iter().cloned());
+                    if let Some(source) = &r.snapshot_source {
+                        retained.push(source.artifact.clone());
+                    }
                     if r.resources_held {
                         let mut admission = self
                             .services
@@ -278,7 +204,10 @@ impl Adxlet {
                             .restore(&r.runtime.id, &r.assignment.devices)?;
                     }
                     let handle = controller::spawn_restored(r.clone(), self.services.clone());
-                    environments.insert(r.spec.id.clone(), (r.spec, r.assignment, handle.clone()));
+                    environments.insert(
+                        r.spec.id.clone(),
+                        (r.spec.clone(), r.assignment.clone(), handle.clone()),
+                    );
                     handle
                 }
             };
@@ -296,14 +225,13 @@ impl Adxlet {
             checkpoint.store.reconcile_local(&retained).await?;
         }
         self.services.routes.finish_reconcile().await?;
-        if let Some(checkpoint) = &self.services.checkpoint {
-            checkpoint.store.authorize_remote_gc(&retained).await?;
-        }
         self.local_holds
             .lock()
             .expect("shared state lock poisoned")
             .clear();
         *ready = true;
+        self.authority_initialized
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 }
@@ -315,6 +243,14 @@ impl Adxlet {
         &self,
         record: EnvironmentRecord,
     ) -> Result<crate::OperationResult> {
+        if self
+            .authority_reconciling
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Unavailable(
+                "node authority reconciliation pending".into(),
+            ));
+        }
         let gate = self.lifecycle_ready.read().await;
         if !*gate || self.is_draining() {
             return Err(Error::Unavailable("node is reconciling or draining".into()));
@@ -375,6 +311,7 @@ impl Adxlet {
                 .environments
                 .lock()
                 .expect("shared state lock poisoned");
+            self.ensure_not_cleaning(&record.spec.id)?;
             if let Some((spec, owner, handle)) = environments.get(&record.spec.id) {
                 if *spec != record.spec || *owner != record.assignment {
                     return Err(Error::Conflict);

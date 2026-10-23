@@ -80,7 +80,6 @@ pub fn router(activator: Arc<Activator>, token: &str, timeout: Duration) -> Resu
         .route("/internal/adx/v1/templates/publish", post(publish))
         .route("/internal/adx/v1/templates/get", post(template))
         .route("/internal/adx/v1/bindings/get", post(binding))
-        .route("/internal/adx/v1/bindings/prepare", post(prepare))
         .route("/internal/adx/v1/bindings/list", post(bindings))
         .route("/internal/adx/v1/bindings/delete", post(delete))
         .route("/internal/adx/v1/bindings/activate", post(activate))
@@ -139,28 +138,13 @@ async fn activate(
     p.start_write();
     match s
         .activator
-        .activate_with_cache(
+        .activate_with_parameters(
             &r.scope,
             r.expected_generation.as_deref(),
             deadline,
             r.bypass_cache,
+            r.parameters.as_deref(),
         )
-        .await
-    {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => failure(e),
-    }
-}
-
-async fn prepare(
-    State(s): State<Service>,
-    axum::Extension(p): axum::Extension<Arc<RequestProgress>>,
-    Json(r): Json<PrepareBindingRequest>,
-) -> Response {
-    p.start_write();
-    match s
-        .activator
-        .prepare_binding(&r.scope, &r.launch, &r.parameters)
         .await
     {
         Ok(v) => Json(v).into_response(),

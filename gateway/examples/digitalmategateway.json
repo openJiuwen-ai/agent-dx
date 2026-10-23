@@ -1,0 +1,14 @@
+{
+  "tenant": "your-tenant",
+  "jiuwen": {
+    "agent_type": "assistant",
+    "template": "jiuwen",
+    "version": "1"
+  },
+  "orbit": {
+    "template": "orbit",
+    "version": "v1-workspace",
+    "backend_path": "/ws",
+    "service_port": 18092
+  }
+}

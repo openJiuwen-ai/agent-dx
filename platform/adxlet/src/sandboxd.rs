@@ -223,6 +223,11 @@ impl Sandboxd {
         generation: u64,
         devices: &[adx_core::scheduling::DeviceAllocation],
     ) -> Result<Request<proto::StartRequest>> {
+        if spec.execution.user.is_some() || spec.execution.group.is_some() {
+            return Err(Error::Invalid(
+                "this sandboxd backend does not support tool user/group overrides".into(),
+            ));
+        }
         let mut config = self.config.clone();
         // Runtime capability metadata owns the guest paths. Never inherit caller
         // values that could redirect the privileged checkpoint handoff.
@@ -655,6 +660,12 @@ pub fn start_request(
         xpu.entry(kind.into()).or_default().push(d.id);
     }
     let options = &spec.execution;
+    options.validate_tunnel_network(options.network.as_ref())?;
+    envs.retain(|key, _| !key.starts_with("EXECD_TUNNEL_"));
+    if let Some(port) = options.tunnel_http_port {
+        envs.insert("EXECD_TUNNEL_HTTP_PORT".into(), port.to_string());
+        envs.insert("EXECD_TUNNEL_WS_PORT".into(), (port - 1).to_string());
+    }
     // Only the typed constructor option may configure runtime initialization.
     envs.remove("ADX_ENVIRONMENT_CWD");
     if let Some(cwd) = &options.cwd {
@@ -809,7 +820,9 @@ pub fn start_request(
         network_policy: options
             .network
             .as_ref()
-            .map(|policy| environment_network_policy(policy, &options.ports, config))
+            .map(|policy| {
+                environment_network_policy(policy, &options.ports, options.tunnel_http_port, config)
+            })
             .transpose()?,
         inject_entrypoint: if options.inherit_entrypoint {
             image_process_config.into()
@@ -888,24 +901,52 @@ fn environment_mount(value: &adx_core::execution::Mount) -> Result<proto::Mount>
         StorageSource::S3(value) => proto::mount::Source::S3Config(environment_s3(value)),
         StorageSource::Local(value) => proto::mount::Source::HostPath(value.clone()),
     };
+    let mut options = value.options.clone();
+    // OCI bind mounts require an explicit mount flag as well as type="bind".
+    // Public Local mount options describe access flags such as ro/rw.
+    if value.kind == "bind"
+        && matches!(&value.source, StorageSource::Local(_))
+        && !options.iter().any(|flag| flag == "bind" || flag == "rbind")
+    {
+        options.push("rbind".into());
+    }
     Ok(proto::Mount {
         r#type: value.kind.clone(),
         target: value.target.clone(),
-        options: value.options.clone(),
+        options,
         source: Some(source),
     })
 }
 
-fn environment_network_policy(
+pub(crate) fn environment_network_policy(
     value: &adx_core::execution::NetworkPolicy,
     ports: &[u16],
+    tunnel_http_port: Option<u16>,
     config: &Config,
 ) -> Result<proto::NetworkPolicy> {
     use adx_core::execution as model;
+    model::ExecutionOptions {
+        tunnel_http_port,
+        ports: ports.to_vec(),
+        ..Default::default()
+    }
+    .validate_tunnel_network(Some(value))?;
     let action = |value| match value {
         model::NetworkAction::Allow => proto::NetworkPolicyAction::Allow as i32,
         model::NetworkAction::Deny => proto::NetworkPolicyAction::Deny as i32,
     };
+    let execd_port = config
+        .env
+        .get("EXECD_HTTP_PORT")
+        .map(|v| v.parse::<u16>())
+        .transpose()
+        .map_err(|_| Error::Invalid("invalid Execd control port".into()))?
+        .unwrap_or(50090);
+    if execd_port == 0 {
+        return Err(Error::Invalid(
+            "positive Execd control port required".into(),
+        ));
+    }
     let control_peer = runtime_control_peer(config)?;
     let traffic = value.traffic.as_ref().map(|traffic| {
         let mut rules: Vec<_> = traffic
@@ -947,13 +988,13 @@ fn environment_network_policy(
         // Control traffic and declared public ports remain reachable under a
         // deny-by-default user policy. UINT32_MAX is reserved by the public
         // contract for these platform-owned rules.
-        for port in std::iter::once(50090u16).chain(ports.iter().copied()) {
+        for port in std::iter::once(execd_port).chain(ports.iter().copied()) {
             rules.push(proto::TrafficRule {
                 action: proto::NetworkPolicyAction::Allow as i32,
                 // Execd control replies must not depend on a conntrack entry
                 // from the previous policy generation. Stateless published
                 // ports also need an explicit return-path rule.
-                direction: if port == 50090 || traffic.mode == model::TrafficMode::Stateless {
+                direction: if port == execd_port || traffic.mode == model::TrafficMode::Stateless {
                     proto::NetworkDirection::Both as i32
                 } else {
                     proto::NetworkDirection::Ingress as i32
@@ -967,6 +1008,22 @@ fn environment_network_policy(
                 sandbox_port_range: Some(proto::PortRange {
                     first: u32::from(port),
                     last: u32::from(port),
+                }),
+                priority: u32::MAX,
+                ..Default::default()
+            });
+        }
+        // Only a new inbound handshake may establish the tunnel return path.
+        // A Both rule would allow arbitrary outbound TCP with this source port.
+        if let Some(port) = tunnel_http_port {
+            rules.push(proto::TrafficRule {
+                action: proto::NetworkPolicyAction::Allow as i32,
+                direction: proto::NetworkDirection::Ingress as i32,
+                protocol: proto::NetworkProtocol::Tcp as i32,
+                peer: Some(proto::NetworkEndpoint::default()),
+                sandbox_port_range: Some(proto::PortRange {
+                    first: u32::from(port - 1),
+                    last: u32::from(port - 1),
                 }),
                 priority: u32::MAX,
                 ..Default::default()
@@ -1044,9 +1101,10 @@ fn runtime_control_peer(config: &Config) -> Result<Option<proto::NetworkEndpoint
 
 #[async_trait]
 impl RuntimeDriver for Sandboxd {
-    fn retains_checkpoint_files(&self, runtime_class: &str) -> bool {
-        // sandboxd completes runsc's synchronous Restore before returning Start.
-        // Firecracker v2 retains its caller-owned incremental memory base.
+    // Keep RuntimeDriver's conservative input retention: sandboxd can enable
+    // runsc background page loading independently of adxlet configuration.
+    // Firecracker also retains its caller-owned incremental memory base.
+    fn retains_capture_files(&self, runtime_class: &str) -> bool {
         runtime_class != "runsc"
     }
 
@@ -1105,6 +1163,7 @@ impl RuntimeDriver for Sandboxd {
         path: &Path,
         origin: Option<&adx_core::runtime::RuntimeIdentity>,
     ) -> Result<IpAddr> {
+        let started = tokio::time::Instant::now();
         let request = self
             .restore_request(
                 spec,
@@ -1114,7 +1173,16 @@ impl RuntimeDriver for Sandboxd {
                 crate::RestoreSource { path, origin },
             )
             .await?;
-        self.execute_start(runtime_id, request, None).await
+        let request_ms = started.elapsed().as_secs_f64() * 1_000.0;
+        let start = tokio::time::Instant::now();
+        let result = self.execute_start(runtime_id, request, None).await;
+        adx_observability::info!(
+            event = "environment_backend_restore_stages", environment_id = %spec.id,
+            %runtime_id, request_ms, start_rpc_ms = start.elapsed().as_secs_f64() * 1_000.0,
+            total_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            success = result.is_ok(), "backend restore stages completed"
+        );
+        result
     }
     async fn restore_from_with_deadline(
         &self,
@@ -1171,6 +1239,7 @@ impl RuntimeDriver for Sandboxd {
         runtime_id: &str,
         policy: Option<&adx_core::execution::NetworkPolicy>,
         ports: &[u16],
+        tunnel_http_port: Option<u16>,
     ) -> Result<()> {
         let id = self.physical_id(runtime_id).await?.ok_or(Error::NotFound)?;
         self.client
@@ -1179,7 +1248,9 @@ impl RuntimeDriver for Sandboxd {
                 self.request(proto::SetNetworkPolicyRequest {
                     sandbox_id: id,
                     network_policy: policy
-                        .map(|value| environment_network_policy(value, ports, &self.config))
+                        .map(|value| {
+                            environment_network_policy(value, ports, tunnel_http_port, &self.config)
+                        })
                         .transpose()?,
                 }),
             )

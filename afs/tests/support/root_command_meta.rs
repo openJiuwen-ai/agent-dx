@@ -22,7 +22,6 @@ use afs::{
             MetaEntity, MetaKey, MetaRead, MetaStore, MetaTxn, OperationResult, RequestKey,
             RequestOutcome, RootAccessGrant, RootCommandRecord, RootCommandType, RootRecord, Store,
             StoreOperation, StoreRevision, TxnCondition, TxnMutation, TxnOutcome,
-            local_file::LocalFileBackend,
         },
     },
     runtime::{self, BoxError, Observability, Services},
@@ -124,6 +123,7 @@ async fn main() -> Result<(), BoxError> {
     let obs = Observability::new()?;
     let _guards = runtime::initialize(&cfg, "afs-root-command-meta", &obs)?;
     let concrete_store = open_local_file_store(&cfg).await?;
+    concrete_store.register_metrics(&obs.registry)?;
     let meta_store: Arc<dyn MetaStore> = concrete_store.clone();
     let trusted = load_trusted_node_certs(&cfg.trusted_node_certs)?;
     let state = Arc::new(Meta::with_store_and_peer_identity(
@@ -246,8 +246,13 @@ fn validate_config(cfg: &Config) -> Result<(), BoxError> {
 }
 
 async fn open_local_file_store(cfg: &Config) -> Result<Arc<Store>, BoxError> {
-    let backend = LocalFileBackend::open(cfg.data_dir.join("meta-store"))?;
-    Ok(Arc::new(Store::open(Arc::new(backend)).await?))
+    meta::open_configured_store(cfg).await?.ok_or_else(|| {
+        afs_error::Error::coded(
+            afs_error::CONFIG_INVALID,
+            "test launcher requires a filesystem authority",
+        )
+        .into()
+    })
 }
 
 async fn wait_for_trigger(

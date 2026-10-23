@@ -48,7 +48,7 @@ fn snapshot_wire_preserves_template_and_durable_references() {
             },
         )
         .unwrap();
-    record.delete("tenant").unwrap();
+    assert!(record.delete("tenant").is_err());
     let wire: adx_protocol::control::ReusableSnapshot = record.clone().try_into().unwrap();
     assert_eq!(Snapshot::try_from(wire).unwrap(), record);
 }

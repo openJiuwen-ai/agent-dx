@@ -46,7 +46,7 @@ fn pressure_uses_hysteresis_and_does_not_open_on_partial_recovery() {
 }
 
 #[tokio::test]
-async fn external_http_source_supplies_host_and_expires_on_disconnect() {
+async fn external_http_source_accepts_zero_capacity_and_reports_disconnect() {
     use adxlet::resources::ResourceSource;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let tmp = tempfile::Builder::new()
@@ -56,50 +56,84 @@ async fn external_http_source_supplies_host_and_expires_on_disconnect() {
     let path = tmp.path().join("resource.sock");
     let listener = tokio::net::UnixListener::bind(&path).unwrap();
     let server = tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let mut headers = vec![];
-        loop {
-            let mut byte = [0];
-            stream.read_exact(&mut byte).await.unwrap();
-            headers.push(byte[0]);
-            if headers.ends_with(b"\r\n\r\n") {
-                break;
+        for body in [
+            r#"{"cpu":0,"mem":4096,"xpu":[]}"#,
+            r#"{"cpu":2,"mem":0,"xpu":[]}"#,
+            r#"{"cpu":0,"mem":0,"xpu":[]}"#,
+            r#"{"cpu":2,"mem":4096,"xpu":[]}"#,
+        ] {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut headers = vec![];
+            loop {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).await.unwrap();
+                headers.push(byte[0]);
+                if headers.ends_with(b"\r\n\r\n") {
+                    break;
+                }
             }
-        }
-        let has_host = String::from_utf8(headers)
-            .unwrap()
-            .to_ascii_lowercase()
-            .contains("\r\nhost: localhost\r\n");
-        let body = r#"{"cpu":2,"mem":4096,"xpu":[]}"#;
-        let status = if has_host {
-            "200 OK"
-        } else {
-            "400 Bad Request"
-        };
-        stream
-            .write_all(
-                format!(
+            let has_host = String::from_utf8(headers)
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("\r\nhost: localhost\r\n");
+            let status = if has_host {
+                "200 OK"
+            } else {
+                "400 Bad Request"
+            };
+            stream
+                .write_all(
+                    format!(
                     "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 )
-                .as_bytes(),
-            )
-            .await
-            .unwrap();
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
     });
     let source = ResourceSource::Sandboxd {
         socket: path,
         valid_for_seconds: 3,
     };
-    let (sample, valid) = source
-        .sample(std::time::Duration::from_secs(2))
-        .await
-        .unwrap();
-    assert_eq!(sample.capacity.cpu_millis, 2000);
-    assert_eq!(valid, std::time::Duration::from_secs(3));
+    for (cpu_millis, memory_bytes) in [(0, 4096), (2000, 0), (0, 0), (2000, 4096)] {
+        let (sample, valid) = source
+            .sample(std::time::Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(sample.capacity.cpu_millis, cpu_millis);
+        assert_eq!(sample.capacity.memory_bytes, memory_bytes);
+        assert_eq!(valid, std::time::Duration::from_secs(3));
+    }
     server.await.unwrap();
     assert!(source
         .sample(std::time::Duration::from_secs(2))
         .await
         .is_err());
+}
+
+#[tokio::test]
+async fn file_source_accepts_zero_capacity_but_rejects_expired_observations() {
+    use adxlet::resources::ResourceSource;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("capacity.json");
+    let source = ResourceSource::File { path: path.clone() };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let observation = serde_json::json!({
+        "capacity": {"cpu_millis": 0, "memory_bytes": 0, "disk_bytes": 0},
+        "valid_until_unix_seconds": now + 60,
+    });
+    std::fs::write(&path, observation.to_string()).unwrap();
+    let (sample, valid) = source.sample(Duration::from_secs(1)).await.unwrap();
+    assert_eq!(sample.capacity, adx_core::Resources::default());
+    assert!(!valid.is_zero());
+    let mut expired = observation;
+    expired["valid_until_unix_seconds"] = now.into();
+    std::fs::write(path, expired.to_string()).unwrap();
+    assert!(source.sample(Duration::from_secs(1)).await.is_err());
 }

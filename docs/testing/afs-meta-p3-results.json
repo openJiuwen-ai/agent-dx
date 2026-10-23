@@ -1,0 +1,387 @@
+{
+  "schema_version": 1,
+  "scope": "local Linux Meta Store API engineering measurements; not formal performance acceptance or filesystem E2E",
+  "environment": {
+    "arch": "aarch64",
+    "vm_cpus": 4,
+    "vm_memory_gib": 8,
+    "container_cpus": 4,
+    "container_memory_gib": 6,
+    "toolchain": "Rust 1.95",
+    "filesystem": "ext4",
+    "formal_nvme_environment_qualified": false
+  },
+  "workload": {
+    "file_inodes": 100000,
+    "total_business_entities": 700001,
+    "copies_per_chunk": 1,
+    "real_chunk_bodies": false,
+    "concurrency": 4,
+    "seconds_per_round": 30,
+    "rounds": 3,
+    "diagnostic": false
+  },
+  "baseline": {
+    "source_commit": "1e9ae5f235d412b06fa4195bdbe26860bd7cd840",
+    "input_manifest_sha256": "873630aa7f22ec9193013f403c8598f792d683b9bac7662b56adfa9c1dd59c14",
+    "helper_sha256": "9f94b07b89c4f559454243d4cab7484a4492b5b2858e937db73284ab795d3644",
+    "seed_revisions": 1,
+    "rows": [
+      {
+        "operation": "create",
+        "rounds": [
+          {
+            "round": 1,
+            "attempts": 35,
+            "ops_per_second": 1.1354737815608849,
+            "p50_ms": 3367.224215,
+            "p95_ms": 3745.390987,
+            "p99_ms": 6393.41058,
+            "elapsed_seconds": 30.824137526
+          },
+          {
+            "round": 2,
+            "attempts": 33,
+            "ops_per_second": 1.0762926776651915,
+            "p50_ms": 3368.200957,
+            "p95_ms": 6509.87165,
+            "p99_ms": 6616.319196,
+            "elapsed_seconds": 30.660805081
+          },
+          {
+            "round": 3,
+            "attempts": 33,
+            "ops_per_second": 1.076832947129927,
+            "p50_ms": 3398.936948,
+            "p95_ms": 6524.21702,
+            "p99_ms": 6539.378942,
+            "elapsed_seconds": 30.645421918
+          }
+        ],
+        "median_ops_per_second": 1.076832947129927,
+        "median_p99_ms": 6539.378942,
+        "ops_max_min": 1.0549860694249777,
+        "p99_max_min": 1.0348653685244786,
+        "stable_ops": true,
+        "stable_p99": true
+      },
+      {
+        "operation": "commit",
+        "rounds": [
+          {
+            "round": 1,
+            "attempts": 33,
+            "ops_per_second": 1.0532934059308128,
+            "p50_ms": 3457.500144,
+            "p95_ms": 6525.883792,
+            "p99_ms": 6572.44252,
+            "elapsed_seconds": 31.330301523
+          },
+          {
+            "round": 2,
+            "attempts": 33,
+            "ops_per_second": 1.0764732925365326,
+            "p50_ms": 3417.152939,
+            "p95_ms": 6529.479823,
+            "p99_ms": 6648.331867,
+            "elapsed_seconds": 30.655660692
+          },
+          {
+            "round": 3,
+            "attempts": 35,
+            "ops_per_second": 1.1384890375978152,
+            "p50_ms": 3395.318928,
+            "p95_ms": 3632.800939,
+            "p99_ms": 6312.118455,
+            "elapsed_seconds": 30.742500669
+          }
+        ],
+        "median_ops_per_second": 1.0764732925365326,
+        "median_p99_ms": 6572.44252,
+        "ops_max_min": 1.0808849948051404,
+        "p99_max_min": 1.053264750083021,
+        "stable_ops": true,
+        "stable_p99": true
+      },
+      {
+        "operation": "read",
+        "rounds": [
+          {
+            "round": 1,
+            "attempts": 50949436,
+            "ops_per_second": 1698270.9215096328,
+            "p50_ms": 0.000708,
+            "p95_ms": 0.01,
+            "p99_ms": 0.02625,
+            "elapsed_seconds": 30.000770404
+          },
+          {
+            "round": 2,
+            "attempts": 50998700,
+            "ops_per_second": 1699921.4780654146,
+            "p50_ms": 0.000708,
+            "p95_ms": 0.010375,
+            "p99_ms": 0.025708,
+            "elapsed_seconds": 30.000621004
+          },
+          {
+            "round": 3,
+            "attempts": 48952130,
+            "ops_per_second": 1631697.1703904432,
+            "p50_ms": 0.000708,
+            "p95_ms": 0.010708,
+            "p99_ms": 0.027583,
+            "elapsed_seconds": 30.000744555
+          }
+        ],
+        "median_ops_per_second": 1698270.9215096328,
+        "median_p99_ms": 0.02625,
+        "ops_max_min": 1.0418118685948607,
+        "p99_max_min": 1.0729344950988018,
+        "stable_ops": true,
+        "stable_p99": true
+      },
+      {
+        "operation": "watch",
+        "rounds": [
+          {
+            "round": 1,
+            "attempts": 13030,
+            "ops_per_second": 434.22866390343114,
+            "p50_ms": 2.243924,
+            "p95_ms": 2.604175,
+            "p99_ms": 3.104843,
+            "elapsed_seconds": 30.007231404
+          },
+          {
+            "round": 2,
+            "attempts": 13654,
+            "ops_per_second": 455.0120798487457,
+            "p50_ms": 2.156298,
+            "p95_ms": 2.416549,
+            "p99_ms": 2.688342,
+            "elapsed_seconds": 30.007994523
+          },
+          {
+            "round": 3,
+            "attempts": 13318,
+            "ops_per_second": 443.81813968424507,
+            "p50_ms": 2.180091,
+            "p95_ms": 2.671925,
+            "p99_ms": 2.91901,
+            "elapsed_seconds": 30.007786544
+          }
+        ],
+        "median_ops_per_second": 443.81813968424507,
+        "median_p99_ms": 2.91901,
+        "ops_max_min": 1.0478628374241472,
+        "p99_max_min": 1.1549285767956605,
+        "stable_ops": true,
+        "stable_p99": false
+      }
+    ],
+    "seed_checkpoint_preparation": "legacy snapshot backend behavior; no separate explicit canonical checkpoint phase"
+  },
+  "p3_measurement": {
+    "input_manifest_sha256": "06a6e9ef637f99b0674599a8bfc86d78baa76303d0123b0f883765214d17b4a2",
+    "helper_sha256": "41b1b17f4c2f195739979dc0612a0de7f49e1b8fd186dbecbd6a8e8f2385bf95",
+    "seed_revisions": 391,
+    "rows": [
+      {
+        "operation": "create",
+        "median_ops_per_second": 5527.672389389115,
+        "median_p50_ns": 604500,
+        "median_p95_ns": 1151001,
+        "median_p99_ns": 1487251,
+        "ops_max_min": 1.0831637899516295,
+        "p99_max_min": 1.4073228361261587,
+        "old_median_ops_per_second": 1.076832947129927,
+        "old_median_p99_ms": 6539.378942,
+        "stability_pass": false,
+        "formal_target_pass": null
+      },
+      {
+        "operation": "commit",
+        "median_ops_per_second": 6132.397339153605,
+        "median_p50_ns": 536001,
+        "median_p95_ns": 1123834,
+        "median_p99_ns": 1331667,
+        "ops_max_min": 1.017802375058361,
+        "p99_max_min": 1.094131599357876,
+        "old_median_ops_per_second": 1.0764732925365326,
+        "old_median_p99_ms": 6572.44252,
+        "stability_pass": true,
+        "formal_target_pass": null
+      },
+      {
+        "operation": "read",
+        "median_ops_per_second": 4236965.263605155,
+        "median_p50_ns": 500,
+        "median_p95_ns": 708,
+        "median_p99_ns": 958,
+        "ops_max_min": 1.0056177560570085,
+        "p99_max_min": 1.0447110141766631,
+        "old_median_ops_per_second": 1698270.9215096328,
+        "old_median_p99_ms": 0.02625,
+        "stability_pass": true,
+        "formal_target_pass": null
+      },
+      {
+        "operation": "watch",
+        "median_ops_per_second": 6652301.037965195,
+        "median_p50_ns": 334,
+        "median_p95_ns": 375,
+        "median_p99_ns": 417,
+        "ops_max_min": 1.0126682971515475,
+        "p99_max_min": 1.0,
+        "old_median_ops_per_second": 443.81813968424507,
+        "old_median_p99_ms": 2.91901,
+        "stability_pass": true,
+        "formal_target_pass": null
+      }
+    ],
+    "seed_checkpoint_preparation": "explicit canonical checkpoint after 391 seed batches",
+    "rounds": [
+      {
+        "operation": "create",
+        "round": 1,
+        "attempts": 155427,
+        "ops_per_second": 5180.195214756291,
+        "p50_ns": 628000,
+        "p95_ns": 1313709,
+        "p99_ns": 2020917,
+        "sample_count": 155427,
+        "helper_elapsed_ns": 30004081614
+      },
+      {
+        "operation": "create",
+        "round": 2,
+        "attempts": 165880,
+        "ops_per_second": 5527.672389389115,
+        "p50_ns": 604500,
+        "p95_ns": 1149250,
+        "p99_ns": 1487251,
+        "sample_count": 165880,
+        "helper_elapsed_ns": 30009014340
+      },
+      {
+        "operation": "create",
+        "round": 3,
+        "attempts": 168351,
+        "ops_per_second": 5610.999881504719,
+        "p50_ns": 596001,
+        "p95_ns": 1151001,
+        "p99_ns": 1436001,
+        "sample_count": 168351,
+        "helper_elapsed_ns": 30003743282
+      },
+      {
+        "operation": "commit",
+        "round": 1,
+        "attempts": 185266,
+        "ops_per_second": 6174.428097943317,
+        "p50_ns": 535875,
+        "p95_ns": 1112750,
+        "p99_ns": 1330584,
+        "sample_count": 185266,
+        "helper_elapsed_ns": 30005370062
+      },
+      {
+        "operation": "commit",
+        "round": 2,
+        "attempts": 184005,
+        "ops_per_second": 6132.397339153605,
+        "p50_ns": 536001,
+        "p95_ns": 1123834,
+        "p99_ns": 1331667,
+        "sample_count": 184005,
+        "helper_elapsed_ns": 30005394273
+      },
+      {
+        "operation": "commit",
+        "round": 3,
+        "attempts": 182031,
+        "ops_per_second": 6066.431214202339,
+        "p50_ns": 541834,
+        "p95_ns": 1153709,
+        "p99_ns": 1455834,
+        "sample_count": 182031,
+        "helper_elapsed_ns": 30006274459
+      },
+      {
+        "operation": "read",
+        "round": 1,
+        "attempts": 127622912,
+        "ops_per_second": 4254076.27387626,
+        "p50_ns": 500,
+        "p95_ns": 667,
+        "p99_ns": 917,
+        "sample_count": 127622912,
+        "helper_elapsed_ns": 30000146632
+      },
+      {
+        "operation": "read",
+        "round": 2,
+        "attempts": 127109532,
+        "ops_per_second": 4236965.263605155,
+        "p50_ns": 500,
+        "p95_ns": 708,
+        "p99_ns": 958,
+        "sample_count": 127109532,
+        "helper_elapsed_ns": 30000135496
+      },
+      {
+        "operation": "read",
+        "round": 3,
+        "attempts": 126909847,
+        "ops_per_second": 4230311.41629434,
+        "p50_ns": 500,
+        "p95_ns": 708,
+        "p99_ns": 958,
+        "sample_count": 126909847,
+        "helper_elapsed_ns": 30000119261
+      },
+      {
+        "operation": "watch",
+        "round": 1,
+        "attempts": 201437805,
+        "ops_per_second": 6714570.396282362,
+        "p50_ns": 334,
+        "p95_ns": 375,
+        "p99_ns": 417,
+        "sample_count": 201437805,
+        "helper_elapsed_ns": 30000103225
+      },
+      {
+        "operation": "watch",
+        "round": 2,
+        "attempts": 199569716,
+        "ops_per_second": 6652301.037965195,
+        "p50_ns": 334,
+        "p95_ns": 375,
+        "p99_ns": 417,
+        "sample_count": 199569716,
+        "helper_elapsed_ns": 30000102951
+      },
+      {
+        "operation": "watch",
+        "round": 3,
+        "attempts": 198917876,
+        "ops_per_second": 6630572.335649524,
+        "p50_ns": 375,
+        "p95_ns": 375,
+        "p99_ns": 417,
+        "sample_count": 198917876,
+        "helper_elapsed_ns": 30000106466
+      }
+    ]
+  },
+  "limitations": [
+    "Initial business entity counts match; seeded outcome/revision/history/checkpoint distributions differ, so not a single-variable causal comparison.",
+    "The P3 performance input predates the final functional candidate; no automatic inheritance as final-candidate performance.",
+    "create p99 max/min 1.407323 exceeds the predeclared 1.10 stability threshold.",
+    "watch measures empty-tail Store polling, not active subscribers or RPC throughput; old watch p99 was unstable.",
+    "Recovery end states differ because old create completed tens of operations, P3 hundreds of thousands; no matched-state recovery speed claim.",
+    "No M/L, full RSS, formal NVMe or 24h acceptance from this report."
+  ]
+}

@@ -31,6 +31,15 @@ pub struct BackendInode {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FileHandle(pub u64);
 
+#[derive(Clone, Copy, Debug)]
+pub struct CopyFileRange {
+    pub source: FileHandle,
+    pub source_offset: u64,
+    pub destination: FileHandle,
+    pub destination_offset: u64,
+    pub length: u64,
+}
+
 /// Lock namespace: Linux keeps POSIX byte-range locks and BSD flock locks
 /// independent for conflict checks.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]

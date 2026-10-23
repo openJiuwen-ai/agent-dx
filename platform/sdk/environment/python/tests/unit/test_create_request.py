@@ -81,6 +81,22 @@ class CreateRequestTests(unittest.TestCase):
         self.pool_factory.assert_not_called()
         self.assertEqual(self.exchanges, [])
 
+    def test_tool_identity_reaches_create_and_is_optional(self):
+        body = self.capture_create(runtime="conch", user="1001", group="1002")
+        self.assertEqual((body["user"], body["group"]), ("1001", "1002"))
+        body = self.capture_create()
+        self.assertNotIn("user", body)
+        self.assertNotIn("group", body)
+
+    def test_invalid_or_incomplete_tool_identity_never_opens_transport(self):
+        for options in ({"user": "1001"}, {"group": "1002"},
+                        {"user": "", "group": "1002"},
+                        {"user": "a:b", "group": "1002"},
+                        {"user": "4294967295", "group": "1002"}):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                Environment(image="tools:1", connection=self.connection, **options)
+        self.assert_no_transport_setup()
+
     def test_omitted_options_inherit_cluster_defaults(self):
         body = self.capture_create()
         self.assertTrue({"network", "xpu", "storageMb", "extra_config"}.isdisjoint(body))

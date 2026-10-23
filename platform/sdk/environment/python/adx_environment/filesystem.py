@@ -16,7 +16,7 @@ import threading
 import uuid
 from typing import Iterator, List, Literal, Union, overload
 
-from ._transport import EnvironmentClient
+from ._transport import EnvironmentClient, EnvironmentHTTPError
 from .types import EntryInfo
 
 _RPC_FILE_CHUNK_SIZE = 1024 * 1024
@@ -182,10 +182,20 @@ class Filesystem:
         return self._entry_from_upload(_check(result, f"Failed to write {path}"))
 
     def list(self, path: str, depth: int = 1) -> List[EntryInfo]:
-        result = _check(
-            self._invoke("file.list", path=path, depth=depth),
-            f"Failed to list {path}",
-        )
+        try:
+            result = _check(
+                self._invoke("file.list", path=path, depth=depth),
+                f"Failed to list {path}",
+            )
+        except EnvironmentHTTPError as error:
+            exception = {
+                "FILE_NOT_FOUND": FileNotFoundError,
+                "NOT_A_DIRECTORY": NotADirectoryError,
+                "PERMISSION_DENIED": PermissionError,
+            }.get(error.payload.get("error_code"))
+            if exception is None:
+                raise
+            raise exception(f"Failed to list {path}: {error}") from error
         return [
             EntryInfo(
                 name=e["name"],
@@ -197,6 +207,52 @@ class Filesystem:
             )
             for e in result["entries"]
         ]
+
+    def search(
+        self,
+        path: str,
+        pattern: str = "*",
+        exclude_patterns: List[str] | None = None,
+        *,
+        depth: int = 64,
+        max_results: int = 1000,
+        max_entries: int = 100000,
+        timeout_ms: int = 10000,
+    ) -> List[EntryInfo]:
+        """Search filenames/paths in the Environment; no client-side tree listing.
+
+        Globs are case-sensitive and support *, ?, and character classes; * also
+        matches path separators. Missing roots and file roots return no matches.
+        Symbolic link directories are not followed. Exclusions filter entries,
+        rather than pruning descendants. Limits fail explicitly without partial
+        results. Runtime failures remain EnvironmentHTTPError exceptions.
+        """
+        if not isinstance(path, str) or not path or len(path.encode("utf-8")) > 4096:
+            raise ValueError("path must be a nonempty string of at most 4096 UTF-8 bytes")
+        if not isinstance(pattern, str) or len(pattern.encode("utf-8")) > 1024:
+            raise ValueError("pattern must be a string of at most 1024 UTF-8 bytes")
+        if exclude_patterns is None:
+            exclude_patterns = []
+        if not isinstance(exclude_patterns, list) or len(exclude_patterns) > 64:
+            raise ValueError("exclude_patterns must be a list of at most 64 strings")
+        if any(not isinstance(p, str) or len(p.encode("utf-8")) > 1024 for p in exclude_patterns):
+            raise ValueError("exclude_patterns must contain strings of at most 1024 UTF-8 bytes")
+        for name, value, maximum in (
+            ("depth", depth, 64),
+            ("max_results", max_results, 10000),
+            ("max_entries", max_entries, 1000000),
+            ("timeout_ms", timeout_ms, 30000),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
+                raise ValueError(f"{name} must be an integer in 1..{maximum}")
+        result = _check(
+            self._invoke(
+                "file.search", path=path, pattern=pattern, exclude_patterns=exclude_patterns,
+                depth=depth, max_results=max_results, max_entries=max_entries, timeout_ms=timeout_ms,
+            ),
+            f"Failed to search {path}",
+        )
+        return [self._entry(entry) for entry in result["entries"]]
 
     def exists(self, path: str) -> bool:
         return self._invoke("file.exists", path=path)["exists"]

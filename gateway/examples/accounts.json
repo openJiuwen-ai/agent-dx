@@ -1,5 +1,4 @@
 {
-  "tenant": "your-tenant",
   "developer_scope": "your-huawei-developer-scope",
   "agreement_version": "1",
   "database_url_env": "ADX_ACCOUNT_DATABASE_URL",

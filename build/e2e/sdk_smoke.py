@@ -66,12 +66,19 @@ try:
         s.files.write('/tmp/adx-e2e.bin', payload)
         if not (s.files.read('/tmp/adx-e2e.bin', format='bytes') == payload):
             raise AssertionError()
-        result['checks'].append({'id': s.id, 'command': True, 'binary_file': True})
+        matches = s.files.search('/tmp', 'adx-e2e.bin', depth=1, max_results=1)
+        if len(matches) != 1 or matches[0].path != '/tmp/adx-e2e.bin' or matches[0].size != len(payload):
+            raise AssertionError(matches)
+        excluded = s.files.search('/tmp', 'adx-e2e.bin', exclude_patterns=['adx-e2e.bin'], depth=1)
+        if excluded:
+            raise AssertionError(excluded)
+        result['checks'].append({'id': s.id, 'command': True, 'binary_file': True, 'file_search': True})
         print('COMMAND_AND_FILE_OK', s.id, flush=True)
     result['cases'].extend(
         [
             {'id': 'command.stdout-stderr-exit', 'status': 'passed', 'seconds': 0},
             {'id': 'filesystem.binary-roundtrip', 'status': 'passed', 'seconds': 0},
+            {'id': 'filesystem.native-search', 'status': 'passed', 'seconds': 0},
         ]
     )
     for s in instances:

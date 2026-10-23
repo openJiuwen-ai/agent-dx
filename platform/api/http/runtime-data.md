@@ -28,6 +28,7 @@ Ingress 校验 API Key 与归属，Relay 核对运行时绑定，再转发给 Ex
 | `file.write_chunk` | `path`、十六进制 `data`、可选 `offset` | `bytes_written`、`offset`、`error`；offset=0 创建或截断 |
 | `file.read_chunk` | `path`、可选 `offset`、`limit` | 十六进制 `data`、`bytes_read`、`eof`、`error` |
 | `file.list` | `path`、可选 `depth` | `entries`、`error`；EntryInfo 含权限、大小、修改时间 |
+| `file.search` | `path`，可选 `pattern`、`exclude_patterns`、`depth`、`max_results`、`max_entries`、`timeout_ms` | 按路径排序的 `entries`、`scanned_entries`、`error`；失败无部分结果 |
 | `file.exists` | `path` | `exists` |
 | `file.remove` | `path` | `error`；目录递归删除 |
 | `file.rename` | `old_path`、`new_path` | 新路径的 EntryInfo 与 `error` |
@@ -64,6 +65,14 @@ poll 等待。`shell.poll.wait_timeout` 当前不使后端阻塞。cwd 和环境
 预算分开；流式响应已开始时截止会结束流，不可能再返回新的 JSON 错误正文。
 
 ## 身份、重试与错误
+
+`file.search` 在运行时匹配文件名或完整路径，区分大小写，支持 `*`、`?` 和字符类；
+`*` 也匹配路径分隔符。排除模式只过滤结果，不剪枝目录遍历；不会跟随子目录符号链接。
+根路径不存在或不是目录时返回空结果。路径最多 4096 UTF-8 字节；模式最多 1024 UTF-8
+字节，排除模式最多 64 个。默认 depth=64、max_results=1000、max_entries=100000、
+timeout_ms=10000；上限依次为 64、10000、1000000、30000，均须为正整数。
+超出数量或响应大小限制返回 HTTP 429 `RESOURCE_EXHAUSTED`，搜索超时返回
+HTTP 408 `DEADLINE_EXCEEDED`；错误响应的 entries 为空，不返回部分匹配结果。
 
 请求身份优先级为 `X-ADX-Request-ID`、`X-Request-Id`、正文 `requestId`。写操作重试
 应保留同一身份和完全相同的参数；不得将一个身份用于不同操作。有限的内存重放缓存

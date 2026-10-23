@@ -31,6 +31,8 @@ pub struct ExecutionSpec {
     pub init_timeout_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readiness_probe: Option<crate::probes::ReadinessProbe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthcheck: Option<crate::probes::Healthcheck>,
 }
 impl From<&TemplateVersion> for ExecutionSpec {
     fn from(value: &TemplateVersion) -> Self {
@@ -48,6 +50,7 @@ impl From<&TemplateVersion> for ExecutionSpec {
             mounts: value.mounts.clone(),
             init_timeout_seconds: value.init_timeout_seconds,
             readiness_probe: value.readiness_probe.clone(),
+            healthcheck: value.healthcheck.clone(),
         }
     }
 }
@@ -65,6 +68,7 @@ impl ExecutionSpec {
             mounts: self.mounts.clone(),
             init_timeout_seconds: self.init_timeout_seconds,
             readiness_probe: self.readiness_probe.clone(),
+            healthcheck: self.healthcheck.clone(),
         };
         template.validate()?;
         for mount in &self.mounts {

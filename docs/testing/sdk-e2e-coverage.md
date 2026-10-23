@@ -1,17 +1,17 @@
 # Environment SDK 公开能力与端到端覆盖
 
-本清单从 `adx_environment` 的公开导出反向检查端到端用例。当前 `__all__` 有 48 个名字：6 个
-操作入口类、12 个错误类型、28 个数据／策略类型，以及 `resources()` 和
+本清单从 `adx_environment` 的公开导出反向检查端到端用例。当前 `__all__` 有 49 个名字，包含
+操作入口类、错误类型、数据／策略类型，以及 `resources()` 和
 `SDK_CAPABILITIES`。`Commands` 与 `Filesystem` 不单独顶层导出，但由 `Environment` 属性返回，
 也是用户接口。`EnvironmentFailure` 是 `EnvironmentInfo.failure` 使用的结构化失败数据，
-不新增独立操作；公开操作仍为 66 个。
+不新增独立操作；包含原生文件搜索后的公开操作为 67 个。
 
 操作数的统计口径是上述操作入口及其返回对象的每个公开方法／属性，加顶层
 `resources()`；数据对象的本地校验和序列化不算独立 E2E 操作。构造参数和错误类型另外
 统计。一个业务用例可以同时覆盖多个操作，但 JUnit 必须展示稳定的子用例 ID，不能只显示
 `data-plane` 这一组名称。
 
-`build/e2e/sdk_surface.py` 保存 66 个操作的处置结果，并把全部 66 个已支持操作逐项关联到稳定的
+`build/e2e/sdk_surface.py` 保存 67 个操作的处置结果，并把全部 67 个已支持操作逐项关联到稳定的
 E2E case ID；静态测试会在 SDK 新增、删除或漏登记公开成员时失败。该映射只说明用例归属，
 仍以对应 Standalone／Firecracker 实跑结果作为通过证据。
 
@@ -22,13 +22,13 @@ E2E case ID；静态测试会在 SDK 新增、删除或漏登记公开成员时�
 | `Environment` | 26 | 26 | Standalone + KVM FC | 普通生命周期、访问操作和 reverse tunnel 由 Standalone 验证；checkpoint、S3 rootfs/mount、入口继承、reload、运行期网络策略和 failover 由 FC 验证 |
 | `CommandHandle` | 8 | 8 | Standalone | ID、归属、poll、同步／异步 wait、kill、stdin、EOF |
 | `Commands` | 6 | 6 | Standalone | run/get/list/kill/send_stdin/close_stdin |
-| `Filesystem` | 10 | 10 | Standalone | 文本／二进制、CRUD、深度目录、双向目录复制 |
+| `Filesystem` | 11 | 11 | Standalone | 文本／二进制、CRUD、原生文件搜索、深度目录、双向目录复制 |
 | `Pty` / `PtySession` | 9 | 9 | Standalone | 创建、会话 ID、输入、EOF、resize、wait、终态和关闭 |
 | `Shells` / `Shell` | 6 | 6 | Standalone | 创建／集合关闭、会话 ID、状态保持、退出码、同步／异步关闭 |
 | `resources()` | 1 | 1 | Standalone | 两节点状态、CPU／内存／磁盘 capacity 与 allocatable、标签 |
-| **合计** | **66** | **66** |  | 每个公开操作均有关联的真实 E2E case ID |
+| **合计** | **67** | **67** |  | 每个公开操作均有关联的真实 E2E case ID |
 
-普通 runc Standalone 负责其中 55 个操作；KVM Firecracker profile 负责其余 11 个操作，包括
+普通 runc Standalone 负责其中 56 个操作；KVM Firecracker profile 负责其余 11 个操作，包括
 checkpoint/snapshot、入口继承、reload 和运行期网络策略。这里的“覆盖”要求
 请求真实经过 API Server、Gateway、adxlet、sandboxd 和 Execd；SDK 单测不计入此表。
 
@@ -85,7 +85,8 @@ upstream，并校验响应体和路径。该项不是客户端序列化单测。
 目录复制、PTY 输出／交互、端口转发和 reverse tunnel 往返。`lifecycle` 有 4 个子用例：detached 显式删除、close
 保留远端、context manager 删除和空闲回收。`placement` 的 6 条规则也以独立 JUnit 用例展示。
 
-`sdk` 组至少展示创建查询、命令结果、二进制文件和删除清理 4 条；带本地 Runtime
+`sdk` 组至少展示创建查询、命令结果、二进制文件、原生文件搜索和删除清理 5 条；原生搜索验证
+文件匹配、结果大小与排除规则。带本地 Runtime
 Environment 的 Standalone 再展示 default、runtime-only 和 custom-image 3 条。完整
 Standalone 的 JUnit 数量因此由运行环境决定，不能继续把“10 组”写成“只有 10 条功能用例”。
 

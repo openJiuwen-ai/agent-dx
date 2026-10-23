@@ -216,7 +216,7 @@ class DemandFixtureTests(unittest.TestCase):
             guest_networks = []
             for node in ('node1', 'node2'):
                 service = json.loads((run / node / 'deployment.yaml').read_text())['services'][0]
-                self.assertFalse(service['config']['checkpoint_gc']['enabled'])
+                self.assertNotIn('checkpoint_gc', service['config'])
                 self.assertGreater(service['config']['rpc_timeout_seconds'], 50,
                                    'readiness budget must cover the 45-second TTL boundary hold')
                 self.assertEqual(service['env']['AWS_VIRTUAL_HOSTED_STYLE_REQUEST'], 'true')

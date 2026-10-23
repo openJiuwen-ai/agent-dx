@@ -21,19 +21,19 @@ class ArtifactIndexTests(unittest.TestCase):
             "schema_version": 1,
             "commit": self.commit,
             "build_id": self.build_id,
-            "bucket": "openyuanrong",
+            "bucket": "agent-dx",
             "endpoint": "obs.cn-southwest-2.myhuaweicloud.com",
-            "manifest_url": "https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/adx/daily/1/manifest.json",
+            "manifest_url": "https://agent-dx.obs.cn-southwest-2.myhuaweicloud.com/adx/daily/1/manifest.json",
             "artifacts": [
                 {
                     "name": "adx-release.tar.gz",
-                    "url": "https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/adx/daily/1/adx-release.tar.gz",
+                    "url": "https://agent-dx.obs.cn-southwest-2.myhuaweicloud.com/adx/daily/1/adx-release.tar.gz",
                     "bytes": 1024,
                     "sha256": "b" * 64,
                 },
                 {
                     "name": "adx-execd.tar.gz",
-                    "url": "https://openyuanrong.obs.cn-southwest-2.myhuaweicloud.com/adx/daily/1/adx-execd.tar.gz",
+                    "url": "https://agent-dx.obs.cn-southwest-2.myhuaweicloud.com/adx/daily/1/adx-execd.tar.gz",
                     "bytes": 512,
                     "sha256": "c" * 64,
                 },

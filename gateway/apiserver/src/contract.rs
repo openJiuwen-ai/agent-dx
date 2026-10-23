@@ -12,6 +12,8 @@ struct Create {
     namespace: String,
     image: String,
     runtime: String,
+    user: Option<String>,
+    group: Option<String>,
     cwd: Option<String>,
     rootfs: Value,
     cpu: i64,
@@ -239,6 +241,7 @@ struct Mount {
     #[serde(alias = "hostPath")]
     host_path: String,
     create_if_missing: bool,
+    create_options: Option<adx_core::execution::CreateOptions>,
 }
 #[derive(Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -481,6 +484,7 @@ fn mount(value: Value) -> Result<adx_core::execution::Mount, Status> {
     let result = adx_core::execution::Mount {
         kind: value.r#type,
         create_if_missing: value.create_if_missing,
+        create_options: value.create_options,
         target: value.target,
         options: value.options,
         source,
@@ -707,7 +711,7 @@ pub fn create_spec_with_environment(
     let policy = affinities(r.affinities, r.labels)?;
     if r.env
         .keys()
-        .any(|k| k.starts_with("ADX_") || k == "EXECD_HTTP_TOKEN")
+        .any(|k| k.starts_with("ADX_") || k == "EXECD_HTTP_TOKEN" || k.starts_with("EXECD_TUNNEL_"))
     {
         return Err(invalid("reserved environment key"));
     }
@@ -779,7 +783,21 @@ pub fn create_spec_with_environment(
             .map_err(|_| invalid("invalid environment extra_config"))?
     };
     let environment = adx_core::execution::ExecutionOptions {
+        user: r.user,
+        group: r.group,
         cwd: r.cwd,
+        tunnel_http_port: if r.tunnel.enabled {
+            Some(
+                u16::try_from(if r.tunnel.proxy_port > 1 {
+                    r.tunnel.proxy_port
+                } else {
+                    8766
+                })
+                .map_err(|_| invalid("invalid tunnel port"))?,
+            )
+        } else {
+            None
+        },
         rootfs,
         mounts,
         network,
@@ -891,20 +909,6 @@ pub fn create_spec_with_environment(
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or(default.into()),
         );
-    }
-    if r.tunnel.enabled {
-        let port = if r.tunnel.proxy_port > 1 {
-            r.tunnel.proxy_port
-        } else {
-            8766
-        };
-        if port > 65535 {
-            return Err(invalid("invalid tunnel port"));
-        }
-        r.env
-            .insert("EXECD_TUNNEL_HTTP_PORT".into(), port.to_string());
-        r.env
-            .insert("EXECD_TUNNEL_WS_PORT".into(), (port - 1).to_string());
     }
     let runtime_profile = if snapshot.is_none() {
         runtime_profile.cloned().map(|mut value| {

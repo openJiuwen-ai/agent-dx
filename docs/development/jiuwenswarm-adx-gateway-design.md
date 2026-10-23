@@ -1,12 +1,12 @@
 # beegent 接入 ADX Ingress 的 Jiuwen 协议模块设计
 
-状态：已实现 Jiuwen 协议适配、华为 Account Kit 与 AGC Auth 登录、共享业务会话、用户级 LiteLLM 凭据、绑定专属启动配置和 AgentServer 端口 readiness 配置。真实华为授权码登录、真实 AGC 换票、鸿蒙双账号隔离、实机及生产额度控制仍待验收。固定身份 local_fixed 已移除。账户接入契约和验证边界统一记录在本文。
+状态：已实现 Jiuwen 协议适配、华为 Account Kit 与 AGC Auth 登录、共享业务会话、用户级 LiteLLM 凭据、通用模板参数注入和 AgentServer 端口 readiness 配置。真实华为授权码登录、真实 AGC 换票、鸿蒙双账号隔离、实机及生产额度控制仍待验收。固定身份 local_fixed 已移除。账户接入契约和验证边界统一记录在本文。
 
 ## 1. 范围
 
 ADX Ingress 新增独立的 Jiuwen 协议模块，对 beegent 暴露 Jiuwen `/ws` 和它需要的附件下载入口。云侧请求不经过 Python Jiuwen Gateway；Python AgentServer 仍运行在 Platform Environment（Environment）内，保留 E2A 业务协议。Agent 层的业务映射统一称为 AgentBinding，Environment 专指 Platform 的稳定运行环境。
 
-WS 请求不按 method 名称做 Gateway 白名单过滤；方法名和参数经通用 E2A 通道转发，由 AgentServer 判断是否支持。`session.list`、`session.create`、`session.get_metadata`、`history.get`、`chat.send`、`chat.interrupt`、`chat.user_answer`、`chat.swarmflow_reply` 保留已实现的参数、ACK 和事件兼容映射；其他方法按请求的 `is_stream` 走通用响应映射。唯一的旧版边界例外是 `health_check.get_conf`：仅当 AgentServer 的连接 ACK 为 `status=ready`、由 `agentserver` 持有 heartbeat 且缺少显式 `readiness` 时，Jiuwen 模块返回等价的 `AGENT_READY` 快照，避免旧版单进程实现把原本由 Python Gateway 处理的健康请求误送入模型执行；带显式 `readiness` 的新 AgentServer 仍自行处理该请求。客户端实际消费的连接确认、聊天流、运行时确认、历史、交互、工具、子任务、文件等事件和字段仍按对照样例验证。
+WS 请求不按 method 名称做 Gateway 白名单过滤；方法名和参数经通用 E2A 通道转发，由 AgentServer 判断是否支持。`session.list`、`session.create`、`session.get_metadata`、`history.get`、`chat.send`、`chat.interrupt`、`chat.user_answer`、`chat.swarmflow_reply` 保留已实现的参数、ACK 和事件兼容映射；其他方法按请求的 `is_stream` 走通用响应映射。唯一的旧版边界例外是 `health_check.get_conf`：仅当 AgentServer 的连接 ACK 为 `status=ready`、由 `agentserver` 持有 heartbeat 且缺少显式 `readiness` 时，DigitalMateGateway 模块返回等价的 `AGENT_READY` 快照，避免旧版单进程实现把原本由 Python Gateway 处理的健康请求误送入模型执行；带显式 `readiness` 的新 AgentServer 仍自行处理该请求。客户端实际消费的连接确认、聊天流、运行时确认、历史、交互、工具、子任务、文件等事件和字段仍按对照样例验证。
 
 附件范围包括 `GET /file-api/download?token=...`、`POST /file-api/upload` 和下载链接。上传采用 multipart 表单，使用业务 Bearer 会话选定当前用户的 Environment，`token` 查询参数不参与处理；`dir` 和文件名组合出的目标路径限定于模板声明的 Environment workspace，文件经 Relay 写入当前用户绑定的 Environment；客户端消息内自带 Base64 的附件不需要 Gateway 文件读取。其余 `/file-api/*`、网页、TUI/IM 等入口不在本轮范围；配置、项目、渠道、Cron 和 Git 等 AgentServer E2A 方法可走同一 WS 通用转发，但它们的业务语义仍由 AgentServer 决定。
 
@@ -32,7 +32,7 @@ flowchart TB
         I -->|/api/v1/auth/huawei/login、/api/v1/auth/agc/login 与 /api/v1/auth/logout| AU[账号模块：外部身份验证与业务会话]
         AU --> DB[(PostgreSQL：账号、会话、加密 Key)]
         U -->|验证业务 Token| AU
-        U -->|首次绑定准备| MK[用户模型凭据模块]
+        U -->|共享激活按需取得参数| MK[用户模型凭据模块]
         MK --> DB
         MK --> LL[LiteLLM 管理 API]
         I -->|/ws 与 /file-api/download、/file-api/upload| U
@@ -61,9 +61,9 @@ flowchart TB
 
 图中实线表示入口或数据调用，虚线表示管理依赖；Activator 可独立部署或嵌入部署。Jiuwen 使用业务会话鉴权，AgentV2Access 负责共享目标选择和授权连接。上传、下载通过通用 Environment 文件能力，底层与 `/direct` 共用 Execd 授权配置、路由和 Relay；Jiuwen 不取得 Execd token。API Server 只提供管理操作与租户隔离的实例查询，不承载文件正文。verified 的底层读取差异仍见第 5、6 节。
 
-公共入口负责监听、TLS、公共限制和路由分发。Jiuwen 模块负责身份、`/ws` 帧和事件协议、请求与会话关联、E2A 转换及附件 HTTP 语义。它与现有 `AgentApi` 平级，不导入 `agent_api.rs` 的 HTTP handler，也不经公网地址回环调用 `/agent/ws`。当前 Ingress 支持按 `<environment-id>-<port>.<domain>` 的 Host 优先选择直连路由；部署时必须为 Jiuwen 公共入口使用不会命中该规则的 Host，并验证 `/ws` 与附件路径不会被直连路由截获。
+公共入口负责监听、TLS、公共限制和路由分发。DigitalMateGateway 模块负责身份、`/ws` 帧和事件协议、请求与会话关联、E2A 转换及附件 HTTP 语义。它与现有 `AgentApi` 平级，不导入 `agent_api.rs` 的 HTTP handler，也不经公网地址回环调用 `/agent/ws`。当前 Ingress 支持按 `<environment-id>-<port>.<domain>` 的 Host 优先选择直连路由；部署时必须为 Jiuwen 公共入口使用不会命中该规则的 Host，并验证 `/ws` 与附件路径不会被直连路由截获。
 
-Agent v2 内部访问能力是两种入口的共用依赖。保持 `ManagedService → Control → ActivatorClient/LocalControl` 边界，以及 RouteResolver、Connector、Relay 的转发职责。Jiuwen 模块通过 ManagedService 解析 AgentBinding，不直接调用 Platform。公共数据面持有部署注入的 Execd 凭据；Jiuwen 仅提供已验证 tenant、Environment ID、文件路径和期限，内部凭据不返回客户端、不写入日志。
+Agent v2 内部访问能力是两种入口的共用依赖。保持 `ManagedService → Control → ActivatorClient/LocalControl` 边界，以及 RouteResolver、Connector、Relay 的转发职责。DigitalMateGateway 模块通过 ManagedService 解析 AgentBinding，不直接调用 Platform。公共数据面持有部署注入的 Execd 凭据；Jiuwen 仅提供网关固定 tenant、已授权 Environment ID、文件路径和期限，内部凭据不返回客户端、不写入日志。
 
 ## 3. Agent v2 内部接口
 
@@ -75,10 +75,10 @@ select(context, Scope { tenant, template, version, binding_id },
 connect_service(ingress, ServiceSelection) -> IngressStream
 ```
 
-Scope 中的 tenant 必须来自调用方已验证的身份。`ServiceSelection` 是字段不公开的目标选择结果，携带原始 deadline、绑定 generation 及一次未发送重试预算。选择阶段复用 ManagedService 完成 Template 和服务校验、绑定解析及目标激活；建连阶段复用 Ingress 的路由授权、RouteResolver、Connector 与 Relay。调用方不取得 Activator 凭据、Relay 地址或 Execd token。
+Scope 中的 tenant 由调用入口的可信上下文确定：通用 Agent 使用已认证的 Platform 租户，DigitalMateGateway 使用模块固定配置。`ServiceSelection` 是字段不公开的目标选择结果，携带原始 deadline、绑定 generation 及一次未发送重试预算。选择阶段复用 ManagedService 完成 Template 和服务校验、绑定解析及目标激活；建连阶段复用 Ingress 的路由授权、RouteResolver、Connector 与 Relay。调用方不取得 Activator 凭据、Relay 地址或 Execd token。
 
 现有 `/agent/ws` 已走共享建连方法；`/agent/http` 使用相同的目标选择和 generation 重试实现，同时保留 BackendHttpPool，避免将 HTTP 改成每次新建连接。Jiuwen 的 connection.rs 消费共享选择结果，通过 connect_service_when_ready 取得授权 Relay 流，在流上执行受原始 deadline 限制的 WebSocket 握手；不经公开 HTTP/WS 路由回环。握手完成后接入连接内驱动，路由撤销覆盖握手及整个驱动生命周期。同一 binding 可以建立多条独立连接，并发会话语义由业务处理；入口按已验证业务用户选择目标。连接失败保留 Agent 或 Ingress 的类型化错误，租户不匹配、认证拒绝及 draining 不触发目标重新激活。原始 deadline 覆盖 WS 的目标选择与建连，建立后的业务流不使用该短期 deadline。Jiuwen 对尚未监听的业务端口在同一 deadline 内每 250 ms 重试 TCP 建连；这发生在发送 WebSocket 握手和业务字节之前，不重复查询或激活目标。认证拒绝、draining 和握手失败不进入该等待。
-同一次请求的目标失效重试沿用请求 deadline 和绑定 generation；若已开始向后端写入，传输中断、绑定删除或重新创建导致目标变化时直接报错，不自动重放。建立后的业务流由连接本身管理。
+目标失效重试沿用原请求 deadline。HTTP/SSH 固定绑定 generation；WS 在尚未发送后端握手或业务字节时，若权威元数据确认 Binding 已删除或换代，可重新解析一次，缺失时复用本次初始化参数，已有绑定忽略新参数。Deleting、鉴权失败、draining 和同 generation 的冲突不触发重选。若已开始向后端写入，传输中断、绑定删除或重新创建导致目标变化时直接报错，不自动重放。建立后的业务流由连接本身管理。
 
 文件读写由 `gateway/src/ingress/environment_files.rs` 的 `Files` 统一实现：文件元数据、限量读取、上传暂存与提交。Jiuwen `download_runtime::Reader` 保留下载 token 和资产登记验证，上传 handler 保留 multipart、workspace 和用户检查。两者调用通用文件能力；`Environment` 生命周期接口不再提供 runtime 凭据读取。`PlatformEnvironment` 与 `EnvironmentRequestMapper` 已删除。
 
@@ -88,7 +88,7 @@ Files 固定首次准入的运行路由，每次后端操作继续检查本地�
 
 Jiuwen 下载适配负责所需的文件及校验元数据读取，执行现有租户授权检查，处理请求超时、Range、流式响应和错误映射。普通及 verified 下载均基于现有 Execd 实现；后者保留 token 与资产登记校验，底层文件打开和并发读取语义沿用 Execd，不宣称与原 AgentServer 读取实现完全等价。
 
-创建侧复用 `EnvironmentSpec.runtime_profile`：Platform 已支持部署侧 rootfs、bootstrap 和环境配置。独立 Activator 通过 API Server 既有 HTTP 接口创建，嵌入式 Activator 使用 API Server Environment 应用服务；runtime 注入归 API Server 部署配置。Agent 模板不再提供 entrypoint/working_dir，创建时启用 `inherit_entrypoint`，由 Platform 提取业务镜像的 ENTRYPOINT/CMD/WORKDIR/USER，生成进程配置供 Execd 执行。业务镜像无需预置 Execd 或额外 JSON。模板已支持 Local mounts 与 Binding 参数渲染，Jiuwen 提供跨版本稳定工作区参数，见[工作区设计](user-workspace-volumes-design.md)。工作目录覆盖、节点目录准备和工作区独占接管仍未实现；真实 SFS 持久化待验收。Inline HTTP 兼容入口已移除。节点 profile 匹配及 Execd 实际端口/token 需通过真实创建验证。此项属于创建适配，与文件数据面访问分离。
+创建侧复用 `EnvironmentSpec.runtime_profile`：Platform 已支持部署侧 rootfs、bootstrap 和环境配置。独立 Activator 通过 API Server 既有 HTTP 接口创建，嵌入式 Activator 使用 API Server Environment 应用服务；runtime 注入归 API Server 部署配置。Agent 模板不再提供 entrypoint/working_dir，创建时启用 `inherit_entrypoint`，由 Platform 提取业务镜像的 ENTRYPOINT/CMD/WORKDIR/USER，生成进程配置供 Execd 执行。业务镜像无需预置 Execd 或额外 JSON。模板已支持 Local mounts 与 Binding 参数渲染，Jiuwen 提供跨版本稳定工作区参数，见[工作区设计](user-workspace-volumes-design.md)。工作目录覆盖和工作区独占接管仍未实现；节点可按挂载的 create_if_missing/create_options 创建缺失目录，真实 SFS 持久化待验收。Inline HTTP 兼容入口已移除。节点 profile 匹配及 Execd 实际端口/token 需通过真实创建验证。此项属于创建适配，与文件数据面访问分离。
 
 ### 通用运行环境文件访问与管理查询
 
@@ -137,23 +137,23 @@ flowchart LR
 
 ## 4. AgentBinding 与唯一的 Environment 语义
 
-ADX 当前入口认证获得的是租户身份，不等于终端用户 `user_id`。Jiuwen 模块应在 WS 与附件 HTTP 请求上取得相同的已验证 `user_id`，由服务端将 `(tenant, user_id, 固定 Agent 类型)` 映射到稳定的业务 binding_id，再结合模板及版本选择 AgentBinding。客户端不能指定其他用户的绑定或 Environment，也不能持有 ADX 租户 API Key。
+ADX 当前入口认证获得的是租户身份，不等于终端用户 `user_id`。DigitalMateGateway 模块应在 WS 与附件 HTTP 请求上取得相同的已验证 `user_id`，由服务端将 `(tenant, user_id, 固定 Agent 类型)` 映射到稳定的业务 binding_id，再结合模板及版本选择 AgentBinding。客户端不能指定其他用户的绑定或 Environment，也不能持有 ADX 租户 API Key。
 
 Agent 层业务对象已统一称为 `AgentBinding`，完整业务身份为 `(tenant, template, version, binding_id)`，保存目标 `environment_id`、绑定 generation 和删除意图。`environment_id` 就是 Platform Environment ID；只有 Platform Environment 拥有运行状态、调度、暂停恢复和 Runtime 替换语义。AgentBinding 是业务地址到该环境的映射，允许先提交绑定身份再发起平台创建，并不是另一套运行环境或平台状态机。
 
 代码中的 `Scope.binding_id` 是业务绑定 ID，不是 Platform Environment ID。Agent 的类型、方法、API 路径、target URN、请求响应及持久化字段已统一到 AgentBinding 命名：业务字段使用 `binding_id`，管理路径改为 `/api/agent/v2/templates/{name}/versions/{version}/bindings/{binding_id}`（列表路径省略最后一段），目标 URN 使用 `urn:adx:binding:{name}:{version}:{binding_id}`。同步修改调用方、测试、文档及开发约定；不保留旧名称的兼容别名、序列化映射或存量数据迁移。此命名变更已实现并通过聚焦测试；Platform 的 Environment 类型保持不变。
 
-同一业务 binding_id 在不同模板版本下形成不同 AgentBinding，分别绑定不同 Platform Environment。绑定删除后重建仍使用新的 generation 和 Environment ID，保留多副本创建幂等、未知结果沿用原身份、旧请求不能影响新绑定的约束。Jiuwen 模块预置模板版本，临时代行 App 的版本选择；修改预置版本属于业务版本切换，不是平台自动升级。后续由 App 选择并由服务端校验版本，数据迁移、兼容性和回滚由业务负责。本轮保留现有身份与生命周期行为，不实现同一个 Environment 跨版本升级。
+同一业务 binding_id 在不同模板版本下形成不同 AgentBinding，分别绑定不同 Platform Environment。绑定删除后重建仍使用新的 generation 和 Environment ID，保留多副本创建幂等、未知结果沿用原身份、旧请求不能影响新绑定的约束。DigitalMateGateway 模块预置模板版本，临时代行 App 的版本选择；修改预置版本属于业务版本切换，不是平台自动升级。后续由 App 选择并由服务端校验版本，数据迁移、兼容性和回滚由业务负责。本轮保留现有身份与生命周期行为，不实现同一个 Environment 跨版本升级。
 
 ### 业务账号与用户模型配置
 
 Ingress 新增账号模块：华为 Account Kit 授权码兑换可信 UnionID，关联内部 userId，签发默认 7 天的不透明业务 Token。用户与会话存储在共享 PostgreSQL，支持多个 Ingress。Jiuwen 的 `/ws` 和下载入口只从业务会话取得身份；ADX 管理及内部服务保持独立鉴权。
 
-`ADX_JIUWEN_CONFIG` 配置 tenant、agent_type、template、version、allowed_hosts、allowed_origins 和传输限制，配套 `ADX_ACCOUNT_CONFIG` 配置账号存储与 LiteLLM。不再配置固定 user_id 或 local_fixed。Jiuwen 不检查传输层 TLS 状态；HTTP 与 HTTPS 监听共享相同业务鉴权，不存在鉴权失败回退。公网 HTTPS/WSS 可在 ELB 终止，内部通过 HTTP/WS 回源。原有 Ingress TLS 与内部 mTLS 能力保留，网络开放范围由部署层控制。客户端须在 WS 握手及附件请求中携带业务 Token。
+`ADX_JIUWEN_CONFIG` 顶层配置网关固定 tenant，平级的 jiuwen/orbit 各自配置目标和请求期限；Jiuwen 协议限制位于 jiuwen 块，配套 `ADX_ACCOUNT_CONFIG` 配置账号存储与 LiteLLM。不再配置固定 user_id 或 local_fixed。Jiuwen 不检查传输层 TLS 状态；HTTP 与 HTTPS 监听共享相同业务鉴权，不存在鉴权失败回退。公网 HTTPS/WSS 可在 ELB 终止，内部通过 HTTP/WS 回源。原有 Ingress TLS 与内部 mTLS 能力保留，网络开放范围由部署层控制。客户端须在 WS 握手及附件请求中携带业务 Token。
 
 binding_id 为紧凑 JSON 数组 `[tenant,userId,agent_type]` 的 SHA-256 小写十六进制加 `jiuwen-` 前缀。模板版本只进入完整 Scope。请求的身份字段不能改选目标；`/ws` 忽略客户端查询参数 `user_id` 的值，所有身份与实例路由仍取自业务会话。下载中的 user_id 仅做一致性核对。
 
-登录不创建实例或调用 LiteLLM。首次 WS 为用户注册/复用 LiteLLM 模型 Key，并通过内部 `bindings/prepare` 原子提交绑定与加密私有启动配置。Activator 将私有模型环境变量覆盖到模板配置后创建 Environment；重试、跨副本创建和重建复用该 Binding 的同一份配置。公开 Binding/Template 不返回用户 Key。用户可在自己的 Environment 中读取自己的 Key。
+登录不创建实例或调用 LiteLLM。首次 WS 的共享解析/激活流程按需向 Jiuwen 业务参数提供方取得用户模型 Key、推理地址和工作区参数，原子创建 Binding，并使用 parameters 渲染 Template.env 和 mounts。热绑定复用持久化参数，不再请求模型管理入口。独立 Activator 与内嵌 Activator 使用同一激活契约；独立 prepare 接口和 Binding 私有 launch 快照已移除。parameters 当前明文保存，后续模型凭据加解密由业务 Gateway/AgentServer 承担。
 
 详细接口、数据库 schema、凭据签发重试、加密与密钥部署、会话撤销和验证范围见本文第 8 节。退出不销毁绑定或更换模型 Key。密钥热轮换、账号禁用到 LiteLLM 的自动联动后置。
 
@@ -169,17 +169,17 @@ binding_id 为紧凑 JSON 数组 `[tenant,userId,agent_type]` 的 SHA-256 小写
 
 附件保持 `GET /file-api/download?token=...` 对外协议，内部改为 `Jiuwen 下载适配 → 通用 Environment 文件能力 → 共享数据面与 Relay → Execd`。上传增加 `POST /file-api/upload`，先用当前业务会话选定 AgentBinding，再校验 multipart 表单中的用户、相对目录和文件名；有界读取整个表单后经同一 Relay 路径写入 Environment workspace。上传查询参数 `token` 被忽略，本阶段没有上传文件令牌的签发和验签。通过 AgentBinding 确定目标 Platform Environment，任意 Ingress 副本独立处理下载，不查找聊天所在副本，不为下载新建或复用 AgentServer E2A 连接。到 Execd 的额外流与到 AgentServer 的 WS 是不同目标，不涉及 AgentServer push 连接抢占。
 
-Jiuwen 下载适配负责用户和环境绑定、token 签名及有效期规则、verified 资产登记校验、文件名与 Content-Type、Range 和错误映射。普通 token 和 verified token 分别实现其签名及声明校验，不混用授权语义。verified 校验不仅是 HMAC 验签，还依赖环境内资产登记状态、路径、大小和摘要字段；底层读取差异按下一段处理。下载配置以所选 Jiuwen AgentServer 模板版本的 env 为唯一来源，模板负责向 AgentServer 注入，Ingress 的 Jiuwen 模块读取同一配置；具体规则见下文。不能将未验签路径直接交给 Execd。beegent 当前将 WS 和下载设为不同端口，云端地址与 TLS 配置也需要同步调整。
+Jiuwen 下载适配负责用户和环境绑定、token 签名及有效期规则、verified 资产登记校验、文件名与 Content-Type、Range 和错误映射。普通 token 和 verified token 分别实现其签名及声明校验，不混用授权语义。verified 校验不仅是 HMAC 验签，还依赖环境内资产登记状态、路径、大小和摘要字段；底层读取差异按下一段处理。下载配置以所选 Jiuwen AgentServer 模板版本的 env 为唯一来源，模板负责向 AgentServer 注入，Ingress 的 DigitalMateGateway 模块读取同一配置；具体规则见下文。不能将未验签路径直接交给 Execd。beegent 当前将 WS 和下载设为不同端口，云端地址与 TLS 配置也需要同步调整。
 
-Jiuwen 模块和 Jiuwen AgentServer 模板由同一业务部署管理，共用配置，无需在 Ingress 再维护一份密钥或路径配置。现有 `TemplateVersion.env → ExecutionSpec.env` 已支持向 Environment 传递这些变量；Jiuwen 模块通过共享 ManagedService 获取所选租户、模板、版本的同一不可变 TemplateVersion，继续遵守 Activator 访问边界。`download_config.rs` 已实现从模板解析下载配置，以及通过 ManagedService 按作用域读取同一模板；这一步不创建 AgentBinding 或 Environment。`download_token.rs` 已实现密钥内容解析、原始 token 验签、声明与资产登记检查；`download_runtime.rs` 保留 Jiuwen 下载的验签和资产登记逻辑，通用 `environment_files.rs` 执行管理准入、数据面授权、Relay 建连与 Execd HTTP 读写。正文限制、原始 deadline、路由撤销及取消释放保持不变；此分层不增强 Execd 原有文件打开的一致性保证。
+DigitalMateGateway 模块和 Jiuwen AgentServer 模板由同一业务部署管理，共用配置，无需在 Ingress 再维护一份密钥或路径配置。现有 `TemplateVersion.env → ExecutionSpec.env` 已支持向 Environment 传递这些变量；DigitalMateGateway 模块通过共享 ManagedService 获取所选租户、模板、版本的同一不可变 TemplateVersion，继续遵守 Activator 访问边界。`download_config.rs` 已实现从模板解析下载配置，以及通过 ManagedService 按作用域读取同一模板；这一步不创建 AgentBinding 或 Environment。`download_token.rs` 已实现密钥内容解析、原始 token 验签、声明与资产登记检查；`download_runtime.rs` 保留 Jiuwen 下载的验签和资产登记逻辑，通用 `environment_files.rs` 执行管理准入、数据面授权、Relay 建连与 Execd HTTP 读写。正文限制、原始 deadline、路由撤销及取消释放保持不变；此分层不增强 Execd 原有文件打开的一致性保证。
 
-| 模板 env 配置 | AgentServer 与 Jiuwen 模块的共同用法 |
+| 模板 env 配置 | AgentServer 与 DigitalMateGateway 模块的共同用法 |
 | --- | --- |
-| `JIUWENSWARM_WORKSPACE` | 模板显式设置 Environment 内绝对路径；未配置有效的显式签名密钥时，AgentServer 在该目录下 `config/.file_download_secret` 读取或生成密钥，Jiuwen 模块通过 Execd 只读获取当前 Environment 的同一文件 |
+| `JIUWENSWARM_WORKSPACE` | 模板显式设置 Environment 内绝对路径；未配置有效的显式签名密钥时，AgentServer 在该目录下 `config/.file_download_secret` 读取或生成密钥，DigitalMateGateway 模块通过 Execd 只读获取当前 Environment 的同一文件 |
 | `JIUWENSWARM_FILE_DOWNLOAD_SECRET` | 可选；配置有效值时，两端直接使用同一值，不要求额外落盘，也不读取自动生成的密钥文件 |
-| `JIUWENSWARM_DOWNLOAD_ASSET_ROOT` | 模板显式设置 Environment 内绝对路径；AgentServer 写入交付文件及 `<asset_id>.json`，Jiuwen 模块在需要资产登记校验时通过 Execd 读取同一目录 |
+| `JIUWENSWARM_DOWNLOAD_ASSET_ROOT` | 模板显式设置 Environment 内绝对路径；AgentServer 写入交付文件及 `<asset_id>.json`，DigitalMateGateway 模块在需要资产登记校验时通过 Execd 读取同一目录 |
 
-共享配置不改变 Environment 文件隔离：采用文件密钥时，不同 Environment 在同一路径拥有各自的密钥文件；Ingress 按当前已授权目标读取。模板显式填写路径，避免依赖镜像 HOME、UID 或临时目录推导。Jiuwen 模块不执行运行时环境探测、不扫描 AgentServer 进程、不自行创建或替换密钥；镜像启动逻辑应遵守模板注入配置。配置解析已拒绝缺少路径、相对路径、父目录跳转及非空但少于 32 个字符的显式密钥；空或缺省密钥选择文件模式。显式密钥保留原始值，资产目录按 AgentServer 规则去除首尾空白，路径仅做词法规范化，不在 Ingress 宿主机解析。Debug 隐去密钥值。后续文件读取若失败，下载返回错误，不另生成密钥。密钥只用于内部校验，不进入公开响应、业务事件或日志。模板版本选择同时决定 AgentServer 与下载模块使用的配置，切换版本遵循既定业务升级语义。
+共享配置不改变 Environment 文件隔离：采用文件密钥时，不同 Environment 在同一路径拥有各自的密钥文件；Ingress 按当前已授权目标读取。模板显式填写路径，避免依赖镜像 HOME、UID 或临时目录推导。DigitalMateGateway 模块不执行运行时环境探测、不扫描 AgentServer 进程、不自行创建或替换密钥；镜像启动逻辑应遵守模板注入配置。配置解析已拒绝缺少路径、相对路径、父目录跳转及非空但少于 32 个字符的显式密钥；空或缺省密钥选择文件模式。显式密钥保留原始值，资产目录按 AgentServer 规则去除首尾空白，路径仅做词法规范化，不在 Ingress 宿主机解析。Debug 隐去密钥值。后续文件读取若失败，下载返回错误，不另生成密钥。密钥只用于内部校验，不进入公开响应、业务事件或日志。模板版本选择同时决定 AgentServer 与下载模块使用的配置，切换版本遵循既定业务升级语义。
 
 下载校验实现分为两步：`DownloadVerifier::verify` 先对原始 Base64URL 文本进行 HMAC-SHA256 校验，再解析路径、会话、有效期及 verified 声明；返回的 SignedDownload 尚不代表资产已获准读取。`check_file` 再次检查有效期，要求普通文件；verified 还校验模板资产目录边界、登记 ID、staged/committed 状态、路径、到期时间、大小、摘要及实际文件大小，成功后返回 CheckedDownload。普通与 verified 共用后续文件读取链路；摘要与登记值比较，不重新计算整个下载内容的散列。
 
@@ -222,7 +222,7 @@ Jiuwen 的 `/api/v1/auth/huawei/login`、`/api/v1/auth/agc/login`、`/api/v1/aut
 
 ADX 管理 API、内部 Activator、Platform 和 Relay 继续使用原有租户／服务认证，业务 Token 不授予这些管理权限。多个业务用户可以属于同一 ADX tenant；Jiuwen 按 `(tenant,userId,agent_type)` 派生 binding_id，并结合 template/version 选择完整作用域。客户端不能通过查询参数或消息中的用户字段改选其他 Environment。
 
-已移除 `local_fixed` 配置与入口回退。测试身份只通过测试中的 BusinessAuth / IdentityProvider 实现注入，不提供生产模拟身份开关。Jiuwen 模块不感知监听器的 TLS 状态，也不依据 X-Forwarded-Proto 授权。HTTP 与 HTTPS 监听使用相同业务认证。公网 TLS 由部署入口负责，可由 ELB 终止后使用 HTTP 回源，或使用 Ingress 原有 TLS 监听器；HTTP 回源端口仅在受控内部网络开放。
+已移除 `local_fixed` 配置与入口回退。测试身份只通过测试中的 BusinessAuth / IdentityProvider 实现注入，不提供生产模拟身份开关。DigitalMateGateway 模块不感知监听器的 TLS 状态，也不依据 X-Forwarded-Proto 授权。HTTP 与 HTTPS 监听使用相同业务认证。公网 TLS 由部署入口负责，可由 ELB 终止后使用 HTTP 回源，或使用 Ingress 原有 TLS 监听器；HTTP 回源端口仅在受控内部网络开放。
 
 ### 接口
 
@@ -260,19 +260,27 @@ WS 在握手前验证会话，连接建立后每 30 秒复查；业务消息不�
 
 ### 数据与模型凭据
 
+#### 透明业务 WebSocket
+
+配置顶层的可选 `orbit` 块与 `jiuwen` 平级，固定 template、version、backend_path 和 service_port，启用独立的 `GET /orbit/ws`。两者共用顶层 tenant 与账号登录；业务与共享账号入口均不按 Host 或 Origin 限制准入，域名及路径的访问范围由部署层控制。透明入口保留客户端原始 Host 和 Origin，后端应用仍可自行校验页面来源。会话没有新增应用 audience；user_id 取自已验证会话，tenant 取自网关固定配置。绑定内部 ID 为 `orbit-` 加 `SHA256(JSON([tenant,user_id]))` 的十六进制全长摘要；模板及版本是 Scope 的其他组成部分。客户端不再选择 binding_id，也没有 Binding ID 响应头。同用户在固定 Scope 内始终复用一个绑定，不同用户隔离，不新增用户归属字段或映射表。
+
+新入口复用 AgentV2Access 的模板 service 校验、激活、冷启动就绪等待，以及共享 Gateway HTTP Upgrade 和双向字节转发；没有独立 Relay 客户端。握手前清除网关消费的认证请求头和内部路由头；只替换后端路径，query 原样保留，不解析、重编码或按名称过滤，不增加专属 query 长度限制。查询参数不参与网关目标选择，由 Orbit 解释。不解析业务帧、不做 Jiuwen 协议转换、不重放已发送请求。激活、连接、连接后会话复查和握手共用原 admission deadline，会话 watcher 在各阶段持续有效，取得后端流后同时监听路由撤销；deadline 到期为 504。握手前会话失效为 401，路由撤销为 502 ROUTE_REVOKED；握手后两者均关闭连接。完整查询参数与错误契约见 [Gateway README](../../gateway/README.md#transparent-business-websocket)。
+
+缺少 Binding 时复用账号模型服务注入 model_api_key/model_api_base，并与 Jiuwen 共用 workspace 生成逻辑：`w-` 加 `SHA256(JSON([tenant,template,user_id]))`，这里 template 使用 Orbit 的固定模板。模板通过 `${workspace}` 声明工作区挂载；非 root 镜像可通过挂载的 `create_options` 声明新目录的 UID/GID/mode；Orbit 示例为 10001/10001/0700，仅改变新目录，不修改已有目录。该能力要求包含实现的 adxlet，当前仅完成本地组件验证，尚未部署到测试环境。原 `/ws` 仍使用原模板、`jiuwen-` 加 `SHA256(JSON([tenant,user_id,agent_type]))` 的 ID 和原工作区初始化。通用 `/agent` 保持租户 API Key、tenant + target、实际 Binding ID 响应与 TLS 要求；账号接口由 DigitalMateGateway 装配。
+
 PostgreSQL 独立 schema `adx_accounts` 保存：
 
-- users：tenant、内部 user_id、provider、provider scope（沿用列名 developer_scope）、client_id、大小写敏感外部 ID（沿用列名 union_id）、status、注册协议版本与时间；`(tenant,provider,scope,external ID)` 唯一约束防止并发重复创建用户。AGC 使用 project ID 和验证 UID，Huawei 使用原 developer scope 和 UnionID；两种 provider 不自动关联。
-- sessions：Token 摘要、tenant/user_id、绝对到期时间、撤销时间。
-- model_credentials：每个 tenant/user_id 一份随机模型 Key 的加密值、凭据版本、签发完成状态。
+- users：内部 user_id、provider、provider scope（沿用列名 developer_scope）、client_id、大小写敏感外部 ID（沿用列名 union_id）、status、注册协议版本与时间；`(provider,scope,external ID)` 唯一约束防止并发重复创建用户。AGC 使用 project ID 和验证 UID，Huawei 使用原 developer scope 和 UnionID；两种 provider 不自动关联。
+- sessions：Token 摘要、user_id、绝对到期时间、撤销时间。
+- model_credentials：每个 user_id 一份随机模型 Key 的加密值、凭据版本、签发完成状态。
 
 内部 userId 不等于 Huawei UnionID 或 AGC UID。LiteLLM user_id 是 tenant/userId 的稳定、无歧义散列标识；API Key 是独立随机 `sk-...` 值。每个业务用户复用一个有效模型 Key，多个 Binding 和登录会话共用该用户额度。
 
 登录不依赖 LiteLLM，也不创建 Environment。首次 WS 需要新 Binding 或首次查询额度时，先在 PostgreSQL 原子保存候选 Key，再调用 LiteLLM `/user/info`、`/user/new`、`/key/info`、`/key/generate`。每次重试使用同一已保存 Key；未知结果通过 key/info 对账，不换 Key。管理 API 使用受保护的管理凭据，密钥查询使用 Key 的 SHA-256，不将可用 Key 放在查询 URL。用户 Key 指定 user_id、llm_api 类型、模型白名单、max_budget 和 RPM/TPM；budget_duration 为 null 时 Key 预算不重置，配置周期后按 LiteLLM 周期重置。额度接口按 Jiuwenswarm 的结构返回 quota.total、balance、used、low_balance、exhausted、reset_period、reset_at；max_budget/spend 1:1 显示为积分，底层仍是 LiteLLM 的预算记账，不是独立的精确 token 计数。账号示例使用 5 积分、1d 周期；配合 [MaaS 统一计价配置](../../build/config/examples/litellm-maas.md)，每百万输入加输出 token（含缓存输入）计 1 积分，形成每日 500 万 token 的折算额度。该模式的 spend 不代表真实美元成本；LiteLLM 1.104.2 按 UTC 零点重置，并发调用可能超额。已有 Key 的预算需通过管理 API 单独更新。生产需选用支持这些 API 参数的 LiteLLM 版本并真实验收。
 
-Jiuwen 经 `ManagedService.prepare_binding` 调用内部 `/internal/adx/v1/bindings/prepare`，私有 LaunchConfig 仅包含 API_KEY、API_BASE；模型展示与选择由 Template 环境配置。AgentState 将加密配置与新 Binding 在同一个 Redis 事务内提交，AAD 绑定完整 Scope 与 generation。配置不出现在公开 Binding/Target/列表中；Debug 隐去明文。重复准备相同配置返回同一 Binding，不同配置返回冲突。Environment 删除成功或明确返回 NotFound 后，按绑定 generation 条件同时删除绑定与私有配置；鉴权失败、超时及未知结果保留记录。
+Jiuwen 将工作区和用户模型访问值提供为通用 parameters：workspace、model_api_key、model_api_base。Template 通过 mounts.host_path 和 env 占位符声明使用方式。共享解析/激活流程在缺少 Binding 时取得这些值、校验并原子保存；已有 Binding 不解析或校验新的参数，继续使用持久化值。并发首次创建以落库成功的记录为准。参数以明文保存并出现在 Binding 元数据中，模型 Key 后续保护由业务 Gateway/AgentServer 负责，不提供独立 launch 存储或 prepare 接口。
 
-Activator 将私有配置覆盖到模板环境变量，再调用已有 Environment 能力。独立及嵌入式模式共用这一实现。配置在 Binding 生命周期内不可变；冷启动重试和重建复用它，热实例访问不查询 LiteLLM 管理服务。当前不实现密钥热轮换；需要显式处理相关 Binding 和 Environment。用户可以在自己的 Environment 中取得自己的模型 Key；管理密钥和上游共享密钥不注入。
+Activator 对参数做通用模板渲染，再调用已有 Environment 能力。独立及嵌入式模式共用实现。热实例访问不查询 LiteLLM 管理服务；用户模型 Key 和 API_BASE 的值通过模板 env 注入，而非额外覆盖模板配置。用户可以在自己的 Environment 中取得自己的模型 Key；管理密钥和上游共享密钥不注入。
 
 退出仅撤销当前业务会话。将账号设为 disabled/deleted 会拒绝登录和业务访问，但不会自动调用 LiteLLM 撤销已发 Key；若需要同时停止独立模型调用，运维需在 LiteLLM 阻断该 Key。自动账号状态联动不在本期实现中。
 
@@ -294,14 +302,14 @@ HUAWEI_OAUTH_CLIENT_SECRET=<应用 Client Secret>
 ADX_AGC_API_CLIENT_SECRET=<AGC 中国区项目 API client secret>
 ADX_ACCOUNT_DATABASE_URL=<PostgreSQL URL>
 ADX_LITELLM_ADMIN_KEY=<LiteLLM 管理凭据>
-ADX_CREDENTIAL_KEY_FILE=/run/secrets/adx-credential-key
+ADX_CREDENTIAL_KEY_FILE=/run/secrets/adx-account-credential-key
 ```
 
-credential-key 文件包含 32 字节随机密钥的 64 位十六进制文本，保护文件读取权限，并备份密钥。所有 Ingress 和独立 Activator 必须挂载相同密钥；独立 Activator 也配置 ADX_CREDENTIAL_KEY_FILE。未配置时，通用 Agent 功能可继续使用，但私有绑定配置准备与读取失败。不要随进程重启重新生成，否则已有凭据无法解密。
+ADX_CREDENTIAL_KEY_FILE 仅供内置账号模块保护 PostgreSQL 中的用户模型凭据，所有账号模块副本使用相同的 32 字节密钥（64 位十六进制文本）。独立 Activator 不读取该文件；Binding.parameters 不加密，不再有独立私有启动快照。
 
 PostgreSQL 默认强制 TLS 并验证证书，database_ca_file 可增加内部 CA；database_allow_plaintext 仅用于明确受信的隔离网络。LiteLLM 默认要求 HTTPS，allow_plaintext 仅用于同类内部网络。华为 Account Kit 与 AGC 中国区目标地址固定，不接受请求覆盖。配置 AGC 后缺少 API client secret、其他生产凭据缺失或数据库 schema 不匹配时启动失败，不回退到本地身份。
 
-allowed_hosts 校验 Jiuwen Host；浏览器 Origin 必须精确匹配 allowed_origins（包含 HTTP/HTTPS scheme 和非默认端口）；原生客户端无 Origin 可使用。Jiuwen 域名不能与 Environment 端口直连域名冲突。既有 Ingress 客户端 ACL 仍生效。公网负载均衡仅发布 Jiuwen 所需路径，内部管理与基础组件保持网络隔离。
+业务模块不配置 Host 白名单，不校验浏览器或原生客户端的 Origin。Environment 端口直连域名路由保留原有优先级。既有 Ingress 客户端 ACL 仍生效。公网负载均衡仅发布 Jiuwen 所需路径，内部管理与基础组件保持网络隔离。
 
 会话表需运维定期清理过期记录。日志不记录授权码、业务 Token、模型 Key、下载链接或管理密钥。数据库备份包含密文，仍按敏感账号数据保护。
 
@@ -312,3 +320,9 @@ allowed_hosts 校验 Jiuwen Host；浏览器 Origin 必须精确匹配 allowed_o
 本地验证使用真实 PostgreSQL、模拟 Huawei/AGC 身份提供方和 LiteLLM HTTP 服务，并独立测试华为签名/声明校验及 AGC Server REST 请求、声明绑定和撤销错误。云端另已验证经 LiteLLM 的真实 DeepSeek 对话；真实华为 Code 兑换、真实 AGC 换票与双账号隔离、生产 LiteLLM 用量拦截及手机 UI 仍需联调，不宣称已通过。
 
 参考：[华为凭证接口](https://developer.huawei.com/consumer/cn/doc/doccenter-references/api/account-api-obtain-user-token)、[AGC 用户 token 服务端验证](https://developer.huawei.com/consumer/en/doc/appgallery-connect-Guides/sever-rest-verifytoken-0000001323246818)、[AGC 验证结果](https://developer.huawei.com/consumer/en/doc/appgallery-connect-references/auth-serversdk-authaccesstoken-0000001055124700)、[LiteLLM 虚拟密钥](https://docs.litellm.ai/docs/proxy/virtual_keys)。
+
+### 账号存储与固定网关租户
+
+账号配置和 Principal 不含 tenant，用户身份按 `(provider,developer_scope,union_id)` 唯一，用户主键及模型凭据主键均为 user_id。存储 SQL 不读写 tenant 列。DigitalMateGateway 固定 tenant 继续参与原有 Binding、workspace、LiteLLM owner 和模型密文 AAD 派生；保持配置值和加密密钥不变，不迁移既有身份或目录。
+
+schema_version 保持 1，无运行时探测、旧 SQL 回退或双写，应用不执行 DDL。

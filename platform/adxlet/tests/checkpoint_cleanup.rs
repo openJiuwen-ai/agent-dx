@@ -1,9 +1,7 @@
 use adx_core::{Assignment, CheckpointArtifact, CheckpointCleanup, EnvironmentRecord, Result};
 use adx_protocol::{auth::Peers, control as pb};
 use adxlet::{
-    checkpoint::{
-        CheckpointCooperation, CheckpointStore, LocalCheckpointStore, MaterializedCheckpoint,
-    },
+    checkpoint::{CheckpointAccess, CheckpointCooperation, LocalCheckpointStore, RestoreAccess},
     Adxlet, Durability, Readiness, Routes, RuntimeDriver, StateSink,
 };
 use async_trait::async_trait;
@@ -83,9 +81,9 @@ struct RecordingStore {
 }
 
 #[async_trait]
-impl CheckpointStore for RecordingStore {
-    async fn allocate(&self) -> Result<PathBuf> {
-        self.local.allocate().await
+impl CheckpointAccess for RecordingStore {
+    async fn begin_capture(&self) -> Result<PathBuf> {
+        self.local.begin_capture().await
     }
 
     async fn discard_staged(&self, path: &Path) -> Result<()> {
@@ -96,15 +94,15 @@ impl CheckpointStore for RecordingStore {
         self.local.retain_staged(path).await
     }
 
-    async fn publish(&self, path: &Path) -> Result<CheckpointArtifact> {
-        self.local.publish(path).await
+    async fn seal(&self, path: &Path) -> Result<CheckpointArtifact> {
+        self.local.seal(path).await
     }
 
-    async fn materialize(&self, artifact: &CheckpointArtifact) -> Result<MaterializedCheckpoint> {
-        self.local.materialize(artifact).await
+    async fn prepare_restore(&self, artifact: &CheckpointArtifact) -> Result<RestoreAccess> {
+        self.local.prepare_restore(artifact).await
     }
 
-    async fn remove(&self, artifact: &CheckpointArtifact) -> Result<()> {
+    async fn release(&self, artifact: &CheckpointArtifact) -> Result<()> {
         self.remove_calls
             .lock()
             .expect("test state lock is healthy")
@@ -272,14 +270,17 @@ async fn cleanup_retries_the_full_idempotent_sequence_after_partial_remove_failu
     )
     .with_checkpointing(store.clone(), Arc::new(Noop))
     .unwrap();
-    let cleanup = cleanup("other", "shared");
+    let mut cleanup = cleanup("node", "");
+    for artifact in &mut cleanup.artifacts {
+        artifact.storage = "local".into();
+    }
 
     assert!(manager
-        .collect_checkpoint_cleanup(&cleanup, true)
+        .collect_checkpoint_cleanup(&cleanup, false)
         .await
         .is_err());
     manager
-        .collect_checkpoint_cleanup(&cleanup, true)
+        .collect_checkpoint_cleanup(&cleanup, false)
         .await
         .unwrap();
     assert_eq!(

@@ -42,7 +42,7 @@ runner 的 case 执行仍限定专用 Linux ARM64 root 环境；这来自探针�
 | --- | --- |
 | OwnerFs workspace bind mount | 保留实现和配置，默认 OFF；显式配置后用于当前实际试用场景 |
 | OwnerFs 远端 FUSE 访问 | 保留代码路径，目标仓二进制须有本轮限定 Linux 运行证据 |
-| DistributedFs 一写多读 | 原生Node数据路径保留；单副本、不配置外部存储的一写一读已形成限定Linux闭环。有界读视图／授权、完整BLAKE3、可选磁盘Peer缓存与正常local-file恢复按下方边界验证；多读者规模及性能另验 |
+| DistributedFs 一写多读 | 原生Node数据路径保留；单副本、不配置外部存储的一写一读已形成限定Linux闭环。原生新写默认CRC及写入代次GC保护，多副本写、跨节点读与正常修复有1GiB限定Linux验收；有界视图/授权保持，显式BLAKE3可选磁盘Peer缓存与正常local-file恢复按下方边界验证；多读者规模及性能另验 |
 | DFS 外部 S3 发布／回源 | 实验接入：外部配置固定单本地副本；4MiB预上传／四路PUT、64MiB有序发布与预算内跨窗口生产、不可变载荷真实计费、异步cache／抗扫描准入、close-to-open视图及最长5秒授权复用、同对象Ready流水线与完整BLAKE3已实现。成功fsync等所有已接纳序号的对象与Meta持久确认，普通write可先返回已接纳；功能按下方交付边界及测试合同验证；性能、崩溃恢复、外部缓存P2P及引用感知GC后置 |
 | 中心 Meta `local-file` | 作为当前可重启恢复基线 |
 | `memory` Meta | 仅用于一次性演示，重启不保留状态 |
@@ -54,6 +54,8 @@ runner 的 case 执行仍限定专用 Linux ARM64 root 环境；这来自探针�
 
 
 ## DFS 原生 Peer 阶段边界
+
+原生新写默认独立ID＋分段CRC；一次写入代次保护替代逐chunk登记，最终发布只核对相关引用。多副本CRC、精确范围远端读及正常修复的当前验收合同见[CRC定向检查](../testing/afs.md#原生crc与写入代次gc定向检查)。下面的完整根、Bao及可选Peer磁盘缓存专指显式BLAKE3对象；CRC不进入这些可选缓存。
 
 不配置外部存储时，DFS通过Node数据副本提供内容；单副本场景的B端真实读取A端数据，
 中心Meta不代理正文。成功fsync保留本地耐久副本与Meta持久发布屏障；单副本不承诺失去A后仍可读。

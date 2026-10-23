@@ -1,6 +1,6 @@
 #![cfg(feature = "agent-api")]
 use adx_agent_core::{environment::ExecutionSpec, TemplateVersion};
-use data_plane_gateway::ingress::jiuwen::download_config::DownloadConfig;
+use data_plane_gateway::ingress::digitalmategateway::download_config::DownloadConfig;
 use serde_json::json;
 
 fn template() -> TemplateVersion {

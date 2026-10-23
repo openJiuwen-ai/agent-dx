@@ -8,6 +8,11 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+mod cow;
+mod gc;
+pub use cow::clone_file_layout;
+pub use gc::{GcFence, GcReference, GcState, UpdateGcReference};
+
 macro_rules! string_id {
     ($name:ident) => {
         #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -373,6 +378,8 @@ pub struct LayoutRoot {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum DigestAlgorithm {
     Blake3,
+    /// BLAKE3 binding of a versioned 32KiB CRC32C table, never a body BLAKE3 root.
+    Crc32cSegmentsV1,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -395,6 +402,35 @@ pub struct ChunkObject {
 }
 
 impl ChunkObject {
+    /// Birth generation of an independently named CRC object. Repairs retain it.
+    pub fn write_generation(&self) -> Option<&str> {
+        let value = self.id.0.strip_prefix("crc32c-v2-")?;
+        let (generation, object) = value.split_once('-')?;
+        let hex = |s: &str| {
+            s.len() == 32
+                && s.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        };
+        (hex(generation) && hex(object)).then_some(generation)
+    }
+
+    pub fn generation_id(operation: &OperationId) -> String {
+        blake3::hash(operation.0.as_bytes()).to_hex()[..32].to_string()
+    }
+
+    pub fn is_segment_crc32c(&self) -> bool {
+        self.content_digest.algorithm == DigestAlgorithm::Crc32cSegmentsV1
+    }
+    pub fn valid_immutable_identity(&self) -> bool {
+        if !self.is_segment_crc32c() {
+            return Self::from_content_addressed_id(&self.id).as_ref() == Some(self);
+        }
+        self.length > 0
+            && self.length <= 4 * 1024 * 1024
+            && self.encoding == ChunkEncoding::Raw
+            && self.write_generation().is_some()
+    }
+
     /// Recover the standard root and length committed by a canonical ChunkId.
     /// Other historical IDs have no content-addressed authority; callers must
     /// retain their complete verification fallback rather than infer a root.
@@ -997,7 +1033,18 @@ pub struct CommitMetadataDelta {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CloneFileRange {
+    pub version: FileVersionId,
+    pub source_offset: u64,
+    pub destination_offset: u64,
+    pub length: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CommitFileVersion {
+    /// Frozen before uploads start; never refreshed when retrying a commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gc_fence: Option<GcFence>,
     pub operation_id: OperationId,
     pub inode_id: InodeId,
     pub write_lease: WriteLease,
@@ -1006,6 +1053,9 @@ pub struct CommitFileVersion {
     pub file_version: FileVersion,
     pub layout_root: LayoutRoot,
     pub chunk_receipts: Vec<ChunkReceipt>,
+    /// COW inherits only the specified range of an immutable source version.
+    #[serde(default)]
+    pub clone_source: Option<CloneFileRange>,
     pub metadata_delta: CommitMetadataDelta,
 }
 
@@ -1110,5 +1160,21 @@ mod external_identity_tests {
         ] {
             assert!(external_object_key("store", "generation", &ChunkId::new(identity)).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod crc32c_format_tests {
+    #[test]
+    fn crc32c_descriptor_has_distinct_persisted_algorithm() {
+        let descriptor: super::ContentDigest = serde_json::from_value(serde_json::json!({
+            "algorithm":"Crc32cSegmentsV1", "bytes":vec![7_u8;32]
+        }))
+        .unwrap();
+        assert_ne!(descriptor.algorithm, super::DigestAlgorithm::Blake3);
+        assert_eq!(
+            serde_json::to_value(descriptor).unwrap()["algorithm"],
+            "Crc32cSegmentsV1"
+        );
     }
 }

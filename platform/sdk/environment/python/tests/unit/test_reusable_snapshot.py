@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import adx_environment
 from adx_environment import Environment
-from adx_environment._transport import EnvironmentClient, EnvironmentError
+from adx_environment._transport import EnvironmentClient, EnvironmentError as SDKEnvironmentError
 
 
 class ReusableSnapshotTests(unittest.TestCase):
@@ -192,7 +192,9 @@ class ReusableSnapshotTests(unittest.TestCase):
         self.assertEqual(client.deleted, "snap-1")
 
     def test_snapshot_catalog_accepts_explicit_connection(self):
-        connection = adx_environment.ConnectionConfig(server_address="control:8443", token="test-key", verify_tls=True)
+        connection = adx_environment.ConnectionConfig(
+            server_address="control:8443", token="test-key", verify_tls=True
+        )
         with patch("adx_environment.environment_api.EnvironmentClient") as client:
             client.return_value.get_snapshot.return_value = {"snapshotId": "saved", "names": []}
             client.return_value.list_snapshots.return_value = {"items": [], "nextPageToken": ""}
@@ -244,10 +246,13 @@ class ReusableSnapshotTests(unittest.TestCase):
                 self.calls.append(("DELETE", url, kwargs))
                 return Response({"status": "deleted"})
 
-        client = object.__new__(EnvironmentClient)
-        client._connection = adx_environment.ConnectionConfig(server_address="frontend", token="test-token")
-        client._base = "https://frontend/api/environment/v1"
-        client._http = HTTP()
+        http = HTTP()
+        with patch("adx_environment._transport.acquire_shared_http_client", return_value=http):
+            client = EnvironmentClient(
+                connection=adx_environment.ConnectionConfig(
+                    server_address="frontend", token="test-token"
+                )
+            )
 
         created = client.create_snapshot("default-source", name="base", timeout_seconds=240)
         client.get_snapshot("snap-1")
@@ -256,23 +261,25 @@ class ReusableSnapshotTests(unittest.TestCase):
 
         self.assertTrue(created["snapshotId"].startswith("snap-"))
         self.assertEqual(
-            [call[0] for call in client._http.calls],
+            [call[0] for call in http.calls],
             ["POST", "GET", "GET", "DELETE"],
         )
         self.assertEqual(
-            client._http.calls[0][1],
+            http.calls[0][1],
             "https://frontend/api/environment/v1/environments/default-source/snapshots",
         )
         self.assertEqual(
-            client._http.calls[0][2]["json"],
+            http.calls[0][2]["json"],
             {"name": "base", "timeoutSeconds": 240},
         )
-        self.assertEqual(client._http.calls[0][2]["timeout"], 270)
+        self.assertEqual(http.calls[0][2]["timeout"], 270)
         self.assertEqual(
-            client._http.calls[2][2]["params"],
+            http.calls[2][2]["params"],
             {"name": "base", "pageToken": "next", "pageSize": 10},
         )
-        self.assertTrue(client._http.calls[3][2]["headers"]["X-ADX-Request-ID"].startswith("delete-snapshot-"))
+        self.assertTrue(
+            http.calls[3][2]["headers"]["X-ADX-Request-ID"].startswith("delete-snapshot-")
+        )
 
     def test_transport_accepts_snapshot_id_distinct_from_request_id(self):
         class Response:
@@ -291,10 +298,13 @@ class ReusableSnapshotTests(unittest.TestCase):
                 del url, kwargs
                 return Response()
 
-        client = object.__new__(EnvironmentClient)
-        client._connection = adx_environment.ConnectionConfig(server_address="frontend", token="test-token")
-        client._base = "https://frontend/api/environment/v1"
-        client._http = HTTP()
+        http = HTTP()
+        with patch("adx_environment._transport.acquire_shared_http_client", return_value=http):
+            client = EnvironmentClient(
+                connection=adx_environment.ConnectionConfig(
+                    server_address="frontend", token="test-token"
+                )
+            )
 
         self.assertEqual(
             client.create_snapshot("default-source", name="base")["snapshotId"],
@@ -314,14 +324,79 @@ class ReusableSnapshotTests(unittest.TestCase):
                 self.calls.append((url, kwargs))
                 return Response()
 
-        client = object.__new__(EnvironmentClient)
-        client._connection = adx_environment.ConnectionConfig(server_address="frontend", token="test-token")
-        client._base = "https://frontend/api/environment/v1"
-        client._http = HTTP()
+        http = HTTP()
+        with patch("adx_environment._transport.acquire_shared_http_client", return_value=http):
+            client = EnvironmentClient(
+                connection=adx_environment.ConnectionConfig(
+                    server_address="frontend", token="test-token"
+                )
+            )
 
         with patch("adx_environment._transport.time.sleep") as sleep:
-            with self.assertRaisesRegex(EnvironmentError, "HTTP 503"):
+            with self.assertRaisesRegex(SDKEnvironmentError, "HTTP 503"):
                 client.create_snapshot("default-source", name="base")
 
-        self.assertEqual(len(client._http.calls), 1)
+        self.assertEqual(len(http.calls), 1)
         sleep.assert_not_called()
+
+    def test_busy_delete_reports_sandbox_ids_and_does_not_retry(self):
+        import httpx
+        from adx_environment._transport import EnvironmentHTTPError
+
+        calls = []
+
+        class HTTP:
+            @staticmethod
+            def delete(url, **kwargs):
+                calls.append((url, kwargs))
+                return httpx.Response(
+                    409,
+                    json={
+                        "code": 409,
+                        "message": "snapshot is in use",
+                        "error": {
+                            "code": "SNAPSHOT_IN_USE",
+                            "retry": "never",
+                            "outcome": "not_started",
+                            "sandbox_ids": ["source", "sandbox-a"],
+                            "template_ids": ["node/base"],
+                        },
+                    },
+                )
+
+        http = HTTP()
+        with patch("adx_environment._transport.acquire_shared_http_client", return_value=http):
+            client = EnvironmentClient(
+                connection=adx_environment.ConnectionConfig(
+                    server_address="frontend", token="test-token"
+                )
+            )
+        with patch("adx_environment._transport.time.sleep") as sleep:
+            with self.assertRaises(EnvironmentHTTPError) as caught:
+                client.delete_snapshot("snapshot-1")
+            sleep.assert_not_called()
+        self.assertEqual(caught.exception.code, "SNAPSHOT_IN_USE")
+        self.assertEqual(caught.exception.sandbox_ids, ("source", "sandbox-a"))
+        self.assertEqual(caught.exception.template_ids, ("node/base",))
+        self.assertEqual(len(calls), 1)
+
+    def test_legacy_text_error_does_not_break_error_decoding(self):
+        import httpx
+        from adx_environment._transport import EnvironmentHTTPError
+
+        class HTTP:
+            @staticmethod
+            def delete(url, **kwargs):
+                return httpx.Response(500, json={"error": "failed"})
+
+        http = HTTP()
+        with patch("adx_environment._transport.acquire_shared_http_client", return_value=http):
+            client = EnvironmentClient(
+                connection=adx_environment.ConnectionConfig(
+                    server_address="frontend", token="test-token"
+                )
+            )
+        with patch("adx_environment._transport.time.sleep"):
+            with self.assertRaises(EnvironmentHTTPError) as caught:
+                client.delete_snapshot("snapshot-1")
+        self.assertEqual(caught.exception.sandbox_ids, ())

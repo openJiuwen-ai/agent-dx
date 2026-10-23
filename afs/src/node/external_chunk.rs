@@ -2301,6 +2301,12 @@ impl ChunkStore for S3ChunkStore {
             return Err(invalid("S3 batch allows at most 128 chunks"));
         }
         for value in &staged {
+            if value.chunk.is_segment_crc32c() {
+                return Err(Error::coded(
+                    afs_error::IO_NOT_SUPPORTED,
+                    "CRC32C external object writes are unsupported",
+                ));
+            }
             validate_chunk(&value.chunk)?;
             if !value.has_sealed_identity() {
                 return Err(invalid("staged Chunk metadata changed after sealing"));
@@ -2325,6 +2331,12 @@ impl ChunkStore for S3ChunkStore {
             return Err(invalid("S3 batch allows at most 128 chunks"));
         }
         for value in &staged {
+            if value.chunk.is_segment_crc32c() {
+                return Err(Error::coded(
+                    afs_error::IO_NOT_SUPPORTED,
+                    "CRC32C external object writes are unsupported",
+                ));
+            }
             validate_chunk(&value.chunk)?;
             if !value.has_sealed_identity() {
                 return Err(invalid("staged Chunk metadata changed after sealing"));

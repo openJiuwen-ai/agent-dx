@@ -12,6 +12,7 @@ build = "build.rs"
 workspace = true
 
 [dependencies]
+adx-checkpoint-storage = { path = "../crates/checkpoint-storage" }
 adx-observability = { path = "../../crates/observability" }
 adx-transport = { path = "../../crates/transport" }
 data-plane-gateway = { path = "../../gateway" }
@@ -23,7 +24,7 @@ adx-core = { path = "../crates/core" }
 adx-protocol = { path = "../crates/protocol" }
 adx-process = { path = "../../crates/process" }
 async-trait = "0.1"
-tokio = { version = "1", features = ["rt", "sync", "macros", "net", "time"] }
+tokio = { version = "1", features = ["rt", "sync", "macros", "net", "time", "process", "io-util"] }
 tonic = "0.12"
 prost = "0.13"
 tower = { version = "0.5", features = ["util"] }

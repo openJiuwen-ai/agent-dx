@@ -18,6 +18,9 @@ pub struct ActivationRequest {
     /// Force a Environment observation even if this Activator already activated this generation.
     #[serde(default, rename = "bypasscache")]
     pub bypass_cache: bool,
+    /// Raw form-encoded initialization. Parsed only when this Binding is absent.
+    #[serde(default)]
+    pub parameters: Option<Vec<u8>>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -77,14 +80,4 @@ impl BindingList {
         }
         Ok(())
     }
-}
-
-/// Internal-only preparation; user credentials never appear in returned bindings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PrepareBindingRequest {
-    pub scope: Scope,
-    pub launch: crate::launch::LaunchConfig,
-    #[serde(default)]
-    pub parameters: crate::mounts::Parameters,
 }

@@ -22,7 +22,7 @@ impl LocalControl {
     ) -> Result<Self> {
         let store = RedisRepository::connect(redis_url, namespace, Duration::from_secs(3)).await?;
         Ok(Self::new(Arc::new(Activator::new(
-            AgentState::new(Arc::new(store)).with_deployment_credentials()?,
+            AgentState::new(Arc::new(store)),
             environment,
         ))))
     }
@@ -34,18 +34,6 @@ impl LocalControl {
 
 #[async_trait]
 impl Control for LocalControl {
-    async fn prepare_binding(
-        &self,
-        ctx: &RequestContext,
-        scope: &Scope,
-        launch: &adx_agent_core::launch::LaunchConfig,
-        parameters: &adx_agent_core::mounts::Parameters,
-    ) -> Result<AgentBinding> {
-        ctx.start_write();
-        self.activator
-            .prepare_binding(scope, launch, parameters)
-            .await
-    }
     async fn publish(
         &self,
         ctx: &RequestContext,
@@ -101,6 +89,25 @@ impl Control for LocalControl {
                 expected_generation,
                 ctx.deadline_unix_ms(),
                 bypass_cache,
+            )
+            .await
+    }
+    async fn activate_with_parameters(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        expected_generation: Option<&str>,
+        bypass_cache: bool,
+        parameters: Option<&[u8]>,
+    ) -> Result<Target> {
+        ctx.start_write();
+        self.activator
+            .activate_with_parameters(
+                scope,
+                expected_generation,
+                ctx.deadline_unix_ms(),
+                bypass_cache,
+                parameters,
             )
             .await
     }

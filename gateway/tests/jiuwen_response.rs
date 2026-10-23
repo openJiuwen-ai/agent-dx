@@ -1,5 +1,5 @@
 #![cfg(feature = "agent-api")]
-use data_plane_gateway::ingress::jiuwen::{protocol::Request, response::Response};
+use data_plane_gateway::ingress::digitalmategateway::{protocol::Request, response::Response};
 use serde_json::{json, Value};
 
 fn request(method: &str) -> Request {
@@ -235,7 +235,7 @@ fn negative_keepalive_is_transport_activity_without_business_output() {
 
 #[test]
 fn busy_state_follows_processing_and_interrupt_events_not_transport_final() {
-    use data_plane_gateway::ingress::jiuwen::response::{Projection, SessionState};
+    use data_plane_gateway::ingress::digitalmategateway::response::{Projection, SessionState};
     let mut state = SessionState::new(2).unwrap();
     let event = |name: &str, payload: Value| Projection {
         frame: Some(json!({"type":"event","event":name,"payload":payload})),
@@ -292,7 +292,7 @@ fn busy_state_follows_processing_and_interrupt_events_not_transport_final() {
 
 #[test]
 fn busy_state_is_bounded_without_silently_evicting_active_sessions() {
-    use data_plane_gateway::ingress::jiuwen::response::{Projection, SessionState};
+    use data_plane_gateway::ingress::digitalmategateway::response::{Projection, SessionState};
     assert!(SessionState::new(0).is_err());
     let mut state = SessionState::new(1).unwrap();
     let event = |id: &str, busy: bool| Projection {

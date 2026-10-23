@@ -15,6 +15,14 @@ impl Session {
     }
     async fn snapshot_cas(&self, id: &str, old: Option<&str>, next: &Snapshot) -> Result<bool> {
         next.validate()?;
+        let _access = if next.state == SnapshotState::Ready {
+            Some(
+                self.store
+                    .lock_artifacts(std::slice::from_ref(&next.artifact))?,
+            )
+        } else {
+            None
+        };
         let [header_value] = self.store.fields([HEADER.into()]).await?;
         let mut header = self.header(&header_value)?;
         if old.is_none() {

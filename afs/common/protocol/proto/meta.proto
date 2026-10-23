@@ -379,6 +379,8 @@ message RecoverRootReply {
 // Meta never carries file content. A node publishes a new inode head only
 // after local or replicated ChunkStore writes have produced durable receipts.
 service DfsMeta {
+  rpc UpdateGcReference(UpdateDfsGcReferenceRequest) returns (UpdateDfsGcReferenceReply);
+  rpc CollectGarbage(CollectDfsGarbageRequest) returns (CollectDfsGarbageReply);
   rpc Lookup(DfsLookupRequest) returns (DfsLookupReply);
   rpc Create(DfsCreateRequest) returns (DfsCreateReply);
   rpc Mkdir(DfsMkdirRequest) returns (DfsMkdirReply);
@@ -580,6 +582,8 @@ message ReportDfsChunkCorruptionReply {}
 enum DfsDigestAlgorithm {
   DFS_DIGEST_ALGORITHM_UNSPECIFIED = 0;
   DFS_DIGEST_ALGORITHM_BLAKE3 = 1;
+  // Descriptor binding of a versioned CRC32C segment table; not a body hash.
+  DFS_DIGEST_ALGORITHM_CRC32C_SEGMENTS_V1 = 2;
 }
 
 enum DfsInodeKind {
@@ -1135,6 +1139,20 @@ message SyncDfsInodeMetadataReply {
   DfsInodeRecord inode = 1;
 }
 
+message DfsCloneFileRange {
+  string version_id = 1;
+  uint64 source_offset = 2;
+  uint64 destination_offset = 3;
+  uint64 length = 4;
+}
+
+message DfsGcFence {
+  oneof kind {
+    uint64 state_revision = 1;
+    bool absent = 2;
+    bool write_generation = 3;
+  }
+}
 message CommitFileVersionRequest {
   string caller_id = 1;
   string operation_id = 2;
@@ -1146,6 +1164,8 @@ message CommitFileVersionRequest {
   repeated DfsChunkReceipt chunk_receipts = 8;
   DfsWriteLease write_lease = 9;
   DfsCommitMetadataDelta metadata_delta = 10;
+  DfsCloneFileRange clone_source = 11;
+  DfsGcFence gc_fence = 12;
 }
 
 message CommitFileVersionReply {
@@ -1223,4 +1243,32 @@ message AuthorizeExternalVersionReadRequest {
 message AuthorizeExternalVersionReadReply {
   repeated DfsExternalAuthorizedRead authorizations = 1;
   uint64 remaining_validity_ms = 2;
+}
+
+// Admission pins must be persisted before exposing an open handle or uploading bytes.
+message UpdateDfsGcReferenceRequest {
+  string node_id = 1;
+  string session_id = 2;
+  string reference_id = 3;
+  string inode_id = 4;
+  string version_id = 5;
+  bool publication = 6;
+  repeated DfsChunkObject chunks = 7;
+  bool release = 8;
+  // Fixed by the sender; a replay never refreshes this admission deadline.
+  uint64 admission_deadline_unix_ms = 9;
+  // Capture once before the caller starts producing native receipts.
+  bool capture_gc_fence = 10;
+}
+message UpdateDfsGcReferenceReply { DfsGcFence gc_fence = 1; }
+message CollectDfsGarbageRequest {
+  string node_id = 1;
+  string session_id = 2;
+  uint64 completed_generation = 3;
+  repeated DfsChunkObject inventory = 4;
+}
+message CollectDfsGarbageReply {
+  uint64 generation = 1;
+  repeated string chunk_ids = 2;
+  bool pending_for_node = 3;
 }

@@ -268,6 +268,22 @@ class TunnelClient:
         self._thread.start()
         return self._connected.wait(timeout=timeout)
 
+    def reconnect(self) -> None:
+        """Retire the active WS and let the existing loop reconnect it.
+
+        Keep the session and resumable requests. Aborting the transport avoids
+        waiting for a close handshake on a path invalidated by a policy change.
+        """
+        loop, ws = self._loop, self._ws
+        if loop is None or ws is None:
+            return
+        if not loop.is_running() or self._stopping.is_set():
+            return
+        try:
+            loop.call_soon_threadsafe(ws.transport.abort)
+        except RuntimeError:
+            logger.debug("tunnel reconnect skipped during shutdown", exc_info=True)
+
     def stop(self) -> None:
         """Signal the tunnel client to stop and wait for the thread."""
         self._stopping.set()

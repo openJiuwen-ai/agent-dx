@@ -33,9 +33,66 @@ Agent DX 平台内部 gRPC 仍按 Environment、Runtime、Snapshot、Route 和 N
 
 Meta 是可恢复状态的权威，不代理稳定数据流。Meta 校验已提交状态并准备候选状态，只有持久后端接受后才发布提交结果。读请求先固定一致视图，再选择本地副本、远端副本或缓存来源，避免一次复合读混用多个 revision。
 
+Meta 的 `local-file`／`memory` 路径通过 `Store::open_log` 重放确定的提交记录，
+再建立一致的已发布视图。提交在私有结构共享状态中准备，记录持久成功后整体切换视图；
+查询只固定已确认版本。日志的独立身份、顺序、前置 hash、CRC 和已声明持久尾都参与恢复核验。
+本地重开再次同步 WAL／目录，避免把仅在页缓存里可读的旧进程写入当成持久确认。
+首次初始化以持久空 `INITIALIZING` 标记保护身份、空 WAL 和初始 CURRENT 的安装；
+精确未完成前缀可继续，未知或非空残留仍拒绝。已初始化目录必须有 CURRENT，
+未列入恢复／退休清单的非空 WAL 拒绝；仅允许身份与恢复 tip 精确匹配的单个空预备段。
+这能检测清单遗漏和留有新日志的回滚，不能检测整目录自洽回滚而无外部见证的情况。
+旧 JSON 快照目录拒绝自动接管；生产仅local-file／memory日志后端，旧快照／etcd／Redis适配及依赖已删除；每个 Store
+只选择一条权威路径，不双写。`Store::checkpoint` 可捕获同一已发布 State 及日志位置，
+在后台任务中编码自包含状态，持久安装带身份、位置、摘要及 CRC 的快照和 `CURRENT`。
+`CURRENT` 同时选择快照和连续日志段；每段头绑定原身份、起始位置及前置 hash，
+活跃段的已同步尾标记承接后续提交。重启核对保留恢复链后，从有效快照只应用后续记录；
+最新快照损坏时，只有上一快照及所需全部已确认历史均有效才回退，否则拒绝。
+调用方取消不会释放仍在工作的安装任务额度。写批次不跨段拆开，段按软阈值轮转；
+先持久更新恢复清单，再验证并删除两恢复点均不需要的封口段及旧快照。退休清单支持
+删除中断后接续，损坏／外来对象保留并计入有限额度；校验旧正文不持写者锁。
+恢复链验证后可回收未引用且经身份、完整摘要和 CRC 核验的本库 checkpoint 镜像；
+不采用孤儿镜像作为新的恢复权威，不删除未知／损坏／外来镜像。
+后台按记录数、保守段字节量或时间软阈值捕获快照，容量压力也可唤醒。只有写前只读准入
+确认尚未追加时才做有界等待，超时拒绝该组且不发布；实际追加错误仍失败关闭，不能按
+容量错误码重试未知结果。观察超时不取消仍在工作的快照任务或释放其额度。
+易失 memory 安装自包含快照后移除覆盖记录，仍不承诺进程退出恢复。
+工作集仍是逻辑计账；六点进程故障、捕获超限拒绝和实际槽位压力下继续提交已有有限回归。
+确定的历史清理使用独立管理记录或业务记录中的关联清理，保存原请求完成代际及完整事件
+revision 水位；不复制实体正文，不伪造用户操作。纯管理记录只推进物理日志位置。
+恢复核对并应用这些决定，不按重启时钟重新选择；自包含快照保存原事件完成时间、保留集、
+压缩水位及已移除事件总数，避免清理后重置后续 Node 事件序号。旧 watch 游标明确返回
+`Compacted` 和重扫位置，有限请求只复制选中的完整 revision。
+canonical单写者按实际owned容量及保守结构预留计量历史，派生索引在恢复时重建，
+正常提交只增量计入本次新增项。时间／条数／字节任一先到即选择确定清理；业务关联清理
+与业务结果同屏障发布，空闲及持续重复请求期间也由独立到期计时推进管理记录。
+待处理输入和准备身份有独立的有限字节准入，身份保护覆盖入队至写者处理终态，
+调用方取消不能提前退还写者仍持有的额度；清理选择与身份准入在短锁内互斥，
+持久 I/O 不持该锁，正在退休的同身份请求在入队前明确拒绝。
+未知ACK后的失败关闭同时阻止后续业务和管理追加。
+canonical读视图另有数量、所持状态字节和期限准入；同一不可变状态共享计账，
+不同代际保守独立计账。过期空闲视图主动解除状态引用，正在执行的读仍持有额度直到结束，
+过期或已知权威失效后不交付成功。此约束不改变业务授权或Node／S3预算，也不覆盖
+已返回的独立结果对象。LocalLog只允许创建进程使用写者句柄；最后真实持有者显式释放
+文件锁，继承的句柄不能读写权威或解开父进程的锁。
+运行时清理后checkpoint／重开，以及降额后先持久清理再准入已有有限回归。
+watch在复制前按独立条数／owned字节上限选取完整revision；请求limit为0也不取消硬上限。
+超限时只返回此前完整revision，首个revision本身超限则明确报容量错误，不修改持久水位、
+不伪造Compacted。已有断档仍通过原Compacted和RecoveryCursor重扫。
+Meta的watch RPC在取数前取得独立响应额度；流式队列有固定槽位、代际与期限，并由单个
+回收任务主动释放无人读取的过期队列。尚未退出的构建请求仍保留额度，旧流不能释放新代际。
+正常EOF／取消退账，超时返回错误，不能把不完整流当成已完成批次推进游标。
+上述约束不计入Node/S3预算，也不代表整个进程、调用方已取走结果或tonic/h2缓冲的内存保证。
+历史策略配置／固定指标已接线，旧Snapshot后端及etcd／Redis适配已移除。物理掉电、
+大场景资源及完整真实产品验收仍未完成，不能宣称持续增长部署已交付。
+配置与当前限制见[部署说明](../deployment/afs.md#meta-操作日志与数据目录)。
+
 OwnerFs 面向小规模 Agent workspace。Home 节点把 workspace 保存为普通本地目录；远端节点通过受控 peer 回到 Home 访问文件。远端传输会话本身不授予文件访问权限，每次打开、读写、flush、sync 和 close 都必须校验授权、句柄、权限、root grant、session、Home session 和 fence。
 
 DFS 把已提交数据表示为不可变 chunk。普通写入先进入 inode 的 dirty 状态；sync、同步写标志、close-time flush 或后台策略触发提交，形成新的 `FileVersion`。复制发生在文件布局之下，Meta 只在收到可验证持久 receipt 后提交新版本和副本目录。验证缓存不能自动算作持久副本。
+
+DFS 的 `copy_file_range` 通过元数据 COW 为目标创建独立 FileVersion，重映射指定源范围的不可变 chunk；不读取或重新上传源数据。范围覆盖保留目标其它区域和源稀疏空洞。Meta 核验源与目标属于同一 namespace、布局严格对应声明范围，重试沿用原操作身份。后续写入提交独立 chunk，源目录删除不会使已提交副本失去数据。
+
+文件提交和完整元数据同步遇到事务 CAS 未命中时，会重新验证 head 和写租约身份；同身份续期或并发 inode 属性变化不再永久污染 writer。换主和 head 变化仍拒绝。单次处理的持续竞争返回可重试错误，保留原 operation，避免把暂时竞争带到退出 drain。
 
 所有启用 OwnerFs 或 DFS 权威能力的 Meta 都要求 mTLS 和
 `trusted_node_certs`。CA 只证明证书链可信；Meta 还把握手得到的叶证书 DER 精确
@@ -45,10 +102,40 @@ Node 的 Meta、peer control 和 data 诊断请求复用生产 TLS 配置，诊�
 这里的 Node ID 绑定发生在服务端对调用方的校验中；客户端仍按 CA 和
 `tls_server_name` 验证服务端，不承诺按目标 Node ID 对服务端证书逐一 pinning。
 
+### OwnerFs Root 授权的代际与回收
+
+RootGrant 按 Root、holder node/session 保存。同 session 的重新 acquire 更新原条目；
+Root 不存在、epoch/Home session 不匹配或 holder session 被替代时，旧授权不能用于新准入。
+新 reservation 使用同一 Meta 写者原子持久分配 epoch：最新分配水位、reservation 和原结果
+属于同一事务。分配只取前一水位加一，调用方 expected 不能提高水位；
+abort、停用和 grant GC 不回退水位；同 intent 重试保持原 epoch。
+此前没有水位的操作日志，从仍保留的 Root/reservation/grant/command/结果引导：
+首次分配直接原子保存；若后台维护先运行，则先把已有最大值与本批 grant 清理原子保存。
+水位保存前暂停旧结果退休，避免删除最后的 epoch 依据。无法推断旧版本早已删除的历史。
+之后水位为独立的 singleton，不为每个已删 Root 保留无界代际列表。
+
+停用精确核对当前 Home grant（包含 Home session/generation），一笔事务移除活动 Root、
+写对应撤权命令及原结果，不再枚举全部历史 grant。Root 移除后的 Meta 校验立即拒绝旧授权；
+同名新 Root 使用新 epoch，不继承旧权限。Home 的本地拒绝、缓存失效、控制断链处理和
+排空顺序保持；这不代表所有 Node 同时收到通知，也不承诺已打开 native FD/mmap 即时撤权。
+
+后台清理在原持久化写者中有界扫描，仅删除已被 Root incarnation、Home 身份或后继
+holder session 替代的记录。当前 Root 引用的 Home grant即使到期也保留，以供恢复推进
+其 generation；普通 holder 到期可清理，因为现有注册状态机禁止过期 session ID 续回；
+不改变该租约合同。选择与准备之间没有 await，删除携带条目 revision
+条件，排队的新 acquire/recover/recreate 不能插入其间；后续请求仍按写者顺序执行。
+清理也经 canonical 日志、原有历史预算及持久后公开，重启继续收敛。
+成功命令及匹配 ACK 只有在 watch／原结果引用已退休、没有 reservation、且不再承担
+活动 Root 排空屏障时才成对原子回收；每次最多扫描128条、删除16对，并受原字节预算约束。
+NodeSession 保留拒绝过期 session ID 重用所需的记录；待确认、失败、孤立 ACK 及仍有引用
+的命令保留。因此有界历史不等于全部权威实体有界，完整生命周期仍有欠账。
+逻辑清理不是立即回收旧 WAL 字节，物理回收仍由 checkpoint/退休协议负责。
+
 ## DFS 原生写正文所有权
 
-普通 FUSE 到本地 inode owner 的 NodeReplicated 写入按 inode FIFO 接纳借用输入，
-直接复制到最终 `ChunkBuilder` 分配。正文准入等待不持 inode 锁或 operation 门禁，
+启用原生写入管线时，普通 FUSE 写入和内核页写回先取得 owned 输入，再由有界 callback
+worker 按同 fh FIFO 执行，避免上传、发布或正文背压占住接收线程。
+worker 将请求正文复制到最终 `ChunkBuilder` 分配。正文准入等待不持 inode 锁或 operation 门禁，
 重新取得短操作门禁后复核 generation、序号、位置和 builder，避免等待期间后台提交造成错接。
 顺序写优先使用4MiB容量块；满块冻结原分配并排队预上传，不触发 Meta 发布。
 提交前仍可原地覆盖可写 builder；已冻结／已提交内容的小覆盖形成普通小 Chunk，
@@ -61,6 +148,14 @@ Node 的 Meta、peer control 和 data 诊断请求复用生产 TLS 配置，诊�
 已有布局并存份数不增加，其capacity与transport临时分配仍须另行计量，不能宣称全部Node元数据受此限制。
 空闲池默认128MiB，独立于 live，不能借作额外接纳额度。共享范围按父分配实际 capacity
 计费一次，最后一个读者、上传／复制／RDMA或冻结提交持有者释放后才退账。
+FUSE owned 输入使用独立的每 mount 32MiB 预算，复制前取得额度，后端执行结束或未准入
+任务丢弃时释放；它不计入原生 ChunkBuilder 的64MiB live账，也不是进程RSS上限。
+额度或队列耗尽时接收端仍会背压；worker 排队消除的是单次后端等待直接占用接收线程，
+不承诺负载超过限额时仍能立即接纳。关闭时唤醒额度等待者并拒绝新任务。
+
+`afs_fuse_write_duration_seconds{filesystem,source,stage}` 将内核页写回和普通 write 分开，
+分别记录输入复制／准入／排队以及后端执行的墙钟耗时。并发调用的累计时间不能与
+pause 或恢复的总墙钟时间直接相加，也不能将 execute 全部解释为存储 I/O。
 
 每一代在首次接纳时固定 OperationId，按 `through_seq` 冻结提交；准备旧代上传时可接纳
 下一代。进入 File／Metadata 或结果未知阶段后，新的 mutation 不能越过；保留原请求、
@@ -84,9 +179,10 @@ AFS live/idle、allocator allocated/active/resident/retained 与进程 RSS 是�
 保留虚拟映射不等于保留同量物理页。S3 原有窗口、正文和 descriptor 预算独立保持，
 尾块也按保留的真实 capacity 计费；本节不引入正文 RAM 内容缓存或变更读授权。
 
-正文一次复制只指上述本地写接纳到提交正文的用户态范围；内核、远端接收、读回和完整 hash
-另列。借用写会占用发生该回调的 FUSE receiver 至接纳／原同步触发结束；其它接收线程
-受线程配置和有界队列限制，不能据 worker 测试声称新请求总能立即接收。
+原生管线的 FUSE 路径包含接收缓冲到 owned 输入、再到 ChunkBuilder 的两次复制；
+冻结后不复制提交正文。内核、远端接收、读回和完整 hash 另列。
+独立构造且未启用管线的本地 Backend 仍可选择借用写，它会占用该回调的 receiver。
+接收线程、worker、任务数与输入字节预算均可形成背压，不能声称新请求总能立即接收。
 具体功能、回收及平台验证边界见[测试说明](../testing/afs.md#原生写-buffer-验证)。
 
 ## DFS 原生节点读取上下文
@@ -117,7 +213,7 @@ B首次缺源时可从同一已核对版本／布局前瞻最多64个后续chunk
 缓存或直接交付：最多重新请求一次全部当前mandatory授权，持续变化则报Unavailable。
 这不是主动撤销协议；尚未知晓的变化仍受既定期限约束。可选批量请求只有精确的
 Meta catalog invalid-request错误才允许一次mandatory-only重新验证，权限、认证、冲突及
-传输错误原样传播。最终授权、完整根校验、fsync及close-to-open合同保持。
+传输错误原样传播。最终授权、对应对象格式的完整性校验、fsync及close-to-open合同保持。
 
 句柄表和五个按 inode 热状态表使用64分片；句柄状态独立加锁，读取快照共享
 `Arc<InodeRecord>`。反向索引只定位目标 inode 的句柄；表锁不跨Meta或Peer RPC。
@@ -142,7 +238,7 @@ resident条目上限不是全部活跃FD、载荷或进程RSS上限。
 候选；legacy未排序或重叠extent保持原序和溢出检查，不改变序列化格式。
 条目上限不等于字节预算，在途Arc及其索引不因淘汰提前释放；mutable dirty布局仍走原路径。
 
-对未进入覆盖组流式发送的请求，A端完整BLAKE3通过后按对象单飞共享不可变正文，默认最多2个LRU驻留对象，
+对显式BLAKE3格式、未进入覆盖组流式发送的请求，A端完整BLAKE3通过后按对象单飞共享不可变正文，默认最多2个LRU驻留对象，
 每对象最多4MiB。短表锁只管理身份、pin、LRU和最多8个active key；填充、扫描、
 sidecar访问及等待均在锁外。完整对象的等待者复用同一次填充，各请求仍独立授权；
 partial／无完整对象结果保持各自范围读取，不承诺这些请求也只扫描一次。
@@ -158,9 +254,17 @@ partial／无完整对象结果保持各自范围读取，不承诺这些请求�
 到期和已知停止，不共享授权成功或增加A→Meta授权RPC。
 这份A端正文额度与B磁盘填充、帧、扫描scratch及进程其它开销分别核算，不是Node总RSS。
 
-### 标准根与覆盖组校验
+### 原生CRC与写入代次
 
-本机读、A端Peer范围服务及B端磁盘命中使用官方Bao outboard，按32KiB覆盖组核对
+原生Node新写默认使用独立ID＋32KiB分段CRC32C，正文不参与内容寻址。对象ID包含出生写入代次和随机对象号；小CRC描述绑定长度/格式及分段表，其摘要不等于正文BLAKE3根。正文、目录和catalog原持久屏障先于durable ACK，多副本保持既有同步策略和预算。复制接收与修复核验同一描述并保持原ID，修复仍受原claim/epoch约束。
+
+首次写入登记一次代次，GC以库存对象ID保护同代次未发布正文，省略逐chunk登记。FullSync等待所需同步副本收据，Meta只检查相关代次引用与当前owner session；版本发布和引用退休同事务。无关GC状态更新不拒绝提交，确切引用失效及旧session不能提交。GC计划仍受全Store快照CAS约束；旧删除代次重放屏障、读引用和修复保护保持。准入窗口及墓碑防止迟到请求重新激活退休代次，已确认提交的回复丢失按原operation重放。
+
+本地CRC读核对覆盖段。远端读保持精确grant，由服务端核对覆盖的32KiB存储段，只返回请求字节和范围CRC；客户端核对可信Meta绑定的描述，对完整段独立核对CRC，非对齐边界依赖认证服务端的存储校验。CRC检测意外损坏，不提供Bao对恶意Peer的密码学证明。CRC对象跳过BLAKE3 proof/驻留及可选磁盘Peer缓存，不通过完整正文hash兜底。正常读视图、源选择、重试和私有输出最终授权保持。
+
+### 显式BLAKE3格式的标准根与覆盖组校验
+
+显式BLAKE3格式的本机读、A端Peer范围服务及B端磁盘命中使用官方Bao outboard，按32KiB覆盖组核对
 同一个标准BLAKE3根，不采用独立1MiB段摘要或CRC替代根校验。outboard编码包含64B
 格式／长度／标准根header及parent CV；4MiB对象最多8192B。结构与根绑定检查不等于
 正文已验证，覆盖组读取仍须校验相关路径并仅向私有结果复制请求区间；实际组读取、
@@ -324,6 +428,13 @@ Header后失败中止，不切换来源或伪造完成。观察到的坏可选si
 授权与帧生产继续在同一blocking任务，拒绝在返回stream前传播；原4帧队列、8 read slots、
 单RPC总截止和排空合同保持。Bytes共享不等于整个Prost／TLS／网络栈零复制。
 
+DFS Peer客户端协商128KiB HTTP/2接收帧上限，OwnerFiles客户端仍为256KiB。
+本策略只作用于客户端接收响应，Node监听端策略不变；帧仍从原connection/stream窗口
+扣除，消息编码/解码上限、载荷/控制额度、并发、TLS和截止时间均不变。相对HTTP/2
+默认16KiB帧，单个已接收帧最多增加112KiB临时载荷缓冲；在途帧总量仍受原连接和流
+窗口约束，不按连接池容量预留128KiB。旧对端可以继续发送小帧。实际DATA帧数量须观察
+完整RPC；帧减少不代表TLS记录、TCP分段或墙钟同比减少。
+
 以上描述当前实现及受影响回归边界；具体通过范围须绑定Linux输入和证据，
 不代表WI-6正式验收或性能目标已经通过。
 
@@ -331,7 +442,9 @@ Header后失败中止，不切换来源或伪造完成。观察到的坏可选si
 
 Node通过公共挂载配置控制接收线程、descriptor clone和callback worker；队列满时等待
 容量，普通完成分别唤醒worker或容量等待者，不在接收线程内执行尚未准入的owned任务。
-借用写仍在原回调生命周期内接纳，并保留同fh顺序和排空；不能把借用输入放进后台队列。
+原生管线写入与页写回拥有输入后入队，保留同fh顺序和排空；输入字节预算耗尽时等待，
+关闭时唤醒等待者并返回错误。仍选择借用写的 Backend 必须在原回调生命周期内完成，
+不能把借用输入放进后台队列。
 
 后端动态确认安全的native只读句柄允许同fh连续READ形成并发批次，排队的write、resize、
 flush、fsync及release仍为排他屏障，后续READ不能越过。OwnerFs、S3和可写句柄维持原
@@ -492,11 +605,67 @@ Meta 纯传输断链时，已打开视图的未到期合法范围可读本地 ca
 对象存储部署与服务端持久性属于外部依赖，Meta 状态持久化
 仍由 AFS 配置的 Meta 后端承担。详见[配置](../deployment/afs.md#dfs-外部-s3-连接)。
 
+### 文件写租约维护
+
+打开的写文件、脏数据和待确认的提交仍需要有效写租约。DFS 节点通过独立的每秒维护任务，
+在 30 秒租约到期前为这些状态续租；该任务不排队等待普通后台写回完成。
+续租只更新同一归属的有效期，不改动已经冻结、需要按原身份重放的提交请求。
+迟到响应不能覆盖新的归属或缩短有效期，正常关闭且已提交的文件无需继续续租。
+Meta 不可用超过租约期限时仍会拒绝旧写入，不通过复活过期租约绕过隔离。
+
 ## OwnerFs workspace bind mount
 
-OwnerFs workspace bind mount 是当前实际试用场景的优先能力，默认 OFF。开启后，它把 Home 上 workspace 的底层真实目录 bind 到 OwnerFs FUSE 根目录下对应的一级目录，例如 `/mnt/afs/ownerfs/agent1`。把 FUSE 目录自身 bind 到别处不满足此设计。
+OwnerFs workspace bind mount 是当前实际试用场景的优先能力，默认 OFF。开启后，它把 Home 上 workspace 的底层真实目录 bind 到独立原生 `ownerfs_workspace_egress_root` 下的同名一级目录。egress root 必须在 OwnerFs FUSE 挂载和 Node 数据目录之外；FUSE 子树仍保留，不以 bind 覆盖。把 FUSE 目录自身 bind 到别处不满足此设计。
 
 核心实现只负责挂载、身份核验和卸载；runc、容器启动、执行、停止和探针属于适配层。ON 场景仍需保留授权、Home/root/epoch 核验、数据新鲜度、close-to-open、权限、错误传播、正常卸载和受管引用排空。当前不承诺已有 native FD、mmap、描述符转移或二级 clone 的即时撤权。
+
+## Checkpoint 共享存储接入
+
+Platform 的 `adx-checkpoint-storage` 用普通文件接口访问 DFS 挂载，不依赖 AFS RPC crate。
+adxlet 直接捕获到共享目录，恢复时把该目录交给 sandboxd；不会先下载整个 checkpoint。
+Coordinator 挂载同一 namespace，统一管理共享文件的回收；节点仅管理执行文件访问。
+匿名恢复点跟随 Environment，可复用 Snapshot 使用中删除返回 Sandbox 列表。
+运行时文件依赖与挂载的实际验证边界见[存储流程](../testing/snapshot-storage.md)。
+
+## DFS 历史与数据块回收
+
+NodeReplicated DFS 的回收由 Meta 判定可达性、AFS Node 删除本机块。Platform Coordinator
+仍负责匿名 checkpoint／Snapshot 的共享目录生命周期；AFS 的回收只处理目录删除后失去引用的
+inode、FileVersion、LayoutRoot 与数据块，两层职责不混用。
+
+- 有链接的 inode 当前版本是保留根。打开的文件／目录使用持久引用；文件的在途访问共享同一引用，
+  最后一个使用者退出才排队释放。有效写租约、尚未提交的上传与复制任务也构成保留根。
+- 最后一个写句柄关闭后，即使数据已提交且序号相同，也后台提交剩余元数据；提交结果未确认时保留
+  原请求和写租约，确认干净后停止续租，避免已 unlink 文件因时间戳脏状态永久保留历史。
+- COW 目标布局直接引用共享 chunk；源文件删除不改变目标的所有权。`parent_version` 仅记录血缘，
+  不作为永久保留历史的理由。打开的 inode 保守保留全部版本，关闭后再回收历史。
+- 新引用的创建请求带固定的 30 秒准入期限，重放不刷新期限；Meta 最多接受 60 秒的剩余期限，
+  容纳时钟差。期限只限制创建请求，已打开文件和长上传的保护不受它限制。
+  对尚未出现的引用释放也必须持久化墓碑，防止释放先到、创建后到；墓碑保护期结束后，
+  原创建请求已过期，不能重新激活引用。
+- 正常关闭先提交释放，默认再等待 60 秒，覆盖已签发的 30 秒读取授权。心跳超时不释放引用。
+  同一 Node 的新 session 接管后，旧 session 引用最早在旧授权截止时间加 60 秒后失效。
+- Meta 先持久化带代次的删除批次和待确认 Node 列表，再删除不可达元数据；该批次中的 chunk
+  在所有相关 Node 确认前禁止重新发布。同内容重新上传需等屏障完成。
+- Node 删除块和校验旁文件，持久化 catalog 检查点及已完成代次后应答；重启或应答丢失重试不重复
+  删除新上传的同内容块。catalog WAL 随检查点截断。Node 清单还会发现无主上传残留。
+
+每批最多 1024 个 chunk，Node 每 5 秒推进，引用释放每次最多 64 个。不可达 Node 会保守阻塞
+当前物理删除批次，不以心跳失联推定磁盘已清空。DFS 外部对象持久化模式目前不启用本机块回收；
+其对象删除需要独立的外部存储回收合同，不能直接套用 NodeReplicated 协议。
+
+## Meta 保留窗口与 Watch 重新同步
+
+Meta 沿用 canonical log 的有限历史策略：默认幂等结果最长保留 24 小时，Watch 历史最长保留
+1 小时，条数与字节预算可提前触发清理。配置使用 `meta_request_retention_ms`、
+`meta_watch_retention_ms`、`meta_watch_events_max` 等平坦字段，具体默认与恢复合同见
+[部署说明](../deployment/afs.md#meta-操作日志有限策略)。清理决定经日志持久化后发布，Watch 按完整
+revision 截断；快照 GC 的读视图和相关键 CAS 保留 canonical 的期限与容量检查。
+
+旧 Watch 游标得到 Compacted 与恢复游标。RootCommand 调用自动从同一份只读视图取得
+当前 session 的待处理命令和 revision，随后从该 revision 增量跟进；历史截断不会丢掉
+仍待执行的撤销命令。`GET /v1/store` 提供实体数量、结果／事件数量、水位和 GC 屏障进度，
+用于观测收敛，管理端口应限制在受信网络。
 
 ## 后置能力
 

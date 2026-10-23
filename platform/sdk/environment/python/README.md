@@ -141,7 +141,7 @@ There are three deliberately different checkpoint paths:
 
 | Path | Public SDK API | Artifact and placement | When to use it |
 | --- | --- | --- | --- |
-| Reusable Snapshot | `create_snapshot()` then `Environment.create()` | New Environment identity; shared storage allows fresh placement, local-only pins the source node. | Independent clones from a prepared source. |
+| Reusable Snapshot | `create_snapshot()` then `Environment.create()` | New Environment identity; shared storage prefers the source node with eligible-node fallback, local-only pins it. | Independent clones from a prepared source. |
 | Pause / resume | `pause()` then `resume()` | Same Environment ID; Coordinator first tries the owner, then schedules a compatible node after definitive resource rejection or owner loss. | Stop and resume one logical environment. |
 | Failure recovery | `failover=True` | Same Environment and node; restores the latest unexpired checkpoint after unexpected backend exit. | Workloads that must recover execution state rather than cold-start. |
 | Explicit reload | `reload()` | Same Environment; replaces a Running backend from its latest unexpired checkpoint. | Operator-requested reset to a known recovery point. |
@@ -212,7 +212,11 @@ clone = Environment.create(
 )
 ```
 
-The new Coordinator inherits omitted image/runtime/scalar resources and validates explicit values against the source geometry. It does not resize a restored VM. Environment overrides and placement constraints are carried into the new Environment; local-only snapshots require the source node. Shared snapshots use normal scheduling. The source briefly pauses during snapshot creation and resumes before success. A reusable snapshot is not consumed by cloning; deletion blocks new references and waits for existing references to be released. See [storage and cloning](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/docs/testing/snapshot-storage.md).
+The Coordinator inherits omitted image/runtime/scalar resources and validates explicit values against the source geometry. It does not resize a restored VM. Environment overrides and placement constraints are carried into the new Environment; local-only snapshots require the source node.
+
+For S3, AFS and JuiceFS snapshots, omitting placement constraints automatically adds a soft preference for the snapshot's source node, including selection of its scheduling shard. This can reuse a node-local cache, but does not guarantee a cache hit. If the source is unavailable, lacks resources or fails a hard constraint, another eligible node can restore from shared storage without waiting for the source. Explicit placement policies take precedence over this default. Snapshot-based creates use Coordinator scheduling even when the API Server enables `local_first`; no extra SDK argument is required. Concurrent creates retain independent identities and reservations, while retries of one identity reuse its assignment.
+
+The source briefly pauses during snapshot creation and resumes before success. A reusable snapshot is not consumed by cloning; deletion returns `SNAPSHOT_IN_USE` while references remain. See [storage and cloning](../../../../docs/testing/snapshot-storage.md).
 
 Later dual-clone FC runs exposed a network failure, tracked in the [investigation](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/docs/testing/2026-09-16-fc-clone-network.md); successful earlier batches do not close that issue.
 
@@ -385,6 +389,17 @@ failures with an uncertain write result surface the same fields on
 `EnvironmentError`. Other malformed typed-result
 shapes can instead surface `ValueError` or `TypeError` while values are
 converted, or `RuntimeError` when resume `portMappings` is not an object.
+A confirmed cancellation before assignment returns
+`DEADLINE_EXCEEDED / never / not_started`; the SDK makes no additional attempt
+or backoff after that response. `error.scheduling_failure` contains placement
+rejection counts, requested resources, and worker capacity/available maxima
+when the server supplies them. Maxima are per dimension and may describe
+different workers; diagnostics describe the current snapshot, not future
+capacity after scaling. A deliberate new create call can start a new queue wait.
+Unconfirmed runtime/transport results retain the same-operation retry policy.
+After retries, a complete service failure remains `EnvironmentHTTPError` with
+its status, payload and metadata; it is not labeled as a connection failure.
+
 `reload()` translates `EnvironmentError` into `False`; it does not normalize those
 other programming/shape exceptions.
 
@@ -446,8 +461,13 @@ writable-layer enforcement.
 ## Rootfs and mounts
 
 `rootfs=S3Config(...)` starts from an S3-compatible EROFS root filesystem.
-`Mount` supports image-backed read-only bind mounts and S3-backed bind or EROFS
-mounts. Credentials are sent to the control plane and sandboxd; callers should
+`Mount` supports image-backed read-only bind mounts, S3-backed bind or EROFS
+mounts, and Local bind mounts through `host_path`. Local mounts accept `options`
+(`ro` by default, or `rw`, plus `nosuid`/`nodev`/`noexec`) and `create_if_missing`
+for leaf-directory creation. Optional `create_options=CreateOptions(uid=10001, gid=10001, mode="0700")` requires `create_if_missing=True` and sets ownership/permissions only for newly created directories; existing directories remain unchanged. IDs must be integers from 0 to 4294967294; mode is a four-digit octal string from `0000` to `0777`. Import `CreateOptions` from `adx_environment`. The shared filesystem must already be mounted in
+the worker runtime namespace. For example, an SFS/MooseFS user workspace uses
+`Mount(target="/home/jiuwen", host_path="/home/agentos/users/user-1",
+options=("rw",), create_if_missing=True)`. Credentials are sent to the control plane and sandboxd; callers should
 use scoped object-store credentials. EXECD is still supplied by the deployment's
 local runtime environment, so a custom rootfs does not need to bake in ADX.
 
@@ -473,6 +493,21 @@ passing `None` clears it. Adxlet reserves the EXECD control port and declared
 published ports with the highest rule priority so a user default-deny policy
 cannot cut the control route. User priorities must be in `1..UINT32_MAX-1`.
 Enforcement is provided by sandboxd's network policy implementation.
+
+Reverse tunnels also retain their server-owned WS listener (default 8765;
+`upstream` HTTP port minus one). The HTTP proxy remains guest-loopback only.
+Tunnel ports cannot overlap the Execd control or published ports, and caller
+`EXECD_TUNNEL_*` environment overrides are rejected. With a traffic policy,
+reverse tunnels require stateful mode; stateless combinations are rejected at
+creation and replacement. After a successful policy update, an Environment
+that owns a tunnel actively retires its current WS transport. The existing
+reconnect loop retains the session and resumable requests while opening a fresh
+connection. Policy-update completion does not wait for tunnel readiness; retry
+application requests during recovery. Updates through another client or raw HTTP
+are detected by the existing application heartbeat (20-second interval and
+10-second pong timeout by default). Only tunnel ingress is protected, so its
+local source port does not authorize new outbound connections.
+
 
 ## Connection configuration
 
@@ -569,10 +604,84 @@ runnable SDK examples.
 
 See [`TODO.md`](TODO.md) for remaining SDK work.
 
+## File listing and concurrent transfers
+
+`files.list()` raises `FileNotFoundError`, `NotADirectoryError`, or `PermissionError`
+when Execd returns the corresponding typed filesystem error. The exception includes
+both the requested path and the original HTTP error. Other failures remain SDK errors.
+Traversal depth is bounded at 64 by Execd.
+
+Direct file uploads open the destination in place and truncate it before writing.
+Existing symlinks are followed, including links to a missing target. Overwriting
+retains the existing inode, ownership and hard-link identity, with normal OS
+write-permission checks and mode semantics. An interrupted upload may leave partial data; concurrent readers may observe empty or partial
+content and concurrent writers require application coordination.
+
+Each file download reads metadata and bytes from one opened descriptor. Full
+responses use chunked framing without a fixed Content-Length, so an in-place
+truncation can return fewer bytes with a valid ending chunk. A transfer interrupted
+before that chunk remains an error, allowing the SDK to retry or resume. Reads are
+bounded by the initial file size during concurrent appends. Range downloads retain their
+fixed-length resume contract and require a stable file; they do not provide a
+snapshot of a concurrently modified file. Downloads accept regular files only.
+
+## Native filename/path search
+
+```python
+matches = environment.files.search(
+    "/workspace", "*.py", exclude_patterns=["test_*", "*/.git/*"],
+    depth=64, max_results=1000, max_entries=100000, timeout_ms=10000,
+)
+for entry in matches:
+    print(entry.path)
+```
+
+This invokes Execd's `file.search` action in the Environment. Traversal and matching
+run in Execd; the SDK receives matching `EntryInfo` values in full-path order and
+does not fetch the directory tree to filter locally. Search matches names/paths,
+not file contents. Case-sensitive globs support `*`, `?`, `[abc]`, `[a-z]`, and
+`[!abc]`; `*` can match separators and leading dots. Braces and backslashes are
+literal, unmatched `[` is literal, and invalid character ranges are rejected.
+Both the basename and full path are tested. Exclusions filter results, so excluding
+a directory's basename alone does not exclude its descendants. Descendant directory
+symlinks are never followed. Missing roots and non-directory roots return `[]`;
+permission/I/O failures remain errors.
+
+| Parameter | Default | Allowed range |
+| --- | --- | --- |
+| `depth` | 64 | 1–64 listing levels, including the root listing |
+| `max_results` | 1000 | 1–10000 matches |
+| `max_entries` | 100000 | 1–1000000 inspected entries |
+| `timeout_ms` | 10000 | 1–30000 ms, checked between filesystem operations |
+
+`path` is a nonempty string of at most 4096 UTF-8 bytes. Patterns are at most 1024
+UTF-8 bytes, with at most 64 exclusion patterns. A conservative 4 MiB response
+budget also bounds result metadata. Exceeding a match/scan/response budget returns
+HTTP 429 with `error_code=RESOURCE_EXHAUSTED`; deadline expiry returns HTTP 408
+with `error_code=DEADLINE_EXCEEDED`. Invalid parameters/patterns return HTTP 400
+with `error_code=INVALID_ARGUMENT`. Errors carry an empty `entries` array and never
+masquerade as successful partial results. SDK callers receive `EnvironmentHTTPError`
+and can inspect `error.payload["error_code"]`. Filesystem errors retain their
+`FILE_NOT_FOUND`, `PERMISSION_DENIED`, `NOT_A_DIRECTORY` or `FILESYSTEM_ERROR` code.
+
+The HTTP contract is `POST /invoke` with
+`{"action":"file.search","args":{"path":"/workspace","pattern":"*.py"}}`.
+Success contains `entries`, `scanned_entries`, and `error:null`. Use an Execd build
+that implements this action together with the matching SDK; unsupported runtimes
+fail explicitly.
+
 ## Recover a background command
 
 Background commands run without an execution deadline by default. Pass
 `timeout` to set one explicitly; foreground commands default to 60 seconds.
+
+Command output is bounded. The API Server supplies defaults of 4 MiB per stdout/stderr
+stream. Operators can configure `ADX_EXECD_COMMAND_STDOUT_LIMIT_BYTES` and
+`ADX_EXECD_COMMAND_STDERR_LIMIT_BYTES` on the API Server; these override request
+Environment variables. `CommandResult.truncated`, `stdout_truncated`, and
+`stderr_truncated` indicate retained prefixes. To retrieve larger output reliably,
+redirect it to a file and download that file. Increasing the stream limits retains
+the independent command-registry memory budget.
 
 The SDK process does not persist command handles. Generate a command ID and
 persist the `(environment_id, command_id)` pair in the caller's own database before
@@ -620,3 +729,20 @@ optional `weight` and `preferredPriority`. `node_id` remains a hard requirement
 when combined with alternatives. See [placement rules](https://gitcode.com/openJiuwen/agent-dx/blob/refactor/docs/testing/http-node-placement.md)
 for the matching, ranking and label contracts. Caller-provided option lists are
 copied before the SDK adds a node constraint.
+
+
+## Tool execution identity
+
+`Environment(image="tools:v1", runtime="conch", user="1001", group="1002")`
+selects the POSIX identity used to launch Execd. Commands, native file operations,
+and files created on Local/MooseFS mounts use that identity. Supply both fields
+as POSIX names or decimal IDs; Conch resolves names on the worker. The shared
+filesystem must already grant that UID/GID access; ADX does not recursively chown
+mounted data. Omitted fields preserve the runtime deployment's identity.
+
+This override currently requires Conch and `python3` in the guest template's PATH
+for its native privilege-drop wrapper. Other runtime backends reject it. It
+cannot be combined with `inherit_entrypoint=True` or a snapshot identity override;
+image entrypoint `process.user` retains its separate meaning. Use matching API
+Server, Coordinator, adxlet, and SDK versions so the typed identity is preserved
+across the complete create path. Unknown account resolution fails creation.

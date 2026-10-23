@@ -14,10 +14,9 @@ Agent 的 `CreateEnvironment`/`ExecutionSpec` 在本 crate 的 `environment_requ
 | --- | --- | --- |
 | `templates/publish` | tenant、template | 发布不可变版本 |
 | `templates/get` | tenant、name、version | 查询模板 |
-| `bindings/prepare` | scope、launch、parameters? | 准备不可变启动配置和挂载参数，不创建 Sandbox |
 | `bindings/get` | scope | 查询产品元数据 |
 | `bindings/list` | tenant、template、version、page_size?、page_token? | 有界分页查询产品元数据，不访问 Environment |
-| `bindings/activate` | scope、expected_generation?、bypasscache? | 热命中续期返回 AgentBinding 绑定；未命中或显式 bypass 时读取 Redis 并查询/创建 Environment |
+| `bindings/activate` | scope、expected_generation?、bypasscache?、parameters? | 热命中续期返回 AgentBinding 绑定；未命中或显式 bypass 时读取 Redis 并查询/创建 Environment |
 | `bindings/delete` | scope | 平台确认删除或明确返回 NotFound 后条件清理元数据 |
 
 仅可信服务可传入租户 scope；公网租户认证在 Gateway 完成。端点不持有用户流量，不限制 HTTP/WS/SSH 并发。`x-adx-deadline-ms` 传递入口绝对期限，创建 Environment 时以剩余期限限制 API Server HTTP 等待。API Server 当前不接受此绝对期限：`createTimeoutSeconds` 使用固定配置，使相同创建操作的重试请求体保持一致；后端可能继续运行到自己的期限。参与调用的主机需要同步时钟。写入响应超时不表示拒绝，调用方复用原身份查询或重试。
@@ -60,14 +59,14 @@ cargo test --locked -p adx-activator --lib binding_cache_memory_profile -- --ign
 
 - 创建：`POST /api/environment/v1/environments`，将 `adx-<generation>` 拆为 namespace/name，保留镜像、隔离 runtime、资源、业务 env、模板 service 端口、渲染后的 mounts、模板 lifecycle、`init_timeout_seconds`、`readiness_probe` 和 `inheritEntrypoint=true`，并附加配置的 `sandbox_network` 策略。模板 readiness 支持 HTTP、TCP 或 exec 单动作，Activator 映射为公共 Environment 的 `readinessProbe`；runtime profile 由 API Server 注入。显式启动覆盖与保留环境变量在提交前拒绝。
 - 查询：`GET /api/instances?instance_id=<id>`，检查单条记录的 ID，Running 才标记 ready。没有返回的 runtime ID 不合成；404 表示当前不可见，不能确认已删除。
-- 删除：`DELETE /api/environment/v1/environments/<id>`，API Server 确认成功返回 Deleted；明确 HTTP 404 返回 NotFound，Activator 对这两种结果均按 generation 条件清理绑定与私有启动配置。断连、超时或不完整响应保留 OutcomeUnknown，不清理绑定。
+- 删除：`DELETE /api/environment/v1/environments/<id>`，API Server 确认成功返回 Deleted；明确 HTTP 404 返回 NotFound，Activator 对这两种结果均按 generation 条件清理 Binding 及其 parameters。断连、超时或不完整响应保留 OutcomeUnknown，不清理绑定。
 - 创建/删除使用由动作、tenant 和 Environment ID 确定的 `X-Request-Id`；同一组 Activator 副本须使用一致的创建规格、`sandbox_network` 与 `request_timeout_seconds`，未完成操作期间改变请求体会被 API Server 的幂等校验拒绝。禁止重定向及自动重放。HTTP 400/409 映射 Invalid/Conflict，查询 403 映射 NotFound；创建/删除 403 和所有 401 表示上游鉴权不可用，不触发删除收尾。读响应丢失为 Unavailable，写响应丢失为 OutcomeUnknown。
 
 旧配置中的 `ADX_ENVIRONMENT_SERVICE_TOKEN` 已移除；Activator 使用 API Server 管理地址与 `environment_api_key_envs`。Ingress 不再提供 `/api/environment/v2/instances`。
 
 ## 模板沙箱网络隔离
 
-独立 Activator 的配置必须提供 `sandbox_network`；嵌入式模式在 `ADX_AGENT_CONFIG` 的 `embedded.sandbox_network` 使用同一结构。所有经模板创建的新 Environment 统一使用该策略，模板和用户启动环境变量不能覆盖它。直接调用 Environment API 的其他场景不受此配置影响；已有 Environment 不更新。
+独立 Activator 的配置必须提供 `sandbox_network`；嵌入式模式在 `ADX_AGENT_CONFIG` 的 `embedded.sandbox_network` 使用同一结构。缺省情况下，所有经模板创建的新 Environment 统一使用该策略。部署者可通过 `runtime_policies` 为指定 runtime 作出显式选择，模板和用户启动环境变量不能覆盖它。直接调用 Environment API 的其他场景不受此配置影响；已有 Environment 不更新。
 
 ```json
 {
@@ -90,8 +89,12 @@ cargo test --locked -p adx-activator --lib binding_cache_memory_profile -- --ign
 
 本地测试覆盖规则优先级、公网与内网区分、模型/DNS 端口例外、错误配置、HTTP/同进程映射及 API Server 规格转换。这些测试不覆盖外部网络设施或业务服务的连通性。
 
+`runtime_policies` 是可选的 runtime 名称到策略的映射：`deployment`（也是未配置 runtime 的缺省行为）使用上述严格 ACL；`unrestricted` 不向 Environment 请求写入 ADX 网络过滤策略，原生运行时部署策略仍然生效。例如，部署者显式设置 `"runtime_policies":{"supervisor":"unrestricted"}`，可运行使用原生网络策略的 supervisor Agent，而其他 runtime 保持严格 ACL。此选项会放弃该 runtime 的 ADX 沙箱间/内网过滤；它不保证与上述隔离语义等价。仅在部署者明确接受此网络边界时启用，且不得把管理凭据交给最终用户。ADX 不会根据 backend 拒绝自动改用 unrestricted。配置仍整体校验；修改策略不会更新已有 Environment，未完成创建也须遵循同一身份/规格的幂等约束。
+
 当前 sandboxd ACL 后端仅支持 IPv4。`sandbox_network` 的地址池、内部地址段和服务例外均须使用 IPv4 CIDR；启动校验拒绝 IPv6 配置，公网放行也仅生成 IPv4 规则。
 
 ## 休眠实例的解析
 
 模板 lifecycle 的空闲窗口、pause retention/timeout/storage 映射到 `idleTimeoutSeconds`、`idleAction`、`pauseOptions`；默认策略不额外写入请求字段。生命周期状态只作为 Platform 观察值，不持久化到 AgentBinding。暂停相关状态返回稳定 Target，ready 仍为 false；真正的鉴权业务流由 Gateway EnsureRunning 唤醒。该行为对热缓存、冷缓存及 bypass 一致，不增加 Agent 自己的恢复控制器。配置与边界见 [自动暂停与按需恢复](../README.md#自动暂停与按需恢复)。
+
+激活请求的 parameters 为原始 URL 表单字节，由共享激活流程仅在 Binding 缺失时解析。已有 Binding 完全忽略输入；并发创建复用成功落库的参数。Template.env 与 mounts.host_path 使用持久化参数渲染。参数当前明文存储，无独立 prepare 或模型专用 launch 配置。

@@ -65,6 +65,11 @@ pub struct SchedulingStats {
     pub query_preparations: u64,
     pub attempts: u64,
 }
+pub(crate) enum Attempt {
+    Assigned(Assignment, EnvironmentSpec),
+    Deferred(Entry),
+    Empty,
+}
 pub(crate) struct ShardScheduler {
     nodes: BTreeMap<String, NodeState>,
     queue: TenantQueue,
@@ -125,6 +130,44 @@ impl ShardScheduler {
             );
         }
     }
+    pub fn diagnose(
+        &self,
+        spec: &EnvironmentSpec,
+        snapshot: &Snapshot,
+        failure: &mut adx_core::scheduling::SchedulingFailure,
+    ) -> Result<()> {
+        let prepared = Prepared::new(spec, snapshot);
+        for state in self.nodes.values() {
+            failure.node_count += 1;
+            let available = state.scalar.available();
+            for (max, value) in [
+                (&mut failure.max_capacity, state.scalar.capacity()),
+                (&mut failure.max_available, available),
+            ] {
+                max.cpu_millis = max.cpu_millis.max(value.cpu_millis);
+                max.memory_bytes = max.memory_bytes.max(value.memory_bytes);
+                max.disk_bytes = max.disk_bytes.max(value.disk_bytes);
+            }
+            let reasons = self.framework.rejections(
+                spec,
+                &Candidate {
+                    node: &state.node,
+                    available,
+                    devices: &state.free_devices,
+                    snapshot,
+                    prepared: Some(&prepared),
+                },
+            )?;
+            if reasons.is_empty() {
+                failure.eligible_nodes += 1;
+            }
+            for reason in reasons {
+                *failure.rejections.entry(reason).or_default() += 1;
+            }
+        }
+        Ok(())
+    }
+
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
@@ -236,6 +279,9 @@ impl ShardScheduler {
         Ok(())
     }
     pub fn enqueue(&mut self, request: EnvironmentSpec) {
+        self.enqueue_entry(Entry::new(0, request));
+    }
+    pub fn enqueue_entry(&mut self, mut entry: Entry) {
         // Start the next sweep before adding new work to an exhausted one.
         // Deferred tickets must participate in priority/FIFO ordering.
         self.begin_round();
@@ -249,7 +295,10 @@ impl ShardScheduler {
             self.deferred_arrivals = true;
             &mut self.deferred
         };
-        queue.restore(Entry::new(self.sequence, request));
+        // A transferred request keeps its original queue deadline, but takes
+        // a sequence from this shard so it cannot overwrite a queued ticket.
+        entry.sequence = self.sequence;
+        queue.restore(entry);
         self.sequence = self
             .sequence
             .checked_add(1)
@@ -257,6 +306,52 @@ impl ShardScheduler {
     }
     pub(crate) fn pending_requests(&self) -> impl Iterator<Item = &Entry> {
         self.queue.entries().chain(self.deferred.entries())
+    }
+    pub fn defer(&mut self, entry: Entry) {
+        self.deferred.restore(entry);
+    }
+    pub fn exclusions(&self, id: &str) -> BTreeSet<String> {
+        self.excluded.get(id).cloned().unwrap_or_default()
+    }
+    pub fn accept_transfer(&mut self, entry: Entry, excluded: BTreeSet<String>) {
+        if !excluded.is_empty() {
+            self.excluded.insert(entry.spec.id.clone(), excluded);
+        }
+        self.enqueue_entry(entry);
+    }
+    /// Inspect an eligible candidate without reserving it. Used for Snapshot
+    /// shard selection and rechecked by the owning shard at assignment time.
+    pub fn best_candidate(
+        &mut self,
+        request: &EnvironmentSpec,
+        snapshot: &Snapshot,
+        excluded: &BTreeSet<String>,
+    ) -> Result<Option<(u64, String)>> {
+        self.stats.query_preparations += 1;
+        let prepared = Prepared::new(request, snapshot);
+        let mut best: Option<(u64, String)> = None;
+        for state in self.nodes.values() {
+            if excluded.contains(&state.node.id) {
+                continue;
+            }
+            self.stats.candidate_evaluations += 1;
+            let candidate = Candidate {
+                node: &state.node,
+                available: state.scalar.available(),
+                devices: &state.free_devices,
+                snapshot,
+                prepared: Some(&prepared),
+            };
+            if let Some(score) = self.framework.evaluate(request, &candidate)? {
+                if best
+                    .as_ref()
+                    .is_none_or(|(old, id)| score > *old || (score == *old && state.node.id < *id))
+                {
+                    best = Some((score, state.node.id.clone()));
+                }
+            }
+        }
+        Ok(best)
     }
     fn select(
         &mut self,
@@ -268,34 +363,9 @@ impl ShardScheduler {
         if config.candidate_cache_entries == 0
             || !self.framework.supports_aggregation(request, snapshot)
         {
-            self.stats.query_preparations += 1;
-            let prepared = Prepared::new(request, snapshot);
-            let mut best: Option<(u64, String)> = None;
-            for state in self.nodes.values() {
-                if self
-                    .excluded
-                    .get(&request.id)
-                    .is_some_and(|ids| ids.contains(&state.node.id))
-                {
-                    continue;
-                }
-                self.stats.candidate_evaluations += 1;
-                let candidate = Candidate {
-                    node: &state.node,
-                    available: state.scalar.available(),
-                    devices: &state.free_devices,
-                    snapshot,
-                    prepared: Some(&prepared),
-                };
-                if let Some(score) = self.framework.evaluate(request, &candidate)? {
-                    if best.as_ref().is_none_or(|(old, id)| {
-                        score > *old || (score == *old && state.node.id < *id)
-                    }) {
-                        best = Some((score, state.node.id.clone()));
-                    }
-                }
-            }
-            return Ok(best.map(|(_, id)| id));
+            return Ok(self
+                .best_candidate(request, snapshot, &self.exclusions(&request.id))?
+                .map(|(_, id)| id));
         }
         let key = Signature::from(request);
         let updates = if let Some(cached) = self.cache.get(&key) {
@@ -367,9 +437,9 @@ impl ShardScheduler {
         snapshot: &Snapshot,
         journal: &MutationJournal,
         config: &SchedulerConfig,
-    ) -> Result<Option<(Assignment, EnvironmentSpec)>> {
+    ) -> Result<Attempt> {
         let Some(entry) = self.queue.pop_entry() else {
-            return Ok(None);
+            return Ok(Attempt::Empty);
         };
         self.stats.attempts += 1;
         let best = match self.select(&entry.spec, snapshot, journal, config) {
@@ -380,8 +450,7 @@ impl ShardScheduler {
             }
         };
         let Some(node_id) = best else {
-            self.deferred.restore(entry);
-            return Ok(None);
+            return Ok(Attempt::Deferred(entry));
         };
         let state = self.nodes.get_mut(&node_id).expect("selected node exists");
         let r = &entry.spec;
@@ -415,7 +484,7 @@ impl ShardScheduler {
             devices,
         };
         self.assigned.insert(r.id.clone(), assignment.clone());
-        Ok(Some((assignment, entry.spec)))
+        Ok(Attempt::Assigned(assignment, entry.spec))
     }
     pub fn retry(&mut self, assignment: &Assignment, spec: EnvironmentSpec) -> Result<()> {
         let mut excluded = self

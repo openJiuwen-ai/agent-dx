@@ -432,8 +432,6 @@ fn replica_header_digest(
         || header.initiator_node_epoch == 0
         || header.placement_revision == 0
         || header.placement_epoch == 0
-        || header.content_digest_algorithm
-            != afs_protocol::node_data::DfsDigestAlgorithm::Blake3 as i32
     {
         return Err(replica_denied("replica header identity or size is invalid"));
     }
@@ -443,7 +441,7 @@ fn replica_header_digest(
         .try_into()
         .map_err(|_| replica_denied("replica digest length is invalid"))?;
     Ok(crate::dfs::ContentDigest {
-        algorithm: crate::dfs::DigestAlgorithm::Blake3,
+        algorithm: super::peer::domain_data_digest(header.content_digest_algorithm)?,
         bytes,
     })
 }
@@ -462,7 +460,7 @@ fn wire_replica_ack(ack: crate::dfs::ReplicaAck) -> DfsReplicaAck {
         catalog_revision: ack.catalog_revision,
         persisted_bytes: ack.persisted_bytes,
         verified_digest: ack.verified_digest.bytes.to_vec(),
-        verified_digest_algorithm: afs_protocol::node_data::DfsDigestAlgorithm::Blake3 as i32,
+        verified_digest_algorithm: super::peer::wire_data_digest(ack.verified_digest.algorithm),
     }
 }
 
@@ -894,10 +892,18 @@ impl DfsChunks for DfsChunksService {
                     "replica stream length differs from header",
                 ));
             }
-            let staged = crate::node::chunk::StagedChunk::new(
+            let expected = crate::dfs::ChunkObject {
+                id: crate::dfs::ChunkId::new(header.chunk_id.clone()),
+                length: header.chunk_length,
+                content_digest: digest.clone(),
+                encoding: crate::dfs::ChunkEncoding::Raw,
+            };
+            let staged = crate::node::chunk::StagedChunk::from_replica(
                 crate::dfs::OperationId::new(header.operation_id),
+                &expected,
                 bytes,
-            );
+            )
+            .map_err(error_to_status)?;
             if staged.chunk.id.0 != header.chunk_id || staged.chunk.content_digest != digest {
                 return Err(Status::invalid_argument(
                     "replica content differs from immutable identity",
@@ -1013,10 +1019,17 @@ impl DfsChunks for DfsChunksService {
                                 )
                             })?
                     };
-                    let staged = crate::node::chunk::StagedChunk::new(
+                    let expected = crate::dfs::ChunkObject {
+                        id: crate::dfs::ChunkId::new(header.chunk_id.clone()),
+                        length: header.chunk_length,
+                        content_digest: digest.clone(),
+                        encoding: crate::dfs::ChunkEncoding::Raw,
+                    };
+                    let staged = crate::node::chunk::StagedChunk::from_replica(
                         crate::dfs::OperationId::new(header.operation_id),
+                        &expected,
                         bytes,
-                    );
+                    )?;
                     if staged.chunk.id.0 != header.chunk_id || staged.chunk.content_digest != digest
                     {
                         return Err(afs_error::Error::coded(
@@ -1527,6 +1540,68 @@ fn stream_dfs_ranges_until(
         let diagnostic =
             local.read_diagnostic(crate::node::read_work::ReadDiagnosticStage::PeerServe);
         let diagnostic_token = diagnostic.as_ref().map(|span| span.token());
+        if let Some(table) = local
+            .peer_crc32c_table(&crate::dfs::ChunkId::new(op.chunk_id.clone()))
+            .map_err(error_to_status)?
+        {
+            let verified = local
+                .read_peer_range_until(
+                    &crate::dfs::ChunkId::new(op.chunk_id.clone()),
+                    op.chunk_offset,
+                    usize::try_from(op.length)
+                        .map_err(|_| Status::invalid_argument("CRC range too large"))?,
+                    admission_deadline,
+                )
+                .map_err(error_to_status)?;
+            if verified.len() as u64 != op.length {
+                return Err(Status::data_loss("CRC range ended early"));
+            }
+            // Exact grants never disclose prefix/suffix bytes of a covering
+            // storage segment. read_peer_range verified those segments first.
+            let checksum = crate::node::chunk_crc32c::checksum(verified.as_slice());
+            let descriptor =
+                serde_json::to_vec(&table).map_err(|error| Status::internal(error.to_string()))?;
+            validate_dfs_read_request(request)?;
+            local.ensure_peer_serve_open().map_err(error_to_status)?;
+            send(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
+                read_id: request.read_id.clone(),
+                attempt_id: request.attempt_id.clone(),
+                operation_index: op.operation_index,
+                chunk_id: op.chunk_id.clone(),
+                chunk_offset: op.chunk_offset,
+                length: op.length,
+                source_copy_id: op.source_copy_id.clone(),
+                blake3_outboard: Default::default(),
+                crc32c_table: descriptor,
+            }))?;
+            let body = verified.into_shared_bytes();
+            for start in (0..body.len()).step_by(DFS_REPLICA_FRAME_BYTES) {
+                validate_dfs_read_request(request)?;
+                local.ensure_peer_serve_open().map_err(error_to_status)?;
+                let data = body.slice(start..(start + DFS_REPLICA_FRAME_BYTES).min(body.len()));
+                if let Some(metrics) = metrics {
+                    metrics.record("grpc", "send", "read", data.len() as u64);
+                }
+                send(dfs_read_ranges_frame::Body::Data(data))?;
+            }
+            send(dfs_read_ranges_frame::Body::Completion(
+                DfsReadRangesCompletion {
+                    crc32c_table: Default::default(),
+                    read_id: request.read_id.clone(),
+                    attempt_id: request.attempt_id.clone(),
+                    operation_index: op.operation_index,
+                    source_copy_id: op.source_copy_id.clone(),
+                    transferred_bytes: op.length,
+                    range_checksum: checksum.to_le_bytes().to_vec(),
+                    range_checksum_algorithm: afs_protocol::node_data::DfsDigestAlgorithm::Crc32c
+                        as i32,
+                },
+            ))?;
+            if let Some(diagnostic) = diagnostic {
+                diagnostic.finish(true);
+            }
+            continue;
+        }
         // Sidecars bind every streamed coverage group to the catalog's
         // standard root. There is no whole-object body allocation or pre-scan.
         // Legacy, partial and proof-capacity fallbacks retain the path below.
@@ -1552,6 +1627,7 @@ fn stream_dfs_ranges_until(
             check_caller().map_err(error_to_status)?;
             local.ensure_peer_serve_open().map_err(error_to_status)?;
             send(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
+                crc32c_table: Default::default(),
                 read_id: request.read_id.clone(),
                 attempt_id: request.attempt_id.clone(),
                 operation_index: op.operation_index,
@@ -1585,6 +1661,7 @@ fn stream_dfs_ranges_until(
             // installing it; a partial prefix is never an object publication.
             send(dfs_read_ranges_frame::Body::Completion(
                 DfsReadRangesCompletion {
+                    crc32c_table: Default::default(),
                     read_id: request.read_id.clone(),
                     attempt_id: request.attempt_id.clone(),
                     operation_index: op.operation_index,
@@ -1638,6 +1715,7 @@ fn stream_dfs_ranges_until(
         validate_dfs_read_request(request)?;
         local.ensure_peer_serve_open().map_err(error_to_status)?;
         send(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
+            crc32c_table: Default::default(),
             read_id: request.read_id.clone(),
             attempt_id: request.attempt_id.clone(),
             operation_index: op.operation_index,
@@ -1678,6 +1756,7 @@ fn stream_dfs_ranges_until(
         }
         send(dfs_read_ranges_frame::Body::Completion(
             DfsReadRangesCompletion {
+                crc32c_table: Default::default(),
                 read_id: request.read_id.clone(),
                 attempt_id: request.attempt_id.clone(),
                 operation_index: op.operation_index,
@@ -4217,14 +4296,33 @@ fn read_packed_dfs_ranges(
                 "immutable Chunk ended before RDMA range",
             ));
         }
+        let table = local
+            .peer_crc32c_table(&crate::dfs::ChunkId::new(op.chunk_id.clone()))
+            .map_err(error_to_status)?;
+        let (checksum, algorithm, descriptor) = if let Some(table) = table {
+            (
+                crate::node::chunk_crc32c::checksum(range)
+                    .to_le_bytes()
+                    .to_vec(),
+                afs_protocol::node_data::DfsDigestAlgorithm::Crc32c as i32,
+                serde_json::to_vec(&table).map_err(|error| Status::internal(error.to_string()))?,
+            )
+        } else {
+            (
+                blake3::hash(range).as_bytes().to_vec(),
+                afs_protocol::node_data::DfsDigestAlgorithm::Blake3 as i32,
+                Vec::new(),
+            )
+        };
         completions.push(DfsReadRangesCompletion {
+            crc32c_table: descriptor,
             read_id: request.read_id.clone(),
             attempt_id: request.attempt_id.clone(),
             operation_index: op.operation_index,
             source_copy_id: op.source_copy_id.clone(),
             transferred_bytes: op.length,
-            range_checksum: blake3::hash(range).as_bytes().to_vec(),
-            range_checksum_algorithm: afs_protocol::node_data::DfsDigestAlgorithm::Blake3 as i32,
+            range_checksum: checksum,
+            range_checksum_algorithm: algorithm,
         });
     }
     Ok(PackedDfsRead {
@@ -4275,6 +4373,7 @@ mod tests {
             "A must not copy proof metadata into the header"
         );
         let header = DfsReadRangesHeader {
+            crc32c_table: Default::default(),
             read_id: "read".into(),
             attempt_id: "attempt".into(),
             operation_index: 3,
@@ -5364,8 +5463,7 @@ mod tests {
         use crate::dfs::*;
         use crate::meta::store::{
             MetaEntity, MetaStore, MetaTxn, NodeSessionLease, OperationResult, RequestKey,
-            RequestOutcome, Store, StoreOperation, TxnCondition, TxnMutation,
-            memory::MemoryBackend,
+            RequestOutcome, Store, StoreOperation, TxnCondition, TxnMutation, journal::MemoryLog,
         };
         use crate::node::chunk::StagedChunk;
 
@@ -5408,7 +5506,7 @@ mod tests {
         };
 
         let store: Arc<dyn MetaStore> = Arc::new(
-            Store::open(Arc::new(MemoryBackend::default()))
+            Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
                 .await
                 .unwrap(),
         );
@@ -5487,17 +5585,15 @@ mod tests {
         ]);
         store.compare_and_commit(txn).await.unwrap();
 
-        let meta = Arc::new(crate::meta::Meta {
-            id: "meta-grpc-unknown".into(),
-            observability: crate::runtime::Observability::new().unwrap(),
-            store: Some(store.clone()),
-            owner_roots: Arc::new(crate::meta::owner_roots::StoreOwnerRootAuthority::new(
-                store.clone(),
-            )),
-            dfs: Some(dfs),
-            trusted_nodes_by_der: Arc::new(std::collections::HashMap::new()),
-            enforce_peer_identity: false,
-        });
+        let mut meta = crate::meta::Meta::with_store(
+            "meta-grpc-unknown".into(),
+            crate::runtime::Observability::new().unwrap(),
+            store.clone(),
+        );
+        // Preserve the failure-injecting DFS authority rather than replacing
+        // it with the constructor's ordinary service.
+        meta.dfs = Some(dfs);
+        let meta = Arc::new(meta);
         let meta_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let meta_endpoint = format!("http://{}", meta_listener.local_addr().unwrap());
         let delay_layer = DelayFirstMetaReplyLayer::new(std::time::Duration::from_secs(2));
@@ -5976,8 +6072,7 @@ mod tests {
         use crate::dfs::*;
         use crate::meta::store::{
             MetaEntity, MetaStore, MetaTxn, NodeSessionLease, OperationResult, RequestKey,
-            RequestOutcome, Store, StoreOperation, TxnCondition, TxnMutation,
-            memory::MemoryBackend,
+            RequestOutcome, Store, StoreOperation, TxnCondition, TxnMutation, journal::MemoryLog,
         };
         use crate::node::chunk::StagedChunk;
         let temp = tempfile::tempdir().unwrap();
@@ -5986,7 +6081,7 @@ mod tests {
         local.put(staged.clone()).unwrap();
         let device = local.device_descriptor().unwrap();
         let store = Arc::new(
-            Store::open(Arc::new(MemoryBackend::default()))
+            Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
                 .await
                 .unwrap(),
         );

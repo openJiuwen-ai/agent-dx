@@ -1751,7 +1751,7 @@
           "id": "joinByField",
           "options": {
             "byField": "node_key",
-            "mode": "outerTabular"
+            "mode": "outer"
           }
         },
         {

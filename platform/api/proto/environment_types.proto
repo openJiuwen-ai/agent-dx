@@ -74,12 +74,18 @@ message StorageSource {
 }
 
 message RootfsSpec { bool readonly = 1; StorageSource source = 2; }
+message MountCreateOptions {
+  uint32 uid = 1;
+  uint32 gid = 2;
+  string mode = 3;
+}
 message MountSpec {
   string type = 1;
   string target = 2;
   repeated string options = 3;
   StorageSource source = 4;
   bool create_if_missing = 5;
+  MountCreateOptions create_options = 6;
 }
 
 enum NetworkAction { NETWORK_ACTION_UNSPECIFIED = 0; NETWORK_ACTION_ALLOW = 1; NETWORK_ACTION_DENY = 2; }
@@ -147,6 +153,10 @@ message ExecutionOptions {
   uint64 init_timeout_seconds = 12;
   // Execd creates this constructor directory before reporting Ready.
   optional string cwd = 13;
+  optional uint32 tunnel_http_port = 14;
+  // Paired runtime identity; unsupported backends reject rather than ignore it.
+  optional string user = 15;
+  optional string group = 16;
 }
 
 enum IdleAction { IDLE_ACTION_DELETE = 0; IDLE_ACTION_PAUSE = 1; }
@@ -195,6 +205,8 @@ message EnvironmentRecord {
   bool resources_held = 6;
   reserved 7;
   RestorePoint checkpoint = 8;
+  repeated CheckpointArtifact execution_artifacts = 13;
+  RestorePoint snapshot_source = 14;
   CompletedOperation last_operation = 9;
   uint32 restart_attempts = 10;
   bool restart_pending = 11;

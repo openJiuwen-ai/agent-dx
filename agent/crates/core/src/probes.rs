@@ -1,4 +1,4 @@
-//! Workload readiness configured by an immutable Agent template.
+//! Workload probes configured by an immutable Agent template.
 use crate::ValidationResult;
 use serde::{Deserialize, Serialize};
 
@@ -118,5 +118,27 @@ impl ReadinessProbe {
             }
             _ => Ok(()),
         }
+    }
+}
+
+/// Periodic workload health check evaluated by Platform, never by Activator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Healthcheck {
+    #[serde(flatten)]
+    pub probe: ReadinessProbe,
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: u32,
+}
+const fn default_failure_threshold() -> u32 {
+    3
+}
+impl Healthcheck {
+    pub fn validate(&self) -> ValidationResult {
+        self.probe.validate()?;
+        if self.failure_threshold == 0 {
+            return Err("healthcheck failure_threshold must be positive".into());
+        }
+        Ok(())
     }
 }

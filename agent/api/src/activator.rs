@@ -17,17 +17,6 @@ use std::{
 /// Product operations shared by the independent HTTP client and embedded Activator.
 #[async_trait]
 pub trait Control: Send + Sync {
-    async fn prepare_binding(
-        &self,
-        _ctx: &RequestContext,
-        _scope: &Scope,
-        _launch: &adx_agent_core::launch::LaunchConfig,
-        _parameters: &adx_agent_core::mounts::Parameters,
-    ) -> Result<AgentBinding> {
-        Err(Error::Unsupported(
-            "private binding preparation unavailable".into(),
-        ))
-    }
     async fn publish(
         &self,
         ctx: &RequestContext,
@@ -59,6 +48,21 @@ pub trait Control: Send + Sync {
         expected_generation: Option<&str>,
         bypass_cache: bool,
     ) -> Result<Target>;
+    /// Initialize only a missing Binding. Existing bindings ignore the raw input.
+    async fn activate_with_parameters(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        expected_generation: Option<&str>,
+        bypass_cache: bool,
+        parameters: Option<&[u8]>,
+    ) -> Result<Target> {
+        if parameters.is_some() {
+            return Err(Error::Unsupported("binding parameters unavailable".into()));
+        }
+        self.activate_with_cache(ctx, scope, expected_generation, bypass_cache)
+            .await
+    }
 }
 
 pub struct ActivatorClient {
@@ -244,26 +248,6 @@ impl ActivatorClient {
 
 #[async_trait]
 impl Control for ActivatorClient {
-    async fn prepare_binding(
-        &self,
-        ctx: &RequestContext,
-        scope: &Scope,
-        launch: &adx_agent_core::launch::LaunchConfig,
-        parameters: &adx_agent_core::mounts::Parameters,
-    ) -> Result<AgentBinding> {
-        self.request(
-            ctx,
-            "bindings/prepare",
-            &PrepareBindingRequest {
-                scope: scope.clone(),
-                launch: launch.clone(),
-                parameters: parameters.clone(),
-            },
-            true,
-            Some(scope),
-        )
-        .await
-    }
     async fn publish(
         &self,
         ctx: &RequestContext,
@@ -311,6 +295,24 @@ impl Control for ActivatorClient {
     ) -> Result<Target> {
         ActivatorClient::activate_with_cache(self, ctx, scope, expected_generation, bypass_cache)
             .await
+    }
+    async fn activate_with_parameters(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        expected_generation: Option<&str>,
+        bypass_cache: bool,
+        parameters: Option<&[u8]>,
+    ) -> Result<Target> {
+        ActivatorClient::activate_with_parameters(
+            self,
+            ctx,
+            scope,
+            expected_generation,
+            bypass_cache,
+            parameters,
+        )
+        .await
     }
 }
 pub(crate) fn uncertain(writes: bool, message: &str) -> Error {
@@ -407,6 +409,17 @@ impl ActivatorClient {
         expected_generation: Option<&str>,
         bypass_cache: bool,
     ) -> Result<Target> {
+        self.activate_with_parameters(ctx, scope, expected_generation, bypass_cache, None)
+            .await
+    }
+    pub async fn activate_with_parameters(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        expected_generation: Option<&str>,
+        bypass_cache: bool,
+        parameters: Option<&[u8]>,
+    ) -> Result<Target> {
         self.request(
             ctx,
             "bindings/activate",
@@ -414,6 +427,7 @@ impl ActivatorClient {
                 scope: scope.clone(),
                 expected_generation: expected_generation.map(str::to_owned),
                 bypass_cache,
+                parameters: parameters.map(<[u8]>::to_vec),
             },
             true,
             Some(scope),

@@ -29,6 +29,8 @@ impl CheckpointArtifact {
 }
 
 impl CheckpointCleanup {
+    // An incomplete capture may have size zero; deletion still needs its identity.
+    // RestorePoint validation separately rejects incomplete captures.
     pub fn validate(&self) -> crate::Result<()> {
         if self.assignment.environment_id.is_empty()
             || self.assignment.node_id.is_empty()
@@ -39,7 +41,7 @@ impl CheckpointCleanup {
             || self
                 .artifacts
                 .iter()
-                .any(|a| a.storage.is_empty() || a.location.is_empty() || a.size_bytes == 0)
+                .any(|a| a.storage.is_empty() || a.location.is_empty())
         {
             return Err(crate::Error::Invalid(
                 "invalid checkpoint cleanup intent".into(),

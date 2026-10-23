@@ -6,10 +6,9 @@ use afs::{
     config::{Cli, Config, Role},
     runtime::{self, BoxError, Observability},
 };
-use clap::Parser;
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-    let cfg = Config::resolve(Role::Meta, Cli::parse())?;
+    let cfg = Config::resolve(Role::Meta, Cli::parse_process())?;
     if cfg.print_config {
         println!("{}", serde_json::to_string_pretty(&cfg)?);
         return Ok(());

@@ -83,6 +83,8 @@ class ObsClient:
             artifact.write_bytes(b"platform")
             output = root / "manifest.json"
             env = dict(os.environ)
+            env.pop("ADX_OBS_BUCKET", None)
+            env.pop("ADX_OBS_ENDPOINT", None)
             env.update(
                 {
                     "PYTHONPATH": str(root),
@@ -110,7 +112,13 @@ class ObsClient:
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(output.read_text())["artifacts"][0]["name"], artifact.name)
+            manifest = json.loads(output.read_text())
+            self.assertEqual(manifest["artifacts"][0]["name"], artifact.name)
+            self.assertEqual(manifest["bucket"], "agent-dx")
+            self.assertTrue(manifest["manifest_url"].startswith(
+                "https://agent-dx.obs.cn-southwest-2.myhuaweicloud.com/adx/daily/"
+            ))
+            self.assertIn(manifest["artifacts"][0]["url"], result.stdout)
 
     def test_daily_upload_uses_adx_namespace_and_publishes_verified_manifest(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -126,7 +134,7 @@ class ObsClient:
                 client=client,
                 files=[package, checksum],
                 output=output,
-                bucket="openyuanrong",
+                bucket="agent-dx",
                 endpoint="obs.example.test",
                 channel="daily",
                 version=None,
@@ -151,7 +159,7 @@ class ObsClient:
             self.assertNotIn("source", manifest["artifacts"][0])
             self.assertNotIn(str(root), output.read_text())
             self.assertEqual(json.loads(output.read_text()), manifest)
-            self.assertIn(("openyuanrong", prefix + "manifest.json"), client.objects)
+            self.assertIn(("agent-dx", prefix + "manifest.json"), client.objects)
             self.assertTrue(client.closed)
 
     def test_release_requires_version_and_uses_immutable_version_path(self):

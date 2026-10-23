@@ -172,3 +172,11 @@ fn template_readiness_probe_is_typed_and_validated() {
         assert!(template.validate().is_err());
     }
 }
+
+#[test]
+fn healthcheck_rejects_zero_failure_threshold() {
+    let mut wire = template();
+    wire["healthcheck"] = json!({"tcp_socket":{"port":18092},"failure_threshold":0});
+    let template: TemplateVersion = serde_json::from_value(wire).unwrap();
+    assert!(template.validate().is_err());
+}

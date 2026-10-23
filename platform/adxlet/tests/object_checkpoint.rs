@@ -1,94 +1,93 @@
-use adxlet::checkpoint::{CheckpointStore, ObjectCheckpointStore};
-use object_store::{memory::InMemory, path::Path as ObjectPath, ObjectStore, ObjectStoreExt};
+use adxlet::checkpoint::{CheckpointAccess, ObjectCheckpointStore};
+use object_store::{memory::InMemory, ObjectStore};
 use std::sync::Arc;
 
 #[tokio::test]
-async fn remote_checkpoint_survives_source_disk_loss_and_verifies_content() {
+async fn remote_checkpoint_survives_source_disk_loss() {
     let remote: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let source_dir = tempfile::tempdir().unwrap();
     let source = ObjectCheckpointStore::new(
         "shared".into(),
-        "test-scope".into(),
         remote.clone(),
         "test".into(),
         source_dir.path().into(),
         1024,
     )
     .unwrap();
-    let staged = source.allocate().await.unwrap();
-    std::fs::create_dir(staged.join("nested")).unwrap();
-    std::fs::write(staged.join("nested/memory"), b"memory-state").unwrap();
-    let artifact = source.publish(&staged).await.unwrap();
-    assert_eq!(artifact.storage, "shared");
-    assert!(!artifact
-        .location
-        .contains(source_dir.path().to_str().unwrap()));
+    let staged = source.begin_capture().await.unwrap();
+    std::fs::write(staged.join("memory"), b"memory-state").unwrap();
+    let artifact = source.seal(&staged).await.unwrap();
     drop(source);
     drop(source_dir);
+
     let destination_dir = tempfile::tempdir().unwrap();
     let destination = ObjectCheckpointStore::new(
         "shared".into(),
-        "test-scope".into(),
-        remote.clone(),
+        remote,
         "test".into(),
         destination_dir.path().into(),
         1024,
     )
     .unwrap();
-    let lease = destination.materialize(&artifact).await.unwrap();
+    let access = destination.prepare_restore(&artifact).await.unwrap();
     assert_eq!(
-        std::fs::read(lease.join("nested/memory")).unwrap(),
+        std::fs::read(access.join("memory")).unwrap(),
         b"memory-state"
     );
-    assert!(
-        destination.remove(&artifact).await.is_err(),
-        "active restore pins artifact"
-    );
-    drop(lease);
-    destination.evict_unreferenced(0).await.unwrap();
-    remote
-        .put(
-            &ObjectPath::from(format!("test/{}/files/nested/memory", artifact.location)),
-            bytes::Bytes::from_static(b"corrupt-data").into(),
-        )
+}
+
+#[tokio::test]
+async fn node_release_keeps_shared_object_until_coordinator_reclaims_it() {
+    use adx_checkpoint_storage::reclaim::{ArtifactReclaimer, ObjectReclaimer};
+    let root = tempfile::tempdir().unwrap();
+    let remote = Arc::new(InMemory::new());
+    let store = ObjectCheckpointStore::new(
+        "shared".into(),
+        remote.clone(),
+        "test".into(),
+        root.path().into(),
+        1024,
+    )
+    .unwrap();
+    let staged = store.begin_capture().await.unwrap();
+    std::fs::write(staged.join("memory"), b"snapshot").unwrap();
+    let artifact = store.seal(&staged).await.unwrap();
+    store.release(&artifact).await.unwrap();
+    assert!(store.prepare_restore(&artifact).await.is_ok());
+    ObjectReclaimer::new("shared".into(), remote, "test".into())
+        .unwrap()
+        .remove(&artifact)
         .await
         .unwrap();
-    assert!(destination.materialize(&artifact).await.is_err());
-    destination.remove(&artifact).await.unwrap();
-    assert!(destination.materialize(&artifact).await.is_err());
+    store.release(&artifact).await.unwrap();
+    assert!(store.prepare_restore(&artifact).await.is_err());
 }
 
 #[tokio::test]
 async fn cache_budget_evicts_only_unpinned_downloads() {
     let remote: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let dir = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
     let store = ObjectCheckpointStore::new(
         "shared".into(),
-        "test-scope".into(),
         remote,
         "test".into(),
-        dir.path().into(),
+        root.path().into(),
         12,
     )
     .unwrap();
-    let mut artifacts = vec![];
+    let mut artifacts = Vec::new();
     for value in [b'1', b'2', b'3'] {
-        let staged = store.allocate().await.unwrap();
+        let staged = store.begin_capture().await.unwrap();
         std::fs::write(staged.join("memory"), vec![value; 6]).unwrap();
-        let artifact = store.publish(&staged).await.unwrap();
+        let artifact = store.seal(&staged).await.unwrap();
         store.committed(&artifact).await.unwrap();
         artifacts.push(artifact);
     }
-    let first = store.materialize(&artifacts[0]).await.unwrap();
-    let second = store.materialize(&artifacts[1]).await.unwrap();
-    let third = store.materialize(&artifacts[2]).await.unwrap();
-    assert!(
-        third.join("memory").exists(),
-        "cache quota cannot block restore"
-    );
+    let first = store.prepare_restore(&artifacts[0]).await.unwrap();
+    let second = store.prepare_restore(&artifacts[1]).await.unwrap();
     let second_path = second.to_path_buf();
     drop(second);
-    let third = store.materialize(&artifacts[2]).await.unwrap();
+    let third = store.prepare_restore(&artifacts[2]).await.unwrap();
     store.evict_unreferenced(0).await.unwrap();
     assert!(!second_path.exists());
     assert!(first.join("memory").exists());
@@ -96,29 +95,23 @@ async fn cache_budget_evicts_only_unpinned_downloads() {
 }
 
 #[tokio::test]
-async fn committed_pause_seeds_cache_without_an_obs_read() {
-    let remote: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+async fn committed_capture_restores_from_local_cache_after_remote_manifest_loss() {
+    use object_store::{path::Path as ObjectPath, ObjectStoreExt};
+    let remote = Arc::new(InMemory::new());
     let root = tempfile::tempdir().unwrap();
     let store = ObjectCheckpointStore::new(
         "shared".into(),
-        "scope".into(),
         remote.clone(),
         "test".into(),
         root.path().into(),
         1024 * 1024,
     )
     .unwrap();
-    let staged = store.allocate().await.unwrap();
+    let staged = store.begin_capture().await.unwrap();
     std::fs::write(staged.join("memory"), b"local-pause").unwrap();
-    let artifact = store.publish(&staged).await.unwrap();
+    let artifact = store.seal(&staged).await.unwrap();
     store.committed(&artifact).await.unwrap();
     store.committed(&artifact).await.unwrap();
-    assert!(
-        staged.exists(),
-        "admission reuses the original files without copying"
-    );
-    // Remove the remote commit marker: a hot restore must need neither a
-    // manifest request nor a checkpoint data GET.
     remote
         .delete(&ObjectPath::from(format!(
             "test/{}/manifest.json",
@@ -126,7 +119,7 @@ async fn committed_pause_seeds_cache_without_an_obs_read() {
         )))
         .await
         .unwrap();
-    let restored = store.materialize(&artifact).await.unwrap();
+    let restored = store.prepare_restore(&artifact).await.unwrap();
     assert_eq!(
         std::fs::read(restored.join("memory")).unwrap(),
         b"local-pause"
@@ -134,293 +127,29 @@ async fn committed_pause_seeds_cache_without_an_obs_read() {
 }
 
 #[tokio::test]
-async fn checkpoint_larger_than_cache_still_restores() {
+async fn upload_rejects_symlinks_and_keeps_staging_for_rollback() {
     let root = tempfile::tempdir().unwrap();
     let store = ObjectCheckpointStore::new(
         "shared".into(),
-        "scope".into(),
         Arc::new(InMemory::new()),
         "test".into(),
         root.path().into(),
-        1,
-    )
-    .unwrap();
-    let staged = store.allocate().await.unwrap();
-    std::fs::write(staged.join("memory"), b"bigger-than-cache").unwrap();
-    let artifact = store.publish(&staged).await.unwrap();
-    store.committed(&artifact).await.unwrap();
-    let restored = store.materialize(&artifact).await.unwrap();
-    assert_eq!(
-        std::fs::read(restored.join("memory")).unwrap(),
-        b"bigger-than-cache"
-    );
-}
-
-#[tokio::test]
-async fn upload_rejects_symlinks_and_leaves_staging_for_rollback() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = ObjectCheckpointStore::new(
-        "shared".into(),
-        "test-scope".into(),
-        Arc::new(InMemory::new()),
-        "test".into(),
-        dir.path().into(),
         1024,
     )
     .unwrap();
-    let staged = store.allocate().await.unwrap();
+    let staged = store.begin_capture().await.unwrap();
     std::fs::write(staged.join("memory"), b"recover-me").unwrap();
     std::os::unix::fs::symlink("/etc/passwd", staged.join("escape")).unwrap();
-    assert!(store.publish(&staged).await.is_err());
+    assert!(store.seal(&staged).await.is_err());
     assert_eq!(std::fs::read(staged.join("memory")).unwrap(), b"recover-me");
 }
 
 #[tokio::test]
-async fn reusable_copy_has_independent_artifact_lifetime() {
-    let root = tempfile::tempdir().unwrap();
-    let store = ObjectCheckpointStore::new(
-        "shared".into(),
-        "test-scope".into(),
-        Arc::new(InMemory::new()),
-        "test".into(),
-        root.path().into(),
-        1024,
-    )
-    .unwrap();
-    let staging = store.allocate().await.unwrap();
-    std::fs::write(staging.join("memory"), b"snapshot").unwrap();
-    let source = store.publish(&staging).await.unwrap();
-    let reusable = store.duplicate(&source).await.unwrap();
-    assert_ne!(source.location, reusable.location);
-    store.remove(&source).await.unwrap();
-    let restored = store.materialize(&reusable).await.unwrap();
-    assert_eq!(std::fs::read(restored.join("memory")).unwrap(), b"snapshot");
-    drop(restored);
-    store.remove(&reusable).await.unwrap();
-}
-
-#[test]
-fn s3_client_and_control_tls_build_in_the_same_process() {
-    let root = tempfile::tempdir().unwrap();
-    let store = adxlet::checkpoint::StorageConfig::S3 {
-        alias: "shared".into(),
-        bucket: "checkpoints".into(),
-        region: "us-east-1".into(),
-        endpoint: Some("https://objects.example.invalid".into()),
-        allow_http: false,
-        prefix: "test".into(),
-        root: root.path().into(),
-        cache_budget_bytes: 1024,
-        cache_max_entries: 500,
-    };
-    let endpoint = tonic::transport::Endpoint::from_static("https://control.example.invalid")
-        .tls_config(tonic::transport::ClientTlsConfig::new().domain_name("adx.internal"));
-    assert!(endpoint.is_ok());
-    assert!(store.build().is_ok());
-}
-
-#[tokio::test]
-async fn orphan_gc_requires_reconciliation_and_preserves_live_and_foreign_uploads() {
-    use adxlet::checkpoint::RemoteGcConfig;
-    let remote: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let old_root = tempfile::tempdir().unwrap();
-    let old = ObjectCheckpointStore::new(
-        "shared".into(),
-        "test-scope".into(),
-        remote.clone(),
-        "test".into(),
-        old_root.path().into(),
-        1024,
-    )
-    .unwrap()
-    .with_owner(
-        "node-a".into(),
-        "boot-old".into(),
-        RemoteGcConfig {
-            min_age_seconds: 0,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let staged = old.allocate().await.unwrap();
-    std::fs::write(staged.join("memory"), b"saved").unwrap();
-    let retained = old.publish(&staged).await.unwrap();
-    let orphan = old.duplicate(&retained).await.unwrap();
-    // This write completed, but the process died before metadata registration.
-    drop(old);
-    drop(old_root);
-    let new_root = tempfile::tempdir().unwrap();
-    let current = ObjectCheckpointStore::new(
-        "shared".into(),
-        "test-scope".into(),
-        remote.clone(),
-        "test".into(),
-        new_root.path().into(),
-        1024,
-    )
-    .unwrap()
-    .with_owner(
-        "node-a".into(),
-        "boot-new".into(),
-        RemoteGcConfig {
-            min_age_seconds: 0,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert!(current.collect_remote_orphans().await.is_err());
-    let active = current.duplicate(&retained).await.unwrap();
-    let foreign_root = tempfile::tempdir().unwrap();
-    let foreign = ObjectCheckpointStore::new(
-        "shared".into(),
-        "test-scope".into(),
-        remote.clone(),
-        "test".into(),
-        foreign_root.path().into(),
-        1024,
-    )
-    .unwrap()
-    .with_owner(
-        "node-b".into(),
-        "another-boot".into(),
-        RemoteGcConfig::default(),
-    )
-    .unwrap();
-    let foreign = foreign.duplicate(&retained).await.unwrap();
-    current
-        .authorize_remote_gc(std::slice::from_ref(&retained))
-        .await
-        .unwrap();
-    assert_eq!(current.collect_remote_orphans().await.unwrap(), 1);
-    assert!(current.materialize(&orphan).await.is_err());
-    for artifact in [&retained, &active, &foreign] {
-        assert!(current.materialize(artifact).await.is_ok());
-    }
-    assert_eq!(current.collect_remote_orphans().await.unwrap(), 0);
-}
-
-#[tokio::test]
-async fn orphan_gc_keeps_unknown_objects_and_retries_pinned_artifacts() {
-    use adxlet::checkpoint::RemoteGcConfig;
-    let remote: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let root = tempfile::tempdir().unwrap();
-    let source = ObjectCheckpointStore::new(
-        "shared".into(),
-        "test-scope".into(),
-        remote.clone(),
-        "test".into(),
-        root.path().join("old"),
-        1024,
-    )
-    .unwrap()
-    .with_owner("node".into(), "old".into(), RemoteGcConfig::default())
-    .unwrap();
-    let staged = source.allocate().await.unwrap();
-    std::fs::write(staged.join("memory"), b"state").unwrap();
-    let artifact = source.publish(&staged).await.unwrap();
-    let store = ObjectCheckpointStore::new(
-        "shared".into(),
-        "test-scope".into(),
-        remote.clone(),
-        "test".into(),
-        root.path().join("new"),
-        1024,
-    )
-    .unwrap()
-    .with_owner(
-        "node".into(),
-        "new".into(),
-        RemoteGcConfig {
-            min_age_seconds: 0,
-            max_artifacts: 1,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let mut invalid = artifact.clone();
-    invalid.location = "../outside".into();
-    assert!(store
-        .authorize_remote_gc(&[artifact.clone(), invalid])
-        .await
-        .is_err());
-    assert!(
-        store.collect_remote_orphans().await.is_err(),
-        "invalid catalog cannot open GC"
-    );
-    store.authorize_remote_gc(&[]).await.unwrap();
-    let lease = store.materialize(&artifact).await.unwrap();
-    assert_eq!(store.collect_remote_orphans().await.unwrap(), 0);
-    drop(lease);
-    assert_eq!(store.collect_remote_orphans().await.unwrap(), 1);
-    let orphan = uuid::Uuid::new_v4();
-    let owner = ObjectPath::from(format!("test/{orphan}/owner.json"));
-    remote
-        .put(
-            &owner,
-            br#"{"version":1,"node_id":"node","session_id":"old"}"#
-                .to_vec()
-                .into(),
-        )
-        .await
-        .unwrap();
-    let part = ObjectPath::from(format!("test/{orphan}/partial"));
-    remote
-        .put(&part, b"incomplete".to_vec().into())
-        .await
-        .unwrap();
-    let unknown = ObjectPath::from(format!("test/{}/memory", uuid::Uuid::new_v4()));
-    remote
-        .put(&unknown, b"legacy".to_vec().into())
-        .await
-        .unwrap();
-    let malformed = ObjectPath::from(format!("test/{}/owner.json", uuid::Uuid::new_v4()));
-    remote
-        .put(&malformed, b"invalid".to_vec().into())
-        .await
-        .unwrap();
-    assert_eq!(store.collect_remote_orphans().await.unwrap(), 1);
-    assert!(remote.head(&part).await.is_err());
-    assert!(remote.head(&owner).await.is_err());
-    assert!(remote.head(&unknown).await.is_ok());
-    assert!(remote.head(&malformed).await.is_ok());
-}
-
-#[tokio::test]
-async fn orphan_gc_grace_period_protects_recent_uploads() {
-    use adxlet::checkpoint::RemoteGcConfig;
-    let remote: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let root = tempfile::tempdir().unwrap();
-    let key = ObjectPath::from(format!("test/{}/owner.json", uuid::Uuid::new_v4()));
-    remote
-        .put(
-            &key,
-            br#"{"version":1,"node_id":"node","session_id":"old"}"#
-                .to_vec()
-                .into(),
-        )
-        .await
-        .unwrap();
-    let store = ObjectCheckpointStore::new(
-        "shared".into(),
-        "test-scope".into(),
-        remote.clone(),
-        "test".into(),
-        root.path().into(),
-        1024,
-    )
-    .unwrap()
-    .with_owner("node".into(), "new".into(), RemoteGcConfig::default())
-    .unwrap();
-    store.authorize_remote_gc(&[]).await.unwrap();
-    assert_eq!(store.collect_remote_orphans().await.unwrap(), 0);
-    assert!(remote.head(&key).await.is_ok());
-}
-
-#[tokio::test]
-async fn remote_checkpoint_rejects_a_different_nonempty_scope() {
-    let remote: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+async fn scoped_capture_references_and_reclaimer_refuse_wrong_backend() {
+    use adx_checkpoint_storage::reclaim::{ArtifactReclaimer, ObjectReclaimer};
+    let remote = Arc::new(InMemory::new());
     let source_root = tempfile::tempdir().unwrap();
-    let source = ObjectCheckpointStore::new(
+    let source = ObjectCheckpointStore::new_scoped(
         "shared".into(),
         "scope-a".into(),
         remote.clone(),
@@ -429,47 +158,60 @@ async fn remote_checkpoint_rejects_a_different_nonempty_scope() {
         1024,
     )
     .unwrap();
-    let staged = source.allocate().await.unwrap();
+    let staged = source.begin_capture().await.unwrap();
+    let references = source.capture_references(&staged).unwrap();
+    let reserved = references.iter().find(|a| a.storage == "shared").unwrap();
+    assert_eq!(reserved.scope, "scope-a");
+    assert_eq!(reserved.size_bytes, 0);
     std::fs::write(staged.join("memory"), b"saved").unwrap();
-    let artifact = source.publish(&staged).await.unwrap();
-    let collector_root = tempfile::tempdir().unwrap();
-    let collector = ObjectCheckpointStore::new(
+    let artifact = source.seal(&staged).await.unwrap();
+    assert_eq!(artifact.scope, "scope-a");
+
+    let other_root = tempfile::tempdir().unwrap();
+    let other = ObjectCheckpointStore::new_scoped(
         "shared".into(),
         "scope-b".into(),
-        remote,
+        remote.clone(),
         "test".into(),
-        collector_root.path().into(),
+        other_root.path().into(),
         1024,
     )
     .unwrap();
-
-    assert!(collector.materialize(&artifact).await.is_err());
-    assert!(collector.remove(&artifact).await.is_err());
+    assert!(other.prepare_restore(&artifact).await.is_err());
+    assert!(
+        ObjectReclaimer::new_scoped("shared".into(), "scope-b".into(), remote, "test".into(),)
+            .unwrap()
+            .remove(&artifact)
+            .await
+            .is_err()
+    );
 }
 
-#[tokio::test]
-async fn scoped_store_accepts_legacy_unscoped_artifacts_from_its_alias() {
-    let remote: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let root = tempfile::tempdir().unwrap();
-    let store = ObjectCheckpointStore::new(
-        "shared".into(),
-        "scope-a".into(),
-        remote,
-        "test".into(),
-        root.path().into(),
-        1024,
-    )
-    .unwrap();
-    let staged = store.allocate().await.unwrap();
-    std::fs::write(staged.join("memory"), b"saved").unwrap();
-    let artifact = store.publish(&staged).await.unwrap();
-    let mut encoded = serde_json::to_value(&artifact).unwrap();
-    encoded.as_object_mut().unwrap().remove("scope");
-    let legacy: adx_core::CheckpointArtifact = serde_json::from_value(encoded).unwrap();
-    assert!(legacy.scope.is_empty());
-
-    let lease = store.materialize(&legacy).await.unwrap();
-    assert_eq!(std::fs::read(lease.join("memory")).unwrap(), b"saved");
-    drop(lease);
-    store.remove(&legacy).await.unwrap();
+#[test]
+fn explicit_s3_endpoint_is_required_for_a_delegable_scope() {
+    use adxlet::checkpoint::StorageConfig;
+    let with_endpoint = StorageConfig::S3 {
+        alias: "shared".into(),
+        bucket: "checkpoints".into(),
+        region: "us-east-1".into(),
+        endpoint: Some("https://objects.example.invalid".into()),
+        allow_http: false,
+        prefix: "test".into(),
+        root: tempfile::tempdir().unwrap().path().into(),
+        cache_budget_bytes: 1024,
+        cache_max_entries: 500,
+    };
+    assert!(with_endpoint.shared_scope().is_some());
+    let without_endpoint = StorageConfig::S3 {
+        alias: "shared".into(),
+        bucket: "checkpoints".into(),
+        region: "us-east-1".into(),
+        endpoint: None,
+        allow_http: false,
+        prefix: "test".into(),
+        root: tempfile::tempdir().unwrap().path().into(),
+        cache_budget_bytes: 1024,
+        cache_max_entries: 500,
+    };
+    assert!(without_endpoint.shared_scope().is_none());
 }

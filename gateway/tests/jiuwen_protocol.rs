@@ -1,6 +1,6 @@
 #![cfg(feature = "agent-api")]
 
-use data_plane_gateway::ingress::jiuwen::protocol::{Request, MAX_FRAME_BYTES};
+use data_plane_gateway::ingress::digitalmategateway::protocol::{Request, MAX_FRAME_BYTES};
 use serde_json::{json, Value};
 
 fn request(method: &str, params: Value) -> Request {

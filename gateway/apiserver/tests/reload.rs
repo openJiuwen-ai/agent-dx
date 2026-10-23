@@ -154,6 +154,8 @@ impl Fixture {
         let address = listener.local_addr().unwrap().to_string();
         let owner = pb::GetEnvironmentResponse {
             record: Some(pb::EnvironmentRecord {
+                execution_artifacts: vec![],
+                snapshot_source: None,
                 failure: None,
                 spec: Some(pb::EnvironmentSpec {
                     compatibility: None,

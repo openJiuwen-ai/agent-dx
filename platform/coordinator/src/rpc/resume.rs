@@ -214,7 +214,7 @@ impl CoordinatorRpc {
                         let alias = stored
                             .result
                             .as_ref()
-                            .and_then(|r| r.checkpoint.as_ref())
+                            .and_then(|r| r.checkpoint.as_ref().or(r.snapshot_source.as_ref()))
                             .ok_or_else(|| {
                                 Status::failed_precondition("resume checkpoint missing")
                             })?
@@ -386,7 +386,7 @@ impl CoordinatorRpc {
                     if rejected
                         .result
                         .as_ref()
-                        .and_then(|r| r.checkpoint.as_ref())
+                        .and_then(|r| r.checkpoint.as_ref().or(r.snapshot_source.as_ref()))
                         .is_some_and(|cp| cp.artifact.storage == "local")
                     {
                         return Err(error);

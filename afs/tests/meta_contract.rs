@@ -2,15 +2,19 @@ use afs::dfs::{
     ChunkId, ContentDigest, DigestAlgorithm, LocalCopyPolicy, OperationId, ReplicationConfig,
     ValidateReplicaWriteRequest,
 };
+use afs::meta::store::{
+    journal::{LogLimits, LogTip, RecoveredLog},
+    log::Record,
+};
 use afs::{
     meta::{
         Meta,
         dfs::DfsService,
         rpc,
         store::{
-            MetaEntity, MetaRead, MetaStore, OperationResult, RequestKey,
-            RootRight as StoreRootRight, Store, StoreBackend, StoreOperation,
-            local_file::LocalFileBackend, memory::MemoryBackend,
+            MetaEntity, MetaLog, MetaRead, MetaStore, OperationResult, RequestKey,
+            RootRight as StoreRootRight, Store, StoreOperation, journal::MemoryLog,
+            local_log::LocalLog,
         },
     },
     runtime::Observability,
@@ -72,9 +76,9 @@ async fn lock_resolver_fixture(
 ) {
     use afs::dfs::{InodeAttributes, InodeId, NamespaceId};
     let backend = Arc::new(LostCommitResultBackend::new(Arc::new(
-        MemoryBackend::default(),
+        MemoryLog::new(Default::default()).unwrap(),
     )));
-    let store = Arc::new(Store::open(backend.clone()).await.unwrap());
+    let store = Arc::new(Store::open_log(backend.clone()).await.unwrap());
     let dfs = DfsService::new(store.clone());
     let (_, lease) = dfs
         .create(afs::meta::dfs::CreateFileRequest {
@@ -335,8 +339,8 @@ async fn dfs_write_authority_lost_acquire_result_replays_after_store_reopen() {
     assert_eq!(error.code(), afs_error::IO_UNAVAILABLE);
     let (commits_after_lost_result, native_version, native_digest) = backend.observed_commit();
 
-    let reopened_backend: Arc<dyn StoreBackend> = backend.clone();
-    let reopened_store = Arc::new(Store::open(reopened_backend).await.unwrap());
+    let reopened_backend: Arc<dyn MetaLog> = backend.clone();
+    let reopened_store = Arc::new(Store::open_log(reopened_backend).await.unwrap());
     let reopened = DfsService::new(reopened_store.clone());
     let (_, replay) = reopened
         .resolve_write_authority(
@@ -826,8 +830,8 @@ async fn dfs_renewal_cannot_resurrect_expired_or_reassigned_authority() {
 #[tokio::test]
 async fn node_rpc_store_local_file_recovers_committed_session_and_reply() {
     let dir = tempfile::tempdir().unwrap();
-    let backend = Arc::new(LocalFileBackend::open(dir.path()).unwrap());
-    let store = Arc::new(Store::open(backend.clone()).await.unwrap());
+    let backend = Arc::new(LocalLog::open(dir.path(), Default::default()).unwrap());
+    let store = Arc::new(Store::open_log(backend.clone()).await.unwrap());
     let meta = Arc::new(Meta::with_store(
         "meta-test".into(),
         Observability::new().unwrap(),
@@ -860,7 +864,7 @@ async fn node_rpc_store_local_file_recovers_committed_session_and_reply() {
     let reopened = Arc::new(Meta::with_store(
         "meta-restarted".into(),
         Observability::new().unwrap(),
-        Arc::new(Store::open(backend).await.unwrap()),
+        Arc::new(Store::open_log(backend).await.unwrap()),
     ));
     let found = rpc::MetaRpc(reopened.clone())
         .lookup_node(Request::new(LookupNodeRequest {
@@ -999,7 +1003,7 @@ async fn contract_rpc_does_not_issue_fake_grants_without_store() {
 #[tokio::test]
 async fn owner_authority_reserve_activate_acquire_validate_and_recover() {
     let store = Arc::new(
-        Store::open(Arc::new(MemoryBackend::default()))
+        Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
             .await
             .unwrap(),
     );
@@ -1293,7 +1297,7 @@ async fn owner_authority_reserve_activate_acquire_validate_and_recover() {
 #[tokio::test]
 async fn owner_authority_stale_abort_cannot_delete_new_pending_reservation() {
     let store = Arc::new(
-        Store::open(Arc::new(MemoryBackend::default()))
+        Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
             .await
             .unwrap(),
     );
@@ -1480,6 +1484,8 @@ fn owner_root_messages_keep_location_reservation_and_access_separate() {
 #[test]
 fn dfs_commit_keeps_file_layout_and_durable_chunk_receipt_explicit() {
     let commit = CommitFileVersionRequest {
+        gc_fence: None,
+        clone_source: None,
         caller_id: "node-a".into(),
         operation_id: "session-a-write-1".into(),
         inode_id: "inode:session-a-create-1".into(),
@@ -1548,7 +1554,7 @@ fn dfs_commit_keeps_file_layout_and_durable_chunk_receipt_explicit() {
 
 async fn n2b1_memory_owner_fixture() -> (Arc<Store>, rpc::MetaRpc, rpc::OwnerRootsRpc) {
     let store = Arc::new(
-        Store::open(Arc::new(MemoryBackend::default()))
+        Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
             .await
             .unwrap(),
     );
@@ -1629,7 +1635,7 @@ fn n2b1_events(
     }
 }
 
-async fn n2b1_wait_for_backend_release(backend: Weak<LocalFileBackend>) {
+async fn n2b1_wait_for_backend_release(backend: Weak<LocalLog>) {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     while backend.upgrade().is_some() {
         assert!(
@@ -1910,13 +1916,13 @@ async fn n2b1_ack_revocation_requires_exact_stored_command_before_writing_ack() 
 }
 
 #[tokio::test]
-async fn n2b1_local_file_reopens_legacy_root_command_and_preserves_exact_ack_replay() {
-    let source_dir = tempfile::tempdir().unwrap();
-    let source_backend = Arc::new(LocalFileBackend::open(source_dir.path()).unwrap());
-    let source_store = Arc::new(Store::open(source_backend.clone()).await.unwrap());
+async fn n2b1_local_file_reopens_canonical_root_command_and_preserves_exact_ack_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_backend = Arc::new(LocalLog::open(dir.path(), Default::default()).unwrap());
+    let source_store = Arc::new(Store::open_log(source_backend.clone()).await.unwrap());
     n2b1_seed_root_command(
         &source_store,
-        "seed-legacy",
+        "seed-first",
         "cmd-legacy",
         "node-a",
         "session-a",
@@ -1924,29 +1930,14 @@ async fn n2b1_local_file_reopens_legacy_root_command_and_preserves_exact_ack_rep
         3,
     )
     .await;
-    let (_, current_bytes) = LocalFileBackend::load(&source_backend).unwrap().unwrap();
-    let source_backend_released = Arc::downgrade(&source_backend);
+    let released = Arc::downgrade(&source_backend);
     drop(source_store);
     drop(source_backend);
-    n2b1_wait_for_backend_release(source_backend_released).await;
-
-    let mut legacy_json = String::from_utf8(current_bytes).unwrap();
-    if legacy_json.contains(",\"command_type\":\"RevokeAccess\"") {
-        legacy_json = legacy_json.replace(",\"command_type\":\"RevokeAccess\"", "");
-    } else if legacy_json.contains("\"command_type\":\"RevokeAccess\",") {
-        legacy_json = legacy_json.replace("\"command_type\":\"RevokeAccess\",", "");
-    } else {
-        panic!("serialized root command should contain command_type before legacy rewrite");
-    }
-
-    let dir = tempfile::tempdir().unwrap();
-    let legacy_backend = LocalFileBackend::open(dir.path()).unwrap();
-    LocalFileBackend::commit(&legacy_backend, 0, legacy_json.as_bytes()).unwrap();
-    drop(legacy_backend);
+    n2b1_wait_for_backend_release(released).await;
 
     {
-        let backend = Arc::new(LocalFileBackend::open(dir.path()).unwrap());
-        let store = Arc::new(Store::open(backend.clone()).await.unwrap());
+        let backend = Arc::new(LocalLog::open(dir.path(), Default::default()).unwrap());
+        let store = Arc::new(Store::open_log(backend.clone()).await.unwrap());
         let meta = Arc::new(Meta::with_store(
             "meta-reopened".into(),
             Observability::new().unwrap(),
@@ -2026,8 +2017,8 @@ async fn n2b1_local_file_reopens_legacy_root_command_and_preserves_exact_ack_rep
     }
 
     {
-        let backend = Arc::new(LocalFileBackend::open(dir.path()).unwrap());
-        let store = Arc::new(Store::open(backend.clone()).await.unwrap());
+        let backend = Arc::new(LocalLog::open(dir.path(), Default::default()).unwrap());
+        let store = Arc::new(Store::open_log(backend.clone()).await.unwrap());
         let meta = Arc::new(Meta::with_store(
             "meta-reopened-again".into(),
             Observability::new().unwrap(),
@@ -2151,7 +2142,7 @@ fn domain_caller_with_groups(
 
 async fn memory_dfs() -> rpc::DfsMetaRpc {
     let store = Arc::new(
-        Store::open(Arc::new(MemoryBackend::default()))
+        Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
             .await
             .unwrap(),
     );
@@ -2164,7 +2155,7 @@ async fn memory_dfs() -> rpc::DfsMetaRpc {
 
 async fn memory_meta_and_dfs_service(replication: ReplicationConfig) -> (rpc::MetaRpc, DfsService) {
     let store = Arc::new(
-        Store::open(Arc::new(MemoryBackend::default()))
+        Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
             .await
             .unwrap(),
     );
@@ -2264,12 +2255,12 @@ struct LostCommitResultState {
 }
 
 struct LostCommitResultBackend {
-    inner: Arc<dyn StoreBackend>,
+    inner: Arc<dyn MetaLog>,
     state: Mutex<LostCommitResultState>,
 }
 
 impl LostCommitResultBackend {
-    fn new(inner: Arc<dyn StoreBackend>) -> Self {
+    fn new(inner: Arc<dyn MetaLog>) -> Self {
         Self {
             inner,
             state: Mutex::new(LostCommitResultState::default()),
@@ -2289,35 +2280,45 @@ impl LostCommitResultBackend {
                 .expect("backend wrapper observed no successful native commit"),
             state
                 .last_digest
-                .expect("backend wrapper observed no committed snapshot digest"),
+                .expect("backend wrapper observed no committed canonical record hash"),
         )
     }
 
-    async fn require_empty_snapshot(&self) {
+    async fn require_empty_log(&self) {
+        let recovered = self.inner.recover().await.unwrap();
         assert!(
-            self.inner.load().await.unwrap().is_none(),
-            "lost-result opt-in backend must start with no existing snapshot"
+            recovered.tip == LogTip::EMPTY
+                && recovered.checkpoint.is_none()
+                && recovered.records.is_empty(),
+            "lost-result injector requires an empty canonical log"
         );
     }
 }
 
-impl StoreBackend for LostCommitResultBackend {
-    fn load(&self) -> afs::meta::store::MetaFuture<'_, Option<(u64, Vec<u8>)>> {
-        self.inner.load()
+impl MetaLog for LostCommitResultBackend {
+    fn persistence(&self) -> afs::meta::store::BackendPersistence {
+        self.inner.persistence()
     }
-
-    fn commit(
+    fn limits(&self) -> LogLimits {
+        self.inner.limits()
+    }
+    fn health(&self) -> afs::meta::store::MetaFuture<'_, ()> {
+        self.inner.health()
+    }
+    fn recover(&self) -> afs::meta::store::MetaFuture<'_, RecoveredLog> {
+        self.inner.recover()
+    }
+    fn append_and_sync(
         &self,
-        expected_version: u64,
-        bytes: Vec<u8>,
-    ) -> afs::meta::store::MetaFuture<'_, u64> {
+        expected: LogTip,
+        records: Vec<Record>,
+    ) -> afs::meta::store::MetaFuture<'_, LogTip> {
         Box::pin(async move {
-            let digest = *blake3::hash(&bytes).as_bytes();
-            let version = self.inner.commit(expected_version, bytes).await?;
+            let tip = self.inner.append_and_sync(expected, records).await?;
             let mut state = self.state.lock().unwrap();
             state.commits += 1;
-            state.last_version = Some(version);
-            state.last_digest = Some(digest);
+            state.last_version = Some(tip.sequence);
+            state.last_digest = Some(tip.record_hash);
             if state.armed {
                 state.armed = false;
                 Err(afs_error::Error::coded(
@@ -2325,7 +2326,7 @@ impl StoreBackend for LostCommitResultBackend {
                     "injected lost backend result after durable Meta commit",
                 ))
             } else {
-                Ok(version)
+                Ok(tip)
             }
         })
     }
@@ -2335,6 +2336,26 @@ async fn lost_result_commit_request(
     meta: &rpc::MetaRpc,
     dfs: &rpc::DfsMetaRpc,
 ) -> CommitFileVersionRequest {
+    commit_request_with_copies(meta, dfs, 1).await
+}
+
+async fn commit_request_with_copies(
+    meta: &rpc::MetaRpc,
+    dfs: &rpc::DfsMetaRpc,
+    copies: u16,
+) -> CommitFileVersionRequest {
+    assert!((1..=3).contains(&copies));
+    for node in ["b", "c"].into_iter().take(usize::from(copies - 1)) {
+        register_dfs_storage_node_with_catalog(
+            meta,
+            &format!("node-{node}"),
+            &format!("session-{node}"),
+            &format!("register-{node}"),
+            &format!("rack-{node}"),
+            7,
+        )
+        .await;
+    }
     register_dfs_storage_node_with_catalog(
         meta,
         "node-a",
@@ -2346,7 +2367,13 @@ async fn lost_result_commit_request(
     .await;
     let dfs_service = DfsService::with_replication_config(
         meta.0.store.as_ref().unwrap().clone(),
-        ReplicationConfig::local_single_copy(),
+        ReplicationConfig {
+            desired_copies: copies,
+            sync_required_copies: copies,
+            min_distinct_nodes: copies,
+            min_distinct_failure_domains: copies,
+            local_copy: LocalCopyPolicy::Required,
+        },
     );
     dfs_service.initialize_replication_config().await.unwrap();
     let placement = dfs_service
@@ -2354,7 +2381,6 @@ async fn lost_result_commit_request(
         .await
         .unwrap();
     let group = placement.replica_groups[0].clone();
-    let target = group.targets[0].clone();
     let created = dfs
         .create(Request::new(DfsCreateRequest {
             caller_id: "node-a".into(),
@@ -2372,6 +2398,8 @@ async fn lost_result_commit_request(
     let inode = created.inode.unwrap();
     let lease = created.write_lease.unwrap();
     CommitFileVersionRequest {
+        gc_fence: None,
+        clone_source: None,
         caller_id: "node-a".into(),
         operation_id: "commit-lost-result".into(),
         inode_id: inode.inode_id.clone(),
@@ -2405,20 +2433,25 @@ async fn lost_result_commit_request(
             placement_revision: placement.revision,
             placement_epoch: group.placement_epoch,
             replica_group_id: group.id.0.clone(),
-            durable_acks: vec![DfsReplicaAck {
-                operation_id: "commit-lost-result".into(),
-                chunk_id: "chunk-lost-result".into(),
-                placement_revision: placement.revision,
-                placement_epoch: group.placement_epoch,
-                node_id: target.node_id,
-                node_epoch: target.node_epoch,
-                device_id: target.device.device_id,
-                device_epoch: target.device.device_epoch,
-                catalog_revision: 7,
-                persisted_bytes: 4096,
-                verified_digest: vec![11; 32],
-                verified_digest_algorithm: afs_protocol::meta::DfsDigestAlgorithm::Blake3.into(),
-            }],
+            durable_acks: group
+                .targets
+                .iter()
+                .map(|target| DfsReplicaAck {
+                    operation_id: "commit-lost-result".into(),
+                    chunk_id: "chunk-lost-result".into(),
+                    placement_revision: placement.revision,
+                    placement_epoch: group.placement_epoch,
+                    node_id: target.node_id.clone(),
+                    node_epoch: target.node_epoch,
+                    device_id: target.device.device_id.clone(),
+                    device_epoch: target.device.device_epoch,
+                    catalog_revision: 7,
+                    persisted_bytes: 4096,
+                    verified_digest: vec![11; 32],
+                    verified_digest_algorithm: afs_protocol::meta::DfsDigestAlgorithm::Blake3
+                        .into(),
+                })
+                .collect(),
         }],
         write_lease: Some(lease),
         metadata_delta: Some(DfsCommitMetadataDelta {
@@ -2430,9 +2463,180 @@ async fn lost_result_commit_request(
     }
 }
 
+/// Domain/RPC-adapter and LocalLog boundary, not a transport or physical-copy test.
+#[tokio::test]
+async fn p3_supported_commit_shapes_survive_local_log_reopen() {
+    use prost::Message;
+    use std::time::Duration;
+
+    // The batch count is the existing NativeWriteConfig maximum, not a new cap.
+    // A large layout remains a single value, independently of top-level slots.
+    for (name, copies, chunks, extents) in [
+        ("single-copy-batch", 1, 1024, 1024),
+        ("three-copy-batch", 3, 1024, 1024),
+        ("fragmented-layout", 1, 1, 65537),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let log = Arc::new(LocalLog::open(dir.path(), LogLimits::default()).unwrap());
+        let store = Arc::new(Store::open_log(log.clone()).await.unwrap());
+        let replication = ReplicationConfig {
+            desired_copies: copies,
+            sync_required_copies: copies,
+            min_distinct_nodes: copies,
+            min_distinct_failure_domains: copies,
+            local_copy: LocalCopyPolicy::Required,
+        };
+        let mut state = Meta::with_store(name.into(), Observability::new().unwrap(), store.clone());
+        state.dfs = Some(DfsService::with_replication_config(
+            store.clone(),
+            replication.clone(),
+        ));
+        let meta = rpc::MetaRpc(Arc::new(state));
+        let dfs = rpc::DfsMetaRpc(meta.0.clone());
+        let mut request = commit_request_with_copies(&meta, &dfs, copies).await;
+        let template = request.chunk_receipts[0].clone();
+        request.chunk_receipts = (0..chunks)
+            .map(|index| {
+                let mut receipt = template.clone();
+                receipt.chunk_id = format!("chunk-{index}");
+                for ack in &mut receipt.durable_acks {
+                    ack.chunk_id = receipt.chunk_id.clone();
+                }
+                receipt
+            })
+            .collect();
+        let length = if chunks == 1 {
+            extents as u64
+        } else {
+            chunks as u64 * 4096
+        };
+        request.version.as_mut().unwrap().length = length;
+        let layout = request.layout.as_mut().unwrap();
+        layout.file_length = length;
+        layout.inline_extents = (0..extents)
+            .map(|index| DfsExtent {
+                file_offset: if chunks == 1 {
+                    index as u64
+                } else {
+                    index as u64 * 4096
+                },
+                length: if chunks == 1 { 1 } else { 4096 },
+                chunk_id: format!("chunk-{}", if chunks == 1 { 0 } else { index }),
+                chunk_offset: 0,
+            })
+            .collect();
+        let layout_id = afs::dfs::LayoutRootId::new(layout.layout_root_id.clone());
+        let wire_bytes = request.encoded_len();
+        assert!(
+            wire_bytes < 4 * 1024 * 1024,
+            "fixture must fit existing default server decoding"
+        );
+        let inode_id = afs::dfs::InodeId::new(request.inode_id.clone());
+        let before = log.recover().await.unwrap().tip;
+        let committed = dfs
+            .commit_file_version(Request::new(request.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        let after = log.recover().await.unwrap();
+        assert_eq!(after.tip.sequence, before.sequence + 1);
+        let Some(Record::Decision { decision, .. }) = after.records.last() else {
+            panic!("expected one domain decision");
+        };
+        let facts = decision.facts().unwrap();
+        // Publishing also releases the in-flight GC reference atomically.
+        let expected_changes = 4 + chunks * (2 + usize::from(copies));
+        assert_eq!(facts.events.len(), expected_changes);
+        assert_eq!(
+            facts
+                .events
+                .iter()
+                .filter(|event| {
+                    matches!(event.key, afs::meta::store::MetaKey::DfsReference { .. })
+                        && matches!(event.change, afs::meta::store::WatchChange::Delete)
+                })
+                .count(),
+            1
+        );
+        assert_eq!(facts.outcomes.len(), 1);
+        let record_bytes = decision
+            .encode(LogLimits::default().record_max_bytes)
+            .unwrap()
+            .len();
+        let expected_inode = store
+            .read(MetaRead::DfsInode(inode_id.clone()))
+            .await
+            .unwrap()
+            .entity;
+        let expected_layout = store
+            .read(MetaRead::DfsLayoutRoot(layout_id.clone()))
+            .await
+            .unwrap()
+            .entity;
+        let replayed = dfs
+            .commit_file_version(Request::new(request.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(committed, replayed);
+        assert_eq!(log.recover().await.unwrap().tip, after.tip);
+        drop(after);
+        drop(dfs);
+        drop(meta);
+        drop(store);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Arc::strong_count(&log) > 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(log);
+        let reopened_log = Arc::new(LocalLog::open(dir.path(), LogLimits::default()).unwrap());
+        let reopened = Arc::new(Store::open_log(reopened_log.clone()).await.unwrap());
+        assert_eq!(
+            reopened
+                .read(MetaRead::DfsInode(inode_id))
+                .await
+                .unwrap()
+                .entity,
+            expected_inode
+        );
+        assert_eq!(
+            reopened
+                .read(MetaRead::DfsLayoutRoot(layout_id))
+                .await
+                .unwrap()
+                .entity,
+            expected_layout
+        );
+        let mut replay_state =
+            Meta::with_store(name.into(), Observability::new().unwrap(), reopened.clone());
+        replay_state.dfs = Some(DfsService::with_replication_config(
+            reopened.clone(),
+            replication,
+        ));
+        let replay_meta = rpc::MetaRpc(Arc::new(replay_state));
+        let replay_dfs = rpc::DfsMetaRpc(replay_meta.0.clone());
+        let tip = reopened_log.recover().await.unwrap().tip;
+        assert_eq!(
+            replay_dfs
+                .commit_file_version(Request::new(request))
+                .await
+                .unwrap()
+                .into_inner(),
+            committed
+        );
+        assert_eq!(reopened_log.recover().await.unwrap().tip, tip);
+        eprintln!(
+            "P3_A27_DOMAIN name={name} copies={copies} chunks={chunks} extents={extents} wire_bytes={wire_bytes} canonical_bytes={record_bytes} changes={expected_changes} one_revision=true LocalLog_reopen=true exact_retry=true"
+        );
+    }
+}
+
 async fn assert_lost_result_commit_contract(backend: Arc<LostCommitResultBackend>) {
-    backend.require_empty_snapshot().await;
-    let store = Arc::new(Store::open(backend.clone()).await.unwrap());
+    backend.require_empty_log().await;
+    let store = Arc::new(Store::open_log(backend.clone()).await.unwrap());
     let meta = rpc::MetaRpc(Arc::new(Meta::with_store(
         "meta-lost-result".into(),
         Observability::new().unwrap(),
@@ -2466,11 +2670,11 @@ async fn assert_lost_result_commit_contract(backend: Arc<LostCommitResultBackend
     );
 
     let (commits_after_lost_result, native_version, native_digest) = backend.observed_commit();
-    let (loaded_version, loaded_bytes) = backend.inner.load().await.unwrap().unwrap();
-    assert_eq!(loaded_version, native_version);
-    assert_eq!(*blake3::hash(&loaded_bytes).as_bytes(), native_digest);
+    let recovered_log = backend.inner.recover().await.unwrap();
+    assert_eq!(recovered_log.tip.sequence, native_version);
+    assert_eq!(recovered_log.tip.record_hash, native_digest);
 
-    let reopened_store = Arc::new(Store::open(backend.clone()).await.unwrap());
+    let reopened_store = Arc::new(Store::open_log(backend.clone()).await.unwrap());
     let reopened = rpc::DfsMetaRpc(Arc::new(Meta::with_store(
         "meta-lost-result-restarted".into(),
         Observability::new().unwrap(),
@@ -2489,7 +2693,7 @@ async fn assert_lost_result_commit_contract(backend: Arc<LostCommitResultBackend
         .await
         .unwrap();
     let Some(MetaEntity::DfsFileVersion(version)) = recovered_version.entity else {
-        panic!("native snapshot must recover the committed FileVersion before replay");
+        panic!("canonical log must recover the committed FileVersion before replay");
     };
     assert_eq!(version.inode_id.0, commit.inode_id);
     assert_eq!(version.length, 4096);
@@ -2501,7 +2705,7 @@ async fn assert_lost_result_commit_contract(backend: Arc<LostCommitResultBackend
         .await
         .unwrap();
     let Some(MetaEntity::DfsLayoutRoot(layout)) = recovered_layout.entity else {
-        panic!("native snapshot must recover the committed LayoutRoot before replay");
+        panic!("canonical log must recover the committed LayoutRoot before replay");
     };
     assert_eq!(layout.file_length, 4096);
     assert_eq!(layout.inline_extents.len(), 1);
@@ -2569,8 +2773,8 @@ async fn assert_lost_result_commit_contract(backend: Arc<LostCommitResultBackend
             .code(),
         Code::InvalidArgument
     );
-    let (_, after_bad_bytes) = backend.inner.load().await.unwrap().unwrap();
-    assert_eq!(*blake3::hash(&after_bad_bytes).as_bytes(), native_digest);
+    let after_bad = backend.inner.recover().await.unwrap();
+    assert_eq!(after_bad.tip.record_hash, native_digest);
 
     let mut next = commit;
     next.operation_id = "commit-lost-result-next".into();
@@ -2598,14 +2802,14 @@ async fn assert_lost_result_commit_contract(backend: Arc<LostCommitResultBackend
             "layout_root_id": "layout-lost-result",
             "receipt_count": 1,
             "native_version_after_lost_result": native_version,
-            "native_snapshot_bytes": loaded_bytes.len(),
+            "durable_records": recovered_log.records.len(),
             "native_snapshot_blake3": blake3::Hash::from_bytes(native_digest).to_hex().to_string(),
             "successful_native_commits_before_replay": commits_after_lost_result,
             "successful_native_commits_after_replay": commits_after_replay,
             "successful_native_commits_after_next_operation": backend.observed_commit().0,
             "old_store_failed_closed": true,
             "same_identity_changed_payload_rejected": true,
-            "scope": "StoreBackend result suppression after real commit; no wire loss or physical chunk proof"
+            "scope": "MetaLog ACK suppression after real canonical append; no wire loss or physical chunk proof"
         })
     );
 }
@@ -2613,35 +2817,9 @@ async fn assert_lost_result_commit_contract(backend: Arc<LostCommitResultBackend
 #[tokio::test]
 async fn dfs_commit_recovers_lost_store_result_with_exact_operation_replay() {
     let backend = Arc::new(LostCommitResultBackend::new(Arc::new(
-        MemoryBackend::default(),
+        MemoryLog::new(Default::default()).unwrap(),
     )));
     assert_lost_result_commit_contract(backend).await;
-}
-
-#[tokio::test]
-#[ignore = "requires a fresh dedicated etcd endpoint in AFS_TEST_ETCD_LOST_RESULT_ENDPOINT"]
-async fn dfs_commit_recovers_lost_store_result_with_etcd_snapshot_backend() {
-    let endpoint = std::env::var("AFS_TEST_ETCD_LOST_RESULT_ENDPOINT")
-        .expect("AFS_TEST_ETCD_LOST_RESULT_ENDPOINT is required");
-    let inner = Arc::new(
-        afs::meta::store::etcd::EtcdBackend::connect(endpoint)
-            .await
-            .unwrap(),
-    );
-    assert_lost_result_commit_contract(Arc::new(LostCommitResultBackend::new(inner))).await;
-}
-
-#[tokio::test]
-#[ignore = "requires a fresh dedicated Redis endpoint in AFS_TEST_REDIS_LOST_RESULT_ENDPOINT"]
-async fn dfs_commit_recovers_lost_store_result_with_redis_snapshot_backend() {
-    let endpoint = std::env::var("AFS_TEST_REDIS_LOST_RESULT_ENDPOINT")
-        .expect("AFS_TEST_REDIS_LOST_RESULT_ENDPOINT is required");
-    let inner = Arc::new(
-        afs::meta::store::redis::RedisBackend::connect(endpoint)
-            .await
-            .unwrap(),
-    );
-    assert_lost_result_commit_contract(Arc::new(LostCommitResultBackend::new(inner))).await;
 }
 
 #[tokio::test]
@@ -2874,6 +3052,8 @@ async fn dfs_commit_accepts_durable_ack_after_unrelated_catalog_advance() {
 
     let committed = dfs
         .commit_file_version(Request::new(CommitFileVersionRequest {
+            gc_fence: None,
+            clone_source: None,
             caller_id: "node-a".into(),
             operation_id: "commit-old-ack".into(),
             inode_id: inode.inode_id.clone(),
@@ -3982,6 +4162,8 @@ async fn dfs_data_commit_allows_metadata_revision_drift_without_losing_attrs() {
     assert_eq!(renamed.revision, linked.revision + 1);
 
     let commit_request = CommitFileVersionRequest {
+        gc_fence: None,
+        clone_source: None,
         caller_id: "node-a".into(),
         operation_id: "commit-cas-drift".into(),
         inode_id: initial.inode_id.clone(),
@@ -4096,6 +4278,8 @@ async fn dfs_data_commit_allows_metadata_revision_drift_without_losing_attrs() {
 
     let old_head = dfs
         .commit_file_version(Request::new(CommitFileVersionRequest {
+            gc_fence: None,
+            clone_source: None,
             caller_id: "node-a".into(),
             operation_id: "commit-cas-old-head".into(),
             inode_id: initial.inode_id.clone(),
@@ -4129,6 +4313,8 @@ async fn dfs_data_commit_allows_metadata_revision_drift_without_losing_attrs() {
 
     let future_revision = dfs
         .commit_file_version(Request::new(CommitFileVersionRequest {
+            gc_fence: None,
+            clone_source: None,
             caller_id: "node-a".into(),
             operation_id: "commit-cas-future-revision".into(),
             inode_id: initial.inode_id,
@@ -4231,7 +4417,7 @@ async fn dfs_metadata_sync_allows_metadata_revision_drift_without_losing_xattrs(
 #[tokio::test]
 async fn dfs_write_lease_reuses_one_owner_and_fences_stale_commits() {
     let store = Arc::new(
-        Store::open(Arc::new(MemoryBackend::default()))
+        Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
             .await
             .unwrap(),
     );
@@ -4303,6 +4489,8 @@ async fn dfs_write_lease_reuses_one_owner_and_fences_stale_commits() {
 
     let stale = dfs
         .commit_file_version(Request::new(CommitFileVersionRequest {
+            gc_fence: None,
+            clone_source: None,
             caller_id: "node-a".into(),
             operation_id: "commit-stale".into(),
             inode_id: inode.inode_id.clone(),
@@ -5068,6 +5256,8 @@ async fn dfs_kernel_killpriv_commit_requires_lease_and_preserves_nonexecutable_s
         let inode = created.inode.unwrap();
         let lease = created.write_lease.unwrap();
         let request = CommitFileVersionRequest {
+            gc_fence: None,
+            clone_source: None,
             caller_id: "node-a".into(),
             operation_id: format!("commit-killpriv-{index}"),
             inode_id: inode.inode_id.clone(),

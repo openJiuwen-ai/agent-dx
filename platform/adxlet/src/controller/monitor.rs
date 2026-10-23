@@ -231,6 +231,11 @@ impl Controller {
             }
             return self.start_attempt(true, true, None).await.map(|_| ());
         }
+        self.schedule_restart();
+        self.sync().await?;
+        cleanup
+    }
+    pub(super) fn schedule_restart(&mut self) {
         self.record.restart_pending = self
             .record
             .spec
@@ -238,11 +243,6 @@ impl Controller {
             .restart
             .as_ref()
             .is_some_and(|p| self.record.restart_attempts < p.max_attempts);
-        self.schedule_restart();
-        self.sync().await?;
-        cleanup
-    }
-    fn schedule_restart(&mut self) {
         self.restart_after = self.record.spec.lifecycle.restart.as_ref().and_then(|p| {
             Instant::now().checked_add(Duration::from_secs(
                 p.backoff_seconds(self.record.restart_attempts),

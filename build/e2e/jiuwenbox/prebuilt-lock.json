@@ -1,0 +1,119 @@
+{
+  "schema_version": 1,
+  "status": "validated",
+  "validated_at": "2026-10-19T11:54:41.742911+00:00",
+  "platform": "linux-x86_64",
+  "conch_backend": "stratovirt",
+  "jiuwenbox": {
+    "distribution": "jiuwenswarm",
+    "version": "1",
+    "source_revision": null,
+    "artifact": {
+      "file": "jiuwenswarm-1-py3-none-any.whl",
+      "sha256": "37f8ef116ffc46cf1753a5388e44a02aebffee7b8644d075398895a73fb94fbe",
+      "size": 14490152,
+      "cache_path": "sha256/37f8ef116ffc46cf1753a5388e44a02aebffee7b8644d075398895a73fb94fbe/jiuwenswarm-1-py3-none-any.whl"
+    }
+  },
+  "conch": {
+    "rpm": "conch-0.1.0-10.oe2403sp4.x86_64.rpm",
+    "reported_version": "conch version unknown, build unknown-unknown",
+    "sdk_version": "0.2.0",
+    "sdk": {
+      "file": "conch-0.2.0-py3-none-any.whl",
+      "sha256": "da54ff97e32e01670c4610801e65cf88d72202013e66e3089f722ff5026303e0",
+      "size": 23351,
+      "cache_path": "sha256/da54ff97e32e01670c4610801e65cf88d72202013e66e3089f722ff5026303e0/conch-0.2.0-py3-none-any.whl"
+    },
+    "source_revision": null,
+    "binary_sha256": {
+      "conch": "28178a8a0c4dcda2dfa40a4d07a06cca236f80da9d7310a2332a1b16180b5506",
+      "conchd": "7c541f27ab2d62e46a1e6d69b849beb1338f2151f793388a350a1f131c1fa856"
+    }
+  },
+  "stratovirt": {
+    "rpm": "stratovirt-2.4.0-14.oe2403sp4.x86_64.rpm",
+    "reported_version": "StratoVirt 2.5.0 commit-id unknown",
+    "binary_sha256": "7997478650004e6f86624eca4f4581368b6ad8a906feb75590a12675c9f37f86"
+  },
+  "guest": {
+    "kernel_sha256": "4e4fff402dad614c777071ee43e42f332a19ababe076cc0f084d154d05e8192e",
+    "initrd_sha256": "318a7e7167aa8517330cbf58cc9d1dcf10ba17a9d09911f48cca5e72e6eae474",
+    "kernel_revision": "fdd5549b0b8c4b54146dc1ccd246b31c9db4544a",
+    "template": "Template Name: localhost/adx-acceptance:4e4fff402dad614c\nTemplate ID: sha256:9f7d7c6c8f68259511709213d040b88c24ad8caa15dc3c1474e4c8770e3431df"
+  },
+  "helpers": {
+    "virtiofsd": {
+      "version": "virtiofsd 1.13.3",
+      "artifact": {
+        "file": "virtiofsd",
+        "sha256": "50c082154147c5041d875c3a535fea7f1a7b1ae7af27127fd2020b1ee880675f",
+        "size": 2949512,
+        "cache_path": "sha256/50c082154147c5041d875c3a535fea7f1a7b1ae7af27127fd2020b1ee880675f/virtiofsd"
+      }
+    },
+    "mkfs_erofs_sha256": "e5b8c3925f199dac18fa3f442387ffe4c192689fca34048e2008740223682aa1"
+  },
+  "archives": [
+    {
+      "file": "jiuwenswarm-daily.tar.gz",
+      "sha256": "d8960ecd5ee06187686b6a038dfb99517990a936535e2828c2b1d6bc6a1aa004",
+      "size": 154157198,
+      "cache_path": "sha256/d8960ecd5ee06187686b6a038dfb99517990a936535e2828c2b1d6bc6a1aa004/jiuwenswarm-daily.tar.gz",
+      "name": "jiuwenswarm-daily",
+      "source_url": "https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/jiuwenswarm/package/daily/agentos_b050/last_successful_build/archive.tar.gz",
+      "members": [
+        {
+          "file": "jiuwenswarm-1-py3-none-any.whl",
+          "sha256": "37f8ef116ffc46cf1753a5388e44a02aebffee7b8644d075398895a73fb94fbe",
+          "size": 14490152,
+          "cache_path": "sha256/37f8ef116ffc46cf1753a5388e44a02aebffee7b8644d075398895a73fb94fbe/jiuwenswarm-1-py3-none-any.whl"
+        }
+      ]
+    },
+    {
+      "file": "conch-release.tar.gz",
+      "sha256": "6fa9e9c9ddfca5fb3f91f83925995334b7a011f7892d4c95bdc82bc8d8c43d49",
+      "size": 71695602,
+      "cache_path": "sha256/6fa9e9c9ddfca5fb3f91f83925995334b7a011f7892d4c95bdc82bc8d8c43d49/conch-release.tar.gz",
+      "name": "conch-release",
+      "source_url": "https://openjiuwen-ci.obs.cn-north-4.myhuaweicloud.com/conch/package/release/agentos_b050/last_successful_build/archive.tar.gz",
+      "members": [
+        {
+          "file": "conch-0.1.0-10.oe2403sp4.x86_64.rpm",
+          "sha256": "fa07d014e3f9cadc5b30301c307de6145ad66b112d464af82524cc6bf6af5757",
+          "size": 34662637,
+          "cache_path": "sha256/fa07d014e3f9cadc5b30301c307de6145ad66b112d464af82524cc6bf6af5757/conch-0.1.0-10.oe2403sp4.x86_64.rpm"
+        },
+        {
+          "file": "erofs-utils-1.9.3-2.oe2403sp4.x86_64.rpm",
+          "sha256": "e5f6712177490a071ee04ee5db587278f24e66aaefeacc0599989ba84d484b68",
+          "size": 215861,
+          "cache_path": "sha256/e5f6712177490a071ee04ee5db587278f24e66aaefeacc0599989ba84d484b68/erofs-utils-1.9.3-2.oe2403sp4.x86_64.rpm"
+        },
+        {
+          "file": "stratovirt-2.4.0-14.oe2403sp4.x86_64.rpm",
+          "sha256": "23acdb5f47715c7b6975e10a09af55432c761318b105827aa77406fdd8d3e77e",
+          "size": 4722853,
+          "cache_path": "sha256/23acdb5f47715c7b6975e10a09af55432c761318b105827aa77406fdd8d3e77e/stratovirt-2.4.0-14.oe2403sp4.x86_64.rpm"
+        }
+      ]
+    }
+  ],
+  "validation": {
+    "adx_commit": "e6bb99a1b53940edff6f9d1441f653826288c632",
+    "adx_dirty": true,
+    "adx_source_manifest_sha256": "9a4b01aa89e09f3dfdbd0f0009034c3638e94752ebfb319dd9172bdd27996524",
+    "adx_package_manifest_sha256": "254dcb9bb9279aacd42bc11ffbe421cb8845f905ff77ceb4f9c47c0ac094ddeb",
+    "sdk_wheel_sha256": "9ce96591e1f3b1b7c10e47390ef6dccd4d5df6e3346c9d9ab33904643125f71a",
+    "execd_sha256": "65986e4419ff533aaab0fbeee91e4a8812b6519d0af27f1deaad3928bfb8fd1b",
+    "execd_erofs_sha256": "b177a7fa2ee5147aa2cb41dd29ac4031d4c42812c5fc66cef4babd92d46cfd8a",
+    "runtime_cases": 9,
+    "public_sdk_cases": 11,
+    "runtime_run": "final-runtime003",
+    "public_sdk_run": "final-sdk003",
+    "node_report_interval_seconds": 1,
+    "evidence_root": "/root/adx-jbx-prebuilt-final-20261019",
+    "scope": "single-host process deployment; no snapshot, host reboot or Redis-fault rerun"
+  }
+}

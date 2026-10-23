@@ -6,11 +6,11 @@ pub mod activator;
 pub mod cache;
 pub mod environment;
 pub mod error;
-pub mod launch;
 pub mod lifecycle;
 pub mod limits;
 pub mod mounts;
 pub mod network;
+pub mod parameters;
 pub mod probes;
 pub mod target;
 pub mod transport;
@@ -137,6 +137,8 @@ pub struct TemplateVersion {
     pub init_timeout_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readiness_probe: Option<probes::ReadinessProbe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthcheck: Option<probes::Healthcheck>,
 }
 
 impl TemplateVersion {
@@ -152,6 +154,16 @@ impl TemplateVersion {
             .map(|mount| mount.render_validated(parameters))
             .collect()
     }
+    pub fn render_env(
+        &self,
+        parameters: &mounts::Parameters,
+    ) -> Result<BTreeMap<String, String>, String> {
+        mounts::validate_parameters(parameters)?;
+        self.env
+            .iter()
+            .map(|(key, value)| Ok((key.clone(), parameters::render(value, Some(parameters))?)))
+            .collect()
+    }
     pub fn validate(&self) -> ValidationResult {
         for (label, value) in [
             ("name", &self.name),
@@ -162,6 +174,7 @@ impl TemplateVersion {
             identifier(value, label)?;
         }
         for (key, value) in &self.env {
+            parameters::render(value, None)?;
             if key.is_empty() || key.contains(['=', '\0']) || value.contains('\0') {
                 return Err("invalid environment variable".into());
             }
@@ -194,6 +207,9 @@ impl TemplateVersion {
             return Err("init_timeout_seconds must be between 1 and 86400".into());
         }
         if let Some(probe) = &self.readiness_probe {
+            probe.validate()?;
+        }
+        if let Some(probe) = &self.healthcheck {
             probe.validate()?;
         }
         self.resources.validate()

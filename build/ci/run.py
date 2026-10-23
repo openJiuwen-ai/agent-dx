@@ -91,6 +91,7 @@ def commands_for(suite, output, jobs):
                 "--locked",
                 "-p",
                 "adx-coordinator",
+                "--lib",
                 "--test",
                 "rpc",
                 "--test",

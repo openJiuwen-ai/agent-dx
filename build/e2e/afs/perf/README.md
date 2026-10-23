@@ -4,6 +4,9 @@
 的部署、实验数据和主机路径不属于此目录。驱动不会创建 VM、格式化磁盘、部署后端、
 全局停止进程或修改后端参数。
 
+Meta 专项使用独立的[显式基线辅助程序](meta-bench.md)，不复用文件读写的计时
+或将 Store 层结果当成 FUSE／RPC 性能结论。
+
 ## 测量边界
 
 - `contract`：双方 `O_RDONLY | O_DIRECT`，记录并核对 `read_ahead_kb=0`、

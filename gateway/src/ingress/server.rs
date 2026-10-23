@@ -336,7 +336,8 @@ pub struct Ingress {
     #[cfg(feature = "agent-api")]
     pub(super) agent_api: Option<Arc<super::agent_api::AgentApi>>,
     #[cfg(feature = "agent-api")]
-    jiuwen_api: Option<Arc<super::jiuwen::entrypoint::JiuwenApi>>,
+    digitalmategateway_api:
+        Option<Arc<super::digitalmategateway::entrypoint::DigitalMateGatewayApi>>,
     resolver: Arc<IngressRouteResolver>,
     connector: DataPlaneL4Connector,
     http_pool: BackendHttpPool,
@@ -377,7 +378,7 @@ impl Ingress {
             #[cfg(feature = "agent-api")]
             agent_api: None,
             #[cfg(feature = "agent-api")]
-            jiuwen_api: None,
+            digitalmategateway_api: None,
             resolver,
             connector,
             http_pool: BackendHttpPool::new(BackendHttpPoolConfig::default()),
@@ -404,8 +405,11 @@ impl Ingress {
     }
 
     #[cfg(feature = "agent-api")]
-    pub fn with_jiuwen_api(mut self, api: Arc<super::jiuwen::entrypoint::JiuwenApi>) -> Self {
-        self.jiuwen_api = Some(api);
+    pub fn with_digitalmategateway_api(
+        mut self,
+        api: Arc<super::digitalmategateway::entrypoint::DigitalMateGatewayApi>,
+    ) -> Self {
+        self.digitalmategateway_api = Some(api);
         self
     }
 
@@ -665,7 +669,7 @@ impl Ingress {
             drop(guard);
             return Err(io::Error::new(
                 io::ErrorKind::NotConnected,
-                "route changed while opening the stream",
+                IngressOpenError::RouteChanged,
             ));
         }
         let stream = self
@@ -1077,12 +1081,13 @@ impl Ingress {
         } else {
             match request.uri().path() {
                 #[cfg(feature = "agent-api")]
-                path if super::jiuwen::entrypoint::JiuwenApi::matches(path)
-                    && self.jiuwen_api.is_some() =>
+                path if super::digitalmategateway::entrypoint::DigitalMateGatewayApi::matches(
+                    path,
+                ) && self.digitalmategateway_api.is_some() =>
                 {
-                    self.jiuwen_api
+                    self.digitalmategateway_api
                         .as_ref()
-                        .expect("configured Jiuwen API")
+                        .expect("configured DigitalMateGateway API")
                         .handle(request, self.clone())
                         .await
                 }
@@ -1581,7 +1586,7 @@ impl Ingress {
         }
         let mut subscription = self
             .command_watch
-            .subscribe(self, route, command.command_id.clone())
+            .subscribe(self, route, command.command_id.clone(), tenant_id)
             .await
             .map_err(IngressOpenError::Connect)?;
         let environment_id = command.environment_id.clone();
@@ -2204,6 +2209,7 @@ impl CommandWatchHub {
         gateway: &Ingress,
         route: RouteHandle,
         command_id: String,
+        _tenant_id: &str,
     ) -> io::Result<HubSubscription> {
         let key = WatchKey {
             environment_id: route.target.instance_id.clone(),
@@ -2212,13 +2218,32 @@ impl CommandWatchHub {
         let entry = if let Some(entry) = entries.get(&key) {
             entry.clone()
         } else {
+            use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+            let request = "ws://execd/commands/watch"
+                .into_client_request()
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            #[cfg(feature = "agent-api")]
+            let request = {
+                let mut request = request;
+                if let Some(access) = &gateway.execd_access {
+                    access
+                        .apply(_tenant_id, &route.target.instance_id, &mut request)
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                "Environment runtime access unavailable",
+                            )
+                        })?;
+                }
+                request
+            };
             let stream = gateway
                 .open_authorized_stream_with_activity(route, true)
                 .await?;
-            let (websocket, _) =
-                tokio_tungstenite::client_async("ws://execd/commands/watch", stream)
-                    .await
-                    .map_err(|error| io::Error::other(error.to_string()))?;
+            let (websocket, _) = tokio_tungstenite::client_async(request, stream)
+                .await
+                .map_err(|error| io::Error::other(error.to_string()))?;
             let (control, controls) = mpsc::channel(self.config.queue_capacity);
             let (events, _) = broadcast::channel(self.config.queue_capacity);
             let entry = WatchEntry {
@@ -2429,7 +2454,7 @@ pub(super) async fn wait_for_route_cancellation(cancelled: Option<watch::Receive
     }
 }
 
-async fn proxy_http<T>(
+pub(super) async fn proxy_http<T>(
     mut request: Request<Incoming>,
     stream: T,
     upstream_name: &'static str,
@@ -2773,8 +2798,13 @@ fn strip_token_query(query: &str) -> String {
 }
 
 fn error_response(error: IngressOpenError) -> Response<ProxyBody> {
-    if matches!(&error, IngressOpenError::Resolve(ResolveError::Resuming))
-        || matches!(&error, IngressOpenError::Connect(e) if e.get_ref().and_then(|e| e.downcast_ref::<ResolveError>()) == Some(&ResolveError::Resuming))
+    // RouteChanged is emitted only before CONNECT or the business send. Keep
+    // that typed evidence so clients can retry; never classify by message text.
+    if matches!(
+        &error,
+        IngressOpenError::Resolve(ResolveError::Resuming) | IngressOpenError::RouteChanged
+    ) || matches!(&error, IngressOpenError::Connect(e) if e.get_ref().and_then(|e| e.downcast_ref::<ResolveError>()) == Some(&ResolveError::Resuming)
+        || matches!(e.get_ref().and_then(|e| e.downcast_ref::<IngressOpenError>()), Some(IngressOpenError::RouteChanged)))
     {
         return resuming_response("", "");
     }
@@ -2858,6 +2888,33 @@ mod tests {
     use crate::common::protocol::ConnectTarget;
     use crate::common::route::{DataPlaneAuthMode, DataPlaneSecurityMode};
     use crate::ingress::{H2PoolConfig, RouteStore};
+
+    #[tokio::test]
+    async fn preforward_route_change_is_retryable_but_other_connection_errors_are_not() {
+        for error in [
+            IngressOpenError::RouteChanged,
+            IngressOpenError::Connect(io::Error::new(
+                io::ErrorKind::NotConnected,
+                IngressOpenError::RouteChanged,
+            )),
+        ] {
+            let response = error_response(error);
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                response.headers().get("x-adx-error-code").unwrap(),
+                "ENV_RESUMING"
+            );
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"]["requestForwarded"], false);
+        }
+        // Words alone are not evidence that no application bytes were sent.
+        let response = error_response(IngressOpenError::Connect(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "route changed while opening the stream",
+        )));
+        assert!(response.headers().get("x-adx-error-code").is_none());
+    }
 
     #[test]
     fn watch_subscription_failure_reconnects_transient_transport_but_rejects_permissions() {

@@ -10,6 +10,13 @@ can replace the active connection. Restore refreshes this identity for the new
 listener generation. Binary file downloads close the HTTP connection after the
 body, matching their response header; chunked tar downloads stay reusable.
 
+PTY sessions send the final output, `exited` status and WebSocket Close in that
+order. Execd reads through the peer's Close reply before releasing TCP, including
+control frames that arrive after the child exits. This prevents unread input from
+resetting TCP and truncating terminal frames through Relay. A peer that does not
+reply is disconnected after a five-second close-handshake deadline. Client-initiated
+Close is acknowledged before the connection ends.
+
 The public Ingress → Relay → EXECD operations are defined in the
 [`data-plane.yaml`](../../api/openapi/data-plane.yaml) OpenAPI contract. Generic
 port forwarding and reverse tunnels carry application-defined protocols and do

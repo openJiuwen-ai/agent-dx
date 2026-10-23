@@ -435,6 +435,8 @@ impl ReplicationEngine {
 }
 
 pub struct DfsChunkStore {
+    optimistic_gc_commit: bool,
+    gc_control: Option<Arc<dyn crate::node::gc::GcControl>>,
     local_node_id: String,
     local_node_epoch: Option<u64>,
     local: Arc<LocalChunkStore>,
@@ -443,6 +445,32 @@ pub struct DfsChunkStore {
 }
 
 impl DfsChunkStore {
+    fn reserve_gc_publications(&self, staged: &[StagedChunk]) -> Result<()> {
+        if let Some(control) = &self.gc_control {
+            let mut operations = std::collections::BTreeMap::<_, Vec<_>>::new();
+            for item in staged {
+                operations
+                    .entry(item.operation_id.clone())
+                    .or_default()
+                    .push(item.chunk.clone());
+            }
+            for (operation, chunks) in operations {
+                control.reserve_publication(&operation, chunks)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn with_optimistic_gc_commit(mut self, enabled: bool) -> Self {
+        self.optimistic_gc_commit = enabled;
+        self
+    }
+
+    pub fn with_gc_control(mut self, control: Arc<dyn crate::node::gc::GcControl>) -> Self {
+        self.gc_control = Some(control);
+        self
+    }
+
     pub fn new(
         local_node_id: String,
         local: Arc<LocalChunkStore>,
@@ -450,6 +478,8 @@ impl DfsChunkStore {
         data_plane: Arc<dyn ReplicaDataPlane>,
     ) -> Self {
         Self {
+            optimistic_gc_commit: false,
+            gc_control: None,
             local_node_id: local_node_id.clone(),
             local_node_epoch: None,
             local: local.clone(),
@@ -466,6 +496,8 @@ impl DfsChunkStore {
         data_plane: Arc<dyn ReplicaDataPlane>,
     ) -> Self {
         Self {
+            optimistic_gc_commit: false,
+            gc_control: None,
             local_node_id: local_node_id.clone(),
             local_node_epoch: Some(local_node_epoch),
             local: local.clone(),
@@ -579,6 +611,7 @@ impl DfsChunkStore {
 
 impl ChunkStore for DfsChunkStore {
     fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
+        self.reserve_gc_publications(&staged)?;
         let snapshot = self.placement.snapshot()?;
         if snapshot.replication.is_local_fast_path() {
             self.put_local_batch(staged, &snapshot)
@@ -629,6 +662,9 @@ impl ChunkStore for DfsChunkStore {
     }
 
     fn put_native_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<NativeChunkReceipt>> {
+        if !self.optimistic_gc_commit {
+            self.reserve_gc_publications(&staged)?;
+        }
         let snapshot = self.placement.snapshot()?;
         let receipts = if snapshot.replication.is_local_fast_path() {
             self.put_local_batch(staged, &snapshot)?
@@ -1120,7 +1156,8 @@ impl ReplicationWorker {
             }
             offset += count;
         }
-        let staged = StagedChunk::new(claim.operation_id.clone(), bytes);
+        let staged = StagedChunk::from_replica(claim.operation_id.clone(), &claim.chunk, bytes)
+            .map_err(|error| (error, true))?;
         if staged.chunk != claim.chunk {
             return Err((invalid("repair source identity or digest differs"), true));
         }
@@ -1349,6 +1386,78 @@ mod tests {
             min_distinct_failure_domains: 1,
             local_copy: LocalCopyPolicy::Required,
         }
+    }
+
+    #[test]
+    fn native_upload_requires_gc_reservation_before_writing() {
+        struct RejectGc;
+        impl crate::node::gc::GcControl for RejectGc {
+            fn retain(
+                &self,
+                _: &str,
+                _: &crate::dfs::InodeId,
+                _: Option<&crate::dfs::FileVersionId>,
+                _: bool,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn release(&self, _: &str) -> Result<()> {
+                Ok(())
+            }
+            fn reserve_publication(
+                &self,
+                _: &OperationId,
+                _: Vec<crate::dfs::ChunkObject>,
+            ) -> Result<()> {
+                Err(Error::coded(
+                    afs_error::META_DFS_GC_BUSY,
+                    "deletion in progress",
+                ))
+            }
+            fn collect(
+                &self,
+                _: u64,
+                _: Vec<crate::dfs::ChunkObject>,
+            ) -> Result<crate::dfs::GcState> {
+                Ok(crate::dfs::GcState::default())
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let snapshot = Arc::new(PlacementSnapshot {
+            revision: 1,
+            replication: config(1),
+            replica_groups: vec![ReplicaGroup {
+                id: ReplicaGroupId::new("g"),
+                placement_epoch: 1,
+                targets: vec![target_with_epoch(
+                    "node-a",
+                    1,
+                    local.device_descriptor().unwrap(),
+                )],
+            }],
+        });
+        let store = DfsChunkStore::new_with_epoch(
+            "node-a".into(),
+            1,
+            local.clone(),
+            Arc::new(StaticPlacement { snapshot }),
+            Arc::new(FakeDataPlane::default()),
+        )
+        .with_gc_control(Arc::new(RejectGc));
+        let input = staged("native-gc-rejection");
+        assert_eq!(
+            store
+                .put_native_batch(vec![input.clone()])
+                .err()
+                .unwrap()
+                .code(),
+            afs_error::META_DFS_GC_BUSY
+        );
+        assert!(
+            local.open_receipt_reader(&input.chunk).is_err(),
+            "rejected upload must not install a chunk"
+        );
     }
 
     #[test]
@@ -2263,6 +2372,54 @@ mod tests {
         );
         op.repair_claim.as_mut().unwrap().worker_node_epoch += 1;
         assert!(crate::node::rpc::peer::replica_header(&op, &staged).is_err());
+    }
+
+    #[test]
+    fn crc32c_replica_header_and_repair_preserve_birth_identity() {
+        let (_temp, local, mut authority, plane) = repair_fixture("crc-repair");
+        let item =
+            StagedChunk::new_crc32c(OperationId::new("original-write"), b"crc-repair".to_vec())
+                .unwrap();
+        let claim = &mut Arc::get_mut(&mut authority).unwrap().claim;
+        claim.chunk = item.chunk.clone();
+        local
+            .persist_batch(
+                std::slice::from_ref(&item),
+                &claim.replica_group.targets[0],
+                claim.placement_revision,
+                claim.replica_group.placement_epoch,
+            )
+            .unwrap();
+        let plan = ReplicationPlan {
+            chunk_id: item.chunk.id.clone(),
+            placement_revision: claim.placement_revision,
+            placement_epoch: claim.replica_group.placement_epoch,
+            replica_group_id: claim.replica_group.id.clone(),
+            config: claim.replication.clone(),
+            ordered_targets: claim.replica_group.targets.clone(),
+        };
+        let op = plan.selected_peer_op("a", 1).unwrap().unwrap();
+        let header = crate::node::rpc::peer::replica_header(&op, &item).unwrap();
+        assert_eq!(header.chunk_id, item.chunk.id.0);
+        assert_eq!(
+            header.content_digest_algorithm,
+            afs_protocol::node_data::DfsDigestAlgorithm::Crc32cSegmentsV1 as i32
+        );
+        let worker = repair_worker(local, authority.clone(), plane);
+        assert_eq!(
+            worker.run_once().unwrap().unwrap().state,
+            crate::dfs::ReplicationTaskState::Completed
+        );
+        let reports = authority.reports.lock().unwrap();
+        assert_eq!(reports[0].claim.chunk, item.chunk);
+        assert_eq!(reports[0].durable_acks.len(), 2);
+        assert!(
+            reports[0]
+                .durable_acks
+                .iter()
+                .all(|ack| ack.chunk_id == item.chunk.id
+                    && ack.verified_digest == item.chunk.content_digest)
+        );
     }
 
     #[test]

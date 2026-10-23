@@ -126,6 +126,8 @@ impl State {
             .get(&stored.assignment.node_id)
             .ok_or(Error::NotFound)?;
         let record = stored.result.clone().unwrap_or_else(|| EnvironmentRecord {
+            execution_artifacts: vec![],
+            snapshot_source: None,
             failure: None,
             spec: stored.spec.clone(),
             assignment: stored.assignment.clone(),
@@ -273,22 +275,31 @@ impl CoordinatorRpc {
         } else {
             None
         };
+        *state.claims_in_flight.entry(spec.id.clone()).or_default() += 1;
         drop(state);
-        let outcome = match self
+        let outcome = self
             .0
             .claim(spec.clone(), candidate.clone(), user_metadata)
-            .await
-        {
+            .await;
+        let mut state = self.0.state.lock().await;
+        let in_flight = state
+            .claims_in_flight
+            .get_mut(&spec.id)
+            .expect("claim registered before releasing the state lock");
+        *in_flight -= 1;
+        if *in_flight == 0 {
+            state.claims_in_flight.remove(&spec.id);
+        }
+        self.0.changed.notify_waiters();
+        let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(e @ Error::Unavailable(_)) => {
-                let mut state = self.0.state.lock().await;
                 state.needs_recovery = true;
                 self.0.changed.notify_waiters();
                 return Err(status(e));
             }
             Err(e) => return Err(status(e)),
         };
-        let mut state = self.0.state.lock().await;
         state.recover_authoritative_state().await.map_err(status)?;
         state.healthy().map_err(status)?;
         let record = outcome.record().clone();
@@ -360,6 +371,8 @@ mod tests {
             spec: spec.clone(),
             assignment: assignment.clone(),
             result: Some(EnvironmentRecord {
+                execution_artifacts: vec![],
+                snapshot_source: None,
                 spec,
                 assignment,
                 state,

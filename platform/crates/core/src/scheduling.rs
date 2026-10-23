@@ -31,6 +31,7 @@ pub struct DeviceRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Node {
     pub id: String,
+    /// Latest observed budget; may be zero or smaller than existing reservations.
     pub capacity: Resources,
     pub available: bool,
     #[serde(default)]
@@ -44,7 +45,6 @@ pub struct Node {
 impl Node {
     pub fn validate(&self) -> Result<()> {
         nonempty(&self.id)?;
-        self.capacity.validate()?;
         validate_labels(&self.labels)?;
         validate_inventory(&self.devices)?;
         let mut seen = BTreeSet::new();
@@ -513,4 +513,18 @@ mod tests {
         ledger.release("a").unwrap();
         assert_eq!(ledger.available().len(), 1);
     }
+}
+
+/// Placement diagnostics from one locked scheduling snapshot at queue expiry.
+/// Rejection counts can overlap; scalar maxima may belong to different nodes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SchedulingFailure {
+    pub snapshot_revision: u64,
+    pub node_count: u64,
+    pub eligible_nodes: u64,
+    pub requested: Resources,
+    pub max_capacity: Resources,
+    pub max_available: Resources,
+    pub rejections: BTreeMap<String, u64>,
 }

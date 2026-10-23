@@ -26,7 +26,7 @@ steps:
         imagePullSecrets:
         - name: swr-pull-secret
         containers:
-        - image: swr.ap-southeast-1.myhuaweicloud.com/openjiuwen-online-test/adx-jiuwen-build@sha256:22a721e3a1b36bdc1a0587efe9af0a569102b95ada8986047e74d3c276706411
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-build@sha256:7cd63f1d779963576ba3ddbf258a01af9fad289fb4f0e848a34dfb75d5139ade
           volumeMounts:
           - name: build-cache
             mountPath: /mnt/paas
@@ -223,7 +223,7 @@ steps:
         imagePullSecrets:
         - name: swr-pull-secret
         containers:
-        - image: swr.ap-southeast-1.myhuaweicloud.com/openjiuwen-online-test/adx-jiuwen-build@sha256:22a721e3a1b36bdc1a0587efe9af0a569102b95ada8986047e74d3c276706411
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-build@sha256:7cd63f1d779963576ba3ddbf258a01af9fad289fb4f0e848a34dfb75d5139ade
           volumeMounts:
           - name: build-cache
             mountPath: /mnt/paas

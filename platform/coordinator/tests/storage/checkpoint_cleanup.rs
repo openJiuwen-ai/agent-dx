@@ -10,6 +10,15 @@ fn artifact(location: &str) -> CheckpointArtifact {
     }
 }
 
+fn local_artifact(location: &str, size_bytes: u64) -> CheckpointArtifact {
+    CheckpointArtifact {
+        storage: "local".into(),
+        scope: String::new(),
+        location: location.into(),
+        size_bytes,
+    }
+}
+
 async fn create(session: &adx_coordinator::storage::Session, generation: u64) -> EnvironmentRecord {
     let assignment = Assignment {
         environment_id: "cleanup".into(),
@@ -218,6 +227,221 @@ async fn cleanup_rejects_aliases_of_retained_environment_and_snapshot() {
         .checkpoint_cleanup_unreferenced(&task, None)
         .await
         .unwrap());
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn cleanup_rejects_local_snapshot_source_and_execution_artifact_aliases() {
+    use adx_coordinator::snapshots::{Reference, Snapshot};
+
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let artifact = local_artifact("/checkpoints/local-alias", 1);
+    let snapshot_task = CheckpointCleanup {
+        assignment: retained_assignment(),
+        revision: 3,
+        artifacts: vec![artifact.clone()],
+    };
+
+    let snapshot = Snapshot::new(
+        "local-source".into(),
+        vec![],
+        spec("source"),
+        "node".into(),
+        "source-1".into(),
+        artifact.clone(),
+    )
+    .unwrap();
+    session.publish_snapshot(snapshot.clone()).await.unwrap();
+    session
+        .acquire_snapshot(
+            &snapshot.id,
+            "tenant",
+            Reference::Restore {
+                environment_id: "clone".into(),
+            },
+        )
+        .await
+        .unwrap();
+    let mut clone_spec = spec("clone");
+    clone_spec.snapshot_id = Some(snapshot.id.clone());
+    let clone_assignment = Assignment {
+        environment_id: "clone".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 2,
+        devices: vec![],
+    };
+    session
+        .reserve(clone_spec.clone(), clone_assignment.clone())
+        .await
+        .unwrap();
+    let mut clone = running(clone_spec, clone_assignment);
+    clone.snapshot_source = Some(RestorePoint {
+        origin: Some(snapshot.origin().unwrap()),
+        id: snapshot.id,
+        artifact: artifact.clone(),
+        expires_at_unix_seconds: None,
+        source_runtime_id: snapshot.source_runtime_id,
+    });
+    session.commit(clone).await.unwrap();
+    let client = redis::Client::open(rig.url.as_str()).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    let _: u64 = redis::cmd("HDEL")
+        .arg("adx:{test}:control:v1:snapshots")
+        .arg("local-source")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert!(
+        !session
+            .checkpoint_cleanup_unreferenced(&snapshot_task, None)
+            .await
+            .unwrap(),
+        "a local snapshot source remains a live borrow when its catalog entry is missing"
+    );
+
+    let execution_artifact = local_artifact("/checkpoints/local-input", 1);
+    let execution_task = CheckpointCleanup {
+        assignment: retained_assignment(),
+        revision: 3,
+        artifacts: vec![execution_artifact.clone()],
+    };
+    let execution_assignment = Assignment {
+        environment_id: "execution-user".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 3,
+        devices: vec![],
+    };
+    session
+        .reserve(spec("execution-user"), execution_assignment.clone())
+        .await
+        .unwrap();
+    let mut execution = running(spec("execution-user"), execution_assignment);
+    execution.execution_artifacts.push(execution_artifact);
+    session.commit(execution).await.unwrap();
+    assert!(
+        !session
+            .checkpoint_cleanup_unreferenced(&execution_task, Some("clone"))
+            .await
+            .unwrap(),
+        "a local execution artifact remains a live input"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn cleanup_rejects_execution_hold_alias() {
+    use adx_coordinator::storage::NodeSession;
+
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    session
+        .register_session(
+            node("node"),
+            "127.0.0.1:9000".into(),
+            "127.0.0.1:9001".into(),
+            Some(NodeSession {
+                id: "old".into(),
+                sequence: 1,
+                routable: true,
+            }),
+        )
+        .await
+        .unwrap();
+    let assignment = Assignment {
+        environment_id: "held".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    session
+        .reserve(spec("held"), assignment.clone())
+        .await
+        .unwrap();
+    let artifact = artifact("held");
+    let mut record = running(spec("held"), assignment);
+    record.execution_artifacts.push(artifact.clone());
+    session.commit(record).await.unwrap();
+    session.invalidate_node("node", "old").await.unwrap();
+    let mut retired = session.get("held").await.unwrap().result.unwrap();
+    retired.state = EnvironmentState::Deleted;
+    retired.resources_held = false;
+    retired.runtime.ip = None;
+    retired.execution_artifacts.clear();
+    retired.revision += 1;
+    session.commit(retired).await.unwrap();
+
+    let task = CheckpointCleanup {
+        assignment: retained_assignment(),
+        revision: 3,
+        artifacts: vec![artifact],
+    };
+    assert!(
+        !session
+            .checkpoint_cleanup_unreferenced(&task, None)
+            .await
+            .unwrap(),
+        "an execution input hold survives the retired record"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn deleting_zero_sized_capture_reservation_creates_durable_cleanup_fence() {
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let assignment = Assignment {
+        environment_id: "capture".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    session
+        .reserve(spec("capture"), assignment.clone())
+        .await
+        .unwrap();
+    let reservation = local_artifact("/checkpoints/capture", 0);
+    let mut record = running(spec("capture"), assignment);
+    record.execution_artifacts.push(reservation.clone());
+    session.commit(record.clone()).await.unwrap();
+    let mut deleted = deleted(record);
+    deleted.execution_artifacts.clear();
+    session.commit(deleted.clone()).await.unwrap();
+
+    let recovered = rig.store().await.begin(1).await.unwrap();
+    let task = recovered
+        .checkpoint_cleanups()
+        .await
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(task.artifacts, vec![reservation]);
+    recovered.commit_with_cleanup(deleted, &[]).await.unwrap();
+    assert_eq!(
+        recovered.checkpoint_cleanups().await.unwrap(),
+        vec![task.clone()]
+    );
+
+    let reuse_assignment = Assignment {
+        environment_id: "capture-reuse".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 2,
+        devices: vec![],
+    };
+    recovered
+        .reserve(spec("capture-reuse"), reuse_assignment.clone())
+        .await
+        .unwrap();
+    let mut reuse = running(spec("capture-reuse"), reuse_assignment);
+    reuse.execution_artifacts.push(task.artifacts[0].clone());
+    assert_eq!(recovered.commit(reuse).await, Err(Error::Conflict));
 }
 
 fn retained_assignment() -> Assignment {

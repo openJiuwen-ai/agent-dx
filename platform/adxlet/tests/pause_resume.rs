@@ -22,11 +22,14 @@ struct Backend {
     checkpoint_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
     checkpoint_entered: tokio::sync::Notify,
     snapshots: Mutex<BTreeMap<String, adx_core::snapshots::Snapshot>>,
+    committed_records: Mutex<BTreeMap<String, EnvironmentRecord>>,
     fail_snapshot_publish: Mutex<bool>,
     running: Mutex<BTreeSet<String>>,
     events: Mutex<Vec<String>>,
     unavailable_commit: Mutex<bool>,
+    unavailable_state: Mutex<Option<EnvironmentState>>,
     fail_restore: Mutex<bool>,
+    unsupported_checkpoint: Mutex<bool>,
     fail_start: Mutex<bool>,
     activity: Mutex<Option<(u64, u64)>>,
     fail_prepare: Mutex<bool>,
@@ -38,6 +41,7 @@ struct Backend {
     workload_checkpoint_timeouts: Mutex<Vec<Duration>>,
     fail_workload_checkpoint: Mutex<bool>,
     workload_prepared: Mutex<bool>,
+    background_restore: Mutex<bool>,
 }
 impl Backend {
     fn event(&self, e: &str) {
@@ -54,6 +58,9 @@ impl Backend {
 #[async_trait]
 impl RuntimeDriver for Backend {
     fn retains_checkpoint_files(&self, runtime_class: &str) -> bool {
+        *self.background_restore.lock().unwrap() || runtime_class != "runsc"
+    }
+    fn retains_capture_files(&self, runtime_class: &str) -> bool {
         runtime_class != "runsc"
     }
     async fn inventory(&self) -> Result<Vec<adxlet::RuntimeObservation>> {
@@ -97,6 +104,9 @@ impl RuntimeDriver for Backend {
         Ok(())
     }
     async fn checkpoint_supported(&self, _: &str) -> Result<()> {
+        if *self.unsupported_checkpoint.lock().unwrap() {
+            return Err(Error::Invalid("unsupported checkpoint".into()));
+        }
         Ok(())
     }
     async fn checkpoint(&self, id: &str, path: &Path, _: Duration) -> Result<()> {
@@ -266,9 +276,19 @@ impl Routes for Backend {
 impl StateSink for Backend {
     async fn commit(&self, r: &EnvironmentRecord) -> Result<Durability> {
         self.event(&format!("commit:{:?}", r.state));
-        if *self.unavailable_commit.lock().unwrap() {
+        if *self.unavailable_commit.lock().unwrap()
+            && self
+                .unavailable_state
+                .lock()
+                .unwrap()
+                .is_none_or(|state| state == r.state)
+        {
             Err(Error::Unavailable("Coordinator unavailable".into()))
         } else {
+            self.committed_records
+                .lock()
+                .unwrap()
+                .insert(r.spec.id.clone(), r.clone());
             Ok(Durability::Published)
         }
     }
@@ -380,6 +400,7 @@ async fn replacing_checkpoint_cleans_previous_only_after_retry_publishes() {
     let running = h.resume(resume(paused.record.revision)).await.unwrap();
     let mut request = pause(running.record.revision);
     request.operation_id = "pause-c".into();
+    *backend.unavailable_state.lock().unwrap() = Some(EnvironmentState::Paused);
     *backend.unavailable_commit.lock().unwrap() = true;
     assert!(h.pause(request.clone()).await.is_err());
     assert!(Path::new(&first).exists());
@@ -456,7 +477,14 @@ async fn pause_resume_preserves_environment_changes_execution_and_fences_delayed
     );
     assert_eq!(
         *backend.events.lock().unwrap(),
-        ["prepare", "retire", "checkpoint", "remove", "commit:Paused"]
+        [
+            "prepare",
+            "commit:Running",
+            "retire",
+            "checkpoint",
+            "remove",
+            "commit:Paused"
+        ]
     );
     assert_eq!(
         h.pause(pause(created.record.revision)).await.unwrap(),
@@ -468,8 +496,14 @@ async fn pause_resume_preserves_environment_changes_execution_and_fences_delayed
     assert_ne!(running.record.runtime.id, created.record.runtime.id);
     assert_eq!(node.used(), spec.resources);
     assert_eq!(
-        &backend.events.lock().unwrap()[5..],
-        ["restore", "ready", "activate", "commit:Running"]
+        &backend.events.lock().unwrap()[6..],
+        [
+            "commit:Paused",
+            "restore",
+            "ready",
+            "activate",
+            "commit:Running"
+        ]
     );
     assert_eq!(
         h.resume(resume(paused.record.revision)).await.unwrap(),
@@ -492,6 +526,7 @@ async fn unpublished_pause_is_retried_by_commit_without_repeating_checkpoint() {
     let (_temp, backend, node, spec, assignment) = fixture();
     let h = node.environment(spec, assignment).unwrap();
     let created = h.create().await.unwrap();
+    *backend.unavailable_state.lock().unwrap() = Some(EnvironmentState::Paused);
     *backend.unavailable_commit.lock().unwrap() = true;
     assert!(h.pause(pause(created.record.revision)).await.is_err());
     assert!(!backend
@@ -547,7 +582,8 @@ async fn expiry_cleans_paused_environment_but_never_deletes_resumed_execution() 
     assert!(Path::new(&cp.artifact.location).exists());
     let r = h.sync().await.unwrap();
     assert_eq!(r.record.state, EnvironmentState::Running);
-    assert_eq!(r.record.checkpoint.as_ref().unwrap().id, cp.id);
+    assert!(r.record.checkpoint.is_none());
+    assert!(r.record.execution_artifacts.contains(&cp.artifact));
     let mut request = pause(r.record.revision);
     request.operation_id = "pause-c".into();
     let paused = h.pause(request).await.unwrap();
@@ -630,30 +666,30 @@ async fn restore_cleanup_failure_keeps_resources_and_invalidates_previous_operat
 
 struct UnavailablePublication(LocalCheckpointStore);
 #[async_trait]
-impl adxlet::checkpoint::CheckpointStore for UnavailablePublication {
+impl adxlet::checkpoint::CheckpointAccess for UnavailablePublication {
     fn storage_alias(&self) -> &str {
         "obs"
     }
-    async fn allocate(&self) -> Result<std::path::PathBuf> {
-        self.0.allocate().await
+    async fn begin_capture(&self) -> Result<std::path::PathBuf> {
+        self.0.begin_capture().await
     }
     async fn discard_staged(&self, p: &Path) -> Result<()> {
         self.0.discard_staged(p).await
     }
     async fn retain_staged(&self, p: &Path) -> Result<adx_core::CheckpointArtifact> {
-        self.0.publish(p).await
+        self.0.seal(p).await
     }
-    async fn publish(&self, _: &Path) -> Result<adx_core::CheckpointArtifact> {
+    async fn seal(&self, _: &Path) -> Result<adx_core::CheckpointArtifact> {
         Err(Error::Unavailable("storage unavailable".into()))
     }
-    async fn materialize(
+    async fn prepare_restore(
         &self,
         a: &adx_core::CheckpointArtifact,
-    ) -> Result<adxlet::checkpoint::MaterializedCheckpoint> {
-        self.0.materialize(a).await
+    ) -> Result<adxlet::checkpoint::RestoreAccess> {
+        self.0.prepare_restore(a).await
     }
-    async fn remove(&self, a: &adx_core::CheckpointArtifact) -> Result<()> {
-        self.0.remove(a).await
+    async fn release(&self, a: &adx_core::CheckpointArtifact) -> Result<()> {
+        self.0.release(a).await
     }
 }
 
@@ -662,37 +698,37 @@ struct SharedPublication {
     backend: Arc<Backend>,
 }
 #[async_trait]
-impl adxlet::checkpoint::CheckpointStore for SharedPublication {
+impl adxlet::checkpoint::CheckpointAccess for SharedPublication {
     fn storage_alias(&self) -> &str {
         "shared"
     }
-    async fn allocate(&self) -> Result<std::path::PathBuf> {
-        self.local.allocate().await
+    async fn begin_capture(&self) -> Result<std::path::PathBuf> {
+        self.local.begin_capture().await
     }
     async fn discard_staged(&self, path: &Path) -> Result<()> {
         self.local.discard_staged(path).await
     }
     async fn retain_staged(&self, path: &Path) -> Result<adx_core::CheckpointArtifact> {
-        self.local.publish(path).await
+        self.local.seal(path).await
     }
-    async fn publish(&self, path: &Path) -> Result<adx_core::CheckpointArtifact> {
+    async fn seal(&self, path: &Path) -> Result<adx_core::CheckpointArtifact> {
         self.backend.event("checkpoint-publish");
-        let mut artifact = self.local.publish(path).await?;
+        let mut artifact = self.local.seal(path).await?;
         artifact.storage = "shared".into();
         Ok(artifact)
     }
-    async fn materialize(
+    async fn prepare_restore(
         &self,
         artifact: &adx_core::CheckpointArtifact,
-    ) -> Result<adxlet::checkpoint::MaterializedCheckpoint> {
+    ) -> Result<adxlet::checkpoint::RestoreAccess> {
         let mut local = artifact.clone();
         local.storage = "local".into();
-        self.local.materialize(&local).await
+        self.local.prepare_restore(&local).await
     }
-    async fn remove(&self, artifact: &adx_core::CheckpointArtifact) -> Result<()> {
+    async fn release(&self, artifact: &adx_core::CheckpointArtifact) -> Result<()> {
         let mut local = artifact.clone();
         local.storage = "local".into();
-        self.local.remove(&local).await
+        self.local.release(&local).await
     }
     async fn committed(&self, _: &adx_core::CheckpointArtifact) -> Result<()> {
         self.backend.event("checkpoint-store-committed");
@@ -1006,12 +1042,12 @@ async fn authoritative_paused_record_with_missing_local_artifact_becomes_failed(
 #[tokio::test]
 async fn reconciliation_preserves_ready_and_deleting_reusable_snapshots() {
     use adx_core::snapshots::{Reference, Snapshot};
-    use adxlet::checkpoint::CheckpointStore;
+    use adxlet::checkpoint::CheckpointAccess;
     let (temp, _, node, spec, _) = fixture();
     let store = LocalCheckpointStore::new(temp.path().into()).unwrap();
-    let path = store.allocate().await.unwrap();
+    let path = store.begin_capture().await.unwrap();
     std::fs::write(path.join("memory"), b"snapshot memory").unwrap();
-    let artifact = store.publish(&path).await.unwrap();
+    let artifact = store.seal(&path).await.unwrap();
     let mut snapshot = Snapshot::new(
         "saved".into(),
         vec![],
@@ -1021,7 +1057,7 @@ async fn reconciliation_preserves_ready_and_deleting_reusable_snapshots() {
         artifact,
     )
     .unwrap();
-    let orphan = store.allocate().await.unwrap();
+    let orphan = store.begin_capture().await.unwrap();
     node.reconcile_catalog(vec![], vec![snapshot.clone()])
         .await
         .unwrap();
@@ -1035,7 +1071,7 @@ async fn reconciliation_preserves_ready_and_deleting_reusable_snapshots() {
             },
         )
         .unwrap();
-    snapshot.delete("tenant").unwrap();
+    assert!(snapshot.delete("tenant").is_err());
     node.reconcile_catalog(vec![], vec![snapshot.clone()])
         .await
         .unwrap();
@@ -1059,10 +1095,10 @@ async fn reconciliation_preserves_ready_and_deleting_reusable_snapshots() {
 #[tokio::test]
 async fn snapshot_collection_requires_closed_references_and_is_retryable() {
     use adx_core::snapshots::{Reference, Snapshot};
-    use adxlet::checkpoint::CheckpointStore;
+    use adxlet::checkpoint::CheckpointAccess;
     let (temp, _, node, spec, _) = fixture();
     let store = LocalCheckpointStore::new(temp.path().into()).unwrap();
-    let path = store.allocate().await.unwrap();
+    let path = store.begin_capture().await.unwrap();
     std::fs::write(path.join("memory"), b"saved memory").unwrap();
     let mut snapshot = Snapshot::new(
         "saved".into(),
@@ -1070,7 +1106,7 @@ async fn snapshot_collection_requires_closed_references_and_is_retryable() {
         spec,
         "node".into(),
         "environment-1".into(),
-        store.publish(&path).await.unwrap(),
+        store.seal(&path).await.unwrap(),
     )
     .unwrap();
     assert!(node.collect_snapshot(&snapshot, false).await.is_err());
@@ -1078,10 +1114,11 @@ async fn snapshot_collection_requires_closed_references_and_is_retryable() {
         environment_id: "clone".into(),
     };
     snapshot.acquire("tenant", reference.clone()).unwrap();
-    snapshot.delete("tenant").unwrap();
+    assert!(snapshot.delete("tenant").is_err());
     assert!(node.collect_snapshot(&snapshot, false).await.is_err());
     assert!(path.exists());
     snapshot.release(&reference).unwrap();
+    snapshot.delete("tenant").unwrap();
     let mut foreign = snapshot.clone();
     foreign.source_node_id = "other".into();
     assert!(node.collect_snapshot(&foreign, false).await.is_err());
@@ -1107,6 +1144,20 @@ impl adxlet::checkpoint::SnapshotCatalog for Backend {
         if *self.fail_snapshot_publish.lock().unwrap() {
             return Err(Error::Unavailable("catalog unavailable".into()));
         }
+        // Match Coordinator's real publication precondition: a source must
+        // commit its temporary artifact hold before the catalog accepts it.
+        if !self
+            .committed_records
+            .lock()
+            .unwrap()
+            .get(&snapshot.template.id)
+            .is_some_and(|record| {
+                record.runtime.id == snapshot.source_runtime_id
+                    && record.execution_artifacts.contains(&snapshot.artifact)
+            })
+        {
+            return Err(Error::Conflict);
+        }
         self.snapshots
             .lock()
             .unwrap()
@@ -1130,16 +1181,12 @@ async fn reusable_snapshot_survives_source_deletion_and_retries_without_checkpoi
     let saved = h.snapshot(request.clone()).await.unwrap();
     assert_eq!(saved.environment.record.state, EnvironmentState::Running);
     assert_eq!(saved.environment.durability, Durability::Published);
-    assert_ne!(
-        saved.snapshot.artifact,
-        saved
-            .environment
-            .record
-            .checkpoint
-            .as_ref()
-            .unwrap()
-            .artifact
-    );
+    assert!(saved.environment.record.checkpoint.is_none());
+    assert!(saved
+        .environment
+        .record
+        .execution_artifacts
+        .contains(&saved.snapshot.artifact));
     let replay = h.snapshot(request.clone()).await.unwrap();
     assert_eq!(saved.snapshot, replay.snapshot);
     assert_eq!(
@@ -1148,7 +1195,7 @@ async fn reusable_snapshot_survives_source_deletion_and_retries_without_checkpoi
             .lock()
             .unwrap()
             .iter()
-            .filter(|e| e.as_str() == "checkpoint")
+            .filter(|e| e.as_str() == "checkpoint-running")
             .count(),
         1
     );
@@ -1206,7 +1253,7 @@ async fn snapshot_checkpoint_commit_failure_still_attempts_source_resume() {
 }
 
 #[tokio::test]
-async fn clone_owns_its_checkpoint_after_source_and_snapshot_are_deleted() {
+async fn clone_borrows_snapshot_and_blocks_deletion_until_it_releases_input() {
     use adx_core::snapshots::Reference;
     let (_temp, backend, node, spec, assignment) = fixture();
     let source = node.environment(spec.clone(), assignment.clone()).unwrap();
@@ -1247,8 +1294,9 @@ async fn clone_owns_its_checkpoint_after_source_and_snapshot_are_deleted() {
     assert!(clone.create().await.is_err());
     let created = clone.create_from_snapshot(snapshot.clone()).await.unwrap();
     assert_eq!(created.record.spec.id, "clone");
-    let cp = created.record.checkpoint.as_ref().unwrap();
-    assert_ne!(cp.artifact, snapshot.artifact);
+    assert!(created.record.checkpoint.is_none());
+    let cp = created.record.snapshot_source.as_ref().unwrap();
+    assert_eq!(cp.artifact, snapshot.artifact);
     assert_eq!(cp.origin.as_ref().unwrap().environment_id, "environment");
     assert_eq!(
         backend
@@ -1260,6 +1308,15 @@ async fn clone_owns_its_checkpoint_after_source_and_snapshot_are_deleted() {
             .count(),
         starts
     );
+    assert!(matches!(
+        snapshot.delete("tenant"),
+        Err(Error::SnapshotInUse { .. })
+    ));
+    assert!(Path::new(&snapshot.artifact.location).exists());
+    let paused = clone.pause(pause(created.record.revision)).await.unwrap();
+    assert!(paused.record.checkpoint.as_ref().unwrap().origin.is_none());
+    clone.resume(resume(paused.record.revision)).await.unwrap();
+    clone.delete().await.unwrap();
     snapshot
         .release(&Reference::Restore {
             environment_id: "clone".into(),
@@ -1268,19 +1325,6 @@ async fn clone_owns_its_checkpoint_after_source_and_snapshot_are_deleted() {
     snapshot.delete("tenant").unwrap();
     node.collect_snapshot(&snapshot, false).await.unwrap();
     assert!(!Path::new(&snapshot.artifact.location).exists());
-    assert!(Path::new(&cp.artifact.location).exists());
-    assert_eq!(
-        clone
-            .create_from_snapshot(snapshot.clone())
-            .await
-            .unwrap_err(),
-        Error::Conflict
-    );
-    let paused = clone.pause(pause(created.record.revision)).await.unwrap();
-    assert!(paused.record.checkpoint.as_ref().unwrap().origin.is_none());
-    clone.resume(resume(paused.record.revision)).await.unwrap();
-    clone.delete().await.unwrap();
-    assert!(!Path::new(&cp.artifact.location).exists());
     assert!(backend.running.lock().unwrap().is_empty());
 }
 
@@ -1332,6 +1376,8 @@ async fn recovery_with_unusable_checkpoint_settles_failed_without_image_start() 
     let (_temp, backend, node, spec, mut assignment) = fixture();
     assignment.generation = 2;
     let record = EnvironmentRecord {
+        execution_artifacts: vec![],
+        snapshot_source: None,
         failure: None,
         spec,
         assignment,
@@ -1383,74 +1429,113 @@ async fn recovery_with_unusable_checkpoint_settles_failed_without_image_start() 
 
 #[tokio::test]
 async fn recovery_retries_publication_without_repeating_backend_restore() {
-    use adxlet::checkpoint::{CheckpointStore, ObjectCheckpointStore};
-    let (temp, backend, _, spec, mut assignment) = fixture();
-    let store = Arc::new(
-        ObjectCheckpointStore::new(
-            "shared".into(),
-            "test-shared".into(),
-            Arc::new(object_store::memory::InMemory::new()),
-            "test".into(),
-            temp.path().into(),
-            1024,
+    use adxlet::checkpoint::{CheckpointAccess, ObjectCheckpointStore};
+    for failure_state in [EnvironmentState::Paused, EnvironmentState::Running] {
+        let (temp, backend, _, spec, mut assignment) = fixture();
+        let store = Arc::new(
+            ObjectCheckpointStore::new_scoped(
+                "shared".into(),
+                "test-shared".into(),
+                Arc::new(object_store::memory::InMemory::new()),
+                "test".into(),
+                temp.path().into(),
+                1024,
+            )
+            .unwrap(),
+        );
+        let path = store.begin_capture().await.unwrap();
+        std::fs::write(path.join("memory"), b"actual saved memory").unwrap();
+        let artifact = store.seal(&path).await.unwrap();
+        let node = Adxlet::new(
+            "node".into(),
+            backend.clone(),
+            backend.clone(),
+            backend.clone(),
+            backend.clone(),
         )
-        .unwrap(),
-    );
-    let path = store.allocate().await.unwrap();
-    std::fs::write(path.join("memory"), b"actual saved memory").unwrap();
-    let artifact = store.publish(&path).await.unwrap();
-    let node = Adxlet::new(
-        "node".into(),
-        backend.clone(),
-        backend.clone(),
-        backend.clone(),
-        backend.clone(),
-    )
-    .with_checkpointing(store, backend.clone())
-    .unwrap();
-    node.update_capacity(spec.resources, Duration::from_secs(60))
+        .with_checkpointing(store, backend.clone())
         .unwrap();
-    assignment.generation = 2;
-    let seed = EnvironmentRecord {
-        failure: None,
-        spec,
-        assignment,
-        runtime: adx_core::Runtime {
-            id: "environment-2".into(),
-            ip: None,
-        },
-        state: EnvironmentState::Paused,
-        revision: 1,
-        resources_held: false,
-        checkpoint: Some(adx_core::RestorePoint {
-            id: "recovery".into(),
-            source_runtime_id: "environment-1".into(),
-            expires_at_unix_seconds: None,
-            origin: Some(adx_core::runtime::RuntimeIdentity {
-                environment_id: "environment".into(),
-                runtime_id: "environment-1".into(),
-                ownership_generation: 1,
+        node.update_capacity(spec.resources, Duration::from_secs(60))
+            .unwrap();
+        assignment.generation = 2;
+        let seed = EnvironmentRecord {
+            execution_artifacts: vec![],
+            snapshot_source: None,
+            failure: None,
+            spec,
+            assignment,
+            runtime: adx_core::Runtime {
+                id: "environment-2".into(),
+                ip: None,
+            },
+            state: EnvironmentState::Paused,
+            revision: 1,
+            resources_held: false,
+            checkpoint: Some(adx_core::RestorePoint {
+                id: "recovery".into(),
+                source_runtime_id: "environment-1".into(),
+                expires_at_unix_seconds: None,
+                origin: Some(adx_core::runtime::RuntimeIdentity {
+                    environment_id: "environment".into(),
+                    runtime_id: "environment-1".into(),
+                    ownership_generation: 1,
+                }),
+                artifact,
             }),
-            artifact,
-        }),
-        last_operation: None,
-        restart_attempts: 0,
-        restart_pending: false,
-    };
-    *backend.unavailable_commit.lock().unwrap() = true;
-    assert!(node.recover_environment(seed.clone()).await.is_err());
-    assert_eq!(backend.running.lock().unwrap().len(), 1);
-    *backend.unavailable_commit.lock().unwrap() = false;
-    let result = node.recover_environment(seed.clone()).await.unwrap();
-    assert_eq!(result.durability, Durability::Published);
-    assert_eq!(result.record.state, EnvironmentState::Running);
-    assert_eq!(
-        node.recover_environment(seed).await.unwrap().record,
-        result.record
-    );
-    let events = backend.events.lock().unwrap();
-    assert_eq!(events.iter().filter(|e| *e == "restore").count(), 1);
-    assert!(!events.iter().any(|e| e == "start"));
+            last_operation: None,
+            restart_attempts: 0,
+            restart_pending: false,
+        };
+        *backend.unavailable_state.lock().unwrap() = Some(failure_state);
+        *backend.unavailable_commit.lock().unwrap() = true;
+        assert!(node.recover_environment(seed.clone()).await.is_err());
+        assert_eq!(
+            backend.running.lock().unwrap().len(),
+            usize::from(failure_state == EnvironmentState::Running)
+        );
+        *backend.unavailable_commit.lock().unwrap() = false;
+        // Coordinator can restart after the input hold was published. Its retry
+        // then carries that newer Paused record, not the original revision one.
+        let mut progress = seed.clone();
+        progress.revision += 1;
+        progress.execution_artifacts = vec![seed.checkpoint.as_ref().unwrap().artifact.clone()];
+        let handle = node
+            .environment(seed.spec.clone(), seed.assignment.clone())
+            .unwrap();
+        assert_eq!(
+            handle
+                .resume(ResumeRequest {
+                    operation_id: "recover-2".into(),
+                    expected_revision: progress.revision
+                })
+                .await
+                .unwrap_err(),
+            Error::Conflict
+        );
+        let result = node.recover_environment(progress.clone()).await.unwrap();
+        assert_eq!(result.durability, Durability::Published);
+        assert_eq!(result.record.state, EnvironmentState::Running);
+        assert_eq!(
+            result
+                .record
+                .last_operation
+                .as_ref()
+                .unwrap()
+                .expected_revision,
+            1
+        );
+        assert_eq!(
+            node.recover_environment(progress).await.unwrap().record,
+            result.record
+        );
+        assert_eq!(
+            node.recover_environment(seed).await.unwrap().record,
+            result.record
+        );
+        let events = backend.events.lock().unwrap();
+        assert_eq!(events.iter().filter(|e| *e == "restore").count(), 1);
+        assert!(!events.iter().any(|e| e == "start"));
+    }
 }
 
 #[tokio::test]
@@ -1873,7 +1958,7 @@ async fn traffic_during_capture_waits_then_resumes_without_replaying_capture() {
 }
 
 #[tokio::test]
-async fn retired_controller_reclaims_unreferenced_shared_checkpoint() {
+async fn retired_controller_leaves_shared_checkpoint_for_coordinator() {
     retired_shared_checkpoint(Some(false)).await;
 }
 #[tokio::test]
@@ -1885,10 +1970,10 @@ async fn retired_controller_preserves_shared_checkpoint_without_global_catalog()
     retired_shared_checkpoint(None).await;
 }
 async fn retired_shared_checkpoint(retained: Option<bool>) {
-    use adxlet::checkpoint::{CheckpointStore, ObjectCheckpointStore};
+    use adxlet::checkpoint::{CheckpointAccess, ObjectCheckpointStore};
     let (temp, backend, _, mut spec, assignment) = fixture();
     let store = Arc::new(
-        ObjectCheckpointStore::new(
+        ObjectCheckpointStore::new_scoped(
             "shared".into(),
             "test-shared".into(),
             Arc::new(object_store::memory::InMemory::new()),
@@ -1933,20 +2018,21 @@ async fn retired_shared_checkpoint(retained: Option<bool>) {
     } else {
         node.reconcile_catalog(vec![], vec![]).await.unwrap();
     }
-    assert_eq!(
+    assert!(
         store.validate_artifact(&artifact).await.is_ok(),
-        retained != Some(false)
+        "node cleanup cannot delete shared objects"
     );
 }
 
 #[tokio::test]
 async fn object_restore_over_quota_releases_runsc_files_and_protects_firecracker() {
     use adxlet::checkpoint::ObjectCheckpointStore;
-    for runtime_class in ["runsc", "firecracker"] {
+    for (runtime_class, background) in [("runsc", false), ("runsc", true), ("firecracker", false)] {
         let (root, backend, _, mut spec, assignment) = fixture();
+        *backend.background_restore.lock().unwrap() = background;
         spec.runtime_class = runtime_class.into();
         let store = Arc::new(
-            ObjectCheckpointStore::new(
+            ObjectCheckpointStore::new_scoped(
                 "shared".into(),
                 "test-shared".into(),
                 Arc::new(object_store::memory::InMemory::new()),
@@ -1977,7 +2063,7 @@ async fn object_restore_over_quota_releases_runsc_files_and_protects_firecracker
         let running = h.resume(resume(paused.record.revision)).await.unwrap();
         assert_eq!(running.record.state, EnvironmentState::Running);
         store.evict_unreferenced(0).await.unwrap();
-        if runtime_class == "runsc" {
+        if runtime_class == "runsc" && !background {
             assert!(
                 !restored_path.exists(),
                 "synchronous runsc restore releases its inputs"
@@ -1985,7 +2071,7 @@ async fn object_restore_over_quota_releases_runsc_files_and_protects_firecracker
         } else {
             assert!(
                 restored_path.join("memory").exists(),
-                "Firecracker base remains pinned despite quota pressure"
+                "background restore input or Firecracker base remains pinned despite quota pressure"
             );
         }
         h.delete().await.unwrap();
@@ -2006,7 +2092,7 @@ async fn object_pause_seeds_same_node_resume_without_remote_manifest() {
     let (root, backend, _, spec, assignment) = fixture();
     let remote: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
     let store = Arc::new(
-        ObjectCheckpointStore::new(
+        ObjectCheckpointStore::new_scoped(
             "shared".into(),
             "test-shared".into(),
             remote.clone(),
@@ -2073,5 +2159,133 @@ async fn idle_pause_after_aborted_prepare_uses_a_new_operation() {
     assert_eq!(
         handle.sync().await.unwrap().record.state,
         EnvironmentState::Paused
+    );
+}
+
+#[tokio::test]
+async fn pause_retries_input_publication_without_capturing_twice() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let h = node.environment(spec, assignment).unwrap();
+    let created = h.create().await.unwrap();
+    let request = pause(created.record.revision);
+    *backend.unavailable_commit.lock().unwrap() = true;
+    assert!(h.pause(request.clone()).await.is_err());
+    assert!(backend
+        .running
+        .lock()
+        .unwrap()
+        .contains(&created.record.runtime.id));
+    assert!(!backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|e| e == "checkpoint"));
+    *backend.unavailable_commit.lock().unwrap() = false;
+    let paused = h.pause(request).await.unwrap();
+    assert_eq!(paused.record.state, EnvironmentState::Paused);
+    assert_eq!(
+        backend
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| *e == "checkpoint")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn unsupported_snapshot_does_not_stop_source_or_allocate_capture() {
+    let (temp, backend, node, spec, assignment) = fixture();
+    let h = node.environment(spec, assignment).unwrap();
+    let created = h.create().await.unwrap();
+    *backend.unsupported_checkpoint.lock().unwrap() = true;
+    assert!(h
+        .snapshot(adxlet::checkpoint::SnapshotRequest {
+            operation_id: "snapshot-unsupported".into(),
+            expected_revision: created.record.revision,
+            names: vec![],
+            timeout_seconds: 30
+        })
+        .await
+        .is_err());
+    assert!(backend
+        .running
+        .lock()
+        .unwrap()
+        .contains(&created.record.runtime.id));
+    assert_eq!(h.sync().await.unwrap().record, created.record);
+    assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+}
+
+#[tokio::test]
+async fn runsc_capture_preserves_background_restore_input_without_pinning_new_capture() {
+    let (root, backend, _, mut spec, assignment) = fixture();
+    let store = Arc::new(
+        adxlet::checkpoint::ObjectCheckpointStore::new(
+            "shared".into(),
+            Arc::new(object_store::memory::InMemory::new()),
+            "test".into(),
+            root.path().into(),
+            1,
+        )
+        .unwrap()
+        .with_max_entries(1)
+        .unwrap(),
+    );
+    let node = Adxlet::new(
+        "node".into(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+    )
+    .with_checkpointing(store.clone(), backend.clone())
+    .unwrap()
+    .with_snapshot_catalog(backend.clone())
+    .unwrap();
+    node.update_capacity(spec.resources, Duration::from_secs(300))
+        .unwrap();
+    spec.runtime_class = "runsc".into();
+    *backend.background_restore.lock().unwrap() = true;
+    let h = node.environment(spec, assignment).unwrap();
+    let created = h.create().await.unwrap();
+    let paused = h.pause(pause(created.record.revision)).await.unwrap();
+    let input = paused.record.checkpoint.as_ref().unwrap().artifact.clone();
+    let running = h.resume(resume(paused.record.revision)).await.unwrap();
+    assert!(running.record.execution_artifacts.contains(&input));
+    let snapshot = h
+        .snapshot(adxlet::checkpoint::SnapshotRequest {
+            operation_id: "capture-after-background-restore".into(),
+            expected_revision: running.record.revision,
+            names: vec![],
+            timeout_seconds: 60,
+        })
+        .await
+        .unwrap();
+    assert!(snapshot
+        .environment
+        .record
+        .execution_artifacts
+        .contains(&input));
+    assert!(!snapshot
+        .environment
+        .record
+        .execution_artifacts
+        .contains(&snapshot.snapshot.artifact));
+    store.evict_unreferenced(0).await.unwrap();
+    let input_path = root.path().join("cache").join(&input.location);
+    assert!(
+        input_path.join("memory").exists(),
+        "new capture must not unpin an ongoing background restore"
+    );
+    let deleted = h.delete().await.unwrap();
+    assert!(deleted.record.execution_artifacts.is_empty());
+    store.evict_unreferenced(0).await.unwrap();
+    assert!(
+        !input_path.exists(),
+        "stopped execution releases the cache input"
     );
 }

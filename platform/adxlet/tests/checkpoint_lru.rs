@@ -1,6 +1,6 @@
 use adx_core::CheckpointArtifact;
 use adxlet::checkpoint::{
-    CheckpointStore, ObjectCheckpointStore, StorageConfig, DEFAULT_CACHE_BUDGET_BYTES,
+    CheckpointAccess, ObjectCheckpointStore, StorageConfig, DEFAULT_CACHE_BUDGET_BYTES,
     DEFAULT_CACHE_MAX_ENTRIES,
 };
 use object_store::{memory::InMemory, path::Path as Key, ObjectStore, ObjectStoreExt};
@@ -12,7 +12,7 @@ fn store(
     bytes: u64,
     entries: usize,
 ) -> ObjectCheckpointStore {
-    ObjectCheckpointStore::new(
+    ObjectCheckpointStore::new_scoped(
         "shared".into(),
         "scope".into(),
         remote,
@@ -28,9 +28,9 @@ async fn publish(
     store: &ObjectCheckpointStore,
     value: &[u8],
 ) -> (CheckpointArtifact, std::path::PathBuf) {
-    let path = store.allocate().await.unwrap();
+    let path = store.begin_capture().await.unwrap();
     std::fs::write(path.join("memory"), value).unwrap();
-    let artifact = store.publish(&path).await.unwrap();
+    let artifact = store.seal(&path).await.unwrap();
     (artifact, path)
 }
 async fn pause(
@@ -89,7 +89,7 @@ async fn entry_limit_evicts_lru_and_keeps_obs_recoverable() {
     let store = store(root.path(), remote.clone(), DEFAULT_CACHE_BUDGET_BYTES, 2);
     let (a, ap) = pause(&store, b"first").await;
     let (b, bp) = pause(&store, b"second").await;
-    drop(store.materialize(&a).await.unwrap());
+    drop(store.prepare_restore(&a).await.unwrap());
     store
         .evict_unreferenced(DEFAULT_CACHE_BUDGET_BYTES)
         .await
@@ -102,7 +102,7 @@ async fn entry_limit_evicts_lru_and_keeps_obs_recoverable() {
         .head(&Key::from(format!("test/{}/manifest.json", b.location)))
         .await
         .is_ok());
-    let restored = store.materialize(&b).await.unwrap();
+    let restored = store.prepare_restore(&b).await.unwrap();
     assert_eq!(std::fs::read(restored.join("memory")).unwrap(), b"second");
 }
 #[tokio::test]
@@ -137,7 +137,7 @@ async fn all_pinned_entries_do_not_block_another_restore() {
     let mut artifacts = vec![];
     for value in [b"first".as_slice(), b"second", b"third"] {
         let (artifact, _) = publish(&store, value).await;
-        let lease = store.materialize(&artifact).await.unwrap();
+        let lease = store.prepare_restore(&artifact).await.unwrap();
         store.committed(&artifact).await.unwrap();
         assert_eq!(std::fs::read(lease.join("memory")).unwrap(), value);
         leases.push(lease);
@@ -167,8 +167,8 @@ async fn oversized_cold_download_is_reclaimed_after_last_lease() {
         "oversized Pause does not retain a reusable copy"
     );
     let target = store(&root.path().join("target"), remote, 1, 1);
-    let first = target.materialize(&artifact).await.unwrap();
-    let second = target.materialize(&artifact).await.unwrap();
+    let first = target.prepare_restore(&artifact).await.unwrap();
+    let second = target.prepare_restore(&artifact).await.unwrap();
     let path = first.to_path_buf();
     assert_eq!(
         path,
@@ -189,7 +189,7 @@ async fn restart_rebuilds_recency_before_enforcing_smaller_entry_limit() {
     let (a, ap) = pause(&old, b"first").await;
     let (b, bp) = pause(&old, b"second").await;
     let (c, cp) = pause(&old, b"third").await;
-    drop(old.materialize(&a).await.unwrap());
+    drop(old.prepare_restore(&a).await.unwrap());
     old.evict_unreferenced(DEFAULT_CACHE_BUDGET_BYTES)
         .await
         .unwrap();
@@ -212,7 +212,7 @@ async fn restart_protects_live_files_before_trimming_and_cleans_partial_download
     std::fs::create_dir(&partial).unwrap();
     std::fs::write(partial.join("memory"), b"partial").unwrap();
     let current = store(root.path(), remote, 1, 1);
-    let lease = current.materialize(&a).await.unwrap();
+    let lease = current.prepare_restore(&a).await.unwrap();
     current.reconcile_local(&[a, b]).await.unwrap();
     assert!(ap.exists());
     assert!(!bp.exists());
@@ -236,7 +236,7 @@ async fn reconciliation_drops_unretained_and_corrupt_copies_then_obs_restores() 
         .unwrap();
     assert!(!ap.exists());
     assert!(!orphan.exists());
-    let restored = current.materialize(&a).await.unwrap();
+    let restored = current.prepare_restore(&a).await.unwrap();
     assert_eq!(std::fs::read(restored.join("memory")).unwrap(), b"correct");
 }
 #[tokio::test]
@@ -256,7 +256,7 @@ async fn same_artifact_concurrent_materialize_shares_one_download() {
         let target = target.clone();
         let artifact = artifact.clone();
         tasks.push(tokio::spawn(async move {
-            target.materialize(&artifact).await.unwrap()
+            target.prepare_restore(&artifact).await.unwrap()
         }));
     }
     let mut leases = vec![];
@@ -285,7 +285,7 @@ async fn restart_without_index_preserves_the_live_original_staging_path() {
     )
     .unwrap();
     let current = store(root.path(), remote, 1, 1);
-    let lease = current.materialize(&artifact).await.unwrap();
+    let lease = current.prepare_restore(&artifact).await.unwrap();
     assert_eq!(
         lease.to_path_buf(),
         staged,
@@ -306,7 +306,7 @@ async fn uncommitted_upload_is_not_a_reusable_eviction_candidate() {
     let root = tempfile::tempdir().unwrap();
     let store = store(root.path(), Arc::new(InMemory::new()), 1, 1);
     let (artifact, staged) = publish(&store, b"awaiting-authoritative-commit").await;
-    drop(store.materialize(&artifact).await.unwrap());
+    drop(store.prepare_restore(&artifact).await.unwrap());
     store.evict_unreferenced(0).await.unwrap();
     assert!(
         staged.exists(),

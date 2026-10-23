@@ -1,5 +1,6 @@
 //! Real Redis and gRPC; runtime memory and object storage are controlled fixtures.
 mod common;
+use adx_checkpoint_storage::ObjectCheckpointStore;
 use adx_coordinator::{rpc::CoordinatorRpc, storage::Session, Placement};
 use adx_core::{EnvironmentRecord, EnvironmentSpec, Resources, Result};
 use adx_protocol::{
@@ -8,7 +9,7 @@ use adx_protocol::{
 };
 use adx_transport::rpc::{RpcChannel, RpcClient};
 use adxlet::{
-    checkpoint::{CheckpointCooperation, ObjectCheckpointStore},
+    checkpoint::CheckpointCooperation,
     rpc::{CoordinatorStateSink, NodeRpc},
     Adxlet, Readiness, Routes, RuntimeDriver,
 };
@@ -243,7 +244,7 @@ async fn worker(
     .unwrap()
     .with_session(session.clone());
     let store = Arc::new(
-        ObjectCheckpointStore::new(
+        ObjectCheckpointStore::new_scoped(
             "obs".into(),
             "test-shared".into(),
             remote,
@@ -755,7 +756,7 @@ async fn multiple_ingress_and_manual_resume_restore_once_on_original_node() {
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
 async fn definite_local_capacity_rejection_restores_same_state_on_another_node() {
-    use adxlet::checkpoint::CheckpointStore;
+    use adx_checkpoint_storage::CheckpointAccess;
     let mut rig = Rig::new(Duration::from_secs(2)).await;
     rig.source
         .manager
@@ -830,9 +831,9 @@ async fn definite_local_capacity_rejection_restores_same_state_on_another_node()
                 .collect::<Result<Vec<_>>>()
                 .unwrap(),
             catalog
-                .retained_checkpoints
+                .retained_artifacts
                 .into_iter()
-                .map(|cp| adx_core::RestorePoint::try_from(cp).map(|cp| cp.artifact))
+                .map(adx_core::CheckpointArtifact::try_from)
                 .collect::<Result<Vec<_>>>()
                 .unwrap(),
         )
@@ -1742,17 +1743,17 @@ async fn background_resume_round_does_not_starve_later_intents() {
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
-async fn original_checkpoint_cache_pressure_is_definite_capacity_rejection() {
-    use adxlet::checkpoint::CheckpointStore;
+async fn original_checkpoint_cache_pressure_does_not_reject_resume() {
+    use adx_checkpoint_storage::CheckpointAccess;
     let rig = Rig::new(Duration::from_secs(2)).await;
-    let stage = rig.source.store.allocate().await.unwrap();
+    let stage = rig.source.store.begin_capture().await.unwrap();
     std::fs::write(stage.join("occupied"), vec![42; 1024]).unwrap();
-    let artifact = rig.source.store.publish(&stage).await.unwrap();
-    let active = rig.source.store.materialize(&artifact).await.unwrap();
+    let artifact = rig.source.store.seal(&stage).await.unwrap();
+    let active = rig.source.store.prepare_restore(&artifact).await.unwrap();
     let restored = rig.resume(false).await.unwrap().record.unwrap();
-    assert_eq!(restored.assignment.unwrap().node_id, "b");
-    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 0);
-    assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 1);
+    assert_eq!(restored.assignment.unwrap().node_id, "a");
+    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.target.backend.restored.load(Ordering::SeqCst), 0);
     assert_eq!(
         std::fs::read(active.join("occupied")).unwrap(),
         vec![42; 1024]

@@ -13,13 +13,13 @@
 | 执行平台 `platform/` | 通用 Environment、调度、持久化、节点生命周期、Execd | Coordinator、adxlet、本地优先创建及 EROFS/OCI 运行环境已接入；沿用已有实现；本次验证见 [命名调整记录](../testing/environment-naming.md) |
 | 共享接入 `gateway/` | Environment API Server、Ingress、Relay、反向代理与转发 | API Server 默认内嵌 Ingress；adxlet 默认内嵌 Relay；Agent API 装配于 Ingress，业务规则归 Agent 层 |
 
-Agent API 在 Gateway Ingress 内处理产品请求。独立模式通过 ActivatorClient 调用远程 Activator，后者经 API Server Environment HTTP 接口访问平台；API Server 内嵌模式通过 LocalControl 调用同进程 Activator，直接复用 Environment 应用服务。两种模式均由 Activator 持久化 Template/AgentBinding。Agent 执行规格先由 Activator 的共享 mapper 转为 Environment 请求；API Server 应用服务再统一校验、转换为 EnvironmentSpec 并注入 runtime。Gateway 与 Activator 均缓存不可变模板；Activator 的 AgentBinding 激活缓存采用有界 LRU，默认 200000 条、5 小时滑动 TTL，请求命中续期，过期检查只随请求发生。独立模式全热解析只有一次 Activator RPC，嵌入式模式仅本地调用，不访问 Agent Redis 或 Environment API。bypass 在查询权威状态前失效旧绑定，HTTP/WS 的发送前目标重试自动启用并固定 generation；删除中的并发请求允许成功或失败，缓存不代表实时健康。
+Agent API 在 Gateway Ingress 内处理产品请求。独立模式通过 ActivatorClient 调用远程 Activator，后者经 API Server Environment HTTP 接口访问平台；API Server 内嵌模式通过 LocalControl 调用同进程 Activator，直接复用 Environment 应用服务。两种模式均由 Activator 持久化 Template/AgentBinding。Agent 执行规格先由 Activator 的共享 mapper 转为 Environment 请求；API Server 应用服务再统一校验、转换为 EnvironmentSpec 并注入 runtime。Gateway 与 Activator 均缓存不可变模板；Activator 的 AgentBinding 激活缓存采用有界 LRU，默认 200000 条、5 小时滑动 TTL，请求命中续期，过期检查只随请求发生。独立模式全热解析只有一次 Activator RPC，嵌入式模式仅本地调用，不访问 Agent Redis 或 Environment API。bypass 在查询权威状态前失效旧绑定，发送前目标重试自动启用 bypass；HTTP/SSH 固定 generation，WS 在发送任何后端握手或业务字节前，可对权威确认的 Binding 删除/换代在原期限内刷新一次，缺失时复用本次初始化参数；删除中的并发请求允许成功或失败，缓存不代表实时健康。
 
 独立 Activator 模式下，Gateway 按完整 AgentBinding scope 做 Rendezvous Hash 亲和路由；静态直达实例列表和 Redis 注册发现二选一。启用发现时，Activator 默认每 5 秒续租 15 秒成员租约，Gateway 约每 5 秒刷新本地列表；请求路径不访问注册目录。Gateway 只读取独立注册键，Template/AgentBinding 权威元数据仍仅由 Activator 访问。成员变化和故障转移只改变缓存归属，不迁移 Environment，不新增生命周期控制器。Agent 不直接操作平台 Redis/SQLite 或 sandboxd。Activator 的生命周期访问只经 API Server：独立部署调用现有 HTTP 接口，嵌入部署调用应用服务；Ingress 不提供旧 Environment v2 管理入口。Jiuwen 通过 Ingress 通用文件能力读写 Environment，归属与 Running 状态经 API Server 查询，文件正文经 Relay/Execd 传输；Execd 凭据由共享数据面持有。用户 Harness 的 HTTP/WS/SSH 经共享数据面转发，业务协议由用户定义。
 
 API Server 仍保留原有九条 `/api/agent` 兼容转发路由，由 `agent_address` 指向外部 Agent 服务；这是平台侧既有入口，不属于当前 Ingress Agent API／Activator 链路，本轮保持不变。
 
-平台内部以 **Environment + Runtime** 建模。Environment 是跨节点、暂停恢复和故障接管期间保持不变的逻辑身份，持有期望规格、生命周期、归属和 checkpoint 引用；Runtime 是 sandboxd 在某个节点创建的一次物理执行，具有独立 `runtime_id`，重启、恢复或接管时可以替换。二者通过 `RuntimeIdentity { environment_id, runtime_id, ownership_generation }` 绑定，adxlet 只允许当前 generation 的 Runtime 对外提供服务。
+平台内部以 **Environment + Runtime** 建模。Environment 是跨节点、暂停恢复和故障接管期间保持不变的逻辑身份，持有期望规格、生命周期、归属和 checkpoint 引用；Runtime 是运行时后端在某个节点创建的一次物理执行，具有独立 `runtime_id`，重启、恢复或接管时可以替换。二者通过 `RuntimeIdentity { environment_id, runtime_id, ownership_generation }` 绑定，adxlet 只允许当前 generation 的 Runtime 对外提供服务。
 
 Environment 自动暂停复用 idle timeout，策略为 delete/pause；匿名恢复点可按配置发布到共享对象存储。Ingress 认证首请求后与 API Server 手动 resume 共用 Coordinator `EnsureRunning`。Coordinator 持久化恢复意图、优先原节点准入，仅在明确资源不足或执行已失效时调度兼容目标；adxlet 执行恢复并提交 Running。节点失效保留 Paused，等待需求或到期/删除。Ingress 获得该执行的已发布路由后才转发业务字节。详见 [节点生命周期](../testing/node-lifecycle.md)。
 
@@ -112,15 +112,16 @@ agent-dx/
 | Coordinator | `storage.rs`、`storage/`、`rpc.rs`、`rpc/` | Redis 条件提交、原子归属、目录、节点失效、快照克隆、共享恢复协调；不执行节点普通生命周期 |
 | Coordinator | `auth.rs`、`routes.rs`、`metrics.rs` | API Key 摘要、路由发布、集群指标 |
 | adxlet | `controller.rs`、`controller/{lifecycle,monitor,snapshots}.rs` | 每 Environment 串行任务、暂停/恢复/删除、空闲回收与重启 |
-| adxlet | `sandboxd.rs`、`runtime_control.rs`、`readiness.rs` | RuntimeDriver 适配；本地 EROFS／OCI image 环境；Execd 双向控制流／HTTP 协作与就绪 |
-| adxlet | `checkpoint.rs`、`checkpoint/` | 可扩展 CheckpointStore、本地/S3、缓存引用和远端孤儿回收 |
-| adxlet | `journal.rs`、`reconciliation.rs` | SQLite 故障降级日志与 Coordinator 权威目录对账 |
+| adxlet | `runtime_router.rs`、`sandboxd.rs`、`jiuwenbox/` | 按 runtime class 创建、按执行归属分发；Jiuwenbox 从权威目录重建内存关联，复用独立 EROFS 和原生 ACL；后端源码不变 |
+| adxlet | `runtime_control.rs`、`readiness.rs` | Execd 双向控制流／HTTP 协作与就绪 |
+| adxlet / checkpoint-storage | `platform/adxlet/src/checkpoint.rs`、`platform/crates/checkpoint-storage/` | CheckpointAccess 捕获/恢复与本地缓存；Coordinator ArtifactReclaimer 负责共享制品物理回收，Deleted outbox 保留失败重试 |
+| adxlet | `node_reconciliation.rs`、`reconciliation.rs`、`journal.rs` | 全后端共用启动和周期性权威对账、孤儿/晚到资源清理、准入及心跳协调；既有可选 SQLite 结果降级日志 |
 | adxlet | `resources.rs`、`routes.rs`、`activity.rs`、`proxy.rs` | 容量源/准入、绑定同步、活动采集、代理进程组合 |
 | Rust API Server | `contract.rs`、`http.rs`、`clients.rs`、`operations.rs` | HTTP 兼容字段到 Environment RPC；认证、版本化 Environment 目录订阅、入口节点轮转、直达节点、快照目录 |
 
 `core` 不依赖 Redis/SQLite/tonic/sandboxd 客户端；`protocol` 不承载调度、状态机、证书文件读取或 TLS 构建。稳定错误语义、可观测、服务进程支持和传输机制位于根级 `crates/`。adxlet 可依赖 Gateway 的 node 库，Gateway 不依赖 Coordinator/adxlet 业务实现。Shard 当前与 Coordinator 同进程。
 
-默认创建经 Global 轮转进入 Shard Filter/Score。启用 `create_mode=local_first` 时，API Server 轮转可用入口节点，adxlet 用同一 Admission 暂留资源，Coordinator 原子确认唯一归属并同步中心账本；本地不满足时使用同一 Environment ID 回退 Shard。Coordinator 向 API Server 首次全量、后续增量发布活跃 Environment 目录；删除通过增量撤销并从 Redis 主目录移除，已有 Environment 操作命中本地目录后直达 adxlet。
+普通创建经 Global 轮转进入 Shard Filter/Score。启用 `create_mode=local_first` 时，API Server 轮转可用入口节点，adxlet 用同一 Admission 暂留资源，Coordinator 原子确认唯一归属并同步中心账本；本地不满足时使用同一 Environment ID 回退 Shard。带 `snapshotId` 的创建始终由 Coordinator 调度：共享制品默认弱亲和来源节点，先跨分片比较可用候选，原节点不满足时使用其他兼容节点；排队期间也可跨分片回退。显式放置规则覆盖默认偏好，local-only 保留来源节点硬约束。Coordinator 向 API Server 首次全量、后续增量发布活跃 Environment 目录；删除通过增量撤销并从 Redis 主目录移除，已有 Environment 操作命中本地目录后直达 adxlet。
 
 ## adxlet / Relay 进程组合
 
@@ -139,6 +140,10 @@ Proxy 首次启动关闭 Environment 准入，adxlet 完成权威对账与全量
 | standalone | API Server 显式配置 `ingress_mode=standalone`，Supervisor 启动 `adx-apiserver` 与 `adx-ingress` | 两种模式复用同一 `IngressService`，不复制路由或转发实现 |
 
 默认共进程时，Ingress 监听绑定失败会阻止 API Server 就绪，运行期监听异常会使整个进程退出并由 Supervisor 重启。详见 [模式配置与验证](../testing/api-ingress-process-modes.md)。
+
+## Agent 首次访问与模板参数
+
+通用 HTTP/WS 接入的 `X-ADX-Parameters` 使用 URL 表单编码。Ingress 将原始字节交给共享解析/激活流程，只有 Binding 不存在时才解析、校验并原子保存参数；已有 Binding 忽略新输入，包括格式错误。并发首次访问复用成功落库的 Binding。Template.env 和 mounts.host_path 使用持久化参数渲染，挂载参数仍受路径约束；Binding 参数当前明文保存。内置 Jiuwen 通过共享流程按需提供业务参数，不再有独立 prepare 阶段、私有 launch 快照或模型专用覆盖逻辑。参数 Header 在转发前移除。
 
 ## 协议与持久化
 
@@ -159,3 +164,13 @@ Rust 共用根 Cargo workspace，Python 工具独立打包；外部 sandboxd 按
 ## 可观测
 
 Coordinator/adxlet 的 Environment 数、资源预留与使用量，Ingress/Relay 的连接、流量与请求指标由各自 `/metrics` 导出。Trace 由组件 OpenTelemetry SDK 经 OTLP/HTTP 发往外部 Collector；结构化 stdout 由 supervisor 滚动压缩，Collector filelog 采集。Pod 可部署 Collector sidecar，进程环境独立托管。统一实时 Trace 队列丢弃指标已后置，不能与已有导出失败计数混同。
+
+Jiuwenbox 接入路径和验收边界见 [Jiuwenbox P0](../testing/jiuwenbox-runtime.md)。正常创建经 Jiuwenbox，Conch 原生 UDS 仅用于失联后的发现和清理。此驱动不提供 checkpoint；EROFS 先挂载到宿主，再通过 bind／virtiofs 暴露给沙箱。
+
+## Checkpoint 存储边界
+
+`platform/crates/checkpoint-storage/` 共享 local、S3+缓存和 AFS 文件适配。
+adxlet 使用 `CheckpointAccess` 捕获和取得恢复目录；Coordinator 使用
+`ArtifactReclaimer` 回收 S3/AFS。匿名恢复点属于 Environment，运行时文件使用独立保护；
+可复用 Snapshot 通过引用被恢复使用，使用中删除直接返回 Sandbox 列表。
+配置、流程和故障边界见[Checkpoint 存储](../testing/snapshot-storage.md)。

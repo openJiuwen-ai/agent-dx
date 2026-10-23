@@ -96,6 +96,8 @@ fn start(config: ProbeConfig) -> Process {
         .process_group(0);
     let child = command.spawn().unwrap();
     let record = EnvironmentRecord {
+        execution_artifacts: vec![],
+        snapshot_source: None,
         failure: None,
         spec: EnvironmentSpec {
             run_policy: None,

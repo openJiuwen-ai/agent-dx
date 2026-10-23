@@ -68,10 +68,91 @@ fn queue_deadline_can_cancel_only_an_unassigned_request() {
     assert!(!coordinator.cancel_pending("waiting"));
 
     coordinator.register(node("n", "z")).unwrap();
+    assert!(
+        coordinator.schedule(0).unwrap().is_none(),
+        "cancelled work must never start later"
+    );
+    assert_eq!(
+        coordinator
+            .scheduling_failure(&spec("probe"))
+            .unwrap()
+            .max_available
+            .cpu_millis,
+        100
+    );
     coordinator.submit(spec("assigned")).unwrap();
     let assignment = coordinator.schedule(0).unwrap().unwrap();
     assert!(!coordinator.cancel_pending("assigned"));
     coordinator.release(&assignment).unwrap();
+}
+
+#[test]
+fn scheduling_diagnosis_distinguishes_total_capacity_and_held_reservations() {
+    let mut coordinator = Coordinator::new(2, Placement::Pack).unwrap();
+    coordinator.register(node("a", "z")).unwrap();
+    coordinator.register(node("b", "z")).unwrap();
+    let mut occupied = spec("occupied");
+    occupied.resources.cpu_millis = 100;
+    coordinator.submit(occupied).unwrap();
+    let assignment = coordinator.schedule(0).unwrap().unwrap();
+    let mut request = spec("oversized");
+    request.resources.cpu_millis = 101;
+    request.resources.memory_bytes = 101;
+    let failure = coordinator.scheduling_failure(&request).unwrap();
+    assert_eq!(failure.node_count, 2);
+    assert_eq!(failure.eligible_nodes, 0);
+    assert_eq!(failure.requested.cpu_millis, 101);
+    assert_eq!(failure.max_capacity.cpu_millis, 100);
+    assert_eq!(failure.max_available.cpu_millis, 100);
+    assert_eq!(failure.rejections["insufficient_cpu"], 2);
+    assert_eq!(failure.rejections["insufficient_memory"], 2);
+    // A smaller request fits the idle worker while the held reservation remains.
+    request.resources.cpu_millis = 1;
+    request.resources.memory_bytes = 1;
+    let busy = coordinator.scheduling_failure(&request).unwrap();
+    assert_eq!(busy.eligible_nodes, 1);
+    assert_eq!(busy.rejections["insufficient_cpu"], 1);
+    coordinator.release(&assignment).unwrap();
+    assert_eq!(
+        coordinator
+            .scheduling_failure(&request)
+            .unwrap()
+            .eligible_nodes,
+        2
+    );
+}
+
+#[test]
+fn scheduling_diagnosis_keeps_unavailable_runtime_affinity_and_device_reasons() {
+    let mut coordinator = Coordinator::new(1, Placement::Pack).unwrap();
+    assert_eq!(
+        coordinator
+            .scheduling_failure(&spec("none"))
+            .unwrap()
+            .rejections["no_workers"],
+        1
+    );
+    let mut n = node("n", "zone-a");
+    n.available = false;
+    n.runtime_classes = vec!["runc".into()];
+    coordinator.register(n).unwrap();
+    let mut request = spec("constrained");
+    request.scheduling.required_node = vec![selector("zone", "zone-b")];
+    request.scheduling.devices = vec![DeviceRequest {
+        kind: DeviceKind::Gpu,
+        model: None,
+        count: 1,
+    }];
+    let failure = coordinator.scheduling_failure(&request).unwrap();
+    for reason in [
+        "node_available",
+        "runtime_fit",
+        "node_affinity",
+        "device_fit",
+    ] {
+        assert_eq!(failure.rejections[reason], 1, "{reason}");
+    }
+    assert!(!failure.rejections.contains_key("insufficient_cpu"));
 }
 
 #[test]

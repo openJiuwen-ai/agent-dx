@@ -1,6 +1,8 @@
 //! Generated transport contracts and validated conversions, without services.
+mod admission;
 mod checkpoint_cleanup;
 mod environment_control;
+pub use admission::{scheduling_deadline, scheduling_failure};
 mod runtime_profile;
 mod snapshots;
 pub mod control {
@@ -304,7 +306,13 @@ impl TryFrom<control::EnvironmentRecord> for adx_core::EnvironmentRecord {
                 ip: runtime_ip,
             },
             resources_held: v.resources_held,
+            snapshot_source: v.snapshot_source.map(TryInto::try_into).transpose()?,
             checkpoint: v.checkpoint.map(TryInto::try_into).transpose()?,
+            execution_artifacts: v
+                .execution_artifacts
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<Vec<_>>>()?,
             last_operation: v.last_operation.map(TryInto::try_into).transpose()?,
             failure: v.failure.map(TryInto::try_into).transpose()?,
         })
@@ -337,13 +345,19 @@ impl TryFrom<adx_core::EnvironmentRecord> for control::EnvironmentRecord {
                 ip: v.runtime.ip.map(|ip| ip.to_string()).unwrap_or_default(),
             }),
             resources_held: v.resources_held,
+            snapshot_source: v.snapshot_source.map(Into::into),
             checkpoint: v.checkpoint.map(Into::into),
+            execution_artifacts: v.execution_artifacts.into_iter().map(Into::into).collect(),
             last_operation: v.last_operation.map(Into::into),
         })
     }
 }
 pub fn status(error: adx_core::Error) -> tonic::Status {
     match error {
+        adx_core::Error::SnapshotInUse { sandbox_ids, template_ids } => tonic::Status::with_details(
+            tonic::Code::FailedPrecondition, "snapshot is in use",
+            serde_json::json!({"code":"SNAPSHOT_IN_USE", "sandbox_ids":sandbox_ids, "template_ids":template_ids}).to_string().into_bytes().into(),
+        ),
         Error::BackendFailure { code, message } => {
             let mut status = tonic::Status::new(backend_wire_code(code), message);
             status.metadata_mut().insert(
@@ -718,5 +732,31 @@ fn backend_wire_code(code: adx_core::BackendFailureCode) -> tonic::Code {
         adx_core::BackendFailureCode::Unavailable => tonic::Code::Unavailable,
         adx_core::BackendFailureCode::DataLoss => tonic::Code::DataLoss,
         adx_core::BackendFailureCode::Unauthenticated => tonic::Code::Unauthenticated,
+    }
+}
+
+/// Artifact references may reserve an incomplete capture with size zero. RestorePoint rejects it.
+impl TryFrom<control::CheckpointArtifact> for adx_core::CheckpointArtifact {
+    type Error = Error;
+    fn try_from(a: control::CheckpointArtifact) -> Result<Self> {
+        if a.storage.is_empty() || a.location.is_empty() {
+            return Err(Error::Invalid("invalid artifact identity".into()));
+        }
+        Ok(Self {
+            storage: a.storage,
+            scope: a.scope,
+            location: a.location,
+            size_bytes: a.size_bytes,
+        })
+    }
+}
+impl From<adx_core::CheckpointArtifact> for control::CheckpointArtifact {
+    fn from(a: adx_core::CheckpointArtifact) -> Self {
+        Self {
+            storage: a.storage,
+            scope: a.scope,
+            location: a.location,
+            size_bytes: a.size_bytes,
+        }
     }
 }

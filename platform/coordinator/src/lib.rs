@@ -1,5 +1,9 @@
 //! Global and embedded ShardScheduler scheduling.
 
+// Let library tests reuse the integration Redis fixture through its crate path.
+#[cfg(test)]
+extern crate self as adx_coordinator;
+
 pub use adx_core::snapshots;
 pub mod auth;
 pub mod autoscaling;
@@ -17,7 +21,7 @@ pub use adx_scheduling::{Node, Placement};
 use journal::MutationJournal;
 pub use queue::TenantQueue;
 pub use shard::SchedulingStats;
-use shard::ShardScheduler;
+use shard::{Attempt, ShardScheduler};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -194,7 +198,8 @@ impl Coordinator {
         Ok(shard)
     }
 
-    /// Global chooses the shard only. Unscheduled work stays in its ShardScheduler queue.
+    /// Global chooses the shard; queued Snapshots can move when a different
+    /// shard has eligible capacity. The shard still owns final reservation.
     pub fn submit_recovery(&mut self, spec: EnvironmentSpec) -> Result<usize> {
         self.retired.remove(&spec.id);
         if !self.requests.contains_key(&spec.id) {
@@ -229,12 +234,94 @@ impl Coordinator {
                 Err(Error::Conflict)
             };
         }
-        let shard = self.next_shard;
-        self.next_shard = (shard + 1) % self.shards.len();
+        let preferred = if spec.snapshot_id.is_some() {
+            self.snapshot_shard(&spec, &BTreeSet::new(), None)?
+        } else {
+            None
+        };
+        let shard = preferred.unwrap_or_else(|| {
+            // Affinity-selected requests do not advance ordinary shard rotation.
+            let shard = self.next_shard;
+            self.next_shard = (shard + 1) % self.shards.len();
+            shard
+        });
         self.requests.insert(spec.id.clone(), (shard, spec.clone()));
         self.shards[shard].enqueue(spec);
         self.wake(shard);
         Ok(shard)
+    }
+
+    /// Snapshot source affinity must take effect before the request enters a
+    /// shard. Use the same hard filters and score as final node selection.
+    fn snapshot_shard(
+        &mut self,
+        spec: &EnvironmentSpec,
+        excluded: &BTreeSet<String>,
+        skip: Option<usize>,
+    ) -> Result<Option<usize>> {
+        let mut best: Option<(u64, String, usize)> = None;
+        for (id, shard) in self.shards.iter_mut().enumerate() {
+            if skip == Some(id) {
+                continue;
+            }
+            if let Some((score, node)) = shard.best_candidate(spec, &self.snapshot, excluded)? {
+                if best.as_ref().is_none_or(|(old, old_node, _)| {
+                    score > *old || (score == *old && node < *old_node)
+                }) {
+                    best = Some((score, node, id));
+                }
+            }
+        }
+        Ok(best.map(|(_, _, id)| id))
+    }
+
+    fn defer_or_transfer(&mut self, shard: usize, entry: queue::Entry) -> Result<()> {
+        if entry.spec.snapshot_id.is_none() {
+            self.shards[shard].defer(entry);
+            return Ok(());
+        }
+        let excluded = self.shards[shard].exclusions(&entry.spec.id);
+        let target = match self.snapshot_shard(&entry.spec, &excluded, Some(shard)) {
+            Ok(target) => target,
+            Err(error) => {
+                self.shards[shard].defer(entry);
+                return Err(error);
+            }
+        };
+        let Some(target) = target else {
+            self.shards[shard].defer(entry);
+            return Ok(());
+        };
+        let Some((owner, _)) = self.requests.get_mut(&entry.spec.id) else {
+            self.shards[shard].defer(entry);
+            return Err(Error::Conflict);
+        };
+        *owner = target;
+        self.shards[shard].forget_queued(&entry.spec.id);
+        self.shards[target].accept_transfer(entry, excluded);
+        self.wake(target);
+        Ok(())
+    }
+
+    /// Inspect current placement constraints, including held reservations.
+    /// This does not cancel requests or imply that execution has not started.
+    pub fn scheduling_failure(
+        &self,
+        spec: &EnvironmentSpec,
+    ) -> Result<adx_core::scheduling::SchedulingFailure> {
+        spec.validate()?;
+        let mut failure = adx_core::scheduling::SchedulingFailure {
+            snapshot_revision: self.snapshot.revision,
+            requested: spec.resources,
+            ..Default::default()
+        };
+        for shard in &self.shards {
+            shard.diagnose(spec, &self.snapshot, &mut failure)?;
+        }
+        if failure.node_count == 0 {
+            failure.rejections.insert("no_workers".into(), 1);
+        }
+        Ok(failure)
     }
 
     /// Remove an unassigned request after its central queue deadline.
@@ -432,7 +519,7 @@ impl Coordinator {
                 &self.journal,
                 &self.config,
             ) {
-                Ok(Some((assignment, spec))) => {
+                Ok(Attempt::Assigned(assignment, spec)) => {
                     self.generation = generation;
                     Arc::make_mut(&mut self.snapshot).place(PlacedEnvironment {
                         spec,
@@ -442,7 +529,13 @@ impl Coordinator {
                     self.wake_pending(Some(shard));
                     outcome.assignments.push(assignment);
                 }
-                Ok(None) => (),
+                Ok(Attempt::Deferred(entry)) => {
+                    if let Err(error) = self.defer_or_transfer(shard, entry) {
+                        outcome.error = Some(error);
+                        break;
+                    }
+                }
+                Ok(Attempt::Empty) => (),
                 Err(error) => {
                     outcome.error = Some(error);
                     break;

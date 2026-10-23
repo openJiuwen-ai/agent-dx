@@ -224,7 +224,9 @@ paths:
         server frames are PTY output. JSON text frames report the started and
         exited lifecycle events; `RESIZE:<cols>:<rows>` and `STDIN_EOF` are
         client control frames. OpenAPI does not standardize WebSocket frames,
-        so the extension records the complete framing boundary.
+        so the extension records the complete framing boundary. After sending
+        exited and Close, Execd completes the peer Close handshake before closing
+        TCP, with a five-second deadline for an unresponsive peer.
       parameters:
         - $ref: "#/components/parameters/InstanceId"
         - $ref: "#/components/parameters/ProcessingTimeout"
@@ -672,6 +674,52 @@ components:
       required:
       - path
       additionalProperties: false
+    FileSearchArgs:
+      type: object
+      properties:
+        path:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: Search root inside the runtime filesystem; at most 4096 UTF-8 bytes.
+        pattern:
+          type: string
+          maxLength: 1024
+          default: '*'
+          description: Case-sensitive basename or full-path glob; at most 1024 UTF-8 bytes. '*' also matches separators.
+        exclude_patterns:
+          type: array
+          maxItems: 64
+          items:
+            type: string
+            maxLength: 1024
+            description: Exclusion glob of at most 1024 UTF-8 bytes.
+          default: []
+          description: Filters matching entries without pruning directory traversal.
+        depth:
+          type: integer
+          minimum: 1
+          maximum: 64
+          default: 64
+        max_results:
+          type: integer
+          minimum: 1
+          maximum: 10000
+          default: 1000
+        max_entries:
+          type: integer
+          minimum: 1
+          maximum: 1000000
+          default: 100000
+        timeout_ms:
+          type: integer
+          minimum: 1
+          maximum: 30000
+          default: 10000
+      required:
+      - path
+      additionalProperties: false
+      description: Missing roots and non-directory roots return no matches. Nested symlink directories are not followed.
     FileRenameArgs:
       type: object
       properties:
@@ -1184,6 +1232,55 @@ components:
       - entries
       - error
       additionalProperties: false
+    FileSearchResult:
+      oneOf:
+      - type: object
+        properties:
+          entries:
+            type: array
+            items:
+              $ref: '#/components/schemas/EntryInfo'
+          scanned_entries:
+            type: integer
+            minimum: 0
+          error:
+            type: 'null'
+        required:
+        - entries
+        - scanned_entries
+        - error
+        additionalProperties: false
+      - type: object
+        properties:
+          entries:
+            type: array
+            maxItems: 0
+          error_code:
+            type: string
+            enum:
+            - INVALID_ARGUMENT
+            - FILE_NOT_FOUND
+            - NOT_A_DIRECTORY
+            - PERMISSION_DENIED
+            - FILESYSTEM_ERROR
+            - RESOURCE_EXHAUSTED
+            - DEADLINE_EXCEEDED
+          error:
+            type: string
+            minLength: 1
+        required:
+        - entries
+        - error_code
+        - error
+        additionalProperties: false
+      description: Results are sorted by path. Limit or timeout failures return no partial entries.
+      examples:
+      - entries: []
+        scanned_entries: 0
+        error: null
+      - entries: []
+        error_code: RESOURCE_EXHAUSTED
+        error: file search max_results exceeded; narrow the search
     FileExistsResult:
       type: object
       properties:
@@ -1570,6 +1667,29 @@ components:
       - action
       additionalProperties: false
       x-adx-result-schema: '#/components/schemas/FileListResult'
+    FileSearchRequest:
+      type: object
+      properties:
+        action:
+          type: string
+          enum:
+          - file.search
+        args:
+          $ref: '#/components/schemas/FileSearchArgs'
+        requestId:
+          type: string
+          description: Compatibility request identity; the X-ADX-Request-ID header takes precedence.
+      required:
+      - action
+      - args
+      additionalProperties: false
+      x-adx-result-schema: '#/components/schemas/FileSearchResult'
+      examples:
+      - action: file.search
+        args:
+          path: /workspace
+          pattern: '*.py'
+          exclude_patterns: ['*/.git/*']
     FileExistsRequest:
       type: object
       properties:
@@ -1751,6 +1871,7 @@ components:
       - $ref: '#/components/schemas/FileWriteChunkRequest'
       - $ref: '#/components/schemas/FileReadChunkRequest'
       - $ref: '#/components/schemas/FileListRequest'
+      - $ref: '#/components/schemas/FileSearchRequest'
       - $ref: '#/components/schemas/FileExistsRequest'
       - $ref: '#/components/schemas/FileRemoveRequest'
       - $ref: '#/components/schemas/FileRenameRequest'
@@ -1773,6 +1894,7 @@ components:
       - $ref: '#/components/schemas/ExecResult'
       - $ref: '#/components/schemas/FileExistsResult'
       - $ref: '#/components/schemas/FileListResult'
+      - $ref: '#/components/schemas/FileSearchResult'
       - $ref: '#/components/schemas/FileMkdirResult'
       - $ref: '#/components/schemas/FileReadChunkResult'
       - $ref: '#/components/schemas/FileReadResult'

@@ -79,6 +79,8 @@ fn start(address: &str) -> Process {
 }
 fn record() -> EnvironmentRecord {
     EnvironmentRecord {
+        execution_artifacts: vec![],
+        snapshot_source: None,
         failure: None,
         spec: EnvironmentSpec {
             run_policy: None,
@@ -407,7 +409,7 @@ async fn adxlet_creation_and_event_driven_checkpoint_wait_for_state_publication(
 }
 
 #[tokio::test]
-async fn restored_binary_reconnects_with_target_identity_and_scoped_credential() {
+async fn restored_binary_reconnects_to_target_node_with_scoped_credential() {
     let test = setup(None, true).await;
     test.client.abort();
     test.hub.disconnect(&identity()).unwrap();
@@ -426,23 +428,30 @@ async fn restored_binary_reconnects_with_target_identity_and_scoped_credential()
     target.assignment.generation = 2;
     target.runtime.id = "i-2".into();
     let target_identity = RuntimeControlClient::identity(&target);
-    test.hub.expect(&target_identity).unwrap();
+    let target_node = setup(None, false).await;
+    target_node.client.abort();
+    target_node.hub.expect(&target_identity).unwrap();
+    let target_control = RuntimeControlClient::new(1, Duration::from_secs(2))
+        .unwrap()
+        .with_stream(target_node.hub.clone());
     let environment = process.temp.path().join("restored-env");
-    std::fs::write(&environment, format!("ADX_ENVIRONMENT_ID=i\nADX_RUNTIME_ID=i-2\nADX_OWNERSHIP_GENERATION=2\nADX_RUNTIME_CONTROL_ADDRESS={}\nADX_RUNTIME_CONTROL_TOKEN={}\n", test.address, execution_token(SECRET, &target_identity).unwrap())).unwrap();
+    std::fs::write(&environment, format!("ADX_ENVIRONMENT_ID=i\nADX_RUNTIME_ID=i-2\nADX_OWNERSHIP_GENERATION=2\nADX_RUNTIME_CONTROL_ADDRESS={}\nADX_RUNTIME_CONTROL_TOKEN={}\n", target_node.address, execution_token(SECRET, &target_identity).unwrap())).unwrap();
     // The existing boot-time path is refreshed only after backend handoff.
     std::fs::copy(&environment, process.temp.path().join("env")).unwrap();
+    test.hub.retire(&identity());
+    test.server.abort(); // The source node must not be needed for recovery.
     let mut writer = process.writer.take().unwrap();
     writer.write_all(b"restore").unwrap();
     drop(writer);
-    test.hub.wait_ready(&target_identity).await.unwrap();
-    test.hub.retire(&identity());
-    let restored = control.status(&target).await.unwrap();
+    target_node.hub.wait_ready(&target_identity).await.unwrap();
+    let restored = target_control.status(&target).await.unwrap();
     assert_eq!(restored.identity, target_identity);
     assert_eq!(
         restored.checkpoint.unwrap().phase,
         CheckpointPhase::Restored
     );
     assert!(control.status(&original).await.is_err());
+    assert!(target_control.status(&original).await.is_err());
 }
 
 #[tokio::test]

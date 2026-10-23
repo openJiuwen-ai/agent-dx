@@ -115,73 +115,139 @@ impl StoreOwnerRootAuthority {
     pub fn new(store: Arc<dyn MetaStore>) -> Self {
         Self { store }
     }
+
+    // Commands and the resume cursor come from the same pinned authority view.
+    // A revocation that fell out of Watch history must still be delivered.
+    async fn resynchronize_commands(
+        &self,
+        input: &WatchRootCommandsInput,
+    ) -> Result<(StoreRevision, Vec<WatchedRootCommand>)> {
+        let view = self.store.read_view().await?;
+        let session = view
+            .read(MetaRead::CurrentNodeSession {
+                node_id: input.node_id.clone(),
+            })
+            .await?;
+        if !matches!(session.entity,Some(MetaEntity::NodeSession(ref session)) if session.session_id==input.session_id && session.is_live_at_unix_ms(now_unix_ms()))
+        {
+            return Err(invalid("node session is not current"));
+        }
+        let (revision, entities) = view.snapshot()?;
+        let commands=entities.iter().filter_map(|entity| {
+            let MetaEntity::RootCommand(command)=entity else {return None};
+            if command.home_node_id!=input.node_id || command.home_session_id!=input.session_id {return None;}
+            let acknowledged=entities.iter().any(|entity| matches!(entity,MetaEntity::RootCommandAck(ack) if ack.command_id==command.command_id && ack.node_id==command.home_node_id && ack.session_id==command.home_session_id && ack.root_id==command.root_id && ack.root_epoch==command.root_epoch && ack.access_generation==command.old_access_generation && ack.success));
+            (!acknowledged).then(||WatchedRootCommand{command:command.clone(),revision})
+        }).collect();
+        Ok((revision, commands))
+    }
 }
 
 impl OwnerRootAuthority for StoreOwnerRootAuthority {
     fn reserve_root(&self, input: ReserveRootInput) -> MetaFuture<'_, ReserveRootOutput> {
         Box::pin(async move {
-            let caller = format!("{}/{}", input.preferred_home_node_id, input.session_id);
-            let request_id = input.request_id;
-            let key = request_key(caller, request_id.clone());
-            let existing = self
-                .store
-                .read(MetaRead::RootReservation {
+            let key = request_key(
+                format!("{}/{}", input.preferred_home_node_id, input.session_id),
+                input.request_id.clone(),
+            );
+            // Allocation shares the existing writer. A different Root reserving
+            // concurrently may advance its floor; retry only that CAS conflict.
+            for _ in 0..32 {
+                let existing = self
+                    .store
+                    .read(MetaRead::RootReservation {
+                        root_id: input.root_id.clone(),
+                    })
+                    .await?;
+                if let Some(MetaEntity::RootReservation(reservation)) = existing.entity
+                    && reservation.home_node_id == input.preferred_home_node_id
+                    && reservation.home_session_id == input.session_id
+                    && reservation.create_intent_id == input.create_intent_id
+                {
+                    return Ok(ReserveRootOutput {
+                        reservation,
+                        already_reserved_by_same_intent: true,
+                    });
+                }
+                let floor = self.store.read(MetaRead::RootEpochWatermark).await?;
+                let Some(MetaEntity::RootEpochWatermark(previous)) = floor.entity else {
+                    return Err(invalid("root epoch allocation floor is unavailable"));
+                };
+                let root_epoch = previous
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("root epoch exhausted"))?;
+                if input.expected_root_epoch > root_epoch {
+                    return Err(invalid("expected root epoch exceeds next allocated epoch"));
+                }
+                let reservation = RootReservationRecord {
                     root_id: input.root_id.clone(),
-                })
-                .await?;
-            if let Some(MetaEntity::RootReservation(reservation)) = existing.entity
-                && reservation.home_node_id == input.preferred_home_node_id
-                && reservation.home_session_id == input.session_id
-                && reservation.create_intent_id == input.create_intent_id
-            {
-                return Ok(ReserveRootOutput {
-                    reservation,
-                    already_reserved_by_same_intent: true,
-                });
+                    root_epoch,
+                    home_node_id: input.preferred_home_node_id.clone(),
+                    home_session_id: input.session_id.clone(),
+                    create_intent_id: input.create_intent_id.clone(),
+                    prepare_token: format!(
+                        "prepare:{}:{}:{}:{}",
+                        input.root_id, input.session_id, input.create_intent_id, input.request_id
+                    ),
+                    created_at_revision: StoreRevision::ZERO,
+                };
+                let mut txn = MetaTxn::new(key.clone(), StoreOperation::ReserveRoot);
+                txn.conditions.extend([
+                    TxnCondition::RequestAbsent(key.clone()),
+                    TxnCondition::RootEpochWatermarkEquals(previous),
+                    TxnCondition::NodeSessionCurrent {
+                        node_id: input.preferred_home_node_id.clone(),
+                        session_id: input.session_id.clone(),
+                    },
+                    TxnCondition::Missing(MetaKey::Root {
+                        root_id: input.root_id.clone(),
+                    }),
+                    TxnCondition::Missing(MetaKey::RootReservation {
+                        root_id: input.root_id.clone(),
+                    }),
+                ]);
+                txn.mutations.extend([
+                    TxnMutation::Put(MetaEntity::RootEpochWatermark(root_epoch)),
+                    TxnMutation::Put(MetaEntity::RootReservation(reservation.clone())),
+                    TxnMutation::RecordRequestOutcome(super::store::RequestOutcome {
+                        request: key.clone(),
+                        operation: txn.operation,
+                        result: OperationResult::RootReservation(reservation),
+                    }),
+                ]);
+                let outcome = match self.store.compare_and_commit(txn).await? {
+                    TxnOutcome::Committed { outcome, .. } => Some(outcome),
+                    TxnOutcome::ConditionFailed {
+                        existing_outcome: Some(outcome),
+                        ..
+                    } => Some(outcome),
+                    TxnOutcome::ConditionFailed { .. } => None,
+                };
+                if let Some(outcome) = outcome {
+                    if outcome.operation != StoreOperation::ReserveRoot {
+                        return Err(invalid(
+                            "request_id was already used for a different Meta operation",
+                        ));
+                    }
+                    let OperationResult::RootReservation(reservation) = outcome.result else {
+                        return Err(invalid("reserve replay returned wrong result type"));
+                    };
+                    return Ok(ReserveRootOutput {
+                        reservation,
+                        already_reserved_by_same_intent: false,
+                    });
+                }
+                let refreshed = self.store.read(MetaRead::RootEpochWatermark).await?;
+                if refreshed.entity == Some(MetaEntity::RootEpochWatermark(previous)) {
+                    return Err(invalid(
+                        "Meta reservation conditions failed; caller must refresh authority state",
+                    ));
+                }
             }
-            let reservation = RootReservationRecord {
-                root_id: input.root_id.clone(),
-                root_epoch: input.expected_root_epoch.max(1),
-                home_node_id: input.preferred_home_node_id.clone(),
-                home_session_id: input.session_id.clone(),
-                create_intent_id: input.create_intent_id.clone(),
-                prepare_token: format!(
-                    "prepare:{}:{}:{}:{}",
-                    input.root_id, input.session_id, input.create_intent_id, request_id
-                ),
-                created_at_revision: StoreRevision::ZERO,
-            };
-            let mut txn = MetaTxn::new(key.clone(), StoreOperation::ReserveRoot);
-            txn.conditions.extend([
-                TxnCondition::RequestAbsent(key),
-                TxnCondition::NodeSessionCurrent {
-                    node_id: input.preferred_home_node_id,
-                    session_id: input.session_id,
-                },
-                TxnCondition::Missing(MetaKey::Root {
-                    root_id: input.root_id.clone(),
-                }),
-                TxnCondition::Missing(MetaKey::RootReservation {
-                    root_id: input.root_id,
-                }),
-            ]);
-            txn.mutations.extend([
-                TxnMutation::Put(MetaEntity::RootReservation(reservation.clone())),
-                TxnMutation::RecordRequestOutcome(super::store::RequestOutcome {
-                    request: txn.request.clone(),
-                    operation: txn.operation,
-                    result: OperationResult::RootReservation(reservation.clone()),
-                }),
-            ]);
-            let OperationResult::RootReservation(reservation) =
-                commit_or_replay(self.store.as_ref(), txn).await?
-            else {
-                return Err(invalid("reserve replay returned wrong result type"));
-            };
-            Ok(ReserveRootOutput {
-                reservation,
-                already_reserved_by_same_intent: false,
-            })
+            Err(Error::coded(
+                afs_error::IO_UNAVAILABLE,
+                "root epoch allocation contention; retry the same request",
+            ))
         })
     }
 
@@ -334,21 +400,27 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                     root.home_node_id
                 )));
             }
-            let grants = self
+            let home = self
                 .store
-                .read(MetaRead::RootGrants {
+                .read(MetaRead::RootGrantByHolder {
                     root_id: root.root_id.clone(),
+                    holder_node_id: root.home_node_id.clone(),
+                    holder_session_id: root.home_session_id.clone(),
                 })
                 .await?;
-            let home_generation = grants.entities.iter().find_map(|entity| match entity {
-                MetaEntity::RootGrant(grant)
-                    if grant.holder_node_id == root.home_node_id
-                        && grant.root_epoch == root.root_epoch =>
-                {
-                    Some(grant.access_generation)
-                }
-                _ => None,
-            });
+            let Some(MetaEntity::RootGrant(home_grant)) = home.entity else {
+                return Err(invalid("current Home grant is missing during deactivation"));
+            };
+            if home_grant.root_epoch != root.root_epoch
+                || home_grant.home_node_id != root.home_node_id
+                || home_grant.home_session_id != root.home_session_id
+                || home_grant.access_generation == 0
+            {
+                return Err(invalid(
+                    "current Home grant does not match deactivated Root",
+                ));
+            }
+            let access_generation = home_grant.access_generation;
             let key = request_key(
                 format!("{}/{}", root.home_node_id, root.home_session_id),
                 input.request_id.clone(),
@@ -361,37 +433,27 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                     session_id: root.home_session_id.clone(),
                 },
                 TxnCondition::EntityEquals(MetaEntity::Root(root.clone())),
+                TxnCondition::EntityEquals(MetaEntity::RootGrant(home_grant)),
             ]);
             txn.mutations.push(TxnMutation::Delete(MetaKey::Root {
                 root_id: root.root_id.clone(),
             }));
-            for entity in &grants.entities {
-                if let MetaEntity::RootGrant(grant) = entity {
-                    txn.mutations.push(TxnMutation::Delete(MetaKey::RootGrant {
-                        root_id: grant.root_id.clone(),
-                        holder_node_id: grant.holder_node_id.clone(),
-                        holder_session_id: grant.holder_session_id.clone(),
-                    }));
-                }
-            }
-            if let Some(access_generation) = home_generation {
-                // 写 REVOKE_ACCESS 命令，让各 holder 的 watch/poll 收到撤权事实；
-                // Home 对未知/已删 root 的 revoke 匹配返回 Ok(false)，不会卡住 poll。
-                txn.mutations.push(TxnMutation::Put(MetaEntity::RootCommand(
-                    RootCommandRecord {
-                        command_id: format!(
-                            "deactivate:{}:{}:{}",
-                            root.root_id, root.root_epoch, input.request_id
-                        ),
-                        home_node_id: root.home_node_id.clone(),
-                        home_session_id: root.home_session_id.clone(),
-                        root_id: root.root_id.clone(),
-                        root_epoch: root.root_epoch,
-                        old_access_generation: access_generation,
-                        command_type: RootCommandType::RevokeAccess,
-                    },
-                )));
-            }
+            // Root absence fences every old grant in the authoritative view.
+            // Physical grant removal is bounded background work, not part of this ACK.
+            txn.mutations.push(TxnMutation::Put(MetaEntity::RootCommand(
+                RootCommandRecord {
+                    command_id: format!(
+                        "deactivate:{}:{}:{}",
+                        root.root_id, root.root_epoch, input.request_id
+                    ),
+                    home_node_id: root.home_node_id.clone(),
+                    home_session_id: root.home_session_id.clone(),
+                    root_id: root.root_id.clone(),
+                    root_epoch: root.root_epoch,
+                    old_access_generation: access_generation,
+                    command_type: RootCommandType::RevokeAccess,
+                },
+            )));
             txn.mutations.push(TxnMutation::RecordRequestOutcome(
                 super::store::RequestOutcome {
                     request: txn.request.clone(),
@@ -606,9 +668,10 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                         _ => None,
                     })
                     .collect()),
-                WatchBatch::Compacted { .. } => {
-                    Err(invalid("watch history was compacted; caller must recover"))
-                }
+                WatchBatch::Compacted { .. } => self
+                    .resynchronize_commands(&input)
+                    .await
+                    .map(|(_, commands)| commands),
             }
         })
     }
@@ -658,15 +721,14 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
                         commands,
                     })
                 }
-                WatchBatch::Compacted {
-                    requested_after,
-                    compacted_to,
-                    recovery,
-                } => Ok(RootCommandBatch::Compacted {
-                    requested_after,
-                    compacted_to,
-                    recovery,
-                }),
+                WatchBatch::Compacted { .. } => {
+                    let (revision, commands) = self.resynchronize_commands(&input).await?;
+                    Ok(RootCommandBatch::Events {
+                        start_revision: StoreRevision(input.after_revision),
+                        next_revision: revision.next(),
+                        commands,
+                    })
+                }
             }
         })
     }
@@ -802,6 +864,8 @@ pub struct ReserveRootInput {
     pub preferred_home_node_id: String,
     pub session_id: String,
     pub rights: Vec<RootRight>,
+    /// Zero selects automatic allocation; a nonzero floor must not exceed the
+    /// authority's next epoch. The caller cannot advance the global watermark.
     pub expected_root_epoch: u64,
     pub create_intent_id: String,
 }
@@ -1046,4 +1110,158 @@ fn now_unix_ms() -> u64 {
         .map_or(0, |duration| {
             u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
         })
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use crate::meta::store::{HistoryLimits, NodeSessionLease, Store, journal::MemoryLog};
+    #[tokio::test]
+    async fn compacted_watch_resynchronizes_pending_commands_without_losing_new_events() {
+        let store = Arc::new(
+            Store::open_log_with_history(
+                Arc::new(MemoryLog::new(Default::default()).unwrap()),
+                HistoryLimits {
+                    event_count: 8,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        let key = || RequestKey::new("node", crate::meta::store::timed_request_id(uuid_id()));
+        store
+            .register_node_session(
+                key(),
+                NodeSessionLease {
+                    node_id: "n".into(),
+                    session_id: "s".into(),
+                    grpc_addr: "http://n:1".into(),
+                    data_addr: "http://n:2".into(),
+                    rest_addr: "http://n:3".into(),
+                    storage_devices: vec![],
+                    lease_ttl: std::time::Duration::from_secs(30),
+                },
+            )
+            .await
+            .unwrap();
+        async fn command(store: &Store, key: RequestKey, id: &str) {
+            let mut txn = MetaTxn::new(key.clone(), StoreOperation::BeginRootRevocation);
+            txn.conditions
+                .push(TxnCondition::RequestAbsent(key.clone()));
+            txn.mutations.push(TxnMutation::Put(MetaEntity::RootCommand(
+                RootCommandRecord {
+                    command_id: id.into(),
+                    home_node_id: "n".into(),
+                    home_session_id: "s".into(),
+                    root_id: "root".into(),
+                    root_epoch: 1,
+                    old_access_generation: 1,
+                    command_type: RootCommandType::RevokeAccess,
+                },
+            )));
+            txn.mutations.push(TxnMutation::RecordRequestOutcome(
+                super::super::store::RequestOutcome {
+                    request: key,
+                    operation: StoreOperation::BeginRootRevocation,
+                    result: OperationResult::Empty,
+                },
+            ));
+            assert!(matches!(
+                store.compare_and_commit(txn).await.unwrap(),
+                TxnOutcome::Committed { .. }
+            ));
+        }
+        command(&store, key(), "old-pending").await;
+        // Manually seeded commands need the same durable epoch floor that
+        // normal root admission establishes before history can be retired.
+        let bootstrap_key = key();
+        let mut bootstrap = MetaTxn::new(bootstrap_key.clone(), StoreOperation::CleanupRootGrants);
+        bootstrap.conditions.extend([
+            TxnCondition::RequestAbsent(bootstrap_key.clone()),
+            TxnCondition::Missing(MetaKey::RootEpochWatermark),
+            TxnCondition::RootEpochWatermarkEquals(1),
+        ]);
+        bootstrap
+            .mutations
+            .push(TxnMutation::Put(MetaEntity::RootEpochWatermark(1)));
+        bootstrap.mutations.push(TxnMutation::RecordRequestOutcome(
+            super::super::store::RequestOutcome {
+                request: bootstrap_key,
+                operation: StoreOperation::CleanupRootGrants,
+                result: OperationResult::Empty,
+            },
+        ));
+        assert!(matches!(
+            store.compare_and_commit(bootstrap).await.unwrap(),
+            TxnOutcome::Committed { .. }
+        ));
+        for index in 0..8 {
+            store
+                .register_node_session(
+                    key(),
+                    NodeSessionLease {
+                        node_id: "unrelated".into(),
+                        session_id: format!("session-{index}"),
+                        grpc_addr: "http://other:1".into(),
+                        data_addr: "http://other:2".into(),
+                        rest_addr: "http://other:3".into(),
+                        storage_devices: vec![],
+                        lease_ttl: std::time::Duration::from_secs(30),
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            store.watch(StoreRevision(0), 16).await.unwrap(),
+            WatchBatch::Compacted { .. }
+        ));
+        let authority = StoreOwnerRootAuthority::new(store.clone());
+        let RootCommandBatch::Events {
+            commands,
+            next_revision,
+            ..
+        } = authority
+            .poll_root_command_batch(WatchRootCommandsInput {
+                node_id: "n".into(),
+                session_id: "s".into(),
+                after_revision: 0,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("compaction must return a full resynchronization")
+        };
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].command.command_id, "old-pending");
+        command(&store, key(), "new-pending").await;
+        let RootCommandBatch::Events { commands, .. } = authority
+            .poll_root_command_batch(WatchRootCommandsInput {
+                node_id: "n".into(),
+                session_id: "s".into(),
+                after_revision: next_revision.0 - 1,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("incremental follow-up")
+        };
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].command.command_id, "new-pending");
+        assert!(
+            authority
+                .poll_root_command_batch(WatchRootCommandsInput {
+                    node_id: "n".into(),
+                    session_id: "old".into(),
+                    after_revision: 0
+                })
+                .await
+                .is_err()
+        );
+    }
+    fn uuid_id() -> u64 {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
 }

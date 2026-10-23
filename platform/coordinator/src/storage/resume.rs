@@ -18,6 +18,8 @@ impl Session {
         deleted.state = EnvironmentState::Deleted;
         deleted.revision = deleted.revision.checked_add(1).ok_or(Error::Conflict)?;
         deleted.checkpoint = None;
+        deleted.snapshot_source = None;
+        deleted.execution_artifacts.clear();
         deleted.last_operation = None;
         self.commit(deleted).await
     }
@@ -36,7 +38,11 @@ impl Session {
                 return Err(Error::Conflict);
             }
             if record.state == EnvironmentState::Paused
-                && record.checkpoint.as_ref().is_none_or(|cp| cp.expired(now))
+                && record
+                    .checkpoint
+                    .as_ref()
+                    .or(record.snapshot_source.as_ref())
+                    .is_none_or(|cp| cp.expired(now))
             {
                 return Err(Error::Invalid("checkpoint expired or missing".into()));
             }

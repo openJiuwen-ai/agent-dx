@@ -23,11 +23,23 @@ impl CoordinatorRpc {
                 .cloned()
                 .collect();
             for stored in candidates {
+                let alias = stored
+                    .recovery_point(now)
+                    .ok_or(Error::Conflict)?
+                    .artifact
+                    .storage
+                    .clone();
                 let mut spec = stored.spec;
+
                 if spec.scheduling.required_node.is_empty() {
                     spec.scheduling.required_node.push(LabelSelector::default());
                 }
                 for alternative in &mut spec.scheduling.required_node {
+                    alternative.expressions.push(LabelRequirement {
+                        key: "ADX_CHECKPOINT_STORAGE".into(),
+                        op: SelectorOp::In,
+                        values: vec![alias.clone()],
+                    });
                     alternative.expressions.push(LabelRequirement {
                         key: "NODE_ID".into(),
                         op: SelectorOp::NotIn,

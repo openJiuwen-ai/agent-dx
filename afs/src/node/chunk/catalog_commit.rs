@@ -426,6 +426,10 @@ pub(super) fn record_allocation(record: &LocalChunkRecord) -> usize {
         + record.chunk.id.0.capacity()
         + record.device_id.capacity()
         + relative_path.capacity()
+        + record
+            .segment_crc
+            .as_ref()
+            .map_or(0, |t| t.checksums.capacity() * 4)
 }
 
 pub(super) fn record_capacity(records: &Vec<LocalChunkRecord>) -> usize {
@@ -437,6 +441,10 @@ pub(super) fn record_capacity(records: &Vec<LocalChunkRecord>) -> usize {
                 record.chunk.id.0.capacity()
                     + record.device_id.capacity()
                     + relative_path.capacity()
+                    + record
+                        .segment_crc
+                        .as_ref()
+                        .map_or(0, |t| t.checksums.capacity() * 4)
             })
             .sum::<usize>()
 }

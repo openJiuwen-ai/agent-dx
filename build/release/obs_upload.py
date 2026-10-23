@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 from urllib.parse import quote
 
-DEFAULT_BUCKET = "openyuanrong"
+DEFAULT_BUCKET = "agent-dx"
 DEFAULT_ENDPOINT = "obs.cn-southwest-2.myhuaweicloud.com"
 SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")

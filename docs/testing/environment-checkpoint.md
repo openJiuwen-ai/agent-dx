@@ -21,11 +21,11 @@
 | `adxlet::controller::lifecycle` | 串行暂停／恢复、资源释放与重新准入、失败回滚 |
 | `CheckpointCooperation` | Execd 控制 prepare／未启动 checkpoint 的 abort（gRPC／HTTP 共用状态机） |
 | `RuntimeDriver` | 能力检查、checkpoint、restore；sandboxd 适配器负责物理 ID 和 RPC |
-| `CheckpointStore` | 分配暂存、发布、物化、删除与节点本地对账清理；实现本地目录与 S3 对象存储 |
+| `CheckpointAccess` | 捕获目录、seal、恢复访问与节点本地缓存释放；共享对象物理删除通过 Coordinator ArtifactReclaimer |
 | `coordinator::storage` / Shard | Redis 版本校验、恢复点保存、增量资源记账 |
 | `gateway/apiserver` | HTTP 格式转换、缓存归属；恢复走统一 Coordinator 入口 |
 
-`CheckpointStore::publish` 是存储完成边界。对象存储在此完成上传，通过 `materialize` 下载；本地/S3、缓存引用和跨节点恢复已实现，见 [存储契约](snapshot-storage.md) 与 [跨节点恢复](firecracker-cross-node.md)。
+`CheckpointAccess::seal` 是存储完成边界。对象存储在此完成上传，通过 `prepare_restore` 下载；本地/S3、缓存引用和跨节点恢复已实现，见 [存储契约](snapshot-storage.md) 与 [跨节点恢复](firecracker-cross-node.md)。
 
 local-only 成功表示后端已生成完整、可在本机读取的制品，并已提交恢复点元数据。adxlet 不主动对本地制品及目录执行 `fsync`；未完成的磁盘写回由操作系统和执行后端处理，不保证突然断电或宿主机崩溃后的制品完整性。该规则同样用于 workload checkpoint、本地回滚恢复点和可复用快照副本；对象存储仍等待完整上传。恢复及重启对账保留本地制品的路径、类型和长度校验，校验失败的恢复点不能用于恢复。
 

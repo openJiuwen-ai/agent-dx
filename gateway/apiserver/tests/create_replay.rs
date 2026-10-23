@@ -34,12 +34,14 @@ use tonic::{Request, Response, Status};
 
 #[derive(Default)]
 struct State {
+    entry_node: Mutex<Option<pb::NodeEndpoint>>,
     owners: Mutex<HashMap<String, pb::GetEnvironmentResponse>>,
     metadata: Mutex<HashMap<String, HashMap<String, String>>>,
     starts: AtomicUsize,
     create_calls: AtomicUsize,
     lookups: AtomicUsize,
     response_error: AtomicUsize,
+    scheduling_expired: AtomicBool,
     block_response: AtomicBool,
     pending_response: AtomicBool,
     deadlines: Mutex<Vec<u64>>,
@@ -62,9 +64,12 @@ macro_rules! service_impl {
     };
 }
 service_impl!(pb::coordinator_service_server::CoordinatorService, {
-    type WatchNodesStream = futures_util::stream::Empty<Result<pb::NodeDirectory, Status>>;
+    type WatchNodesStream = std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<pb::NodeDirectory, Status>> + Send>>;
     async fn watch_nodes(&self, _: Request<pb::WatchNodesRequest>) -> Result<Response<Self::WatchNodesStream>, Status> {
-        Err(Status::unimplemented("central create fixture"))
+        let node = self.0.entry_node.lock().unwrap().clone().ok_or_else(|| Status::unimplemented("central create fixture"))?;
+        Ok(Response::new(Box::pin(futures_util::stream::once(async move {
+            Ok(pb::NodeDirectory { epoch: 1, valid_for_millis: 5000, nodes: vec![node] })
+        }).chain(futures_util::stream::pending()))))
     }
     async fn get_environment(&self, request: Request<pb::GetEnvironmentRequest>) -> Result<Response<pb::GetEnvironmentResponse>, Status> {
         self.0.lookups.fetch_add(1, Ordering::SeqCst);
@@ -86,6 +91,12 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
         } else {
             spec
         };
+        if self.0.scheduling_expired.load(Ordering::SeqCst) {
+            return Err(adx_protocol::scheduling_deadline(adx_core::scheduling::SchedulingFailure {
+                rejections: [("insufficient_cpu".into(), 1)].into(),
+                ..Default::default()
+            }));
+        }
         let record = {
             let mut owners = self.0.owners.lock().unwrap();
             if let Some(owner) = owners.get_mut(&spec.id) {
@@ -101,6 +112,8 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
             } else {
                 self.0.starts.fetch_add(1, Ordering::SeqCst);
                 let record = pb::EnvironmentRecord {
+                    execution_artifacts: vec![],
+            snapshot_source: None,
                     failure: None,
 assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: "node".into(), generation: 1, ..Default::default() }),
                     spec: Some(spec.clone()), state: if self.0.pending_response.load(Ordering::SeqCst) { pb::EnvironmentState::Pending as i32 } else { pb::EnvironmentState::Running as i32 }, revision: 1,
@@ -316,10 +329,23 @@ impl Fixture {
         Self::with_retention(600).await
     }
     async fn with_retention(retention: u64) -> Self {
+        Self::with_mode(retention, false).await
+    }
+    async fn with_mode(retention: u64, local_first: bool) -> Self {
         adx_transport::install_crypto_provider();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let state = Arc::new(State::default());
+        if local_first {
+            *state.entry_node.lock().unwrap() = Some(pb::NodeEndpoint {
+                node_id: "arbitrary-entry".into(),
+                address: address.clone(),
+                relay_address: address.clone(),
+                session_id: "boot".into(),
+                accepting_allocations: true,
+                ..Default::default()
+            });
+        }
         let endpoint = Service(state.clone());
         let auth = endpoint.clone();
         let snapshots = endpoint.clone();
@@ -339,6 +365,7 @@ impl Fixture {
             "listen":"127.0.0.1:0", "coordinator_address":address, "internal_security":"network", "ingress_mode":"standalone",
             "rpc_timeout_seconds":2, "cache_entries":1, "auth_cache_ttl_seconds":1,
             "create_unknown_retention_seconds":retention,
+            "create_mode":if local_first { "local_first" } else { "central" },
             "e2b": {
                 "domain":"sandbox.test",
                 "envdVersion":"0.9.0",
@@ -404,6 +431,40 @@ fn native_template() -> adx_agent_core::TemplateVersion {
         "readiness_probe":{"tcp_socket":{"port":8080},"period_seconds":3,"timeout_seconds":2}
     })).unwrap()
 }
+
+#[tokio::test]
+async fn snapshot_create_uses_coordinator_even_with_a_live_local_first_entry() {
+    let fixture = Fixture::with_mode(600, true).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while fixture.clients.nodes().await.is_err() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        fixture.clients.nodes().await.unwrap()[0].node_id,
+        "arbitrary-entry"
+    );
+    let mut spec = spec("snapshot-clone");
+    spec.snapshot_id = Some("snapshot".into());
+    let request = pb::CreateEnvironmentRequest {
+        spec: Some(spec),
+        caller: Some(caller()),
+        ..Default::default()
+    };
+    let (first, replay) = tokio::join!(
+        fixture
+            .clients
+            .create_environment(request.clone(), Duration::from_secs(2)),
+        fixture
+            .clients
+            .create_environment(request, Duration::from_secs(2)),
+    );
+    assert_eq!(first.unwrap(), replay.unwrap());
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
+}
 fn spec(id: &str) -> pb::EnvironmentSpec {
     pb::EnvironmentSpec {
         compatibility: None,
@@ -418,6 +479,35 @@ fn caller() -> pb::CallerContext {
         tenant_id: "tenant".into(),
         administrator: false,
     }
+}
+
+#[tokio::test]
+async fn cancelled_schedule_is_cached_without_resubmission_or_runtime_start() {
+    let fixture = Fixture::new().await;
+    fixture
+        .state
+        .scheduling_expired
+        .store(true, Ordering::SeqCst);
+    let error = fixture
+        .create("too-large", "create-too-large")
+        .await
+        .unwrap_err();
+    assert!(adx_protocol::scheduling_failure(&error).is_some());
+    let replay = fixture
+        .create("too-large", "create-too-large")
+        .await
+        .unwrap_err();
+    assert_eq!(replay.details(), error.details());
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 0);
+    assert!(fixture.state.owners.lock().unwrap().is_empty());
+    // A deliberate new logical request may wait for placement again.
+    let error = fixture
+        .create("too-large", "create-new-budget")
+        .await
+        .unwrap_err();
+    assert!(adx_protocol::scheduling_failure(&error).is_some());
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
@@ -649,6 +739,7 @@ async fn native_template_query_uses_real_local_control_without_binding_or_enviro
                 internal_cidrs: vec![],
                 public_egress: false,
                 egress_allow: vec![],
+                runtime_policies: Default::default(),
             },
         )
         .unwrap(),

@@ -8,6 +8,9 @@
 
 - `acceptance/`：标准验收 runner、环境准入、driver、probe 和小规模 case 清单。
 - `ownerfs_acceptance.py`：OwnerFs 三节点/远端访问验收入口，默认从目标仓根目录定位 `afs/common/protocol/proto`。
+  Meta固定使用local-file；准入、初启和重启共用本轮`C/meta-data`目录，配置／TLS材料仍由测试流程提供。
+  旧etcd选项不再接受；旧目录须保留给原二进制，不自动导入新格式。
+  `acceptance/test_ownerfs_meta_storage.py`只测参数构造和拒绝，不启动SSH／FUSE，不能代替真实恢复验收。
 - `scripts/dfs/r1_e2e.py`：DFS R=1 小规模本地 E2E 驱动。
 - `scripts/ownerfs/`：OwnerFs workspace 控制，以及 bind ON 两节点 local-file 恢复验证入口。
 - `scripts/check-rdma-cancellation.py`：RDMA 取消路径辅助检查。
@@ -45,9 +48,26 @@ python3 build/e2e/afs/scripts/ownerfs/bind-two-node-localfile.py --help
 
 真实 FUSE、权限、runc、RDMA、MooseFS、3FS 和多 VM 验收只在 Linux 环境执行。macOS 仅用于静态检查、路径回归和文档整理。目标仓二进制必须通过本仓构建产生，历史 DMS/AFS 证据只能作为迁移来源和判据参考。
 
+`ownerfs_acceptance.py`（R-OWN2）要求每个角色使用全新的运行目录，重复的
+`--run-id` 不会卸载或覆盖旧现场。挂载就绪以精确挂载点、`afs-ownerfs` source
+和 FUSE 类型核对，不要求挂载根中再有一个 `ownerfs` 子目录。
+每个角色的运行目录创建后通过远端 `realpath` 绑定物理路径，目录别名不替代
+精确挂载检查。REST 判定保留完整正文后解析，不能把日志摘要的截断用于归属判断；
+非法 JSON 或错误的 root/Home 身份仍使验收失败，日志 tail 仍保持原上限。
+进程由测试端父进程持有，停止请求核对本轮身份并取得真实退出码；Meta 在 Node
+之后停止。输出的 `waits` 包含产品及 FD 辅助进程回执，清理错误会使整体结果为 FAIL。
+只使用正常卸载；失败时保留目录，成功时可用 `--keep-tmp` 保留完整现场。
+此驱动的功能运行不等于性能、完整 POSIX 或多主机验收；实际主机、配置和二进制身份
+须由调用流程记录。驱动生命周期回归可在 Linux 单独执行：
+
+```bash
+python3 -m unittest discover -s build/e2e/afs/acceptance \
+  -p 'test_ownerfs_runner_lifecycle.py' -v
+```
+
 ### OwnerFs workspace bind ON 两节点 local-file 验证
 
-该入口用于当前候选的最小真实运行核对：在一台 Linux VM 上启动 `afs-meta`、`node-a`、`node-b`，使用 local-file Meta 和 mTLS，先通过 FUSE 创建 Home workspace，再对 `node-a` 开启 OwnerFs workspace bind mount，验证本地 bind 与远端 FUSE 的读写、权限、错误传播、正常停止、local-file Meta 重启恢复和卸载排空。它不声明性能达标，也不声明跨节点锁能力。
+该入口用于当前候选的最小真实运行核对：在一台 Linux VM 上启动 `afs-meta`、`node-a`、`node-b`，使用 local-file Meta 和 mTLS，先通过 FUSE 创建 Home workspace，再对 `node-a` 开启 OwnerFs workspace bind mount。驱动在 work root 下配置独立 `node-a/egress`，核对真实 Home ext4 inode 与 egress bind 一致、FUSE 子树未被覆盖，验证本地 bind 与远端 FUSE 的读写、权限、错误传播、正常停止、local-file Meta 重启恢复和卸载排空。它不声明性能达标，也不声明跨节点锁能力。
 
 运行前需先在 Linux 上构建目标二进制，例如：
 

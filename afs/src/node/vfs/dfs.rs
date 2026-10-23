@@ -224,6 +224,10 @@ pub struct DistributedFs {
     read_engine: Arc<DfsReadEngine>,
     remote_owner_factory: Option<Arc<dyn DfsRemoteOwnerFactory>>,
     handles: DfsHandleTable,
+    gc_references: Option<Arc<crate::node::gc::GcReferences>>,
+    optimistic_gc_commit: bool,
+    crc32c_writes: bool,
+    gc_gate: Mutex<()>,
     dir_handles: Mutex<HashMap<u64, DfsDirectoryHandle>>,
     inode_writes: ShardedMap<InodeId, SharedInodeWriteState>,
     remote_inode_providers: ShardedMap<InodeId, RemoteDfsWriteSession>,
@@ -255,6 +259,7 @@ pub struct DistributedFs {
     lock_session_reap_cursor: AtomicU64,
     owner_handle_reap_cursor: AtomicU64,
     writeback_cursor: AtomicU64,
+    write_lease_cursor: AtomicU64,
     writeback_maintenance_gate: Mutex<()>,
     write_pipeline_budget: Arc<DeferredWriteBudget>,
     write_pipeline_budget_gate: Mutex<()>,
@@ -643,6 +648,7 @@ struct NativeReadView {
 }
 
 struct DfsFileHandle {
+    gc_pin: Option<Arc<crate::node::gc::GcPin>>,
     inode_id: InodeId,
     opened_inode: InodeRecord,
     opened_page_identity: Option<PageCacheIdentity>,
@@ -655,6 +661,7 @@ struct DfsFileHandle {
 }
 
 struct DfsHandle {
+    _gc_pin: Option<Arc<crate::node::gc::GcPin>>,
     inode_id: InodeId,
     flags: i32,
     owner_scope: Option<DfsOwnerHandleScope>,
@@ -730,6 +737,7 @@ impl NativeReadRefresh {
 impl From<DfsFileHandle> for DfsHandle {
     fn from(opened: DfsFileHandle) -> Self {
         Self {
+            _gc_pin: opened.gc_pin,
             inode_id: opened.inode_id,
             flags: opened.flags,
             owner_scope: opened.owner_scope,
@@ -1095,6 +1103,7 @@ impl OwnerOpenFinishPause {
 }
 
 struct DfsDirectoryHandle {
+    _gc_pin: Option<Arc<crate::node::gc::GcPin>>,
     entries: Vec<DirectoryEntry>,
 }
 
@@ -2340,6 +2349,7 @@ impl Drop for NativeUploadPermit {
 }
 
 struct NativeUpload {
+    _gc_pin: Option<Arc<crate::node::gc::GcPin>>,
     operation_id: OperationId,
     chunk: ChunkObject,
     owner: Weak<InodeWriteStateCell>,
@@ -2459,6 +2469,7 @@ struct DirtyExtentMap {
     next_builder_order: u64,
     native_admitted_bytes: Option<u64>,
     native_operation_id: Option<OperationId>,
+    native_gc_pin: Option<Arc<crate::node::gc::GcPin>>,
 }
 
 struct NativeDirtyBuilder {
@@ -2496,6 +2507,7 @@ impl Clone for DirtyExtentMap {
             next_builder_order: self.next_builder_order,
             native_admitted_bytes: self.native_admitted_bytes,
             native_operation_id: self.native_operation_id.clone(),
+            native_gc_pin: self.native_gc_pin.clone(),
         }
     }
 }
@@ -2542,6 +2554,7 @@ struct OverlaySegment {
 
 #[derive(Clone)]
 struct CommitBatch {
+    _gc_pin: Option<Arc<crate::node::gc::GcPin>>,
     through_seq: u64,
     commit: Arc<CommitFileVersion>,
     _native_accounting: Option<Arc<NativeCommitAccounting>>,
@@ -2643,6 +2656,10 @@ impl DistributedFs {
             read_engine,
             remote_owner_factory: None,
             handles: DfsHandleTable::default(),
+            gc_references: None,
+            optimistic_gc_commit: false,
+            crc32c_writes: false,
+            gc_gate: Mutex::new(()),
             dir_handles: Mutex::new(HashMap::new()),
             inode_writes: ShardedMap::default(),
             remote_inode_providers: ShardedMap::default(),
@@ -2673,6 +2690,7 @@ impl DistributedFs {
             lock_session_reap_cursor: AtomicU64::new(0),
             owner_handle_reap_cursor: AtomicU64::new(0),
             writeback_cursor: AtomicU64::new(0),
+            write_lease_cursor: AtomicU64::new(0),
             writeback_maintenance_gate: Mutex::new(()),
             write_pipeline_budget: Arc::new(DeferredWriteBudget::default()),
             write_pipeline_budget_gate: Mutex::new(()),
@@ -2700,6 +2718,56 @@ impl DistributedFs {
             next_operation: AtomicU64::new(1),
             next_owner_open_seq: AtomicU64::new(1),
         }
+    }
+
+    pub fn with_gc_references(
+        mut self,
+        references: Option<Arc<crate::node::gc::GcReferences>>,
+    ) -> Self {
+        self.gc_references = references;
+        self
+    }
+    pub(crate) fn with_crc32c_writes(mut self, enabled: bool) -> Self {
+        self.crc32c_writes = enabled;
+        self
+    }
+    fn stage_native_chunk(&self, op: OperationId, bytes: SharedChunkBytes) -> Result<StagedChunk> {
+        if self.crc32c_writes {
+            StagedChunk::from_shared_crc32c(op, bytes)
+        } else {
+            Ok(StagedChunk::from_shared(op, bytes))
+        }
+    }
+    pub(crate) fn with_optimistic_gc_commit(mut self, enabled: bool) -> Self {
+        self.optimistic_gc_commit = enabled;
+        self
+    }
+    pub fn flush_gc_releases(&self) -> Result<()> {
+        if let Some(references) = &self.gc_references {
+            references.flush()?;
+        }
+        Ok(())
+    }
+    pub fn collect_garbage(&self) -> Result<usize> {
+        let Some(references) = &self.gc_references else {
+            return Ok(0);
+        };
+        let _gate = self
+            .gc_gate
+            .lock()
+            .map_err(|_| unavailable("GC worker poisoned"))?;
+        references.flush()?;
+        let completed = self.read_engine.gc_generation()?;
+        let batch = references
+            .control
+            .collect(completed, self.read_engine.gc_inventory()?)?;
+        if batch.waiting_nodes.contains(&self.node_id) && batch.generation > completed {
+            self.read_engine
+                .collect_generation(batch.generation, &batch.chunks)?;
+            references.control.collect(batch.generation, Vec::new())?;
+            return Ok(batch.chunks.len());
+        }
+        Ok(0)
     }
 
     pub(crate) fn with_native_write_pipeline(
@@ -3076,6 +3144,22 @@ impl DistributedFs {
                     self.observe_handle_error(handle)?;
                 }
             }
+            let gc_pin = if generation.is_none() {
+                self.gc_references
+                    .as_ref()
+                    .map(|references| {
+                        if self.optimistic_gc_commit && self.crc32c_writes {
+                            references.pin_generation(&snapshot.inode_id, None, &operation_id)
+                        } else if self.optimistic_gc_commit {
+                            references.pin_fenced(&snapshot.inode_id, None, &operation_id)
+                        } else {
+                            references.pin(&snapshot.inode_id, None, Some(&operation_id))
+                        }
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
             let operation = self.begin_inode_operation(&snapshot.inode_id, cell.clone())?;
             let (written, accepted_seq) = {
                 let mut state = cell
@@ -3102,6 +3186,7 @@ impl DistributedFs {
                 let next_seq = state.next_write_seq.saturating_add(1);
                 if state.dirty_extents.native_operation_id.is_none() {
                     state.dirty_extents.native_operation_id = Some(operation_id.clone());
+                    state.dirty_extents.native_gc_pin = gc_pin;
                 }
                 let written = state.dirty_extents.write_native_prepared(
                     position,
@@ -3214,8 +3299,9 @@ impl DistributedFs {
             }
             // The immutable allocation stays the same. Staging performs the
             // standard BLAKE3 scan; no body concatenation or clone is involved.
-            let staged = StagedChunk::from_shared(operation_id.clone(), body.clone());
+            let staged = self.stage_native_chunk(operation_id.clone(), body.clone())?;
             let upload = Arc::new(NativeUpload {
+                _gc_pin: state.dirty_extents.native_gc_pin.clone(),
                 operation_id: operation_id.clone(),
                 chunk: staged.chunk.clone(),
                 owner: Arc::downgrade(cell),
@@ -3354,10 +3440,15 @@ impl DistributedFs {
         }
         let permit = NativeUploadPermit(pipeline.metadata.clone());
         let store = self.chunk_store.clone();
-        let staged = state
-            .staged
-            .take()
-            .unwrap_or_else(|| StagedChunk::from_shared(upload.operation_id.clone(), body));
+        let staged = match state.staged.take() {
+            Some(staged) => staged,
+            None if upload.chunk.is_segment_crc32c() => StagedChunk::from_shared_crc32c_id(
+                upload.operation_id.clone(),
+                body,
+                upload.chunk.id.clone(),
+            )?,
+            None => StagedChunk::from_shared(upload.operation_id.clone(), body),
+        };
         if staged.chunk != upload.chunk {
             return Err(invalid("native upload changed its immutable object"));
         }
@@ -3690,11 +3781,11 @@ impl DistributedFs {
     }
 
     fn operation_id(&self, prefix: &str) -> OperationId {
-        OperationId::new(format!(
+        OperationId::new(crate::meta::store::timed_request_id(format!(
             "{}-{prefix}-{}",
             self.session_id,
             self.next_operation.fetch_add(1, Ordering::Relaxed)
-        ))
+        )))
     }
 
     fn validate_inode(&self, inode: InodeRecord) -> Result<InodeRecord> {
@@ -3789,9 +3880,13 @@ impl DistributedFs {
         })
     }
 
-    fn allocate_handle(&self, handle: DfsFileHandle) -> Result<FileHandle> {
+    fn allocate_handle(&self, mut handle: DfsFileHandle) -> Result<FileHandle> {
         let id = self.next_handle.fetch_add(1, Ordering::Relaxed);
         let inode_id = handle.inode_id.clone();
+        if let Some(references) = &self.gc_references {
+            handle.gc_pin =
+                Some(references.pin(&inode_id, handle.opened_inode.head_version.as_ref(), None)?);
+        }
         self.handles.insert(id, handle, || {
             let dynamic = self.write_state(&inode_id)?.is_some()
                 || self.current_remote_provider(&inode_id)?.is_some();
@@ -3922,7 +4017,6 @@ impl DistributedFs {
             && state.in_flight.is_none()
             && !state.commit_busy
             && !state.operation_busy
-            && !state.last_writer_background_requested
             && state.background_error.is_none()
             && state.terminal_error.is_none()
     }
@@ -5269,15 +5363,23 @@ impl DistributedFs {
                     state.commit_busy = true;
                     break 'action CommitAction::Send(pending);
                 } else {
+                    // Data-only commits can advance the data sequence while
+                    // leaving timestamps pending. Once the last writer closes,
+                    // flush that metadata even when both sequences are equal;
+                    // otherwise lease renewal keeps unlinked versions forever.
                     let sync_metadata_only = state.metadata_dirty
-                        && matches!(
+                        && (matches!(
                             reason,
                             CommitReason::DataSync
                                 | CommitReason::FullSync
                                 | CommitReason::Close
                                 | CommitReason::NodeDrain
-                        )
-                        && state.visible_write_seq > state.committed_write_seq;
+                        ) && state.visible_write_seq > state.committed_write_seq
+                            || state.open_writers == 0
+                                && matches!(
+                                    reason,
+                                    CommitReason::Background | CommitReason::LastWriter
+                                ));
                     if !(state.dirty
                         || sync_metadata_only
                         || matches!(reason, CommitReason::FullSync) && state.metadata_dirty
@@ -5340,8 +5442,8 @@ impl DistributedFs {
             let pending_reuse = matches!(&action, CommitAction::Send(_));
             let pending = match action {
                 CommitAction::Send(pending) => pending,
-                CommitAction::Prepare(frozen, publication_window) => {
-                    match self.prepare_commit(&frozen, reason, publication_window) {
+                CommitAction::Prepare(mut frozen, publication_window) => {
+                    match self.prepare_commit(&mut frozen, reason, publication_window) {
                         Ok(batch) => {
                             let pending_file = PendingFileCommit {
                                 frozen: *frozen,
@@ -5610,6 +5712,7 @@ impl DistributedFs {
                 state.inode = updated;
                 state.metadata_dirty = false;
                 state.kill_suidgid_dirty = false;
+                state.last_writer_background_requested = false;
                 state.durable_write_seq = state.durable_write_seq.max(through_seq);
                 state.committed_write_seq = state.committed_write_seq.max(through_seq);
                 Ok(Some(state.committed_write_seq))
@@ -5741,12 +5844,17 @@ impl DistributedFs {
 
     fn prepare_native_generation(
         &self,
-        frozen: &FrozenCommit,
+        frozen: &mut FrozenCommit,
         operation_id: &OperationId,
         layout_id: LayoutRootId,
         retained_uploads: &mut Vec<Arc<NativeUpload>>,
     ) -> Result<(LayoutRoot, Vec<ChunkReceipt>)> {
-        let mut plan = CommitPlanner.plan(frozen, operation_id.clone(), layout_id)?;
+        let mut plan = CommitPlanner.plan_with_integrity(
+            frozen,
+            operation_id.clone(),
+            layout_id,
+            self.crc32c_writes,
+        )?;
         let mut receipts: Vec<ChunkReceipt> = Vec::new();
         for extent in frozen.dirty_extents.extents.values() {
             if let Some(upload) = &extent.native_upload {
@@ -5786,6 +5894,7 @@ impl DistributedFs {
                     unavailable("native publication body has no descriptor reservation")
                 })?;
             let upload = Arc::new(NativeUpload {
+                _gc_pin: frozen.dirty_extents.native_gc_pin.clone(),
                 operation_id: operation_id.clone(),
                 chunk: staged.chunk.clone(),
                 owner: self
@@ -5804,6 +5913,33 @@ impl DistributedFs {
                 cv: Condvar::new(),
                 _descriptor: descriptor,
             });
+            if upload.chunk.is_segment_crc32c() {
+                // Preserve the immutable tail identity before any fallible I/O.
+                // Failed preparation restores this map, including successful
+                // receipts. Dispatch keeps the original sequential order.
+                for extent in plan
+                    .layout_root
+                    .inline_extents
+                    .iter()
+                    .filter(|extent| extent.chunk_id == upload.chunk.id)
+                {
+                    frozen.dirty_extents.insert_native(DirtyExtent {
+                        file_offset: extent.file_offset,
+                        length: extent.length,
+                        write_seq: frozen.through_seq,
+                        data: None,
+                        builder: None,
+                        source_offset: usize::try_from(extent.chunk_offset)
+                            .map_err(|_| invalid("native tail offset is too large"))?,
+                        native_reuse_end: extent.file_offset + extent.length,
+                        uploaded: None,
+                        native_upload: Some(upload.clone()),
+                        native_descriptor: Some(upload._descriptor.clone()),
+                        budget_reservations: Vec::new(),
+                    });
+                }
+            }
+            retained_uploads.push(upload.clone());
             let receipt = self.wait_native_upload(&upload)?;
             if !receipts
                 .iter()
@@ -5811,7 +5947,6 @@ impl DistributedFs {
             {
                 receipts.push(receipt);
             }
-            retained_uploads.push(upload);
         }
         plan.layout_root
             .inline_extents
@@ -5835,7 +5970,7 @@ impl DistributedFs {
 
     fn prepare_commit(
         &self,
-        frozen: &FrozenCommit,
+        frozen: &mut FrozenCommit,
         reason: CommitReason,
         publication_window: Option<PublicationWindow>,
     ) -> std::result::Result<CommitBatch, PrepareCommitError> {
@@ -5871,11 +6006,55 @@ impl DistributedFs {
             .native_operation_id
             .clone()
             .or_else(|| {
+                // Length-only preparation can fail after admission. The pin
+                // already owns its exact operation; never mint a replacement.
+                frozen
+                    .dirty_extents
+                    .native_gc_pin
+                    .as_ref()
+                    .and_then(|pin| pin.write_operation_id())
+            })
+            .or_else(|| {
                 publication_window
                     .as_ref()
                     .map(|window| window.operation_id.clone())
             })
             .unwrap_or_else(|| self.operation_id(reason.operation_prefix()));
+        let gc_pin = match (&frozen.dirty_extents.native_gc_pin, &self.gc_references) {
+            (Some(pin), _) => Some(pin.clone()),
+            (None, Some(references)) => Some(
+                (if self.optimistic_gc_commit && self.crc32c_writes {
+                    references.pin_generation(
+                        &frozen.inode.inode_id,
+                        frozen.inode.head_version.as_ref(),
+                        &operation_id,
+                    )
+                } else if self.optimistic_gc_commit {
+                    references.pin_fenced(
+                        &frozen.inode.inode_id,
+                        frozen.inode.head_version.as_ref(),
+                        &operation_id,
+                    )
+                } else {
+                    references.pin(
+                        &frozen.inode.inode_id,
+                        frozen.inode.head_version.as_ref(),
+                        Some(&operation_id),
+                    )
+                })
+                .map_err(|error| PrepareCommitError {
+                    error,
+                    publication_window: None,
+                    budget_reservations: Vec::new(),
+                })?,
+            ),
+            (None, None) => None,
+        };
+        if self.optimistic_gc_commit {
+            // Length-only generations have no write-time pin. Freeze their
+            // captured fence as well; preparation retries never refresh it.
+            frozen.dirty_extents.native_gc_pin = gc_pin.clone();
+        }
         let generation = self.next_operation.fetch_add(1, Ordering::Relaxed);
         let layout_id = LayoutRootId::new(format!("{}-layout-{generation}", self.session_id));
 
@@ -5967,7 +6146,16 @@ impl DistributedFs {
             layout_root: layout_root.id.clone(),
             created_at_unix_ms: now,
         };
+        let gc_fence = gc_pin.as_ref().and_then(|pin| pin.fence());
+        if self.optimistic_gc_commit && gc_fence.is_none() {
+            return Err(PrepareCommitError {
+                error: unavailable("optimistic commit has no frozen GC fence"),
+                publication_window: None,
+                budget_reservations: Vec::new(),
+            });
+        }
         let commit = CommitFileVersion {
+            gc_fence,
             operation_id,
             inode_id: frozen.inode.inode_id.clone(),
             write_lease: frozen.write_lease.clone(),
@@ -5979,6 +6167,7 @@ impl DistributedFs {
             file_version: version,
             layout_root,
             chunk_receipts: receipts,
+            clone_source: None,
             metadata_delta: reason.metadata_delta(
                 frozen.inode.attributes.mtime_unix_ms,
                 frozen.inode.attributes.ctime_unix_ms,
@@ -6060,6 +6249,7 @@ impl DistributedFs {
             None
         };
         Ok(CommitBatch {
+            _gc_pin: gc_pin,
             through_seq: frozen.through_seq,
             _budget_reservations: budget_reservations,
             _native_accounting: native_accounting,
@@ -6470,7 +6660,7 @@ impl DistributedFs {
         if kill_suidgid {
             Self::apply_kernel_killpriv_to_state(&mut state);
         }
-        if state.open_writers == 0 && state.dirty {
+        if state.open_writers == 0 && (state.dirty || state.metadata_dirty) {
             state.last_writer_background_requested = true;
         }
         Ok(state.visible_write_seq)
@@ -6485,7 +6675,7 @@ impl DistributedFs {
             .lock()
             .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
         state.open_writers = state.open_writers.saturating_sub(1);
-        if state.open_writers == 0 && state.dirty {
+        if state.open_writers == 0 && (state.dirty || state.metadata_dirty) {
             state.last_writer_background_requested = true;
         }
         Ok(())
@@ -7955,6 +8145,70 @@ impl DistributedFs {
         )
     }
 
+    pub fn renew_active_write_leases(&self) -> Result<usize> {
+        // Open idle writers and unknown commits still depend on their lease.
+        // Renew independently of writeback, without changing a frozen request.
+        let mut entries = self.inode_writes.snapshot()?;
+        entries.sort_by(|left, right| left.0.0.cmp(&right.0.0));
+        if !entries.is_empty() {
+            let start = self.write_lease_cursor.load(Ordering::Relaxed) as usize % entries.len();
+            entries.rotate_left(start);
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut examined = 0;
+        let mut renewed_count = 0;
+        let mut first_error = None;
+        for (_, cell) in entries {
+            if Instant::now() >= deadline {
+                break;
+            }
+            examined += 1;
+            let lease = {
+                let Ok(state) = cell.state.try_lock() else {
+                    continue;
+                };
+                if state.terminal_error.is_some()
+                    || !(state.open_writers > 0
+                        || state.dirty
+                        || state.metadata_dirty
+                        || state.kill_suidgid_dirty
+                        || state.in_flight.is_some())
+                    || !should_background_renew(&state.write_lease)
+                {
+                    continue;
+                }
+                state.write_lease.clone()
+            };
+            match self.meta.renew_write_lease_with_timeout(
+                lease.clone(),
+                deadline.saturating_duration_since(Instant::now()),
+            ) {
+                Ok(renewed) if same_lease_identity(&lease, &renewed) => {
+                    let mut state = cell
+                        .lock()
+                        .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                    // A late reply cannot replace a newer authority or shorten TTL.
+                    if state.terminal_error.is_none()
+                        && same_lease_identity(&state.write_lease, &lease)
+                    {
+                        state.write_lease = merge_same_identity_lease(&state.write_lease, renewed);
+                        renewed_count += 1;
+                    }
+                }
+                Ok(_) => {
+                    first_error
+                        .get_or_insert_with(|| stale("DFS writer renewal changed lease identity"));
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        self.write_lease_cursor
+            .fetch_add(examined, Ordering::Relaxed);
+        first_error.map_or(Ok(renewed_count), Err)
+    }
+
     fn writeback_pending_with_budget(&self, budget: Duration, max_ops: usize) -> Result<usize> {
         let _guard = match self.writeback_maintenance_gate.try_lock() {
             Ok(guard) => guard,
@@ -8013,6 +8267,16 @@ impl DistributedFs {
                         committed += 1;
                     }
                     Ok(None) => {}
+                    // A bounded maintenance RPC can expire after Meta committed.
+                    // finish_commit retains the exact request for replay. This
+                    // scheduling deferral must not poison a later successful
+                    // foreground fsync; real I/O and fencing errors still do.
+                    Err(error) if error.kind() == afs_error::ErrorKind::DeadlineExceeded => {
+                        afs_logging::debug!("dfs.background_commit_deferred";
+                            "inode_id" => inode_id.0.as_str(),
+                            "error" => error.to_string()
+                        );
+                    }
                     Err(error) => self.record_background_error(&inode_id, error)?,
                 }
             }
@@ -9157,6 +9421,7 @@ impl DirtyExtentMap {
     fn restore_before(&mut self, mut older: DirtyExtentMap) {
         if self.native_operation_id.is_none() {
             self.native_operation_id = older.native_operation_id.take();
+            self.native_gc_pin = older.native_gc_pin.take();
         }
         // The restored batch has already frozen its owners. Mutable builder
         // indices belong only to the active map and must never be renumbered.
@@ -9364,6 +9629,16 @@ impl CommitPlanner {
         operation_id: OperationId,
         layout_id: LayoutRootId,
     ) -> Result<CommitPlan> {
+        self.plan_with_integrity(frozen, operation_id, layout_id, false)
+    }
+
+    fn plan_with_integrity(
+        &self,
+        frozen: &FrozenCommit,
+        operation_id: OperationId,
+        layout_id: LayoutRootId,
+        crc32c_writes: bool,
+    ) -> Result<CommitPlan> {
         let overlay = normalized_overlay(&frozen.dirty_extents, frozen.logical_length)?;
         let mut extents = frozen
             .base_layout
@@ -9433,10 +9708,12 @@ impl CommitPlanner {
                     Some(index) => *index,
                     None => {
                         let index = staged_chunks.len();
-                        staged_chunks.push(StagedChunk::from_shared(
-                            operation_id.clone(),
-                            bytes.slice(start..end),
-                        ));
+                        let body = bytes.slice(start..end);
+                        staged_chunks.push(if crc32c_writes {
+                            StagedChunk::from_shared_crc32c(operation_id.clone(), body)?
+                        } else {
+                            StagedChunk::from_shared(operation_id.clone(), body)
+                        });
                         staged_by_source.insert(key, index);
                         index
                     }
@@ -11546,6 +11823,7 @@ impl Backend for DistributedFs {
         self.install_write_state(inode.clone(), write_lease)?;
         let session = self.open_write_session(&inode, flags)?;
         let handle = self.allocate_handle(DfsFileHandle {
+            gc_pin: None,
             inode_id: inode.inode_id.clone(),
             opened_inode: inode.clone(),
             opened_page_identity: None,
@@ -11699,6 +11977,7 @@ impl Backend for DistributedFs {
             self.check_native_read_view(view)?;
         }
         self.allocate_handle(DfsFileHandle {
+            gc_pin: None,
             inode_id: opened_inode.inode_id.clone(),
             opened_inode,
             opened_page_identity,
@@ -11792,6 +12071,12 @@ impl Backend for DistributedFs {
     }
 
     fn write_admission_mode(&self, handle: FileHandle) -> WriteAdmissionMode {
+        // Native admission may wait for mutation/publication or shared body
+        // capacity. Keep those waits on a worker so the FUSE receiver can
+        // admit unrelated reads and writeback needed to make progress.
+        if self.native_pipeline.is_some() {
+            return WriteAdmissionMode::Queued;
+        }
         if !self.deferred_publication_enabled()
             && self
                 .handle_snapshot(handle)
@@ -12289,6 +12574,158 @@ impl Backend for DistributedFs {
         Ok(total_written)
     }
 
+    fn copy_file_range(
+        &self,
+        _: &RequestContext,
+        range: super::types::CopyFileRange,
+    ) -> Result<u64> {
+        let source = self.handle_snapshot(range.source)?;
+        let destination = self.handle_snapshot(range.destination)?;
+        if source.flags & libc::O_ACCMODE == libc::O_WRONLY
+            || destination.flags & libc::O_ACCMODE == libc::O_RDONLY
+        {
+            return Err(bad_file_descriptor(
+                "COW copy requires readable source and writable destination",
+            ));
+        }
+        if source.inode_id == destination.inode_id {
+            return Err(Error::coded(
+                afs_error::IO_NOT_SUPPORTED,
+                "same-inode COW range is unsupported",
+            ));
+        }
+        let session = destination
+            .write_session
+            .as_ref()
+            .ok_or_else(|| bad_file_descriptor("missing destination write session"))?;
+        if session.remote.is_some()
+            || destination.flags & libc::O_APPEND != 0
+            || self
+                .remote_provider_visible_for_reads(&source.inode_id)?
+                .is_some()
+        {
+            return Err(Error::coded(
+                afs_error::IO_NOT_SUPPORTED,
+                "COW requires local destination authority and committed source",
+            ));
+        }
+        // Snapshot the source before acquiring destination admission, avoiding
+        // cross-copy deadlock. Concurrent later writes create another version.
+        self.commit_inode(&source.inode_id, CommitReason::FullSync)?;
+        let inode = self.validate_inode(self.meta.get_inode(&source.inode_id)?)?;
+        let Some(version_id) = inode.head_version else {
+            return Ok(0);
+        };
+        let (source_version, source_layout) = self.meta.get_file_version(&version_id)?;
+        if range.source_offset >= source_version.length || range.length == 0 {
+            return Ok(0);
+        }
+        let length = range
+            .length
+            .min(source_version.length - range.source_offset)
+            .min(u64::from(u32::MAX));
+        let cell = self
+            .write_state(&destination.inode_id)?
+            .ok_or_else(|| stale("destination write state is missing"))?;
+        let _operation = self.begin_inode_operation(&destination.inode_id, cell.clone())?;
+        self.commit_inode_inside_operation(&destination.inode_id, CommitReason::FullSync)?;
+        let pending = {
+            let mut state = cell
+                .lock()
+                .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+            if should_renew(&state.write_lease) {
+                state.write_lease = self.meta.renew_write_lease(state.write_lease.clone())?;
+            }
+            let clone_source = crate::dfs::CloneFileRange {
+                version: version_id,
+                source_offset: range.source_offset,
+                destination_offset: range.destination_offset,
+                length,
+            };
+            let generation = self.next_operation.fetch_add(1, Ordering::Relaxed);
+            let layout = crate::dfs::clone_file_layout(
+                &state.base_layout,
+                &source_layout,
+                &clone_source,
+                LayoutRootId::new(format!("{}-cow-layout-{generation}", self.session_id)),
+            )?;
+            let now = now_unix_ms();
+            state.next_write_seq = state.next_write_seq.saturating_add(1);
+            state.visible_write_seq = state.next_write_seq;
+            state.logical_length = layout.file_length;
+            state.metadata_dirty = true;
+            state.inode.attributes.mtime_unix_ms = now;
+            state.inode.attributes.ctime_unix_ms = now;
+            Self::apply_kernel_killpriv_to_state(&mut state);
+            let frozen = FrozenCommit {
+                through_seq: state.visible_write_seq,
+                logical_length: layout.file_length,
+                inode: state.inode.clone(),
+                write_lease: state.write_lease.clone(),
+                base_version: state.base_version.clone(),
+                base_layout: state.base_layout.clone(),
+                dirty_extents: DirtyExtentMap::default(),
+                // COW shares committed chunks; it owns no dirty write body.
+                dirty_budget_reservations: Vec::new(),
+                kill_suidgid_dirty: state.kill_suidgid_dirty,
+            };
+            let commit = CommitFileVersion {
+                gc_fence: None,
+                operation_id: self.operation_id("cow-copy"),
+                inode_id: destination.inode_id.clone(),
+                write_lease: state.write_lease.clone(),
+                expected_inode_revision: state.inode.revision,
+                expected_head_version: state.inode.head_version.clone(),
+                file_version: FileVersion {
+                    id: FileVersionId::new(format!("{}-cow-version-{generation}", self.session_id)),
+                    inode_id: destination.inode_id.clone(),
+                    parent_version: state.inode.head_version.clone(),
+                    length: layout.file_length,
+                    layout_root: layout.id.clone(),
+                    created_at_unix_ms: now,
+                },
+                layout_root: layout,
+                chunk_receipts: Vec::new(),
+                clone_source: Some(clone_source),
+                metadata_delta: CommitReason::FullSync.metadata_delta(
+                    now,
+                    now,
+                    state.kill_suidgid_dirty,
+                ),
+            };
+            let pending = PendingFileCommit {
+                frozen,
+                batch: CommitBatch {
+                    _gc_pin: None,
+                    through_seq: state.visible_write_seq,
+                    commit: Arc::new(commit),
+                    _native_accounting: None,
+                    _native_uploads: Vec::new(),
+                    _budget_reservations: Vec::new(),
+                },
+                trace_send_attempt: self
+                    .pending_trace
+                    .as_ref()
+                    .map(|_| Arc::new(AtomicU64::new(0))),
+            };
+            state.in_flight = Some(InFlightCommit::File(Box::new(pending.clone())));
+            state.commit_busy = true;
+            InFlightCommit::File(Box::new(pending))
+        };
+        if let Some(seq) = self.finish_commit(cell, pending, None, "cow-copy")? {
+            self.update_handles_after_commit(&destination.inode_id, seq)?;
+            self.update_handle_write_progress(range.destination, seq)?;
+        }
+        afs_logging::info!("dfs.cow_range_committed";
+            "source_inode" => source.inode_id.0,
+            "source_version" => source_version.id.0,
+            "destination_inode" => destination.inode_id.0,
+            "source_offset" => range.source_offset,
+            "destination_offset" => range.destination_offset,
+            "length" => length);
+        Ok(length)
+    }
+
     fn flush(&self, _: &RequestContext, handle: FileHandle) -> Result<()> {
         let snapshot = self.handle_snapshot(handle)?;
         if let Some(session) = snapshot.write_session.as_ref() {
@@ -12358,7 +12795,17 @@ impl Backend for DistributedFs {
         self.dir_handles
             .lock()
             .map_err(|_| unavailable("DFS directory handle table is poisoned"))?
-            .insert(id, DfsDirectoryHandle { entries });
+            .insert(
+                id,
+                DfsDirectoryHandle {
+                    entries,
+                    _gc_pin: self
+                        .gc_references
+                        .as_ref()
+                        .map(|references| references.pin(&inode_id, None, None))
+                        .transpose()?,
+                },
+            );
         Ok(DirectoryHandle(id))
     }
 
@@ -12550,9 +12997,16 @@ impl Backend for DistributedFs {
     }
 
     fn getxattr(&self, ctx: &RequestContext, inode: BackendInode, name: &OsStr) -> Result<Vec<u8>> {
+        let inode_id = self.inode_id(inode)?;
+        if name.as_encoded_bytes() == b"security.capability" {
+            return Err(Error::coded(
+                afs_error::IO_NOT_SUPPORTED,
+                "DFS currently supports only user.* xattrs",
+            ));
+        }
         self.meta.get_xattr(GetXattrRequest {
             caller: caller_context(ctx),
-            inode_id: self.inode_id(inode)?,
+            inode_id,
             name: name.as_encoded_bytes().to_vec(),
         })
     }
@@ -12777,6 +13231,7 @@ impl crate::node::rpc::control::DfsOwnerLifecycleHandler for DistributedFs {
                 Self::apply_kernel_killpriv_to_state(&mut state);
             }
             self.allocate_handle(DfsFileHandle {
+                gc_pin: None,
                 inode_id: inode.inode_id.clone(),
                 opened_inode: inode.clone(),
                 opened_page_identity: None,
@@ -14094,7 +14549,9 @@ fn unavailable(message: impl Into<String>) -> Error {
 fn is_definite_commit_rejection(error: &Error) -> bool {
     matches!(
         error.code(),
-        afs_error::META_CATALOG_INVALID_REQUEST | afs_error::META_DFS_CONFLICT
+        afs_error::META_CATALOG_INVALID_REQUEST
+            | afs_error::META_DFS_CONFLICT
+            | afs_error::META_DFS_GC_CHANGED
     )
 }
 
@@ -14108,6 +14565,76 @@ fn bad_file_descriptor(message: impl Into<String>) -> Error {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn meta_capability_local_rejection_skips_authority() {
+        let (_temp, meta, fs) = test_fs();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        for uid in [0, 1000, 2000] {
+            let mut caller = context();
+            caller.uid = uid;
+            let error = fs
+                .getxattr(&caller, inode, OsStr::new("security.capability"))
+                .unwrap_err();
+            assert_eq!(error.code(), afs_error::IO_NOT_SUPPORTED);
+            assert_eq!(error.message(), "DFS currently supports only user.* xattrs");
+        }
+        assert_eq!(meta.xattr_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn meta_capability_other_names_keep_authority_and_errors() {
+        let (_temp, meta, fs) = test_fs();
+        let inode_id = {
+            let mut inode = meta.inode.lock().unwrap();
+            inode
+                .xattrs
+                .insert(b"user.meta-capability".to_vec(), b"value".to_vec());
+            inode.inode_id.clone()
+        };
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        assert_eq!(
+            fs.getxattr(&context(), inode, OsStr::new("user.meta-capability"))
+                .unwrap(),
+            b"value"
+        );
+        *meta.next_xattr_error.lock().unwrap() = Some(Error::coded(
+            afs_error::IO_PERMISSION_DENIED,
+            "authority denied",
+        ));
+        let error = fs
+            .getxattr(&context(), inode, OsStr::new("user.meta-capability"))
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::IO_PERMISSION_DENIED);
+        assert_eq!(error.message(), "authority denied");
+        for name in [
+            "security.selinux",
+            "security.capability.extra",
+            "user.missing",
+        ] {
+            assert_eq!(
+                fs.getxattr(&context(), inode, OsStr::new(name))
+                    .unwrap_err()
+                    .code(),
+                afs_error::NODE_VFS_NOT_FOUND
+            );
+        }
+        assert_eq!(meta.xattr_calls.load(Ordering::SeqCst), 5);
+    }
+
+    #[test]
+    fn meta_capability_invalid_inode_keeps_local_failure_order() {
+        let (_temp, meta, fs) = test_fs();
+        let inode = BackendInode { value: u64::MAX };
+        let expected = fs.inode_id(inode).unwrap_err();
+        let actual = fs
+            .getxattr(&context(), inode, OsStr::new("security.capability"))
+            .unwrap_err();
+        assert_eq!(actual.code(), expected.code());
+        assert_eq!(actual.message(), expected.message());
+        assert_eq!(meta.xattr_calls.load(Ordering::SeqCst), 0);
+    }
+
     use super::*;
     use crate::{
         dfs::{
@@ -14209,14 +14736,14 @@ mod tests {
     }
 
     #[cfg(feature = "dfs")]
-    struct CountingStoreBackend {
-        inner: Arc<dyn crate::meta::store::StoreBackend>,
+    struct CountingMetaLog {
+        inner: Arc<dyn crate::meta::store::MetaLog>,
         commits: AtomicU64,
     }
 
     #[cfg(feature = "dfs")]
-    impl CountingStoreBackend {
-        fn new(inner: Arc<dyn crate::meta::store::StoreBackend>) -> Self {
+    impl CountingMetaLog {
+        fn new(inner: Arc<dyn crate::meta::store::MetaLog>) -> Self {
             Self {
                 inner,
                 commits: AtomicU64::new(0),
@@ -14229,28 +14756,30 @@ mod tests {
     }
 
     #[cfg(feature = "dfs")]
-    impl crate::meta::store::StoreBackend for CountingStoreBackend {
+    impl crate::meta::store::MetaLog for CountingMetaLog {
         fn health(&self) -> crate::meta::store::MetaFuture<'_, ()> {
             self.inner.health()
         }
-
         fn persistence(&self) -> crate::meta::store::BackendPersistence {
             self.inner.persistence()
         }
-
-        fn load(&self) -> crate::meta::store::MetaFuture<'_, Option<(u64, Vec<u8>)>> {
-            self.inner.load()
+        fn limits(&self) -> crate::meta::store::journal::LogLimits {
+            self.inner.limits()
         }
-
-        fn commit(
+        fn recover(
             &self,
-            expected_version: u64,
-            bytes: Vec<u8>,
-        ) -> crate::meta::store::MetaFuture<'_, u64> {
+        ) -> crate::meta::store::MetaFuture<'_, crate::meta::store::journal::RecoveredLog> {
+            self.inner.recover()
+        }
+        fn append_and_sync(
+            &self,
+            expected: crate::meta::store::journal::LogTip,
+            records: Vec<crate::meta::store::log::Record>,
+        ) -> crate::meta::store::MetaFuture<'_, crate::meta::store::journal::LogTip> {
             Box::pin(async move {
-                let version = self.inner.commit(expected_version, bytes).await?;
+                let tip = self.inner.append_and_sync(expected, records).await?;
                 self.commits.fetch_add(1, Ordering::SeqCst);
-                Ok(version)
+                Ok(tip)
             })
         }
     }
@@ -14290,6 +14819,8 @@ mod tests {
         resolve_lock_calls: AtomicUsize,
         resolve_write_calls: AtomicUsize,
         get_inode_calls: AtomicUsize,
+        xattr_calls: AtomicUsize,
+        next_xattr_error: Mutex<Option<Error>>,
     }
 
     impl RecordingMeta {
@@ -14352,6 +14883,8 @@ mod tests {
                 resolve_lock_calls: AtomicUsize::new(0),
                 resolve_write_calls: AtomicUsize::new(0),
                 get_inode_calls: AtomicUsize::new(0),
+                xattr_calls: AtomicUsize::new(0),
+                next_xattr_error: Mutex::new(None),
             }
         }
 
@@ -14505,6 +15038,7 @@ mod tests {
                 created_at_unix_ms: now,
             };
             let commit = CommitFileVersion {
+                gc_fence: None,
                 operation_id: OperationId::new(format!("external-commit-{generation}")),
                 inode_id: inode.inode_id.clone(),
                 write_lease: self.lease.lock().unwrap().clone(),
@@ -14517,6 +15051,7 @@ mod tests {
                     inline_extents,
                 },
                 chunk_receipts,
+                clone_source: None,
                 metadata_delta: CommitMetadataDelta {
                     mode: CommitMetadataMode::Full,
                     mtime_unix_ms: Some(now),
@@ -14837,6 +15372,10 @@ mod tests {
         }
 
         fn get_xattr(&self, request: GetXattrRequest) -> Result<Vec<u8>> {
+            self.xattr_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(error) = self.next_xattr_error.lock().unwrap().take() {
+                return Err(error);
+            }
             self.inode
                 .lock()
                 .unwrap()
@@ -14905,6 +15444,328 @@ mod tests {
             umask: 0,
             supplementary_gids: Vec::new(),
         }
+    }
+
+    #[derive(Default)]
+    struct Pr88GcControl {
+        captures: AtomicUsize,
+        unfenced_publications: AtomicUsize,
+    }
+    impl crate::node::gc::GcControl for Pr88GcControl {
+        fn retain(
+            &self,
+            _: &str,
+            _: &InodeId,
+            _: Option<&FileVersionId>,
+            publication: bool,
+        ) -> Result<()> {
+            if publication {
+                self.unfenced_publications.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        fn retain_fenced(
+            &self,
+            id: &str,
+            _: &InodeId,
+            _: Option<&FileVersionId>,
+        ) -> Result<crate::dfs::GcFence> {
+            self.captures.fetch_add(1, Ordering::SeqCst);
+            Ok(if id.starts_with("write:") {
+                crate::dfs::GcFence::WriteGeneration
+            } else {
+                crate::dfs::GcFence::Absent
+            })
+        }
+        fn release(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn reserve_publication(&self, _: &OperationId, _: Vec<ChunkObject>) -> Result<()> {
+            Ok(())
+        }
+        fn collect(&self, _: u64, _: Vec<ChunkObject>) -> Result<crate::dfs::GcState> {
+            Ok(crate::dfs::GcState::default())
+        }
+    }
+
+    #[test]
+    fn pr88_fix_crc32c_meta_resize_after_fullsync_keeps_fence() {
+        let (_temp, meta, fs) = test_fs();
+        let control = Arc::new(Pr88GcControl::default());
+        let references = crate::node::gc::GcReferences::new(control.clone());
+        let fs = fs
+            .with_gc_references(Some(references.clone()))
+            .with_optimistic_gc_commit(true)
+            .with_crc32c_writes(true);
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("pr88-resize"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let mut expected = vec![11; 65549];
+        fs.write(&context(), file.handle, 0, &expected).unwrap();
+        fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+        for length in [32775, 70001] {
+            fs.setattr(
+                &context(),
+                file.entry.inode,
+                Some(file.handle),
+                &AttributeChange {
+                    size: Some(length),
+                    ..AttributeChange::default()
+                },
+            )
+            .unwrap();
+            fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+            expected.resize(length as usize, 0);
+            let mut got = vec![0; 80000];
+            assert_eq!(
+                fs.read(&context(), file.handle, 0, &mut got).unwrap(),
+                expected.len()
+            );
+            assert_eq!(&got[..expected.len()], expected.as_slice());
+        }
+        let commits = meta.commits.lock().unwrap();
+        assert_eq!(commits.len(), 3);
+        assert!(
+            commits
+                .iter()
+                .all(|c| c.gc_fence == Some(crate::dfs::GcFence::WriteGeneration))
+        );
+        assert_eq!(commits.last().unwrap().file_version.length, 70001);
+        drop(commits);
+        assert_eq!(control.captures.load(Ordering::SeqCst), 3);
+        assert_eq!(control.unfenced_publications.load(Ordering::SeqCst), 0);
+        fs.release(&context(), file.handle).unwrap();
+        references.flush().unwrap();
+    }
+
+    #[test]
+    fn pr88_fix_crc32c_tail_partial_success_retry_keeps_ids_and_receipts() {
+        struct LostSecondReceipt {
+            inner: Arc<LocalChunkStore>,
+            attempts: Mutex<Vec<ChunkObject>>,
+        }
+        impl ChunkStore for LostSecondReceipt {
+            fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
+                assert_eq!(staged.len(), 1);
+                let call = {
+                    let mut attempts = self.attempts.lock().unwrap();
+                    attempts.push(staged[0].chunk.clone());
+                    attempts.len()
+                };
+                let receipts = self.inner.put_batch(staged)?;
+                if call == 2 {
+                    return Err(unavailable("injected lost second durable receipt"));
+                }
+                Ok(receipts)
+            }
+            fn put_native_batch(
+                &self,
+                staged: Vec<StagedChunk>,
+            ) -> Result<Vec<crate::node::chunk::NativeChunkReceipt>> {
+                self.put_batch(staged).map(|receipts| {
+                    receipts
+                        .into_iter()
+                        .map(|receipt| crate::node::chunk::NativeChunkReceipt {
+                            receipt,
+                            local_required_and_durable: true,
+                        })
+                        .collect()
+                })
+            }
+            fn read_native_uploaded_at(
+                &self,
+                receipt: &ChunkReceipt,
+                offset: u64,
+                out: &mut [u8],
+            ) -> Result<usize> {
+                self.inner
+                    .open_receipt_reader(&receipt.chunk)?
+                    .read_at(offset, out)
+            }
+            fn read_at(
+                &self,
+                id: &crate::dfs::ChunkId,
+                offset: u64,
+                out: &mut [u8],
+            ) -> Result<usize> {
+                self.inner.read_at(id, offset, out)
+            }
+        }
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let store = Arc::new(LostSecondReceipt {
+            inner: local.clone(),
+            attempts: Mutex::new(Vec::new()),
+        });
+        let control = Arc::new(Pr88GcControl::default());
+        let references = crate::node::gc::GcReferences::new(control.clone());
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local.clone(),
+            store.clone(),
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        )
+        .with_gc_references(Some(references.clone()))
+        .with_optimistic_gc_commit(true)
+        .with_crc32c_writes(true);
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("pr88-tail-retry"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let offset = 2 * COMMIT_CHUNK_BYTES;
+        fs.write(&context(), file.handle, 0, &[17; 65549]).unwrap();
+        fs.write(&context(), file.handle, offset, &[29; 65549])
+            .unwrap();
+        assert!(fs.fsync(&context(), file.handle, SyncMode::Full).is_err());
+        assert_eq!(meta.commit_count(), 0);
+        assert_eq!(
+            local.gc_inventory().unwrap().len(),
+            2,
+            "both tails reached real durable storage"
+        );
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        let cell = fs.write_state(&inode_id).unwrap().unwrap();
+        {
+            let state = cell.lock().unwrap();
+            let upload = state.dirty_extents.extents[&0]
+                .native_upload
+                .as_ref()
+                .unwrap();
+            assert!(
+                upload.state.lock().unwrap().body.is_none(),
+                "successful local R1 tail retires its memory body"
+            );
+        }
+        let mut first_tail = vec![0; 65549];
+        assert_eq!(
+            fs.read(&context(), file.handle, 0, &mut first_tail)
+                .unwrap(),
+            first_tail.len()
+        );
+        assert_eq!(
+            first_tail,
+            vec![17; 65549],
+            "failed preparation retains an anchored durable read"
+        );
+        fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+        let attempts = store.attempts.lock().unwrap();
+        assert_eq!(
+            attempts.len(),
+            3,
+            "successful first tail must not be submitted again"
+        );
+        assert_eq!(
+            attempts[2], attempts[1],
+            "lost receipt retry must keep the same CRC object"
+        );
+        assert_ne!(attempts[0].id, attempts[1].id);
+        assert!(attempts.iter().all(ChunkObject::is_segment_crc32c));
+        let original = [attempts[0].id.clone(), attempts[1].id.clone()];
+        drop(attempts);
+        assert_eq!(
+            local.gc_inventory().unwrap().len(),
+            2,
+            "retry must not create duplicate physical objects"
+        );
+        let commits = meta.commits.lock().unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(
+            commits[0].gc_fence,
+            Some(crate::dfs::GcFence::WriteGeneration)
+        );
+        assert_eq!(commits[0].chunk_receipts.len(), 2);
+        assert!(
+            commits[0]
+                .chunk_receipts
+                .iter()
+                .all(|r| original.contains(&r.chunk.id))
+        );
+        drop(commits);
+        let mut expected = vec![0; offset as usize + 65549];
+        expected[..65549].fill(17);
+        expected[offset as usize..].fill(29);
+        let mut got = vec![0; expected.len()];
+        for (index, out) in got.chunks_mut(1024 * 1024).enumerate() {
+            assert_eq!(
+                fs.read(&context(), file.handle, (index * 1024 * 1024) as u64, out)
+                    .unwrap(),
+                out.len()
+            );
+        }
+        assert_eq!(got, expected);
+        assert_eq!(
+            control.captures.load(Ordering::SeqCst),
+            1,
+            "retry must not refresh the frozen GC fence"
+        );
+        fs.release(&context(), file.handle).unwrap();
+        references.flush().unwrap();
+    }
+
+    #[test]
+    fn crc32c_vfs_partial_overwrite_and_truncate() {
+        let (_temp, meta, fs) = test_fs();
+        let fs = fs.with_crc32c_writes(true);
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("crc-range.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let mut expected = vec![11; 65549];
+        fs.write(&context(), file.handle, 0, &expected).unwrap();
+        fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+        fs.write(&context(), file.handle, 32760, &[29; 30]).unwrap();
+        expected[32760..32790].fill(29);
+        fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+        let mut got = vec![0; expected.len()];
+        assert_eq!(
+            fs.read(&context(), file.handle, 0, &mut got).unwrap(),
+            expected.len()
+        );
+        assert_eq!(got, expected);
+        fs.setattr(
+            &context(),
+            file.entry.inode,
+            Some(file.handle),
+            &AttributeChange {
+                size: Some(32775),
+                ..AttributeChange::default()
+            },
+        )
+        .unwrap();
+        fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+        expected.truncate(32775);
+        let mut got = vec![0; 65549];
+        assert_eq!(
+            fs.read(&context(), file.handle, 0, &mut got).unwrap(),
+            expected.len()
+        );
+        assert_eq!(&got[..expected.len()], &expected);
+        assert!(
+            meta.commits
+                .lock()
+                .unwrap()
+                .iter()
+                .flat_map(|c| &c.chunk_receipts)
+                .all(|r| r.chunk.is_segment_crc32c())
+        );
+        fs.release(&context(), file.handle).unwrap();
     }
 
     fn test_fs() -> (tempfile::TempDir, Arc<RecordingMeta>, DistributedFs) {
@@ -15346,6 +16207,7 @@ mod tests {
         inner: Arc<dyn ChunkStore>,
         put_batches: AtomicUsize,
         capacity_calls: AtomicUsize,
+        fail_empty_prepare: AtomicBool,
     }
 
     #[cfg(feature = "dfs")]
@@ -15355,6 +16217,7 @@ mod tests {
                 inner,
                 put_batches: AtomicUsize::new(0),
                 capacity_calls: AtomicUsize::new(0),
+                fail_empty_prepare: AtomicBool::new(false),
             }
         }
 
@@ -15371,6 +16234,11 @@ mod tests {
     impl ChunkStore for CountingChunkStore {
         fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<crate::dfs::ChunkReceipt>> {
             self.put_batches.fetch_add(1, Ordering::SeqCst);
+            if staged.is_empty() && self.fail_empty_prepare.swap(false, Ordering::SeqCst) {
+                return Err(unavailable(
+                    "injected PR93 preparation failure after admission",
+                ));
+            }
             self.inner.put_batch(staged)
         }
 
@@ -16706,6 +17574,122 @@ mod tests {
     }
 
     #[test]
+    fn native_stalled_upload_keeps_ordinary_write_off_the_fuse_receiver() {
+        let (_temp, _meta, fs, _runtime, store) = native_pipeline_fixture(true, 4 * 1024 * 1024, 8);
+        let fs = Arc::new(fs);
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("stalled-write-admission"),
+                0o600,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let body = vec![0x5b; 64 * 1024];
+        fs.write(&context(), created.handle, 0, &body).unwrap();
+        let pause = Arc::new(CommitPause::new(0));
+        *store.pause.lock().unwrap() = Some(pause.clone());
+        let writer_fs = fs.clone();
+        let writer =
+            std::thread::spawn(move || writer_fs.fsync(&context(), created.handle, SyncMode::Full));
+        pause.wait_until_reached();
+        // Another ordinary write can wait for this inode's mutation/publication.
+        // Its admission contract must keep that wait off the receive thread.
+        let admission = fs.write_admission_mode(created.handle);
+        pause.release();
+        writer.join().unwrap().unwrap();
+        let mut actual = vec![0; body.len()];
+        assert_eq!(
+            fs.read(&context(), created.handle, 0, &mut actual).unwrap(),
+            body.len()
+        );
+        fs.release(&context(), created.handle).unwrap();
+        assert_eq!(
+            actual, body,
+            "queued admission must retain the durability barrier"
+        );
+        assert_eq!(
+            admission,
+            WriteAdmissionMode::Queued,
+            "ordinary native writes can wait for publication and must not hold the FUSE receiver"
+        );
+    }
+
+    #[test]
+    fn native_generation_retains_gc_reference_through_upload_and_publication() {
+        #[derive(Default)]
+        struct Control {
+            active: Mutex<HashSet<String>>,
+        }
+        impl crate::node::gc::GcControl for Control {
+            fn retain(
+                &self,
+                id: &str,
+                _: &InodeId,
+                _: Option<&FileVersionId>,
+                _: bool,
+            ) -> Result<()> {
+                self.active.lock().unwrap().insert(id.into());
+                Ok(())
+            }
+            fn release(&self, id: &str) -> Result<()> {
+                self.active.lock().unwrap().remove(id);
+                Ok(())
+            }
+            fn reserve_publication(&self, _: &OperationId, _: Vec<ChunkObject>) -> Result<()> {
+                Ok(())
+            }
+            fn collect(&self, _: u64, _: Vec<ChunkObject>) -> Result<crate::dfs::GcState> {
+                Ok(crate::dfs::GcState::default())
+            }
+        }
+        let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+        let control = Arc::new(Control::default());
+        let references = crate::node::gc::GcReferences::new(control.clone());
+        let fs = fs.with_gc_references(Some(references.clone()));
+        let file = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("native-gc"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let body = vec![7; 4 * 1024 * 1024];
+        fs.write(&context(), file.handle, 0, &body).unwrap();
+        native_wait_uploads(&fs, 1);
+        references.flush().unwrap();
+        assert_eq!(meta.commits.lock().unwrap().len(), 0);
+        assert_eq!(
+            control
+                .active
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|id| id.starts_with("publish:"))
+                .count(),
+            1,
+            "uploaded but unpublished generation must remain protected"
+        );
+        fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+        references.flush().unwrap();
+        assert_eq!(meta.commits.lock().unwrap().len(), 1);
+        assert_eq!(
+            control
+                .active
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|id| id.starts_with("publish:"))
+                .count(),
+            0,
+            "published generation must release its reference"
+        );
+    }
+
+    #[test]
     fn p2_w2_required_upload_retires_body_and_dirty_read_uses_anchored_local_object() {
         let (_temp, meta, fs, _runtime, store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
         let file = fs
@@ -18004,6 +18988,13 @@ mod tests {
     #[cfg(feature = "dfs")]
     #[test]
     fn native_builder_preupload_retry_preserves_object_but_layout_excludes_old_tail_and_patch() {
+        native_preupload_retry_with_integrity(false);
+    }
+    #[test]
+    fn crc32c_native_preupload_retry_preserves_immutable_id() {
+        native_preupload_retry_with_integrity(true);
+    }
+    fn native_preupload_retry_with_integrity(crc: bool) {
         struct FailOnceStore {
             inner: Arc<LocalChunkStore>,
             fail: AtomicBool,
@@ -18044,7 +19035,8 @@ mod tests {
             store.clone(),
             DEFAULT_DIRTY_DATA_BUDGET_BYTES,
         )
-        .with_write_buffer_pool(pool.clone());
+        .with_write_buffer_pool(pool.clone())
+        .with_crc32c_writes(crc);
         let created = fs
             .create(
                 &context(),
@@ -18091,14 +19083,34 @@ mod tests {
         );
         assert_eq!(attempts[2].len(), 1);
         assert_eq!(attempts[2][0].length, 4096);
-        assert_eq!(
-            attempts[1][0].content_digest.bytes,
-            *blake3::hash(&original).as_bytes()
-        );
-        assert_eq!(
-            attempts[2][0].content_digest.bytes,
-            *blake3::hash(&[7; 4096]).as_bytes()
-        );
+        if crc {
+            assert!(
+                attempts
+                    .iter()
+                    .flatten()
+                    .all(ChunkObject::is_segment_crc32c)
+            );
+            for (chunk, body) in [
+                (&attempts[1][0], original.as_slice()),
+                (&attempts[2][0], [7; 4096].as_slice()),
+            ] {
+                assert_eq!(
+                    chunk.content_digest,
+                    crate::node::chunk_crc32c::CrcTable::build(body)
+                        .unwrap()
+                        .descriptor_digest()
+                );
+            }
+        } else {
+            assert_eq!(
+                attempts[1][0].content_digest.bytes,
+                *blake3::hash(&original).as_bytes()
+            );
+            assert_eq!(
+                attempts[2][0].content_digest.bytes,
+                *blake3::hash(&[7; 4096]).as_bytes()
+            );
+        }
         let original_id = attempts[0][0].id.clone();
         drop(attempts);
         let commits = meta.commits.lock().unwrap();
@@ -18660,11 +19672,11 @@ mod tests {
         tokio::task::JoinHandle<()>,
         Arc<dyn crate::meta::store::MetaStore>,
         Arc<LocalChunkStore>,
-        Arc<CountingStoreBackend>,
+        Arc<CountingMetaLog>,
     ) {
         use crate::meta::{
             Meta,
-            store::{MetaRead, NodeSessionLease, RequestKey, Store, memory::MemoryBackend},
+            store::{MetaRead, NodeSessionLease, RequestKey, Store, journal::MemoryLog},
         };
         use tokio::net::TcpListener;
         use tokio_stream::wrappers::TcpListenerStream;
@@ -18673,11 +19685,11 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let local_a =
             Arc::new(LocalChunkStore::open(temp.path().join("node-a"), "node-a").unwrap());
-        let backend = Arc::new(CountingStoreBackend::new(
-            Arc::new(MemoryBackend::default()),
-        ));
+        let backend = Arc::new(CountingMetaLog::new(Arc::new(
+            MemoryLog::new(Default::default()).unwrap(),
+        )));
         let store: Arc<dyn crate::meta::store::MetaStore> =
-            Arc::new(Store::open(backend.clone()).await.unwrap());
+            Arc::new(Store::open_log(backend.clone()).await.unwrap());
         store
             .register_node_session(
                 RequestKey::new("node-a", "register-node-a"),
@@ -18728,6 +19740,208 @@ mod tests {
                 .unwrap();
         });
         (temp, meta_endpoint, gate, server, store, local_a, backend)
+    }
+
+    #[cfg(feature = "dfs")]
+    async fn pr93_resize_prepare_retry(new_length: usize) {
+        use crate::meta::store::{MetaEntity, MetaRead};
+        let (_temp, endpoint, gate, server, store, local, _backend) =
+            real_grpc_meta_fixture().await;
+        // This case injects a preparation failure, not a lost commit reply.
+        gate.gate.hits.store(2, Ordering::SeqCst);
+        let (meta, chunks, raw) = grpc_dfs_test_fs(
+            "node-a",
+            "session-a",
+            &endpoint,
+            local,
+            Duration::from_secs(2),
+        )
+        .await;
+        let references = crate::node::gc::GcReferences::new(meta.inner.clone());
+        let fs = Arc::new(
+            raw.with_gc_references(Some(references.clone()))
+                .with_optimistic_gc_commit(true)
+                .with_crc32c_writes(true),
+        );
+        let file = {
+            let fs = fs.clone();
+            run_blocking(move || {
+                let file = fs
+                    .create(
+                        &context(),
+                        fs.root_inode(),
+                        OsStr::new("pr93-resize"),
+                        0o640,
+                        libc::O_RDWR,
+                    )
+                    .unwrap();
+                fs.write(&context(), file.handle, 0, &vec![11; 65549])
+                    .unwrap();
+                fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
+                file
+            })
+            .await
+        };
+        let handle = file.handle;
+        let inode = file.entry.inode;
+        let inode_id = fs.inode_id(inode).unwrap();
+        let before = meta.commits();
+        assert_eq!(before.len(), 1);
+        assert!(
+            before[0]
+                .chunk_receipts
+                .iter()
+                .all(|receipt| receipt.chunk.is_segment_crc32c())
+        );
+        {
+            let fs = fs.clone();
+            let chunks = chunks.clone();
+            run_blocking(move || {
+                fs.setattr(
+                    &context(),
+                    inode,
+                    Some(handle),
+                    &AttributeChange {
+                        size: Some(new_length as u64),
+                        ..AttributeChange::default()
+                    },
+                )
+                .unwrap();
+                chunks.fail_empty_prepare.store(true, Ordering::SeqCst);
+                let error = fs.fsync(&context(), handle, SyncMode::Full).unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("injected PR93 preparation failure")
+                );
+                assert!(!chunks.fail_empty_prepare.load(Ordering::SeqCst));
+            })
+            .await;
+        }
+        assert_eq!(
+            meta.commits().len(),
+            1,
+            "failed preparation must not publish"
+        );
+        let (_, entities) = store.read_view().await.unwrap().snapshot().unwrap();
+        let active: Vec<_> = entities
+            .into_iter()
+            .filter_map(|entity| match entity {
+                MetaEntity::DfsReference(reference)
+                    if reference.inode_id.as_ref() == Some(&inode_id)
+                        && reference.publication
+                        && reference.retired_at_unix_ms.is_none()
+                        && reference.reference_id.starts_with("write:") =>
+                {
+                    Some(reference)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            active.len(),
+            1,
+            "real Meta must have admitted one pending generation"
+        );
+        let admitted = active[0].clone();
+        assert!(
+            admitted.chunks.is_empty(),
+            "per-chunk registration stays absent"
+        );
+        assert_eq!(
+            store
+                .read(MetaRead::DfsInode(inode_id.clone()))
+                .await
+                .unwrap()
+                .entity
+                .and_then(|entity| match entity {
+                    MetaEntity::DfsInode(inode) => inode.head_version,
+                    _ => None,
+                }),
+            Some(before[0].file_version.id.clone())
+        );
+        {
+            let fs = fs.clone();
+            run_blocking(move || fs.fsync(&context(), handle, SyncMode::Full))
+                .await
+                .unwrap();
+        }
+        let commits = meta.commits();
+        assert_eq!(commits.len(), 2);
+        let committed = &commits[1];
+        assert_eq!(
+            admitted.reference_id,
+            format!(
+                "write:{}",
+                ChunkObject::generation_id(&committed.operation_id)
+            ),
+            "retry must use the identity admitted before the preparation failure"
+        );
+        assert_eq!(
+            committed.gc_fence,
+            Some(crate::dfs::GcFence::WriteGeneration)
+        );
+        let (_, entities) = store.read_view().await.unwrap().snapshot().unwrap();
+        let references_after: Vec<_> = entities
+            .into_iter()
+            .filter_map(|entity| match entity {
+                MetaEntity::DfsReference(reference)
+                    if reference.inode_id.as_ref() == Some(&inode_id)
+                        && reference.reference_id.starts_with("write:") =>
+                {
+                    Some(reference)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            references_after.len(),
+            2,
+            "retry must not obtain a replacement generation"
+        );
+        assert!(
+            references_after
+                .iter()
+                .any(|reference| reference.reference_id == admitted.reference_id
+                    && reference.retired_at_unix_ms.is_some())
+        );
+        let version = store
+            .read(MetaRead::DfsFileVersion(committed.file_version.id.clone()))
+            .await
+            .unwrap();
+        assert!(
+            matches!(version.entity, Some(MetaEntity::DfsFileVersion(version)) if version.length == new_length as u64)
+        );
+        {
+            let fs = fs.clone();
+            run_blocking(move || {
+                let mut got = vec![0; 80000];
+                assert_eq!(
+                    fs.read(&context(), handle, 0, &mut got).unwrap(),
+                    new_length
+                );
+                let mut expected = vec![11; 65549];
+                expected.resize(new_length, 0);
+                assert_eq!(&got[..new_length], expected.as_slice());
+                fs.release(&context(), handle).unwrap();
+                references.flush().unwrap();
+            })
+            .await;
+        }
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pr93_fix_truncate_prepare_retry_uses_real_meta_generation() {
+        pr93_resize_prepare_retry(32775).await;
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pr93_fix_extend_prepare_retry_uses_real_meta_generation() {
+        pr93_resize_prepare_retry(70001).await;
     }
 
     #[cfg(feature = "dfs")]
@@ -19222,7 +20436,7 @@ mod tests {
         let trace_fixture =
             std::env::var_os("AFS_DFS_PENDING_TRACE_FIXTURE_DIR").map(std::path::PathBuf::from);
         if let Some(directory) = &trace_fixture {
-            use crate::meta::store::StoreBackend;
+            use crate::meta::store::MetaLog;
             std::fs::create_dir(directory).unwrap();
             std::fs::copy(&trace_output, directory.join("trace-unknown.jsonl")).unwrap();
             std::fs::write(
@@ -19235,8 +20449,13 @@ mod tests {
                 serde_json::to_vec(&outcome).unwrap(),
             )
             .unwrap();
-            let (revision, bytes) = _backend.load().await.unwrap().unwrap();
-            std::fs::write(directory.join("meta-store-state.raw.json"), bytes).unwrap();
+            let recovered = _backend.recover().await.unwrap();
+            let revision = recovered.tip.sequence;
+            std::fs::write(
+                directory.join("meta-log-records.json"),
+                serde_json::to_vec(&recovered.records).unwrap(),
+            )
+            .unwrap();
             std::fs::write(directory.join("scope.json"), serde_json::to_vec(&serde_json::json!({"status":"HARNESS_ONLY",
                 "test_fixture":true,"backend":"memory","backend_revision":revision,"installed_fault":"NOT_RUN",
                 "reason":"actual Rust emit and Meta outcome; header lacks installed process identity"})).unwrap()).unwrap();
@@ -25006,6 +26225,7 @@ mod tests {
                             .insert(
                                 id,
                                 DfsFileHandle {
+                                    gc_pin: None,
                                     inode_id: inode.inode_id.clone(),
                                     opened_inode: inode.clone(),
                                     opened_page_identity: None,
@@ -27585,6 +28805,51 @@ mod tests {
     }
 
     #[test]
+    fn background_commit_timeout_defers_exact_replay_without_poisoning_fsync() {
+        let (_temp, meta, fs) = test_fs();
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("budget-replay.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.write(&context(), created.handle, 0, b"pending").unwrap();
+        meta.fail_next_commit_with(Error::coded(
+            afs_error::CLIENT_DEADLINE_EXCEEDED,
+            "background RPC budget expired after send",
+        ));
+        assert_eq!(
+            fs.writeback_pending_with_budget(Duration::from_secs(1), 64)
+                .unwrap(),
+            0
+        );
+        let pending = meta.failed_commits.lock().unwrap()[0].clone();
+        let cell = fs.write_state(&pending.inode_id).unwrap().unwrap();
+        {
+            let state = cell.lock().unwrap();
+            assert!(
+                state.in_flight.is_some(),
+                "unknown acknowledgement retains the exact request"
+            );
+            assert!(
+                state.background_error.is_none(),
+                "maintenance budget expiry must not become a later FUSE error"
+            );
+        }
+        assert_eq!(
+            fs.writeback_pending_with_budget(Duration::from_secs(1), 64)
+                .unwrap(),
+            1
+        );
+        assert_eq!(meta.commits.lock().unwrap().as_slice(), &[pending]);
+        fs.fsync(&context(), created.handle, SyncMode::Full)
+            .unwrap();
+    }
+
+    #[test]
     fn background_writeback_expired_before_send_retains_exact_pending_for_replay() {
         let (temp, meta, mut fs) = test_fs();
         let created = fs
@@ -27711,6 +28976,138 @@ mod tests {
         assert!(state.background_error.is_none());
         assert!(state.dirty);
         assert!(state.in_flight.is_none());
+    }
+
+    #[test]
+    fn closed_metadata_only_writer_stops_pinning_old_versions() {
+        let (_temp, meta, fs) = test_fs();
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("closed-metadata.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.write(&context(), created.handle, 0, b"data").unwrap();
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        let cell = fs.write_state(&inode_id).unwrap().unwrap();
+        {
+            let state = cell.lock().unwrap();
+            assert!(!state.dirty);
+            assert!(state.metadata_dirty);
+            assert_eq!(state.visible_write_seq, state.committed_write_seq);
+        }
+        fs.release(&context(), created.handle).unwrap();
+        assert_eq!(fs.writeback_pending().unwrap(), 1);
+        {
+            let mut state = cell.lock().unwrap();
+            assert!(!state.metadata_dirty);
+            assert!(!state.last_writer_background_requested);
+            assert!(state.in_flight.is_none());
+            state.write_lease.expires_at_unix_ms = now_unix_ms() + 10_000;
+        }
+        assert_eq!(fs.renew_active_write_leases().unwrap(), 0);
+        assert_eq!(meta.metadata_syncs.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn active_writer_lease_renewal_runs_without_mutating_pending_commit() {
+        let (_temp, meta, fs) = test_fs();
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("idle-writer.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        fs.write(&context(), created.handle, 0, b"pending").unwrap();
+        meta.fail_next_commit_with(Error::coded(
+            afs_error::CLIENT_DEADLINE_EXCEEDED,
+            "unknown commit",
+        ));
+        fs.fsync(&context(), created.handle, SyncMode::Full)
+            .unwrap_err();
+        let pending = meta.failed_commits.lock().unwrap()[0].clone();
+        let cell = fs.write_state(&pending.inode_id).unwrap().unwrap();
+        cell.lock().unwrap().write_lease.expires_at_unix_ms = now_unix_ms() + 10_000;
+        let renewed_expiry = now_unix_ms() + 30_000;
+        meta.queue_renew_result(Ok(meta.lease_with_expiry(renewed_expiry)));
+        assert_eq!(fs.renew_active_write_leases().unwrap(), 1);
+        assert_eq!(
+            cell.lock().unwrap().write_lease.expires_at_unix_ms,
+            renewed_expiry
+        );
+        fs.fsync(&context(), created.handle, SyncMode::Full)
+            .unwrap();
+        assert_eq!(meta.commits.lock().unwrap()[0], pending);
+    }
+
+    #[test]
+    fn active_writer_lease_renewal_skips_closed_clean_states_and_rejects_fencing() {
+        let (_temp, meta, fs) = test_fs();
+        let mut lease = meta.lease.lock().unwrap().clone();
+        lease.expires_at_unix_ms = now_unix_ms() + 10_000;
+        let cell = synthetic_write_state(
+            lease.inode_id.clone(),
+            lease.clone(),
+            false,
+            false,
+            false,
+            false,
+        );
+        fs.inode_writes
+            .insert(lease.inode_id.clone(), cell.clone())
+            .unwrap();
+        assert_eq!(fs.renew_active_write_leases().unwrap(), 0);
+        assert_eq!(meta.renew_call_count(), 0);
+        cell.lock().unwrap().open_writers = 1;
+        let mut fenced = lease.clone();
+        fenced.lease_epoch += 1;
+        meta.queue_renew_result(Ok(fenced));
+        assert!(fs.renew_active_write_leases().is_err());
+        assert_eq!(cell.lock().unwrap().write_lease, lease);
+        meta.queue_renew_result(Err(unavailable("transient Meta outage")));
+        assert!(fs.renew_active_write_leases().is_err());
+        assert!(cell.lock().unwrap().terminal_error.is_none());
+    }
+
+    #[test]
+    fn active_writer_lease_renewal_late_reply_cannot_replace_newer_authority() {
+        let (_temp, meta, fs) = test_fs();
+        let fs = Arc::new(fs);
+        let mut lease = meta.lease.lock().unwrap().clone();
+        lease.expires_at_unix_ms = now_unix_ms() + 10_000;
+        let cell = synthetic_write_state(
+            lease.inode_id.clone(),
+            lease.clone(),
+            true,
+            false,
+            false,
+            false,
+        );
+        fs.inode_writes
+            .insert(lease.inode_id.clone(), cell.clone())
+            .unwrap();
+        let pause = meta.pause_next_renew();
+        meta.queue_renew_result(Ok(meta.lease_with_expiry(now_unix_ms() + 30_000)));
+        let worker_fs = fs.clone();
+        let worker = std::thread::spawn(move || worker_fs.renew_active_write_leases());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pause.was_reached() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(pause.was_reached());
+        lease.lease_epoch += 1;
+        cell.lock().unwrap().write_lease = lease.clone();
+        pause.release();
+        assert_eq!(worker.join().unwrap().unwrap(), 0);
+        assert_eq!(cell.lock().unwrap().write_lease, lease);
     }
 
     #[test]

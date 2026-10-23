@@ -2,7 +2,7 @@
 """Linux syscall contract for local-only checkpoint publication.
 
 Build the adxlet local_checkpoint test executable before running this check.
-strace observes the real store, including retain and reusable-snapshot copy.
+strace observes the real store, including retain and reopening sealed files.
 """
 
 import argparse

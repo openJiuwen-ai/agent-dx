@@ -5,7 +5,7 @@ component=${1:?component}
 # test executable. Cargo build concurrency and the complete test set stay intact.
 case "$component" in
   platform)
-    packages=(adx-deployment adx-coordinator adxlet adx-core adx-scheduling adx-protocol adx-discovery
+    packages=(adx-deployment adx-coordinator adxlet adx-core adx-checkpoint-storage adx-scheduling adx-protocol adx-discovery
               adx-error adx-observability adx-process adx-transport)
     export RUST_TEST_THREADS=1
     ;;

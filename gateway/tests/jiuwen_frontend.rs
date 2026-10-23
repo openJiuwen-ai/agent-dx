@@ -1,5 +1,5 @@
 #![cfg(feature = "agent-api")]
-use data_plane_gateway::ingress::jiuwen::{
+use data_plane_gateway::ingress::digitalmategateway::{
     connection::ConnectionError,
     driver::{self, DriverError},
     frontend::{self, FrontendConfig},
@@ -238,7 +238,9 @@ async fn pending_backend_cannot_accumulate_unbounded_frontend_requests() {
 
 #[tokio::test]
 async fn frontend_and_e2a_driver_preserve_user_and_runtime_request_correlation() {
-    use data_plane_gateway::ingress::jiuwen::{driver::DriverConfig, session::SessionLimits};
+    use data_plane_gateway::ingress::digitalmategateway::{
+        driver::DriverConfig, session::SessionLimits,
+    };
     let (mut client, frontend_socket) = pair().await;
     let (backend_socket, mut agent) = pair().await;
     let task = tokio::spawn(frontend::run(

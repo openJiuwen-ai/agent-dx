@@ -1,3 +1,7 @@
+use afs::meta::store::{
+    journal::{LogLimits, LogTip, RecoveredLog},
+    log::Record,
+};
 use std::{
     sync::{
         Arc,
@@ -12,8 +16,8 @@ use afs::{
         owner_roots::{ActivateRootInput, ReserveRootInput, WireRootReservation},
         rest,
         store::{
-            MetaFuture, NodeSessionLease, RequestKey, RootRight as StoreRootRight, Store,
-            StoreBackend, memory::MemoryBackend,
+            MetaFuture, MetaLog, NodeSessionLease, RequestKey, RootRight as StoreRootRight, Store,
+            journal::MemoryLog,
         },
     },
     runtime::Observability,
@@ -25,9 +29,8 @@ use axum::{
 use serde_json::Value;
 use tower::ServiceExt;
 
-#[derive(Default)]
 struct SwitchableBackend {
-    inner: MemoryBackend,
+    inner: MemoryLog,
     reject_load: AtomicBool,
 }
 
@@ -37,8 +40,20 @@ impl SwitchableBackend {
     }
 }
 
-impl StoreBackend for SwitchableBackend {
-    fn load(&self) -> MetaFuture<'_, Option<(u64, Vec<u8>)>> {
+impl MetaLog for SwitchableBackend {
+    fn persistence(&self) -> afs::meta::store::BackendPersistence {
+        self.inner.persistence()
+    }
+    fn limits(&self) -> LogLimits {
+        self.inner.limits()
+    }
+    fn recover(&self) -> MetaFuture<'_, RecoveredLog> {
+        self.inner.recover()
+    }
+    fn append_and_sync(&self, expected: LogTip, records: Vec<Record>) -> MetaFuture<'_, LogTip> {
+        self.inner.append_and_sync(expected, records)
+    }
+    fn health(&self) -> MetaFuture<'_, ()> {
         Box::pin(async move {
             if self.reject_load.load(Ordering::Acquire) {
                 Err(afs_error::Error::coded(
@@ -46,42 +61,43 @@ impl StoreBackend for SwitchableBackend {
                     "injected backend read failure",
                 ))
             } else {
-                self.inner.load().await
+                self.inner.health().await
             }
         })
     }
-
-    fn commit(&self, expected_version: u64, bytes: Vec<u8>) -> MetaFuture<'_, u64> {
-        self.inner.commit(expected_version, bytes)
-    }
 }
 
-#[derive(Default)]
 struct HangingBackend {
-    inner: MemoryBackend,
+    inner: MemoryLog,
     loads: AtomicUsize,
     notified: tokio::sync::Notify,
 }
 
-impl StoreBackend for HangingBackend {
-    fn load(&self) -> MetaFuture<'_, Option<(u64, Vec<u8>)>> {
-        Box::pin(async move {
-            if self.loads.fetch_add(1, Ordering::AcqRel) == 0 {
-                return self.inner.load().await;
-            }
-            self.notified.notified().await;
-            self.inner.load().await
-        })
+impl MetaLog for HangingBackend {
+    fn limits(&self) -> LogLimits {
+        self.inner.limits()
     }
-
-    fn commit(&self, expected_version: u64, bytes: Vec<u8>) -> MetaFuture<'_, u64> {
-        self.inner.commit(expected_version, bytes)
+    fn recover(&self) -> MetaFuture<'_, RecoveredLog> {
+        self.inner.recover()
+    }
+    fn append_and_sync(&self, expected: LogTip, records: Vec<Record>) -> MetaFuture<'_, LogTip> {
+        self.inner.append_and_sync(expected, records)
+    }
+    fn persistence(&self) -> afs::meta::store::BackendPersistence {
+        self.inner.persistence()
+    }
+    fn health(&self) -> MetaFuture<'_, ()> {
+        Box::pin(async move {
+            self.loads.fetch_add(1, Ordering::AcqRel);
+            self.notified.notified().await;
+            self.inner.health().await
+        })
     }
 }
 
 async fn meta_with_memory_store() -> (Arc<Meta>, Arc<Store>) {
     let store = Arc::new(
-        Store::open(Arc::new(MemoryBackend::default()))
+        Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
             .await
             .unwrap(),
     );
@@ -213,7 +229,7 @@ async fn root_location_keeps_owner_but_reports_unavailable_for_expired_home_sess
 #[tokio::test]
 async fn health_uses_backend_probe_not_cached_read_view() {
     let backend = Arc::new(SwitchableBackend::default());
-    let store = Arc::new(Store::open(backend.clone()).await.unwrap());
+    let store = Arc::new(Store::open_log(backend.clone()).await.unwrap());
     let meta = Arc::new(Meta::with_store(
         "meta-rest-test".into(),
         Observability::new().unwrap(),
@@ -241,7 +257,7 @@ async fn health_uses_backend_probe_not_cached_read_view() {
 #[tokio::test]
 async fn health_backend_probe_is_bounded_when_backend_stalls() {
     let store = Arc::new(
-        Store::open(Arc::new(HangingBackend::default()))
+        Store::open_log(Arc::new(HangingBackend::default()))
             .await
             .unwrap(),
     );
@@ -510,4 +526,23 @@ async fn external_replication_summary_reports_catalog_eligibility_without_backen
     assert_eq!(body["copies"][0]["available"], false);
     assert_eq!(body["backend_reachability"], "not_probed");
     assert_eq!(body["loss_confirmed"], false);
+}
+
+impl Default for SwitchableBackend {
+    fn default() -> Self {
+        Self {
+            inner: MemoryLog::new(Default::default()).unwrap(),
+            reject_load: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Default for HangingBackend {
+    fn default() -> Self {
+        Self {
+            inner: MemoryLog::new(Default::default()).unwrap(),
+            loads: AtomicUsize::new(0),
+            notified: tokio::sync::Notify::new(),
+        }
+    }
 }

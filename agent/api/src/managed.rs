@@ -7,6 +7,13 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell};
 type TemplateKey = (String, String, String);
 
+#[derive(Default)]
+struct ActivationInput<'a> {
+    generation: Option<&'a str>,
+    bypass_cache: bool,
+    parameters: Option<&'a [u8]>,
+}
+
 pub struct ManagedService {
     control: Arc<dyn Control>,
     templates: Mutex<BoundedCache<TemplateKey, Arc<OnceCell<TemplateVersion>>>>,
@@ -104,28 +111,6 @@ impl ManagedService {
         .await
     }
 
-    pub async fn prepare_binding(
-        &self,
-        ctx: &RequestContext,
-        scope: &Scope,
-        launch: &adx_agent_core::launch::LaunchConfig,
-        parameters: &adx_agent_core::mounts::Parameters,
-    ) -> Result<AgentBinding> {
-        scope.validate().map_err(Error::Invalid)?;
-        let binding = self
-            .control
-            .prepare_binding(ctx, scope, launch, parameters)
-            .await?;
-        if binding.scope != *scope
-            || binding.phase != BindingPhase::Active
-            || binding.parameters != *parameters
-        {
-            return Err(Error::Unavailable(
-                "prepared binding identity mismatch".into(),
-            ));
-        }
-        Ok(binding)
-    }
     pub async fn binding(&self, ctx: &RequestContext, scope: &Scope) -> Result<AgentBinding> {
         self.control.binding(ctx, scope).await
     }
@@ -161,8 +146,17 @@ impl ManagedService {
         port: Option<u16>,
         bypass_cache: bool,
     ) -> Result<(Target, u16)> {
-        self.resolve_generation(ctx, scope, protocol, port, None, bypass_cache)
-            .await
+        self.resolve_generation(
+            ctx,
+            scope,
+            protocol,
+            port,
+            ActivationInput {
+                bypass_cache,
+                ..Default::default()
+            },
+        )
+        .await
     }
     /// A retry of the same incoming request must not start a new lifecycle after deletion.
     pub async fn retry_resolve(
@@ -173,8 +167,40 @@ impl ManagedService {
         port: u16,
         generation: &str,
     ) -> Result<(Target, u16)> {
-        self.resolve_generation(ctx, scope, protocol, Some(port), Some(generation), true)
-            .await
+        self.resolve_generation(
+            ctx,
+            scope,
+            protocol,
+            Some(port),
+            ActivationInput {
+                generation: Some(generation),
+                bypass_cache: true,
+                parameters: None,
+            },
+        )
+        .await
+    }
+    pub async fn resolve_with_parameters(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+        protocol: Protocol,
+        port: Option<u16>,
+        parameters: Option<&[u8]>,
+        bypass_cache: bool,
+    ) -> Result<(Target, u16)> {
+        self.resolve_generation(
+            ctx,
+            scope,
+            protocol,
+            port,
+            ActivationInput {
+                parameters,
+                bypass_cache,
+                ..Default::default()
+            },
+        )
+        .await
     }
     async fn resolve_generation(
         &self,
@@ -182,8 +208,7 @@ impl ManagedService {
         scope: &Scope,
         protocol: Protocol,
         port: Option<u16>,
-        generation: Option<&str>,
-        bypass_cache: bool,
+        input: ActivationInput<'_>,
     ) -> Result<(Target, u16)> {
         scope.validate().map_err(Error::Invalid)?;
         let template = self
@@ -192,7 +217,13 @@ impl ManagedService {
         let port = Self::select_service(&template, protocol, port)?;
         let target = self
             .control
-            .activate_with_cache(ctx, scope, generation, bypass_cache)
+            .activate_with_parameters(
+                ctx,
+                scope,
+                input.generation,
+                input.bypass_cache,
+                input.parameters,
+            )
             .await?;
         if target.binding.scope != *scope
             || target.binding.phase != BindingPhase::Active

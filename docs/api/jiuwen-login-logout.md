@@ -6,7 +6,7 @@
 
 1. 客户端通过华为 Account Kit 获取一次性授权码，或从当前 AGC Auth 用户获取 access token。授权包含 `openid profile` 时，后端可从已验签 Account Kit ID Token 的 `display_name` 读取华为昵称；仅授权 `openid` 的用户仍可登录。
 2. 客户端把凭据提交给对应入口：`POST /api/v1/auth/huawei/login` 兑换 Account Kit 授权码；`POST /api/v1/auth/agc/login` 验证 AGC 用户 token。两者都建立 ADX 业务会话并返回相同格式的 Bearer token。
-3. 客户端在 `/ws`、文件上传下载和额度查询等业务请求中发送 `Authorization: Bearer <business-token>`。Ingress 根据会话确定用户身份。
+3. 客户端在 `/ws`、可选的透明入口 `/orbit/ws`、文件上传下载和额度查询等业务请求中发送 `Authorization: Bearer <business-token>`。Ingress 根据会话确定用户身份。通用 `/agent` 接口仍使用租户 API Key，业务会话不能授权它。
 4. 用户退出时调用 `POST /api/v1/auth/logout`，撤销当前 token，并清除客户端保存的 token。
 
 ADX 只接收客户端已经获取的 Account Kit 授权码或 AGC 用户 access token；不提供原 jiuwenswarm 的 `/api/v1/auth/authorize`、`/api/v1/auth/callback`、`/api/v1/auth/claim` 浏览器授权流程，也不通过 Cookie 返回业务会话。
@@ -81,7 +81,7 @@ Ingress 使用固定的 AGC 中国区服务地址和部署配置的项目/API cl
 
 每次验票失败只记录一条脱敏告警，包含失败阶段、分类原因，以及能够取得的上游 HTTP 状态和 `ret.code`；不记录用户 token、UID、资料或服务端凭据。
 
-AGC 身份按“ADX tenant + provider `agc` + AGC project ID + 已验证 UID”独立映射。它不会因为 UID、手机号或端侧 owner ID 与 Account Kit 身份相同而自动合并；两种 provider 的历史资源默认彼此独立。
+AGC 身份按“provider `agc` + AGC project ID + 已验证 UID”独立映射。它不会因为 UID、手机号或端侧 owner ID 与 Account Kit 身份相同而自动合并；两种 provider 的历史资源默认彼此独立。
 
 ## 登出
 
@@ -112,7 +112,7 @@ Authorization: Bearer <business-token>
 
 - 无请求体，不接受 URL 查询参数。
 - 必须使用 `Authorization: Bearer <business-token>`；ADX 管理密钥、华为授权码、文件 token 和 `X-Auth` 均不能代替它。
-- 如果请求携带 `Origin`，其值须在网关允许列表中。
+- Ingress 不限制 `Host` 或 `Origin`；业务接口仍需通过会话鉴权。
 
 调用示例：
 
@@ -161,7 +161,15 @@ curl -i 'https://<gateway-host>/api/v1/auth/quota' \
 
 接口先验证业务会话，再查询该用户的 LiteLLM key 信息。如果用户尚无 key，首次查询会创建并保存该用户的 key，然后读取额度；**查询本身不扣除额度，也不创建 Sandbox**。已有 key 的预算规则不会因部署配置改动而自动重置。准备凭据时会将该用户 key 的模型权限更新为 `all-proxy-models`，覆盖 LiteLLM 当前及后续新增模型；Account Kit 用户的 `key_alias` 为 `huawei-<华为昵称>-<ADX用户ID前8位>`，没有可用昵称时为 `huawei-<ADX用户ID前8位>`；AGC 用户当前不导入昵称，别名为 `agc-<ADX用户ID前8位>`。昵称只保留字母、数字、中文等 Unicode 字母数字以及空格、下划线和连字符，最长 128 字符。更新只改变模型权限和显示别名，保留 key、预算、消费记录和限流。模板声明决定 Jiuwen 展示的模型列表。旧用户需再次完成华为登录才能取得此前未保存的昵称，之后查询额度或准备新绑定时同步别名；旧业务 token 也会读取账户最新昵称。暖沙箱调用不会触发别名同步。
 
-账户 schema 保持未发布的 v1。全新环境应用 `gateway/src/ingress/accounts/schema.sql`；若开发环境已有旧版 v1 表，由 schema owner 直接补充可空的 `users.display_name` 字段后再启动新版 Ingress，不新增 v2 版本标记或迁移文件，已有用户、会话和加密 Key 保持不变。Key 显示名称不会自动改变 LiteLLM 原生限流错误；客户端错误使用别名需要另外配置 LiteLLM 错误回调。
+账号配置、Principal、用户表、会话表和模型凭据表均不携带 tenant。DigitalMateGateway 配置顶层的固定 tenant 用于 Agent Scope、Binding、workspace、LiteLLM owner 及模型 Key 加密上下文的稳定派生，必须保持原值。schema_version 保持 1；运行时 SQL 不检测旧列、不执行 DDL，也不按版本切换。全新环境使用 [schema.sql](../../gateway/src/ingress/accounts/schema.sql)。Key 显示名称不会自动改变 LiteLLM 原生限流错误；客户端错误使用别名需要另外配置 LiteLLM 错误回调。
+
+## 透明 WebSocket
+
+`ADX_JIUWEN_CONFIG` 的顶层配置了 `orbit` 块时可连接 `wss://<gateway-host>/orbit/ws`，握手携带相同的 `Authorization: Bearer <business-token>`。绑定只根据网关固定 tenant、已验证 user_id 和服务端固定模板/版本确定；同用户重连复用，不同用户隔离。不从客户端查询参数选择 Binding，也不返回 Binding ID 响应头。
+
+目标模板、版本、后端路径和端口均由服务端固定，不能由客户端改选。入口只替换配置的后端路径，原样保留 query，包括 token、authorization 等应用参数；这些参数不用于网关鉴权或选路，不额外限制 query 长度。入口复用共享 Gateway Upgrade 和双向字节转发，保留业务 WebSocket 帧和关闭语义；不使用原 `/ws` 的 Jiuwen 协议转换。原 `/ws` 的模板、Binding ID 和工作区保持原规则。首次缺少绑定时，与 Jiuwen 共用模型参数和工作区参数生成逻辑；`workspace` 由 `[tenant, Orbit模板名, user_id]` 确定，模板通过 `${workspace}` 挂载用户目录。非 root 镜像可通过模板挂载的 `create_if_missing: true` 和 `create_options` 声明新目录的 UID/GID/mode；Orbit 示例使用 10001/10001/0700，已有目录不变。该能力需要升级 adxlet，尚未在测试环境部署。详细配置和转发规则见 [透明入口契约](../../gateway/README.md#transparent-business-websocket) 与 [完整配置示例](../../gateway/examples/digitalmategateway.json)。
+
+Jiuwen 与 Orbit 使用网关顶层固定 tenant，并共用同一份账号配置和登录会话，各自配置目标参数与请求期限。业务及共享账号入口不按 Host 或 Origin 限制准入，域名和路径的访问范围由部署层控制。透明入口保留原始 Host 和 Origin，由后端应用执行自己的 Origin 校验；后端连接地址及端口仍由服务端固定配置。该划分不增加用户级或应用级会话权限模型。
 
 ## 常见错误
 
@@ -174,15 +182,22 @@ curl -i 'https://<gateway-host>/api/v1/auth/quota' \
 | HTTP 状态 | `code` | 场景 |
 | --- | --- | --- |
 | 400 | `INVALID_LOGIN_REQUEST` | 登录 JSON 格式、字段或授权码不合法；登录请求体过大。 |
-| 400 | `INVALID_QUERY` | 任一接口的 URL 带查询参数。 |
-| 401 | `UNAUTHORIZED` | 登录时华为授权码或身份验证失败；登出、额度查询缺少或使用了无效、过期、已撤销的业务 token。 |
+| 400 | `INVALID_QUERY` | 登录、登出或额度查询带查询参数。 |
+| 400 | `INVALID_WEBSOCKET_HANDSHAKE` | 透明入口 Upgrade 握手无效。 |
+| 400 | `INVALID_REQUEST` | 透明入口目标 URI 或 Agent 请求无效。 |
+| 401 | `UNAUTHORIZED` | 登录时华为授权码或身份验证失败；业务入口缺少或使用了无效、过期、已撤销的业务 token。 |
 | 401 | `INVALID_AGC_ACCESS_TOKEN` | AGC 用户 token 无效、过期、已撤销或属于其他项目。 |
 | 403 | `AGREEMENT_REQUIRED` | 首次注册未提供当前协议版本。 |
 | 403 | `ACCOUNT_DISABLED` | 已映射的业务账号被禁用或删除。 |
 | 403 | `FORBIDDEN` | 额度查询时 LiteLLM key 与当前用户不匹配。 |
-| 403 | `ACCESS_DENIED` | 请求的 `Host` 或可选的 `Origin` 不在网关配置允许范围。 |
+| 404 | `NOT_FOUND` | 透明入口未配置，或固定模板不存在。 |
 | 405 | `METHOD_NOT_ALLOWED` | 登录、登出未使用 POST，或额度查询未使用 GET。 |
 | 415 | `JSON_REQUIRED` | 登录未使用 `application/json`。 |
 | 503 | `AUTH_UNAVAILABLE` | 华为或 AGC 身份服务、AGC API client 授权、账号存储或 LiteLLM 管理接口不可用，或认证、额度处理超时。 |
+| 502 | `ROUTE_REVOKED` | 透明入口握手前路由撤销，不表示会话失效。 |
+| 502 | `AGENT_SERVER_UNAVAILABLE` | 透明入口后端连接不可用。 |
+| 504 | `AGENT_SERVER_UNAVAILABLE` | 透明入口激活、连接、会话复查或后端握手耗尽同一准入期限。 |
+
+透明连接握手后会话失效或路由撤销将关闭连接；撤销检查沿用现有会话守卫，轮询间隔最多 30 秒。绑定激活的其他产品错误沿用 Jiuwen 的 `CONFLICT`、`UNSUPPORTED`、`AGENT_UNAVAILABLE` 语义。
 
 业务 token 只用于 ADX 业务接口认证，不是华为授权码、AGC 用户 token、文件 token 或 LiteLLM key。客户端应保存登录响应中的 token，并在登出后删除本地副本。

@@ -6,8 +6,8 @@
     "version": "20.04"
   },
   "source_image": "docker.io/library/ubuntu:20.04@sha256:c664f8f86ed5a386b0a340d981b8f81714e21a8b9c73f658c4bea56aa179d54a",
-  "repository": "swr.ap-southeast-1.myhuaweicloud.com/openjiuwen-online-test/adx-jiuwen-build",
-  "ci_image": "swr.ap-southeast-1.myhuaweicloud.com/openjiuwen-online-test/adx-jiuwen-build@sha256:22a721e3a1b36bdc1a0587efe9af0a569102b95ada8986047e74d3c276706411",
+  "repository": "swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-build",
+  "ci_image": "swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-build@sha256:7cd63f1d779963576ba3ddbf258a01af9fad289fb4f0e848a34dfb75d5139ade",
   "rust": "1.95.0",
   "go": "1.25.5",
   "redis": "7.2.5",

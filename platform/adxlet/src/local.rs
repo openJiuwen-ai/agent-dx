@@ -23,6 +23,14 @@ impl Adxlet {
         spec: &EnvironmentSpec,
         user_metadata: adx_core::metadata::UserMetadata,
     ) -> Result<LocalReservation> {
+        if self
+            .authority_reconciling
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(Error::Unavailable(
+                "node authority reconciliation pending".into(),
+            ));
+        }
         spec.validate()?;
         adx_core::metadata::validate_user_metadata(&user_metadata)?;
         if self.is_draining() {
@@ -32,6 +40,7 @@ impl Adxlet {
             .environments
             .lock()
             .expect("shared state lock poisoned");
+        self.ensure_not_cleaning(&spec.id)?;
         if let Some((old, assignment, _)) = environments.get(&spec.id) {
             if old != spec {
                 return Err(Error::Conflict);

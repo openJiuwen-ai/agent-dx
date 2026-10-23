@@ -4,7 +4,7 @@ use adx_agent_core::{
     environment::*,
     lifecycle::RetentionPolicy,
     limits,
-    network::{EgressProtocol, SandboxNetworkPolicy},
+    network::{EgressProtocol, RuntimeNetworkPolicy, SandboxNetworkPolicy},
 };
 use ipnet::IpNet;
 use serde_json::{json, Value};
@@ -83,7 +83,6 @@ fn validate_execution_fields(execution: &ExecutionSpec) -> Result<(), Environmen
     }
     Ok(())
 }
-
 /// Convert the immutable execution portion of a request to the public Environment contract.
 ///
 /// This deliberately excludes caller identity, Environment identity, operation timeouts, and
@@ -119,6 +118,11 @@ pub fn execution_input(execution: &ExecutionSpec) -> Result<Value, EnvironmentEr
     if let Some(probe) = &execution.readiness_probe {
         input["readinessProbe"] = readiness_probe_input(probe)?;
     }
+    if let Some(healthcheck) = &execution.healthcheck {
+        let mut probe = readiness_probe_input(&healthcheck.probe)?;
+        probe["failureThreshold"] = json!(healthcheck.failure_threshold);
+        input["healthcheckProbe"] = probe;
+    }
     if let Some(limit) = execution.resources.cpu_limit_millis {
         input["cpu_limit"] = json!(limit);
     }
@@ -151,7 +155,15 @@ pub fn create_input(
     let mut input = execution_input(&request.execution)?;
     input["namespace"] = json!("adx");
     input["name"] = json!(name);
-    input["network"] = network_input(network)?;
+    // Validate the complete deployment configuration even for an explicit opt-out.
+    let network_request = network_input(network)?;
+    if network
+        .runtime_policies
+        .get(&request.execution.isolation_runtime)
+        != Some(&RuntimeNetworkPolicy::Unrestricted)
+    {
+        input["network"] = network_request;
+    }
     input["createTimeoutSeconds"] = json!(timeout.as_secs().max(1));
     Ok(input)
 }
@@ -225,6 +237,19 @@ pub(crate) fn observed(
 /// The sandboxd backend accepts IPv4 only. Unsupported CIDRs, overlapping service
 /// exceptions and invalid port ranges fail closed before creating an Environment.
 pub fn network_input(config: &SandboxNetworkPolicy) -> Result<Value, EnvironmentError> {
+    if config.runtime_policies.len() > 64
+        || config.runtime_policies.keys().any(|runtime| {
+            runtime.is_empty()
+                || runtime.len() > 64
+                || !runtime
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_'))
+        })
+    {
+        return Err(EnvironmentError::Invalid(
+            "runtime network policies require at most 64 valid runtime names".into(),
+        ));
+    }
     fn cidr(value: &str) -> Result<IpNet, EnvironmentError> {
         value.parse::<ipnet::Ipv4Net>().map(IpNet::V4).map_err(|_| {
             EnvironmentError::Invalid("Environment network requires an IPv4 CIDR".into())

@@ -45,6 +45,9 @@ SDK command 返回的 stdout/stderr 不会自动归档为主进程日志。
 推算已分配。集群分配率面板的分子与分母均只统计可调度节点。CPU/内存/磁盘口径一致。
 
 节点状态表按环境与节点关联当前瞬时值，显示健康、准入、资源采样状态及 CPU/内存/磁盘调度容量和分配率；
+九条查询通过 `node_key` 使用 `joinByField` 的 `outer` 模式合并，保持每个环境与节点一行。
+Grafana 11.5.2 下 `outerTabular` 会产生重复节点行和大量空单元格。若部署环境通过 Helm
+管理看板，升级前需将这份 JSON 同步到 chart 的 dashboard 配置中。
 CPU 以核显示，内存与磁盘按字节自动换算；暂停准入时容量显示 0。缺少观测显示 `Unknown`。Coordinator 指标携带 `node_id`；adxlet 的采样指标需要
 部署抓取配置注入相同的 `node_id`，或在 Kubernetes 中提供与节点 ID 一致的
 `k8s_node_name`。资源采样样本超过 45 秒后不作为当前状态；修改默认 15 秒

@@ -11,6 +11,7 @@ description = "ADX persistent control-plane state and shard scheduling service"
 workspace = true
 
 [dependencies]
+adx-checkpoint-storage = { path = "../crates/checkpoint-storage" }
 adx-observability = { path = "../../crates/observability" }
 adx-transport = { path = "../../crates/transport" }
 hyper-util = { version = "0.1", features = ["tokio"] }

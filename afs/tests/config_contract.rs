@@ -503,10 +503,162 @@ fn invalid_limits_and_uncompiled_mode_fail() {
 }
 
 #[test]
-fn meta_store_defaults_to_etcd_and_cli_overrides_toml() {
-    let default = Config::resolve(Role::Meta, Cli::parse_from(["afs-meta"])).unwrap();
-    assert_eq!(default.meta_store, MetaStoreBackend::Etcd);
+fn p3_cli_retired_backend_errors_explain_safe_migration() {
+    for args in [
+        vec!["--meta-store", "etcd"],
+        vec!["--meta-store=redis"],
+        vec!["--etcd-endpoint", "http://127.0.0.1:2379"],
+        vec!["--redis-endpoint=redis://127.0.0.1:6379/0"],
+    ] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_afs-meta"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        let text = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            text.contains("retired")
+                && text.contains("empty directory")
+                && text.contains("original binary"),
+            "missing safe migration guidance: {text}"
+        );
+    }
+    for flag in ["--help", "--version"] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_afs-meta"))
+            .arg(flag)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(
+            !String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("retired")
+        );
+    }
+}
 
+#[test]
+fn p3_settings_default_is_local_file_without_retired_endpoints() {
+    let cfg = Config::resolve(Role::Meta, Cli::parse_from(["afs-meta"])).unwrap();
+    assert_eq!(cfg.meta_store, MetaStoreBackend::LocalFile);
+    let output = serde_json::to_value(&cfg).unwrap();
+    assert!(output.get("etcd_endpoint").is_none());
+    assert!(output.get("redis_endpoint").is_none());
+}
+#[test]
+fn p3_settings_retired_backend_selection_and_endpoints_are_rejected() {
+    for (flag, value) in [
+        ("--meta-store", "etcd"),
+        ("--meta-store", "redis"),
+        ("--etcd-endpoint", "http://127.0.0.1:2379"),
+        ("--redis-endpoint", "redis://127.0.0.1:6379/0"),
+    ] {
+        if let Ok(cli) = Cli::try_parse_from(["afs-meta", flag, value]) {
+            assert!(
+                Config::resolve(Role::Meta, cli).is_err(),
+                "retired CLI option accepted: {flag}={value}"
+            );
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("retired.toml");
+    for text in [
+        "meta_store='etcd'",
+        "meta_store='redis'",
+        "etcd_endpoint='http://127.0.0.1:2379'",
+        "redis_endpoint='redis://127.0.0.1:6379/0'",
+    ] {
+        std::fs::write(&path, text).unwrap();
+        let result = Config::resolve(
+            Role::Meta,
+            Cli::parse_from(["afs-meta", "--config", path.to_str().unwrap()]),
+        );
+        assert!(result.is_err(), "retired TOML accepted: {text}");
+    }
+}
+#[test]
+fn p3_settings_finite_policy_defaults_match_the_approved_plan() {
+    let cfg = Config::resolve(Role::Meta, Cli::parse_from(["afs-meta"])).unwrap();
+    let output = serde_json::to_value(cfg).unwrap();
+    for (key, value) in [
+        ("meta_checkpoint_wal_bytes", 128 * 1024 * 1024_u64),
+        ("meta_checkpoint_wal_records", 1_000_000),
+        ("meta_checkpoint_interval_ms", 60_000),
+        ("meta_wal_segment_bytes", 64 * 1024 * 1024),
+        ("meta_request_retention_ms", 86_400_000),
+        ("meta_request_outcomes_max", 1_000_000),
+        ("meta_request_bytes_max", 256 * 1024 * 1024),
+        ("meta_watch_events_max", 1_000_000),
+        ("meta_watch_bytes_max", 64 * 1024 * 1024),
+        ("meta_watch_retention_ms", 3_600_000),
+    ] {
+        assert_eq!(
+            output[key],
+            serde_json::json!(value),
+            "missing or wrong default: {key}"
+        );
+    }
+}
+#[test]
+fn p3_settings_finite_policy_toml_cli_precedence_and_zero_rejection() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("policy.toml");
+    let fields = [
+        ("meta_checkpoint_wal_bytes", 1_048_576_u64),
+        ("meta_checkpoint_wal_records", 128),
+        ("meta_checkpoint_interval_ms", 1000),
+        ("meta_wal_segment_bytes", 1_048_576),
+        ("meta_request_retention_ms", 5000),
+        ("meta_request_outcomes_max", 128),
+        ("meta_request_bytes_max", 1_048_576),
+        ("meta_watch_events_max", 128),
+        ("meta_watch_bytes_max", 1_048_576),
+        ("meta_watch_retention_ms", 5000),
+    ];
+    for (key, value) in fields {
+        std::fs::write(&path, format!("{key}={value}\n")).unwrap();
+        let cfg = Config::resolve(
+            Role::Meta,
+            Cli::parse_from(["afs-meta", "--config", path.to_str().unwrap()]),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(cfg).unwrap()[key],
+            serde_json::json!(value)
+        );
+        let flag = format!("--{}", key.replace('_', "-"));
+        let alternate = (value * 2).to_string();
+        let cfg = Config::resolve(
+            Role::Meta,
+            Cli::try_parse_from([
+                "afs-meta",
+                "--config",
+                path.to_str().unwrap(),
+                &flag,
+                &alternate,
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(cfg).unwrap()[key],
+            serde_json::json!(value * 2)
+        );
+        std::fs::write(&path, format!("{key}=0\n")).unwrap();
+        assert!(
+            Config::resolve(
+                Role::Meta,
+                Cli::parse_from(["afs-meta", "--config", path.to_str().unwrap()])
+            )
+            .is_err(),
+            "zero policy accepted: {key}"
+        );
+    }
+}
+#[test]
+fn meta_store_defaults_to_local_file_and_cli_overrides_toml() {
+    let default = Config::resolve(Role::Meta, Cli::parse_from(["afs-meta"])).unwrap();
+    assert_eq!(default.meta_store, MetaStoreBackend::LocalFile);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("meta.toml");
     std::fs::write(&path, "meta_store = 'memory'\n").unwrap();
@@ -516,7 +668,6 @@ fn meta_store_defaults_to_etcd_and_cli_overrides_toml() {
     )
     .unwrap();
     assert_eq!(file.meta_store, MetaStoreBackend::InMemory);
-
     let cli = Config::resolve(
         Role::Meta,
         Cli::parse_from([
@@ -524,35 +675,91 @@ fn meta_store_defaults_to_etcd_and_cli_overrides_toml() {
             "--config",
             path.to_str().unwrap(),
             "--meta-store",
-            "etcd",
+            "local-file",
         ]),
     )
     .unwrap();
-    assert_eq!(cli.meta_store, MetaStoreBackend::Etcd);
+    assert_eq!(cli.meta_store, MetaStoreBackend::LocalFile);
+}
 
-    let local = Config::resolve(
+#[test]
+fn p3_log_limits_defaults_cli_override_and_invalid_bounds() {
+    fn limits(cfg: &Config) -> (usize, usize, u64) {
+        (
+            cfg.meta_record_max_bytes,
+            cfg.meta_batch_max_bytes,
+            cfg.meta_wal_max_bytes,
+        )
+    }
+    let defaults = afs::meta::store::journal::LogLimits::default();
+    assert_eq!(
+        limits(&Config::resolve(Role::Meta, Cli::parse_from(["afs-meta"])).unwrap()),
+        (
+            defaults.record_max_bytes,
+            defaults.batch_max_bytes,
+            defaults.wal_max_bytes
+        )
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("meta.toml");
+    std::fs::write(&path, "meta_store='local-file'\nmeta_record_max_bytes=1024\nmeta_batch_max_bytes=2048\nmeta_wal_max_bytes=16384\nmeta_wal_segment_bytes=8192\n").unwrap();
+    let file = Config::resolve(
         Role::Meta,
-        Cli::parse_from(["afs-meta", "--meta-store", "local-file"]),
+        Cli::parse_from(["afs-meta", "--config", path.to_str().unwrap()]),
     )
     .unwrap();
-    assert_eq!(local.meta_store, MetaStoreBackend::LocalFile);
-
-    let redis = Config::resolve(
+    assert_eq!(limits(&file), (1024, 2048, 16384));
+    let cli = Config::resolve(
         Role::Meta,
         Cli::parse_from([
             "afs-meta",
-            "--meta-store",
-            "redis",
-            "--redis-endpoint",
-            "redis://127.0.0.1:6379/0",
+            "--config",
+            path.to_str().unwrap(),
+            "--meta-record-max-bytes",
+            "4096",
+            "--meta-batch-max-bytes",
+            "8192",
+            "--meta-wal-max-bytes",
+            "32768",
         ]),
     )
     .unwrap();
-    assert_eq!(redis.meta_store, MetaStoreBackend::Redis);
-    assert_eq!(
-        redis.redis_endpoint.as_deref(),
-        Some("redis://127.0.0.1:6379/0")
-    );
+    assert_eq!(limits(&cli), (4096, 8192, 32768));
+    for (record, batch, wal) in [
+        (0u64, 2048u64, 16384u64),
+        (255, 2048, 16384),
+        (2048, 1024, 16384),
+        (1024, 2048, 4096),
+        (1024, 2048, 6143),
+        (4294967296, 4294967296, 8589934592),
+    ] {
+        std::fs::write(&path, format!("meta_record_max_bytes={record}\nmeta_batch_max_bytes={batch}\nmeta_wal_max_bytes={wal}\n")).unwrap();
+        let error = Config::resolve(
+            Role::Meta,
+            Cli::parse_from(["afs-meta", "--config", path.to_str().unwrap()]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+    }
+}
+
+#[test]
+fn p3_settings_reject_segment_above_wal_and_excessive_timer() {
+    for args in [
+        vec!["afs-meta", "--meta-wal-segment-bytes", "1073741825"],
+        vec![
+            "afs-meta",
+            "--meta-checkpoint-interval-ms",
+            "18446744073709551615",
+        ],
+    ] {
+        assert_eq!(
+            Config::resolve(Role::Meta, Cli::parse_from(args))
+                .unwrap_err()
+                .code(),
+            afs_error::CONFIG_INVALID
+        );
+    }
 }
 
 #[test]

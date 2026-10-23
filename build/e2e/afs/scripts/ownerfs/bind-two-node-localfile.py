@@ -317,10 +317,13 @@ trusted_node_certs = {trusted}
 
     def enable_bind_for_node_a(self) -> None:
         cfg = self.root / "etc/node-a.toml"
+        egress = self.root / "node-a/egress"
+        egress.mkdir()
         with cfg.open("a", encoding="utf-8") as handle:
             handle.write(
                 f'''
 experimental_ownerfs_workspace_bind = true
+ownerfs_workspace_egress_root = "{egress}"
 [ownerfs_workspace_bind]
 workspace = "{WORKSPACE}"
 '''
@@ -460,11 +463,11 @@ workspace = "{WORKSPACE}"
         try:
             self.start("meta")
             self.start("node-a")
-            home = self.root / "node-a/mount/ownerfs" / WORKSPACE
+            fuse_home = self.root / "node-a/mount/ownerfs" / WORKSPACE
             remote = self.root / "node-b/mount/ownerfs" / WORKSPACE
-            home.mkdir(mode=0o700)
-            os.chown(home, WORKLOAD_UID, WORKLOAD_GID)
-            fd = os.open(home.parent, os.O_RDONLY | os.O_DIRECTORY)
+            fuse_home.mkdir(mode=0o700)
+            os.chown(fuse_home, WORKLOAD_UID, WORKLOAD_GID)
+            fd = os.open(fuse_home.parent, os.O_RDONLY | os.O_DIRECTORY)
             try:
                 os.fsync(fd)
             finally:
@@ -473,6 +476,7 @@ workspace = "{WORKSPACE}"
             self.enable_bind_for_node_a()
             self.start("node-a")
             self.start("node-b")
+            home = self.root / "node-a/egress" / WORKSPACE
 
             physical = list((self.root / "node-a/state/ownerfs").glob("root-776f726b7370616365-e*"))
             self.check("one physical Home epoch", len(physical) == 1, [str(path) for path in physical])
@@ -488,6 +492,18 @@ workspace = "{WORKSPACE}"
                 found.get("fstype") == "ext4"
                 and (home_stat.st_dev, home_stat.st_ino) == (physical_stat.st_dev, physical_stat.st_ino),
                 found,
+            )
+            local_mount = json.loads(
+                self.command(
+                    ["findmnt", "-J", "--target", fuse_home, "-o", "TARGET,SOURCE,FSTYPE,ID"],
+                    check_name="find uncovered local fuse workspace",
+                )
+            )["filesystems"][0]
+            self.check(
+                "local workspace remains on FUSE, bind target is separate",
+                local_mount.get("source") == "afs-ownerfs"
+                and (fuse_home.stat().st_dev != home_stat.st_dev),
+                local_mount,
             )
             remote_mount = json.loads(
                 self.command(

@@ -26,6 +26,8 @@ uds_path = "/opt/adx/run/afs/node-a.sock"
 # Cache-retained metadata estimate; active reader Arcs and Node RSS are separate.
 # Includes layout/index capacities, ID buffers and conservative cache-table overhead.
 # dfs_version_cache_bytes = 33554432
+# Catalog request count, independent of body/proof budgets.
+dfs_catalog_commit_queue = 256
 # Bounded native cache flight records, valid range 1..=8.
 # This does not enable multiple body fills or object prefetch.
 # dfs_fetch_max_inflight_objects = 8
@@ -42,6 +44,11 @@ uds_path = "/opt/adx/run/afs/node-a.sock"
 # dfs_source_cache_max_ms = 5000
 # dfs_source_lookahead_chunks = 64
 # dfs_source_cache_bytes = 4194304
+# Native DFS Node defaults: independent IDs, 32KiB CRC32C and write-generation GC.
+# Replica counts/local-copy policy remain the existing filesystem policy.
+# S3 and OwnerFs-only do not enable these native defaults.
+# dfs_crc32c_writes = true
+# dfs_optimistic_gc_commit = true
 timeout_ms = 5000
 log_level = "info"
 trace_enabled = false
@@ -68,9 +75,6 @@ tls_ca_certificate = "/opt/adx/config/afs/tls/ca.pem"
 tls_identity_certificate = "/opt/adx/config/afs/tls/node-a.pem"
 tls_identity_private_key = "/opt/adx/config/afs/tls/node-a-key.pem"
 tls_server_name = "afs-cluster"
-
-# Catalog request count, independent of body/proof budgets.
-dfs_catalog_commit_queue = 256
 
 # Native DFS live uploads and unpublished metadata. S3 keeps its separate budgets.
 dfs_dirty_budget_bytes = 67108864

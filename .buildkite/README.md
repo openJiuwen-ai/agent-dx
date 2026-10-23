@@ -48,7 +48,7 @@ Set these variables on a Buildkite build or in that pipeline's environment setti
 | `ADX_ARM_OBS_UPLOAD` | inherits `ADX_OBS_UPLOAD` | Base: override only ARM final OBS publication; ARM Buildkite artifacts remain available |
 | `ADX_OBS_UPLOAD_CHANNEL` | `daily` | Base/SDK: `daily` or `release` |
 | `ADX_RELEASE_VERSION` | tag-derived | OBS release path version |
-| `ADX_OBS_BUCKET` / `ADX_OBS_ENDPOINT` | `openyuanrong` / `obs.cn-southwest-2.myhuaweicloud.com` | OBS intermediate transport and final publication destination |
+| `ADX_OBS_BUCKET` / `ADX_OBS_ENDPOINT` | `agent-dx` / `obs.cn-southwest-2.myhuaweicloud.com` | OBS intermediate transport and final publication destination |
 | `ADX_ARTIFACT_TRANSPORT` | `obs` | Base components: `obs` staging or explicit `buildkite` transport |
 | `ADX_ADMIN_PYPI_UPLOAD` | `0` | Base/admin: `1` enables adxadmin publication on a repository release tag |
 | `ADX_ADMIN_PYPI_REPOSITORY` | `pypi` | Base/admin: `pypi` or `testpypi` |
@@ -64,6 +64,12 @@ there is no silent transport fallback. AMD64 temporary artifacts use
 `adx/ci/<build UUID>/<commit>/<component>/`, with commit/build/group and SHA256
 checked before extraction. Configure bucket retention for this temporary prefix
 separately from `adx/daily/` and `adx/release/`.
+
+AMD64 publication honors the same transport choice: with `obs` it consumes the
+verified staged release and the exact Execd component from this build. Small
+SDK/admin candidates still come from Buildkite artifacts. Explicit `buildkite`
+retains the complete Buildkite handoff. A failed OBS transfer or identity/hash
+check stops publication without falling back to another transport.
 
 ## Parallel Linux ARM64 packages
 
@@ -131,7 +137,8 @@ The base pipeline's `admin-package` uses the same outer Docker runner as the SDK
 pipeline, with the digest-pinned Python 3.12 image. It runs UT, builds wheel/sdist,
 checks them with Twine and performs a clean installation smoke test. The outer
 runner verifies the exact clean Git checkout. The Python image does not need Git.
-Rust build tooling uses the selected builder's Python: the owned AMD64 builder supplies Python 3.11.14; the separately pinned ARM builder retains its existing interpreter.
+Rust build tooling uses Python 3.9 from the pinned Guiyang AMD64 builder. The
+separately pinned ARM builder retains its existing interpreter.
 
 ## Base package deployment mode
 
@@ -206,10 +213,10 @@ default) or `testpypi`; successful readback is written to
 `out/buildkite/sdk-publish/publish.json`. OBS upload remains independent and is
 still controlled by `ADX_OBS_UPLOAD`.
 
-The Environment SDK starts at package version `0.1.0rc1`, declared in its
+The Environment SDK version is `0.1.0rc3`, declared in its
 `pyproject.toml`. Its wheel is
-`adx_environment-0.1.0rc1-py3-none-any.whl`. One repository release tag, such
-as `v0.1.0rc1`, can publish both Python packages when their respective upload
+`adx_environment-0.1.0rc3-py3-none-any.whl`. One repository release tag, such
+as `v0.1.0rc3`, can publish both Python packages when their respective upload
 flags are enabled. Each package keeps the version declared in its own
 `pyproject.toml`; a repository tag does not overwrite that version. Wheel
 filenames use normalized Python package versions, which omit the optional
@@ -476,7 +483,8 @@ are available through `ADX_REDIS_SERVER` / `ADX_REDIS_CLI` and
 ## ADX build image and Cargo cache
 
 `build/images/build-environment.json` is the source of truth for the immutable
-Linux AMD64 build-image digest. The AMD64 recipe bootstraps Rust, Protobuf,
+Linux AMD64 build-image digest. Package jobs use the published Guiyang
+`yuanrong-dev/adx-build` image. The maintenance recipe bootstraps Rust, Protobuf,
 Python and the remaining tools from digest-pinned official Ubuntu 20.04 while
 preserving the focal GNU ABI. ARM, Python, packager and acceptance jobs retain
 their separately pinned image profiles. Regular package jobs run through
@@ -553,6 +561,9 @@ Workers read `AK` and `SK` from the `obs-credentials` Secret into
 creation so Buildkite-only builds can run; selecting OBS without credentials fails
 explicitly. Credentials are never passed on argv or written to artifacts.
 `ADX_OBS_BUCKET` and `ADX_OBS_ENDPOINT` override the documented defaults.
+The base and Environment SDK pipeline bootstraps explicitly select the `agent-dx`
+bucket in `cn-southwest-2`. Published `adx/daily/` and `adx/release/` objects allow
+anonymous downloads; `adx/ci/` intermediate objects require authentication.
 
 The default channel is `daily`:
 

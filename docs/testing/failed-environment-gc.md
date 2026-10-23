@@ -32,9 +32,9 @@ services:
 
 `CommitEnvironmentRequest.cleanup_artifacts` 只允许出现在 Deleted 提交中，保存节点仍持有的旧制品清理列表。任务包含完整 Assignment、Deleted revision 和制品列表，以 Environment ID 长度前缀、generation、revision 标识；该任务不进入公开 Sandbox 或 Snapshot 目录。
 
-Coordinator 每5秒按游标至多尝试16项清理。派发前读取持久任务并复核没有 Environment checkpoint 或 Ready/Deleting Snapshot 引用相同物理制品；新快照发布和 Deleted 退役共享原子 header 栅栏。节点必须在线、已对账、session 匹配。local 或无 scope 的制品仅由原节点处理；全部为具有明确 scope 的共享制品时，可由声明相同实际存储 scope 的节点接手。原节点当前 scope 不匹配时，不阻塞兼容节点接手。包含 local 与共享制品的同一任务仍需可处理全部制品的原节点；不会跨节点猜测本地路径。
+Coordinator 每5秒按游标至多尝试16项清理。派发前读取持久任务并复核没有 Environment checkpoint、执行输入或 Ready/Deleting Snapshot 引用相同物理制品；新快照发布和 Deleted 退役共享原子 header 栅栏。共享部分由 Coordinator 配置的 ArtifactReclaimer 物理删除并校验 namespace scope，缺回收器时保留任务报错重试，不依赖源节点在线。含 local 路径的任务仍要求原节点在线、已对账且 session 匹配；只将 local 子集交给节点，不跨节点猜测本地路径。
 
-`NodeService.CollectCheckpointCleanup` 仅允许 Coordinator 身份，节点再次检查就绪、当前进程 session、来源与 scope，按顺序幂等删除。中途失败保留整个任务；已缺失对象视为删除成功，重试可以从头重复。全部完成后，Coordinator 用 epoch、任务 ID 和完整任务内容 CAS 确认。进程崩溃、RPC 断连或确认丢失不清空任务，任务没有 TTL。
+`NodeService.CollectCheckpointCleanup` 仅允许 Coordinator 身份，节点检查就绪、进程 session 和来源，仅清理 source 节点的 local 制品；delegated 或共享对象请求明确拒绝，节点缓存释放不能代替共享对象删除。混合任务先完成本地部分，再由 Coordinator 回收共享部分；中途失败保留整个持久任务，缺失对象按幂等合同重试。全部实际完成后，Coordinator 用 epoch、任务 ID 和完整任务内容 CAS 确认。进程崩溃、RPC 断连或确认丢失不清空任务，任务没有 TTL。
 
 清理完成后保留不可变制品身份索引和删除结果摘要，禁止后来的新引用重新使用已退役对象。正常提交按 `(storage, location)` 摘要索引查询 scope，不扫描历史任务；空 scope 按保守别名规则匹配。上述少量控制元数据随历史清理量增长，不等同于保留 checkpoint 内容；当前没有自动压缩策略。S3 制品使用不可重用 UUID，副本生成独立 UUID；不得由外部工具在同一路径写入另一份制品，迟到的物理 DELETE 无法保护被人为复用的对象地址。
 

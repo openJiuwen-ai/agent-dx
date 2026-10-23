@@ -140,6 +140,48 @@ impl Framework {
         }
         Ok(true)
     }
+    /// Explain all hard-filter rejections without changing placement or scoring.
+    /// Plugin failures remain errors rather than invented capacity diagnoses.
+    pub fn rejections(
+        &self,
+        request: &EnvironmentSpec,
+        candidate: &Candidate<'_>,
+    ) -> Result<Vec<String>> {
+        request.validate()?;
+        let mut reasons = Vec::new();
+        for filter in &self.filters {
+            if filter.filter(request, candidate)? {
+                continue;
+            }
+            if filter.name() == "resource-fit" {
+                for (reason, requested, available) in [
+                    (
+                        "insufficient_cpu",
+                        request.resources.cpu_millis,
+                        candidate.available.cpu_millis,
+                    ),
+                    (
+                        "insufficient_memory",
+                        request.resources.memory_bytes,
+                        candidate.available.memory_bytes,
+                    ),
+                    (
+                        "insufficient_disk",
+                        request.resources.disk_bytes,
+                        candidate.available.disk_bytes,
+                    ),
+                ] {
+                    if requested > available {
+                        reasons.push(reason.into());
+                    }
+                }
+            } else {
+                reasons.push(filter.name().replace('-', "_"));
+            }
+        }
+        Ok(reasons)
+    }
+
     pub fn evaluate(
         &self,
         request: &EnvironmentSpec,

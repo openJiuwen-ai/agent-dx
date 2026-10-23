@@ -3,6 +3,20 @@ fs = "all"
 grpc_listen = "127.0.0.1:7400"
 rest_listen = "127.0.0.1:7401"
 meta_store = "local-file"
+# New operation-log format only; preserve old snapshot/wal directories separately.
+meta_record_max_bytes = 67108864
+meta_batch_max_bytes = 134217728
+meta_wal_max_bytes = 1073741824
+meta_wal_segment_bytes = 67108864
+meta_checkpoint_wal_bytes = 134217728
+meta_checkpoint_wal_records = 1000000
+meta_checkpoint_interval_ms = 60000
+meta_request_retention_ms = 86400000
+meta_request_outcomes_max = 1000000
+meta_request_bytes_max = 268435456
+meta_watch_events_max = 1000000
+meta_watch_bytes_max = 67108864
+meta_watch_retention_ms = 3600000
 data_dir = "/opt/adx/data/afs/meta"
 # DFS replication is a filesystem initialization contract. These R1 defaults
 # must remain unchanged on later starts unless the filesystem is reinitialized.

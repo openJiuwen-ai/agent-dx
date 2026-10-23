@@ -1,31 +1,5 @@
 use crate::control as pb;
-use adx_core::{CheckpointArtifact, CheckpointCleanup, Error, Result};
-
-impl From<CheckpointArtifact> for pb::CheckpointArtifact {
-    fn from(a: CheckpointArtifact) -> Self {
-        Self {
-            storage: a.storage,
-            scope: a.scope,
-            location: a.location,
-            size_bytes: a.size_bytes,
-        }
-    }
-}
-
-impl TryFrom<pb::CheckpointArtifact> for CheckpointArtifact {
-    type Error = Error;
-    fn try_from(a: pb::CheckpointArtifact) -> Result<Self> {
-        if a.storage.is_empty() || a.location.is_empty() || a.size_bytes == 0 {
-            return Err(Error::Invalid("invalid checkpoint artifact".into()));
-        }
-        Ok(Self {
-            storage: a.storage,
-            scope: a.scope,
-            location: a.location,
-            size_bytes: a.size_bytes,
-        })
-    }
-}
+use adx_core::{CheckpointCleanup, Error, Result};
 
 impl TryFrom<CheckpointCleanup> for pb::CheckpointCleanup {
     type Error = Error;

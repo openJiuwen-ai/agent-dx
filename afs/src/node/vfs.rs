@@ -299,6 +299,16 @@ pub trait Backend: Send + Sync {
         self.write(ctx, handle, offset, data)
     }
 
+    /// Copy file data, allowing a backend to share immutable chunks via COW.
+    /// Unsupported ranges return EOPNOTSUPP for the caller's ordinary copy path.
+    fn copy_file_range(
+        &self,
+        _ctx: &types::RequestContext,
+        _range: types::CopyFileRange,
+    ) -> Result<u64> {
+        Err(unsupported("copy_file_range"))
+    }
+
     /// FUSE close 的可返回错误屏障：提交该句柄先前的写入并报告错误。
     /// 只读句柄不能提交其它 writer；release 只清理资源，不承担提交。
     fn flush(&self, _ctx: &types::RequestContext, _handle: types::FileHandle) -> Result<()> {

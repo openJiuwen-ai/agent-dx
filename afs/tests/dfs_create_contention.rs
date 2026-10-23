@@ -11,7 +11,7 @@ use afs::{
             BackendReadiness, MetaEntity, MetaFuture, MetaRead, MetaReadView, MetaStore, MetaTxn,
             OperationResult, OwnerRootScan, RecoveryScan, RequestKey, RequestOutcome, Store,
             StoreOperation, StoreRevision, TxnCondition, TxnMutation, TxnOutcome, WatchBatch,
-            memory::MemoryBackend,
+            journal::MemoryLog,
         },
     },
 };
@@ -21,7 +21,7 @@ const EXPECTED_CREATE_PARENT_DRIFT_RETRY_LIMIT: usize = 64;
 
 async fn memory_dfs() -> DfsService {
     let store = Arc::new(
-        Store::open(Arc::new(MemoryBackend::default()))
+        Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
             .await
             .unwrap(),
     );
@@ -32,7 +32,7 @@ async fn memory_dfs() -> DfsService {
 
 async fn memory_store() -> Arc<Store> {
     Arc::new(
-        Store::open(Arc::new(MemoryBackend::default()))
+        Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
             .await
             .unwrap(),
     )

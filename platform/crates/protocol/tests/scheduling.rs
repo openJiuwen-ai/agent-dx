@@ -1,6 +1,37 @@
 use adx_core::{scheduling::*, Assignment, EnvironmentSpec, Resources};
 use adx_protocol::control as wire;
 use prost::Message;
+
+#[test]
+fn node_reports_preserve_zero_capacity_without_weakening_resource_requests() {
+    for (cpu_millis, memory_bytes) in [(0, 1024), (1000, 0), (0, 0)] {
+        let report = wire::RegisterNodeRequest {
+            node_id: "n".into(),
+            capacity: Some(wire::Resources {
+                cpu_millis,
+                memory_bytes,
+                disk_bytes: 0,
+            }),
+            accepting_allocations: true,
+            ..Default::default()
+        };
+        let decoded = wire::RegisterNodeRequest::decode(report.encode_to_vec().as_slice()).unwrap();
+        let node = Node::try_from(decoded).unwrap();
+        assert_eq!(
+            node.capacity,
+            Resources {
+                cpu_millis,
+                memory_bytes,
+                disk_bytes: 0
+            }
+        );
+        assert!(node.available);
+        assert!(
+            node.capacity.validate().is_err(),
+            "requests still require positive CPU and memory"
+        );
+    }
+}
 fn selector() -> LabelSelector {
     LabelSelector {
         match_labels: [("app".into(), "a".into())].into(),

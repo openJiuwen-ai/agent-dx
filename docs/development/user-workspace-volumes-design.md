@@ -75,23 +75,15 @@ Agent 继续通过公共 Sandbox capability 的 HTTP 或同进程适配器访问
 
 /mnt/sfs/workspaces 是 SFS 在 adx-node 上的本地路径，不是远端 NFS 地址。模板挂载规则由受信任的模板发布方配置。
 
-Jiuwen 准备 Binding 时提交：
+Jiuwen 首次访问通用入口时提交初始化参数，例如：
 
-```json
-{
-  "scope": {
-    "tenant": "tenant-A",
-    "template": "coding",
-    "version": "v2",
-    "binding_id": "jiuwen-example"
-  },
-  "parameters": {
-    "workspace": "w-0123456789abcdef"
-  }
-}
+```http
+GET /agent/ws?target=urn:adx:binding:coding:v2:jiuwen-example
+Authorization: Bearer <ADX platform key>
+X-ADX-Parameters: workspace=w-0123456789abcdef
 ```
 
-示例省略现有 launch 配置。parameters 是通用字符串映射；workspace 是模板约定的参数名，Agent 不给它附加用户含义。
+Header 使用 URL 表单编码的字符串键值对。parameters 是通用字符串映射；workspace 是模板约定的参数名，Agent 不给它附加用户含义。Binding 不存在时，共享解析/激活流程才解析参数并原子创建 Binding；不提供独立准备接口。
 
 建议 Jiuwen 首版采用固定算法生成目录名，例如 w- 加 SHA256(JSON([tenant, template, user_id])) 的完整十六进制编码，示例值仅作缩写。使用认证后的内部 user_id，不使用用户可任意提交的身份字符串。算法编码和字段顺序固定，不包含 version、binding_id、generation、sandbox_id 或 agent_type；同一模板的不同 agent_type 因而可以选到同一目录，这一点需与业务权限一致。
 
@@ -101,14 +93,14 @@ Jiuwen 准备 Binding 时提交：
 
 ## 5 占位符渲染契约
 
-首版只在挂载的 host_path 字段支持 ${parameter_name} 字符串占位符，不执行表达式、Shell、环境变量读取或递归展开；本设计不扩展到 env、command 等其他模板字段。
+Template 的 mounts[].host_path 与 env 值支持 ${parameter_name} 字符串占位符，不执行表达式、Shell、环境变量读取或递归展开；command 等其他字段不参与渲染。
 
 - 模板发布时校验占位符语法、挂载目标和 source 互斥。host_path 保留固定的绝对根路径前缀，参数用于卷内相对路径。
-- 准备 Binding 时，所有被引用的参数必须存在且非空；缺失时报错，不能把占位符替换为空后挂载整个根目录。
+- 首次激活创建 Binding 时，所有被引用的参数必须存在；挂载路径参数还必须非空，不能把占位符替换为空后挂载整个根目录。env 值允许普通字符串，不套用路径限制。
 - 路径参数不得含绝对路径、空路径分量、点路径分量、反斜杠或控制字符；拒绝含 .. 的路径分量，不能靠清理路径将越界输入变为合法值。
 - 渲染后校验规范化结果位于模板的固定根路径下。路径字符串校验不代替节点上的符号链接与实际挂载检查。
-- parameters 在创建 Binding 时与 generation 一起持久化；重复准备时参数一致则幂等，不一致返回冲突，不能覆盖已存在绑定的数据目录。
-- 模板版本不可变。激活、重试、缓存恢复均使用保存的参数；已有 ActivationRequest 继续只携带 Scope、expected_generation、bypasscache，不追加用户身份或临时参数。
+- parameters 在创建 Binding 时与 generation 一起持久化；已有 Binding 完全忽略新请求的初始化参数，包括缺失、不同或格式错误的参数。并发首次创建以原子写入获胜者为准，不能覆盖已有绑定的数据目录。
+- 模板版本不可变。激活、重试、缓存恢复均使用保存的参数；ActivationRequest 透传原始初始化参数，仅缺失 Binding 时消费。删除 Binding 后再次访问使用新参数初始化。
 
 这是通用模板渲染能力。Activator 不反解 workspace 参数，也不据此查用户或计算目录。
 
@@ -119,14 +111,12 @@ Jiuwen 准备 Binding 时提交：
    │ Principal(tenant, user_id)
    ▼
 Jiuwen
-   │ Scope + launch + parameters.workspace
+   │ 通用 /agent/ws + X-ADX-Parameters
    ▼
-Agent PrepareBinding
-   │ 保存 Scope、generation、sandbox_id、parameters
-   ▼
-Activator Activate
-   │ 读取不可变模板 + Binding parameters
-   │ 渲染 mounts
+共享解析 → Activator Activate
+   │ 首次原子保存 Scope、generation、environment_id、parameters
+   │ 读取不可变模板 + 已保存 Binding parameters
+   │ 渲染 mounts 和 env
    ▼
 Sandbox capability（HTTP 或同进程）
    │ Create Sandbox JSON，mounts 已没有占位符
@@ -188,7 +178,7 @@ SFS 必须在 sandboxd 执行挂载的 mount namespace 中可见。本环境 nod
 
 目录创建由每个挂载的 `create_if_missing` 布尔字段控制，默认 false。模板声明该字段，Activator 将它与渲染后的具体路径一同传入 Sandbox capability，Platform 在 EnvironmentSpec 和内部 RPC 中保留它；adxlet 在 start/restore 前执行。Jiuwen 与 Activator 不直接 mkdir，也不增加节点受管目录配置项。
 
-为 true 时只创建最终一级源目录，父目录须由部署预先准备。节点逐级使用目录描述符和 O_NOFOLLOW 解析路径，拒绝符号链接；已有目录复用，不递归 chown 或清理。新目录 mode 为 0755（受节点 umask 影响），属主是节点进程，当前 test 的 AgentServer 使用 root。其他应用 UID 需另行准备权限。SFS 类型、来源和读写选项由现有节点启动检查确认。
+为 true 时只创建最终一级源目录，父目录须由部署预先准备。节点逐级使用目录描述符和 O_NOFOLLOW 解析路径，拒绝符号链接；已有目录复用，不递归 chown 或清理。未指定创建属性时，新目录 mode 为 0755（受节点 umask 影响），属主是节点进程。非 root 应用可在挂载内声明 `create_options: {"uid":10001,"gid":10001,"mode":"0700"}`，与 `create_if_missing: true` 配合使用。三个属性均必填；UID/GID 为 0–4294967294 的整数，mode 为 0000–0777 的四位八进制字符串，不解析镜像用户名。节点直接 mkdir 最终源目录，仅本次创建成功的调用者通过目录描述符设置所有权和权限。并发 mkdir 返回已存在时复用目录，不重复设置。创建与属性设置不是一个原子操作；并发首次使用或进程中断可能看到未完成的属性。设置失败返回错误、阻止本次启动，保留目录供修正，不自动删除、重命名或修复已有目录。已有目录不变，不递归修改；不引入工作区所有者字段或迁移逻辑。共享文件系统需允许节点设置所有权和权限；不要求 renameat2 或额外目录发布协议。Orbit 示例使用 UID/GID 10001、0700；当前仅完成本地组件验证，需要升级 adxlet 后才能使用，尚未进行 SFS/Orbit 云端验收。SFS 类型、来源和读写选项由现有节点启动检查确认。
 
 该开关采用显式“缺失即创建”语义，不保存工作区初始化登记，也不能区分首次创建和已存在数据被外部删除。需要禁止数据丢失后自动创建的场景，应在目录已准备后使用 false，或另行实现数据完整性策略。此能力不新增独立 Volume 资源 API，不解决多实例并发访问 SQLite 的互斥。
 
@@ -227,7 +217,7 @@ Local/rw 本身不提供互斥。本方案要求**同一工作区任何时刻最
 
 | 阶段 | 待实施事项与验证 |
 | --- | --- |
-| 1 契约（已实现） | TemplateVersion mounts、Binding parameters、准备请求和不可变存储；测试参数缺失、非法路径和重复请求冲突 |
+| 1 契约（已实现） | TemplateVersion mounts/env、Binding parameters、首次激活原子存储；测试参数缺失、非法路径、热请求忽略输入与并发首次创建 |
 | 2 渲染与传输（已实现） | Activator 渲染 mounts，扩展 ExecutionSpec，统一 HTTP/同进程请求；测试跨版本同路径、跨用户及模板不同路径 |
 | 3 Local 入口（已实现） | API source 三选一转换、SDK/API 文档；host_path/hostPath 接受、rw 保留及全量 source 互斥组合已有契约测试 |
 | 4 节点部署 | SFS 挂载、namespace 可见性、受管目录准备、权限、调度范围和管理入口授权；缺失挂载必须失败 |
@@ -345,7 +335,7 @@ prepare_runtime_workspace 会补齐和迁移配置并清理旧 team 文件，平
 
 - [Agent 核心模型](../../agent/crates/core/src/lib.rs)与[准备和激活契约](../../agent/crates/core/src/activator.rs)：已新增 mounts 和 parameters，保持 Scope 和执行生命周期分离。
 - [Agent 存储](../../agent/crates/store/src/state.rs)：模板不可变、绑定条件创建及 generation 约束。
-- [Jiuwen 入口](../../gateway/src/ingress/jiuwen/entrypoint.rs)：可信 Principal、binding_id 和 Scope 的现有映射。
+- [Jiuwen 入口](../../gateway/src/ingress/digitalmategateway/entrypoint.rs)：可信 Principal、binding_id 和 Scope 的现有映射。
 - [Agent Environment 请求转换](../../agent/activator/src/environment_request.rs)：统一公共请求生成，已传递渲染后的 mounts。
 - [公共 Environment 挂载校验](../../gateway/apiserver/src/contract.rs)、[平台 Mount 模型](../../platform/crates/core/src/execution.rs)、[adxlet 挂载转换](../../platform/adxlet/src/sandboxd.rs)：公共入口将 host_path 转 Local，经现有节点转换传给 sandboxd。
 - [sandboxd 锁定版本](../../third_party/sandboxd/source.json)与[运行时协议](../../third_party/sandboxd/sandbox-api.proto)：协议已有 HostPath。

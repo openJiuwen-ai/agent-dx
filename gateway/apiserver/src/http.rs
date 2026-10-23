@@ -419,22 +419,23 @@ impl Api {
                     object.remove("runtime");
                 }
             }
+            let spec = match self
+                .environment_service
+                .prepare_create(input.clone(), &caller)
+            {
+                Ok(spec) => spec,
+                Err(error) => return error_response(error, &request_id, None, None, false),
+            };
             if stream && path.ends_with("environments") {
-                let spec = match self
-                    .environment_service
-                    .prepare_create(input.clone(), &caller)
-                {
-                    Ok(spec) => spec,
-                    Err(error) => return error_response(error, &request_id, None, None, false),
-                };
                 return self.create_stream(spec, input, request_id, caller);
             }
-            let result = Box::pin(self.environment_service.create_request(
-                input,
-                &request_id,
-                &caller,
-            ))
-            .await;
+            let environment_id = spec.id.clone();
+            let result =
+                Box::pin(
+                    self.environment_service
+                        .create(spec, input, &request_id, &caller),
+                )
+                .await;
             return response(
                 if path == "/api/environment/create" {
                     result.map(|v| json!({"instance_id":v["environmentId"]}))
@@ -443,7 +444,7 @@ impl Api {
                 },
                 &request_id,
                 None,
-                None,
+                Some(&environment_id),
                 true,
             );
         }
@@ -594,26 +595,7 @@ impl Api {
             );
             let final_event = match result {
                 Ok(value) => value,
-                Err(error) => {
-                    let detail = ErrorDetail::from_status(
-                        &error,
-                        &request_id,
-                        None,
-                        Some(&instance_id),
-                        true,
-                    );
-                    json!({
-                        "status": if error.code() == Code::DeadlineExceeded {
-                            "timeout"
-                        } else {
-                            "failed"
-                        },
-                        "requestId": request_id,
-                        "errorCode": status_code(&error),
-                        "message": error.message(),
-                        "error": detail,
-                    })
-                }
+                Err(error) => create_error_event(&error, &request_id, &instance_id),
             };
             let _ = sender.send(Ok(sse("final", final_event))).await;
         }));
@@ -951,6 +933,17 @@ fn instance_page_after(
 fn header<'a>(request: &'a Request<Incoming>, key: &str) -> Option<&'a str> {
     request.headers().get(key).and_then(|v| v.to_str().ok())
 }
+fn create_error_event(error: &Status, request_id: &str, environment_id: &str) -> Value {
+    let detail = ErrorDetail::from_status(error, request_id, None, Some(environment_id), true);
+    json!({
+        "status": if error.code() == Code::DeadlineExceeded { "timeout" } else { "failed" },
+        "requestId": request_id,
+        "errorCode": status_code(error),
+        "message": error.message(),
+        "error": detail,
+    })
+}
+
 fn sse(name: &str, data: Value) -> Frame<Bytes> {
     Frame::data(Bytes::from(format!("event: {name}\ndata: {data}\n\n")))
 }
@@ -1348,6 +1341,8 @@ mod error_contract_tests {
     fn instance_view_exposes_record_tenant_without_execution_secrets() {
         let view = instance_view(pb::GetEnvironmentResponse {
             record: Some(pb::EnvironmentRecord {
+                execution_artifacts: vec![],
+                snapshot_source: None,
                 spec: Some(pb::EnvironmentSpec {
                     id: "environment-1".into(),
                     tenant_id: "tenant-a".into(),
@@ -1667,6 +1662,27 @@ mod error_contract_tests {
     }
 
     #[tokio::test]
+    async fn busy_snapshot_delete_returns_complete_blocker_list() {
+        let response = error_response(
+            adx_protocol::status(adx_core::Error::SnapshotInUse {
+                sandbox_ids: vec!["sandbox-a".into(), "source".into()],
+                template_ids: vec![],
+            }),
+            "request-a",
+            None,
+            None,
+            false,
+        );
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = error_body(response).await;
+        assert_eq!(body["error"]["code"], "SNAPSHOT_IN_USE");
+        assert_eq!(
+            body["error"]["sandbox_ids"],
+            serde_json::json!(["sandbox-a", "source"])
+        );
+        assert_eq!(body["error"]["retry"], "never");
+    }
+    #[tokio::test]
     async fn submitted_write_error_serializes_the_stable_contract() {
         let response = error_response(
             Status::unavailable("reply lost"),
@@ -1684,6 +1700,41 @@ mod error_contract_tests {
         assert_eq!(value["error"]["requestId"], "request-a");
         assert_eq!(value["error"]["operationId"], "pause-a");
         assert_eq!(value["error"]["environmentId"], "instance-a");
+    }
+
+    #[tokio::test]
+    async fn cancelled_scheduling_timeout_serializes_diagnosis_and_not_started() {
+        let diagnosis = json!({
+            "snapshotRevision": 1, "nodeCount": 3, "eligibleNodes": 0,
+            "requested": {"cpu_millis":32001,"memory_bytes":1024,"disk_bytes":0},
+            "maxCapacity": {"cpu_millis":32000,"memory_bytes":2048,"disk_bytes":0},
+            "maxAvailable": {"cpu_millis":32000,"memory_bytes":2048,"disk_bytes":0},
+            "rejections": {"insufficient_cpu":3}
+        });
+        let mut status = Status::with_details(
+            Code::DeadlineExceeded,
+            "scheduling deadline: insufficient CPU",
+            serde_json::to_vec(&diagnosis).unwrap().into(),
+        );
+        status
+            .metadata_mut()
+            .insert("adx-scheduling-cancelled", "true".parse().unwrap());
+        let frame = sse("final", create_error_event(&status, "create-a", "env-a"));
+        let data = frame.into_data().unwrap();
+        let text = std::str::from_utf8(&data).unwrap();
+        let streamed: Value =
+            serde_json::from_str(text.strip_prefix("event: final\ndata: ").unwrap().trim())
+                .unwrap();
+        assert_eq!(streamed["status"], "timeout");
+        assert_eq!(streamed["errorCode"], 504);
+        let streamed_detail = streamed["error"].clone();
+        assert_eq!(streamed_detail["retry"], "never");
+        assert_eq!(streamed_detail["outcome"], "not_started");
+        assert_eq!(streamed_detail["schedulingFailure"], diagnosis);
+        let response = error_response(status, "create-a", None, Some("env-a"), true);
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let value = error_body(response).await;
+        assert_eq!(value["error"], streamed_detail);
     }
 
     #[tokio::test]

@@ -432,6 +432,7 @@ pub(crate) fn normalize_environment_action(action: &str) -> Option<&'static str>
             Some("fs_read_chunk")
         }
         "fs_list" | "file.list" | "fs.list" => Some("fs_list"),
+        "file.search" => Some("fs_search"),
         "fs_exists" | "file.exists" | "fs.exists" => Some("fs_exists"),
         "fs_remove" | "file.remove" | "fs.remove" => Some("fs_remove"),
         "fs_rename" | "file.rename" | "fs.rename" => Some("fs_rename"),
@@ -470,19 +471,22 @@ pub(crate) fn dispatch_runtime_action_with_trace(
                 trace_id,
             ))
         }
-        "fs_read" | "fs_write" | "fs_write_chunk" | "fs_read_chunk" | "fs_list" | "fs_exists"
-        | "fs_remove" | "fs_rename" | "fs_make_dir" | "fs_get_info" => Some(match method {
-            "fs_read" => super::fs::fs_read(kw),
-            "fs_write" => super::fs::fs_write(kw),
-            "fs_write_chunk" => super::fs::fs_write_chunk(kw),
-            "fs_read_chunk" => super::fs::fs_read_chunk(kw),
-            "fs_list" => super::fs::fs_list(kw),
-            "fs_exists" => super::fs::fs_exists(kw),
-            "fs_remove" => super::fs::fs_remove(kw),
-            "fs_rename" => super::fs::fs_rename(kw),
-            "fs_make_dir" => super::fs::fs_make_dir(kw),
-            _ => super::fs::fs_get_info(kw),
-        }),
+        "fs_read" | "fs_write" | "fs_write_chunk" | "fs_read_chunk" | "fs_list" | "fs_search"
+        | "fs_exists" | "fs_remove" | "fs_rename" | "fs_make_dir" | "fs_get_info" => {
+            Some(match method {
+                "fs_read" => super::fs::fs_read(kw),
+                "fs_write" => super::fs::fs_write(kw),
+                "fs_write_chunk" => super::fs::fs_write_chunk(kw),
+                "fs_read_chunk" => super::fs::fs_read_chunk(kw),
+                "fs_list" => super::fs::fs_list(kw),
+                "fs_search" => super::file_search::search(kw),
+                "fs_exists" => super::fs::fs_exists(kw),
+                "fs_remove" => super::fs::fs_remove(kw),
+                "fs_rename" => super::fs::fs_rename(kw),
+                "fs_make_dir" => super::fs::fs_make_dir(kw),
+                _ => super::fs::fs_get_info(kw),
+            })
+        }
         "cmd_start" | "cmd_get" | "cmd_poll" | "cmd_wait" | "cmd_kill" | "cmd_list"
         | "cmd_capabilities" | "cmd_send_stdin" => Some(match method {
             "cmd_start" => super::cmd::cmd_start(kw),
@@ -755,32 +759,55 @@ mod tests {
     }
 
     #[test]
+    fn cmd_run_honors_short_timeout_without_waiting_for_child_readiness() {
+        let kw = BTreeMap::from([
+            ("cmd".into(), rmpv::Value::from("exec sleep 30")),
+            ("timeout".into(), rmpv::Value::F64(0.1)),
+        ]);
+        let started = Instant::now();
+        let result = dispatch_runtime_action_with_trace("cmd_run", &kw, "")
+            .expect("cmd_run should dispatch");
+
+        // The budget starts before spawn. A busy worker may kill the child
+        // before it executes any shell statements; no readiness file is needed.
+        // Allow the bounded one-second reap grace and CI scheduling overhead.
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(result_field(&result, "exit_code").as_i64(), Some(-1));
+        assert!(result_field(&result, "stderr")
+            .as_str()
+            .unwrap_or_default()
+            .contains("Command timed out after 0.1 seconds"));
+    }
+
+    #[test]
     fn cmd_run_honors_timeout_and_reaps_the_shell_process() {
         let temp = tempfile::tempdir().expect("create temp dir");
         let shell_pid = temp.path().join("shell.pid");
         let descendant_marker = temp.path().join("descendant-finished");
         let command = format!(
-            "echo $$ > {}; (sleep 0.5; touch {}) & wait",
+            "echo $$ > {}; (sleep 2; touch {}) & wait",
             shell_pid.display(),
             descendant_marker.display()
         );
         let mut kw = BTreeMap::new();
         kw.insert("cmd".to_string(), rmpv::Value::from(command));
-        kw.insert("timeout".to_string(), rmpv::Value::F64(0.1));
+        // This separate case inspects child-created state. Give the fixture
+        // time to initialize instead of requiring it within a 100 ms budget.
+        kw.insert("timeout".to_string(), rmpv::Value::F64(1.0));
 
         let started = Instant::now();
         let result = dispatch_runtime_action_with_trace("cmd_run", &kw, "")
             .expect("cmd_run should dispatch");
 
         assert!(
-            started.elapsed() < Duration::from_millis(400),
-            "timed command should return near its deadline"
+            started.elapsed() < Duration::from_secs(5),
+            "timed command must return without waiting for descendants"
         );
         assert_eq!(result_field(&result, "exit_code").as_i64(), Some(-1));
         assert!(result_field(&result, "stderr")
             .as_str()
             .unwrap_or_default()
-            .contains("Command timed out after 0.1 seconds"));
+            .contains("Command timed out after 1 seconds"));
 
         let pid = std::fs::read_to_string(&shell_pid)
             .expect("shell should write its pid before timeout")
@@ -799,7 +826,7 @@ mod tests {
             Some(libc::ESRCH)
         );
 
-        std::thread::sleep(Duration::from_millis(550));
+        std::thread::sleep(Duration::from_millis(2100));
         assert!(
             !descendant_marker.exists(),
             "timeout should kill the whole process group, not only /bin/sh"

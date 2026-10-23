@@ -107,3 +107,13 @@ Rust／RPC 在 macOS ARM64 执行，测试 Redis 7.2.5 使用 AOF always；二�
 Go HTTP、服务配置、Redis 发现、心跳与重启对账、Ingress 路由订阅、Relay 启动同步、SQLite 降级及本地 FC 暂停/恢复、跨节点恢复均已接线。统一发布与基本 K8s 已验收；证书热重载和 K8s FC 后置。
 
 `replace_rejected` 的持久化接口与节点故障后的 checkpoint 恢复流程职责不同。RPC 不把任意 Node 超时当作“尚未执行”来调用旧分配替换；故障恢复按持久化失效、有效 checkpoint、新归属和返回节点对账处理，见 [恢复契约](node-failure-takeover.md)。
+
+## 调度取消边界
+
+`control-rpc` 和 `api-control` 套件还执行 Coordinator 库的独立 Redis 测试，
+覆盖进行中的本地归属声明与队列到期竞争。声明延迟时保持 unknown 结果；
+持久化完成后，以 assignment 为权威。另行确认的 pending 请求取消不会留下
+排队请求或 Environment 记录。RPC 测试夹具覆盖 CPU／内存不满足、到期后的
+容量释放，以及已经分配的运行时在队列截止时间后完成创建的情况。
+`api-control` HTTPS 夹具还验证原始 JSON 和 SSE 的容量失败响应、请求与
+Environment 身份，以及最终资源回到基线。

@@ -115,25 +115,6 @@ impl Activator {
         }
         Ok(())
     }
-    pub async fn prepare_binding(
-        &self,
-        scope: &Scope,
-        launch: &adx_agent_core::launch::LaunchConfig,
-        parameters: &adx_agent_core::mounts::Parameters,
-    ) -> Result<AgentBinding> {
-        launch.validate().map_err(Error::Invalid)?;
-        let template = self
-            .template(&scope.tenant, &scope.template, &scope.version)
-            .await?;
-        let mut execution: adx_agent_core::environment::ExecutionSpec = (&template).into();
-        execution.mounts = template.render_mounts(parameters).map_err(Error::Invalid)?;
-        execution.env.extend(launch.env.clone());
-        self.environment.validate_execution(&execution)?;
-        Ok(self
-            .state
-            .create_binding_with_parameters(scope.clone(), Some(launch), parameters)
-            .await?)
-    }
     pub async fn activate(
         &self,
         scope: &Scope,
@@ -152,6 +133,24 @@ impl Activator {
         expected_generation: Option<&str>,
         deadline_unix_ms: u64,
         bypass_cache: bool,
+    ) -> Result<Target> {
+        self.activate_with_parameters(
+            scope,
+            expected_generation,
+            deadline_unix_ms,
+            bypass_cache,
+            None,
+        )
+        .await
+    }
+    /// Resolve initialization only after the authoritative Binding lookup misses.
+    pub async fn activate_with_parameters(
+        &self,
+        scope: &Scope,
+        expected_generation: Option<&str>,
+        deadline_unix_ms: u64,
+        bypass_cache: bool,
+        parameters: Option<&[u8]>,
     ) -> Result<Target> {
         scope.validate().map_err(Error::Invalid)?;
         let attempt = {
@@ -198,7 +197,19 @@ impl Activator {
                     "selected AgentBinding no longer exists".into(),
                 ));
             }
-            None => self.state.create_binding(scope.clone()).await?,
+            None => {
+                let parameters = adx_agent_core::parameters::parse(parameters.unwrap_or_default())
+                    .map_err(Error::Invalid)?;
+                let mut execution: adx_agent_core::environment::ExecutionSpec = (&template).into();
+                execution.mounts = template
+                    .render_mounts(&parameters)
+                    .map_err(Error::Invalid)?;
+                execution.env = template.render_env(&parameters).map_err(Error::Invalid)?;
+                self.environment.validate_execution(&execution)?;
+                self.state
+                    .create_binding_with_parameters(scope.clone(), &parameters)
+                    .await?
+            }
         };
         if expected_generation.is_some_and(|generation| generation != binding.generation) {
             return Err(Error::Conflict(
@@ -212,9 +223,9 @@ impl Activator {
         execution.mounts = template
             .render_mounts(&binding.parameters)
             .map_err(Error::Invalid)?;
-        if let Some(launch) = self.state.launch_config(&binding).await? {
-            execution.env.extend(launch.env);
-        }
+        execution.env = template
+            .render_env(&binding.parameters)
+            .map_err(Error::Invalid)?;
         self.environment.validate_execution(&execution)?;
         let observed = match self
             .environment

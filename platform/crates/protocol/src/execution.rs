@@ -75,11 +75,31 @@ impl TryFrom<pb::RootfsSpec> for core::Rootfs {
     }
 }
 
+impl From<core::CreateOptions> for pb::MountCreateOptions {
+    fn from(value: core::CreateOptions) -> Self {
+        Self {
+            uid: value.uid,
+            gid: value.gid,
+            mode: value.mode,
+        }
+    }
+}
+impl From<pb::MountCreateOptions> for core::CreateOptions {
+    fn from(value: pb::MountCreateOptions) -> Self {
+        Self {
+            uid: value.uid,
+            gid: value.gid,
+            mode: value.mode,
+        }
+    }
+}
+
 impl From<core::Mount> for pb::MountSpec {
     fn from(value: core::Mount) -> Self {
         Self {
             r#type: value.kind,
             create_if_missing: value.create_if_missing,
+            create_options: value.create_options.map(Into::into),
             target: value.target,
             options: value.options,
             source: Some(value.source.into()),
@@ -92,6 +112,7 @@ impl TryFrom<pb::MountSpec> for core::Mount {
         Ok(Self {
             kind: value.r#type,
             create_if_missing: value.create_if_missing,
+            create_options: value.create_options.map(Into::into),
             target: value.target,
             options: value.options,
             source: value
@@ -302,7 +323,10 @@ fn security_pb(value: core::DataPlaneSecurityMode) -> i32 {
 impl From<core::ExecutionOptions> for pb::ExecutionOptions {
     fn from(value: core::ExecutionOptions) -> Self {
         Self {
+            user: value.user,
+            group: value.group,
             cwd: value.cwd,
+            tunnel_http_port: value.tunnel_http_port.map(u32::from),
             rootfs: value.rootfs.map(Into::into),
             mounts: value.mounts.into_iter().map(Into::into).collect(),
             network: value.network.map(Into::into),
@@ -331,7 +355,13 @@ impl TryFrom<pb::ExecutionOptions> for core::ExecutionOptions {
         let data_plane = value.data_plane.unwrap_or_default();
         let limits = value.limits.unwrap_or_default();
         Ok(Self {
+            user: value.user,
+            group: value.group,
             cwd: value.cwd,
+            tunnel_http_port: value
+                .tunnel_http_port
+                .map(|port| u16::try_from(port).map_err(|_| invalid("tunnel port")))
+                .transpose()?,
             rootfs: value.rootfs.map(TryInto::try_into).transpose()?,
             mounts: value
                 .mounts

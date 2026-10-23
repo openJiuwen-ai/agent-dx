@@ -149,19 +149,48 @@ impl Controller {
                 .await?;
             return Err(error);
         }
-        let staged =
-            match before_deadline(deadline, "checkpoint allocation", services.store.allocate())
-                .await
-            {
-                Ok(path) => path,
-                Err(error) => {
-                    services
-                        .cooperation
-                        .finish_workload(&self.record, &id, Some(error.to_string()))
-                        .await?;
-                    return Err(error);
-                }
-            };
+        let staged = match before_deadline(
+            deadline,
+            "checkpoint allocation",
+            self.capture_directory(
+                services.store.as_ref(),
+                &id,
+                self.capture_preparation
+                    .as_ref()
+                    .map_or(self.record.revision, |(op, _)| op.expected_revision),
+                adx_core::LifecycleKind::Snapshot,
+            ),
+        )
+        .await
+        {
+            Ok(path) => path,
+            Err(error) => {
+                services
+                    .cooperation
+                    .finish_workload(&self.record, &id, Some(error.to_string()))
+                    .await?;
+                return Err(error);
+            }
+        };
+        for reference in services
+            .store
+            .capture_references(&staged)?
+            .into_iter()
+            .filter(|a| {
+                storage != adx_core::lifecycle::CheckpointStorage::Local || a.storage == "local"
+            })
+        {
+            if !self.record.execution_artifacts.contains(&reference) {
+                self.record.execution_artifacts.push(reference);
+            }
+        }
+        self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
+        let reserved = before_deadline(deadline, "capture input reservation", self.sync()).await?;
+        if reserved.durability != Durability::Published {
+            return Err(Error::Unavailable(
+                "capture input reservation publication pending".into(),
+            ));
+        }
         if let Err(error) = before_deadline(
             deadline,
             "runtime preparation",
@@ -178,15 +207,22 @@ impl Controller {
                 .finish_workload(&self.record, &id, Some(error.to_string()))
                 .await;
             services.store.discard_staged(&staged).await?;
+            self.capture_preparation = None;
             if abort.is_err() {
                 self.cleanup().await?;
                 self.transition(Event::Fail)?;
                 self.sync().await?;
             }
+            self.record
+                .execution_artifacts
+                .retain(|a| a.size_bytes != 0);
+            self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
+            self.sync().await?;
             ack?;
             return Err(error);
         }
-        // Only this operation uses leave_running=true. It never retires routes,
+        self.capture_preparation = None;
+        // Runtime-originated capture uses leave_running=true. It never retires routes,
         // releases admission, changes execution identity, or creates a reusable snapshot.
         let backend_timeout = remaining_backend_timeout(deadline)?;
         let capture = before_deadline(
@@ -225,6 +261,19 @@ impl Controller {
             services.store.discard_staged(&staged).await?;
             return Err(error);
         }
+        let retained = self
+            .services
+            .runtime
+            .retains_capture_files(&self.record.spec.runtime_class);
+        if retained {
+            let original = services.store.retain_staged(&staged).await?;
+            self.hold_artifact(
+                original.clone(),
+                services.store.prepare_restore(&original).await?,
+            );
+            self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
+            self.sync().await?;
+        }
         let artifact = match before_deadline(
             deadline,
             "checkpoint publication",
@@ -238,7 +287,15 @@ impl Controller {
                     .cooperation
                     .finish_workload(&self.record, &id, Some(error.to_string()))
                     .await?;
-                services.store.discard_staged(&staged).await?;
+                if !retained {
+                    self.record
+                        .execution_artifacts
+                        .retain(|a| a.size_bytes != 0);
+                    services.store.discard_staged(&staged).await?;
+                }
+                self.record.revision =
+                    self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
+                self.sync().await?;
                 return Err(error);
             }
         };
@@ -248,13 +305,20 @@ impl Controller {
         if self
             .services
             .runtime
-            .retains_checkpoint_files(&self.record.spec.runtime_class)
+            .retains_capture_files(&self.record.spec.runtime_class)
         {
-            self.recovery_files = Some(services.store.materialize(&artifact).await?);
+            self.hold_artifact(
+                artifact.clone(),
+                services.store.prepare_restore(&artifact).await?,
+            );
         }
+        self.record
+            .execution_artifacts
+            .retain(|a| a.size_bytes != 0);
         if let Some(previous) = self.record.checkpoint.take() {
             self.obsolete_checkpoints.push(previous.artifact);
         }
+        self.record.snapshot_source = None;
         self.record.checkpoint = Some(RestorePoint {
             id: id.clone(),
             artifact,

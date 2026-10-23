@@ -24,11 +24,11 @@ use std::{
 use afs_error::{Error, Result};
 use afs_tracing::tracing;
 use fuser::{
-    AccessFlags, BackgroundSession, Config, Errno, FileAttr, FileHandle as FuseFileHandle,
-    FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags, KernelConfig, LockOwner,
-    MountOption, OpenFlags, RenameFlags as FuseRenameFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen, ReplyStatfs, ReplyWrite,
-    ReplyXattr, Request, SessionACL, TimeOrNow, WriteFlags,
+    AccessFlags, BackgroundSession, Config, CopyFileRangeFlags, Errno, FileAttr,
+    FileHandle as FuseFileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags,
+    KernelConfig, LockOwner, MountOption, OpenFlags, RenameFlags as FuseRenameFlags, ReplyAttr,
+    ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyLock, ReplyOpen,
+    ReplyStatfs, ReplyWrite, ReplyXattr, Request, SessionACL, TimeOrNow, WriteFlags,
 };
 
 #[cfg(feature = "ownerfs")]
@@ -50,6 +50,7 @@ const MAX_INLINE_LOCAL_READ_SCRATCH: usize = 1024 * 1024;
 const PAGE_CACHE_IDENTITIES: usize = 65_536;
 const PAGE_CACHE_VERSION_BYTES: usize = 1024 * 1024;
 const PAGE_CACHE_INODE_GATES: usize = 64;
+const MAX_OWNED_WRITE_INPUT_BYTES: usize = 32 * 1024 * 1024;
 
 /// Explicit execution and DFS cache policy for one mounted FUSE session.
 /// OwnerFs consumes execution settings only; its private cache policy remains
@@ -247,6 +248,8 @@ fn complete_read_reply(
 pub struct FuseRequestMetrics {
     requests: afs_metrics::IntCounterVec,
     io_size_bytes: afs_metrics::HistogramVec,
+    copy_range_duration: afs_metrics::HistogramVec,
+    write_duration: afs_metrics::HistogramVec,
 }
 
 impl FuseRequestMetrics {
@@ -268,7 +271,31 @@ impl FuseRequestMetrics {
             )?;
             afs_metrics::register_collector(registry, &requests)?;
             afs_metrics::register_collector(registry, &io_size_bytes)?;
+            let copy_range_duration = afs_metrics::HistogramVec::new(
+                afs_metrics::HistogramOpts::new(
+                    "afs_fuse_copy_file_range_duration_seconds",
+                    "Dispatched copy_file_range queue and execution wall time.",
+                ),
+                &["filesystem", "stage"],
+            )?;
+            afs_metrics::register_collector(registry, &copy_range_duration)?;
+            let write_duration = afs_metrics::HistogramVec::new(
+                afs_metrics::HistogramOpts::new(
+                    "afs_fuse_write_duration_seconds",
+                    "Dispatched write admission queue and backend execution wall time, including failures.",
+                ).buckets(vec![0.0001, 0.001, 0.01, 0.1, 1.0, 5.0, 30.0, 60.0]),
+                &["filesystem", "source", "stage"],
+            )?;
+            afs_metrics::register_collector(registry, &write_duration)?;
             for filesystem in ["ownerfs", "dfs"] {
+                for source in ["page_cache", "write_call"] {
+                    for stage in ["queue", "execute"] {
+                        write_duration.with_label_values(&[filesystem, source, stage]);
+                    }
+                }
+                for stage in ["queue", "execute"] {
+                    copy_range_duration.with_label_values(&[filesystem, stage]);
+                }
                 for operation in FUSE_CALLBACKS {
                     requests.with_label_values(&[filesystem, operation]);
                 }
@@ -276,10 +303,7 @@ impl FuseRequestMetrics {
                     io_size_bytes.with_label_values(&[filesystem, operation]);
                 }
             }
-            Ok(Self {
-                requests,
-                io_size_bytes,
-            })
+            Ok(Self { requests, io_size_bytes, copy_range_duration, write_duration })
         })
     }
 
@@ -317,6 +341,7 @@ const FUSE_CALLBACKS: &[&str] = &[
     "open",
     "read",
     "write",
+    "copy_file_range",
     "flush",
     "release",
     "fsync",
@@ -777,11 +802,34 @@ struct FuseDispatchShared {
     drained: Condvar,
 }
 
+struct FuseWriteInput {
+    data: Vec<u8>,
+    shared: Arc<FuseDispatchShared>,
+}
+
+impl FuseWriteInput {
+    fn as_slice(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl Drop for FuseWriteInput {
+    fn drop(&mut self) {
+        let bytes = self.data.len();
+        drop(std::mem::take(&mut self.data));
+        if let Ok(mut queue) = self.shared.queue.lock() {
+            queue.write_input_bytes = queue.write_input_bytes.saturating_sub(bytes);
+        }
+        self.shared.capacity.notify_all();
+    }
+}
+
 struct FuseQueue {
     ready: VecDeque<(Option<FuseTurn>, FuseJob)>,
     waiting: HashMap<u64, VecDeque<(FuseAccess, FuseJob)>>,
     active: HashMap<u64, FuseActive>,
     jobs: usize,
+    write_input_bytes: usize,
     closed: bool,
 }
 
@@ -793,6 +841,7 @@ impl FuseDispatch {
                 waiting: HashMap::new(),
                 active: HashMap::new(),
                 jobs: 0,
+                write_input_bytes: 0,
                 closed: false,
             }),
             ready: Condvar::new(),
@@ -860,6 +909,25 @@ impl FuseDispatch {
         queue.jobs += 1;
         queue.ready.push_back((None, FuseJob::Owned(Box::new(job))));
         self.shared.ready.notify_one();
+    }
+
+    fn copy_write_input(&self, data: &[u8]) -> std::result::Result<FuseWriteInput, i32> {
+        if data.len() > MAX_OWNED_WRITE_INPUT_BYTES {
+            return Err(libc::E2BIG);
+        }
+        let mut queue = self.shared.queue.lock().map_err(|_| libc::EIO)?;
+        while data.len() > MAX_OWNED_WRITE_INPUT_BYTES - queue.write_input_bytes && !queue.closed {
+            queue = self.shared.capacity.wait(queue).map_err(|_| libc::EIO)?;
+        }
+        if queue.closed {
+            return Err(libc::EIO);
+        }
+        queue.write_input_bytes += data.len();
+        drop(queue);
+        Ok(FuseWriteInput {
+            data: data.to_vec(),
+            shared: self.shared.clone(),
+        })
     }
 
     fn submit_keyed(&self, key: u64, job: impl FnOnce() + Send + 'static) {
@@ -2061,9 +2129,12 @@ impl Filesystem for AfsFuse {
             .lock()
             .expect("FUSE handle state mutex poisoned")
             .file_handle(fh);
-        let admission = file.map_or(WriteAdmissionMode::Queued, |file| {
-            backend.write_admission_mode(file.handle)
-        });
+        let admission = fuse_write_admission(
+            file.map_or(WriteAdmissionMode::Queued, |file| {
+                backend.write_admission_mode(file.handle)
+            }),
+            write_flags,
+        );
         afs_logging::debug!(
             "FUSE write admission";
             "event" => "fuse_write_admission",
@@ -2094,8 +2165,38 @@ impl Filesystem for AfsFuse {
             queue_wait_us = tracing::field::Empty,
             returned_bytes = tracing::field::Empty,
         );
+        let input = if admission == WriteAdmissionMode::Queued {
+            let input = tracing::info_span!(
+                parent: &copy_span_parent,
+                "node.fuse.write.input_copy",
+                copied_bytes = data.len() as u64,
+            )
+            .in_scope(|| self.dispatch.copy_write_input(data));
+            match input {
+                Ok(input) => Some(input),
+                Err(error) => {
+                    reply.error(fuse_errno(error));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let cache_ids = self.page_cache_ids.clone();
+        let timing = self.requests.clone();
+        let source = if write_flags.contains(WriteFlags::FUSE_WRITE_CACHE) {
+            "page_cache"
+        } else {
+            "write_call"
+        };
         let run = move |data: &[u8]| {
+            if let Some((metrics, filesystem)) = &timing {
+                metrics
+                    .write_duration
+                    .with_label_values(&[filesystem, source, "queue"])
+                    .observe(enqueue_at.elapsed().as_secs_f64());
+            }
+            let executing = std::time::Instant::now();
             let result = fuse_span.in_scope(|| {
                 tracing::info_span!("node.fuse.write.execute").in_scope(|| {
                     fuse_span.record("queue_wait_us", enqueue_at.elapsed().as_micros() as u64);
@@ -2108,6 +2209,12 @@ impl Filesystem for AfsFuse {
                     })
                 })
             });
+            if let Some((metrics, filesystem)) = &timing {
+                metrics
+                    .write_duration
+                    .with_label_values(&[filesystem, source, "execute"])
+                    .observe(executing.elapsed().as_secs_f64());
+            }
             match result {
                 Ok(written) => match u32::try_from(written) {
                     Ok(written) => {
@@ -2123,20 +2230,81 @@ impl Filesystem for AfsFuse {
                 Err(error) => reply.error(fuse_errno(error)),
             }
         };
-        match admission {
-            WriteAdmissionMode::Borrowed => {
+        match input {
+            None => {
                 self.dispatch.run_borrowed_keyed(fh, || run(data));
             }
-            WriteAdmissionMode::Queued => {
-                let data = tracing::info_span!(
-                    parent: &copy_span_parent,
-                    "node.fuse.write.input_copy",
-                    copied_bytes = data.len() as u64,
-                )
-                .in_scope(|| data.to_vec());
-                self.dispatch.submit_keyed(fh, move || run(&data));
+            Some(data) => {
+                self.dispatch.submit_keyed(fh, move || run(data.as_slice()));
             }
         }
+    }
+
+    fn copy_file_range(
+        &self,
+        req: &Request,
+        ino_in: INodeNo,
+        fh_in: FuseFileHandle,
+        offset_in: u64,
+        ino_out: INodeNo,
+        fh_out: FuseFileHandle,
+        offset_out: u64,
+        len: u64,
+        flags: CopyFileRangeFlags,
+        reply: ReplyWrite,
+    ) {
+        self.record_request("copy_file_range");
+        if !flags.is_empty() {
+            reply.error(fuse_errno(libc::EINVAL));
+            return;
+        }
+        let backend = self.backend.clone();
+        let state = self.state.clone();
+        let context = Self::context(req, 0);
+        let queued = std::time::Instant::now();
+        let metrics = self.requests.clone();
+        self.dispatch.submit_keyed(fh_out.0, move || {
+            let _timer = metrics.as_ref().map(|(metrics, filesystem)| {
+                metrics
+                    .copy_range_duration
+                    .with_label_values(&[filesystem, "queue"])
+                    .observe(queued.elapsed().as_secs_f64());
+                metrics
+                    .copy_range_duration
+                    .with_label_values(&[filesystem, "execute"])
+                    .start_timer()
+            });
+            let result = (|| {
+                let (source, destination) = {
+                    let state = state.lock().unwrap();
+                    (
+                        state.file_handle(fh_in.0).ok_or(libc::ESTALE)?,
+                        state.file_handle(fh_out.0).ok_or(libc::ESTALE)?,
+                    )
+                };
+                AfsFuse::validate_handle_inode_in(&state, ino_in.0)?;
+                AfsFuse::validate_handle_inode_in(&state, ino_out.0)?;
+                backend
+                    .copy_file_range(
+                        &context,
+                        crate::node::vfs::types::CopyFileRange {
+                            source: source.handle,
+                            source_offset: offset_in,
+                            destination: destination.handle,
+                            destination_offset: offset_out,
+                            length: len,
+                        },
+                    )
+                    .map_err(errno)
+            })();
+            match result {
+                Ok(copied) => match u32::try_from(copied) {
+                    Ok(copied) => reply.written(copied),
+                    Err(_) => reply.error(fuse_errno(libc::EOVERFLOW)),
+                },
+                Err(error) => reply.error(fuse_errno(error)),
+            }
+        });
     }
 
     fn flush(
@@ -2807,6 +2975,17 @@ fn negotiated_init_flags(available: InitFlags) -> impl Iterator<Item = InitFlags
     requested_init_flags()
         .iter()
         .filter(move |capability| available.contains(*capability))
+}
+
+fn fuse_write_admission(mode: WriteAdmissionMode, flags: WriteFlags) -> WriteAdmissionMode {
+    // Kernel page writeback can wait for uploads/publication. Keep the FUSE
+    // receiver available for unrelated page faults; the owned bounded queue
+    // retains the same handle FIFO and the original backend acknowledgement.
+    if flags.contains(WriteFlags::FUSE_WRITE_CACHE) {
+        WriteAdmissionMode::Queued
+    } else {
+        mode
+    }
 }
 
 fn write_kill_suidgid(write_flags: WriteFlags) -> bool {
@@ -4246,6 +4425,106 @@ mod dispatch_tests {
         });
         dispatch.close_and_drain();
         assert_eq!(dispatch.shared.queue.lock().unwrap().jobs, 0);
+    }
+
+    #[test]
+    fn kernel_writeback_does_not_hold_the_fuse_receiver() {
+        use crate::node::vfs::WriteAdmissionMode;
+        let dispatch = Arc::new(FuseDispatch::new(2));
+        let receiver = dispatch.clone();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (progress, observed) = std::sync::mpsc::channel();
+        let (tail, tail_rx) = std::sync::mpsc::channel();
+        let receive = std::thread::spawn(move || {
+            let write = move || {
+                blocked.recv().unwrap();
+            };
+            match super::fuse_write_admission(
+                WriteAdmissionMode::Borrowed,
+                fuser::WriteFlags::FUSE_WRITE_CACHE,
+            ) {
+                WriteAdmissionMode::Borrowed => receiver.run_borrowed_keyed(51, write),
+                WriteAdmissionMode::Queued => receiver.submit_keyed(51, write),
+            }
+            receiver.submit_keyed(52, move || {
+                progress.send(()).unwrap();
+            });
+            receiver.submit_keyed(51, move || {
+                tail.send(()).unwrap();
+            });
+        });
+        let independent = observed.recv_timeout(Duration::from_secs(1));
+        let premature_sync = tail_rx.try_recv();
+        release.send(()).unwrap();
+        receive.join().unwrap();
+        let sync = tail_rx.recv_timeout(Duration::from_secs(1));
+        dispatch.close_and_drain();
+        assert!(
+            independent.is_ok(),
+            "kernel page writeback must not stop admission of another inode's page fault"
+        );
+        assert!(
+            premature_sync.is_err() && sync.is_ok(),
+            "same-handle fsync must remain behind the accepted write"
+        );
+    }
+
+    #[test]
+    fn owned_write_input_waits_for_bytes_before_copying() {
+        let dispatch = Arc::new(FuseDispatch::new(2));
+        let held = dispatch
+            .copy_write_input(&vec![7; super::MAX_OWNED_WRITE_INPUT_BYTES])
+            .unwrap();
+        let other = dispatch.clone();
+        let (progress, observed) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let input = other.copy_write_input(&[9]).unwrap();
+            progress.send(()).unwrap();
+            assert_eq!(input.as_slice(), &[9]);
+        });
+        let early = observed.recv_timeout(Duration::from_millis(100));
+        drop(held);
+        if early.is_err() {
+            observed.recv_timeout(Duration::from_secs(1)).unwrap();
+        }
+        writer.join().unwrap();
+        dispatch.close_and_drain();
+        assert!(
+            early.is_err(),
+            "owned write inputs must not exceed the byte budget"
+        );
+        assert_eq!(dispatch.shared.queue.lock().unwrap().write_input_bytes, 0);
+    }
+
+    #[test]
+    fn owned_write_input_shutdown_wakes_waiters_and_drops_unadmitted_body() {
+        let dispatch = Arc::new(FuseDispatch::new(2));
+        let held = dispatch
+            .copy_write_input(&vec![7; super::MAX_OWNED_WRITE_INPUT_BYTES])
+            .unwrap();
+        let other = dispatch.clone();
+        let (result, observed) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            result.send(other.copy_write_input(&[9]).err()).unwrap();
+        });
+        let early = observed.recv_timeout(Duration::from_millis(100));
+        dispatch.close_and_drain();
+        let error = match early {
+            Ok(error) => error,
+            Err(_) => observed.recv_timeout(Duration::from_secs(1)).unwrap(),
+        };
+        drop(held);
+        writer.join().unwrap();
+        assert_eq!(error, Some(libc::EIO));
+        assert_eq!(dispatch.shared.queue.lock().unwrap().write_input_bytes, 0);
+        let fresh = FuseDispatch::new(1);
+        let input = fresh.copy_write_input(&[1; 8]).unwrap();
+        fresh.close_and_drain();
+        fresh.submit_keyed(1, move || {
+            drop(input);
+            panic!("closed dispatcher ran backend work");
+        });
+        assert_eq!(fresh.shared.queue.lock().unwrap().write_input_bytes, 0);
     }
 
     #[test]

@@ -1,7 +1,11 @@
 import os
 import tempfile
 import unittest
+from unittest.mock import MagicMock
 
+import pytest
+
+from adx_environment._transport import EnvironmentHTTPError
 from adx_environment.filesystem import Filesystem
 
 
@@ -119,3 +123,88 @@ class FilesystemTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@pytest.mark.parametrize(
+    "code,exception",
+    [
+        ("FILE_NOT_FOUND", FileNotFoundError),
+        ("NOT_A_DIRECTORY", NotADirectoryError),
+        ("PERMISSION_DENIED", PermissionError),
+    ],
+)
+def test_list_preserves_typed_runtime_error(code, exception):
+    client = MagicMock()
+    error = EnvironmentHTTPError(400, {"error_code": code, "error": "detail"}, "detail")
+    client.invoke.side_effect = error
+    with pytest.raises(exception, match="/requested"):
+        Filesystem(client, "env").list("/requested")
+
+
+def test_list_does_not_reclassify_unknown_http_errors():
+    client = MagicMock()
+    error = EnvironmentHTTPError(400, {"error": "invalid request"}, "invalid request")
+    client.invoke.side_effect = error
+    with pytest.raises(EnvironmentHTTPError):
+        Filesystem(client, "env").list("/requested")
+
+
+def test_native_search_uses_one_remote_search_and_maps_entries():
+    client = MagicMock()
+    client.invoke.return_value = {
+        "entries": [
+            {
+                "name": "a.py",
+                "path": "/tree/a.py",
+                "type": "file",
+                "size": 2,
+                "permissions": "644",
+                "modified_time": 0.0,
+            }
+        ],
+        "error": None,
+    }
+    items = Filesystem(client, "env").search("/tree", "*.py", exclude_patterns=["test_*"], depth=3)
+    assert len(items) == 1 and items[0].path == "/tree/a.py"
+    client.invoke.assert_called_once_with(
+        "env",
+        "file.search",
+        {
+            "path": "/tree",
+            "pattern": "*.py",
+            "exclude_patterns": ["test_*"],
+            "depth": 3,
+            "max_results": 1000,
+            "max_entries": 100000,
+            "timeout_ms": 10000,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"depth": 0},
+        {"max_results": True},
+        {"max_results": 10001},
+        {"max_entries": 0},
+        {"timeout_ms": 30001},
+        {"exclude_patterns": "*.tmp"},
+        {"exclude_patterns": [1]},
+        {"pattern": None},
+    ],
+)
+def test_native_search_rejects_invalid_parameters_before_network(kwargs):
+    client = MagicMock()
+    with pytest.raises((ValueError, TypeError)):
+        Filesystem(client, "env").search("/tree", **kwargs)
+    client.invoke.assert_not_called()
+
+
+def test_native_search_does_not_hide_runtime_errors():
+    client = MagicMock()
+    client.invoke.side_effect = EnvironmentHTTPError(
+        429, {"error_code": "RESOURCE_EXHAUSTED"}, "search max_results exceeded"
+    )
+    with pytest.raises(EnvironmentHTTPError, match="max_results"):
+        Filesystem(client, "env").search("/tree")

@@ -2,7 +2,7 @@
 use super::resolver::AccessKind;
 use super::server::{Ingress, IngressOpenError, IngressStream};
 use adx_agent_api::{managed::ManagedService, request::RequestContext, Error};
-use adx_agent_core::{Protocol, Scope};
+use adx_agent_core::{BindingPhase, Protocol, Scope};
 use std::sync::Arc;
 
 #[derive(Clone, Copy)]
@@ -19,7 +19,7 @@ pub enum ServiceAccessError {
     Ingress(#[from] IngressOpenError),
 }
 
-/// Immutable routing identity plus the original request's one pre-write retry budget.
+/// Selected logical Binding plus the original request's one pre-write retry budget.
 /// Constructed only after ManagedService validates the scope and declared service.
 #[derive(Clone)]
 pub struct ServiceSelection {
@@ -30,6 +30,7 @@ pub struct ServiceSelection {
     environment_id: String,
     generation: String,
     retried: bool,
+    parameters: Option<Vec<u8>>,
 }
 impl ServiceSelection {
     pub(crate) fn deadline(&self) -> tokio::time::Instant {
@@ -50,6 +51,12 @@ impl ServiceSelection {
     }
 }
 
+/// Preserve a business initializer's authentication errors without coupling shared activation to it.
+pub enum InitializationError<E> {
+    Agent(Error),
+    Source(E),
+}
+
 #[derive(Clone)]
 pub struct AgentV2Access {
     managed: Arc<ManagedService>,
@@ -68,11 +75,25 @@ impl AgentV2Access {
         scope: Scope,
         selector: ServiceSelector,
     ) -> Result<ServiceSelection, Error> {
+        self.select_with_parameters(context, scope, selector, None)
+            .await
+    }
+    pub async fn select_with_parameters(
+        &self,
+        context: Arc<RequestContext>,
+        scope: Scope,
+        selector: ServiceSelector,
+        parameters: Option<&[u8]>,
+    ) -> Result<ServiceSelection, Error> {
         let (target, port) = context
-            .run(
-                self.managed
-                    .resolve(&context, &scope, selector.protocol, selector.port),
-            )
+            .run(self.managed.resolve_with_parameters(
+                &context,
+                &scope,
+                selector.protocol,
+                selector.port,
+                parameters,
+                false,
+            ))
             .await?;
         Ok(ServiceSelection {
             context,
@@ -82,17 +103,49 @@ impl AgentV2Access {
             environment_id: target.binding.environment_id,
             generation: target.binding.generation,
             retried: false,
+            parameters: parameters.map(<[u8]>::to_vec),
         })
     }
 
-    /// Refresh once after a failure known to precede business writes. Keeps the
-    /// original deadline and generation; deletion cannot silently create a new binding.
+    /// Business adapters provide parameters lazily; Binding decisions stay in the shared flow.
+    pub async fn select_with_initializer<F, E>(
+        &self,
+        context: Arc<RequestContext>,
+        scope: Scope,
+        selector: ServiceSelector,
+        initializer: F,
+    ) -> Result<ServiceSelection, InitializationError<E>>
+    where
+        F: std::future::Future<Output = Result<adx_agent_core::mounts::Parameters, E>>,
+    {
+        let parameters = match context.run(self.managed.binding(&context, &scope)).await {
+            Ok(_) => None,
+            Err(Error::NotFound) => {
+                let values = tokio::time::timeout_at(context.deadline(), initializer)
+                    .await
+                    .map_err(|_| {
+                        InitializationError::Agent(Error::Unavailable(
+                            "initialization deadline exceeded".into(),
+                        ))
+                    })?
+                    .map_err(InitializationError::Source)?;
+                Some(adx_agent_core::parameters::encode(&values))
+            }
+            Err(error) => return Err(InitializationError::Agent(error)),
+        };
+        self.select_with_parameters(context, scope, selector, parameters.as_deref())
+            .await
+            .map_err(InitializationError::Agent)
+    }
+
+    /// Refresh once before writes. WS admission may reselect a deleted/rebuilt Binding;
+    /// HTTP/SSH retain the original generation. All paths retain the original deadline.
     pub(crate) async fn retry(&self, selection: &mut ServiceSelection) -> Result<bool, Error> {
         if selection.retried {
             return Ok(false);
         }
         selection.retried = true;
-        let (target, port) = selection
+        let resolved = selection
             .context
             .run(self.managed.retry_resolve(
                 &selection.context,
@@ -101,8 +154,43 @@ impl AgentV2Access {
                 selection.port,
                 &selection.generation,
             ))
-            .await?;
+            .await;
+        let (target, port) = match resolved {
+            Err(error @ Error::Conflict(_)) if selection.protocol == Protocol::Ws => {
+                let changed = match selection
+                    .context
+                    .run(self.managed.binding(&selection.context, &selection.scope))
+                    .await
+                {
+                    Ok(binding) => {
+                        binding.scope == selection.scope
+                            && binding.phase == BindingPhase::Active
+                            && binding.generation != selection.generation
+                    }
+                    Err(Error::NotFound) => true,
+                    Err(error) => return Err(error),
+                };
+                if !changed {
+                    return Err(error);
+                }
+                // No WS handshake or business bytes have been sent. Reuse this
+                // admission's initialization input only if the Binding is missing.
+                selection
+                    .context
+                    .run(self.managed.resolve_with_parameters(
+                        &selection.context,
+                        &selection.scope,
+                        selection.protocol,
+                        Some(selection.port),
+                        selection.parameters.as_deref(),
+                        true,
+                    ))
+                    .await?
+            }
+            result => result?,
+        };
         selection.environment_id = target.binding.environment_id;
+        selection.generation = target.binding.generation;
         selection.port = port;
         Ok(true)
     }

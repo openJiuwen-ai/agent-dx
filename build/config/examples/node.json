@@ -45,12 +45,6 @@
   },
   "metrics_listen": "127.0.0.1:19091",
   "runtime_ready_timeout_seconds": 120,
-  "checkpoint_gc": {
-    "enabled": true,
-    "min_age_seconds": 86400,
-    "interval_seconds": 300,
-    "max_artifacts": 100
-  },
   "runtime_profile": {
     "rootfs": {
       "runtime_class": "runsc",

@@ -141,6 +141,8 @@ impl IngressRouteResolver {
         self
     }
     pub async fn wake(&self, route: &RouteHandle) -> Result<RouteHandle, ResolveError> {
+        let started = std::time::Instant::now();
+        let mut ensure_running_ms = 0.0;
         let deadline = route.processing.clone().unwrap_or_default();
         deadline.waiting_resume();
         let _permit = self
@@ -156,6 +158,7 @@ impl IngressRouteResolver {
                 .ok_or(ResolveError::NotFound)?
                 .ensure_running(&wake_route)
                 .await?;
+            ensure_running_ms = started.elapsed().as_secs_f64() * 1_000.0;
             let mut changes = self.store.subscribe();
             loop {
                 if !self.store.ready() {
@@ -188,6 +191,15 @@ impl IngressRouteResolver {
         .await
         .map_err(|_| ResolveError::Resuming)??;
         deadline.prepared();
+        adx_observability::info!(
+            event = "environment_ingress_wake_stages",
+            environment_id = %route.target.instance_id,
+            request_id = %route.target.request_id,
+            ensure_running_ms,
+            route_wait_ms = started.elapsed().as_secs_f64() * 1_000.0 - ensure_running_ms,
+            total_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            "ingress wake stages completed"
+        );
         Ok(ready)
     }
 

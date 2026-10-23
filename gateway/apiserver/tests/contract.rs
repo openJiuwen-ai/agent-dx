@@ -422,12 +422,17 @@ fn constructor_cwd_is_preserved_and_invalid_paths_are_rejected() {
 #[test]
 fn local_mount_accepts_both_spellings_and_preserves_rw() {
     for field in ["host_path", "hostPath"] {
-        let mut mount = json!({"type":"bind","target":"/home/jiuwen","options":["rw"],"create_if_missing":true});
+        let mut mount = json!({"type":"bind","target":"/home/jiuwen","options":["rw"],"create_if_missing":true,"create_options":{"uid":10001,"gid":10001,"mode":"0700"}});
         mount[field] = json!("/mnt/sfs/workspaces/user-a");
         let spec = create_spec(json!({"image":"app", "mounts":[mount]}), &caller()).unwrap();
         let mounts = spec.execution.unwrap().mounts;
         assert_eq!(mounts[0].options, ["rw"]);
         assert!(mounts[0].create_if_missing);
+        let creation = mounts[0].create_options.as_ref().unwrap();
+        assert_eq!(
+            (creation.uid, creation.gid, creation.mode.as_str()),
+            (10001, 10001, "0700")
+        );
         assert!(
             matches!(mounts[0].source.as_ref().unwrap().source.as_ref().unwrap(),
             pb::storage_source::Source::Local(path) if path == "/mnt/sfs/workspaces/user-a")
@@ -483,11 +488,97 @@ fn local_mount_rejects_relative_traversal_and_control_characters() {
 }
 
 #[test]
-fn directory_creation_rejects_non_local_or_non_bind_mounts() {
+fn directory_creation_rejects_invalid_sources_and_attributes() {
     for mount in [
         json!({"type":"bind","target":"/data","image_url":"app","create_if_missing":true}),
         json!({"type":"erofs","target":"/data","host_path":"/mnt/sfs/data","create_if_missing":true}),
+        json!({"type":"bind","target":"/data","host_path":"/mnt/sfs/data","create_options":{"uid":10001,"gid":10001,"mode":"0700"}}),
     ] {
         assert!(create_spec(json!({"image":"app","mounts":[mount]}), &caller()).is_err());
+    }
+    for options in [
+        json!({"uid":-1,"gid":10001,"mode":"0700"}),
+        json!({"uid":4294967295u64,"gid":10001,"mode":"0700"}),
+        json!({"uid":10001,"gid":4294967295u64,"mode":"0700"}),
+        json!({"uid":10001,"gid":10001,"mode":"755"}),
+        json!({"uid":10001,"gid":10001,"mode":"0788"}),
+        json!({"uid":10001,"gid":10001,"mode":"1777"}),
+        json!({"uid":10001,"mode":"0700"}),
+    ] {
+        let mount = json!({"type":"bind","target":"/data","host_path":"/mnt/sfs/data","create_if_missing":true,"create_options":options});
+        assert_eq!(
+            create_spec(json!({"image":"app","mounts":[mount]}), &caller())
+                .unwrap_err()
+                .code(),
+            tonic::Code::InvalidArgument
+        );
+    }
+}
+
+#[test]
+fn tunnel_listener_configuration_cannot_be_supplied_through_user_environment() {
+    for key in ["EXECD_TUNNEL_WS_PORT", "EXECD_TUNNEL_HTTP_PORT"] {
+        assert!(
+            create_spec(json!({"image":"image", "env":{key:"12345"}}), &caller()).is_err(),
+            "accepted {key}"
+        );
+    }
+}
+
+#[test]
+fn tunnel_configuration_is_not_stored_in_untrusted_environment() {
+    let spec = create_spec(
+        json!({"image":"image", "tunnel":{"enabled":true,"proxyPort":18766}}),
+        &caller(),
+    )
+    .unwrap();
+    assert!(!spec.env.contains_key("EXECD_TUNNEL_WS_PORT"));
+    assert!(!spec.env.contains_key("EXECD_TUNNEL_HTTP_PORT"));
+}
+
+#[test]
+fn tunnel_listeners_roundtrip_with_default_and_custom_ports() {
+    for (input, expected) in [(0, 8766), (18766, 18766)] {
+        let spec = create_spec(json!({"image":"image", "tunnel":{"enabled":true,"proxyPort":input},"network":{"blockNetwork":true}}), &caller()).unwrap();
+        let options: adx_core::execution::ExecutionOptions =
+            spec.execution.unwrap().try_into().unwrap();
+        assert_eq!(options.tunnel_http_port, Some(expected));
+        let wire: pb::ExecutionOptions = options.clone().into();
+        let restored: adx_core::execution::ExecutionOptions = wire.try_into().unwrap();
+        assert_eq!(restored, options);
+    }
+    for request in [
+        json!({"image":"image","tunnel":{"enabled":true,"proxyPort":65536}}),
+        json!({"image":"image","tunnel":{"enabled":true,"proxyPort":50090}}),
+        json!({"image":"image","tunnel":{"enabled":true,"proxyPort":50091}}),
+        json!({"image":"image","tunnel":{"enabled":true},"ports":["8765"]}),
+        json!({"image":"image","tunnel":{"enabled":true},"network":{"schemaVersion":2,"traffic":{"ingressDefaultAction":"deny","egressDefaultAction":"deny","mode":"stateless","rules":[]}}}),
+    ] {
+        assert!(
+            create_spec(request.clone(), &caller()).is_err(),
+            "accepted {request}"
+        );
+    }
+}
+
+#[test]
+fn tool_identity_is_preserved_and_invalid_pairs_are_rejected() {
+    let spec = create_spec(
+        json!({"image":"tools:1","runtime":"conch","user":"1001","group":"1002"}),
+        &caller(),
+    )
+    .unwrap();
+    let execution = spec.execution.unwrap();
+    assert_eq!(execution.user.as_deref(), Some("1001"));
+    assert_eq!(execution.group.as_deref(), Some("1002"));
+    for body in [
+        json!({"image":"tools:1","user":"1001"}),
+        json!({"image":"tools:1","group":"1002"}),
+        json!({"image":"tools:1","user":"","group":"1002"}),
+        json!({"image":"tools:1","user":"a:b","group":"1002"}),
+        json!({"image":"tools:1","user":"4294967295","group":"1002"}),
+        json!({"image":"tools:1","user":"1001","group":"1002","inheritEntrypoint":true}),
+    ] {
+        assert!(create_spec(body.clone(), &caller()).is_err(), "{body}");
     }
 }

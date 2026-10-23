@@ -24,6 +24,11 @@ pub enum Error {
     Invalid(String),
     #[error("request conflicts with existing state")]
     Conflict,
+    #[error("snapshot is in use by sandboxes {sandbox_ids:?} or templates {template_ids:?}")]
+    SnapshotInUse {
+        sandbox_ids: Vec<String>,
+        template_ids: Vec<String>,
+    },
     #[error("insufficient resources or node admission closed")]
     NoCapacity,
     #[error("record not found")]
@@ -74,6 +79,7 @@ pub struct Resources {
 }
 
 impl Resources {
+    /// Validate a resource request. Observed node capacities may contain zeros.
     pub fn validate(&self) -> Result<()> {
         if self.cpu_millis == 0 || self.memory_bytes == 0 {
             return Err(Error::Invalid("CPU and memory must be positive".into()));
@@ -184,6 +190,11 @@ impl EnvironmentSpec {
         } else if self.image.trim().is_empty() && self.execution.rootfs.is_none() {
             return Err(Error::Invalid(
                 "image or runtime environment is required".into(),
+            ));
+        }
+        if self.snapshot_id.is_some() && self.execution.user.is_some() {
+            return Err(Error::Invalid(
+                "tool identity cannot override a snapshot".into(),
             ));
         }
         self.lifecycle.validate()?;
@@ -361,6 +372,13 @@ pub struct EnvironmentRecord {
     pub resources_held: bool,
     #[serde(default)]
     pub checkpoint: Option<RestorePoint>,
+    /// Files used or reserved by the execution, independently of its latest recovery point.
+    /// Size zero reserves an incomplete capture; such inputs are never eligible for restore.
+    #[serde(default)]
+    pub execution_artifacts: Vec<CheckpointArtifact>,
+    /// Borrowed reusable snapshot; it is not an Environment-owned anonymous checkpoint.
+    #[serde(default)]
+    pub snapshot_source: Option<RestorePoint>,
     #[serde(default)]
     pub last_operation: Option<CompletedOperation>,
 }

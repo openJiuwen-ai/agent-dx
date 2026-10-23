@@ -236,9 +236,8 @@ async fn authenticated_services_observe_binding_deletion_and_recreation() {
 }
 
 #[tokio::test]
-async fn private_launch_configuration_crosses_only_authenticated_control_api() {
-    use adx_agent_api::activator::Control;
-    let state = AgentState::new(Arc::new(MemoryRepository::default())).with_credential_key([4; 32]);
+async fn initialization_crosses_authenticated_activation_api() {
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let activator = Arc::new(Activator::new(
         state,
         Arc::new(Backend(AtomicUsize::new(0))),
@@ -257,17 +256,17 @@ async fn private_launch_configuration_crosses_only_authenticated_control_api() {
         version: "1".into(),
         binding_id: "private".into(),
     };
-    let launch = adx_agent_core::launch::LaunchConfig {
-        credential_version: "1".into(),
-        env: std::collections::BTreeMap::from([("API_KEY".into(), "sk-private".into())]),
-    };
-    let parameters = std::collections::BTreeMap::from([("workspace".into(), "w-user".into())]);
+    let parameters = adx_agent_core::parameters::encode(&std::collections::BTreeMap::from([(
+        "workspace".into(),
+        "w-user".into(),
+    )]));
     let response = reqwest::Client::new()
-        .post(format!("{url}/internal/adx/v1/bindings/prepare"))
-        .json(&adx_agent_core::activator::PrepareBindingRequest {
+        .post(format!("{url}/internal/adx/v1/bindings/activate"))
+        .json(&adx_agent_core::activator::ActivationRequest {
             scope: scope.clone(),
-            launch: launch.clone(),
-            parameters: parameters.clone(),
+            expected_generation: None,
+            bypass_cache: false,
+            parameters: Some(parameters.clone()),
         })
         .send()
         .await
@@ -276,17 +275,15 @@ async fn private_launch_configuration_crosses_only_authenticated_control_api() {
     let client =
         ActivatorClient::new(vec![url], TOKEN.into(), Duration::from_secs(3), None, true).unwrap();
     let binding = client
-        .prepare_binding(&context(), &scope, &launch, &parameters)
+        .activate_with_parameters(&context(), &scope, None, false, Some(&parameters))
         .await
-        .unwrap();
-    assert_eq!(binding.parameters, parameters);
-    assert_eq!(client.binding(&context(), &scope).await.unwrap(), binding);
-    assert!(!serde_json::to_string(&binding)
         .unwrap()
-        .contains("sk-private"));
+        .binding;
+    assert_eq!(binding.parameters["workspace"], "w-user");
+    assert_eq!(client.binding(&context(), &scope).await.unwrap(), binding);
     assert_eq!(
         client
-            .activate(&context(), &scope, None)
+            .activate_with_parameters(&context(), &scope, None, true, Some(b"%invalid"))
             .await
             .unwrap()
             .binding,

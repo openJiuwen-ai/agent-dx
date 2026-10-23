@@ -1,3 +1,7 @@
+use afs::meta::store::{
+    journal::{LogLimits, LogTip, RecoveredLog},
+    log::Record,
+};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -8,8 +12,7 @@ use afs::{
         Meta, rest,
         rpc::MetaRpc,
         store::{
-            BackendPersistence, MetaFuture, Store, StoreBackend, local_file::LocalFileBackend,
-            memory::MemoryBackend,
+            BackendPersistence, MetaFuture, MetaLog, Store, journal::MemoryLog, local_log::LocalLog,
         },
     },
     node::rpc::meta::{MetaPersistenceCapability, registration_readiness_from_reply},
@@ -27,9 +30,8 @@ use serde_json::Value;
 use tonic::Request as GrpcRequest;
 use tower::ServiceExt;
 
-#[derive(Default)]
 struct SwitchableBackend {
-    inner: MemoryBackend,
+    inner: MemoryLog,
     reject_load: AtomicBool,
     persistence: Option<BackendPersistence>,
 }
@@ -47,34 +49,39 @@ impl SwitchableBackend {
     }
 }
 
-impl StoreBackend for SwitchableBackend {
-    fn persistence(&self) -> BackendPersistence {
-        self.persistence.unwrap_or(BackendPersistence::Unknown)
+impl MetaLog for SwitchableBackend {
+    fn persistence(&self) -> afs::meta::store::BackendPersistence {
+        self.persistence
+            .unwrap_or(afs::meta::store::BackendPersistence::Unknown)
     }
-
-    fn load(&self) -> MetaFuture<'_, Option<(u64, Vec<u8>)>> {
+    fn limits(&self) -> LogLimits {
+        self.inner.limits()
+    }
+    fn recover(&self) -> MetaFuture<'_, RecoveredLog> {
+        self.inner.recover()
+    }
+    fn append_and_sync(&self, expected: LogTip, records: Vec<Record>) -> MetaFuture<'_, LogTip> {
+        self.inner.append_and_sync(expected, records)
+    }
+    fn health(&self) -> MetaFuture<'_, ()> {
         Box::pin(async move {
             if self.reject_load.load(Ordering::Acquire) {
                 Err(afs_error::Error::coded(
                     afs_error::IO_UNAVAILABLE,
-                    "injected backend load failure",
+                    "injected backend read failure",
                 ))
             } else {
-                self.inner.load().await
+                self.inner.health().await
             }
         })
     }
-
-    fn commit(&self, expected_version: u64, bytes: Vec<u8>) -> MetaFuture<'_, u64> {
-        self.inner.commit(expected_version, bytes)
-    }
 }
 
-async fn meta_with_backend(backend: Arc<dyn StoreBackend>) -> Arc<Meta> {
+async fn meta_with_backend(backend: Arc<dyn MetaLog>) -> Arc<Meta> {
     Arc::new(Meta::with_store(
         "meta-capability-test".into(),
         Observability::new().unwrap(),
-        Arc::new(Store::open(backend).await.unwrap()),
+        Arc::new(Store::open_log(backend).await.unwrap()),
     ))
 }
 
@@ -123,7 +130,7 @@ async fn get_json(meta: Arc<Meta>, path: &str) -> (StatusCode, Value) {
 
 #[tokio::test]
 async fn memory_backend_is_healthy_but_not_persistent_ready() {
-    let meta = meta_with_backend(Arc::new(MemoryBackend::default())).await;
+    let meta = meta_with_backend(Arc::new(MemoryLog::new(Default::default()).unwrap())).await;
 
     let reply = register(meta.clone(), "session-memory").await;
     assert!(reply.lease_remaining_ms > 0);
@@ -146,7 +153,10 @@ async fn memory_backend_is_healthy_but_not_persistent_ready() {
 #[tokio::test]
 async fn local_file_backend_reports_persistent_ready_after_probe() {
     let dir = tempfile::tempdir().unwrap();
-    let meta = meta_with_backend(Arc::new(LocalFileBackend::open(dir.path()).unwrap())).await;
+    let meta = meta_with_backend(Arc::new(
+        LocalLog::open(dir.path(), Default::default()).unwrap(),
+    ))
+    .await;
 
     let reply = register(meta.clone(), "session-local-file").await;
     assert_eq!(
@@ -264,6 +274,16 @@ fn client_normalizes_contradictory_register_readiness_fail_closed() {
                 decoded.meta_backend_persistence,
                 MetaPersistenceCapability::Unknown
             );
+        }
+    }
+}
+
+impl Default for SwitchableBackend {
+    fn default() -> Self {
+        Self {
+            inner: MemoryLog::new(Default::default()).unwrap(),
+            reject_load: AtomicBool::new(false),
+            persistence: None,
         }
     }
 }

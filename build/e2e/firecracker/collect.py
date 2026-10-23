@@ -12,7 +12,7 @@ for name in ('api-key', 'admin-key', 'other-key', 'redis-key', 's3-user', 's3-ke
     path = root / 'secrets' / name
     if path.exists():
         secrets.append(path.read_bytes().strip())
-for directory in ('evidence', 'state/logs', 'runtime-logs'):
+for directory in ('evidence', 'state/logs', 'runtime-logs', 'ingress2/state/logs'):
     source = root / directory
     if not source.exists():
         continue

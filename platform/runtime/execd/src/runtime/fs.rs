@@ -37,14 +37,25 @@ fn encode_hex(bytes: &[u8]) -> String {
 
 /// EntryInfo has six fields: name/path/type/size/permissions/modified_time.
 fn entry_fields(path: &str) -> Vec<(&'static str, Value)> {
+    entry_fields_impl(path, fs::symlink_metadata(path).ok().as_ref())
+}
+
+pub(super) fn entry_fields_from_metadata(
+    path: &str,
+    metadata: &fs::Metadata,
+) -> Vec<(&'static str, Value)> {
+    entry_fields_impl(path, Some(metadata))
+}
+
+fn entry_fields_impl(path: &str, metadata: Option<&fs::Metadata>) -> Vec<(&'static str, Value)> {
     let p = Path::new(path);
     let name = p
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_string();
-    let (typ, size, perms, mtime) = match fs::symlink_metadata(p) {
-        Ok(m) => {
+    let (typ, size, perms, mtime) = match metadata {
+        Some(m) => {
             let typ = if m.is_dir() {
                 "dir"
             } else if m.file_type().is_symlink() {
@@ -67,7 +78,7 @@ fn entry_fields(path: &str) -> Vec<(&'static str, Value)> {
                 .unwrap_or(0.0);
             (typ, m.len() as i64, perms, mtime)
         }
-        Err(_) => ("file", 0, String::from("0"), 0.0),
+        None => ("file", 0, String::from("0"), 0.0),
     };
     vec![
         ("name", Value::from(name)),
@@ -219,10 +230,19 @@ pub fn fs_list(kw: &BTreeMap<String, Value>) -> Value {
     let mut entries = Vec::new();
     match collect_entries(Path::new(&path), depth, &mut entries) {
         Ok(()) => map_value(vec![("entries", Value::Array(entries)), ("error", nil())]),
-        Err(e) => map_value(vec![
-            ("entries", Value::Array(vec![])),
-            ("error", err(e.to_string())),
-        ]),
+        Err(e) => {
+            let code = match e.kind() {
+                std::io::ErrorKind::NotFound => "FILE_NOT_FOUND",
+                std::io::ErrorKind::NotADirectory => "NOT_A_DIRECTORY",
+                std::io::ErrorKind::PermissionDenied => "PERMISSION_DENIED",
+                _ => "FILESYSTEM_ERROR",
+            };
+            map_value(vec![
+                ("entries", Value::Array(vec![])),
+                ("error_code", Value::from(code)),
+                ("error", err(format!("Failed to list {path}: {e}"))),
+            ])
+        }
     }
 }
 

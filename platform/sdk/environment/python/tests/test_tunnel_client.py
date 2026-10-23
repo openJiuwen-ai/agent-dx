@@ -801,6 +801,68 @@ class TunnelClientRelayCleanupTests(unittest.IsolatedAsyncioTestCase):
         await self._check_relay_cleanup(cancel_proxy=True)
 
 
+class TunnelClientReconnectTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reconnect_is_safe_without_an_active_running_tunnel(self):
+        for state in ("not-started", "disconnected", "loop-stopped", "stopping"):
+            with self.subTest(state=state):
+                client = TunnelClient("127.0.0.1:1")
+                loop, ws = mock.Mock(), mock.Mock()
+                loop.is_running.return_value = state != "loop-stopped"
+                client._loop = None if state == "not-started" else loop
+                client._ws = None if state == "disconnected" else ws
+                if state == "stopping":
+                    client._stopping.set()
+                client.reconnect()
+                loop.call_soon_threadsafe.assert_not_called()
+                ws.transport.abort.assert_not_called()
+
+    async def test_reconnect_replaces_unresponsive_ws_without_restarting_session(self):
+        connected = asyncio.Queue()
+        peers = []
+
+        async def peer(ws):
+            hello = json.loads(await ws.recv())
+            peers.append(ws)
+            if len(peers) == 1:
+                # An invalidated return path cannot acknowledge a WS close.
+                ws.transport.pause_reading()
+            await connected.put(hello)
+            await ws.wait_closed()
+
+        client = TunnelClient("127.0.0.1:1", ping_interval=3600, ping_timeout=3600)
+        async with serve(peer, "127.0.0.1", 0, ping_interval=None) as server:
+            url = f"ws://127.0.0.1:{server.sockets[0].getsockname()[1]}"
+            try:
+                self.assertTrue(await asyncio.to_thread(client.start, url, 2))
+                first = await asyncio.wait_for(connected.get(), 2)
+                state, http = client._resume_state, client._http_client
+                client.reconnect()
+                second = await asyncio.wait_for(connected.get(), 4)
+                self.assertEqual(second["session_id"], first["session_id"])
+                self.assertIs(client._resume_state, state)
+                self.assertIs(client._http_client, http)
+                self.assertFalse(client._stopping.is_set())
+            finally:
+                for ws in peers:
+                    ws.transport.resume_reading()
+                await asyncio.to_thread(client.stop)
+
+    async def test_delayed_reconnect_only_retires_the_captured_connection(self):
+        client = TunnelClient("127.0.0.1:1")
+        loop = mock.Mock()
+        loop.is_running.return_value = True
+        old, replacement = mock.Mock(), mock.Mock()
+        client._loop, client._ws = loop, old
+        client.reconnect()
+        client._ws = replacement
+        callback = loop.call_soon_threadsafe.call_args.args[0]
+        callback()
+        old.transport.abort.assert_called_once_with()
+        replacement.transport.abort.assert_not_called()
+        loop.call_soon_threadsafe.side_effect = RuntimeError("event loop is closed")
+        client.reconnect()  # Concurrent shutdown must not fail an applied policy.
+
+
 class TunnelClientHeartbeatTests(unittest.IsolatedAsyncioTestCase):
     async def test_sends_application_ping_and_accepts_matching_pong(self):
         websocket = _FrameWebSocket()

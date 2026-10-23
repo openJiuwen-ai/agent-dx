@@ -729,21 +729,36 @@ impl OwnerRootsService for OwnerRootsRpc {
         let request = request.into_inner();
         require_text(&request.node_id, "node_id")?;
         require_text(&request.session_id, "session_id")?;
-        let commands = self
+        let ownership = self
             .0
-            .owner_roots
-            .watch_root_commands(super::owner_roots::WatchRootCommandsInput {
-                node_id: request.node_id,
-                session_id: request.session_id,
-                after_revision: request.after_revision,
-            })
-            .await
+            .watch_budget
+            .reserve()
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        let commands = tokio::time::timeout_at(
+            ownership.deadline,
+            self.0
+                .owner_roots
+                .watch_root_commands(super::owner_roots::WatchRootCommandsInput {
+                    node_id: request.node_id,
+                    session_id: request.session_id,
+                    after_revision: request.after_revision,
+                }),
+        )
+        .await
+        .map_err(|_| {
+            afs_transport::grpc::error_status::error_to_status(super::watch::unavailable(
+                "watch response construction expired",
+            ))
+        })?
+        .map_err(afs_transport::grpc::error_status::error_to_status)?;
         let commands = commands
             .into_iter()
-            .map(|command| Ok(command_from_record(command.command, command.revision)))
+            .map(|command| command_from_record(command.command, command.revision))
             .collect::<Vec<_>>();
-        Ok(Response::new(Box::pin(tokio_stream::iter(commands))))
+        let stream = ownership
+            .stream(commands)
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(Box::pin(stream)))
     }
 
     async fn poll_root_command_batch(
@@ -762,17 +777,39 @@ impl OwnerRootsService for OwnerRootsRpc {
                 request.node_id
             )));
         }
-        let batch = self
+        let ownership = self
             .0
-            .owner_roots
-            .poll_root_command_batch(super::owner_roots::WatchRootCommandsInput {
-                node_id: request.node_id,
-                session_id: request.session_id,
-                after_revision: request.after_revision,
-            })
-            .await
+            .watch_budget
+            .reserve()
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
-        Ok(Response::new(root_command_batch_reply_from_domain(batch)))
+        let batch = tokio::time::timeout_at(
+            ownership.deadline,
+            self.0.owner_roots.poll_root_command_batch(
+                super::owner_roots::WatchRootCommandsInput {
+                    node_id: request.node_id,
+                    session_id: request.session_id,
+                    after_revision: request.after_revision,
+                },
+            ),
+        )
+        .await
+        .map_err(|_| {
+            afs_transport::grpc::error_status::error_to_status(super::watch::unavailable(
+                "watch poll construction expired",
+            ))
+        })?
+        .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        let reply = root_command_batch_reply_from_domain(batch);
+        if let Some(afs_protocol::meta::root_command_batch_reply::Result::Events(events)) =
+            &reply.result
+        {
+            super::watch::wire_charge(&events.commands)
+                .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        }
+        ownership
+            .check()
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(reply))
     }
 
     async fn ack_revocation(
@@ -855,6 +892,103 @@ impl OwnerRootsService for OwnerRootsRpc {
 
 #[tonic::async_trait]
 impl DfsMetaService for DfsMetaRpc {
+    async fn update_gc_reference(
+        &self,
+        request: Request<afs_protocol::meta::UpdateDfsGcReferenceRequest>,
+    ) -> Result<Response<afs_protocol::meta::UpdateDfsGcReferenceReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.node_id)?;
+        if request.capture_gc_fence
+            && (request.release
+                || !request.publication
+                || request.inode_id.is_empty()
+                || !request.chunks.is_empty())
+        {
+            return Err(Status::invalid_argument(
+                "GC fence requires initial publication retain",
+            ));
+        }
+        let observation = if request.release {
+            "dfs_gc_release"
+        } else if !request.chunks.is_empty() {
+            "dfs_gc_register"
+        } else if request.capture_gc_fence {
+            "dfs_gc_capture"
+        } else {
+            "dfs_gc_retain"
+        };
+        let capture = request.capture_gc_fence;
+        let generation = request.reference_id.starts_with("write:");
+        let service = dfs_service(&self.0)?;
+        service
+            .update_gc_reference(crate::dfs::UpdateGcReference {
+                node_id: request.node_id,
+                session_id: request.session_id,
+                reference_id: request.reference_id,
+                inode_id: optional_id(request.inode_id).map(crate::dfs::InodeId::new),
+                version_id: optional_id(request.version_id).map(crate::dfs::FileVersionId::new),
+                publication: request.publication,
+                chunks: request
+                    .chunks
+                    .into_iter()
+                    .map(domain_chunk_object)
+                    .collect::<Result<Vec<_>, _>>()?,
+                release: request.release,
+                admission_deadline_unix_ms: request.admission_deadline_unix_ms,
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        // No payload is admitted by the Node until this response is received.
+        let gc_fence = if capture {
+            Some(
+                (if generation {
+                    crate::dfs::GcFence::WriteGeneration
+                } else {
+                    service
+                        .current_gc_fence()
+                        .await
+                        .map_err(afs_transport::grpc::error_status::error_to_status)?
+                })
+                .wire(),
+            )
+        } else {
+            None
+        };
+        self.0.observability.record("meta", observation, true);
+        Ok(Response::new(
+            afs_protocol::meta::UpdateDfsGcReferenceReply { gc_fence },
+        ))
+    }
+    async fn collect_garbage(
+        &self,
+        request: Request<afs_protocol::meta::CollectDfsGarbageRequest>,
+    ) -> Result<Response<afs_protocol::meta::CollectDfsGarbageReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.node_id)?;
+        let node = request.node_id.clone();
+        let state = dfs_service(&self.0)?
+            .collect_garbage(
+                request.node_id,
+                request.session_id,
+                request.completed_generation,
+                request
+                    .inventory
+                    .into_iter()
+                    .map(domain_chunk_object)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        self.0.observability.record("meta", "dfs_gc_collect", true);
+        Ok(Response::new(afs_protocol::meta::CollectDfsGarbageReply {
+            generation: state.generation,
+            pending_for_node: state.waiting_nodes.contains(&node),
+            chunk_ids: state.chunks.into_iter().map(|id| id.0).collect(),
+        }))
+    }
+
     async fn lookup(
         &self,
         request: Request<DfsLookupRequest>,
@@ -1222,7 +1356,7 @@ impl DfsMetaService for DfsMetaRpc {
         let _authenticated = authenticated_node_id(&self.0, &request)?;
         let request = request.into_inner();
         require_text(&request.inode_id, "inode_id")?;
-        let value = dfs_service(&self.0)?
+        let result = dfs_service(&self.0)?
             .get_xattr(crate::dfs::GetXattrRequest {
                 caller: domain_caller_context(
                     request
@@ -1232,8 +1366,11 @@ impl DfsMetaService for DfsMetaRpc {
                 inode_id: crate::dfs::InodeId::new(request.inode_id),
                 name: request.name,
             })
-            .await
-            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+            .await;
+        self.0
+            .observability
+            .record("meta", "dfs_get_xattr", result.is_ok());
+        let value = result.map_err(afs_transport::grpc::error_status::error_to_status)?;
         Ok(Response::new(DfsGetXattrReply { value }))
     }
 
@@ -1914,6 +2051,11 @@ impl DfsMetaService for DfsMetaRpc {
             .commit_file_version(
                 request.caller_id,
                 crate::dfs::CommitFileVersion {
+                    gc_fence: request
+                        .gc_fence
+                        .map(crate::dfs::GcFence::from_wire)
+                        .transpose()
+                        .map_err(afs_transport::grpc::error_status::error_to_status)?,
                     operation_id: crate::dfs::OperationId::new(request.operation_id),
                     inode_id: crate::dfs::InodeId::new(request.inode_id),
                     write_lease,
@@ -1923,11 +2065,22 @@ impl DfsMetaService for DfsMetaRpc {
                     file_version: version,
                     layout_root: layout,
                     chunk_receipts: receipts,
+                    clone_source: request
+                        .clone_source
+                        .map(|source| crate::dfs::CloneFileRange {
+                            version: crate::dfs::FileVersionId::new(source.version_id),
+                            source_offset: source.source_offset,
+                            destination_offset: source.destination_offset,
+                            length: source.length,
+                        }),
                     metadata_delta,
                 },
             )
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        self.0
+            .observability
+            .record("meta", "dfs_commit_file_version", true);
         Ok(Response::new(CommitFileVersionReply {
             inode: Some(wire_dfs_inode(inode)),
         }))
@@ -2161,6 +2314,9 @@ fn wire_replica_write_grant(
             crate::dfs::DigestAlgorithm::Blake3 => {
                 afs_protocol::meta::DfsDigestAlgorithm::Blake3 as i32
             }
+            crate::dfs::DigestAlgorithm::Crc32cSegmentsV1 => {
+                afs_protocol::meta::DfsDigestAlgorithm::Crc32cSegmentsV1 as i32
+            }
         },
         placement_revision: grant.placement_revision,
         placement_epoch: grant.placement_epoch,
@@ -2182,6 +2338,9 @@ fn wire_chunk_object(chunk: crate::dfs::ChunkObject) -> afs_protocol::meta::DfsC
         content_digest_algorithm: match chunk.content_digest.algorithm {
             crate::dfs::DigestAlgorithm::Blake3 => {
                 afs_protocol::meta::DfsDigestAlgorithm::Blake3 as i32
+            }
+            crate::dfs::DigestAlgorithm::Crc32cSegmentsV1 => {
+                afs_protocol::meta::DfsDigestAlgorithm::Crc32cSegmentsV1 as i32
             }
         },
     }
@@ -2704,6 +2863,9 @@ fn domain_digest_algorithm(value: i32) -> Result<crate::dfs::DigestAlgorithm, St
         .map_err(|_| invalid("DFS digest algorithm is invalid"))?
     {
         afs_protocol::meta::DfsDigestAlgorithm::Blake3 => Ok(crate::dfs::DigestAlgorithm::Blake3),
+        afs_protocol::meta::DfsDigestAlgorithm::Crc32cSegmentsV1 => {
+            Ok(crate::dfs::DigestAlgorithm::Crc32cSegmentsV1)
+        }
         afs_protocol::meta::DfsDigestAlgorithm::Unspecified => {
             Err(invalid("DFS digest algorithm is required"))
         }
@@ -2719,6 +2881,66 @@ mod tests {
     use super::*;
     use tonic::Code;
 
+    #[tokio::test]
+    async fn p3_watch_rpc_idle_response_expires_without_delivering_old_commands() {
+        use super::super::store::{
+            MetaEntity, MetaStore, MetaTxn, OperationResult, RequestOutcome, Store, StoreOperation,
+            TxnCondition, TxnMutation,
+            journal::{LogLimits, MemoryLog},
+        };
+        use tokio_stream::StreamExt;
+        let store = Arc::new(
+            Store::open_log(Arc::new(MemoryLog::new(LogLimits::default()).unwrap()))
+                .await
+                .unwrap(),
+        );
+        let key = RequestKey::new("watch-test", "install");
+        let command = RootCommandRecord {
+            command_id: "command".into(),
+            home_node_id: "node".into(),
+            home_session_id: "session".into(),
+            root_id: "root".into(),
+            root_epoch: 1,
+            old_access_generation: 1,
+            command_type: StoreRootCommandType::InvalidateCache,
+        };
+        let mut txn = MetaTxn::new(key.clone(), StoreOperation::BeginRootRevocation);
+        txn.conditions
+            .push(TxnCondition::RequestAbsent(key.clone()));
+        txn.mutations.extend([
+            TxnMutation::Put(MetaEntity::RootCommand(command.clone())),
+            TxnMutation::RecordRequestOutcome(RequestOutcome {
+                request: key,
+                operation: StoreOperation::BeginRootRevocation,
+                result: OperationResult::RootCommand(command),
+            }),
+        ]);
+        store.compare_and_commit(txn).await.unwrap();
+        let meta = Arc::new(super::super::Meta::with_store(
+            "watch-test".into(),
+            crate::runtime::Observability::new().unwrap(),
+            store.clone(),
+        ));
+        let mut stream = OwnerRootsRpc(meta)
+            .watch_root_commands(Request::new(WatchRootCommandsRequest {
+                node_id: "node".into(),
+                session_id: "session".into(),
+                after_revision: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        // Keep the response entirely unpolled: deadline must also detach idle
+        // application queues, not only be checked after a consumer wakes it.
+        tokio::time::sleep(Duration::from_secs(31)).await;
+        let result = stream.next().await;
+        assert!(
+            matches!(result, Some(Err(_))),
+            "an expired response must not serve old commands"
+        );
+        assert!(stream.next().await.is_none());
+        store.health().await.unwrap();
+    }
     #[test]
     fn registration_reply_uses_remaining_actual_lease_after_readiness_probe() {
         let session = super::super::store::NodeSession {
