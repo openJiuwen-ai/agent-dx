@@ -244,6 +244,7 @@ async fn action(
             .await?,
         )),
         ("DELETE", "sandbox", "") => {
+            sandbox_owner(api, id, caller, true).await?;
             api.environment_service
                 .execute(Kind::Delete, id, &operation_id("delete"), json!({}), caller)
                 .await?;
@@ -252,6 +253,7 @@ async fn action(
         ("POST", "sandbox", "timeout") => {
             let input: TimeoutRequest = decode(request).await?;
             input.validate().map_err(validation)?;
+            sandbox_owner(api, id, caller, true).await?;
             api.clients
                 .update_environment_control(id, caller, input.timeout, false)
                 .await?;
@@ -260,11 +262,7 @@ async fn action(
         ("POST", "sandbox", "pause") => {
             let input = pause_request(body(request.into_body(), BODY_LIMIT).await?)?;
             input.validate().map_err(validation)?;
-            api.clients
-                .environment_control(id, caller)
-                .await?
-                .compatibility
-                .ok_or_else(|| Status::not_found("sandbox is not E2B-compatible"))?;
+            sandbox_owner(api, id, caller, true).await?;
             api.environment_service
                 .execute(Kind::Pause, id, &operation_id("pause"), json!({}), caller)
                 .await?;
@@ -283,11 +281,7 @@ async fn action(
                 ))
             })?;
             input.validate().map_err(validation)?;
-            api.clients
-                .environment_control(id, caller)
-                .await?
-                .compatibility
-                .ok_or_else(|| Status::not_found("sandbox is not E2B-compatible"))?;
+            sandbox_owner(api, id, caller, true).await?;
             let value = api
                 .environment_service
                 .execute(
@@ -320,7 +314,7 @@ async fn update_network(
     let input: NetworkUpdateRequest = decode(request).await?;
     // Reject unsupported semantics before performing an ownership lookup.
     input.policy(None).map_err(validation)?;
-    let owner = api.clients.owner(id, caller, true).await?;
+    let owner = sandbox_owner(api, id, caller, true).await?;
     let record = owner
         .record
         .ok_or_else(|| Status::data_loss("missing environment record"))?;
@@ -365,14 +359,10 @@ async fn connect(
             .map_err(|_| Status::invalid_argument("invalid connect request"))?;
     input.validate().map_err(validation)?;
     let timeout = input.timeout.unwrap_or(DEFAULT_TIMEOUT_SECONDS);
+    let owner = sandbox_owner(api, id, caller, true).await?;
     api.clients
         .update_environment_control(id, caller, timeout, true)
         .await?;
-    let owner = api
-        .environment_service
-        .inspect(&caller.tenant_id, id)
-        .await?
-        .ok_or_else(|| Status::not_found("sandbox not found"))?;
     let paused = owner
         .record
         .as_ref()
@@ -475,6 +465,24 @@ pub(super) async fn decode<T: serde::de::DeserializeOwned>(
 fn operation_id(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::new_v4())
 }
+// Scope is an E2B adapter concern. A common run policy is not an E2B marker.
+async fn sandbox_owner(
+    api: &Api,
+    id: &str,
+    caller: &pb::CallerContext,
+    refresh: bool,
+) -> Result<pb::GetEnvironmentResponse, Status> {
+    let owner = api.clients.owner(id, caller, refresh).await?;
+    if owner
+        .record
+        .as_ref()
+        .and_then(|record| record.spec.as_ref())
+        .is_none_or(|spec| spec.compatibility.is_none())
+    {
+        return Err(Status::not_found("E2B sandbox not found"));
+    }
+    Ok(owner)
+}
 async fn sandbox_detail(
     api: &Api,
     control: &pb::EnvironmentControlRecord,
@@ -493,10 +501,7 @@ async fn sandbox_detail_with_metadata(
     metadata: &std::collections::HashMap<String, String>,
     caller: &pb::CallerContext,
 ) -> Result<Value, Status> {
-    let owner = api
-        .clients
-        .owner(&control.environment_id, caller, false)
-        .await?;
+    let owner = sandbox_owner(api, &control.environment_id, caller, false).await?;
     let record = owner
         .record
         .ok_or_else(|| Status::data_loss("missing environment record"))?;
@@ -512,10 +517,11 @@ async fn sandbox_detail_with_metadata(
     } else {
         return Err(Status::failed_precondition("sandbox is not available"));
     };
-    let compatibility = control
-        .compatibility
+    let compatibility = record
+        .spec
         .as_ref()
-        .ok_or_else(|| Status::data_loss("missing sandbox compatibility"))?;
+        .and_then(|spec| spec.compatibility.as_ref())
+        .ok_or_else(|| Status::not_found("E2B sandbox not found"))?;
     let domain = api
         .clients
         .config

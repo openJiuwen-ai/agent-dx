@@ -9,6 +9,7 @@ fn environment_identity_survives_runtime_replacement() {
     let mut record = EnvironmentRecord {
         failure: None,
         spec: EnvironmentSpec {
+            run_policy: None,
             template_identity: None,
             compatibility: None,
             id: "environment-a".into(),

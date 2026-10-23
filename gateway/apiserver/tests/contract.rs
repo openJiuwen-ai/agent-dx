@@ -40,6 +40,7 @@ fn public_create_maps_directly_to_instance_and_uses_verified_identity() {
     assert_eq!(spec.id, "ns-case");
     assert_eq!(spec.tenant_id, "verified");
     assert_eq!(spec.runtime_class, "runsc");
+    assert!(spec.run_policy.is_none());
     let resources = spec.resources.unwrap();
     assert_eq!(
         (
@@ -51,6 +52,15 @@ fn public_create_maps_directly_to_instance_and_uses_verified_identity() {
     );
     assert_eq!(spec.env["USER_VALUE"], "ok");
     assert_eq!(spec.lifecycle.unwrap().idle_timeout_seconds, 15);
+}
+#[test]
+fn native_http_does_not_enable_internal_run_policy() {
+    let spec = create_spec(
+        json!({"image":"image", "runPolicy":{"timeoutSeconds":1,"action":"delete"}}),
+        &caller(),
+    )
+    .unwrap();
+    assert!(spec.run_policy.is_none());
 }
 #[test]
 fn clone_preserves_omitted_geometry_and_does_not_invent_image() {

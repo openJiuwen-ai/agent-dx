@@ -149,13 +149,15 @@ metadata 不进入执行规格、control、调度 labels、guest env 或快照�
 
 当前通用查询使用原子存储条目上限4096后再扫描，没有 metadata 索引；容量超限明确拒绝，不截断成完整列表。上限包含同一 Coordinator 存储 hash 的其他条目，扩容需后续索引/存储分页设计。该实现有界但仍为线性扫描，不声明大规模列表性能。
 
-Redis 的 StoredEnvironment 保存独立 EnvironmentControlRecord。运行期限从首次联合 Ready 开始，到期不随命令或文件活动自动顺延。续期、到期 claim 和节点结果提交通过现有持久化 CAS 协调；claimed 到期不能再续期。Coordinator 重启保留期限，节点的迟到结果不覆盖新期限。显式暂停清除运行期限；Snapshot 内部暂停不清除期限。恢复后建立新期限，普通 generation 更新不延长旧期限。
+运行期限是平台可选能力：`EnvironmentSpec.run_policy` 保存初始时长与类型化的 Delete/Pause 到期动作，`StoredEnvironment.control` 只保存动态 deadline、revision/generation、claim 和暂停态覆盖值，不复制兼容身份或凭据。当前由 E2B 入口填写策略；内部无 compatibility 的实例也能使用，未配置策略的实例不建立 control。原生公共 HTTP 入口暂不开放该字段。
+
+运行期限从首次权威 Running（Ready 成功的节点结果）开始，不随命令或文件活动自动顺延。续期、到期 claim 和节点结果提交复用现有持久化 CAS；每轮 CAS 尝试重新校验当前时间，已经到期或 claimed 均拒绝续期。持久 claim 和稳定操作身份允许到期扫描重试，执行复用原生 Pause/Delete、operation 重放及 owner/session/revision/generation 保护。显式暂停清除当前 deadline，Snapshot 内部暂停/源恢复保留原 deadline；普通状态重报和 generation 更新不续期。运行中 setTimeout/Connect 只改变本轮 deadline；暂停态 Connect 设置持久 timeout 覆盖值，后续每轮 Running 使用它，直到再次显式覆盖，Spec 默认值保持不变。期限与 checkpoint 保留期限分别管理。
 
 创建时 `autoPause: true` 且省略 `autoPauseMemory` 按上游默认的内存模式处理，实际支持范围由原生 backend/checkpoint storage 判断。显式 `autoPauseMemory: false` 不受支持。Connect 与 Snapshot 使用各自的严格请求类型，不能把磁盘模式选择静默当作内存恢复执行；这些 DTO 检查不代表对应 backend 已通过生命周期验收。
 
 创建时 `network: {}` 保留模板默认的 `allowPublicTraffic`，出站默认允许；出站字段转换与动态更新共用下述映射。Connect 的 timeout 省略时为 300 秒，允许 1～86400 秒；单独的 setTimeout 接口继续允许 0，表示立即到期。
 
-有意保留的差异：运行期限最多 86400 秒；暂停恢复点默认保留 90000 秒，可由模板配置，不是原装 E2B 的无限保留；不支持磁盘暂停、自动恢复、网络代理/域名及转换规则、IAM、卷挂载、MCP 或 Code Interpreter 高层能力；未知字段/未实现能力显式报错。模板构建管理也未接入，首版使用预配置模板映射。CCE runc 验证中，SDK 覆盖直接位于 sticky `/tmp` 下的用户文件会返回上游 permission denied；默认 `/home/user` 工作目录及非 sticky 子目录的私有文件读写、覆盖和目录操作可用。本版保留该环境限制，不修改共享宿主机的文件保护策略。错误是 E2B 原始 JSON `{code, message, error_code?}`，不使用 ADX data envelope。
+有意保留的差异：E2B 入口运行期限最多 86400 秒（当前支持范围，通用平台策略没有该上限）；暂停恢复点默认保留 90000 秒，可由模板配置，不是原装 E2B 的无限保留；不支持磁盘暂停、自动恢复、网络代理/域名及转换规则、IAM、卷挂载、MCP 或 Code Interpreter 高层能力；未知字段/未实现能力显式报错。模板构建管理也未接入，首版使用预配置模板映射。CCE runc 验证中，SDK 覆盖直接位于 sticky `/tmp` 下的用户文件会返回上游 permission denied；默认 `/home/user` 工作目录及非 sticky 子目录的私有文件读写、覆盖和目录操作可用。本版保留该环境限制，不修改共享宿主机的文件保护策略。错误是 E2B 原始 JSON `{code, message, error_code?}`，不使用 ADX data envelope。
 
 ## API Key 管理配置
 
@@ -163,7 +165,7 @@ Redis 的 StoredEnvironment 保存独立 EnvironmentControlRecord。运行期限
 
 创建请求只有 `{ "name": "ci-key" }`，name 非空、最多 256 个非控制字符；未知字段 400。同名允许存在，创建不是幂等操作。返回 `id` 为公开 UUID，`createdAt` 为 RFC3339，`mask` 包含 `prefix`、`valueLength`、`maskedValuePrefix` 和 `maskedValueSuffix`。prefix 使用真实的 `adx_`，valueLength 是去掉类型前缀后的随机值长度；创建响应另有一次性 `key`，列表无此字段。`createdBy` 与 `lastUsed` 为 null。成功响应使用 `Cache-Control: no-store`。
 
-本版按未上线 schema 更新部署，Coordinator、adxlet 和 API Server 使用同一版本；先清理旧测试记录，再切换服务和配置。旧组件不能承接新的模板身份或 metadata 合同；Key 的 public-ID 模式也需要新版 Coordinator。内部网络更新 RPC 沿用原有协议。
+本版按未上线 schema 更新部署，Coordinator、adxlet 和 API Server 使用同一版本；先清理旧测试记录，再切换服务和配置。旧组件不能承接新的模板身份、metadata 或 run_policy/control 合同；此次不提供旧兼容记录的滚动迁移。Key 的 public-ID 模式也需要新版 Coordinator。内部网络更新 RPC 沿用原有协议。
 
 Coordinator 的 CredentialService 复用原有 digest 索引、expiry 与撤销 tombstone，增加可选 metadata；原文不持久化。旧原生 key 缺少 metadata，继续用于原生认证/管理，不出现在兼容列表中。原生 `/api/admin/v1/keys` 的 hash ID 与全局管理员语义保持原有行为。公开 UUID 撤销在同一 Redis 脚本内校验 active 记录、tenant 和 UUID，再写 tombstone、删除 active 记录。
 

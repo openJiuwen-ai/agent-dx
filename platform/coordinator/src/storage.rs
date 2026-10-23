@@ -230,11 +230,13 @@ impl StoredEnvironment {
         adx_core::metadata::validate_user_metadata(&self.user_metadata)?;
         self.spec.validate()?;
         if let Some(control) = &self.control {
-            control.compatibility.validate()?;
-            if self.spec.compatibility.is_none()
+            if self.spec.run_policy.is_none()
                 || control.environment_id != self.spec.id
                 || control.revision == 0
                 || (control.expiry_claimed && control.expires_at_unix_ms == 0)
+                || control
+                    .timeout_override_seconds
+                    .is_some_and(|seconds| seconds == 0 || seconds.checked_mul(1000).is_none())
             {
                 return Err(Error::Conflict);
             }

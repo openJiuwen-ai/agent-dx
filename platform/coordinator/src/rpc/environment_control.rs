@@ -48,7 +48,7 @@ impl CoordinatorRpc {
         Ok(Response::new(
             stored
                 .control
-                .ok_or_else(|| Status::not_found("sandbox control not found"))?
+                .ok_or_else(|| Status::not_found("environment control not found"))?
                 .into(),
         ))
     }
@@ -66,13 +66,13 @@ impl CoordinatorRpc {
         tenant(r.caller.as_ref(), &stored.spec.tenant_id)?;
         let changed = state
             .session
-            .set_sandbox_timeout(&r.id, r.timeout_seconds, r.extend_only)
+            .set_environment_timeout(&r.id, r.timeout_seconds, r.extend_only)
             .await
             .map_err(status)?;
         let control = changed
             .control
             .clone()
-            .ok_or_else(|| Status::not_found("sandbox control not found"))?;
+            .ok_or_else(|| Status::not_found("environment control not found"))?;
         state.remember_environment(changed);
         Ok(Response::new(control.into()))
     }
@@ -134,7 +134,8 @@ impl CoordinatorRpc {
         let mut outcomes = stream::iter(ids)
             .map(|id| {
                 let session = session.clone();
-                async move { self.expire_sandbox(&session, &id, now).await }
+                // Keep the lifecycle RPC future off the scanner's poll stack.
+                async move { Box::pin(self.expire_environment(&session, &id, now)).await }
             })
             .buffer_unordered(4);
         let mut completed = 0;
@@ -154,8 +155,8 @@ impl CoordinatorRpc {
         }
         Ok(completed)
     }
-    async fn expire_sandbox(&self, session: &Session, id: &str, now: u64) -> Result<bool> {
-        let stored = match session.claim_sandbox_expiry(id, now).await {
+    async fn expire_environment(&self, session: &Session, id: &str, now: u64) -> Result<bool> {
+        let stored = match session.claim_environment_expiry(id, now).await {
             Ok(s) => s,
             Err(Error::Conflict | Error::NotFound) => return Ok(false),
             Err(e) => return Err(e),
@@ -189,8 +190,9 @@ impl CoordinatorRpc {
             tenant_id: stored.spec.tenant_id.clone(),
             administrator: false,
         });
-        let response = if control.compatibility.timeout_action == "pause"
-            && record.state == EnvironmentState::Running
+        let response = if stored.spec.run_policy.as_ref().is_some_and(|policy| {
+            policy.action == adx_core::environment_control::RunExpiryAction::Pause
+        }) && record.state == EnvironmentState::Running
         {
             client
                 .pause_environment(expiry_pause_request(
@@ -228,7 +230,9 @@ mod tests {
     use super::expiry_pause_request;
     use crate::storage::StoredEnvironment;
     use adx_core::{
-        environment_control::{EnvironmentCompatibility, EnvironmentControlRecord},
+        environment_control::{
+            EnvironmentCompatibility, EnvironmentControlRecord, RunExpiryAction, RunPolicy,
+        },
         lifecycle::{CheckpointStorage, LifecyclePolicy, PausePolicy, RetentionPolicy},
         Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Resources, Runtime,
     };
@@ -236,6 +240,10 @@ mod tests {
 
     fn stored(pause: Option<PausePolicy>) -> StoredEnvironment {
         let spec = EnvironmentSpec {
+            run_policy: Some(RunPolicy {
+                timeout_seconds: 1,
+                action: RunExpiryAction::Pause,
+            }),
             template_identity: None,
             compatibility: Some(EnvironmentCompatibility {
                 template_id: "template".into(),
@@ -243,8 +251,6 @@ mod tests {
                 envd_access_token: "a".repeat(32),
                 traffic_access_token: "b".repeat(32),
                 allow_public_traffic: false,
-                timeout_seconds: 1,
-                timeout_action: "pause".into(),
             }),
             runtime_profile: None,
             snapshot_id: None,
@@ -311,12 +317,12 @@ mod tests {
             stored,
             &EnvironmentControlRecord {
                 environment_id: stored.spec.id.clone(),
-                compatibility: stored.spec.compatibility.clone().expect("fixture"),
                 expires_at_unix_ms: 10,
                 started_at_unix_ms: 1,
                 revision: 2,
                 generation: 1,
                 expiry_claimed: true,
+                timeout_override_seconds: None,
             },
             &record,
             None,

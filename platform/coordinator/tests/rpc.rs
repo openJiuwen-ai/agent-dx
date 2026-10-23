@@ -97,6 +97,7 @@ async fn channel(address: std::net::SocketAddr, name: &str) -> Channel {
 }
 fn spec(id: &str) -> EnvironmentSpec {
     EnvironmentSpec {
+        run_policy: None,
         template_identity: None,
         compatibility: None,
         runtime_profile: None,
@@ -279,6 +280,22 @@ impl Drop for Servers {
             task.abort();
         }
     }
+}
+
+// Construct the large tonic server future outside the lifecycle test future.
+fn serve_recovered_coordinator(
+    listener: TcpListener,
+    service: CoordinatorRpc,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        Server::builder()
+            .tls_config(server_tls("coordinator"))
+            .unwrap()
+            .add_service(pb::coordinator_service_server::CoordinatorServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    })
 }
 
 #[tokio::test]
@@ -825,6 +842,185 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
             .is_empty());
     }
 
+    // Keep this additional RPC scenario off the already large test future's stack.
+    Box::pin(async {
+        // Native run policies use the common control lease and node lifecycle RPCs;
+        // compatibility is deliberately absent from both expiry cases.
+        let mut expiry_delete = create("expiry-delete");
+        let mut delete_spec = spec("expiry-delete");
+        delete_spec.run_policy = Some(adx_core::environment_control::RunPolicy {
+            timeout_seconds: 60,
+            action: adx_core::environment_control::RunExpiryAction::Delete,
+        });
+        expiry_delete.spec = Some(delete_spec.into());
+        frontend.create_environment(expiry_delete).await.unwrap();
+        assert!(session
+            .get("expiry-delete")
+            .await
+            .unwrap()
+            .spec
+            .compatibility
+            .is_none());
+        let removed_before_expiry = backend.removed.load(Ordering::SeqCst);
+        frontend
+            .update_environment_control(pb::UpdateEnvironmentControlRequest {
+                id: "expiry-delete".into(),
+                caller: caller(),
+                timeout_seconds: 0,
+                extend_only: false,
+            })
+            .await
+            .unwrap();
+        // Persist the claim before reconstructing the Coordinator's in-memory state.
+        // This is a component recovery check, not a process/KVM restart.
+        session
+            .claim_environment_expiry("expiry-delete", u64::MAX)
+            .await
+            .unwrap();
+        let recovered_expiry = CoordinatorRpc::new(
+            session.clone(),
+            Placement::Pack,
+            peers(),
+            client_tls("coordinator"),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        let recovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let recovery_address = recovery_listener.local_addr().unwrap();
+        servers.0.push(serve_recovered_coordinator(
+            recovery_listener,
+            recovered_expiry.clone(),
+        ));
+        let mut recovered_node = pb::coordinator_service_client::CoordinatorServiceClient::new(
+            channel(recovery_address, "node").await,
+        );
+        // A recovered Coordinator must re-establish the real heartbeat/reconcile
+        // fence before it can accept lifecycle publication from this node session.
+        let mut recovery_register = register.clone();
+        recovery_register.heartbeat_sequence += 2;
+        recovery_register.reconciling = true;
+        recovery_register.accepting_allocations = false;
+        recovered_node
+            .register_node(recovery_register.clone())
+            .await
+            .unwrap();
+        recovered_node
+            .inspect_node(pb::InspectNodeRequest {
+                node_id: "node".into(),
+                session_id: "boot-1".into(),
+            })
+            .await
+            .unwrap();
+        recovery_register.heartbeat_sequence += 1;
+        recovery_register.reconciling = false;
+        recovery_register.accepting_allocations = true;
+        recovered_node
+            .register_node(recovery_register)
+            .await
+            .unwrap();
+        assert_eq!(recovered_expiry.expire_environments().await.unwrap(), 1);
+        assert_eq!(
+            session.get("expiry-delete").await.unwrap_err(),
+            adx_core::Error::NotFound
+        );
+        assert_eq!(
+            backend.removed.load(Ordering::SeqCst),
+            removed_before_expiry + 1
+        );
+        assert_eq!(cleanup_rpc.expire_environments().await.unwrap(), 0);
+        let mut recovered_register = register.clone();
+        recovered_register.heartbeat_sequence += 4;
+        node_coordinator
+            .register_node(recovered_register)
+            .await
+            .unwrap();
+
+        let mut expiry_pause = create("expiry-pause");
+        let mut pause_spec = spec("expiry-pause");
+        pause_spec.run_policy = Some(adx_core::environment_control::RunPolicy {
+            timeout_seconds: 60,
+            action: adx_core::environment_control::RunExpiryAction::Pause,
+        });
+        expiry_pause.spec = Some(pause_spec.into());
+        frontend.create_environment(expiry_pause).await.unwrap();
+        let pause_before = session.get("expiry-pause").await.unwrap();
+        assert!(pause_before.spec.compatibility.is_none());
+        let pause_revision = pause_before.result.as_ref().unwrap().revision;
+        let control = frontend
+            .update_environment_control(pb::UpdateEnvironmentControlRequest {
+                id: "expiry-pause".into(),
+                caller: caller(),
+                timeout_seconds: 0,
+                extend_only: false,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let operation_id = format!(
+            "expiry-{}-{}",
+            control.expires_at_unix_ms,
+            control.revision + 1
+        );
+        assert_eq!(cleanup_rpc.expire_environments().await.unwrap(), 1);
+        let paused = session.get("expiry-pause").await.unwrap();
+        assert_eq!(
+            paused.result.as_ref().unwrap().state,
+            adx_core::EnvironmentState::Paused
+        );
+        assert_eq!(
+            paused
+                .result
+                .as_ref()
+                .unwrap()
+                .last_operation
+                .as_ref()
+                .unwrap()
+                .id,
+            operation_id
+        );
+        assert_eq!(paused.control.as_ref().unwrap().expires_at_unix_ms, 0);
+        assert!(backend.running.lock().unwrap().is_empty());
+        assert_eq!(cleanup_rpc.expire_environments().await.unwrap(), 0);
+
+        let replay = stale_coordinator
+            .pause_environment(pb::PauseEnvironmentRequest {
+                assignment: Some(paused.assignment.clone().try_into().unwrap()),
+                caller: caller(),
+                operation_id,
+                expected_revision: pause_revision,
+                retention: Some(
+                    adx_core::lifecycle::RetentionPolicy::Ttl {
+                        ttl_seconds: 90_000,
+                    }
+                    .into(),
+                ),
+                timeout_seconds: 300,
+                expiry_revision: Some(pause_revision),
+                node_session_id: "boot-1".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let replayed: EnvironmentRecord = replay.record.unwrap().try_into().unwrap();
+        assert_eq!(replayed, paused.result.unwrap());
+        node_frontend
+            .delete_environment(pb::DeleteEnvironmentRequest {
+                assignment: Some(paused.assignment.try_into().unwrap()),
+                caller: caller(),
+                failed_revision: None,
+                node_session_id: "boot-1".into(),
+                expiry_revision: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            session.get("expiry-pause").await.unwrap_err(),
+            adx_core::Error::NotFound
+        );
+    })
+    .await;
+
     // Run metadata capacity/corruption probes after the public API fixture, whose
     // contract requires an empty scheduler and an unmodified storage schema.
     let mut retry_expired = create("queue-deadline");
@@ -848,7 +1044,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         .update_capacity(capacity, Duration::from_secs(60))
         .unwrap();
     let mut metadata_register = register.clone();
-    metadata_register.heartbeat_sequence += 2;
+    metadata_register.heartbeat_sequence += 5;
     metadata_register.capacity = Some(capacity.into());
     node_coordinator
         .register_node(metadata_register.clone())
@@ -953,8 +1149,6 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
             envd_access_token: "a".repeat(32),
             traffic_access_token: "b".repeat(32),
             allow_public_traffic: true,
-            timeout_seconds: 60,
-            timeout_action: "delete".into(),
         });
         session
             .claim_with_metadata(

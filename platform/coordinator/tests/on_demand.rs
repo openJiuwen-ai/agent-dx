@@ -50,6 +50,7 @@ fn spec() -> EnvironmentSpec {
         priority: 0,
         scheduling: Default::default(),
         execution: Default::default(),
+        run_policy: None,
         template_identity: None,
         compatibility: None,
     }

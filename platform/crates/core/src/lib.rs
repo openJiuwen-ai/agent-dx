@@ -108,6 +108,8 @@ impl Resources {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_policy: Option<environment_control::RunPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_identity: Option<NativeTemplateIdentity>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compatibility: Option<environment_control::EnvironmentCompatibility>,
@@ -161,6 +163,9 @@ impl EnvironmentSpec {
     pub fn validate(&self) -> Result<()> {
         if let Some(compatibility) = &self.compatibility {
             compatibility.validate()?;
+        }
+        if let Some(run_policy) = &self.run_policy {
+            run_policy.validate()?;
         }
         if let Some(template_identity) = &self.template_identity {
             template_identity.validate(&self.tenant_id)?;

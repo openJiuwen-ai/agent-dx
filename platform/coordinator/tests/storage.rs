@@ -5,14 +5,18 @@ mod claims;
 mod common;
 #[path = "storage/dormancy.rs"]
 mod dormancy;
+#[path = "storage/run_policy.rs"]
+mod run_policy;
 use adx_coordinator::{storage::StoredNode, Coordinator, Node, Placement};
 use adx_core::{
+    environment_control::{RunExpiryAction, RunPolicy},
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Resources,
 };
 use std::time::Duration;
 
 fn spec(id: &str) -> EnvironmentSpec {
     EnvironmentSpec {
+        run_policy: None,
         template_identity: None,
         compatibility: None,
         runtime_profile: None,
@@ -1585,21 +1589,47 @@ mod admin_keys;
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis; ADX_TEST_REDIS_SERVER"]
-async fn e2b_control_renewal_survives_stale_node_commit_and_redis_restart() {
+async fn native_environment_without_run_policy_has_no_control_lease() {
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let spec = spec("native-no-policy");
+    assert!(spec.compatibility.is_none());
+    assert!(spec.run_policy.is_none());
+    let assignment = Assignment {
+        environment_id: spec.id.clone(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    session
+        .reserve(spec.clone(), assignment.clone())
+        .await
+        .unwrap();
+    session
+        .commit(running(spec.clone(), assignment))
+        .await
+        .unwrap();
+    assert!(matches!(
+        session.environment_control(&spec.id).await,
+        Err(Error::NotFound)
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; ADX_TEST_REDIS_SERVER"]
+async fn native_run_policy_renewal_survives_stale_node_commit_and_redis_restart() {
     let mut rig = common::Redis::new().await;
     let store = rig.store().await;
     let session = store.begin(1).await.unwrap();
     register(&session, "node").await;
     let mut spec = spec("e2b-control");
-    spec.compatibility = Some(adx_core::environment_control::EnvironmentCompatibility {
-        template_id: "base".into(),
-        envd_version: "0.9.0".into(),
-        envd_access_token: "a".repeat(32),
-        traffic_access_token: "b".repeat(32),
-        allow_public_traffic: false,
+    spec.run_policy = Some(RunPolicy {
         timeout_seconds: 60,
-        timeout_action: "delete".into(),
+        action: RunExpiryAction::Delete,
     });
+    assert!(spec.compatibility.is_none());
     let assignment = Assignment {
         environment_id: spec.id.clone(),
         node_id: "node".into(),
@@ -1627,11 +1657,17 @@ async fn e2b_control_renewal_survives_stale_node_commit_and_redis_restart() {
     session.commit(result.clone()).await.unwrap();
     let initial = session.environment_control(&spec.id).await.unwrap();
     session
-        .set_sandbox_timeout(&spec.id, 120, true)
+        .set_environment_timeout(&spec.id, 120, true)
         .await
         .unwrap();
     let renewed = session.environment_control(&spec.id).await.unwrap();
     assert!(renewed.expires_at_unix_ms > initial.expires_at_unix_ms);
+    assert!(matches!(
+        session
+            .claim_environment_expiry(&spec.id, initial.expires_at_unix_ms)
+            .await,
+        Err(Error::Conflict)
+    ));
     assert_eq!(
         session.get(&spec.id).await.unwrap().user_metadata["owner"],
         "user-data"
@@ -1654,19 +1690,129 @@ async fn e2b_control_renewal_survives_stale_node_commit_and_redis_restart() {
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis; ADX_TEST_REDIS_SERVER"]
-async fn e2b_claimed_expiry_cannot_renew_and_delete_retires_control() {
+async fn run_policy_preserves_snapshot_lease_and_restarts_after_explicit_pause() {
+    use adx_core::{CheckpointArtifact, CompletedOperation, LifecycleKind, RestorePoint};
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let mut spec = spec("policy-pause");
+    spec.run_policy = Some(RunPolicy {
+        timeout_seconds: 60,
+        action: RunExpiryAction::Pause,
+    });
+    let assignment = Assignment {
+        environment_id: spec.id.clone(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    session
+        .reserve(spec.clone(), assignment.clone())
+        .await
+        .unwrap();
+    let running = running(spec, assignment);
+    session.commit(running.clone()).await.unwrap();
+    let initial = session.environment_control("policy-pause").await.unwrap();
+
+    let mut snapshot_paused = running.clone();
+    snapshot_paused.state = EnvironmentState::Paused;
+    snapshot_paused.revision += 1;
+    snapshot_paused.resources_held = false;
+    snapshot_paused.runtime.ip = None;
+    snapshot_paused.checkpoint = Some(RestorePoint {
+        origin: None,
+        id: "snapshot".into(),
+        source_runtime_id: running.runtime.id.clone(),
+        expires_at_unix_seconds: None,
+        artifact: CheckpointArtifact {
+            storage: "local".into(),
+            scope: String::new(),
+            location: "/tmp/snapshot".into(),
+            size_bytes: 1,
+        },
+    });
+    snapshot_paused.last_operation = Some(CompletedOperation {
+        id: "snapshot".into(),
+        kind: LifecycleKind::Snapshot,
+        expected_revision: running.revision,
+    });
+    session.commit(snapshot_paused.clone()).await.unwrap();
+    assert_eq!(
+        session.environment_control("policy-pause").await.unwrap(),
+        initial
+    );
+
+    let mut resumed = snapshot_paused.clone();
+    resumed.state = EnvironmentState::Running;
+    resumed.revision += 1;
+    resumed.resources_held = true;
+    resumed.runtime.id = format!("{}-r{}", running.runtime.id, resumed.revision);
+    resumed.runtime.ip = Some("10.0.0.3".parse().unwrap());
+    resumed.last_operation = Some(CompletedOperation {
+        id: "resume".into(),
+        kind: LifecycleKind::Resume,
+        expected_revision: snapshot_paused.revision,
+    });
+    session.commit(resumed.clone()).await.unwrap();
+    assert_eq!(
+        session.environment_control("policy-pause").await.unwrap(),
+        initial
+    );
+
+    let mut explicit_pause = resumed.clone();
+    explicit_pause.state = EnvironmentState::Paused;
+    explicit_pause.revision += 1;
+    explicit_pause.resources_held = false;
+    explicit_pause.runtime.ip = None;
+    explicit_pause.last_operation = Some(CompletedOperation {
+        id: "pause".into(),
+        kind: LifecycleKind::Pause,
+        expected_revision: resumed.revision,
+    });
+    session.commit(explicit_pause.clone()).await.unwrap();
+    assert_eq!(
+        session
+            .environment_control("policy-pause")
+            .await
+            .unwrap()
+            .expires_at_unix_ms,
+        0
+    );
+    session
+        .set_environment_timeout("policy-pause", 120, false)
+        .await
+        .unwrap();
+    let mut restarted = explicit_pause;
+    restarted.state = EnvironmentState::Running;
+    restarted.revision += 1;
+    restarted.resources_held = true;
+    restarted.runtime.id = format!("{}-r{}", running.runtime.id, restarted.revision);
+    restarted.runtime.ip = Some("10.0.0.4".parse().unwrap());
+    restarted.last_operation = Some(CompletedOperation {
+        id: "resume-after-pause".into(),
+        kind: LifecycleKind::Resume,
+        expected_revision: restarted.revision - 1,
+    });
+    session.commit(restarted).await.unwrap();
+    let restarted_control = session.environment_control("policy-pause").await.unwrap();
+    assert_eq!(restarted_control.timeout_override_seconds, Some(120));
+    assert_eq!(
+        restarted_control.expires_at_unix_ms - restarted_control.started_at_unix_ms,
+        120_000
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; ADX_TEST_REDIS_SERVER"]
+async fn native_claimed_expiry_cannot_renew_and_delete_retires_control() {
     let rig = common::Redis::new().await;
     let session = rig.store().await.begin(1).await.unwrap();
     register(&session, "node").await;
     let mut spec = spec("e2b-expiry");
-    spec.compatibility = Some(adx_core::environment_control::EnvironmentCompatibility {
-        template_id: "base".into(),
-        envd_version: "0.9.0".into(),
-        envd_access_token: "a".repeat(32),
-        traffic_access_token: "b".repeat(32),
-        allow_public_traffic: true,
+    spec.run_policy = Some(RunPolicy {
         timeout_seconds: 60,
-        timeout_action: "delete".into(),
+        action: RunExpiryAction::Delete,
     });
     let assignment = Assignment {
         environment_id: spec.id.clone(),
@@ -1682,15 +1828,15 @@ async fn e2b_claimed_expiry_cannot_renew_and_delete_retires_control() {
     let mut result = running(spec.clone(), assignment);
     session.commit(result.clone()).await.unwrap();
     session
-        .set_sandbox_timeout(&spec.id, 0, false)
+        .set_environment_timeout(&spec.id, 0, false)
         .await
         .unwrap();
     session
-        .claim_sandbox_expiry(&spec.id, u64::MAX)
+        .claim_environment_expiry(&spec.id, u64::MAX)
         .await
         .unwrap();
     assert!(session
-        .set_sandbox_timeout(&spec.id, 60, false)
+        .set_environment_timeout(&spec.id, 60, false)
         .await
         .is_err());
     result.state = EnvironmentState::Deleted;

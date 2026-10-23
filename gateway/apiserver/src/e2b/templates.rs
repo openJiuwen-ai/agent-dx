@@ -65,13 +65,15 @@ pub(super) async fn create_spec(
     compatibility.traffic_access_token = uuid::Uuid::new_v4().to_string();
     compatibility.allow_public_traffic =
         public_traffic.unwrap_or(compatibility.allow_public_traffic);
-    compatibility.timeout_seconds = input.timeout.unwrap_or(300);
-    compatibility.timeout_action = if input.auto_pause == Some(true) {
-        "pause"
-    } else {
-        "delete"
-    }
-    .into();
+    // E2B enables the common policy; platform lease logic has no protocol defaults.
+    spec.run_policy = Some(pb::RunPolicy {
+        timeout_seconds: input.timeout.unwrap_or(300),
+        action: if input.auto_pause == Some(true) {
+            pb::RunExpiryAction::Pause
+        } else {
+            pb::RunExpiryAction::Delete
+        } as i32,
+    });
     // Use the same canonical form as Coordinator for durable create replay equality.
     adx_core::EnvironmentSpec::try_from(spec)
         .map(Into::into)

@@ -293,6 +293,7 @@ async fn discovers_runtime_classes_from_sandboxd_uds() {
 }
 fn spec() -> EnvironmentSpec {
     EnvironmentSpec {
+        run_policy: None,
         template_identity: None,
         compatibility: None,
         runtime_profile: None,

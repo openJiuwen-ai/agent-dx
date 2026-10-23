@@ -190,14 +190,14 @@ assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: "nod
         let id = request.into_inner().id;
         let owner = self.0.owners.lock().unwrap().get(&id).cloned()
             .ok_or_else(|| Status::not_found("environment not found"))?;
-        let compatibility = owner.record
+        let policy = owner.record
             .and_then(|record| record.spec)
-            .and_then(|spec| spec.compatibility)
-            .ok_or_else(|| Status::not_found("sandbox control not found"))?;
+            .and_then(|spec| spec.run_policy)
+            .ok_or_else(|| Status::not_found("run policy disabled"))?;
         Ok(Response::new(pb::EnvironmentControlRecord {
             environment_id: id,
-            compatibility: Some(compatibility),
-            expires_at_unix_ms: 1,
+            timeout_override_seconds: None,
+            expires_at_unix_ms: policy.timeout_seconds.saturating_mul(1000).saturating_add(1),
             started_at_unix_ms: 1,
             revision: 1,
             generation: 1,
@@ -547,6 +547,9 @@ async fn e2b_create_through_http_listener_completes_on_default_worker_stack() {
     assert_eq!(execution.init_timeout_seconds, 30);
     assert!(execution.readiness_probe.is_some());
     assert_eq!(spec.lifecycle.as_ref().unwrap().idle_timeout_seconds, 0);
+    let policy = spec.run_policy.as_ref().unwrap();
+    assert_eq!(policy.timeout_seconds, 300);
+    assert_eq!(policy.action, pb::RunExpiryAction::Delete as i32);
     assert_eq!(
         spec.scheduling.unwrap().required_node[0].match_labels["adx.runtime.profile"],
         "e2b-v1"
@@ -734,6 +737,77 @@ async fn e2b_list_delegates_metadata_filters_and_opaque_cursors_to_platform() {
 }
 
 #[tokio::test]
+async fn generic_run_policy_does_not_make_a_native_environment_an_e2b_sandbox() {
+    let fixture = Fixture::new().await;
+    let mut native = spec("native-with-runtime-policy");
+    native.run_policy = Some(pb::RunPolicy {
+        timeout_seconds: 90_000,
+        action: pb::RunExpiryAction::Delete as i32,
+    });
+    fixture
+        .service
+        .create(
+            native,
+            json!({"name":"native-with-runtime-policy"}),
+            "native-runtime-policy",
+            &caller(),
+        )
+        .await
+        .unwrap();
+    // The generic control exists independently of E2B.
+    assert!(fixture
+        .clients
+        .environment_control("native-with-runtime-policy", &caller())
+        .await
+        .is_ok());
+    let headers = [
+        ("X-API-Key", "k".repeat(32)),
+        ("Content-Type", "application/json".into()),
+    ];
+    for (method, suffix, body) in [
+        ("GET", "", ""),
+        ("DELETE", "", ""),
+        ("POST", "/timeout", r#"{"timeout":60}"#),
+        ("POST", "/pause", "{}"),
+        ("POST", "/snapshots", "{}"),
+        ("PUT", "/network", "{}"),
+    ] {
+        let response = http::request(
+            fixture.api.clone(),
+            method,
+            &format!("/sandboxes/native-with-runtime-policy{suffix}"),
+            &headers,
+            body,
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 404, "{method} {suffix}");
+    }
+    let response = http::request(
+        fixture.api.clone(),
+        "POST",
+        "/v2/sandboxes/native-with-runtime-policy/connect",
+        &headers,
+        "{}",
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 404);
+    let list = http::request(fixture.api.clone(), "GET", "/v2/sandboxes", &headers, "").await;
+    assert_eq!(list.status().as_u16(), 200);
+    assert!(serde_json::from_slice::<Value>(list.body())
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
+    assert!(fixture
+        .state
+        .owners
+        .lock()
+        .unwrap()
+        .contains_key("native-with-runtime-policy"));
+}
+
+#[tokio::test]
 async fn e2b_snapshot_clone_uses_the_persisted_spec_after_alias_resolution() {
     let fixture = Fixture::new().await;
     let headers = [
@@ -778,7 +852,7 @@ async fn e2b_snapshot_clone_uses_the_persisted_spec_after_alias_resolution() {
         "POST",
         "/v2/sandboxes",
         &headers,
-        r#"{"templateID":"snapshot-1","metadata":{"clone":"two"}}"#,
+        r#"{"templateID":"snapshot-1","timeout":60,"autoPause":true,"metadata":{"clone":"two"}}"#,
     )
     .await;
     assert_eq!(cloned.status().as_u16(), 201);
@@ -809,6 +883,12 @@ async fn e2b_snapshot_clone_uses_the_persisted_spec_after_alias_resolution() {
     assert_eq!(cloned.resources, original.resources);
     assert_eq!(cloned.env, original.env);
     assert_eq!(cloned.runtime_profile, original.runtime_profile);
+    assert_eq!(original.run_policy.as_ref().unwrap().timeout_seconds, 300);
+    assert_eq!(cloned.run_policy.as_ref().unwrap().timeout_seconds, 60);
+    assert_eq!(
+        cloned.run_policy.as_ref().unwrap().action,
+        pb::RunExpiryAction::Pause as i32
+    );
     let original_compatibility = original.compatibility.unwrap();
     let cloned_compatibility = cloned.compatibility.unwrap();
     assert_eq!(cloned.template_identity, original.template_identity);

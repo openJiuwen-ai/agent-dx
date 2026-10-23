@@ -19,6 +19,7 @@ fn protobuf_round_trip_preserves_every_placement_constraint_and_card_identity() 
         tenants: vec!["t".into()],
     };
     let spec = EnvironmentSpec {
+        run_policy: None,
         template_identity: None,
         compatibility: None,
         runtime_profile: None,

@@ -12,22 +12,29 @@ pub(crate) fn now_ms() -> Result<u64> {
     .map_err(|_| Error::Unavailable("clock out of range".into()))
 }
 pub(crate) fn seed(spec: &EnvironmentSpec, generation: u64) -> Option<EnvironmentControlRecord> {
-    spec.compatibility
-        .clone()
-        .map(|c| EnvironmentControlRecord::new(spec.id.clone(), c, generation))
+    spec.run_policy
+        .as_ref()
+        .map(|_| EnvironmentControlRecord::new(spec.id.clone(), generation))
 }
 pub(super) fn transition(stored: &mut StoredEnvironment, result: &EnvironmentRecord) -> Result<()> {
     let previous = stored.result.as_ref().map(|r| r.state);
     if stored.control.is_none() {
         stored.control = seed(&stored.spec, result.assignment.generation);
     }
+    let default_timeout_seconds = stored
+        .spec
+        .run_policy
+        .as_ref()
+        .map(|policy| policy.timeout_seconds);
     let Some(c) = &mut stored.control else {
         return Ok(());
     };
     match result.state {
-        EnvironmentState::Running if c.expires_at_unix_ms == 0 => {
-            c.begin_run(now_ms()?, result.assignment.generation)?
-        }
+        EnvironmentState::Running if c.expires_at_unix_ms == 0 => c.begin_run(
+            now_ms()?,
+            result.assignment.generation,
+            default_timeout_seconds.ok_or(Error::Conflict)?,
+        )?,
         EnvironmentState::Running => c.rebind(result.assignment.generation)?,
         EnvironmentState::Paused => {
             // Snapshot uses its own pause/resume internally; preserve its lease.
@@ -72,16 +79,15 @@ impl Session {
             }
         }
         Err(Error::Unavailable(
-            "sandbox control contention; retry request".into(),
+            "environment control contention; retry request".into(),
         ))
     }
-    pub async fn set_sandbox_timeout(
+    pub async fn set_environment_timeout(
         &self,
         id: &str,
         seconds: u64,
         extend_only: bool,
     ) -> Result<StoredEnvironment> {
-        let now = now_ms()?;
         self.edit_environment_control(id, |stored| {
             let paused = stored
                 .result
@@ -92,21 +98,15 @@ impl Session {
                 return Err(Error::Conflict);
             }
             if paused && c.expires_at_unix_ms == 0 {
-                if seconds == 0 || seconds > 86400 {
-                    return Err(Error::Invalid(
-                        "paused connect timeout must be 1..86400 seconds".into(),
-                    ));
-                }
-                c.compatibility.timeout_seconds = seconds;
-                c.revision = c.revision.checked_add(1).ok_or(Error::Conflict)?;
-                Ok(())
+                c.set_timeout_override(seconds)
             } else {
-                c.set_timeout(now, seconds, extend_only)
+                // Read time inside the CAS closure so a retry never applies a stale deadline.
+                c.set_timeout(now_ms()?, seconds, extend_only)
             }
         })
         .await
     }
-    pub async fn claim_sandbox_expiry(&self, id: &str, now: u64) -> Result<StoredEnvironment> {
+    pub async fn claim_environment_expiry(&self, id: &str, now: u64) -> Result<StoredEnvironment> {
         self.edit_environment_control(id, |stored| {
             let c = stored.control.as_mut().ok_or(Error::NotFound)?;
             if !c.expiry_claimed && !c.claim_expiry(now)? {

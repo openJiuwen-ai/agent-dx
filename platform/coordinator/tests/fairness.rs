@@ -4,6 +4,7 @@ use std::time::Duration;
 
 fn request(id: &str, tenant: &str) -> EnvironmentSpec {
     EnvironmentSpec {
+        run_policy: None,
         template_identity: None,
         compatibility: None,
         runtime_profile: None,

@@ -89,6 +89,7 @@ fn environment_roundtrip_preserves_oci_source() {
 #[test]
 fn record_roundtrip_preserves_identity_state_and_ownership() {
     let spec = EnvironmentSpec {
+        run_policy: None,
         template_identity: None,
         compatibility: None,
         runtime_profile: Some(serde_json::from_value(serde_json::json!({

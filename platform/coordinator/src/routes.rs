@@ -411,21 +411,27 @@ fn published_environment(
 fn route_compatibility(environment: &StoredEnvironment) -> Option<pb::SandboxRouteCompatibility> {
     use sha2::{Digest, Sha256};
     environment
-        .control
+        .spec
+        .compatibility
         .as_ref()
-        .map(|c| pb::SandboxRouteCompatibility {
-            envd_token_sha256: format!(
-                "{:x}",
-                Sha256::digest(c.compatibility.envd_access_token.as_bytes())
-            ),
-            traffic_token_sha256: format!(
-                "{:x}",
-                Sha256::digest(c.compatibility.traffic_access_token.as_bytes())
-            ),
-            allow_public_traffic: c.compatibility.allow_public_traffic,
-            envd_ready: !c.expiry_claimed && c.expires_at_unix_ms != 0,
-            expires_at_unix_ms: c.expires_at_unix_ms,
-            control_revision: c.revision,
+        .and_then(|compatibility| {
+            environment
+                .control
+                .as_ref()
+                .map(|control| pb::SandboxRouteCompatibility {
+                    envd_token_sha256: format!(
+                        "{:x}",
+                        Sha256::digest(compatibility.envd_access_token.as_bytes())
+                    ),
+                    traffic_token_sha256: format!(
+                        "{:x}",
+                        Sha256::digest(compatibility.traffic_access_token.as_bytes())
+                    ),
+                    allow_public_traffic: compatibility.allow_public_traffic,
+                    envd_ready: !control.expiry_claimed && control.expires_at_unix_ms != 0,
+                    expires_at_unix_ms: control.expires_at_unix_ms,
+                    control_revision: control.revision,
+                })
         })
 }
 

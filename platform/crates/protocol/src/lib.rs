@@ -30,6 +30,7 @@ impl TryFrom<control::EnvironmentSpec> for adx_core::EnvironmentSpec {
             .resources
             .ok_or_else(|| Error::Invalid("resources are required".into()))?;
         let spec = Self {
+            run_policy: value.run_policy.map(TryInto::try_into).transpose()?,
             template_identity: value.template_identity.map(|identity| {
                 adx_core::NativeTemplateIdentity {
                     tenant_id: identity.tenant_id,
@@ -75,6 +76,7 @@ impl TryFrom<control::EnvironmentSpec> for adx_core::EnvironmentSpec {
 impl From<adx_core::EnvironmentSpec> for control::EnvironmentSpec {
     fn from(value: adx_core::EnvironmentSpec) -> Self {
         Self {
+            run_policy: value.run_policy.map(Into::into),
             template_identity: value.template_identity.map(|identity| {
                 control::NativeTemplateIdentity {
                     tenant_id: identity.tenant_id,
@@ -155,6 +157,10 @@ mod tests {
     #[test]
     fn environment_spec_round_trip_preserves_units_and_priority() {
         let value = adx_core::EnvironmentSpec {
+            run_policy: Some(adx_core::environment_control::RunPolicy {
+                timeout_seconds: 90_000,
+                action: adx_core::environment_control::RunExpiryAction::Pause,
+            }),
             template_identity: Some(adx_core::NativeTemplateIdentity {
                 tenant_id: "t".into(),
                 name: "python".into(),
@@ -166,8 +172,6 @@ mod tests {
                 envd_access_token: "a".repeat(32),
                 traffic_access_token: "b".repeat(32),
                 allow_public_traffic: false,
-                timeout_seconds: 60,
-                timeout_action: "pause".into(),
             }),
             runtime_profile: None,
             snapshot_id: None,
@@ -194,6 +198,7 @@ mod tests {
     #[test]
     fn native_template_identity_round_trips_without_compatibility() {
         let spec = adx_core::EnvironmentSpec {
+            run_policy: None,
             template_identity: Some(adx_core::NativeTemplateIdentity {
                 tenant_id: "tenant".into(),
                 name: "native".into(),
@@ -223,6 +228,17 @@ mod tests {
         let mut mismatched = spec;
         mismatched.template_identity.as_mut().unwrap().tenant_id = "other".into();
         assert!(mismatched.validate().is_err());
+    }
+
+    #[test]
+    fn run_policy_rejects_unspecified_action() {
+        assert!(
+            adx_core::environment_control::RunPolicy::try_from(control::RunPolicy {
+                timeout_seconds: 60,
+                action: 0,
+            })
+            .is_err()
+        );
     }
 }
 

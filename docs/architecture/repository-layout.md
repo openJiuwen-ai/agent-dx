@@ -29,7 +29,7 @@ AFS（Agent FS）是可选文件系统组件，源码、整体文档、构建、
 
 ## 可选 E2B 兼容链路
 
-E2B 管理协议适配属于 `gateway/apiserver/src/e2b`，通过现有 Activator 只读查询复用原生 TemplateVersion，固定租户内模板版本与实际执行规格，创建仍复用 EnvironmentService；部署 RuntimeProfile 是唯一可信 bootstrap/envd 配置，E2B 别名只保存 name/version，Pause/Snapshot 不回查当前别名；独立绝对期限属于平台 `EnvironmentControlRecord`；用户 metadata 独立保存在 `StoredEnvironment.user_metadata`，通过通用内部查询过滤、分页，不进入执行规格、control 或快照模板。Ingress 读取平台发布的凭据摘要、envd Ready 与期限，经 Relay 将 commands/files/PTY 请求发往 guest envd 49983。Execd 管理固定 envd 的初始化和健康，adxlet 的 Ready 同时要求 Execd 与 envd 成功；原生 ADX 沙箱不启动 envd。Firecracker 受信任 guest metadata 由打补丁的 sandboxd 在 boot/load-resume 间写入 MMDS。profile 只配置受信任 rootfs/bootstrap，不成为第二个生命周期状态机。接口、配置与请求图见 [E2B 部署指南](../deployment/e2b-compatibility.md)，当前证明范围见 [CCE 验证记录](../testing/2026-10-10-e2b-compatibility.md)。
+E2B 管理协议适配属于 `gateway/apiserver/src/e2b`，通过现有 Activator 只读查询复用原生 TemplateVersion，固定租户内模板版本与实际执行规格，创建仍复用 EnvironmentService；部署 RuntimeProfile 是唯一可信 bootstrap/envd 配置，E2B 别名只保存 name/version，Pause/Snapshot 不回查当前别名；可选绝对期限由平台 `EnvironmentSpec.run_policy` 配置、`EnvironmentControlRecord` 保存动态状态，不依赖 E2B 身份，复用原生 CAS、Pause/Delete 和操作重放，当前仅 E2B 公共入口启用；用户 metadata 独立保存在 `StoredEnvironment.user_metadata`，通过通用内部查询过滤、分页，不进入执行规格、control 或快照模板。Ingress 读取平台发布的凭据摘要、envd Ready 与期限，经 Relay 将 commands/files/PTY 请求发往 guest envd 49983。Execd 管理固定 envd 的初始化和健康，adxlet 的 Ready 同时要求 Execd 与 envd 成功；原生 ADX 沙箱不启动 envd。Firecracker 受信任 guest metadata 由打补丁的 sandboxd 在 boot/load-resume 间写入 MMDS。profile 只配置受信任 rootfs/bootstrap，不成为第二个生命周期状态机。接口、配置与请求图见 [E2B 部署指南](../deployment/e2b-compatibility.md)，当前证明范围见 [CCE 验证记录](../testing/2026-10-10-e2b-compatibility.md)。
 
 ## 实际目录
 

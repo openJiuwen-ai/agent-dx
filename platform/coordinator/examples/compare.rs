@@ -30,6 +30,7 @@ fn node(i: usize, capacity: u64, revision: usize) -> Node {
 }
 fn spec(i: usize) -> EnvironmentSpec {
     EnvironmentSpec {
+        run_policy: None,
         template_identity: None,
         compatibility: None,
         runtime_profile: None,
