@@ -53,6 +53,7 @@ impl Cache {
             };
             let artifact = CheckpointArtifact {
                 storage: String::new(),
+                scope: String::new(),
                 location: id.to_owned(),
                 size_bytes: record.manifest.size,
             };
@@ -403,6 +404,7 @@ impl ObjectCheckpointStore {
         for entry in cache.entries.values().filter(|e| e.record.staged) {
             local.push(CheckpointArtifact {
                 storage: "local".into(),
+                scope: String::new(),
                 location: entry.path.to_string_lossy().into_owned(),
                 size_bytes: entry.record.manifest.size,
             });

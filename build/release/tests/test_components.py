@@ -38,6 +38,25 @@ class ComponentManifestTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 component.create_manifest("gateway", root, "a" * 40, "x86_64-unknown-linux-gnu")
 
+    def test_execd_component_accepts_complete_optional_envd_provenance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for filename in component.REQUIRED_FILES["execd"]:
+                (root / filename).write_text(filename)
+            for filename in component.OPTIONAL_FILE_SETS["execd"]:
+                (root / filename).write_text(filename)
+            manifest = component.create_manifest(
+                "execd", root, "a" * 40, "x86_64-unknown-linux-gnu"
+            )
+            self.assertEqual(
+                set(manifest["files"]),
+                component.REQUIRED_FILES["execd"] | component.OPTIONAL_FILE_SETS["execd"],
+            )
+            component.verify_manifest(root)
+            (root / "envd-LICENSE").unlink()
+            with self.assertRaises(ValueError):
+                component.verify_manifest(root)
+
     @staticmethod
     def write_component(root, name):
         directory = root / name

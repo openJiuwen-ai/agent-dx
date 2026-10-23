@@ -26,6 +26,7 @@ async fn network_create_preserves_tenant_session_and_api_key_checks() {
                 tenant_id: "tenant".into(),
                 administrator: false,
                 expires_at_unix_seconds: 0,
+                metadata: None,
             },
         )
         .await
@@ -85,6 +86,7 @@ async fn network_create_preserves_tenant_session_and_api_key_checks() {
             .unwrap();
     }));
     let mut register = pb::RegisterNodeRequest {
+        checkpoint_scopes: vec![],
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),
@@ -270,6 +272,7 @@ async fn create_retries_delivery_and_lost_response_on_the_same_assignment() {
         accepting_allocations: false,
         labels: Default::default(),
         devices: vec![],
+        checkpoint_scopes: vec![],
     };
     worker.register_node(register.clone()).await.unwrap();
     worker
@@ -374,6 +377,7 @@ async fn create_retries_delivery_and_lost_response_on_the_same_assignment() {
             caller: caller(),
             node_session_id: String::new(),
             failed_revision: None,
+            expiry_revision: None,
         })
         .await
         .unwrap();

@@ -57,6 +57,7 @@ async fn mock_full_data_plane_protocol_matrix() {
         tunnel_security_mode: Default::default(),
         port_forward_security_mode: Default::default(),
         port_forward_routes: Vec::new(),
+        e2b: None,
     };
     node.activate_route(
         route.instance_id.clone(),
@@ -736,6 +737,7 @@ async fn assert_half_closed_route_cancel(websocket: bool) {
             tunnel_security_mode: Default::default(),
             port_forward_security_mode: Default::default(),
             port_forward_routes: Vec::new(),
+            e2b: None,
         });
     }
     store.set_ready(true);

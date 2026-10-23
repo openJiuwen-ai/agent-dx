@@ -12,10 +12,17 @@ fn store(
     bytes: u64,
     entries: usize,
 ) -> ObjectCheckpointStore {
-    ObjectCheckpointStore::new("shared".into(), remote, "test".into(), root.into(), bytes)
-        .unwrap()
-        .with_max_entries(entries)
-        .unwrap()
+    ObjectCheckpointStore::new_scoped(
+        "shared".into(),
+        "scope".into(),
+        remote,
+        "test".into(),
+        root.into(),
+        bytes,
+    )
+    .unwrap()
+    .with_max_entries(entries)
+    .unwrap()
 }
 async fn publish(
     store: &ObjectCheckpointStore,

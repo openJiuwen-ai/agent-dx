@@ -93,6 +93,9 @@ fn environment_roundtrip_preserves_oci_source() {
 #[test]
 fn record_roundtrip_preserves_identity_state_and_ownership() {
     let spec = EnvironmentSpec {
+        run_policy: None,
+        template_identity: None,
+        compatibility: None,
         runtime_profile: Some(serde_json::from_value(serde_json::json!({
             "rootfs": {"runtime_class": "runc", "type": "local", "path": "/opt/adx/runtime/rootfs.img", "readonly": false},
             "bootstrap": {"type": "erofs", "root": "/opt/adx/runtime/rootfs.img", "target": "/__adx", "entrypoint": ["/__adx/usr/local/bin/adx-execd"]},
@@ -116,6 +119,8 @@ fn record_roundtrip_preserves_identity_state_and_ownership() {
     };
     let r = EnvironmentRecord {
         execution_artifacts: vec![adx_core::CheckpointArtifact {
+            scope: "capture-scope".into(),
+
             storage: "afs".into(),
             location: "pending-capture".into(),
             size_bytes: 0,
@@ -123,6 +128,8 @@ fn record_roundtrip_preserves_identity_state_and_ownership() {
         snapshot_source: Some(adx_core::RestorePoint {
             id: "saved".into(),
             artifact: adx_core::CheckpointArtifact {
+                scope: "capture-scope".into(),
+
                 storage: "afs".into(),
                 location: "snapshot-input".into(),
                 size_bytes: 8,
@@ -214,11 +221,27 @@ fn local_directory_creation_survives_mount_protocol_roundtrip() {
 #[test]
 fn capture_reservation_is_not_a_restorable_checkpoint() {
     let artifact = control::CheckpointArtifact {
+        scope: "capture-scope".into(),
+
         storage: "afs".into(),
         location: "capture".into(),
         size_bytes: 0,
     };
     assert!(adx_core::CheckpointArtifact::try_from(artifact.clone()).is_ok());
+    let cleanup = control::CheckpointCleanup {
+        assignment: Some(control::Assignment {
+            environment_id: "environment".into(),
+            node_id: "node".into(),
+            shard_id: 0,
+            generation: 1,
+            devices: vec![],
+        }),
+        revision: 1,
+        artifacts: vec![artifact.clone()],
+    };
+    let cleanup = adx_core::CheckpointCleanup::try_from(cleanup).unwrap();
+    let restored = control::CheckpointCleanup::try_from(cleanup).unwrap();
+    assert_eq!(restored.artifacts, vec![artifact.clone()]);
     let point = control::RestorePoint {
         id: "capture".into(),
         artifact: Some(artifact),

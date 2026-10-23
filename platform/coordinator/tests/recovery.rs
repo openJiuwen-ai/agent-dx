@@ -8,6 +8,9 @@ use adx_core::{
 };
 fn saved() -> StoredSnapshot {
     let request = EnvironmentSpec {
+        run_policy: None,
+        template_identity: None,
+        compatibility: None,
         runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),
@@ -73,13 +76,17 @@ fn saved() -> StoredSnapshot {
                 proxy_address: "127.0.0.1:9001".into(),
                 session: None,
                 scheduling_paused: false,
+                checkpoint_scopes: Default::default(),
+                checkpoint_gc_fenced: false,
             },
         )]
         .into(),
         environments: [(
             "i".into(),
             StoredEnvironment {
+                user_metadata: Default::default(),
                 resume: None,
+                control: None,
                 failed_since_unix_seconds: None,
                 recovery: None,
                 invalidated: false,

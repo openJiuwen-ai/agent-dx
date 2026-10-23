@@ -10,7 +10,7 @@ use adx_transport::deadline::Deadline;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -22,6 +22,7 @@ type CreateKey = (String, String);
 struct CreateOperation {
     digest: Vec<u8>,
     spec: pb::EnvironmentSpec,
+    user_metadata: BTreeMap<String, String>,
     result: Option<Result<Value, Status>>,
     created_at: Instant,
     deadline: Deadline,
@@ -115,6 +116,21 @@ impl EnvironmentService {
             .await
     }
 
+    /// Execute a read-merge-write operation only at the inspected revision.
+    pub async fn execute_at_revision(
+        &self,
+        kind: Kind,
+        id: &str,
+        request_id: &str,
+        body: Value,
+        caller: &pb::CallerContext,
+        required_revision: u64,
+    ) -> Result<Value, Status> {
+        self.operations
+            .execute_at_revision(kind, id, request_id, body, caller, required_revision)
+            .await
+    }
+
     /// Inspect the caller-visible Environment through the same versioned
     /// ownership directory used by REST lifecycle requests.
     pub async fn inspect(
@@ -164,12 +180,28 @@ impl EnvironmentService {
         request_id: &str,
         caller: &pb::CallerContext,
     ) -> Result<Value, Status> {
+        self.create_with_metadata(spec, input, request_id, caller, BTreeMap::new())
+            .await
+    }
+
+    /// Create an Environment with platform-owned user metadata. The metadata participates in
+    /// idempotency and is carried separately from the execution specification.
+    pub async fn create_with_metadata(
+        &self,
+        spec: pb::EnvironmentSpec,
+        input: Value,
+        request_id: &str,
+        caller: &pb::CallerContext,
+        user_metadata: BTreeMap<String, String>,
+    ) -> Result<Value, Status> {
         if request_id.len() > 256 {
             return Err(Status::invalid_argument("request ID too long"));
         }
+        adx_core::metadata::validate_user_metadata(&user_metadata).map_err(adx_protocol::status)?;
         let create_key = (caller.tenant_id.clone(), request_id.to_string());
         let request_digest = Sha256::digest(
-            serde_json::to_vec(&input).expect("serde_json::Value serialization is infallible"),
+            serde_json::to_vec(&(&input, &user_metadata))
+                .map_err(|_| Status::internal("unable to encode create identity"))?,
         )
         .to_vec();
         let (operation, retry_pending) = {
@@ -182,6 +214,7 @@ impl EnvironmentService {
                 let operation = Arc::new(Mutex::new(CreateOperation {
                     digest: request_digest.clone(),
                     spec,
+                    user_metadata,
                     result: None,
                     created_at: Instant::now(),
                     deadline: Deadline::after(Duration::from_secs(contract::create_timeout(
@@ -229,7 +262,9 @@ impl EnvironmentService {
             };
             if let Some(other) = other {
                 let other = other.lock().await;
-                if !matches_spec(&operation.spec, &other.spec) {
+                if !matches_spec(&operation.spec, &other.spec)
+                    || operation.user_metadata != other.user_metadata
+                {
                     let result = Err(Status::already_exists(
                         "environment create in progress with different arguments",
                     ));
@@ -239,7 +274,13 @@ impl EnvironmentService {
                 }
             }
             let result = self
-                .reuse_existing(&operation.spec, &input, request_id, caller)
+                .reuse_existing(
+                    &operation.spec,
+                    &operation.user_metadata,
+                    &input,
+                    request_id,
+                    caller,
+                )
                 .await;
             self.finish_create(&create_key, &mut operation, &result)
                 .await;
@@ -325,7 +366,10 @@ impl EnvironmentService {
                         .spec
                         .as_ref()
                         .ok_or_else(|| Status::data_loss("owner specification missing"))?,
-                ) {
+                ) || !self
+                    .metadata_matches(&spec.id, caller, &operation.user_metadata)
+                    .await?
+                {
                     return Err(Status::already_exists(
                         "environment already exists with different arguments",
                     ));
@@ -367,6 +411,7 @@ impl EnvironmentService {
                 create_timeout_seconds: timeouts.create_seconds,
                 create_deadline_unix_millis: deadline.unix_millis(),
                 expected_assignment: expected_assignment.clone(),
+                user_metadata: operation.user_metadata.clone().into_iter().collect(),
             },
             budget,
         ))
@@ -417,6 +462,7 @@ impl EnvironmentService {
     async fn reuse_existing(
         &self,
         spec: &pb::EnvironmentSpec,
+        user_metadata: &BTreeMap<String, String>,
         input: &Value,
         request_id: &str,
         caller: &pb::CallerContext,
@@ -431,7 +477,32 @@ impl EnvironmentService {
         let record = owner
             .record
             .ok_or_else(|| Status::data_loss("environment directory returned no record"))?;
+        if !self
+            .metadata_matches(&spec.id, caller, user_metadata)
+            .await?
+        {
+            return Err(Status::already_exists(
+                "environment already exists with different arguments",
+            ));
+        }
         existing_running_response(spec, input, request_id, &record)
+    }
+
+    async fn metadata_matches(
+        &self,
+        id: &str,
+        caller: &pb::CallerContext,
+        user_metadata: &BTreeMap<String, String>,
+    ) -> Result<bool, Status> {
+        let metadata = self
+            .clients
+            .environment_metadata(id, caller)
+            .await?
+            .user_metadata;
+        Ok(metadata.len() == user_metadata.len()
+            && user_metadata
+                .iter()
+                .all(|(key, value)| metadata.get(key) == Some(value)))
     }
 }
 
@@ -550,6 +621,7 @@ fn matches_spec(want: &pb::EnvironmentSpec, got: &pb::EnvironmentSpec) -> bool {
     want.id == got.id
         && want.tenant_id == got.tenant_id
         && want.snapshot_id == got.snapshot_id
+        && want.compatibility == got.compatibility
         && (!got.image.is_empty() || got.runtime_profile.is_some())
         && !got.runtime_class.is_empty()
         && (want.image.is_empty() || want.image == got.image)
@@ -623,9 +695,11 @@ mod tests {
         let operation = Arc::new(Mutex::new(CreateOperation {
             digest: Vec::new(),
             spec: pb::EnvironmentSpec {
+                compatibility: None,
                 id: "environment".into(),
                 ..Default::default()
             },
+            user_metadata: BTreeMap::new(),
             result: None,
             created_at: old,
             deadline: Deadline::after(Duration::from_secs(90)).unwrap(),
@@ -658,9 +732,11 @@ mod tests {
                 Arc::new(Mutex::new(CreateOperation {
                     digest: Vec::new(),
                     spec: pb::EnvironmentSpec {
+                        compatibility: None,
                         id: "environment".into(),
                         ..Default::default()
                     },
+                    user_metadata: BTreeMap::new(),
                     result: None,
                     created_at: now - Duration::from_secs(30),
                     deadline: Deadline::after(Duration::from_secs(90)).unwrap(),
@@ -682,6 +758,7 @@ mod tests {
     #[test]
     fn existing_running_name_converges_only_for_identical_spec() {
         let spec = pb::EnvironmentSpec {
+            compatibility: None,
             id: "tenant-worker".into(),
             tenant_id: "tenant".into(),
             runtime_class: "runsc".into(),
@@ -720,6 +797,7 @@ mod tests {
     #[test]
     fn custom_reverse_tunnel_port_is_encoded_in_public_path() {
         let mut spec = pb::EnvironmentSpec {
+            compatibility: None,
             id: "tenant-worker".into(),
             tenant_id: "tenant".into(),
             ..Default::default()
@@ -756,6 +834,7 @@ mod tests {
             snapshot_source: None,
             failure: None,
             spec: Some(pb::EnvironmentSpec {
+                compatibility: None,
                 id: "tenant-worker".into(),
                 tenant_id: "tenant".into(),
                 ..Default::default()

@@ -26,6 +26,10 @@ AFS_REQUIRED_FILES = {
     "third_party/afs-source/LICENSE",
     "third_party/afs-source/NOTICE",
 }
+ENVD_PROVENANCE_FILES = {
+    "runtime/envd/manifest.json",
+    "runtime/envd/LICENSE",
+}
 
 
 def sha256(path: Path) -> str:
@@ -57,6 +61,9 @@ def verify(directory: Path, *, enforce_host_architecture: bool = False) -> dict:
     target = manifest.get("target", "")
     if manifest.get("profile") == "release" and "linux" in target:
         required.add("runtime/adx-runtime-rootfs.img")
+    envd_artifacts = expected & ENVD_PROVENANCE_FILES
+    if envd_artifacts and envd_artifacts != ENVD_PROVENANCE_FILES:
+        raise ValueError("incomplete envd provenance")
     afs_artifacts = {f"bin/{binary}" for binary in AFS_BINARIES} & expected
     afs_artifacts.update(path for path in expected if path.startswith("etc/examples/afs/"))
     afs_artifacts.update(path for path in expected if path.startswith("third_party/afs-source/"))

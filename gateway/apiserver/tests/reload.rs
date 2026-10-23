@@ -60,6 +60,12 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
         Ok(Response::new(state.owner.clone()))
     }
 }, [
+    get_environment_metadata(GetEnvironmentMetadataRequest) -> EnvironmentMetadataRecord,
+    list_environment_metadata(ListEnvironmentMetadataRequest) -> ListEnvironmentMetadataResponse,
+    list_e2b_environment_metadata(ListEnvironmentMetadataRequest) -> ListEnvironmentMetadataResponse,
+    get_environment_control(GetEnvironmentControlRequest) -> EnvironmentControlRecord,
+    update_environment_control(UpdateEnvironmentControlRequest) -> EnvironmentControlRecord,
+    list_environment_controls(ListEnvironmentControlsRequest) -> ListEnvironmentControlsResponse,
     get_scheduling_queue(GetSchedulingQueueRequest) -> GetSchedulingQueueResponse,
     set_node_scheduling(SetNodeSchedulingRequest) -> NodeSchedulingState,
     prepare_create(LocalEnvironmentCreateRequest) -> PreparedEnvironment,
@@ -128,6 +134,7 @@ service_impl!(pb::node_service_server::NodeService, {
     update_network_policy(UpdateNetworkPolicyRequest) -> EnvironmentResult,
     create_snapshot(CreateSnapshotRequest) -> CreateSnapshotResponse,
     collect_snapshot(CollectSnapshotRequest) -> CollectSnapshotResponse,
+    collect_checkpoint_cleanup(CollectCheckpointCleanupRequest) -> CollectCheckpointCleanupResponse,
 ]);
 
 struct Fixture {
@@ -151,6 +158,7 @@ impl Fixture {
                 snapshot_source: None,
                 failure: None,
                 spec: Some(pb::EnvironmentSpec {
+                    compatibility: None,
                     id: "environment".into(),
                     tenant_id: "tenant".into(),
                     ..Default::default()

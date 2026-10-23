@@ -7,6 +7,7 @@ use adx_core::{CheckpointArtifact, Error, Result};
 use async_trait::async_trait;
 pub use filesystem::FilesystemCheckpointStore;
 pub use object::ObjectCheckpointStore;
+use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -30,6 +31,11 @@ pub fn now() -> Result<u64> {
 pub trait CheckpointAccess: Send + Sync {
     fn storage_alias(&self) -> &str {
         "local"
+    }
+    /// A stable identity for the configured shared backend. Local and
+    /// unpinned remote configurations must not participate in delegation.
+    fn shared_scope(&self) -> Option<&str> {
+        None
     }
     fn validate_policy(&self, policy: adx_core::lifecycle::CheckpointStorage) -> Result<()> {
         if policy == adx_core::lifecycle::CheckpointStorage::Shared
@@ -60,6 +66,7 @@ pub trait CheckpointAccess: Send + Sync {
     fn capture_references(&self, staged: &Path) -> Result<Vec<CheckpointArtifact>> {
         Ok(vec![CheckpointArtifact {
             storage: "local".into(),
+            scope: String::new(),
             location: staged.to_string_lossy().into_owned(),
             size_bytes: 0,
         }])
@@ -199,6 +206,7 @@ impl CheckpointAccess for LocalCheckpointStore {
     async fn discard_staged(&self, staged: &Path) -> Result<()> {
         self.release(&CheckpointArtifact {
             storage: "local".into(),
+            scope: String::new(),
             location: staged.to_string_lossy().into_owned(),
             size_bytes: 0,
         })
@@ -218,6 +226,7 @@ impl CheckpointAccess for LocalCheckpointStore {
         }
         Ok(CheckpointArtifact {
             storage: "local".into(),
+            scope: String::new(),
             location: path.to_string_lossy().into_owned(),
             size_bytes: size,
         })
@@ -285,6 +294,24 @@ pub enum StorageConfig {
     },
 }
 impl StorageConfig {
+    /// Returns a stable, non-secret identity for the exact remote target used by
+    /// this process. An SDK-inherited endpoint is intentionally insufficient:
+    /// delegation requires a configured target bound into artifact metadata.
+    pub fn shared_scope(&self) -> Option<String> {
+        let Self::S3 {
+            alias,
+            bucket,
+            region,
+            endpoint: Some(endpoint),
+            prefix,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        s3_scope(alias, bucket, region, endpoint, prefix)
+    }
+
     pub fn build(self) -> Result<Arc<dyn CheckpointAccess>> {
         self.build_owned(None)
     }
@@ -296,6 +323,7 @@ impl StorageConfig {
         self.build_owned(Some((node_id, session_id)))
     }
     fn build_owned(self, owner: Option<(String, String)>) -> Result<Arc<dyn CheckpointAccess>> {
+        let scope = self.shared_scope().unwrap_or_default();
         match self {
             Self::DistributedFs {
                 alias,
@@ -325,8 +353,9 @@ impl StorageConfig {
                     builder = builder.with_endpoint(endpoint);
                 }
                 let remote = builder.build().map_err(io_error)?;
-                let store = ObjectCheckpointStore::new(
+                let store = ObjectCheckpointStore::new_scoped(
                     alias,
+                    scope,
                     Arc::new(remote),
                     prefix,
                     root,
@@ -342,4 +371,27 @@ impl StorageConfig {
             }
         }
     }
+}
+
+fn s3_scope(
+    alias: &str,
+    bucket: &str,
+    region: &str,
+    endpoint: &str,
+    prefix: &str,
+) -> Option<String> {
+    if alias.is_empty()
+        || bucket.is_empty()
+        || region.is_empty()
+        || endpoint.trim().is_empty()
+        || prefix.is_empty()
+    {
+        return None;
+    }
+    let mut hash = Sha256::new();
+    for value in ["s3-v1", alias, endpoint, bucket, region, prefix] {
+        hash.update(value.as_bytes());
+        hash.update([0]);
+    }
+    Some(format!("s3:{:x}", hash.finalize()))
 }

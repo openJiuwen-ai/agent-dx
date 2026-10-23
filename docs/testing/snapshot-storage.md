@@ -95,6 +95,8 @@ Meta 校验固定源版本、同 namespace、源/目标范围及完整布局；�
 Coordinator 的 S3 身份需要 prefix 下的 List/Delete；共享文件系统身份需要目录访问与删除权限。
 缺少回收器时删除保持待完成并报告错误，不转交给源节点删除共享数据。
 
+Environment 删除后的制品回收使用 Coordinator 持久 outbox，任务与 Deleted 退役原子提交；公开 DELETE 与对象最终删除分开。共享制品由 Coordinator 的 `ArtifactReclaimer` 物理删除，节点 `release()` 只负责本地目录或缓存，不能将清缓存当成共享对象回收成功。含本地目录的任务仍依赖原节点确认，缺少回收器或本地节点不可达时保留任务重试；只有各部分实际完成后才确认 outbox。S3 的非空 scope 必须与配置 namespace 一致。完整合同见 [Failed Environment GC](failed-environment-gc.md#deleted-后的持久对象清理)。
+
 ## 文件接口与流程
 
 节点侧：
@@ -248,7 +250,7 @@ Watch 窗口设为 16 个 revision，保留生产的 60 秒引用保护期。
 `gc-observations.json` 记录每阶段的 Meta 实体、幂等结果、Watch 水位，以及各 Node 的
 实际 chunk 数量、字节和 catalog 大小。两批之间等待保护期结束，比较稳定存量；删除
 Environment 后必须回到初始存量附近，同时 inode、目录项、版本、布局、引用、写租约和 chunk
-实体不能超过初始数量。初始存量只允许 CheckpointStore 的三字节 `store-id` 及其元数据，
+实体不能超过初始数量。初始存量只允许 存储后端的三字节 `store-id` 及其元数据，
 不允许上轮执行文件或写租约。只看到目录删除或 SDK 成功不能判定物理回收通过。
 执行拓扑仍是一台 KVM 主机上的两个隔离执行节点，不代表两个物理故障域。
 

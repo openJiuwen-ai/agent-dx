@@ -117,6 +117,7 @@ impl EnvironmentDirectory {
 
     pub fn put(&mut self, value: pb::GetEnvironmentResponse) -> Result<(), Status> {
         let published = pb::PublishedEnvironment {
+            compatibility: None,
             record: value.record,
             node_address: value.node_address,
             relay_address: value.relay_address,
@@ -225,11 +226,13 @@ mod tests {
 
     fn entry(id: &str, generation: u64, revision: u64) -> pb::PublishedEnvironment {
         pb::PublishedEnvironment {
+            compatibility: None,
             record: Some(pb::EnvironmentRecord {
                 execution_artifacts: vec![],
                 snapshot_source: None,
                 failure: None,
                 spec: Some(pb::EnvironmentSpec {
+                    compatibility: None,
                     id: id.into(),
                     tenant_id: "tenant".into(),
                     ..Default::default()

@@ -28,9 +28,8 @@ class BackendObsTests(unittest.TestCase):
         self.output = self.root / "installed"
         self.archive = self.root / "backend.tar.gz"
         self.pin = self.root / "artifacts.json"
-        self.revision = json.loads(
-            (backend.ROOT / "third_party/sandboxd/source.json").read_text()
-        )["revision"]
+        pinned = json.loads((backend.ROOT / "third_party/sandboxd/source.json").read_text())
+        self.revision = pinned["revision"]
         for name in backend.BACKEND_BINARIES:
             self.payload.joinpath(name).write_bytes(
                 b"\x7fELF\x02\x01"
@@ -40,6 +39,10 @@ class BackendObsTests(unittest.TestCase):
             )
         self.manifest = {
             "sandboxd_revision": self.revision,
+            "sandboxd_patches": [
+                {"path": patch["path"], "sha256": patch["sha256"]}
+                for patch in pinned["patches"]
+            ],
             "target": TARGET,
             "files": {
                 name: backend.sha(self.payload / name)

@@ -115,6 +115,35 @@ impl Operations {
             self.clients.put_owner(owner).await?;
             return Ok(value);
         }
+        self.execute_inner(kind, id, request_id, body, caller, None)
+            .await
+    }
+
+    /// Executes a lifecycle operation only if a fresh owner lookup still has
+    /// `required_revision`. E2B network updates use this to avoid publishing a
+    /// stale read-merge-write result.
+    pub async fn execute_at_revision(
+        &self,
+        kind: Kind,
+        id: &str,
+        request_id: &str,
+        body: Value,
+        caller: &pb::CallerContext,
+        required_revision: u64,
+    ) -> Result<Value, Status> {
+        self.execute_inner(kind, id, request_id, body, caller, Some(required_revision))
+            .await
+    }
+
+    async fn execute_inner(
+        &self,
+        kind: Kind,
+        id: &str,
+        request_id: &str,
+        body: Value,
+        caller: &pb::CallerContext,
+        required_revision: Option<u64>,
+    ) -> Result<Value, Status> {
         let seconds = number(&body, "timeoutSeconds", 300, 3600)?;
         let name = body
             .get("name")
@@ -135,7 +164,13 @@ impl Operations {
         let clients = &self.clients;
         // Workload checkpoint acknowledges publication before the directory watch
         // necessarily catches up. Reload must start from the committed revision.
-        let mut owner = clients.owner(id, caller, kind == Kind::Reload).await?;
+        let mut owner = clients
+            .owner(
+                id,
+                caller,
+                kind == Kind::Reload || required_revision.is_some(),
+            )
+            .await?;
         if kind == Kind::Delete
             && owner
                 .record
@@ -190,6 +225,9 @@ impl Operations {
         } else {
             default_retention
         };
+        if required_revision.is_some_and(|required| required != record.revision) {
+            return Err(Status::aborted("sandbox revision changed"));
+        }
         if kind == Kind::Delete
             && record.state == pb::EnvironmentState::Deleted as i32
             && !record.resources_held
@@ -248,6 +286,7 @@ impl Operations {
                             "apiserver.delete",
                             node.delete_environment(trace::inject(pb::DeleteEnvironmentRequest {
                                 failed_revision: None,
+                                expiry_revision: None,
                                 node_session_id: String::new(),
                                 assignment,
                                 caller: caller_context,
@@ -267,6 +306,8 @@ impl Operations {
                                 expected_revision: operation.expected,
                                 retention: Some(retention.into()),
                                 timeout_seconds: seconds,
+                                expiry_revision: None,
+                                node_session_id: String::new(),
                             })),
                         )
                         .await
@@ -452,6 +493,7 @@ pub fn number(value: &Value, key: &str, default: u64, max: u64) -> Result<u64, S
     }
     Ok(value)
 }
+
 pub fn snapshot_value(
     s: &pb::ReusableSnapshot,
     caller: &pb::CallerContext,

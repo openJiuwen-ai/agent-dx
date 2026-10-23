@@ -63,6 +63,8 @@ async fn pause(node: &Arc<Adxlet>, record: EnvironmentRecord) -> EnvironmentReco
         }),
         operation_id: format!("pause-{}", record.revision),
         expected_revision: record.revision,
+        expiry_revision: None,
+        node_session_id: String::new(),
         timeout_seconds: 5,
         retention: Some(adx_core::lifecycle::RetentionPolicy::Forever.into()),
     }))

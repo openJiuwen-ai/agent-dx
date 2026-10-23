@@ -27,6 +27,10 @@ Environment 自动暂停复用 idle timeout，策略为 delete/pause；匿名恢
 
 AFS（Agent FS）是可选文件系统组件，源码、整体文档、构建、CI 和发布入口统一使用 `afs`。OwnerFs 与 DFS 是其内部平级模式；模式模块及 `ownerfs_*`／`dfs_*` 配置沿用各自名称。参见 [AFS 架构与关键时序图](afs.md)，其中包含 OwnerFs／DFS 总览、workspace bind 与远端路径、DFS 外部 S3 发布和读取流程。
 
+## 可选 E2B 兼容链路
+
+E2B 管理协议适配属于 `gateway/apiserver/src/e2b`，通过现有 Activator 只读查询复用原生 TemplateVersion，固定租户内模板版本与实际执行规格，创建仍复用 EnvironmentService；部署 RuntimeProfile 是唯一可信 bootstrap/envd 配置，E2B 别名只保存 name/version，Pause/Snapshot 不回查当前别名；可选绝对期限由平台 `EnvironmentSpec.run_policy` 配置、`EnvironmentControlRecord` 保存动态状态，不依赖 E2B 身份，复用原生 CAS、Pause/Delete 和操作重放，当前仅 E2B 公共入口启用；用户 metadata 独立保存在 `StoredEnvironment.user_metadata`，通过通用内部查询过滤、分页，不进入执行规格、control 或快照模板。Ingress 读取平台发布的凭据摘要、envd Ready 与期限，经 Relay 将 commands/files/PTY 请求发往 guest envd 49983。Execd 管理固定 envd 的初始化和健康，adxlet 的 Ready 同时要求 Execd 与 envd 成功；原生 ADX 沙箱不启动 envd。Firecracker 受信任 guest metadata 由打补丁的 sandboxd 在 boot/load-resume 间写入 MMDS。profile 只配置受信任 rootfs/bootstrap，不成为第二个生命周期状态机。接口、配置与请求图见 [E2B 部署指南](../deployment/e2b-compatibility.md)，当前证明范围见 [CCE 验证记录](../testing/2026-10-10-e2b-compatibility.md)。
+
 ## 实际目录
 
 ```text
@@ -110,7 +114,7 @@ agent-dx/
 | adxlet | `controller.rs`、`controller/{lifecycle,monitor,snapshots}.rs` | 每 Environment 串行任务、暂停/恢复/删除、空闲回收与重启 |
 | adxlet | `runtime_router.rs`、`sandboxd.rs`、`jiuwenbox/` | 按 runtime class 创建、按执行归属分发；Jiuwenbox 从权威目录重建内存关联，复用独立 EROFS 和原生 ACL；后端源码不变 |
 | adxlet | `runtime_control.rs`、`readiness.rs` | Execd 双向控制流／HTTP 协作与就绪 |
-| adxlet | `checkpoint.rs`、`checkpoint/` | 可扩展 CheckpointStore、本地/S3、缓存引用和远端孤儿回收 |
+| adxlet / checkpoint-storage | `platform/adxlet/src/checkpoint.rs`、`platform/crates/checkpoint-storage/` | CheckpointAccess 捕获/恢复与本地缓存；Coordinator ArtifactReclaimer 负责共享制品物理回收，Deleted outbox 保留失败重试 |
 | adxlet | `node_reconciliation.rs`、`reconciliation.rs`、`journal.rs` | 全后端共用启动和周期性权威对账、孤儿/晚到资源清理、准入及心跳协调；既有可选 SQLite 结果降级日志 |
 | adxlet | `resources.rs`、`routes.rs`、`activity.rs`、`proxy.rs` | 容量源/准入、绑定同步、活动采集、代理进程组合 |
 | Rust API Server | `contract.rs`、`http.rs`、`clients.rs`、`operations.rs` | HTTP 兼容字段到 Environment RPC；认证、版本化 Environment 目录订阅、入口节点轮转、直达节点、快照目录 |

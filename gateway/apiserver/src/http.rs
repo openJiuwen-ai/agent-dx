@@ -4,6 +4,8 @@ use crate::{
     errors::ErrorDetail,
     operations::{snapshot_value, Kind},
 };
+use adx_agent_api::{managed::ManagedService, request::RequestContext as AgentRequestContext};
+use adx_agent_core::{error::Error as AgentError, TemplateVersion};
 use adx_observability::trace;
 use adx_protocol::control as pb;
 use adx_transport::request::RequestContext;
@@ -37,20 +39,82 @@ pub type Body = UnsyncBoxBody<Bytes, Error>;
 pub struct Api {
     pub clients: Arc<Clients>,
     pub environment_service: Arc<EnvironmentService>,
+    pub templates: Option<Arc<ManagedService>>,
     proxy: reqwest::Client,
 }
 impl Api {
     pub fn new(clients: Arc<Clients>) -> Result<Arc<Self>, Error> {
+        Self::build(clients, None)
+    }
+
+    /// Construct an API with a trusted, read-only Agent template source.
+    pub fn with_templates(
+        clients: Arc<Clients>,
+        templates: Arc<ManagedService>,
+    ) -> Result<Arc<Self>, Error> {
+        Self::build(clients, Some(templates))
+    }
+
+    /// Construct an API and embedded template source over one Environment service instance.
+    pub fn with_templates_and_environment(
+        clients: Arc<Clients>,
+        environment_service: Arc<EnvironmentService>,
+        templates: Arc<ManagedService>,
+    ) -> Result<Arc<Self>, Error> {
+        Self::build_with_environment(clients, environment_service, Some(templates))
+    }
+
+    fn build(
+        clients: Arc<Clients>,
+        templates: Option<Arc<ManagedService>>,
+    ) -> Result<Arc<Self>, Error> {
+        let environment_service = EnvironmentService::new(clients.clone());
+        Self::build_with_environment(clients, environment_service, templates)
+    }
+
+    fn build_with_environment(
+        clients: Arc<Clients>,
+        environment_service: Arc<EnvironmentService>,
+        templates: Option<Arc<ManagedService>>,
+    ) -> Result<Arc<Self>, Error> {
         Ok(Arc::new(Self {
-            environment_service: EnvironmentService::new(clients.clone()),
+            environment_service,
             clients,
+            templates,
             proxy: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(10))
                 .build()?,
         }))
     }
+
+    /// Read a published template without selecting or activating an AgentBinding.
+    pub async fn native_template(
+        &self,
+        tenant: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<TemplateVersion, Status> {
+        let templates = self.templates.as_ref().ok_or_else(|| {
+            Status::failed_precondition("native template source is not configured")
+        })?;
+        let context = AgentRequestContext::new(self.clients.config.timeout());
+        templates
+            .template(&context, tenant, name, version)
+            .await
+            .map_err(native_template_error)
+    }
     pub async fn serve(
+        self: Arc<Self>,
+        request: Request<Incoming>,
+    ) -> Result<Response<Body>, Infallible> {
+        // Hyper polls this public service future directly on its connection
+        // worker. Keep the full request tracing and dispatch state off that
+        // default worker frame.
+        Box::pin(self.serve_inner(request)).await
+    }
+
+    async fn serve_inner(
         self: Arc<Self>,
         request: Request<Incoming>,
     ) -> Result<Response<Body>, Infallible> {
@@ -112,15 +176,35 @@ impl Api {
     }
     async fn handle(self: Arc<Self>, request: Request<Incoming>) -> Response<Body> {
         let request_id = RequestContext::from_headers(request.headers()).request_id;
-        let api_key = header(&request, "authorization")
-            .and_then(|s| s.strip_prefix("Bearer "))
-            .or_else(|| header(&request, "x-auth-token"))
-            .or_else(|| header(&request, "x-auth"))
-            .unwrap_or("")
-            .trim();
-        let caller = match Box::pin(self.clients.authenticate(api_key)).await {
+        let e2b_route = crate::e2b::http::route(request.uri().path());
+        let api_key = if crate::e2b::keys::route(request.uri().path()) {
+            match crate::e2b::keys::token(request.headers()) {
+                Ok(key) => key,
+                Err(error) => return crate::e2b::http::authentication_error(error),
+            }
+        } else if e2b_route {
+            header(&request, "x-api-key").unwrap_or("").trim()
+        } else {
+            header(&request, "authorization")
+                .and_then(|s| s.strip_prefix("Bearer "))
+                .or_else(|| header(&request, "x-auth-token"))
+                .or_else(|| header(&request, "x-auth"))
+                .unwrap_or("")
+                .trim()
+        };
+        let authentication = async {
+            if e2b_route {
+                self.clients.authenticate_fresh(api_key).await
+            } else {
+                self.clients.authenticate(api_key).await
+            }
+        };
+        let caller = match Box::pin(authentication).await {
             Ok(caller) => caller,
             Err(error) => {
+                if e2b_route {
+                    return crate::e2b::http::authentication_error(error);
+                }
                 let status = if matches!(error.code(), Code::Unavailable | Code::DeadlineExceeded) {
                     Status::unavailable("authentication service unavailable")
                 } else {
@@ -129,6 +213,11 @@ impl Api {
                 return error_response(status, &request_id, None, None, false);
             }
         };
+        if e2b_route {
+            // Keep the opt-in adapter's RPC futures off the native request
+            // frame; both protocols share this listener on default stacks.
+            return Box::pin(crate::e2b::http::handle(self, request, caller)).await;
+        }
         let path = match percent_encoding::percent_decode_str(request.uri().path()).decode_utf8() {
             Ok(path) => path.trim_end_matches('/').to_string(),
             Err(_) => {
@@ -616,6 +705,7 @@ impl Api {
                             caller: Some(caller.clone()),
                             tenant_id: input.tenant_id.clone(),
                             expires_at_unix_seconds: input.expires_at_unix_seconds,
+                            name: None,
                         })),
                     )
                     .await?;
@@ -658,6 +748,8 @@ impl Api {
                         client.revoke_tenant_key(trace::inject(pb::RevokeTenantKeyRequest {
                             caller: Some(caller.clone()),
                             id: id.into(),
+                            public_id: String::new(),
+                            tenant_id: String::new(),
                         })),
                     )
                     .await?;
@@ -717,6 +809,19 @@ impl Api {
                 output
             }
         }
+    }
+}
+
+fn native_template_error(error: AgentError) -> Status {
+    match error {
+        AgentError::Invalid(message) => Status::invalid_argument(message),
+        AgentError::Unsupported(message) => Status::unimplemented(message),
+        AgentError::NotFound => Status::not_found("native template not found"),
+        AgentError::NotReady(message) | AgentError::Unavailable(message) => {
+            Status::unavailable(message)
+        }
+        AgentError::Conflict(message) => Status::aborted(message),
+        AgentError::OutcomeUnknown(message) => Status::unavailable(message),
     }
 }
 fn trace_identifiers(context: &str) -> (&str, &str) {
@@ -842,7 +947,7 @@ fn create_error_event(error: &Status, request_id: &str, environment_id: &str) ->
 fn sse(name: &str, data: Value) -> Frame<Bytes> {
     Frame::data(Bytes::from(format!("event: {name}\ndata: {data}\n\n")))
 }
-async fn body(body: Incoming, limit: usize) -> Result<Value, Status> {
+pub(crate) async fn body(body: Incoming, limit: usize) -> Result<Value, Status> {
     let bytes = tokio::time::timeout(
         Duration::from_secs(10),
         http_body_util::Limited::new(body, limit).collect(),
@@ -1529,6 +1634,7 @@ mod error_contract_tests {
         let value = scheduling_queue_view(pb::GetSchedulingQueueResponse {
             environments: vec![pb::PendingEnvironment {
                 spec: Some(pb::EnvironmentSpec {
+                    compatibility: None,
                     id: "environment-a".into(),
                     resources: Some(pb::Resources {
                         cpu_millis: 2000,

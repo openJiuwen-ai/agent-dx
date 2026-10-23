@@ -50,6 +50,8 @@ Agent DX (**Agent Distributed eXecutor**) is a distributed execution substrate f
 
 API Server embeds Ingress by default, and adxlet embeds Relay by default. Both pairs keep the same contracts when configured as separate processes.
 
+An opt-in experimental [E2B compatibility profile](docs/deployment/e2b-compatibility.md) adds E2B management adapters, a pinned guest envd service, token-aware routing and durable runtime deadlines. It also adapts tenant-bound API key management and IPv4/CIDR egress policies to native ADX services. See the [base CCE verification](docs/testing/2026-10-10-e2b-compatibility.md) and [key/network component verification](docs/testing/2026-10-15-e2b-key-network-adaptation.md) for the supported scope and remaining runtime checks.
+
 ## 📦 Installation
 
 ADX release packages target Linux and contain `adx-coordinator`, `adxlet` (embedded Relay by default), `adx-apiserver` (embedded Ingress by default), the optional standalone `adx-ingress` and `adx-relay` binaries, `adxctl`, the read-only [`adx-inspect`](docs/deployment/adx-inspect.md), Execd, the Python Environment SDK, and managed Redis with `redis-cli`. The debug forwarder is a source-build tool. sandboxd remains independently managed and is pinned by [`third_party/sandboxd/source.json`](third_party/sandboxd/source.json).

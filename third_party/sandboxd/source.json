@@ -6,12 +6,27 @@
     {
       "source": "api/runtime/v1/sandbox-api.proto",
       "vendored": "sandbox-api.proto",
-      "sha256": "a0053b7d6b5f9f4ce1e344e96741192a98a11e79d6b1cac4d17fea5a36b716ab"
+      "sha256": "a0053b7d6b5f9f4ce1e344e96741192a98a11e79d6b1cac4d17fea5a36b716ab",
+      "vendored_sha256": "cd6370d14b5898a9fd7f3a0b7c331fad27348570ac1a5f5d4a94a4be96eac25a"
     },
     {
       "source": "LICENSE",
       "vendored": "LICENSE",
       "sha256": "0b81e2ea9cf9c447b3317b84e5bbaca9f3cf98a5d08ef8d754a3286f21c3392a"
+    }
+  ],
+  "patches": [
+    {
+      "path": "third_party/sandboxd/patches/trusted-guest-metadata.patch",
+      "sha256": "47caebfcd3ebfb6502607f85d7d8db9c5764b50ab9d0193bab2f77c3cc53051d"
+    },
+    {
+      "path": "third_party/sandboxd/patches/firecracker-realtime-restore.patch",
+      "sha256": "bb147e0ff139b320be3d27f6beed6d2def714c18e9b24fc5644b87f1f11a4ed5"
+    },
+    {
+      "path": "third_party/sandboxd/patches/firecracker-restore-network-fence.patch",
+      "sha256": "92c98a1547c1cf44f819a0c9d7372bb33482e97d4798ab42be0fe04278421899"
     }
   ]
 }

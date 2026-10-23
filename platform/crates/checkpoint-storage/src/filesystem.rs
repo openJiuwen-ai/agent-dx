@@ -173,6 +173,7 @@ impl CheckpointAccess for FilesystemCheckpointStore {
     fn capture_references(&self, staged: &Path) -> Result<Vec<CheckpointArtifact>> {
         Ok(vec![CheckpointArtifact {
             storage: self.alias.clone(),
+            scope: String::new(),
             location: self.staged_id(staged)?,
             size_bytes: 0,
         }])
@@ -245,6 +246,7 @@ impl CheckpointAccess for FilesystemCheckpointStore {
             }
             Ok(CheckpointArtifact {
                 storage: alias,
+                scope: String::new(),
                 location: id,
                 size_bytes: size,
             })

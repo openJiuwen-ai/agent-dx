@@ -36,6 +36,7 @@ struct FileEntry {
 pub struct ObjectCheckpointStore {
     pub(super) owner: Option<super::orphans::UploadOwner>,
     pub(super) alias: String,
+    pub(super) scope: String,
     pub(super) remote: Arc<dyn ObjectStore>,
     pub(super) prefix: Key,
     staging: LocalCheckpointStore,
@@ -68,6 +69,17 @@ impl ObjectCheckpointStore {
         root: PathBuf,
         budget: u64,
     ) -> Result<Self> {
+        Self::new_scoped(alias, String::new(), remote, prefix, root, budget)
+    }
+
+    pub fn new_scoped(
+        alias: String,
+        scope: String,
+        remote: Arc<dyn ObjectStore>,
+        prefix: String,
+        root: PathBuf,
+        budget: u64,
+    ) -> Result<Self> {
         if alias.is_empty()
             || alias == "local"
             || !alias
@@ -89,6 +101,7 @@ impl ObjectCheckpointStore {
         Ok(Self {
             owner: None,
             alias,
+            scope,
             remote,
             prefix: Key::from(prefix),
             staging,
@@ -104,6 +117,7 @@ impl ObjectCheckpointStore {
     }
     pub(super) fn validate(&self, a: &CheckpointArtifact) -> Result<()> {
         if a.storage != self.alias
+            || (!a.scope.is_empty() && a.scope != self.scope)
             || uuid::Uuid::parse_str(&a.location).is_err()
             || a.size_bytes == 0
         {
@@ -334,6 +348,9 @@ impl CheckpointAccess for ObjectCheckpointStore {
     fn storage_alias(&self) -> &str {
         &self.alias
     }
+    fn shared_scope(&self) -> Option<&str> {
+        (!self.scope.is_empty()).then_some(self.scope.as_str())
+    }
     fn capture_references(&self, staged: &Path) -> Result<Vec<CheckpointArtifact>> {
         let path = self.staging.owned_path(staged)?;
         let id = path
@@ -344,6 +361,7 @@ impl CheckpointAccess for ObjectCheckpointStore {
         let mut refs = self.staging.capture_references(staged)?;
         refs.push(CheckpointArtifact {
             storage: self.alias.clone(),
+            scope: self.scope.clone(),
             location: id.into(),
             size_bytes: 0,
         });
@@ -462,6 +480,7 @@ impl CheckpointAccess for ObjectCheckpointStore {
             }
             Ok(CheckpointArtifact {
                 storage: self.alias.clone(),
+                scope: self.scope.clone(),
                 location: id.clone(),
                 size_bytes: manifest.size,
             })

@@ -188,11 +188,16 @@ impl Controller {
         });
     }
     pub(super) async fn pause(&mut self, request: PauseRequest) -> Result<OperationResult> {
-        if self.replay_operation(
-            &request.operation_id,
-            request.expected_revision,
-            LifecycleKind::Pause,
-        )? {
+        self.pause_for(request, LifecycleKind::Pause).await
+    }
+    /// Internal checkpoint callers retain their own lifecycle kind so durable
+    /// control records can distinguish an explicit pause from a snapshot.
+    pub(super) async fn pause_for(
+        &mut self,
+        request: PauseRequest,
+        kind: LifecycleKind,
+    ) -> Result<OperationResult> {
+        if self.replay_operation(&request.operation_id, request.expected_revision, kind)? {
             return self.replay_or_sync().await;
         }
         if self.record.state != EnvironmentState::Running {
@@ -447,11 +452,7 @@ impl Controller {
             source_runtime_id: self.record.runtime.id.clone(),
         });
         self.transition(Event::Checkpointed)?;
-        self.completed(
-            request.operation_id,
-            request.expected_revision,
-            LifecycleKind::Pause,
-        );
+        self.completed(request.operation_id, request.expected_revision, kind);
         self.sync().await
     }
     async fn restore_execution(&mut self, path: &Path) -> Result<()> {

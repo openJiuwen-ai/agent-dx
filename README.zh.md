@@ -224,3 +224,5 @@ SDK 发布名为 `adx-environment`，Python 导入名为 `adx_environment`，CLI
 ## 许可证
 
 Agent DX 使用 [Apache License 2.0](LICENSE)。
+
+实验性的 [E2B 兼容入口](docs/deployment/e2b-compatibility.md) 可显式启用管理协议适配、固定 envd、凭据路由和绝对运行期限；支持范围与 [CCE 验证边界](docs/testing/2026-10-10-e2b-compatibility.md) 独立记录。

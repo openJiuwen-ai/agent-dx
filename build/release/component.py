@@ -31,6 +31,17 @@ REQUIRED_FILES = {
     "execd": {"adx-execd", "adx-runtime-rootfs.img"},
     "afs": {"afs-meta", "afs-node"},
 }
+OPTIONAL_FILE_SETS = {
+    "execd": {"envd-LICENSE", "envd-manifest.json"},
+}
+
+
+def valid_files(component, files):
+    required = REQUIRED_FILES[component]
+    optional = OPTIONAL_FILE_SETS.get(component, set())
+    return required.issubset(files) and files.issubset(required | optional) and (
+        not (files & optional) or optional.issubset(files)
+    )
 
 
 def sha256(path):
@@ -66,7 +77,7 @@ def create_manifest(component, directory, commit, target):
     _identity(commit, target)
     directory = Path(directory)
     files = _regular_files(directory)
-    if set(files) != REQUIRED_FILES[component]:
+    if not valid_files(component, set(files)):
         raise ValueError("component artifact file set is incomplete or unexpected")
     manifest = {
         "schema_version": 1,
@@ -94,7 +105,7 @@ def verify_manifest(directory, component=None, commit=None, target=None):
         raise ValueError("component commit mismatch")
     if target is not None and manifest["target"] != target:
         raise ValueError("component target mismatch")
-    if set(manifest.get("files", {})) != REQUIRED_FILES[manifest["component"]]:
+    if not valid_files(manifest["component"], set(manifest.get("files", {}))):
         raise ValueError("component artifact file set is incomplete or unexpected")
     if manifest.get("files") != _regular_files(directory):
         raise ValueError("component artifact integrity check failed")
@@ -193,7 +204,7 @@ def verify_build_manifest(
     if set(manifest.get("components", {})) != expected_components:
         raise ValueError("build manifest component set is incomplete")
     for name, record in manifest["components"].items():
-        if set(record.get("files", {})) != REQUIRED_FILES[name]:
+        if not valid_files(name, set(record.get("files", {}))):
             raise ValueError(f"{name} component file set is incomplete")
         digest = record.get("manifest_sha256", "")
         if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):

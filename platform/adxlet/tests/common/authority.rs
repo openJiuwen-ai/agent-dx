@@ -124,6 +124,42 @@ impl pb::coordinator_service_server::CoordinatorService for Authority {
     ) -> Result<Response<pb::GetEnvironmentResponse>, Status> {
         Err(Status::unimplemented("unused test RPC"))
     }
+    async fn get_environment_metadata(
+        &self,
+        _: Request<pb::GetEnvironmentMetadataRequest>,
+    ) -> Result<Response<pb::EnvironmentMetadataRecord>, Status> {
+        Err(Status::unimplemented("unused test RPC"))
+    }
+    async fn list_environment_metadata(
+        &self,
+        _: Request<pb::ListEnvironmentMetadataRequest>,
+    ) -> Result<Response<pb::ListEnvironmentMetadataResponse>, Status> {
+        Err(Status::unimplemented("unused test RPC"))
+    }
+    async fn list_e2b_environment_metadata(
+        &self,
+        _: Request<pb::ListEnvironmentMetadataRequest>,
+    ) -> Result<Response<pb::ListEnvironmentMetadataResponse>, Status> {
+        Err(Status::unimplemented("unused test RPC"))
+    }
+    async fn get_environment_control(
+        &self,
+        _: Request<pb::GetEnvironmentControlRequest>,
+    ) -> Result<Response<pb::EnvironmentControlRecord>, Status> {
+        Err(Status::unimplemented("unused test RPC"))
+    }
+    async fn update_environment_control(
+        &self,
+        _: Request<pb::UpdateEnvironmentControlRequest>,
+    ) -> Result<Response<pb::EnvironmentControlRecord>, Status> {
+        Err(Status::unimplemented("unused test RPC"))
+    }
+    async fn list_environment_controls(
+        &self,
+        _: Request<pb::ListEnvironmentControlsRequest>,
+    ) -> Result<Response<pb::ListEnvironmentControlsResponse>, Status> {
+        Err(Status::unimplemented("unused test RPC"))
+    }
     async fn ensure_running(
         &self,
         _: Request<pb::EnsureRunningRequest>,

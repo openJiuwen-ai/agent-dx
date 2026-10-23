@@ -180,6 +180,7 @@ mod tests {
             "source-1".into(),
             adx_core::CheckpointArtifact {
                 storage: storage.into(),
+                scope: String::new(),
                 location: "artifact".into(),
                 size_bytes: 100,
             },

@@ -50,6 +50,34 @@ def sha(p):
     return hashlib.sha256(p.read_bytes()).hexdigest()
 
 
+def patch_identity(pinned):
+    """Validate the exact reviewed patch set before building or accepting a cache."""
+    identities = []
+    for patch in pinned.get('patches', []):
+        relative = Path(patch['path'])
+        if (
+            relative.is_absolute()
+            or '..' in relative.parts
+            or relative.parts[:3] != ('third_party', 'sandboxd', 'patches')
+        ):
+            raise ValueError('invalid sandboxd patch path')
+        if sha(ROOT / relative) != patch['sha256']:
+            raise ValueError('sandboxd patch integrity mismatch')
+        identities.append({'path': relative.as_posix(), 'sha256': patch['sha256']})
+    return identities
+
+
+def apply_patches(source, pinned):
+    identities = patch_identity(pinned)
+    for patch in identities:
+        path = ROOT / patch['path']
+        subprocess.run(['git', 'apply', '--check', str(path)], cwd=source, check=True)
+        subprocess.run(['git', 'apply', str(path)], cwd=source, check=True)
+    if identities:
+        subprocess.run([_executable('make'), 'protos-local'], cwd=source, check=True)
+    return identities
+
+
 def release_checksum(manifest, filename):
     matches = []
     for line in manifest.splitlines():
@@ -83,6 +111,17 @@ def download(url, output):
     )
 
 
+def copy_verified_runc(source, output, expected):
+    """Copy a caller-supplied runc only after checking the pinned digest."""
+    if not source.is_file():
+        raise ValueError('runc binary must be a regular file')
+    if sha(source) != expected:
+        raise ValueError('runc checksum mismatch')
+    output.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, output)
+    output.chmod(0o755)
+
+
 def fetch_pinned_source(source, repository, revision, *, attempts=3, command=run, sleeper=time.sleep):
     if attempts < 1:
         raise ValueError('positive fetch attempts required')
@@ -110,6 +149,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--source', type=Path)
+    p.add_argument('--runc-binary', type=Path,
+                   help='verified local runc cache; its pinned SHA-256 is still enforced')
     p.add_argument('--redis-cli', type=Path, required=True)
     p.add_argument('--jobs', type=int, default=2)
     a = p.parse_args()
@@ -125,14 +166,26 @@ def main():
         source = a.source.resolve() if a.source else Path(tmp) / 'source'
         if a.source is None:
             fetch_pinned_source(source, pinned['repository'], pinned['revision'])
-        if run(['git', '-C', source, 'rev-parse', 'HEAD']) != pinned['revision'] or run(
-            ['git', '-C', source, 'status', '--porcelain']
-        ):
+        revision = run(['git', '-c', f'safe.directory={source}', '-C', source, 'rev-parse', 'HEAD'])
+        status = run(['git', '-c', f'safe.directory={source}', '-C', source, 'status', '--porcelain'])
+        if revision != pinned['revision'] or status:
             raise ValueError('sandboxd source must match the clean pinned revision')
         for file in pinned['files']:
             if sha(source / file['source']) != file['sha256']:
                 raise ValueError('sandboxd source integrity mismatch')
-        env = {**os.environ, 'GOFLAGS': '-p=' + str(a.jobs), 'GOMAXPROCS': str(a.jobs)}
+        # Never patch a caller's checkout. Source identity remains the clean
+        # upstream commit; reviewed patch hashes form part of artifact identity.
+        if pinned.get('patches'):
+            patched = Path(tmp) / 'patched'
+            shutil.copytree(source, patched, ignore=shutil.ignore_patterns('output'))
+            source = patched
+        patches = apply_patches(source, pinned)
+        env = {
+            **os.environ,
+            'GOTOOLCHAIN': 'go1.25.5',
+            'GOFLAGS': '-buildvcs=false -p=' + str(a.jobs),
+            'GOMAXPROCS': str(a.jobs),
+        }
         subprocess.run(
             [_executable('make', cwd=source, environment=env), 'RELEASE_GOARCH=' + arch, *SANDBOXD_BUILD_TARGETS],
             cwd=source,
@@ -154,10 +207,13 @@ def main():
             checksums = Path(tmp) / 'runc.sha256sum'
             download(url + 'runc.sha256sum', checksums)
             expected = release_checksum(checksums.read_text(), 'runc.' + arch)
-        download(url + 'runc.' + arch, a.output / 'runc')
-        if sha(a.output / 'runc') != expected:
-            raise ValueError('runc checksum mismatch')
-        (a.output / 'runc').chmod(0o755)
+        if a.runc_binary is None:
+            download(url + 'runc.' + arch, a.output / 'runc')
+            if sha(a.output / 'runc') != expected:
+                raise ValueError('runc checksum mismatch')
+            (a.output / 'runc').chmod(0o755)
+        else:
+            copy_verified_runc(a.runc_binary.resolve(), a.output / 'runc', expected)
         if '7.2.5' not in run([a.redis_cli.resolve(), '--version']):
             raise ValueError('Redis CLI version mismatch')
         shutil.copy2(a.redis_cli, a.output / 'redis-cli')
@@ -166,6 +222,7 @@ def main():
             json.dumps(
                 {
                     'sandboxd_revision': pinned['revision'],
+                    'sandboxd_patches': patches,
                     'target': target,
                     'runc_version': versions['RUNC_VERSION'],
                     'files': files,

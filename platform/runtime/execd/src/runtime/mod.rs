@@ -34,6 +34,7 @@ pub mod control;
 pub mod control_stream;
 mod dispatch;
 mod entrypoint;
+mod envd;
 mod file_search;
 mod fs;
 mod httpserver;
@@ -112,8 +113,48 @@ struct RuntimeHooks {
     http: httpserver::HttpServerControl,
     tunnel: Option<tunnel::TunnelServerControl>,
     port: u16,
+    envd: Arc<tokio::sync::Mutex<Option<envd::EnvdManager>>>,
 }
 impl control::CheckpointHooks for RuntimeHooks {
+    fn prepare_checkpoint(&self) -> control::Cooperation<'_> {
+        Box::pin(async {
+            if let Some(manager) = &mut *self.envd.lock().await {
+                match manager.prepare_checkpoint().await {
+                    Ok(envd::FreezeOutcome::NotRequested) => {}
+                    Ok(envd::FreezeOutcome::Confirmed) => execd_info!("envd freeze confirmed"),
+                    Ok(envd::FreezeOutcome::Unconfirmed) => {
+                        execd_warn!("envd freeze unconfirmed; using best-effort checkpoint")
+                    }
+                    Err(error) => {
+                        execd_warn!("envd freeze failed; using best-effort checkpoint: {error}")
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+    fn rollback_checkpoint_prepare(&self) -> control::Cooperation<'_> {
+        Box::pin(async {
+            if let Some(manager) = &mut *self.envd.lock().await {
+                manager
+                    .rollback_checkpoint_prepare()
+                    .await
+                    .map_err(std::io::Error::other)?;
+            }
+            Ok(())
+        })
+    }
+    fn resume_after_checkpoint(&self) -> control::Cooperation<'_> {
+        Box::pin(async {
+            if let Some(manager) = &mut *self.envd.lock().await {
+                manager
+                    .resume_after_checkpoint()
+                    .await
+                    .map_err(std::io::Error::other)?;
+            }
+            Ok(())
+        })
+    }
     fn open(&self) -> std::io::Result<control::Handoff> {
         let opened = crate::startup::open_checkpoint_handoff()?
             .ok_or_else(|| std::io::Error::other("backend checkpoint handoff unavailable"))?;
@@ -127,53 +168,68 @@ impl control::CheckpointHooks for RuntimeHooks {
             )
         }))
     }
-    fn restore(&self, previous: &RuntimeIdentity) -> std::io::Result<RuntimeIdentity> {
-        Ok(self.restore_context(previous)?.target)
-    }
-    fn restore_context(
-        &self,
-        previous: &RuntimeIdentity,
-    ) -> std::io::Result<adx_core::runtime::RuntimeRestore> {
-        let path = crate::startup::restore_environment_file_path()
-            .ok_or_else(|| std::io::Error::other("restore environment is required"))?;
-        let environment = crate::startup::read_environment_file(&path)?;
-        let target = identity_from(&environment)?
-            .ok_or_else(|| std::io::Error::other("restored identity is missing"))?;
-        let restored = adx_core::runtime::RuntimeRestore {
-            target,
-            origin: environment
-                .get("ADX_RESTORE_ORIGIN")
-                .filter(|value| !value.is_empty())
-                .map(|value| serde_json::from_str(value).map_err(std::io::Error::other))
-                .transpose()?,
-        };
-        restored.validate(previous).map_err(std::io::Error::other)?;
-        if let Some(value) = environment.get("EXECD_HTTP_PORT") {
-            if value.parse::<u16>().ok() != Some(self.port) {
-                return Err(std::io::Error::other(
-                    "restore cannot change the inherited HTTP port",
-                ));
+    fn restore_context_async<'a>(&'a self, previous: &'a RuntimeIdentity) -> control::Restore<'a> {
+        Box::pin(async move {
+            let path = crate::startup::restore_environment_file_path()
+                .ok_or_else(|| std::io::Error::other("restore environment is required"))?;
+            let environment = crate::startup::read_environment_file(&path)?;
+            let target = identity_from(&environment)?
+                .ok_or_else(|| std::io::Error::other("restored identity is missing"))?;
+            let restored = adx_core::runtime::RuntimeRestore {
+                target,
+                origin: environment
+                    .get("ADX_RESTORE_ORIGIN")
+                    .filter(|value| !value.is_empty())
+                    .map(|value| serde_json::from_str(value).map_err(std::io::Error::other))
+                    .transpose()?,
+            };
+            restored.validate(previous).map_err(std::io::Error::other)?;
+            if let Some(value) = environment.get("EXECD_HTTP_PORT") {
+                if value.parse::<u16>().ok() != Some(self.port) {
+                    return Err(std::io::Error::other(
+                        "restore cannot change the inherited HTTP port",
+                    ));
+                }
             }
-        }
-        if let Some(tunnel) = &self.tunnel {
-            tunnel.validate_restored_ports(&environment)?;
-        }
-        constructor_cwd::initialize(environment.get(constructor_cwd::ENV).map(String::as_str))?;
-        child_env::refresh_from_map(&environment);
-        for (key, value) in &environment {
-            std::env::set_var(key, value);
-        }
-        if let Some(token) = environment.get("EXECD_HTTP_TOKEN") {
-            self.http.update_token(token.clone())?;
-        }
-        self.http.rearm()?;
-        if let Some(checkpoint) = &self.checkpoint {
-            checkpoint.rearm()?;
-        }
-        if let Some(tunnel) = &self.tunnel {
-            tunnel.rearm().map_err(std::io::Error::other)?;
-        }
-        Ok(restored)
+            if let Some(tunnel) = &self.tunnel {
+                tunnel.validate_restored_ports(&environment)?;
+            }
+            constructor_cwd::initialize(environment.get(constructor_cwd::ENV).map(String::as_str))?;
+            child_env::refresh_from_map(&environment);
+            for (key, value) in &environment {
+                std::env::set_var(key, value);
+            }
+            if let Some(token) = environment.get("EXECD_HTTP_TOKEN") {
+                self.http.update_token(token.clone())?;
+            }
+            let restored_environment = environment
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            let restored_envd = envd::EnvdConfig::from_environment(&restored_environment)
+                .map_err(std::io::Error::other)?;
+            {
+                let mut managed_envd = self.envd.lock().await;
+                match (&mut *managed_envd, restored_envd) {
+                    (Some(manager), Some(config)) => manager
+                        .refresh_after_restore(&config, &restored.target.runtime_id)
+                        .await
+                        .map_err(std::io::Error::other),
+                    (None, None) => Ok(()),
+                    _ => Err(std::io::Error::other(
+                        "restore cannot change required envd service",
+                    )),
+                }
+            }?;
+            self.http.rearm()?;
+            if let Some(checkpoint) = &self.checkpoint {
+                checkpoint.rearm()?;
+            }
+            if let Some(tunnel) = &self.tunnel {
+                tunnel.rearm().map_err(std::io::Error::other)?;
+            }
+            Ok(restored)
+        })
     }
 }
 async fn boot(
@@ -213,11 +269,16 @@ async fn boot(
         wait_for_runtime_ready(ready.clone()).await?;
     }
     entrypoint::complete_create().map_err(|failure| std::io::Error::other(failure.message))?;
+    let envd_config = envd::EnvdConfig::from_environment(&std::env::vars().collect())?;
+    let envd = Arc::new(tokio::sync::Mutex::new(
+        envd_config.map(envd::EnvdManager::new),
+    ));
     let hooks = Arc::new(RuntimeHooks {
         http,
         tunnel,
         port,
         checkpoint,
+        envd: envd.clone(),
     });
     if let Some(identity) = identity {
         let controller = control::Controller::new(identity, hooks.clone())?;
@@ -225,6 +286,87 @@ async fn boot(
             controller.begin_probe_initialization()?;
         }
         control::install(controller.clone())?;
+        if envd.lock().await.is_some() {
+            controller.set_required_service(
+                "envd",
+                adx_core::runtime::RequiredServiceStatus {
+                    phase: adx_core::runtime::RequiredServicePhase::Starting,
+                    version: None,
+                    error: None,
+                },
+            )?;
+            let result = match envd.lock().await.as_mut() {
+                Some(manager) => {
+                    manager
+                        .start_and_initialize(&controller.status().identity.runtime_id)
+                        .await
+                }
+                None => Err(adx_core::Error::Invalid(
+                    "required envd manager is unavailable".into(),
+                )),
+            };
+            match result {
+                Ok(()) => controller.set_required_service(
+                    "envd",
+                    adx_core::runtime::RequiredServiceStatus {
+                        phase: adx_core::runtime::RequiredServicePhase::Ready,
+                        version: envd
+                            .lock()
+                            .await
+                            .as_ref()
+                            .and_then(envd::EnvdManager::version),
+                        error: None,
+                    },
+                )?,
+                Err(error) => {
+                    controller.set_required_service(
+                        "envd",
+                        adx_core::runtime::RequiredServiceStatus {
+                            phase: adx_core::runtime::RequiredServicePhase::Failed,
+                            version: None,
+                            error: Some(error.to_string()),
+                        },
+                    )?;
+                    return Err(format!("envd initialization failed: {error}").into());
+                }
+            }
+            let monitored_envd = envd.clone();
+            let monitored_controller = controller.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    // Checkpoint quiescence and restore deliberately suspend
+                    // guest I/O. A probe started before handoff can also finish
+                    // after it; neither case is a live-service failure.
+                    if monitored_controller.status().phase
+                        != adx_core::runtime::RuntimePhase::Running
+                    {
+                        continue;
+                    }
+                    let mut managed_envd = monitored_envd.lock().await;
+                    let result = match managed_envd.as_mut() {
+                        Some(manager) => manager.check_running().await,
+                        None => Err(adx_core::Error::Unavailable("envd manager retired".into())),
+                    };
+                    if let Err(error) = result {
+                        if monitored_controller.status().phase
+                            != adx_core::runtime::RuntimePhase::Running
+                        {
+                            continue;
+                        }
+                        let _ = monitored_controller.set_required_service(
+                            "envd",
+                            adx_core::runtime::RequiredServiceStatus {
+                                phase: adx_core::runtime::RequiredServicePhase::Failed,
+                                version: None,
+                                error: Some(error.to_string()),
+                            },
+                        );
+                        break;
+                    }
+                }
+            });
+        }
         if control_stream::ControlStreamConfig::from_environment()?.is_some() {
             tokio::spawn(control_stream::run(controller.clone(), || {
                 control_stream::ControlStreamConfig::from_environment()?.ok_or_else(|| {

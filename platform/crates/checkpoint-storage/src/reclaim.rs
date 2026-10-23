@@ -1,5 +1,5 @@
 //! Coordinator-owned authoritative deletion; no staging or cache dependency.
-use super::{io_error, FilesystemCheckpointStore};
+use super::{io_error, s3_scope, FilesystemCheckpointStore};
 use adx_core::{CheckpointArtifact, Error, Result};
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
@@ -38,11 +38,21 @@ impl Reclaimers {
 }
 pub struct ObjectReclaimer {
     alias: String,
+    scope: String,
     remote: Arc<dyn ObjectStore>,
     prefix: Key,
 }
 impl ObjectReclaimer {
     pub fn new(alias: String, remote: Arc<dyn ObjectStore>, prefix: String) -> Result<Self> {
+        Self::new_scoped(alias, String::new(), remote, prefix)
+    }
+
+    pub fn new_scoped(
+        alias: String,
+        scope: String,
+        remote: Arc<dyn ObjectStore>,
+        prefix: String,
+    ) -> Result<Self> {
         if alias.is_empty()
             || alias == "local"
             || prefix.is_empty()
@@ -54,6 +64,7 @@ impl ObjectReclaimer {
         }
         Ok(Self {
             alias,
+            scope,
             remote,
             prefix: Key::from(prefix),
         })
@@ -65,7 +76,10 @@ impl ArtifactReclaimer for ObjectReclaimer {
         &self.alias
     }
     async fn remove(&self, artifact: &CheckpointArtifact) -> Result<()> {
-        if artifact.storage != self.alias || uuid::Uuid::parse_str(&artifact.location).is_err() {
+        if artifact.storage != self.alias
+            || (!artifact.scope.is_empty() && artifact.scope != self.scope)
+            || uuid::Uuid::parse_str(&artifact.location).is_err()
+        {
             return Err(Error::Invalid("artifact outside object reclaimer".into()));
         }
         let prefix = Key::from(format!("{}/{}/", self.prefix, artifact.location));
@@ -114,7 +128,23 @@ pub enum ReclaimerConfig {
     },
 }
 impl ReclaimerConfig {
+    pub fn shared_scope(&self) -> Option<String> {
+        let Self::S3 {
+            alias,
+            bucket,
+            region,
+            endpoint: Some(endpoint),
+            prefix,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        s3_scope(alias, bucket, region, endpoint, prefix)
+    }
+
     pub fn build(self) -> Result<Arc<dyn ArtifactReclaimer>> {
+        let scope = self.shared_scope().unwrap_or_default();
         match self {
             Self::DistributedFs {
                 alias,
@@ -139,8 +169,9 @@ impl ReclaimerConfig {
                 if let Some(endpoint) = endpoint {
                     builder = builder.with_endpoint(endpoint);
                 }
-                Ok(Arc::new(ObjectReclaimer::new(
+                Ok(Arc::new(ObjectReclaimer::new_scoped(
                     alias,
+                    scope,
                     Arc::new(builder.build().map_err(io_error)?),
                     prefix,
                 )?))
@@ -172,6 +203,7 @@ mod tests {
             ObjectReclaimer::new("s3-test".into(), remote.clone(), "checkpoints".into()).unwrap();
         let artifact = CheckpointArtifact {
             storage: "s3-test".into(),
+            scope: String::new(),
             location: id.clone(),
             size_bytes: 6,
         };

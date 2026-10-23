@@ -55,7 +55,15 @@ impl CoordinatorRpc {
                     && live.last_seen.elapsed() < self.0.heartbeat_timeout
             });
             if live.is_none() {
-                if !stored.invalidated || stored.resources_held() {
+                if !stored.invalidated
+                    || stored.resources_held()
+                    || stored
+                        .result
+                        .as_ref()
+                        .is_some_and(|record| record.checkpoint.is_some())
+                {
+                    // Storage-only retirement cannot remove checkpoint objects.
+                    // Keep their durable reference until an owner can clean them.
                     return Ok(false);
                 }
                 // Any failure after the durable retirement must rebuild the in-memory
@@ -65,6 +73,7 @@ impl CoordinatorRpc {
                 // If retirement loses its response, do not requeue the old spec as
                 // an absent, never-persisted request during authoritative recovery.
                 state.specs.remove(id);
+                state.pending_metadata.remove(id);
                 let deleted = state
                     .session
                     .retire_invalidated_failed(&stored, now)
@@ -84,6 +93,7 @@ impl CoordinatorRpc {
                 state.environments.remove(id);
                 state.failed_environments.remove(id);
                 state.specs.remove(id);
+                state.pending_metadata.remove(id);
                 state.scheduling_deadlines.remove(id);
                 state.needs_recovery = false;
                 self.0.changed.notify_waiters();
@@ -111,6 +121,7 @@ impl CoordinatorRpc {
         let response =
             pb::node_service_client::NodeServiceClient::new(self.0.node_tls.wrap(channel))
                 .delete_environment(pb::DeleteEnvironmentRequest {
+                    expiry_revision: None,
                     assignment: Some(record.assignment.clone().try_into()?),
                     caller: None,
                     failed_revision: Some(record.revision),

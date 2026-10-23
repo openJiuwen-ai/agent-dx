@@ -42,6 +42,7 @@ impl CoordinatorRpc {
             .map_err(status)?;
         state.environments.remove(&request.environment_id);
         state.specs.remove(&request.environment_id);
+        state.pending_metadata.remove(&request.environment_id);
         self.0.changed.notify_waiters();
         Ok(pb::EnvironmentResult {
             record: Some(deleted.try_into().map_err(status)?),
@@ -86,6 +87,7 @@ impl CoordinatorRpc {
                     state.scheduler.forget_deleted(&stored.spec.id)?;
                     state.environments.remove(&stored.spec.id);
                     state.specs.remove(&stored.spec.id);
+                    state.pending_metadata.remove(&stored.spec.id);
                     completed += 1;
                 }
                 Err(Error::Conflict | Error::NotFound) => (),

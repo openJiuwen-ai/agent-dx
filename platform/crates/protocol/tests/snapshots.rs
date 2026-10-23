@@ -5,6 +5,9 @@ use adx_core::{
 #[test]
 fn snapshot_wire_preserves_template_and_durable_references() {
     let spec = EnvironmentSpec {
+        run_policy: None,
+        template_identity: None,
+        compatibility: None,
         runtime_profile: None,
         snapshot_id: None,
         id: "source".into(),
@@ -30,6 +33,7 @@ fn snapshot_wire_preserves_template_and_durable_references() {
         "source-1".into(),
         CheckpointArtifact {
             storage: "shared".into(),
+            scope: String::new(),
             location: "artifact".into(),
             size_bytes: 512,
         },

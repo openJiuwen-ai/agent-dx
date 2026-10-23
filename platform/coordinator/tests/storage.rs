@@ -1,17 +1,26 @@
 #[path = "storage/artifact_lifecycle.rs"]
 mod artifact_lifecycle;
+#[path = "storage/checkpoint_cleanup.rs"]
+mod checkpoint_cleanup;
 #[path = "storage/claims.rs"]
 mod claims;
 mod common;
 #[path = "storage/dormancy.rs"]
 mod dormancy;
+#[path = "storage/run_policy.rs"]
+mod run_policy;
 use adx_coordinator::{storage::StoredNode, Coordinator, Node, Placement};
 use adx_core::{
+    environment_control::{RunExpiryAction, RunPolicy},
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Resources,
 };
+use std::time::Duration;
 
 fn spec(id: &str) -> EnvironmentSpec {
     EnvironmentSpec {
+        run_policy: None,
+        template_identity: None,
+        compatibility: None,
         runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),
@@ -70,6 +79,64 @@ async fn register(s: &adx_coordinator::storage::Session, id: &str) -> StoredNode
     s.register(node(id), "127.0.0.1:9000".into(), "127.0.0.1:9001".into())
         .await
         .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn redis_response_uses_the_store_operation_budget() {
+    let rig = common::Redis::new().await;
+    let client = redis::Client::open(rig.url.as_str()).unwrap();
+    let mut admin = client.get_multiplexed_async_connection().await.unwrap();
+
+    let store = adx_coordinator::storage::RedisStore::connect(
+        &rig.url,
+        "response-budget-long",
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap();
+    let session = store.begin(1).await.unwrap();
+    let _: () = redis::cmd("CLIENT")
+        .arg("PAUSE")
+        .arg(700)
+        .arg("WRITE")
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    session
+        .advertise(
+            "response-budget-long",
+            "https://127.0.0.1:9100",
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+    let store = adx_coordinator::storage::RedisStore::connect(
+        &rig.url,
+        "response-budget-short",
+        Duration::from_millis(200),
+    )
+    .await
+    .unwrap();
+    let session = store.begin(1).await.unwrap();
+    let _: () = redis::cmd("CLIENT")
+        .arg("PAUSE")
+        .arg(700)
+        .arg("WRITE")
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    assert!(matches!(
+        session
+            .advertise(
+                "response-budget-short",
+                "https://127.0.0.1:9101",
+                Duration::from_secs(5),
+            )
+            .await,
+        Err(Error::Unavailable(_))
+    ));
 }
 
 #[tokio::test]
@@ -176,6 +243,42 @@ async fn failed_collection_age_survives_retry_and_coordinator_restart() {
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn user_metadata_is_durable_and_node_commit_cannot_replace_it() {
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let assignment = Assignment {
+        environment_id: "metadata".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    let metadata: adx_core::metadata::UserMetadata = [("project".into(), "alpha\nnotes".into())]
+        .into_iter()
+        .collect();
+    session
+        .reserve_with_metadata(spec("metadata"), assignment.clone(), metadata.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .reserve_with_metadata(spec("metadata"), assignment.clone(), Default::default())
+            .await,
+        Err(Error::Conflict)
+    );
+    session
+        .commit(running(spec("metadata"), assignment))
+        .await
+        .unwrap();
+    assert_eq!(
+        session.get("metadata").await.unwrap().user_metadata,
+        metadata
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
 async fn invalidated_failed_collection_is_atomic_and_fences_replacement() {
     let rig = common::Redis::new().await;
     let session = rig.store().await.begin(1).await.unwrap();
@@ -243,6 +346,73 @@ async fn invalidated_failed_collection_is_atomic_and_fences_replacement() {
             .await
             .unwrap_err(),
         Error::Conflict
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn invalidated_failed_collection_retains_an_expired_checkpoint_for_owner_cleanup() {
+    use adx_core::{CheckpointArtifact, RestorePoint};
+
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    session
+        .register_session(
+            node("node"),
+            "127.0.0.1:9000".into(),
+            "127.0.0.1:9001".into(),
+            Some(adx_coordinator::storage::NodeSession {
+                id: "s1".into(),
+                sequence: 1,
+                routable: true,
+            }),
+        )
+        .await
+        .unwrap();
+    let assignment = Assignment {
+        environment_id: "invalid-gc-checkpoint".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    session
+        .reserve(spec("invalid-gc-checkpoint"), assignment.clone())
+        .await
+        .unwrap();
+    let mut record = running(spec("invalid-gc-checkpoint"), assignment);
+    record.checkpoint = Some(RestorePoint {
+        origin: None,
+        id: "expired-checkpoint".into(),
+        source_runtime_id: record.runtime.id.clone(),
+        expires_at_unix_seconds: Some(1),
+        artifact: CheckpointArtifact {
+            storage: "s3".into(),
+            scope: "shared".into(),
+            location: "bucket/checkpoints/expired".into(),
+            size_bytes: 1,
+        },
+    });
+    session.commit(record).await.unwrap();
+    session.invalidate_node("node", "s1").await.unwrap();
+
+    let failed = session.get("invalid-gc-checkpoint").await.unwrap();
+    assert!(failed.failed_collectable(u64::MAX, 0));
+    assert_eq!(
+        session
+            .retire_invalidated_failed(&failed, u64::MAX)
+            .await
+            .unwrap_err(),
+        Error::Conflict
+    );
+    assert_eq!(
+        session
+            .get("invalid-gc-checkpoint")
+            .await
+            .unwrap()
+            .result
+            .and_then(|record| record.checkpoint),
+        failed.result.and_then(|record| record.checkpoint)
     );
 }
 
@@ -427,6 +597,70 @@ async fn deleted_environment_is_retired_and_the_name_can_be_reused() {
         second_assignment
     );
     assert_eq!(session.commit(first_running).await, Err(Error::Conflict));
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn deleted_checkpoint_cleanup_survives_catalog_retirement_and_redis_crash() {
+    let mut rig = common::Redis::new().await;
+    let db = rig.store().await;
+    let session = db.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let assignment = Assignment {
+        environment_id: "cleanup-crash".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    session
+        .reserve(spec("cleanup-crash"), assignment.clone())
+        .await
+        .unwrap();
+    let mut record = running(spec("cleanup-crash"), assignment);
+    record.checkpoint = Some(adx_core::RestorePoint {
+        origin: None,
+        id: "checkpoint".into(),
+        artifact: adx_core::CheckpointArtifact {
+            storage: "shared".into(),
+            scope: "test-scope".into(),
+            location: "owned/checkpoint".into(),
+            size_bytes: 1,
+        },
+        expires_at_unix_seconds: Some(1),
+        source_runtime_id: record.runtime.id.clone(),
+    });
+    session.commit(record.clone()).await.unwrap();
+    record.state = EnvironmentState::Deleted;
+    record.checkpoint = None;
+    record.resources_held = false;
+    record.runtime.ip = None;
+    record.revision += 1;
+    session.commit(record.clone()).await.unwrap();
+    assert_eq!(session.get("cleanup-crash").await, Err(Error::NotFound));
+    // Simulate losing both the delete response and every in-memory controller.
+    drop(session);
+    drop(db);
+    rig.crash();
+    rig.start().await;
+    let client = redis::Client::open(rig.url.as_str()).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    let tasks: Vec<String> = redis::cmd("HVALS")
+        .arg("adx:{test}:control:v1:checkpoint-cleanups")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(
+        tasks.len(),
+        1,
+        "Deleted must atomically retain a durable cleanup intent"
+    );
+    let task: serde_json::Value = serde_json::from_str(&tasks[0]).unwrap();
+    assert_eq!(task["assignment"]["environment_id"], "cleanup-crash");
+    assert_eq!(task["artifacts"][0]["location"], "owned/checkpoint");
+    let next = rig.store().await.begin(1).await.unwrap();
+    assert!(next.snapshot().await.unwrap().environments.is_empty());
+    assert_eq!(next.commit(record.clone()).await.unwrap(), record);
 }
 
 #[tokio::test]
@@ -812,6 +1046,7 @@ async fn credential_bootstrap_is_idempotent_and_fenced() {
         tenant_id: "t".into(),
         administrator: false,
         expires_at_unix_seconds: 0,
+        metadata: None,
     };
     session
         .bootstrap_credential(&key, &credential)
@@ -846,7 +1081,6 @@ async fn credential_bootstrap_is_idempotent_and_fenced() {
 #[tokio::test]
 #[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
 async fn discovery_expires_and_rejects_superseded_coordinator() {
-    use std::time::Duration;
     let rig = common::Redis::new().await;
     let store = rig.store().await;
     let first = store.begin(1).await.unwrap();
@@ -924,6 +1158,7 @@ async fn pause_resume_persists_recovery_point_fences_old_results_and_restores_ca
         expires_at_unix_seconds: None,
         artifact: CheckpointArtifact {
             storage: "local".into(),
+            scope: String::new(),
             location: "/checkpoints/cp".into(),
             size_bytes: 123,
         },
@@ -1016,6 +1251,7 @@ async fn sqlite_replays_pause_and_resume_after_redis_and_node_sink_restart() {
         expires_at_unix_seconds: None,
         artifact: CheckpointArtifact {
             storage: "local".into(),
+            scope: String::new(),
             location: "/tmp/checkpoint".into(),
             size_bytes: 1,
         },
@@ -1112,6 +1348,7 @@ async fn credential_revocation_survives_restart_and_bootstrap_replay() {
         tenant_id: "tenant".into(),
         administrator: false,
         expires_at_unix_seconds: 0,
+        metadata: None,
     };
     first.bootstrap_credential(key, &credential).await.unwrap();
     let id = digest(key).unwrap();
@@ -1196,6 +1433,7 @@ async fn expired_executions_remain_invalid_after_redis_and_coordinator_restart()
         Err(Error::Conflict)
     );
     let failed = session.invalidate_node("lost", "boot").await.unwrap();
+    assert!(failed.nodes["lost"].checkpoint_gc_fenced);
     assert_eq!(failed.routes().unwrap().len(), 1);
     for id in ["running", "pending"] {
         let environment = &failed.environments[id];
@@ -1270,6 +1508,7 @@ async fn recovery_assignment_is_durable_and_old_generation_cannot_publish() {
         source_runtime_id: "held-1".into(),
         artifact: adx_core::CheckpointArtifact {
             storage: "shared".into(),
+            scope: String::new(),
             location: "artifact".into(),
             size_bytes: 8,
         },
@@ -1371,6 +1610,7 @@ async fn recovery_never_uses_missing_local_or_expired_checkpoint() {
                 source_runtime_id: "held-1".into(),
                 artifact: adx_core::CheckpointArtifact {
                     storage: if kind == "local" { "local" } else { "shared" }.into(),
+                    scope: String::new(),
                     location: "artifact".into(),
                     size_bytes: 8,
                 },
@@ -1402,3 +1642,268 @@ async fn recovery_never_uses_missing_local_or_expired_checkpoint() {
 
 #[path = "storage/admin_keys.rs"]
 mod admin_keys;
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; ADX_TEST_REDIS_SERVER"]
+async fn native_environment_without_run_policy_has_no_control_lease() {
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let spec = spec("native-no-policy");
+    assert!(spec.compatibility.is_none());
+    assert!(spec.run_policy.is_none());
+    let assignment = Assignment {
+        environment_id: spec.id.clone(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    session
+        .reserve(spec.clone(), assignment.clone())
+        .await
+        .unwrap();
+    session
+        .commit(running(spec.clone(), assignment))
+        .await
+        .unwrap();
+    assert!(matches!(
+        session.environment_control(&spec.id).await,
+        Err(Error::NotFound)
+    ));
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; ADX_TEST_REDIS_SERVER"]
+async fn native_run_policy_renewal_survives_stale_node_commit_and_redis_restart() {
+    let mut rig = common::Redis::new().await;
+    let store = rig.store().await;
+    let session = store.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let mut spec = spec("e2b-control");
+    spec.run_policy = Some(RunPolicy {
+        timeout_seconds: 60,
+        action: RunExpiryAction::Delete,
+    });
+    assert!(spec.compatibility.is_none());
+    let assignment = Assignment {
+        environment_id: spec.id.clone(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    session
+        .reserve_with_metadata(
+            spec.clone(),
+            assignment.clone(),
+            [("owner".into(), "user-data".into())].into_iter().collect(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .environment_control(&spec.id)
+            .await
+            .unwrap()
+            .expires_at_unix_ms,
+        0
+    );
+    let mut result = running(spec.clone(), assignment);
+    session.commit(result.clone()).await.unwrap();
+    let initial = session.environment_control(&spec.id).await.unwrap();
+    session
+        .set_environment_timeout(&spec.id, 120, true)
+        .await
+        .unwrap();
+    let renewed = session.environment_control(&spec.id).await.unwrap();
+    assert!(renewed.expires_at_unix_ms > initial.expires_at_unix_ms);
+    assert!(matches!(
+        session
+            .claim_environment_expiry(&spec.id, initial.expires_at_unix_ms)
+            .await,
+        Err(Error::Conflict)
+    ));
+    assert_eq!(
+        session.get(&spec.id).await.unwrap().user_metadata["owner"],
+        "user-data"
+    );
+    assert!(spec.scheduling.labels.is_empty());
+    result.revision += 1;
+    session.commit(result.clone()).await.unwrap();
+    assert_eq!(
+        session.environment_control(&spec.id).await.unwrap(),
+        renewed
+    );
+    rig.crash();
+    rig.start().await;
+    let restarted = rig.store().await.begin(1).await.unwrap();
+    assert_eq!(
+        restarted.environment_control(&spec.id).await.unwrap(),
+        renewed
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; ADX_TEST_REDIS_SERVER"]
+async fn run_policy_preserves_snapshot_lease_and_restarts_after_explicit_pause() {
+    use adx_core::{CheckpointArtifact, CompletedOperation, LifecycleKind, RestorePoint};
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let mut spec = spec("policy-pause");
+    spec.run_policy = Some(RunPolicy {
+        timeout_seconds: 60,
+        action: RunExpiryAction::Pause,
+    });
+    let assignment = Assignment {
+        environment_id: spec.id.clone(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    session
+        .reserve(spec.clone(), assignment.clone())
+        .await
+        .unwrap();
+    let running = running(spec, assignment);
+    session.commit(running.clone()).await.unwrap();
+    let initial = session.environment_control("policy-pause").await.unwrap();
+
+    let mut snapshot_paused = running.clone();
+    snapshot_paused.state = EnvironmentState::Paused;
+    snapshot_paused.revision += 1;
+    snapshot_paused.resources_held = false;
+    snapshot_paused.runtime.ip = None;
+    snapshot_paused.checkpoint = Some(RestorePoint {
+        origin: None,
+        id: "snapshot".into(),
+        source_runtime_id: running.runtime.id.clone(),
+        expires_at_unix_seconds: None,
+        artifact: CheckpointArtifact {
+            storage: "local".into(),
+            scope: String::new(),
+            location: "/tmp/snapshot".into(),
+            size_bytes: 1,
+        },
+    });
+    snapshot_paused.last_operation = Some(CompletedOperation {
+        id: "snapshot".into(),
+        kind: LifecycleKind::Snapshot,
+        expected_revision: running.revision,
+    });
+    session.commit(snapshot_paused.clone()).await.unwrap();
+    assert_eq!(
+        session.environment_control("policy-pause").await.unwrap(),
+        initial
+    );
+
+    let mut resumed = snapshot_paused.clone();
+    resumed.state = EnvironmentState::Running;
+    resumed.revision += 1;
+    resumed.resources_held = true;
+    resumed.runtime.id = format!("{}-r{}", running.runtime.id, resumed.revision);
+    resumed.runtime.ip = Some("10.0.0.3".parse().unwrap());
+    resumed.last_operation = Some(CompletedOperation {
+        id: "resume".into(),
+        kind: LifecycleKind::Resume,
+        expected_revision: snapshot_paused.revision,
+    });
+    session.commit(resumed.clone()).await.unwrap();
+    assert_eq!(
+        session.environment_control("policy-pause").await.unwrap(),
+        initial
+    );
+
+    let mut explicit_pause = resumed.clone();
+    explicit_pause.state = EnvironmentState::Paused;
+    explicit_pause.revision += 1;
+    explicit_pause.resources_held = false;
+    explicit_pause.runtime.ip = None;
+    explicit_pause.last_operation = Some(CompletedOperation {
+        id: "pause".into(),
+        kind: LifecycleKind::Pause,
+        expected_revision: resumed.revision,
+    });
+    session.commit(explicit_pause.clone()).await.unwrap();
+    assert_eq!(
+        session
+            .environment_control("policy-pause")
+            .await
+            .unwrap()
+            .expires_at_unix_ms,
+        0
+    );
+    session
+        .set_environment_timeout("policy-pause", 120, false)
+        .await
+        .unwrap();
+    let mut restarted = explicit_pause;
+    restarted.state = EnvironmentState::Running;
+    restarted.revision += 1;
+    restarted.resources_held = true;
+    restarted.runtime.id = format!("{}-r{}", running.runtime.id, restarted.revision);
+    restarted.runtime.ip = Some("10.0.0.4".parse().unwrap());
+    restarted.last_operation = Some(CompletedOperation {
+        id: "resume-after-pause".into(),
+        kind: LifecycleKind::Resume,
+        expected_revision: restarted.revision - 1,
+    });
+    session.commit(restarted).await.unwrap();
+    let restarted_control = session.environment_control("policy-pause").await.unwrap();
+    assert_eq!(restarted_control.timeout_override_seconds, Some(120));
+    assert_eq!(
+        restarted_control.expires_at_unix_ms - restarted_control.started_at_unix_ms,
+        120_000
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; ADX_TEST_REDIS_SERVER"]
+async fn native_claimed_expiry_cannot_renew_and_delete_retires_control() {
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let mut spec = spec("e2b-expiry");
+    spec.run_policy = Some(RunPolicy {
+        timeout_seconds: 60,
+        action: RunExpiryAction::Delete,
+    });
+    let assignment = Assignment {
+        environment_id: spec.id.clone(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    session
+        .reserve(spec.clone(), assignment.clone())
+        .await
+        .unwrap();
+    let mut result = running(spec.clone(), assignment);
+    session.commit(result.clone()).await.unwrap();
+    session
+        .set_environment_timeout(&spec.id, 0, false)
+        .await
+        .unwrap();
+    session
+        .claim_environment_expiry(&spec.id, u64::MAX)
+        .await
+        .unwrap();
+    assert!(session
+        .set_environment_timeout(&spec.id, 60, false)
+        .await
+        .is_err());
+    result.state = EnvironmentState::Deleted;
+    result.revision += 1;
+    result.resources_held = false;
+    result.runtime.ip = None;
+    session.commit(result.clone()).await.unwrap();
+    assert!(matches!(
+        session.environment_control(&spec.id).await,
+        Err(Error::NotFound)
+    ));
+    assert!(session.snapshot().await.unwrap().environments.is_empty());
+    assert_eq!(session.commit(result.clone()).await.unwrap(), result);
+}

@@ -1,9 +1,11 @@
 import ast
+import hashlib
 import importlib.util
 import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +41,67 @@ def contains_expression(tree, expression):
 
 
 class FirecrackerEvidenceTests(unittest.TestCase):
+    def test_rootfs_build_applies_envd_config_and_keeps_plain_rootfs(self):
+        spec = importlib.util.spec_from_file_location('runtime_rootfs', ROOT.parent / 'runtime/rootfs.py')
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+
+        images = []
+
+        def capture_rootfs(command, **_kwargs):
+            if command[0] != '/mock/mkfs.erofs':
+                return None
+            root = Path(command[-1])
+            manifest = root / 'etc/adx-envd-manifest.json'
+            images.append(
+                {
+                    'manifest': json.loads(manifest.read_text()) if manifest.exists() else None,
+                    'passwd': (root / 'etc/passwd').read_text(),
+                    'group': (root / 'etc/group').read_text(),
+                    'envd': (root / 'usr/local/bin/envd').read_bytes() if manifest.exists() else None,
+                    'bash': (root / 'bin/bash').read_bytes() if manifest.exists() else None,
+                }
+            )
+            return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            execd = base / 'adx-execd'
+            busybox = base / 'busybox'
+            envd_binary = base / 'envd'
+            bash = base / 'bash'
+            for path, contents in ((execd, b'execd'), (busybox, b'busybox'), (envd_binary, b'envd'), (bash, b'bash')):
+                path.write_bytes(contents)
+            with (
+                mock.patch.object(module, '_executable', side_effect=lambda name: '/mock/' + name),
+                mock.patch.object(module, 'static_executable'),
+                mock.patch.object(module, 'shell_dependencies', return_value=[]),
+                mock.patch.object(module.os, 'chown') as chown,
+                mock.patch.object(module.subprocess, 'check_output', return_value='busybox\nsh\n'),
+                mock.patch.object(module.subprocess, 'run', side_effect=capture_rootfs),
+            ):
+                module.build(
+                    execd,
+                    base / 'with-envd.img',
+                    busybox,
+                    module.EnvdConfig(envd_binary, bash, 'e2e'),
+                )
+                module.build(execd, base / 'plain.img', busybox)
+
+        self.assertEqual(images[0]['envd'], b'envd')
+        self.assertEqual(images[0]['bash'], b'bash')
+        self.assertEqual(images[0]['manifest']['default_user'], 'e2e')
+        self.assertEqual(images[0]['manifest']['sha256'], hashlib.sha256(b'envd').hexdigest())
+        self.assertIn('e2e:x:1000:1000:E2B user:/home/e2e:/bin/bash\n', images[0]['passwd'])
+        self.assertIn('e2e:x:1000:\n', images[0]['group'])
+        chown.assert_called_once()
+        self.assertEqual(images[1]['manifest'], None)
+        self.assertEqual(images[1]['envd'], None)
+        self.assertEqual(images[1]['bash'], None)
+        self.assertEqual(images[1]['passwd'], 'root:x:0:0:root:/root:/bin/sh\n')
+        self.assertEqual(images[1]['group'], 'root:x:0:\n')
+
     def test_fc_bootstrap_has_separate_admin_and_tenant_credentials(self):
         import os
         import subprocess
@@ -202,23 +265,93 @@ class FirecrackerEvidenceTests(unittest.TestCase):
                 p.parent.mkdir(parents=True, exist_ok=True)
                 p.write_bytes(name.encode())
                 files[name] = hashlib.sha256(p.read_bytes()).hexdigest()
+            patches = kit.expected_sandboxd_patches()
             backend = {
                 'target': 'aarch64-unknown-linux-gnu',
-                'sandboxd_revision': 'pinned',
+                'sandboxd_revision': kit.expected_sandboxd_revision(),
+                'sandboxd_patches': patches,
                 'files': {
-                    'sandboxd': files['bin/sandboxd'],
-                    'sbox': files['bin/sbox'],
-                    'redis-cli': files['tools/redis-cli'],
+                    'sandboxd': files.get('bin/sandboxd'),
+                    'sbox': files.get('bin/sbox'),
+                    'redis-cli': files.get('tools/redis-cli'),
                 },
             }
-            (root / 'manifest.json').write_text(
-                json.dumps(
-                    {'schema_version': 1, 'target': backend['target'], 'sandboxd_revision': 'pinned', 'files': files}
-                )
-            )
+            manifest = {
+                'schema_version': 1,
+                'target': backend['target'],
+                'sandboxd_revision': backend['sandboxd_revision'],
+                'sandboxd_patches': patches,
+                'initrd_provenance': {
+                    'source_revision': backend['sandboxd_revision'],
+                    'patches': patches,
+                    'sha256': files.get('artifacts/initrd.img'),
+                },
+                'files': files,
+            }
+            (root / 'manifest.json').write_text(json.dumps(manifest))
             kit.verify(root, backend)
             (root / 'artifacts/Image').write_bytes(b'altered')
             with self.assertRaises(ValueError):
+                kit.verify(root, backend)
+
+    def test_kit_rejects_missing_or_stale_patch_and_initrd_provenance(self):
+        import hashlib
+
+        import kit
+
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            files = {}
+            for name in kit.REQUIRED:
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(name.encode())
+                files[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+            patches = kit.expected_sandboxd_patches()
+            backend = {
+                'target': 'aarch64-unknown-linux-gnu',
+                'sandboxd_revision': kit.expected_sandboxd_revision(),
+                'sandboxd_patches': patches,
+                'files': {
+                    'sandboxd': files.get('bin/sandboxd'),
+                    'sbox': files.get('bin/sbox'),
+                    'redis-cli': files.get('tools/redis-cli'),
+                },
+            }
+            manifest = {
+                'schema_version': 1,
+                'target': backend['target'],
+                'sandboxd_revision': backend['sandboxd_revision'],
+                'sandboxd_patches': patches,
+                'initrd_provenance': {
+                    'source_revision': backend['sandboxd_revision'],
+                    'patches': patches,
+                    'sha256': files.get('artifacts/initrd.img'),
+                },
+                'files': files,
+            }
+            (root / 'manifest.json').write_text(json.dumps(manifest))
+            kit.verify(root, backend)
+            manifest.pop('sandboxd_patches')
+            (root / 'manifest.json').write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, 'patch identity'):
+                kit.verify(root, backend)
+            manifest['sandboxd_patches'] = list(reversed(patches))
+            (root / 'manifest.json').write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, 'patch identity'):
+                kit.verify(root, backend)
+            manifest['sandboxd_patches'] = patches
+            manifest.pop('initrd_provenance')
+            (root / 'manifest.json').write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, 'initrd provenance'):
+                kit.verify(root, backend)
+            manifest['initrd_provenance'] = {
+                'source_revision': backend['sandboxd_revision'],
+                'patches': patches,
+                'sha256': '0' * 64,
+            }
+            (root / 'manifest.json').write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, 'initrd provenance'):
                 kit.verify(root, backend)
 
     def test_complete_evidence_passes_but_cleanup_error_fails(self):

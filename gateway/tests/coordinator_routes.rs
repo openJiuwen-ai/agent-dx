@@ -15,6 +15,7 @@ fn route(id: &str) -> PublishedRoute {
         port_forward_security_mode:
             adx_protocol::control::DataPlaneSecurityMode::DataPlaneSecurityTlsToken as i32,
         forwarded_ports: vec![8080],
+        compatibility: None,
     }
 }
 #[test]

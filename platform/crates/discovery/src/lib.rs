@@ -72,7 +72,14 @@ impl RedisDiscovery {
         let operation = async {
             let mut guard = self.connection.lock().await;
             if guard.is_none() {
-                *guard = Some(self.client.get_multiplexed_async_connection().await?);
+                // Discovery's outer operation timeout is the authoritative budget.
+                *guard = Some(
+                    self.client
+                        .get_multiplexed_async_connection_with_config(
+                            &redis::AsyncConnectionConfig::new().set_response_timeout(None),
+                        )
+                        .await?,
+                );
             }
             let mut connection = guard
                 .as_ref()

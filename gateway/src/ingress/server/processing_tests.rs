@@ -18,6 +18,7 @@ impl DemandResolver for SlowDemand {
         request_id: String,
     ) -> Result<RouteHandle, ResolveError> {
         Ok(RouteHandle {
+            e2b: None,
             needs_resume: true,
             processing: None,
             access_kind: kind,
@@ -205,6 +206,7 @@ async fn running_backend(
     });
     let store = Arc::new(RouteStore::new());
     store.put(RouteInfo {
+        e2b: None,
         instance_id: "environment".into(),
         tenant_id: "tenant".into(),
         environment_id: "running".into(),

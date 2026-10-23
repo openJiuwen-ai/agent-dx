@@ -1,0 +1,510 @@
+diff --git a/api/runtime/v1/sandbox_api_compat_test.go b/api/runtime/v1/sandbox_api_compat_test.go
+index 7f6340dec824ccc1cf9d7c8788440e82d0fd5568..55107fa22ec5f0958913884e11dc42a3b23aa3d3 100644
+--- a/api/runtime/v1/sandbox_api_compat_test.go
++++ b/api/runtime/v1/sandbox_api_compat_test.go
+@@ -35,10 +35,10 @@ func TestV010WireContract(t *testing.T) {
+ 		t.Fatal(err)
+ 	}
+ 	sum := sha256.Sum256(wire)
+-	// Rolled for StartResponse.sandbox_ip (field 4), required for YuanRong
+-	// Node Proxy route registration; existing response fields are unchanged.
++	// Rolled for reviewed downstream StartRequest.trusted_guest_metadata (field
++	// 23); original wire fields are unchanged.
+ 	// Recompute after any proto change: run this test, copy the got hash.
+-	const want = "21eb701d4c16828d5f4ac42d6a50d6f644e038b6b967b4c5165a9dd025aed67b"
++	const want = "bc960aa132ccbc80680d987f518e4d528387fe9ea18ad7ca705f8dc39cdb355f"
+ 	if got := hex.EncodeToString(sum[:]); got != want {
+ 		t.Fatalf("sandbox API descriptor hash = %s, want %s", got, want)
+ 	}
+diff --git a/doc/checkpoint-restore.md b/doc/checkpoint-restore.md
+index 2eb818f299a911a0b55ad3ca9c1002208d327e65..84b0fd8667a59fee2ff08a37957f20c8260aa2ed 100644
+--- a/doc/checkpoint-restore.md
++++ b/doc/checkpoint-restore.md
+@@ -14,6 +14,8 @@ There is no separate restore RPC. Restore is a form of sandbox creation, so it
+ uses the normal `Start` path to allocate the target sandbox's filesystem,
+ network, cgroup, and other resources.
+ 
++For a Firecracker restore, sandboxd takes the target TAP down before loading the snapshot, preventing bridge forwarding while the restored guest still carries the source network identity. sandboxd keeps the TAP down until the guest agent has accepted `MessageSetNetwork` for the target lease, then brings it up before releasing checkpointed workload threads. A failed snapshot load, agent handshake, or network update leaves the TAP isolated; if workload release fails after activation, sandboxd takes the TAP down again before cleanup. This host-side fence does not prove that the VMM has drained every guest descriptor captured in the snapshot; Firecracker runtime validation must check that no stale source-MAC frame can pollute the bridge FDB after activation.
++
+ sandboxd coordinates the runtime operation and cleans partial output. It does
+ not manage checkpoint names, catalogs, storage, transfer, retention, or
+ compatibility negotiation. The caller chooses the checkpoint directory and
+diff --git a/pkg/networkmanager/tap.go b/pkg/networkmanager/tap.go
+index f09f8b8bd951a4b25386802cce978ae326388524..a04784d9a31805cb9a655a91161a19a9a2752857 100644
+--- a/pkg/networkmanager/tap.go
++++ b/pkg/networkmanager/tap.go
+@@ -158,6 +158,73 @@ func (m *InterfaceManager) tapResource(link netlink.Link, ip net.IP) (*NetResour
+ 	}, nil
+ }
+ 
++// IsolateTAPForRestore disables host TAP forwarding until the guest agent has
++// installed the network identity assigned to this lease. This host-side fence
++// does not prove that a VMM has drained every guest descriptor captured in the
++// snapshot; runtime coverage must check that boundary on the target VMM.
++func IsolateTAPForRestore(resource *NetResource) error {
++	return setTAPRestoreFence(resource, false, systemLinkOperations{})
++}
++
++// ActivateTAPAfterRestore releases a restore fence after the guest agent has
++// installed the assigned network identity.
++func ActivateTAPAfterRestore(resource *NetResource) error {
++	return setTAPRestoreFence(resource, true, systemLinkOperations{})
++}
++
++func setTAPRestoreFence(resource *NetResource, up bool, links linkOperations) error {
++	if resource == nil || resource.Interface == nil {
++		return errors.New("TAP restore fence resource interface is missing")
++	}
++	if resource.SchemaVersion > NetResourceSchemaVersion {
++		return fmt.Errorf(
++			"unsupported network resource schema %d (max %d)",
++			resource.SchemaVersion,
++			NetResourceSchemaVersion,
++		)
++	}
++	if resource.EndpointType != EndpointTypeTap {
++		return fmt.Errorf("TAP restore fence requires TAP endpoint, got %q", resource.EndpointType)
++	}
++	ip4 := resource.Ip.To4()
++	if ip4 == nil {
++		return fmt.Errorf("TAP restore fence has invalid IPv4 address %q", resource.Ip)
++	}
++	expectedName := util.IpToTap(ip4.String())
++	if resource.Interface.Name != expectedName {
++		return fmt.Errorf(
++			"TAP restore fence identity mismatch: interface %q, want %q",
++			resource.Interface.Name,
++			expectedName,
++		)
++	}
++	link, err := links.LinkByName(expectedName)
++	if err != nil {
++		return fmt.Errorf("find TAP %s for restore fence: %w", expectedName, err)
++	}
++	if link.Type() != "tuntap" {
++		return fmt.Errorf("restore fence endpoint %s has type %q, want tuntap", expectedName, link.Type())
++	}
++	if resource.Interface.Index != 0 && resource.Interface.Index != link.Attrs().Index {
++		return fmt.Errorf(
++			"restore fence endpoint %s was replaced externally: ifindex %d, lease records %d",
++			expectedName,
++			link.Attrs().Index,
++			resource.Interface.Index,
++		)
++	}
++	if up {
++		if err := links.LinkSetUp(link); err != nil {
++			return fmt.Errorf("activate TAP %s after restore: %w", expectedName, err)
++		}
++		return nil
++	}
++	if err := links.LinkSetDown(link); err != nil {
++		return fmt.Errorf("isolate TAP %s for restore: %w", expectedName, err)
++	}
++	return nil
++}
++
+ func (m *InterfaceManager) setTapState(resource *NetResource, up bool) error {
+ 	if resource == nil || resource.Interface == nil {
+ 		return errors.New("TAP resource interface is missing")
+diff --git a/pkg/networkmanager/tap_restore_fence_test.go b/pkg/networkmanager/tap_restore_fence_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..7b878ec74852afa054b44e5d8bf27c470d4178c0
+--- /dev/null
++++ b/pkg/networkmanager/tap_restore_fence_test.go
+@@ -0,0 +1,133 @@
++// Copyright (c) 2026 Ant Group Corporation.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package networkmanager
++
++import (
++	"errors"
++	"net"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"github.com/vishvananda/netlink"
++)
++
++func TestTAPRestoreFenceChangesOnlyTheRequestedLinkState(t *testing.T) {
++	tap := convergedTap(t, 13)
++	resource, err := newTapRecoveryFixture(t, tap).manager.tapResource(tap, net.ParseIP("10.88.0.5"))
++	require.NoError(t, err)
++
++	for _, test := range []struct {
++		name      string
++		up        bool
++		configure func(*fakeLinkOperations)
++		wantUp    int
++		wantDown  int
++		wantErr   string
++	}{
++		{name: "isolate", wantDown: 1},
++		{name: "activate", up: true, wantUp: 1},
++		{
++			name: "isolation error is wrapped",
++			configure: func(ops *fakeLinkOperations) {
++				ops.setDownErr = errors.New("netlink down failed")
++			},
++			wantDown: 1,
++			wantErr:  "isolate TAP",
++		},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			ops := &fakeLinkOperations{link: tap}
++			if test.configure != nil {
++				test.configure(ops)
++			}
++
++			err := setTAPRestoreFence(resource, test.up, ops)
++			if test.wantErr == "" {
++				require.NoError(t, err)
++			} else {
++				require.ErrorContains(t, err, test.wantErr)
++			}
++			assert.Equal(t, test.wantUp, ops.setUpCount)
++			assert.Equal(t, test.wantDown, ops.setDownCount)
++		})
++	}
++}
++
++func TestTAPRestoreFenceRejectsInvalidOrReplacedEndpoint(t *testing.T) {
++	tap := convergedTap(t, 13)
++	resource, err := newTapRecoveryFixture(t, tap).manager.tapResource(tap, net.ParseIP("10.88.0.5"))
++	require.NoError(t, err)
++
++	tests := []struct {
++		name     string
++		resource func() *NetResource
++		link     netlink.Link
++		wantErr  string
++	}{
++		{
++			name: "wrong schema",
++			resource: func() *NetResource {
++				copy := *resource
++				copy.SchemaVersion = NetResourceSchemaVersion + 1
++				return &copy
++			},
++			link:    tap,
++			wantErr: "unsupported network resource schema",
++		},
++		{
++			name: "wrong interface name",
++			resource: func() *NetResource {
++				copy := *resource
++				iface := *resource.Interface
++				iface.Name = "tap.wrong"
++				copy.Interface = &iface
++				return &copy
++			},
++			link:    tap,
++			wantErr: "identity mismatch",
++		},
++		{
++			name: "non tap link",
++			resource: func() *NetResource {
++				copy := *resource
++				return &copy
++			},
++			link: &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{
++				Name: resource.Interface.Name, Index: resource.Interface.Index,
++			}},
++			wantErr: "want tuntap",
++		},
++		{
++			name: "replaced ifindex",
++			resource: func() *NetResource {
++				copy := *resource
++				return &copy
++			},
++			link:    convergedTap(t, 14),
++			wantErr: "was replaced externally",
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			ops := &fakeLinkOperations{link: test.link}
++			err := setTAPRestoreFence(test.resource(), false, ops)
++			require.ErrorContains(t, err, test.wantErr)
++			assert.Zero(t, ops.setUpCount)
++			assert.Zero(t, ops.setDownCount)
++		})
++	}
++}
+diff --git a/pkg/runtime/firecracker/checkpoint_handler.go b/pkg/runtime/firecracker/checkpoint_handler.go
+index eae806c0ea5b0deb3e471e98253b5e77c50cbe6f..38c395d50e8875fb608c60f2042049eec131e2ff 100644
+--- a/pkg/runtime/firecracker/checkpoint_handler.go
++++ b/pkg/runtime/firecracker/checkpoint_handler.go
+@@ -31,6 +31,7 @@ import (
+ 
+ 	"github.com/inclusionAI/sandboxd/config"
+ 	"github.com/inclusionAI/sandboxd/internal/firecrackerproto"
++	"github.com/inclusionAI/sandboxd/pkg/networkmanager"
+ 	runtimecore "github.com/inclusionAI/sandboxd/pkg/runtime"
+ 	runtimecommon "github.com/inclusionAI/sandboxd/pkg/runtime/internal/common"
+ 	"github.com/sirupsen/logrus"
+@@ -704,6 +705,52 @@ func restoreCheckpointRequest(environment []string) firecrackerproto.CheckpointR
+ 	}
+ }
+ 
++type restoreNetworkHandoff struct {
++	isolateTap      func() error
++	loadSnapshot    func() error
++	snapshotLoaded  func()
++	waitForAgent    func() error
++	setNetwork      func() error
++	activateTap     func() error
++	releaseWorkload func() error
++}
++
++// runRestoreNetworkHandoff keeps the restored VM's TAP isolated while the
++// snapshot still carries its source guest MAC and IP. The guest agent must
++// receive the target identity before bridge forwarding resumes.
++func runRestoreNetworkHandoff(handoff restoreNetworkHandoff) error {
++	if err := handoff.isolateTap(); err != nil {
++		return fmt.Errorf("isolate restored Firecracker TAP: %w", err)
++	}
++	if err := handoff.loadSnapshot(); err != nil {
++		return fmt.Errorf("load Firecracker checkpoint: %w", err)
++	}
++	if handoff.snapshotLoaded != nil {
++		handoff.snapshotLoaded()
++	}
++	if err := handoff.waitForAgent(); err != nil {
++		return fmt.Errorf("wait for restored Firecracker agent: %w", err)
++	}
++	if err := handoff.setNetwork(); err != nil {
++		return fmt.Errorf("configure restored Firecracker network: %w", err)
++	}
++	if err := handoff.activateTap(); err != nil {
++		return fmt.Errorf("activate restored Firecracker TAP: %w", err)
++	}
++	if err := handoff.releaseWorkload(); err != nil {
++		return errors.Join(
++			fmt.Errorf("release restored Firecracker sandbox: %w", err),
++			func() error {
++				if fenceErr := handoff.isolateTap(); fenceErr != nil {
++					return fmt.Errorf("re-isolate restored Firecracker TAP: %w", fenceErr)
++				}
++				return nil
++			}(),
++		)
++	}
++	return nil
++}
++
+ func (handler *Handler) Restore(
+ 	ctx context.Context,
+ 	startConfig runtimecore.StartConfig,
+@@ -967,40 +1014,59 @@ func (handler *Handler) Restore(
+ 	}
+ 	readyCancel()
+ 	tReady := time.Now()
+-	if err := api.loadSnapshot(
+-		ctx,
+-		checkpointFiles.State,
+-		checkpointFiles.Memory,
+-		filepath.Join(storageDir, firecrackerVirtioFSMemory),
+-		startConfig.Network.Interface.Name,
+-		vsockPath,
+-		virtioFSSocketPathIfConfigured(virtioFSState),
+-		checkpointFiles.VirtioFSState,
+-		startConfig.TrustedGuestMetadata,
+-	); err != nil {
+-		return fmt.Errorf("load Firecracker checkpoint for %s: %w", startConfig.ID, err)
+-	}
+-	tLoaded := time.Now()
+-	agentCtx, agentCancel := context.WithTimeout(ctx, firecrackerAgentTimeout)
+-	defer agentCancel()
+-	if err := waitForFirecrackerAgent(agentCtx, vsockPath); err != nil {
+-		return err
+-	}
+-	if err := requestFirecrackerAgent(
+-		agentCtx,
+-		vsockPath,
+-		firecrackerproto.MessageSetNetwork,
+-		plan.configure.Network,
+-	); err != nil {
+-		return fmt.Errorf("configure restored Firecracker network: %w", err)
+-	}
+-	if err := requestFirecrackerAgent(
+-		agentCtx,
+-		vsockPath,
+-		firecrackerproto.MessageCheckpoint,
+-		restoreCheckpointRequest(plan.configure.Process.Env),
+-	); err != nil {
+-		return fmt.Errorf("release restored Firecracker sandbox: %w", err)
++	var tLoaded time.Time
++	var agentCtx context.Context
++	var agentCancel context.CancelFunc
++	defer func() {
++		if agentCancel != nil {
++			agentCancel()
++		}
++	}()
++	if err := runRestoreNetworkHandoff(restoreNetworkHandoff{
++		isolateTap: func() error {
++			return networkmanager.IsolateTAPForRestore(startConfig.Network)
++		},
++		loadSnapshot: func() error {
++			return api.loadSnapshot(
++				ctx,
++				checkpointFiles.State,
++				checkpointFiles.Memory,
++				filepath.Join(storageDir, firecrackerVirtioFSMemory),
++				startConfig.Network.Interface.Name,
++				vsockPath,
++				virtioFSSocketPathIfConfigured(virtioFSState),
++				checkpointFiles.VirtioFSState,
++				startConfig.TrustedGuestMetadata,
++			)
++		},
++		snapshotLoaded: func() {
++			tLoaded = time.Now()
++		},
++		waitForAgent: func() error {
++			agentCtx, agentCancel = context.WithTimeout(ctx, firecrackerAgentTimeout)
++			return waitForFirecrackerAgent(agentCtx, vsockPath)
++		},
++		setNetwork: func() error {
++			return requestFirecrackerAgent(
++				agentCtx,
++				vsockPath,
++				firecrackerproto.MessageSetNetwork,
++				plan.configure.Network,
++			)
++		},
++		activateTap: func() error {
++			return networkmanager.ActivateTAPAfterRestore(startConfig.Network)
++		},
++		releaseWorkload: func() error {
++			return requestFirecrackerAgent(
++				agentCtx,
++				vsockPath,
++				firecrackerproto.MessageCheckpoint,
++				restoreCheckpointRequest(plan.configure.Process.Env),
++			)
++		},
++	}); err != nil {
++		return fmt.Errorf("restore Firecracker sandbox %s network handoff: %w", startConfig.ID, err)
+ 	}
+ 	instance.markConfigured()
+ 	// A restored Firecracker diffs against the memory file it loaded, so the
+diff --git a/pkg/runtime/firecracker/restore_network_fence_test.go b/pkg/runtime/firecracker/restore_network_fence_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..158b40446157c10d7b892375506e7b5ef4e7795b
+--- /dev/null
++++ b/pkg/runtime/firecracker/restore_network_fence_test.go
+@@ -0,0 +1,97 @@
++// Copyright (c) 2026 Ant Group Corporation.
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package firecracker
++
++import (
++	"errors"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++func TestRestoreNetworkFence(t *testing.T) {
++	tests := []struct {
++		name    string
++		failAt  string
++		wantLog []string
++	}{
++		{
++			name:    "successful handoff activates only after guest network is configured",
++			wantLog: []string{"down", "load", "agent", "network", "up", "release"},
++		},
++		{
++			name:    "down failure aborts before snapshot load",
++			failAt:  "down",
++			wantLog: []string{"down"},
++		},
++		{
++			name:    "snapshot load failure keeps tap isolated",
++			failAt:  "load",
++			wantLog: []string{"down", "load"},
++		},
++		{
++			name:    "agent readiness failure keeps tap isolated",
++			failAt:  "agent",
++			wantLog: []string{"down", "load", "agent"},
++		},
++		{
++			name:    "guest network failure keeps tap isolated",
++			failAt:  "network",
++			wantLog: []string{"down", "load", "agent", "network"},
++		},
++		{
++			name:    "tap activation failure aborts before workload release",
++			failAt:  "up",
++			wantLog: []string{"down", "load", "agent", "network", "up"},
++		},
++		{
++			name:    "workload release failure re-isolates the tap",
++			failAt:  "release",
++			wantLog: []string{"down", "load", "agent", "network", "up", "release", "down"},
++		},
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			var log []string
++			step := func(name string) func() error {
++				return func() error {
++					log = append(log, name)
++					if test.failAt == name {
++						return errors.New(name + " failed")
++					}
++					return nil
++				}
++			}
++
++			err := runRestoreNetworkHandoff(restoreNetworkHandoff{
++				isolateTap:      step("down"),
++				loadSnapshot:    step("load"),
++				waitForAgent:    step("agent"),
++				setNetwork:      step("network"),
++				activateTap:     step("up"),
++				releaseWorkload: step("release"),
++			})
++
++			if test.failAt == "" {
++				require.NoError(t, err)
++			} else {
++				require.ErrorContains(t, err, test.failAt+" failed")
++			}
++			assert.Equal(t, test.wantLog, log)
++		})
++	}
++}

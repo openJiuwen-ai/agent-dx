@@ -23,6 +23,9 @@ fn node(id: &str, cpu: u64) -> Node {
 }
 fn spec(id: &str) -> EnvironmentSpec {
     EnvironmentSpec {
+        run_policy: None,
+        template_identity: None,
+        compatibility: None,
         runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),

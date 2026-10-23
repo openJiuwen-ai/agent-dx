@@ -57,7 +57,8 @@ Coordinator 收到 Published 的创建结果后再读取已提交记录核对，
 | Coordinator.RegisterNode | Node(node_id) | 证书身份必须与注册 ID 一致 |
 | Coordinator.CreateEnvironment | API Server | CallerContext 与 Spec 租户匹配，或已认证管理员 |
 | Coordinator.GetEnvironment | API Server 或归属 Node | 租户权限／节点归属 |
-| Coordinator.CommitEnvironment | 归属 Node | 完整 Assignment、Spec、实例 revision 由存储层核验 |
+| Coordinator.CommitEnvironment | 归属 Node | 完整 Assignment、Spec、实例 revision 由存储层核验；Deleted 的 cleanup_artifacts 与退役原子持久化 |
+| Node.CollectCheckpointCleanup | Coordinator | 已持久的任务、目标节点 session、就绪状态和制品 scope；幂等删除后按完整任务确认 |
 | Node.CreateEnvironment | Coordinator | 本机 node_id、Spec、Assignment、设备分配 |
 | Node.DeleteEnvironment | API Server | 租户权限、本机控制器、完整 Assignment |
 

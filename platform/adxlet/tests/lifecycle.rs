@@ -21,6 +21,7 @@ struct Dependencies {
     actual: std::sync::atomic::AtomicBool,
     fail_cleanup: std::sync::atomic::AtomicBool,
     failure: Mutex<Option<adx_core::RuntimeFailure>>,
+    compatibility_ready: std::sync::atomic::AtomicBool,
 }
 
 impl Dependencies {
@@ -39,6 +40,7 @@ impl Dependencies {
             actual: std::sync::atomic::AtomicBool::new(false),
             fail_cleanup: std::sync::atomic::AtomicBool::new(false),
             failure: Mutex::default(),
+            compatibility_ready: std::sync::atomic::AtomicBool::new(true),
         })
     }
     fn event(&self, name: &str) -> Result<()> {
@@ -107,6 +109,16 @@ impl RuntimeDriver for Dependencies {
 }
 #[async_trait]
 impl Readiness for Dependencies {
+    async fn activity(&self, _record: &EnvironmentRecord) -> Result<(u64, u64)> {
+        if self
+            .compatibility_ready
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            Ok((1, 0))
+        } else {
+            Err(Error::Unavailable("envd is not ready".into()))
+        }
+    }
     async fn probe_failure(
         &self,
         _: &EnvironmentRecord,
@@ -162,6 +174,9 @@ fn resources() -> Resources {
 }
 fn spec(id: &str) -> EnvironmentSpec {
     EnvironmentSpec {
+        run_policy: None,
+        template_identity: None,
+        compatibility: None,
         runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),
@@ -174,6 +189,15 @@ fn spec(id: &str) -> EnvironmentSpec {
         resources: resources(),
         priority: 0,
         execution: Default::default(),
+    }
+}
+fn e2b_compatibility() -> adx_core::environment_control::EnvironmentCompatibility {
+    adx_core::environment_control::EnvironmentCompatibility {
+        template_id: "base".into(),
+        envd_version: "0.9.0".into(),
+        envd_access_token: "a".repeat(32),
+        traffic_access_token: "b".repeat(32),
+        allow_public_traffic: false,
     }
 }
 fn assignment(id: &str) -> Assignment {
@@ -222,6 +246,78 @@ async fn create_publishes_only_after_runtime_readiness_and_route_binding() {
     environment.delete().await.unwrap();
     assert_eq!(deps.events.lock().unwrap().len(), 7);
     assert_eq!(environment.create().await.unwrap_err(), Error::Conflict);
+}
+
+#[tokio::test]
+async fn e2b_envd_failure_on_tick_retires_route_and_releases_resources() {
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let mut value = spec("e2b-tick");
+    value.compatibility = Some(e2b_compatibility());
+    let environment = node.environment(value, assignment("e2b-tick")).unwrap();
+    environment.create().await.unwrap();
+
+    deps.compatibility_ready
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    environment.tick().await.unwrap();
+
+    let failed = environment.sync().await.unwrap().record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    assert!(!failed.resources_held);
+    assert_eq!(node.used(), Resources::default());
+    assert_eq!(
+        &deps.events.lock().unwrap()[4..7],
+        ["retire", "remove", "commit:Failed"]
+    );
+}
+
+#[tokio::test]
+async fn e2b_envd_failure_event_retires_route_without_waiting_for_monitor_policy() {
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let mut value = spec("e2b-event");
+    value.compatibility = Some(e2b_compatibility());
+    let environment = node.environment(value, assignment("e2b-event")).unwrap();
+    environment.create().await.unwrap();
+
+    deps.compatibility_ready
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    node.observe_runtime_event(&adx_core::runtime::RuntimeIdentity {
+        environment_id: "e2b-event".into(),
+        runtime_id: "e2b-event-1".into(),
+        ownership_generation: 1,
+    })
+    .await
+    .unwrap();
+
+    let failed = environment.sync().await.unwrap().record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    assert!(!failed.resources_held);
+    assert_eq!(node.used(), Resources::default());
+    assert_eq!(
+        &deps.events.lock().unwrap()[4..7],
+        ["retire", "remove", "commit:Failed"]
+    );
+}
+
+#[tokio::test]
+async fn native_runtime_does_not_require_optional_compatibility_health() {
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let environment = node
+        .environment(spec("native"), assignment("native"))
+        .unwrap();
+    environment.create().await.unwrap();
+
+    deps.compatibility_ready
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    environment.tick().await.unwrap();
+
+    assert_eq!(
+        environment.sync().await.unwrap().record.state,
+        EnvironmentState::Running
+    );
+    assert_eq!(node.used(), resources());
 }
 
 #[tokio::test]

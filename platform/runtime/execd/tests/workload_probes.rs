@@ -100,6 +100,9 @@ fn start(config: ProbeConfig) -> Process {
         snapshot_source: None,
         failure: None,
         spec: EnvironmentSpec {
+            run_policy: None,
+            template_identity: None,
+            compatibility: None,
             runtime_profile: None,
             snapshot_id: None,
             lifecycle: Default::default(),

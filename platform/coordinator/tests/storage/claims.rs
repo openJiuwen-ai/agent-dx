@@ -249,6 +249,26 @@ async fn batched_local_claims_allocate_one_contiguous_generation_range() {
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn batched_claim_replay_compares_user_metadata() {
+    let rig = common::Redis::new().await;
+    let db = rig.store().await;
+    let session = db.begin(1).await.unwrap();
+    let candidate = claimant(&session, "a").await;
+    let metadata = [("project".into(), "alpha".into())].into_iter().collect();
+    session
+        .claim_with_metadata(spec("metadata-replay"), &candidate, metadata)
+        .await
+        .unwrap();
+
+    let outcomes = session
+        .claim_batch(vec![(spec("metadata-replay"), candidate)])
+        .await
+        .unwrap();
+    assert!(matches!(outcomes.as_slice(), [Err(Error::Conflict)]));
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
 async fn device_choice_is_part_of_owned_replay_and_bad_claims_do_not_consume_generation() {
     use adx_core::scheduling::{DeviceAllocation, DeviceKind, DeviceRequest};
     let rig = common::Redis::new().await;
@@ -296,6 +316,7 @@ async fn snapshot_claim_requires_existing_restore_reference() {
         "source-1".into(),
         adx_core::CheckpointArtifact {
             storage: "shared".into(),
+            scope: String::new(),
             location: "artifact".into(),
             size_bytes: 1,
         },

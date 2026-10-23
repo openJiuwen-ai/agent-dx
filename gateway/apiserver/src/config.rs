@@ -32,6 +32,8 @@ pub enum IngressMode {
 #[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
+    pub e2b: Option<crate::e2b::Config>,
+    #[serde(default)]
     pub runtime_profile: Option<adx_core::runtime_profile::RuntimeProfile>,
     pub listen: SocketAddr,
     #[serde(default)]
@@ -65,6 +67,11 @@ pub struct Config {
 }
 impl Config {
     pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(e2b) = &self.e2b {
+            if let Err(error) = e2b.validate(self.runtime_profile.as_ref()) {
+                return Err(error.message.into());
+            }
+        }
         if let Some(e) = &self.runtime_profile {
             e.validate()?;
         }

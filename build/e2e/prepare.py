@@ -100,6 +100,9 @@ def main():
     pinned = json.loads((ROOT / 'third_party/sandboxd/source.json').read_text())
     if backend['sandboxd_revision'] != pinned['revision'] or backend['target'] != manifest['target']:
         raise ValueError('backend revision or architecture mismatch')
+    from build_backend import patch_identity
+    if backend.get('sandboxd_patches', []) != patch_identity(pinned):
+        raise ValueError('backend patch identity mismatch')
     for name in BACKEND_BINARIES:
         path = a.backend / name
         if path.is_symlink() or sha(path) != backend['files'][name]:

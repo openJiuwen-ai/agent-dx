@@ -4,6 +4,9 @@ fn placed(id: &str, tenant: &str, labels: &[(&str, &str)]) -> PlacedEnvironment 
     PlacedEnvironment {
         node_id: "n".into(),
         spec: EnvironmentSpec {
+            run_policy: None,
+            template_identity: None,
+            compatibility: None,
             runtime_profile: None,
             snapshot_id: None,
             lifecycle: Default::default(),

@@ -86,7 +86,17 @@ impl Session {
         spec: EnvironmentSpec,
         candidate: &LocalClaim,
     ) -> Result<ClaimOutcome> {
+        self.claim_with_metadata(spec, candidate, Default::default())
+            .await
+    }
+    pub async fn claim_with_metadata(
+        &self,
+        spec: EnvironmentSpec,
+        candidate: &LocalClaim,
+        user_metadata: adx_core::metadata::UserMetadata,
+    ) -> Result<ClaimOutcome> {
         spec.validate()?;
+        adx_core::metadata::validate_user_metadata(&user_metadata)?;
         if candidate.node_id.trim().is_empty() || candidate.node_session_id.trim().is_empty() {
             return Err(Error::Invalid(
                 "claim requires node and process session".into(),
@@ -117,7 +127,7 @@ impl Session {
             if let Some(environment_value) = &environment_value {
                 let existing: StoredEnvironment = decode(environment_value)?;
                 existing.validate()?;
-                if existing.spec != spec {
+                if existing.spec != spec || existing.user_metadata != user_metadata {
                     return Err(Error::Conflict);
                 }
                 if existing.assignment.node_id != candidate.node_id
@@ -153,7 +163,9 @@ impl Session {
             };
             let generation = header.generation.checked_add(1).ok_or(Error::Conflict)?;
             let record = StoredEnvironment {
+                user_metadata: user_metadata.clone(),
                 resume: None,
+                control: super::environment_control::seed(&spec, generation),
                 failed_since_unix_seconds: None,
                 recovery: None,
                 invalidated: false,
@@ -199,11 +211,28 @@ impl Session {
         &self,
         claims: Vec<(EnvironmentSpec, LocalClaim)>,
     ) -> Result<Vec<Result<ClaimOutcome>>> {
+        self.claim_batch_with_metadata(
+            claims
+                .into_iter()
+                .map(|(spec, candidate)| (spec, candidate, Default::default()))
+                .collect(),
+        )
+        .await
+    }
+    pub async fn claim_batch_with_metadata(
+        &self,
+        claims: Vec<(
+            EnvironmentSpec,
+            LocalClaim,
+            adx_core::metadata::UserMetadata,
+        )>,
+    ) -> Result<Vec<Result<ClaimOutcome>>> {
         if claims.is_empty() {
             return Ok(Vec::new());
         }
-        for (spec, candidate) in &claims {
+        for (spec, candidate, user_metadata) in &claims {
             spec.validate()?;
+            adx_core::metadata::validate_user_metadata(user_metadata)?;
             if candidate.node_id.trim().is_empty() || candidate.node_session_id.trim().is_empty() {
                 return Err(Error::Invalid(
                     "claim requires node and process session".into(),
@@ -213,11 +242,11 @@ impl Session {
         }
         let environment_fields: BTreeSet<_> = claims
             .iter()
-            .map(|(spec, _)| format!("environment:{}", spec.id))
+            .map(|(spec, _, _)| format!("environment:{}", spec.id))
             .collect();
         let node_fields: BTreeSet<_> = claims
             .iter()
-            .map(|(_, candidate)| format!("node:{}", candidate.node_id))
+            .map(|(_, candidate, _)| format!("node:{}", candidate.node_id))
             .collect();
         for _ in 0..ATTEMPTS {
             let fields: Vec<_> = std::iter::once(HEADER.to_owned())
@@ -244,8 +273,8 @@ impl Session {
             }
             let snapshot_ids: BTreeSet<_> = claims
                 .iter()
-                .filter(|(spec, _)| !environments.contains_key(&spec.id))
-                .filter_map(|(spec, _)| spec.snapshot_id.clone())
+                .filter(|(spec, _, _)| !environments.contains_key(&spec.id))
+                .filter_map(|(spec, _, _)| spec.snapshot_id.clone())
                 .collect();
             let mut snapshots = BTreeMap::new();
             for id in &snapshot_ids {
@@ -257,7 +286,7 @@ impl Session {
 
             let mut results = Vec::with_capacity(claims.len());
             let mut writes = Vec::new();
-            for (spec, candidate) in &claims {
+            for (spec, candidate, user_metadata) in &claims {
                 let result = (|| {
                     let node = nodes.get(&candidate.node_id).ok_or(Error::NotFound)?;
                     if node.node.id != candidate.node_id
@@ -271,7 +300,7 @@ impl Session {
                     }
                     claim_admission(node)?;
                     if let Some(existing) = environments.get(&spec.id) {
-                        if existing.spec != *spec {
+                        if existing.spec != *spec || existing.user_metadata != *user_metadata {
                             return Err(Error::Conflict);
                         }
                         if existing.assignment.node_id != candidate.node_id
@@ -300,7 +329,9 @@ impl Session {
                     header.generation = generation;
                     header.advance()?;
                     let record = StoredEnvironment {
+                        user_metadata: user_metadata.clone(),
                         resume: None,
+                        control: super::environment_control::seed(spec, generation),
                         failed_since_unix_seconds: None,
                         recovery: None,
                         invalidated: false,

@@ -25,9 +25,13 @@ fn terminal_without_execution(record: &EnvironmentRecord) -> bool {
 impl Adxlet {
     /// Called only with a Coordinator-authorized, unreferenced deletion record.
     /// A lost acknowledgement can safely repeat the same artifact removal.
-    pub async fn collect_snapshot(&self, snapshot: &Snapshot) -> Result<()> {
+    pub async fn collect_snapshot(&self, snapshot: &Snapshot, delegated: bool) -> Result<()> {
         snapshot.validate()?;
-        if snapshot.source_node_id != self.node_id || !snapshot.collectable() {
+        if delegated
+            || snapshot.source_node_id != self.node_id
+            || snapshot.artifact.storage != "local"
+            || !snapshot.collectable()
+        {
             return Err(Error::Conflict);
         }
         let checkpoint = self
@@ -36,6 +40,35 @@ impl Adxlet {
             .as_ref()
             .ok_or_else(|| Error::Unavailable("checkpoint storage is not configured".into()))?;
         checkpoint.store.release(&snapshot.artifact).await
+    }
+
+    /// Remove artifacts authorized by a durable Coordinator cleanup task.
+    /// Repeating a task after a lost acknowledgement is safe because storage
+    /// removal is idempotent; a later artifact remains pending on failure.
+    pub async fn collect_checkpoint_cleanup(
+        &self,
+        cleanup: &adx_core::CheckpointCleanup,
+        delegated: bool,
+    ) -> Result<()> {
+        cleanup.validate()?;
+        let checkpoint = self
+            .services
+            .checkpoint
+            .as_ref()
+            .ok_or_else(|| Error::Unavailable("checkpoint storage is not configured".into()))?;
+        if delegated
+            || cleanup.assignment.node_id != self.node_id
+            || cleanup
+                .artifacts
+                .iter()
+                .any(|artifact| artifact.storage != "local")
+        {
+            return Err(Error::Conflict);
+        }
+        for artifact in &cleanup.artifacts {
+            checkpoint.store.release(artifact).await?;
+        }
+        Ok(())
     }
 
     /// Caller must obtain the entire catalog from the current Coordinator while node

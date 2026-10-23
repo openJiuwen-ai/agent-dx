@@ -273,6 +273,9 @@ message StartRequest {
   // rootfs. Empty disables injection. It does not replace the sandbox's own
   // command.
   string inject_entrypoint = 22;
+  // TrustedGuestMetadata is deployment-owned JSON for guest services. It is
+  // applied by runtimes only where a trusted metadata transport exists.
+  string trusted_guest_metadata = 23;
 }
 
 // StartResponse is returned after sandbox start.

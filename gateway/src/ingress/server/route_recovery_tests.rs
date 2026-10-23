@@ -52,6 +52,7 @@ async fn binding_replacement(next_tenant: Option<&str>, change_security: bool) {
         tunnel_security_mode: Default::default(),
         port_forward_security_mode: Default::default(),
         port_forward_routes: Vec::new(),
+        e2b: None,
     };
     store.put(route.clone());
     store.set_ready(true);
@@ -156,6 +157,7 @@ impl crate::ingress::resolver::DemandResolver for ProbeDemand {
         request: String,
     ) -> Result<RouteHandle, ResolveError> {
         Ok(RouteHandle {
+            e2b: None,
             needs_resume: self.paused,
             processing: None,
             access_kind: kind,
@@ -204,6 +206,7 @@ async fn health_and_metrics_never_wake_paused_or_rejected_old_routes() {
         store.set_ready(true);
         if !paused {
             store.put(RouteInfo {
+                e2b: None,
                 instance_id: "environment".into(),
                 tenant_id: "tenant".into(),
                 environment_id: "old-runtime".into(),
@@ -282,6 +285,7 @@ async fn rejected_binding_preserves_temporary_wake_failure_as_retryable() {
     let store = Arc::new(RouteStore::new());
     store.set_ready(true);
     store.put(RouteInfo {
+        e2b: None,
         instance_id: "environment".into(),
         tenant_id: "tenant".into(),
         environment_id: "old-runtime".into(),

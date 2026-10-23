@@ -97,6 +97,9 @@ async fn channel(address: std::net::SocketAddr, name: &str) -> Channel {
 }
 fn spec(id: &str) -> EnvironmentSpec {
     EnvironmentSpec {
+        run_policy: None,
+        template_identity: None,
+        compatibility: None,
         runtime_profile: None,
         snapshot_id: None,
         lifecycle: Default::default(),
@@ -129,6 +132,7 @@ fn create(id: &str) -> pb::CreateEnvironmentRequest {
         create_timeout_seconds: 90,
         create_deadline_unix_millis: 0,
         expected_assignment: None,
+        user_metadata: Default::default(),
     }
 }
 struct Backend {
@@ -169,30 +173,7 @@ impl RuntimeDriver for Backend {
         let allocation = self.session.get(&spec.id).await?;
         assert_eq!(allocation.assignment.generation, generation);
         assert_eq!(allocation.spec, *spec);
-        // Validate public HTTP input at the execution boundary, before deletion
-        // retires its authoritative record.
-        match spec.id.as_str() {
-            "t-http-case" => {
-                assert_eq!(spec.tenant_id, "tenant");
-                assert_eq!(spec.env["USER_VALUE"], "propagated");
-            }
-            "t-http-peer" => assert_eq!(spec.scheduling.labels["app"], "db"),
-            "t-http-affinity" => {
-                assert_eq!(spec.scheduling.placement_groups.len(), 3);
-                assert!(spec.scheduling.placement_groups.iter().any(|g| g.ordered));
-                assert!(spec
-                    .scheduling
-                    .placement_groups
-                    .iter()
-                    .any(|g| g.required && g.terms.len() == 2));
-                assert!(spec
-                    .scheduling
-                    .placement_groups
-                    .iter()
-                    .any(|g| g.anti && g.terms[0].weight == 7));
-            }
-            _ => (),
-        }
+        assert_http_spec_at_execution(spec, &allocation.assignment.node_id);
         self.started.fetch_add(1, Ordering::SeqCst);
         if spec.id == "assignment-wins" {
             // Assignment wins before the queue deadline; runtime readiness may
@@ -261,6 +242,26 @@ impl RuntimeDriver for Backend {
         Ok(())
     }
 }
+
+fn assert_http_spec_at_execution(spec: &EnvironmentSpec, node_id: &str) {
+    match spec.id.as_str() {
+        "lf-first" => assert_eq!(node_id, "a"),
+        "lf-second" => assert_eq!(node_id, "b"),
+        "t-http-case" => {
+            assert_eq!(spec.tenant_id, "tenant");
+            assert_eq!(spec.env["USER_VALUE"], "propagated");
+        }
+        "t-http-peer" => assert_eq!(spec.scheduling.labels["app"], "db"),
+        "t-http-affinity" => {
+            let groups = &spec.scheduling.placement_groups;
+            assert_eq!(groups.len(), 3);
+            assert!(groups.iter().any(|g| g.ordered));
+            assert!(groups.iter().any(|g| g.required && g.terms.len() == 2));
+            assert!(groups.iter().any(|g| g.anti && g.terms[0].weight == 7));
+        }
+        _ => (),
+    }
+}
 struct LocalChecks;
 #[async_trait::async_trait]
 impl Readiness for LocalChecks {
@@ -290,6 +291,28 @@ impl Drop for Servers {
     }
 }
 
+// Construct the large tonic server future outside the lifecycle test future.
+fn serve_recovered_coordinator(
+    listener: TcpListener,
+    service: CoordinatorRpc,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        Server::builder()
+            .tls_config(server_tls("coordinator"))
+            .unwrap()
+            .add_service(pb::coordinator_service_server::CoordinatorServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    })
+}
+
+// Poll expiry on its own default-stack task. This large fixture must not add
+// its RPC setup frames to the scanner's call stack.
+fn spawn_expiry_scan(service: CoordinatorRpc) -> tokio::task::JoinHandle<Result<usize>> {
+    tokio::spawn(async move { Box::pin(service.expire_environments()).await })
+}
+
 #[tokio::test]
 #[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
 async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
@@ -306,6 +329,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     .await
     .unwrap();
     let metrics_rpc = coordinator.clone();
+    let cleanup_rpc = coordinator.clone();
     let metrics_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let metrics_address = metrics_listener.local_addr().unwrap();
     let ml = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -355,7 +379,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     );
     let checkpoint_root = tempfile::tempdir().unwrap();
     let checkpoint_store = Arc::new(
-        adxlet::checkpoint::LocalCheckpointStore::new(checkpoint_root.path().into()).unwrap(),
+        adx_checkpoint_storage::LocalCheckpointStore::new(checkpoint_root.path().into()).unwrap(),
     );
     let manager = Arc::new(
         Adxlet::new(
@@ -388,6 +412,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     let mut node_coordinator =
         pb::coordinator_service_client::CoordinatorServiceClient::new(channel(ma, "node").await);
     let mut register = pb::RegisterNodeRequest {
+        checkpoint_scopes: vec![],
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),
@@ -501,6 +526,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert_eq!(
         frontend
             .commit_environment(pb::CommitEnvironmentRequest {
+                cleanup_artifacts: vec![],
                 node_session_id: "boot-1".into(),
                 record: Some(first_record.clone())
             })
@@ -526,6 +552,8 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         tonic::Code::PermissionDenied
     );
     let mut pause = pb::PauseEnvironmentRequest {
+        expiry_revision: None,
+        node_session_id: String::new(),
         assignment: Some(assignment.clone()),
         caller: caller(),
         operation_id: "pause-auth".into(),
@@ -575,6 +603,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     );
     let mut bad_delete = pb::DeleteEnvironmentRequest {
         failed_revision: None,
+        expiry_revision: None,
         node_session_id: String::new(),
         assignment: Some(assignment.clone()),
         caller: caller(),
@@ -594,6 +623,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
         node_frontend
             .delete_environment(pb::DeleteEnvironmentRequest {
                 failed_revision: None,
+                expiry_revision: None,
                 node_session_id: String::new(),
                 assignment: Some(stale),
                 caller: caller()
@@ -605,8 +635,18 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     );
     let mut expires = create("queue-deadline");
     expires.schedule_timeout_seconds = 1;
+    expires.user_metadata = [("attempt".into(), "expired".into())].into_iter().collect();
+    let mut conflicting = create("queue-deadline");
+    conflicting.user_metadata = [("attempt".into(), "conflict".into())]
+        .into_iter()
+        .collect();
+    let mut conflicting_client = frontend.clone();
     let started = tokio::time::Instant::now();
-    let error = frontend.create_environment(expires).await.unwrap_err();
+    let (expired, conflict) = tokio::join!(frontend.create_environment(expires), async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        conflicting_client.create_environment(conflicting).await
+    });
+    let error = expired.unwrap_err();
     assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
     // Cancellation is acknowledged only before any assignment exists.
     assert_eq!(
@@ -617,6 +657,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert_eq!(failure["rejections"]["insufficient_cpu"], 1);
     assert_eq!(failure["requested"]["cpu_millis"], 100);
     assert_eq!(failure["maxAvailable"]["cpu_millis"], 0);
+    assert_eq!(conflict.unwrap_err().code(), tonic::Code::AlreadyExists);
     assert!(started.elapsed() >= Duration::from_millis(900));
     assert_eq!(
         session.get("queue-deadline").await.unwrap_err(),
@@ -661,6 +702,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     );
     let delete = pb::DeleteEnvironmentRequest {
         failed_revision: None,
+        expiry_revision: None,
         node_session_id: String::new(),
         assignment: Some(assignment),
         caller: caller(),
@@ -695,6 +737,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert_eq!(
         node_coordinator
             .commit_environment(pb::CommitEnvironmentRequest {
+                cleanup_artifacts: vec![],
                 node_session_id: "boot-1".into(),
                 record: Some(first_record)
             })
@@ -706,6 +749,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     redis.crash();
     let delete = pb::DeleteEnvironmentRequest {
         failed_revision: None,
+        expiry_revision: None,
         node_session_id: String::new(),
         assignment: Some(second.assignment.try_into().unwrap()),
         caller: caller(),
@@ -751,6 +795,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert_eq!(record.state, pb::EnvironmentState::Running as i32);
     node_frontend
         .delete_environment(pb::DeleteEnvironmentRequest {
+            expiry_revision: None,
             failed_revision: None,
             node_session_id: String::new(),
             assignment: record.assignment,
@@ -773,6 +818,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
                         tenant_id: tenant.into(),
                         administrator: false,
                         expires_at_unix_seconds: 0,
+                        metadata: None,
                     },
                 )
                 .await
@@ -785,6 +831,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
                     tenant_id: "tenant".into(),
                     administrator: false,
                     expires_at_unix_seconds: 1,
+                    metadata: None,
                 },
             )
             .await
@@ -796,6 +843,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
                     tenant_id: "admin".into(),
                     administrator: true,
                     expires_at_unix_seconds: 0,
+                    metadata: None,
                 },
             )
             .await
@@ -855,6 +903,8 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
             "{}",
             String::from_utf8_lossy(&result.stderr)
         );
+        // Spec propagation was asserted at Start while ownership existed.
+        // Successful DELETE retires full records instead of preserving history.
         for id in [
             "t-http-case",
             "t-http-peer",
@@ -869,6 +919,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
                 Err(adx_core::Error::NotFound)
             ));
         }
+        cleanup_rpc.collect_checkpoint_cleanups().await.unwrap();
         assert!(backend.running.lock().unwrap().is_empty());
         assert!(session
             .snapshot()
@@ -878,6 +929,445 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
             .unwrap()
             .is_empty());
     }
+
+    // Keep this additional RPC scenario off the already large test future's stack.
+    Box::pin(async {
+        // Native run policies use the common control lease and node lifecycle RPCs;
+        // compatibility is deliberately absent from both expiry cases.
+        let mut expiry_delete = create("expiry-delete");
+        let mut delete_spec = spec("expiry-delete");
+        delete_spec.run_policy = Some(adx_core::environment_control::RunPolicy {
+            timeout_seconds: 60,
+            action: adx_core::environment_control::RunExpiryAction::Delete,
+        });
+        expiry_delete.spec = Some(delete_spec.into());
+        frontend.create_environment(expiry_delete).await.unwrap();
+        assert!(session
+            .get("expiry-delete")
+            .await
+            .unwrap()
+            .spec
+            .compatibility
+            .is_none());
+        let removed_before_expiry = backend.removed.load(Ordering::SeqCst);
+        frontend
+            .update_environment_control(pb::UpdateEnvironmentControlRequest {
+                id: "expiry-delete".into(),
+                caller: caller(),
+                timeout_seconds: 0,
+                extend_only: false,
+            })
+            .await
+            .unwrap();
+        // Persist the claim before reconstructing the Coordinator's in-memory state.
+        // This is a component recovery check, not a process/KVM restart.
+        session
+            .claim_environment_expiry("expiry-delete", u64::MAX)
+            .await
+            .unwrap();
+        let recovered_expiry = CoordinatorRpc::new(
+            session.clone(),
+            Placement::Pack,
+            peers(),
+            client_tls("coordinator"),
+            Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        let recovery_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let recovery_address = recovery_listener.local_addr().unwrap();
+        servers.0.push(serve_recovered_coordinator(
+            recovery_listener,
+            recovered_expiry.clone(),
+        ));
+        let mut recovered_node = pb::coordinator_service_client::CoordinatorServiceClient::new(
+            channel(recovery_address, "node").await,
+        );
+        // A recovered Coordinator must re-establish the real heartbeat/reconcile
+        // fence before it can accept lifecycle publication from this node session.
+        let mut recovery_register = register.clone();
+        recovery_register.heartbeat_sequence += 2;
+        recovery_register.reconciling = true;
+        recovery_register.accepting_allocations = false;
+        recovered_node
+            .register_node(recovery_register.clone())
+            .await
+            .unwrap();
+        recovered_node
+            .inspect_node(pb::InspectNodeRequest {
+                node_id: "node".into(),
+                session_id: "boot-1".into(),
+            })
+            .await
+            .unwrap();
+        recovery_register.heartbeat_sequence += 1;
+        recovery_register.reconciling = false;
+        recovery_register.accepting_allocations = true;
+        recovered_node
+            .register_node(recovery_register)
+            .await
+            .unwrap();
+        assert_eq!(
+            spawn_expiry_scan(recovered_expiry.clone())
+                .await
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            session.get("expiry-delete").await.unwrap_err(),
+            adx_core::Error::NotFound
+        );
+        assert_eq!(
+            backend.removed.load(Ordering::SeqCst),
+            removed_before_expiry + 1
+        );
+        assert_eq!(
+            spawn_expiry_scan(cleanup_rpc.clone())
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        let mut recovered_register = register.clone();
+        recovered_register.heartbeat_sequence += 4;
+        node_coordinator
+            .register_node(recovered_register)
+            .await
+            .unwrap();
+
+        let mut expiry_pause = create("expiry-pause");
+        let mut pause_spec = spec("expiry-pause");
+        pause_spec.run_policy = Some(adx_core::environment_control::RunPolicy {
+            timeout_seconds: 60,
+            action: adx_core::environment_control::RunExpiryAction::Pause,
+        });
+        expiry_pause.spec = Some(pause_spec.into());
+        frontend.create_environment(expiry_pause).await.unwrap();
+        let pause_before = session.get("expiry-pause").await.unwrap();
+        assert!(pause_before.spec.compatibility.is_none());
+        let pause_revision = pause_before.result.as_ref().unwrap().revision;
+        let control = frontend
+            .update_environment_control(pb::UpdateEnvironmentControlRequest {
+                id: "expiry-pause".into(),
+                caller: caller(),
+                timeout_seconds: 0,
+                extend_only: false,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let operation_id = format!(
+            "expiry-{}-{}",
+            control.expires_at_unix_ms,
+            control.revision + 1
+        );
+        assert_eq!(
+            spawn_expiry_scan(cleanup_rpc.clone())
+                .await
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        let paused = session.get("expiry-pause").await.unwrap();
+        assert_eq!(
+            paused.result.as_ref().unwrap().state,
+            adx_core::EnvironmentState::Paused
+        );
+        assert_eq!(
+            paused
+                .result
+                .as_ref()
+                .unwrap()
+                .last_operation
+                .as_ref()
+                .unwrap()
+                .id,
+            operation_id
+        );
+        assert_eq!(paused.control.as_ref().unwrap().expires_at_unix_ms, 0);
+        assert!(backend.running.lock().unwrap().is_empty());
+        assert_eq!(
+            spawn_expiry_scan(cleanup_rpc.clone())
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+
+        let replay = stale_coordinator
+            .pause_environment(pb::PauseEnvironmentRequest {
+                assignment: Some(paused.assignment.clone().try_into().unwrap()),
+                caller: caller(),
+                operation_id,
+                expected_revision: pause_revision,
+                retention: Some(
+                    adx_core::lifecycle::RetentionPolicy::Ttl {
+                        ttl_seconds: 90_000,
+                    }
+                    .into(),
+                ),
+                timeout_seconds: 300,
+                expiry_revision: Some(pause_revision),
+                node_session_id: "boot-1".into(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let replayed: EnvironmentRecord = replay.record.unwrap().try_into().unwrap();
+        assert_eq!(replayed, paused.result.unwrap());
+        node_frontend
+            .delete_environment(pb::DeleteEnvironmentRequest {
+                assignment: Some(paused.assignment.try_into().unwrap()),
+                caller: caller(),
+                failed_revision: None,
+                node_session_id: "boot-1".into(),
+                expiry_revision: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            session.get("expiry-pause").await.unwrap_err(),
+            adx_core::Error::NotFound
+        );
+    })
+    .await;
+
+    // Run metadata capacity/corruption probes after the public API fixture, whose
+    // contract requires an empty scheduler and an unmodified storage schema.
+    let mut retry_expired = create("queue-deadline");
+    retry_expired.user_metadata = [("attempt".into(), "replacement".into())]
+        .into_iter()
+        .collect();
+    frontend.create_environment(retry_expired).await.unwrap();
+    assert_eq!(
+        session.get("queue-deadline").await.unwrap().user_metadata["attempt"],
+        "replacement"
+    );
+
+    // Metadata is platform-owned: a native Environment has no compatibility
+    // record, yet is created, read, filtered, and paginated through Coordinator.
+    let capacity = Resources {
+        cpu_millis: 5_000,
+        memory_bytes: 8 * 1024 * 1024,
+        disk_bytes: 0,
+    };
+    manager
+        .update_capacity(capacity, Duration::from_secs(60))
+        .unwrap();
+    let mut metadata_register = register.clone();
+    metadata_register.heartbeat_sequence += 5;
+    metadata_register.capacity = Some(capacity.into());
+    node_coordinator
+        .register_node(metadata_register.clone())
+        .await
+        .unwrap();
+
+    for id in ["metadata-a", "metadata-b", "metadata-c"] {
+        let mut request = create(id);
+        request.user_metadata = [
+            ("project".into(), "alpha".into()),
+            ("group".into(), "core".into()),
+        ]
+        .into_iter()
+        .collect();
+        frontend.create_environment(request).await.unwrap();
+        assert!(session.get(id).await.unwrap().spec.compatibility.is_none());
+    }
+    let mut other_tenant = create("metadata-other");
+    other_tenant.spec.as_mut().unwrap().tenant_id = "other".into();
+    other_tenant.caller.as_mut().unwrap().tenant_id = "other".into();
+    other_tenant.user_metadata = [
+        ("project".into(), "alpha".into()),
+        ("group".into(), "core".into()),
+    ]
+    .into_iter()
+    .collect();
+    frontend.create_environment(other_tenant).await.unwrap();
+
+    let metadata_filter: std::collections::HashMap<String, String> = [
+        ("project".into(), "alpha".into()),
+        ("group".into(), "core".into()),
+    ]
+    .into_iter()
+    .collect();
+    let metadata_caller = caller();
+    let first_page = frontend
+        .list_environment_metadata(pb::ListEnvironmentMetadataRequest {
+            caller: metadata_caller.clone(),
+            metadata_filter: metadata_filter.clone(),
+            states: vec![pb::EnvironmentState::Running as i32],
+            cursor: String::new(),
+            limit: 2,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first_page.records.len(), 2);
+    assert!(!first_page.next_cursor.is_empty());
+    assert!(first_page
+        .records
+        .iter()
+        .all(|record| record.environment_id != "metadata-other"));
+    let second_page = frontend
+        .list_environment_metadata(pb::ListEnvironmentMetadataRequest {
+            caller: metadata_caller.clone(),
+            metadata_filter: metadata_filter.clone(),
+            states: vec![pb::EnvironmentState::Running as i32],
+            cursor: first_page.next_cursor.clone(),
+            limit: 2,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second_page.records.len(), 1);
+    assert_eq!(second_page.records[0].environment_id, "metadata-c");
+    assert!(second_page.next_cursor.is_empty());
+    assert_eq!(
+        frontend
+            .get_environment_metadata(pb::GetEnvironmentMetadataRequest {
+                id: "metadata-a".into(),
+                caller: metadata_caller.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .user_metadata["project"],
+        "alpha"
+    );
+    let mut changed_filter = metadata_filter.clone();
+    changed_filter.insert("group".into(), "different".into());
+    assert_eq!(
+        frontend
+            .list_environment_metadata(pb::ListEnvironmentMetadataRequest {
+                caller: metadata_caller,
+                metadata_filter: changed_filter,
+                states: vec![pb::EnvironmentState::Running as i32],
+                cursor: first_page.next_cursor,
+                limit: 2,
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+
+    // E2B list ownership is an entrypoint scope. It must not narrow the generic query.
+    for id in ["metadata-e2b-a", "metadata-e2b-b"] {
+        let mut e2b_spec = spec(id);
+        e2b_spec.compatibility = Some(adx_core::environment_control::EnvironmentCompatibility {
+            template_id: "base".into(),
+            envd_version: "0.9.0".into(),
+            envd_access_token: "a".repeat(32),
+            traffic_access_token: "b".repeat(32),
+            allow_public_traffic: true,
+        });
+        session
+            .claim_with_metadata(
+                e2b_spec,
+                &adx_coordinator::storage::LocalClaim {
+                    node_id: "node".into(),
+                    node_session_id: "boot-1".into(),
+                    devices: vec![],
+                },
+                [("project".into(), "alpha".into())].into_iter().collect(),
+            )
+            .await
+            .unwrap();
+    }
+    let scoped_query = || pb::ListEnvironmentMetadataRequest {
+        caller: caller(),
+        metadata_filter: [("project".into(), "alpha".into())].into_iter().collect(),
+        states: vec![],
+        cursor: String::new(),
+        limit: 1,
+    };
+    let e2b_page = frontend
+        .list_e2b_environment_metadata(scoped_query())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(e2b_page.records[0].environment_id, "metadata-e2b-a");
+    assert!(!e2b_page.next_cursor.is_empty());
+    let mut continuation = scoped_query();
+    continuation.cursor = e2b_page.next_cursor.clone();
+    let e2b_last = frontend
+        .list_e2b_environment_metadata(continuation.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(e2b_last.records[0].environment_id, "metadata-e2b-b");
+    assert!(e2b_last.next_cursor.is_empty());
+    assert_eq!(
+        frontend
+            .list_environment_metadata(continuation)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    let native_page = frontend
+        .list_environment_metadata(scoped_query())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(native_page.records[0].environment_id, "metadata-a");
+    let mut wrong_scope = scoped_query();
+    wrong_scope.cursor = native_page.next_cursor;
+    assert_eq!(
+        frontend
+            .list_e2b_environment_metadata(wrong_scope)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+
+    for index in 0..17 {
+        let mut request = create(&format!("metadata-budget-{index:02}"));
+        request.user_metadata = std::iter::once(("set".into(), "response-budget".into()))
+            .chain((0..15).map(|entry| (format!("{entry:03}"), "v".repeat(4093))))
+            .collect();
+        frontend.create_environment(request).await.unwrap();
+    }
+    let budget_page = frontend
+        .list_environment_metadata(pb::ListEnvironmentMetadataRequest {
+            caller: caller(),
+            metadata_filter: [("set".into(), "response-budget".into())]
+                .into_iter()
+                .collect(),
+            states: vec![pb::EnvironmentState::Running as i32],
+            cursor: String::new(),
+            limit: 100,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(budget_page.records.len() < 17);
+    assert!(!budget_page.next_cursor.is_empty());
+
+    let client = redis::Client::open(redis.url.as_str()).unwrap();
+    let mut raw = client.get_multiplexed_async_connection().await.unwrap();
+    let mut command = redis::cmd("HSET");
+    command.arg("adx:{test}:control:v1");
+    for index in 0..4097 {
+        command.arg(format!("metadata-scan-{index}")).arg("x");
+    }
+    let _: usize = command.query_async(&mut raw).await.unwrap();
+    assert_eq!(
+        frontend
+            .list_environment_metadata(pb::ListEnvironmentMetadataRequest {
+                caller: caller(),
+                metadata_filter: Default::default(),
+                states: vec![],
+                cursor: String::new(),
+                limit: 1,
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unavailable
+    );
 }
 
 #[tokio::test]
@@ -1201,6 +1691,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
 
     assert_eq!(
         node.commit_environment(pb::CommitEnvironmentRequest {
+            cleanup_artifacts: vec![],
             record: Some(running.clone().try_into().unwrap()),
             node_session_id: "first-boot".into()
         })
@@ -1211,6 +1702,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
     );
     assert_eq!(
         node.commit_environment(pb::CommitEnvironmentRequest {
+            cleanup_artifacts: vec![],
             record: Some(running.try_into().unwrap()),
             node_session_id: "second-boot".into(),
         })
@@ -1435,6 +1927,7 @@ async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint(
     assert_eq!(
         node_coordinator
             .commit_environment(pb::CommitEnvironmentRequest {
+                cleanup_artifacts: vec![],
                 record: Some(running.clone()),
                 node_session_id: "boot-1".into(),
             })
@@ -1609,6 +2102,7 @@ async fn coordinator_restart_bounds_re_registration_grace() {
             assert!(result.runtime.ip.is_none());
             assert!(
                 node.commit_environment(pb::CommitEnvironmentRequest {
+                    cleanup_artifacts: vec![],
                     record: Some(running.try_into().unwrap()),
                     node_session_id: "boot".into(),
                 })
@@ -1620,6 +2114,7 @@ async fn coordinator_restart_bounds_re_registration_grace() {
             deleted.state = EnvironmentState::Deleted;
             deleted.revision += 1;
             node.commit_environment(pb::CommitEnvironmentRequest {
+                cleanup_artifacts: vec![],
                 record: Some(deleted.try_into().unwrap()),
                 node_session_id: "boot".into(),
             })
@@ -1672,6 +2167,7 @@ async fn published_routes_drive_real_gateway_streams_and_reconnect_to_new_coordi
                 tenant_id: "tenant".into(),
                 administrator: false,
                 expires_at_unix_seconds: 0,
+                metadata: None,
             },
         )
         .await
@@ -1981,6 +2477,7 @@ async fn snapshot_rpc_enforces_tenant_and_rejects_busy_deletion() {
         "source-1".into(),
         CheckpointArtifact {
             storage: "shared".into(),
+            scope: String::new(),
             location: "artifact".into(),
             size_bytes: 100,
         },
@@ -2134,6 +2631,7 @@ async fn tenant_key_rpc_requires_frontend_admin_and_revokes_verification() {
         caller: admin.clone(),
         tenant_id: "tenant".into(),
         expires_at_unix_seconds: 0,
+        name: None,
     };
     let mut ingress =
         pb::credential_service_client::CredentialServiceClient::new(channel(addr, "ingress").await);
@@ -2202,11 +2700,14 @@ async fn tenant_key_rpc_requires_frontend_admin_and_revokes_verification() {
         .into_inner();
     assert_eq!(page.keys.len(), 1);
     assert_eq!(page.keys[0].id, id);
+    assert!(page.keys[0].metadata.is_none());
     for _ in 0..2 {
         client
             .revoke_tenant_key(pb::RevokeTenantKeyRequest {
                 caller: admin.clone(),
                 id: id.clone(),
+                public_id: String::new(),
+                tenant_id: String::new(),
             })
             .await
             .unwrap();
@@ -2215,6 +2716,131 @@ async fn tenant_key_rpc_requires_frontend_admin_and_revokes_verification() {
         verify
             .verify_api_key(pb::VerifyApiKeyRequest {
                 api_key: created.api_key
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unauthenticated
+    );
+
+    // Metadata management preserves native digest-ID behavior above, while
+    // public IDs are tenant-bound and have a distinct missing-key contract.
+    for name in [" ".to_owned(), "x".repeat(257), "bad\nname".to_owned()] {
+        let error = client
+            .create_tenant_key(pb::CreateTenantKeyRequest {
+                caller: admin.clone(),
+                tenant_id: "admin".into(),
+                expires_at_unix_seconds: 0,
+                name: Some(name),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+    assert_eq!(
+        client
+            .create_tenant_key(pb::CreateTenantKeyRequest {
+                caller: admin.clone(),
+                tenant_id: "another".into(),
+                expires_at_unix_seconds: 0,
+                name: Some("managed".into()),
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::PermissionDenied
+    );
+    let managed = client
+        .create_tenant_key(pb::CreateTenantKeyRequest {
+            caller: admin.clone(),
+            tenant_id: "admin".into(),
+            expires_at_unix_seconds: 0,
+            name: Some("managed key".into()),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let metadata = managed.key.as_ref().unwrap().metadata.as_ref().unwrap();
+    assert!(uuid::Uuid::parse_str(&metadata.public_id).is_ok());
+    assert_eq!(metadata.name, "managed key");
+    assert!(metadata.created_at_unix_ms > 0);
+    assert_eq!(metadata.prefix, "adx_");
+    let value = managed.api_key.strip_prefix("adx_").unwrap();
+    assert_eq!(metadata.value_length as usize, value.len());
+    assert_eq!(metadata.masked_value_prefix, &value[..2]);
+    assert_eq!(metadata.masked_value_suffix, &value[value.len() - 4..]);
+    let public_id = metadata.public_id.clone();
+    let page = client
+        .list_tenant_keys(pb::ListTenantKeysRequest {
+            caller: admin.clone(),
+            tenant_id: "admin".into(),
+            page_size: 1000,
+            page_token: String::new(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(page.keys[0].metadata.as_ref().unwrap(), metadata);
+    let redis_client = redis::Client::open(redis.url.as_str()).unwrap();
+    let mut connection = redis_client
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let persisted: String = redis::cmd("HGET")
+        .arg("adx:{test}:control:v1:credentials")
+        .arg(&managed.key.as_ref().unwrap().id)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert!(!persisted.contains(&managed.api_key));
+    let persisted: serde_json::Value = serde_json::from_str(&persisted).unwrap();
+    assert_eq!(persisted["metadata"]["public_id"], metadata.public_id);
+    assert!(persisted.get("api_key").is_none());
+    assert!(persisted.get("key").is_none());
+    let public_revoke = pb::RevokeTenantKeyRequest {
+        caller: admin.clone(),
+        id: String::new(),
+        public_id,
+        tenant_id: "admin".into(),
+    };
+    assert_eq!(
+        client
+            .revoke_tenant_key(pb::RevokeTenantKeyRequest {
+                caller: Some(pb::CallerContext {
+                    tenant_id: "another".into(),
+                    administrator: true
+                }),
+                tenant_id: "another".into(),
+                ..public_revoke.clone()
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+    // A failed cross-team lookup did not revoke the target.
+    assert!(verify
+        .verify_api_key(pb::VerifyApiKeyRequest {
+            api_key: managed.api_key.clone()
+        })
+        .await
+        .is_ok());
+    client
+        .revoke_tenant_key(public_revoke.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .revoke_tenant_key(public_revoke)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::NotFound
+    );
+    assert_eq!(
+        verify
+            .verify_api_key(pb::VerifyApiKeyRequest {
+                api_key: managed.api_key
             })
             .await
             .unwrap_err()
@@ -2239,8 +2865,8 @@ impl adxlet::checkpoint::CheckpointCooperation for LocalChecks {
 #[tokio::test]
 #[ignore = "requires isolated Redis and generated mTLS certificates"]
 async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
+    use adx_checkpoint_storage::{CheckpointAccess, LocalCheckpointStore};
     use adx_core::snapshots::{Reference, Snapshot, SnapshotState};
-    use adxlet::checkpoint::{CheckpointAccess, LocalCheckpointStore};
     let redis = common::Redis::new().await;
     let session = redis.store().await.begin(1).await.unwrap();
     let root = tempfile::tempdir().unwrap();
@@ -2324,6 +2950,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     let mut client =
         pb::coordinator_service_client::CoordinatorServiceClient::new(channel(ma, "node").await);
     let mut report = pb::RegisterNodeRequest {
+        checkpoint_scopes: vec![],
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),
@@ -2393,6 +3020,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     let request = pb::CollectSnapshotRequest {
         snapshot: Some(deleting.clone().try_into().unwrap()),
         node_session_id: "gc-boot".into(),
+        delegated: false,
     };
     let mut frontend =
         pb::node_service_client::NodeServiceClient::new(channel(na, "apiserver").await);
@@ -2475,6 +3103,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     frontend
         .delete_environment(pb::DeleteEnvironmentRequest {
             failed_revision: None,
+            expiry_revision: None,
             node_session_id: String::new(),
             assignment: source.assignment,
             caller: caller(),
@@ -2483,6 +3112,10 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         .unwrap();
     assert!(std::path::Path::new(&reusable.artifact.as_ref().unwrap().location).exists());
     let mut request = create("snapshot-clone");
+    // Capturing a reusable Snapshot no longer creates an anonymous restore point.
+    // Deleting the source must preserve the catalog-owned Snapshot bytes.
+    assert!(session.checkpoint_cleanups().await.unwrap().is_empty());
+    assert!(std::path::Path::new(&reusable.artifact.as_ref().unwrap().location).exists());
     let raw = request.spec.as_mut().unwrap();
     raw.snapshot_id = Some(reusable.id.clone());
     raw.image.clear();
@@ -2553,12 +3186,14 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     frontend
         .delete_environment(pb::DeleteEnvironmentRequest {
             failed_revision: None,
+            expiry_revision: None,
             node_session_id: String::new(),
             assignment: created.assignment,
             caller: caller(),
         })
         .await
         .unwrap();
+    assert_eq!(coordinator.collect_checkpoint_cleanups().await.unwrap(), 0);
     assert!(session
         .get_snapshot(&reusable.id)
         .await
@@ -2588,6 +3223,7 @@ async fn coordinator_restart_releases_snapshot_pins_for_lost_memory_queue_only()
         "source-1".into(),
         adx_core::CheckpointArtifact {
             storage: "shared".into(),
+            scope: String::new(),
             location: "immutable".into(),
             size_bytes: 10,
         },
@@ -2689,8 +3325,8 @@ impl RuntimeDriver for RecoveryBackend {
 #[tokio::test]
 #[ignore = "requires isolated Redis and mTLS certificates"]
 async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deleting_artifact() {
+    use adx_checkpoint_storage::{CheckpointAccess, ObjectCheckpointStore};
     use adx_core::{Assignment, EnvironmentState, RestorePoint};
-    use adxlet::checkpoint::{CheckpointAccess, ObjectCheckpointStore};
     let redis = common::Redis::new().await;
     let session = redis.store().await.begin(2).await.unwrap();
     let test_peers = || {
@@ -2724,8 +3360,9 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
     })]);
     let remote = Arc::new(object_store::memory::InMemory::new());
     let src_dir = tempfile::tempdir().unwrap();
-    let source_store = ObjectCheckpointStore::new(
+    let source_store = ObjectCheckpointStore::new_scoped(
         "shared".into(),
+        "test-scope".into(),
         remote.clone(),
         "test".into(),
         src_dir.path().into(),
@@ -2739,8 +3376,9 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
     let artifact = source_store.seal(&staged).await.unwrap();
     let target_dir = tempfile::tempdir().unwrap();
     let target_store = Arc::new(
-        ObjectCheckpointStore::new(
+        ObjectCheckpointStore::new_scoped(
             "shared".into(),
+            "test-scope".into(),
             remote.clone(),
             "test".into(),
             target_dir.path().into(),
@@ -2920,6 +3558,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
     );
     assert!(source
         .commit_environment(pb::CommitEnvironmentRequest {
+            cleanup_artifacts: vec![],
             record: Some(old.clone().try_into().unwrap()),
             node_session_id: "source-boot".into()
         })
@@ -2941,8 +3580,9 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
     assert_eq!(catalog.retained_artifacts.len(), 1);
     let returned_dir = tempfile::tempdir().unwrap();
     let returned_store = Arc::new(
-        ObjectCheckpointStore::new(
+        ObjectCheckpointStore::new_scoped(
             "shared".into(),
+            "test-scope".into(),
             remote.clone(),
             "test".into(),
             returned_dir.path().into(),

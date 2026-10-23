@@ -67,6 +67,8 @@ SSE 创建的 `final` 事件保留 `errorCode` 数值字段，并携带同一个
 
 内部 RPC 的连接拒绝、连接重置等传输不可用返回 HTTP 503。Tonic 在握手或重连期间将部分连接重置报告为 `Unknown / transport error` 或带有传输来源的 `Cancelled`；API Server 仅在错误来源链包含 `tonic::transport::Error` 时归一为 `Unavailable`，不会把应用返回的 `Unknown`、`Cancelled` 或 `Internal` 一律改成 503。RPC 超时归一为 504、`DEADLINE_EXCEEDED`；只有等待超时而没有确认终态时，仍使用 `outcome=unknown`、`retry=same_operation`。写请求的结果可能未知，重试必须沿用原 Request ID、Operation ID、Environment ID 和归属代次；连接失败不能作为释放归属或换 ID 重建的依据。
 
+E2B 管理入口使用自己的协议错误响应。`POST /v2/sandboxes` 调用共享创建能力后，创建调用及后续控制记录/详情读取的 `Unavailable` 对外映射为 500，避免 E2B SDK 收到 503 后以新实例身份自动重建。创建前的认证、模板预检错误保留原映射；超时仍为 504，其他 E2B 路由不受影响。此规则仅作用于适配层，不改变上述原生错误合同，不增加跨请求幂等，也不因应答失败删除结果未知的实例。
+
 ### 创建超时阶段
 
 创建超时使用 HTTP 504 和 `DEADLINE_EXCEEDED`。节点确认该创建已失败时，返回

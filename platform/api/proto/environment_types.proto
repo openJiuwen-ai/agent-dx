@@ -21,6 +21,40 @@ message EnvironmentSpec {
   map<string,string> env = 8;
   LifecyclePolicy lifecycle = 9;
   ExecutionOptions execution = 12;
+  EnvironmentCompatibility compatibility = 13;
+  NativeTemplateIdentity template_identity = 14;
+  RunPolicy run_policy = 15;
+}
+
+message NativeTemplateIdentity {
+  string tenant_id = 1;
+  string name = 2;
+  string version = 3;
+}
+
+message EnvironmentCompatibility {
+  string template_id = 1;
+  string envd_version = 2;
+  string envd_access_token = 3;
+  string traffic_access_token = 4;
+  bool allow_public_traffic = 5;
+  reserved 6, 7, 8, 9, 10, 11;
+}
+enum RunExpiryAction {
+  RUN_EXPIRY_ACTION_UNSPECIFIED = 0;
+  RUN_EXPIRY_ACTION_DELETE = 1;
+  RUN_EXPIRY_ACTION_PAUSE = 2;
+}
+message RunPolicy { uint64 timeout_seconds = 1; RunExpiryAction action = 2; }
+message EnvironmentControlRecord {
+  string environment_id = 1;
+  reserved 2;
+  uint64 expires_at_unix_ms = 3;
+  uint64 started_at_unix_ms = 4;
+  uint64 revision = 5;
+  uint64 generation = 6;
+  bool expiry_claimed = 7;
+  optional uint64 timeout_override_seconds = 8;
 }
 
 message S3Source {
@@ -249,7 +283,7 @@ message SchedulingPolicy {
   repeated PlacementGroup placement_groups = 10;
 }
 
-message CheckpointArtifact { string storage = 1; string location = 2; uint64 size_bytes = 3; }
+message CheckpointArtifact { string storage = 1; string location = 2; uint64 size_bytes = 3; string scope = 4; }
 
 message RuntimeIdentity { string environment_id = 1; string runtime_id = 2; uint64 ownership_generation = 3; }
 

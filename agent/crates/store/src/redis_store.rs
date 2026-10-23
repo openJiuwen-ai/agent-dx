@@ -144,7 +144,10 @@ impl RedisRepository {
             if state.connection.is_none() {
                 let connection = self
                     .client
-                    .get_multiplexed_async_connection()
+                    // The repository's deadline covers admission, connection, and response.
+                    .get_multiplexed_async_connection_with_config(
+                        &redis::AsyncConnectionConfig::new().set_response_timeout(None),
+                    )
                     .await
                     .map_err(|_| Error::Unavailable("Redis reconnect failed".into()))?;
                 state.generation = state.generation.wrapping_add(1);

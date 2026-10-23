@@ -28,6 +28,29 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target,
     if with_afs:
         inputs.update({f"bin/{name}": binary_dir / name for name in AFS_BINARIES})
     inputs["runtime/adx-execd"] = binary_dir / "adx-execd"
+    envd_dir = binary_dir / "envd"
+    envd_component = (binary_dir / "envd-manifest.json", binary_dir / "envd-LICENSE")
+    if envd_dir.exists() and any(path.exists() for path in envd_component):
+        raise ValueError("envd provenance has multiple sources")
+    if envd_dir.exists():
+        if envd_dir.is_symlink() or not envd_dir.is_dir():
+            raise ValueError("envd build output must be a directory")
+        envd_manifest = envd_dir / "manifest.json"
+        envd_license = envd_dir / "LICENSE"
+    elif any(path.exists() for path in envd_component):
+        envd_manifest, envd_license = envd_component
+    else:
+        envd_manifest = envd_license = None
+    if envd_manifest is not None:
+        if any(path.is_symlink() or not path.is_file() for path in (envd_manifest, envd_license)):
+            raise ValueError("envd build manifest and license are required")
+        envd = json.loads(envd_manifest.read_text())
+        if not isinstance(envd.get("sha256"), str) or len(envd["sha256"]) != 64 or any(
+            character not in "0123456789abcdef" for character in envd["sha256"].lower()
+        ):
+            raise ValueError("envd build manifest is invalid")
+        inputs["runtime/envd/manifest.json"] = envd_manifest
+        inputs["runtime/envd/LICENSE"] = envd_license
     # Native Linux release builder supplies the EROFS payload. Debug/native macOS
     # packages retain binary-only development support.
     runtime_root = binary_dir / "adx-runtime-rootfs.img"

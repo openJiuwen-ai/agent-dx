@@ -54,8 +54,10 @@ impl Controller {
             if self.workload_checkpoint().await? {
                 return Ok(());
             }
+            let compatibility_requires_health = self.record.spec.compatibility.is_some();
             let runtime_activity = if self.record.spec.lifecycle.idle_timeout_seconds > 0
                 || self.services.health_failure_threshold.is_some()
+                || compatibility_requires_health
             {
                 tokio::time::timeout(
                     self.services.operation_timeout,
@@ -66,6 +68,12 @@ impl Controller {
             } else {
                 Ok((0, 0))
             };
+            // An E2B compatibility service is part of the published data-plane
+            // contract. Do not leave its route live after Execd reports envd
+            // unavailable, even when optional native health checks are disabled.
+            if compatibility_requires_health && runtime_activity.is_err() {
+                return self.unexpected_exit().await;
+            }
             if let Some(threshold) = self.services.health_failure_threshold {
                 if runtime_activity.is_ok() {
                     self.health_failures = 0;
@@ -198,7 +206,7 @@ impl Controller {
         self.unexpected_exit().await?;
         Ok(true)
     }
-    async fn unexpected_exit(&mut self) -> Result<()> {
+    pub(super) async fn unexpected_exit(&mut self) -> Result<()> {
         self.idle = None;
         let cleanup = self.cleanup().await;
         self.transition(Event::Fail)?;

@@ -216,12 +216,15 @@ impl RuntimeControlClient {
         }
         Ok(())
     }
-    pub async fn wait_ready_notification(&self, record: &EnvironmentRecord) -> Result<bool> {
+    pub async fn wait_ready_notification(
+        &self,
+        record: &EnvironmentRecord,
+    ) -> Result<Option<RuntimeStatus>> {
         if let Some(stream) = &self.stream {
             stream.wait_ready(&Self::identity(record)).await?;
-            return Ok(true);
+            return stream.observed(&Self::identity(record));
         }
-        Ok(false)
+        Ok(None)
     }
     pub fn pending_checkpoint(&self, record: &EnvironmentRecord) -> Result<Option<RuntimeStatus>> {
         self.stream
@@ -553,6 +556,9 @@ mod tests {
             snapshot_source: None,
             failure: None,
             spec: EnvironmentSpec {
+                run_policy: None,
+                template_identity: None,
+                compatibility: None,
                 runtime_profile: None,
                 snapshot_id: None,
                 lifecycle: LifecyclePolicy::default(),
@@ -653,6 +659,7 @@ mod tests {
             active_requests: 0,
             active_commands: 0,
             activity_revision: 1,
+            required_services: Default::default(),
         };
         let encoded = serde_json::to_vec(&expected).unwrap();
         let server = thread::spawn(move || {
@@ -738,6 +745,7 @@ mod tests {
             active_requests: 0,
             active_commands: 0,
             activity_revision: 1,
+            required_services: Default::default(),
         };
         let encoded = serde_json::to_vec(&expected).unwrap();
         let server = thread::spawn(move || {
@@ -795,6 +803,7 @@ mod tests {
                     active_requests: 0,
                     active_commands: 0,
                     activity_revision: 1,
+                    required_services: Default::default(),
                 })
                 .unwrap()
             })

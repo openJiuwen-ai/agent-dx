@@ -1,5 +1,7 @@
 //! Generated transport contracts and validated conversions, without services.
 mod admission;
+mod checkpoint_cleanup;
+mod environment_control;
 pub use admission::{scheduling_deadline, scheduling_failure};
 mod runtime_profile;
 mod snapshots;
@@ -30,6 +32,15 @@ impl TryFrom<control::EnvironmentSpec> for adx_core::EnvironmentSpec {
             .resources
             .ok_or_else(|| Error::Invalid("resources are required".into()))?;
         let spec = Self {
+            run_policy: value.run_policy.map(TryInto::try_into).transpose()?,
+            template_identity: value.template_identity.map(|identity| {
+                adx_core::NativeTemplateIdentity {
+                    tenant_id: identity.tenant_id,
+                    name: identity.name,
+                    version: identity.version,
+                }
+            }),
+            compatibility: value.compatibility.map(Into::into),
             runtime_profile: value.runtime_profile.map(TryInto::try_into).transpose()?,
             snapshot_id: value.snapshot_id,
             lifecycle: value
@@ -67,6 +78,15 @@ impl TryFrom<control::EnvironmentSpec> for adx_core::EnvironmentSpec {
 impl From<adx_core::EnvironmentSpec> for control::EnvironmentSpec {
     fn from(value: adx_core::EnvironmentSpec) -> Self {
         Self {
+            run_policy: value.run_policy.map(Into::into),
+            template_identity: value.template_identity.map(|identity| {
+                control::NativeTemplateIdentity {
+                    tenant_id: identity.tenant_id,
+                    name: identity.name,
+                    version: identity.version,
+                }
+            }),
+            compatibility: value.compatibility.map(Into::into),
             runtime_profile: value.runtime_profile.map(Into::into),
             snapshot_id: value.snapshot_id,
             lifecycle: Some(value.lifecycle.into()),
@@ -139,6 +159,22 @@ mod tests {
     #[test]
     fn environment_spec_round_trip_preserves_units_and_priority() {
         let value = adx_core::EnvironmentSpec {
+            run_policy: Some(adx_core::environment_control::RunPolicy {
+                timeout_seconds: 90_000,
+                action: adx_core::environment_control::RunExpiryAction::Pause,
+            }),
+            template_identity: Some(adx_core::NativeTemplateIdentity {
+                tenant_id: "t".into(),
+                name: "python".into(),
+                version: "2026.10.23".into(),
+            }),
+            compatibility: Some(adx_core::environment_control::EnvironmentCompatibility {
+                template_id: "template-id".into(),
+                envd_version: "0.9.0".into(),
+                envd_access_token: "a".repeat(32),
+                traffic_access_token: "b".repeat(32),
+                allow_public_traffic: false,
+            }),
             runtime_profile: None,
             snapshot_id: None,
             lifecycle: Default::default(),
@@ -159,6 +195,52 @@ mod tests {
         let bytes = control::EnvironmentSpec::from(value.clone()).encode_to_vec();
         let decoded = control::EnvironmentSpec::decode(bytes.as_slice()).unwrap();
         assert_eq!(adx_core::EnvironmentSpec::try_from(decoded).unwrap(), value);
+    }
+
+    #[test]
+    fn native_template_identity_round_trips_without_compatibility() {
+        let spec = adx_core::EnvironmentSpec {
+            run_policy: None,
+            template_identity: Some(adx_core::NativeTemplateIdentity {
+                tenant_id: "tenant".into(),
+                name: "native".into(),
+                version: "v1".into(),
+            }),
+            compatibility: None,
+            runtime_profile: None,
+            snapshot_id: None,
+            lifecycle: Default::default(),
+            env: Default::default(),
+            id: "native-environment".into(),
+            tenant_id: "tenant".into(),
+            image: "image".into(),
+            runtime_class: "runtime".into(),
+            resources: adx_core::Resources {
+                cpu_millis: 1,
+                memory_bytes: 1,
+                disk_bytes: 0,
+            },
+            priority: 0,
+            scheduling: Default::default(),
+            execution: Default::default(),
+        };
+        let wire: control::EnvironmentSpec = spec.clone().into();
+        assert_eq!(adx_core::EnvironmentSpec::try_from(wire).unwrap(), spec);
+
+        let mut mismatched = spec;
+        mismatched.template_identity.as_mut().unwrap().tenant_id = "other".into();
+        assert!(mismatched.validate().is_err());
+    }
+
+    #[test]
+    fn run_policy_rejects_unspecified_action() {
+        assert!(
+            adx_core::environment_control::RunPolicy::try_from(control::RunPolicy {
+                timeout_seconds: 60,
+                action: 0,
+            })
+            .is_err()
+        );
     }
 }
 
@@ -265,15 +347,7 @@ impl TryFrom<adx_core::EnvironmentRecord> for control::EnvironmentRecord {
             resources_held: v.resources_held,
             snapshot_source: v.snapshot_source.map(Into::into),
             checkpoint: v.checkpoint.map(Into::into),
-            execution_artifacts: v
-                .execution_artifacts
-                .into_iter()
-                .map(|a| control::CheckpointArtifact {
-                    storage: a.storage,
-                    location: a.location,
-                    size_bytes: a.size_bytes,
-                })
-                .collect(),
+            execution_artifacts: v.execution_artifacts.into_iter().map(Into::into).collect(),
             last_operation: v.last_operation.map(Into::into),
         })
     }
@@ -359,6 +433,7 @@ impl From<adx_core::RestorePoint> for control::RestorePoint {
             source_runtime_id: v.source_runtime_id,
             artifact: Some(control::CheckpointArtifact {
                 storage: v.artifact.storage,
+                scope: v.artifact.scope,
                 location: v.artifact.location,
                 size_bytes: v.artifact.size_bytes,
             }),
@@ -387,6 +462,7 @@ impl TryFrom<control::RestorePoint> for adx_core::RestorePoint {
             source_runtime_id: v.source_runtime_id,
             artifact: adx_core::CheckpointArtifact {
                 storage: a.storage,
+                scope: a.scope,
                 location: a.location,
                 size_bytes: a.size_bytes,
             },
@@ -668,6 +744,7 @@ impl TryFrom<control::CheckpointArtifact> for adx_core::CheckpointArtifact {
         }
         Ok(Self {
             storage: a.storage,
+            scope: a.scope,
             location: a.location,
             size_bytes: a.size_bytes,
         })
@@ -677,6 +754,7 @@ impl From<adx_core::CheckpointArtifact> for control::CheckpointArtifact {
     fn from(a: adx_core::CheckpointArtifact) -> Self {
         Self {
             storage: a.storage,
+            scope: a.scope,
             location: a.location,
             size_bytes: a.size_bytes,
         }

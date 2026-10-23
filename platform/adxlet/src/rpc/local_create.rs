@@ -5,15 +5,15 @@ impl NodeRpc {
     /// Retry only idle, unconfirmed holds. HTTP callers may have disappeared;
     /// ownership must still converge before these resources can be released.
     pub async fn retry_local_claims(&self) {
-        let specs: Vec<_> = self
+        let holds: Vec<_> = self
             .manager
             .local_holds
             .lock()
             .expect("shared state lock poisoned")
             .values()
-            .map(|hold| hold.spec.clone())
+            .map(|hold| (hold.spec.clone(), hold.user_metadata.clone()))
             .collect();
-        for spec in specs {
+        for (spec, user_metadata) in holds {
             let busy = self
                 .entry_locks
                 .lock()
@@ -34,6 +34,7 @@ impl NodeRpc {
                     create_timeout_seconds: 90,
                     create_deadline_unix_millis: 0,
                     expected_assignment: None,
+                    user_metadata: user_metadata.into_iter().collect(),
                 }),
                 node_session_id: self.session_id.clone(),
             };
@@ -107,7 +108,15 @@ impl NodeRpc {
         } else {
             raw.clone().try_into().map_err(status)?
         };
-        let reservation = match self.manager.reserve_local(&spec) {
+        let user_metadata: adx_core::metadata::UserMetadata = request
+            .create
+            .as_ref()
+            .map(|create| create.user_metadata.clone().into_iter().collect())
+            .unwrap_or_default();
+        let reservation = match self
+            .manager
+            .reserve_local_with_metadata(&spec, user_metadata.clone())
+        {
             Ok(held) => held,
             Err(Error::NoCapacity) => {
                 drop(gate);
@@ -125,6 +134,7 @@ impl NodeRpc {
                 .into_iter()
                 .map(Into::into)
                 .collect(),
+            user_metadata: user_metadata.into_iter().collect(),
         };
         let mut answer = Err(Status::unavailable("claim unavailable"));
         for _ in 0..2 {

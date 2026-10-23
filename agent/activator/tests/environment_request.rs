@@ -1,6 +1,6 @@
 mod support;
 
-use adx_activator::environment_request::{create_input, operation_id};
+use adx_activator::environment_request::{create_input, execution_input, operation_id};
 use adx_agent_core::environment::CreateEnvironment;
 use serde_json::json;
 use std::time::Duration;
@@ -50,6 +50,20 @@ fn platform_owned_credentials_and_process_overrides_are_rejected() {
     assert!(create_input(&request, Duration::from_secs(60), &network_policy()).is_err());
     request.execution.env.clear();
     request.execution.entrypoint = vec!["/override".into()];
+    assert!(create_input(&request, Duration::from_secs(60), &network_policy()).is_err());
+}
+
+#[test]
+fn execution_input_keeps_explicit_startup_for_non_agent_callers() {
+    let mut request = request();
+    request.execution.inherit_entrypoint = false;
+    request.execution.entrypoint = vec!["/bin/server".into(), "--foreground".into()];
+    request.execution.working_dir = "/workspace".into();
+    request.execution.user = Some("sandbox".into());
+
+    let input = execution_input(&request.execution).unwrap();
+    assert_eq!(input["inheritEntrypoint"], false);
+    assert_eq!(input["image"], "app:1");
     assert!(create_input(&request, Duration::from_secs(60), &network_policy()).is_err());
 }
 

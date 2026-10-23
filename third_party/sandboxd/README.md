@@ -3,9 +3,15 @@
 - Repository: https://github.com/inclusionAI/sandboxd
 - Selected change: https://github.com/inclusionAI/sandboxd/pull/56
 - Pinned head: `efc201531d7e2e9d69505da151eb66084b61eebf`
-- ADX builds this revision without downstream source patches. Rootfs defaults,
-  bootstrap mounts and managed-file paths are adapted by the control plane to
-  the published sandboxd protocol.
+- ADX applies the tracked trusted-guest-metadata and Firecracker realtime-restore
+  patches to this revision. On restore, sandboxd sends a fresh trusted host realtime
+  timestamp to the guest PID 1, which sets CLOCK_REALTIME before it releases the
+  checkpoint handoff. The restore-network-fence patch takes the target TAP down before
+  loading a Firecracker snapshot and only activates it after the guest accepts its new
+  network identity; failed handoff paths keep it isolated. The timestamp change requires
+  a newly built initrd and fresh checkpoint; it does not make older snapshot artifacts
+  compatible. Rootfs defaults, bootstrap mounts and managed-file paths are adapted by the
+  control plane to the published sandboxd protocol.
 - Source path: `api/runtime/v1/sandbox-api.proto`
 - License: Apache-2.0; source and license copied verbatim.
 

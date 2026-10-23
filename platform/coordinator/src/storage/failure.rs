@@ -14,6 +14,7 @@ impl Session {
             }
             node.node.available = false;
             node.session.as_mut().ok_or(Error::Conflict)?.routable = false;
+            node.checkpoint_gc_fenced = true;
             let mut holds = Vec::new();
             let mut writes = vec![(format!("node:{id}"), encode(node)?)];
             for (environment_id, environment) in &mut saved.environments {

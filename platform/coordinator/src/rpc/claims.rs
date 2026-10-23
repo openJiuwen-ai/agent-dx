@@ -4,6 +4,36 @@ use crate::storage::{ClaimOutcome, LocalClaim};
 use adx_core::snapshots::Reference;
 use pb::claim_environment_response::Outcome;
 
+fn pending_specs(
+    specs: &BTreeMap<String, EnvironmentSpec>,
+    known: &BTreeMap<String, StoredEnvironment>,
+    saved: &crate::storage::StoredSnapshot,
+) -> Vec<EnvironmentSpec> {
+    specs
+        .values()
+        .filter(|spec| !saved.environments.contains_key(&spec.id) && !known.contains_key(&spec.id))
+        .cloned()
+        .collect()
+}
+
+fn rebuilt_specs(
+    pending: &[EnvironmentSpec],
+    saved: &crate::storage::StoredSnapshot,
+) -> BTreeMap<String, EnvironmentSpec> {
+    let mut specs: BTreeMap<String, EnvironmentSpec> = pending
+        .iter()
+        .cloned()
+        .map(|spec| (spec.id.clone(), spec))
+        .collect();
+    specs.extend(
+        saved
+            .environments
+            .iter()
+            .map(|(id, stored)| (id.clone(), stored.spec.clone())),
+    );
+    specs
+}
+
 impl State {
     pub(super) async fn recover_authoritative_state(&mut self) -> Result<()> {
         if !self.needs_recovery {
@@ -13,12 +43,7 @@ impl State {
         // in-flight CAS from materializing after the authoritative snapshot.
         self.session.claim_barrier().await?;
         let saved = self.session.snapshot().await?;
-        let pending: Vec<_> = self
-            .specs
-            .values()
-            .filter(|s| !saved.environments.contains_key(&s.id))
-            .cloned()
-            .collect();
+        let pending = pending_specs(&self.specs, &self.environments, &saved);
         let mut scheduler = Coordinator::restore(&saved, self.placement)?;
         for node in saved.nodes.values() {
             let mut candidate = node.node.clone();
@@ -32,12 +57,18 @@ impl State {
             });
             scheduler.register(candidate)?;
         }
-        for spec in pending {
-            scheduler.submit(spec)?;
+        for spec in &pending {
+            scheduler.submit(spec.clone())?;
         }
+        let specs = rebuilt_specs(&pending, &saved);
         self.scheduler = scheduler;
         self.nodes = saved.nodes;
         self.environments = saved.environments;
+        self.specs = specs;
+        // Only uncommitted queued requests need this transient input. A
+        // recovered durable record owns its metadata in StoredEnvironment.
+        self.pending_metadata
+            .retain(|id, _| self.specs.contains_key(id) && !self.environments.contains_key(id));
         self.failed_environments = self
             .environments
             .iter()
@@ -48,9 +79,6 @@ impl State {
             })
             .map(|(id, _)| id.clone())
             .collect();
-        for (id, record) in &self.environments {
-            self.specs.insert(id.clone(), record.spec.clone());
-        }
         self.needs_recovery = false;
         Ok(())
     }
@@ -122,6 +150,7 @@ impl State {
         })
     }
 }
+
 impl CoordinatorRpc {
     pub(super) async fn prepare_local(
         &self,
@@ -171,6 +200,8 @@ impl CoordinatorRpc {
             .ok_or_else(|| Status::invalid_argument("spec required"))?
             .try_into()
             .map_err(status)?;
+        let user_metadata = request.user_metadata.into_iter().collect();
+        adx_core::metadata::validate_user_metadata(&user_metadata).map_err(status)?;
         tenant(request.caller.as_ref(), &spec.tenant_id)?;
         let candidate = LocalClaim {
             node_id: node.clone(),
@@ -246,7 +277,10 @@ impl CoordinatorRpc {
         };
         *state.claims_in_flight.entry(spec.id.clone()).or_default() += 1;
         drop(state);
-        let outcome = self.0.claim(spec.clone(), candidate.clone()).await;
+        let outcome = self
+            .0
+            .claim(spec.clone(), candidate.clone(), user_metadata)
+            .await;
         let mut state = self.0.state.lock().await;
         let in_flight = state
             .claims_in_flight
@@ -299,5 +333,95 @@ impl CoordinatorRpc {
         Ok(pb::ClaimEnvironmentResponse {
             outcome: Some(outcome),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(id: &str) -> EnvironmentSpec {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "tenant_id": "tenant", "image": "image",
+            "runtime_class": "runsc", "priority": 0,
+            "resources": {"cpu_millis": 100, "memory_bytes": 128, "disk_bytes": 0}
+        }))
+        .unwrap()
+    }
+
+    fn stored(
+        spec: EnvironmentSpec,
+        state: EnvironmentState,
+        resources_held: bool,
+    ) -> StoredEnvironment {
+        let assignment = adx_core::Assignment {
+            environment_id: spec.id.clone(),
+            node_id: "source".into(),
+            shard_id: 0,
+            generation: 1,
+            devices: vec![],
+        };
+        StoredEnvironment {
+            user_metadata: Default::default(),
+            control: None,
+            resume: Default::default(),
+            failed_since_unix_seconds: None,
+            recovery: None,
+            invalidated: state == EnvironmentState::Deleted,
+            spec: spec.clone(),
+            assignment: assignment.clone(),
+            result: Some(EnvironmentRecord {
+                execution_artifacts: vec![],
+                snapshot_source: None,
+                spec,
+                assignment,
+                state,
+                revision: 1,
+                runtime: adx_core::Runtime {
+                    id: "record-1".into(),
+                    ip: None,
+                },
+                resources_held,
+                checkpoint: None,
+                last_operation: None,
+                restart_attempts: 0,
+                restart_pending: false,
+                failure: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn authoritative_rebuild_does_not_requeue_a_stale_deleted_recovery_spec() {
+        let stale = spec("deleted-recovery");
+        let fresh = spec("first-create");
+        let persisted = spec("persisted");
+        let specs = BTreeMap::from([
+            (stale.id.clone(), stale.clone()),
+            (fresh.id.clone(), fresh.clone()),
+            (persisted.id.clone(), persisted.clone()),
+        ]);
+        let known = BTreeMap::from([(
+            stale.id.clone(),
+            stored(stale.clone(), EnvironmentState::Deleted, false),
+        )]);
+        let saved = crate::storage::StoredSnapshot {
+            shard_count: 1,
+            generation: 1,
+            revision: 1,
+            nodes: BTreeMap::new(),
+            environments: BTreeMap::from([(
+                persisted.id.clone(),
+                stored(persisted.clone(), EnvironmentState::Running, true),
+            )]),
+        };
+
+        let pending = pending_specs(&specs, &known, &saved);
+        assert_eq!(pending, vec![fresh.clone()]);
+        assert_eq!(
+            rebuilt_specs(&pending, &saved),
+            BTreeMap::from([(fresh.id.clone(), fresh), (persisted.id.clone(), persisted)]),
+            "a durable deletion is pruned while genuine pending and persisted work survive"
+        );
     }
 }

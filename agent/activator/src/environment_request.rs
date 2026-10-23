@@ -48,12 +48,17 @@ pub fn validate_timeout(timeout: Duration) -> Result<(), EnvironmentError> {
     Ok(())
 }
 pub fn validate_execution(execution: &ExecutionSpec) -> Result<(), EnvironmentError> {
-    execution.validate().map_err(EnvironmentError::Invalid)?;
+    validate_execution_fields(execution)?;
     if !execution.inherit_entrypoint {
         return Err(EnvironmentError::Unsupported(
             "API Server adapter requires image process inheritance".into(),
         ));
     }
+    Ok(())
+}
+
+fn validate_execution_fields(execution: &ExecutionSpec) -> Result<(), EnvironmentError> {
+    execution.validate().map_err(EnvironmentError::Invalid)?;
     if execution
         .env
         .keys()
@@ -78,41 +83,19 @@ pub fn validate_execution(execution: &ExecutionSpec) -> Result<(), EnvironmentEr
     }
     Ok(())
 }
-/// Both HTTP and local adapters submit the same request body. Deadline is transport metadata.
-pub fn create_input(
-    request: &CreateEnvironment,
-    timeout: Duration,
-    network: &SandboxNetworkPolicy,
-) -> Result<Value, EnvironmentError> {
-    validate_execution(&request.execution)?;
-    validate_identity(&request.tenant)?;
-    validate_identity(&request.id)?;
-    validate_timeout(timeout)?;
-    // AgentBinding generations use adx-<UUID>. The public API builds namespace-name IDs.
-    let name = request
-        .id
-        .strip_prefix("adx-")
-        .filter(|name| !name.is_empty() && name.len() <= 256)
-        .ok_or_else(|| {
-            EnvironmentError::Invalid("managed Environment ID must be adx-<name>".into())
-        })?;
-    let execution = &request.execution;
-    // Validate the complete deployment configuration even for an explicit opt-out.
-    let network_request = network_input(network)?;
-    // Keep the submitted specification stable across retries. The caller's absolute
-    // deadline bounds HTTP waiting; API Server owns its independent create budget.
+/// Convert the immutable execution portion of a request to the public Environment contract.
+///
+/// This deliberately excludes caller identity, Environment identity, operation timeouts, and
+/// deployment network policy so non-Agent callers can add their own trusted values. Agent
+/// creation retains image-process inheritance through [`validate_execution`].
+pub fn execution_input(execution: &ExecutionSpec) -> Result<Value, EnvironmentError> {
+    validate_execution_fields(execution)?;
     let mut input = json!({
-        "namespace":"adx", "name":name, "image":execution.image, "runtime":execution.isolation_runtime,
+        "image":execution.image, "runtime":execution.isolation_runtime,
         "cpu":execution.resources.cpu_millis, "memory":execution.resources.memory_mib,
-        "inheritEntrypoint":true, "env":execution.env,
+        "inheritEntrypoint":execution.inherit_entrypoint, "env":execution.env,
         "ports":execution.service.iter().map(|service| service.port.to_string()).collect::<std::collections::BTreeSet<_>>(),
-        "createTimeoutSeconds":timeout.as_secs().max(1),
     });
-    if network.runtime_policies.get(&execution.isolation_runtime)
-        != Some(&RuntimeNetworkPolicy::Unrestricted)
-    {
-        input["network"] = network_request;
-    }
     if !execution.lifecycle.is_default() {
         input["idleTimeoutSeconds"] = json!(execution.lifecycle.idle_timeout_seconds);
         input["idleAction"] = json!(execution.lifecycle.idle_action);
@@ -146,6 +129,42 @@ pub fn create_input(
     if let Some(limit) = execution.resources.memory_limit_mib {
         input["mem_limit"] = json!(limit);
     }
+    Ok(input)
+}
+
+/// Both HTTP and local adapters submit the same request body. Deadline is transport metadata.
+pub fn create_input(
+    request: &CreateEnvironment,
+    timeout: Duration,
+    network: &SandboxNetworkPolicy,
+) -> Result<Value, EnvironmentError> {
+    validate_execution(&request.execution)?;
+    validate_identity(&request.tenant)?;
+    validate_identity(&request.id)?;
+    validate_timeout(timeout)?;
+    // AgentBinding generations use adx-<UUID>. The public API builds namespace-name IDs.
+    let name = request
+        .id
+        .strip_prefix("adx-")
+        .filter(|name| !name.is_empty() && name.len() <= 256)
+        .ok_or_else(|| {
+            EnvironmentError::Invalid("managed Environment ID must be adx-<name>".into())
+        })?;
+    // Keep the submitted specification stable across retries. The caller's absolute
+    // deadline bounds HTTP waiting; API Server owns its independent create budget.
+    let mut input = execution_input(&request.execution)?;
+    input["namespace"] = json!("adx");
+    input["name"] = json!(name);
+    // Validate the complete deployment configuration even for an explicit opt-out.
+    let network_request = network_input(network)?;
+    if network
+        .runtime_policies
+        .get(&request.execution.isolation_runtime)
+        != Some(&RuntimeNetworkPolicy::Unrestricted)
+    {
+        input["network"] = network_request;
+    }
+    input["createTimeoutSeconds"] = json!(timeout.as_secs().max(1));
     Ok(input)
 }
 

@@ -162,6 +162,7 @@ impl IngressService {
             config.control_plane_routes.clone(),
         )
         .with_port_host_domain(config.port_host_domain.clone())
+        .with_e2b_enabled(config.e2b_enabled)
         .with_backend_http_pool_config(config.backend_http_pool_config())
         .with_reverse_proxy_config(config.reverse_proxy.clone())
         .with_proxy_routes(config.proxy_routes.clone())
@@ -305,7 +306,12 @@ impl IngressService {
 }
 
 fn load_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor, ServiceError> {
-    adx_transport::tls::http_server_acceptor(cert_path, key_path, None, vec![b"http/1.1".to_vec()])
+    adx_transport::tls::http_server_acceptor(
+        cert_path,
+        key_path,
+        None,
+        vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+    )
 }
 
 fn send_error(error: Box<dyn std::error::Error>) -> ServiceError {
@@ -361,6 +367,7 @@ mod tests {
             default_direct_port: 50_090,
             default_tunnel_port: 8_765,
             port_host_domain: None,
+            e2b_enabled: false,
             node_security_mode: IngressNodeSecurityMode::Network,
             node_tls_ca: String::new(),
             node_tls_server_name: String::new(),

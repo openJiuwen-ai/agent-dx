@@ -1,5 +1,6 @@
 //! Real Redis and gRPC; runtime memory and object storage are controlled fixtures.
 mod common;
+use adx_checkpoint_storage::ObjectCheckpointStore;
 use adx_coordinator::{rpc::CoordinatorRpc, storage::Session, Placement};
 use adx_core::{EnvironmentRecord, EnvironmentSpec, Resources, Result};
 use adx_protocol::{
@@ -8,7 +9,7 @@ use adx_protocol::{
 };
 use adx_transport::rpc::{RpcChannel, RpcClient};
 use adxlet::{
-    checkpoint::{CheckpointCooperation, ObjectCheckpointStore},
+    checkpoint::CheckpointCooperation,
     rpc::{CoordinatorStateSink, NodeRpc},
     Adxlet, Readiness, Routes, RuntimeDriver,
 };
@@ -50,6 +51,9 @@ fn spec() -> EnvironmentSpec {
         priority: 0,
         scheduling: Default::default(),
         execution: Default::default(),
+        run_policy: None,
+        template_identity: None,
+        compatibility: None,
     }
 }
 fn caller() -> Option<pb::CallerContext> {
@@ -240,8 +244,9 @@ async fn worker(
     .unwrap()
     .with_session(session.clone());
     let store = Arc::new(
-        ObjectCheckpointStore::new(
+        ObjectCheckpointStore::new_scoped(
             "obs".into(),
+            "test-shared".into(),
             remote,
             "checkpoints".into(),
             dir.path().into(),
@@ -288,6 +293,7 @@ async fn worker(
             proxy_address: format!("{id}:9002"),
             capacity: Some(spec().resources.into()),
             runtime_classes: vec!["test-runtime".into()],
+            checkpoint_scopes: vec!["test-shared".into()],
             labels: [("ADX_CHECKPOINT_STORAGE".into(), "obs".into())].into(),
             session_id: session,
             heartbeat_sequence: 1,
@@ -400,6 +406,7 @@ impl Rig {
                 create_timeout_seconds: 10,
                 create_deadline_unix_millis: 0,
                 expected_assignment: None,
+                user_metadata: Default::default(),
             })
             .await
             .unwrap()
@@ -412,6 +419,8 @@ impl Rig {
             assignment: record.assignment,
             caller: caller(),
             operation_id: "pause-original".into(),
+            expiry_revision: None,
+            node_session_id: String::new(),
             expected_revision: record.revision,
             retention: Some(adx_core::lifecycle::RetentionPolicy::Ttl { ttl_seconds }.into()),
             timeout_seconds: 10,
@@ -604,6 +613,7 @@ async fn coordinator_autoscaling_http_queries_authoritative_node_ownership_witho
                     create_timeout_seconds: 10,
                     create_deadline_unix_millis: 0,
                     expected_assignment: None,
+                    user_metadata: Default::default(),
                 })
                 .await
             });
@@ -746,7 +756,7 @@ async fn multiple_ingress_and_manual_resume_restore_once_on_original_node() {
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
 async fn definite_local_capacity_rejection_restores_same_state_on_another_node() {
-    use adxlet::checkpoint::CheckpointAccess;
+    use adx_checkpoint_storage::CheckpointAccess;
     let mut rig = Rig::new(Duration::from_secs(2)).await;
     rig.source
         .manager
@@ -1295,6 +1305,7 @@ async fn multiple_ingress_traffic(timeout_retry: bool) {
                 tenant_id: "tenant".into(),
                 administrator: false,
                 expires_at_unix_seconds: 0,
+                metadata: Default::default(),
             },
         )
         .await
@@ -1615,6 +1626,7 @@ async fn delete_serializes_with_restore_and_fences_its_late_result() {
         assignment: Some(paused.assignment.clone().try_into().unwrap()),
         caller: caller(),
         failed_revision: None,
+        expiry_revision: None,
         node_session_id: String::new(),
     }));
     assert!(futures_util::poll!(deleting.as_mut()).is_pending());
@@ -1732,7 +1744,7 @@ async fn background_resume_round_does_not_starve_later_intents() {
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
 async fn original_checkpoint_cache_pressure_does_not_reject_resume() {
-    use adxlet::checkpoint::CheckpointAccess;
+    use adx_checkpoint_storage::CheckpointAccess;
     let rig = Rig::new(Duration::from_secs(2)).await;
     let stage = rig.source.store.begin_capture().await.unwrap();
     std::fs::write(stage.join("occupied"), vec![42; 1024]).unwrap();

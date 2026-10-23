@@ -5,6 +5,7 @@ use crate::RuntimeDriver;
 use adx_core::{EnvironmentSpec, Error, Result};
 use async_trait::async_trait;
 use hyper_util::rt::TokioIo;
+use sha2::{Digest, Sha512};
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -598,6 +599,36 @@ pub fn start_request(
     envs.remove("ADX_RUNTIME_CONTROL_ADDRESS");
     envs.remove("ADX_RUNTIME_CONTROL_TOKEN");
     envs.remove("ADX_RUNTIME_CONTROL_SECRET");
+    // Compatibility guest-service configuration is deployment-owned. User
+    // EnvironmentSpec values must not redirect the privileged envd bootstrap
+    // or replace its per-sandbox credential.
+    const ENVD_CONFIGURATION_KEYS: [&str; 6] = [
+        "ADX_ENVD_PATH",
+        "ADX_ENVD_SHA256",
+        "ADX_ENVD_ARGS",
+        "ADX_ENVD_DEFAULT_USER",
+        "ADX_ENVD_DEFAULT_WORKDIR",
+        "ADX_ENVD_FREEZE_ON_CHECKPOINT",
+    ];
+    for key in ENVD_CONFIGURATION_KEYS
+        .into_iter()
+        .chain(["ADX_ENVD_ACCESS_TOKEN"])
+    {
+        envs.remove(key);
+    }
+    if let Some(compatibility) = &spec.compatibility {
+        if let Some(profile) = config.runtime_profile.as_ref() {
+            for key in ENVD_CONFIGURATION_KEYS {
+                if let Some(value) = profile.env.get(key) {
+                    envs.insert(key.into(), value.clone());
+                }
+            }
+        }
+        envs.insert(
+            "ADX_ENVD_ACCESS_TOKEN".into(),
+            compatibility.envd_access_token.clone(),
+        );
+    }
     if let (Some(address), Some(secret)) = (
         config.env.get("ADX_RUNTIME_CONTROL_ADDRESS"),
         config.env.get("ADX_RUNTIME_CONTROL_SECRET"),
@@ -798,6 +829,12 @@ pub fn start_request(
         } else {
             String::new()
         },
+        trusted_guest_metadata: spec.compatibility.as_ref().map(|compatibility| {
+            serde_json::json!({
+                "accessTokenHash": format!("{:x}", Sha512::digest(compatibility.envd_access_token.as_bytes())),
+            })
+            .to_string()
+        }).unwrap_or_default(),
         ..Default::default()
     })
 }
@@ -1400,8 +1437,64 @@ mod tests {
     }
 
     #[test]
+    fn deployment_envd_payload_is_enabled_only_for_compatible_sandboxes() {
+        let profile: adx_core::runtime_profile::RuntimeProfile = serde_json::from_value(serde_json::json!({
+            "rootfs":{"runtime_class":"runc","type":"local","path":"/opt/adx/runtime.img","readonly":false},
+            "bootstrap":{"type":"erofs","root":"/opt/adx/runtime.img","target":"/__adx","entrypoint":["/__adx/usr/local/bin/adx-execd"]},
+            "env":{"ADX_ENVD_PATH":"/usr/local/bin/envd","ADX_ENVD_SHA256":"a".repeat(64),"ADX_ENVD_DEFAULT_USER":"user","ADX_ENVD_DEFAULT_WORKDIR":"/home/user","ADX_ENVD_FREEZE_ON_CHECKPOINT":"false"}
+        })).unwrap();
+        let mut spec = EnvironmentSpec {
+            run_policy: None,
+            template_identity: None,
+            compatibility: None,
+            runtime_profile: Some(profile.clone()),
+            snapshot_id: None,
+            lifecycle: Default::default(),
+            env: [("ADX_ENVD_FREEZE_ON_CHECKPOINT".into(), "true".into())].into(),
+            scheduling: Default::default(),
+            id: "compat-switch".into(),
+            tenant_id: "tenant".into(),
+            image: String::new(),
+            runtime_class: "runc".into(),
+            resources: adx_core::Resources {
+                cpu_millis: 1000,
+                memory_bytes: 512 * 1024 * 1024,
+                disk_bytes: 0,
+            },
+            priority: 0,
+            execution: Default::default(),
+        };
+        let config = Config {
+            runtime_profile: Some(profile),
+            ..Config::default()
+        };
+        let native = start_request(&spec, "compat-switch-1", 1, &[], &config).unwrap();
+        assert!(!native.envs.contains_key("ADX_ENVD_PATH"));
+        assert!(!native.envs.contains_key("ADX_ENVD_ACCESS_TOKEN"));
+        assert!(!native.envs.contains_key("ADX_ENVD_FREEZE_ON_CHECKPOINT"));
+        spec.compatibility = Some(adx_core::environment_control::EnvironmentCompatibility {
+            template_id: "base".into(),
+            envd_version: "0.9.0".into(),
+            envd_access_token: "t".repeat(32),
+            traffic_access_token: "p".repeat(32),
+            allow_public_traffic: true,
+        });
+        let compatible = start_request(&spec, "compat-switch-2", 2, &[], &config).unwrap();
+        assert_eq!(compatible.envs["ADX_ENVD_PATH"], "/usr/local/bin/envd");
+        assert_eq!(compatible.envs["ADX_ENVD_ACCESS_TOKEN"], "t".repeat(32));
+        assert_eq!(compatible.envs["ADX_ENVD_FREEZE_ON_CHECKPOINT"], "false");
+        assert!(compatible
+            .trusted_guest_metadata
+            .contains("accessTokenHash"));
+        assert!(!compatible.trusted_guest_metadata.contains(&"t".repeat(32)));
+    }
+
+    #[test]
     fn request_preserves_execution_identity_image_and_resource_units() {
         let spec = EnvironmentSpec {
+            run_policy: None,
+            template_identity: None,
+            compatibility: None,
             runtime_profile: None,
             snapshot_id: None,
             lifecycle: Default::default(),
@@ -1460,6 +1553,9 @@ mod tests {
     #[test]
     fn runtime_control_credentials_are_scoped_and_host_secret_is_not_injected() {
         let mut spec = EnvironmentSpec {
+            run_policy: None,
+            template_identity: None,
+            compatibility: None,
             id: "i".into(),
             tenant_id: "t".into(),
             image: "image".into(),
@@ -1521,6 +1617,9 @@ mod tests {
     #[test]
     fn workload_probe_configuration_is_node_owned_and_preserves_init_budget() {
         let workload = EnvironmentSpec {
+            run_policy: None,
+            template_identity: None,
+            compatibility: None,
             execution: adx_core::execution::ExecutionOptions {
                 inherit_entrypoint: true,
                 rootfs: Some(adx_core::execution::Rootfs {

@@ -31,6 +31,9 @@ fn record() -> EnvironmentRecord {
         restart_attempts: 0,
         restart_pending: false,
         spec: EnvironmentSpec {
+            run_policy: None,
+            template_identity: None,
+            compatibility: None,
             runtime_profile: None,
             snapshot_id: None,
             lifecycle: Default::default(),

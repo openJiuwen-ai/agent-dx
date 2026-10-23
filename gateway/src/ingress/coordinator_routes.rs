@@ -7,6 +7,7 @@ use crate::common::route::{
     DataPlaneAuthMode, DataPlaneSecurityMode, EnvironmentStatus, PortForwardRoute, RouteCache,
     RouteInfo,
 };
+use crate::ingress::e2b_route::E2bRouteConfig;
 use adx_discovery::RedisDiscovery;
 use adx_protocol::control as pb;
 use adx_transport::rpc::{RpcChannel, RpcClient};
@@ -63,10 +64,17 @@ impl RouteConsumer {
             {
                 return Err("invalid published route".into());
             }
-            if let Some(old) = self.routes.get(&r.environment_id) {
-                if (r.generation, r.environment_revision)
-                    < (old.generation, old.environment_revision)
+            if let Some(compatibility) = &r.compatibility {
+                if compatibility.control_revision == 0
+                    || compatibility.expires_at_unix_ms == 0
+                    || !valid_sha256(&compatibility.envd_token_sha256)
+                    || !valid_sha256(&compatibility.traffic_token_sha256)
                 {
+                    return Err("invalid E2B route compatibility policy".into());
+                }
+            }
+            if let Some(old) = self.routes.get(&r.environment_id) {
+                if route_version(&r) < route_version(old) {
                     return Err("route execution version regressed".into());
                 }
             }
@@ -112,6 +120,18 @@ impl RouteConsumer {
     }
 }
 
+fn route_version(route: &pb::PublishedRoute) -> (u64, u64, u64) {
+    (
+        route.generation,
+        route.environment_revision,
+        route
+            .compatibility
+            .as_ref()
+            .map(|compatibility| compatibility.control_revision)
+            .unwrap_or_default(),
+    )
+}
+
 fn route_info(r: &pb::PublishedRoute) -> Result<RouteInfo, String> {
     let tunnel_security_mode = security_mode(r.tunnel_security_mode)?;
     let port_forward_security_mode = security_mode(r.port_forward_security_mode)?;
@@ -144,7 +164,22 @@ fn route_info(r: &pb::PublishedRoute) -> Result<RouteInfo, String> {
                 })
             })
             .collect::<Result<_, &str>>()?,
+        e2b: r
+            .compatibility
+            .as_ref()
+            .map(|compatibility| E2bRouteConfig {
+                envd_token_sha256: compatibility.envd_token_sha256.clone(),
+                traffic_token_sha256: compatibility.traffic_token_sha256.clone(),
+                allow_public_traffic: compatibility.allow_public_traffic,
+                envd_ready: compatibility.envd_ready,
+                expires_at_unix_ms: compatibility.expires_at_unix_ms,
+                control_revision: compatibility.control_revision,
+            }),
     })
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 fn security_mode(value: i32) -> Result<DataPlaneSecurityMode, String> {
     match pb::DataPlaneSecurityMode::try_from(value) {
@@ -163,6 +198,17 @@ fn security_mode(value: i32) -> Result<DataPlaneSecurityMode, String> {
 mod route_consumer_tests {
     use super::*;
 
+    fn compatibility(control_revision: u64) -> pb::SandboxRouteCompatibility {
+        pb::SandboxRouteCompatibility {
+            envd_token_sha256: "a".repeat(64),
+            traffic_token_sha256: "b".repeat(64),
+            allow_public_traffic: false,
+            envd_ready: true,
+            expires_at_unix_ms: u64::MAX,
+            control_revision,
+        }
+    }
+
     fn published_route(id: &str, revision: u64) -> pb::PublishedRoute {
         pb::PublishedRoute {
             environment_id: id.into(),
@@ -175,6 +221,7 @@ mod route_consumer_tests {
             tunnel_security_mode: pb::DataPlaneSecurityMode::DataPlaneSecurityTlsToken as i32,
             port_forward_security_mode: pb::DataPlaneSecurityMode::DataPlaneSecurityTlsToken as i32,
             forwarded_ports: vec![8080],
+            compatibility: None,
         }
     }
 
@@ -211,6 +258,37 @@ mod route_consumer_tests {
             consumer.routes["environment-09999"].relay_address.as_ptr(),
             untouched,
             "an incremental route frame must not clone untouched entries"
+        );
+    }
+
+    #[test]
+    fn rejects_e2b_control_revision_regression() {
+        let store = Arc::new(RouteStore::new());
+        let mut consumer = RouteConsumer::new(store);
+        let mut current = published_route("environment-a", 1);
+        current.compatibility = Some(compatibility(2));
+        consumer
+            .apply(pb::RouteFrame {
+                epoch: 1,
+                revision: 1,
+                reset: true,
+                upserts: vec![current],
+                ..Default::default()
+            })
+            .unwrap();
+        let mut stale = published_route("environment-a", 1);
+        stale.compatibility = Some(compatibility(1));
+        assert_eq!(
+            consumer
+                .apply(pb::RouteFrame {
+                    epoch: 1,
+                    base_revision: 1,
+                    revision: 2,
+                    upserts: vec![stale],
+                    ..Default::default()
+                })
+                .unwrap_err(),
+            "route execution version regressed"
         );
     }
 }
@@ -373,6 +451,7 @@ impl super::resolver::DemandResolver for CoordinatorConnection {
             .as_ref()
             .is_some_and(|s| s.ports.contains(&u32::from(port)));
         Ok(RouteHandle {
+            e2b: None,
             needs_resume: true,
             processing: None,
             access_kind: kind,

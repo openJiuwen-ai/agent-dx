@@ -4,6 +4,7 @@ use adx_core::{CheckpointArtifact, RestorePoint};
 fn artifact() -> CheckpointArtifact {
     CheckpointArtifact {
         storage: "shared".into(),
+        scope: String::new(),
         location: uuid::Uuid::new_v4().to_string(),
         size_bytes: 8,
     }
@@ -228,6 +229,71 @@ async fn deletion_candidate(s: &adx_coordinator::storage::Session) -> Checkpoint
     r.revision += 1;
     s.commit(r).await.unwrap();
     a
+}
+
+async fn cleanup_candidate(s: &adx_coordinator::storage::Session) -> CheckpointArtifact {
+    register(s, "source").await;
+    let assignment = Assignment {
+        environment_id: "cleanup-owner".into(),
+        node_id: "source".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    s.reserve(spec("cleanup-owner"), assignment.clone())
+        .await
+        .unwrap();
+    let a = artifact();
+    let mut record = running(spec("cleanup-owner"), assignment);
+    record.checkpoint = Some(RestorePoint {
+        origin: None,
+        id: "checkpoint".into(),
+        artifact: a.clone(),
+        expires_at_unix_seconds: Some(1),
+        source_runtime_id: record.runtime.id.clone(),
+    });
+    s.commit(record.clone()).await.unwrap();
+    record.state = EnvironmentState::Deleted;
+    record.resources_held = false;
+    record.runtime.ip = None;
+    record.checkpoint = None;
+    record.revision += 1;
+    s.commit_with_cleanup(record, &[]).await.unwrap();
+    a
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn checkpoint_outbox_reclaims_shared_artifacts_without_a_source_node() {
+    use object_store::{path::Path as Key, ObjectStoreExt};
+    let rig = common::Redis::new().await;
+    let s = rig.store().await.begin(1).await.unwrap();
+    let a = cleanup_candidate(&s).await;
+    let remote = std::sync::Arc::new(object_store::memory::InMemory::new());
+    let key = Key::from(format!("test/{}/files/memory", a.location));
+    remote.put(&key, b"memory".to_vec().into()).await.unwrap();
+
+    let unconfigured = rpc(
+        s.clone(),
+        adx_checkpoint_storage::reclaim::Reclaimers::default(),
+    )
+    .await;
+    assert!(unconfigured.collect_checkpoint_cleanups().await.is_err());
+    assert!(remote.get(&key).await.is_ok());
+    assert_eq!(s.checkpoint_cleanups().await.unwrap().len(), 1);
+
+    let reclaimer = std::sync::Arc::new(
+        adx_checkpoint_storage::reclaim::ObjectReclaimer::new(
+            "shared".into(),
+            remote.clone(),
+            "test".into(),
+        )
+        .unwrap(),
+    );
+    let coordinator = rpc(s.clone(), reclaimers(reclaimer)).await;
+    assert_eq!(coordinator.collect_checkpoint_cleanups().await.unwrap(), 1);
+    assert!(remote.get(&key).await.is_err());
+    assert!(s.checkpoint_cleanups().await.unwrap().is_empty());
 }
 
 #[tokio::test]

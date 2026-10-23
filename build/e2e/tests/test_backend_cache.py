@@ -24,6 +24,7 @@ class BackendCacheTests(unittest.TestCase):
         pinned = json.loads((cached.ROOT / 'third_party/sandboxd/source.json').read_text())
         self.manifest = {
             'sandboxd_revision': pinned['revision'],
+            'sandboxd_patches': cached.patch_identity(pinned),
             'target': 'x86_64-unknown-linux-gnu',
             'files': {name: cached.sha(self.root / name) for name in cached.BACKEND_BINARIES},
         }
@@ -39,6 +40,12 @@ class BackendCacheTests(unittest.TestCase):
     def test_changed_binary_is_rejected(self):
         (self.root / 'runc').write_bytes(b'corrupt')
         with self.assertRaisesRegex(ValueError, 'integrity'):
+            cached.verify(self.root, self.manifest['target'])
+
+    def test_unpatched_backend_is_rejected(self):
+        self.manifest.pop('sandboxd_patches')
+        self.save()
+        with self.assertRaisesRegex(ValueError, 'patch identity'):
             cached.verify(self.root, self.manifest['target'])
 
     def test_wrong_revision_and_architecture_are_rejected(self):

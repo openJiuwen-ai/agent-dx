@@ -4,6 +4,38 @@ use super::*;
 use crate::auth::Credential;
 
 impl Session {
+    pub async fn revoke_credential_public(&self, public_id: &str, tenant_id: &str) -> Result<()> {
+        let public_id = uuid::Uuid::parse_str(public_id)
+            .map_err(|_| Error::Invalid("invalid credential public ID".into()))?
+            .to_string();
+        let [header] = self.store.fields([HEADER.into()]).await?;
+        self.header(&header)?;
+        let mut command = redis::cmd("EVAL");
+        command.arg(r#"
+          if redis.call('HGET', KEYS[1], 'header') ~= ARGV[1] then return 0 end
+          local entries = redis.call('HGETALL', KEYS[2])
+          local target = nil
+          for i = 1, #entries, 2 do
+            local ok, record = pcall(cjson.decode, entries[i + 1])
+            if not ok or type(record) ~= 'table' then return 3 end
+            if record.tenant_id == ARGV[2] and type(record.metadata) == 'table' and record.metadata.public_id == ARGV[3] then
+              if record.administrator then return 2 end
+              if target then return 3 end
+              target = entries[i]
+            end
+          end
+          if not target then return 2 end
+          redis.call('HSET', KEYS[3], target, 'revoked')
+          redis.call('HDEL', KEYS[2], target)
+          return 1
+        "#).arg(3).arg(&self.store.key).arg(format!("{}:credentials", self.store.key)).arg(format!("{}:revoked-credentials", self.store.key)).arg(header.as_deref().ok_or(Error::Conflict)?).arg(tenant_id).arg(public_id);
+        match self.store.query::<u64>(command).await? {
+            1 => Ok(()),
+            2 => Err(Error::NotFound),
+            3 => Err(Error::Unavailable("corrupt credential record".into())),
+            _ => Err(Error::Conflict),
+        }
+    }
     /// Reconcile the deployment's complete administrator key set atomically.
     /// Removed keys are permanently revoked. Invalid sets, revoked keys and
     /// concurrent credential changes fail without changing the active keys.

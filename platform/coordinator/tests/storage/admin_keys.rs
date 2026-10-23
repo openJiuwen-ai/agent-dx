@@ -1,15 +1,110 @@
 use super::*;
-use adx_coordinator::auth::{digest, Credential};
+use adx_coordinator::auth::{digest, Credential, CredentialMetadata};
 
 fn admin() -> Credential {
     Credential {
         tenant_id: "admin".into(),
         administrator: true,
         expires_at_unix_seconds: 0,
+        metadata: None,
     }
 }
 fn key(name: &str) -> String {
     format!("admin-rotation-{name}-012345678901234567890123456789")
+}
+
+#[test]
+fn legacy_credential_json_deserializes_without_metadata_or_key_material() {
+    let credential: Credential = serde_json::from_str(
+        r#"{"tenant_id":"tenant","administrator":false,"expires_at_unix_seconds":0}"#,
+    )
+    .unwrap();
+    assert_eq!(credential.metadata, None);
+    let encoded = serde_json::to_string(&credential).unwrap();
+    assert!(!encoded.contains("api_key"));
+    assert!(!encoded.contains("raw"));
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis"]
+async fn public_key_revoke_is_tenant_bound_atomic_and_permanent() {
+    let redis = common::Redis::new().await;
+    let session = redis.store().await.begin(1).await.unwrap();
+    let raw = format!("adx_{}", "a".repeat(64));
+    let metadata = CredentialMetadata {
+        public_id: uuid::Uuid::new_v4().to_string(),
+        name: "managed".into(),
+        created_at_unix_ms: 1,
+        prefix: "adx_".into(),
+        value_length: 64,
+        masked_value_prefix: "aa".into(),
+        masked_value_suffix: "aaaa".into(),
+    };
+    let credential = Credential {
+        tenant_id: "tenant".into(),
+        administrator: false,
+        expires_at_unix_seconds: 0,
+        metadata: Some(metadata.clone()),
+    };
+    session
+        .bootstrap_credential(&raw, &credential)
+        .await
+        .unwrap();
+    let id = digest(&raw).unwrap();
+    let client = redis::Client::open(redis.url.as_str()).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    let stored: String = redis::cmd("HGET")
+        .arg("adx:{test}:control:v1:credentials")
+        .arg(&id)
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    assert!(!stored.contains(&raw));
+    assert!(matches!(
+        session
+            .revoke_credential_public(&metadata.public_id, "other")
+            .await,
+        Err(Error::NotFound)
+    ));
+    assert!(session.credential(&id).await.is_ok());
+    redis::cmd("HSET")
+        .arg("adx:{test}:control:v1:credentials")
+        .arg("corrupt")
+        .arg("{")
+        .query_async::<()>(&mut connection)
+        .await
+        .unwrap();
+    assert!(matches!(
+        session
+            .revoke_credential_public(&metadata.public_id, "tenant")
+            .await,
+        Err(Error::Unavailable(_))
+    ));
+    assert!(session.credential(&id).await.is_ok());
+    redis::cmd("HDEL")
+        .arg("adx:{test}:control:v1:credentials")
+        .arg("corrupt")
+        .query_async::<()>(&mut connection)
+        .await
+        .unwrap();
+    session
+        .revoke_credential_public(&metadata.public_id.to_uppercase(), "tenant")
+        .await
+        .unwrap();
+    assert!(matches!(
+        session
+            .revoke_credential_public(&metadata.public_id, "tenant")
+            .await,
+        Err(Error::NotFound)
+    ));
+    session
+        .bootstrap_credential(&raw, &credential)
+        .await
+        .unwrap();
+    assert!(matches!(
+        session.credential(&id).await,
+        Err(Error::NotFound)
+    ));
 }
 
 #[tokio::test]
@@ -29,6 +124,7 @@ async fn administrator_rotation_is_atomic_persistent_and_preserves_tenant_keys()
                 tenant_id: "tenant".into(),
                 administrator: false,
                 expires_at_unix_seconds: 0,
+                metadata: None,
             },
         )
         .await

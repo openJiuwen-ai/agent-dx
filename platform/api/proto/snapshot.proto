@@ -47,7 +47,7 @@ message ListSnapshotsResponse { repeated ReusableSnapshot snapshots = 1; string 
 
 message DeleteSnapshotRequest { string id = 1; CallerContext caller = 2; }
 
-message CollectSnapshotRequest { ReusableSnapshot snapshot = 1; string node_session_id = 2; }
+message CollectSnapshotRequest { ReusableSnapshot snapshot = 1; string node_session_id = 2; bool delegated = 3; }
 
 message CollectSnapshotResponse { string snapshot_id = 1; uint64 revision = 2; }
 

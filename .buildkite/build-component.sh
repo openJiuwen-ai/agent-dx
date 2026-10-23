@@ -59,9 +59,16 @@ case "$component" in
     cargo build --locked --release --target "$musl_target" -j "$jobs" \
       -p adx-execd --bin adx-execd
     cp "$CARGO_TARGET_DIR/$musl_target/release/adx-execd" "$output/adx-execd"
-    python3 build/runtime/rootfs.py \
-      --binary "$output/adx-execd" \
-      --output "$output/adx-runtime-rootfs.img"
+    rootfs_args=(--binary "$output/adx-execd" --output "$output/adx-runtime-rootfs.img")
+    if [[ -n "${ADX_ENVD_SOURCE:-}" ]]; then
+      echo "--- :package: Build optional pinned envd"
+      python3 build/e2b/build_envd.py --source "$ADX_ENVD_SOURCE" --output "$output/envd-build" --jobs "$jobs"
+      cp "$output/envd-build/manifest.json" "$output/envd-manifest.json"
+      cp "$output/envd-build/LICENSE" "$output/envd-LICENSE"
+      rootfs_args+=(--envd-binary "$output/envd-build/envd")
+    fi
+    python3 build/runtime/rootfs.py "${rootfs_args[@]}"
+    rm -rf "$output/envd-build"
     ;;
   afs)
     [[ "$ADX_WITH_AFS" == "1" ]] || { echo 'AFS component requires ADX_WITH_AFS=1' >&2; exit 2; }

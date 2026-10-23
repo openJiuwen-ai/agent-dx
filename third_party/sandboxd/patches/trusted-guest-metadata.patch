@@ -1,0 +1,307 @@
+diff --git a/api/runtime/v1/sandbox-api.proto b/api/runtime/v1/sandbox-api.proto
+index f6f45bb..0887616 100644
+--- a/api/runtime/v1/sandbox-api.proto
++++ b/api/runtime/v1/sandbox-api.proto
+@@ -273,6 +273,9 @@ message StartRequest {
+   // rootfs. Empty disables injection. It does not replace the sandbox's own
+   // command.
+   string inject_entrypoint = 22;
++  // TrustedGuestMetadata is deployment-owned JSON for guest services. It is
++  // applied by runtimes only where a trusted metadata transport exists.
++  string trusted_guest_metadata = 23;
+ }
+ 
+ // StartResponse is returned after sandbox start.
+diff --git a/internal/server/server.go b/internal/server/server.go
+index c83f29e..3c1070b 100644
+--- a/internal/server/server.go
++++ b/internal/server/server.go
+@@ -1513,6 +1513,7 @@ func (h *sandboxService) Start(ctx context.Context, request *runtime.StartReques
+ 		ExtraConfig:             startReq.ExtraConfig,
+ 		EnableKVM:               extraConfig.EnableKVM,
+ 		CheckpointDir:           checkpointDir,
++		TrustedGuestMetadata:    startReq.TrustedGuestMetadata,
+ 	}
+ 	if err := h.startSandboxRuntime(ctx, startReq.Runtime, runtimeConfig); err != nil {
+ 		return &runtime.StartResponse{
+diff --git a/pkg/runtime/firecracker/api.go b/pkg/runtime/firecracker/api.go
+index f515412..a6036c3 100644
+--- a/pkg/runtime/firecracker/api.go
++++ b/pkg/runtime/firecracker/api.go
+@@ -120,6 +120,37 @@ func (api *firecrackerAPI) resume(ctx context.Context) error {
+ 	return api.patch(ctx, "/vm", map[string]string{"state": "Resumed"})
+ }
+ 
++// configureMMDS installs a deployment-owned metadata document before guest
++// vCPUs run. Firecracker exposes the document at the link-local MMDS endpoint.
++func (api *firecrackerAPI) configureMMDSBeforeBoot(ctx context.Context, document string) error {
++	if document == "" {
++		return nil
++	}
++	var decoded map[string]any
++	if err := json.Unmarshal([]byte(document), &decoded); err != nil || decoded == nil {
++		return fmt.Errorf("trusted guest metadata must be a JSON object")
++	}
++	if err := api.put(ctx, "/mmds/config", map[string]any{
++		"version": "V2", "network_interfaces": []string{"eth0"},
++	}); err != nil {
++		return err
++	}
++	return api.put(ctx, "/mmds", decoded)
++}
++
++// updateMMDSAfterRestore changes only the document. Firecracker rejects MMDS
++// configuration changes after a VM has booted, including a paused snapshot.
++func (api *firecrackerAPI) updateMMDSAfterRestore(ctx context.Context, document string) error {
++	if document == "" {
++		return nil
++	}
++	var decoded map[string]any
++	if err := json.Unmarshal([]byte(document), &decoded); err != nil || decoded == nil {
++		return fmt.Errorf("trusted guest metadata must be a JSON object")
++	}
++	return api.put(ctx, "/mmds", decoded)
++}
++
+ func (api *firecrackerAPI) createSnapshot(
+ 	ctx context.Context,
+ 	statePath,
+@@ -151,6 +182,7 @@ func (api *firecrackerAPI) loadSnapshot(
+ 	vsockPath,
+ 	virtioFSSocketPath,
+ 	virtioFSStatePath string,
++	trustedGuestMetadata string,
+ ) error {
+ 	backend := map[string]string{
+ 		"backend_type": "File",
+@@ -167,7 +199,7 @@ func (api *firecrackerAPI) loadSnapshot(
+ 		"snapshot_path":     statePath,
+ 		"mem_backend":       backend,
+ 		"track_dirty_pages": true,
+-		"resume_vm":         true,
++		"resume_vm":         false,
+ 		"network_overrides": []map[string]string{{
+ 			"iface_id":      "eth0",
+ 			"host_dev_name": tapName,
+@@ -183,7 +215,13 @@ func (api *firecrackerAPI) loadSnapshot(
+ 			"state_path":  virtioFSStatePath,
+ 		}
+ 	}
+-	return api.put(ctx, "/snapshot/load", body)
++	if err := api.put(ctx, "/snapshot/load", body); err != nil {
++		return err
++	}
++	if err := api.updateMMDSAfterRestore(ctx, trustedGuestMetadata); err != nil {
++		return err
++	}
++	return api.resume(ctx)
+ }
+ 
+ func firecrackerDrivePath(id string) string {
+@@ -203,6 +241,7 @@ func configureFirecrackerVM(
+ 	vsockPath string,
+ 	virtioFSSocketPath string,
+ 	drives []firecrackerDrive,
++	trustedGuestMetadata string,
+ ) error {
+ 	if err := api.put(ctx, "/boot-source", map[string]any{
+ 		"kernel_image_path": kernelPath,
+@@ -258,6 +297,9 @@ func configureFirecrackerVM(
+ 	}); err != nil {
+ 		return err
+ 	}
++	if err := api.configureMMDSBeforeBoot(ctx, trustedGuestMetadata); err != nil {
++		return err
++	}
+ 	return api.put(ctx, "/actions", map[string]any{
+ 		"action_type": "InstanceStart",
+ 	})
+diff --git a/pkg/runtime/firecracker/api_test.go b/pkg/runtime/firecracker/api_test.go
+index 5979397..79540fc 100644
+--- a/pkg/runtime/firecracker/api_test.go
++++ b/pkg/runtime/firecracker/api_test.go
+@@ -82,6 +82,7 @@ func TestConfigureFirecrackerVM(t *testing.T) {
+ 			{ID: "rootfs", Path: "/images/root.erofs", ReadOnly: true},
+ 			{ID: "overlay", Path: "/storage/overlay.ext4", IOEngine: "AsyncDirect", CacheType: "Writeback"},
+ 		},
++		`{"accessTokenHash":"digest"}`,
+ 	)
+ 	if err != nil {
+ 		t.Fatal(err)
+@@ -94,6 +95,8 @@ func TestConfigureFirecrackerVM(t *testing.T) {
+ 		"/drives/overlay",
+ 		"/network-interfaces/eth0",
+ 		"/vsock",
++		"/mmds/config",
++		"/mmds",
+ 		"/actions",
+ 	}
+ 	mu.Lock()
+@@ -128,8 +131,11 @@ func TestConfigureFirecrackerVM(t *testing.T) {
+ 		payloads[4]["guest_mac"] != "02:fc:0a:2a:00:02" {
+ 		t.Fatalf("network config = %+v", payloads[4])
+ 	}
+-	if payloads[6]["action_type"] != "InstanceStart" {
+-		t.Fatalf("start action = %+v", payloads[6])
++	if payloads[6]["version"] != "V2" || payloads[7]["accessTokenHash"] != "digest" {
++		t.Fatalf("trusted metadata = %+v %+v", payloads[6], payloads[7])
++	}
++	if payloads[8]["action_type"] != "InstanceStart" {
++		t.Fatalf("start action = %+v", payloads[8])
+ 	}
+ }
+ 
+@@ -198,6 +204,7 @@ func TestFirecrackerSnapshotAPI(t *testing.T) {
+ 		"/run/firecracker/restored.vsock",
+ 		"",
+ 		"",
++		`{"accessTokenHash":"restore"}`,
+ 	); err != nil {
+ 		t.Fatal(err)
+ 	}
+@@ -219,13 +226,14 @@ func TestFirecrackerSnapshotAPI(t *testing.T) {
+ 		"/run/firecracker/virtiofs.vsock",
+ 		"/run/firecracker/virtiofs.sock",
+ 		"/checkpoint/virtiofs.state",
++		"",
+ 	); err != nil {
+ 		t.Fatal(err)
+ 	}
+ 
+ 	mu.Lock()
+ 	defer mu.Unlock()
+-	if len(calls) != 6 {
++	if len(calls) != 9 {
+ 		t.Fatalf("snapshot API calls = %+v", calls)
+ 	}
+ 	if calls[0].method != http.MethodPatch || calls[0].path != "/vm" ||
+@@ -244,7 +252,7 @@ func TestFirecrackerSnapshotAPI(t *testing.T) {
+ 	}
+ 	if calls[3].method != http.MethodPut ||
+ 		calls[3].path != "/snapshot/load" ||
+-		calls[3].payload["resume_vm"] != true ||
++		calls[3].payload["resume_vm"] != false ||
+ 		calls[3].payload["track_dirty_pages"] != true {
+ 		t.Fatalf("load snapshot call = %+v", calls[3])
+ 	}
+@@ -261,16 +269,23 @@ func TestFirecrackerSnapshotAPI(t *testing.T) {
+ 	if memory["backend_type"] != "File" || memory["backend_path"] != "/tmp/memory" {
+ 		t.Fatalf("memory backend = %+v", memory)
+ 	}
+-	if calls[4].payload["fs_state_path"] != "/checkpoint/virtiofs.state" {
+-		t.Fatalf("virtio-fs snapshot create = %+v", calls[4])
++	if calls[4].path != "/mmds" || calls[4].payload["accessTokenHash"] != "restore" ||
++		calls[5].path != "/vm" || calls[5].payload["state"] != "Resumed" {
++		t.Fatalf("restore metadata must be installed before resume: %+v", calls[4:6])
++	}
++	if calls[6].payload["fs_state_path"] != "/checkpoint/virtiofs.state" {
++		t.Fatalf("virtio-fs snapshot create = %+v", calls[6])
+ 	}
+-	sharedMemory := calls[5].payload["mem_backend"].(map[string]any)
++	sharedMemory := calls[7].payload["mem_backend"].(map[string]any)
+ 	if sharedMemory["backend_type"] != "SharedFile" ||
+ 		sharedMemory["backend_path"] != "/storage/memory.live" ||
+ 		sharedMemory["source_path"] != "/checkpoint/memory" {
+ 		t.Fatalf("shared memory backend = %+v", sharedMemory)
+ 	}
+-	fsOverride := calls[5].payload["fs_override"].(map[string]any)
++	if calls[8].path != "/vm" || calls[8].payload["state"] != "Resumed" {
++		t.Fatalf("restore without metadata must still resume: %+v", calls[8])
++	}
++	fsOverride := calls[7].payload["fs_override"].(map[string]any)
+ 	if fsOverride["fs_id"] != "root" ||
+ 		fsOverride["socket_path"] != "/run/firecracker/virtiofs.sock" ||
+ 		fsOverride["state_path"] != "/checkpoint/virtiofs.state" {
+@@ -302,3 +317,56 @@ func (function roundTripperFunc) RoundTrip(
+ ) (*http.Response, error) {
+ 	return function(request)
+ }
++
++func TestLoadSnapshotMetadataFailurePreventsResume(t *testing.T) {
++	socket := filepath.Join(t.TempDir(), "api.sock")
++	listener, err := net.Listen("unix", socket)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listener.Close()
++
++	var mu sync.Mutex
++	var paths []string
++	server := &http.Server{Handler: http.HandlerFunc(func(
++		writer http.ResponseWriter,
++		request *http.Request,
++	) {
++		defer request.Body.Close()
++		mu.Lock()
++		paths = append(paths, request.URL.Path)
++		mu.Unlock()
++		if request.URL.Path == "/mmds" {
++			writer.WriteHeader(http.StatusInternalServerError)
++			return
++		}
++		writer.WriteHeader(http.StatusNoContent)
++	})}
++	serverDone := make(chan error, 1)
++	go func() { serverDone <- server.Serve(listener) }()
++	defer func() {
++		_ = server.Close()
++		<-serverDone
++	}()
++
++	api := newFirecrackerAPI(socket)
++	err = api.loadSnapshot(
++		context.Background(),
++		"/checkpoint/vmstate", "/checkpoint/memory", "", "tap-test",
++		"/run/firecracker/test.vsock", "", "", `{"accessTokenHash":"digest"}`,
++	)
++	if err == nil {
++		t.Fatal("metadata write failure was ignored")
++	}
++	mu.Lock()
++	defer mu.Unlock()
++	want := []string{"/snapshot/load", "/mmds"}
++	if len(paths) != len(want) {
++		t.Fatalf("API paths = %v, want %v", paths, want)
++	}
++	for index := range want {
++		if paths[index] != want[index] {
++			t.Fatalf("API path %d = %q, want %q", index, paths[index], want[index])
++		}
++	}
++}
+diff --git a/pkg/runtime/firecracker/checkpoint_handler.go b/pkg/runtime/firecracker/checkpoint_handler.go
+index 9756841..f20e7ce 100644
+--- a/pkg/runtime/firecracker/checkpoint_handler.go
++++ b/pkg/runtime/firecracker/checkpoint_handler.go
+@@ -966,6 +966,7 @@ func (handler *Handler) Restore(
+ 		vsockPath,
+ 		virtioFSSocketPathIfConfigured(virtioFSState),
+ 		checkpointFiles.VirtioFSState,
++		startConfig.TrustedGuestMetadata,
+ 	); err != nil {
+ 		return fmt.Errorf("load Firecracker checkpoint for %s: %w", startConfig.ID, err)
+ 	}
+diff --git a/pkg/runtime/firecracker/handler.go b/pkg/runtime/firecracker/handler.go
+index a8e3038..29bce75 100644
+--- a/pkg/runtime/firecracker/handler.go
++++ b/pkg/runtime/firecracker/handler.go
+@@ -756,6 +756,7 @@ func (handler *Handler) Start(
+ 		vsockPath,
+ 		virtioFSSocketPathIfConfigured(virtioFSState),
+ 		drives,
++		startConfig.TrustedGuestMetadata,
+ 	); err != nil {
+ 		return err
+ 	}
+diff --git a/pkg/runtime/handler.go b/pkg/runtime/handler.go
+index a51c875..d45ab86 100644
+--- a/pkg/runtime/handler.go
++++ b/pkg/runtime/handler.go
+@@ -101,6 +101,7 @@ type StartConfig struct {
+ 	ExtraConfig             string
+ 	EnableKVM               bool
+ 	CheckpointDir           string
++	TrustedGuestMetadata    string
+ }
+ 
+ // SpecUpdates contains provider-resolved OCI changes. Device providers use
