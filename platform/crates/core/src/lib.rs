@@ -2,6 +2,7 @@
 
 pub mod checkpoint;
 pub mod lifecycle;
+pub mod metadata;
 pub mod runtime_profile;
 pub mod snapshots;
 pub use checkpoint::{
@@ -107,6 +108,8 @@ impl Resources {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_identity: Option<NativeTemplateIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compatibility: Option<environment_control::EnvironmentCompatibility>,
     #[serde(default)]
     pub runtime_profile: Option<runtime_profile::RuntimeProfile>,
@@ -128,10 +131,39 @@ pub struct EnvironmentSpec {
     pub execution: execution::ExecutionOptions,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeTemplateIdentity {
+    pub tenant_id: String,
+    pub name: String,
+    pub version: String,
+}
+
+impl NativeTemplateIdentity {
+    fn validate(&self, environment_tenant_id: &str) -> Result<()> {
+        if self.tenant_id != environment_tenant_id
+            || [
+                self.tenant_id.as_str(),
+                self.name.as_str(),
+                self.version.as_str(),
+            ]
+            .iter()
+            .any(|value| {
+                value.trim().is_empty() || value.len() > 512 || value.chars().any(char::is_control)
+            })
+        {
+            return Err(Error::Invalid("invalid native template identity".into()));
+        }
+        Ok(())
+    }
+}
+
 impl EnvironmentSpec {
     pub fn validate(&self) -> Result<()> {
         if let Some(compatibility) = &self.compatibility {
             compatibility.validate()?;
+        }
+        if let Some(template_identity) = &self.template_identity {
+            template_identity.validate(&self.tenant_id)?;
         }
         for (name, value) in [
             ("id", &self.id),
@@ -373,5 +405,23 @@ mod tests {
             EnvironmentState::Starting.apply(Event::Ready),
             Ok(EnvironmentState::Running)
         );
+    }
+
+    #[test]
+    fn native_template_identity_requires_tenant_owned_bounded_text() {
+        let mut identity = NativeTemplateIdentity {
+            tenant_id: "tenant".into(),
+            name: "native".into(),
+            version: "v1".into(),
+        };
+        assert!(identity.validate("tenant").is_ok());
+        identity.tenant_id = "other".into();
+        assert!(identity.validate("tenant").is_err());
+        identity.tenant_id = "tenant".into();
+        identity.name = "\u{0000}".into();
+        assert!(identity.validate("tenant").is_err());
+        identity.name = "native".into();
+        identity.version = "v".repeat(513);
+        assert!(identity.validate("tenant").is_err());
     }
 }

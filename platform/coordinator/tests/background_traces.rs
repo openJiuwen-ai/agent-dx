@@ -99,6 +99,7 @@ async fn heartbeats_and_scheduler_rounds_do_not_export_spans_but_create_keeps_it
         create_timeout_seconds: 0,
         create_deadline_unix_millis: 0,
         expected_assignment: None,
+        user_metadata: Default::default(),
     });
     request
         .metadata_mut()

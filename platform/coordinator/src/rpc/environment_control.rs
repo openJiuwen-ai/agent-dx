@@ -2,7 +2,38 @@
 use super::*;
 use futures_util::{stream, StreamExt};
 
+fn expiry_pause_request(
+    stored: &StoredEnvironment,
+    control: &adx_core::environment_control::EnvironmentControlRecord,
+    record: &EnvironmentRecord,
+    caller: Option<pb::CallerContext>,
+    node_session_id: String,
+) -> Result<pb::PauseEnvironmentRequest> {
+    let pause = stored.spec.lifecycle.pause.clone().unwrap_or_default();
+    Ok(pb::PauseEnvironmentRequest {
+        assignment: Some(stored.assignment.clone().try_into()?),
+        caller,
+        operation_id: format!("expiry-{}-{}", control.expires_at_unix_ms, control.revision),
+        expected_revision: record.revision,
+        retention: Some(pause.retention.into()),
+        timeout_seconds: pause.timeout_seconds,
+        expiry_revision: Some(record.revision),
+        node_session_id,
+    })
+}
+
 impl CoordinatorRpc {
+    /// Protocol entrypoint scope belongs here, outside the shared metadata query.
+    pub(super) async fn list_e2b_environment_metadata_rpc(
+        &self,
+        request: Request<pb::ListEnvironmentMetadataRequest>,
+    ) -> std::result::Result<Response<pb::ListEnvironmentMetadataResponse>, Status> {
+        self.query_environment_metadata(request, "e2b", |stored| {
+            stored.spec.compatibility.is_some()
+        })
+        .await
+    }
+
     pub(super) async fn get_environment_control_rpc(
         &self,
         request: Request<pb::GetEnvironmentControlRequest>,
@@ -162,23 +193,13 @@ impl CoordinatorRpc {
             && record.state == EnvironmentState::Running
         {
             client
-                .pause_environment(pb::PauseEnvironmentRequest {
-                    assignment: Some(stored.assignment.clone().try_into()?),
+                .pause_environment(expiry_pause_request(
+                    &stored,
+                    control,
+                    record,
                     caller,
-                    operation_id: format!(
-                        "expiry-{}-{}",
-                        control.expires_at_unix_ms, control.revision
-                    ),
-                    expected_revision: record.revision,
-                    retention: Some(pb::RetentionPolicy {
-                        policy: Some(pb::retention_policy::Policy::TtlSeconds(
-                            control.compatibility.pause_retention_seconds,
-                        )),
-                    }),
-                    timeout_seconds: 30,
-                    expiry_revision: Some(record.revision),
-                    node_session_id: session_id.clone(),
-                })
+                    session_id.clone(),
+                )?)
                 .await
         } else {
             client
@@ -199,5 +220,143 @@ impl CoordinatorRpc {
         let result: EnvironmentRecord = response.record.ok_or(Error::Conflict)?.try_into()?;
         self.commit(result, session_id).await?;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expiry_pause_request;
+    use crate::storage::StoredEnvironment;
+    use adx_core::{
+        environment_control::{EnvironmentCompatibility, EnvironmentControlRecord},
+        lifecycle::{CheckpointStorage, LifecyclePolicy, PausePolicy, RetentionPolicy},
+        Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Resources, Runtime,
+    };
+    use adx_protocol::control as pb;
+
+    fn stored(pause: Option<PausePolicy>) -> StoredEnvironment {
+        let spec = EnvironmentSpec {
+            template_identity: None,
+            compatibility: Some(EnvironmentCompatibility {
+                template_id: "template".into(),
+                envd_version: "v1".into(),
+                envd_access_token: "a".repeat(32),
+                traffic_access_token: "b".repeat(32),
+                allow_public_traffic: false,
+                timeout_seconds: 1,
+                timeout_action: "pause".into(),
+            }),
+            runtime_profile: None,
+            snapshot_id: None,
+            lifecycle: LifecyclePolicy {
+                pause,
+                ..Default::default()
+            },
+            env: Default::default(),
+            id: "environment".into(),
+            tenant_id: "tenant".into(),
+            image: "image".into(),
+            runtime_class: "runc".into(),
+            resources: Resources {
+                cpu_millis: 1,
+                memory_bytes: 1,
+                disk_bytes: 0,
+            },
+            priority: 0,
+            scheduling: Default::default(),
+            execution: Default::default(),
+        };
+        let assignment = Assignment {
+            environment_id: spec.id.clone(),
+            node_id: "node".into(),
+            shard_id: 0,
+            generation: 1,
+            devices: vec![],
+        };
+        StoredEnvironment {
+            user_metadata: Default::default(),
+            resume: None,
+            control: None,
+            failed_since_unix_seconds: None,
+            recovery: None,
+            invalidated: false,
+            spec,
+            assignment,
+            result: None,
+        }
+    }
+
+    fn record(stored: &StoredEnvironment) -> EnvironmentRecord {
+        EnvironmentRecord {
+            failure: None,
+            restart_attempts: 0,
+            restart_pending: false,
+            runtime: Runtime {
+                id: "runtime".into(),
+                ip: None,
+            },
+            spec: stored.spec.clone(),
+            assignment: stored.assignment.clone(),
+            state: EnvironmentState::Running,
+            revision: 7,
+            resources_held: true,
+            checkpoint: None,
+            last_operation: None,
+        }
+    }
+
+    fn request(stored: &StoredEnvironment) -> pb::PauseEnvironmentRequest {
+        let record = record(stored);
+        expiry_pause_request(
+            stored,
+            &EnvironmentControlRecord {
+                environment_id: stored.spec.id.clone(),
+                compatibility: stored.spec.compatibility.clone().expect("fixture"),
+                expires_at_unix_ms: 10,
+                started_at_unix_ms: 1,
+                revision: 2,
+                generation: 1,
+                expiry_claimed: true,
+            },
+            &record,
+            None,
+            "session".into(),
+        )
+        .expect("fixture")
+    }
+
+    #[test]
+    fn expiry_pause_request_preserves_native_pause_policy() {
+        let forever = request(&stored(Some(PausePolicy {
+            retention: RetentionPolicy::Forever,
+            timeout_seconds: 123,
+            storage: CheckpointStorage::Shared,
+        })));
+        assert_eq!(forever.timeout_seconds, 123);
+        assert_eq!(
+            forever.retention.and_then(|r| r.policy),
+            Some(pb::retention_policy::Policy::Forever(true))
+        );
+
+        let ttl = request(&stored(Some(PausePolicy {
+            retention: RetentionPolicy::Ttl { ttl_seconds: 456 },
+            timeout_seconds: 78,
+            storage: CheckpointStorage::Shared,
+        })));
+        assert_eq!(ttl.timeout_seconds, 78);
+        assert_eq!(
+            ttl.retention.and_then(|r| r.policy),
+            Some(pb::retention_policy::Policy::TtlSeconds(456))
+        );
+
+        let default = request(&stored(None));
+        assert_eq!(
+            default.timeout_seconds,
+            PausePolicy::default().timeout_seconds
+        );
+        assert_eq!(
+            default.retention.and_then(|r| r.policy),
+            Some(pb::retention_policy::Policy::TtlSeconds(90_000))
+        );
     }
 }

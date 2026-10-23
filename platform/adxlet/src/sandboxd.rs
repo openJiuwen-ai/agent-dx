@@ -1373,6 +1373,7 @@ mod tests {
             "env":{"ADX_ENVD_PATH":"/usr/local/bin/envd","ADX_ENVD_SHA256":"a".repeat(64),"ADX_ENVD_DEFAULT_USER":"user","ADX_ENVD_DEFAULT_WORKDIR":"/home/user","ADX_ENVD_FREEZE_ON_CHECKPOINT":"false"}
         })).unwrap();
         let mut spec = EnvironmentSpec {
+            template_identity: None,
             compatibility: None,
             runtime_profile: Some(profile.clone()),
             snapshot_id: None,
@@ -1407,8 +1408,6 @@ mod tests {
             allow_public_traffic: true,
             timeout_seconds: 60,
             timeout_action: "delete".into(),
-            pause_retention_seconds: 90_000,
-            metadata: Default::default(),
         });
         let compatible = start_request(&spec, "compat-switch-2", 2, &[], &config).unwrap();
         assert_eq!(compatible.envs["ADX_ENVD_PATH"], "/usr/local/bin/envd");
@@ -1423,6 +1422,7 @@ mod tests {
     #[test]
     fn request_preserves_execution_identity_image_and_resource_units() {
         let spec = EnvironmentSpec {
+            template_identity: None,
             compatibility: None,
             runtime_profile: None,
             snapshot_id: None,
@@ -1482,6 +1482,7 @@ mod tests {
     #[test]
     fn runtime_control_credentials_are_scoped_and_host_secret_is_not_injected() {
         let mut spec = EnvironmentSpec {
+            template_identity: None,
             compatibility: None,
             id: "i".into(),
             tenant_id: "t".into(),
@@ -1544,6 +1545,7 @@ mod tests {
     #[test]
     fn workload_probe_configuration_is_node_owned_and_preserves_init_budget() {
         let workload = EnvironmentSpec {
+            template_identity: None,
             compatibility: None,
             execution: adx_core::execution::ExecutionOptions {
                 inherit_entrypoint: true,

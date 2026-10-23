@@ -10,12 +10,21 @@ pub struct LocalReservation {
 }
 pub(crate) struct LocalHold {
     pub spec: EnvironmentSpec,
+    pub user_metadata: adx_core::metadata::UserMetadata,
     pub token: String,
     pub devices: Vec<DeviceAllocation>,
 }
 impl Adxlet {
     pub fn reserve_local(&self, spec: &EnvironmentSpec) -> Result<LocalReservation> {
+        self.reserve_local_with_metadata(spec, Default::default())
+    }
+    pub fn reserve_local_with_metadata(
+        &self,
+        spec: &EnvironmentSpec,
+        user_metadata: adx_core::metadata::UserMetadata,
+    ) -> Result<LocalReservation> {
         spec.validate()?;
+        adx_core::metadata::validate_user_metadata(&user_metadata)?;
         if self.is_draining() {
             return Err(Error::Unavailable("node draining".into()));
         }
@@ -34,7 +43,7 @@ impl Adxlet {
         }
         let mut holds = self.local_holds.lock().expect("shared state lock poisoned");
         if let Some(hold) = holds.get(&spec.id) {
-            if hold.spec != *spec {
+            if hold.spec != *spec || hold.user_metadata != user_metadata {
                 return Err(Error::Conflict);
             }
             return Ok(LocalReservation {
@@ -64,6 +73,7 @@ impl Adxlet {
             spec.id.clone(),
             LocalHold {
                 spec: spec.clone(),
+                user_metadata,
                 token: token.clone(),
                 devices: devices.clone(),
             },

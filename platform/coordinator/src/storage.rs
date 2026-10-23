@@ -66,6 +66,9 @@ redis.call('HDEL', KEYS[1], ARGV[3])
 return 1
 "#;
 const ATTEMPTS: usize = 32;
+/// Metadata listing is deliberately non-indexed.  Keep the entire Redis hash
+/// below this bound before materializing it for a filtered page.
+pub(crate) const MAX_METADATA_LIST_FIELDS: usize = 4096;
 // Match the API operation replay window without retaining a deleted Environment.
 const DELETED_RECEIPT_TTL: Duration = Duration::from_secs(600);
 
@@ -139,6 +142,9 @@ pub struct ResumeIntent {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredEnvironment {
+    /// Platform-owned user annotations. Node results never supply or replace them.
+    #[serde(default)]
+    pub user_metadata: adx_core::metadata::UserMetadata,
     #[serde(default)]
     pub resume: Option<ResumeIntent>,
     /// Platform-owned mutable control data; node result commits preserve it.
@@ -221,6 +227,7 @@ impl StoredEnvironment {
         })
     }
     fn validate(&self) -> Result<()> {
+        adx_core::metadata::validate_user_metadata(&self.user_metadata)?;
         self.spec.validate()?;
         if let Some(control) = &self.control {
             control.compatibility.validate()?;
@@ -565,6 +572,38 @@ impl RedisStore {
         let mut cmd = redis::cmd("HGETALL");
         cmd.arg(&self.key);
         self.query(cmd).await
+    }
+    async fn raw_bounded(&self, maximum_fields: usize) -> Result<BTreeMap<String, String>> {
+        // HLEN and HGETALL must be one Redis operation: checking first and then
+        // fetching would let a concurrent writer bypass the materialization cap.
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg(
+                r#"
+                if redis.call('HLEN', KEYS[1]) > tonumber(ARGV[1]) then return '' end
+                return cjson.encode(redis.call('HGETALL', KEYS[1]))
+            "#,
+            )
+            .arg(1)
+            .arg(&self.key)
+            .arg(maximum_fields);
+        let encoded: String = self.query(command).await?;
+        if encoded.is_empty() {
+            return Err(Error::Unavailable(
+                "metadata listing exceeds the configured environment scan limit".into(),
+            ));
+        }
+        let fields: Vec<String> = serde_json::from_str(&encoded)
+            .map_err(|_| Error::Unavailable("Redis returned invalid bounded fields".into()))?;
+        if !fields.len().is_multiple_of(2) {
+            return Err(Error::Unavailable(
+                "Redis returned an invalid bounded field list".into(),
+            ));
+        }
+        Ok(fields
+            .chunks_exact(2)
+            .map(|pair| (pair[0].clone(), pair[1].clone()))
+            .collect())
     }
     async fn cas(
         &self,
@@ -960,6 +999,11 @@ impl Session {
         self.header(&raw.get(HEADER).cloned())?;
         snapshot(&raw)
     }
+    pub(crate) async fn metadata_snapshot(&self) -> Result<StoredSnapshot> {
+        let raw = self.store.raw_bounded(MAX_METADATA_LIST_FIELDS).await?;
+        self.header(&raw.get(HEADER).cloned())?;
+        snapshot(&raw)
+    }
     /// Node identity keeps its assigned ShardScheduler. Only first registration scans
     /// ShardScheduler counts; capacity refreshes read/write a single node field.
     pub async fn register(
@@ -1110,6 +1154,16 @@ impl Session {
         spec: EnvironmentSpec,
         assignment: Assignment,
     ) -> Result<StoredEnvironment> {
+        self.reserve_with_metadata(spec, assignment, Default::default())
+            .await
+    }
+    pub async fn reserve_with_metadata(
+        &self,
+        spec: EnvironmentSpec,
+        assignment: Assignment,
+        user_metadata: adx_core::metadata::UserMetadata,
+    ) -> Result<StoredEnvironment> {
+        adx_core::metadata::validate_user_metadata(&user_metadata)?;
         if let Some(id) = &spec.snapshot_id {
             let snapshot = self.get_snapshot(id).await?;
             if snapshot.template.tenant_id != spec.tenant_id
@@ -1123,6 +1177,7 @@ impl Session {
             }
         }
         let record = StoredEnvironment {
+            user_metadata,
             resume: None,
             control: environment_control::seed(&spec, assignment.generation),
             failed_since_unix_seconds: None,
@@ -1146,7 +1201,10 @@ impl Session {
             let mut header = self.header(&header_value)?;
             if let Some(environment_value) = &environment_value {
                 let existing: StoredEnvironment = decode(environment_value)?;
-                return if existing.spec == record.spec && existing.assignment == record.assignment {
+                return if existing.spec == record.spec
+                    && existing.assignment == record.assignment
+                    && existing.user_metadata == record.user_metadata
+                {
                     Ok(existing)
                 } else {
                     Err(Error::Conflict)

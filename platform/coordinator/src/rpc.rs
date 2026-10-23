@@ -6,6 +6,7 @@ mod claims;
 mod cloning;
 mod collection;
 mod environment_control;
+mod metadata;
 mod metrics;
 mod recovery;
 mod resume;
@@ -39,6 +40,7 @@ struct State {
     session: Session,
     scheduler: Coordinator,
     specs: BTreeMap<String, EnvironmentSpec>,
+    pending_metadata: BTreeMap<String, adx_core::metadata::UserMetadata>,
     environments: BTreeMap<String, StoredEnvironment>,
     failed_environments: BTreeSet<String>,
     nodes: BTreeMap<String, StoredNode>,
@@ -151,6 +153,11 @@ impl State {
                 .get(&assignment.environment_id)
                 .ok_or(Error::Conflict)?
                 .clone();
+            let user_metadata = self
+                .pending_metadata
+                .get(&spec.id)
+                .cloned()
+                .unwrap_or_default();
             let recovery_now = recovery::now()?;
             let recovery = self
                 .environments
@@ -162,10 +169,13 @@ impl State {
                     .reserve_recovery(&old.assignment, assignment.clone(), recovery::now()?)
                     .await
             } else {
-                self.session.reserve(spec, assignment.clone()).await
+                self.session
+                    .reserve_with_metadata(spec, assignment.clone(), user_metadata)
+                    .await
             };
             match saved {
                 Ok(record) => {
+                    self.pending_metadata.remove(&record.spec.id);
                     if let Some(source) = record
                         .recovery
                         .as_ref()
@@ -224,6 +234,7 @@ struct Inner {
 struct PendingClaim {
     spec: EnvironmentSpec,
     candidate: LocalClaim,
+    user_metadata: adx_core::metadata::UserMetadata,
     response: oneshot::Sender<Result<ClaimOutcome>>,
 }
 
@@ -250,9 +261,15 @@ async fn run_claim_batches(session: Session, mut requests: mpsc::Receiver<Pendin
         }
         let claims = batch
             .iter()
-            .map(|request| (request.spec.clone(), request.candidate.clone()))
+            .map(|request| {
+                (
+                    request.spec.clone(),
+                    request.candidate.clone(),
+                    request.user_metadata.clone(),
+                )
+            })
             .collect();
-        match session.claim_batch(claims).await {
+        match session.claim_batch_with_metadata(claims).await {
             Ok(outcomes) => {
                 for (request, outcome) in batch.into_iter().zip(outcomes) {
                     let _ = request.response.send(outcome);
@@ -268,12 +285,18 @@ async fn run_claim_batches(session: Session, mut requests: mpsc::Receiver<Pendin
 }
 
 impl Inner {
-    async fn claim(&self, spec: EnvironmentSpec, candidate: LocalClaim) -> Result<ClaimOutcome> {
+    async fn claim(
+        &self,
+        spec: EnvironmentSpec,
+        candidate: LocalClaim,
+        user_metadata: adx_core::metadata::UserMetadata,
+    ) -> Result<ClaimOutcome> {
         let (response, receiver) = oneshot::channel();
         self.claim_sender
             .send(PendingClaim {
                 spec,
                 candidate,
+                user_metadata,
                 response,
             })
             .await
@@ -393,6 +416,7 @@ impl CoordinatorRpc {
                 session,
                 scheduler,
                 specs,
+                pending_metadata: BTreeMap::new(),
                 failed_environments: saved
                     .environments
                     .iter()
@@ -483,6 +507,7 @@ impl CoordinatorRpc {
     async fn create(
         &self,
         spec: EnvironmentSpec,
+        user_metadata: adx_core::metadata::UserMetadata,
         schedule_timeout: Duration,
         create_deadline: adx_transport::deadline::Deadline,
         expected_assignment: Option<adx_core::Assignment>,
@@ -516,7 +541,16 @@ impl CoordinatorRpc {
                 ));
             }
             if let Some(existing) = state.specs.get(&spec.id) {
-                if existing != &spec {
+                if existing != &spec
+                    || state
+                        .pending_metadata
+                        .get(&spec.id)
+                        .is_some_and(|existing| existing != &user_metadata)
+                    || state
+                        .environments
+                        .get(&spec.id)
+                        .is_some_and(|existing| existing.user_metadata != user_metadata)
+                {
                     return Err(Status::already_exists(
                         "environment ID has a different specification",
                     ));
@@ -560,6 +594,9 @@ impl CoordinatorRpc {
                     return Err(status(error));
                 }
                 state.specs.insert(spec.id.clone(), spec.clone());
+                state
+                    .pending_metadata
+                    .insert(spec.id.clone(), user_metadata.clone());
                 let deadline =
                     (tokio::time::Instant::now() + schedule_timeout).min(create_deadline.instant());
                 state.scheduling_deadlines.insert(spec.id.clone(), deadline);
@@ -746,6 +783,7 @@ impl CoordinatorRpc {
             return Ok(false);
         }
         state.specs.remove(&spec.id);
+        state.pending_metadata.remove(&spec.id);
         state.scheduling_deadlines.remove(&spec.id);
         if let Some(snapshot_id) = &spec.snapshot_id {
             state
@@ -875,6 +913,7 @@ impl CoordinatorRpc {
             state.environments.remove(&accepted.spec.id);
             state.failed_environments.remove(&accepted.spec.id);
             state.specs.remove(&accepted.spec.id);
+            state.pending_metadata.remove(&accepted.spec.id);
             state.scheduling_deadlines.remove(&accepted.spec.id);
         }
         self.0.changed.notify_waiters();
@@ -924,6 +963,24 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         request: Request<pb::GetEnvironmentControlRequest>,
     ) -> std::result::Result<Response<pb::EnvironmentControlRecord>, Status> {
         self.get_environment_control_rpc(request).await
+    }
+    async fn get_environment_metadata(
+        &self,
+        request: Request<pb::GetEnvironmentMetadataRequest>,
+    ) -> std::result::Result<Response<pb::EnvironmentMetadataRecord>, Status> {
+        self.get_environment_metadata_rpc(request).await
+    }
+    async fn list_environment_metadata(
+        &self,
+        request: Request<pb::ListEnvironmentMetadataRequest>,
+    ) -> std::result::Result<Response<pb::ListEnvironmentMetadataResponse>, Status> {
+        self.list_environment_metadata_rpc(request).await
+    }
+    async fn list_e2b_environment_metadata(
+        &self,
+        request: Request<pb::ListEnvironmentMetadataRequest>,
+    ) -> std::result::Result<Response<pb::ListEnvironmentMetadataResponse>, Status> {
+        self.list_e2b_environment_metadata_rpc(request).await
     }
     async fn update_environment_control(
         &self,
@@ -1131,6 +1188,8 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             .map(TryInto::try_into)
             .transpose()
             .map_err(status)?;
+        let user_metadata = create.user_metadata.clone().into_iter().collect();
+        adx_core::metadata::validate_user_metadata(&user_metadata).map_err(status)?;
         let prepared = self.prepare_local(&node, request).await?;
         let spec = prepared
             .spec
@@ -1140,7 +1199,13 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
         let service = self.clone();
         tokio::spawn(trace.run(async move {
             service
-                .create(spec, schedule_timeout, deadline, expected_assignment)
+                .create(
+                    spec,
+                    user_metadata,
+                    schedule_timeout,
+                    deadline,
+                    expected_assignment,
+                )
                 .await
                 .map(Response::new)
         }))
@@ -1387,6 +1452,8 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     return Err(Status::permission_denied("Frontend caller required"));
                 }
                 let r = request.into_inner();
+                let user_metadata = r.user_metadata.clone().into_iter().collect();
+                adx_core::metadata::validate_user_metadata(&user_metadata).map_err(status)?;
                 let schedule_timeout =
                     scheduling_timeout(r.schedule_timeout_seconds).ok_or_else(|| {
                         Status::invalid_argument("schedule timeout must not exceed 24 hours")
@@ -1414,7 +1481,13 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 tokio::spawn(
                     adx_observability::trace::Trace::child("coordinator.create").run(async move {
                         service
-                            .create(spec, schedule_timeout, deadline, expected_assignment)
+                            .create(
+                                spec,
+                                user_metadata,
+                                schedule_timeout,
+                                deadline,
+                                expected_assignment,
+                            )
                             .await
                             .map(Response::new)
                     }),
@@ -1572,6 +1645,7 @@ mod reconciliation_tests {
             devices: vec![],
         };
         let mut environment = StoredEnvironment {
+            user_metadata: Default::default(),
             resume: None,
             control: None,
             failed_since_unix_seconds: None,

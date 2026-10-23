@@ -444,22 +444,6 @@ mod tests {
     }
 
     #[test]
-    fn template_alias_resolves_once_to_immutable_base_template() {
-        let catalog: crate::e2b::TemplateCatalog = serde_json::from_value(json!({"templates": {
-            "base": {"runtimeProfileRef":"e2b-fc-v1", "defaultUser":"user",
-              "defaultWorkdir":"/home/user", "cpuMillicores":1000, "memoryMiB":512,
-              "capabilities":["envd", "memoryCheckpoint", "reusableSnapshot"]},
-            "adx-e2b-base": {"runtimeProfileRef":"unused", "defaultUser":"unused",
-              "defaultWorkdir":"/unused", "cpuMillicores":1, "memoryMiB":1,
-              "aliasOf":"base"}
-        }}))
-        .unwrap();
-        let (template, resolved) = catalog.resolve("adx-e2b-base").unwrap();
-        assert_eq!(resolved, "base");
-        assert_eq!(template.runtime_profile_ref, "e2b-fc-v1");
-    }
-
-    #[test]
     fn e2b_errors_do_not_use_the_adx_envelope_shape() {
         let value = serde_json::to_value(ErrorBody {
             code: 400,

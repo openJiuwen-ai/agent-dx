@@ -48,6 +48,9 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
         Ok(Response::new(state.owner.clone()))
     }
 }, [
+    get_environment_metadata(GetEnvironmentMetadataRequest) -> EnvironmentMetadataRecord,
+    list_environment_metadata(ListEnvironmentMetadataRequest) -> ListEnvironmentMetadataResponse,
+    list_e2b_environment_metadata(ListEnvironmentMetadataRequest) -> ListEnvironmentMetadataResponse,
     ensure_running(EnsureRunningRequest) -> GetEnvironmentResponse,
     retire_dormant(GetEnvironmentRequest) -> EnvironmentResult,
     get_environment_control(GetEnvironmentControlRequest) -> EnvironmentControlRecord,
@@ -195,11 +198,13 @@ impl Fixture {
             "listen":"127.0.0.1:0", "coordinator_address": address,
             "internal_security":"network", "ingress_mode":"standalone",
             "rpc_timeout_seconds":2, "cache_entries":8, "auth_cache_ttl_seconds":1,
-            "e2b":{"domain":"sandbox.test", "envdVersion":"0.9.0", "runtimeProfiles":{"e2b":{
+            "e2b":{"domain":"sandbox.test", "envdVersion":"0.9.0",
+            "templates":{"base":{"name":"base","version":"1"}}},
+            "runtime_profile":{
                 "rootfs":{"runtime_class":"runsc","type":"local","path":"/rootfs","readonly":true},
                 "bootstrap":{"type":"erofs","root":"/rootfs","target":"/rootfs","entrypoint":["/rootfs/init"]},
-                "env":{"ADX_ENVD_PATH":"/usr/local/bin/envd","ADX_ENVD_SHA256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
-            }}, "templates":{"templates":{"base":{"runtimeProfileRef":"e2b","defaultUser":"user","defaultWorkdir":"/workspace","cpuMillicores":1000,"memoryMiB":512,"capabilities":["envd"]}}}}
+                "env":{"ADX_ENVD_PATH":"/usr/local/bin/envd","ADX_ENVD_SHA256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ADX_ENVD_DEFAULT_USER":"user","ADX_ENVD_DEFAULT_WORKDIR":"/workspace"}
+            }
         })).unwrap();
         let clients = Clients::new(config).unwrap();
         Self {

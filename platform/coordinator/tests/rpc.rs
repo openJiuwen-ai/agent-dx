@@ -97,6 +97,7 @@ async fn channel(address: std::net::SocketAddr, name: &str) -> Channel {
 }
 fn spec(id: &str) -> EnvironmentSpec {
     EnvironmentSpec {
+        template_identity: None,
         compatibility: None,
         runtime_profile: None,
         snapshot_id: None,
@@ -130,6 +131,7 @@ fn create(id: &str) -> pb::CreateEnvironmentRequest {
         create_timeout_seconds: 90,
         create_deadline_unix_millis: 0,
         expected_assignment: None,
+        user_metadata: Default::default(),
     }
 }
 struct Backend {
@@ -601,15 +603,19 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     );
     let mut expires = create("queue-deadline");
     expires.schedule_timeout_seconds = 1;
+    expires.user_metadata = [("attempt".into(), "expired".into())].into_iter().collect();
+    let mut conflicting = create("queue-deadline");
+    conflicting.user_metadata = [("attempt".into(), "conflict".into())]
+        .into_iter()
+        .collect();
+    let mut conflicting_client = frontend.clone();
     let started = tokio::time::Instant::now();
-    assert_eq!(
-        frontend
-            .create_environment(expires)
-            .await
-            .unwrap_err()
-            .code(),
-        tonic::Code::DeadlineExceeded
-    );
+    let (expired, conflict) = tokio::join!(frontend.create_environment(expires), async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        conflicting_client.create_environment(conflicting).await
+    });
+    assert_eq!(expired.unwrap_err().code(), tonic::Code::DeadlineExceeded);
+    assert_eq!(conflict.unwrap_err().code(), tonic::Code::AlreadyExists);
     assert!(started.elapsed() >= Duration::from_millis(900));
     assert_eq!(
         session.get("queue-deadline").await.unwrap_err(),
@@ -818,6 +824,244 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
             .unwrap()
             .is_empty());
     }
+
+    // Run metadata capacity/corruption probes after the public API fixture, whose
+    // contract requires an empty scheduler and an unmodified storage schema.
+    let mut retry_expired = create("queue-deadline");
+    retry_expired.user_metadata = [("attempt".into(), "replacement".into())]
+        .into_iter()
+        .collect();
+    frontend.create_environment(retry_expired).await.unwrap();
+    assert_eq!(
+        session.get("queue-deadline").await.unwrap().user_metadata["attempt"],
+        "replacement"
+    );
+
+    // Metadata is platform-owned: a native Environment has no compatibility
+    // record, yet is created, read, filtered, and paginated through Coordinator.
+    let capacity = Resources {
+        cpu_millis: 5_000,
+        memory_bytes: 8 * 1024 * 1024,
+        disk_bytes: 0,
+    };
+    manager
+        .update_capacity(capacity, Duration::from_secs(60))
+        .unwrap();
+    let mut metadata_register = register.clone();
+    metadata_register.heartbeat_sequence += 2;
+    metadata_register.capacity = Some(capacity.into());
+    node_coordinator
+        .register_node(metadata_register.clone())
+        .await
+        .unwrap();
+
+    for id in ["metadata-a", "metadata-b", "metadata-c"] {
+        let mut request = create(id);
+        request.user_metadata = [
+            ("project".into(), "alpha".into()),
+            ("group".into(), "core".into()),
+        ]
+        .into_iter()
+        .collect();
+        frontend.create_environment(request).await.unwrap();
+        assert!(session.get(id).await.unwrap().spec.compatibility.is_none());
+    }
+    let mut other_tenant = create("metadata-other");
+    other_tenant.spec.as_mut().unwrap().tenant_id = "other".into();
+    other_tenant.caller.as_mut().unwrap().tenant_id = "other".into();
+    other_tenant.user_metadata = [
+        ("project".into(), "alpha".into()),
+        ("group".into(), "core".into()),
+    ]
+    .into_iter()
+    .collect();
+    frontend.create_environment(other_tenant).await.unwrap();
+
+    let metadata_filter: std::collections::HashMap<String, String> = [
+        ("project".into(), "alpha".into()),
+        ("group".into(), "core".into()),
+    ]
+    .into_iter()
+    .collect();
+    let metadata_caller = caller();
+    let first_page = frontend
+        .list_environment_metadata(pb::ListEnvironmentMetadataRequest {
+            caller: metadata_caller.clone(),
+            metadata_filter: metadata_filter.clone(),
+            states: vec![pb::EnvironmentState::Running as i32],
+            cursor: String::new(),
+            limit: 2,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(first_page.records.len(), 2);
+    assert!(!first_page.next_cursor.is_empty());
+    assert!(first_page
+        .records
+        .iter()
+        .all(|record| record.environment_id != "metadata-other"));
+    let second_page = frontend
+        .list_environment_metadata(pb::ListEnvironmentMetadataRequest {
+            caller: metadata_caller.clone(),
+            metadata_filter: metadata_filter.clone(),
+            states: vec![pb::EnvironmentState::Running as i32],
+            cursor: first_page.next_cursor.clone(),
+            limit: 2,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(second_page.records.len(), 1);
+    assert_eq!(second_page.records[0].environment_id, "metadata-c");
+    assert!(second_page.next_cursor.is_empty());
+    assert_eq!(
+        frontend
+            .get_environment_metadata(pb::GetEnvironmentMetadataRequest {
+                id: "metadata-a".into(),
+                caller: metadata_caller.clone(),
+            })
+            .await
+            .unwrap()
+            .into_inner()
+            .user_metadata["project"],
+        "alpha"
+    );
+    let mut changed_filter = metadata_filter.clone();
+    changed_filter.insert("group".into(), "different".into());
+    assert_eq!(
+        frontend
+            .list_environment_metadata(pb::ListEnvironmentMetadataRequest {
+                caller: metadata_caller,
+                metadata_filter: changed_filter,
+                states: vec![pb::EnvironmentState::Running as i32],
+                cursor: first_page.next_cursor,
+                limit: 2,
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+
+    // E2B list ownership is an entrypoint scope. It must not narrow the generic query.
+    for id in ["metadata-e2b-a", "metadata-e2b-b"] {
+        let mut e2b_spec = spec(id);
+        e2b_spec.compatibility = Some(adx_core::environment_control::EnvironmentCompatibility {
+            template_id: "base".into(),
+            envd_version: "0.9.0".into(),
+            envd_access_token: "a".repeat(32),
+            traffic_access_token: "b".repeat(32),
+            allow_public_traffic: true,
+            timeout_seconds: 60,
+            timeout_action: "delete".into(),
+        });
+        session
+            .claim_with_metadata(
+                e2b_spec,
+                &adx_coordinator::storage::LocalClaim {
+                    node_id: "node".into(),
+                    node_session_id: "boot-1".into(),
+                    devices: vec![],
+                },
+                [("project".into(), "alpha".into())].into_iter().collect(),
+            )
+            .await
+            .unwrap();
+    }
+    let scoped_query = || pb::ListEnvironmentMetadataRequest {
+        caller: caller(),
+        metadata_filter: [("project".into(), "alpha".into())].into_iter().collect(),
+        states: vec![],
+        cursor: String::new(),
+        limit: 1,
+    };
+    let e2b_page = frontend
+        .list_e2b_environment_metadata(scoped_query())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(e2b_page.records[0].environment_id, "metadata-e2b-a");
+    assert!(!e2b_page.next_cursor.is_empty());
+    let mut continuation = scoped_query();
+    continuation.cursor = e2b_page.next_cursor.clone();
+    let e2b_last = frontend
+        .list_e2b_environment_metadata(continuation.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(e2b_last.records[0].environment_id, "metadata-e2b-b");
+    assert!(e2b_last.next_cursor.is_empty());
+    assert_eq!(
+        frontend
+            .list_environment_metadata(continuation)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+    let native_page = frontend
+        .list_environment_metadata(scoped_query())
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(native_page.records[0].environment_id, "metadata-a");
+    let mut wrong_scope = scoped_query();
+    wrong_scope.cursor = native_page.next_cursor;
+    assert_eq!(
+        frontend
+            .list_e2b_environment_metadata(wrong_scope)
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::InvalidArgument
+    );
+
+    for index in 0..17 {
+        let mut request = create(&format!("metadata-budget-{index:02}"));
+        request.user_metadata = std::iter::once(("set".into(), "response-budget".into()))
+            .chain((0..15).map(|entry| (format!("{entry:03}"), "v".repeat(4093))))
+            .collect();
+        frontend.create_environment(request).await.unwrap();
+    }
+    let budget_page = frontend
+        .list_environment_metadata(pb::ListEnvironmentMetadataRequest {
+            caller: caller(),
+            metadata_filter: [("set".into(), "response-budget".into())]
+                .into_iter()
+                .collect(),
+            states: vec![pb::EnvironmentState::Running as i32],
+            cursor: String::new(),
+            limit: 100,
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(budget_page.records.len() < 17);
+    assert!(!budget_page.next_cursor.is_empty());
+
+    let client = redis::Client::open(redis.url.as_str()).unwrap();
+    let mut raw = client.get_multiplexed_async_connection().await.unwrap();
+    let mut command = redis::cmd("HSET");
+    command.arg("adx:{test}:control:v1");
+    for index in 0..4097 {
+        command.arg(format!("metadata-scan-{index}")).arg("x");
+    }
+    let _: usize = command.query_async(&mut raw).await.unwrap();
+    assert_eq!(
+        frontend
+            .list_environment_metadata(pb::ListEnvironmentMetadataRequest {
+                caller: caller(),
+                metadata_filter: Default::default(),
+                states: vec![],
+                cursor: String::new(),
+                limit: 1,
+            })
+            .await
+            .unwrap_err()
+            .code(),
+        tonic::Code::Unavailable
+    );
 }
 
 #[tokio::test]

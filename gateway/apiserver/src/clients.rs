@@ -363,6 +363,48 @@ impl Clients {
         )
         .await
     }
+    pub async fn environment_metadata(
+        &self,
+        id: &str,
+        caller: &pb::CallerContext,
+    ) -> Result<pb::EnvironmentMetadataRecord, Status> {
+        let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
+            self.coordinator().await?,
+        );
+        self.rpc(
+            "apiserver.get_environment_metadata",
+            client.get_environment_metadata(trace::inject(pb::GetEnvironmentMetadataRequest {
+                id: id.into(),
+                caller: Some(caller.clone()),
+            })),
+        )
+        .await
+    }
+    pub async fn list_e2b_environment_metadata(
+        &self,
+        caller: &pb::CallerContext,
+        metadata_filter: std::collections::HashMap<String, String>,
+        states: Vec<i32>,
+        cursor: String,
+        limit: u32,
+    ) -> Result<pb::ListEnvironmentMetadataResponse, Status> {
+        let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
+            self.coordinator().await?,
+        );
+        self.rpc(
+            "apiserver.list_e2b_environment_metadata",
+            client.list_e2b_environment_metadata(trace::inject(
+                pb::ListEnvironmentMetadataRequest {
+                    caller: Some(caller.clone()),
+                    metadata_filter,
+                    states,
+                    cursor,
+                    limit,
+                },
+            )),
+        )
+        .await
+    }
     pub async fn update_environment_control(
         &self,
         id: &str,

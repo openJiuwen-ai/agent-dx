@@ -14,15 +14,18 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use http_body_util::{BodyExt, Full};
 use hyper::{body::Incoming, Request, Response};
 use serde_json::{json, Value};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Arc,
+};
 use tonic::{Code, Status};
 
 const BODY_LIMIT: usize = 64 * 1024;
 const DEFAULT_TIMEOUT_SECONDS: u64 = 300;
 struct ListQuery {
     states: Vec<String>,
-    metadata: HashMap<String, String>,
-    offset: usize,
+    metadata: BTreeMap<String, String>,
+    cursor: String,
     limit: usize,
 }
 fn list_query(query: &str) -> Result<ListQuery, Status> {
@@ -45,11 +48,7 @@ fn list_query(query: &str) -> Result<ListQuery, Status> {
     if !(1..=100).contains(&limit) {
         return Err(Status::invalid_argument("invalid limit"));
     }
-    let offset = values.get("nextToken").map_or(Ok(0), |value| {
-        value
-            .parse::<usize>()
-            .map_err(|_| Status::invalid_argument("invalid nextToken"))
-    })?;
+    let cursor = values.get("nextToken").cloned().unwrap_or_default();
     let states = values.get("state").map_or_else(
         || Ok(vec!["running".into()]),
         |value| {
@@ -66,7 +65,7 @@ fn list_query(query: &str) -> Result<ListQuery, Status> {
         },
     )?;
     let metadata = values.get("metadata").map_or_else(
-        || Ok(HashMap::new()),
+        || Ok(BTreeMap::new()),
         |value| {
             if !value.is_empty() && value.split('&').any(|entry| !entry.contains('=')) {
                 return Err(Status::invalid_argument("invalid metadata"));
@@ -88,7 +87,7 @@ fn list_query(query: &str) -> Result<ListQuery, Status> {
     Ok(ListQuery {
         states,
         metadata,
-        offset,
+        cursor,
         limit,
     })
 }
@@ -143,189 +142,76 @@ async fn create(
 ) -> Result<Value, Status> {
     let input: CreateRequest = decode(request).await?;
     input.validate().map_err(validation)?;
-    let (network, public_traffic) = input.network_configuration().map_err(validation)?;
-    let config = api
-        .clients
-        .config
-        .e2b
-        .as_ref()
-        .ok_or_else(|| Status::unimplemented("E2B API is disabled"))?;
-    let resolved = config.templates.resolve(&input.template_id);
-    let snapshot = if resolved.is_err() {
-        let mut client = pb::snapshot_service_client::SnapshotServiceClient::new(
-            api.clients.coordinator().await?,
-        );
-        Some(
-            Box::pin(api.clients.rpc(
-                "apiserver.e2b_create_snapshot_source",
-                client.get_snapshot(trace::inject(pb::GetSnapshotRequest {
-                    id: input.template_id.clone(),
-                    caller: Some(caller.clone()),
-                    node_session_id: String::new(),
-                })),
-            ))
-            .await?,
-        )
-    } else {
-        None
-    };
-    let snapshot_template_id = snapshot
-        .as_ref()
-        .and_then(|snapshot| snapshot.template.as_ref())
-        .and_then(|spec| spec.compatibility.as_ref())
-        .map(|compatibility| compatibility.template_id.as_str());
-    let (template, template_id) = match snapshot_template_id {
-        Some(template_id) => config.templates.resolve(template_id).map_err(validation)?,
-        None => resolved.map_err(|error| {
-            if snapshot.is_some() {
-                Status::not_found("snapshot is not E2B-compatible")
-            } else {
-                validation(error)
-            }
-        })?,
-    };
-    let mut profile = config.runtime_profile(template).map_err(validation)?;
-    template.require_capability("envd").map_err(validation)?;
-    if snapshot.is_some() {
-        template
-            .require_capability("reusableSnapshot")
-            .map_err(validation)?;
-    }
-    profile.env.insert(
-        "ADX_ENVD_DEFAULT_USER".into(),
-        template.default_user.clone(),
-    );
-    profile.env.insert(
-        "ADX_ENVD_DEFAULT_WORKDIR".into(),
-        template.default_workdir.clone(),
-    );
-    let id = format!("e2b-{}", uuid::Uuid::new_v4());
-    let timeout = input.timeout.unwrap_or(DEFAULT_TIMEOUT_SECONDS);
-    let allow_public_traffic = public_traffic.unwrap_or(template.allow_public_traffic);
-    let timeout_action = if input.auto_pause == Some(true) {
-        "pause".into()
-    } else {
-        template.timeout_action.clone()
-    };
-    if timeout_action == "pause" {
-        template
-            .require_capability("memoryCheckpoint")
-            .map_err(validation)?;
-    }
-    let snapshot_spec = snapshot
-        .as_ref()
-        .and_then(|snapshot| snapshot.template.as_ref());
-    let resources = snapshot_spec
-        .and_then(|spec| spec.resources)
-        .unwrap_or(pb::Resources {
-            cpu_millis: template.cpu_millicores,
-            memory_bytes: template
-                .memory_mib
-                .checked_mul(1_048_576)
-                .ok_or_else(|| Status::invalid_argument("template memory overflows"))?,
-            disk_bytes: 0,
-        });
-    let runtime_class = snapshot_spec
-        .map(|spec| spec.runtime_class.clone())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| profile.rootfs.runtime_class.clone());
-    let mut runtime_profile = snapshot_spec
-        .and_then(|spec| spec.runtime_profile.clone())
-        .unwrap_or_else(|| profile.clone().into());
-    runtime_profile.env.insert(
-        "ADX_ENVD_DEFAULT_USER".into(),
-        template.default_user.clone(),
-    );
-    runtime_profile.env.insert(
-        "ADX_ENVD_DEFAULT_WORKDIR".into(),
-        template.default_workdir.clone(),
-    );
-    let spec = pb::EnvironmentSpec {
-        id: id.clone(),
-        tenant_id: caller.tenant_id.clone(),
-        runtime_class,
-        runtime_profile: Some(runtime_profile),
-        resources: Some(resources),
-        lifecycle: Some(pb::LifecyclePolicy {
-            idle_timeout_seconds: 0,
-            restart: None,
-            ..Default::default()
-        }),
-        env: input.env_vars.into_iter().collect(),
-        compatibility: Some(pb::EnvironmentCompatibility {
-            template_id,
-            envd_version: config.envd_version.clone(),
-            envd_access_token: uuid::Uuid::new_v4().to_string(),
-            traffic_access_token: uuid::Uuid::new_v4().to_string(),
-            allow_public_traffic,
-            timeout_seconds: timeout,
-            timeout_action,
-            pause_retention_seconds: template.pause_retention_seconds,
-            metadata: input.metadata.into_iter().collect(),
-        }),
-        snapshot_id: snapshot.as_ref().map(|value| value.id.clone()),
-        execution: Some(pb::ExecutionOptions {
-            network: network.map(Into::into),
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    // Coordinator canonicalizes Environment specs through adx-core before it
-    // publishes them. Apply that same validated round trip before recording
-    // this create identity, so replay comparison sees scheduling and sandbox
-    // defaults in their durable form.
-    let spec = adx_core::EnvironmentSpec::try_from(spec)
-        .map(pb::EnvironmentSpec::from)
-        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let spec = Box::pin(super::templates::create_spec(api, &input, caller)).await?;
+    let id = spec.id.clone();
     let request_id = operation_id("create");
-    Box::pin(
-        api.environment_service
-            .create(spec, json!({"e2b":true}), &request_id, caller),
-    )
+    Box::pin(api.environment_service.create_with_metadata(
+        spec,
+        json!({"e2b":true}),
+        &request_id,
+        caller,
+        input.metadata.clone(),
+    ))
     .await?;
     let control = Box::pin(api.clients.environment_control(&id, caller)).await?;
     Box::pin(sandbox_detail(api, &control, caller)).await
 }
 async fn list(api: &Api, query: &str, caller: &pb::CallerContext) -> Result<Value, Status> {
     let query = list_query(query)?;
-    let mut records = api.clients.list_environment_controls(caller).await?;
-    records.sort_by(|left, right| left.environment_id.cmp(&right.environment_id));
-    let mut matches = Vec::new();
-    for record in records {
-        let mut value = match sandbox_detail(api, &record, caller).await {
+    let states = query
+        .states
+        .iter()
+        .map(|state| match state.as_str() {
+            "running" => Ok(pb::EnvironmentState::Running as i32),
+            "paused" => Ok(pb::EnvironmentState::Paused as i32),
+            _ => Err(Status::invalid_argument("invalid state")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let page = api
+        .clients
+        .list_e2b_environment_metadata(
+            caller,
+            query.metadata.into_iter().collect(),
+            states,
+            query.cursor,
+            u32::try_from(query.limit).map_err(|_| Status::invalid_argument("invalid limit"))?,
+        )
+        .await?;
+    let mut items = Vec::new();
+    for metadata in page.records {
+        let control = match api
+            .clients
+            .environment_control(&metadata.environment_id, caller)
+            .await
+        {
+            Ok(control) => control,
+            // A metadata row can race deletion or control removal after the platform page was read.
+            Err(status) if matches!(status.code(), Code::FailedPrecondition | Code::NotFound) => {
+                continue
+            }
+            Err(status) => return Err(status),
+        };
+        let mut value = match sandbox_detail_with_metadata(
+            api,
+            &control,
+            &metadata.user_metadata,
+            caller,
+        )
+        .await
+        {
             Ok(value) => value,
             Err(status) if matches!(status.code(), Code::FailedPrecondition | Code::NotFound) => {
                 continue
             }
             Err(status) => return Err(status),
         };
-        let state = value["state"].as_str().unwrap_or_default();
-        let metadata = value["metadata"].as_object();
-        if !query.states.iter().any(|expected| expected == state)
-            || query.metadata.iter().any(|(key, expected)| {
-                metadata
-                    .and_then(|value| value.get(key))
-                    .and_then(Value::as_str)
-                    != Some(expected.as_str())
-            })
-        {
-            continue;
-        }
         if let Some(value) = value.as_object_mut() {
             value.remove("envdAccessToken");
             value.remove("trafficAccessToken");
         }
-        matches.push(value);
+        items.push(value);
     }
-    let next_offset = query.offset.saturating_add(query.limit);
-    let next = if next_offset < matches.len() {
-        next_offset.to_string()
-    } else {
-        String::new()
-    };
-    Ok(
-        json!({"items":matches.into_iter().skip(query.offset).take(query.limit).collect::<Vec<_>>(),"nextToken":next}),
-    )
+    Ok(json!({"items":items,"nextToken":page.next_cursor}))
 }
 async fn action(
     api: &Api,
@@ -374,26 +260,17 @@ async fn action(
         ("POST", "sandbox", "pause") => {
             let input = pause_request(body(request.into_body(), BODY_LIMIT).await?)?;
             input.validate().map_err(validation)?;
-            let template = sandbox_template(api, id, caller).await?;
-            template
-                .require_capability("memoryCheckpoint")
-                .map_err(validation)?;
+            api.clients
+                .environment_control(id, caller)
+                .await?
+                .compatibility
+                .ok_or_else(|| Status::not_found("sandbox is not E2B-compatible"))?;
             api.environment_service
-                .execute(
-                    Kind::Pause,
-                    id,
-                    &operation_id("pause"),
-                    json!({"retention":{"ttlSeconds":template.pause_retention_seconds}}),
-                    caller,
-                )
+                .execute(Kind::Pause, id, &operation_id("pause"), json!({}), caller)
                 .await?;
             Ok((204, Value::Null))
         }
         ("POST", "sandbox", "snapshots") => {
-            sandbox_template(api, id, caller)
-                .await?
-                .require_capability("reusableSnapshot")
-                .map_err(validation)?;
             let value = body(request.into_body(), BODY_LIMIT).await?;
             if !value.is_object() {
                 return Err(Status::invalid_argument(
@@ -406,6 +283,11 @@ async fn action(
                 ))
             })?;
             input.validate().map_err(validation)?;
+            api.clients
+                .environment_control(id, caller)
+                .await?
+                .compatibility
+                .ok_or_else(|| Status::not_found("sandbox is not E2B-compatible"))?;
             let value = api
                 .environment_service
                 .execute(
@@ -561,28 +443,6 @@ async fn snapshots(api: &Api, query: &str, caller: &pb::CallerContext) -> Result
         .collect::<Vec<_>>();
     Ok(json!({"snapshots": snapshots, "nextToken":page.next_page_token}))
 }
-async fn sandbox_template(
-    api: &Api,
-    id: &str,
-    caller: &pb::CallerContext,
-) -> Result<super::Template, Status> {
-    let control = api.clients.environment_control(id, caller).await?;
-    let compatibility = control
-        .compatibility
-        .ok_or_else(|| Status::not_found("sandbox is not E2B-compatible"))?;
-    let config = api
-        .clients
-        .config
-        .e2b
-        .as_ref()
-        .ok_or_else(|| Status::unimplemented("E2B API is disabled"))?;
-    Ok(config
-        .templates
-        .resolve(&compatibility.template_id)
-        .map_err(validation)?
-        .0
-        .clone())
-}
 async fn delete_snapshot(api: &Api, id: &str, caller: &pb::CallerContext) -> Result<(), Status> {
     let mut client =
         pb::snapshot_service_client::SnapshotServiceClient::new(api.clients.coordinator().await?);
@@ -620,6 +480,19 @@ async fn sandbox_detail(
     control: &pb::EnvironmentControlRecord,
     caller: &pb::CallerContext,
 ) -> Result<Value, Status> {
+    let metadata = api
+        .clients
+        .environment_metadata(&control.environment_id, caller)
+        .await?;
+    sandbox_detail_with_metadata(api, control, &metadata.user_metadata, caller).await
+}
+
+async fn sandbox_detail_with_metadata(
+    api: &Api,
+    control: &pb::EnvironmentControlRecord,
+    metadata: &std::collections::HashMap<String, String>,
+    caller: &pb::CallerContext,
+) -> Result<Value, Status> {
     let owner = api
         .clients
         .owner(&control.environment_id, caller, false)
@@ -652,7 +525,7 @@ async fn sandbox_detail(
         .domain
         .clone();
     Ok(
-        json!({"templateID":compatibility.template_id,"sandboxID":control.environment_id,"clientID":"adx","envdVersion":compatibility.envd_version,"state":state,"startedAt":rfc3339(control.started_at_unix_ms),"endAt":rfc3339(control.expires_at_unix_ms),"cpuCount":resources.cpu_millis / 1000,"memoryMB":resources.memory_bytes / 1_048_576,"diskSizeMB":resources.disk_bytes / 1_048_576,"metadata":compatibility.metadata,"envdAccessToken":compatibility.envd_access_token,"trafficAccessToken":compatibility.traffic_access_token,"domain":domain}),
+        json!({"templateID":compatibility.template_id,"sandboxID":control.environment_id,"clientID":"adx","envdVersion":compatibility.envd_version,"state":state,"startedAt":rfc3339(control.started_at_unix_ms),"endAt":rfc3339(control.expires_at_unix_ms),"cpuCount":resources.cpu_millis / 1000,"memoryMB":resources.memory_bytes / 1_048_576,"diskSizeMB":resources.disk_bytes / 1_048_576,"metadata":metadata,"envdAccessToken":compatibility.envd_access_token,"trafficAccessToken":compatibility.traffic_access_token,"domain":domain}),
     )
 }
 fn rfc3339(milliseconds: u64) -> String {
@@ -803,18 +676,14 @@ mod tests {
 
     #[test]
     fn list_query_defaults_and_rejects_malformed_cursors() {
-        let query =
-            list_query("state=running,paused&metadata=team%3Dcore&limit=2&nextToken=3").unwrap();
+        let query = list_query(
+            "state=running,paused&metadata=team%3Dcore&limit=2&nextToken=platform-cursor",
+        )
+        .unwrap();
         assert_eq!(query.states, ["running", "paused"]);
         assert_eq!(query.metadata["team"], "core");
-        assert_eq!((query.limit, query.offset), (2, 3));
-        for query in [
-            "limit=0",
-            "limit=101",
-            "nextToken=bad",
-            "state=deleted",
-            "metadata=bad",
-        ] {
+        assert_eq!((query.limit, query.cursor.as_str()), (2, "platform-cursor"));
+        for query in ["limit=0", "limit=101", "state=deleted", "metadata=bad"] {
             assert!(list_query(query).is_err());
         }
     }

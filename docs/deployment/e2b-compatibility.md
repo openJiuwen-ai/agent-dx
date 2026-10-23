@@ -8,29 +8,38 @@
 
 sandboxd 必须使用 `third_party/sandboxd/source.json` 的固定基线和 `patches`，不能复用未打补丁的缓存后端。`build/e2e/build_backend.py` 在临时副本打补丁并记录补丁摘要，原始 checkout 保持不变。Firecracker 恢复先 load（不运行），更新 MMDS 数据，再 resume；元数据写入失败时不 resume。
 
-在 `adxctl` deployment 的 API Server `config` 中加入以下 `e2b` 部分；路径、摘要和域名替换为实际部署值。`templates.templates` 是当前配置结构。节点的 `runtime_profile` 必须与所选 profile 的 rootfs、bootstrap、env 完全一致，包括默认用户和目录。当前每个 worker deployment 只配置一个受信任 profile，应为模板准备匹配的 worker；profile 不是就绪检查机制。
+E2B 入口复用原生 Agent 模板。先在每个租户内通过现有 Agent 模板发布接口发布固定 `name/version`；镜像使用完整 OCI digest。API Server 设置已有 `ADX_AGENT_CONFIG`，可连接独立 Activator 或使用嵌入配置；未提供模板源时 E2B 启动失败。模板查询不会激活 AgentBinding，也不直接读取 Agent 存储。
+
+`adxctl` deployment 的 API Server `config` 使用以下结构。`runtime_profile` 与节点部署共用；`e2b.templates` 只保存原生模板引用，不复制资源、用户、目录或能力白名单。示例摘要需要替换为发布制品的实际值。
 
 ```json
 {
+  "runtime_profile": {
+    "rootfs": {"runtime_class": "runc", "type": "local", "path": "/opt/adx/e2b-v1/runtime/adx-runtime-rootfs.img", "readonly": false},
+    "bootstrap": {"type": "erofs", "root": "/opt/adx/e2b-v1/runtime/adx-runtime-rootfs.img", "target": "/__adx", "entrypoint": ["/__adx/usr/local/bin/adx-execd"]},
+    "env": {"ADX_ENVD_PATH": "/__adx/usr/local/bin/envd", "ADX_ENVD_SHA256": "REPLACE_WITH_BUILT_ENVD_SHA256", "ADX_ENVD_DEFAULT_USER": "user", "ADX_ENVD_DEFAULT_WORKDIR": "/home/user", "ADX_ENVD_ARGS": "[\"--isnotfc\",\"--no-cgroups\"]"}
+  },
   "e2b": {
     "domain": "sandbox.example.com",
     "envdVersion": "0.9.0",
-    "runtimeProfiles": {
-      "e2b-runc-v1": {
-        "rootfs": {"runtime_class": "runc", "type": "local", "path": "/opt/adx/current/runtime/adx-runtime-rootfs.img", "readonly": false},
-        "bootstrap": {"type": "erofs", "root": "/opt/adx/current/runtime/adx-runtime-rootfs.img", "target": "/__adx", "entrypoint": ["/__adx/usr/local/bin/adx-execd"]},
-        "env": {"ADX_ENVD_PATH": "/__adx/usr/local/bin/envd", "ADX_ENVD_SHA256": "REPLACE_WITH_BUILT_ENVD_SHA256", "ADX_ENVD_DEFAULT_USER": "user", "ADX_ENVD_DEFAULT_WORKDIR": "/home/user", "ADX_ENVD_ARGS": "[\"--isnotfc\",\"--no-cgroups\"]"}
-      }
+    "templates": {
+      "base": {"name": "e2b-base", "version": "1"},
+      "adx-e2b-base": {"name": "e2b-base", "version": "1"}
     },
-    "templates": {"templates": {
-      "base": {"runtimeProfileRef": "e2b-runc-v1", "defaultUser": "user", "defaultWorkdir": "/home/user", "cpuMillicores": 1000, "memoryMiB": 512, "capabilities": ["envd"], "pauseRetentionSeconds": 90000, "allowPublicTraffic": true, "timeoutAction": "delete"},
-      "adx-e2b-base": {"aliasOf": "base"}
-    }}
+    "requiredNodeLabels": {"adx.runtime.profile": "e2b-v1"}
   }
 }
 ```
 
-以上 runc profile 只开启 envd。只有运行时和 checkpoint storage 实际支持内存暂停与可复用快照时，才增加 `memoryCheckpoint`、`reusableSnapshot`；Firecracker profile 的 runtime class 设为 `firecracker`，去掉 `--isnotfc`。这些能力由模板显式允许，缺少能力返回 400 `capability_not_supported`。
+将匹配 profile 的 worker 注册标签配置为同一 `adx.runtime.profile=e2b-v1`。`requiredNodeLabels` 使用已有 required-node selector，可省略的前提是所有候选节点都使用同一可信 profile；节点仍检查 profile 内容一致。当前每个 worker deployment 只有一个 profile，标签不会自动安装 profile。Firecracker 部署选择对应 runtime class，并去掉 `--isnotfc`。
+
+原生模板镜像提供用户 rootfs，可信 bootstrap 只读挂到 `/__adx`；不要求两者镜像相同。镜像需包含 envd 所需动态依赖、bash、配置的用户与可写目录。E2B 保留原生模板的镜像 ENTRYPOINT/CMD 继承语义，并继承普通环境变量、资源/limits、mounts、服务端口、init/readiness 和 pause policy；envVars 可覆盖普通变量，保留控制键禁止覆盖。模板挂载中必需的参数无法由 E2B 提供时明确拒绝，不能创建 AgentBinding 补齐参数。E2B 基础镜像应提供合适的常驻入口；入口立即退出、缺少依赖或探针依赖的服务未启动，仍按原生启动/就绪合同失败，不能因为 envd 单独可用就报成功。
+
+Pause/Snapshot 不再受静态 `capabilities` 声明约束，是否支持由真实 backend 和 checkpoint storage 检查。手动与到期 Pause 使用实例保存的原生 pause retention、timeout 和 storage，支持已有 Forever/Shared 语义；缺省采用原生 PausePolicy。E2B 的绝对运行期限继续独立于 idle timeout，兼容实例不启用 idle 回收。
+
+创建在通用 `EnvironmentSpec.template_identity` 保存租户及原生模板 name/version，另存实际规格与完整 profile；E2B 的公开 templateID 仅作为兼容协议 ID，不承担原生模板身份。修改别名只影响以后新建；Pause/Connect 与从 Snapshot 克隆不回查当前模板。克隆继承快照的镜像、资源、挂载、profile、pause policy 和节点约束，只更新新实例身份、独立凭据、运行期限、metadata及允许覆盖的普通 env/网络。旧 profile 对应的节点和制品必须继续可用，否则明确失败。
+
+本次配置/控制记录变更按未上线系统更新，没有旧静态目录或 Redis control 记录的滚动迁移适配；升级测试环境应先清理旧测试实例/记录，再使用新配置与新发布模板。不要把新的必填字段直接用于未迁移的持久化环境。
 
 E2B 专用 runc 或 runsc worker 还需要配置 sandboxd 的受信任 OCI 基线。发布包包含 [e2b-runc-oci-spec.json](../../build/config/examples/e2b-runc-oci-spec.json)，在固定 sandboxd 默认基线上增加 `CAP_SETUID`、`CAP_SETGID`、`CAP_CHOWN`、`CAP_DAC_OVERRIDE`，供 envd 切换命令子进程的用户及补充组，设置上传文件的用户归属，并允许作为 root 服务运行的 envd 访问目标用户的私有文件及目录。同时将初始 `oomScoreAdj` 设为 0。envd 的命令包装会将子进程调整为 100；不设置初值时，runc 会继承 Kubernetes Pod 的分数，非特权命令无法将高于 100 的分数降低。该基线不向 guest 增加 `CAP_SYS_RESOURCE`。原生 worker 继续使用原有基线。将以下路径加入 E2B worker 的 sandboxd TOML；该配置属于节点部署，不通过用户 envVars 或 MMDS 下发：
 
@@ -51,7 +60,8 @@ Ingress（内嵌或独立）的环境变量设置 `ADX_DATA_PLANE_INGRESS_E2B_EN
 flowchart LR
   SDK[E2B SDK] -->|HTTPS 管理请求 / X-API-Key| I[Ingress]
   I --> A[API Server E2B adapter]
-  A -->|Environment RPC| C[Coordinator + durable lease]
+  A -->|只读模板查询| T[原生 Activator / TemplateVersion]
+  A -->|固定版本与实际规格 / Environment RPC| C[Coordinator + durable lease]
   C --> R[(Redis)]
   C --> N[adxlet]
   N --> S[sandboxd / patched Firecracker]
@@ -133,9 +143,15 @@ Firecracker恢复的内部checkpoint消息带上host在handoff前新采样的可
 | `GET /api-keys` | 原始数组，列举同 tenant 有 metadata 的 key，不返回原文 |
 | `DELETE /api-keys/{uuid}` | 同 tenant 原子撤销；204，缺失/已撤销/其他 tenant 为 404 |
 
-Redis 的 StoredEnvironment 保存独立 EnvironmentControlRecord；metadata 不写入调度 labels。运行期限从首次联合 Ready 开始，到期不随命令或文件活动自动顺延。续期、到期 claim 和节点结果提交通过现有持久化 CAS 协调；claimed 到期不能再续期。Coordinator 重启保留期限，节点的迟到结果不覆盖新期限。显式暂停清除运行期限；Snapshot 内部暂停不清除期限。恢复后建立新期限，普通 generation 更新不延长旧期限。
+用户 metadata 由平台通用能力管理：创建输入通过 `CreateEnvironmentRequest.user_metadata`（local-first 认领同时透传）首次原子写入 `StoredEnvironment.user_metadata`，不依赖 E2B compatibility。详情使用内部 `GetEnvironmentMetadata`；平台通用 `ListEnvironmentMetadata` 不含 E2B 范围字段。E2B 列表通过薄适配 RPC `ListE2bEnvironmentMetadata` 选择本入口实例，再复用同一平台查询处理 state、metadata、响应预算和分页；范围在分页前应用，API Server 不全量读取后筛选。原生 HTTP metadata 入口和更新接口暂未开放。
 
-创建时 `autoPause: true` 且省略 `autoPauseMemory` 按上游默认的内存模式处理，仍要求模板声明 `memoryCheckpoint`。显式 `autoPauseMemory: false` 不受支持。Connect 与 Snapshot 使用各自的严格请求类型，不能把磁盘模式选择静默当作内存恢复执行；这些 DTO 检查不代表对应 backend 已通过生命周期验收。
+metadata 不进入执行规格、control、调度 labels、guest env 或快照模板；同一实例暂停恢复保持不变，节点结果不能覆盖。从 Snapshot 新建只保存本次请求 metadata，省略则为空。同 ID 创建重试必须提交相同 metadata。最多128项，键256 bytes、值4096 bytes，总计64KiB。列表每页1–100项，并受约1MiB响应预算约束；nextToken 是绑定租户、入口范围及状态/metadata过滤条件的版本化游标，不能作为权限凭据，不接受旧 offset。并发创建/删除下是实时分页，不承诺历史快照。
+
+当前通用查询使用原子存储条目上限4096后再扫描，没有 metadata 索引；容量超限明确拒绝，不截断成完整列表。上限包含同一 Coordinator 存储 hash 的其他条目，扩容需后续索引/存储分页设计。该实现有界但仍为线性扫描，不声明大规模列表性能。
+
+Redis 的 StoredEnvironment 保存独立 EnvironmentControlRecord。运行期限从首次联合 Ready 开始，到期不随命令或文件活动自动顺延。续期、到期 claim 和节点结果提交通过现有持久化 CAS 协调；claimed 到期不能再续期。Coordinator 重启保留期限，节点的迟到结果不覆盖新期限。显式暂停清除运行期限；Snapshot 内部暂停不清除期限。恢复后建立新期限，普通 generation 更新不延长旧期限。
+
+创建时 `autoPause: true` 且省略 `autoPauseMemory` 按上游默认的内存模式处理，实际支持范围由原生 backend/checkpoint storage 判断。显式 `autoPauseMemory: false` 不受支持。Connect 与 Snapshot 使用各自的严格请求类型，不能把磁盘模式选择静默当作内存恢复执行；这些 DTO 检查不代表对应 backend 已通过生命周期验收。
 
 创建时 `network: {}` 保留模板默认的 `allowPublicTraffic`，出站默认允许；出站字段转换与动态更新共用下述映射。Connect 的 timeout 省略时为 300 秒，允许 1～86400 秒；单独的 setTimeout 接口继续允许 0，表示立即到期。
 
@@ -147,7 +163,7 @@ Redis 的 StoredEnvironment 保存独立 EnvironmentControlRecord；metadata 不
 
 创建请求只有 `{ "name": "ci-key" }`，name 非空、最多 256 个非控制字符；未知字段 400。同名允许存在，创建不是幂等操作。返回 `id` 为公开 UUID，`createdAt` 为 RFC3339，`mask` 包含 `prefix`、`valueLength`、`maskedValuePrefix` 和 `maskedValueSuffix`。prefix 使用真实的 `adx_`，valueLength 是去掉类型前缀后的随机值长度；创建响应另有一次性 `key`，列表无此字段。`createdBy` 与 `lastUsed` 为 null。成功响应使用 `Cache-Control: no-store`。
 
-发布时先升级 Coordinator，再升级 API Server 和 Ingress；旧 Coordinator 不认识 metadata/public-ID 模式，不能承接新 key 管理入口。内部网络更新 RPC 沿用原有协议。
+本版按未上线 schema 更新部署，Coordinator、adxlet 和 API Server 使用同一版本；先清理旧测试记录，再切换服务和配置。旧组件不能承接新的模板身份或 metadata 合同；Key 的 public-ID 模式也需要新版 Coordinator。内部网络更新 RPC 沿用原有协议。
 
 Coordinator 的 CredentialService 复用原有 digest 索引、expiry 与撤销 tombstone，增加可选 metadata；原文不持久化。旧原生 key 缺少 metadata，继续用于原生认证/管理，不出现在兼容列表中。原生 `/api/admin/v1/keys` 的 hash ID 与全局管理员语义保持原有行为。公开 UUID 撤销在同一 Redis 脚本内校验 active 记录、tenant 和 UUID，再写 tombstone、删除 active 记录。
 
@@ -199,7 +215,7 @@ ADX_TEST_REDIS_SERVER=/absolute/path/to/redis-server \
 cargo test -p adx-coordinator --test storage e2b_ -- --ignored
 ```
 
-真实 envd-only 部署验证可运行 `build/e2b/smoke.py`，传入 HTTPS Ingress、测试租户与另一个租户的 key 文件、测试 CA、输出 JSON 路径。它使用 SDK 2.52.0，验证创建/详情、commands/files/PTY、metadata 筛选、鉴权与控制端口隔离、Connect/续期、活动期间绝对到期、envd 退出后的路由撤销。它会创建并删除自身测试沙箱，应使用独立验证部署及只包含 `envd` capability 的模板。凭据不写入输出。
+真实 envd-only 部署验证可运行 `build/e2b/smoke.py`，传入 HTTPS Ingress、测试租户与另一个租户的 key 文件、测试 CA、输出 JSON 路径。它使用 SDK 2.52.0，验证创建/详情、commands/files/PTY、metadata 筛选、鉴权与控制端口隔离、Connect/续期、活动期间绝对到期、envd 退出后的路由撤销。它会创建并删除自身测试沙箱，应使用独立验证部署及已发布的原生模板，运行时和存储按各自真实能力验收。凭据不写入输出。
 
 检查点协作可使用 `build/e2b/checkpoint.py`：它针对隔离部署执行 Pause、Resume、snapshot 和 clone 的基础检查，并清理自身创建的沙箱。它不替代共享对象接管、宿主重启、长期压力或完整阶段三验收。控制面重启、网络故障和跨节点回收应使用对应的部署级验证流程，而不是把客户端 smoke 当作可用性证明。
 

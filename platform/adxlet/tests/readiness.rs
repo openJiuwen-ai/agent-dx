@@ -46,6 +46,7 @@ fn record() -> EnvironmentRecord {
         restart_attempts: 0,
         restart_pending: false,
         spec: EnvironmentSpec {
+            template_identity: None,
             compatibility: None,
             runtime_profile: None,
             snapshot_id: None,
@@ -244,9 +245,7 @@ async fn e2b_requires_ready_envd_with_the_requested_protocol_version() {
             traffic_access_token: "b".repeat(32),
             timeout_seconds: 60,
             timeout_action: "delete".into(),
-            pause_retention_seconds: 90000,
             allow_public_traffic: true,
-            metadata: Default::default(),
         });
         let body = serde_json::json!({
             "identity":{"environment_id":"i","runtime_id":"i-1","ownership_generation":1},
@@ -290,8 +289,6 @@ async fn e2b_activity_requires_ready_envd_with_matching_version() {
             allow_public_traffic: true,
             timeout_seconds: 60,
             timeout_action: "delete".into(),
-            pause_retention_seconds: 90_000,
-            metadata: Default::default(),
         });
         let body = serde_json::json!({
             "identity":{"environment_id":"i","runtime_id":"i-1","ownership_generation":1},

@@ -2,7 +2,7 @@
 //! state remains owned by EnvironmentRecord; this record never schedules a VM.
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fmt};
+use std::fmt;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -14,13 +14,6 @@ pub struct EnvironmentCompatibility {
     pub allow_public_traffic: bool,
     pub timeout_seconds: u64,
     pub timeout_action: String,
-    #[serde(default = "default_pause_retention")]
-    pub pause_retention_seconds: u64,
-    #[serde(default)]
-    pub metadata: BTreeMap<String, String>,
-}
-fn default_pause_retention() -> u64 {
-    90_000
 }
 impl fmt::Debug for EnvironmentCompatibility {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -42,12 +35,6 @@ impl EnvironmentCompatibility {
             || self.timeout_seconds == 0
             || self.timeout_seconds > 86_400
             || !matches!(self.timeout_action.as_str(), "delete" | "pause")
-            || self.pause_retention_seconds == 0
-            || self.metadata.len() > 128
-            || self
-                .metadata
-                .iter()
-                .any(|(k, v)| k.is_empty() || k.len() > 256 || v.len() > 4096)
         {
             return Err(Error::Invalid(
                 "invalid sandbox compatibility configuration".into(),
@@ -151,8 +138,6 @@ mod tests {
                 allow_public_traffic: true,
                 timeout_seconds: 60,
                 timeout_action: "delete".into(),
-                pause_retention_seconds: 90_000,
-                metadata: BTreeMap::new(),
             },
             1,
         )

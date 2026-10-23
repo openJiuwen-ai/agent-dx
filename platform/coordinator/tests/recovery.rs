@@ -8,6 +8,7 @@ use adx_core::{
 };
 fn saved() -> StoredSnapshot {
     let request = EnvironmentSpec {
+        template_identity: None,
         compatibility: None,
         runtime_profile: None,
         snapshot_id: None,
@@ -82,6 +83,7 @@ fn saved() -> StoredSnapshot {
         environments: [(
             "i".into(),
             StoredEnvironment {
+                user_metadata: Default::default(),
                 resume: None,
                 control: None,
                 failed_since_unix_seconds: None,

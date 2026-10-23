@@ -10,8 +10,6 @@ impl From<pb::EnvironmentCompatibility> for EnvironmentCompatibility {
             allow_public_traffic: v.allow_public_traffic,
             timeout_seconds: v.timeout_seconds,
             timeout_action: v.timeout_action,
-            pause_retention_seconds: v.pause_retention_seconds,
-            metadata: v.metadata.into_iter().collect(),
         }
     }
 }
@@ -25,8 +23,6 @@ impl From<EnvironmentCompatibility> for pb::EnvironmentCompatibility {
             allow_public_traffic: v.allow_public_traffic,
             timeout_seconds: v.timeout_seconds,
             timeout_action: v.timeout_action,
-            pause_retention_seconds: v.pause_retention_seconds,
-            metadata: v.metadata.into_iter().collect(),
         }
     }
 }

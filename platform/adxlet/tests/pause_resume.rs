@@ -323,6 +323,7 @@ fn fixture() -> (
     node.update_capacity(resources, Duration::from_secs(300))
         .unwrap();
     let spec = EnvironmentSpec {
+        template_identity: None,
         compatibility: None,
         runtime_profile: None,
         snapshot_id: None,
@@ -1515,8 +1516,6 @@ async fn e2b_runtime_event_processes_guest_checkpoint_before_service_health() {
         allow_public_traffic: false,
         timeout_seconds: 60,
         timeout_action: "delete".into(),
-        pause_retention_seconds: 90_000,
-        metadata: Default::default(),
     });
     let handle = node.environment(spec, assignment).unwrap();
     let created = handle.create().await.unwrap();

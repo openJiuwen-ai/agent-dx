@@ -918,6 +918,7 @@ pub fn create_spec_with_environment(
         None
     };
     Ok(pb::EnvironmentSpec {
+        template_identity: None,
         compatibility: None,
         runtime_profile,
         id: format!("{}-{}", r.namespace, r.name),

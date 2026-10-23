@@ -30,6 +30,13 @@ impl TryFrom<control::EnvironmentSpec> for adx_core::EnvironmentSpec {
             .resources
             .ok_or_else(|| Error::Invalid("resources are required".into()))?;
         let spec = Self {
+            template_identity: value.template_identity.map(|identity| {
+                adx_core::NativeTemplateIdentity {
+                    tenant_id: identity.tenant_id,
+                    name: identity.name,
+                    version: identity.version,
+                }
+            }),
             compatibility: value.compatibility.map(Into::into),
             runtime_profile: value.runtime_profile.map(TryInto::try_into).transpose()?,
             snapshot_id: value.snapshot_id,
@@ -68,6 +75,13 @@ impl TryFrom<control::EnvironmentSpec> for adx_core::EnvironmentSpec {
 impl From<adx_core::EnvironmentSpec> for control::EnvironmentSpec {
     fn from(value: adx_core::EnvironmentSpec) -> Self {
         Self {
+            template_identity: value.template_identity.map(|identity| {
+                control::NativeTemplateIdentity {
+                    tenant_id: identity.tenant_id,
+                    name: identity.name,
+                    version: identity.version,
+                }
+            }),
             compatibility: value.compatibility.map(Into::into),
             runtime_profile: value.runtime_profile.map(Into::into),
             snapshot_id: value.snapshot_id,
@@ -141,7 +155,20 @@ mod tests {
     #[test]
     fn environment_spec_round_trip_preserves_units_and_priority() {
         let value = adx_core::EnvironmentSpec {
-            compatibility: None,
+            template_identity: Some(adx_core::NativeTemplateIdentity {
+                tenant_id: "t".into(),
+                name: "python".into(),
+                version: "2026.10.23".into(),
+            }),
+            compatibility: Some(adx_core::environment_control::EnvironmentCompatibility {
+                template_id: "template-id".into(),
+                envd_version: "0.9.0".into(),
+                envd_access_token: "a".repeat(32),
+                traffic_access_token: "b".repeat(32),
+                allow_public_traffic: false,
+                timeout_seconds: 60,
+                timeout_action: "pause".into(),
+            }),
             runtime_profile: None,
             snapshot_id: None,
             lifecycle: Default::default(),
@@ -162,6 +189,40 @@ mod tests {
         let bytes = control::EnvironmentSpec::from(value.clone()).encode_to_vec();
         let decoded = control::EnvironmentSpec::decode(bytes.as_slice()).unwrap();
         assert_eq!(adx_core::EnvironmentSpec::try_from(decoded).unwrap(), value);
+    }
+
+    #[test]
+    fn native_template_identity_round_trips_without_compatibility() {
+        let spec = adx_core::EnvironmentSpec {
+            template_identity: Some(adx_core::NativeTemplateIdentity {
+                tenant_id: "tenant".into(),
+                name: "native".into(),
+                version: "v1".into(),
+            }),
+            compatibility: None,
+            runtime_profile: None,
+            snapshot_id: None,
+            lifecycle: Default::default(),
+            env: Default::default(),
+            id: "native-environment".into(),
+            tenant_id: "tenant".into(),
+            image: "image".into(),
+            runtime_class: "runtime".into(),
+            resources: adx_core::Resources {
+                cpu_millis: 1,
+                memory_bytes: 1,
+                disk_bytes: 0,
+            },
+            priority: 0,
+            scheduling: Default::default(),
+            execution: Default::default(),
+        };
+        let wire: control::EnvironmentSpec = spec.clone().into();
+        assert_eq!(adx_core::EnvironmentSpec::try_from(wire).unwrap(), spec);
+
+        let mut mismatched = spec;
+        mismatched.template_identity.as_mut().unwrap().tenant_id = "other".into();
+        assert!(mismatched.validate().is_err());
     }
 }
 

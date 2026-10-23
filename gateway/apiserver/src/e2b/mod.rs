@@ -5,8 +5,9 @@ mod dto;
 pub mod http;
 pub(crate) mod keys;
 mod network;
+mod templates;
 
-pub use config::{Config, Template, TemplateCatalog};
+pub use config::{Config, TemplateRef};
 pub use dto::{
     ConnectRequest, CreateRequest, ErrorBody, PauseRequest, SnapshotRequest, TimeoutRequest,
     ValidationError,

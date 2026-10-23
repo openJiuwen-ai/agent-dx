@@ -5,6 +5,7 @@ use adx_core::{
 #[test]
 fn snapshot_wire_preserves_template_and_durable_references() {
     let spec = EnvironmentSpec {
+        template_identity: None,
         compatibility: None,
         runtime_profile: None,
         snapshot_id: None,

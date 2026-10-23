@@ -50,6 +50,7 @@ fn spec() -> EnvironmentSpec {
         priority: 0,
         scheduling: Default::default(),
         execution: Default::default(),
+        template_identity: None,
         compatibility: None,
     }
 }
@@ -403,6 +404,7 @@ impl Rig {
                 create_timeout_seconds: 10,
                 create_deadline_unix_millis: 0,
                 expected_assignment: None,
+                user_metadata: Default::default(),
             })
             .await
             .unwrap()
@@ -609,6 +611,7 @@ async fn coordinator_autoscaling_http_queries_authoritative_node_ownership_witho
                     create_timeout_seconds: 10,
                     create_deadline_unix_millis: 0,
                     expected_assignment: None,
+                    user_metadata: Default::default(),
                 })
                 .await
             });

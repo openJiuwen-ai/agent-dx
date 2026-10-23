@@ -73,6 +73,7 @@ impl CoordinatorRpc {
                 // If retirement loses its response, do not requeue the old spec as
                 // an absent, never-persisted request during authoritative recovery.
                 state.specs.remove(id);
+                state.pending_metadata.remove(id);
                 let deleted = state
                     .session
                     .retire_invalidated_failed(&stored, now)
@@ -92,6 +93,7 @@ impl CoordinatorRpc {
                 state.environments.remove(id);
                 state.failed_environments.remove(id);
                 state.specs.remove(id);
+                state.pending_metadata.remove(id);
                 state.scheduling_deadlines.remove(id);
                 state.needs_recovery = false;
                 self.0.changed.notify_waiters();

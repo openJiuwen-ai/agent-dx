@@ -13,6 +13,7 @@ use std::time::Duration;
 
 fn spec(id: &str) -> EnvironmentSpec {
     EnvironmentSpec {
+        template_identity: None,
         compatibility: None,
         runtime_profile: None,
         snapshot_id: None,
@@ -177,6 +178,42 @@ async fn failed_collection_age_survives_retry_and_coordinator_restart() {
             .unwrap()
             .failed_since_unix_seconds,
         Some(since)
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn user_metadata_is_durable_and_node_commit_cannot_replace_it() {
+    let rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let assignment = Assignment {
+        environment_id: "metadata".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    let metadata: adx_core::metadata::UserMetadata = [("project".into(), "alpha\nnotes".into())]
+        .into_iter()
+        .collect();
+    session
+        .reserve_with_metadata(spec("metadata"), assignment.clone(), metadata.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        session
+            .reserve_with_metadata(spec("metadata"), assignment.clone(), Default::default())
+            .await,
+        Err(Error::Conflict)
+    );
+    session
+        .commit(running(spec("metadata"), assignment))
+        .await
+        .unwrap();
+    assert_eq!(
+        session.get("metadata").await.unwrap().user_metadata,
+        metadata
     );
 }
 
@@ -1562,8 +1599,6 @@ async fn e2b_control_renewal_survives_stale_node_commit_and_redis_restart() {
         allow_public_traffic: false,
         timeout_seconds: 60,
         timeout_action: "delete".into(),
-        pause_retention_seconds: 90_000,
-        metadata: [("owner".into(), "user-data".into())].into_iter().collect(),
     });
     let assignment = Assignment {
         environment_id: spec.id.clone(),
@@ -1573,7 +1608,11 @@ async fn e2b_control_renewal_survives_stale_node_commit_and_redis_restart() {
         devices: vec![],
     };
     session
-        .reserve(spec.clone(), assignment.clone())
+        .reserve_with_metadata(
+            spec.clone(),
+            assignment.clone(),
+            [("owner".into(), "user-data".into())].into_iter().collect(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1593,7 +1632,10 @@ async fn e2b_control_renewal_survives_stale_node_commit_and_redis_restart() {
         .unwrap();
     let renewed = session.environment_control(&spec.id).await.unwrap();
     assert!(renewed.expires_at_unix_ms > initial.expires_at_unix_ms);
-    assert_eq!(renewed.compatibility.metadata["owner"], "user-data");
+    assert_eq!(
+        session.get(&spec.id).await.unwrap().user_metadata["owner"],
+        "user-data"
+    );
     assert!(spec.scheduling.labels.is_empty());
     result.revision += 1;
     session.commit(result.clone()).await.unwrap();
@@ -1625,8 +1667,6 @@ async fn e2b_claimed_expiry_cannot_renew_and_delete_retires_control() {
         allow_public_traffic: true,
         timeout_seconds: 60,
         timeout_action: "delete".into(),
-        pause_retention_seconds: 90_000,
-        metadata: Default::default(),
     });
     let assignment = Assignment {
         environment_id: spec.id.clone(),

@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 adx-activator = { path = "../../agent/activator" }
+adx-agent-api = { path = "../../agent/api" }
 adx-core = { path = "../../platform/crates/core" }
 adx-agent-core = { path = "../../agent/crates/core" }
 adx-protocol = { path = "../../platform/crates/protocol" }
@@ -41,7 +42,6 @@ tokio-stream = "0.1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
 
 [dev-dependencies]
-adx-agent-api = { path = "../../agent/api" }
 adx-agent-store = { path = "../../agent/crates/store", features = ["test-memory"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"

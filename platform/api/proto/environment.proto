@@ -9,6 +9,10 @@ import public "credentials.proto";
 import public "routes.proto";
 
 service CoordinatorService {
+  rpc GetEnvironmentMetadata(GetEnvironmentMetadataRequest) returns (EnvironmentMetadataRecord);
+  rpc ListEnvironmentMetadata(ListEnvironmentMetadataRequest) returns (ListEnvironmentMetadataResponse);
+  // Compatibility entrypoint scope; the shared metadata query has no protocol filter.
+  rpc ListE2bEnvironmentMetadata(ListEnvironmentMetadataRequest) returns (ListEnvironmentMetadataResponse);
   rpc GetEnvironmentControl(GetEnvironmentControlRequest) returns (EnvironmentControlRecord);
   rpc UpdateEnvironmentControl(UpdateEnvironmentControlRequest) returns (EnvironmentControlRecord);
   rpc ListEnvironmentControls(ListEnvironmentControlsRequest) returns (ListEnvironmentControlsResponse);
@@ -39,6 +43,24 @@ message UpdateEnvironmentControlRequest {
 }
 message ListEnvironmentControlsRequest { CallerContext caller = 1; }
 message ListEnvironmentControlsResponse { repeated EnvironmentControlRecord records = 1; }
+message GetEnvironmentMetadataRequest { string id = 1; CallerContext caller = 2; }
+message EnvironmentMetadataRecord {
+  string environment_id = 1;
+  map<string,string> user_metadata = 2;
+  EnvironmentState state = 3;
+}
+message ListEnvironmentMetadataRequest {
+  CallerContext caller = 1;
+  map<string,string> metadata_filter = 2;
+  repeated EnvironmentState states = 3;
+  string cursor = 4;
+  uint32 limit = 5;
+  reserved 6;
+}
+message ListEnvironmentMetadataResponse {
+  repeated EnvironmentMetadataRecord records = 1;
+  string next_cursor = 2;
+}
 
 service NodeService {
   rpc CreateLocalEnvironment(LocalEnvironmentCreateRequest) returns (EnvironmentResult);
@@ -102,6 +124,8 @@ message CreateEnvironmentRequest {
   uint64 create_deadline_unix_millis = 5;
   // When retrying an observed Pending owner, never allocate another generation.
   Assignment expected_assignment = 6;
+  // Platform-owned annotations. They are not part of the node execution spec.
+  map<string,string> user_metadata = 7;
 }
 
 message GetEnvironmentRequest { string environment_id = 1; CallerContext caller = 2; }
@@ -204,7 +228,7 @@ message SetNodeSchedulingRequest {
 message NodeSchedulingState { string node_id = 1; bool accepting_allocations = 2; }
 message LocalEnvironmentCreateRequest { CreateEnvironmentRequest create = 1; string node_session_id = 2; }
 message PreparedEnvironment { EnvironmentSpec spec = 1; ReusableSnapshot snapshot = 2; }
-message ClaimEnvironmentRequest { EnvironmentSpec spec = 1; CallerContext caller = 2; string node_session_id = 3; repeated DeviceAllocation devices = 4; }
+message ClaimEnvironmentRequest { EnvironmentSpec spec = 1; CallerContext caller = 2; string node_session_id = 3; repeated DeviceAllocation devices = 4; map<string,string> user_metadata = 5; }
 message ClaimEnvironmentResponse {
   oneof outcome {
     StartAssignedEnvironmentRequest owned = 1;

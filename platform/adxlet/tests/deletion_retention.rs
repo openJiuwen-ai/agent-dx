@@ -83,6 +83,7 @@ impl StateSink for Dependencies {
 
 fn spec() -> EnvironmentSpec {
     EnvironmentSpec {
+        template_identity: None,
         compatibility: None,
         runtime_profile: None,
         snapshot_id: None,

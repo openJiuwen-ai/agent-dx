@@ -4,6 +4,8 @@ use crate::{
     errors::ErrorDetail,
     operations::{snapshot_value, Kind},
 };
+use adx_agent_api::{managed::ManagedService, request::RequestContext as AgentRequestContext};
+use adx_agent_core::{error::Error as AgentError, TemplateVersion};
 use adx_observability::trace;
 use adx_protocol::control as pb;
 use adx_transport::request::RequestContext;
@@ -37,18 +39,70 @@ pub type Body = UnsyncBoxBody<Bytes, Error>;
 pub struct Api {
     pub clients: Arc<Clients>,
     pub environment_service: Arc<EnvironmentService>,
+    pub templates: Option<Arc<ManagedService>>,
     proxy: reqwest::Client,
 }
 impl Api {
     pub fn new(clients: Arc<Clients>) -> Result<Arc<Self>, Error> {
+        Self::build(clients, None)
+    }
+
+    /// Construct an API with a trusted, read-only Agent template source.
+    pub fn with_templates(
+        clients: Arc<Clients>,
+        templates: Arc<ManagedService>,
+    ) -> Result<Arc<Self>, Error> {
+        Self::build(clients, Some(templates))
+    }
+
+    /// Construct an API and embedded template source over one Environment service instance.
+    pub fn with_templates_and_environment(
+        clients: Arc<Clients>,
+        environment_service: Arc<EnvironmentService>,
+        templates: Arc<ManagedService>,
+    ) -> Result<Arc<Self>, Error> {
+        Self::build_with_environment(clients, environment_service, Some(templates))
+    }
+
+    fn build(
+        clients: Arc<Clients>,
+        templates: Option<Arc<ManagedService>>,
+    ) -> Result<Arc<Self>, Error> {
+        let environment_service = EnvironmentService::new(clients.clone());
+        Self::build_with_environment(clients, environment_service, templates)
+    }
+
+    fn build_with_environment(
+        clients: Arc<Clients>,
+        environment_service: Arc<EnvironmentService>,
+        templates: Option<Arc<ManagedService>>,
+    ) -> Result<Arc<Self>, Error> {
         Ok(Arc::new(Self {
-            environment_service: EnvironmentService::new(clients.clone()),
+            environment_service,
             clients,
+            templates,
             proxy: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(10))
                 .build()?,
         }))
+    }
+
+    /// Read a published template without selecting or activating an AgentBinding.
+    pub async fn native_template(
+        &self,
+        tenant: &str,
+        name: &str,
+        version: &str,
+    ) -> Result<TemplateVersion, Status> {
+        let templates = self.templates.as_ref().ok_or_else(|| {
+            Status::failed_precondition("native template source is not configured")
+        })?;
+        let context = AgentRequestContext::new(self.clients.config.timeout());
+        templates
+            .template(&context, tenant, name, version)
+            .await
+            .map_err(native_template_error)
     }
     pub async fn serve(
         self: Arc<Self>,
@@ -773,6 +827,19 @@ impl Api {
                 output
             }
         }
+    }
+}
+
+fn native_template_error(error: AgentError) -> Status {
+    match error {
+        AgentError::Invalid(message) => Status::invalid_argument(message),
+        AgentError::Unsupported(message) => Status::unimplemented(message),
+        AgentError::NotFound => Status::not_found("native template not found"),
+        AgentError::NotReady(message) | AgentError::Unavailable(message) => {
+            Status::unavailable(message)
+        }
+        AgentError::Conflict(message) => Status::aborted(message),
+        AgentError::OutcomeUnknown(message) => Status::unavailable(message),
     }
 }
 fn trace_identifiers(context: &str) -> (&str, &str) {

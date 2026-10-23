@@ -1,8 +1,10 @@
 use adx_activator::local_environment::LocalEnvironment;
+use adx_agent_api::managed::ManagedService;
 use adx_agent_core::{environment::Environment, limits};
 use adx_apiserver::{
     clients::Clients,
     config::{Config, IngressMode},
+    environment_service::EnvironmentService,
     http::Api,
     ingress::EmbeddedIngress,
 };
@@ -21,7 +23,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config: Config = read_config()?;
     config.validate()?;
     let clients = Clients::new(config.clone())?;
-    let api = Api::new(clients).map_err(|_| "API initialization failed")?;
+    let environment_service = EnvironmentService::new(clients.clone());
+    let templates = if config.e2b.is_some() {
+        native_templates(environment_service.clone()).await?
+    } else {
+        None
+    };
+    if config.e2b.is_some() && templates.is_none() {
+        return Err("E2B requires ADX_AGENT_CONFIG with an Agent template source".into());
+    }
+    let api = match templates {
+        Some(templates) => {
+            Api::with_templates_and_environment(clients, environment_service, templates)
+        }
+        None => Api::new(clients),
+    }
+    .map_err(|_| "API initialization failed")?;
     let acceptor = if config.loopback_http {
         None
     } else {
@@ -126,6 +143,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(error.into());
     }
     Ok(())
+}
+
+async fn native_templates(
+    environment_service: Arc<EnvironmentService>,
+) -> Result<Option<Arc<ManagedService>>, Box<dyn std::error::Error>> {
+    let Some(path) = std::env::var_os("ADX_AGENT_CONFIG") else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(path)?;
+    let settings: data_plane_gateway::ingress::agent_api::AgentConfig =
+        serde_json::from_slice(&bytes)?;
+    let api = if settings.embedded.is_some() {
+        // The embedded adapter and LocalControl must use the same Environment service. Parse a
+        // second copy only because AgentApi consumes its configuration during construction.
+        let environment_settings: data_plane_gateway::ingress::agent_api::AgentConfig =
+            serde_json::from_slice(&bytes)?;
+        let embedded = environment_settings
+            .embedded
+            .ok_or("embedded Agent configuration missing")?;
+        let adapter = Arc::new(LocalEnvironment::new(
+            environment_service,
+            limits::ENVIRONMENT_REQUEST_TIMEOUT,
+            embedded.sandbox_network,
+        )?);
+        data_plane_gateway::ingress::agent_api::AgentApi::new_embedded(settings, adapter).await?
+    } else {
+        data_plane_gateway::ingress::agent_api::AgentApi::new(settings)?
+    };
+    Ok(Some(api.managed))
 }
 
 fn embedded_environment_service(

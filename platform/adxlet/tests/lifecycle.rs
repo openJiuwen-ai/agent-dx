@@ -173,6 +173,7 @@ fn resources() -> Resources {
 }
 fn spec(id: &str) -> EnvironmentSpec {
     EnvironmentSpec {
+        template_identity: None,
         compatibility: None,
         runtime_profile: None,
         snapshot_id: None,
@@ -197,8 +198,6 @@ fn e2b_compatibility() -> adx_core::environment_control::EnvironmentCompatibilit
         allow_public_traffic: false,
         timeout_seconds: 60,
         timeout_action: "delete".into(),
-        pause_retention_seconds: 90_000,
-        metadata: Default::default(),
     }
 }
 fn assignment(id: &str) -> Assignment {

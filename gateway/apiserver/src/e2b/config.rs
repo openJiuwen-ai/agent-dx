@@ -1,167 +1,86 @@
 use super::ValidationError;
+use adx_core::runtime_profile::RuntimeProfile;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
+/// Protocol aliases only. Execution settings remain owned by native templates.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Config {
     pub domain: String,
     pub envd_version: String,
+    pub templates: BTreeMap<String, TemplateRef>,
+    /// Deployment-owned selection for workers with the matching trusted profile.
     #[serde(default)]
-    pub runtime_profiles: HashMap<String, adx_core::runtime_profile::RuntimeProfile>,
-    pub templates: TemplateCatalog,
+    pub required_node_labels: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct TemplateCatalog {
-    #[serde(default)]
-    pub templates: HashMap<String, Template>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Template {
-    #[serde(default)]
-    pub runtime_profile_ref: String,
-    #[serde(default)]
-    pub default_user: String,
-    #[serde(default)]
-    pub default_workdir: String,
-    #[serde(default)]
-    pub cpu_millicores: u64,
-    #[serde(default, rename = "memoryMiB")]
-    pub memory_mib: u64,
-    #[serde(default = "default_pause_retention")]
-    pub pause_retention_seconds: u64,
-    #[serde(default)]
-    pub capabilities: Vec<String>,
-    #[serde(default)]
-    pub alias_of: Option<String>,
-    #[serde(default = "default_allow_public_traffic")]
-    pub allow_public_traffic: bool,
-    #[serde(default = "default_timeout_action")]
-    pub timeout_action: String,
-}
-
-fn default_pause_retention() -> u64 {
-    90_000
-}
-
-fn default_timeout_action() -> String {
-    "delete".into()
-}
-fn default_allow_public_traffic() -> bool {
-    true
+pub struct TemplateRef {
+    pub name: String,
+    pub version: String,
 }
 
 impl Config {
-    pub fn validate(&self) -> Result<(), ValidationError> {
-        if self.domain.trim().is_empty() || self.envd_version.trim().is_empty() {
-            return Err(ValidationError::invalid("invalid E2B configuration"));
-        }
-        self.templates.validate()?;
-        for template in self
-            .templates
-            .templates
-            .values()
-            .filter(|template| template.alias_of.is_none())
-        {
-            let profile = self
-                .runtime_profiles
-                .get(&template.runtime_profile_ref)
-                .ok_or_else(|| ValidationError::invalid("unknown E2B runtime profile"))?;
-            profile
-                .validate()
-                .map_err(|_| ValidationError::invalid("invalid E2B runtime profile"))?;
-            let path = profile
-                .env
-                .get("ADX_ENVD_PATH")
-                .ok_or_else(|| ValidationError::invalid("missing ADX_ENVD_PATH"))?;
-            let digest = profile
-                .env
-                .get("ADX_ENVD_SHA256")
-                .ok_or_else(|| ValidationError::invalid("missing ADX_ENVD_SHA256"))?;
-            if !path.starts_with('/')
-                || path.contains('\0')
-                || digest.len() != 64
-                || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-            {
-                return Err(ValidationError::invalid("invalid envd profile"));
-            }
-        }
-        Ok(())
-    }
-
-    pub fn runtime_profile(
-        &self,
-        template: &Template,
-    ) -> Result<adx_core::runtime_profile::RuntimeProfile, ValidationError> {
-        self.runtime_profiles
-            .get(&template.runtime_profile_ref)
-            .cloned()
-            .ok_or_else(|| ValidationError::invalid("unknown E2B runtime profile"))
-    }
-}
-
-impl TemplateCatalog {
-    pub fn validate(&self) -> Result<(), ValidationError> {
-        if self.templates.is_empty() {
-            return Err(ValidationError::invalid("E2B templates are required"));
-        }
-        self.resolve("base")?;
-        for id in self.templates.keys() {
-            self.resolve(id)?;
-        }
-        Ok(())
-    }
-
-    pub fn resolve(&self, id: &str) -> Result<(&Template, String), ValidationError> {
-        let mut resolved = id.to_owned();
-        for _ in 0..2 {
-            let template = self
-                .templates
-                .get(&resolved)
-                .ok_or_else(|| ValidationError::invalid("unknown templateID"))?;
-            match template.alias_of.as_deref() {
-                Some(alias) if alias != resolved => resolved = alias.to_owned(),
-                Some(_) => return Err(ValidationError::invalid("invalid template alias")),
-                None => {
-                    template.validate()?;
-                    return Ok((template, resolved));
-                }
-            }
-        }
-        Err(ValidationError::invalid(
-            "template aliases may only have one level",
-        ))
-    }
-}
-
-impl Template {
-    pub fn require_capability(&self, capability: &str) -> Result<(), ValidationError> {
-        if self.capabilities.iter().any(|value| value == capability) {
-            Ok(())
-        } else {
-            Err(ValidationError::unsupported(
-                "capability is not enabled by this template",
-            ))
-        }
-    }
-    fn validate(&self) -> Result<(), ValidationError> {
-        if self.runtime_profile_ref.trim().is_empty()
-            || self.default_user.trim().is_empty()
-            || !self.default_workdir.starts_with('/')
-            || self.cpu_millicores == 0
-            || self.memory_mib == 0
-            || self.pause_retention_seconds == 0
-            || !matches!(self.timeout_action.as_str(), "delete" | "pause")
-            || !self.capabilities.iter().any(|value| value == "envd")
-            || self.default_user.contains('\0')
-            || self.default_workdir.contains('\0')
+    pub fn validate(&self, profile: Option<&RuntimeProfile>) -> Result<(), ValidationError> {
+        if self.domain.trim().is_empty()
+            || self.envd_version.trim().is_empty()
+            || !self.templates.contains_key("base")
         {
             return Err(ValidationError::invalid(
-                "invalid E2B template configuration",
+                "E2B domain, envd version and base template reference required",
+            ));
+        }
+        for (alias, target) in &self.templates {
+            for value in [alias, &target.name, &target.version] {
+                adx_agent_core::identifier(value, "template reference")
+                    .map_err(|_| ValidationError::invalid("invalid native template reference"))?;
+            }
+        }
+        adx_core::scheduling::LabelSelector {
+            match_labels: self.required_node_labels.clone(),
+            expressions: vec![],
+        }
+        .validate()
+        .map_err(|_| ValidationError::invalid("invalid E2B worker selector"))?;
+        let profile = profile.ok_or_else(|| {
+            ValidationError::invalid("E2B requires the deployment runtime_profile")
+        })?;
+        profile
+            .validate()
+            .map_err(|_| ValidationError::invalid("invalid runtime_profile"))?;
+        let path = profile
+            .env
+            .get("ADX_ENVD_PATH")
+            .map(String::as_str)
+            .unwrap_or("");
+        let digest = profile
+            .env
+            .get("ADX_ENVD_SHA256")
+            .map(String::as_str)
+            .unwrap_or("");
+        let user = profile
+            .env
+            .get("ADX_ENVD_DEFAULT_USER")
+            .map(String::as_str)
+            .unwrap_or("");
+        let cwd = profile
+            .env
+            .get("ADX_ENVD_DEFAULT_WORKDIR")
+            .map(String::as_str)
+            .unwrap_or("");
+        if !path.starts_with('/')
+            || path.contains('\0')
+            || digest.len() != 64
+            || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || user.trim().is_empty()
+            || user.contains('\0')
+            || !cwd.starts_with('/')
+            || cwd.contains('\0')
+        {
+            return Err(ValidationError::invalid(
+                "runtime_profile requires trusted envd path, digest, user and workdir",
             ));
         }
         Ok(())
@@ -171,11 +90,30 @@ impl Template {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    fn profile() -> RuntimeProfile {
+        serde_json::from_value(json!({
+            "rootfs":{"runtime_class":"runc","type":"local","path":"/rootfs","readonly":false},
+            "bootstrap":{"type":"erofs","root":"/rootfs","target":"/__adx","entrypoint":["/__adx/init"]},
+            "env":{"ADX_ENVD_PATH":"/__adx/envd","ADX_ENVD_SHA256":"a".repeat(64),"ADX_ENVD_DEFAULT_USER":"user","ADX_ENVD_DEFAULT_WORKDIR":"/home/user"}
+        })).unwrap()
+    }
     #[test]
-    fn public_traffic_defaults_to_enabled_and_envd_is_required() {
-        let template: Template = serde_json::from_str(r#"{"runtimeProfileRef":"p","defaultUser":"u","defaultWorkdir":"/w","cpuMillicores":1,"memoryMiB":1,"capabilities":["envd"]}"#).unwrap();
-        assert!(template.allow_public_traffic);
-        assert!(template.require_capability("envd").is_ok());
-        assert!(template.require_capability("memoryCheckpoint").is_err());
+    fn aliases_only_reference_native_versions_and_require_trusted_envd() {
+        let config: Config = serde_json::from_value(json!({
+            "domain":"sandbox.test","envdVersion":"0.9.0",
+            "templates":{"base":{"name":"python","version":"1"},"python":{"name":"python","version":"1"}},
+            "requiredNodeLabels":{"adx.runtime.profile":"e2b-v1"}
+        })).unwrap();
+        assert!(config.validate(Some(&profile())).is_ok());
+        assert!(config.validate(None).is_err());
+        let mut invalid = profile();
+        invalid.env.remove("ADX_ENVD_DEFAULT_USER");
+        assert!(config.validate(Some(&invalid)).is_err());
+        assert!(serde_json::from_value::<Config>(json!({
+            "domain":"sandbox.test","envdVersion":"0.9.0",
+            "templates":{"base":{"name":"python","version":"1","cpuMillicores":1000}}
+        }))
+        .is_err());
     }
 }

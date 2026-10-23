@@ -68,7 +68,7 @@ pub struct Config {
 impl Config {
     pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(e2b) = &self.e2b {
-            if let Err(error) = e2b.validate() {
+            if let Err(error) = e2b.validate(self.runtime_profile.as_ref()) {
                 return Err(error.message.into());
             }
         }

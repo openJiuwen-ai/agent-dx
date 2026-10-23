@@ -65,6 +65,10 @@ impl State {
         self.nodes = saved.nodes;
         self.environments = saved.environments;
         self.specs = specs;
+        // Only uncommitted queued requests need this transient input. A
+        // recovered durable record owns its metadata in StoredEnvironment.
+        self.pending_metadata
+            .retain(|id, _| self.specs.contains_key(id) && !self.environments.contains_key(id));
         self.failed_environments = self
             .environments
             .iter()
@@ -194,6 +198,8 @@ impl CoordinatorRpc {
             .ok_or_else(|| Status::invalid_argument("spec required"))?
             .try_into()
             .map_err(status)?;
+        let user_metadata = request.user_metadata.into_iter().collect();
+        adx_core::metadata::validate_user_metadata(&user_metadata).map_err(status)?;
         tenant(request.caller.as_ref(), &spec.tenant_id)?;
         let candidate = LocalClaim {
             node_id: node.clone(),
@@ -268,7 +274,11 @@ impl CoordinatorRpc {
             None
         };
         drop(state);
-        let outcome = match self.0.claim(spec.clone(), candidate.clone()).await {
+        let outcome = match self
+            .0
+            .claim(spec.clone(), candidate.clone(), user_metadata)
+            .await
+        {
             Ok(outcome) => outcome,
             Err(e @ Error::Unavailable(_)) => {
                 let mut state = self.0.state.lock().await;
@@ -341,6 +351,7 @@ mod tests {
             devices: vec![],
         };
         StoredEnvironment {
+            user_metadata: Default::default(),
             control: None,
             resume: Default::default(),
             failed_since_unix_seconds: None,

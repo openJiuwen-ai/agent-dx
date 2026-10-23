@@ -60,6 +60,9 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
         Ok(Response::new(state.owner.clone()))
     }
 }, [
+    get_environment_metadata(GetEnvironmentMetadataRequest) -> EnvironmentMetadataRecord,
+    list_environment_metadata(ListEnvironmentMetadataRequest) -> ListEnvironmentMetadataResponse,
+    list_e2b_environment_metadata(ListEnvironmentMetadataRequest) -> ListEnvironmentMetadataResponse,
     get_environment_control(GetEnvironmentControlRequest) -> EnvironmentControlRecord,
     update_environment_control(UpdateEnvironmentControlRequest) -> EnvironmentControlRecord,
     list_environment_controls(ListEnvironmentControlsRequest) -> ListEnvironmentControlsResponse,

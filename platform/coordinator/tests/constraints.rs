@@ -2,6 +2,7 @@ use adx_coordinator::{Coordinator, Node, Placement};
 use adx_core::{scheduling::*, EnvironmentSpec, Resources};
 fn spec(id: &str) -> EnvironmentSpec {
     EnvironmentSpec {
+        template_identity: None,
         compatibility: None,
         runtime_profile: None,
         snapshot_id: None,

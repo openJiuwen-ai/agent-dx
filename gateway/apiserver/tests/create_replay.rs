@@ -1,4 +1,15 @@
 //! Replay capacity is a cache budget, never a create admission limit.
+#[path = "support/http.rs"]
+mod http;
+#[path = "support/templates.rs"]
+mod templates;
+
+use adx_activator::{local_environment::LocalEnvironment, Activator};
+use adx_agent_api::{
+    activator::Control, local::LocalControl, managed::ManagedService, request::RequestContext,
+};
+use adx_agent_core::network::SandboxNetworkPolicy;
+use adx_agent_store::{AgentState, MemoryRepository};
 use adx_apiserver::{
     clients::Clients, config::Config, environment_service::EnvironmentService, http::Api,
     operations::Kind,
@@ -8,7 +19,7 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
@@ -24,6 +35,7 @@ use tonic::{Request, Response, Status};
 #[derive(Default)]
 struct State {
     owners: Mutex<HashMap<String, pb::GetEnvironmentResponse>>,
+    metadata: Mutex<HashMap<String, HashMap<String, String>>>,
     starts: AtomicUsize,
     create_calls: AtomicUsize,
     lookups: AtomicUsize,
@@ -32,6 +44,8 @@ struct State {
     pending_response: AtomicBool,
     deadlines: Mutex<Vec<u64>>,
     timeout_phase: Mutex<Option<String>>,
+    snapshot: Mutex<Option<pb::ReusableSnapshot>>,
+    snapshot_calls: AtomicUsize,
     release: Notify,
 }
 #[derive(Clone)]
@@ -62,7 +76,9 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
         let deadline = request.get_ref().create_deadline_unix_millis;
         self.0.deadlines.lock().unwrap().push(request.get_ref().create_deadline_unix_millis);
         self.0.create_calls.fetch_add(1, Ordering::SeqCst);
-        let spec = request.into_inner().spec.unwrap();
+        let request = request.into_inner();
+        let user_metadata = request.user_metadata;
+        let spec = request.spec.unwrap();
         // The coordinator validates and canonicalizes E2B Environment specs
         // through the core model before publishing them.
         let spec = if spec.compatibility.is_some() {
@@ -91,6 +107,7 @@ assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: "nod
                     resources_held: true, ..Default::default()
                 };
                 owners.insert(spec.id, pb::GetEnvironmentResponse { record: Some(record.clone()), node_address: "127.0.0.1:9000".into(), relay_address: "127.0.0.1:9443".into() });
+                self.0.metadata.lock().unwrap().insert(record.spec.as_ref().unwrap().id.clone(), user_metadata);
                 record
             }
         };
@@ -122,6 +139,53 @@ assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: "nod
         }
         Ok(Response::new(pb::EnvironmentResult { record: Some(record), durability: pb::Durability::Published as i32 }))
     }
+    async fn get_environment_metadata(&self, request: Request<pb::GetEnvironmentMetadataRequest>) -> Result<Response<pb::EnvironmentMetadataRecord>, Status> {
+        let request = request.into_inner();
+        let owner = self.0.owners.lock().unwrap().get(&request.id).cloned()
+            .ok_or_else(|| Status::not_found("environment not found"))?;
+        let record = owner.record.ok_or_else(|| Status::not_found("environment not found"))?;
+        let spec = record.spec.ok_or_else(|| Status::not_found("environment not found"))?;
+        if request.caller.as_ref().is_none_or(|caller| caller.tenant_id != spec.tenant_id) {
+            return Err(Status::not_found("environment not found"));
+        }
+        Ok(Response::new(pb::EnvironmentMetadataRecord {
+            environment_id: request.id.clone(),
+            user_metadata: self.0.metadata.lock().unwrap().get(&request.id).cloned().unwrap_or_default(),
+            state: record.state,
+        }))
+    }
+    async fn list_e2b_environment_metadata(&self, request: Request<pb::ListEnvironmentMetadataRequest>) -> Result<Response<pb::ListEnvironmentMetadataResponse>, Status> {
+        let request = request.into_inner();
+        let caller = request.caller.ok_or_else(|| Status::unauthenticated("caller required"))?;
+        let owners = self.0.owners.lock().unwrap().clone();
+        let metadata = self.0.metadata.lock().unwrap().clone();
+        let mut records = owners.into_iter().filter_map(|(id, owner)| {
+            let record = owner.record?;
+            let spec = record.spec?;
+            let values = metadata.get(&id).cloned().unwrap_or_default();
+            (caller.tenant_id == spec.tenant_id
+                && spec.compatibility.is_some()
+                && (request.states.is_empty() || request.states.contains(&record.state))
+                && request.metadata_filter.iter().all(|(key, value)| values.get(key) == Some(value)))
+                .then_some(pb::EnvironmentMetadataRecord { environment_id: id, user_metadata: values, state: record.state })
+        }).collect::<Vec<_>>();
+        records.sort_by(|left, right| left.environment_id.cmp(&right.environment_id));
+        let start = if request.cursor.is_empty() {
+            0
+        } else {
+            request.cursor.strip_prefix("fixture:")
+                .and_then(|value| value.parse::<usize>().ok())
+                .ok_or_else(|| Status::invalid_argument("invalid fixture cursor"))?
+        }.min(records.len());
+        let limit = usize::try_from(request.limit).unwrap_or(0);
+        let end = start.saturating_add(limit).min(records.len());
+        let next_cursor = if end < records.len() {
+            format!("fixture:{end}")
+        } else {
+            String::new()
+        };
+        Ok(Response::new(pb::ListEnvironmentMetadataResponse { records: records[start..end].to_vec(), next_cursor }))
+    }
     async fn get_environment_control(&self, request: Request<pb::GetEnvironmentControlRequest>) -> Result<Response<pb::EnvironmentControlRecord>, Status> {
         let id = request.into_inner().id;
         let owner = self.0.owners.lock().unwrap().get(&id).cloned()
@@ -142,6 +206,7 @@ assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: "nod
     }
 }, [
     update_environment_control(UpdateEnvironmentControlRequest) -> EnvironmentControlRecord,
+    list_environment_metadata(ListEnvironmentMetadataRequest) -> ListEnvironmentMetadataResponse,
     list_environment_controls(ListEnvironmentControlsRequest) -> ListEnvironmentControlsResponse,
     get_scheduling_queue(GetSchedulingQueueRequest) -> GetSchedulingQueueResponse,
     set_node_scheduling(SetNodeSchedulingRequest) -> NodeSchedulingState,
@@ -168,6 +233,46 @@ impl pb::auth_service_server::AuthService for Service {
             caller: Some(caller()),
             expires_at_unix_seconds: 0,
         }))
+    }
+}
+
+#[tonic::async_trait]
+impl pb::snapshot_service_server::SnapshotService for Service {
+    async fn publish_snapshot(
+        &self,
+        _: Request<pb::PublishSnapshotRequest>,
+    ) -> Result<Response<pb::ReusableSnapshot>, Status> {
+        Err(Status::unimplemented("fixture only resolves snapshots"))
+    }
+
+    async fn get_snapshot(
+        &self,
+        request: Request<pb::GetSnapshotRequest>,
+    ) -> Result<Response<pb::ReusableSnapshot>, Status> {
+        self.0.snapshot_calls.fetch_add(1, Ordering::SeqCst);
+        let snapshot = self
+            .0
+            .snapshot
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|snapshot| snapshot.id == request.get_ref().id)
+            .ok_or_else(|| Status::not_found("snapshot not found"))?;
+        Ok(Response::new(snapshot))
+    }
+
+    async fn list_snapshots(
+        &self,
+        _: Request<pb::ListSnapshotsRequest>,
+    ) -> Result<Response<pb::ListSnapshotsResponse>, Status> {
+        Err(Status::unimplemented("fixture only resolves snapshots"))
+    }
+
+    async fn delete_snapshot(
+        &self,
+        _: Request<pb::DeleteSnapshotRequest>,
+    ) -> Result<Response<pb::ReusableSnapshot>, Status> {
+        Err(Status::unimplemented("fixture only resolves snapshots"))
     }
 }
 #[tonic::async_trait]
@@ -198,6 +303,7 @@ struct Fixture {
     clients: Arc<Clients>,
     api: Arc<Api>,
     state: Arc<State>,
+    templates: Arc<templates::TemplateSource>,
     server: tokio::task::JoinHandle<()>,
 }
 impl Drop for Fixture {
@@ -216,6 +322,7 @@ impl Fixture {
         let state = Arc::new(State::default());
         let endpoint = Service(state.clone());
         let auth = endpoint.clone();
+        let snapshots = endpoint.clone();
         let server = tokio::spawn(async move {
             let incoming = futures_util::stream::unfold(listener, |listener| async {
                 let socket = listener.accept().await.map(|(socket, _)| socket);
@@ -225,6 +332,7 @@ impl Fixture {
                 .add_service(pb::coordinator_service_server::CoordinatorServiceServer::new(endpoint.clone()))
                 .add_service(pb::environment_directory_service_server::EnvironmentDirectoryServiceServer::new(endpoint))
                 .add_service(pb::auth_service_server::AuthServiceServer::new(auth))
+                .add_service(pb::snapshot_service_server::SnapshotServiceServer::new(snapshots))
                 .serve_with_incoming(incoming).await.unwrap();
         });
         let config: Config = serde_json::from_value(json!({
@@ -234,22 +342,21 @@ impl Fixture {
             "e2b": {
                 "domain":"sandbox.test",
                 "envdVersion":"0.9.0",
-                "runtimeProfiles": {
-                    "e2b": {
-                        "rootfs":{"runtime_class":"runsc","type":"local","path":"/rootfs","readonly":true},
-                        "bootstrap":{"type":"erofs","root":"/rootfs","target":"/rootfs","entrypoint":["/rootfs/init"]},
-                        "env":{"ADX_ENVD_PATH":"/usr/local/bin/envd","ADX_ENVD_SHA256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
-                    }
-                },
-                "templates":{"templates":{"base":{
-                    "runtimeProfileRef":"e2b","defaultUser":"user","defaultWorkdir":"/workspace",
-                    "cpuMillicores":1000,"memoryMiB":512,"capabilities":["envd"]
-                }}}
+                "templates":{"base":{"name":"base","version":"1"}},
+                "requiredNodeLabels":{"adx.runtime.profile":"e2b-v1"}
+            },
+            "runtime_profile": {
+                "rootfs":{"runtime_class":"runsc","type":"local","path":"/rootfs","readonly":true},
+                "bootstrap":{"type":"erofs","root":"/rootfs","target":"/rootfs","entrypoint":["/rootfs/init"]},
+                "env":{"ADX_ENVD_PATH":"/usr/local/bin/envd","ADX_ENVD_SHA256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ADX_ENVD_DEFAULT_USER":"user","ADX_ENVD_DEFAULT_WORKDIR":"/workspace"}
             }
         })).unwrap();
         let clients = Clients::new(config).unwrap();
         let service = EnvironmentService::new(clients.clone());
-        let api = Api::new(clients.clone()).unwrap();
+        let (managed, templates) =
+            templates::TemplateSource::managed(vec![("tenant".into(), native_template())]);
+        let api =
+            Api::with_templates_and_environment(clients.clone(), service.clone(), managed).unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
             while service.inspect("tenant", "not-created").await.is_err() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -262,6 +369,7 @@ impl Fixture {
             clients,
             api,
             state,
+            templates,
             server,
         }
     }
@@ -281,6 +389,20 @@ impl Fixture {
         .await
         .unwrap();
     }
+}
+
+fn native_template() -> adx_agent_core::TemplateVersion {
+    serde_json::from_value(json!({
+        "name":"base","version":"1",
+        "image":format!("registry.example/base@sha256:{}", "a".repeat(64)),
+        "isolation_runtime":"runsc",
+        "env":{"NATIVE_TEMPLATE":"true"},
+        "resources":{"cpu_millis":1250,"memory_mib":768,"cpu_limit_millis":1500,"memory_limit_mib":1024},
+        "service":[{"protocol":"http","port":8080}],
+        "lifecycle":{"idle_timeout_seconds":600,"idle_action":"pause","pause":{"retention":{"kind":"forever"},"timeout_seconds":30,"storage":"shared"}},
+        "init_timeout_seconds":30,
+        "readiness_probe":{"tcp_socket":{"port":8080},"period_seconds":3,"timeout_seconds":2}
+    })).unwrap()
 }
 fn spec(id: &str) -> pb::EnvironmentSpec {
     pb::EnvironmentSpec {
@@ -379,7 +501,7 @@ async fn e2b_create_through_http_listener_completes_on_default_worker_stack() {
             .await
             .unwrap();
     });
-    let request = br#"{"templateID":"base"}"#;
+    let request = br#"{"templateID":"base","envVars":{"REQUEST_VALUE":"ok"}}"#;
     let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
     let request = format!(
         "POST /v2/sandboxes HTTP/1.1\r\nHost: localhost\r\nX-API-Key: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
@@ -396,6 +518,312 @@ async fn e2b_create_through_http_listener_completes_on_default_worker_stack() {
         "{}",
         String::from_utf8_lossy(&response)
     );
+    assert_eq!(
+        fixture.templates.calls(),
+        vec![("tenant".into(), "base".into(), "1".into())]
+    );
+    let owner = fixture
+        .state
+        .owners
+        .lock()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    let spec = owner.record.unwrap().spec.unwrap();
+    assert_eq!(spec.image, native_template().image);
+    assert_eq!(spec.env["NATIVE_TEMPLATE"], "true");
+    assert_eq!(spec.env["REQUEST_VALUE"], "ok");
+    assert_eq!(spec.resources.as_ref().unwrap().cpu_millis, 1250);
+    let execution = spec.execution.as_ref().unwrap();
+    assert!(execution.inherit_entrypoint);
+    assert_eq!(execution.ports, vec![8080]);
+    assert_eq!(execution.limits.as_ref().unwrap().cpu_millis, 1500);
+    assert_eq!(
+        execution.limits.as_ref().unwrap().memory_bytes,
+        1024 * 1_048_576
+    );
+    assert_eq!(execution.init_timeout_seconds, 30);
+    assert!(execution.readiness_probe.is_some());
+    assert_eq!(spec.lifecycle.as_ref().unwrap().idle_timeout_seconds, 0);
+    assert_eq!(
+        spec.scheduling.unwrap().required_node[0].match_labels["adx.runtime.profile"],
+        "e2b-v1"
+    );
+    let identity = spec.template_identity.unwrap();
+    assert_eq!(identity.tenant_id, "tenant");
+    assert_eq!(identity.name, "base");
+    assert_eq!(identity.version, "1");
+}
+
+#[tokio::test]
+async fn e2b_create_rejects_control_environment_overrides_before_template_lookup() {
+    let fixture = Fixture::new().await;
+    let headers = [
+        ("X-API-Key", "k".repeat(32)),
+        ("Content-Type", "application/json".into()),
+    ];
+    let response = crate::http::request(
+        fixture.api.clone(),
+        "POST",
+        "/v2/sandboxes",
+        &headers,
+        r#"{"templateID":"base","envVars":{"ADX_ENVD_PATH":"injected"}}"#,
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 400);
+    assert!(fixture.templates.calls().is_empty());
+}
+
+#[tokio::test]
+async fn configured_native_alias_not_found_does_not_fallback_to_same_named_snapshot() {
+    let fixture = Fixture::new().await;
+    *fixture.state.snapshot.lock().unwrap() = Some(pb::ReusableSnapshot {
+        id: "base".into(),
+        template: Some(spec("snapshot-base")),
+        state: pb::SnapshotState::Ready as i32,
+        ..Default::default()
+    });
+    let (managed, source) =
+        templates::TemplateSource::managed(vec![("other-tenant".into(), native_template())]);
+    let api = Api::with_templates_and_environment(
+        fixture.clients.clone(),
+        fixture.service.clone(),
+        managed,
+    )
+    .unwrap();
+    let headers = [
+        ("X-API-Key", "k".repeat(32)),
+        ("Content-Type", "application/json".into()),
+    ];
+    let response = http::request(
+        api,
+        "POST",
+        "/v2/sandboxes",
+        &headers,
+        r#"{"templateID":"base"}"#,
+    )
+    .await;
+    assert_eq!(response.status().as_u16(), 404);
+    assert_eq!(fixture.state.snapshot_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        source.calls(),
+        vec![("tenant".into(), "base".into(), "1".into())]
+    );
+}
+
+#[tokio::test]
+async fn create_rejects_oversized_platform_metadata_before_any_create_rpc() {
+    let fixture = Fixture::new().await;
+    let metadata = (0..17)
+        .map(|index| (format!("key-{index}"), "x".repeat(4096)))
+        .collect::<BTreeMap<_, _>>();
+    let error = fixture
+        .service
+        .create_with_metadata(
+            spec("metadata-too-large"),
+            json!({}),
+            "metadata-too-large",
+            &caller(),
+            metadata,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn native_template_query_uses_real_local_control_without_binding_or_environment_create() {
+    let fixture = Fixture::new().await;
+    let environment = Arc::new(
+        LocalEnvironment::new(
+            fixture.service.clone(),
+            Duration::from_secs(60),
+            SandboxNetworkPolicy {
+                sandbox_cidrs: vec!["10.0.0.0/24".into()],
+                internal_cidrs: vec![],
+                public_egress: false,
+                egress_allow: vec![],
+            },
+        )
+        .unwrap(),
+    );
+    let activator = Arc::new(Activator::new(
+        AgentState::new(Arc::new(MemoryRepository::default())),
+        environment,
+    ));
+    let control = Arc::new(LocalControl::new(activator));
+    let managed = Arc::new(ManagedService::new(control.clone()));
+    let context = RequestContext::new(Duration::from_secs(3));
+    control
+        .publish(&context, "tenant", &native_template())
+        .await
+        .unwrap();
+    let api = Api::with_templates_and_environment(
+        fixture.clients.clone(),
+        fixture.service.clone(),
+        managed,
+    )
+    .unwrap();
+    let template = api.native_template("tenant", "base", "1").await.unwrap();
+    assert_eq!(template, native_template());
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 0);
+    assert!(control
+        .binding(
+            &context,
+            &adx_agent_core::Scope {
+                tenant: "tenant".into(),
+                template: "base".into(),
+                version: "1".into(),
+                binding_id: "unused".into(),
+            }
+        )
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn e2b_list_delegates_metadata_filters_and_opaque_cursors_to_platform() {
+    let fixture = Fixture::new().await;
+    let headers = [
+        ("X-API-Key", "k".repeat(32)),
+        ("Content-Type", "application/json".into()),
+    ];
+    for metadata in [
+        r#"{"team":"core","purpose":"one"}"#,
+        r#"{"team":"core","purpose":"two"}"#,
+    ] {
+        let response = http::request(
+            fixture.api.clone(),
+            "POST",
+            "/v2/sandboxes",
+            &headers,
+            &format!(r#"{{"templateID":"base","metadata":{metadata}}}"#),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), 201);
+    }
+    let page = http::request(
+        fixture.api.clone(),
+        "GET",
+        "/v2/sandboxes?metadata=team%3Dcore&limit=1",
+        &headers,
+        "",
+    )
+    .await;
+    assert_eq!(page.status().as_u16(), 200);
+    assert_eq!(page.headers().get("x-next-token").unwrap(), "fixture:1");
+    let page: Value = serde_json::from_slice(page.body()).unwrap();
+    assert_eq!(page.as_array().unwrap().len(), 1);
+    assert_eq!(page[0]["metadata"]["team"], "core");
+    assert_eq!(page[0].get("envdAccessToken"), None);
+    let next = http::request(
+        fixture.api.clone(),
+        "GET",
+        "/v2/sandboxes?metadata=team%3Dcore&limit=1&nextToken=fixture%3A1",
+        &headers,
+        "",
+    )
+    .await;
+    assert_eq!(next.status().as_u16(), 200);
+    let next: Value = serde_json::from_slice(next.body()).unwrap();
+    assert_eq!(next.as_array().unwrap().len(), 1);
+    assert_ne!(page[0]["sandboxID"], next[0]["sandboxID"]);
+}
+
+#[tokio::test]
+async fn e2b_snapshot_clone_uses_the_persisted_spec_after_alias_resolution() {
+    let fixture = Fixture::new().await;
+    let headers = [
+        ("X-API-Key", "k".repeat(32)),
+        ("Content-Type", "application/json".into()),
+    ];
+    let first = http::request(
+        fixture.api.clone(),
+        "POST",
+        "/v2/sandboxes",
+        &headers,
+        r#"{"templateID":"base","metadata":{"source":"one"}}"#,
+    )
+    .await;
+    assert_eq!(first.status().as_u16(), 201);
+    let mut original = fixture
+        .state
+        .owners
+        .lock()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .record
+        .as_ref()
+        .unwrap()
+        .spec
+        .clone()
+        .unwrap();
+    // The published alias may be removed or repointed after the snapshot. Restore must consume
+    // the persisted specification and never attempt to resolve this historical identity.
+    original.compatibility.as_mut().unwrap().template_id = "deleted-alias".into();
+    *fixture.state.snapshot.lock().unwrap() = Some(pb::ReusableSnapshot {
+        id: "snapshot-1".into(),
+        template: Some(original.clone()),
+        state: pb::SnapshotState::Ready as i32,
+        ..Default::default()
+    });
+
+    let cloned = http::request(
+        fixture.api.clone(),
+        "POST",
+        "/v2/sandboxes",
+        &headers,
+        r#"{"templateID":"snapshot-1","metadata":{"clone":"two"}}"#,
+    )
+    .await;
+    assert_eq!(cloned.status().as_u16(), 201);
+    let cloned = fixture
+        .state
+        .owners
+        .lock()
+        .unwrap()
+        .values()
+        .map(|owner| {
+            owner
+                .record
+                .as_ref()
+                .unwrap()
+                .spec
+                .as_ref()
+                .unwrap()
+                .clone()
+        })
+        .find(|spec| spec.id != original.id)
+        .unwrap();
+    assert_eq!(fixture.state.snapshot_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture.templates.calls(),
+        vec![("tenant".into(), "base".into(), "1".into())]
+    );
+    assert_eq!(cloned.image, original.image);
+    assert_eq!(cloned.resources, original.resources);
+    assert_eq!(cloned.env, original.env);
+    assert_eq!(cloned.runtime_profile, original.runtime_profile);
+    let original_compatibility = original.compatibility.unwrap();
+    let cloned_compatibility = cloned.compatibility.unwrap();
+    assert_eq!(cloned.template_identity, original.template_identity);
+    assert_ne!(
+        cloned_compatibility.envd_access_token,
+        original_compatibility.envd_access_token
+    );
+    assert_ne!(
+        cloned_compatibility.traffic_access_token,
+        original_compatibility.traffic_access_token
+    );
+    let metadata = fixture.state.metadata.lock().unwrap();
+    assert_eq!(metadata[&original.id]["source"], "one");
+    assert_eq!(metadata[&cloned.id]["clone"], "two");
+    assert!(!metadata[&cloned.id].contains_key("source"));
 }
 #[tokio::test]
 async fn unknown_results_do_not_block_new_names_and_retry_original_identity() {

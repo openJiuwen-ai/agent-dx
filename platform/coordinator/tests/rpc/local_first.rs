@@ -931,6 +931,7 @@ async fn new_local_claim_avoids_redundant_preclaim_storage_read() {
             caller: caller(),
             node_session_id: "boot-a".into(),
             devices: vec![],
+            user_metadata: Default::default(),
         })
         .await
         .unwrap();
@@ -957,6 +958,7 @@ async fn concurrent_local_claims_share_bounded_redis_commits() {
                     caller: caller(),
                     node_session_id: "boot-a".into(),
                     devices: vec![],
+                    user_metadata: Default::default(),
                 })
                 .await
                 .unwrap()
@@ -987,6 +989,7 @@ async fn claim_rpc_auth_session_directory_and_real_delayed_redis_write() {
         caller: caller(),
         node_session_id: "boot-a".into(),
         devices: vec![],
+        user_metadata: Default::default(),
     };
     assert_eq!(
         rig.coordinator
@@ -1440,4 +1443,47 @@ async fn existing_terminal_claim_reconciles_a_late_commit_into_scheduler_account
         "{metrics}"
     );
     rig.delete(&recreated).await;
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; ADX_TEST_REDIS_SERVER"]
+async fn local_first_preserves_native_metadata_and_rejects_changed_replay() {
+    let mut rig = Rig::new().await;
+    let mut request = Rig::request("native-metadata", 0);
+    request.create.as_mut().unwrap().user_metadata = [("note".into(), "line one\nline two".into())]
+        .into_iter()
+        .collect();
+    let created = rig.nodes[0]
+        .create_local_environment(request.clone())
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    let stored = rig.session.get("native-metadata").await.unwrap();
+    assert!(stored.spec.compatibility.is_none());
+    assert_eq!(stored.user_metadata["note"], "line one\nline two");
+    assert!(!stored.spec.env.contains_key("note"));
+    assert!(!stored.spec.scheduling.labels.contains_key("note"));
+    request.create.as_mut().unwrap().user_metadata.clear();
+    assert!(rig.nodes[0]
+        .create_local_environment(request)
+        .await
+        .is_err());
+    assert_eq!(
+        rig.session
+            .get("native-metadata")
+            .await
+            .unwrap()
+            .user_metadata,
+        stored.user_metadata
+    );
+    assert_eq!(
+        rig.backends
+            .iter()
+            .map(|backend| backend.started.load(Ordering::SeqCst))
+            .sum::<usize>(),
+        1
+    );
+    rig.delete(&created).await;
 }
