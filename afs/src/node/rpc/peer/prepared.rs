@@ -187,6 +187,7 @@ mod tests {
             attempt_id: "attempt".into(),
             file_version_id: "version".into(),
             layout_root_id: "layout".into(),
+            include_blake3_outboard: false,
             operations: vec![DfsChunkReadOp {
                 operation_index: 0,
                 chunk_id: "chunk".into(),
@@ -250,13 +251,14 @@ mod tests {
                             chunk_offset: operation.chunk_offset,
                             length: operation.length,
                             source_copy_id: operation.source_copy_id.clone(),
+                            blake3_outboard: prost::bytes::Bytes::new(),
                         },
                     ),
                 ),
             },
             DfsReadRangesFrame {
                 body: Some(afs_protocol::node_data::dfs_read_ranges_frame::Body::Data(
-                    bytes.to_vec(),
+                    bytes.to_vec().into(),
                 )),
             },
             DfsReadRangesFrame {

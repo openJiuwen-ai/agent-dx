@@ -2078,8 +2078,13 @@ impl DfsReadEngine {
                 "private native read cannot use an external backend",
             ));
         }
-        // Native layout operations are disjoint. Reject overlaps explicitly:
-        // direct local grouping must not change the old scatter precedence.
+        Self::validate_private_output_ranges(batch)?;
+        self.read_private_batch_checked(batch, out, deadline)
+    }
+
+    /// Native layout operations are disjoint. Reject overlaps explicitly:
+    /// direct local grouping must not change the old scatter precedence.
+    fn validate_private_output_ranges(batch: &ReadBatch) -> Result<()> {
         for (index, left) in batch.ops.iter().enumerate() {
             if left.length == 0 {
                 continue;
@@ -2090,9 +2095,20 @@ impl DfsReadEngine {
                     && left.output_offset < right.output_offset + right.length as usize
                     && right.output_offset < left_end
             }) {
-                return Err(invalid("private native read output ranges overlap"));
+                return Err(invalid("private read output ranges overlap"));
             }
         }
+        Ok(())
+    }
+
+    /// Runs the native transfer into an unpublished private buffer and checks
+    /// that the read authority did not change while it was in flight.
+    fn read_private_batch_checked(
+        &self,
+        batch: &ReadBatch,
+        out: &mut [u8],
+        deadline: Option<Instant>,
+    ) -> Result<()> {
         let authority = self.capture_native_read_authority()?;
         self.read_batch_into_private(batch, out, true, deadline, None)
             .inspect_err(|error| {
@@ -2207,16 +2223,24 @@ impl DfsReadEngine {
         result
     }
 
-    /// Aggregated sequential read-ahead. The group limit is separate from the
-    /// legacy per-batch budget, and all ranges still publish together.
-    pub fn read_group_batch(
+    /// Aggregated sequential read-ahead into a caller-owned, unpublished group
+    /// window. The group limit is separate from the legacy per-batch budget.
+    /// On error this private buffer may change and must be discarded. Range
+    /// offsets must already be packed from zero and must not overlap; external
+    /// reads keep the staging path because publication there is bounded by a
+    /// separately captured authority deadline.
+    pub fn read_group_batch_native_into_private(
         &self,
         batch: &ReadBatch,
         out: &mut [u8],
         group_bytes: u64,
     ) -> Result<()> {
         batch.validate_group_for_output(out.len(), group_bytes)?;
-        self.read_batch_limited(batch, out)
+        if self.external_backend.is_some() {
+            return self.read_batch_limited(batch, out);
+        }
+        Self::validate_private_output_ranges(batch)?;
+        self.read_private_batch_checked(batch, out, None)
     }
 
     fn read_batch_limited(&self, batch: &ReadBatch, out: &mut [u8]) -> Result<()> {
@@ -5151,18 +5175,37 @@ impl DfsReadEngine {
                         && matches!(&source.location, CopyLocation::Node { node_id, .. } if node_id != &self.local_node_id)
                 }).cloned().collect()).unwrap_or_default()
         }).collect();
+        struct GroupWork {
+            group: Vec<usize>,
+            attempt: PeerReadBatch,
+            scratch: Vec<u8>,
+            direct: bool,
+            integrity: Option<ChunkObject>,
+        }
+        enum GroupOutcome {
+            Done(GroupWork),
+            Failed { work: GroupWork, error: Error },
+        }
+
         let mut next = vec![0; batch.ops.len()];
         let mut pending: Vec<usize> = (0..batch.ops.len()).collect();
         let mut last_error = None;
         while !pending.is_empty() {
             let mut groups: Vec<Vec<usize>> = Vec::new();
             for &index in &pending {
-                let Some(source) = candidates[index].get(next[index]) else {
+                let candidate_count = candidates[index].len();
+                if candidate_count == 0 {
                     return Err(last_error
                         .unwrap_or_else(|| corrupt("committed Chunk has no readable copy")));
-                };
+                }
+                // Stripe independent operations over every available peer so
+                // multi-source reads transfer concurrently instead of sharing
+                // one sequential peer queue. A retry advances exactly once.
+                let choice = (next[index] + index) % candidate_count;
+                let source = &candidates[index][choice];
                 if let Some(group) = groups.iter_mut().find(|group| {
                     let first = group[0];
+                    let first_choice = (next[first] + first) % candidates[first].len();
                     !sources.iter().any(|set| {
                         (set.chunk_id == batch.ops[index].chunk_id
                             || set.chunk_id == batch.ops[first].chunk_id)
@@ -5170,7 +5213,7 @@ impl DfsReadEngine {
                                 .chunk
                                 .as_ref()
                                 .is_some_and(ChunkObject::is_segment_crc32c)
-                    }) && same_peer_context(&candidates[first][next[first]], source)
+                    }) && same_peer_context(&candidates[first][first_choice], source)
                 }) {
                     group.push(index);
                 } else {
@@ -5178,6 +5221,7 @@ impl DfsReadEngine {
                 }
             }
             pending.clear();
+            let mut work = Vec::with_capacity(groups.len());
             for group in groups {
                 let mut length = 0;
                 let operations = group
@@ -5186,9 +5230,10 @@ impl DfsReadEngine {
                         let mut op = batch.ops[index].clone();
                         op.output_offset = length;
                         length += op.length as usize; // validated by ReadBatch
+                        let choice = (next[index] + index) % candidates[index].len();
                         ResolvedReadOp {
                             op,
-                            source: candidates[index][next[index]].clone(),
+                            source: candidates[index][choice].clone(),
                         }
                     })
                     .collect();
@@ -5205,46 +5250,124 @@ impl DfsReadEngine {
                     && group.len() == 1
                     && batch.ops[0].output_offset == 0
                     && length == out.len();
-                let mut scratch = if direct { Vec::new() } else { vec![0; length] };
+                let scratch = if direct { Vec::new() } else { vec![0; length] };
+                // CRC32C objects never join a multi-operation group; their exact
+                // range is verified against the Meta-bound descriptor by the adapter.
                 let integrity = sources
                     .iter()
                     .find(|set| set.chunk_id == batch.ops[group[0]].chunk_id)
-                    .and_then(|set| set.chunk.as_ref())
-                    .filter(|chunk| chunk.is_segment_crc32c());
-                let target = if direct { &mut *out } else { &mut scratch };
-                let result = if let Some(chunk) = integrity {
-                    self.transfer
-                        .read_crc32c_range_async(&attempt, chunk, target)
-                        .await
-                } else {
-                    self.transfer_batch(&attempt, target).await
-                };
-                match result {
-                    Ok(()) => {
-                        if attempt
+                    .and_then(|set| set.chunk.clone())
+                    .filter(ChunkObject::is_segment_crc32c);
+                work.push(GroupWork {
+                    group,
+                    attempt,
+                    scratch,
+                    direct,
+                    integrity,
+                });
+            }
+            // One peer context keeps the historical path and may write the
+            // caller buffer in place. Multiple peers run one transfer each.
+            let outcomes = if work.len() <= 1 {
+                let mut outcomes = Vec::with_capacity(work.len());
+                for mut item in work {
+                    let result = match (item.integrity.as_ref(), item.direct) {
+                        (Some(chunk), true) => {
+                            self.transfer
+                                .read_crc32c_range_async(&item.attempt, chunk, out)
+                                .await
+                        }
+                        (Some(chunk), false) => {
+                            self.transfer
+                                .read_crc32c_range_async(&item.attempt, chunk, &mut item.scratch)
+                                .await
+                        }
+                        (None, true) => self.transfer_batch(&item.attempt, out).await,
+                        (None, false) => {
+                            self.transfer_batch(&item.attempt, &mut item.scratch).await
+                        }
+                    };
+                    outcomes.push(match result {
+                        Ok(()) => GroupOutcome::Done(item),
+                        Err(error) => GroupOutcome::Failed { work: item, error },
+                    });
+                }
+                outcomes
+            } else {
+                // Independent peers transfer in parallel. Each thread drives its
+                // own future through the adapter's synchronous boundary, so no
+                // two groups ever borrow the caller buffer at once.
+                std::thread::scope(|scope| {
+                    let handles = work
+                        .into_iter()
+                        .map(|mut item| {
+                            let engine = &*self;
+                            debug_assert!(!item.direct);
+                            scope.spawn(move || {
+                                let result = engine.transfer.block_on_read(Box::pin(async {
+                                    match item.integrity.as_ref() {
+                                        Some(chunk) => {
+                                            engine
+                                                .transfer
+                                                .read_crc32c_range_async(
+                                                    &item.attempt,
+                                                    chunk,
+                                                    &mut item.scratch,
+                                                )
+                                                .await
+                                        }
+                                        None => {
+                                            engine
+                                                .transfer_batch(&item.attempt, &mut item.scratch)
+                                                .await
+                                        }
+                                    }
+                                }));
+                                match result {
+                                    Ok(()) => GroupOutcome::Done(item),
+                                    Err(error) => GroupOutcome::Failed { work: item, error },
+                                }
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    handles
+                        .into_iter()
+                        .map(|handle| match handle.join() {
+                            Ok(outcome) => outcome,
+                            Err(panic) => std::panic::resume_unwind(panic),
+                        })
+                        .collect::<Vec<_>>()
+                })
+            };
+            for outcome in outcomes {
+                match outcome {
+                    GroupOutcome::Done(item) => {
+                        if item
+                            .attempt
                             .operations
                             .iter()
-                            .any(|item| !self.source_matches(batch, &item.source))
+                            .any(|operation| !self.source_matches(batch, &operation.source))
                         {
                             return Err(external_denied(
                                 "native peer read authority expired before publication",
                             ));
                         }
-                        if direct {
+                        if item.direct {
                             continue;
                         }
-                        for (&index, item) in group.iter().zip(&attempt.operations) {
+                        for (&index, operation) in item.group.iter().zip(&item.attempt.operations) {
                             let original = &batch.ops[index];
                             let len = original.length as usize;
                             self.local
                                 .record_read_copy("attempt_to_staging", original.length);
                             out[original.output_offset..original.output_offset + len]
                                 .copy_from_slice(
-                                    &scratch[item.op.output_offset..item.op.output_offset + len],
+                                    &item.scratch[operation.op.output_offset
+                                        ..operation.op.output_offset + len],
                                 );
                         }
                     }
-                    Err(error) => {
+                    GroupOutcome::Failed { work: item, error } => {
                         self.invalidate_native_batch_on_error(batch, &error);
                         if matches!(
                             error.kind(),
@@ -5260,19 +5383,21 @@ impl DfsReadEngine {
                         // operation on that same source once with a fresh scratch.
                         // Each candidate gets at most one batch and one single-op
                         // attempt; failed singles advance exactly once.
-                        for (index, item) in group.iter().copied().zip(&attempt.operations) {
-                            if group.len() > 1 {
-                                let mut single = item.clone();
+                        for (index, operation) in
+                            item.group.iter().copied().zip(&item.attempt.operations)
+                        {
+                            if item.group.len() > 1 {
+                                let mut single = operation.clone();
                                 single.op.output_offset = 0;
                                 let single_batch = PeerReadBatch {
                                     file_version_id: version.clone(),
                                     layout_root_id: batch.layout_root_id.clone(),
                                     operations: vec![single],
                                 };
-                                let mut single_scratch = vec![0; item.op.length as usize];
+                                let mut single_scratch = vec![0; operation.op.length as usize];
                                 match self.transfer_batch(&single_batch, &mut single_scratch).await {
                                     Ok(()) => {
-                                        if !self.source_matches(batch, &item.source) {
+                                        if !self.source_matches(batch, &operation.source) {
                                             return Err(external_denied(
                                                 "native peer read authority expired before publication",
                                             ));
@@ -10479,6 +10604,8 @@ mod tests {
         let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
             revision: 1,
             chunks: vec![ChunkSources {
+                allowed_ranges: Vec::new(),
+                chunk: None,
                 chunk_id: chunk.clone(),
                 sources: vec![source("a-copy", &chunk, "node-b")],
             }],
@@ -10495,6 +10622,7 @@ mod tests {
         )
         .with_transport_metrics(metrics.clone());
         let batch = ReadBatch {
+            lookahead: Vec::new(),
             file_version_id: Some(FileVersionId::new("version")),
             layout_root_id: LayoutRootId::new("layout"),
             ops: vec![ChunkReadOp {
@@ -10531,6 +10659,8 @@ mod tests {
         let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
             revision: 1,
             chunks: vec![ChunkSources {
+                allowed_ranges: Vec::new(),
+                chunk: None,
                 chunk_id: chunk.clone(),
                 sources: vec![source("a-copy", &chunk, "node-b")],
             }],
@@ -10547,6 +10677,7 @@ mod tests {
         )
         .with_transport_metrics(metrics);
         let batch = ReadBatch {
+            lookahead: Vec::new(),
             file_version_id: Some(FileVersionId::new("version")),
             layout_root_id: LayoutRootId::new("layout"),
             ops: vec![ChunkReadOp {

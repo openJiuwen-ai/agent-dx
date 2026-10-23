@@ -2555,7 +2555,7 @@ fn dfs_read_group_defaults_and_rejects_invalid_budgets() {
         "--dfs-read-group-mode",
         "sequential",
         "--dfs-read-group-bytes",
-        "104857600",
+        "100663296",
         "--dfs-read-group-host-budget-bytes",
         "1073741824",
     ])
@@ -2565,5 +2565,5 @@ fn dfs_read_group_defaults_and_rejects_invalid_budgets() {
         serde_json::to_value(&cfg).unwrap()["dfs_read_group_mode"],
         "sequential"
     );
-    assert_eq!(cfg.dfs_read_group_bytes, 104857600);
+    assert_eq!(cfg.dfs_read_group_bytes, 100663296);
 }

@@ -1452,6 +1452,7 @@ impl PinnedChunkReader {
             force,
             self.read_work.as_ref(),
             builder,
+            None,
         )?;
         if PeerFileIdentity::read(&self.file)? != before {
             return Err(corrupt(
@@ -1655,6 +1656,13 @@ std::thread_local! {
 #[cfg(test)]
 pub(crate) fn reset_verified_scan_count_for_test() {
     VERIFIED_SCAN_COUNT_FOR_TEST.with(|count| count.set(0));
+}
+
+/// Parallel packing scans Chunks on worker threads, so the caller records the
+/// completed scans on its own counter.
+#[cfg(test)]
+pub(crate) fn note_verified_scan_for_test() {
+    VERIFIED_SCAN_COUNT_FOR_TEST.with(|count| count.set(count.get().saturating_add(1)));
 }
 
 #[cfg(test)]
@@ -4250,7 +4258,7 @@ impl LocalChunkStore {
     /// Fill a caller-owned, unpublished range with one complete integrity scan.
     /// The output may be dirtied on failure and must not be returned to a peer
     /// until this operation succeeds. No verified reader or cache is retained.
-    #[cfg(any(all(feature = "dfs", feature = "rdma"), test))]
+    #[cfg(test)]
     pub(crate) fn read_range_at_uncommitted(
         &self,
         chunk_id: &ChunkId,
@@ -4277,24 +4285,6 @@ impl LocalChunkStore {
         })
     }
 
-    /// Verify one immutable Chunk while scattering all requested ranges into
-    /// an uncommitted output buffer. The output may be partially written when
-    /// this returns an error; callers must not publish it on failure.
-    pub(crate) fn read_ranges_at_uncommitted(
-        &self,
-        chunk_id: &ChunkId,
-        ranges: &[VerifiedRangeCopy],
-        out: &mut [u8],
-    ) -> Result<Vec<usize>> {
-        self.open_unverified_reader(chunk_id)?
-            .read_ranges_at_uncommitted(ranges, out)
-            .inspect_err(|error| {
-                if verified_copy_is_invalid(error) {
-                    self.try_quarantine(chunk_id);
-                }
-            })
-    }
-
     /// Read requested ranges and return each range's BLAKE3 digest from the
     /// same verifying scan, so callers do not hash the bytes a second time.
     pub(crate) fn read_ranges_at_uncommitted_with_checksums(
@@ -4303,41 +4293,13 @@ impl LocalChunkStore {
         ranges: &[VerifiedRangeCopy],
         out: &mut [u8],
     ) -> Result<(Vec<usize>, Vec<[u8; 32]>)> {
-        self.open_unverified_reader(chunk_id)?
+        self.open_cataloged(chunk_id)?
             .read_ranges_at_uncommitted_with_checksums(ranges, out)
             .inspect_err(|error| {
                 if verified_copy_is_invalid(error) {
                     self.try_quarantine(chunk_id);
                 }
             })
-    }
-
-    fn open_unverified_reader(&self, chunk_id: &ChunkId) -> Result<PinnedChunkReader> {
-        let record = self
-            .catalog
-            .lock()
-            .map_err(|_| invalid("local chunk catalog lock is poisoned"))?
-            .records
-            .get(chunk_id)
-            .cloned()
-            .ok_or_else(|| invalid(format!("local Chunk '{}' is not cataloged", chunk_id.0)))?;
-        if record.state != LocalChunkState::Durable {
-            return Err(corrupt(chunk_id, "local copy is quarantined"));
-        }
-        let path = self.path_for_record(&record)?;
-        let file = match File::open(path).map_err(Error::from) {
-            Ok(file) => file,
-            Err(error) => {
-                if verified_copy_is_invalid(&error) {
-                    self.try_quarantine(chunk_id);
-                }
-                return Err(error);
-            }
-        };
-        Ok(PinnedChunkReader {
-            file,
-            chunk: record.chunk,
-        })
     }
 
     #[cfg(any(all(feature = "dfs", feature = "rdma"), test))]
@@ -5082,6 +5044,7 @@ impl LocalChunkStore {
                 true,
                 self.read_work.as_ref(),
                 builder,
+                None,
             )?;
             if PeerFileIdentity::read(&file)? != before
                 || self.peer_catalog_record(chunk_id)? != record
@@ -5820,6 +5783,7 @@ fn verified_ranges_with_checksums_into(
         .map(|(counts, _)| counts)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verified_ranges_into_building(
     file: &File,
     chunk: &ChunkObject,

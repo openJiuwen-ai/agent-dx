@@ -568,6 +568,7 @@ async fn stream_prepared_read(
             chunk_offset: operation.chunk_offset,
             length: operation.length,
             source_copy_id: operation.source_copy_id.clone(),
+            blake3_outboard: prost::bytes::Bytes::new(),
         }))
         .await?;
         let start = packed_cursor;
@@ -589,7 +590,7 @@ async fn stream_prepared_read(
             let end = offset
                 .saturating_add(PREPARED_READ_FRAME_BYTES)
                 .min(range.len());
-            let data = range[offset..end].to_vec();
+            let data = prost::bytes::Bytes::copy_from_slice(&range[offset..end]);
             let sent_bytes = data.len();
             send(dfs_read_ranges_frame::Body::Data(data)).await?;
             if let Some(metrics) = metrics {
@@ -649,6 +650,174 @@ pub(super) fn read_packed_dfs_ranges(
     read_packed_dfs_ranges_with_budget(local, request, length, budget)
 }
 
+/// Chunk scans are independent reads plus BLAKE3, so a batch completes in
+/// roughly one Chunk's scan time instead of the sum of its Chunks.
+fn source_scan_pool() -> Option<&'static rayon_core::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon_core::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let workers = std::thread::available_parallelism()
+            .map_or(4, |parallel| parallel.get())
+            .clamp(1, MAX_SOURCE_SCAN_THREADS);
+        rayon_core::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .thread_name(|index| format!("afs-source-scan-{index}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+/// A verified group batch holds at most 128 MiB of 4 MiB Chunks, so this also
+/// bounds the transient per-Chunk copy buffers to 64 MiB.
+const MAX_SOURCE_SCAN_THREADS: usize = 16;
+
+/// One range's transport digest and its bounded descriptor.
+#[derive(Clone)]
+struct PackedRangeDigest {
+    checksum: Vec<u8>,
+    algorithm: i32,
+    table: Vec<u8>,
+}
+
+/// One Chunk's requested ranges in packed-output order.
+struct PackedChunkGroup {
+    chunk_id: String,
+    /// Operation index, relative output range, and absolute packed offset.
+    ranges: Vec<(usize, crate::node::chunk::VerifiedRangeCopy, usize)>,
+    relative_length: usize,
+}
+
+/// Runs one independent Chunk scan per slot on the bounded scan pool.
+fn run_chunk_scans<F>(count: usize, scan: F)
+where
+    F: Fn(usize) + Send + Sync,
+{
+    match source_scan_pool() {
+        Some(pool) => {
+            let scan = &scan;
+            pool.install(|| {
+                rayon_core::scope(|scope| {
+                    for index in 0..count {
+                        scope.spawn(move |_| scan(index));
+                    }
+                });
+            });
+        }
+        None => (0..count).for_each(scan),
+    }
+}
+
+/// Verifies one immutable Chunk once, copies every requested range into `out`
+/// and returns the per-range digests from that same scan.
+fn scan_packed_chunk(
+    local: &crate::node::chunk::LocalChunkStore,
+    group: &PackedChunkGroup,
+    out: &mut [u8],
+    deadline: Instant,
+) -> Result<Vec<PackedRangeDigest>, Status> {
+    let id = crate::dfs::ChunkId::new(group.chunk_id.clone());
+    // CRC32C objects are bound to a Meta descriptor, so each range digest is
+    // the CRC of the copied bytes plus that bounded descriptor.
+    if let Some(table) = local
+        .peer_crc32c_table(&id)
+        .map_err(super::error_to_status)?
+    {
+        let descriptor =
+            serde_json::to_vec(&table).map_err(|error| Status::internal(error.to_string()))?;
+        let mut digests = Vec::with_capacity(group.ranges.len());
+        for (_, range, _) in &group.ranges {
+            let end = range
+                .output_offset
+                .checked_add(range.length)
+                .ok_or_else(|| Status::internal("packed DFS range overflow"))?;
+            let payload = local
+                .read_peer_range_until(&id, range.chunk_offset, range.length, deadline)
+                .map_err(super::error_to_status)?;
+            let data = payload.as_slice();
+            if data.len() != range.length {
+                return Err(super::coded_status(
+                    afs_error::NODE_TRANSFER_CORRUPT_DATA,
+                    "immutable Chunk ended before packed DFS range",
+                ));
+            }
+            out.get_mut(range.output_offset..end)
+                .ok_or_else(|| Status::internal("packed DFS range exceeds its buffer"))?
+                .copy_from_slice(data);
+            digests.push(PackedRangeDigest {
+                checksum: crate::node::chunk_crc32c::checksum(data)
+                    .to_le_bytes()
+                    .to_vec(),
+                algorithm: afs_protocol::node_data::DfsDigestAlgorithm::Crc32c as i32,
+                table: descriptor.clone(),
+            });
+        }
+        return Ok(digests);
+    }
+    let copies = group
+        .ranges
+        .iter()
+        .map(|(_, range, _)| *range)
+        .collect::<Vec<_>>();
+    match local.read_ranges_at_uncommitted_with_checksums(&id, &copies, out) {
+        Ok((copied, checksums))
+            if copied.len() == copies.len()
+                && copied
+                    .iter()
+                    .zip(&copies)
+                    .all(|(count, range)| *count == range.length)
+                && checksums.len() == copies.len() =>
+        {
+            Ok(checksums
+                .into_iter()
+                .map(|checksum| PackedRangeDigest {
+                    checksum: checksum.to_vec(),
+                    algorithm: afs_protocol::node_data::DfsDigestAlgorithm::Blake3 as i32,
+                    table: Vec::new(),
+                })
+                .collect())
+        }
+        Ok(_) => Err(super::coded_status(
+            afs_error::NODE_TRANSFER_CORRUPT_DATA,
+            "immutable Chunk ended before packed DFS range",
+        )),
+        Err(error) => Err(super::error_to_status(error)),
+    }
+}
+
+/// Returns each Chunk group's packed-output span when every group's ranges are
+/// contiguous and the spans tile the whole output. The scan can then write the
+/// final snapshot directly instead of copying the payload a second time.
+fn contiguous_group_spans(
+    groups: &[PackedChunkGroup],
+    length: usize,
+) -> Option<Vec<(usize, usize)>> {
+    let mut spans = Vec::with_capacity(groups.len());
+    for group in groups {
+        let (_, _, first_output) = group.ranges.first()?;
+        let mut cursor = *first_output;
+        for (_, range, output_offset) in &group.ranges {
+            if *output_offset != cursor {
+                return None;
+            }
+            cursor = cursor.checked_add(range.length)?;
+        }
+        if cursor != first_output.checked_add(group.relative_length)? {
+            return None;
+        }
+        spans.push((*first_output, cursor));
+    }
+    let mut ordered = (0..spans.len()).collect::<Vec<_>>();
+    ordered.sort_unstable_by_key(|&index| spans[index].0);
+    let mut cursor = 0_usize;
+    for index in ordered {
+        if spans[index].0 != cursor {
+            return None;
+        }
+        cursor = spans[index].1;
+    }
+    (cursor == length).then_some(spans)
+}
+
 /// Group snapshots use the explicit group budget. Each Chunk is verified and
 /// hashed once; the per-range BLAKE3 digests come from that same scan.
 pub(super) fn read_packed_dfs_ranges_with_budget(
@@ -663,7 +832,10 @@ pub(super) fn read_packed_dfs_ranges_with_budget(
         ));
     }
     let mut bytes = vec![0; length];
-    let mut grouped = HashMap::<String, Vec<(usize, crate::node::chunk::VerifiedRangeCopy)>>::new();
+    // Chunk order must stay deterministic for error selection; each Chunk is
+    // verified and hashed independently, so the scans run concurrently.
+    let mut groups = Vec::<PackedChunkGroup>::new();
+    let mut group_index = HashMap::<String, usize>::new();
     let mut packed_cursor = 0_usize;
     for (index, op) in request.operations.iter().enumerate() {
         if op.length == 0 || op.chunk_offset.checked_add(op.length).is_none() {
@@ -679,92 +851,153 @@ pub(super) fn read_packed_dfs_ranges_with_budget(
             .filter(|end| *end <= bytes.len())
             .ok_or_else(|| Status::invalid_argument("DFS packed output range exceeds buffer"))?;
         packed_cursor = end;
-        grouped.entry(op.chunk_id.clone()).or_default().push((
+        let slot = match group_index.get(&op.chunk_id) {
+            Some(slot) => *slot,
+            None => {
+                let slot = groups.len();
+                group_index.insert(op.chunk_id.clone(), slot);
+                groups.push(PackedChunkGroup {
+                    chunk_id: op.chunk_id.clone(),
+                    ranges: Vec::new(),
+                    relative_length: 0,
+                });
+                slot
+            }
+        };
+        let relative_offset = groups[slot].relative_length;
+        groups[slot].relative_length = groups[slot]
+            .relative_length
+            .checked_add(range_length)
+            .ok_or_else(|| Status::invalid_argument("DFS packed chunk length overflow"))?;
+        groups[slot].ranges.push((
             index,
             crate::node::chunk::VerifiedRangeCopy {
                 chunk_offset: op.chunk_offset,
                 length: range_length,
-                output_offset: start,
+                output_offset: relative_offset,
             },
+            start,
         ));
     }
 
     let mut range_digests = vec![None; request.operations.len()];
     let deadline = local.peer_serve_deadline();
-    for (chunk_id, ranges) in grouped {
-        let id = crate::dfs::ChunkId::new(chunk_id);
-        // CRC32C objects are bound to a Meta descriptor, so their range
-        // checksum is the CRC of the copied bytes rather than a BLAKE3 root.
-        if let Some(table) = local
-            .peer_crc32c_table(&id)
-            .map_err(super::error_to_status)?
-        {
-            let descriptor = serde_json::to_vec(&table)
-                .map_err(|error| Status::internal(error.to_string()))?;
-            for (index, range) in &ranges {
-                let payload = local
-                    .read_peer_range_until(&id, range.chunk_offset, range.length, deadline)
-                    .map_err(super::error_to_status)?;
-                let data = payload.as_slice();
-                if data.len() != range.length {
-                    return Err(super::coded_status(
-                        afs_error::NODE_TRANSFER_CORRUPT_DATA,
-                        "immutable Chunk ended before packed DFS range",
-                    ));
-                }
-                let end = range.output_offset + range.length;
-                bytes
-                    .get_mut(range.output_offset..end)
-                    .ok_or_else(|| Status::internal("packed DFS range exceeds its buffer"))?
-                    .copy_from_slice(data);
-                range_digests[*index] = Some((
-                    crate::node::chunk_crc32c::checksum(data)
-                        .to_le_bytes()
-                        .to_vec(),
-                    afs_protocol::node_data::DfsDigestAlgorithm::Crc32c as i32,
-                    descriptor.clone(),
+    if let Some(spans) = contiguous_group_spans(&groups, length) {
+        let mut ordered = (0..groups.len()).collect::<Vec<_>>();
+        ordered.sort_unstable_by_key(|&index| spans[index].0);
+        let mut slices = (0..groups.len())
+            .map(|_| None)
+            .collect::<Vec<Option<&mut [u8]>>>();
+        let mut remainder: &mut [u8] = &mut bytes;
+        for index in ordered {
+            let (start, end) = spans[index];
+            let (head, tail) = remainder.split_at_mut(end - start);
+            slices[index] = Some(head);
+            remainder = tail;
+        }
+        let outputs = Mutex::new(slices);
+        let slots = Mutex::new(
+            (0..groups.len())
+                .map(|_| None)
+                .collect::<Vec<Option<Result<Vec<PackedRangeDigest>, Status>>>>(),
+        );
+        let scan = |index: usize| {
+            let output = match outputs.lock() {
+                Ok(mut outputs) => outputs[index].take(),
+                Err(poisoned) => poisoned.into_inner()[index].take(),
+            };
+            let result = output
+                .ok_or_else(|| Status::internal("verified DFS range output slice disappeared"))
+                .and_then(|output| scan_packed_chunk(local, &groups[index], output, deadline));
+            match slots.lock() {
+                Ok(mut slots) => slots[index] = Some(result),
+                Err(poisoned) => poisoned.into_inner()[index] = Some(result),
+            }
+        };
+        run_chunk_scans(groups.len(), scan);
+        drop(outputs);
+        let mut slots = slots
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (index, group) in groups.iter().enumerate() {
+            let scan = slots[index]
+                .take()
+                .ok_or_else(|| Status::internal("verified DFS range checksum scan did not run"))?;
+            let digests = scan?;
+            #[cfg(test)]
+            crate::node::chunk::note_verified_scan_for_test();
+            if digests.len() != group.ranges.len() {
+                return Err(Status::internal(
+                    "verified DFS range checksum count changed",
                 ));
             }
-            continue;
+            for ((operation_index, _, _), digest) in group.ranges.iter().zip(digests) {
+                range_digests[*operation_index] = Some(digest);
+            }
         }
-        let copies = ranges.iter().map(|(_, range)| *range).collect::<Vec<_>>();
-        let (copied, checksums) = local
-            .read_ranges_at_uncommitted_with_checksums(&id, &copies, &mut bytes)
-            .map_err(super::error_to_status)?;
-        if copied.len() != copies.len()
-            || copied
-                .iter()
-                .zip(&copies)
-                .any(|(count, range)| *count != range.length)
-        {
-            return Err(super::coded_status(
-                afs_error::NODE_TRANSFER_CORRUPT_DATA,
-                "immutable Chunk ended before packed DFS range",
-            ));
-        }
-        for ((index, _), checksum) in ranges.iter().zip(checksums) {
-            range_digests[*index] = Some((
-                checksum.to_vec(),
-                afs_protocol::node_data::DfsDigestAlgorithm::Blake3 as i32,
-                Vec::new(),
-            ));
+    } else {
+        // Interleaved Chunk operations cannot share one final slice, so each
+        // scan keeps a private buffer and the caller copies it afterwards.
+        type ChunkScan = Result<(Vec<u8>, Vec<PackedRangeDigest>), Status>;
+        let slots = Mutex::new(
+            (0..groups.len())
+                .map(|_| None)
+                .collect::<Vec<Option<ChunkScan>>>(),
+        );
+        let scan = |index: usize| {
+            let group = &groups[index];
+            let mut buffer = vec![0; group.relative_length];
+            let result = scan_packed_chunk(local, group, &mut buffer, deadline)
+                .map(|checksums| (buffer, checksums));
+            match slots.lock() {
+                Ok(mut slots) => slots[index] = Some(result),
+                Err(poisoned) => poisoned.into_inner()[index] = Some(result),
+            }
+        };
+        run_chunk_scans(groups.len(), scan);
+        let mut slots = slots
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (index, group) in groups.iter().enumerate() {
+            let scan = slots[index]
+                .take()
+                .ok_or_else(|| Status::internal("verified DFS range checksum scan did not run"))?;
+            let (buffer, digests) = scan?;
+            #[cfg(test)]
+            crate::node::chunk::note_verified_scan_for_test();
+            let mut offset = 0_usize;
+            for ((operation_index, range, output_offset), digest) in
+                group.ranges.iter().zip(digests)
+            {
+                let end = offset
+                    .checked_add(range.length)
+                    .filter(|end| *end <= buffer.len())
+                    .ok_or_else(|| Status::internal("verified DFS range output overflow"))?;
+                let output_end = output_offset
+                    .checked_add(range.length)
+                    .filter(|end| *end <= bytes.len())
+                    .ok_or_else(|| Status::internal("verified DFS output range exceeds buffer"))?;
+                bytes[*output_offset..output_end].copy_from_slice(&buffer[offset..end]);
+                offset = end;
+                range_digests[*operation_index] = Some(digest);
+            }
         }
     }
 
     let mut completions = Vec::with_capacity(request.operations.len());
     for (index, op) in request.operations.iter().enumerate() {
-        let (range_checksum, range_checksum_algorithm, crc32c_table) = range_digests[index]
+        let digest = range_digests[index]
             .take()
             .ok_or_else(|| Status::internal("verified DFS range checksum disappeared"))?;
         completions.push(DfsReadRangesCompletion {
-            crc32c_table,
+            crc32c_table: digest.table,
             read_id: request.read_id.clone(),
             attempt_id: request.attempt_id.clone(),
             operation_index: op.operation_index,
             source_copy_id: op.source_copy_id.clone(),
             transferred_bytes: op.length,
-            range_checksum,
-            range_checksum_algorithm,
+            range_checksum: digest.checksum,
+            range_checksum_algorithm: digest.algorithm,
         });
     }
     Ok((bytes, completions))
@@ -843,6 +1076,7 @@ mod tests {
             attempt_id: "prepared-attempt".into(),
             file_version_id: "fixture-version".into(),
             layout_root_id: "fixture-layout".into(),
+            include_blake3_outboard: false,
             operations: vec![DfsChunkReadOp {
                 operation_index: 0,
                 chunk_id,

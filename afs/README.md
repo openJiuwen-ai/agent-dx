@@ -58,16 +58,19 @@ CLI 对应 `--dfs-fuse-max-io-bytes`，范围 4096..=8388608 且必须是 4096 �
 优先于 TOML，且不得超过 `dfs_read_max_inflight_bytes`。该值只传给 DFS 挂载，OwnerFs
 和测试 backend 继续使用 1 MiB 默认值。实现通过 `set_max_write` 驱动库的 `max_pages`
 推导，因此同时改变写请求容量；内核缺少 `FUSE_MAX_PAGES` 或存在页数上限时可能钳制，
-实际是否形成大 READ 必须以 `afs_fuse_read_request_bytes` 和 DFS batch 证据判断，
+实际是否形成大 READ 必须以 `afs_fuse_callback_size_bytes` 和 DFS batch 证据判断，
 不能从配置或 INIT 日志推导。
 
 顺序预读组由根配置 `dfs_read_group_mode` 控制，默认 `"off"`。设为 `"sequential"` 时，
 只读 direct 句柄把当前读及后续最多 `dfs_read_group_bytes`（默认 8 MiB，上限 128 MiB，
 必须 4 KiB 对齐）的连续范围合并为一个 DFS 批次，并用
 `dfs_read_group_max_descriptors`（1..=128）和 `dfs_read_group_host_budget_bytes`
-约束 descriptor 数与 Host 预算。该模式只对 gRPC 或 HIXL prepared 路径生效；RDMA
-数据面继续使用原逐批预算。seek、重开、版本变化或写入可见性变化会丢弃预取窗口并
-重新验证，预取命中的请求不重复计入传输字节。边界见[架构说明](../docs/architecture/afs.md)。
+约束 descriptor 数与 Host 预算。`dfs_read_group_max_inflight = 2` 时，当前组被消费
+期间由后台线程预取下一组（流水第一级），源端在途批次数不变；seek、close、版本或
+写入可见性变化会丢弃该预取结果，第二级源端双批流水尚未实现。该模式只对 gRPC 或
+HIXL prepared 路径生效；RDMA 数据面继续使用原逐批预算。seek、重开、版本变化或写入
+可见性变化会丢弃预取窗口并重新验证，预取命中的请求不重复计入传输字节。边界见
+[架构说明](../docs/architecture/afs.md)。
 
 带宽对照可显式设置 Node 根配置 `dfs_read_measurement_mode = "prepared-payload"`
 （CLI：`--dfs-read-measurement-mode prepared-payload`），默认 `"baseline"` 保留原流式读取。
@@ -110,8 +113,10 @@ HIXL 的首版代码仅加速 DFS 已提交不可变 chunk 的远端读。默认
 64 MiB，与固定 Host 池分别统计。默认使用一个 `device_id`，可通过有序的
 `[[hixl.additional_devices]]` 配置最多 16 个 SDK 逻辑设备，各设备使用独立 engine、
 监听端口和 ACL owner；同一 batch 按协商窗口容量切片并分波并行读取，完整成功后按原请求顺序发布。
-小 batch 不为占满设备而进一步均分，成功 batch 之间轮转起始 lane；每 peer 仍只准入一个
-逻辑 batch。默认 4 MiB 窗口下，128 KiB batch 只用一个 lane，8 MiB batch 使用两个 lanes。
+小 batch 不为占满设备而进一步均分。每个 peer 连接首次读取时绑定到当前占用最少的
+lane，后续 batch 固定使用该 lane；peer 数超过 lane 数时按占用数复用。一个 batch 的
+窗口全部在该 lane 上准备、传输和释放，因此组读快路径在多设备配置下同样生效，每波
+窗口数还受源端该 lane 的 `export_slots` 限制；每 peer 仍只准入一个逻辑 batch。
 Node 先完成本地 HIXL 初始化，再向 Meta 首次注册，避免多设备初始化消耗已注册会话的租约。
 每个 peer 的 HIXL 控制会话默认在空闲 300 秒后回收，可用 `[hixl].session_idle_ms` 调整；
 0 表示进程生命周期内不回收，避免稀疏小读每次重付约 0.2 秒建链开销。
@@ -122,14 +127,29 @@ Node 先完成本地 HIXL 初始化，再向 Meta 首次注册，避免多设备
 进程正常停止仍须完成排空；15 秒进程停机期限耗尽时，以失败码 124 直接退出并跳过
 可能阻塞的 native 退出处理器，不把该路径标记为正常关闭或已证明设备排空。
 源端按逻辑读取 batch 生成已校验的不可变快照，同一 chunk 的多个范围合并为一次完整校验；
-后续 native 窗口从快照取片段。单 batch 最多 8 MiB、每源节点快照合计最多 64 MiB，
-与 Host/HBM 池预算独立；每窗仍重新授权，完整释放或关闭、过期、drain 时清理快照。
-此请求级准备优化、多设备并行与内部协议 v4 已通过本地 Linux/WSL 构建及 CPU/fake SDK
-回归。吞吐与链路收益待真机验证。
+后续 native 窗口从快照取片段。普通 batch 最多 8 MiB、组 batch 最多 128 MiB，每源节点
+快照合计相应为 64 MiB / 128 MiB，与 Host/HBM 池预算独立；每窗仍重新授权，完整释放或
+关闭、过期、drain 时清理快照。组 batch 在节点间传输边界按 128 MiB / 512 operations
+校验，不再因超过普通 batch 的 8 MiB 预算而退化为逐窗口重试。
+此请求级准备优化、多设备并行与内部协议 v5 已通过本地 Linux/WSL 构建及 CPU/fake SDK
+回归。A3 HCCS 四机双源（1 个 meta、2 个源节点、1 个全远端 reader）已完成 1 GiB
+顺序读验收：4 MiB FUSE 读、`direct`、128 MiB 组读，读回数据 SHA-256 校验通过。
+组读开启预取（`dfs_read_group_max_inflight = 2`）后的同轮对照为 HIXL 0.696 s、
+gRPC/TCP 1.592 s，HIXL 比 TCP 低约 56%；预取把 HIXL 从 0.953 s、TCP 从 1.934 s
+分别降低约 27% 和 18%，组大小与在途批次数未变。源端已把逐 Chunk 的读取与 BLAKE3
+校验改为有界并行（最多 16 线程，每 Chunk 仍只做一次完整读取），结果按请求顺序散列
+回打包快照；输出范围连续时直接写入最终快照。`afs_dfs_read_phase_seconds{phase="validate"}`
+记录每波校验墙钟，不再累加各窗口耗时。预取是流水第一级，第二级（源端双 prepared
+batch、prepare 与 transfer 重叠）尚未实现。
+
+共享测试机的绝对数值存在波动，只能比较同轮对照；端到端数字包含测试脚本的 Python
+SHA-256 校验，且 DFS 会为 reader 后台补齐本地副本，测量前必须清理 reader 的 Chunk。
+完整口径与限制见[部署文档](../docs/deployment/afs.md#hixl-dfs-远端读)。
 同卡多进程可通过可选 `[hixl].device_listen_port` 分离 SDK 设备侧监听端口，
 其取值为 1..65535，与 `engine_id` 的 Host 端口独立；未配置时沿用 SDK 默认。
 OwnerFs、DFS dirty-owner 读和复制写入仍使用原 `data_mode`。
-这版代码尚未经过 A2/A3 双机 RoCE、A3 HCCS 与故障恢复验收，配置与信任边界见
+这版代码尚未经过 A2 RoCE、两个以上源节点或并发 reader 的扩展与故障恢复验收；
+A3 HCCS 双机单源与四机双源读路径已完成真机验证，配置与信任边界见
 [部署文档](../docs/deployment/afs.md#hixl-dfs-远端读)。
 
 ## 当前能力边界

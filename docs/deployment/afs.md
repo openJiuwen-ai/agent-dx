@@ -201,8 +201,8 @@ CLI 为 `--dfs-fuse-max-io-bytes`；范围 4096..=8388608，必须为 4096 的�
 超过 `dfs_read_max_inflight_bytes`。该值只影响 DFS 挂载，OwnerFs 与测试 backend 保持
 1 MiB。它经 `set_max_write` 影响库推导的 `max_pages`，也同时提高写请求容量；宿主内核
 缺少 `FUSE_MAX_PAGES` 或 `max_pages_limit` 更小时会钳制，不能把配置值当作实际 READ
-大小。验收需同时查看 `afs_fuse_read_request_bytes`、`afs_dfs_read_transport_*` 和
-真实 DFS batch。
+大小。验收需同时查看 `afs_fuse_callback_size_bytes{operation="read"}`、
+`afs_dfs_read_transport_*` 和真实 DFS batch。
 
 Node 根配置 `dfs_read_measurement_mode` 默认为 `"baseline"`，CLI 同名参数采用短横线。
 实验性 `"prepared-payload"` 要求 `data_mode = "grpc"`，且 `[hixl].dfs_read_mode`
@@ -217,16 +217,27 @@ HIXL 原有 64 MiB 快照预算独立保留，组批次使用 128 MiB 独立预�
 
 - `dfs_read_group_bytes`：单个组合的目标字节数，默认 8388608，范围
   1048576..=134217728 且为 4096 的倍数。
-- `dfs_read_group_max_inflight`：1 或 2，默认 1；当前实现为单组串行，2 只用于
-  配置与预算校验，不表示已经存在流水线重叠。
+- `dfs_read_group_max_inflight`：1 或 2，默认 1。1 为单组串行；2 表示在消费当前
+  组的同时，用一个后台线程预取下一组（只与 FUSE 消费重叠，不增加在途传输批次数）。
+  预取失败、seek、版本或写入可见性变化、close 都会丢弃预取结果；预取线程只做已授权
+  的组读，交付前仍校验 native read view。
 - `dfs_read_group_max_descriptors`：1..=128，默认 128，并受 `[hixl].receive_slots`
   约束；一次 native batch 最多 64 个 descriptor。
-- `dfs_read_group_host_budget_bytes`：预取快照与 staging 副本的共享预算，默认
-  1073741824，且不得小于 `dfs_read_group_bytes`。
+- `dfs_read_group_host_budget_bytes`：预取窗口的共享预算，默认 1073741824，且不得
+  小于 `dfs_read_group_bytes`；native 组读每个句柄最多占两个窗口（当前窗口与预取中
+  的下一组），external 路径按窗口与 staging 两份预留。
+
+产品默认组大小保持 8 MiB（8388608）；提交/回归测试配置使用 128 MiB
+（134217728，8 MiB 的整数倍，即 32 个 4 MiB 窗口）。FUSE 会把排队读合并成约
+43–46 MiB 的逻辑批，配置更大的组不会按比例增大实际 native batch。
 
 该模式只对 gRPC 或 HIXL prepared 路径生效；RDMA 数据面保持原逐批预算，配置值不会
-暗中缩小 native descriptor 数。100 MiB 单 lane 测试需要
-`[hixl].receive_slots` 与 `[hixl].export_slots` 至少 25，并保持单 lane。
+暗中缩小 native descriptor 数。128 MiB 组读需要 `[hixl].receive_slots` 与该 peer 绑定
+lane 的源端 `[hixl].export_slots` 都至少 32；多 lane 下每个 peer 子批的波宽只按自己
+那条 lane 的 export 容量取上限，不要求单 lane 配置。
+组 batch 在节点间传输边界按 128 MiB / 512 operations 校验；8 MiB / 128 operations
+仍是发送端构造普通 batch 的预算，服务端不会因为组 batch 超过该预算而拒绝并退化为
+逐窗口重试。
 seek、倒退、重开、版本变化或写入可见性变化会丢弃预取窗口；组内存不足时退回原读取路径。
 
 HIXL 是单独的 native 编译开关，默认 `ADX_AFS_WITH_HIXL=0`。启用构建必须同时设置
@@ -284,7 +295,7 @@ Node 的进程停机期限为 15 秒。期限耗尽走失败退出码 124，并�
 退出码 124 不证明设备已排空，恢复测试前仍须核对遗留进程和设备状态。
 
 默认只使用主项 `device_id`。多设备时在同一配置追加有序的设备表，例如以下两设备
-HCCS 结构示例（实现已通过本地软件门禁，真机验证待执行；IP 和逻辑设备号需按环境替换）：
+HCCS 结构示例（实现已通过本地软件门禁与 A3 真机功能验证；IP 和逻辑设备号需按环境替换）：
 
 ```toml
 [hixl]
@@ -309,25 +320,61 @@ device_listen_port = 30601
 主项加附加项合计 1..16 个设备，SDK 逻辑 device ID 必须非负并由运行环境识别；本地 device ID、
 engine endpoint、显式设备监听端口必须分别唯一。多设备要求每 lane 都显式配置监听
 端口。两端按列表顺序配对，数量与公共 transport/池参数相同；两端本地 device ID
-可以不同，需先核实其物理卡、NUMA 与链路拓扑。`0,2` 不是已验证的物理卡组合。
+可以不同，需先核实其物理卡、NUMA 与链路拓扑。A3 真机已验证 `0,1` 与 `0,1,2,3`
+两组逻辑设备组合；`0,2` 等其他组合尚未验证。
 同一个 batch 按协商窗口容量切片，不按设备数强制均分；小 batch 保留一个窗口。
-窗口从当前 peer 的起始 lane 轮转分配，成功 batch 后从下一 lane 开始，失败不推进。
-多窗口在 lanes 间分波并行，只有完整成功后发布；每 peer 仍只准入一个逻辑读取任务，
-跨 batch 轮转不等于跨 batch 并发。4 MiB 窗口下，128 KiB batch 仅使用一个 lane，
-8 MiB batch 使用两个 lanes；增加设备不保证每个 batch 都用满全部设备。
+每个 peer 连接在首次读取时绑定到当前占用最少的 lane，同一 peer 的后续 batch 固定
+使用该 lane；peer 数超过 lane 数时按占用数复用 lane。一个 batch 的所有窗口都在该
+绑定 lane 上准备、传输和释放，因此组读快路径在多 lane 配置下同样生效；每波的窗口
+数同时受 `receive_slots`、组描述符上限和源端该 lane 的 `export_slots` 限制。
+每 peer 仍只准入一个逻辑读取任务，多个 peer 各自使用不同 lane 时互不阻塞。
 上述 Host 为每 lane 32 MiB、合计 64 MiB，HCCS HBM 为每 lane
 64 MiB、合计 128 MiB。生产配置的各类聚合上限分别为 8 GiB，不包含源快照普通内存。
 将公共 transport 改为 `roce` 同样使用多 lane，此时中转 HBM 预算为 0。
 
+### 验收边界
+
+HIXL 读路径已在 A3 HCCS 四机拓扑（1 个 meta、2 个各持一份副本的源节点、1 个全远端
+reader）完成 1 GiB 顺序读验收：4 MiB FUSE 读、`direct`、128 MiB 组读，每轮清理 reader
+本地副本，读回数据 SHA-256 校验通过。测试机为共享环境，轮次间背景负载会带来约 ±10%
+波动，因此只比较同一时段内的同轮对照。
+
+| 1 GiB 四机双源（中位） | HIXL | gRPC/TCP |
+| --- | --- | --- |
+| 组读串行（`dfs_read_group_max_inflight = 1`） | 0.953 s | 1.934 s |
+| 组读预取（`dfs_read_group_max_inflight = 2`） | 0.696 s | 1.592 s |
+
+预取把 HIXL 降低约 27%、TCP 降低约 18%，同轮 HIXL 比 TCP 低约 56%；收益来自把源端
+快照、传输与校验移出 FUSE 消费的临界路径，组大小与在途批次数均未改变。
+
+解读口径：
+
+- HIXL 把源端读盘与 BLAKE3 校验记在 `prepare`，TCP 把它们记在 `transfer`；单看 prepare
+  不构成同口径比较，应合并 `prepare + transfer`。
+- `afs_dfs_read_phase_seconds{phase="validate"}` 记录每波校验墙钟，不再累加各窗口耗时。
+- 端到端数字包含测试脚本对读回数据的 Python SHA-256 校验（该容器内 1 GiB 约 0.635 s），
+  比较产品吞吐时应扣除；FUSE 内核路径、组读、散列/校验与源端 prepare 属于产品路径。
+- DFS 会为 reader 后台补齐本地副本，连续读若干轮后退化为本地读；测量必须在每轮前清理
+  reader 的 Chunk，并核对 `afs_hixl_reader_native_batch_bytes_total` 与
+  `afs_dfs_read_transport_bytes_total{transport="hixl"}` 随读取增长。
+
+已验证范围是 1 GiB / 512 MiB 顺序读与双源、三源单 reader。更多源、并发读写、单 peer
+跨多 lane 的分片传输、A2 RoCE 与故障恢复尚未验收；多 lane 目前只作为隔离与并发余量，
+不是吞吐承诺。组级流水第二级（源端同时保留两个 prepared batch，让 prepare(N+1) 与
+transfer(N) 重叠）尚未实现：落地前需要放宽 `max_inflight_per_peer = 1`、把
+`receive_slots`/`export_slots` 扩到两组，并为协议增加多批在途语义。
+
 `window_bytes` 是每次 native 导出的容量上限，默认 4 MiB；实际窗口仍受逻辑读取长度和
 FUSE 请求拆分影响。64 KiB 是此前最小资源诊断配置，不是产品默认值或 HIXL 限制。
-源端另保留请求级已校验快照：单逻辑 batch 最多 8 MiB、每源节点合计最多 64 MiB，
-预算不足在读取源数据前返回 `NODE_TRANSFER_RESOURCE_EXHAUSTED`。每个认证 session
+源端另保留请求级已校验快照：普通逻辑 batch 最多 8 MiB、组 batch 最多 128 MiB，
+每源节点合计相应为 64 MiB / 128 MiB，预算不足在读取源数据前返回
+`NODE_TRANSFER_RESOURCE_EXHAUSTED`。每个认证 session
 同时只准备一个父 batch，各窗口必须按偏移顺序覆盖该 batch；每窗重新校验整个父请求的
 授权。完整 batch 的窗口全部终态释放后，或 close、过期、drain、quarantine 时清理快照。
 这些普通内存副本与 native Host/HBM 池分别计量；清快照不表示未知 native 传输已排空。
 当前 `/health` 和 native 内存指标只报告 Host/HBM 池，不包含快照普通内存。
-此优化的本地 CPU/fake SDK 回归已通过；硬件验证与后续对照待执行。
+此优化的本地 CPU/fake SDK 回归已通过，并已在 A3 真机 HIXL 读路径上执行；独立预算
+压力对照尚未执行。
 
 AFS 控制 RPC 仍使用原 gRPC endpoint；engine 地址用于 HIXL 独立参数交换。
 可选 `device_listen_port` 是 SDK 的设备侧监听端口，取值为 1..65535；
@@ -358,10 +405,11 @@ engine_id = "192.0.2.10:7920"
 仍需满足配置范围。Host 池预算独立计算，不因开启中转而减少。
 
 启动时检查 A3 型号，并通过 `aclrtGetDeviceInfo(ACL_DEV_ATTR_SUPER_POD_ID)` 查询实际
-super-pod ID；查询失败或负数视为能力缺失。协议 v4 在授权后、分配 session 和建链前
+super-pod ID；查询失败或负数视为能力缺失。协议 v5 在授权后、分配 session 和建链前
 检查两端 lane 数、transport、池参数和 domain；domain 0 是有效值。不同域、模式或池参数返回
-协议/参数错误，不能当作 `preferred` 的 capability fallback。v4 同时携带精确父 batch、窗口
-偏移、lane 身份与每 lane 的 engine/generation/容量，节点升级需统一使用 v4。
+协议/参数错误，不能当作 `preferred` 的 capability fallback。v5 同时携带精确父 batch、窗口
+偏移、lane 身份与每 lane 的 engine/generation/容量，并支持按 peer 子批批量释放窗口；
+节点升级需统一使用 v5。
 
 HCCS 模式要求 `HCCL_INTRA_ROCE_ENABLE` 未设置或为 `0`，
 `HCCL_INTER_HCCS_DISABLE` 未设置或为 `FALSE`，冲突配置在初始化 engine 前拒绝。
@@ -376,7 +424,7 @@ AFS grant 不限制 HIXL 参数面暴露的注册池或中转地址访问范围�
 `/health` 的 `checks.hixl` 报告模式、transport、super-pod ID、代际、Host
 allocated/quarantined bytes、`relay_hbm_budget_bytes` 和 slot 使用数；资源字段为组内聚合。
 `lane_count` 和有序 `lanes` 另列配置的设备/监听端口、engine/generation、状态及资源，
-活动 runtime 的 `internal_protocol_version` 为 4。设备监听端口来自启动配置，并非 SDK
+活动 runtime 的 `internal_protocol_version` 为 5。设备监听端口来自启动配置，并非 SDK
 实测端口。HBM 字段表示
 SDK 两组池的配置容量，不是实测使用量；无 runtime 时为 0、domain 为 null。
 已有代际进入 quarantine 后，即使为 `preferred` 也显示 degraded，不静默切换通道。
