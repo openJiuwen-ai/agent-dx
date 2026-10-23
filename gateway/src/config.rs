@@ -186,7 +186,7 @@ impl RelayConfig {
 
 impl IngressConfig {
     pub fn from_env() -> Result<Self, ConfigError> {
-        let etcd_endpoints = Vec::new();
+        let etcd_endpoints = Self::etcd_endpoints_from_env()?;
         let tls_bind = parse_env("ADX_DATA_PLANE_INGRESS_TLS_BIND", "0.0.0.0:8443")?;
         let plain_bind = parse_env("ADX_DATA_PLANE_INGRESS_PLAIN_BIND", "0.0.0.0:8080")?;
         let health_bind = parse_env("ADX_DATA_PLANE_INGRESS_HEALTH_BIND", "127.0.0.1:18080")?;
@@ -420,7 +420,17 @@ impl IngressConfig {
         })
     }
 
-    #[cfg(test)]
+    /// Reads the etcd endpoint list from the environment. The variable is
+    /// optional so deployments that do not use the etcd-backed route watch
+    /// keep working; when it is set it must contain at least one endpoint.
+    fn etcd_endpoints_from_env() -> Result<Vec<String>, ConfigError> {
+        match env::var(INGRESS_ETCD_ENDPOINTS_ENV) {
+            Ok(value) => Self::parse_etcd_endpoints(&value),
+            Err(env::VarError::NotPresent) => Ok(Vec::new()),
+            Err(env::VarError::NotUnicode(_)) => Err(ConfigError::InvalidEtcdEndpoints),
+        }
+    }
+
     fn parse_etcd_endpoints(value: &str) -> Result<Vec<String>, ConfigError> {
         let etcd_endpoints = value
             .split(',')
@@ -652,6 +662,20 @@ mod tests {
             IngressConfig::parse_etcd_endpoints(" , ").unwrap_err(),
             ConfigError::EmptyEtcdEndpoints
         );
+    }
+
+    #[test]
+    fn reads_etcd_endpoints_from_environment() {
+        // The variable is process-global, so both scenarios live in one test
+        // to stay correct under the default parallel test runner.
+        std::env::set_var(INGRESS_ETCD_ENDPOINTS_ENV, " http://etcd-1:2379 ");
+        let endpoints = IngressConfig::etcd_endpoints_from_env();
+        std::env::remove_var(INGRESS_ETCD_ENDPOINTS_ENV);
+        assert_eq!(endpoints.unwrap(), vec!["http://etcd-1:2379"]);
+
+        assert!(IngressConfig::etcd_endpoints_from_env()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
