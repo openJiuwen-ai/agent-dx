@@ -152,6 +152,7 @@ mod tests {
             attempt_id: "batch-attempt".into(),
             file_version_id: "version".into(),
             layout_root_id: "layout".into(),
+            include_blake3_outboard: false,
             operations: [0, 1]
                 .into_iter()
                 .map(|index| DfsChunkReadOp {

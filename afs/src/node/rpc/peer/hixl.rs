@@ -14,8 +14,8 @@ use crate::{
 };
 use afs_protocol::node_data::{
     DfsCloseHixlRequest, DfsDigestAlgorithm, DfsHixlGroupWindow, DfsHixlReleaseOutcome,
-    DfsHixlTransport, DfsNegotiateHixlReply, DfsNegotiateHixlRequest,
-    DfsPrepareReadRangesHixlGroupRequest, DfsPrepareReadRangesHixlReply,
+    DfsHixlReleaseWindow, DfsHixlReleaseWindowResult, DfsHixlTransport, DfsNegotiateHixlReply,
+    DfsNegotiateHixlRequest, DfsPrepareReadRangesHixlGroupRequest, DfsPrepareReadRangesHixlReply,
     DfsPrepareReadRangesHixlRequest, DfsReadRangesRequest, DfsReleaseHixlReadRequest,
     dfs_chunks_client::DfsChunksClient,
 };
@@ -526,6 +526,71 @@ fn validate_bytes(reply: &DfsPrepareReadRangesHixlReply, bytes: &[u8]) -> afs_er
     Ok(())
 }
 
+/// Bounded hash pool for native window verification. Every window is hashed
+/// independently, so a group completes in roughly one window's hash time
+/// instead of the sum of its windows.
+fn validation_pool() -> Option<&'static rayon_core::ThreadPool> {
+    static POOL: std::sync::OnceLock<Option<rayon_core::ThreadPool>> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        let workers = std::thread::available_parallelism()
+            .map_or(4, |parallel| parallel.get())
+            .clamp(1, 8);
+        rayon_core::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .thread_name(|index| format!("afs-hixl-validate-{index}"))
+            .build()
+            .ok()
+    })
+    .as_ref()
+}
+
+/// Validates each window against its prepared checksum. Results keep request
+/// order; the caller publishes only after every digest matches.
+fn validate_windows(
+    windows: &[(&DfsPrepareReadRangesHixlReply, &[u8])],
+) -> Vec<(Duration, afs_error::Result<()>)> {
+    let slots = StdMutex::new(
+        windows
+            .iter()
+            .map(|_| None)
+            .collect::<Vec<Option<(Duration, afs_error::Result<()>)>>>(),
+    );
+    let validate = |index: usize| {
+        let (reply, bytes) = windows[index];
+        let started = Instant::now();
+        let result = validate_bytes(reply, bytes);
+        let elapsed = started.elapsed();
+        match slots.lock() {
+            Ok(mut slots) => slots[index] = Some((elapsed, result)),
+            Err(poisoned) => poisoned.into_inner()[index] = Some((elapsed, result)),
+        }
+    };
+    match validation_pool() {
+        Some(pool) => pool.install(|| {
+            rayon_core::scope(|scope| {
+                for index in 0..windows.len() {
+                    scope.spawn(move |_| validate(index));
+                }
+            });
+        }),
+        None => (0..windows.len()).for_each(validate),
+    }
+    let slots = slots
+        .into_inner()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.unwrap_or_else(|| {
+                (
+                    Duration::ZERO,
+                    Err(dfs_protocol_error("HIXL window validation did not run")),
+                )
+            })
+        })
+        .collect()
+}
+
 fn may_fallback(mode: HixlDfsReadMode, dispatched: bool, error: &afs_error::Error) -> bool {
     mode == HixlDfsReadMode::Preferred
         && !dispatched
@@ -549,7 +614,6 @@ type EngineBindings = Arc<Mutex<HashMap<String, EngineIdentity>>>;
 struct PeerSlot {
     session: Option<Arc<PeerSession>>,
     touched: Instant,
-    next_lane: usize,
     /// Present while a detached warm task negotiates and connects this peer.
     /// Waiters subscribe instead of starting a second native connection.
     warming: Option<watch::Sender<bool>>,
@@ -641,6 +705,9 @@ struct ReadContext {
     group: Option<ReadGroupPolicy>,
     receive_slots: usize,
     session_idle: Option<Duration>,
+    /// Pins each peer to one device lane so concurrent peers transfer on
+    /// different devices. Peers share a lane once every lane is taken.
+    lane_bindings: Arc<StdMutex<HashMap<PeerKey, usize>>>,
 }
 
 /// Optional reader-pull transport for committed DFS chunks.
@@ -687,6 +754,7 @@ impl HixlChunkTransfer {
                 group: None,
                 receive_slots: 16,
                 session_idle: None,
+                lane_bindings: Arc::new(StdMutex::new(HashMap::new())),
             },
             runtime: PeerRuntime::current_or_new().map_err(|error| error.0)?,
             next_read: AtomicU64::new(1),
@@ -843,6 +911,7 @@ impl ChunkTransfer for HixlChunkTransfer {
                     })
                 })
                 .collect::<afs_error::Result<_>>()?,
+            include_blake3_outboard: false,
         };
         let started = Instant::now();
         let deadline = started
@@ -1142,6 +1211,38 @@ impl ReadContext {
         }
     }
 
+    /// Binds a peer to the least-used device lane. Concurrent peers therefore
+    /// transfer on separate devices instead of serializing on one lane; a peer
+    /// without a free lane shares the least-loaded one.
+    fn bind_lane(&self, key: &PeerKey) -> usize {
+        let lanes = self.native.lane_count().max(1);
+        if lanes == 1 {
+            return 0;
+        }
+        let mut bindings = match self.lane_bindings.lock() {
+            Ok(bindings) => bindings,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(lane) = bindings.get(key) {
+            return *lane % lanes;
+        }
+        // Peer epochs churn on restart; keep the best-effort binding table bounded.
+        if bindings.len() >= MAX_HIXL_PEERS * 4 {
+            bindings.clear();
+        }
+        let mut counts = vec![0_usize; lanes];
+        for lane in bindings.values() {
+            counts[*lane % lanes] += 1;
+        }
+        let lane = counts
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, count)| **count)
+            .map_or(0, |(index, _)| index);
+        bindings.insert(key.clone(), lane);
+        lane
+    }
+
     /// Waits until a detached warm task for this peer settles. A failed warm
     /// clears the flag, so the caller falls back to the inline connect.
     async fn settle_warm(
@@ -1213,7 +1314,6 @@ impl ReadContext {
                     Arc::new(Mutex::new(PeerSlot {
                         session: None,
                         touched: Instant::now(),
-                        next_lane: 0,
                         warming: None,
                     }))
                 })
@@ -1365,7 +1465,6 @@ impl ReadContext {
                         Arc::new(Mutex::new(PeerSlot {
                             session: None,
                             touched: Instant::now(),
-                            next_lane: 0,
                             warming: None,
                         }))
                     })
@@ -1393,12 +1492,10 @@ impl ReadContext {
             .ok_or_else(|| dfs_protocol_error("HIXL authority has no caller epoch"))?;
         if let Some(session) = &guard.session {
             if session.poisoned.load(Ordering::Acquire) || caller_epoch != session.caller_epoch {
-                return Err(afs_error::Error::coded(
-                    afs_error::NODE_TRANSFER_DRAIN_INCOMPLETE,
-                    "HIXL peer session is fenced",
-                ));
-            }
-            if let Some(idle) = self.session_idle
+                let start = Instant::now();
+                let closed = retire_idle_session(&mut guard, self.timeout).await;
+                self.observe(Operation::Close, start.elapsed(), closed);
+            } else if let Some(idle) = self.session_idle
                 && guard.touched.elapsed() >= idle
             {
                 let start = Instant::now();
@@ -1491,7 +1588,7 @@ impl ReadContext {
             None
         };
         let capacity = parallel_window_capacity(&batch, capacity, lane_count)?;
-        let first_lane = lease.guard.next_lane;
+        let lane = self.bind_lane(&(peer_identity.0.clone(), peer_identity.1, address.clone()));
         let mut batch_offset = 0_u64;
         let max_window_ops = if group.is_some() {
             crate::node::dfs_read::MAX_DFS_GROUP_OPS
@@ -1509,24 +1606,36 @@ impl ReadContext {
                             .map_err(|_| dfs_protocol_error("HIXL batch length overflow"))?,
                     )
                     .ok_or_else(|| dfs_protocol_error("HIXL batch offset overflow"))?;
-                let lane = (first_lane + index % lane_count) % lane_count;
                 Ok((index, window, offset, lane))
             })
             .collect::<afs_error::Result<Vec<_>>>()?;
-        let next_lane = (first_lane + planned.len() % lane_count) % lane_count;
-        // A group is one native SDK call over every prepared window of a single
-        // lane. Multi-lane grouping stays on the per-window pipeline for now.
+        // A group is one native SDK call over every prepared window of the
+        // peer's bound lane, so the group path also applies on multi-device
+        // readers. The wave never asks for more simultaneous exports than the
+        // source lane can hold.
+        let export_slots = usize::try_from(
+            lease
+                .session
+                .reply
+                .lanes
+                .get(lane)
+                .map_or(0, |lane| lane.export_slots),
+        )
+        .unwrap_or(0);
         let group_windows = group
-            .filter(|_| prepared_output_len.is_some() && lane_count == 1 && planned.len() > 1)
+            .filter(|_| prepared_output_len.is_some() && planned.len() > 1)
             .map(|group| {
                 group
                     .max_descriptors
                     .min(self.receive_slots)
+                    .min(export_slots)
                     .clamp(1, crate::node::dfs_read::MAX_DFS_GROUP_OPS)
             });
         let mut completed = Vec::with_capacity(planned.len());
         let mut prepared_chunks = Vec::new();
-        let wave_width = group_windows.unwrap_or(lane_count);
+        // Every planned window is on the peer's bound lane, so an ungrouped
+        // wave is bounded by that lane's export capacity as well.
+        let wave_width = group_windows.unwrap_or_else(|| lane_count.min(export_slots).max(1));
         for wave in planned.chunks(wave_width) {
             // Admission remains ordered while native transfers run independently.
             let prepared = if group_windows.is_some() {
@@ -1629,7 +1738,6 @@ impl ReadContext {
             self.observe_prepared_payload_error(payload_elapsed);
             return Err(error);
         }
-        lease.guard.next_lane = next_lane;
         if let (Some(metrics), Some(bytes)) = (&self.payload_metrics, payload_bytes) {
             metrics.observe("hixl", "ok", bytes, payload_elapsed);
             Ok(ReadResult::PreparedComplete(prepared_chunks))
@@ -1974,19 +2082,24 @@ impl ReadContext {
             }
         }
 
+        static EMPTY_BYTES: [u8; 0] = [];
+        let ranges = results
+            .iter()
+            .map(|result| match &result.transfer {
+                Ok(outcome) => (&result.reply, outcome.bytes.as_slice()),
+                Err(_) => (&result.reply, EMPTY_BYTES.as_slice()),
+            })
+            .collect::<Vec<_>>();
         let mut validations = Vec::with_capacity(results.len());
-        for result in &results {
-            let validation = match &result.transfer {
-                Ok(outcome) => {
-                    let validate_started = Instant::now();
-                    let validation = validate_bytes(&result.reply, &outcome.bytes);
-                    let validate_elapsed = validate_started.elapsed();
-                    self.observe(Operation::Validate, validate_elapsed, validation.is_ok());
-                    self.observe_phase("validate", validate_elapsed);
-                    validation
-                }
-                Err(_) => Ok(()),
-            };
+        let validate_started = Instant::now();
+        let window_validations = validate_windows(&ranges);
+        self.observe_phase("validate", validate_started.elapsed());
+        for (result, (elapsed, validation)) in results.iter().zip(window_validations) {
+            if result.transfer.is_err() {
+                validations.push(Ok(()));
+                continue;
+            }
+            self.observe(Operation::Validate, elapsed, validation.is_ok());
             validations.push(validation);
         }
         if all_transfers_succeeded && !lengths_match {
@@ -2183,43 +2296,49 @@ impl ReadContext {
         }
 
         let mut failure = None;
-        let mut validations = Vec::with_capacity(prepared.len());
+        let mut ranges = Vec::with_capacity(prepared.len());
         let mut offset = 0_usize;
         for (_, window, reply, _) in &prepared {
             let end = offset + window.length;
-            let bytes = &outcome.bytes[offset..end];
+            ranges.push((reply, &outcome.bytes[offset..end]));
             offset = end;
-            let validate_started = Instant::now();
-            let validation = validate_bytes(reply, bytes);
-            let validate_elapsed = validate_started.elapsed();
-            self.observe(Operation::Validate, validate_elapsed, validation.is_ok());
-            self.observe_phase("validate", validate_elapsed);
+        }
+        let mut validations = Vec::with_capacity(ranges.len());
+        let validate_started = Instant::now();
+        let window_validations = validate_windows(&ranges);
+        self.observe_phase("validate", validate_started.elapsed());
+        for (elapsed, validation) in window_validations {
+            self.observe(Operation::Validate, elapsed, validation.is_ok());
             validations.push(validation);
         }
 
-        for ((_, window, reply, _), validation) in prepared.iter().zip(validations) {
-            let content_validated = validation.is_ok();
-            let mut client = session.client.clone();
-            let release_started = Instant::now();
-            let released = release_window(
-                &mut client,
-                release_request(
-                    session,
-                    reply,
-                    DfsHixlReleaseOutcome::Completed,
-                    content_validated,
-                ),
-                self.timeout,
-            )
-            .await;
-            let release_elapsed = release_started.elapsed();
-            self.observe(Operation::Release, release_elapsed, released.is_ok());
-            self.observe_phase("release", release_elapsed);
-            let released_ok = released.is_ok();
-            if let Err(error) = validation {
-                merge_window_failure(&mut failure, WindowFailure::from(error));
+        let operations = prepared
+            .iter()
+            .zip(&validations)
+            .map(|((_, _, reply, _), validation)| ReleaseOperation {
+                reply,
+                outcome: DfsHixlReleaseOutcome::Completed,
+                content_validated: validation.is_ok(),
+            })
+            .collect::<Vec<_>>();
+        let release_started = Instant::now();
+        let released = match release_batch_request(session, &operations) {
+            Ok(request) => {
+                let mut client = session.client.clone();
+                release_windows(&mut client, request, self.timeout).await
             }
-            if let Err(error) = released {
+            Err(error) => Err(error),
+        };
+        let release_elapsed = release_started.elapsed();
+        self.observe(Operation::Release, release_elapsed, released.is_ok());
+        self.observe_phase("release", release_elapsed);
+        let released_ok = released.is_ok();
+        if let Err(error) = released {
+            merge_window_failure(&mut failure, WindowFailure::from(error));
+        }
+        for ((_, window, _, _), validation) in prepared.iter().zip(validations) {
+            let content_validated = validation.is_ok();
+            if let Err(error) = validation {
                 merge_window_failure(&mut failure, WindowFailure::from(error));
             }
             if content_validated
@@ -2256,20 +2375,15 @@ impl ReadContext {
         prepared: &[PreparedWindow],
         outcome: DfsHixlReleaseOutcome,
     ) -> bool {
-        let mut failed = false;
-        for (_, _, reply, _) in prepared {
-            let mut client = session.client.clone();
-            let started = Instant::now();
-            let result = release_window(
-                &mut client,
-                release_request(session, reply, outcome, false),
-                self.timeout,
-            )
-            .await;
-            self.observe(Operation::Release, started.elapsed(), result.is_ok());
-            failed |= result.is_err();
-        }
-        failed
+        let operations = prepared
+            .iter()
+            .map(|(_, _, reply, _)| ReleaseOperation {
+                reply,
+                outcome,
+                content_validated: false,
+            })
+            .collect::<Vec<_>>();
+        self.release_batch(session, &operations).await
     }
 
     async fn release_not_submitted_wave(
@@ -2277,20 +2391,34 @@ impl ReadContext {
         session: &PeerSession,
         prepared: &[PreparedWindow],
     ) -> bool {
-        let mut failed = false;
-        for (_, _, reply, _) in prepared {
-            let mut client = session.client.clone();
-            let started = Instant::now();
-            let result = release_window(
-                &mut client,
-                release_request(session, reply, DfsHixlReleaseOutcome::NotSubmitted, false),
-                self.timeout,
-            )
-            .await;
-            self.observe(Operation::Release, started.elapsed(), result.is_ok());
-            failed |= result.is_err();
-        }
-        failed
+        let operations = prepared
+            .iter()
+            .map(|(_, _, reply, _)| ReleaseOperation {
+                reply,
+                outcome: DfsHixlReleaseOutcome::NotSubmitted,
+                content_validated: false,
+            })
+            .collect::<Vec<_>>();
+        self.release_batch(session, &operations).await
+    }
+
+    async fn release_batch(
+        &self,
+        session: &PeerSession,
+        operations: &[ReleaseOperation<'_>],
+    ) -> bool {
+        let started = Instant::now();
+        let result = match release_batch_request(session, operations) {
+            Ok(request) => {
+                let mut client = session.client.clone();
+                release_windows(&mut client, request, self.timeout)
+                    .await
+                    .map(|_| ())
+            }
+            Err(error) => Err(error),
+        };
+        self.observe(Operation::Release, started.elapsed(), result.is_ok());
+        result.is_err()
     }
 }
 
@@ -2331,6 +2459,12 @@ fn bind_engine(
     Ok(())
 }
 
+struct ReleaseOperation<'a> {
+    reply: &'a DfsPrepareReadRangesHixlReply,
+    outcome: DfsHixlReleaseOutcome,
+    content_validated: bool,
+}
+
 fn release_request(
     session: &PeerSession,
     reply: &DfsPrepareReadRangesHixlReply,
@@ -2340,18 +2474,71 @@ fn release_request(
     DfsReleaseHixlReadRequest {
         session_id: reply.session_id,
         read_id: reply.read_id.clone(),
-        attempt_id: reply.attempt_id.clone(),
         source_node_id: reply.source_node_id.clone(),
         source_node_epoch: reply.source_node_epoch,
         engine_id: reply.engine_id.clone(),
         engine_generation: reply.engine_generation,
         pool_generation: reply.pool_generation,
-        slot_id: reply.slot_id,
-        slot_generation: reply.slot_generation,
         caller_node_epoch: session.caller_epoch,
-        outcome: outcome as i32,
-        content_validated,
+        windows: vec![DfsHixlReleaseWindow {
+            attempt_id: reply.attempt_id.clone(),
+            slot_id: reply.slot_id,
+            slot_generation: reply.slot_generation,
+            outcome: outcome as i32,
+            content_validated,
+        }],
     }
+}
+
+fn release_batch_request(
+    session: &PeerSession,
+    operations: &[ReleaseOperation<'_>],
+) -> afs_error::Result<DfsReleaseHixlReadRequest> {
+    let Some(first) = operations.first() else {
+        return Err(dfs_protocol_error("HIXL release batch is empty"));
+    };
+    let reply = first.reply;
+    if operations
+        .iter()
+        .any(|operation| !same_release_identity(reply, operation.reply))
+    {
+        return Err(dfs_protocol_error(
+            "HIXL release batch spans multiple source windows",
+        ));
+    }
+    Ok(DfsReleaseHixlReadRequest {
+        session_id: reply.session_id,
+        read_id: reply.read_id.clone(),
+        source_node_id: reply.source_node_id.clone(),
+        source_node_epoch: reply.source_node_epoch,
+        engine_id: reply.engine_id.clone(),
+        engine_generation: reply.engine_generation,
+        pool_generation: reply.pool_generation,
+        caller_node_epoch: session.caller_epoch,
+        windows: operations
+            .iter()
+            .map(|operation| DfsHixlReleaseWindow {
+                attempt_id: operation.reply.attempt_id.clone(),
+                slot_id: operation.reply.slot_id,
+                slot_generation: operation.reply.slot_generation,
+                outcome: operation.outcome as i32,
+                content_validated: operation.content_validated,
+            })
+            .collect(),
+    })
+}
+
+fn same_release_identity(
+    left: &DfsPrepareReadRangesHixlReply,
+    right: &DfsPrepareReadRangesHixlReply,
+) -> bool {
+    left.session_id == right.session_id
+        && left.read_id == right.read_id
+        && left.source_node_id == right.source_node_id
+        && left.source_node_epoch == right.source_node_epoch
+        && left.engine_id == right.engine_id
+        && left.engine_generation == right.engine_generation
+        && left.pool_generation == right.pool_generation
 }
 
 async fn release_window(
@@ -2359,6 +2546,14 @@ async fn release_window(
     request: DfsReleaseHixlReadRequest,
     timeout: Duration,
 ) -> afs_error::Result<()> {
+    release_windows(client, request, timeout).await.map(|_| ())
+}
+
+async fn release_windows(
+    client: &mut DfsChunksClient<Channel>,
+    request: DfsReleaseHixlReadRequest,
+    timeout: Duration,
+) -> afs_error::Result<Vec<DfsHixlReleaseWindowResult>> {
     let mut last_error = None;
     for _ in 0..3 {
         let mut command = afs_tracing::request_with_current_context(request.clone());
@@ -2366,20 +2561,27 @@ async fn release_window(
         match client.release_hixl_read(command).await {
             Ok(reply) => {
                 let reply = reply.into_inner();
-                if request.outcome == DfsHixlReleaseOutcome::Unknown as i32 {
-                    if reply.consumed {
-                        return Err(dfs_protocol_error(
-                            "HIXL source released an unknown native outcome",
-                        ));
-                    }
-                    return Ok(());
-                }
-                if !reply.consumed {
+                if reply.windows.len() != request.windows.len() {
                     return Err(dfs_protocol_error(
-                        "HIXL completed source window was not released",
+                        "HIXL release reply does not cover every prepared window",
                     ));
                 }
-                return Ok(());
+                for (window, result) in request.windows.iter().zip(&reply.windows) {
+                    let outcome = DfsHixlReleaseOutcome::try_from(window.outcome)
+                        .map_err(|_| dfs_protocol_error("HIXL release outcome is unknown"))?;
+                    if outcome == DfsHixlReleaseOutcome::Unknown {
+                        if result.consumed {
+                            return Err(dfs_protocol_error(
+                                "HIXL source released an unknown native outcome",
+                            ));
+                        }
+                    } else if !result.consumed {
+                        return Err(dfs_protocol_error(
+                            "HIXL completed source window was not released",
+                        ));
+                    }
+                }
+                return Ok(reply.windows);
             }
             Err(status) => {
                 let error = status_to_error(status);
@@ -2528,7 +2730,6 @@ mod tests {
         let mut slot = PeerSlot {
             session: Some(control_session()),
             touched: Instant::now() - Duration::from_secs(20),
-            next_lane: 0,
             warming: None,
         };
         assert!(!retire_idle_session(&mut slot, Duration::from_millis(20)).await);
@@ -2553,7 +2754,6 @@ mod tests {
             let slot = Arc::new(Mutex::new(PeerSlot {
                 session: None,
                 touched: Instant::now(),
-                next_lane: 0,
                 warming: None,
             }));
             {
@@ -2610,6 +2810,7 @@ mod tests {
             attempt_id: "a".into(),
             file_version_id: "v".into(),
             layout_root_id: "l".into(),
+            include_blake3_outboard: false,
             operations: vec![DfsChunkReadOp {
                 operation_index: 0,
                 chunk_id: "chunk".into(),
@@ -2806,7 +3007,7 @@ mod tests {
     }
 
     #[test]
-    fn negotiation_requires_protocol_v4() {
+    fn negotiation_rejects_older_protocol_versions() {
         for version in [1, 2, 3] {
             let (_, mut reply, _) = descriptor();
             reply.protocol_version = version;
@@ -3264,6 +3465,30 @@ mod tests {
             afs_error::NODE_TRANSFER_CORRUPT_DATA
         );
         assert!(validate_bytes(&reply, b"ab").is_err());
+    }
+
+    #[test]
+    fn parallel_window_validation_preserves_order_and_reports_each_digest() {
+        let (_, _, good) = descriptor();
+        let mut bad = good.clone();
+        bad.ranges[0].range_checksum = blake3::hash(b"other").as_bytes().to_vec();
+        let windows = vec![
+            (&good, b"abc".as_slice()),
+            (&bad, b"abc".as_slice()),
+            (&good, b"abc".as_slice()),
+        ];
+        let observed = validate_windows(&windows);
+        assert_eq!(observed.len(), 3);
+        assert!(observed[0].1.is_ok());
+        assert_eq!(
+            observed[1]
+                .1
+                .as_ref()
+                .expect_err("mismatched digest must fail")
+                .code(),
+            afs_error::NODE_TRANSFER_CORRUPT_DATA
+        );
+        assert!(observed[2].1.is_ok());
     }
 
     #[test]
@@ -3882,7 +4107,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn small_batches_keep_one_window_and_rotate_lanes() {
+        async fn small_batches_keep_one_window_on_the_bound_lane() {
             let Harness {
                 _temp,
                 native,
@@ -3894,7 +4119,7 @@ mod tests {
                 ..
             } = harness().await;
             batch.operations[0].op.length = 2;
-            for expected_lanes in [vec![0], vec![0, 1], vec![0, 1, 0]] {
+            for expected_lanes in [vec![0], vec![0, 0], vec![0, 0, 0]] {
                 let reader = reader.clone();
                 let batch = batch.clone();
                 let output = tokio::task::spawn_blocking(move || {
@@ -3909,16 +4134,47 @@ mod tests {
                 assert_eq!(
                     memory.reads.iter().map(|read| read.0).collect::<Vec<_>>(),
                     expected_lanes,
-                    "one small batch must use one lane; later batches rotate"
+                    "one small batch uses one window on the peer's bound lane"
                 );
                 assert!(memory.reads.iter().all(|read| read.2 == 2));
                 assert!(memory.active.is_empty());
                 drop(memory);
                 let sessions = source_hixl::test_support::sessions(&source);
-                assert_eq!(sessions.len(), 1, "rotation must reuse the control session");
+                assert_eq!(sessions.len(), 1, "one peer keeps one control session");
                 assert_eq!(sessions[0].prepared_bytes, 0);
                 assert_eq!(sessions[0].active_windows, 0);
             }
+            stop.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn peers_spread_over_lanes_before_sharing_one() {
+            let Harness {
+                _temp,
+                reader,
+                stop,
+                server,
+                ..
+            } = harness().await;
+            let first = ("peer-a".to_owned(), 9, "grpc-a".to_owned());
+            let second = ("peer-b".to_owned(), 9, "grpc-b".to_owned());
+            let third = ("peer-c".to_owned(), 9, "grpc-c".to_owned());
+            assert_eq!(reader.context.bind_lane(&first), 0);
+            assert_eq!(reader.context.bind_lane(&second), 1);
+            assert_eq!(
+                reader.context.bind_lane(&first),
+                0,
+                "a bound peer keeps its lane"
+            );
+            assert_eq!(
+                reader.context.bind_lane(&third),
+                0,
+                "a peer without a free lane shares the least-used one"
+            );
             stop.send(()).unwrap();
             tokio::time::timeout(Duration::from_secs(1), server)
                 .await
@@ -4027,7 +4283,6 @@ mod tests {
             let slot = Arc::new(Mutex::new(PeerSlot {
                 session: None,
                 touched: Instant::now(),
-                next_lane: 0,
                 warming: None,
             }));
             context.slots.lock().await.insert(key.clone(), slot.clone());
@@ -4097,6 +4352,7 @@ mod tests {
                 attempt_id: "group-attempt".into(),
                 file_version_id: batch.file_version_id.0.clone(),
                 layout_root_id: batch.layout_root_id.0.clone(),
+                include_blake3_outboard: false,
                 operations: batch
                     .operations
                     .iter()
@@ -4467,7 +4723,7 @@ mod tests {
                 endpoint,
                 stop,
                 server,
-            } = harness().await;
+            } = harness_with(2, 2, 2).await;
             let failed_reader = reader.clone();
             let failed_batch = batch.clone();
             let (failed, output) = tokio::task::spawn_blocking(move || {
@@ -4519,7 +4775,7 @@ mod tests {
                 assert_eq!(
                     memory.reads.len(),
                     2,
-                    "the prepared third window must never enter READ"
+                    "the refused wave must never enter READ"
                 );
             }
             assert_eq!(native.reader_quarantines.load(Ordering::SeqCst), 0);

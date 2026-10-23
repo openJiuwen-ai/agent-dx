@@ -12,11 +12,11 @@ use std::time::{Duration, Instant};
 
 use afs_protocol::node_data::{
     DfsCloseHixlReply, DfsCloseHixlRequest, DfsDigestAlgorithm, DfsHixlLane,
-    DfsHixlPreparedGroupWindow, DfsHixlReadRange, DfsHixlReleaseOutcome, DfsHixlTransport,
-    DfsNegotiateHixlReply, DfsNegotiateHixlRequest, DfsPrepareReadRangesHixlGroupReply,
-    DfsPrepareReadRangesHixlGroupRequest, DfsPrepareReadRangesHixlReply,
-    DfsPrepareReadRangesHixlRequest, DfsReadRangesCompletion, DfsReadRangesRequest,
-    DfsReleaseHixlReadReply, DfsReleaseHixlReadRequest,
+    DfsHixlPreparedGroupWindow, DfsHixlReadRange, DfsHixlReleaseOutcome, DfsHixlReleaseWindow,
+    DfsHixlReleaseWindowResult, DfsHixlTransport, DfsNegotiateHixlReply, DfsNegotiateHixlRequest,
+    DfsPrepareReadRangesHixlGroupReply, DfsPrepareReadRangesHixlGroupRequest,
+    DfsPrepareReadRangesHixlReply, DfsPrepareReadRangesHixlRequest, DfsReadRangesCompletion,
+    DfsReadRangesRequest, DfsReleaseHixlReadReply, DfsReleaseHixlReadRequest,
 };
 use afs_transport::grpc::error_status::{coded_status, error_to_status};
 use afs_transport::hixl::{EngineInfo, ExportWindow, HixlError, HixlRuntimeGroup, ReadTransport};
@@ -597,7 +597,7 @@ impl HixlReadService {
             let range_checksums = batch_range_checksums(&batch, &completions);
             session.prepared_batch = Some(PreparedBatch {
                 request: Arc::new(batch),
-                bytes,
+                bytes: Arc::new(bytes),
                 next_offset: 0,
                 range_checksums,
             });
@@ -1040,7 +1040,7 @@ impl HixlReadService {
             let range_checksums = batch_range_checksums(batch, &completions);
             session.prepared_batch = Some(PreparedBatch {
                 request: Arc::new(batch.clone()),
-                bytes,
+                bytes: Arc::new(bytes),
                 next_offset: 0,
                 range_checksums,
             });
@@ -1052,7 +1052,7 @@ impl HixlReadService {
         let mut failure = None;
         for plan in windows {
             let step = (|| -> Result<(DfsPrepareReadRangesHixlReply, Arc<DfsReadRangesRequest>), Status> {
-                let (bytes, batch_request, completions) = {
+                let (snapshot, start, batch_request, completions) = {
                     let prepared = session.prepared_batch.as_ref().ok_or_else(|| {
                         Status::internal("HIXL verified batch snapshot was lost")
                     })?;
@@ -1060,27 +1060,39 @@ impl HixlReadService {
                         .map_err(|_| Status::internal("HIXL group offset overflow"))?;
                     let end = usize::try_from(plan.end)
                         .map_err(|_| Status::internal("HIXL group offset overflow"))?;
-                    let bytes = prepared
-                        .bytes
-                        .get(start..end)
-                        .ok_or_else(|| {
-                            coded_status(
-                                afs_error::NODE_TRANSFER_INVALID,
-                                "HIXL group window exceeds the verified batch",
-                            )
-                        })?
-                        .to_vec();
+                    let window = prepared.bytes.get(start..end).ok_or_else(|| {
+                        coded_status(
+                            afs_error::NODE_TRANSFER_INVALID,
+                            "HIXL group window exceeds the verified batch",
+                        )
+                    })?;
                     let completions = window_completions(
                         &plan.read,
-                        &bytes,
+                        window,
                         &prepared.range_checksums,
                         self.metrics.as_ref(),
                     )?;
-                    (bytes, prepared.request.clone(), completions)
+                    (
+                        Arc::clone(&prepared.bytes),
+                        start,
+                        prepared.request.clone(),
+                        completions,
+                    )
                 };
+                let length = plan
+                    .end
+                    .checked_sub(plan.offset)
+                    .and_then(|length| usize::try_from(length).ok())
+                    .ok_or_else(|| Status::internal("HIXL window length overflow"))?;
                 let export = self
                     .provider
-                    .prepare_export(lane_id, bytes, Instant::now() + HIXL_SESSION_TTL)
+                    .prepare_export_shared(
+                        lane_id,
+                        snapshot,
+                        start,
+                        length,
+                        Instant::now() + HIXL_SESSION_TTL,
+                    )
                     .map_err(runtime_status)?;
                 let info = self
                     .provider
@@ -1225,35 +1237,45 @@ impl HixlReadService {
     ) -> Result<Response<DfsReleaseHixlReadReply>, Status> {
         if request.session_id == 0
             || request.read_id.is_empty()
-            || request.attempt_id.is_empty()
             || request.source_node_id != self.node_id
             || request.source_node_epoch != self.node_epoch
             || request.caller_node_epoch == 0
             || request.engine_id.is_empty()
-            || request.slot_generation == 0
+            || request.windows.is_empty()
+            || request.windows.len() > MAX_HIXL_WINDOWS
         {
             return Err(coded_status(
                 afs_error::NODE_TRANSFER_INVALID,
                 "HIXL release identity is incomplete",
             ));
         }
-        let outcome = DfsHixlReleaseOutcome::try_from(request.outcome).map_err(|_| {
-            coded_status(
-                afs_error::NODE_TRANSFER_INVALID,
-                "HIXL release outcome is unknown",
-            )
-        })?;
-        if outcome == DfsHixlReleaseOutcome::Unspecified {
-            return Err(coded_status(
-                afs_error::NODE_TRANSFER_INVALID,
-                "HIXL release outcome is required",
-            ));
-        }
-        if outcome == DfsHixlReleaseOutcome::NotSubmitted && request.content_validated {
-            return Err(coded_status(
-                afs_error::NODE_TRANSFER_INVALID,
-                "a never-submitted HIXL window cannot claim validated content",
-            ));
+        let mut outcomes = Vec::with_capacity(request.windows.len());
+        for window in &request.windows {
+            if window.attempt_id.is_empty() || window.slot_generation == 0 {
+                return Err(coded_status(
+                    afs_error::NODE_TRANSFER_INVALID,
+                    "HIXL release window identity is incomplete",
+                ));
+            }
+            let outcome = DfsHixlReleaseOutcome::try_from(window.outcome).map_err(|_| {
+                coded_status(
+                    afs_error::NODE_TRANSFER_INVALID,
+                    "HIXL release outcome is unknown",
+                )
+            })?;
+            if outcome == DfsHixlReleaseOutcome::Unspecified {
+                return Err(coded_status(
+                    afs_error::NODE_TRANSFER_INVALID,
+                    "HIXL release outcome is required",
+                ));
+            }
+            if outcome == DfsHixlReleaseOutcome::NotSubmitted && window.content_validated {
+                return Err(coded_status(
+                    afs_error::NODE_TRANSFER_INVALID,
+                    "a never-submitted HIXL window cannot claim validated content",
+                ));
+            }
+            outcomes.push(outcome);
         }
         let mut registry = self
             .registry
@@ -1261,84 +1283,79 @@ impl HixlReadService {
             .map_err(|_| Status::internal("HIXL registry lock is poisoned"))?;
         registry.expire_sessions();
         self.quarantine_pending_windows(&mut registry, false)?;
-        let key = WindowKey {
-            read_id: request.read_id.clone(),
-            attempt_id: request.attempt_id.clone(),
-        };
-        let prepared = {
+        let mut results = vec![DfsHixlReleaseWindowResult::default(); request.windows.len()];
+        let mut pending = Vec::new();
+        let mut pinned = false;
+        {
             let session = registry.session_mut(
                 request.session_id,
                 peer,
                 request.caller_node_epoch,
                 request.source_node_epoch,
             )?;
-            if session.tombstones.matches(&key, &request) {
-                session.last_used = Instant::now();
-                return Ok(Response::new(DfsReleaseHixlReadReply {
-                    consumed: true,
-                    already_released: true,
-                }));
+            for ((index, window), outcome) in request
+                .windows
+                .iter()
+                .enumerate()
+                .zip(outcomes.iter().copied())
+            {
+                let key = WindowKey {
+                    read_id: request.read_id.clone(),
+                    attempt_id: window.attempt_id.clone(),
+                };
+                if session.tombstones.matches(&key, &request, window) {
+                    results[index] = DfsHixlReleaseWindowResult {
+                        consumed: true,
+                        already_released: true,
+                    };
+                    continue;
+                }
+                let record = session.windows.get(&key).ok_or_else(|| {
+                    coded_status(
+                        afs_error::NODE_TRANSFER_INVALID,
+                        "HIXL release does not identify an admitted window",
+                    )
+                })?;
+                validate_release_identity(record, &request, window)?;
+                if matches!(
+                    outcome,
+                    DfsHixlReleaseOutcome::Unknown | DfsHixlReleaseOutcome::Failed
+                ) {
+                    pinned = true;
+                    continue;
+                }
+                pending.push((
+                    index,
+                    key,
+                    record.lane_id,
+                    record.reply.slot_id,
+                    record.reply.slot_generation,
+                    ReleaseTombstone::from_window(record, window.outcome, window.content_validated),
+                ));
             }
-            let window = session.windows.get(&key).ok_or_else(|| {
-                coded_status(
-                    afs_error::NODE_TRANSFER_INVALID,
-                    "HIXL release does not identify an admitted window",
-                )
-            })?;
-            validate_release_identity(window, &request)?;
-            if matches!(
-                outcome,
-                DfsHixlReleaseOutcome::Unknown | DfsHixlReleaseOutcome::Failed
-            ) {
+            for (index, key, lane_id, slot_id, slot_generation, identity) in pending {
+                self.provider
+                    .release_export(lane_id, slot_id, slot_generation)
+                    .map_err(runtime_status)?;
+                session.windows.remove(&key);
+                session.tombstones.insert(identity);
                 session.last_used = Instant::now();
-                None
-            } else {
-                Some((
-                    window.lane_id,
-                    window.reply.slot_id,
-                    window.reply.slot_generation,
-                    ReleaseTombstone::from_window(
-                        window,
-                        request.outcome,
-                        request.content_validated,
-                    ),
-                ))
+                results[index].consumed = true;
             }
-        };
-        if prepared.is_none() {
+            if session.windows.is_empty()
+                && session
+                    .prepared_batch
+                    .as_ref()
+                    .is_some_and(|batch| batch.next_offset == batch.bytes.len())
+            {
+                session.prepared_batch = None;
+            }
+            session.last_used = Instant::now();
+        }
+        if pinned {
             self.quarantine_pending_windows(&mut registry, true)?;
-            return Ok(Response::new(DfsReleaseHixlReadReply {
-                consumed: false,
-                already_released: false,
-            }));
         }
-        let Some((lane_id, slot_id, slot_generation, identity)) = prepared else {
-            return Err(Status::internal("HIXL release state was lost"));
-        };
-        self.provider
-            .release_export(lane_id, slot_id, slot_generation)
-            .map_err(runtime_status)?;
-        let session = registry.session_mut(
-            request.session_id,
-            peer,
-            request.caller_node_epoch,
-            request.source_node_epoch,
-        )?;
-        session.windows.remove(&key);
-        session.tombstones.insert(identity);
-        if session.windows.is_empty()
-            && session
-                .prepared_batch
-                .as_ref()
-                .is_some_and(|batch| batch.next_offset == batch.bytes.len())
-        {
-            session.prepared_batch = None;
-        }
-        session.last_used = Instant::now();
-        Ok(Response::new(DfsReleaseHixlReadReply {
-            consumed: true,
-            already_released: false,
-        }))
+        Ok(Response::new(DfsReleaseHixlReadReply { windows: results }))
     }
 
     fn close_blocking(
@@ -1441,6 +1458,20 @@ pub(crate) trait ExportProvider: Send + Sync {
         bytes: Vec<u8>,
         deadline: Instant,
     ) -> Result<ExportWindow, HixlError>;
+    fn prepare_export_shared(
+        &self,
+        lane: usize,
+        data: Arc<Vec<u8>>,
+        offset: usize,
+        length: usize,
+        deadline: Instant,
+    ) -> Result<ExportWindow, HixlError> {
+        let window = data
+            .get(offset..offset.saturating_add(length))
+            .ok_or_else(invalid_export_range)?
+            .to_vec();
+        self.prepare_export(lane, window, deadline)
+    }
     fn release_export(&self, lane: usize, slot_id: u64, generation: u64) -> Result<(), HixlError>;
     fn quarantine(&self) -> Result<(), HixlError>;
 }
@@ -1476,6 +1507,20 @@ impl ExportProvider for RuntimeExportProvider {
             .prepare_export(bytes, deadline)
     }
 
+    fn prepare_export_shared(
+        &self,
+        lane: usize,
+        data: Arc<Vec<u8>>,
+        offset: usize,
+        length: usize,
+        deadline: Instant,
+    ) -> Result<ExportWindow, HixlError> {
+        self.runtime
+            .lane(lane)
+            .ok_or_else(invalid_runtime_lane)?
+            .prepare_export_shared(data, offset, length, deadline)
+    }
+
     fn release_export(&self, lane: usize, slot_id: u64, generation: u64) -> Result<(), HixlError> {
         self.runtime
             .lane(lane)
@@ -1494,6 +1539,16 @@ fn invalid_runtime_lane() -> HixlError {
         kind: afs_transport::hixl::HixlErrorKind::InvalidArgument,
         native_status: None,
         message: "HIXL lane is not configured".into(),
+        read_may_be_in_flight: false,
+    }
+}
+
+fn invalid_export_range() -> HixlError {
+    HixlError {
+        phase: afs_transport::hixl::HixlPhase::PrepareExport,
+        kind: afs_transport::hixl::HixlErrorKind::InvalidArgument,
+        native_status: None,
+        message: "HIXL export range exceeds the shared snapshot".into(),
         read_may_be_in_flight: false,
     }
 }
@@ -1684,7 +1739,7 @@ struct Session {
 
 struct PreparedBatch {
     request: Arc<DfsReadRangesRequest>,
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
     next_offset: usize,
     range_checksums: HashMap<(String, u64, u64), Vec<u8>>,
 }
@@ -1786,17 +1841,22 @@ impl Tombstones {
         self.by_key.contains_key(key)
     }
 
-    fn matches(&self, key: &WindowKey, request: &DfsReleaseHixlReadRequest) -> bool {
+    fn matches(
+        &self,
+        key: &WindowKey,
+        request: &DfsReleaseHixlReadRequest,
+        release: &DfsHixlReleaseWindow,
+    ) -> bool {
         self.by_key.get(key).is_some_and(|entry| {
             entry.engine_id == request.engine_id
                 && entry.engine_generation == request.engine_generation
                 && entry.pool_generation == request.pool_generation
-                && entry.slot_id == request.slot_id
-                && entry.slot_generation == request.slot_generation
+                && entry.slot_id == release.slot_id
+                && entry.slot_generation == release.slot_generation
                 && entry.caller_epoch == request.caller_node_epoch
                 && entry.source_epoch == request.source_node_epoch
-                && entry.outcome == request.outcome
-                && entry.content_validated == request.content_validated
+                && entry.outcome == release.outcome
+                && entry.content_validated == release.content_validated
         })
     }
 
@@ -1932,14 +1992,15 @@ fn effective_export_slots(slots: usize) -> Result<u32, Status> {
 fn validate_release_identity(
     window: &WindowRecord,
     request: &DfsReleaseHixlReadRequest,
+    release: &DfsHixlReleaseWindow,
 ) -> Result<(), Status> {
     if window.reply.session_id != request.session_id
         || window.reply.source_node_epoch != request.source_node_epoch
         || window.reply.engine_id != request.engine_id
         || window.reply.engine_generation != request.engine_generation
         || window.reply.pool_generation != request.pool_generation
-        || window.reply.slot_id != request.slot_id
-        || window.reply.slot_generation != request.slot_generation
+        || window.reply.slot_id != release.slot_id
+        || window.reply.slot_generation != release.slot_generation
         || window
             .request
             .operations
@@ -2156,6 +2217,7 @@ mod tests {
             attempt_id: "attempt".into(),
             file_version_id: "version".into(),
             layout_root_id: "layout".into(),
+            include_blake3_outboard: false,
             operations: vec![DfsChunkReadOp {
                 operation_index: 0,
                 chunk_id: format!("blake3-{}-4", blake3::hash(b"data")),
@@ -2222,17 +2284,19 @@ mod tests {
         DfsReleaseHixlReadRequest {
             session_id: reply.session_id,
             read_id: reply.read_id.clone(),
-            attempt_id: reply.attempt_id.clone(),
             source_node_id: reply.source_node_id.clone(),
             source_node_epoch: reply.source_node_epoch,
             engine_id: reply.engine_id.clone(),
             engine_generation: reply.engine_generation,
             pool_generation: reply.pool_generation,
-            slot_id: reply.slot_id,
-            slot_generation: reply.slot_generation,
             caller_node_epoch: 1,
-            outcome: DfsHixlReleaseOutcome::Completed as i32,
-            content_validated: true,
+            windows: vec![DfsHixlReleaseWindow {
+                attempt_id: reply.attempt_id.clone(),
+                slot_id: reply.slot_id,
+                slot_generation: reply.slot_generation,
+                outcome: DfsHixlReleaseOutcome::Completed as i32,
+                content_validated: true,
+            }],
         }
     }
 
@@ -2449,7 +2513,7 @@ mod tests {
         let (service, provider, authorizer) = service();
         let prepared = admitted_fixture(&service, authorizer.clone(), local.clone()).await;
         let mut request = release_request(&prepared);
-        request.outcome = DfsHixlReleaseOutcome::NotSubmitted as i32;
+        request.windows[0].outcome = DfsHixlReleaseOutcome::NotSubmitted as i32;
         assert!(
             service
                 .release("reader".into(), request.clone())
@@ -2457,13 +2521,14 @@ mod tests {
                 .is_err(),
             "never-submitted cannot claim validated content"
         );
-        request.content_validated = false;
+        request.windows[0].content_validated = false;
         assert!(
             service
                 .release("reader".into(), request.clone())
                 .await
                 .unwrap()
                 .into_inner()
+                .windows[0]
                 .consumed
         );
         assert!(
@@ -2472,6 +2537,7 @@ mod tests {
                 .await
                 .unwrap()
                 .into_inner()
+                .windows[0]
                 .already_released
         );
         assert_eq!(provider.quarantines.load(Ordering::SeqCst), 0);
@@ -3071,6 +3137,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_release_request_covers_every_prepared_window() {
+        let (service, provider, authorizer) = service();
+        let (_temp, local) = local_store();
+        let batch = read_request("batch-release", "fixture-grant");
+        let session = service
+            .negotiate(
+                "reader".into(),
+                negotiate_request(batch.clone()),
+                authorizer.clone(),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        let first = service
+            .prepare(
+                "reader".into(),
+                batch_window_request(session.session_id, &batch, 0, 2, "window-0"),
+                authorizer.clone(),
+                Some(local.clone()),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        let second = service
+            .prepare(
+                "reader".into(),
+                batch_window_request(session.session_id, &batch, 2, 2, "window-1"),
+                authorizer,
+                Some(local),
+            )
+            .await
+            .unwrap()
+            .into_inner();
+        let mut request = release_request(&first);
+        request.windows.push(DfsHixlReleaseWindow {
+            attempt_id: second.attempt_id.clone(),
+            slot_id: second.slot_id,
+            slot_generation: second.slot_generation,
+            outcome: DfsHixlReleaseOutcome::Completed as i32,
+            content_validated: true,
+        });
+        let reply = service
+            .release("reader".into(), request)
+            .await
+            .expect("batched release")
+            .into_inner();
+        assert_eq!(reply.windows.len(), 2);
+        assert!(reply.windows.iter().all(|window| window.consumed));
+        assert_eq!(provider.releases.load(Ordering::SeqCst), 2);
+        let registry = service.registry.lock().unwrap();
+        assert_eq!(registry.prepared_batch_bytes(), 0);
+        assert!(registry.sessions[&session.session_id].windows.is_empty());
+    }
+
+    #[tokio::test]
     async fn logical_batch_rejects_changed_parent_and_out_of_order_window() {
         let (service, provider, authorizer) = service();
         let (_temp, local) = local_store();
@@ -3614,13 +3735,13 @@ mod tests {
             .expect_err("capacity must be bounded");
         assert_eq!(capacity.code(), tonic::Code::ResourceExhausted);
         let mut unknown = release_request(&first);
-        unknown.outcome = DfsHixlReleaseOutcome::Unknown as i32;
+        unknown.windows[0].outcome = DfsHixlReleaseOutcome::Unknown as i32;
         let unknown_reply = service
             .release("reader".into(), unknown)
             .await
             .expect("unknown release")
             .into_inner();
-        assert!(!unknown_reply.consumed);
+        assert!(!unknown_reply.windows[0].consumed);
         assert_eq!(provider.releases.load(Ordering::SeqCst), 0);
         let frozen = service
             .negotiate(
@@ -3671,15 +3792,15 @@ mod tests {
             .await
             .expect("release")
             .into_inner();
-        assert!(released.consumed);
+        assert!(released.windows[0].consumed);
         let replay = service
             .release("reader".into(), release_request(&first))
             .await
             .expect("idempotent release")
             .into_inner();
-        assert!(replay.already_released);
+        assert!(replay.windows[0].already_released);
         let mut mismatched = release_request(&first);
-        mismatched.content_validated = false;
+        mismatched.windows[0].content_validated = false;
         let mismatch = service
             .release("reader".into(), mismatched)
             .await
@@ -3726,14 +3847,14 @@ mod tests {
             .unwrap()
             .into_inner();
         let mut release = release_request(&window);
-        release.outcome = DfsHixlReleaseOutcome::Failed as i32;
-        release.content_validated = false;
+        release.windows[0].outcome = DfsHixlReleaseOutcome::Failed as i32;
+        release.windows[0].content_validated = false;
         let reply = service
             .release("reader".into(), release)
             .await
             .unwrap()
             .into_inner();
-        assert!(!reply.consumed);
+        assert!(!reply.windows[0].consumed);
         assert_eq!(provider.releases.load(Ordering::SeqCst), 0);
         assert_eq!(provider.quarantines.load(Ordering::SeqCst), 1);
     }
@@ -3862,6 +3983,7 @@ mod tests {
                 attempt_id: "attempt".into(),
                 file_version_id: "version".into(),
                 layout_root_id: "layout".into(),
+                include_blake3_outboard: false,
                 operations: vec![DfsChunkReadOp {
                     operation_index: 0,
                     chunk_id: "chunk".into(),
@@ -3892,16 +4014,19 @@ mod tests {
         let request = DfsReleaseHixlReadRequest {
             session_id: 5,
             read_id: "read".into(),
-            attempt_id: "attempt".into(),
+            source_node_id: "source".into(),
             source_node_epoch: 9,
             caller_node_epoch: 3,
             engine_id: "engine".into(),
             engine_generation: 11,
             pool_generation: 11,
-            slot_id: 13,
-            slot_generation: 18,
-            ..DfsReleaseHixlReadRequest::default()
+            windows: vec![DfsHixlReleaseWindow {
+                attempt_id: "attempt".into(),
+                slot_id: 13,
+                slot_generation: 18,
+                ..DfsHixlReleaseWindow::default()
+            }],
         };
-        assert!(validate_release_identity(&window, &request).is_err());
+        assert!(validate_release_identity(&window, &request, &request.windows[0]).is_err());
     }
 }

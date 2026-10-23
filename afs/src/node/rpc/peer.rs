@@ -1375,8 +1375,11 @@ impl GrpcChunkTransfer {
                 let mut client = DfsChunksClient::new(channel)
                     .max_encoding_message_size(self.peers.config.max_encoding_message_bytes)
                     .max_decoding_message_size(self.peers.config.max_decoding_message_bytes);
-                if let Some(metrics) = &self.payload_metrics {
-                    return prepared::read(&mut client, &request, out, self.timeout, metrics).await;
+                if chunk.is_none()
+                    && let Some(metrics) = &self.payload_metrics
+                {
+                    prepared::read(&mut client, &request, out, self.timeout, metrics).await?;
+                    return Ok(None);
                 }
                 let mut rpc_request = request_with_current_context(request.clone());
                 rpc_request.set_timeout(timeout);
@@ -3410,34 +3413,33 @@ impl<'a> ReadFrameDecoder<'a> {
                         "peer read completion identity/length mismatch",
                     ));
                 }
-                let digest = if self.deferred.is_some() {
-                    None
-                } else if self.producer_root_pending {
-                    Some(blake3::Hash::from(
-                        <[u8; 32]>::try_from(completion.range_checksum.as_slice()).map_err(
-                            |_| dfs_corrupt_error("peer read completion checksum mismatch"),
-                        )?,
-                    ))
-                } else if self.root_mode == PeerRootMode::ConsumerTree {
-                    let object = self
-                        .verified_object
-                        .as_mut()
-                        .ok_or_else(|| dfs_protocol_error("consumer tree lacks trusted object"))?;
-                    let root = object
-                        .finish_outboard(observation)?
-                        .ok_or_else(|| dfs_protocol_error("consumer tree root was not completed"))?;
-                    Some(blake3::Hash::from(root))
-                } else {
-                    let checksum = active
-                        .checksum
-                        .as_ref()
-                        .ok_or_else(|| dfs_protocol_error("Peer consumer root state is missing"))?;
-                    Some(
-                        observation.measure(ReadDiagnosticConsumerStage::RootBlake3, 0, || {
-                            checksum.finalize()
-                        }),
-                    )
-                };
+                let digest =
+                    if self.deferred.is_some() {
+                        None
+                    } else if self.producer_root_pending {
+                        Some(blake3::Hash::from(
+                            <[u8; 32]>::try_from(completion.range_checksum.as_slice()).map_err(
+                                |_| dfs_corrupt_error("peer read completion checksum mismatch"),
+                            )?,
+                        ))
+                    } else if self.root_mode == PeerRootMode::ConsumerTree {
+                        let object = self.verified_object.as_mut().ok_or_else(|| {
+                            dfs_protocol_error("consumer tree lacks trusted object")
+                        })?;
+                        let root = object.finish_outboard(observation)?.ok_or_else(|| {
+                            dfs_protocol_error("consumer tree root was not completed")
+                        })?;
+                        Some(blake3::Hash::from(root))
+                    } else {
+                        let checksum = active.checksum.as_ref().ok_or_else(|| {
+                            dfs_protocol_error("Peer consumer root state is missing")
+                        })?;
+                        Some(observation.measure(
+                            ReadDiagnosticConsumerStage::RootBlake3,
+                            0,
+                            || checksum.finalize(),
+                        ))
+                    };
                 if let Some(digest) = digest {
                     if completion.range_checksum.as_slice() != digest.as_bytes() {
                         return Err(dfs_corrupt_error("peer read completion checksum mismatch"));
@@ -7264,6 +7266,64 @@ mod tests {
                     > + Send,
             >,
         >;
+        type FetchPreparedReadStream = std::pin::Pin<
+            Box<
+                dyn tokio_stream::Stream<
+                        Item = Result<afs_protocol::node_data::DfsReadRangesFrame, Status>,
+                    > + Send,
+            >,
+        >;
+        async fn prepare_read_ranges(
+            &self,
+            _request: Request<DfsReadRangesRequest>,
+        ) -> Result<Response<afs_protocol::node_data::DfsPreparedReadReply>, Status> {
+            Err(Status::unimplemented("unused fixture RPC"))
+        }
+        async fn fetch_prepared_read(
+            &self,
+            _request: Request<afs_protocol::node_data::DfsFetchPreparedReadRequest>,
+        ) -> Result<Response<Self::FetchPreparedReadStream>, Status> {
+            Err(Status::unimplemented("unused fixture RPC"))
+        }
+        async fn release_prepared_read(
+            &self,
+            _request: Request<afs_protocol::node_data::DfsReleasePreparedReadRequest>,
+        ) -> Result<Response<afs_protocol::node_data::DfsReleasePreparedReadReply>, Status>
+        {
+            Err(Status::unimplemented("unused fixture RPC"))
+        }
+        async fn negotiate_hixl(
+            &self,
+            _request: Request<afs_protocol::node_data::DfsNegotiateHixlRequest>,
+        ) -> Result<Response<afs_protocol::node_data::DfsNegotiateHixlReply>, Status> {
+            Err(Status::unimplemented("unused fixture RPC"))
+        }
+        async fn prepare_read_ranges_hixl(
+            &self,
+            _request: Request<afs_protocol::node_data::DfsPrepareReadRangesHixlRequest>,
+        ) -> Result<Response<afs_protocol::node_data::DfsPrepareReadRangesHixlReply>, Status>
+        {
+            Err(Status::unimplemented("unused fixture RPC"))
+        }
+        async fn prepare_read_ranges_hixl_group(
+            &self,
+            _request: Request<afs_protocol::node_data::DfsPrepareReadRangesHixlGroupRequest>,
+        ) -> Result<Response<afs_protocol::node_data::DfsPrepareReadRangesHixlGroupReply>, Status>
+        {
+            Err(Status::unimplemented("unused fixture RPC"))
+        }
+        async fn release_hixl_read(
+            &self,
+            _request: Request<afs_protocol::node_data::DfsReleaseHixlReadRequest>,
+        ) -> Result<Response<afs_protocol::node_data::DfsReleaseHixlReadReply>, Status> {
+            Err(Status::unimplemented("unused fixture RPC"))
+        }
+        async fn close_hixl(
+            &self,
+            _request: Request<afs_protocol::node_data::DfsCloseHixlRequest>,
+        ) -> Result<Response<afs_protocol::node_data::DfsCloseHixlReply>, Status> {
+            Err(Status::unimplemented("unused fixture RPC"))
+        }
         async fn put_replica_stream(
             &self,
             _request: Request<tonic::Streaming<afs_protocol::node_data::DfsPutReplicaFrame>>,
@@ -10416,7 +10476,9 @@ mod tests {
         let mut decoder = ReadFrameDecoder::prepared(&request);
         for mut frame in (0..2).flat_map(|index| range_frames(&request, index)) {
             if let Some(dfs_read_ranges_frame::Body::Data(bytes)) = frame.body.as_mut() {
-                bytes[0] ^= 1;
+                let mut corrupted = bytes.to_vec();
+                corrupted[0] ^= 1;
+                *bytes = corrupted.into();
             }
             decoder.accept(frame, &mut out).unwrap();
         }

@@ -306,25 +306,35 @@ enum DfsHixlReleaseOutcome {
   DFS_HIXL_RELEASE_OUTCOME_NOT_SUBMITTED = 4;
 }
 
+// One prepared native window of a release batch. Every window in a
+// DfsReleaseHixlReadRequest shares the session, read and engine identity.
+message DfsHixlReleaseWindow {
+  string attempt_id = 1;
+  uint64 slot_id = 2;
+  uint64 slot_generation = 3;
+  DfsHixlReleaseOutcome outcome = 4;
+  bool content_validated = 5;
+}
+
 message DfsReleaseHixlReadRequest {
   uint64 session_id = 1;
   string read_id = 2;
-  string attempt_id = 3;
-  string source_node_id = 4;
-  uint64 source_node_epoch = 5;
-  string engine_id = 6;
-  uint64 engine_generation = 7;
-  uint64 pool_generation = 8;
-  uint64 slot_id = 9;
-  uint64 slot_generation = 10;
-  uint64 caller_node_epoch = 11;
-  DfsHixlReleaseOutcome outcome = 12;
-  bool content_validated = 13;
+  string source_node_id = 3;
+  uint64 source_node_epoch = 4;
+  string engine_id = 5;
+  uint64 engine_generation = 6;
+  uint64 pool_generation = 7;
+  uint64 caller_node_epoch = 8;
+  repeated DfsHixlReleaseWindow windows = 9;
+}
+
+message DfsHixlReleaseWindowResult {
+  bool consumed = 1;
+  bool already_released = 2;
 }
 
 message DfsReleaseHixlReadReply {
-  bool consumed = 1;
-  bool already_released = 2;
+  repeated DfsHixlReleaseWindowResult windows = 1;
 }
 
 message DfsCloseHixlRequest {

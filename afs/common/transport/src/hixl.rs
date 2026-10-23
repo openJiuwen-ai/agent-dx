@@ -594,9 +594,18 @@ impl<B: NativeBackend> RuntimeCore<B> {
         Ok(())
     }
 
+    #[cfg(test)]
     fn prepare_export(
         &mut self,
         data: Vec<u8>,
+        deadline: Instant,
+    ) -> Result<ExportWindow, HixlError> {
+        self.prepare_export_slice(&data, deadline)
+    }
+
+    fn prepare_export_slice(
+        &mut self,
+        data: &[u8],
         deadline: Instant,
     ) -> Result<ExportWindow, HixlError> {
         self.ensure_running(HixlPhase::PrepareExport)?;
@@ -641,7 +650,7 @@ impl<B: NativeBackend> RuntimeCore<B> {
         self.exports[slot_id].state = SlotState::Active;
         let address = match self
             .backend
-            .prepare_export(slot_id as u64, generation, &data)
+            .prepare_export(slot_id as u64, generation, data)
         {
             Ok(address) if address != 0 => address,
             Ok(_) => {
@@ -1343,7 +1352,9 @@ enum Command {
         reply: SyncSender<Result<(), HixlError>>,
     },
     PrepareExport {
-        data: Vec<u8>,
+        data: Arc<Vec<u8>>,
+        offset: usize,
+        length: usize,
         deadline: Instant,
         reply: SyncSender<Result<ExportWindow, HixlError>>,
     },
@@ -1533,9 +1544,22 @@ impl HixlRuntime {
         data: Vec<u8>,
         deadline: Instant,
     ) -> Result<ExportWindow, HixlError> {
+        let length = data.len();
+        self.prepare_export_shared(Arc::new(data), 0, length, deadline)
+    }
+
+    /// Exports one window out of a shared snapshot without copying the window
+    /// into a temporary `Vec`; only the native slot copy remains.
+    pub fn prepare_export_shared(
+        &self,
+        data: Arc<Vec<u8>>,
+        offset: usize,
+        length: usize,
+        deadline: Instant,
+    ) -> Result<ExportWindow, HixlError> {
         #[cfg(not(feature = "hixl"))]
         {
-            let _ = (data, deadline);
+            let _ = (data, offset, length, deadline);
             Err(HixlError::unsupported(
                 HixlPhase::PrepareExport,
                 "afs-transport was built without the hixl feature",
@@ -1543,10 +1567,24 @@ impl HixlRuntime {
         }
         #[cfg(feature = "hixl")]
         {
+            if length == 0
+                || offset
+                    .checked_add(length)
+                    .is_none_or(|end| end > data.len())
+            {
+                return Err(HixlError::new(
+                    HixlPhase::PrepareExport,
+                    HixlErrorKind::InvalidArgument,
+                    None,
+                    "export range exceeds the shared snapshot",
+                ));
+            }
             let (reply, receiver) = mpsc::sync_channel(1);
             self.send(
                 Command::PrepareExport {
                     data,
+                    offset,
+                    length,
                     deadline,
                     reply,
                 },
@@ -1861,10 +1899,22 @@ fn owner_loop<B: NativeBackend>(
             }
             Command::PrepareExport {
                 data,
+                offset,
+                length,
                 deadline,
                 reply,
             } => {
-                let result = core.prepare_export(data, deadline);
+                let result = data
+                    .get(offset..offset.saturating_add(length))
+                    .ok_or_else(|| {
+                        HixlError::new(
+                            HixlPhase::PrepareExport,
+                            HixlErrorKind::InvalidArgument,
+                            None,
+                            "export range exceeds the shared snapshot",
+                        )
+                    })
+                    .and_then(|slice| core.prepare_export_slice(slice, deadline));
                 update_status(&status, core.status());
                 let _ = reply.send(result);
                 false

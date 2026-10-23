@@ -583,7 +583,7 @@ mod hixl_health_tests {
         assert!(check.ready);
         assert_eq!(check.body["lane_count"], 2);
         #[cfg(feature = "dfs")]
-        assert_eq!(check.body["internal_protocol_version"], 4);
+        assert_eq!(check.body["internal_protocol_version"], 5);
         assert_eq!(check.body["relay_hbm_budget_bytes"], 128 * 1024 * 1024);
         assert_eq!(check.body["receive_slots_in_use"], 3);
         assert_eq!(check.body["export_slots_in_use"], 2);
