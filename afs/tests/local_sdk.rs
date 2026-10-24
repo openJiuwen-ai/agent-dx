@@ -5,7 +5,6 @@ use afs::node::{
     storage::{MAX_TRANSFER_BYTES, Storage},
 };
 use afs_client::{
-    DfsAccess, DfsFileVersion, DfsLocalClient, DfsLocalClientConfig, DfsReadBuffer, DfsWriteBuffer,
     DiagnosticLocalClient, DiagnosticLocalClientConfig, LocalClientError,
     max_parallel_shm_operations,
 };
@@ -87,68 +86,6 @@ async fn local_api_rejects_missing_shm_grant_without_data_fallback() {
     assert!(error.message().contains("missing SHM source grant"));
 
     server.shutdown().await.expect("shutdown local api");
-}
-
-#[tokio::test]
-async fn dfs_local_sdk_is_typed_and_never_falls_through_to_diagnostics_storage() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let socket_path = temp.path().join("afs-node.sock");
-    let storage = Storage::new(temp.path().join("diagnostics")).expect("storage");
-    let server = serve_local_api(storage, &socket_path)
-        .await
-        .expect("serve local api");
-    let diagnostic =
-        DiagnosticLocalClient::connect(DiagnosticLocalClientConfig::new(socket_path.clone()))
-            .await
-            .expect("connect diagnostic client");
-    diagnostic
-        .write("inode-test", 0, b"diagnostic-only".to_vec())
-        .await
-        .expect("seed diagnostics object");
-
-    let dfs = DfsLocalClient::connect(DfsLocalClientConfig::new(socket_path))
-        .await
-        .expect("connect DFS local client");
-    let error = dfs
-        .open("default", "inode-test", DfsAccess::ReadWrite, None)
-        .await
-        .expect_err("unwired DFS service must fail explicitly");
-    assert!(
-        matches!(error, LocalClientError::Status(status) if status.code() == afs_error::NODE_VFS_UNIMPLEMENTED)
-    );
-    assert_eq!(
-        diagnostic
-            .read("inode-test", 0, 15)
-            .await
-            .expect("diagnostics object remains independent"),
-        b"diagnostic-only"
-    );
-
-    server.shutdown().await.expect("shutdown local api");
-}
-
-#[test]
-fn dfs_sdk_buffers_and_fixed_version_validate_ownership_inputs() {
-    let read = DfsReadBuffer::new(8).expect("allocate DFS read buffer");
-    assert_eq!(read.capacity(), 8);
-    assert_eq!(read.read_prefix(0).unwrap(), Vec::<u8>::new());
-
-    let write = DfsWriteBuffer::from_bytes(b"payload".to_vec()).expect("DFS write buffer");
-    assert_eq!(write.length(), 7);
-
-    let version = DfsFileVersion::new("default", "inode-test", "version:1")
-        .expect("complete fixed version identity");
-    assert_eq!(
-        version,
-        DfsFileVersion::new("default", "inode-test", "version:1").unwrap()
-    );
-    assert!(matches!(
-        DfsFileVersion::new("", "inode-test", "version:1"),
-        Err(LocalClientError::InvalidArgument {
-            field: "namespace_id",
-            ..
-        })
-    ));
 }
 
 #[tokio::test]
@@ -262,4 +199,53 @@ async fn missing_file_preserves_rpc_error_and_releases_broker_before_return() {
         2
     );
     server.shutdown().await.unwrap();
+}
+
+/// 参照组：per-op gRPC + 每 IO 一次 shm 拷贝，**没有环、没有批量**。
+///
+/// 这是"每次 IO 跨一次边界"的客户端形态，也就是 FUSE 的结构性替身（FUSE 还要多两次内核穿越）。
+/// 用它和共享环路径对比，才能量化"把 IPC 从每次 IO 一次改成每批一次"到底值多少。
+///
+/// `cargo test --release -p afs --test local_sdk -- --ignored --nocapture per_op_grpc_reference`
+#[ignore = "性能测量，不在门禁里跑"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn per_op_grpc_reference() {
+    use std::time::Instant;
+
+    const SLOTS: u64 = 64;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (server, client) = start_local_api(&temp).await;
+
+    for (payload_len, ops) in [(4096_usize, 1024_usize), (1024 * 1024, 128)] {
+        let payload = vec![0x5a_u8; payload_len];
+
+        let started = Instant::now();
+        for op in 0..ops {
+            let offset = (op as u64 % SLOTS) * payload_len as u64;
+            client
+                .write("bench.bin", offset, payload.clone())
+                .await
+                .expect("per-op write");
+        }
+        let write_elapsed = started.elapsed();
+
+        let started = Instant::now();
+        for op in 0..ops {
+            let offset = (op as u64 % SLOTS) * payload_len as u64;
+            let _ = client
+                .read("bench.bin", offset, payload_len as u32)
+                .await
+                .expect("per-op read");
+        }
+        let read_elapsed = started.elapsed();
+
+        println!(
+            "per-op gRPC {payload_len}B: 写 {:.1} µs/op / 读 {:.1} µs/op（{} 条，每 IO 一次往返 + 一次拷贝）",
+            write_elapsed.as_secs_f64() * 1e6 / ops as f64,
+            read_elapsed.as_secs_f64() * 1e6 / ops as f64,
+            ops,
+        );
+    }
+
+    server.shutdown().await.expect("shutdown");
 }

@@ -8,10 +8,18 @@
 
 #[cfg(feature = "grpc")]
 mod error;
+#[cfg(feature = "shm")]
+pub mod eventfd;
 #[cfg(feature = "grpc")]
 pub mod grpc;
+#[cfg(feature = "shm")]
+pub mod iov;
+#[cfg(feature = "shm")]
+pub mod mapped;
 #[cfg(feature = "rdma")]
 pub mod rdma;
+#[cfg(feature = "shm")]
+pub mod ring;
 #[cfg(feature = "shm")]
 pub mod shm;
 

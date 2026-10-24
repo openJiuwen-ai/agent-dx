@@ -1165,6 +1165,10 @@ pub async fn run_with_shutdown(
     run_node(cfg, obs, move || shutdown.arm()).await
 }
 
+/// 本机 SDK 的 DFS 命名空间。meta 适配器、DFS 实例与 local API 三处必须用同一个值，
+/// 散写字符串会漂移成「SDK 连到另一个命名空间」。
+const DEFAULT_DFS_NAMESPACE: &str = "default";
+
 async fn run_node(
     cfg: Config,
     obs: Observability,
@@ -1476,7 +1480,7 @@ async fn run_node(
                 meta_endpoint.expect("DFS checked meta_endpoint"),
                 cfg.id.clone(),
                 session_id.clone(),
-                crate::dfs::NamespaceId::new("default"),
+                crate::dfs::NamespaceId::new(DEFAULT_DFS_NAMESPACE),
                 timeout,
                 cfg.tls_config(),
             )?
@@ -1542,7 +1546,7 @@ async fn run_node(
     dfs_write_buffers.register_metrics(&obs.registry)?;
     #[cfg(feature = "dfs")]
     let dfs_instance = if cfg.dfs {
-        let namespace = crate::dfs::NamespaceId::new("default");
+        let namespace = crate::dfs::NamespaceId::new(DEFAULT_DFS_NAMESPACE);
         let meta = dfs_meta
             .as_ref()
             .expect("DFS Meta adapter was constructed")
@@ -1723,11 +1727,22 @@ async fn run_node(
     let sessions = rpc::control::RdmaSessionRegistry::new(cfg.rdma_device.clone());
     #[cfg(feature = "ownerfs")]
     let owner_rdma_sessions = rpc::control::RdmaSessionRegistry::new(cfg.rdma_device.clone());
+    // 本机 SDK 的数据面直接调用已装配的 DFS 后端；未启用 DFS 时保持 None，
+    // 让 DfsLocalData 明确返回 UNIMPLEMENTED，而不是退回 diagnostics 目录。
+    #[cfg(feature = "dfs")]
+    let dfs_backend: Option<Arc<dyn vfs::Backend>> = dfs_instance
+        .as_ref()
+        .map(|backend| Arc::clone(backend) as Arc<dyn vfs::Backend>);
+    #[cfg(not(feature = "dfs"))]
+    let dfs_backend: Option<Arc<dyn vfs::Backend>> = None;
     let local = api::local::serve_local_api_with_options(
         diagnostic_storage.clone(),
         &cfg.uds_path,
         api::local::LocalApiOptions {
             metrics_registry: Some(obs.registry.clone()),
+            dfs_backend,
+            // 与上面 DFS 后端构造时使用的命名空间保持一致。
+            dfs_namespace: Some(DEFAULT_DFS_NAMESPACE.to_owned()),
         },
     )
     .await?;

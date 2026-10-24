@@ -6,3 +6,6 @@
 
 pub mod local;
 pub mod rest;
+pub mod usrbio;
+#[cfg(test)]
+mod usrbio_e2e;

@@ -15,16 +15,144 @@ service LocalData {
   rpc Write(LocalWriteRequest) returns (LocalWriteReply);
 }
 
-// DfsLocalData 是 DistributedFs 专用的侵入式本机数据入口。Node 签发的 handle
-// 绑定打开文件状态；固定 FileVersion 引用只允许读。范围和同步屏障始终显式传递，
-// 文件内容只经 LocalShmGrant 指向的共享内存搬运。
+// DfsLocalData 是 DistributedFs 专用的侵入式本机数据入口。
+//
+// 控制面只负责建立持久 iov、注册已打开的句柄、绑定共享环；文件内容不经过 gRPC。
+// 一次 read/write 由 SDK 直接写进 iov 并通过共享环提交，Node 的环 worker 从同一块
+// 内存取字节调用 DFS 后端，完成后把结果写进共享完成队列。因此数据面既没有 RPC，
+// 也没有逐次操作的 FD 传递。
 service DfsLocalData {
   rpc Open(DfsOpenRequest) returns (DfsOpenReply);
-  rpc Read(DfsReadRequest) returns (DfsReadReply);
-  rpc Write(DfsWriteRequest) returns (DfsWriteReply);
   rpc Sync(DfsSyncRequest) returns (DfsSyncReply);
   rpc Close(DfsCloseRequest) returns (DfsCloseReply);
+  // 建立持久 iov：SDK 创建共享内存，Node 映射并按区块管理。
+  rpc IovCreate(DfsIovCreateRequest) returns (DfsIovCreateReply);
+  rpc IovDestroy(DfsIovDestroyRequest) returns (DfsIovDestroyReply);
+  // 注册已打开的句柄：把权限与版本身份固定下来，环内只携带编号。
+  rpc RegisterFile(DfsRegisterFileRequest) returns (DfsRegisterFileReply);
+  rpc UnregisterFile(DfsUnregisterFileRequest) returns (DfsUnregisterFileReply);
+  // 绑定一条共享环：Node 为该环启动唯一的消费 worker。
+  rpc RingCreate(DfsRingCreateRequest) returns (DfsRingCreateReply);
+  rpc RingDestroy(DfsRingDestroyRequest) returns (DfsRingDestroyReply);
 }
+
+enum DfsOpenAccess {
+  DFS_OPEN_ACCESS_UNSPECIFIED = 0;
+  DFS_OPEN_ACCESS_READ_ONLY = 1;
+  DFS_OPEN_ACCESS_READ_WRITE = 2;
+}
+
+enum DfsSyncBarrier {
+  DFS_SYNC_BARRIER_UNSPECIFIED = 0;
+  DFS_SYNC_BARRIER_DATA = 1;
+  DFS_SYNC_BARRIER_FULL = 2;
+}
+
+// value 是 Node 生成并校验的本机不透明身份，SDK 不解析、不拼接。
+message DfsFileHandle {
+  bytes value = 1;
+}
+
+// 打开按挂载内路径进行：Node 从根 inode 逐段 lookup，与 FUSE 走同一条后端路径，
+// 因此权限与目录项语义完全一致。早期草案用 inode_id，但后端只有 inode→id 的单向
+// 映射，无法由 id 反解出可打开的句柄，已改为路径。
+message DfsOpenRequest {
+  string namespace_id = 1;
+  // 挂载内绝对路径，必须以 / 开头。
+  string path = 2;
+  DfsOpenAccess access = 3;
+}
+
+// file_version_id 是打开那一刻绑定的版本；SDK 拿它做固定版本校验。
+message DfsOpenReply {
+  DfsFileHandle handle = 1;
+  string file_version_id = 2;
+  uint64 length = 3;
+}
+
+message DfsSyncRequest {
+  DfsFileHandle handle = 1;
+  DfsSyncBarrier barrier = 2;
+}
+
+message DfsSyncReply {
+  string file_version_id = 1;
+  uint64 durable_write_seq = 2;
+}
+
+message DfsCloseRequest {
+  DfsFileHandle handle = 1;
+}
+
+message DfsCloseReply {}
+
+// ---------------------------------------------------------------------------
+// usrbio 控制面
+// ---------------------------------------------------------------------------
+
+message DfsIovCreateRequest {
+  // SDK 创建的持久 iov；region_offset 必须为 0，length 是整块字节数。
+  LocalShmGrant region = 1;
+  uint64 block_size = 2;
+  uint32 blocks = 3;
+}
+
+message DfsIovCreateReply {
+  uint64 iov_id = 1;
+  uint64 block_size = 2;
+  uint32 blocks = 3;
+  uint64 total_bytes = 4;
+}
+
+message DfsIovDestroyRequest {
+  uint64 iov_id = 1;
+}
+
+message DfsIovDestroyReply {}
+
+message DfsRegisterFileRequest {
+  DfsFileHandle handle = 1;
+}
+
+message DfsRegisterFileReply {
+  uint32 reg_id = 1;
+  // 该句柄当前绑定的版本；环内读写都固定在这个版本身份上。
+  string file_version_id = 2;
+}
+
+message DfsUnregisterFileRequest {
+  uint32 reg_id = 1;
+}
+
+message DfsUnregisterFileReply {}
+
+message DfsRingCreateRequest {
+  // SDK 创建的共享环：头部 + SQ + CQ。
+  LocalShmGrant region = 1;
+  uint64 iov_id = 2;
+  uint32 entries = 3;
+  // >0 攒够 io_depth 个才处理；<0 最多等 |io_depth| 个，受 timeout_ms 约束；
+  // 0 有多少处理多少。批次策略属于消费端，因此由 Node 的环 worker 执行。
+  int32 io_depth = 4;
+  uint32 timeout_ms = 5;
+  // SDK 创建的 eventfd，作为真正的唤醒门铃：SDK 每提交一批写一次，Node 的环 worker 阻塞等它，
+  // 不再靠固定间隔忙轮询。解绑环时 Node 自己写一次把 worker 叫醒退出。
+  LocalShmGrant doorbell = 6;
+  // SDK 创建的 eventfd，方向与门铃相反：Node 每投递一批完成项写一次，SDK 阻塞等它。
+  // 没有它 SDK 只能轮询完成队列——而 tokio 的定时器粒度是毫秒级，单条 IO 会被抬高一个数量级。
+  LocalShmGrant completion = 7;
+}
+
+message DfsRingCreateReply {
+  uint64 ring_id = 1;
+  uint32 entries = 2;
+}
+
+message DfsRingDestroyRequest {
+  uint64 ring_id = 1;
+}
+
+message DfsRingDestroyReply {}
 
 message LocalShmGrant {
   string broker_socket_path = 1;
@@ -56,91 +184,3 @@ message LocalWriteRequest {
 message LocalWriteReply {
   uint32 written = 1;
 }
-
-enum DfsOpenAccess {
-  DFS_OPEN_ACCESS_UNSPECIFIED = 0;
-  DFS_OPEN_ACCESS_READ_ONLY = 1;
-  DFS_OPEN_ACCESS_READ_WRITE = 2;
-}
-
-enum DfsSyncBarrier {
-  DFS_SYNC_BARRIER_UNSPECIFIED = 0;
-  DFS_SYNC_BARRIER_DATA = 1;
-  DFS_SYNC_BARRIER_FULL = 2;
-}
-
-// value 是 Node 生成并校验的本机不透明身份，SDK 不解析、不拼接。
-message DfsFileHandle {
-  bytes value = 1;
-}
-
-// 固定版本引用绕过 mutable head；三个身份必须同时出现，且只能用于读取。
-message DfsFileVersionRef {
-  string namespace_id = 1;
-  string inode_id = 2;
-  string file_version_id = 3;
-}
-
-message DfsReadTarget {
-  oneof target {
-    DfsFileHandle handle = 1;
-    DfsFileVersionRef version = 2;
-  }
-}
-
-message DfsFileRange {
-  uint64 offset = 1;
-  uint32 length = 2;
-}
-
-message DfsOpenRequest {
-  string namespace_id = 1;
-  string inode_id = 2;
-  DfsOpenAccess access = 3;
-  // 非空时要求 mutable head 恰好等于该版本，防止在错误版本上打开。
-  optional string expected_file_version_id = 4;
-}
-
-message DfsOpenReply {
-  DfsFileHandle handle = 1;
-  string file_version_id = 2;
-  uint64 length = 3;
-}
-
-message DfsReadRequest {
-  DfsReadTarget target = 1;
-  DfsFileRange range = 2;
-  LocalShmGrant target_buffer = 3;
-}
-
-message DfsReadReply {
-  uint32 length = 1;
-  string resolved_file_version_id = 2;
-}
-
-message DfsWriteRequest {
-  DfsFileHandle handle = 1;
-  DfsFileRange range = 2;
-  LocalShmGrant source_buffer = 3;
-}
-
-message DfsWriteReply {
-  uint32 written = 1;
-  uint64 accepted_write_seq = 2;
-}
-
-message DfsSyncRequest {
-  DfsFileHandle handle = 1;
-  DfsSyncBarrier barrier = 2;
-}
-
-message DfsSyncReply {
-  string file_version_id = 1;
-  uint64 durable_write_seq = 2;
-}
-
-message DfsCloseRequest {
-  DfsFileHandle handle = 1;
-}
-
-message DfsCloseReply {}

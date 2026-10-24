@@ -31,20 +31,26 @@ use std::{
 
 use afs_metrics::{IntCounterVec, Opts, Registry};
 use afs_protocol::local_api::{
-    DfsCloseReply, DfsCloseRequest, DfsOpenReply, DfsOpenRequest, DfsReadReply, DfsReadRequest,
-    DfsSyncReply, DfsSyncRequest, DfsWriteReply, DfsWriteRequest, LocalReadReply, LocalReadRequest,
+    DfsCloseReply, DfsCloseRequest, DfsFileHandle, DfsIovCreateReply, DfsIovCreateRequest,
+    DfsIovDestroyReply, DfsIovDestroyRequest, DfsOpenAccess, DfsOpenReply, DfsOpenRequest,
+    DfsRegisterFileReply, DfsRegisterFileRequest, DfsRingCreateReply, DfsRingCreateRequest,
+    DfsRingDestroyReply, DfsRingDestroyRequest, DfsSyncBarrier, DfsSyncReply, DfsSyncRequest,
+    DfsUnregisterFileReply, DfsUnregisterFileRequest, LocalReadReply, LocalReadRequest,
     LocalShmGrant, LocalWriteReply, LocalWriteRequest,
     dfs_local_data_server::{DfsLocalData, DfsLocalDataServer},
     local_data_server::{LocalData, LocalDataServer},
 };
-use afs_transport::shm::{
-    BrokerToken, FdBrokerClient, FdRequest, ShmError, read_fd_at, write_fd_at,
+use afs_transport::{
+    iov::IovLayout,
+    shm::{BrokerToken, FdBrokerClient, FdRequest, ShmError, read_fd_at, write_fd_at},
 };
 use tokio::{net::UnixListener, sync::oneshot, task::JoinHandle};
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::{Request, Response, Status, transport::Server};
 
+use crate::node::api::usrbio::{OpenAccess, UsrbioHub};
 use crate::node::storage::{Storage, StorageError};
+use crate::node::vfs::{Backend, types};
 
 const STALE_SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 
@@ -55,9 +61,25 @@ pub async fn serve_local_api(
     serve_local_api_with_options(storage, socket_path, LocalApiOptions::default()).await
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct LocalApiOptions {
     pub metrics_registry: Option<Registry>,
+    /// DFS 后端。未装配时 `DfsLocalData` 的每个方法都返回 UNIMPLEMENTED，绝不退回到
+    /// diagnostics 的测试对象目录。
+    pub dfs_backend: Option<Arc<dyn Backend>>,
+    /// 本机 SDK 服务声明的命名空间；`None` 表示不校验请求里的 `namespace_id`。
+    pub dfs_namespace: Option<String>,
+}
+
+impl std::fmt::Debug for LocalApiOptions {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LocalApiOptions")
+            .field("metrics_registry", &self.metrics_registry.is_some())
+            .field("dfs_backend", &self.dfs_backend.is_some())
+            .field("dfs_namespace", &self.dfs_namespace)
+            .finish()
+    }
 }
 
 /// 启动本机 Local API。
@@ -93,7 +115,19 @@ pub async fn serve_local_api_with_options(
         storage: storage.into(),
         metrics: metrics.clone(),
     });
-    let dfs_service = DfsLocalDataServer::new(DfsLocalDataService { metrics });
+    let ring_metrics = metrics.as_ref().map(|metrics| metrics.usrbio.clone());
+    let dfs_hub = options.dfs_backend.map(|backend| {
+        let hub = UsrbioHub::new(backend, options.dfs_namespace.clone());
+        let hub = match ring_metrics {
+            Some(ring_metrics) => hub.with_metrics(ring_metrics),
+            None => hub,
+        };
+        Arc::new(hub)
+    });
+    let dfs_service = DfsLocalDataServer::new(DfsLocalDataService {
+        metrics,
+        hub: dfs_hub,
+    });
     let task = tokio::spawn(async move {
         afs_transport::grpc::GrpcConfig::default()
             .configure_server(Server::builder())
@@ -175,11 +209,15 @@ struct DiagnosticLocalDataService {
 #[derive(Clone)]
 struct DfsLocalDataService {
     metrics: Option<LocalApiMetrics>,
+    /// usrbio 注册表；未装配 DFS 后端时为 `None`。
+    hub: Option<Arc<UsrbioHub>>,
 }
 
 #[derive(Clone)]
 struct LocalApiMetrics {
     requests: IntCounterVec,
+    /// usrbio 环活动；与 `requests` 分开是因为它的 label 是事件类型而不是 RPC 结果。
+    usrbio: crate::node::api::usrbio::RingMetrics,
 }
 
 #[derive(Clone, Copy)]
@@ -209,7 +247,16 @@ impl LocalApiMetrics {
                     &["operation", "result"],
                 )?;
                 registry.register(Box::new(requests.clone()))?;
-                Ok(Self { requests })
+                let usrbio_io = IntCounterVec::new(
+                    Opts::new(
+                        crate::node::api::usrbio::RingMetrics::NAME,
+                        "AFS usrbio shared-ring activity",
+                    ),
+                    &["event"],
+                )?;
+                registry.register(Box::new(usrbio_io.clone()))?;
+                let usrbio = crate::node::api::usrbio::RingMetrics::from_vec(usrbio_io);
+                Ok(Self { requests, usrbio })
             })
             .map_err(|error| io::Error::other(error.to_string()))
     }
@@ -230,14 +277,20 @@ impl DiagnosticLocalDataService {
 }
 
 impl DfsLocalDataService {
-    fn reject<T>(&self, operation: &'static str) -> Result<Response<T>, Status> {
+    fn record(&self, operation: &'static str, ok: bool) {
         if let Some(metrics) = &self.metrics {
-            metrics.record(operation, false);
+            metrics.record(operation, ok);
         }
-        Err(coded_status(
-            afs_error::NODE_VFS_UNIMPLEMENTED,
-            format!("DFS local SDK backend is not wired: {operation}"),
-        ))
+    }
+
+    /// 未装配 DFS 后端时显式拒绝。本机 SDK 绝不退回到 diagnostics 的测试对象目录。
+    fn hub(&self) -> Result<&Arc<UsrbioHub>, Status> {
+        self.hub.as_ref().ok_or_else(|| {
+            coded_status(
+                afs_error::NODE_VFS_UNIMPLEMENTED,
+                "DFS local SDK backend is not wired",
+            )
+        })
     }
 }
 
@@ -280,25 +333,313 @@ impl LocalData for DiagnosticLocalDataService {
 
 #[tonic::async_trait]
 impl DfsLocalData for DfsLocalDataService {
-    async fn open(&self, _: Request<DfsOpenRequest>) -> Result<Response<DfsOpenReply>, Status> {
-        self.reject("dfs_open")
+    async fn open(
+        &self,
+        request: Request<DfsOpenRequest>,
+    ) -> Result<Response<DfsOpenReply>, Status> {
+        let request = request.into_inner();
+        let outcome = async {
+            let hub = self.hub()?.clone();
+            let access = open_access(request.access)?;
+            let (namespace, path) = (request.namespace_id.clone(), request.path.clone());
+            let executor = hub.executor().clone();
+            let (value, length) = executor
+                .run(move || hub.open(&namespace, &path, access))
+                .await
+                .map_err(error_to_status)?;
+            Ok(DfsOpenReply {
+                handle: Some(DfsFileHandle { value }),
+                // 版本身份目前无法从 `Backend` 取得（trait 没有版本访问器），因此留空表示
+                // 「未固定」；SDK 不得把空串当作固定版本使用。
+                file_version_id: String::new(),
+                length,
+            })
+        }
+        .await;
+        self.record("dfs_open", outcome.is_ok());
+        outcome.map(Response::new)
     }
 
-    async fn read(&self, _: Request<DfsReadRequest>) -> Result<Response<DfsReadReply>, Status> {
-        self.reject("dfs_read")
+    async fn sync(
+        &self,
+        request: Request<DfsSyncRequest>,
+    ) -> Result<Response<DfsSyncReply>, Status> {
+        let request = request.into_inner();
+        let outcome = async {
+            let hub = self.hub()?.clone();
+            let handle = handle_value(request.handle)?;
+            let mode = sync_mode(request.barrier)?;
+            let executor = hub.executor().clone();
+            executor
+                .run(move || hub.sync(&handle, mode))
+                .await
+                .map_err(error_to_status)?;
+            Ok(DfsSyncReply {
+                // 同 open：后端未暴露版本身份与 durable 序号，这里返回零值而不是编造。
+                file_version_id: String::new(),
+                durable_write_seq: 0,
+            })
+        }
+        .await;
+        self.record("dfs_sync", outcome.is_ok());
+        outcome.map(Response::new)
     }
 
-    async fn write(&self, _: Request<DfsWriteRequest>) -> Result<Response<DfsWriteReply>, Status> {
-        self.reject("dfs_write")
+    async fn close(
+        &self,
+        request: Request<DfsCloseRequest>,
+    ) -> Result<Response<DfsCloseReply>, Status> {
+        let request = request.into_inner();
+        let outcome = async {
+            let hub = self.hub()?.clone();
+            let handle = handle_value(request.handle)?;
+            let executor = hub.executor().clone();
+            executor
+                .run(move || hub.close(&handle))
+                .await
+                .map_err(error_to_status)?;
+            Ok(DfsCloseReply {})
+        }
+        .await;
+        self.record("dfs_close", outcome.is_ok());
+        outcome.map(Response::new)
     }
 
-    async fn sync(&self, _: Request<DfsSyncRequest>) -> Result<Response<DfsSyncReply>, Status> {
-        self.reject("dfs_sync")
+    async fn iov_create(
+        &self,
+        request: Request<DfsIovCreateRequest>,
+    ) -> Result<Response<DfsIovCreateReply>, Status> {
+        let request = request.into_inner();
+        let outcome = async {
+            let hub = self.hub()?;
+            let grant = request
+                .region
+                .ok_or_else(|| shm_invalid_status("missing iov SHM grant"))?;
+            if grant.region_offset != 0 {
+                return Err(shm_invalid_status("iov grant must start at offset 0"));
+            }
+            let block_size = usize::try_from(request.block_size)
+                .map_err(|_| invalid_status("iov block_size is too large"))?;
+            let layout = IovLayout::new(block_size, request.blocks)
+                .map_err(|error| invalid_status(error.to_string()))?;
+            let total = layout.total_bytes();
+            if u64::from(grant.length) != total as u64 {
+                return Err(shm_invalid_status(
+                    "iov grant length does not match the block layout",
+                ));
+            }
+            let (fd, offset) = request_grant_fd(grant).await?;
+            if offset != 0 {
+                return Err(shm_invalid_status("iov grant offset must be zero"));
+            }
+            let iov_id = hub.create_iov(fd, layout).map_err(error_to_status)?;
+            Ok(DfsIovCreateReply {
+                iov_id,
+                block_size: block_size as u64,
+                blocks: layout.blocks(),
+                total_bytes: total as u64,
+            })
+        }
+        .await;
+        self.record("dfs_iov_create", outcome.is_ok());
+        outcome.map(Response::new)
     }
 
-    async fn close(&self, _: Request<DfsCloseRequest>) -> Result<Response<DfsCloseReply>, Status> {
-        self.reject("dfs_close")
+    async fn iov_destroy(
+        &self,
+        request: Request<DfsIovDestroyRequest>,
+    ) -> Result<Response<DfsIovDestroyReply>, Status> {
+        let request = request.into_inner();
+        let outcome = async {
+            let hub = self.hub()?;
+            hub.destroy_iov(request.iov_id).map_err(error_to_status)?;
+            Ok(DfsIovDestroyReply {})
+        }
+        .await;
+        self.record("dfs_iov_destroy", outcome.is_ok());
+        outcome.map(Response::new)
     }
+
+    async fn register_file(
+        &self,
+        request: Request<DfsRegisterFileRequest>,
+    ) -> Result<Response<DfsRegisterFileReply>, Status> {
+        let request = request.into_inner();
+        let outcome = async {
+            let hub = self.hub()?;
+            let handle = handle_value(request.handle)?;
+            let reg_id = hub.register_file(&handle).map_err(error_to_status)?;
+            Ok(DfsRegisterFileReply {
+                reg_id,
+                file_version_id: String::new(),
+            })
+        }
+        .await;
+        self.record("dfs_register_file", outcome.is_ok());
+        outcome.map(Response::new)
+    }
+
+    async fn unregister_file(
+        &self,
+        request: Request<DfsUnregisterFileRequest>,
+    ) -> Result<Response<DfsUnregisterFileReply>, Status> {
+        let request = request.into_inner();
+        let outcome = async {
+            let hub = self.hub()?;
+            hub.unregister_file(request.reg_id)
+                .map_err(error_to_status)?;
+            Ok(DfsUnregisterFileReply {})
+        }
+        .await;
+        self.record("dfs_unregister_file", outcome.is_ok());
+        outcome.map(Response::new)
+    }
+
+    async fn ring_create(
+        &self,
+        request: Request<DfsRingCreateRequest>,
+    ) -> Result<Response<DfsRingCreateReply>, Status> {
+        let request = request.into_inner();
+        let outcome = async {
+            let hub = self.hub()?;
+            let grant = request
+                .region
+                .ok_or_else(|| shm_invalid_status("missing ring SHM grant"))?;
+            if grant.region_offset != 0 {
+                return Err(shm_invalid_status("ring grant must start at offset 0"));
+            }
+            let layout = afs_transport::ring::RingLayout::new(request.entries)
+                .map_err(|error| invalid_status(error.to_string()))?;
+            let total = layout.total_bytes();
+            if u64::from(grant.length) != total as u64 {
+                return Err(shm_invalid_status(
+                    "ring grant length does not match the queue layout",
+                ));
+            }
+            let (fd, offset) = request_grant_fd(grant).await?;
+            if offset != 0 {
+                return Err(shm_invalid_status("ring grant offset must be zero"));
+            }
+            let doorbell_grant = request
+                .doorbell
+                .ok_or_else(|| shm_invalid_status("missing ring doorbell grant"))?;
+            let (doorbell_fd, doorbell_offset) = request_grant_fd(doorbell_grant).await?;
+            if doorbell_offset != 0 {
+                return Err(shm_invalid_status(
+                    "ring doorbell grant offset must be zero",
+                ));
+            }
+            let completion_grant = request
+                .completion
+                .ok_or_else(|| shm_invalid_status("missing ring completion grant"))?;
+            let (completion_fd, completion_offset) = request_grant_fd(completion_grant).await?;
+            if completion_offset != 0 {
+                return Err(shm_invalid_status(
+                    "ring completion grant offset must be zero",
+                ));
+            }
+            let ring_id = hub
+                .create_ring(
+                    super::usrbio::RingFds {
+                        region: fd,
+                        doorbell: doorbell_fd,
+                        completion: completion_fd,
+                    },
+                    layout,
+                    request.iov_id,
+                    request.io_depth,
+                    request.timeout_ms,
+                )
+                .map_err(error_to_status)?;
+            Ok(DfsRingCreateReply {
+                ring_id,
+                entries: layout.entries(),
+            })
+        }
+        .await;
+        self.record("dfs_ring_create", outcome.is_ok());
+        outcome.map(Response::new)
+    }
+
+    async fn ring_destroy(
+        &self,
+        request: Request<DfsRingDestroyRequest>,
+    ) -> Result<Response<DfsRingDestroyReply>, Status> {
+        let request = request.into_inner();
+        let outcome = async {
+            let hub = self.hub()?;
+            // 解绑前留一条计数摘要：环消失后这些数字就没了，而它正是判断这条环是否
+            // 被打满、空唤醒是否偏多的唯一依据。
+            if let Some(stats) = hub.ring_stats(request.ring_id) {
+                afs_logging::debug!("usrbio.ring_summary";
+                    "ring_id" => request.ring_id,
+                    "submitted" => stats.submitted,
+                    "completed" => stats.completed,
+                    "failed" => stats.failed,
+                    "bytes" => stats.bytes,
+                    "wakeups" => stats.wakeups);
+            }
+            let ring_id = request.ring_id;
+            let hub = hub.clone();
+            blocking(move || hub.destroy_ring(ring_id)).await?;
+            Ok(DfsRingDestroyReply {})
+        }
+        .await;
+        self.record("dfs_ring_destroy", outcome.is_ok());
+        outcome.map(Response::new)
+    }
+}
+
+/// 在阻塞线程上执行一次会阻塞的工作。
+///
+/// 注意它**不能**用来调用后端：`GrpcDfsMeta` 用 `Handle::block_on`，而 `spawn_blocking` 的线程
+/// 仍带 runtime 上下文，照样 panic。后端调用一律走 [`UsrbioHub::executor`]。
+async fn blocking<T, F>(work: F) -> Result<T, Status>
+where
+    F: FnOnce() -> Result<T, afs_error::Error> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|error| coded_status(afs_error::NODE_VFS_UNAVAILABLE, error.to_string()))?
+        .map_err(error_to_status)
+}
+
+/// 打开访问模式：未指定必须是错误，不能默默当成只读。
+fn open_access(value: i32) -> Result<OpenAccess, Status> {
+    match DfsOpenAccess::try_from(value) {
+        Ok(DfsOpenAccess::ReadOnly) => Ok(OpenAccess::ReadOnly),
+        Ok(DfsOpenAccess::ReadWrite) => Ok(OpenAccess::ReadWrite),
+        _ => Err(invalid_status(
+            "open requires an explicit read-only or read-write access",
+        )),
+    }
+}
+
+/// 同步屏障：未指定必须是错误，不能默默降级为不落盘。
+fn sync_mode(value: i32) -> Result<types::SyncMode, Status> {
+    match DfsSyncBarrier::try_from(value) {
+        Ok(DfsSyncBarrier::Data) => Ok(types::SyncMode::DataOnly),
+        Ok(DfsSyncBarrier::Full) => Ok(types::SyncMode::Full),
+        _ => Err(invalid_status(
+            "sync requires an explicit data or full barrier",
+        )),
+    }
+}
+
+fn handle_value(handle: Option<DfsFileHandle>) -> Result<Vec<u8>, Status> {
+    match handle {
+        Some(handle) if !handle.value.is_empty() => Ok(handle.value),
+        _ => Err(invalid_status("missing DFS file handle")),
+    }
+}
+
+fn invalid_status(message: impl Into<String>) -> Status {
+    coded_status(afs_error::NODE_VFS_INVALID, message)
+}
+
+fn shm_invalid_status(message: impl Into<String>) -> Status {
+    coded_status(afs_error::NODE_SHM_INVALID, message)
 }
 
 impl DiagnosticLocalDataService {

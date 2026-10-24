@@ -122,10 +122,24 @@ impl FdRequest {
 ///
 /// grant 被成功领取后会从 HashMap 删除，所以同一个 token 不能重放。TTL 用来清理
 /// 调用方取消或 node 未连接造成的悬挂授权。
+/// 授权出去的 fd 属于哪一类，决定发送前要不要做区域校验。
+///
+/// 默认是 [`FdGrantKind::Region`]：共享内存区域必须是通过校验的密封 memfd，这条约束不能为了
+/// 方便就悄悄放宽。`Object` 只用于**明确不是区域**的对象（例如 eventfd 门铃），它不享受区域
+/// 语义，因此也不接受区域校验。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FdGrantKind {
+    /// 密封的 memfd 区域。
+    Region,
+    /// 非区域对象。
+    Object,
+}
+
 pub struct FdGrant {
     request: FdRequest,
     fd: OwnedFd,
     expires_at: Option<Instant>,
+    kind: FdGrantKind,
 }
 
 impl FdGrant {
@@ -134,6 +148,7 @@ impl FdGrant {
             request,
             fd,
             expires_at: None,
+            kind: FdGrantKind::Region,
         }
     }
 
@@ -142,6 +157,20 @@ impl FdGrant {
             request,
             fd,
             expires_at: Some(Instant::now() + ttl),
+            kind: FdGrantKind::Region,
+        }
+    }
+
+    /// 授权一个**非区域**对象（例如 eventfd 门铃），跳过区域格式校验。
+    ///
+    /// 调用方必须是真的知道这个 fd 不是共享内存区域；把区域误标成对象会失去那道校验，
+    /// 因此不要用它来绕过区域校验失败。
+    pub fn object_with_ttl(request: FdRequest, fd: OwnedFd, ttl: Duration) -> Self {
+        Self {
+            request,
+            fd,
+            expires_at: Some(Instant::now() + ttl),
+            kind: FdGrantKind::Object,
         }
     }
 
@@ -163,10 +192,22 @@ pub struct SharedRegion {
 impl SharedRegion {
     pub fn create(name: &str, len: usize) -> Result<Self, ShmError> {
         // 1 MiB 是第一版 Local SDK 单次传输上限，防止本机 API 被误用成大对象通道。
-        if len == 0 || len > MAX_REGION_BYTES {
+        Self::create_with_limit(name, len, MAX_REGION_BYTES)
+    }
+
+    /// 按调用方给出的上限创建区域。
+    ///
+    /// 1 MiB 默认上限约束的是「逐次传输」；持久 iov 和共享环是常驻结构，必须映射整块，
+    /// 因此由调用方显式抬高上限，而不是放宽默认值让单次传输也能超过 1 MiB。
+    pub fn create_with_limit(name: &str, len: usize, limit: usize) -> Result<Self, ShmError> {
+        if len == 0 || len > limit {
             return Err(ShmError::InvalidArgument {
                 field: "len",
-                reason: "must be within 1..=1 MiB",
+                reason: if limit == MAX_REGION_BYTES {
+                    "must be within 1..=1 MiB"
+                } else {
+                    "must be positive and no larger than the caller-provided limit"
+                },
             });
         }
         let fd = create_memfd(name)?;
@@ -307,7 +348,9 @@ impl FdBrokerServer {
                 Some(_) | None => return Err(ShmError::InvalidToken),
             }
         };
-        validate_sealed_fd(grant.fd.as_raw_fd(), 0)?;
+        if grant.kind == FdGrantKind::Region {
+            validate_sealed_fd(grant.fd.as_raw_fd(), 0)?;
+        }
         send_fd(stream.stream(), grant.fd.as_raw_fd())
     }
 }
@@ -440,10 +483,25 @@ fn add_required_seals(fd: RawFd) -> Result<(), ShmError> {
 
 // 接收方重新验证 fd：不能信任 gRPC grant 里的 length/path，也不能信任对端没换 fd。
 fn validate_sealed_fd(fd: RawFd, required_len: usize) -> Result<(), ShmError> {
-    if required_len > MAX_REGION_BYTES {
+    validate_sealed_fd_with_limit(fd, required_len, MAX_REGION_BYTES)
+}
+
+/// 校验一个常驻区域 fd（iov、共享环）：大小满足要求且 seal 齐全。
+///
+/// `limit` 由调用方给出，因为常驻区域合法地大于 1 MiB 的单次传输上限。
+pub fn validate_region_fd(fd: RawFd, required_len: usize, limit: usize) -> Result<(), ShmError> {
+    validate_sealed_fd_with_limit(fd, required_len, limit)
+}
+
+fn validate_sealed_fd_with_limit(
+    fd: RawFd,
+    required_len: usize,
+    limit: usize,
+) -> Result<(), ShmError> {
+    if required_len > limit {
         return Err(ShmError::InvalidArgument {
             field: "range",
-            reason: "exceeds 1 MiB transfer limit",
+            reason: "exceeds the region limit",
         });
     }
     validate_file_len(fd, required_len)?;
