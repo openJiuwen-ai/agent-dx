@@ -176,6 +176,15 @@ impl Relay {
         })
     }
 
+    pub(crate) fn notify_activity_change(&self) {
+        if let Some(tracker) = &self.activity {
+            tracker.notify_change();
+        }
+    }
+    pub(crate) fn activity_changes(&self) -> Option<tokio::sync::watch::Receiver<()>> {
+        self.activity.as_ref().map(|tracker| tracker.subscribe())
+    }
+
     pub fn instance_activity(&self, instance_id: &str) -> Option<(u64, u64)> {
         self.activity
             .as_ref()

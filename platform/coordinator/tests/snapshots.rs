@@ -198,3 +198,25 @@ async fn acquire_and_delete_race_has_one_winner_and_deletion_fences_republicatio
         );
     }
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn committed_snapshot_changes_update_inspection_cache() {
+    let mut rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    session.refresh_inspection_inventory().await.unwrap();
+    let record = snapshot();
+    session.publish_snapshot(record.clone()).await.unwrap();
+    let reference = Reference::Template {
+        node_id: "node1".into(),
+        template_id: "cache".into(),
+    };
+    let updated = session
+        .acquire_snapshot(&record.id, "tenant", reference)
+        .await
+        .unwrap();
+    rig.crash();
+    let (snapshots, holds) = session.inspection_inventory().await.unwrap();
+    assert_eq!(snapshots, vec![updated]);
+    assert!(holds.is_empty());
+}

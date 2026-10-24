@@ -9,6 +9,13 @@ pub const MAX_CONTROL_MESSAGE_BYTES: usize = 65_536;
 #[serde(rename_all = "snake_case")]
 pub enum ControlOperation {
     Status,
+    Quiesce {
+        identity: RuntimeIdentity,
+        activity_revision: u64,
+    },
+    ReopenIdle {
+        identity: RuntimeIdentity,
+    },
     Prepare(PrepareCheckpoint),
     Abort(AbortCheckpoint),
     Finish(FinishWorkloadCheckpoint),

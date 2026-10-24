@@ -22,6 +22,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.validate()?;
     let clients = Clients::new(config.clone())?;
     let api = Api::new(clients).map_err(|_| "API initialization failed")?;
+    // Bind before accepting traffic so a bad monitoring address fails startup.
+    let metrics_listener = match config.metrics_listen {
+        Some(address) => Some(TcpListener::bind(address).await?),
+        None => None,
+    };
     let acceptor = if config.loopback_http {
         None
     } else {
@@ -59,8 +64,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown = shutdown();
     tokio::pin!(shutdown);
     let mut ingress_failure = None;
+    let metrics = async {
+        match metrics_listener {
+            Some(listener) => {
+                adx_apiserver::metrics::serve(listener, api.environment_service.clone()).await
+            }
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(metrics);
     loop {
         tokio::select! {
+            result = &mut metrics => {
+                ingress_failure = Some(result.err().map_or_else(|| "metrics listener stopped".to_owned(), |error| error.to_string()));
+                break;
+            }
             _ = &mut shutdown => break,
             result = async {
                 match embedded_ingress.as_mut() {

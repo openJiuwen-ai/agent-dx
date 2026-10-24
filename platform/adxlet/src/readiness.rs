@@ -102,6 +102,17 @@ impl Readiness for ExecdReadiness {
         } else {
             self.ready_timeout
         };
+        if self.client.uses_stream() {
+            return tokio::time::timeout(ready_timeout, async {
+                self.client.wait_ready_notification(record).await?;
+                if !self.runtime.is_running(&record.runtime.id).await? {
+                    return Err(unavailable("runtime exited before Ready"));
+                }
+                Ok(())
+            })
+            .await
+            .map_err(|_| Error::DeadlineExceeded("Execd readiness deadline exceeded".into()))?;
+        }
         let polling = async {
             loop {
                 let probe = tokio::time::timeout(self.probe_timeout, async {
@@ -121,24 +132,8 @@ impl Readiness for ExecdReadiness {
                 tokio::time::sleep(self.poll_interval).await;
             }
         };
-        tokio::time::timeout(ready_timeout, async {
-            if self.client.uses_stream() {
-                tokio::select! {
-                    result = self.client.wait_ready_notification(record) => {
-                        result?;
-                        self.probe(record).await?;
-                        if !self.runtime.is_running(&record.runtime.id).await? {
-                            return Err(unavailable("runtime exited before Ready"));
-                        }
-                        Ok(())
-                    }
-                    result = polling => result,
-                }
-            } else {
-                polling.await
-            }
-        })
-        .await
-        .map_err(|_| Error::DeadlineExceeded("Execd readiness deadline exceeded".into()))?
+        tokio::time::timeout(ready_timeout, polling)
+            .await
+            .map_err(|_| Error::DeadlineExceeded("Execd readiness deadline exceeded".into()))?
     }
 }

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "activity-client")]
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{watch, Notify};
 
 const ACTIVITY_SHARD_COUNT: usize = 64;
 
@@ -42,6 +42,7 @@ pub struct ActivityTracker {
     proxy_session_id: String,
     count_shards: Arc<Vec<Mutex<HashMap<String, Count>>>>,
     changed: Arc<Notify>,
+    updates: watch::Sender<()>,
     last_sequence: Arc<AtomicU64>,
 }
 
@@ -55,6 +56,7 @@ impl ActivityTracker {
                     .collect(),
             ),
             changed: Arc::new(Notify::new()),
+            updates: watch::channel(()).0,
             last_sequence: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -113,6 +115,14 @@ impl ActivityTracker {
         }
         drop(counts);
         self.changed.notify_one();
+        self.updates.send_replace(());
+    }
+
+    pub(crate) fn notify_change(&self) {
+        self.updates.send_replace(());
+    }
+    pub(crate) fn subscribe(&self) -> watch::Receiver<()> {
+        self.updates.subscribe()
     }
 
     pub fn observe(&self, instance_id: &str) -> (u64, u64) {
@@ -136,6 +146,7 @@ impl ActivityTracker {
                 counts.remove(instance_id);
             }
         }
+        self.updates.send_replace(());
     }
     pub fn register(&self, instance_id: &str) {
         let mut counts = self
@@ -143,6 +154,7 @@ impl ActivityTracker {
             .lock()
             .expect("activity tracker mutex poisoned");
         counts.entry(instance_id.to_string()).or_default().retired = false;
+        self.updates.send_replace(());
     }
 
     fn count_shard(&self, instance_id: &str) -> &Mutex<HashMap<String, Count>> {

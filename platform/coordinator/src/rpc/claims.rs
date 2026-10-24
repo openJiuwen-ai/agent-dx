@@ -6,13 +6,15 @@ use pb::claim_environment_response::Outcome;
 
 impl State {
     pub(super) async fn recover_authoritative_state(&mut self) -> Result<()> {
-        if !self.needs_recovery {
+        if !self.needs_recovery && self.session.inspection_ready().await {
             return Ok(());
         }
+        self.needs_recovery = true;
         // The failed writer has returned. Advancing the header prevents its last
         // in-flight CAS from materializing after the authoritative snapshot.
         self.session.claim_barrier().await?;
         let saved = self.session.snapshot().await?;
+        self.session.refresh_inspection_inventory().await?;
         let pending: Vec<_> = self
             .specs
             .values()

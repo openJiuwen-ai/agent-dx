@@ -55,5 +55,22 @@ async fn queued_and_detached_work_keep_their_own_parents_and_end_on_cancel() {
         trace::traceparent().is_none(),
         "no context leaked into caller task"
     );
+    let parent = Trace::remote("captured_parent", Some(a), None);
+    let detached = parent.scope(|| {
+        trace::with_current_context(async {
+            Trace::child("captured_child")
+                .run(async { trace::traceparent().unwrap() })
+                .await
+        })
+    });
+    drop(parent);
+    assert!(tokio::spawn(detached).await.unwrap().contains(&a[3..35]));
+    provider.force_flush().unwrap();
+    let spans = exporter.get_finished_spans().unwrap();
+    let parent = spans.iter().find(|s| s.name == "captured_parent").unwrap();
+    let child = spans.iter().find(|s| s.name == "captured_child").unwrap();
+    assert_eq!(child.parent_span_id, parent.span_context.span_id());
+    assert!(parent.end_time <= child.start_time);
+    assert!(trace::traceparent().is_none());
     drop(provider.tracer("unused"));
 }

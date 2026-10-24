@@ -325,13 +325,12 @@ if result_ttl:
 if use_journal:
     node_config['degradation_journal'] = str(P / 'degraded/results.sqlite')
     node_config['rpc_timeout_seconds'] = 30
-if os.getenv('ADX_E2E_RUNTIME_CONTROL') == '1':
-    bridge_ip = sandboxd_gateway_range(node).split('/')[0]
-    node_config['runtime_control'] = {
-        'listen': f'{bridge_ip}:19003',
-        'advertised_address': f'http://{bridge_ip}:19003',
-        'key_file': str(P / 'runtime-control-key'),
-    }
+bridge_ip = sandboxd_gateway_range(node).split('/')[0]
+node_config['runtime_control'] = {
+    'listen': f'{bridge_ip}:19003',
+    'advertised_address': f'http://{bridge_ip}:19003',
+    'key_file': str(P / 'runtime-control-key'),
+}
 add(node, 'adxlet', node_config, np)
 if relay_mode == 'standalone':
     add('relay', 'relay', {}, np)
@@ -363,7 +362,9 @@ if node == 'node1' or activator_mode:
         'ADX_DATA_PLANE_INGRESS_HEALTH_BIND': '127.0.0.1:18080',
         'ADX_DATA_PLANE_INGRESS_TLS_CERT': str(T / 'ingress.pem'),
         'ADX_DATA_PLANE_INGRESS_TLS_KEY': str(T / 'ingress.key'),
-        'ADX_DATA_PLANE_INGRESS_ALLOWED_CLIENT_CIDRS': '127.0.0.1/32,172.16.0.0/12' if activator_mode else '127.0.0.1/32',
+        'ADX_DATA_PLANE_INGRESS_ALLOWED_CLIENT_CIDRS': (
+            '127.0.0.1/32,172.16.0.0/12' if activator_mode else '127.0.0.1/32'
+        ),
         'ADX_DATA_PLANE_INGRESS_NODE_TLS_CA': str(T / 'ca.pem'),
         'ADX_DATA_PLANE_INGRESS_NODE_TLS_SERVER_NAME': 'localhost',
         'ADX_DATA_PLANE_INGRESS_NODE_TLS_CLIENT_CERT': str(T / 'ingress.pem'),
@@ -386,7 +387,9 @@ if node == 'node1' or activator_mode:
 if activator_mode:
     from activator_fixture import configure
 
-    configure(activator_mode, node, services, f'redis://:{redis_key.read_text().strip()}@{redis_host}:6379/', PRIVATE, P)
+    configure(
+        activator_mode, node, services, f'redis://:{redis_key.read_text().strip()}@{redis_host}:6379/', PRIVATE, P
+    )
 for service in services:
     service.setdefault('env', {}).update(
         {
@@ -450,6 +453,22 @@ elif runtime_artifact.is_file():
 (P / 'deployment.yaml').write_text(json.dumps(d))
 (P / 'deployment.yaml').chmod(0o600)
 (EVIDENCE / f'deployment-{node}.json').write_text(
-    json.dumps({**d, 'redis_url': f'redis://:REDACTED@{redis_host}:6379/', 'services': [{**s, 'env': {k: ('REDACTED' if k == 'ADX_ACTIVATOR_SERVICE_TOKEN' else v) for k, v in s['env'].items()}} for s in services]}, indent=2)
+    json.dumps(
+        {
+            **d,
+            'redis_url': f'redis://:REDACTED@{redis_host}:6379/',
+            'services': [
+                {
+                    **service,
+                    'env': {
+                        key: ('REDACTED' if key == 'ADX_ACTIVATOR_SERVICE_TOKEN' else value)
+                        for key, value in service['env'].items()
+                    },
+                }
+                for service in services
+            ],
+        },
+        indent=2,
+    )
 )
 print('configured', node, capacity)

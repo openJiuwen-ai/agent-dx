@@ -1,0 +1,225 @@
+{
+  "uid": "adx-environments",
+  "title": "ADX Environments",
+  "id": null,
+  "version": 2,
+  "schemaVersion": 40,
+  "editable": true,
+  "refresh": "",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "description": "Current Running and Paused inventory and fresh runtime usage from the optional short-retention Prometheus datasource. Paused resources are absent rather than a pre-pause sample.",
+  "templating": {
+    "list": [
+      {
+        "name": "adx_env",
+        "label": "Environment",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus-details"
+        },
+        "query": "label_values(adx_environment_info, adx_env)",
+        "refresh": 1,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".+",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "state",
+        "type": "custom",
+        "query": "Running,Paused",
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        },
+        "multi": true,
+        "includeAll": true,
+        "allValue": "Running|Paused"
+      },
+      {
+        "name": "environment_id",
+        "label": "Environment ID regex",
+        "description": "RE2 regex. Use \\x60 to match a backtick.",
+        "type": "textbox",
+        "query": ".*",
+        "current": {
+          "text": ".*",
+          "value": ".*"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Environment Inventory",
+      "type": "table",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus-details"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 24,
+        "h": 10
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (adx_env,environment_id,node_id,state) (adx_environment_info{adx_env=~\"$adx_env\",state=~\"$state\",environment_id=~`${environment_id:raw}`})",
+          "instant": true,
+          "format": "table"
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true,
+              "Value": true
+            },
+            "indexByName": {
+              "adx_env": 0,
+              "environment_id": 1,
+              "node_id": 2,
+              "state": 3
+            },
+            "renameByName": {
+              "adx_env": "Deployment",
+              "environment_id": "Environment",
+              "node_id": "Node",
+              "state": "State"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Environment CPU Usage",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus-details"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 10,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cores"
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "rate(adx_environment_cpu_usage_seconds_total{adx_env=~\"$adx_env\",environment_id=~`${environment_id:raw}`}[2m]) and on(adx_env,instance,environment_id,runtime_id) (adx_environment_stats_age_seconds{adx_env=~\"$adx_env\"} <= 45) and on (adx_env,environment_id) max by (adx_env,environment_id) (adx_environment_info{adx_env=~\"$adx_env\",state=~\"$state\"})",
+          "instant": false,
+          "format": "time_series",
+          "legendFormat": "{{environment_id}} / {{runtime_id}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Environment Memory Usage",
+      "type": "timeseries",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus-details"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 10,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "adx_environment_memory_usage_bytes{adx_env=~\"$adx_env\",environment_id=~`${environment_id:raw}`} and on(adx_env,instance,environment_id,runtime_id) (adx_environment_stats_age_seconds{adx_env=~\"$adx_env\"} <= 45) and on (adx_env,environment_id) max by (adx_env,environment_id) (adx_environment_info{adx_env=~\"$adx_env\",state=~\"$state\"})",
+          "instant": false,
+          "format": "time_series",
+          "legendFormat": "{{environment_id}} / {{runtime_id}}"
+        }
+      ]
+    }
+  ],
+  "links": [
+    {
+      "title": "Schedule",
+      "type": "link",
+      "url": "/d/adx-schedule",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false
+    },
+    {
+      "title": "Data Plane",
+      "type": "link",
+      "url": "/d/adx-data-plane",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false
+    },
+    {
+      "title": "Process Resources",
+      "type": "link",
+      "url": "/d/adx-process-resources",
+      "includeVars": true,
+      "keepTime": true,
+      "targetBlank": false
+    },
+    {
+      "title": "Environment Logs",
+      "type": "link",
+      "url": "/d/adx-environment-logs",
+      "includeVars": true,
+      "keepTime": false,
+      "targetBlank": false,
+      "tooltip": "Open on-demand log search, initially the last 15 minutes."
+    },
+    {
+      "title": "Environments",
+      "type": "link",
+      "url": "/d/adx-environments",
+      "includeVars": true,
+      "keepTime": false,
+      "targetBlank": false
+    }
+  ]
+}

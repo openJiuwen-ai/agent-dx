@@ -327,7 +327,6 @@ async fn adxlet_creation_and_event_driven_checkpoint_wait_for_state_publication(
     assert_eq!(created.record.state, EnvironmentState::Running);
     assert_eq!(created.durability, adxlet::Durability::Published);
     let node = Arc::new(node);
-    let mut events = test.hub.take_events().unwrap();
     let path = runtime
         .process
         .lock()
@@ -344,33 +343,11 @@ async fn adxlet_creation_and_event_driven_checkpoint_wait_for_state_publication(
         socket.read_to_end(&mut bytes).await.unwrap();
         String::from_utf8(bytes).unwrap()
     });
-    let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    let mut stale_event = event.clone();
-    stale_event.ownership_generation += 1;
-    node.observe_runtime_event(&stale_event).await.unwrap();
-    assert!(publication
-        .record
-        .lock()
-        .unwrap()
-        .as_ref()
-        .unwrap()
-        .checkpoint
-        .is_none());
-    assert!(!caller.is_finished());
-    let current = node.clone();
-    let mut handling = tokio::spawn(async move { current.observe_runtime_event(&event).await });
-    // Preserve the publication deadline, but report an early lifecycle failure
-    // instead of hiding it behind a semaphore timeout.
-    let publication_entry = tokio::select! {
-        result = &mut handling => panic!("checkpoint handling finished before publication: {result:?}"),
-        result = tokio::time::timeout(
-            Duration::from_secs(2),
-            publication.checkpoint_entered.acquire(),
-        ) => result,
-    };
+    let publication_entry = tokio::time::timeout(
+        Duration::from_secs(2),
+        publication.checkpoint_entered.acquire(),
+    )
+    .await;
     publication_entry
         .unwrap_or_else(|error| {
             let process = runtime.process.lock().unwrap();
@@ -393,7 +370,6 @@ async fn adxlet_creation_and_event_driven_checkpoint_wait_for_state_publication(
     assert!(committed.checkpoint.is_some());
     assert_eq!(committed.runtime.id, "i-1");
     publication.checkpoint_release.add_permits(1);
-    handling.await.unwrap().unwrap();
     let response = tokio::time::timeout(Duration::from_secs(2), caller)
         .await
         .unwrap()

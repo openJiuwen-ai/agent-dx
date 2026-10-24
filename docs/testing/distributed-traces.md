@@ -5,11 +5,21 @@ ADX 使用 OpenTelemetry SDK 和 W3C `traceparent` / `tracestate`。采样与导
 ## 请求与任务边界
 
 - Ingress 接收 HTTP 上下文、创建 `HTTP 方法 + 路由模板` Span，并将子上下文传给 Environment API、Execd HTTP 或 Relay CONNECT。
-- Rust API Server 创建以 HTTP 方法和接口模板命名的服务端 Span，gRPC 客户端拦截器携带上下文；节点地址缓存命中后的直达操作也经过同一拦截器。
+- Rust API Server 创建以 HTTP 方法和接口模板命名的服务端 Span，gRPC 客户端拦截器在发送时注入当前上下文，保证远端服务端 Span 是当前客户端 RPC Span 的子节点；节点地址缓存命中后的直达操作也经过同一拦截器。
 - Coordinator 在创建、查询、提交和快照 RPC 入口接收上下文；独立创建/提交任务显式携带子 Span。周期节点注册/心跳及内部调度轮次不创建 Span。中心排队耗时仍包含在该请求的 `coordinator.create` Span 中，不额外导出服务多个请求的调度轮次。
-- adxlet 在每个 Environment 命令封装中保存 `environment.queue` Span，串行执行时创建 `environment.execute`。创建链路在执行 Span 内继续划分 `environment.runtime.start`、`environment.runtime.ready`、`environment.route.activate` 和 `environment.state.commit`，分别覆盖执行后端启动、Execd 就绪、本机路由绑定和持久化提交。调用方断开后，已接受操作继续保持原上下文；状态提交继续向 Coordinator 透传。
+- adxlet 对用户生命周期命令在入队时保存 `environment.queue` Span，在出队时结束它；随后使用保留的上下文创建 `environment.execute`。queue 仅计入入队背压和串行等待，execute 计入实际处理，两者时间不重叠。执行 Span 的父节点仍为对应的已结束队列 Span。创建链路在执行 Span 内继续划分 `environment.runtime.start`、`environment.runtime.ready`、`environment.route.activate` 和 `environment.state.commit`，分别覆盖执行后端启动、Execd 就绪、本机路由绑定和持久化提交。调用方断开后，已接受操作继续保持原上下文；状态提交继续向 Coordinator 透传。
+- 周期 Tick 和恢复点有效期扫描不生成 queue/execute Span。巡检确认退出时创建 `environment.unexpected_exit`，触发自动暂停时创建 `environment.auto_pause`，实际状态提交、恢复和启动保留生命周期 Span。
 - Relay 为 CONNECT 生命周期记录 Span。它转发的是字节流，Execd 的 HTTP Span 延续 Ingress 注入的上下文；两者可能是同一请求的并列子 Span。
-- Execd 在解析 HTTP 头后创建以 HTTP 方法和接口模板命名的 Span，Environment ID 作为属性；`/invoke` 另外记录有界的 `rpc.method` 操作名。此 Span 覆盖 HTTP 操作处理；异步提交命令之后的用户进程运行时间尚不属于该 HTTP Span。
+- Execd 对没有入站 Trace 上下文的 `GET /healthz`、`GET /metrics` 和 `GET /control/v1/status` 不创建 Span；带上下文的诊断请求和其他操作继续跟踪。Execd 在解析 HTTP 头后创建以 HTTP 方法和接口模板命名的 Span，Environment ID 作为属性；`/invoke` 另外记录有界的 `rpc.method` 操作名。此 Span 覆盖 HTTP 操作处理；异步提交命令之后的用户进程运行时间尚不属于该 HTTP Span。
+
+创建总耗时统一使用 API Server 的 `environment.create` Span，与
+`adx_environment_create_duration_seconds` 的应用服务边界一致：参数转换后进入创建服务，
+直到确认 Running、本机路由绑定、持久化提交及创建结果目录确认；失败或取消则计到该调用结束。
+JSON、SSE 和内嵌创建共用此埋点；重放也记录本次调用耗时，不冒充第一次创建耗时。
+`environment.create.outcome` 区分 success、failure、unknown、cancelled，失败结果标记 Error；
+unknown/cancelled 不表示已确认实例创建失败。`environment_create_completed` 日志使用同一服务边界。
+SDK 连接、传输、重试退避、身份认证和参数转换不计入此服务耗时；完整 SDK 调用仍需客户端计时。
+SSE 保留请求上下文，在最终结果交给流之前完成创建 Span，客户端读取耗时另算。
 
 HTTP Span 包含 `http.request.method`、`http.route`，Ingress/API Server 返回后记录 `http.response.status_code`。HTTP Span 当前覆盖生成响应的处理阶段；创建等流式响应可能先返回，而后台任务继续运行。Span 时长不等于 SDK 等待完整操作的总耗时，完整链路与后台执行阶段需打开 Trace 查看。实例/快照/密钥 ID 使用 `{id}` 占位，不记录查询参数、用户端口路径或文件路径。未知接口统一使用 `/unmatched`。
 
@@ -43,7 +53,8 @@ sandboxd 是独立运行时服务。本版本在 adxlet→sandboxd 的 gRPC 边�
 `adx-schedule` 顶部的 **Explore 接口查询** 打开原生 Tempo Explore，带入 `adx_env`，
 使用最近 6 小时、50 条 Trace、每条最多 3 个匹配 Span 的查询。入口固定
 `Table Format = Spans`，选择 `name`、`resource.service.name`、
-`span.http.response.status_code`、`span.rpc.method`；排除 `/unmatched`、健康和指标请求。
+`span.http.response.status_code`、`span.rpc.method`、`span.environment.create.outcome`；排除 `/unmatched`、健康和指标请求。
+创建行显示 `environment.create` 总耗时，成功创建的 HTTP 响应头行不混入该列表；HTTP 4xx/5xx 行仍保留，认证或参数校验失败、尚未进入创建服务的请求也可查询。打开完整 Trace 仍可查看 HTTP 阶段。
 Name 显示 HTTP 方法和接口模板，rpc.method 区分 Execd 的 `/invoke` 操作；点击 Span ID
 查看整条链路。Span 表不生成 Traces 表的 nested JSON 列。
 

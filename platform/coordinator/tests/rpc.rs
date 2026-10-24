@@ -448,6 +448,18 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert_eq!(backend.started.load(Ordering::SeqCst), 1);
     let first_record = first.record.unwrap();
     let metrics = scrape_metrics(metrics_address).await;
+    assert!(metrics.contains("adx_environment_created_total 1\n"));
+    // Re-publishing the same durable Running result must not create a second event.
+    node_coordinator
+        .commit_environment(pb::CommitEnvironmentRequest {
+            node_session_id: "boot-1".into(),
+            record: Some(first_record.clone()),
+        })
+        .await
+        .unwrap();
+    assert!(scrape_metrics(metrics_address)
+        .await
+        .contains("adx_environment_created_total 1\n"));
     assert!(metrics.contains(
         "adx_coordinator_environments{shard_id=\"0\",node_id=\"node\",state=\"Running\"} 1\n"
     ));
@@ -1094,7 +1106,12 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
         checkpoint: None,
         last_operation: None,
     };
-    session.commit(running.clone()).await.unwrap();
+    node.commit_environment(pb::CommitEnvironmentRequest {
+        record: Some(running.clone().try_into().unwrap()),
+        node_session_id: report.session_id.clone(),
+    })
+    .await
+    .unwrap();
     assert_eq!(session.snapshot().await.unwrap().routes().unwrap().len(), 1);
     assert!(
         node.inspect_node(pb::InspectNodeRequest {
@@ -2989,3 +3006,66 @@ mod local_first;
 
 #[path = "rpc/network.rs"]
 mod network;
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and mTLS certificates; run control-rpc suite"]
+async fn inspect_node_uses_committed_cache_when_redis_is_unavailable() {
+    let mut redis = common::Redis::new().await;
+    let store = redis.store().await;
+    let session = store.begin(1).await.unwrap();
+    let rpc = CoordinatorRpc::with_heartbeat_timeout(
+        session.clone(),
+        Placement::Pack,
+        peers(),
+        client_tls("coordinator"),
+        Duration::from_secs(2),
+        Duration::from_millis(250),
+    )
+    .await
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let service = rpc.clone();
+    let _servers = Servers(vec![tokio::spawn(async move {
+        Server::builder()
+            .tls_config(server_tls("coordinator"))
+            .unwrap()
+            .add_service(pb::coordinator_service_server::CoordinatorServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    })]);
+    let mut node = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        channel(address, "node").await,
+    );
+
+    node.register_node(pb::RegisterNodeRequest {
+        node_id: "node".into(),
+        node_address: "127.0.0.1:9001".into(),
+        proxy_address: "127.0.0.1:9002".into(),
+        capacity: Some(spec("cache").resources.into()),
+        session_id: "cache-session".into(),
+        heartbeat_sequence: 1,
+        accepting_allocations: false,
+        reconciling: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let request = pb::InspectNodeRequest {
+        node_id: "node".into(),
+        session_id: "cache-session".into(),
+    };
+    let before = node
+        .inspect_node(request.clone())
+        .await
+        .unwrap()
+        .into_inner();
+    redis.crash();
+    let after = node.inspect_node(request).await.unwrap().into_inner();
+    assert_eq!(after, before);
+    // Empty background sweeps use the same committed inventory; neither a
+    // recovery check nor dormant expiration needs a fresh durable catalog.
+    assert_eq!(rpc.resume_pending().await.unwrap(), 0);
+    assert_eq!(rpc.expire_dormant().await.unwrap(), 0);
+}

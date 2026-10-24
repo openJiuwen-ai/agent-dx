@@ -15,6 +15,10 @@ impl CoordinatorRpc {
             .await
             .map_err(status)?;
         tenant(request.caller.as_ref(), &stored.spec.tenant_id)?;
+        state.needs_recovery = true;
+        // A lost retirement reply must not requeue the removed durable record
+        // as an in-memory creation that has not reached Redis yet.
+        state.specs.remove(&request.environment_id);
         let deleted = state
             .session
             .retire_dormant(&stored)
@@ -42,6 +46,7 @@ impl CoordinatorRpc {
             .map_err(status)?;
         state.environments.remove(&request.environment_id);
         state.specs.remove(&request.environment_id);
+        state.needs_recovery = false;
         self.0.changed.notify_waiters();
         Ok(pb::EnvironmentResult {
             record: Some(deleted.try_into().map_err(status)?),
@@ -53,11 +58,8 @@ impl CoordinatorRpc {
         state.recover_authoritative_state().await?;
         let now = recovery::now()?;
         let candidates = state
-            .session
-            .snapshot()
-            .await?
             .environments
-            .into_values()
+            .values()
             .filter(|s| {
                 s.invalidated
                     && s.result.as_ref().is_some_and(|r| {
@@ -66,9 +68,12 @@ impl CoordinatorRpc {
                     })
             })
             .take(16)
+            .cloned()
             .collect::<Vec<_>>();
         let mut completed = 0;
         for stored in candidates {
+            state.needs_recovery = true;
+            state.specs.remove(&stored.spec.id);
             match state.session.retire_dormant(&stored).await {
                 Ok(_) => {
                     if let Some(snapshot) = &stored.spec.snapshot_id {
@@ -86,6 +91,7 @@ impl CoordinatorRpc {
                     state.scheduler.forget_deleted(&stored.spec.id)?;
                     state.environments.remove(&stored.spec.id);
                     state.specs.remove(&stored.spec.id);
+                    state.needs_recovery = false;
                     completed += 1;
                 }
                 Err(Error::Conflict | Error::NotFound) => (),
@@ -162,12 +168,16 @@ impl CoordinatorRpc {
                         relay_address: node.proxy_address.clone(),
                     });
                 }
+                // A cancelled or ambiguous CAS must reload before cached sweeps
+                // decide that no durable wake intent remains.
+                state.needs_recovery = true;
                 let demanded = state
                     .session
                     .request_resume(&request.environment_id, recovery::now().map_err(status)?)
                     .await
                     .map_err(status)?;
                 state.remember_environment(demanded);
+                state.needs_recovery = false;
             }
             self.drive_resume(&request.environment_id).await
         })
@@ -188,6 +198,7 @@ impl CoordinatorRpc {
                 let mut stored = state.session.get(id).await.map_err(status)?;
                 if stored.resume.is_some() {
                     let was_rejected = stored.resume.as_ref().is_some_and(|r| r.local_rejected);
+                    state.needs_recovery = true;
                     stored = state
                         .session
                         .request_resume(id, recovery::now().map_err(status)?)
@@ -198,6 +209,7 @@ impl CoordinatorRpc {
                     }
                 }
                 state.remember_environment(stored.clone());
+                state.needs_recovery = false;
                 if stored
                     .resume_point(recovery::now().map_err(status)?)
                     .is_some()
@@ -372,6 +384,7 @@ impl CoordinatorRpc {
                 }
                 Err(error) if error.code() == tonic::Code::ResourceExhausted => {
                     let mut state = self.0.state.lock().await;
+                    state.needs_recovery = true;
                     let rejected = state
                         .session
                         .reject_local_resume(
@@ -381,6 +394,8 @@ impl CoordinatorRpc {
                         )
                         .await
                         .map_err(status)?;
+                    state.remember_environment(rejected.clone());
+                    state.needs_recovery = false;
                     if rejected
                         .result
                         .as_ref()
@@ -389,7 +404,6 @@ impl CoordinatorRpc {
                     {
                         return Err(error);
                     }
-                    state.remember_environment(rejected);
                 }
                 // An owner RPC has a shorter budget than the whole restore.
                 // Keep waiting on that owner after an ambiguous transport or
@@ -413,12 +427,14 @@ impl CoordinatorRpc {
     pub async fn resume_pending(&self) -> Result<usize> {
         let pending = {
             let mut state = self.0.state.lock().await;
-            let environments = state.session.snapshot().await?.environments;
+            state.recover_authoritative_state().await?;
+            state.healthy()?;
             let cursor = state.resume_cursor.clone().unwrap_or_default();
-            let pending = environments
+            let pending = state
+                .environments
                 .values()
                 .filter(|e| e.spec.id > cursor)
-                .chain(environments.values().filter(|e| e.spec.id <= cursor))
+                .chain(state.environments.values().filter(|e| e.spec.id <= cursor))
                 .filter(|e| e.resume.is_some())
                 .take(16)
                 .cloned()

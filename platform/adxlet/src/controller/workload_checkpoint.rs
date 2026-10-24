@@ -7,7 +7,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-const DEFAULT_BACKEND_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(600);
+pub(super) const DEFAULT_BACKEND_CHECKPOINT_TIMEOUT: Duration = Duration::from_secs(600);
 
 impl Controller {
     /// Reconciliation must not replay a capture whose metadata never committed.
@@ -80,7 +80,18 @@ impl Controller {
         if status.identity != crate::runtime_control::RuntimeControlClient::identity(&self.record) {
             return Err(Error::Conflict);
         }
-        let deadline = match checkpoint_deadline(status.requested_checkpoint_deadline_unix_millis) {
+        let deadline = match checkpoint_deadline(status.requested_checkpoint_deadline_unix_millis)
+            .and_then(|deadline| {
+                let fixed = self.workload_deadline(&status.identity, &id);
+                let deadline = match (deadline, fixed) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                };
+                if deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now()) {
+                    return Err(Error::Unavailable("workload checkpoint timed out".into()));
+                }
+                Ok(deadline)
+            }) {
             Ok(deadline) => deadline,
             Err(error) => {
                 services
@@ -346,7 +357,9 @@ impl Controller {
     }
 }
 
-fn checkpoint_deadline(deadline_unix_millis: Option<u64>) -> Result<Option<tokio::time::Instant>> {
+pub(super) fn checkpoint_deadline(
+    deadline_unix_millis: Option<u64>,
+) -> Result<Option<tokio::time::Instant>> {
     let Some(deadline_unix_millis) = deadline_unix_millis else {
         return Ok(None);
     };

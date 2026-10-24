@@ -135,13 +135,21 @@ try:
     )
 
     def sampled_stats():
-        text = urllib.request.urlopen('http://127.0.0.1:17003/metrics', timeout=5).read().decode()
-        return text if 'adx_environment_memory_usage_bytes' in text and s.id in text else None
+        with urllib.request.urlopen('http://127.0.0.1:17003/metrics', timeout=5) as response:
+            summary_metrics = response.read().decode()
+        with urllib.request.urlopen('http://127.0.0.1:17003/metrics/environments', timeout=5) as response:
+            detail_metrics = response.read().decode()
+        sampled = any(
+            line.startswith('adx_environment_memory_usage_bytes{') and f'environment_id="{s.id}"' in line
+            for line in detail_metrics.splitlines()
+        )
+        if sampled and 'adx_node_reserved_cpu_millis ' in summary_metrics:
+            return summary_metrics, detail_metrics
+        return None
 
-    stats = wait(sampled_stats, 30)
-    (out / 'metrics.txt').write_text(stats)
-    if 'adx_node_reserved_cpu_millis' not in stats:
-        raise AssertionError()
+    summary, detail = wait(sampled_stats, 30)
+    (out / 'metrics.txt').write_text(summary)
+    (out / 'environment-metrics.txt').write_text(detail)
     s.kill()
 
     recovered_from_checkpoint = create(idle_timeout=0, failover=True)

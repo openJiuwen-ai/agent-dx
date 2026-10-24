@@ -9,6 +9,7 @@ service RelayService {
   rpc ReplaceBindings(BindingSnapshot) returns (BindingState);
   rpc UpdateBinding(UpdateBindingRequest) returns (UpdateBindingResponse);
   rpc GetEnvironmentActivity(GetEnvironmentActivityRequest) returns (EnvironmentActivityState);
+  rpc WatchActivity(GetBindingStateRequest) returns (stream ProxyActivitySnapshot);
   rpc SetEnvironmentAdmission(EnvironmentAdmissionRequest) returns (EnvironmentAdmissionResponse);
 }
 message EnvironmentAdmissionRequest {
@@ -69,3 +70,7 @@ message ActivityAcknowledgement { uint64 accepted_sequence = 1; }
 service NodeAdminService { rpc Drain(DrainRequest) returns (DrainResponse); }
 message DrainRequest {}
 message DrainResponse { uint64 deleted_environments = 1; }
+
+// Complete activity view, including zero counts and revisions for bursts between updates.
+message ProxyActivitySnapshot { string proxy_session_id = 1; repeated ProxyActivity environments = 2; bool reset = 3; }
+message ProxyActivity { string environment_id = 1; string runtime_id = 2; uint64 revision = 3; uint64 active_streams = 4; bool removed = 5; }

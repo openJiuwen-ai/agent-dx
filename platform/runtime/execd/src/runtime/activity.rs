@@ -1,6 +1,10 @@
 //! Runtime-local counters observed through the HTTP control status endpoint.
 //! Adxlet decides idle policy; counters have no transport or lifecycle side effects.
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+static CHANGED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+pub(super) async fn changed() {
+    CHANGED.notified().await;
+}
 static REVISION: AtomicU64 = AtomicU64::new(1);
 pub fn revision() -> u64 {
     REVISION.load(Ordering::SeqCst)
@@ -21,6 +25,7 @@ pub struct CommandActivityGuard;
 pub(crate) fn enter(_: ActivitySource) -> ActiveGuard {
     ACTIVE.fetch_add(1, Ordering::SeqCst);
     REVISION.fetch_add(1, Ordering::SeqCst);
+    CHANGED.notify_one();
     ActiveGuard
 }
 pub(crate) fn try_enter(source: ActivitySource) -> adx_core::Result<ActiveGuard> {
@@ -45,17 +50,20 @@ impl Drop for ActiveGuard {
     fn drop(&mut self) {
         ACTIVE.fetch_sub(1, Ordering::SeqCst);
         REVISION.fetch_add(1, Ordering::SeqCst);
+        CHANGED.notify_one();
     }
 }
 pub fn enter_command() -> CommandActivityGuard {
     COMMANDS.fetch_add(1, Ordering::SeqCst);
     REVISION.fetch_add(1, Ordering::SeqCst);
+    CHANGED.notify_one();
     CommandActivityGuard
 }
 impl Drop for CommandActivityGuard {
     fn drop(&mut self) {
         COMMANDS.fetch_sub(1, Ordering::SeqCst);
         REVISION.fetch_add(1, Ordering::SeqCst);
+        CHANGED.notify_one();
     }
 }
 pub fn active_count() -> i64 {

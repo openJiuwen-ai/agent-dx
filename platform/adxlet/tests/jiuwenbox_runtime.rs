@@ -663,7 +663,7 @@ async fn periodic_native_cleanup_keeps_other_environment_lifecycle_available() {
 }
 
 #[tokio::test]
-async fn periodic_reclaims_failed_execution_through_environment_work() {
+async fn recovery_reclaims_failed_execution_without_a_retained_controller() {
     let fixture = Fixture::new();
     let driver = fixture.driver().await;
     let node = authority::manager(Arc::new(driver.clone()));
@@ -701,9 +701,11 @@ async fn periodic_reclaims_failed_execution_through_environment_work() {
             .count(),
         deletes
     );
-    // There is no retained controller: the existing per-Environment orphan
-    // work queue owns this retry, rather than the inventory implementation.
+    // An external execution has no lifecycle controller; recovery owns cleanup.
     fixture.backend.reject_delete.store(false, Ordering::SeqCst);
+    authority.cycle(&node).await.unwrap();
+    assert_eq!(driver.inventory().await.unwrap().len(), 1);
+    authority.registration.reconciling = true;
     authority.cycle(&node).await.unwrap();
     assert!(node.accepting_allocations());
     assert!(driver.inventory().await.unwrap().is_empty());
@@ -711,7 +713,7 @@ async fn periodic_reclaims_failed_execution_through_environment_work() {
 }
 
 #[tokio::test]
-async fn periodic_backend_epoch_change_is_cleaned_by_its_controller() {
+async fn backend_epoch_change_is_cleaned_during_session_recovery() {
     let mut fixture = Fixture::new();
     let driver = fixture.driver().await;
     let record = running_record("conch");
@@ -734,6 +736,9 @@ async fn periodic_backend_epoch_change_is_cleaned_by_its_controller() {
     assert_eq!(observed.len(), 1);
     assert!(!observed[0].running);
     assert_eq!(fixture.native.physical.lock().unwrap().len(), 1);
+    authority.cycle(&node).await.unwrap();
+    assert_eq!(fixture.native.physical.lock().unwrap().len(), 1);
+    authority.registration.reconciling = true;
     authority.cycle(&node).await.unwrap();
     assert!(node.accepting_allocations());
     assert!(fixture.native.physical.lock().unwrap().is_empty());
@@ -1362,7 +1367,7 @@ async fn policy_updates_use_jiuwenbox_api_and_reject_unsupported_before_mutation
 }
 
 #[tokio::test]
-async fn public_authority_cycle_reaps_late_supervisor_and_conch_without_local_records() {
+async fn recovery_reaps_late_supervisor_and_conch_without_local_records() {
     for class in ["supervisor", "conch"] {
         let fixture = Fixture::new();
         let driver = fixture.driver().await;
@@ -1389,7 +1394,11 @@ async fn public_authority_cycle_reaps_late_supervisor_and_conch_without_local_re
             fixture.host.supervisors.lock().unwrap().push(id);
             fixture.host.process_alive.store(true, Ordering::SeqCst);
         }
-        // Both backends appeared after an empty authority cycle, without driver records.
+        // Ordinary data reconciliation does not scan backend execution state.
+        authority.cycle(&node).await.unwrap();
+        assert!(!fixture.backend.refs.lock().unwrap().is_empty(), "{class}");
+        // A new recovery handshake performs complete orphan cleanup.
+        authority.registration.reconciling = true;
         authority.cycle(&node).await.unwrap();
         assert!(fixture.backend.refs.lock().unwrap().is_empty(), "{class}");
         assert!(

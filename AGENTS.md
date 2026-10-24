@@ -18,11 +18,12 @@
 
 ## Builds and tests
 
-- Internal gRPC contracts are Environment-centric; no legacy Frontend or POSIX protobuf adapters. Design new internal RPCs around Environment responsibilities; do not reuse old POSIX/function services. Execd user operations use HTTP. Runtime cooperation can use an Execd-initiated bidirectional gRPC stream; HTTP control remains available when the node has no runtime_control configuration. Both transports share adx-core runtime types and the same state machine.
+- Internal gRPC contracts are Environment-centric; no legacy Frontend or POSIX protobuf adapters. Design new internal RPCs around Environment responsibilities; do not reuse old POSIX/function services. Execd user operations use HTTP. Runtime cooperation uses an Execd-initiated bidirectional gRPC stream; adxlet requires runtime_control configuration. HTTP control remains available for explicit operations and diagnostics. Both transports share adx-core runtime types and the same state machine.
 
 - Root Cargo workspace includes the API Server; Python packages build independently.
 - Use Makefile/native package commands. `build/` contains tracked scripts; outputs go to `out/` or explicitly configured external caches.
 - Run focused checks for changed components; report runtime/cluster validation separately.
+- Before committing Python changes, run `make python-check PYTHON_CHECK_BASE=<target-branch-ref>` against the PR's updated target branch, then the affected tests. See [Python precheck](docs/development/python-checks.md) for coverage and remote CodeCheck verification.
 - Delegate long builds/tests/packaging to a narrow-context subagent when available: exact repo, commands, concurrency, success criteria and log path. The worker does not edit source. Keep complete logs, poll every 60–180 seconds and return compact results.
 
 ## Programming standards

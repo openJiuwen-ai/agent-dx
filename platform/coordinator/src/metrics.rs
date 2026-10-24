@@ -15,14 +15,22 @@ pub async fn serve(listener: TcpListener, coordinator: CoordinatorRpc) -> std::i
                     let coordinator = coordinator.clone();
                     async move {
                         let (status, body) = if request.method() != hyper::Method::GET
-                            || request.uri().path() != "/metrics"
+                            || !matches!(request.uri().path(), "/metrics" | "/metrics/environments")
                         {
                             (404, String::new())
                         } else {
-                            match coordinator.metrics().await {
+                            let detail = request.uri().path() == "/metrics/environments";
+                            let result = if detail {
+                                coordinator.environment_metrics().await
+                            } else {
+                                coordinator.metrics().await
+                            };
+                            match result {
                                 Ok(mut text) => {
-                                    text.push_str(&adx_observability::trace::metrics());
-                                    text.push_str(&adx_observability::process::metrics());
+                                    if !detail {
+                                        text.push_str(&adx_observability::trace::metrics());
+                                        text.push_str(&adx_observability::process::metrics());
+                                    }
                                     (200, text)
                                 }
                                 Err(_) => (503, "metrics temporarily unavailable\n".into()),

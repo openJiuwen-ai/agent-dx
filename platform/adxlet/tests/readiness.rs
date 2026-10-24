@@ -226,7 +226,7 @@ async fn terminal_readiness_failure_is_not_retried_as_transport_error() {
 }
 
 #[tokio::test]
-async fn probe_observation_uses_http_when_control_stream_is_disconnected() {
+async fn explicit_probe_can_use_http_but_stream_readiness_never_polls() {
     let (port, _server, requests) = serve(r#"{"identity":{"environment_id":"i","runtime_id":"i-1","ownership_generation":1},"revision":2,"phase":"failed","failure":{"kind":"healthcheck_failed","message":"HTTP 503","consecutive_failures":3,"http_status":503},"checkpoint":null,"active_requests":0,"active_commands":0}"#, None).await;
     let hub =
         adxlet::control_stream::RuntimeControlHub::new(vec![7; 32], Duration::from_millis(100))
@@ -251,6 +251,11 @@ async fn probe_observation_uses_http_when_control_stream_is_disconnected() {
     assert_eq!(requests.load(Ordering::SeqCst), 1);
     assert!(matches!(
         checker.wait_ready(&record).await,
-        Err(adx_core::Error::ProbeFailed(_))
+        Err(adx_core::Error::DeadlineExceeded(_))
     ));
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "stream readiness must not poll HTTP"
+    );
 }

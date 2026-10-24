@@ -13,6 +13,9 @@ pub use adx_protocol::auth::SecurityMode;
 pub struct Caller(Option<Principal>);
 impl Interceptor for Caller {
     fn call(&mut self, mut request: Request<()>) -> Result<Request<()>, Status> {
+        // Generated clients run interceptors when polled, inside the caller's
+        // RPC span. Refresh metadata that may predate that span's creation.
+        adx_observability::trace::inject_metadata(request.metadata_mut());
         if let Some(principal) = &self.0 {
             let role = match principal {
                 Principal::Coordinator => "coordinator",

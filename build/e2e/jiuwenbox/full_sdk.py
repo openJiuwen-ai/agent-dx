@@ -20,19 +20,22 @@ import yaml
 from accept import Acceptance, cgroup_roots, command as backend_command
 
 
-def command(*args):
+def command(*command_args):
     try:
-        return backend_command(*args)
+        return backend_command(*command_args)
     except subprocess.CalledProcessError as error:
-        raise RuntimeError(f"{Path(args[0]).name} failed: {error.stderr}") from error
+        raise RuntimeError(f"{Path(command_args[0]).name} failed: {error.stderr}") from error
 
 
 class FullSDK(Acceptance):
     async def prepare(self):
         # Check every listener before reserving the backends' fixed global paths.
-        for port in (26379, 27000, 27001, 27090, 27091, 27092, 28444, 28888, 29444, 30443, 30880, 30881):
+        for port in (26379, 27000, 27001, 27003, 27090, 27091, 27092, 28444, 28888, 29444, 30443, 30880, 30881):
             with socket.socket() as s:
                 s.bind(("127.0.0.1", port))
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
+            route.connect(("192.0.2.1", 1))
+            control_host = route.getsockname()[0]
         await super().prepare()
         await self.stop(self.jw)
         workspace = self.run / "workspace"
@@ -155,6 +158,11 @@ class FullSDK(Acceptance):
                 "rpc_timeout_seconds": 120,
                 "runtime_ready_timeout_seconds": 120,
                 "execd_port": 50090,
+                "runtime_control": {
+                    "listen": "0.0.0.0:27003",
+                    "advertised_address": f"http://{control_host}:27003",
+                    "key_file": str(self.run / "runtime-control-key"),
+                },
                 "execd_health_failure_threshold": 3,
                 "execd_env": {},
                 "metrics_listen": "127.0.0.1:27091",

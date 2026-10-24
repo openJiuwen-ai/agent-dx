@@ -4,6 +4,11 @@ Build with the root Cargo workspace: `cargo build --locked -p adx-execd --bin ad
 
 `adx-execd` serves Environment operations over HTTP: `/healthz`, `/invoke`, command watches, uploads and downloads. Configure `EXECD_HTTP_PORT` (default 50090) and optional `EXECD_HTTP_TOKEN`. Reverse tunnels use HTTP/WebSocket and are enabled with `EXECD_TUNNEL_WS_PORT` and `EXECD_TUNNEL_HTTP_PORT`.
 
+Routine `GET /healthz`, `GET /metrics`, and `GET /control/v1/status` requests
+without an incoming trace context do not create spans. Requests carrying a trace
+context, business operations, and control mutations retain HTTP tracing. See
+[distributed traces](../../../docs/testing/distributed-traces.md).
+
 When `ADX_ENVIRONMENT_ID` is configured, the reverse-tunnel WebSocket handshake
 must carry the same `X-Environment-ID`. A mismatched client is rejected before it
 can replace the active connection. Restore refreshes this identity for the new

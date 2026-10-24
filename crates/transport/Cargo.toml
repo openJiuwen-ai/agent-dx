@@ -12,6 +12,7 @@ publish = false
 workspace = true
 
 [dependencies]
+adx-observability = { path = "../observability" }
 adx-protocol = { path = "../../platform/crates/protocol" }
 http = "1"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }

@@ -21,6 +21,7 @@ endif
 JOBS ?= 2
 OUT ?= $(CURDIR)/out
 PYTEST_ARGS ?=
+PYTHON_CHECK_BASE ?=
 E2E_PROFILE ?= standalone
 E2E_CGROUPNS ?= private
 K8S_E2E_PROFILE ?= k8s-basic
@@ -54,6 +55,7 @@ endif
 .PHONY: help cargo-cache-info cargo-cache-env cargo-cache-isolated-env generate build test rust-check rust-test afs-check afs-build afs-lint afs-all-features-lint afs-test scheduler-bench python-test agent-test activator-e2e environment-sdk-test admin-test package ci data-plane-gateway data-plane-gateway-dev data-plane-gateway-ut
 help:
 	@echo 'generate | build | test | package | ci SUITE=<suite>; set ADX_WITH_AFS=1 for Agent FS (AFS); tests: rust-check rust-test scheduler-bench python-test; cache: cargo-cache-info cargo-cache-env cargo-cache-isolated-env'
+	@echo 'Python precheck: make python-check PYTHON_CHECK_BASE=<target-branch-ref> (requires uv)'
 cargo-cache-info:
 	@$(PYTHON) $(ADX_CARGO_CACHE_HELPER) --repo $(CURDIR) status --target-dir '$(CARGO_TARGET_DIR)'
 cargo-cache-env:
@@ -97,6 +99,9 @@ afs-test:
 	$(CARGO) test --locked $(AFS_PACKAGES) --all-targets -j $(JOBS) -- --test-threads=$(JOBS)
 scheduler-bench:
 	$(CARGO) test --locked --release -p adx-coordinator --test benchmark -j $(JOBS) -- --ignored --nocapture
+.PHONY: python-check
+python-check:
+	bash build/ci/python-check.sh '$(PYTHON_CHECK_BASE)'
 python-test: environment-sdk-test admin-test
 activator-e2e:
 	@test -n "$(BUNDLE)" || { echo 'set BUNDLE to a bundle prepared with --activator' >&2; exit 2; }

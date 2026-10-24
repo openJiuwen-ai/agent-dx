@@ -223,6 +223,50 @@ impl RuntimeControlClient {
         }
         Ok(false)
     }
+    pub fn subscribe(
+        &self,
+        record: &EnvironmentRecord,
+    ) -> Result<Option<tokio::sync::watch::Receiver<Option<RuntimeStatus>>>> {
+        self.stream
+            .as_ref()
+            .map(|stream| stream.subscribe(&Self::identity(record)))
+            .transpose()
+    }
+    pub async fn quiesce_idle(
+        &self,
+        record: &EnvironmentRecord,
+        activity_revision: u64,
+    ) -> Result<()> {
+        let stream = self.stream.as_ref().ok_or_else(|| {
+            Error::Unavailable("idle barrier requires runtime control stream".into())
+        })?;
+        let identity = Self::identity(record);
+        stream
+            .request(
+                &identity,
+                adx_protocol::runtime_stream::ControlOperation::Quiesce {
+                    identity: identity.clone(),
+                    activity_revision,
+                },
+            )
+            .await
+            .map(|_| ())
+    }
+    pub async fn reopen_idle(&self, record: &EnvironmentRecord) -> Result<()> {
+        let stream = self.stream.as_ref().ok_or_else(|| {
+            Error::Unavailable("idle barrier requires runtime control stream".into())
+        })?;
+        let identity = Self::identity(record);
+        stream
+            .request(
+                &identity,
+                adx_protocol::runtime_stream::ControlOperation::ReopenIdle {
+                    identity: identity.clone(),
+                },
+            )
+            .await
+            .map(|_| ())
+    }
     pub fn pending_checkpoint(&self, record: &EnvironmentRecord) -> Result<Option<RuntimeStatus>> {
         self.stream
             .as_ref()

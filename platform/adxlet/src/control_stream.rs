@@ -116,6 +116,12 @@ impl RuntimeControlHub {
             .cloned()
             .ok_or(Error::Conflict)
     }
+    pub fn subscribe(
+        &self,
+        identity: &RuntimeIdentity,
+    ) -> Result<watch::Receiver<Option<RuntimeStatus>>> {
+        Ok(self.slot(identity)?.status.subscribe())
+    }
     pub fn observed(&self, identity: &RuntimeIdentity) -> Result<Option<RuntimeStatus>> {
         Ok(self.slot(identity)?.status.borrow().clone())
     }

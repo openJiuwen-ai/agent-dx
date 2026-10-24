@@ -455,14 +455,13 @@ for service in deployment["services"]:
     if service["role"] == "adxlet":
         c = service["config"]
         c.pop("checkpoint_dir", None)
-        if os.getenv("ADX_E2E_RUNTIME_CONTROL") == "1":
-            c["runtime_control"] = {
-                "listen": os.getenv("ADX_E2E_RUNTIME_CONTROL_LISTEN", "10.231.16.1:19003"),
-                "advertised_address": os.getenv(
-                    "ADX_E2E_RUNTIME_CONTROL_ADDRESS", "http://10.231.16.1:19003"
-                ),
-                "key_file": str(RUN / "runtime-control-key"),
-            }
+        c["runtime_control"] = {
+            "listen": os.getenv("ADX_E2E_RUNTIME_CONTROL_LISTEN", "10.231.16.1:19003"),
+            "advertised_address": os.getenv(
+                "ADX_E2E_RUNTIME_CONTROL_ADDRESS", "http://10.231.16.1:19003"
+            ),
+            "key_file": str(RUN / "runtime-control-key"),
+        }
         c["checkpoint_storage"] = {
             "kind": "s3",
             "alias": "shared",

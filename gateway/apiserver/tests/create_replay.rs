@@ -56,6 +56,7 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
         Ok(Response::new(owner))
     }
     async fn create_environment(&self, request: Request<pb::CreateEnvironmentRequest>) -> Result<Response<pb::EnvironmentResult>, Status> {
+        let _trace = adx_observability::trace::Trace::rpc("test.coordinator.create_environment", &request);
         let deadline = request.get_ref().create_deadline_unix_millis;
         self.0.deadlines.lock().unwrap().push(request.get_ref().create_deadline_unix_millis);
         self.0.create_calls.fetch_add(1, Ordering::SeqCst);
@@ -84,7 +85,7 @@ service_impl!(pb::coordinator_service_server::CoordinatorService, {
                     execution_artifacts: vec![],
             snapshot_source: None,
                     failure: None,
-assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: "node".into(), generation: 1, ..Default::default() }),
+assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: self.0.entry_node.lock().unwrap().as_ref().map_or_else(|| "node".into(), |node| node.node_id.clone()), generation: 1, ..Default::default() }),
                     spec: Some(spec.clone()), state: if self.0.pending_response.load(Ordering::SeqCst) { pb::EnvironmentState::Pending as i32 } else { pb::EnvironmentState::Running as i32 }, revision: 1,
                     resources_held: true, ..Default::default()
                 };
@@ -194,6 +195,8 @@ impl Fixture {
                 Some((socket, listener))
             });
             tonic::transport::Server::builder()
+                .add_service(pb::auth_service_server::AuthServiceServer::new(endpoint.clone()))
+                .add_service(pb::node_service_server::NodeServiceServer::new(endpoint.clone()))
                 .add_service(pb::coordinator_service_server::CoordinatorServiceServer::new(endpoint.clone()))
                 .add_service(pb::environment_directory_service_server::EnvironmentDirectoryServiceServer::new(endpoint))
                 .serve_with_incoming(incoming).await.unwrap();
@@ -313,6 +316,101 @@ async fn cancelled_schedule_is_cached_without_resubmission_or_runtime_start() {
         .unwrap_err();
     assert!(adx_protocol::scheduling_failure(&error).is_some());
     assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn creation_metrics_wait_for_result_and_count_replay_as_a_response() {
+    let fixture = Fixture::new().await;
+    fixture.state.block_response.store(true, Ordering::SeqCst);
+    let service = fixture.service.clone();
+    let pending = tokio::spawn(async move {
+        service
+            .create(
+                spec("observed"),
+                json!({"name":"observed"}),
+                "observed",
+                &caller(),
+            )
+            .await
+    });
+    fixture.wait_starts(1).await;
+    let metrics = fixture.service.metrics();
+    assert!(metrics.contains("adx_environment_create_in_flight 1\n"));
+    assert!(metrics.contains("adx_environment_create_responses_total{outcome=\"success\"} 0\n"));
+    fixture.state.release.notify_one();
+    pending.await.unwrap().unwrap();
+    fixture.create("observed", "observed").await.unwrap();
+    let metrics = fixture.service.metrics();
+    assert!(metrics.contains("adx_environment_create_in_flight 0\n"));
+    assert!(metrics.contains("adx_environment_create_responses_total{outcome=\"success\"} 2\n"));
+    assert!(!metrics.contains("environment_id="));
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn private_metrics_include_rejected_http_arrivals_without_reporting_success() {
+    adx_transport::install_crypto_provider();
+    let fixture = Fixture::new().await;
+    let api = adx_apiserver::http::Api::new(fixture.clients.clone()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let api_service = api.clone();
+    let http = tokio::spawn(async move {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            let api = api_service.clone();
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(move |request| api.clone().serve(request));
+                hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(socket), service)
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let monitoring = listener.local_addr().unwrap();
+    let metrics = tokio::spawn(adx_apiserver::metrics::serve(
+        listener,
+        api.environment_service.clone(),
+    ));
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    for path in [
+        "/api/environment/v1/environments",
+        "/api/environment/create/",
+        "/api/%65nvironment/v1/environments",
+    ] {
+        let response = client
+            .post(format!("http://{address}{path}"))
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert!(!response.status().is_success());
+    }
+    let text = client
+        .get(format!("http://{monitoring}/metrics"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(text.contains("adx_environment_create_requests_total{source=\"http\"} 3\n"));
+    assert!(text.contains("adx_environment_create_responses_total{outcome=\"success\"} 0\n"));
+    assert!(text.contains("adx_environment_create_in_flight 0\n"));
+    assert_eq!(
+        client
+            .post(format!("http://{monitoring}/metrics"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 0);
+    http.abort();
+    metrics.abort();
 }
 
 #[tokio::test]
@@ -597,4 +695,320 @@ async fn pending_retry_rejects_a_changed_generation() {
         tonic::Code::FailedPrecondition
     );
     assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 2);
+}
+
+#[tonic::async_trait]
+impl pb::auth_service_server::AuthService for Service {
+    async fn verify_api_key(
+        &self,
+        _: Request<pb::VerifyApiKeyRequest>,
+    ) -> Result<Response<pb::VerifyApiKeyResponse>, Status> {
+        Ok(Response::new(pb::VerifyApiKeyResponse {
+            caller: Some(caller()),
+            expires_at_unix_seconds: 0,
+        }))
+    }
+}
+service_impl!(pb::node_service_server::NodeService, {
+    async fn create_local_environment(&self, request: Request<pb::LocalEnvironmentCreateRequest>) -> Result<Response<pb::EnvironmentResult>, Status> {
+        let trace = adx_observability::trace::Trace::rpc("test.node.create_local_environment", &request);
+        trace.run_result(async {
+            let create = request.into_inner().create.unwrap();
+            pb::coordinator_service_server::CoordinatorService::create_environment(self, adx_observability::trace::inject(create)).await
+        }).await
+    }
+}, [
+    recover_environment(RecoverEnvironmentRequest) -> EnvironmentResult,
+    get_session(GetNodeSessionRequest) -> GetNodeSessionResponse,
+    create_environment(StartAssignedEnvironmentRequest) -> EnvironmentResult,
+    delete_environment(DeleteEnvironmentRequest) -> EnvironmentResult,
+    pause_environment(PauseEnvironmentRequest) -> EnvironmentResult,
+    resume_environment(ResumeEnvironmentRequest) -> EnvironmentResult,
+    ensure_environment_running(EnsureEnvironmentRunningRequest) -> EnvironmentResult,
+    update_network_policy(UpdateNetworkPolicyRequest) -> EnvironmentResult,
+    reload_environment(ReloadEnvironmentRequest) -> EnvironmentResult,
+    create_snapshot(CreateSnapshotRequest) -> CreateSnapshotResponse,
+    collect_snapshot(CollectSnapshotRequest) -> CollectSnapshotResponse,
+]);
+
+static TRACE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn traced_create(
+    exporter: &opentelemetry_sdk::trace::InMemorySpanExporter,
+    mode: &str,
+    failure: bool,
+    local: bool,
+) -> (Vec<opentelemetry_sdk::trace::SpanData>, String) {
+    adx_transport::install_crypto_provider();
+    let fixture = Fixture::with_mode(600, local).await;
+    if local {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while fixture.clients.nodes().await.is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    fixture.state.block_response.store(true, Ordering::SeqCst);
+    if failure {
+        fixture
+            .state
+            .response_error
+            .store(tonic::Code::InvalidArgument as usize, Ordering::SeqCst);
+    }
+    let api = adx_apiserver::http::Api::new(fixture.clients.clone()).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let serving = api.clone();
+    let http = tokio::spawn(async move {
+        loop {
+            let (socket, _) = listener.accept().await.unwrap();
+            let api = serving.clone();
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(move |request| api.clone().serve(request));
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(hyper_util::rt::TokioIo::new(socket), service)
+                    .await;
+            });
+        }
+    });
+    let before = exporter.get_finished_spans().unwrap().len();
+    let input = json!({"name":"trace-create", "image":"image", "runtimeClass":"runsc"});
+    let embedded = mode == "embedded";
+    let service = api.environment_service.clone();
+    let mode = mode.to_owned();
+    let request = tokio::spawn(async move {
+        if embedded {
+            let result = adx_observability::trace::Trace::child("test.embedded_create")
+                .run(service.create_request(input, "trace-create", &caller()))
+                .await;
+            assert_eq!(result.is_err(), failure);
+        } else {
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let response = client
+                .post(format!("http://{address}/api/environment/v1/environments"))
+                .header(
+                    "authorization",
+                    format!("Bearer {}", "trace-test".repeat(4)),
+                )
+                .header(
+                    "accept",
+                    if mode == "sse" {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    },
+                )
+                .body(input.to_string())
+                .send()
+                .await
+                .unwrap();
+            let text = response.text().await.unwrap();
+            if mode == "sse" {
+                assert!(text.contains("event: final"), "{text}");
+            }
+            assert_eq!(text.contains("error"), failure, "{text}");
+        }
+    });
+    fixture.wait_starts(1).await;
+    let in_progress = exporter.get_finished_spans().unwrap();
+    assert!(
+        !in_progress[before..]
+            .iter()
+            .any(|span| span.name == "environment.create"
+                && span
+                    .attributes
+                    .iter()
+                    .any(|a| a.key.as_str() == "environment.id"
+                        && a.value.to_string() == "default-trace-create")),
+        "create must not finish before confirmation"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    fixture.state.release.notify_one();
+    request.await.unwrap();
+    tokio::task::yield_now().await;
+    let completed = exporter.get_finished_spans().unwrap();
+    let total = completed[before..]
+        .iter()
+        .find(|span| {
+            span.name == "environment.create"
+                && span.attributes.iter().any(|a| {
+                    a.key.as_str() == "environment.id"
+                        && a.value.to_string() == "default-trace-create"
+                })
+        })
+        .expect("total create span missing");
+    let result = completed[before..]
+        .iter()
+        .filter(|span| span.span_context.trace_id() == total.span_context.trace_id())
+        .cloned()
+        .collect();
+    let metrics = api.environment_service.metrics();
+    http.abort();
+    (result, metrics)
+}
+
+#[tokio::test]
+async fn create_total_span_matches_metric_boundary_for_json_sse_and_embedded() {
+    let _serial = TRACE_TEST_LOCK.lock().await;
+    let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    opentelemetry::global::set_tracer_provider(provider.clone());
+    for mode in ["json", "sse", "embedded"] {
+        let (spans, metrics) = traced_create(&exporter, mode, false, false).await;
+        let creates: Vec<_> = spans
+            .iter()
+            .filter(|span| span.name == "environment.create")
+            .collect();
+        assert_eq!(
+            creates.len(),
+            1,
+            "{mode}: exactly one total create span required"
+        );
+        let create = creates[0];
+        assert!(create
+            .attributes
+            .iter()
+            .any(|a| a.key.as_str() == "environment.id"
+                && a.value.to_string() == "default-trace-create"));
+        let elapsed = create
+            .end_time
+            .duration_since(create.start_time)
+            .unwrap()
+            .as_secs_f64();
+        assert!(elapsed >= 0.03, "{mode}: confirmation wait missing");
+        let measured: f64 = metrics
+            .lines()
+            .find_map(|line| line.strip_prefix("adx_environment_create_duration_seconds_sum "))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            (elapsed - measured).abs() < 0.02,
+            "{mode}: span={elapsed}, metric={measured}"
+        );
+        let parent = spans
+            .iter()
+            .find(|s| s.span_context.span_id() == create.parent_span_id)
+            .unwrap();
+        assert_eq!(
+            parent.span_context.trace_id(),
+            create.span_context.trace_id()
+        );
+        assert_eq!(
+            parent.name,
+            if mode == "embedded" {
+                "test.embedded_create"
+            } else {
+                "POST /api/environment/v1/environments"
+            }
+        );
+        if mode == "sse" {
+            assert!(parent.end_time < create.end_time);
+        }
+    }
+}
+
+#[tokio::test]
+async fn create_rpc_server_spans_are_children_of_the_matching_client_span() {
+    let _serial = TRACE_TEST_LOCK.lock().await;
+    let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    opentelemetry::global::set_tracer_provider(provider.clone());
+    for local in [false, true] {
+        let (spans, _) = traced_create(&exporter, "sse", false, local).await;
+        let (client, server) = if local {
+            (
+                "apiserver.create_local",
+                "test.node.create_local_environment",
+            )
+        } else {
+            ("apiserver.create", "test.coordinator.create_environment")
+        };
+        let client = spans.iter().find(|s| s.name == client).unwrap();
+        let server = spans.iter().find(|s| s.name == server).unwrap();
+        assert_eq!(server.parent_span_id, client.span_context.span_id());
+        assert_eq!(
+            server.span_context.trace_id(),
+            client.span_context.trace_id()
+        );
+        assert!(client.start_time <= server.start_time && client.end_time >= server.end_time);
+    }
+}
+
+#[tokio::test]
+async fn create_total_span_records_errors_for_json_sse_and_embedded() {
+    let _serial = TRACE_TEST_LOCK.lock().await;
+    let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    opentelemetry::global::set_tracer_provider(provider.clone());
+    for mode in ["json", "sse", "embedded"] {
+        let (spans, _) = traced_create(&exporter, mode, true, false).await;
+        let create = spans
+            .iter()
+            .find(|span| span.name == "environment.create")
+            .expect("total create span missing");
+        assert!(
+            matches!(create.status, opentelemetry::trace::Status::Error { .. }),
+            "{mode}: {:?}",
+            create.status
+        );
+    }
+}
+
+#[tokio::test]
+async fn cancelled_create_ends_total_span_without_losing_its_parent() {
+    let _serial = TRACE_TEST_LOCK.lock().await;
+    let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    opentelemetry::global::set_tracer_provider(provider.clone());
+    let fixture = Fixture::new().await;
+    fixture.state.block_response.store(true, Ordering::SeqCst);
+    let service = fixture.service.clone();
+    let request = tokio::spawn(
+        adx_observability::trace::Trace::child("test.cancelled_create").run(async move {
+            service
+                .create_request(
+                    json!({"name":"cancelled-create","image":"image"}),
+                    "cancelled-create",
+                    &caller(),
+                )
+                .await
+        }),
+    );
+    fixture.wait_starts(1).await;
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    let spans = exporter.get_finished_spans().unwrap();
+    let parent = spans
+        .iter()
+        .find(|s| s.name == "test.cancelled_create")
+        .unwrap();
+    let create = spans
+        .iter()
+        .find(|s| {
+            s.name == "environment.create"
+                && s.parent_span_id == parent.span_context.span_id()
+                && s.span_context.trace_id() == parent.span_context.trace_id()
+        })
+        .unwrap();
+    assert_eq!(create.parent_span_id, parent.span_context.span_id());
+    assert!(create
+        .attributes
+        .iter()
+        .any(|a| a.key.as_str() == "environment.create.outcome"
+            && a.value.to_string() == "cancelled"));
+    let metrics = fixture.service.metrics();
+    assert!(metrics.contains("adx_environment_create_in_flight 0\n"));
+    assert!(metrics.contains("adx_environment_create_responses_total{outcome=\"cancelled\"} 1\n"));
+    fixture.state.release.notify_one();
 }

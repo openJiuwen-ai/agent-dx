@@ -1,0 +1,42 @@
+rule_files:
+  - rules.json
+evaluation_interval: 15s
+tests:
+  - name: create requests aggregate replicas and handle a counter reset
+    interval: 15s
+    input_series:
+      - series: 'adx_environment_create_requests_total{adx_env="test",source="http",instance="a"}'
+        values: '0 15 30 45 60 15 30 45 60'
+      - series: 'adx_environment_create_requests_total{adx_env="test",source="http",instance="b"}'
+        values: '0+30x8'
+      - series: 'adx_environment_created_total{adx_env="test",instance="coordinator"}'
+        values: '0+15x8'
+    promql_expr_test:
+      - expr: 'abs(adx:environment_create_request_qps:rate1m{adx_env="test"} - 3) < bool 1e-9'
+        eval_time: 2m
+        exp_samples:
+          - labels: '{adx_env="test"}'
+            value: 1
+      - expr: 'abs(adx:environment_created_qps:rate1m{adx_env="test"} - 1) < bool 1e-9'
+        eval_time: 2m
+        exp_samples:
+          - labels: '{adx_env="test"}'
+            value: 1
+  - name: cluster peak is the maximum simultaneous sum rather than sum of individual peaks
+    interval: 15s
+    input_series:
+      - series: 'adx_environment_create_requests_total{adx_env="a",source="http",instance="a"}'
+        values: '0+90x20 1800+0x20'
+      - series: 'adx_environment_create_requests_total{adx_env="b",source="http",instance="b"}'
+        values: '0+0x20 0+90x20'
+    promql_expr_test:
+      - expr: 'abs(max_over_time((sum(adx:environment_create_request_qps:rate1m{adx_env=~"a|b"}))[10m:15s]) - 6) < bool 1e-9'
+        eval_time: 10m
+        exp_samples:
+          - labels: '{}'
+            value: 1
+      - expr: 'abs(sum(max_over_time(adx:environment_create_request_qps:rate1m{adx_env=~"a|b"}[10m])) - 12) < bool 1e-9'
+        eval_time: 10m
+        exp_samples:
+          - labels: '{}'
+            value: 1

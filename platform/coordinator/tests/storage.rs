@@ -1402,3 +1402,15 @@ async fn recovery_never_uses_missing_local_or_expired_checkpoint() {
 
 #[path = "storage/admin_keys.rs"]
 mod admin_keys;
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn inspection_inventory_remains_available_without_redis() {
+    let mut rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    session.refresh_inspection_inventory().await.unwrap();
+    rig.crash();
+    let (snapshots, holds) = session.inspection_inventory().await.unwrap();
+    assert!(snapshots.is_empty());
+    assert!(holds.is_empty());
+}

@@ -49,6 +49,23 @@
       "includeVars": true,
       "keepTime": true,
       "targetBlank": false
+    },
+    {
+      "title": "Environment Logs",
+      "type": "link",
+      "url": "/d/adx-environment-logs",
+      "includeVars": true,
+      "keepTime": false,
+      "targetBlank": false,
+      "tooltip": "Open on-demand log search, initially the last 15 minutes."
+    },
+    {
+      "title": "Environments",
+      "type": "link",
+      "url": "/d/adx-environments",
+      "includeVars": true,
+      "keepTime": false,
+      "targetBlank": false
     }
   ],
   "templating": {
@@ -256,7 +273,7 @@
           "range": true
         }
       ],
-      "title": "CPU — cluster total (cores)",
+      "title": "CPU \u2014 cluster total (cores)",
       "type": "timeseries"
     },
     {
@@ -320,7 +337,7 @@
           "range": true
         }
       ],
-      "title": "Memory — cluster total (bytes)",
+      "title": "Memory \u2014 cluster total (bytes)",
       "type": "timeseries"
     },
     {
@@ -384,7 +401,7 @@
           "range": true
         }
       ],
-      "title": "Open file descriptors — cluster total",
+      "title": "Open file descriptors \u2014 cluster total",
       "type": "timeseries"
     },
     {
@@ -448,7 +465,7 @@
           "range": true
         }
       ],
-      "title": "Threads — cluster total",
+      "title": "Threads \u2014 cluster total",
       "type": "timeseries"
     },
     {

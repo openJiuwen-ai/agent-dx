@@ -114,8 +114,8 @@ impl RuntimeLogs {
         self.policy.paths(runtime_id)
     }
 
-    /// Call only after a successful authoritative sandboxd inventory. An
-    /// unavailable backend cannot prove that a runtime has terminated.
+    /// Call only after node recovery, with all live and unconfirmed-cleanup
+    /// executions retained. An unavailable backend is not proof of termination.
     pub fn collect(&self, active: &HashSet<String>, now: SystemTime) -> io::Result<usize> {
         let now_seconds = now
             .duration_since(UNIX_EPOCH)

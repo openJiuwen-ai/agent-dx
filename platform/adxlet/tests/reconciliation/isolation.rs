@@ -211,102 +211,49 @@ async fn live_comparison_preserves_in_progress_checkpoint_directory() {
 }
 
 #[tokio::test]
-async fn failed_orphan_cleanup_only_fences_its_environment_and_retries_absent_runtime() {
+async fn recovery_cleanup_failure_keeps_admission_closed_until_retry() {
     let backend = Arc::new(Backend::default());
     let node = authority::manager(backend.clone());
     let mut authority = authority::Fixture::new().await;
     authority.cycle(&node).await.unwrap();
     backend.actual.lock().unwrap().push(observed("orphan"));
     backend.fail_remove.store(true, Ordering::SeqCst);
+    authority.registration.reconciling = true;
     assert!(authority.cycle(&node).await.is_err());
-    assert!(node.accepting_allocations());
-    assert!(
-        authority
-            .authority
-            .reports
-            .lock()
-            .unwrap()
-            .last()
-            .unwrap()
-            .accepting_allocations
-    );
-    let orphan = record("orphan", EnvironmentState::Pending);
+    assert!(!node.accepting_allocations());
+    let candidate = record("other", EnvironmentState::Pending);
     assert!(node
-        .environment(orphan.spec.clone(), orphan.assignment.clone())
+        .environment(candidate.spec.clone(), candidate.assignment.clone())
         .is_err());
-    backend.allow_start.store(true, Ordering::SeqCst);
-    let new = record("other", EnvironmentState::Pending);
-    let new = node
-        .environment(new.spec, new.assignment)
-        .unwrap()
-        .create()
-        .await
-        .unwrap()
-        .record;
-    authority
-        .authority
-        .records
-        .lock()
-        .unwrap()
-        .push(new.try_into().unwrap());
-    // Delete may have succeeded remotely even though its response was lost.
-    backend
-        .actual
-        .lock()
-        .unwrap()
-        .retain(|r| r.environment_id != "orphan");
     backend.fail_remove.store(false, Ordering::SeqCst);
     authority.cycle(&node).await.unwrap();
-    assert!(node.environment(orphan.spec, orphan.assignment).is_ok());
+    assert!(backend.actual.lock().unwrap().is_empty());
+    assert!(node.accepting_allocations());
+    assert!(node
+        .environment(candidate.spec, candidate.assignment)
+        .is_ok());
 }
 
 #[tokio::test]
-async fn later_orphan_execution_keeps_its_environment_fenced_until_both_deletes_finish() {
+async fn recovery_cleans_all_orphan_executions_before_reopening() {
     let backend = Arc::new(Backend::default());
     let node = authority::manager(backend.clone());
     let mut authority = authority::Fixture::new().await;
     authority.cycle(&node).await.unwrap();
-    backend.block_remove.store(true, Ordering::SeqCst);
-    backend.actual.lock().unwrap().push(observed("orphan"));
-    authority.cycle(&node).await.unwrap();
     let mut late = observed("orphan");
     late.runtime_id = "orphan-8".into();
     late.generation = 8;
-    backend.actual.lock().unwrap().push(late);
+    backend
+        .actual
+        .lock()
+        .unwrap()
+        .extend([observed("orphan"), late]);
     authority.cycle(&node).await.unwrap();
-    backend.remove_release.notify_one();
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while backend
-            .actual
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|r| r.runtime_id == "orphan-7")
-        {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    tokio::task::yield_now().await;
+    assert_eq!(backend.actual.lock().unwrap().len(), 2);
+    authority.registration.reconciling = true;
+    authority.cycle(&node).await.unwrap();
+    assert!(backend.actual.lock().unwrap().is_empty());
     let candidate = record("orphan", EnvironmentState::Pending);
-    assert!(node
-        .environment(candidate.spec.clone(), candidate.assignment.clone())
-        .is_err());
-    authority.cycle(&node).await.unwrap();
-    assert!(node
-        .environment(candidate.spec.clone(), candidate.assignment.clone())
-        .is_err());
-    backend.block_remove.store(false, Ordering::SeqCst);
-    backend.remove_release.notify_one();
-    tokio::time::timeout(Duration::from_secs(1), async {
-        while !backend.actual.lock().unwrap().is_empty() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
-    authority.cycle(&node).await.unwrap();
     assert!(node
         .environment(candidate.spec, candidate.assignment)
         .is_ok());

@@ -34,6 +34,9 @@ pub struct Config {
     #[serde(default)]
     pub runtime_profile: Option<adx_core::runtime_profile::RuntimeProfile>,
     pub listen: SocketAddr,
+    /// Private Prometheus listener, independent of the public HTTP API.
+    #[serde(default)]
+    pub metrics_listen: Option<SocketAddr>,
     #[serde(default)]
     pub create_mode: CreateMode,
     #[serde(default)]

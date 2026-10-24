@@ -103,6 +103,11 @@ impl Drop for Trace {
         self.context.span().end();
     }
 }
+/// Capture the current context now and attach it only while polling the future.
+/// Detached work can retain its parent without keeping the parent's span open.
+pub fn with_current_context<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    future.with_context(Context::current())
+}
 pub fn traceparent() -> Option<String> {
     let mut headers = HashMap::new();
     TraceContextPropagator::new().inject_context(&Context::current(), &mut headers);

@@ -1007,6 +1007,19 @@ impl RuntimeDriver for Jiuwenbox {
         }
     }
     async fn observe(&self, id: &str) -> Result<RuntimeStatus> {
+        if let Some(record) = self.state.get(id).await? {
+            if record.epoch != self.client.epoch().await? {
+                return Ok(RuntimeStatus {
+                    running: false,
+                    failure: Some(adx_core::RuntimeFailure {
+                        reason: adx_core::RuntimeFailureReason::Missing,
+                        exit_code: None,
+                        probe_failure: None,
+                        message: "runtime backend restarted".into(),
+                    }),
+                });
+            }
+        }
         Ok(RuntimeStatus {
             running: self.is_running(id).await?,
             failure: None,

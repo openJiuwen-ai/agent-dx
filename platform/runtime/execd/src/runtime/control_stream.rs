@@ -110,6 +110,7 @@ async fn session(controller: Arc<Controller>, config: ControlStreamConfig) -> Re
         identity.environment_id,
         identity.ownership_generation
     );
+    let mut activity_due = None;
     loop {
         tokio::select! {
             changed = changes.changed() => {
@@ -118,10 +119,23 @@ async fn session(controller: Arc<Controller>, config: ControlStreamConfig) -> Re
                 if status.identity != identity { return Err(Error::Conflict); }
                 events.send(pb::RuntimeEvent { event: Some(pb::runtime_event::Event::StatusJson(encode(&status)?)) }).await.map_err(|_| unavailable("control status stream closed"))?;
             },
+            _ = super::activity::changed() => {
+                activity_due.get_or_insert_with(|| tokio::time::Instant::now() + Duration::from_millis(250));
+            },
+            _ = async {
+                match activity_due { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await }
+            } => {
+                activity_due = None;
+                let status = controller.status();
+                if status.identity != identity { return Err(Error::Conflict); }
+                events.send(pb::RuntimeEvent { event: Some(pb::runtime_event::Event::StatusJson(encode(&status)?)) }).await.map_err(|_| unavailable("control status stream closed"))?;
+            },
             command = commands.message() => {
                 let command = command.map_err(|_| unavailable("node control stream failed"))?.ok_or_else(|| unavailable("node control stream closed"))?;
                 let result = match serde_json::from_slice::<ControlOperation>(&command.operation_json) {
                     Ok(ControlOperation::Status) => Ok(controller.status()),
+                    Ok(ControlOperation::Quiesce { identity, activity_revision }) => controller.quiesce_idle(&identity, activity_revision),
+                    Ok(ControlOperation::ReopenIdle { identity }) => controller.reopen_idle(&identity),
                     Ok(ControlOperation::Prepare(request)) => controller.prepare(request).await,
                     Ok(ControlOperation::Abort(request)) => controller.abort_unstarted(&request.operation_id, &request.identity, request.expected_revision),
                     Ok(ControlOperation::Finish(request)) => controller.finish_checkpoint(request),
@@ -145,4 +159,114 @@ fn encode(status: &RuntimeStatus) -> Result<Vec<u8>> {
 }
 fn unavailable(message: &str) -> Error {
     Error::Unavailable(message.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{
+        activity,
+        control::{CheckpointHooks, Handoff},
+    };
+    use super::*;
+    use adx_core::runtime::RuntimeIdentity;
+    struct Hooks;
+    impl CheckpointHooks for Hooks {
+        fn open(&self) -> std::io::Result<Handoff> {
+            Err(std::io::Error::other("unused checkpoint"))
+        }
+        fn restore(&self, identity: &RuntimeIdentity) -> std::io::Result<RuntimeIdentity> {
+            Ok(identity.clone())
+        }
+    }
+    #[tokio::test]
+    async fn activity_burst_updates_stream_without_lifecycle_revision_change() {
+        use adx_protocol::runtime_stream::execution_token;
+        use adxlet::control_stream::RuntimeControlHub;
+        let identity = RuntimeIdentity {
+            environment_id: "activity".into(),
+            runtime_id: "activity-1".into(),
+            ownership_generation: 1,
+        };
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let hub = RuntimeControlHub::new(secret.to_vec(), Duration::from_secs(1)).unwrap();
+        hub.expect(&identity).unwrap();
+        let controller = Controller::new(identity.clone(), Arc::new(Hooks)).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = ControlStreamConfig {
+            address: format!("http://{}", listener.local_addr().unwrap()),
+            token: execution_token(secret, &identity).unwrap(),
+        };
+        let service =
+            pb::runtime_control_service_server::RuntimeControlServiceServer::new(hub.clone());
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(service)
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let current = controller.clone();
+        let client = tokio::spawn(async move {
+            run(current, move || Ok(config.clone())).await;
+        });
+        hub.wait_ready(&identity).await.unwrap();
+        let before = hub.observed(&identity).unwrap().unwrap();
+        let mut changes = hub.subscribe(&identity).unwrap();
+        drop(activity::enter_command());
+        let after = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let current = changes.borrow_and_update().clone().unwrap();
+                if current.activity_revision > before.activity_revision {
+                    return current;
+                }
+                changes.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(after.revision, before.revision);
+        assert_eq!(after.active_commands, 0);
+        client.abort();
+        server.abort();
+    }
+    #[test]
+    fn idle_quiesce_checks_current_activity_and_closes_admission() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                activity::reopen();
+            }
+        }
+        let _reset = Reset;
+        activity::reopen();
+        let identity = RuntimeIdentity {
+            environment_id: "idle".into(),
+            runtime_id: "idle-1".into(),
+            ownership_generation: 1,
+        };
+        let controller = Controller::new(identity.clone(), Arc::new(Hooks)).unwrap();
+        let active = activity::enter(activity::ActivitySource::DirectHttp);
+        assert_eq!(
+            controller.quiesce_idle(&identity, activity::revision()),
+            Err(Error::Conflict)
+        );
+        drop(active);
+        let old = activity::revision();
+        drop(activity::enter_command());
+        assert_eq!(
+            controller.quiesce_idle(&identity, old),
+            Err(Error::Conflict)
+        );
+        controller
+            .quiesce_idle(&identity, activity::revision())
+            .unwrap();
+        assert!(activity::try_enter(activity::ActivitySource::DirectHttp).is_err());
+        let mut stale = identity.clone();
+        stale.ownership_generation += 1;
+        assert_eq!(controller.reopen_idle(&stale), Err(Error::Conflict));
+        assert!(activity::try_enter(activity::ActivitySource::DirectHttp).is_err());
+        controller.reopen_idle(&identity).unwrap();
+        controller.reopen_idle(&identity).unwrap();
+        assert!(activity::try_enter(activity::ActivitySource::DirectHttp).is_ok());
+    }
 }

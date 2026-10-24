@@ -47,5 +47,7 @@ protoc-bin-vendored = "3"
 tonic-build = "0.12"
 
 [dev-dependencies]
+opentelemetry = { version = "0.31", features = ["trace"] }
+opentelemetry_sdk = { version = "0.31", features = ["trace", "testing"] }
 tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"

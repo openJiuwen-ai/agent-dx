@@ -662,7 +662,7 @@ async fn settled_start_errors_release_resources_after_confirmed_cleanup() {
 }
 
 #[tokio::test]
-async fn failed_start_releases_absent_backend_without_repeating_start() {
+async fn ambiguous_start_keeps_cleanup_pending_without_repeating_start() {
     let server = Server {
         transport_error: true,
         ..Default::default()
@@ -670,12 +670,9 @@ async fn failed_start_releases_absent_backend_without_repeating_start() {
     let (adapter, _server) = connect(server.clone()).await;
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
-    adapter.remove("i-1").await.unwrap();
+    assert!(adapter.remove("i-1").await.is_err());
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
-    assert_eq!(
-        *server.requests.lock().unwrap(),
-        vec!["start:", "list:", "list:"]
-    );
+    assert_eq!(*server.requests.lock().unwrap(), vec!["start:", "list:"]);
 }
 
 #[tokio::test]
@@ -686,10 +683,9 @@ async fn late_backend_of_failed_start_is_deleted_not_adopted() {
     };
     let (adapter, _server) = connect(server.clone()).await;
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
-    adapter.remove("i-1").await.unwrap();
+    assert!(adapter.remove("i-1").await.is_err());
     *server.running.lock().unwrap() = true;
-    // Reconciliation discovers the original execution after its failed create
-    // released capacity. It cleans that backend rather than repeating Start.
+    // Targeted cleanup retries discover and remove the late execution.
     adapter.remove("i-1").await.unwrap();
     assert!(!*server.running.lock().unwrap());
     assert!(adapter.start(&spec(), "i-1", 1, &[]).await.is_err());
@@ -760,14 +756,21 @@ fn lifecycle_assignment() -> Assignment {
 }
 
 #[tokio::test]
-async fn failed_create_monitor_removes_late_backend_after_capacity_release() {
+async fn failed_create_retries_late_backend_cleanup_without_polling() {
     let server = Server {
         transport_error: true,
         ..Default::default()
     };
     let (adapter, _server) = connect(server.clone()).await;
     let hooks = Arc::new(LifecycleHooks::default());
-    let node = lifecycle_node(adapter, &hooks);
+    let hub = adxlet::control_stream::RuntimeControlHub::new(vec![7; 32], Duration::from_secs(1))
+        .unwrap();
+    let control = adxlet::runtime_control::RuntimeControlClient::new(50090, Duration::from_secs(1))
+        .unwrap()
+        .with_stream(hub);
+    let node = lifecycle_node(adapter, &hooks)
+        .with_runtime_control(control)
+        .unwrap();
     let environment = node.environment(spec(), lifecycle_assignment()).unwrap();
     assert!(environment.create().await.is_err());
     assert_eq!(node.used(), Resources::default());
@@ -776,7 +779,13 @@ async fn failed_create_monitor_removes_late_backend_after_capacity_release() {
         EnvironmentState::Failed
     );
     *server.running.lock().unwrap() = true;
-    node.monitor_environments().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while *server.running.lock().unwrap() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
     assert!(!*server.running.lock().unwrap());
     assert_eq!(node.used(), Resources::default());
     assert!(environment.create().await.is_err());
@@ -794,14 +803,21 @@ async fn failed_create_monitor_removes_late_backend_after_capacity_release() {
 }
 
 #[tokio::test]
-async fn start_timeout_remains_failed_when_success_response_arrives_late() {
+async fn start_timeout_keeps_targeted_cleanup_for_late_backend() {
     let server = Server {
         release: Arc::new(Semaphore::new(0)),
         ..Default::default()
     };
     let (adapter, _server) = connect(server.clone()).await;
     let hooks = Arc::new(LifecycleHooks::default());
+    let hub = adxlet::control_stream::RuntimeControlHub::new(vec![7; 32], Duration::from_secs(1))
+        .unwrap();
+    let control = adxlet::runtime_control::RuntimeControlClient::new(50090, Duration::from_secs(1))
+        .unwrap()
+        .with_stream(hub);
     let node = lifecycle_node(adapter, &hooks)
+        .with_runtime_control(control)
+        .unwrap()
         .with_operation_timeout(Duration::from_millis(100))
         .unwrap();
     let environment = node.environment(spec(), lifecycle_assignment()).unwrap();
@@ -820,10 +836,26 @@ async fn start_timeout_remains_failed_when_success_response_arrives_late() {
     assert!(!failed.resources_held);
     assert_eq!(node.used(), Resources::default());
     server.release.add_permits(1);
-    tokio::time::timeout(Duration::from_secs(1), node.monitor_environments())
-        .await
-        .unwrap()
-        .unwrap();
+    // The RPC has expired; model a backend completing work after cancellation.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    *server.running.lock().unwrap() = true;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        // Wait for the server's delayed side effect, then automatic cleanup.
+        loop {
+            if server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request == "delete:generated-backend-id")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
     assert!(!*server.running.lock().unwrap());
     let failed = environment.sync().await.unwrap().record;
     assert_eq!(failed.state, EnvironmentState::Failed);
@@ -954,7 +986,7 @@ async fn every_start_error_is_failed_and_absence_allows_cleanup() {
         tonic::Code::Unauthenticated,
     ] {
         // Every failed create is terminal for this execution identity.
-        // A backend arriving later is handled by reconciliation.
+        // A definite rejection needs no late-result cleanup retry.
         let (adapter, _server) = connect(Server {
             unsettled_error: Some(code),
             ..Default::default()
@@ -1800,6 +1832,9 @@ async fn public_authority_cycle_collects_sandboxd_orphan_without_local_controlle
     creator.start(&spec(), "i-1", 1, &[]).await.unwrap();
     assert!(*server.running.lock().unwrap());
     authority.cycle(&node).await.unwrap();
+    assert!(*server.running.lock().unwrap());
+    authority.registration.reconciling = true;
+    authority.cycle(&node).await.unwrap();
     assert!(!*server.running.lock().unwrap());
     assert_eq!(server.starts.lock().unwrap().len(), 1);
     assert_eq!(node.used(), Resources::default());
@@ -1835,6 +1870,9 @@ async fn public_authority_cycle_reaps_transport_lost_create_after_empty_scan() {
     authority.cycle(&node).await.unwrap();
     // The first complete inventory was empty; the failed create materializes later.
     *server.running.lock().unwrap() = true;
+    authority.cycle(&node).await.unwrap();
+    assert!(*server.running.lock().unwrap());
+    authority.registration.reconciling = true;
     authority.cycle(&node).await.unwrap();
     assert!(!*server.running.lock().unwrap());
     assert!(server

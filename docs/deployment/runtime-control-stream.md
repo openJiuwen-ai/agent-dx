@@ -26,13 +26,13 @@ adxctl validate --config /opt/adx/config/deployment.yaml
 
 配置文件需要先保存到指定路径；`validate` 命令只校验，不部署服务。进程启动方式仍见 [adxctl](adxctl.md)。
 
-该开关当前是显式启用。现有 profile 默认未配置 runtime_control，保持 HTTP 控制方式，避免更新 adxlet 后仍使用旧 Execd 的镜像导致就绪失败。启用前必须把新 Execd 装入内置运行时 rootfs 或用户镜像的 bootstrap。对外用户 API、SDK、命令、端口和 tunnel 接口不变；sandboxd 不增加配置字段或补丁。
+`runtime_control` 是 adxlet 的必需配置，示例部署和 E2E 配置均启用。升级时须同时把支持主动控制流的 Execd 装入运行时 rootfs 或 bootstrap。节点缺少配置会在启动时返回明确错误。`metrics_interval_seconds` 默认为 15 秒，独立于心跳与数据对账的 `report_interval_seconds`。
 
 就绪、checkpoint 协作和请求应答走专用双向 gRPC 流；HTTP 控制接口仍可用于独立诊断。网络限制下不能主动回连时应先修复地址与网络配置，启用流模式不会在失败后自动退回 HTTP 轮询。
 
 Execd 在阻塞线程池打开 checkpoint handoff 文件，通过本次 prepare 新建的私有 Unix socket 通知单线程 I/O 调度器；该 socket 在发布 Prepared 前已消费并关闭，不带入快照。后续跨快照的 handoff 读取继续使用阻塞任务的结果通路。客户端断开不会取消已经接纳的准备操作；只有成功打开 handoff 后才发布 Prepared，读取到恢复结果后仍须校验执行身份并重新开放监听器。
 
-健康节点的周期性权威核对使用非阻塞方式申请生命周期独占锁；已接纳的操作仍在执行、且完整目录中的归属与本机一致时，延后本次核对，避免写锁排队阻塞其他 Environment 的 pause/resume。延后期间保留既有生命周期和路由，新分配等待后续完整核对成功。启动恢复、归属变化、权威终止及已关闭准入的路径仍排空已接纳操作，再执行独占核对和清理；延后核对不会授权删除快照或释放运行中的引用。
+正常权威核对从 Coordinator 缓存取得目录，只比较记录归属和版本。运行时清单接管在节点启动或会话恢复时执行。活动、退出、健康失败和 checkpoint 请求由事件及实例截止时间推进，资源采样不推进生命周期。
 
 用户配置 deny-by-default 网络策略时，adxlet 保留到此节点 IPv4／控制 TCP 端口的系统规则，优先级为平台保留的最大值。创建和运行期策略更新均使用同一转换；stateless 策略也允许该端点的应答。其他目标、其他端口和用户 DNS 策略保持原限制。该例外不能由 SDK env 改写，仍需执行身份凭证认证。
 

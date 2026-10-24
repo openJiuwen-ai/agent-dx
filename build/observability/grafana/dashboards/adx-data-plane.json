@@ -693,6 +693,23 @@
       "includeVars": true,
       "keepTime": true,
       "targetBlank": false
+    },
+    {
+      "title": "Environment Logs",
+      "type": "link",
+      "url": "/d/adx-environment-logs",
+      "includeVars": true,
+      "keepTime": false,
+      "targetBlank": false,
+      "tooltip": "Open on-demand log search, initially the last 15 minutes."
+    },
+    {
+      "title": "Environments",
+      "type": "link",
+      "url": "/d/adx-environments",
+      "includeVars": true,
+      "keepTime": false,
+      "targetBlank": false
     }
   ]
 }

@@ -128,13 +128,33 @@ impl Session {
             for (field, value) in writes {
                 command.arg(field).arg(value);
             }
+            let cached_holds = holds
+                .iter()
+                .map(|(field, value)| {
+                    Ok((field.clone(), decode::<artifacts::ExecutionHold>(value)?))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?;
             for (field, value) in holds {
                 command.arg(field).arg(value);
             }
-            if self.store.query::<u8>(command).await? == 1 {
+            let mut inventory = self.inspection.lock().await;
+            let mut committed = inventory.take();
+            let applied = match self.store.query::<u8>(command).await {
+                Ok(applied) => applied,
+                Err(error) => {
+                    *inventory = None;
+                    return Err(error);
+                }
+            };
+            if applied == 1 {
+                if let Some(inventory) = committed.as_mut() {
+                    inventory.holds.extend(cached_holds);
+                }
+                *inventory = committed;
                 self.store.notify_committed_change(header.revision, changed);
                 return Ok(saved);
             }
+            *inventory = committed;
         }
         Err(Error::Unavailable(
             "concurrent node invalidation; retry request".into(),

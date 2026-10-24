@@ -25,7 +25,7 @@ use proto::{
 pub struct BindingService {
     proxy: Arc<Relay>,
     session: String,
-    state: Mutex<Bindings>,
+    state: Arc<Mutex<Bindings>>,
 }
 #[derive(Default)]
 struct Bindings {
@@ -41,7 +41,7 @@ impl BindingService {
         Self {
             proxy,
             session: uuid::Uuid::new_v4().to_string(),
-            state: Mutex::default(),
+            state: Arc::default(),
         }
     }
     fn state_message(&self, s: &Bindings) -> proto::BindingState {
@@ -73,6 +73,7 @@ impl BindingService {
         s.ready = false;
         s.snapshot = None;
         self.proxy.clear_bindings();
+        self.proxy.notify_activity_change();
         Ok(self.state_message(&s))
     }
     pub async fn replace(
@@ -136,6 +137,7 @@ impl BindingService {
         s.versions = next;
         s.snapshot = Some(request);
         s.ready = true;
+        self.proxy.notify_activity_change();
         self.proxy.set_bindings_ready(true);
         Ok(self.state_message(&s))
     }
@@ -217,6 +219,95 @@ fn ack(request: &UpdateBindingRequest) -> UpdateBindingResponse {
 }
 #[tonic::async_trait]
 impl RelayService for BindingService {
+    type WatchActivityStream =
+        tokio_stream::wrappers::ReceiverStream<Result<proto::ProxyActivitySnapshot, Status>>;
+
+    async fn watch_activity(
+        &self,
+        _: Request<proto::GetBindingStateRequest>,
+    ) -> Result<Response<Self::WatchActivityStream>, Status> {
+        let mut changes = self
+            .proxy
+            .activity_changes()
+            .ok_or_else(|| Status::unavailable("activity tracking disabled"))?;
+        let state = self.state.clone();
+        let proxy = self.proxy.clone();
+        let session = self.session.clone();
+        let (send, receive) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            let mut previous = HashMap::new();
+            let mut initial = true;
+            loop {
+                changes.borrow_and_update();
+                let current: HashMap<_, _> = {
+                    let state = state.lock().await;
+                    state
+                        .versions
+                        .iter()
+                        .filter_map(|(id, version)| {
+                            if !state.ready {
+                                return None;
+                            }
+                            let Some(Binding::Active(target)) = &version.binding else {
+                                return None;
+                            };
+                            let (revision, active_streams) = proxy.instance_activity(id)?;
+                            Some((
+                                id.clone(),
+                                proto::ProxyActivity {
+                                    environment_id: id.clone(),
+                                    runtime_id: target.runtime_id.clone(),
+                                    revision,
+                                    active_streams,
+                                    removed: false,
+                                },
+                            ))
+                        })
+                        .collect()
+                };
+                let mut environments: Vec<_> = current
+                    .iter()
+                    .filter(|(id, row)| previous.get(*id) != Some(*row))
+                    .map(|(_, row)| row.clone())
+                    .collect();
+                environments.extend(
+                    previous
+                        .iter()
+                        .filter(|(id, row)| {
+                            current
+                                .get(*id)
+                                .is_none_or(|next| next.runtime_id != row.runtime_id)
+                        })
+                        .map(|(_, row)| {
+                            let mut row = row.clone();
+                            row.removed = true;
+                            row
+                        }),
+                );
+                if initial || !environments.is_empty() {
+                    let snapshot = proto::ProxyActivitySnapshot {
+                        proxy_session_id: session.clone(),
+                        environments,
+                        reset: initial,
+                    };
+                    if send.send(Ok(snapshot)).await.is_err() {
+                        break;
+                    }
+                }
+                initial = false;
+                previous = current;
+                tokio::select! {
+                    result = changes.changed() => { if result.is_err() { break; } },
+                    _ = send.closed() => break,
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            receive,
+        )))
+    }
+
     async fn set_environment_admission(
         &self,
         request: Request<proto::EnvironmentAdmissionRequest>,

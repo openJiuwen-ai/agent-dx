@@ -13,5 +13,6 @@
     "redis_url": "redis://127.0.0.1:6379/",
     "namespace": "adx",
     "poll_seconds": 5
-  }
+  },
+  "metrics_listen": "127.0.0.1:19092"
 }

@@ -1,0 +1,18 @@
+{
+  "groups": [
+    {
+      "name": "adx-creation",
+      "interval": "15s",
+      "rules": [
+        {
+          "record": "adx:environment_create_request_qps:rate1m",
+          "expr": "sum by (adx_env) (rate(adx_environment_create_requests_total[1m]))"
+        },
+        {
+          "record": "adx:environment_created_qps:rate1m",
+          "expr": "sum by (adx_env) (rate(adx_environment_created_total[1m]))"
+        }
+      ]
+    }
+  ]
+}

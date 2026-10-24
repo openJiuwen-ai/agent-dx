@@ -88,10 +88,27 @@ impl Session {
         "#).arg(2).arg(&self.store.key).arg(format!("{}:input-holds",self.store.key))
             .arg(header.as_deref().ok_or(Error::Conflict)?).arg(format!("node:{node}"))
             .arg(raw_node.as_deref().ok_or(Error::Conflict)?).arg(node);
-        if self.store.query::<u64>(cmd).await? != 1 {
-            return Err(Error::Conflict);
+        let mut inventory = self.inspection.lock().await;
+        let mut committed = inventory.take();
+        match self.store.query::<u64>(cmd).await {
+            Ok(1) => {
+                if let Some(inventory) = committed.as_mut() {
+                    inventory
+                        .holds
+                        .retain(|_, hold| hold.assignment.node_id != node);
+                }
+                *inventory = committed;
+                Ok(())
+            }
+            Ok(_) => {
+                *inventory = committed;
+                Err(Error::Conflict)
+            }
+            Err(error) => {
+                *inventory = None;
+                Err(error)
+            }
         }
-        Ok(())
     }
     pub async fn shared_artifacts(&self) -> Result<Vec<CheckpointArtifact>> {
         let [header] = self.store.fields([HEADER.into()]).await?;

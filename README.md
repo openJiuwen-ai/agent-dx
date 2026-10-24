@@ -250,3 +250,5 @@ The SDK distribution is `adx-environment`, its Python import is `adx_environment
 ## License
 
 Agent DX is released under the [Apache License 2.0](LICENSE).
+
+Creation throughput, Running/Paused views and tiered resource collection: [observability capacity](docs/testing/observability-capacity.md).

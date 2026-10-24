@@ -431,6 +431,36 @@ impl Rig {
             target,
         }
     }
+    async fn restart_coordinator(&mut self, register_nodes: bool) {
+        self.server.abort();
+        let _ = (&mut self.server).await;
+        self.session = self._redis.store().await.begin(1).await.unwrap();
+        self.rpc = CoordinatorRpc::new(
+            self.session.clone(),
+            Placement::Pack,
+            Peers::network(),
+            RpcClient::network(Principal::Coordinator),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        let listener = TcpListener::bind(&self.address).await.unwrap();
+        let service = self.rpc.clone();
+        self.server = tokio::spawn(async move {
+            Server::builder()
+                .add_service(pb::coordinator_service_server::CoordinatorServiceServer::new(service))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        if register_nodes {
+            for worker in [&mut self.source, &mut self.target] {
+                worker.report.heartbeat_sequence += 1;
+                worker.report.reconciling = true;
+                register(&self.address, worker).await;
+            }
+        }
+    }
     async fn resume(
         &self,
         traffic: bool,
@@ -1004,9 +1034,47 @@ async fn sleeping_node_loss_only_restores_after_demand() {
 
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
+async fn cached_background_sweep_retries_a_live_committed_wake_after_timeout() {
+    let rig = Rig::new(Duration::from_secs(2)).await;
+    let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        channel(&rig.address, Principal::ApiServer).await,
+    );
+    client
+        .set_node_scheduling(pb::SetNodeSchedulingRequest {
+            node_id: "a".into(),
+            accepting_allocations: false,
+        })
+        .await
+        .unwrap();
+    let error = client
+        .ensure_running(pb::EnsureRunningRequest {
+            expected_runtime_id: "sleep-1".into(),
+            environment_id: "sleep".into(),
+            caller: caller(),
+            timeout_seconds: 1,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+    assert!(rig.session.get("sleep").await.unwrap().resume.is_some());
+    client
+        .set_node_scheduling(pb::SetNodeSchedulingRequest {
+            node_id: "a".into(),
+            accepting_allocations: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(rig.rpc.resume_pending().await.unwrap(), 1);
+    assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 1);
+    assert!(rig.session.get("sleep").await.unwrap().resume.is_none());
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
 async fn redis_restart_preserves_pending_wake_and_restore_point() {
     let mut rig = Rig::new(Duration::from_secs(2)).await;
     let pending = rig.session.request_resume("sleep", 1).await.unwrap();
+    rig.restart_coordinator(true).await;
     rig._redis.crash();
     rig._redis.start().await;
     let after = tokio::time::timeout(Duration::from_secs(2), async {
@@ -1032,32 +1100,7 @@ async fn redis_restart_preserves_pending_wake_and_restore_point() {
 async fn coordinator_restart_reconciles_the_durable_wake_without_new_identity() {
     let mut rig = Rig::new(Duration::from_secs(2)).await;
     let pending = rig.session.request_resume("sleep", 1).await.unwrap();
-    rig.server.abort();
-    let _ = (&mut rig.server).await;
-    rig.session = rig._redis.store().await.begin(1).await.unwrap();
-    rig.rpc = CoordinatorRpc::new(
-        rig.session.clone(),
-        Placement::Pack,
-        Peers::network(),
-        RpcClient::network(Principal::Coordinator),
-        Duration::from_secs(2),
-    )
-    .await
-    .unwrap();
-    let listener = TcpListener::bind(&rig.address).await.unwrap();
-    let service = rig.rpc.clone();
-    rig.server = tokio::spawn(async move {
-        Server::builder()
-            .add_service(pb::coordinator_service_server::CoordinatorServiceServer::new(service))
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-            .unwrap();
-    });
-    for worker in [&mut rig.source, &mut rig.target] {
-        worker.report.heartbeat_sequence += 1;
-        worker.report.reconciling = true;
-        register(&rig.address, worker).await;
-    }
+    rig.restart_coordinator(true).await;
     assert_eq!(
         rig.session.get("sleep").await.unwrap().resume,
         pending.resume
@@ -1667,12 +1710,15 @@ async fn expired_dormant_restore_point_cannot_be_awakened() {
 #[ignore = "requires dedicated real Redis"]
 async fn deletion_and_expiry_retire_dormancy_when_the_source_is_lost() {
     for expired in [false, true] {
-        let rig = Rig::with_ttl(Duration::from_secs(2), if expired { 1 } else { 3600 }).await;
+        let mut rig = Rig::with_ttl(Duration::from_secs(2), if expired { 1 } else { 3600 }).await;
         rig.session
             .invalidate_node("a", &rig.source.report.session_id)
             .await
             .unwrap();
         if expired {
+            // Load the staged lost-node catalog through startup, as production
+            // invalidation normally updates the live Coordinator cache itself.
+            rig.restart_coordinator(false).await;
             tokio::time::sleep(Duration::from_millis(1100)).await;
             assert_eq!(rig.rpc.expire_dormant().await.unwrap(), 1);
         } else {
@@ -1704,13 +1750,14 @@ async fn deletion_and_expiry_retire_dormancy_when_the_source_is_lost() {
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
 async fn background_resume_round_does_not_starve_later_intents() {
-    let rig = Rig::new(Duration::from_secs(2)).await;
+    let mut rig = Rig::new(Duration::from_secs(2)).await;
     let template = rig.session.get("sleep").await.unwrap().result.unwrap();
     for index in 0..16 {
         let id = format!("a-blocked-{index:02}");
         let mut record = template.clone();
         record.spec.id = id.clone();
         record.assignment.environment_id = id.clone();
+        record.assignment.node_id = "b".into();
         record.assignment.generation = index + 2;
         record.runtime.id = format!("{id}-{}", index + 2);
         record.checkpoint.as_mut().unwrap().source_runtime_id = record.runtime.id.clone();
@@ -1722,6 +1769,12 @@ async fn background_resume_round_does_not_starve_later_intents() {
         rig.session.request_resume(&id, 1).await.unwrap();
     }
     rig.session.request_resume("sleep", 1).await.unwrap();
+    // Only the source rejoins. The staged intents on b remain blocked and
+    // must not prevent the next bounded round from reaching the live source.
+    rig.restart_coordinator(false).await;
+    rig.source.report.heartbeat_sequence += 1;
+    rig.source.report.reconciling = true;
+    register(&rig.address, &mut rig.source).await;
     rig.rpc.resume_pending().await.unwrap();
     assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 0);
     rig.rpc.resume_pending().await.unwrap();

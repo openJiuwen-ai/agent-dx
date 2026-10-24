@@ -114,6 +114,9 @@ impl RuntimeDriver for RuntimeRouter {
             Err(e) => Err(e),
         }
     }
+    async fn wait_exit(&self, id: &str) -> Result<adx_core::RuntimeFailure> {
+        self.owner(id).await?.wait_exit(id).await
+    }
     async fn observe(&self, id: &str) -> Result<RuntimeStatus> {
         match self.owner(id).await {
             Ok(r) => r.observe(id).await,

@@ -278,7 +278,6 @@ impl Adxlet {
                 .environments
                 .lock()
                 .expect("shared state lock poisoned");
-            self.ensure_not_cleaning(&record.spec.id)?;
             if let Some((spec, owner, handle)) = environments.get(&record.spec.id) {
                 if *spec != record.spec || *owner != record.assignment {
                     return Err(Error::Conflict);

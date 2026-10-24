@@ -1,5 +1,6 @@
 //! Versioned bindings and complete startup synchronization over a protected UDS.
 use crate::Routes;
+mod activity;
 use adx_core::{EnvironmentRecord, Error, Result};
 use adx_protocol::relay::{
     self as pb, relay_service_client::RelayServiceClient, update_binding_request::Binding, Retired,
@@ -25,6 +26,7 @@ pub struct UdsRoutes {
     local: Arc<Mutex<Local>>,
     sync: Arc<Mutex<()>>,
     owner: String,
+    activity: Arc<activity::ActivityHub>,
 }
 impl UdsRoutes {
     pub fn new(path: PathBuf, timeout: Duration) -> Result<Self> {
@@ -39,21 +41,30 @@ impl UdsRoutes {
             local: Arc::default(),
             sync: Arc::default(),
             owner: uuid::Uuid::new_v4().to_string(),
+            activity: Arc::default(),
         })
     }
     async fn connect(&self) -> Result<RelayServiceClient<Channel>> {
-        let path = self.path.clone();
+        Self::connect_at(self.path.clone(), self.timeout).await
+    }
+    async fn connect_at(path: PathBuf, timeout: Duration) -> Result<RelayServiceClient<Channel>> {
         let channel = tokio::time::timeout(
-            self.timeout,
-            Endpoint::from_static("http://relay").connect_with_connector(service_fn(move |_| {
-                let path = path.clone();
-                async move { UnixStream::connect(path).await.map(TokioIo::new) }
-            })),
+            timeout,
+            Endpoint::from_static("http://relay")
+                .http2_keep_alive_interval(Duration::from_secs(30))
+                .keep_alive_timeout(Duration::from_secs(10))
+                .keep_alive_while_idle(true)
+                .connect_with_connector(service_fn(move |_| {
+                    let path = path.clone();
+                    async move { UnixStream::connect(path).await.map(TokioIo::new) }
+                })),
         )
         .await
         .map_err(|_| unavailable("connection deadline"))?
         .map_err(unavailable)?;
-        Ok(RelayServiceClient::new(channel).max_encoding_message_size(64 * 1024 * 1024))
+        Ok(RelayServiceClient::new(channel)
+            .max_encoding_message_size(64 * 1024 * 1024)
+            .max_decoding_message_size(64 * 1024 * 1024))
     }
     fn request<T>(&self, message: T) -> tonic::Request<T> {
         let mut r = tonic::Request::new(message);
@@ -267,6 +278,25 @@ impl Routes for UdsRoutes {
             .await
             .map_err(rpc_error)?;
         Ok(())
+    }
+    async fn activity_changed(
+        &self,
+        record: &EnvironmentRecord,
+        previous: Option<(String, u64, u64)>,
+    ) -> Result<(String, u64, u64)> {
+        let mut changes = self.activity_receiver(record);
+        loop {
+            let current = changes.borrow_and_update().clone();
+            if current != previous {
+                return current.ok_or_else(|| {
+                    unavailable("proxy activity disconnected or execution binding changed")
+                });
+            }
+            changes
+                .changed()
+                .await
+                .map_err(|_| unavailable("proxy activity subscription closed"))?;
+        }
     }
     async fn activity(&self, record: &EnvironmentRecord) -> Result<(String, u64, u64)> {
         let mut client = self.connect().await?;

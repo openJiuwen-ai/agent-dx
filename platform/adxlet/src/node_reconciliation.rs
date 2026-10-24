@@ -117,7 +117,8 @@ pub async fn reconcile_node(
     // Admission can close after a failed cleanup/report. That does not make
     // already recovered controllers need startup recovery again.
     let periodic = manager.authority_initialized.load(Ordering::Acquire)
-        && registration.heartbeat_sequence > 0;
+        && registration.heartbeat_sequence > 0
+        && !registration.reconciling;
     manager.authority_reconciling.store(true, Ordering::Release);
     // Startup withdraws routability until recovery completes. A validated live
     // session only closes new allocation while refreshing its authority catalog.

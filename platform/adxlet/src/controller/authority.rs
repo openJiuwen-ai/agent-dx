@@ -1,10 +1,8 @@
 //! A periodic comparison owns only this controller's serial queue.
 use super::*;
-use crate::RuntimeObservation;
 
 pub(crate) struct AuthorityCheck {
     pub record: Option<EnvironmentRecord>,
-    pub actual: Vec<RuntimeObservation>,
     pub references: Option<Arc<CheckpointReferences>>,
 }
 
@@ -16,6 +14,24 @@ pub(crate) enum AuthorityResult {
 }
 
 impl Controller {
+    pub(super) fn authority_trace(
+        &self,
+        check: &AuthorityCheck,
+    ) -> Option<adx_observability::trace::Trace> {
+        // Classify only telemetry here. Every check still executes the same
+        // ownership, publication and cleanup logic below in the serial queue.
+        if !self.authority_fenced
+            && !self.retired
+            && self.durability == Some(Durability::Published)
+            && check.record.as_ref() == Some(&self.record)
+        {
+            return None;
+        }
+        let trace = adx_observability::trace::Trace::child("environment.authority_reconcile");
+        trace.attribute("environment.id", self.record.spec.id.clone());
+        Some(trace)
+    }
+
     fn compare_authority(&self, record: &EnvironmentRecord) -> Result<AuthorityComparison> {
         if self.durability != Some(Durability::Published) {
             return Ok(AuthorityComparison::Unpublished);
@@ -37,7 +53,6 @@ impl Controller {
     ) -> Result<AuthorityResult> {
         let Some(record) = check.record else {
             self.discard_execution(check.references.as_deref()).await?;
-            self.remove_unowned(&check.actual, None).await?;
             return Ok(AuthorityResult::Retired);
         };
         if record.assignment.generation < self.record.assignment.generation {
@@ -77,24 +92,10 @@ impl Controller {
                 self.retired = false;
                 self.durability = Some(Durability::Published);
             }
-            self.remove_unowned(&check.actual, None).await?;
             return Ok(AuthorityResult::Current);
         }
         self.align_authority(record.clone()).await?;
-        let current_runtime = self.record.runtime.id.clone();
-        self.remove_unowned(&check.actual, Some(&current_runtime))
-            .await?;
-        let execution_matches = match record.state {
-            EnvironmentState::Running => check
-                .actual
-                .iter()
-                .any(|r| r.runtime_id == current_runtime && r.running),
-            EnvironmentState::Paused => {
-                !check.actual.iter().any(|r| r.runtime_id == current_runtime)
-            }
-            _ => false,
-        };
-        if comparison != AuthorityComparison::Published || !execution_matches {
+        if comparison != AuthorityComparison::Published {
             let result = self.reconcile().await?;
             if result.durability != Durability::Published {
                 return Err(Error::Unavailable(
@@ -103,27 +104,6 @@ impl Controller {
             }
         }
         Ok(AuthorityResult::Current)
-    }
-
-    async fn remove_unowned(
-        &self,
-        actual: &[RuntimeObservation],
-        keep: Option<&str>,
-    ) -> Result<()> {
-        for runtime in actual
-            .iter()
-            .filter(|r| Some(r.runtime_id.as_str()) != keep)
-        {
-            timeout(self.services.operation_timeout, async {
-                if runtime.generation != self.record.assignment.generation {
-                    self.services.routes.retire_orphan(runtime).await?;
-                }
-                self.services.runtime.remove(&runtime.runtime_id).await
-            })
-            .await
-            .map_err(|_| Error::Unavailable("orphan cleanup timed out".into()))??;
-        }
-        Ok(())
     }
 }
 

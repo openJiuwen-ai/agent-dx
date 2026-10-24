@@ -54,6 +54,18 @@ impl Api {
         self: Arc<Self>,
         request: Request<Incoming>,
     ) -> Result<Response<Body>, Infallible> {
+        if request.method() == hyper::Method::POST
+            && percent_encoding::percent_decode_str(request.uri().path())
+                .decode_utf8()
+                .is_ok_and(|path| {
+                    matches!(
+                        path.trim_end_matches('/'),
+                        "/api/environment/v1/environments" | "/api/environment/create"
+                    )
+                })
+        {
+            self.environment_service.creation_metrics.http_request();
+        }
         let trace = trace::Trace::http(
             request.method().as_str(),
             trace::http_route(request.uri().path()),
@@ -473,9 +485,7 @@ impl Api {
                     .boxed_unsync(),
             )
             .expect("static event-stream response is valid");
-        let trace = trace::Trace::child("apiserver.create_stream");
-        let started = Instant::now();
-        tokio::spawn(trace.run(async move {
+        tokio::spawn(trace::with_current_context(async move {
             let accepted = json!({"status":"creating", "requestId":request_id});
             if sender.send(Ok(sse("accepted", accepted))).await.is_err() {
                 return;
@@ -495,15 +505,6 @@ impl Api {
                     }
                 }
             };
-            adx_observability::info!(
-                event = "environment_create_stream_completed",
-                request_id,
-                environment_id = %instance_id,
-                duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
-                succeeded = result.is_ok(),
-                status_code = result.as_ref().err().map_or("OK", |error| error.code().description()),
-                "Environment create stream completed"
-            );
             let final_event = match result {
                 Ok(value) => value,
                 Err(error) => create_error_event(&error, &request_id, &instance_id),

@@ -236,6 +236,34 @@ impl Controller {
         self.publish(&mut state);
         Ok(state.status.clone())
     }
+    pub fn quiesce_idle(
+        &self,
+        identity: &RuntimeIdentity,
+        activity_revision: u64,
+    ) -> Result<RuntimeStatus> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Unavailable("runtime state lock poisoned".into()))?;
+        if state.status.identity != *identity || state.status.phase != RuntimePhase::Running {
+            return Err(Error::Conflict);
+        }
+        super::activity::quiesce(activity_revision)?;
+        drop(state);
+        Ok(self.status())
+    }
+    pub fn reopen_idle(&self, identity: &RuntimeIdentity) -> Result<RuntimeStatus> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| Error::Unavailable("runtime state lock poisoned".into()))?;
+        if state.status.identity != *identity || state.status.phase != RuntimePhase::Running {
+            return Err(Error::Conflict);
+        }
+        super::activity::reopen();
+        drop(state);
+        Ok(self.status())
+    }
     pub fn status(&self) -> RuntimeStatus {
         let mut status = self.state.lock().unwrap().status.clone();
         status.active_requests = super::activity::active_count().max(0) as u64;

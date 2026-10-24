@@ -47,3 +47,5 @@ tempfile = "3"
 [dev-dependencies]
 async-trait = "0.1"
 adxlet = { path = "../../adxlet" }
+opentelemetry = { version = "0.31", features = ["trace"] }
+opentelemetry_sdk = { version = "0.31", features = ["trace", "testing"] }

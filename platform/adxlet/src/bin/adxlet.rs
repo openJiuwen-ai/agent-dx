@@ -11,16 +11,10 @@ use adxlet::{
     runtime_logs::{RuntimeLogPolicy, RuntimeLogs},
     runtime_router::RuntimeRouter,
     sandboxd::{connect_when_ready, Config as RuntimeConfig},
-    Adxlet, RuntimeDriver,
+    Adxlet,
 };
 use serde::Deserialize;
-use std::{
-    collections::{HashMap, HashSet},
-    net::SocketAddr,
-    path::PathBuf,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -63,6 +57,8 @@ struct Config {
     #[serde(default)]
     degradation_journal: Option<PathBuf>,
     report_interval_seconds: u64,
+    #[serde(default = "metrics_interval")]
+    metrics_interval_seconds: u64,
     rpc_timeout_seconds: u64,
     #[serde(default = "runtime_ready_timeout")]
     runtime_ready_timeout_seconds: u64,
@@ -88,6 +84,9 @@ struct PressureConfig {
     disk_path: PathBuf,
     #[serde(default)]
     thresholds: PressurePolicy,
+}
+fn metrics_interval() -> u64 {
+    15
 }
 fn runtime_ready_timeout() -> u64 {
     120
@@ -131,12 +130,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if config.sandboxd_socket.is_none() && config.jiuwenbox.is_none() {
         return Err("configure sandboxd_socket and/or jiuwenbox".into());
     }
+    if config.runtime_control.is_none() {
+        return Err("runtime_control is required for event-driven lifecycle observations".into());
+    }
     let runtime_logs = RuntimeLogs::new(config.runtime_logs.clone())?;
     // Embedded Proxy and Adxlet share this process-wide subscriber and
     // tracer provider; standalone Proxy initializes the same library itself.
     let _logging_guard = adx_observability::logging::init("adxlet", false)?;
     if config.node_id.is_empty()
         || config.report_interval_seconds == 0
+        || config.metrics_interval_seconds == 0
         || config.rpc_timeout_seconds == 0
         || config.runtime_ready_timeout_seconds == 0
     {
@@ -471,21 +474,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let monitoring = async {
         let mut interval =
-            tokio::time::interval(Duration::from_secs(config.report_interval_seconds));
+            tokio::time::interval(Duration::from_secs(config.metrics_interval_seconds));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            if let Err(error) = manager.monitor_environments().await {
+            if let Err(error) = manager.sample_metrics().await {
                 adx_observability::warn!("environment observation incomplete: {error}");
-            }
-        }
-    };
-    let expiry = async {
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        loop {
-            interval.tick().await;
-            if let Err(error) = manager.expire_checkpoints().await {
-                adx_observability::warn!("checkpoint expiry incomplete: {error}");
             }
         }
     };
@@ -495,14 +489,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            let active: HashSet<String> = match runtime.inventory().await {
-                Ok(inventory) => inventory.into_iter().map(|item| item.runtime_id).collect(),
-                Err(error) => {
-                    adx_observability::warn!(
-                        "runtime log GC skipped; backend inventory unavailable: {error}"
-                    );
-                    continue;
-                }
+            let Some(active) = manager.retained_runtime_ids() else {
+                continue;
             };
             let logs = runtime_logs.clone();
             match tokio::task::spawn_blocking(move || {
@@ -538,32 +526,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Ok::<(), tonic::transport::Error>(())
     };
-    let control_events = async {
-        if let Some((_, hub)) = &stream_setup {
-            let mut events = hub.take_events()?;
-            let mut tasks = tokio::task::JoinSet::new();
-            loop {
-                tokio::select! {
-                    event = events.recv(), if tasks.len() < 32 => {
-                        let Some(identity) = event else { break; };
-                        let manager = manager.clone();
-                        tasks.spawn(async move { manager.observe_runtime_event(&identity).await });
-                    }
-                    result = tasks.join_next(), if !tasks.is_empty() => {
-                        match result {
-                            Some(Ok(Ok(()))) => (),
-                            Some(Ok(Err(error))) => adx_observability::warn!("runtime control event processing incomplete: {error}"),
-                            Some(Err(error)) => adx_observability::warn!("runtime control event task failed: {error}"),
-                            None => (),
-                        }
-                    }
-                }
-            }
-        } else {
-            std::future::pending::<()>().await;
-        }
-        Ok::<(), adx_core::Error>(())
-    };
     let proxy_failure = async {
         match &mut embedded {
             Some(proxy) => proxy.failed().await,
@@ -573,13 +535,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::select! {
         result = proxy_failure => result?,
         result = control_server => result?,
-        result = control_events => result?,
         result = &mut server => result?,
         result = report => result?,
         result = metrics => result?,
         _ = claim_retries => {}
         _ = monitoring => {}
-        _ = expiry => {}
         _ = log_gc => {}
         result = admin => result.map_err(|error| -> Box<dyn std::error::Error> { error })?,
         _ = shutdown() => {}

@@ -732,6 +732,18 @@ async fn concurrent_local_entries_converge_and_fallback_preserves_both_ledgers()
         .unwrap()
         .into_inner();
     assert_eq!(replay.record.as_ref(), Some(&record));
+    assert!(rig
+        .rpc
+        .metrics()
+        .await
+        .unwrap()
+        .contains("adx_environment_created_total 1\n"));
+    assert!(rig
+        .rpc
+        .environment_metrics()
+        .await
+        .unwrap()
+        .contains("adx_environment_info{environment_id=\"same\",node_id="));
     let mut changed = Rig::request("same", 1);
     changed
         .create
@@ -770,6 +782,7 @@ async fn concurrent_local_entries_converge_and_fallback_preserves_both_ledgers()
         200
     );
     let metrics = rig.rpc.metrics().await.unwrap();
+    assert!(metrics.contains("adx_environment_created_total 2\n"));
     assert!(metrics
         .contains("adx_coordinator_node_reserved_cpu_millis{shard_id=\"0\",node_id=\"a\"} 100"));
     assert!(metrics

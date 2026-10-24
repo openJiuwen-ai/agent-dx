@@ -8,6 +8,7 @@ pub mod environment_service;
 pub mod errors;
 pub mod http;
 pub mod ingress;
+pub mod metrics;
 pub mod operations;
 pub mod ownership;
 

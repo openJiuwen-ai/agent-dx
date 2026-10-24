@@ -119,6 +119,13 @@ async fn start<T: RelayService>(service: T) -> (Server, UdsRoutes) {
 struct Handler(Arc<BindingService>);
 #[tonic::async_trait]
 impl RelayService for Handler {
+    type WatchActivityStream = <BindingService as RelayService>::WatchActivityStream;
+    async fn watch_activity(
+        &self,
+        request: Request<pb::GetBindingStateRequest>,
+    ) -> Result<Response<Self::WatchActivityStream>, Status> {
+        self.0.watch_activity(request).await
+    }
     async fn set_environment_admission(
         &self,
         request: Request<pb::EnvironmentAdmissionRequest>,
@@ -225,6 +232,15 @@ struct ConcurrentUpdates {
 
 #[tonic::async_trait]
 impl RelayService for ConcurrentUpdates {
+    type WatchActivityStream =
+        tokio_stream::wrappers::ReceiverStream<Result<pb::ProxyActivitySnapshot, Status>>;
+    async fn watch_activity(
+        &self,
+        _: Request<pb::GetBindingStateRequest>,
+    ) -> Result<Response<Self::WatchActivityStream>, Status> {
+        Err(Status::unimplemented("fixture activity stream"))
+    }
+
     async fn set_environment_admission(
         &self,
         _: Request<pb::EnvironmentAdmissionRequest>,
@@ -302,6 +318,15 @@ async fn independent_binding_updates_do_not_wait_for_each_other() {
 }
 #[tonic::async_trait]
 impl RelayService for Delayed {
+    type WatchActivityStream =
+        tokio_stream::wrappers::ReceiverStream<Result<pb::ProxyActivitySnapshot, Status>>;
+    async fn watch_activity(
+        &self,
+        _: Request<pb::GetBindingStateRequest>,
+    ) -> Result<Response<Self::WatchActivityStream>, Status> {
+        Err(Status::unimplemented("fixture activity stream"))
+    }
+
     async fn set_environment_admission(
         &self,
         _: Request<pb::EnvironmentAdmissionRequest>,
@@ -526,4 +551,47 @@ async fn periodic_reconciliation_preserves_ready_binding_session() {
         adapter.finish_reconcile().await.unwrap();
         assert_eq!(handler.inspect().await, before);
     }
+}
+
+#[tokio::test]
+async fn activity_subscription_preserves_bursts_and_reports_binding_retirement() {
+    let tracker = Arc::new(data_plane_gateway::node::activity::ActivityTracker::new(
+        "activity",
+    ));
+    let proxy = Arc::new(
+        Relay::new(GatewayPolicy::new(vec![]))
+            .with_route_enforcement()
+            .with_activity_tracker(tracker.clone()),
+    );
+    let service = Arc::new(BindingService::new(proxy));
+    let (_server, routes) = start(Handler(service)).await;
+    routes.activate(&record()).await.unwrap();
+    let initial = tokio::time::timeout(
+        Duration::from_secs(2),
+        routes.activity_changed(&record(), None),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(initial.2, 0);
+    tracker.activate("i");
+    tracker.deactivate("i");
+    let after = tokio::time::timeout(
+        Duration::from_secs(2),
+        routes.activity_changed(&record(), Some(initial.clone())),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(after.0, initial.0);
+    assert!(after.1 > initial.1);
+    assert_eq!(after.2, 0);
+    routes.retire(&record()).await.unwrap();
+    assert!(tokio::time::timeout(
+        Duration::from_secs(2),
+        routes.activity_changed(&record(), Some(after))
+    )
+    .await
+    .unwrap()
+    .is_err());
 }

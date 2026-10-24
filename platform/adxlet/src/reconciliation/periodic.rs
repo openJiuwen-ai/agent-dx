@@ -101,13 +101,7 @@ impl Adxlet {
         wait: std::time::Duration,
     ) -> Result<ReconciliationOutcome> {
         let catalog = Catalog::new(&self.node_id, records, snapshots, Some(retained))?;
-        let actual = tokio::time::timeout(self.services.operation_timeout, async {
-            self.services.runtime.reconcile_unowned_executions().await?;
-            self.services.runtime.inventory().await
-        })
-        .await
-        .map_err(|_| Error::Unavailable("inventory timed out".into()))??;
-        validate_inventory(&actual, &catalog.records)?;
+
         if self.is_draining() {
             return Err(Error::Unavailable("node is draining".into()));
         }
@@ -158,31 +152,6 @@ impl Adxlet {
                 Err(error) => failure = Some(error),
             }
         }
-        let orphan_groups = {
-            let controllers = self
-                .environments
-                .lock()
-                .expect("shared state lock poisoned");
-            let holds = self.local_holds.lock().expect("shared state lock poisoned");
-            let mut cleaning = self
-                .orphan_cleanup
-                .lock()
-                .expect("shared state lock poisoned");
-            for runtime in actual.iter().filter(|runtime| {
-                !catalog.records.contains_key(&runtime.environment_id)
-                    && !controllers.contains_key(&runtime.environment_id)
-                    && !holds.contains_key(&runtime.environment_id)
-            }) {
-                let pending = cleaning.entry(runtime.environment_id.clone()).or_default();
-                if !pending
-                    .iter()
-                    .any(|old| old.runtime_id == runtime.runtime_id)
-                {
-                    pending.push(runtime.clone());
-                }
-            }
-            cleaning.clone()
-        };
         for (id, reservation) in basis.holds {
             if !catalog.records.contains_key(&id) {
                 self.release_local(&id, &reservation)?;
@@ -193,11 +162,6 @@ impl Adxlet {
         self.authority_reconciling.store(false, Ordering::Release);
         for (id, (assignment, handle)) in work {
             let record = catalog.records.get(&id).cloned();
-            let actual = actual
-                .iter()
-                .filter(|runtime| runtime.environment_id == id)
-                .cloned()
-                .collect();
             let references = catalog.references.clone();
             let manager = self.clone();
             let gate = _gate.clone();
@@ -206,7 +170,6 @@ impl Adxlet {
                 let result = handle
                     .check_authority(AuthorityCheck {
                         record: record.clone(),
-                        actual,
                         references: references.clone(),
                     })
                     .await?;
@@ -233,53 +196,9 @@ impl Adxlet {
                         return handle
                             .check_authority(AuthorityCheck {
                                 record: Some(record),
-                                actual: vec![],
                                 references,
                             })
                             .await;
-                    }
-                }
-                Ok(AuthorityResult::Current)
-            });
-        }
-        // Group by environment so one successful remove cannot reopen an ID
-        // while another orphan execution for that same ID is still being removed.
-        for (id, runtimes) in orphan_groups {
-            if catalog.records.get(&id).is_some_and(|record| {
-                runtimes
-                    .iter()
-                    .any(|runtime| record.runtime.id == runtime.runtime_id)
-            }) {
-                failure = Some(Error::Conflict);
-                continue;
-            }
-            let manager = self.clone();
-            let gate = _gate.clone();
-            self.start_comparison(id.clone(), async move {
-                let _gate = gate;
-                for runtime in &runtimes {
-                    tokio::time::timeout(manager.services.operation_timeout, async {
-                        manager.services.routes.retire_orphan(runtime).await?;
-                        manager.services.runtime.remove(&runtime.runtime_id).await
-                    })
-                    .await
-                    .map_err(|_| Error::Unavailable("orphan cleanup timed out".into()))??;
-                }
-                // On failure or cancellation the ID stays fenced until retry.
-                let mut cleaning = manager
-                    .orphan_cleanup
-                    .lock()
-                    .expect("shared state lock poisoned");
-                if let Some(pending) = cleaning.get_mut(&id) {
-                    // Another catalog can discover a late execution while this
-                    // batch runs. Keep its fence until that execution is removed.
-                    pending.retain(|runtime| {
-                        !runtimes
-                            .iter()
-                            .any(|done| done.runtime_id == runtime.runtime_id)
-                    });
-                    if pending.is_empty() {
-                        cleaning.remove(&id);
                     }
                 }
                 Ok(AuthorityResult::Current)
@@ -356,7 +275,6 @@ impl Adxlet {
         }) {
             return Err(Error::Conflict);
         }
-        self.ensure_not_cleaning(&record.spec.id)?;
         self.adopt_local(&record.spec, &record.assignment)?;
         if record.resources_held {
             let mut admission = self

@@ -95,6 +95,8 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "opentelemetry 0.31.0",
+ "opentelemetry_sdk 0.31.0",
  "percent-encoding",
  "reqwest 0.13.5",
  "rustls",
@@ -251,6 +253,8 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "opentelemetry 0.31.0",
+ "opentelemetry_sdk 0.31.0",
  "portable-pty",
  "regex",
  "rmp",
@@ -326,6 +330,7 @@ dependencies = [
 name = "adx-transport"
 version = "0.1.0"
 dependencies = [
+ "adx-observability",
  "adx-protocol",
  "http",
  "rustls",
@@ -359,6 +364,8 @@ dependencies = [
  "hyper-util",
  "libc",
  "object_store",
+ "opentelemetry 0.31.0",
+ "opentelemetry_sdk 0.31.0",
  "prost 0.13.5",
  "protoc-bin-vendored",
  "reqwest 0.13.5",

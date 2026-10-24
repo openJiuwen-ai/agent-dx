@@ -7,6 +7,7 @@ pub use artifacts::ArtifactDeletionGuard;
 mod collection;
 mod credentials;
 mod failure;
+mod inspection;
 mod recovery;
 mod resume;
 mod snapshots;
@@ -716,6 +717,7 @@ impl RedisStore {
                 return Ok(Session {
                     store: self.clone(),
                     epoch: h.epoch,
+                    inspection: Arc::new(Mutex::new(None)),
                 });
             }
         }
@@ -818,6 +820,7 @@ fn snapshot(raw: &BTreeMap<String, String>) -> Result<StoredSnapshot> {
 pub struct Session {
     store: RedisStore,
     epoch: u64,
+    inspection: Arc<Mutex<Option<inspection::InspectionInventory>>>,
 }
 impl Session {
     pub(crate) fn committed_changes(&self) -> broadcast::Receiver<ControlChange> {

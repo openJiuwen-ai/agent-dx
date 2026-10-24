@@ -1,6 +1,6 @@
 # Execd 主动控制连接验证
 
-本次将运行时协作接入 Execd 主动建立的双向 gRPC 控制流。Ready、工作负载 checkpoint 请求与 handoff 状态通过事件发送，adxlet 不再通过 HTTP 轮询它们。配置、启用条件与网络限制见[部署说明](../deployment/runtime-control-stream.md)，消息及应答规则见[协议契约](../../platform/api/proto/runtime-control.md)。周期监控仍负责健康、资源和空闲检查，并可从缓存补处理被有界通知队列遗漏的 checkpoint 请求。
+本次将运行时协作接入 Execd 主动建立的双向 gRPC 控制流。Ready、工作负载 checkpoint 请求与 handoff 状态通过事件发送，adxlet 不再通过 HTTP 轮询它们。配置、启用条件与网络限制见[部署说明](../deployment/runtime-control-stream.md)，消息及应答规则见[协议契约](../../platform/api/proto/runtime-control.md)。节点按执行订阅保留的最新状态；健康、空闲和 checkpoint 由事件及截止时间处理，资源指标独立采样。正常对账读取 Coordinator 缓存并只比较权威记录。
 
 ## 测试范围
 

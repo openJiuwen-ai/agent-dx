@@ -22,6 +22,12 @@
   "report_interval_seconds": 5,
   "rpc_timeout_seconds": 30,
   "execd_port": 50090,
+  "runtime_control": {
+    "listen": "0.0.0.0:19003",
+    "advertised_address": "http://10.0.0.10:19003",
+    "key_file": "/opt/adx/data/runtime-control-key"
+  },
+  "metrics_interval_seconds": 15,
   "execd_env": {},
   "discovery": {
     "redis_url": "redis://127.0.0.1:6379/",

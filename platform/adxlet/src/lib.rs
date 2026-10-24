@@ -25,7 +25,8 @@ pub mod sandboxd;
 
 use adx_core::scheduling::{validate_device_assignment, Device, DeviceAllocation, DeviceLedger};
 use adx_core::{
-    Assignment, EnvironmentRecord, EnvironmentSpec, Error, ResourceLedger, Resources, Result,
+    Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, ResourceLedger,
+    Resources, Result,
 };
 use async_trait::async_trait;
 pub use controller::EnvironmentHandle;
@@ -120,6 +121,9 @@ pub trait RuntimeDriver: Send + Sync {
         .await
         .map_err(|_| Error::Unavailable("runtime restore deadline exceeded".into()))?
     }
+    async fn wait_exit(&self, _runtime_id: &str) -> Result<adx_core::RuntimeFailure> {
+        std::future::pending().await
+    }
     async fn stats(&self, _runtime_id: &str) -> Result<metrics::RuntimeUsage> {
         Err(Error::Unavailable("runtime usage is unavailable".into()))
     }
@@ -196,7 +200,7 @@ pub trait RuntimeDriver: Send + Sync {
     }
     /// Correlate the supplied platform execution identity with a backend-generated
     /// ID. A failed Start is terminal for this execution; a late backend must be
-    /// cleaned by reconciliation, not adopted as a successful create.
+    /// removed by targeted cleanup retries, never adopted as a successful create.
     async fn start(
         &self,
         spec: &EnvironmentSpec,
@@ -271,6 +275,13 @@ pub trait Routes: Send + Sync {
         self.activate(record).await
     }
     /// (process session, cumulative activity revision, active streams).
+    async fn activity_changed(
+        &self,
+        _record: &EnvironmentRecord,
+        _previous: Option<(String, u64, u64)>,
+    ) -> Result<(String, u64, u64)> {
+        std::future::pending().await
+    }
     async fn activity(&self, _record: &EnvironmentRecord) -> Result<(String, u64, u64)> {
         Err(Error::Unavailable("proxy activity is unavailable".into()))
     }
@@ -377,7 +388,6 @@ pub struct Adxlet {
     retired_environments: Arc<Mutex<BTreeMap<String, RetiredEnvironment>>>,
     services: Arc<Services>,
     environments: Arc<Mutex<EnvironmentDirectory>>,
-    orphan_cleanup: Arc<Mutex<BTreeMap<String, Vec<RuntimeObservation>>>>,
     authority_tasks: Arc<Mutex<AuthorityTasks>>,
     authority_progress: Arc<tokio::sync::Notify>,
 }
@@ -426,7 +436,6 @@ impl Adxlet {
                 health_failure_threshold: None,
             }),
             environments: Arc::default(),
-            orphan_cleanup: Arc::default(),
             authority_tasks: Arc::default(),
             authority_progress: Arc::default(),
         }
@@ -706,7 +715,6 @@ impl Adxlet {
             .environments
             .lock()
             .expect("shared state lock poisoned");
-        self.ensure_not_cleaning(&spec.id)?;
         if let Some((existing, owner, handle)) = environments.get(&spec.id) {
             if *existing == spec && *owner == assignment {
                 return Ok(handle.clone());
@@ -740,22 +748,6 @@ impl Adxlet {
         );
         environments.insert(spec.id.clone(), (spec, assignment, handle.clone()));
         Ok(handle)
-    }
-
-    // Call while holding the environment registry lock so orphan collection and
-    // admission cannot race for the same ID. Other IDs remain independent.
-    fn ensure_not_cleaning(&self, id: &str) -> Result<()> {
-        if self
-            .orphan_cleanup
-            .lock()
-            .expect("shared state lock poisoned")
-            .contains_key(id)
-        {
-            return Err(Error::Unavailable(
-                "environment orphan cleanup pending".into(),
-            ));
-        }
-        Ok(())
     }
 }
 
@@ -809,6 +801,69 @@ impl Adxlet {
             handle.observe_runtime(identity.clone()).await?;
         }
         Ok(())
+    }
+    pub fn retained_runtime_ids(&self) -> Option<std::collections::HashSet<String>> {
+        if !self
+            .authority_initialized
+            .load(std::sync::atomic::Ordering::Acquire)
+            || !self.lifecycle_ready.try_read().is_ok_and(|ready| *ready)
+        {
+            return None;
+        }
+        Some(
+            self.environments
+                .lock()
+                .expect("shared state lock poisoned")
+                .values()
+                .filter_map(|(_, _, handle)| handle.retained_runtime_id())
+                .collect(),
+        )
+    }
+    pub async fn sample_metrics(&self) -> Result<()> {
+        let handles: Vec<_> = self
+            .environments
+            .lock()
+            .expect("shared state lock poisoned")
+            .values()
+            .map(|(_, _, handle)| handle.clone())
+            .collect();
+        let mut pending = tokio::task::JoinSet::new();
+        let mut handles = handles.into_iter();
+        loop {
+            while pending.len() < 32 {
+                let Some(handle) = handles.next() else {
+                    break;
+                };
+                let (record, durability) = handle.view();
+                if record.state == EnvironmentState::Deleted
+                    && !record.resources_held
+                    && durability == Some(Durability::Published)
+                {
+                    self.release_published_controller(&OperationResult {
+                        record,
+                        durability: Durability::Published,
+                    });
+                    continue;
+                }
+                if record.state != EnvironmentState::Running {
+                    continue;
+                }
+                let services = self.services.clone();
+                pending.spawn(async move {
+                    if let Ok(Ok(usage)) = tokio::time::timeout(
+                        services.operation_timeout,
+                        services.runtime.stats(&record.runtime.id),
+                    )
+                    .await
+                    {
+                        handle.record_usage(&services.metrics, &record, usage);
+                    }
+                });
+            }
+            if pending.join_next().await.is_none() {
+                return Ok(());
+            }
+        }
     }
     pub async fn monitor_environments(&self) -> Result<()> {
         self.prune_retired_environments();

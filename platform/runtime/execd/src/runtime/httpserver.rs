@@ -293,25 +293,39 @@ async fn handle_one_request(
     };
     let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
     let (trace_method, trace_path) = parse_request_line(&head);
-    let trace = adx_observability::trace::Trace::http(
-        &trace_method,
-        adx_observability::trace::http_route(&trace_path),
-        parse_header(&head, "traceparent").as_deref(),
-        parse_header(&head, "tracestate").as_deref(),
-    );
-    trace.run_result(async {
-    let (method, path) = parse_request_line(&head);
-    adx_observability::trace::attribute("environment.id",std::env::var("ADX_ENVIRONMENT_ID").unwrap_or_default());
-    let content_len = parse_content_length(&head);
-    let body_mode = if header_has_token(&head, "transfer-encoding", "chunked") {
-        RequestBody::Chunked
-    } else {
-        RequestBody::ContentLength(content_len)
-    };
-    let auth = parse_header(&head, "x-auth");
-    let trace_id = parse_header(&head, "x-trace-id").unwrap_or_default();
-    let route = request_path(&path);
-    execd_info!(
+    let parent = parse_header(&head, "traceparent");
+    let passive = trace_method == "GET"
+        && matches!(
+            request_path(&trace_path),
+            "/healthz" | "/metrics" | "/control/v1/status"
+        )
+        && parent.is_none();
+    // Ordinary observations are silent; explicit diagnostic parents and all
+    // mutations retain their HTTP context and lifecycle spans.
+    let trace = (!passive).then(|| {
+        adx_observability::trace::Trace::http(
+            &trace_method,
+            adx_observability::trace::http_route(&trace_path),
+            parent.as_deref(),
+            parse_header(&head, "tracestate").as_deref(),
+        )
+    });
+    let request = async {
+        let (method, path) = parse_request_line(&head);
+        adx_observability::trace::attribute(
+            "environment.id",
+            std::env::var("ADX_ENVIRONMENT_ID").unwrap_or_default(),
+        );
+        let content_len = parse_content_length(&head);
+        let body_mode = if header_has_token(&head, "transfer-encoding", "chunked") {
+            RequestBody::Chunked
+        } else {
+            RequestBody::ContentLength(content_len)
+        };
+        let auth = parse_header(&head, "x-auth");
+        let trace_id = parse_header(&head, "x-trace-id").unwrap_or_default();
+        let route = request_path(&path);
+        execd_info!(
         "[execd-http] request method={} path={} body_mode={} content_len={} initial_body={} trace={}",
         method,
         route,
@@ -324,18 +338,18 @@ async fn handle_one_request(
         trace_id
     );
 
-    // Health checks do not need a body.
-    if method == "GET" && route == "/healthz" {
-        if super::control::current().is_some_and(|controller| {
-            controller.status().phase != adx_core::runtime::RuntimePhase::Running
-        }) {
-            return write_resp(sock, 503, "{\"status\":\"unavailable\"}").await;
+        // Health checks do not need a body.
+        if method == "GET" && route == "/healthz" {
+            if super::control::current().is_some_and(|controller| {
+                controller.status().phase != adx_core::runtime::RuntimePhase::Running
+            }) {
+                return write_resp(sock, 503, "{\"status\":\"unavailable\"}").await;
+            }
+            return write_resp(sock, 200, "{\"status\":\"ok\"}").await;
         }
-        return write_resp(sock, 200, "{\"status\":\"ok\"}").await;
-    }
-    if method == "GET" && route == "/metrics" {
-        let metrics = super::cmd::command_metrics();
-        let body = format!(
+        if method == "GET" && route == "/metrics" {
+            let metrics = super::cmd::command_metrics();
+            let body = format!(
             "command_records {}\ncommand_running {}\ncommand_completed {}\ncommand_result_bytes {}\ncommand_result_truncated_total {}\ncommand_record_expired_total {}\ncommand_id_conflict_total {}\ncommand_watch_connections {}\n",
             metrics.records,
             metrics.running,
@@ -346,131 +360,146 @@ async fn handle_one_request(
             metrics.id_conflict_total,
             COMMAND_WATCHERS.load(std::sync::atomic::Ordering::Relaxed),
         );
-        return write_resp(sock, 200, &body).await;
-    }
-    // Auth: EXECD requires token authentication. /invoke, /upload, and /download are all control-plane capabilities.
-    if let Some(expect) = token.as_deref() {
-        if auth.as_deref() != Some(expect) {
-            return write_resp(sock, 401, "{\"error\":\"unauthorized\"}").await;
+            return write_resp(sock, 200, &body).await;
         }
-    }
+        // Auth: EXECD requires token authentication. /invoke, /upload, and /download are all control-plane capabilities.
+        if let Some(expect) = token.as_deref() {
+            if auth.as_deref() != Some(expect) {
+                return write_resp(sock, 401, "{\"error\":\"unauthorized\"}").await;
+            }
+        }
 
-    if route.starts_with("/control/v1/") {
-        if content_len > 65536 || header_has_token(&head, "transfer-encoding", "chunked") {
+        if route.starts_with("/control/v1/") {
+            if content_len > 65536 || header_has_token(&head, "transfer-encoding", "chunked") {
+                return write_resp(
+                    sock,
+                    400,
+                    "{\"error\":\"control body requires bounded content-length\"}",
+                )
+                .await;
+            }
+            let mut body = buf[header_end..].to_vec();
+            while body.len() < content_len {
+                let n = sock.read(&mut tmp).await?;
+                if n == 0 {
+                    return Ok(());
+                }
+                body.extend_from_slice(&tmp[..n]);
+            }
+            let response = control_response(&method, route, &body[..content_len]).await;
+            let checkpoint_control = route.starts_with("/control/v1/checkpoint/");
+            if checkpoint_control {
+                execd_info!(
+                    "[checkpoint-control] http_response_ready path={} status={}",
+                    route,
+                    response.status
+                );
+            }
+            let result = write_resp(sock, response.status, &response.body).await;
+            if checkpoint_control {
+                execd_info!(
+                    "[checkpoint-control] http_response_written path={} status={} success={}",
+                    route,
+                    response.status,
+                    result.is_ok()
+                );
+            }
+            return result;
+        }
+        if super::control::current().is_some_and(|controller| {
+            controller.status().phase != adx_core::runtime::RuntimePhase::Running
+        }) {
             return write_resp(
                 sock,
-                400,
-                "{\"error\":\"control body requires bounded content-length\"}",
+                503,
+                "{\"error\":\"runtime checkpoint transition in progress\"}",
             )
             .await;
         }
+
+        if method == "GET"
+            && route == "/commands/watch"
+            && header_has_token(&head, "upgrade", "websocket")
+        {
+            // An upgraded stream owns this connection until it ends. Returning to
+            // the HTTP keep-alive loop would keep TCP open after its Close frame.
+            *close_after_response = true;
+            return handle_command_watch(sock, &head).await;
+        }
+        if method == "GET" && route == "/pty" && header_has_token(&head, "upgrade", "websocket") {
+            *close_after_response = true;
+            return handle_pty(sock, &head, &path).await;
+        }
+
+        // Ordinary atomic operations are data activity. The long-lived command
+        // watch above is deliberately a passive observer and must not prevent idle.
+        let _active = match super::activity::try_enter(super::activity::ActivitySource::DirectHttp)
+        {
+            Ok(active) => active,
+            Err(_) => return write_resp(sock, 503, "{\"error\":\"runtime is quiescing\"}").await,
+        };
+
+        if method == "GET" && route == "/upload/status" {
+            return handle_upload_status(sock, &path).await;
+        }
+        if method == "POST" && route == "/upload/commit" {
+            return handle_upload_commit(sock, &path).await;
+        }
+        if method == "POST" && route == "/upload" {
+            return handle_upload(
+                sock,
+                &path,
+                body_mode,
+                &buf[header_end..],
+                &mut tmp,
+                trace_id.as_str(),
+            )
+            .await;
+        }
+        if method == "GET" && route == "/download" {
+            // Binary file responses advertise Connection: close. Tar downloads
+            // and ordinary error responses remain reusable.
+            *close_after_response =
+                handle_download(sock, &path, &head, &mut tmp, trace_id.as_str()).await?;
+            return Ok(());
+        }
+
+        if !(method == "POST" && route == "/invoke") {
+            return write_resp(sock, 404, "{\"error\":\"not found\"}").await;
+        }
+
+        // /invoke needs a JSON body. Read the full body only on this path to avoid buffering large /upload payloads in memory.
         let mut body = buf[header_end..].to_vec();
         while body.len() < content_len {
             let n = sock.read(&mut tmp).await?;
             if n == 0 {
-                return Ok(());
+                break;
             }
             body.extend_from_slice(&tmp[..n]);
         }
-        let response = control_response(&method, route, &body[..content_len]).await;
-        let checkpoint_control = route.starts_with("/control/v1/checkpoint/");
-        if checkpoint_control {
-            execd_info!("[checkpoint-control] http_response_ready path={} status={}", route, response.status);
-        }
-        let result = write_resp(sock, response.status, &response.body).await;
-        if checkpoint_control {
-            execd_info!("[checkpoint-control] http_response_written path={} status={} success={}", route, response.status, result.is_ok());
-        }
-        return result;
-    }
-    if super::control::current().is_some_and(|controller| {
-        controller.status().phase != adx_core::runtime::RuntimePhase::Running
-    }) {
-        return write_resp(
-            sock,
-            503,
-            "{\"error\":\"runtime checkpoint transition in progress\"}",
-        )
-        .await;
-    }
 
-    if method == "GET"
-        && route == "/commands/watch"
-        && header_has_token(&head, "upgrade", "websocket")
-    {
-        // An upgraded stream owns this connection until it ends. Returning to
-        // the HTTP keep-alive loop would keep TCP open after its Close frame.
-        *close_after_response = true;
-        return handle_command_watch(sock, &head).await;
-    }
-    if method == "GET" && route == "/pty" && header_has_token(&head, "upgrade", "websocket") {
-        *close_after_response = true;
-        return handle_pty(sock, &head, &path).await;
-    }
+        let parsed: serde_json::Value = match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(e) => return write_resp(sock, 400, &err_json(&format!("bad json: {e}"))).await,
+        };
+        let action = parsed
+            .get("action")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if let Some(operation) = super::dispatch::normalize_environment_action(&action) {
+            adx_observability::trace::attribute("rpc.method", operation.to_owned());
+        }
+        let kw = json_args_to_kwargs(parsed.get("args"));
+        let request_id = request_id_from(&head, &parsed);
 
-    // Ordinary atomic operations are data activity. The long-lived command
-    // watch above is deliberately a passive observer and must not prevent idle.
-    let _active = match super::activity::try_enter(super::activity::ActivitySource::DirectHttp) {
-        Ok(active) => active, Err(_) => return write_resp(sock, 503, "{\"error\":\"runtime is quiescing\"}").await,
+        let resp = execute_invoke(request_id, action, kw, trace_id).await;
+        write_resp(sock, resp.status, &resp.body).await
     };
-
-    if method == "GET" && route == "/upload/status" {
-        return handle_upload_status(sock, &path).await;
+    match trace {
+        Some(trace) => trace.run_result(request).await,
+        None => request.await,
     }
-    if method == "POST" && route == "/upload/commit" {
-        return handle_upload_commit(sock, &path).await;
-    }
-    if method == "POST" && route == "/upload" {
-        return handle_upload(
-            sock,
-            &path,
-            body_mode,
-            &buf[header_end..],
-            &mut tmp,
-            trace_id.as_str(),
-        )
-        .await;
-    }
-    if method == "GET" && route == "/download" {
-        // Binary file responses advertise Connection: close. Tar downloads
-        // and ordinary error responses remain reusable.
-        *close_after_response =
-            handle_download(sock, &path, &head, &mut tmp, trace_id.as_str()).await?;
-        return Ok(());
-    }
-
-    if !(method == "POST" && route == "/invoke") {
-        return write_resp(sock, 404, "{\"error\":\"not found\"}").await;
-    }
-
-    // /invoke needs a JSON body. Read the full body only on this path to avoid buffering large /upload payloads in memory.
-    let mut body = buf[header_end..].to_vec();
-    while body.len() < content_len {
-        let n = sock.read(&mut tmp).await?;
-        if n == 0 {
-            break;
-        }
-        body.extend_from_slice(&tmp[..n]);
-    }
-
-    let parsed: serde_json::Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(e) => return write_resp(sock, 400, &err_json(&format!("bad json: {e}"))).await,
-    };
-    let action = parsed
-        .get("action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    if let Some(operation) = super::dispatch::normalize_environment_action(&action) {
-        adx_observability::trace::attribute("rpc.method", operation.to_owned());
-    }
-    let kw = json_args_to_kwargs(parsed.get("args"));
-    let request_id = request_id_from(&head, &parsed);
-
-    let resp = execute_invoke(request_id, action, kw, trace_id).await;
-    write_resp(sock, resp.status, &resp.body).await
-    }).await
 }
 
 async fn control_response(method: &str, path: &str, body: &[u8]) -> CachedResponse {
@@ -1893,6 +1922,9 @@ fn hex_encode(b: &[u8]) -> String {
     }
     s
 }
+
+#[cfg(test)]
+mod trace_tests;
 
 #[cfg(test)]
 mod tests {

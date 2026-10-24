@@ -24,7 +24,7 @@ fn node_request<T>(body: T) -> Request<T> {
 
 #[tokio::test]
 #[ignore = "requires isolated Redis; run control-rpc suite"]
-async fn heartbeats_and_scheduler_rounds_do_not_export_spans_but_create_keeps_its_trace() {
+async fn routine_reports_and_inspection_are_silent_but_failures_and_requests_keep_traces() {
     let mut redis = common::Redis::new().await;
     let session = redis.store().await.begin(1).await.unwrap();
     let rpc = CoordinatorRpc::new(
@@ -68,6 +68,37 @@ async fn heartbeats_and_scheduler_rounds_do_not_export_spans_but_create_keeps_it
     }))
     .await
     .unwrap();
+    for _ in 0..3 {
+        rpc.inspect_node(node_request(pb::InspectNodeRequest {
+            node_id: "node".into(),
+            session_id: "boot".into(),
+        }))
+        .await
+        .unwrap();
+    }
+    provider.force_flush().unwrap();
+    assert!(
+        exporter.get_finished_spans().unwrap().is_empty(),
+        "normal node inspection must stay silent"
+    );
+    assert!(rpc
+        .inspect_node(node_request(pb::InspectNodeRequest {
+            node_id: "node".into(),
+            session_id: "stale".into()
+        }))
+        .await
+        .is_err());
+    let mut diagnostic = node_request(pb::InspectNodeRequest {
+        node_id: "node".into(),
+        session_id: "boot".into(),
+    });
+    diagnostic.metadata_mut().insert(
+        "traceparent",
+        "00-11111111111111111111111111111111-2222222222222222-01"
+            .parse()
+            .unwrap(),
+    );
+    rpc.inspect_node(diagnostic).await.unwrap();
     report.reconciling = false;
     report.accepting_allocations = true;
     for sequence in 2..=4 {
@@ -126,6 +157,21 @@ async fn heartbeats_and_scheduler_rounds_do_not_export_spans_but_create_keeps_it
         !spans.iter().any(|s| s.name == "shard.schedule_round"),
         "internal rounds must not produce trace traffic"
     );
+    let inspections: Vec<_> = spans
+        .iter()
+        .filter(|s| s.name == "coordinator.inspect_node")
+        .collect();
+    assert_eq!(
+        inspections.len(),
+        2,
+        "retain only failed or explicitly traced inspection"
+    );
+    assert!(inspections
+        .iter()
+        .any(|s| matches!(s.status, opentelemetry::trace::Status::Error { .. })));
+    assert!(inspections
+        .iter()
+        .any(|s| s.parent_span_id.to_string() == "2222222222222222"));
     let create = spans
         .iter()
         .find(|s| s.name == "coordinator.create_environment")

@@ -1,6 +1,6 @@
 //! sandboxd PR #56 adapter. The RPC task outlives a canceled caller so cleanup
-//! cannot race its client task. Failed starts are terminal; reconciliation removes
-//! any backend that arrives after the failed create released its reservation.
+//! cannot race its client task. Failed starts are terminal; ambiguous outcomes
+//! retain targeted cleanup retries until their backend can be removed.
 use crate::RuntimeDriver;
 use adx_core::{EnvironmentSpec, Error, Result};
 use async_trait::async_trait;
@@ -48,6 +48,7 @@ enum StartState {
     Started(IpAddr),
     Settled,
     Failed,
+    UncertainStart,
     // Checkpoint may still be executing after its transport failed.
     Uncertain,
 }
@@ -303,7 +304,7 @@ impl Sandboxd {
         if matches!(*state, StartState::Failed) {
             return Err(Error::Conflict);
         }
-        if matches!(*state, StartState::Uncertain) {
+        if matches!(*state, StartState::Uncertain | StartState::UncertainStart) {
             return Err(unavailable("start outcome requires reconciliation"));
         }
         if let Some(deadline) = deadline {
@@ -333,6 +334,19 @@ impl Sandboxd {
                             "sandboxd: {}",
                             error.message()
                         )));
+                    }
+                    if !matches!(
+                        error.code(),
+                        Code::InvalidArgument
+                            | Code::Unimplemented
+                            | Code::PermissionDenied
+                            | Code::Unauthenticated
+                    ) && error
+                        .metadata()
+                        .get("sandboxd-start-settled")
+                        .is_none_or(|value| value != "true")
+                    {
+                        *state = StartState::UncertainStart;
                     }
                     if error.code() == Code::DeadlineExceeded
                         && deadline.is_some_and(|deadline| deadline <= tokio::time::Instant::now())
@@ -1194,6 +1208,17 @@ impl RuntimeDriver for Sandboxd {
     async fn is_running(&self, runtime_id: &str) -> Result<bool> {
         Sandboxd::is_running(self, runtime_id).await
     }
+    async fn wait_exit(&self, runtime_id: &str) -> Result<adx_core::RuntimeFailure> {
+        let id = self.physical_id(runtime_id).await?.ok_or(Error::NotFound)?;
+        let result = self
+            .client
+            .clone()
+            .wait(Request::new(proto::WaitRequest { id }))
+            .await
+            .map_err(unavailable)?
+            .into_inner();
+        Ok(runtime_failure(result))
+    }
     async fn observe(&self, runtime_id: &str) -> Result<crate::RuntimeStatus> {
         Sandboxd::observe(self, runtime_id).await
     }
@@ -1251,14 +1276,18 @@ impl RuntimeDriver for Sandboxd {
 
     async fn remove(&self, runtime_id: &str) -> Result<()> {
         let mut state = self.cell(runtime_id).lock_owned().await;
-        let failed_start = matches!(*state, StartState::Failed);
-        if matches!(*state, StartState::Uncertain) {
+        let failed_start = matches!(*state, StartState::Failed | StartState::UncertainStart);
+        if matches!(*state, StartState::Uncertain | StartState::UncertainStart) {
             if self.list_id(runtime_id).await?.is_empty() {
                 return Err(unavailable(
                     "cannot confirm cleanup while Start outcome is unknown",
                 ));
             }
-            *state = StartState::Settled;
+            *state = if failed_start {
+                StartState::Failed
+            } else {
+                StartState::Settled
+            };
         }
         if let Some(physical) = self.physical_id(runtime_id).await? {
             match self
@@ -1312,7 +1341,7 @@ impl Sandboxd {
             ));
         }
         let mut state = self.cell(runtime_id).lock_owned().await;
-        if matches!(*state, StartState::Uncertain) {
+        if matches!(*state, StartState::Uncertain | StartState::UncertainStart) {
             return Err(unavailable("execution outcome requires reconciliation"));
         }
         if matches!(*state, StartState::Failed) {

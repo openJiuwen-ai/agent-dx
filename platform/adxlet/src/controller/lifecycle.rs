@@ -26,7 +26,9 @@ impl Controller {
                 return Ok(());
             }
             self.auto_pause_guard = Some((stamp, demand));
-            self.pause(request).await.map(|_| ())
+            let trace = adx_observability::trace::Trace::child("environment.auto_pause");
+            trace.attribute("environment.id", self.record.spec.id.clone());
+            trace.run_result(self.pause(request)).await.map(|_| ())
         }
         .await;
         self.auto_pause_guard = None;
@@ -110,6 +112,21 @@ impl Controller {
         let Some(cp) = self.record.checkpoint.clone().filter(|cp| cp.expired(now)) else {
             return Ok(None);
         };
+        if !matches!(
+            self.record.state,
+            EnvironmentState::Paused | EnvironmentState::Running | EnvironmentState::Failed
+        ) {
+            return Ok(None);
+        }
+        let trace = adx_observability::trace::Trace::child("environment.checkpoint_expired");
+        trace.attribute("environment.id", self.record.spec.id.clone());
+        trace.run_result(self.expire_checkpoint_inner(cp)).await
+    }
+
+    async fn expire_checkpoint_inner(
+        &mut self,
+        cp: RestorePoint,
+    ) -> Result<Option<OperationResult>> {
         if self.record.state == EnvironmentState::Paused {
             return self.delete().await.map(Some);
         }
@@ -378,6 +395,8 @@ impl Controller {
         if let Some(control) = &self.services.runtime_control {
             control.retire(&self.record);
         }
+        // The stop barrier has completed; pre-pause usage is no longer current.
+        self.services.metrics.remove(&self.metrics_registration);
         self.recovery_files = None;
         self.execution_files.clear();
         self.record.execution_artifacts.clear();

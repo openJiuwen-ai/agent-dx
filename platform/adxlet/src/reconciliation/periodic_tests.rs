@@ -82,7 +82,6 @@ async fn adopted_controller_requires_authority_check_before_exposing_lifecycle()
         let result = handle
             .check_authority(AuthorityCheck {
                 record: Some(record),
-                actual: vec![],
                 references: None,
             })
             .await

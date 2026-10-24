@@ -14,7 +14,7 @@
       }
     ]
   },
-  "description": "ADX scheduling and operations: allocation ledgers, disk, queues, health, logs and trace export. Actual node and environment resource usage belongs to their detail dashboards.",
+  "description": "ADX creation throughput, Running and Paused populations, allocation ledgers, node health and telemetry health.",
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
@@ -47,11 +47,28 @@
     {
       "title": "Explore Requests",
       "type": "link",
-      "url": "/explore?schemaVersion=1&panes=%7B%22a%22%3A%7B%22datasource%22%3A%22tempo%22%2C%22queries%22%3A%5B%7B%22refId%22%3A%22A%22%2C%22datasource%22%3A%7B%22type%22%3A%22tempo%22%2C%22uid%22%3A%22tempo%22%7D%2C%22queryType%22%3A%22traceql%22%2C%22query%22%3A%22%7B%20resource.adx_env%20%3D~%20%5C%22${adx_env:percentencode}%5C%22%20%26%26%20name%20%3D~%20%5C%22%5E%28GET%7CPOST%7CPUT%7CDELETE%7CPATCH%7CHEAD%7COPTIONS%7CCONNECT%7COTHER%29%20%2F.%2A%5C%22%20%26%26%20span.http.route%20%21%3D%20%5C%22%2Funmatched%5C%22%20%26%26%20name%20%21%3D%20%5C%22GET%20%2Fhealthz%5C%22%20%26%26%20name%20%21%3D%20%5C%22GET%20%2Fmetrics%5C%22%20%7D%20%7C%20select%28name%2C%20resource.service.name%2C%20span.http.response.status_code%2C%20span.rpc.method%29%22%2C%22tableType%22%3A%22spans%22%2C%22limit%22%3A50%2C%22spss%22%3A3%7D%5D%2C%22range%22%3A%7B%22from%22%3A%22now-6h%22%2C%22to%22%3A%22now%22%7D%7D%7D",
+      "url": "/explore?schemaVersion=1&panes=%7B%22a%22%3A%7B%22datasource%22%3A%22tempo%22%2C%22queries%22%3A%5B%7B%22refId%22%3A%22A%22%2C%22datasource%22%3A%7B%22type%22%3A%22tempo%22%2C%22uid%22%3A%22tempo%22%7D%2C%22queryType%22%3A%22traceql%22%2C%22query%22%3A%22%7B%20resource.adx_env%20%3D~%20%5C%22${adx_env:percentencode}%5C%22%20%26%26%20%28name%20%3D%20%5C%22environment.create%5C%22%20%7C%7C%20%28name%20%3D~%20%5C%22%5E%28GET%7CPOST%7CPUT%7CDELETE%7CPATCH%7CHEAD%7COPTIONS%7CCONNECT%7COTHER%29%20%2F.%2A%5C%22%20%26%26%20span.http.route%20%21%3D%20%5C%22%2Funmatched%5C%22%20%26%26%20%28%28name%20%21%3D%20%5C%22POST%20%2Fapi%2Fenvironment%2Fv1%2Fenvironments%5C%22%20%26%26%20name%20%21%3D%20%5C%22POST%20%2Fapi%2Fenvironment%2Fcreate%5C%22%29%20%7C%7C%20span.http.response.status_code%20%3D~%20%5C%22%5E%5B45%5D%5B0-9%5D%7B2%7D%24%5C%22%29%20%26%26%20name%20%21%3D%20%5C%22GET%20%2Fhealthz%5C%22%20%26%26%20name%20%21%3D%20%5C%22GET%20%2Fmetrics%5C%22%29%29%20%7D%20%7C%20select%28name%2C%20resource.service.name%2C%20span.http.response.status_code%2C%20span.rpc.method%2C%20span.environment.create.outcome%29%22%2C%22tableType%22%3A%22spans%22%2C%22limit%22%3A50%2C%22spss%22%3A3%7D%5D%2C%22range%22%3A%7B%22from%22%3A%22now-6h%22%2C%22to%22%3A%22now%22%7D%7D%7D",
       "includeVars": false,
       "keepTime": false,
       "targetBlank": false,
-      "tooltip": "Search spans by endpoint, component, response status and Execd operation in Explore; click a Span ID to inspect the full trace."
+      "tooltip": "Creation rows show total server create time; rejected requests and other HTTP rows show HTTP handling time. Click a Span ID to inspect stages."
+    },
+    {
+      "title": "Environment Logs",
+      "type": "link",
+      "url": "/d/adx-environment-logs",
+      "includeVars": true,
+      "keepTime": false,
+      "targetBlank": false,
+      "tooltip": "Open on-demand log search, initially the last 15 minutes."
+    },
+    {
+      "title": "Environments",
+      "type": "link",
+      "url": "/d/adx-environments",
+      "includeVars": true,
+      "keepTime": false,
+      "targetBlank": false
     }
   ],
   "panels": [
@@ -72,18 +89,12 @@
               {
                 "color": "green",
                 "value": 0
-              },
-              {
-                "color": "yellow",
-                "value": 50
-              },
-              {
-                "color": "red",
-                "value": 100
               }
             ]
           },
-          "unit": "short"
+          "unit": "short",
+          "min": 0,
+          "decimals": 0
         },
         "overrides": []
       },
@@ -95,9 +106,11 @@
       },
       "id": 1,
       "options": {
-        "minVizHeight": 75,
-        "minVizWidth": 75,
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
         "orientation": "auto",
+        "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
             "lastNotNull"
@@ -105,10 +118,10 @@
           "fields": "",
           "values": false
         },
-        "showThresholdLabels": false,
-        "showThresholdMarkers": true,
-        "sizing": "auto",
-        "text": {}
+        "showPercentChange": false,
+        "text": {},
+        "textMode": "value",
+        "wideLayout": true
       },
       "pluginVersion": "12.3.1",
       "targets": [
@@ -118,12 +131,14 @@
             "uid": "prometheus"
           },
           "expr": "sum(adx_coordinator_environments{adx_env=~\"$adx_env\",state=\"Running\"})",
-          "legendFormat": "Total Running Instances",
-          "refId": "A"
+          "legendFormat": "Running",
+          "refId": "A",
+          "instant": false
         }
       ],
       "title": "Running Environments",
-      "type": "gauge"
+      "type": "stat",
+      "description": "Committed Running state."
     },
     {
       "datasource": {
@@ -150,9 +165,9 @@
         "overrides": []
       },
       "gridPos": {
-        "x": 6,
+        "x": 12,
         "y": 0,
-        "w": 6,
+        "w": 4,
         "h": 4
       },
       "id": 2,
@@ -200,9 +215,9 @@
         "overrides": []
       },
       "gridPos": {
-        "x": 12,
+        "x": 16,
         "y": 0,
-        "w": 6,
+        "w": 4,
         "h": 4
       },
       "id": 3,
@@ -234,9 +249,9 @@
         "overrides": []
       },
       "gridPos": {
-        "x": 18,
+        "x": 20,
         "y": 0,
-        "w": 6,
+        "w": 4,
         "h": 4
       },
       "id": 4,
@@ -293,7 +308,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 4,
+        "y": 24,
         "w": 8,
         "h": 5
       },
@@ -397,7 +412,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 9,
+        "y": 29,
         "w": 8,
         "h": 8
       },
@@ -481,7 +496,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 4,
+        "y": 24,
         "w": 8,
         "h": 5
       },
@@ -585,7 +600,7 @@
       },
       "gridPos": {
         "x": 8,
-        "y": 9,
+        "y": 29,
         "w": 8,
         "h": 8
       },
@@ -669,7 +684,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 4,
+        "y": 24,
         "w": 8,
         "h": 5
       },
@@ -773,7 +788,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 9,
+        "y": 29,
         "w": 8,
         "h": 8
       },
@@ -880,7 +895,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 17,
+        "y": 37,
         "w": 12,
         "h": 8
       },
@@ -894,7 +909,7 @@
           ],
           "displayMode": "table",
           "placement": "right",
-          "showLegend": false
+          "showLegend": true
         },
         "tooltip": {
           "hideZeros": false,
@@ -905,16 +920,12 @@
       "pluginVersion": "12.3.1",
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "sum(adx_coordinator_environments{adx_env=~\"$adx_env\",state=\"Running\"})",
-          "legendFormat": "Cluster total",
-          "refId": "A"
+          "refId": "A",
+          "expr": "sum by (state) (adx_coordinator_environments{adx_env=~\"$adx_env\",state=~\"Running|Paused\"})",
+          "legendFormat": "{{state}}"
         }
       ],
-      "title": "Running Environments over Time",
+      "title": "Running and Paused Environments over Time",
       "type": "timeseries"
     },
     {
@@ -977,7 +988,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 17,
+        "y": 37,
         "w": 12,
         "h": 8
       },
@@ -1002,16 +1013,12 @@
       "pluginVersion": "12.3.1",
       "targets": [
         {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "prometheus"
-          },
-          "expr": "sum by (node_id) (adx_coordinator_environments{adx_env=~\"$adx_env\",state=\"Running\"} and on (adx_env, node_id) (adx_coordinator_node_reachable{adx_env=~\"$adx_env\"} == 1))",
-          "legendFormat": "{{node_id}}",
-          "refId": "A"
+          "refId": "A",
+          "expr": "sum by (adx_env,node_id,state) (adx_coordinator_environments{adx_env=~\"$adx_env\",state=~\"Running|Paused\"})",
+          "legendFormat": "{{adx_env}} / {{node_id}} / {{state}}"
         }
       ],
-      "title": "Running Environments by Node",
+      "title": "Running and Paused Environments by Node",
       "type": "timeseries"
     },
     {
@@ -1048,7 +1055,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 25,
+        "y": 45,
         "w": 12,
         "h": 8
       },
@@ -1119,7 +1126,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 25,
+        "y": 45,
         "w": 12,
         "h": 8
       },
@@ -1605,7 +1612,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 33,
+        "y": 53,
         "w": 24,
         "h": 8
       },
@@ -1798,7 +1805,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 41,
+        "y": 61,
         "w": 24,
         "h": 8
       },
@@ -1834,220 +1841,726 @@
       "description": "Native Coordinator and adxlet span export counters. Query Ingress traces directly in Tempo."
     },
     {
+      "id": 23,
+      "title": "Paused Environments",
+      "type": "stat",
+      "description": "Committed Paused state. Resource samples from before pause are not current usage.",
       "datasource": {
-        "type": "loki",
-        "uid": "loki"
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 0,
+        "w": 6,
+        "h": 4
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short"
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": 0
+              }
+            ]
+          },
+          "unit": "short",
+          "min": 0,
+          "decimals": 0
         },
         "overrides": []
       },
-      "gridPos": {
-        "x": 0,
-        "y": 49,
-        "w": 24,
-        "h": 10
-      },
-      "id": 21,
       "options": {
-        "showTime": true,
-        "wrapLogMessage": true,
-        "enableLogDetails": true,
-        "sortOrder": "Descending",
-        "dedupStrategy": "none"
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "loki",
-            "uid": "loki"
-          },
-          "expr": "{adx_env=~\"$adx_env\",component_name=\"adx-runtime\"} | runtime_id=~`${runtime_id:regex}` |= ${log_search:doublequote}",
-          "refId": "A"
-        }
-      ],
-      "title": "Environment Logs",
-      "type": "logs",
-      "description": "Search environment main-process stdout/stderr by runtime records and case-sensitive keywords. Runtime IDs contain Environment ID and generation. Options come from resource samples in the selected time range; use All for records without samples. SDK command results are not archived here. Defaults to the last 6 hours unless an absolute time range is selected. No main-process output means no log entries.",
-      "timeFrom": "6h"
-    },
-    {
-      "id": 22,
-      "type": "table",
-      "title": "HTTP Request Traces",
-      "description": "One row per matching HTTP span, showing endpoint, actual component, response status and span duration. Streaming HTTP spans may finish before background tasks; click Trace ID for the complete trace. Excludes unmatched routes and health checks. Does not require an upstream root span.",
-      "datasource": {
-        "type": "tempo",
-        "uid": "tempo"
-      },
-      "gridPos": {
-        "x": 0,
-        "y": 59,
-        "w": 24,
-        "h": 10
-      },
-      "fieldConfig": {
-        "defaults": {
-          "custom": {
-            "align": "auto",
-            "cellOptions": {
-              "type": "auto"
-            },
-            "inspect": false
-          }
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
         },
-        "overrides": [
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Trace ID"
-            },
-            "properties": [
-              {
-                "id": "custom.hidden",
-                "value": false
-              },
-              {
-                "id": "custom.width",
-                "value": 290
-              },
-              {
-                "id": "links",
-                "value": [
-                  {
-                    "title": "View Trace",
-                    "url": "",
-                    "internal": {
-                      "datasourceUid": "tempo",
-                      "datasourceName": "Tempo",
-                      "query": {
-                        "query": "${__value.raw}",
-                        "queryType": "traceql"
-                      }
-                    }
-                  }
-                ]
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Endpoint"
-            },
-            "properties": [
-              {
-                "id": "custom.width",
-                "value": 500
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Start Time"
-            },
-            "properties": [
-              {
-                "id": "custom.width",
-                "value": 225
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Component"
-            },
-            "properties": [
-              {
-                "id": "custom.width",
-                "value": 150
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Status"
-            },
-            "properties": [
-              {
-                "id": "custom.width",
-                "value": 80
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Span Duration"
-            },
-            "properties": [
-              {
-                "id": "custom.width",
-                "value": 100
-              }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "showHeader": true,
-        "cellHeight": "sm"
+        "showPercentChange": false,
+        "text": {},
+        "textMode": "value",
+        "wideLayout": true
       },
       "targets": [
         {
           "refId": "A",
-          "datasource": {
-            "type": "tempo",
-            "uid": "tempo"
-          },
-          "queryType": "traceql",
-          "tableType": "spans",
-          "query": "{ resource.adx_env =~ \"$adx_env\" && (resource.service.name = \"adx-apiserver\" || resource.service.name = \"adx-ingress\") && name =~ \"^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|CONNECT|OTHER) /.*\" && span.http.route != \"/unmatched\" && name != \"GET /healthz\" && name != \"GET /metrics\" } | select(span.http.request.method, span.http.route, span.http.response.status_code, resource.service.name)",
-          "limit": 50,
-          "filters": []
+          "expr": "sum(adx_coordinator_environments{adx_env=~\"$adx_env\",state=\"Paused\"})",
+          "instant": false,
+          "legendFormat": "Paused"
         }
       ],
-      "transformations": [
+      "pluginVersion": "12.3.1"
+    },
+    {
+      "id": 25,
+      "title": "Create Request QPS (1m window)",
+      "type": "stat",
+      "description": "Public HTTP and embedded create arrivals, including retries and rejected HTTP requests.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 6,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
         {
-          "id": "organize",
-          "options": {
-            "excludeByName": {
-              "traceService": true,
-              "traceName": true,
-              "spanID": true,
-              "adx_env": true,
-              "http.request.method": true,
-              "http.route": true,
-              "nested": true
-            },
-            "indexByName": {
-              "time": 0,
-              "name": 1,
-              "service.name": 2,
-              "http.response.status_code": 3,
-              "duration": 4,
-              "traceIdHidden": 5,
-              "Start time": 0,
-              "Name": 1,
-              "Duration": 4
-            },
-            "renameByName": {
-              "time": "Start Time",
-              "name": "Endpoint",
-              "service.name": "Component",
-              "http.response.status_code": "Status",
-              "duration": "Span Duration",
-              "traceIdHidden": "Trace ID",
-              "Start time": "Start Time",
-              "Name": "Endpoint",
-              "Duration": "Span Duration"
-            }
-          }
+          "refId": "A",
+          "expr": "sum(adx:environment_create_request_qps:rate1m{adx_env=~\"$adx_env\"})",
+          "instant": true,
+          "legendFormat": "{{adx_env}}"
+        }
+      ]
+    },
+    {
+      "id": 26,
+      "title": "Create Request Peak QPS (1m window)",
+      "type": "stat",
+      "description": "Maximum cluster-wide one-minute average over the selected time range.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 4,
+        "w": 6,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max_over_time((sum(adx:environment_create_request_qps:rate1m{adx_env=~\"$adx_env\"}))[$__range:15s])",
+          "instant": true,
+          "legendFormat": "{{adx_env}}"
+        }
+      ]
+    },
+    {
+      "id": 27,
+      "title": "Created QPS (1m window)",
+      "type": "stat",
+      "description": "First durably committed Running result for a new Environment. Replays, resume and restart are excluded.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 6,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(adx:environment_created_qps:rate1m{adx_env=~\"$adx_env\"})",
+          "instant": true,
+          "legendFormat": "{{adx_env}}"
+        }
+      ]
+    },
+    {
+      "id": 28,
+      "title": "Created Peak QPS (1m window)",
+      "type": "stat",
+      "description": "Maximum cluster-wide one-minute average over the selected time range.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 4,
+        "w": 6,
+        "h": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max_over_time((sum(adx:environment_created_qps:rate1m{adx_env=~\"$adx_env\"}))[$__range:15s])",
+          "instant": true,
+          "legendFormat": "{{adx_env}}"
+        }
+      ]
+    },
+    {
+      "id": 29,
+      "title": "Creation Throughput (1m window)",
+      "type": "timeseries",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (adx_env) (adx:environment_create_request_qps:rate1m{adx_env=~\"$adx_env\"})",
+          "instant": false,
+          "legendFormat": "{{adx_env}} requests"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (adx_env) (adx:environment_created_qps:rate1m{adx_env=~\"$adx_env\"})",
+          "legendFormat": "{{adx_env}} created"
+        }
+      ]
+    },
+    {
+      "id": 30,
+      "title": "Create Call Outcomes",
+      "type": "timeseries",
+      "description": "Application calls, including replay responses. Unknown and cancelled do not imply creation failure.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 8,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (outcome) (rate(adx_environment_create_responses_total{adx_env=~\"$adx_env\"}[1m]))",
+          "instant": false,
+          "legendFormat": "{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 31,
+      "title": "Create Calls in Flight",
+      "type": "stat",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 16,
+        "w": 6,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(adx_environment_create_in_flight{adx_env=~\"$adx_env\"})",
+          "instant": false,
+          "legendFormat": "{{adx_env}}"
+        }
+      ]
+    },
+    {
+      "id": 32,
+      "title": "Create Call Duration P95/P99",
+      "type": "timeseries",
+      "description": "Application execution through its final result, including SSE background creation. Replays are included.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 16,
+        "w": 18,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95,sum by (le) (rate(adx_environment_create_duration_seconds_bucket{adx_env=~\"$adx_env\"}[5m])))",
+          "instant": false,
+          "legendFormat": "P95"
+        },
+        {
+          "refId": "B",
+          "expr": "histogram_quantile(0.99,sum by (le) (rate(adx_environment_create_duration_seconds_bucket{adx_env=~\"$adx_env\"}[5m])))",
+          "legendFormat": "P99"
+        }
+      ]
+    },
+    {
+      "id": 33,
+      "title": "Environment CPU Usage",
+      "type": "timeseries",
+      "description": "Sampled running-runtime usage. Samples older than 45 seconds do not contribute current memory. CPU is a monotonic sampled lifetime total; inspect freshness alongside its rate.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 69,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "cores",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (adx_env,runtime_class) (rate(adx_node_environment_cpu_usage_seconds_total{adx_env=~\"$adx_env\"}[5m]))",
+          "instant": false,
+          "legendFormat": "{{adx_env}} / {{runtime_class}}"
+        }
+      ]
+    },
+    {
+      "id": 34,
+      "title": "Environment Memory Usage",
+      "type": "timeseries",
+      "description": "Sampled running-runtime usage. Samples older than 45 seconds do not contribute current memory. CPU is a monotonic sampled lifetime total; inspect freshness alongside its rate.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 69,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (adx_env,runtime_class) (adx_node_environment_memory_usage_bytes{adx_env=~\"$adx_env\"})",
+          "instant": false,
+          "legendFormat": "{{adx_env}} / {{runtime_class}}"
+        }
+      ]
+    },
+    {
+      "id": 35,
+      "title": "Fresh and Stale Resource Samples",
+      "type": "timeseries",
+      "description": "Sampled running-runtime usage. Samples older than 45 seconds do not contribute current memory. CPU is a monotonic sampled lifetime total; inspect freshness alongside its rate.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 69,
+        "w": 8,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (adx_env) (adx_node_environment_samples{adx_env=~\"$adx_env\"})",
+          "instant": false,
+          "legendFormat": "{{adx_env}} fresh"
+        },
+        {
+          "refId": "B",
+          "expr": "sum by (adx_env) (adx_node_environment_stale_samples{adx_env=~\"$adx_env\"})",
+          "legendFormat": "{{adx_env}} stale"
+        }
+      ]
+    },
+    {
+      "id": 36,
+      "title": "Runtime Log Rate (last 1m)",
+      "type": "stat",
+      "description": "Current log entries per second over the last minute. Instant query with a fixed lookback bounds the log scan independently of the dashboard time range.",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 77,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "graphMode": "none",
+        "colorMode": "value",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (adx_env) (rate({adx_env=~\"$adx_env\",component_name=\"adx-runtime\"}[1m]))",
+          "instant": true,
+          "legendFormat": "{{adx_env}}",
+          "queryType": "instant"
+        }
+      ]
+    },
+    {
+      "id": 37,
+      "title": "Control Warnings / Errors (last 5m)",
+      "type": "stat",
+      "description": "Current count of WARN/ERROR control log entries in the last five minutes. Instant query with a fixed lookback; level parsing depends on deployment log formatting.",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 77,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "graphMode": "none",
+        "colorMode": "value",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (adx_env) (count_over_time({adx_env=~\"$adx_env\",component_name!=\"adx-runtime\"} | json | level=~\"(?i)error|warn\" [5m]))",
+          "instant": true,
+          "legendFormat": "{{adx_env}}",
+          "queryType": "instant"
+        }
+      ]
+    },
+    {
+      "id": 38,
+      "title": "Collector Queue Utilization",
+      "type": "timeseries",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 84,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max by (adx_env,exporter) (otelcol_exporter_queue_size{adx_env=~\"$adx_env\"} / otelcol_exporter_queue_capacity{adx_env=~\"$adx_env\"})",
+          "instant": false,
+          "legendFormat": "{{adx_env}}"
+        }
+      ]
+    },
+    {
+      "id": 39,
+      "title": "Collector Refused / Enqueue Failed",
+      "type": "timeseries",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 84,
+        "w": 12,
+        "h": 7
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (adx_env) (rate({__name__=~\"otelcol_.*(refused|enqueue_failed).*\",adx_env=~\"$adx_env\"}[5m]))",
+          "instant": false,
+          "legendFormat": "{{adx_env}}"
+        }
+      ]
+    },
+    {
+      "id": 40,
+      "title": "Environment States by Node",
+      "type": "table",
+      "description": "",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prometheus"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 91,
+        "w": 24,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (adx_env,node_id,state) (adx_coordinator_environments{adx_env=~\"$adx_env\",state=~\"Running|Paused\"})",
+          "instant": true,
+          "legendFormat": "{{adx_env}}",
+          "format": "table"
         }
       ]
     }
@@ -2070,7 +2583,10 @@
           "text": "All",
           "value": "$__all"
         },
-        "datasource": "Prometheus",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
         "definition": "label_values(adx_coordinator_node_capacity_cpu_millis, adx_env)",
         "includeAll": true,
         "label": "adx_env",
@@ -2084,48 +2600,6 @@
         "regex": "",
         "sort": 1,
         "type": "query"
-      },
-      {
-        "name": "runtime_id",
-        "label": "Environment Runtime",
-        "description": "Search by Environment ID and select runtime records from resource samples in the current time range. All searches all collected environment output.",
-        "type": "query",
-        "datasource": {
-          "type": "prometheus",
-          "uid": "prometheus"
-        },
-        "definition": "label_values(adx_environment_stats_age_seconds{adx_env=~\"$adx_env\"}, runtime_id)",
-        "query": {
-          "query": "label_values(adx_environment_stats_age_seconds{adx_env=~\"$adx_env\"}, runtime_id)",
-          "refId": "Prometheus-runtime-id-Variable"
-        },
-        "multi": true,
-        "includeAll": true,
-        "allValue": ".+",
-        "current": {
-          "text": [
-            "All"
-          ],
-          "value": [
-            "$__all"
-          ]
-        },
-        "options": [],
-        "refresh": 2,
-        "sort": 1,
-        "regex": ""
-      },
-      {
-        "name": "log_search",
-        "label": "Log Keyword",
-        "description": "Case-sensitive substring search in the original log message. Leave empty to match all messages.",
-        "type": "textbox",
-        "query": "",
-        "current": {
-          "text": "",
-          "value": ""
-        },
-        "options": []
       }
     ]
   },
@@ -2137,6 +2611,6 @@
   "timezone": "browser",
   "title": "ADX Schedule",
   "uid": "adx-schedule",
-  "version": 9,
+  "version": 10,
   "weekStart": ""
 }

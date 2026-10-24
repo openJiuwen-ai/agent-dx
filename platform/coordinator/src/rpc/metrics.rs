@@ -1,6 +1,45 @@
 use super::*;
 
 impl CoordinatorRpc {
+    /// Current per-Environment inventory for the optional short-retention store.
+    pub async fn environment_metrics(&self) -> Result<String> {
+        let state = self
+            .0
+            .state
+            .try_lock()
+            .map_err(|_| Error::Unavailable("Coordinator state busy".into()))?;
+        state.healthy()?;
+        let mut out = adx_observability::metrics::Text::default();
+        for stored in state.environments.values() {
+            let name = if stored.invalidated {
+                "Invalidated".to_owned()
+            } else if stored
+                .recovery
+                .as_ref()
+                .is_some_and(|recovery| recovery.pending)
+            {
+                "Recovering".to_owned()
+            } else {
+                stored
+                    .result
+                    .as_ref()
+                    .map_or("Reserved".to_owned(), |record| {
+                        format!("{:?}", record.state)
+                    })
+            };
+            out.gauge(
+                "adx_environment_info",
+                &[
+                    ("environment_id", stored.spec.id.clone()),
+                    ("node_id", stored.assignment.node_id.clone()),
+                    ("state", name),
+                ],
+                1,
+            );
+        }
+        Ok(out.finish())
+    }
+
     /// Read the current in-memory committed directory and scheduler ledgers.
     /// Never query Redis or block lifecycle RPCs waiting for a metrics scrape.
     pub async fn metrics(&self) -> Result<String> {
@@ -90,6 +129,11 @@ impl CoordinatorRpc {
                 count,
             );
         }
-        Ok(out.finish())
+        let mut output = out.finish();
+        output.push_str(&format!(
+            "# TYPE adx_environment_created_total counter\nadx_environment_created_total {}\n",
+            self.0.created.load(std::sync::atomic::Ordering::Relaxed)
+        ));
+        Ok(output)
     }
 }

@@ -44,7 +44,25 @@ impl Session {
             .arg(id)
             .arg(old.unwrap_or(""))
             .arg(encode(next)?);
-        Ok(self.store.query::<u64>(command).await? == 1)
+        let mut inventory = self.inspection.lock().await;
+        let mut committed = inventory.take();
+        match self.store.query::<u64>(command).await {
+            Ok(1) => {
+                if let Some(inventory) = committed.as_mut() {
+                    inventory.snapshots.insert(id.into(), next.clone());
+                }
+                *inventory = committed;
+                Ok(true)
+            }
+            Ok(_) => {
+                *inventory = committed;
+                Ok(false)
+            }
+            Err(error) => {
+                *inventory = None;
+                Err(error)
+            }
+        }
     }
     pub async fn publish_snapshot(&self, record: Snapshot) -> Result<Snapshot> {
         record.validate()?;
