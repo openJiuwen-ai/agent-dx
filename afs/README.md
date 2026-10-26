@@ -70,6 +70,17 @@ python3 build/ci/run.py afs
 
 SHM 的 memfd、sealing 与原子 CLOEXEC FD 传递实现及对应运行测试只在 Linux 编译。macOS 上返回 `ShmError::Unsupported`，仅检查该不支持契约；这不代表 AFS/FUSE 在 macOS 可运行。
 
+## Outlet 预挂载网格（可选）
+
+Node 可配置 `outlet_users_root` / `outlet_import_root` / `outlet_public_root`
+三路径启用多节点 workspace 发布面；三者为 all-or-none，且要求 OwnerFs，
+与 legacy egress、native workspace 互斥。部署方负责 users 数据卷、public
+tmpfs 与各成员 NFS import 挂载，AFS 只做只读校验和探活。可选
+`[outlet_transport] backend = "nfs"`。详细架构、配置与验证边界见
+[架构](../docs/architecture/afs.md#outlet-预挂载网格)、
+[部署](../docs/deployment/afs.md#outlet-预挂载网格配置) 与
+[测试](../docs/testing/afs.md#outlet-预挂载网格回归)。
+
 ## 当前能力边界
 
 - OwnerFs workspace bind mount 默认 OFF；当前实际试用场景需要显式配置 ON。

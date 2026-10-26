@@ -161,6 +161,41 @@ sudo adxctl validate
 `node.toml` 中启用对应 `ownerfs_mount` 或 `dfs_mount`。挂载所有者捕获的 canonical
 path、mount ID 和 source 同时作为 readiness 身份；挂载被替换时健康检查继续失败关闭。
 
+## Outlet 预挂载网格配置
+
+Outlet 可选启用，要求 Node 已启用 OwnerFs（`fs = "ownerfs"` 或 `"all"`），
+并与 legacy egress（`experimental_ownerfs_workspace_bind`）及
+`experimental_native_workspace` 互斥。三个路径必须同时设置，缺一即拒绝启动：
+
+```toml
+outlet_users_root  = "/mnt/adx/users"
+outlet_import_root = "/mnt/adx/imports"
+outlet_public_root = "/mnt/adx/public"
+
+[outlet_transport]
+backend = "nfs"   # v1 唯一合法值；省略时同样按 nfs 语义运行
+```
+
+部署方必须先准备挂载，`afs-node` 只读校验：
+
+```sh
+mount -o rw,nosuid,nodev <device> /mnt/adx/users && chmod 0711 /mnt/adx/users
+mount -t tmpfs -o size=64m,mode=0755,nosuid,nodev tmpfs /mnt/adx/public
+mount -t nfs <peer>:/<users_root> /mnt/adx/imports/<peer>/users
+```
+
+约束：
+
+- 三个路径都必须是绝对路径、不含 `.`/`..`，彼此不重叠，也不与 `data_dir` 重叠；
+- `outlet_users_root` 是 OwnerFs 物理存储根，启动时必须已存在，否则 fail-fast，
+  避免数据写到根文件系统；
+- `outlet_public_root` 必须是已挂载的 tmpfs；节点启动时会校验，缺失即失败；
+- 每个 live 成员的 `<import_root>/<node>/users` 必须由部署方预挂载；缺失或
+  文件系统类型漂移只告警并在拓扑中标记，不自动补挂；
+- 工作区物理目录名等于裸 workspace 名；Root id 必须是 canonical
+  `root-<lowercase hex>`，内部保留名（`.pub`、`.quarantine`、
+  `.ownerfs-roots`）会被拒绝。
+
 ## OwnerFs workspace bind ON
 
 普通发行默认关闭 workspace bind。当前实际试用场景需要显式开启，示例字段以 `build/config/examples/afs/node.toml` 为准；历史 `native_workspace` 命名只作为兼容入口，不能作为新的核心能力名称。
