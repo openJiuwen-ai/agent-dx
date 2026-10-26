@@ -623,7 +623,19 @@ impl CoordinatorRpc {
                         n.last_seen.elapsed() >= self.0.heartbeat_timeout || !n.inspected
                     })
                 {
-                    return Err(Status::unavailable("owner node requires reconciliation"));
+                    // Retain the accepted assignment's original create budget
+                    // while owner readiness is unavailable. Reload authority
+                    // after notification instead of ending the RPC after the
+                    // client's short retry window.
+                    drop(state);
+                    tokio::time::timeout_at(create_deadline.instant(), changed)
+                        .await
+                        .map_err(|_| {
+                            Status::deadline_exceeded(
+                                "create deadline exceeded waiting for owner reconciliation",
+                            )
+                        })?;
+                    continue;
                 }
                 let snapshot = match &spec.snapshot_id {
                     Some(id) => {

@@ -293,6 +293,36 @@ impl Rig {
             node_session_id: format!("boot-{}", if index == 0 { "a" } else { "b" }),
         }
     }
+    async fn claim_with_closed_owner(&mut self, id: &str) -> pb::RegisterNodeRequest {
+        self.claimants[0]
+            .claim_environment(pb::ClaimEnvironmentRequest {
+                spec: Some(spec(id).into()),
+                caller: caller(),
+                node_session_id: "boot-a".into(),
+                devices: vec![],
+            })
+            .await
+            .unwrap();
+        let stored = self.session.snapshot().await.unwrap().nodes["a"].clone();
+        let register = pb::RegisterNodeRequest {
+            runtime_classes: stored.node.runtime_classes,
+            node_id: "a".into(),
+            node_address: stored.address,
+            proxy_address: stored.proxy_address,
+            capacity: Some(stored.node.capacity.into()),
+            accepting_allocations: false,
+            labels: stored.node.labels.into_iter().collect(),
+            devices: stored.node.devices.into_iter().map(Into::into).collect(),
+            session_id: "boot-a".into(),
+            heartbeat_sequence: stored.session.unwrap().sequence + 1,
+            reconciling: true,
+        };
+        self.claimants[0]
+            .register_node(register.clone())
+            .await
+            .unwrap();
+        register
+    }
     async fn delete(&mut self, record: &pb::EnvironmentRecord) {
         let owner = record.assignment.as_ref().unwrap();
         let index = usize::from(owner.node_id == "b");
@@ -306,6 +336,93 @@ impl Rig {
             .await
             .unwrap();
     }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
+async fn existing_create_waits_for_owner_reconciliation_without_reassigning() {
+    let mut rig = Rig::new().await;
+    let mut heartbeat = rig.claim_with_closed_owner("reconciling-owner").await;
+    let original = rig
+        .session
+        .get("reconciling-owner")
+        .await
+        .unwrap()
+        .assignment;
+    let mut coordinator = rig.coordinator.clone();
+    let pending = tokio::spawn(async move {
+        coordinator
+            .create_environment(create("reconciling-owner"))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        !pending.is_finished(),
+        "temporary closed admission must retain the accepted create"
+    );
+    assert_eq!(rig.backends[0].started.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.backends[1].started.load(Ordering::SeqCst), 0);
+    rig.claimants[0]
+        .inspect_node(pb::InspectNodeRequest {
+            node_id: "a".into(),
+            session_id: "boot-a".into(),
+        })
+        .await
+        .unwrap();
+    heartbeat.heartbeat_sequence += 1;
+    heartbeat.reconciling = false;
+    heartbeat.accepting_allocations = true;
+    rig.claimants[0].register_node(heartbeat).await.unwrap();
+    let record = tokio::time::timeout(Duration::from_secs(3), pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    assert_eq!(
+        record.assignment.as_ref().unwrap().generation,
+        original.generation
+    );
+    assert_eq!(record.assignment.as_ref().unwrap().node_id, "a");
+    assert_eq!(rig.backends[0].started.load(Ordering::SeqCst), 1);
+    assert_eq!(rig.backends[1].started.load(Ordering::SeqCst), 0);
+    rig.delete(&record).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
+async fn existing_create_owner_reconciliation_keeps_the_original_deadline() {
+    let mut rig = Rig::new().await;
+    rig.claim_with_closed_owner("reconciling-deadline").await;
+    let original = rig
+        .session
+        .get("reconciling-deadline")
+        .await
+        .unwrap()
+        .assignment;
+    let mut request = create("reconciling-deadline");
+    request.create_timeout_seconds = 1;
+    let began = tokio::time::Instant::now();
+    let error = rig
+        .coordinator
+        .create_environment(request)
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+    assert!(began.elapsed() >= Duration::from_millis(800));
+    assert!(began.elapsed() < Duration::from_secs(3));
+    assert_eq!(
+        rig.session
+            .get("reconciling-deadline")
+            .await
+            .unwrap()
+            .assignment,
+        original
+    );
+    assert_eq!(rig.backends[0].started.load(Ordering::SeqCst), 0);
+    assert_eq!(rig.backends[1].started.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
