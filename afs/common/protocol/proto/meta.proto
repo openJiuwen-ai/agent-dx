@@ -8,6 +8,9 @@ service Meta {
   rpc Ping(PingRequest) returns (PingReply);
   rpc RegisterNode(RegisterNodeRequest) returns (RegisterNodeReply);
   rpc LookupNode(LookupNodeRequest) returns (LookupNodeReply);
+  // 全量 live 节点会话清单。供 outlet 拓扑对齐等集群视图消费方轮询；
+  // 要求调用方持有当前 live 会话，与 OwnerRoots 轮询面同一认证姿态。
+  rpc ListNodes(ListNodesRequest) returns (ListNodesReply);
 }
 
 message PingRequest {
@@ -75,6 +78,17 @@ message LookupNodeReply {
   bool found = 4;
 }
 
+message ListNodesRequest {
+  string node_id = 1;
+  string session_id = 2;
+}
+
+message ListNodesReply {
+  // 快照时刻 live 的全部节点会话（过期会话已被过滤），按 node_id 排序。
+  repeated NodeDescriptor nodes = 1;
+  uint64 authority_revision = 2;
+}
+
 // ===== OwnerFs 根目录归属与访问授权 =====
 // OwnerRoots 是 OwnerFs 的粗粒度授权面。Meta 只管理根目录归属、
 // 授权代与撤销屏障；每个文件的 inode/dentry/内容仍在 afs-node。
@@ -99,6 +113,13 @@ service OwnerRoots {
   rpc PollRootCommandBatch(PollRootCommandBatchRequest) returns (RootCommandBatchReply);
   rpc AckRevocation(AckRevocationRequest) returns (AckRevocationReply);
   rpc RecoverRoot(RecoverRootRequest) returns (RecoverRootReply);
+  // ===== outlet 消费面（预挂载网格，见 afs/outlet-premounted-spec-v1.md）=====
+  // 事件面：发布 worker 轮询 Root 与 NodeSession 变更（Reserve 等
+  // 中间态不进发布面）；Compacted 时消费者退化为全量快照恢复。
+  rpc PollOutletEvents(PollOutletEventsRequest) returns (OutletEventBatchReply);
+  // 全量快照面：全集群 Active roots（不按 home 过滤），供启动对账与
+  // Compacted 恢复。RootLocation 只供定位，不是授权。
+  rpc ListOutletRoots(ListOutletRootsRequest) returns (ListOutletRootsReply);
 }
 
 enum RootRight {
@@ -337,6 +358,80 @@ message RootCommandBatchReply {
     RootCommandBatchCompacted compacted = 2;
     RootCommandBatchUnsupported unsupported = 3;
   }
+}
+
+// ===== outlet 消费面消息 =====
+// PollOutletEvents 复用 RootCommandBatch 的游标契约：批内修订单调递增、
+// 游标只跨越完整修订；next_revision = 本批最后事件修订 + 1，消费方下一轮
+// 以 next_revision - 1 作为 after_revision（与 PollRootCommandBatch 相同）。
+// Compacted 携带恢复游标，消费者改走全量快照。
+message PollOutletEventsRequest {
+  string node_id = 1;
+  string session_id = 2;
+  uint64 after_revision = 3;
+}
+
+message OutletEventRootActivated {
+  RootLocation root = 1;
+}
+
+message OutletEventRootDeleted {
+  string root_id = 1;
+}
+
+message OutletEventNodeSessionRegistered {
+  string node_id = 1;
+  string session_id = 2;
+}
+
+message OutletEvent {
+  uint64 revision = 1;
+  oneof kind {
+    OutletEventRootActivated root_activated = 2;
+    OutletEventRootDeleted root_deleted = 3;
+    OutletEventNodeSessionRegistered node_session_registered = 4;
+  }
+}
+
+enum OutletEventRecoveryReason {
+  OUTLET_EVENT_RECOVERY_REASON_UNSPECIFIED = 0;
+  OUTLET_EVENT_RECOVERY_REASON_WATCH_COMPACTED = 1;
+  OUTLET_EVENT_RECOVERY_REASON_NODE_SESSION_RESTARTED = 2;
+  OUTLET_EVENT_RECOVERY_REASON_BACKEND_LEADER_CHANGED = 3;
+}
+
+message OutletEventRecoveryCursor {
+  uint64 resume_after = 1;
+  OutletEventRecoveryReason reason = 2;
+}
+
+message OutletEventBatchEvents {
+  uint64 start_revision = 1;
+  uint64 next_revision = 2;
+  repeated OutletEvent events = 3;
+}
+
+message OutletEventBatchCompacted {
+  uint64 requested_after = 1;
+  uint64 compacted_to = 2;
+  OutletEventRecoveryCursor recovery_cursor = 3;
+}
+
+message OutletEventBatchReply {
+  oneof result {
+    OutletEventBatchEvents events = 1;
+    OutletEventBatchCompacted compacted = 2;
+  }
+}
+
+message ListOutletRootsRequest {
+  string node_id = 1;
+  string session_id = 2;
+}
+
+message ListOutletRootsReply {
+  repeated RootLocation roots = 1;
+  uint64 authority_revision = 2;
 }
 
 message AckRevocationRequest {

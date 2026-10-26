@@ -21,19 +21,19 @@ use afs::{
 };
 use afs_protocol::meta::{
     AbortRootRequest, AckRevocationRequest, AcquireRootRequest, ActivateRootReply,
-    ActivateRootRequest, CommitFileVersionRequest, DfsCallerContext, DfsChunkReceipt,
-    DfsCommitMetadataDelta, DfsCommitMetadataMode, DfsCreateRequest, DfsExtent, DfsFileVersion,
-    DfsGetXattrRequest, DfsInodeAttributeUpdate, DfsInodeAttributes, DfsLayoutRoot, DfsLinkRequest,
-    DfsListXattrRequest, DfsLookupRequest, DfsMkdirRequest, DfsReadDirRequest, DfsReadLinkRequest,
-    DfsRemoveXattrRequest, DfsRenameMode, DfsRenameRequest, DfsReplicaAck, DfsRmdirRequest,
-    DfsSetInodeAttributesRequest, DfsSetXattrRequest, DfsStorageDevice, DfsSymlinkRequest,
-    DfsUnlinkRequest, DfsWriteLease, DfsXattrSetMode, ListOwnerRootsRequest, LookupNodeRequest,
-    LookupRootReply, LookupRootRequest, NodeDescriptor, NodeEndpoint, OpenDfsWriteRequest,
-    PollRootCommandBatchRequest, PresentedRootAccess, RecoverRootRequest, RegisterNodeRequest,
-    ReserveRootReply, ReserveRootRequest, RootAccess, RootCommand, RootCommandType, RootLocation,
-    RootReservation, RootRight, ValidateRootAccessRequest, WatchRootCommandsRequest,
-    dfs_meta_server::DfsMeta as DfsMetaService, meta_server::Meta as MetaService,
-    owner_roots_server::OwnerRoots as OwnerRootsService,
+    ActivateRootRequest, CommitFileVersionRequest, DeactivateRootRequest, DfsCallerContext,
+    DfsChunkReceipt, DfsCommitMetadataDelta, DfsCommitMetadataMode, DfsCreateRequest, DfsExtent,
+    DfsFileVersion, DfsGetXattrRequest, DfsInodeAttributeUpdate, DfsInodeAttributes, DfsLayoutRoot,
+    DfsLinkRequest, DfsListXattrRequest, DfsLookupRequest, DfsMkdirRequest, DfsReadDirRequest,
+    DfsReadLinkRequest, DfsRemoveXattrRequest, DfsRenameMode, DfsRenameRequest, DfsReplicaAck,
+    DfsRmdirRequest, DfsSetInodeAttributesRequest, DfsSetXattrRequest, DfsStorageDevice,
+    DfsSymlinkRequest, DfsUnlinkRequest, DfsWriteLease, DfsXattrSetMode, ListOwnerRootsRequest,
+    LookupNodeRequest, LookupRootReply, LookupRootRequest, NodeDescriptor, NodeEndpoint,
+    OpenDfsWriteRequest, PollRootCommandBatchRequest, PresentedRootAccess, RecoverRootRequest,
+    RegisterNodeRequest, ReserveRootReply, ReserveRootRequest, RootAccess, RootCommand,
+    RootCommandType, RootLocation, RootReservation, RootRight, ValidateRootAccessRequest,
+    WatchRootCommandsRequest, dfs_meta_server::DfsMeta as DfsMetaService,
+    meta_server::Meta as MetaService, owner_roots_server::OwnerRoots as OwnerRootsService,
 };
 use std::sync::{Arc, Mutex, Weak};
 use tonic::{Code, Request};
@@ -944,7 +944,7 @@ async fn contract_rpc_does_not_issue_fake_grants_without_store() {
     let recover = rpc::OwnerRootsRpc(meta.clone())
         .recover_root(Request::new(RecoverRootRequest {
             request_id: "recover-a".into(),
-            root_id: "workspace-a".into(),
+            root_id: canonical_root_id("workspace-a"),
             expected_root_epoch: 7,
             home_node_id: "node-a".into(),
             home_session_id: "session-a-new".into(),
@@ -1014,6 +1014,7 @@ async fn owner_authority_reserve_activate_acquire_validate_and_recover() {
     ));
     let meta_rpc = rpc::MetaRpc(meta.clone());
     let owner_rpc = rpc::OwnerRootsRpc(meta);
+    let root_id = canonical_root_id("workspace-a");
 
     for (node_id, session_id) in [("node-a", "session-a"), ("node-b", "session-b")] {
         let reply = meta_rpc
@@ -1043,7 +1044,7 @@ async fn owner_authority_reserve_activate_acquire_validate_and_recover() {
     let reservation = owner_rpc
         .reserve_root(Request::new(ReserveRootRequest {
             request_id: "reserve-a".into(),
-            root_id: "workspace-a".into(),
+            root_id: root_id.clone(),
             preferred_home_node_id: "node-a".into(),
             session_id: "session-a".into(),
             rights: vec![RootRight::Lookup.into(), RootRight::Write.into()],
@@ -1059,7 +1060,7 @@ async fn owner_authority_reserve_activate_acquire_validate_and_recover() {
         .unwrap();
     assert_eq!(
         reservation.prepare_token,
-        "prepare:workspace-a:session-a:mkdir-a:reserve-a"
+        format!("prepare:{root_id}:session-a:mkdir-a:reserve-a")
     );
 
     let home_access = owner_rpc
@@ -1081,7 +1082,7 @@ async fn owner_authority_reserve_activate_acquire_validate_and_recover() {
     let location = owner_rpc
         .lookup_root(Request::new(LookupRootRequest {
             request_id: "lookup-a".into(),
-            root_id: "workspace-a".into(),
+            root_id: root_id.clone(),
         }))
         .await
         .unwrap()
@@ -1098,14 +1099,14 @@ async fn owner_authority_reserve_activate_acquire_validate_and_recover() {
         .unwrap()
         .into_inner();
     assert_eq!(listed.active_roots.len(), 1);
-    assert_eq!(listed.active_roots[0].root_id, "workspace-a");
+    assert_eq!(listed.active_roots[0].root_id, root_id);
     assert!(listed.pending_reservations.is_empty());
     assert!(listed.authority_revision > 0);
 
     let remote_access = owner_rpc
         .acquire_root(Request::new(AcquireRootRequest {
             request_id: "acquire-b".into(),
-            root_id: "workspace-a".into(),
+            root_id: root_id.clone(),
             requester_node_id: "node-b".into(),
             session_id: "session-b".into(),
             rights: vec![RootRight::Lookup.into(), RootRight::Read.into()],
@@ -1127,7 +1128,7 @@ async fn owner_authority_reserve_activate_acquire_validate_and_recover() {
     let widened_access = owner_rpc
         .acquire_root(Request::new(AcquireRootRequest {
             request_id: "acquire-b-write".into(),
-            root_id: "workspace-a".into(),
+            root_id: root_id.clone(),
             requester_node_id: "node-b".into(),
             session_id: "session-b".into(),
             rights: vec![RootRight::Write.into()],
@@ -1150,7 +1151,7 @@ async fn owner_authority_reserve_activate_acquire_validate_and_recover() {
 
     let persisted_access = store
         .read(MetaRead::RootGrantByHolder {
-            root_id: "workspace-a".into(),
+            root_id: root_id.clone(),
             holder_node_id: "node-b".into(),
             holder_session_id: "session-b".into(),
         })
@@ -1245,7 +1246,7 @@ async fn owner_authority_reserve_activate_acquire_validate_and_recover() {
     let recovered = owner_rpc
         .recover_root(Request::new(RecoverRootRequest {
             request_id: "recover-a".into(),
-            root_id: "workspace-a".into(),
+            root_id: root_id.clone(),
             expected_root_epoch: 1,
             home_node_id: "node-a".into(),
             home_session_id: "session-a-2".into(),
@@ -1264,7 +1265,7 @@ async fn owner_authority_reserve_activate_acquire_validate_and_recover() {
     let reacquired = owner_rpc
         .acquire_root(Request::new(AcquireRootRequest {
             request_id: "acquire-b-after-home-recover".into(),
-            root_id: "workspace-a".into(),
+            root_id: root_id.clone(),
             requester_node_id: "node-b".into(),
             session_id: "session-b".into(),
             rights: vec![RootRight::Lookup.into(), RootRight::Read.into()],
@@ -1332,7 +1333,7 @@ async fn owner_authority_stale_abort_cannot_delete_new_pending_reservation() {
     let old = owner_rpc
         .reserve_root(Request::new(ReserveRootRequest {
             request_id: "reserve-old".into(),
-            root_id: "workspace-race".into(),
+            root_id: canonical_root_id("workspace-race"),
             preferred_home_node_id: "node-a".into(),
             session_id: "session-a".into(),
             expected_root_epoch: 1,
@@ -1361,7 +1362,7 @@ async fn owner_authority_stale_abort_cannot_delete_new_pending_reservation() {
     let new = owner_rpc
         .reserve_root(Request::new(ReserveRootRequest {
             request_id: "reserve-new".into(),
-            root_id: "workspace-race".into(),
+            root_id: canonical_root_id("workspace-race"),
             preferred_home_node_id: "node-a".into(),
             session_id: "session-a".into(),
             expected_root_epoch: 1,
@@ -1564,6 +1565,357 @@ async fn n2b1_memory_owner_fixture() -> (Arc<Store>, rpc::MetaRpc, rpc::OwnerRoo
         store.clone(),
     ));
     (store, rpc::MetaRpc(meta.clone()), rpc::OwnerRootsRpc(meta))
+}
+
+// ===== outlet 消费面契约（PollOutletEvents / ListOutletRoots / ListNodes）=====
+
+/// Node 编码器的字节级等价实现：root id 必须是 `root-<lowercase hex>`，
+/// 否则 Meta 的 canonical 校验会拒绝契约测试自身的数据。
+fn canonical_root_id(name: &str) -> String {
+    let encoded: String = name.bytes().map(|byte| format!("{byte:02x}")).collect();
+    format!("root-{encoded}")
+}
+
+async fn outlet_register_node(
+    meta_rpc: &rpc::MetaRpc,
+    node_id: &str,
+    session_id: &str,
+    lease_seconds: u64,
+) {
+    meta_rpc
+        .register_node(Request::new(RegisterNodeRequest {
+            request_id: format!("register-{node_id}-{session_id}"),
+            node: Some(NodeDescriptor {
+                node_id: node_id.into(),
+                endpoint: Some(NodeEndpoint {
+                    grpc_addr: format!("http://{node_id}:7400"),
+                    data_addr: format!("http://{node_id}:7500"),
+                    rest_addr: format!("http://{node_id}:7600"),
+                }),
+                labels: Default::default(),
+                capabilities: vec!["ownerfs".into()],
+                session_id: session_id.into(),
+                storage_devices: Vec::new(),
+            }),
+            lease_seconds,
+        }))
+        .await
+        .unwrap();
+}
+
+async fn outlet_activate_root(
+    owner_rpc: &rpc::OwnerRootsRpc,
+    request_id: &str,
+    root_id: &str,
+    home_node_id: &str,
+    home_session_id: &str,
+) -> u64 {
+    let reservation = owner_rpc
+        .reserve_root(Request::new(ReserveRootRequest {
+            request_id: format!("reserve-{request_id}"),
+            root_id: root_id.into(),
+            preferred_home_node_id: home_node_id.into(),
+            session_id: home_session_id.into(),
+            rights: vec![RootRight::Lookup.into(), RootRight::Write.into()],
+            expected_root_epoch: 1,
+            parent_root_id: String::new(),
+            create_intent_id: format!("mkdir-{request_id}"),
+            conflict_policy: 0,
+        }))
+        .await
+        .unwrap()
+        .into_inner()
+        .reservation
+        .unwrap();
+    let root_epoch = reservation.root_epoch;
+    owner_rpc
+        .activate_root(Request::new(ActivateRootRequest {
+            request_id: format!("activate-{request_id}"),
+            reservation: Some(reservation),
+            local_prepare_id: format!("local-prepare-{request_id}"),
+            parent_fsync_generation: 1,
+            parent_fsync_complete: true,
+        }))
+        .await
+        .unwrap();
+    root_epoch
+}
+
+async fn outlet_poll_events(
+    owner_rpc: &rpc::OwnerRootsRpc,
+    node_id: &str,
+    session_id: &str,
+    after_revision: u64,
+) -> afs_protocol::meta::OutletEventBatchEvents {
+    let reply = owner_rpc
+        .poll_outlet_events(Request::new(afs_protocol::meta::PollOutletEventsRequest {
+            node_id: node_id.into(),
+            session_id: session_id.into(),
+            after_revision,
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    match reply.result.unwrap() {
+        afs_protocol::meta::outlet_event_batch_reply::Result::Events(events) => events,
+        _ => panic!("expected outlet events reply"),
+    }
+}
+
+fn outlet_event_summary(event: &afs_protocol::meta::OutletEvent) -> String {
+    use afs_protocol::meta::outlet_event::Kind;
+    match event.kind.as_ref().unwrap() {
+        Kind::RootActivated(activated) => {
+            format!("activated:{}", activated.root.as_ref().unwrap().root_id)
+        }
+        Kind::RootDeleted(deleted) => format!("deleted:{}", deleted.root_id),
+        Kind::NodeSessionRegistered(session) => {
+            format!("node:{}:{}", session.node_id, session.session_id)
+        }
+    }
+}
+
+#[tokio::test]
+async fn outlet_poll_events_without_store_fails_closed() {
+    let owner_rpc = rpc::OwnerRootsRpc(Arc::new(Meta::new(
+        "meta-no-store".into(),
+        Observability::new().unwrap(),
+    )));
+    let error = owner_rpc
+        .poll_outlet_events(Request::new(afs_protocol::meta::PollOutletEventsRequest {
+            node_id: "node-a".into(),
+            session_id: "session-a".into(),
+            after_revision: 0,
+        }))
+        .await
+        .unwrap_err();
+    assert_ne!(error.code(), Code::Ok);
+}
+
+#[tokio::test]
+async fn outlet_poll_events_rejects_missing_current_session() {
+    let (_, _, owner_rpc) = n2b1_memory_owner_fixture().await;
+    let error = owner_rpc
+        .poll_outlet_events(Request::new(afs_protocol::meta::PollOutletEventsRequest {
+            node_id: "node-a".into(),
+            session_id: "session-a".into(),
+            after_revision: 0,
+        }))
+        .await
+        .unwrap_err();
+    assert_ne!(error.code(), Code::Ok);
+}
+
+#[tokio::test]
+async fn outlet_poll_events_filters_publication_surface_and_advances_cursor() {
+    let (_, meta_rpc, owner_rpc) = n2b1_memory_owner_fixture().await;
+    outlet_register_node(&meta_rpc, "node-a", "session-a", 30).await;
+
+    // Reserve-only root: pending reservations must stay off the outlet surface.
+    owner_rpc
+        .reserve_root(Request::new(ReserveRootRequest {
+            request_id: "reserve-pending".into(),
+            root_id: canonical_root_id("workspace-pending"),
+            preferred_home_node_id: "node-a".into(),
+            session_id: "session-a".into(),
+            rights: vec![RootRight::Lookup.into()],
+            expected_root_epoch: 1,
+            parent_root_id: String::new(),
+            create_intent_id: "mkdir-pending".into(),
+            conflict_policy: 0,
+        }))
+        .await
+        .unwrap();
+
+    let root_a = canonical_root_id("workspace-a");
+    let root_a_epoch = outlet_activate_root(&owner_rpc, "a", &root_a, "node-a", "session-a").await;
+
+    let first = outlet_poll_events(&owner_rpc, "node-a", "session-a", 0).await;
+    assert_eq!(first.start_revision, 0);
+    assert!(first.next_revision > 0);
+    let summaries: Vec<_> = first.events.iter().map(outlet_event_summary).collect();
+    assert!(summaries.contains(&"node:node-a:session-a".to_string()));
+    assert!(summaries.contains(&format!("activated:{root_a}")));
+    assert!(
+        !summaries
+            .iter()
+            .any(|summary| summary.contains(&canonical_root_id("workspace-pending"))),
+        "pending reservation must not appear: {summaries:?}"
+    );
+
+    owner_rpc
+        .deactivate_root(Request::new(DeactivateRootRequest {
+            request_id: "deactivate-a".into(),
+            root_id: root_a.clone(),
+            root_epoch: root_a_epoch,
+            home_node_id: "node-a".into(),
+            home_session_id: "session-a".into(),
+            reason: "test".into(),
+        }))
+        .await
+        .unwrap();
+
+    let resume = first.next_revision - 1;
+    let second = outlet_poll_events(&owner_rpc, "node-a", "session-a", resume).await;
+    let summaries: Vec<_> = second.events.iter().map(outlet_event_summary).collect();
+    assert_eq!(summaries, vec![format!("deleted:{root_a}")]);
+
+    let head = second.next_revision - 1;
+    let idle = outlet_poll_events(&owner_rpc, "node-a", "session-a", head).await;
+    assert!(idle.events.is_empty());
+    assert!(idle.next_revision > head);
+}
+
+#[tokio::test]
+async fn outlet_list_roots_returns_all_active_roots_across_homes() {
+    let (_, meta_rpc, owner_rpc) = n2b1_memory_owner_fixture().await;
+    outlet_register_node(&meta_rpc, "node-a", "session-a", 30).await;
+    outlet_register_node(&meta_rpc, "node-b", "session-b", 30).await;
+    let root_a = canonical_root_id("workspace-a");
+    let root_b = canonical_root_id("workspace-b");
+    let root_a_epoch = outlet_activate_root(&owner_rpc, "a", &root_a, "node-a", "session-a").await;
+    outlet_activate_root(&owner_rpc, "b", &root_b, "node-b", "session-b").await;
+
+    owner_rpc
+        .reserve_root(Request::new(ReserveRootRequest {
+            request_id: "reserve-pending".into(),
+            root_id: canonical_root_id("workspace-pending"),
+            preferred_home_node_id: "node-a".into(),
+            session_id: "session-a".into(),
+            rights: vec![RootRight::Lookup.into()],
+            expected_root_epoch: 1,
+            parent_root_id: String::new(),
+            create_intent_id: "mkdir-pending".into(),
+            conflict_policy: 0,
+        }))
+        .await
+        .unwrap();
+
+    let listed = owner_rpc
+        .list_outlet_roots(Request::new(afs_protocol::meta::ListOutletRootsRequest {
+            node_id: "node-b".into(),
+            session_id: "session-b".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let root_ids: Vec<_> = listed
+        .roots
+        .iter()
+        .map(|root| root.root_id.clone())
+        .collect();
+    assert_eq!(root_ids, vec![root_a.clone(), root_b.clone()]);
+    assert_eq!(
+        listed.roots[0].home_node_id, "node-a",
+        "outlet snapshot is not filtered by the caller's home"
+    );
+    assert!(listed.authority_revision > 0);
+
+    let home_listed = owner_rpc
+        .list_owner_roots(Request::new(ListOwnerRootsRequest {
+            request_id: "list-home".into(),
+            home_node_id: "node-a".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(home_listed.active_roots.len(), 1);
+    assert_eq!(home_listed.active_roots[0].root_id, root_a);
+
+    owner_rpc
+        .deactivate_root(Request::new(DeactivateRootRequest {
+            request_id: "deactivate-a".into(),
+            root_id: root_a,
+            root_epoch: root_a_epoch,
+            home_node_id: "node-a".into(),
+            home_session_id: "session-a".into(),
+            reason: "test".into(),
+        }))
+        .await
+        .unwrap();
+    let listed = owner_rpc
+        .list_outlet_roots(Request::new(afs_protocol::meta::ListOutletRootsRequest {
+            node_id: "node-b".into(),
+            session_id: "session-b".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let root_ids: Vec<_> = listed
+        .roots
+        .iter()
+        .map(|root| root.root_id.clone())
+        .collect();
+    assert_eq!(root_ids, vec![root_b]);
+}
+
+#[tokio::test]
+async fn outlet_list_roots_revision_anchors_event_cursor_without_gaps() {
+    let (_, meta_rpc, owner_rpc) = n2b1_memory_owner_fixture().await;
+    outlet_register_node(&meta_rpc, "node-a", "session-a", 30).await;
+    outlet_activate_root(
+        &owner_rpc,
+        "a",
+        &canonical_root_id("workspace-a"),
+        "node-a",
+        "session-a",
+    )
+    .await;
+
+    let snapshot = owner_rpc
+        .list_outlet_roots(Request::new(afs_protocol::meta::ListOutletRootsRequest {
+            node_id: "node-a".into(),
+            session_id: "session-a".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let anchor = snapshot.authority_revision;
+
+    let root_b = canonical_root_id("workspace-b");
+    outlet_activate_root(&owner_rpc, "b", &root_b, "node-a", "session-a").await;
+
+    let events = outlet_poll_events(&owner_rpc, "node-a", "session-a", anchor).await;
+    let summaries: Vec<_> = events.events.iter().map(outlet_event_summary).collect();
+    assert_eq!(
+        summaries,
+        vec![format!("activated:{root_b}")],
+        "snapshot anchor plus polled events must cover every change exactly once"
+    );
+}
+
+#[tokio::test]
+async fn meta_list_nodes_returns_only_live_sessions_sorted() {
+    let (_, meta_rpc, _) = n2b1_memory_owner_fixture().await;
+    outlet_register_node(&meta_rpc, "node-b", "session-b", 30).await;
+    outlet_register_node(&meta_rpc, "node-a", "session-a", 30).await;
+    outlet_register_node(&meta_rpc, "node-c", "session-c", 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+
+    let reply = meta_rpc
+        .list_nodes(Request::new(afs_protocol::meta::ListNodesRequest {
+            node_id: "node-a".into(),
+            session_id: "session-a".into(),
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    let node_ids: Vec<_> = reply
+        .nodes
+        .iter()
+        .map(|node| node.node_id.clone())
+        .collect();
+    assert_eq!(node_ids, vec!["node-a".to_string(), "node-b".to_string()]);
+    assert!(reply.authority_revision > 0);
+
+    let error = meta_rpc
+        .list_nodes(Request::new(afs_protocol::meta::ListNodesRequest {
+            node_id: "node-a".into(),
+            session_id: "session-old".into(),
+        }))
+        .await
+        .unwrap_err();
+    assert_ne!(error.code(), Code::Ok);
 }
 
 async fn n2b1_register_node(meta_rpc: &rpc::MetaRpc) {

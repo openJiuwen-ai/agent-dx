@@ -35,6 +35,11 @@ pub trait OwnerRootAuthority: Send + Sync {
         &self,
         input: WatchRootCommandsInput,
     ) -> MetaFuture<'_, RootCommandBatch>;
+    fn poll_outlet_events(&self, input: PollOutletEventsInput) -> MetaFuture<'_, OutletEventBatch>;
+    fn list_outlet_roots(
+        &self,
+        input: ListOutletRootsInput,
+    ) -> MetaFuture<'_, ListOutletRootsOutput>;
     fn ack_revocation(&self, input: AckRevocationInput) -> MetaFuture<'_, u64>;
     fn recover_root(&self, input: RecoverRootInput) -> MetaFuture<'_, RootAccessGrant>;
 }
@@ -98,6 +103,20 @@ impl OwnerRootAuthority for MissingOwnerRootAuthority {
         })
     }
 
+    fn poll_outlet_events(
+        &self,
+        _input: PollOutletEventsInput,
+    ) -> MetaFuture<'_, OutletEventBatch> {
+        Box::pin(async { Err(unavailable_meta_store()) })
+    }
+
+    fn list_outlet_roots(
+        &self,
+        _input: ListOutletRootsInput,
+    ) -> MetaFuture<'_, ListOutletRootsOutput> {
+        Box::pin(async { Err(unavailable_meta_store()) })
+    }
+
     fn ack_revocation(&self, _input: AckRevocationInput) -> MetaFuture<'_, u64> {
         Box::pin(async { Err(unavailable_meta_store()) })
     }
@@ -146,6 +165,9 @@ impl StoreOwnerRootAuthority {
 impl OwnerRootAuthority for StoreOwnerRootAuthority {
     fn reserve_root(&self, input: ReserveRootInput) -> MetaFuture<'_, ReserveRootOutput> {
         Box::pin(async move {
+            // Reserve 是 root_id 进入 Meta 的唯一入口；activate/recover/deactivate
+            // 都要求匹配 Reserve 已持久化的记录，无需重复校验。
+            ensure_canonical_root_id(&input.root_id)?;
             let key = request_key(
                 format!("{}/{}", input.preferred_home_node_id, input.session_id),
                 input.request_id.clone(),
@@ -733,6 +755,102 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
         })
     }
 
+    fn poll_outlet_events(&self, input: PollOutletEventsInput) -> MetaFuture<'_, OutletEventBatch> {
+        Box::pin(async move {
+            require_current_live_session(self.store.as_ref(), &input.node_id, &input.session_id)
+                .await?;
+            let batch = self
+                .store
+                .watch(StoreRevision(input.after_revision), 1024)
+                .await?;
+            match batch {
+                WatchBatch::Events {
+                    start_revision,
+                    next_revision,
+                    events,
+                } => {
+                    let max_event_revision = events.iter().map(|event| event.revision).max();
+                    if next_revision <= start_revision
+                        || next_revision <= StoreRevision(input.after_revision)
+                        || max_event_revision.is_some_and(|revision| next_revision <= revision)
+                    {
+                        return Err(invalid("outlet event batch cursor did not advance"));
+                    }
+                    let events = events
+                        .into_iter()
+                        .filter_map(|event| {
+                            let revision = event.revision;
+                            let kind = match event.change {
+                                WatchChange::Put(MetaEntity::Root(root)) => {
+                                    OutletEvent::RootActivated { root }
+                                }
+                                WatchChange::Delete => match event.key {
+                                    MetaKey::Root { root_id } => {
+                                        OutletEvent::RootDeleted { root_id }
+                                    }
+                                    _ => return None,
+                                },
+                                // 只认会话本体 key：register_node_session 在同一
+                                // 事务同一修订下还会写 CurrentNodeSession 索引
+                                // （ListNodes 消费），事件流不得重复上报。
+                                WatchChange::Put(MetaEntity::NodeSession(session))
+                                    if matches!(event.key, MetaKey::NodeSession { .. }) =>
+                                {
+                                    OutletEvent::NodeSessionRegistered {
+                                        node_id: session.node_id,
+                                        session_id: session.session_id,
+                                    }
+                                }
+                                _ => return None,
+                            };
+                            Some(WatchedOutletEvent {
+                                event: kind,
+                                revision,
+                            })
+                        })
+                        .collect();
+                    Ok(OutletEventBatch::Events {
+                        start_revision,
+                        next_revision,
+                        events,
+                    })
+                }
+                WatchBatch::Compacted {
+                    requested_after,
+                    compacted_to,
+                    recovery,
+                } => Ok(OutletEventBatch::Compacted {
+                    requested_after,
+                    compacted_to,
+                    recovery,
+                }),
+            }
+        })
+    }
+
+    fn list_outlet_roots(
+        &self,
+        input: ListOutletRootsInput,
+    ) -> MetaFuture<'_, ListOutletRootsOutput> {
+        Box::pin(async move {
+            require_current_live_session(self.store.as_ref(), &input.node_id, &input.session_id)
+                .await?;
+            let snapshot = self.store.read(MetaRead::Roots).await?;
+            let active_roots = snapshot
+                .entities
+                .into_iter()
+                .filter_map(|entity| match entity {
+                    MetaEntity::Root(root) => Some(root),
+                    _ => None,
+                })
+                .collect();
+            Ok(ListOutletRootsOutput {
+                authority_revision: snapshot.revision,
+                active_roots,
+            })
+        })
+    }
+
     fn ack_revocation(&self, input: AckRevocationInput) -> MetaFuture<'_, u64> {
         Box::pin(async move {
             let ack = RootCommandAck {
@@ -976,6 +1094,49 @@ pub enum RootCommandBatch {
     },
 }
 
+pub struct PollOutletEventsInput {
+    pub node_id: String,
+    pub session_id: String,
+    pub after_revision: u64,
+}
+
+/// Outlet-visible store change. Reservation and grant churn never reaches the
+/// publication surface: only activated roots, root deletion, and node session
+/// registration are publication/topology inputs.
+pub enum OutletEvent {
+    RootActivated { root: RootRecord },
+    RootDeleted { root_id: String },
+    NodeSessionRegistered { node_id: String, session_id: String },
+}
+
+pub struct WatchedOutletEvent {
+    pub event: OutletEvent,
+    pub revision: StoreRevision,
+}
+
+pub enum OutletEventBatch {
+    Events {
+        start_revision: StoreRevision,
+        next_revision: StoreRevision,
+        events: Vec<WatchedOutletEvent>,
+    },
+    Compacted {
+        requested_after: StoreRevision,
+        compacted_to: StoreRevision,
+        recovery: RecoveryCursor,
+    },
+}
+
+pub struct ListOutletRootsInput {
+    pub node_id: String,
+    pub session_id: String,
+}
+
+pub struct ListOutletRootsOutput {
+    pub authority_revision: StoreRevision,
+    pub active_roots: Vec<RootRecord>,
+}
+
 pub struct AckRevocationInput {
     pub request_id: String,
     pub command_id: String,
@@ -1098,6 +1259,53 @@ fn merge_rights(
 
 fn invalid(message: impl Into<String>) -> Error {
     Error::coded(afs_error::META_CATALOG_INVALID_REQUEST, message)
+}
+
+/// Canonical root ids are `root-` plus the lowercase hex encoding of a valid
+/// workspace name. Meta must reject anything else at the Reserve entry: a
+/// non-canonical id would freeze the publication surface (the outlet worker
+/// decodes ids back to names before creating symlinks), and a dot-leading
+/// name would collide with the internal namespace (`.pub`, `.quarantine`,
+/// `.ownerfs-roots`).
+///
+/// This deliberately mirrors `crate::node::vfs::ownerfs::root::root_name_from_id`
+/// instead of importing it: the owner-roots domain layer stays independent of
+/// node modules. Keep both copies in sync.
+fn ensure_canonical_root_id(root_id: &str) -> Result<()> {
+    let encoded = root_id
+        .strip_prefix("root-")
+        .ok_or_else(non_canonical_root_id)?;
+    let digits = encoded.as_bytes();
+    if digits.is_empty() || digits.len() % 2 != 0 {
+        return Err(non_canonical_root_id());
+    }
+    let mut name = Vec::with_capacity(digits.len() / 2);
+    for pair in digits.chunks_exact(2) {
+        let high = hex_digit(pair[0]).ok_or_else(non_canonical_root_id)?;
+        let low = hex_digit(pair[1]).ok_or_else(non_canonical_root_id)?;
+        name.push((high << 4) | low);
+    }
+    if name == b"."
+        || name == b".."
+        || name.first() == Some(&b'.')
+        || name.contains(&b'/')
+        || name.contains(&0)
+    {
+        return Err(invalid("root id decodes to an invalid root name"));
+    }
+    Ok(())
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn non_canonical_root_id() -> Error {
+    invalid("root id is not a canonical name")
 }
 
 fn permission_denied(message: impl Into<String>) -> Error {
@@ -1263,5 +1471,46 @@ mod retention_tests {
     fn uuid_id() -> u64 {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod canonical_root_id_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_root_id_accepts_hex_encoded_names() {
+        for name in ["job-42", "workspace-a", "ünïcode"] {
+            let encoded: String = name.bytes().map(|byte| format!("{byte:02x}")).collect();
+            ensure_canonical_root_id(&format!("root-{encoded}")).unwrap();
+        }
+        // 非 UTF-8 名字经 hex 编解码无损往返（镜像 node 侧 round-trip 测试）。
+        let encoded: String = b"job-\xff\xfe"
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        ensure_canonical_root_id(&format!("root-{encoded}")).unwrap();
+    }
+
+    #[test]
+    fn canonical_root_id_rejects_non_canonical_and_reserved_forms() {
+        for bad in [
+            "workspace-a",                       // 裸名，无 root- 前缀
+            "root-",                             // 空编码
+            "root-abc",                          // 奇数位 hex
+            "root-AB",                           // 大写 hex 非规范形
+            "root-2f",                           // 解码为 "/"
+            "root-610062",                       // 解码为 "a\0b"
+            "root-2e",                           // 解码为 "."
+            "root-2e2e",                         // 解码为 ".."
+            "root-2e707562",                     // 解码为 ".pub"（发布暂存区）
+            "root-2e71756172616e74696e65",       // 解码为 ".quarantine"
+            "root-2e6f776e657266732d726f6f7473", // 解码为 ".ownerfs-roots"
+        ] {
+            assert!(
+                ensure_canonical_root_id(bad).is_err(),
+                "root id {bad:?} must be rejected"
+            );
+        }
     }
 }

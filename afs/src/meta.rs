@@ -160,6 +160,49 @@ impl Meta {
             _ => None,
         })
     }
+
+    /// Lists every live node session, sorted by node_id. The caller must hold
+    /// the named current live session, mirroring the OwnerRoots polling face.
+    pub async fn list_nodes(
+        &self,
+        caller_node_id: &str,
+        caller_session_id: &str,
+    ) -> afs_error::Result<(Vec<store::NodeSession>, store::StoreRevision)> {
+        let store = self
+            .store
+            .as_deref()
+            .ok_or_else(store::unavailable_meta_store)?;
+        let caller = store
+            .read(store::MetaRead::CurrentNodeSession {
+                node_id: caller_node_id.to_owned(),
+            })
+            .await?;
+        match caller.entity {
+            Some(store::MetaEntity::NodeSession(session))
+                if session.session_id == caller_session_id
+                    && session.is_live_at_unix_ms(store::now_unix_ms()) => {}
+            _ => {
+                return Err(afs_error::Error::coded(
+                    afs_error::META_CATALOG_INVALID_REQUEST,
+                    "node session is not current",
+                ));
+            }
+        }
+        let snapshot = store.read(store::MetaRead::CurrentNodeSessions).await?;
+        let now = store::now_unix_ms();
+        let mut sessions = snapshot
+            .entities
+            .into_iter()
+            .filter_map(|entity| match entity {
+                store::MetaEntity::NodeSession(session) if session.is_live_at_unix_ms(now) => {
+                    Some(session)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_by(|left, right| left.node_id.cmp(&right.node_id));
+        Ok((sessions, snapshot.revision))
+    }
 }
 /// 先恢复权威并初始化，再绑定两个端口并启动共享 Meta 的 gRPC 和 REST。
 pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {

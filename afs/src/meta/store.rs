@@ -355,6 +355,10 @@ pub enum MetaRead {
     Root {
         root_id: String,
     },
+    /// Fetches every active Root across all homes. Used by the outlet
+    /// publication snapshot; unlike `scan_owner_roots_for_recovery` it is not
+    /// filtered by home node.
+    Roots,
     RootReservation {
         root_id: String,
     },
@@ -7789,11 +7793,16 @@ mod grant_lifecycle_tests {
         let authority = StoreOwnerRootAuthority::new(store.clone());
         (store, log, authority)
     }
+    /// Meta 只接受 `root-<lowercase hex>` 规范 id；store 单测同样遵守该入口校验。
+    fn canonical_root_id(name: &str) -> String {
+        let encoded: String = name.bytes().map(|byte| format!("{byte:02x}")).collect();
+        format!("root-{encoded}")
+    }
     async fn reserve(authority: &StoreOwnerRootAuthority, intent: &str) -> RootReservationRecord {
         authority
             .reserve_root(ReserveRootInput {
                 request_id: format!("reserve-{intent}"),
-                root_id: "workspace".into(),
+                root_id: canonical_root_id("workspace"),
                 preferred_home_node_id: "home".into(),
                 session_id: "s".into(),
                 rights: vec![RootRight::Read],
@@ -7827,7 +7836,7 @@ mod grant_lifecycle_tests {
     fn deactivate(epoch: u64) -> DeactivateRootInput {
         DeactivateRootInput {
             request_id: "deactivate".into(),
-            root_id: "workspace".into(),
+            root_id: canonical_root_id("workspace"),
             root_epoch: epoch,
             home_node_id: "home".into(),
             home_session_id: "s".into(),
@@ -7905,7 +7914,7 @@ mod grant_lifecycle_tests {
         assert_eq!(
             store
                 .read(MetaRead::RootGrants {
-                    root_id: "workspace".into()
+                    root_id: canonical_root_id("workspace"),
                 })
                 .await
                 .unwrap()
@@ -8000,7 +8009,7 @@ mod grant_lifecycle_tests {
         authority.deactivate_root(input).await.unwrap();
         let view = store.committed().await.unwrap();
         let key = MetaKey::RootCommand {
-            command_id: format!("deactivate:workspace:{}:deactivate", home.root_epoch),
+            command_id: format!("deactivate:{}:{}:deactivate", home.root_id, home.root_epoch),
         };
         assert!(
             matches!(&view.entities.get(&key).unwrap().entity,MetaEntity::RootCommand(command)
@@ -8017,7 +8026,7 @@ mod grant_lifecycle_tests {
                 StoreOwnerRootAuthority::new(store)
                     .reserve_root(ReserveRootInput {
                         request_id: format!("r-{i}"),
-                        root_id: format!("root-{i}"),
+                        root_id: canonical_root_id(&format!("workspace-{i}")),
                         preferred_home_node_id: "home".into(),
                         session_id: "s".into(),
                         rights: vec![RootRight::Read],
@@ -8044,7 +8053,7 @@ mod grant_lifecycle_tests {
         let rejected = authority
             .reserve_root(ReserveRootInput {
                 request_id: "max".into(),
-                root_id: "other".into(),
+                root_id: canonical_root_id("other"),
                 preferred_home_node_id: "home".into(),
                 session_id: "s".into(),
                 rights: vec![],
@@ -8095,7 +8104,7 @@ mod grant_lifecycle_tests {
             loop {
                 if store
                     .read(MetaRead::RootGrants {
-                        root_id: "workspace".into(),
+                        root_id: canonical_root_id("workspace"),
                     })
                     .await
                     .unwrap()
@@ -8134,7 +8143,7 @@ mod grant_lifecycle_tests {
         assert!(
             store
                 .read(MetaRead::RootGrants {
-                    root_id: "workspace".into()
+                    root_id: canonical_root_id("workspace"),
                 })
                 .await
                 .unwrap()
