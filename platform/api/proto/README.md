@@ -14,12 +14,32 @@ Public HTTP contracts are separate from these internal gRPC protocols:
 | `environment.proto` / `adx.control.v1` | Coordinator/Node registration, allocation and node-owned state submission | Direct typed RPC from API Server |
 | `environment_types.proto` | Shared Environment, Assignment, resources and scheduling types | Shared by control services |
 | `snapshot.proto` | Snapshot catalog, references and collection | Coordinator and Node snapshot services |
+| `volume.proto` | Tenant Volume definitions, references, node execution grants and initialization | Management: API Server identity; execution: owning node session |
 | `credentials.proto` | API Key validation and administrator operations | AuthService and CredentialService |
 | `routes.proto` | Versioned Environment directory and committed route publication | EnvironmentDirectoryService and RouteService |
 | `node.proto` / `adx.node.v1` | Versioned Relay bindings and activity | Node-local UDS services |
 | `runtime_control.proto` / `adx.runtime.v1` | Execd-initiated Ready/state events and node checkpoint commands | Opt-in [bidirectional control stream](runtime-control.md) |
 | EXECD HTTP | Commands, files, health and tunnels; control when no stream is configured | See [HTTP runtime contract](../http/runtime-control.md) |
 | Management errors | Stable HTTP/gRPC/SDK code, retry and outcome semantics | See [error contract](../http/error-contract.md) |
+
+The shared types include Volume definitions (default `shared` access), fixed UID
+references, and execution occupancy identities. User `MountSpec` selects either
+an existing inline `StorageSource` or a `VolumeRef`; Rootfs retains its original
+`StorageSource`. Coordinator implements internal ensure/get/list/delete RPCs;
+ensure returns the existing tenant/ID definition unchanged. Deletion removes only
+unreferenced, unowned, unoccupied metadata. Ensure can idempotently associate an
+opaque owner; owner release follows confirmed Environment absence and removes only
+its associations and unused last-owner definitions. It persists no deleted-owner
+marker. Inspection includes initialization state and errors. Placement reserves exclusive occupancy atomically
+with the execution assignment. Before start or restore, the owning node requests
+an execution grant, verifies the configured mounted backend, and resolves fixed
+Volume references into runtime-only paths. Shared first-use initialization has a
+durable owner and result; interrupted or failed work requires repair. The original
+Environment specification retains its Volume references. `CommitEnvironment`
+carries confirmed stopped runtime IDs; releasing compute capacity alone cannot
+release exclusive occupancy. Node heartbeat expiry atomically invalidates its
+assignments and releases matching occupancy; interrupted initialization requires
+repair. Public integration remains tracked in the [Volume implementation plan](../../../docs/development/platform-volume-design.md).
 
 The Rust API Server converts public HTTP JSON directly into Environment RPC types.
 All owned protobuf definitions are generated through the Cargo protocol crate.
@@ -75,7 +95,12 @@ The SDK, API Server, Ingress and Activator must use this same contract.
 
 `environment_types.proto` defines typed SchedulingPolicy selectors, hard/soft node and
 Environment affinity, topology spread, device requests and physical allocations.
-RegisterNode carries labels and healthy device inventory. Assignment carries
+RegisterNode carries labels, healthy device inventory and a complete `storage_mounts`
+map of verified domain/backend/root reports. Missing mounts withdraw eligibility
+for dynamically admitted storage domains. Reports use the existing authenticated
+node session and heartbeat sequence; Coordinator refreshes queued Volume topology
+and resolves execution roots from the same current view. Fixed domains retain
+`node_roots` constraints. Storage access mode does not control topology. Assignment carries
 node-local GPU/NPU IDs and models; Adxlet checks these against the request
 and local inventory before forwarding sandboxd `xpu_allocations`.
 

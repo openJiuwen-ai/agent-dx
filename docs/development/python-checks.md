@@ -20,6 +20,7 @@ make python-check PYTHON_CHECK_BASE=github/master
 静态检查通过后，还要运行改动组件的回归测试。测试通过只能证明已覆盖的行为；
 CodeCheck 的平台规则另行检查。处理 Python 代码时尤其注意：
 
+- 类型校验使用 `isinstance`，字典分隔符保留空格；新增或修改的条件语句最多包含 3 个布尔表达式。
 - URL 使用 `urllib.parse` 构建和编码，CIDR 使用 `ipaddress` 构造；动态字典查找显式处理键缺失。
 - 运行日志使用 `logging`；循环内定义的回调通过参数显式绑定循环变量，避免延迟绑定。
 - 外部命令先通过 `shutil.which` 查找、处理缺失，再解析为绝对路径。

@@ -22,6 +22,7 @@ Response format:
 """
 
 import base64
+from urllib.parse import quote
 import json
 import logging
 import math
@@ -278,15 +279,25 @@ class EnvironmentClient:
         """Reject unsupported servers before accepting a probe-dependent create."""
         response = self._http.get(f"{self._base}/capabilities", headers={"X-Auth": self._token}, timeout=10)
         if response.status_code in (404, 405, 501):
-            raise EnvironmentError("server does not support workload probes", code="UNSUPPORTED", retry="never", outcome="not_started")
+            raise EnvironmentError(
+                "server does not support workload probes", code="UNSUPPORTED", retry="never", outcome="not_started"
+            )
         if response.status_code >= 400:
             raise self._http_error(response)
         try:
             payload = response.json()
         except ValueError as exc:
-            raise EnvironmentError("invalid server capabilities response", code="UNSUPPORTED", retry="never", outcome="not_started") from exc
-        if not isinstance(payload, dict) or not isinstance(payload.get("capabilities"), list) or "workload-probes-v1" not in payload["capabilities"]:
-            raise EnvironmentError("server does not support workload probes", code="UNSUPPORTED", retry="never", outcome="not_started")
+            raise EnvironmentError(
+                "invalid server capabilities response", code="UNSUPPORTED", retry="never", outcome="not_started"
+            ) from exc
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("capabilities"), list)
+            or "workload-probes-v1" not in payload["capabilities"]
+        ):
+            raise EnvironmentError(
+                "server does not support workload probes", code="UNSUPPORTED", retry="never", outcome="not_started"
+            )
 
     def create(self, body: Dict[str, Any]) -> str:
         """POST /environments — returns the new environmentID."""
@@ -590,6 +601,45 @@ class EnvironmentClient:
             raise self._http_error(resp, request_id=request_id)
         return self._json(resp)
 
+    def ensure_volume(self, spec: Dict[str, Any]) -> Dict[str, Any]:
+        return self._json(
+            self._http.post(
+                f"{self._base}/volumes",
+                json=spec,
+                timeout=ADX_GET_DEFAULT_TIMEOUT + self._connection.communication_margin_seconds,
+            )
+        )
+
+    def get_volume(self, volume_id: str) -> Dict[str, Any]:
+        return self._json(
+            self._http.get(
+                f"{self._base}/volumes/{quote(volume_id, safe='')}",
+                timeout=ADX_GET_DEFAULT_TIMEOUT + self._connection.communication_margin_seconds,
+            )
+        )
+
+    def list_volumes(self, *, page_token: Optional[str] = None, page_size: Optional[int] = None) -> Dict[str, Any]:
+        params = {}
+        if page_token is not None:
+            params["pageToken"] = page_token
+        if page_size is not None:
+            params["pageSize"] = page_size
+        return self._json(
+            self._http.get(
+                f"{self._base}/volumes",
+                params=params,
+                timeout=ADX_GET_DEFAULT_TIMEOUT + self._connection.communication_margin_seconds,
+            )
+        )
+
+    def delete_volume(self, volume_id: str) -> None:
+        self._json(
+            self._http.delete(
+                f"{self._base}/volumes/{quote(volume_id, safe='')}",
+                timeout=ADX_GET_DEFAULT_TIMEOUT + self._connection.communication_margin_seconds,
+            )
+        )
+
     def get_snapshot(self, snapshot_id: str) -> Dict[str, Any]:
         resp = self._http.get(
             f"{self._base}/snapshots/{snapshot_id}",
@@ -693,7 +743,9 @@ class EnvironmentClient:
                     try:
                         result = self._json(resp)
                     except EnvironmentError as exc:
-                        raise EnvironmentError(f"environment {operation} failed (requestId={request_id}): {exc}") from exc
+                        raise EnvironmentError(
+                            f"environment {operation} failed (requestId={request_id}): {exc}"
+                        ) from exc
                     if operation == "pause" and result.get("snapshotId") != request_id:
                         raise EnvironmentError(
                             "environment pause returned a snapshotId that does not match "
@@ -770,13 +822,19 @@ class EnvironmentClient:
         primitive does not trip the client first.
         """
         logical_timeout = ADX_GET_DEFAULT_TIMEOUT if timeout is None else timeout
-        if isinstance(logical_timeout, bool) or not isinstance(logical_timeout, (int, float)) or not math.isfinite(logical_timeout):
+        if (
+            isinstance(logical_timeout, bool)
+            or not isinstance(logical_timeout, (int, float))
+            or not math.isfinite(logical_timeout)
+        ):
             raise ValueError("timeout must be finite")
         if logical_timeout == 0 or logical_timeout > 86400:
             raise ValueError("timeout must be positive and at most 86400 seconds, or negative for unbounded calls")
         request_id = self._new_request_id("invoke")
         processing_deadline = None if logical_timeout < 0 else time.monotonic() + logical_timeout
-        deadline = None if processing_deadline is None else processing_deadline + self._connection.communication_margin_seconds
+        deadline = (
+            None if processing_deadline is None else processing_deadline + self._connection.communication_margin_seconds
+        )
 
         # Prefer the /direct path; fall back to the control-plane invoke path.
         if self._direct_enabled and not self._direct_disabled:
@@ -998,7 +1056,9 @@ class EnvironmentClient:
         remaining = self._remaining_timeout(deadline)
         if remaining is None or remaining > 0:
             try:
-                info = self.environment_info(environment_id, timeout=min(2.0, remaining) if remaining is not None else 2.0)
+                info = self.environment_info(
+                    environment_id, timeout=min(2.0, remaining) if remaining is not None else 2.0
+                )
             except (EnvironmentError, httpx.RequestError):
                 info = {}
             failure = info.get("failure")
@@ -1430,7 +1490,9 @@ class EnvironmentClient:
             environment_id=detail.get("environmentId"),
             scheduling_failure=detail.get("schedulingFailure"),
             probe_failure=detail.get("probeFailure"),
-            request_forwarded=detail.get("requestForwarded") if isinstance(detail.get("requestForwarded"), bool) else None,
+            request_forwarded=detail.get("requestForwarded")
+            if isinstance(detail.get("requestForwarded"), bool)
+            else None,
         )
 
     @staticmethod

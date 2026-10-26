@@ -190,9 +190,29 @@ impl Snapshot {
     pub fn same_content(&self, other: &Self) -> bool {
         self.id == other.id
             && self.names == other.names
-            && self.template == other.template
+            && self.matches_template(&other.template)
             && self.source_node_id == other.source_node_id
             && self.source_runtime_id == other.source_runtime_id
             && self.artifact == other.artifact
+    }
+
+    /// Match the source spec after normalizing omitted UIDs to this snapshot's fixed identities.
+    pub fn matches_template(&self, spec: &EnvironmentSpec) -> bool {
+        let fixed: Vec<_> = self
+            .template
+            .execution
+            .mounts
+            .iter()
+            .filter_map(|mount| match &mount.source {
+                crate::execution::MountSource::Volume(reference) => Some(reference.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut spec = spec.clone();
+        // Before publication both templates may still contain unresolved references.
+        if spec == self.template {
+            return true;
+        }
+        spec.fix_volume_references(&fixed).is_ok() && spec == self.template
     }
 }

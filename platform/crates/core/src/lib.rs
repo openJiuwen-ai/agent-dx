@@ -12,6 +12,7 @@ pub mod observation;
 pub mod probes;
 pub mod runtime;
 pub mod scheduling;
+pub mod volumes;
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -29,6 +30,8 @@ pub enum Error {
     },
     #[error("insufficient resources or node admission closed")]
     NoCapacity,
+    #[error("waiting for Volume {0}")]
+    VolumeBusy(String),
     #[error("record not found")]
     NotFound,
     #[error("dependency unavailable: {0}")]

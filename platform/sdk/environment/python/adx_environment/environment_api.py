@@ -24,6 +24,9 @@ from .types import (
     ConnectionConfig,
     DataPlaneSecurityPolicy,
     Mount,
+    VolumeSpec,
+    VolumeInfo,
+    _volume_id,
     NetworkPolicy,
     PauseResult,
     PortForwarding,
@@ -65,7 +68,9 @@ def _get_create_timeout(timeout: Optional[int]) -> int:
     return value
 
 
-def _resolve_create_timeouts(create_timeout: Optional[int], schedule_timeout: Optional[int], init_timeout: int = _INIT_CALL_TIMEOUT) -> tuple[int, int]:
+def _resolve_create_timeouts(
+    create_timeout: Optional[int], schedule_timeout: Optional[int], init_timeout: int = _INIT_CALL_TIMEOUT
+) -> tuple[int, int]:
     if isinstance(init_timeout, bool) or not isinstance(init_timeout, int) or not 1 <= init_timeout <= 86400:
         raise ValueError("init_timeout must be an integer between 1 and 86400")
     reserve = init_timeout + CREATE_TIMEOUT_BUFFER
@@ -205,6 +210,60 @@ class Environment:
             _snapshot_resource_fields=explicit_resource_fields,
             **kwargs,
         )
+
+    @staticmethod
+    def _volume_info(payload: Mapping[str, Any]) -> VolumeInfo:
+        try:
+            return VolumeInfo.from_dict(payload)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise EnvironmentError("invalid Volume response") from exc
+
+    @classmethod
+    def ensure_volume(cls, spec: VolumeSpec, *, connection: Optional[ConnectionConfig] = None) -> VolumeInfo:
+        if not isinstance(spec, VolumeSpec):
+            raise TypeError("spec must be VolumeSpec")
+        client = EnvironmentClient(connection=connection) if connection is not None else EnvironmentClient()
+        try:
+            return cls._volume_info(client.ensure_volume(spec.to_dict()))
+        finally:
+            client.close()
+
+    @classmethod
+    def get_volume(cls, volume_id: str, *, connection: Optional[ConnectionConfig] = None) -> VolumeInfo:
+        _volume_id(volume_id)
+        client = EnvironmentClient(connection=connection) if connection is not None else EnvironmentClient()
+        try:
+            return cls._volume_info(client.get_volume(volume_id))
+        finally:
+            client.close()
+
+    @classmethod
+    def list_volumes(
+        cls,
+        *,
+        page_token: Optional[str] = None,
+        page_size: Optional[int] = None,
+        connection: Optional[ConnectionConfig] = None,
+    ) -> Tuple[List[VolumeInfo], str]:
+        if page_token is not None and not isinstance(page_token, str):
+            raise TypeError("page_token must be a string")
+        if page_size is not None and (type(page_size) is not int or not 1 <= page_size <= 1000):
+            raise ValueError("page_size must be between 1 and 1000")
+        client = EnvironmentClient(connection=connection) if connection is not None else EnvironmentClient()
+        try:
+            payload = client.list_volumes(page_token=page_token, page_size=page_size)
+            return [cls._volume_info(value) for value in payload["items"]], str(payload.get("nextPageToken") or "")
+        finally:
+            client.close()
+
+    @classmethod
+    def delete_volume(cls, volume_id: str, *, connection: Optional[ConnectionConfig] = None) -> None:
+        _volume_id(volume_id)
+        client = EnvironmentClient(connection=connection) if connection is not None else EnvironmentClient()
+        try:
+            client.delete_volume(volume_id)
+        finally:
+            client.close()
 
     @staticmethod
     def _snapshot_info(payload: Mapping[str, Any]) -> SnapshotInfo:
@@ -416,8 +475,9 @@ class Environment:
         """
         if not isinstance(idle_action, IdleAction):
             raise TypeError("idle_action must be an IdleAction")
-        if idle_action == IdleAction.PAUSE and (isinstance(idle_timeout, bool) or not isinstance(idle_timeout, int) or idle_timeout <= 0):
-            raise ValueError("idle pause requires a positive idle_timeout")
+        if idle_action == IdleAction.PAUSE:
+            if isinstance(idle_timeout, bool) or not isinstance(idle_timeout, int) or idle_timeout <= 0:
+                raise ValueError("idle pause requires a positive idle_timeout")
         if pause_policy is not None and not isinstance(pause_policy, PausePolicy):
             raise TypeError("pause_policy must be a PausePolicy")
         if image is not None and (not isinstance(image, str) or not image.strip()):
@@ -451,7 +511,10 @@ class Environment:
             raise ValueError("inherit_entrypoint requires an image rootfs")
         if inherit_entrypoint and snapshot_id is not None:
             raise ValueError("inherit_entrypoint cannot be combined with snapshot_id")
-        for value, expected, label in ((readiness_probe, ReadinessProbe, "readiness_probe"), (healthcheck_probe, HealthcheckProbe, "healthcheck_probe")):
+        for value, expected, label in (
+            (readiness_probe, ReadinessProbe, "readiness_probe"),
+            (healthcheck_probe, HealthcheckProbe, "healthcheck_probe"),
+        ):
             if value is not None and type(value) is not expected:
                 raise TypeError(f"{label} must be a {expected.__name__} or None")
         if (readiness_probe is not None or healthcheck_probe is not None) and not inherit_entrypoint:
@@ -545,7 +608,9 @@ class Environment:
         self._upstream = upstream
 
         # ── build create body ─────────────────────────────────────────────
-        resolved_create_timeout, resolved_schedule_timeout = _resolve_create_timeouts(create_timeout, schedule_timeout, init_timeout)
+        resolved_create_timeout, resolved_schedule_timeout = _resolve_create_timeouts(
+            create_timeout, schedule_timeout, init_timeout
+        )
         body: Dict[str, Any] = {
             "namespace": "default",
             "snapshotId": snapshot_id.strip() if snapshot_id is not None else None,
@@ -998,7 +1063,9 @@ class Environment:
             raise ValueError("timeout_seconds must be between 1 and 3600")
         if self._closed:
             raise RuntimeError("environment is closed")
-        result = self._client.pause(self._sid, retention.to_dict() if retention is not None else None, timeout_seconds=timeout_seconds)
+        result = self._client.pause(
+            self._sid, retention.to_dict() if retention is not None else None, timeout_seconds=timeout_seconds
+        )
         pause = PauseResult(
             environment_id=str(result.get("environmentId") or ""),
             snapshot_id=str(result.get("snapshotId") or ""),

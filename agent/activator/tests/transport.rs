@@ -415,3 +415,118 @@ async fn forbidden_queries_do_not_become_absence_or_leak_server_details() {
     ));
     task.abort();
 }
+
+#[tokio::test]
+async fn volume_management_explicit_refusals_keep_deterministic_errors() {
+    use adx_agent_core::volumes::{VolumeSource, VolumeSpec};
+    use axum::http::StatusCode;
+    let spec = VolumeSpec {
+        id: "workspace".into(),
+        source: VolumeSource::Directory {
+            storage_domain: "sfs".into(),
+            path: "workspaces/user".into(),
+        },
+        access_mode: Default::default(),
+        create_if_missing: false,
+        create_options: None,
+    };
+    for status in [
+        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
+        StatusCode::NOT_FOUND,
+    ] {
+        let (url, task) = serve(
+            Router::new().fallback(move || async move { (status, "private upstream detail") }),
+        )
+        .await;
+        let client = HttpEnvironment::new(
+            &url,
+            credentials(),
+            Duration::from_secs(1),
+            None,
+            true,
+            network_policy(),
+        )
+        .unwrap();
+        for result in [
+            client
+                .ensure_volume("tenant", "adx-owner", &spec)
+                .await
+                .map(|_| ()),
+            client.release_volumes("tenant", "adx-owner").await,
+        ] {
+            if status == StatusCode::NOT_FOUND {
+                assert_eq!(result, Err(EnvironmentError::NotFound));
+            } else {
+                assert!(
+                    matches!(result, Err(EnvironmentError::Invalid(_))),
+                    "{result:?}"
+                );
+                assert!(!result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("private upstream detail"));
+            }
+        }
+        task.abort();
+    }
+}
+
+#[tokio::test]
+async fn volume_ensure_identity_conflict_is_distinct_from_a_missing_uid() {
+    use adx_agent_core::volumes::{VolumeSource, VolumeSpec};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let spec = VolumeSpec {
+        id: "workspace".into(),
+        source: VolumeSource::Directory {
+            storage_domain: "sfs".into(),
+            path: "workspaces/user".into(),
+        },
+        access_mode: Default::default(),
+        create_if_missing: false,
+        create_options: None,
+    };
+    for (value, conflict) in [
+        (
+            serde_json::json!({"uid":"uid", "spec":{"tenant_id":"other", "id":"workspace"}}),
+            true,
+        ),
+        (
+            serde_json::json!({"uid":"uid", "spec":{"tenant_id":"tenant", "id":"other"}}),
+            true,
+        ),
+        (
+            serde_json::json!({"spec":{"tenant_id":"tenant", "id":"workspace"}}),
+            false,
+        ),
+    ] {
+        let encoded = STANDARD.encode(serde_json::to_vec(&value).unwrap());
+        let (url, task) = serve(Router::new().fallback(move || {
+            let encoded = encoded.clone();
+            async move { Json(serde_json::json!({"code":200,"data":encoded})) }
+        }))
+        .await;
+        let client = HttpEnvironment::new(
+            &url,
+            credentials(),
+            Duration::from_secs(1),
+            None,
+            true,
+            network_policy(),
+        )
+        .unwrap();
+        let result = client.ensure_volume("tenant", "adx-owner", &spec).await;
+        if conflict {
+            assert!(
+                matches!(result, Err(EnvironmentError::Conflict(_))),
+                "{result:?}"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(EnvironmentError::OutcomeUnknown(_))),
+                "{result:?}"
+            );
+        }
+        task.abort();
+    }
+}

@@ -62,10 +62,8 @@ async fn embedded_and_http_creation_use_the_same_platform_contract() {
     let mount = &local.execution.as_ref().unwrap().mounts[0];
     assert_eq!(mount.target, "/home/jiuwen");
     assert_eq!(mount.options, ["rw"]);
-    assert!(
-        matches!(mount.source.as_ref().unwrap().source.as_ref().unwrap(),
-        pb::storage_source::Source::Local(path) if path == "/mnt/sfs/w-user")
-    );
+    assert!(matches!(mount.mount_source.as_ref(),
+        Some(pb::mount_spec::MountSource::Source(pb::StorageSource { source: Some(pb::storage_source::Source::Local(path)) })) if path == "/mnt/sfs/w-user"));
     assert!(local.execution.as_ref().unwrap().inherit_entrypoint);
     assert_eq!(local.execution.as_ref().unwrap().init_timeout_seconds, 30);
     let readiness = local

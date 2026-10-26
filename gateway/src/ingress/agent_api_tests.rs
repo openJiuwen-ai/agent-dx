@@ -281,9 +281,17 @@ async fn independent_activators_share_redis_identity() {
         .delete_binding(&control_context(), &scope)
         .await
         .unwrap();
+    // Another Activator's hot cache is allowed to retain the old target.
+    // Explicit refresh reads authoritative Binding identity after deletion.
     let fresh = a
         .managed
-        .resolve(&ctx, &scope, adx_agent_core::Protocol::Http, None)
+        .resolve_with_cache(
+            &control_context(),
+            &scope,
+            adx_agent_core::Protocol::Http,
+            None,
+            true,
+        )
         .await
         .unwrap();
     assert_ne!(original.0.binding.generation, fresh.0.binding.generation);

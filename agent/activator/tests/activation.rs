@@ -14,6 +14,8 @@ struct Platform {
     observations: Mutex<HashMap<(String, String), EnvironmentObservation>>,
     lose_create_response: AtomicBool,
     lose_delete_response: AtomicBool,
+    create_entered: tokio::sync::Notify,
+    create_gate: Mutex<Option<Arc<tokio::sync::Notify>>>,
 }
 #[async_trait::async_trait]
 impl Environment for Platform {
@@ -21,6 +23,11 @@ impl Environment for Platform {
         &self,
         r: &CreateEnvironment,
     ) -> Result<EnvironmentObservation, EnvironmentError> {
+        let gate = self.create_gate.lock().unwrap().take();
+        if let Some(gate) = gate {
+            self.create_entered.notify_one();
+            gate.notified().await;
+        }
         let observed = self
             .observations
             .lock()
@@ -90,15 +97,13 @@ async fn replicas_and_unknown_outcomes_keep_the_committed_identity() {
     let b = Activator::new(state.clone(), platform.clone());
     a.publish("tenant", &template()).await.unwrap();
     platform.lose_create_response.store(true, Ordering::SeqCst);
-    assert!(matches!(
-        a.activate(
-            &scope("e"),
-            None,
-            adx_agent_core::unix_time_millis() + 60_000
-        )
-        .await,
-        Err(Error::OutcomeUnknown(_))
-    ));
+    a.activate(
+        &scope("e"),
+        None,
+        adx_agent_core::unix_time_millis() + 60_000,
+    )
+    .await
+    .expect("query and retry within the original activation deadline");
     let original = a.binding(&scope("e")).await.unwrap();
     let e = scope("e");
     let (x, y) = tokio::join!(
@@ -340,4 +345,41 @@ async fn dormant_bindings_resolve_after_cache_loss_without_recreating_or_waking(
         assert_eq!(rows.len(), 1);
         assert_eq!(rows.values().next().unwrap(), &observation);
     }
+}
+
+#[tokio::test]
+async fn late_activation_after_binding_deletion_cleans_only_the_old_environment() {
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let platform = Arc::new(Platform::default());
+    let a = Arc::new(Activator::new(state.clone(), platform.clone()));
+    let b = Activator::new(state.clone(), platform.clone());
+    a.publish("tenant", &template()).await.unwrap();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    *platform.create_gate.lock().unwrap() = Some(gate.clone());
+    let pending = {
+        let a = a.clone();
+        tokio::spawn(async move {
+            a.activate(&scope("racing"), None, unix_time_millis() + 60_000)
+                .await
+        })
+    };
+    platform.create_entered.notified().await;
+    let old = b.binding(&scope("racing")).await.unwrap();
+    b.delete_binding(&scope("racing")).await.unwrap();
+    let fresh = b
+        .activate(&scope("racing"), None, unix_time_millis() + 60_000)
+        .await
+        .unwrap()
+        .binding;
+    gate.notify_one();
+    assert!(pending.await.unwrap().is_err());
+    let observations = platform.observations.lock().unwrap();
+    assert_eq!(
+        observations[&("tenant".into(), old.environment_id)].phase,
+        EnvironmentPhase::Deleted
+    );
+    assert_eq!(
+        observations[&("tenant".into(), fresh.environment_id)].phase,
+        EnvironmentPhase::Running
+    );
 }

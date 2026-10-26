@@ -176,6 +176,10 @@ Environment.create_snapshot(*, name=None, timeout_seconds=300) -> SnapshotInfo
 `timeout_seconds` must be an integral, non-boolean value from 1 through 3600.
 The result is a frozen `SnapshotInfo(snapshot_id: str, names: tuple[str, ...])`.
 The Snapshot has no TTL: delete it explicitly when it is no longer needed.
+Snapshots preserve fixed Volume UIDs and protect their definitions through completed
+Snapshot deletion, even after the last Binding is deleted. External directory data
+is not copied. Clones do not inherit the Snapshot mounts; explicitly requested
+Volume mounts use normal admission. Volume inspection exposes `snapshot_ids`.
 
 ```python
 same_snapshot = Environment.get_snapshot(snapshot.snapshot_id)
@@ -746,3 +750,32 @@ cannot be combined with `inherit_entrypoint=True` or a snapshot identity overrid
 image entrypoint `process.user` retains its separate meaning. Use matching API
 Server, Coordinator, adxlet, and SDK versions so the typed identity is preserved
 across the complete create path. Unknown account resolution fails creation.
+
+## Managed Volumes
+
+```python
+from adx_environment import DirectoryVolumeSource, Environment, Mount, VolumeSpec
+
+volume = Environment.ensure_volume(VolumeSpec(
+    id="workspace-alice",
+    source=DirectoryVolumeSource(storage_domain="sfs", path="workspaces/tenant-a/alice"),
+    access_mode="exclusive",
+    create_if_missing=True,
+))
+mount = Mount(target="/workspace", volume_id=volume.spec.id, volume_uid=volume.uid, options=("rw",))
+```
+
+Pass the mount to Environment creation as usual. Default access is shared; ensure
+returns the existing definition unchanged. `Environment.get_volume(id)`,
+`Environment.list_volumes(page_size=100)` and `Environment.delete_volume(id)` use
+the same connection configuration. List returns `(items, next_page_token)`.
+Deletion requires no references, owners or occupancy and retains directory data.
+References cannot mix inline sources or leaf-creation options. AgentBinding
+ownership is managed by Activator; SDK-created definitions without an owner use
+explicit deletion. See [Volume API](../../../api/http/volumes.md) for topology,
+initialization status and the accepted disconnected-writer policy. Real shared
+storage/runtime acceptance remains in P7.
+
+Volume IDs accept 1–256 ASCII letters, digits, dots, underscores or hyphens;
+`.` and `..` are rejected because URL clients normalize those path segments.
+The SDK validates both definitions and lookup/deletion IDs before sending requests.

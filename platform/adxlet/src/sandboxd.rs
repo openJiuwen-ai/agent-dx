@@ -873,7 +873,8 @@ fn environment_rootfs(value: &adx_core::execution::Rootfs) -> Result<proto::Root
 
 fn environment_mount(value: &adx_core::execution::Mount) -> Result<proto::Mount> {
     use adx_core::execution::StorageSource;
-    let source = match &value.source {
+    let inline = value.source.inline()?;
+    let source = match inline {
         StorageSource::Image(value) => proto::mount::Source::ImageUrl(value.clone()),
         StorageSource::S3(value) => proto::mount::Source::S3Config(environment_s3(value)),
         StorageSource::Local(value) => proto::mount::Source::HostPath(value.clone()),
@@ -882,7 +883,7 @@ fn environment_mount(value: &adx_core::execution::Mount) -> Result<proto::Mount>
     // OCI bind mounts require an explicit mount flag as well as type="bind".
     // Public Local mount options describe access flags such as ro/rw.
     if value.kind == "bind"
-        && matches!(&value.source, StorageSource::Local(_))
+        && matches!(inline, StorageSource::Local(_))
         && !options.iter().any(|flag| flag == "bind" || flag == "rbind")
     {
         options.push("rbind".into());

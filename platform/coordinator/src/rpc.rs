@@ -10,6 +10,7 @@ mod observation;
 mod recovery;
 mod resume;
 mod snapshots;
+mod volumes;
 use crate::{
     storage::{ClaimOutcome, LocalClaim, NodeSession, Session, StoredEnvironment, StoredNode},
     Coordinator, Node, Placement,
@@ -56,6 +57,7 @@ struct State {
     claims_in_flight: BTreeMap<String, usize>,
     create_requests: BTreeMap<String, BTreeSet<String>>,
     local_reservation_deadlines: BTreeMap<String, (adx_core::Assignment, tokio::time::Instant)>,
+    volume_waiters: BTreeMap<String, BTreeSet<String>>,
 }
 
 fn requires_node_reconciliation(environment: &StoredEnvironment) -> bool {
@@ -167,6 +169,17 @@ impl State {
                 self.session
                     .reserve_recovery(&old.assignment, assignment.clone(), recovery::now()?)
                     .await
+            } else if crate::storage::has_volumes(&spec) {
+                self.session
+                    .reserve_with_request(
+                        spec.clone(),
+                        assignment.clone(),
+                        self.create_requests
+                            .get(&spec.id)
+                            .and_then(|ids| ids.first())
+                            .map_or("", String::as_str),
+                    )
+                    .await
             } else {
                 Ok(StoredEnvironment {
                     creation_generation: assignment.generation,
@@ -177,11 +190,12 @@ impl State {
                             .map_or("", String::as_str),
                     )?),
                     last_interruption: None,
+                    volume_execution: None,
                     resume: None,
                     failed_since_unix_seconds: None,
                     recovery: None,
                     invalidated: false,
-                    spec,
+                    spec: spec.clone(),
                     assignment: assignment.clone(),
                     result: None,
                 })
@@ -200,6 +214,29 @@ impl State {
                         source.inspected = false;
                     }
                     self.remember_environment(record);
+                }
+                Err(Error::VolumeBusy(uid)) => {
+                    let queued = self
+                        .scheduler
+                        .requests
+                        .get(&spec.id)
+                        .ok_or(Error::Conflict)?
+                        .1
+                        .clone();
+                    let mut placement = self
+                        .scheduler
+                        .volume_placement
+                        .get(&spec.id)
+                        .ok_or(Error::Conflict)?
+                        .clone();
+                    self.scheduler.release(&assignment)?;
+                    self.scheduler.submit(queued)?;
+                    placement.waiting_for = Some(uid.clone());
+                    self.scheduler.set_volume_placement(&spec.id, placement);
+                    self.volume_waiters
+                        .entry(uid)
+                        .or_default()
+                        .insert(spec.id.clone());
                 }
                 Err(Error::Conflict)
                     if self
@@ -234,6 +271,7 @@ impl State {
 struct Inner {
     business: Arc<std::sync::RwLock<Option<observation::BusinessSnapshot>>>,
     business_fenced: Arc<std::sync::atomic::AtomicBool>,
+    volume_domains: std::sync::RwLock<BTreeMap<String, adx_core::volumes::StorageDomain>>,
     created: std::sync::atomic::AtomicU64,
     reclaimers: std::sync::RwLock<adx_checkpoint_storage::reclaim::Reclaimers>,
     resume_admission: Arc<tokio::sync::Semaphore>,
@@ -414,6 +452,7 @@ impl CoordinatorRpc {
         let recovering = saved.nodes.keys().map(|id| (id.clone(), now)).collect();
         let (claim_sender, claim_requests) = mpsc::channel(CLAIM_BATCH_CAPACITY);
         tokio::spawn(run_claim_batches(session.clone(), claim_requests));
+        let volume_changes = session.committed_changes();
         let monitoring = session.clone();
         let counters = monitoring.business_counters().await?;
         let service = Self(Arc::new(Inner {
@@ -457,7 +496,9 @@ impl CoordinatorRpc {
                 claims_in_flight: BTreeMap::new(),
                 create_requests: BTreeMap::new(),
                 local_reservation_deadlines: BTreeMap::new(),
+                volume_waiters: BTreeMap::new(),
             }),
+            volume_domains: Default::default(),
             claim_sender,
             changed: Notify::new(),
             peers,
@@ -489,6 +530,7 @@ impl CoordinatorRpc {
                 }
             }
         });
+        service.watch_volume_changes(volume_changes);
         Ok(service)
     }
     pub fn with_reclaimers(self, reclaimers: adx_checkpoint_storage::reclaim::Reclaimers) -> Self {
@@ -551,6 +593,10 @@ impl CoordinatorRpc {
                 _ => None,
             };
             if spec.is_none() {
+                state.local_reservation_deadlines.remove(&id);
+                continue;
+            }
+            if spec.as_ref().is_some_and(crate::storage::has_volumes) {
                 state.local_reservation_deadlines.remove(&id);
                 continue;
             }
@@ -955,6 +1001,11 @@ impl CoordinatorRpc {
                         })
                 });
             } else {
+                let domains = self.volume_domains(&state).map_err(status)?;
+                state
+                    .prepare_volumes(&spec, &domains)
+                    .await
+                    .map_err(status)?;
                 state.scheduler.submit(spec.clone()).map_err(status)?;
                 state.specs.insert(spec.id.clone(), spec.clone());
                 let deadline =
@@ -1225,6 +1276,8 @@ impl CoordinatorRpc {
         }
         state.specs.remove(&spec.id);
         state.scheduling_deadlines.remove(&spec.id);
+        state.forget_volume_waiter(&spec.id);
+        state.session.unpin_volumes(spec).await.map_err(status)?;
         if let Some(snapshot_id) = &spec.snapshot_id {
             state
                 .session
@@ -1244,6 +1297,15 @@ impl CoordinatorRpc {
         &self,
         record: EnvironmentRecord,
         session_id: String,
+    ) -> Result<EnvironmentRecord> {
+        self.commit_releasing(record, session_id, vec![]).await
+    }
+
+    async fn commit_releasing(
+        &self,
+        record: EnvironmentRecord,
+        session_id: String,
+        stopped_runtime_ids: Vec<String>,
     ) -> Result<EnvironmentRecord> {
         let _publication = self
             .create_guard(format!("publication:{}", record.spec.id))
@@ -1315,7 +1377,7 @@ impl CoordinatorRpc {
                 return Err(Error::Conflict);
             }
             winner
-        } else if initial {
+        } else if initial && !crate::storage::has_volumes(&record.spec) {
             // Retire an optional pending Claim as well as the memory reservation;
             // unsuccessful initial attempts have no durable creation result.
             session.abandon_initial(&record.assignment).await?;
@@ -1336,11 +1398,13 @@ impl CoordinatorRpc {
             self.0.changed.notify_waiters();
             return Ok(record);
         } else {
-            let committed = session.commit_with_state(record).await?;
+            let committed = session
+                .commit_releasing_with_state(record, &session_id, &stopped_runtime_ids)
+                .await?;
             authoritative = committed.stored;
             committed.result
         };
-        if initial {
+        if initial && accepted.state != EnvironmentState::Deleted {
             authoritative = Some(session.get(&accepted.spec.id).await?);
         }
         let mut state = self.0.state.lock().await;
@@ -1794,30 +1858,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 .environments
                 .values()
                 .filter(|i| i.assignment.node_id == r.node_id && requires_node_reconciliation(i))
-                .cloned()
-                .map(|i| {
-                    i.result
-                        .unwrap_or_else(|| EnvironmentRecord {
-                            observation: None,
-                            execution_artifacts: vec![],
-                            snapshot_source: None,
-                            failure: None,
-                            restart_attempts: 0,
-                            restart_pending: false,
-                            runtime: adx_core::Runtime {
-                                id: format!("{}-{}", i.spec.id, i.assignment.generation),
-                                ip: None,
-                            },
-                            spec: i.spec,
-                            assignment: i.assignment,
-                            state: EnvironmentState::Pending,
-                            revision: 0,
-                            resources_held: true,
-                            checkpoint: None,
-                            last_operation: None,
-                        })
-                        .try_into()
-                })
+                .map(|stored| stored.effective_record().try_into())
                 .collect::<Result<Vec<_>>>()
                 .map_err(status)?;
             let snapshots = cached_snapshots
@@ -1873,6 +1914,9 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             return Err(Status::invalid_argument(
                 "node session, monotonic heartbeat and closed reconciliation admission required",
             ));
+        }
+        for mount in r.storage_mounts.values() {
+            adx_core::volumes::StorageMount::try_from(mount.clone()).map_err(status)?;
         }
         let node = Node::try_from(r.clone()).map_err(status)?;
         for address in [&r.node_address, &r.proxy_address] {
@@ -1984,6 +2028,13 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     .await
                     .map_err(status)?;
             }
+            let topology_changed = state.live.get(&r.node_id).is_none_or(|old| {
+                old.expired
+                    || old.session != r.session_id
+                    || old.inspected != inspected
+                    || old.report.reconciling != r.reconciling
+                    || old.report.storage_mounts != r.storage_mounts
+            });
             if let Some(old) = state.live.remove(&r.node_id) {
                 if old.session != r.session_id {
                     state
@@ -2002,6 +2053,10 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     report: r,
                 },
             );
+            if topology_changed {
+                let domains = service.volume_domains(&state).map_err(status)?;
+                state.refresh_volume_topology(&domains).map_err(status)?;
+            }
             service.0.changed.notify_waiters();
             Ok(Response::new(pb::RegisterNodeResponse {
                 shard_id: u32::try_from(shard).map_err(|_| Status::internal("shard overflow"))?,
@@ -2094,7 +2149,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 tokio::spawn(
                     adx_observability::trace::Trace::child("coordinator.commit").run(async move {
                         let record = service
-                            .commit(record, r.node_session_id)
+                            .commit_releasing(record, r.node_session_id, r.stopped_runtime_ids)
                             .await
                             .map_err(status)?;
                         Ok(Response::new(pb::CommitEnvironmentResponse {
@@ -2166,6 +2221,7 @@ mod reconciliation_tests {
             creation_generation: assignment.generation,
             creation: None,
             last_interruption: None,
+            volume_execution: None,
             resume: None,
             failed_since_unix_seconds: None,
             recovery: None,
@@ -2229,7 +2285,12 @@ mod cancellation_tests {
         // Replace the batch consumer so persistence is released at an exact
         // boundary, without sleeps or a race against the real batch window.
         let (sender, mut claims) = mpsc::channel(1);
-        Arc::get_mut(&mut rpc.0).unwrap().claim_sender = sender;
+        // Volume notifications retain a Weak reference. Rebuild the uniquely
+        // owned fixture so replacing the consumer does not require zero Weak refs.
+        let mut inner = Arc::try_unwrap(rpc.0).ok().expect("fixture has one owner");
+        inner.claim_sender = sender;
+        rpc = CoordinatorRpc(Arc::new(inner));
+        rpc.watch_volume_changes(session.committed_changes());
         let spec: EnvironmentSpec = serde_json::from_value(serde_json::json!({
             "id":"claim-race", "tenant_id":"tenant", "image":"image",
             "runtime_class":"runsc", "priority":0,

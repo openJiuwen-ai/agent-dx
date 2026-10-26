@@ -119,6 +119,7 @@ impl Session {
                 restart_pending: false,
             });
             stored_environment.assignment = replacement.clone();
+            stored_environment.volume_execution = None;
             stored_environment.invalidated = false;
             if let Some(intent) = &mut stored_environment.resume {
                 intent.local_rejected = false;
@@ -136,19 +137,24 @@ impl Session {
                 last.recovery_state = RecoveryState::Recovering;
             }
             stored_environment.validate()?;
+            let catalog = if super::volumes::has_volumes(&stored_environment.spec) {
+                let mut catalog = self.volume_catalog().await?;
+                if Some(&catalog.header_value) != header_value.as_ref() {
+                    continue;
+                }
+                catalog.reserve(&stored_environment, &target)?;
+                Some(catalog)
+            } else {
+                None
+            };
 
             if self
-                .store
-                .object_cas(
-                    header_value
-                        .as_deref()
-                        .expect("validated control header is present"),
+                .assignment_cas(
                     &header,
-                    Some((
-                        &field,
-                        environment_value.as_deref(),
-                        encode(&stored_environment)?,
-                    )),
+                    environment_value.as_deref(),
+                    &stored_environment,
+                    catalog.as_ref(),
+                    None,
                 )
                 .await?
             {

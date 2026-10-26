@@ -64,6 +64,7 @@ async fn live_catalog_keeps_a_durable_claim_pending_until_the_create_rpc() {
     let snapshot = rig.session.snapshot().await.unwrap();
     let node = &snapshot.nodes["a"];
     let mut registration = pb::RegisterNodeRequest {
+        storage_mounts: Default::default(),
         node_id: "a".into(),
         session_id: "boot-a".into(),
         node_address: node.address.clone(),
@@ -115,6 +116,7 @@ fn local_peers() -> Peers {
             ("apiserver", Principal::ApiServer),
             ("node", Principal::Node("a".into())),
             ("ingress", Principal::Node("b".into())),
+            ("unknown", Principal::Node("c".into())),
         ]
         .map(|(cert, role)| (file(&format!("{cert}.der")), role)),
     )
@@ -151,11 +153,15 @@ struct Rig {
     node_rpcs: Vec<NodeRpc>,
     sinks: Vec<Arc<CoordinatorStateSink>>,
     address: std::net::SocketAddr,
+    registrations: Vec<pb::RegisterNodeRequest>,
 }
 impl Rig {
     async fn new() -> Self {
+        Self::new_with_shards(1).await
+    }
+    async fn new_with_shards(shards: usize) -> Self {
         let redis = common::Redis::new().await;
-        let session = redis.store().await.begin(1).await.unwrap();
+        let session = redis.store().await.begin(shards).await.unwrap();
         let rpc = CoordinatorRpc::with_heartbeat_timeout(
             session.clone(),
             Placement::Pack,
@@ -174,12 +180,14 @@ impl Rig {
         publication.refresh().await.unwrap();
         let updater = publication.clone();
         let service = rpc.clone();
-        let mut servers = Servers(vec![
+        let servers = Servers(vec![
             tokio::spawn(updater.run(Duration::from_millis(20))),
             tokio::spawn(async move {
                 Server::builder()
                     .tls_config(server_tls("coordinator"))
                     .unwrap()
+                    .add_service(pb::volume_service_server::VolumeServiceServer::new(service.clone()))
+                    .add_service(pb::volume_execution_service_server::VolumeExecutionServiceServer::new(service.clone()))
                     .add_service(pb::coordinator_service_server::CoordinatorServiceServer::new(service))
                     .add_service(pb::auth_service_server::AuthServiceServer::new(auth))
                     .add_service(
@@ -192,92 +200,7 @@ impl Rig {
                     .unwrap();
             }),
         ]);
-        let mut node_rpcs = vec![];
-        let mut sinks = vec![];
-        let mut managers = vec![];
-        let mut backends = vec![];
-        let mut nodes = vec![];
-        let mut claimants = vec![];
-        for (id, cert) in [("a", "node"), ("b", "ingress")] {
-            let client = channel(ma, cert).await;
-            let sink = Arc::new(
-                CoordinatorStateSink::new(client.clone(), Duration::from_secs(2))
-                    .unwrap()
-                    .with_session(format!("boot-{id}")),
-            );
-            sinks.push(sink.clone());
-            let backend = Arc::new(Backend {
-                pause_writes_after_remove: Mutex::new(None),
-                session: session.clone(),
-                started: AtomicUsize::new(0),
-                removed: AtomicUsize::new(0),
-                running: Mutex::default(),
-            });
-            let manager = Arc::new(Adxlet::new(
-                id.into(),
-                backend.clone(),
-                Arc::new(LocalChecks),
-                Arc::new(LocalChecks),
-                sink.clone(),
-            ));
-            manager
-                .update_capacity(spec("x").resources, Duration::from_secs(60))
-                .unwrap();
-            let node = NodeRpc::new(manager.clone(), local_peers(), format!("boot-{id}"))
-                .with_local_creation((*sink).clone());
-            node_rpcs.push(node.clone());
-            let nl = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let na = nl.local_addr().unwrap();
-            servers.0.push(tokio::spawn(async move {
-                Server::builder()
-                    .tls_config(server_tls(cert))
-                    .unwrap()
-                    .add_service(pb::node_service_server::NodeServiceServer::new(node))
-                    .serve_with_incoming(TcpListenerStream::new(nl))
-                    .await
-                    .unwrap();
-            }));
-            let mut coordinator =
-                pb::coordinator_service_client::CoordinatorServiceClient::new(client);
-            let mut register = pb::RegisterNodeRequest {
-                runtime_classes: vec![
-                    "runsc".into(),
-                    "runc".into(),
-                    "firecracker".into(),
-                    "r".into(),
-                    "test-runtime".into(),
-                ],
-                node_id: id.into(),
-                node_address: na.to_string(),
-                proxy_address: "127.0.0.1:9999".into(),
-                capacity: Some(spec("x").resources.into()),
-                accepting_allocations: false,
-                labels: Default::default(),
-                devices: vec![],
-                session_id: format!("boot-{id}"),
-                heartbeat_sequence: 1,
-                reconciling: true,
-            };
-            coordinator.register_node(register.clone()).await.unwrap();
-            coordinator
-                .inspect_node(pb::InspectNodeRequest {
-                    node_id: id.into(),
-                    session_id: format!("boot-{id}"),
-                })
-                .await
-                .unwrap();
-            register.heartbeat_sequence = 2;
-            register.reconciling = false;
-            register.accepting_allocations = true;
-            coordinator.register_node(register).await.unwrap();
-            managers.push(manager);
-            backends.push(backend);
-            claimants.push(coordinator);
-            nodes.push(pb::node_service_client::NodeServiceClient::new(
-                channel(na, "apiserver").await,
-            ));
-        }
-        Self {
+        let mut rig = Self {
             _redis: redis,
             _servers: servers,
             session,
@@ -285,14 +208,116 @@ impl Rig {
             coordinator: pb::coordinator_service_client::CoordinatorServiceClient::new(
                 channel(ma, "apiserver").await,
             ),
-            nodes,
-            claimants,
-            managers,
-            backends,
-            node_rpcs,
-            sinks,
+            nodes: vec![],
+            claimants: vec![],
+            managers: vec![],
+            backends: vec![],
+            node_rpcs: vec![],
+            sinks: vec![],
             address: ma,
+            registrations: vec![],
+        };
+        for (id, cert) in [("a", "node"), ("b", "ingress")] {
+            rig.add_node(id, cert).await;
         }
+        rig
+    }
+    async fn add_node(&mut self, id: &str, cert: &'static str) {
+        let client = channel(self.address, cert).await;
+        let sink = Arc::new(
+            CoordinatorStateSink::new(client.clone(), Duration::from_secs(2))
+                .unwrap()
+                .with_session(format!("boot-{id}")),
+        );
+        let backend = Arc::new(Backend {
+            pause_writes_after_remove: Mutex::new(None),
+            session: self.session.clone(),
+            started: AtomicUsize::new(0),
+            removed: AtomicUsize::new(0),
+            running: Mutex::default(),
+        });
+        let manager = Arc::new(Adxlet::new(
+            id.into(),
+            backend.clone(),
+            Arc::new(LocalChecks),
+            Arc::new(LocalChecks),
+            sink.clone(),
+        ));
+        manager
+            .update_capacity(spec("x").resources, Duration::from_secs(60))
+            .unwrap();
+        let node = NodeRpc::new(manager.clone(), local_peers(), format!("boot-{id}"))
+            .with_local_creation((*sink).clone());
+        self.sinks.push(sink.clone());
+        self.node_rpcs.push(node.clone());
+        let nl = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let na = nl.local_addr().unwrap();
+        self._servers.0.push(tokio::spawn(async move {
+            Server::builder()
+                .tls_config(server_tls(cert))
+                .unwrap()
+                .add_service(pb::node_service_server::NodeServiceServer::new(node))
+                .serve_with_incoming(TcpListenerStream::new(nl))
+                .await
+                .unwrap();
+        }));
+        let mut coordinator = pb::coordinator_service_client::CoordinatorServiceClient::new(client);
+        let mut register = pb::RegisterNodeRequest {
+            storage_mounts: Default::default(),
+            runtime_classes: vec![
+                "runsc".into(),
+                "runc".into(),
+                "firecracker".into(),
+                "r".into(),
+                "test-runtime".into(),
+            ],
+            node_id: id.into(),
+            node_address: na.to_string(),
+            proxy_address: "127.0.0.1:9999".into(),
+            capacity: Some(spec("x").resources.into()),
+            accepting_allocations: false,
+            labels: Default::default(),
+            devices: vec![],
+            session_id: format!("boot-{id}"),
+            heartbeat_sequence: 1,
+            reconciling: true,
+        };
+        coordinator.register_node(register.clone()).await.unwrap();
+        coordinator
+            .inspect_node(pb::InspectNodeRequest {
+                node_id: id.into(),
+                session_id: format!("boot-{id}"),
+            })
+            .await
+            .unwrap();
+        register.heartbeat_sequence = 2;
+        register.reconciling = false;
+        register.accepting_allocations = true;
+        coordinator.register_node(register.clone()).await.unwrap();
+        self.registrations.push(register);
+        self.managers.push(manager);
+        self.backends.push(backend);
+        self.claimants.push(coordinator);
+        self.nodes
+            .push(pb::node_service_client::NodeServiceClient::new(
+                channel(na, "apiserver").await,
+            ));
+    }
+    async fn report_mounts(
+        &mut self,
+        index: usize,
+        mounts: std::collections::BTreeMap<String, adx_core::volumes::StorageMount>,
+    ) {
+        let report = &mut self.registrations[index];
+        report.heartbeat_sequence += 1;
+        report.storage_mounts = mounts
+            .into_iter()
+            .map(|(id, mount)| (id, mount.into()))
+            .collect();
+        self.claimants[index]
+            .register_node(report.clone())
+            .await
+            .unwrap();
     }
     fn request(id: &str, index: usize) -> pb::LocalEnvironmentCreateRequest {
         pb::LocalEnvironmentCreateRequest {
@@ -303,7 +328,11 @@ impl Rig {
     }
     async fn delete(&mut self, record: &pb::EnvironmentRecord) {
         let owner = record.assignment.as_ref().unwrap();
-        let index = usize::from(owner.node_id == "b");
+        let index = self
+            .registrations
+            .iter()
+            .position(|r| r.node_id == owner.node_id)
+            .unwrap();
         self.nodes[index]
             .delete_environment(pb::DeleteEnvironmentRequest {
                 failed_revision: None,
@@ -314,6 +343,401 @@ impl Rig {
             .await
             .unwrap();
     }
+}
+
+async fn volume_rig() -> (Rig, tempfile::TempDir, adx_core::volumes::Volume) {
+    volume_rig_with_mode(adx_core::volumes::AccessMode::Exclusive, 1).await
+}
+
+async fn volume_rig_with_mode(
+    access_mode: adx_core::volumes::AccessMode,
+    shards: usize,
+) -> (Rig, tempfile::TempDir, adx_core::volumes::Volume) {
+    use adx_core::{
+        execution::CreateOptions,
+        volumes::{StorageDomain, VolumeSource, VolumeSpec},
+    };
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let rig = Rig::new_with_shards(shards).await;
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("workspaces/tenant/user");
+    std::fs::create_dir_all(&path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o711)).unwrap();
+    std::fs::write(path.join("state"), "existing").unwrap();
+    let before = std::fs::metadata(&path).unwrap();
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+    let backend = mounts
+        .lines()
+        .find_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            (fields[4] == "/")
+                .then(|| fields[fields.iter().position(|f| *f == "-").unwrap() + 2].to_owned())
+        })
+        .unwrap();
+    let domains = std::collections::BTreeMap::from([(
+        "test".into(),
+        StorageDomain {
+            dynamic_nodes: false,
+            backend_id: backend,
+            node_roots: [
+                ("a".into(), root.path().to_str().unwrap().into()),
+                ("b".into(), root.path().to_str().unwrap().into()),
+            ]
+            .into(),
+            tenant_paths: [("tenant".into(), "workspaces/tenant".into())].into(),
+        },
+    )]);
+    rig.rpc
+        .clone()
+        .with_volume_domains(domains.clone())
+        .unwrap();
+    let volume = rig
+        .session
+        .ensure_volume(
+            VolumeSpec {
+                tenant_id: "tenant".into(),
+                id: "workspace".into(),
+                source: VolumeSource::Directory {
+                    storage_domain: "test".into(),
+                    path: "workspaces/tenant/user".into(),
+                },
+                access_mode,
+                create_if_missing: true,
+                create_options: Some(CreateOptions {
+                    uid: before.uid(),
+                    gid: before.gid(),
+                    mode: "0700".into(),
+                }),
+            },
+            &domains,
+        )
+        .await
+        .unwrap();
+    (rig, root, volume)
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
+async fn volume_execution_preserves_existing_data_and_releases_after_cleanup() {
+    use adx_core::{
+        execution::{Mount, MountSource},
+        volumes::VolumeRef,
+    };
+    use std::os::unix::fs::MetadataExt;
+    let (mut rig, root, volume) = volume_rig().await;
+    let path = root.path().join("workspaces/tenant/user");
+    let before = std::fs::metadata(&path).unwrap();
+    let mut raw = spec("volume-execution");
+    raw.execution.mounts.push(Mount {
+        kind: "bind".into(),
+        target: "/workspace".into(),
+        options: vec!["rw".into()],
+        source: MountSource::Volume(VolumeRef {
+            id: "workspace".into(),
+            uid: Some(volume.uid.clone()),
+        }),
+        create_if_missing: false,
+        create_options: None,
+    });
+    let mut request = Rig::request(&raw.id, 0);
+    request.create.as_mut().unwrap().spec = Some(raw.clone().into());
+    let created = rig.nodes[0]
+        .create_local_environment(request)
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    let stored = rig.session.get(&raw.id).await.unwrap();
+    assert_eq!(stored.spec, raw);
+    let held = rig.session.get_volume("tenant", "workspace").await.unwrap();
+    assert_eq!(
+        held.occupancy.unwrap().phase,
+        adx_core::volumes::OccupancyPhase::Held
+    );
+    assert!(matches!(
+        held.initialization,
+        adx_coordinator::storage::Initialization::Ready { .. }
+    ));
+    let after = std::fs::metadata(&path).unwrap();
+    assert_eq!(
+        (before.uid(), before.gid(), before.mode()),
+        (after.uid(), after.gid(), after.mode())
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.join("state")).unwrap(),
+        "existing"
+    );
+    rig.delete(&created).await;
+    assert_eq!(rig.backends[0].removed.load(Ordering::SeqCst), 1);
+    let released = rig.session.get_volume("tenant", "workspace").await.unwrap();
+    assert!(released.occupancy.is_none());
+    assert!(released.references.is_empty());
+    assert_eq!(released.volume.uid, volume.uid);
+    let mut failed = raw;
+    failed.id = "volume-start-failure".into();
+    failed.env.insert("FAIL_START".into(), "true".into());
+    let mut request = Rig::request(&failed.id, 0);
+    request.create.as_mut().unwrap().spec = Some(failed.into());
+    assert!(rig.nodes[0]
+        .create_local_environment(request)
+        .await
+        .is_err());
+    assert!(rig
+        .session
+        .get_volume("tenant", "workspace")
+        .await
+        .unwrap()
+        .occupancy
+        .is_none());
+
+    assert_eq!(
+        std::fs::read_to_string(path.join("state")).unwrap(),
+        "existing"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
+async fn heartbeat_expiry_wakes_only_the_volume_wait_and_allows_takeover_before_old_runtime_stops()
+{
+    use adx_core::{
+        execution::{Mount, MountSource},
+        volumes::VolumeRef,
+    };
+    let (mut rig, _root, volume) = volume_rig().await;
+    let request = |id: &str, index: usize| {
+        let mut input = spec(id);
+        input.execution.mounts.push(Mount {
+            kind: "bind".into(),
+            target: "/workspace".into(),
+            options: vec!["rw".into()],
+            source: MountSource::Volume(VolumeRef {
+                id: "workspace".into(),
+                uid: Some(volume.uid.clone()),
+            }),
+            create_if_missing: false,
+            create_options: None,
+        });
+        let mut request = Rig::request(id, index);
+        request.create.as_mut().unwrap().spec = Some(input.into());
+        request
+    };
+    let old = rig.nodes[0]
+        .create_local_environment(request("old", 0))
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    let mut node = rig.nodes[1].clone();
+    let next_request = request("next", 1);
+    let waiting = tokio::spawn(async move { node.create_local_environment(next_request).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let queue = rig
+                .coordinator
+                .get_scheduling_queue(pb::GetSchedulingQueueRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            if queue
+                .environments
+                .iter()
+                .any(|pending| pending.spec.as_ref().is_some_and(|spec| spec.id == "next"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let snapshot = rig.session.snapshot().await.unwrap();
+    let b = &snapshot.nodes["b"];
+    rig.claimants[1]
+        .register_node(pb::RegisterNodeRequest {
+            storage_mounts: Default::default(),
+            runtime_classes: b.node.runtime_classes.clone(),
+            node_id: "b".into(),
+            node_address: b.address.clone(),
+            proxy_address: b.proxy_address.clone(),
+            capacity: Some(b.node.capacity.into()),
+            accepting_allocations: true,
+            labels: Default::default(),
+            devices: vec![],
+            session_id: "boot-b".into(),
+            heartbeat_sequence: 3,
+            reconciling: false,
+        })
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(5_100)).await;
+    assert_eq!(rig.rpc.expire_nodes().await.unwrap(), 1);
+    let current = tokio::time::timeout(Duration::from_secs(3), waiting)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    assert_eq!(current.assignment.as_ref().unwrap().node_id, "b");
+    assert_eq!(
+        rig.session
+            .get_volume("tenant", "workspace")
+            .await
+            .unwrap()
+            .occupancy
+            .unwrap()
+            .assignment
+            .environment_id,
+        "next"
+    );
+    assert!(rig.session.get("old").await.unwrap().invalidated);
+    // The accepted failure policy does not wait for a physical stop on node a.
+    assert_eq!(rig.backends[0].removed.load(Ordering::SeqCst), 0);
+    assert!(rig.backends[0]
+        .running
+        .lock()
+        .unwrap()
+        .contains(&old.runtime.as_ref().unwrap().id));
+    let error = rig.claimants[0]
+        .commit_environment(pb::CommitEnvironmentRequest {
+            record: Some(old.clone()),
+            node_session_id: "boot-a".into(),
+            stopped_runtime_ids: vec![old.runtime.unwrap().id],
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(
+        rig.session
+            .get_volume("tenant", "workspace")
+            .await
+            .unwrap()
+            .occupancy
+            .unwrap()
+            .assignment
+            .environment_id,
+        "next"
+    );
+    rig.delete(&current).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
+async fn volume_wait_releases_local_capacity_and_expiry_removes_only_the_waiting_reference() {
+    use adx_core::{
+        execution::{Mount, MountSource},
+        volumes::{AccessMode, StorageDomain, VolumeRef, VolumeSource, VolumeSpec},
+    };
+    let mut rig = Rig::new().await;
+    let domains = std::collections::BTreeMap::from([(
+        "sfs".into(),
+        StorageDomain {
+            dynamic_nodes: false,
+            backend_id: "server:/export".into(),
+            node_roots: [
+                ("a".into(), "/mnt/sfs".into()),
+                ("b".into(), "/mnt/sfs".into()),
+            ]
+            .into(),
+            tenant_paths: [("tenant".into(), "workspaces/tenant".into())].into(),
+        },
+    )]);
+    rig.rpc
+        .clone()
+        .with_volume_domains(domains.clone())
+        .unwrap();
+    rig.session
+        .ensure_volume(
+            VolumeSpec {
+                tenant_id: "tenant".into(),
+                id: "workspace".into(),
+                source: VolumeSource::Directory {
+                    storage_domain: "sfs".into(),
+                    path: "workspaces/tenant/user".into(),
+                },
+                access_mode: AccessMode::Exclusive,
+                create_if_missing: false,
+                create_options: None,
+            },
+            &domains,
+        )
+        .await
+        .unwrap();
+    let with_volume = |id: &str| {
+        let mut spec = spec(id);
+        spec.execution.mounts.push(Mount {
+            kind: "bind".into(),
+            target: "/workspace".into(),
+            options: vec!["rw".into()],
+            source: MountSource::Volume(VolumeRef {
+                id: "workspace".into(),
+                uid: None,
+            }),
+            create_if_missing: false,
+            create_options: None,
+        });
+        spec
+    };
+    rig.claimants[0]
+        .claim_environment(pb::ClaimEnvironmentRequest {
+            create_deadline_unix_millis: 0,
+            request_id: String::new(),
+            spec: Some(with_volume("owner").into()),
+            caller: caller(),
+            node_session_id: "boot-a".into(),
+            devices: vec![],
+        })
+        .await
+        .unwrap();
+    let mut request = Rig::request("waiter", 1);
+    let create = request.create.as_mut().unwrap();
+    create.spec = Some(with_volume("waiter").into());
+    create.schedule_timeout_seconds = 1;
+    let mut entry = rig.nodes[1].clone();
+    let waiting = tokio::spawn(async move { entry.create_local_environment(request).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let queue = rig
+                .coordinator
+                .get_scheduling_queue(pb::GetSchedulingQueueRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            if queue.environments.iter().any(|pending| {
+                pending
+                    .spec
+                    .as_ref()
+                    .is_some_and(|spec| spec.id == "waiter")
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let unrelated = rig.nodes[1]
+        .create_local_environment(Rig::request("other", 1))
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    assert_eq!(unrelated.assignment.as_ref().unwrap().node_id, "b");
+    let error = waiting.await.unwrap().unwrap_err();
+    let failure =
+        adx_protocol::scheduling_failure(&error).expect("confirmed unassigned cancellation");
+    assert_eq!(failure.rejections.get("waiting_for_volume"), Some(&2));
+    let volume = rig.session.get_volume("tenant", "workspace").await.unwrap();
+    assert_eq!(volume.references, ["owner".into()].into());
+    assert_eq!(volume.occupancy.unwrap().assignment.environment_id, "owner");
+    assert_eq!(rig.backends[0].started.load(Ordering::SeqCst), 0);
+    rig.delete(&unrelated).await;
 }
 
 #[tokio::test]
@@ -393,6 +817,7 @@ async fn failed_gc_cleans_invalidated_owner_and_fences_delayed_running() {
     );
     assert!(rig.claimants[0]
         .commit_environment(pb::CommitEnvironmentRequest {
+            stopped_runtime_ids: vec![],
             record: Some(created),
             node_session_id: "boot-a".into()
         })
@@ -416,6 +841,7 @@ async fn redis_restart_recovers_scheduler_after_failed_node_heartbeat() {
     let stored = rig.session.snapshot().await.unwrap();
     let node = &stored.nodes["a"];
     let heartbeat = pb::RegisterNodeRequest {
+        storage_mounts: Default::default(),
         runtime_classes: vec!["runsc".into(), "runc".into()],
         node_id: "a".into(),
         node_address: node.address.clone(),
@@ -773,6 +1199,7 @@ async fn environment_directory_increment_does_not_rescan_control_history() {
     let heartbeat_before = redis_command_calls(&rig._redis, "hgetall").await;
     rig.claimants[0]
         .register_node(pb::RegisterNodeRequest {
+            storage_mounts: Default::default(),
             runtime_classes: stored.node.runtime_classes,
             node_id: stored.node.id,
             node_address: stored.address,
@@ -1009,6 +1436,10 @@ async fn deleted_named_environment_can_be_created_again_with_a_new_generation() 
 #[ignore = "requires real Redis and generated mTLS certificates"]
 async fn new_local_claim_avoids_redundant_preclaim_storage_read() {
     let mut rig = Rig::new().await;
+    // Count only the claim: the periodic route publisher has independent reads.
+    let publisher = rig._servers.0.remove(0);
+    publisher.abort();
+    let _ = publisher.await;
     let before = redis_command_calls(&rig._redis, "hmget").await;
 
     rig.claimants[0]
@@ -1024,10 +1455,7 @@ async fn new_local_claim_avoids_redundant_preclaim_storage_read() {
         .unwrap();
 
     let reads = redis_command_calls(&rig._redis, "hmget").await - before;
-    assert!(
-        (1..=2).contains(&reads),
-        "claim uses one storage read; the incremental route publisher may contribute one more, got {reads}"
-    );
+    assert_eq!(reads, 1, "claim should use exactly one storage read");
 }
 
 #[tokio::test]
@@ -1274,13 +1702,7 @@ async fn central_assignment_waits_for_unconfirmed_local_capacity_without_reassig
     rig.delete(&center).await;
 }
 
-#[tokio::test]
-#[ignore = "requires real Redis, mTLS certificates and API Server binary for HTTPS"]
-async fn local_first_https_directory_round_robin_and_concurrent_creation() {
-    let Ok(api_binary) = std::env::var("ADX_TEST_APISERVER") else {
-        return;
-    };
-    let mut rig = Rig::new().await;
+async fn prepare_http(rig: &mut Rig) {
     for (key, tenant) in [("a", "tenant"), ("b", "other")] {
         rig.session
             .bootstrap_credential(
@@ -1306,6 +1728,7 @@ async fn local_first_https_directory_round_robin_and_concurrent_creation() {
         let node = &rig.session.snapshot().await.unwrap().nodes[if i == 0 { "a" } else { "b" }];
         rig.claimants[i]
             .register_node(pb::RegisterNodeRequest {
+                storage_mounts: Default::default(),
                 runtime_classes: vec![
                     "runsc".into(),
                     "runc".into(),
@@ -1327,6 +1750,17 @@ async fn local_first_https_directory_round_robin_and_concurrent_creation() {
             .await
             .unwrap();
     }
+}
+
+async fn start_api(
+    rig: &Rig,
+    api_binary: &str,
+    prefix: &str,
+) -> (
+    tempfile::TempDir,
+    tokio::process::Child,
+    std::net::SocketAddr,
+) {
     let directory = tempfile::tempdir().unwrap();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
@@ -1343,14 +1777,27 @@ async fn local_first_https_directory_round_robin_and_concurrent_creation() {
     let path = directory.path().join("api.json");
     std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
     let evidence = PathBuf::from(std::env::var("ADX_TEST_EVIDENCE").unwrap());
-    let log = std::fs::File::create(evidence.join("local-first-api.log")).unwrap();
-    let mut process = tokio::process::Command::new(api_binary)
+    let log = std::fs::File::create(evidence.join(format!("{prefix}-api.log"))).unwrap();
+    let process = tokio::process::Command::new(api_binary)
         .args(["--config", path.to_str().unwrap()])
         .stdout(log.try_clone().unwrap())
         .stderr(log)
         .kill_on_drop(true)
         .spawn()
         .unwrap();
+    (directory, process, address)
+}
+
+#[tokio::test]
+#[ignore = "requires real Redis, mTLS certificates and API Server binary for HTTPS"]
+async fn local_first_https_directory_round_robin_and_concurrent_creation() {
+    let Ok(api_binary) = std::env::var("ADX_TEST_APISERVER") else {
+        return;
+    };
+    let mut rig = Rig::new().await;
+    prepare_http(&mut rig).await;
+    let (_directory, mut process, address) = start_api(&rig, &api_binary, "local-first").await;
+    let evidence = PathBuf::from(std::env::var("ADX_TEST_EVIDENCE").unwrap());
     let script =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../build/ci/local_first_http.py");
     let result = tokio::process::Command::new("python3")
@@ -1549,6 +1996,7 @@ async fn ordinary_heartbeats_do_not_write_redis() {
     for sequence in 3..23 {
         rig.claimants[0]
             .register_node(pb::RegisterNodeRequest {
+                storage_mounts: Default::default(),
                 node_id: "a".into(),
                 session_id: "boot-a".into(),
                 node_address: saved.address.clone(),
@@ -1744,12 +2192,15 @@ async fn coordinator_restart_reclaims_unconfirmed_runtime_before_reassignment() 
     let saved = session.snapshot().await.unwrap();
     for (index, id, cert) in [(0, "a", "node"), (1, "b", "ingress")] {
         let channel = channel(address, cert).await;
-        rig.sinks[index].reconnect(adx_transport::rpc::authenticated_channel(channel.clone()));
+        rig.sinks[index]
+            .reconnect(adx_transport::rpc::authenticated_channel(channel.clone()))
+            .unwrap();
         let mut authority = pb::coordinator_service_client::CoordinatorServiceClient::new(
             adx_transport::rpc::authenticated_channel(channel),
         );
         let node = &saved.nodes[id];
         let mut report = pb::RegisterNodeRequest {
+            storage_mounts: Default::default(),
             node_id: id.into(),
             node_address: node.address.clone(),
             proxy_address: node.proxy_address.clone(),
@@ -2029,6 +2480,7 @@ async fn memory_local_reservation_expires_and_late_result_is_fenced() {
     assert_eq!(
         rig.claimants[0]
             .commit_environment(pb::CommitEnvironmentRequest {
+                stopped_runtime_ids: vec![],
                 record: Some(late),
                 node_session_id: "boot-a".into()
             })
@@ -2148,4 +2600,339 @@ async fn memory_local_concurrent_entries_reuse_one_success() {
         .managers
         .iter()
         .all(|m| m.used() == Resources::default()));
+}
+
+fn managed_request(id: &str, volume: &adx_core::volumes::Volume) -> pb::CreateEnvironmentRequest {
+    let mut request = create(id);
+    let mut raw = spec(id);
+    raw.execution.mounts.push(adx_core::execution::Mount {
+        kind: "bind".into(),
+        target: "/workspace".into(),
+        options: vec!["rw".into()],
+        source: adx_core::execution::MountSource::Volume(adx_core::volumes::VolumeRef {
+            id: volume.spec.id.clone(),
+            uid: Some(volume.uid.clone()),
+        }),
+        create_if_missing: false,
+        create_options: None,
+    });
+    request.spec = Some(raw.into());
+    request
+}
+
+async fn wait_for_queued(rig: &mut Rig, id: &str) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let queue = rig
+                .coordinator
+                .get_scheduling_queue(pb::GetSchedulingQueueRequest {})
+                .await
+                .unwrap()
+                .into_inner();
+            if queue
+                .environments
+                .iter()
+                .any(|pending| pending.spec.as_ref().is_some_and(|spec| spec.id == id))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
+async fn dynamic_storage_refreshes_waiting_topology_and_withdraws_without_restarting() {
+    use adx_core::volumes::{AccessMode, StorageDomain, StorageMount};
+    use std::collections::BTreeMap;
+    for dynamic_nodes in [false, true] {
+        let (mut rig, root, volume) = volume_rig_with_mode(AccessMode::Shared, 2).await;
+        let backend = rig
+            .session
+            .get_volume("tenant", "workspace")
+            .await
+            .unwrap()
+            .backend_id;
+        let mounts = adxlet::managed_mounts::mounted_storage(BTreeMap::from([(
+            "test".into(),
+            StorageMount {
+                backend_id: backend.clone(),
+                root: root.path().to_str().unwrap().into(),
+            },
+        )]))
+        .await
+        .unwrap();
+        rig.rpc
+            .clone()
+            .with_volume_domains(BTreeMap::from([(
+                "test".into(),
+                StorageDomain {
+                    backend_id: backend,
+                    dynamic_nodes,
+                    node_roots: [
+                        ("a".into(), root.path().to_str().unwrap().into()),
+                        ("b".into(), root.path().to_str().unwrap().into()),
+                    ]
+                    .into(),
+                    tenant_paths: [("tenant".into(), "workspaces/tenant".into())].into(),
+                },
+            )]))
+            .unwrap();
+        let primer = rig
+            .coordinator
+            .create_environment(create("prime-shard-rotation"))
+            .await
+            .unwrap()
+            .into_inner()
+            .record
+            .unwrap();
+        rig.delete(&primer).await;
+        let mut occupied = Vec::new();
+        for (index, id) in ["fill-a", "fill-b"].into_iter().enumerate() {
+            rig.report_mounts(index, mounts.clone()).await;
+            occupied.push(
+                rig.nodes[index]
+                    .create_local_environment(Rig::request(id, index))
+                    .await
+                    .unwrap()
+                    .into_inner()
+                    .record
+                    .unwrap(),
+            );
+        }
+        let mut api = rig.coordinator.clone();
+        let request = managed_request("waiting", &volume);
+        let waiting = tokio::spawn(async move { api.create_environment(request).await });
+        wait_for_queued(&mut rig, "waiting").await;
+        rig.add_node("c", "unknown").await;
+        assert!(
+            !waiting.is_finished(),
+            "unreported storage entered topology"
+        );
+        let mut wrong = mounts.clone();
+        wrong.get_mut("test").unwrap().backend_id = "other:/export".into();
+        rig.report_mounts(2, wrong).await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(
+            !waiting.is_finished(),
+            "mismatched backend entered topology"
+        );
+        rig.report_mounts(2, mounts.clone()).await;
+        if !dynamic_nodes {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            assert!(
+                !waiting.is_finished(),
+                "fixed topology expanded to a new node"
+            );
+            rig.delete(&occupied.remove(0)).await;
+        }
+        let created = tokio::time::timeout(Duration::from_secs(3), waiting)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .into_inner()
+            .record
+            .unwrap();
+        assert_eq!(
+            created.assignment.as_ref().unwrap().node_id,
+            if dynamic_nodes { "c" } else { "a" }
+        );
+        if dynamic_nodes {
+            let stale = rig.registrations[2].clone();
+            rig.report_mounts(2, BTreeMap::new()).await;
+            let mut grants = pb::volume_execution_service_client::VolumeExecutionServiceClient::new(
+                channel(rig.address, "unknown").await,
+            );
+            assert_eq!(
+                grants
+                    .authorize_execution(pb::AuthorizeVolumeExecutionRequest {
+                        record: Some(created.clone()),
+                        previous_runtime_id: created.runtime.as_ref().unwrap().id.clone(),
+                        node_session_id: "boot-c".into(),
+                    })
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::ResourceExhausted
+            );
+            assert_eq!(
+                rig.claimants[2]
+                    .register_node(stale)
+                    .await
+                    .unwrap_err()
+                    .code(),
+                tonic::Code::FailedPrecondition
+            );
+            // A capability withdrawal does not retire an already-running backend.
+            assert_eq!(rig.backends[2].removed.load(Ordering::SeqCst), 0);
+            rig.delete(&created).await;
+            let request = managed_request("after-withdrawal", &volume);
+            let mut api = rig.coordinator.clone();
+            let next = tokio::spawn(async move { api.create_environment(request).await });
+            wait_for_queued(&mut rig, "after-withdrawal").await;
+            let unrelated = rig.nodes[2]
+                .create_local_environment(pb::LocalEnvironmentCreateRequest {
+                    persist_claim: false,
+                    create: Some(create("unrelated")),
+                    node_session_id: "boot-c".into(),
+                })
+                .await
+                .unwrap()
+                .into_inner()
+                .record
+                .unwrap();
+            assert!(!next.is_finished());
+            rig.delete(&unrelated).await;
+            rig.report_mounts(2, mounts).await;
+            let next = tokio::time::timeout(Duration::from_secs(3), next)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap()
+                .into_inner()
+                .record
+                .unwrap();
+            assert_eq!(next.assignment.as_ref().unwrap().node_id, "c");
+            rig.delete(&next).await;
+        } else {
+            rig.delete(&created).await;
+        }
+        for record in occupied {
+            rig.delete(&record).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("workspaces/tenant/user/state")).unwrap(),
+            "existing"
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and generated mTLS certificates; run control-rpc suite"]
+async fn dynamic_storage_refresh_keeps_exclusive_wait_until_release() {
+    use adx_core::volumes::{StorageDomain, StorageMount};
+    use std::collections::BTreeMap;
+    let (mut rig, root, volume) = volume_rig().await;
+    let mut request = Rig::request("holder", 0);
+    request.create = Some(managed_request("holder", &volume));
+    let holder = rig.nodes[0]
+        .create_local_environment(request)
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    let backend = rig
+        .session
+        .get_volume("tenant", "workspace")
+        .await
+        .unwrap()
+        .backend_id;
+    rig.rpc
+        .clone()
+        .with_volume_domains(BTreeMap::from([(
+            "test".into(),
+            StorageDomain {
+                backend_id: backend.clone(),
+                dynamic_nodes: true,
+                node_roots: [
+                    ("a".into(), root.path().to_str().unwrap().into()),
+                    ("b".into(), root.path().to_str().unwrap().into()),
+                ]
+                .into(),
+                tenant_paths: [("tenant".into(), "workspaces/tenant".into())].into(),
+            },
+        )]))
+        .unwrap();
+    let mut request = managed_request("exclusive-wait", &volume);
+    request.spec.as_mut().unwrap().scheduling = Some(pb::SchedulingPolicy {
+        required_node: vec![pb::LabelSelector {
+            match_labels: [("NODE_ID".into(), "c".into())].into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let mut api = rig.coordinator.clone();
+    let waiting = tokio::spawn(async move { api.create_environment(request).await });
+    wait_for_queued(&mut rig, "exclusive-wait").await;
+    rig.add_node("c", "unknown").await;
+    rig.report_mounts(
+        2,
+        BTreeMap::from([(
+            "test".into(),
+            StorageMount {
+                backend_id: backend,
+                root: root.path().to_str().unwrap().into(),
+            },
+        )]),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(!waiting.is_finished());
+    assert_eq!(rig.backends[2].started.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        rig.session
+            .get_volume("tenant", "workspace")
+            .await
+            .unwrap()
+            .occupancy
+            .unwrap()
+            .assignment
+            .environment_id,
+        "holder"
+    );
+    rig.delete(&holder).await;
+    let next = tokio::time::timeout(Duration::from_secs(3), waiting)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    assert_eq!(next.assignment.as_ref().unwrap().node_id, "c");
+    rig.delete(&next).await;
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and mTLS; run control-rpc suite"]
+async fn default_local_creation_still_claims_an_exclusive_volume() {
+    let (mut rig, _root, volume) = volume_rig().await;
+    let mut request = Rig::request("default-exclusive", 0);
+    request.persist_claim = false;
+    request.create = Some(managed_request("default-exclusive", &volume));
+    let owner = rig.nodes[0]
+        .create_local_environment(request)
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    let saved = rig.session.get("default-exclusive").await.unwrap();
+    assert_eq!(
+        saved.assignment,
+        owner.assignment.clone().unwrap().try_into().unwrap()
+    );
+    assert!(saved.volume_execution.is_some());
+    let occupancy = rig
+        .session
+        .get_volume("tenant", "workspace")
+        .await
+        .unwrap()
+        .occupancy
+        .unwrap();
+    assert_eq!(occupancy.assignment, saved.assignment);
+    assert_eq!(occupancy.phase, adx_core::volumes::OccupancyPhase::Held);
+    rig.delete(&owner).await;
+    assert!(rig
+        .session
+        .get_volume("tenant", "workspace")
+        .await
+        .unwrap()
+        .occupancy
+        .is_none());
 }

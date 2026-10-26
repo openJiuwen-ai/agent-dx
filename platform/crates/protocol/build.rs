@@ -12,6 +12,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "environment.proto",
         "environment_types.proto",
         "snapshot.proto",
+        "volume.proto",
         "credentials.proto",
         "routes.proto",
     ] {

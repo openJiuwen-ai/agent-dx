@@ -38,7 +38,7 @@ impl Controller {
         match catalog.get(&id).await {
             Ok(snapshot) => {
                 if snapshot.names != request.names
-                    || snapshot.template != self.record.spec
+                    || !snapshot.matches_template(&self.record.spec)
                     || snapshot.state != SnapshotState::Ready
                     || snapshot.source_node_id != self.record.assignment.node_id
                 {

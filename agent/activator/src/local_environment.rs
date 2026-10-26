@@ -13,6 +13,18 @@ use std::{sync::Arc, time::Duration};
 /// authenticates the caller before passing its tenant to this private interface.
 #[async_trait]
 pub trait EnvironmentApplication: Send + Sync {
+    async fn ensure_volume_request(
+        &self,
+        _tenant: &str,
+        _input: Value,
+    ) -> Result<Value, EnvironmentError> {
+        Err(EnvironmentError::Unsupported(
+            "Volume management unavailable".into(),
+        ))
+    }
+    async fn release_volume_owner(&self, _tenant: &str, _id: &str) -> Result<(), EnvironmentError> {
+        Ok(())
+    }
     async fn create_request(
         &self,
         tenant: &str,
@@ -51,6 +63,34 @@ impl LocalEnvironment {
 }
 #[async_trait]
 impl Environment for LocalEnvironment {
+    async fn ensure_volume(
+        &self,
+        tenant: &str,
+        owner: &str,
+        spec: &adx_agent_core::volumes::VolumeSpec,
+    ) -> Result<adx_agent_core::volumes::VolumeRef, EnvironmentError> {
+        spec.validate().map_err(EnvironmentError::Invalid)?;
+        let mut input = serde_json::to_value(spec)
+            .map_err(|_| EnvironmentError::Invalid("invalid Volume definition".into()))?;
+        input["owner_id"] = json!(owner);
+        let value = tokio::time::timeout(
+            self.timeout,
+            self.application.ensure_volume_request(tenant, input),
+        )
+        .await
+        .map_err(|_| {
+            EnvironmentError::OutcomeUnknown("Volume ensure response timed out".into())
+        })??;
+        environment_request::volume_reference(&value, tenant, &spec.id)
+    }
+    async fn release_volumes(&self, tenant: &str, owner: &str) -> Result<(), EnvironmentError> {
+        tokio::time::timeout(
+            self.timeout,
+            self.application.release_volume_owner(tenant, owner),
+        )
+        .await
+        .map_err(|_| EnvironmentError::OutcomeUnknown("Volume owner cleanup timed out".into()))?
+    }
     fn validate_execution(&self, execution: &ExecutionSpec) -> Result<(), EnvironmentError> {
         environment_request::validate_execution(execution)
     }

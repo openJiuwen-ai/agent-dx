@@ -15,6 +15,7 @@ use std::{
 
 #[derive(Default)]
 struct Backend {
+    execution_admission_error: Mutex<Option<Error>>,
     sampled_runtimes: Mutex<BTreeSet<String>>,
     checkpoint_commit_failures: Mutex<usize>,
     workload_ack_failures: Mutex<usize>,
@@ -295,6 +296,16 @@ impl Routes for Backend {
 }
 #[async_trait]
 impl StateSink for Backend {
+    async fn prepare_execution(
+        &self,
+        record: &EnvironmentRecord,
+        _: &str,
+    ) -> Result<EnvironmentSpec> {
+        if let Some(error) = self.execution_admission_error.lock().unwrap().clone() {
+            return Err(error);
+        }
+        Ok(record.spec.clone())
+    }
     async fn commit(&self, r: &EnvironmentRecord) -> Result<Durability> {
         self.event(&format!("commit:{:?}", r.state));
         if r.checkpoint.is_some() {
@@ -2285,6 +2296,50 @@ async fn runsc_capture_preserves_background_restore_input_without_pinning_new_ca
         !input_path.exists(),
         "stopped execution releases the cache input"
     );
+}
+
+#[tokio::test]
+async fn refused_resume_admission_preserves_previous_runtime_and_can_retry() {
+    for error in [Error::VolumeBusy("workspace-uid".into()), Error::NoCapacity] {
+        let (_temp, backend, node, spec, assignment) = fixture();
+        let handle = node.environment(spec, assignment).unwrap();
+        let created = handle.create().await.unwrap();
+        let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+        *backend.execution_admission_error.lock().unwrap() = Some(error.clone());
+        assert_eq!(
+            handle.resume(resume(paused.record.revision)).await,
+            Err(error)
+        );
+        let waiting = handle.sync().await.unwrap();
+        assert_eq!(waiting.record.state, EnvironmentState::Paused);
+        assert!(!waiting.record.resources_held);
+        assert_eq!(waiting.record.runtime.id, paused.record.runtime.id);
+        *backend.execution_admission_error.lock().unwrap() = None;
+        let restored = handle
+            .resume(resume(waiting.record.revision))
+            .await
+            .unwrap();
+        assert_eq!(restored.record.state, EnvironmentState::Running);
+        assert_ne!(restored.record.runtime.id, paused.record.runtime.id);
+    }
+}
+
+#[tokio::test]
+async fn ambiguous_resume_admission_retains_attempt_identity_for_cleanup() {
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let created = handle.create().await.unwrap();
+    let paused = handle.pause(pause(created.record.revision)).await.unwrap();
+    let error = Error::Unavailable("authorization response lost".into());
+    *backend.execution_admission_error.lock().unwrap() = Some(error.clone());
+    assert_eq!(
+        handle.resume(resume(paused.record.revision)).await,
+        Err(error)
+    );
+    let waiting = handle.sync().await.unwrap();
+    assert_eq!(waiting.record.state, EnvironmentState::Paused);
+    assert!(!waiting.record.resources_held);
+    assert_ne!(waiting.record.runtime.id, paused.record.runtime.id);
 }
 
 #[derive(Clone, Copy)]

@@ -209,6 +209,40 @@ impl Api {
                 Err(error) => error_response(error, &request_id, None, None, method != "GET"),
             };
         }
+        if path == "/api/environment/v1/volumes" || path.starts_with("/api/environment/v1/volumes/")
+        {
+            let id = path.strip_prefix("/api/environment/v1/volumes/");
+            let input = if method == "POST" {
+                match body(request.into_body(), 1_048_576).await {
+                    Ok(value) => value,
+                    Err(error) => return error_response(error, &request_id, None, None, false),
+                }
+            } else {
+                Value::Null
+            };
+            return response(
+                Box::pin(
+                    self.environment_service
+                        .volume_request(&method, id, input, &query, &caller),
+                )
+                .await,
+                &request_id,
+                None,
+                None,
+                method != "GET",
+            );
+        }
+        if let Some(id) = path.strip_prefix("/api/environment/v1/volume-owners/") {
+            let result = if method == "DELETE" {
+                self.environment_service
+                    .release_volume_owner(id, &caller)
+                    .await
+                    .map(|()| Value::Null)
+            } else {
+                Err(Status::unimplemented("unsupported Volume owner method"))
+            };
+            return response(result, &request_id, None, None, method == "DELETE");
+        }
         if method == "GET" && path == "/api/environment/v1/capabilities" {
             return plain(200, json!({"capabilities": ["workload-probes-v1"]}));
         }

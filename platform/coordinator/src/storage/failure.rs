@@ -14,6 +14,19 @@ impl Session {
                 .connection
                 .publication_sequence
                 .load(Ordering::Acquire);
+            let mut catalog = if saved.environments.values().any(|record| {
+                record.assignment.node_id == id
+                    && !record.invalidated
+                    && volumes::has_volumes(&record.spec)
+            }) {
+                let catalog = self.volume_catalog().await?;
+                if raw.get(HEADER) != Some(&catalog.header_value) {
+                    continue;
+                }
+                Some(catalog)
+            } else {
+                None
+            };
             let node = saved.nodes.get_mut(id).ok_or(Error::NotFound)?;
             if node.session.as_ref().is_none_or(|s| s.id != session_id) {
                 return Err(Error::Conflict);
@@ -45,28 +58,18 @@ impl Session {
                     continue;
                 }
                 environment.observe_node_loss(&incident_id, &mut counters.value)?;
-                let mut result = environment
-                    .result
-                    .clone()
-                    .unwrap_or_else(|| EnvironmentRecord {
-                        observation: None,
-                        execution_artifacts: vec![],
-                        snapshot_source: None,
-                        failure: None,
-                        spec: environment.spec.clone(),
-                        assignment: environment.assignment.clone(),
-                        runtime: adx_core::Runtime {
-                            id: format!("{}-{}", environment_id, environment.assignment.generation),
-                            ip: None,
-                        },
-                        revision: 0,
-                        state: EnvironmentState::Pending,
-                        resources_held: true,
-                        checkpoint: None,
-                        last_operation: None,
-                        restart_attempts: 0,
-                        restart_pending: false,
-                    });
+                if volumes::has_volumes(&environment.spec) {
+                    catalog
+                        .as_mut()
+                        .ok_or(Error::Conflict)?
+                        .invalidate_execution(environment, session_id)?;
+                }
+                // A new attempt may have been authorized after the last observed
+                // result. Retire that attempt so returning-node cleanup sees it.
+                let mut result = environment.effective_record();
+                if let Some(execution) = &mut environment.volume_execution {
+                    execution.released = true;
+                }
                 let mut inputs = result.execution_artifacts.clone();
                 if result.resources_held {
                     if let Some(snapshot) = snapshots
@@ -147,25 +150,47 @@ impl Session {
                 .arg(
                     r#"
                 if redis.call('HGET', KEYS[1], 'epoch') ~= ARGV[1] then return 0 end
+                local tail=tonumber(ARGV[5])
+                if ARGV[6] ~= '' and redis.call('HGET',KEYS[1],'header') ~= ARGV[6] then return 0 end
                 local expected = cjson.decode(ARGV[2])
                 for field,value in pairs(expected) do if (redis.call('HGET',KEYS[1],field) or '') ~= value then return 0 end end
                 local facts=cjson.decode(ARGV[3])
                 if (redis.call('HGET',KEYS[3],facts[1]) or '') ~= facts[2] then return 0 end
                 redis.call('HSET',KEYS[3],facts[1],facts[3])
-                local count=tonumber(ARGV[4]); for i=5,4+count*2,2 do redis.call('HSET',KEYS[1],ARGV[i],ARGV[i+1]) end
-                for i=5+count*2,#ARGV-1,2 do redis.call('HSET',KEYS[2],ARGV[i],ARGV[i+1]) end
-                redis.call('HDEL',KEYS[1],ARGV[#ARGV]); return 1
+                local count=tonumber(ARGV[4]); for i=8,7+count*2,2 do redis.call('HSET',KEYS[1],ARGV[i],ARGV[i+1]) end
+                for i=8+count*2,7+(count+tail)*2,2 do redis.call('HSET',KEYS[2],ARGV[i],ARGV[i+1]) end
+                local cursor=8+(count+tail)*2
+                local volumes=tonumber(ARGV[cursor]); cursor=cursor+1
+                for _=1,volumes do
+                  if ARGV[cursor+1] == '' then redis.call('HDEL',KEYS[4],ARGV[cursor])
+                  else redis.call('HSET',KEYS[4],ARGV[cursor],ARGV[cursor+1]) end
+                  cursor=cursor+2
+                end
+                if ARGV[6] ~= '' then redis.call('HSET',KEYS[1],'header',ARGV[7]) end
+                redis.call('HDEL',KEYS[1],ARGV[cursor]); return 1
             "#,
                 )
-                .arg(3)
+                .arg(4)
                 .arg(&self.store.key)
                 .arg(format!("{}:input-holds",self.store.key))
                 .arg(format!("{}:business",self.store.key))
+                .arg(self.volumes_key())
                 .arg(self.epoch.to_string())
                 .arg(encode(&expected)?)
                 .arg(counters.argument()?)
-                .arg(writes.len());
-            let changed = writes.iter().map(|(field, _)| field.clone()).collect();
+                .arg(writes.len()).arg(holds.len());
+            if let Some(catalog) = &catalog {
+                command
+                    .arg(&catalog.header_value)
+                    .arg(encode(&catalog.advanced_header()?)?);
+            } else {
+                command.arg("").arg("");
+            }
+            let changed = writes
+                .iter()
+                .map(|(field, _)| field.clone())
+                .chain(catalog.iter().flat_map(volumes::Catalog::change_fields))
+                .collect();
             for (field, value) in writes {
                 command.arg(field).arg(value);
             }
@@ -183,6 +208,11 @@ impl Session {
                 .flat_map(|hold| hold.artifacts.clone())
                 .collect::<Vec<_>>();
             let _access = self.store.lock_artifacts(&protected)?;
+            if let Some(catalog) = &catalog {
+                catalog.append_writes(&mut command)?;
+            } else {
+                command.arg(0);
+            }
             command.arg(format!("node-session:{id}"));
             let mut inventory = self.inspection.lock().await;
             let mut committed = inventory.take();

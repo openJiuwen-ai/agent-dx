@@ -240,3 +240,57 @@ fn snapshot_retry_keeps_rejected_nodes_excluded_across_shard_transfers() {
     assert!(coordinator.cancel_pending("clone"));
     assert!(coordinator.pending_requests().is_empty());
 }
+
+#[test]
+fn snapshot_source_preference_respects_volume_topology() {
+    for placement in [Placement::Pack, Placement::Spread] {
+        let mut coordinator = Coordinator::new(2, placement).unwrap();
+        coordinator.register(node("source", 100)).unwrap();
+        coordinator.register(node("volume-node", 100)).unwrap();
+        coordinator.set_volume_placement(
+            "clone",
+            adx_coordinator::VolumePlacement {
+                storage_domains: Default::default(),
+                nodes: ["volume-node".into()].into(),
+                waiting_for: None,
+            },
+        );
+        assert_eq!(coordinator.submit(request("clone")).unwrap(), 1);
+        assert_eq!(drain(&mut coordinator)[0].node_id, "volume-node");
+    }
+}
+
+#[test]
+fn snapshot_volume_wait_sleeps_without_blocking_unrelated_work() {
+    let mut coordinator = Coordinator::new(2, Placement::Pack).unwrap();
+    coordinator.register(node("source", 100)).unwrap();
+    coordinator.register(node("other", 100)).unwrap();
+    coordinator.set_volume_placement(
+        "clone",
+        adx_coordinator::VolumePlacement {
+            storage_domains: Default::default(),
+            nodes: ["source".into(), "other".into()].into(),
+            waiting_for: Some("workspace-uid".into()),
+        },
+    );
+    coordinator.submit(request("clone")).unwrap();
+    let mut unrelated = request("unrelated");
+    unrelated.snapshot_id = None;
+    coordinator.submit(unrelated).unwrap();
+    let assignments = drain(&mut coordinator);
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments[0].environment_id, "unrelated");
+    assert_eq!(coordinator.pending_requests().len(), 1);
+    coordinator.set_volume_placement(
+        "clone",
+        adx_coordinator::VolumePlacement {
+            storage_domains: Default::default(),
+            nodes: ["source".into(), "other".into()].into(),
+            waiting_for: None,
+        },
+    );
+    let assignments = drain(&mut coordinator);
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments[0].environment_id, "clone");
+    assert_eq!(assignments[0].node_id, "source");
+}

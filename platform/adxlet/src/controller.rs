@@ -426,6 +426,7 @@ fn spawn_controller(
         observed_demand: 0,
         auto_pause_guard: None,
         create_deadline: None,
+        stopped_runtime_ids: Vec::new(),
     };
     controller.publish_view();
     tokio::spawn(async move {
@@ -521,13 +522,18 @@ fn spawn_controller(
                 Command::CheckAuthority(check, _) => controller.authority_trace(check),
                 _ => trace,
             };
-            if let Some(trace) = trace {
+            if let Some(trace) = &trace {
                 trace.attribute("environment.id", controller.record.spec.id.clone());
-                let reconciliation = matches!(&command, Command::CheckAuthority(_, _));
+            }
+            let reconciliation = matches!(&command, Command::CheckAuthority(_, _));
+            // Keep the large command future out of the actor's tracing wrappers.
+            // Commands still execute serially within this task.
+            let dispatch = Box::pin(controller.dispatch(command, reply));
+            if let Some(trace) = trace {
                 let work = trace.scope(|| {
                     adx_observability::trace::with_current_context(async {
                         adx_observability::trace::Trace::child("environment.execute")
-                            .run(controller.dispatch(command, reply))
+                            .run(dispatch)
                             .await;
                     })
                 });
@@ -542,7 +548,7 @@ fn spawn_controller(
             } else {
                 // Observation is passive. State-changing work below creates its
                 // own lifecycle spans only when that work actually occurs.
-                controller.dispatch(command, reply).await;
+                dispatch.await;
             }
             if controller.record.state == EnvironmentState::Failed {
                 controller.retry_lifecycle();
@@ -754,6 +760,7 @@ impl Controller {
 struct Controller {
     // One validated reload may retry after its intent-only state revisions.
     intent_retry: Option<adx_core::CompletedOperation>,
+    stopped_runtime_ids: Vec<String>,
     capture_preparation: Option<(adx_core::CompletedOperation, std::path::PathBuf)>,
     create_deadline: Option<tokio::time::Instant>,
     auto_pause_guard: Option<((String, u64, u64), u64)>,
@@ -1041,12 +1048,18 @@ impl Controller {
         }
         let durability = timeout(
             self.services.operation_timeout,
-            adx_observability::trace::Trace::child("environment.state.commit")
-                .run_result(self.services.sink.commit(&self.record)),
+            adx_observability::trace::Trace::child("environment.state.commit").run_result(
+                self.services
+                    .sink
+                    .commit_releasing(&self.record, &self.stopped_runtime_ids),
+            ),
         )
         .await
         .map_err(|_| Error::Unavailable("state commit timed out".into()))??;
         self.durability = Some(durability);
+        if durability == Durability::Published {
+            self.stopped_runtime_ids.clear();
+        }
         self.publish_view();
         self.clean_obsolete_checkpoints().await?;
         Ok(OperationResult {
@@ -1119,6 +1132,7 @@ impl Controller {
         restore_checkpoint: bool,
         completion: Option<(String, u64, LifecycleKind)>,
     ) -> Result<OperationResult> {
+        let previous_runtime_id = self.record.runtime.id.clone();
         let runtime_id = if restart {
             format!(
                 "{}-{}-r{}",
@@ -1182,6 +1196,11 @@ impl Controller {
                     .await?;
             }
             self.services.readiness.expect_runtime(&self.record)?;
+            let execution = self
+                .services
+                .sink
+                .prepare_execution(&self.record, &previous_runtime_id)
+                .await?;
             self.create_stage(adx_core::observation::CreateStage::RuntimeStart);
             let runtime_start_started = Instant::now();
             self.record.runtime.ip = Some(
@@ -1207,7 +1226,7 @@ impl Controller {
                                 .services
                                 .runtime
                                 .restore_from_with_deadline(
-                                    &self.record.spec,
+                                    &execution,
                                     &self.record.runtime.id,
                                     self.record.assignment.generation,
                                     &self.record.assignment.devices,
@@ -1236,7 +1255,7 @@ impl Controller {
                             self.services
                                 .runtime
                                 .start_with_deadline(
-                                    &self.record.spec,
+                                    &execution,
                                     &self.record.runtime.id,
                                     self.record.assignment.generation,
                                     &self.record.assignment.devices,
@@ -1346,8 +1365,13 @@ impl Controller {
                     }
                     return Err(start_error);
                 }
-                let commit = self.sync().await;
+                let mut commit = self.sync().await;
                 let cleanup = self.cleanup().await;
+                if cleanup.is_ok() && !self.stopped_runtime_ids.is_empty() {
+                    // Failure publication precedes physical cleanup. Publish the
+                    // completed cleanup separately before opening Volume admission.
+                    commit = self.sync().await;
+                }
                 return match (cleanup, commit) {
                     (Ok(()), Ok(_)) => Err(start_error),
                     (cleanup, commit) => Err(Error::Unavailable(format!(
@@ -1419,6 +1443,7 @@ impl Controller {
         })
         .await
         .map_err(|_| Error::Unavailable("environment cleanup timed out".into()))??;
+        self.record_stopped_runtime();
         self.cleanup_pending
             .store(false, std::sync::atomic::Ordering::Release);
         self.capture_preparation = None;
@@ -1474,5 +1499,21 @@ impl Controller {
         self.record.runtime.ip = None;
         self.transition(Event::Removed)?;
         self.sync().await
+    }
+
+    fn record_stopped_runtime(&mut self) {
+        if self
+            .record
+            .spec
+            .execution
+            .mounts
+            .iter()
+            .any(|mount| matches!(mount.source, adx_core::execution::MountSource::Volume(_)))
+            && !self.stopped_runtime_ids.contains(&self.record.runtime.id)
+        {
+            self.stopped_runtime_ids
+                .push(self.record.runtime.id.clone());
+            self.durability = None;
+        }
     }
 }

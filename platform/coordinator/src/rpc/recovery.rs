@@ -23,6 +23,8 @@ impl CoordinatorRpc {
                 .cloned()
                 .collect();
             for stored in candidates {
+                let domains = self.volume_domains(&state)?;
+                state.prepare_volumes(&stored.spec, &domains).await?;
                 let alias = stored
                     .recovery_point(now)
                     .ok_or(Error::Conflict)?

@@ -300,7 +300,8 @@ async fn register(address: &str, worker: &mut Worker) {
     worker.manager.pause_lifecycle().await;
     worker
         .sink
-        .reconnect(channel(address, Principal::Node(worker.report.node_id.clone())).await);
+        .reconnect(channel(address, Principal::Node(worker.report.node_id.clone())).await)
+        .unwrap();
     worker.report.reconciling = true;
     worker.report.accepting_allocations = false;
     let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
@@ -1225,7 +1226,7 @@ async fn coordinator_restart_uncommitted_restore(versioned_routes: bool) {
         // Keep publication rejected while every accepted retry drains. Otherwise
         // a queued sync can legitimately publish Running during re-registration,
         // and this fixture no longer tests an uncommitted execution.
-        .reconnect(channel(&rig.address, Principal::Node("b".into())).await);
+        .reconnect(channel(&rig.address, Principal::Node("b".into())).await).unwrap();
     gate.notify_one();
     rig.source.manager.pause_lifecycle().await;
     let handle = rig
@@ -1246,7 +1247,8 @@ async fn coordinator_restart_uncommitted_restore(versioned_routes: bool) {
     );
     rig.source
         .sink
-        .reconnect(channel(&rig.address, Principal::Node("a".into())).await);
+        .reconnect(channel(&rig.address, Principal::Node("a".into())).await)
+        .unwrap();
     *rig.source.backend.restore_gate.lock().unwrap() = None;
     for worker in [&mut rig.source, &mut rig.target] {
         worker.report.heartbeat_sequence += 1;
@@ -1801,4 +1803,205 @@ async fn original_checkpoint_cache_pressure_does_not_reject_resume() {
         std::fs::read(active.join("occupied")).unwrap(),
         vec![42; 1024]
     );
+}
+
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn local_checkpoint_waits_for_volume_without_rejecting_its_owner_node() {
+    use adx_core::{
+        execution::{Mount, MountSource},
+        volumes::{AccessMode, StorageDomain, VolumeRef, VolumeSource, VolumeSpec},
+    };
+    let redis = common::Redis::new().await;
+    let session = redis.store().await.begin(1).await.unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let relative = directory
+        .path()
+        .strip_prefix("/")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    std::fs::create_dir(directory.path().join("workspace")).unwrap();
+    let backend = std::fs::read_to_string("/proc/self/mountinfo")
+        .unwrap()
+        .lines()
+        .find_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            (fields[4] == "/").then(|| {
+                fields[fields.iter().position(|field| *field == "-").unwrap() + 2].to_owned()
+            })
+        })
+        .unwrap();
+    let domains = BTreeMap::from([(
+        "test".into(),
+        StorageDomain {
+            dynamic_nodes: false,
+            backend_id: backend,
+            node_roots: BTreeMap::from([("a".into(), "/".into())]),
+            tenant_paths: BTreeMap::from([("tenant".into(), relative.clone())]),
+        },
+    )]);
+    let volume = session
+        .ensure_volume(
+            VolumeSpec {
+                tenant_id: "tenant".into(),
+                id: "workspace".into(),
+                source: VolumeSource::Directory {
+                    storage_domain: "test".into(),
+                    path: format!("{relative}/workspace"),
+                },
+                access_mode: AccessMode::Exclusive,
+                create_if_missing: false,
+                create_options: None,
+            },
+            &domains,
+        )
+        .await
+        .unwrap();
+    let rpc = CoordinatorRpc::new(
+        session.clone(),
+        Placement::Pack,
+        Peers::network(),
+        RpcClient::network(Principal::Coordinator),
+        Duration::from_secs(2),
+    )
+    .await
+    .unwrap()
+    .with_volume_domains(domains)
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(
+                pb::volume_execution_service_server::VolumeExecutionServiceServer::new(rpc.clone()),
+            )
+            .add_service(pb::coordinator_service_server::CoordinatorServiceServer::new(rpc))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let remote = Arc::new(object_store::memory::InMemory::new());
+    let mut source = worker("a", &address, remote.clone(), None).await;
+    register(&address, &mut source).await;
+    let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        channel(&address, Principal::ApiServer).await,
+    );
+    let request = |spec: EnvironmentSpec| pb::CreateEnvironmentRequest {
+        request_id: String::new(),
+        spec: Some(spec.into()),
+        caller: caller(),
+        schedule_timeout_seconds: 3,
+        create_timeout_seconds: 10,
+        create_deadline_unix_millis: 0,
+        expected_assignment: None,
+    };
+    let mut desired = spec();
+    desired.lifecycle.pause.as_mut().unwrap().storage =
+        adx_core::lifecycle::CheckpointStorage::Local;
+    desired.execution.mounts.push(Mount {
+        kind: "bind".into(),
+        target: "/workspace".into(),
+        options: vec!["rw".into()],
+        source: MountSource::Volume(VolumeRef {
+            id: "workspace".into(),
+            uid: Some(volume.uid),
+        }),
+        create_if_missing: false,
+        create_options: None,
+    });
+    let created = client
+        .create_environment(request(desired.clone()))
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    let mut node = pb::node_service_client::NodeServiceClient::new(
+        channel(&source.report.node_address, Principal::ApiServer).await,
+    );
+    let paused = node
+        .pause_environment(pb::PauseEnvironmentRequest {
+            assignment: created.assignment,
+            caller: caller(),
+            operation_id: "pause-volume".into(),
+            expected_revision: created.revision,
+            retention: Some(adx_core::lifecycle::RetentionPolicy::Ttl { ttl_seconds: 600 }.into()),
+            timeout_seconds: 10,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    assert_eq!(
+        paused
+            .checkpoint
+            .as_ref()
+            .unwrap()
+            .artifact
+            .as_ref()
+            .unwrap()
+            .storage,
+        "local"
+    );
+    let mut holder = desired;
+    holder.id = "holder".into();
+    let holder = client
+        .create_environment(request(holder))
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    let mut waking_client = client.clone();
+    let mut waking = tokio::spawn(async move {
+        waking_client
+            .ensure_running(pb::EnsureRunningRequest {
+                environment_id: "sleep".into(),
+                caller: caller(),
+                timeout_seconds: 5,
+                expected_runtime_id: String::new(),
+            })
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut waking)
+            .await
+            .is_err()
+    );
+    let waiting = session.get("sleep").await.unwrap();
+    assert!(!waiting.resume.as_ref().unwrap().local_rejected);
+    assert_eq!(
+        waiting.result.as_ref().unwrap().runtime.id,
+        paused.runtime.as_ref().unwrap().id
+    );
+    assert_eq!(source.backend.restored.load(Ordering::SeqCst), 0);
+    // A Volume wait on a does not hold the scheduler or block an inline workload on b.
+    let mut other = worker("b", &address, remote, None).await;
+    register(&address, &mut other).await;
+    let mut unrelated = spec();
+    unrelated.id = "unrelated".into();
+    let unrelated = client
+        .create_environment(request(unrelated))
+        .await
+        .unwrap()
+        .into_inner()
+        .record
+        .unwrap();
+    assert_eq!(unrelated.assignment.as_ref().unwrap().node_id, "b");
+    node.delete_environment(pb::DeleteEnvironmentRequest {
+        assignment: holder.assignment,
+        caller: caller(),
+        failed_revision: None,
+        node_session_id: String::new(),
+    })
+    .await
+    .unwrap();
+    let running = waking.await.unwrap().unwrap().into_inner().record.unwrap();
+    assert_eq!(running.state, pb::EnvironmentState::Running as i32);
+    assert_eq!(running.assignment, paused.assignment);
+    assert_eq!(source.backend.restored.load(Ordering::SeqCst), 1);
+    server.abort();
 }

@@ -102,24 +102,37 @@ impl From<core::Mount> for pb::MountSpec {
             create_options: value.create_options.map(Into::into),
             target: value.target,
             options: value.options,
-            source: Some(value.source.into()),
+            mount_source: Some(match value.source {
+                core::MountSource::Inline(source) => {
+                    pb::mount_spec::MountSource::Source(source.into())
+                }
+                core::MountSource::Volume(reference) => {
+                    pb::mount_spec::MountSource::Volume(reference.into())
+                }
+            }),
         }
     }
 }
 impl TryFrom<pb::MountSpec> for core::Mount {
     type Error = Error;
     fn try_from(value: pb::MountSpec) -> Result<Self> {
-        Ok(Self {
+        let mount = Self {
             kind: value.r#type,
             create_if_missing: value.create_if_missing,
             create_options: value.create_options.map(Into::into),
             target: value.target,
             options: value.options,
-            source: value
-                .source
-                .ok_or_else(|| invalid("mount source"))?
-                .try_into()?,
-        })
+            source: match value.mount_source.ok_or_else(|| invalid("mount source"))? {
+                pb::mount_spec::MountSource::Source(source) => {
+                    core::MountSource::Inline(source.try_into()?)
+                }
+                pb::mount_spec::MountSource::Volume(reference) => {
+                    core::MountSource::Volume(reference.try_into()?)
+                }
+            },
+        };
+        mount.validate()?;
+        Ok(mount)
     }
 }
 

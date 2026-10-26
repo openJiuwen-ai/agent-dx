@@ -1,10 +1,11 @@
 //! Stateless AgentBinding activation. Platform owns Environment lifecycle and readiness.
+mod creation;
 pub mod environment_request;
 pub mod local_environment;
 pub mod server;
 pub mod transport;
 use adx_agent_core::environment::{
-    CreateEnvironment, Environment, EnvironmentError, EnvironmentObservation, EnvironmentPhase,
+    Environment, EnvironmentError, EnvironmentObservation, EnvironmentPhase,
 };
 pub use adx_agent_core::error::{Error, Result};
 use adx_agent_core::{activator::Target, AgentBinding, BindingPhase, Scope, TemplateVersion};
@@ -205,6 +206,7 @@ impl Activator {
                     .render_mounts(&parameters)
                     .map_err(Error::Invalid)?;
                 execution.env = template.render_env(&parameters).map_err(Error::Invalid)?;
+                creation::definitions(&template, &parameters, &execution.mounts)?;
                 self.environment.validate_execution(&execution)?;
                 self.state
                     .create_binding_with_parameters(scope.clone(), &parameters)
@@ -227,30 +229,18 @@ impl Activator {
             .render_env(&binding.parameters)
             .map_err(Error::Invalid)?;
         self.environment.validate_execution(&execution)?;
-        let observed = match self
-            .environment
-            .get(&scope.tenant, &binding.environment_id)
-            .await?
-        {
-            Some(observed) => observed,
-            None => {
-                self.environment
-                    .create(&CreateEnvironment {
-                        id: binding.environment_id.clone(),
-                        tenant: scope.tenant.clone(),
-                        execution,
-                        deadline_unix_ms: Some(deadline_unix_ms),
-                    })
-                    .await?
-            }
-        };
-        Self::validate_observation(&binding, &observed)?;
-        // Reject a delayed result after product deletion/recreation. Platform must also fence
-        // create/delete ordering: a metadata check alone cannot revoke an already-sent create.
-        let current = self.binding(scope).await?;
-        if current != binding {
+        let volumes = creation::definitions(&template, &binding.parameters, &execution.mounts)?;
+        let observed = self
+            .activate_environment(&binding, execution, &volumes, deadline_unix_ms)
+            .await;
+        // Compensate a late activation using its saved identity. Never delete
+        // the Environment belonging to a replacement Binding lifecycle.
+        if self.state.binding(scope).await?.as_ref() != Some(&binding) {
+            self.cleanup_binding(&binding).await?;
             return Err(Error::Conflict("binding changed during activation".into()));
         }
+        let observed = observed?;
+        Self::validate_observation(&binding, &observed)?;
         // A target is a stable identity, not proof of a live execution. Only the
         // authorized Gateway data path requests Platform EnsureRunning.
         match observed.phase {
@@ -292,13 +282,18 @@ impl Activator {
         self.binding(scope).await?;
         let binding = self.state.begin_delete(scope).await?;
         self.invalidate(scope).await;
+        self.cleanup_binding(&binding).await?;
+        self.state.finish_delete(&binding).await?;
+        Ok(())
+    }
+    async fn cleanup_binding(&self, binding: &AgentBinding) -> Result<()> {
         match self
             .environment
-            .delete(&scope.tenant, &binding.environment_id)
+            .delete(&binding.scope.tenant, &binding.environment_id)
             .await
         {
             Ok(observed) => {
-                Self::validate_observation(&binding, &observed)?;
+                Self::validate_observation(binding, &observed)?;
                 if observed.phase != EnvironmentPhase::Deleted {
                     return Err(Error::OutcomeUnknown(
                         "Platform has not confirmed deletion; retry this AgentBinding deletion"
@@ -310,7 +305,9 @@ impl Activator {
             Err(EnvironmentError::NotFound) => {}
             Err(error) => return Err(error.into()),
         }
-        self.state.finish_delete(&binding).await?;
+        self.environment
+            .release_volumes(&binding.scope.tenant, &binding.environment_id)
+            .await?;
         Ok(())
     }
 }

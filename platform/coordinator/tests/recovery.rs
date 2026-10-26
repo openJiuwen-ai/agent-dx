@@ -83,6 +83,7 @@ fn saved() -> StoredSnapshot {
                 creation_generation: assignment.generation,
                 creation: None,
                 last_interruption: None,
+                volume_execution: None,
                 resume: None,
                 failed_since_unix_seconds: None,
                 recovery: None,

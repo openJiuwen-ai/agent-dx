@@ -451,6 +451,7 @@ impl Controller {
         if let Some(control) = &self.services.runtime_control {
             control.retire(&self.record);
         }
+        self.record_stopped_runtime();
         // The stop barrier has completed; pre-pause usage is no longer current.
         self.services.metrics.remove(&self.metrics_registration);
         self.recovery_files = None;
@@ -530,6 +531,7 @@ impl Controller {
         self.sync().await
     }
     async fn restore_execution(&mut self, path: &Path) -> Result<()> {
+        let previous_runtime_id = self.record.runtime.id.clone();
         let next_revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
         let runtime_id = format!(
             "{}-{}-r{}",
@@ -551,14 +553,21 @@ impl Controller {
             self.services.operation_timeout
         };
         let restore_started = Instant::now();
+        let mut execution_admitted = false;
         let attempt = tokio::time::timeout(initialization_timeout, async {
             self.services.readiness.expect_runtime(&self.record)?;
+            let execution = self
+                .services
+                .sink
+                .prepare_execution(&self.record, &previous_runtime_id)
+                .await?;
+            execution_admitted = true;
             let runtime_started = Instant::now();
             self.record.runtime.ip = Some(
                 self.services
                     .runtime
                     .restore_from(
-                        &self.record.spec,
+                        &execution,
                         &self.record.runtime.id,
                         self.record.assignment.generation,
                         &self.record.assignment.devices,
@@ -600,6 +609,13 @@ impl Controller {
             match self.cleanup().await {
                 Ok(()) => {
                     self.record.runtime.ip = None;
+                    if !execution_admitted
+                        && matches!(error, Error::VolumeBusy(_) | Error::NoCapacity)
+                    {
+                        // Admission refused before granting this attempt. Keep
+                        // the previous identity for the next Paused retry.
+                        self.record.runtime.id = previous_runtime_id;
+                    }
                     self.transition(Event::Rollback)?;
                 }
                 Err(cleanup) => {

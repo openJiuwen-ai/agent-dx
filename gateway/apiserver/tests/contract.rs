@@ -102,14 +102,10 @@ fn s3_rootfs_and_mount_credentials_follow_sandboxd_contract() {
         pb::storage_source::Source::S3(_)
     ));
     assert!(matches!(
-        options.mounts[0]
-            .source
-            .as_ref()
-            .unwrap()
-            .source
-            .as_ref()
-            .unwrap(),
-        pb::storage_source::Source::S3(_)
+        options.mounts[0].mount_source.as_ref(),
+        Some(pb::mount_spec::MountSource::Source(pb::StorageSource {
+            source: Some(pb::storage_source::Source::S3(_))
+        }))
     ));
 }
 
@@ -423,10 +419,8 @@ fn local_mount_accepts_both_spellings_and_preserves_rw() {
             (creation.uid, creation.gid, creation.mode.as_str()),
             (10001, 10001, "0700")
         );
-        assert!(
-            matches!(mounts[0].source.as_ref().unwrap().source.as_ref().unwrap(),
-            pb::storage_source::Source::Local(path) if path == "/mnt/sfs/workspaces/user-a")
-        );
+        assert!(matches!(mounts[0].mount_source.as_ref(),
+            Some(pb::mount_spec::MountSource::Source(pb::StorageSource { source: Some(pb::storage_source::Source::Local(path)) })) if path == "/mnt/sfs/workspaces/user-a"));
     }
 }
 
@@ -571,4 +565,24 @@ fn tool_identity_is_preserved_and_invalid_pairs_are_rejected() {
     ] {
         assert!(create_spec(body.clone(), &caller()).is_err(), "{body}");
     }
+}
+
+#[test]
+fn volume_mounts_are_exclusive_with_inline_sources_and_keep_fixed_uid() {
+    let mut input = json!({"namespace":"test","name":"vol","image":"app","runtime":"runc","cpu":1000,"memory":128,
+        "mounts":[{"type":"bind","target":"/workspace","volume_id":"workspace","volume_uid":"fixed-uid","options":["rw"]}]});
+    let spec = create_spec(input.clone(), &caller()).unwrap();
+    let spec: adx_core::EnvironmentSpec = spec.try_into().unwrap();
+    assert!(
+        matches!(&spec.execution.mounts[0].source, adx_core::execution::MountSource::Volume(reference)
+        if reference.id == "workspace" && reference.uid.as_deref()==Some("fixed-uid"))
+    );
+    input["mounts"][0]["host_path"] = json!("/mnt/data");
+    assert!(create_spec(input.clone(), &caller()).is_err());
+    input["mounts"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("host_path");
+    input["mounts"][0]["create_if_missing"] = json!(true);
+    assert!(create_spec(input, &caller()).is_err());
 }

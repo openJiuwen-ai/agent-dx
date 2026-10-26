@@ -202,7 +202,8 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                     .ok_or_else(|| {
                         Status::failed_precondition("snapshot source is not assigned")
                     })?;
-                if source.assignment.node_id != node_id || source.spec != snapshot.template {
+                if source.assignment.node_id != node_id || !snapshot.matches_template(&source.spec)
+                {
                     return Err(Status::failed_precondition(
                         "snapshot source ownership changed",
                     ));

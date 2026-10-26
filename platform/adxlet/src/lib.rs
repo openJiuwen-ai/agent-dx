@@ -310,6 +310,36 @@ pub trait Routes: Send + Sync {
 
 #[async_trait]
 pub trait StateSink: Send + Sync {
+    /// Resolve managed mounts only after Coordinator grants this concrete attempt.
+    /// Custom/offline sinks cannot authorize a referenced Volume.
+    async fn prepare_execution(
+        &self,
+        record: &EnvironmentRecord,
+        _previous_runtime_id: &str,
+    ) -> Result<EnvironmentSpec> {
+        if record
+            .spec
+            .execution
+            .mounts
+            .iter()
+            .any(|mount| matches!(mount.source, adx_core::execution::MountSource::Volume(_)))
+        {
+            return Err(Error::Unavailable(
+                "Volume execution requires Coordinator authorization".into(),
+            ));
+        }
+        Ok(record.spec.clone())
+    }
+
+    /// Persist cleanup evidence with the result; a journal must retain both.
+    async fn commit_releasing(
+        &self,
+        record: &EnvironmentRecord,
+        _stopped_runtime_ids: &[String],
+    ) -> Result<Durability> {
+        self.commit(record).await
+    }
+
     /// Normal path: Coordinator -> cluster store. On outage, return Journaled only
     /// after a durable local append. Reject stale assignment generations and
     /// revisions. Repeated commits of an identical record are idempotent.

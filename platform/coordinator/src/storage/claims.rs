@@ -9,25 +9,36 @@ use adx_core::{
 use std::collections::{BTreeMap, BTreeSet};
 
 const CLAIM_BATCH: &str = r#"
-if redis.call('HGET', KEYS[1], 'epoch') ~= ARGV[1] then return 0 end
-local cursor = 4
-for _ = 1, tonumber(ARGV[3]) do
-  if redis.call('HGET', KEYS[2], ARGV[cursor]) ~= ARGV[cursor + 1] then return 0 end
-  cursor = cursor + 2
+if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] then return 0 end
+local cursor=4
+for _=1,tonumber(ARGV[3]) do
+  if redis.call('HGET',KEYS[2],ARGV[cursor]) ~= ARGV[cursor+1] then return 0 end
+  cursor=cursor+2
 end
-local writes = tonumber(ARGV[2])
 if (redis.call('HGET',KEYS[1],'claim-fence') or '0') ~= ARGV[cursor] then return 0 end
-cursor = cursor + 1
-local check = cursor
-for _=1,writes do if redis.call('HEXISTS',KEYS[1],ARGV[check]) == 1 then return 0 end; check=check+2 end
-for i=check,#ARGV,2 do
-  if redis.call('HGET',KEYS[1],ARGV[i]) ~= ARGV[i+1] then return 0 end
+cursor=cursor+1
+local first=cursor
+for _=1,tonumber(ARGV[2]) do
+  if redis.call('HEXISTS',KEYS[1],ARGV[cursor]) == 1 then return 0 end
+  cursor=cursor+2
 end
-for i=check,#ARGV,2 do redis.call('HINCRBY',KEYS[1],'node-ownership:' .. string.sub(ARGV[i],14),1) end
-for _ = 1, writes do
-  redis.call('HSET', KEYS[1], ARGV[cursor], ARGV[cursor + 1])
-  cursor = cursor + 2
+local nodes=tonumber(ARGV[cursor]); cursor=cursor+1
+local node_start=cursor
+for _=1,nodes do
+  if redis.call('HGET',KEYS[1],ARGV[cursor]) ~= ARGV[cursor+1] then return 0 end
+  cursor=cursor+2
 end
+if ARGV[cursor] ~= '' and redis.call('HGET',KEYS[1],'header') ~= ARGV[cursor] then return 0 end
+local next_header=ARGV[cursor+1]; cursor=cursor+2
+for i=first,first+tonumber(ARGV[2])*2-1,2 do redis.call('HSET',KEYS[1],ARGV[i],ARGV[i+1]) end
+for i=node_start,node_start+nodes*2-1,2 do redis.call('HINCRBY',KEYS[1],'node-ownership:' .. string.sub(ARGV[i],14),1) end
+local count=tonumber(ARGV[cursor]); cursor=cursor+1
+for _=1,count do
+  if ARGV[cursor+1] == '' then redis.call('HDEL',KEYS[3],ARGV[cursor])
+  else redis.call('HSET',KEYS[3],ARGV[cursor],ARGV[cursor+1]) end
+  cursor=cursor+2
+end
+if next_header ~= '' then redis.call('HSET',KEYS[1],'header',next_header) end
 return 1
 "#;
 
@@ -91,6 +102,14 @@ impl Session {
         spec: EnvironmentSpec,
         candidate: &LocalClaim,
     ) -> Result<ClaimOutcome> {
+        if volumes::has_volumes(&spec) {
+            return self
+                .claim_batch(vec![(spec, candidate.clone())])
+                .await?
+                .into_iter()
+                .next()
+                .ok_or(Error::Conflict)?;
+        }
         spec.validate()?;
         if candidate.node_id.trim().is_empty() || candidate.node_session_id.trim().is_empty() {
             return Err(Error::Invalid(
@@ -163,6 +182,7 @@ impl Session {
                 creation_generation: generation,
                 creation: Some(CreationSummary::new(&candidate.request_id)?),
                 last_interruption: None,
+                volume_execution: None,
                 resume: None,
                 failed_since_unix_seconds: None,
                 recovery: None,
@@ -230,6 +250,11 @@ impl Session {
             }
             validate_device_assignment(&spec.scheduling.devices, &candidate.devices)?;
         }
+        let mut pinned = Vec::with_capacity(claims.len());
+        for (spec, _) in &claims {
+            pinned.push(self.pin_volumes(spec).await.map(|_| ()));
+        }
+        let uses_volumes = claims.iter().any(|(spec, _)| volumes::has_volumes(spec));
         let environment_fields: BTreeSet<_> = claims
             .iter()
             .map(|(spec, _)| format!("environment:{}", spec.id))
@@ -252,6 +277,15 @@ impl Session {
                 .remove("claim-fence")
                 .flatten()
                 .unwrap_or_else(|| "0".into());
+            let mut catalog = if uses_volumes {
+                let catalog = self.volume_catalog().await?;
+                if catalog.header_value != header_value {
+                    continue;
+                }
+                Some(catalog)
+            } else {
+                None
+            };
             let mut environments = BTreeMap::new();
             for field in &environment_fields {
                 if let Some(value) = by_field.remove(field).flatten() {
@@ -285,7 +319,7 @@ impl Session {
             let mut results = Vec::with_capacity(claims.len());
             let mut writes = Vec::new();
             let mut writing_nodes = BTreeMap::new();
-            for (spec, candidate) in &claims {
+            for ((spec, candidate), pinned) in claims.iter().zip(&pinned) {
                 let result = (|| {
                     let node = nodes.get(&candidate.node_id).ok_or(Error::NotFound)?;
                     if node.node.id != candidate.node_id
@@ -315,6 +349,7 @@ impl Session {
                         return Ok(ClaimOutcome::Owned(existing.clone()));
                     }
                     claim_admission(node)?;
+                    pinned.clone()?;
                     if let Some(id) = &spec.snapshot_id {
                         let (_, snapshot) = snapshots.get(id).ok_or(Error::NotFound)?;
                         if snapshot.template.tenant_id != spec.tenant_id
@@ -331,6 +366,7 @@ impl Session {
                         creation_generation: generation,
                         creation: Some(CreationSummary::new(&candidate.request_id)?),
                         last_interruption: None,
+                        volume_execution: None,
                         resume: None,
                         failed_since_unix_seconds: None,
                         recovery: None,
@@ -346,6 +382,12 @@ impl Session {
                         },
                     };
                     record.validate()?;
+                    if volumes::has_volumes(spec) {
+                        catalog
+                            .as_mut()
+                            .ok_or(Error::Conflict)?
+                            .reserve(&record, node)?;
+                    }
                     environments.insert(spec.id.clone(), record.clone());
                     writing_nodes
                         .insert(candidate.node_id.clone(), candidate.node_session_id.clone());
@@ -364,9 +406,10 @@ impl Session {
             let mut command = redis::cmd("EVAL");
             command
                 .arg(CLAIM_BATCH)
-                .arg(2)
+                .arg(3)
                 .arg(&self.store.key)
                 .arg(self.snapshots_key())
+                .arg(self.volumes_key())
                 .arg(self.epoch.to_string())
                 .arg(writes.len())
                 .arg(snapshot_ids.len());
@@ -377,10 +420,23 @@ impl Session {
             for (field, value, _) in &writes {
                 command.arg(field).arg(value);
             }
+            command.arg(writing_nodes.len());
             for (node, session) in &writing_nodes {
                 command.arg(format!("node-session:{node}")).arg(session);
             }
+            if let Some(catalog) = &catalog {
+                command
+                    .arg(&catalog.header_value)
+                    .arg(encode(&catalog.advanced_header()?)?);
+                catalog.append_writes(&mut command)?;
+            } else {
+                command.arg("").arg("").arg(0);
+            }
             if self.store.query::<u8>(command).await? == 1 {
+                if let Some(catalog) = &catalog {
+                    self.store
+                        .notify_committed_change(0, catalog.change_fields().collect());
+                }
                 for (field, _, revision) in writes {
                     self.store.notify_committed_change(revision, vec![field]);
                 }

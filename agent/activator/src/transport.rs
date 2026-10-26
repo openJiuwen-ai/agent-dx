@@ -72,6 +72,89 @@ impl HttpEnvironment {
         })
     }
 
+    async fn volume_request(
+        &self,
+        tenant: &str,
+        owner: &str,
+        spec: Option<&adx_agent_core::volumes::VolumeSpec>,
+    ) -> Result<Value, EnvironmentError> {
+        validate_identity(tenant)?;
+        validate_identity(owner)?;
+        let key = self.api_keys.get(tenant).ok_or_else(|| {
+            EnvironmentError::Invalid("Platform tenant credential is not configured".into())
+        })?;
+        let uncertain = || {
+            EnvironmentError::OutcomeUnknown(
+                "Volume management response unavailable; retry same identity".into(),
+            )
+        };
+        let mut url = self
+            .base
+            .join(if spec.is_some() {
+                "/api/environment/v1/volumes"
+            } else {
+                "/api/environment/v1/volume-owners"
+            })
+            .map_err(|_| EnvironmentError::Invalid("invalid Volume URL".into()))?;
+        let mut request = if let Some(spec) = spec {
+            spec.validate().map_err(EnvironmentError::Invalid)?;
+            let mut input = serde_json::to_value(spec)
+                .map_err(|_| EnvironmentError::Invalid("invalid Volume definition".into()))?;
+            input["owner_id"] = json!(owner);
+            self.client.post(url).json(&input)
+        } else {
+            url.path_segments_mut()
+                .map_err(|_| EnvironmentError::Invalid("invalid Volume URL".into()))?
+                .push(owner);
+            self.client.delete(url)
+        }
+        .bearer_auth(key)
+        .timeout(self.timeout);
+        request = request.header(
+            "x-request-id",
+            environment_request::operation_id("volumes", tenant, owner)?,
+        );
+        let mut response = request.send().await.map_err(|_| uncertain())?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(match status {
+                StatusCode::BAD_REQUEST => {
+                    EnvironmentError::Invalid("Volume request rejected".into())
+                }
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                    EnvironmentError::Invalid("Volume request credentials rejected".into())
+                }
+                StatusCode::NOT_FOUND => EnvironmentError::NotFound,
+                StatusCode::CONFLICT => {
+                    EnvironmentError::Conflict("Volume is still referenced or occupied".into())
+                }
+                StatusCode::NOT_IMPLEMENTED => {
+                    EnvironmentError::Unsupported("Volume management unavailable".into())
+                }
+                _ => uncertain(),
+            });
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| uncertain())? {
+            if chunk.len() > limits::HTTP_JSON_BYTES.saturating_sub(body.len()) {
+                return Err(uncertain());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let value: Value = serde_json::from_slice(&body).map_err(|_| uncertain())?;
+        if value["code"] != 200 {
+            return Err(uncertain());
+        }
+        match &value["data"] {
+            Value::String(encoded) => {
+                serde_json::from_slice(&STANDARD.decode(encoded).map_err(|_| uncertain())?)
+                    .map_err(|_| uncertain())
+            }
+            Value::Null if spec.is_none() => Ok(Value::Null),
+            _ => Err(uncertain()),
+        }
+    }
+
     async fn request(
         &self,
         method: Method,
@@ -208,6 +291,21 @@ impl HttpEnvironment {
 }
 #[async_trait]
 impl Environment for HttpEnvironment {
+    async fn ensure_volume(
+        &self,
+        tenant: &str,
+        owner: &str,
+        spec: &adx_agent_core::volumes::VolumeSpec,
+    ) -> Result<adx_agent_core::volumes::VolumeRef, EnvironmentError> {
+        environment_request::volume_reference(
+            &self.volume_request(tenant, owner, Some(spec)).await?,
+            tenant,
+            &spec.id,
+        )
+    }
+    async fn release_volumes(&self, tenant: &str, owner: &str) -> Result<(), EnvironmentError> {
+        self.volume_request(tenant, owner, None).await.map(|_| ())
+    }
     fn validate_execution(&self, execution: &ExecutionSpec) -> Result<(), EnvironmentError> {
         environment_request::validate_execution(execution)
     }

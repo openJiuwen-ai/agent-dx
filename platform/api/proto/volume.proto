@@ -1,0 +1,51 @@
+syntax = "proto3";
+package adx.control.v1;
+import "environment_types.proto";
+
+// Definitions and references are managed by Coordinator; adxlet never accesses Redis.
+service VolumeService {
+  rpc EnsureVolume(EnsureVolumeRequest) returns (Volume);
+  rpc GetVolume(GetVolumeRequest) returns (VolumeInfo);
+  rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse);
+  rpc DeleteVolume(GetVolumeRequest) returns (DeleteVolumeResponse);
+  rpc ReleaseOwner(ReleaseVolumeOwnerRequest) returns (DeleteVolumeResponse);
+}
+// Node execution authorization uses Coordinator storage; it does not claim placement.
+service VolumeExecutionService {
+  rpc AuthorizeExecution(AuthorizeVolumeExecutionRequest) returns (VolumeExecutionGrant);
+  rpc BeginInitialization(VolumeInitializationRequest) returns (VolumeInitializationResponse);
+  rpc CompleteInitialization(CompleteVolumeInitializationRequest) returns (DeleteVolumeResponse);
+}
+message AuthorizeVolumeExecutionRequest {
+  EnvironmentRecord record = 1;
+  string previous_runtime_id = 2;
+  string node_session_id = 3;
+}
+message GrantedVolume { Volume volume = 1; string backend_id = 2; string root = 3; }
+message VolumeExecutionGrant {
+  Assignment assignment = 1;
+  string runtime_id = 2;
+  string node_session_id = 3;
+  repeated GrantedVolume volumes = 4;
+}
+message VolumeInitializationRequest { string volume_uid = 1; EnvironmentRecord record = 2; string node_session_id = 3; }
+message VolumeInitializationResponse {
+  bool initialize = 1;
+  // A Pending replay must verify existing creation attributes before publishing success.
+  bool verify_existing = 2;
+}
+message CompleteVolumeInitializationRequest { VolumeInitializationRequest execution = 1; bool success = 2; string error = 3; }
+message EnsureVolumeRequest { VolumeSpec spec = 1; CallerContext caller = 2; string owner_id = 3; }
+message ReleaseVolumeOwnerRequest { string tenant_id = 1; string owner_id = 2; CallerContext caller = 3; }
+message GetVolumeRequest { string tenant_id = 1; string id = 2; CallerContext caller = 3; }
+enum VolumeInitializationState {
+  VOLUME_INITIALIZATION_STATE_NOT_REQUESTED = 0;
+  VOLUME_INITIALIZATION_STATE_UNINITIALIZED = 1;
+  VOLUME_INITIALIZATION_STATE_PENDING = 2;
+  VOLUME_INITIALIZATION_STATE_READY = 3;
+  VOLUME_INITIALIZATION_STATE_NEEDS_REPAIR = 4;
+}
+message VolumeInfo { Volume volume = 1; repeated string environment_ids = 2; VolumeOccupancy occupancy = 3; repeated string owner_ids = 4; VolumeInitializationState initialization_state = 5; string initialization_error = 6; repeated string snapshot_ids = 7; }
+message ListVolumesRequest { string tenant_id = 1; CallerContext caller = 2; string page_token = 3; uint32 page_size = 4; }
+message ListVolumesResponse { repeated VolumeInfo volumes = 1; string next_page_token = 2; }
+message DeleteVolumeResponse {}

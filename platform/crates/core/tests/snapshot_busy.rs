@@ -75,3 +75,38 @@ fn unreferenced_delete_closes_new_users() {
         )
         .is_err());
 }
+
+#[test]
+fn snapshot_source_replay_accepts_omitted_uid_but_rejects_different_mount_identity() {
+    use adx_core::{
+        execution::{Mount, MountSource},
+        volumes::VolumeRef,
+    };
+    let mut saved = snapshot();
+    saved.template.execution.mounts.push(Mount {
+        kind: "bind".into(),
+        target: "/workspace".into(),
+        options: vec!["rw".into()],
+        source: MountSource::Volume(VolumeRef {
+            id: "workspace".into(),
+            uid: Some("fixed-uid".into()),
+        }),
+        create_if_missing: false,
+        create_options: None,
+    });
+    let mut request = saved.clone();
+    let MountSource::Volume(reference) = &mut request.template.execution.mounts[0].source else {
+        unreachable!()
+    };
+    reference.uid = None;
+    assert!(saved.same_content(&request));
+    assert!(saved.matches_template(&request.template));
+    let MountSource::Volume(reference) = &mut request.template.execution.mounts[0].source else {
+        unreachable!()
+    };
+    reference.uid = Some("recreated-uid".into());
+    assert!(!saved.same_content(&request));
+    request.template.execution.mounts.clear();
+    assert!(!saved.same_content(&request));
+    assert!(!saved.matches_template(&request.template));
+}

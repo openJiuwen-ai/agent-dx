@@ -63,7 +63,7 @@ impl CreateReplays {
 /// Owns Environment lifecycle semantics independently of any transport adapter.
 pub struct EnvironmentService {
     pub(crate) creation_metrics: crate::metrics::CreationMetrics,
-    clients: Arc<Clients>,
+    pub(crate) clients: Arc<Clients>,
     operations: Operations,
     creates: Mutex<CreateReplays>,
     names: Mutex<HashMap<String, CreateKey>>,

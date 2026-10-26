@@ -1,5 +1,5 @@
-//! Compare opaque records under the current Coordinator epoch. Snapshot mutations do
-//! not change Environment route versions or the scheduling catalog.
+//! Compare opaque records under the current Coordinator epoch. Snapshot publication
+//! and final deletion update their Volume protections in the same transaction.
 use super::*;
 use adx_core::snapshots::{Reference, Snapshot, SnapshotState};
 impl Session {
@@ -13,7 +13,13 @@ impl Session {
         command.arg(self.snapshots_key()).arg(id);
         self.store.query(command).await
     }
-    async fn snapshot_cas(&self, id: &str, old: Option<&str>, next: &Snapshot) -> Result<bool> {
+    async fn snapshot_cas(
+        &self,
+        id: &str,
+        old: Option<&str>,
+        next: &Snapshot,
+        catalog: Option<&volumes::Catalog>,
+    ) -> Result<bool> {
         next.validate()?;
         let _access = if next.state == SnapshotState::Ready {
             Some(
@@ -23,27 +29,50 @@ impl Session {
         } else {
             None
         };
-        let [header_value] = self.store.fields([HEADER.into()]).await?;
+        let header_value = match catalog {
+            Some(catalog) => Some(catalog.header_value.clone()),
+            None => self.store.fields([HEADER.into()]).await?[0].clone(),
+        };
         self.header(&header_value)?;
+        let header = catalog.map(volumes::Catalog::advanced_header).transpose()?;
         let mut command = redis::cmd("EVAL");
         command
             .arg(
                 r#"
             if redis.call('HGET', KEYS[1], 'epoch') ~= ARGV[1] then return 0 end
+            if ARGV[6] ~= '' and redis.call('HGET',KEYS[1],'header') ~= ARGV[6] then return 0 end
             local old = redis.call('HGET', KEYS[2], ARGV[2])
             if ARGV[3] == '' then
                 if old then return 0 end
             elseif old ~= ARGV[3] then return 0 end
-            redis.call('HSET', KEYS[2], ARGV[2], ARGV[4]); return 1
+            redis.call('HSET', KEYS[2], ARGV[2], ARGV[4])
+            if ARGV[5] ~= '' then redis.call('HSET', KEYS[1], 'header', ARGV[5]) end
+            for i = 8, #ARGV, 2 do
+                if ARGV[i + 1] == '' then redis.call('HDEL', KEYS[3], ARGV[i])
+                else redis.call('HSET', KEYS[3], ARGV[i], ARGV[i + 1]) end
+            end
+            return 1
         "#,
             )
-            .arg(2)
+            .arg(3)
             .arg(&self.store.key)
             .arg(self.snapshots_key())
+            .arg(self.volumes_key())
             .arg(self.epoch.to_string())
             .arg(id)
             .arg(old.unwrap_or(""))
-            .arg(encode(next)?);
+            .arg(encode(next)?)
+            .arg(header.as_ref().map(encode).transpose()?.unwrap_or_default())
+            .arg(
+                catalog
+                    .map(|catalog| catalog.header_value.as_str())
+                    .unwrap_or(""),
+            );
+        if let Some(catalog) = catalog {
+            catalog.append_writes(&mut command)?;
+        } else {
+            command.arg(0);
+        }
         let mut inventory = self.inspection.lock().await;
         let mut committed = inventory.take();
         match self.store.query::<u64>(command).await {
@@ -52,6 +81,12 @@ impl Session {
                     inventory.snapshots.insert(id.into(), next.clone());
                 }
                 *inventory = committed;
+                if let (Some(header), Some(catalog)) = (header, catalog) {
+                    self.store.notify_committed_change(
+                        header.revision,
+                        catalog.change_fields().collect(),
+                    );
+                }
                 Ok(true)
             }
             Ok(_) => {
@@ -84,8 +119,19 @@ impl Session {
                     Err(Error::Conflict)
                 };
             }
-            if self.snapshot_cas(&record.id, None, &record).await? {
-                return Ok(record);
+            let mut next = record.clone();
+            let catalog = if volumes::has_volumes(&next.template) {
+                let mut catalog = self.volume_catalog().await?;
+                catalog.protect_snapshot(&mut next)?;
+                Some(catalog)
+            } else {
+                None
+            };
+            if self
+                .snapshot_cas(&record.id, None, &next, catalog.as_ref())
+                .await?
+            {
+                return Ok(next);
             }
         }
         Err(Error::Unavailable("snapshot publication contention".into()))
@@ -142,7 +188,21 @@ impl Session {
             next.validate()?;
             let revision = next.revision;
             change(&mut next)?;
-            if next.revision == revision || self.snapshot_cas(id, Some(&raw), &next).await? {
+            if next.revision == revision {
+                return Ok(next);
+            }
+            let catalog =
+                if next.state == SnapshotState::Deleted && volumes::has_volumes(&next.template) {
+                    let mut catalog = self.volume_catalog().await?;
+                    catalog.release_snapshot(&next)?;
+                    Some(catalog)
+                } else {
+                    None
+                };
+            if self
+                .snapshot_cas(id, Some(&raw), &next, catalog.as_ref())
+                .await?
+            {
                 return Ok(next);
             }
         }

@@ -48,13 +48,27 @@ Platform 检测空闲、保存 checkpoint 并释放执行资源。持续 HTTP/WS
 
 Paused/Pausing/Resuming 保留原 AgentBinding generation 和 Sandbox ID；Activator 冷缓存及 bypass 查询可返回该身份，不创建第二个 Sandbox，也不调用 resume。鉴权后的业务 HTTP/WS/SSH 或文件访问经共享 Gateway 请求 Platform EnsureRunning，等待已提交 Running 路由后转发。并发首请求的恢复去重由 Platform 负责；管理查询、未授权访问和被动健康探测不唤醒。`Target` 表示可路由身份，不保证业务进程已 Ready；Failed/Deleted 和未就绪的创建仍返回原有错误。恢复超时沿用原身份重试，不能据此重建实例。
 
+## 受管卷
+
+模板可声明 `volumes`，并以 `mounts[].volume_id` 挂载；内联 host_path 继续保留。例如：
+
+```json
+{"volumes":[{"id":"workspace-${workspace}","source":{"type":"directory","storage_domain":"sfs","path":"workspaces/tenant-a/${workspace}"},"access_mode":"exclusive","create_if_missing":true,"create_options":{"uid":10001,"gid":10001,"mode":"0700"}}],"mounts":[{"type":"bind","volume_id":"workspace-${workspace}","target":"/workspace","options":["rw"]}]}
+```
+
+首次激活先保存 Binding，再用不可变模板和已保存参数 ensure 卷并关联 Binding，固定返回的 UID 后创建 Environment。已有定义为准，不覆盖其路径或模式；默认 shared，exclusive 显式声明。多个 Binding 可以关联同卷。激活超时保留关联；删除 Binding 先收敛 Environment 与引用，最后一个关联解除且没有其他使用后删除卷定义，底层数据保留。
+
+创建连接失效后，Activator 在原总期限内查询同一个 Environment ID，并仅在无 Environment 时幂等重试创建；退避带抖动。已有 Creating 仍返回 NotReady，生命周期继续由 Platform 处理。Binding 在平台操作后已删除或换代时，Activator 补偿清理旧身份，不删除新 Binding 的 Environment。不新增后台激活恢复或 Platform Binding 删除标记；进程在副作用后、后置检查前崩溃不获得孤儿清理保证。
+
+部署配置、公共接口和验证范围见 [Volume API](../platform/api/http/volumes.md)；真实存储及运行时验收仍按 [P7](../docs/development/platform-volume-design.md) 执行。
+
 ## 模板挂载与 Binding 参数
 
-模板支持 `mounts: [{"type":"bind","host_path":"/mnt/sfs/workspaces/${workspace}","target":"/home/jiuwen","options":["rw"],"create_if_missing":true}]`。Agent 首版只暴露 Local bind；Sandbox API 仍支持 image/S3 等其他来源。最多 32 个挂载，目标路径不得重复；options 支持 ro、rw、nosuid、nodev、noexec，拒绝重复项及 ro/rw 同时出现。
+模板支持 `mounts: [{"type":"bind","host_path":"/mnt/sfs/workspaces/${workspace}","target":"/home/jiuwen","options":["rw"],"create_if_missing":true}]`。Agent 支持 Local bind 和 VolumeRef；Environment API 仍支持 image/S3 等内联来源。最多 32 个挂载，目标路径不得重复；options 支持 ro、rw、nosuid、nodev、noexec，拒绝重复项及 ro/rw 同时出现。
 
 首次访问通用 `/agent/ws` 或 `/agent/http` 时，可通过 `X-ADX-Parameters: workspace=w-user&model_api_base=https%3A%2F%2Fmodel.example%2Fv1` 提供 URL 表单参数。共享解析/激活流程仅在 Binding 不存在时解析和校验，原子保存参数后激活。已有 Binding 完全忽略新参数，包括缺失、不同值和格式错误；并发创建以成功落库的 Binding 为准。删除 Binding 后再次访问重新初始化。没有独立 prepare 阶段或接口。
 
-Template 的 `mounts[].host_path` 和 `env` 值支持 `${name}` 渲染。挂载参数按相对子目录校验，环境变量参数允许普通字符串；不执行 Shell 展开或递归展开。参数仅能替换模板声明的占位符。参数当前明文保存并出现在 Binding 元数据中；模型 Key 的后续加解密由业务 Gateway/AgentServer 管理，ADX 不提供模型专用私有启动配置。参数 Header 由 Ingress 消费，不转发到业务服务。
+Template 的 `mounts[].host_path`、`mounts[].volume_id`、Volume 定义和 `env` 值支持 `${name}` 渲染。挂载参数按相对子目录校验，环境变量参数允许普通字符串；不执行 Shell 展开或递归展开。参数仅能替换模板声明的占位符。参数当前明文保存并出现在 Binding 元数据中；模型 Key 的后续加解密由业务 Gateway/AgentServer 管理，ADX 不提供模型专用私有启动配置。参数 Header 由 Ingress 消费，不转发到业务服务。
 
 ```yaml
 env:
@@ -72,9 +86,9 @@ mounts:
 
 需要为非 root 应用创建目录时，可同时声明 `create_options: {"uid":10001,"gid":10001,"mode":"0700"}`。三个字段均必填，UID/GID 为 0–4294967294 的整数，mode 为 `0000`–`0777` 的四位八进制字符串。仅允许与 `create_if_missing: true` 一起使用；只对新目录设置所有权和权限，已有目录保持原状，不递归 chown。未声明时保持原有 0755（受节点 umask 影响）及节点进程所有权。节点直接创建最终源目录，再通过目录描述符设置所有权和权限；设置失败则本次启动失败并保留目录，需修正残留权限。该过程不承诺原子初始化，并发首次使用可能看到尚未设置完成的权限。需要包含该能力的 adxlet；单独更新 Ingress 或模板不能使旧节点支持它。
 
-Activator 在准备和激活时渲染 mounts；HTTP 与嵌入式 Sandbox 适配器发送相同的具体挂载，不传 parameters、user_id 或 owner_id。Jiuwen 根据认证身份的 `[tenant, template, user_id]` JSON 数组 SHA-256 生成 `w-<完整十六进制摘要>`，版本、Binding 和 Sandbox ID 不参与目录标识。
+Activator 在准备和激活时渲染 mounts；HTTP 与嵌入式 Sandbox 适配器发送相同的具体挂载，Environment 创建请求不传 parameters 或业务 user_id；Volume 管理的 owner_id 使用 Binding 固定的 Environment ID，不代表业务用户。Jiuwen 根据认证身份的 `[tenant, template, user_id]` JSON 数组 SHA-256 生成 `w-<完整十六进制摘要>`，版本、Binding 和 Sandbox ID 不参与目录标识。
 
-[Jiuwen 模板例子](activator/examples/jiuwen-sfs-template.json)将应用数据和 HOME 收敛到 `/home/jiuwen`。当前没有 SFS 自动挂载或跨 Binding 的工作区独占协调；目录创建由上述挂载声明控制。使用 SQLite/WAL 的工作区必须保证旧 Sandbox 完全停止访问后才启用后继，不能同时运行新旧版本。详见[工作区设计](../docs/development/user-workspace-volumes-design.md)。
+[Jiuwen 模板例子](activator/examples/jiuwen-sfs-template.json)将应用数据和 HOME 收敛到 `/home/jiuwen`，仍采用内联挂载，尚未切换到受管 Volume；SFS 挂载由部署准备，目录创建由上述挂载声明控制。使用 SQLite/WAL 的工作区必须保证旧 Sandbox 完全停止访问后才启用后继，不能同时运行新旧版本。详见[工作区设计](../docs/development/user-workspace-volumes-design.md)和[Volume 方案](../docs/development/platform-volume-design.md)。
 
 ## 进程配置
 

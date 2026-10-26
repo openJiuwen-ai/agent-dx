@@ -538,7 +538,7 @@ impl Jiuwenbox {
             );
         }
         for mount in &spec.execution.mounts {
-            let StorageSource::Local(source) = &mount.source else {
+            let StorageSource::Local(source) = mount.source.inline()? else {
                 return Err(Error::Invalid(
                     "Jiuwenbox requires Local bind mounts".into(),
                 ));

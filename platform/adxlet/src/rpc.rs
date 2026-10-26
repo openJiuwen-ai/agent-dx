@@ -1,6 +1,7 @@
 //! Node RPC adaptation; EnvironmentHandle remains the lifecycle owner.
 use adx_transport::rpc::{authenticated_channel, RpcChannel};
 mod local_create;
+mod volumes;
 use crate::{Adxlet, Durability, StateSink};
 use adx_core::{EnvironmentRecord, Error, Result};
 use adx_protocol::{
@@ -591,6 +592,11 @@ impl pb::node_service_server::NodeService for NodeRpc {
 
 #[derive(Clone)]
 pub struct CoordinatorStateSink {
+    volumes: Arc<
+        std::sync::RwLock<
+            pb::volume_execution_service_client::VolumeExecutionServiceClient<RpcChannel>,
+        >,
+    >,
     snapshots:
         Arc<std::sync::RwLock<pb::snapshot_service_client::SnapshotServiceClient<RpcChannel>>>,
     client: Arc<
@@ -609,6 +615,11 @@ impl CoordinatorStateSink {
             return Err(Error::Invalid("RPC timeout must be positive".into()));
         }
         Ok(Self {
+            volumes: Arc::new(std::sync::RwLock::new(
+                pb::volume_execution_service_client::VolumeExecutionServiceClient::new(
+                    channel.clone(),
+                ),
+            )),
             snapshots: Arc::new(std::sync::RwLock::new(
                 pb::snapshot_service_client::SnapshotServiceClient::new(channel.clone()),
             )),
@@ -623,17 +634,45 @@ impl CoordinatorStateSink {
         self.session_id = session_id;
         self
     }
-    pub fn reconnect(&self, channel: RpcChannel) {
-        *self.snapshots.write().expect("shared state lock poisoned") =
+    pub fn reconnect(&self, channel: RpcChannel) -> Result<()> {
+        *self
+            .volumes
+            .write()
+            .map_err(|_| Error::Unavailable("Volume RPC client unavailable".into()))? =
+            pb::volume_execution_service_client::VolumeExecutionServiceClient::new(channel.clone());
+        *self
+            .snapshots
+            .write()
+            .map_err(|_| Error::Unavailable("Snapshot RPC client unavailable".into()))? =
             pb::snapshot_service_client::SnapshotServiceClient::new(channel.clone());
-        *self.client.write().expect("shared state lock poisoned") =
+        *self
+            .client
+            .write()
+            .map_err(|_| Error::Unavailable("Coordinator RPC client unavailable".into()))? =
             pb::coordinator_service_client::CoordinatorServiceClient::new(channel);
+        Ok(())
     }
 }
 #[async_trait::async_trait]
 impl StateSink for CoordinatorStateSink {
+    async fn prepare_execution(
+        &self,
+        record: &EnvironmentRecord,
+        previous_runtime_id: &str,
+    ) -> Result<adx_core::EnvironmentSpec> {
+        self.prepare_volume_execution(record, previous_runtime_id)
+            .await
+    }
     async fn commit(&self, record: &EnvironmentRecord) -> Result<Durability> {
+        self.commit_releasing(record, &[]).await
+    }
+    async fn commit_releasing(
+        &self,
+        record: &EnvironmentRecord,
+        stopped_runtime_ids: &[String],
+    ) -> Result<Durability> {
         let mut request = Request::new(pb::CommitEnvironmentRequest {
+            stopped_runtime_ids: stopped_runtime_ids.to_vec(),
             record: Some(record.clone().try_into()?),
             node_session_id: self.session_id.clone(),
         });

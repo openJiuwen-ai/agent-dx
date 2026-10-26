@@ -9,9 +9,21 @@ use std::sync::{Arc, Mutex};
 struct Coordinator {
     failure: Mutex<Option<Error>>,
     records: Mutex<Vec<EnvironmentRecord>>,
+    stopped: Mutex<Vec<Vec<String>>>,
 }
 #[async_trait]
 impl StateSink for Coordinator {
+    async fn commit_releasing(
+        &self,
+        record: &EnvironmentRecord,
+        stopped: &[String],
+    ) -> Result<Durability> {
+        let durability = self.commit(record).await?;
+        if !stopped.is_empty() {
+            self.stopped.lock().unwrap().push(stopped.to_vec());
+        }
+        Ok(durability)
+    }
     async fn commit(&self, record: &EnvironmentRecord) -> Result<Durability> {
         if let Some(e) = self.failure.lock().unwrap().clone() {
             return Err(e);
@@ -63,6 +75,35 @@ fn record(revision: u64) -> EnvironmentRecord {
         checkpoint: None,
         last_operation: None,
     }
+}
+
+#[tokio::test]
+async fn recovery_replays_cleanup_proof_even_when_the_failed_result_was_already_committed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("journal.sqlite");
+    let coordinator = Arc::new(Coordinator::default());
+    let mut failed = record(2);
+    failed.state = EnvironmentState::Failed;
+    failed.resources_held = false;
+    failed.runtime.ip = None;
+    let sink = JournalSink::new(path.clone(), coordinator.clone());
+    sink.commit(&failed).await.unwrap();
+    *coordinator.failure.lock().unwrap() = Some(Error::Unavailable("offline".into()));
+    assert_eq!(
+        sink.commit_releasing(&failed, &["i-1".into()])
+            .await
+            .unwrap(),
+        Durability::Journaled
+    );
+    drop(sink);
+    *coordinator.failure.lock().unwrap() = None;
+    let sink = JournalSink::new(path, coordinator.clone());
+    sink.recover(&[failed]).await.unwrap();
+    assert_eq!(
+        *coordinator.stopped.lock().unwrap(),
+        vec![vec!["i-1".to_owned()]]
+    );
+    assert_eq!(sink.pending().await.unwrap(), 0);
 }
 
 #[tokio::test]

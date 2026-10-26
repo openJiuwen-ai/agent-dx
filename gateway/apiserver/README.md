@@ -34,6 +34,7 @@ resuming admission makes the current resources visible again.
 
 | Module | Responsibility |
 |---|---|
+| `volumes.rs` | Tenant Volume validation and direct management RPCs, shared with embedded Activator |
 | `contract.rs` | Typed public JSON validation, resources, environment and affinity conversion |
 | `http.rs` | REST routes, authentication boundary, JSON/SSE responses and Agent compatibility forwarding |
 | `environment_service.rs` | Environment lifecycle semantics, create replay handling and durable-result checks |
@@ -61,6 +62,8 @@ The API Server's legacy `/api/agent` compatibility routes forward to `agent_addr
 See [HTTP contract](docs/environment-lifecycle-api.md), [failure behavior](docs/environment-runtime-failure.md), [deployment](../../docs/testing/process-deployment.md), and [Rust migration status](../../docs/testing/rust-apiserver.md).
 
 Local bind mounts accept `host_path`/`hostPath` when exactly one source is present; `rw` is preserved. Paths refer to sources visible to the node runtime. Local bind mounts can set `create_if_missing: true` (default false) to create the final directory on the node; parents must already exist and symlinks are rejected during creation. Optional `create_options: {"uid":10001,"gid":10001,"mode":"0700"}` sets ownership and permissions only for newly created directories and requires `create_if_missing: true`; existing directories are unchanged. Source-path availability and authorization are caller responsibilities; see the [Local mount contract](docs/environment-lifecycle-api.md#local-mount-sources).
+
+Volume endpoints and reference mounts are documented in the [Volume API](../../platform/api/http/volumes.md). The API Server forwards occupancy and initialization decisions to Coordinator.
 
 ## Creation metrics
 

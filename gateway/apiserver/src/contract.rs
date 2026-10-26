@@ -240,6 +240,8 @@ struct Mount {
     s3_config: Option<S3>,
     #[serde(alias = "hostPath")]
     host_path: String,
+    volume_id: Option<String>,
+    volume_uid: Option<String>,
     create_if_missing: bool,
     create_options: Option<adx_core::execution::CreateOptions>,
 }
@@ -456,16 +458,24 @@ fn storage_source(root: &Rootfs) -> Result<Option<adx_core::execution::StorageSo
     }
 }
 fn mount(value: Value) -> Result<adx_core::execution::Mount, Status> {
-    use adx_core::execution::StorageSource;
+    use adx_core::execution::{MountSource, StorageSource};
     let value: Mount = serde_json::from_value(value).map_err(|_| invalid("invalid mount"))?;
+    if value.volume_id.is_none() && value.volume_uid.is_some() {
+        return Err(invalid("volume_uid requires volume_id"));
+    }
     let source = match (
+        value.volume_id,
         value.image_url.is_empty(),
         value.s3_config,
         value.host_path.is_empty(),
     ) {
-        (false, None, true) => StorageSource::Image(value.image_url),
-        (true, Some(value), true) => StorageSource::S3(s3(value)?),
-        (true, None, false) => {
+        (Some(id), true, None, true) => MountSource::Volume(adx_core::volumes::VolumeRef {
+            id,
+            uid: value.volume_uid,
+        }),
+        (None, false, None, true) => StorageSource::Image(value.image_url).into(),
+        (None, true, Some(source), true) => StorageSource::S3(s3(source)?).into(),
+        (None, true, None, false) => {
             if !value.host_path.starts_with('/')
                 || value.host_path.chars().any(char::is_control)
                 || value
@@ -477,7 +487,7 @@ fn mount(value: Value) -> Result<adx_core::execution::Mount, Status> {
                     "host_path must be an absolute path without traversal",
                 ));
             }
-            StorageSource::Local(value.host_path)
+            StorageSource::Local(value.host_path).into()
         }
         _ => return Err(invalid("mount requires exactly one source")),
     };

@@ -60,6 +60,9 @@ impl State {
         }
         self.specs.clear();
         for spec in pending {
+            if let Some(placement) = self.scheduler.volume_placement.get(&spec.id).cloned() {
+                scheduler.set_volume_placement(&spec.id, placement);
+            }
             scheduler.submit(spec.clone())?;
             self.specs.insert(spec.id.clone(), spec);
         }
@@ -80,6 +83,7 @@ impl State {
             self.specs.insert(id.clone(), record.spec.clone());
         }
         self.needs_recovery = false;
+        self.refresh_volume_waiters().await?;
         Ok(())
     }
     pub(super) fn accept_stored_claim(&mut self, record: StoredEnvironment) -> Result<()> {
@@ -125,25 +129,7 @@ impl State {
             .nodes
             .get(&stored.assignment.node_id)
             .ok_or(Error::NotFound)?;
-        let record = stored.result.clone().unwrap_or_else(|| EnvironmentRecord {
-            observation: None,
-            execution_artifacts: vec![],
-            snapshot_source: None,
-            failure: None,
-            spec: stored.spec.clone(),
-            assignment: stored.assignment.clone(),
-            runtime: adx_core::Runtime {
-                id: format!("{}-{}", stored.spec.id, stored.assignment.generation),
-                ip: None,
-            },
-            state: EnvironmentState::Pending,
-            revision: 0,
-            resources_held: true,
-            checkpoint: None,
-            last_operation: None,
-            restart_attempts: 0,
-            restart_pending: false,
-        });
+        let record = stored.effective_record();
         Ok(pb::GetEnvironmentResponse {
             record: Some(record.try_into()?),
             node_address: node.address.clone(),
@@ -325,14 +311,21 @@ impl CoordinatorRpc {
             if record.spec != spec {
                 return Err(Status::already_exists("environment specification conflict"));
             }
-        } else if !state
-            .scheduler
-            .local_candidate(&spec, &node, &candidate.devices)
-            .map_err(status)?
-        {
-            return Ok(pb::ClaimEnvironmentResponse {
-                outcome: Some(Outcome::Fallback(true)),
-            });
+        } else {
+            let domains = self.volume_domains(&state).map_err(status)?;
+            state
+                .prepare_volumes(&spec, &domains)
+                .await
+                .map_err(status)?;
+            if !state
+                .scheduler
+                .local_candidate(&spec, &node, &candidate.devices)
+                .map_err(status)?
+            {
+                return Ok(pb::ClaimEnvironmentResponse {
+                    outcome: Some(Outcome::Fallback(true)),
+                });
+            }
         }
         if let Some(record) = &existing {
             // A center-selected assignment is memory-only. A competing optional
@@ -385,7 +378,7 @@ impl CoordinatorRpc {
             .entry(spec.id.clone())
             .or_default()
             .insert(request_id);
-        if !persistent {
+        if !persistent && !crate::storage::has_volumes(&spec) {
             let deadline = deadline
                 .ok_or_else(|| Status::invalid_argument("local reservation deadline required"))?;
             let generation = state.session.next_generation().map_err(status)?;
@@ -407,6 +400,7 @@ impl CoordinatorRpc {
                     crate::storage::CreationSummary::new(&candidate.request_id).map_err(status)?,
                 ),
                 last_interruption: None,
+                volume_execution: None,
                 spec: spec.clone(),
                 assignment: assignment.clone(),
                 result: None,
@@ -452,6 +446,11 @@ impl CoordinatorRpc {
         self.0.changed.notify_waiters();
         let outcome = match outcome {
             Ok(outcome) => outcome,
+            Err(Error::VolumeBusy(_)) => {
+                return Ok(pb::ClaimEnvironmentResponse {
+                    outcome: Some(Outcome::Fallback(true)),
+                })
+            }
             Err(e @ Error::Unavailable(_)) => {
                 state.needs_recovery = true;
                 self.0.changed.notify_waiters();
@@ -480,7 +479,8 @@ impl CoordinatorRpc {
         let outcome = match outcome {
             ClaimOutcome::Owned(_) => {
                 Outcome::Owned(Box::new(pb::StartAssignedEnvironmentRequest {
-                    create_deadline_unix_millis: 0,
+                    create_deadline_unix_millis: deadline
+                        .map_or(0, |deadline| deadline.unix_millis()),
                     spec: Some(record.spec.into()),
                     assignment: Some(record.assignment.try_into().map_err(status)?),
                     node_session_id: candidate.node_session_id,

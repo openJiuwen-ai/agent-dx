@@ -193,6 +193,10 @@ impl CoordinatorRpc {
         id: &str,
     ) -> std::result::Result<pb::GetEnvironmentResponse, Status> {
         loop {
+            let changed = self.0.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let mut waiting_for_volume = false;
             let work = {
                 let mut state = self.0.state.lock().await;
                 state.healthy().map_err(status)?;
@@ -217,6 +221,11 @@ impl CoordinatorRpc {
                 {
                     // Only an absent execution or a definitive admission rejection
                     // permits transfer. An ambiguous RPC never enters this branch.
+                    let domains = self.volume_domains(&state).map_err(status)?;
+                    state
+                        .prepare_volumes(&stored.spec, &domains)
+                        .await
+                        .map_err(status)?;
                     let mut spec = stored.spec.clone();
                     if spec.scheduling.required_node.is_empty() {
                         spec.scheduling.required_node.push(LabelSelector::default());
@@ -274,6 +283,18 @@ impl CoordinatorRpc {
                     .result
                     .clone()
                     .ok_or_else(|| Status::failed_precondition("execution is not resumable"))?;
+                if record.state == EnvironmentState::Paused && !stored.resources_held() {
+                    let domains = self.volume_domains(&state).map_err(status)?;
+                    state
+                        .prepare_volumes(&stored.spec, &domains)
+                        .await
+                        .map_err(status)?;
+                    waiting_for_volume = state
+                        .scheduler
+                        .volume_placement
+                        .get(id)
+                        .is_some_and(|placement| placement.waiting_for.is_some());
+                }
                 if !matches!(
                     record.state,
                     EnvironmentState::Running | EnvironmentState::Paused
@@ -318,6 +339,7 @@ impl CoordinatorRpc {
                 if available
                     && !stored.invalidated
                     && !stored.resume.as_ref().is_some_and(|r| r.local_rejected)
+                    && !waiting_for_volume
                 {
                     Some((stored, node, record))
                 } else {
@@ -325,7 +347,11 @@ impl CoordinatorRpc {
                 }
             };
             let Some((stored, node, record)) = work else {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                if waiting_for_volume {
+                    changed.await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
                 continue;
             };
             let intent = stored.resume.clone().ok_or_else(|| {
@@ -382,6 +408,16 @@ impl CoordinatorRpc {
                         .try_into()
                         .map_err(status)?;
                     self.commit(restored, session).await.map_err(status)?;
+                }
+                Err(error)
+                    if matches!(
+                        adx_protocol::dependency_status(error.clone()),
+                        Error::VolumeBusy(_)
+                    ) =>
+                {
+                    // A competing claimant won after the preflight. Keep the
+                    // existing owner and recheck the same Volume wait condition.
+                    continue;
                 }
                 Err(error) if error.code() == tonic::Code::ResourceExhausted => {
                     let mut state = self.0.state.lock().await;

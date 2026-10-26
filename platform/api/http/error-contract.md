@@ -103,7 +103,7 @@ API Server、Coordinator 和入口节点为创建错误回传预留最多 3 秒�
 
 - `snapshotRevision`、`nodeCount`、`eligibleNodes`：快照版本、已知 worker 数、当前通过全部硬过滤器的 worker 数。
 - `requested`、`maxCapacity`、`maxAvailable`：请求资源、逐维最大 worker 总容量、逐维最大可用资源。资源字段为 `cpu_millis`、`memory_bytes`、`disk_bytes`；可用量已扣除预留，最大值可能来自不同 worker，不能拼成一台可用机器。
-- `rejections`：各失败条件的节点计数，可重叠。标量不足使用 `insufficient_cpu`、`insufficient_memory`、`insufficient_disk`；其他键为失败过滤器名的下划线形式，如 `node_available`、`runtime_fit`、`device_fit`、`node_affinity`、`placement_groups`、`environment_affinity`、`topology_spread`。没有 worker 时为 `no_workers=1`。
+- `rejections`：各失败条件的节点计数，可重叠。标量不足使用 `insufficient_cpu`、`insufficient_memory`、`insufficient_disk`；其他键为失败过滤器名的下划线形式，如 `node_available`、`runtime_fit`、`device_fit`、`node_affinity`、`placement_groups`、`environment_affinity`、`topology_spread`。Volume 检查增加 `waiting_for_volume`（卷被占用）和 `volume_topology`（节点不可访问相关存储域）；同卷等待不阻塞其他请求，没有严格 FIFO。没有 worker 时为 `no_workers=1`。
 
 诊断不包含节点 ID、标签、其他租户的实例或内部地址。它描述到期时的集群状态，
 不证明未来扩容后仍无法调度。`eligibleNodes>0` 时可能只是队列预算先到，不能
@@ -180,3 +180,7 @@ a Published terminal Failed result. It maps to retry=never/outcome=terminal; pla
 transport Unavailable or DeadlineExceeded retains outcome=unknown. API diagnostics
 export bounded labels rather than raw error messages. See the
 [Sandbox metric contract](../../../docs/testing/sandbox-observability.md).
+
+### Volume 管理错误
+
+Volume 管理沿用上述错误结构。ensure 与删除应答未知时用相同 tenant/Volume ID 或 owner ID 重试；不能从超时推断定义或关联未提交。删除有引用、关联或占用的卷返回 CONFLICT，数据目录始终保留。接口见 [Volume API](volumes.md)。

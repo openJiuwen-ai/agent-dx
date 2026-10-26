@@ -119,7 +119,7 @@ agent-dx/
 
 `core` 不依赖 Redis/SQLite/tonic/sandboxd 客户端；`protocol` 不承载调度、状态机、证书文件读取或 TLS 构建。稳定错误语义、可观测、服务进程支持和传输机制位于根级 `crates/`。adxlet 可依赖 Gateway 的 node 库，Gateway 不依赖 Coordinator/adxlet 业务实现。Shard 当前与 Coordinator 同进程。
 
-普通创建经 Global 轮转进入 Shard Filter/Score。启用 `create_mode=local_first` 时，API Server 轮转可用入口节点，adxlet 用同一 Admission 暂留资源，Coordinator 分配 generation 并同步内存预留，成功时原子发布唯一有效结果；独立开关 `persist_local_claim` 默认关闭，开启后才提前持久化 Claim；本地不满足时使用同一 Environment ID 回退 Shard。带 `snapshotId` 的创建始终由 Coordinator 调度：共享制品默认弱亲和来源节点，先跨分片比较可用候选，原节点不满足时使用其他兼容节点；排队期间也可跨分片回退。显式放置规则覆盖默认偏好，local-only 保留来源节点硬约束。Coordinator 向 API Server 首次全量、后续增量发布活跃 Environment 目录；删除通过增量撤销并从 Redis 主目录移除，已有 Environment 操作命中本地目录后直达 adxlet。
+普通创建经 Global 轮转进入 Shard Filter/Score。启用 `create_mode=local_first` 时，API Server 轮转可用入口节点，adxlet 用同一 Admission 暂留资源，Coordinator 分配 generation 并同步内存预留，成功时原子发布唯一有效结果；独立开关 `persist_local_claim` 默认关闭，开启后才为普通请求提前持久化 Claim；受管卷保留提前持久化的授权执行身份，exclusive 占用与分配原子提交；本地不满足时使用同一 Environment ID 回退 Shard。带 `snapshotId` 的创建始终由 Coordinator 调度：共享制品默认弱亲和来源节点，先跨分片比较可用候选，原节点不满足时使用其他兼容节点；排队期间也可跨分片回退。显式放置规则覆盖默认偏好，local-only 保留来源节点硬约束。Coordinator 向 API Server 首次全量、后续增量发布活跃 Environment 目录；删除通过增量撤销并从 Redis 主目录移除，已有 Environment 操作命中本地目录后直达 adxlet。受管卷调度还会把卷可访问节点集合纳入选点，未分配的带卷请求可转移到有容量的可访问分片；exclusive 卷在下发节点前由 Coordinator 原子持久化执行分配与占用。本地与中心创建共享卷准入，节点不直接访问 Redis。
 
 ## adxlet / Relay 进程组合
 

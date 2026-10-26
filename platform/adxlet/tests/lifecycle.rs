@@ -199,6 +199,37 @@ fn node(deps: &Arc<Dependencies>) -> Adxlet {
 }
 
 #[tokio::test]
+async fn referenced_volume_cannot_start_without_coordinator_authorization() {
+    use adx_core::{
+        execution::{Mount, MountSource},
+        volumes::VolumeRef,
+    };
+    let deps = Dependencies::new(false);
+    let node = node(&deps);
+    let mut spec = spec("volume");
+    spec.execution.mounts.push(Mount {
+        kind: "bind".into(),
+        target: "/workspace".into(),
+        options: vec!["rw".into()],
+        source: MountSource::Volume(VolumeRef {
+            id: "workspace".into(),
+            uid: Some("uid".into()),
+        }),
+        create_if_missing: false,
+        create_options: None,
+    });
+    let environment = node.environment(spec, assignment("volume")).unwrap();
+    assert!(environment.create().await.is_err());
+    assert!(!deps
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event == "start"));
+    assert!(!deps.actual.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
 async fn create_publishes_only_after_runtime_readiness_and_route_binding() {
     let deps = Dependencies::new(false);
     let node = node(&deps);

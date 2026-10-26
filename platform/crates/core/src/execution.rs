@@ -95,12 +95,44 @@ impl CreateOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum MountSource {
+    Inline(StorageSource),
+    Volume(crate::volumes::VolumeRef),
+}
+
+impl MountSource {
+    /// Runtime adapters only accept a concrete source resolved by authorized node execution.
+    pub fn inline(&self) -> Result<&StorageSource> {
+        match self {
+            Self::Inline(source) => Ok(source),
+            Self::Volume(_) => Err(Error::Invalid(
+                "VolumeRef requires Coordinator-authorized resolution".into(),
+            )),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::Inline(source) => source.validate(),
+            Self::Volume(reference) => reference.validate(),
+        }
+    }
+}
+
+impl From<StorageSource> for MountSource {
+    fn from(source: StorageSource) -> Self {
+        Self::Inline(source)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Mount {
     pub kind: String,
     pub target: String,
     #[serde(default)]
     pub options: Vec<String>,
-    pub source: StorageSource,
+    pub source: MountSource,
     #[serde(default)]
     pub create_if_missing: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -109,6 +141,13 @@ pub struct Mount {
 
 impl Mount {
     pub fn validate(&self) -> Result<()> {
+        if matches!(self.source, MountSource::Volume(_))
+            && (self.kind != "bind" || self.create_if_missing || self.create_options.is_some())
+        {
+            return Err(Error::Invalid(
+                "VolumeRef requires a bind mount without inline initialization".into(),
+            ));
+        }
         if let Some(options) = &self.create_options {
             if !self.create_if_missing {
                 return Err(Error::Invalid(
@@ -118,14 +157,15 @@ impl Mount {
             options.mode_bits()?;
         }
         if self.create_if_missing
-            && (self.kind != "bind" || !matches!(self.source, StorageSource::Local(_)))
+            && (self.kind != "bind"
+                || !matches!(self.source, MountSource::Inline(StorageSource::Local(_))))
         {
             return Err(Error::Invalid(
                 "create_if_missing requires a Local bind mount".into(),
             ));
         }
         if self.create_if_missing {
-            if let StorageSource::Local(path) = &self.source {
+            if let MountSource::Inline(StorageSource::Local(path)) = &self.source {
                 if !path.starts_with('/')
                     || path.len() <= 1
                     || path[1..]

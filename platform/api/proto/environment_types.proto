@@ -49,9 +49,37 @@ message MountSpec {
   string type = 1;
   string target = 2;
   repeated string options = 3;
-  StorageSource source = 4;
+  oneof mount_source {
+    StorageSource source = 4;
+    VolumeRef volume = 7;
+  }
   bool create_if_missing = 5;
   MountCreateOptions create_options = 6;
+}
+
+message VolumeRef { string id = 1; optional string uid = 2; }
+enum VolumeAccessMode { VOLUME_ACCESS_MODE_SHARED = 0; VOLUME_ACCESS_MODE_EXCLUSIVE = 1; }
+message DirectoryVolumeSource { string storage_domain = 1; string path = 2; }
+message VolumeSpec {
+  string tenant_id = 1;
+  string id = 2;
+  oneof source { DirectoryVolumeSource directory = 3; }
+  VolumeAccessMode access_mode = 4;
+  bool create_if_missing = 5;
+  MountCreateOptions create_options = 6;
+}
+message Volume { string uid = 1; VolumeSpec spec = 2; uint64 revision = 3; }
+enum VolumeOccupancyPhase {
+  VOLUME_OCCUPANCY_PHASE_UNSPECIFIED = 0;
+  VOLUME_OCCUPANCY_PHASE_RESERVED = 1;
+  VOLUME_OCCUPANCY_PHASE_HELD = 2;
+}
+message VolumeOccupancy {
+  string volume_uid = 1;
+  Assignment assignment = 2;
+  string runtime_id = 3;
+  string node_session_id = 4;
+  VolumeOccupancyPhase phase = 5;
 }
 
 enum NetworkAction { NETWORK_ACTION_UNSPECIFIED = 0; NETWORK_ACTION_ALLOW = 1; NETWORK_ACTION_DENY = 2; }

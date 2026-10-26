@@ -66,6 +66,21 @@ pub struct Coordinator {
     journal: MutationJournal,
     ready: VecDeque<usize>,
     retired: BTreeSet<String>,
+    volume_placement: BTreeMap<String, VolumePlacement>,
+}
+
+/// Coordinator-resolved storage topology and a currently unavailable exclusive UID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VolumePlacement {
+    /// Domains used to refresh queued topology after node mount reports change.
+    pub storage_domains: BTreeSet<String>,
+    pub nodes: BTreeSet<String>,
+    pub waiting_for: Option<String>,
+}
+impl VolumePlacement {
+    fn allows(&self, node: &str) -> bool {
+        self.waiting_for.is_none() && self.nodes.contains(node)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -175,6 +190,7 @@ impl Coordinator {
             snapshot: Arc::new(Snapshot::default()),
             ready: VecDeque::new(),
             retired: BTreeSet::new(),
+            volume_placement: BTreeMap::new(),
         })
     }
 
@@ -248,7 +264,7 @@ impl Coordinator {
             };
         }
         let preferred = if spec.snapshot_id.is_some() {
-            self.snapshot_shard(&spec, &BTreeSet::new(), None)?
+            self.candidate_shard(&spec, &BTreeSet::new(), None)?
         } else {
             None
         };
@@ -264,9 +280,9 @@ impl Coordinator {
         Ok(shard)
     }
 
-    /// Snapshot source affinity must take effect before the request enters a
-    /// shard. Use the same hard filters and score as final node selection.
-    fn snapshot_shard(
+    /// Use the same hard filters and score for Snapshot affinity and queued
+    /// Volume requests that gain accessible capacity on another shard.
+    fn candidate_shard(
         &mut self,
         spec: &EnvironmentSpec,
         excluded: &BTreeSet<String>,
@@ -277,7 +293,12 @@ impl Coordinator {
             if skip == Some(id) {
                 continue;
             }
-            if let Some((score, node)) = shard.best_candidate(spec, &self.snapshot, excluded)? {
+            if let Some((score, node)) = shard.best_candidate(
+                spec,
+                &self.snapshot,
+                excluded,
+                self.volume_placement.get(&spec.id),
+            )? {
                 if best.as_ref().is_none_or(|(old, old_node, _)| {
                     score > *old || (score == *old && node < *old_node)
                 }) {
@@ -289,12 +310,12 @@ impl Coordinator {
     }
 
     fn defer_or_transfer(&mut self, shard: usize, entry: queue::Entry) -> Result<()> {
-        if entry.spec.snapshot_id.is_none() {
+        if entry.spec.snapshot_id.is_none() && !self.volume_placement.contains_key(&entry.spec.id) {
             self.shards[shard].defer(entry);
             return Ok(());
         }
         let excluded = self.shards[shard].exclusions(&entry.spec.id);
-        let target = match self.snapshot_shard(&entry.spec, &excluded, Some(shard)) {
+        let target = match self.candidate_shard(&entry.spec, &excluded, Some(shard)) {
             Ok(target) => target,
             Err(error) => {
                 self.shards[shard].defer(entry);
@@ -316,6 +337,13 @@ impl Coordinator {
         Ok(())
     }
 
+    pub fn set_volume_placement(&mut self, id: &str, placement: VolumePlacement) {
+        self.volume_placement.insert(id.to_owned(), placement);
+        if let Some((shard, _)) = self.requests.get(id) {
+            self.wake(*shard);
+        }
+    }
+
     /// Inspect current placement constraints, including held reservations.
     /// This does not cancel requests or imply that execution has not started.
     pub fn scheduling_failure(
@@ -329,7 +357,12 @@ impl Coordinator {
             ..Default::default()
         };
         for shard in &self.shards {
-            shard.diagnose(spec, &self.snapshot, &mut failure)?;
+            shard.diagnose(
+                spec,
+                &self.snapshot,
+                &mut failure,
+                self.volume_placement.get(&spec.id),
+            )?;
         }
         if failure.node_count == 0 {
             failure.rejections.insert("no_workers".into(), 1);
@@ -350,6 +383,7 @@ impl Coordinator {
             shard.forget_queued(id);
         }
         self.requests.remove(id);
+        self.volume_placement.remove(id);
         true
     }
 
@@ -415,6 +449,13 @@ impl Coordinator {
         node: &str,
         devices: &[adx_core::scheduling::DeviceAllocation],
     ) -> Result<bool> {
+        if self
+            .volume_placement
+            .get(&spec.id)
+            .is_some_and(|placement| !placement.allows(node))
+        {
+            return Ok(false);
+        }
         let Some(shard) = self.node_shards.get(node) else {
             return Ok(false);
         };
@@ -532,6 +573,7 @@ impl Coordinator {
                 &self.snapshot,
                 &self.journal,
                 &self.config,
+                &self.volume_placement,
             ) {
                 Ok(Attempt::Assigned(assignment, spec)) => {
                     self.generation = generation;

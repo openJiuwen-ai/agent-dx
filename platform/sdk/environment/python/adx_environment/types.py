@@ -64,13 +64,21 @@ class PausePolicy:
     def __post_init__(self):
         if not isinstance(self.retention, RetentionPolicy):
             raise TypeError("retention must be a RetentionPolicy")
-        if isinstance(self.timeout_seconds, bool) or not isinstance(self.timeout_seconds, int) or not 0 < self.timeout_seconds <= 3600:
+        if (
+            isinstance(self.timeout_seconds, bool)
+            or not isinstance(self.timeout_seconds, int)
+            or not 0 < self.timeout_seconds <= 3600
+        ):
             raise ValueError("timeout_seconds must be an integer from 1 through 3600")
         if not isinstance(self.storage, CheckpointStorage):
             raise TypeError("storage must be a CheckpointStorage")
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"retention": self.retention.to_dict(), "timeoutSeconds": self.timeout_seconds, "storage": self.storage.value}
+        return {
+            "retention": self.retention.to_dict(),
+            "timeoutSeconds": self.timeout_seconds,
+            "storage": self.storage.value,
+        }
 
 
 @dataclass(frozen=True)
@@ -149,10 +157,15 @@ class ConnectionConfig:
     request_max_attempts: int = 3
 
     def __post_init__(self) -> None:
-        if isinstance(self.request_max_attempts, bool) or not isinstance(self.request_max_attempts, int) or self.request_max_attempts < 1:
+        if (
+            isinstance(self.request_max_attempts, bool)
+            or not isinstance(self.request_max_attempts, int)
+            or self.request_max_attempts < 1
+        ):
             raise ValueError("request_max_attempts must be a positive integer")
         margin = self.communication_margin_seconds
-        if isinstance(margin, bool) or not isinstance(margin, (int, float)) or not math.isfinite(margin) or not 0 <= margin <= 3600:
+        numeric_margin = isinstance(margin, (int, float)) and not isinstance(margin, bool)
+        if not numeric_margin or not math.isfinite(margin) or not 0 <= margin <= 3600:
             raise ValueError("communication_margin_seconds must be finite and between 0 and 3600")
         for field_name in ("server_address", "token"):
             value = getattr(self, field_name)
@@ -207,7 +220,9 @@ class ConnectionConfig:
             gateway_address=gateway_address or None,
             gateway_use_tls=_connection_env_flag("ADX_GATEWAY_TLS", False),
             verify_tls=verify_tls,
-            communication_margin_seconds=float(os.environ.get("ADX_COMMUNICATION_MARGIN_SECONDS", str(ADX_GET_TIMEOUT_BUFFER))),
+            communication_margin_seconds=float(
+                os.environ.get("ADX_COMMUNICATION_MARGIN_SECONDS", str(ADX_GET_TIMEOUT_BUFFER))
+            ),
             request_max_attempts=int(os.environ.get("ADX_REQUEST_MAX_ATTEMPTS", "3")),
         )
 
@@ -719,9 +734,116 @@ class CreateOptions:
         return {"uid": self.uid, "gid": self.gid, "mode": self.mode}
 
 
+def _volume_id(value: str) -> None:
+    if not isinstance(value, str) or re.fullmatch(r"[A-Za-z0-9._-]{1,256}", value) is None or value in (".", ".."):
+        raise ValueError(
+            "Volume ID must contain 1–256 ASCII letters, digits, dots, underscores or hyphens; '.' and '..' are invalid"
+        )
+
+
+def _volume_identifier(value: str) -> None:
+    nonempty_string = isinstance(value, str) and bool(value.strip())
+    if not nonempty_string or len(value.encode()) > 256 or any(ord(c) < 32 or ord(c) == 127 for c in value):
+        raise ValueError("Volume identifiers must be nonempty strings of at most 256 bytes without control characters")
+
+
+@dataclass(frozen=True)
+class DirectoryVolumeSource:
+    storage_domain: str
+    path: str
+
+    def __post_init__(self) -> None:
+        _volume_identifier(self.storage_domain)
+        bounded_path = isinstance(self.path, str) and len(self.path.encode()) <= 4096
+        if (
+            not bounded_path
+            or any(p in ("", ".", "..") for p in self.path.split("/"))
+            or any(ord(c) < 32 or ord(c) == 127 or c == "\\" for c in self.path)
+        ):
+            raise ValueError("Volume path must be a relative directory without traversal")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {"type": "directory", "storage_domain": self.storage_domain, "path": self.path}
+
+
+@dataclass(frozen=True)
+class VolumeSpec:
+    id: str
+    source: DirectoryVolumeSource
+    access_mode: str = "shared"
+    create_if_missing: bool = False
+    create_options: Optional[CreateOptions] = None
+
+    def __post_init__(self) -> None:
+        _volume_id(self.id)
+        if not isinstance(self.source, DirectoryVolumeSource):
+            raise ValueError("source must be DirectoryVolumeSource")
+        if self.access_mode not in ("shared", "exclusive"):
+            raise ValueError("access_mode must be shared or exclusive")
+        if not isinstance(self.create_if_missing, bool):
+            raise ValueError("create_if_missing must be a boolean")
+        if self.create_options is not None and (
+            not isinstance(self.create_options, CreateOptions) or not self.create_if_missing
+        ):
+            raise ValueError("Volume create_options requires create_if_missing and CreateOptions")
+
+    def to_dict(self) -> Dict[str, Any]:
+        value = {
+            "id": self.id,
+            "source": self.source.to_dict(),
+            "access_mode": self.access_mode,
+            "create_if_missing": self.create_if_missing,
+        }
+        if self.create_options is not None:
+            value["create_options"] = self.create_options.to_dict()
+        return value
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "VolumeSpec":
+        source = value["source"]
+        if source.get("type") != "directory":
+            raise ValueError("unsupported Volume source")
+        options = value.get("create_options")
+        return cls(
+            id=value["id"],
+            source=DirectoryVolumeSource(storage_domain=source["storage_domain"], path=source["path"]),
+            access_mode=value["access_mode"],
+            create_if_missing=value["create_if_missing"],
+            create_options=None if options is None else CreateOptions(**options),
+        )
+
+
+@dataclass(frozen=True)
+class VolumeInfo:
+    uid: str
+    spec: VolumeSpec
+    revision: int
+    environment_ids: Tuple[str, ...] = ()
+    owner_ids: Tuple[str, ...] = ()
+    snapshot_ids: Tuple[str, ...] = ()
+    occupancy: Optional[Mapping[str, Any]] = None
+    initialization: Optional[Mapping[str, Any]] = None
+
+    @classmethod
+    def from_dict(cls, value: Mapping[str, Any]) -> "VolumeInfo":
+        _volume_identifier(value["uid"])
+        if type(value["revision"]) is not int or value["revision"] <= 0:
+            raise ValueError("invalid Volume revision")
+        return cls(
+            uid=value["uid"],
+            spec=VolumeSpec.from_dict(value["spec"]),
+            revision=value["revision"],
+            environment_ids=tuple(value.get("environment_ids", ())),
+            owner_ids=tuple(value.get("owner_ids", ())),
+            snapshot_ids=tuple(value.get("snapshot_ids", ())),
+            occupancy=value.get("occupancy"),
+            initialization=value.get("initialization"),
+        )
+
+
 @dataclass(frozen=True)
 class Mount:
-    """Image/S3 read-only mount or a node-local bind mount.
+    """Image/S3 read-only, inline host bind, or managed Volume reference mount.
 
     ``host_path`` refers to a path visible to the worker (including a mounted
     shared filesystem such as MooseFS). ADX does not mount the filesystem itself.
@@ -734,6 +856,8 @@ class Mount:
     s3_config: Optional[S3Config] = None
     type: str = "bind"
     host_path: Optional[str] = None
+    volume_id: Optional[str] = None
+    volume_uid: Optional[str] = None
     options: Sequence[str] = ("ro",)
     create_if_missing: bool = False
     create_options: Optional[CreateOptions] = None
@@ -746,9 +870,19 @@ class Mount:
                 raise ValueError(f"{label} must be an absolute path without parent traversal or NUL")
             if "\0" in path or ".." in path.split("/"):
                 raise ValueError(f"{label} must be an absolute path without parent traversal or NUL")
-        count = sum(source is not None for source in (self.image_url, self.s3_config, self.host_path))
+        count = sum(source is not None for source in (self.image_url, self.s3_config, self.host_path, self.volume_id))
         if count != 1:
-            raise ValueError(f"Exactly one of image_url, s3_config, host_path must be specified, got {count}")
+            raise ValueError(
+                f"Exactly one of image_url, s3_config, host_path, volume_id must be specified, got {count}"
+            )
+        if self.volume_uid is not None:
+            _volume_identifier(self.volume_uid)
+            if self.volume_id is None:
+                raise ValueError("volume_uid requires volume_id")
+        if self.volume_id is not None:
+            _volume_id(self.volume_id)
+            if self.type != "bind":
+                raise ValueError("Volume references require bind mounts")
         if self.image_url is not None and (not isinstance(self.image_url, str) or not self.image_url.strip()):
             raise ValueError("image_url must be a non-empty string")
         if self.s3_config is not None and not isinstance(self.s3_config, S3Config):
@@ -764,8 +898,9 @@ class Mount:
             raise ValueError("mount options must be unique and cannot contain both ro and rw")
         if "ro" not in options and "rw" not in options:
             options = ("ro",) + options
-        if "rw" in options and (self.host_path is None or self.type != "bind"):
-            raise ValueError("only local bind mounts may be writable")
+        directory_bind = self.type == "bind" and (self.host_path is not None or self.volume_id is not None)
+        if "rw" in options and not directory_bind:
+            raise ValueError("only directory bind mounts may be writable")
         if not isinstance(self.create_if_missing, bool):
             raise ValueError("create_if_missing must be a boolean")
         if self.create_if_missing and (self.host_path is None or self.type != "bind"):
@@ -786,6 +921,10 @@ class Mount:
         if self.host_path is not None:
             d["host_path"] = self.host_path
             d["create_if_missing"] = self.create_if_missing
+        if self.volume_id is not None:
+            d["volume_id"] = self.volume_id
+        if self.volume_uid is not None:
+            d["volume_uid"] = self.volume_uid
         if self.create_options is not None:
             d["create_options"] = self.create_options.to_dict()
         return d

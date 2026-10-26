@@ -1435,7 +1435,7 @@ async fn conch_reserved_mount_targets_are_rejected_before_side_effects() {
             kind: "bind".into(),
             target: target.into(),
             options: vec!["ro".into()],
-            source: adx_core::execution::StorageSource::Local("/tmp".into()),
+            source: adx_core::execution::StorageSource::Local("/tmp".into()).into(),
             create_if_missing: false,
             create_options: None,
         });

@@ -1,4 +1,6 @@
 mod common;
+#[path = "rpc/volumes.rs"]
+mod volumes;
 use adx_coordinator::{routes::RoutePublisher, rpc::CoordinatorRpc, storage::Session, Placement};
 use adx_core::{
     scheduling::DeviceAllocation, EnvironmentRecord, EnvironmentSpec, Resources, Result,
@@ -171,9 +173,40 @@ impl RuntimeDriver for Backend {
         match self.session.get(&spec.id).await {
             Ok(allocation) => {
                 assert_eq!(allocation.assignment.generation, generation);
-                assert_eq!(allocation.spec, *spec);
+                let mut resolved = allocation.spec.clone();
+                for (raw, actual) in resolved
+                    .execution
+                    .mounts
+                    .iter_mut()
+                    .zip(&spec.execution.mounts)
+                {
+                    if let adx_core::execution::MountSource::Volume(reference) = &raw.source {
+                        let definition = self
+                            .session
+                            .get_volume(&spec.tenant_id, &reference.id)
+                            .await?;
+                        assert_eq!(reference.uid.as_ref(), Some(&definition.volume.uid));
+                        let adx_core::volumes::VolumeSource::Directory { path, .. } =
+                            definition.volume.spec.source;
+                        let adx_core::execution::StorageSource::Local(source) =
+                            actual.source.inline()?
+                        else {
+                            panic!("resolved directory mount required")
+                        };
+                        assert!(std::path::Path::new(source).ends_with(&path));
+                        assert!(std::path::Path::new(source).is_dir());
+                        raw.source = actual.source.clone();
+                        assert!(!actual.create_if_missing);
+                        assert!(actual.create_options.is_none());
+                    }
+                }
+                assert_eq!(resolved, *spec);
             }
-            Err(adx_core::Error::NotFound | adx_core::Error::Conflict) => (),
+            Err(adx_core::Error::NotFound | adx_core::Error::Conflict) => assert!(!spec
+                .execution
+                .mounts
+                .iter()
+                .any(|mount| matches!(mount.source, adx_core::execution::MountSource::Volume(_)))),
             Err(error) => return Err(error),
         }
         // Validate public HTTP input at the execution boundary, before deletion
@@ -210,6 +243,11 @@ impl RuntimeDriver for Backend {
             tokio::time::sleep(Duration::from_millis(1200)).await;
         }
         self.running.lock().unwrap().insert(id.into());
+        if spec.env.contains_key("FAIL_START") {
+            return Err(adx_core::Error::Unavailable(
+                "injected runtime start failure".into(),
+            ));
+        }
         Ok("10.0.0.2".parse().unwrap())
     }
     async fn checkpoint_supported(&self, _: &str) -> Result<()> {
@@ -414,6 +452,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     let mut node_coordinator =
         pb::coordinator_service_client::CoordinatorServiceClient::new(channel(ma, "node").await);
     let mut register = pb::RegisterNodeRequest {
+        storage_mounts: Default::default(),
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),
@@ -484,6 +523,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     // Re-publishing the same durable Running result must not create a second event.
     node_coordinator
         .commit_environment(pb::CommitEnvironmentRequest {
+            stopped_runtime_ids: vec![],
             node_session_id: "boot-1".into(),
             record: Some(first_record.clone()),
         })
@@ -545,6 +585,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert_eq!(
         frontend
             .commit_environment(pb::CommitEnvironmentRequest {
+                stopped_runtime_ids: vec![],
                 node_session_id: "boot-1".into(),
                 record: Some(first_record.clone())
             })
@@ -739,6 +780,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert_eq!(
         node_coordinator
             .commit_environment(pb::CommitEnvironmentRequest {
+                stopped_runtime_ids: vec![],
                 node_session_id: "boot-1".into(),
                 record: Some(first_record)
             })
@@ -1144,6 +1186,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
         last_operation: None,
     };
     node.commit_environment(pb::CommitEnvironmentRequest {
+        stopped_runtime_ids: vec![],
         record: Some(running.clone().try_into().unwrap()),
         node_session_id: report.session_id.clone(),
     })
@@ -1256,6 +1299,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
 
     assert_eq!(
         node.commit_environment(pb::CommitEnvironmentRequest {
+            stopped_runtime_ids: vec![],
             record: Some(running.clone().try_into().unwrap()),
             node_session_id: "first-boot".into()
         })
@@ -1266,6 +1310,7 @@ async fn heartbeat_expiry_reconciliation_and_old_session_fencing() {
     );
     assert_eq!(
         node.commit_environment(pb::CommitEnvironmentRequest {
+            stopped_runtime_ids: vec![],
             record: Some(running.try_into().unwrap()),
             node_session_id: "second-boot".into(),
         })
@@ -1491,6 +1536,7 @@ async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint(
     assert_eq!(
         node_coordinator
             .commit_environment(pb::CommitEnvironmentRequest {
+                stopped_runtime_ids: vec![],
                 record: Some(running.clone()),
                 node_session_id: "boot-1".into(),
             })
@@ -1666,6 +1712,7 @@ async fn coordinator_restart_bounds_re_registration_grace() {
             assert!(result.runtime.ip.is_none());
             assert!(
                 node.commit_environment(pb::CommitEnvironmentRequest {
+                    stopped_runtime_ids: vec![],
                     record: Some(running.try_into().unwrap()),
                     node_session_id: "boot".into(),
                 })
@@ -1677,6 +1724,7 @@ async fn coordinator_restart_bounds_re_registration_grace() {
             deleted.state = EnvironmentState::Deleted;
             deleted.revision += 1;
             node.commit_environment(pb::CommitEnvironmentRequest {
+                stopped_runtime_ids: vec![],
                 record: Some(deleted.try_into().unwrap()),
                 node_session_id: "boot".into(),
             })
@@ -2383,6 +2431,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     let mut client =
         pb::coordinator_service_client::CoordinatorServiceClient::new(channel(ma, "node").await);
     let mut report = pb::RegisterNodeRequest {
+        storage_mounts: Default::default(),
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),
@@ -2862,6 +2911,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
         ..Default::default()
     };
     let mut target_report = pb::RegisterNodeRequest {
+        storage_mounts: Default::default(),
         labels: [("ADX_CHECKPOINT_STORAGE".into(), "shared".into())].into(),
         runtime_classes: vec![
             "runsc".into(),
@@ -2983,6 +3033,7 @@ async fn shared_checkpoint_moves_to_new_node_and_old_node_cleans_without_deletin
     );
     assert!(source
         .commit_environment(pb::CommitEnvironmentRequest {
+            stopped_runtime_ids: vec![],
             record: Some(old.clone().try_into().unwrap()),
             node_session_id: "source-boot".into()
         })

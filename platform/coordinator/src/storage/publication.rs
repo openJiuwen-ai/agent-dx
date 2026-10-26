@@ -57,7 +57,10 @@ impl Session {
             return Ok(());
         };
         let stored: StoredEnvironment = decode(&old)?;
-        if stored.assignment != *assignment || stored.result.is_some() || stored.recovery.is_some()
+        if volumes::has_volumes(&stored.spec)
+            || stored.assignment != *assignment
+            || stored.result.is_some()
+            || stored.recovery.is_some()
         {
             return Ok(());
         }
@@ -148,6 +151,7 @@ impl Session {
                 None => CreationSummary::new(requests.first().map_or("", String::as_str))?,
             }),
             last_interruption: None,
+            volume_execution: None,
             resume: None,
             failed_since_unix_seconds: None,
             recovery: None,
@@ -159,7 +163,18 @@ impl Session {
         let artifacts = artifacts::record_artifacts(&record);
         let _access = self.store.lock_artifacts(&artifacts)?;
         for _ in 0..ATTEMPTS {
+            let catalog = if volumes::has_volumes(&record.spec) {
+                Some(self.volume_catalog().await?)
+            } else {
+                None
+            };
             let [header, old] = self.store.fields([HEADER.into(), field.clone()]).await?;
+            if catalog
+                .as_ref()
+                .is_some_and(|catalog| catalog.control.get(&field) != old.as_ref())
+            {
+                continue;
+            }
             let mut counters = CounterUpdate::load(&self.store, field.clone()).await?;
             self.header(&header)?;
             let previous = old
@@ -183,6 +198,13 @@ impl Session {
             let mut next = next.clone();
             if let Some(previous) = &previous {
                 next.creation = previous.creation.clone();
+                next.volume_execution = previous.volume_execution.clone();
+            }
+            let mut catalog = catalog;
+            if !published && !pending_conflict {
+                if let Some(catalog) = &mut catalog {
+                    catalog.apply_result(&record, node_session, &[])?;
+                }
             }
             next.observe_result(&record, &mut counters.value)?;
             next.result = Some(record.clone());
@@ -214,24 +236,37 @@ impl Session {
                 end
                 if ARGV[6] == 'conflict' then return {-1,''} end
                 if ARGV[7] ~= '' and redis.call('HGET',KEYS[1],ARGV[8]) ~= ARGV[7] then return {-1,''} end
+                if ARGV[10] ~= '' and redis.call('HGET',KEYS[1],'header') ~= ARGV[10] then return {0,''} end
                 local facts = cjson.decode(ARGV[9])
                 if (redis.call('HGET',KEYS[5],facts[1]) or '') ~= facts[2] then return {0,''} end
                 redis.call('HSET',KEYS[5],facts[1],facts[3])
                 redis.call('HSET',KEYS[1],ARGV[2],ARGV[4])
                 redis.call('HINCRBY',KEYS[1],'node-ownership:' .. string.sub(ARGV[8],14),1)
                 aliases(ARGV[4], ARGV[2])
-                for i=10,#ARGV,2 do redis.call('HSET',KEYS[4],ARGV[i],ARGV[i+1]) end
+                local cursor=13
+                for _=1,tonumber(ARGV[12]) do redis.call('HSET',KEYS[6],ARGV[cursor],ARGV[cursor+1]); cursor=cursor+2 end
+                if ARGV[10] ~= '' then redis.call('HSET',KEYS[1],'header',ARGV[11]) end
+                for i=cursor,#ARGV,2 do redis.call('HSET',KEYS[4],ARGV[i],ARGV[i+1]) end
                 return {1,ARGV[4]}
-            "#).arg(5).arg(&self.store.key)
+            "#).arg(6).arg(&self.store.key)
                 .arg(format!("{}:create-requests", self.store.key))
                 .arg(format!("{}:create-receipts", self.store.key))
                 .arg(format!("{}:artifacts", self.store.key))
                 .arg(format!("{}:business", self.store.key))
+                .arg(self.volumes_key())
                 .arg(self.epoch.to_string()).arg(&field).arg(old.as_deref().unwrap_or(""))
                 .arg(encode(&next)?).arg(encode(&request_fields)?)
                 .arg(if published { "published" } else if pending_conflict { "conflict" } else { "initial" }).arg(node_session)
                 .arg(format!("node-session:{}", record.assignment.node_id))
                 .arg(counters.argument()?);
+            if let Some(catalog) = &catalog {
+                command
+                    .arg(&catalog.header_value)
+                    .arg(encode(&catalog.advanced_header()?)?);
+                catalog.append_writes(&mut command)?;
+            } else {
+                command.arg("").arg("").arg(0);
+            }
             for artifact in &artifacts {
                 command
                     .arg(artifacts::artifact_key(artifact))
@@ -245,6 +280,12 @@ impl Session {
                         0,
                         vec![format!("environment:{}", winner.spec.id)],
                     );
+                    if code == 1 {
+                        if let Some(catalog) = &catalog {
+                            self.store
+                                .notify_committed_change(0, catalog.change_fields().collect());
+                        }
+                    }
                     if code == 2 {
                         return self.resolve_receipt(winner).await;
                     }

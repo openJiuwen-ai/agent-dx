@@ -5,6 +5,7 @@ package adx.control.v1;
 // Versioned internal Environment control. All callers authenticate with mTLS.
 import public "environment_types.proto";
 import public "snapshot.proto";
+import public "volume.proto";
 import public "credentials.proto";
 import public "routes.proto";
 
@@ -73,7 +74,13 @@ message RegisterNodeRequest {
   uint64 heartbeat_sequence = 9;
   bool reconciling = 10;
   repeated string runtime_classes = 11; // Available classes reported by the configured runtime adapters.
+  // Complete current mount view. Omitted domains are unavailable on this session.
+  map<string, StorageMount> storage_mounts = 12;
+}
 
+message StorageMount {
+  string backend_id = 1;
+  string root = 2;
 }
 
 message RegisterNodeResponse { uint32 shard_id = 1; uint64 coordinator_epoch = 2; }
@@ -113,7 +120,7 @@ message DeleteEnvironmentRequest {
   string node_session_id = 4;
 }
 
-message CommitEnvironmentRequest { EnvironmentRecord record = 1; string node_session_id = 2; }
+message CommitEnvironmentRequest { EnvironmentRecord record = 1; string node_session_id = 2; repeated string stopped_runtime_ids = 3; }
 
 message CommitEnvironmentResponse { EnvironmentRecord record = 1; }
 

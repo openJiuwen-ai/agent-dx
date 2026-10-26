@@ -14,6 +14,7 @@ pub mod parameters;
 pub mod probes;
 pub mod target;
 pub mod transport;
+pub mod volumes;
 
 pub type ValidationResult = Result<(), String>;
 
@@ -131,6 +132,8 @@ pub struct TemplateVersion {
     pub lifecycle: lifecycle::LifecyclePolicy,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mounts: Vec<mounts::Mount>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<volumes::VolumeSpec>,
     #[serde(default)]
     pub service: Vec<Service>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -152,6 +155,23 @@ impl TemplateVersion {
         self.mounts
             .iter()
             .map(|mount| mount.render_validated(parameters))
+            .collect()
+    }
+    pub fn render_volumes(
+        &self,
+        parameters: &mounts::Parameters,
+    ) -> Result<Vec<volumes::VolumeSpec>, String> {
+        mounts::validate_parameters(parameters)?;
+        let mut ids = BTreeSet::new();
+        self.volumes
+            .iter()
+            .map(|volume| {
+                let volume = volume.render(Some(parameters))?;
+                if !ids.insert(volume.id.clone()) {
+                    return Err("duplicate rendered Volume ID".into());
+                }
+                Ok(volume)
+            })
             .collect()
     }
     pub fn render_env(
@@ -199,6 +219,16 @@ impl TemplateVersion {
             }
         }
         mounts::validate_mounts(&self.mounts)?;
+        if self.volumes.len() > 32 {
+            return Err("at most 32 Volumes are allowed".into());
+        }
+        let mut volumes = BTreeSet::new();
+        for volume in &self.volumes {
+            volume.render(None)?;
+            if !volumes.insert(&volume.id) {
+                return Err("duplicate Volume ID".into());
+            }
+        }
         self.lifecycle.validate()?;
         if self
             .init_timeout_seconds

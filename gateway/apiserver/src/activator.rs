@@ -10,6 +10,26 @@ use tonic::{Code, Status};
 
 #[async_trait]
 impl EnvironmentApplication for EnvironmentService {
+    async fn ensure_volume_request(
+        &self,
+        tenant: &str,
+        input: Value,
+    ) -> Result<Value, EnvironmentError> {
+        Box::pin(self.volume_request(
+            "POST",
+            None,
+            input,
+            &std::collections::HashMap::new(),
+            &caller(tenant),
+        ))
+        .await
+        .map_err(map_volume_status)
+    }
+    async fn release_volume_owner(&self, tenant: &str, id: &str) -> Result<(), EnvironmentError> {
+        EnvironmentService::release_volume_owner(self, id, &caller(tenant))
+            .await
+            .map_err(map_volume_status)
+    }
     async fn create_request(
         &self,
         tenant: &str,
@@ -58,6 +78,16 @@ fn caller(tenant: &str) -> pb::CallerContext {
         administrator: false,
     }
 }
+fn map_volume_status(status: Status) -> EnvironmentError {
+    match status.code() {
+        Code::PermissionDenied | Code::Unauthenticated => {
+            EnvironmentError::Invalid("Volume request credentials rejected".into())
+        }
+        Code::NotFound => EnvironmentError::NotFound,
+        _ => map_status(status, true),
+    }
+}
+
 fn map_delete_status(status: Status) -> EnvironmentError {
     if status.code() == Code::NotFound {
         EnvironmentError::NotFound
@@ -88,6 +118,27 @@ fn map_status(status: Status, write: bool) -> EnvironmentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn volume_refusals_are_terminal_and_transport_failures_remain_unknown() {
+        for status in [
+            Status::permission_denied("private"),
+            Status::unauthenticated("private"),
+        ] {
+            assert!(matches!(
+                map_volume_status(status),
+                EnvironmentError::Invalid(_)
+            ));
+        }
+        assert_eq!(
+            map_volume_status(Status::not_found("absent")),
+            EnvironmentError::NotFound
+        );
+        assert!(matches!(
+            map_volume_status(Status::unavailable("lost reply")),
+            EnvironmentError::OutcomeUnknown(_)
+        ));
+    }
+
     #[test]
     fn delete_absence_is_distinct_from_permission_and_unknown_outcomes() {
         assert_eq!(

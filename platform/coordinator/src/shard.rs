@@ -1,7 +1,7 @@
 use crate::{
     journal::MutationJournal,
     queue::{Entry, TenantQueue},
-    SchedulerConfig,
+    SchedulerConfig, VolumePlacement,
 };
 use adx_core::scheduling::{select_devices, Device, DeviceLedger};
 use adx_core::{Assignment, EnvironmentSpec, Error, ResourceLedger, Result};
@@ -135,6 +135,7 @@ impl ShardScheduler {
         spec: &EnvironmentSpec,
         snapshot: &Snapshot,
         failure: &mut adx_core::scheduling::SchedulingFailure,
+        placement: Option<&VolumePlacement>,
     ) -> Result<()> {
         let prepared = Prepared::new(spec, snapshot);
         for state in self.nodes.values() {
@@ -148,7 +149,7 @@ impl ShardScheduler {
                 max.memory_bytes = max.memory_bytes.max(value.memory_bytes);
                 max.disk_bytes = max.disk_bytes.max(value.disk_bytes);
             }
-            let reasons = self.framework.rejections(
+            let mut reasons = self.framework.rejections(
                 spec,
                 &Candidate {
                     node: &state.node,
@@ -158,6 +159,13 @@ impl ShardScheduler {
                     prepared: Some(&prepared),
                 },
             )?;
+            if let Some(placement) = placement {
+                if placement.waiting_for.is_some() {
+                    reasons.push("waiting_for_volume".into());
+                } else if !placement.nodes.contains(&state.node.id) {
+                    reasons.push("volume_topology".into());
+                }
+            }
             if reasons.is_empty() {
                 failure.eligible_nodes += 1;
             }
@@ -331,12 +339,18 @@ impl ShardScheduler {
         request: &EnvironmentSpec,
         snapshot: &Snapshot,
         excluded: &BTreeSet<String>,
+        placement: Option<&VolumePlacement>,
     ) -> Result<Option<(u64, String)>> {
+        if placement.is_some_and(|placement| placement.waiting_for.is_some()) {
+            return Ok(None);
+        }
         self.stats.query_preparations += 1;
         let prepared = Prepared::new(request, snapshot);
         let mut best: Option<(u64, String)> = None;
         for state in self.nodes.values() {
-            if excluded.contains(&state.node.id) {
+            if excluded.contains(&state.node.id)
+                || placement.is_some_and(|placement| !placement.allows(&state.node.id))
+            {
                 continue;
             }
             self.stats.candidate_evaluations += 1;
@@ -364,12 +378,16 @@ impl ShardScheduler {
         snapshot: &Snapshot,
         journal: &MutationJournal,
         config: &SchedulerConfig,
+        placement: Option<&VolumePlacement>,
     ) -> Result<Option<String>> {
+        if placement.is_some_and(|placement| placement.waiting_for.is_some()) {
+            return Ok(None);
+        }
         if config.candidate_cache_entries == 0
             || !self.framework.supports_aggregation(request, snapshot)
         {
             return Ok(self
-                .best_candidate(request, snapshot, &self.exclusions(&request.id))?
+                .best_candidate(request, snapshot, &self.exclusions(&request.id), placement)?
                 .map(|(_, id)| id));
         }
         let key = Signature::from(request);
@@ -426,10 +444,11 @@ impl ShardScheduler {
             .ranked
             .iter()
             .find(|(_, id)| {
-                !self
-                    .excluded
-                    .get(&request.id)
-                    .is_some_and(|ids| ids.contains(id))
+                placement.is_none_or(|placement| placement.allows(id))
+                    && !self
+                        .excluded
+                        .get(&request.id)
+                        .is_some_and(|ids| ids.contains(id))
             })
             .map(|(_, id)| id.clone()))
     }
@@ -442,12 +461,19 @@ impl ShardScheduler {
         snapshot: &Snapshot,
         journal: &MutationJournal,
         config: &SchedulerConfig,
+        placements: &BTreeMap<String, VolumePlacement>,
     ) -> Result<Attempt> {
         let Some(entry) = self.queue.pop_entry() else {
             return Ok(Attempt::Empty);
         };
         self.stats.attempts += 1;
-        let best = match self.select(&entry.spec, snapshot, journal, config) {
+        let best = match self.select(
+            &entry.spec,
+            snapshot,
+            journal,
+            config,
+            placements.get(&entry.spec.id),
+        ) {
             Ok(best) => best,
             Err(e) => {
                 self.queue.restore(entry);

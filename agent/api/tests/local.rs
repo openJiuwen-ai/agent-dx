@@ -184,13 +184,13 @@ async fn embedded_resolve_bypass_invalidates_warm_binding_before_backend_failure
         managed
             .resolve_with_cache(&context(), &scope(), Protocol::Http, None, true)
             .await,
-        Err(Error::Unavailable(_))
+        Err(Error::OutcomeUnknown(_))
     ));
     assert!(matches!(
         managed
             .resolve(&context(), &scope(), Protocol::Http, None)
             .await,
-        Err(Error::Unavailable(_))
+        Err(Error::OutcomeUnknown(_))
     ));
     backend.unavailable.store(false, Ordering::SeqCst);
     assert_eq!(

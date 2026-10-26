@@ -86,6 +86,7 @@ async fn network_create_preserves_tenant_session_and_api_key_checks() {
             .unwrap();
     }));
     let mut register = pb::RegisterNodeRequest {
+        storage_mounts: Default::default(),
         runtime_classes: vec![
             "runsc".into(),
             "runc".into(),
@@ -261,6 +262,7 @@ async fn create_retries_ready_delivery_and_lost_response_within_original_deadlin
         connect(ma, Principal::Node("node".into())).await,
     );
     let mut register = pb::RegisterNodeRequest {
+        storage_mounts: Default::default(),
         runtime_classes: vec!["runc".into()],
         session_id: "boot-1".into(),
         heartbeat_sequence: 1,

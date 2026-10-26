@@ -21,6 +21,8 @@ struct Config {
     node_id: String,
     #[serde(default)]
     labels: HashMap<String, String>,
+    #[serde(default)]
+    storage_mounts: std::collections::BTreeMap<String, adx_core::volumes::StorageMount>,
     listen: SocketAddr,
     advertised_address: String,
     proxy_address: String,
@@ -132,6 +134,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if config.runtime_control.is_none() {
         return Err("runtime_control is required for event-driven lifecycle observations".into());
+    }
+    for mount in config.storage_mounts.values() {
+        mount.validate()?;
     }
     let runtime_logs = RuntimeLogs::new(config.runtime_logs.clone())?;
     // Embedded Proxy and Adxlet share this process-wide subscriber and
@@ -344,6 +349,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         labels.insert("ADX_CHECKPOINT_STORAGE".into(), alias.into());
     }
     let registration = pb::RegisterNodeRequest {
+        storage_mounts: Default::default(),
         node_id: config.node_id.clone(),
         node_address: config.advertised_address,
         proxy_address: config.proxy_address,
@@ -401,7 +407,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match discovery.lookup().await {
                     Ok(found) if found.address != endpoint => {
                         let channel = coordinator_channel(&client_tls, &found.address, timeout)?;
-                        sink.reconnect(channel.clone());
+                        sink.reconnect(channel.clone())?;
                         coordinator =
                             pb::coordinator_service_client::CoordinatorServiceClient::new(channel);
                         endpoint = found.address;
@@ -411,15 +417,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             let mut r = last.clone();
-            // A failed capability refresh closes new admission, but existing
-            // executions and the heartbeat continue for reconciliation.
-            r.runtime_classes =
-                match tokio::time::timeout(sample_timeout, runtime.available_runtime_classes())
-                    .await
-                {
-                    Ok(Ok(classes)) => classes,
-                    _ => vec![],
-                };
+            // Observe storage and runtime capabilities concurrently so storage
+            // does not add another timeout period to the heartbeat path.
+            let (mounts, classes) = tokio::join!(
+                tokio::time::timeout(
+                    sample_timeout,
+                    adxlet::managed_mounts::mounted_storage(config.storage_mounts.clone()),
+                ),
+                tokio::time::timeout(sample_timeout, runtime.available_runtime_classes()),
+            );
+            // A failed storage observation withdraws only volume eligibility.
+            r.storage_mounts = match mounts {
+                Ok(Ok(mounts)) => mounts
+                    .into_iter()
+                    .map(|(id, mount)| (id, mount.into()))
+                    .collect(),
+                _ => Default::default(),
+            };
+            // A failed runtime observation closes new admission, while accepted
+            // executions and heartbeats continue through reconciliation.
+            r.runtime_classes = match classes {
+                Ok(Ok(classes)) => classes,
+                _ => vec![],
+            };
             manager.update_runtime_classes(r.runtime_classes.clone())?;
             if let Ok((o, valid)) = sample(&source, &runtime, sample_timeout).await {
                 valid_until = tokio::time::Instant::now() + valid;

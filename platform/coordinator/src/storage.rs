@@ -17,6 +17,7 @@ pub use observability::{
 };
 mod resume;
 mod snapshots;
+mod volumes;
 use crate::Node;
 use adx_core::{
     scheduling::validate_device_assignment, Assignment, EnvironmentRecord, EnvironmentSpec,
@@ -36,6 +37,10 @@ use std::{
 use tokio::{
     sync::{broadcast, Mutex},
     time::timeout,
+};
+pub(crate) use volumes::has_volumes;
+pub use volumes::{
+    AuthorizedExecution, Initialization, InitializationAction, InitializationOwner, StoredVolume,
 };
 
 const HEADER: &str = "header";
@@ -64,11 +69,20 @@ return 1
 const RETIRE_ENVIRONMENT: &str = r#"
 if redis.call('HGET', KEYS[1], 'epoch') ~= ARGV[1] then return 0 end
 if redis.call('HGET', KEYS[1], ARGV[3]) ~= ARGV[4] then return 0 end
+if ARGV[8] ~= '' and redis.call('HGET',KEYS[1],'header') ~= ARGV[8] then return 0 end
 local facts = cjson.decode(ARGV[7])
 if (redis.call('HGET',KEYS[3],facts[1]) or '') ~= facts[2] then return 0 end
 redis.call('SET', KEYS[2], ARGV[5], 'PX', ARGV[6])
 redis.call('HSET',KEYS[3],facts[1],facts[3])
 redis.call('HDEL', KEYS[1], ARGV[3])
+if ARGV[8] ~= '' then
+  redis.call('HSET',KEYS[1],'header',ARGV[9])
+  redis.call('HSET',KEYS[5],ARGV[10],ARGV[11])
+end
+for i=13,#ARGV,2 do
+  if ARGV[i+1] == '' then redis.call('HDEL',KEYS[4],ARGV[i])
+  else redis.call('HSET',KEYS[4],ARGV[i],ARGV[i+1]) end
+end
 return 1
 "#;
 const ATTEMPTS: usize = 32;
@@ -151,6 +165,8 @@ pub struct StoredEnvironment {
     #[serde(default)]
     pub last_interruption: Option<InterruptionSummary>,
     #[serde(default)]
+    pub volume_execution: Option<volumes::AuthorizedExecution>,
+    #[serde(default)]
     pub resume: Option<ResumeIntent>,
     /// Durable age of a terminal failure; retries and Coordinator restarts do not reset it.
     #[serde(default)]
@@ -215,11 +231,22 @@ impl StoredEnvironment {
         }
     }
     pub fn resources_held(&self) -> bool {
+        if !self.invalidated
+            && self.volume_execution.as_ref().is_some_and(|execution| {
+                !execution.released
+                    && self
+                        .result
+                        .as_ref()
+                        .is_none_or(|result| result.runtime.id != execution.runtime_id)
+            })
+        {
+            return true;
+        }
         (!self.invalidated && self.recovery.as_ref().is_some_and(|r| r.pending))
             || self.result.as_ref().is_none_or(|r| r.resources_held)
     }
     pub(crate) fn effective_record(&self) -> EnvironmentRecord {
-        self.result.clone().unwrap_or_else(|| EnvironmentRecord {
+        let mut record = self.result.clone().unwrap_or_else(|| EnvironmentRecord {
             observation: None,
             execution_artifacts: vec![],
             snapshot_source: None,
@@ -237,7 +264,19 @@ impl StoredEnvironment {
             resources_held: true,
             checkpoint: None,
             last_operation: None,
-        })
+        });
+        if let Some(execution) = &self.volume_execution {
+            if !self.invalidated && !execution.released && record.runtime.id != execution.runtime_id
+            {
+                record.runtime.id = execution.runtime_id.clone();
+                record.runtime.ip = None;
+                record.state = EnvironmentState::Pending;
+                record.revision = execution.revision.saturating_sub(1);
+                record.resources_held = true;
+                record.last_operation = None;
+            }
+        }
+        record
     }
     fn validate(&self) -> Result<()> {
         self.spec.validate()?;
@@ -253,6 +292,17 @@ impl StoredEnvironment {
             if r.spec != self.spec || r.assignment != self.assignment {
                 return Err(Error::Conflict);
             }
+        }
+        if self.volume_execution.as_ref().is_some_and(|execution| {
+            execution.revision == 0
+                || execution.node_session_id.is_empty()
+                || !adx_core::valid_runtime_id(
+                    &self.spec.id,
+                    self.assignment.generation,
+                    &execution.runtime_id,
+                )
+        }) {
+            return Err(Error::Conflict);
         }
         Ok(())
     }
@@ -316,6 +366,9 @@ impl StoredSnapshot {
                     .as_ref()
                     .filter(|r| {
                         r.state == EnvironmentState::Running
+                            && i.volume_execution.as_ref().is_none_or(|execution| {
+                                !execution.released && execution.runtime_id == r.runtime.id
+                            })
                             && self.nodes[&r.assignment.node_id]
                                 .session
                                 .as_ref()
@@ -769,29 +822,48 @@ impl RedisStore {
         _expected_header: &str,
         expected_environment: &str,
         header: &Header,
-        field: &str,
         receipt: &DeletedReceipt,
         counters: &CounterUpdate,
+        catalog: Option<&volumes::Catalog>,
     ) -> Result<bool> {
+        let field = format!("environment:{}", receipt.environment_id);
         let mut cmd = redis::cmd("EVAL");
         cmd.arg(RETIRE_ENVIRONMENT)
-            .arg(3)
+            .arg(5)
             .arg(&self.key)
             .arg(self.deleted_receipt_key(&receipt.environment_id))
             .arg(format!("{}:business", self.key))
+            .arg(format!("{}:volumes", self.key))
+            .arg(format!("{}:volume-references", self.key))
             .arg(header.epoch.to_string())
             .arg(encode(header)?)
-            .arg(field)
+            .arg(&field)
             .arg(expected_environment)
             .arg(encode(receipt)?)
             .arg(DELETED_RECEIPT_TTL.as_millis() as u64)
             .arg(counters.argument()?);
+        if let Some(catalog) = catalog {
+            cmd.arg(&catalog.header_value)
+                .arg(encode(&catalog.advanced_header()?)?)
+                .arg(&receipt.environment_id)
+                .arg(catalog.reference_value(&receipt.environment_id)?);
+            catalog.append_writes(&mut cmd)?;
+        } else {
+            cmd.arg("").arg("").arg("").arg("").arg(0);
+        }
         let applied: u8 = self.query(cmd).await?;
         if applied == 2 {
             return Err(Error::Conflict);
         }
         if applied == 1 {
-            self.notify_committed_change(header.revision, vec![field.to_owned()]);
+            let changed = std::iter::once(field.to_owned())
+                .chain(
+                    catalog
+                        .into_iter()
+                        .flat_map(volumes::Catalog::change_fields),
+                )
+                .collect();
+            self.notify_committed_change(header.revision, changed);
         }
         Ok(applied == 1)
     }
@@ -1400,17 +1472,59 @@ impl Session {
                 self.observe_node(record.clone());
                 return Ok(record);
             }
-            if self
-                .store
-                .object_cas(
-                    header_value
-                        .as_deref()
-                        .expect("validated control header is present"),
-                    &header,
-                    Some((&field, node_value.as_deref(), encoded)),
-                )
-                .await?
+            let mut fields = vec![(field.clone(), encoded.clone())];
+            let catalog = if let Some((previous, next)) = previous
+                .as_ref()
+                .and_then(|node| node.session.as_ref())
+                .zip(record.session.as_ref())
+                .filter(|(previous, next)| previous.id != next.id)
             {
+                let mut catalog = self.volume_catalog().await?;
+                if Some(&catalog.header_value) != header_value.as_ref() {
+                    continue;
+                }
+                let environments = snapshot(&catalog.control)?.environments;
+                if catalog.control.get(&field) != node_value.as_ref() {
+                    continue;
+                }
+                for mut environment in environments.into_values().filter(|environment| {
+                    environment.assignment.node_id == record.node.id
+                        && !environment.invalidated
+                        && volumes::has_volumes(&environment.spec)
+                }) {
+                    catalog.rebind_execution_session(&mut environment, &previous.id, &next.id)?;
+                    fields.push((
+                        format!("environment:{}", environment.spec.id),
+                        encode(&environment)?,
+                    ));
+                }
+                Some(catalog)
+            } else {
+                None
+            };
+            let expected = header_value.as_deref().ok_or(Error::Conflict)?;
+            let applied = match catalog {
+                Some(catalog) => {
+                    self.control_volume_cas(
+                        expected,
+                        &catalog.advanced_header()?,
+                        &fields,
+                        &catalog,
+                        None,
+                    )
+                    .await?
+                }
+                None => {
+                    self.store
+                        .object_cas(
+                            expected,
+                            &header,
+                            Some((&field, node_value.as_deref(), encoded)),
+                        )
+                        .await?
+                }
+            };
+            if applied {
                 self.observe_node(record.clone());
                 return Ok(record);
             }
@@ -1478,6 +1592,7 @@ impl Session {
         assignment: Assignment,
         request_id: &str,
     ) -> Result<StoredEnvironment> {
+        self.pin_volumes(&spec).await?;
         if let Some(id) = &spec.snapshot_id {
             let snapshot = self.get_snapshot(id).await?;
             if snapshot.template.tenant_id != spec.tenant_id
@@ -1494,6 +1609,7 @@ impl Session {
             creation_generation: assignment.generation,
             creation: Some(CreationSummary::new(request_id)?),
             last_interruption: None,
+            volume_execution: None,
             resume: None,
             failed_since_unix_seconds: None,
             recovery: None,
@@ -1530,16 +1646,19 @@ impl Session {
             if node.shard_id != record.assignment.shard_id {
                 return Err(Error::Conflict);
             }
+            let catalog = if volumes::has_volumes(&record.spec) {
+                let mut catalog = self.volume_catalog().await?;
+                if Some(&catalog.header_value) != header_value.as_ref() {
+                    continue;
+                }
+                catalog.reserve(&record, &node)?;
+                Some(catalog)
+            } else {
+                None
+            };
 
             if self
-                .store
-                .object_cas(
-                    header_value
-                        .as_deref()
-                        .expect("validated control header is present"),
-                    &header,
-                    Some((&field, None, encode(&record)?)),
-                )
+                .assignment_cas(&header, None, &record, catalog.as_ref(), None)
                 .await?
             {
                 return Ok(record);
@@ -1591,22 +1710,32 @@ impl Session {
             if node.shard_id != replacement.shard_id {
                 return Err(Error::Conflict);
             }
+            let mut catalog = if volumes::has_volumes(&stored_environment.spec) {
+                let mut catalog = self.volume_catalog().await?;
+                if Some(&catalog.header_value) != header_value.as_ref() {
+                    continue;
+                }
+                let source = self.get_node(&previous.node_id).await?;
+                catalog.retire_unstarted(&stored_environment, &source)?;
+                Some(catalog)
+            } else {
+                None
+            };
             stored_environment.assignment = replacement.clone();
+            stored_environment.volume_execution = None;
             stored_environment.result = None;
             stored_environment.validate()?;
+            if let Some(catalog) = &mut catalog {
+                catalog.reserve(&stored_environment, &node)?;
+            }
 
             if self
-                .store
-                .object_cas(
-                    header_value
-                        .as_deref()
-                        .expect("validated control header is present"),
+                .assignment_cas(
                     &header,
-                    Some((
-                        &field,
-                        environment_value.as_deref(),
-                        encode(&stored_environment)?,
-                    )),
+                    environment_value.as_deref(),
+                    &stored_environment,
+                    catalog.as_ref(),
+                    None,
                 )
                 .await?
             {
@@ -1629,6 +1758,44 @@ impl Session {
         &self,
         result: EnvironmentRecord,
     ) -> Result<CommittedEnvironment> {
+        self.commit_releasing_with_state(result, "", &[]).await
+    }
+
+    /// Publish the result and explicitly confirmed stopped attempts in one CAS.
+    /// Releasing compute capacity alone does not release a Volume.
+    pub async fn commit_releasing(
+        &self,
+        result: EnvironmentRecord,
+        session: &str,
+        stopped: &[String],
+    ) -> Result<EnvironmentRecord> {
+        Ok(self
+            .commit_releasing_with_state(result, session, stopped)
+            .await?
+            .result)
+    }
+
+    pub(crate) async fn commit_releasing_with_state(
+        &self,
+        result: EnvironmentRecord,
+        session: &str,
+        stopped: &[String],
+    ) -> Result<CommittedEnvironment> {
+        if !stopped.is_empty()
+            && (session.is_empty()
+                || stopped.len() > 1024
+                || stopped.iter().any(|runtime| {
+                    !adx_core::valid_runtime_id(
+                        &result.spec.id,
+                        result.assignment.generation,
+                        runtime,
+                    )
+                }))
+        {
+            return Err(Error::Invalid(
+                "invalid stopped execution identities".into(),
+            ));
+        }
         if let Some(source) = &result.snapshot_source {
             let snapshot = self
                 .get_snapshot(result.spec.snapshot_id.as_deref().ok_or(Error::Conflict)?)
@@ -1667,6 +1834,7 @@ impl Session {
             let mut stored_environment: StoredEnvironment = decode(environment_value)?;
             if !(next_result(&stored_environment, &result)?
                 || result.state == EnvironmentState::Running && stored_environment.resume.is_some())
+                && stopped.is_empty()
             {
                 self.store.notify_committed_change(0, vec![field.clone()]);
                 return Ok(CommittedEnvironment {
@@ -1674,6 +1842,24 @@ impl Session {
                     stored: Some(stored_environment),
                 });
             }
+            let catalog = if volumes::has_volumes(&result.spec) {
+                let mut catalog = self.volume_catalog().await?;
+                if Some(&catalog.header_value) != header_value.as_ref() {
+                    continue;
+                }
+                catalog.apply_result(&result, session, stopped)?;
+                if let Some(execution) = &mut stored_environment.volume_execution {
+                    if !result.resources_held
+                        && execution.node_session_id == session
+                        && stopped.contains(&execution.runtime_id)
+                    {
+                        execution.released = true;
+                    }
+                }
+                Some(catalog)
+            } else {
+                None
+            };
             if result.state != EnvironmentState::Paused {
                 stored_environment.resume = None;
                 if let Some(recovery) = &mut stored_environment.recovery {
@@ -1700,23 +1886,20 @@ impl Session {
                         expected_header,
                         environment_value,
                         &header,
-                        &field,
                         &DeletedReceipt::from_result(&result)?,
                         &counters,
+                        catalog.as_ref(),
                     )
                     .await?
             } else {
-                self.store
-                    .object_cas_with_counters(
-                        &header,
-                        Some((
-                            &field,
-                            Some(environment_value),
-                            encode(&stored_environment)?,
-                        )),
-                        Some(&counters),
-                    )
-                    .await?
+                self.assignment_cas(
+                    &header,
+                    Some(environment_value),
+                    &stored_environment,
+                    catalog.as_ref(),
+                    Some(&counters),
+                )
+                .await?
             };
             if applied {
                 stored_environment.log_observation_change(previous_observation.as_ref());

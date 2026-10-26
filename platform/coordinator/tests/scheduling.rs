@@ -48,6 +48,73 @@ fn node(id: &str, capacity: u64) -> Node {
 }
 
 #[test]
+fn volume_waiting_skips_a_high_priority_request_and_release_wakes_it() {
+    use adx_coordinator::VolumePlacement;
+    let mut coordinator = Coordinator::new(1, Placement::Pack).unwrap();
+    coordinator.register(node("n1", 4)).unwrap();
+    coordinator.submit(spec("blocked", "t", 10)).unwrap();
+    coordinator.set_volume_placement(
+        "blocked",
+        VolumePlacement {
+            storage_domains: Default::default(),
+            nodes: ["n1".into()].into(),
+            waiting_for: Some("uid".into()),
+        },
+    );
+    coordinator.submit(spec("other", "t", 0)).unwrap();
+    let round = coordinator.schedule_round(0).unwrap();
+    assert_eq!(round.assignments.len(), 1);
+    assert_eq!(round.assignments[0].environment_id, "other");
+    assert_eq!(coordinator.pending(0).unwrap(), 1);
+    assert_eq!(
+        coordinator
+            .scheduling_failure(&spec("blocked", "t", 10))
+            .unwrap()
+            .rejections
+            .get("waiting_for_volume"),
+        Some(&1)
+    );
+    coordinator.set_volume_placement(
+        "blocked",
+        VolumePlacement {
+            storage_domains: Default::default(),
+            nodes: ["n1".into()].into(),
+            waiting_for: None,
+        },
+    );
+    let shard = coordinator.take_ready_shard().unwrap();
+    assert_eq!(
+        coordinator.schedule(shard).unwrap().unwrap().environment_id,
+        "blocked"
+    );
+}
+
+#[test]
+fn volume_topology_filters_local_and_cached_central_candidates_per_request() {
+    use adx_coordinator::VolumePlacement;
+    let mut coordinator = Coordinator::new(1, Placement::Spread).unwrap();
+    coordinator.register(node("n1", 4)).unwrap();
+    coordinator.register(node("n2", 4)).unwrap();
+    let restricted = spec("restricted", "t", 10);
+    coordinator.set_volume_placement(
+        &restricted.id,
+        VolumePlacement {
+            storage_domains: Default::default(),
+            nodes: ["n2".into()].into(),
+            waiting_for: None,
+        },
+    );
+    assert!(!coordinator.local_candidate(&restricted, "n1", &[]).unwrap());
+    assert!(coordinator.local_candidate(&restricted, "n2", &[]).unwrap());
+    coordinator.submit(restricted).unwrap();
+    coordinator.submit(spec("other", "t", 0)).unwrap();
+    let round = coordinator.schedule_round(0).unwrap();
+    assert_eq!(round.assignments.len(), 2);
+    assert_eq!(round.assignments[0].node_id, "n2");
+    assert_eq!(round.assignments[1].node_id, "n1");
+}
+
+#[test]
 fn global_round_robin_shards_and_balanced_node_registration() {
     let mut coordinator = Coordinator::new(2, Placement::Spread).unwrap();
     assert_eq!(coordinator.register(node("n1", 2)).unwrap(), 0);
@@ -294,4 +361,51 @@ fn local_candidate_obeys_hard_constraints_and_occupancy_without_global_score() {
     let mut too_large = spec("other", "t", 0);
     too_large.resources.cpu_millis = 2;
     assert!(!coordinator.local_candidate(&too_large, "n2", &[]).unwrap());
+}
+
+#[test]
+fn queued_volume_request_uses_a_newly_accessible_node_on_another_shard() {
+    use adx_coordinator::VolumePlacement;
+    let mut coordinator = Coordinator::new(2, Placement::Pack).unwrap();
+    assert_eq!(coordinator.register(node("a", 0)).unwrap(), 0);
+    assert_eq!(coordinator.register(node("b", 0)).unwrap(), 1);
+    // Rotate the second request into b's shard before c exists.
+    assert_eq!(coordinator.submit(spec("unrelated", "t", 0)).unwrap(), 0);
+    assert_eq!(coordinator.submit(spec("waiting", "t", 0)).unwrap(), 1);
+    coordinator.set_volume_placement(
+        "waiting",
+        VolumePlacement {
+            storage_domains: ["sfs".into()].into(),
+            nodes: ["a".into(), "b".into()].into(),
+            waiting_for: None,
+        },
+    );
+    while let Some(shard) = coordinator.take_ready_shard() {
+        assert!(coordinator
+            .schedule_round(shard)
+            .unwrap()
+            .assignments
+            .is_empty());
+    }
+    assert_eq!(coordinator.register(node("c", 4)).unwrap(), 0);
+    coordinator.set_volume_placement(
+        "waiting",
+        VolumePlacement {
+            storage_domains: ["sfs".into()].into(),
+            nodes: ["c".into()].into(),
+            waiting_for: None,
+        },
+    );
+    let mut assignments = Vec::new();
+    while let Some(shard) = coordinator.take_ready_shard() {
+        assignments.extend(coordinator.schedule_round(shard).unwrap().assignments);
+    }
+    assert_eq!(assignments.len(), 2);
+    let assigned = assignments
+        .iter()
+        .find(|a| a.environment_id == "waiting")
+        .unwrap();
+    assert_eq!(assigned.node_id, "c");
+    assert_eq!(assigned.shard_id, 0);
+    assert!(coordinator.pending_requests().is_empty());
 }

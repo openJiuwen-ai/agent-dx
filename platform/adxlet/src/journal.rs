@@ -7,7 +7,20 @@ use rusqlite::{params, Connection};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 
-type Entry = (i64, EnvironmentRecord);
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct Pending {
+    #[serde(flatten)]
+    record: EnvironmentRecord,
+    #[serde(default)]
+    stopped_runtime_ids: Vec<String>,
+}
+impl std::ops::Deref for Pending {
+    type Target = EnvironmentRecord;
+    fn deref(&self) -> &Self::Target {
+        &self.record
+    }
+}
+type Entry = (i64, Pending);
 
 pub struct JournalSink {
     path: PathBuf,
@@ -103,8 +116,15 @@ impl JournalSink {
         .await
     }
 
-    async fn append(&self, record: &EnvironmentRecord) -> Result<Durability> {
-        let record = record.clone();
+    async fn append(
+        &self,
+        record: &EnvironmentRecord,
+        stopped_runtime_ids: &[String],
+    ) -> Result<Durability> {
+        let record = Pending {
+            record: record.clone(),
+            stopped_runtime_ids: stopped_runtime_ids.to_vec(),
+        };
         self.database(true, move |connection| {
             let mut connection = connection.ok_or_else(|| unavailable("missing database"))?;
             let tx = connection.transaction().map_err(unavailable)?;
@@ -114,9 +134,9 @@ impl JournalSink {
                 rows.next().map_err(unavailable)?.map(|row| row.get::<_,String>(0)).transpose().map_err(unavailable)?
             };
             if let Some(previous) = previous {
-                let old: EnvironmentRecord = serde_json::from_str(&previous).map_err(unavailable)?;
+                let old: Pending = serde_json::from_str(&previous).map_err(unavailable)?;
                 if old == record { return Ok(Durability::Journaled); }
-                if old.assignment != record.assignment || old.spec != record.spec || old.revision >= record.revision {
+                if old.record != record.record && (old.assignment != record.assignment || old.spec != record.spec || old.revision >= record.revision) {
                     return Err(Error::Conflict);
                 }
             }
@@ -140,7 +160,12 @@ impl JournalSink {
 
     async fn publish(&self, entries: Vec<Entry>) -> Result<()> {
         for (sequence, record) in entries {
-            if self.upstream.commit(&record).await? != Durability::Published {
+            if self
+                .upstream
+                .commit_releasing(&record.record, &record.stopped_runtime_ids)
+                .await?
+                != Durability::Published
+            {
                 return Err(unavailable("upstream did not publish result"));
             }
             self.acknowledge(sequence).await?;
@@ -163,18 +188,25 @@ impl JournalSink {
                 Some(current)
                     if current.assignment == record.assignment
                         && current.spec == record.spec
-                        && !(matches!(
+                        && (!matches!(
                             current.state,
                             adx_core::EnvironmentState::Failed
                                 | adx_core::EnvironmentState::Deleted
-                        ) && !current.resources_held
-                            && !current.restart_pending) =>
+                        ) || current.resources_held
+                            || current.restart_pending
+                            || !record.stopped_runtime_ids.is_empty()) =>
                 {
-                    if current.revision == record.revision && current != &record {
+                    if current.revision == record.revision && current != &record.record {
                         return Err(Error::Conflict);
                     }
-                    if current.revision < record.revision
-                        && self.upstream.commit(&record).await? != Durability::Published
+                    if (current.revision < record.revision
+                        || current.revision == record.revision
+                            && !record.stopped_runtime_ids.is_empty())
+                        && self
+                            .upstream
+                            .commit_releasing(&record.record, &record.stopped_runtime_ids)
+                            .await?
+                            != Durability::Published
                     {
                         return Err(unavailable("recovery result is not published"));
                     }
@@ -200,6 +232,47 @@ impl JournalSink {
 #[async_trait]
 impl StateSink for JournalSink {
     async fn commit(&self, record: &EnvironmentRecord) -> Result<Durability> {
+        self.commit_releasing(record, &[]).await
+    }
+
+    async fn prepare_execution(
+        &self,
+        record: &EnvironmentRecord,
+        previous_runtime_id: &str,
+    ) -> Result<adx_core::EnvironmentSpec> {
+        if !record
+            .spec
+            .execution
+            .mounts
+            .iter()
+            .any(|mount| matches!(mount.source, adx_core::execution::MountSource::Volume(_)))
+        {
+            return Ok(record.spec.clone());
+        }
+        let ready = self.ready.read().await;
+        if !*ready {
+            return Err(unavailable("authoritative recovery required"));
+        }
+        let serial = self
+            .environments
+            .lock()
+            .await
+            .entry(record.spec.id.clone())
+            .or_default()
+            .clone();
+        let _serial = serial.lock().await;
+        self.publish(self.entries(Some(record.spec.id.clone())).await?)
+            .await?;
+        self.upstream
+            .prepare_execution(record, previous_runtime_id)
+            .await
+    }
+
+    async fn commit_releasing(
+        &self,
+        record: &EnvironmentRecord,
+        stopped_runtime_ids: &[String],
+    ) -> Result<Durability> {
         let ready = self.ready.read().await;
         if !*ready {
             return Err(unavailable("authoritative recovery required"));
@@ -214,7 +287,7 @@ impl StateSink for JournalSink {
         let _serial = serial.lock().await;
         let pending = self.entries(Some(record.spec.id.clone())).await?;
         if let Some((_, latest)) = pending.last() {
-            if latest != record
+            if &latest.record != record
                 && (latest.assignment != record.assignment
                     || latest.spec != record.spec
                     || latest.revision >= record.revision)
@@ -224,12 +297,18 @@ impl StateSink for JournalSink {
         }
         let result = self.publish(pending).await;
         match result {
-            Ok(()) => match self.upstream.commit(record).await {
+            Ok(()) => match self
+                .upstream
+                .commit_releasing(record, stopped_runtime_ids)
+                .await
+            {
                 Ok(Durability::Published) => Ok(Durability::Published),
-                Err(Error::Unavailable(_)) | Ok(Durability::Journaled) => self.append(record).await,
+                Err(Error::Unavailable(_)) | Ok(Durability::Journaled) => {
+                    self.append(record, stopped_runtime_ids).await
+                }
                 Err(error) => Err(error),
             },
-            Err(Error::Unavailable(_)) => self.append(record).await,
+            Err(Error::Unavailable(_)) => self.append(record, stopped_runtime_ids).await,
             Err(error) => Err(error),
         }
     }

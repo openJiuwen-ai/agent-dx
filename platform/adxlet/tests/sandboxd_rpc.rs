@@ -364,7 +364,7 @@ fn local_bind_mount_includes_the_oci_bind_flag() {
         kind: "bind".into(),
         target: "/workspace".into(),
         options: vec!["rw".into(), "nosuid".into()],
-        source: adx_core::execution::StorageSource::Local("/shared/workspace".into()),
+        source: adx_core::execution::StorageSource::Local("/shared/workspace".into()).into(),
     });
     let request = start_request(&spec, "i-1", 1, &[], &Config::default()).unwrap();
     let mount = request
@@ -390,7 +390,7 @@ fn kata_start_preserves_explicit_terminal_mount() {
         kind: "bind".into(),
         target: "/dev/pts".into(),
         options: vec!["rbind".into()],
-        source: adx_core::execution::StorageSource::Local("/runtime/pts".into()),
+        source: adx_core::execution::StorageSource::Local("/runtime/pts".into()).into(),
     });
     let request = start_request(&spec, "i-1", 1, &[], &Config::default()).unwrap();
     let mounts: Vec<_> = request
@@ -440,7 +440,8 @@ fn start_maps_public_environment_contract_to_backend_protocol() {
                 object: "workspace.erofs".into(),
                 access_key_id: "key".into(),
                 access_key_secret: "secret".into(),
-            }),
+            })
+            .into(),
         }],
         network: Some(model::NetworkPolicy {
             traffic: Some(model::TrafficPolicy {

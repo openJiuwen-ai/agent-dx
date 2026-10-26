@@ -28,7 +28,7 @@ fn environment_options_roundtrip_preserves_backend_contract() {
             kind: "bind".into(),
             target: "/workspace".into(),
             options: vec!["ro".into()],
-            source: model::StorageSource::Image("registry.example/tools:v1".into()),
+            source: model::StorageSource::Image("registry.example/tools:v1".into()).into(),
         }],
         network: Some(model::NetworkPolicy {
             traffic: Some(model::TrafficPolicy {
@@ -199,7 +199,7 @@ fn local_directory_creation_survives_mount_protocol_roundtrip() {
         kind: "bind".into(),
         target: "/data".into(),
         options: vec!["rw".into()],
-        source: model::StorageSource::Local("/mnt/sfs/workspaces/user".into()),
+        source: model::StorageSource::Local("/mnt/sfs/workspaces/user".into()).into(),
         create_if_missing: true,
         create_options: Some(model::CreateOptions {
             uid: 10001,

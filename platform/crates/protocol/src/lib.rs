@@ -3,6 +3,7 @@ mod admission;
 pub use admission::{scheduling_deadline, scheduling_failure};
 mod runtime_profile;
 mod snapshots;
+mod volumes;
 pub mod control {
     tonic::include_proto!("adx.control.v1");
 }
@@ -300,6 +301,10 @@ pub fn status(error: adx_core::Error) -> tonic::Status {
         Error::Conflict => tonic::Status::failed_precondition("identity or version conflict"),
         Error::NotFound => tonic::Status::not_found("environment or node not found"),
         Error::NoCapacity => tonic::Status::resource_exhausted("capacity unavailable"),
+        Error::VolumeBusy(uid) => tonic::Status::with_details(
+            tonic::Code::ResourceExhausted, "waiting for Volume",
+            serde_json::json!({"code":"WAITING_FOR_VOLUME", "volume_uid":uid}).to_string().into_bytes().into(),
+        ),
         Error::Unavailable(message) => tonic::Status::unavailable(message),
         Error::ResponseTimeout(message) => tonic::Status::deadline_exceeded(message),
         Error::DeadlineExceeded(message) => {
@@ -329,6 +334,21 @@ pub fn status(error: adx_core::Error) -> tonic::Status {
     }
 }
 pub fn dependency_status(status: tonic::Status) -> Error {
+    if status.code() == tonic::Code::ResourceExhausted {
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(status.details()) {
+            if value["code"] == "WAITING_FOR_VOLUME" {
+                if let Some(uid) = value["volume_uid"].as_str() {
+                    let reference = adx_core::volumes::VolumeRef {
+                        id: uid.into(),
+                        uid: None,
+                    };
+                    if reference.validate().is_ok() {
+                        return Error::VolumeBusy(uid.into());
+                    }
+                }
+            }
+        }
+    }
     if let Some(failure) = deadline_failure(&status) {
         return Error::DeadlineExceeded(failure.message);
     }

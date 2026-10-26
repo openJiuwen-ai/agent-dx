@@ -391,11 +391,20 @@ impl Operations {
                         Kind::Snapshot => {
                             let snapshot = snapshot
                                 .as_ref()
-                                .filter(|snapshot| {
-                                    snapshot.state == pb::SnapshotState::Ready as i32
-                                        && snapshot.template == record.spec
-                                })
                                 .ok_or_else(|| Status::data_loss("invalid snapshot source"))?;
+                            let saved: adx_core::snapshots::Snapshot =
+                                snapshot.clone().try_into().map_err(adx_protocol::status)?;
+                            let source: adx_core::EnvironmentSpec = record
+                                .spec
+                                .clone()
+                                .ok_or_else(|| Status::data_loss("snapshot source missing"))?
+                                .try_into()
+                                .map_err(adx_protocol::status)?;
+                            if saved.state != adx_core::snapshots::SnapshotState::Ready
+                                || !saved.matches_template(&source)
+                            {
+                                return Err(Status::data_loss("invalid snapshot source"));
+                            }
                             snapshot_value(snapshot, caller)?
                         }
                         Kind::Network => json!({"success": true}),

@@ -66,6 +66,7 @@ impl ExecutionSpec {
             lifecycle: self.lifecycle.clone(),
             service: self.service.clone(),
             mounts: self.mounts.clone(),
+            volumes: vec![],
             init_timeout_seconds: self.init_timeout_seconds,
             readiness_probe: self.readiness_probe.clone(),
             healthcheck: self.healthcheck.clone(),
@@ -167,6 +168,24 @@ pub struct EnvironmentInfo {
 }
 #[async_trait]
 pub trait Environment: Send + Sync {
+    async fn ensure_volume(
+        &self,
+        _tenant: &str,
+        _owner_id: &str,
+        _spec: &crate::volumes::VolumeSpec,
+    ) -> Result<crate::volumes::VolumeRef, EnvironmentError> {
+        Err(EnvironmentError::Unsupported(
+            "Volume management unavailable".into(),
+        ))
+    }
+    /// Called after confirmed deletion/absence; implementations release only this lifecycle's associations.
+    async fn release_volumes(
+        &self,
+        _tenant: &str,
+        _owner_id: &str,
+    ) -> Result<(), EnvironmentError> {
+        Ok(())
+    }
     async fn describe(
         &self,
         tenant: &str,

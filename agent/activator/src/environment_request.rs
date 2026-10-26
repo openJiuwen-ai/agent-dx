@@ -332,3 +332,24 @@ pub fn network_input(config: &SandboxNetworkPolicy) -> Result<Value, Environment
         json!({"schemaVersion":2,"traffic":{"ingressDefaultAction":"deny","egressDefaultAction":"deny","mode":"stateful","rules":rules}}),
     )
 }
+
+/// The persisted definition wins; only its stable reference enters the execution request.
+pub(crate) fn volume_reference(
+    value: &Value,
+    tenant: &str,
+    id: &str,
+) -> Result<adx_agent_core::volumes::VolumeRef, EnvironmentError> {
+    if value["spec"]["tenant_id"] != tenant || value["spec"]["id"] != id {
+        return Err(EnvironmentError::Conflict(
+            "Volume ensure identity mismatch".into(),
+        ));
+    }
+    let uid = value["uid"]
+        .as_str()
+        .filter(|uid| !uid.is_empty())
+        .ok_or_else(|| EnvironmentError::OutcomeUnknown("Volume ensure UID missing".into()))?;
+    Ok(adx_agent_core::volumes::VolumeRef {
+        id: id.into(),
+        uid: uid.into(),
+    })
+}

@@ -21,6 +21,8 @@ struct Bootstrap {
 #[serde(deny_unknown_fields)]
 struct Config {
     #[serde(default)]
+    storage_domains: std::collections::BTreeMap<String, adx_core::volumes::StorageDomain>,
+    #[serde(default)]
     checkpoint_reclaimers: Vec<adx_checkpoint_storage::reclaim::ReclaimerConfig>,
     listen: SocketAddr,
     #[serde(default)]
@@ -123,7 +125,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for store in config.checkpoint_reclaimers {
         reclaimers.insert(store.build()?)?;
     }
-    let rpc = rpc.with_reclaimers(reclaimers);
+    let rpc = rpc
+        .with_volume_domains(config.storage_domains)?
+        .with_reclaimers(reclaimers);
     let metrics_listener = match config.metrics_listen {
         Some(address) => Some(tokio::net::TcpListener::bind(address).await?),
         None => None,
@@ -215,6 +219,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.tls_config(tls)?;
     }
     let server = builder
+        .add_service(
+            pb::volume_execution_service_server::VolumeExecutionServiceServer::new(rpc.clone()),
+        )
+        .add_service(pb::volume_service_server::VolumeServiceServer::new(
+            rpc.clone(),
+        ))
         .add_service(pb::snapshot_service_server::SnapshotServiceServer::new(
             rpc.clone(),
         ))

@@ -98,3 +98,11 @@ cargo test --locked -p adx-activator --lib binding_cache_memory_profile -- --ign
 模板 lifecycle 的空闲窗口、pause retention/timeout/storage 映射到 `idleTimeoutSeconds`、`idleAction`、`pauseOptions`；默认策略不额外写入请求字段。生命周期状态只作为 Platform 观察值，不持久化到 AgentBinding。暂停相关状态返回稳定 Target，ready 仍为 false；真正的鉴权业务流由 Gateway EnsureRunning 唤醒。该行为对热缓存、冷缓存及 bypass 一致，不增加 Agent 自己的恢复控制器。配置与边界见 [自动暂停与按需恢复](../README.md#自动暂停与按需恢复)。
 
 激活请求的 parameters 为原始 URL 表单字节，由共享激活流程仅在 Binding 缺失时解析。已有 Binding 完全忽略输入；并发创建复用成功落库的参数。Template.env 与 mounts.host_path 使用持久化参数渲染。参数当前明文存储，无独立 prepare 或模型专用 launch 配置。
+
+Volume 定义、固定 UID、Binding 关联及迟到激活补偿见 [Agent 受管卷](../README.md#受管卷)。创建连接断开在原请求期限内查询原身份并退避重试；不增加持久化创建等待队列。
+
+Volume management retries preserve the saved Binding and original deadline.
+Explicit credential/request refusals, missing resources and returned identity
+conflicts fail immediately; transport ambiguity or a missing UID in an ensure
+success remains an unknown outcome. Volume IDs use 1–256 ASCII letters, digits,
+dots, underscores or hyphens, excluding the URL-normalized `.` and `..` segments.

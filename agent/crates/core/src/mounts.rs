@@ -1,4 +1,4 @@
-//! Template-local host mounts. Parameters carry no user or storage lifecycle semantics.
+//! Template bind mounts with inline host paths or stable Volume references.
 use crate::ValidationResult;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -23,7 +23,7 @@ pub struct CreateOptions {
 }
 
 impl CreateOptions {
-    fn validate(&self) -> ValidationResult {
+    pub(crate) fn validate(&self) -> ValidationResult {
         if self.uid == u32::MAX || self.gid == u32::MAX {
             return Err("create_options uid/gid must be below 4294967295".into());
         }
@@ -43,7 +43,12 @@ impl CreateOptions {
 pub struct Mount {
     #[serde(rename = "type")]
     pub kind: MountType,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub host_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_uid: Option<String>,
     pub target: String,
     #[serde(default)]
     pub options: Vec<String>,
@@ -60,7 +65,7 @@ pub(crate) fn parameter_name(name: &str) -> bool {
         && name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_')
 }
 
-fn relative_path(path: &str) -> ValidationResult {
+pub(crate) fn relative_path(path: &str) -> ValidationResult {
     if path.is_empty()
         || path.len() > MAX_PATH
         || path
@@ -168,6 +173,23 @@ impl Mount {
 
     /// Validate syntax at template publication without resolving parameters.
     pub fn validate_template(&self) -> ValidationResult {
+        if let Some(id) = &self.volume_id {
+            self.validate_options()?;
+            if !self.host_path.is_empty() || self.create_if_missing || self.create_options.is_some()
+            {
+                return Err(
+                    "Volume reference cannot include inline source or initialization".into(),
+                );
+            }
+            crate::volumes::volume_id(&crate::parameters::render(id, None)?)?;
+            if let Some(uid) = &self.volume_uid {
+                crate::volumes::identifier(uid)?;
+            }
+            return Ok(());
+        }
+        if self.volume_uid.is_some() {
+            return Err("volume_uid requires volume_id".into());
+        }
         if self.host_path.len() > MAX_PATH {
             return Err("mount path too long".into());
         }
@@ -177,8 +199,11 @@ impl Mount {
 
     /// Execution specs must contain only concrete paths, never unresolved placeholders.
     pub fn validate(&self) -> ValidationResult {
-        self.validate_options()?;
-        absolute_path(&self.host_path)
+        self.validate_template()?;
+        match &self.volume_id {
+            Some(id) => crate::volumes::volume_id(id),
+            None => absolute_path(&self.host_path),
+        }
     }
 
     /// Missing parameters or invalid paths fail before any Sandbox side effect.
@@ -190,7 +215,11 @@ impl Mount {
 
     pub(crate) fn render_validated(&self, parameters: &Parameters) -> Result<Self, String> {
         let mut result = self.clone();
-        result.host_path = self.render_path(Some(parameters))?;
+        if let Some(id) = &self.volume_id {
+            result.volume_id = Some(crate::parameters::render(id, Some(parameters))?);
+        } else {
+            result.host_path = self.render_path(Some(parameters))?;
+        }
         result.validate()?;
         Ok(result)
     }
