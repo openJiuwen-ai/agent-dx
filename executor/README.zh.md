@@ -40,17 +40,17 @@ pre-stop:    yr.agentexecutor.handler.pre_stop
 `0.0.0.0:18093`(可用环境变量 `YR_AGENT_EXECUTOR_HOST`/
 `YR_AGENT_EXECUTOR_PORT` 覆盖),但仅接受回环来源的请求。同机进程通过回环
 HTTP 创建、操作与销毁**远端子沙箱容器**——目标是独立的子容器,不是函数实例
-容器本身。沙箱不预创建:调用方先 `POST /api/sandbox/v1/sandboxes` 创建一个,
-拿到沙箱 id 后放入后续请求的 URL 路径;多个沙箱按 id 隔离,各自独立生命周期。
+容器本身。沙箱不预创建:调用方先 `POST /api/environment/v1/environments` 创建一个,
+拿到环境 id 后放入后续请求的 URL 路径;多个沙箱按 id 隔离,各自独立生命周期。
 
 本 API 遵循平台 yaml 契约(管理面 `sandbox.yaml` + 数据面 `data-plane.yaml`),
 由两族端点组成:
 
-- **管理面**——`POST /api/sandbox/v1/sandboxes`(创建)与
-  `DELETE /api/sandbox/v1/sandboxes/{sandboxId}`(删除)。成功响应为
+- **管理面**——`POST /api/environment/v1/environments`(创建)与
+  `DELETE /api/environment/v1/environments/{environmentId}`(删除)。成功响应为
   Envelope 形态(`data` 为 Base64 编码的 JSON);失败响应为 ErrorEnvelope
   形态。
-- **数据面**——`POST /direct/{instanceId}/invoke`,单一动作分发端点,携带
+- **数据面**——`POST /direct/{environmentId}/invoke`,单一动作分发端点,携带
   原生动作 JSON;action 级失败走 HTTP 200、错误在 body。
 
 旧前缀 `/v1/sandbox/sandboxes` **不再注册**:任何请求一律返回 404
@@ -109,10 +109,10 @@ HTTP 创建、操作与销毁**远端子沙箱容器**——目标是独立的�
   形态。action 级失败——分发已完成但操作本身失败(缺文件、RPC 失败等)——
   走 HTTP 200,错误在动作结果 body 内(见各 action)。
 
-### 1. 创建沙箱:`POST /api/sandbox/v1/sandboxes`
+### 1. 创建环境:`POST /api/environment/v1/environments`
 
 ```http
-POST /api/sandbox/v1/sandboxes HTTP/1.1
+POST /api/environment/v1/environments HTTP/1.1
 Content-Type: application/json
 X-Request-Id: req-create-013
 X-Trace-ID: trace-abc
@@ -143,7 +143,7 @@ X-Trace-ID: trace-abc
 | `memory` | int | 否 | 无 | 内存(MiB) |
 | `env` | object\<string,string\> | 否 | 继承沙箱运行时 | 环境变量;指定后整体生效(不与默认环境合并) |
 | `ports` | array\<string\> | 否 | 无 | 端口转发列表;元素为 `"proto:port"`(如 `"tcp:8080"`)或 `"port"` |
-| `idleTimeoutSeconds` | int | 否 | `300` | 空闲回收超时(秒);须非负(允许 0)。`idle_timeout` 为兼容别名 |
+| `idleTimeoutSeconds` | int | 否 | `0` | 空闲观察窗(秒),0 关闭空闲回收。`idle_timeout` 为兼容别名 |
 | `mounts` | array\<object\> | 否 | 无 | 挂载声明;原样并入 rootfs JSON 的 `mounts` 键透传后端。须搭配对象形态 `rootfs` 或 `image`(字符串 `rootfs` 不接受 mounts) |
 | `snapshotId` | string | 否 | 无 | 从快照创建:分流到恢复链路(`Sandbox(checkpoint_id=...)`),其余参数忽略 |
 | `tunnel` | object | 否 | 无 | `{enabled, proxyPort}`:`proxyPort` 接底层代理端口;`enabled=true` 须搭配 `extra_config.upstream`(否则 400);`enabled=false` 显式关断 upstream 隐含的隧道 |
@@ -165,14 +165,13 @@ X-Trace-ID: trace-abc
 `data` 明文:
 
 ```json
-{"sandboxId": "34420000-0000-4000-886a-980025037460",
- "instanceId": "34420000-0000-4000-886a-980025037460",
+{"environmentId": "34420000-0000-4000-886a-980025037460",
  "status": "running", "requestId": "req-create-013"}
 ```
 
-`sandboxId` 与 `instanceId` 同值(底层 create 返回的平台实例 id);
-`status` 恒为 `"running"`,`requestId` 为本次生效的请求 id。后续所有操作
-将该 id 放入 URL 路径。
+`environmentId` 即底层 create 返回的平台实例 id;`status` 恒为
+`"running"`,`requestId` 为本次生效的请求 id。后续所有操作将该 id 放入
+URL 路径。
 
 **失败响应**为 ErrorEnvelope 形态,例如:
 
@@ -183,16 +182,16 @@ X-Trace-ID: trace-abc
   (`Failed to initialize sandbox instance: ...`)。注意 `ports` 元素格式
   (`proto:port`)仅在创建时校验,非法元素同样表现为 500。
 
-### 2. 删除沙箱:`DELETE /api/sandbox/v1/sandboxes/{sandboxId}`
+### 2. 删除环境:`DELETE /api/environment/v1/environments/{environmentId}`
 
 ```http
-DELETE /api/sandbox/v1/sandboxes/34420000-0000-4000-886a-980025037460 HTTP/1.1
+DELETE /api/environment/v1/environments/34420000-0000-4000-886a-980025037460 HTTP/1.1
 X-Request-Id: req-del-007
 ```
 
 | 参数 | 类型 | 必填 | 说明 |
 |---|---|---|---|
-| `{sandboxId}`(路径) | string | 是 | 沙箱 id,即 create 返回的 `sandboxId`/`instanceId` |
+| `{environmentId}`(路径) | string | 是 | 环境 id,即 create 返回的 `environmentId` |
 | `X-Request-Id`(头) | string | 否 | 同创建,生成/回显 |
 
 无请求体。
@@ -212,7 +211,7 @@ X-Request-Id: req-del-007
            "requestId": "req-del-007"}}
 ```
 
-### 3. 运行时动作分发:`POST /direct/{instanceId}/invoke`
+### 3. 运行时动作分发:`POST /direct/{environmentId}/invoke`
 
 数据面单一端点分发受支持的动作。响应为原生动作 JSON(无 Envelope);
 action 级失败走 HTTP 200、错误在 body。
@@ -221,7 +220,7 @@ action 级失败走 HTTP 200、错误在 body。
 
 | 参数 | 位置 | 必填 | 默认值 | 说明 |
 |---|---|---|---|---|
-| `{instanceId}` | path | 是 | — | 沙箱实例 id |
+| `{environmentId}` | path | 是 | — | 环境实例 id |
 | `X-ADX-Request-ID` | header | 否 | 见 `requestId` | 请求标识(幂等键);优先级:头 > body.requestId > 服务端生成 UUID |
 | `X-Trace-ID` | header | 否 | `""` | 链路追踪(私有约定,契约外) |
 | `action` | body | 是 | — | 6 个受支持动作之一:`process.exec`、`process.run`、`file.read`、`file.write`、`file.list`、`file.search`;契约其余 action(含分块 `file.read_chunk`/`file.write_chunk`)一律返回 400 |
@@ -232,11 +231,11 @@ action 级失败走 HTTP 200、错误在 body。
 
 | args | 类型 | 必填 | 默认值 | 说明 |
 |---|---|---|---|---|
-| `cmd` | string | 与 `command` 二选一(`cmd` 优先) | 无 | shell 命令 |
-| `command` | string | 否 | 无 | `cmd` 别名 |
-| `cwd` | string | 否 | 无 | 工作目录(`working_dir` 别名同收) |
-| `envs` | object\<string,string\> | 否 | 无 | 环境变量(`env` 别名同收) |
-| `timeout` | number,≥0 | 否 | 不限 | 超时秒数 |
+| `cmd` | string 或 array\<string\> | 与 `command` 二选一(`cmd` 优先) | 无 | 命令;字符串经沙箱内 `/bin/sh -c` 执行,数组不经 shell 直接执行(契约外扩展) |
+| `command` | string 或 array\<string\> | 否 | 无 | `cmd` 的并列字段(契约默认空串) |
+| `cwd` | string | 否 | 无 | 工作目录(`working_dir` 并列同收);须已存在 |
+| `envs` | object\<string,string\> | 否 | 无 | 环境变量(`env` 并列同收);指定后整体替换默认环境 |
+| `timeout` | number,≥0 | 否 | 不限 | 超时秒数;0 为立即超时(契约语义) |
 
 ```json
 {"action": "process.exec", "args": {"cmd": "ls -la", "cwd": "/ws", "timeout": 300},
@@ -262,8 +261,9 @@ action 级失败走 HTTP 200、错误在 body。
 | args | 类型 | 必填 | 默认值 | 说明 |
 |---|---|---|---|---|
 | `path` | string | 是 | — | 目标路径 |
-| `data` | string | 是 | — | 内容;`binary=true` 时为 **hex** |
+| `data` | string | 是 | — | 内容(可为空串——写空文件);`binary=true` 时为 **hex** |
 | `binary` | bool | 否 | `false` | 编码选择,同 `file.read` |
+| `append` | bool | 否 | `false` | 追加而非截断(契约外扩展);与 `binary` 组合映射底层 `a`/`ab` |
 
 响应:`{"name": "a.txt", "path": "/ws/a.txt", "type": "file", "size": 5,
 "error": null}`。
@@ -273,7 +273,7 @@ action 级失败走 HTTP 200、错误在 body。
 | args | 类型 | 必填 | 默认值 | 说明 |
 |---|---|---|---|---|
 | `path` | string | 是 | — | 目录路径 |
-| `depth` | int | 否 | `1`(clamp 1–64) | 递归深度 |
+| `depth` | int | 否 | `1`(clamp 1–64) | 递归深度(返回相对深度 ≤ N 的条目) |
 
 响应条目对齐 execd 结构——`type` 为类别(`file`/`dir`)、`modified_time`
 为 unix 秒、`permissions` 恒 `null`(py 底层无权限数据;execd 实现返回
@@ -285,21 +285,30 @@ action 级失败走 HTTP 200、错误在 body。
               "modified_time": 1695441203.5}], "error": null}
 ```
 
-**action `file.search`**——文件名通配符递归搜索:
+**action `file.search`**——递归文件搜索:
 
 | args | 类型 | 必填 | 默认值 | 说明 |
 |---|---|---|---|---|
-| `path` | string | 是 | — | 搜索根目录 |
-| `pattern` | string | 是 | — | 文件名 fnmatch 通配符(如 `*.log`) |
-| `exclude_patterns` | array\<string\> | 否 | 无 | 排除模式(同为文件名 fnmatch) |
-| `depth` | int | 否 | `64`(clamp 1–64) | 递归深度上限,适配层按相对路径层数过滤 |
+| `path` | string | 是 | — | 搜索根目录;根不存在或非目录返回空结果 |
+| `pattern` | string | 否 | `*` | 大小写敏感的文件名或完整路径 glob,`*` 也匹配路径分隔符 |
+| `exclude_patterns` | array\<string\> | 否 | `[]` | 排除 glob,只过滤结果、不剪枝遍历 |
+| `depth` | int | 否 | `64`(clamp 1–64) | 递归深度上限,底层遍历按深度剪枝 |
+| `max_results` | int | 否 | `1000`(clamp 1–10000) | 结果条数上限,超出返回 HTTP 429 |
+| `max_entries` | int | 否 | `100000`(clamp 1–1000000) | 校验接受;py 底层不执行扫描上限,不触发 429 |
+| `timeout_ms` | int | 否 | `10000`(clamp 1–30000) | 校验接受;py 底层无搜索超时,不触发 408 |
 
-响应:`file.list` 形态的文件条目,仅含匹配文件。
+响应:`{"entries": [...], "scanned_entries": <int>, "error": null}`,条目为
+`file.list` 形态、按 path 排序,`scanned_entries` 为遍历遇到的条目数(文件
+与目录,不含根,受 `depth` 约束;子目录符号链接计入扫描但不跟随)。
+action 级失败(仍 200):`{"entries": [],
+"error_code": "FILESYSTEM_ERROR", "error": "search files failed: ..."}`;
+超出 `max_results` 返回 HTTP 429,体为
+`{"entries": [], "error_code": "RESOURCE_EXHAUSTED", "error": ...}`。
 
 ### 生命周期与回收
 
-- `sandboxId` 与 `instanceId` 同值(平台实例 id,UUID 形态);functionsystem
-  内部维护实例到物理沙箱的映射,调用方无需感知物理沙箱 id。
+- `environmentId` 即平台实例 id(UUID 形态);functionsystem 内部维护实例
+  到物理沙箱的映射,调用方无需感知物理沙箱 id。
 - 命名创建:设置 `name` 时,实例以运行时命名空间(`{ns}-{name}`)创建并
   寻址;适配层钉住 namespace,保证 create 侧注册与 invoke 侧寻址一致。
 - 创建同步阻塞:200 即就绪,500 即失败,无需轮询。

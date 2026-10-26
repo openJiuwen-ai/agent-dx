@@ -29,9 +29,9 @@ evolve separately. This module owns every sandbox concern:
 Two yaml-contract API families share this mixin, both loopback-only (the
 legacy ``/v1/sandbox/sandboxes`` prefix is not carried over to this branch):
 
-- management plane ``/api/sandbox/v1/sandboxes`` — Envelope + base64 success
-  bodies, ErrorEnvelope failures (sandbox.yaml contract);
-- data plane ``POST /direct/{instanceId}/invoke`` — single action-dispatch
+- management plane ``/api/environment/v1/environments`` — Envelope + base64
+  success bodies, ErrorEnvelope failures (environment.yaml contract);
+- data plane ``POST /direct/{environmentId}/invoke`` — single action-dispatch
   endpoint, raw action JSON, action-level failures ride HTTP 200
   (data-plane.yaml contract; args semantics mirror the execd runtime).
 
@@ -44,6 +44,7 @@ purpose, there is no ``SandboxRequestMixin`` without a
 from __future__ import annotations
 
 import base64
+import fnmatch
 import ipaddress
 import json
 import logging
@@ -60,9 +61,9 @@ _LOG = logging.getLogger(__name__)
 DEFAULT_MAX_SANDBOX_REQUEST_SIZE = 512 * 1024 * 1024
 DEFAULT_MAX_SANDBOX_RESPONSE_SIZE = 512 * 1024 * 1024
 
-# ── yaml 契约端点(管理面 sandbox.yaml + 数据面 data-plane.yaml)─────────────
+# ── yaml 契约端点(管理面 environment.yaml + 数据面 data-plane.yaml)──────────
 # 管理面:create/delete;成功响应 Envelope(data=base64 JSON),错误 ErrorEnvelope。
-MGMT_SANDBOX_PREFIX = "/api/sandbox/v1/sandboxes"
+MGMT_ENV_PREFIX = "/api/environment/v1/environments"
 # 数据面:单端点 action 分发,参数在 body args,action 级失败走 HTTP 200。
 INVOKE_PREFIX = "/direct"
 
@@ -100,7 +101,7 @@ def sandbox_api_kind(path: str) -> Optional[str]:
     旧前缀 ``/v1/sandbox/sandboxes`` 不在本分支注册(返回 None),
     由 http_server 统一按端点未找到返回 404。
     """
-    if path == MGMT_SANDBOX_PREFIX or path.startswith(f"{MGMT_SANDBOX_PREFIX}/"):
+    if path == MGMT_ENV_PREFIX or path.startswith(f"{MGMT_ENV_PREFIX}/"):
         return "mgmt"
     if path == INVOKE_PREFIX or path.startswith(f"{INVOKE_PREFIX}/"):
         return "invoke"
@@ -125,6 +126,10 @@ class SandboxMethodNotAllowedError(ValueError):
         super().__init__(f"method {method} not allowed for sandbox resource")
         self.method = method
         self.path = path
+
+
+class SandboxSearchLimitError(Exception):
+    """file.search 匹配结果超出 max_results(HTTP 429 + 失败形态体)。"""
 
 
 class SandboxRequestMixin:
@@ -154,7 +159,7 @@ class SandboxRequestMixin:
         else:
             self._mgmt_request(method, path, query)
 
-    # ── 管理面:/api/sandbox/v1/sandboxes(Envelope 成功 + ErrorEnvelope 失败)──
+    # ── 管理面:/api/environment/v1/environments(Envelope 成功/ErrorEnvelope)──
 
     def _mgmt_request(self, method: str, path: str, query: dict[str, list[str]]) -> None:
         request_id = self.headers.get("X-Request-Id") or str(uuid.uuid4())
@@ -185,7 +190,7 @@ class SandboxRequestMixin:
             self._write_mgmt_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc), request_id)
 
     def _dispatch_mgmt(self, method: str, path: str, request_id: str) -> dict[str, Any]:
-        if path == MGMT_SANDBOX_PREFIX:
+        if path == MGMT_ENV_PREFIX:
             if method != "POST":
                 raise SandboxMethodNotAllowedError(method, path)
             payload = self._read_json_body()
@@ -216,7 +221,7 @@ class SandboxRequestMixin:
                     raise
                 raise RuntimeError(f"create sandbox failed: {exc}") from exc
             return self._create_result(instance_id, request_id)
-        rest = path[len(MGMT_SANDBOX_PREFIX) + 1:]
+        rest = path[len(MGMT_ENV_PREFIX) + 1:]
         parts = rest.split("/")
         if len(parts) == 1 and parts[0]:
             sandbox_id = parts[0]
@@ -232,17 +237,16 @@ class SandboxRequestMixin:
 
     @staticmethod
     def _create_result(instance_id: str, request_id: str) -> dict[str, Any]:
-        # py 模型无独立 sandbox 概念:两个 ID 同值兼容契约(设计方案 API-1)。
+        # 契约 CreateEnvironmentResult:{environmentId, status, requestId}。
         return {
-            "sandboxId": instance_id,
-            "instanceId": instance_id,
+            "environmentId": instance_id,
             "status": "running",
             "requestId": request_id,
         }
 
     @staticmethod
     def _mgmt_envelope(payload: dict[str, Any]) -> dict[str, Any]:
-        """契约 Envelope:data = base64 编码的 JSON 业务结果(sandbox.yaml)。"""
+        """契约 Envelope:data = base64 编码的 JSON 业务结果(environment.yaml)。"""
         encoded = base64.b64encode(
             json.dumps(payload, separators=(",", ":")).encode("utf-8")
         ).decode("ascii")
@@ -278,11 +282,11 @@ class SandboxRequestMixin:
 
     @staticmethod
     def _mgmt_allowed_methods(path: str) -> str:
-        if path == MGMT_SANDBOX_PREFIX:
+        if path == MGMT_ENV_PREFIX:
             return "POST"
         return "DELETE"
 
-    # ── 数据面:/direct/{instanceId}/invoke(raw JSON;action 级失败走 200)────
+    # ── 数据面:/direct/{environmentId}/invoke(raw JSON;action 级失败走 200)─
 
     def _invoke_request(self, method: str, path: str, query: dict[str, list[str]]) -> None:
         rest = path[len(INVOKE_PREFIX) + 1:] if len(path) > len(INVOKE_PREFIX) else ""
@@ -338,6 +342,12 @@ class SandboxRequestMixin:
             )
         except (SandboxRequestTooLargeError, SandboxResponseTooLargeError) as exc:
             self._write_json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": str(exc)})
+        except SandboxSearchLimitError as exc:
+            # 契约 file.search:数量超限返回 429,错误体为失败形态(无部分结果)。
+            self._write_json(
+                HTTPStatus.TOO_MANY_REQUESTS,
+                {"entries": [], "error_code": "RESOURCE_EXHAUSTED", "error": str(exc)},
+            )
         except FileNotFoundError as exc:
             self._write_json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
         except (ValueError, TypeError) as exc:
@@ -383,8 +393,16 @@ class SandboxRequestMixin:
     @staticmethod
     def _invoke_exec(sandbox: Any, args: dict[str, Any], trace_id: str) -> dict[str, Any]:
         command = args.get("cmd") if args.get("cmd") is not None else args.get("command")
-        if not isinstance(command, str) or not command:
+        if command is None:
             raise ValueError("cmd (or command) is required")
+        if isinstance(command, str):
+            # 字符串经沙箱内 /bin/sh -c 执行,须非空。
+            if not command:
+                raise ValueError("cmd (or command) is required")
+        elif not isinstance(command, list):
+            # 数组不经 shell 直接执行(契约外扩展);空数组与元素合法性由
+            # 运行期判定,错误随 action 级失败走 200。
+            raise TypeError("cmd must be a string or an array of strings")
         cwd = args.get("cwd") if args.get("cwd") is not None else args.get("working_dir")
         if cwd is not None and not isinstance(cwd, str):
             raise TypeError("cwd must be a string")
@@ -439,6 +457,9 @@ class SandboxRequestMixin:
         if not isinstance(data, str):
             raise ValueError("data is required")
         binary = self._optional_bool(args, "binary", False)
+        # append 为契约外扩展:与 binary 组合映射底层 a/ab(默认 w/wb)。
+        append = self._optional_bool(args, "append", False)
+        mode = ("ab" if binary else "a") if append else ("wb" if binary else "w")
         if binary:
             try:
                 payload: Any = bytes.fromhex(data)
@@ -449,7 +470,7 @@ class SandboxRequestMixin:
             payload = data
             size = len(data.encode("utf-8"))
         try:
-            sandbox.write_file(path, payload, "wb" if binary else "w", trace_id=trace_id)
+            sandbox.write_file(path, payload, mode, trace_id=trace_id)
         except Exception as exc:
             return {
                 "name": os.path.basename(path), "path": path, "type": "file",
@@ -463,11 +484,14 @@ class SandboxRequestMixin:
     def _invoke_file_list(self, sandbox: Any, args: dict[str, Any], trace_id: str) -> dict[str, Any]:
         path = self._invoke_path_arg(args)
         depth = self._invoke_int_arg(args, "depth", 1, 1, 64)
+        # 契约 depth = 返回条目的最大相对深度;底层 _scan 自根(0 层)计数、
+        # current_depth > max_depth 才停止——传 max_depth = depth - 1 才能将
+        # 返回收敛到相对深度 <= depth(与 file.search 的深度剪枝语义一致)。
         try:
             result = sandbox.list_files(
                 path,
                 recursive=depth > 1,
-                max_depth=depth,
+                max_depth=depth - 1,
                 include_files=True,
                 include_dirs=True,
                 trace_id=trace_id,
@@ -479,33 +503,67 @@ class SandboxRequestMixin:
 
     def _invoke_file_search(self, sandbox: Any, args: dict[str, Any], trace_id: str) -> dict[str, Any]:
         path = self._invoke_path_arg(args)
+        # 契约 FileSearchArgs:pattern 可选默认 '*'(文件名或完整路径 glob,
+        # 大小写敏感,'*' 跨分隔符);exclude 只过滤不剪枝;max_results 超限 429。
         pattern = args.get("pattern")
-        if not isinstance(pattern, str) or not pattern:
-            raise ValueError("pattern is required")
+        if pattern is None:
+            pattern = "*"
+        if not isinstance(pattern, str):
+            raise TypeError("pattern must be a string")
         excludes = args.get("exclude_patterns")
-        if excludes is not None and (
-            not isinstance(excludes, list)
-            or not all(isinstance(item, str) for item in excludes)
+        if excludes is None:
+            excludes = []
+        if not isinstance(excludes, list) or not all(
+            isinstance(item, str) for item in excludes
         ):
             raise TypeError("exclude_patterns must be an array of strings")
         depth = self._invoke_int_arg(args, "depth", 64, 1, 64)
+        max_results = self._invoke_int_arg(args, "max_results", 1000, 1, 10000)
+        # max_entries/timeout_ms 经校验接受:py 底层递归无扫描计数与超时机制,
+        # 不触发对应的 429/408(与 permissions 恒 null 同属两实现已知差异)。
+        self._invoke_int_arg(args, "max_entries", 100000, 1, 1000000)
+        self._invoke_int_arg(args, "timeout_ms", 10000, 1, 30000)
         try:
+            # 底层按 depth 剪枝取文件全集并统计扫描条目数(scanned:遍历遇到
+            # 的文件与目录总数,不含根);pattern 文件名/完整路径双形态与
+            # exclude 过滤在适配层完成,保证大小写敏感语义跨平台一致
+            # (fnmatchcase)。
             result = sandbox.search_files(
-                path, pattern, exclude_patterns=excludes, trace_id=trace_id
+                path, "*", exclude_patterns=None, depth=depth, trace_id=trace_id
             )
         except Exception as exc:
-            return {"entries": [], "error": f"search files failed: {exc}"}
+            # 契约失败分支 additionalProperties: false(仅 entries/error_code/
+            # error),不带 scanned_entries。
+            return {
+                "entries": [],
+                "error_code": "FILESYSTEM_ERROR",
+                "error": f"search files failed: {exc}",
+            }
         items = result.get("items", []) if isinstance(result, dict) else []
-        root = path.rstrip("/")
-        entries = []
+        scanned = result.get("scanned") if isinstance(result, dict) else None
+        if not isinstance(scanned, int):
+            scanned = len(items)  # 部署偏斜回退:以返回条目数近似
+        matched = []
         for item in items:
-            # 底层递归无深度上限;契约 depth(默认 64)由适配层按相对路径层数收口。
             item_path = str(item.get("path", ""))
-            rel = item_path[len(root) + 1:] if item_path.startswith(root + "/") else item_path
-            if rel.count("/") + 1 > depth:
+            # 匹配用路径统一为 posix 分隔:契约 glob 语义按运行时(Linux)
+            # 路径定义,规范化消除宿主平台分隔符差异;响应内路径保持底层原样。
+            match_path = item_path.replace("\\", "/")
+            name = str(item.get("name", ""))
+            if not (fnmatch.fnmatchcase(name, pattern)
+                    or fnmatch.fnmatchcase(match_path, pattern)):
                 continue
-            entries.append(self._to_contract_entry(item))
-        return {"entries": entries, "error": None}
+            if any(fnmatch.fnmatchcase(name, pat) or fnmatch.fnmatchcase(match_path, pat)
+                   for pat in excludes):
+                continue
+            matched.append(self._to_contract_entry(item))
+        # 契约语义:结果按 path 排序;失败不返回部分结果(超限整体 429)。
+        matched.sort(key=lambda entry: entry["path"])
+        if len(matched) > max_results:
+            raise SandboxSearchLimitError(
+                "file search max_results exceeded; narrow the search"
+            )
+        return {"entries": matched, "scanned_entries": scanned, "error": None}
 
     @staticmethod
     def _to_contract_entry(item: dict[str, Any]) -> dict[str, Any]:
@@ -621,9 +679,11 @@ class SandboxRequestMixin:
         memory = payload.get("memory")
         if memory is not None and (isinstance(memory, bool) or not isinstance(memory, int)):
             raise TypeError("memory must be an integer")
+        # 契约字段为 idleTimeoutSeconds(默认 0=关闭空闲回收);
+        # idle_timeout 为旧内部名兼容别名,主名优先。
         idle_timeout = payload.get("idleTimeoutSeconds")
         if idle_timeout is None:
-            idle_timeout = payload.get("idle_timeout", 300)
+            idle_timeout = payload.get("idle_timeout", 0)
         if isinstance(idle_timeout, bool) or not isinstance(idle_timeout, int):
             raise TypeError("idleTimeoutSeconds must be an integer")
         if idle_timeout < 0:

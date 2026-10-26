@@ -374,7 +374,8 @@ class SandboxInstance:
             path: str,
             pattern: str,
             exclude_patterns: Optional[List[str]] = None,
-    ) -> List[Dict]:
+            depth: Optional[int] = None,
+    ) -> Dict:
         """
         Search files inside the sandbox by glob pattern using native Python I/O.
 
@@ -385,17 +386,22 @@ class SandboxInstance:
             path (str): Absolute path of the search root directory.
             pattern (str): Glob pattern to match file names (e.g. "*.txt").
             exclude_patterns (Optional[List[str]]): Glob patterns to exclude.
+            depth (Optional[int]): Maximum relative depth of traversed
+                entries. None = unlimited.
 
         Returns:
-            List[Dict]: List of item dicts with keys: name, path, size,
-                        is_directory, modified_time, type.
+            Dict: ``{"items": [{name, path, size, is_directory,
+            modified_time, type}, ...], "scanned": <int>}`` — *scanned*
+            counts every entry encountered during traversal (files and
+            directories, excluding the root).
 
         Raises:
             FileNotFoundError: If the search root does not exist.
             OSError: If the path cannot be accessed.
         """
         from yr.agentexecutor.sandbox.filesystem import _search_files_impl
-        return _search_files_impl(path, pattern, exclude_patterns=exclude_patterns)
+        return _search_files_impl(path, pattern, exclude_patterns=exclude_patterns,
+                                  depth=depth)
 
     def execute(
         self,
@@ -1207,6 +1213,7 @@ class Sandbox:
         path: str,
         pattern: str,
         exclude_patterns: Optional[List[str]] = None,
+        depth: Optional[int] = None,
         trace_id: Optional[str] = None,
     ) -> Dict:
         """
@@ -1216,11 +1223,15 @@ class Sandbox:
             path (str): Absolute path of the search root directory.
             pattern (str): Glob pattern to match file names (e.g. "*.txt").
             exclude_patterns (Optional[List[str]]): Glob patterns to exclude.
+            depth (Optional[int]): Maximum relative depth of traversed
+                entries. None (default) = unlimited.
             trace_id (Optional[str]): Trace id for link tracing of this invoke.
                 None (default) keeps the existing behavior.
 
         Returns:
-            Dict: ``{"items": [{name, path, size, is_directory, modified_time, type}, ...]}``
+            Dict: ``{"items": [{name, path, size, is_directory, modified_time, type}, ...],
+            "scanned": <int>}`` — *scanned* counts every entry encountered
+            during traversal (files and directories, excluding the root).
 
         Examples:
             >>> result = sb.search_files("/tmp", "*.py", exclude_patterns=["*.pyc"])
@@ -1228,12 +1239,12 @@ class Sandbox:
         method = self._instance.search_files
         if trace_id:
             method = method.options(_with_trace(trace_id))
-        items = yr.get(method.invoke(
+        return yr.get(method.invoke(
             path,
             pattern,
             exclude_patterns=exclude_patterns,
+            depth=depth,
         ))
-        return {"items": items}
 
     def get_working_dir(self, trace_id: Optional[str] = None):
         """Get the working directory of the sandbox."""

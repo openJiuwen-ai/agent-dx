@@ -50,18 +50,18 @@ accepts only loopback-originated requests. Same-machine processes create,
 operate, and destroy **remote child sandbox containers** over loopback HTTP —
 the target is a separate child container, not the function-instance container
 itself. Sandboxes are not precreated: the caller first creates one with
-`POST /api/sandbox/v1/sandboxes`, receives a sandbox id, and puts it into the
+`POST /api/environment/v1/environments`, receives an environment id, and puts it into the
 URL path of subsequent requests; multiple sandboxes are isolated by id, each
 with an independent lifecycle.
 
 The API follows the platform yaml contracts (management plane `sandbox.yaml` +
 data plane `data-plane.yaml`) and consists of two families:
 
-- **Management plane** — `POST /api/sandbox/v1/sandboxes` (create) and
-  `DELETE /api/sandbox/v1/sandboxes/{sandboxId}` (delete). Successes use the
+- **Management plane** — `POST /api/environment/v1/environments` (create) and
+  `DELETE /api/environment/v1/environments/{environmentId}` (delete). Successes use the
   Envelope form (`data` is a Base64-encoded JSON payload); failures use the
   ErrorEnvelope form.
-- **Data plane** — `POST /direct/{instanceId}/invoke`, a single
+- **Data plane** — `POST /direct/{environmentId}/invoke`, a single
   action-dispatch endpoint carrying raw action JSON; action-level failures
   ride HTTP 200 with the error in the body.
 
@@ -133,10 +133,10 @@ to it returns 404 `{"message": "endpoint not found"}`.
   failure, ...) — ride HTTP 200 with the error inside the action result (see
   each action below).
 
-### 1. Create sandbox: `POST /api/sandbox/v1/sandboxes`
+### 1. Create environment: `POST /api/environment/v1/environments`
 
 ```http
-POST /api/sandbox/v1/sandboxes HTTP/1.1
+POST /api/environment/v1/environments HTTP/1.1
 Content-Type: application/json
 X-Request-Id: req-create-013
 X-Trace-ID: trace-abc
@@ -168,7 +168,7 @@ Body fields (the 13 contract fields the adapter consumes):
 | `memory` | int | no | none | Memory, MiB |
 | `env` | object\<string,string\> | no | inherit sandbox runtime | Environment variables; when specified they apply wholesale (not merged with the default environment) |
 | `ports` | array\<string\> | no | none | Port forwarding list; each element is `"proto:port"` (e.g. `"tcp:8080"`) or `"port"` |
-| `idleTimeoutSeconds` | int | no | `300` | Idle timeout in seconds; must be non-negative (0 allowed). `idle_timeout` is accepted as a legacy alias |
+| `idleTimeoutSeconds` | int | no | `0` | Idle observation window in seconds; 0 disables idle reclamation. `idle_timeout` is accepted as a legacy alias |
 | `mounts` | array\<object\> | no | none | Mount declarations; merged verbatim into the rootfs JSON `mounts` key and passed to the backend. Requires an object `rootfs` or `image` (a string `rootfs` cannot carry mounts) |
 | `snapshotId` | string | no | none | Create from a snapshot: the request is routed to the restore branch (`Sandbox(checkpoint_id=...)`) and all other parameters are ignored |
 | `tunnel` | object | no | none | `{enabled, proxyPort}`: `proxyPort` maps to the underlying proxy port; `enabled=true` requires `extra_config.upstream` (else 400); `enabled=false` explicitly disables the upstream-implied tunnel |
@@ -193,13 +193,12 @@ JSON payload:
 The `data` payload decodes to:
 
 ```json
-{"sandboxId": "34420000-0000-4000-886a-980025037460",
- "instanceId": "34420000-0000-4000-886a-980025037460",
+{"environmentId": "34420000-0000-4000-886a-980025037460",
  "status": "running", "requestId": "req-create-013"}
 ```
 
-`sandboxId` and `instanceId` carry the same value (the platform instance id
-returned by the underlying create); `status` is always `"running"` and
+`environmentId` carries the platform instance id returned by the underlying
+create; `status` is always `"running"` and
 `requestId` is the effective request id. All subsequent operations put the id
 into the URL path.
 
@@ -213,16 +212,16 @@ into the URL path.
   `ports` element format (`proto:port`) is only validated at creation time,
   so an invalid element also surfaces as 500.
 
-### 2. Delete sandbox: `DELETE /api/sandbox/v1/sandboxes/{sandboxId}`
+### 2. Delete environment: `DELETE /api/environment/v1/environments/{environmentId}`
 
 ```http
-DELETE /api/sandbox/v1/sandboxes/34420000-0000-4000-886a-980025037460 HTTP/1.1
+DELETE /api/environment/v1/environments/34420000-0000-4000-886a-980025037460 HTTP/1.1
 X-Request-Id: req-del-007
 ```
 
 | Parameter | Type | Required | Description |
 |---|---|---|---|
-| `{sandboxId}` (path) | string | yes | Sandbox id, the `sandboxId`/`instanceId` returned by create |
+| `{environmentId}` (path) | string | yes | Environment id, the `environmentId` returned by create |
 | `X-Request-Id` (header) | string | no | Generated/echoed like on create |
 
 No request body.
@@ -243,7 +242,7 @@ returns 404 with an ErrorEnvelope (changed from the legacy 200 +
            "requestId": "req-del-007"}}
 ```
 
-### 3. Invoke action: `POST /direct/{instanceId}/invoke`
+### 3. Invoke action: `POST /direct/{environmentId}/invoke`
 
 A single data-plane endpoint dispatches the supported actions. The response
 is raw action JSON (no envelope); action-level failures ride HTTP 200 with
@@ -253,7 +252,7 @@ Common parameters:
 
 | Parameter | Location | Required | Default | Description |
 |---|---|---|---|---|
-| `{instanceId}` | path | yes | — | Sandbox instance id |
+| `{environmentId}` | path | yes | — | Environment instance id |
 | `X-ADX-Request-ID` | header | no | see `requestId` | Request identifier (idempotency key); priority: header > body.requestId > server-generated UUID |
 | `X-Trace-ID` | header | no | `""` | Trace id (private convention, outside the contract) |
 | `action` | body | yes | — | One of the 6 supported actions: `process.exec`, `process.run`, `file.read`, `file.write`, `file.list`, `file.search`. Contract actions outside this set — including the chunked `file.read_chunk`/`file.write_chunk` — return 400 |
@@ -265,11 +264,11 @@ are synonyms):
 
 | args | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `cmd` | string | one of `cmd`/`command` (`cmd` wins) | none | Shell command |
-| `command` | string | no | none | `cmd` alias |
-| `cwd` | string | no | none | Working directory (`working_dir` accepted as an alias) |
-| `envs` | object\<string,string\> | no | none | Environment variables (`env` accepted as an alias) |
-| `timeout` | number, >= 0 | no | unlimited | Timeout in seconds |
+| `cmd` | string or array\<string\> | one of `cmd`/`command` (`cmd` wins) | none | Command; a string runs via `/bin/sh -c` in the sandbox, an array executes directly without a shell (contract-external extension) |
+| `command` | string or array\<string\> | no | none | Parallel field to `cmd` (contract default `""`) |
+| `cwd` | string | no | none | Working directory (`working_dir` parallel field); must already exist |
+| `envs` | object\<string,string\> | no | none | Environment variables (`env` parallel field); replaces the default environment wholesale |
+| `timeout` | number, >= 0 | no | unlimited | Timeout in seconds; 0 is an immediate deadline (contract semantics) |
 
 ```json
 {"action": "process.exec", "args": {"cmd": "ls -la", "cwd": "/ws", "timeout": 300},
@@ -296,8 +295,9 @@ automatically):
 | args | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `path` | string | yes | — | Target path |
-| `data` | string | yes | — | Content; **hex** when `binary=true` |
+| `data` | string | yes | — | Content (may be empty — writes an empty file); **hex** when `binary=true` |
 | `binary` | bool | no | `false` | Encoding selector, same as `file.read` |
+| `append` | bool | no | `false` | Append instead of truncate (contract-external extension); combines with `binary` into `a`/`ab` |
 
 Response: `{"name": "a.txt", "path": "/ws/a.txt", "type": "file", "size": 5,
 "error": null}`.
@@ -307,7 +307,7 @@ Response: `{"name": "a.txt", "path": "/ws/a.txt", "type": "file", "size": 5,
 | args | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `path` | string | yes | — | Directory path |
-| `depth` | int | no | `1` (clamped to 1–64) | Recursion depth |
+| `depth` | int | no | `1` (clamped to 1–64) | Recursion depth: entries up to relative depth N are returned |
 
 Response entries align with the execd structure — `type` is the category
 (`file`/`dir`), `modified_time` is unix seconds, and `permissions` is always
@@ -320,22 +320,32 @@ execd implementation, which returns an octal permission string):
               "modified_time": 1695441203.5}], "error": null}
 ```
 
-**action `file.search`** — recursive filename glob search:
+**action `file.search`** — recursive file search:
 
 | args | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `path` | string | yes | — | Search root |
-| `pattern` | string | yes | — | Filename fnmatch glob (e.g. `*.log`) |
-| `exclude_patterns` | array\<string\> | no | none | Exclusion globs (also filename fnmatch) |
-| `depth` | int | no | `64` (clamped to 1–64) | Recursion depth cap, applied by the adapter over relative path depth |
+| `path` | string | yes | — | Search root; a missing or non-directory root returns an empty result |
+| `pattern` | string | no | `*` | Case-sensitive basename or full-path glob; `*` also matches separators |
+| `exclude_patterns` | array\<string\> | no | `[]` | Exclusion globs, filtering results without pruning traversal |
+| `depth` | int | no | `64` (clamped to 1–64) | Recursion depth cap; the backend traversal prunes by depth |
+| `max_results` | int | no | `1000` (clamped to 1–10000) | Result cap; exceeding it returns HTTP 429 |
+| `max_entries` | int | no | `100000` (clamped to 1–1000000) | Accepted and validated; the Python backend does not enforce a scan cap, so it does not trigger 429 |
+| `timeout_ms` | int | no | `10000` (clamped to 1–30000) | Accepted and validated; the Python backend has no search timeout, so it does not trigger 408 |
 
-Response: file entries in the `file.list` shape, only matching files.
+Response: `{"entries": [...], "scanned_entries": <int>, "error": null}` with
+entries in the `file.list` shape, sorted by path; `scanned_entries` counts
+every entry encountered during traversal (files and directories, excluding
+the root, bounded by `depth`; nested symlink directories are counted but
+not followed). Action failure (still 200):
+`{"entries": [], "error_code": "FILESYSTEM_ERROR",
+"error": "search files failed: ..."}`; exceeding `max_results` returns HTTP
+429 with `{"entries": [], "error_code": "RESOURCE_EXHAUSTED", "error": ...}`.
 
 ### Lifecycle and reclamation
 
-- `sandboxId` equals `instanceId` (the platform instance id, UUID form);
-  functionsystem maintains the instance-to-physical-sandbox mapping
-  internally, so callers never need to know the physical sandbox id.
+- `environmentId` is the platform instance id (UUID form); functionsystem
+  maintains the instance-to-physical-sandbox mapping internally, so callers
+  never need to know the physical sandbox id.
 - Named creates: when `name` is set, the instance is created and addressed
   under the runtime namespace (`{ns}-{name}`); the adapter pins the namespace
   so create-side registration and invoke-side addressing stay consistent.
