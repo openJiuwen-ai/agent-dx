@@ -702,6 +702,55 @@ struct NativeReadView {
     deadline: Instant,
 }
 
+struct PrefetchReservation {
+    prefetch_bytes: Arc<AtomicUsize>,
+    reserved_bytes: usize,
+}
+
+impl PrefetchReservation {
+    fn resize(&mut self, bytes: usize, budget: usize) -> bool {
+        let mut current = self.prefetch_bytes.load(Ordering::Acquire);
+        loop {
+            let next = if bytes >= self.reserved_bytes {
+                let Some(next) = current.checked_add(bytes - self.reserved_bytes) else {
+                    return false;
+                };
+                next
+            } else {
+                let Some(next) = current.checked_sub(self.reserved_bytes - bytes) else {
+                    return false;
+                };
+                next
+            };
+            if next > budget {
+                return false;
+            }
+            match self.prefetch_bytes.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.reserved_bytes = bytes;
+                    return true;
+                }
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl Drop for PrefetchReservation {
+    fn drop(&mut self) {
+        let _ = self
+            .prefetch_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                Some(current.saturating_sub(self.reserved_bytes))
+            });
+    }
+}
+
 /// One sequential read-ahead group owned by a single direct read handle.
 struct PrefetchWindow {
     inode_id: InodeId,
@@ -710,9 +759,7 @@ struct PrefetchWindow {
     start: u64,
     next_offset: u64,
     data: Vec<u8>,
-    /// Bytes charged against the host budget. Native groups own only this
-    /// window; external groups also materialize a transient staging copy.
-    reserved_bytes: usize,
+    reservation: PrefetchReservation,
 }
 
 /// File identity a read-ahead group must still match when it is promoted.
@@ -739,20 +786,18 @@ impl PrefetchIdentity {
     }
 }
 
-/// One group being filled ahead of the cursor. The reservation belongs to this
-/// entry: whichever side removes the entry releases it. The fill thread only
-/// publishes data, so a cancelled entry simply drops its buffer.
+/// One group being filled ahead of the cursor.
 struct GroupAheadEntry {
     identity: PrefetchIdentity,
     start: u64,
     length: usize,
-    reserved_bytes: usize,
     generation: u64,
     completion: Arc<GroupAheadCompletion>,
 }
 
 struct GroupAheadCompletion {
     data: Mutex<Option<std::result::Result<Vec<u8>, ()>>>,
+    reservation: Mutex<Option<PrefetchReservation>>,
     ready: Condvar,
 }
 
@@ -5307,38 +5352,53 @@ impl DistributedFs {
         }
     }
 
-    fn readonly_snapshot(
-        &self,
-        inode_id: &InodeId,
-    ) -> Result<(Option<FileVersionId>, u64, LayoutRoot)> {
-        let inode = self.validate_inode(self.meta.get_inode(inode_id)?)?;
-        let version = self.load_readonly_version(inode.head_version.as_ref())?;
-        Ok((
-            version.version.as_ref().map(|value| value.id.clone()),
-            version.version.as_ref().map_or(0, |value| value.length),
-            version.layout.clone(),
-        ))
-    }
-
-    fn read_grouped(
+    fn read_native_group_owned(
         &self,
         handle: FileHandle,
-        inode_id: &InodeId,
+        snapshot: &DfsFileHandleSnapshot,
         offset: u64,
-        out: &mut [u8],
+        size: usize,
         group: ReadGroupPolicy,
-    ) -> Result<usize> {
-        if out.is_empty() {
-            return Ok(0);
+    ) -> Result<Vec<u8>> {
+        let operation = self.capture_native_read_view()?;
+        let (inode, view) = self.native_inode_for_read(handle, snapshot)?;
+        let cached = self.readonly_version_for_inode(&inode)?;
+        let mut out = vec![0; size];
+        let count = self.read_grouped_snapshot(
+            handle,
+            &snapshot.inode_id,
+            cached.version.as_ref().map(|version| version.id.clone()),
+            cached.layout.file_length,
+            &cached.layout,
+            offset,
+            &mut out,
+            group,
+        )?;
+        self.check_native_read_view(&view)?;
+        #[cfg(test)]
+        {
+            let hook = self.native_read_before_delivery.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
-        if self.write_state(inode_id)?.is_some() {
-            self.drop_prefetch(handle);
-            return self.read_visible_from_handle_inode(handle, inode_id, None, offset, out);
+        self.check_native_read_view(&operation)?;
+        if snapshot.handle.closed.load(Ordering::Acquire) {
+            return Err(stale("DFS file handle is no longer open"));
         }
-        let (version_id, length, layout) = self.readonly_snapshot(inode_id)?;
-        self.read_grouped_snapshot(
-            handle, inode_id, version_id, length, &layout, offset, out, group,
-        )
+        let current = snapshot
+            .handle
+            .state
+            .lock()
+            .map_err(|_| unavailable("DFS handle state is poisoned"))?;
+        if current.native_denial_serial != snapshot.native_denial_serial {
+            return Err(unavailable(
+                "DFS native read authorization changed before delivery",
+            ));
+        }
+        drop(current);
+        out.truncate(count);
+        Ok(out)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5405,28 +5465,24 @@ impl DistributedFs {
             .is_some_and(|entry| entry.generation != self.prefetch_generation(handle.0))
             && let Some(entry) = ahead.take()
         {
-            self.release_prefetch_bytes(entry.reserved_bytes);
+            drop(entry);
         }
 
         // A preloaded group is usable only when the background fill finished
         // with the expected length; otherwise fall back to the synchronous fill.
         let ahead_filled = ahead.and_then(|entry| {
             let entry_length = entry.length;
-            let reserved = entry.reserved_bytes;
             match Self::wait_ahead(&entry) {
-                Some(filled) if filled.len() == entry_length => Some((filled, reserved)),
-                _ => {
-                    self.release_prefetch_bytes(reserved);
-                    None
+                Some((filled, reservation)) if filled.len() == entry_length => {
+                    Some((filled, reservation))
                 }
+                _ => None,
             }
         });
-        let (data, reserved_bytes) = match ahead_filled {
-            Some((filled, reserved)) => {
-                if let Some(window) = previous.take() {
-                    self.release_prefetch_bytes(window.reserved_bytes);
-                }
-                (filled, reserved)
+        let (data, reservation) = match ahead_filled {
+            Some(filled) => {
+                drop(previous.take());
+                filled
             }
             None => match self.fill_group_window(
                 &mut previous,
@@ -5444,25 +5500,22 @@ impl DistributedFs {
             },
         };
         let window_end = offset.saturating_add(data.len() as u64);
+        let count = count.min(data.len());
         out[..count].copy_from_slice(&data[..count]);
+        let window = PrefetchWindow {
+            inode_id: inode_id.clone(),
+            version_id: version_id.clone(),
+            layout_root_id: layout.id.clone(),
+            start: offset,
+            next_offset: offset + count as u64,
+            data,
+            reservation,
+        };
         let mut cache = self
             .prefetch
             .lock()
             .map_err(|_| unavailable("DFS prefetch table is poisoned"))?;
-        if let Some(retired) = cache.insert(
-            handle.0,
-            PrefetchWindow {
-                inode_id: inode_id.clone(),
-                version_id: version_id.clone(),
-                layout_root_id: layout.id.clone(),
-                start: offset,
-                next_offset: offset + count as u64,
-                data,
-                reserved_bytes,
-            },
-        ) {
-            self.release_prefetch_bytes(retired.reserved_bytes);
-        }
+        drop(cache.insert(handle.0, window));
         drop(cache);
         self.spawn_ahead(
             handle.0, inode_id, version_id, layout, window_end, length, group,
@@ -5481,7 +5534,7 @@ impl DistributedFs {
         offset: u64,
         file_length: u64,
         group: ReadGroupPolicy,
-    ) -> Result<Option<(Vec<u8>, usize)>> {
+    ) -> Result<Option<(Vec<u8>, PrefetchReservation)>> {
         let grouped_end = offset.saturating_add(group.bytes as u64).min(file_length);
         let grouped_length = usize::try_from(grouped_end - offset)
             .map_err(|_| invalid("read group length is too large"))?;
@@ -5494,21 +5547,33 @@ impl DistributedFs {
         } else {
             grouped_length
         };
-        let retired = previous.take();
-        if let Some(window) = &retired {
-            self.release_prefetch_bytes(window.reserved_bytes);
-        }
-        if !self.reserve_prefetch_bytes(reserved_bytes, group.host_budget_bytes) {
-            return Ok(None);
-        }
-        let mut data = match retired {
+        let (mut data, reservation) = match previous.take() {
             Some(window) => {
-                let mut data = window.data;
-                data.resize(grouped_length, 0);
-                data
+                let PrefetchWindow {
+                    data, reservation, ..
+                } = window;
+                (data, Some(reservation))
             }
-            None => vec![0; grouped_length],
+            None => (Vec::new(), None),
         };
+        let reservation = match reservation {
+            Some(mut reservation) => {
+                if !reservation.resize(reserved_bytes, group.host_budget_bytes) {
+                    drop(data);
+                    return Ok(None);
+                }
+                reservation
+            }
+            None => {
+                let Some(reservation) =
+                    self.reserve_prefetch_bytes(reserved_bytes, group.host_budget_bytes)
+                else {
+                    return Ok(None);
+                };
+                reservation
+            }
+        };
+        data.resize(grouped_length, 0);
         if let Err(error) = self.read_layout_range_with(
             version_id.as_ref(),
             layout,
@@ -5516,10 +5581,11 @@ impl DistributedFs {
             &mut data,
             Some(u64::try_from(grouped_length).unwrap_or(u64::MAX)),
         ) {
-            self.release_prefetch_bytes(reserved_bytes);
+            drop(data);
+            drop(reservation);
             return Err(error);
         }
-        Ok(Some((data, reserved_bytes)))
+        Ok(Some((data, reservation)))
     }
 
     fn prefetch_generation(&self, handle: u64) -> u64 {
@@ -5559,31 +5625,34 @@ impl DistributedFs {
     }
 
     fn drop_ahead(&self, handle: u64) {
-        let removed = self
-            .prefetch_ahead
-            .slots
-            .lock()
-            .ok()
-            .and_then(|mut slots| slots.remove(&handle));
-        if let Some(entry) = removed {
-            self.release_prefetch_bytes(entry.reserved_bytes);
-        }
+        drop(
+            self.prefetch_ahead
+                .slots
+                .lock()
+                .ok()
+                .and_then(|mut slots| slots.remove(&handle)),
+        );
     }
 
-    fn wait_ahead(entry: &GroupAheadEntry) -> Option<Vec<u8>> {
-        let mut slot = entry.completion.data.lock().ok()?;
-        while slot.is_none() {
-            let (next, timeout) = entry
-                .completion
-                .ready
-                .wait_timeout(slot, Duration::from_secs(30))
-                .ok()?;
-            slot = next;
-            if timeout.timed_out() && slot.is_none() {
-                return None;
+    fn wait_ahead(entry: &GroupAheadEntry) -> Option<(Vec<u8>, PrefetchReservation)> {
+        let result = {
+            let mut slot = entry.completion.data.lock().ok()?;
+            while slot.is_none() {
+                let (next, timeout) = entry
+                    .completion
+                    .ready
+                    .wait_timeout(slot, Duration::from_secs(30))
+                    .ok()?;
+                slot = next;
+                if timeout.timed_out() && slot.is_none() {
+                    return None;
+                }
             }
-        }
-        slot.take().and_then(|result| result.ok())
+            slot.take()?
+        };
+        let data = result.ok()?;
+        let reservation = entry.completion.reservation.lock().ok()?.take()?;
+        Some((data, reservation))
     }
 
     fn fill_ahead(
@@ -5641,20 +5710,20 @@ impl DistributedFs {
             Ok(_) => {}
             Err(_) => return,
         }
-        if !self.reserve_prefetch_bytes(length, group.host_budget_bytes) {
+        let Some(reservation) = self.reserve_prefetch_bytes(length, group.host_budget_bytes) else {
             return;
-        }
+        };
         let identity = PrefetchIdentity::of(inode_id, version_id, layout);
         let generation = self.prefetch_generation(handle);
         let completion = Arc::new(GroupAheadCompletion {
             data: Mutex::new(None),
+            reservation: Mutex::new(Some(reservation)),
             ready: Condvar::new(),
         });
         let entry = GroupAheadEntry {
             identity: identity.clone(),
             start,
             length,
-            reserved_bytes: length,
             generation,
             completion: completion.clone(),
         };
@@ -5662,10 +5731,7 @@ impl DistributedFs {
             Ok(mut slots) => {
                 slots.insert(handle, entry);
             }
-            Err(_) => {
-                self.release_prefetch_bytes(length);
-                return;
-            }
+            Err(_) => return,
         }
         let read_engine = Arc::clone(&self.read_engine);
         let layout = layout.clone();
@@ -5675,8 +5741,6 @@ impl DistributedFs {
             .spawn(move || {
                 let result =
                     Self::fill_ahead(&read_engine, &layout, &identity, start, length, group_bytes);
-                // The slot owns the reservation; a cancelled slot was already
-                // released by whoever removed it, so the result is just dropped.
                 if let Ok(mut slot) = completion.data.lock() {
                     *slot = Some(result);
                 }
@@ -5690,24 +5754,20 @@ impl DistributedFs {
     fn drop_prefetch(&self, handle: FileHandle) {
         self.bump_prefetch_generation(handle.0);
         self.drop_ahead(handle.0);
-        let removed = self
-            .prefetch
-            .lock()
-            .ok()
-            .and_then(|mut cache| cache.remove(&handle.0));
-        if let Some(window) = removed {
-            self.release_prefetch_bytes(window.reserved_bytes);
-        }
+        drop(
+            self.prefetch
+                .lock()
+                .ok()
+                .and_then(|mut cache| cache.remove(&handle.0)),
+        );
     }
 
-    fn reserve_prefetch_bytes(&self, bytes: usize, budget: usize) -> bool {
+    fn reserve_prefetch_bytes(&self, bytes: usize, budget: usize) -> Option<PrefetchReservation> {
         let mut current = self.prefetch_bytes.load(Ordering::Acquire);
         loop {
-            let Some(next) = current.checked_add(bytes) else {
-                return false;
-            };
+            let next = current.checked_add(bytes)?;
             if next > budget {
-                return false;
+                return None;
             }
             match self.prefetch_bytes.compare_exchange_weak(
                 current,
@@ -5715,18 +5775,15 @@ impl DistributedFs {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return true,
+                Ok(_) => {
+                    return Some(PrefetchReservation {
+                        prefetch_bytes: self.prefetch_bytes.clone(),
+                        reserved_bytes: bytes,
+                    });
+                }
                 Err(observed) => current = observed,
             }
         }
-    }
-
-    fn release_prefetch_bytes(&self, bytes: usize) {
-        let _ = self
-            .prefetch_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                Some(current.saturating_sub(bytes))
-            });
     }
 
     fn native_read_capability(&self, handle: FileHandle) -> Option<Arc<DfsHandle>> {
@@ -12602,8 +12659,12 @@ impl Backend for DistributedFs {
                 && self
                     .remote_provider_visible_for_reads(&snapshot.inode_id)?
                     .is_none()
+                && self.write_state(&snapshot.inode_id)?.is_none()
             {
-                return self.read_grouped(handle, &snapshot.inode_id, offset, out, group);
+                let result =
+                    self.read_native_group_owned(handle, &snapshot, offset, out.len(), group)?;
+                out[..result.len()].copy_from_slice(&result);
+                return Ok(result.len());
             }
             let result = self.read_native_owned(handle, &snapshot, offset, out.len())?;
             out[..result.len()].copy_from_slice(&result);
@@ -12672,41 +12733,7 @@ impl Backend for DistributedFs {
                     .is_none()
                 && self.write_state(&snapshot.inode_id)?.is_none()
             {
-                // Resolve the version from the handle's native read view. The
-                // grouped path covers many FUSE reads, so a Meta lookup per
-                // read would dominate the transfer it is trying to amortize.
-                let operation = self.capture_native_read_view()?;
-                let (inode, view) = self.native_inode_for_read(handle, &snapshot)?;
-                let cached = self.readonly_version_for_inode(&inode)?;
-                let mut out = vec![0; size];
-                let count = self.read_grouped_snapshot(
-                    handle,
-                    &snapshot.inode_id,
-                    cached.version.as_ref().map(|version| version.id.clone()),
-                    cached.layout.file_length,
-                    &cached.layout,
-                    offset,
-                    &mut out,
-                    group,
-                )?;
-                self.check_native_read_view(&view)?;
-                self.check_native_read_view(&operation)?;
-                if snapshot.handle.closed.load(Ordering::Acquire) {
-                    return Err(stale("DFS file handle is no longer open"));
-                }
-                let current = snapshot
-                    .handle
-                    .state
-                    .lock()
-                    .map_err(|_| unavailable("DFS handle state is poisoned"))?;
-                if current.native_denial_serial != snapshot.native_denial_serial {
-                    return Err(unavailable(
-                        "DFS native read authorization changed before delivery",
-                    ));
-                }
-                drop(current);
-                out.truncate(count);
-                return Ok(out);
+                return self.read_native_group_owned(handle, &snapshot, offset, size, group);
             }
             return self
                 .read_native_owned(handle, &snapshot, offset, size)
@@ -13456,6 +13483,9 @@ impl Backend for DistributedFs {
             .handles
             .remove(handle.0)?
             .ok_or_else(|| stale("DFS file handle is no longer open"))?;
+        if let Ok(mut generations) = self.prefetch_ahead.generations.lock() {
+            generations.remove(&handle.0);
+        }
         if let Some(pin) = removed
             ._gc_pin
             .as_ref()
@@ -29165,6 +29195,66 @@ mod tests {
         (temp, meta, fs)
     }
 
+    fn wait_for_prefetch_bytes(fs: &DistributedFs, expected: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while fs.prefetch_bytes.load(Ordering::SeqCst) != expected {
+            assert!(
+                Instant::now() < deadline,
+                "prefetch budget did not reach {expected}: {}",
+                fs.prefetch_bytes.load(Ordering::SeqCst)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn group_read_rechecks_native_authority_before_cached_delivery() {
+        let (_temp, meta, fs, authority) = test_fs_with_native_authority();
+        let fs = fs.with_read_group(Some(ReadGroupPolicy {
+            bytes: 4,
+            max_inflight: 1,
+            max_descriptors: 8,
+            host_budget_bytes: 1024 * 1024,
+        }));
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "group-authority", b"abcdefgh");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        let mut first = [0; 2];
+        assert_eq!(fs.read(&context(), reader, 0, &mut first).unwrap(), 2);
+        assert_eq!(&first, b"ab");
+
+        authority.stop();
+        let mut cached = [0xa5; 2];
+        assert!(fs.read(&context(), reader, 2, &mut cached).is_err());
+        assert_eq!(cached, [0xa5; 2]);
+        fs.release(&context(), reader).unwrap();
+    }
+
+    #[test]
+    fn group_read_rechecks_native_denial_before_delivery() {
+        let (_temp, meta, fs) = grouped_fs(8);
+        let fs = Arc::new(fs);
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "group-late-denial", b"data");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        let hook_fs = fs.clone();
+        let hook_meta = meta.clone();
+        *fs.native_read_before_delivery.lock().unwrap() = Some(Box::new(move || {
+            hook_meta.fail_next_get_inode_with(Error::coded(
+                afs_error::IO_PERMISSION_DENIED,
+                "group read revoked",
+            ));
+            assert!(hook_fs.getattr(&context(), inode, Some(reader)).is_err());
+        }));
+
+        let mut output = [0xa5; 4];
+        assert!(fs.read(&context(), reader, 0, &mut output).is_err());
+        assert_eq!(output, [0xa5; 4]);
+        fs.release(&context(), reader).unwrap();
+    }
+
     #[test]
     fn sequential_group_read_prefetches_ahead_and_serves_the_cursor_from_cache() {
         let (_temp, meta, fs) = grouped_fs(4);
@@ -29223,6 +29313,60 @@ mod tests {
         );
 
         fs.release(&context(), reader).unwrap();
+        wait_for_prefetch_bytes(&fs, 0);
+    }
+
+    #[test]
+    fn cancelled_group_ahead_retains_budget_until_the_worker_finishes() {
+        let (_temp, _meta, fs) = grouped_fs_with_inflight(4, 2);
+        let reservation = fs.reserve_prefetch_bytes(4, 4).unwrap();
+        let completion = Arc::new(GroupAheadCompletion {
+            data: Mutex::new(None),
+            reservation: Mutex::new(Some(reservation)),
+            ready: Condvar::new(),
+        });
+        fs.prefetch_ahead.slots.lock().unwrap().insert(
+            91,
+            GroupAheadEntry {
+                identity: PrefetchIdentity {
+                    inode_id: InodeId::new("inode:cancelled-ahead"),
+                    version_id: None,
+                    layout_root_id: LayoutRootId::new("layout:cancelled-ahead"),
+                },
+                start: 0,
+                length: 4,
+                generation: 0,
+                completion: completion.clone(),
+            },
+        );
+        drop(completion);
+        let worker_completion = fs
+            .prefetch_ahead
+            .slots
+            .lock()
+            .unwrap()
+            .get(&91)
+            .unwrap()
+            .completion
+            .clone();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let data = vec![1, 2, 3, 4];
+            started_tx.send(()).unwrap();
+            let _ = finish_rx.recv();
+            if let Ok(mut slot) = worker_completion.data.lock() {
+                *slot = Some(Ok(data));
+            }
+            worker_completion.ready.notify_all();
+        });
+        started_rx.recv().unwrap();
+
+        fs.drop_ahead(91);
+        assert_eq!(fs.prefetch_bytes.load(Ordering::SeqCst), 4);
+
+        finish_tx.send(()).unwrap();
+        worker.join().unwrap();
         assert_eq!(fs.prefetch_bytes.load(Ordering::SeqCst), 0);
     }
 
@@ -29242,14 +29386,39 @@ mod tests {
         let mut tail = [0; 2];
         assert_eq!(fs.read(&context(), reader, 6, &mut tail).unwrap(), 2);
         assert_eq!(&tail, b"gh");
-        assert_eq!(
-            fs.prefetch_bytes.load(Ordering::SeqCst),
-            2,
-            "a seek releases the preloaded group before filling the new one"
-        );
+        wait_for_prefetch_bytes(&fs, 2);
 
         fs.release(&context(), reader).unwrap();
         assert_eq!(fs.prefetch_bytes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn release_clears_prefetch_generation_but_drop_prefetch_preserves_it() {
+        let (_temp, meta, fs) = grouped_fs(4);
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "group-generation-release", b"abcd");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        let mut out = [0; 2];
+        assert_eq!(fs.read(&context(), reader, 0, &mut out).unwrap(), 2);
+
+        fs.drop_prefetch(reader);
+        assert!(
+            fs.prefetch_ahead
+                .generations
+                .lock()
+                .unwrap()
+                .contains_key(&reader.0)
+        );
+
+        fs.release(&context(), reader).unwrap();
+        assert!(
+            !fs.prefetch_ahead
+                .generations
+                .lock()
+                .unwrap()
+                .contains_key(&reader.0)
+        );
     }
 
     #[test]
@@ -29299,7 +29468,7 @@ mod tests {
     }
 
     #[test]
-    fn group_read_drops_the_window_when_the_file_version_changes() {
+    fn group_read_drops_stale_window_when_native_view_refreshes() {
         let (_temp, meta, fs) = grouped_fs(8);
         let inode_id = meta.inode.lock().unwrap().inode_id.clone();
         publish_external_version_with_bytes(&meta, &fs, "group-old-version", b"abcdefgh");
@@ -29311,6 +29480,10 @@ mod tests {
         assert_eq!(&first, b"ab");
 
         publish_external_version_with_bytes(&meta, &fs, "group-new-version", b"ABCDEFGH");
+        let mut opened = [0; 2];
+        assert_eq!(fs.read(&context(), reader, 2, &mut opened).unwrap(), 2);
+        assert_eq!(&opened, b"cd");
+        expire_native_read_view(&fs, reader);
         let mut next = [0; 2];
         assert_eq!(fs.read(&context(), reader, 2, &mut next).unwrap(), 2);
         assert_eq!(&next, b"CD");
@@ -29323,6 +29496,25 @@ mod tests {
 
         fs.release(&context(), reader).unwrap();
         assert_eq!(fs.prefetch_bytes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn group_read_shortens_request_to_available_group_window() {
+        let (_temp, meta, fs) = grouped_fs(4);
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "group-short-read", b"abcdefgh");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+
+        let mut first = [0xa5; 8];
+        assert_eq!(fs.read(&context(), reader, 0, &mut first).unwrap(), 4);
+        assert_eq!(&first[..4], b"abcd");
+        assert_eq!(&first[4..], &[0xa5; 4]);
+        let mut second = [0xa5; 8];
+        assert_eq!(fs.read(&context(), reader, 4, &mut second).unwrap(), 4);
+        assert_eq!(&second[..4], b"efgh");
+        assert_eq!(&second[4..], &[0xa5; 4]);
+        fs.release(&context(), reader).unwrap();
     }
 
     #[test]

@@ -381,6 +381,53 @@ int main(int argc, char **argv) {
     char source[4] = {'r', 'e', 'a', 'd'};
     void *request = nullptr;
     uint32_t dispatch_started = 0;
+    if (scenario == "roce-pre-dispatch-bad-alloc" || scenario == "hccs-pre-dispatch-bad-alloc") {
+        char output[4] = {};
+        uint64_t sdk_ns = 0;
+        uint64_t copy_ns = 0;
+        auto call = [&]() {
+            if (relay_mode) {
+                return afs_hixl_read_sync(runtime, 0, "127.0.0.1:7921",
+                    reinterpret_cast<uintptr_t>(source), reinterpret_cast<uint8_t *>(output),
+                    sizeof(output), 123, &dispatch_started, &sdk_ns, &copy_ns, error, sizeof(error));
+            }
+            return afs_hixl_submit_read(runtime, 0, "127.0.0.1:7921",
+                reinterpret_cast<uintptr_t>(source), 4, &request, &dispatch_started, error, sizeof(error));
+        };
+        auto complete_async = [&]() {
+            if (relay_mode) { return; }
+            uint32_t state = 0;
+            assert(request != nullptr);
+            assert(afs_hixl_poll_read(runtime, request, reinterpret_cast<uint8_t *>(output),
+                sizeof(output), &state, &sdk_ns, &copy_ns, error, sizeof(error)) == 0);
+            assert(state == AFS_HIXL_POLL_COMPLETED);
+            request = nullptr;
+        };
+
+        uint32_t status = call();
+        assert(status == 0 && dispatch_started == 1);
+        complete_async();
+        assert(std::memcmp(output, source, 4) == 0);
+
+        // Fail deterministically between Host slot reservation and dispatch;
+        // the bridge must roll the reservation back without submitting.
+        assert(setenv("AFS_HIXL_TEST_FAIL_BEFORE_DISPATCH", "1", 1) == 0);
+        dispatch_started = 0;
+        status = call();
+        assert(unsetenv("AFS_HIXL_TEST_FAIL_BEFORE_DISPATCH") == 0);
+        assert(status != 0 && dispatch_started == 0 && request == nullptr);
+        assert((relay_mode ? sync_calls : submissions) == 1);
+
+        dispatch_started = 0;
+        status = call();
+        assert(status == 0 && dispatch_started == 1);
+        complete_async();
+        assert(std::memcmp(output, source, 4) == 0);
+        assert(afs_hixl_shutdown(runtime, error, sizeof(error)) == 0);
+        afs_hixl_destroy(runtime);
+        assert(allocations == 0);
+        return 0;
+    }
     if (relay_mode) {
         assert(registrations == 0);
         assert(actual_domain == 7);

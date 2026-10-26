@@ -471,8 +471,31 @@ struct RuntimeCore<B> {
 }
 
 #[cfg(any(feature = "hixl", test))]
+fn fresh_generation() -> Result<u64, HixlError> {
+    let mut entropy = [0_u8; 8];
+    getrandom::fill(&mut entropy).map_err(|error| {
+        HixlError::new(
+            HixlPhase::Initialize,
+            HixlErrorKind::Internal,
+            None,
+            format!("cannot generate a fresh HIXL engine generation: {error}"),
+        )
+    })?;
+    Ok(u64::from_ne_bytes(entropy).max(1))
+}
+
+#[cfg(any(feature = "hixl", test))]
 impl<B: NativeBackend> RuntimeCore<B> {
+    #[cfg(test)]
     fn new(backend: B, options: RuntimeOptions) -> Result<Self, HixlError> {
+        Self::new_with_generation(backend, options, fresh_generation()?)
+    }
+
+    fn new_with_generation(
+        backend: B,
+        options: RuntimeOptions,
+        generation: u64,
+    ) -> Result<Self, HixlError> {
         validate_options(&options)?;
         let hccs_domain_id = if options.transport == ReadTransport::HccsBufferPool {
             Some(backend.hccs_domain_id().ok_or_else(|| {
@@ -488,16 +511,6 @@ impl<B: NativeBackend> RuntimeCore<B> {
         };
         let export_count = options.export_slots;
         let receive_count = options.receive_slots;
-        let mut entropy = [0_u8; 8];
-        getrandom::fill(&mut entropy).map_err(|error| {
-            HixlError::new(
-                HixlPhase::Initialize,
-                HixlErrorKind::Internal,
-                None,
-                format!("cannot generate a fresh HIXL engine generation: {error}"),
-            )
-        })?;
-        let generation = u64::from_ne_bytes(entropy).max(1);
         Ok(Self {
             backend,
             info: EngineInfo {
@@ -974,6 +987,7 @@ impl<B: NativeBackend> RuntimeCore<B> {
                 "batch READ output length differs from the submitted windows",
             ));
         }
+        let timeout_ms = deadline_timeout_ms(deadline, HixlPhase::SubmitRead)?;
         let mut slots = Vec::with_capacity(windows.len());
         for _ in windows {
             let Some(slot_id) = self
@@ -1017,7 +1031,6 @@ impl<B: NativeBackend> RuntimeCore<B> {
             })
             .collect::<Vec<_>>();
         if self.options.transport == ReadTransport::HccsBufferPool {
-            let timeout_ms = deadline_timeout_ms(deadline, HixlPhase::SubmitRead)?;
             let timing =
                 match self
                     .backend
@@ -1427,6 +1440,7 @@ impl HixlRuntime {
                         "HIXL command budget overflow",
                     )
                 })?;
+            let generation = fresh_generation()?;
             let (sender, receiver) = mpsc::sync_channel(capacity);
             let (startup_sender, startup_receiver) = mpsc::sync_channel(1);
             let status = Arc::new(RwLock::new(RuntimeStatus {
@@ -1454,7 +1468,9 @@ impl HixlRuntime {
                                 HixlErrorKind::NativeFailure,
                             )
                         })
-                        .and_then(|backend| RuntimeCore::new(backend, owner_options));
+                        .and_then(|backend| {
+                            RuntimeCore::new_with_generation(backend, owner_options, generation)
+                        });
                     match result {
                         Ok(core) => {
                             let info = core.info();
@@ -2973,6 +2989,12 @@ mod tests {
     }
 
     #[test]
+    fn runtime_core_uses_a_generation_created_before_native_startup() {
+        let core = RuntimeCore::new_with_generation(FakeBackend::default(), options(), 42).unwrap();
+        assert_eq!(core.info().generation, 42);
+    }
+
+    #[test]
     fn separate_runtime_instances_have_distinct_nonzero_generations() {
         let first = RuntimeCore::new(FakeBackend::default(), options()).unwrap();
         let second = RuntimeCore::new(FakeBackend::default(), options()).unwrap();
@@ -3453,6 +3475,33 @@ mod tests {
         assert_eq!(outcome.timing.sdk_transfer, Some(Duration::from_millis(7)));
         assert_eq!(outcome.timing.output_copy, Some(Duration::from_millis(2)));
         assert_eq!(core.status().receive_slots_in_use, 0);
+        core.shutdown().unwrap();
+    }
+
+    #[test]
+    fn hccs_batch_expired_deadline_releases_every_slot_before_native_entry() {
+        let mut opts = batch_options(2);
+        opts.transport = super::ReadTransport::HccsBufferPool;
+        let mut core =
+            connected_batch_core(RuntimeCore::new(FakeBackend::default(), opts).unwrap());
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        let error = core
+            .read_batch(
+                "peer",
+                &batch_windows(2, 4 * MIB),
+                vec![0; 8 * MIB],
+                deadline,
+                Duration::ZERO,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.kind, HixlErrorKind::DeadlineExceeded);
+        assert!(!error.read_may_be_in_flight);
+        assert_eq!(core.status().state, RuntimeState::Running);
+        assert_eq!(core.status().receive_slots_in_use, 0);
+        assert!(core.backend.sync_batches.is_empty());
         core.shutdown().unwrap();
     }
 

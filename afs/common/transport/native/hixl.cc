@@ -17,6 +17,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <set>
 #include <string>
 #include <vector>
@@ -452,6 +453,24 @@ void reserve_batch(Runtime *runtime, const BatchPlan &plan) {
     }
 }
 
+void release_reservation(Runtime *runtime, const BatchPlan &plan) noexcept {
+    for (size_t slot_id : plan.slot_ids) {
+        runtime->receive[slot_id].in_use = false;
+    }
+}
+
+// Test seam: the fake-boundary bridge test recompiles this file with
+// AFS_HIXL_TEST_FAULT_INJECTION so it can fail deterministically between Host
+// slot reservation and the dispatch boundary. Production builds neither
+// define nor call this helper.
+#ifdef AFS_HIXL_TEST_FAULT_INJECTION
+void fail_before_dispatch_for_test() {
+    if (std::getenv("AFS_HIXL_TEST_FAIL_BEFORE_DISPATCH") != nullptr) {
+        throw std::bad_alloc();
+    }
+}
+#endif
+
 void release_batch(Runtime *runtime, const Request &request) {
     for (const RequestEntry &entry : request.entries) {
         HostSlot &slot = runtime->receive[entry.slot_id];
@@ -762,7 +781,9 @@ extern "C" uint32_t afs_hixl_submit_read_batch(void *opaque,
                                                size_t error_len) {
     auto *runtime = static_cast<Runtime *>(opaque);
     bool invoked = false;
+    bool reserved = false;
     Request *request = nullptr;
+    BatchPlan plan;
     if (out_request == nullptr || dispatch_started == nullptr) {
         write_error(error, error_len, "invalid HIXL submit output arguments");
         return kParamInvalid;
@@ -786,7 +807,6 @@ extern "C" uint32_t afs_hixl_submit_read_batch(void *opaque,
         if (request == nullptr) {
             return kResourceExhausted;
         }
-        BatchPlan plan;
         status = plan_batch(runtime, windows, count, 0, plan, error, error_len);
         if (status != kSuccess) {
             return status;
@@ -796,6 +816,10 @@ extern "C" uint32_t afs_hixl_submit_read_batch(void *opaque,
         // Entering TransferAsync is the uncertainty boundary. A failure or
         // exception after this point does not prove that no DMA was submitted.
         reserve_batch(runtime, plan);
+        reserved = true;
+#ifdef AFS_HIXL_TEST_FAULT_INJECTION
+        fail_before_dispatch_for_test();
+#endif
         request->entries = plan.entries;
         request->length = plan.output_length;
         request->active = true;
@@ -813,11 +837,19 @@ extern "C" uint32_t afs_hixl_submit_read_batch(void *opaque,
         }
         return kSuccess;
     } catch (const std::exception &exception) {
-        if (invoked && request != nullptr) { quarantine_request(runtime, *request); }
+        if (invoked && request != nullptr) {
+            quarantine_request(runtime, *request);
+        } else if (reserved) {
+            release_reservation(runtime, plan);
+        }
         write_error(error, error_len, exception.what());
         return kFailed;
     } catch (...) {
-        if (invoked && request != nullptr) { quarantine_request(runtime, *request); }
+        if (invoked && request != nullptr) {
+            quarantine_request(runtime, *request);
+        } else if (reserved) {
+            release_reservation(runtime, plan);
+        }
         write_error(error, error_len, "unknown exception submitting HIXL batch READ");
         return kFailed;
     }
@@ -855,7 +887,9 @@ extern "C" uint32_t afs_hixl_read_sync_batch(void *opaque,
                                              size_t error_len) {
     auto *runtime = static_cast<Runtime *>(opaque);
     bool invoked = false;
+    bool reserved = false;
     Request request;
+    BatchPlan plan;
     if (dispatch_started == nullptr || sdk_transfer_ns == nullptr || output_copy_ns == nullptr) {
         write_error(error, error_len, "missing HIXL batch read timing output");
         return kParamInvalid;
@@ -876,10 +910,13 @@ extern "C" uint32_t afs_hixl_read_sync_batch(void *opaque,
             write_error(error, error_len, "HIXL READ peer is not connected");
             return kNotConnected;
         }
-        BatchPlan plan;
         const uint32_t planned = plan_batch(runtime, windows, count, output_len, plan, error, error_len);
         if (planned != kSuccess) { return planned; }
         reserve_batch(runtime, plan);
+        reserved = true;
+#ifdef AFS_HIXL_TEST_FAULT_INJECTION
+        fail_before_dispatch_for_test();
+#endif
         request.entries = plan.entries;
         request.length = plan.output_length;
         request.active = true;
@@ -905,11 +942,19 @@ extern "C" uint32_t afs_hixl_read_sync_batch(void *opaque,
         release_batch(runtime, request);
         return kSuccess;
     } catch (const std::exception &exception) {
-        if (invoked) { quarantine_request(runtime, request); }
+        if (invoked) {
+            quarantine_request(runtime, request);
+        } else if (reserved) {
+            release_reservation(runtime, plan);
+        }
         write_error(error, error_len, exception.what());
         return kFailed;
     } catch (...) {
-        if (invoked) { quarantine_request(runtime, request); }
+        if (invoked) {
+            quarantine_request(runtime, request);
+        } else if (reserved) {
+            release_reservation(runtime, plan);
+        }
         write_error(error, error_len, "unknown exception during HCCS relay batch READ");
         return kFailed;
     }

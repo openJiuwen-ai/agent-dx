@@ -28,7 +28,7 @@ class AfsBuildBoundaryTests(unittest.TestCase):
                               "esac\n")
                 binaries = root / "target" / "release"
                 binaries.mkdir(parents=True)
-                for name in ("adx-apiserver", "adx-ingress", "adx-relay", "adxctl",
+                for name in ("adx-activator", "adx-apiserver", "adx-ingress", "adx-relay", "adxctl",
                              "adx-inspect", "adx-coordinator", "adxlet", "adx-execd"):
                     (binaries / name).write_text("fixture")
             for name, body in {

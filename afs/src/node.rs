@@ -2118,7 +2118,8 @@ async fn run_node(
             } else {
                 Arc::new(
                     rpc::peer::GrpcChunkTransfer::new(peer_connections.clone(), timeout)?
-                        .with_move_metrics(dfs_read_move_metrics.clone()),
+                        .with_move_metrics(dfs_read_move_metrics.clone())
+                        .with_read_group(grpc_group),
                 )
             };
         let dfs_read_transport_metrics =

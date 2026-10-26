@@ -769,6 +769,14 @@ impl HixlChunkTransfer {
         self
     }
 
+    fn grpc_fallback(&self, timeout: Duration) -> afs_error::Result<GrpcChunkTransfer> {
+        let mut fallback = GrpcChunkTransfer::new(self.context.peers.clone(), timeout)?;
+        if let Some(group) = self.context.group {
+            fallback = fallback.with_read_group(Some(group.bytes as u64));
+        }
+        Ok(fallback)
+    }
+
     /// Retires an idle peer session after `idle_ms`; zero keeps it for the process.
     pub fn with_session_idle(mut self, idle_ms: u64) -> Self {
         self.context.session_idle = session_idle_limit(idle_ms);
@@ -925,11 +933,7 @@ impl ChunkTransfer for HixlChunkTransfer {
             )
         {
             let remaining = remaining(deadline)?;
-            let mut fallback = GrpcChunkTransfer::new(self.context.peers.clone(), remaining)?;
-            if let Some(group) = self.context.group {
-                fallback = fallback.with_read_group(Some(group.bytes as u64));
-            }
-            let result = fallback.read_ranges(batch, out);
+            let result = self.grpc_fallback(remaining)?.read_ranges(batch, out);
             if result.is_ok()
                 && let Some(metrics) = &self.context.metrics
             {
@@ -974,8 +978,7 @@ impl ChunkTransfer for HixlChunkTransfer {
                 let remaining = remaining(deadline)?;
                 self.context
                     .observe(Operation::Fallback, started.elapsed(), true);
-                GrpcChunkTransfer::new(self.context.peers.clone(), remaining)?
-                    .read_ranges(batch, out)
+                self.grpc_fallback(remaining)?.read_ranges(batch, out)
             }
         }
     }
@@ -4028,6 +4031,17 @@ mod tests {
             export_slots: usize,
             mode: HixlDfsReadMode,
         ) -> Harness {
+            harness_with_capabilities(lanes, window_bytes, export_slots, mode, true, None).await
+        }
+
+        async fn harness_with_capabilities(
+            lanes: u16,
+            window_bytes: usize,
+            export_slots: usize,
+            mode: HixlDfsReadMode,
+            source_supported: bool,
+            group: Option<ReadGroupPolicy>,
+        ) -> Harness {
             let temp = tempfile::tempdir().unwrap();
             let local = Arc::new(LocalChunkStore::open(temp.path(), "source").unwrap());
             let staged = StagedChunk::new(
@@ -4059,7 +4073,7 @@ mod tests {
                 DfsChunkTransportResources {
                     rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
                     payload_metrics: None,
-                    hixl: Some(source.clone()),
+                    hixl: source_supported.then(|| source.clone()),
                 },
             );
             let (stop, stopping) = tokio::sync::oneshot::channel();
@@ -4080,19 +4094,21 @@ mod tests {
                 )
                 .unwrap(),
             );
-            let reader = Arc::new(
-                HixlChunkTransfer::from_runtime(
-                    peers,
-                    Arc::new(ReaderNative {
-                        boundary: native.clone(),
-                        lanes,
-                        window_bytes,
-                    }),
-                    mode,
-                    Duration::from_secs(5),
-                )
-                .unwrap(),
-            );
+            let mut reader = HixlChunkTransfer::from_runtime(
+                peers,
+                Arc::new(ReaderNative {
+                    boundary: native.clone(),
+                    lanes,
+                    window_bytes,
+                }),
+                mode,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            if let Some(group) = group {
+                reader = reader.with_read_group(group, export_slots);
+            }
+            let reader = Arc::new(reader);
             let batch = read_batch(chunk_id, &endpoint);
             Harness {
                 _temp: temp,
@@ -4175,6 +4191,60 @@ mod tests {
                 0,
                 "a peer without a free lane shares the least-used one"
             );
+            stop.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn unsupported_fallback_preserves_the_group_budget() {
+            let Harness {
+                _temp,
+                native,
+                reader,
+                mut batch,
+                stop,
+                server,
+                ..
+            } = harness_with_capabilities(
+                2,
+                2,
+                1,
+                HixlDfsReadMode::Preferred,
+                false,
+                Some(ReadGroupPolicy {
+                    bytes: 1024,
+                    max_inflight: 1,
+                    max_descriptors: crate::node::dfs_read::MAX_DFS_GROUP_OPS,
+                    host_budget_bytes: 2048,
+                }),
+            )
+            .await;
+            let template = batch.operations[0].clone();
+            batch.operations = (0..=crate::node::dfs_read::MAX_DFS_READ_OPS)
+                .map(|index| {
+                    let mut operation = template.clone();
+                    operation.op.length = 1;
+                    operation.op.output_offset = index;
+                    operation
+                })
+                .collect();
+            let expected = vec![b'a'; batch.operations.len()];
+
+            let output = tokio::task::spawn_blocking(move || {
+                let mut output = vec![b'!'; batch.operations.len()];
+                reader
+                    .grpc_fallback(reader.context.timeout)?
+                    .read_ranges(&batch, &mut output)?;
+                Ok::<_, afs_error::Error>(output)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(output, expected);
+            assert!(native.memory.lock().unwrap().reads.is_empty());
             stop.send(()).unwrap();
             tokio::time::timeout(Duration::from_secs(1), server)
                 .await

@@ -13,6 +13,7 @@ fn bridge_enforces_device_roce_direction_and_uncertain_submission_retention() {
     let mut build = Command::new(compiler);
     build
         .arg("-std=c++17")
+        .arg("-DAFS_HIXL_TEST_FAULT_INJECTION")
         .arg(format!("-I{}", sdk.join("include").display()))
         .arg(root.join("tests/native/hixl_bridge_test.cc"))
         .arg(root.join("native/hixl.cc"));
@@ -47,6 +48,7 @@ fn bridge_enforces_device_roce_direction_and_uncertain_submission_retention() {
         "completed",
         "failed-poll",
         "pre-submit-invalid",
+        "roce-pre-dispatch-bad-alloc",
         "startup-cleanup-failed",
         "shared-acl-device-leases",
         "shared-acl-same-device-leases",
@@ -60,6 +62,7 @@ fn bridge_enforces_device_roce_direction_and_uncertain_submission_retention() {
         "hccs-failed",
         "hccs-exception",
         "hccs-pre-submit-invalid",
+        "hccs-pre-dispatch-bad-alloc",
         "hccs-invalid-pool",
         "hccs-unsupported-soc",
         "hccs-null-soc",

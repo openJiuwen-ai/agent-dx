@@ -144,6 +144,11 @@ impl FuseMountOptions {
             .unwrap_or(usize::from(self.fuse_workers) * 8)
     }
 
+    fn for_ownerfs(mut self) -> Self {
+        self.dfs_fuse_max_io_bytes = DEFAULT_MAX_IO_BYTES;
+        self
+    }
+
     fn validate(self) -> Result<Self> {
         self.dfs_read_pipeline.validate()?;
         if !(1..=64).contains(&self.fuse_threads)
@@ -837,7 +842,7 @@ fn mount_ownerfs_inner(
     metrics: Option<FuseRequestMetrics>,
     options: FuseMountOptions,
 ) -> Result<MountedFuse> {
-    let options = options.validate()?;
+    let options = options.for_ownerfs().validate()?;
     let path = canonical_mount_path(path)?;
     reject_existing_mount(&path)?;
     let mut fs = AfsFuse::with_mount_options(ownerfs.clone(), options);
@@ -5399,6 +5404,13 @@ mod dispatch_tests {
             super::DEFAULT_MAX_IO_BYTES
         );
         assert_eq!(default.mount_options.dfs_fuse_max_io_bytes, 1024 * 1024);
+
+        let ownerfs = super::FuseMountOptions {
+            dfs_fuse_max_io_bytes: 4 * 1024 * 1024,
+            ..Default::default()
+        }
+        .for_ownerfs();
+        assert_eq!(ownerfs.dfs_fuse_max_io_bytes, 1024 * 1024);
 
         let dfs = super::AfsFuse::with_mount_options(
             Arc::new(RootOnlyBackend),
