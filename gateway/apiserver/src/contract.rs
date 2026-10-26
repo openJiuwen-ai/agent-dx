@@ -8,6 +8,7 @@ use tonic::Status;
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct Create {
+    process: Option<adx_core::execution::WorkloadProcess>,
     name: String,
     namespace: String,
     image: String,
@@ -795,6 +796,7 @@ pub fn create_spec_with_environment(
     let environment = adx_core::execution::ExecutionOptions {
         user: r.user,
         group: r.group,
+        process: r.process,
         cwd: r.cwd,
         tunnel_http_port: if r.tunnel.enabled {
             Some(

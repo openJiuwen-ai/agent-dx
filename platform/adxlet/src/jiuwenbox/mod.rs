@@ -499,6 +499,11 @@ impl Jiuwenbox {
             spec.execution.tunnel_http_port,
             &self.launch,
         )?;
+        if spec.execution.process.is_some() {
+            return Err(Error::Invalid(
+                "Jiuwenbox workload process overrides are unsupported".into(),
+            ));
+        }
         if !devices.is_empty()
             || !spec.execution.extra_config.is_empty()
             || spec.execution.limits.disk_bytes > 0

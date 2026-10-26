@@ -58,14 +58,35 @@ pub(crate) struct Failure {
     pub message: String,
 }
 
+struct ManagedChild {
+    process: Arc<Mutex<std::process::Child>>,
+    process_group: i32,
+    stderr_tail: Arc<Mutex<Vec<u8>>>,
+}
+
+fn terminate_process_group(process_group: i32) -> std::io::Result<()> {
+    // SAFETY: every positive ID passed here belongs to a workload command that was
+    // spawned as the leader of its own process group. The negative ID targets only
+    // that command and its descendants.
+    let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
 enum State {
     Disabled,
     Failed(Failure),
     Running {
         pid: u32,
         started_at: u64,
-        started: Instant,
-        child: Arc<Mutex<std::process::Child>>,
+        children: Vec<Arc<Mutex<std::process::Child>>>,
     },
     Exited(ExitInfo),
 }
@@ -118,15 +139,17 @@ impl Manager {
                 inner.create_completed = true;
                 Ok(())
             }
-            State::Running { child, .. } => {
-                child
-                    .lock()
-                    .expect("entrypoint child poisoned")
-                    .try_wait()
-                    .map_err(|error| Failure {
-                        code: FailureCode::ProcessFailed,
-                        message: format!("failed to inspect image entrypoint: {error}"),
-                    })?;
+            State::Running { children, .. } => {
+                for child in children {
+                    child
+                        .lock()
+                        .expect("entrypoint child poisoned")
+                        .try_wait()
+                        .map_err(|error| Failure {
+                            code: FailureCode::ProcessFailed,
+                            message: format!("failed to inspect image entrypoint: {error}"),
+                        })?;
+                }
                 inner.create_completed = true;
                 Ok(())
             }
@@ -185,49 +208,114 @@ fn start_from_environment(manager: Arc<Manager>) {
     };
     std::env::remove_var(CONFIG_ENV);
     let path = PathBuf::from(raw_path);
-    let spec = match read_spec(&path) {
-        Ok(spec) => spec,
-        Err(message) => {
-            manager.fail(FailureCode::InvalidConfiguration, message);
-            return;
-        }
-    };
-
-    let identity = match resolve_identity(&spec.user) {
-        Ok(identity) => identity,
-        Err(message) => {
-            manager.fail(FailureCode::InvalidConfiguration, message);
-            return;
-        }
-    };
-    let _ = PROCESS_SPEC.set(spec.clone());
-    let stderr_tail = Arc::new(Mutex::new(Vec::new()));
-    let mut command = Command::new(&spec.args[0]);
-    command
-        .args(&spec.args[1..])
-        .current_dir(&spec.cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    child_env::apply(&mut command);
-    apply_identity(&mut command, identity);
-
-    let mut child = match command.spawn() {
-        Ok(child) => child,
+    let process = std::env::var(adx_core::execution::WORKLOAD_PROCESS_ENV);
+    std::env::remove_var(adx_core::execution::WORKLOAD_PROCESS_ENV);
+    let process = match process {
+        Ok(value) => match serde_json::from_str::<adx_core::execution::WorkloadProcess>(&value) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                manager.fail(
+                    FailureCode::InvalidConfiguration,
+                    format!("invalid workload process: {error}"),
+                );
+                return;
+            }
+        },
+        Err(std::env::VarError::NotPresent) => None,
         Err(error) => {
             manager.fail(
-                FailureCode::ProcessFailed,
-                format!("failed to spawn image entrypoint: {error}"),
+                FailureCode::InvalidConfiguration,
+                format!("invalid workload process: {error}"),
             );
             return;
         }
     };
-    let pid = child.id();
+    let specs = match read_specs(&path, process.as_ref()) {
+        Ok(specs) => specs,
+        Err(message) => {
+            manager.fail(FailureCode::InvalidConfiguration, message);
+            return;
+        }
+    };
+
+    let Some(first) = specs.first() else {
+        manager.fail(
+            FailureCode::InvalidConfiguration,
+            "workload has no startup command",
+        );
+        return;
+    };
+    let _ = PROCESS_SPEC.set(first.clone());
+    let mut children: Vec<ManagedChild> = Vec::new();
+    for spec in specs {
+        let identity = match resolve_identity(&spec.user) {
+            Ok(identity) => identity,
+            Err(message) => {
+                manager.fail(FailureCode::InvalidConfiguration, message);
+                return;
+            }
+        };
+        let stderr_tail = Arc::new(Mutex::new(Vec::new()));
+        let mut command = Command::new(&spec.args[0]);
+        command
+            .args(&spec.args[1..])
+            .current_dir(&spec.cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        child_env::apply(&mut command);
+        command.process_group(0);
+        apply_identity(&mut command, identity);
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                for child in &children {
+                    let _ = terminate_process_group(child.process_group);
+                    let mut child = child.process.lock().expect("entrypoint child poisoned");
+                    let _ = child.wait();
+                }
+                manager.fail(
+                    FailureCode::ProcessFailed,
+                    format!("failed to spawn image entrypoint: {error}"),
+                );
+                return;
+            }
+        };
+        let process_group = match i32::try_from(child.id()) {
+            Ok(process_group) if process_group > 0 => process_group,
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                for child in &children {
+                    let _ = terminate_process_group(child.process_group);
+                    let _ = child
+                        .process
+                        .lock()
+                        .expect("entrypoint child poisoned")
+                        .wait();
+                }
+                manager.fail(
+                    FailureCode::ProcessFailed,
+                    "failed to assign image entrypoint process group",
+                );
+                return;
+            }
+        };
+        spawn_tee_reader(child.stdout.take(), false, None);
+        spawn_tee_reader(child.stderr.take(), true, Some(stderr_tail.clone()));
+        children.push(ManagedChild {
+            process: Arc::new(Mutex::new(child)),
+            process_group,
+            stderr_tail,
+        });
+    }
     let started_at = unix_millis();
     let started = Instant::now();
-    spawn_tee_reader(child.stdout.take(), false, None);
-    spawn_tee_reader(child.stderr.take(), true, Some(stderr_tail.clone()));
-    let child = Arc::new(Mutex::new(child));
+    let handles: Vec<_> = children
+        .iter()
+        .map(|child| (child.process.clone(), child.process_group))
+        .collect();
+    let pid = handles[0].0.lock().expect("entrypoint child poisoned").id();
     manager
         .inner
         .lock()
@@ -235,63 +323,68 @@ fn start_from_environment(manager: Arc<Manager>) {
         .state = State::Running {
         pid,
         started_at,
-        started,
-        child: child.clone(),
+        children: handles.iter().map(|(child, _)| child.clone()).collect(),
     };
-    std::thread::spawn(move || {
-        let status = loop {
-            // Release the child lock before sleeping so startup can inspect it
-            // without blocking the single-threaded runtime's control listener.
-            let result = {
-                let mut child = child.lock().expect("entrypoint child poisoned");
-                child.try_wait()
+    let remaining = Arc::new(std::sync::atomic::AtomicUsize::new(children.len()));
+    for child in children {
+        let stderr_tail = child.stderr_tail;
+        let child = child.process;
+        let manager = manager.clone();
+        let handles = handles.clone();
+        let remaining = remaining.clone();
+        std::thread::spawn(move || {
+            let pid = child.lock().expect("entrypoint child poisoned").id();
+            let status = loop {
+                let result = child.lock().expect("entrypoint child poisoned").try_wait();
+                match result {
+                    Ok(Some(status)) => break Ok(status),
+                    Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                    Err(error) => break Err(error),
+                }
             };
-            match result {
-                Ok(Some(status)) => break Ok(status),
-                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                Err(error) => break Err(error),
+            let failed = status.as_ref().map_or(true, |status| !status.success());
+            let mut inner = manager.inner.lock().expect("entrypoint state poisoned");
+            let last = remaining.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1;
+            if !failed && !last {
+                return;
             }
-        };
-        let exited_at = unix_millis();
-        let (started_at, runtime_ms) = {
-            let inner = manager.inner.lock().expect("entrypoint state poisoned");
-            match &inner.state {
-                State::Running {
+            let exited_at = unix_millis();
+            let runtime_ms = started.elapsed().as_millis() as u64;
+            let stderr_tail =
+                String::from_utf8_lossy(&stderr_tail.lock().expect("entrypoint stderr poisoned"))
+                    .into_owned();
+            let info = match status {
+                Ok(status) => {
+                    exit_info(pid, status, started_at, exited_at, runtime_ms, stderr_tail)
+                }
+                Err(error) => ExitInfo {
+                    kind: "entrypoint_exited",
+                    pid,
+                    status_kind: "wait_failed",
+                    exit_code: None,
+                    signal: None,
+                    signal_name: None,
+                    shell_exit_code: -1,
+                    core_dumped: false,
                     started_at,
-                    started,
-                    ..
-                } => (*started_at, started.elapsed().as_millis() as u64),
-                _ => (exited_at, 0),
+                    exited_at,
+                    runtime_ms,
+                    stderr_tail,
+                    message: format!("failed to wait for image entrypoint: {error}"),
+                },
+            };
+            if matches!(inner.state, State::Running { .. }) {
+                inner.state = State::Exited(info);
             }
-        };
-        let stderr_tail =
-            String::from_utf8_lossy(&stderr_tail.lock().expect("entrypoint stderr poisoned"))
-                .into_owned();
-        let info = match status {
-            Ok(status) => exit_info(pid, status, started_at, exited_at, runtime_ms, stderr_tail),
-            Err(error) => ExitInfo {
-                kind: "entrypoint_exited",
-                pid,
-                status_kind: "wait_failed",
-                exit_code: None,
-                signal: None,
-                signal_name: None,
-                shell_exit_code: -1,
-                core_dumped: false,
-                started_at,
-                exited_at,
-                runtime_ms,
-                stderr_tail,
-                message: format!("failed to wait for image entrypoint: {error}"),
-            },
-        };
-        manager
-            .inner
-            .lock()
-            .expect("entrypoint state poisoned")
-            .state = State::Exited(info);
-        manager.changed.notify_all();
-    });
+            drop(inner);
+            if failed {
+                for (_, process_group) in &handles {
+                    let _ = terminate_process_group(*process_group);
+                }
+            }
+            manager.changed.notify_all();
+        });
+    }
 }
 
 fn apply_identity(command: &mut Command, identity: Option<Identity>) {
@@ -332,7 +425,18 @@ pub(crate) fn probe_command(argv: &[String]) -> Result<tokio::process::Command, 
     Ok(command)
 }
 
+#[cfg(test)]
 fn read_spec(path: &Path) -> Result<ProcessSpec, String> {
+    read_specs(path, None)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "image has no startup command".into())
+}
+
+fn read_specs(
+    path: &Path,
+    process: Option<&adx_core::execution::WorkloadProcess>,
+) -> Result<Vec<ProcessSpec>, String> {
     validate_canonical_absolute_path(path, "image process config")?;
     let mut file = OpenOptions::new()
         .read(true)
@@ -372,6 +476,34 @@ fn read_spec(path: &Path) -> Result<ProcessSpec, String> {
             spec.version
         ));
     }
+    let mut base = spec;
+    if let Some(process) = process {
+        process.validate().map_err(|error| error.to_string())?;
+        if let Some(user) = &process.user {
+            base.user.clone_from(user);
+        }
+        if let Some(cwd) = &process.cwd {
+            base.cwd.clone_from(cwd);
+        }
+    }
+    let specs = if let Some(commands) = process.and_then(|value| value.commands.as_ref()) {
+        commands
+            .iter()
+            .map(|args| ProcessSpec {
+                args: args.clone(),
+                ..base.clone()
+            })
+            .collect()
+    } else {
+        vec![base]
+    };
+    for spec in &specs {
+        validate_spec(spec)?;
+    }
+    Ok(specs)
+}
+
+fn validate_spec(spec: &ProcessSpec) -> Result<(), String> {
     if spec.args.is_empty() {
         return Err("image has no startup command".to_string());
     }
@@ -385,7 +517,7 @@ fn read_spec(path: &Path) -> Result<ProcessSpec, String> {
     if spec.user.contains('\0') {
         return Err("image user contains NUL".to_string());
     }
-    Ok(spec)
+    Ok(())
 }
 
 fn validate_canonical_absolute_path(path: &Path, label: &str) -> Result<(), String> {
@@ -694,6 +826,26 @@ mod tests {
     }
 
     #[test]
+    fn workload_user_overrides_the_image_user_without_switching_identity() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("image-process.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"args":["/bin/echo","ok"],"cwd":"/","user":"1000:1000"}"#,
+        )
+        .expect("write spec");
+        let process = adx_core::execution::WorkloadProcess {
+            user: Some("2000:3000".to_string()),
+            ..Default::default()
+        };
+
+        let specs = read_specs(&path, Some(&process)).expect("workload process");
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].user, "2000:3000");
+    }
+
+    #[test]
     fn complete_create_accepts_entrypoint_that_already_exited() {
         let manager = Manager::disabled();
         manager.inner.lock().unwrap().state = State::Exited(ExitInfo {
@@ -727,8 +879,7 @@ mod tests {
         manager.inner.lock().unwrap().state = State::Running {
             pid,
             started_at: 1,
-            started: Instant::now(),
-            child: Arc::new(Mutex::new(child)),
+            children: vec![Arc::new(Mutex::new(child))],
         };
 
         assert!(manager.complete_create().is_ok());

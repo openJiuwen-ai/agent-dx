@@ -132,6 +132,14 @@ message ProbeFailure {
   optional int32 exit_code = 4; optional uint32 http_status = 5;
 }
 
+message WorkloadCommand { repeated string args = 1; }
+message WorkloadProcess {
+  repeated WorkloadCommand commands = 1;
+  // Preserve absent commands separately from an invalid explicit empty list.
+  bool override_commands = 2;
+  optional string user = 3;
+  optional string cwd = 4;
+}
 message ExecutionOptions {
   RootfsSpec rootfs = 1;
   repeated MountSpec mounts = 2;
@@ -151,6 +159,7 @@ message ExecutionOptions {
   // Paired runtime identity; unsupported backends reject rather than ignore it.
   optional string user = 15;
   optional string group = 16;
+  WorkloadProcess process = 17;
 }
 
 enum IdleAction { IDLE_ACTION_DELETE = 0; IDLE_ACTION_PAUSE = 1; }

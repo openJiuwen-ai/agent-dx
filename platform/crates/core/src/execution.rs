@@ -373,6 +373,53 @@ pub struct ResourceLimits {
     pub disk_bytes: u64,
 }
 
+pub const WORKLOAD_PROCESS_ENV: &str = "ADX_WORKLOAD_PROCESS";
+
+/// Explicit workload overrides; unspecified fields retain the image defaults.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkloadProcess {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commands: Option<Vec<Vec<String>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+impl WorkloadProcess {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(commands) = &self.commands {
+            if commands.is_empty()
+                || commands.len() > 32
+                || commands.iter().any(|args| {
+                    args.is_empty()
+                        || args.len() > 256
+                        || args[0].trim().is_empty()
+                        || args.iter().any(|arg| arg.contains('\0'))
+                })
+                || commands.iter().flatten().map(String::len).sum::<usize>() > 65536
+            {
+                return Err(Error::Invalid("invalid workload commands".into()));
+            }
+        }
+        if self.user.as_ref().is_some_and(|user| {
+            user.trim().is_empty()
+                || user.len() > 256
+                || user.chars().any(char::is_control)
+                || user.split(':').count() > 2
+        }) {
+            return Err(Error::Invalid("invalid workload user".into()));
+        }
+        if let Some(cwd) = &self.cwd {
+            validate_cwd(cwd)?;
+            if cwd.split('/').any(|part| matches!(part, "." | "..")) {
+                return Err(Error::Invalid("workload cwd must be canonical".into()));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecutionOptions {
     /// Identity for the runtime daemon and its tool operations. Backend support is required.
@@ -380,6 +427,8 @@ pub struct ExecutionOptions {
     pub user: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process: Option<WorkloadProcess>,
     pub readiness_probe: Option<crate::probes::ProbeSpec>,
     pub healthcheck_probe: Option<crate::probes::ProbeSpec>,
     #[serde(default = "crate::probes::default_init_timeout")]
@@ -449,6 +498,14 @@ impl ExecutionOptions {
             return Err(Error::Invalid(
                 "tool identity cannot override an inherited image process".into(),
             ));
+        }
+        if let Some(process) = &self.process {
+            process.validate()?;
+            if !self.inherit_entrypoint {
+                return Err(Error::Invalid(
+                    "workload process requires inherit_entrypoint".into(),
+                ));
+            }
         }
         self.probe_config().validate()?;
         if self.readiness_probe.is_some() || self.healthcheck_probe.is_some() {

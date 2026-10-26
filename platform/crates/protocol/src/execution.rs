@@ -333,11 +333,49 @@ fn security_pb(value: core::DataPlaneSecurityMode) -> i32 {
     }
 }
 
+impl From<core::WorkloadProcess> for pb::WorkloadProcess {
+    fn from(value: core::WorkloadProcess) -> Self {
+        Self {
+            override_commands: value.commands.is_some(),
+            commands: value
+                .commands
+                .unwrap_or_default()
+                .into_iter()
+                .map(|args| pb::WorkloadCommand { args })
+                .collect(),
+            user: value.user,
+            cwd: value.cwd,
+        }
+    }
+}
+impl TryFrom<pb::WorkloadProcess> for core::WorkloadProcess {
+    type Error = Error;
+    fn try_from(value: pb::WorkloadProcess) -> Result<Self> {
+        if !value.override_commands && !value.commands.is_empty() {
+            return Err(invalid("workload command presence"));
+        }
+        let process = Self {
+            commands: value.override_commands.then(|| {
+                value
+                    .commands
+                    .into_iter()
+                    .map(|command| command.args)
+                    .collect()
+            }),
+            user: value.user,
+            cwd: value.cwd,
+        };
+        process.validate()?;
+        Ok(process)
+    }
+}
+
 impl From<core::ExecutionOptions> for pb::ExecutionOptions {
     fn from(value: core::ExecutionOptions) -> Self {
         Self {
             user: value.user,
             group: value.group,
+            process: value.process.map(Into::into),
             cwd: value.cwd,
             tunnel_http_port: value.tunnel_http_port.map(u32::from),
             rootfs: value.rootfs.map(Into::into),
@@ -370,6 +408,7 @@ impl TryFrom<pb::ExecutionOptions> for core::ExecutionOptions {
         Ok(Self {
             user: value.user,
             group: value.group,
+            process: value.process.map(TryInto::try_into).transpose()?,
             cwd: value.cwd,
             tunnel_http_port: value
                 .tunnel_http_port

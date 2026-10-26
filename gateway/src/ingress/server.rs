@@ -994,7 +994,11 @@ impl Ingress {
             .get::<super::agent_access::BindingNotice>()
             .cloned();
         #[cfg(feature = "agent-api")]
-        let agent_forward = binding_notice.is_some();
+        let agent_forward = binding_notice.is_some()
+            || request
+                .extensions()
+                .get::<super::agent_access::InstanceAccess>()
+                .is_some();
         #[cfg(not(feature = "agent-api"))]
         let agent_forward = false;
         let response = if let Some(response) = agent_data_error {
@@ -1127,10 +1131,6 @@ impl Ingress {
         if ingress_security == IngressSecurity::Plaintext {
             return Err(tls_required());
         }
-        let api = self
-            .agent_api
-            .as_ref()
-            .ok_or_else(|| response_text(StatusCode::NOT_FOUND, "managed access is disabled"))?;
         let identity = self
             .authenticator
             .authenticate_request_identity_with_policy(request, true)
@@ -1144,6 +1144,31 @@ impl Ingress {
         }
         let tenant = identity.tenant_id.clone();
         request.extensions_mut().insert(identity);
+        if let adx_agent_core::target::Target::Instance(id) = &access.target {
+            let port = access.port.ok_or_else(|| {
+                response_text(
+                    StatusCode::BAD_REQUEST,
+                    "instance access requires an explicit port",
+                )
+            })?;
+            request
+                .headers_mut()
+                .remove(adx_agent_core::parameters::HEADER);
+            request
+                .extensions_mut()
+                .insert(super::agent_access::InstanceAccess(ParsedDirectPath {
+                    instance_id: id.clone(),
+                    target_port: port,
+                    stripped_path: access.backend_uri.path().into(),
+                    access_kind: AccessKind::PortForwarding,
+                }));
+            *request.uri_mut() = access.backend_uri;
+            return Ok(());
+        }
+        let api = self
+            .agent_api
+            .as_ref()
+            .ok_or_else(|| response_text(StatusCode::NOT_FOUND, "managed access is disabled"))?;
         api.prepare_data(request, &tenant, access)
             .await
             .map_err(|error| super::agent_response::error_response(error, None))?;
@@ -1204,6 +1229,13 @@ impl Ingress {
     }
 
     fn direct_route<B>(&self, request: &Request<B>) -> Option<ParsedDirectPath> {
+        #[cfg(feature = "agent-api")]
+        if let Some(access) = request
+            .extensions()
+            .get::<super::agent_access::InstanceAccess>()
+        {
+            return Some(access.0.clone());
+        }
         self.port_host_route(request).or_else(|| {
             parse_direct_path(
                 request.uri().path(),

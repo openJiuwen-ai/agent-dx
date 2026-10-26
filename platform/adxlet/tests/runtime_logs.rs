@@ -39,8 +39,28 @@ fn runtime_paths_are_distinct_and_cannot_escape_the_log_directory() {
             .to_str()
             .unwrap()
     );
-    assert!(logs.paths("../outside").is_err());
-    assert!(logs.paths("environment/other").is_err());
+    for runtime in [
+        "env-alice+jiuwenswarm-2",
+        "env-用户:agent name-1",
+        ".environment-1",
+    ] {
+        let (out, err) = logs.paths(runtime).unwrap();
+        assert_eq!(std::path::Path::new(&out).parent(), Some(directory.path()));
+        fs::write(out, "stdout").unwrap();
+        fs::write(err, "stderr").unwrap();
+    }
+    for runtime in [
+        "",
+        ".",
+        "..",
+        "../outside",
+        "environment/other",
+        "environment\\other",
+        "env\n1",
+        "env\0",
+    ] {
+        assert!(logs.paths(runtime).is_err(), "{runtime:?}");
+    }
 }
 
 #[test]

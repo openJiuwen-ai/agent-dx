@@ -44,14 +44,21 @@ pub fn parse_direct_path(
 
     let rest = normalized.strip_prefix('/')?;
     let mut segments = rest.splitn(3, '/');
-    let instance_id = segments.next()?.trim();
+    let instance_id = percent_encoding::percent_decode_str(segments.next()?)
+        .decode_utf8()
+        .ok()?;
     let target_port = segments.next()?.parse::<u16>().ok()?;
-    if instance_id.is_empty() || target_port == 0 {
+    if instance_id.trim().is_empty()
+        || instance_id
+            .chars()
+            .any(|c| c.is_control() || c == '/' || c == '\\')
+        || target_port == 0
+    {
         return None;
     }
     let tail = segments.next().unwrap_or("");
     Some(ParsedDirectPath {
-        instance_id: instance_id.to_owned(),
+        instance_id: instance_id.into_owned(),
         target_port,
         stripped_path: if tail.is_empty() {
             "/".to_owned()
@@ -148,6 +155,22 @@ mod tests {
             }
         );
         assert!(parse_direct_path("/direct/", 50090, 8765).is_none());
+    }
+
+    #[test]
+    fn direct_paths_decode_environment_ids_once_without_changing_the_guest_path() {
+        for (encoded, expected) in [
+            ("env-alice%2Bjiuwenswarm", "env-alice+jiuwenswarm"),
+            ("env-alice%252Bjiuwenswarm", "env-alice%2Bjiuwenswarm"),
+        ] {
+            let route =
+                parse_direct_path(&format!("/direct/{encoded}/file%20name"), 50090, 8765).unwrap();
+            assert_eq!(route.instance_id, expected);
+            assert_eq!(route.stripped_path, "/file%20name");
+        }
+        for encoded in ["env%2Fother", "env%5Cother", "env%00other", "%FF"] {
+            assert!(parse_direct_path(&format!("/direct/{encoded}/invoke"), 50090, 8765).is_none());
+        }
     }
 
     #[test]

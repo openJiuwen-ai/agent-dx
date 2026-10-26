@@ -371,6 +371,24 @@ access uses the API Server instance directory for admission and the shared data
 plane for Relay/Execd transport. PlatformEnvironment and its runtime lookup have been
 removed.
 
+### Explicit Environment HTTP/WS access
+
+A Gateway built with `agent-api` also accepts
+`/agent/http[/business/path]?target=urn:adx:instance:<environment-id>&port=<port>`
+and `/agent/ws` with the same query. Instance access requires an explicit nonzero
+port, HTTPS and a tenant API Key authorized for the existing Environment.
+URN components are percent-encoded before URL query encoding. HTTP rejects
+WebSocket Upgrade; WS requires GET and WebSocket Upgrade.
+
+This path does not need `ADX_AGENT_CONFIG`, a Template, Binding, Activator or the
+Jiuwen module. The caller first creates the Environment through the public
+Environment API. Ingress reuses the normal authorized port-forwarding route,
+including route publication and traffic-triggered resume. It strips platform
+credentials, initialization headers and routing query parameters before
+forwarding the business path, query, HTTP body or WebSocket traffic. Instance
+access neither creates a Binding nor emits Binding identity headers. Managed
+Template/Binding access keeps its existing activation behavior.
+
 ### Managed Agent service access
 
 With `agent-api`, `AgentApi::service_access()` supplies `AgentV2Access` backed by

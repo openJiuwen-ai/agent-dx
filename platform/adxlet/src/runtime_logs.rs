@@ -59,10 +59,10 @@ impl RuntimeLogPolicy {
         self.validate()?;
         if runtime_id.is_empty()
             || runtime_id.len() > 240
-            || runtime_id.starts_with('.')
-            || !runtime_id
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+            || matches!(runtime_id, "." | "..")
+            || runtime_id
+                .chars()
+                .any(|c| c.is_control() || c == '/' || c == '\\')
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

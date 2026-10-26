@@ -60,6 +60,7 @@ fn environment_options_roundtrip_preserves_backend_contract() {
         ports: vec![8080],
         failover: true,
         inherit_entrypoint: false,
+        process: None,
         readiness_probe: None,
         healthcheck_probe: None,
         init_timeout_seconds: 0,

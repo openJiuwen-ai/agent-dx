@@ -2,6 +2,8 @@
 
 机器可读定义为 [data-plane.yaml](../openapi/data-plane.yaml)。用户通过 Ingress
 访问 `POST /direct/{environmentId}/invoke`，请求为 `action`、`args` 和可选 `requestId`。
+`environmentId` 按 URL 路径段编码，Ingress 只解码一次；例如名称中的 `+` 可编码为 `%2B`。
+后续业务路径保持原始编码，解码后的 Environment ID 不允许控制字符或路径分隔符。
 Ingress 校验 API Key 与归属，Relay 核对运行时绑定，再转发给 Execd 的 `/invoke`。
 运行时协作与 Unix checkpoint 使用独立的 [控制契约](runtime-control.md)。
 

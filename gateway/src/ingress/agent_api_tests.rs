@@ -889,21 +889,33 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
     let mut gateway = Arc::try_unwrap(gateway).ok().unwrap().with_agent_api(api);
     gateway.control_plane_routes = Arc::new(vec![StaticRoute::Prefix("/api".into())]);
     let gateway = Arc::new(gateway);
-    {
+    let fixed = Arc::new(Ingress::new(
+        Arc::new(IngressRouteResolver::new(routes)),
+        DataPlaneL4Connector::new(H2PoolConfig::default()),
+        IngressAuthenticator::with_verifier(Arc::new(Identity)),
+        50090,
+        8765,
+        "127.0.0.1:1",
+        vec![StaticRoute::Prefix("/api".into())],
+    ));
+    for (gateway, selector, binding_headers) in [
+        (gateway, "target=urn:adx:binding:demo:1:env", true),
+        (fixed, "target=urn:adx:instance:api", false),
+    ] {
         let (mut sender, server, client) = connection(gateway.clone(), IngressSecurity::Tls).await;
-        let selector = "target=urn:adx:binding:demo:1:env";
         let req = Request::builder()
             .method("POST")
             .uri(format!("/agent/http/chat?{selector}&port={port}&q=a&q=b"))
             .header("host", "public.example")
             .header("x-business", "keep")
             .header("authorization", "Bearer tenant")
+            .header("x-adx-parameters", "%malformed")
             .body(Full::new(Bytes::from_static(b"business-body")))
             .unwrap();
         let response = sender.send_request(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
         assert_eq!(response.headers()["x-business"], "kept");
-        {
+        if binding_headers {
             assert_eq!(response.headers()["x-adx-binding-id"], "env");
             assert_eq!(
                 response.headers()["x-adx-binding-urn"],
@@ -918,6 +930,8 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
         assert_eq!(uri, "/chat?q=a&q=b");
         assert_eq!(headers["host"], "public.example");
         assert_eq!(headers["x-business"], "keep");
+        assert!(!headers.contains_key("authorization"));
+        assert!(!headers.contains_key("x-adx-parameters"));
         client.abort();
         server.abort();
 
@@ -936,7 +950,7 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
-        {
+        if binding_headers {
             assert_eq!(response.headers()["x-adx-binding-id"], "env");
         }
         let mut upgraded = TokioIo::new(hyper::upgrade::on(&mut response).await.unwrap());
@@ -949,6 +963,27 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
         assert_eq!(headers["sec-websocket-protocol"], "chat");
         client.abort();
         server.abort();
+        for token in ["other", "invalid"] {
+            let (mut sender, server, client) =
+                connection(gateway.clone(), IngressSecurity::Tls).await;
+            let response = sender
+                .send_request(request(
+                    "POST",
+                    &format!("/agent/http/chat?{selector}&port={port}"),
+                    token,
+                    "denied",
+                    serde_json::json!({}),
+                ))
+                .await
+                .unwrap();
+            assert!(matches!(
+                response.status(),
+                StatusCode::FORBIDDEN | StatusCode::NOT_FOUND | StatusCode::UNAUTHORIZED
+            ));
+            assert!(seen.try_recv().is_err());
+            client.abort();
+            server.abort();
+        }
     }
     backend_task.abort();
     node_task.abort();
@@ -1952,3 +1987,61 @@ async fn websocket_retry_refreshes_deleted_or_rebuilt_binding_before_writes() {
 #[cfg(feature = "mock-e2e")]
 #[path = "command_watch_auth_tests.rs"]
 mod command_watch_auth_tests;
+
+#[tokio::test]
+async fn instance_access_authenticates_without_activator_and_keeps_fixed_target() {
+    let (gateway, _) = fixture().await;
+    for path in ["/agent/http/chat", "/agent/ws/chat"] {
+        let builder = Request::builder()
+            .uri(format!("{path}?target=urn:adx:instance:api&port=18092&q=1"))
+            .header("authorization", "Bearer tenant")
+            .header("x-adx-parameters", "%malformed");
+        let builder = if path.starts_with("/agent/ws") {
+            builder.header("upgrade", "websocket")
+        } else {
+            builder
+        };
+        let mut request = builder.body(()).unwrap();
+        gateway
+            .prepare_agent_data(&mut request, IngressSecurity::Tls)
+            .await
+            .unwrap();
+        assert_eq!(request.uri(), "/chat?q=1");
+        let target = gateway.direct_route(&request).unwrap();
+        assert_eq!(target.instance_id, "api");
+        assert_eq!(target.target_port, 18092);
+        assert_eq!(target.stripped_path, "/chat");
+        assert_eq!(
+            request
+                .extensions()
+                .get::<AuthenticatedIdentity>()
+                .unwrap()
+                .tenant_id,
+            "tenant"
+        );
+        assert!(!request.headers().contains_key("x-adx-parameters"));
+        assert!(request
+            .extensions()
+            .get::<super::super::agent_access::BindingNotice>()
+            .is_none());
+    }
+    for (security, token, expected) in [
+        (
+            IngressSecurity::Plaintext,
+            "tenant",
+            StatusCode::UPGRADE_REQUIRED,
+        ),
+        (IngressSecurity::Tls, "invalid", StatusCode::UNAUTHORIZED),
+    ] {
+        let mut request = Request::builder()
+            .uri("/agent/http?target=urn:adx:instance:api&port=18092")
+            .header("authorization", format!("Bearer {token}"))
+            .body(())
+            .unwrap();
+        let response = gateway
+            .prepare_agent_data(&mut request, security)
+            .await
+            .unwrap_err();
+        assert_eq!(response.status(), expected);
+    }
+}

@@ -715,6 +715,14 @@ pub fn start_request(
                 .map_err(|e| Error::Invalid(e.to_string()))?,
         );
     }
+    envs.remove(adx_core::execution::WORKLOAD_PROCESS_ENV);
+    if let Some(process) = &options.process {
+        process.validate()?;
+        envs.insert(
+            adx_core::execution::WORKLOAD_PROCESS_ENV.into(),
+            serde_json::to_string(process).map_err(|error| Error::Invalid(error.to_string()))?,
+        );
+    }
     if options.inherit_entrypoint {
         envs.insert(
             "ADX_IMAGE_PROCESS_CONFIG".into(),

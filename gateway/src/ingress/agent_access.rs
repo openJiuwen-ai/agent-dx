@@ -1,7 +1,10 @@
-//! Managed Agent HTTP/WS target selection and backend path adaptation.
+//! Agent HTTP/WS target selection and backend path adaptation.
 use adx_agent_api::Error;
 use adx_agent_core::{target::Target, Protocol, Scope};
 use http::{HeaderMap, Request};
+
+#[derive(Debug, Clone)]
+pub(super) struct InstanceAccess(pub super::path::ParsedDirectPath);
 
 #[derive(Debug)]
 pub(super) struct AccessRequest {
@@ -87,9 +90,9 @@ impl AccessRequest {
             }
         }
         let target = target.ok_or_else(|| Error::Invalid("managed target required".into()))?;
-        if matches!(target, Target::Instance(_)) {
+        if matches!(target, Target::Instance(_)) && port.is_none() {
             return Err(Error::Invalid(
-                "managed access requires a template or binding target".into(),
+                "instance access requires an explicit port".into(),
             ));
         }
         if websocket != (protocol == Protocol::Ws)
@@ -171,6 +174,31 @@ mod tests {
             let access = AccessRequest::parse(&ws).unwrap().unwrap();
             let expected = "/?q=1";
             assert_eq!(access.backend_uri.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn instance_access_requires_an_explicit_port_and_preserves_business_path() {
+        for path in ["/agent/http/events", "/agent/ws/events"] {
+            let ws = path.starts_with("/agent/ws");
+            let make = |suffix: &str| {
+                let builder = Request::builder().uri(format!(
+                    "{path}?target=urn:adx:instance:default-worker{suffix}"
+                ));
+                let builder = if ws {
+                    builder.header("upgrade", "websocket")
+                } else {
+                    builder
+                };
+                builder.body(()).unwrap()
+            };
+            assert!(AccessRequest::parse(&make("")).is_err());
+            let access = AccessRequest::parse(&make("&port=18092&q=a&q=b"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(access.target, Target::Instance("default-worker".into()));
+            assert_eq!(access.port, Some(18092));
+            assert_eq!(access.backend_uri, "/events?q=a&q=b");
         }
     }
 }

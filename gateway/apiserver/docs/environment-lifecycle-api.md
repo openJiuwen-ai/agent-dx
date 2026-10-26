@@ -311,6 +311,39 @@ ID checks still apply; other lifecycle operations continue to use the local
 directory. This read does not lock the revision against subsequent concurrent
 operations, which may still produce a conflict.
 
+## Workload process overrides
+
+Image creation with `inheritEntrypoint: true` accepts an optional `process`:
+
+```json
+{
+  "image": "registry.example/agentserver:release",
+  "inheritEntrypoint": true,
+  "process": {
+    "commands": [["sh", "-c", "exec jiuwenswarm-agentserver --port 18092"]],
+    "user": "agentos",
+    "cwd": "/home/agentos"
+  }
+}
+```
+
+Omitted fields inherit the image's startup command, user and working directory.
+`commands` replaces the combined OCI Entrypoint/Cmd with 1–32 argv arrays, each
+containing 1–256 arguments. No shell is inserted. Multiple commands start
+concurrently with the same effective user and cwd; a failed command fails the
+workload and terminates its sibling processes. Successful completion waits for
+all commands. Startup readiness and health checks use the same effective identity
+and working directory.
+
+Like an inherited OCI USER, a non-default `user` requires the deployment-owned sandboxd OCI base spec to grant Execd `CAP_SETUID` and `CAP_SETGID` for child identity changes.
+
+`user` accepts the existing image user-resolution syntax (name or numeric UID,
+optionally followed by a group). `cwd` is an absolute canonical path; it must
+already be accessible to that user. This is separate from the constructor `cwd`
+option below. `process` requires `inheritEntrypoint: true`; the Jiuwenbox backend
+does not support these overrides. Environment persistence and internal RPC retain
+the explicit fields across lifecycle operations.
+
 ## Constructor working directory
 
 The create request accepts an optional `cwd` absolute path without control
