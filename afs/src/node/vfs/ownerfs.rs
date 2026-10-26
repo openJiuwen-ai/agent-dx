@@ -4837,8 +4837,9 @@ impl LocalOwnerFs {
         }
         afs_logging::info!("ownerfs.rmdir_root.unmounted"; "root_id" => ?root_id);
 
-        // 3. RootManager::delete_root（revoke → 缓存移除 → Meta deactivate
-        //    → 物理目录 → catalog）。
+        // 3. RootManager::delete_root（物理目录 → revoke + 缓存移除
+        //    → Meta deactivate → catalog）。ENOTEMPTY 等物理删除失败
+        //    零副作用返回，root 仍可访问，本函数第 4 步不会执行。
         self.roots.delete_root(&root_id)?;
         afs_logging::info!("ownerfs.rmdir_root.root_deleted"; "root_id" => ?root_id);
 

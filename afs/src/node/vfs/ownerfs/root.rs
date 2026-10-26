@@ -10,7 +10,7 @@
 use std::{
     collections::{HashMap, HashSet},
     ffi::{OsStr, OsString},
-    os::unix::ffi::OsStrExt,
+    os::unix::ffi::{OsStrExt, OsStringExt},
     sync::{
         Arc, Condvar, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
@@ -519,7 +519,7 @@ impl RootManager {
             return Err(invalid_grant("reserved root does not match this Node"));
         }
 
-        let data_dir = root_data_dir(name, reservation.epoch)?;
+        let data_dir = root_data_dir(name)?;
         let local_prepare_id = format!("{}:{}", reservation.prepare_token, self.session_id);
         match self.disk.mkdir(&data_dir, mode) {
             Ok(()) => {}
@@ -535,13 +535,35 @@ impl RootManager {
                     .scan_roots()?
                     .into_iter()
                     .find(|record| record.id == id);
-                if old.is_none() {
-                    // A crash may leave an empty directory after the Meta
-                    // reservation was canceled. Never silently reuse its
-                    // contents as a new root with the same epoch.
-                    self.disk.remove_dir(&data_dir).map_err(Error::from)?;
-                    self.disk.sync_root().map_err(Error::from)?;
-                    self.disk.mkdir(&data_dir, mode).map_err(Error::from)?;
+                // 裸名目录无法自证代次（D11）：epoch 在无 Draining 换代的
+                // v1 恒为 1，无代次信息量；真正的代次判据是 local_prepare_id
+                // （内嵌每次 Reserve 唯一的 prepare_token:request_id）。同
+                // session 重试经 already_reserved_by_same_intent 幂等路径拿回
+                // 原 token → 匹配 → 同一次创建的崩溃恢复；删除后重建（meta
+                // 原 reservation 已在 Activate 时删除）→ 新 token → 不匹配
+                // → 上一代残留，不得让新 root 静默继承旧数据。
+                match old {
+                    Some(record)
+                        if record.epoch == reservation.epoch
+                            && record.local_prepare_id == local_prepare_id => {}
+                    Some(_) => {
+                        let _ = self.meta.abort_root(&reservation);
+                        return Err(invalid_grant(
+                            "reserved root path belongs to a previous epoch of the same name",
+                        ));
+                    }
+                    None => {
+                        // A crash may leave an empty directory after the Meta
+                        // reservation was canceled. Only an empty directory may
+                        // be reclaimed; non-empty content without a catalog
+                        // record is never silently adopted.
+                        if let Err(error) = self.disk.remove_dir(&data_dir) {
+                            let _ = self.meta.abort_root(&reservation);
+                            return Err(Error::from(error));
+                        }
+                        self.disk.sync_root().map_err(Error::from)?;
+                        self.disk.mkdir(&data_dir, mode).map_err(Error::from)?;
+                    }
                 }
             }
             Err(error) => {
@@ -1035,14 +1057,17 @@ impl RootManager {
 
     /// D4: 完整删除一个 active root。
     ///
-    /// 调用顺序：revoke → 缓存移除 → Meta deactivate → 物理目录 → catalog。
-    /// 每步幂等，部分失败可安全重试。并发 rmdir 中，缓存移除是线性化点：
-    /// 第二个调用在缓存中找不到 root，返回 invalid_grant（FUSE 层转 ENOENT）。
-    /// 物理目录删除先于 catalog 移除：非空目录使 remove_dir 返回 ENOTEMPTY 时
-    /// catalog 记录仍保留，root 可被重启 reconcile 继续收敛，不会成为
-    /// 控制面记录先于数据被清除的孤儿（review: 非空 root 删除失败会丢失控制面记录）。
-    /// Meta 不可达时在 deactivate 处失败并保持 catalog/物理目录不变，
-    /// 残留记录由 reconcile_on_startup 的 zombie 检测在下次启动时清理。
+    /// 调用顺序：物理目录 → revoke + 缓存移除 → Meta deactivate → catalog。
+    /// **物理删除先行**：ENOTEMPTY（非空目录）/ EBUSY 等失败时零副作用返回，
+    /// 缓存/Meta/catalog 原样——用户清空内容后重试 rmdir 即可，与本地
+    /// 文件系统的 POSIX 语义一致（失败的 rmdir 不得使目录消失或不可达）。
+    /// 并发 rmdir 中，缓存移除是线性化点：后到的调用在缓存中找不到 root，
+    /// 返回 invalid_grant（FUSE 层转 ENOENT）；两方同时在物理删除步竞争时，
+    /// 先删者成功，后删者把 NotFound 视为已删除（幂等）继续收敛。
+    /// 崩溃窗口由 reconcile_on_startup 收敛：物理已删 + Meta 仍在 = zombie
+    /// 分支补 deactivate；Meta 已删 + catalog 仍在 = 清理分支移除记录。
+    /// Meta 不可达时在 deactivate 处失败，残留记录由 reconcile_on_startup
+    /// 的 zombie 检测在下次启动时清理。
     pub fn delete_root(&self, id: &RootId) -> Result<()> {
         afs_logging::info!("root.delete_root.start"; "root_id" => ?id);
         let result = self.delete_root_inner(id);
@@ -1058,10 +1083,23 @@ impl RootManager {
     /// 执行步骤见 [`RootManager::delete_root`] 文档；每步成功后记录 info，
     /// 任一步失败时提前返回，统一由外层 `delete_root` 记录失败日志。
     fn delete_root_inner(&self, id: &RootId) -> Result<()> {
-        // 1. revoke — 阻止新的 enter_root。
-        self.revoke_root(id);
+        // 1. 读取 catalog 记录（epoch 供 deactivate 用）。记录缺失 = 状态
+        //    不一致，零副作用报错（缓存尚未触碰）。
+        let records = self.catalog.scan_roots()?;
+        let record = records
+            .into_iter()
+            .find(|record| &record.id == id)
+            .ok_or_else(|| invalid_grant("root catalog record not found"))?;
 
-        // 2. 从缓存移除（并发 rmdir 的线性化点）。
+        // 2. 删除物理目录（零副作用失败点）：ENOTEMPTY/EBUSY 直接返回，
+        //    root 在缓存/Meta/catalog 中原样存活，FUSE 仍可访问——用户
+        //    rm -rf 内容后重试 rmdir 即可。在途 RootUse 的已打开句柄按
+        //    POSIX 语义存活到关闭。
+        self.remove_abandoned_dir(&record.data_dir)?;
+        afs_logging::info!("root.delete_root.dir_removed"; "root_id" => ?id, "data_dir" => ?record.data_dir);
+
+        // 3. revoke + 从缓存移除（并发 rmdir 线性化点）。
+        self.revoke_root(id);
         {
             let mut roots = self
                 .roots
@@ -1074,20 +1112,10 @@ impl RootManager {
         }
         afs_logging::info!("root.delete_root.cache_removed"; "root_id" => ?id);
 
-        // 3. Meta deactivate（epoch 从 catalog 获取）。
-        let records = self.catalog.scan_roots()?;
-        let record = records
-            .into_iter()
-            .find(|record| &record.id == id)
-            .ok_or_else(|| invalid_grant("root catalog record not found"))?;
+        // 4. Meta deactivate（幂等：root 已不在 Meta 时返回 Ok）。
         self.meta
             .deactivate_root(id, record.epoch, &self.local_node_id, &self.session_id)?;
         afs_logging::info!("root.delete_root.meta_deactivated"; "root_id" => ?id, "epoch" => record.epoch);
-
-        // 4. 删除物理目录。先于 catalog 移除：目录删除失败（如非空）时
-        //    catalog 记录仍存在，root 可被重启 reconcile 重新收敛或继续清理。
-        self.remove_abandoned_dir(&record.data_dir)?;
-        afs_logging::info!("root.delete_root.dir_removed"; "root_id" => ?id, "data_dir" => ?record.data_dir);
 
         // 5. 清除 catalog 条目。
         self.catalog.remove_prepared_root(&record)?;
@@ -1146,7 +1174,7 @@ impl RootManager {
         for record in self.catalog.scan_roots()? {
             if record.epoch == 0
                 || root_id_from_name(&record.name)? != record.id
-                || root_data_dir(&record.name, record.epoch)? != record.data_dir
+                || root_data_dir(&record.name)? != record.data_dir
             {
                 return Err(invalid_grant(
                     "local root catalog identity is not canonical",
@@ -1186,7 +1214,7 @@ impl RootManager {
                 ));
             }
             if let Some(record) = records.get(&reservation.id) {
-                let expected_dir = root_data_dir(&record.name, reservation.epoch)?;
+                let expected_dir = root_data_dir(&record.name)?;
                 let expected_prepare_id =
                     format!("{}:{}", reservation.prepare_token, reservation.session_id);
                 if record.epoch != reservation.epoch
@@ -1318,16 +1346,7 @@ impl RootManager {
 }
 
 fn pending_data_dir(reservation: &RootReservation) -> Result<StoragePath> {
-    let Some(encoded_name) = reservation.id.0.strip_prefix("root-") else {
-        return Err(invalid_grant("pending root id is not a canonical name"));
-    };
-    if encoded_name.is_empty()
-        || encoded_name.len() % 2 != 0
-        || !encoded_name.bytes().all(|byte| byte.is_ascii_hexdigit())
-    {
-        return Err(invalid_grant("pending root id is not a canonical name"));
-    }
-    StoragePath::new(format!("{}-e{}", reservation.id.0, reservation.epoch)).map_err(Error::from)
+    root_data_dir(&root_name_from_id(&reservation.id)?)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1533,24 +1552,65 @@ fn unavailable_grant(message: &'static str) -> Error {
 
 /// Encode arbitrary Linux root names without lossy UTF-8 conversion.
 pub fn root_id_from_name(name: &OsStr) -> Result<RootId> {
-    let bytes = name.as_bytes();
+    validate_root_name(name.as_bytes())?;
+    Ok(RootId(format!("root-{}", hex(name.as_bytes()))))
+}
+
+fn validate_root_name(bytes: &[u8]) -> Result<()> {
     if bytes.is_empty()
         || bytes == b"."
         || bytes == b".."
+        || bytes.first() == Some(&b'.')
         || bytes.contains(&b'/')
         || bytes.contains(&0)
     {
         return Err(Error::coded(
             afs_error::NODE_VFS_INVALID,
-            "root name must be one non-empty path component",
+            "root name must be one non-empty path component without a leading dot",
         ));
     }
-    Ok(RootId(format!("root-{}", hex(bytes))))
+    Ok(())
 }
 
-fn root_data_dir(name: &OsStr, epoch: u64) -> Result<StoragePath> {
-    let bytes = name.as_bytes();
-    StoragePath::new(format!("root-{}-e{epoch}", hex(bytes))).map_err(Error::from)
+/// Decode a canonical root id back to its name. Inverse of
+/// [`root_id_from_name`]; used where only the Meta identity survives
+/// (pending-reservation cleanup) and the physical directory must be located.
+pub fn root_name_from_id(id: &RootId) -> Result<OsString> {
+    let encoded =
+        id.0.strip_prefix("root-")
+            .ok_or_else(|| invalid_grant("root id is not a canonical name"))?;
+    let digits = encoded.as_bytes();
+    if digits.is_empty() || digits.len() % 2 != 0 {
+        return Err(invalid_grant("root id is not a canonical name"));
+    }
+    let mut bytes = Vec::with_capacity(digits.len() / 2);
+    for pair in digits.chunks_exact(2) {
+        let high = hex_digit(pair[0]).ok_or_else(non_canonical_root_id)?;
+        let low = hex_digit(pair[1]).ok_or_else(non_canonical_root_id)?;
+        bytes.push((high << 4) | low);
+    }
+    validate_root_name(&bytes)?;
+    Ok(OsString::from_vec(bytes))
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn non_canonical_root_id() -> Error {
+    invalid_grant("root id is not a canonical name")
+}
+
+/// D11（outlet spec）：物理目录名 = 裸 workspace 名（无 hex 编码、无 epoch
+/// 后缀）。"目录名 = workspace 名"的等式只允许在本函数内成立；其余代码经
+/// `root_name_from_id` / record.data_dir 解析，防命名假设扩散。
+fn root_data_dir(name: &OsStr) -> Result<StoragePath> {
+    validate_root_name(name.as_bytes())?;
+    StoragePath::new(name).map_err(Error::from)
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -1635,7 +1695,7 @@ mod tests {
     ) -> (tempfile::TempDir, RootManager, PreparedRoot) {
         let temp = tempfile::tempdir().unwrap();
         let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
-        let data_dir = StoragePath::new("job-42-e1").unwrap();
+        let data_dir = StoragePath::new("job-42").unwrap();
         disk.mkdir(&data_dir, 0o700).unwrap();
         disk.sync_root().unwrap();
         let id = RootId("job-42".into());
@@ -1699,7 +1759,7 @@ mod tests {
     fn peer_access_is_validated_once_then_cached() {
         let temp = tempfile::tempdir().unwrap();
         let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
-        let data_dir = StoragePath::new("job-42-e1").unwrap();
+        let data_dir = StoragePath::new("job-42").unwrap();
         disk.mkdir(&data_dir, 0o700).unwrap();
         disk.sync_root().unwrap();
         let id = RootId("job-42".into());
@@ -1989,7 +2049,7 @@ mod tests {
     fn home_revocation_fences_cached_peer_grants() {
         let temp = tempfile::tempdir().unwrap();
         let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
-        let data_dir = StoragePath::new("job-42-e1").unwrap();
+        let data_dir = StoragePath::new("job-42").unwrap();
         disk.mkdir(&data_dir, 0o700).unwrap();
         disk.sync_root().unwrap();
         let id = RootId("job-42".into());
@@ -2199,7 +2259,7 @@ mod tests {
     fn private_foundation_fences_cached_peer_grants_without_native_authority() {
         let temp = tempfile::tempdir().unwrap();
         let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
-        let data_dir = StoragePath::new("job-42-e1").unwrap();
+        let data_dir = StoragePath::new("job-42").unwrap();
         disk.mkdir(&data_dir, 0o700).unwrap();
         disk.sync_root().unwrap();
         let id = RootId("job-42".into());
@@ -2421,8 +2481,8 @@ mod tests {
             let meta = Arc::new(RecoveryMeta::default());
             let name = OsStr::new("job");
             let id = root_id_from_name(name).unwrap();
-            let reservation = meta.reserve_root(&id, "old-intent").unwrap();
-            let data_dir = root_data_dir(name, reservation.epoch).unwrap();
+            let _reservation = meta.reserve_root(&id, "old-intent").unwrap();
+            let data_dir = root_data_dir(name).unwrap();
             if cut >= 1 {
                 disk.mkdir(&data_dir, 0o700).unwrap();
             }
@@ -2501,7 +2561,7 @@ mod tests {
         let meta = Arc::new(RecoveryMeta::default());
         let name = OsStr::new("job");
         let id = root_id_from_name(name).unwrap();
-        let data_dir = root_data_dir(name, 1).unwrap();
+        let data_dir = root_data_dir(name).unwrap();
         disk.mkdir(&data_dir, 0o700).unwrap();
         disk.sync_root().unwrap();
         let catalog = LocalFsRootCatalog::new(disk.clone());
@@ -2563,7 +2623,7 @@ mod tests {
         let meta = Arc::new(RecoveryMeta::default());
         let name = OsStr::new("job");
         let id = root_id_from_name(name).unwrap();
-        let data_dir = root_data_dir(name, 1).unwrap();
+        let data_dir = root_data_dir(name).unwrap();
         disk.mkdir(&data_dir, 0o700).unwrap();
         disk.sync_root().unwrap();
         meta.0.lock().unwrap().active = Some(RootLocation {
@@ -2624,7 +2684,7 @@ mod tests {
         let meta = Arc::new(RecoveryMeta::default());
         let name = OsStr::new("job");
         let id = root_id_from_name(name).unwrap();
-        let data_dir = root_data_dir(name, 1).unwrap();
+        let data_dir = root_data_dir(name).unwrap();
         // catalog 持久化要求 data_dir 存在：先建目录，持久化后再删除，
         // 构造"目录已被删除但 catalog/Meta 仍记录"的 zombie root。
         disk.mkdir(&data_dir, 0o700).unwrap();
@@ -2668,14 +2728,17 @@ mod tests {
         assert!(locked.scan_roots().unwrap().is_empty());
     }
 
+    /// 非空 root 直接 rmdir：ENOTEMPTY 失败必须零副作用（root 在缓存/
+    /// Meta/catalog 原样存活，FUSE 仍可访问），清空内容后重试即可成功。
+    /// 与本地文件系统的 POSIX 语义一致。
     #[test]
-    fn delete_root_keeps_catalog_when_physical_dir_not_empty() {
+    fn delete_root_non_empty_dir_fails_without_side_effects() {
         let temp = tempfile::tempdir().unwrap();
         let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
         let meta = Arc::new(RecoveryMeta::default());
         let name = OsStr::new("job");
         let id = root_id_from_name(name).unwrap();
-        let data_dir = root_data_dir(name, 1).unwrap();
+        let data_dir = root_data_dir(name).unwrap();
         disk.mkdir(&data_dir, 0o700).unwrap();
         disk.sync_root().unwrap();
         meta.0.lock().unwrap().active = Some(RootLocation {
@@ -2710,28 +2773,16 @@ mod tests {
         // 制造非空目录：删除必然 ENOTEMPTY。
         std::fs::write(temp.path().join(data_dir.as_path()).join("payload"), b"x").unwrap();
 
-        // 删除在物理目录一步失败：Meta 已 deactivate、缓存已移除，
-        // 但 catalog 记录必须保留，否则数据成为无法重新准入的孤儿。
+        // 零副作用失败（POSIX 语义）：ENOTEMPTY 返回，但 root 在缓存/
+        // Meta/catalog 中原样存活，FUSE 层仍可访问，用户可清空后重试。
         let err = manager.delete_root(&id).unwrap_err();
         assert_eq!(err.code(), afs_error::IO_DIRECTORY_NOT_EMPTY);
+        assert_eq!(manager.cached_local_roots().unwrap().len(), 1);
+        assert!(meta.0.lock().unwrap().active.is_some());
 
-        // catalog 记录仍在（manager 持有独占锁，先释放再验证）。
-        drop(manager);
-        let locked = LocalFsRootCatalog::new(disk.clone())
-            .lock_and_open()
-            .unwrap();
-        assert_eq!(locked.scan_roots().unwrap().len(), 1);
-        drop(locked);
-
-        // 重启 reconcile：catalog 有记录但 Meta 无 active，收敛为移除
-        // catalog 条目；非空目录被保留并告警，不阻塞启动。
-        let manager = RootManager::open(
-            "node-a".into(),
-            "session-a".into(),
-            meta.clone(),
-            disk.clone(),
-        )
-        .unwrap();
+        // 清空内容后重试：完整删除成功。
+        std::fs::remove_file(temp.path().join(data_dir.as_path()).join("payload")).unwrap();
+        manager.delete_root(&id).unwrap();
         assert!(manager.cached_local_roots().unwrap().is_empty());
         assert!(meta.0.lock().unwrap().active.is_none());
         drop(manager);
@@ -2739,5 +2790,93 @@ mod tests {
             .lock_and_open()
             .unwrap();
         assert!(locked.scan_roots().unwrap().is_empty());
+    }
+
+    /// 重启 reconcile 的残留收敛：Meta 已无记录、catalog 记录 + 非空物理
+    /// 目录残留（delete 提交 deactivate 后 catalog 清理中断）→ 移除 catalog
+    /// 条目，非空目录保留并告警，不阻塞启动。
+    #[test]
+    fn startup_reconcile_keeps_non_empty_leftover_dir_with_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let name = OsStr::new("job");
+        let id = root_id_from_name(name).unwrap();
+        let data_dir = root_data_dir(name).unwrap();
+        disk.mkdir(&data_dir, 0o700).unwrap();
+        disk.sync_root().unwrap();
+        std::fs::write(temp.path().join(data_dir.as_path()).join("payload"), b"x").unwrap();
+        let catalog = LocalFsRootCatalog::new(disk.clone());
+        let locked = catalog.lock_and_open().unwrap();
+        locked
+            .persist_prepared_root(&LocalRootRecord {
+                id,
+                name: name.into(),
+                epoch: 1,
+                data_dir: data_dir.clone(),
+                local_prepare_id: "prepare-1:old-session".into(),
+            })
+            .unwrap();
+        drop(locked);
+        // Meta 无记录（deactivate 已提交）。
+        let manager =
+            RootManager::open("node-a".into(), "session-a".into(), meta, disk.clone()).unwrap();
+        assert!(manager.cached_local_roots().unwrap().is_empty());
+        // 非空物理目录保留（证据），catalog 记录已清除。
+        assert!(disk.metadata(&data_dir).is_ok());
+        drop(manager);
+        let locked = LocalFsRootCatalog::new(disk.clone())
+            .lock_and_open()
+            .unwrap();
+        assert!(locked.scan_roots().unwrap().is_empty());
+    }
+
+    #[test]
+    fn root_data_dir_is_the_bare_workspace_name() {
+        // D11：物理目录名 = 裸 workspace 名，无 hex 编码、无 epoch 后缀。
+        assert_eq!(
+            root_data_dir(OsStr::new("job-42")).unwrap(),
+            StoragePath::new("job-42").unwrap()
+        );
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\0b",
+            ".pub",
+            ".quarantine",
+            ".ownerfs-roots",
+        ] {
+            assert!(
+                root_data_dir(OsStr::new(bad)).is_err(),
+                "name {bad:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn root_name_from_id_round_trips_and_rejects_non_canonical_ids() {
+        for name in ["job-42", "agent-a1", "ünïcode"] {
+            let id = root_id_from_name(OsStr::new(name)).unwrap();
+            assert_eq!(root_name_from_id(&id).unwrap(), OsString::from(name));
+        }
+        // 非 UTF-8 名字经 hex 编解码无损往返。
+        let raw = OsStr::from_bytes(b"job-\xff\xfe");
+        let id = root_id_from_name(raw).unwrap();
+        assert_eq!(root_name_from_id(&id).unwrap(), raw.to_os_string());
+        for bad in [
+            RootId("job-42".into()),
+            RootId("root-".into()),
+            RootId("root-abc".into()),
+            RootId("root-AB".into()),
+            RootId("root-2e2e".into()),
+            RootId("root-2e707562".into()),
+        ] {
+            assert!(
+                root_name_from_id(&bad).is_err(),
+                "id {bad:?} must be rejected"
+            );
+        }
     }
 }
