@@ -25,6 +25,8 @@ pub mod fuse;
 pub mod gc;
 #[cfg(feature = "ownerfs")]
 mod native_workspace;
+#[cfg(feature = "ownerfs")]
+pub mod outlet;
 #[cfg(feature = "dfs")]
 pub mod peer_cache;
 mod read_activity;
@@ -1363,6 +1365,8 @@ async fn run_node(
     #[cfg(feature = "ownerfs")]
     let mut workspace_bind_root_control = None;
     #[cfg(feature = "ownerfs")]
+    let mut outlet_control = None;
+    #[cfg(feature = "ownerfs")]
     let ownerfs_instance = if cfg.ownerfs {
         let endpoint = meta_endpoint.expect("OwnerFs checked meta_endpoint");
         let root_meta = Arc::new(rpc::meta::GrpcRootMeta::new(
@@ -1372,7 +1376,10 @@ async fn run_node(
             timeout,
             cfg.tls_config(),
         )?);
-        let disk = Arc::new(storage::LocalFs::open(cfg.data_dir.join("ownerfs"))?);
+        // Outlet 地基换基单点（spec §16）：启用 outlet 时 OwnerFs 物理存储根
+        // 为 users_root（数据卷挂载点，缺失 fail-fast）；否则保持
+        // data_dir/ownerfs。catalog/对账相对路径自动跟随此根。
+        let disk = Arc::new(storage::LocalFs::open(cfg.ownerfs_storage_root()?)?);
         let recovery_disk = disk.clone();
         let recovery_node_id = cfg.id.clone();
         let recovery_session_id = session_id.clone();
@@ -1428,7 +1435,32 @@ async fn run_node(
             cfg.experimental_ownerfs_workspace_bind,
             cfg.experimental_native_workspace,
         ) {
-            workspace_bind_root_control = Some((root_meta, roots.clone()));
+            workspace_bind_root_control = Some((root_meta.clone(), roots.clone()));
+        }
+        // Outlet 启动序列（spec §12/§16）：public_root 必须是部署方已
+        // 挂载的 tmpfs（fail-fast），随后装配传输后端（机制层唯一注册点）、
+        // 拓扑对齐 worker 与表现层发布 worker。
+        if let Some(outlet) = cfg.outlet.as_ref() {
+            outlet::reconcile::prepare_public_root(&outlet.public_root)?;
+            let backend = Arc::new(outlet::transport::nfs::NfsBackend::new(
+                outlet.import_root.clone(),
+            )) as Arc<dyn outlet::transport::TransportBackend>;
+            let (topology_state, topology_state_rx) =
+                tokio::sync::watch::channel(outlet::topology::TopologyState::default());
+            let publisher = Arc::new(outlet::publish::OutletPublisher::new(
+                outlet.public_root.clone(),
+                outlet.users_root.clone(),
+                backend.clone(),
+                topology_state_rx,
+                cfg.id.clone(),
+            ));
+            outlet_control = Some((
+                root_meta.clone(),
+                backend,
+                topology_state,
+                publisher,
+                cfg.id.clone(),
+            ));
         }
         let roots_for_startup = roots.clone();
         let owner = if cfg.experimental_ownerfs_workspace_bind {
@@ -2386,6 +2418,23 @@ async fn run_node(
     {
         let stop = services.stop.subscribe();
         services.spawn(run_workspace_bind_root_commands(meta, roots, stop));
+    }
+    // Outlet workers：拓扑对齐（Meta 失联仅降级为告警并保留上一状态，
+    // spec §7.2）与表现层发布（fail-closed 停发，对账兜底，spec §9/§12）。
+    #[cfg(feature = "ownerfs")]
+    if native_workspace_startup_error.is_none()
+        && let Some((meta, backend, topology_state, publisher, local_node_id)) = outlet_control
+    {
+        let stop = services.stop.subscribe();
+        services.spawn(outlet::topology::run_topology_sync(
+            meta.clone(),
+            backend,
+            local_node_id,
+            topology_state,
+            stop,
+        ));
+        let stop = services.stop.subscribe();
+        services.spawn(outlet::publish::run_outlet_publisher(meta, publisher, stop));
     }
     // Close read admission at the same lifecycle boundary that broadcasts
     // shutdown. A cached object must not outlive a known Node/session stop.

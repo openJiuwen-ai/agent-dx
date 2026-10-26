@@ -8,7 +8,7 @@ use crate::node::vfs::ownerfs::{
     catalog::LocalRootRecord,
     root::{
         OwnerRootInventory, PreparedRoot, PresentedRootAccess, RootGrant, RootId, RootLocation,
-        RootMeta, RootReservation, RootRight,
+        RootMeta, RootReservation, RootRight, root_name_from_id,
     },
 };
 #[cfg(any(feature = "ownerfs", feature = "dfs"))]
@@ -19,8 +19,9 @@ use afs_error::{
 #[cfg(feature = "ownerfs")]
 use afs_protocol::meta::{
     AbortRootRequest, AcquireRootRequest, ActivateRootRequest, DeactivateRootRequest,
-    ListOwnerRootsRequest, LookupNodeRequest, LookupRootRequest, PollRootCommandBatchRequest,
-    RecoverRootRequest, ReserveConflictPolicy, ReserveRootRequest, ValidateRootAccessRequest,
+    ListNodesRequest, ListOutletRootsRequest, ListOwnerRootsRequest, LookupNodeRequest,
+    LookupRootRequest, PollOutletEventsRequest, PollRootCommandBatchRequest, RecoverRootRequest,
+    ReserveConflictPolicy, ReserveRootRequest, ValidateRootAccessRequest,
     owner_roots_client::OwnerRootsClient,
 };
 use afs_protocol::meta::{
@@ -29,6 +30,8 @@ use afs_protocol::meta::{
 };
 use afs_transport::grpc::{GrpcConfig, SecurityManager, TlsConfig};
 use std::error::Error as StdError;
+#[cfg(feature = "ownerfs")]
+use std::ffi::OsString;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "dfs")]
 use std::sync::{Arc, Mutex};
@@ -564,6 +567,78 @@ impl GrpcRootMeta {
             }))?
             .into_inner();
         root_command_batch_from_wire(after_revision, reply)
+    }
+
+    /// Meta live 成员表快照：快照时刻已过滤过期会话、按 node_id 排序。
+    /// 供 Outlet 拓扑对齐周期全量拉取（spec §7.2）；`authority_revision`
+    /// 为快照锚点。
+    pub(crate) fn list_nodes(&self) -> Result<(Vec<String>, u64)> {
+        let mut client = MetaClient::new(self.channel.clone());
+        let reply = self
+            .run(client.list_nodes(ListNodesRequest {
+                node_id: self.node_id.clone(),
+                session_id: self.session_id.clone(),
+            }))?
+            .into_inner();
+        let mut node_ids = Vec::with_capacity(reply.nodes.len());
+        for node in reply.nodes {
+            if node.node_id.is_empty() {
+                return Err(Error::coded(
+                    CLIENT_PROTOCOL_VIOLATION,
+                    "ListNodes returned an empty node id",
+                ));
+            }
+            node_ids.push(node.node_id);
+        }
+        Ok((node_ids, reply.authority_revision))
+    }
+
+    /// Outlet 事件流（spec §9）：游标契约与 PollRootCommandBatch 相同，
+    /// 调用方以 `next_revision - 1` 作为下一轮 `after_revision` 恢复；
+    /// `Compacted` 表示事件史不可续，调用方改走全量快照恢复。
+    pub(crate) fn poll_outlet_events(&self, after_revision: u64) -> Result<OutletEventBatch> {
+        let mut client = self.client();
+        let reply = self
+            .run(client.poll_outlet_events(PollOutletEventsRequest {
+                node_id: self.node_id.clone(),
+                session_id: self.session_id.clone(),
+                after_revision,
+            }))?
+            .into_inner();
+        outlet_event_batch_from_wire(after_revision, reply)
+    }
+
+    /// 全集群 Active 根快照（spec §12 对账 diff1 输入）。`authority_revision`
+    /// 是快照锚点：以此为 `after_revision` 续拉事件流与快照无缺口衔接。
+    pub(crate) fn list_outlet_roots(&self) -> Result<(Vec<OutletActiveRoot>, u64)> {
+        let mut client = self.client();
+        let reply = self
+            .run(client.list_outlet_roots(ListOutletRootsRequest {
+                node_id: self.node_id.clone(),
+                session_id: self.session_id.clone(),
+            }))?
+            .into_inner();
+        let mut roots = Vec::with_capacity(reply.roots.len());
+        for root in reply.roots {
+            if root.root_id.is_empty() || root.home_node_id.is_empty() {
+                return Err(Error::coded(
+                    CLIENT_PROTOCOL_VIOLATION,
+                    "ListOutletRoots returned an incomplete root location",
+                ));
+            }
+            let name = root_name_from_id(&RootId(root.root_id.clone())).map_err(|error| {
+                Error::coded(
+                    CLIENT_PROTOCOL_VIOLATION,
+                    format!("ListOutletRoots returned a non-canonical root id: {error}"),
+                )
+            })?;
+            roots.push(OutletActiveRoot {
+                root_id: root.root_id,
+                name,
+                home_node_id: root.home_node_id,
+            });
+        }
+        Ok((roots, reply.authority_revision))
     }
 
     /// 节点位置来自 Meta 注册表，而非调用者在数据请求中自报的地址。
@@ -3501,6 +3576,155 @@ fn root_command_batch_from_wire(
         None => Err(Error::coded(
             CLIENT_PROTOCOL_VIOLATION,
             "RootCommandBatchReply is empty",
+        )),
+    }
+}
+
+/// Outlet 事件在发布面的投影（spec §9）：只保留表现层收敛所需字段，
+/// workspace 名从 root_id 无损反解，NodeSessionRegistered 是拓扑输入
+/// （TopologyManager 经 ListNodes 消费），发布面无动作。
+#[cfg(feature = "ownerfs")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum OutletPublicationEvent {
+    RootActivated {
+        root_id: String,
+        name: OsString,
+        home_node_id: String,
+    },
+    RootDeleted {
+        root_id: String,
+    },
+    NodeSessionRegistered {
+        node_id: String,
+    },
+}
+
+#[cfg(feature = "ownerfs")]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum OutletEventBatch {
+    /// `next_revision` 为排他界：调用方下一轮以 `next_revision - 1` 恢复。
+    Events {
+        next_revision: u64,
+        events: Vec<OutletPublicationEvent>,
+    },
+    /// 事件史不可续：调用方退化为全量快照恢复（= 启动对账路径）。
+    Compacted,
+}
+
+/// Active 根的发布面投影：名字已解码、home 已校验非空。
+#[cfg(feature = "ownerfs")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OutletActiveRoot {
+    pub(crate) root_id: String,
+    pub(crate) name: OsString,
+    pub(crate) home_node_id: String,
+}
+
+#[cfg(feature = "ownerfs")]
+fn outlet_event_from_wire(
+    event: afs_protocol::meta::OutletEvent,
+) -> Result<OutletPublicationEvent> {
+    use afs_protocol::meta::outlet_event::Kind;
+    let kind = event.kind.ok_or_else(|| {
+        Error::coded(CLIENT_PROTOCOL_VIOLATION, "OutletEvent is missing its kind")
+    })?;
+    match kind {
+        Kind::RootActivated(activated) => {
+            let root = activated.root.ok_or_else(|| {
+                Error::coded(
+                    CLIENT_PROTOCOL_VIOLATION,
+                    "OutletEventRootActivated is missing root",
+                )
+            })?;
+            if root.root_id.is_empty() || root.home_node_id.is_empty() {
+                return Err(Error::coded(
+                    CLIENT_PROTOCOL_VIOLATION,
+                    "OutletEventRootActivated has invalid root identity",
+                ));
+            }
+            let name = root_name_from_id(&RootId(root.root_id.clone())).map_err(|error| {
+                Error::coded(
+                    CLIENT_PROTOCOL_VIOLATION,
+                    format!("OutletEventRootActivated has a non-canonical root id: {error}"),
+                )
+            })?;
+            Ok(OutletPublicationEvent::RootActivated {
+                root_id: root.root_id,
+                name,
+                home_node_id: root.home_node_id,
+            })
+        }
+        Kind::RootDeleted(deleted) => {
+            if deleted.root_id.is_empty() {
+                return Err(Error::coded(
+                    CLIENT_PROTOCOL_VIOLATION,
+                    "OutletEventRootDeleted has an empty root id",
+                ));
+            }
+            Ok(OutletPublicationEvent::RootDeleted {
+                root_id: deleted.root_id,
+            })
+        }
+        Kind::NodeSessionRegistered(registered) => {
+            if registered.node_id.is_empty() {
+                return Err(Error::coded(
+                    CLIENT_PROTOCOL_VIOLATION,
+                    "OutletEventNodeSessionRegistered has an empty node id",
+                ));
+            }
+            Ok(OutletPublicationEvent::NodeSessionRegistered {
+                node_id: registered.node_id,
+            })
+        }
+    }
+}
+
+#[cfg(feature = "ownerfs")]
+fn outlet_event_batch_from_wire(
+    requested_after: u64,
+    value: afs_protocol::meta::OutletEventBatchReply,
+) -> Result<OutletEventBatch> {
+    use afs_protocol::meta::outlet_event_batch_reply::Result as WireResult;
+    match value.result {
+        Some(WireResult::Events(events)) => {
+            if events.start_revision != requested_after {
+                return Err(Error::coded(
+                    CLIENT_PROTOCOL_VIOLATION,
+                    "OutletEventBatchEvents start revision does not match request",
+                ));
+            }
+            if events.next_revision == 0 || events.next_revision <= events.start_revision {
+                return Err(Error::coded(
+                    CLIENT_PROTOCOL_VIOLATION,
+                    "OutletEventBatchEvents has invalid next revision",
+                ));
+            }
+            let next_revision = events.next_revision;
+            let mut last_revision = events.start_revision;
+            let mut parsed = Vec::with_capacity(events.events.len());
+            for event in events.events {
+                // 非严格递增：一个事务可在同一修订下产生多条事件（如多 key
+                // 写入），与 RootCommandBatch 排序契约一致；修订必须落在
+                // 批内 (start, next) 区间。
+                if event.revision < last_revision || event.revision >= next_revision {
+                    return Err(Error::coded(
+                        CLIENT_PROTOCOL_VIOLATION,
+                        "OutletEvent revisions are unordered or outside the batch range",
+                    ));
+                }
+                last_revision = event.revision;
+                parsed.push(outlet_event_from_wire(event)?);
+            }
+            Ok(OutletEventBatch::Events {
+                next_revision,
+                events: parsed,
+            })
+        }
+        // 恢复游标诊断由全量快照路径消化，发布面不区分恢复原因。
+        Some(WireResult::Compacted(_)) => Ok(OutletEventBatch::Compacted),
+        None => Err(Error::coded(
+            CLIENT_PROTOCOL_VIOLATION,
+            "OutletEventBatchReply is missing its result",
         )),
     }
 }
