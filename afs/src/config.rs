@@ -447,6 +447,11 @@ struct FileConfig {
     experimental_ownerfs_workspace_bind: Option<bool>,
     ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
     ownerfs_workspace_egress_root: Option<PathBuf>,
+    /// Outlet（预挂载网格）三路径，all-or-none；见 afs/outlet-premounted-spec-v1.md §6。
+    outlet_users_root: Option<PathBuf>,
+    outlet_import_root: Option<PathBuf>,
+    outlet_public_root: Option<PathBuf>,
+    outlet_transport: Option<OutletTransportFileConfig>,
     dfs_mount: Option<PathBuf>,
     fuse_threads: Option<u16>,
     fuse_clone_fd: Option<bool>,
@@ -514,6 +519,33 @@ impl DfsReadCrcMode {
     }
 }
 
+/// Outlet（预挂载网格）路径组：物理层 users_root、拓扑层 import_root、
+/// 表现层 public_root。三个路径 all-or-none，全部设置才启用 outlet。
+/// 语义见 afs/outlet-premounted-spec-v1.md §6。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OutletConfig {
+    /// 物理层：数据卷挂载点，OwnerFs 物理存储根（工作区目录名 = 裸名）。
+    pub users_root: PathBuf,
+    /// 拓扑层父目录（0700 私有）。
+    pub import_root: PathBuf,
+    /// 表现层公共契约路径（tmpfs，如 /users）。
+    pub public_root: PathBuf,
+}
+
+/// 文件配置的 `[outlet_transport]` 节：backend 为必填（节内唯一键）。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OutletTransportFileConfig {
+    backend: String,
+}
+
+/// Outlet 传输后端选择（spec §6 `[outlet_transport]`）。v1 唯一实现为
+/// kernel NFS；未识别值在配置解析期拒绝（fail-fast，预留后续后端扩展）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OutletTransportConfig {
+    pub backend: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 /// 解析和校验后的进程配置。模块接收这个值，不各自重复读取配置文件或环境变量。
 pub struct Config {
@@ -555,6 +587,8 @@ pub struct Config {
     pub experimental_ownerfs_workspace_bind: bool,
     pub ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
     pub ownerfs_workspace_egress_root: Option<PathBuf>,
+    pub outlet: Option<OutletConfig>,
+    pub outlet_transport: Option<OutletTransportConfig>,
     pub dfs_mount: Option<PathBuf>,
     pub fuse_threads: u16,
     pub fuse_clone_fd: bool,
@@ -897,6 +931,41 @@ impl Config {
             .dfs_optimistic_gc_commit
             .or(file.dfs_optimistic_gc_commit)
             .unwrap_or(dfs_crc32c_writes);
+        // Outlet 三路径 all-or-none：部分设置在构造前即拒绝，避免半配置网格。
+        let outlet = match (
+            file.outlet_users_root,
+            file.outlet_import_root,
+            file.outlet_public_root,
+        ) {
+            (None, None, None) => None,
+            (Some(users_root), Some(import_root), Some(public_root)) => Some(OutletConfig {
+                users_root,
+                import_root,
+                public_root,
+            }),
+            _ => {
+                return Err(invalid(
+                    "outlet paths are all-or-none: set outlet_users_root, \
+                     outlet_import_root and outlet_public_root together",
+                ));
+            }
+        };
+        // `[outlet_transport]`：v1 唯一合法 backend 为 nfs；未识别值拒绝
+        // （fail-fast，拼写错误不得静默落到默认后端）。
+        let outlet_transport = file
+            .outlet_transport
+            .map(|transport| {
+                if transport.backend != "nfs" {
+                    return Err(invalid(format!(
+                        "outlet_transport backend {:?} is not supported; v1 supports \"nfs\"",
+                        transport.backend
+                    )));
+                }
+                Ok(OutletTransportConfig {
+                    backend: transport.backend,
+                })
+            })
+            .transpose()?;
         let cfg = Self {
             grpc_listen: cli.grpc_listen.or(file.grpc_listen).unwrap_or_else(|| {
                 ([127, 0, 0, 1], if role == Role::Meta { 7400 } else { 7500 }).into()
@@ -1003,6 +1072,8 @@ impl Config {
             ownerfs_workspace_egress_root: cli
                 .ownerfs_workspace_egress_root
                 .or(file.ownerfs_workspace_egress_root),
+            outlet,
+            outlet_transport,
             dfs_mount: cli.dfs_mount.or(file.dfs_mount),
             fuse_threads,
             fuse_clone_fd: cli.fuse_clone_fd.or(file.fuse_clone_fd).unwrap_or(true),
@@ -1144,6 +1215,45 @@ impl Config {
         }
         if !cfg.uds_path.is_absolute() || !cfg.data_dir.is_absolute() {
             return Err(invalid("uds_path and data_dir must be absolute"));
+        }
+        if let Some(outlet) = &cfg.outlet {
+            // 顺序要求：本块先于 experimental egress 校验，保证互斥错误明确指向 outlet。
+            if role != Role::Node || !cfg.ownerfs {
+                return Err(invalid(
+                    "outlet paths require a Node with OwnerFs enabled (fs=ownerfs or fs=all)",
+                ));
+            }
+            if cfg.experimental_ownerfs_workspace_bind || cfg.experimental_native_workspace {
+                return Err(invalid(
+                    "outlet cannot be enabled together with the experimental workspace egress \
+                     entries; they are mutually exclusive deployment modes",
+                ));
+            }
+            let overlaps = |a: &Path, b: &Path| a.starts_with(b) || b.starts_with(a);
+            for path in [&outlet.users_root, &outlet.import_root, &outlet.public_root] {
+                if !path.is_absolute()
+                    || path.components().any(|component| {
+                        matches!(component, Component::ParentDir | Component::CurDir)
+                    })
+                {
+                    return Err(invalid(
+                        "outlet paths must be absolute and contain no traversal",
+                    ));
+                }
+                if overlaps(path, &cfg.data_dir) {
+                    return Err(invalid(
+                        "outlet paths must not overlap the data_dir directory",
+                    ));
+                }
+            }
+            let paths = [&outlet.users_root, &outlet.import_root, &outlet.public_root];
+            for index in 0..paths.len() {
+                for other in &paths[(index + 1)..] {
+                    if overlaps(paths[index], other) {
+                        return Err(invalid("outlet paths must not overlap each other"));
+                    }
+                }
+            }
         }
         for mount in [&cfg.ownerfs_mount, &cfg.dfs_mount].into_iter().flatten() {
             if !mount.is_absolute() {
@@ -1363,6 +1473,25 @@ impl Config {
                 }
             }
             _ => afs_transport::grpc::TlsConfig::Disabled,
+        }
+    }
+
+    /// OwnerFs 物理存储根：启用 outlet 时为 users_root（数据卷挂载点，必须
+    /// 已存在——缺失即失败，防止 LocalFs 在根文件系统上静默创建目录存数据）；
+    /// 未启用 outlet 时回退 data_dir/ownerfs。
+    pub fn ownerfs_storage_root(&self) -> Result<PathBuf> {
+        match &self.outlet {
+            Some(outlet) => {
+                if outlet.users_root.is_dir() {
+                    Ok(outlet.users_root.clone())
+                } else {
+                    Err(invalid(
+                        "outlet_users_root must exist before start; mount the data volume there \
+                         before enabling outlet",
+                    ))
+                }
+            }
+            None => Ok(self.data_dir.join("ownerfs")),
         }
     }
 }
