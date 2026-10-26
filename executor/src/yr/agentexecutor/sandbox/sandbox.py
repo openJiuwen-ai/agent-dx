@@ -74,6 +74,33 @@ def _local_request_id() -> str:
     return str(uuid.uuid4())
 
 
+# 与 libruntime 的 DEFAULT_YR_NAMESPACE(yuanrong src/dto/constant.h)逐字一致
+# —— 注意上游常量本身拼写即为 "defalut"。后续 invoke 在 functionMeta.ns 为空
+# 时硬编码用它拼 "{ns}-{name}" 寻址,create 侧必须用同一值才能对上。
+_DEFAULT_INSTANCE_NAMESPACE = "yr_defalut_namespace"
+
+
+def _named_instance_namespace() -> str:
+    """Namespace pinned onto named sandbox creates.
+
+    Named instances are addressed as ``{ns}-{name}`` on every post-create
+    invoke (libruntime composes the target id from the function meta). The
+    create-side designated instance id only carries that prefix when a
+    namespace is set on the invoke options, so a named create without one
+    registers the bare name while later invokes route to the prefixed id —
+    the instance is then never found. Pin the namespace here: the runtime's
+    configured namespace when it reports one, else the same default
+    libruntime hardcodes for invoke-side addressing.
+    """
+    try:
+        ns = global_runtime.get_runtime().get_namespace()
+    except Exception:  # noqa: BLE001 - namespace query is best-effort
+        ns = ""
+    if isinstance(ns, str) and ns:
+        return ns
+    return _DEFAULT_INSTANCE_NAMESPACE
+
+
 def _sandbox_trace_enter(op: str, trace_id: Optional[str], request_id: str,
                          **extra) -> None:
     """Emit ``[sandbox.<op>.enter]`` log line for signal-channel operations."""
@@ -347,7 +374,8 @@ class SandboxInstance:
             path: str,
             pattern: str,
             exclude_patterns: Optional[List[str]] = None,
-    ) -> List[Dict]:
+            depth: Optional[int] = None,
+    ) -> Dict:
         """
         Search files inside the sandbox by glob pattern using native Python I/O.
 
@@ -358,17 +386,22 @@ class SandboxInstance:
             path (str): Absolute path of the search root directory.
             pattern (str): Glob pattern to match file names (e.g. "*.txt").
             exclude_patterns (Optional[List[str]]): Glob patterns to exclude.
+            depth (Optional[int]): Maximum relative depth of traversed
+                entries. None = unlimited.
 
         Returns:
-            List[Dict]: List of item dicts with keys: name, path, size,
-                        is_directory, modified_time, type.
+            Dict: ``{"items": [{name, path, size, is_directory,
+            modified_time, type}, ...], "scanned": <int>}`` — *scanned*
+            counts every entry encountered during traversal (files and
+            directories, excluding the root).
 
         Raises:
             FileNotFoundError: If the search root does not exist.
             OSError: If the path cannot be accessed.
         """
         from yr.agentexecutor.sandbox.filesystem import _search_files_impl
-        return _search_files_impl(path, pattern, exclude_patterns=exclude_patterns)
+        return _search_files_impl(path, pattern, exclude_patterns=exclude_patterns,
+                                  depth=depth)
 
     def execute(
         self,
@@ -892,6 +925,11 @@ class Sandbox:
 
         if name is not None:
             opt.name = name
+            if name:
+                # 命名实例的后续 invoke 按 "{ns}-{name}" 寻址,create 必须钉住
+                # 同一 namespace,否则实例按裸名注册而 invoke 找不到。见
+                # _named_instance_namespace。
+                opt.namespace = _named_instance_namespace()
         if cpu is not None:
             opt.cpu = cpu
         if memory is not None:
@@ -1175,6 +1213,7 @@ class Sandbox:
         path: str,
         pattern: str,
         exclude_patterns: Optional[List[str]] = None,
+        depth: Optional[int] = None,
         trace_id: Optional[str] = None,
     ) -> Dict:
         """
@@ -1184,11 +1223,15 @@ class Sandbox:
             path (str): Absolute path of the search root directory.
             pattern (str): Glob pattern to match file names (e.g. "*.txt").
             exclude_patterns (Optional[List[str]]): Glob patterns to exclude.
+            depth (Optional[int]): Maximum relative depth of traversed
+                entries. None (default) = unlimited.
             trace_id (Optional[str]): Trace id for link tracing of this invoke.
                 None (default) keeps the existing behavior.
 
         Returns:
-            Dict: ``{"items": [{name, path, size, is_directory, modified_time, type}, ...]}``
+            Dict: ``{"items": [{name, path, size, is_directory, modified_time, type}, ...],
+            "scanned": <int>}`` — *scanned* counts every entry encountered
+            during traversal (files and directories, excluding the root).
 
         Examples:
             >>> result = sb.search_files("/tmp", "*.py", exclude_patterns=["*.pyc"])
@@ -1196,12 +1239,12 @@ class Sandbox:
         method = self._instance.search_files
         if trace_id:
             method = method.options(_with_trace(trace_id))
-        items = yr.get(method.invoke(
+        return yr.get(method.invoke(
             path,
             pattern,
             exclude_patterns=exclude_patterns,
+            depth=depth,
         ))
-        return {"items": items}
 
     def get_working_dir(self, trace_id: Optional[str] = None):
         """Get the working directory of the sandbox."""

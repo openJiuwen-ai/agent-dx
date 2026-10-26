@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # coding=UTF-8
 
-import base64
 import fnmatch
 import io
 import json
@@ -9,7 +8,6 @@ import logging
 import os
 import stat
 import subprocess
-import sys
 import threading
 import time
 import urllib.error
@@ -137,24 +135,6 @@ def _get_json(server, path):
         return response.status, json.load(response)
 
 
-def _put_raw(server, path, body: bytes):
-    host, port = server.address
-    request = urllib.request.Request(
-        f"http://{host}:{port}{path}",
-        data=body,
-        method="PUT",
-    )
-    with urllib.request.urlopen(request) as response:
-        return response.status, json.load(response)
-
-
-def _delete(server, path):
-    host, port = server.address
-    request = urllib.request.Request(f"http://{host}:{port}{path}", method="DELETE")
-    with urllib.request.urlopen(request) as response:
-        return response.status, json.load(response)
-
-
 def _request_method(server, path, method, data=None):
     """Send a request with an arbitrary method and return raw status/body/headers."""
     host, port = server.address
@@ -168,128 +148,6 @@ def _request_method(server, path, method, data=None):
         return caught.code, caught.read(), dict(caught.headers)
 
 
-def test_patch_sandbox_url_returns_405_json(tmp_path):
-    server = _server()
-    server.start()
-    try:
-        status, body, headers = _request_method(
-            server,
-            "/v1/sandbox/sandboxes/local/files/write?path=/tmp/t1.txt&mode=w",
-            "PATCH",
-            data=b"hello files",
-        )
-        assert status == 405
-        payload = json.loads(body)
-        assert "not allowed for sandbox resource" in payload["message"]
-        # Allow is per-resource: files/write only registers PUT.
-        assert headers["Allow"] == "PUT"
-        assert headers["Content-Type"] == "application/json"
-    finally:
-        server.stop()
-
-
-def test_head_sandbox_url_returns_405_json_without_body():
-    server = _server()
-    server.start()
-    try:
-        status, body, headers = _request_method(
-            server, "/v1/sandbox/sandboxes/local/files/read?path=/tmp/t1.txt", "HEAD"
-        )
-        assert status == 405
-        # urllib suppresses the body of a HEAD response, so the RFC-required
-        # message can only be verified through the advertised Content-Length:
-        # it must describe a non-empty JSON body that HEAD itself does not send.
-        # Allow is per-resource: the files/read URL only registers GET.
-        assert headers["Allow"] == "GET"
-        assert headers["Content-Type"] == "application/json"
-        assert int(headers["Content-Length"]) > 0
-        assert body == b""
-    finally:
-        server.stop()
-
-
-def test_patch_create_url_returns_405():
-    server = _server()
-    server.start()
-    try:
-        status, body, headers = _request_method(
-            server, "/v1/sandbox/sandboxes", "PATCH", data=b'{"sandbox_type":"x"}'
-        )
-        assert status == 405
-        assert "not allowed for sandbox resource" in json.loads(body)["message"]
-        # Allow is per-resource: the bare create URL only registers POST.
-        assert headers["Allow"] == "POST"
-    finally:
-        server.stop()
-
-
-def test_wrong_action_on_registered_shape_returns_404_not_405():
-    """URL shape itself is unregistered (bogus action) → 404, not 405."""
-    server = _server()
-    server.start()
-    try:
-        status, body, _ = _request_method(
-            server, "/v1/sandbox/sandboxes/local/files/bogus?path=/tmp/x", "PATCH"
-        )
-        assert status == 404
-        assert "not found" in json.loads(body)["message"]
-    finally:
-        server.stop()
-
-
-def test_bogus_subresource_returns_404_not_405():
-    server = _server()
-    server.start()
-    try:
-        status, body, _ = _request_method(
-            server, "/v1/sandbox/sandboxes/local/bogus/xyz", "PATCH"
-        )
-        assert status == 404
-        assert "not found" in json.loads(body)["message"]
-    finally:
-        server.stop()
-
-
-def test_unregistered_method_on_unknown_instance_returns_404():
-    """Instance existence beats method registration: unknown id → 404, not 405."""
-    server = _server()
-    server.start()
-    try:
-        status, body, _ = _request_method(
-            server,
-            "/v1/sandbox/sandboxes/00000000-0000-0000-0000-000000000000/files/write?path=/tmp/x",
-            "PATCH",
-            data=b"x",
-        )
-        assert status == 404
-        assert "sandbox 00000000" in json.loads(body)["message"]
-    finally:
-        server.stop()
-
-
-def test_unregistered_method_on_live_instance_returns_405():
-    server = _server()
-    server.start()
-    try:
-        status, body, headers = _request_method(
-            server,
-            "/v1/sandbox/sandboxes/local/files/bogus?path=/tmp/x",
-            "GET",
-        )
-        # GET is a registered method but this URL shape does not exist → 404;
-        # contrast with a live sandbox + registered shape + wrong method → 405.
-        assert status == 404
-
-        status, body, headers = _request_method(
-            server, "/v1/sandbox/sandboxes/local/files/read?path=/tmp/x", "PATCH"
-        )
-        assert status == 405
-        assert "method PATCH not allowed" in json.loads(body)["message"]
-        assert headers["Allow"] == "GET"
-    finally:
-        server.stop()
-
-
 def test_patch_non_sandbox_path_returns_404_json():
     server = _server()
     server.start()
@@ -299,38 +157,6 @@ def test_patch_non_sandbox_path_returns_404_json():
         assert json.loads(body) == {"message": "endpoint not found"}
         assert headers["Content-Type"] == "application/json"
         assert headers.get("Allow") is None
-    finally:
-        server.stop()
-
-
-def test_registered_methods_unaffected(tmp_path):
-    server = _server()
-    server.start()
-    target = tmp_path / "regression.txt"
-    try:
-        status, result = _put_raw(
-            server,
-            f"/v1/sandbox/sandboxes/local/files/write?path={urllib.parse.quote(str(target))}&mode=w",
-            b"regression",
-        )
-        assert status == 200
-        assert result["success"] is True
-        status, body = _get_json(server, "/healthz")
-        assert (status, body) == (200, {"status": "ready"})
-        status, executed = _post_json(
-            server,
-            "/v1/sandbox/sandboxes/local/execute",
-            {"command": [sys.executable, "-c", "pass"]},
-        )
-        assert status == 200
-        assert executed["returncode"] == 0
-        # No DELETE here: the _LocalSandbox stub has no terminate(), and the
-        # manager re-raises that as 500 — delete is covered by manager tests.
-        status, body = _get_json(
-            server,
-            f"/v1/sandbox/sandboxes/local/files/read?path={urllib.parse.quote(str(target))}&mode=r",
-        )
-        assert (status, body["content"]) == (200, "regression")
     finally:
         server.stop()
 
@@ -392,89 +218,6 @@ def test_download_without_path_is_bad_request():
             urllib.request.urlopen(f"http://{host}:{port}/v1/files/download")
         assert caught.value.code == 400
         assert caught.value.headers.get("Content-Range") is None
-    finally:
-        server.stop()
-
-
-def test_sandbox_execute_and_text_file_operations(tmp_path):
-    server = _server()
-    server.start()
-    target = tmp_path / "nested" / "message.txt"
-    try:
-        status, written = _put_raw(
-            server,
-            f"/v1/sandbox/sandboxes/local/files/write?path={urllib.parse.quote(str(target))}&mode=w",
-            b"hello sandbox",
-        )
-        assert status == 200
-        assert written == {"success": True, "path": str(target)}
-
-        _, read = _get_json(
-            server,
-            f"/v1/sandbox/sandboxes/local/files/read?path={urllib.parse.quote(str(target))}&mode=r",
-        )
-        assert read == {
-            "path": str(target),
-            "mode": "r",
-            "content": "hello sandbox",
-            "content_encoding": "text",
-        }
-
-        _, executed = _post_json(
-            server,
-            "/v1/sandbox/sandboxes/local/execute",
-            {
-                "command": [sys.executable, "-c",
-                            "import os,sys; sys.stdout.write(os.environ['VALUE']+':'+os.getcwd())"],
-                "working_dir": str(tmp_path),
-                "env": {"VALUE": "ok"},
-            },
-        )
-        assert executed == {
-            "returncode": 0,
-            "stdout": f"ok:{tmp_path}",
-            "stderr": "",
-        }
-    finally:
-        server.stop()
-
-
-def test_sandbox_binary_file_list_and_search_operations(tmp_path):
-    server = _server()
-    server.start()
-    target = tmp_path / "nested" / "payload.bin"
-    ignored = tmp_path / "nested" / "ignored.bin"
-    try:
-        for path, content in ((target, b"\x00\xff"), (ignored, b"ignored")):
-            _put_raw(
-                server,
-                f"/v1/sandbox/sandboxes/local/files/write?path={urllib.parse.quote(str(path))}&mode=wb",
-                base64.b64encode(content),
-            )
-
-        _, read = _get_json(
-            server,
-            f"/v1/sandbox/sandboxes/local/files/read?path={urllib.parse.quote(str(target))}",
-        )
-        assert base64.b64decode(read["content"]) == b"\x00\xff"
-        assert read["content_encoding"] == "base64"
-
-        _, listed = _get_json(
-            server,
-            f"/v1/sandbox/sandboxes/local/files/list?path={urllib.parse.quote(str(tmp_path))}&recursive=true",
-        )
-        assert {item["name"] for item in listed["items"]} == {
-            "nested",
-            "payload.bin",
-            "ignored.bin",
-        }
-
-        _, searched = _get_json(
-            server,
-            f"/v1/sandbox/sandboxes/local/files/search?path={urllib.parse.quote(str(tmp_path))}"
-            "&pattern=*.bin&exclude_patterns=ignored.*",
-        )
-        assert [item["name"] for item in searched["items"]] == ["payload.bin"]
     finally:
         server.stop()
 
@@ -611,87 +354,7 @@ def test_files_list_route_rejects_non_bool_recursive(tmp_path):
             _get_json(server, f"/v1/files/list?{query}")
         assert caught.value.code == 400
         assert b"must be a boolean" in caught.value.read()
-
-        # 沙箱 files_list 路由额外接受 include_files/include_dirs。
-        base = f"/v1/sandbox/sandboxes/local/files/list?path={urllib.parse.quote(str(tmp_path))}"
-        for param in ("include_files", "include_dirs"):
-            with pytest.raises(urllib.error.HTTPError) as caught:
-                _get_json(server, f"{base}&{param}=aaa")
-            assert caught.value.code == 400
-            assert b"must be a boolean" in caught.value.read()
-
-        # 沙箱路由的 recursive 同样严格校验。
-        with pytest.raises(urllib.error.HTTPError) as caught:
-            _get_json(server, f"{base}&recursive=aaa")
-        assert caught.value.code == 400
-        assert b"must be a boolean" in caught.value.read()
-    finally:
-        server.stop()
-
-
-def test_sandbox_rejects_invalid_json_and_oversized_body():
-    server = _server(max_sandbox_request_size=8)
-    server.start()
-    try:
-        host, port = server.address
-        request = urllib.request.Request(
-            f"http://{host}:{port}/v1/sandbox/sandboxes/local/execute",
-            data=b"not-json",
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with pytest.raises(urllib.error.HTTPError) as invalid:
-            urllib.request.urlopen(request)
-        assert invalid.value.code == 400
-
-        request = urllib.request.Request(
-            f"http://{host}:{port}/v1/sandbox/sandboxes/local/execute",
-            data=b'{"command":"true"}',
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with pytest.raises(urllib.error.HTTPError) as oversized:
-            urllib.request.urlopen(request)
-        assert oversized.value.code == 413
-    finally:
-        server.stop()
-
-
-def test_sandbox_size_limits_are_independent_from_frontend_file_limit(tmp_path):
-    server = _server(
-        max_file_size=8,
-        max_sandbox_request_size=1024,
-        max_sandbox_response_size=1024,
-    )
-    server.start()
-    target = tmp_path / "sandbox.txt"
-    try:
-        status, result = _put_raw(
-            server,
-            f"/v1/sandbox/sandboxes/local/files/write?path={urllib.parse.quote(str(target))}&mode=w",
-            b"more than eight bytes",
-        )
-        assert status == 200
-        assert result["success"] is True
-        assert target.read_text() == "more than eight bytes"
-    finally:
-        server.stop()
-
-
-def test_sandbox_rejects_oversized_json_response(tmp_path):
-    target = tmp_path / "large.txt"
-    target.write_text("response larger than limit")
-    server = _server(max_sandbox_response_size=16)
-    server.start()
-    try:
-        host, port = server.address
-        with pytest.raises(urllib.error.HTTPError) as caught:
-            _get_json(
-                server,
-                f"/v1/sandbox/sandboxes/local/files/read?path={urllib.parse.quote(str(target))}&mode=r",
-            )
-        assert caught.value.code == 413
-        assert "response body exceeds max 16" in json.load(caught.value)["message"]
+        # 沙箱侧的参数校验由 test_sandbox_yaml_api 的 invoke 用例覆盖。
     finally:
         server.stop()
 
@@ -714,7 +377,9 @@ def test_server_rejects_requests_above_concurrency_limit():
     first_result = []
 
     def first_request():
-        first_result.append(_post_json(server, "/v1/sandbox/sandboxes/local/execute", {"command": "true"}))
+        first_result.append(_post_json(
+            server, "/direct/local/invoke",
+            {"action": "process.exec", "args": {"cmd": "true"}}))
 
     thread = threading.Thread(target=first_request)
     thread.start()
@@ -730,7 +395,8 @@ def test_server_rejects_requests_above_concurrency_limit():
         thread.join(timeout=2)
         server.stop()
 
-    assert first_result == [(200, {"returncode": 0, "stdout": "", "stderr": ""})]
+    # invoke 数据面响应形态:exit_code(非旧接口的 returncode)。
+    assert first_result == [(200, {"stdout": "", "stderr": "", "exit_code": 0})]
 
 
 def test_server_does_not_own_sandbox_lifecycle():
@@ -749,35 +415,6 @@ def test_server_does_not_own_sandbox_lifecycle():
     # The server never constructs a sandbox itself and never terminates one on
     # stop; the runtime that injected the manager owns cleanup.
     assert sandbox.method_calls == []
-
-
-def test_sandbox_request_logs_agent_trace_pairs(caplog):
-    caplog.set_level(logging.INFO)
-    server = _server()
-    server.start()
-    try:
-        host, port = server.address
-        request = urllib.request.Request(
-            f"http://{host}:{port}/v1/sandbox/sandboxes/local/execute",
-            data=json.dumps({"command": ["true"]}).encode("utf-8"),
-            headers={"Content-Type": "application/json", "X-Trace-ID": "t-002"},
-            method="POST",
-        )
-        with urllib.request.urlopen(request) as response:
-            assert response.status == 200
-        # POST sandbox 路由的 op 取路径最后一段(execute)
-        assert "[agent.execute.enter] agentexecutor" in caplog.text
-        assert "trace_id=t-002" in caplog.text
-        # The exit line is logged by the server thread after the response is
-        # fully sent, so poll briefly instead of asserting immediately.
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and (
-            "[agent.execute.exit] agentexecutor result=HTTP:200" not in caplog.text
-        ):
-            time.sleep(0.05)
-        assert "[agent.execute.exit] agentexecutor result=HTTP:200" in caplog.text
-    finally:
-        server.stop()
 
 
 def test_healthz_emits_no_agent_trace(caplog):

@@ -40,10 +40,10 @@ from .file_handler import DEFAULT_MAX_FILE_SIZE, FileHandler, FileListTimeoutErr
 from .sandbox_http import (
     DEFAULT_MAX_SANDBOX_REQUEST_SIZE,
     DEFAULT_MAX_SANDBOX_RESPONSE_SIZE,
-    SANDBOX_PREFIX,
     SandboxRequestMixin,
     SandboxRequestTooLargeError,
     SandboxResponseTooLargeError,
+    sandbox_api_kind,
 )
 from .sandbox_manager import SandboxManager
 
@@ -198,8 +198,8 @@ class _ExecutorRequestHandler(SandboxRequestMixin, BaseHTTPRequestHandler):
             with self._agent_trace("filelist", parsed.path):
                 self._list(parse_qs(parsed.query))
             return
-        if path == SANDBOX_PREFIX or path.startswith(f"{SANDBOX_PREFIX}/"):
-            self._sandbox_request("GET", path, parse_qs(parsed.query))
+        if sandbox_api_kind(path):
+            self._sandbox_api_request("GET", path, parse_qs(parsed.query))
             return
         self._write_json(HTTPStatus.NOT_FOUND, {"message": "endpoint not found"})
 
@@ -217,10 +217,10 @@ class _ExecutorRequestHandler(SandboxRequestMixin, BaseHTTPRequestHandler):
             with self._agent_trace("exec", path):
                 self._exec_command()
             return
-        # sandbox POST: /v1/sandbox/sandboxes (create) or /v1/sandbox/sandboxes/{id}/execute
-        if path == SANDBOX_PREFIX or path.startswith(f"{SANDBOX_PREFIX}/"):
+        # sandbox POST: yaml 管理面 create 或数据面 invoke
+        if sandbox_api_kind(path):
             with self._agent_trace(path.rsplit("/", 1)[-1], path):
-                self._sandbox_request("POST", path, {})
+                self._sandbox_api_request("POST", path, {})
             return
         self._write_json(HTTPStatus.NOT_FOUND, {"message": "endpoint not found"})
 
@@ -229,16 +229,16 @@ class _ExecutorRequestHandler(SandboxRequestMixin, BaseHTTPRequestHandler):
         if path == "/v1/files/upload":
             self._upload()
             return
-        # sandbox PUT: /v1/sandbox/sandboxes/{id}/files/write
-        if path.startswith(f"{SANDBOX_PREFIX}/"):
-            self._sandbox_request("PUT", path, parse_qs(urlsplit(self.path).query))
+        # sandbox PUT: yaml 端点仅注册 POST/DELETE,其余方法一律 405
+        if sandbox_api_kind(path):
+            self._sandbox_api_request("PUT", path, parse_qs(urlsplit(self.path).query))
             return
         self._write_json(HTTPStatus.NOT_FOUND, {"message": "endpoint not found"})
 
     def _handle_delete(self) -> None:
         path = urlsplit(self.path).path
-        if path.startswith(f"{SANDBOX_PREFIX}/"):
-            self._sandbox_request("DELETE", path, {})
+        if sandbox_api_kind(path):
+            self._sandbox_api_request("DELETE", path, {})
             return
         self._write_json(HTTPStatus.NOT_FOUND, {"message": "endpoint not found"})
 
@@ -463,14 +463,14 @@ class _ExecutorRequestHandler(SandboxRequestMixin, BaseHTTPRequestHandler):
         """Unified entry for methods without a dedicated do_* handler
         (PATCH/HEAD/OPTIONS/TRACE/CONNECT). Not a method whitelist: route by
         sandbox path first and let the dispatch tail decide; new methods only
-        add a branch in _dispatch_sandbox, this layer stays untouched."""
+        add a branch in the sandbox API handlers, this layer stays untouched."""
         parsed = urlsplit(self.path)
         path = parsed.path
-        if path == SANDBOX_PREFIX or path.startswith(f"{SANDBOX_PREFIX}/"):
+        if sandbox_api_kind(path):
             # This method never consumes a request body; drop keep-alive so a
             # pipelined next request cannot read the previous body's leftovers.
             self.close_connection = True
-            self._sandbox_request(self.command, path, parse_qs(parsed.query))
+            self._sandbox_api_request(self.command, path, parse_qs(parsed.query))
             return
         self._write_json(HTTPStatus.NOT_FOUND, {"message": "endpoint not found"})
 

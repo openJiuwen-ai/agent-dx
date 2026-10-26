@@ -9,7 +9,7 @@
 # http://www.apache.org/licenses/LICENSE-2.0
 #
 # Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
+# distributed under the License is distribute；d on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
@@ -160,15 +160,24 @@ def _search_files_impl(
     path: str,
     pattern: str,
     exclude_patterns: Optional[List[str]] = None,
-) -> List[Dict]:
-    """Search files by glob pattern using fnmatch."""
+    depth: Optional[int] = None,
+) -> Dict:
+    """Search files by glob pattern using fnmatch.
+
+    Returns ``{"items": [...], "scanned": <int>}`` where *scanned* counts
+    every filesystem entry encountered during traversal (files and
+    directories, excluding the root). *depth* bounds the maximum relative
+    depth of traversed entries (``None`` = unlimited).
+    """
     excludes = exclude_patterns or []
     result: List[Dict] = []
+    scanned = 0
 
     def _is_excluded(entry_name: str) -> bool:
         return any(fnmatch.fnmatch(entry_name, pat) for pat in excludes)
 
-    def _search(dir_path: str) -> None:
+    def _search(dir_path: str, current_depth: int) -> None:
+        nonlocal scanned
         try:
             entries = os.listdir(dir_path)
         except OSError:
@@ -176,13 +185,21 @@ def _search_files_impl(
         for entry in entries:
             entry_path = os.path.join(dir_path, entry)
             if os.path.isdir(entry_path):
-                _search(entry_path)
+                scanned += 1
+                # 契约语义:不跟随子目录符号链接(计入扫描,不递归进入)。
+                if os.path.islink(entry_path):
+                    continue
+                # 条目相对深度为 current_depth + 1,其孩子为 current_depth + 2;
+                # 超过 depth 即剪枝(与 file.list 的契约 depth 语义一致)。
+                if depth is None or current_depth + 2 <= depth:
+                    _search(entry_path, current_depth + 1)
             else:
+                scanned += 1
                 if fnmatch.fnmatch(entry, pattern) and not _is_excluded(entry):
                     result.append(_build_fs_item(entry_path))
 
-    _search(path)
-    return result
+    _search(path, 0)
+    return {"items": result, "scanned": scanned}
 
 
 def _get_gateway_host() -> str:
