@@ -5426,8 +5426,12 @@ impl DistributedFs {
             .prefetch
             .lock()
             .map_err(|_| unavailable("DFS prefetch table is poisoned"))?;
+        // The window is an immutable snapshot of its byte range for this
+        // version, so any request inside the range is served without a new
+        // group. Requiring the exact cursor position would rebuild the whole
+        // group whenever the kernel interleaves a small synchronous fault
+        // with its larger readahead request at the same offset.
         if let Some(window) = cache.get_mut(&handle.0)
-            && window.next_offset == offset
             && window.inode_id == *inode_id
             && window.version_id == version_id
             && window.layout_root_id == layout.id
@@ -5437,7 +5441,7 @@ impl DistributedFs {
             let relative = usize::try_from(offset - window.start)
                 .map_err(|_| invalid("read prefetch offset is too large"))?;
             out[..count].copy_from_slice(&window.data[relative..relative + count]);
-            window.next_offset = offset + count as u64;
+            window.next_offset = window.next_offset.max(offset + count as u64);
             return Ok(count);
         }
         // A retired window keeps its allocation for the next fill: every fill
@@ -12683,7 +12687,10 @@ impl Backend for DistributedFs {
     }
 
     fn supports_async_reads(&self) -> bool {
-        self.read_engine.async_read_enabled()
+        // The async pipeline carries no group window; routing a grouped read
+        // through it would re-issue a whole group per request. Sequential
+        // group mode keeps the synchronous windowed path.
+        self.read_engine.async_read_enabled() && self.read_group.is_none()
     }
 
     fn read_reply_async(
@@ -12711,6 +12718,18 @@ impl Backend for DistributedFs {
         let snapshot = self.handle_snapshot(handle)?;
         if snapshot.flags & libc::O_ACCMODE == libc::O_WRONLY {
             return Err(bad_file_descriptor("DFS handle was not opened for reading"));
+        }
+        // The FUSE reply path routes here, so sequential group mode must serve
+        // from the same prefetched group window as `read`; without this branch
+        // every request re-issues a whole group through the transport.
+        if let Some(group) = self.read_group
+            && self
+                .remote_provider_visible_for_reads(&snapshot.inode_id)?
+                .is_none()
+            && self.write_state(&snapshot.inode_id)?.is_none()
+        {
+            let data = self.read_native_group_owned(handle, &snapshot, offset, size, group)?;
+            return Ok(data.into());
         }
         self.read_native_owned(handle, &snapshot, offset, size)
     }
@@ -29390,6 +29409,33 @@ mod tests {
 
         fs.release(&context(), reader).unwrap();
         assert_eq!(fs.prefetch_bytes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn read_reply_serves_sequential_group_reads_from_one_window() {
+        let (_temp, meta, fs) = grouped_fs(8);
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "reply-group-window", b"abcdefgh");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        // Kernel readahead interleaves a small synchronous fault at an offset
+        // with its larger readahead request at the same offset, and may fault
+        // an already-served page again. All of those stay inside the group.
+        for base in [0_usize, 2, 4] {
+            let fault = fs.read_reply(&context(), reader, base as u64, 1).unwrap();
+            assert_eq!(&fault[..], &b"abcdefgh"[base..base + 1]);
+            let ahead = fs.read_reply(&context(), reader, base as u64, 2).unwrap();
+            assert_eq!(&ahead[..], &b"abcdefgh"[base..base + 2]);
+        }
+        let backward = fs.read_reply(&context(), reader, 1, 3).unwrap();
+        assert_eq!(&backward[..], b"bcd");
+        // One fill at offset zero must serve every request; a window rebuilt
+        // per request would start at the last offset instead.
+        let cache = fs.prefetch.lock().unwrap();
+        let window = cache.get(&reader.0).expect("group window stays cached");
+        assert_eq!(window.start, 0);
+        assert_eq!(window.data.len(), 8);
+        assert_eq!(window.next_offset, 6);
     }
 
     #[test]

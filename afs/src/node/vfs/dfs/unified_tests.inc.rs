@@ -188,3 +188,53 @@ async fn unified_cancelled_refresh_unlinks_flight_and_retains_original_result() 
     assert!(flight.wait_async(&fs, &operation).await.is_err());
     fs.release(&context(), file.handle).unwrap();
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn group_mode_routes_native_reads_through_the_group_window() {
+    let temp = tempfile::tempdir().unwrap();
+    let meta = Arc::new(RecordingMeta::new());
+    let local = Arc::new(
+        LocalChunkStore::open(temp.path().join("chunks"), "node-a")
+            .unwrap()
+            .with_peer_read_crc_mode(crate::config::DfsReadCrcMode::Off),
+    );
+    let engine = DfsReadEngine::new(
+        NamespaceId::new("default"),
+        "node-a".into(),
+        local.clone(),
+        Arc::new(crate::node::dfs_read::UnimplementedReadSourceProvider),
+        Arc::new(UnifiedLocalTransfer),
+        crate::node::dfs_read::DfsReadConfig::default(),
+    )
+    .with_read_pipeline(crate::node::read_pipeline::ReadPipelineLimits::default())
+    .unwrap();
+    let fs = DistributedFs::new(
+        NamespaceId::new("default"),
+        "node-a",
+        "session-a",
+        meta.clone(),
+        local,
+        Arc::new(engine),
+    )
+    .with_read_group(Some(ReadGroupPolicy {
+        bytes: 8,
+        max_inflight: 1,
+        max_descriptors: 8,
+        host_budget_bytes: 1024 * 1024,
+    }));
+    // The async pipeline carries no group window, so sequential group mode
+    // must keep the synchronous windowed path even for async transports.
+    assert!(!fs.supports_async_reads());
+    let id = meta.inode.lock().unwrap().inode_id.clone();
+    publish_external_version_with_bytes(&meta, &fs, "unified-group-route", b"abcdefgh");
+    let inode = fs.backend_inode(&id).unwrap();
+    let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+    assert_eq!(
+        &fs.read_reply(&context(), reader, 0, 4).unwrap()[..],
+        b"abcd"
+    );
+    assert_eq!(
+        &fs.read_reply(&context(), reader, 4, 4).unwrap()[..],
+        b"efgh"
+    );
+    fs.release(&context(), reader).unwrap();
+}
