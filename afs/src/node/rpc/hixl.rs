@@ -267,6 +267,7 @@ pub struct HixlMetrics {
     source_checksums_reused: IntCounter,
     source_checksums_computed: IntCounter,
     cold_fallbacks: IntCounter,
+    crc_fallbacks: IntCounter,
     allocated: IntGauge,
     relay_hbm_budget: IntGauge,
     quarantined: IntGauge,
@@ -357,6 +358,10 @@ impl HixlMetrics {
                 "afs_hixl_cold_tcp_fallbacks_total",
                 "Preferred-mode small batches served by gRPC while the peer session warms.",
             )?;
+            let crc_fallbacks = IntCounter::new(
+                "afs_hixl_crc_tcp_fallbacks_total",
+                "CRC32C reads served by the gRPC adapter because native windows verify BLAKE3 digests only.",
+            )?;
             let allocated = IntGauge::new(
                 "afs_hixl_allocated_bytes",
                 "Fixed ACL Host pool allocation.",
@@ -391,6 +396,7 @@ impl HixlMetrics {
             register_collector(registry, &source_checksums_reused)?;
             register_collector(registry, &source_checksums_computed)?;
             register_collector(registry, &cold_fallbacks)?;
+            register_collector(registry, &crc_fallbacks)?;
             for gauge in [
                 &allocated,
                 &relay_hbm_budget,
@@ -415,6 +421,7 @@ impl HixlMetrics {
                 source_checksums_reused,
                 source_checksums_computed,
                 cold_fallbacks,
+                crc_fallbacks,
                 allocated,
                 relay_hbm_budget,
                 quarantined,
@@ -486,6 +493,11 @@ impl HixlMetrics {
     /// Records a small preferred-mode batch kept on gRPC while warming HIXL.
     pub fn observe_cold_fallback(&self) {
         self.cold_fallbacks.inc();
+    }
+
+    /// Records a CRC32C range the native window protocol cannot verify.
+    pub fn observe_crc_fallback(&self) {
+        self.crc_fallbacks.inc();
     }
 
     pub fn snapshot(&self, status: &RuntimeStatus) {

@@ -715,6 +715,7 @@ struct ReadContext {
 pub struct HixlChunkTransfer {
     context: ReadContext,
     runtime: PeerRuntime,
+    crc: GrpcChunkTransfer,
     next_read: AtomicU64,
 }
 
@@ -740,6 +741,7 @@ impl HixlChunkTransfer {
                 "HIXL mode and deadline are invalid",
             ));
         }
+        let crc = GrpcChunkTransfer::new(peers.clone(), timeout)?;
         Ok(Self {
             context: ReadContext {
                 peers,
@@ -757,6 +759,7 @@ impl HixlChunkTransfer {
                 lane_bindings: Arc::new(StdMutex::new(HashMap::new())),
             },
             runtime: PeerRuntime::current_or_new().map_err(|error| error.0)?,
+            crc,
             next_read: AtomicU64::new(1),
         })
     }
@@ -852,14 +855,20 @@ impl ChunkTransfer for HixlChunkTransfer {
 
     /// CRC32C objects are single-range by construction and the native window
     /// protocol carries BLAKE3 digests only, so keep them on the gRPC adapter.
+    /// Each served range is counted so a `required` peer never looks idle.
     fn read_crc32c_range(
         &self,
         batch: &PeerReadBatch,
         chunk: &crate::dfs::ChunkObject,
         out: &mut [u8],
     ) -> afs_error::Result<()> {
-        GrpcChunkTransfer::new(self.context.peers.clone(), self.context.timeout)?
-            .read_crc32c_range(batch, chunk, out)
+        let result = self.crc.read_crc32c_range(batch, chunk, out);
+        if result.is_ok()
+            && let Some(metrics) = &self.context.metrics
+        {
+            metrics.observe_crc_fallback();
+        }
+        result
     }
 
     fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> afs_error::Result<()> {
@@ -1473,12 +1482,29 @@ impl ReadContext {
                     })
                     .clone()
             };
-            let guard = slot.clone().try_lock_owned().map_err(|_| {
-                afs_error::Error::coded(
-                    afs_error::NODE_TRANSFER_RESOURCE_EXHAUSTED,
-                    "HIXL peer already has an admitted read",
-                )
-            })?;
+            // One peer admits a single logical read at a time. Concurrent FUSE
+            // reads must queue for that admission instead of failing: a cold
+            // readahead fan-out would otherwise turn the peer limit into errors.
+            let wait = remaining(deadline)?;
+            let guard = tokio::time::timeout(wait, slot.clone().lock_owned())
+                .await
+                .map_err(|_| {
+                    afs_error::Error::coded(
+                        afs_error::CLIENT_DEADLINE_EXCEEDED,
+                        "HIXL peer read admission exceeded the batch deadline",
+                    )
+                })?;
+            // The slot may have been reclaimed while this read queued.
+            if !self
+                .slots
+                .lock()
+                .await
+                .get(&key)
+                .is_some_and(|current| Arc::ptr_eq(current, &slot))
+            {
+                drop(guard);
+                continue;
+            }
             if guard.session.is_none() && guard.warming.is_some() {
                 drop(guard);
                 self.settle_warm(node_id, node_epoch, address, deadline)
@@ -4320,6 +4346,118 @@ mod tests {
                 1,
                 "warming must negotiate exactly one control session"
             );
+            stop.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn concurrent_peer_reads_queue_instead_of_failing() {
+            let Harness {
+                _temp,
+                native,
+                reader,
+                mut batch,
+                stop,
+                server,
+                ..
+            } = harness().await;
+            batch.operations[0].op.length = 2;
+            // The first read holds the peer admission while its native connect
+            // is blocked; a second read must queue for it instead of reporting
+            // an exhausted peer.
+            native.close_connect_gate();
+            let first = {
+                let reader = reader.clone();
+                let batch = batch.clone();
+                tokio::spawn(async move {
+                    tokio::task::spawn_blocking(move || {
+                        let mut output = vec![b'!'; 3];
+                        reader.read_ranges(&batch, &mut output)?;
+                        Ok::<_, afs_error::Error>(output)
+                    })
+                    .await
+                    .unwrap()
+                })
+            };
+            native.wait_connect_entered(1).await;
+            let second = {
+                let reader = reader.clone();
+                let batch = batch.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    tokio::task::spawn_blocking(move || {
+                        let mut output = vec![b'!'; 3];
+                        reader.read_ranges(&batch, &mut output)?;
+                        Ok::<_, afs_error::Error>(output)
+                    })
+                    .await
+                    .unwrap()
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            native.open_connect_gate();
+            let first = first.await.unwrap().unwrap();
+            let second = second.await.unwrap().unwrap();
+            assert_eq!(&first[1..], b"ab");
+            assert_eq!(&second[1..], b"ab");
+            stop.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn queued_admission_past_the_deadline_reports_a_deadline_error() {
+            let Harness {
+                _temp,
+                native,
+                reader,
+                mut batch,
+                endpoint,
+                stop,
+                server,
+                ..
+            } = harness().await;
+            batch.operations[0].op.length = 2;
+            native.close_connect_gate();
+            let first = {
+                let reader = reader.clone();
+                let batch = batch.clone();
+                tokio::spawn(async move {
+                    tokio::task::spawn_blocking(move || {
+                        let mut output = vec![b'!'; 3];
+                        reader.read_ranges(&batch, &mut output)?;
+                        Ok::<_, afs_error::Error>(output)
+                    })
+                    .await
+                    .unwrap()
+                })
+            };
+            native.wait_connect_entered(1).await;
+            let deadline = Instant::now() + Duration::from_millis(100);
+            let acquired = reader
+                .context
+                .acquire(
+                    "source",
+                    9,
+                    &endpoint,
+                    &DfsReadRangesRequest::default(),
+                    deadline,
+                )
+                .await;
+            match acquired {
+                Err(error) => {
+                    assert_eq!(error.code(), afs_error::CLIENT_DEADLINE_EXCEEDED);
+                }
+                Ok(_) => panic!("a queued read past its deadline must not be admitted"),
+            }
+            native.open_connect_gate();
+            let first = first.await.unwrap().unwrap();
+            assert_eq!(&first[1..], b"ab");
             stop.send(()).unwrap();
             tokio::time::timeout(Duration::from_secs(1), server)
                 .await
