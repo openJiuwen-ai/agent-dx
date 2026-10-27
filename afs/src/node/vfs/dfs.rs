@@ -4804,7 +4804,7 @@ impl DistributedFs {
         }
     }
 
-    #[cfg(test)]
+    /// Synchronous compatibility boundary for grouped native reads.
     fn native_inode_for_read(
         &self,
         handle: FileHandle,

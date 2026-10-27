@@ -65,7 +65,9 @@ use tonic::{Request, Response, Status};
 #[cfg(feature = "dfs")]
 use crate::node::chunk::LocalChunkStore;
 #[cfg(feature = "dfs")]
-use crate::node::dfs_read::{MAX_DFS_GROUP_BYTES, MAX_DFS_GROUP_OPS};
+use crate::node::dfs_read::{
+    MAX_DFS_GROUP_BYTES, MAX_DFS_GROUP_OPS, MAX_DFS_READ_BYTES, MAX_DFS_READ_OPS,
+};
 use crate::node::{
     rpc::control::RdmaSessionRegistry,
     storage::{MAX_TRANSFER_BYTES, Storage, StorageError},
@@ -7998,6 +8000,9 @@ mod tests {
             replica_data_plane: None,
             replica_permits: Arc::new(tokio::sync::Semaphore::new(1)),
             read_permits: Arc::new(tokio::sync::Semaphore::new(1)),
+            read_limits: Default::default(),
+            disk_slots: Arc::new(tokio::sync::Semaphore::new(1)),
+            open_setup_gates: Arc::new(Default::default()),
             replica_timeout: std::time::Duration::from_secs(1),
             rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
             payload_metrics: None,

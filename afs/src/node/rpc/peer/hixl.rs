@@ -4071,6 +4071,7 @@ mod tests {
                 None,
                 Duration::from_secs(5),
                 DfsChunkTransportResources {
+                    read_pipeline: Default::default(),
                     rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
                     payload_metrics: None,
                     hixl: source_supported.then(|| source.clone()),

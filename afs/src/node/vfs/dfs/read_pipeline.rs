@@ -252,7 +252,7 @@ impl DistributedFs {
                     return Ok(prost::bytes::Bytes::new());
                 }
                 let count = (view.length - offset).min(size as u64) as usize;
-                let ops = self.layout_read_ops(&view.layout, offset, count)?;
+                let ops = Self::layout_read_ops(&view.layout, offset, count)?;
                 let batch = ReadBatch {
                     file_version_id: view.committed.clone(),
                     layout_root_id: view.layout.id.clone(),

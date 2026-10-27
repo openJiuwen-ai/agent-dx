@@ -2213,12 +2213,7 @@ impl DfsReadEngine {
         let result = self.transfer.read_ranges_async(batch, out).await;
         if let Some(metrics) = &self.transport_metrics {
             let outcome = if result.is_ok() { "ok" } else { "error" };
-            metrics.record(
-                self.transfer.transport(),
-                outcome,
-                bytes,
-                started.elapsed(),
-            );
+            metrics.record(self.transfer.transport(), outcome, bytes, started.elapsed());
         }
         result
     }
@@ -5297,7 +5292,10 @@ impl DfsReadEngine {
                                     operations: vec![single],
                                 };
                                 let mut single_scratch = vec![0; operation.op.length as usize];
-                                match self.transfer_batch(&single_batch, &mut single_scratch).await {
+                                match self
+                                    .transfer_batch(&single_batch, &mut single_scratch)
+                                    .await
+                                {
                                     Ok(()) => {
                                         if !self.source_matches(batch, &operation.source) {
                                             return Err(external_denied(

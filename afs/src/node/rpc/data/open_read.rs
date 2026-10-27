@@ -795,6 +795,7 @@ mod tests {
                 read_pipeline: limits,
                 rdma_sessions: super::super::super::control::RdmaSessionRegistry::new(None),
                 payload_metrics: None,
+                hixl: None,
             },
         );
         let credentials = tempfile::tempdir().unwrap();
