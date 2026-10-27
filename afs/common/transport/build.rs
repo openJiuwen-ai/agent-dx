@@ -34,7 +34,7 @@ fn build_hixl() -> Result<(), String> {
         return Err("the hixl feature requires a Linux target with the CANN SDK".to_owned());
     }
     let configured = std::env::var("ADX_CANN_PATH")
-        .map_err(|_| "ADX_CANN_PATH must point to a matching CANN 9.1.1 SDK (for example /opt/ascend/cann) when hixl is enabled".to_owned())?;
+        .map_err(|_| "ADX_CANN_PATH must point to a matching CANN 9.1.0 SDK (for example /opt/ascend/cann) when hixl is enabled".to_owned())?;
     let configured = std::path::PathBuf::from(configured);
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").map_err(|error| error.to_string())?;
     if arch != "x86_64" && arch != "aarch64" {
@@ -61,7 +61,7 @@ fn build_hixl() -> Result<(), String> {
     ] {
         if !required.is_file() {
             return Err(format!(
-                "ADX_CANN_PATH does not contain the required HIXL 9.1.1 SDK file: {}",
+                "ADX_CANN_PATH does not contain the required HIXL 9.1.0 SDK file: {}",
                 required.display()
             ));
         }

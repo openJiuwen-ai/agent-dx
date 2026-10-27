@@ -3010,8 +3010,8 @@ mod tests {
     }
 
     #[test]
-    fn negotiation_rejects_older_protocol_versions() {
-        for version in [1, 2, 3] {
+    fn negotiation_rejects_mismatched_protocol_versions() {
+        for version in [0, HIXL_PROTOCOL_VERSION + 1] {
             let (_, mut reply, _) = descriptor();
             reply.protocol_version = version;
             let error = validate_negotiation(
@@ -3020,7 +3020,7 @@ mod tests {
                 7,
                 &engine_info(ReadTransport::Roce, 0, 0, None),
             )
-            .expect_err("older HIXL replies must be rejected");
+            .expect_err("mismatched HIXL replies must be rejected");
             assert_eq!(error.code(), afs_error::CLIENT_PROTOCOL_VIOLATION);
         }
     }

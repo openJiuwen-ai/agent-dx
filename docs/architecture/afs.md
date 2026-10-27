@@ -781,7 +781,7 @@ READ。可选 `hccs-buffer-pool` 使用未注册 Host 业务窗口与同步 READ
 预算为每设备 `2 * buffer_pool_count * buffer_pool_size_mib` MiB，默认 64 MiB，最多 512 MiB。
 Host 与 HBM 分开统计，HBM 数值表示配置容量；聚合预算随设备数增长，两类各最多 8 GiB。
 
-协议 v5 携带精确父 batch、窗口偏移与 lane ID，协商有序 lane engine/generation/容量，
+协议 v1 携带精确父 batch、窗口偏移与 lane ID，协商有序 lane engine/generation/容量，
 Release 请求按 peer 子批携带逐窗口身份与结果。
 在授权后校验两端 lane 数、transport、BufferPool 参数和 SDK 实际查询到的 super-pod ID，
 匹配后才分配 session/建链。HCCS 模式只接受配套 SDK 支持的 A3 型号和已知同域 peer，

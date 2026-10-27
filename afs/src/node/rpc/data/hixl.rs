@@ -2580,15 +2580,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn negotiate_rejects_old_protocol_before_authorization() {
+    async fn negotiate_rejects_mismatched_protocol_before_authorization() {
         let (service, _provider, authorizer) = service();
-        let mut request = negotiate_request(read_request("old-version", "fixture-grant"));
-        request.protocol_version = 1;
+        let mut request = negotiate_request(read_request("mismatched-version", "fixture-grant"));
+        request.protocol_version = HIXL_PROTOCOL_VERSION + 1;
 
         let error = service
             .negotiate("reader".into(), request, authorizer.clone())
             .await
-            .expect_err("HIXL v1 must be rejected");
+            .expect_err("a mismatched HIXL protocol version must be rejected");
 
         assert_eq!(error.code(), tonic::Code::Unimplemented);
         assert_eq!(authorizer.calls.load(Ordering::SeqCst), 0);

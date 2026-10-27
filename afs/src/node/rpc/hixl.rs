@@ -6,7 +6,7 @@ use afs_metrics::{
 };
 use afs_transport::hixl::{HixlError, HixlErrorKind, HixlReadTiming, RuntimeStatus};
 
-pub(crate) const HIXL_PROTOCOL_VERSION: u32 = 5;
+pub(crate) const HIXL_PROTOCOL_VERSION: u32 = 1;
 
 pub(crate) fn runtime_error(error: HixlError) -> afs_error::Error {
     let code = match error.kind {

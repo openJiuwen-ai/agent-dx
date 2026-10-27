@@ -131,7 +131,7 @@ Node 先完成本地 HIXL 初始化，再向 Meta 首次注册，避免多设备
 快照合计相应为 64 MiB / 128 MiB，与 Host/HBM 池预算独立；每窗仍重新授权，完整释放或
 关闭、过期、drain 时清理快照。组 batch 在节点间传输边界按 128 MiB / 512 operations
 校验，不再因超过普通 batch 的 8 MiB 预算而退化为逐窗口重试。
-此请求级准备优化、多设备并行与内部协议 v5 已通过本地 Linux/WSL 构建及 CPU/fake SDK
+此请求级准备优化、多设备并行与内部协议 v1 已通过本地 Linux/WSL 构建及 CPU/fake SDK
 回归。A3 HCCS 四机双源（1 个 meta、2 个源节点、1 个全远端 reader）已完成 1 GiB
 顺序读验收：4 MiB FUSE 读、`direct`、128 MiB 组读，读回数据 SHA-256 校验通过。
 组读开启预取（`dfs_read_group_max_inflight = 2`）后的同轮对照为 HIXL 0.696 s、

@@ -250,7 +250,7 @@ make platform-release ADX_WITH_AFS=1 ADX_AFS_WITH_HIXL=1 ADX_CANN_PATH=/opt/asce
 
 AFS HIXL 支持 CANN ≥ 9.1.0、HDK ≥ 25.5.0。运行节点的 CANN、HDK 与设备型号需使用
 配套组合；容器部署时，CANN 来自容器，HDK 来自宿主机。
-安装根需提供同一配套版本的 HIXL/ACL 头文件及共享库。已有软件验证使用 CANN 9.1.1。
+安装根需提供同一配套版本的 HIXL/ACL 头文件及共享库。已有软件验证使用 CANN 9.1.0。
 构建不会下载或把 CANN 复制进 ADX 包。运行节点应加载正式 CANN 环境、驱动库及 Ascend 设备；SDK 的 devlib
 stub 只可用于无硬件的编译/软件单测，不能代替驱动完成真实 READ。
 启用 HIXL 的二进制即使配置 `preferred`，仍需动态加载 CANN 依赖；它不是运行时 dlopen 插件。
@@ -399,17 +399,17 @@ engine_id = "192.0.2.10:7920"
 
 此模式使用未注册的 ACL Host 业务窗口和 SDK 通信域引擎，在专用 ACL owner 线程执行
 `TransferSync(READ)`，将剩余读取 deadline 传给 SDK。不会同时配置 `protocol_desc` 或
-`LocalCommRes`，因为配套 HIXL 9.1.1 的该组合会选择不支持中转的 HixlCS 引擎。
+`LocalCommRes`，因为配套 HIXL 9.1.0 的该组合会选择不支持中转的 HixlCS 引擎。
 `buffer_pool_count` 和 `buffer_pool_size_mib` 各为 1..64；两组 HBM 池的合计预算为
 `2 * count * size_mib` MiB，最多 512 MiB，默认 64 MiB。RoCE 不分配中转 HBM；这些字段
 仍需满足配置范围。Host 池预算独立计算，不因开启中转而减少。
 
 启动时检查 A3 型号，并通过 `aclrtGetDeviceInfo(ACL_DEV_ATTR_SUPER_POD_ID)` 查询实际
-super-pod ID；查询失败或负数视为能力缺失。协议 v5 在授权后、分配 session 和建链前
+super-pod ID；查询失败或负数视为能力缺失。协议 v1 在授权后、分配 session 和建链前
 检查两端 lane 数、transport、池参数和 domain；domain 0 是有效值。不同域、模式或池参数返回
-协议/参数错误，不能当作 `preferred` 的 capability fallback。v5 同时携带精确父 batch、窗口
+协议/参数错误，不能当作 `preferred` 的 capability fallback。v1 同时携带精确父 batch、窗口
 偏移、lane 身份与每 lane 的 engine/generation/容量，并支持按 peer 子批批量释放窗口；
-节点升级需统一使用 v5。
+节点升级需统一使用 v1。
 
 HCCS 模式要求 `HCCL_INTRA_ROCE_ENABLE` 未设置或为 `0`，
 `HCCL_INTER_HCCS_DISABLE` 未设置或为 `FALSE`，冲突配置在初始化 engine 前拒绝。
@@ -424,7 +424,7 @@ AFS grant 不限制 HIXL 参数面暴露的注册池或中转地址访问范围�
 `/health` 的 `checks.hixl` 报告模式、transport、super-pod ID、代际、Host
 allocated/quarantined bytes、`relay_hbm_budget_bytes` 和 slot 使用数；资源字段为组内聚合。
 `lane_count` 和有序 `lanes` 另列配置的设备/监听端口、engine/generation、状态及资源，
-活动 runtime 的 `internal_protocol_version` 为 5。设备监听端口来自启动配置，并非 SDK
+活动 runtime 的 `internal_protocol_version` 为 1。设备监听端口来自启动配置，并非 SDK
 实测端口。HBM 字段表示
 SDK 两组池的配置容量，不是实测使用量；无 runtime 时为 0、domain 为 null。
 已有代际进入 quarantine 后，即使为 `preferred` 也显示 degraded，不静默切换通道。
