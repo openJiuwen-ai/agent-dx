@@ -11,6 +11,7 @@ mod failure;
 mod inspection;
 mod observability;
 use observability::CounterUpdate;
+pub mod prewarm;
 mod recovery;
 pub use observability::{
     BusinessCounters, CreationResult, CreationSummary, InterruptionSummary, RecoveryState,
@@ -1592,6 +1593,8 @@ impl Session {
         assignment: Assignment,
         request_id: &str,
     ) -> Result<StoredEnvironment> {
+        self.guard_preparation_generation(&spec.id, Some(assignment.generation))
+            .await?;
         self.pin_volumes(&spec).await?;
         if let Some(id) = &spec.snapshot_id {
             let snapshot = self.get_snapshot(id).await?;

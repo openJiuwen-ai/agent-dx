@@ -1,6 +1,7 @@
 //! Node RPC adaptation; EnvironmentHandle remains the lifecycle owner.
 use adx_transport::rpc::{authenticated_channel, RpcChannel};
 mod local_create;
+mod prewarm;
 mod volumes;
 use crate::{Adxlet, Durability, StateSink};
 use adx_core::{EnvironmentRecord, Error, Result};
@@ -22,6 +23,7 @@ pub struct NodeRpc {
     coordinator: Option<CoordinatorStateSink>,
     local_retries:
         Arc<std::sync::Mutex<std::collections::BTreeMap<String, local_create::PendingLocalCreate>>>,
+    artifact_cache: Option<Arc<crate::prewarm::ArtifactCache>>,
     entry_locks: Arc<
         std::sync::Mutex<
             std::collections::BTreeMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
@@ -57,12 +59,17 @@ impl NodeRpc {
         self.coordinator = Some(coordinator);
         self
     }
+    pub fn with_artifact_cache(mut self, cache: Arc<crate::prewarm::ArtifactCache>) -> Self {
+        self.artifact_cache = Some(cache);
+        self
+    }
     pub fn new(manager: Arc<Adxlet>, peers: Peers, session_id: String) -> Self {
         Self {
             manager,
             peers,
             session_id,
             coordinator: None,
+            artifact_cache: None,
             entry_locks: Arc::default(),
             local_retries: Arc::default(),
         }
@@ -257,6 +264,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     return Err(Status::unavailable("node is reconciling"));
                 }
                 let r = request.into_inner();
+                self.allow_checkpoint(r.assignment.as_ref()).await?;
                 let handle = self.owned_handle(r.assignment, r.caller.as_ref())?;
                 let saved = handle
                     .snapshot(crate::checkpoint::SnapshotRequest {
@@ -320,6 +328,15 @@ impl pb::node_service_server::NodeService for NodeRpc {
                         "only Coordinator may assign environments",
                     ));
                 }
+                let id = request
+                    .get_ref()
+                    .spec
+                    .as_ref()
+                    .ok_or_else(|| Status::invalid_argument("spec required"))?
+                    .id
+                    .clone();
+                let entry_lock = self.environment_entry_lock(&id)?;
+                let _entry = entry_lock.lock().await;
                 let gate = self.manager.lifecycle_ready.read().await;
                 if !*gate {
                     return Err(Status::unavailable("node is reconciling"));
@@ -338,17 +355,22 @@ impl pb::node_service_server::NodeService for NodeRpc {
                         .instant(),
                     )
                 };
-                let spec = r
+                let spec: adx_core::EnvironmentSpec = r
                     .spec
                     .ok_or_else(|| Status::invalid_argument("spec required"))?
                     .try_into()
                     .map_err(status)?;
-                let assignment = r
+                let assignment: adx_core::Assignment = r
                     .assignment
                     .ok_or_else(|| Status::invalid_argument("assignment required"))?
                     .try_into()
                     .map_err(status)?;
-                let handle = self.manager.environment(spec, assignment).map_err(status)?;
+                let handle = self
+                    .manager
+                    .environment(spec.clone(), assignment.clone())
+                    .map_err(status)?;
+                self.pin_artifact(&r.prepared_artifact_id, &spec, &assignment)
+                    .await?;
                 let result = match r.snapshot {
                     Some(snapshot) => match deadline {
                         Some(deadline) => {
@@ -391,6 +413,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     return Err(Status::unavailable("node is reconciling"));
                 }
                 let r = request.into_inner();
+                self.allow_checkpoint(r.assignment.as_ref()).await?;
                 let handle = self.owned_handle(r.assignment, r.caller.as_ref())?;
                 response(
                     handle
@@ -506,6 +529,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     return Err(Status::unavailable("node is reconciling"));
                 }
                 let r = request.into_inner();
+                self.allow_checkpoint(r.assignment.as_ref()).await?;
                 let handle = self.owned_handle(r.assignment, r.caller.as_ref())?;
                 response(
                     handle
@@ -530,6 +554,15 @@ impl pb::node_service_server::NodeService for NodeRpc {
                         "validated Frontend caller required",
                     ));
                 }
+                let id = request
+                    .get_ref()
+                    .assignment
+                    .as_ref()
+                    .ok_or_else(|| Status::invalid_argument("assignment required"))?
+                    .environment_id
+                    .clone();
+                let entry_lock = self.environment_entry_lock(&id)?;
+                let _entry = entry_lock.lock().await;
                 let gate = self.manager.lifecycle_ready.read().await;
                 if !*gate {
                     return Err(Status::unavailable("node is reconciling"));

@@ -62,13 +62,13 @@ pub(crate) fn apply_pty(command: &mut portable_pty::CommandBuilder) {
 }
 
 pub(crate) fn is_reserved(key: &OsStr) -> bool {
-    key.to_string_lossy().starts_with("ADX_")
+    key.to_string_lossy().starts_with("ADX_") || key == OsStr::new("EXECD_HTTP_TOKEN")
 }
 
 pub(crate) fn validate_override(key: &str) -> Result<(), String> {
     if is_reserved(OsStr::new(key)) {
         return Err(format!(
-            "environment variable {key} uses the reserved ADX_ prefix"
+            "environment variable {key} is reserved for runtime control"
         ));
     }
     Ok(())
@@ -87,6 +87,10 @@ mod tests {
                 OsString::from("/tmp/spec"),
             ),
             (OsString::from("USER_VALUE"), OsString::from("ok")),
+            (
+                OsString::from("EXECD_HTTP_TOKEN"),
+                OsString::from("private-control-token"),
+            ),
         ]);
         assert_eq!(values.len(), 2);
         assert!(values.iter().all(|(key, _)| !is_reserved(key)));
@@ -94,6 +98,7 @@ mod tests {
 
     #[test]
     fn rejects_reserved_user_override() {
+        assert!(validate_override("EXECD_HTTP_TOKEN").is_err());
         assert!(validate_override("ADX_INTERNAL").is_err());
         assert!(validate_override("USER_VALUE").is_ok());
     }

@@ -18,6 +18,8 @@ use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time:
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
+    #[serde(default)]
+    prewarm_artifacts: Option<adxlet::prewarm::ArtifactCacheConfig>,
     node_id: String,
     #[serde(default)]
     labels: HashMap<String, String>,
@@ -247,6 +249,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ))
         })
         .transpose()?;
+    let artifact_cache = config
+        .prewarm_artifacts
+        .map(|sources| {
+            adxlet::prewarm::ArtifactCache::new(sources, config.runtime_profile.as_ref())
+                .map(Arc::new)
+        })
+        .transpose()?;
     let runtime_config = RuntimeConfig {
         runtime_profile: config.runtime_profile,
         command: config.execd_command,
@@ -268,6 +277,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
         None => None,
     };
+    let sandboxd = sandboxd.map(|backend| match &artifact_cache {
+        Some(cache) => backend.with_artifact_cache(cache.clone()),
+        None => backend,
+    });
+    if artifact_cache.is_some() && sandboxd.is_none() {
+        return Err("prewarm artifacts require the sandboxd backend".into());
+    }
     let runtime = Arc::new(RuntimeRouter::new(sandboxd, jiuwenbox)?);
     // The sandboxd network plugin may create the configured bridge during
     // initialization. Bind only after backend readiness, before admitting work.
@@ -365,6 +381,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bind before registration so dispatch cannot race an unbound address.
     let node_rpc = NodeRpc::new(manager.clone(), peers, session_id.clone())
         .with_local_creation((*sink).clone());
+    let node_rpc = match artifact_cache {
+        Some(cache) => node_rpc.with_artifact_cache(cache),
+        None => node_rpc,
+    };
     let claim_retries = async {
         let mut interval =
             tokio::time::interval(Duration::from_secs(config.report_interval_seconds));
@@ -379,6 +399,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.tls_config(tls)?;
     }
     let server = builder
+        .add_service(
+            pb::preparation_node_service_server::PreparationNodeServiceServer::new(
+                node_rpc.clone(),
+            ),
+        )
         .add_service(pb::node_service_server::NodeServiceServer::new(
             node_rpc.clone(),
         ))

@@ -54,6 +54,45 @@ fn platform_owned_credentials_and_process_overrides_are_rejected() {
 }
 
 #[test]
+fn preparation_context_is_template_derived_and_shared_by_both_adapters() {
+    use adx_agent_core::environment::PreparationContext;
+    let template: adx_agent_core::TemplateVersion = serde_json::from_value(json!({
+        "name":"app", "version":"1", "image":"app:1", "isolation_runtime":"runc",
+        "env":{"API_KEY":"${model_key}"}, "resources":{"cpu_millis":100,"memory_mib":128}
+    }))
+    .unwrap();
+    let context = PreparationContext::for_template("tenant", &template).unwrap();
+    let mut request = request();
+    request.preparation_context = Some(context.clone());
+    let input = create_input(&request, Duration::from_secs(60), &network_policy()).unwrap();
+    assert_eq!(
+        input["preparationContext"],
+        serde_json::to_value(&context).unwrap()
+    );
+    let mut other = request.clone();
+    other
+        .execution
+        .env
+        .insert("API_KEY".into(), "private-user-b".into());
+    assert_eq!(
+        create_input(&other, Duration::from_secs(60), &network_policy()).unwrap()
+            ["preparationContext"],
+        input["preparationContext"]
+    );
+    let serialized = input["preparationContext"].to_string();
+    assert!(!serialized.contains("private-user-b"));
+    assert!(!serialized.contains("API_KEY"));
+    other.tenant = "other".into();
+    assert!(create_input(&other, Duration::from_secs(60), &network_policy()).is_err());
+    request
+        .preparation_context
+        .as_mut()
+        .unwrap()
+        .contract_version = 2;
+    assert!(create_input(&request, Duration::from_secs(60), &network_policy()).is_err());
+}
+
+#[test]
 fn burst_limits_reach_the_public_sandbox_contract_independently_of_requests() {
     let mut wire = serde_json::to_value(request()).unwrap();
     wire["execution"]["resources"] = json!({"cpu_millis":500,"memory_mib":1024,

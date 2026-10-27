@@ -9,6 +9,7 @@ pub use checkpoint::{
 };
 pub mod execution;
 pub mod observation;
+pub mod prewarm;
 pub mod probes;
 pub mod runtime;
 pub mod scheduling;

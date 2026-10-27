@@ -1,7 +1,7 @@
 //! Request-scoped activation retries retain the saved Binding and original deadline.
 use super::*;
 use adx_agent_core::{
-    environment::{CreateEnvironment, ExecutionSpec},
+    environment::{CreateEnvironment, ExecutionSpec, PreparationContext},
     mounts::{Mount, Parameters},
     volumes::VolumeSpec,
 };
@@ -32,6 +32,7 @@ impl Activator {
         binding: &AgentBinding,
         mut execution: ExecutionSpec,
         volumes: &[VolumeSpec],
+        preparation_context: PreparationContext,
         deadline: u64,
     ) -> Result<EnvironmentObservation> {
         let deadline_at = Instant::now()
@@ -93,6 +94,7 @@ impl Activator {
                                 id: binding.environment_id.clone(),
                                 tenant: binding.scope.tenant.clone(),
                                 execution: execution.clone(),
+                                preparation_context: Some(preparation_context.clone()),
                                 deadline_unix_ms: Some(deadline),
                             })
                             .await

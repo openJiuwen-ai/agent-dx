@@ -7,6 +7,9 @@ mod cloning;
 mod collection;
 mod metrics;
 mod observation;
+mod prewarm;
+mod prewarm_controller;
+mod prewarm_metrics;
 mod recovery;
 mod resume;
 mod snapshots;
@@ -272,6 +275,7 @@ struct Inner {
     business: Arc<std::sync::RwLock<Option<observation::BusinessSnapshot>>>,
     business_fenced: Arc<std::sync::atomic::AtomicBool>,
     volume_domains: std::sync::RwLock<BTreeMap<String, adx_core::volumes::StorageDomain>>,
+    prewarm_metrics: prewarm_metrics::Metrics,
     created: std::sync::atomic::AtomicU64,
     reclaimers: std::sync::RwLock<adx_checkpoint_storage::reclaim::Reclaimers>,
     resume_admission: Arc<tokio::sync::Semaphore>,
@@ -463,6 +467,7 @@ impl CoordinatorRpc {
                 },
             ))),
             business_fenced: Default::default(),
+            prewarm_metrics: Default::default(),
             created: Default::default(),
             create_locks: Default::default(),
             reclaimers: Default::default(),
@@ -734,6 +739,7 @@ impl CoordinatorRpc {
             }
             Err(error) => return Err(status(error)),
         };
+        Box::pin(self.accept_preparation_context(&spec, r.preparation_context)).await?;
         let service = self.clone();
         tokio::spawn(
             adx_observability::trace::Trace::child("coordinator.create").run(async move {
@@ -784,7 +790,12 @@ impl CoordinatorRpc {
         .map_err(|_| Status::deadline_exceeded("create deadline waiting for environment"))?;
         let outcome = match tokio::time::timeout_at(
             create_deadline.instant() + adx_transport::deadline::CREATE_RESPONSE_GRACE,
-            self.create_attempt(spec.clone(), schedule_timeout, create_deadline, request_id),
+            Box::pin(self.create_attempt(
+                spec.clone(),
+                schedule_timeout,
+                create_deadline,
+                request_id,
+            )),
         )
         .await
         {
@@ -886,8 +897,7 @@ impl CoordinatorRpc {
                     .result
                     .ok_or_else(|| Status::internal("confirmed environment result missing"))?;
                 let record = if record.state == EnvironmentState::Running {
-                    session
-                        .publish_existing(record, &request_id)
+                    Box::pin(session.publish_existing(record, &request_id))
                         .await
                         .map_err(status)?
                 } else {
@@ -956,9 +966,10 @@ impl CoordinatorRpc {
             .create_requests
             .entry(spec.id.clone())
             .or_default()
-            .insert(request_id);
+            .insert(request_id.clone());
         drop(inspection);
         let mut schedule_deadline = None;
+        let mut counted_preparation = false;
         loop {
             create_deadline.remaining().map_err(|_| {
                 Status::deadline_exceeded("create deadline exceeded during central scheduling")
@@ -1074,7 +1085,41 @@ impl CoordinatorRpc {
                     continue;
                 }
                 let snapshot = prepared_snapshot.clone();
+                let preparation_session = state.session.clone();
                 drop(state);
+                // Prewarm creation opts into durable ownership. Ordinary master
+                // local/central reservations retain their transient fast path.
+                match preparation_session
+                    .preparation_attempt(&spec.tenant_id, &spec.id)
+                    .await
+                {
+                    Ok(_) => {
+                        Box::pin(preparation_session.reserve_with_request(
+                            spec.clone(),
+                            stored.assignment.clone(),
+                            &request_id,
+                        ))
+                        .await
+                        .map_err(status)?;
+                    }
+                    Err(Error::NotFound) => (),
+                    Err(error) => return Err(status(error)),
+                }
+                let preparation = Box::pin(preparation_session.assign_preparation(
+                    &spec,
+                    &stored.assignment,
+                    recovery::now().map_err(status)?,
+                ))
+                .await
+                .map_err(status)?;
+                if !counted_preparation {
+                    if let Some(attempt) = &preparation {
+                        self.0.prewarm_metrics.acquire(attempt.selection);
+                        counted_preparation = true;
+                    }
+                }
+                let selected_at = std::time::Instant::now();
+                let preparation_selection = preparation.as_ref().map(|attempt| attempt.selection);
                 let endpoint = self
                     .0
                     .node_tls
@@ -1093,6 +1138,9 @@ impl CoordinatorRpc {
                     }
                 };
                 let request = pb::StartAssignedEnvironmentRequest {
+                    prepared_artifact_id: preparation
+                        .and_then(|attempt| attempt.artifact_id)
+                        .unwrap_or_default(),
                     create_deadline_unix_millis: create_deadline.unix_millis(),
                     snapshot,
                     node_session_id: node
@@ -1172,6 +1220,11 @@ impl CoordinatorRpc {
                 } else if result.durability != pb::Durability::Journaled as i32 {
                     return Err(Status::unavailable("unknown result durability"));
                 }
+                if let Some(selection) = preparation_selection {
+                    self.0.prewarm_metrics.ready(selected_at.elapsed());
+                    adx_observability::info!(event="prewarm_environment_ready",environment_id=%spec.id,selection=?selection,
+                        claim_to_ready_ms=selected_at.elapsed().as_secs_f64()*1000.0,"preparation selection reached Environment readiness");
+                }
                 return Ok(result);
             }
             drop(state);
@@ -1201,6 +1254,16 @@ impl CoordinatorRpc {
         let mut state = self.0.state.lock().await;
         state.recover_authoritative_state().await.map_err(status)?;
         state.healthy().map_err(status)?;
+        if state
+            .session
+            .preparation_is_assigned(id, assignment)
+            .await
+            .map_err(status)?
+        {
+            return Err(Status::unavailable(
+                "preparation ownership remains fixed; query or retry the same Environment",
+            ));
+        }
         // A timed-out Redis write may have succeeded before its reply was lost.
         match state.session.get(id).await {
             Ok(stored) if stored.result.is_some() => {
@@ -1361,23 +1424,26 @@ impl CoordinatorRpc {
             .cloned()
             .unwrap_or_default();
         drop(state);
+        let prepared_initial = initial
+            && session
+                .preparation_is_assigned(&record.spec.id, &record.assignment)
+                .await?;
         let mut authoritative = None;
         let mut accepted = if initial && record.state == EnvironmentState::Running {
-            let winner = session
-                .publish_initial_observed(
-                    record.clone(),
-                    &request_ids.into_iter().collect::<Vec<_>>(),
-                    &session_id,
-                    creation,
-                )
-                .await?;
+            let winner = Box::pin(session.publish_initial_observed(
+                record.clone(),
+                &request_ids.into_iter().collect::<Vec<_>>(),
+                &session_id,
+                creation,
+            ))
+            .await?;
             if winner.assignment != record.assignment || winner.runtime.id != record.runtime.id {
                 session.abandon_initial(&record.assignment).await?;
                 self.discard_unconfirmed_locked(&record.spec).await;
                 return Err(Error::Conflict);
             }
             winner
-        } else if initial && !crate::storage::has_volumes(&record.spec) {
+        } else if initial && !crate::storage::has_volumes(&record.spec) && !prepared_initial {
             // Retire an optional pending Claim as well as the memory reservation;
             // unsuccessful initial attempts have no durable creation result.
             session.abandon_initial(&record.assignment).await?;
@@ -1398,9 +1464,12 @@ impl CoordinatorRpc {
             self.0.changed.notify_waiters();
             return Ok(record);
         } else {
-            let committed = session
-                .commit_releasing_with_state(record, &session_id, &stopped_runtime_ids)
-                .await?;
+            let committed = Box::pin(session.commit_releasing_with_state(
+                record,
+                &session_id,
+                &stopped_runtime_ids,
+            ))
+            .await?;
             authoritative = committed.stored;
             committed.result
         };
@@ -1788,7 +1857,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             .create
             .ok_or_else(|| Status::invalid_argument("create required"))?;
         let service = self.clone();
-        tokio::spawn(trace.run(async move { service.create_from_request(create).await }))
+        tokio::spawn(trace.run(async move { Box::pin(service.create_from_request(create)).await }))
             .await
             .map_err(|_| Status::internal("forwarded creation task failed"))?
     }
@@ -2077,7 +2146,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 if self.0.peers.authenticate(&request)? != Principal::ApiServer {
                     return Err(Status::permission_denied("Frontend caller required"));
                 }
-                self.create_from_request(request.into_inner()).await
+                Box::pin(self.create_from_request(request.into_inner())).await
             })
             .await
     }
@@ -2148,10 +2217,13 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 let service = self.clone();
                 tokio::spawn(
                     adx_observability::trace::Trace::child("coordinator.commit").run(async move {
-                        let record = service
-                            .commit_releasing(record, r.node_session_id, r.stopped_runtime_ids)
-                            .await
-                            .map_err(status)?;
+                        let record = Box::pin(service.commit_releasing(
+                            record,
+                            r.node_session_id,
+                            r.stopped_runtime_ids,
+                        ))
+                        .await
+                        .map_err(status)?;
                         Ok(Response::new(pb::CommitEnvironmentResponse {
                             record: Some(record.try_into().map_err(status)?),
                         }))

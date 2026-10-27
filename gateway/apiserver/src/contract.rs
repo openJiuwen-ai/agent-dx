@@ -640,6 +640,22 @@ fn security(value: &str) -> Result<adx_core::execution::DataPlaneSecurityMode, S
 pub fn create_spec(body: Value, caller: &pb::CallerContext) -> Result<pb::EnvironmentSpec, Status> {
     create_spec_with_environment(body, caller, None)
 }
+
+/// A preparation hint never supplies tenant authority or a slot/node identity.
+pub fn preparation_context(
+    input: &Value,
+    caller: &pb::CallerContext,
+) -> Result<Option<pb::PreparationContext>, Status> {
+    let Some(value) = input.get("preparationContext") else {
+        return Ok(None);
+    };
+    let context: adx_core::prewarm::PreparationContext =
+        serde_json::from_value(value.clone()).map_err(|_| invalid("invalid preparationContext"))?;
+    context
+        .validate(&caller.tenant_id)
+        .map_err(|error| invalid(&error.to_string()))?;
+    Ok(Some(context.into()))
+}
 pub fn create_spec_with_environment(
     body: Value,
     caller: &pb::CallerContext,

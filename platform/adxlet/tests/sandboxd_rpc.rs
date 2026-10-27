@@ -295,6 +295,133 @@ async fn discovers_runtime_classes_from_sandboxd_uds() {
 }
 
 #[tokio::test]
+async fn prepared_erofs_start_uses_readonly_process_mount_and_final_user_environment() {
+    use adx_core::prewarm::*;
+    use adxlet::prewarm::*;
+    use sha2::{Digest, Sha256};
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("source.img");
+    let mut bytes = vec![0; 4096];
+    bytes[1024..1028].copy_from_slice(&[0xe2, 0xe1, 0xf5, 0xe0]);
+    std::fs::write(&path, &bytes).unwrap();
+    let mut wanted = spec();
+    wanted.image = format!("app@sha256:{}", "a".repeat(64));
+    wanted.execution.inherit_entrypoint = true;
+    wanted.execution.rootfs = Some(adx_core::execution::Rootfs {
+        readonly: false,
+        source: adx_core::execution::StorageSource::Image(wanted.image.clone()),
+    });
+    wanted.env.insert("CONFLICT".into(), "from-user".into());
+    wanted
+        .env
+        .insert("USER_SECRET".into(), "private-user-value".into());
+    let architecture = if std::env::consts::ARCH == "aarch64" {
+        "arm64"
+    } else {
+        "amd64"
+    };
+    let profile = PreparationProfile {
+        source_ref: SourceRef {
+            tenant: "tenant".into(),
+            template: "app".into(),
+            version: "1".into(),
+            template_digest: format!("sha256:{}", "b".repeat(64)),
+        },
+        image: wanted.image.clone(),
+        runtime_class: wanted.runtime_class.clone(),
+        resources: wanted.resources,
+        architecture: architecture.into(),
+        runtime_recipe_digest: fingerprint(
+            &Option::<adx_core::runtime_profile::RuntimeProfile>::None,
+        )
+        .unwrap(),
+        security_digest: format!("sha256:{}", "c".repeat(64)),
+        late_binding_contract_digest: format!("sha256:{}", "d".repeat(64)),
+        contract_version: 1,
+    };
+    let cache = Arc::new(
+        ArtifactCache::new(
+            ArtifactCacheConfig {
+                root: directory.path().join("cache"),
+                max_disk_bytes: 8192,
+                sources: vec![ArtifactSource {
+                    image: wanted.image.clone(),
+                    path,
+                    sha256: format!("sha256:{:x}", Sha256::digest(bytes)),
+                    architecture: architecture.into(),
+                    runtime_classes: vec!["runsc".into()],
+                    process: ImageProcess {
+                        version: 1,
+                        args: vec!["/app".into()],
+                        cwd: "/".into(),
+                        user: "10001:10001".into(),
+                    },
+                    env: std::collections::BTreeMap::from([
+                        ("IMAGE_DEFAULT".into(), "source".into()),
+                        ("CONFLICT".into(), "from-image".into()),
+                    ]),
+                }],
+            },
+            None,
+        )
+        .unwrap(),
+    );
+    cache
+        .prepare("artifact-contract", &profile, 8192)
+        .await
+        .unwrap();
+    cache
+        .pin(
+            "artifact-contract",
+            &wanted.image,
+            "tenant",
+            &adx_core::runtime::RuntimeIdentity {
+                environment_id: "i".into(),
+                runtime_id: "i-7".into(),
+                ownership_generation: 7,
+            },
+        )
+        .await
+        .unwrap();
+    let server = Server::default();
+    let starts = server.starts.clone();
+    let (adapter, _server) = connect(server).await;
+    let adapter = adapter.with_artifact_cache(cache.clone());
+    adapter.start(&wanted, "i-7", 7, &[]).await.unwrap();
+    let request = starts.lock().unwrap()[0].clone();
+    assert!(matches!(
+        request.rootfs.as_ref().unwrap().source,
+        Some(rootfs_config::Source::Path(_))
+    ));
+    let process = request
+        .mounts
+        .iter()
+        .find(|m| m.target == "/etc/adx-image-process.json")
+        .unwrap();
+    assert!(process.options.iter().any(|o| o == "ro"));
+    assert!(process.options.iter().any(|o| o == "bind"));
+    assert!(request.inject_entrypoint.is_empty());
+    assert_eq!(
+        request.envs["ADX_IMAGE_PROCESS_CONFIG"],
+        "/etc/adx-image-process.json"
+    );
+    assert_eq!(request.envs["CONFLICT"], "from-user");
+    assert_eq!(request.envs["IMAGE_DEFAULT"], "source");
+    assert_eq!(request.envs["USER_SECRET"], "private-user-value");
+    assert_eq!(request.labels["adx.environment_id"], "i");
+    assert_eq!(request.labels["adx.generation"], "7");
+    assert!(!std::fs::read_to_string(
+        directory
+            .path()
+            .join("cache/artifact-contract/manifest.json")
+    )
+    .unwrap()
+    .contains("private-user-value"));
+    adapter.remove("i-7").await.unwrap();
+    assert!(!cache.observe("artifact-contract").await.unwrap().in_use);
+}
+
+#[tokio::test]
 async fn running_runsc_retains_input_after_restore_acknowledgement() {
     let (adapter, _server) = connect(Server::default()).await;
     let mut source = spec();

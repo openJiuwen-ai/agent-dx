@@ -192,6 +192,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     let collection_rpc = rpc.clone();
+    let prewarm_rpc = rpc.clone();
+    let prewarm = async {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            if let Err(error) = prewarm_rpc.reconcile_prewarm().await {
+                adx_observability::warn!("prewarm reconciliation incomplete: {error}");
+            }
+        }
+    };
     let collection = async {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
         loop {
@@ -222,6 +233,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_service(
             pb::volume_execution_service_server::VolumeExecutionServiceServer::new(rpc.clone()),
         )
+        .add_service(pb::prewarm_service_server::PrewarmServiceServer::new(
+            rpc.clone(),
+        ))
         .add_service(pb::volume_service_server::VolumeServiceServer::new(
             rpc.clone(),
         ))
@@ -252,6 +266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ = maintenance => {}
         _ = route_task => {}
         _ = collection => {}
+        _ = prewarm => {}
         _ = recovery => {}
         result = metrics => result?,
         result = autoscaling => result?,

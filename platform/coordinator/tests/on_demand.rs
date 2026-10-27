@@ -396,6 +396,7 @@ impl Rig {
         let created = client
             .create_environment(pb::CreateEnvironmentRequest {
                 request_id: String::new(),
+                preparation_context: None,
                 spec: Some(spec().into()),
                 caller: caller(),
                 schedule_timeout_seconds: 3,
@@ -631,6 +632,7 @@ async fn coordinator_autoscaling_http_queries_authoritative_node_ownership_witho
                 )
                 .create_environment(pb::CreateEnvironmentRequest {
                     request_id: String::new(),
+                    preparation_context: None,
                     spec: Some(queued.into()),
                     caller: caller(),
                     schedule_timeout_seconds: 1,
@@ -1890,6 +1892,7 @@ async fn local_checkpoint_waits_for_volume_without_rejecting_its_owner_node() {
     );
     let request = |spec: EnvironmentSpec| pb::CreateEnvironmentRequest {
         request_id: String::new(),
+        preparation_context: None,
         spec: Some(spec.into()),
         caller: caller(),
         schedule_timeout_seconds: 3,

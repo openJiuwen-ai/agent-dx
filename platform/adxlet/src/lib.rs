@@ -12,6 +12,7 @@ pub mod journal;
 pub mod managed_mounts;
 pub mod metrics;
 pub mod node_reconciliation;
+pub mod prewarm;
 pub mod proxy;
 pub mod readiness;
 mod reconciliation;

@@ -116,9 +116,131 @@ pub struct CreateEnvironment {
     pub id: String,
     pub tenant: String,
     pub execution: ExecutionSpec,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation_context: Option<PreparationContext>,
     /// Request metadata, not part of environment identity or execution specification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_unix_ms: Option<u64>,
+}
+
+/// Stable template identity, independent of rendered user parameters and live pool policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparationSourceRef {
+    pub tenant: String,
+    pub template: String,
+    pub version: String,
+    pub template_digest: String,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PreparationPreference {
+    Prefer,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparationContext {
+    pub source_ref: PreparationSourceRef,
+    pub preference: PreparationPreference,
+    pub contract_version: u32,
+}
+
+/// Static management profile. These fingerprints describe template content;
+/// only Platform/backend qualification permits preparing a physical artifact.
+#[derive(Debug, Clone, Serialize)]
+pub struct CompiledPreparationProfile {
+    pub source_ref: PreparationSourceRef,
+    pub image: String,
+    pub runtime_class: String,
+    pub resources: PreparationResources,
+    pub architecture: String,
+    pub runtime_recipe_digest: String,
+    pub security_digest: String,
+    pub late_binding_contract_digest: String,
+    pub contract_version: u32,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct PreparationResources {
+    pub cpu_millis: u64,
+    pub memory_bytes: u64,
+    pub disk_bytes: u64,
+}
+impl CompiledPreparationProfile {
+    pub fn for_template(
+        tenant: &str,
+        template: &TemplateVersion,
+        architecture: &str,
+        runtime_recipe_digest: String,
+    ) -> Result<Self, EnvironmentError> {
+        template.validate().map_err(EnvironmentError::Invalid)?;
+        let context = PreparationContext::for_template(tenant, template)?;
+        let memory_bytes = template
+            .resources
+            .memory_mib
+            .checked_mul(1_048_576)
+            .ok_or_else(|| EnvironmentError::Invalid("memory byte overflow".into()))?;
+        Ok(Self {
+            security_digest: context.source_ref.template_digest.clone(),
+            late_binding_contract_digest: context.source_ref.template_digest.clone(),
+            source_ref: context.source_ref,
+            image: template.image.clone(),
+            runtime_class: template.isolation_runtime.clone(),
+            resources: PreparationResources {
+                cpu_millis: template.resources.cpu_millis,
+                memory_bytes,
+                disk_bytes: 0,
+            },
+            architecture: architecture.into(),
+            runtime_recipe_digest,
+            contract_version: 1,
+        })
+    }
+}
+impl PreparationContext {
+    pub fn for_template(
+        tenant: &str,
+        template: &TemplateVersion,
+    ) -> Result<Self, EnvironmentError> {
+        use sha2::{Digest, Sha256};
+        let bytes = serde_json::to_vec(template)
+            .map_err(|_| EnvironmentError::Invalid("invalid template serialization".into()))?;
+        let context = Self {
+            source_ref: PreparationSourceRef {
+                tenant: tenant.into(),
+                template: template.name.clone(),
+                version: template.version.clone(),
+                template_digest: format!("sha256:{:x}", Sha256::digest(bytes)),
+            },
+            preference: PreparationPreference::Prefer,
+            contract_version: 1,
+        };
+        context.validate(tenant)?;
+        Ok(context)
+    }
+    pub fn validate(&self, tenant: &str) -> Result<(), EnvironmentError> {
+        for value in [
+            &self.source_ref.tenant,
+            &self.source_ref.template,
+            &self.source_ref.version,
+        ] {
+            crate::identifier(value, "preparation source").map_err(EnvironmentError::Invalid)?;
+        }
+        let digest = self.source_ref.template_digest.strip_prefix("sha256:");
+        if self.source_ref.tenant != tenant
+            || self.contract_version != 1
+            || digest.is_none_or(|d| {
+                d.len() != 64
+                    || !d
+                        .bytes()
+                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            })
+        {
+            return Err(EnvironmentError::Invalid(
+                "preparation source tenant, digest or contract version mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

@@ -230,8 +230,18 @@ impl Activator {
             .map_err(Error::Invalid)?;
         self.environment.validate_execution(&execution)?;
         let volumes = creation::definitions(&template, &binding.parameters, &execution.mounts)?;
+        let preparation_context = adx_agent_core::environment::PreparationContext::for_template(
+            &scope.tenant,
+            &template,
+        )?;
         let observed = self
-            .activate_environment(&binding, execution, &volumes, deadline_unix_ms)
+            .activate_environment(
+                &binding,
+                execution,
+                &volumes,
+                preparation_context,
+                deadline_unix_ms,
+            )
             .await;
         // Compensate a late activation using its saved identity. Never delete
         // the Environment belonging to a replacement Binding lifecycle.
