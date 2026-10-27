@@ -594,6 +594,11 @@ impl RootManager {
         self.enter_root(prepared.reservation().id(), RootRight::Write)
     }
 
+    /// 本节点身份；用于判断某个 root 的 Home 是否就是本节点。
+    pub fn local_node_id(&self) -> &str {
+        &self.local_node_id
+    }
+
     /// B-side slow path: locate a root without granting file access.
     pub fn lookup_root_location(&self, id: &RootId) -> Result<Option<RootLocation>> {
         self.meta.lookup_root(id)

@@ -671,6 +671,11 @@ impl OwnerFsPeerExecutor {
             .peer_rmdir(ctx, peer_node_id, access, path, expected, expected_parent)
     }
 
+    /// Home 侧：删除一个 root。只有 Home 能执行；非 Home 节点必须转发。
+    pub fn delete_root(&self, peer_node_id: &str, access: &PresentedRootAccess) -> Result<()> {
+        self.local.peer_delete_root(peer_node_id, access)
+    }
+
     // Keep the agreed peer contract explicit instead of allocating a request
     // object just to satisfy the argument-count lint on this cold operation.
     #[allow(clippy::too_many_arguments)]
@@ -2959,6 +2964,56 @@ impl LocalOwnerFs {
         Ok(())
     }
 
+    /// Home 侧删除整个 root。调用方（非 Home 节点）已由通道与 Meta grant
+    /// 证明其 Admin 权利；Home 只在本机 catalog 上执行删除，绝不转发。
+    fn peer_delete_root(&self, peer_node_id: &str, access: &PresentedRootAccess) -> Result<()> {
+        afs_logging::info!(
+            "ownerfs.peer_delete_root.start";
+            "node" => self.roots.local_node_id(),
+            "peer" => peer_node_id,
+            "root_id" => ?access.id,
+            "epoch" => access.epoch,
+            "access_generation" => access.access_generation,
+            "home" => %access.home_node_id,
+            "home_session" => %access.home_session_id,
+            "session" => %access.session_id
+        );
+        if let Err(error) = self.validate_peer(access, peer_node_id, RootRight::Admin) {
+            afs_logging::warn!(
+                "ownerfs.peer_delete_root.rejected";
+                "node" => self.roots.local_node_id(),
+                "peer" => peer_node_id,
+                "root_id" => ?access.id,
+                "epoch" => access.epoch,
+                "access_generation" => access.access_generation,
+                "error" => ?error
+            );
+            return Err(error);
+        }
+        if !self.roots.has_active_local_root(&access.id) {
+            afs_logging::warn!(
+                "ownerfs.peer_delete_root.not_home";
+                "node" => self.roots.local_node_id(),
+                "peer" => peer_node_id,
+                "root_id" => ?access.id,
+                "home" => %access.home_node_id
+            );
+            return Err(Error::coded(
+                afs_error::NODE_VFS_NOT_FOUND,
+                "root is not homed on this node",
+            ));
+        }
+        self.delete_local_root(&access.id)?;
+        self.cleanup_local_root(&access.id)?;
+        afs_logging::info!(
+            "ownerfs.peer_delete_root.completed";
+            "node" => self.roots.local_node_id(),
+            "peer" => peer_node_id,
+            "root_id" => ?access.id
+        );
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn peer_rename(
         &self,
@@ -4804,13 +4859,12 @@ impl LocalOwnerFs {
         Ok(())
     }
 
-    /// D4: 删除整个 root 目录（spec §5.4）。
+    /// D4: 删除整个 root 目录（spec §5.4 / §11）。
     ///
-    /// 顺序：解析 root_id → 卸载 bind mount → RootManager::delete_root
-    /// （revoke → 缓存移除 → Meta deactivate → 物理目录 → catalog）→
-    /// OwnerState 索引清理 → PrivateFuseCache 清理。任一步失败时后续步骤
-    /// 不再执行，残留记录由 reconcile_on_startup 的 zombie 检测在下一次
-    /// 启动时清理。
+    /// 物理目录与 catalog 只在 Home 上存在，因此本函数按 Meta 的 Home 归属
+    /// 分流：Home 就是本节点时走本地删除；否则只向 Home 转发一次 Admin
+    /// 删除请求，成功后清理本节点的 FUSE 索引。这样 `rmdir <name>` 可以在
+    /// 任意节点发起，而物理删除始终由 Home 执行。
     fn rmdir_root(&self, name: &OsStr) -> Result<()> {
         // 1. 解析 root_id。并发 rmdir 的第二个调用在这里已找不到 name
         //    条目（第一个调用完成 state.remove_root 后），返回 ENOENT，
@@ -4827,39 +4881,177 @@ impl LocalOwnerFs {
                 .root_id
                 .clone()
         };
-        afs_logging::info!("ownerfs.rmdir_root.resolved"; "name" => ?name, "root_id" => ?root_id);
+        afs_logging::info!(
+            "ownerfs.rmdir_root.resolved";
+            "node" => self.roots.local_node_id(),
+            "name" => ?name,
+            "root_id" => ?root_id
+        );
 
-        // 2. 卸载活跃 bind mount。detach 失败（如活跃 fd 导致 EBUSY）时
-        //    request_unmount 记录日志并保留条目，不阻塞删除流程；物理目录
-        //    删除若因残留挂载失败，由下次启动的 reconcile 重试。
-        if let Some(mm) = &self.mount_manager {
-            mm.request_unmount(&root_id)?;
+        // 2. 按 Home 归属分流。Meta 不可达时在动数据之前失败（零副作用）。
+        let location = match self.roots.lookup_root_location(&root_id) {
+            Ok(location) => location,
+            Err(error) => {
+                afs_logging::warn!(
+                    "ownerfs.rmdir_root.location_lookup_failed";
+                    "node" => self.roots.local_node_id(),
+                    "root_id" => ?root_id,
+                    "error" => ?error
+                );
+                return Err(error);
+            }
+        };
+        match location {
+            Some(location) if location.home_node_id != self.roots.local_node_id() => {
+                afs_logging::info!(
+                    "ownerfs.rmdir_root.remote_forward";
+                    "node" => self.roots.local_node_id(),
+                    "root_id" => ?root_id,
+                    "home" => %location.home_node_id,
+                    "home_session" => %location.home_session_id,
+                    "epoch" => location.epoch
+                );
+                let remote = match self.acquire_remote_root(&root_id, RootRight::Admin) {
+                    Ok(remote) => remote,
+                    Err(error) => {
+                        afs_logging::warn!(
+                            "ownerfs.rmdir_root.remote_grant_failed";
+                            "node" => self.roots.local_node_id(),
+                            "root_id" => ?root_id,
+                            "home" => %location.home_node_id,
+                            "error" => ?error
+                        );
+                        return Err(error);
+                    }
+                };
+                afs_logging::info!(
+                    "ownerfs.rmdir_root.remote_grant_acquired";
+                    "node" => self.roots.local_node_id(),
+                    "root_id" => ?root_id,
+                    "holder" => %remote.grant.holder_node_id,
+                    "session" => %remote.grant.session_id,
+                    "epoch" => remote.grant.epoch,
+                    "access_generation" => remote.grant.access_generation,
+                    "fencing_token" => %remote.grant.fencing_token
+                );
+                if let Err(error) = remote.files.delete_root(&remote.grant) {
+                    afs_logging::warn!(
+                        "ownerfs.rmdir_root.remote_failed";
+                        "node" => self.roots.local_node_id(),
+                        "root_id" => ?root_id,
+                        "home" => %location.home_node_id,
+                        "error" => ?error
+                    );
+                    return Err(error);
+                }
+                afs_logging::info!(
+                    "ownerfs.rmdir_root.remote_deleted";
+                    "node" => self.roots.local_node_id(),
+                    "root_id" => ?root_id,
+                    "home" => %location.home_node_id
+                );
+            }
+            Some(location) => {
+                afs_logging::info!(
+                    "ownerfs.rmdir_root.local_owner";
+                    "node" => self.roots.local_node_id(),
+                    "root_id" => ?root_id,
+                    "epoch" => location.epoch
+                );
+                self.delete_local_root(&root_id)?;
+            }
+            None if self.roots.has_active_local_root(&root_id) => {
+                afs_logging::info!(
+                    "ownerfs.rmdir_root.local_unregistered";
+                    "node" => self.roots.local_node_id(),
+                    "root_id" => ?root_id
+                );
+                self.delete_local_root(&root_id)?;
+            }
+            None => {
+                afs_logging::warn!(
+                    "ownerfs.rmdir_root.not_registered";
+                    "node" => self.roots.local_node_id(),
+                    "root_id" => ?root_id
+                );
+                return Err(Error::coded(
+                    afs_error::NODE_VFS_NOT_FOUND,
+                    "root is not registered in Meta",
+                ));
+            }
+        }
+
+        // 3. 清理本节点 FUSE 索引与远端句柄缓存。Home 侧 peer 删除路径同样
+        //    执行这一步，保证发起节点和 Home 都不残留已删除 root 的条目。
+        self.cleanup_local_root(&root_id)?;
+        afs_logging::info!(
+            "ownerfs.rmdir_root.completed";
+            "node" => self.roots.local_node_id(),
+            "name" => ?name,
+            "root_id" => ?root_id
+        );
+        Ok(())
+    }
+
+    /// 物理删除只允许在 Home 执行：先卸载该 root 的 bind mount，再走
+    /// RootManager::delete_root（物理目录 → revoke + 缓存移除 → Meta
+    /// deactivate → catalog）。ENOTEMPTY/EBUSY 等失败零副作用返回。
+    fn delete_local_root(&self, root_id: &RootId) -> Result<()> {
+        afs_logging::info!(
+            "ownerfs.delete_local_root.start";
+            "node" => self.roots.local_node_id(),
+            "root_id" => ?root_id
+        );
+        // bind detach 失败（如活跃 fd 导致 EBUSY）时 request_unmount 记录
+        // 日志并保留条目，不阻塞删除流程；物理目录删除若因残留挂载失败，
+        // 由下次启动的 reconcile 重试。
+        if let Some(mm) = &self.mount_manager
+            && let Err(error) = mm.request_unmount(root_id)
+        {
+            afs_logging::warn!(
+                "ownerfs.delete_local_root.unmount_failed";
+                "node" => self.roots.local_node_id(),
+                "root_id" => ?root_id,
+                "error" => ?error
+            );
+            return Err(error);
         }
         afs_logging::info!("ownerfs.rmdir_root.unmounted"; "root_id" => ?root_id);
+        if let Err(error) = self.roots.delete_root(root_id) {
+            afs_logging::warn!(
+                "ownerfs.delete_local_root.failed";
+                "node" => self.roots.local_node_id(),
+                "root_id" => ?root_id,
+                "error" => ?error
+            );
+            return Err(error);
+        }
+        afs_logging::info!(
+            "ownerfs.rmdir_root.root_deleted";
+            "node" => self.roots.local_node_id(),
+            "root_id" => ?root_id
+        );
+        Ok(())
+    }
 
-        // 3. RootManager::delete_root（物理目录 → revoke + 缓存移除
-        //    → Meta deactivate → catalog）。ENOTEMPTY 等物理删除失败
-        //    零副作用返回，root 仍可访问，本函数第 4 步不会执行。
-        self.roots.delete_root(&root_id)?;
-        afs_logging::info!("ownerfs.rmdir_root.root_deleted"; "root_id" => ?root_id);
-
-        // 4. 清除 OwnerState 中的 FUSE 索引。
+    /// 清除本节点 OwnerState 的 FUSE 索引、PrivateFuseCache 与远端句柄缓存。
+    fn cleanup_local_root(&self, root_id: &RootId) -> Result<()> {
         {
             let mut state = self.state.lock().map_err(|_| poisoned())?;
-            state.remove_root(&root_id);
+            state.remove_root(root_id);
         }
         afs_logging::info!("ownerfs.rmdir_root.state_cleaned"; "root_id" => ?root_id);
-
-        // 5. 清除 PrivateFuseCache 中的共享缓存与 native home 索引。
         {
             let mut cache = self
                 .private_cache
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            cache.remove_root(&root_id);
+            cache.remove_root(root_id);
         }
         afs_logging::info!("ownerfs.rmdir_root.cache_cleaned"; "root_id" => ?root_id);
-
+        if let Ok(mut remote_roots) = self.remote_roots.lock() {
+            remote_roots.remove(root_id);
+        }
         Ok(())
     }
 
@@ -7554,6 +7746,7 @@ mod tests {
         fail_statfs_permission: AtomicBool,
         open_calls: AtomicUsize,
         last_open_killpriv: AtomicBool,
+        delete_root_calls: AtomicUsize,
     }
 
     impl RestartingRemoteFiles {
@@ -7952,6 +8145,11 @@ mod tests {
     }
 
     impl remote::RemoteFiles for RestartingRemoteFiles {
+        fn delete_root(&self, _: &RootGrant) -> Result<()> {
+            self.delete_root_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
         fn lookup(
             &self,
             grant: &RootGrant,
@@ -8317,6 +8515,7 @@ mod tests {
             fail_statfs_permission: AtomicBool::new(false),
             open_calls: AtomicUsize::new(0),
             last_open_killpriv: AtomicBool::new(false),
+            delete_root_calls: AtomicUsize::new(0),
         });
         let roots = Arc::new(RootManager::new(
             "node-b".into(),
@@ -11237,6 +11436,71 @@ mod tests {
     }
 
     #[test]
+    fn rmdir_root_on_non_home_forwards_to_home() {
+        let (_temp, fs, ctx, _meta, remote, root_id) = remote_fixture();
+        let root = backend_inode(OWNERFS_ROOT_INODE);
+        // 远程 lookup 把 root 名称放进本节点 FUSE 索引，模拟 B 节点看到
+        // Home 在 node-a 的 workspace。
+        fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+
+        fs.rmdir(&ctx, root, OsStr::new("job-42")).unwrap();
+
+        assert_eq!(remote.delete_root_calls.load(Ordering::SeqCst), 1);
+        let local = fs.require_local().unwrap();
+        assert!(!local.roots.has_active_local_root(&root_id));
+        assert!(local.state.lock().unwrap().root_names.is_empty());
+    }
+
+    #[test]
+    fn rmdir_root_on_home_deletes_physical_directory() {
+        let (temp, fs, ctx) = fixture();
+        let root = backend_inode(OWNERFS_ROOT_INODE);
+        fs.mkdir(&ctx, root, OsStr::new("job-home"), 0o755).unwrap();
+        assert!(temp.path().join("job-home").is_dir());
+
+        fs.rmdir(&ctx, root, OsStr::new("job-home")).unwrap();
+
+        assert!(!temp.path().join("job-home").exists());
+    }
+
+    #[test]
+    fn peer_delete_root_requires_home_and_removes_data() {
+        let (temp, fs, ctx) = fixture_with_rights(vec![
+            RootRight::Lookup,
+            RootRight::Read,
+            RootRight::Write,
+            RootRight::Admin,
+        ]);
+        let root = backend_inode(OWNERFS_ROOT_INODE);
+        fs.mkdir(&ctx, root, OsStr::new("job-peer"), 0o755).unwrap();
+        assert!(temp.path().join("job-peer").is_dir());
+
+        let root_id = root::root_id_from_name(OsStr::new("job-peer")).unwrap();
+        let access = root::PresentedRootAccess {
+            id: root_id.clone(),
+            epoch: 1,
+            home_node_id: "node-a".to_owned(),
+            home_session_id: "session-a".to_owned(),
+            holder_node_id: "node-b".to_owned(),
+            session_id: "session-b".to_owned(),
+            access_generation: 1,
+            fencing_token: "fence-1".to_owned(),
+        };
+        fs.peer_executor()
+            .unwrap()
+            .delete_root("node-b", &access)
+            .unwrap();
+
+        assert!(!temp.path().join("job-peer").exists());
+        assert!(
+            !fs.require_local()
+                .unwrap()
+                .roots
+                .has_active_local_root(&root_id)
+        );
+    }
+
+    #[test]
     fn remote_open_refreshes_cached_grant_after_home_restart() {
         let (_temp, fs, ctx, meta, remote, root_id) = remote_fixture();
         let root = BackendInode {
@@ -12457,6 +12721,7 @@ mod tests {
             fail_statfs_permission: AtomicBool::new(false),
             open_calls: AtomicUsize::new(0),
             last_open_killpriv: AtomicBool::new(false),
+            delete_root_calls: AtomicUsize::new(0),
         });
         let (remote_file, _) = remote::RemoteFiles::open(
             remote.as_ref(),
