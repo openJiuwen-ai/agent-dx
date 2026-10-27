@@ -21,11 +21,16 @@ ARG PYTHON_VERSION=3.11.14
 ARG PYTHON_SHA256=8d3ed8ec5c88c1c95f5e558612a725450d2452813ddad5e58fdb1a53b1209b78
 ARG PROTOC_VERSION=25.1
 ARG GO_VERSION=1.25.5
-ARG GO_SHA256=9e9b755d63b36acf30c12a9a3fc379243714c1c6d3dd72861da637f336ebb35b
-RUN case "$TARGETARCH" in amd64|arm64) ;; *) exit 2 ;; esac \
+ARG GO_SHA256_AMD64=9e9b755d63b36acf30c12a9a3fc379243714c1c6d3dd72861da637f336ebb35b
+ARG GO_SHA256_ARM64=b00b694903d126c588c378e72d3545549935d3982635ba3f7a964c9fa23fe3b9
+RUN case "$TARGETARCH" in \
+      amd64) go_sha=$GO_SHA256_AMD64 ;; \
+      arm64) go_sha=$GO_SHA256_ARM64 ;; \
+      *) exit 2 ;; \
+    esac \
     && curl --fail --location --retry 3 --connect-timeout 20 --max-time 600 \
       "https://mirrors.aliyun.com/golang/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz" -o /tmp/go.tar.gz \
-    && echo "${GO_SHA256}  /tmp/go.tar.gz" | sha256sum --check \
+    && echo "${go_sha}  /tmp/go.tar.gz" | sha256sum --check \
     && rm -rf /usr/local/go \
     && tar -xzf /tmp/go.tar.gz -C /usr/local \
     && rm /tmp/go.tar.gz
