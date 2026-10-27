@@ -792,10 +792,12 @@ impl RootManager {
             self.check_peer_not_fenced(&state, presented)?;
             if let Some(cached) = state.validated_peer_grants.get(&key) {
                 self.check_authoritative_matches_presented(cached, presented)?;
-                if let Some(right) = right {
-                    self.check_grant_right(cached, right)?;
+                if right.is_none_or(|right| cached.rights.contains(&right)) {
+                    return Ok(cached.clone());
                 }
-                return Ok(cached.clone());
+                // 缓存的 rights 不含本次需要的权利（例如对端刚通过
+                // AcquireRoot 扩展到 Admin）：落回 Meta 重新校验并刷新缓存，
+                // 而不是用陈旧 rights 直接拒绝。
             }
         }
 
@@ -1858,6 +1860,9 @@ mod tests {
                 .code(),
             afs_error::NODE_OWNER_RIGHT_DENIED
         );
+        // 缓存缺请求权利时会回 Meta 复核一次（对端可能刚扩展了 grant），
+        // 权威 grant 仍缺该权利才拒绝。
+        assert_eq!(meta.validate_calls.load(Ordering::SeqCst), 2);
         manager.fence_peer_session("node-b", "session-b").unwrap();
         assert!(
             !manager
@@ -1872,7 +1877,7 @@ mod tests {
                 .code(),
             afs_error::NODE_OWNER_INVALID_GRANT,
         );
-        assert_eq!(meta.validate_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(meta.validate_calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -1890,6 +1895,88 @@ mod tests {
                 .enter_root(&prepared.reservation.id, RootRight::Lookup)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn peer_right_expansion_refreshes_cached_grant() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let data_dir = StoragePath::new("job-42").unwrap();
+        disk.mkdir(&data_dir, 0o700).unwrap();
+        disk.sync_root().unwrap();
+        let id = RootId("job-42".into());
+        let prepared = PreparedRoot {
+            reservation: RootReservation {
+                id: id.clone(),
+                epoch: 1,
+                home_node_id: "node-a".into(),
+                session_id: "session-a".into(),
+                create_intent_id: "intent-a".into(),
+                prepare_token: "prepare-a".into(),
+            },
+            data_dir,
+            local_prepare_id: "local-a".into(),
+            parent_fsync_generation: 1,
+        };
+        let local_grant = RootGrant {
+            id: id.clone(),
+            epoch: 1,
+            home_node_id: "node-a".into(),
+            home_session_id: "session-a".into(),
+            holder_node_id: "node-a".into(),
+            session_id: "session-a".into(),
+            access_generation: 7,
+            rights: vec![RootRight::Lookup],
+            fencing_token: "fence-a".into(),
+        };
+        let peer_grant = RootGrant {
+            id: id.clone(),
+            epoch: 1,
+            home_node_id: "node-a".into(),
+            home_session_id: "session-a".into(),
+            holder_node_id: "node-b".into(),
+            session_id: "session-b".into(),
+            access_generation: 7,
+            rights: vec![RootRight::Read],
+            fencing_token: "fence-b".into(),
+        };
+        let meta = fixed_meta(local_grant, Some(peer_grant.clone()));
+        let manager = RootManager::new("node-a".into(), "session-a".into(), meta.clone(), disk);
+        manager
+            .activate_prepared(OsString::from("job-42"), &prepared)
+            .unwrap();
+        let presented = PresentedRootAccess {
+            id,
+            epoch: 1,
+            home_node_id: "node-a".into(),
+            home_session_id: "session-a".into(),
+            holder_node_id: "node-b".into(),
+            session_id: "session-b".into(),
+            access_generation: 7,
+            fencing_token: "fence-b".into(),
+        };
+
+        manager
+            .validate_peer_root_access(&presented, "node-b", RootRight::Read)
+            .unwrap();
+        assert_eq!(meta.validate_calls.load(Ordering::SeqCst), 1);
+
+        // 对端通过 AcquireRoot 把 Admin 合并进同一 holder grant；presented
+        // 访问事实不变，Home 只能靠“缓存缺该权利”触发重新校验。
+        let mut expanded = peer_grant;
+        expanded.rights.push(RootRight::Admin);
+        *meta.peer.lock().unwrap() = Some(expanded);
+
+        let validated = manager
+            .validate_peer_root_access(&presented, "node-b", RootRight::Admin)
+            .unwrap();
+        assert!(validated.rights.contains(&RootRight::Admin));
+        assert_eq!(meta.validate_calls.load(Ordering::SeqCst), 2);
+
+        manager
+            .validate_peer_root_access(&presented, "node-b", RootRight::Admin)
+            .unwrap();
+        assert_eq!(meta.validate_calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
