@@ -1634,9 +1634,11 @@ impl HixlRuntime {
         }
     }
 
-    /// Allocates the private result buffer for one native multi-window batch.
+    /// Reserves the private result buffer for one native multi-window batch.
     /// The length covers every descriptor in the batch, so the bound is the
-    /// window size multiplied by the native descriptor limit.
+    /// window size multiplied by the native descriptor limit. Only the address
+    /// space is prepared: the bytes stay untouched until the native READ fills
+    /// them, so a group wave does not memset 128 MiB the transfer overwrites.
     pub fn prepare_read_batch_buffer(&self, len: usize) -> Result<Vec<u8>, HixlError> {
         let limit = self.info.window_bytes.saturating_mul(MAX_BATCH_WINDOWS);
         if len == 0 || len > limit {
@@ -1656,12 +1658,21 @@ impl HixlRuntime {
                 format!("cannot reserve HIXL batch read output buffer: {error}"),
             )
         })?;
-        output.resize(len, 0);
+        // SAFETY: the private buffer only ever reaches the native READ below and
+        // the caller's scatter, and that READ writes all `len` bytes before it
+        // reports success; a failed or short READ drops the buffer without
+        // publishing any byte. Initialising the reservation first would memset
+        // the whole batch (a group wave reaches 128 MiB) only for the transfer
+        // to overwrite it.
+        unsafe { output.set_len(len) };
         Ok(output)
     }
 
-    /// Allocates and initializes a private result buffer before a caller starts
-    /// measuring the payload read interval.
+    /// Reserves a private result buffer before a caller starts measuring the
+    /// payload read interval. Like the batch form, the reservation is not
+    /// written until the native READ fills it, so the preparation measured by
+    /// `buffers` covers address space only and the first touch moves into the
+    /// transfer it belongs to.
     pub fn prepare_read_buffer(&self, len: usize) -> Result<Vec<u8>, HixlError> {
         if len == 0 || len > self.info.window_bytes {
             return Err(HixlError::new(
@@ -1683,7 +1694,11 @@ impl HixlRuntime {
                 format!("cannot reserve HIXL read output buffer: {error}"),
             )
         })?;
-        output.resize(len, 0);
+        // SAFETY: as in `prepare_read_batch_buffer`, the native READ fills every
+        // byte of this private buffer before it reports success, so the content
+        // becomes initialised before any caller reads it; skipping the memset
+        // only removes work the transfer would overwrite.
+        unsafe { output.set_len(len) };
         Ok(output)
     }
 

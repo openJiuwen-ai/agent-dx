@@ -1077,7 +1077,8 @@ impl HixlChunkTransfer {
         let context = self.context.clone();
         let peer_identity = (node_id.clone(), *node_epoch);
         let cancel = Arc::new(Cancellation::default());
-        let prepared_output_len = self.context.payload_metrics.as_ref().map(|_| out.len());
+        let output_len = out.len();
+        let prepared = self.context.payload_metrics.is_some();
         let crc = crc_lookup(batch, crc_chunk);
         let result = self.runtime.block_on(async move {
             let command_cancel = cancel.clone();
@@ -1087,7 +1088,8 @@ impl HixlChunkTransfer {
                         peer_identity,
                         address,
                         request,
-                        prepared_output_len,
+                        output_len,
+                        prepared,
                         deadline,
                         crc,
                         command_cancel,
@@ -1795,11 +1797,13 @@ impl ReadContext {
         peer_identity: (String, u64),
         address: String,
         authority: DfsReadRangesRequest,
-        prepared_output_len: Option<usize>,
+        output_len: usize,
+        prepared: bool,
         deadline: Instant,
         crc: Option<CrcLookup>,
         cancel: Arc<Cancellation>,
     ) -> afs_error::Result<ReadResult> {
+        let prepared_output_len = prepared.then_some(output_len);
         let prepared_measurement = prepared_output_len.is_some();
         let mut payload_elapsed = Duration::ZERO;
         let mut lease = match self
@@ -1881,15 +1885,17 @@ impl ReadContext {
                 .map_or(0, |lane| lane.export_slots),
         )
         .unwrap_or(0);
-        let group_windows = group
-            .filter(|_| prepared_output_len.is_some() && planned.len() > 1)
-            .map(|group| {
-                group
-                    .max_descriptors
-                    .min(self.receive_slots)
-                    .min(export_slots)
-                    .clamp(1, crate::node::dfs_read::MAX_DFS_GROUP_OPS)
-            });
+        // A wave of windows shares one Prepare RPC and one native SDK batch on
+        // every path, so the aggregation must not depend on the prepared
+        // payload measurement mode; a single-window wave would otherwise pay a
+        // control round trip and an SDK read submission per window.
+        let group_windows = group.filter(|_| planned.len() > 1).map(|group| {
+            group
+                .max_descriptors
+                .min(self.receive_slots)
+                .min(export_slots)
+                .clamp(1, crate::node::dfs_read::MAX_DFS_GROUP_OPS)
+        });
         let mut completed = Vec::with_capacity(planned.len());
         let mut prepared_chunks = Vec::new();
         // Every planned window is on the peer's bound lane, so an ungrouped
@@ -1946,7 +1952,7 @@ impl ReadContext {
                     return Err(self.abort_batch(&mut lease, failure).await);
                 }
             };
-            if let Some(output_len) = prepared_output_len {
+            if group_windows.is_some() || prepared_output_len.is_some() {
                 let read = if group_windows.is_some() {
                     self.read_prepared_group(
                         &lease.session,
@@ -2002,6 +2008,8 @@ impl ReadContext {
         }
         if let (Some(metrics), Some(bytes)) = (&self.payload_metrics, payload_bytes) {
             metrics.observe("hixl", "ok", bytes, payload_elapsed);
+        }
+        if group_windows.is_some() || prepared_output_len.is_some() {
             Ok(ReadResult::PreparedComplete(prepared_chunks))
         } else {
             Ok(ReadResult::Complete(completed))
@@ -5120,6 +5128,84 @@ mod tests {
             assert_eq!(sessions[0].active_windows, 0);
             assert!(native.memory.lock().unwrap().active.is_empty());
             drop(lease);
+            stop.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn baseline_group_aggregates_one_native_batch_without_payload_metrics() {
+            use crate::node::dfs_read::ReadGroupPolicy;
+            let Harness {
+                _temp,
+                native,
+                source,
+                reader,
+                batch,
+                stop,
+                server,
+                ..
+            } = harness_with_capabilities(
+                1,
+                4,
+                8,
+                HixlDfsReadMode::Required,
+                true,
+                Some(ReadGroupPolicy {
+                    bytes: 8,
+                    max_inflight: 1,
+                    max_descriptors: 8,
+                    host_budget_bytes: 1024 * 1024,
+                }),
+            )
+            .await;
+            let authority = pack_read_batch(read_authority(&batch)).unwrap();
+            let context = reader.context.clone();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let crate::dfs::CopyLocation::Node {
+                node_id,
+                node_epoch,
+                ..
+            } = &batch.operations[0].source.location
+            else {
+                panic!("loopback source must be a node copy");
+            };
+            let address = batch.operations[0]
+                .source
+                .node_data_endpoint()
+                .unwrap()
+                .to_owned();
+            // The baseline path carries no payload metrics, yet a grouped wave
+            // must still submit one Prepare round trip and one native batch
+            // instead of one SDK read per window.
+            let result = context
+                .read_batch(
+                    (node_id.clone(), *node_epoch),
+                    address,
+                    authority,
+                    8,
+                    false,
+                    deadline,
+                    None,
+                    Arc::new(Cancellation::default()),
+                )
+                .await
+                .unwrap();
+            let mut output = vec![0_u8; 8];
+            match result {
+                ReadResult::PreparedComplete(chunks) => {
+                    scatter_prepared(chunks, &mut output).unwrap();
+                }
+                _ => panic!("grouped baseline read must use the native batch path"),
+            }
+            assert_eq!(output, b"abcdefgh");
+            assert_eq!(native.batch_reads.load(Ordering::SeqCst), 1);
+            let sessions = source_hixl::test_support::sessions(&source);
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].active_windows, 0);
+            assert!(native.memory.lock().unwrap().active.is_empty());
             stop.send(()).unwrap();
             tokio::time::timeout(Duration::from_secs(1), server)
                 .await
