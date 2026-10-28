@@ -1773,6 +1773,7 @@ mod tests {
                         token: "dfs-open-v1:read-open:test".into(),
                     },
                 },
+                chunk: None,
             }],
         };
         async fn read(

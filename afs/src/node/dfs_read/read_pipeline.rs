@@ -203,7 +203,7 @@ impl DfsReadEngine {
                 source.read_grant.token = format!("dfs-open-v1:{reference}");
                 let request = PeerReadBatch { file_version_id: version.clone(),
                     layout_root_id: batch.layout_root_id.clone(),
-                    operations: vec![ResolvedReadOp { op: op.clone(), source }],
+                    operations: vec![ResolvedReadOp { op: op.clone(), source, chunk: None }],
                 };
                 let owned = self.reserve_owned_native_read(request, chunk.clone(), output_len, deadline, group_handle, lifetime.clone()).await?;
                 match self.transfer.clone().read_owned_native_async(owned).await {

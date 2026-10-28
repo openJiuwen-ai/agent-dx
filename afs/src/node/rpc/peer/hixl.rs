@@ -507,18 +507,44 @@ fn validate_prepare(
     Ok(())
 }
 
-/// Meta-bound identity a CRC32C window must still match when it is promoted.
+/// Meta-bound identity a CRC32C range must still match when it is promoted.
 #[derive(Clone)]
 struct CrcExpectation {
-    chunk_id: String,
     content_digest: crate::dfs::ContentDigest,
     length: u64,
+}
+
+impl CrcExpectation {
+    fn of(chunk: &crate::dfs::ChunkObject) -> Self {
+        Self {
+            content_digest: chunk.content_digest.clone(),
+            length: chunk.length,
+        }
+    }
+}
+
+/// Descriptors of every CRC32C object carried by one batch.
+type CrcLookup = std::collections::HashMap<String, CrcExpectation>;
+
+fn crc_lookup(batch: &PeerReadBatch, extra: Option<&crate::dfs::ChunkObject>) -> Option<CrcLookup> {
+    let mut lookup = CrcLookup::new();
+    for operation in &batch.operations {
+        if let Some(chunk) = &operation.chunk
+            && chunk.is_segment_crc32c()
+        {
+            lookup.insert(chunk.id.0.clone(), CrcExpectation::of(chunk));
+        }
+    }
+    if let Some(chunk) = extra.filter(|chunk| chunk.is_segment_crc32c()) {
+        lookup.insert(chunk.id.0.clone(), CrcExpectation::of(chunk));
+    }
+    (!lookup.is_empty()).then_some(lookup)
 }
 
 fn validate_bytes(
     reply: &DfsPrepareReadRangesHixlReply,
     bytes: &[u8],
-    crc: Option<&CrcExpectation>,
+    crc: Option<&CrcLookup>,
 ) -> afs_error::Result<()> {
     if usize::try_from(reply.packed_length).ok() != Some(bytes.len()) {
         return Err(dfs_protocol_error("HIXL native READ length differs"));
@@ -536,7 +562,7 @@ fn validate_bytes(
             .ok_or_else(|| dfs_protocol_error("HIXL checksum range exceeds READ"))?;
         match range.range_checksum_algorithm {
             algorithm if algorithm == DfsDigestAlgorithm::Blake3 as i32 => {
-                if crc.is_some() {
+                if crc.is_some_and(|crc| crc.contains_key(&range.chunk_id)) {
                     return Err(dfs_protocol_error("HIXL CRC range is labelled as BLAKE3"));
                 }
                 if range.range_checksum.as_slice() != blake3::hash(data).as_bytes() {
@@ -544,14 +570,11 @@ fn validate_bytes(
                 }
             }
             algorithm if algorithm == DfsDigestAlgorithm::Crc32c as i32 => {
-                let Some(expected) = crc else {
+                let Some(expected) = crc.and_then(|crc| crc.get(&range.chunk_id)) else {
                     return Err(dfs_protocol_error(
-                        "HIXL BLAKE3 batch served a CRC32C range",
+                        "HIXL CRC32C range has no Meta-bound descriptor",
                     ));
                 };
-                if range.chunk_id != expected.chunk_id {
-                    return Err(dfs_protocol_error("HIXL CRC range chunk differs"));
-                }
                 let checksum = crate::node::chunk_crc32c::checksum(data).to_le_bytes();
                 if range.range_checksum.as_slice() != checksum {
                     return Err(dfs_corrupt_error("HIXL CRC range checksum differs"));
@@ -627,7 +650,7 @@ fn validation_pool() -> Option<&'static rayon_core::ThreadPool> {
 /// order; the caller publishes only after every digest matches.
 fn validate_windows(
     windows: &[(&DfsPrepareReadRangesHixlReply, &[u8])],
-    crc: Option<&CrcExpectation>,
+    crc: Option<&CrcLookup>,
 ) -> Vec<(Duration, afs_error::Result<()>)> {
     let slots = StdMutex::new(
         windows
@@ -1055,11 +1078,7 @@ impl HixlChunkTransfer {
         let peer_identity = (node_id.clone(), *node_epoch);
         let cancel = Arc::new(Cancellation::default());
         let prepared_output_len = self.context.payload_metrics.as_ref().map(|_| out.len());
-        let crc = crc_chunk.map(|chunk| CrcExpectation {
-            chunk_id: chunk.id.0.clone(),
-            content_digest: chunk.content_digest.clone(),
-            length: chunk.length,
-        });
+        let crc = crc_lookup(batch, crc_chunk);
         let result = self.runtime.block_on(async move {
             let command_cancel = cancel.clone();
             let task = tokio::spawn(async move {
@@ -1131,6 +1150,12 @@ enum Acquired {
 impl ChunkTransfer for HixlChunkTransfer {
     fn transport(&self) -> &'static str {
         "hixl"
+    }
+
+    /// Windows carry one CRC32C range descriptor per operation, so CRC32C
+    /// chunks batch with their neighbours instead of going one chunk at a time.
+    fn supports_batched_crc(&self) -> bool {
+        true
     }
 
     /// CRC32C objects travel through the same native windows: the source
@@ -1772,7 +1797,7 @@ impl ReadContext {
         authority: DfsReadRangesRequest,
         prepared_output_len: Option<usize>,
         deadline: Instant,
-        crc: Option<CrcExpectation>,
+        crc: Option<CrcLookup>,
         cancel: Arc<Cancellation>,
     ) -> afs_error::Result<ReadResult> {
         let prepared_measurement = prepared_output_len.is_some();
@@ -2152,7 +2177,7 @@ impl ReadContext {
         reply: DfsPrepareReadRangesHixlReply,
         lane_id: usize,
         deadline: Instant,
-        crc: Option<&CrcExpectation>,
+        crc: Option<&CrcLookup>,
     ) -> Result<Vec<u8>, WindowFailure> {
         let mut client = session.client.clone();
         let native = self
@@ -2212,7 +2237,7 @@ impl ReadContext {
         output_len: usize,
         deadline: Instant,
         payload_elapsed: &mut Duration,
-        crc: Option<&CrcExpectation>,
+        crc: Option<&CrcLookup>,
     ) -> Result<Vec<PreparedChunk>, WindowFailure> {
         let mut submissions = Vec::with_capacity(prepared.len());
         let mut preparation_failure = None;
@@ -2434,7 +2459,7 @@ impl ReadContext {
         output_len: usize,
         deadline: Instant,
         payload_elapsed: &mut Duration,
-        crc: Option<&CrcExpectation>,
+        crc: Option<&CrcLookup>,
     ) -> Result<Vec<PreparedChunk>, WindowFailure> {
         let Some((_, _, first_reply, lane_id)) = prepared.first() else {
             return Ok(Vec::new());
@@ -3713,11 +3738,14 @@ mod tests {
         let (_request, _session, template) = descriptor();
         let bytes = vec![7_u8; crate::node::chunk_crc32c::SEGMENT];
         let table = crate::node::chunk_crc32c::CrcTable::build(&bytes).unwrap();
-        let expected = CrcExpectation {
-            chunk_id: "crc-chunk".into(),
-            content_digest: table.descriptor_digest(),
-            length: bytes.len() as u64,
-        };
+        let mut expected = CrcLookup::new();
+        expected.insert(
+            "crc-chunk".to_owned(),
+            CrcExpectation {
+                content_digest: table.descriptor_digest(),
+                length: bytes.len() as u64,
+            },
+        );
         let mut reply = template;
         reply.packed_length = bytes.len() as u64;
         reply.ranges = vec![DfsHixlReadRange {
@@ -4282,6 +4310,7 @@ mod tests {
                             token: "offline-grant".into(),
                         },
                     },
+                    chunk: None,
                 }],
             }
         }
@@ -4684,12 +4713,19 @@ mod tests {
             let chunk = staged.chunk.clone();
             let chunk_id = chunk.id.clone();
             local.put(staged).unwrap();
+            let staged_tail = StagedChunk::new_crc32c(
+                crate::dfs::OperationId::new("crc-window-tail"),
+                b"ijklmnop".to_vec(),
+            )
+            .unwrap();
+            let tail_chunk = staged_tail.chunk.clone();
+            local.put(staged_tail).unwrap();
             let native = Arc::new(NativeBoundary::default());
             let source = Arc::new(source_hixl::HixlReadService::for_test(
                 Arc::new(SourceNative {
                     boundary: native.clone(),
                     lanes: 1,
-                    window_bytes: 8,
+                    window_bytes: 16,
                     export_slots: 4,
                 }),
                 "source".into(),
@@ -4735,32 +4771,46 @@ mod tests {
                     Arc::new(ReaderNative {
                         boundary: native.clone(),
                         lanes: 1,
-                        window_bytes: 8,
+                        window_bytes: 16,
                     }),
                     HixlDfsReadMode::Required,
                     Duration::from_secs(5),
                 )
                 .unwrap(),
             );
-            let batch = read_batch(chunk_id, &endpoint);
+            // Two CRC32C chunks share one window: each operation carries its
+            // own Meta-bound descriptor, exactly like a BLAKE3 batch.
+            let mut batch = read_batch(chunk_id.clone(), &endpoint);
+            let mut tail_op = batch.operations[0].clone();
+            tail_op.op = crate::node::dfs_read::ChunkReadOp {
+                chunk_id: tail_chunk.id.clone(),
+                chunk_offset: 0,
+                length: 8,
+                output_offset: 9,
+            };
+            batch.operations[0].chunk = Some(chunk.clone());
+            batch.operations[0].op.length = 8;
+            tail_op.source.chunk_id = tail_chunk.id.clone();
+            tail_op.chunk = Some(tail_chunk.clone());
+            batch.operations.push(tail_op);
 
             let read_reader = reader.clone();
-            let read_chunk = chunk.clone();
             let read_batch_input = batch.clone();
             let output = tokio::task::spawn_blocking(move || {
-                let mut output = vec![b'!'; 9];
+                let mut output = vec![b'!'; 17];
                 read_reader
-                    .read_crc32c_range(&read_batch_input, &read_chunk, &mut output)
+                    .read_ranges(&read_batch_input, &mut output)
                     .unwrap();
                 output
             })
             .await
             .unwrap();
             assert_eq!(&output[1..9], b"abcdefgh");
+            assert_eq!(&output[9..17], b"ijklmnop");
             assert_eq!(
                 native.prepare_calls.load(Ordering::SeqCst),
                 1,
-                "the CRC chunk must be served by a native window, not the gRPC adapter"
+                "both CRC32C ranges must share one native window"
             );
             let _ = source;
             stop.send(()).unwrap();

@@ -496,6 +496,10 @@ struct ExternalReadBackend {
 pub struct ResolvedReadOp {
     pub op: ChunkReadOp,
     pub source: SourceCandidate,
+    /// Meta-bound object descriptor for transports that must verify a range
+    /// against the object identity (CRC32C windows). None keeps BLAKE3-only
+    /// batches unchanged.
+    pub chunk: Option<ChunkObject>,
 }
 
 #[derive(Clone, Debug)]
@@ -608,6 +612,13 @@ pub trait ChunkTransfer: Send + Sync {
     }
 
     fn supports_async_native_read(&self) -> bool {
+        false
+    }
+
+    /// Whether several CRC32C ranges may share one transport batch, each with
+    /// its own Meta-bound descriptor. The gRPC streaming decoder keeps one
+    /// range per request and stays `false`.
+    fn supports_batched_crc(&self) -> bool {
         false
     }
 
@@ -4367,6 +4378,7 @@ impl DfsReadEngine {
                             output_offset: 0,
                         },
                         source: source.clone(),
+                        chunk: None,
                     }],
                 };
                 if use_stream {
@@ -4864,6 +4876,7 @@ impl DfsReadEngine {
                     output_offset: 0,
                 },
                 source: source.clone(),
+                chunk: None,
             }],
         };
         let mut empty = [];
@@ -5180,16 +5193,19 @@ impl DfsReadEngine {
                     return Err(last_error
                         .unwrap_or_else(|| corrupt("committed Chunk has no readable copy")));
                 };
+                let batched_crc = self.transfer.supports_batched_crc();
                 if let Some(group) = groups.iter_mut().find(|group| {
                     let first = group[0];
-                    !sources.iter().any(|set| {
-                        (set.chunk_id == batch.ops[index].chunk_id
-                            || set.chunk_id == batch.ops[first].chunk_id)
-                            && set
-                                .chunk
-                                .as_ref()
-                                .is_some_and(ChunkObject::is_segment_crc32c)
-                    }) && same_peer_context(&candidates[first][next[first]], source)
+                    (batched_crc
+                        || !sources.iter().any(|set| {
+                            (set.chunk_id == batch.ops[index].chunk_id
+                                || set.chunk_id == batch.ops[first].chunk_id)
+                                && set
+                                    .chunk
+                                    .as_ref()
+                                    .is_some_and(ChunkObject::is_segment_crc32c)
+                        }))
+                        && same_peer_context(&candidates[first][next[first]], source)
                 }) {
                     group.push(index);
                 } else {
@@ -5208,6 +5224,10 @@ impl DfsReadEngine {
                         ResolvedReadOp {
                             op,
                             source: candidates[index][next[index]].clone(),
+                            chunk: sources
+                                .iter()
+                                .find(|set| set.chunk_id == batch.ops[index].chunk_id)
+                                .and_then(|set| set.chunk.clone()),
                         }
                     })
                     .collect();
@@ -5225,13 +5245,18 @@ impl DfsReadEngine {
                     && batch.ops[0].output_offset == 0
                     && length == out.len();
                 let mut scratch = if direct { Vec::new() } else { vec![0; length] };
-                // CRC32C objects never join a multi-operation group; their exact
-                // range is verified against the Meta-bound descriptor by the adapter.
-                let integrity = sources
-                    .iter()
-                    .find(|set| set.chunk_id == batch.ops[group[0]].chunk_id)
-                    .and_then(|set| set.chunk.as_ref())
-                    .filter(|chunk| chunk.is_segment_crc32c());
+                // A single-range lane verifies CRC32C against the Meta-bound
+                // descriptor in the adapter; a batched-CRC transport carries
+                // each range's descriptor in the batch instead.
+                let integrity = if self.transfer.supports_batched_crc() {
+                    None
+                } else {
+                    sources
+                        .iter()
+                        .find(|set| set.chunk_id == batch.ops[group[0]].chunk_id)
+                        .and_then(|set| set.chunk.as_ref())
+                        .filter(|chunk| chunk.is_segment_crc32c())
+                };
                 let target = if direct { &mut *out } else { &mut scratch };
                 let result = if let Some(chunk) = integrity {
                     self.transfer
@@ -9986,6 +10011,7 @@ mod tests {
                     output_offset: 0,
                 },
                 source: candidate,
+                chunk: None,
             }],
         };
         let mut body = vec![0; fixture.chunk.length as usize];
@@ -10157,6 +10183,7 @@ mod tests {
                         output_offset: 0,
                     },
                     source: fixture.sources.reply.lock().unwrap().chunks[0].sources[0].clone(),
+                    chunk: None,
                 }],
             };
             let mut body = vec![0; fixture.chunk.length as usize];

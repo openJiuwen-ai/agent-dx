@@ -7574,6 +7574,7 @@ mod tests {
                         token: "test-token".into(),
                     },
                 },
+                chunk: None,
             }],
         }
     }
