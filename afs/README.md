@@ -120,6 +120,9 @@ lane，后续 batch 固定使用该 lane；peer 数超过 lane 数时按占用�
 Node 先完成本地 HIXL 初始化，再向 Meta 首次注册，避免多设备初始化消耗已注册会话的租约。
 每个 peer 的 HIXL 控制会话默认在空闲 300 秒后回收，可用 `[hixl].session_idle_ms` 调整；
 0 表示进程生命周期内不回收，避免稀疏小读每次重付约 0.2 秒建链开销。
+`[hixl].prewarm_nodes` 列出需要在启动时预建控制会话的 peer Node ID（要求
+`dfs_read_mode` 为 `preferred` 或 `required`）。预建在后台线程完成，带重试，不阻塞启动；
+预建会话不携带任何读授权（首个窗口 prepare 仍逐窗授权），闲置回收策略同样适用。
 `dfs_read_mode = "preferred"` 时，peer 尚无控制会话或会话正在建立，当前 batch 使用同一
 授权经 gRPC 读取，同时后台协商并建链；建链期间到达的 batch 不等待，会话就绪后恢复 HIXL。
 成功走该路径的 batch 计入 `afs_hixl_cold_tcp_fallbacks_total`；`"required"` 不启用该回退。

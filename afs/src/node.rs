@@ -265,6 +265,57 @@ fn cleanup_hixl_startup_runtime(runtime: Option<Arc<afs_transport::hixl::HixlRun
     }
 }
 
+/// Pre-establishes HIXL control sessions for the configured peers at startup.
+/// The loop is bounded and never blocks node startup: a peer that is not up
+/// yet is retried with a fresh registry lookup, and a pre-warm that cannot
+/// succeed leaves the lazy first-read connect path unchanged. `session_idle`
+/// still governs how long an unused pre-warmed session survives.
+#[cfg(feature = "dfs")]
+fn spawn_hixl_prewarm(
+    transfer: Arc<rpc::peer::hixl::HixlChunkTransfer>,
+    nodes: Vec<String>,
+    caller_epoch: u64,
+    meta: Arc<rpc::meta::GrpcDfsMeta>,
+) {
+    const ATTEMPTS: usize = 10;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+    let spawned = std::thread::Builder::new()
+        .name("afs-hixl-prewarm".to_owned())
+        .spawn(move || {
+            for node_id in &nodes {
+                for attempt in 0..ATTEMPTS {
+                    match meta.lookup_node_data_location(node_id) {
+                        Ok((address, node_epoch)) => {
+                            if transfer.prewarm(node_id, node_epoch, &address, caller_epoch) {
+                                afs_logging::info!("dfs.hixl_prewarm_connected";
+                                    "peer" => node_id.as_str(),
+                                );
+                                break;
+                            }
+                            if attempt + 1 == ATTEMPTS {
+                                afs_logging::warn!("dfs.hixl_prewarm_exhausted";
+                                    "peer" => node_id.as_str(),
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            if attempt + 1 == ATTEMPTS {
+                                afs_logging::warn!("dfs.hixl_prewarm_failed";
+                                    "peer" => node_id.as_str(),
+                                    "error" => error.to_string(),
+                                );
+                            }
+                        }
+                    }
+                    std::thread::sleep(RETRY_DELAY);
+                }
+            }
+        });
+    if spawned.is_err() {
+        afs_logging::error!("dfs.hixl_prewarm_spawn_failed");
+    }
+}
+
 #[cfg(test)]
 mod hixl_startup_order_tests {
     use super::{BoxError, HixlStartupGuard, initialize_hixl_and_register_node};
@@ -2114,7 +2165,18 @@ async fn run_node(
                 if let Some(group) = read_group {
                     transfer = transfer.with_read_group(group, cfg.hixl.receive_slots);
                 }
-                Arc::new(transfer)
+                let transfer = Arc::new(transfer);
+                if !cfg.hixl.prewarm_nodes.is_empty()
+                    && let Some(meta) = dfs_meta.clone()
+                {
+                    spawn_hixl_prewarm(
+                        transfer.clone(),
+                        cfg.hixl.prewarm_nodes.clone(),
+                        registered_node_epoch,
+                        meta,
+                    );
+                }
+                transfer
             } else {
                 Arc::new(
                     rpc::peer::GrpcChunkTransfer::new(peer_connections.clone(), timeout)?

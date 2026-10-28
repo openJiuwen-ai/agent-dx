@@ -91,6 +91,9 @@ pub struct HixlConfig {
     pub max_inflight_per_peer: usize,
     /// Idle peer control-session lifetime; zero keeps it for the process lifetime.
     pub session_idle_ms: u64,
+    /// Peer Node IDs whose HIXL control sessions are pre-established at
+    /// startup so the first read skips negotiation.
+    pub prewarm_nodes: Vec<String>,
     pub buffer_pool_count: usize,
     pub buffer_pool_size_mib: usize,
 }
@@ -109,6 +112,7 @@ impl Default for HixlConfig {
             export_slots: 16,
             max_inflight_per_peer: 1,
             session_idle_ms: 300_000,
+            prewarm_nodes: Vec::new(),
             buffer_pool_count: 4,
             buffer_pool_size_mib: 8,
         }
@@ -152,6 +156,11 @@ impl HixlConfig {
             ));
         }
         self.validate_device_set()?;
+        if !self.prewarm_nodes.is_empty() && self.dfs_read_mode == HixlDfsReadMode::Off {
+            return Err(invalid(
+                "hixl.prewarm_nodes requires dfs_read_mode preferred or required",
+            ));
+        }
         if self.dfs_read_mode == HixlDfsReadMode::Off {
             return Ok(());
         }
@@ -2013,6 +2022,23 @@ mod hixl_config_tests {
         let mut too_long = valid_multi_device_config();
         too_long.session_idle_ms = 3_600_001;
         assert!(too_long.validate(Role::Node, false, false, false).is_err());
+    }
+
+    #[test]
+    fn prewarm_nodes_requires_an_active_read_mode() {
+        assert!(HixlConfig::default().prewarm_nodes.is_empty());
+
+        let mut inactive = valid_multi_device_config();
+        inactive.prewarm_nodes = vec!["peer-a".into()];
+        assert!(
+            inactive.validate(Role::Node, true, true, true).is_err(),
+            "pre-warm peers with dfs_read_mode off must be rejected"
+        );
+
+        let mut active = valid_multi_device_config();
+        active.dfs_read_mode = HixlDfsReadMode::Preferred;
+        active.prewarm_nodes = vec!["peer-a".into(), "peer-b".into()];
+        assert!(active.validate(Role::Node, true, true, true).is_ok());
     }
 
     #[test]

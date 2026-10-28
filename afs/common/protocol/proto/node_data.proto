@@ -190,6 +190,9 @@ enum DfsHixlTransport {
 // operation's DfsReadGrant remain the authority; the HIXL descriptors only
 // describe a window that was prepared after those checks passed.
 message DfsNegotiateHixlRequest {
+  // Absent for a startup pre-warm: the session carries no read authority and
+  // every window prepare still authorizes its own grant. Node epochs stay
+  // mandatory either way.
   DfsReadRangesRequest read_request = 1;
   string client_engine_id = 2;
   uint64 client_engine_generation = 3;

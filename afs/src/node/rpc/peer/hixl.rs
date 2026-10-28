@@ -643,7 +643,8 @@ struct WarmTask {
     node_id: String,
     node_epoch: u64,
     address: String,
-    authority: DfsReadRangesRequest,
+    /// `None` pre-warms the transport without a read authority.
+    authority: Option<DfsReadRangesRequest>,
     caller_epoch: u64,
 }
 
@@ -657,7 +658,7 @@ impl WarmTask {
                         &self.node_id,
                         self.node_epoch,
                         &self.address,
-                        &self.authority,
+                        self.authority.as_ref(),
                         self.caller_epoch,
                         deadline,
                     )
@@ -828,6 +829,48 @@ impl HixlChunkTransfer {
         }
         self.runtime.block_on(task.cancel());
         false
+    }
+
+    /// Pre-establishes the HIXL control session for one peer without a read.
+    /// Startup wiring calls this from a dedicated thread so the first read
+    /// skips negotiation. Best effort: a failed or unsupported pre-warm
+    /// leaves the lazy first-read connect path unchanged. Returns true once
+    /// the peer holds a session. Must not run inside the async runtime.
+    pub fn prewarm(
+        &self,
+        node_id: &str,
+        node_epoch: u64,
+        address: &str,
+        caller_epoch: u64,
+    ) -> bool {
+        let Some(deadline) = Instant::now().checked_add(self.context.timeout) else {
+            return false;
+        };
+        match self.runtime.block_on(self.context.begin_prewarm(
+            node_id.to_owned(),
+            node_epoch,
+            address.to_owned(),
+            caller_epoch,
+        )) {
+            WarmStart::Started(task) => {
+                if !self.runtime.spawn_background(task.clone().run()) {
+                    // The task was never polled; clearing the flag keeps the
+                    // slot reusable for the lazy path.
+                    self.runtime.block_on(task.cancel());
+                    return false;
+                }
+            }
+            // InProgress: another task is connecting. Skip covers a connected
+            // peer and a busy slot alike. Both settle below, and the session
+            // check tells the caller which one happened.
+            WarmStart::InProgress | WarmStart::Skip => {}
+        }
+        let _ = self.runtime.block_on(
+            self.context
+                .settle_warm(node_id, node_epoch, address, deadline),
+        );
+        self.runtime
+            .block_on(self.context.has_session(node_id, node_epoch, address))
     }
 }
 
@@ -1314,6 +1357,50 @@ impl ReadContext {
         else {
             return WarmStart::Skip;
         };
+        self.start_warm_task(node_id, node_epoch, address, Some(authority), caller_epoch)
+            .await
+    }
+
+    /// Starts a detached pre-warm task for a peer without a session and
+    /// without a read authority. The transport session is established so the
+    /// first read skips negotiation; every window still authorizes its own
+    /// grant afterwards. The caller epoch must be this Node's registered
+    /// incarnation so later read grants accept the pre-warmed session.
+    async fn begin_prewarm(
+        &self,
+        node_id: String,
+        node_epoch: u64,
+        address: String,
+        caller_epoch: u64,
+    ) -> WarmStart {
+        if caller_epoch == 0 {
+            return WarmStart::Skip;
+        }
+        self.start_warm_task(node_id, node_epoch, address, None, caller_epoch)
+            .await
+    }
+
+    /// Whether a peer slot already holds a control session.
+    async fn has_session(&self, node_id: &str, node_epoch: u64, address: &str) -> bool {
+        let key = (node_id.to_owned(), node_epoch, address.to_owned());
+        let slot = {
+            let slots = self.slots.lock().await;
+            slots.get(&key).cloned()
+        };
+        let Some(slot) = slot else {
+            return false;
+        };
+        slot.lock().await.session.is_some()
+    }
+
+    async fn start_warm_task(
+        &self,
+        node_id: String,
+        node_epoch: u64,
+        address: String,
+        authority: Option<DfsReadRangesRequest>,
+        caller_epoch: u64,
+    ) -> WarmStart {
         let key = (node_id.clone(), node_epoch, address.clone());
         let slot = {
             let mut slots = self.slots.lock().await;
@@ -1357,13 +1444,14 @@ impl ReadContext {
 
     /// Negotiates and connects a peer control session. The caller must have
     /// verified that the slot has no session; a concurrent warm task is
-    /// serialized by the slot's `warming` flag.
+    /// serialized by the slot's `warming` flag. A read authority negotiates a
+    /// serving session; `None` pre-warms the transport without one.
     async fn establish(
         &self,
         node_id: &str,
         node_epoch: u64,
         address: &str,
-        authority: &DfsReadRangesRequest,
+        authority: Option<&DfsReadRangesRequest>,
         caller_epoch: u64,
         deadline: Instant,
     ) -> afs_error::Result<Option<Arc<PeerSession>>> {
@@ -1375,7 +1463,7 @@ impl ReadContext {
         let (transport, buffer_pool_count, buffer_pool_size_mib, hccs_domain_id) =
             engine_transport_parameters(&info)?;
         let mut request = afs_tracing::request_with_current_context(DfsNegotiateHixlRequest {
-            read_request: Some(authority.clone()),
+            read_request: authority.cloned(),
             client_engine_id: info.engine_id.clone(),
             client_engine_generation: info.generation,
             protocol_version: HIXL_PROTOCOL_VERSION,
@@ -1538,7 +1626,7 @@ impl ReadContext {
                     node_id,
                     node_epoch,
                     address,
-                    authority,
+                    Some(authority),
                     caller_epoch,
                     deadline,
                 )
@@ -4403,6 +4491,59 @@ mod tests {
             let second = second.await.unwrap().unwrap();
             assert_eq!(&first[1..], b"ab");
             assert_eq!(&second[1..], b"ab");
+            stop.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn prewarm_connects_the_session_before_the_first_read() {
+            let Harness {
+                _temp,
+                native,
+                reader,
+                mut batch,
+                endpoint,
+                stop,
+                server,
+                ..
+            } = harness_with_mode(2, 2, 1, HixlDfsReadMode::Required).await;
+            batch.operations[0].op.length = 2;
+
+            let prewarm_reader = reader.clone();
+            let connected = tokio::task::spawn_blocking(move || {
+                prewarm_reader.prewarm("source", 9, &endpoint, 1)
+            })
+            .await
+            .unwrap();
+            assert!(connected, "pre-warm must publish a session");
+            {
+                let gate = native.connects.lock().unwrap();
+                assert_eq!(gate.completed, 2, "pre-warm connects every lane once");
+            }
+
+            let read_reader = reader.clone();
+            let read_batch = batch.clone();
+            let output = tokio::task::spawn_blocking(move || {
+                let mut output = vec![b'!'; 3];
+                read_reader.read_ranges(&read_batch, &mut output).unwrap();
+                output
+            })
+            .await
+            .unwrap();
+            assert_eq!(&output[1..], b"ab");
+            {
+                let gate = native.connects.lock().unwrap();
+                // The reader-lane mock counts every native READ as one
+                // connect, so a read that re-established the session would
+                // add the two lane connects on top of this one.
+                assert_eq!(
+                    gate.completed, 3,
+                    "the first read reuses the pre-warmed session"
+                );
+            }
             stop.send(()).unwrap();
             tokio::time::timeout(Duration::from_secs(1), server)
                 .await

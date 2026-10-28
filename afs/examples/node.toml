@@ -169,6 +169,10 @@ max_inflight_per_peer = 1
 # Idle peer control sessions are retired after this many milliseconds.
 # 0 keeps them for the process lifetime, avoiding a ~0.2 s reconnect on sparse reads.
 session_idle_ms = 300000
+# Peer Node IDs whose HIXL control sessions are pre-established at startup so
+# the first read skips negotiation. Requires preferred or required read mode;
+# the idle policy above still governs an unused pre-warmed session.
+# prewarm_nodes = ["node-a"]
 # Optional ordered extra lanes; primary plus extras are limited to 16 SDK
 # logical devices. Both peers pair by lane order. Hardware validation is pending.
 # Multi-device mode requires distinct explicit listener ports on every lane,

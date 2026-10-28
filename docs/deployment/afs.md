@@ -274,6 +274,11 @@ max_inflight_per_peer = 1
 # Idle peer control sessions are retired after this many milliseconds.
 # 0 keeps them for the process lifetime; the range is 0..=3600000.
 session_idle_ms = 300000
+# Peer Node IDs whose HIXL control sessions are pre-established at startup so
+# the first read skips negotiation. Requires preferred or required read mode;
+# retries in the background without blocking startup. The idle policy above
+# still governs how long an unused pre-warmed session survives.
+# prewarm_nodes = ["node-a"]
 ```
 
 `off` 不初始化 CANN；`preferred` 只在本地明确能力缺失且清理已完成，或 peer 在任何

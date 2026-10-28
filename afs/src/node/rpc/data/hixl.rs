@@ -256,19 +256,23 @@ impl HixlReadService {
         request: DfsNegotiateHixlRequest,
         authorizer: Arc<dyn DfsReadAuthorizer>,
     ) -> Result<Response<DfsNegotiateHixlReply>, Status> {
-        let read = request.read_request.as_ref().ok_or_else(|| {
-            coded_status(
-                afs_error::NODE_TRANSFER_INVALID,
-                "HIXL read authority is absent",
-            )
-        })?;
-        validate_hixl_identity(
-            peer,
-            self.node_epoch,
-            request.caller_node_epoch,
-            request.source_node_epoch,
-            read,
-        )?;
+        // A pre-warm negotiation carries no read authority: it only builds
+        // the transport session, and every window prepare still authorizes
+        // its own grant. Node identity stays bound to the epochs either way.
+        let read = request.read_request.as_ref();
+        if let Some(read) = read {
+            validate_hixl_identity(
+                peer,
+                self.node_epoch,
+                request.caller_node_epoch,
+                request.source_node_epoch,
+                read,
+            )?;
+        } else if request.caller_node_epoch == 0 || request.source_node_epoch != self.node_epoch {
+            return Err(Status::permission_denied(
+                "HIXL pre-warm caller or source epoch is stale",
+            ));
+        }
         if request.protocol_version != HIXL_PROTOCOL_VERSION {
             return Err(coded_status(
                 afs_error::NODE_TRANSFER_UNSUPPORTED,
@@ -284,7 +288,9 @@ impl HixlReadService {
                 "HIXL client engine identity is invalid",
             ));
         }
-        self.authorize(authorizer.as_ref(), peer, read)?;
+        if let Some(read) = read {
+            self.authorize(authorizer.as_ref(), peer, read)?;
+        }
 
         let info = self.provider.info();
         let lane_infos = self.provider.lane_infos();
@@ -2488,6 +2494,47 @@ mod tests {
         assert_eq!(reply.buffer_pool_count, 0);
         assert_eq!(reply.buffer_pool_size_mib, 0);
         assert_eq!(reply.hccs_domain_id, None);
+    }
+
+    fn prewarm_request() -> DfsNegotiateHixlRequest {
+        DfsNegotiateHixlRequest {
+            read_request: None,
+            ..negotiate_request(read_request("roce", "unused"))
+        }
+    }
+
+    #[tokio::test]
+    async fn negotiate_prewarms_without_read_authority() {
+        let (service, _provider, authorizer) = service();
+        let reply = service
+            .negotiate("reader".into(), prewarm_request(), authorizer)
+            .await
+            .expect("pre-warm negotiation")
+            .into_inner();
+
+        assert_eq!(reply.protocol_version, HIXL_PROTOCOL_VERSION);
+        assert_eq!(reply.transport, DfsHixlTransport::Roce as i32);
+        assert!(!reply.lanes.is_empty(), "pre-warm still binds lanes");
+    }
+
+    #[tokio::test]
+    async fn prewarm_rejects_stale_source_epoch_and_zero_caller_epoch() {
+        let (service, _provider, authorizer) = service();
+        let mut stale_source = prewarm_request();
+        stale_source.source_node_epoch = 8;
+        let status = service
+            .negotiate("reader".into(), stale_source, authorizer.clone())
+            .await
+            .expect_err("stale source epoch must be denied");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
+
+        let mut zero_caller = prewarm_request();
+        zero_caller.caller_node_epoch = 0;
+        let status = service
+            .negotiate("reader".into(), zero_caller, authorizer)
+            .await
+            .expect_err("zero caller epoch must be denied");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied);
     }
 
     #[tokio::test]
