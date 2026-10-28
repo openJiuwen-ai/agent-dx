@@ -126,12 +126,11 @@ Node 先完成本地 HIXL 初始化，再向 Meta 首次注册，避免多设备
 `dfs_read_mode = "preferred"` 时，peer 尚无控制会话或会话正在建立，当前 batch 使用同一
 授权经 gRPC 读取，同时后台协商并建链；建链期间到达的 batch 不等待，会话就绪后恢复 HIXL。
 成功走该路径的 batch 计入 `afs_hixl_cold_tcp_fallbacks_total`；`"required"` 不启用该回退。
-CRC32C 原生对象的读始终交给 gRPC 适配层：native 窗口协议只携带 BLAKE3 正文校验，无法
-核对 32 KiB 分段 CRC 表。原生 DFS 默认 `dfs_crc32c_writes = true`，因此默认写入的对象在
-`"required"` 下也不会经过 HIXL；成功经该适配层读取的范围计入
-`afs_hixl_crc_tcp_fallbacks_total`，此时 `afs_hixl_validated_read_bytes_total` 为 0 只表示
-数据面未被使用，不是链路故障。需要 HIXL 承载正文时显式设置 `dfs_crc32c_writes = false`，
-新写入对象使用 BLAKE3 校验。
+CRC32C 原生对象同样走 native 窗口：源端按 Meta 绑定的 32 KiB 分段表校验后，为每个窗口
+携带 CRC32C 区间校验和与分段描述符，读取节点逐区间复核校验和，完整分段再与描述符
+摘要绑定（与 gRPC 通道相同的强度）；窗口切片只依赖区间校验和与源端存储校验。
+`afs_hixl_validated_read_bytes_total` 只统计 HIXL 承载的字节。preferred 模式冷 peer 的
+首个 CRC batch 仍经 gRPC 适配层，计入 `afs_hixl_crc_tcp_fallbacks_total`。
 注册失败或启动取消时清理已初始化的 runtime；设备清理在阻塞线程中执行。
 进程正常停止仍须完成排空；15 秒进程停机期限耗尽时，以失败码 124 直接退出并跳过
 可能阻塞的 native 退出处理器，不把该路径标记为正常关闭或已证明设备排空。

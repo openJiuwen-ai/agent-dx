@@ -762,7 +762,9 @@ Drop 仅安排有界后台清理，失败持有 fd/配额重试，显式 unregis
 读取节点按两端协商的最小窗口容量切片，不为占满设备而缩小 IO。多 lane 时每个 peer
 连接在首次读取时绑定到当前占用最少的 lane，同一 peer 的后续 batch 固定使用该 lane，
 peer 数超过 lane 数时按占用数复用；单 lane 配置退化为原行为。一个 batch 的所有窗口
-在该绑定 lane 上准备、传输和释放。完成并逐 range 校验 BLAKE3，全部成功后验证
+在该绑定 lane 上准备、传输和释放。完成并逐 range 校验摘要：BLAKE3 对象比正文哈希，
+CRC32C 对象比区间 CRC 并核对 Meta 绑定的 32 KiB 分段描述（完整分段逐段复核，切片边界
+依赖区间 CRC 与源端存储校验），全部成功后验证
 scatter 范围并按原请求顺序填入输出，保留目的区重叠语义；scheduler 仍在整个 batch
 成功后发布 staging 数据。
 组批次在 reader 侧用有界 8 线程池并行校验各窗口，按校验波记录墙钟；native 组窗口

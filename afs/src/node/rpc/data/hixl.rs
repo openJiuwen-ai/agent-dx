@@ -24,7 +24,8 @@ use afs_transport::hixl::{EngineInfo, ExportWindow, HixlError, HixlRuntimeGroup,
 use tonic::{Response, Status};
 
 use super::prepared::{
-    read_packed_dfs_ranges, read_packed_dfs_ranges_with_budget, validate_packed_dfs_read,
+    PackedRangeDigest, read_packed_dfs_ranges, read_packed_dfs_ranges_with_budget,
+    validate_packed_dfs_read,
 };
 use super::{DfsReadAuthorizer, dfs_read_caller_epoch, validate_dfs_read_request};
 use crate::node::chunk::LocalChunkStore;
@@ -601,12 +602,12 @@ impl HixlReadService {
             };
             self.observe(Operation::SourceRead, started, packed.is_ok());
             let (bytes, completions) = packed?;
-            let range_checksums = batch_range_checksums(&batch, &completions);
+            let range_digests = batch_range_checksums(&batch, &completions);
             session.prepared_batch = Some(PreparedBatch {
                 request: Arc::new(batch),
                 bytes: Arc::new(bytes),
                 next_offset: 0,
-                range_checksums,
+                range_digests,
             });
         }
         let prepared = session
@@ -625,7 +626,8 @@ impl HixlReadService {
         let completions = window_completions(
             &read,
             &bytes,
-            &prepared.range_checksums,
+            &prepared.range_digests,
+            &local,
             self.metrics.as_ref(),
         )?;
         let export = self
@@ -685,6 +687,7 @@ impl HixlReadService {
                     source_copy_id: operation.source_copy_id.clone(),
                     range_checksum: completion.range_checksum.clone(),
                     range_checksum_algorithm: completion.range_checksum_algorithm,
+                    crc32c_table: completion.crc32c_table.clone(),
                 })
                 .collect::<Vec<_>>();
             let reply = DfsPrepareReadRangesHixlReply {
@@ -1078,12 +1081,12 @@ impl HixlReadService {
             };
             self.observe(Operation::SourceRead, started, packed.is_ok());
             let (bytes, completions) = packed.map_err(|status| (status, false))?;
-            let range_checksums = batch_range_checksums(batch, &completions);
+            let range_digests = batch_range_checksums(batch, &completions);
             session.prepared_batch = Some(PreparedBatch {
                 request: Arc::new(batch.clone()),
                 bytes: Arc::new(bytes),
                 next_offset: 0,
-                range_checksums,
+                range_digests,
             });
             created_snapshot = true;
         }
@@ -1112,7 +1115,8 @@ impl HixlReadService {
                     let completions = window_completions(
                         &plan.read,
                         window,
-                        &prepared.range_checksums,
+                        &prepared.range_digests,
+                        local,
                         self.metrics.as_ref(),
                     )?;
                     (
@@ -1189,6 +1193,7 @@ impl HixlReadService {
                         source_copy_id: operation.source_copy_id.clone(),
                         range_checksum: completion.range_checksum.clone(),
                         range_checksum_algorithm: completion.range_checksum_algorithm,
+                        crc32c_table: completion.crc32c_table.clone(),
                     })
                     .collect::<Vec<_>>();
                 Ok((
@@ -1660,7 +1665,7 @@ fn invalid_export_range() -> HixlError {
 fn batch_range_checksums(
     batch: &DfsReadRangesRequest,
     completions: &[DfsReadRangesCompletion],
-) -> HashMap<(String, u64, u64), Vec<u8>> {
+) -> HashMap<(String, u64, u64), PackedRangeDigest> {
     batch
         .operations
         .iter()
@@ -1672,7 +1677,11 @@ fn batch_range_checksums(
                     operation.chunk_offset,
                     operation.length,
                 ),
-                completion.range_checksum.clone(),
+                PackedRangeDigest {
+                    checksum: completion.range_checksum.clone(),
+                    algorithm: completion.range_checksum_algorithm,
+                    table: completion.crc32c_table.clone(),
+                },
             )
         })
         .collect()
@@ -1681,7 +1690,8 @@ fn batch_range_checksums(
 fn window_completions(
     read: &DfsReadRangesRequest,
     bytes: &[u8],
-    reusable: &HashMap<(String, u64, u64), Vec<u8>>,
+    reusable: &HashMap<(String, u64, u64), PackedRangeDigest>,
+    local: &LocalChunkStore,
     metrics: Option<&HixlMetrics>,
 ) -> Result<Vec<DfsReadRangesCompletion>, Status> {
     let mut reused = 0_usize;
@@ -1700,29 +1710,49 @@ fn window_completions(
             let range = bytes.get(start..end).ok_or_else(|| {
                 Status::invalid_argument("HIXL range exceeds the verified window")
             })?;
-            let range_checksum = match reusable.get(&(
+            let digest = match reusable.get(&(
                 operation.chunk_id.clone(),
                 operation.chunk_offset,
                 operation.length,
             )) {
-                Some(checksum) => {
+                Some(digest) => {
                     reused += 1;
-                    checksum.clone()
+                    digest.clone()
                 }
                 None => {
                     computed += 1;
-                    blake3::hash(range).as_bytes().to_vec()
+                    // A window slice can cut a stored range, so recompute the
+                    // same transport digest the snapshot used for this Chunk:
+                    // CRC32C objects stay bound to their Meta descriptor.
+                    match local
+                        .peer_crc32c_table(&crate::dfs::ChunkId::new(operation.chunk_id.clone()))
+                        .map_err(error_to_status)?
+                    {
+                        Some(table) => PackedRangeDigest {
+                            checksum: crate::node::chunk_crc32c::checksum(range)
+                                .to_le_bytes()
+                                .to_vec(),
+                            algorithm: DfsDigestAlgorithm::Crc32c as i32,
+                            table: serde_json::to_vec(&table)
+                                .map_err(|error| Status::internal(error.to_string()))?,
+                        },
+                        None => PackedRangeDigest {
+                            checksum: blake3::hash(range).as_bytes().to_vec(),
+                            algorithm: DfsDigestAlgorithm::Blake3 as i32,
+                            table: Vec::new(),
+                        },
+                    }
                 }
             };
             Ok(DfsReadRangesCompletion {
-                crc32c_table: Default::default(),
+                crc32c_table: digest.table,
                 read_id: read.read_id.clone(),
                 attempt_id: read.attempt_id.clone(),
                 operation_index: operation.operation_index,
                 source_copy_id: operation.source_copy_id.clone(),
                 transferred_bytes: operation.length,
-                range_checksum,
-                range_checksum_algorithm: DfsDigestAlgorithm::Blake3 as i32,
+                range_checksum: digest.checksum,
+                range_checksum_algorithm: digest.algorithm,
             })
         })
         .collect::<Result<Vec<_>, Status>>()?;
@@ -1845,7 +1875,7 @@ struct PreparedBatch {
     request: Arc<DfsReadRangesRequest>,
     bytes: Arc<Vec<u8>>,
     next_offset: usize,
-    range_checksums: HashMap<(String, u64, u64), Vec<u8>>,
+    range_digests: HashMap<(String, u64, u64), PackedRangeDigest>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]

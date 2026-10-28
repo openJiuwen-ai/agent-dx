@@ -473,14 +473,17 @@ fn validate_prepare(
         .zip(&reply.ranges)
         .zip(&reply.completions)
     {
+        let blake3_shape = range.range_checksum_algorithm == DfsDigestAlgorithm::Blake3 as i32
+            && range.range_checksum.len() == 32;
+        let crc32c_shape = range.range_checksum_algorithm == DfsDigestAlgorithm::Crc32c as i32
+            && range.range_checksum.len() == 4;
         if range.operation_index != op.operation_index
             || range.chunk_id != op.chunk_id
             || range.chunk_offset != op.chunk_offset
             || range.length != op.length
             || range.packed_offset != op.destination_offset
             || range.source_copy_id != op.source_copy_id
-            || range.range_checksum_algorithm != DfsDigestAlgorithm::Blake3 as i32
-            || range.range_checksum.len() != 32
+            || !(blake3_shape || crc32c_shape)
             || completion.read_id != window.request.read_id
             || completion.attempt_id != window.request.attempt_id
             || completion.operation_index != op.operation_index
@@ -504,7 +507,19 @@ fn validate_prepare(
     Ok(())
 }
 
-fn validate_bytes(reply: &DfsPrepareReadRangesHixlReply, bytes: &[u8]) -> afs_error::Result<()> {
+/// Meta-bound identity a CRC32C window must still match when it is promoted.
+#[derive(Clone)]
+struct CrcExpectation {
+    chunk_id: String,
+    content_digest: crate::dfs::ContentDigest,
+    length: u64,
+}
+
+fn validate_bytes(
+    reply: &DfsPrepareReadRangesHixlReply,
+    bytes: &[u8],
+    crc: Option<&CrcExpectation>,
+) -> afs_error::Result<()> {
     if usize::try_from(reply.packed_length).ok() != Some(bytes.len()) {
         return Err(dfs_protocol_error("HIXL native READ length differs"));
     }
@@ -519,8 +534,72 @@ fn validate_bytes(reply: &DfsPrepareReadRangesHixlReply, bytes: &[u8]) -> afs_er
         let data = bytes
             .get(start..end)
             .ok_or_else(|| dfs_protocol_error("HIXL checksum range exceeds READ"))?;
-        if range.range_checksum.as_slice() != blake3::hash(data).as_bytes() {
-            return Err(dfs_corrupt_error("HIXL range checksum differs"));
+        match range.range_checksum_algorithm {
+            algorithm if algorithm == DfsDigestAlgorithm::Blake3 as i32 => {
+                if crc.is_some() {
+                    return Err(dfs_protocol_error("HIXL CRC range is labelled as BLAKE3"));
+                }
+                if range.range_checksum.as_slice() != blake3::hash(data).as_bytes() {
+                    return Err(dfs_corrupt_error("HIXL range checksum differs"));
+                }
+            }
+            algorithm if algorithm == DfsDigestAlgorithm::Crc32c as i32 => {
+                let Some(expected) = crc else {
+                    return Err(dfs_protocol_error(
+                        "HIXL BLAKE3 batch served a CRC32C range",
+                    ));
+                };
+                if range.chunk_id != expected.chunk_id {
+                    return Err(dfs_protocol_error("HIXL CRC range chunk differs"));
+                }
+                let checksum = crate::node::chunk_crc32c::checksum(data).to_le_bytes();
+                if range.range_checksum.as_slice() != checksum {
+                    return Err(dfs_corrupt_error("HIXL CRC range checksum differs"));
+                }
+                validate_crc_descriptor(range, data, expected)?;
+            }
+            _ => {
+                return Err(dfs_protocol_error(
+                    "HIXL range checksum algorithm is unsupported",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Complete aligned segments bind to the Meta descriptor exactly like the gRPC
+/// lane; a window slice that cuts a segment relies on the range checksum above
+/// plus the authenticated source's storage verification.
+fn validate_crc_descriptor(
+    range: &afs_protocol::node_data::DfsHixlReadRange,
+    data: &[u8],
+    expected: &CrcExpectation,
+) -> afs_error::Result<()> {
+    let segment = crate::node::chunk_crc32c::SEGMENT as u64;
+    let complete = range.chunk_offset.is_multiple_of(segment)
+        && (range.length.is_multiple_of(segment)
+            || range.chunk_offset.checked_add(range.length) == Some(expected.length));
+    if !complete {
+        if !range.crc32c_table.is_empty() {
+            return Err(dfs_protocol_error("HIXL CRC table on a partial range"));
+        }
+        return Ok(());
+    }
+    if range.crc32c_table.is_empty() || range.crc32c_table.len() > 4096 {
+        return Err(dfs_protocol_error("HIXL CRC descriptor missing"));
+    }
+    let table: crate::node::chunk_crc32c::CrcTable = serde_json::from_slice(&range.crc32c_table)
+        .map_err(|_| dfs_corrupt_error("HIXL CRC descriptor is invalid"))?;
+    if !table.valid_shape(expected.length) || table.descriptor_digest() != expected.content_digest {
+        return Err(dfs_corrupt_error("HIXL CRC descriptor differs from Meta"));
+    }
+    let base = usize::try_from(range.chunk_offset / segment)
+        .map_err(|_| dfs_protocol_error("HIXL CRC segment index overflow"))?;
+    for (relative, bytes) in data.chunks(crate::node::chunk_crc32c::SEGMENT).enumerate() {
+        if table.checksums.get(base + relative) != Some(&crate::node::chunk_crc32c::checksum(bytes))
+        {
+            return Err(dfs_corrupt_error("HIXL CRC segment differs from Meta"));
         }
     }
     Ok(())
@@ -548,6 +627,7 @@ fn validation_pool() -> Option<&'static rayon_core::ThreadPool> {
 /// order; the caller publishes only after every digest matches.
 fn validate_windows(
     windows: &[(&DfsPrepareReadRangesHixlReply, &[u8])],
+    crc: Option<&CrcExpectation>,
 ) -> Vec<(Duration, afs_error::Result<()>)> {
     let slots = StdMutex::new(
         windows
@@ -558,7 +638,7 @@ fn validate_windows(
     let validate = |index: usize| {
         let (reply, bytes) = windows[index];
         let started = Instant::now();
-        let result = validate_bytes(reply, bytes);
+        let result = validate_bytes(reply, bytes, crc);
         let elapsed = started.elapsed();
         match slots.lock() {
             Ok(mut slots) => slots[index] = Some((elapsed, result)),
@@ -872,49 +952,15 @@ impl HixlChunkTransfer {
         self.runtime
             .block_on(self.context.has_session(node_id, node_epoch, address))
     }
-}
 
-/// Validated native output that has not yet reached the caller buffer.
-struct PreparedChunk {
-    bytes: Vec<u8>,
-    windows: Vec<ReadWindow>,
-}
-
-enum ReadResult {
-    Complete(Vec<CompletedWindow>),
-    PreparedComplete(Vec<PreparedChunk>),
-    Unsupported,
-}
-
-enum Acquired {
-    Lease(PeerLease),
-    Unsupported,
-}
-
-impl ChunkTransfer for HixlChunkTransfer {
-    fn transport(&self) -> &'static str {
-        "hixl"
-    }
-
-    /// CRC32C objects are single-range by construction and the native window
-    /// protocol carries BLAKE3 digests only, so keep them on the gRPC adapter.
-    /// Each served range is counted so a `required` peer never looks idle.
-    fn read_crc32c_range(
+    /// Shared native window path. `crc_chunk` marks a CRC32C object: every
+    /// promoted window must then carry that object's CRC32C digest.
+    fn read_native_batch(
         &self,
         batch: &PeerReadBatch,
-        chunk: &crate::dfs::ChunkObject,
         out: &mut [u8],
+        crc_chunk: Option<&crate::dfs::ChunkObject>,
     ) -> afs_error::Result<()> {
-        let result = self.crc.read_crc32c_range(batch, chunk, out);
-        if result.is_ok()
-            && let Some(metrics) = &self.context.metrics
-        {
-            metrics.observe_crc_fallback();
-        }
-        result
-    }
-
-    fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> afs_error::Result<()> {
         match self.context.group {
             Some(group) => batch.validate_group(out.len(), group.bytes as u64)?,
             None => batch.validate(out.len())?,
@@ -985,8 +1031,20 @@ impl ChunkTransfer for HixlChunkTransfer {
             )
         {
             let remaining = remaining(deadline)?;
-            let result = self.grpc_fallback(remaining)?.read_ranges(batch, out);
-            if result.is_ok()
+            let result = match crc_chunk {
+                Some(chunk) => {
+                    let result = self.crc.read_crc32c_range(batch, chunk, out);
+                    if result.is_ok()
+                        && let Some(metrics) = &self.context.metrics
+                    {
+                        metrics.observe_crc_fallback();
+                    }
+                    result
+                }
+                None => self.grpc_fallback(remaining)?.read_ranges(batch, out),
+            };
+            if crc_chunk.is_none()
+                && result.is_ok()
                 && let Some(metrics) = &self.context.metrics
             {
                 metrics.observe_cold_fallback();
@@ -997,6 +1055,11 @@ impl ChunkTransfer for HixlChunkTransfer {
         let peer_identity = (node_id.clone(), *node_epoch);
         let cancel = Arc::new(Cancellation::default());
         let prepared_output_len = self.context.payload_metrics.as_ref().map(|_| out.len());
+        let crc = crc_chunk.map(|chunk| CrcExpectation {
+            chunk_id: chunk.id.0.clone(),
+            content_digest: chunk.content_digest.clone(),
+            length: chunk.length,
+        });
         let result = self.runtime.block_on(async move {
             let command_cancel = cancel.clone();
             let task = tokio::spawn(async move {
@@ -1007,6 +1070,7 @@ impl ChunkTransfer for HixlChunkTransfer {
                         request,
                         prepared_output_len,
                         deadline,
+                        crc,
                         command_cancel,
                     )
                     .await
@@ -1030,9 +1094,60 @@ impl ChunkTransfer for HixlChunkTransfer {
                 let remaining = remaining(deadline)?;
                 self.context
                     .observe(Operation::Fallback, started.elapsed(), true);
-                self.grpc_fallback(remaining)?.read_ranges(batch, out)
+                match crc_chunk {
+                    Some(chunk) => {
+                        let result = self.crc.read_crc32c_range(batch, chunk, out);
+                        if result.is_ok()
+                            && let Some(metrics) = &self.context.metrics
+                        {
+                            metrics.observe_crc_fallback();
+                        }
+                        result
+                    }
+                    None => self.grpc_fallback(remaining)?.read_ranges(batch, out),
+                }
             }
         }
+    }
+}
+
+/// Validated native output that has not yet reached the caller buffer.
+struct PreparedChunk {
+    bytes: Vec<u8>,
+    windows: Vec<ReadWindow>,
+}
+
+enum ReadResult {
+    Complete(Vec<CompletedWindow>),
+    PreparedComplete(Vec<PreparedChunk>),
+    Unsupported,
+}
+
+enum Acquired {
+    Lease(PeerLease),
+    Unsupported,
+}
+
+impl ChunkTransfer for HixlChunkTransfer {
+    fn transport(&self) -> &'static str {
+        "hixl"
+    }
+
+    /// CRC32C objects travel through the same native windows: the source
+    /// serves a CRC32C range checksum plus its Meta-bound segment table, and
+    /// the window is validated against both. The gRPC adapter remains the
+    /// fallback for a preferred-mode cold peer and for an unsupported source.
+    fn read_crc32c_range(
+        &self,
+        batch: &PeerReadBatch,
+        chunk: &crate::dfs::ChunkObject,
+        out: &mut [u8],
+    ) -> afs_error::Result<()> {
+        self.read_native_batch(batch, out, Some(chunk))
+    }
+
+    fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> afs_error::Result<()> {
+        self.read_native_batch(batch, out, None)
     }
 }
 
@@ -1649,6 +1764,7 @@ impl ReadContext {
         Ok(Acquired::Lease(PeerLease { session, guard }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn read_batch(
         &self,
         peer_identity: (String, u64),
@@ -1656,6 +1772,7 @@ impl ReadContext {
         authority: DfsReadRangesRequest,
         prepared_output_len: Option<usize>,
         deadline: Instant,
+        crc: Option<CrcExpectation>,
         cancel: Arc<Cancellation>,
     ) -> afs_error::Result<ReadResult> {
         let prepared_measurement = prepared_output_len.is_some();
@@ -1812,6 +1929,7 @@ impl ReadContext {
                         output_len,
                         deadline,
                         &mut payload_elapsed,
+                        crc.as_ref(),
                     )
                     .await
                 } else {
@@ -1821,6 +1939,7 @@ impl ReadContext {
                         output_len,
                         deadline,
                         &mut payload_elapsed,
+                        crc.as_ref(),
                     )
                     .await
                 };
@@ -1836,9 +1955,10 @@ impl ReadContext {
                 for (ordinal, window, reply, lane) in prepared {
                     let context = self.clone();
                     let session = lease.session.clone();
+                    let crc = crc.clone();
                     tasks.spawn(async move {
                         let result = context
-                            .read_prepared(&session, &window, reply, lane, deadline)
+                            .read_prepared(&session, &window, reply, lane, deadline, crc.as_ref())
                             .await;
                         (ordinal, window, result)
                     });
@@ -2032,6 +2152,7 @@ impl ReadContext {
         reply: DfsPrepareReadRangesHixlReply,
         lane_id: usize,
         deadline: Instant,
+        crc: Option<&CrcExpectation>,
     ) -> Result<Vec<u8>, WindowFailure> {
         let mut client = session.client.clone();
         let native = self
@@ -2054,7 +2175,7 @@ impl ReadContext {
         let (outcome, validation) = match &transfer {
             Ok(bytes) => {
                 let start = Instant::now();
-                let result = validate_bytes(&reply, bytes);
+                let result = validate_bytes(&reply, bytes, crc);
                 self.observe(Operation::Validate, start.elapsed(), result.is_ok());
                 (native_release_outcome(&transfer), result)
             }
@@ -2091,6 +2212,7 @@ impl ReadContext {
         output_len: usize,
         deadline: Instant,
         payload_elapsed: &mut Duration,
+        crc: Option<&CrcExpectation>,
     ) -> Result<Vec<PreparedChunk>, WindowFailure> {
         let mut submissions = Vec::with_capacity(prepared.len());
         let mut preparation_failure = None;
@@ -2209,7 +2331,7 @@ impl ReadContext {
             .collect::<Vec<_>>();
         let mut validations = Vec::with_capacity(results.len());
         let validate_started = Instant::now();
-        let window_validations = validate_windows(&ranges);
+        let window_validations = validate_windows(&ranges, crc);
         self.observe_phase("validate", validate_started.elapsed());
         for (result, (elapsed, validation)) in results.iter().zip(window_validations) {
             if result.transfer.is_err() {
@@ -2312,6 +2434,7 @@ impl ReadContext {
         output_len: usize,
         deadline: Instant,
         payload_elapsed: &mut Duration,
+        crc: Option<&CrcExpectation>,
     ) -> Result<Vec<PreparedChunk>, WindowFailure> {
         let Some((_, _, first_reply, lane_id)) = prepared.first() else {
             return Ok(Vec::new());
@@ -2422,7 +2545,7 @@ impl ReadContext {
         }
         let mut validations = Vec::with_capacity(ranges.len());
         let validate_started = Instant::now();
-        let window_validations = validate_windows(&ranges);
+        let window_validations = validate_windows(&ranges, crc);
         self.observe_phase("validate", validate_started.elapsed());
         for (elapsed, validation) in window_validations {
             self.observe(Operation::Validate, elapsed, validation.is_ok());
@@ -3001,6 +3124,7 @@ mod tests {
                 source_copy_id: "copy".into(),
                 range_checksum: checksum.clone(),
                 range_checksum_algorithm: DfsDigestAlgorithm::Blake3 as i32,
+                crc32c_table: Default::default(),
             }],
             completions: vec![DfsReadRangesCompletion {
                 crc32c_table: Default::default(),
@@ -3576,12 +3700,62 @@ mod tests {
     #[test]
     fn completed_native_read_still_requires_exact_bytes_and_checksum() {
         let (_, _, reply) = descriptor();
-        validate_bytes(&reply, b"abc").unwrap();
+        validate_bytes(&reply, b"abc", None).unwrap();
         assert_eq!(
-            validate_bytes(&reply, b"abd").unwrap_err().code(),
+            validate_bytes(&reply, b"abd", None).unwrap_err().code(),
             afs_error::NODE_TRANSFER_CORRUPT_DATA
         );
-        assert!(validate_bytes(&reply, b"ab").is_err());
+        assert!(validate_bytes(&reply, b"ab", None).is_err());
+    }
+
+    #[test]
+    fn crc_window_binds_range_checksum_and_meta_descriptor() {
+        let (_request, _session, template) = descriptor();
+        let bytes = vec![7_u8; crate::node::chunk_crc32c::SEGMENT];
+        let table = crate::node::chunk_crc32c::CrcTable::build(&bytes).unwrap();
+        let expected = CrcExpectation {
+            chunk_id: "crc-chunk".into(),
+            content_digest: table.descriptor_digest(),
+            length: bytes.len() as u64,
+        };
+        let mut reply = template;
+        reply.packed_length = bytes.len() as u64;
+        reply.ranges = vec![DfsHixlReadRange {
+            operation_index: 0,
+            chunk_id: "crc-chunk".into(),
+            chunk_offset: 0,
+            length: bytes.len() as u64,
+            packed_offset: 0,
+            source_copy_id: "copy".into(),
+            range_checksum: crate::node::chunk_crc32c::checksum(&bytes)
+                .to_le_bytes()
+                .to_vec(),
+            range_checksum_algorithm: DfsDigestAlgorithm::Crc32c as i32,
+            crc32c_table: serde_json::to_vec(&table).unwrap(),
+        }];
+        validate_bytes(&reply, &bytes, Some(&expected)).unwrap();
+
+        let mut damaged = bytes.clone();
+        damaged[5] ^= 1;
+        assert_eq!(
+            validate_bytes(&reply, &damaged, Some(&expected))
+                .unwrap_err()
+                .code(),
+            afs_error::NODE_TRANSFER_CORRUPT_DATA
+        );
+
+        let mut foreign = reply.clone();
+        let other = crate::node::chunk_crc32c::CrcTable::build(&vec![9_u8; bytes.len()]).unwrap();
+        foreign.ranges[0].crc32c_table = serde_json::to_vec(&other).unwrap();
+        assert!(
+            validate_bytes(&foreign, &bytes, Some(&expected)).is_err(),
+            "a table from another object must not bind"
+        );
+
+        assert!(
+            validate_bytes(&reply, &bytes, None).is_err(),
+            "a BLAKE3 batch must reject CRC32C ranges"
+        );
     }
 
     #[test]
@@ -3594,7 +3768,7 @@ mod tests {
             (&bad, b"abc".as_slice()),
             (&good, b"abc".as_slice()),
         ];
-        let observed = validate_windows(&windows);
+        let observed = validate_windows(&windows, None);
         assert_eq!(observed.len(), 3);
         assert!(observed[0].1.is_ok());
         assert_eq!(
@@ -4499,6 +4673,104 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn crc32c_chunks_travel_through_native_windows() {
+            let temp = tempfile::tempdir().unwrap();
+            let local = Arc::new(LocalChunkStore::open(temp.path(), "source").unwrap());
+            let staged = StagedChunk::new_crc32c(
+                crate::dfs::OperationId::new("crc-window"),
+                b"abcdefgh".to_vec(),
+            )
+            .unwrap();
+            let chunk = staged.chunk.clone();
+            let chunk_id = chunk.id.clone();
+            local.put(staged).unwrap();
+            let native = Arc::new(NativeBoundary::default());
+            let source = Arc::new(source_hixl::HixlReadService::for_test(
+                Arc::new(SourceNative {
+                    boundary: native.clone(),
+                    lanes: 1,
+                    window_bytes: 8,
+                    export_slots: 4,
+                }),
+                "source".into(),
+                9,
+            ));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let service = make_dfs_chunks_server_with_transport(
+                Some(local),
+                Arc::new(TestAuthority),
+                Arc::new(TestAuthority),
+                Arc::new(DenyDfsReplicaAuthorizer),
+                None,
+                Duration::from_secs(5),
+                DfsChunkTransportResources {
+                    read_pipeline: Default::default(),
+                    rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
+                    payload_metrics: None,
+                    hixl: Some(source.clone()),
+                },
+            );
+            let (stop, stopping) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(service)
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                        let _ = stopping.await;
+                    })
+                    .await
+                    .unwrap();
+            });
+            let peers = Arc::new(
+                PeerConnectionPool::new(
+                    afs_transport::GrpcConfig::default(),
+                    afs_transport::TlsConfig::Disabled,
+                    16,
+                )
+                .unwrap(),
+            );
+            let reader = Arc::new(
+                HixlChunkTransfer::from_runtime(
+                    peers,
+                    Arc::new(ReaderNative {
+                        boundary: native.clone(),
+                        lanes: 1,
+                        window_bytes: 8,
+                    }),
+                    HixlDfsReadMode::Required,
+                    Duration::from_secs(5),
+                )
+                .unwrap(),
+            );
+            let batch = read_batch(chunk_id, &endpoint);
+
+            let read_reader = reader.clone();
+            let read_chunk = chunk.clone();
+            let read_batch_input = batch.clone();
+            let output = tokio::task::spawn_blocking(move || {
+                let mut output = vec![b'!'; 9];
+                read_reader
+                    .read_crc32c_range(&read_batch_input, &read_chunk, &mut output)
+                    .unwrap();
+                output
+            })
+            .await
+            .unwrap();
+            assert_eq!(&output[1..9], b"abcdefgh");
+            assert_eq!(
+                native.prepare_calls.load(Ordering::SeqCst),
+                1,
+                "the CRC chunk must be served by a native window, not the gRPC adapter"
+            );
+            let _ = source;
+            stop.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn prewarm_connects_the_session_before_the_first_read() {
             let Harness {
                 _temp,
@@ -4776,7 +5048,14 @@ mod tests {
             let mut payload = Duration::ZERO;
             let chunks = expect_window(
                 context
-                    .read_prepared_group(&session, prepared, output.len(), deadline, &mut payload)
+                    .read_prepared_group(
+                        &session,
+                        prepared,
+                        output.len(),
+                        deadline,
+                        &mut payload,
+                        None,
+                    )
                     .await,
                 "group native read",
             );
@@ -4865,7 +5144,14 @@ mod tests {
             let mut payload = Duration::ZERO;
             let chunks = expect_window(
                 context
-                    .read_prepared_group(&session, prepared, output.len(), deadline, &mut payload)
+                    .read_prepared_group(
+                        &session,
+                        prepared,
+                        output.len(),
+                        deadline,
+                        &mut payload,
+                        None,
+                    )
                     .await,
                 "group native read",
             );

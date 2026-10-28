@@ -253,6 +253,9 @@ message DfsHixlReadRange {
   string source_copy_id = 6;
   bytes range_checksum = 7;
   DfsDigestAlgorithm range_checksum_algorithm = 8;
+  // Serialized Meta-bound CRC32C segment table for CRC32C ranges; empty for
+  // BLAKE3 ranges. Bound like the gRPC header descriptor.
+  bytes crc32c_table = 9;
 }
 
 message DfsPrepareReadRangesHixlReply {

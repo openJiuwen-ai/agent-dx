@@ -673,10 +673,10 @@ const MAX_SOURCE_SCAN_THREADS: usize = 16;
 
 /// One range's transport digest and its bounded descriptor.
 #[derive(Clone)]
-struct PackedRangeDigest {
-    checksum: Vec<u8>,
-    algorithm: i32,
-    table: Vec<u8>,
+pub(super) struct PackedRangeDigest {
+    pub(super) checksum: Vec<u8>,
+    pub(super) algorithm: i32,
+    pub(super) table: Vec<u8>,
 }
 
 /// One Chunk's requested ranges in packed-output order.
