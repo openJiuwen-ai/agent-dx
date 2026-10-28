@@ -7369,6 +7369,7 @@ mod tests {
                 std::time::Duration::from_secs(10),
                 Some(pool),
                 None,
+                None,
             )
             .unwrap();
             let bytes = tokio::task::spawn_blocking(move || {
@@ -7407,6 +7408,7 @@ mod tests {
             peers,
             std::time::Duration::from_secs(10),
             Some(pool),
+            None,
             None,
         )
         .unwrap();

@@ -1229,6 +1229,9 @@ pub struct GrpcChunkTransfer {
     next_read: std::sync::atomic::AtomicU64,
     move_metrics: Option<crate::node::dfs_read::DfsReadMoveMetrics>,
     payload_metrics: Option<crate::node::dfs_read::DfsReadPayloadMetrics>,
+    /// Observation-only phase sampling for the plain streaming path; unlike
+    /// `payload_metrics` it never selects the prepared-payload route.
+    phase_metrics: Option<crate::node::dfs_read::DfsReadPayloadMetrics>,
     group_bytes: Option<u64>,
 }
 
@@ -1259,6 +1262,7 @@ impl GrpcChunkTransfer {
             fast_open_ready: std::sync::Mutex::new(std::collections::HashSet::new()),
             move_metrics: None,
             payload_metrics: None,
+            phase_metrics: None,
             group_bytes: None,
         })
     }
@@ -1283,6 +1287,22 @@ impl GrpcChunkTransfer {
         self.move_metrics = Some(metrics);
         self
     }
+
+    /// Attaches observation-only phase sampling for the plain streaming path.
+    /// Selection of the prepared-payload route stays tied to `payload_metrics`.
+    pub fn with_phase_metrics(
+        mut self,
+        metrics: crate::node::dfs_read::DfsReadPayloadMetrics,
+    ) -> Self {
+        self.phase_metrics = Some(metrics);
+        self
+    }
+
+    fn observe_phase(&self, phase: &'static str, elapsed: std::time::Duration) {
+        if let Some(metrics) = &self.phase_metrics {
+            metrics.observe_phase("grpc", phase, elapsed);
+        }
+    }
 }
 
 #[cfg(feature = "dfs")]
@@ -1305,7 +1325,9 @@ impl GrpcChunkTransfer {
         out: &'a mut [u8],
         proof_budget: Option<Arc<OutboardBudget>>,
     ) -> afs_error::Result<Option<VerifiedPeerChunk<'a>>> {
+        let admit_started = std::time::Instant::now();
         let _read_owner = self.admit_borrowed_read().await?;
+        self.observe_phase("admit", admit_started.elapsed());
 
         match chunk {
             Some(chunk) => crate::node::dfs_read::validate_verified_peer_object_request(
@@ -1362,6 +1384,7 @@ impl GrpcChunkTransfer {
         async {
             // One deadline covers connection, response headers and every frame.
             tokio::time::timeout(timeout, async {
+                let connect_started = std::time::Instant::now();
                 let channel = self
                     .peers
                     .channel(
@@ -1372,6 +1395,7 @@ impl GrpcChunkTransfer {
                             .ok_or_else(|| dfs_protocol_error("peer source has no endpoint"))?,
                     )
                     .await?;
+                self.observe_phase("connect", connect_started.elapsed());
                 let mut client = DfsChunksClient::new(channel)
                     .max_encoding_message_size(self.peers.config.max_encoding_message_bytes)
                     .max_decoding_message_size(self.peers.config.max_decoding_message_bytes);
@@ -1386,10 +1410,12 @@ impl GrpcChunkTransfer {
                 if let Some(metrics) = &self.peers.read_work_metrics {
                     metrics.read_rpc("peer_read_ranges");
                 }
+                let transfer_started = std::time::Instant::now();
                 let response = client
                     .read_ranges(rpc_request)
                     .await
                     .map_err(afs_transport::grpc::error_status::status_to_error)?;
+                self.observe_phase("transfer", transfer_started.elapsed());
                 consume_peer_read_stream(
                     &request,
                     chunk,
@@ -1397,6 +1423,7 @@ impl GrpcChunkTransfer {
                     response.into_inner(),
                     self.peers.read_work_metrics.as_ref(),
                     self.move_metrics.as_ref(),
+                    self.phase_metrics.as_ref(),
                     proof_budget,
                 )
                 .await
@@ -2993,6 +3020,7 @@ impl Drop for GrpcMoveSample<'_> {
 }
 
 #[cfg(feature = "dfs")]
+#[allow(clippy::too_many_arguments)]
 async fn consume_peer_read_stream<'a, S>(
     request: &DfsReadRangesRequest,
     chunk: Option<&'a ChunkObject>,
@@ -3000,6 +3028,7 @@ async fn consume_peer_read_stream<'a, S>(
     mut stream: S,
     metrics: Option<&ReadWorkMetrics>,
     move_metrics: Option<&crate::node::dfs_read::DfsReadMoveMetrics>,
+    phase_metrics: Option<&crate::node::dfs_read::DfsReadPayloadMetrics>,
     proof_budget: Option<Arc<OutboardBudget>>,
 ) -> afs_error::Result<Option<VerifiedPeerChunk<'a>>>
 where
@@ -3019,6 +3048,7 @@ where
         moved: std::time::Duration::ZERO,
         ok: false,
     };
+    let mut verify_elapsed = std::time::Duration::ZERO;
     while let Some(frame) = {
         let started = std::time::Instant::now();
         let next = stream.next().await;
@@ -3030,10 +3060,15 @@ where
             Some(dfs_read_ranges_frame::Body::Data(bytes)) => bytes.len() as u64,
             _ => 0,
         };
+        let verify_started = std::time::Instant::now();
         decoder.accept(frame, out)?;
+        verify_elapsed += verify_started.elapsed();
         if let Some(metrics) = metrics {
             metrics.copy("frame_to_attempt", copied);
         }
+    }
+    if let Some(metrics) = phase_metrics {
+        metrics.observe_phase("grpc", "verify", verify_elapsed);
     }
     // EOF, including a possible late gRPC Status, precedes proof creation.
     let result = match chunk {
@@ -3943,9 +3978,14 @@ fn validate_dfs_rdma_read_reply(
 fn grpc_with_move_metrics(
     transfer: GrpcChunkTransfer,
     metrics: Option<crate::node::dfs_read::DfsReadMoveMetrics>,
+    phase_metrics: Option<crate::node::dfs_read::DfsReadPayloadMetrics>,
 ) -> GrpcChunkTransfer {
-    match metrics {
+    let transfer = match metrics {
         Some(metrics) => transfer.with_move_metrics(metrics),
+        None => transfer,
+    };
+    match phase_metrics {
+        Some(metrics) => transfer.with_phase_metrics(metrics),
         None => transfer,
     }
 }
@@ -3957,6 +3997,7 @@ pub fn make_chunk_transfer(
     timeout: Duration,
     rdma: Option<Arc<DfsRdmaPool>>,
     move_metrics: Option<crate::node::dfs_read::DfsReadMoveMetrics>,
+    phase_metrics: Option<crate::node::dfs_read::DfsReadPayloadMetrics>,
 ) -> afs_error::Result<Arc<dyn crate::node::dfs_read::ChunkTransfer>> {
     match mode {
         DataMode::Rdma => Ok(Arc::new(RdmaChunkTransfer::new(
@@ -3971,12 +4012,14 @@ pub fn make_chunk_transfer(
                 Ok(Arc::new(grpc_with_move_metrics(
                     GrpcChunkTransfer::new(peers, timeout)?,
                     move_metrics,
+                    phase_metrics,
                 )))
             }
         }
         DataMode::Grpc => Ok(Arc::new(grpc_with_move_metrics(
             GrpcChunkTransfer::new(peers, timeout)?,
             move_metrics,
+            phase_metrics,
         ))),
     }
 }
@@ -9707,7 +9750,7 @@ mod tests {
                 .unwrap()
                 .into_inner();
             let mut output = vec![0; payload.len()];
-            consume_peer_read_stream(&request, None, &mut output, stream, None, None, None)
+            consume_peer_read_stream(&request, None, &mut output, stream, None, None, None, None)
                 .await
                 .unwrap();
             assert_eq!(output, payload);
@@ -10181,6 +10224,7 @@ mod tests {
             tokio_stream::iter(frames.into_iter().map(Ok)),
             Some(&metrics),
             None,
+            None,
             Some(budget.clone()),
         )
         .await
@@ -10269,6 +10313,7 @@ mod tests {
                     tokio_stream::iter(stream),
                     None,
                     None,
+                    None,
                     Some(budget.clone()),
                 )
                 .await
@@ -10301,6 +10346,7 @@ mod tests {
             Some(&metrics),
             None,
             None,
+            None,
         )
         .await
         .unwrap()
@@ -10323,6 +10369,45 @@ mod tests {
 
     #[cfg(feature = "dfs")]
     #[tokio::test]
+    async fn plain_stream_records_observation_only_verify_phase() {
+        let body: Vec<u8> = (0..(256 * 1024) + 5)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let (chunk, request, frames) = verified_object_frames(&body);
+        let registry = afs_metrics::Registry::new();
+        let payload = crate::node::dfs_read::DfsReadPayloadMetrics::register(&registry).unwrap();
+        let mut out = vec![0; body.len()];
+        let verified = consume_peer_read_stream(
+            &request,
+            Some(&chunk),
+            &mut out,
+            tokio_stream::iter(frames.into_iter().map(Ok)),
+            None,
+            None,
+            Some(&payload),
+            None,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(verified.bytes(), body);
+        let text = afs_metrics::encode_text(&registry).unwrap();
+        let verify_line = format!(
+            "afs_dfs_read_phase_seconds_count{{phase={quote}verify{quote},transport={quote}grpc{quote}}} 1\n",
+            quote = '"',
+        );
+        assert!(text.contains(&verify_line), "{text}");
+        // Observation-only sampling must not record prepared-payload delivery
+        // samples for the plain streaming path.
+        assert!(
+            text.contains(
+                "afs_dfs_read_payload_seconds_count{result=\"ok\",transport=\"grpc\"} 0\n"
+            ),
+            "{text}"
+        );
+    }
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
     async fn verified_peer_stream_rejects_server_consistent_wrong_meta_root() {
         let (mut chunk, request, frames) = verified_object_frames(b"peer-consistent body");
         chunk.content_digest.bytes[0] ^= 1;
@@ -10332,6 +10417,7 @@ mod tests {
             Some(&chunk),
             &mut out,
             tokio_stream::iter(frames.into_iter().map(Ok)),
+            None,
             None,
             None,
             None,
@@ -10361,6 +10447,7 @@ mod tests {
                     Some(&chunk),
                     &mut out,
                     tokio_stream::iter(stream),
+                    None,
                     None,
                     None,
                     None,
@@ -10780,9 +10867,15 @@ mod tests {
             .is_err()
         );
 
-        let _transfer =
-            make_chunk_transfer(DataMode::Auto, peers, Duration::from_millis(10), None, None)
-                .unwrap();
+        let _transfer = make_chunk_transfer(
+            DataMode::Auto,
+            peers,
+            Duration::from_millis(10),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(
             make_chunk_transfer(
                 DataMode::Rdma,
@@ -10795,6 +10888,7 @@ mod tests {
                     .unwrap()
                 ),
                 Duration::from_millis(10),
+                None,
                 None,
                 None
             )

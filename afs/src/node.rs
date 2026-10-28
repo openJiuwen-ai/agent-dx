@@ -2136,6 +2136,7 @@ async fn run_node(
                     Arc::new(
                         rpc::peer::GrpcChunkTransfer::new(peer_connections.clone(), timeout)?
                             .with_move_metrics(dfs_read_move_metrics.clone())
+                            .with_phase_metrics(dfs_read_payload_metrics.clone())
                             .with_read_group(grpc_group),
                     )
                 } else {
@@ -2145,6 +2146,7 @@ async fn run_node(
                         timeout,
                         dfs_rdma_pool.clone(),
                         Some(dfs_read_move_metrics.clone()),
+                        Some(dfs_read_payload_metrics.clone()),
                     )?
                 }
             } else if let Some(runtime) = &hixl_runtime {
