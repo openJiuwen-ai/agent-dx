@@ -236,7 +236,10 @@ async fn terminal_case(native: bool) {
     environment.install("other", "other-instance").await;
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"ssh","port":port}]})).unwrap();
-    state.publish("tenant", &template).await.unwrap();
+    state
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
+        .await
+        .unwrap();
     let api = Arc::new(AgentApi {
         managed: Arc::new(adx_agent_api::managed::ManagedService::new(Arc::new(
             remote_control(adx_activator::Activator::new(state.clone(), environment)).await,
@@ -298,7 +301,7 @@ async fn terminal_case(native: bool) {
         let target = SshRoute {
             target: Target::Template {
                 name: "demo".into(),
-                version: "1".into(),
+                template_ref: adx_agent_core::TemplateRef::Version("1".into()),
             },
             port: None,
             trace: None,
@@ -329,7 +332,7 @@ async fn terminal_case(native: bool) {
         let query = adx_agent_core::activator::BindingList {
             tenant: "tenant".into(),
             template: "demo".into(),
-            version: "1".into(),
+            template_ref: adx_agent_core::TemplateRef::Version("1".into()),
             page_size: 10,
             page_token: None,
         };
@@ -359,7 +362,7 @@ async fn terminal_case(native: bool) {
             urn.parse::<Target>().unwrap(),
             Target::Binding {
                 name: "demo".into(),
-                version: "1".into(),
+                template_ref: adx_agent_core::TemplateRef::Version("1".into()),
                 id: id.into()
             }
         );
@@ -367,7 +370,7 @@ async fn terminal_case(native: bool) {
             .binding(&Scope {
                 tenant: "tenant".into(),
                 template: "demo".into(),
-                version: "1".into(),
+                template_ref: adx_agent_core::TemplateRef::Version("1".into()),
                 binding_id: id.into(),
             })
             .await

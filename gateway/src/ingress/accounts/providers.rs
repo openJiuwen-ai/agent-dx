@@ -479,6 +479,9 @@ impl ModelConfig {
                 return Err(Error::Configuration);
             }
         }
+        if !self.points_per_budget_unit.is_finite() || self.points_per_budget_unit <= 0.0 {
+            return Err(Error::Configuration);
+        }
         if !self.max_budget.is_finite()
             || self.max_budget <= 0.0
             || self.rpm_limit == 0
@@ -580,25 +583,40 @@ impl LiteLlm {
             .map(|_| ())
             .ok_or(Error::Unavailable)
     }
-    fn quota_from_info(&self, info: &Value) -> QuotaResponse {
-        fn amount(value: &Value) -> Option<f64> {
-            let parsed = value.as_f64().or_else(|| value.as_str()?.parse().ok())?;
-            (parsed.is_finite() && parsed >= 0.0).then_some(parsed)
+    fn quota_from_info(&self, info: &Value) -> Result<QuotaResponse> {
+        fn amount(value: &Value, factor: f64) -> Result<Option<f64>> {
+            let Some(parsed) = value
+                .as_f64()
+                .or_else(|| value.as_str()?.parse().ok())
+                .filter(|value| value.is_finite() && *value >= 0.0)
+            else {
+                return Ok(None);
+            };
+            let points = parsed * factor;
+            if !points.is_finite() {
+                return Err(Error::Unavailable);
+            }
+            Ok(Some(points))
         }
-        let total = amount(&info["max_budget"]);
-        let used = amount(&info["spend"]);
+        let total = amount(&info["max_budget"], self.config.points_per_budget_unit)?;
+        let used = amount(&info["spend"], self.config.points_per_budget_unit)?;
         let known = total.is_some() && used.is_some();
         let balance = match (total, used) {
-            (Some(total), Some(used)) => ((total - used) * 1_000_000.0).round() / 1_000_000.0,
-            _ => -1.0,
+            (Some(total), Some(used)) => {
+                ((total - used).max(0.0) * 1_000_000.0).round() / 1_000_000.0
+            }
+            _ => 0.0,
         };
+        if !balance.is_finite() {
+            return Err(Error::Unavailable);
+        }
         let reset_period = info["budget_duration"].as_str().unwrap_or("").to_owned();
         let reset_at = if reset_period.is_empty() {
             String::new()
         } else {
             info["budget_reset_at"].as_str().unwrap_or("").to_owned()
         };
-        QuotaResponse {
+        Ok(QuotaResponse {
             ok: true,
             available: true,
             quota: ModelQuota {
@@ -610,7 +628,7 @@ impl LiteLlm {
                 reset_period,
                 reset_at,
             },
-        }
+        })
     }
 }
 #[async_trait]
@@ -675,7 +693,7 @@ impl ModelProvider for LiteLlm {
             .key_info(user_id, key)
             .await?
             .ok_or(Error::Unavailable)?;
-        Ok(self.quota_from_info(&info))
+        self.quota_from_info(&info)
     }
 }
 
@@ -882,34 +900,59 @@ mod tests {
     }
 
     #[test]
-    fn key_spend_is_displayed_as_points_without_conversion() {
+    fn key_spend_is_displayed_as_points_with_configured_conversion() {
         let config: ModelConfig = serde_json::from_value(json!({
             "management_url":"https://litellm.example.com",
             "api_base":"https://litellm.example.com/v1",
             "admin_key_env":"UNUSED",
-            "max_budget":5.0,
-            "budget_duration":null,
+            "max_budget":15.0,
+            "points_per_budget_unit":2.0,
+            "budget_duration":"1d",
             "rpm_limit":30,
             "tpm_limit":30000
         }))
         .unwrap();
-        let provider = LiteLlm::with_key(config, "admin".into()).unwrap();
-        let quota = provider.quota_from_info(&json!({"max_budget":5.0,"spend":1.25}));
-        assert_eq!(
-            (quota.quota.total, quota.quota.used, quota.quota.balance),
-            (5.0, 1.25, 3.75)
-        );
-        assert!(!quota.quota.low_balance && !quota.quota.exhausted);
-        let unknown = provider.quota_from_info(&json!({}));
+        let provider = LiteLlm::with_key(config.clone(), "admin".into()).unwrap();
+        for (spend, expected, low_balance, exhausted) in [
+            (3.75, (30.0, 7.5, 22.5), false, false),
+            (13.5, (30.0, 27.0, 3.0), true, false),
+            (15.0, (30.0, 30.0, 0.0), true, true),
+            (16.0, (30.0, 32.0, 0.0), true, true),
+            (20.0, (30.0, 40.0, 0.0), true, true),
+        ] {
+            let quota = provider
+                .quota_from_info(&json!({
+                    "max_budget":15.0,"spend":spend,
+                    "budget_duration":"1d","budget_reset_at":"2026-10-30T00:00:00+08:00"
+                }))
+                .unwrap();
+            assert_eq!(
+                (quota.quota.total, quota.quota.used, quota.quota.balance),
+                expected
+            );
+            assert_eq!(quota.quota.low_balance, low_balance);
+            assert_eq!(quota.quota.exhausted, exhausted);
+            assert_eq!(quota.quota.reset_period, "1d");
+            assert_eq!(quota.quota.reset_at, "2026-10-30T00:00:00+08:00");
+        }
+        let unknown = provider.quota_from_info(&json!({})).unwrap();
         assert_eq!(
             (
                 unknown.quota.total,
                 unknown.quota.used,
                 unknown.quota.balance
             ),
-            (-1.0, -1.0, -1.0)
+            (-1.0, -1.0, 0.0)
         );
         assert!(!unknown.quota.exhausted);
+        assert!(provider
+            .quota_from_info(&json!({"max_budget":f64::MAX,"spend":0.0}))
+            .is_err());
+        for factor in [0.0, -1.0, f64::INFINITY, f64::NAN] {
+            let mut invalid = config.clone();
+            invalid.points_per_budget_unit = factor;
+            assert!(matches!(invalid.validate(), Err(Error::Configuration)));
+        }
     }
     #[test]
     fn huawei_identity_requires_signature_application_issuer_and_expiry() {

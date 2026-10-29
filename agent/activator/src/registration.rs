@@ -5,7 +5,7 @@ use adx_agent_store::discovery::RedisRegistry;
 use serde::Deserialize;
 use std::time::Duration;
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegistrationConfig {
     pub instance_id: String,

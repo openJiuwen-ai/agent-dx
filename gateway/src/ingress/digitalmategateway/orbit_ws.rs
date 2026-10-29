@@ -1,4 +1,4 @@
-//! Session admission for a fixed template; transport stays in shared Gateway forwarding.
+//! Session admission for a configured template reference; transport stays in shared Gateway forwarding.
 use super::entrypoint::{agent_error, auth_error, error};
 use crate::ingress::{
     accounts::{BusinessAuth, Principal, SessionGuard},
@@ -20,7 +20,7 @@ pub struct OrbitWsConfig {
     #[serde(default = "super::entrypoint::request_timeout")]
     pub request_timeout_seconds: u64,
     pub template: String,
-    pub version: String,
+    pub template_ref: String,
     pub backend_path: String,
     pub service_port: u16,
 }
@@ -42,7 +42,7 @@ impl OrbitWsConfig {
         let scope = Scope {
             tenant: tenant.into(),
             template: self.template.clone(),
-            version: self.version.clone(),
+            template_ref: self.template_ref.parse().map_err(Error::Invalid)?,
             binding_id: format!("orbit-{}", hex::encode(Sha256::digest(tuple))),
         };
         scope.validate().map_err(Error::Invalid)?;
@@ -216,10 +216,108 @@ mod tests {
         OrbitWsConfig {
             request_timeout_seconds: 60,
             template: "orbit".into(),
-            version: "1".into(),
+            template_ref: "1".into(),
             backend_path: "/ws".into(),
             service_port: 18092,
         }
+    }
+
+    #[test]
+    fn orbit_alias_reference_preserves_user_binding_and_workspace_identity() {
+        let fixed = config().scope("tenant", "alice").unwrap();
+        let config: OrbitWsConfig = serde_json::from_value(serde_json::json!({
+            "template": "orbit", "template_ref": "production",
+            "backend_path": "/ws", "service_port": 18092
+        }))
+        .unwrap();
+        config.validate("tenant").unwrap();
+        let alias = config.scope("tenant", "alice").unwrap();
+        assert_eq!(alias.binding_id, fixed.binding_id);
+        assert_eq!(alias.template, fixed.template);
+        assert_eq!(alias.tenant, fixed.tenant);
+        assert_eq!(
+            alias.template_ref,
+            adx_agent_core::TemplateRef::Alias("production".into())
+        );
+        assert_ne!(
+            alias.binding_id,
+            config.scope("tenant", "bob").unwrap().binding_id
+        );
+        assert_ne!(
+            alias.binding_id,
+            config.scope("other", "alice").unwrap().binding_id
+        );
+        let workspace = super::super::entrypoint::workspace_parameters;
+        assert_eq!(
+            workspace(&alias.tenant, &alias.template, "alice").unwrap(),
+            workspace(&fixed.tenant, &fixed.template, "alice").unwrap()
+        );
+    }
+
+    #[test]
+    fn orbit_template_reference_requires_one_valid_version_or_alias() {
+        for reference in [serde_json::json!("1"), serde_json::json!("production")] {
+            let config: OrbitWsConfig = serde_json::from_value(serde_json::json!({
+                "template": "orbit", "template_ref": reference,
+                "backend_path": "/ws", "service_port": 18092
+            }))
+            .unwrap();
+            config.validate("tenant").unwrap();
+        }
+        for reference in [
+            serde_json::json!({}),
+            serde_json::json!({"version": "1", "alias": "production"}),
+            serde_json::json!(""),
+            serde_json::json!("\n"),
+        ] {
+            let config = serde_json::from_value::<OrbitWsConfig>(serde_json::json!({
+                "template": "orbit", "template_ref": reference,
+                "backend_path": "/ws", "service_port": 18092
+            }));
+            assert!(config.is_err() || config.unwrap().validate("tenant").is_err());
+        }
+    }
+
+    #[test]
+    fn orbit_volume_template_keeps_existing_workspace_directory() {
+        use adx_agent_core::{mounts::Parameters, volumes::VolumeSource};
+        let draft: adx_agent_core::TemplateDraft = serde_json::from_str(include_str!(
+            "../../../../agent/activator/examples/orbit-sfs-template.json"
+        ))
+        .unwrap();
+        draft.validate().unwrap();
+        let template = draft.with_version("1".into());
+        let parameters = Parameters::from([
+            ("workspace".into(), "w-existing-user".into()),
+            ("model_api_base".into(), "https://model.example/v1".into()),
+            ("model_api_key".into(), "synthetic-key".into()),
+        ]);
+        let volumes = template.render_volumes(&parameters).unwrap();
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0].id, "orbit-workspace-w-existing-user");
+        let VolumeSource::Directory {
+            storage_domain,
+            path,
+        } = &volumes[0].source;
+        assert_eq!(storage_domain, "sfs");
+        assert_eq!(
+            format!("/mnt/sfs/{path}"),
+            "/mnt/sfs/workspaces/w-existing-user"
+        );
+        assert!(volumes[0].create_if_missing);
+        let options = volumes[0].create_options.as_ref().unwrap();
+        assert_eq!(
+            (options.uid, options.gid, options.mode.as_str()),
+            (10001, 10001, "0700")
+        );
+        let mounts = template.render_mounts(&parameters).unwrap();
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].volume_id.as_deref(), Some(volumes[0].id.as_str()));
+        assert!(mounts[0].host_path.is_empty());
+        assert_eq!(mounts[0].target, "/data/state");
+        let mut next = template.clone();
+        next.version = "2".into();
+        assert_eq!(volumes, next.render_volumes(&parameters).unwrap());
     }
 
     #[test]
@@ -234,9 +332,12 @@ mod tests {
             assert_ne!(alice.binding_id, other.binding_id);
         }
         assert_eq!(alice.template, "orbit");
-        assert_eq!(alice.version, "1");
+        assert_eq!(
+            alice.template_ref,
+            adx_agent_core::TemplateRef::Version("1".into())
+        );
         let mut next = config.clone();
-        next.version = "2".into();
+        next.template_ref = "2".into();
         assert_eq!(
             alice.binding_id,
             next.scope("tenant", "alice").unwrap().binding_id

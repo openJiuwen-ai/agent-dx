@@ -46,7 +46,7 @@ fn scope() -> Scope {
     Scope {
         tenant: "tenant".into(),
         template: "app".into(),
-        version: "1".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
         binding_id: "env".into(),
     }
 }
@@ -76,7 +76,12 @@ async fn caller_deadline_distinguishes_remote_reads_and_possible_writes() {
     ));
     let ctx = context();
     assert!(matches!(
-        ctx.run(control.publish(&ctx, "tenant", &template())).await,
+        ctx.run(control.publish(
+            &ctx,
+            "tenant",
+            &adx_agent_core::TemplateDraft::from(&template())
+        ))
+        .await,
         Err(Error::OutcomeUnknown(_))
     ));
 }
@@ -85,7 +90,13 @@ async fn timed_out_activation_keeps_identity_for_another_replica() {
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let a = remote_control(Activator::new(state.clone(), Arc::new(StalledEnvironment))).await;
     let b = remote_control(Activator::new(state, Arc::new(StalledEnvironment))).await;
-    a.publish(&context(), "tenant", &template()).await.unwrap();
+    a.publish(
+        &context(),
+        "tenant",
+        &adx_agent_core::TemplateDraft::from(&template()),
+    )
+    .await
+    .unwrap();
     let ctx = context();
     assert!(matches!(
         ctx.run(a.activate(&ctx, &scope(), None)).await,
@@ -161,7 +172,11 @@ async fn remote_activation_passes_the_original_deadline_to_environment_create() 
     ))
     .await;
     client
-        .publish(&context(), "tenant", &template())
+        .publish(
+            &context(),
+            "tenant",
+            &adx_agent_core::TemplateDraft::from(&template()),
+        )
         .await
         .unwrap();
     let ctx = context();

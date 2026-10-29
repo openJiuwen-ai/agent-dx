@@ -130,9 +130,9 @@ curl -i 'https://<gateway-host>/api/v1/auth/quota' \
   "ok": true,
   "available": true,
   "quota": {
-    "total": 5.0,
-    "balance": 3.75,
-    "used": 1.25,
+    "total": 30.0,
+    "balance": 22.5,
+    "used": 7.5,
     "low_balance": false,
     "exhausted": false,
     "reset_period": "",
@@ -145,17 +145,19 @@ curl -i 'https://<gateway-host>/api/v1/auth/quota' \
 | --- | --- | --- |
 | `ok` | boolean | 请求成功时为 `true`。 |
 | `available` | boolean | 当前成功响应固定为 `true`；**不要用它判断是否仍有额度**。 |
-| `quota.total` | number | LiteLLM key 的 `max_budget`，按 1:1 数值显示为积分。 |
-| `quota.used` | number | LiteLLM key 的 `spend`，按 1:1 数值显示为已用积分。 |
-| `quota.balance` | number | `total - used`，保留到小数点后最多 6 位；超额时可能为负数。 |
+| `quota.total` | number | LiteLLM key 的 `max_budget × points_per_budget_unit`，显示为总积分。 |
+| `quota.used` | number | LiteLLM key 的 `spend × points_per_budget_unit`，显示为已用积分。 |
+| `quota.balance` | number | `max(total - used, 0)`，保留到小数点后最多 6 位；超额时显示 `0`，已用积分和实际消费记录不截断。 |
 | `quota.low_balance` | boolean | `total > 0` 且已使用至少 90% 时为 `true`。 |
 | `quota.exhausted` | boolean | 总额和已用量均可读取，且 `balance <= 0` 时为 `true`。客户端应优先检查此字段。 |
 | `quota.reset_period` | string | LiteLLM key 的 `budget_duration`；一次性额度返回空字符串。 |
 | `quota.reset_at` | string | 有重置周期时返回 LiteLLM 的 `budget_reset_at`；一次性额度返回空字符串。 |
 
-如果 LiteLLM 没有返回有效的 `max_budget` 或 `spend`，对应的 `total`、`used` 和无法计算的 `balance` 使用 `-1` 表示未知。此时 `exhausted` 不会仅因数据缺失而变为 `true`；客户端不要把 `-1` 当作可用余额。
+如果 LiteLLM 没有返回有效的 `max_budget` 或 `spend`，对应的 `total` 或 `used` 使用 `-1` 表示未知，无法计算的 `balance` 返回 `0`。此时 `exhausted` 不会仅因数据缺失而变为 `true`；客户端不能仅凭 `balance: 0` 判断额度已耗尽。
 
-**计量口径：** 这些数字是积分展示值，取自 LiteLLM 的金额预算与消费记录，并非输入/输出 token 数量。当前代码按 1:1 显示 LiteLLM 的预算数值，没有进行 token 换算。仓库[账号配置示例](../../gateway/examples/accounts.json)设置 `max_budget: 5.0`、`budget_duration: "1d"`，表示每天 5 积分。配合 [MaaS 统一计价配置](../../build/config/examples/litellm-maas.md)，每百万输入加输出 token（含缓存输入）计 1 积分，对应每日 500 万 token；此时 spend 不代表上游实际美元成本。LiteLLM 1.104.2 按配置的 UTC 零点重置，即北京时间 08:00；并发或进行中的请求可能超额。实际额度由部署配置和用户现有 LiteLLM key 决定，已有 Key 需通过管理 API 单独更新。
+**计量口径：** 这些数字是积分展示值，并非输入/输出 token 数量。账号配置中的 `litellm.points_per_budget_unit` 指定每个 LiteLLM 预算单位对应多少积分，必须为有限正数，默认 `1.0`。仓库[账号配置示例](../../gateway/examples/accounts.json)设置 `max_budget: 15.0`、`points_per_budget_unit: 2.0`、`budget_duration: "1d"`：当 LiteLLM 按人民币元记录模型价格和消费时，每天 15 元预算显示为 30 积分；已用 3.75 元时显示已用 7.5 积分、剩余 22.5 积分。换算只影响额度响应，不改写 LiteLLM 的预算、消费记录、模型价格、限流或重置时间。缺失数值的 `-1` 哨兵不参与换算；数值换算溢出返回 `503 AUTH_UNAVAILABLE`，不会返回无效 JSON 数字。
+
+模型价格、峰谷时段、预算周期与重置时区由 LiteLLM 部署配置决定，积分倍率不选择峰谷价格。倍率在 Ingress 启动时读取；发布新配置并重启后，对新旧 Key 的后续额度查询统一生效。已有 Key 的预算需通过 LiteLLM 管理 API 单独更新；修改账号配置中的 `max_budget` 仅影响新建 Key。进行中或并发的模型请求可能超出预算。
 
 ### 查询时的行为
 

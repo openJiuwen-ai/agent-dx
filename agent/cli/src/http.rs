@@ -34,12 +34,12 @@ impl HttpArgs {
         let target = match &self.binding_id {
             Some(id) => Target::Binding {
                 name: self.scope.template.clone(),
-                version: self.scope.version.clone(),
+                template_ref: self.scope.version.parse().map_err(Error::Invalid)?,
                 id: id.clone(),
             },
             None => Target::Template {
                 name: self.scope.template.clone(),
-                version: self.scope.version.clone(),
+                template_ref: self.scope.version.parse().map_err(Error::Invalid)?,
             },
         };
         target

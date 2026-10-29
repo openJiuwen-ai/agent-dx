@@ -17,12 +17,30 @@ use std::{
 /// Product operations shared by the independent HTTP client and embedded Activator.
 #[async_trait]
 pub trait Control: Send + Sync {
+    async fn resolve(
+        &self,
+        ctx: &RequestContext,
+        request: &ResolveRequest,
+    ) -> Result<ResolvedTarget>;
+    async fn binding_view(&self, ctx: &RequestContext, scope: &Scope) -> Result<BindingView>;
+    async fn update_alias(
+        &self,
+        ctx: &RequestContext,
+        request: &AliasUpdate,
+    ) -> Result<AliasSnapshot>;
+    async fn alias_config(
+        &self,
+        _ctx: &RequestContext,
+        _request: &AliasRequest,
+    ) -> Result<AliasSnapshot> {
+        Err(Error::Unsupported("alias configuration unavailable".into()))
+    }
     async fn publish(
         &self,
         ctx: &RequestContext,
         tenant: &str,
-        template: &TemplateVersion,
-    ) -> Result<()>;
+        template: &adx_agent_core::TemplateDraft,
+    ) -> Result<TemplateVersion>;
     async fn template(
         &self,
         ctx: &RequestContext,
@@ -248,12 +266,52 @@ impl ActivatorClient {
 
 #[async_trait]
 impl Control for ActivatorClient {
+    async fn resolve(
+        &self,
+        ctx: &RequestContext,
+        request: &ResolveRequest,
+    ) -> Result<ResolvedTarget> {
+        self.request(
+            ctx,
+            "bindings/resolve",
+            request,
+            true,
+            Some(&request.activation.scope),
+        )
+        .await
+    }
+    async fn binding_view(&self, ctx: &RequestContext, scope: &Scope) -> Result<BindingView> {
+        self.request(
+            ctx,
+            "bindings/view",
+            &ScopeRequest {
+                scope: scope.clone(),
+            },
+            false,
+            Some(scope),
+        )
+        .await
+    }
+    async fn update_alias(
+        &self,
+        ctx: &RequestContext,
+        request: &AliasUpdate,
+    ) -> Result<AliasSnapshot> {
+        self.request(ctx, "aliases/put", request, true, None).await
+    }
+    async fn alias_config(
+        &self,
+        ctx: &RequestContext,
+        request: &AliasRequest,
+    ) -> Result<AliasSnapshot> {
+        self.request(ctx, "aliases/get", request, false, None).await
+    }
     async fn publish(
         &self,
         ctx: &RequestContext,
         tenant: &str,
-        template: &TemplateVersion,
-    ) -> Result<()> {
+        template: &adx_agent_core::TemplateDraft,
+    ) -> Result<TemplateVersion> {
         ActivatorClient::publish(self, ctx, tenant, template).await
     }
     async fn template(
@@ -327,8 +385,8 @@ impl ActivatorClient {
         &self,
         ctx: &RequestContext,
         tenant: &str,
-        template: &TemplateVersion,
-    ) -> Result<()> {
+        template: &adx_agent_core::TemplateDraft,
+    ) -> Result<TemplateVersion> {
         self.request(
             ctx,
             "templates/publish",

@@ -61,12 +61,12 @@ pub fn arguments(
     let target = match &ssh.binding_id {
         Some(id) => Target::Binding {
             name: ssh.scope.template.clone(),
-            version: ssh.scope.version.clone(),
+            template_ref: ssh.scope.version.parse().map_err(Error::Invalid)?,
             id: id.clone(),
         },
         None => Target::Template {
             name: ssh.scope.template.clone(),
-            version: ssh.scope.version.clone(),
+            template_ref: ssh.scope.version.parse().map_err(Error::Invalid)?,
         },
     };
     let route = SshRoute {
@@ -165,7 +165,7 @@ mod tests {
             route.target,
             Target::Binding {
                 name: "demo agent".into(),
-                version: "1".into(),
+                template_ref: adx_agent_core::TemplateRef::Version("1".into()),
                 id: "my env".into()
             }
         );

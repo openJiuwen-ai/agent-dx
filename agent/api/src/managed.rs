@@ -28,11 +28,15 @@ impl ManagedService {
     /// Select an AgentBinding identity without creating product or Environment state.
     /// Returns Invalid for a direct instance target or invalid scope components.
     pub fn binding_scope(tenant: &str, target: &AccessTarget) -> Result<Scope> {
-        let (name, version, id) = match target {
-            AccessTarget::Template { name, version } => {
-                (name, version, uuid::Uuid::new_v4().to_string())
+        let (name, template_ref, id) = match target {
+            AccessTarget::Template { name, template_ref } => {
+                (name, template_ref.clone(), uuid::Uuid::new_v4().to_string())
             }
-            AccessTarget::Binding { name, version, id } => (name, version, id.clone()),
+            AccessTarget::Binding {
+                name,
+                template_ref,
+                id,
+            } => (name, template_ref.clone(), id.clone()),
             AccessTarget::Instance(_) => {
                 return Err(Error::Invalid(
                     "managed access requires a template or binding target".into(),
@@ -42,37 +46,18 @@ impl ManagedService {
         let scope = Scope {
             tenant: tenant.into(),
             template: name.clone(),
-            version: version.clone(),
+            template_ref,
             binding_id: id,
         };
         scope.validate().map_err(Error::Invalid)?;
         Ok(scope)
     }
-    /// Select a declared service port before activation.
-    /// Returns Invalid when the protocol and optional port do not identify exactly one service.
-    pub fn select_service(
-        template: &TemplateVersion,
-        protocol: Protocol,
-        port: Option<u16>,
-    ) -> Result<u16> {
-        let mut ports = template
-            .service
-            .iter()
-            .filter(|s| s.protocol == protocol && port.is_none_or(|p| p == s.port))
-            .map(|s| s.port);
-        match (ports.next(), ports.next()) {
-            (Some(port), None) => Ok(port),
-            _ => Err(Error::Invalid(
-                "service must identify exactly one declared protocol/port".into(),
-            )),
-        }
-    }
     pub async fn publish(
         &self,
         ctx: &RequestContext,
         tenant: &str,
-        template: &TemplateVersion,
-    ) -> Result<()> {
+        template: &adx_agent_core::TemplateDraft,
+    ) -> Result<TemplateVersion> {
         self.control.publish(ctx, tenant, template).await
     }
     pub async fn template(
@@ -109,6 +94,80 @@ impl ManagedService {
             .cloned()
         })
         .await
+    }
+
+    pub async fn binding_template(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+    ) -> Result<TemplateVersion> {
+        match &scope.template_ref {
+            TemplateRef::Version(version) => {
+                self.template(ctx, &scope.tenant, &scope.template, version)
+                    .await
+            }
+            TemplateRef::Alias(_) => Ok(self.binding_view(ctx, scope).await?.template),
+        }
+    }
+    /// Return metadata selected by Activator, with no activation side effects.
+    pub async fn binding_view(
+        &self,
+        ctx: &RequestContext,
+        scope: &Scope,
+    ) -> Result<activator::BindingView> {
+        scope.validate().map_err(Error::Invalid)?;
+        let view = ctx.run(self.control.binding_view(ctx, scope)).await?;
+        if view.template.name != scope.template
+            || matches!(&scope.template_ref, TemplateRef::Version(version) if version != &view.template.version)
+            || view.binding.as_ref().is_some_and(|binding| {
+                binding.scope != *scope || binding.current.version != view.template.version
+            })
+        {
+            return Err(Error::Unavailable(
+                "Binding/template identity mismatch".into(),
+            ));
+        }
+        view.template.validate().map_err(Error::Invalid)?;
+        Ok(view)
+    }
+    pub async fn update_alias(
+        &self,
+        ctx: &RequestContext,
+        request: &activator::AliasUpdate,
+    ) -> Result<activator::AliasSnapshot> {
+        request.config.validate().map_err(Error::Invalid)?;
+        self.control.update_alias(ctx, request).await
+    }
+
+    pub async fn alias_config(
+        &self,
+        ctx: &RequestContext,
+        tenant: &str,
+        template: &str,
+        alias: &str,
+    ) -> Result<activator::AliasSnapshot> {
+        for value in [tenant, template, alias] {
+            identifier(value, "alias scope").map_err(Error::Invalid)?;
+        }
+        let snapshot = self
+            .control
+            .alias_config(
+                ctx,
+                &activator::AliasRequest {
+                    tenant: tenant.into(),
+                    template: template.into(),
+                    alias: alias.into(),
+                },
+            )
+            .await?;
+        if snapshot.config.tenant != tenant
+            || snapshot.config.template != template
+            || snapshot.config.alias != alias
+        {
+            return Err(Error::Unavailable("alias identity mismatch".into()));
+        }
+        snapshot.config.validate().map_err(Error::Unavailable)?;
+        Ok(snapshot)
     }
 
     pub async fn binding(&self, ctx: &RequestContext, scope: &Scope) -> Result<AgentBinding> {
@@ -164,14 +223,14 @@ impl ManagedService {
         ctx: &RequestContext,
         scope: &Scope,
         protocol: Protocol,
-        port: u16,
+        port: Option<u16>,
         generation: &str,
     ) -> Result<(Target, u16)> {
         self.resolve_generation(
             ctx,
             scope,
             protocol,
-            Some(port),
+            port,
             ActivationInput {
                 generation: Some(generation),
                 bypass_cache: true,
@@ -211,30 +270,38 @@ impl ManagedService {
         input: ActivationInput<'_>,
     ) -> Result<(Target, u16)> {
         scope.validate().map_err(Error::Invalid)?;
-        let template = self
-            .template(ctx, &scope.tenant, &scope.template, &scope.version)
-            .await?;
-        let port = Self::select_service(&template, protocol, port)?;
-        let target = self
-            .control
-            .activate_with_parameters(
-                ctx,
-                scope,
-                input.generation,
-                input.bypass_cache,
-                input.parameters,
-            )
-            .await?;
+        let request = activator::ResolveRequest {
+            activation: activator::ActivationRequest {
+                scope: scope.clone(),
+                expected_generation: input.generation.map(str::to_owned),
+                bypass_cache: input.bypass_cache,
+                parameters: input.parameters.map(<[u8]>::to_vec),
+            },
+            service: activator::ServiceSelector { protocol, port },
+        };
+        let resolved = ctx.run(self.control.resolve(ctx, &request)).await?;
+        let target = resolved.target;
+        let selected_port = resolved.port;
+        if matches!(&scope.template_ref, TemplateRef::Version(version) if version != &target.binding.current.version)
+        {
+            return Err(Error::Unavailable(
+                "Activator returned another template version".into(),
+            ));
+        }
         if target.binding.scope != *scope
             || target.binding.phase != BindingPhase::Active
             || target.binding.generation.is_empty()
-            || target.binding.environment_id.is_empty()
-            || target.service != template.service
+            || target.binding.current.environment_id.is_empty()
+            || port.is_some_and(|port| port != selected_port)
+            || !target
+                .service
+                .iter()
+                .any(|service| service.protocol == protocol && service.port == selected_port)
         {
             return Err(Error::Unavailable(
                 "Activator target identity or service mismatch".into(),
             ));
         }
-        Ok((target, port))
+        Ok((target, selected_port))
     }
 }

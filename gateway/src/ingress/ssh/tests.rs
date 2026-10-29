@@ -43,7 +43,7 @@ fn terminal_notice_returns_a_reusable_binding_identity() {
         urn.parse::<Target>().unwrap(),
         Target::Binding {
             name: "demo".into(),
-            version: "1".into(),
+            template_ref: adx_agent_core::TemplateRef::Version("1".into()),
             id: scope.binding_id.clone()
         }
     );

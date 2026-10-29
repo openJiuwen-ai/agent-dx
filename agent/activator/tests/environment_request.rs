@@ -88,7 +88,7 @@ fn rendered_mounts_reach_the_shared_public_request() {
 #[test]
 fn template_idle_pause_policy_reaches_the_public_environment_request() {
     let template: adx_agent_core::TemplateVersion = serde_json::from_value(json!({
-        "name":"app", "version":"sleep", "image":"app:1", "isolation_runtime":"runsc",
+        "name":"app", "version":"1", "image":"app:1", "isolation_runtime":"runsc",
         "resources":{"cpu_millis":500,"memory_mib":1024},
         "lifecycle":{"idle_timeout_seconds":600,"idle_action":"pause",
             "pause":{"retention":{"kind":"forever"},"timeout_seconds":300,"storage":"shared"}}
@@ -109,7 +109,7 @@ fn template_idle_pause_policy_reaches_the_public_environment_request() {
 #[test]
 fn template_readiness_reaches_the_public_environment_request() {
     let template: adx_agent_core::TemplateVersion = serde_json::from_value(json!({
-        "name":"jiuwen", "version":"ready", "image":"jiuwen:1", "isolation_runtime":"runsc",
+        "name":"jiuwen", "version":"1", "image":"jiuwen:1", "isolation_runtime":"runsc",
         "resources":{"cpu_millis":1000,"memory_mib":1024},
         "service":[{"protocol":"ws","port":18092}],
         "init_timeout_seconds":30,
@@ -132,7 +132,7 @@ fn template_readiness_reaches_the_public_environment_request() {
 #[test]
 fn template_healthcheck_reaches_platform_with_failure_threshold() {
     let template: adx_agent_core::TemplateVersion = serde_json::from_value(json!({
-        "name":"jiuwen", "version":"health", "image":"jiuwen:1", "isolation_runtime":"runc",
+        "name":"jiuwen", "version":"1", "image":"jiuwen:1", "isolation_runtime":"runc",
         "resources":{"cpu_millis":1000,"memory_mib":1024},
         "healthcheck":{"tcp_socket":{"port":18092}, "initial_delay_seconds":5,
             "period_seconds":10,"timeout_seconds":2,"failure_threshold":3}

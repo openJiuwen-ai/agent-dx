@@ -1,5 +1,5 @@
 //! Authenticated Gateway/Activator contracts. No platform runtime state is persisted here.
-use crate::{AgentBinding, Scope, Service, TemplateVersion};
+use crate::{AgentBinding, Scope, Service};
 use serde::{Deserialize, Serialize};
 
 pub const DEADLINE_HEADER: &str = "x-adx-deadline-ms";
@@ -22,6 +22,48 @@ pub struct ActivationRequest {
     #[serde(default)]
     pub parameters: Option<Vec<u8>>,
 }
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceSelector {
+    pub protocol: crate::Protocol,
+    pub port: Option<u16>,
+}
+impl ServiceSelector {
+    /// Returns an error unless the selector identifies exactly one declared service.
+    pub fn select(&self, services: &[Service]) -> Result<u16, String> {
+        let mut ports = services
+            .iter()
+            .filter(|service| {
+                service.protocol == self.protocol
+                    && self.port.is_none_or(|port| port == service.port)
+            })
+            .map(|service| service.port);
+        match (ports.next(), ports.next()) {
+            (Some(port), None) => Ok(port),
+            _ => Err("service must identify exactly one declared protocol/port".into()),
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveRequest {
+    pub activation: ActivationRequest,
+    pub service: ServiceSelector,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolvedTarget {
+    pub target: Target,
+    pub port: u16,
+}
+/// One read-only Binding snapshot and the immutable template for its actual version.
+/// Before first activation, binding is None and template is selected from the desired state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BindingView {
+    pub binding: Option<AgentBinding>,
+    pub template: crate::TemplateVersion,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TemplateRequest {
@@ -33,7 +75,26 @@ pub struct TemplateRequest {
 #[serde(deny_unknown_fields)]
 pub struct PublishRequest {
     pub tenant: String,
-    pub template: TemplateVersion,
+    pub template: crate::TemplateDraft,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AliasRequest {
+    pub tenant: String,
+    pub template: String,
+    pub alias: String,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AliasUpdate {
+    pub config: crate::alias::AliasConfig,
+    pub expected_revision: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AliasSnapshot {
+    pub config: crate::alias::AliasConfig,
+    pub revision: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Target {
@@ -47,7 +108,7 @@ pub struct Target {
 pub struct BindingList {
     pub tenant: String,
     pub template: String,
-    pub version: String,
+    pub template_ref: crate::TemplateRef,
     #[serde(default = "default_page_size")]
     pub page_size: usize,
     #[serde(default)]
@@ -67,12 +128,13 @@ pub struct BindingPage {
 impl BindingList {
     pub fn validate(&self) -> crate::ValidationResult {
         for (label, value) in [
-            ("tenant", &self.tenant),
-            ("template", &self.template),
-            ("version", &self.version),
+            ("tenant", self.tenant.as_str()),
+            ("template", self.template.as_str()),
+            ("template reference", self.template_ref.name()),
         ] {
             crate::identifier(value, label)?;
         }
+        self.template_ref.validate()?;
         if !(1..=crate::limits::BINDING_PAGE_SIZE).contains(&self.page_size)
             || self.page_token.as_ref().is_some_and(|v| v.len() > 16384)
         {

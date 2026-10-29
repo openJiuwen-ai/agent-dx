@@ -30,6 +30,7 @@ impl Activator {
     pub(super) async fn activate_environment(
         &self,
         binding: &AgentBinding,
+        environment: &adx_agent_core::EnvironmentRef,
         mut execution: ExecutionSpec,
         volumes: &[VolumeSpec],
         deadline: u64,
@@ -39,11 +40,11 @@ impl Activator {
                 deadline.saturating_sub(adx_agent_core::unix_time_millis()),
             ))
             .ok_or_else(|| Error::Invalid("activation deadline is out of range".into()))?;
-        let mut fixed = BTreeMap::new();
+        let mut fixed: BTreeMap<String, String> = binding.volumes.clone();
         let mut backoff = 50_u64;
         let mut retry = false;
         loop {
-            if retry && self.state.binding(&binding.scope).await?.as_ref() != Some(binding) {
+            if retry && !self.reference_is_active(binding, environment).await? {
                 return Err(Error::Conflict("binding changed during activation".into()));
             }
             let remaining = deadline_at.saturating_duration_since(Instant::now());
@@ -56,7 +57,7 @@ impl Activator {
                 for volume in volumes {
                     let reference = self
                         .environment
-                        .ensure_volume(&binding.scope.tenant, &binding.environment_id, volume)
+                        .ensure_volume(&binding.scope.tenant, &environment.environment_id, volume)
                         .await?;
                     if reference.id != volume.id
                         || fixed
@@ -68,6 +69,19 @@ impl Activator {
                         ));
                     }
                     fixed.insert(reference.id, reference.uid);
+                }
+                self.state
+                    .fix_volumes(binding, &fixed)
+                    .await
+                    .map_err(|error| EnvironmentError::Conflict(error.to_string()))?;
+                if !self
+                    .reference_is_active(binding, environment)
+                    .await
+                    .map_err(|error| EnvironmentError::Conflict(error.to_string()))?
+                {
+                    return Err(EnvironmentError::Conflict(
+                        "Env reference is no longer active".into(),
+                    ));
                 }
                 for mount in &mut execution.mounts {
                     if let Some(id) = &mount.volume_id {
@@ -83,14 +97,14 @@ impl Activator {
                 }
                 match self
                     .environment
-                    .get(&binding.scope.tenant, &binding.environment_id)
+                    .get(&binding.scope.tenant, &environment.environment_id)
                     .await?
                 {
                     Some(observed) => Ok(observed),
                     None => {
                         self.environment
                             .create(&CreateEnvironment {
-                                id: binding.environment_id.clone(),
+                                id: environment.environment_id.clone(),
                                 tenant: binding.scope.tenant.clone(),
                                 execution: execution.clone(),
                                 deadline_unix_ms: Some(deadline),

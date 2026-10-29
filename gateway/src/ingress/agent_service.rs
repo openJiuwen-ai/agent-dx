@@ -27,6 +27,7 @@ pub struct ServiceSelection {
     scope: Scope,
     protocol: Protocol,
     port: u16,
+    requested_port: Option<u16>,
     environment_id: String,
     generation: String,
     retried: bool,
@@ -100,7 +101,8 @@ impl AgentV2Access {
             scope,
             protocol: selector.protocol,
             port,
-            environment_id: target.binding.environment_id,
+            requested_port: selector.port,
+            environment_id: target.binding.current.environment_id,
             generation: target.binding.generation,
             retried: false,
             parameters: parameters.map(<[u8]>::to_vec),
@@ -151,7 +153,7 @@ impl AgentV2Access {
                 &selection.context,
                 &selection.scope,
                 selection.protocol,
-                selection.port,
+                selection.requested_port,
                 &selection.generation,
             ))
             .await;
@@ -181,7 +183,7 @@ impl AgentV2Access {
                         &selection.context,
                         &selection.scope,
                         selection.protocol,
-                        Some(selection.port),
+                        selection.requested_port,
                         selection.parameters.as_deref(),
                         true,
                     ))
@@ -189,7 +191,7 @@ impl AgentV2Access {
             }
             result => result?,
         };
-        selection.environment_id = target.binding.environment_id;
+        selection.environment_id = target.binding.current.environment_id;
         selection.generation = target.binding.generation;
         selection.port = port;
         Ok(true)

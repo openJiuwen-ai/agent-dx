@@ -7,8 +7,11 @@ use std::{collections::BTreeSet, fmt};
 
 mod redis_store;
 pub use redis_store::RedisRepository;
+mod notifications;
+pub use notifications::{MetadataChange, RedisChanges};
 mod state;
 pub use state::AgentState;
+mod aliases;
 #[cfg(feature = "test-memory")]
 mod memory;
 #[cfg(feature = "test-memory")]
@@ -32,38 +35,54 @@ impl std::error::Error for Error {}
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Key(String, Option<Index>);
+pub struct Key(String, Vec<Index>);
 
 /// Derived ordered index; updated with its records in the same transaction.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Index(String);
 impl Index {
-    pub fn bindings(tenant: &str, template: &str, version: &str) -> Result<Self> {
-        for value in [tenant, template, version] {
+    pub fn bindings(
+        tenant: &str,
+        template: &str,
+        reference: &adx_agent_core::TemplateRef,
+    ) -> Result<Self> {
+        for value in [tenant, template, reference.name()] {
             adx_agent_core::identifier(value, "index scope").map_err(Error::Invalid)?;
         }
         Ok(Self(format!(
             "bindings:{}",
-            adx_agent_core::encode_key(&[tenant, template, version])
+            adx_agent_core::encode_key(&[tenant, template, reference.kind(), reference.name()])
         )))
+    }
+    pub fn all_bindings() -> Self {
+        Self("all-bindings".into())
     }
 }
 impl Key {
     pub fn new(kind: &str, parts: &[&str]) -> Result<Self> {
-        if !matches!(kind, "template" | "binding" | "binding-launch")
-            || parts.is_empty()
+        if !matches!(
+            kind,
+            "template" | "template-sequence" | "binding" | "binding-launch" | "alias"
+        ) || parts.is_empty()
             || parts.iter().any(|s| s.is_empty() || s.len() > 2048)
         {
             return Err(Error::Invalid("invalid record key".into()));
         }
-        let index = if kind == "binding" && parts.len() == 4 {
-            Some(Index::bindings(parts[0], parts[1], parts[2])?)
-        } else {
-            None
-        };
+        let mut indexes = Vec::new();
+        if kind == "binding" {
+            indexes.push(Index::all_bindings());
+            if parts.len() == 5 {
+                let reference = match parts[2] {
+                    "version" => adx_agent_core::TemplateRef::Version(parts[3].into()),
+                    "alias" => adx_agent_core::TemplateRef::Alias(parts[3].into()),
+                    _ => return Err(Error::Invalid("invalid Binding template reference".into())),
+                };
+                indexes.push(Index::bindings(parts[0], parts[1], &reference)?);
+            }
+        }
         Ok(Self(
             format!("{kind}:{}", adx_agent_core::encode_key(parts)),
-            index,
+            indexes,
         ))
     }
     pub fn as_str(&self) -> &str {
@@ -85,6 +104,10 @@ impl Revision {
     }
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+    pub fn parse(value: &str) -> Result<Self> {
+        uuid::Uuid::parse_str(value).map_err(|_| Error::Invalid("invalid revision".into()))?;
+        Ok(Self(value.into()))
     }
 }
 

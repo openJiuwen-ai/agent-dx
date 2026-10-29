@@ -19,7 +19,9 @@ adx --token-file /run/secrets/adx-token env get demo --template assistant --vers
 adx --token-file /run/secrets/adx-token env delete demo --template assistant --version 1
 ```
 
-`template.json` 使用 [Agent Template](../README.md) 的 `name/version/image/isolation_runtime/env/resources/service` 配置。发布的模板版本不可变；查询和列举 AgentBinding 不激活 Environment，删除会调用服务端删除流程。指定 ID 的 AgentBinding 创建由 HTTP/WS/SSH 访问流量或 resolve 请求触发，CLI 不提供显式创建命令。
+`template.json` 使用 [Agent Template](../README.md) 的 `name/image/isolation_runtime/env/resources/service` 配置。发布文件不填写 version，响应返回服务端分配的递增数字版本，发布的模板版本不可变；查询和列举 AgentBinding 不激活 Environment，删除会调用服务端删除流程。指定 ID 的 AgentBinding 创建由 HTTP/WS/SSH 访问流量或 resolve 请求触发，CLI 不提供显式创建命令。
+
+`--version` 接受数字版本或非数字 Alias，HTTP/SSH 和管理查询采用相同解析规则；例如 `--version production`。
 
 `env list` 每次仅请求一页，返回 `bindings` 和 `next_page_token`。后续页传 `--page-token`；默认页大小 50，上限 100。同一 token 只能用于同一租户、模板和版本。列表反映 ADX 元数据，不表示实时 Environment 健康状态；并发更新时不保证快照。
 
@@ -64,7 +66,7 @@ CLI 使用 `/agent/http` 和管理命令相同的租户 API Key。`--path` 为 H
 }
 ```
 
-管理命令的正常结果打印到 stdout，默认使用格式化 JSON；`--output json` 输出单行 JSON，不附加说明文字。诊断写入 stderr；成功退出码为 0，失败为 1，Ctrl-C 为 130。客户端不自动重放请求，也不跟随重定向；写请求发送后中断可能已经提交，应通过 get/list 回查原身份。Ctrl-C 不保证取消已经提交的服务端操作。
+管理命令的正常结果打印到 stdout，默认使用格式化 JSON；`--output json` 输出单行 JSON，不附加说明文字。诊断写入 stderr；成功退出码为 0，失败为 1，Ctrl-C 为 130。客户端不自动重放请求，也不跟随重定向；写请求发送后中断可能已经提交，应通过 get/list 回查原身份。模板发布可能已分配新版本，不能盲目重发；通过受控管理通路核对序列和模板记录。Ctrl-C 不保证取消已经提交的服务端操作。
 
 ## SSH 交互终端
 

@@ -129,7 +129,7 @@ fn embedded_create_returns_rpc_failure_on_normal_worker_stack() {
                 AgentState::new(Arc::new(MemoryRepository::default())), adapter,
             ))));
             let context = RequestContext::new(std::time::Duration::from_secs(5));
-            control.publish(&context, "tenant", &template).await.unwrap();
+            control.publish(&context, "tenant", &adx_agent_core::TemplateDraft::from(&template)).await.unwrap();
             let api = Arc::new(data_plane_gateway::ingress::agent_api::AgentApi {
                 managed: Arc::new(ManagedService::new(control)),
                 request_timeout: std::time::Duration::from_secs(5),

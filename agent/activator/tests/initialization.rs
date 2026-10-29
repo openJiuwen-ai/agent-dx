@@ -45,7 +45,7 @@ fn scope() -> Scope {
     Scope {
         tenant: "tenant".into(),
         template: "app".into(),
-        version: "1".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
         binding_id: "alice".into(),
     }
 }
@@ -56,7 +56,9 @@ async fn initialize_once_and_ignore_even_malformed_parameters_across_activators(
     let platform = Arc::new(Capture::default());
     let a = Activator::new(state.clone(), platform.clone());
     let b = Activator::new(state.clone(), platform.clone());
-    a.publish("tenant", &template()).await.unwrap();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&template()))
+        .await
+        .unwrap();
     let scope = scope();
     let first = a
         .activate_with_parameters(
@@ -107,7 +109,9 @@ async fn invalid_initialization_has_no_binding_or_environment_side_effect() {
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let platform = Arc::new(Capture::default());
     let a = Activator::new(state.clone(), platform.clone());
-    a.publish("tenant", &template()).await.unwrap();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&template()))
+        .await
+        .unwrap();
     for input in [
         None,
         Some(b"workspace=../bad&model_url=x".as_slice()),
@@ -129,7 +133,9 @@ async fn concurrent_first_access_uses_the_winning_parameters() {
     let platform = Arc::new(Capture::default());
     let a = Activator::new(state.clone(), platform.clone());
     let b = Activator::new(state.clone(), platform.clone());
-    a.publish("tenant", &template()).await.unwrap();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&template()))
+        .await
+        .unwrap();
     let scope = scope();
     let deadline = unix_time_millis() + 60000;
     let (left, right) = tokio::join!(

@@ -5,7 +5,7 @@ use adx_agent_core::{target::Target, Protocol, Scope, TemplateVersion};
 fn binding_selection_generates_an_identity_and_reuses_an_explicit_one() {
     let template = Target::Template {
         name: "demo".into(),
-        version: "1".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
     };
     let selected = ManagedService::binding_scope("tenant-a", &template).unwrap();
     uuid::Uuid::parse_str(&selected.binding_id).unwrap();
@@ -14,13 +14,13 @@ fn binding_selection_generates_an_identity_and_reuses_an_explicit_one() {
         Scope {
             tenant: "tenant-a".into(),
             template: "demo".into(),
-            version: "1".into(),
+            template_ref: adx_agent_core::TemplateRef::Version("1".into()),
             binding_id: selected.binding_id.clone(),
         }
     );
     let explicit = Target::Binding {
         name: "demo".into(),
-        version: "1".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
         id: selected.binding_id.clone(),
     };
     assert_eq!(
@@ -63,14 +63,42 @@ fn service_selection_matches_protocol_and_requires_an_unambiguous_port() {
         (Protocol::Ssh, Some(2222), 2222),
     ] {
         assert_eq!(
-            ManagedService::select_service(&template, protocol, port).unwrap(),
+            adx_agent_core::activator::ServiceSelector { protocol, port }
+                .select(&template.service)
+                .map_err(Error::Invalid)
+                .unwrap(),
             expected
         );
     }
     for (protocol, port) in [(Protocol::Ssh, None), (Protocol::Http, Some(22))] {
         assert!(matches!(
-            ManagedService::select_service(&template, protocol, port),
+            adx_agent_core::activator::ServiceSelector { protocol, port }
+                .select(&template.service)
+                .map_err(Error::Invalid),
             Err(Error::Invalid(_))
         ));
+    }
+}
+
+#[test]
+fn unified_binding_targets_select_numeric_versions_and_named_aliases() {
+    for (reference, expected) in [
+        ("12", adx_agent_core::TemplateRef::Version("12".into())),
+        (
+            "production",
+            adx_agent_core::TemplateRef::Alias("production".into()),
+        ),
+        (
+            "v1-workspace",
+            adx_agent_core::TemplateRef::Alias("v1-workspace".into()),
+        ),
+    ] {
+        let target = format!("urn:adx:binding:orbit:{reference}:user")
+            .parse()
+            .unwrap();
+        let scope = ManagedService::binding_scope("tenant", &target).unwrap();
+        assert_eq!(scope.template_ref, expected);
+        assert_eq!(scope.binding_id, "user");
+        assert_eq!(Target::from(&scope), target);
     }
 }

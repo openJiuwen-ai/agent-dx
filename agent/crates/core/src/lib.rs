@@ -54,21 +54,81 @@ pub fn encode_key(parts: &[&str]) -> String {
 pub struct Scope {
     pub tenant: String,
     pub template: String,
-    pub version: String,
+    pub template_ref: TemplateRef,
     pub binding_id: String,
 }
 
 impl Scope {
     pub fn validate(&self) -> ValidationResult {
         for (label, value) in [
-            ("tenant", &self.tenant),
-            ("template", &self.template),
-            ("version", &self.version),
-            ("binding_id", &self.binding_id),
+            ("tenant", self.tenant.as_str()),
+            ("template", self.template.as_str()),
+            ("template reference", self.template_ref.name()),
+            ("binding_id", self.binding_id.as_str()),
         ] {
             identifier(value, label)?;
         }
+        self.template_ref.validate()?;
         Ok(())
+    }
+}
+
+/// The template reference is part of the logical identity; its resolved version is not.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemplateRef {
+    Version(String),
+    Alias(String),
+}
+impl TemplateRef {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Version(value) | Self::Alias(value) => value,
+        }
+    }
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Version(_) => "version",
+            Self::Alias(_) => "alias",
+        }
+    }
+}
+
+/// Published versions are canonical positive u64 decimal strings.
+pub fn version_number(value: &str) -> Result<u64, String> {
+    let number = value
+        .parse::<u64>()
+        .map_err(|_| "version must be a positive decimal u64".to_owned())?;
+    if number == 0 || number.to_string() != value {
+        return Err("version must be a canonical positive decimal u64".into());
+    }
+    Ok(number)
+}
+pub fn alias_name(value: &str) -> ValidationResult {
+    identifier(value, "alias")?;
+    if value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("alias must not be purely numeric".into());
+    }
+    Ok(())
+}
+impl std::str::FromStr for TemplateRef {
+    type Err = String;
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let reference = if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+            Self::Version(value.into())
+        } else {
+            Self::Alias(value.into())
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
+}
+impl TemplateRef {
+    pub fn validate(&self) -> ValidationResult {
+        match self {
+            Self::Version(value) => version_number(value).map(|_| ()),
+            Self::Alias(value) => alias_name(value),
+        }
     }
 }
 
@@ -117,6 +177,34 @@ impl Resources {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct TemplateDraft {
+    pub name: String,
+    pub image: String,
+    pub isolation_runtime: String,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    pub resources: Resources,
+    #[serde(
+        default,
+        skip_serializing_if = "lifecycle::LifecyclePolicy::is_default"
+    )]
+    pub lifecycle: lifecycle::LifecyclePolicy,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<mounts::Mount>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<volumes::VolumeSpec>,
+    #[serde(default)]
+    pub service: Vec<Service>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_timeout_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_probe: Option<probes::ReadinessProbe>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub healthcheck: Option<probes::Healthcheck>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TemplateVersion {
     pub name: String,
     pub version: String,
@@ -142,6 +230,48 @@ pub struct TemplateVersion {
     pub readiness_probe: Option<probes::ReadinessProbe>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub healthcheck: Option<probes::Healthcheck>,
+}
+
+impl TemplateDraft {
+    pub fn validate(&self) -> ValidationResult {
+        self.with_version("1".into()).validate()
+    }
+    /// Attach the server-assigned version to this immutable publication snapshot.
+    pub fn with_version(&self, version: String) -> TemplateVersion {
+        TemplateVersion {
+            version,
+            name: self.name.clone(),
+            image: self.image.clone(),
+            isolation_runtime: self.isolation_runtime.clone(),
+            env: self.env.clone(),
+            resources: self.resources.clone(),
+            lifecycle: self.lifecycle.clone(),
+            mounts: self.mounts.clone(),
+            volumes: self.volumes.clone(),
+            service: self.service.clone(),
+            init_timeout_seconds: self.init_timeout_seconds,
+            readiness_probe: self.readiness_probe.clone(),
+            healthcheck: self.healthcheck.clone(),
+        }
+    }
+}
+impl From<&TemplateVersion> for TemplateDraft {
+    fn from(template: &TemplateVersion) -> Self {
+        Self {
+            name: template.name.clone(),
+            image: template.image.clone(),
+            isolation_runtime: template.isolation_runtime.clone(),
+            env: template.env.clone(),
+            resources: template.resources.clone(),
+            lifecycle: template.lifecycle.clone(),
+            mounts: template.mounts.clone(),
+            volumes: template.volumes.clone(),
+            service: template.service.clone(),
+            init_timeout_seconds: template.init_timeout_seconds,
+            readiness_probe: template.readiness_probe.clone(),
+            healthcheck: template.healthcheck.clone(),
+        }
+    }
 }
 
 impl TemplateVersion {
@@ -185,6 +315,7 @@ impl TemplateVersion {
             .collect()
     }
     pub fn validate(&self) -> ValidationResult {
+        version_number(&self.version)?;
         for (label, value) in [
             ("name", &self.name),
             ("version", &self.version),
@@ -258,12 +389,46 @@ pub enum BindingPhase {
 pub struct AgentBinding {
     pub scope: Scope,
     pub generation: String,
-    /// Stable Platform identity, including across retries and runtime pause/resume.
-    pub environment_id: String,
+    pub current: EnvironmentRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary: Option<SecondaryEnv>,
     /// Product deletion intent only; Environment runtime state belongs to Platform.
     pub phase: BindingPhase,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub parameters: mounts::Parameters,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub volumes: BTreeMap<String, String>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentRef {
+    pub version: String,
+    pub environment_id: String,
+}
+impl EnvironmentRef {
+    pub fn new(version: String, environment_id: String) -> Self {
+        Self {
+            version,
+            environment_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecondaryIntent {
+    Preparing,
+    Retiring,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecondaryEnv {
+    pub environment: EnvironmentRef,
+    pub intent: SecondaryIntent,
+}
+
+pub mod alias;
 
 pub mod discovery;

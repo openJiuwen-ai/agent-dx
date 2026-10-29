@@ -1,6 +1,6 @@
 # Activator
 
-Activator 是无状态产品控制模块，可作为独立进程 `adx-activator`，也可嵌入 API Server 所在进程。多个副本连接相同 ADX Redis namespace，通过条件写提交唯一 AgentBinding 身份。独立模式调用 API Server 的现有 Environment HTTP 管理接口；嵌入式模式直接调用 API Server 的 Environment 应用服务。独立模式可通过 Redis 注册成员租约；无选主、生命周期所有权或恢复扫描。
+Activator 是无状态产品控制模块，可作为独立进程 `adx-activator`，也可嵌入 API Server 所在进程。多个副本连接相同 ADX Redis namespace，通过条件写提交唯一 AgentBinding 身份。独立模式调用 API Server 的现有 Environment HTTP 管理接口；嵌入式模式直接调用 API Server 的 Environment 应用服务。独立模式可通过 Redis 注册成员租约；启用别名目标态收敛后按 Rendezvous Hash 分工，无选主或逐 Binding 排他工作锁，不承担 Environment 健康恢复。
 
 Gateway 在独立模式通过 ActivatorClient 发起 HTTP 请求，在嵌入式模式通过 LocalControl 直接调用 Activator。公开认证与业务流量转发留在 Gateway；Activator 管理 Template/AgentBinding 状态。配置见[Agent 进程配置](../README.md#进程配置)。
 
@@ -12,20 +12,26 @@ Agent 的 `CreateEnvironment`/`ExecutionSpec` 在本 crate 的 `environment_requ
 
 | 后缀 | 请求 | 行为 |
 | --- | --- | --- |
-| `templates/publish` | tenant、template | 发布不可变版本 |
+| `templates/publish` | tenant、不含 version 的 template | 原子分配数字版本，返回完整 TemplateVersion |
 | `templates/get` | tenant、name、version | 查询模板 |
+| `aliases/get` | tenant、template、alias | 查询最新配置和 revision |
+| `aliases/put` | config、expected_revision? | 校验已发布版本并 CAS 保存完整分布 |
 | `bindings/get` | scope | 查询产品元数据 |
-| `bindings/list` | tenant、template、version、page_size?、page_token? | 有界分页查询产品元数据，不访问 Environment |
+| `bindings/view` | scope | Activator 解析版本或别名，返回同一次读取的 `{binding, template}`；尚无 Binding 时 binding 为 null，不创建或激活 Env |
+| `bindings/resolve` | activation（scope、expected_generation?、bypasscache?、parameters?）、service（protocol、port?） | Activator 选择实际版本并在创建前校验服务，返回 `{target, port}`；热命中不读取 Redis/Platform |
+| `bindings/list` | tenant、template、template_ref、page_size?、page_token? | 有界分页查询产品元数据，不访问 Environment |
 | `bindings/activate` | scope、expected_generation?、bypasscache?、parameters? | 热命中续期返回 AgentBinding 绑定；未命中或显式 bypass 时读取 Redis 并查询/创建 Environment |
 | `bindings/delete` | scope | 平台确认删除或明确返回 NotFound 后条件清理元数据 |
 
 仅可信服务可传入租户 scope；公网租户认证在 Gateway 完成。端点不持有用户流量，不限制 HTTP/WS/SSH 并发。`x-adx-deadline-ms` 传递入口绝对期限，创建 Environment 时以剩余期限限制 API Server HTTP 等待。API Server 当前不接受此绝对期限：`createTimeoutSeconds` 使用固定配置，使相同创建操作的重试请求体保持一致；后端可能继续运行到自己的期限。参与调用的主机需要同步时钟。写入响应超时不表示拒绝，调用方复用原身份查询或重试。
 
-列表默认每页 50 条，最多 100 条，返回 `bindings` 和 `next_page_token`。分页 token 绑定租户及模板版本，非法参数或跨范围 token 返回 Invalid；模板不存在返回 NotFound。列表包含 Deleting 元数据，不表示平台运行状态，并发更新期间不提供快照。删除完成后的独立回源请求可重建同名 AgentBinding；回源发现 Deleting 返回 Conflict。其他副本的热缓存允许短暂陈旧，删除中的并发请求可能成功或失败。
+列表默认每页 50 条，最多 100 条，返回 `bindings` 和 `next_page_token`。分页 token 绑定租户、模板及 template_ref，非法参数或跨范围 token 返回 Invalid；模板不存在返回 NotFound。列表包含 Deleting 元数据，不表示平台运行状态，并发更新期间不提供快照。删除完成后的独立回源请求可重建同名 AgentBinding；回源发现 Deleting 返回 Conflict。其他副本的热缓存允许短暂陈旧，删除中的并发请求可能成功或失败。
 
 同一次 HTTP/WS 用户请求在 Gateway 内部重试时，携带首次选定的 `expected_generation` 和 `bypasscache: true`。元数据已删除或属于新 generation 时返回 Conflict，不重新创建或转到另一次生命周期；`expected_generation` 不属于用户的调用参数。
 
-`/health/live` 和 `/health/ready` 表示进程启动完成；启动时验证 Redis schema，后续存储故障由回源请求明确返回；热缓存可继续服务。不进行 AgentBinding 后台全表扫描或健康轮询；启用注册后仅周期续租实例成员资格。
+`/health/live` 表示进程存活；未启用别名收敛时 ready 表示启动完成，后续存储故障由回源明确返回。启用收敛时 ready 还要求订阅恢复和初始扫描完成；断线期间 alias 缓存不作为最新状态。不会周期全表扫描或进行 Environment 健康轮询；成员续租与列表刷新独立运行。
+
+发布文件使用 TemplateDraft，不含 version。每次成功发布生成新数字版本（即使内容相同），响应返回完整 TemplateVersion；发布超时可能已经分配编号，不能自动重放，应通过受控管理通路核对序列及模板记录。序列按 tenant/template 隔离，并与快照原子提交；旧数据必须先经运维转换，服务不会自动编号旧字符串版本。
 
 ## 激活缓存
 
@@ -33,7 +39,7 @@ Agent 的 `CreateEnvironment`/`ExecutionSpec` 在本 crate 的 `environment_requ
 
 AgentBinding 缓存按完整 scope 保存已确认的 Target（含 generation、environment_id、service），采用 LRU 和滑动 TTL。`binding_cache.capacity` 默认 200000，设为 0 禁用；`binding_cache.idle_seconds` 默认 18000（5 小时），必须为正。每次命中更新最近访问顺序和时间；持续访问可以无限续期。闲置过期只在下一次请求访问时检查，不触发后台工作。容量满时淘汰最久未访问的条目，不删除权威 AgentBinding 或 Environment。
 
-全热请求直接返回绑定，Redis 和 Environment API 均为零次。未命中或 bypass 先取消旧成功标记，再读取 Redis；平台返回身份一致的 Running/ready 或 Pausing/Paused/Resuming，且元数据复核通过后才填充。失败或取消不恢复旧成功标记，较早在途结果不能覆盖后发刷新。删除入口主动失效本副本缓存；无跨副本失效广播，其他副本可暂时使用旧绑定。TTL 管理闲置数据，不保证实时状态一致，删除过程中请求允许成功或失败。
+`bindings/resolve` 和原始激活的全热请求均使用同一绑定缓存；resolve 在 Activator 校验协议/端口并返回确定的端口，Redis 和 Environment API 均为零次。未命中或 bypass 先取消旧成功标记，再读取 Redis；平台返回身份一致的 Running/ready 或 Pausing/Paused/Resuming，且元数据复核通过后才填充。失败或取消不恢复旧成功标记，较早在途结果不能覆盖后发刷新。删除入口主动失效本副本缓存；启用 registration 时通过 Redis Binding 通知失效其他副本缓存，传播期间允许短暂陈旧；未启用时保留按请求刷新。TTL 管理闲置数据，不保证实时状态一致，删除过程中请求允许成功或失败。
 
 `bypasscache` 默认为 false；true 跳过 AgentBinding 成功绑定，不绕过不可变模板、认证或身份校验，不强制重建 Environment。已有 Running Environment 通过 GET 复用，平台确认不存在时才按原身份 CREATE。HTTP/WS 既有的一次发送前目标重试强制 bypass，并固定 generation；同名重建返回 Conflict，不切换生命周期。SSH 没有新增自动重试。Platform/Environment API 不变。
 
@@ -49,11 +55,11 @@ cargo test --locked -p adx-activator --lib binding_cache_memory_profile -- --ign
 
 ## 实例注册
 
-`registration` 为可选配置；缺省使用静态地址。示例：[discovery.json](examples/discovery.json)。`instance_id` 在活跃副本之间必须唯一，建议重启后保持稳定；`advertise_url` 必须是 Gateway 可直达的单实例地址，不能使用 `0.0.0.0` 或多实例随机负载均衡地址。地址及认证/TLS 校验沿用 ActivatorClient 的传输策略。
+`registration` 为可选配置；配置后同时启用下述别名后台收敛，要求 Redis 通知能力就绪；缺省使用静态地址并按请求处理。示例：[discovery.json](examples/discovery.json)。`instance_id` 在活跃副本之间必须唯一，建议重启后保持稳定；`advertise_url` 必须是 Gateway 可直达的单实例地址，不能使用 `0.0.0.0` 或多实例随机负载均衡地址。地址及认证/TLS 校验沿用 ActivatorClient 的传输策略。
 
 进程绑定监听端口后先注册，再开始服务；注册失败会拒绝启动。默认租约 15 秒，心跳 5 秒；`lease_seconds` 范围 6–300，`heartbeat_seconds` 至少 1 且不超过租约的三分之一。Redis 服务端时间决定租约是否到期，与 AgentBinding 的 5 小时滑动 TTL 独立。正常退出时先停心跳并注销，然后结束 HTTP 服务；异常退出靠租约过期被发现端移除，Gateway 默认最多还需一个刷新周期才看到变更。
 
-每次进程启动生成新的 incarnation，同一个活跃 ID 的其他 incarnation 无法续租或注销它。异常退出后立即用相同 ID 启动可能在旧租约到期前返回 Conflict，调用方应在租约到期后重试。后续续租失败会产生 tracing 警告；不会修改 AgentBinding 元数据或发起 Environment 恢复。注册地址只决定缓存亲和，任何 Activator 仍可通过 Redis 恢复 AgentBinding 身份。
+每次进程启动生成新的 incarnation，同一个活跃 ID 的其他 incarnation 无法续租或注销它。异常退出后立即用相同 ID 启动可能在旧租约到期前返回 Conflict，调用方应在租约到期后重试。后续续租失败会产生 tracing 警告；不会修改 AgentBinding 元数据或发起 Environment 恢复。成员 ID 同时用于请求亲和与后台 Binding 分工，任何 Activator 仍可通过 Redis 恢复 AgentBinding 身份。
 
 ## Environment HTTP 适配契约
 
@@ -106,3 +112,56 @@ Explicit credential/request refusals, missing resources and returned identity
 conflicts fail immediately; transport ambiguity or a missing UID in an ensure
 success remains an unknown outcome. Volume IDs use 1–256 ASCII letters, digits,
 dots, underscores or hyphens, excluding the URL-normalized `.` and `..` segments.
+
+## 别名收敛配置
+
+独立和嵌入式 Activator 均由 `registration` 自动启用后台协调，没有单独的 `reconciliation` 配置字段或启停开关。独立模式示例见 [discovery.json](examples/discovery.json)，嵌入式模式在 `embedded` 内提供同样的 registration：
+
+```json
+{
+  "registration": {
+    "instance_id": "activator-1",
+    "advertise_url": "http://activator-1:8091",
+    "lease_seconds": 15,
+    "heartbeat_seconds": 5
+  }
+}
+```
+
+配置 registration 后自动完成成员注册、租约续租、变更监听、启动恢复扫描和成员变化接管。后台默认并发 8、单次工作期限 60 秒、成员刷新间隔 5 秒；这些是内部默认值，不是部署配置项。省略 registration 时不注册成员、不启动后台协调，保留按请求处理及请求触发缓存刷新。
+
+参与后台收敛的所有副本使用相同 Redis URL/namespace 和各自稳定且唯一的实例 ID。独立模式的请求侧可通过同一 Redis 注册目录发现可调用的 Activator。嵌入式 `advertise_url` 是注册身份地址，不新增内部 HTTP 监听或改变本地调用模式；远程 ActivatorClient 的发现目录不能包含没有内部 HTTP 接口的嵌入式成员。
+
+启用 registration 时，Redis 由部署者配置 `notify-keyspace-events 'K$g'`；Activator 仅检查，不自动修改。需要 CONFIG GET、PSUBSCRIBE 和普通元数据访问权限。启动先确认订阅，再扫描持久化 Binding；断线后先订阅再补读，恢复期间 readiness 返回 503 且 alias 缓存不作为最新状态。成员列表默认每 5 秒刷新，变化后重新分配 owner 并扫描，包括缩容和租约过期。没有周期全量 Binding 扫描；已开始工作的对象按结果短暂退避后继续核对。owner 只用于减少重复调用，CAS 与 Platform 幂等仍为正确性边界。
+
+Scope 请求示例：`{"scope":{"tenant":"tenant","template":"app","template_ref":{"alias":"production"},"binding_id":"workspace"}}`。版本引用改用 `"template_ref":{"version":"1"}`。内部 Scope 保留类型，外部 URN 只通过 reference 是否纯数字解析版本或 Alias。返回的 AgentBinding current/secondary 包含真实版本及 EnvID；Binding generation 在升级期间不变。
+
+Alias 配置统一通过 Ingress 的公开 Agent 管理 API 写入，独立和嵌入式模式使用同一路径与租户 API Key，身份规则与模板发布一致。Ingress 从凭据确定 tenant，从 URL 确定 template/alias；请求体不接受 tenant 覆盖。内部 aliases/put 仅供 Gateway→独立 Activator 服务间 RPC，运维不需要直连该端点或 Redis。
+
+先发布 app 的版本 1、2，再保存完整目标态：
+
+```sh
+curl --fail-with-body -X PUT "$ADX_SERVER_ADDRESS/api/agent/v2/templates/app/aliases/production" \
+  -H "Authorization: Bearer $ADX_TOKEN" \
+  -H 'Content-Type: application/json' \
+  --data-binary '{"seed":"stable","versions":[{"version":"1","weight":9},{"version":"2","weight":1}],"expected_revision":null}'
+```
+
+响应为 `{"alias":{"config":{...},"revision":"..."}}`。更新前 GET 同一路径，将 `alias.revision` 填入 expected_revision，并提交最新完整分布；seed 保持不变。409 表示并发修改，应重读后编辑；超时可能已写入，先查询同一 Alias，不能盲目重试。首次配置和改权都只保存目标态，由后台主动准备，不等待流量触发。
+
+Alias 更新仅分页读取该 tenant/template/alias 的现有 Binding 索引，再按 owner 分工。启动、订阅恢复和成员变化仍进行全量恢复扫描；单个 Binding 通知只入队该对象并失效缓存。
+
+目标模板缺失时不创建新的 secondary。已有 Preparing 候选缺失模板时记录带 scope、版本与 EnvID 的错误，先 CAS 标记 Retiring，再清理候选 Env/卷关联，确认完成后 CAS 清除 secondary；current 保持不变。清理失败或结果未知保留退役引用，后台重试；不会把模板 NotFound 当作完成，也不会因重试不断生成新的候选身份。
+
+用户删除在持久化 Deleting 后，即使前台返回失败或结果未知，owner 仍会接续删除。暂时故障、冲突与未知结果默认约 5 秒后重试；尚需下一步时约 1 秒继续。Invalid/Unsupported 记录阻塞警告后停止主动重试，等待相关变更或恢复扫描；未成功保存 Deleting 的失败不代表删除意图已提交。可通过 Binding GET/list 查看 Deleting/current/secondary，并结合 `Binding convergence waiting or blocked` 的 scope/error 日志排查。未启用 registration 时仍需请求方重试。
+
+current 切换后调用既有 delete，不新增退役协议、连接计数或排空等待。Platform 优雅退出属于外部能力缺口，本次不实现；当前删除会直接清理运行时。删除确认/NotFound 后释放旧 Env 的卷 owner，再 CAS 清除 secondary；未知结果保留引用。Binding 整体删除覆盖两个引用。
+
+真实 Redis 测试（一次性数据库；重连用例会关闭该数据库的普通或 Pub/Sub 连接）：
+
+```sh
+ADX_AGENT_TEST_REDIS_URL=redis://127.0.0.1:6379/0 \
+  cargo test --locked -p adx-activator --test reconciliation -- --ignored --test-threads=1
+```
+
+这些测试使用模拟 Platform，不证明真实运行时、共享文件系统、连接排空或集群端到端行为。

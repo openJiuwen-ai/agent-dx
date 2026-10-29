@@ -7,7 +7,7 @@
   },
   "orbit": {
     "template": "orbit",
-    "version": "v1-workspace",
+    "template_ref": "production",
     "backend_path": "/ws",
     "service_port": 18092
   }

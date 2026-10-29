@@ -29,7 +29,7 @@ fn binding_identity_round_trips_between_wire_scope_and_target() {
     let scope_json = json!({
         "tenant": "tenant-a",
         "template": "assistant",
-        "version": "v1",
+        "template_ref": {"version": "1"},
         "binding_id": "user:a/中文"
     });
     let scope: Scope = serde_json::from_value(scope_json.clone()).unwrap();
@@ -40,7 +40,7 @@ fn binding_identity_round_trips_between_wire_scope_and_target() {
         "binding": {
             "scope": scope_json,
             "generation": "generation-a",
-            "environment_id": "environment-a",
+            "current": {"version":"1", "environment_id":"environment-a"},
             "phase": "active"
         },
         "service": [{"protocol": "ws", "port": 8080}]
@@ -76,7 +76,7 @@ fn internal_response_additions_are_allowed_but_write_specs_remain_strict() {
         serde_json::from_value::<adx_agent_core::environment::EnvironmentObservation>(observation)
             .is_ok()
     );
-    let target = serde_json::json!({"binding":{"environment_id":"s", "scope":{"tenant":"t","template":"a","version":"1","binding_id":"e"}, "generation":"g", "phase":"active"}, "service":[], "future_field":42});
+    let target = serde_json::json!({"binding":{"current":{"version":"1","environment_id":"s"}, "scope":{"tenant":"t","template":"a","template_ref":{"version":"1"},"binding_id":"e"}, "generation":"g", "phase":"active"}, "service":[], "future_field":42});
     assert!(serde_json::from_value::<adx_agent_core::activator::Target>(target).is_ok());
     let execution = serde_json::json!({"image":"app", "isolation_runtime":"runc", "entrypoint":[], "working_dir":"/", "user":null, "env":{}, "resources":{"cpu_millis":1,"memory_mib":1}, "service":[], "future_field":42});
     assert!(

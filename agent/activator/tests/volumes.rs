@@ -100,7 +100,7 @@ fn scope(id: &str) -> Scope {
     Scope {
         tenant: "tenant".into(),
         template: "app".into(),
-        version: "1".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
         binding_id: id.into(),
     }
 }
@@ -110,7 +110,9 @@ async fn activation_ensures_before_create_and_deletion_releases_only_its_binding
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let a = Activator::new(state.clone(), platform.clone());
     let b = Activator::new(state, platform.clone());
-    a.publish("tenant", &template()).await.unwrap();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&template()))
+        .await
+        .unwrap();
     let mut ids = Vec::new();
     for id in ["a", "b"] {
         let binding = a
@@ -124,7 +126,12 @@ async fn activation_ensures_before_create_and_deletion_releases_only_its_binding
             .await
             .unwrap()
             .binding;
-        ids.push(binding.environment_id);
+        assert_eq!(
+            binding.volumes.get("workspace-user").map(String::as_str),
+            Some("fixed-uid"),
+            "activation response must include the committed Volume UID"
+        );
+        ids.push(binding.current.environment_id);
     }
     assert_eq!(platform.owners.lock().unwrap().len(), 2);
     b.delete_binding(&scope("a")).await.unwrap();
@@ -142,7 +149,9 @@ async fn activation_deadline_keeps_binding_volume_association_until_explicit_del
         AgentState::new(Arc::new(MemoryRepository::default())),
         platform.clone(),
     );
-    a.publish("tenant", &template()).await.unwrap();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&template()))
+        .await
+        .unwrap();
     let started = tokio::time::Instant::now();
     assert!(a
         .activate_with_parameters(
@@ -160,7 +169,7 @@ async fn activation_deadline_keeps_binding_volume_association_until_explicit_del
         .owners
         .lock()
         .unwrap()
-        .contains(&binding.environment_id));
+        .contains(&binding.current.environment_id));
     a.delete_binding(&scope("a")).await.unwrap();
     assert!(platform.owners.lock().unwrap().is_empty());
 }
@@ -178,7 +187,10 @@ async fn deterministic_volume_refusals_do_not_consume_the_activation_retry_budge
             AgentState::new(Arc::new(MemoryRepository::default())),
             platform.clone(),
         );
-        activator.publish("tenant", &template()).await.unwrap();
+        activator
+            .publish("tenant", &adx_agent_core::TemplateDraft::from(&template()))
+            .await
+            .unwrap();
         let started = tokio::time::Instant::now();
         let result = activator
             .activate_with_parameters(
@@ -205,4 +217,67 @@ async fn deterministic_volume_refusals_do_not_consume_the_activation_retry_budge
         assert_eq!(started.elapsed(), std::time::Duration::ZERO);
         assert!(platform.executions.lock().unwrap().is_empty());
     }
+}
+
+#[tokio::test]
+async fn alias_upgrade_preserves_volume_uid_and_releases_only_the_retired_owner() {
+    use adx_agent_core::alias::{AliasConfig, VersionWeight};
+    let platform = Arc::new(Platform::default());
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let activator = Activator::new(state.clone(), platform.clone());
+    activator
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template()))
+        .await
+        .unwrap();
+    let mut two = template();
+    two.version = "2".into();
+    two.image = "image:2".into();
+    activator
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&two))
+        .await
+        .unwrap();
+    let mut config = AliasConfig {
+        tenant: "tenant".into(),
+        template: "app".into(),
+        alias: "production".into(),
+        seed: "stable".into(),
+        versions: vec![VersionWeight {
+            version: "1".into(),
+            weight: 1,
+        }],
+    };
+    let revision = state.put_alias(&config, None).await.unwrap();
+    let mut scope = scope("workspace");
+    scope.template_ref = TemplateRef::Alias("production".into());
+    let deadline = unix_time_millis() + 5000;
+    activator
+        .activate_with_parameters(&scope, None, deadline, false, Some(b"user=user"))
+        .await
+        .unwrap();
+    let original = state.binding(&scope).await.unwrap().unwrap();
+    assert_eq!(
+        original.volumes.get("workspace-user").map(String::as_str),
+        Some("fixed-uid")
+    );
+    config.versions = vec![VersionWeight {
+        version: "2".into(),
+        weight: 1,
+    }];
+    state.put_alias(&config, Some(&revision)).await.unwrap();
+    activator.reconcile_binding(&scope, deadline).await.unwrap();
+    let switched = state.binding(&scope).await.unwrap().unwrap();
+    assert_eq!(switched.current.version, "2");
+    assert_eq!(switched.volumes, original.volumes);
+    assert_eq!(
+        platform.owners.lock().unwrap().len(),
+        2,
+        "new owner must exist before old release"
+    );
+    activator.reconcile_binding(&scope, deadline).await.unwrap();
+    assert_eq!(
+        *platform.owners.lock().unwrap(),
+        [switched.current.environment_id].into()
+    );
+    activator.delete_binding(&scope).await.unwrap();
+    assert!(platform.owners.lock().unwrap().is_empty());
 }

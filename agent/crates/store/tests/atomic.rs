@@ -229,5 +229,5 @@ async fn concurrent_namespace_initialization_preserves_current_state() {
         .query_async(&mut connection)
         .await
         .unwrap();
-    assert_eq!(marker, "binding-index-v1");
+    assert_eq!(marker, "binding-numbered-versions-v3");
 }

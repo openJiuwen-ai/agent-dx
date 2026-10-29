@@ -129,7 +129,7 @@ impl DigitalMateGatewayConfig {
         Ok(Scope {
             tenant: self.tenant.clone(),
             template: self.jiuwen.template.clone(),
-            version: self.jiuwen.version.clone(),
+            template_ref: self.jiuwen.version.parse().map_err(Error::Invalid)?,
             binding_id: format!("jiuwen-{}", hex::encode(Sha256::digest(tuple))),
         })
     }
@@ -541,14 +541,11 @@ impl DigitalMateGatewayApi {
         let context = Arc::new(RequestContext::new(Duration::from_secs(
             self.config.jiuwen.download_timeout_seconds,
         )));
-        let template = match self
-            .managed
-            .template(&context, &scope.tenant, &scope.template, &scope.version)
-            .await
-        {
+        let view = match self.managed.binding_view(&context, &scope).await {
             Ok(value) => value,
             Err(e) => return agent_error(e),
         };
+        let template = view.template;
         let workspace = match absolute_directory(
             template
                 .env
@@ -559,10 +556,10 @@ impl DigitalMateGatewayApi {
             Ok(value) => value,
             Err(e) => return agent_error(e),
         };
-        let target = match context.run(self.managed.binding(&context, &scope)).await {
-            Ok(target) if target.phase == adx_agent_core::BindingPhase::Active => target,
-            Ok(_) => return error(StatusCode::CONFLICT, "BINDING_DELETING"),
-            Err(e) => return agent_error(e),
+        let target = match view.binding {
+            Some(target) if target.phase == adx_agent_core::BindingPhase::Active => target,
+            Some(_) => return error(StatusCode::CONFLICT, "BINDING_DELETING"),
+            None => return agent_error(Error::NotFound),
         };
         let user_id = principal.user_id.clone();
         let guard = accounts::SessionGuard {
@@ -573,7 +570,7 @@ impl DigitalMateGatewayApi {
             ingress,
             context,
             tenant: scope.tenant,
-            environment_id: target.environment_id,
+            environment_id: target.current.environment_id,
             workspace,
             user_id,
             agent_type: self.config.jiuwen.agent_type.clone(),
@@ -616,14 +613,18 @@ impl DigitalMateGatewayApi {
         let context = Arc::new(RequestContext::new(Duration::from_secs(
             self.config.jiuwen.download_timeout_seconds,
         )));
-        let config = match DownloadConfig::load(&self.managed, &context, &scope).await {
-            Ok(v) => v,
+        let view = match self.managed.binding_view(&context, &scope).await {
+            Ok(value) => value,
             Err(e) => return agent_error(e),
         };
-        let target = match context.run(self.managed.binding(&context, &scope)).await {
-            Ok(target) if target.phase == adx_agent_core::BindingPhase::Active => target,
-            Ok(_) => return error(StatusCode::CONFLICT, "BINDING_DELETING"),
+        let config = match DownloadConfig::from_template(&view.template) {
+            Ok(value) => value,
             Err(e) => return agent_error(e),
+        };
+        let target = match view.binding {
+            Some(target) if target.phase == adx_agent_core::BindingPhase::Active => target,
+            Some(_) => return error(StatusCode::CONFLICT, "BINDING_DELETING"),
+            None => return agent_error(Error::NotFound),
         };
         let guard = accounts::SessionGuard {
             auth: self.auth.clone(),
@@ -633,7 +634,7 @@ impl DigitalMateGatewayApi {
             ingress,
             context,
             tenant: scope.tenant.clone(),
-            environment_id: target.environment_id,
+            environment_id: target.current.environment_id,
             config,
             token,
             expected_session: None,

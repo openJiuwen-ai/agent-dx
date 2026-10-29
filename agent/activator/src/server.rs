@@ -79,14 +79,27 @@ pub fn router(activator: Arc<Activator>, token: &str, timeout: Duration) -> Resu
     Ok(Router::new()
         .route("/internal/adx/v1/templates/publish", post(publish))
         .route("/internal/adx/v1/templates/get", post(template))
+        .route("/internal/adx/v1/aliases/get", post(alias))
+        .route("/internal/adx/v1/aliases/put", post(update_alias))
         .route("/internal/adx/v1/bindings/get", post(binding))
         .route("/internal/adx/v1/bindings/list", post(bindings))
         .route("/internal/adx/v1/bindings/delete", post(delete))
         .route("/internal/adx/v1/bindings/activate", post(activate))
+        .route("/internal/adx/v1/bindings/resolve", post(resolve))
+        .route("/internal/adx/v1/bindings/view", post(binding_view))
         .layer(DefaultBodyLimit::max(limits::HTTP_JSON_BYTES))
         .route_layer(middleware::from_fn_with_state(s.clone(), authorize))
         .route("/health/live", get(|| async { StatusCode::NO_CONTENT }))
-        .route("/health/ready", get(|| async { StatusCode::NO_CONTENT }))
+        .route(
+            "/health/ready",
+            get(|State(s): State<Service>| async move {
+                if s.activator.ready() {
+                    StatusCode::NO_CONTENT
+                } else {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        )
         .with_state(s))
 }
 async fn publish(
@@ -96,7 +109,7 @@ async fn publish(
 ) -> Response {
     p.start_write();
     match s.activator.publish(&r.tenant, &r.template).await {
-        Ok(()) => Json(()).into_response(),
+        Ok(template) => Json(template).into_response(),
         Err(e) => failure(e),
     }
 }
@@ -104,6 +117,23 @@ async fn template(State(s): State<Service>, Json(r): Json<TemplateRequest>) -> R
     match s.activator.template(&r.tenant, &r.name, &r.version).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => failure(e),
+    }
+}
+async fn alias(State(s): State<Service>, Json(r): Json<AliasRequest>) -> Response {
+    match s.activator.alias_config(&r).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => failure(error),
+    }
+}
+async fn update_alias(
+    State(s): State<Service>,
+    axum::Extension(p): axum::Extension<Arc<RequestProgress>>,
+    Json(r): Json<AliasUpdate>,
+) -> Response {
+    p.start_write();
+    match s.activator.update_alias(&r).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => failure(error),
     }
 }
 async fn binding(State(s): State<Service>, Json(r): Json<ScopeRequest>) -> Response {
@@ -149,5 +179,24 @@ async fn activate(
     {
         Ok(v) => Json(v).into_response(),
         Err(e) => failure(e),
+    }
+}
+
+async fn resolve(
+    State(s): State<Service>,
+    axum::Extension(p): axum::Extension<Arc<RequestProgress>>,
+    axum::Extension(deadline): axum::Extension<u64>,
+    Json(request): Json<ResolveRequest>,
+) -> Response {
+    p.start_write();
+    match s.activator.resolve(&request, deadline).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => failure(error),
+    }
+}
+async fn binding_view(State(s): State<Service>, Json(request): Json<ScopeRequest>) -> Response {
+    match s.activator.binding_view(&request.scope).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => failure(error),
     }
 }

@@ -8,7 +8,7 @@ use adx_agent_api::{
 };
 use adx_agent_core::environment::Environment;
 use adx_agent_core::limits;
-use adx_agent_core::{Protocol, Scope, TemplateVersion};
+use adx_agent_core::{Protocol, Scope};
 use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::BodyExt;
@@ -46,6 +46,7 @@ pub struct EmbeddedActivatorConfig {
     pub sandbox_network: adx_agent_core::network::SandboxNetworkPolicy,
     pub redis_url: String,
     pub namespace: String,
+    pub registration: Option<adx_agent_api::local::RegistrationConfig>,
 }
 pub struct AgentApi {
     pub managed: Arc<ManagedService>,
@@ -121,9 +122,20 @@ impl AgentApi {
                 Error::Invalid("Agent timeout must be positive and representable".into()).into(),
             );
         }
-        let control: Arc<dyn Control> = Arc::new(
-            LocalControl::connect(&settings.redis_url, &settings.namespace, environment).await?,
-        );
+        let control: Arc<dyn Control> = Arc::new(match settings.registration {
+            Some(registration) => {
+                LocalControl::connect_reconciled(
+                    &settings.redis_url,
+                    &settings.namespace,
+                    environment,
+                    registration,
+                )
+                .await?
+            }
+            None => {
+                LocalControl::connect(&settings.redis_url, &settings.namespace, environment).await?
+            }
+        });
         Ok(Self {
             managed: Arc::new(ManagedService::new(control)),
             request_timeout: timeout,
@@ -154,6 +166,13 @@ struct ResolveInput {
     #[serde(default, rename = "bypasscache")]
     bypass_cache: bool,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AliasInput {
+    seed: String,
+    versions: Vec<adx_agent_core::alias::VersionWeight>,
+    expected_revision: Option<String>,
+}
 fn segment(value: &str) -> Result<String, Error> {
     let value = percent_encoding::percent_decode_str(value)
         .decode_utf8()
@@ -183,7 +202,10 @@ impl AgentApi {
             .split('/')
             .collect();
         let listing = parts.method == http::Method::GET
-            && matches!(path.as_slice(), ["templates", _, "versions", _, "bindings"]);
+            && matches!(
+                path.as_slice(),
+                ["templates", _, "versions" | "aliases", _, "bindings"]
+            );
         if !listing && parts.uri.query().is_some() {
             return Err(Error::Invalid(
                 "this managed API does not accept query parameters".into(),
@@ -191,21 +213,27 @@ impl AgentApi {
         }
         let managed = &self.managed;
         if path == ["templates"] && parts.method == http::Method::POST {
-            let input: TemplateVersion = decode_body(body).await?;
+            let input: adx_agent_core::TemplateDraft = decode_body(body).await?;
 
-            managed.publish(ctx, tenant, &input).await?;
-            return Ok(serde_json::json!({"template":input}));
+            let published = managed.publish(ctx, tenant, &input).await?;
+            return Ok(serde_json::json!({"template":published}));
         }
-        let ["templates", name, "versions", version, rest @ ..] = path.as_slice() else {
+        let ["templates", name, kind, reference, rest @ ..] = path.as_slice() else {
             return Err(Error::NotFound);
         };
         let name = segment(name)?;
-        let version = segment(version)?;
+        let reference = segment(reference)?;
+        let template_ref = match *kind {
+            "versions" => adx_agent_core::TemplateRef::Version(reference),
+            "aliases" => adx_agent_core::TemplateRef::Alias(reference),
+            _ => return Err(Error::NotFound),
+        };
+        template_ref.validate().map_err(Error::Invalid)?;
         if rest == ["bindings"] && parts.method == http::Method::GET {
             let mut query = adx_agent_core::activator::BindingList {
                 tenant: tenant.into(),
                 template: name,
-                version,
+                template_ref: template_ref.clone(),
                 page_size: adx_agent_core::activator::default_page_size(),
                 page_token: None,
             };
@@ -229,10 +257,32 @@ impl AgentApi {
             return serde_json::to_value(managed.list_bindings(ctx, &query).await?)
                 .map_err(|_| Error::Unavailable("AgentBinding page serialization failed".into()));
         }
+        if rest.is_empty() && parts.method == http::Method::PUT {
+            let adx_agent_core::TemplateRef::Alias(alias) = &template_ref else {
+                return Err(Error::NotFound);
+            };
+            let input: AliasInput = decode_body(body).await?;
+            let request = adx_agent_core::activator::AliasUpdate {
+                config: adx_agent_core::alias::AliasConfig {
+                    tenant: tenant.into(),
+                    template: name,
+                    alias: alias.clone(),
+                    seed: input.seed,
+                    versions: input.versions,
+                },
+                expected_revision: input.expected_revision,
+            };
+            return Ok(serde_json::json!({"alias":managed.update_alias(ctx, &request).await?}));
+        }
         if rest.is_empty() && parts.method == http::Method::GET {
-            return Ok(
-                serde_json::json!({"template":managed.template(ctx, tenant,&name,&version).await?}),
-            );
+            return match &template_ref {
+                adx_agent_core::TemplateRef::Version(version) => Ok(
+                    serde_json::json!({"template":managed.template(ctx, tenant,&name,version).await?}),
+                ),
+                adx_agent_core::TemplateRef::Alias(alias) => Ok(
+                    serde_json::json!({"alias":managed.alias_config(ctx,tenant,&name,alias).await?}),
+                ),
+            };
         }
         let ["bindings", binding, action @ ..] = rest else {
             return Err(Error::NotFound);
@@ -240,7 +290,7 @@ impl AgentApi {
         let scope = Scope {
             tenant: tenant.into(),
             template: name,
-            version,
+            template_ref: template_ref.clone(),
             binding_id: segment(binding)?,
         };
         scope.validate().map_err(Error::Invalid)?;
@@ -259,7 +309,7 @@ impl AgentApi {
                     .resolve_with_cache(ctx, &scope, input.protocol, input.port, input.bypass_cache)
                     .await?;
                 Ok(
-                    serde_json::json!({"environment_id":target.binding.environment_id,"port":port,"protocol":input.protocol}),
+                    serde_json::json!({"environment_id":target.binding.current.environment_id,"port":port,"protocol":input.protocol}),
                 )
             }
             _ => Err(Error::NotFound),

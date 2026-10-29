@@ -53,7 +53,7 @@ async fn public_management_routes_credentials_and_json_output() {
                 "a+b",
             ],
             "GET",
-            "/api/agent/v2/templates/app%2Fname/versions/v%201/bindings?page_size=2&page_token=a%2Bb",
+            "/api/agent/v2/templates/app%2Fname/aliases/v%201/bindings?page_size=2&page_token=a%2Bb",
         ),
         (
             vec![

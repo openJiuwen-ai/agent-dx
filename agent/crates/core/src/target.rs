@@ -6,11 +6,11 @@ pub enum Target {
     Instance(String),
     Template {
         name: String,
-        version: String,
+        template_ref: crate::TemplateRef,
     },
     Binding {
         name: String,
-        version: String,
+        template_ref: crate::TemplateRef,
         id: String,
     },
 }
@@ -22,11 +22,11 @@ impl FromStr for Target {
             ["urn", "adx", "instance", id] => Ok(Self::Instance(decode(id)?)),
             ["urn", "adx", "template", name, version] => Ok(Self::Template {
                 name: decode(name)?,
-                version: decode(version)?,
+                template_ref: decode(version)?.parse()?,
             }),
             ["urn", "adx", "binding", name, version, id] => Ok(Self::Binding {
                 name: decode(name)?,
-                version: decode(version)?,
+                template_ref: decode(version)?.parse()?,
                 id: decode(id)?,
             }),
             _ => Err("target must be an ADX instance, template or binding URN".into()),
@@ -37,16 +37,34 @@ impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Instance(id) => write!(f, "urn:adx:instance:{}", encode(id)),
-            Self::Template { name, version } => {
-                write!(f, "urn:adx:template:{}:{}", encode(name), encode(version))
+            Self::Template { name, template_ref } => {
+                write!(
+                    f,
+                    "urn:adx:template:{}:{}",
+                    encode(name),
+                    encode(template_ref.name())
+                )
             }
-            Self::Binding { name, version, id } => write!(
+            Self::Binding {
+                name,
+                template_ref,
+                id,
+            } => write!(
                 f,
                 "urn:adx:binding:{}:{}:{}",
                 encode(name),
-                encode(version),
+                encode(template_ref.name()),
                 encode(id)
             ),
+        }
+    }
+}
+impl From<&crate::Scope> for Target {
+    fn from(scope: &crate::Scope) -> Self {
+        Self::Binding {
+            name: scope.template.clone(),
+            template_ref: scope.template_ref.clone(),
+            id: scope.binding_id.clone(),
         }
     }
 }

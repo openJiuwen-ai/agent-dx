@@ -9,25 +9,25 @@ pub struct MemoryRepository {
 }
 #[derive(Default)]
 struct MemoryState {
-    records: BTreeMap<Key, Record>,
+    records: BTreeMap<String, Record>,
     indexes: BTreeMap<Index, BTreeSet<String>>,
 }
 
 #[async_trait]
 impl Repository for MemoryRepository {
     async fn get(&self, key: &Key) -> Result<Option<Record>> {
-        Ok(self.state.lock().await.records.get(key).cloned())
+        Ok(self.state.lock().await.records.get(&key.0).cloned())
     }
     async fn commit(&self, tx: &Transaction) -> Result<bool> {
         let mut state = self.state.lock().await;
         for check in &tx.checks {
-            if state.records.get(&check.key).map(|r| &r.revision) != check.expected.as_ref() {
+            if state.records.get(&check.key.0).map(|r| &r.revision) != check.expected.as_ref() {
                 return Ok(false);
             }
         }
         for put in &tx.puts {
-            state.records.insert(put.key.clone(), put.record.clone());
-            if let Some(index) = &put.key.1 {
+            state.records.insert(put.key.0.clone(), put.record.clone());
+            for index in &put.key.1 {
                 state
                     .indexes
                     .entry(index.clone())
@@ -36,8 +36,8 @@ impl Repository for MemoryRepository {
             }
         }
         for key in &tx.deletes {
-            state.records.remove(key);
-            if let Some(index) = &key.1 {
+            state.records.remove(&key.0);
+            for index in &key.1 {
                 if let Some(members) = state.indexes.get_mut(index) {
                     members.remove(&key.0);
                 }
@@ -63,7 +63,7 @@ impl Repository for MemoryRepository {
             .map(|member| {
                 state
                     .records
-                    .get(&Key(member.clone(), Some(index.clone())))
+                    .get(member)
                     .cloned()
                     .map(|record| (member.clone(), record))
                     .ok_or_else(|| Error::Corrupt("AgentBinding index member missing".into()))

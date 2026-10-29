@@ -228,6 +228,125 @@ async fn agent_configuration_builds_client_and_validates_deadline() {
 }
 
 #[tokio::test]
+#[ignore = "requires disposable Redis with notify-keyspace-events K$g"]
+async fn embedded_registration_automatically_reconciles_aliases() {
+    use adx_agent_core::{
+        alias::{AliasConfig, VersionWeight},
+        Scope, TemplateRef,
+    };
+    use adx_agent_store::{discovery::RedisRegistry, RedisRepository};
+    use std::time::Duration;
+
+    let redis_url = std::env::var("ADX_AGENT_TEST_REDIS_URL").unwrap();
+    let namespace = format!("embedded-reconciliation-{}", uuid::Uuid::new_v4());
+    let registry = RedisRegistry::new(&redis_url, &namespace, Duration::from_secs(3)).unwrap();
+    let store = RedisRepository::connect(&redis_url, &namespace, Duration::from_secs(3))
+        .await
+        .unwrap();
+    let state = AgentState::new(Arc::new(store));
+    let draft = serde_json::from_value(serde_json::json!({
+        "name": "automatic-upgrade", "image": "app:1", "isolation_runtime": "runc",
+        "resources": {"cpu_millis": 1000, "memory_mib": 512}
+    }))
+    .unwrap();
+    let template = state.publish("tenant", &draft).await.unwrap();
+    state.publish("tenant", &draft).await.unwrap();
+    let mut alias = AliasConfig {
+        tenant: "tenant".into(),
+        template: "automatic-upgrade".into(),
+        alias: "production".into(),
+        seed: "stable".into(),
+        versions: vec![VersionWeight {
+            version: "1".into(),
+            weight: 1,
+        }],
+    };
+    let revision = state.put_alias(&alias, None).await.unwrap();
+    let scope = Scope {
+        tenant: alias.tenant.clone(),
+        template: alias.template.clone(),
+        template_ref: TemplateRef::Alias(alias.alias.clone()),
+        binding_id: "workspace".into(),
+    };
+    let original = state.create_binding(scope.clone()).await.unwrap();
+    let backend = Arc::new(Backend::default());
+    backend
+        .create(&CreateEnvironment {
+            id: original.current.environment_id.clone(),
+            tenant: "tenant".into(),
+            execution: (&template).into(),
+            deadline_unix_ms: None,
+        })
+        .await
+        .unwrap();
+    alias.versions[0].version = "2".into();
+    let revision = state.put_alias(&alias, Some(&revision)).await.unwrap();
+    let config = serde_json::from_value(serde_json::json!({
+        "embedded": {
+            "sandbox_network": {"sandbox_cidrs": ["10.0.0.0/20"], "internal_cidrs": [], "public_egress": true, "egress_allow": []},
+            "redis_url": redis_url,
+            "namespace": namespace,
+            "registration": {
+                "instance_id": "embedded-default",
+                "advertise_url": "http://embedded-default:8080",
+                "lease_seconds": 6,
+                "heartbeat_seconds": 1
+            }
+        }
+    })).unwrap();
+    let api = AgentApi::new_embedded(config, backend.clone())
+        .await
+        .unwrap();
+    let members = registry.members().await.unwrap();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].id, "embedded-default");
+
+    // No foreground activation: startup scanning and later notifications must both work.
+    for version in ["2", "1"] {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let binding = state.binding(&scope).await.unwrap().unwrap();
+                if binding.current.version == version && binding.secondary.is_none() {
+                    assert_eq!(binding.generation, original.generation);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("registration must automatically start alias reconciliation");
+        if version == "2" {
+            assert_eq!(
+                backend.0.lock().unwrap()
+                    [&("tenant".into(), original.current.environment_id.clone())]
+                    .phase,
+                EnvironmentPhase::Deleted
+            );
+            alias.versions[0].version = "1".into();
+            state.put_alias(&alias, Some(&revision)).await.unwrap();
+        }
+    }
+    assert_ne!(
+        state
+            .binding(&scope)
+            .await
+            .unwrap()
+            .unwrap()
+            .current
+            .environment_id,
+        original.current.environment_id
+    );
+    drop(api);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !registry.members().await.unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("dropping the embedded API must stop registration renewal");
+}
+
+#[tokio::test]
 #[ignore = "requires ADX_AGENT_TEST_REDIS_URL pointing to a disposable Redis"]
 async fn independent_activators_share_redis_identity() {
     let redis_url = std::env::var("ADX_AGENT_TEST_REDIS_URL").unwrap();
@@ -258,13 +377,17 @@ async fn independent_activators_share_redis_identity() {
     let b = &clients[1];
     let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})).unwrap();
     a.managed
-        .publish(&control_context(), "tenant", &template)
+        .publish(
+            &control_context(),
+            "tenant",
+            &adx_agent_core::TemplateDraft::from(&template),
+        )
         .await
         .unwrap();
     let scope = adx_agent_core::Scope {
         tenant: "tenant".into(),
         template: "demo".into(),
-        version: "1".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
         binding_id: "env".into(),
     };
     let ctx = control_context();
@@ -296,8 +419,8 @@ async fn independent_activators_share_redis_identity() {
         .unwrap();
     assert_ne!(original.0.binding.generation, fresh.0.binding.generation);
     assert_ne!(
-        original.0.binding.environment_id,
-        fresh.0.binding.environment_id
+        original.0.binding.current.environment_id,
+        fresh.0.binding.current.environment_id
     );
     a.managed
         .delete_binding(&control_context(), &scope)
@@ -326,7 +449,7 @@ async fn managed_binding_management_and_protocol_forwarding() {
             .with_agent_api(api.clone()),
     );
     let (mut sender, server, client) = connection(gateway.clone(), IngressSecurity::Tls).await;
-    let template = serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080},{"protocol":"ws","port":8080},{"protocol":"ssh","port":22}]});
+    let template = serde_json::json!({"name":"demo","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080},{"protocol":"ws","port":8080},{"protocol":"ssh","port":22}]});
     let response = sender
         .send_request(request(
             "POST",
@@ -338,7 +461,8 @@ async fn managed_binding_management_and_protocol_forwarding() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
-    json(response).await;
+    let published = json(response).await;
+    assert_eq!(published["template"]["version"], "1");
     let path = "/api/agent/v2/templates/demo/versions/1/bindings/env";
     let mut traffic = Request::builder()
         .uri("/agent/http/path?target=urn:adx:binding:demo:1:env&port=8080")
@@ -395,7 +519,7 @@ async fn managed_binding_management_and_protocol_forwarding() {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         json(response).await;
     }
-    let id = binding["environment_id"].as_str().unwrap();
+    let id = binding["current"]["environment_id"].as_str().unwrap();
     let response = sender
         .send_request(request(
             "POST",
@@ -588,13 +712,22 @@ async fn only_managed_data_entrypoint_resolves_and_reuses_authenticated_identity
     let scope = adx_agent_core::Scope {
         tenant: "tenant".into(),
         template: "test".into(),
-        version: "1".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
         binding_id: "env".into(),
     };
     let template = serde_json::from_value(serde_json::json!({"name":"test","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})).unwrap();
-    state.publish("tenant", &template).await.unwrap();
+    state
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
+        .await
+        .unwrap();
     state.create_binding(scope.clone()).await.unwrap();
-    let id = state.binding(&scope).await.unwrap().unwrap().environment_id;
+    let id = state
+        .binding(&scope)
+        .await
+        .unwrap()
+        .unwrap()
+        .current
+        .environment_id;
     let control = Arc::new(
         remote_control(adx_activator::Activator::new(
             state.clone(),
@@ -688,7 +821,10 @@ async fn managed_http_entry_authenticates_before_creating_binding() {
     let (gateway, _) = fixture().await;
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080},{"protocol":"ws","port":8080}]})).unwrap();
-    state.publish("tenant", &template).await.unwrap();
+    state
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
+        .await
+        .unwrap();
     let api = Arc::new(AgentApi {
         managed: Arc::new(adx_agent_api::managed::ManagedService::new(Arc::new(
             remote_control(adx_activator::Activator::new(
@@ -712,7 +848,7 @@ async fn managed_http_entry_authenticates_before_creating_binding() {
     let listing = adx_agent_core::activator::BindingList {
         tenant: "tenant".into(),
         template: "demo".into(),
-        version: "1".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
         page_size: 10,
         page_token: None,
     };
@@ -720,7 +856,10 @@ async fn managed_http_entry_authenticates_before_creating_binding() {
     assert_eq!(page.bindings.len(), 1);
     assert_eq!(
         managed.uri().to_string(),
-        format!("/{}/8080/chat?q=one", page.bindings[0].environment_id)
+        format!(
+            "/{}/8080/chat?q=one",
+            page.bindings[0].current.environment_id
+        )
     );
     for (path, token, status) in [
         (
@@ -858,15 +997,18 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
     let (gateway, _, routes) = fixture_with_routes().await;
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":port},{"protocol":"ws","port":port}]})).unwrap();
-    state.publish("tenant", &template).await.unwrap();
+    state
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
+        .await
+        .unwrap();
     let scope = adx_agent_core::Scope {
         tenant: "tenant".into(),
         template: "demo".into(),
-        version: "1".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
         binding_id: "env".into(),
     };
     let binding = state.create_binding(scope).await.unwrap();
-    for id in ["api", &binding.environment_id] {
+    for id in ["api", &binding.current.environment_id] {
         let route: crate::common::route::RouteInfo = serde_json::from_value(serde_json::json!({"instanceID":id,"instanceStatus":{"code":3},"tenantID":"tenant","environmentID":format!("runtime-{id}"),"environmentIP":"127.0.0.1","nodeProxyAddress":node_address.to_string()})).unwrap();
         node.activate_route(
             route.instance_id.clone(),
@@ -997,7 +1139,10 @@ mod ssh_terminal;
 async fn managed_http_and_ws_activation_are_bounded_by_the_entry_deadline() {
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080},{"protocol":"ws","port":8080}]})).unwrap();
-    state.publish("tenant", &template).await.unwrap();
+    state
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
+        .await
+        .unwrap();
     let api = AgentApi {
         managed: Arc::new(adx_agent_api::managed::ManagedService::new(Arc::new(
             remote_control(adx_activator::Activator::new(
@@ -1035,7 +1180,10 @@ async fn managed_http_and_ws_activation_are_bounded_by_the_entry_deadline() {
 async fn managed_target_retry_uses_the_original_deadline() {
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})).unwrap();
-    state.publish("tenant", &template).await.unwrap();
+    state
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
+        .await
+        .unwrap();
     let api = AgentApi {
         managed: Arc::new(adx_agent_api::managed::ManagedService::new(Arc::new(
             remote_control(adx_activator::Activator::new(
@@ -1143,7 +1291,10 @@ async fn shared_service_access_retries_only_unsent_generation_and_checks_tenant(
     let (gateway, _, routes) = fixture_with_routes().await;
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"ws","port":8080},{"protocol":"http","port":8080}]})).unwrap();
-    state.publish("tenant", &template).await.unwrap();
+    state
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
+        .await
+        .unwrap();
     let backend = Arc::new(Backend::default());
     let managed = Arc::new(adx_agent_api::managed::ManagedService::new(Arc::new(
         remote_control(adx_activator::Activator::new(
@@ -1156,7 +1307,7 @@ async fn shared_service_access_retries_only_unsent_generation_and_checks_tenant(
     let scope = Scope {
         tenant: "tenant".into(),
         template: "demo".into(),
-        version: "1".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
         binding_id: "binding".into(),
     };
     let selector = ServiceSelector {
@@ -1196,7 +1347,7 @@ async fn shared_service_access_retries_only_unsent_generation_and_checks_tenant(
         )
         .await
         .unwrap();
-    routes.put(serde_json::from_value(serde_json::json!({"instanceID":binding.environment_id,"instanceStatus":{"code":3},"tenantID":"other","environmentID":"runtime","environmentIP":"127.0.0.1","nodeProxyAddress":"127.0.0.1:1"})).unwrap());
+    routes.put(serde_json::from_value(serde_json::json!({"instanceID":binding.current.environment_id,"instanceStatus":{"code":3},"tenantID":"other","environmentID":"runtime","environmentIP":"127.0.0.1","nodeProxyAddress":"127.0.0.1:1"})).unwrap());
     let before = backend.1.load(Ordering::SeqCst);
     assert!(matches!(
         access.connect_service(&gateway, selection).await,
@@ -1246,7 +1397,7 @@ async fn shared_service_access_retries_only_unsent_generation_and_checks_tenant(
         )
         .await
         .unwrap();
-    routes.delete(&binding.environment_id);
+    routes.delete(&binding.current.environment_id);
     assert!(matches!(
         access.connect_service(&gateway, pending).await,
         Err(ServiceAccessError::Agent(adx_agent_api::Error::Conflict(_)))
@@ -1289,15 +1440,18 @@ async fn jiuwen_cold_start_waits_for_backend_listener_before_ws_handshake() {
     let (gateway, _, routes) = fixture_with_routes().await;
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"ws","port":port}]})).unwrap();
-    state.publish("tenant", &template).await.unwrap();
+    state
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
+        .await
+        .unwrap();
     let scope = Scope {
         tenant: "tenant".into(),
         template: "demo".into(),
-        version: "1".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
         binding_id: "jiuwen".into(),
     };
     let binding = state.create_binding(scope.clone()).await.unwrap();
-    let route: crate::common::route::RouteInfo = serde_json::from_value(serde_json::json!({"instanceID":binding.environment_id,"instanceStatus":{"code":3},"tenantID":"tenant","environmentID":"runtime-jiuwen","environmentIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
+    let route: crate::common::route::RouteInfo = serde_json::from_value(serde_json::json!({"instanceID":binding.current.environment_id,"instanceStatus":{"code":3},"tenantID":"tenant","environmentID":"runtime-jiuwen","environmentIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
     node.activate_route(
         route.instance_id.clone(),
         route.environment_id.clone(),
@@ -1410,15 +1564,18 @@ async fn jiuwen_concurrent_connections_obey_handshake_deadline_and_revocation() 
     let (gateway, _, routes) = fixture_with_routes().await;
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
     let template = serde_json::from_value(serde_json::json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"ws","port":port}]})).unwrap();
-    state.publish("tenant", &template).await.unwrap();
+    state
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
+        .await
+        .unwrap();
     let scope = Scope {
         tenant: "tenant".into(),
         template: "demo".into(),
-        version: "1".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
         binding_id: "jiuwen".into(),
     };
     let binding = state.create_binding(scope.clone()).await.unwrap();
-    let route: crate::common::route::RouteInfo = serde_json::from_value(serde_json::json!({"instanceID":binding.environment_id,"instanceStatus":{"code":3},"tenantID":"tenant","environmentID":"runtime-jiuwen","environmentIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
+    let route: crate::common::route::RouteInfo = serde_json::from_value(serde_json::json!({"instanceID":binding.current.environment_id,"instanceStatus":{"code":3},"tenantID":"tenant","environmentID":"runtime-jiuwen","environmentIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
     node.activate_route(
         route.instance_id.clone(),
         route.environment_id.clone(),
@@ -1597,7 +1754,7 @@ async fn jiuwen_concurrent_connections_obey_handshake_deadline_and_revocation() 
         assert_eq!(envelope["method"], "session.list");
     }
     assert_eq!(gateway.active_sessions(), 1);
-    routes.delete(&binding.environment_id);
+    routes.delete(&binding.current.environment_id);
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(2), running)
             .await
@@ -1764,17 +1921,26 @@ async fn jiuwen_download_config_reads_the_scoped_template_without_activation() {
         .await,
     ));
     let mut template:adx_agent_core::TemplateVersion=serde_json::from_value(serde_json::json!({"name":"jiuwen","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"env":{"JIUWENSWARM_WORKSPACE":"/tenant-one/v1","JIUWENSWARM_DOWNLOAD_ASSET_ROOT":"/assets"}})).unwrap();
-    state.publish("tenant", &template).await.unwrap();
+    state
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
+        .await
+        .unwrap();
     template.version = "2".into();
     template
         .env
         .insert("JIUWENSWARM_WORKSPACE".into(), "/tenant-one/v2".into());
-    state.publish("tenant", &template).await.unwrap();
+    state
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
+        .await
+        .unwrap();
     template.version = "1".into();
     template
         .env
         .insert("JIUWENSWARM_WORKSPACE".into(), "/tenant-two/v1".into());
-    state.publish("other", &template).await.unwrap();
+    state
+        .publish("other", &adx_agent_core::TemplateDraft::from(&template))
+        .await
+        .unwrap();
     let context = RequestContext::new(std::time::Duration::from_secs(2));
     for (tenant, version, workspace) in [
         ("tenant", "1", "/tenant-one/v1"),
@@ -1784,7 +1950,7 @@ async fn jiuwen_download_config_reads_the_scoped_template_without_activation() {
         let scope = Scope {
             tenant: tenant.into(),
             template: "jiuwen".into(),
-            version: version.into(),
+            template_ref: adx_agent_core::TemplateRef::Version(version.into()),
             binding_id: "not-created".into(),
         };
         let config = DownloadConfig::load(&managed, &context, &scope)
@@ -1800,7 +1966,7 @@ async fn jiuwen_download_config_reads_the_scoped_template_without_activation() {
     let scope = Scope {
         tenant: "tenant".into(),
         template: "jiuwen".into(),
-        version: "1".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
         binding_id: "not-created".into(),
     };
     assert!(
@@ -1837,7 +2003,10 @@ async fn managed_ws_consumes_parameters_only_for_the_first_activation() {
         "mounts":[{"type":"bind","host_path":"/mnt/users/${workspace}","target":"/home/agent"}]
     }))
     .unwrap();
-    activator.publish("tenant", &template).await.unwrap();
+    activator
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
+        .await
+        .unwrap();
     let api = AgentApi {
         managed: Arc::new(adx_agent_api::managed::ManagedService::new(Arc::new(
             adx_agent_api::local::LocalControl::new(activator),
@@ -1879,7 +2048,7 @@ async fn managed_ws_consumes_parameters_only_for_the_first_activation() {
     let scope = adx_agent_core::Scope {
         tenant: "tenant".into(),
         template: "params".into(),
-        version: "1".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
         binding_id: "alice".into(),
     };
     let binding = state.binding(&scope).await.unwrap().unwrap();
@@ -1912,11 +2081,14 @@ async fn websocket_retry_refreshes_deleted_or_rebuilt_binding_before_writes() {
                 "env":{"WORKSPACE":"${workspace}"}
             }))
             .unwrap();
-            first.publish("tenant", &template).await.unwrap();
+            first
+                .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
+                .await
+                .unwrap();
             let scope = Scope {
                 tenant: "tenant".into(),
                 template: "refresh".into(),
-                version: "1".into(),
+                template_ref: adx_agent_core::TemplateRef::Version("1".into()),
                 binding_id: "alice".into(),
             };
             let access = AgentV2Access::new(Arc::new(ManagedService::new(Arc::new(
@@ -1962,7 +2134,7 @@ async fn websocket_retry_refreshes_deleted_or_rebuilt_binding_before_writes() {
                 .forwarding_uri(&"/".parse().unwrap())
                 .unwrap()
                 .path()
-                .contains(&old.environment_id));
+                .contains(&old.current.environment_id));
             let result = access.retry(&mut selected).await;
             if protocol == Protocol::Http {
                 assert!(matches!(result, Err(adx_agent_api::Error::Conflict(_))));
@@ -1979,7 +2151,7 @@ async fn websocket_retry_refreshes_deleted_or_rebuilt_binding_before_writes() {
                 .forwarding_uri(&"/".parse().unwrap())
                 .unwrap()
                 .path()
-                .contains(&current.environment_id));
+                .contains(&current.current.environment_id));
             assert!(!access.retry(&mut selected).await.unwrap());
         }
     }
@@ -2043,5 +2215,171 @@ async fn instance_access_authenticates_without_activator_and_keeps_fixed_target(
             .await
             .unwrap_err();
         assert_eq!(response.status(), expected);
+    }
+}
+
+#[tokio::test]
+async fn unified_reference_traffic_reuses_the_requested_version_or_alias_scope() {
+    let (gateway, backend) = fixture().await;
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let input: adx_agent_core::TemplateDraft = serde_json::from_value(serde_json::json!({
+        "name":"orbit", "image":"app:1", "isolation_runtime":"runc",
+        "resources":{"cpu_millis":100,"memory_mib":128},
+        "service":[{"protocol":"http","port":8080}]
+    }))
+    .unwrap();
+    let one = state.publish("tenant", &input).await.unwrap();
+    let two = state.publish("tenant", &input).await.unwrap();
+    assert_eq!((one.version.as_str(), two.version.as_str()), ("1", "2"));
+    state
+        .put_alias(
+            &serde_json::from_value(serde_json::json!({
+                "tenant":"tenant", "template":"orbit", "alias":"v1-workspace", "seed":"stable",
+                "versions":[{"version":"1", "weight":1}]
+            }))
+            .unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
+    let managed = Arc::new(adx_agent_api::managed::ManagedService::new(Arc::new(
+        adx_agent_api::local::LocalControl::new(Arc::new(adx_activator::Activator::new(
+            state.clone(),
+            backend,
+        ))),
+    )));
+    let gateway = Arc::new(gateway.as_ref().clone().with_agent_api(Arc::new(AgentApi {
+        managed,
+        request_timeout: std::time::Duration::from_secs(3),
+    })));
+    for (reference, expected) in [
+        ("1", adx_agent_core::TemplateRef::Version("1".into())),
+        (
+            "v1-workspace",
+            adx_agent_core::TemplateRef::Alias("v1-workspace".into()),
+        ),
+    ] {
+        let (mut sender, server, client) = connection(gateway.clone(), IngressSecurity::Tls).await;
+        let response = sender
+            .send_request(
+                Request::get(format!(
+                    "/agent/http?target=urn:adx:binding:orbit:{reference}:user"
+                ))
+                .header("authorization", "Bearer tenant")
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The fixture has no published Platform route; admission must still persist the exact scope.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        response.collect().await.unwrap();
+        let binding = state
+            .binding(&adx_agent_core::Scope {
+                tenant: "tenant".into(),
+                template: "orbit".into(),
+                template_ref: expected,
+                binding_id: "user".into(),
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(binding.current.version, "1");
+        server.abort();
+        client.abort();
+    }
+}
+
+#[tokio::test]
+async fn alias_writes_use_ingress_authentication_and_revision_in_both_modes() {
+    use adx_agent_api::{activator::Control, local::LocalControl, managed::ManagedService};
+    for embedded in [false, true] {
+        let (gateway, backend) = fixture().await;
+        let state = AgentState::new(Arc::new(MemoryRepository::default()));
+        let activator = adx_activator::Activator::new(state.clone(), backend);
+        let control: Arc<dyn Control> = if embedded {
+            Arc::new(LocalControl::new(Arc::new(activator)))
+        } else {
+            Arc::new(remote_control(activator).await)
+        };
+        let mut gateway = Arc::try_unwrap(gateway).ok().unwrap();
+        gateway.agent_api = Some(Arc::new(AgentApi {
+            managed: Arc::new(ManagedService::new(control)),
+            request_timeout: std::time::Duration::from_secs(5),
+        }));
+        let (mut client, serving, connection) =
+            connection(Arc::new(gateway), IngressSecurity::Tls).await;
+        let draft = serde_json::json!({"name":"agent","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512}});
+        let response = client
+            .send_request(request(
+                "POST",
+                "/api/agent/v2/templates",
+                "tenant",
+                "trace",
+                draft,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        json(response).await;
+        let path = "/api/agent/v2/templates/agent/aliases/production";
+        let body = serde_json::json!({"seed":"stable","versions":[{"version":"1","weight":1}]});
+        let response = client
+            .send_request(request("PUT", path, "invalid", "trace", body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        response.collect().await.unwrap();
+        assert!(state
+            .alias("tenant", "agent", "production")
+            .await
+            .unwrap()
+            .is_none());
+        let response = client
+            .send_request(request("PUT", path, "tenant", "trace", body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created = json(response).await;
+        assert_eq!(created["alias"]["config"]["tenant"], "tenant");
+        let response = client
+            .send_request(request("PUT", path, "tenant", "trace", body.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        json(response).await;
+        let mut update = body.clone();
+        update["expected_revision"] = created["alias"]["revision"].clone();
+        update["versions"][0]["weight"] = serde_json::json!(3);
+        let response = client
+            .send_request(request("PUT", path, "tenant", "trace", update))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        json(response).await;
+        let response = client
+            .send_request(request("PUT", path, "other", "trace", body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        json(response).await;
+        assert!(state
+            .alias("other", "agent", "production")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            state
+                .alias("tenant", "agent", "production")
+                .await
+                .unwrap()
+                .unwrap()
+                .1
+                .versions[0]
+                .weight,
+            3
+        );
+        serving.abort();
+        connection.abort();
     }
 }

@@ -2,7 +2,7 @@
 pub mod http;
 pub mod ssh;
 
-use adx_agent_core::{activator::default_page_size, limits, TemplateVersion};
+use adx_agent_core::{activator::default_page_size, limits, TemplateDraft};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 use serde_json::Value;
@@ -87,6 +87,7 @@ pub enum TemplateCommand {
 pub struct TemplateScope {
     #[arg(long)]
     pub template: String,
+    /// 数字版本或非数字别名。
     #[arg(long)]
     pub version: String,
 }
@@ -297,7 +298,7 @@ pub async fn execute(command: &Command, config: &Configuration) -> Result<Comman
             if std::fs::metadata(file)?.len() > limits::HTTP_JSON_BYTES as u64 {
                 return Err(Error::Invalid("模板文件超过请求大小限制".into()));
             }
-            let template: TemplateVersion = serde_json::from_slice(&std::fs::read(file)?)
+            let template: TemplateDraft = serde_json::from_slice(&std::fs::read(file)?)
                 .map_err(|_| Error::Invalid("无效的模板 JSON".into()))?;
             template.validate().map_err(Error::Invalid)?;
             body = Some(serde_json::to_value(template).map_err(|_| Error::Unavailable)?);
@@ -308,18 +309,33 @@ pub async fn execute(command: &Command, config: &Configuration) -> Result<Comman
         }
         Command::Template {
             command: TemplateCommand::Get { name, version },
-        } => (
-            reqwest::Method::GET,
-            route(
-                &config.endpoint,
-                &["api", "agent", "v2", "templates", name, "versions", version],
-            )?,
-        ),
+        } => {
+            let reference: adx_agent_core::TemplateRef = version.parse().map_err(Error::Invalid)?;
+            let kind = if matches!(reference, adx_agent_core::TemplateRef::Version(_)) {
+                "versions"
+            } else {
+                "aliases"
+            };
+            (
+                reqwest::Method::GET,
+                route(
+                    &config.endpoint,
+                    &["api", "agent", "v2", "templates", name, kind, version],
+                )?,
+            )
+        }
         Command::Binding { command } => {
             let (scope, id, method) = match command {
                 BindingCommand::List { scope, .. } => (scope, None, reqwest::Method::GET),
                 BindingCommand::Get { id, scope } => (scope, Some(id), reqwest::Method::GET),
                 BindingCommand::Delete { id, scope } => (scope, Some(id), reqwest::Method::DELETE),
+            };
+            let reference: adx_agent_core::TemplateRef =
+                scope.version.parse().map_err(Error::Invalid)?;
+            let kind = if matches!(reference, adx_agent_core::TemplateRef::Version(_)) {
+                "versions"
+            } else {
+                "aliases"
             };
             let mut segments = vec![
                 "api",
@@ -327,7 +343,7 @@ pub async fn execute(command: &Command, config: &Configuration) -> Result<Comman
                 "v2",
                 "templates",
                 &scope.template,
-                "versions",
+                kind,
                 &scope.version,
                 "bindings",
             ];

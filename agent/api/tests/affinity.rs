@@ -15,7 +15,7 @@ fn scope() -> Scope {
     Scope {
         tenant: "t".into(),
         template: "a".into(),
-        version: "1".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
         binding_id: "env".into(),
     }
 }
@@ -48,9 +48,11 @@ async fn handler(
     let binding = AgentBinding {
         scope: serde_json::from_value(value["scope"].clone()).unwrap(),
         generation: id,
-        environment_id: "environment".into(),
+        current: adx_agent_core::EnvironmentRef::new("1".into(), "environment".into()),
+        secondary: None,
         phase: BindingPhase::Active,
         parameters: Default::default(),
+        volumes: Default::default(),
     };
     if uri.path().ends_with("/delete") {
         Json(serde_json::Value::Null)

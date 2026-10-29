@@ -3,9 +3,11 @@
 import json
 import os
 import secrets
+import shutil
 import signal
 import subprocess
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -25,13 +27,20 @@ def configure(mode, node, services, redis_url, private, state):
         token_file.write_text(secrets.token_hex(32))
         token_file.chmod(0o600)
     if mode == 'standalone':
-        agent = {'activator': {'urls': ['http://coordinator:18091', 'http://node2:18091'], 'token_env': 'ADX_ACTIVATOR_SERVICE_TOKEN', 'allow_plaintext': True}}
+        agent = {'activator': {
+            'urls': ['http://coordinator:18091', 'http://node2:18091'],
+            'token_env': 'ADX_ACTIVATOR_SERVICE_TOKEN', 'allow_plaintext': True,
+        }}
         activator = {
             'listen': '0.0.0.0:18091', 'redis_url': redis_url, 'namespace': namespace,
             'sandbox_network': sandbox_network,
-            'environment_url': 'http://127.0.0.1:8888', 'environment_api_key_envs': {'e2e': 'ADX_PLATFORM_TENANT_API_KEY'},
+            'environment_url': 'http://127.0.0.1:8888',
+            'environment_api_key_envs': {'e2e': 'ADX_PLATFORM_TENANT_API_KEY'},
             'environment_ca_file': None, 'allow_plaintext_transport': True, 'request_timeout_seconds': 120,
-            'registration': {'instance_id': node, 'advertise_url': f'http://{"coordinator" if node == "node1" else "node2"}:18091', 'lease_seconds': 15, 'heartbeat_seconds': 5},
+            'registration': {
+                'instance_id': node, 'advertise_url': f'http://{"coordinator" if node == "node1" else "node2"}:18091',
+                'lease_seconds': 15, 'heartbeat_seconds': 5,
+            },
         }
         path = state / 'activator.json'
         path.write_text(json.dumps(activator))
@@ -54,6 +63,19 @@ def start(node, restart=False):
     state, private = Path('/tmp/adx-e2e'), Path('/secrets')
     marker = state / 'activator-process.json'
     previous = None
+    # The fixture provisions Redis notifications before registration starts coordination.
+    redis = urllib.parse.urlsplit(json.loads((state / 'activator.json').read_text())['redis_url'])
+    redis_env = {**os.environ, 'REDISCLI_AUTH': (private / 'redis-key').read_text().strip()}
+    redis_cli = shutil.which('redis-cli')
+    if redis_cli is None:
+        raise RuntimeError('redis-cli is required for Activator acceptance')
+    notification_result = subprocess.check_output(
+        [redis_cli, '-h', redis.hostname, '-p', str(redis.port or 6379),
+         'CONFIG', 'SET', 'notify-keyspace-events', 'K$g'],
+        env=redis_env, text=True, timeout=10,
+    )
+    if notification_result.strip() != 'OK':
+        raise RuntimeError('failed to provision Redis notifications for Activator acceptance')
     if restart:
         previous = json.loads(marker.read_text())
         if Path(f'/proc/{previous["pid"]}/stat').read_text().split()[21] != previous['start_ticks']:
@@ -71,7 +93,10 @@ def start(node, restart=False):
            'ADX_ACTIVATOR_SERVICE_TOKEN': (private / 'activator-key').read_text().strip(),
            'ADX_PLATFORM_TENANT_API_KEY': (private / 'api-key').read_text().strip()}
     with (Path('/evidence') / f'activator-{node}.log').open('a') as log:
-        child = subprocess.Popen(['/opt/adx/package/bin/adx-activator'], env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        child = subprocess.Popen(
+            ['/opt/adx/package/bin/adx-activator'], env=env, stdout=log,
+            stderr=subprocess.STDOUT, start_new_session=True,
+        )
     process = {'pid': child.pid, 'start_ticks': Path(f'/proc/{child.pid}/stat').read_text().split()[21]}
     marker.write_text(json.dumps(process))
     deadline = time.monotonic() + 30

@@ -24,16 +24,18 @@ fn binding_cache_memory_profile() {
         let scope = Scope {
             tenant: "t".repeat(36),
             template: "a".repeat(32),
-            version: "v".repeat(8),
+            template_ref: adx_agent_core::TemplateRef::Version("v".repeat(8)),
             binding_id: format!("{i:036}"),
         };
         let target = Target {
             binding: AgentBinding {
                 scope: scope.clone(),
                 generation: "g".repeat(36),
-                environment_id: "s".repeat(40),
+                current: adx_agent_core::EnvironmentRef::new("v".repeat(8), "s".repeat(40)),
+                secondary: None,
                 phase: BindingPhase::Active,
                 parameters: Default::default(),
+                volumes: Default::default(),
             },
             service: vec![adx_agent_core::Service {
                 protocol: adx_agent_core::Protocol::Http,

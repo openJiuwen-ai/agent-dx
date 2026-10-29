@@ -282,46 +282,41 @@ impl SessionTarget {
         let Self::Managed { scope, .. } = self else {
             return None;
         };
-        let urn = Target::Binding {
-            name: scope.template.clone(),
-            version: scope.version.clone(),
-            id: scope.binding_id.clone(),
-        };
+        let urn = Target::from(scope);
         Some(format!(
             "AgentBinding ID: {}\r\nAgentBinding URN: {urn}\r\n",
             scope.binding_id
         ))
     }
-    async fn connect(
+    async fn resolve(
         &self,
         gateway: &Ingress,
         ctx: &adx_agent_api::request::RequestContext,
-    ) -> Result<IngressStream> {
-        let (id, tenant, port, trace, inline) = match self {
-            Self::Inline {
-                id,
-                tenant,
-                port,
-                trace,
-            } => (id.clone(), tenant.as_str(), *port, trace, true),
-            Self::Managed { scope, port, trace } => {
+    ) -> Result<(String, u16)> {
+        match self {
+            Self::Inline { id, port, .. } => Ok((id.clone(), *port)),
+            Self::Managed { scope, port, .. } => {
                 let api = gateway.agent_api.as_ref().ok_or(Error::Forbidden)?;
                 let (target, port) = api
                     .managed
                     .resolve(ctx, scope, Protocol::Ssh, *port)
                     .await
-                    .map_err(|e| Error::Target(e.to_string()))?;
-                (
-                    target.binding.environment_id,
-                    scope.tenant.as_str(),
-                    port,
-                    trace,
-                    false,
-                )
+                    .map_err(|error| match error {
+                        adx_agent_api::Error::Invalid(message) => Error::Invalid(message),
+                        error => Error::Target(error.to_string()),
+                    })?;
+                Ok((target.binding.current.environment_id, port))
             }
+        }
+    }
+    async fn connect(&self, gateway: &Ingress, selected: &(String, u16)) -> Result<IngressStream> {
+        let (id, port) = selected;
+        let (tenant, trace, inline) = match self {
+            Self::Inline { tenant, trace, .. } => (tenant.as_str(), trace, true),
+            Self::Managed { scope, trace, .. } => (scope.tenant.as_str(), trace, false),
         };
         let route = gateway
-            .resolve_route(&id, port, AccessKind::Ssh, trace.clone())
+            .resolve_route(id, *port, AccessKind::Ssh, trace.clone())
             .await
             .map_err(|e| Error::Target(e.to_string()))?;
         // Legacy system tenant "0" can reach inline instances across tenants; managed access remains tenant-scoped.
@@ -547,25 +542,16 @@ async fn terminal(
     let pty = pty.ok_or_else(|| Error::Invalid("interactive SSH requires a terminal".into()))?;
     let ctx = adx_agent_api::request::RequestContext::new(settings.connect_timeout);
     let deadline = ctx.deadline();
-    // Validate the managed service before announcing an AgentBinding or submitting a create.
-    if let SessionTarget::Managed { scope, port, .. } = &target {
-        let api = gateway.agent_api.as_ref().ok_or(Error::Forbidden)?;
-        let template = tokio::time::timeout_at(
-            deadline,
-            api.managed
-                .template(&ctx, &scope.tenant, &scope.template, &scope.version),
-        )
-        .await
-        .map_err(|_| Error::Timeout)?
-        .map_err(|e| Error::Target(e.to_string()))?;
-        ManagedService::select_service(&template, Protocol::Ssh, *port)
-            .map_err(|e| Error::Invalid(e.to_string()))?;
-    }
+    let resolved = match target.resolve(&gateway, &ctx).await {
+        Err(Error::Invalid(message)) => return Err(Error::Invalid(message)),
+        result => result,
+    };
     let connected = async {
         if let Some(notice) = target.notice() {
             front.data(notice.as_bytes()).await?;
         }
-        let stream = target.connect(&gateway, &ctx).await?;
+        let selected = resolved?;
+        let stream = target.connect(&gateway, &selected).await?;
         let mut backend = client::connect_stream(
             Arc::new(client::Config::default()),
             stream,

@@ -75,7 +75,10 @@ async fn authenticated_services_observe_binding_deletion_and_recreation() {
                     if request.uri().path().ends_with("templates/get") {
                         tc.fetch_add(1, Ordering::SeqCst);
                     }
-                    if request.uri().path().ends_with("bindings/activate") {
+                    if matches!(
+                        request.uri().path(),
+                        "/internal/adx/v1/bindings/activate" | "/internal/adx/v1/bindings/resolve"
+                    ) {
                         ac.fetch_add(1, Ordering::SeqCst);
                     }
                     next.run(request).await
@@ -110,17 +113,25 @@ async fn authenticated_services_observe_binding_deletion_and_recreation() {
     let other_gateway = ManagedService::new(other_client.clone());
     let template:TemplateVersion=serde_json::from_value(serde_json::json!({"name":"app","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})).unwrap();
     other_gateway
-        .publish(&context(), "tenant", &template)
+        .publish(
+            &context(),
+            "tenant",
+            &adx_agent_core::TemplateDraft::from(&template),
+        )
         .await
         .unwrap();
     service
-        .publish(&context(), "tenant", &template)
+        .publish(
+            &context(),
+            "tenant",
+            &adx_agent_core::TemplateDraft::from(&template),
+        )
         .await
         .unwrap();
     let scope = Scope {
         tenant: "tenant".into(),
         template: "app".into(),
-        version: "1".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
         binding_id: "env".into(),
     };
     assert!(matches!(
@@ -171,7 +182,7 @@ async fn authenticated_services_observe_binding_deletion_and_recreation() {
             &activator::BindingList {
                 tenant: "tenant".into(),
                 template: "app".into(),
-                version: "1".into(),
+                template_ref: adx_agent_core::TemplateRef::Version("1".into()),
                 page_size: 10,
                 page_token: None,
             },
@@ -197,7 +208,7 @@ async fn authenticated_services_observe_binding_deletion_and_recreation() {
         .0
         .binding;
     assert_ne!(fresh.generation, env.generation);
-    assert_ne!(fresh.environment_id, env.environment_id);
+    assert_ne!(fresh.current.environment_id, env.current.environment_id);
     assert!(matches!(
         other_client
             .activate(&context(), &scope, Some(&env.generation))
@@ -243,7 +254,10 @@ async fn initialization_crosses_authenticated_activation_api() {
         Arc::new(Backend(AtomicUsize::new(0))),
     ));
     let template:TemplateVersion=serde_json::from_value(serde_json::json!({"name":"app","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})).unwrap();
-    activator.publish("tenant", &template).await.unwrap();
+    activator
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
+        .await
+        .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let app = adx_activator::server::router(activator, TOKEN, Duration::from_secs(3)).unwrap();
@@ -253,7 +267,7 @@ async fn initialization_crosses_authenticated_activation_api() {
     let scope = Scope {
         tenant: "tenant".into(),
         template: "app".into(),
-        version: "1".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
         binding_id: "private".into(),
     };
     let parameters = adx_agent_core::parameters::encode(&std::collections::BTreeMap::from([(

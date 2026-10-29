@@ -20,12 +20,7 @@ pub(super) struct BindingNotice {
 }
 impl BindingNotice {
     pub fn new(scope: &Scope) -> Result<Self, Error> {
-        let urn = Target::Binding {
-            name: scope.template.clone(),
-            version: scope.version.clone(),
-            id: scope.binding_id.clone(),
-        }
-        .to_string();
+        let urn = Target::from(scope).to_string();
         Ok(Self {
             id: scope.binding_id.parse().map_err(|_| {
                 Error::Invalid("AgentBinding ID is not a valid response header".into())

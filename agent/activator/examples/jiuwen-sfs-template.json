@@ -1,6 +1,5 @@
 {
   "name": "jiuwen",
-  "version": "sfs-autopause-v1",
   "image": "registry.example/jiuwenswarm:v1",
   "isolation_runtime": "runsc",
   "env": {

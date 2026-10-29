@@ -26,12 +26,15 @@ fn orbit_ws_configuration_is_optional_and_independent() {
     let config: DigitalMateGatewayConfig = serde_json::from_value(json!({
         "tenant":"tenant",
         "jiuwen":{"agent_type":"assistant", "template":"demo", "version":"1"},
-        "orbit":{"template":"orbit", "version":"fixed", "backend_path":"/ws", "service_port":18092}
+        "orbit":{"template":"orbit", "template_ref":"1", "backend_path":"/ws", "service_port":18092}
     }))
     .unwrap();
     config.validate().unwrap();
     assert_eq!(config.scope("alice").unwrap().template, "demo");
-    assert_eq!(config.scope("alice").unwrap().version, "1");
+    assert_eq!(
+        config.scope("alice").unwrap().template_ref,
+        adx_agent_core::TemplateRef::Version("1".into())
+    );
 }
 
 #[test]
@@ -339,7 +342,7 @@ async fn jiuwen_public_routes_share_one_e2a_and_download_on_another_replica() {
         port,
     });
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
-    state.publish("tenant", &serde_json::from_value(json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"ws","port":port}],"env":{"JIUWENSWARM_WORKSPACE":"/work","JIUWENSWARM_DOWNLOAD_ASSET_ROOT":"/assets","JIUWENSWARM_FILE_DOWNLOAD_SECRET":"s".repeat(32)}})).unwrap()).await.unwrap();
+    state.publish("tenant", &adx_agent_core::TemplateDraft::from(&serde_json::from_value(json!({"name":"demo","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"ws","port":port}],"env":{"JIUWENSWARM_WORKSPACE":"/work","JIUWENSWARM_DOWNLOAD_ASSET_ROOT":"/assets","JIUWENSWARM_FILE_DOWNLOAD_SECRET":"s".repeat(32)}})).unwrap())).await.unwrap();
     let binding = state
         .create_binding(settings().scope("alice").unwrap())
         .await
@@ -347,7 +350,7 @@ async fn jiuwen_public_routes_share_one_e2a_and_download_on_another_replica() {
     let managed = Arc::new(ManagedService::new(Arc::new(LocalControl::new(Arc::new(
         adx_activator::Activator::new(state, backend.clone()),
     )))));
-    let route:crate::common::route::RouteInfo=serde_json::from_value(json!({"instanceID":binding.environment_id,"instanceStatus":{"code":3},"tenantID":"tenant","environmentID":"runtime-local","environmentIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
+    let route:crate::common::route::RouteInfo=serde_json::from_value(json!({"instanceID":binding.current.environment_id,"instanceStatus":{"code":3},"tenantID":"tenant","environmentID":"runtime-local","environmentIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
     relay
         .activate_route(
             route.instance_id.clone(),
@@ -592,7 +595,7 @@ async fn jiuwen_public_routes_share_one_e2a_and_download_on_another_replica() {
             .send_request(
                 Request::get(format!(
                     "/direct/{}/download?path=/work/report.txt&type=file",
-                    binding.environment_id
+                    binding.current.environment_id
                 ))
                 .header("authorization", "Bearer tenant")
                 .header("range", "bytes=0-4")
@@ -610,7 +613,7 @@ async fn jiuwen_public_routes_share_one_e2a_and_download_on_another_replica() {
             .send_request(
                 Request::get(format!(
                     "/direct/{}/download?path=/work/report.txt&type=file",
-                    binding.environment_id
+                    binding.current.environment_id
                 ))
                 .header("authorization", "Bearer other")
                 .header("range", "bytes=0-4")

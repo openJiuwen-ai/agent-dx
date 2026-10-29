@@ -18,7 +18,7 @@ struct PageCursor {
 
 #[derive(Clone)]
 pub struct AgentState {
-    store: Arc<dyn Repository>,
+    pub(crate) store: Arc<dyn Repository>,
     templates: Arc<Mutex<BoundedCache<Key, TemplateCell>>>,
 }
 pub(crate) fn binding_key(scope: &Scope) -> Result<Key> {
@@ -28,18 +28,19 @@ pub(crate) fn binding_key(scope: &Scope) -> Result<Key> {
         &[
             &scope.tenant,
             &scope.template,
-            &scope.version,
+            scope.template_ref.kind(),
+            scope.template_ref.name(),
             &scope.binding_id,
         ],
     )
 }
-fn check(key: &Key, record: &Record) -> Check {
+pub(crate) fn check(key: &Key, record: &Record) -> Check {
     Check {
         key: key.clone(),
         expected: Some(record.revision.clone()),
     }
 }
-fn put<T: Serialize>(key: &Key, value: &T) -> Result<Put> {
+pub(crate) fn put<T: Serialize>(key: &Key, value: &T) -> Result<Put> {
     Ok(Put {
         key: key.clone(),
         record: Record::new(value)?,
@@ -52,33 +53,57 @@ impl AgentState {
             templates: Arc::new(Mutex::new(BoundedCache::new(TEMPLATE_CACHE_ENTRIES))),
         }
     }
-    pub async fn publish(&self, tenant: &str, template: &TemplateVersion) -> Result<()> {
+    /// Atomically publish a snapshot and advance its tenant/template sequence.
+    /// An ambiguous commit is returned without replay; existing storage requires an
+    /// explicitly initialized sequence, never an automatic legacy-data migration.
+    pub async fn publish(
+        &self,
+        tenant: &str,
+        draft: &adx_agent_core::TemplateDraft,
+    ) -> Result<TemplateVersion> {
         adx_agent_core::identifier(tenant, "tenant").map_err(Error::Invalid)?;
-        template.validate().map_err(Error::Invalid)?;
-        let key = Key::new("template", &[tenant, &template.name, &template.version])?;
-        if self
-            .store
-            .commit(&Transaction::new(
-                vec![Check {
-                    key: key.clone(),
-                    expected: None,
-                }],
-                vec![put(&key, template)?],
-            )?)
-            .await?
-        {
-            return Ok(());
+        draft.validate().map_err(Error::Invalid)?;
+        let sequence_key = Key::new("template-sequence", &[tenant, &draft.name])?;
+        for _ in 0..limits::CAS_ATTEMPTS {
+            let previous = self.store.get(&sequence_key).await?;
+            let last = previous
+                .as_ref()
+                .map(|record| record.decode::<u64>())
+                .transpose()?
+                .unwrap_or(0);
+            let next = last
+                .checked_add(1)
+                .ok_or_else(|| Error::Conflict("template version sequence exhausted".into()))?;
+            let template = draft.with_version(next.to_string());
+            let key = Key::new("template", &[tenant, &template.name, &template.version])?;
+            let expected = previous.as_ref().map(|record| record.revision.clone());
+            if self
+                .store
+                .commit(&Transaction::new(
+                    vec![
+                        Check {
+                            key: sequence_key.clone(),
+                            expected: expected.clone(),
+                        },
+                        Check {
+                            key: key.clone(),
+                            expected: None,
+                        },
+                    ],
+                    vec![put(&sequence_key, &next)?, put(&key, &template)?],
+                )?)
+                .await?
+            {
+                return Ok(template);
+            }
+            let observed = self.store.get(&sequence_key).await?;
+            if observed.as_ref().map(|record| &record.revision) == expected.as_ref() {
+                return Err(Error::Conflict("template version already exists; initialize the publication sequence through operations".into()));
+            }
         }
-        let existing = self
-            .store
-            .get(&key)
-            .await?
-            .ok_or_else(|| Error::Conflict("template changed".into()))?;
-        if existing.decode::<TemplateVersion>()? == *template {
-            Ok(())
-        } else {
-            Err(Error::Conflict("template versions are immutable".into()))
-        }
+        Err(Error::Conflict(
+            "template publication changed concurrently".into(),
+        ))
     }
     pub async fn template(
         &self,
@@ -86,6 +111,7 @@ impl AgentState {
         name: &str,
         version: &str,
     ) -> Result<Option<TemplateVersion>> {
+        adx_agent_core::version_number(version).map_err(Error::Invalid)?;
         let key = Key::new("template", &[tenant, name, version])?;
         let cell = {
             let mut templates = self.templates.lock().await;
@@ -121,11 +147,15 @@ impl AgentState {
     }
     pub async fn list_bindings(&self, query: &BindingList) -> Result<BindingPage> {
         query.validate().map_err(Error::Invalid)?;
-        let index = Index::bindings(&query.tenant, &query.template, &query.version)?;
+        let index = Index::bindings(&query.tenant, &query.template, &query.template_ref)?;
         let scope = [
             query.tenant.clone(),
             query.template.clone(),
-            query.version.clone(),
+            format!(
+                "{}:{}",
+                query.template_ref.kind(),
+                query.template_ref.name()
+            ),
         ];
         let after = query
             .page_token
@@ -171,7 +201,7 @@ impl AgentState {
                 let value: AgentBinding = record.decode()?;
                 if value.scope.tenant != query.tenant
                     || value.scope.template != query.template
-                    || value.scope.version != query.version
+                    || value.scope.template_ref != query.template_ref
                     || binding_key(&value.scope)?.as_str() != key
                 {
                     return Err(Error::Corrupt("AgentBinding index scope mismatch".into()));
@@ -196,8 +226,9 @@ impl AgentState {
         parameters: &adx_agent_core::mounts::Parameters,
     ) -> Result<AgentBinding> {
         let key = binding_key(&scope)?;
+        let (version, alias_check) = self.desired_version(&scope).await?;
         let template = self
-            .template(&scope.tenant, &scope.template, &scope.version)
+            .template(&scope.tenant, &scope.template, &version)
             .await?
             .ok_or_else(|| Error::Invalid("template version does not exist".into()))?;
         template.render_mounts(parameters).map_err(Error::Invalid)?;
@@ -205,20 +236,21 @@ impl AgentState {
         let generation = uuid::Uuid::new_v4().to_string();
         let value = AgentBinding {
             scope,
-            environment_id: format!("adx-{generation}"),
+            current: adx_agent_core::EnvironmentRef::new(version, format!("adx-{generation}")),
+            secondary: None,
             generation,
             phase: BindingPhase::Active,
             parameters: parameters.clone(),
+            volumes: Default::default(),
         };
+        let mut checks = vec![Check {
+            key: key.clone(),
+            expected: None,
+        }];
+        checks.extend(alias_check);
         if self
             .store
-            .commit(&Transaction::new(
-                vec![Check {
-                    key: key.clone(),
-                    expected: None,
-                }],
-                vec![put(&key, &value)?],
-            )?)
+            .commit(&Transaction::new(checks, vec![put(&key, &value)?])?)
             .await?
         {
             return Ok(value);
@@ -280,7 +312,8 @@ impl AgentState {
             return Ok(());
         }
         if current.phase != BindingPhase::Deleting
-            || current.environment_id != binding.environment_id
+            || current.current != binding.current
+            || current.secondary != binding.secondary
         {
             return Err(Error::Conflict("binding deletion identity mismatch".into()));
         }

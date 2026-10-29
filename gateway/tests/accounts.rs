@@ -295,7 +295,9 @@ async fn litellm_quota_uses_key_budget_and_spend_one_to_one() {
     }
     let quota = provider.quota("owner", key).await.unwrap();
     assert!(quota.quota.exhausted);
-    assert!(quota.quota.balance < 0.0);
+    assert_eq!(quota.quota.balance, 0.0);
+    assert_eq!(quota.quota.used, 1.1);
+    assert_eq!(model.keys.lock().unwrap()[&digest]["spend"], json!(1.1));
     server.abort();
 }
 

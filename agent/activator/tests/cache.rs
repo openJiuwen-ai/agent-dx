@@ -105,7 +105,7 @@ fn scope() -> Scope {
     Scope {
         tenant: "tenant".into(),
         template: "app".into(),
-        version: "1".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
         binding_id: "env".into(),
     }
 }
@@ -118,7 +118,10 @@ async fn warm_activation_skips_redis_and_platform() {
     let store = Arc::new(Store::default());
     let platform = Arc::new(Platform::default());
     let service = Activator::new(AgentState::new(store.clone()), platform.clone());
-    service.publish("tenant", &template()).await.unwrap();
+    service
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template()))
+        .await
+        .unwrap();
     let first = service.activate(&scope(), None, deadline()).await.unwrap();
     store.reads.store(0, Ordering::SeqCst);
     platform.gets.store(0, Ordering::SeqCst);
@@ -148,7 +151,10 @@ async fn immutable_templates_share_cached_reads_without_caching_absence() {
         .await
         .unwrap()
         .is_none());
-    state.publish("tenant", &template()).await.unwrap();
+    state
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template()))
+        .await
+        .unwrap();
     store.reads.store(0, Ordering::SeqCst);
     let (a, b) = tokio::join!(
         state.template("tenant", "app", "1"),
@@ -183,7 +189,10 @@ async fn bypasscache_refreshes_and_failed_refresh_does_not_leave_a_success_hit()
         AgentState::new(Arc::new(Store::default())),
         platform.clone(),
     ));
-    service.publish("tenant", &template()).await.unwrap();
+    service
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template()))
+        .await
+        .unwrap();
     let first = service.activate(&scope(), None, deadline()).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!(
@@ -206,7 +215,7 @@ async fn bypasscache_refreshes_and_failed_refresh_does_not_leave_a_success_hit()
         .records
         .lock()
         .unwrap()
-        .get_mut(&first.binding.environment_id)
+        .get_mut(&first.binding.current.environment_id)
         .unwrap()
         .ready = false;
     let response = reqwest::Client::new()
@@ -234,7 +243,9 @@ async fn remote_deletion_allows_stale_hits_until_bypass_and_preserves_generation
     let platform = Arc::new(Platform::default());
     let a = Activator::new(AgentState::new(store.clone()), platform.clone());
     let b = Activator::new(AgentState::new(store.clone()), platform.clone());
-    a.publish("tenant", &template()).await.unwrap();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&template()))
+        .await
+        .unwrap();
     let first = a.activate(&scope(), None, deadline()).await.unwrap();
     AgentState::new(store).begin_delete(&scope()).await.unwrap();
     assert_eq!(a.activate(&scope(), None, deadline()).await.unwrap(), first);
@@ -263,7 +274,10 @@ async fn older_observation_cannot_refill_cache_after_newer_refresh_fails() {
         AgentState::new(Arc::new(Store::default())),
         platform.clone(),
     ));
-    service.publish("tenant", &template()).await.unwrap();
+    service
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template()))
+        .await
+        .unwrap();
     let first = service.activate(&scope(), None, deadline()).await.unwrap();
     platform.pause_next_get.store(true, Ordering::SeqCst);
     let older_service = service.clone();
@@ -279,7 +293,7 @@ async fn older_observation_cannot_refill_cache_after_newer_refresh_fails() {
         .records
         .lock()
         .unwrap()
-        .get_mut(&first.binding.environment_id)
+        .get_mut(&first.binding.current.environment_id)
         .unwrap()
         .ready = false;
     assert!(matches!(
@@ -300,13 +314,16 @@ async fn older_observation_cannot_refill_cache_after_newer_refresh_fails() {
 #[tokio::test]
 async fn not_ready_binding_is_not_cached_and_can_become_ready() {
     let state = AgentState::new(Arc::new(Store::default()));
-    state.publish("tenant", &template()).await.unwrap();
+    state
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template()))
+        .await
+        .unwrap();
     let binding = state.create_binding(scope()).await.unwrap();
     let platform = Arc::new(Platform::default());
     platform.records.lock().unwrap().insert(
-        binding.environment_id.clone(),
+        binding.current.environment_id.clone(),
         EnvironmentObservation {
-            id: binding.environment_id.clone(),
+            id: binding.current.environment_id.clone(),
             tenant: binding.scope.tenant.clone(),
             phase: EnvironmentPhase::Creating,
             ready: false,
@@ -321,7 +338,7 @@ async fn not_ready_binding_is_not_cached_and_can_become_ready() {
     ));
     {
         let mut records = platform.records.lock().unwrap();
-        let record = records.get_mut(&binding.environment_id).unwrap();
+        let record = records.get_mut(&binding.current.environment_id).unwrap();
         record.phase = EnvironmentPhase::Running;
         record.ready = true;
     }
@@ -338,7 +355,10 @@ async fn warm_cache_survives_redis_failure_but_bypass_invalidates_before_read() 
     let store = Arc::new(Store::default());
     let platform = Arc::new(Platform::default());
     let service = Activator::new(AgentState::new(store.clone()), platform.clone());
-    service.publish("tenant", &template()).await.unwrap();
+    service
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template()))
+        .await
+        .unwrap();
     store.unavailable.store(true, Ordering::SeqCst);
     assert!(matches!(
         service.template("tenant", "app", "1").await,
@@ -383,7 +403,10 @@ async fn sliding_ttl_renews_on_access_and_lru_eviction_only_causes_reload() {
         },
     )
     .unwrap();
-    service.publish("tenant", &template()).await.unwrap();
+    service
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template()))
+        .await
+        .unwrap();
     let a = scope();
     let b = Scope {
         binding_id: "b".into(),

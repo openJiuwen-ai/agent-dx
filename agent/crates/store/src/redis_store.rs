@@ -25,13 +25,13 @@ end
 for i = 1, count do
   local key = KEYS[i]
   local replacement = ARGV[(i-1)*3+3]
-  local index = tonumber(ARGV[(i-1)*3+4])
+  local indexes = cjson.decode(ARGV[(i-1)*3+4])
   if replacement == '#delete' then
     redis.call('DEL', key)
-    if index > 0 then redis.call('ZREM', KEYS[index], key) end
+    for _, index in ipairs(indexes) do redis.call('ZREM', KEYS[index], key) end
   elseif replacement ~= '' then
     redis.call('SET', key, replacement)
-    if index > 0 then redis.call('ZADD', KEYS[index], 0, key) end
+    for _, index in ipairs(indexes) do redis.call('ZADD', KEYS[index], 0, key) end
   end
 end
 return 1
@@ -56,11 +56,11 @@ struct ConnectionState {
 
 #[derive(Clone)]
 pub struct RedisRepository {
-    client: redis::Client,
+    pub(crate) client: redis::Client,
     connection: std::sync::Arc<tokio::sync::Mutex<ConnectionState>>,
     budget: std::sync::Arc<tokio::sync::Semaphore>,
-    prefix: String,
-    timeout: Duration,
+    pub(crate) prefix: String,
+    pub(crate) timeout: Duration,
 }
 impl RedisRepository {
     pub async fn connect(url: &str, namespace: &str, timeout: Duration) -> Result<Self> {
@@ -109,7 +109,7 @@ impl RedisRepository {
         })
     }
     async fn check_schema(&self) -> Result<()> {
-        const SCHEMA: &str = "binding-index-v1";
+        const SCHEMA: &str = "binding-numbered-versions-v3";
         let key = format!("{}schema", self.prefix);
         let mut set = redis::cmd("SET");
         set.arg(&key).arg(SCHEMA).arg("NX");
@@ -192,7 +192,7 @@ impl Repository for RedisRepository {
         let indexes: Vec<_> = tx
             .checks
             .iter()
-            .filter_map(|c| c.key.1.clone())
+            .flat_map(|c| c.key.1.iter().cloned())
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
@@ -218,14 +218,19 @@ impl Repository for RedisRepository {
                     ""
                 }),
             };
-            command.arg(
-                check
-                    .key
-                    .1
-                    .as_ref()
-                    .and_then(|index| indexes.iter().position(|i| i == index))
-                    .map_or(0, |i| tx.checks.len() + i + 1),
-            );
+            let positions: Vec<_> = check
+                .key
+                .1
+                .iter()
+                .filter_map(|index| {
+                    indexes
+                        .iter()
+                        .position(|i| i == index)
+                        .map(|i| tx.checks.len() + i + 1)
+                })
+                .collect();
+            command
+                .arg(serde_json::to_string(&positions).map_err(|e| Error::Invalid(e.to_string()))?);
         }
         let result: i64 = self.execute(command, true).await?;
         match result {

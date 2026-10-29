@@ -159,12 +159,18 @@ pub struct ModelConfig {
     pub api_base: String,
     pub admin_key_env: String,
     pub max_budget: f64,
+    /// Displayed points per LiteLLM budget unit; does not alter billing or key budgets.
+    #[serde(default = "default_points_per_budget_unit")]
+    pub points_per_budget_unit: f64,
     #[serde(default)]
     pub budget_duration: Option<String>,
     pub rpm_limit: u32,
     pub tpm_limit: u32,
     #[serde(default)]
     pub allow_plaintext: bool,
+}
+fn default_points_per_budget_unit() -> f64 {
+    1.0
 }
 pub struct AccountService {
     pub(crate) store: AccountStore,

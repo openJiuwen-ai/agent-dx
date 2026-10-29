@@ -1,6 +1,6 @@
 # Agent DX 当前目录与组件边界
 
-核对日期：2026-10-14。此页描述当前源码布局；首次导入记录保留在 [迁移报告](../migration/2026-09-14-import.md)。[HTML 阅读版](repository-layout.html) 从本文件生成，架构图为仓库内 SVG。
+核对日期：2026-10-29。此页描述当前源码布局；首次导入记录保留在 [迁移报告](../migration/2026-09-14-import.md)。[HTML 阅读版](repository-layout.html) 从本文件生成，架构图为仓库内 SVG。
 
 ![当前组件与调用方向](../../assets/architecture/current-architecture.svg)
 
@@ -13,9 +13,9 @@
 | 执行平台 `platform/` | 通用 Environment、调度、持久化、节点生命周期、Execd | Coordinator、adxlet、本地优先创建及 EROFS/OCI 运行环境已接入；沿用已有实现；本次验证见 [命名调整记录](../testing/environment-naming.md) |
 | 共享接入 `gateway/` | Environment API Server、Ingress、Relay、反向代理与转发 | API Server 默认内嵌 Ingress；adxlet 默认内嵌 Relay；Agent API 装配于 Ingress，业务规则归 Agent 层 |
 
-Agent API 在 Gateway Ingress 内处理产品请求。独立模式通过 ActivatorClient 调用远程 Activator，后者经 API Server Environment HTTP 接口访问平台；API Server 内嵌模式通过 LocalControl 调用同进程 Activator，直接复用 Environment 应用服务。两种模式均由 Activator 持久化 Template/AgentBinding。Agent 执行规格先由 Activator 的共享 mapper 转为 Environment 请求；API Server 应用服务再统一校验、转换为 EnvironmentSpec 并注入 runtime。Gateway 与 Activator 均缓存不可变模板；Activator 的 AgentBinding 激活缓存采用有界 LRU，默认 200000 条、5 小时滑动 TTL，请求命中续期，过期检查只随请求发生。独立模式全热解析只有一次 Activator RPC，嵌入式模式仅本地调用，不访问 Agent Redis 或 Environment API。bypass 在查询权威状态前失效旧绑定，发送前目标重试自动启用 bypass；HTTP/SSH 固定 generation，WS 在发送任何后端握手或业务字节前，可对权威确认的 Binding 删除/换代在原期限内刷新一次，缺失时复用本次初始化参数；删除中的并发请求允许成功或失败，缓存不代表实时健康。
+Agent API 在 Gateway Ingress 内处理产品请求。独立模式通过 ActivatorClient 调用远程 Activator，后者经 API Server Environment HTTP 接口访问平台；API Server 内嵌模式通过 LocalControl 调用同进程 Activator，直接复用 Environment 应用服务。两种模式均由 Activator 持久化 Template/AliasConfig/AgentBinding，公开 Alias GET/PUT 与模板管理共用 Ingress 的租户鉴权。Gateway 选择逻辑 Binding 身份，Activator 统一选择别名实际版本并校验服务协议/端口。文件入口从 Activator 一次读取 Binding 及其实际版本模板的只读快照，再由 Gateway 校验业务权限。Agent 执行规格先由 Activator 的共享 mapper 转为 Environment 请求；API Server 应用服务再统一校验、转换为 EnvironmentSpec 并注入 runtime。Gateway 与 Activator 均缓存不可变模板；Activator 的 AgentBinding 激活缓存采用有界 LRU，默认 200000 条、5 小时滑动 TTL，请求命中续期，过期检查只随请求发生。独立模式的数字版本及别名全热解析均只有一次 Activator RPC，Activator 不访问 Agent Redis 或 Environment API；嵌入式模式仅本地调用。bypass 在查询权威状态前失效旧绑定，发送前目标重试自动启用 bypass；HTTP/SSH 固定 generation，WS 在发送任何后端握手或业务字节前，可对权威确认的 Binding 删除/换代在原期限内刷新一次，缺失时复用本次初始化参数；删除中的并发请求允许成功或失败，缓存不代表实时健康。
 
-独立 Activator 模式下，Gateway 按完整 AgentBinding scope 做 Rendezvous Hash 亲和路由；静态直达实例列表和 Redis 注册发现二选一。启用发现时，Activator 默认每 5 秒续租 15 秒成员租约，Gateway 约每 5 秒刷新本地列表；请求路径不访问注册目录。Gateway 只读取独立注册键，Template/AgentBinding 权威元数据仍仅由 Activator 访问。成员变化和故障转移只改变缓存归属，不迁移 Environment，不新增生命周期控制器。Agent 不直接操作平台 Redis/SQLite 或 sandboxd。Activator 的生命周期访问只经 API Server：独立部署调用现有 HTTP 接口，嵌入部署调用应用服务；Ingress 不提供旧 Environment v2 管理入口。Jiuwen 通过 Ingress 通用文件能力读写 Environment，归属与 Running 状态经 API Server 查询，文件正文经 Relay/Execd 传输；Execd 凭据由共享数据面持有。用户 Harness 的 HTTP/WS/SSH 经共享数据面转发，业务协议由用户定义。
+独立 Activator 模式下，Gateway 按完整 AgentBinding scope 做 Rendezvous Hash 亲和路由；静态直达实例列表和 Redis 注册发现二选一。启用发现时，Activator 默认每 5 秒续租 15 秒成员租约，Gateway 约每 5 秒刷新本地列表；请求路径不访问注册目录。Gateway 只读取独立注册键，Template/AgentBinding 权威元数据仍仅由 Activator 访问。成员变化和故障转移重新分配请求亲和与别名收敛 owner，本身不迁移 Environment。别名配置变化由 Activator 准备新 Env、CAS 切换 current，再通过既有 Environment delete 清理旧引用；优雅退出为 Platform 能力缺口，本次不实现，Activator 不统计连接。启动、订阅重连和成员变化触发恢复扫描，无周期全量 Binding 扫描。Agent 不直接操作平台 Redis/SQLite 或 sandboxd。Activator 的生命周期访问只经 API Server：独立部署调用现有 HTTP 接口，嵌入部署调用应用服务；Ingress 不提供旧 Environment v2 管理入口。Jiuwen 通过 Ingress 通用文件能力读写 Environment，归属与 Running 状态经 API Server 查询，文件正文经 Relay/Execd 传输；Execd 凭据由共享数据面持有。用户 Harness 的 HTTP/WS/SSH 经共享数据面转发，业务协议由用户定义。
 
 API Server 仍保留原有九条 `/api/agent` 兼容转发路由，由 `agent_address` 指向外部 Agent 服务；这是平台侧既有入口，不属于当前 Ingress Agent API／Activator 链路，本轮保持不变。
 
@@ -142,6 +142,8 @@ Proxy 首次启动关闭 Environment 准入，adxlet 完成权威对账与全量
 ## Agent 首次访问与模板参数
 
 通用 HTTP/WS 接入的 `X-ADX-Parameters` 使用 URL 表单编码。Ingress 将原始字节交给共享解析/激活流程，只有 Binding 不存在时才解析、校验并原子保存参数；已有 Binding 忽略新输入，包括格式错误。并发首次访问复用成功落库的 Binding。Template.env 和 mounts.host_path 使用持久化参数渲染，挂载参数仍受路径约束；Binding 参数当前明文保存。内置 Jiuwen 通过共享流程按需提供业务参数，不再有独立 prepare 阶段、私有 launch 快照或模型专用覆盖逻辑。参数 Header 在转发前移除。
+
+模板发布定义不携带版本号；Agent 用同一持久化 CAS 事务推进 tenant/template 序列并保存数字版本快照。统一 template/binding URN 中的纯数字 reference 选择版本，非数字 reference 选择 Alias。内部 Scope 继续保存显式类型。Orbit 入口配置 `template_ref` 字符串并复用此解析，用户和 workspace 身份不变；其模板通过受管 Volume 挂载原目录。已有字符串模板转成同名 Alias 由独立的人工运维流程完成，不在运行时自动迁移。
 
 ## 协议与持久化
 

@@ -5,7 +5,9 @@ fn urn_and_ssh_routes_keep_target_identity_and_options() {
     for value in [
         "urn:adx:instance:instance-1",
         "urn:adx:template:demo:1",
+        "urn:adx:template:demo:production",
         "urn:adx:binding:demo:1:env%3Aone",
+        "urn:adx:binding:demo:production:env%3Aone",
     ] {
         let target: Target = value.parse().unwrap();
         assert_eq!(target.to_string(), value);
@@ -32,6 +34,7 @@ fn urn_and_ssh_routes_keep_target_identity_and_options() {
 fn malformed_or_ambiguous_routes_are_rejected() {
     for value in [
         "urn:adx:template:demo",
+        "urn:adx:alias-binding:demo:production:user",
         "urn:adx:template::1",
         "urn:adx:instance:id%GG",
         "urn:adx:binding:a:b:x:y",
@@ -44,5 +47,14 @@ fn malformed_or_ambiguous_routes_are_rejected() {
         "adx:target:urn%3Aadx%3Atemplate%3Ademo%3A1:instance=id",
     ] {
         assert!(value.parse::<SshRoute>().is_err(), "{value}");
+    }
+}
+
+#[test]
+fn numeric_qualifiers_reject_zero_leading_zeroes_and_overflow() {
+    for reference in ["0", "01", "18446744073709551616"] {
+        assert!(format!("urn:adx:binding:agent:{reference}:user")
+            .parse::<Target>()
+            .is_err());
     }
 }

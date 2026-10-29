@@ -83,7 +83,8 @@ changed source, mode or initialization request does not overwrite them. A new
 definition after deletion receives a new UID.
 
 An optional `owner_id` associates the resource with a lifecycle, idempotently.
-Activator uses the Binding's stable Environment ID. Several owners may share a
+Activator uses the actual Environment ID of each saved Binding execution reference;
+an Alias upgrade associates the new Environment before releasing the old owner. Several owners may share a
 Volume. Owner release cancels an unassigned request when its outcome is settled,
 removes that Environment's fixed references, and deletes definitions only when
 this was the last owner and no other references or occupancy remain. Otherwise

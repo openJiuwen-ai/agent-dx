@@ -18,7 +18,7 @@ Activator mode, AgentBinding operations use deterministic rendezvous hashing ove
 instance URLs or Redis membership discovery; discovery refresh runs in the
 background and requests use a local member snapshot. Embedded Activator mode calls
 the local module without cross-instance AgentBinding affinity. Both modes share AgentBinding activation caching
-and explicit bypass semantics. See the
+and explicit bypass semantics. Both modes automatically start membership leases, change subscriptions and background reconciliation when `registration` is configured; omitting it keeps request-driven processing. There is no separate `reconciliation` configuration field. Embedded background ownership does not change local request calls. Registration does not expose an internal HTTP listener; remote Activator discovery must exclude embedded members without that interface. See the
 [Agent deployment and cache contract](../agent/README.md#activator-%E5%8F%91%E7%8E%B0%E4%B8%8E-agentbinding-%E4%BA%B2%E5%92%8C%E8%B7%AF%E7%94%B1).
 
 The typed public Ingress → Relay → EXECD operations are defined by the
@@ -389,6 +389,23 @@ forwarding the business path, query, HTTP body or WebSocket traffic. Instance
 access neither creates a Binding nor emits Binding identity headers. Managed
 Template/Binding access keeps its existing activation behavior.
 
+### Alias targets
+
+Managed HTTP/WS/SSH accepts `urn:adx:binding:<template>:<alias>:<binding_id>`.
+The long-lived Binding scope stores an explicit version or alias reference; its
+current Environment carries the actual immutable template version and ID. Service
+validation and Alias version selection run inside Activator before Binding/Environment creation. Gateway forwards the scope/protocol/port and uses the returned target/port; a hot resolve requires one RPC for both numeric and Alias scopes. An unsent refresh can observe a newer current
+without changing Binding generation; an implicit port is selected again from the
+new version, while an explicit port remains a caller constraint. No request or
+handshake is replayed after bytes are sent.
+
+Management GET/DELETE/resolve and list operations also accept
+`/api/agent/v2/templates/<template>/aliases/<alias>/bindings[/<binding_id>]`.
+Alias configuration uses tenant-authenticated `GET/PUT /api/agent/v2/templates/<template>/aliases/<alias>` in both modes. PUT accepts `{seed, versions, expected_revision?}` and returns `{alias:{config,revision}}`; template/alias come from the URL and tenant comes from the verified key. The private aliases/put endpoint is an internal service RPC;
+see [alias setup](../agent/activator/README.md#别名收敛配置).
+Platform graceful Environment shutdown is deferred; current deletion can interrupt
+old connections. Activator requests deletion without observing connection counts.
+
 ### Managed Agent service access
 
 With `agent-api`, `AgentApi::service_access()` supplies `AgentV2Access` backed by
@@ -424,8 +441,7 @@ uses a 2 MiB worker-stack regression fixture. See the
 remaining validation boundaries.
 
 Jiuwen download settings are decoded from the selected `TemplateVersion.env` by
-`digitalmategateway::download_config::DownloadConfig::load`, using the shared ManagedService
-and its tenant/template/version cache without creating a binding or Environment.
+`digitalmategateway::download_config::DownloadConfig::from_template`. Upload/download obtain Binding identity and its actual template together from Activator's read-only bindings/view, without creating a Binding or Environment. Gateway does not choose a version from Alias weights.
 The same env is already passed to AgentServer through ExecutionSpec. Templates
 must explicitly set absolute `JIUWENSWARM_WORKSPACE` and
 `JIUWENSWARM_DOWNLOAD_ASSET_ROOT` paths. A nonempty
@@ -522,7 +538,7 @@ shared top-level `tenant` and peer application blocks. The required `jiuwen` blo
   },
   "orbit": {
     "template": "orbit",
-    "version": "v1-workspace",
+    "template_ref": "production",
     "backend_path": "/ws",
     "service_port": 18092
   }
@@ -549,8 +565,12 @@ Ingress TLS listener; business sessions do not authorize them.
 
 Use `/orbit/ws` and `Authorization: Bearer <business-token>`.
 The binding is fixed per verified user: its internal ID is `orbit-` plus the
-full hexadecimal SHA-256 of compact JSON `[tenant,user_id]`. Template/version
-remain separate scope fields. Reconnects reuse the same scope; different users
+full hexadecimal SHA-256 of compact JSON `[tenant,user_id]`. Template and
+`template_ref` remain separate scope fields. `orbit.template_ref` uses the shared
+reference parser: a canonical positive numeric string selects a version, and a
+non-numeric string selects an Alias; for example `"12"` or `"production"`.
+An Alias must exist before admission and its reconciliation requires configured
+Activator registration and Redis notifications; registration automatically starts reconciliation. Reconnects reuse the same scope; different users
 are isolated. There is no client-selected binding ID or binding ID response
 header, ownership field, or mapping table.
 
@@ -578,15 +598,27 @@ Jiuwen rule: `w-` plus the full SHA-256 of compact JSON `[tenant,template,user_i
 using Orbit's configured template. The value is stable across template versions
 and distinct from a different user's or template's workspace. The
 [Orbit template example](../agent/activator/examples/orbit-sfs-template.json)
-uses `${workspace}` in its SFS mount and model parameters in its environment.
-Existing binding parameters remain unchanged. The Orbit example declares
-`create_if_missing: true` and `create_options` with UID/GID 10001 and mode `0700`,
-so a supporting adxlet creates a missing workspace with the required ownership.
-Existing directories retain their permissions and ownership. The SFS parent must
-already be mounted and prepared. This requires a node release supporting these
-options; updating Ingress alone does not enable it on existing nodes. Local
-component tests cover creation attributes; this change has not been deployed or
-validated against SFS/Orbit in the test environment.
+omits the server-assigned version from its publish input and retains the same
+application image, using a shared managed
+Volume `orbit-workspace-${workspace}` in domain `sfs`, relative path
+`workspaces/${workspace}`, mounted at `/data/state`. With domain root `/mnt/sfs`,
+this preserves the existing workspace directory. Model parameters remain in the
+environment and existing binding parameters remain unchanged. Volume initialization
+declares `create_if_missing: true` and UID/GID 10001, mode `0700`; existing directory
+ownership and permissions are retained. Coordinator storage-domain authorization,
+node storage mounts and the SFS parent must be configured before activation.
+Shared Volume access does not provide application write isolation. The old direct
+bind Env does not acquire managed occupancy retroactively.
+
+Changing a fixed-version scope to an Alias scope changes its storage key. Deploy
+the matching `template_ref` configuration with this binary; the old `orbit.version`
+field is not accepted. Existing string template versions become same-name Aliases
+through an explicitly reviewed offline migration, with no automatic data migration.
+Preserve the existing Binding and data during that maintenance operation; changing
+the config alone can cause first traffic to create another Binding.
+Local tests cover typed references, authenticated Alias forwarding and managed
+Volume activation with a simulated Platform. Real Orbit/SFS deployment and the
+manual metadata migration remain operational acceptance work.
 
 Agent activation, connection, the post-connect session recheck and HTTP Upgrade
 share the original Orbit admission deadline; the recheck cannot add its separate
@@ -649,18 +681,27 @@ the current Gateway implementation.
 
 `POST /api/v1/auth/logout` revokes that session only. `GET /api/v1/auth/quota`
 requires the business Bearer token and returns the same quota payload as
-Jiuwenswarm: `{"ok":true,"available":true,"quota":{"total":5,"balance":3.75,
-"used":1.25,"low_balance":false,"exhausted":false,"reset_period":"",
-"reset_at":""}}`. Values are LiteLLM key `max_budget` and `spend` presented
-1:1 as points; they are not literal token counts. LiteLLM interprets
-`max_budget` as USD. The [MaaS configuration](../build/config/examples/litellm-maas.md)
-uses uniform quota rates instead: one point per million input + output tokens,
-including cached input. Paired with the account example (`5.0`, `1d`), this gives
-a five-million-token daily budget, resetting at midnight UTC on LiteLLM 1.104.2.
-Spend in this mode is not actual provider cost; concurrent calls may overshoot.
+Jiuwenswarm: `{"ok":true,"available":true,"quota":{"total":30,"balance":22.5,
+"used":7.5,"low_balance":false,"exhausted":false,"reset_period":"",
+"reset_at":""}}`. `litellm.points_per_budget_unit` scales LiteLLM key
+`max_budget`, `spend`, and their remaining balance into displayed points. It
+defaults to `1.0` and must be finite and positive. With the [account example](examples/accounts.json),
+`max_budget: 15.0` and `points_per_budget_unit: 2.0`, a LiteLLM budget of 15
+displays as 30 points; spending 3.75 displays 7.5 used and 22.5 remaining.
+Remaining points are clamped to zero: spending 20 against a budget of 15
+displays 40 used and zero remaining, with `exhausted: true`.
+When model prices use RMB, this means one point represents RMB 0.50. This
+conversion does not change LiteLLM prices, spend, key budgets, rate limits,
+or reset schedules. Missing total or used values remain `-1`; when either
+is unknown, remaining points are zero without marking the budget exhausted.
+Unrepresentable converted
+amounts return `503 AUTH_UNAVAILABLE`. Low-balance and exhaustion flags retain
+their budget semantics. Concurrent model calls may overshoot the budget.
+The multiplier is read at Ingress startup; restarting with a new value changes
+subsequent quota responses for both new and existing keys.
 `budget_duration: null` gives a one-time key budget;
 a configured duration enables resets. Existing keys retain their LiteLLM
-budget policy; configuration changes apply to newly issued keys. The query
+budget policy; changes to `max_budget` and `budget_duration` apply to newly issued keys. The query
 creates or reconciles the user's persisted key if needed, without creating a Sandbox. It does not
 accept query parameters and returns `Cache-Control: no-store`.
 `/ws`, `GET/HEAD

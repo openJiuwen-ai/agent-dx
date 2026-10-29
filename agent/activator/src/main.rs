@@ -1,5 +1,6 @@
 use adx_activator::{
-    registration::{RegistrationConfig, RegistrationLease},
+    reconciliation::{ReconcileSettings, Reconciliation},
+    registration::RegistrationConfig,
     server,
     transport::HttpEnvironment,
     Activator, CacheSettings,
@@ -60,26 +61,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?,
     );
     let activator = Arc::new(Activator::with_cache(
-        AgentState::new(store),
+        AgentState::new(store.clone()),
         environment,
         settings.binding_cache,
     )?);
     let app = server::router(
-        activator,
+        activator.clone(),
         &std::env::var("ADX_ACTIVATOR_SERVICE_TOKEN")?,
         timeout,
     )?;
     let listener = tokio::net::TcpListener::bind(settings.listen).await?;
-    let registration = match settings.registration {
+    let reconciliation = match settings.registration {
         Some(config) => Some(
-            RegistrationLease::start(
+            Reconciliation::start(
+                activator,
+                store.as_ref().clone(),
                 adx_agent_store::discovery::RedisRegistry::new(
                     &settings.redis_url,
                     &settings.namespace,
                     Duration::from_secs(3),
                 )?,
                 config,
-                settings.allow_plaintext_transport,
+                ReconcileSettings::default(),
             )
             .await?,
         ),
@@ -98,10 +101,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 let _ = tokio::signal::ctrl_c().await;
             }
-            if let Some(registration) = registration {
-                if let Err(error) = registration.shutdown().await {
-                    tracing::warn!(%error, "Activator unregister failed; lease will expire");
-                }
+            if let Some(reconciliation) = reconciliation {
+                if let Err(error) = reconciliation.shutdown().await { tracing::warn!(%error, "Activator reconciliation shutdown failed; lease will expire"); }
             }
         })
         .await?;

@@ -26,7 +26,7 @@ fn affinity_is_order_independent_and_membership_changes_only_move_affected_envs(
         let scope = Scope {
             tenant: "tenant".into(),
             template: "app".into(),
-            version: "1".into(),
+            template_ref: adx_agent_core::TemplateRef::Version("1".into()),
             binding_id: i.to_string(),
         };
         let ranked = ranked_endpoints(&scope, &old);

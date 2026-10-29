@@ -23,7 +23,8 @@ pub fn ranked_endpoints(scope: &Scope, endpoints: &[ActivatorEndpoint]) -> Vec<A
     let key = crate::encode_key(&[
         &scope.tenant,
         &scope.template,
-        &scope.version,
+        scope.template_ref.kind(),
+        scope.template_ref.name(),
         &scope.binding_id,
     ]);
     let mut ranked: Vec<_> = endpoints

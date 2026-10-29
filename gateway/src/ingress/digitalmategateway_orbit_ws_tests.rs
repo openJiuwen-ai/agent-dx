@@ -7,10 +7,16 @@ fn orbit_settings(port: u16) -> DigitalMateGatewayConfig {
         "tenant":"tenant",
         "jiuwen":{"agent_type":"assistant", "template":"demo", "version":"1"},
         "orbit": {
-            "template":"orbit", "version":"fixed", "backend_path":"/opaque", "service_port":port
+            "template":"orbit", "template_ref":"1", "backend_path":"/opaque", "service_port":port
         }
     }))
     .unwrap()
+}
+
+fn orbit_alias_settings(port: u16) -> DigitalMateGatewayConfig {
+    let mut config = orbit_settings(port);
+    config.orbit.as_mut().unwrap().template_ref = "production".into();
+    config
 }
 
 fn orbit_request(query: &str) -> Request<Full<Bytes>> {
@@ -183,7 +189,18 @@ async fn orbit_ws_reuses_shared_forwarding_and_preserves_frames() {
         })
     };
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
-    state.publish("tenant", &serde_json::from_value(json!({"name":"orbit","version":"fixed","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"ws","port":port}]})).unwrap()).await.unwrap();
+    state.publish("tenant", &adx_agent_core::TemplateDraft::from(&serde_json::from_value(json!({"name":"orbit","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"ws","port":port}]})).unwrap())).await.unwrap();
+    state
+        .put_alias(
+            &serde_json::from_value(json!({
+                "tenant":"tenant", "template":"orbit", "alias":"production", "seed":"stable",
+                "versions":[{"version":"1", "weight":1}]
+            }))
+            .unwrap(),
+            None,
+        )
+        .await
+        .unwrap();
     let mut bindings = vec![];
     for user in ["alice", "bob"] {
         bindings.push(
@@ -191,7 +208,7 @@ async fn orbit_ws_reuses_shared_forwarding_and_preserves_frames() {
                 .create_binding(adx_agent_core::Scope {
                     tenant: "tenant".into(),
                     template: "orbit".into(),
-                    version: "fixed".into(),
+                    template_ref: adx_agent_core::TemplateRef::Alias("production".into()),
                     binding_id: format!(
                         "orbit-{}",
                         hex::encode(Sha256::digest(
@@ -209,7 +226,7 @@ async fn orbit_ws_reuses_shared_forwarding_and_preserves_frames() {
     )))));
     let (gateway, _, routes) = fixture_with_routes().await;
     for binding in &bindings {
-        let route: crate::common::route::RouteInfo = serde_json::from_value(json!({"instanceID":binding.environment_id,"instanceStatus":{"code":3},"tenantID":"tenant","environmentID":format!("runtime-{}",binding.scope.binding_id),"environmentIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
+        let route: crate::common::route::RouteInfo = serde_json::from_value(json!({"instanceID":binding.current.environment_id,"instanceStatus":{"code":3},"tenantID":"tenant","environmentID":format!("runtime-{}",binding.scope.binding_id),"environmentIP":"127.0.0.1","nodeProxyAddress":address.to_string()})).unwrap();
         relay
             .activate_route(
                 route.instance_id.clone(),
@@ -225,8 +242,12 @@ async fn orbit_ws_reuses_shared_forwarding_and_preserves_frames() {
             .as_ref()
             .clone()
             .with_digitalmategateway_api(Arc::new(
-                DigitalMateGatewayApi::new(orbit_settings(port), managed.clone(), auth.clone())
-                    .unwrap(),
+                DigitalMateGatewayApi::new(
+                    orbit_alias_settings(port),
+                    managed.clone(),
+                    auth.clone(),
+                )
+                .unwrap(),
             )),
     );
     let reconcile = tokio::spawn(gateway.clone().run_route_reconciler(routes.subscribe()));
@@ -309,7 +330,7 @@ async fn orbit_ws_reuses_shared_forwarding_and_preserves_frames() {
                 tokio::time::advance(Duration::from_secs(31)).await;
                 tokio::time::resume();
             } else {
-                routes.delete(&bindings[1].environment_id);
+                routes.delete(&bindings[1].current.environment_id);
             }
             let end = tokio::time::timeout(Duration::from_secs(3), front.next())
                 .await
@@ -323,7 +344,7 @@ async fn orbit_ws_reuses_shared_forwarding_and_preserves_frames() {
         client.abort();
     }
     // A blocked post-connect account read must consume the original admission budget.
-    let mut config = orbit_settings(port);
+    let mut config = orbit_alias_settings(port);
     config.orbit.as_mut().unwrap().request_timeout_seconds = 1;
     let bounded = Arc::new(
         gateway
@@ -378,7 +399,7 @@ async fn orbit_ws_reuses_shared_forwarding_and_preserves_frames() {
             .unwrap()
             .unwrap();
         if route_revoked {
-            routes.delete(&bindings[0].environment_id);
+            routes.delete(&bindings[0].current.environment_id);
         } else {
             auth.inner
                 .0
@@ -423,8 +444,9 @@ async fn orbit_ws_reuses_shared_forwarding_and_preserves_frames() {
                 .await
                 .unwrap()
                 .unwrap()
+                .current
                 .environment_id,
-            binding.environment_id
+            binding.current.environment_id
         );
     }
     app.abort();
@@ -497,81 +519,181 @@ impl crate::ingress::accounts::BusinessAuth for ModelAuth {
     }
 }
 
+struct OrbitVolumeBackend {
+    inner: Arc<dyn Environment>,
+    volumes: Mutex<Vec<(String, String, adx_agent_core::volumes::VolumeSpec)>>,
+    creations: Mutex<Vec<CreateEnvironment>>,
+}
+
+#[async_trait::async_trait]
+impl Environment for OrbitVolumeBackend {
+    async fn ensure_volume(
+        &self,
+        tenant: &str,
+        owner: &str,
+        spec: &adx_agent_core::volumes::VolumeSpec,
+    ) -> Result<adx_agent_core::volumes::VolumeRef, EnvironmentError> {
+        self.volumes
+            .lock()
+            .unwrap()
+            .push((tenant.into(), owner.into(), spec.clone()));
+        Ok(adx_agent_core::volumes::VolumeRef {
+            id: spec.id.clone(),
+            uid: "synthetic-volume-uid".into(),
+        })
+    }
+
+    async fn create(
+        &self,
+        request: &CreateEnvironment,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        self.creations.lock().unwrap().push(request.clone());
+        self.inner.create(request).await
+    }
+
+    async fn get(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<Option<EnvironmentObservation>, EnvironmentError> {
+        self.inner.get(tenant, id).await
+    }
+
+    async fn delete(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        self.inner.delete(tenant, id).await
+    }
+}
+
 #[tokio::test]
 async fn orbit_initialization_uses_account_model_and_user_workspace_parameters() {
-    let (gateway, backend) = fixture().await;
-    let state = AgentState::new(Arc::new(MemoryRepository::default()));
-    let mut template: adx_agent_core::TemplateVersion = serde_json::from_str(include_str!(
-        "../../../agent/activator/examples/orbit-sfs-template.json"
-    ))
-    .unwrap();
-    template.version = "fixed".into();
-    state.publish("tenant", &template).await.unwrap();
-    let managed = Arc::new(ManagedService::new(Arc::new(LocalControl::new(Arc::new(
-        adx_activator::Activator::new(state.clone(), backend),
-    )))));
-    let auth = Arc::new(ModelAuth::new());
-    let gateway = Arc::new(
-        gateway
-            .as_ref()
-            .clone()
-            .with_digitalmategateway_api(Arc::new(
-                DigitalMateGatewayApi::new(orbit_settings(18092), managed, auth.clone()).unwrap(),
-            )),
-    );
-    let scope = adx_agent_core::Scope {
-        tenant: "tenant".into(),
-        template: "orbit".into(),
-        version: "fixed".into(),
-        binding_id: format!(
-            "orbit-{}",
-            hex::encode(Sha256::digest(
-                serde_json::to_vec(&["tenant", "alice"]).unwrap()
-            ))
-        ),
-    };
-    let mut identity = None;
-    for _ in 0..2 {
-        let (mut sender, server, client) =
-            connection(gateway.clone(), IngressSecurity::Plaintext).await;
-        let mut request = orbit_request("");
-        request.headers_mut().insert(
-            adx_agent_core::parameters::HEADER,
-            "workspace=forged".parse().unwrap(),
-        );
-        // Activation succeeds; this fixture deliberately publishes no Environment route.
-        let response = sender.send_request(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        response.collect().await.unwrap();
-        let binding = state.binding(&scope).await.unwrap().unwrap();
-        assert_eq!(binding.parameters.len(), 3);
-        assert_eq!(binding.parameters["model_api_key"], "synthetic-model-key");
-        assert_eq!(binding.parameters["model_api_base"], "http://model.test/v1");
-        assert_eq!(
-            binding.parameters["workspace"],
-            format!(
-                "w-{}",
-                hex::encode(Sha256::digest(
-                    serde_json::to_vec(&["tenant", "orbit", "alice"]).unwrap()
-                ))
+    for reference in [
+        adx_agent_core::TemplateRef::Version("1".into()),
+        adx_agent_core::TemplateRef::Alias("production".into()),
+    ] {
+        let (gateway, backend) = fixture().await;
+        let state = AgentState::new(Arc::new(MemoryRepository::default()));
+        let draft: adx_agent_core::TemplateDraft = serde_json::from_str(include_str!(
+            "../../../agent/activator/examples/orbit-sfs-template.json"
+        ))
+        .unwrap();
+        let template = draft.with_version("1".into());
+        state
+            .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
+            .await
+            .unwrap();
+        state
+            .put_alias(
+                &serde_json::from_value(json!({
+                    "tenant":"tenant", "template":"orbit", "alias":"production", "seed":"stable",
+                    "versions":[{"version":"1", "weight":1}]
+                }))
+                .unwrap(),
+                None,
             )
+            .await
+            .unwrap();
+        let backend = Arc::new(OrbitVolumeBackend {
+            inner: backend,
+            volumes: Mutex::new(Vec::new()),
+            creations: Mutex::new(Vec::new()),
+        });
+        let managed = Arc::new(ManagedService::new(Arc::new(LocalControl::new(Arc::new(
+            adx_activator::Activator::new(state.clone(), backend.clone()),
+        )))));
+        let auth = Arc::new(ModelAuth::new());
+        let gateway = Arc::new(
+            gateway
+                .as_ref()
+                .clone()
+                .with_digitalmategateway_api(Arc::new(
+                    DigitalMateGatewayApi::new(
+                        {
+                            let mut config = orbit_settings(18092);
+                            config.orbit.as_mut().unwrap().template_ref = reference.name().into();
+                            config
+                        },
+                        managed,
+                        auth.clone(),
+                    )
+                    .unwrap(),
+                )),
         );
-        let mounts = template.render_mounts(&binding.parameters).unwrap();
-        assert_eq!(
-            mounts[0].host_path,
-            format!("/mnt/sfs/workspaces/{}", binding.parameters["workspace"])
-        );
-        assert_eq!(mounts[0].target, "/data/state");
-        let env = template.render_env(&binding.parameters).unwrap();
-        assert_eq!(env["API_KEY"], "synthetic-model-key");
-        assert_eq!(env["API_BASE"], "http://model.test/v1");
-        assert_eq!(env["ORBIT_WORKSPACE"], "/data/state");
-        if let Some(previous) = &identity {
-            assert_eq!(&binding.environment_id, previous);
+        let scope = adx_agent_core::Scope {
+            tenant: "tenant".into(),
+            template: "orbit".into(),
+            template_ref: reference,
+            binding_id: format!(
+                "orbit-{}",
+                hex::encode(Sha256::digest(
+                    serde_json::to_vec(&["tenant", "alice"]).unwrap()
+                ))
+            ),
+        };
+        let mut identity = None;
+        for _ in 0..2 {
+            let (mut sender, server, client) =
+                connection(gateway.clone(), IngressSecurity::Plaintext).await;
+            let mut request = orbit_request("");
+            request.headers_mut().insert(
+                adx_agent_core::parameters::HEADER,
+                "workspace=forged".parse().unwrap(),
+            );
+            // Activation succeeds; this fixture deliberately publishes no Environment route.
+            let response = sender.send_request(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            response.collect().await.unwrap();
+            let binding = state.binding(&scope).await.unwrap().unwrap();
+            assert_eq!(binding.parameters.len(), 3);
+            assert_eq!(binding.parameters["model_api_key"], "synthetic-model-key");
+            assert_eq!(binding.parameters["model_api_base"], "http://model.test/v1");
+            assert_eq!(
+                binding.parameters["workspace"],
+                format!(
+                    "w-{}",
+                    hex::encode(Sha256::digest(
+                        serde_json::to_vec(&["tenant", "orbit", "alice"]).unwrap()
+                    ))
+                )
+            );
+            let mounts = template.render_mounts(&binding.parameters).unwrap();
+            let volume_id = format!("orbit-workspace-{}", binding.parameters["workspace"]);
+            assert_eq!(mounts[0].volume_id.as_deref(), Some(volume_id.as_str()));
+            assert!(mounts[0].host_path.is_empty());
+            assert_eq!(binding.current.version, "1");
+            assert_eq!(binding.volumes[&volume_id], "synthetic-volume-uid");
+            for (tenant, owner, volume) in backend.volumes.lock().unwrap().iter() {
+                assert_eq!(tenant, "tenant");
+                assert_eq!(owner, &binding.current.environment_id);
+                assert_eq!(volume.id, volume_id);
+                let adx_agent_core::volumes::VolumeSource::Directory { path, .. } = &volume.source;
+                assert_eq!(
+                    path,
+                    &format!("workspaces/{}", binding.parameters["workspace"])
+                );
+            }
+            let creations = backend.creations.lock().unwrap();
+            assert_eq!(creations.len(), 1);
+            assert_eq!(
+                creations[0].execution.mounts[0].volume_uid.as_deref(),
+                Some("synthetic-volume-uid")
+            );
+            assert!(creations[0].execution.mounts[0].host_path.is_empty());
+            assert_eq!(mounts[0].target, "/data/state");
+            let env = template.render_env(&binding.parameters).unwrap();
+            assert_eq!(env["API_KEY"], "synthetic-model-key");
+            assert_eq!(env["API_BASE"], "http://model.test/v1");
+            assert_eq!(env["ORBIT_WORKSPACE"], "/data/state");
+            if let Some(previous) = &identity {
+                assert_eq!(&binding.current.environment_id, previous);
+            }
+            identity = Some(binding.current.environment_id);
+            server.abort();
+            client.abort();
         }
-        identity = Some(binding.environment_id);
-        server.abort();
-        client.abort();
+        assert_eq!(auth.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
-    assert_eq!(auth.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }

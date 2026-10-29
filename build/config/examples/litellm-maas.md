@@ -21,9 +21,13 @@ tokens. LiteLLM's spend fields and UI may still label these values as USD;
 under this configuration they are quota points, not actual provider charges.
 All newly added models must use the same rates to preserve this quota policy.
 
-Pair this configuration with `litellm.max_budget: 5.0` and
-`litellm.budget_duration: "1d"` in Ingress's `ADX_ACCOUNT_CONFIG`, as in
-[`accounts.json`](../../../gateway/examples/accounts.json). Restart Ingress
+For this uniform-token-quota example, set `litellm.max_budget: 5.0`,
+`litellm.points_per_budget_unit: 1.0`, and `litellm.budget_duration: "1d"`
+in Ingress's `ADX_ACCOUNT_CONFIG`. These override the currency-to-points
+values in [`accounts.json`](../../../gateway/examples/accounts.json).
+That account example uses a 15-unit currency budget and two displayed points
+per budget unit; it requires model prices expressed in the same currency.
+Restart Ingress
 after updating its configuration. ADX shares one persisted key across each
 business user's bindings and sessions. Its existing-key reconciliation does
 not change budgets: update existing business keys separately through LiteLLM's

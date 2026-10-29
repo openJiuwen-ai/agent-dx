@@ -1,16 +1,16 @@
 # Agent 产品状态存储
 
-`AgentState` 保存不可变 Template 和 AgentBinding 元数据；`Repository` 提供原子条件持久化。生产使用 Redis，`test-memory` 仅供显式启用的测试，不作为故障降级存储。
+`AgentState` 保存不可变 Template、AliasConfig 和 AgentBinding 元数据；`Repository` 提供原子条件持久化。生产使用 Redis，`test-memory` 仅供显式启用的测试，不作为故障降级存储。
 
 AgentState 为不可变模板提供最多 1024 条 FIFO 本地缓存，键包括 tenant/name/version；克隆 AgentState 共享该缓存，同键在途加载合并。不存在和错误结果不缓存，模板发布仍执行原权威条件写。AgentBinding 查询始终访问 Repository，不使用模板缓存作为存储故障降级；Activator 自身可缓存已验证的成功激活绑定，见 [Activator](../../activator/README.md#激活缓存)。
 
-AgentBinding scope 包含 tenant、template、version、binding_id。首次条件写提交 generation 和稳定 environment_id，并发创建返回胜出的同一记录。产品 Active/Deleting 不代表 Environment 运行状态。删除在平台确认 Deleted 或明确返回 NotFound 后按 revision 条件清理Binding 及其 parameters，旧 generation 的清理不能影响同名新环境；超时、鉴权失败和未知结果不触发最终清理。
+AgentBinding scope 包含 tenant、template、template_ref、binding_id。template_ref 是 version 或 alias 的显式引用。首次条件写提交 generation 和 current（真实 version、environment_id），并发创建返回胜出的同一记录。产品 Active/Deleting 不代表 Environment 运行状态。删除在平台确认 Deleted 或明确返回 NotFound 后按 revision 条件清理Binding 及其 parameters，旧 generation 的清理不能影响同名新环境；超时、鉴权失败和未知结果不触发最终清理。
 
 每条记录使用 UUID revision。事务先检查全部条件再修改；不持久化 Environment 运行状态或操作流水。
 
-AgentBinding 列表使用按 tenant/template/version 分组的有序集合索引。成员是 AgentBinding 记录的完整键，score 固定为 0，按键的字典序分页。创建、元数据更新和最终删除通过同一 Lua 事务维护记录与索引；Deleting 仍可见。每页最多读取 page_size + 1 条，读取索引和记录也在同一 Lua 脚本内完成，不执行全命名空间 SCAN。索引只派生自产品状态，不作为额外生命周期目录。
+AgentBinding 列表使用按 tenant/template/template_ref 分组的有序集合索引。成员是 AgentBinding 记录的完整键，score 固定为 0，按键的字典序分页。创建、元数据更新和最终删除通过同一 Lua 事务维护记录、分组索引与全局恢复索引；Deleting 仍可见。每页最多读取 page_size + 1 条，读取索引和记录也在同一 Lua 脚本内完成，不执行全命名空间 SCAN。索引只派生自产品状态，不作为额外生命周期目录。
 
-schema marker 为 `binding-index-v1`，初始化 `SET NX` 后读取确认，不扫描命名空间，不覆盖冲突 marker。本次带索引结构使用新的部署 namespace，已有测试数据不会自动建立索引；不提供在线迁移或后台修复扫描。
+schema marker 为 `binding-numbered-versions-v3`，初始化 `SET NX` 后读取确认，不扫描命名空间，不覆盖冲突 marker。旧 marker 拒绝连接；由运维完成版本映射、Binding/索引和序列核对后最后更新 marker，不提供自动迁移或后台修复扫描。迁移工具由独立运维流程管理，不接入本库或服务启动。
 
 `OutcomeUnknown` 可能已经提交。调用方读取原身份，不能换一个 Environment ID 绕过未知结果。Redis 断线后允许重新连接，不能自动重放结果未知的写入。
 
@@ -37,3 +37,16 @@ ADX_AGENT_TEST_REDIS_URL=redis://127.0.0.1:6379/0 \
 Gateway 的发现客户端延迟建立独立连接，不执行 schema 初始化，也不访问 Template/AgentBinding；发现错误不覆盖已有本地快照。注册目录需要 EVAL、TIME、HGET/HSET/HDEL、ZADD/ZREM/ZCARD/ZSCORE/ZRANGEBYSCORE/ZREMRANGEBYSCORE。部署可将 Gateway Redis 凭据限制在注册键及读取所需命令；注册写入凭据仅提供给 Activator。
 
 parameters 与 Binding 在同一条件写中持久化，当前使用明文。并发创建返回已落库的胜出记录，不比较不同调用方的参数。已存在 Binding 的新输入是否忽略由上层共享激活流程控制；存储层不参与模型配置解释、凭据加解密或 Environment 状态管理。
+
+## Alias 与两 Env 引用
+
+AliasConfig 只保存最新完整权重分布，由 UUID revision 做 CAS；配置必须引用已发布的模板，seed 不可变。put_alias 的 expected_revision 为空表示仅创建；更新必须给出上一次读取的 revision，冲突重新读取后编辑，不盲目重放。
+
+AgentBinding 的 current 与 secondary 在同一记录内原子更新。prepare_binding 先保存候选实际 ID；switch_current 同时检查最新 Alias revision、Binding generation/Active 及准备引用，交换 current 并将旧引用标为 retiring；clear_secondary 只清除调用方已确认清理的同一引用。版本选择已匹配时仍需处理 secondary。Volume ID/UID 在平台创建前按同一 Binding 生命周期固定。
+
+后台恢复枚举 `all-bindings` 有序索引，每页 128 条；不扫描 Platform 私有状态。Alias 更新、Binding 更新、启动、订阅重连和成员变化触发核对，无周期全量 Binding 扫描。
+
+通知使用独立 Pub/Sub 连接订阅 `__keyspace@<db>__:adx:v2:<namespace>:{alias,binding}:*`，仅作唤醒信号，不保存消息流水。先确认订阅再扫描；断线重连补读最新状态。部署需启用 `notify-keyspace-events 'K$g'`（或包含这些事件的更大集合），并授权 Activator `CONFIG GET notify-keyspace-events`、PSUBSCRIBE。库检查配置但不修改 Redis；配置不满足时拒绝启用收敛。
+
+
+模板发布接收 TemplateDraft，不接受调用方指定版本。`template-sequence:[tenant,name]` Record 保存最后分配的 u64；序号推进与不可变模板写入在同一 CAS 事务中提交，多个 Activator 不共享进程内计数器。每次成功发布分配一个新版本，即使内容相同；未知写入结果不自动重放。序号耗尽或未初始化序列与既有记录冲突时返回 Conflict，不扫描、重编号或迁移旧记录。运维必须在旧数据切换前保存既有最大编号及转换映射，并初始化序列；删除模板数据时也不得丢弃该高水位。

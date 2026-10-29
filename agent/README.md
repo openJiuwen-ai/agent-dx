@@ -5,14 +5,14 @@ Agent 层使用 Rust，产品 API 嵌入统一 Gateway。Activator 可独立部�
 | 目录 | 职责 |
 | --- | --- |
 | `crates/core` | 产品类型、协议、Environment 能力边界及通用校验 |
-| `crates/store` | Template/AgentBinding 元数据、Redis 原子条件写；内存实现仅供测试 |
-| `activator` | 产品管理与稳定身份激活，调用 Environment 接口，无后台健康/恢复扫描 |
-| `api` | Activator HTTP 客户端或本地模块调用、AgentBinding 身份选择、服务选择 |
+| `crates/store` | Template/AliasConfig/AgentBinding 元数据、Redis 原子条件写；内存实现仅供测试 |
+| `activator` | 产品管理、稳定逻辑身份激活及别名目标态收敛；不做 Environment 健康恢复 |
+| `api` | Activator HTTP 客户端或本地模块调用、AgentBinding 身份选择、解析结果校验 |
 | `cli` | Rust 用户命令行 `adx`；Template 发布/查询、AgentBinding 分页查询/删除、HTTP 流式调用、SSH 交互终端 |
 
-AgentBinding 对应一个稳定逻辑 Environment ID。指定 AgentBinding 的首次访问会幂等创建元数据，再激活 Environment；多副本复用同一身份。无效模板或未声明的 service 不创建 AgentBinding。Environment 状态、健康、暂停/恢复与运行载体 0–1 由 Platform 保证。产品删除确认后，新访问可以重建同名 AgentBinding，generation 隔离旧生命周期。
+AgentBinding 对应一个长期存在的逻辑实例；current 保存当前实际版本与 Environment ID，别名升级时可更换 Env 而保留 Binding generation。指定 AgentBinding 的首次访问会幂等创建元数据，再激活 Environment；多副本复用同一身份。无效模板或未声明的 service 不创建 AgentBinding。Environment 状态、健康、暂停/恢复与运行载体 0–1 由 Platform 保证。产品删除确认后，新访问可以重建同名 AgentBinding，generation 隔离旧生命周期。
 
-公开 API、认证、路由和连接实现位于 Gateway。HTTP/WS/SSH 通过普通方法调用 Agent 的 `ManagedService`，共用 AgentBinding 身份选择和 service 唯一匹配规则；身份选择本身不创建元数据或 Environment。HTTP 响应头、SSH 终端提示与协议转发仍由 Gateway 处理。
+公开 API、认证、路由和连接实现位于 Gateway。HTTP/WS/SSH 通过普通方法调用 Agent 的 `ManagedService` 选择逻辑 AgentBinding 身份，再由 Activator 统一选择实际版本并校验 service 协议和端口的唯一匹配；逻辑身份选择本身不创建元数据或 Environment。HTTP 响应头、SSH 终端提示与协议转发仍由 Gateway 处理。
 
 Gateway 对同一次请求的目标失效重试强制绕过 Activator 的成功激活缓存。HTTP/SSH 固定首次选定的 generation。WS 在发送任何后端握手或业务字节前，若权威元数据确认 Binding 已删除或换代，可在原 deadline 内重新解析同一逻辑 Binding 一次；缺失时使用本次初始化参数创建，已存在时忽略参数。Deleting、鉴权失败、draining 及同 generation 的其他冲突不触发重选。已开始发送后不切换生命周期，不重放业务请求。
 
@@ -23,7 +23,7 @@ Gateway 对同一次请求的目标失效重试强制绕过 Activator 的成功�
 Agent 模板使用业务镜像的 ENTRYPOINT/CMD、WORKDIR 和 USER，不接受 `entrypoint` 或 `working_dir` 覆盖。创建规格设置 `inherit_entrypoint=true`；Platform 注入部署侧 runtime 并生成进程配置，Execd 据此启动业务进程。业务镜像不需要预装 Execd 或额外进程 JSON。模板工作目录覆盖暂不支持；可通过 mounts 声明 Local bind 挂载。
 
 ```json
-{"name":"assistant","version":"1","image":"registry.example/assistant:v1","isolation_runtime":"runc","env":{"APP_MODE":"production"},"resources":{"cpu_millis":1000,"memory_mib":1024},"service":[{"protocol":"ws","port":8080}]}
+{"name":"assistant","image":"registry.example/assistant:v1","isolation_runtime":"runc","env":{"APP_MODE":"production"},"resources":{"cpu_millis":1000,"memory_mib":1024},"service":[{"protocol":"ws","port":8080}]}
 ```
 
 模板 `resources.cpu_millis` 与 `memory_mib` 是调度预留。可选的 `cpu_limit_millis` 与 `memory_limit_mib` 是运行上限，省略时各自等于对应预留；上限必须大于等于预留。例如 `{"cpu_millis":500,"memory_mib":1024,"cpu_limit_millis":2000,"memory_limit_mib":4096}` 按 0.5 CPU / 1 GiB 调度，允许运行时使用至 2 CPU / 4 GiB。Activator 将上限映射为 Environment API 的 `cpu_limit`、`mem_limit`，独立与嵌入式模式共用此转换。上限不计入调度预留，也不保证所有 Environment 同时获得上限资源；已有 Environment 不会因模板内容变化被原地调整或重建。
@@ -62,6 +62,8 @@ Paused/Pausing/Resuming 保留原 AgentBinding generation 和 Sandbox ID；Activ
 
 部署配置、公共接口和验证范围见 [Volume API](../platform/api/http/volumes.md)；真实存储及运行时验收仍按 [P7](../docs/development/platform-volume-design.md) 执行。
 
+[Orbit 模板](activator/examples/orbit-sfs-template.json)不包含 version 字段，发布后由服务端分配数字版本；该模板使用受管共享卷 `orbit-workspace-${workspace}`，在 storage domain `sfs` 中声明 `workspaces/${workspace}`，挂载到 `/data/state`。将域根配置为 `/mnt/sfs` 时复用原目录。存量固定版本 Binding 转到 Alias、存储域配置和首次卷交接须在停写窗口内按经审查的运维清单执行，不提供自动转换接口。
+
 ## 模板挂载与 Binding 参数
 
 模板支持 `mounts: [{"type":"bind","host_path":"/mnt/sfs/workspaces/${workspace}","target":"/home/jiuwen","options":["rw"],"create_if_missing":true}]`。Agent 支持 Local bind 和 VolumeRef；Environment API 仍支持 image/S3 等内联来源。最多 32 个挂载，目标路径不得重复；options 支持 ro、rw、nosuid、nodev、noexec，拒绝重复项及 ro/rw 同时出现。
@@ -86,7 +88,7 @@ mounts:
 
 需要为非 root 应用创建目录时，可同时声明 `create_options: {"uid":10001,"gid":10001,"mode":"0700"}`。三个字段均必填，UID/GID 为 0–4294967294 的整数，mode 为 `0000`–`0777` 的四位八进制字符串。仅允许与 `create_if_missing: true` 一起使用；只对新目录设置所有权和权限，已有目录保持原状，不递归 chown。未声明时保持原有 0755（受节点 umask 影响）及节点进程所有权。节点直接创建最终源目录，再通过目录描述符设置所有权和权限；设置失败则本次启动失败并保留目录，需修正残留权限。该过程不承诺原子初始化，并发首次使用可能看到尚未设置完成的权限。需要包含该能力的 adxlet；单独更新 Ingress 或模板不能使旧节点支持它。
 
-Activator 在准备和激活时渲染 mounts；HTTP 与嵌入式 Sandbox 适配器发送相同的具体挂载，Environment 创建请求不传 parameters 或业务 user_id；Volume 管理的 owner_id 使用 Binding 固定的 Environment ID，不代表业务用户。Jiuwen 根据认证身份的 `[tenant, template, user_id]` JSON 数组 SHA-256 生成 `w-<完整十六进制摘要>`，版本、Binding 和 Sandbox ID 不参与目录标识。
+Activator 在准备和激活时渲染 mounts；HTTP 与嵌入式 Sandbox 适配器发送相同的具体挂载，Environment 创建请求不传 parameters 或业务 user_id；Volume 管理的 owner_id 使用对应 Env 引用的实际 Environment ID，不代表业务用户。Jiuwen 根据认证身份的 `[tenant, template, user_id]` JSON 数组 SHA-256 生成 `w-<完整十六进制摘要>`，版本、Binding 和 Sandbox ID 不参与目录标识。
 
 [Jiuwen 模板例子](activator/examples/jiuwen-sfs-template.json)将应用数据和 HOME 收敛到 `/home/jiuwen`，仍采用内联挂载，尚未切换到受管 Volume；SFS 挂载由部署准备，目录创建由上述挂载声明控制。使用 SQLite/WAL 的工作区必须保证旧 Sandbox 完全停止访问后才启用后继，不能同时运行新旧版本。详见[工作区设计](../docs/development/user-workspace-volumes-design.md)和[Volume 方案](../docs/development/platform-volume-design.md)。
 
@@ -142,9 +144,9 @@ API Server 内嵌 Ingress 时，也可将 `ADX_AGENT_CONFIG` 配成嵌入式模�
 
 `activator` 与 `embedded` 只能配置一个。独立 Ingress 不持有 API Server 的业务服务，应使用独立 Activator 模式。
 
-`timeout_seconds` 默认 60 秒且必须为正，由入口确定一次绝对 deadline。管理面在鉴权后统一处理 trace、请求读取、业务调用和 JSON 响应；HTTP/WS 目标激活的模板查询、激活和内部目标重试共用同一期限。客户端将剩余预算传给 Activator，地址重选不重置期限。纯读超时返回 Unavailable，可能写入的操作超时返回 OutcomeUnknown，重试使用原身份；已到期的内部重试直接拒绝。网络连接及 Environment 后端配置上限只能缩短剩余预算。创建的 `deadline_unix_ms` 不进入执行规格或 Redis。独立 Activator 用剩余期限限制 HTTP 等待，但现有 API Server 没有该绝对期限字段；创建请求中的 `createTimeoutSeconds` 固定取 Activator 配置，保持相同身份重试的请求体与操作 ID 稳定。API Server 可能在调用方超时后继续创建，超时返回 OutcomeUnknown，不自动重放或换 ID。嵌入式 `LocalEnvironment` 同样按剩余期限限制调用等待，固定创建预算为 60 秒；提交后超时返回 OutcomeUnknown。两种模式使用相同的创建请求和确定性操作 ID。激活期限不覆盖建立后的 HTTP 响应流、WS 或 SSH 会话；SSH 模板校验、身份提示和后端握手共用 SSH 连接期限。
+`timeout_seconds` 默认 60 秒且必须为正，由入口确定一次绝对 deadline。管理面在鉴权后统一处理 trace、请求读取、业务调用和 JSON 响应；HTTP/WS 目标激活的模板查询、激活和内部目标重试共用同一期限。客户端将剩余预算传给 Activator，地址重选不重置期限。纯读超时返回 Unavailable，可能写入的操作超时返回 OutcomeUnknown，重试使用原身份；已到期的内部重试直接拒绝。网络连接及 Environment 后端配置上限只能缩短剩余预算。每次调用的 `deadline_unix_ms` 不进入执行规格或 Redis；后台收敛的下一次核对使用新的有界等待预算，沿用同一已持久化 EnvID 和固定创建规格。独立 Activator 用剩余期限限制 HTTP 等待，但现有 API Server 没有该绝对期限字段；创建请求中的 `createTimeoutSeconds` 固定取 Activator 配置，保持相同身份重试的请求体与操作 ID 稳定。API Server 可能在调用方超时后继续创建，超时返回 OutcomeUnknown，不自动重放或换 ID。嵌入式 `LocalEnvironment` 同样按剩余期限限制调用等待，固定创建预算为 60 秒；提交后超时返回 OutcomeUnknown。两种模式使用相同的创建请求和确定性操作 ID。激活期限不覆盖建立后的 HTTP 响应流、WS 或 SSH 会话；SSH 模板校验、身份提示和后端握手共用 SSH 连接期限。
 
-Gateway 与 Activator 都缓存不可变模板，按 tenant/name/version 隔离，各最多 1024 条；同键在途读取合并，缺失和失败不缓存。Gateway 不缓存 AgentBinding/Target，每次解析都调用 Activator。Activator 的 AgentBinding 成功绑定采用 LRU，默认容量 200000，滑动 TTL 为 18000 秒（5 小时）；热命中直接返回并续期，不读 Redis、不调用 Environment API。TTL 只在请求访问时检查，没有 AgentBinding 后台刷新或过期扫描；容量淘汰、闲置过期、重启和 bypass 会引起回源。缓存是派生状态，实际连通性由 Gateway/Relay 校验；删除中的并发请求允许成功或失败。Activator 进程与缓存内存测量见[进程说明](activator/README.md)，权威状态保证见[存储说明](crates/store/README.md)。
+Gateway 与 Activator 都缓存不可变模板，按 tenant/name/version 隔离，各最多 1024 条；同键在途读取合并，缺失和失败不缓存。Gateway 不缓存 AgentBinding/Target，每次解析都调用 Activator。Activator 的 AgentBinding 成功绑定采用 LRU，默认容量 200000，滑动 TTL 为 18000 秒（5 小时）；热命中直接返回并续期，不读 Redis、不调用 Environment API。TTL 只在请求访问时检查；别名收敛另由元数据事件及启动/重连/成员变化触发，不做周期全量 Binding 扫描；容量淘汰、闲置过期、重启和 bypass 会引起回源。缓存是派生状态，实际连通性由 Gateway/Relay 校验；删除中的并发请求允许成功或失败。Activator 进程与缓存内存测量见[进程说明](activator/README.md)，权威状态保证见[存储说明](crates/store/README.md)。
 
 独立模式经 ActivatorClient 调用远程进程；嵌入式模式经 LocalControl 调用同进程 Activator，复用上述缓存及 bypass 语义。嵌入式 Activator 使用默认 200000 条、5 小时配置，当前没有独立的缓存配置入口。
 
@@ -170,11 +172,15 @@ Gateway 与 Activator 都缓存不可变模板，按 tenant/name/version 隔离�
 
 Activator 在相同 Redis namespace 注册实例 ID 和可直达地址。Gateway 启动后立即异步读取成员列表，默认随后约每 5 秒刷新（±20% 抖动），`refresh_seconds` 范围 1–300。请求仅使用本地快照，不同步查 Redis。刷新失败保留上次快照；成功读取空列表则停止选路；首次尚无列表时受管请求返回 Unavailable。Gateway 仅使用 Store 的注册发现客户端，不读取或修改 Template/AgentBinding 元数据。
 
-完整 AgentBinding scope（tenant/template/version/binding_id）按固定 SHA-256 Rendezvous Hash 排序实例。所有 Gateway 使用相同成员集合时选择相同实例，成员顺序不影响结果；静态模式用规范化地址作实例 ID。resolve、bypass、单 AgentBinding 查询和删除使用相同选择规则，generation 不参与选路。成员变更只重新分配受影响的 AgentBinding；短暂列表差异允许重复缓存，身份隔离仍由权威元数据和 generation 保证。只有连接失败且请求未发送时才尝试排名第二的实例，共用原 deadline，最多两个地址；响应超时或结果未知不自动重放。无单个 AgentBinding 的模板管理/列表请求仍轮询实例。
+完整逻辑 AgentBinding scope（tenant/template/template_ref/binding_id）按固定 SHA-256 Rendezvous Hash 排序实例。所有 Gateway 使用相同成员集合时选择相同实例，成员顺序不影响结果；静态模式用规范化地址作实例 ID。resolve、bypass、单 AgentBinding 查询和删除使用相同选择规则，generation、当前实际版本和 EnvID 不参与选路。成员变更只重新分配受影响的 AgentBinding；短暂列表差异允许重复缓存，身份隔离仍由权威元数据和 generation 保证。只有连接失败且请求未发送时才尝试排名第二的实例，共用原 deadline，最多两个地址；响应超时或结果未知不自动重放。无单个 AgentBinding 的模板管理/列表请求仍轮询实例。
 
-注册发现与 AgentBinding 亲和用于独立 Activator 模式；嵌入式模式直接调用本进程 Activator，不注册成员、不做跨进程选路，也不保证相同 AgentBinding 总是落到同一个进程；多个 API Server 可能各自缓存同一 AgentBinding。注册发现不改变 Platform 的发现机制，也不增加 AgentBinding 生命周期控制器。独立模式全热解析为 **1 次 Gateway→Activator、0 次 Agent Redis、0 次 Environment API**；后台成员刷新与实例续租单独计费，不属于单次解析访问。
+独立模式的请求亲和使用注册发现；嵌入式请求直接调用本进程 Activator，不保证请求落到同一进程。两种模式配置 `registration` 后均自动启动注册续租、变更监听与后台收敛，无需单独配置 `reconciliation`；省略 registration 时只按请求处理。嵌入式 registration 位于 `embedded` 内，后台按注册成员分工；多个 API Server 仍可能各自缓存同一 Binding。嵌入式注册不会新增内部 HTTP 接口，其成员目录不能用于远程 ActivatorClient 的请求发现。配置组合见 [Activator 收敛配置](activator/README.md#别名收敛配置)。成员分工不构成排他锁，仍由 CAS 与 Platform 幂等保护副作用。注册发现不改变 Platform 的发现机制。普通 HTTP/WS/SSH 的 scope 解析、别名选版及服务协议/端口校验统一由 Activator 完成，Gateway 不读取 Alias 权重或自行选版；独立模式的数字版本和 Alias 全热 resolve 均为 **1 次 Gateway→Activator、0 次 Agent Redis、0 次 Environment API**；后台成员刷新与实例续租单独计费，不属于单次解析访问。
 
-受管接口使用 `/api/agent/v2/templates/{name}/versions/{version}/bindings/{binding_id}`，GET/DELETE 对应查询和删除；AgentBinding 由访问流量触发创建。`POST .../{id}/resolve` 接受 `{protocol, port?, bypasscache?}`；`bypasscache` 为布尔值，默认 false。true 强制当前 Activator 读取 Redis AgentBinding 并查询 Environment，跳过 AgentBinding 成功绑定，不绕过不可变模板缓存、租户/service 校验或 generation 隔离。平台刷新失败、不就绪或请求被取消后，本次绑定不作为成功缓存保留；较早的在途响应不能覆盖更新的刷新结果。其他 Activator 的本地缓存不接收失效广播；普通热调用可能继续返回旧绑定，目标失效通过 Gateway 发送前 bypass 重试修正。HTTP/SSH 重试固定原 generation；WS 仅在尚未发送后端握手或业务字节时允许一次删除/换代刷新，复用原始 deadline 和初始化参数。
+Alias 的公开管理入口为 `GET/PUT /api/agent/v2/templates/{name}/aliases/{alias}`。PUT 请求为 `{seed, versions, expected_revision?}`，返回 `{alias:{config,revision}}`；tenant 由 Gateway 鉴权确定，与模板发布使用同一租户 API Key。两种 Activator 模式均支持，示例见 [Alias 配置](activator/README.md#别名收敛配置)。
+
+SSH 使用同一 Activator resolve 结果校验服务、连接目标 Env；文件入口从 Activator 的只读 Binding/模板联合结果读取实际版本配置与 EnvID，不重新根据 Alias 选择模板，也不因查询元数据创建 Env。业务会话鉴权、下载令牌与文件范围检查仍由 Ingress 负责。
+
+受管接口使用 `/api/agent/v2/templates/{name}/versions/{version}/bindings/{binding_id}`，GET/DELETE 对应查询和删除；AgentBinding 由访问流量触发创建。`POST .../{id}/resolve` 接受 `{protocol, port?, bypasscache?}`；`bypasscache` 为布尔值，默认 false。true 强制当前 Activator 读取 Redis AgentBinding 并查询 Environment，跳过 AgentBinding 成功绑定，不绕过不可变模板缓存、租户/service 校验或 generation 隔离。平台刷新失败、不就绪或请求被取消后，本次绑定不作为成功缓存保留；较早的在途响应不能覆盖更新的刷新结果。启用别名收敛时，各 Activator 订阅 Binding 更新并失效已有缓存；传播是异步的，目标失效仍通过 Gateway 发送前 bypass 重试修正。未启用监听时保留请求触发刷新语义。HTTP/SSH 重试固定原 generation；WS 仅在尚未发送后端握手或业务字节时允许一次删除/换代刷新，复用原始 deadline 和初始化参数。
 
 例如强制刷新 HTTP 目标：
 
@@ -188,14 +194,28 @@ Activator 在相同 Redis namespace 注册实例 ID 和可直达地址。Gateway
 
 Rust CLI 的当前管理能力与配置见 [CLI 使用说明](cli/README.md)。HTTP CLI 支持方法、Header、文件/stdin 请求体、逐块响应和 stdout AgentBinding 通知；SSH CLI 使用系统 OpenSSH。
 
+## 别名目标态与灰度升级
+
+发布接口接收不含 `version` 的 TemplateDraft，原子分配同租户/模板下递增的数字版本并返回完整 TemplateVersion。版本为规范的正 u64 十进制字符串；`0`、前导零和溢出均拒绝。Alias 名不能为纯数字。通用 template/binding URN 均使用同一 reference 段；不存在自动 latest、版本优先回退查询或另一个 Alias URN 类型。已有字符串版本需通过人工运维转为数字快照和同名 Alias，不自动迁移存储。
+
+AliasConfig 保存 `tenant/template/alias/seed/versions`，versions 为 `{version, weight}` 列表。所有版本必须已发布，版本不能重复；weight 为非负 u64 整数，总和须在 1–u64::MAX 内，不要求为 100 或 10000。按 `weight / sum(weights)` 选择稳定的 Binding 分布，不逐请求抽样，也不保证实际请求量精确等于权重。seed 在同一 Alias 生命周期内不可修改，revision 不参与选择；列表重排与同比缩放不会改变分配。
+
+Scope 使用 `template_ref: {"version":"1"}` 或 `template_ref: {"alias":"production"}`。AgentBinding 保留 generation、parameters、跨版本 Volume ID/UID，并保存 current 及可选 secondary；Env 引用只有真实 version、environment_id，secondary 另带 `preparing` / `retiring` 意图。固定版本 Binding 始终使用 current。没有 AliasBinding、target_version、发布任务或第三个 Env 槽位。
+
+升级为 `current=E1 → current=E1, secondary=E2/preparing → current=E2, secondary=E1/retiring → current=E2`。先保存候选 ID，再调用 Platform；Ready Running 或已初始化 Paused 才原子交换引用。切换前 CAS 核对最新 Alias revision 与 Binding 引用。配置连续变化时优先使用最新目标，但先清理不再需要的 secondary；已退役 Env 不再次提升，回退会准备新的 Env。每次平台调用使用保存的实际 ID，不从 BindingID 或 generation 反推。
+
+切换后直接调用既有 Environment delete；Activator 不感知存量连接。删除未知时保留引用，确认删除及卷关联释放后清空。**Platform 优雅退出尚缺失，本次不实现；当前实际删除会清理运行时，不能保证旧连接不中断。** 新 Env 先建立卷 owner，旧 Env 删除确认后释放旧 owner；独享卷仍可能等待旧执行释放，无强制抢占或零空窗承诺。
+
+启用方式、Redis 通知配置及受控 curl 配置入口见 [Activator 别名收敛](activator/README.md#别名收敛配置)，完整方案见 [Agent 别名目标态与灰度升级方案](../docs/development/agent-alias-rollout-design.md)。管理页不在首期范围。公开 GET/DELETE/resolve 和分页路径也接受 `/api/agent/v2/templates/{name}/aliases/{alias}/bindings[/<binding_id>]`；读取 Alias 使用 `GET /api/agent/v2/templates/{name}/aliases/{alias}`，创建或更新使用同路径 PUT。公开入口的租户始终来自认证，两种 Activator 模式均支持通过 Ingress 写入配置。
+
 ## 统一 HTTP/WS 访问
 
 HTTP 使用 `/agent/http[/业务路径]`，WS 使用 `/agent/ws`；受管 WS 可追加业务路径。HTTP 入口拒绝 WebSocket Upgrade，WS 入口要求 GET 和 WebSocket Upgrade。通过 target 指定目标，重复路由参数返回 400：
 
 | 参数 | 路径与认证 |
 | --- | --- |
-| `target=urn:adx:template:<name>:<version>` | v2 API Key 认证；服务端生成 AgentBinding ID 并激活 |
-| `target=urn:adx:binding:<name>:<version>:<binding_id>` | v2 API Key 认证；创建或复用指定 AgentBinding |
+| `target=urn:adx:template:<name>:<reference>` | v2 API Key 认证；服务端生成 AgentBinding ID 并激活 |
+| `target=urn:adx:binding:<name>:<reference>:<binding_id>` | v2 API Key 认证；创建或复用指定 AgentBinding，数字 reference 为版本，非数字为 Alias |
 
 URN 各段按 UTF-8 百分号编码；作为 query 参数时还需要经过 URL query 编码。租户来自认证，不放在 URN 内。受管目标的端口必须匹配 service，只有一个对应协议端口时可省略。
 
@@ -213,7 +233,7 @@ HTTP/WS 入口使用 Platform API Key，要求 TLS。移除公开路径前缀及
 
 设置 `ADX_SSH_CONFIG` 后，独立 Ingress 或 API Server 内嵌 Ingress 会启动独立 SSH 监听端口。原实例使用路由用户名 `yr:instance:<id>[:port=<port>][:trace=<id>]`，受管目标使用 `adx:target:<百分号编码的完整URN>[:port=<port>][:trace=<id>]`。两种目标共用 listener，分别检查配置中的公钥授权表；路由用户名不是租户或后端 Linux 用户。
 
-SSH 首版只提供一个连接一个交互式终端，要求 PTY 和 shell 请求，支持输入输出、窗口调整、退出码与连接关闭。AgentBinding 提示在鉴权完成、交互 shell 建立后通过 stdout 显示，然后激活并连接后端；它通知选定的身份，不表示 Environment 已就绪。省略 env 时当前连接只生成一个 ID；携带返回的 AgentBinding URN 可再次访问。仅认证或打开 channel 不创建资源。inline 直接定位实例，默认端口 22，不调用 Activator，不生成 AgentBinding。
+SSH 首版只提供一个连接一个交互式终端，要求 PTY 和 shell 请求，支持输入输出、窗口调整、退出码与连接关闭。受管 SSH 在鉴权和 PTY/shell 请求完成后调用 Activator resolve；服务校验失败直接拒绝，其他结果在连接后端前通过 stdout 提示选定的 AgentBinding 身份，激活失败也可能提示原身份供重试。提示不表示 Environment 已就绪或后端 SSH 握手成功。省略 env 时当前连接只生成一个 ID；携带返回的 AgentBinding URN 可再次访问。仅认证或打开 channel 不创建资源。inline 直接定位实例，默认端口 22，不调用 Activator，不生成 AgentBinding。
 
 后端复用共享 L4 connector → Relay → Environment sshd；没有新建数据通道或本地目标缓存。使用未修改的 russh 0.63.3，不发送认证 Banner。首版不提供 SSH 远程 exec、SFTP 或端口转发。已有 Environment-ID SSH/CONNECT 转发入口保持原有行为。
 

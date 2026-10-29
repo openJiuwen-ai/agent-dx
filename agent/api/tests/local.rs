@@ -46,7 +46,7 @@ fn scope() -> Scope {
     Scope {
         tenant: "tenant".into(),
         template: "app".into(),
-        version: "1".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
         binding_id: "env".into(),
     }
 }
@@ -75,7 +75,12 @@ async fn caller_deadline_distinguishes_local_reads_and_possible_writes() {
     ));
     let ctx = context();
     assert!(matches!(
-        ctx.run(control.publish(&ctx, "tenant", &template())).await,
+        ctx.run(control.publish(
+            &ctx,
+            "tenant",
+            &adx_agent_core::TemplateDraft::from(&template())
+        ))
+        .await,
         Err(Error::OutcomeUnknown(_))
     ));
 }
@@ -90,7 +95,13 @@ async fn timed_out_activation_keeps_identity_for_another_local_replica() {
         state,
         Arc::new(StalledEnvironment),
     )));
-    a.publish(&context(), "tenant", &template()).await.unwrap();
+    a.publish(
+        &context(),
+        "tenant",
+        &adx_agent_core::TemplateDraft::from(&template()),
+    )
+    .await
+    .unwrap();
     let ctx = context();
     assert!(matches!(
         ctx.run(a.activate(&ctx, &scope(), None)).await,
@@ -164,7 +175,11 @@ async fn embedded_resolve_bypass_invalidates_warm_binding_before_backend_failure
         backend.clone(),
     ))));
     control
-        .publish(&context(), "tenant", &template())
+        .publish(
+            &context(),
+            "tenant",
+            &adx_agent_core::TemplateDraft::from(&template()),
+        )
         .await
         .unwrap();
     let managed = ManagedService::new(control);

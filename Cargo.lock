@@ -19,6 +19,7 @@ dependencies = [
  "base64 0.22.1",
  "hashlink",
  "ipnet",
+ "redis",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -64,6 +65,7 @@ version = "0.1.0"
 dependencies = [
  "adx-agent-core",
  "async-trait",
+ "futures-util",
  "base64 0.22.1",
  "redis",
  "serde",

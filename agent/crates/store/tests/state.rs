@@ -9,17 +9,30 @@ async fn exercise(a: Arc<dyn Repository>, b: Arc<dyn Repository>) {
         "resources":{"cpu_millis":1000,"memory_mib":512}
     }))
     .unwrap();
-    a.publish("tenant", &template).await.unwrap();
-    b.publish("tenant", &template).await.unwrap();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
+        .await
+        .unwrap();
+    b.publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
+        .await
+        .unwrap();
     template.image = "registry/other:1".into();
-    assert!(matches!(
-        b.publish("tenant", &template).await,
-        Err(Error::Conflict(_))
-    ));
+    let third = b
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
+        .await
+        .unwrap();
+    assert_eq!(third.version, "3");
+    assert_eq!(
+        a.template("tenant", "agent", "1")
+            .await
+            .unwrap()
+            .unwrap()
+            .image,
+        "registry/agent:1"
+    );
     let scope = Scope {
         tenant: "tenant".into(),
         template: "agent".into(),
-        version: "1".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
         binding_id: "env".into(),
     };
     let (x, y) = tokio::join!(
@@ -30,7 +43,10 @@ async fn exercise(a: Arc<dyn Repository>, b: Arc<dyn Repository>) {
     assert_eq!(original, y.unwrap());
     assert_eq!(a.binding(&scope).await.unwrap(), Some(original.clone()));
     let deleting = b.begin_delete(&scope).await.unwrap();
-    assert_eq!(deleting.environment_id, original.environment_id);
+    assert_eq!(
+        deleting.current.environment_id,
+        original.current.environment_id
+    );
     assert_eq!(deleting.phase, BindingPhase::Deleting);
     assert!(matches!(
         a.create_binding(scope.clone()).await,
@@ -40,7 +56,10 @@ async fn exercise(a: Arc<dyn Repository>, b: Arc<dyn Repository>) {
     assert!(b.binding(&scope).await.unwrap().is_none());
     let fresh = b.create_binding(scope.clone()).await.unwrap();
     assert_ne!(fresh.generation, original.generation);
-    assert_ne!(fresh.environment_id, original.environment_id);
+    assert_ne!(
+        fresh.current.environment_id,
+        original.current.environment_id
+    );
     a.finish_delete(&deleting).await.unwrap();
     assert_eq!(a.binding(&scope).await.unwrap(), Some(fresh));
     let other = Scope {
@@ -108,11 +127,14 @@ async fn deletion_cas_retry_cannot_delete_recreated_binding() {
     let repo = Arc::new(Paused::default());
     let state = AgentState::new(repo.clone());
     let template=serde_json::from_value(serde_json::json!({"name":"test","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512}})).unwrap();
-    state.publish("tenant", &template).await.unwrap();
+    state
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template))
+        .await
+        .unwrap();
     let scope = Scope {
         tenant: "tenant".into(),
         template: "test".into(),
-        version: "1".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
         binding_id: "reused".into(),
     };
     state.create_binding(scope.clone()).await.unwrap();
@@ -139,13 +161,16 @@ async fn binding_pages(repo: Arc<dyn Repository>) {
     let state = AgentState::new(repo);
     let template = serde_json::from_value(serde_json::json!({"name":"app","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512}})).unwrap();
     for tenant in ["a", "b"] {
-        state.publish(tenant, &template).await.unwrap();
+        state
+            .publish(tenant, &adx_agent_core::TemplateDraft::from(&template))
+            .await
+            .unwrap();
         for id in ["one", "two", "three"] {
             state
                 .create_binding(Scope {
                     tenant: tenant.into(),
                     template: "app".into(),
-                    version: "1".into(),
+                    template_ref: adx_agent_core::TemplateRef::Version("1".into()),
                     binding_id: id.into(),
                 })
                 .await
@@ -155,7 +180,7 @@ async fn binding_pages(repo: Arc<dyn Repository>) {
     let query = BindingList {
         tenant: "a".into(),
         template: "app".into(),
-        version: "1".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
         page_size: 2,
         page_token: None,
     };
