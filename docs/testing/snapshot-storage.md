@@ -6,13 +6,14 @@
 共享回收接口 `ArtifactReclaimer`。adxlet 处理捕获、恢复和本机缓存；Coordinator
 管理 Environment/Snapshot 的保留关系并回收共享文件。默认 ADX 构建不依赖 AFS/FUSE。
 
-## 三种模式
+## 存储模式
 
 | 模式 | 捕获 | 恢复 | 物理回收 |
 | --- | --- | --- | --- |
 | local only | 写节点私有目录，完成可读性校验 | 直接读取本地目录 | 原节点；不支持跨节点恢复 |
 | S3 + 本地缓存 | 写本地 staging，文件上传完成后发布 manifest | 命中缓存直接用；否则下载并校验后使用 | Coordinator 删除 S3；节点独立淘汰缓存 |
 | AFS / JuiceFS（distributed_fs） | 直接写挂载目录中的独立捕获目录，逐文件同步后发布 manifest | 直接使用同一共享路径，不预下载整个制品 | Coordinator 删除共享 manifest 和目录 |
+| distributed_fs + local_cache | 本地捕获，再同步复制到共享卷，最后持久发布 manifest | 本地命中，或下载校验后在节点私有目录中恢复 | Coordinator 删除共享制品；节点只淘汰未使用缓存 |
 
 每个共享后端使用稳定 `alias`。同一 alias 的所有节点与 Coordinator 必须配置同一
 存储 namespace。调度通过 `ADX_CHECKPOINT_STORAGE=<alias>` 选择兼容节点。
@@ -61,6 +62,35 @@ sandboxd 和 ADX 业务组件不调用这些后端的 SDK。JuiceFS client 必�
 快照目录、每个执行节点的私有 runtime 目录和业务 shares 目录分别管理。
 匿名恢复点跟随 Environment，仍在运行的输入由 Coordinator 的持久引用保护；
 底层 COW 块、打开文件与物理对象的回收由文件系统负责。
+
+### 共享文件系统与节点本地 reflink
+
+gVisor 原生 filestore FICLONE 要求捕获目录与运行中的 filestore 位于同一支持
+reflink 的文件系统。节点 filestore 位于本地 XFS、checkpoint 持久层位于 JuiceFS
+时，应在节点的 `distributed_fs` 配置中增加 `local_cache`：
+
+```json
+{"checkpoint_storage":{"kind":"distributed_fs","alias":"shared-checkpoints","mount_root":"/mnt/juicefs","prefix":"adx/checkpoints-cached","local_cache":{"root":"/opt/adx/data/checkpoints","budget_bytes":53687091200,"max_entries":500}}}
+```
+
+`root` 必须是独立的节点本地绝对目录，由部署层验证它与 sandboxd filestore
+位于同一个 reflink 文件系统；不能位于共享挂载内部或覆盖共享挂载。
+`budget_bytes` 和 `max_entries` 分别默认 50 GiB 和 500，必须为正数，
+仅约束未被执行使用的缓存。捕获完成后，ADX 保留本地原文件作为恢复缓存，
+将稀疏文件、目录、权限和 SHA-256 manifest 发布到共享卷。
+数据及目录完成同步后，manifest 才成为发布标识；源节点丢失后，其他节点
+先将完整文件校验并落到自己的本地目录，再交给 sandboxd。
+本地 reflink 不省去跨节点数据传输，也不实现应用内存脏页增量快照。
+
+首次启用缓存模式必须选择新的、空的 prefix。`cached-layout` 固定该 namespace
+的文件格式，防止与直接访问模式混写；省略 `local_cache` 的原有直接访问模式不变。
+所有共享该 alias 的执行节点应使用相同模式。Coordinator 继续使用不带
+`local_cache` 的 `distributed_fs` 回收配置，删除 `artifacts/<id>` 整个目录；
+节点不删除共享制品。后台恢复的本地文件受执行引用保护，不能手动清理缓存目录。
+挂载丢失或 namespace 被替换时停止共享访问，失败发布保留本地恢复文件。
+
+目录 fixture 单元测试覆盖源盘丢失、缓存引用、稀疏传输、损坏输入、失败发布和
+namespace 替换；它们不是原生 gVisor、真实 JuiceFS 或 Kubernetes 跨节点验收。
 
 外部 sandboxd 必须能看到传入的绝对路径。运行时的可写文件应放到私有执行目录，
 不能修改已发布的 checkpoint。若希望避免跨文件系统复制，sandboxd 的运行目录也应配置

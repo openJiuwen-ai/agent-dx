@@ -26,6 +26,16 @@ pub fn now() -> Result<u64> {
         .map(|t| t.as_secs())
         .map_err(|_| Error::Unavailable("system clock before epoch".into()))
 }
+/// Node-private capture and restore files for a shared filesystem backend.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalCacheConfig {
+    pub root: PathBuf,
+    #[serde(default = "default_cache_budget_bytes")]
+    pub budget_bytes: u64,
+    #[serde(default = "default_cache_max_entries")]
+    pub max_entries: usize,
+}
 #[async_trait]
 pub trait CheckpointAccess: Send + Sync {
     fn storage_alias(&self) -> &str {
@@ -264,6 +274,8 @@ pub enum StorageConfig {
         alias: String,
         mount_root: PathBuf,
         prefix: PathBuf,
+        #[serde(default)]
+        local_cache: Option<LocalCacheConfig>,
     },
     Local {
         root: PathBuf,
@@ -301,9 +313,27 @@ impl StorageConfig {
                 alias,
                 mount_root,
                 prefix,
-            } => Ok(Arc::new(FilesystemCheckpointStore::new(
-                alias, mount_root, prefix,
-            )?)),
+                local_cache,
+            } => {
+                let filesystem = FilesystemCheckpointStore::new(alias, mount_root, prefix)?;
+                match local_cache {
+                    None => Ok(Arc::new(filesystem)),
+                    Some(cache) => {
+                        let store = ObjectCheckpointStore::from_filesystem(
+                            filesystem,
+                            cache.root,
+                            cache.budget_bytes,
+                        )?
+                        .with_max_entries(cache.max_entries)?;
+                        let store = if let Some((node, session)) = owner {
+                            store.with_owner(node, session)?
+                        } else {
+                            store
+                        };
+                        Ok(Arc::new(store))
+                    }
+                }
+            }
             Self::Local { root } => Ok(Arc::new(LocalCheckpointStore::new(root)?)),
             Self::S3 {
                 alias,

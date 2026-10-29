@@ -14,7 +14,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 tokio = { version = "1", features = ["rt", "sync", "fs", "io-util", "time"] }
-object_store = { version = "0.14", default-features = false, features = ["aws-base", "reqwest", "ring"] }
+object_store = { version = "0.14", default-features = false, features = ["aws-base", "reqwest", "ring", "fs"] }
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 futures-util = "0.3"
 sha2 = "0.10"

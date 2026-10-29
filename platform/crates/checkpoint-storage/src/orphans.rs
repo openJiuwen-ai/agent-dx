@@ -26,6 +26,7 @@ impl ObjectCheckpointStore {
         Ok(self)
     }
     pub(super) async fn mark_upload(&self, id: &str) -> Result<()> {
+        self.shared_ready()?;
         if let Some(owner) = &self.owner {
             let bytes = serde_json::to_vec(owner).map_err(invalid)?;
             self.remote

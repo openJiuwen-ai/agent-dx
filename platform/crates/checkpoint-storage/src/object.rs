@@ -15,6 +15,7 @@ use std::{
     sync::Arc,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncSeekExt, SeekFrom};
 
 const MANIFEST_LIMIT: usize = 4 * 1024 * 1024;
 #[derive(Clone, Serialize, Deserialize)]
@@ -37,6 +38,7 @@ pub struct ObjectCheckpointStore {
     pub(super) owner: Option<super::orphans::UploadOwner>,
     pub(super) alias: String,
     pub(super) remote: Arc<dyn ObjectStore>,
+    filesystem: Option<crate::FilesystemCheckpointStore>,
     pub(super) prefix: Key,
     staging: LocalCheckpointStore,
     cache_root: PathBuf,
@@ -90,6 +92,7 @@ impl ObjectCheckpointStore {
             owner: None,
             alias,
             remote,
+            filesystem: None,
             prefix: Key::from(prefix),
             staging,
             cache_root,
@@ -98,6 +101,56 @@ impl ObjectCheckpointStore {
             index_root,
             cache: Arc::new(tokio::sync::Mutex::new(cache)),
         })
+    }
+    /// Use a guarded shared filesystem for immutable objects and local execution files.
+    /// The node must place `root` on the runtime filestore's reflink-capable volume.
+    pub fn from_filesystem(
+        filesystem: crate::FilesystemCheckpointStore,
+        root: PathBuf,
+        budget: u64,
+    ) -> Result<Self> {
+        filesystem.ready()?;
+        if !root.is_absolute() {
+            return Err(invalid("filesystem cache root must be absolute"));
+        }
+        std::fs::create_dir_all(&root).map_err(io_error)?;
+        let root = std::fs::canonicalize(root).map_err(io_error)?;
+        if root.starts_with(&filesystem.mount_root) || filesystem.mount_root.starts_with(&root) {
+            return Err(invalid("local cache overlaps shared checkpoint storage"));
+        }
+        filesystem.initialize_cached_layout()?;
+        // LocalFileSystem::new_with_prefix canonicalizes its prefix and would lose
+        // the opened-mount anchor. PrefixStore keeps /proc/self/fd/<fd> intact.
+        let anchor = filesystem.pinned_root();
+        let prefix = anchor.strip_prefix("/").map_err(invalid)?;
+        let prefix = prefix
+            .to_str()
+            .ok_or_else(|| invalid("non UTF-8 filesystem anchor"))?;
+        let remote = object_store::prefix::PrefixStore::new(
+            object_store::local::LocalFileSystem::new().with_fsync(true),
+            Key::from(prefix),
+        );
+        let mut store = Self::new(
+            filesystem.alias.clone(),
+            Arc::new(remote),
+            "artifacts".into(),
+            root,
+            budget,
+        )?;
+        store.filesystem = Some(filesystem);
+        Ok(store)
+    }
+    pub(super) fn shared_ready(&self) -> Result<()> {
+        if let Some(filesystem) = &self.filesystem {
+            filesystem.ready()?;
+        }
+        Ok(())
+    }
+    fn filesystem_path(&self, key: &Key) -> Result<Option<PathBuf>> {
+        self.filesystem
+            .as_ref()
+            .map(|filesystem| filesystem.object_path(Path::new(key.as_ref())))
+            .transpose()
     }
     pub(super) fn key(&self, id: &str, name: &str) -> Key {
         Key::from(format!("{}/{id}/{name}", self.prefix))
@@ -113,6 +166,7 @@ impl ObjectCheckpointStore {
     }
     async fn manifest(&self, a: &CheckpointArtifact) -> Result<Manifest> {
         self.validate(a)?;
+        self.filesystem_path(&self.key(&a.location, "manifest.json"))?;
         let result = self
             .remote
             .get(&self.key(&a.location, "manifest.json"))
@@ -131,6 +185,7 @@ impl ObjectCheckpointStore {
         }
         let m: Manifest = serde_json::from_slice(&data).map_err(invalid)?;
         Self::validate_manifest(&m, a)?;
+        self.shared_ready()?;
         Ok(m)
     }
     fn validate_manifest(m: &Manifest, a: &CheckpointArtifact) -> Result<()> {
@@ -250,6 +305,7 @@ impl ObjectCheckpointStore {
                 .map_err(io_error)?;
         }
         for f in &m.files {
+            self.filesystem_path(&self.key(&a.location, &format!("files/{}", f.path)))?;
             let path = target.join(&f.path);
             let parent = path
                 .parent()
@@ -277,19 +333,107 @@ impl ObjectCheckpointStore {
                     return Err(invalid("object exceeds manifest size"));
                 }
                 digest.update(&chunk);
-                output.write_all(&chunk).await.map_err(io_error)?;
+                write_sparse(&mut output, &chunk).await?;
             }
             if size != f.size || format!("{:x}", digest.finalize()) != f.sha256 {
                 return Err(invalid("object checksum mismatch"));
             }
+            output.set_len(size).await.map_err(io_error)?;
             output
                 .set_permissions(std::fs::Permissions::from_mode(f.mode))
                 .await
                 .map_err(io_error)?;
             output.sync_all().await.map_err(io_error)?;
         }
+        self.shared_ready()?;
         Ok(())
     }
+}
+/// Avoid allocating zero-filled pages when materializing a sparse filestore.
+async fn write_sparse(output: &mut tokio::fs::File, bytes: &[u8]) -> Result<()> {
+    if bytes.iter().all(|byte| *byte == 0) {
+        let offset = i64::try_from(bytes.len()).map_err(invalid)?;
+        output
+            .seek(SeekFrom::Current(offset))
+            .await
+            .map_err(io_error)?;
+    } else {
+        output.write_all(bytes).await.map_err(io_error)?;
+    }
+    Ok(())
+}
+
+async fn upload_sparse(
+    source: &Path,
+    target: &Path,
+    boundary: &Path,
+    mode: u32,
+) -> Result<(u64, String)> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| invalid("filesystem object has no parent"))?;
+    tokio::fs::create_dir_all(parent).await.map_err(io_error)?;
+    let temporary = parent.join(format!(".upload-{}", uuid::Uuid::new_v4()));
+    let result = async {
+        let mut input = tokio::fs::File::open(source).await.map_err(io_error)?;
+        let mut output = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .await
+            .map_err(io_error)?;
+        let mut digest = Sha256::new();
+        let mut size = 0_u64;
+        let mut buffer = vec![0; 256 * 1024];
+        loop {
+            let count = input.read(&mut buffer).await.map_err(io_error)?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+            size = size
+                .checked_add(u64::try_from(count).map_err(invalid)?)
+                .ok_or_else(|| invalid("filesystem object size overflow"))?;
+            write_sparse(&mut output, &buffer[..count]).await?;
+        }
+        output.set_len(size).await.map_err(io_error)?;
+        output
+            .set_permissions(std::fs::Permissions::from_mode(mode))
+            .await
+            .map_err(io_error)?;
+        output.sync_all().await.map_err(io_error)?;
+        drop(output);
+        tokio::fs::rename(&temporary, target)
+            .await
+            .map_err(io_error)?;
+        let boundary = boundary.to_owned();
+        let mut directory = parent.to_owned();
+        tokio::task::spawn_blocking(move || {
+            loop {
+                std::fs::File::open(&directory)
+                    .map_err(io_error)?
+                    .sync_all()
+                    .map_err(io_error)?;
+                if directory == boundary {
+                    break;
+                }
+                directory = directory
+                    .parent()
+                    .filter(|parent| parent.starts_with(&boundary))
+                    .ok_or_else(|| invalid("filesystem object escaped root"))?
+                    .to_owned();
+            }
+            Ok::<_, Error>(())
+        })
+        .await
+        .map_err(io_error)??;
+        Ok((size, format!("{:x}", digest.finalize())))
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(temporary).await;
+    }
+    result
 }
 type FileInventory = (Vec<(String, u32)>, Vec<String>);
 fn inventory(root: &Path) -> Result<FileInventory> {
@@ -350,6 +494,7 @@ impl CheckpointAccess for ObjectCheckpointStore {
         Ok(refs)
     }
     async fn begin_capture(&self) -> Result<PathBuf> {
+        self.shared_ready()?;
         self.staging.begin_capture().await
     }
     async fn discard_staged(&self, staged: &Path) -> Result<()> {
@@ -381,6 +526,7 @@ impl CheckpointAccess for ObjectCheckpointStore {
         self.manifest(artifact).await.map(|_| ())
     }
     async fn seal(&self, staged: &Path) -> Result<CheckpointArtifact> {
+        self.shared_ready()?;
         let local = self.staging.seal(staged).await?;
         let root = PathBuf::from(&local.location);
         let scan_root = root.clone();
@@ -401,6 +547,25 @@ impl CheckpointAccess for ObjectCheckpointStore {
                 directories,
             };
             for (path, mode) in files {
+                if let Some(target) =
+                    self.filesystem_path(&self.key(&id, &format!("files/{path}")))?
+                {
+                    let filesystem = self
+                        .filesystem
+                        .as_ref()
+                        .ok_or_else(|| invalid("filesystem transfer has no mount guard"))?;
+                    let (size, sha256) =
+                        upload_sparse(&root.join(&path), &target, &filesystem.pinned_root(), mode)
+                            .await?;
+                    filesystem.ready()?;
+                    manifest.files.push(FileEntry {
+                        path,
+                        size,
+                        sha256,
+                        mode,
+                    });
+                    continue;
+                }
                 let mut input = tokio::fs::File::open(root.join(&path))
                     .await
                     .map_err(io_error)?;
@@ -447,10 +612,12 @@ impl CheckpointAccess for ObjectCheckpointStore {
             if data.len() > MANIFEST_LIMIT {
                 return Err(invalid("manifest too large"));
             }
+            self.filesystem_path(&self.key(&id, "manifest.json"))?;
             self.remote
                 .put(&self.key(&id, "manifest.json"), data.into())
                 .await
                 .map_err(io_error)?;
+            self.shared_ready()?;
             let record = CacheRecord {
                 manifest: manifest.clone(),
                 staged: true,
