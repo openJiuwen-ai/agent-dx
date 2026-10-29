@@ -495,14 +495,18 @@ Outlet（`afs/src/node/outlet/`）是可选的多节点 workspace 发布面：�
 `public_root` 下的 workspace symlink。部署方负责建立并维持全部挂载，AFS
 只做只读校验和探活，缺失或漂移只告警，永不自行挂载或修复。
 
-- 物理层 `users_root`：OwnerFs 的 `LocalFs` 根；工作区物理目录名等于裸
-  workspace 名（D11），不再带 hex/epoch 后缀。
+- 物理层 `users_root`：OwnerFs 的 `LocalFs` 根；工作区物理目录名是
+  `<workspace>-e<epoch>`（D11，代次进目录名），公开名与容器内路径仍是
+  `<workspace>`。
 - 拓扑层 `import_root`：`<import_root>/<node>/users` 是各远端成员的 NFS
   import 挂载点；`transport` 模块是传输知识唯一居所，策略层只依赖
   `TransportBackend`。
 - 表现层 `public_root`：部署方提供的 tmpfs；`publish` 单写者通过
   `.pub/` 暂存 + rename 原子亮出 symlink，删除走 unlink，失效实体移入
-  `.quarantine/` 保留证据。
+  `.quarantine/` 保留证据。symlink target 自带代次，因此同名重建后旧代
+  链接指向不存在的路径：窗口内的读者从读到旧代数据（fail-open）降为
+  `ENOENT`（fail-closed）。`/public/<name>` 是唯一对外契约，禁止解析
+  target 反推物理目录。
 
 Meta 通过 `ListNodes` 提供 live 成员表，通过 `PollOutletEvents` /
 `ListOutletRoots` 提供 Root 激活、Root 删除与 NodeSession 注册事件及全量
