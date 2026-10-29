@@ -3874,6 +3874,17 @@ impl LocalOwnerFs {
     }
 
     fn getxattr(&self, ctx: &RequestContext, inode: BackendInode, name: &OsStr) -> Result<Vec<u8>> {
+        // CORRECTNESS/PERF: OwnerFs only stores `user.*` xattrs. A probe for any
+        // other namespace (notably `security.capability`, which the kernel issues
+        // on nearly every create/open) means "this attribute is absent", so answer
+        // ENODATA via IO_NO_DATA. Returning ENOTSUP/FAILED_PRECONDITION here makes
+        // the kernel treat every file creation as a failed xattr lookup.
+        if !name.as_bytes().starts_with(b"user.") {
+            return Err(Error::coded(
+                afs_error::IO_NO_DATA,
+                "xattr namespace is not stored by OwnerFs",
+            ));
+        }
         validate_user_xattr_name(name)?;
         if let Some((record, remote)) = self.remote_entry_for_xattr(inode, RootRight::Read)? {
             return remote.files.getxattr(
