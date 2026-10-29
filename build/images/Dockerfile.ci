@@ -60,11 +60,28 @@ RUN case "$TARGETARCH" in amd64) rust_host=x86_64-unknown-linux-gnu ;; arm64) ru
 
 RUN mkdir -p /root/.cargo \
     && printf '%s\n' \
+       '# 多个国内源可同时定义，但同一时刻只有 replace-with 指向的那个生效' \
        '[source.crates-io]' \
-       'replace-with = "rsproxy-sparse"' \
+       "replace-with = 'aliyun'" \
        '' \
-       '[source.rsproxy-sparse]' \
+       '# 阿里云（当前生效，稀疏索引，dl 走 mirrors.aliyun.com/crates/api/v1/crates）' \
+       '[source.aliyun]' \
+       'registry = "sparse+https://mirrors.aliyun.com/crates.io-index/"' \
+       '' \
+       '# 字节 rsproxy（备选）' \
+       '[source.rsproxy]' \
        'registry = "sparse+https://rsproxy.cn/index/"' \
+       '' \
+       '# 中科大（备选）' \
+       '[source.ustc]' \
+       'registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"' \
+       '' \
+       '# 清华（备选）' \
+       '[source.tuna]' \
+       'registry = "sparse+https://mirrors.tuna.tsinghua.edu.cn/crates.io-index/"' \
+       '' \
+       '[net]' \
+       'git-fetch-with-cli = true' \
        > /root/.cargo/config.toml
 
 RUN case "$TARGETARCH" in amd64) protoc_arch=x86_64 ;; arm64) protoc_arch=aarch_64 ;; *) exit 2 ;; esac \
