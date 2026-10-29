@@ -4214,7 +4214,14 @@ fn os_str_bytes(value: &OsStr) -> &[u8] {
 }
 
 fn errno(error: Error) -> i32 {
-    afs_logging::error!("FUSE request failed"; "code"=>error.code().raw(), "kind"=>format!("{:?}", error.kind()), "message"=>error.message());
+    // NotFound is a normal answer for create-probes and negative lookups: the
+    // kernel asks "does this exist yet" before it creates. Logging those as
+    // errors produced one ERRO line per created file.
+    if error.kind() == afs_error::ErrorKind::NotFound {
+        afs_logging::debug!("FUSE request negative"; "code"=>error.code().raw(), "message"=>error.message());
+    } else {
+        afs_logging::error!("FUSE request failed"; "code"=>error.code().raw(), "kind"=>format!("{:?}", error.kind()), "message"=>error.message());
+    }
     crate::error::errno(&error)
 }
 
