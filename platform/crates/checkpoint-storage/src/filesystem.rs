@@ -5,7 +5,9 @@ use adx_core::{CheckpointArtifact, Error, Result};
 use async_trait::async_trait;
 use mount::MountGuard;
 use serde::{Deserialize, Serialize};
-use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Serialize, Deserialize)]
@@ -111,7 +113,16 @@ impl FilesystemCheckpointStore {
     }
     /// Keep all cached-backend I/O on the opened mount, even during lazy unmount.
     pub(super) fn pinned_root(&self) -> PathBuf {
-        PathBuf::from(format!("/proc/self/fd/{}", self.root_handle.as_raw_fd()))
+        #[cfg(target_os = "linux")]
+        {
+            PathBuf::from(format!("/proc/self/fd/{}", self.root_handle.as_raw_fd()))
+        }
+        // Real shared mounts require Linux /proc mount identity checks. Keep
+        // directory fixtures usable on the other supported Unix test hosts.
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.root.clone()
+        }
     }
     fn direct_ready(&self) -> Result<()> {
         self.ready()?;
