@@ -88,6 +88,9 @@ pub fn create_input(
     validate_identity(&request.tenant)?;
     validate_identity(&request.id)?;
     validate_timeout(timeout)?;
+    if let Some(context) = &request.preparation_context {
+        context.validate(&request.tenant)?;
+    }
     // AgentBinding generations use adx-<UUID>. The public API builds namespace-name IDs.
     let name = request
         .id
@@ -108,6 +111,9 @@ pub fn create_input(
         "ports":execution.service.iter().map(|service| service.port.to_string()).collect::<std::collections::BTreeSet<_>>(),
         "createTimeoutSeconds":timeout.as_secs().max(1),
     });
+    if let Some(context) = &request.preparation_context {
+        input["preparationContext"] = json!(context);
+    }
     if network.runtime_policies.get(&execution.isolation_runtime)
         != Some(&RuntimeNetworkPolicy::Unrestricted)
     {

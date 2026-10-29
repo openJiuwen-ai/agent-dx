@@ -245,6 +245,7 @@ async fn environment_identity_precedes_new_snapshot_normalization() {
     let result = api
         .create_environment(pb::CreateEnvironmentRequest {
             request_id: "new-request".into(),
+            preparation_context: None,
             spec: Some(retry),
             caller: Some(pb::CallerContext {
                 tenant_id: "tenant".into(),

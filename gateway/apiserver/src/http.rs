@@ -29,6 +29,7 @@ use std::{
 };
 use tokio::sync::mpsc;
 use tonic::{Code, Status};
+mod prewarm;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 const DEFAULT_INSTANCE_PAGE_SIZE: usize = 100;
@@ -38,10 +39,12 @@ pub struct Api {
     pub clients: Arc<Clients>,
     pub environment_service: Arc<EnvironmentService>,
     proxy: reqwest::Client,
+    agent_templates: tokio::sync::OnceCell<Arc<adx_agent_api::managed::ManagedService>>,
 }
 impl Api {
     pub fn new(clients: Arc<Clients>) -> Result<Arc<Self>, Error> {
         Ok(Arc::new(Self {
+            agent_templates: tokio::sync::OnceCell::new(),
             environment_service: EnvironmentService::new(clients.clone()),
             clients,
             proxy: reqwest::Client::builder()
@@ -168,6 +171,9 @@ impl Api {
             }
         };
         let method = request.method().as_str().to_string();
+        if prewarm::matches(&path) {
+            return Box::pin(self.prewarm(request, &caller, &path)).await;
+        }
         if agent_route(&method, &path) {
             return Box::pin(self.agent(request, &caller)).await;
         }
@@ -244,7 +250,10 @@ impl Api {
             return response(result, &request_id, None, None, method == "DELETE");
         }
         if method == "GET" && path == "/api/environment/v1/capabilities" {
-            return plain(200, json!({"capabilities": ["workload-probes-v1"]}));
+            return plain(
+                200,
+                json!({"capabilities": ["workload-probes-v1", "prewarm-pools-v1", "prewarm-erofs-artifacts-v1"]}),
+            );
         }
         if method == "GET" && path == "/api/environment/v1/resources" {
             return match self.clients.nodes().await {
@@ -983,6 +992,15 @@ fn plain(status: u16, value: Value) -> Response<Body> {
         .expect("static response headers are valid")
 }
 fn status_code(error: &Status) -> u16 {
+    match error
+        .metadata()
+        .get("adx-prewarm-error")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some("precondition_required") => return 428,
+        Some("precondition_failed") => return 412,
+        _ => (),
+    }
     match error.code() {
         Code::InvalidArgument => 400,
         Code::Unauthenticated => 401,

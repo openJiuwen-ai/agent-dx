@@ -282,6 +282,7 @@ async fn snapshot_create_uses_coordinator_even_with_a_live_local_first_entry() {
     spec.snapshot_id = Some("snapshot".into());
     let request = pb::CreateEnvironmentRequest {
         request_id: String::new(),
+        preparation_context: None,
         spec: Some(spec),
         caller: Some(caller()),
         ..Default::default()

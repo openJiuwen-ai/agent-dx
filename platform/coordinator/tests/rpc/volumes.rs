@@ -416,6 +416,7 @@ async fn release_volume_owner_rejects_foreign_pending_requests_before_cancellati
         create_client
             .create_environment(pb::CreateEnvironmentRequest {
                 request_id: String::new(),
+                preparation_context: None,
                 spec: Some(source.into()),
                 caller: Some(pb::CallerContext {
                     tenant_id: "tenant-b".into(),

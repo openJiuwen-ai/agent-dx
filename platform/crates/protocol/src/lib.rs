@@ -12,6 +12,7 @@ pub use adx_core::valid_runtime_id;
 use adx_core::{Error, Result};
 mod execution;
 mod observation;
+mod prewarm;
 mod probes;
 pub use observation::create_status;
 mod scheduling;

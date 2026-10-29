@@ -419,6 +419,7 @@ impl CoordinatorRpc {
             return Ok(pb::ClaimEnvironmentResponse {
                 outcome: Some(Outcome::Owned(Box::new(
                     pb::StartAssignedEnvironmentRequest {
+                        prepared_artifact_id: String::new(),
                         create_deadline_unix_millis: deadline.unix_millis(),
                         spec: Some(spec.into()),
                         assignment: Some(assignment.try_into().map_err(status)?),
@@ -479,6 +480,7 @@ impl CoordinatorRpc {
         let outcome = match outcome {
             ClaimOutcome::Owned(_) => {
                 Outcome::Owned(Box::new(pb::StartAssignedEnvironmentRequest {
+                    prepared_artifact_id: String::new(),
                     create_deadline_unix_millis: deadline
                         .map_or(0, |deadline| deadline.unix_millis()),
                     spec: Some(record.spec.into()),

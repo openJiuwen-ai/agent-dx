@@ -152,6 +152,7 @@ dependencies = [
 name = "adx-coordinator"
 version = "0.1.0"
 dependencies = [
+ "adx-apiserver",
  "adx-checkpoint-storage",
  "adx-core",
  "adx-discovery",
@@ -172,6 +173,7 @@ dependencies = [
  "opentelemetry 0.31.0",
  "opentelemetry_sdk 0.31.0",
  "redis",
+ "reqwest 0.13.5",
  "rustls",
  "rustls-pemfile",
  "serde",
@@ -192,6 +194,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 1.0.69",
 ]
 
@@ -4191,6 +4194,8 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
+ "serde",
+ "serde_json",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

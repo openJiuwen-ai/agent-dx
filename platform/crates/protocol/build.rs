@@ -15,6 +15,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "volume.proto",
         "credentials.proto",
         "routes.proto",
+        "prewarm.proto",
     ] {
         println!("cargo:rerun-if-changed={}", proto.join(file).display());
     }

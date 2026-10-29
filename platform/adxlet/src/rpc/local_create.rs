@@ -77,6 +77,13 @@ impl NodeRpc {
             .coordinator
             .as_ref()
             .ok_or_else(|| Status::unavailable("local-first entry is not configured"))?;
+        if request
+            .create
+            .as_ref()
+            .is_some_and(|c| c.preparation_context.is_some())
+        {
+            return self.forward_local(sink, request, deadline).await;
+        }
         let lock = {
             let mut locks = self.entry_locks.lock().expect("shared state lock poisoned");
             locks.retain(|_, lock| lock.strong_count() > 0);
@@ -95,6 +102,7 @@ impl NodeRpc {
         }
         if raw.snapshot_id.is_some() {
             drop(gate);
+            drop(_serial);
             return self.forward_local(sink, request, deadline).await;
         }
         let spec: adx_core::EnvironmentSpec = raw.clone().try_into().map_err(status)?;
@@ -102,6 +110,7 @@ impl NodeRpc {
             Ok(held) => held,
             Err(Error::NoCapacity | Error::Conflict) => {
                 drop(gate);
+                drop(_serial);
                 return self.forward_local(sink, request, deadline).await;
             }
             Err(e) => return Err(status(e)),
@@ -261,6 +270,7 @@ impl NodeRpc {
                     .map_err(status)
                 } else {
                     drop(gate);
+                    drop(_serial);
                     self.forward_local(sink, request, deadline).await
                 }
             }
@@ -269,6 +279,7 @@ impl NodeRpc {
                     .release_local(&spec.id, &reservation)
                     .map_err(status)?;
                 drop(gate);
+                drop(_serial);
                 self.forward_local(sink, request, deadline).await
             }
             Outcome::Fallback(false) => Err(Status::data_loss("invalid fallback decision")),

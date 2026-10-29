@@ -128,6 +128,7 @@ fn caller() -> Option<pb::CallerContext> {
 fn create(id: &str) -> pb::CreateEnvironmentRequest {
     pb::CreateEnvironmentRequest {
         request_id: String::new(),
+        preparation_context: None,
         spec: Some(spec(id).into()),
         caller: caller(),
         schedule_timeout_seconds: 30,
@@ -546,6 +547,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert_eq!(
         stale_coordinator
             .create_environment(pb::StartAssignedEnvironmentRequest {
+                prepared_artifact_id: String::new(),
                 create_deadline_unix_millis: 0,
                 snapshot: None,
                 spec: Some(spec("late").into()),
@@ -601,6 +603,7 @@ async fn lifecycle_rpc_persists_before_execution_and_retries_only_the_result() {
     assert_eq!(
         node_frontend
             .create_environment(pb::StartAssignedEnvironmentRequest {
+                prepared_artifact_id: String::new(),
                 create_deadline_unix_millis: 0,
                 snapshot: None,
                 node_session_id: "boot-1".into(),

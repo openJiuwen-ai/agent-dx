@@ -160,6 +160,7 @@ impl Session {
                 return Ok(ClaimOutcome::Owned(existing));
             }
             claim_admission(&node)?;
+            self.guard_preparation_generation(&spec.id, None).await?;
             // Snapshot references are kept in a separate hash and do not bump
             // the control header. Compare their exact bytes in the same CAS.
             let snapshot = if let Some(id) = &spec.snapshot_id {
@@ -317,6 +318,17 @@ impl Session {
             }
 
             let mut results = Vec::with_capacity(claims.len());
+            let mut preparation_guards = BTreeMap::new();
+            for (spec, _) in &claims {
+                if !environments.contains_key(&spec.id)
+                    && !preparation_guards.contains_key(&spec.id)
+                {
+                    preparation_guards.insert(
+                        spec.id.clone(),
+                        self.guard_preparation_generation(&spec.id, None).await,
+                    );
+                }
+            }
             let mut writes = Vec::new();
             let mut writing_nodes = BTreeMap::new();
             for ((spec, candidate), pinned) in claims.iter().zip(&pinned) {
@@ -359,6 +371,9 @@ impl Session {
                         {
                             return Err(Error::Conflict);
                         }
+                    }
+                    if let Some(result) = preparation_guards.get(&spec.id) {
+                        result.clone()?;
                     }
                     let generation = self.next_generation()?;
 

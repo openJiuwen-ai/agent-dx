@@ -144,6 +144,7 @@ impl EnvironmentService {
         input: Value,
         caller: &pb::CallerContext,
     ) -> Result<pb::EnvironmentSpec, Status> {
+        contract::preparation_context(&input, caller)?;
         contract::create_spec_with_environment(
             input,
             caller,
@@ -396,6 +397,7 @@ impl EnvironmentService {
         let result = Box::pin(self.clients.create_environment(
             pb::CreateEnvironmentRequest {
                 request_id: request_id.to_owned(),
+                preparation_context: contract::preparation_context(input, caller)?,
                 spec: Some(spec.clone()),
                 caller: Some(caller.clone()),
                 schedule_timeout_seconds: timeouts.schedule_seconds,

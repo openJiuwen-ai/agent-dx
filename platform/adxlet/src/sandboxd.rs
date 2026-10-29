@@ -58,6 +58,7 @@ type Cell = Arc<tokio::sync::Mutex<StartState>>;
 pub struct Sandboxd {
     client: SandboxServiceClient<Channel>,
     config: Config,
+    artifact_cache: Option<Arc<crate::prewarm::ArtifactCache>>,
     starts: Arc<Mutex<BTreeMap<String, Cell>>>,
     backend_ids: Arc<Mutex<BTreeMap<String, String>>>,
 }
@@ -96,6 +97,10 @@ pub async fn connect_when_ready(
 }
 
 impl Sandboxd {
+    pub fn with_artifact_cache(mut self, cache: Arc<crate::prewarm::ArtifactCache>) -> Self {
+        self.artifact_cache = Some(cache);
+        self
+    }
     /// Discover live execution backends through sandboxd's Unix socket.
     pub async fn available_runtime_classes(&self) -> Result<Vec<String>> {
         let response = self
@@ -168,6 +173,7 @@ impl Sandboxd {
         Ok(Self {
             client: SandboxServiceClient::new(channel),
             config,
+            artifact_cache: None,
             starts: Arc::default(),
             backend_ids: Arc::default(),
         })
@@ -246,7 +252,50 @@ impl Sandboxd {
                     .insert("ADX_ENV_FILE".into(), info.restore_env_path);
             }
         }
-        let request = start_request(spec, runtime_id, generation, devices, &config)?;
+        let mut request = start_request(spec, runtime_id, generation, devices, &config)?;
+        if let Some(cache) = &self.artifact_cache {
+            if let Some(input) = cache.prepared_input(runtime_id).await? {
+                let target = config.runtime_profile.as_ref().map_or(
+                    adx_core::runtime_profile::DEFAULT_IMAGE_PROCESS_CONFIG,
+                    |profile| profile.bootstrap.image_process_config.as_str(),
+                );
+                if spec.execution.rootfs.as_ref().is_some_and(|rootfs|!matches!(&rootfs.source,adx_core::execution::StorageSource::Image(image) if image==&spec.image))
+                    || request.mounts.iter().any(|m| {
+                        m.target == target
+                            || target.starts_with(&format!("{}/", m.target.trim_end_matches('/')))
+                    })
+                {
+                    return Err(Error::Invalid(
+                        "prepared rootfs conflicts with an explicit filesystem override".into(),
+                    ));
+                }
+                let mut environment = input.env.into_iter().collect::<HashMap<_, _>>();
+                environment.extend(request.envs);
+                request.envs = environment;
+                request.rootfs = Some(proto::RootfsConfig {
+                    readonly: request.rootfs.as_ref().is_some_and(|root| root.readonly),
+                    r#type: proto::RootfsSrcType::Local as i32,
+                    source: Some(proto::rootfs_config::Source::Path(
+                        input.rootfs.to_string_lossy().into_owned(),
+                    )),
+                    writable_layer_size_bytes: 0,
+                });
+                request.mounts.push(proto::Mount {
+                    r#type: "bind".into(),
+                    target: target.into(),
+                    options: vec!["ro".into(), "bind".into()],
+                    source: Some(proto::mount::Source::HostPath(
+                        input.process.to_string_lossy().into_owned(),
+                    )),
+                });
+                request.inject_entrypoint.clear();
+                if spec.execution.inherit_entrypoint {
+                    request
+                        .envs
+                        .insert("ADX_IMAGE_PROCESS_CONFIG".into(), target.into());
+                }
+            }
+        }
         crate::managed_mounts::prepare(spec).await?;
         Ok(self.request(request))
     }
@@ -1331,6 +1380,9 @@ impl RuntimeDriver for Sandboxd {
             .lock()
             .expect("shared state lock poisoned")
             .remove(runtime_id);
+        if let Some(cache) = &self.artifact_cache {
+            cache.release(runtime_id).await?;
+        }
         // A failed create cannot become successful through a retry of the same
         // execution. Keep its identity terminal so a later backend is cleanup-only.
         *state = if failed_start {

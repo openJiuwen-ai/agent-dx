@@ -11,6 +11,7 @@ description = "ADX public HTTP API and instance ownership cache"
 workspace = true
 
 [dependencies]
+adx-agent-api = { path = "../../agent/api" }
 adx-activator = { path = "../../agent/activator" }
 adx-core = { path = "../../platform/crates/core" }
 adx-agent-core = { path = "../../agent/crates/core" }
@@ -42,7 +43,6 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 [dev-dependencies]
 opentelemetry = { version = "0.31", features = ["trace"] }
 opentelemetry_sdk = { version = "0.31", features = ["trace", "testing"] }
-adx-agent-api = { path = "../../agent/api" }
 adx-agent-store = { path = "../../agent/crates/store", features = ["test-memory"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"

@@ -8,6 +8,7 @@ import public "snapshot.proto";
 import public "volume.proto";
 import public "credentials.proto";
 import public "routes.proto";
+import public "prewarm.proto";
 
 service CoordinatorService {
   rpc WatchNodes(WatchNodesRequest) returns (stream NodeDirectory);
@@ -103,6 +104,7 @@ message CreateEnvironmentRequest {
   Assignment expected_assignment = 6;
   // Stable public operation identity, preserved on every hop and retry.
   string request_id = 7;
+  PreparationContext preparation_context = 8;
 }
 
 message GetEnvironmentRequest { string environment_id = 1; CallerContext caller = 2; }
@@ -110,6 +112,7 @@ message GetEnvironmentRequest { string environment_id = 1; CallerContext caller 
 message GetEnvironmentResponse { EnvironmentRecord record = 1; string node_address = 2; string relay_address = 3; }
 
 message StartAssignedEnvironmentRequest {
+  string prepared_artifact_id = 6;
   ReusableSnapshot snapshot = 4;
   EnvironmentSpec spec = 1;
   Assignment assignment = 2;
