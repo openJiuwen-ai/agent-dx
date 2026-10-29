@@ -141,3 +141,19 @@ async fn local_adapter_observes_dormancy_without_lifecycle_side_effects() {
         assert!(app.creates.lock().unwrap().is_empty());
     }
 }
+
+#[tokio::test]
+async fn local_creation_attempt_changes_only_the_operation_identity() {
+    let app = Arc::new(Application::default());
+    let environment =
+        LocalEnvironment::new(app.clone(), Duration::from_secs(60), network_policy()).unwrap();
+    let mut request = request();
+    environment.create(&request).await.unwrap();
+    environment.create(&request).await.unwrap();
+    request.creation_attempt = 1;
+    environment.create(&request).await.unwrap();
+    let calls = app.creates.lock().unwrap();
+    assert_eq!(calls[0], calls[1]);
+    assert_ne!(calls[0].2, calls[2].2);
+    assert_eq!(calls[0].1, calls[2].1);
+}

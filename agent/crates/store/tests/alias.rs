@@ -143,3 +143,44 @@ async fn alias_updates_require_expected_revision_and_published_versions() {
     config.versions[0].version = "unpublished".into();
     assert!(state.put_alias(&config, None).await.is_err());
 }
+
+#[tokio::test]
+async fn creation_cancellation_cas_advances_once_and_backoff_is_bounded() {
+    let (state, scope, mut config) = fixture().await;
+    state.create_binding(scope.clone()).await.unwrap();
+    select(&state, &mut config, "2").await;
+    let saved = state.prepare_binding(&scope).await.unwrap();
+    let candidate = &saved.secondary.as_ref().unwrap().environment;
+    let attempt = CreationAttempt::default();
+    let (a, b) = tokio::join!(
+        state.defer_creation(&saved, candidate, &attempt, true, 1000),
+        state.defer_creation(&saved, candidate, &attempt, true, 1000)
+    );
+    assert_eq!(a.unwrap(), b.unwrap());
+    let mut saved = state.binding(&scope).await.unwrap().unwrap();
+    assert_eq!(saved.creation_attempts[&candidate.environment_id].number, 1);
+    for expected in [10, 20, 40, 60, 60] {
+        let previous = saved.creation_attempts[&candidate.environment_id].clone();
+        saved = state
+            .defer_creation(&saved, candidate, &previous, true, 1000)
+            .await
+            .unwrap();
+        let next = &saved.creation_attempts[&candidate.environment_id];
+        assert_eq!(next.number, previous.number + 1);
+        assert_eq!(next.backoff_seconds, expected);
+        assert_eq!(next.retry_after_unix_ms, 1000 + expected * 1000);
+    }
+    let (rev, mut config) = state
+        .alias("tenant", "agent", "production")
+        .await
+        .unwrap()
+        .unwrap();
+    config.versions[0].version = "1".into();
+    state.put_alias(&config, Some(&rev)).await.unwrap();
+    state.prepare_binding(&scope).await.unwrap();
+    let previous = saved.creation_attempts[&candidate.environment_id].clone();
+    assert!(state
+        .defer_creation(&saved, candidate, &previous, true, 1000)
+        .await
+        .is_err());
+}

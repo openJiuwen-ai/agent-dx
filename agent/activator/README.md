@@ -66,7 +66,7 @@ cargo test --locked -p adx-activator --lib binding_cache_memory_profile -- --ign
 - 创建：`POST /api/environment/v1/environments`，将 `adx-<generation>` 拆为 namespace/name，保留镜像、隔离 runtime、资源、业务 env、模板 service 端口、渲染后的 mounts、模板 lifecycle、`init_timeout_seconds`、`readiness_probe` 和 `inheritEntrypoint=true`，并附加配置的 `sandbox_network` 策略。模板 readiness 支持 HTTP、TCP 或 exec 单动作，Activator 映射为公共 Environment 的 `readinessProbe`；runtime profile 由 API Server 注入。显式启动覆盖与保留环境变量在提交前拒绝。
 - 查询：`GET /api/instances?instance_id=<id>`，检查单条记录的 ID，Running 才标记 ready。没有返回的 runtime ID 不合成；404 表示当前不可见，不能确认已删除。
 - 删除：`DELETE /api/environment/v1/environments/<id>`，API Server 确认成功返回 Deleted；明确 HTTP 404 返回 NotFound，Activator 对这两种结果均按 generation 条件清理 Binding 及其 parameters。断连、超时或不完整响应保留 OutcomeUnknown，不清理绑定。
-- 创建/删除使用由动作、tenant 和 Environment ID 确定的 `X-Request-Id`；同一组 Activator 副本须使用一致的创建规格、`sandbox_network` 与 `request_timeout_seconds`，未完成操作期间改变请求体会被 API Server 的幂等校验拒绝。禁止重定向及自动重放。HTTP 400/409 映射 Invalid/Conflict，查询 403 映射 NotFound；创建/删除 403 和所有 401 表示上游鉴权不可用，不触发删除收尾。读响应丢失为 Unavailable，写响应丢失为 OutcomeUnknown。
+- 删除使用由动作、tenant 和 Environment ID 确定的 `X-Request-Id`；创建还包含持久化的尝试序号，仅在确定分配前取消后推进；同一组 Activator 副本须使用一致的创建规格、`sandbox_network` 与 `request_timeout_seconds`，未完成操作期间改变请求体会被 API Server 的幂等校验拒绝。禁止重定向及自动重放。HTTP 400/409 映射 Invalid/Conflict，查询 403 映射 NotFound；创建/删除 403 和所有 401 表示上游鉴权不可用，不触发删除收尾。读响应丢失为 Unavailable，写响应丢失为 OutcomeUnknown。
 
 旧配置中的 `ADX_ENVIRONMENT_SERVICE_TOKEN` 已移除；Activator 使用 API Server 管理地址与 `environment_api_key_envs`。Ingress 不再提供 `/api/environment/v2/instances`。
 
@@ -165,3 +165,16 @@ ADX_AGENT_TEST_REDIS_URL=redis://127.0.0.1:6379/0 \
 ```
 
 这些测试使用模拟 Platform，不证明真实运行时、共享文件系统、连接排空或集群端到端行为。
+
+
+### 创建排队取消与退避
+
+HTTP 与进程内 Environment 适配器保留 Platform 的 `adx_core::scheduling::SchedulingFailure`，映射为 `EnvironmentError::SchedulingCancelled`。只有结构化的确定排队取消才允许发起下一次创建尝试；HTTP 必须同时为504且包含 `DEADLINE_EXCEEDED / never / not_started / schedulingFailure`，进程内调用使用协议的取消标记。普通超时、响应丢失、未找到 Env、损坏诊断和业务启动失败均不构成推进尝试的依据。Platform 的排队超时及 API Server 的600秒完成缓存保持原行为。
+
+Activator 将每个仍被 Binding 引用的 Env 的当前尝试序号、下次检查时间和退避秒数保存在 `creation_attempts`。收到确定取消后按 Binding generation、活动引用和原尝试元数据做 revision CAS，仅推进一次序号；同一个 Env ID、版本、规格及 Volume UID 不变。序号0保持原 Request ID，后续 Request ID由tenant、Env ID和序号派生；多副本及进程重启复用同一尝试身份。结果未知继续查询或重放原身份，不能通过新序号续开未知操作的预算。
+
+确认取消后，退避为5、10、20、40、60秒并在60秒封顶。后台将对象放回待处理队列，等待期间不占worker；元数据通知、成员变化或进程重启可能提前唤醒检查，但持久化的下次创建时间仍生效。每轮先查询候选 Env；已有 Pending/Starting、重启恢复、Paused或Failed 执行均直接观察，不再 CREATE。候选不存在且达到检查时间后，统一查询旧current Env，不区分无卷、共享卷或独占卷模板：旧Env仍在运行、启动、暂停中、恢复或失败时只延后检查，不发创建请求、不推进尝试序号；旧Env已Paused/Deleted或查询不存在时才提交候选创建。这项升级策略在候选第一次创建前即生效，也适用于后续重试；Binding首次激活current不检查旧Env。Running仅表示旧Env尚未暂停，不证明有活跃连接；该检查不主动pause旧Env，也不构成查询与创建之间的原子排空保证。仅查询不存在不授权改变Request ID，结果未知仍保留原尝试身份。
+
+Activator不读取卷occupancy；卷的实际占用、释放与准入始终由Platform判定。重试前仍按既有流程ensure并固定Volume UID，不新增卷管理接口。
+
+Alias目标变化会先退役原候选；清理完成时同时移除该候选的创建尝试元数据，不改Binding generation。此机制不会改变业务请求对current的解析、主动暂停旧Env或保留休眠状态的既有灰度行为。

@@ -53,6 +53,7 @@ async fn handler(
         phase: BindingPhase::Active,
         parameters: Default::default(),
         volumes: Default::default(),
+        creation_attempts: Default::default(),
     };
     if uri.path().ends_with("/delete") {
         Json(serde_json::Value::Null)

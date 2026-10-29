@@ -43,7 +43,7 @@ impl EnvironmentApplication for EnvironmentService {
             &caller(tenant),
         ))
         .await
-        .map_err(|error| map_status(error, true))
+        .map_err(map_create_status)
     }
     async fn instance(&self, tenant: &str, id: &str) -> Result<Option<Value>, EnvironmentError> {
         let Some(owner) = self
@@ -78,6 +78,13 @@ fn caller(tenant: &str) -> pb::CallerContext {
         administrator: false,
     }
 }
+fn map_create_status(status: Status) -> EnvironmentError {
+    match adx_protocol::scheduling_failure(&status) {
+        Some(failure) => EnvironmentError::SchedulingCancelled(Box::new(failure)),
+        None => map_status(status, true),
+    }
+}
+
 fn map_volume_status(status: Status) -> EnvironmentError {
     match status.code() {
         Code::PermissionDenied | Code::Unauthenticated => {
@@ -118,6 +125,33 @@ fn map_status(status: Status, write: bool) -> EnvironmentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_confirmed_queue_cancellation_authorizes_another_creation_attempt() {
+        let failure = adx_core::scheduling::SchedulingFailure {
+            rejections: [("waiting_for_volume".into(), 1)].into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            map_create_status(adx_protocol::scheduling_deadline(failure.clone())),
+            EnvironmentError::SchedulingCancelled(Box::new(failure))
+        );
+        for status in [
+            Status::deadline_exceeded("timeout"),
+            Status::unavailable("lost response"),
+        ] {
+            assert!(matches!(
+                map_create_status(status),
+                EnvironmentError::OutcomeUnknown(_)
+            ));
+        }
+        assert!(matches!(
+            map_create_status(adx_protocol::status(adx_core::Error::DeadlineExceeded(
+                "runtime start failed".into()
+            ))),
+            EnvironmentError::OutcomeUnknown(_)
+        ));
+    }
+
     #[test]
     fn volume_refusals_are_terminal_and_transport_failures_remain_unknown() {
         for status in [

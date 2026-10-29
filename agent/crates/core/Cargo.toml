@@ -10,6 +10,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+adx-core = { path = "../../../platform/crates/core" }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

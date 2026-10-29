@@ -50,3 +50,6 @@ AgentBinding 的 current 与 secondary 在同一记录内原子更新。prepare_
 
 
 模板发布接收 TemplateDraft，不接受调用方指定版本。`template-sequence:[tenant,name]` Record 保存最后分配的 u64；序号推进与不可变模板写入在同一 CAS 事务中提交，多个 Activator 不共享进程内计数器。每次成功发布分配一个新版本，即使内容相同；未知写入结果不自动重放。序号耗尽或未初始化序列与既有记录冲突时返回 Conflict，不扫描、重编号或迁移旧记录。运维必须在旧数据切换前保存既有最大编号及转换映射，并初始化序列；删除模板数据时也不得丢弃该高水位。
+
+
+`AgentBinding.creation_attempts`按仍被current/secondary引用的Env ID保存创建请求元数据：`number`、`retry_after_unix_ms`和`backoff_seconds`，缺省为空。首次尝试序号为0；仅上层确认分配前取消时CAS增加序号。旧Env仍活跃的观察只推进退避时间，不改序号。退避为5→10→20→40→60秒封顶；相同原尝试的并发更新只提交一次。记录不保存Platform生命周期、占用快照或历史流水；退休引用清理时移除对应元数据。未知提交仍读回同一Binding，不能盲目重复递增。

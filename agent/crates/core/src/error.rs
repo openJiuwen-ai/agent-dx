@@ -10,6 +10,8 @@ pub enum Error {
     Conflict(String),
     Unavailable(String),
     OutcomeUnknown(String),
+    SchedulingCancelled(Box<adx_core::scheduling::SchedulingFailure>),
+    CreationDeferred { retry_after_unix_ms: u64 },
 }
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -28,6 +30,7 @@ impl From<crate::environment::EnvironmentError> for Error {
             E::Conflict(s) => Self::Conflict(s),
             E::Unavailable(s) => Self::Unavailable(s),
             E::OutcomeUnknown(s) => Self::OutcomeUnknown(s),
+            E::SchedulingCancelled(failure) => Self::SchedulingCancelled(failure),
         }
     }
 }

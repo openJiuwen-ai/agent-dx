@@ -317,7 +317,24 @@ fn caller() -> pb::CallerContext {
 
 #[tokio::test]
 async fn cancelled_schedule_is_cached_without_resubmission_or_runtime_start() {
-    let fixture = Fixture::new().await;
+    let mut fixture = Fixture::new().await;
+    // Keep all three request results resident; other fixture tests intentionally use capacity 1.
+    let mut config = fixture.clients.config.clone();
+    config.cache_entries = 8;
+    fixture.clients = Clients::new(config).unwrap();
+    fixture.service = EnvironmentService::new(fixture.clients.clone());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while fixture
+            .service
+            .inspect("tenant", "not-created")
+            .await
+            .is_err()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
     fixture
         .state
         .scheduling_expired
@@ -342,6 +359,24 @@ async fn cancelled_schedule_is_cached_without_resubmission_or_runtime_start() {
         .unwrap_err();
     assert!(adx_protocol::scheduling_failure(&error).is_some());
     assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), 2);
+    fixture
+        .state
+        .scheduling_expired
+        .store(false, Ordering::SeqCst);
+    let created = fixture
+        .create("too-large", "placement-returned")
+        .await
+        .unwrap();
+    assert_eq!(created["environmentId"], "too-large");
+    assert_eq!(fixture.state.starts.load(Ordering::SeqCst), 1);
+    let calls = fixture.state.create_calls.load(Ordering::SeqCst);
+    // The old request's result remains immutable even after a new attempt succeeds.
+    let old = fixture
+        .create("too-large", "create-too-large")
+        .await
+        .unwrap_err();
+    assert!(adx_protocol::scheduling_failure(&old).is_some());
+    assert_eq!(fixture.state.create_calls.load(Ordering::SeqCst), calls);
 }
 
 #[tokio::test]

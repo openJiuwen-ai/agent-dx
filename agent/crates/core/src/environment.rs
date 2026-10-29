@@ -1,5 +1,6 @@
 //! General Environment capability boundary shared by Gateway adapters and Activator clients.
-//! Contains no Coordinator/Adxlet identities, Platform storage keys or business invoke protocol.
+//! Preserves the canonical Platform SchedulingFailure diagnostic; contains no
+//! Coordinator/Adxlet identities, Platform storage keys or business invoke protocol.
 use crate::{Resources, Service, TemplateVersion, ValidationResult};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -119,6 +120,9 @@ pub struct CreateEnvironment {
     /// Request metadata, not part of environment identity or execution specification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline_unix_ms: Option<u64>,
+    /// Transport attempt only; advances after confirmed cancellation before assignment.
+    #[serde(default)]
+    pub creation_attempt: u64,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -150,6 +154,8 @@ pub enum EnvironmentError {
     Conflict(String),
     Unavailable(String),
     OutcomeUnknown(String),
+    /// Coordinator confirmed cancellation before assignment, not an ambiguous RPC timeout.
+    SchedulingCancelled(Box<adx_core::scheduling::SchedulingFailure>),
 }
 impl std::fmt::Display for EnvironmentError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

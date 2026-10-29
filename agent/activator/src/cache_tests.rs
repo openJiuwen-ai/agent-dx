@@ -36,6 +36,7 @@ fn binding_cache_memory_profile() {
                 phase: BindingPhase::Active,
                 parameters: Default::default(),
                 volumes: Default::default(),
+                creation_attempts: Default::default(),
             },
             service: vec![adx_agent_core::Service {
                 protocol: adx_agent_core::Protocol::Http,

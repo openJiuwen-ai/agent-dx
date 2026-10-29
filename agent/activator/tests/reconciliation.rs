@@ -134,6 +134,16 @@ async fn select(state: &AgentState, config: &mut AliasConfig, version: &str) {
     }];
     state.put_alias(config, Some(&revision)).await.unwrap();
 }
+async fn pause_current(platform: &Platform, state: &AgentState, scope: &Scope) {
+    let binding = state.binding(scope).await.unwrap().unwrap();
+    platform
+        .0
+        .lock()
+        .unwrap()
+        .get_mut(&binding.current.environment_id)
+        .unwrap()
+        .phase = EnvironmentPhase::Paused;
+}
 fn scope(id: &str) -> Scope {
     Scope {
         tenant: "tenant".into(),
@@ -176,6 +186,7 @@ async fn member_removal_transfers_unfinished_bindings_without_an_alias_update() 
     )
     .await
     .unwrap();
+    pause_current(&platform, &state, &scope).await;
     select(&state, &mut config, "2").await;
     tokio::time::sleep(Duration::from_millis(1300)).await;
     assert_eq!(
@@ -205,6 +216,7 @@ async fn startup_scan_and_later_notifications_converge_and_invalidate_hot_cache(
         .await
         .unwrap()
         .binding;
+    pause_current(&platform, &state, &scope).await;
     select(&state, &mut config, "2").await;
     let worker = Reconciliation::start(
         activator.clone(),
@@ -226,6 +238,7 @@ async fn startup_scan_and_later_notifications_converge_and_invalidate_hot_cache(
             .version,
         "2"
     );
+    pause_current(&platform, &state, &scope).await;
     select(&state, &mut config, "1").await;
     converged(&state, &scope, "1").await;
     let restored = activator
@@ -245,7 +258,7 @@ async fn startup_scan_and_later_notifications_converge_and_invalidate_hot_cache(
 #[tokio::test]
 #[ignore = "requires disposable Redis; disconnects all Pub/Sub clients"]
 async fn subscription_reconnect_rescans_changes_missed_while_disconnected() {
-    let (store, registry, state, activator, _platform, mut config) = fixture().await;
+    let (store, registry, state, activator, platform, mut config) = fixture().await;
     let scope = scope("reconnect");
     activator
         .activate(&scope, None, unix_time_millis() + 5000)
@@ -289,6 +302,7 @@ async fn subscription_reconnect_rescans_changes_missed_while_disconnected() {
     })
     .await
     .expect("subscription disconnect must disable alias cache");
+    pause_current(&platform, &state, &scope).await;
     select(&state, &mut config, "2").await;
     converged(&state, &scope, "2").await;
     assert!(activator.ready());
@@ -327,6 +341,7 @@ async fn two_live_activators_invalidate_their_caches_on_the_same_binding_switch(
     .await
     .unwrap();
     tokio::time::sleep(Duration::from_millis(1200)).await;
+    pause_current(&platform, &state, &scope).await;
     select(&state, &mut config, "2").await;
     converged(&state, &scope, "2").await;
     // Delivery is asynchronous; each replica must eventually stop returning its old hot target.
@@ -350,4 +365,147 @@ async fn two_live_activators_invalidate_their_caches_on_the_same_binding_switch(
     assert_eq!(platform.0.lock().unwrap().len(), 2);
     one.shutdown().await.unwrap();
     two.shutdown().await.unwrap();
+}
+
+#[derive(Default)]
+struct CancelledPlatform {
+    inner: Platform,
+    blocked: std::sync::Mutex<Option<String>>,
+    attempts: std::sync::Mutex<Vec<u64>>,
+    cancellations: std::sync::atomic::AtomicUsize,
+}
+#[async_trait::async_trait]
+impl Environment for CancelledPlatform {
+    async fn create(
+        &self,
+        request: &CreateEnvironment,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        if self.blocked.lock().unwrap().as_deref() == Some(&request.id) {
+            self.attempts.lock().unwrap().push(request.creation_attempt);
+            if self
+                .cancellations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                return Err(EnvironmentError::SchedulingCancelled(Box::default()));
+            }
+        }
+        self.inner.create(request).await
+    }
+    async fn get(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<Option<EnvironmentObservation>, EnvironmentError> {
+        self.inner.get(tenant, id).await
+    }
+    async fn delete(
+        &self,
+        tenant: &str,
+        id: &str,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        self.inner.delete(tenant, id).await
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires disposable Redis with notify-keyspace-events K$g"]
+async fn cancelled_creation_retries_after_backoff_without_holding_a_worker() {
+    let (store, registry, state, _, _, mut config) = fixture().await;
+    let platform = Arc::new(CancelledPlatform::default());
+    let activator = Arc::new(Activator::new(state.clone(), platform.clone()));
+    let waiting = scope("a-waiting");
+    let other = scope("b-other");
+    for scope in [&waiting, &other] {
+        activator
+            .activate(scope, None, unix_time_millis() + 5000)
+            .await
+            .unwrap();
+    }
+    for scope in [&waiting, &other] {
+        pause_current(&platform.inner, &state, scope).await;
+    }
+    select(&state, &mut config, "2").await;
+    let binding = state.prepare_binding(&waiting).await.unwrap();
+    *platform.blocked.lock().unwrap() = Some(
+        binding
+            .secondary
+            .as_ref()
+            .unwrap()
+            .environment
+            .environment_id
+            .clone(),
+    );
+    let worker = Reconciliation::start(
+        activator,
+        store,
+        registry,
+        registration("one-worker"),
+        ReconcileSettings {
+            concurrency: 1,
+            ..settings()
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), converged(&state, &other, "2"))
+        .await
+        .expect("a deferred binding must not occupy the only worker");
+    let current = state
+        .binding(&waiting)
+        .await
+        .unwrap()
+        .unwrap()
+        .current
+        .environment_id;
+    platform
+        .inner
+        .0
+        .lock()
+        .unwrap()
+        .get_mut(&current)
+        .unwrap()
+        .phase = EnvironmentPhase::Paused;
+    converged(&state, &waiting, "2").await;
+    assert_eq!(*platform.attempts.lock().unwrap(), vec![0, 1]);
+    worker.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires disposable Redis with notify-keyspace-events K$g"]
+async fn unpaused_current_defers_candidate_without_holding_a_worker() {
+    let (store, registry, state, activator, platform, mut config) = fixture().await;
+    let waiting = scope("a-unpaused");
+    let other = scope("b-paused");
+    for scope in [&waiting, &other] {
+        activator
+            .activate(scope, None, unix_time_millis() + 5000)
+            .await
+            .unwrap();
+    }
+    pause_current(&platform, &state, &other).await;
+    select(&state, &mut config, "2").await;
+    let worker = Reconciliation::start(
+        activator,
+        store,
+        registry,
+        registration("preflight-worker"),
+        ReconcileSettings {
+            concurrency: 1,
+            ..settings()
+        },
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), converged(&state, &other, "2"))
+        .await
+        .expect("waiting for the old Env must not occupy the only worker");
+    let saved = state.binding(&waiting).await.unwrap().unwrap();
+    let candidate = &saved.secondary.as_ref().unwrap().environment.environment_id;
+    assert_eq!(saved.current.version, "1");
+    assert_eq!(saved.creation_attempts[candidate].number, 0);
+    assert!(!platform.0.lock().unwrap().contains_key(candidate));
+    pause_current(&platform, &state, &waiting).await;
+    converged(&state, &waiting, "2").await;
+    worker.shutdown().await.unwrap();
 }

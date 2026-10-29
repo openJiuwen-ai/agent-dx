@@ -102,6 +102,13 @@ async fn alias_service_validation_uses_current_version_and_prewrite_retry_uses_n
         "metadata must follow current, not the new Alias goal"
     );
     assert_eq!(view.binding.unwrap().current, old.binding.current);
+    platform
+        .0
+        .lock()
+        .unwrap()
+        .get_mut(&old.binding.current.environment_id)
+        .unwrap()
+        .phase = EnvironmentPhase::Paused;
     activator
         .reconcile_binding(&scope, context.deadline_unix_ms())
         .await
@@ -263,6 +270,7 @@ async fn missing_candidate_template_retires_before_clearing_and_does_not_recreat
             tenant: "tenant".into(),
             execution: (&candidate_template).into(),
             deadline_unix_ms: None,
+            creation_attempt: 0,
         })
         .await
         .unwrap();

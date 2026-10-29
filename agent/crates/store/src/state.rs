@@ -242,6 +242,7 @@ impl AgentState {
             phase: BindingPhase::Active,
             parameters: parameters.clone(),
             volumes: Default::default(),
+            creation_attempts: Default::default(),
         };
         let mut checks = vec![Check {
             key: key.clone(),

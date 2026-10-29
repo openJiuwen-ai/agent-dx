@@ -21,6 +21,7 @@ fn alias_identity_is_independent_of_selected_environment() {
         phase: BindingPhase::Active,
         parameters: Default::default(),
         volumes: Default::default(),
+        creation_attempts: Default::default(),
     };
     let secondary = binding.secondary.take().unwrap();
     let old = std::mem::replace(&mut binding.current, secondary.environment);

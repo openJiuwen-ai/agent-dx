@@ -2,6 +2,8 @@
 
 Agent 层使用 Rust，产品 API 嵌入统一 Gateway。Activator 可独立部署，也可与 API Server 和 Ingress 共进程；多个副本使用相同产品状态命名空间。
 
+面向开发与交付的讲解见 [Agent 统一能力与 Jiuwen 交付场景串讲](../docs/development/agent-jiuwen-walkthrough.zh.md)，通过单机、多机和场景部署视图，先讲通用模型、激活与访问，再讲 digital-mate App 场景的账号、模型和共享工作区部署。
+
 | 目录 | 职责 |
 | --- | --- |
 | `crates/core` | 产品类型、协议、Environment 能力边界及通用校验 |
@@ -264,3 +266,6 @@ Template 的 service 声明 HTTP/WS/SSH 协议及端口，例如 `[{"protocol":"
 ## 验证
 
 运行 `make agent-test`。真实 Redis 测试将 `ADX_AGENT_TEST_REDIS_URL` 指向一次性数据库并显式使用 `--ignored`，测试会留下独立命名空间记录。组件测试只证明相应代码与 fixture 覆盖的契约。
+
+
+创建排队确认取消后的重试由Activator管理：Binding保存当前创建尝试序号及5→10→20→40→60秒封顶的退避时间，候选Env ID保持不变；每轮先查询候选Env；候选不存在时，在第一次创建及后续重试前统一检查旧Env已Paused/Deleted或不存在，不区分模板卷模式。旧Env尚未暂停只延后检查，仅确定分配前取消才推进Request ID。结果未知和已有执行的重启恢复仍保持原平台语义，见[创建排队取消与退避](activator/README.md#创建排队取消与退避)。

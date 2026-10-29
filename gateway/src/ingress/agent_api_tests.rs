@@ -276,6 +276,7 @@ async fn embedded_registration_automatically_reconciles_aliases() {
             tenant: "tenant".into(),
             execution: (&template).into(),
             deadline_unix_ms: None,
+            creation_attempt: 0,
         })
         .await
         .unwrap();

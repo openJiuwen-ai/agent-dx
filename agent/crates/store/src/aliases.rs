@@ -263,6 +263,11 @@ impl AgentState {
         if binding.generation != retired.generation || binding.secondary != retired.secondary {
             return Err(Error::Conflict("retired reference changed".into()));
         }
+        if let Some(secondary) = &binding.secondary {
+            binding
+                .creation_attempts
+                .remove(&secondary.environment.environment_id);
+        }
         binding.secondary = None;
         if !self
             .store
@@ -275,6 +280,79 @@ impl AgentState {
             return Err(Error::Conflict("binding changed during cleanup".into()));
         }
         Ok(())
+    }
+
+    /// Defer the saved creation attempt. Only a confirmed pre-assignment cancellation
+    /// may set `cancelled`; an active previous Env observation keeps the request identity.
+    /// Changed lifecycles/references return Conflict; an advanced attempt is reused.
+    pub async fn defer_creation(
+        &self,
+        saved: &AgentBinding,
+        environment: &EnvironmentRef,
+        expected: &adx_agent_core::CreationAttempt,
+        cancelled: bool,
+        now_unix_ms: u64,
+    ) -> Result<AgentBinding> {
+        let key = binding_key(&saved.scope)?;
+        for _ in 0..adx_agent_core::limits::CAS_ATTEMPTS {
+            let record = self
+                .store
+                .get(&key)
+                .await?
+                .ok_or_else(|| Error::Conflict("binding missing".into()))?;
+            let mut binding: AgentBinding = record.decode()?;
+            if binding.generation != saved.generation
+                || binding.phase != BindingPhase::Active
+                || !(binding.current == *environment
+                    || binding.secondary.as_ref().is_some_and(|s| {
+                        s.intent == SecondaryIntent::Preparing && s.environment == *environment
+                    }))
+            {
+                return Err(Error::Conflict("creation reference changed".into()));
+            }
+            let current = binding
+                .creation_attempts
+                .get(&environment.environment_id)
+                .cloned()
+                .unwrap_or_default();
+            if current != *expected {
+                return Ok(binding);
+            }
+            let number = if cancelled {
+                current
+                    .number
+                    .checked_add(1)
+                    .ok_or_else(|| Error::Conflict("creation attempt exhausted".into()))?
+            } else {
+                current.number
+            };
+            let backoff_seconds = match current.backoff_seconds {
+                0 => 5,
+                n => n.saturating_mul(2).min(60),
+            };
+            let retry_after_unix_ms = now_unix_ms
+                .checked_add(backoff_seconds * 1000)
+                .ok_or_else(|| Error::Invalid("creation retry time overflow".into()))?;
+            binding.creation_attempts.insert(
+                environment.environment_id.clone(),
+                adx_agent_core::CreationAttempt {
+                    number,
+                    retry_after_unix_ms,
+                    backoff_seconds,
+                },
+            );
+            if self
+                .store
+                .commit(&Transaction::new(
+                    vec![check(&key, &record)],
+                    vec![put(&key, &binding)?],
+                )?)
+                .await?
+            {
+                return Ok(binding);
+            }
+        }
+        Err(Error::Conflict("creation attempt contention".into()))
     }
 
     pub async fn binding_records(

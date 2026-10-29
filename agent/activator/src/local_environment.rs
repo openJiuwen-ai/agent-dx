@@ -99,8 +99,7 @@ impl Environment for LocalEnvironment {
         request: &CreateEnvironment,
     ) -> Result<EnvironmentObservation, EnvironmentError> {
         let input = environment_request::create_input(request, self.timeout, &self.network)?;
-        let operation_id =
-            environment_request::operation_id("create", &request.tenant, &request.id)?;
+        let operation_id = environment_request::creation_request_id(request)?;
         let remaining = remaining_time(capped_deadline(request.deadline_unix_ms, self.timeout));
         if remaining.is_zero() {
             return Err(EnvironmentError::Unavailable(

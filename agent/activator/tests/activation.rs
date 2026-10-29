@@ -439,6 +439,13 @@ async fn alias_switch_keeps_logical_identity_and_restart_finishes_retirement() {
     scope.template_ref = TemplateRef::Alias("production".into());
     let deadline = adx_agent_core::unix_time_millis() + 10_000;
     let original = a.activate(&scope, None, deadline).await.unwrap().binding;
+    platform
+        .observations
+        .lock()
+        .unwrap()
+        .get_mut(&("tenant".into(), original.current.environment_id.clone()))
+        .unwrap()
+        .phase = EnvironmentPhase::Paused;
     config.versions = vec![VersionWeight {
         version: "2".into(),
         weight: 1,
@@ -519,6 +526,13 @@ async fn late_candidate_creation_after_target_change_is_cleaned_using_its_saved_
         .await
         .unwrap()
         .binding;
+    platform
+        .observations
+        .lock()
+        .unwrap()
+        .get_mut(&("tenant".into(), original.current.environment_id.clone()))
+        .unwrap()
+        .phase = EnvironmentPhase::Paused;
     config.versions[0].version = "2".into();
     let revision = state.put_alias(&config, Some(&revision)).await.unwrap();
     let gate = Arc::new(tokio::sync::Notify::new());
@@ -551,7 +565,7 @@ async fn late_candidate_creation_after_target_change_is_cleaned_using_its_saved_
     );
     assert_eq!(
         observations[&("tenant".into(), original.current.environment_id)].phase,
-        EnvironmentPhase::Running
+        EnvironmentPhase::Paused
     );
 }
 

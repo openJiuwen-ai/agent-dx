@@ -181,7 +181,7 @@ async fn run(
     scan(activator, id, members, &mut pending, None).await?;
     activator.subscription_ready.store(true, Ordering::Release);
     let mut running = BTreeSet::new();
-    let mut jobs = JoinSet::new();
+    let mut jobs: JoinSet<(Scope, Result<bool>, Option<Instant>)> = JoinSet::new();
     let mut refresh =
         tokio::time::interval(Duration::from_secs(settings.membership_refresh_seconds));
     refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -209,13 +209,16 @@ async fn run(
                 Err(error)=>tracing::warn!(%error,"Activator membership refresh failed; retaining snapshot"),
             },
             completed=jobs.join_next(), if !jobs.is_empty()=>{
-                let (scope,result)=completed.ok_or_else(||Error::Unavailable("reconcile worker disappeared".into()))?
+                let (scope,result,retry_at)=completed.ok_or_else(||Error::Unavailable("reconcile worker disappeared".into()))?
                     .map_err(|_|Error::Unavailable("reconcile worker failed; rescan required".into()))?;
                 running.remove(&scope);
                 if owns(&scope,id,members) {
                     match result {
                         Ok(true)=>(),
                         Ok(false)=>{pending.entry(scope).or_insert(Instant::now()+Duration::from_secs(1));},
+                        Err(Error::CreationDeferred { .. })=>{
+                            pending.insert(scope, retry_at.unwrap_or_else(Instant::now));
+                        }
                         Err(error)=>{
                             tracing::warn!(%error,?scope,"Binding convergence waiting or blocked");
                             if !matches!(error,Error::Invalid(_)|Error::Unsupported(_)) {
@@ -252,7 +255,20 @@ async fn run(
                             "reconciliation step timed out; inspect saved Env".into(),
                         )),
                     };
-                (scope, result)
+                let retry_at = match &result {
+                    Err(Error::CreationDeferred {
+                        retry_after_unix_ms,
+                    }) => Some(
+                        Instant::now()
+                            + Duration::from_millis(
+                                retry_after_unix_ms
+                                    .saturating_sub(adx_agent_core::unix_time_millis())
+                                    .min(60_000),
+                            ),
+                    ),
+                    _ => None,
+                };
+                (scope, result, retry_at)
             });
         }
     }

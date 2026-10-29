@@ -171,6 +171,39 @@ pub fn operation_id(action: &str, tenant: &str, id: &str) -> Result<String, Envi
         .map_err(|_| EnvironmentError::Invalid("invalid Environment identity".into()))?;
     Ok(format!("activator-{action}-{:x}", Sha256::digest(identity)))
 }
+/// Stable within one creation attempt, including retries after response loss.
+pub fn creation_request_id(request: &CreateEnvironment) -> Result<String, EnvironmentError> {
+    creation_operation_id(&request.tenant, &request.id, request.creation_attempt)
+}
+pub(crate) fn creation_operation_id(
+    tenant: &str,
+    id: &str,
+    attempt: u64,
+) -> Result<String, EnvironmentError> {
+    if attempt == 0 {
+        return operation_id("create", tenant, id);
+    }
+    validate_identity(tenant)?;
+    validate_identity(id)?;
+    let identity = serde_json::to_vec(&(tenant, id, attempt))
+        .map_err(|_| EnvironmentError::Invalid("invalid creation identity".into()))?;
+    Ok(format!("activator-create-{:x}", Sha256::digest(identity)))
+}
+
+/// Only the structured, confirmed pre-assignment cancellation authorizes another attempt.
+pub(crate) fn scheduling_cancellation(value: &Value) -> Option<EnvironmentError> {
+    let error = value.get("error")?;
+    if error["code"] != "DEADLINE_EXCEEDED"
+        || error["retry"] != "never"
+        || error["outcome"] != "not_started"
+    {
+        return None;
+    }
+    let failure: adx_core::scheduling::SchedulingFailure =
+        serde_json::from_value(error.get("schedulingFailure")?.clone()).ok()?;
+    Some(EnvironmentError::SchedulingCancelled(Box::new(failure)))
+}
+
 pub(crate) fn created(
     tenant: &str,
     id: &str,

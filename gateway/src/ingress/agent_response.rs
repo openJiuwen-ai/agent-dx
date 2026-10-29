@@ -45,9 +45,11 @@ pub(super) fn error_response(
         Error::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
         Error::NotFound => StatusCode::NOT_FOUND,
         Error::Conflict(_) => StatusCode::CONFLICT,
-        Error::NotReady(_) | Error::Unavailable(_) | Error::OutcomeUnknown(_) => {
-            StatusCode::SERVICE_UNAVAILABLE
-        }
+        Error::NotReady(_)
+        | Error::Unavailable(_)
+        | Error::OutcomeUnknown(_)
+        | Error::SchedulingCancelled(_)
+        | Error::CreationDeferred { .. } => StatusCode::SERVICE_UNAVAILABLE,
     };
     json_response(
         status,

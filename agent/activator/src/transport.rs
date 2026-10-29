@@ -162,6 +162,7 @@ impl HttpEnvironment {
         id: &str,
         payload: Option<Value>,
         deadline: Option<u64>,
+        creation_attempt: u64,
     ) -> Result<Option<Value>, EnvironmentError> {
         validate_identity(tenant)?;
         validate_identity(id)?;
@@ -205,7 +206,11 @@ impl HttpEnvironment {
             let action = if create { "create" } else { "delete" };
             request = request.header(
                 "x-request-id",
-                environment_request::operation_id(action, tenant, id)?,
+                if create {
+                    environment_request::creation_operation_id(tenant, id, creation_attempt)?
+                } else {
+                    environment_request::operation_id(action, tenant, id)?
+                },
             );
         }
         if let Some(payload) = payload {
@@ -245,6 +250,13 @@ impl HttpEnvironment {
             body.extend_from_slice(&chunk);
         }
         if !status.is_success() {
+            if create && status == StatusCode::GATEWAY_TIMEOUT {
+                if let Ok(value) = serde_json::from_slice::<Value>(&body) {
+                    if let Some(error) = environment_request::scheduling_cancellation(&value) {
+                        return Err(error);
+                    }
+                }
+            }
             // Keep explicit DELETE absence distinct from authentication and transport failures.
             return Err(match status {
                 StatusCode::BAD_REQUEST => {
@@ -320,6 +332,7 @@ impl Environment for HttpEnvironment {
             &request.id,
             Some(payload),
             request.deadline_unix_ms,
+            request.creation_attempt,
         )
         .await?;
         Ok(observation(
@@ -333,7 +346,7 @@ impl Environment for HttpEnvironment {
         tenant: &str,
         id: &str,
     ) -> Result<Option<EnvironmentObservation>, EnvironmentError> {
-        let Some(value) = self.request(Method::GET, tenant, id, None, None).await? else {
+        let Some(value) = self.request(Method::GET, tenant, id, None, None, 0).await? else {
             return Ok(None);
         };
         let rows = value
@@ -355,6 +368,7 @@ impl Environment for HttpEnvironment {
             id,
             Some(json!({"timeoutSeconds":self.timeout.as_secs().max(1)})),
             None,
+            0,
         )
         .await?;
         Ok(observation(tenant, id, EnvironmentPhase::Deleted))

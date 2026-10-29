@@ -398,6 +398,17 @@ pub struct AgentBinding {
     pub parameters: mounts::Parameters,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub volumes: BTreeMap<String, String>,
+    /// Creation request metadata, not Platform lifecycle or health state. Keyed by Env ID.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub creation_attempts: BTreeMap<String, CreationAttempt>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreationAttempt {
+    pub number: u64,
+    pub retry_after_unix_ms: u64,
+    pub backoff_seconds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

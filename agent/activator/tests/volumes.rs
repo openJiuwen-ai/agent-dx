@@ -259,6 +259,13 @@ async fn alias_upgrade_preserves_volume_uid_and_releases_only_the_retired_owner(
         original.volumes.get("workspace-user").map(String::as_str),
         Some("fixed-uid")
     );
+    platform
+        .executions
+        .lock()
+        .unwrap()
+        .get_mut(&original.current.environment_id)
+        .unwrap()
+        .phase = EnvironmentPhase::Paused;
     config.versions = vec![VersionWeight {
         version: "2".into(),
         weight: 1,

@@ -10,6 +10,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+adx-core = { path = "../../platform/crates/core" }
 ipnet = "2"
 base64 = "0.22"
 sha2 = "0.10"
