@@ -4230,18 +4230,35 @@ fn errno_xattr(
     name: &OsStr,
     context: &RequestContext,
 ) -> i32 {
-    afs_logging::error!(
-        "FUSE request failed";
-        "code" => error.code().raw(),
-        "kind" => format!("{:?}", error.kind()),
-        "message" => error.message(),
-        "op" => op,
-        "inode" => ino,
-        "name" => name.to_string_lossy().into_owned(),
-        "pid" => context.pid,
-        "uid" => context.uid,
-        "gid" => context.gid,
-    );
+    // An absent attribute is a normal answer, not a failure: the kernel probes
+    // security.capability on nearly every create/open and OwnerFs stores only
+    // user.* names. Logging those probes at error level produced one ERRO line
+    // per created file and polluted error-based alerting.
+    let absent = error.kind() == afs_error::ErrorKind::NotFound;
+    if absent {
+        afs_logging::debug!(
+            "FUSE xattr absent";
+            "code" => error.code().raw(),
+            "kind" => format!("{:?}", error.kind()),
+            "message" => error.message(),
+            "op" => op,
+            "inode" => ino,
+            "name" => name.to_string_lossy().into_owned()
+        );
+    } else {
+        afs_logging::error!(
+            "FUSE request failed";
+            "code" => error.code().raw(),
+            "kind" => format!("{:?}", error.kind()),
+            "message" => error.message(),
+            "op" => op,
+            "inode" => ino,
+            "name" => name.to_string_lossy().into_owned(),
+            "pid" => context.pid,
+            "uid" => context.uid,
+            "gid" => context.gid,
+        );
+    }
     crate::error::errno(&error)
 }
 
