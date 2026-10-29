@@ -17,7 +17,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use tokio::sync::watch;
@@ -32,6 +32,9 @@ const TOPOLOGY_SYNC_INTERVAL: Duration = Duration::from_secs(10);
 const PROBE_INTERVAL: Duration = Duration::from_secs(10);
 /// 探针睡眠分段：保证 stop 标志在半个周期内被观察到。
 const PROBE_STOP_POLL: Duration = Duration::from_millis(500);
+/// 探活结论的有效期（m-1）：3 个探针周期。超过后仍保留记录但输出不健康
+/// ——挂死时永久保留 `true` 会让新发布继续指向死节点（NFS `D` 状态）。
+const PROBE_TTL: Duration = Duration::from_secs(30);
 
 /// 集群拓扑快照：live 成员表 × 各远端通路健康。本地节点在 `live` 中，
 /// 但不对自身维护 `paths`（本地 home 走物理层 users_root，不经传输通路）。
@@ -125,21 +128,38 @@ struct MemberProbe {
     stop: Arc<AtomicBool>,
 }
 
+/// 单个成员的探活结论（m-1）。`healthy` 是最近一次探活的返回值，
+/// `last_success` 记录最近一次成功的时间：探活挂死（线程阻塞在 stat 上）
+/// 时不会再刷新它，超过 [`PROBE_TTL`] 即判为不健康。
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProbeRecord {
+    pub(crate) healthy: bool,
+    pub(crate) last_success: Option<Instant>,
+}
+
+/// 探活结论是否仍然有效（m-1）：成功且未超期。
+fn probe_healthy(record: &ProbeRecord, now: Instant) -> bool {
+    record.healthy
+        && record
+            .last_success
+            .is_some_and(|at| now.duration_since(at) < PROBE_TTL)
+}
+
 /// 每成员探针注册表（探活隔离的核心）：成员加入起线程、离场停线程。
 ///
-/// 健康语义（spec §12 故障表）：
-/// - 探活成功 → 缓存 true；
+/// 健康语义（spec §12 故障表，m-1 后有界）：
+/// - 探活成功 → 缓存 true 并刷新 `last_success`；
 /// - 探活报错（soft mount / ESTALE）→ 缓存 false → 停发/下线该 home
 ///   的 symlink，恢复后对账补发；
-/// - 探活挂死（hard mount 失联）→ 缓存保留最后成功值：已发布 symlink
-///   保留（在跑容器由 kernel 无限重试无缝续上），新发布被阻止（新成员
-///   从未探活成功，默认 false）。
+/// - 探活挂死（hard mount 失联）→ 30s 内保留最后成功值：已发布 symlink
+///   保留（在跑容器由 kernel 无限重试无缝续上）；超过 30s 转不健康，
+///   停发新入口；从未探活成功（无记录）由拓扑侧省略传递。
 ///
 /// 线程数上界 = 远端 live 成员数（+ 离场时仍阻塞在 stat 上的线程，随
 /// stat 返回退出）。
 struct ProbeRegistry {
     /// 探活结果缓存：最后成功值即当前判定。
-    healthy: Arc<Mutex<BTreeMap<NodeId, bool>>>,
+    healthy: Arc<Mutex<BTreeMap<NodeId, ProbeRecord>>>,
     probes: BTreeMap<NodeId, MemberProbe>,
 }
 
@@ -211,11 +231,33 @@ impl ProbeRegistry {
         }
     }
 
-    /// 探活缓存快照（轮询循环消费）。
+    /// 探活缓存快照（轮询循环消费）：输出的是"有效结论"——成功且未超过
+    /// [`PROBE_TTL`]。过期记录仍然保留并输出 `false`，与"无记录 = 尚未
+    /// 探活"（由调用方省略）区分。
     fn snapshot(&self) -> BTreeMap<NodeId, bool> {
+        let now = Instant::now();
         self.healthy
             .lock()
-            .map(|cache| cache.clone())
+            .map(|cache| {
+                cache
+                    .iter()
+                    .map(|(node, record)| (node.clone(), probe_healthy(record, now)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// 缓存中"有成功记录但已过期"的条目数（m-1 观测）。
+    fn stale_count(&self) -> usize {
+        let now = Instant::now();
+        self.healthy
+            .lock()
+            .map(|cache| {
+                cache
+                    .values()
+                    .filter(|record| record.healthy && !probe_healthy(record, now))
+                    .count()
+            })
             .unwrap_or_default()
     }
 }
@@ -223,7 +265,7 @@ impl ProbeRegistry {
 fn probe_loop(
     backend: &dyn TransportBackend,
     node: NodeId,
-    healthy: Arc<Mutex<BTreeMap<NodeId, bool>>>,
+    healthy: Arc<Mutex<BTreeMap<NodeId, ProbeRecord>>>,
     stop: Arc<AtomicBool>,
 ) {
     loop {
@@ -232,8 +274,24 @@ fn probe_loop(
         }
         // 可能无限阻塞（hard mount 失联）——只困住本成员线程。
         let probed = backend.healthy(&node);
+        // 写前复查 stop（m-1）：成员在阻塞期间离场，缓存已被 sync 清除，
+        // 此时写回会让记录在 map 里无界残留，且重新加入后会读到旧结论。
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
         if let Ok(mut cache) = healthy.lock() {
-            cache.insert(node.clone(), probed);
+            let last_success = if probed {
+                Some(Instant::now())
+            } else {
+                cache.get(&node).and_then(|record| record.last_success)
+            };
+            cache.insert(
+                node.clone(),
+                ProbeRecord {
+                    healthy: probed,
+                    last_success,
+                },
+            );
         }
         // 分段睡眠：stop 及时可见，避免离场线程多跑一轮。
         let mut slept = Duration::ZERO;
@@ -263,6 +321,7 @@ pub(crate) async fn run_topology_sync(
     tokio::pin!(shutdown);
     let mut current = TopologyState::default();
     let mut registry = ProbeRegistry::new();
+    let mut unprobed_reported: BTreeSet<NodeId> = BTreeSet::new();
     let mut delay = Duration::ZERO;
     loop {
         tokio::select! {
@@ -296,32 +355,63 @@ pub(crate) async fn run_topology_sync(
         // 健康判定读探针缓存（阻塞只发生在各探针线程内）；mountinfo 校验
         // （本地 /proc 读）在阻塞池批量完成。
         let healthy_cache = registry.snapshot();
+        let stale = registry.stale_count();
+        if stale > 0 {
+            afs_logging::warn!("outlet.topology.probe_stale"; "stale" => stale);
+        }
         let backend_for_task = backend.clone();
         let previous = current.clone();
         let local = local_node_id.clone();
-        let (next, changes) = tokio::task::spawn_blocking(move || {
+        let (next, changes, unprobed) = tokio::task::spawn_blocking(move || {
             let mut probed = BTreeMap::new();
+            let mut unprobed: BTreeSet<NodeId> = BTreeSet::new();
             for node in &live {
                 if node == &local {
                     continue;
                 }
                 let path = backend_for_task.path_state(node);
-                let healthy = matches!(path, TransportPathState::Present)
-                    && healthy_cache.get(node).copied().unwrap_or(false);
-                probed.insert(
-                    node.clone(),
-                    PathHealth {
-                        state: path,
-                        healthy,
-                    },
-                );
+                match (&path, healthy_cache.get(node).copied()) {
+                    // 通路就绪且有有效结论：按值使用。
+                    (TransportPathState::Present, Some(healthy)) => {
+                        probed.insert(
+                            node.clone(),
+                            PathHealth {
+                                state: path,
+                                healthy,
+                            },
+                        );
+                    }
+                    // 尚未探活（m-7）：不合成不健康，也不写入 `paths`。已
+                    // 发布入口据此保留（`None => true`），新发布被拒
+                    // （`is_some_and(usable)`）。
+                    (TransportPathState::Present, None) => {
+                        unprobed.insert(node.clone());
+                    }
+                    // Missing / Drift：明确退化，照常停发。
+                    _ => {
+                        probed.insert(
+                            node.clone(),
+                            PathHealth {
+                                state: path,
+                                healthy: false,
+                            },
+                        );
+                    }
+                }
             }
-            advance_topology(&previous, &live, &probed, &local)
+            let (next, changes) = advance_topology(&previous, &live, &probed, &local);
+            (next, changes, unprobed)
         })
         .await?;
         for change in &changes {
             log_topology_change(change);
         }
+        for node in &unprobed {
+            if !unprobed_reported.contains(node) {
+                afs_logging::info!("outlet.topology.path_unprobed"; "node" => node.clone());
+            }
+        }
+        unprobed_reported = unprobed;
         current = next.clone();
         // 发布 worker 尚未订阅时无接收者，忽略发送结果并继续对齐。
         let _ = state.send(next);
@@ -508,10 +598,37 @@ mod tests {
         assert!(changes.is_empty());
     }
 
-    /// 探活挂死语义（spec §12）：advance_topology 只看传入快照，"挂死"
-    /// 表现为上一轮的成功值继续传入——已发布 symlink 保留、无降级事件。
+    /// 探活挂死语义（spec §12，m-1 后有界）：30s 内保留最后成功值——已
+    /// 发布 symlink 保留、无降级事件；达到 30s 转不健康（停止新发布，已
+    /// 发布入口由拓扑轮摘除）。
     #[test]
     fn hung_probe_keeps_previous_health() {
+        let now = Instant::now();
+        let fresh = ProbeRecord {
+            healthy: true,
+            last_success: Some(now - (PROBE_TTL - Duration::from_secs(1))),
+        };
+        assert!(probe_healthy(&fresh, now), "within TTL keeps healthy");
+        let stale = ProbeRecord {
+            healthy: true,
+            last_success: Some(now - PROBE_TTL),
+        };
+        assert!(!probe_healthy(&stale, now), "TTL expiry turns unhealthy");
+        assert!(!probe_healthy(
+            &ProbeRecord {
+                healthy: false,
+                last_success: Some(now),
+            },
+            now
+        ));
+        assert!(!probe_healthy(
+            &ProbeRecord {
+                healthy: true,
+                last_success: None,
+            },
+            now
+        ));
+        // TTL 由 registry 出口统一施加；advance_topology 仍只看传入快照。
         let previous = TopologyState {
             live: live(&["A", "B"]),
             paths: probed(&[(("B", TransportPathState::Present), true)]),
@@ -524,6 +641,43 @@ mod tests {
         );
         assert!(state.paths["B"].usable());
         assert!(changes.is_empty());
+    }
+
+    /// 快照出口区分"记录过期"（输出 false、记录保留）与"无记录"
+    /// （省略，由调用方按 unprobed 处理）。
+    #[test]
+    fn snapshot_distinguishes_stale_from_unprobed() {
+        let registry = ProbeRegistry::new();
+        {
+            let mut cache = registry.healthy.lock().unwrap();
+            cache.insert(
+                "stale".to_owned(),
+                ProbeRecord {
+                    healthy: true,
+                    last_success: Some(Instant::now() - PROBE_TTL),
+                },
+            );
+            cache.insert(
+                "fresh".to_owned(),
+                ProbeRecord {
+                    healthy: true,
+                    last_success: Some(Instant::now()),
+                },
+            );
+            cache.insert(
+                "failed".to_owned(),
+                ProbeRecord {
+                    healthy: false,
+                    last_success: None,
+                },
+            );
+        }
+        let snapshot = registry.snapshot();
+        assert_eq!(snapshot.get("stale"), Some(&false));
+        assert_eq!(snapshot.get("fresh"), Some(&true));
+        assert_eq!(snapshot.get("failed"), Some(&false));
+        assert_eq!(snapshot.get("never-probed"), None);
+        assert_eq!(registry.stale_count(), 1);
     }
 
     struct ProbeFakeBackend {
@@ -539,8 +693,15 @@ mod tests {
             self.healthy.contains(node)
         }
 
-        fn resolve_target(&self, name: &OsStr, home: &NodeId) -> afs_error::Result<PathBuf> {
-            Ok(PathBuf::from("/imports").join(home).join(name))
+        fn resolve_target(
+            &self,
+            name: &OsStr,
+            home: &NodeId,
+            epoch: u64,
+        ) -> afs_error::Result<PathBuf> {
+            Ok(PathBuf::from("/imports")
+                .join(home)
+                .join(format!("{}-e{epoch}", name.to_string_lossy())))
         }
     }
 

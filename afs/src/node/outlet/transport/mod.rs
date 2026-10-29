@@ -56,9 +56,11 @@ pub trait TransportBackend: Send + Sync {
     /// （spec §12：挂死 = 在跑容器由 kernel 重试无缝续上；报错 = 停发）。
     fn healthy(&self, node: &NodeId) -> bool;
 
-    /// 发布时问路：远端 home 的 workspace `<name>` 在本节点的数据路径
-    /// （表现层 symlink target），路径布局由后端决定。调用方保证 `home`
-    /// 为远端 live 成员且通路可用；本地 home 的 target 由发布层直接取
-    /// 物理层 users_root，不经本接口。
-    fn resolve_target(&self, name: &OsStr, home: &NodeId) -> Result<PathBuf>;
+    /// 发布时问路：远端 home 的 workspace `<name>` 第 `epoch` 代在本节点的
+    /// 数据路径（表现层 symlink target），路径布局由后端决定。代次是 target
+    /// 的自描述信息：同一名字的两代必须解析出不同文本，否则删除窗口内的
+    /// 旧链接会静默指向新一代数据（spec §12）。调用方保证 `home` 为远端
+    /// live 成员且通路可用；本地 home 的 target 由发布层直接取物理层
+    /// users_root，不经本接口。
+    fn resolve_target(&self, name: &OsStr, home: &NodeId, epoch: u64) -> Result<PathBuf>;
 }

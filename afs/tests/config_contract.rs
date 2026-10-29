@@ -1452,6 +1452,32 @@ fn outlet_transport_backend_defaults_to_none_and_rejects_unknown_values() {
         )
         .is_err()
     );
+
+    // 空节：节存在但 backend 缺失 → 拒绝（不默认为 nfs）。
+    std::fs::write(&path, format!("{base}[outlet_transport]\n")).unwrap();
+    assert!(
+        Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()])
+        )
+        .is_err(),
+        "an empty [outlet_transport] section must be rejected"
+    );
+
+    // 未知键：即便 backend 合法，未知字段也拒绝（fail-fast，避免拼写错误静默生效）。
+    std::fs::write(
+        &path,
+        format!("{base}[outlet_transport]\nbackend='nfs'\nmount_options='vers=4'\n"),
+    )
+    .unwrap();
+    assert!(
+        Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()])
+        )
+        .is_err(),
+        "unknown [outlet_transport] keys must be rejected"
+    );
 }
 
 #[test]

@@ -619,24 +619,32 @@ impl GrpcRootMeta {
             }))?
             .into_inner();
         let mut roots = Vec::with_capacity(reply.roots.len());
+        let mut skipped = 0usize;
         for root in reply.roots {
-            if root.root_id.is_empty() || root.home_node_id.is_empty() {
-                return Err(Error::coded(
-                    CLIENT_PROTOCOL_VIOLATION,
-                    "ListOutletRoots returned an incomplete root location",
-                ));
+            // 毒丸条目降级：单个 root 解码失败只跳过该条，不能把整份
+            // Active 快照打成 Err——那会让启动/周期对账永久失败、进程
+            // 停在一个坏名字上无法自愈。
+            let root_id = root.root_id.clone();
+            let home_node_id = root.home_node_id.clone();
+            match outlet_active_root_from_wire(root) {
+                Ok(active) => roots.push(active),
+                Err(error) => {
+                    skipped += 1;
+                    afs_logging::warn!(
+                        "outlet.meta.root_decode_skipped";
+                        "root_id" => root_id,
+                        "home_node_id" => home_node_id,
+                        "error" => error.to_string()
+                    );
+                }
             }
-            let name = root_name_from_id(&RootId(root.root_id.clone())).map_err(|error| {
-                Error::coded(
-                    CLIENT_PROTOCOL_VIOLATION,
-                    format!("ListOutletRoots returned a non-canonical root id: {error}"),
-                )
-            })?;
-            roots.push(OutletActiveRoot {
-                root_id: root.root_id,
-                name,
-                home_node_id: root.home_node_id,
-            });
+        }
+        if skipped > 0 {
+            afs_logging::warn!(
+                "outlet.meta.roots_degraded";
+                "skipped" => skipped,
+                "authority_revision" => reply.authority_revision
+            );
         }
         Ok((roots, reply.authority_revision))
     }
@@ -3590,6 +3598,8 @@ pub(crate) enum OutletPublicationEvent {
         root_id: String,
         name: OsString,
         home_node_id: String,
+        /// 归属代次；发布面 target 的组成部分，因此不能降级为可选。
+        epoch: u64,
     },
     RootDeleted {
         root_id: String,
@@ -3611,13 +3621,46 @@ pub(crate) enum OutletEventBatch {
     Compacted,
 }
 
-/// Active 根的发布面投影：名字已解码、home 已校验非空。
+/// Active 根的发布面投影：名字已解码、home 已校验非空、代次非零。
 #[cfg(feature = "ownerfs")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OutletActiveRoot {
     pub(crate) root_id: String,
     pub(crate) name: OsString,
     pub(crate) home_node_id: String,
+    pub(crate) epoch: u64,
+}
+
+/// 单个 Active root 的发布面投影。字段缺失或 root_id 非规范都返回 Err，
+/// 由调用方计数并跳过（毒丸条目降级，不能拖垮整份快照）。
+#[cfg(feature = "ownerfs")]
+fn outlet_active_root_from_wire(
+    root: afs_protocol::meta::RootLocation,
+) -> Result<OutletActiveRoot> {
+    if root.root_id.is_empty() || root.home_node_id.is_empty() {
+        return Err(Error::coded(
+            CLIENT_PROTOCOL_VIOLATION,
+            "Outlet root location has invalid identity",
+        ));
+    }
+    if root.root_epoch == 0 {
+        return Err(Error::coded(
+            CLIENT_PROTOCOL_VIOLATION,
+            "Outlet root location has a zero epoch",
+        ));
+    }
+    let name = root_name_from_id(&RootId(root.root_id.clone())).map_err(|error| {
+        Error::coded(
+            CLIENT_PROTOCOL_VIOLATION,
+            format!("Outlet root has a non-canonical root id: {error}"),
+        )
+    })?;
+    Ok(OutletActiveRoot {
+        root_id: root.root_id,
+        name,
+        home_node_id: root.home_node_id,
+        epoch: root.root_epoch,
+    })
 }
 
 #[cfg(feature = "ownerfs")]
@@ -3642,6 +3685,12 @@ fn outlet_event_from_wire(
                     "OutletEventRootActivated has invalid root identity",
                 ));
             }
+            if root.root_epoch == 0 {
+                return Err(Error::coded(
+                    CLIENT_PROTOCOL_VIOLATION,
+                    "OutletEventRootActivated has a zero epoch",
+                ));
+            }
             let name = root_name_from_id(&RootId(root.root_id.clone())).map_err(|error| {
                 Error::coded(
                     CLIENT_PROTOCOL_VIOLATION,
@@ -3652,6 +3701,7 @@ fn outlet_event_from_wire(
                 root_id: root.root_id,
                 name,
                 home_node_id: root.home_node_id,
+                epoch: root.root_epoch,
             })
         }
         Kind::RootDeleted(deleted) => {
@@ -3679,6 +3729,26 @@ fn outlet_event_from_wire(
     }
 }
 
+/// 解码失败时仍要能定位到事件的原始标识：坏 root_id 往往正是失败原因，
+/// 不先抓下来就随 `outlet_event_from_wire` 一起被消费掉了。
+#[cfg(feature = "ownerfs")]
+fn outlet_event_root_id(event: &afs_protocol::meta::OutletEvent) -> String {
+    use afs_protocol::meta::outlet_event::Kind;
+    match event.kind.as_ref() {
+        Some(Kind::RootActivated(activated)) => activated
+            .root
+            .as_ref()
+            .map(|root| root.root_id.clone())
+            .unwrap_or_default(),
+        Some(Kind::RootDeleted(deleted)) => deleted.root_id.clone(),
+        // 该事件类型没有 root_id，用 node 标识替代定位字段。
+        Some(Kind::NodeSessionRegistered(registered)) => {
+            format!("node:{}", registered.node_id)
+        }
+        None => String::new(),
+    }
+}
+
 #[cfg(feature = "ownerfs")]
 fn outlet_event_batch_from_wire(
     requested_after: u64,
@@ -3699,9 +3769,11 @@ fn outlet_event_batch_from_wire(
                     "OutletEventBatchEvents has invalid next revision",
                 ));
             }
+            let start_revision = events.start_revision;
             let next_revision = events.next_revision;
-            let mut last_revision = events.start_revision;
+            let mut last_revision = start_revision;
             let mut parsed = Vec::with_capacity(events.events.len());
+            let mut skipped = 0usize;
             for event in events.events {
                 // 非严格递增：一个事务可在同一修订下产生多条事件（如多 key
                 // 写入），与 RootCommandBatch 排序契约一致；修订必须落在
@@ -3713,7 +3785,31 @@ fn outlet_event_batch_from_wire(
                     ));
                 }
                 last_revision = event.revision;
-                parsed.push(outlet_event_from_wire(event)?);
+                // 毒丸事件降级：单条解码失败只跳过该条并继续解下一条，
+                // 整批仍按 next_revision 前进——否则一条坏事件会让游标
+                // 永久停在原地，整条发布链路停在旧状态。
+                let revision = event.revision;
+                let root_id = outlet_event_root_id(&event);
+                match outlet_event_from_wire(event) {
+                    Ok(parsed_event) => parsed.push(parsed_event),
+                    Err(error) => {
+                        skipped += 1;
+                        afs_logging::warn!(
+                            "outlet.meta.event_decode_skipped";
+                            "revision" => revision,
+                            "root_id" => root_id,
+                            "error" => error.to_string()
+                        );
+                    }
+                }
+            }
+            if skipped > 0 {
+                afs_logging::warn!(
+                    "outlet.meta.event_batch_degraded";
+                    "skipped" => skipped,
+                    "start_revision" => start_revision,
+                    "next_revision" => next_revision
+                );
             }
             Ok(OutletEventBatch::Events {
                 next_revision,
@@ -3726,6 +3822,159 @@ fn outlet_event_batch_from_wire(
             CLIENT_PROTOCOL_VIOLATION,
             "OutletEventBatchReply is missing its result",
         )),
+    }
+}
+
+#[cfg(all(test, feature = "ownerfs"))]
+mod outlet_wire_tests {
+    use super::*;
+    use crate::node::vfs::ownerfs::root::root_id_from_name;
+    use std::ffi::OsStr;
+
+    fn location(root_id: &str) -> afs_protocol::meta::RootLocation {
+        afs_protocol::meta::RootLocation {
+            root_id: root_id.to_owned(),
+            root_epoch: 1,
+            home_node_id: "home-a".to_owned(),
+            home_session_id: "session-a".to_owned(),
+        }
+    }
+
+    fn activated(revision: u64, root_id: &str) -> afs_protocol::meta::OutletEvent {
+        use afs_protocol::meta::outlet_event::Kind;
+        afs_protocol::meta::OutletEvent {
+            revision,
+            kind: Some(Kind::RootActivated(
+                afs_protocol::meta::OutletEventRootActivated {
+                    root: Some(location(root_id)),
+                },
+            )),
+        }
+    }
+
+    fn events_reply(
+        start_revision: u64,
+        next_revision: u64,
+        events: Vec<afs_protocol::meta::OutletEvent>,
+    ) -> afs_protocol::meta::OutletEventBatchReply {
+        afs_protocol::meta::OutletEventBatchReply {
+            result: Some(
+                afs_protocol::meta::outlet_event_batch_reply::Result::Events(
+                    afs_protocol::meta::OutletEventBatchEvents {
+                        start_revision,
+                        next_revision,
+                        events,
+                    },
+                ),
+            ),
+        }
+    }
+
+    /// M-4：单条坏事件被跳过，同批合法事件仍生效，游标照常前进。
+    #[test]
+    fn outlet_event_batch_skips_poison_event_and_advances_cursor() {
+        let good = root_id_from_name(OsStr::new("ws-a")).unwrap().0;
+        let batch = outlet_event_batch_from_wire(
+            7,
+            events_reply(
+                7,
+                10,
+                vec![activated(8, "root-not-hex"), activated(9, &good)],
+            ),
+        )
+        .unwrap();
+        match batch {
+            OutletEventBatch::Events {
+                next_revision,
+                events,
+            } => {
+                assert_eq!(next_revision, 10);
+                assert_eq!(events.len(), 1);
+                assert!(matches!(
+                    &events[0],
+                    OutletPublicationEvent::RootActivated { name, .. } if name == OsStr::new("ws-a")
+                ));
+            }
+            OutletEventBatch::Compacted => panic!("expected events batch"),
+        }
+    }
+
+    /// M-4 保持不变项：游标失同步仍整批 Err，不得被逐条降级吞掉。
+    #[test]
+    fn outlet_event_batch_rejects_cursor_desync() {
+        for reply in [
+            events_reply(8, 9, Vec::new()),
+            events_reply(7, 7, Vec::new()),
+        ] {
+            assert_eq!(
+                outlet_event_batch_from_wire(7, reply).unwrap_err().code(),
+                CLIENT_PROTOCOL_VIOLATION
+            );
+        }
+    }
+
+    /// M-12（方案 B）：Compacted 携带的恢复游标字段不参与发布面判定。
+    #[test]
+    fn outlet_event_batch_maps_compacted_regardless_of_recovery_fields() {
+        let reply = afs_protocol::meta::OutletEventBatchReply {
+            result: Some(
+                afs_protocol::meta::outlet_event_batch_reply::Result::Compacted(
+                    afs_protocol::meta::OutletEventBatchCompacted {
+                        requested_after: 3,
+                        compacted_to: 11,
+                        recovery_cursor: None,
+                    },
+                ),
+            ),
+        };
+        assert_eq!(
+            outlet_event_batch_from_wire(3, reply).unwrap(),
+            OutletEventBatch::Compacted
+        );
+    }
+
+    /// M-4 快照路径：坏身份/非规范 root_id 的条目返回 Err 供调用方跳过。
+    #[test]
+    fn outlet_active_root_projection_rejects_bad_identity() {
+        assert!(outlet_active_root_from_wire(location("root-not-hex")).is_err());
+        let mut missing_home = location("root-7773");
+        missing_home.home_node_id.clear();
+        assert!(outlet_active_root_from_wire(missing_home).is_err());
+        let good = root_id_from_name(OsStr::new("ws-a")).unwrap().0;
+        assert_eq!(
+            outlet_active_root_from_wire(location(&good)).unwrap().name,
+            OsStr::new("ws-a")
+        );
+    }
+
+    /// M-6：代次是发布面 target 的组成部分，零代次不可投影（快照与事件
+    /// 两条路径都必须拒绝）。
+    #[test]
+    fn outlet_projection_rejects_zero_epoch() {
+        let good = root_id_from_name(OsStr::new("ws-a")).unwrap().0;
+        let mut snapshot = location(&good);
+        snapshot.root_epoch = 0;
+        assert_eq!(
+            outlet_active_root_from_wire(snapshot).unwrap_err().code(),
+            CLIENT_PROTOCOL_VIOLATION
+        );
+
+        let mut event = activated(8, &good);
+        if let Some(afs_protocol::meta::outlet_event::Kind::RootActivated(inner)) = &mut event.kind
+        {
+            inner.root.as_mut().unwrap().root_epoch = 0;
+        }
+        // 事件路径按 M-4 毒丸降级：跳过该条，游标仍前进。
+        match outlet_event_batch_from_wire(7, events_reply(7, 9, vec![event])).unwrap() {
+            OutletEventBatch::Events {
+                next_revision,
+                events,
+            } => {
+                assert_eq!(next_revision, 9);
+                assert!(events.is_empty());
+            }
+            OutletEventBatch::Compacted => panic!("expected events batch"),
+        }
     }
 }
 

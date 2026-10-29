@@ -77,26 +77,56 @@ pub(crate) fn reconcile_farm(
     let mut state = FarmState::default();
     let mut active_by_name: BTreeMap<&OsStr, &OutletActiveRoot> = BTreeMap::new();
     for root in active {
-        // workspace 名全局唯一由 meta ReserveRoot CAS 保证（spec §8）。
-        active_by_name.insert(&root.name, root);
+        // workspace 名全局唯一由 meta ReserveRoot CAS 保证（spec §8）；此处
+        // 覆盖仅作"若发生则可见"的护栏（n-3）。
+        if let Some(previous) = active_by_name.insert(&root.name, root) {
+            afs_logging::warn!(
+                "outlet.reconcile.duplicate_active_name";
+                "workspace" => ?root.name,
+                "replaced" => previous.root_id.clone(),
+                "kept" => root.root_id.clone()
+            );
+        }
         state.roots.insert(
             root.root_id.clone(),
             DesiredRoot {
                 name: root.name.clone(),
                 home: root.home_node_id.clone(),
+                epoch: root.epoch,
             },
         );
     }
     let public_root = publisher.public_root();
     let entries = std::fs::read_dir(public_root).map_err(Error::from)?;
+    let mut skipped = 0usize;
     for entry in entries {
-        let entry = entry.map_err(Error::from)?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                skipped += 1;
+                afs_logging::warn!(
+                    "outlet.reconcile.entry_skipped";
+                    "error" => error.to_string()
+                );
+                continue;
+            }
+        };
         let name: OsString = entry.file_name();
         if name == OsStr::new(STAGING_DIR) || name == OsStr::new(QUARANTINE_DIR) {
             continue;
         }
         let path = public_root.join(&name);
-        let metadata = std::fs::symlink_metadata(&path).map_err(Error::from)?;
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                skipped += 1;
+                afs_logging::warn!(
+                    "outlet.reconcile.entry_skipped";
+                    "workspace" => ?name, "error" => error.to_string()
+                );
+                continue;
+            }
+        };
         if metadata.file_type().is_symlink() {
             match active_by_name.get(name.as_os_str()) {
                 Some(root) => {
@@ -105,11 +135,22 @@ pub(crate) fn reconcile_farm(
                     // 直接认领会把消费方 bind 到错误数据树（spec §10 静默
                     // 错连防线）。指向不符或无法计算期望 → 摘除并留在未
                     // 发布集，收敛循环按正常门控重发。
-                    match publisher.expected_target(&root.name, &root.home_node_id) {
-                        Ok(expected) => {
-                            if std::fs::read_link(&path).is_ok_and(|actual| actual == expected) {
-                                state.published.insert(root.root_id.clone());
-                            } else {
+                    match publisher.expected_target(&root.name, &root.home_node_id, root.epoch) {
+                        Ok(expected) => match std::fs::read_link(&path) {
+                            Ok(actual) if actual == expected => {
+                                // 文本一致仍不足以证明可用：本地 home 的
+                                // target 可能已被删除（悬空 symlink 永不自
+                                // 愈），需追加存在性复核。
+                                if local_target_present(publisher, root, &expected) {
+                                    state.published.insert(root.root_id.clone());
+                                } else if let Err(error) = publisher.unpublish(&name) {
+                                    afs_logging::warn!(
+                                        "outlet.reconcile.unpublish_failed";
+                                        "workspace" => ?name, "error" => error.to_string()
+                                    );
+                                }
+                            }
+                            Ok(_) => {
                                 if let Err(error) = publisher.unpublish(&name) {
                                     afs_logging::warn!(
                                         "outlet.reconcile.unpublish_failed";
@@ -117,13 +158,29 @@ pub(crate) fn reconcile_farm(
                                     );
                                 }
                             }
-                        }
+                            Err(error) => {
+                                skipped += 1;
+                                afs_logging::warn!(
+                                    "outlet.reconcile.entry_skipped";
+                                    "workspace" => ?name, "error" => error.to_string()
+                                );
+                            }
+                        },
+                        // 期望 target 算不出来 = 该 home 的传输布局不可知，
+                        // 与"指向不符"同姿态：摘除并留在未发布集，由收敛
+                        // 按正常门控重发。
                         Err(error) => {
                             afs_logging::warn!(
                                 "outlet.reconcile.expected_target_failed";
-                                "workspace" => ?name, "home" => root.home_node_id.clone(),
+                                "workspace" => ?root.name, "home" => root.home_node_id.clone(),
                                 "error" => error.to_string()
                             );
+                            if let Err(error) = publisher.unpublish(&name) {
+                                afs_logging::warn!(
+                                    "outlet.reconcile.unpublish_failed";
+                                    "workspace" => ?name, "error" => error.to_string()
+                                );
+                            }
                         }
                     }
                 }
@@ -142,7 +199,41 @@ pub(crate) fn reconcile_farm(
             publisher.quarantine(&path);
         }
     }
+    if skipped > 0 {
+        afs_logging::warn!(
+            "outlet.reconcile.degraded";
+            "skipped" => skipped,
+            "public_root" => ?public_root
+        );
+    }
     Ok(state)
+}
+
+/// 本地 home 的 target 存在性复核（M-2）。
+///
+/// 远端 home 一律返回 true（不查）：target 落在 NFS import 挂载点上，hard
+/// mount 下对端失联时 `stat` **不返回错误而是不返回**，会挂死 60s 对账
+/// 线程。只有 `NotFound` 判为不可用；其它 IO 错误是瞬时抖动，保留入口。
+fn local_target_present(
+    publisher: &OutletPublisher,
+    root: &OutletActiveRoot,
+    target: &Path,
+) -> bool {
+    if !publisher.is_local_home(&root.home_node_id) {
+        return true;
+    }
+    match std::fs::symlink_metadata(target) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            afs_logging::warn!(
+                "outlet.reconcile.target_stat_failed";
+                "workspace" => ?root.name, "target" => ?target,
+                "error" => error.to_string()
+            );
+            true
+        }
+    }
 }
 
 #[cfg(test)]
@@ -167,8 +258,13 @@ mod tests {
             false
         }
 
-        fn resolve_target(&self, name: &OsStr, home: &NodeId) -> Result<PathBuf> {
-            Ok(PathBuf::from("/imports").join(home).join(name))
+        fn resolve_target(&self, name: &OsStr, home: &NodeId, epoch: u64) -> Result<PathBuf> {
+            if name == OsStr::new("bad-name") {
+                return Err(Error::from(std::io::Error::other("test: unresolvable")));
+            }
+            Ok(PathBuf::from("/imports")
+                .join(home)
+                .join(format!("{}-e{epoch}", name.to_string_lossy())))
         }
     }
 
@@ -188,10 +284,15 @@ mod tests {
     }
 
     fn active(root_id: &str, name: &str, home: &str) -> OutletActiveRoot {
+        active_epoch(root_id, name, home, 1)
+    }
+
+    fn active_epoch(root_id: &str, name: &str, home: &str, epoch: u64) -> OutletActiveRoot {
         OutletActiveRoot {
             root_id: root_id.to_owned(),
             name: name.into(),
             home_node_id: home.to_owned(),
+            epoch,
         }
     }
 
@@ -235,8 +336,10 @@ mod tests {
         let publisher = publisher(&root);
         let public = publisher.public_root();
         let expected_keep = publisher
-            .expected_target(OsStr::new("keep-a"), &"A".to_owned())
+            .expected_target(OsStr::new("keep-a"), &"A".to_owned(), 1)
             .unwrap();
+        // M-2：本地 home 的 target 必须真实存在，否则同文本也会被摘除。
+        std::fs::create_dir_all(&expected_keep).unwrap();
 
         // farm 现状：Active 且指向正确的 symlink、多余（不在 Active）的
         // symlink、ghost 目录、.pub 残留各一。
@@ -291,7 +394,7 @@ mod tests {
         // Active：ws-a home = 远端 B；farm 残留：ws-a 指向旧 home A。
         std::os::unix::fs::symlink(
             publisher
-                .expected_target(OsStr::new("ws-a"), &"A".to_owned())
+                .expected_target(OsStr::new("ws-a"), &"A".to_owned(), 1)
                 .unwrap(),
             public.join("ws-a"),
         )
@@ -304,12 +407,105 @@ mod tests {
         assert!(std::fs::symlink_metadata(public.join("ws-a")).is_err());
     }
 
+    /// M-6：同名下一代（epoch 变化、home 不变）同样必须判指向不符并摘除。
+    /// 删除事件丢失窗口内同名重建时，旧代 symlink 会让消费方 bind 到
+    /// `-e<旧代>` 的数据树，因此不能只看 home 与名字是否一致。
     #[test]
-    fn reconcile_fam_on_empty_farm_is_clean() {
+    fn reconcile_fam_removes_symlink_pointing_at_previous_epoch() {
+        let root = tempfile::tempdir().unwrap();
+        let publisher = publisher(&root);
+        let public = publisher.public_root();
+        let previous = publisher
+            .expected_target(OsStr::new("ws-a"), &"B".to_owned(), 1)
+            .unwrap();
+        let current = publisher
+            .expected_target(OsStr::new("ws-a"), &"B".to_owned(), 2)
+            .unwrap();
+        // 代次进入 target 文本，这是摘除判据成立的前提。
+        assert_ne!(previous, current);
+        std::os::unix::fs::symlink(&previous, public.join("ws-a")).unwrap();
+
+        let state = reconcile_farm(&publisher, &[active_epoch("root-ws", "ws-a", "B", 2)]).unwrap();
+
+        assert!(state.published.is_empty());
+        assert!(std::fs::symlink_metadata(public.join("ws-a")).is_err());
+    }
+
+    #[test]
+    fn reconcile_farm_on_empty_farm_is_clean() {
         let root = tempfile::tempdir().unwrap();
         let publisher = publisher(&root);
         let state = reconcile_farm(&publisher, &[]).unwrap();
         assert!(state.roots.is_empty());
         assert!(state.published.is_empty());
+    }
+
+    /// M-2：本地 home 且 target 文本相等，但物理不存在 → 判悬空并摘除。
+    #[test]
+    fn reconcile_fam_removes_dangling_local_target() {
+        let root = tempfile::tempdir().unwrap();
+        let publisher = publisher(&root);
+        let public = publisher.public_root();
+        let target = publisher
+            .expected_target(OsStr::new("local-a"), &"A".to_owned(), 1)
+            .unwrap();
+        std::os::unix::fs::symlink(&target, public.join("local-a")).unwrap();
+
+        let state = reconcile_farm(&publisher, &[active("root-local", "local-a", "A")]).unwrap();
+
+        assert!(state.published.is_empty());
+        assert!(std::fs::symlink_metadata(public.join("local-a")).is_err());
+    }
+
+    /// M-2：远端 home 一律不查存在性（NFS hard mount 会挂死对账线程）→ 保留。
+    #[test]
+    fn reconcile_fam_keeps_remote_target_without_stat() {
+        let root = tempfile::tempdir().unwrap();
+        let publisher = publisher(&root);
+        let public = publisher.public_root();
+        let target = publisher
+            .expected_target(OsStr::new("remote-a"), &"B".to_owned(), 1)
+            .unwrap();
+        std::os::unix::fs::symlink(&target, public.join("remote-a")).unwrap();
+
+        let state = reconcile_farm(&publisher, &[active("root-remote", "remote-a", "B")]).unwrap();
+
+        assert_eq!(state.published, ["root-remote".to_owned()].into());
+        assert_eq!(std::fs::read_link(public.join("remote-a")).unwrap(), target);
+    }
+
+    /// M-10：单条目无法计算期望 target 时降级（摘除 + 继续），整轮仍返回 Ok。
+    #[test]
+    fn reconcile_fam_skips_unresolvable_entry_and_keeps_round_ok() {
+        let root = tempfile::tempdir().unwrap();
+        let publisher = publisher(&root);
+        let public = publisher.public_root();
+        let good = publisher
+            .expected_target(OsStr::new("good-a"), &"A".to_owned(), 1)
+            .unwrap();
+        std::fs::create_dir_all(&good).unwrap();
+        std::os::unix::fs::symlink("/x", public.join("bad-name")).unwrap();
+        std::os::unix::fs::symlink(&good, public.join("good-a")).unwrap();
+
+        let state = reconcile_farm(
+            &publisher,
+            &[
+                active("root-bad", "bad-name", "B"),
+                active("root-good", "good-a", "A"),
+            ],
+        )
+        .unwrap();
+
+        assert!(std::fs::symlink_metadata(public.join("bad-name")).is_err());
+        assert_eq!(state.published, ["root-good".to_owned()].into());
+    }
+
+    /// M-10：`public_root` 不可读属结构性失败，整轮返回 Err（启动路径致命）。
+    #[test]
+    fn reconcile_fam_fails_when_public_root_unreadable() {
+        let root = tempfile::tempdir().unwrap();
+        let publisher = publisher(&root);
+        std::fs::remove_dir_all(publisher.public_root()).unwrap();
+        assert!(reconcile_farm(&publisher, &[]).is_err());
     }
 }

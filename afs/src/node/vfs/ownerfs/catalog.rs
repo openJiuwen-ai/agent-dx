@@ -218,6 +218,42 @@ mod tests {
         locked.persist_prepared_root(&record).unwrap();
         assert_eq!(locked.scan_roots().unwrap(), vec![record]);
     }
+
+    /// M-6：同名两代的 catalog 记录不得互相覆盖。旧代未删除时必须给出可操作
+    /// 错误（而不是静默改写），否则旧代数据目录会失去唯一指向而泄漏。
+    #[test]
+    fn persist_prepared_root_rejects_record_from_previous_epoch() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let catalog = LocalFsRootCatalog::new(disk.clone());
+        let locked = catalog.lock_and_open().unwrap();
+        let name = "ws-a";
+        let id = RootId(format!("root-{}", hex(name.as_bytes())));
+        let session = "12345678-1234-1234-1234-123456789abc";
+        let record = |epoch: u64| {
+            std::fs::create_dir_all(temp.path().join(format!("{}-e{epoch}", id.0))).unwrap();
+            LocalRootRecord {
+                id: id.clone(),
+                name: OsString::from(name),
+                epoch,
+                data_dir: StoragePath::new(format!("{}-e{epoch}", id.0)).unwrap(),
+                local_prepare_id: format!("node-a-afs-acc-01:{session}:{epoch}:{session}"),
+            }
+        };
+        locked.persist_prepared_root(&record(1)).unwrap();
+
+        let error = locked.persist_prepared_root(&record(2)).unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_OWNER_INVALID_GRANT);
+        let message = error.message();
+        assert!(
+            message.contains("unremoved local record from a previous epoch"),
+            "{message}"
+        );
+        assert!(message.contains("record epoch: 1"), "{message}");
+        assert!(message.contains("this epoch: 2"), "{message}");
+        // 旧代记录保持原样，未被新一代覆盖。
+        assert_eq!(locked.scan_roots().unwrap(), vec![record(1)]);
+    }
 }
 
 impl LockedLocalRootCatalog for LockedLocalFsRootCatalog {
@@ -232,10 +268,16 @@ impl LockedLocalRootCatalog for LockedLocalFsRootCatalog {
         let final_path = Self::record_path(&record.id)?;
         match self.read_record(&final_path) {
             Ok(existing) if existing == *record => return Ok(()),
-            Ok(_) => {
+            Ok(existing) => {
                 return Err(Error::coded(
                     afs_error::NODE_OWNER_INVALID_GRANT,
-                    "conflicting local root record already exists",
+                    format!(
+                        "workspace name has an unremoved local record from a previous epoch \
+                         (root_id: {}, record epoch: {}, this epoch: {}); finish the previous \
+                         deletion (retry rmdir) or restart the node to reconcile; do not delete \
+                         records under `.ownerfs-roots` manually",
+                        existing.id.0, existing.epoch, record.epoch
+                    ),
                 ));
             }
             Err(error) if error.code() == afs_error::IO_NOT_FOUND => {}

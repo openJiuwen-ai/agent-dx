@@ -1261,12 +1261,17 @@ fn invalid(message: impl Into<String>) -> Error {
     Error::coded(afs_error::META_CATALOG_INVALID_REQUEST, message)
 }
 
+/// 与节点侧 `ownerfs::root::MAX_ROOT_NAME_BYTES` 相同的上限；两边各自
+/// 定义以保持 meta 域独立于 node 模块，修改时必须同步。
+const MAX_ROOT_NAME_BYTES: usize = 200;
+
 /// Canonical root ids are `root-` plus the lowercase hex encoding of a valid
 /// workspace name. Meta must reject anything else at the Reserve entry: a
 /// non-canonical id would freeze the publication surface (the outlet worker
-/// decodes ids back to names before creating symlinks), and a dot-leading
+/// decodes ids back to names before creating symlinks), a dot-leading
 /// name would collide with the internal namespace (`.pub`, `.quarantine`,
-/// `.ownerfs-roots`).
+/// `.ownerfs-roots`), and an over-long name cannot become a physical
+/// `<name>-e<epoch>` directory within NAME_MAX.
 ///
 /// This deliberately mirrors `crate::node::vfs::ownerfs::root::root_name_from_id`
 /// instead of importing it: the owner-roots domain layer stays independent of
@@ -1292,6 +1297,12 @@ fn ensure_canonical_root_id(root_id: &str) -> Result<()> {
         || name.contains(&0)
     {
         return Err(invalid("root id decodes to an invalid root name"));
+    }
+    // 与节点侧 `ownerfs::root::MAX_ROOT_NAME_BYTES` 同口径：物理目录名带
+    // `-e<epoch>` 后缀，名字必须留够 NAME_MAX 余量。这里提前拒绝，避免
+    // "Reserve 成功、节点 create 失败"的半提交状态。
+    if name.len() > MAX_ROOT_NAME_BYTES {
+        return Err(invalid("root id decodes to an over-long root name"));
     }
     Ok(())
 }
@@ -1511,6 +1522,63 @@ mod canonical_root_id_tests {
                 ensure_canonical_root_id(bad).is_err(),
                 "root id {bad:?} must be rejected"
             );
+        }
+    }
+
+    /// m-5：Meta 侧 [`ensure_canonical_root_id`] 与节点侧
+    /// `ownerfs::root::root_name_from_id` 是两份独立实现，必须对同一组样例
+    /// 给出一致结论，防止漂移把“Reserve 成功、create 失败”变成跨域不一致。
+    #[test]
+    fn canonical_root_id_agrees_with_node_side_decoder() {
+        use std::os::unix::ffi::OsStrExt;
+
+        use crate::node::vfs::ownerfs::root::{RootId, root_name_from_id};
+
+        let hex =
+            |bytes: &[u8]| -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() };
+
+        // 语法层：两侧都必须接受并还原出原始名字（含非 UTF-8 与长度上限）。
+        let accepted: [&[u8]; 5] = [
+            b"job-42",
+            b"workspace-a",
+            "ünïcode".as_bytes(),
+            b"job-\xff\xfe",
+            &[b'a'; 200],
+        ];
+        for name in accepted {
+            let root_id = format!("root-{}", hex(name));
+            assert!(ensure_canonical_root_id(&root_id).is_ok(), "{root_id:?}");
+            let decoded = root_name_from_id(&RootId(root_id.clone())).unwrap();
+            assert_eq!(decoded.as_os_str().as_bytes(), name, "{root_id:?}");
+        }
+
+        // 语法层：两侧都必须拒绝（非规范形、非法解码结果与超长名字）。
+        let rejected = [
+            "workspace-a".to_owned(),
+            "root-".to_owned(),
+            "root-abc".to_owned(),
+            "root-AB".to_owned(),
+            "root-2f".to_owned(),
+            "root-610062".to_owned(),
+            "root-2e".to_owned(),
+            "root-2e2e".to_owned(),
+            format!("root-{}", hex(&[b'a'; 201])),
+        ];
+        for root_id in rejected {
+            let node = root_name_from_id(&RootId(root_id.clone()));
+            let meta = ensure_canonical_root_id(&root_id);
+            assert!(
+                node.is_err() && meta.is_err(),
+                "both sides must reject {root_id:?}: node={node:?} meta={meta:?}"
+            );
+        }
+
+        // 准入层：保留名（内部命名空间）Meta 必须拒绝；节点侧按“前导点”
+        // 语法规则同样拒绝，因此两侧一致。
+        for reserved in [".pub", ".quarantine", ".ownerfs-roots"] {
+            let root_id = format!("root-{}", hex(reserved.as_bytes()));
+            assert!(ensure_canonical_root_id(&root_id).is_err(), "{root_id:?}");
+            assert!(root_name_from_id(&RootId(root_id)).is_err(), "{reserved:?}");
         }
     }
 }

@@ -958,7 +958,7 @@ async fn contract_rpc_does_not_issue_fake_grants_without_store() {
         .validate_root_access(Request::new(ValidateRootAccessRequest {
             request_id: "validate-b".into(),
             presented_access: Some(PresentedRootAccess {
-                root_id: "workspace-a".into(),
+                root_id: canonical_root_id("workspace-a"),
                 root_epoch: 1,
                 home_node_id: "node-a".into(),
                 holder_node_id: "node-b".into(),
@@ -978,7 +978,7 @@ async fn contract_rpc_does_not_issue_fake_grants_without_store() {
     let reserve_root = rpc::OwnerRootsRpc(meta.clone())
         .reserve_root(Request::new(ReserveRootRequest {
             request_id: "req-root".into(),
-            root_id: "workspace-a".into(),
+            root_id: canonical_root_id("workspace-a"),
             preferred_home_node_id: "node-a".into(),
             session_id: "session-a".into(),
             create_intent_id: "mkdir-a".into(),
@@ -998,6 +998,38 @@ async fn contract_rpc_does_not_issue_fake_grants_without_store() {
         .await
         .unwrap_err();
     assert_eq!(lookup.code(), Code::Unimplemented);
+}
+
+/// `ReserveRoot` 是 root id 进入 Meta 的唯一入口，非 canonical 的 id 必须在这里
+/// 被拒，且错误码是 `InvalidArgument` 而非笼统的 `Unimplemented`。用真实 store：
+/// 无 store 时 `MissingOwnerRootAuthority` 会先短路成 `Unimplemented`，掩蔽校验。
+#[tokio::test]
+async fn reserve_root_rejects_non_canonical_root_ids_at_the_meta_boundary() {
+    let (_, _, owner_rpc) = n2b1_memory_owner_fixture().await;
+    for (root_id, expected) in [
+        ("workspace-a", "not a canonical name"),
+        ("root-2e707562", "invalid root name"), // 解码为 `.pub` 保留名
+        ("root-abc", "not a canonical name"),   // 奇数位 hex
+        ("root-zz", "not a canonical name"),    // 非小写 hex
+    ] {
+        let error = owner_rpc
+            .reserve_root(Request::new(ReserveRootRequest {
+                request_id: format!("reserve-{root_id}"),
+                root_id: root_id.into(),
+                preferred_home_node_id: "node-a".into(),
+                session_id: "session-a".into(),
+                create_intent_id: "mkdir-a".into(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument, "root_id {root_id}");
+        assert!(
+            error.message().contains(expected),
+            "root_id {root_id}: {}",
+            error.message()
+        );
+    }
 }
 
 #[tokio::test]
@@ -1689,7 +1721,7 @@ async fn outlet_poll_events_without_store_fails_closed() {
         }))
         .await
         .unwrap_err();
-    assert_ne!(error.code(), Code::Ok);
+    assert_eq!(error.code(), Code::Unimplemented);
 }
 
 #[tokio::test]
@@ -1703,7 +1735,8 @@ async fn outlet_poll_events_rejects_missing_current_session() {
         }))
         .await
         .unwrap_err();
-    assert_ne!(error.code(), Code::Ok);
+    assert_eq!(error.code(), Code::InvalidArgument);
+    assert!(error.message().contains("node session is not current"));
 }
 
 #[tokio::test]

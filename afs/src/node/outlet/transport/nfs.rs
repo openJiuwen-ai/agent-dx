@@ -14,7 +14,9 @@ use std::{
 use afs_error::{Error, Result};
 
 use super::{NodeId, TransportBackend, TransportPathState};
-use crate::node::{mountinfo_path_bytes, parse_exact_mountinfo_line};
+use crate::node::{
+    mountinfo_path_bytes, parse_exact_mountinfo_line, vfs::ownerfs::root::root_dir_name,
+};
 
 /// NFS import 后端。路径布局：对端 `<node>` 的 users 树挂载在
 /// `<import_root>/<node>/users`；workspace 的 symlink target 为该挂载点下
@@ -69,14 +71,18 @@ impl TransportBackend for NfsBackend {
         std::fs::metadata(self.import_mount_point(node)).is_ok()
     }
 
-    fn resolve_target(&self, name: &OsStr, home: &NodeId) -> Result<PathBuf> {
+    fn resolve_target(&self, name: &OsStr, home: &NodeId, epoch: u64) -> Result<PathBuf> {
         if !is_single_normal_component(name) {
             return Err(Error::coded(
                 afs_error::CLIENT_ARGUMENT_INVALID,
                 "workspace name must be a single path component",
             ));
         }
-        Ok(self.import_mount_point(home).join(name))
+        // 目录名与 Home 侧物理布局必须同源：直接复用 ownerfs 的命名函数，
+        // 避免两处各写一遍 `<name>-e<epoch>` 后漂移。
+        Ok(self
+            .import_mount_point(home)
+            .join(root_dir_name(name, epoch)?))
     }
 }
 
@@ -187,11 +193,19 @@ mod tests {
     }
 
     #[test]
-    fn resolve_target_composes_import_layout() {
+    fn resolve_target_composes_import_layout_with_epoch() {
         let target = backend()
-            .resolve_target(OsStr::new("agent-a1"), &"B".to_owned())
+            .resolve_target(OsStr::new("agent-a1"), &"B".to_owned(), 7)
             .unwrap();
-        assert_eq!(target, PathBuf::from("/run/afs/imports/B/users/agent-a1"));
+        assert_eq!(
+            target,
+            PathBuf::from("/run/afs/imports/B/users/agent-a1-e7")
+        );
+        // 同一名字的两代必须解析出不同文本，否则旧链接会跨代认领。
+        let first = backend()
+            .resolve_target(OsStr::new("agent-a1"), &"B".to_owned(), 1)
+            .unwrap();
+        assert_ne!(first, target);
     }
 
     #[test]
@@ -199,7 +213,7 @@ mod tests {
         for name in ["a/b", "..", ".", ""] {
             assert!(
                 backend()
-                    .resolve_target(OsStr::new(name), &"B".to_owned())
+                    .resolve_target(OsStr::new(name), &"B".to_owned(), 1)
                     .is_err()
             );
         }

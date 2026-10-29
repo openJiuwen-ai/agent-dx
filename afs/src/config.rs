@@ -524,7 +524,8 @@ impl DfsReadCrcMode {
 /// 语义见 afs/outlet-premounted-spec-v1.md §6。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OutletConfig {
-    /// 物理层：数据卷挂载点，OwnerFs 物理存储根（工作区目录名 = 裸名）。
+    /// 物理层：数据卷挂载点，OwnerFs 物理存储根（工作区目录名 =
+    /// `<workspace>-e<epoch>`，公开名仍是 `<workspace>`）。
     pub users_root: PathBuf,
     /// 拓扑层父目录（0700 私有）。
     pub import_root: PathBuf,

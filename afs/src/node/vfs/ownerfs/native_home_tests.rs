@@ -624,10 +624,10 @@ fn rmdir_root_then_recreate_same_name_succeeds() {
     assert!(second_data_dir.join("new").exists());
 }
 
-/// VC-D4：并发 rmdir 恰好一个成功，另一个在解析或缓存线性化点失败
-/// （ENOENT 或 invalid grant 错误）。
+/// VC-D4 / §2.16：并发 rmdir 均成功（删除幂等）。后到的一方在缓存或
+/// catalog 上看到前一方已完成的工作，按"已删除"收敛而不是报错。
 #[test]
-fn concurrent_rmdir_root_single_winner() {
+fn concurrent_rmdir_root_is_idempotent() {
     let (_temp, owner, ctx, _disk) = fixture(false);
     mkdir_root(&owner, &ctx, "d4");
     let owner = Arc::new(owner);
@@ -647,17 +647,12 @@ fn concurrent_rmdir_root_single_winner() {
             .map(|handle| handle.join().unwrap())
             .collect()
     });
-    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-    let loser_codes: Vec<_> = results
-        .iter()
-        .filter_map(|result| result.as_ref().err())
-        .map(|error| error.code())
-        .collect();
-    assert_eq!(loser_codes.len(), 1);
-    assert!(matches!(
-        loser_codes[0],
-        afs_error::NODE_VFS_NOT_FOUND | afs_error::NODE_OWNER_INVALID_GRANT
-    ));
+    for result in &results {
+        assert!(
+            result.is_ok(),
+            "concurrent rmdir must be idempotent: {result:?}"
+        );
+    }
     // 最终状态干净：lookup ENOENT、catalog 空。
     assert!(Backend::lookup(owner.as_ref(), &ctx, owner.root_inode(), OsStr::new("d4")).is_err());
     assert!(
