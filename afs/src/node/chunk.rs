@@ -4473,6 +4473,70 @@ impl LocalChunkStore {
         }
     }
 
+    /// Verifies CRC32C ranges straight into a caller-owned snapshot buffer.
+    ///
+    /// Unlike `read_peer_range_until`, the bytes are not first held as a
+    /// private payload charged to the shared peer read budget: the caller has
+    /// already bounded the snapshot that receives them. The body check follows
+    /// the configured peer read CRC mode exactly as that path does, and the
+    /// catalog record and stored inode must stay unchanged across the read.
+    #[cfg(feature = "dfs")]
+    pub(crate) fn read_crc32c_ranges_into(
+        &self,
+        chunk_id: &ChunkId,
+        ranges: &[VerifiedRangeCopy],
+        out: &mut [u8],
+    ) -> Result<Vec<usize>> {
+        let _reader = self.begin_peer_serve_read()?;
+        let result = (|| {
+            let record = self.peer_catalog_record(chunk_id)?;
+            if !record.chunk.is_segment_crc32c() {
+                return Err(invalid("CRC32C snapshot read needs a CRC-format object"));
+            }
+            let reader = self.open_cataloged(chunk_id)?;
+            let before = PeerFileIdentity::read(&reader.file)?;
+            let segment = super::chunk_crc32c::SEGMENT as u64;
+            let mut counts = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                let length =
+                    u64::try_from(range.length).map_err(|_| invalid("CRC range is too large"))?;
+                let allowed = record
+                    .chunk
+                    .length
+                    .saturating_sub(range.chunk_offset)
+                    .min(length);
+                let complete = range.chunk_offset.is_multiple_of(segment)
+                    && (allowed.is_multiple_of(segment)
+                        || range.chunk_offset.saturating_add(allowed) == record.chunk.length);
+                let verify_body = match self.peer_read_crc_mode {
+                    crate::config::DfsReadCrcMode::Both => true,
+                    crate::config::DfsReadCrcMode::Receiver => !complete,
+                    crate::config::DfsReadCrcMode::Off => false,
+                };
+                counts.extend(reader.crc_ranges_with_body_check(
+                    std::slice::from_ref(range),
+                    out,
+                    verify_body,
+                )?);
+            }
+            if self.peer_catalog_record(chunk_id)? != record
+                || PeerFileIdentity::read(&File::open(self.path_for_record(&record)?)?)? != before
+            {
+                return Err(corrupt(
+                    chunk_id,
+                    "CRC snapshot range changed during verification",
+                ));
+            }
+            Ok(counts)
+        })();
+        if let Err(error) = &result
+            && verified_copy_is_invalid(error)
+        {
+            self.try_quarantine(chunk_id);
+        }
+        result
+    }
+
     /// Enter streaming only before any header is sent. Missing/legacy proofs
     /// or unavailable optional working capacity preserve the full-scan path.
     #[cfg(all(feature = "dfs", test))]

@@ -1171,11 +1171,44 @@ impl ChunkTransfer for HixlChunkTransfer {
         out: &mut [u8],
     ) -> afs_error::Result<()> {
         self.read_native_batch(batch, out, Some(chunk))
+            .inspect_err(|error| report_batch_failure(batch, out.len(), error))
     }
 
     fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> afs_error::Result<()> {
         self.read_native_batch(batch, out, None)
+            .inspect_err(|error| report_batch_failure(batch, out.len(), error))
     }
+}
+
+/// Reports why one HIXL read batch failed.
+///
+/// The read engine answers a failed batch by retrying every operation on its
+/// own, so a batch failure costs as many single-range reads as the batch had
+/// operations. The reason therefore has to stay visible at the default log
+/// level; otherwise a transport-level retry looks like ordinary overhead.
+fn report_batch_failure(batch: &PeerReadBatch, output_len: usize, error: &afs_error::Error) {
+    let crc_operations = batch
+        .operations
+        .iter()
+        .filter(|operation| {
+            operation
+                .chunk
+                .as_ref()
+                .is_some_and(crate::dfs::ChunkObject::is_segment_crc32c)
+        })
+        .count();
+    let bytes = batch.operations.iter().fold(0_u64, |sum, operation| {
+        sum.saturating_add(operation.op.length)
+    });
+    afs_logging::error!(
+        "HIXL read batch failed";
+        "code" => format!("{:?}", error.code()),
+        "operations" => batch.operations.len(),
+        "crc_operations" => crc_operations,
+        "bytes" => bytes,
+        "output_len" => output_len,
+        "error" => error.to_string()
+    );
 }
 
 #[derive(Default)]
@@ -1889,6 +1922,8 @@ impl ReadContext {
         // every path, so the aggregation must not depend on the prepared
         // payload measurement mode; a single-window wave would otherwise pay a
         // control round trip and an SDK read submission per window.
+        // CRC32C and BLAKE3 windows share one wave width: the source verifies
+        // both into the same bounded group snapshot.
         let group_windows = group.filter(|_| planned.len() > 1).map(|group| {
             group
                 .max_descriptors
@@ -1904,7 +1939,7 @@ impl ReadContext {
         for wave in planned.chunks(wave_width) {
             // Admission remains ordered while native transfers run independently.
             let prepared = if group_windows.is_some() {
-                self.prepare_group_windows(&lease.session, wave, &batch, deadline)
+                self.prepare_group_windows_within_budget(&lease.session, wave, &batch, deadline)
                     .await
             } else {
                 prepare_wave(
@@ -1949,6 +1984,13 @@ impl ReadContext {
                 Ok(prepared) => prepared,
                 Err(failure) => {
                     self.observe_prepared_payload_error(payload_elapsed);
+                    report_wave_failure(
+                        "prepare",
+                        planned.len(),
+                        wave.len(),
+                        group_windows,
+                        &failure,
+                    );
                     return Err(self.abort_batch(&mut lease, failure).await);
                 }
             };
@@ -1978,6 +2020,13 @@ impl ReadContext {
                     Ok(mut chunks) => prepared_chunks.append(&mut chunks),
                     Err(failure) => {
                         self.observe_prepared_payload_error(payload_elapsed);
+                        report_wave_failure(
+                            "read",
+                            planned.len(),
+                            wave.len(),
+                            group_windows,
+                            &failure,
+                        );
                         return Err(self.abort_batch(&mut lease, failure).await);
                     }
                 }
@@ -2154,6 +2203,47 @@ impl ReadContext {
             )
             .await;
         Err(failure)
+    }
+
+    /// Prepares one wave, halving it while the source reports a capacity
+    /// shortfall.
+    ///
+    /// The source charges every served range against one shared payload
+    /// budget, which concurrent readers can consume at any moment. A wave the
+    /// budget cannot admit is a sizing signal, not a transport fault: retrying
+    /// half of it keeps the session and the group, while propagating the error
+    /// would end the session and leave the engine to retry every range on its
+    /// own. The narrowed width applies to the rest of this wave only, so one
+    /// contended moment does not narrow every later wave.
+    async fn prepare_group_windows_within_budget(
+        &self,
+        session: &PeerSession,
+        wave: &[PlannedWindow],
+        batch: &DfsReadRangesRequest,
+        deadline: Instant,
+    ) -> Result<Vec<PreparedWindow>, WindowFailure> {
+        let mut prepared = Vec::with_capacity(wave.len());
+        let mut start = 0;
+        let mut width = wave.len();
+        while start < wave.len() {
+            let end = (start + width).min(wave.len());
+            match self
+                .prepare_group_windows(session, &wave[start..end], batch, deadline)
+                .await
+            {
+                Ok(mut ready) => {
+                    prepared.append(&mut ready);
+                    start = end;
+                }
+                Err(failure)
+                    if failure.error.code() == afs_error::IO_CAPACITY && end - start > 1 =>
+                {
+                    width = (end - start) / 2;
+                }
+                Err(failure) => return Err(failure),
+            }
+        }
+        Ok(prepared)
     }
 
     async fn release_replies<'a>(
@@ -2933,8 +3023,12 @@ struct WindowFailure {
 }
 
 impl WindowFailure {
+    /// A prepare that ran out of capacity did not corrupt the session: the
+    /// source still serves narrower waves, so the caller retries with fewer
+    /// windows instead of fencing the peer and losing the group.
     fn from_prepare(error: afs_error::Error) -> Self {
-        let fence_peer = error.code() != afs_error::NODE_TRANSFER_RESOURCE_EXHAUSTED;
+        let fence_peer = error.code() != afs_error::NODE_TRANSFER_RESOURCE_EXHAUSTED
+            && error.code() != afs_error::IO_CAPACITY;
         Self {
             error,
             fence_peer,
@@ -2977,6 +3071,35 @@ impl From<afs_error::Error> for WindowFailure {
     }
 }
 
+/// Reports why a prepared HIXL wave failed.
+///
+/// A failed wave tears its session down and leaves the read engine to retry
+/// every window of the wave on its own, so the reason must stay visible at the
+/// default log level instead of disappearing into an ordinary retry.
+fn report_wave_failure(
+    phase: &'static str,
+    planned: usize,
+    windows: usize,
+    group_windows: Option<usize>,
+    failure: &WindowFailure,
+) {
+    // Capacity shortfalls narrow the wave and retry inside the transport, so
+    // they are expected under contention and not worth an error record.
+    if failure.error.code() == afs_error::IO_CAPACITY {
+        return;
+    }
+    afs_logging::error!(
+        "HIXL prepared wave failed";
+        "phase" => phase,
+        "planned" => planned,
+        "windows" => windows,
+        "group_windows" => group_windows.unwrap_or(0),
+        "code" => format!("{:?}", failure.error.code()),
+        "fence_peer" => failure.fence_peer,
+        "error" => failure.error.to_string()
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2986,6 +3109,28 @@ mod tests {
         DfsReadGrant, DfsReadRangesCompletion,
     };
     use afs_transport::hixl::{EngineInfo, ReadTransport};
+
+    #[test]
+    fn a_capacity_shortfall_does_not_fence_the_session() {
+        let shortfall = WindowFailure::from_prepare(afs_error::Error::coded(
+            afs_error::IO_CAPACITY,
+            "shared Peer read payload budget exhausted",
+        ));
+        assert!(
+            !shortfall.fence_peer,
+            "capacity shortfalls narrow the wave instead of ending the session"
+        );
+        let unavailable = WindowFailure::from_prepare(afs_error::Error::coded(
+            afs_error::IO_UNAVAILABLE,
+            "peer serve is stopped",
+        ));
+        assert!(unavailable.fence_peer);
+        let exhausted = WindowFailure::from_prepare(afs_error::Error::coded(
+            afs_error::NODE_TRANSFER_RESOURCE_EXHAUSTED,
+            "transfer capacity exhausted",
+        ));
+        assert!(!exhausted.fence_peer);
+    }
 
     fn control_session() -> Arc<PeerSession> {
         Arc::new(PeerSession {
@@ -4821,6 +4966,136 @@ mod tests {
                 "both CRC32C ranges must share one native window"
             );
             let _ = source;
+            stop.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn crc32c_group_wave_is_one_prepare_while_the_peer_budget_is_held() {
+            use crate::node::dfs_read::ReadGroupPolicy;
+            let temp = tempfile::tempdir().unwrap();
+            let local = Arc::new(LocalChunkStore::open(temp.path(), "source").unwrap());
+            let staged = StagedChunk::new_crc32c(
+                crate::dfs::OperationId::new("crc-group"),
+                b"abcdefgh".to_vec(),
+            )
+            .unwrap();
+            let chunk = staged.chunk.clone();
+            local.put(staged).unwrap();
+            let staged_tail = StagedChunk::new_crc32c(
+                crate::dfs::OperationId::new("crc-group-tail"),
+                b"ijkl".to_vec(),
+            )
+            .unwrap();
+            let tail_chunk = staged_tail.chunk.clone();
+            local.put(staged_tail).unwrap();
+            // Concurrent peer reads hold the whole shared payload budget. The
+            // group snapshot must not need any of it for CRC32C ranges.
+            let held = local
+                .reserve_peer_read_payload(crate::node::chunk::PEER_READ_PAYLOAD_LIMIT)
+                .unwrap();
+            let native = Arc::new(NativeBoundary::default());
+            let source = Arc::new(source_hixl::HixlReadService::for_test(
+                Arc::new(SourceNative {
+                    boundary: native.clone(),
+                    lanes: 1,
+                    window_bytes: 4,
+                    export_slots: 8,
+                }),
+                "source".into(),
+                9,
+            ));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let service = make_dfs_chunks_server_with_transport(
+                Some(local.clone()),
+                Arc::new(TestAuthority),
+                Arc::new(TestAuthority),
+                Arc::new(DenyDfsReplicaAuthorizer),
+                None,
+                Duration::from_secs(5),
+                DfsChunkTransportResources {
+                    read_pipeline: Default::default(),
+                    rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
+                    payload_metrics: None,
+                    hixl: Some(source.clone()),
+                },
+            );
+            let (stop, stopping) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                tonic::transport::Server::builder()
+                    .add_service(service)
+                    .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                        let _ = stopping.await;
+                    })
+                    .await
+                    .unwrap();
+            });
+            let peers = Arc::new(
+                PeerConnectionPool::new(
+                    afs_transport::GrpcConfig::default(),
+                    afs_transport::TlsConfig::Disabled,
+                    16,
+                )
+                .unwrap(),
+            );
+            let reader = Arc::new(
+                HixlChunkTransfer::from_runtime(
+                    peers,
+                    Arc::new(ReaderNative {
+                        boundary: native.clone(),
+                        lanes: 1,
+                        window_bytes: 4,
+                    }),
+                    HixlDfsReadMode::Required,
+                    Duration::from_secs(5),
+                )
+                .unwrap()
+                .with_read_group(
+                    ReadGroupPolicy {
+                        bytes: 16,
+                        max_inflight: 1,
+                        max_descriptors: 8,
+                        host_budget_bytes: 1024 * 1024,
+                    },
+                    8,
+                ),
+            );
+            let mut batch = read_batch(chunk.id.clone(), &endpoint);
+            let mut tail_op = batch.operations[0].clone();
+            tail_op.op = crate::node::dfs_read::ChunkReadOp {
+                chunk_id: tail_chunk.id.clone(),
+                chunk_offset: 0,
+                length: 4,
+                output_offset: 9,
+            };
+            batch.operations[0].chunk = Some(chunk.clone());
+            tail_op.source.chunk_id = tail_chunk.id.clone();
+            tail_op.chunk = Some(tail_chunk.clone());
+            batch.operations.push(tail_op);
+
+            let read_reader = reader.clone();
+            let output = tokio::task::spawn_blocking(move || {
+                let mut output = vec![b'!'; 13];
+                read_reader.read_ranges(&batch, &mut output).unwrap();
+                output
+            })
+            .await
+            .unwrap();
+            assert_eq!(&output[1..9], b"abcdefgh");
+            assert_eq!(&output[9..13], b"ijkl");
+            // Three 4-byte windows: one group Prepare exports all of them and
+            // one native batch reads them, with no per-window retry.
+            assert_eq!(native.prepare_calls.load(Ordering::SeqCst), 3);
+            assert_eq!(native.batch_reads.load(Ordering::SeqCst), 1);
+            let sessions = source_hixl::test_support::sessions(&source);
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].active_windows, 0);
+            assert_eq!(sessions[0].prepared_bytes, 0);
+            drop(held);
             stop.send(()).unwrap();
             tokio::time::timeout(Duration::from_secs(1), server)
                 .await

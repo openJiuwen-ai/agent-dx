@@ -640,6 +640,8 @@ pub(super) fn packed_dfs_read_length(
         .map_err(|_| Status::invalid_argument("packed DFS read length exceeds address space"))
 }
 
+// HIXL snapshots use `read_hixl_snapshot_ranges`; RDMA packed reads keep this path.
+#[cfg(any(test, feature = "rdma"))]
 pub(super) fn read_packed_dfs_ranges(
     local: &crate::node::chunk::LocalChunkStore,
     request: &DfsReadRangesRequest,
@@ -648,6 +650,28 @@ pub(super) fn read_packed_dfs_ranges(
     let budget = usize::try_from(crate::node::dfs_read::MAX_DFS_READ_BYTES)
         .map_err(|_| Status::invalid_argument("DFS read byte budget exceeds platform capacity"))?;
     read_packed_dfs_ranges_with_budget(local, request, length, budget)
+}
+
+/// Packs a verified HIXL snapshot. CRC32C ranges are verified straight into
+/// the snapshot buffer, which the HIXL service already bounds with its own
+/// snapshot budget, instead of each range taking a private payload from the
+/// shared peer read budget first.
+pub(super) fn read_hixl_snapshot_ranges(
+    local: &crate::node::chunk::LocalChunkStore,
+    request: &DfsReadRangesRequest,
+    length: usize,
+    budget: usize,
+) -> Result<(Vec<u8>, Vec<DfsReadRangesCompletion>), Status> {
+    read_packed_ranges(local, request, length, budget, CrcScan::Snapshot)
+}
+
+/// Where a packed scan places the bytes of a CRC32C range.
+#[derive(Clone, Copy)]
+enum CrcScan {
+    /// Each range is a private peer payload charged to the shared budget.
+    PeerPayload,
+    /// Each range is verified straight into the bounded snapshot buffer.
+    Snapshot,
 }
 
 /// Chunk scans are independent reads plus BLAKE3, so a batch completes in
@@ -714,6 +738,7 @@ fn scan_packed_chunk(
     group: &PackedChunkGroup,
     out: &mut [u8],
     deadline: Instant,
+    crc_scan: CrcScan,
 ) -> Result<Vec<PackedRangeDigest>, Status> {
     let id = crate::dfs::ChunkId::new(group.chunk_id.clone());
     // CRC32C objects are bound to a Meta descriptor, so each range digest is
@@ -724,6 +749,9 @@ fn scan_packed_chunk(
     {
         let descriptor =
             serde_json::to_vec(&table).map_err(|error| Status::internal(error.to_string()))?;
+        if let CrcScan::Snapshot = crc_scan {
+            return scan_crc32c_snapshot(local, &id, group, out, &table, &descriptor);
+        }
         let mut digests = Vec::with_capacity(group.ranges.len());
         for (_, range, _) in &group.ranges {
             let end = range
@@ -784,6 +812,60 @@ fn scan_packed_chunk(
     }
 }
 
+/// Verifies one CRC32C Chunk's ranges into `out` and digests the copied bytes.
+///
+/// Only a range covering whole segments carries the Meta-bound descriptor; a
+/// HIXL reader rejects a descriptor on a range that cuts a segment.
+fn scan_crc32c_snapshot(
+    local: &crate::node::chunk::LocalChunkStore,
+    id: &crate::dfs::ChunkId,
+    group: &PackedChunkGroup,
+    out: &mut [u8],
+    table: &crate::node::chunk_crc32c::CrcTable,
+    descriptor: &[u8],
+) -> Result<Vec<PackedRangeDigest>, Status> {
+    let copies = group
+        .ranges
+        .iter()
+        .map(|(_, range, _)| *range)
+        .collect::<Vec<_>>();
+    let copied = local
+        .read_crc32c_ranges_into(id, &copies, out)
+        .map_err(super::error_to_status)?;
+    if copied.len() != copies.len()
+        || copied
+            .iter()
+            .zip(&copies)
+            .any(|(count, range)| *count != range.length)
+    {
+        return Err(super::coded_status(
+            afs_error::NODE_TRANSFER_CORRUPT_DATA,
+            "immutable Chunk ended before packed DFS range",
+        ));
+    }
+    copies
+        .iter()
+        .map(|range| {
+            let data = range
+                .output_offset
+                .checked_add(range.length)
+                .and_then(|end| out.get(range.output_offset..end))
+                .ok_or_else(|| Status::internal("packed DFS range exceeds its buffer"))?;
+            Ok(PackedRangeDigest {
+                checksum: crate::node::chunk_crc32c::checksum(data)
+                    .to_le_bytes()
+                    .to_vec(),
+                algorithm: afs_protocol::node_data::DfsDigestAlgorithm::Crc32c as i32,
+                table: if table.covers_whole_segments(range.chunk_offset, data.len() as u64) {
+                    descriptor.to_vec()
+                } else {
+                    Vec::new()
+                },
+            })
+        })
+        .collect()
+}
+
 /// Returns each Chunk group's packed-output span when every group's ranges are
 /// contiguous and the spans tile the whole output. The scan can then write the
 /// final snapshot directly instead of copying the payload a second time.
@@ -825,6 +907,16 @@ pub(super) fn read_packed_dfs_ranges_with_budget(
     request: &DfsReadRangesRequest,
     length: usize,
     budget: usize,
+) -> Result<(Vec<u8>, Vec<DfsReadRangesCompletion>), Status> {
+    read_packed_ranges(local, request, length, budget, CrcScan::PeerPayload)
+}
+
+fn read_packed_ranges(
+    local: &crate::node::chunk::LocalChunkStore,
+    request: &DfsReadRangesRequest,
+    length: usize,
+    budget: usize,
+    crc_scan: CrcScan,
 ) -> Result<(Vec<u8>, Vec<DfsReadRangesCompletion>), Status> {
     if packed_dfs_read_length(request, budget)? != length {
         return Err(Status::invalid_argument(
@@ -908,7 +1000,9 @@ pub(super) fn read_packed_dfs_ranges_with_budget(
             };
             let result = output
                 .ok_or_else(|| Status::internal("verified DFS range output slice disappeared"))
-                .and_then(|output| scan_packed_chunk(local, &groups[index], output, deadline));
+                .and_then(|output| {
+                    scan_packed_chunk(local, &groups[index], output, deadline, crc_scan)
+                });
             match slots.lock() {
                 Ok(mut slots) => slots[index] = Some(result),
                 Err(poisoned) => poisoned.into_inner()[index] = Some(result),
@@ -947,7 +1041,7 @@ pub(super) fn read_packed_dfs_ranges_with_budget(
         let scan = |index: usize| {
             let group = &groups[index];
             let mut buffer = vec![0; group.relative_length];
-            let result = scan_packed_chunk(local, group, &mut buffer, deadline)
+            let result = scan_packed_chunk(local, group, &mut buffer, deadline, crc_scan)
                 .map(|checksums| (buffer, checksums));
             match slots.lock() {
                 Ok(mut slots) => slots[index] = Some(result),
@@ -1171,6 +1265,77 @@ mod tests {
             completions[1].range_checksum,
             blake3::hash(&bytes[40_000..70_000]).as_bytes().to_vec()
         );
+    }
+
+    #[test]
+    fn hixl_snapshot_serves_crc32c_ranges_without_the_peer_payload_budget() {
+        use crate::node::chunk::{PEER_READ_PAYLOAD_LIMIT, StagedChunk};
+        use afs_protocol::node_data::DfsDigestAlgorithm;
+
+        let temp = tempfile::tempdir().unwrap();
+        let local = crate::node::chunk::LocalChunkStore::open(temp.path(), "node").unwrap();
+        let bytes: Vec<_> = (0..70_000).map(|index| (index % 251) as u8).collect();
+        let staged =
+            StagedChunk::new_crc32c(crate::dfs::OperationId::new("snapshot-crc"), bytes.clone())
+                .unwrap();
+        local.put(staged.clone()).unwrap();
+        let mut request = read_request(staged.chunk.id.0.clone(), 70_000);
+        request.operations = vec![
+            DfsChunkReadOp {
+                operation_index: 0,
+                chunk_id: staged.chunk.id.0.clone(),
+                chunk_offset: 0,
+                length: 70_000,
+                destination_offset: 0,
+                source_copy_id: "copy-a".into(),
+                grant: None,
+            },
+            // This range cuts a CRC32C segment, so its covering segments are
+            // verified as well.
+            DfsChunkReadOp {
+                operation_index: 1,
+                chunk_id: staged.chunk.id.0.clone(),
+                chunk_offset: 40_000,
+                length: 30_000,
+                destination_offset: 70_000,
+                source_copy_id: "copy-b".into(),
+                grant: None,
+            },
+        ];
+        // Concurrent peer reads hold every byte of the shared payload budget.
+        let held = local
+            .reserve_peer_read_payload(PEER_READ_PAYLOAD_LIMIT)
+            .unwrap();
+
+        let (packed, completions) =
+            super::read_hixl_snapshot_ranges(&local, &request, 100_000, 1024 * 1024).unwrap();
+        assert_eq!(&packed[..70_000], &bytes[..]);
+        assert_eq!(&packed[70_000..], &bytes[40_000..70_000]);
+        assert_eq!(completions.len(), 2);
+        for (completion, range) in completions.iter().zip([&bytes[..], &bytes[40_000..70_000]]) {
+            assert_eq!(
+                completion.range_checksum_algorithm,
+                DfsDigestAlgorithm::Crc32c as i32
+            );
+            assert_eq!(
+                completion.range_checksum,
+                crate::node::chunk_crc32c::checksum(range)
+                    .to_le_bytes()
+                    .to_vec()
+            );
+        }
+        // The first range ends at the object end, so its descriptor binds it;
+        // the second cuts a segment and relies on its range checksum alone.
+        assert!(!completions[0].crc32c_table.is_empty());
+        assert!(completions[1].crc32c_table.is_empty());
+
+        // Other packed readers keep serving CRC32C ranges as budgeted peer
+        // payloads, so they still wait for the shared budget.
+        assert!(
+            super::read_packed_dfs_ranges_with_budget(&local, &request, 100_000, 1024 * 1024)
+                .is_err()
+        );
+        drop(held);
     }
 
     #[tokio::test]

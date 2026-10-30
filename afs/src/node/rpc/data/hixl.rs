@@ -23,10 +23,7 @@ use afs_transport::grpc::error_status::{coded_status, error_to_status};
 use afs_transport::hixl::{EngineInfo, ExportWindow, HixlError, HixlRuntimeGroup, ReadTransport};
 use tonic::{Response, Status};
 
-use super::prepared::{
-    PackedRangeDigest, read_packed_dfs_ranges, read_packed_dfs_ranges_with_budget,
-    validate_packed_dfs_read,
-};
+use super::prepared::{PackedRangeDigest, read_hixl_snapshot_ranges, validate_packed_dfs_read};
 use super::{DfsReadAuthorizer, dfs_read_caller_epoch, validate_dfs_read_request};
 use crate::node::chunk::LocalChunkStore;
 use crate::node::dfs_read::{MAX_DFS_GROUP_BYTES, MAX_DFS_READ_BYTES};
@@ -44,6 +41,7 @@ const HIXL_SESSION_TTL: Duration = Duration::from_secs(30);
 // most 8 MiB, while one explicitly grouped batch may reach the group budget.
 const MAX_HIXL_PREPARED_BATCH_BYTES: usize = 64 * 1024 * 1024;
 const MAX_HIXL_GROUP_BATCH_BYTES: usize = MAX_DFS_GROUP_BYTES as usize;
+const MAX_HIXL_LEGACY_BATCH_BYTES: usize = MAX_DFS_READ_BYTES as usize;
 
 fn snapshot_budget(group_batch: bool) -> usize {
     if group_batch {
@@ -590,16 +588,18 @@ impl HixlReadService {
                 ));
             }
             let started = Instant::now();
-            let packed = if group_batch {
-                read_packed_dfs_ranges_with_budget(
-                    &local,
-                    &batch,
-                    batch_length,
-                    MAX_HIXL_GROUP_BATCH_BYTES,
-                )
-            } else {
-                read_packed_dfs_ranges(&local, &batch, batch_length)
-            };
+            // Both budgets bound the snapshot before any source byte is read,
+            // so CRC32C ranges fill it directly like BLAKE3 ranges do.
+            let packed = read_hixl_snapshot_ranges(
+                &local,
+                &batch,
+                batch_length,
+                if group_batch {
+                    MAX_HIXL_GROUP_BATCH_BYTES
+                } else {
+                    MAX_HIXL_LEGACY_BATCH_BYTES
+                },
+            );
             self.observe(Operation::SourceRead, started, packed.is_ok());
             let (bytes, completions) = packed?;
             let range_digests = batch_range_checksums(&batch, &completions);
@@ -1069,16 +1069,18 @@ impl HixlReadService {
                 ));
             }
             let started = Instant::now();
-            let packed = if group_batch {
-                read_packed_dfs_ranges_with_budget(
-                    local,
-                    batch,
-                    batch_length,
-                    MAX_HIXL_GROUP_BATCH_BYTES,
-                )
-            } else {
-                read_packed_dfs_ranges(local, batch, batch_length)
-            };
+            // Both budgets bound the snapshot before any source byte is read,
+            // so CRC32C ranges fill it directly like BLAKE3 ranges do.
+            let packed = read_hixl_snapshot_ranges(
+                local,
+                batch,
+                batch_length,
+                if group_batch {
+                    MAX_HIXL_GROUP_BATCH_BYTES
+                } else {
+                    MAX_HIXL_LEGACY_BATCH_BYTES
+                },
+            );
             self.observe(Operation::SourceRead, started, packed.is_ok());
             let (bytes, completions) = packed.map_err(|status| (status, false))?;
             let range_digests = batch_range_checksums(batch, &completions);
@@ -1728,13 +1730,21 @@ fn window_completions(
                         .peer_crc32c_table(&crate::dfs::ChunkId::new(operation.chunk_id.clone()))
                         .map_err(error_to_status)?
                     {
+                        // A slice that cuts a segment carries no descriptor;
+                        // the reader binds it by its range checksum.
                         Some(table) => PackedRangeDigest {
                             checksum: crate::node::chunk_crc32c::checksum(range)
                                 .to_le_bytes()
                                 .to_vec(),
                             algorithm: DfsDigestAlgorithm::Crc32c as i32,
-                            table: serde_json::to_vec(&table)
-                                .map_err(|error| Status::internal(error.to_string()))?,
+                            table: if table
+                                .covers_whole_segments(operation.chunk_offset, operation.length)
+                            {
+                                serde_json::to_vec(&table)
+                                    .map_err(|error| Status::internal(error.to_string()))?
+                            } else {
+                                Vec::new()
+                            },
                         },
                         None => PackedRangeDigest {
                             checksum: blake3::hash(range).as_bytes().to_vec(),
