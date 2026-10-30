@@ -29,6 +29,7 @@ use fuser::Notifier;
 use self::root::{PresentedRootAccess, RootGrant, RootId, RootManager, RootRight};
 use super::{
     Backend,
+    WriteAdmissionMode,
     locks::{LockError, LockRequest, LockTable, LockTableLimits, LockWaiterId, LockWaiterOutcome},
     types::{
         AttributeChange, BackendInode, CreatedFile, DirectoryEntry, DirectoryHandle, Entry,
@@ -259,6 +260,19 @@ impl OwnerFs {
             .is_some()
     }
 
+    /// An inode this node answers purely from its own disk while holding the
+    /// exclusive grant, so a stale answer cannot come from a peer writer.
+    /// Used to decide whether a callback can run on the FUSE receive thread.
+    pub(crate) fn is_private_local_inode(&self, inode: BackendInode) -> bool {
+        let Some(local) = self.local.as_deref() else {
+            return false;
+        };
+        if local.native_home_enabled() {
+            return false;
+        }
+        local.is_private_local_inode(inode.value)
+    }
+
     /// Periodic Home-side cleanup for peer process sessions that Meta has
     /// authoritatively expired or replaced. Meta errors retain every handle.
     /// This runs off the FUSE/data hot path.
@@ -302,11 +316,19 @@ impl OwnerFs {
         if cache.native_home_eligible {
             return reply(Duration::ZERO, false);
         }
-        let private = self
-            .local
-            .as_ref()
-            .and_then(|local| local.private_root_for_inode(inode.value))
-            .is_some_and(|id| !cache.shared_roots.contains(&id));
+        // The synthetic mount root is not a materialised inode record, so the
+        // per-inode root lookup cannot classify it and every path walk would
+        // fall back to a zero attribute TTL. It is this node's own namespace
+        // directory, so give it the same one second freshness bound the
+        // workspace root directories already get.
+        let private = if inode.value == OWNERFS_ROOT_INODE {
+            true
+        } else {
+            self.local
+                .as_ref()
+                .and_then(|local| local.private_root_for_inode(inode.value))
+                .is_some_and(|id| !cache.shared_roots.contains(&id))
+        };
         let ttl = if private {
             Duration::from_secs(1)
         } else {
@@ -1137,6 +1159,36 @@ impl Backend for OwnerFs {
     ) -> Result<usize> {
         self.require_local()?
             .write_with_options(handle, offset, data, options)
+    }
+
+    /// Mirror the DFS admission policy: a write that cannot block on
+    /// publication, peer capacity or a durability barrier runs on the FUSE
+    /// receive thread, keeping the same per-handle turn bookkeeping. Anything
+    /// that may wait stays on a worker so the receiver can keep admitting
+    /// unrelated requests and writeback.
+    fn write_admission_mode(&self, handle: FileHandle) -> WriteAdmissionMode {
+        let Some(local) = self.local.as_deref() else {
+            return WriteAdmissionMode::Queued;
+        };
+        if local.native_home_enabled() {
+            return WriteAdmissionMode::Queued;
+        }
+        let Ok(slot) = local.open_file_handle(handle) else {
+            return WriteAdmissionMode::Queued;
+        };
+        let Ok(slot) = slot.lock() else {
+            return WriteAdmissionMode::Queued;
+        };
+        match &slot.file {
+            OpenFileHandle::Local(file)
+                if file.write_sync == WriteSyncMode::None
+                    && file.fatal_sync_error.is_none()
+                    && local.root_is_private(&file.handle.root_id) =>
+            {
+                WriteAdmissionMode::Borrowed
+            }
+            _ => WriteAdmissionMode::Queued,
+        }
     }
 
     fn flush(&self, _: &RequestContext, handle: FileHandle) -> Result<()> {
@@ -2156,6 +2208,21 @@ impl LocalOwnerFs {
         self.roots.has_active_local_root(&id).then_some(id)
     }
 
+    /// True when this node holds the exclusive local grant for the root, so no
+    /// peer writer can mutate the file while this node holds the handle.
+    fn root_is_private(&self, root_id: &RootId) -> bool {
+        self.roots.has_active_local_root(root_id)
+    }
+
+    /// Whether this node owns the inode's root exclusively, so a metadata answer
+    /// cannot be stale relative to a peer writer.
+    pub(crate) fn is_private_local_inode(&self, inode: u64) -> bool {
+        if inode == OWNERFS_ROOT_INODE {
+            return true;
+        }
+        self.private_root_for_inode(inode).is_some()
+    }
+
     fn remote_for_record(&self, record: &NodeRecord, right: RootRight) -> Result<RemoteRoot> {
         self.acquire_remote_root(&record.root_id, right)
     }
@@ -2401,6 +2468,18 @@ impl LocalOwnerFs {
         parent: &StoragePath,
         expected: &files::FileIdentity,
     ) -> Result<FileAttributes> {
+        self.namespace_parent_attributes_with_dir(data_dir, parent, expected)
+            .map(|(attributes, _dir)| attributes)
+    }
+
+    /// Same as [`Self::namespace_parent_attributes`] but keeps the open parent
+    /// directory so callers can resolve a child without re-walking the path.
+    fn namespace_parent_attributes_with_dir(
+        &self,
+        data_dir: &StoragePath,
+        parent: &StoragePath,
+        expected: &files::FileIdentity,
+    ) -> Result<(FileAttributes, <LocalFs as crate::node::storage::FileStore>::Directory)> {
         let physical = data_dir.join_path(parent).map_err(Error::from)?;
         let dir = self.disk.open_dir(&physical).map_err(Error::from)?;
         let metadata = dir.metadata().map_err(Error::from)?;
@@ -2408,7 +2487,7 @@ impl LocalOwnerFs {
             let actual = identity_from_metadata(&metadata)?;
             check_expected_identity(Some(expected), &actual)?;
         }
-        attributes_from_metadata(metadata)
+        Ok((attributes_from_metadata(metadata)?, dir))
     }
 
     fn peer_lookup(
@@ -4023,21 +4102,28 @@ impl LocalOwnerFs {
             .roots
             .enter_root(&parent_record.root_id, RootRight::Write)?;
         let _namespace_guard = self.namespace_lock.lock().map_err(|_| poisoned())?;
-        let parent_attributes = self.namespace_parent_attributes(
+        let create_trace = std::time::Instant::now();
+        let (parent_attributes, parent_dir) = self.namespace_parent_attributes_with_dir(
             root_use.data_dir(),
             &parent_record.relative,
             &parent_record.identity,
         )?;
+        let mark_parent_attrs = create_trace.elapsed();
         let physical = root_use.data_dir().join_path(&child).map_err(Error::from)?;
         let create_flags = create_open_flags_for_backend(flags) | libc::O_CREAT;
-        let created_new = path_missing_before_create(&self.disk, &physical)?;
+        // Resolve the child through the already-open parent directory: a
+        // path-based stat walks every component again.
+        let created_new = match parent_dir.child_present(name) {
+            Ok(present) => !present,
+            Err(_) => path_missing_before_create(&self.disk, &physical)?,
+        };
+        let mark_path_missing = create_trace.elapsed();
         if created_new {
             authorize_create_in_directory(ctx, &parent_attributes)?;
         }
-        let create_file = self
-            .disk
-            .open_file(&physical, OpenSpec::new(create_flags, mode))
+        let create_file = LocalFs::open_child_in(&parent_dir, name, OpenSpec::new(create_flags, mode))
             .map_err(Error::from)?;
+        let mark_create_open = create_trace.elapsed();
         if created_new {
             apply_created_file_owner_and_mode(
                 &create_file,
@@ -4046,17 +4132,33 @@ impl LocalOwnerFs {
                 mode,
             )?;
         }
-        let created_metadata = create_file.metadata().map_err(Error::from)?;
-        let created_identity = identity_from_metadata(&created_metadata)?;
-        drop(create_file);
-        let file = self
-            .disk
-            .open_file(&physical, OpenSpec::new(flags & !libc::O_CREAT, 0))
+        // A private root has no peer writer, so the name cannot be swapped under
+        // us: the handle we just created stays authoritative and the extra
+        // open + metadata for the replacement check is pure overhead.
+        let mark_owner_mode = create_trace.elapsed();
+        let root_private = self.root_is_private(&parent_record.root_id);
+        let file = if root_private {
+            drop(parent_dir);
+            create_file
+        } else {
+            let created_metadata = create_file.metadata().map_err(Error::from)?;
+            let created_identity = identity_from_metadata(&created_metadata)?;
+            drop(create_file);
+            let reopened = LocalFs::open_child_in(
+                &parent_dir,
+                name,
+                OpenSpec::new(flags & !libc::O_CREAT, 0),
+            )
             .map_err(Error::from)?;
-        let reopened_identity = identity_from_metadata(&file.metadata().map_err(Error::from)?)?;
-        if reopened_identity != created_identity {
-            return Err(stale("created file was replaced before readonly reopen"));
-        }
+            drop(parent_dir);
+            let reopened_identity =
+                identity_from_metadata(&reopened.metadata().map_err(Error::from)?)?;
+            if reopened_identity != created_identity {
+                return Err(stale("created file was replaced before readonly reopen"));
+            }
+            reopened
+        };
+        let mark_reopen = create_trace.elapsed();
         let write_sync = write_sync_mode_from_flags(flags);
         let needs_flush = flags & libc::O_TRUNC != 0 && write_sync == WriteSyncMode::None;
         if flags & libc::O_TRUNC != 0 {
@@ -4069,6 +4171,7 @@ impl LocalOwnerFs {
         let identity = identity_from_metadata(&metadata)?;
         let attributes = attributes_from_metadata(metadata)?;
         let mut state = self.state.lock().map_err(|_| poisoned())?;
+        let mark_state_lock = create_trace.elapsed();
         let inode = state.inode_for_path(
             parent_record.root_id,
             child,
@@ -4076,6 +4179,7 @@ impl LocalOwnerFs {
             attributes.clone(),
             attributes.kind,
         );
+        let mark_inode = create_trace.elapsed();
         let handle = state.insert_file_handle(
             files::LocalOpenFile {
                 #[cfg(test)]
@@ -4091,6 +4195,23 @@ impl LocalOwnerFs {
             write_sync,
             flags,
         );
+        let mark_handle = create_trace.elapsed();
+        if ownerfs_create_trace_enabled() {
+            let total = create_trace.elapsed();
+            afs_logging::warn!(
+                "ownerfs.create.stage";
+                "parent_attrs" => mark_parent_attrs.as_micros() as u64,
+                "path_missing" => (mark_path_missing - mark_parent_attrs).as_micros() as u64,
+                "create_open" => (mark_create_open - mark_path_missing).as_micros() as u64,
+                "owner_mode" => (mark_owner_mode - mark_create_open).as_micros() as u64,
+                "reopen" => (mark_reopen - mark_owner_mode).as_micros() as u64,
+                "state_lock" => (mark_state_lock - mark_reopen).as_micros() as u64,
+                "inode_for_path" => (mark_inode - mark_state_lock).as_micros() as u64,
+                "insert_handle" => (mark_handle - mark_inode).as_micros() as u64,
+                "tail" => (total - mark_reopen).as_micros() as u64,
+                "total" => total.as_micros() as u64
+            );
+        }
         Ok(CreatedFile {
             entry: Entry {
                 inode: backend_inode(inode),
@@ -4280,6 +4401,20 @@ impl LocalOwnerFs {
         match &mut file.file {
             OpenFileHandle::Local(file) if file.needs_flush => {
                 file.check_no_fatal_sync_error()?;
+                // Closing a handle on an exclusively owned local root needs no
+                // data sync: the write already sits in the page cache and the
+                // kernel writeback thread persists it, exactly like a local
+                // filesystem that was never fsync'ed. Roots shared with peers
+                // keep the synchronous close so a remote reader never observes
+                // a stale file once the writer's close has returned.
+                // AFS_OWNERFS_CLOSE_SYNC=1 restores the old behaviour.
+                if file.write_sync == WriteSyncMode::None
+                    && self.roots.has_active_local_root(&file.handle.root_id)
+                    && !ownerfs_close_sync_forced()
+                {
+                    file.needs_flush = false;
+                    return Ok(());
+                }
                 let sync_result = file.handle.file.sync_data().map_err(Error::from);
                 if let Err(error) = &sync_result {
                     file.remember_fatal_sync_error(error);
@@ -7062,6 +7197,28 @@ fn should_refresh_remote_root(error: &Error) -> bool {
 
 fn poisoned() -> Error {
     Error::coded(afs_error::RUNTIME_INTERNAL, "OwnerFs state lock poisoned")
+}
+
+/// Escape hatch for A/B measurement: `AFS_OWNERFS_CLOSE_SYNC=1` restores the
+/// per-close `fdatasync` that private local roots now skip.
+/// Escape hatch for A/B measurement: `AFS_OWNERFS_CLOSE_SYNC=1` restores the
+/// per-close `fdatasync` that private local roots now skip.
+fn ownerfs_create_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("AFS_FUSE_TRACE")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+fn ownerfs_close_sync_forced() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| {
+        std::env::var("AFS_OWNERFS_CLOSE_SYNC")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
 }
 
 fn release_owner_locks(table: &LockTable, owner: &FileLockOwner, kind: ReleaseKind) -> Result<()> {
