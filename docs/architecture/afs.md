@@ -513,6 +513,26 @@ DFS的版本复用与read-ahead设置不覆盖OwnerFs策略。read-ahead是向�
 bind 与远端访问共享底层文件，新打开的可见性及权限仍需按支持范围验证；
 图示不承诺已有 FD/mmap 即时撤权或跨节点锁一致性。
 
+## 跨节点 Workspace 出口（outlet）
+
+outlet 让集群内任一节点用**同一个平坦名字**访问某 workspace，而数据权威仍在
+Home 节点的本地盘上，不做复制。整体设计见
+[outlet 跨节点规范](../../afs/outlet-cross-node-spec-v2.md)；本节只记录已实现的
+Meta 契约。
+
+**已实现**：`OwnerRoots.ListActiveOutletRoots` 是 outlet 镜像面的唯一输入，
+返回全局 Active root 全量快照（`root_id`、`root_epoch`、`home_node_id`），
+按 `root_id` 升序以保证 diff 可复现。它没有游标、事件或增量语义——全量快照
+本身就是恢复机制。该 RPC 只读，不签发 `RootAccess`，不改变授权语义。
+
+"Active" 在持久层等价于 Root 实体存在：`DeactivateRoot` 直接删除 Root 键，
+不存在软删除状态位，因此快照不需要额外状态过滤。名字由 `root_id` 反解
+（`root-<hex(name)>`，与 OwnerFs 命名同源），不为 outlet 新增持久字段。
+
+**未实现（roadmap）**：节点侧镜像 worker（`/public/<name>` symlink 收敛）、
+mountinfo 只读诊断、部署侧统一挂载布局。在镜像 worker 落地前，上述快照没有
+运行时消费者，跨节点共享能力不对外宣称可用。
+
 ## DFS 外部对象持久化边界
 
 ![DFS 外部 S3 写入发布与独立读取](../../assets/architecture/afs-dfs-s3.svg)

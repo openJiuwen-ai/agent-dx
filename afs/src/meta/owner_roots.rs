@@ -22,6 +22,13 @@ pub trait OwnerRootAuthority: Send + Sync {
     fn deactivate_root(&self, input: DeactivateRootInput) -> MetaFuture<'_, ()>;
     fn lookup_root(&self, input: LookupRootInput) -> MetaFuture<'_, RootLookupState>;
     fn list_owner_roots(&self, input: ListOwnerRootsInput) -> MetaFuture<'_, ListOwnerRootsOutput>;
+    /// 全局 Active root 快照，供各节点 outlet 镜像 worker 使用。
+    ///
+    /// 与 `list_owner_roots` 的区别：后者按 home 节点过滤、同时返回待激活
+    /// reservation，服务 OwnerFs 恢复；本方法是跨节点全局视图，只返回
+    /// Active（= Root 实体存在）的 root，用于把 `/public/<name>` 映射为
+    /// 远端路径文本。调用方必须持有 live 会话（RPC 层校验）。
+    fn list_active_outlet_roots(&self) -> MetaFuture<'_, ListActiveOutletRootsOutput>;
     fn acquire_root(&self, input: AcquireRootInput) -> MetaFuture<'_, RootAccessGrant>;
     fn validate_root_access(
         &self,
@@ -66,6 +73,10 @@ impl OwnerRootAuthority for MissingOwnerRootAuthority {
         &self,
         _input: ListOwnerRootsInput,
     ) -> MetaFuture<'_, ListOwnerRootsOutput> {
+        Box::pin(async { Err(unavailable_meta_store()) })
+    }
+
+    fn list_active_outlet_roots(&self) -> MetaFuture<'_, ListActiveOutletRootsOutput> {
         Box::pin(async { Err(unavailable_meta_store()) })
     }
 
@@ -658,6 +669,23 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
         })
     }
 
+    fn list_active_outlet_roots(&self) -> MetaFuture<'_, ListActiveOutletRootsOutput> {
+        Box::pin(async move {
+            let snapshot = self.store.read(MetaRead::ActiveRoots).await?;
+            let revision = snapshot.revision;
+            let mut roots = snapshot
+                .entities
+                .into_iter()
+                .filter_map(|entity| match entity {
+                    MetaEntity::Root(root) => Some(root),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            roots.sort_by(|left, right| left.root_id.cmp(&right.root_id));
+            Ok(ListActiveOutletRootsOutput { revision, roots })
+        })
+    }
+
     fn acquire_root(&self, input: AcquireRootInput) -> MetaFuture<'_, RootAccessGrant> {
         Box::pin(async move {
             let root = self
@@ -1204,6 +1232,12 @@ pub struct ListOwnerRootsOutput {
     pub authority_revision: StoreRevision,
     pub active_roots: Vec<RootRecord>,
     pub pending_reservations: Vec<RootReservationRecord>,
+}
+
+/// 全局 Active root 快照（outlet 镜像面输入）。
+pub struct ListActiveOutletRootsOutput {
+    pub revision: StoreRevision,
+    pub roots: Vec<RootRecord>,
 }
 
 pub struct AcquireRootInput {

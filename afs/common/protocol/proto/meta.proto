@@ -93,6 +93,9 @@ service OwnerRoots {
   rpc DeactivateRoot(DeactivateRootRequest) returns (DeactivateRootReply);
   rpc LookupRoot(LookupRootRequest) returns (LookupRootReply);
   rpc ListOwnerRoots(ListOwnerRootsRequest) returns (ListOwnerRootsReply);
+  // 只读：返回全局 Active root 快照，供各节点 outlet 镜像 worker 使用。
+  // 不改变授权语义，不签发 RootAccess。
+  rpc ListActiveOutletRoots(ListActiveOutletRootsRequest) returns (ListActiveOutletRootsReply);
   rpc AcquireRoot(AcquireRootRequest) returns (AcquireRootReply);
   rpc ValidateRootAccess(ValidateRootAccessRequest) returns (ValidateRootAccessReply);
   rpc WatchRootCommands(WatchRootCommandsRequest) returns (stream RootCommand);
@@ -239,6 +242,18 @@ message ListOwnerRootsReply {
   repeated RootLocation active_roots = 1;
   repeated RootReservation pending_reservations = 2;
   uint64 authority_revision = 3;
+}
+
+// ListActiveOutletRoots 是 outlet 镜像面的唯一输入：全局 Active root 全量快照。
+// 无游标、无事件、无增量语义——全量快照即恢复机制。名字由 root_id 反解，
+// 不新增持久字段（root_id 编码为 root-<hex(name)>，见 OwnerFs root_id_from_name）。
+message ListActiveOutletRootsRequest {
+  string request_id = 1;
+}
+
+message ListActiveOutletRootsReply {
+  repeated RootLocation active_roots = 1;
+  uint64 authority_revision = 2;
 }
 
 message AcquireRootRequest {
