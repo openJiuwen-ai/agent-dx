@@ -20,6 +20,11 @@ fn main() {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| Path::new(".").to_path_buf());
     println!("cargo:rerun-if-changed=build.rs");
+    // The provenance inputs are environment overrides on this platform, so a
+    // new commit without a source change must still trigger a rebuild. Without
+    // this, cargo happily reuses the previous binary and the provenance lies.
+    println!("cargo:rerun-if-env-changed=AFS_BUILD_COMMIT");
+    println!("cargo:rerun-if-env-changed=AFS_BUILD_DIRTY");
     if root.join(".git").exists() {
         // A commit or checkout changes HEAD; the pointer file changes when a
         // worktree is re-attached.
