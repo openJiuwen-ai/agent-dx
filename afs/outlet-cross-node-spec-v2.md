@@ -17,8 +17,9 @@
 - **v3 修订**（相对本文件 v2 初稿）：
   1. NFS 由 `hard` 改为 **`softerr`**（§6）——`hard` 会让进程进入不可 kill 的
      D 状态，同时使 `umount` 失效，故障时既不能有界失败也不能卸载修复；
-  2. 新增 **`root_revision` 校验位**（§4.2）替代每轮全量传输，作用域限定在
-     Root 实体，不受 DFS 事件污染；**明确不做事件游标**（§4.3 给出对比）；
+  2. 新增 **`root_digest` 摘要校验位**（§4.2）替代每轮全量传输，只覆盖
+     `(root_id, root_epoch, home_node_id)`，不受 DFS 事件污染；**明确不做
+     事件游标**（§4.3 给出对比）；
   3. 新增 **NFS 参数硬要求**与挂载点权限（§6）；
   4. 新增 **存量 `/home/agentos/users` 迁移**前置条件（§6.4）；
   5. 保留 D5（target 带 epoch），**不引入 home 侧稳定名**——理由见 §7.3；
@@ -48,7 +49,7 @@
 | D4 | 镜像 worker 永不 stat target | 远端 target 在 softerr 挂载上仍可能阻塞至 `io_failure_bound` | target 存在性前置校验（由消费方启动门禁承担） |
 | D5 | 镜像 target 直接携带代次（`-e<epoch>`），**不设 home 侧稳定名** | 换代 = 镜像文本变化 = 一次原子 rename；同名重建无歧义（epoch 直可见） | 换代传播的最终一致性窗口（由 H11 宽限期兜住，见 §7.3） |
 | D6 | NFS 用 `softerr` 而非 `hard` | `hard` 使进程进入不可 kill 的 D 状态且阻塞 `umount`，故障时无法有界失败也无法卸载修复 | 极少数"静默重试直到恢复"的连续性（改为有界失败，由消费方重试） |
-| D7 | 传输层用 `root_revision` 校验位，**不用事件游标** | 空闲每轮 20 B；不需要游标、Compacted 回退、生产级唤醒原语 | 事件级增量（ε 级延迟，但本场景不可观测，见 §4.3） |
+| D7 | 传输层用 `root_digest` 摘要校验位，**不用事件游标** | 空闲每轮 ~60 B；不需要游标、Compacted 回退、生产级唤醒原语；摘要是答案的纯函数，重启后自然复现 | 事件级增量（ε 级延迟，但本场景不可观测，见 §4.3） |
 | D8 | 不做后端抽象；NFS 判定收敛到单一模块（编译期，不是 trait） | 首版只有 NFS；抽象等到第二个实现出现再引入 | 可插拔后端 |
 
 ## 3. 核心抽象与不变式
@@ -89,20 +90,20 @@ target(/public/<name>) = "/imports/" + home + "/users/" + data_dir_text(name, ep
 master 的 root 生命周期与 `NodeSession`（含 `is_live_at_unix_ms`）原样复用，
 root 记录**不新增字段**。新增一个只读 RPC，带可选的变更校验位。
 
-### 4.1 `ListActiveOutletRoots(known_root_revision) -> { roots, root_revision }`
+### 4.1 `ListActiveOutletRoots(known_digest) -> { roots, digest, unchanged }`
 
 ```proto
 message ListActiveOutletRootsRequest {
   string request_id = 1;
-  // 0 表示"无本地快照，要全量"。非 0 时若与 Meta 当前值相等，
-  // 服务端返回 unchanged=true 且不带 roots。
-  uint64 known_root_revision = 2;
+  // 调用方已持有的集合摘要；空表示要求全量快照。
+  string known_digest = 2;
 }
 
 message ListActiveOutletRootsReply {
   repeated RootLocation active_roots = 1;
-  uint64 root_revision = 2;
-  bool unchanged = 3;
+  uint64 authority_revision = 2;
+  string digest = 3;
+  bool unchanged = 4;
 }
 ```
 
@@ -114,39 +115,46 @@ message ListActiveOutletRootsReply {
 - **wire 不含 `home_session_id`**：镜像不用它，而它占 payload 约 1/3。
   需要 session 信息的消费者走 `ListOwnerRoots`，不复用本 RPC。
 
-### 4.2 `root_revision`：作用域正确的校验位
+### 4.2 `root_digest`：对答案本身求摘要
 
-在 `State` 增加 `root_revision: u64`，**仅在写路径中对 Root 系实体递增**：
+RPC 返回 `digest`：对**已排序的 `(root_id, root_epoch, home_node_id)` 三元组**
+求 blake3 摘要。请求带 `known_digest`，命中则返回 `unchanged=true` 且不带
+`active_roots`。
 
-```rust
-// state.rs 现有 Put/Delete 分支内，紧邻 state.events.push
-if matches!(key, MetaKey::Root { .. } | MetaKey::RootReservation { .. }) {
-    state.root_revision = state.root_revision.wrapping_add(1);
-}
-```
+**为什么是摘要而不是计数器。** 起初设计为在写路径维护 `root_revision: u64`，
+实施时发现它在重启后不可靠：
 
-**硬规则 H13**：`root_revision` 的递增条件只允许是上述两个 key 变体。
-禁止改用全局 `state.revision`。
+- 不新增 checkpoint 字段就没有持久化位置；
+- 从恢复后的实体推导，则"删一个 root 再建一个"可能推导出与崩溃前相同的值，
+  客户端会误判为未变化；
+- 加字段则要在 checkpoint schema、`StateImage`、replay 三处同步，且一次
+  半途崩溃就可能让计数器与实体不一致。
+
+摘要没有这些问题：它是**答案的纯函数**。恢复出相同的 root 集合，必然得到
+相同的摘要；集合变化，摘要必然变化；不持久化、不推导、不恢复。
+
+**硬规则 H13**：摘要的输入只允许是 `(root_id, root_epoch, home_node_id)`。
+禁止加入 `revision`、`compacted_to`、时间戳或任何全局序号。
 
 理由（这是本设计最容易被做错的地方）：`state.rs` 的每个 `Put`/`Delete`
 都会推全局 `revision` 并追加事件，**包括 DFS 的每个 inode 写、GC 引用更新、
-复制任务状态**。任何基于全局 revision 的"有没有变"判断，在有 DFS 流量的
-集群里会持续判定为"已变"，校验位退化为 `always false`，方案失效。
-`root_revision` 的作用域必须严格限定在"改变 Active root 集合"的实体上。
+复制任务状态**。把 `revision` 混进摘要，在有 DFS 流量的集群里会持续判定为
+"已变"，校验位退化为 `always false`，每轮都全量传输，方案失效。
+作用域也必须限定：`RootReservation`、`RootGrant`、`RootCommand`、
+`NodeSession` 都不在摘要输入内——它们变化不改变镜像要发布的集合。
 
-`RootReservation` 计入递增是保守选择：reservation 不可发布（§3.3），但它
-之后必然转为 Root 或消失，提前失效快照只会多一次全量传输，不会漏发布。
+字段长度做前缀，避免 `("ab","c")` 与 `("a","bc")` 的拼接歧义。
 
 ### 4.3 为什么不用事件游标
 
 事件游标（`WatchRoots(after_revision, wait)` long-poll + 基线 + `Compacted`
-回退）与 `root_revision` 校验位的对比如下。设定：10 节点、500 workspace、
+回退）与 `root_digest` 校验位的对比如下。设定：10 节点、500 workspace、
 Root 集合每天变化约 200 次。
 
-| 维度 | 全量快照 250ms | **`root_revision` 校验位 250ms** | 事件游标 long-poll |
+| 维度 | 全量快照 250ms | **`root_digest` 校验位 250ms** | 事件游标 long-poll |
 |---|---|---|---|
 | 空闲单轮传输 | 60 KB | **20 B** | 空批仍计入 `WATCH_RESPONSE_BASE_BYTES`（64 KB 预算） |
-| 集群空闲出口 | 2.4 MB/s | **800 B/s** | ~1 KB/s |
+| 集群空闲出口 | 2.4 MB/s | **2.4 KB/s** | ~1 KB/s |
 | 变化时传输 | 60 KB 全量重传 | 60 KB（一次） | 仅变化事件（~120 B/条） |
 | 感知延迟 | ≤250ms | ≤250ms | 提交 + RTT（~1ms） |
 | 恢复路径数 | 1（首轮扫描） | **1**（计数器失配即全量） | **2**（基线 + `Compacted` 回退） |
@@ -154,7 +162,7 @@ Root 集合每天变化约 200 次。
 | 客户端状态 | 无 | 一个 `u64` | `after_revision` + 本地集合 + 回退逻辑 |
 | 估计代码量 | 0（T1 已有） | **~60 行** | **~300–400 行** |
 
-**结论**：校验位在空闲流量上与游标几乎持平（800 B/s vs 1 KB/s），在复杂度
+**结论**：校验位在空闲流量上与游标同一量级（2.4 KB/s vs 1 KB/s），在复杂度
 上是它的 1/6，代价是 250ms 的发布延迟。
 
 250ms 在本场景不可观测：workspace 激活后，容器 provisioning 要走调度、
@@ -166,9 +174,9 @@ Root 集合每天变化约 200 次。
 250ms 一轮即 0.02%–0.08% CPU。若将来 workspace 上到万级（约 8% CPU），
 再重新评估游标方案；届时本节的对比表是决策依据。
 
-**可选优化（非必需）**：Meta 侧可用 `root_revision` 兼作快照缓存键
-（未变则复用上次序列化的 `Arc<[u8]>`），把空闲开销降为 O(1) 比较。
-首版不实现，等实测显示扫描成为瓶颈再加。
+**可选优化（非必需）**：Meta 侧可用 `digest` 兼作快照缓存键（未变则复用
+上次序列化的 `Arc<[u8]>`），把空闲开销降为 O(1) 比较。首版不实现，等实测
+显示扫描成为瓶颈再加。
 
 ### 4.4 `Active` 的语义边界（消费方必读）
 
@@ -191,10 +199,10 @@ Root 集合每天变化约 200 次。
 维护 cached_revision: u64 = 0（进程内，不持久化）
 
 每 outlet_mirror_interval_ms（默认 250ms）：
-  reply = Meta.ListActiveOutletRoots(cached_revision)
+  reply = Meta.ListActiveOutletRoots(cached_digest)
   if reply.unchanged:
       continue                                  # 磁盘与期望态都没变，零动作
-  cached_revision = reply.root_revision
+  cached_digest = reply.digest
   active  = reply.active_roots                  # 期望态
   present = read_dir(public_root) 过滤保留名     # 现状态
   对 active - present 的每个 root：
@@ -207,7 +215,7 @@ Root 集合每天变化约 200 次。
 ```
 
 **硬规则 H14**：`unchanged=true` 时**不得**执行任何 diff 或 unlink。
-该分支的语义是"服务端保证 Root 集合自 `known_root_revision` 以来未变"，
+该分支的语义是"服务端保证 Root 集合与 `known_digest` 一致"，
 把它当成"没有 root"会导致 `/public` 被整体清空。
 
 **硬规则 H15**：`cached_revision` 只放在进程内存。进程重启后从 0 开始，
@@ -263,11 +271,11 @@ Root 集合每天变化约 200 次。
 | 项 | 计算 | 结果 |
 |---|---|---|
 | 单次全量 payload | 500 × (40 B `root_id` + 8 B epoch + 40 B home + 帧开销) | ≈ 60 KB |
-| 空闲单轮（`unchanged`） | 20 B | 20 B |
-| 每节点空闲 | 4 轮/s × 20 B | **80 B/s** |
-| 集群空闲出口 | 10 × 80 B/s | **800 B/s** |
-| 集群空闲每日 | 800 B/s × 86400 | **69 MB** |
-| 集群空闲每年 | | **25 GB** |
+| 空闲单轮（`unchanged`） | digest 32 B（hex）+ 帧开销 | ~60 B |
+| 每节点空闲 | 4 轮/s × 60 B | **240 B/s** |
+| 集群空闲出口 | 10 × 240 B/s | **2.4 KB/s** |
+| 集群空闲每日 | 2.4 KB/s × 86400 | **207 MB** |
+| 集群空闲每年 | | **76 GB** |
 | 对比：无校验位 250ms | 10 × 240 KB/s | 2.4 MB/s（207 GB/天） |
 | Meta 扫描开销 | 500 条 × 200 µs / 250ms | 0.08% CPU（单 Meta） |
 
@@ -497,7 +505,7 @@ timeout -s KILL 3 ls /public/<name>/ >/dev/null 2>&1
 | activate 中途崩溃 | 物理目录或 Active 记录存在而另一者缺失 | activate 幂等重试（复用 master 生命周期）+ 镜像下轮对齐 | 无 |
 | 换代窗口内消费（symlink 未更新） | 新容器取得旧代 target（H11 宽限期内可解析） | 宽限期后旧代回收；数据为旧代快照，属预期 | 无 |
 | `softerr` 触发 EIO | 容器内 I/O 返回错误而非挂死 | 上层重试；home 恢复后成功 | 无 |
-| `root_revision` 误用全局 revision | 校验位恒失配，退化为每轮全量 | 违反 H13，需修复 | 是（代码缺陷） |
+| `digest` 混入全局 revision | 摘要恒变，退化为每轮全量 | 违反 H13，需修复 | 是（代码缺陷） |
 
 ## 9. 配置面
 
@@ -540,7 +548,7 @@ generation_grace_ms = 120000         # 可选，默认 120000；H11 旧代目录
 
 | # | 任务 | 内容 | 验收 |
 |---|---|---|---|
-| T1 | Meta 只读 RPC + 校验位 | `ListActiveOutletRoots`（proto + owner_roots 实现 + 现有会话校验）+ `State.root_revision` + `MetaRead::ActiveRoots` | 单元测试：Active 集投影、非 live 会话拒绝、**reservation 不泄漏**、**deactivate 后消失**、**稳定排序**、`root_revision` 仅随 Root 系实体递增（DFS 事件不改变它） |
+| T1 | Meta 只读 RPC + 摘要校验位 | `ListActiveOutletRoots`（proto + owner_roots 实现 + 现有会话校验）+ `MetaRead::ActiveRoots` + `active_roots_digest` | 单元测试：Active 集投影、非 live 会话拒绝、**reservation 不泄漏**、**deactivate 后消失**、**稳定排序**、**DFS 写入不改变摘要**、**重启后摘要可复现**、`unchanged` 命中/失配 |
 | T2 | mountinfo 诊断 | 解析 + 三类告警（缺失/类型漂移/tmpfs 校验） | 纯函数测试（构造 mountinfo 文本） |
 | T3 | 镜像 worker | diff 纯函数 + 收敛循环 + `unchanged` 短路（H14）+ 原子放置 + ghost 隔离 + staging 清扫 | 纯函数表驱动测试（§12 TC1-TC7 的离线版）+ `unchanged` 分支测试 |
 | T4 | 配置与接线 | 三路径 all-or-none 校验、`node.rs` 启动接线、`[outlet_mirror]`、H11 取值校验 | 配置校验测试、启动 fail-fast 测试、grace 下限校验测试 |
@@ -569,9 +577,9 @@ T5-T6 一组（资产与证据），不混入无关变更。
 | TC12b | 启动门禁（可选穿透检查） | A 宕机时 `timeout -s KILL 3 ls /public/<name>/` 3s 超时退出；A 活着时毫秒级通过。注意：`softerr` 下不检查也会在 `timeo×retrans` 内有界失败，本用例验证的是"失败出现在 provisioning 判定点而非 runc 挂载阶段" |
 | TC13 | 换代窗口（H11） | epoch 7→8 后、B 的 symlink 更新前启动新容器：bind 成功且读到 e7 数据（宽限期内）；宽限期后旧代目录被回收 |
 | TC14 | `/public` 整棵挂入容器（违约） | 容器内 symlink 断链；逐条 bind 正常——文档禁令与现象一致 |
-| TC15 | `root_revision` 作用域（H13） | 只创建 DFS entity（不碰 Root）：`root_revision` 不变，带校验位的请求返回 `unchanged=true` |
+| TC15 | 摘要作用域（H13） | 只写非 root 实体（推进全局 revision）：`digest` 不变，带 `known_digest` 的请求返回 `unchanged=true` |
 | TC16 | `unchanged` 短路（H14） | 构造 `unchanged=true` 但 `/public` 有 symlink：**不得**被清除；`/public` 内容逐字节不变 |
-| TC17 | 服务端 `unchanged` 判定 | 首次请求（`known=0`）返回全量 + `root_revision=N`；再请求 `known=N` 返回 `unchanged`；Root 变更后 `known=N` 返回全量 + `root_revision>N` |
+| TC17 | 服务端 `unchanged` 判定 | 首次请求（无 `known_digest`）返回全量 + `digest=D`；再请求 `D` 返回 `unchanged` 且无 payload；Root 变更后请求 `D` 返回全量 + 新 `digest` |
 | TC18 | H11 取值约束 | `interval_ms` 或 `actimeo` 调大至违反 `grace ≥ max(interval×10, actimeo×2)` 时，启动失败并指明约束 |
 | TC19 | NFS 路径不经 AFS 授权（§6.5) | 在 B 上对 `/public/<name>` 做 IO：A 的 `afs-node` 日志无 `validate_root_access` / `ValidateRootAccess` 调用；B 侧无任何 `RootGrant` |
 | TC20 | 导出范围核对（H18） | 部署检查脚本：`/etc/exports` 的客户端集合与成员表一致；加入非成员 IP 时脚本报错 |
@@ -599,10 +607,10 @@ T5-T6 一组（资产与证据），不混入无关变更。
   迁移时点、灰度方式、回滚方案未定。风险在于该路径是现役契约，迁移期间
   新旧两种形态不能共存（同一路径不能既是 tmpfs 又保留真实目录）。
   **在 R6 关闭前，本特性不得在生产启用。**
-- **R7 `root_revision` 的实现纪律（H13）**：这是唯一"写错也能跑、只是
-  退化"的地方——误用全局 `revision` 不会报错，只会让校验位恒失配、
-  流量退化为 2.4 MB/s。缓解：TC15 用例 + 代码注释指向本节。审查时须
-  特别核对递增条件的作用域。
+- **R7 摘要的实现纪律（H13）**：这是唯一"写错也能跑、只是退化"的地方——
+  把全局 `revision` 混入摘要不会报错，只会让摘要恒变、流量退化为
+  2.4 MB/s。缓解：TC15 用例 + 代码注释指向本节。审查时须核对摘要输入
+  是否严格只有三元组。
 - **R8 NFS 导出即可见性边界（H18，接受）**：NFS 数据面绕过 AFS 授权
   （§6.5），因此 AFS 无法对 B 侧访问做 workspace 级授权，
   `access_generation` / `fencing_token` / `revoke` 对 NFS 路径无效。

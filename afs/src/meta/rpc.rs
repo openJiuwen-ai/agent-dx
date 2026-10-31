@@ -686,15 +686,24 @@ impl OwnerRootsService for OwnerRootsRpc {
         let _caller = authenticated_node_id(&self.0, &request)?;
         let request = request.into_inner();
         require_text(&request.request_id, "request_id")?;
+        let known_digest = if request.known_digest.is_empty() {
+            None
+        } else {
+            Some(request.known_digest)
+        };
         let output = self
             .0
             .owner_roots
-            .list_active_outlet_roots()
+            .list_active_outlet_roots(super::owner_roots::ListActiveOutletRootsInput {
+                known_digest,
+            })
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
         Ok(Response::new(ListActiveOutletRootsReply {
             active_roots: output.roots.into_iter().map(wire_location).collect(),
             authority_revision: output.revision.0,
+            digest: output.digest,
+            unchanged: output.unchanged,
         }))
     }
 
@@ -3206,6 +3215,7 @@ mod tests {
         let error = OwnerRootsRpc(meta)
             .list_active_outlet_roots(Request::new(ListActiveOutletRootsRequest {
                 request_id: String::new(),
+                known_digest: String::new(),
             }))
             .await
             .unwrap_err();
@@ -3231,6 +3241,7 @@ mod tests {
         let reply = OwnerRootsRpc(meta)
             .list_active_outlet_roots(Request::new(ListActiveOutletRootsRequest {
                 request_id: "req-1".into(),
+                known_digest: String::new(),
             }))
             .await
             .unwrap()

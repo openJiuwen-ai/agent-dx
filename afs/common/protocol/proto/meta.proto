@@ -249,11 +249,19 @@ message ListOwnerRootsReply {
 // 不新增持久字段（root_id 编码为 root-<hex(name)>，见 OwnerFs root_id_from_name）。
 message ListActiveOutletRootsRequest {
   string request_id = 1;
+  // 调用方已持有的集合摘要；空表示要求全量快照。
+  // 摘要只覆盖 (root_id, root_epoch, home_node_id)，DFS 事件、grant、
+  // session、命令的变化都不会改变它。
+  string known_digest = 2;
 }
 
 message ListActiveOutletRootsReply {
+  // unchanged 为真时 active_roots 为空，调用方必须沿用本地快照，
+  // 不得解读为"当前没有 root"。
   repeated RootLocation active_roots = 1;
   uint64 authority_revision = 2;
+  string digest = 3;
+  bool unchanged = 4;
 }
 
 message AcquireRootRequest {
