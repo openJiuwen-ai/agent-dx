@@ -64,7 +64,27 @@ TC10/TC11/TC15/TC16/TC17 已有单元测试；TC18 已在配置校验实现
 TC20 属部署脚本（T5）；TC24 指标按产品决定未实现，以
 `ownerfs.reclaim.swept` 日志的 `pending` 计数代替。
 
+## 第三轮：规模验证（2026-10-31 23:45–11-1 00:05 CST）
+
+在两节点各创建 200 个 workspace（FUSE mkdir），然后从 B 的 `/public`
+（outlet 名字层）把一份 30 文件 / 329KB 的配置树拷贝进全部 401 个
+workspace，并逐一校验内容哈希。
+
+| 步骤 | 结果 |
+|---|---|
+| A 创建 200 个 workspace（FUSE mkdir，`ws001–ws200`） | ✅ 0 失败，数据目录 200 |
+| B 创建 200 个 workspace（FUSE mkdir，`wsb001–wsb200`） | ✅ 0 失败（见问题 8 的同名限制） |
+| 镜像收敛 | ✅ `/public` 401 个 symlink，`active=401` 一轮内追平 |
+| **401 份拷贝（全部经 `/public` 路径）** | ✅ 0 失败，24s；A-homed 的 200 个写穿 NFS `ro→rw` 后落盘 |
+| 逐一哈希校验 | ✅ **401 checked, 0 mismatched** |
+| A 侧反向抽查 | ✅ `find data/node-a/ownerfs -name builtin_rules.yaml` = 200 份 |
+
+**结论**：outlet 名字层在 401 root 规模下功能正确；跨节点写入路径
+（`/public` symlink → NFS import → home 磁盘）全部生效。
+
 ## 过程中发现并即时处理的问题
+
+
 
 1. **宿主已有其他 AFS 进程**：7400（他人 meta）与 127.0.0.1:17400
   （`/home/lzq/afs-baseline`）。全部避开，未触碰。
@@ -82,6 +102,20 @@ TC20 属部署脚本（T5）；TC24 指标按产品决定未实现，以
 5. **build-info 缓存事故**：commit 变更后 cargo 未重跑 build.rs，
   `--build-info` 报告旧 commit。发现于 checksum 变化而 commit 不变；
   修复为 `cargo:rerun-if-env-changed`（be657ecb）。
+6. **`/public` 是单点拓扑**：outlet 镜像只部署在 B 上，A 没有镜像也没有
+  `/public`。跨节点批量操作必须在运行镜像的节点上经 `/public` 执行——
+  在 A 上 glob `/public/root-*` 会拿到字面目录名并把 400 份拷进一个目录。
+7. **每个 home 都必须出现在 `imports/<node>/users`**：B 自己的 workspace
+  的 symlink 指向 `imports/node-b/users/...`，漏挂时全部断链（spec §5.2
+  的部署要求，容易只挂远端漏本机）。本机用 `mount --bind` 补挂即恢复。
+8. **OwnerFs 同名 root 的僵尸目录**：一轮并发混乱在 Meta 留下 pending 记录
+  后，同名 FUSE mkdir 返回 EEXIST 且目录删不掉（`Device or resource busy`），
+  换新名字立即可建。**这是 OwnerFs 名字管理层的问题，不是 outlet 的**；
+  待办：同名复用前应允许从 Meta 残留中恢复（当前 fail-fast 是保守正确
+  的，但运维上需要一条恢复路径）。
+9. **NFS 导出/挂载的 rw 忘记切换**：验证初期用 `ro` 导出，401 份拷贝在
+  A-homed 的 200 个上报 `Read-only file system`。改 `exportfs rw` +
+  重挂后通过。
 
 ## 边界声明
 
