@@ -8368,16 +8368,21 @@ mod outlet_active_roots_tests {
         reserve_and_activate(&authority, "root-6167", "agent1").await;
         let before = active_ids(&authority).await;
         // 独立空 store 的读取为空，且不影响原 store 视图：扫描只读本地状态。
-        let empty = Arc::new(Store::open_log(Arc::new(
-            MemoryLog::new(Default::default()).unwrap(),
-        ))
-        .await
-        .unwrap());
+        let empty = Arc::new(
+            Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
+                .await
+                .unwrap(),
+        );
         let empty_authority = StoreOwnerRootAuthority::new(empty);
         assert!(active_ids(&empty_authority).await.is_empty());
         assert_eq!(active_ids(&authority).await, before);
         assert_eq!(
-            store.read(MetaRead::ActiveRoots).await.unwrap().entities.len(),
+            store
+                .read(MetaRead::ActiveRoots)
+                .await
+                .unwrap()
+                .entities
+                .len(),
             1
         );
     }
