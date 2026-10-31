@@ -6,4 +6,5 @@
 //!
 //! 设计要点见 `afs/outlet-cross-node-spec-v2.md`；本文只记录实现契约。
 
+pub mod live;
 pub mod mirror;
