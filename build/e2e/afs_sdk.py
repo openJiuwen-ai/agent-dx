@@ -16,6 +16,11 @@ def perl(code, *arguments, uid=10000):
     identity = (f'defined(POSIX::setgid({uid})) or die "setgid: $!";$)="{uid} {uid}";'
                 f'defined(POSIX::setuid({uid})) or die "setuid: $!";'
                 f'die "wrong UID real=$< effective=$> expected={uid}" unless $<=={uid} && $>=={uid};')
+    if uid != 0:
+        identity += ('open(my $s,"<","/proc/self/status") or die $!;'
+                     'my $caps=0;while(<$s>){if(/^Cap(?:Eff|Prm|Amb):\\s+(\\S+)/){'
+                     'die "workload retains capabilities $_" unless hex($1)==0;$caps++;}}'
+                     'close($s);die "missing capability evidence" unless $caps==3;')
     return ' '.join(shlex.quote(str(v)) for v in ('perl', '-MIO::Handle', '-MPOSIX', '-e', identity + code, *arguments))
 
 

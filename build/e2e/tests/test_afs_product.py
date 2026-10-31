@@ -38,9 +38,10 @@ class ProductContracts(unittest.TestCase):
         self.assertFalse(any(v.get('hostPath') for p in base if p['kind'] == 'Pod'
                              for v in p['spec']['volumes']))
 
-    def test_sdk_fixture_allows_identity_drop_without_dac_override(self):
+    def test_sdk_fixture_separates_privileged_file_api_from_unprivileged_commands(self):
         spec = json.loads((HERE / 'afs_runc_spec.json').read_text())
-        expected = {'CAP_AUDIT_WRITE', 'CAP_KILL', 'CAP_NET_BIND_SERVICE', 'CAP_SETUID', 'CAP_SETGID'}
+        expected = {'CAP_AUDIT_WRITE', 'CAP_KILL', 'CAP_NET_BIND_SERVICE', 'CAP_SETUID',
+                    'CAP_SETGID', 'CAP_DAC_OVERRIDE'}
         for capabilities in spec['process']['capabilities'].values():
             self.assertEqual(set(capabilities), expected)
         self.assertFalse(any(ns['type'] == 'user' for ns in spec['linux']['namespaces']))

@@ -286,6 +286,14 @@ The current sandboxd backend rejects tool user/group overrides. Environments
 therefore use the supported default identity; SDK commands explicitly drop the
 workload UID/GID and verify the effective UID before POSIX operations. This
 tests AFS permission enforcement without claiming tool override support.
+Only this SDK target configures sandboxd's existing `basic_spec` option with
+`afs_runc_spec.json`: the backend's three default capabilities plus `SETUID`,
+`SETGID` and `DAC_OVERRIDE`. The last capability lets the root SDK Files API
+access the private UID-10000 workspace; POSIX workload commands drop identity
+and must show zero effective, permitted and ambient capabilities before running. It does not change the shared deployment defaults. A failed credential
+switch fails explicitly; the test does not continue as root. This deployment
+configuration is a prerequisite, not evidence that the default backend permits
+identity switching.
 
 For AFS ON, `.buildkite/run-e2e.sh` without a diagnostic selector runs
 `afs_gate.py`: public profile -> five AFS component cases -> both SDK variants.

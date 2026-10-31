@@ -15,7 +15,9 @@ def connect(config):
     if not isinstance(prefix, list) or not prefix or not all(isinstance(x, str) and x for x in prefix):
         raise ValueError('literal kubectl argv is required')
     namespace, pod = config.get('namespace', ''), config.get('pod', '')
-    if not re.fullmatch(r'adx-e2e-[a-z0-9-]{1,40}', namespace) or not re.fullmatch(r'afs-[mabc]', pod):
+    product_node = mount_namespace == 'container' and pod in ('node1', 'node2')
+    if not re.fullmatch(r'adx-e2e-[a-z0-9-]{1,40}', namespace) or not (
+            re.fullmatch(r'afs-[mabc]', pod) or product_node):
         raise ValueError('an owned AFS namespace and role Pod are required')
     if config.get('container') != 'platform':
         raise ValueError('AFS worker container must be platform')
@@ -27,6 +29,8 @@ def connect(config):
                                               text=True, timeout=30))
     if any(meta.get('labels', {}).get('adx.e2e.run') != namespace for meta in (ns['metadata'], item['metadata'])):
         raise Blocked('Kubernetes role ownership changed')
+    if product_node and item['metadata']['labels'].get('afs.e2e.data') != 'true':
+        raise Blocked('Kubernetes product role has not opted into the AFS SDK fixture')
     if ns['metadata'].get('uid') != config['namespace_uid'] or item['metadata'].get('uid') != config['pod_uid']:
         raise Blocked('Kubernetes namespace or Pod was replaced')
     if item.get('status', {}).get('phase') != 'Running' or item['status'].get('podIP') != config['pod_ip']:
