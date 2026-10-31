@@ -14,6 +14,7 @@ import time
 
 from fixtures import singlevm, ssh, namespaces, kubernetes
 from fixtures.common import Blocked, sha256, write_json
+from fixtures.common import HERE
 
 ROLES = ("M", "A", "B", "C")
 NAMES = {"M": "meta", "A": "node-a", "B": "node-b", "C": "node-c"}
@@ -472,7 +473,17 @@ class Cluster:
     def topology(self):
         for role in self.roles[1:]:
             path = self.workspace(role) if role == "A" and self.mode == "ownerfs" else self.mount(role)
-            value = self.command(role, ["findmnt", "-J", "--mountpoint", path, "-o", "TARGET,SOURCE,FSTYPE,ID"])
+            try:
+                value = self.command(role, ["findmnt", "-J", "--mountpoint", path, "-o", "TARGET,SOURCE,FSTYPE,ID"])
+            except AssertionError:
+                if role == 'A' and self.mode == 'ownerfs':
+                    try:
+                        diagnostic = self.python(role, (HERE / 'bind_probe.py').read_text(), self.root(role),
+                                                 self.token, owner=False, check=False)
+                        self.record('ownerfs.bind_diagnostic', diagnostic)
+                    except Exception as error:
+                        self.record('ownerfs.bind_diagnostic', {'diagnostic_error': str(error)})
+                raise
             mount = json.loads(value["stdout"])["filesystems"][0]
             if role == "A" and self.mode == "ownerfs":
                 assert mount["fstype"] == "ext4", mount

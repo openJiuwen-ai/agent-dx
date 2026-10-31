@@ -36,6 +36,13 @@ Rust源码、`runner_tests/`、缓存和私有环境配置不分发；选择Rust
 默认使用 local-file Meta、真实 mTLS、OwnerFs 本地 egress bind/远端 FUSE、DFS NodeReplicated R1。
 S3、etcd、Redis、RDMA、VM 断电、HA、长稳和性能不在这些基础集合的验收范围。
 
+OwnerFs A的精确bind挂载检查失败时，fixture会追加`ownerfs.bind_diagnostic`记录：
+在同一worker私有mount namespace、匹配所有权token的新临时目录中，逐步探测
+`open_tree`、带NOSUID/NODEV及MS_PRIVATE的`mount_setattr`、`move_mount`。
+若私有传播策略失败，另测不带MS_PRIVATE的控制组，仅用于区分失败条件，不是产品回退或通过依据。
+探针关闭fd后正常卸载，只清理自己的目录；清理失败保留目录并由原worker残留检查拦截。
+无论探针成功或失败，原OwnerFs拓扑失败都保留；它不改变任何业务断言。环境记录同时保存实际内核版本。
+
 ## 输入准备
 
 复制 `fixtures/singlevm.example.json`、`namespaces-3.example.json` 或 `namespaces-4.example.json`

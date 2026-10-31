@@ -66,6 +66,7 @@ class Worker:
         uuid = dmi.read_text().strip() if dmi.exists() else None
         return dict(
             system=platform.system(),
+            kernel=platform.release(),
             machine=platform.machine(),
             uid=os.geteuid(),
             machine_id=machine,
