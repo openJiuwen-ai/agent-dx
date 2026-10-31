@@ -370,6 +370,9 @@ metadata = {
     "normative_html_pages": 1,
     "offline": True,
     "component_integration_implemented": True,
-    "ci_implementation_created": False,
+    "ci_asset_handoff_implemented": True,
+    "ci_component_adapter_implemented": True,
+    "ci_runtime_validated": False,
+    "ci_product_cases_integrated": False,
 }
 print(json.dumps(metadata, ensure_ascii=False, indent=2))

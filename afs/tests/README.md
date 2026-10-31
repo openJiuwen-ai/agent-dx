@@ -1,8 +1,19 @@
 # AFS 组件集成：单 VM 与多 namespace
 
 `run.py` 是第二、三步的共用入口，Python 用例直接位于 `suites/`；已有 Rust
-`*_contract.rs` 和 `support/` 保持原位。本工具不部署完整 ADX、不接 Buildkite、不创建 VM，
+`*_contract.rs` 和 `support/` 保持原位。本工具不部署完整 ADX、不创建流水线或 VM，
 不自动安装依赖、修改主机用户或全局挂载/网络配置。
+
+公共E2E已补测试资产交接：AFS ON时，`build/e2e/prepare.py`及K8s
+`stage_harness()`携带本目录的`run.py`、`suites/`、`fixtures/`运行文件和示例配置，
+放在测试镜像/Pod的`/opt/adx/e2e/afs-tests/`；正式产品包不包含这些测试资产。
+`build/e2e/afs_handoff.py`从候选manifest生成`inputs/artifact-identity.json`，
+验证实际AFS二进制的SHA/架构后建立链接，供后续`--binary-dir .../afs-tests/inputs`使用。
+产品commit与测试harness commit分别记录。CI1另增`fixtures/kubernetes.py`接入，
+公共`build/e2e/kubernetes/run.py --profile full --case afs-component`准备M/A/B Pod和动态环境文件，
+调用同一入口执行5项已有组件用例。K8s角色按namespace/Pod UID、实际worker UID和隔离身份核验，
+不冒充多VM。当前适配已完成本地工具检查，真实K8s执行尚待验证；VM模板不能直接填Pod地址使用。
+Rust源码、`runner_tests/`、缓存和私有环境配置不分发；选择Rust合同还需另交付同架构测试ELF。
 
 ## 运行条件
 
@@ -401,4 +412,5 @@ python3 -m unittest discover -s afs/tests/runner_tests -v
 
 代码提供local/受管namespace/可选SSH适配、matrix调度和全部基础集合；真实通过、旧冻结输入验证、当前源码构建阻塞以及缺少多VM环境
 必须分别登记。当前运行记录见 [五步测试规范](../../docs/testing/test-strategy.md#step-2)，
-AFS技术边界见 [测试合同](../../docs/testing/afs.md)。本入口不调用或宣称已接通第四、五步产品/CI。
+AFS技术边界见 [测试合同](../../docs/testing/afs.md)。K8s组件定向入口与公共产品E2E分开，
+默认冒烟/Full选集未因此扩大；SDK真实使用AFS、强制门禁和全量/长稳均不由此获得通过结论。

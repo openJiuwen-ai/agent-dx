@@ -32,6 +32,8 @@ download_image_artifact() {
 download_image_artifact 'out/buildkite/summaries/images.json'
 echo "--- :kubernetes: Deploy and run public SDK acceptance"
 download_image_artifact 'out/buildkite/bundle/*.json'
+python3 build/e2e/afs_handoff.py verify-bundle \
+  --bundle out/buildkite/bundle/bundle.json --with-afs "${ADX_WITH_AFS:-0}"
 args=(--bundle out/buildkite/bundle/bundle.json --registry-images out/buildkite/bundle/registry-images.json --kubeconfig "$ADX_KUBECONFIG")
 if [[ -n ${ADX_E2E_TARGET_CASE:-} && -n ${ADX_E2E_TARGET_CASES:-} ]]; then
   echo 'Select ADX_E2E_TARGET_CASE or ADX_E2E_TARGET_CASES, not both' >&2

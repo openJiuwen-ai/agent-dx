@@ -59,7 +59,8 @@ class Worker:
             with socket.socket() as sock:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock.bind((address, port))
-        machine = Path("/etc/machine-id").read_text().strip()
+        machine_path = Path('/etc/machine-id')
+        machine = machine_path.read_text().strip() if machine_path.exists() else None
         dmi = Path("/sys/class/dmi/id/product_uuid")
         uuid = dmi.read_text().strip() if dmi.exists() else None
         return dict(
@@ -67,6 +68,7 @@ class Worker:
             machine=platform.machine(),
             uid=os.geteuid(),
             machine_id=machine,
+            pod_uid=os.environ.get('AFS_TEST_POD_UID'),
             product_uuid=uuid,
             boot_id=Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
             filesystem=fs,

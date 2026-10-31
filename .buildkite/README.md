@@ -388,6 +388,47 @@ The Full pipeline requires `ADX_BASE_PACKAGE_BUILD_ID` and `ADX_SDK_BUILD_ID`.
 For an AFS-enabled base candidate, also set `ADX_WITH_AFS=1`; the image
 handoff checks the explicit mode against both manifests and rejects a mismatch.
 Base L0 forwards its build mode through the same verification path.
+
+With AFS ON, `prepare.py` also copies the runtime Python files from `afs/tests/`
+into the node test image at `/opt/adx/e2e/afs-tests/`. It emits
+`out/buildkite/bundle/afs-tests.json`; `bundle.json` binds its SHA256. Existing
+bundle JSON artifact rules carry this sidecar, without adding test files to the
+product release. The manifest records product commit/target, an independent
+harness commit and file hashes. Generated `inputs/artifact-identity.json`
+maps the verified release's AFS binary digests to the existing runner contract.
+During node-image preparation, `afs_handoff.py materialize` checks both actual
+Linux ELF files, architecture, executable modes and hashes before linking them
+into `inputs/`; it never starts AFS or changes the release directory.
+
+Before cluster execution, `run-e2e.sh` checks the downloaded sidecar and candidate
+mode against `ADX_WITH_AFS`. An older ON bundle without the sidecar fails this
+check: reprepare test images from the verified product/SDK inputs with current
+tooling. OFF bundles require no AFS assets or FUSE support. When reusing a
+product image with newer tests, `sync_harness()` transfers the current
+`afs/tests/` assets, replaces only `/opt/adx/e2e/afs-tests/`, verifies both
+identities and actual binary bytes in each test Pod, and records the effective
+AFS manifest beside `harness.json` in acceptance evidence.
+
+This handoff is locally tool-tested; real Buildkite/Kubernetes validation is
+pending. The explicit K8s target `afs-component` now reuses the same AFS runner
+for five component assertions, described below. Real FUSE admission, AFS product
+variants and required smoke/Full results still need runtime evidence or wiring.
+A selected Rust contract still needs a separately
+identified, matching `fuse_contract` test ELF; the handoff does not fabricate one.
+
+For CI1, select the existing Full pipeline with `ADX_WITH_AFS=1`, exact
+`ADX_BASE_PACKAGE_BUILD_ID` / `ADX_SDK_BUILD_ID`, the product's full
+`ADX_E2E_ARTIFACT_COMMIT`, and `ADX_E2E_TARGET_CASE=afs-component`. This is a
+targeted component run, not the default eleven-group product Full. It creates
+three owned M/A/B Pods and runs OwnerFs cross-node read/write and permissions,
+DFS cross-node read/write and visibility, plus topology/normal cleanup. The
+targeted entry uses `afs/tests/run.py`; no business assertions are duplicated.
+AFS ON test images install FUSE tools; OFF images do not. Eligible workers must
+already provide `/dev/fuse` and ext4-backed Pod state. The driver does not load
+host modules, create VMs or modify host-wide state. Full-profile A/B placement
+requires two distinct workers. Component and Kubernetes cleanup results remain
+separate; deleting Pods cannot turn missing normal unmount/exit evidence green.
+
 `platform-images` downloads both immutable candidates by Buildkite build UUID,
 verifies their commits and digests, restores the base package tree and injects
 the independently built SDK wheel into the test image. It then publishes the

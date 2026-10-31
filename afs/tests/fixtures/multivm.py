@@ -12,7 +12,7 @@ import subprocess
 import shutil
 import time
 
-from fixtures import singlevm, ssh, namespaces
+from fixtures import singlevm, ssh, namespaces, kubernetes
 from fixtures.common import Blocked, sha256, write_json
 
 ROLES = ("M", "A", "B", "C")
@@ -20,8 +20,8 @@ NAMES = {"M": "meta", "A": "node-a", "B": "node-b", "C": "node-c"}
 
 
 def validate(config, cases):
-    if config.get("kind") not in ("singlevm", "multivm", "namespaces"):
-        raise ValueError("kind must be singlevm, namespaces or multivm")
+    if config.get("kind") not in ("singlevm", "multivm", "namespaces", "kubernetes"):
+        raise ValueError("kind must be singlevm, namespaces, multivm or kubernetes")
     for field in ("uid", "gid", "other_uid", "other_gid"):
         if not isinstance(config.get(field), int) or config[field] <= 0:
             raise ValueError("explicit positive numeric identity required: " + field)
@@ -51,8 +51,10 @@ def validate(config, cases):
     for name, host in hosts.items():
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name):
             raise ValueError("unsafe host ID")
-        if host.get("transport") not in ("local", "ssh", "exec"):
+        if host.get("transport") not in ("local", "ssh", "exec", "kubernetes"):
             raise ValueError("unknown transport on " + name)
+        if config['kind'] == 'kubernetes' and host.get('transport') != 'kubernetes':
+            raise ValueError('Kubernetes topology requires Kubernetes role transport')
         base = Path(host.get("base", ""))
         if (
             not base.is_absolute()
@@ -62,7 +64,7 @@ def validate(config, cases):
         ):
             raise ValueError("host base must be a dedicated existing absolute directory")
     selected_hosts = [roles[r]["host"] for r in needed]
-    if config["kind"] in ("multivm", "namespaces"):
+    if config["kind"] in ("multivm", "namespaces", "kubernetes"):
         if len(set(selected_hosts)) != len(needed):
             raise Blocked("multivm requires a distinct guest for every selected role")
         if any(any(t.startswith("local-") for t in c.tags) for c in cases):
@@ -151,7 +153,8 @@ class Cluster:
         for host in sorted(hosts):
             cfg = self.config["hosts"][host]
             try:
-                connector = {"local": singlevm.connect, "ssh": ssh.connect, "exec": namespaces.connect}[
+                connector = {"local": singlevm.connect, "ssh": ssh.connect, "exec": namespaces.connect,
+                             "kubernetes": kubernetes.connect}[
                     cfg["transport"]
                 ]
                 self.channels[host] = connector(cfg)
@@ -162,6 +165,10 @@ class Cluster:
                     for port in self.ports(r)
                 ]
                 info = self.channels[host].call("inspect", base=cfg["base"], listeners=listeners)
+                if self.config['kind'] == 'kubernetes':
+                    if info.get('pod_uid') != cfg['pod_uid']:
+                        raise Blocked('worker Pod identity differs from the frozen Kubernetes role')
+                    info['kubernetes'] = self.channels[host].kubernetes_identity
             except (OSError, RuntimeError) as exc:
                 raise Blocked("cannot establish selected worker prerequisites: " + str(exc)) from exc
             infos[host] = info
@@ -174,7 +181,7 @@ class Cluster:
             uuids = [v["product_uuid"] for v in infos.values()]
             boots = [v["boot_id"] for v in infos.values()]
             distinct_boots = len(set(boots)) == len(boots)
-            distinct_ids = len(set(ids)) == len(ids)
+            distinct_ids = all(ids) and len(set(ids)) == len(ids)
             distinct_uuids = all(uuids) and len(set(uuids)) == len(uuids)
             if not distinct_boots or not (distinct_ids or distinct_uuids):
                 raise Blocked(
@@ -186,6 +193,15 @@ class Cluster:
             for field in ("network_namespace", "pid_namespace", "mount_namespace"):
                 if len({v[field] for v in infos.values()}) != len(infos):
                     raise Blocked("role namespace isolation is missing: " + field)
+        if self.config['kind'] == 'kubernetes':
+            pod_ids = [v['kubernetes']['pod_uid'] for v in infos.values()]
+            if len(set(pod_ids)) != len(infos):
+                raise Blocked('distinct Kubernetes role Pod UIDs are required')
+            if len({v['kubernetes']['namespace_uid'] for v in infos.values()}) != 1:
+                raise Blocked('Kubernetes role namespace identity differs')
+            for field in ('network_namespace', 'pid_namespace', 'mount_namespace'):
+                if len({(v['boot_id'], v[field]) for v in infos.values()}) != len(infos):
+                    raise Blocked('Kubernetes role namespace isolation is missing: ' + field)
         self.infos = infos
         write_json(
             self.output / "environment.json",
