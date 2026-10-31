@@ -23,7 +23,10 @@
   4. 新增 **存量 `/home/agentos/users` 迁移**前置条件（§6.4）；
   5. 保留 D5（target 带 epoch），**不引入 home 侧稳定名**——理由见 §7.3；
   6. 明确 `ListActiveOutletRoots` 会返回死 home 的 root（recovery 语义不做
-     存活过滤），消费方不得据此推断 home 活着（§4.4）。
+     存活过滤），消费方不得据此推断 home 活着（§4.4）；
+  7. 新增 **§6.5 NFS 导出绕过 AFS 授权**与 **H18 整树导出**——数据面不经过
+     `afs-node`，`validate_peer_root_access` 不参与，可见性边界由
+     `/etc/exports` 决定（R8）。
 
 ## 1. 需求概述
 
@@ -336,6 +339,55 @@ worker，否则会因 tmpfs 覆盖而丢失用户数据。
 
 迁移时点与灰度方式见 R6（开放问题）。
 
+### 6.5 NFS 导出绕过 AFS 授权（重要边界）
+
+**事实**：B 侧对 `/public/<name>` 的读写不经过 `afs-node`。数据路径是
+
+```
+B 容器 → 内核 NFS client → A 的内核 nfsd → A 的本地 ext4
+```
+
+`afs-node` 进程全程不在数据路径上。因此 AFS 的授权校验
+（`validate_peer_root_access` → `Meta.ValidateRootAccess`）**完全不参与**，
+B 侧也不需要、不会获得任何 `RootGrant`。
+
+**代码级依据**（供审查复核）：
+
+- `validate_peer_root_access`（`root.rs:715`）的唯一入口是 P2P gRPC handler
+  （`node/rpc/data.rs`）经 `OwnerFs::{lookup,getattr,read,write}(peer_node_id,
+  access: &PresentedRootAccess, ...)` 调用；所有调用点都是 `peer_*` 函数。
+- 该函数的第一个参数是 `PresentedRootAccess`，含 `fencing_token`、
+  `access_generation`、`holder_session_id` 等字段。NFS 协议（filehandle +
+  AUTH_SYS/Kerberos）**没有位置携带该结构**。
+- AFS 不实现 nfsd（`afs/src/` 无 `nfsd`/`exportfs`/`mountd` 代码），也不执行
+  非 bind 的挂载（`bind_mount.rs` 的 `libc::mount` 第三参数恒为 `null`，
+  只用 `MS_BIND`/`MS_PRIVATE`）。
+
+**推论一（授权面不变）**：B 在 AFS 的授权模型里始终是"未被 grant 的 peer"。
+`access_generation`、`fencing_token`、`revoke` 语义均不受影响。B 能读到数据
+的唯一原因是部署方在 A 的 `/etc/exports` 中导出了该目录——这是**基础设施层
+的权限决定，不是 AFS 的授权决定**。
+
+**推论二（导出范围即可见性边界）**：既然 NFS 绕过 AFS 授权，那么
+`/etc/exports` 的导出粒度就是**实际生效的可见性边界**，无法由 AFS 收紧。
+
+**硬规则 H18**：导出单位必须是整个 `users_root`（整树导出），
+不得按 workspace 逐个导出。理由与后果：
+
+- 当前设计不存在"按节点过滤 workspace 可见性"的语义——名字面就是
+  Meta Active 集合，所有节点看到同一份（§3.1、§4.4）。整树导出与此**自洽**。
+- 因此 **H18 的前提是"不做 per-node 可见性"**。若将来需要"某 workspace 只对
+  某些节点可见"，该需求**无法在 NFS 层实现**，必须在 AFS 的 P2P 路径上做，
+  或改用能表达 per-client 可见性的传输——这会推翻本规范的数据面选择。
+  届时按新需求另立规范，不在本设计上加装。
+
+需部署方确认的两点：
+
+1. `/etc/exports` 的客户端范围应等于集群成员集合（默认 `*(ro,sync,
+   no_subtree_check)` 或按成员 IP 列举，二选一由运维决定）；
+2. **不得对非成员主机导出**。NFS 层没有 workspace 级授权，导出范围一旦放宽，
+   等同把全部 workspace 数据面暴露给该主机。
+
 ## 7. 消费方契约
 
 ### 7.1 挂载方式
@@ -492,7 +544,7 @@ generation_grace_ms = 120000         # 可选，默认 120000；H11 旧代目录
 | T2 | mountinfo 诊断 | 解析 + 三类告警（缺失/类型漂移/tmpfs 校验） | 纯函数测试（构造 mountinfo 文本） |
 | T3 | 镜像 worker | diff 纯函数 + 收敛循环 + `unchanged` 短路（H14）+ 原子放置 + ghost 隔离 + staging 清扫 | 纯函数表驱动测试（§12 TC1-TC7 的离线版）+ `unchanged` 分支测试 |
 | T4 | 配置与接线 | 三路径 all-or-none 校验、`node.rs` 启动接线、`[outlet_mirror]`、H11 取值校验 | 配置校验测试、启动 fail-fast 测试、grace 下限校验测试 |
-| T5 | 部署资产 | 两节点部署脚本（fstab 示例含 `softerr` 等参数、nfsd 导出示例、挂载点 0555）、`docs/deployment/afs.md`、架构文档、README、**存量迁移步骤（H17）** | `python3 build/docs/check.py`、`git diff --check` |
+| T5 | 部署资产 | 两节点部署脚本（fstab 示例含 `softerr` 等参数、nfsd 导出示例含**导出 IP 与成员表一致性检查**、挂载点 0555）、`docs/deployment/afs.md`、架构文档、README、**存量迁移步骤（H17）** | `python3 build/docs/check.py`、`git diff --check`、导出范围核对脚本（TC20） |
 | T6 | 双节点运行验证 | §12 全部用例 | 验证报告（明确"非多 VM/HA 证明"的边界声明） |
 
 提交按 conventional commits + 单条 Signed-off-by；T1-T4 一组（行为），
@@ -521,6 +573,8 @@ T5-T6 一组（资产与证据），不混入无关变更。
 | TC16 | `unchanged` 短路（H14） | 构造 `unchanged=true` 但 `/public` 有 symlink：**不得**被清除；`/public` 内容逐字节不变 |
 | TC17 | 服务端 `unchanged` 判定 | 首次请求（`known=0`）返回全量 + `root_revision=N`；再请求 `known=N` 返回 `unchanged`；Root 变更后 `known=N` 返回全量 + `root_revision>N` |
 | TC18 | H11 取值约束 | `interval_ms` 或 `actimeo` 调大至违反 `grace ≥ max(interval×10, actimeo×2)` 时，启动失败并指明约束 |
+| TC19 | NFS 路径不经 AFS 授权（§6.5) | 在 B 上对 `/public/<name>` 做 IO：A 的 `afs-node` 日志无 `validate_root_access` / `ValidateRootAccess` 调用；B 侧无任何 `RootGrant` |
+| TC20 | 导出范围核对（H18） | 部署检查脚本：`/etc/exports` 的客户端集合与成员表一致；加入非成员 IP 时脚本报错 |
 
 ## 13. 风险与开放问题
 
@@ -549,3 +603,13 @@ T5-T6 一组（资产与证据），不混入无关变更。
   退化"的地方——误用全局 `revision` 不会报错，只会让校验位恒失配、
   流量退化为 2.4 MB/s。缓解：TC15 用例 + 代码注释指向本节。审查时须
   特别核对递增条件的作用域。
+- **R8 NFS 导出即可见性边界（H18，接受）**：NFS 数据面绕过 AFS 授权
+  （§6.5），因此 AFS 无法对 B 侧访问做 workspace 级授权，
+  `access_generation` / `fencing_token` / `revoke` 对 NFS 路径无效。
+  当前设计中这**不构成矛盾**（不存在 per-node 可见性语义）。真正的风险是
+  **导出范围被放宽**：一旦 `/etc/exports` 包含非成员主机，等同把所有
+  workspace 数据暴露给它，且 AFS 侧无从察觉（数据路径上无 AFS 组件）。
+  缓解：H18 写入部署合同；部署检查脚本核对导出 IP 列表与成员表一致
+  （T5 交付物）。此项**无法在代码层防御**，属部署合同风险。
+  若未来需要 per-node 可见性或 workspace 级撤权即时生效，必须放弃 NFS
+  数据面，改走 AFS P2P 路径——那会重新引入本规范刻意舍弃的探针与门禁成本。
