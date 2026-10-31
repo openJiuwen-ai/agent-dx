@@ -38,6 +38,58 @@ Profiles are explicit:
   the two platform Pods to be placed on distinct physical workers. Actual Pod
   to worker placement is checked after scheduling and retained as evidence.
 
+## AFS component target (CI1)
+
+`--profile full --case afs-component` is an explicit component diagnostic;
+it does not expand the default L0 or eleven-group Full product profiles. It
+requires an AFS ON bundle with the test-asset sidecar. Buildkite Full #73 exposed OwnerFs bind activation failure. With the fixed
+product from Base #223, Full #76 passed all five real component assertions and
+normal AFS/Kubernetes cleanup. The production fix is delivered separately in
+[MR !126](https://gitcode.com/openJiuwen/agent-dx/merge_requests/126); this test
+integration requires an appropriate fixed candidate on affected kernels.
+See the [canonical strategy](../../../docs/testing/test-strategy.md#step-4) for identities and evidence boundaries.
+
+```sh
+python3 build/e2e/kubernetes/run.py \
+  --bundle /path/to/bundle/bundle.json \
+  --registry-images /path/to/bundle/registry-images.json \
+  --kubeconfig /path/to/target-kubeconfig \
+  --profile full --case afs-component --output /absolute/new-afs-result
+```
+
+The controller supports the existing Linux Python 3.8+ deployer, openssl and kubectl; role Pods use the ON image Python 3.12 runtime. Tool contract tests are shipped
+as hashed test assets and run in the M Pod after harness synchronization; they
+do not require tomllib on the Python 3.8 controller. Runtime tools needed by
+suite discovery are included even when performance cases are not selected. It uses the existing
+registry/kubeconfig path to create three privileged role Pods (M/A/B) from the
+verified node test image. Each has only its own emptyDir and the host FUSE
+character device; no host data root, service-account credential, SSH access or
+developer VM is mounted. State must resolve to native ext4 with at least 1 GiB
+free per role. Workers must already supply `/dev/fuse`; a missing device or
+unsupported filesystem blocks the run. Only ON test images install fuse3 and
+util-linux. The driver does not change host modules or storage configuration.
+
+The current harness and AFS inputs are verified on every Pod. Dynamic environment
+configuration freezes namespace/Pod UIDs and IPs; the worker's Downward API Pod
+UID is checked again after exec. Network/PID/mount identity is validated within
+each actual kernel, without treating Pods as VMs. A/B must land on distinct K8s
+workers for this Full-profile target; M can share a worker.
+
+The target runs Linux runner tool contracts, then calls the existing
+`afs/tests/run.py` with exactly `ownerfs.cluster.read_write`,
+`ownerfs.cluster.permissions`, `dfs.cluster.read_write`,
+`dfs.cluster.visibility` and `cluster.topology_cleanup`. These use real Meta and
+Node processes, mTLS, OwnerFs bind/remote FUSE and DFS FUSE; content, permissions,
+remote-read counters and normal cleanup remain the original assertions.
+
+Inspect `afs/result.json`, each case's `checks.json`, `environment.json`,
+`waits.json` and `cleanup.json`, plus `placement.json`, `harness.json`,
+`afs-tests.json` and `kubernetes-cleanup.json`. All five selected cases must
+execute and pass; missing, failed or blocked cases fail the targeted job. AFS
+normal process/unmount cleanup and owned namespace deletion are independently
+required. This is component evidence, not SDK-on-AFS, complete AFS Full,
+cross-VM failure, durability soak or performance evidence.
+
 ## Target cluster prerequisites
 
 The target cluster is separate from the Kubernetes cluster that hosts the

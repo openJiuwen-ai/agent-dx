@@ -317,8 +317,8 @@ page = (
         'on">打印／PDF</button></div></header>\n<section class="hero"><div class='
         '"eyebrow">已确认规范 · 单页收敛</div><h1>ADX／AFS 五步测试规范</h1><p class="lead">开'
         '发自检 → 共享CI门禁 → 固定包验收</p><div class="meta"><span class="pill">第二/三步基础'
-        '已实现 · CI/产品接线待补</span><span class="pill neutral">2026-10-31</span><s'
-        'pan class="pill neutral">事实基线 1e9ae5f2</span></div></section>\n<secti'
+        '已实现 · CI1组件已通过</span><span class="pill neutral">2026-11-01</span><s'
+        'pan class="pill neutral">候选 00f1695b</span></div></section>\n<secti'
         'on class="principles" aria-labelledby="principles-title"><h2 id="pri'
         'nciples-title">先把五步逻辑讲清楚</h2>'
     )
@@ -349,7 +349,7 @@ page = (
     + """<p id="empty" class="empty" hidden>没有匹配的步骤，请调整关键词。</p></section>"""
     + reference
     + (
-        "<footer><span>第二/三步基础已实现并验证 · 第四/五步CI与产品接线未实施</span>"
+        "<footer><span>CI1组件闭环已通过 · SDK产品与必需门禁待补</span>"
         "<span>源码已有断言、历史通过与当前实测分别登记</span></footer></main><script>"
     )
     + script
@@ -370,6 +370,10 @@ metadata = {
     "normative_html_pages": 1,
     "offline": True,
     "component_integration_implemented": True,
-    "ci_implementation_created": False,
+    "ci_asset_handoff_implemented": True,
+    "ci_component_adapter_implemented": True,
+    "ci_runtime_validated": True,
+    "ci_runtime_scope": "Full #76 targeted AFS components only; product and required gate pending",
+    "ci_product_cases_integrated": False,
 }
 print(json.dumps(metadata, ensure_ascii=False, indent=2))

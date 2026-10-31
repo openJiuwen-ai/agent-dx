@@ -32,6 +32,9 @@ ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('release_package', ROOT / 'build/release/package.py')
 package = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(package)
+afs_spec = importlib.util.spec_from_file_location('afs_handoff', ROOT / 'build/e2e/afs_handoff.py')
+afs_handoff = importlib.util.module_from_spec(afs_spec)
+afs_spec.loader.exec_module(afs_handoff)
 BACKEND_BINARIES = ('sandboxd', 'sbox', 'runc', 'runc-shim', 'sandbox-logger', 'redis-cli')
 
 
@@ -118,6 +121,11 @@ def main():
     a = p.parse_args()
     a.output.mkdir(parents=True, exist_ok=False)
     manifest = package.verify(a.package)
+    harness_commit = None
+    if afs_handoff.enabled(manifest):
+        harness_commit = os.getenv('BUILDKITE_COMMIT') or subprocess.check_output(
+            [_executable('git'), '-C', str(ROOT), 'rev-parse', 'HEAD'], text=True,
+        ).strip()
     runsc_sha256 = verify_runsc(a.runsc_bin, manifest['target']) if a.runsc_bin else None
     expected_commit = os.getenv('ADX_E2E_ARTIFACT_COMMIT', os.getenv('BUILDKITE_COMMIT', manifest['commit']))
     sdk = verify_sdk(a.sdk_wheel, a.sdk_candidate, expected_commit)
@@ -175,6 +183,11 @@ def main():
         shutil.copytree(ROOT / 'build/e2e', context / 'e2e', ignore=shutil.ignore_patterns('__pycache__', 'tests'))
         shutil.copy2(ROOT / 'build/ci/rpc_certificates.py', context / 'e2e/rpc_certificates.py')
         shutil.copy2(ROOT / 'build/release/package.py', context / 'e2e/package.py')
+        if afs_handoff.enabled(manifest):
+            afs_handoff.stage(ROOT / 'afs/tests', context / 'e2e/afs-tests', manifest, harness_commit)
+            shutil.copyfile(context / 'e2e/afs-tests/manifest.json', a.output / 'afs-tests.json')
+            for name in afs_handoff.BINARIES:
+                (context / 'package/bin' / name).chmod(0o755)
         if fc_kit:
             for name in fc_kit['files']:
                 output = context / 'fc-kit' / name
@@ -197,6 +210,19 @@ def main():
                 '/sdk/*.whl\nWORKDIR /opt/adx\nCMD ["sleep", "infinity"]\n'
             )
         )
+        if afs_handoff.enabled(manifest):
+            command = [
+                'python3', '/opt/adx/e2e/afs_handoff.py', 'materialize',
+                '--assets', '/opt/adx/e2e/afs-tests', '--package', '/opt/adx/package',
+                '--harness-commit', harness_commit, '--product-commit', manifest['commit'],
+                '--target', manifest['target'],
+            ]
+            with (context / 'Dockerfile.node').open('a') as dockerfile:
+                dockerfile.write(
+                    'RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y '
+                    '--no-install-recommends fuse3 util-linux && rm -rf /var/lib/apt/lists/*\n'
+                )
+                dockerfile.write('RUN ' + json.dumps(command) + '\n')
         if a.runsc_bin:
             with (context / 'Dockerfile.node').open('a') as dockerfile:
                 dockerfile.write('COPY runsc /usr/local/bin/runsc\n')
@@ -299,6 +325,8 @@ def main():
         'base_images': {'node': a.runtime_base, 'execd': a.execd_base},
     }
     result['collector'] = {**collector, 'image': collector_image}
+    if afs_handoff.enabled(manifest):
+        result['afs_tests'] = {'manifest': 'afs-tests.json', 'sha256': sha(a.output / 'afs-tests.json')}
     if a.activator:
         result['activator_archive_sha256'] = sha(a.output / 'activator.tar')
     if a.workload_probes:

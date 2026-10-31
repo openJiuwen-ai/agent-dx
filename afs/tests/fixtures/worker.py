@@ -36,9 +36,10 @@ class Worker:
 
     def owned(self, value):
         path = Path(value)
-        if self.root is None or not path.is_absolute() or not path.is_relative_to(self.root):
+        if self.root is None or not path.is_absolute() or not (path == self.root or self.root in path.parents):
             raise ValueError("path is outside this worker run")
-        if not path.resolve().is_relative_to(self.root.resolve()):
+        resolved, root = path.resolve(), self.root.resolve()
+        if not (resolved == root or root in resolved.parents):
             raise ValueError("resolved path escapes this worker run")
         if ".." in path.parts:
             raise ValueError("parent traversal is forbidden")
@@ -61,14 +62,17 @@ class Worker:
             with socket.socket() as sock:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock.bind((address, port))
-        machine = Path("/etc/machine-id").read_text().strip()
+        machine_path = Path('/etc/machine-id')
+        machine = machine_path.read_text().strip() if machine_path.exists() else None
         dmi = Path("/sys/class/dmi/id/product_uuid")
         uuid = dmi.read_text().strip() if dmi.exists() else None
         return dict(
             system=platform.system(),
+            kernel=platform.release(),
             machine=platform.machine(),
             uid=os.geteuid(),
             machine_id=machine,
+            pod_uid=os.environ.get('AFS_TEST_POD_UID'),
             product_uuid=uuid,
             boot_id=Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
             filesystem=fs,

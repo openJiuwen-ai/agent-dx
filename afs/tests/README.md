@@ -1,8 +1,23 @@
 # AFS 组件集成：单 VM 与多 namespace
 
 `run.py` 是第二、三步的共用入口，Python 用例直接位于 `suites/`；已有 Rust
-`*_contract.rs` 和 `support/` 保持原位。本工具不部署完整 ADX、不接 Buildkite、不创建 VM，
+`*_contract.rs` 和 `support/` 保持原位。本工具不部署完整 ADX、不创建流水线或 VM，
 不自动安装依赖、修改主机用户或全局挂载/网络配置。
+
+公共E2E已补测试资产交接：AFS ON时，`build/e2e/prepare.py`及K8s
+`stage_harness()`携带本目录的`run.py`、`suites/`、`fixtures/`、`tools/`及`runner_tests/`的Python文件和示例配置，
+放在测试镜像/Pod的`/opt/adx/e2e/afs-tests/`；正式产品包不包含这些测试资产。
+`build/e2e/afs_handoff.py`从候选manifest生成`inputs/artifact-identity.json`，
+验证实际AFS二进制的SHA/架构后建立链接，供后续`--binary-dir .../afs-tests/inputs`使用。
+产品commit与测试harness commit分别记录。CI1另增`fixtures/kubernetes.py`接入，
+公共`build/e2e/kubernetes/run.py --profile full --case afs-component`准备M/A/B Pod和动态环境文件，
+调用同一入口执行5项已有组件用例。CI控制端兼容既有ADX deployer的Python3.8；Pod worker沿用测试镜像的Python3.12，VM路径仍按下文3.10+准备。
+K8s角色按namespace/Pod UID、实际worker UID和隔离身份核验，
+不冒充多VM。适配已用Base #223新候选在Buildkite Full #76定向跑通原5项；旧#73/#75的OwnerFs准备失败保留。
+这只覆盖K8s组件闭环，不代表SDK产品路径或默认必需门禁已接；VM模板不能直接填Pod地址使用。
+工具合同在同步后的M Pod内使用Python3.12执行，避免把新测试的tomllib依赖加到Python3.8控制端。
+这些都是AFS ON测试资产，不进入产品包；Rust源码、缓存和私有环境配置不分发。
+选择Rust合同还需另交付同架构测试ELF。
 
 ## 运行条件
 
@@ -25,6 +40,22 @@
 应用数据持续加密以有效`tls_encryption_enabled`配置为准，当前生产默认关闭；证书认证不代表正文持续加密。
 实际解析配置保留在每例证据中，不为说明文字调整运行模式。
 S3、etcd、Redis、RDMA、VM 断电、HA、长稳和性能不在这些基础集合的验收范围。
+
+OwnerFs A的精确bind挂载检查失败时，fixture会追加`ownerfs.bind_diagnostic`记录：
+在同一worker私有mount namespace、匹配所有权token的新临时目录中，逐步探测
+`open_tree`、带NOSUID/NODEV及MS_PRIVATE的`mount_setattr`、`move_mount`。
+若私有传播策略失败，另测不带MS_PRIVATE的控制组，仅用于区分失败条件，不是产品回退或通过依据。
+若仅缺少`mount_setattr`，诊断按产品路径继续`move_mount`和旧接口补属性，
+比较被覆盖的原target fd与已附着的tree fd；控制组只修改本次bind的挂载属性，不改变业务结果。
+探针关闭fd后正常卸载，只清理自己的目录；清理失败保留目录并由原worker残留检查拦截。
+无论探针成功或失败，原OwnerFs拓扑失败都保留；它不改变任何业务断言。环境记录同时保存实际内核版本。
+真实OwnerFs bind还须有NOSUID、NODEV和private传播属性；有挂载但策略不符同样失败。
+Linux5.10兼容修复由[MR !126](https://gitcode.com/openJiuwen/agent-dx/merge_requests/126)独立交付：
+根据#75诊断，对已附着tree应用/回滚旧接口策略，并用MS_BIND限制remount。
+本CI0/CI1接线不包含该生产修复；此内核运行OwnerFs须选择已包含修复的候选（如以下#223），或待其合入后重新出包。
+Base #223（产品commit `00f1695b`）完成Linux编译、AFS2058项测试通过／58项ignored，
+Full #76用同一新包和原5项业务断言通过；拓扑同时强制检查上述挂载策略。
+旧失败与探针对照、组件功能和公共SDK产品结果分开记录，详见[原总规范第四步](../../docs/testing/test-strategy.md#step-4)。
 
 ## 输入准备
 
@@ -404,7 +435,8 @@ python3 -m unittest discover -s afs/tests/runner_tests -v
 
 代码提供local/受管namespace/可选SSH适配、matrix调度和全部基础集合；真实通过、旧冻结输入验证、当前源码构建阻塞以及缺少多VM环境
 必须分别登记。当前运行记录见 [五步测试规范](../../docs/testing/test-strategy.md#step-2)，
-AFS技术边界见 [测试合同](../../docs/testing/afs.md)。本入口不调用或宣称已接通第四、五步产品/CI。
+AFS技术边界见 [测试合同](../../docs/testing/afs.md)。K8s组件定向入口与公共产品E2E分开，
+默认冒烟/Full选集未因此扩大；SDK真实使用AFS、强制门禁和全量/长稳均不由此获得通过结论。
 
 ## 读写专项与性能资产
 
