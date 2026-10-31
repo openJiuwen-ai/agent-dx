@@ -1,0 +1,41 @@
+{
+  "kind": "multivm",
+  "uid": 10001,
+  "gid": 10001,
+  "other_uid": 10002,
+  "other_gid": 10002,
+  "roles": {
+    "M": {
+      "host": "vm-m",
+      "address": "192.0.2.10"
+    },
+    "A": {
+      "host": "vm-a",
+      "address": "192.0.2.11"
+    },
+    "B": {
+      "host": "vm-b",
+      "address": "192.0.2.12"
+    }
+  },
+  "hosts": {
+    "vm-m": {
+      "transport": "ssh",
+      "base": "/var/tmp/afs-integration",
+      "ssh_target": "vm-m",
+      "sudo": true
+    },
+    "vm-a": {
+      "transport": "ssh",
+      "base": "/var/tmp/afs-integration",
+      "ssh_target": "vm-a",
+      "sudo": true
+    },
+    "vm-b": {
+      "transport": "ssh",
+      "base": "/var/tmp/afs-integration",
+      "ssh_target": "vm-b",
+      "sudo": true
+    }
+  }
+}

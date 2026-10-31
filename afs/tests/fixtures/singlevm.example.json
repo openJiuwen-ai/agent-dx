@@ -1,0 +1,31 @@
+{
+  "kind": "singlevm",
+  "uid": 10001,
+  "gid": 10001,
+  "other_uid": 10002,
+  "other_gid": 10002,
+  "roles": {
+    "M": {
+      "host": "guest",
+      "address": "127.0.0.1"
+    },
+    "A": {
+      "host": "guest",
+      "address": "127.0.0.2"
+    },
+    "B": {
+      "host": "guest",
+      "address": "127.0.0.3"
+    },
+    "C": {
+      "host": "guest",
+      "address": "127.0.0.4"
+    }
+  },
+  "hosts": {
+    "guest": {
+      "transport": "local",
+      "base": "/var/tmp/afst/local"
+    }
+  }
+}
