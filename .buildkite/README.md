@@ -409,8 +409,8 @@ product image with newer tests, `sync_harness()` transfers the current
 identities and actual binary bytes in each test Pod, and records the effective
 AFS manifest beside `harness.json` in acceptance evidence.
 
-This handoff is locally tool-tested; real Buildkite/Kubernetes validation is
-pending. The explicit K8s target `afs-component` now reuses the same AFS runner
+Full #72 verified this handoff in the real image build; #73 verified the
+current harness with those images in Kubernetes. The explicit K8s target `afs-component` now reuses the same AFS runner
 for five component assertions, described below. Real FUSE admission, AFS product
 variants and required smoke/Full results still need runtime evidence or wiring.
 A selected Rust contract still needs a separately

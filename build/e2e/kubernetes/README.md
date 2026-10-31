@@ -42,8 +42,9 @@ Profiles are explicit:
 
 `--profile full --case afs-component` is an explicit component diagnostic;
 it does not expand the default L0 or eleven-group Full product profiles. It
-requires an AFS ON bundle with the test-asset sidecar. Current code is locally
-tool-tested; real K8s execution is pending.
+requires an AFS ON bundle with the test-asset sidecar. Buildkite Full #73 exercised this target: two DFS assertions passed; three
+OwnerFs cases failed during bind preparation. Overall acceptance has not passed.
+See the [canonical strategy](../../../docs/testing/test-strategy.md#step-4) for identities and evidence boundaries.
 
 ```sh
 python3 build/e2e/kubernetes/run.py \
