@@ -269,6 +269,70 @@ pub trait RootMeta: Send + Sync {
         record: &super::catalog::LocalRootRecord,
         new_session_id: &str,
     ) -> Result<RootGrant>;
+    /// Global snapshot of Active roots, for the cross-node outlet mirror.
+    ///
+    /// `known_digest` is the digest the caller already holds; `Some` lets Meta
+    /// answer `unchanged` without a payload. This is a read-only projection:
+    /// it issues no grant and confers no authority.
+    ///
+    /// Default is UNIMPLEMENTED so existing in-process implementations keep
+    /// compiling; the gRPC client overrides it.
+    fn list_active_outlet_roots(&self, known_digest: Option<&str>) -> Result<ActiveOutletRoots> {
+        let _ = known_digest;
+        Err(Error::coded(
+            afs_error::META_STORE_UNIMPLEMENTED,
+            "RootMeta outlet snapshot lookup is not wired",
+        ))
+    }
+}
+
+/// Global snapshot of Active roots as seen by one outlet mirror.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ActiveOutletRoots {
+    /// Ordered by `root_id`. Empty when `unchanged` is true — callers must
+    /// keep their previous snapshot rather than interpreting this as "no roots".
+    pub roots: Vec<OutletRoot>,
+    /// Digest of the returned set; a pure function of the triples below.
+    pub digest: String,
+    /// True when the caller's `known_digest` matched and `roots` was omitted.
+    pub unchanged: bool,
+}
+
+impl ActiveOutletRoots {
+    /// Interpret a reply against a cached snapshot.
+    ///
+    /// `unchanged` replies carry no payload by design, so a caller that needs
+    /// the roots must keep them from the previous round. Folding that rule into
+    /// one function keeps callers from mistaking an empty `roots` for "Meta has
+    /// no active roots", which would wipe the public directory (spec H14).
+    pub fn merge_into(&self, cached: Vec<OutletRoot>) -> Vec<OutletRoot> {
+        if self.unchanged {
+            cached
+        } else {
+            self.roots.clone()
+        }
+    }
+}
+
+/// One Active root as the outlet mirror needs it.
+///
+/// Deliberately excludes `home_session_id`: the mirror never reads it, and it
+/// is roughly a third of the payload. Consumers that need session liveness use
+/// `list_owner_roots` instead.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutletRoot {
+    pub root_id: RootId,
+    pub root_epoch: u64,
+    pub home_node_id: String,
+}
+
+impl OutletRoot {
+    /// Stable ordering key. `RootId` does not implement `Ord`, and the mirror
+    /// only needs a deterministic order for reproducible diffs, so compare the
+    /// raw identifier rather than widening the id type's contract.
+    pub fn sort_key(&self) -> &str {
+        &self.root_id.0
+    }
 }
 
 /// 缓存中的一个本机根；只在 Meta 已激活且身份校验通过后发布。
@@ -1888,7 +1952,11 @@ pub fn root_id_from_name(name: &OsStr) -> Result<RootId> {
     Ok(RootId(format!("root-{}", hex(bytes))))
 }
 
-fn root_data_dir(name: &OsStr, epoch: u64) -> Result<StoragePath> {
+/// Physical data directory for a root generation: `root-<hex(name)>-e<epoch>`.
+///
+/// `pub(crate)` so the outlet mirror can cross-check its path formula against
+/// this function instead of duplicating the encoding.
+pub(crate) fn root_data_dir(name: &OsStr, epoch: u64) -> Result<StoragePath> {
     let bytes = name.as_bytes();
     StoragePath::new(format!("root-{}-e{epoch}", hex(bytes))).map_err(Error::from)
 }

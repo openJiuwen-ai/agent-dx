@@ -27,6 +27,8 @@ pub mod gc;
 mod native_prefetch;
 #[cfg(feature = "ownerfs")]
 mod native_workspace;
+#[cfg(feature = "ownerfs")]
+pub mod outlet;
 #[cfg(feature = "dfs")]
 pub mod peer_cache;
 mod read_activity;
