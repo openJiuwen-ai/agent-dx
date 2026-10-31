@@ -40,13 +40,16 @@ Profiles are explicit:
 
 ## AFS component target (CI1)
 
-`--profile full --case afs-component` is an explicit component diagnostic;
+`--profile full --case afs-component` is an explicit component target;
 it does not expand the default L0 or eleven-group Full product profiles. It
 requires an AFS ON bundle with the test-asset sidecar. Buildkite Full #73 exposed OwnerFs bind activation failure. With the fixed
 product from Base #223, Full #76 passed all five real component assertions and
 normal AFS/Kubernetes cleanup. The production fix is delivered separately in
 [MR !126](https://gitcode.com/openJiuwen/agent-dx/merge_requests/126); this test
 integration requires an appropriate fixed candidate on affected kernels.
+The independently published test source at `817078f4` was revalidated by Full #77
+with freshly prepared images, fixed product/SDK #223, 62 M Pod tool contracts and
+all five component cases plus normal AFS/Kubernetes cleanup passing.
 See the [canonical strategy](../../../docs/testing/test-strategy.md#step-4) for identities and evidence boundaries.
 
 ```sh

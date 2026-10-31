@@ -14,6 +14,7 @@
 调用同一入口执行5项已有组件用例。CI控制端兼容既有ADX deployer的Python3.8；Pod worker沿用测试镜像的Python3.12，VM路径仍按下文3.10+准备。
 K8s角色按namespace/Pod UID、实际worker UID和隔离身份核验，
 不冒充多VM。适配已用Base #223新候选在Buildkite Full #76定向跑通原5项；旧#73/#75的OwnerFs准备失败保留。
+本次最新master独立接线在Full #77重新准备镜像，M Pod工具62/62、原5项及正常清理通过；测试commit817078f4、固定产品/SDK仍为#223。
 这只覆盖K8s组件闭环，不代表SDK产品路径或默认必需门禁已接；VM模板不能直接填Pod地址使用。
 工具合同在同步后的M Pod内使用Python3.12执行，避免把新测试的tomllib依赖加到Python3.8控制端。
 这些都是AFS ON测试资产，不进入产品包；Rust源码、缓存和私有环境配置不分发。

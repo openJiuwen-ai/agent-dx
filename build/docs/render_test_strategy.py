@@ -373,7 +373,7 @@ metadata = {
     "ci_asset_handoff_implemented": True,
     "ci_component_adapter_implemented": True,
     "ci_runtime_validated": True,
-    "ci_runtime_scope": "Full #76 targeted AFS components only; product and required gate pending",
+    "ci_runtime_scope": "Full #77 targeted AFS components, fixed product #223; product path and required gate pending",
     "ci_product_cases_integrated": False,
 }
 print(json.dumps(metadata, ensure_ascii=False, indent=2))

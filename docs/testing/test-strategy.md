@@ -30,7 +30,7 @@
 | ① 基础UT／LLT | 尽早发现模块规则、错误传播、状态机及接口合同回归 | 已有8个AFS crate测试入口；普通非ignored测试已接ON组件构建 | Linux；UT在源文件，LLT在域内tests；`make afs-test`／选包 `cargo test` | 固定推荐范围、说明feature/ignored边界；新功能按代码补UT，不另造runner | 维护基线；P0明确范围 |
 | ② 单VM集成 | 验证真实Meta/Node、FUSE/bind、数据/权限/缓存和正常恢复/清理 | 已实现统一入口和11个基础case；本轮冻结产物真实运行11/11通过 | 一台Linux VM；`afs/tests/run.py`＋`suites/`＋local/exec适配 | 此前冻结输入的新构建阻塞保留为历史；后续新版本持续跑对应本地集合 | P0基础已完成 |
 | ③ 多namespace集成 | 验证隔离节点的真实TCP/mTLS、远端数据路径、恢复和多读者 | 用户确认一VM多namespace；三角色基础＋C读者共9case，本轮9/9通过 | 一VM的M/A/B/C隔离角色；标准Linux环境说明；`cluster-basic`／`cluster-manyread`；同run.py | 可选SSH真实多VM适配未实跑；不宣称VM断电/宿主故障隔离 | P1基础已完成 |
-| ④ Buildkite门禁 | 防止共享候选包破坏AFS和ADX基本功能；组件/产品分别举证 | ON Cargo/公共L0/Full已有；CI0/CI1通过，新包Full #76定向5/5；Base #223公共L0 2/2；SDK-on-AFS未接 | CI执行集群→已有目标K8s；现有 `.buildkite/run-e2e.sh`及公共K8s runner | P0继续CI2产品路径→CI3必需冒烟；P1接CI4功能Full | P0打通冒烟；P1扩Full |
+| ④ Buildkite门禁 | 防止共享候选包破坏AFS和ADX基本功能；组件/产品分别举证 | ON Cargo/公共L0/Full已有；CI0/CI1独立发布分支Full #77定向5/5、M Pod工具62/62；固定产品#223；SDK-on-AFS未接 | CI执行集群→已有目标K8s；现有 `.buildkite/run-e2e.sh`及公共K8s runner | 先交付CI0/CI1接线，再接组件必需冒烟；SDK/CI2暂缓；P1扩Full | P0打通冒烟；P1扩Full |
 | ⑤ 固定包验收 | 人或AI可自主部署、验收和复现，扩大版本质量验证 | 公共K8s Full、Docker单宿主11组和专项已有；只有5分钟soak/90秒采样，完整长稳未闭环 | 先备固定包/SDK/backend/bundle及合格环境；直接公共E2E或独立Full代跑 | PK0–PK4：拿包复现→产品Full→专项→公共长稳→受控性能；复用第四步适配，补说明/负载/判据 | P1可复现全量/专项；P2长稳/性能 |
 
 ## 统一口径与优先级
@@ -269,6 +269,10 @@ python3 afs/tests/run.py run --suite cluster-manyread --env /absolute/namespaces
 | AFS正常清理／K8s删除 | PASS／PASS | 每例正常退出/卸载、无自有进程或挂载残留；namespace删除单独确认 |
 
 **当前出口**：修复后的原5项及两层清理均通过，CI1定向组件闭环完成。SDK/CI2暂缓；下一项先交付CI0/CI1接线并接组件必需冒烟，再扩CI4。完整产品门禁仍依赖后续SDK实际AFS路径；本轮不实施这些扩展。#223首次两次Execd外部下载失败、#222失败均保留，不用重跑成绩抹去。AFS全特性/RDMA、ignored内核测试、取消流程、长稳和性能未因此获得通过。
+
+**独立发布分支复测（最新master）**：[Full #77](https://buildkite.com/agent-dx/agent-dx-full-test/builds/77)为本次CI0/CI1交付重新构建测试镜像，测试代码commit `817078f489459604b1eb108990a6290b929ca448`，固定产品/SDK仍为Base #223/`00f1695b`，不把两种commit混写。M Pod Python3.12工具合同 **62/62通过**，原5项组件用例 **5/5通过**，正常AFS清理和K8s删除通过。最新master的22项基础、20项读写专项、2项性能资产注册全部保留；这些集合没有因资产发现或工具合同运行而自动进入本次五项功能选集。
+
+本交付不含`afs/src`生产改动，OwnerFs兼容修复仍由MR !126独立交付；在受影响内核上换用未修复的包，真实bind断言仍会失败。`tools/`和`runner_tests/`作为已哈希的测试文件交付，不进入产品包。独立打包目录的入口回归已覆盖工具遗漏；M Pod执行合同避免把tomllib依赖加到Python3.8控制端。当前公共工具回归139项、固定Python预检规则通过；make包装的离线工具缓存失败单列，不冒称该命令通过。Rust测试CA文件与#223已测文件相同，未为本发布分支重新编译Rust；AFS全特性/RDMA仍未验证。对应[Issue #67](https://gitcode.com/openJiuwen/agent-dx/issues/67)，下一项为接线MR交付及组件必需冒烟，SDK/完整产品门禁继续后置。
 
 原#72/#73证据保留在工作区`adx/evidence/afs-ci1-buildkite-20261031/`；本次诊断、修复和失败构建保留在`adx/evidence/afs-ownerfs-bind-ci-20261031/`。不另建规范页面，不用探针成功代替产品运行。
 

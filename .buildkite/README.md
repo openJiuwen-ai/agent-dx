@@ -428,6 +428,9 @@ targeted component run, not the default eleven-group product Full. It creates
 three owned M/A/B Pods and runs OwnerFs cross-node read/write and permissions,
 DFS cross-node read/write and visibility, plus topology/normal cleanup. The
 targeted entry uses `afs/tests/run.py`; no business assertions are duplicated.
+Full #77 revalidated publication commit `817078f4` with newly prepared images
+and fixed product/SDK #223: 62 tool contracts, all five component cases and
+normal AFS/Kubernetes cleanup passed.
 The hashed ON test payload includes suite tools and runner contract tests. Those
 contracts run in the synchronized M Pod with Python 3.12, while orchestration
 remains compatible with the existing Python 3.8 deployer.
