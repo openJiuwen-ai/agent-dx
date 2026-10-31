@@ -13,7 +13,8 @@
 公共`build/e2e/kubernetes/run.py --profile full --case afs-component`准备M/A/B Pod和动态环境文件，
 调用同一入口执行5项已有组件用例。CI控制端兼容既有ADX deployer的Python3.8；Pod worker沿用测试镜像的Python3.12，VM路径仍按下文3.10+准备。
 K8s角色按namespace/Pod UID、实际worker UID和隔离身份核验，
-不冒充多VM。当前适配已在Buildkite #73实跑：DFS两项通过，OwnerFs三项准备失败，完整验收尚未通过；VM模板不能直接填Pod地址使用。
+不冒充多VM。适配已用Base #223新候选在Buildkite Full #76定向跑通原5项；旧#73/#75的OwnerFs准备失败保留。
+这只覆盖K8s组件闭环，不代表SDK产品路径或默认必需门禁已接；VM模板不能直接填Pod地址使用。
 Rust源码、`runner_tests/`、缓存和私有环境配置不分发；选择Rust合同还需另交付同架构测试ELF。
 
 ## 运行条件
@@ -45,8 +46,10 @@ OwnerFs A的精确bind挂载检查失败时，fixture会追加`ownerfs.bind_diag
 探针关闭fd后正常卸载，只清理自己的目录；清理失败保留目录并由原worker残留检查拦截。
 无论探针成功或失败，原OwnerFs拓扑失败都保留；它不改变任何业务断言。环境记录同时保存实际内核版本。
 真实OwnerFs bind还须有NOSUID、NODEV和private传播属性；有挂载但策略不符同样失败。
-Linux5.10兼容修复候选已根据#75诊断改为对已附着tree应用/回滚旧接口策略，并用MS_BIND限制remount；
-当前待新候选包的Linux编译与同环境完整复测，不能从探针对照成功直接认作产品通过。
+Linux5.10兼容修复根据#75诊断改为对已附着tree应用/回滚旧接口策略，并用MS_BIND限制remount。
+Base #223（产品commit `00f1695b`）完成Linux编译、AFS2058项测试通过／58项ignored，
+Full #76用同一新包和原5项业务断言通过；拓扑同时强制检查上述挂载策略。
+旧失败与探针对照、组件功能和公共SDK产品结果分开记录，详见[原总规范第四步](../../docs/testing/test-strategy.md#step-4)。
 
 ## 输入准备
 
