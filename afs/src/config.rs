@@ -258,6 +258,16 @@ pub struct Cli {
     /// Defaults to 60000. Only swept when OwnerFs is enabled.
     #[arg(long)]
     pub ownerfs_reclaim_interval_ms: Option<u64>,
+    /// tmpfs directory that holds the outlet public names. All three outlet
+    /// paths must be set together; leaving them unset disables the feature.
+    #[arg(long)]
+    pub outlet_public_root: Option<PathBuf>,
+    /// Root under which per-home data trees are mounted.
+    #[arg(long)]
+    pub outlet_import_root: Option<PathBuf>,
+    /// Convergence period of the outlet mirror (10..=60000ms), default 250.
+    #[arg(long)]
+    pub outlet_mirror_interval_ms: Option<u64>,
     #[arg(long)]
     pub dfs_mount: Option<PathBuf>,
     /// FUSE receive threads shared by OwnerFs and DFS (1..=64).
@@ -469,6 +479,9 @@ struct FileConfig {
     ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
     ownerfs_workspace_egress_root: Option<PathBuf>,
     ownerfs_reclaim_interval_ms: Option<u64>,
+    outlet_public_root: Option<PathBuf>,
+    outlet_import_root: Option<PathBuf>,
+    outlet_mirror_interval_ms: Option<u64>,
     dfs_mount: Option<PathBuf>,
     fuse_threads: Option<u16>,
     fuse_clone_fd: Option<bool>,
@@ -583,6 +596,9 @@ pub struct Config {
     pub ownerfs_workspace_egress_root: Option<PathBuf>,
     /// OwnerFs data-root reclaim sweep period (10..=3600000ms).
     pub ownerfs_reclaim_interval_ms: u64,
+    /// Outlet public (name) layer. `Some` only when all three outlet paths are
+    /// configured; the feature is off otherwise.
+    pub outlet: Option<OutletConfig>,
     pub dfs_mount: Option<PathBuf>,
     pub fuse_threads: u16,
     pub fuse_clone_fd: bool,
@@ -636,6 +652,29 @@ pub struct Config {
     #[serde(skip)]
     pub print_config: bool,
 }
+
+/// Cross-node outlet name layer.
+///
+/// Configured as a unit. A partially configured layer would publish names
+/// pointing at an import layout the deployer never described, so resolution
+/// rejects it rather than guessing defaults for the missing half.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OutletConfig {
+    /// tmpfs mount holding the published `name -> target` symlinks.
+    pub public_root: PathBuf,
+    /// Root under which `<home>/users/<data_dir>` trees are mounted.
+    pub import_root: PathBuf,
+    /// Convergence period. Affects publish latency only, never the data path.
+    pub mirror_interval_ms: u64,
+}
+
+impl OutletConfig {
+    #[must_use]
+    pub fn mirror_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.mirror_interval_ms)
+    }
+}
+
 impl Config {
     /// 按默认值 < TOML < 显式 CLI 合并；所有可发现的配置错误在监听服务之前返回。
     /// Meta 可以没有文件后端；Node 至少启用一个。未指定 fs 时使用当前编译进去的集合。
@@ -1067,6 +1106,40 @@ impl Config {
             ownerfs_workspace_egress_root: cli
                 .ownerfs_workspace_egress_root
                 .or(file.ownerfs_workspace_egress_root),
+            outlet: {
+                let public = cli.outlet_public_root.or(file.outlet_public_root);
+                let imports = cli.outlet_import_root.or(file.outlet_import_root);
+                match (public, imports) {
+                    (None, None) => None,
+                    (Some(public), Some(import_root)) => {
+                        if !public.is_absolute() || !import_root.is_absolute() {
+                            return Err(invalid("outlet paths must be absolute"));
+                        }
+                        if public == import_root {
+                            return Err(invalid("outlet public root and import root must differ"));
+                        }
+                        let interval_ms = cli
+                            .outlet_mirror_interval_ms
+                            .or(file.outlet_mirror_interval_ms)
+                            .unwrap_or(250);
+                        if !(10..=60_000).contains(&interval_ms) {
+                            return Err(invalid("outlet mirror interval must be 10..=60000ms"));
+                        }
+                        Some(OutletConfig {
+                            public_root: public,
+                            import_root,
+                            mirror_interval_ms: interval_ms,
+                        })
+                    }
+                    // all-or-none: a half-configured name layer would publish
+                    // names pointing at an unknown import layout.
+                    _ => {
+                        return Err(invalid(
+                            "outlet_public_root and outlet_import_root must be set together",
+                        ));
+                    }
+                }
+            },
             ownerfs_reclaim_interval_ms: {
                 let ms = cli
                     .ownerfs_reclaim_interval_ms
@@ -2010,6 +2083,115 @@ mod ownerfs_reclaim_config_tests {
             .unwrap_err();
             assert!(
                 format!("{error:?}").contains("OwnerFs reclaim interval"),
+                "unexpected error for {ms}: {error:?}"
+            );
+        }
+    }
+}
+
+/// outlet 名字面的三件套：all-or-none、绝对路径、周期范围。
+#[cfg(test)]
+mod outlet_config_tests {
+    use super::*;
+
+    #[test]
+    fn outlet_is_disabled_when_unset() {
+        let cfg =
+            Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--fs", "ownerfs"])).unwrap();
+        assert!(cfg.outlet.is_none());
+    }
+
+    #[test]
+    fn outlet_defaults_the_mirror_interval_to_250ms() {
+        let cfg = Config::resolve(
+            Role::Node,
+            Cli::parse_from([
+                "afs-node",
+                "--fs",
+                "ownerfs",
+                "--outlet-public-root",
+                "/mnt/adx/public",
+                "--outlet-import-root",
+                "/mnt/adx/imports",
+            ]),
+        )
+        .unwrap();
+        let outlet = cfg.outlet.expect("configured");
+        assert_eq!(outlet.mirror_interval_ms, 250);
+        assert_eq!(outlet.public_root, PathBuf::from("/mnt/adx/public"));
+    }
+
+    /// 只配置一半时必须拒绝：否则名字会被发布到一个部署方从未描述过的
+    /// import 布局上。
+    #[test]
+    fn half_configured_outlet_is_rejected() {
+        for partial in [
+            vec!["--outlet-public-root", "/mnt/adx/public"],
+            vec!["--outlet-import-root", "/mnt/adx/imports"],
+        ] {
+            let mut args = vec!["afs-node", "--fs", "ownerfs"];
+            args.extend(partial);
+            let error = Config::resolve(Role::Node, Cli::parse_from(args)).unwrap_err();
+            assert!(
+                format!("{error:?}").contains("must be set together"),
+                "unexpected error: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn outlet_paths_must_be_absolute_and_distinct() {
+        let relative = Config::resolve(
+            Role::Node,
+            Cli::parse_from([
+                "afs-node",
+                "--fs",
+                "ownerfs",
+                "--outlet-public-root",
+                "public",
+                "--outlet-import-root",
+                "/mnt/adx/imports",
+            ]),
+        )
+        .unwrap_err();
+        assert!(format!("{relative:?}").contains("absolute"), "{relative:?}");
+
+        let same = Config::resolve(
+            Role::Node,
+            Cli::parse_from([
+                "afs-node",
+                "--fs",
+                "ownerfs",
+                "--outlet-public-root",
+                "/mnt/adx/x",
+                "--outlet-import-root",
+                "/mnt/adx/x",
+            ]),
+        )
+        .unwrap_err();
+        assert!(format!("{same:?}").contains("must differ"), "{same:?}");
+    }
+
+    #[test]
+    fn outlet_mirror_interval_range_is_enforced() {
+        for ms in ["9", "60001"] {
+            let error = Config::resolve(
+                Role::Node,
+                Cli::parse_from([
+                    "afs-node",
+                    "--fs",
+                    "ownerfs",
+                    "--outlet-public-root",
+                    "/mnt/adx/public",
+                    "--outlet-import-root",
+                    "/mnt/adx/imports",
+                    "--outlet-mirror-interval-ms",
+                    ms,
+                ]),
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:?}").contains("outlet mirror interval"),
                 "unexpected error for {ms}: {error:?}"
             );
         }
