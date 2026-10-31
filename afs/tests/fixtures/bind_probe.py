@@ -102,16 +102,40 @@ def probe(root, token, operations=None):
         tree = ops.clone(fds[0])
         result['steps'].append({'step': step, 'status': 'OK'})
         step = 'mount_setattr_private'
-        ops.policy(tree, True)
-        result['steps'].append({'step': step, 'status': 'OK'})
+        missing_policy_api = False
+        try:
+            ops.policy(tree, True)
+            result['steps'].append({'step': step, 'status': 'OK'})
+        except OSError as policy_error:
+            if policy_error.errno != errno.ENOSYS:
+                raise
+            missing_policy_api = True
+            result['steps'].append(dict(failure(step, policy_error), handled_by_product_fallback=True))
         step = 'move_mount'
         ops.attach(tree, fds[1])
         attached = True
         result['steps'].append({'step': step, 'status': 'OK'})
+        if missing_policy_api:
+            step = 'legacy_remount_held_target'
+            ops.legacy_policy('/proc/thread-self/fd/' + str(fds[1]))
+            result['steps'].append({'step': step, 'status': 'OK'})
         result['status'] = 'CAPABLE'
     except OSError as error:
         result['first_error'] = failure(step, error)
         result['steps'].append(result['first_error'])
+        if step == 'legacy_remount_held_target':
+            try:
+                ops.legacy_policy('/proc/thread-self/fd/' + str(fds[1]), True)
+                result['control_held_target_bind'] = {'status': 'OK'}
+            except OSError as control_error:
+                result['control_held_target_bind'] = failure('held_target_bind', control_error)
+            try:
+                tree_path = '/proc/thread-self/fd/' + str(tree)
+                ops.legacy_private(tree_path)
+                ops.legacy_policy(tree_path, True)
+                result['control_attached_tree'] = {'status': 'OK'}
+            except OSError as control_error:
+                result['control_attached_tree'] = failure('attached_tree_policy', control_error)
         if step == 'mount_setattr_private':
             # A control isolates the propagation flag; it cannot turn the failed product policy into PASS.
             try:

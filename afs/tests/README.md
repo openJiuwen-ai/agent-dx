@@ -40,6 +40,8 @@ OwnerFs A的精确bind挂载检查失败时，fixture会追加`ownerfs.bind_diag
 在同一worker私有mount namespace、匹配所有权token的新临时目录中，逐步探测
 `open_tree`、带NOSUID/NODEV及MS_PRIVATE的`mount_setattr`、`move_mount`。
 若私有传播策略失败，另测不带MS_PRIVATE的控制组，仅用于区分失败条件，不是产品回退或通过依据。
+若仅缺少`mount_setattr`，诊断按产品路径继续`move_mount`和旧接口补属性，
+比较被覆盖的原target fd与已附着的tree fd；控制组只修改本次bind的挂载属性，不改变业务结果。
 探针关闭fd后正常卸载，只清理自己的目录；清理失败保留目录并由原worker残留检查拦截。
 无论探针成功或失败，原OwnerFs拓扑失败都保留；它不改变任何业务断言。环境记录同时保存实际内核版本。
 

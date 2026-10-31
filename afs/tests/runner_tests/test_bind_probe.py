@@ -98,6 +98,27 @@ class BindProbeTests(unittest.TestCase):
         self.assertEqual(report['status'], 'FAILED')
         self.assertEqual(report['cleanup']['status'], 'PASS')
 
+    def test_missing_setattr_follows_product_fallback_and_tests_attached_tree_control(self):
+        class PartialApi(Operations):
+            def policy(self, _tree, _private):
+                raise OSError(errno.ENOSYS, 'mount_setattr absent')
+
+            def legacy_private(self, _target):
+                self.calls.append(('private-tree',))
+
+            def legacy_policy(self, target, bind_remount=False):
+                if str(target).endswith('/999999') and bind_remount:
+                    return
+                raise OSError(errno.EINVAL, 'held covered target')
+
+        report = self.module.probe(self.root, 'owned-token', PartialApi())
+        self.assertEqual(report['first_error']['step'], 'legacy_remount_held_target')
+        self.assertEqual(report['first_error']['errno'], errno.EINVAL)
+        self.assertEqual(report['control_held_target_bind']['errno'], errno.EINVAL)
+        self.assertEqual(report['control_attached_tree']['status'], 'OK')
+        self.assertEqual(report['status'], 'FAILED')
+        self.assertEqual(report['cleanup']['status'], 'PASS')
+
     def test_diagnostic_cannot_replace_the_original_topology_failure(self):
         from fixtures.multivm import Cluster
         cluster = object.__new__(Cluster)
