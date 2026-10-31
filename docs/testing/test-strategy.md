@@ -1,7 +1,7 @@
 <a id="top"></a>
 # ADX／AFS 测试规范：五步验证路径
 
-状态：2026-11-01。第二、三步基础与CI0/CI1组件定向闭环已通过；本分支已实现SDK-on-AFS和AFS ON必需验收包装，CI2真实SDK定向已通过，CI3组合子项均通过，JUnit已正常生成；总报告身份交接仍被CI guard拦截，已补齐并待复测，尚不记整条门禁通过。
+状态：2026-11-01。第二、三步基础及CI0/CI1组件定向闭环已通过；本分支CI2 SDK-on-AFS、CI3流水线内必需冒烟已实现并真实通过。最终运行是Full #85／测试commit `6660ffc1`，固定产品/SDK为Base #223，未重编或替换产品。
 
 本次只补测试、部署配置与CI接线，不改ADX、AFS或SDK生产源码。基于[CI0/CI1 MR !127](https://gitcode.com/openJiuwen/agent-dx/merge_requests/127)，OwnerFs生产修复继续由[MR !126](https://gitcode.com/openJiuwen/agent-dx/merge_requests/126)独立交付；固定使用已含修复的Base #223产品和SDK，测试commit另记。共享默认分支及线上合入保护配置不改。各阶段当前结果、待补项和历史失败都在本页，组件通过、产品通过和必需门禁通过分别举证。
 
@@ -15,7 +15,7 @@
 4. **Buildkite门禁：用已有CI环境保护共享集成。** 在ADX既有目标K8s部署AFS，选核心用例进冒烟、更完整功能进Full，并验证ADX实际使用AFS；不调用开发者VM。
 5. **固定包验收：开发者和测试人员都能自主闭环。** 拿固定包及配套制品，在合格环境中复用公共E2E跑全量、专项；小时／天级长稳和受控性能另补公共能力与AFS负载。
 
-第2/3步按开发者条件选择，没条件可以不跑并注明未验证；实际失败不能伪装成环境跳过。当前已通过AFS组件定向CI；本分支已补SDK产品路径与必需包装，真实SDK已通过、组合门禁验证中，不能提前当作已有自动兜底。两步都默认在一台Linux VM内：第二步同guest多进程，第三步隔离namespace。可选SSH多VM适配仍保留，未纳入本轮实测；这不是AFS不能容器化的声明。
+第2/3步按开发者条件选择，没条件可以不跑并注明未验证；实际失败不能伪装成环境跳过。当前已通过AFS组件定向CI；本分支已补SDK产品路径与必需包装，真实SDK与固定包组合门禁均已通过；接线尚待评审合入，线上触发/必需状态未核验，不能当作已经生效的自动合入保护。两步都默认在一台Linux VM内：第二步同guest多进程，第三步隔离namespace。可选SSH多VM适配仍保留，未纳入本轮实测；这不是AFS不能容器化的声明。
 
 ## 五步总表
 
@@ -26,14 +26,14 @@
 | ① 基础UT／LLT | 尽早发现模块规则、错误传播、状态机及接口合同回归 | 已有8个AFS crate测试入口；普通非ignored测试已接ON组件构建 | Linux；UT在源文件，LLT在域内tests；`make afs-test`／选包 `cargo test` | 固定推荐范围、说明feature/ignored边界；新功能按代码补UT，不另造runner | 维护基线；P0明确范围 |
 | ② 单VM集成 | 验证真实Meta/Node、FUSE/bind、数据/权限/缓存和正常恢复/清理 | 已实现统一入口和11个基础case；本轮冻结产物真实运行11/11通过 | 一台Linux VM；`afs/tests/run.py`＋`suites/`＋local/exec适配 | 此前冻结输入的新构建阻塞保留为历史；后续新版本持续跑对应本地集合 | P0基础已完成 |
 | ③ 多namespace集成 | 验证隔离节点的真实TCP/mTLS、远端数据路径、恢复和多读者 | 用户确认一VM多namespace；三角色基础＋C读者共9case，本轮9/9通过 | 一VM的M/A/B/C隔离角色；标准Linux环境说明；`cluster-basic`／`cluster-manyread`；同run.py | 可选SSH真实多VM适配未实跑；不宣称VM断电/宿主故障隔离 | P1基础已完成 |
-| ④ Buildkite门禁 | 防止共享候选包破坏AFS和ADX基本功能；组件/产品分别举证 | ON Cargo/公共L0/Full已有；CI0/CI1 Full #77定向5/5；固定产品#223；本分支SDK-on-AFS Full #81两模式/12项通过，必需包装已实现、组合验证中 | CI执行集群→已有目标K8s；现有 `.buildkite/run-e2e.sh`及公共K8s runner | 完成CI2/CI3实际验证及接线评审；P1扩Full，线上触发/保护策略另核验 | P0打通冒烟；P1扩Full |
+| ④ Buildkite门禁 | 防止共享候选包破坏AFS和ADX基本功能；组件/产品分别举证 | 固定#223候选；SDK定向#81两模式12项通过；最终#85公共L0/auth＋组件5＋SDK两模式、根报告/JUnit/CI summary通过 | 既有CI目标K8s；`.buildkite/run-e2e.sh` → `afs_gate.py` → 公共K8s runner，复用原用例 | 依赖MR126/127及本批测试接线评审；合入后按正式候选重跑，核验线上ON触发/合入保护；P1扩Full | P0流水线内已通；P1 Full |
 | ⑤ 固定包验收 | 人或AI可自主部署、验收和复现，扩大版本质量验证 | 公共K8s Full、Docker单宿主11组和专项已有；只有5分钟soak/90秒采样，完整长稳未闭环 | 先备固定包/SDK/backend/bundle及合格环境；直接公共E2E或独立Full代跑 | PK0–PK4：拿包复现→产品Full→专项→公共长稳→受控性能；复用第四步适配，补说明/负载/判据 | P1可复现全量/专项；P2长稳/性能 |
 
 ## 统一口径与优先级
 
 - **已定原则／决策**：组件UT/集成归AFS，真实组件测试统一目标 `afs/tests/`；ADX公开SDK及完整产品场景归 `build/e2e/`。本地、CI、拿包验收复用断言和结果语义，按环境适配，不复制一套Buildkite专用业务用例。
 - **事实**是已有代码/调用；**已有规划**是原仓内目标但未闭环；**待补项**是后续实现范围；**待验证**是尚未实测的环境/触发条件。总体规范已确认，不表示具体CLI文件、CI接线或所有场景已存在。
-- **当前**第二/三步基础及CI0/CI1组件定向闭环已通过；**当前P0**验收SDK实际AFS路径与必需冒烟，**P1**扩产品Full、拿包复现和专项，**P2**建设完整长稳及受控性能。实现顺序不把本地VM变成所有开发者的提交前强制条件。
+- **当前**第二/三步基础及CI0/CI1组件定向闭环已通过；**P0**接线评审/依赖合入后按正式候选回归，并核验线上触发/保护策略；SDK与流水线内冒烟已通过，**P1**扩产品Full、拿包复现和专项，**P2**建设完整长稳及受控性能。实现顺序不把本地VM变成所有开发者的提交前强制条件。
 - **通过标准**：选中的必需项必须实际执行，0匹配、ignored、未执行、BLOCKED不能记PASS；定向通过不冒称完整Full，含AFS二进制不证明产品使用了AFS；正常清理也必须举证。
 - **环境与结果范围**：VM、Docker、K8s分别记录；Pod跨worker不能冒充多VM/断电验证；功能、正常恢复、故障、长稳及性能分别报告。CI缺必需环境不能静默跳过为成功。
 
@@ -206,12 +206,12 @@ python3 afs/tests/run.py run --suite cluster-manyread --env /absolute/namespaces
 
 具体角色地址/command-prefix均在仓外环境文件；不把个人session、凭据或当前机器状态写死进产品用例。`namespaces-3/4.example.json`为模板，须填实际公共工具和session；`matrix.example.json`引用local/cluster配置。只有真实不同net/PID/mount身份才准入，不能给同一进程取三个host别名冒充隔离。可选SSH配置按已有信任接入，不创建用户/密钥或修改机器identity。
 
-**当前边界与后续**：第二/三步基础闭环已通过此前冻结输入；第四步组件CI已通过，SDK产品接线本分支已实现、实际验证中。独立VM、VM断电、复杂后端/设备矩阵、长稳和性能按需求另验收，不从本轮结果外推。
+**当前边界与后续**：第二/三步基础闭环已通过此前冻结输入；第四步组件CI已通过，SDK产品与流水线内必需冒烟本分支已真实通过。独立VM、VM断电、复杂后端/设备矩阵、长稳和性能按需求另验收，不从本轮结果外推。
 
 <a id="step-4"></a>
 ## 第四步：Buildkite共享门禁
 
-**本步原则、现状与优先级**：原则：复用既有CI目标K8s，部署AFS并选集；不调用个人VM。现状：普通Cargo、CI0资产/环境和CI1真实组件定向已通过，SDK产品路径本分支Full #81已通过；必需包装已实现、组合验证中。待补：实跑验收、线上触发/保护核验和完整Full选集。优先级：P0冒烟、P1 Full。
+**本步原则、现状与优先级**：原则：复用既有CI目标K8s，部署AFS并选集；不调用个人VM。现状：普通Cargo、CI0资产/环境和CI1真实组件定向已通过，SDK产品路径本分支Full #81已通过；必需包装在#85以固定包通过。待补：接线评审合入、正式候选重跑、线上触发/保护核验和完整Full选集。优先级：P0冒烟、P1 Full。
 
 **状态**：五步总体逻辑已确认；以下目录/命令中标注目标或待补者尚未实施。
 
@@ -224,8 +224,8 @@ python3 afs/tests/run.py run --suite cluster-manyread --env /absolute/namespaces
 | SDK产品目标 | `ADX_E2E_TARGET_CASE=afs-sdk` → `.buildkite/run-e2e.sh` → K8s `run.py --profile full --case afs-sdk` → `afs_product.py` / `afs_sdk.py` | Full #81真实两模式/12子项通过；只运行两种AFS产品模式，不是公共11组Full |
 | 两种模式的必需断言 | OwnerFs、DFS各要求挂载device/inode/mountinfo、三版本双向write/fsync/新OPEN全内容、权限EACCES、只读EROFS、删除、Environment回收六个结果；DFS另需B端peer计数增长 | 不以READY、普通目录、零退出码或缺失结果作为通过；AFS正常卸载、ADX backend为空及K8s删除分别验收 |
 | 现有后端能力与环境 | sandboxd不支持tool user/group覆盖；测试不请求该能力。只有SDK目标通过已有`basic_spec`配置`afs_runc_spec.json`：默认三项capability加SETUID、SETGID、DAC_OVERRIDE，后者供root SDK Files接口访问普通用户私有工作区 | 普通POSIX工作负载先降到10000或10001，再要求CapEff/CapPrm/CapAmb全0；权限拒绝因此仍由普通用户实际验证。该配置是测试部署前提，不宣称共享默认环境支持身份切换 |
-| 正常AFS ON门禁 | `.buildkite/run-e2e.sh`未选定向目标时 → `afs_gate.py`：公共原profile → 原五项AFS组件 → 两个SDK模式；任一必需项缺失/失败/清理不明即失败 | 实现完成、组合实跑待验；OFF沿用公共路径。显式诊断目标通过不算完整必需门禁 |
-| 固定包重放冒烟 | `ADX_E2E_TARGET_CASE=afs-required-smoke`，同一wrapper以`l0`执行上述三部分 | 用已有Full管道重放Base等价冒烟；不重编或替换产品，不因此声称新head已跑完Base构建、公共11组Full或线上合入保护 |
+| 正常AFS ON门禁 | `.buildkite/run-e2e.sh`未选定向目标时 → `afs_gate.py`：公共原profile → 原五项AFS组件 → 两个SDK模式；缺结果/缺项/失败/清理不明即失败，三子harness整体必须一致 | #84/#85以固定包重放L0组合并通过原CI summary身份检查；OFF沿用公共路径。公共Full嵌套时保留stop的Collector/Gateway指标/trace收据要求；该Full分支只有工具回归，未实跑公共11组 |
+| 固定包重放冒烟 | `ADX_E2E_TARGET_CASE=afs-required-smoke`，同一wrapper以`l0`执行上述三部分 | 已在#85用已有Full管道重放Base等价冒烟；不重编或替换产品，不因此声称新head已跑完Base构建、公共11组Full或线上合入保护 |
 
 当前固定产品/SDK：Base #223，`00f1695bd25bac01e44c8dd1f452cf42c47b5c77`；固定镜像bundle来自Full #77。harness单独按当前commit同步、哈希验证。工具测试和Python静态检查只证明测试工具合同，不代替真实SDK结果。
 
@@ -235,8 +235,14 @@ python3 afs/tests/run.py run --suite cluster-manyread --env /absolute/namespaces
 | [Full #79](https://buildkite.com/agent-dx/agent-dx-full-test/builds/79) | 63工具通过；首个Environment创建后身份切换失败，未进入AFS；不能推断未输出的具体UID | 已创建Environment回收、ADX/K8s清理通过；无AFS准备 |
 | [Full #80](https://buildkite.com/agent-dx/agent-dx-full-test/builds/80) | 63工具和两侧warmup通过，实际UID10000；AFS传输入口只接受afs-a/b，拒绝复用的node1/node2；产品正文未执行 | 沿原结果保留失败，后续补显式共享namespace、opt-in标签及冻结UID检查 |
 | [Full #81](https://buildkite.com/agent-dx/agent-dx-full-test/builds/81) | 测试commit `bd73b190`，64工具、两个模式各6项全部通过；各3代×16KiB双向内容检查；DFS peer计数0→4 | 每模式4个Environment回收；AFS正常退出/卸载无残留、ADX backend为空、K8s删除均通过 |
-| [Full #82](https://buildkite.com/agent-dx/agent-dx-full-test/builds/82) | 同一commit、固定产品和镜像；公共L0/auth、组件5、SDK两模式均通过，但gate成功报告缺error字段，JUnit与CI summary抛KeyError，最终作业failed | 不把子项通过当门禁通过；已补error=null及成功报告回归，待真实复测 |
-| [Full #83](https://buildkite.com/agent-dx/agent-dx-full-test/builds/83) | 测试commit `ee421f51`，三部分/各层清理通过，root JUnit四项零失败；root缺harness被原CI summary身份检查拒绝，CI仍failed | 三子harness整体及336文件SHA完全一致；已补根报告承接/一致性核对，并以原summary.collect/render回归验证，待组合复测 |
+| [Full #82](https://buildkite.com/agent-dx/agent-dx-full-test/builds/82) | 同一commit、固定产品和镜像；公共L0/auth、组件5、SDK两模式均通过，但gate成功报告缺error字段，JUnit与CI summary抛KeyError，最终作业failed | 不把子项通过当门禁通过；修复后#84/#85通过，原失败保留 |
+| [Full #83](https://buildkite.com/agent-dx/agent-dx-full-test/builds/83) | 测试commit `ee421f51`，三部分/各层清理通过，root JUnit四项零失败；root缺harness被原CI summary身份检查拒绝，CI仍failed | 三子harness整体及336文件SHA完全一致；修复根身份承接/一致性核对并通过原summary回归后，#84/#85整条通过，原失败保留 |
+| [Full #84](https://buildkite.com/agent-dx/agent-dx-full-test/builds/84) | 测试commit `ce61c0f1`，三部分及各层清理通过；根报告承接三子相同harness，JUnit四项零失败，CI summary JSON/Markdown与最终作业通过 | 三个独立namespace均已删除；保留本次独立输入和证据 |
+| [Full #85](https://buildkite.com/agent-dx/agent-dx-full-test/builds/85) | 最终runtime commit `6660ffc1b5447e7d8b6aef2771b1d3767ebbb6e7`，同一L0组合再次通过；公共L0/auth、组件5、OwnerFs/DFS各6项、根报告/JUnit/CI summary全部通过 | 严格正常AFS、Environment、ADX backend和K8s清理；新补Full stop观测分支未因L0重放而获得实跑证明 |
+
+本批本地公共工具150项、K8s传输mock6项、固定Python预检（master差异19文件／父提交差异8文件）通过。回归包含成功gate由既有CI summary.collect/render消费、缺结果/错身份/清理失败判红及公共Full stop收据不丢失。早期#78–80、#82–83失败均保留；不修改既有CI guard来放过缺失身份。最终文档提交与上述实跑runtime提交分开记录。
+
+**本批出口与下一项**：AFS ON流水线内必需冒烟在固定候选上已接通；尚未改共享默认分支、webhook或合入保护。MR !126、!127和本批测试接线评审合入后，应按正式候选重跑Base/包路径；CI4完整公共11组＋已登记AFS Full集合、第五步PK0–PK4、取消实跑、长稳与性能仍另行验收。不能用#85外推新head已编译打包或公共Full已通过。
 
 ### CI0／CI1历史运行：旧包故障、修复与新候选复测
 
@@ -341,11 +347,11 @@ python3 afs/tests/run.py run --suite cluster-manyread --env /absolute/namespaces
 
 依据：[候选组包/校验](../../.buildkite/package-e2e.sh)、[AFS交付文件集](../../build/release/component.py)、[runner输入合同](../../afs/tests/fixtures/multivm.py)、[harness范围](../../build/e2e/kubernetes/run.py)、[运行镜像配方](../../build/images/Dockerfile.e2e-runtime)、[现有runtime准入](../../build/e2e/preflight.py)。本节是编码前盘点快照；下方计划除上节已实现的交接子项外仍待实施。
 
-### 第四步实施计划：组件、产品与门禁分别验收（CI0–CI2已通过，CI3复测中，CI4待完成）
+### 第四步实施计划：组件、产品与门禁分别验收（CI0–CI3流水线内已通过，CI4及线上策略待完成或核验）
 
 **先看顺序**：固定候选与CI环境 → 真实AFS组件读写/清理 → SDK实际使用AFS → 接入必需冒烟 → 扩展功能Full。沿用现有两条公共流水线；CI组件结果、ADX产品结果和最终门禁状态分别可追溯，前一批通过不冒充后一批已经完成。
 
-本计划按 `02d1a06f` 检出核对。第二/三步的runner、worker、业务断言和结果协议已经存在，不再从旧脚本另做一套；此前ARM64冻结产物的20项通过只保留原身份，**不能代替正式amd64 CI候选、K8s能力或产品路径验收**。CI0/CI1已用Base #223新候选在Full #76/#77定向通过；CI2已在Full #81验证两个SDK模式；CI3已实现、修复汇总后#83又发现根身份缺失，补齐后待组合复测；CI4功能Full与线上触发/保护策略仍待完成或核验。
+本计划按 `02d1a06f` 检出核对。第二/三步的runner、worker、业务断言和结果协议已经存在，不再从旧脚本另做一套；此前ARM64冻结产物的20项通过只保留原身份，**不能代替正式amd64 CI候选、K8s能力或产品路径验收**。CI0/CI1已用Base #223新候选在Full #76/#77定向通过；CI2已在Full #81验证两个SDK模式；CI3已在#84/#85完成固定包组合门禁，根报告/JUnit/CI summary和最终作业均通过；CI4功能Full与线上触发/保护策略仍待完成或核验。
 
 #### 最小闭环分批实施
 
@@ -354,7 +360,7 @@ python3 afs/tests/run.py run --suite cluster-manyread --env /absolute/namespaces
 | CI0／P0：候选和环境准入 | 统一包/SDK/backend/bundle身份检查、现有K8s manifest/preflight、AFS身份与worker准入 | 已通过：`build/e2e/prepare.py`、`afs_handoff.py`及K8s harness交接；#223/#76实际核验FUSE、ext4、UID/GID、网络/mTLS、真实bind/FUSE及正常清理。不自动改集群全局设置 | 在目标K8s用自有临时资源实际验证必需能力并清理；缺设备/错误架构/产物缺失明确阻塞。只能声称环境与输入可用，不能声称AFS功能通过；此前ARM64结果不能为amd64放行 |
 | CI1／P0：AFS组件纵向闭环 | `afs/tests/run.py`、`suites/operations.py`、现有读写/权限/版本/清理断言及worker协议 | 已通过：`afs/tests/fixtures/kubernetes.py`角色接入和环境描述；#76原5项与加强的bind策略断言通过；公共K8s工具提供Pod/exec/copy与资源生命周期，复用同一worker执行M/A/B角色。复用本次已补的 `afs/tests/` 分发和已校验候选输入；不在目标Pod编译产品 | 先分别通过OwnerFs A本地egress bind↔B FUSE、DFS A发布/B远端读回与删除；证明真实挂载、peer路径、实际退出和无自有残留。旧#75已真实验证失败被保留、作业判红且正常清理；取消尚未实测。此时只报K8s组件定向通过，尚未接入必需门禁 |
 | CI2／P0：最小ADX产品路径（已通过） | 已有两ADX node Pod、独立sandboxd、SDK `Mount(host_path=...)`、共享 `scenarios.py` / `sdk_smoke.py` | 已由 `build/e2e/kubernetes/afs_product.py` / `afs_sdk.py` 管理M/A/B，复用原SDK Local Mount及节点放置；OwnerFs/DFS分开运行，源身份与runtime挂载对应。仅SDK测试Pod使用已有basic_spec配置；普通UID实际降权且零capability，SDK Files接口root身份单独说明 | Full #81已通过两个SDK模式、各六项断言，三版本双向完整内容；实际EACCES/EROFS、删除/Environment回收及正常AFS/ADX/K8s清理通过。用mountinfo/device/inode及DFS peer 0→4证明路径；组件PASS不替代产品PASS |
-| CI3／P0：正式冒烟接线 | 基础 `pipeline-package.yml: platform-e2e`、`.buildkite/run-e2e.sh`、公共L0/auth、JUnit及artifact上报 | 本分支已实现 `.buildkite/run-e2e.sh` → `afs_gate.py`，AFS ON正常入口串公共原profile、五项组件与两种SDK；OFF沿用公共入口。#82子项通过但总报告/JUnit失败，#83仍被根报告身份缺失拦截，补齐后待复测。仍须另核验ON触发范围、不可关闭/必需状态等线上策略，不改共享默认分支 | 用明确ON候选真实跑通一次必需冒烟；验证必需case失败/缺环境/超时/清理失败会使作业及汇总失败，未执行不能变绿；OFF分支结果不被标为AFS通过。若webhook/必需状态未落实，只能称流水线内接通，不能称自动合入保护已完成 |
+| CI3／P0：必需冒烟接线（流水线内已通过） | 基础 `pipeline-package.yml: platform-e2e`、`.buildkite/run-e2e.sh`、公共L0/auth、JUnit及artifact上报 | 本分支已实现 `.buildkite/run-e2e.sh` → `afs_gate.py`，AFS ON正常入口串公共原profile、五项组件与两种SDK；OFF沿用公共入口。#82/#83汇总失败保留，#84/#85修复后整条通过；未因包装丢失原Full stop观测收据要求。仍须另核验ON触发范围、不可关闭/必需状态等线上策略，不改共享默认分支 | 已用明确ON候选在#85真实跑通必需冒烟；失败/缺项/错身份/清理失败判红由工具回归和真实失败运行共同举证，未执行不能变绿；OFF分支结果不被标为AFS通过。若webhook/必需状态未落实，只能称流水线内接通，不能称自动合入保护已完成 |
 | CI4／P1：功能Full接线 | 独立 `pipeline-full.yml`、同一验收包装、公共11组及AFS现有基础/扩展断言 | 增加明确登记的CI Full选集、单Pod内核合同环境和跨Pod角色环境；按需加入C读者，补同目录恢复、权限/缓存、命名空间/busy合同。公共11组继续复用，AFS产品变体扩展相关行为；不机械复制每组、不直接用 `--all` 代替合同 | Full包含已登记冒烟必需断言；对应单Pod/跨Pod环境、选中Rust ELF和每个case都有实际证据。公共Full保持两worker检查，AFS跨worker声明另验角色实际放置。缺必需资产/拓扑不得删项后报Full；不外推Pod删除持久恢复、VM故障、长稳或性能 |
 
 CI0/CI1的环境适配与第五步拿包输入可同时设计，做到后可先直接调用验证，不必等线上触发策略就绪；但CI3的真实调用、失败传播和线上条件分别验收，不能用本地运行补齐它们的结果。
@@ -450,8 +456,8 @@ Full默认11组为：`sdk`、`data-plane`、`lifecycle`、`auth`、`capacity`、
 
 | 来源与要拦截的问题 | 冒烟：最小代表 | 功能全量：扩展覆盖 | 现状与需要补的部分 |
 | --- | --- | --- | --- |
-| LB01、MV01：真实AFS进程/挂载/路径是否存在 | OwnerFs bind＋远端FUSE、DFS真实挂载；同候选、真实网络寻址 | 保留准入并记录跨worker放置、完整角色和节点身份 | M/A/B跨worker、FUSE/ext4/mTLS与OwnerFs native bind已在#76通过；SDK产品路径未接 |
-| LB02/03、MV02：基本操作与OwnerFs互通 | 小文件目录创建、读写/长度/哈希、fsync后重开、rename/删除；OwnerFs双向读写 | 覆盖/截短、属性/目录和边界错误；多个版本变化 | 现有runner已有核心读写和最低操作链；资产/角色接入及OwnerFs读写在#76通过；SDK挂载联动未接 |
+| LB01、MV01：真实AFS进程/挂载/路径是否存在 | OwnerFs bind＋远端FUSE、DFS真实挂载；同候选、真实网络寻址 | 保留准入并记录跨worker放置、完整角色和节点身份 | M/A/B跨worker、FUSE/ext4/mTLS与OwnerFs native bind已在#76通过；SDK产品两模式及流水线内必需冒烟已在#81/#85通过 |
+| LB02/03、MV02：基本操作与OwnerFs互通 | 小文件目录创建、读写/长度/哈希、fsync后重开、rename/删除；OwnerFs双向读写 | 覆盖/截短、属性/目录和边界错误；多个版本变化 | 现有runner已有核心读写和最低操作链；资产/角色接入及OwnerFs读写在#76通过；SDK挂载身份、双向fsync/重开、EACCES/EROFS/删除及回收已在#81/#85通过 |
 | LB05、MV04：DFS发布与远端可读 | R1下一写一远端读，成功fsync、新OPEN版本/长度/哈希和删除；证明确实发生远端取数 | 扩充读者/版本组合，保留真实数据路径证据 | DFS A/B跨Pod读写/远端计数在#76新候选复测通过；默认冒烟/Full登记待补 |
 | LB04、MV05部分：权限拒绝与新鲜度 | 一个授权非root读写、一个越权新OPEN拒绝、ENOENT；短新版本重开校验 | setid/CAP_FSETID、权限修改/恢复、缓存拒绝/刷新等完整合同 | OwnerFs UID/setid断言、真实DFS权限断言可复用；OwnerFs/DFS的CI权限均在#76通过；产品挂载适配未接 |
 | LB06、MV05部分：内核顺序与缓存 | 只保留上面短重开代表；不默认执行全部16MiB缓存探针 | 显式选择真实内核顺序、增长/截短、真实DFS keep-cache及计数断言 | 已有Python真实DFS缓存合同；选入Full的Rust合同须显式提供ELF/依赖并执行；同机双挂载例在受控单Pod运行 |
@@ -646,7 +652,7 @@ python3 build/e2e/kubernetes/targeted_suite.py \
 | P1/P2 | 已有长稳目标与短负载基元 | **公共先补**可配置持续时长、连续负载、持续资源趋势/阈值、错误与故障策略、取消/清理和中断证据；**AFS再补**相应负载与挂载/FD/内存/磁盘等指标判据。不得宣称已有一键24小时 | 公共长稳能力融入ADX，AFS提供适用负载和观测，不另造AFS独家长稳平台 |
 | P1/P2 | 公共负载采样与AFS已有测量方法 | 区分共享集群诊断与受控基准；固定资源/版本/缓存/数据/比较基线、计时边界及门槛，再输出性能结论 | 产品性能复用公共专项；纯文件系统性能保留AFS专用工具与合同 |
 
-第四步已由用户确认总体方向：复用现有CI部署、部署AFS并选集运行，不使用开发者VM；CI0/CI1已实现并实测，SDK产品/必需包装本分支已实现、实际验证中。第五步承接这些适配，让人或AI在已准备环境上直接运行同一能力。**当前最完整的是固定版本的功能Full和定向专项；统一小时/天级长稳与受控性能验收仍有明确缺口。**
+第四步已由用户确认总体方向：复用现有CI部署、部署AFS并选集运行，不使用开发者VM；CI0/CI1已实现并实测，SDK产品/流水线内必需冒烟本分支已在#81/#85通过。第五步承接这些适配，让人或AI在已准备环境上直接运行同一能力。**当前最完整的是固定版本的功能Full和定向专项；统一小时/天级长稳与受控性能验收仍有明确缺口。**
 
 五步总体逻辑已确认；后续按本页优先级另行安排实现，不因规范收口启动全量、专项、长稳或环境操作。
 
