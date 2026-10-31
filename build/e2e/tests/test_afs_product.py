@@ -147,6 +147,25 @@ class ProductContracts(unittest.TestCase):
             with self.assertRaises(ValueError):
                 gate.accept_harness(report, {'harness': bad}, 'a' * 40)
 
+    def test_full_wrapper_keeps_existing_stop_observability_required(self):
+        gate = load('afs_gate_full_evidence_test', HERE / 'kubernetes/afs_gate.py')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'result.json').write_text(json.dumps({
+                'status': 'passed', 'checks': ['stop'], 'required_checks': ['stop'],
+                'missing_checks': [], 'cleanup_errors': [], 'cases': [{'name': 'stop', 'status': 'passed'}],
+            }))
+            (root / 'kubernetes-cleanup.json').write_text(json.dumps({'status': 'PASS', 'errors': []}))
+            (root / 'bundle.json').write_text(json.dumps({'collector': {'pinned': True}}))
+            for node in ('node1', 'node2'):
+                (root / node).mkdir()
+                for kind in ('collection', 'gateway-metrics', 'traces'):
+                    (root / node / f'{kind}-{node}.json').write_text(json.dumps({'status': 'passed'}))
+            gate.verify_part(root, ('stop',))
+            (root / 'node1/traces-node1.json').write_text(json.dumps({'status': 'failed'}))
+            with self.assertRaises(ValueError):
+                gate.verify_part(root, ('stop',))
+
     def test_sdk_target_is_explicit_and_cannot_become_an_off_or_default_pass(self):
         kubernetes = load('afs_sdk_selection_test', HERE / 'kubernetes/run.py')
         self.assertEqual(kubernetes.selected_checks('full', 'afs-sdk'), ('afs-sdk-ownerfs', 'afs-sdk-dfs'))

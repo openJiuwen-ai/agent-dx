@@ -297,6 +297,10 @@ identity switching.
 
 For AFS ON, `.buildkite/run-e2e.sh` without a diagnostic selector runs
 `afs_gate.py`: public profile -> five AFS component cases -> both SDK variants.
+The root report carries the identical, verified child harness/product identities,
+and uses the existing CI summary contract. When the public profile includes
+`stop`, its Collector, Gateway metrics and trace receipts remain required in
+the child directory; nesting cannot bypass the original Full evidence gate.
 Every required result and cleanup must exist and pass; zero process exit alone
 is insufficient. OFF preserves the public path. Explicit targeted builds stay
 marked diagnostic, and do not count as this required gate. Repository webhook

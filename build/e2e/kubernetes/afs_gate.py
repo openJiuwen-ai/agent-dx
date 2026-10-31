@@ -38,6 +38,14 @@ def verify_part(directory, expected):
     cleanup = json.loads((directory / 'kubernetes-cleanup.json').read_text())
     if cleanup.get('status') != 'PASS' or cleanup.get('errors'):
         raise ValueError('Kubernetes cleanup failed or is unconfirmed')
+    # The public Full stop contract stays mandatory when nested under this gate.
+    # CI summary reads top-level node paths, so validate these child receipts here.
+    if 'stop' in expected and json.loads((directory / 'bundle.json').read_text()).get('collector'):
+        for node in ('node1', 'node2'):
+            for kind in ('collection', 'gateway-metrics', 'traces'):
+                evidence = json.loads((directory / node / f'{kind}-{node}.json').read_text())
+                if evidence.get('status') != 'passed':
+                    raise ValueError('public Full stop observability failed: ' + node + '/' + kind)
     if expected == ('afs-component',):
         from afs_component import validate_result
         validate_result(json.loads((directory / 'afs/result.json').read_text()),
