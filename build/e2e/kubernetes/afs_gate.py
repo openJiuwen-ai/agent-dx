@@ -53,7 +53,7 @@ def main():
     plans = [('public', args.profile, None), ('afs-component', 'full', 'afs-component'),
              ('afs-sdk', 'full', 'afs-sdk')]
     report = {'status': 'failed', 'profile': 'afs-required-smoke', 'source_profile': args.profile,
-              'required_checks': [p[0] for p in plans], 'checks': [], 'cleanup_errors': [], 'cases': []}
+              'required_checks': [p[0] for p in plans], 'checks': [], 'cleanup_errors': [], 'cases': [], 'error': None}
 
     def cancel(signum, _frame):
         raise InterruptedError('AFS gate canceled: ' + str(signum))

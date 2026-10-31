@@ -101,6 +101,24 @@ class ProductContracts(unittest.TestCase):
             self.assertEqual(result['status'], 'failed')
             self.assertIn('afs-sdk', result['missing_checks'])
 
+    def test_complete_gate_writes_success_junit_with_no_error(self):
+        gate = load('afs_gate_success_test', HERE / 'kubernetes/afs_gate.py')
+        kubernetes = load('afs_gate_success_kube_test', HERE / 'kubernetes/run.py')
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'gate'
+            argv = ['gate', '--bundle', '/fixture/bundle.json', '--registry-images', '/fixture/images.json',
+                    '--kubeconfig', '/fixture/kubeconfig', '--output', str(output), '--profile', 'l0']
+            child = Mock(wait=Mock(return_value=0), poll=Mock(return_value=0))
+            with patch.object(sys, 'argv', argv), patch.dict(sys.modules, {'run': kubernetes}), \
+                    patch.object(gate, 'verify_part', return_value={}), \
+                    patch.object(gate.subprocess, 'Popen', return_value=child):
+                self.assertEqual(gate.main(), 0)
+            result = json.loads((output / 'result.json').read_text())
+            self.assertIsNone(result['error'])
+            self.assertEqual(result['checks'], ['public', 'afs-component', 'afs-sdk'])
+            self.assertEqual(result['missing_checks'], [])
+            self.assertTrue((output / 'junit.xml').is_file())
+
     def test_sdk_target_is_explicit_and_cannot_become_an_off_or_default_pass(self):
         kubernetes = load('afs_sdk_selection_test', HERE / 'kubernetes/run.py')
         self.assertEqual(kubernetes.selected_checks('full', 'afs-sdk'), ('afs-sdk-ownerfs', 'afs-sdk-dfs'))
