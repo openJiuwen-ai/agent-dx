@@ -24,21 +24,24 @@ use afs_protocol::meta::{
     DfsUnlinkRequest, DfsWriteLeaseReply, DfsXattrRecord as PbDfsXattrRecord,
     DfsXattrSetMode as PbDfsXattrSetMode, GetDfsChunkSourcesReply, GetDfsChunkSourcesRequest,
     GetDfsInodeReply, GetDfsInodeRequest, GetDfsPlacementSnapshotReply,
-    GetDfsPlacementSnapshotRequest, GetFileVersionReply, GetFileVersionRequest,
-    ListOwnerRootsReply, ListOwnerRootsRequest, LookupNodeReply, LookupNodeRequest,
-    LookupRootReply, LookupRootRequest, MetaBackendPersistence, NodeDescriptor, NodeEndpoint,
-    OpenDfsWriteReply, OpenDfsWriteRequest, PingReply, PingRequest, PollRootCommandBatchRequest,
-    PresentedRootAccess, RecoverRootReply, RecoverRootRequest, RegisterNodeReply,
-    RegisterNodeRequest, RenewDfsWriteLeaseRequest, ReserveRootReply, ReserveRootRequest,
-    ResolveDfsLockAuthorityReply, ResolveDfsLockAuthorityRequest, ResolveDfsWriteAuthorityReply,
-    ResolveDfsWriteAuthorityRequest, RootCommand, RootCommandBatchCompacted,
-    RootCommandBatchEvents, RootCommandBatchReply, RootCommandBatchUnsupported,
-    RootCommandRecoveryCursor, RootCommandRecoveryReason, RootCommandType, RootLocation,
-    RootReservation, RootRight as PbRootRight, SyncDfsInodeMetadataReply,
-    SyncDfsInodeMetadataRequest, ValidateDfsReplicaWriteReply, ValidateDfsReplicaWriteRequest,
-    ValidateRootAccessReply, ValidateRootAccessRequest, WatchRootCommandsRequest,
-    dfs_meta_server::DfsMeta as DfsMetaService, meta_server::Meta as MetaService,
-    owner_roots_server::OwnerRoots as OwnerRootsService,
+    GetDfsPlacementSnapshotRequest, GetFileVersionReply, GetFileVersionRequest, ListNodesReply,
+    ListNodesRequest, ListOutletRootsReply, ListOutletRootsRequest, ListOwnerRootsReply,
+    ListOwnerRootsRequest, LookupNodeReply, LookupNodeRequest, LookupRootReply, LookupRootRequest,
+    MetaBackendPersistence, NodeDescriptor, NodeEndpoint, OpenDfsWriteReply, OpenDfsWriteRequest,
+    OutletEvent, OutletEventBatchCompacted, OutletEventBatchEvents, OutletEventBatchReply,
+    OutletEventNodeSessionRegistered, OutletEventRecoveryCursor, OutletEventRecoveryReason,
+    OutletEventRootActivated, OutletEventRootDeleted, PingReply, PingRequest,
+    PollOutletEventsRequest, PollRootCommandBatchRequest, PresentedRootAccess, RecoverRootReply,
+    RecoverRootRequest, RegisterNodeReply, RegisterNodeRequest, RenewDfsWriteLeaseRequest,
+    ReserveRootReply, ReserveRootRequest, ResolveDfsLockAuthorityReply,
+    ResolveDfsLockAuthorityRequest, ResolveDfsWriteAuthorityReply, ResolveDfsWriteAuthorityRequest,
+    RootCommand, RootCommandBatchCompacted, RootCommandBatchEvents, RootCommandBatchReply,
+    RootCommandBatchUnsupported, RootCommandRecoveryCursor, RootCommandRecoveryReason,
+    RootCommandType, RootLocation, RootReservation, RootRight as PbRootRight,
+    SyncDfsInodeMetadataReply, SyncDfsInodeMetadataRequest, ValidateDfsReplicaWriteReply,
+    ValidateDfsReplicaWriteRequest, ValidateRootAccessReply, ValidateRootAccessRequest,
+    WatchRootCommandsRequest, dfs_meta_server::DfsMeta as DfsMetaService,
+    meta_server::Meta as MetaService, owner_roots_server::OwnerRoots as OwnerRootsService,
 };
 use std::{pin::Pin, sync::Arc, time::Duration};
 use tokio_stream::Stream;
@@ -333,6 +336,73 @@ fn root_command_batch_reply_from_domain(
     }
 }
 
+fn outlet_recovery_reason_to_wire(reason: RecoveryReason) -> OutletEventRecoveryReason {
+    match reason {
+        RecoveryReason::WatchCompacted => OutletEventRecoveryReason::WatchCompacted,
+        RecoveryReason::NodeSessionRestarted => OutletEventRecoveryReason::NodeSessionRestarted,
+        RecoveryReason::BackendLeaderChanged => OutletEventRecoveryReason::BackendLeaderChanged,
+    }
+}
+
+fn outlet_event_to_wire(event: super::owner_roots::WatchedOutletEvent) -> OutletEvent {
+    let kind = match event.event {
+        super::owner_roots::OutletEvent::RootActivated { root } => {
+            afs_protocol::meta::outlet_event::Kind::RootActivated(OutletEventRootActivated {
+                root: Some(wire_location(root)),
+            })
+        }
+        super::owner_roots::OutletEvent::RootDeleted { root_id } => {
+            afs_protocol::meta::outlet_event::Kind::RootDeleted(OutletEventRootDeleted { root_id })
+        }
+        super::owner_roots::OutletEvent::NodeSessionRegistered {
+            node_id,
+            session_id,
+        } => afs_protocol::meta::outlet_event::Kind::NodeSessionRegistered(
+            OutletEventNodeSessionRegistered {
+                node_id,
+                session_id,
+            },
+        ),
+    };
+    OutletEvent {
+        revision: event.revision.0,
+        kind: Some(kind),
+    }
+}
+
+fn outlet_event_batch_reply_from_domain(
+    batch: super::owner_roots::OutletEventBatch,
+) -> OutletEventBatchReply {
+    let result = match batch {
+        super::owner_roots::OutletEventBatch::Events {
+            start_revision,
+            next_revision,
+            events,
+        } => afs_protocol::meta::outlet_event_batch_reply::Result::Events(OutletEventBatchEvents {
+            start_revision: start_revision.0,
+            next_revision: next_revision.0,
+            events: events.into_iter().map(outlet_event_to_wire).collect(),
+        }),
+        super::owner_roots::OutletEventBatch::Compacted {
+            requested_after,
+            compacted_to,
+            recovery,
+        } => afs_protocol::meta::outlet_event_batch_reply::Result::Compacted(
+            OutletEventBatchCompacted {
+                requested_after: requested_after.0,
+                compacted_to: compacted_to.0,
+                recovery_cursor: Some(OutletEventRecoveryCursor {
+                    resume_after: recovery.resume_after.0,
+                    reason: outlet_recovery_reason_to_wire(recovery.reason).into(),
+                }),
+            },
+        ),
+    };
+    OutletEventBatchReply {
+        result: Some(result),
+    }
+}
+
 #[tonic::async_trait]
 impl MetaService for MetaRpc {
     async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PingReply>, Status> {
@@ -444,6 +514,33 @@ impl MetaService for MetaRpc {
             lease_epoch,
             expires_at_unix_ms,
             found: lease_epoch != 0,
+        }))
+    }
+
+    async fn list_nodes(
+        &self,
+        request: Request<ListNodesRequest>,
+    ) -> Result<Response<ListNodesReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        require_text(&request.node_id, "node_id")?;
+        require_text(&request.session_id, "session_id")?;
+        if let Some(authenticated) = authenticated
+            && authenticated != request.node_id
+        {
+            return Err(permission_denied(format!(
+                "authenticated node {authenticated} does not match node_id {}",
+                request.node_id
+            )));
+        }
+        let (sessions, authority_revision) = self
+            .0
+            .list_nodes(&request.node_id, &request.session_id)
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(ListNodesReply {
+            nodes: sessions.into_iter().map(wire_node).collect(),
+            authority_revision: authority_revision.0,
         }))
     }
 }
@@ -810,6 +907,66 @@ impl OwnerRootsService for OwnerRootsRpc {
             .check()
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
         Ok(Response::new(reply))
+    }
+
+    async fn poll_outlet_events(
+        &self,
+        request: Request<PollOutletEventsRequest>,
+    ) -> Result<Response<OutletEventBatchReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        require_text(&request.node_id, "node_id")?;
+        require_text(&request.session_id, "session_id")?;
+        if let Some(authenticated) = authenticated
+            && authenticated != request.node_id
+        {
+            return Err(permission_denied(format!(
+                "authenticated node {authenticated} does not match node_id {}",
+                request.node_id
+            )));
+        }
+        let batch = self
+            .0
+            .owner_roots
+            .poll_outlet_events(super::owner_roots::PollOutletEventsInput {
+                node_id: request.node_id,
+                session_id: request.session_id,
+                after_revision: request.after_revision,
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(outlet_event_batch_reply_from_domain(batch)))
+    }
+
+    async fn list_outlet_roots(
+        &self,
+        request: Request<ListOutletRootsRequest>,
+    ) -> Result<Response<ListOutletRootsReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        require_text(&request.node_id, "node_id")?;
+        require_text(&request.session_id, "session_id")?;
+        if let Some(authenticated) = authenticated
+            && authenticated != request.node_id
+        {
+            return Err(permission_denied(format!(
+                "authenticated node {authenticated} does not match node_id {}",
+                request.node_id
+            )));
+        }
+        let output = self
+            .0
+            .owner_roots
+            .list_outlet_roots(super::owner_roots::ListOutletRootsInput {
+                node_id: request.node_id,
+                session_id: request.session_id,
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(ListOutletRootsReply {
+            roots: output.active_roots.into_iter().map(wire_location).collect(),
+            authority_revision: output.authority_revision.0,
+        }))
     }
 
     async fn ack_revocation(

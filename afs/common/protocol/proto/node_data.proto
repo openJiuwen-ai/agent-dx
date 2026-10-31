@@ -278,6 +278,9 @@ service OwnerFiles {
   rpc Mknod(OwnerMknodRequest) returns (OwnerMknodReply);
   rpc Unlink(OwnerUnlinkRequest) returns (OwnerUnlinkReply);
   rpc Rmdir(OwnerRmdirRequest) returns (OwnerRmdirReply);
+  // 删除整个 root（workspace）。只能由 Home 执行：Home 拥有物理目录和 catalog。
+  // 非 Home 节点把请求转发到 Home，成功后清理本节点的 FUSE 索引。
+  rpc DeleteRoot(OwnerDeleteRootRequest) returns (OwnerDeleteRootReply);
   rpc Rename(OwnerRenameRequest) returns (OwnerRenameReply);
   rpc Open(OwnerOpenRequest) returns (OwnerOpenReply);
   rpc Readlink(OwnerReadlinkRequest) returns (OwnerReadlinkReply);
@@ -572,6 +575,14 @@ message OwnerRmdirRequest {
 }
 
 message OwnerRmdirReply {}
+
+// 删除整个 root。携带完整的 RootAccess，Home 用 Meta 校验 Admin 权利、
+// root_epoch 与 access_generation；Home 只用自己的 catalog 定位物理目录。
+message OwnerDeleteRootRequest {
+  RootAccess access = 1;
+}
+
+message OwnerDeleteRootReply {}
 
 message OwnerRenameRequest {
   RootAccess access = 1;

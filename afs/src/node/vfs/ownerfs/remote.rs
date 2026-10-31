@@ -77,6 +77,16 @@ pub trait RemoteFiles: Send + Sync {
         Err(lock_unsupported())
     }
 
+    /// 删除整个 root（workspace）。只有 Home 能执行：Home 拥有物理目录与
+    /// catalog，非 Home 节点必须把请求转发给 Home。默认实现拒绝，避免
+    /// 未实现该能力的传输层静默吞掉删除。
+    fn delete_root(&self, _grant: &RootGrant) -> Result<()> {
+        Err(Error::coded(
+            afs_error::NODE_VFS_UNIMPLEMENTED,
+            "OwnerFs remote root deletion is not implemented by this transport",
+        ))
+    }
+
     fn lookup(
         &self,
         grant: &RootGrant,

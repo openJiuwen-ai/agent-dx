@@ -510,6 +510,42 @@ DFS的版本复用与read-ahead设置不覆盖OwnerFs策略。read-ahead是向�
 bind 与远端访问共享底层文件，新打开的可见性及权限仍需按支持范围验证；
 图示不承诺已有 FD/mmap 即时撤权或跨节点锁一致性。
 
+## Outlet 预挂载网格
+
+Outlet（`afs/src/node/outlet/`）是可选的多节点 workspace 发布面：每个 Node
+把本节点 OwnerFs 的 `users_root` 与远端成员预挂载的 users 树，统一发布为
+`public_root` 下的 workspace symlink。部署方负责建立并维持全部挂载，AFS
+只做只读校验和探活，缺失或漂移只告警，永不自行挂载或修复。
+
+- 物理层 `users_root`：OwnerFs 的 `LocalFs` 根；工作区物理目录名是
+  `<workspace>-e<epoch>`（D11，代次进目录名），公开名与容器内路径仍是
+  `<workspace>`。
+- 拓扑层 `import_root`：`<import_root>/<node>/users` 是各远端成员的 NFS
+  import 挂载点；`transport` 模块是传输知识唯一居所，策略层只依赖
+  `TransportBackend`。
+- 表现层 `public_root`：部署方提供的 tmpfs；`publish` 单写者通过
+  `.pub/` 暂存 + rename 原子亮出 symlink，删除走 unlink，失效实体移入
+  `.quarantine/` 保留证据。symlink target 自带代次，因此同名重建后旧代
+  链接指向不存在的路径：窗口内的读者从读到旧代数据（fail-open）降为
+  `ENOENT`（fail-closed）。`/public/<name>` 是唯一对外契约，禁止解析
+  target 反推物理目录。
+
+Meta 通过 `ListNodes` 提供 live 成员表，通过 `PollOutletEvents` /
+`ListOutletRoots` 提供 Root 激活、Root 删除与 NodeSession 注册事件及全量
+Active 快照。三者在服务端都要求调用方当前 live 会话。拓扑 worker 每 10s
+拉取成员表，按成员隔离探针；发布 worker 以 250ms 游标轮询事件，并以
+60s 全量对账兜底。`Compacted` 是例行恢复信号：消费者改用全量快照重建，
+不退出进程。
+
+Root 身份保持 canonical（`root-<lowercase hex>`），Meta 在 Reserve 入口
+拒绝裸名、非规范 hex 以及解码后命中的内部保留名（`.pub`、
+`.quarantine`、`.ownerfs-roots`）。Root 物理删除先行，非空目录返回
+`ENOTEMPTY` 时零副作用，与本地 POSIX 语义一致；同名重建依据
+`local_prepare_id` 而非恒为 1 的 epoch 拒绝上一代残留。
+
+该能力只覆盖上述发布面：不提供容器内 bind mount、跨节点锁、NFS server
+导出或自动挂载。运行验收仍以部署拓扑和实际 Linux 证据为准。
+
 ## DFS 外部对象持久化边界
 
 ![DFS 外部 S3 写入发布与独立读取](../../assets/architecture/afs-dfs-s3.svg)

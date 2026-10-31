@@ -65,9 +65,9 @@ use afs_protocol::node_control::{OwnerCloseDataRequest, OwnerNegotiateDataReques
 use afs_protocol::node_data::DfsNegotiateRdmaReply;
 #[cfg(feature = "ownerfs")]
 use afs_protocol::node_data::{
-    DataPlane, FileIdentity as PbFileIdentity, OwnerCreateRequest, OwnerDirectoryHandle,
-    OwnerFileAttr, OwnerFileKind, OwnerFlushRequest, OwnerFsyncDirRequest, OwnerFsyncRequest,
-    OwnerGetAttrRequest, OwnerGetXattrRequest, OwnerHandle, OwnerLinkRequest,
+    DataPlane, FileIdentity as PbFileIdentity, OwnerCreateRequest, OwnerDeleteRootRequest,
+    OwnerDirectoryHandle, OwnerFileAttr, OwnerFileKind, OwnerFlushRequest, OwnerFsyncDirRequest,
+    OwnerFsyncRequest, OwnerGetAttrRequest, OwnerGetXattrRequest, OwnerHandle, OwnerLinkRequest,
     OwnerListXattrRequest, OwnerLookupRequest, OwnerMkdirRequest, OwnerMknodRequest,
     OwnerOpenRequest, OwnerOpendirRequest, OwnerReadRequest, OwnerReaddirRequest,
     OwnerReadlinkRequest, OwnerReleaseDirRequest, OwnerReleaseRequest, OwnerRemoveXattrRequest,
@@ -5527,6 +5527,17 @@ impl RemoteFiles for OwnerPeerClient {
                 expected_file_identity: expected_identity.map(file_identity),
                 expected_parent: Some(file_identity(expected_parent)),
                 caller: Some(owner_caller(ctx)),
+            }
+        );
+        Ok(())
+    }
+
+    fn delete_root(&self, grant: &RootGrant) -> afs_error::Result<()> {
+        let _reply = owner_rpc!(
+            self,
+            delete_root,
+            OwnerDeleteRootRequest {
+                access: Some(root_access(grant)),
             }
         );
         Ok(())

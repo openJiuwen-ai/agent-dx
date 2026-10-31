@@ -910,6 +910,29 @@ cargo test --locked --release -p afs --lib --all-features meta::store::log::test
 ```
 
 
+## Outlet 预挂载网格回归
+
+```sh
+cargo test -p afs --test config_contract
+cargo test -p afs --test meta_contract
+cargo test -p afs --lib node::outlet --locked
+```
+
+配置契约覆盖：三路径 all-or-none、绝对路径/无遍历、路径互斥与 `data_dir`
+隔离、OwnerFs/Meta 角色限制、legacy egress 与 native workspace 互斥、
+`outlet_transport` 只接受 `nfs`，以及 `ownerfs_storage_root` 的 users_root
+存在性检查。
+
+Meta 契约覆盖：`ListNodes` 只返回 live 会话并按 node_id 排序，非当前会话被
+拒绝；`PollOutletEvents` 不暴露 pending reservation、游标可续拉；`ListOutletRoots`
+返回全集群 Active 根且 revision 可作为事件游标锚点；无 store 时 fail-closed。
+
+Node 单元测试覆盖：带代次的物理目录 `<workspace>-e<epoch>`、canonical root id
+编解码与保留名拒绝、非空目录删除零副作用、发布/摘牌/隔离/欠账重试。
+
+这些用例验证代码契约，不等价于真实 NFS import、多节点网格、内核 hard mount
+失联或完整端到端验收；后者须在部署拓扑中单独记录证据。
+
 ## OwnerFs epoch 与有界 grant 清理回归
 
 ```sh

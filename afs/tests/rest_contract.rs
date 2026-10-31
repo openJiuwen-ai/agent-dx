@@ -129,12 +129,19 @@ async fn register_node_with_ttl(meta: &Meta, session_id: &str, ttl: Duration) {
     .unwrap();
 }
 
-async fn activate_root(meta: &Meta, root_id: &str, session_id: &str) {
+/// Node 编码器的字节级等价实现：Meta 只接受 `root-<lowercase hex>` 规范 id。
+fn canonical_root_id(name: &str) -> String {
+    let encoded: String = name.bytes().map(|byte| format!("{byte:02x}")).collect();
+    format!("root-{encoded}")
+}
+
+async fn activate_root(meta: &Meta, root_name: &str, session_id: &str) {
+    let root_id = canonical_root_id(root_name);
     let reserved = meta
         .owner_roots
         .reserve_root(ReserveRootInput {
             request_id: format!("reserve-{root_id}"),
-            root_id: root_id.into(),
+            root_id: root_id.clone(),
             preferred_home_node_id: "node-a".into(),
             session_id: session_id.into(),
             rights: vec![StoreRootRight::Lookup, StoreRootRight::Write],
@@ -195,11 +202,12 @@ async fn root_location_reports_serving_for_live_exact_home_session() {
     let (meta, _store) = meta_with_memory_store().await;
     register_node_with_ttl(&meta, "session-live", Duration::from_secs(30)).await;
     activate_root(&meta, "workspace-live", "session-live").await;
+    let root_id = canonical_root_id("workspace-live");
 
-    let (status, body) = get_json(meta, "/v1/roots/workspace-live").await;
+    let (status, body) = get_json(meta, &format!("/v1/roots/{root_id}")).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["root_id"], "workspace-live");
+    assert_eq!(body["root_id"].as_str(), Some(root_id.as_str()));
     assert_eq!(body["status"], "serving");
     assert_eq!(body["home_serving"], true);
     assert_eq!(body["home_node_id"], "node-a");
@@ -213,11 +221,12 @@ async fn root_location_keeps_owner_but_reports_unavailable_for_expired_home_sess
     register_node_with_ttl(&meta, "session-expired", Duration::from_millis(50)).await;
     activate_root(&meta, "workspace-expired", "session-expired").await;
     tokio::time::sleep(Duration::from_millis(80)).await;
+    let root_id = canonical_root_id("workspace-expired");
 
-    let (status, body) = get_json(meta, "/v1/roots/workspace-expired").await;
+    let (status, body) = get_json(meta, &format!("/v1/roots/{root_id}")).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["root_id"], "workspace-expired");
+    assert_eq!(body["root_id"].as_str(), Some(root_id.as_str()));
     assert_eq!(body["status"], "unavailable");
     assert_eq!(body["home_serving"], false);
     assert_eq!(body["owner"], "node-a");
@@ -244,7 +253,11 @@ async fn health_uses_backend_probe_not_cached_read_view() {
     assert_eq!(health_status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(health_body["error"]["kind"], "Unavailable");
 
-    let (root_status, root_body) = get_json(meta.clone(), "/v1/roots/workspace-live").await;
+    let (root_status, root_body) = get_json(
+        meta.clone(),
+        &format!("/v1/roots/{}", canonical_root_id("workspace-live")),
+    )
+    .await;
     assert_eq!(root_status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(root_body["error"]["kind"], "Unavailable");
 

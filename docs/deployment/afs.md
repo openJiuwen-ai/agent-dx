@@ -174,6 +174,96 @@ false；可在TOML或CLI（`--tls-encryption-enabled true|false`）覆盖。fals
 `node.toml` 中启用对应 `ownerfs_mount` 或 `dfs_mount`。挂载所有者捕获的 canonical
 path、mount ID 和 source 同时作为 readiness 身份；挂载被替换时健康检查继续失败关闭。
 
+## Outlet 预挂载网格配置
+
+Outlet 可选启用，要求 Node 已启用 OwnerFs（`fs = "ownerfs"` 或 `"all"`），
+并与 legacy egress（`experimental_ownerfs_workspace_bind`）及
+`experimental_native_workspace` 互斥。三个路径必须同时设置，缺一即拒绝启动：
+
+```toml
+outlet_users_root  = "/mnt/adx/users"
+outlet_import_root = "/mnt/adx/imports"
+outlet_public_root = "/mnt/adx/public"
+
+[outlet_transport]
+backend = "nfs"   # v1 唯一合法值；省略时同样按 nfs 语义运行
+```
+
+部署方必须先准备挂载，`afs-node` 只读校验：
+
+```sh
+mount -o rw,nosuid,nodev <device> /mnt/adx/users && chmod 0711 /mnt/adx/users
+mount -t tmpfs -o size=64m,mode=0755,nosuid,nodev tmpfs /mnt/adx/public
+mount -t nfs <peer>:/<users_root> /mnt/adx/imports/<peer>/users
+```
+
+约束：
+
+- 三个路径都必须是绝对路径、不含 `.`/`..`，彼此不重叠，也不与 `data_dir` 重叠；
+- `outlet_users_root` 是 OwnerFs 物理存储根，启动时必须已存在，否则 fail-fast，
+  避免数据写到根文件系统；
+- `outlet_public_root` 必须是已挂载的 tmpfs；节点启动时会校验，缺失即失败；
+- 每个 live 成员的 `<import_root>/<node>/users` 必须由部署方预挂载；缺失或
+  文件系统类型漂移只告警并在拓扑中标记，不自动补挂；
+- 工作区物理目录名是 `<workspace>-e<epoch>`（代次进目录名）；公开名与容器内
+  路径仍是 `<workspace>`，`/public/<name>` 是唯一对外契约，禁止解析其 target
+  反推物理目录；
+- `/public/<name>` 的 target 自带代次：同名重建后旧代链接指向不存在的路径，
+  因此窗口内的读者从 fail-open（读到旧代数据）降为 fail-closed（读到 ENOENT）；
+- Root id 必须是 canonical `root-<lowercase hex>`，内部保留名（`.pub`、
+  `.quarantine`、`.ownerfs-roots`）会被拒绝。
+
+### 部署前提检查清单
+
+AFS 只校验 `outlet_public_root` 的挂载类型（tmpfs）、`outlet_users_root` 的
+存在性与 `pub` 保留目录的创建；**mount flags 与权限位一律不校验**，安全属性
+完全由部署方负责，上线前需逐项确认：
+
+1. 数据卷、public tmpfs 与各成员 NFS import 三处都必须携带 `nosuid,nodev`：
+
+   ```sh
+   findmnt -no SOURCE,FSTYPE,OPTIONS /mnt/adx/users
+   findmnt -no SOURCE,FSTYPE,OPTIONS /mnt/adx/public
+   findmnt -no SOURCE,FSTYPE,OPTIONS /mnt/adx/imports/<peer>/users
+   ```
+
+2. `.pub` 与 `.quarantine` 必须为 `0700`。AFS 只在**创建时**设置权限，已存在的
+   目录不会被校验或改权：
+
+   ```sh
+   install -d -m 0700 /mnt/adx/public/.pub /mnt/adx/public/.quarantine
+   stat -c '%a %n' /mnt/adx/public/.pub /mnt/adx/public/.quarantine
+   ```
+
+### `.quarantine` 与 tmpfs 容量
+
+`.quarantine/` 只进不出：失效入口被移入后 AFS **不回收**，需外部任务按需清理。
+`outlet_public_root` 按 `size=64m` 部署（见上文示例），占满后 `symlink`/`rename`
+返回 `ENOSPC`，表现为**该节点所有新发布失败，而已有入口与探测均正常**，因此需
+同时监控 tmpfs 使用率与发布失败日志。
+
+### 删除失败后的重试
+
+删除在 Meta 不可达处（deactivate 失败）中断后，重试删除即可完成收敛、**无需
+重启**；Home 本地与任意节点发起的删除均适用。注意"删除成功后立即同名重建 +
+重发删除"属于未定义边界（删除请求只带名字），部署与运维侧应避免，待名字级
+tombstone 立项解决。
+
+## 升级与迁移边界
+
+v1 尚未发布，**仅支持新部署，不支持原地升级**（无存量数据，因而不提供自动迁移）。
+本版本同时改变了 OwnerFs 物理布局：
+
+- workspace 物理目录名由裸名改为 `<workspace>-e<epoch>`（代次进目录名，见
+  [架构](../architecture/afs.md) 的 D11 与发布面布局）；
+- OwnerFs 物理根由 `<data_dir>/ownerfs` 改为 `outlet_users_root`。
+
+启动时若发现旧布局，Node 会 fail-fast 并列出命中的记录（workspace 名、旧目录名、
+期望目录名），而不是笼统的身份校验失败。确需保留旧数据时，只能手工迁移：
+把 workspace 目录**与** `.ownerfs-roots/` 一并搬到 `outlet_users_root`，并把每条
+JSON 记录里的 `data_dir` 改为新目录名；只搬目录不搬 catalog、或不改写 `data_dir`
+都会仍然启动失败。
+
 ## OwnerFs workspace bind ON
 
 普通发行默认关闭 workspace bind。当前实际试用场景需要显式开启，示例字段以 `build/config/examples/afs/node.toml` 为准；历史 `native_workspace` 命名只作为兼容入口，不能作为新的核心能力名称。

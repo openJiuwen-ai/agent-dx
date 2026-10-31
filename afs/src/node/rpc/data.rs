@@ -2169,24 +2169,6 @@ use std::{
 };
 
 #[cfg(feature = "ownerfs")]
-use afs_protocol::node_data::{
-    OwnerCreateReply, OwnerCreateRequest, OwnerDirEntry, OwnerDirectoryHandle, OwnerFlushReply,
-    OwnerFlushRequest, OwnerFsyncDirReply, OwnerFsyncDirRequest, OwnerFsyncReply,
-    OwnerFsyncRequest, OwnerGetAttrReply, OwnerGetAttrRequest, OwnerGetXattrReply,
-    OwnerGetXattrRequest, OwnerLinkReply, OwnerLinkRequest, OwnerListXattrReply,
-    OwnerListXattrRequest, OwnerLookupReply, OwnerLookupRequest, OwnerMkdirReply,
-    OwnerMkdirRequest, OwnerMknodReply, OwnerMknodRequest, OwnerOpenReply, OwnerOpenRequest,
-    OwnerOpendirReply, OwnerOpendirRequest, OwnerReadReply, OwnerReadRequest, OwnerReaddirReply,
-    OwnerReaddirRequest, OwnerReadlinkReply, OwnerReadlinkRequest, OwnerReleaseDirReply,
-    OwnerReleaseDirRequest, OwnerReleaseReply, OwnerReleaseRequest, OwnerRemoveXattrReply,
-    OwnerRemoveXattrRequest, OwnerRenameReply, OwnerRenameRequest, OwnerRmdirReply,
-    OwnerRmdirRequest, OwnerSetAttrReply, OwnerSetAttrRequest, OwnerSetXattrReply,
-    OwnerSetXattrRequest, OwnerStatFsReply, OwnerStatFsRequest, OwnerSymlinkReply,
-    OwnerSymlinkRequest, OwnerUnlinkReply, OwnerUnlinkRequest, OwnerWriteReply, OwnerWriteRequest,
-    owner_files_server::{OwnerFiles, OwnerFilesServer},
-};
-
-#[cfg(feature = "ownerfs")]
 use crate::node::vfs::{
     ownerfs::{
         OwnerFsPeerExecutor,
@@ -2197,6 +2179,24 @@ use crate::node::vfs::{
         AttributeChange, FileAttributes, FileKind, FilesystemCapacity, OpenOptions, RenameFlags,
         RequestContext, SetAttrOptions, SpecialFileKind, WriteOptions,
     },
+};
+#[cfg(feature = "ownerfs")]
+use afs_protocol::node_data::{
+    OwnerCreateReply, OwnerCreateRequest, OwnerDeleteRootReply, OwnerDeleteRootRequest,
+    OwnerDirEntry, OwnerDirectoryHandle, OwnerFlushReply, OwnerFlushRequest, OwnerFsyncDirReply,
+    OwnerFsyncDirRequest, OwnerFsyncReply, OwnerFsyncRequest, OwnerGetAttrReply,
+    OwnerGetAttrRequest, OwnerGetXattrReply, OwnerGetXattrRequest, OwnerLinkReply,
+    OwnerLinkRequest, OwnerListXattrReply, OwnerListXattrRequest, OwnerLookupReply,
+    OwnerLookupRequest, OwnerMkdirReply, OwnerMkdirRequest, OwnerMknodReply, OwnerMknodRequest,
+    OwnerOpenReply, OwnerOpenRequest, OwnerOpendirReply, OwnerOpendirRequest, OwnerReadReply,
+    OwnerReadRequest, OwnerReaddirReply, OwnerReaddirRequest, OwnerReadlinkReply,
+    OwnerReadlinkRequest, OwnerReleaseDirReply, OwnerReleaseDirRequest, OwnerReleaseReply,
+    OwnerReleaseRequest, OwnerRemoveXattrReply, OwnerRemoveXattrRequest, OwnerRenameReply,
+    OwnerRenameRequest, OwnerRmdirReply, OwnerRmdirRequest, OwnerSetAttrReply, OwnerSetAttrRequest,
+    OwnerSetXattrReply, OwnerSetXattrRequest, OwnerStatFsReply, OwnerStatFsRequest,
+    OwnerSymlinkReply, OwnerSymlinkRequest, OwnerUnlinkReply, OwnerUnlinkRequest, OwnerWriteReply,
+    OwnerWriteRequest,
+    owner_files_server::{OwnerFiles, OwnerFilesServer},
 };
 
 /// Home 侧真实文件操作接口。
@@ -2311,6 +2311,14 @@ pub trait OwnerFilesHandler: Send + Sync + 'static {
     ) -> afs_error::Result<OwnerRmdirReply> {
         let _ = (authenticated_peer_node_id, request);
         Err(owner_handler_unimplemented("OwnerFiles.Rmdir"))
+    }
+    fn delete_root(
+        &self,
+        authenticated_peer_node_id: &str,
+        request: OwnerDeleteRootRequest,
+    ) -> afs_error::Result<OwnerDeleteRootReply> {
+        let _ = (authenticated_peer_node_id, request);
+        Err(owner_handler_unimplemented("OwnerFiles.DeleteRoot"))
     }
     fn rename(
         &self,
@@ -2794,6 +2802,17 @@ impl OwnerFilesHandler for OwnerFsPeerHandler {
             &expected_parent,
         )?;
         Ok(OwnerRmdirReply {})
+    }
+
+    fn delete_root(
+        &self,
+        authenticated_peer_node_id: &str,
+        request: OwnerDeleteRootRequest,
+    ) -> afs_error::Result<OwnerDeleteRootReply> {
+        let access = presented_access(request.access)?;
+        self.executor
+            .delete_root(authenticated_peer_node_id, &access)?;
+        Ok(OwnerDeleteRootReply {})
     }
 
     fn rename(
@@ -4052,6 +4071,18 @@ impl OwnerFiles for OwnerFilesService {
         self.dispatch(request, "OwnerFiles.Rmdir", |handler, peer, request| {
             handler.rmdir(&peer, request)
         })
+        .await
+    }
+
+    async fn delete_root(
+        &self,
+        request: Request<OwnerDeleteRootRequest>,
+    ) -> Result<Response<OwnerDeleteRootReply>, Status> {
+        self.dispatch(
+            request,
+            "OwnerFiles.DeleteRoot",
+            |handler, peer, request| handler.delete_root(&peer, request),
+        )
         .await
     }
 

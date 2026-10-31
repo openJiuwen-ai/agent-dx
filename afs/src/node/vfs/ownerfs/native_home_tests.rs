@@ -624,10 +624,10 @@ fn rmdir_root_then_recreate_same_name_succeeds() {
     assert!(second_data_dir.join("new").exists());
 }
 
-/// VC-D4：并发 rmdir 恰好一个成功，另一个在解析或缓存线性化点失败
-/// （ENOENT 或 invalid grant 错误）。
+/// VC-D4 / §2.16：并发 rmdir 均成功（删除幂等）。后到的一方在缓存或
+/// catalog 上看到前一方已完成的工作，按"已删除"收敛而不是报错。
 #[test]
-fn concurrent_rmdir_root_single_winner() {
+fn concurrent_rmdir_root_is_idempotent() {
     let (_temp, owner, ctx, _disk) = fixture(false);
     mkdir_root(&owner, &ctx, "d4");
     let owner = Arc::new(owner);
@@ -647,17 +647,12 @@ fn concurrent_rmdir_root_single_winner() {
             .map(|handle| handle.join().unwrap())
             .collect()
     });
-    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
-    let loser_codes: Vec<_> = results
-        .iter()
-        .filter_map(|result| result.as_ref().err())
-        .map(|error| error.code())
-        .collect();
-    assert_eq!(loser_codes.len(), 1);
-    assert!(matches!(
-        loser_codes[0],
-        afs_error::NODE_VFS_NOT_FOUND | afs_error::NODE_OWNER_INVALID_GRANT
-    ));
+    for result in &results {
+        assert!(
+            result.is_ok(),
+            "concurrent rmdir must be idempotent: {result:?}"
+        );
+    }
     // 最终状态干净：lookup ENOENT、catalog 空。
     assert!(Backend::lookup(owner.as_ref(), &ctx, owner.root_inode(), OsStr::new("d4")).is_err());
     assert!(
@@ -684,11 +679,8 @@ fn rmdir_root_meta_deactivate_failure_returns_error_and_keeps_state_repairable()
     let error = Backend::rmdir(&owner, &ctx, owner.root_inode(), OsStr::new("d6")).unwrap_err();
     assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE);
 
-    // 失败未损毁持久状态：Meta active 仍含该 root、物理目录仍在（catalog
-    // 记录保留，否则删除流程不会停在物理目录之前）。
-    assert!(meta.lookup_root(&root_id).unwrap().is_some());
-    assert!(data_dir.exists());
-    // 缓存移除是并发线性化点，与 Meta 无关，必然已发生。
+    // 物理删除与缓存移除先于 deactivate 执行（线性化点与 Meta 无关）。
+    assert!(!data_dir.exists());
     assert!(
         owner
             .require_local()
@@ -697,6 +689,17 @@ fn rmdir_root_meta_deactivate_failure_returns_error_and_keeps_state_repairable()
             .cached_local_roots()
             .unwrap()
             .is_empty()
+    );
+    // 残留 = Meta active + catalog 记录（zombie 检测的收敛输入，不可丢失）。
+    // catalog 独占锁由 manager 持有，从磁盘布局验证记录文件仍在。
+    assert!(meta.lookup_root(&root_id).unwrap().is_some());
+    let catalog_dir = temp.path().join(".ownerfs-roots");
+    assert_eq!(
+        std::fs::read_dir(&catalog_dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .count(),
+        1
     );
 
     // 故障恢复后 Meta 可正常清理，active 不再残留（状态可收敛）。

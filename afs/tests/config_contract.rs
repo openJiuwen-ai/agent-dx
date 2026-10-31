@@ -1274,6 +1274,218 @@ fn ownerfs_workspace_bind_requires_isolated_egress_root() {
     );
 }
 
+#[cfg(feature = "ownerfs")]
+fn outlet_config(users: &str, import: &str, public: &str) -> String {
+    format!(
+        "fs='ownerfs'\ndata_dir='/tmp/afs-outlet/data'\noutlet_users_root={users:?}\noutlet_import_root={import:?}\noutlet_public_root={public:?}\n"
+    )
+}
+
+#[cfg(feature = "ownerfs")]
+#[test]
+fn outlet_paths_are_all_or_none_and_enable_the_storage_root_switch() {
+    let default = Config::resolve(Role::Node, Cli::default()).unwrap();
+    assert!(default.outlet.is_none());
+    assert!(default.outlet_transport.is_none());
+    assert_eq!(
+        default.ownerfs_storage_root().unwrap(),
+        default.data_dir.join("ownerfs")
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let users = dir.path().join("users");
+    std::fs::create_dir(&users).unwrap();
+    let import = dir.path().join("import");
+    let public = dir.path().join("public");
+    let path = dir.path().join("node.toml");
+    std::fs::write(
+        &path,
+        outlet_config(
+            users.to_str().unwrap(),
+            import.to_str().unwrap(),
+            public.to_str().unwrap(),
+        ),
+    )
+    .unwrap();
+    let cfg = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+    .unwrap();
+    let outlet = cfg
+        .outlet
+        .as_ref()
+        .expect("outlet paths configure the grid");
+    assert_eq!(outlet.users_root, users);
+    assert_eq!(outlet.import_root, import);
+    assert_eq!(outlet.public_root, public);
+    assert_eq!(cfg.ownerfs_storage_root().unwrap(), users);
+
+    // 部分设置即拒绝，避免半配置网格。
+    for partial in [
+        format!("outlet_users_root={:?}\n", users.to_str().unwrap()),
+        format!(
+            "outlet_users_root={:?}\noutlet_import_root={:?}\n",
+            users.to_str().unwrap(),
+            import.to_str().unwrap()
+        ),
+    ] {
+        std::fs::write(&path, format!("fs='ownerfs'\n{partial}")).unwrap();
+        assert!(
+            Config::resolve(
+                Role::Node,
+                Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()])
+            )
+            .is_err()
+        );
+    }
+
+    // users_root 必须已存在（部署方数据卷）：缺失即 fail-fast。
+    let missing = dir.path().join("missing-users");
+    std::fs::write(
+        &path,
+        outlet_config(
+            missing.to_str().unwrap(),
+            import.to_str().unwrap(),
+            public.to_str().unwrap(),
+        ),
+    )
+    .unwrap();
+    let cfg = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+    .unwrap();
+    let error = cfg.ownerfs_storage_root().unwrap_err();
+    assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+
+    // Meta 角色与未启用 OwnerFs 的 Node 均拒绝。
+    assert!(
+        Config::resolve(
+            Role::Meta,
+            Cli::parse_from(["afs-meta", "--config", path.to_str().unwrap()])
+        )
+        .is_err()
+    );
+    std::fs::write(&path, "fs='dfs'\noutlet_users_root='/tmp/outlet-users'\noutlet_import_root='/tmp/outlet-import'\noutlet_public_root='/tmp/outlet-public'\n").unwrap();
+    assert!(
+        Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()])
+        )
+        .is_err()
+    );
+}
+
+#[cfg(feature = "ownerfs")]
+#[test]
+fn outlet_paths_reject_traversal_overlap_and_legacy_egress_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+    let users = "/tmp/afs-outlet/users";
+    let import = "/tmp/afs-outlet/import";
+    let public = "/tmp/afs-outlet/public";
+
+    for (name, contents) in [
+        ("relative", outlet_config("relative/users", import, public)),
+        (
+            "parent traversal",
+            outlet_config("/tmp/outlet/../users", import, public),
+        ),
+        (
+            "data_dir overlap",
+            outlet_config(users, "/tmp/afs-outlet/data/import", public),
+        ),
+        (
+            "mutual overlap",
+            outlet_config("/tmp/afs-outlet", "/tmp/afs-outlet/import", public),
+        ),
+        (
+            "legacy egress",
+            format!(
+                "{}experimental_ownerfs_workspace_bind=true\n[ownerfs_workspace_bind]\nworkspace='ws'\n",
+                outlet_config(users, import, public)
+            ),
+        ),
+        (
+            "native workspace",
+            format!(
+                "{}experimental_native_workspace=true\n",
+                outlet_config(users, import, public)
+            ),
+        ),
+    ] {
+        std::fs::write(&path, contents).unwrap();
+        assert!(
+            Config::resolve(
+                Role::Node,
+                Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()])
+            )
+            .is_err(),
+            "outlet {name} configuration must be rejected"
+        );
+    }
+}
+
+#[cfg(feature = "ownerfs")]
+#[test]
+fn outlet_transport_backend_defaults_to_none_and_rejects_unknown_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+    let base = outlet_config(
+        "/tmp/afs-outlet/users",
+        "/tmp/afs-outlet/import",
+        "/tmp/afs-outlet/public",
+    );
+    std::fs::write(&path, format!("{base}[outlet_transport]\nbackend='nfs'\n")).unwrap();
+    let cfg = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+    .unwrap();
+    assert_eq!(
+        cfg.outlet_transport
+            .as_ref()
+            .map(|transport| transport.backend.as_str()),
+        Some("nfs")
+    );
+
+    std::fs::write(&path, format!("{base}[outlet_transport]\nbackend='smb'\n")).unwrap();
+    assert!(
+        Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()])
+        )
+        .is_err()
+    );
+
+    // 空节：节存在但 backend 缺失 → 拒绝（不默认为 nfs）。
+    std::fs::write(&path, format!("{base}[outlet_transport]\n")).unwrap();
+    assert!(
+        Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()])
+        )
+        .is_err(),
+        "an empty [outlet_transport] section must be rejected"
+    );
+
+    // 未知键：即便 backend 合法，未知字段也拒绝（fail-fast，避免拼写错误静默生效）。
+    std::fs::write(
+        &path,
+        format!("{base}[outlet_transport]\nbackend='nfs'\nmount_options='vers=4'\n"),
+    )
+    .unwrap();
+    assert!(
+        Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()])
+        )
+        .is_err(),
+        "unknown [outlet_transport] keys must be rejected"
+    );
+}
+
 #[test]
 fn fuse_execution_and_dfs_cache_defaults_are_explicit() {
     let cfg = Config::resolve(Role::Node, Cli::default()).unwrap();

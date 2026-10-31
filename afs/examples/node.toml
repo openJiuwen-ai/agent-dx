@@ -12,6 +12,16 @@ data_dir = "/opt/adx/data/afs/node-a"
 uds_path = "/opt/adx/run/afs/node-a.sock"
 # ownerfs_mount = "/mnt/adx/ownerfs"
 # dfs_mount = "/mnt/adx/dfs"
+# Outlet（预挂载网格）三路径 all-or-none；全部设置才启用。
+# 挂载由部署方提供，afs-node 只读校验、永不自行挂载：
+#   mount -o rw,nosuid,nodev <device> /mnt/adx/users && chmod 0711 /mnt/adx/users
+#   mount -t tmpfs -o size=64m,mode=0755,nosuid,nodev tmpfs /mnt/adx/public
+#   mount -t nfs <peer>:/<users_root> /mnt/adx/imports/<peer>/users
+# outlet_users_root = "/mnt/adx/users"
+# outlet_import_root = "/mnt/adx/imports"
+# outlet_public_root = "/mnt/adx/public"
+# [outlet_transport]
+# backend = "nfs"
 # FUSE receive/executor settings shared by OwnerFs and DFS.
 # fuse_threads = 4
 # fuse_clone_fd = true
