@@ -288,6 +288,27 @@ Root 集合每天变化约 200 次。
 **可选定期全量**：若需要清理 ghost，可加 `full_rescan_interval_ms`
 （默认 60000），到期时把 `cached_revision` 置 0 强制全量。首版不实现。
 
+### 5.6 实现状态与未接线项
+
+已实现并在 `afs/src/node/outlet/` 中：纯函数 `plan`、`scan_public`、
+`apply`（staging + rename 原子发布）、`quarantine`、`ensure_public_root_is_tmpfs`、
+`prepare`、`converge`、循环 `run`，以及 `RootMeta::list_active_outlet_roots`
+的 gRPC 客户端与配置三件套接入。
+
+**未接线的项（不要误认为已生效）**：
+
+| 项 | 状态 | 影响 |
+|---|---|---|
+| H11 `generation_grace_ms` | 未实现 | 换代时旧代目录立即可回收，`interval + actimeo` 窗口内新容器可能拿到断链而非旧代 |
+| §5.4 mountinfo 漂移诊断 | 未实现（T2） | 只校验 tmpfs，不告警 `path_missing` / `path_drift` |
+| `full_rescan_interval_ms` | 未实现 | ghost 只在 Root 集合变化时被清理；steady state 下会留存 |
+| T5 部署资产 / T6 双节点验证 | 未开始 | 无部署脚本，无多节点证据 |
+
+在 H11 落地前，一次真正的换代（同一名字新 epoch）在当前实现里会让旧代
+目录按 OwnerFs 常规回收删除，而 `/public` 的 symlink 已先指向新代——因此
+**指向是新的、旧代被删是安全的**；但已 bind 旧代的运行中容器会失去后端
+路径。这条与 §7.4 的窗口分析不同：那里假设宽限期存在。
+
 ## 6. 部署合同
 
 部署方负责（AFS 只校验，见 H3）：
@@ -562,49 +583,40 @@ ENOTEMPTY 的残留是**可回收的**（有 catalog 记录 + 回收循环）；
 
 ### 8.3 第二段：物理回收（异步、幂等、可重试）
 
-**按目录名发现待回收代次，不用 catalog 当删除队列。** 这是本节最关键的决定，
-来自一个实现时踩到的坑：catalog 以 `root_id` 为主键，而 `root_id` 由名字派生
-（`root-<hex(name)>`），所以同名重建会命中同一条记录。若把待回收代次记在
-catalog，只有两种结局：
+**以 catalog 条目为唯一证据，不从目录名推断。** 这是实现时踩过两次坑之后
+定下的边界：
 
-- 记录冲突 → `persist_prepared_root` 返回 `conflicting local root record
-  already exists`，**该名字在对端句柄释放前永久不可用**；
-- 允许覆盖 → 旧代次的回收凭证被新一代覆盖，旧目录变孤儿。
+- 曾按"目录不在 `roots` 缓存 ∪ catalog 的并集内即可回收"实现——这会**误删
+  同名换代后的旧代目录**。旧代在重建时被新 epoch 的记录覆盖，于是既不在
+  缓存也不在 catalog，而 NFS 客户端可能仍 bind 在它上面（§7.5 的窗口）。
+  删掉等于让运行中容器当场失去数据。
+- 也曾让 `reconcile_on_startup` 丢弃条目，导致回收失去证据来源。
 
-两者都不可接受。因此 catalog 回归单一职责（活跃记录），回收靠目录名发现：
+现在的判定需要两个正面证据，缺一不回收：
 
 ```
 每 outlet_reclaim.reclaim_interval_ms（默认 60000），调用
 RootManager::reclaim_deferred()：
-  active = {roots 缓存中每个 root 的 data_dir} ∪ {catalog 每条记录的 data_dir}
-  for name in read_dir(数据根):
-    if !is_data_dir_name(name): continue          // root-<hex>-e<epoch> 形状
-    if active.contains(name): continue            // 活跃代次或 pending 准备目录
-    match disk.remove_dir(name):
-      Ok        → removed += 1
-      NotFound  → 忽略（已不在）
+  cached = {roots 缓存中每个 root 的 data_dir}
+  for record in catalog.scan_roots():
+    if cached.contains(record.data_dir): continue      // 仍活跃
+    match disk.remove_dir(record.data_dir):
+      Ok        → catalog.remove_prepared_root(record)  // 出队
+      NotFound  → catalog.remove_prepared_root(record)
       ENOTEMPTY → pending += 1（对端仍持有，下轮再试）
       other     → 告警 root.reclaim.failed，中止本轮并上抛
-  返回 (removed, pending)
 ```
 
-`active` 的并集就是"不该删"的全集：`roots` 缓存代表当前准入代次，catalog
-记录覆盖"已 prepare 未 activate"的 pending 目录与活跃记录。**不在此并集中的
-`root-*-e*` 目录只可能来自已逻辑删除的代次。**
-
-**配套改动 H19 的语义**：`persist_prepared_root` 遇到同 `root_id` 但**更旧
-epoch** 的记录时允许取代（`existing.epoch < record.epoch`），并记录
-`ownerfs.catalog_supersede_stale_record`；遇到更新的 epoch 仍拒绝（那说明
-本地状态被回退，属错误）。epoch 单调递增且永不重用，因此"更旧"等价于
-"已被 Meta 逻辑删除"。
-
 **硬规则 H21**：回收循环不得阻塞请求路径、不持 `roots` 锁跨越磁盘操作
-（只在开头做一次读锁快照）。它只读 catalog 与磁盘。
+（只在开头做一次读锁快照）。它只读写 catalog 与磁盘。
 
-**为什么不复用 `reconcile_on_startup`**：那个函数（a）只在启动时跑一次，
-（b）按既有约定在 ENOTEMPTY 时移除 catalog 条目并保留目录、不阻塞启动——
-那个行为本身是对的（留下有告警的目录优于阻塞启动），本规范不修改它；
-运行期由 `reclaim_deferred` 补位把它清掉。
+**硬规则 H23**：**不得从"目录不在活跃集合内"推断可回收。** 缺 catalog
+证据的目录一律保持不动。代价是换代旧代目录会长期滞留（见 R11），收益是
+绝不删除可能仍在服务的数据。要缩短滞留只能靠 H11 宽限期，不能靠放宽
+这里的判定。
+
+配套：`reconcile_on_startup` 在 ENOTEMPTY 时**保留 catalog 条目**（否则
+回收失去证据），目录原样保留、不阻塞启动。
 
 ### 8.4 退避与可观测性
 
@@ -675,11 +687,13 @@ outlet_users_root  = "/mnt/adx/users"     # 本机数据根（bind 源，仅用�
 outlet_import_root = "/mnt/adx/imports"   # 统一布局挂载点根
 outlet_public_root = "/mnt/adx/public"    # 表现层 tmpfs
 
-[outlet_mirror]
-interval_ms = 250                    # 可选，默认 250；仅影响发布延迟，不影响数据面
-generation_grace_ms = 120000         # 可选，默认 120000；H11 旧代目录宽限期
-                                     # 约束：≥ max(interval_ms×10, actimeo×2)
-# full_rescan_interval_ms = 60000    # 可选，默认不启用；定期强制全量以清理 ghost
+# 名字面三件套：必须同时配置，只配一半会在启动时报错。
+outlet_public_root      = "/mnt/adx/public"    # tmpfs，必须已是挂载点（启动校验）
+outlet_import_root      = "/mnt/adx/imports"   # 各 home 数据树挂载根
+outlet_mirror_interval_ms = 250                # 可选，默认 250，范围 10..=60000
+
+# H11 旧代目录宽限期（尚未接线，见 T2/T5 遗留项）
+# generation_grace_ms = 120000
 
 # 回收扫描周期。实际实现为 afs-node 的顶层配置项（CLI 为
 # --ownerfs-reclaim-interval-ms），不是 outlet 专有命名空间：
@@ -713,8 +727,8 @@ ownerfs_reclaim_interval_ms = 60000  # 可选，默认 60000；合法范围 10..
 |---|---|---|---|
 | T1 | Meta 只读 RPC + 摘要校验位 | `ListActiveOutletRoots`（proto + owner_roots 实现 + 现有会话校验）+ `MetaRead::ActiveRoots` + `active_roots_digest` | 单元测试：Active 集投影、非 live 会话拒绝、**reservation 不泄漏**、**deactivate 后消失**、**稳定排序**、**DFS 写入不改变摘要**、**重启后摘要可复现**、`unchanged` 命中/失配 |
 | T2 | mountinfo 诊断 | 解析 + 三类告警（缺失/类型漂移/tmpfs 校验） | 纯函数测试（构造 mountinfo 文本） |
-| T3 | 镜像 worker | diff 纯函数 + 收敛循环 + `unchanged` 短路（H14）+ 原子放置 + ghost 隔离 + staging 清扫 | 纯函数表驱动测试（§13 TC1-TC7 的离线版）+ `unchanged` 分支测试 |
-| T4 | 配置与接线 | 三路径 all-or-none 校验、`node.rs` 启动接线、`[outlet_mirror]`、H11 取值校验 | 配置校验测试、启动 fail-fast 测试、grace 下限校验测试 |
+| T3 | 镜像 worker | ✅ **已实现** `node/outlet/mirror.rs`（纯函数 plan）+ `node/outlet/live.rs`（扫描/执行/循环）+ `RootMeta::list_active_outlet_roots` 客户端 | 12 个纯函数测试 + 10 个 IO 测试：发布、`unchanged` 保持、换代替换、下线摘除、ghost 隔离、Meta 失败不撤名、tmpfs 校验、命名与 `root_data_dir` 逐字节一致 |
+| T4 | 配置与接线 | ✅ **已实现** `outlet_public_root` / `outlet_import_root` / `outlet_mirror_interval_ms` 三件套 all-or-none、启动 tmpfs 门禁、`services.spawn` 接线 | 5 个配置测试（未配置即关闭、默认 250ms、半配置拒绝、相对路径与相同路径拒绝、周期范围） |
 | T5 | 部署资产 | 两节点部署脚本（fstab 示例含 `softerr` 等参数、nfsd 导出示例含**导出 IP 与成员表一致性检查**、挂载点 0555）、`docs/deployment/afs.md`、架构文档、README、**存量迁移步骤（H17）** | `python3 build/docs/check.py`、`git diff --check`、导出范围核对脚本（TC20） |
 | T6 | 双节点运行验证 | §13 全部用例 | 验证报告（明确"非多 VM/HA 证明"的边界声明） |
 | T7 | 两段式删除 | ENOTEMPTY 不上抛（H20）+ `persist_prepared_root` 允许取代更旧 epoch（H19 配套，保证同名重建）+ `reclaim_deferred` 按目录名扫描回收（H21）+ `[outlet_reclaim]` 配置 | 单元测试：ENOTEMPTY 时 delete_root 返回 Ok、Meta 已删、目录保留；**同名重建成功且新旧目录并存**；句柄释放后回收删除旧目录；`reconcile_on_startup` 行为保持基线（移除 catalog、保留目录、不阻塞） |
@@ -791,6 +805,12 @@ T5-T6 一组（资产与证据），不混入无关变更。
   `persist_prepared_root` 允许取代更旧 epoch，因此旧目录滞留不影响该名字
   重新使用（见 §8.3）。这一条是实现时发现的：最初把待回收代次记在 catalog，
   会让同名重建直接失败。
+- **R11 换代旧代目录滞留（H23 的已知代价）**：同名换代后旧代目录既不在
+  `roots` 缓存也不在 catalog，按 H23 不得推断回收，因此**会长期占用磁盘**，
+  直到 H11 宽限期机制落地。这是有意的取舍：误删仍在被 NFS 客户端使用的
+  旧代数据，比泄漏一份磁盘严重得多。
+  观察手段：`ls /imports/<home>/users/` 中 `-e<epoch>` 早于当前 epoch 的目录；
+  当前无自动指标。
 - **R10 僵尸 root 优于残留目录（已定序）**：Meta deactivate 保持在物理
   删除之前。若反过来先删目录，Meta 不可达时会留下"Meta 仍 Active、数据已
   不存在"的僵尸 root——名字继续发布、消费者 bind 到空路径、且 cache 已移除

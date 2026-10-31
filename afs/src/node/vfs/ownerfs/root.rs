@@ -1398,67 +1398,57 @@ impl RootManager {
 
     /// 回收一次延迟删除的数据目录（H21）。
     ///
-    /// **扫描数据根目录，而不是 catalog。** catalog 以 `root_id` 为主键，而
-    /// `root_id` 由名字派生，因此同名重建会覆盖旧代的条目——catalog 天生不能
-    /// 同时承担"活跃记录"与"按代次区分的删除队列"两个职责。若把待回收代次
-    /// 记在 catalog，同名重建要么被冲突拒绝（该名字在对端句柄释放前不可用），
-    /// 要么覆盖后丢失回收凭证。改为按目录名发现待回收代次，catalog 回归单一
-    /// 职责。
+    /// **只回收"有 catalog 记录但 Meta 已无该 root"的目录**，不从目录名推断。
     ///
-    /// 判定一个 `root-<hex>-e<epoch>` 目录可回收的条件（全部满足）：
-    /// 1. 命名合法（与 `root_data_dir` / `pending_data_dir` 同源）；
-    /// 2. 不属于 `roots` 缓存中的任何 root（缓存持有 = 当前活跃代次）；
-    /// 3. 不属于 catalog 中任何记录指向的 `data_dir`（含 pending 准备目录）。
+    /// 曾按"不在 roots 缓存 ∪ catalog 的并集内即可回收"实现，这会把**同名
+    /// 换代后的旧代目录**当作孤儿删除——旧代在重建时被新 epoch 的记录覆盖，
+    /// 于是既不在缓存也不在 catalog。而对端 NFS 客户端可能仍 bind 在旧代上，
+    /// 删除会让运行中的容器当场失去数据（spec §7.5 的换代窗口）。在没有
+    /// H11 宽限期之前，这种推断方式不安全。
     ///
-    /// 返回 `(removed, pending)`。不持 `roots` 锁跨越磁盘操作。
+    /// 现在的判定需要两个正面证据：
+    /// 1. catalog 有一条记录指向该 `data_dir`（说明它曾被本节点激活）；
+    /// 2. `roots` 缓存中没有该 root（说明它当前不活跃）。
+    ///
+    /// 两个条件都不满足的目录（例如换代前的旧代）**保持不动**，交给未来的
+    /// 宽限期机制处理。宁可泄漏磁盘，也不删可能仍在服务的数据。
     pub fn reclaim_deferred(&self) -> Result<(usize, usize)> {
-        // 快照活跃代次：roots 缓存 + catalog 记录。两者都不含"已逻辑删除"的
-        // 代次，因此它们的并集之外的数据目录即为待回收。
-        let mut active: std::collections::HashSet<String> = std::collections::HashSet::new();
-        {
+        let cached: std::collections::HashSet<String> = {
             let roots = self
                 .roots
                 .read()
                 .map_err(|_| invalid_grant("root cache lock poisoned"))?;
-            for root in roots.values() {
-                active.insert(root.data_dir.as_path().to_string_lossy().into_owned());
-            }
-        }
-        for record in self.catalog.scan_roots()? {
-            active.insert(record.data_dir.as_path().to_string_lossy().into_owned());
-        }
+            roots
+                .values()
+                .map(|root| root.data_dir.as_path().to_string_lossy().into_owned())
+                .collect()
+        };
 
         let mut removed = 0;
         let mut pending = 0;
-        for name in self
-            .disk
-            .read_dir(&StoragePath::root())
-            .map_err(Error::from)?
-        {
-            let Some(name) = name.to_str() else { continue };
-            if !is_data_dir_name(name) {
+        for record in self.catalog.scan_roots()? {
+            let dir = record.data_dir.as_path().to_string_lossy().into_owned();
+            // 仍活跃：不属回收范围。
+            if cached.contains(&dir) {
                 continue;
             }
-            if active.contains(name) {
-                continue;
-            }
-            let Ok(data_dir) = StoragePath::new(name) else {
-                continue;
-            };
-            match self.remove_abandoned_dir(&data_dir) {
+            match self.remove_abandoned_dir(&record.data_dir) {
                 Ok(()) => {
+                    self.catalog.remove_prepared_root(&record)?;
                     removed += 1;
-                    afs_logging::info!("root.reclaim.completed"; "data_dir" => name);
+                    afs_logging::info!("root.reclaim.completed"; "data_dir" => dir);
                 }
                 Err(error) if error.code() == afs_error::IO_DIRECTORY_NOT_EMPTY => {
                     // 对端仍持有句柄，下一轮再试。
                     pending += 1;
                 }
-                Err(error) if error.code() == afs_error::IO_NOT_FOUND => {}
+                Err(error) if error.code() == afs_error::IO_NOT_FOUND => {
+                    self.catalog.remove_prepared_root(&record)?;
+                }
                 Err(error) => {
                     afs_logging::warn!(
                         "root.reclaim.failed";
-                        "data_dir" => name,
+                        "data_dir" => dir,
                         "error" => error.to_string(),
                     );
                     return Err(error);
@@ -1597,11 +1587,17 @@ impl RootManager {
                 // 保留目录由 `reclaim_deferred` 按目录名发现并回收，不依赖
                 // catalog 条目——catalog 以 root_id 为主键，同名重建会覆盖旧代，
                 // 不能兼作删除队列。
+                // 保留目录时**保留 catalog 条目**（H19）：回收循环以它是
+                // 唯一证据来判断"这个目录曾被本节点激活、现在需要清理"。
+                // 丢弃条目会让目录失去归属，而回收若改从目录名推断，就会
+                // 误删同名换代后的旧代（仍可能被 NFS 客户端 bind）。
                 match self.remove_abandoned_dir(&record.data_dir) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        self.catalog.remove_prepared_root(&record)?;
+                    }
                     Err(error) if error.code() == afs_error::IO_DIRECTORY_NOT_EMPTY => {
                         afs_logging::warn!(
-                            "root.reconcile.leftover_data_dir";
+                            "root.reconcile.deferred_data_dir";
                             "root_id" => ?record.id,
                             "data_dir" => ?record.data_dir,
                             "error" => error.to_string(),
@@ -1609,7 +1605,6 @@ impl RootManager {
                     }
                     Err(error) => return Err(error),
                 }
-                self.catalog.remove_prepared_root(&record)?;
                 continue;
             };
             if location.epoch != record.epoch || location.home_node_id != self.local_node_id {
@@ -1699,26 +1694,6 @@ impl RootManager {
             })
             .unwrap_or_default()
     }
-}
-
-/// True for `<root_id>-e<epoch>` data directory names.
-///
-/// Mirrors `root_data_dir` / `pending_data_dir` shape without allocating a
-/// `StoragePath`: `root-` + even-length lowercase hex + `-e` + decimal epoch.
-/// Used by reclaim to recognise candidate directories while scanning the data
-/// root, so unrelated entries are never considered.
-fn is_data_dir_name(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix("root-") else {
-        return false;
-    };
-    let Some((encoded, epoch)) = rest.rsplit_once("-e") else {
-        return false;
-    };
-    !encoded.is_empty()
-        && encoded.len() % 2 == 0
-        && encoded.bytes().all(|byte| byte.is_ascii_hexdigit())
-        && !epoch.is_empty()
-        && epoch.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn pending_data_dir(reservation: &RootReservation) -> Result<StoragePath> {
@@ -3251,6 +3226,64 @@ mod tests {
             .lock_and_open()
             .unwrap();
         assert!(locked.scan_roots().unwrap().is_empty());
+    }
+
+    /// 回收范围必须保守：只删"有 catalog 证据且已不活跃"的目录。
+    ///
+    /// 同名换代后，旧代目录既不在 roots 缓存也不在 catalog。若回收靠"不在
+    /// 集合内"推断，就会误删仍在被 NFS 客户端使用的旧代数据（spec §7.5）。
+    #[test]
+    fn reclaim_leaves_superseded_generation_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+
+        // 旧代：目录存在，但 catalog 无记录（已被新代覆盖）→ 必须不动。
+        let old_dir = root_data_dir(OsStr::new("agent1"), 7).unwrap();
+        disk.mkdir(&old_dir, 0o700).unwrap();
+        disk.sync_root().unwrap();
+        std::fs::write(temp.path().join(old_dir.as_path()).join("live"), b"x").unwrap();
+
+        // 活跃代：catalog 有记录且 Meta 认作 active（epoch 1 与 fixture 的
+        // recovery_grant 一致），因此会被加载进 roots 缓存。
+        let live_dir = root_data_dir(OsStr::new("agent2"), 1).unwrap();
+        disk.mkdir(&live_dir, 0o700).unwrap();
+        disk.sync_root().unwrap();
+        let live_id = root_id_from_name(OsStr::new("agent2")).unwrap();
+        let locked = LocalFsRootCatalog::new(disk.clone())
+            .lock_and_open()
+            .unwrap();
+        locked
+            .persist_prepared_root(&LocalRootRecord {
+                id: live_id.clone(),
+                name: OsStr::new("agent2").into(),
+                epoch: 1,
+                data_dir: live_dir.clone(),
+                local_prepare_id: "prepare-1".into(),
+            })
+            .unwrap();
+        drop(locked);
+
+        let meta = Arc::new(RecoveryMeta::default());
+        meta.0.lock().unwrap().active = Some(RootLocation {
+            id: live_id,
+            epoch: 1,
+            home_node_id: "node-a".into(),
+            home_session_id: "session-a".into(),
+        });
+        meta.0.lock().unwrap().active_prepare_id = Some("prepare-1".into());
+        let manager =
+            RootManager::open("node-a".into(), "session-a".into(), meta, disk.clone()).unwrap();
+
+        let (removed, pending) = manager.reclaim_deferred().unwrap();
+        assert_eq!((removed, pending), (0, 0), "nothing is reclaimable here");
+        assert!(
+            temp.path().join(old_dir.as_path()).exists(),
+            "a superseded generation must not be deleted by inference"
+        );
+        assert!(
+            temp.path().join(live_dir.as_path()).exists(),
+            "the active generation must never be reclaimed"
+        );
     }
 }
 
