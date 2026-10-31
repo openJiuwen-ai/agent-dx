@@ -3,12 +3,27 @@
 import argparse
 import json
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
 import time
 
 HERE = Path(__file__).resolve().parent
+
+
+def accept_harness(report, part, commit):
+    harness = part.get('harness') or {}
+    files = harness.get('files')
+    if (harness.get('schema_version') != 1 or harness.get('commit') != commit
+            or not re.fullmatch(r'[0-9a-f]{40}', harness.get('product_commit', ''))
+            or not isinstance(files, dict) or not files
+            or any(not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest)
+                   for digest in files.values())):
+        raise ValueError('required child harness identity missing or invalid')
+    if report.get('harness') and report['harness'] != harness:
+        raise ValueError('required child harness/product identities differ')
+    report['harness'] = harness
 
 
 def verify_part(directory, expected):
@@ -39,7 +54,7 @@ def verify_part(directory, expected):
 
 
 def main():
-    from run import selected_checks, write_junit
+    from run import selected_checks, source_commit, write_junit
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('bundle', 'registry-images', 'kubeconfig', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
@@ -54,6 +69,7 @@ def main():
              ('afs-sdk', 'full', 'afs-sdk')]
     report = {'status': 'failed', 'profile': 'afs-required-smoke', 'source_profile': args.profile,
               'required_checks': [p[0] for p in plans], 'checks': [], 'cleanup_errors': [], 'cases': [], 'error': None}
+    commit = source_commit()
 
     def cancel(signum, _frame):
         raise InterruptedError('AFS gate canceled: ' + str(signum))
@@ -81,7 +97,8 @@ def main():
             code = child.wait()
             if code:
                 raise ValueError(name + ' failed, exit=' + str(code))
-            verify_part(output / name, selected_checks(profile, case))
+            part = verify_part(output / name, selected_checks(profile, case))
+            accept_harness(report, part, commit)
             report['checks'].append(name)
             record['status'] = 'passed'
         except Exception as exc:

@@ -95,6 +95,7 @@ class ProductContracts(unittest.TestCase):
             argv = ['gate', '--bundle', '/fixture/bundle.json', '--registry-images', '/fixture/images.json',
                     '--kubeconfig', '/fixture/kubeconfig', '--output', str(output), '--profile', 'l0']
             with patch.object(sys, 'argv', argv), patch.dict(sys.modules, {'run': kubernetes}), \
+                    patch.object(kubernetes, 'source_commit', return_value='a' * 40), \
                     patch.object(gate.subprocess, 'Popen', side_effect=child):
                 self.assertEqual(gate.main(), 1)
             result = json.loads((output / 'result.json').read_text())
@@ -104,13 +105,25 @@ class ProductContracts(unittest.TestCase):
     def test_complete_gate_writes_success_junit_with_no_error(self):
         gate = load('afs_gate_success_test', HERE / 'kubernetes/afs_gate.py')
         kubernetes = load('afs_gate_success_kube_test', HERE / 'kubernetes/run.py')
+        summary = load('afs_gate_ci_summary_test', HERE.parents[1] / '.buildkite/summary.py')
         with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / 'gate'
+            root = Path(directory)
+            output = root / 'acceptance'
+            (root / 'bundle').mkdir()
+            (root / 'bundle/bundle.json').write_text(json.dumps({'package': {'commit': 'b' * 40}}))
+            (root / 'summaries').mkdir()
+            (root / 'summaries/images.json').write_text(json.dumps({
+                'commit': 'c' * 40, 'product_commit': 'b' * 40, 'stages': {},
+                'images': {'references': {}, 'backend': 'pinned-backend'},
+            }))
+            harness = {'schema_version': 1, 'commit': kubernetes.source_commit(),
+                       'product_commit': 'b' * 40, 'files': {'fixture.py': 'd' * 64}}
             argv = ['gate', '--bundle', '/fixture/bundle.json', '--registry-images', '/fixture/images.json',
                     '--kubeconfig', '/fixture/kubeconfig', '--output', str(output), '--profile', 'l0']
             child = Mock(wait=Mock(return_value=0), poll=Mock(return_value=0))
             with patch.object(sys, 'argv', argv), patch.dict(sys.modules, {'run': kubernetes}), \
-                    patch.object(gate, 'verify_part', return_value={}), \
+                    patch.object(kubernetes, 'source_commit', return_value=harness['commit']), \
+                    patch.object(gate, 'verify_part', return_value={'harness': harness}), \
                     patch.object(gate.subprocess, 'Popen', return_value=child):
                 self.assertEqual(gate.main(), 0)
             result = json.loads((output / 'result.json').read_text())
@@ -118,6 +131,21 @@ class ProductContracts(unittest.TestCase):
             self.assertEqual(result['checks'], ['public', 'afs-component', 'afs-sdk'])
             self.assertEqual(result['missing_checks'], [])
             self.assertTrue((output / 'junit.xml').is_file())
+            collected = summary.collect(root, 'e2e', 0, harness['commit'], artifact_build='fixed-images')
+            self.assertEqual(collected['e2e']['report']['harness'], harness)
+            self.assertIn('public, afs-component, afs-sdk', summary.render(collected))
+
+    def test_gate_rejects_missing_or_inconsistent_child_identity(self):
+        gate = load('afs_gate_identity_test', HERE / 'kubernetes/afs_gate.py')
+        harness = {'schema_version': 1, 'commit': 'a' * 40, 'product_commit': 'b' * 40,
+                   'files': {'fixture.py': 'd' * 64}}
+        report = {}
+        gate.accept_harness(report, {'harness': harness}, 'a' * 40)
+        gate.accept_harness(report, {'harness': harness}, 'a' * 40)
+        for bad in ({}, dict(harness, commit='c' * 40), dict(harness, product_commit='c' * 40),
+                    dict(harness, files={}), dict(harness, files={'fixture.py': 'e' * 64})):
+            with self.assertRaises(ValueError):
+                gate.accept_harness(report, {'harness': bad}, 'a' * 40)
 
     def test_sdk_target_is_explicit_and_cannot_become_an_off_or_default_pass(self):
         kubernetes = load('afs_sdk_selection_test', HERE / 'kubernetes/run.py')
