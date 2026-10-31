@@ -27,7 +27,9 @@
      存活过滤），消费方不得据此推断 home 活着（§4.4）；
   7. 新增 **§6.5 NFS 导出绕过 AFS 授权**与 **H18 整树导出**——数据面不经过
      `afs-node`，`validate_peer_root_access` 不参与，可见性边界由
-     `/etc/exports` 决定（R8）。
+     `/etc/exports` 决定（R8）；
+  8. 新增 **§8 删除时序（两段式）**与 **H19–H22**——NFS 句柄让 ENOTEMPTY 成为
+     常态，必须把控制面删除与物理删除分离，并引入可观测的回收队列。
 
 ## 1. 需求概述
 
@@ -299,7 +301,7 @@ Root 集合每天变化约 200 次。
 3. **节点身份固定**：IP 与导出配置在节点生命周期内不变；
 4. **`/public` tmpfs**：部署方提供并挂载，**必须不含存量真实目录**（§6.4）；
 5. **成员表变化**：由部署工具重生成各节点 fstab 并 `mount -a`
-   （N² 挂载表是本设计的已知运维成本，见 §13）。
+   （N² 挂载表是本设计的已知运维成本，见 §14）。
 
 ### 6.1 NFS 挂载参数（硬要求，不是建议）
 
@@ -313,7 +315,7 @@ Root 集合每天变化约 200 次。
 | 重启后可恢复 | 节点重启后不依赖人工挂载 | `bg` 或 `x-systemd.automount` |
 
 **硬规则 H16**：`softerr` 是硬要求。选择 `hard` 会使"故障时卸载修复"这条
-恢复路径整体失效，与 §8 故障语义表冲突。
+恢复路径整体失效，与 §9 故障语义表冲突。
 
 `actimeo=60` 的后果要显式声明：NFS 客户端目录属性缓存最长 60s，因此
 **换代后新代可见性可能滞后至约 2×actimeo（120s）**。H11 宽限期的默认
@@ -493,7 +495,125 @@ timeout -s KILL 3 ls /public/<name>/ >/dev/null 2>&1
 `max(250×10, 60000×2) = 120000ms`（2 分钟）。
 调大 `actimeo` 或 `interval_ms` 时必须按此式重新核对（TC18 覆盖）。
 
-## 8. 故障语义表
+## 8. 删除时序（两段式）
+
+outlet 让"删除 root"这件事从"只和 AFS 自己的 peer 打交道"变成"还要面对
+内核 NFS 客户端持有的句柄"，因此必须把**控制面删除**与**物理删除**分开。
+
+### 8.1 为什么要分段
+
+现有 `rmdir_root`（`ownerfs.rs:4814`）经 `RootManager::delete_root`
+（`root.rs:1046`）执行：
+
+```
+revoke → 缓存移除 → Meta deactivate → 物理目录 remove_dir → catalog 移除
+```
+
+`revoke_root` + `access_generation` 能撤掉 AFS peer 的授权，但**对 NFS
+客户端完全无效**——B 侧内核在数据路径上直接读写 A 的 ext4，AFS 无从撤销。
+因此 `remove_dir` 遇到 ENOTEMPTY 会成为**常态**而非罕见情形。
+
+问题在于现有顺序把 Meta 删除放在物理删除**之前**：一旦 `remove_dir` 返回
+ENOTEMPTY，状态变成"Meta 已无记录、物理目录仍在、catalog 记录悬空"。
+现有实现把这种情况留给启动对账处理（`root.rs:1211-1232`：记录
+`root.reconcile.leftover_data_dir` 警告、丢弃 catalog 记录、保留物理目录
+等人工清理）。在 outlet 场景下这会退化为：
+
+1. **磁盘泄漏无界**——每次带句柄的删除都留一个目录；
+2. **告警只在重启时出现**，运行期不可观测；
+3. catalog 记录被清掉后，**系统里没有任何记录记得这个目录该被清理**。
+
+### 8.2 第一段：控制面 + 名字面（同步，必须成功）
+
+```
+1. revoke_root                                  阻止新 enter_root
+2. roots 缓存移除                                并发 rmdir 线性化点
+3. 物理目录 remove_dir：
+     Ok            → 继续
+     ENOENT        → 继续（已不存在）
+     ENOTEMPTY     → 继续，标记"待回收"（不是失败）
+     其他          → 返回错误，Meta 记录保持不动（可重试）
+4. Meta deactivate_root                          名字从所有节点消失
+5. catalog 记录：仅在步骤 3 成功时移除；
+   待回收时保留，并写入 defer_until
+```
+
+**硬规则 H19**：物理目录**未能删除**时，**不得**移除 catalog 记录。
+catalog 记录是"这个目录还该被清"的唯一持久证据，删掉它就是制造无主孤儿。
+
+**硬规则 H20**：`ENOTEMPTY` 在本路径上**不是失败**，是"现在不能删"。
+不得向 FUSE 返回 ENOTEMPTY，也不得放弃回收。
+
+注意顺序调整的方向：把 `Meta deactivate` 从步骤 3 之前挪到之后。代价是
+"删除过程中名字仍可见"（读者可能拿到一个即将消失的 workspace），收益是
+**物理删除失败时 Meta 记录还在，下一轮 rmdir 或对账可继续**。在 fail-open
+语义下前者可接受——home 死了名字本来也不消失。
+
+### 8.3 第二段：物理回收（异步、幂等、可重试）
+
+home 节点维护**本地删除队列**，条目来源是 catalog 中 `defer_until` 非零的
+记录（不新增持久化结构，复用现有 catalog）。
+
+```
+每 reclaim_interval_ms（默认 60000）：
+  for record in catalog.deferred():
+    if now < record.defer_until: continue
+    match disk.remove_dir(record.data_dir):
+      Ok       → catalog.remove_prepared_root(record)       // 出队
+      NotFound → catalog.remove_prepared_root(record)       // 已消失，出队
+      ENOTEMPTY→ record.attempts += 1
+                 record.defer_until = now + backoff(attempts)
+                 指标 outlet_pending_deletions.inc()
+      other    → 告警 outlet.reclaim.failed，保留条目，下轮重试
+```
+
+**硬规则 H21**：回收循环不得阻塞任何请求路径，不得持有 `roots` 锁。
+它只读写 catalog 与磁盘。
+
+### 8.4 退避与可观测性
+
+对端句柄可能持续数小时（B 的容器一直开着文件），因此退避不能太激进：
+
+```
+backoff(attempts) = min(60s × 2^(attempts-1), 30min)
+```
+
+**硬规则 H22**：必须暴露指标：
+
+| 指标 | 含义 | 告警建议 |
+|---|---|---|
+| `outlet_pending_deletions` | 删除队列长度 | > 100 或持续增长时告警 |
+| `outlet_reclaim_attempts_total` | 累计回收尝试 | — |
+| `outlet_reclaim_oldest_age_seconds` | 最老条目的等待时长 | > 24h 告警（疑似句柄泄漏） |
+
+没有这些指标，"ENOTEMPTY 常态化"就是不可见的磁盘泄漏。
+
+### 8.5 与同名重建的关系
+
+删除后立即用同名重建是允许的（§7.4：epoch 直可见，无歧义）。但要注意：
+
+- 新 root 的 `root-<hex>-e<epoch+1>` 是**另一个目录**，与待回收的旧代目录
+  并存，互不干扰；
+- 旧代的回收队列条目带 `epoch`，只删对应那一代，不会误删新一代；
+- 若旧代目录里仍有 NFS 句柄，回收会一直推迟，但这不影响新一代的可用性。
+
+**inode 层面的新危险：`unlink` 会让 NFS 客户端拿到 stale handle。** 见 §8.6。
+
+### 8.6 需要显式接受的 stale handle
+
+对端持有"指向已删除 inode 的句柄"时的行为由 NFS 协议决定，AFS 无法干预：
+
+| 对端操作 | 结果 |
+|---|---|
+| 已打开的 fd 继续读写 | 若 inode 仍被内核引用（目录未删成），继续成功 |
+| 目录被删后凭旧 filehandle 访问 | `ESTALE` |
+| 重新按路径 open | `ENOENT`（若名字已摘）或新代数据（若同名已重建） |
+
+**明确不做**：不承诺 `ESTALE` 的具体出现时机，不做 filehandle 的跨代迁移。
+这是 NFS 数据面的固有语义，不是本设计的缺陷；`softerr` 保证它以错误而非
+挂死的形式出现（§6.1）。
+
+## 9. 故障语义表
 
 | 故障 | 现象 | 恢复 | 人工操作 |
 |---|---|---|---|
@@ -507,7 +627,7 @@ timeout -s KILL 3 ls /public/<name>/ >/dev/null 2>&1
 | `softerr` 触发 EIO | 容器内 I/O 返回错误而非挂死 | 上层重试；home 恢复后成功 | 无 |
 | `digest` 混入全局 revision | 摘要恒变，退化为每轮全量 | 违反 H13，需修复 | 是（代码缺陷） |
 
-## 9. 配置面
+## 10. 配置面
 
 TOML 三路径 all-or-none（沿用现有校验模式，任一缺失即配置拒绝）：
 
@@ -522,6 +642,10 @@ interval_ms = 250                    # 可选，默认 250；仅影响发布延�
 generation_grace_ms = 120000         # 可选，默认 120000；H11 旧代目录宽限期
                                      # 约束：≥ max(interval_ms×10, actimeo×2)
 # full_rescan_interval_ms = 60000    # 可选，默认不启用；定期强制全量以清理 ghost
+
+[outlet_reclaim]
+reclaim_interval_ms = 60000          # 可选，默认 60000；§8.3 物理回收轮询间隔
+backoff_max_minutes = 30             # 可选，默认 30；§8.4 退避上限
 ```
 
 - **H12**：节点侧 outlet 组件不读取 `outlet_users_root` 内容（数据路径
@@ -529,7 +653,7 @@ generation_grace_ms = 120000         # 可选，默认 120000；H11 旧代目录
 - master 现有 `experimental_ownerfs_workspace_bind`（本机 bind 加速）与本
   特性正交，互不依赖。
 
-## 10. 与 master 现有代码的锚点
+## 11. 与 master 现有代码的锚点
 
 | 锚点 | 位置（master） | 用途 |
 |---|---|---|
@@ -544,21 +668,22 @@ generation_grace_ms = 120000         # 可选，默认 120000；H11 旧代目录
 诊断）、Meta 两个只读 RPC、配置节、部署脚本示例。master 上不存在因此**不需要
 删除**的：无（greenfield）。
 
-## 11. 任务分解
+## 12. 任务分解
 
 | # | 任务 | 内容 | 验收 |
 |---|---|---|---|
 | T1 | Meta 只读 RPC + 摘要校验位 | `ListActiveOutletRoots`（proto + owner_roots 实现 + 现有会话校验）+ `MetaRead::ActiveRoots` + `active_roots_digest` | 单元测试：Active 集投影、非 live 会话拒绝、**reservation 不泄漏**、**deactivate 后消失**、**稳定排序**、**DFS 写入不改变摘要**、**重启后摘要可复现**、`unchanged` 命中/失配 |
 | T2 | mountinfo 诊断 | 解析 + 三类告警（缺失/类型漂移/tmpfs 校验） | 纯函数测试（构造 mountinfo 文本） |
-| T3 | 镜像 worker | diff 纯函数 + 收敛循环 + `unchanged` 短路（H14）+ 原子放置 + ghost 隔离 + staging 清扫 | 纯函数表驱动测试（§12 TC1-TC7 的离线版）+ `unchanged` 分支测试 |
+| T3 | 镜像 worker | diff 纯函数 + 收敛循环 + `unchanged` 短路（H14）+ 原子放置 + ghost 隔离 + staging 清扫 | 纯函数表驱动测试（§13 TC1-TC7 的离线版）+ `unchanged` 分支测试 |
 | T4 | 配置与接线 | 三路径 all-or-none 校验、`node.rs` 启动接线、`[outlet_mirror]`、H11 取值校验 | 配置校验测试、启动 fail-fast 测试、grace 下限校验测试 |
 | T5 | 部署资产 | 两节点部署脚本（fstab 示例含 `softerr` 等参数、nfsd 导出示例含**导出 IP 与成员表一致性检查**、挂载点 0555）、`docs/deployment/afs.md`、架构文档、README、**存量迁移步骤（H17）** | `python3 build/docs/check.py`、`git diff --check`、导出范围核对脚本（TC20） |
-| T6 | 双节点运行验证 | §12 全部用例 | 验证报告（明确"非多 VM/HA 证明"的边界声明） |
+| T6 | 双节点运行验证 | §13 全部用例 | 验证报告（明确"非多 VM/HA 证明"的边界声明） |
+| T7 | 两段式删除 | `delete_root_inner` 重排顺序（H19/H20）+ 回收循环（H21）+ 指标（H22）+ `[outlet_reclaim]` 配置 | 单元测试：ENOTEMPTY 时 Meta 记录保留、catalog 不移除、回收重试成功；指标存在性测试 |
 
 提交按 conventional commits + 单条 Signed-off-by；T1-T4 一组（行为），
 T5-T6 一组（资产与证据），不混入无关变更。
 
-## 12. 验证用例
+## 13. 验证用例
 
 | # | 用例 | 期望 |
 |---|---|---|
@@ -583,8 +708,12 @@ T5-T6 一组（资产与证据），不混入无关变更。
 | TC18 | H11 取值约束 | `interval_ms` 或 `actimeo` 调大至违反 `grace ≥ max(interval×10, actimeo×2)` 时，启动失败并指明约束 |
 | TC19 | NFS 路径不经 AFS 授权（§6.5) | 在 B 上对 `/public/<name>` 做 IO：A 的 `afs-node` 日志无 `validate_root_access` / `ValidateRootAccess` 调用；B 侧无任何 `RootGrant` |
 | TC20 | 导出范围核对（H18） | 部署检查脚本：`/etc/exports` 的客户端集合与成员表一致；加入非成员 IP 时脚本报错 |
+| TC21 | 删除时有远端句柄（H19/H20） | B 容器持有 agent1 内文件句柄，A 执行 rmdir：`/public/agent1` ≤250ms 摘除、**Meta 记录保留**、catalog 记录保留且 `defer_until` 已设置；FUSE 不返回 ENOTEMPTY |
+| TC22 | 回收重试（H21） | 句柄释放后下一轮回收成功：目录删除、catalog 出队、`outlet_pending_deletions` 归零 |
+| TC23 | 同名重建与待回收并存（§8.5） | 旧代待回收期间同名重建：新代可正常读写；旧代回收只删旧代 epoch 目录，新一代不受影响 |
+| TC24 | 回收指标（H22） | 持续 ENOTEMPTY 时 `outlet_pending_deletions` 与 `outlet_reclaim_oldest_age_seconds` 正确增长 |
 
-## 13. 风险与开放问题
+## 14. 风险与开放问题
 
 - **R1 fail-open 的运维语义**：故障排查依赖"名字在但数据摸不到"的可识别性。
   缓解：§7.3 写入文档；告警体系覆盖 path_missing/drift。**运维约定**：
@@ -611,6 +740,21 @@ T5-T6 一组（资产与证据），不混入无关变更。
   把全局 `revision` 混入摘要不会报错，只会让摘要恒变、流量退化为
   2.4 MB/s。缓解：TC15 用例 + 代码注释指向本节。审查时须核对摘要输入
   是否严格只有三元组。
+- **R9 删除残留与磁盘泄漏（H19–H22，已缓解）**：outlet 让 ENOTEMPTY 成为
+  常态——B 的容器开着文件时 A 无法删除目录，而 AFS 的 revoke 对内核 NFS
+  客户端无效。缓解：两段式删除把控制面删除与物理删除分离，物理删除失败时
+  保留 catalog 记录并进入回收队列，配退避与三个指标。
+  **残留风险**：若对端句柄永不释放（容器长期运行、或客户端崩溃后内核未回收），
+  目录会长期滞留。指标 `outlet_reclaim_oldest_age_seconds > 24h` 是唯一的
+  发现手段。明确不做强制回收——在 NFS 数据面上强制删除会让对端收到 ESTALE，
+  比磁盘泄漏更糟。
+- **R10 删除期间名字仍可见**：H19 把 Meta deactivate 挪到物理删除之后，
+  因此"正在删除"的窗口内（一次 `remove_dir` 的耗时，通常亚毫秒，最坏
+  受 `softerr` 的 `timeo × retrans` 约束）该名字仍可能被消费方拿到。
+  在 fail-open 语义下可接受：拿到的名字随即可用性由数据面决定，
+  且窗口结束后必然消失。若需严格"删除即不可见"，须把 Meta deactivate
+  提前，代价是回到孤儿目录问题。
+
 - **R8 NFS 导出即可见性边界（H18，接受）**：NFS 数据面绕过 AFS 授权
   （§6.5），因此 AFS 无法对 B 侧访问做 workspace 级授权，
   `access_generation` / `fencing_token` / `revoke` 对 NFS 路径无效。
