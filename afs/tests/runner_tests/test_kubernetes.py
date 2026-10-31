@@ -114,5 +114,23 @@ class KubernetesTransportTests(unittest.TestCase):
                 Cluster(config, '/inputs', directory, Case('probe', (), 'ownerfs', (), None), 'test').connect()
 
 
+class ControllerCompatibilityTests(unittest.TestCase):
+    def test_path_ownership_does_not_require_python39_path_api(self):
+        from fixtures.worker import Worker
+        import tempfile
+        worker = object.__new__(Worker)
+        with tempfile.TemporaryDirectory() as directory:
+            worker.root = Path(directory) / 'owned'
+            worker.root.mkdir()
+            outside = Path(directory) / 'outside'
+            outside.mkdir()
+            (worker.root / 'escape').symlink_to(outside, target_is_directory=True)
+            with patch.object(Path, 'is_relative_to', create=True, side_effect=AttributeError('Python 3.8')):
+                self.assertEqual(worker.owned(str(worker.root / 'ok')), worker.root / 'ok')
+                for value in (outside, worker.root / '..' / 'outside', worker.root / 'escape' / 'file'):
+                    with self.assertRaises(ValueError):
+                        worker.owned(str(value))
+
+
 if __name__ == '__main__':
     unittest.main()

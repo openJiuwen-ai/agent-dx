@@ -34,9 +34,10 @@ class Worker:
 
     def owned(self, value):
         path = Path(value)
-        if self.root is None or not path.is_absolute() or not path.is_relative_to(self.root):
+        if self.root is None or not path.is_absolute() or not (path == self.root or self.root in path.parents):
             raise ValueError("path is outside this worker run")
-        if not path.resolve().is_relative_to(self.root.resolve()):
+        resolved, root = path.resolve(), self.root.resolve()
+        if not (resolved == root or root in resolved.parents):
             raise ValueError("resolved path escapes this worker run")
         if ".." in path.parts:
             raise ValueError("parent traversal is forbidden")

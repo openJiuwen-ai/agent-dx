@@ -53,7 +53,7 @@ python3 build/e2e/kubernetes/run.py \
   --profile full --case afs-component --output /absolute/new-afs-result
 ```
 
-The controller needs Linux Python 3.10+, openssl and kubectl. It uses the existing
+The controller supports the existing Linux Python 3.8+ deployer, openssl and kubectl; role Pods use the ON image Python runtime. It uses the existing
 registry/kubeconfig path to create three privileged role Pods (M/A/B) from the
 verified node test image. Each has only its own emptyDir and the host FUSE
 character device; no host data root, service-account credential, SSH access or

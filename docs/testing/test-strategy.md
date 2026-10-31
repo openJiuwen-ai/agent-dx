@@ -232,7 +232,9 @@ python3 afs/tests/run.py run --suite cluster-manyread --env /absolute/namespaces
 | `dfs.cluster.visibility` | 多版本新OPEN和权限变化 |
 | `cluster.topology_cleanup` | 实际挂载路径/源身份；每例另核验真实退出、卸载和监听/挂载残留 |
 
-环境前提：控制端Linux Python3.10+、openssl、kubectl和现有kubeconfig/registry权限；目标worker已有`/dev/fuse`、ext4-backed emptyDir及每角色至少1GiB空闲。ON测试镜像补fuse3/util-linux，OFF不引入；不修改宿主模块/存储。M/A/B独立Pod，A/B在Full目标要求不同worker；不冒称多VM。冻结namespace/Pod UID，并由worker核对实际Pod UID和隔离身份，防止角色被替换。
+环境前提：控制端兼容现有Linux Python3.8+部署镜像，Pod worker使用ON镜像的Python3.12；需要openssl、kubectl和现有kubeconfig/registry权限；目标worker已有`/dev/fuse`、ext4-backed emptyDir及每角色至少1GiB空闲。ON测试镜像补fuse3/util-linux，OFF不引入；不修改宿主模块/存储。M/A/B独立Pod，A/B在Full目标要求不同worker；不冒称多VM。冻结namespace/Pod UID，并由worker核对实际Pod UID和隔离身份，防止角色被替换。
+
+**第一次真实运行已完成**：[Full #72](https://buildkite.com/agent-dx/agent-dx-full-test/builds/72)，测试commit`23057ad905809d171bb4fcb990317fd225f54799`，产品为#208的`18acb0fe12152628dc0568c2943cc02edccd2c0b`。真实release/SDK校验、ON工具安装、AFS ELF/测试资产materialize及镜像发布通过；部署端因Python低于3.10被新增guard拦截，5项全部NOT_RUN、无Pod或挂载，不能称AFS正常清理通过。已修复控制端兼容性：去除Python3.9专有路径API、保留路径/符号链接隔离检查，并让Linux工具合同在真实部署镜像里运行；接下来复用#72镜像和当前harness重跑。共享部署镜像及默认分支不改。
 
 工具检查通过只说明适配代码和失败传播合同可用。只有真实运行中5项均执行通过、AFS正常停进程/卸载与namespace删除分别成功，才记CI1定向组件通过；缺环境、缺用例、超时或清理不明都不能变绿。真实运行证据待追加，当前不认CI1已通过。
 

@@ -11,7 +11,8 @@
 验证实际AFS二进制的SHA/架构后建立链接，供后续`--binary-dir .../afs-tests/inputs`使用。
 产品commit与测试harness commit分别记录。CI1另增`fixtures/kubernetes.py`接入，
 公共`build/e2e/kubernetes/run.py --profile full --case afs-component`准备M/A/B Pod和动态环境文件，
-调用同一入口执行5项已有组件用例。K8s角色按namespace/Pod UID、实际worker UID和隔离身份核验，
+调用同一入口执行5项已有组件用例。CI控制端兼容既有ADX deployer的Python3.8；Pod worker沿用测试镜像的Python3.12，VM路径仍按下文3.10+准备。
+K8s角色按namespace/Pod UID、实际worker UID和隔离身份核验，
 不冒充多VM。当前适配已完成本地工具检查，真实K8s执行尚待验证；VM模板不能直接填Pod地址使用。
 Rust源码、`runner_tests/`、缓存和私有环境配置不分发；选择Rust合同还需另交付同架构测试ELF。
 

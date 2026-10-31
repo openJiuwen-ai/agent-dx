@@ -172,10 +172,8 @@ class ResultTests(unittest.TestCase):
             env = Path(temp) / "env.json"
             env.write_text((TESTS / "fixtures/singlevm.example.json").read_text())
             result = Path(temp) / "result"
-            with (
-                patch.object(module, "discover", return_value=[case]),
-                patch.object(module, "Cluster", ControlledFixture),
-            ):
+            with patch.object(module, "discover", return_value=[case]), \
+                    patch.object(module, "Cluster", ControlledFixture):
                 code = module.main(
                     ["run", "--case", case.id, "--env", str(env), "--binary-dir", temp, "--work-root", str(result)]
                 )

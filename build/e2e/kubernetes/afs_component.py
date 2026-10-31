@@ -36,6 +36,10 @@ def resources(namespace, image, architecture, registry_auth=False, node_names=()
         ]
         container['volumeMounts'] = [{'name': 'state', 'mountPath': '/a'},
                                      {'name': 'fuse', 'mountPath': '/dev/fuse'}]
+        if role == 'M':
+            # This Pod runs only Meta, rather than the full ADX platform stack.
+            container['resources'] = {'requests': {'cpu': '250m', 'memory': '256Mi'},
+                                      'limits': {'cpu': '1', 'memory': '1Gi'}}
         spec['containers'] = [container]
         spec['volumes'] = [{'name': 'state', 'emptyDir': {}},
                            {'name': 'fuse', 'hostPath': {'path': '/dev/fuse', 'type': 'CharDevice'}}]
@@ -72,8 +76,8 @@ class Component:
         self.package = bundle['package']
         if not self.package.get('with_afs'):
             raise ValueError('AFS component acceptance requires an AFS ON candidate')
-        if sys.version_info < (3, 10):
-            raise ValueError('AFS controller requires Python 3.10 or newer')
+        if sys.version_info < (3, 8):
+            raise ValueError('AFS controller requires Python 3.8 or newer')
         objects = resources(run.id, refs['node'], bundle['architecture'], registry_auth is not None,
                             node_names, distinct_workers)
         run.command(
