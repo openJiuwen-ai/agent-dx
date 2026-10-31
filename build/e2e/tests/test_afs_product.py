@@ -3,6 +3,7 @@
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -36,6 +37,26 @@ class ProductContracts(unittest.TestCase):
             self.assertIn({'name': 'state', 'mountPath': '/a'}, platform['volumeMounts'])
         self.assertFalse(any(v.get('hostPath') for p in base if p['kind'] == 'Pod'
                              for v in p['spec']['volumes']))
+
+    def test_sdk_fixture_allows_identity_drop_without_dac_override(self):
+        spec = json.loads((HERE / 'afs_runc_spec.json').read_text())
+        expected = {'CAP_AUDIT_WRITE', 'CAP_KILL', 'CAP_NET_BIND_SERVICE', 'CAP_SETUID', 'CAP_SETGID'}
+        for capabilities in spec['process']['capabilities'].values():
+            self.assertEqual(set(capabilities), expected)
+        self.assertFalse(any(ns['type'] == 'user' for ns in spec['linux']['namespaces']))
+
+    def test_sdk_runtime_configuration_changes_only_existing_basic_spec(self):
+        product = load('afs_runtime_config_test', HERE / 'kubernetes/afs_product.py')
+        run = Mock()
+        product.Product(run).configure_runtime('node1')
+        args = run.execute.call_args.args
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'sandboxd.toml'
+            path.write_text('[plugin.runtime.basic_spec]\nrunc = ""\n'
+                            '[plugin.runtime.runtime_binary]\nrunc = "/usr/local/bin/runc"\n')
+            subprocess.run([sys.executable, '-c', args[3], str(path), *args[5:]], check=True)
+            self.assertIn('runc = "/opt/adx/e2e/afs_runc_spec.json"', path.read_text())
+            self.assertIn('runc = "/usr/local/bin/runc"', path.read_text())
 
     def test_sdk_success_requires_exact_cases_real_identity_and_confirmed_cleanup(self):
         product = load('afs_product_result_test', HERE / 'kubernetes/afs_product.py')

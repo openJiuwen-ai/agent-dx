@@ -13,8 +13,9 @@ SDK_CASES = ('mount-identity', 'bidirectional-publish', 'permissions', 'readonly
 
 
 def perl(code, *arguments, uid=10000):
-    identity = (f'POSIX::setgid({uid})==0 or die $!;$)="{uid} {uid}";'
-                f'POSIX::setuid({uid})==0 or die $!;die "wrong UID" unless $<=={uid} && $>=={uid};')
+    identity = (f'defined(POSIX::setgid({uid})) or die "setgid: $!";$)="{uid} {uid}";'
+                f'defined(POSIX::setuid({uid})) or die "setuid: $!";'
+                f'die "wrong UID real=$< effective=$> expected={uid}" unless $<=={uid} && $>=={uid};')
     return ' '.join(shlex.quote(str(v)) for v in ('perl', '-MIO::Handle', '-MPOSIX', '-e', identity + code, *arguments))
 
 

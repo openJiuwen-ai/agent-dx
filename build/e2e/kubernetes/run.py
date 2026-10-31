@@ -423,6 +423,8 @@ class KubernetesRun(common.Run):
                 'setup',
                 node,
             )
+            if self.afs_product:
+                self.afs_product.configure_runtime(node)
             self.execute(
                 node,
                 'sh',

@@ -70,6 +70,18 @@ class Product:
             }
         (run.output / 'afs-sdk-environment.json').write_text(json.dumps(self.config, indent=2))
 
+    def configure_runtime(self, node):
+        # Only these disposable SDK-test Pods use identity-switch capabilities.
+        # Reuse sandboxd's existing basic_spec deployment option, before it starts.
+        self.run.execute(node, 'python3', '-c',
+                         'from pathlib import Path;import sys;'
+                         'p=Path(sys.argv[1]);s=p.read_text();old=sys.argv[2];'
+                         'assert s.count(old)==1,"unexpected sandboxd config";'
+                         'p.write_text(s.replace(old,sys.argv[3]));',
+                         '/tmp/adx-e2e/sandboxd/config.toml',
+                         '[plugin.runtime.basic_spec]\nrunc = ""',
+                         '[plugin.runtime.basic_spec]\nrunc = "/opt/adx/e2e/afs_runc_spec.json"')
+
     def sdk(self, config, destination):
         run = self.run
         run.execute('node1', 'python3', '-c',
