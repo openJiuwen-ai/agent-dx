@@ -626,4 +626,157 @@ mod tests {
         let mountinfo = b"36 1 0:32 / /mnt/ad\\040x/public rw - tmpfs tmpfs rw\n";
         assert!(ensure_public_root_is_tmpfs(root, mountinfo).is_ok());
     }
+
+    /// 诊断只报告，不改变名字面：即便 import 挂载缺失，已发布的名字仍保留。
+    #[test]
+    fn diagnosis_does_not_disturb_published_names() {
+        let dir = tempfile::tempdir().unwrap();
+        prepare(dir.path()).unwrap();
+        let meta = ScriptedMeta::new(vec![full("d1", vec![node("root-61", 7, "node-a")])]);
+        let mut digest = None;
+        let mut roots = Vec::new();
+        converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
+
+        // import 根下什么都没有 → 应当报告，但名字面不受影响。
+        let findings = diagnose(&config(dir.path()), b"");
+        assert!(
+            dir.path().join("root-61").symlink_metadata().is_ok(),
+            "diagnosis must never retract names"
+        );
+        // 该临时目录不是 tmpfs 挂载点，因此 public 也应有 finding。
+        assert!(!findings.is_empty());
+    }
+
+    /// 诊断从目录枚举 home，而不是从 mountinfo：挂载消失的 home 仍要报告。
+    #[test]
+    fn homes_are_enumerated_from_the_directory_not_from_mountinfo() {
+        let dir = tempfile::tempdir().unwrap();
+        let imports = dir.path().join("imports");
+        std::fs::create_dir_all(imports.join("node-a")).unwrap();
+        std::fs::create_dir_all(imports.join("node-b")).unwrap();
+        let config = MirrorConfig {
+            public_root: dir.path().join("public"),
+            import_root: imports.to_string_lossy().into_owned(),
+            interval: Duration::from_millis(10),
+        };
+        assert_eq!(homes_under(&config.import_root), vec!["node-a", "node-b"]);
+
+        // 没有任何 mountinfo 条目覆盖它们 → 每个 home 都报 path_missing。
+        let findings = diagnose(&config, b"");
+        let missing = findings
+            .iter()
+            .filter(|finding| finding.kind() == "path_missing")
+            .count();
+        assert!(
+            missing >= 2,
+            "both homes should be reported, got {findings:?}"
+        );
+    }
+
+    /// 挂载齐全时不应产生 import 相关 finding。
+    #[test]
+    fn healthy_topology_reports_nothing_for_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let imports = dir.path().join("imports");
+        std::fs::create_dir_all(imports.join("node-a")).unwrap();
+        let public = dir.path().join("public");
+        std::fs::create_dir_all(&public).unwrap();
+        let config = MirrorConfig {
+            public_root: public.clone(),
+            import_root: imports.to_string_lossy().into_owned(),
+            interval: Duration::from_millis(10),
+        };
+
+        let mountinfo = format!(
+            "1 0 0:1 / {} rw - tmpfs tmpfs rw\n2 0 0:2 / {}/node-a/users rw - nfs4 home-a:/x rw\n",
+            public.display(),
+            imports.display()
+        );
+        let findings = diagnose(&config, mountinfo.as_bytes());
+        assert!(findings.is_empty(), "unexpected findings: {findings:?}");
+    }
+}
+
+/// Diagnosis cadence. Slower than the mirror interval on purpose: mount drift
+/// is an operator-visible condition, not something the loop reacts to.
+pub const DIAGNOSIS_INTERVAL: Duration = Duration::from_secs(60);
+
+/// One diagnosis pass. Returns findings; the caller only logs them.
+///
+/// Pure with respect to the mirror: it reads mountinfo and the import
+/// directory, never mutates names, and never feeds back into `converge`
+/// (spec H3). A missing or drifting mount must not stop publication — a
+/// symlink to a currently unreachable target is still the correct name layer,
+/// and retracting it would take names away from consumers that never touched
+/// that home.
+pub fn diagnose(config: &MirrorConfig, mountinfo: &[u8]) -> Vec<super::topology::Finding> {
+    let mounts = super::topology::parse(mountinfo);
+    let mut findings = super::topology::diagnose_public(&config.public_root, &mounts);
+    let homes = homes_under(&config.import_root);
+    findings.extend(super::topology::diagnose_imports(
+        Path::new(&config.import_root),
+        &homes,
+        &mounts,
+    ));
+    findings
+}
+
+/// Node ids that have a directory under the import root.
+///
+/// Enumerated from the directory rather than from mountinfo so a home whose
+/// mount silently disappeared is still reported: it would otherwise vanish
+/// from the check entirely, which is exactly the case worth catching.
+fn homes_under(import_root: &str) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(import_root) else {
+        return Vec::new();
+    };
+    let mut homes: Vec<String> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .collect();
+    homes.sort();
+    homes
+}
+
+/// Run the diagnosis loop until `shutdown` resolves.
+pub async fn run_diagnosis(
+    config: MirrorConfig,
+    mut shutdown: impl std::future::Future<Output = ()> + Unpin,
+) {
+    let mut tick = tokio::time::interval(DIAGNOSIS_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => return,
+            _ = tick.tick() => {
+                let config = config.clone();
+                match tokio::task::spawn_blocking(move || {
+                    let mountinfo = std::fs::read("/proc/self/mountinfo").ok()?;
+                    Some(diagnose(&config, &mountinfo))
+                })
+                .await
+                {
+                    Ok(Some(findings)) => {
+                        for finding in findings {
+                            // One event per finding so each is separately
+                            // alertable; a single "topology bad" line would
+                            // hide which home broke.
+                            afs_logging::warn!(
+                                "outlet.topology";
+                                "kind" => finding.kind(),
+                                "mount_point" => finding.mount_point(),
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        afs_logging::warn!("outlet.topology.mountinfo_unreadable");
+                    }
+                    Err(error) => {
+                        afs_logging::warn!("outlet.topology.worker_failed"; "error" => error.to_string());
+                    }
+                }
+            }
+        }
+    }
 }

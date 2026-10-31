@@ -257,13 +257,21 @@ Root 集合每天变化约 200 次。
 
 ### 5.4 mountinfo 只读诊断
 
-启动时与每 60s 解析 `/proc/self/mountinfo`：
+启动时与每 60s 解析 `/proc/self/mountinfo`（`topology::parse`）：
 
-- `outlet_public_root` 非 tmpfs → 启动失败（同上）；
-- `/imports/<node>/users` 缺失 → `warn outlet.topology.path_missing`；
-- 本机条目非 bind/ext4 类、远端条目非 `nfs*` → `warn path_drift`。
+- `outlet_public_root` 非 tmpfs 或不是独立挂载点 → **启动失败**；
+  运行期再检测到则 `warn outlet.topology{kind=path_drift|path_missing}`；
+- `<import_root>/<node>/users` 没有**自己的**挂载点 → `path_missing`；
+  只被父挂载覆盖也算缺失（那说明 per-home 挂载没做）；
+- 挂载类型不属于本地文件系统或 `nfs*` → `path_drift`。
 
-诊断不参与任何决策（H3），不得阻塞收敛循环（独立任务或复用阻塞池）。
+判定细节：取**最长前缀匹配**的挂载点（嵌套 bind 生效），并要求挂载点
+恰好等于目标路径。home 列表从 `<import_root>` 目录枚举而非从 mountinfo，
+这样挂载消失的 home 仍会被报出来。
+
+诊断不参与任何决策（H3），独立任务、独立周期（`DIAGNOSIS_INTERVAL`，60s），
+不得阻塞收敛循环。**诊断绝不撤名**：target 暂时不可达不影响名字层的正确性，
+撤名会波及从未访问过该 home 的消费方。
 
 ### 5.5 容量与参数依据
 
@@ -299,15 +307,17 @@ Root 集合每天变化约 200 次。
 
 | 项 | 状态 | 影响 |
 |---|---|---|
-| H11 `generation_grace_ms` | 未实现 | 换代时旧代目录立即可回收，`interval + actimeo` 窗口内新容器可能拿到断链而非旧代 |
-| §5.4 mountinfo 漂移诊断 | 未实现（T2） | 只校验 tmpfs，不告警 `path_missing` / `path_drift` |
+| H11 `generation_grace_ms` | 未实现 | 换代后旧代目录不会被回收（H23 保守策略），因此**不会**出现断链；代价是旧代长期滞留磁盘（R11） |
 | `full_rescan_interval_ms` | 未实现 | ghost 只在 Root 集合变化时被清理；steady state 下会留存 |
 | T5 部署资产 / T6 双节点验证 | 未开始 | 无部署脚本，无多节点证据 |
 
-在 H11 落地前，一次真正的换代（同一名字新 epoch）在当前实现里会让旧代
-目录按 OwnerFs 常规回收删除，而 `/public` 的 symlink 已先指向新代——因此
-**指向是新的、旧代被删是安全的**；但已 bind 旧代的运行中容器会失去后端
-路径。这条与 §7.4 的窗口分析不同：那里假设宽限期存在。
+在 H11 落地前，一次真正的换代（同一名字新 epoch）行为如下：`/public` 的
+symlink 被原子替换指向新代；旧代目录既不在 `roots` 缓存也无 catalog 记录，
+按 H23 **不回收、原样保留**。因此已 bind 旧代的运行中容器**仍可继续读写**
+——这恰好实现了宽限期想要的效果，只是以"永不回收"为代价（R11）。
+
+也就是说：H11 缺失不造成数据面故障，只造成磁盘滞留。这是把"宁可泄漏、
+不可误删"作为默认取向的直接结果。
 
 ## 6. 部署合同
 
@@ -726,7 +736,7 @@ ownerfs_reclaim_interval_ms = 60000  # 可选，默认 60000；合法范围 10..
 | # | 任务 | 内容 | 验收 |
 |---|---|---|---|
 | T1 | Meta 只读 RPC + 摘要校验位 | `ListActiveOutletRoots`（proto + owner_roots 实现 + 现有会话校验）+ `MetaRead::ActiveRoots` + `active_roots_digest` | 单元测试：Active 集投影、非 live 会话拒绝、**reservation 不泄漏**、**deactivate 后消失**、**稳定排序**、**DFS 写入不改变摘要**、**重启后摘要可复现**、`unchanged` 命中/失配 |
-| T2 | mountinfo 诊断 | 解析 + 三类告警（缺失/类型漂移/tmpfs 校验） | 纯函数测试（构造 mountinfo 文本） |
+| T2 | mountinfo 诊断 | ✅ **已实现** `node/outlet/topology.rs`（纯解析+判定）+ `live::diagnose` / `run_diagnosis`（60s 独立任务）+ 启动 tmpfs 门禁 | 13 个测试：八进制转义、坏行跳过、缺失/漂移、父挂载不算通过、多 home 独立、最长前缀、诊断不改名字面、home 从目录枚举、健康拓扑零 finding |
 | T3 | 镜像 worker | ✅ **已实现** `node/outlet/mirror.rs`（纯函数 plan）+ `node/outlet/live.rs`（扫描/执行/循环）+ `RootMeta::list_active_outlet_roots` 客户端 | 12 个纯函数测试 + 10 个 IO 测试：发布、`unchanged` 保持、换代替换、下线摘除、ghost 隔离、Meta 失败不撤名、tmpfs 校验、命名与 `root_data_dir` 逐字节一致 |
 | T4 | 配置与接线 | ✅ **已实现** `outlet_public_root` / `outlet_import_root` / `outlet_mirror_interval_ms` 三件套 all-or-none、启动 tmpfs 门禁、`services.spawn` 接线 | 5 个配置测试（未配置即关闭、默认 250ms、半配置拒绝、相对路径与相同路径拒绝、周期范围） |
 | T5 | 部署资产 | 两节点部署脚本（fstab 示例含 `softerr` 等参数、nfsd 导出示例含**导出 IP 与成员表一致性检查**、挂载点 0555）、`docs/deployment/afs.md`、架构文档、README、**存量迁移步骤（H17）** | `python3 build/docs/check.py`、`git diff --check`、导出范围核对脚本（TC20） |

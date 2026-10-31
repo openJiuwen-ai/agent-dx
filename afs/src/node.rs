@@ -1929,10 +1929,20 @@ async fn run_node(
             "interval_ms" => outlet.mirror_interval_ms
         );
         let stop = services.stop.subscribe();
+        let mirror_config = config.clone();
         services.spawn(async move {
             let shutdown = cancelled(stop);
             tokio::pin!(shutdown);
-            crate::node::outlet::live::run(config, meta, shutdown).await;
+            crate::node::outlet::live::run(mirror_config, meta, shutdown).await;
+            Ok(())
+        });
+        // Read-only topology diagnosis. A separate task so a slow mount scan
+        // can never delay publication (spec H3).
+        let stop = services.stop.subscribe();
+        services.spawn(async move {
+            let shutdown = cancelled(stop);
+            tokio::pin!(shutdown);
+            crate::node::outlet::live::run_diagnosis(config, shutdown).await;
             Ok(())
         });
     }
