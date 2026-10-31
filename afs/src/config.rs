@@ -254,6 +254,10 @@ pub struct Cli {
     /// ownerfs_mount and data_dir, required when experimental_ownerfs_workspace_bind.
     #[arg(long)]
     pub ownerfs_workspace_egress_root: Option<PathBuf>,
+    /// Period of the OwnerFs data-root reclaim sweep, in ms (10..=3600000).
+    /// Defaults to 60000. Only swept when OwnerFs is enabled.
+    #[arg(long)]
+    pub ownerfs_reclaim_interval_ms: Option<u64>,
     #[arg(long)]
     pub dfs_mount: Option<PathBuf>,
     /// FUSE receive threads shared by OwnerFs and DFS (1..=64).
@@ -464,6 +468,7 @@ struct FileConfig {
     experimental_ownerfs_workspace_bind: Option<bool>,
     ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
     ownerfs_workspace_egress_root: Option<PathBuf>,
+    ownerfs_reclaim_interval_ms: Option<u64>,
     dfs_mount: Option<PathBuf>,
     fuse_threads: Option<u16>,
     fuse_clone_fd: Option<bool>,
@@ -576,6 +581,8 @@ pub struct Config {
     pub experimental_ownerfs_workspace_bind: bool,
     pub ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
     pub ownerfs_workspace_egress_root: Option<PathBuf>,
+    /// OwnerFs data-root reclaim sweep period (10..=3600000ms).
+    pub ownerfs_reclaim_interval_ms: u64,
     pub dfs_mount: Option<PathBuf>,
     pub fuse_threads: u16,
     pub fuse_clone_fd: bool,
@@ -1060,6 +1067,16 @@ impl Config {
             ownerfs_workspace_egress_root: cli
                 .ownerfs_workspace_egress_root
                 .or(file.ownerfs_workspace_egress_root),
+            ownerfs_reclaim_interval_ms: {
+                let ms = cli
+                    .ownerfs_reclaim_interval_ms
+                    .or(file.ownerfs_reclaim_interval_ms)
+                    .unwrap_or(60_000);
+                if !(10..=3_600_000).contains(&ms) {
+                    return Err(invalid("OwnerFs reclaim interval must be 10..=3600000ms"));
+                }
+                ms
+            },
             dfs_mount: cli.dfs_mount.or(file.dfs_mount),
             fuse_threads,
             fuse_clone_fd: cli.fuse_clone_fd.or(file.fuse_clone_fd).unwrap_or(true),
@@ -1942,5 +1959,59 @@ mod read_concurrency_config_tests {
         let cli =
             Cli::try_parse_from(["afs-node", "--fs", "dfs", "--fuse-max-tasks", "0"]).unwrap();
         assert!(Config::resolve(Role::Node, cli).is_err());
+    }
+}
+
+/// OwnerFs 回收扫描周期：默认值与边界校验。
+#[cfg(test)]
+mod ownerfs_reclaim_config_tests {
+    use super::*;
+
+    #[test]
+    fn reclaim_interval_defaults_to_sixty_seconds() {
+        let cfg =
+            Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--fs", "ownerfs"])).unwrap();
+        assert_eq!(cfg.ownerfs_reclaim_interval_ms, 60_000);
+    }
+
+    #[test]
+    fn reclaim_interval_accepts_the_documented_range() {
+        for ms in ["10", "60000", "3600000"] {
+            let cfg = Config::resolve(
+                Role::Node,
+                Cli::parse_from([
+                    "afs-node",
+                    "--fs",
+                    "ownerfs",
+                    "--ownerfs-reclaim-interval-ms",
+                    ms,
+                ]),
+            )
+            .unwrap();
+            assert_eq!(cfg.ownerfs_reclaim_interval_ms, ms.parse::<u64>().unwrap());
+        }
+    }
+
+    /// 过小的周期会放大扫描开销，过大的周期会让延迟删除长期不被回收；
+    /// 两者都在启动时拒绝，而不是运行期静默使用。
+    #[test]
+    fn reclaim_interval_rejects_out_of_range_values() {
+        for ms in ["0", "9", "3600001"] {
+            let error = Config::resolve(
+                Role::Node,
+                Cli::parse_from([
+                    "afs-node",
+                    "--fs",
+                    "ownerfs",
+                    "--ownerfs-reclaim-interval-ms",
+                    ms,
+                ]),
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:?}").contains("OwnerFs reclaim interval"),
+                "unexpected error for {ms}: {error:?}"
+            );
+        }
     }
 }

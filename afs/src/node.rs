@@ -1390,6 +1390,9 @@ async fn run_node(
 
     #[cfg(feature = "ownerfs")]
     let mut workspace_bind_root_control = None;
+    // Reclaim sweep handle, taken from the OwnerFs construction site.
+    #[cfg(feature = "ownerfs")]
+    let mut roots_for_reclaim = None;
     #[cfg(feature = "ownerfs")]
     let ownerfs_instance = if cfg.ownerfs {
         let endpoint = meta_endpoint.expect("OwnerFs checked meta_endpoint");
@@ -1459,6 +1462,10 @@ async fn run_node(
             workspace_bind_root_control = Some((root_meta, roots.clone()));
         }
         let roots_for_startup = roots.clone();
+        // Reclaim sweeps directories left behind by a root deletion whose
+        // physical removal was deferred (see `RootManager::reclaim_deferred`).
+        // Kept outside `owner` so the sweep does not depend on the VFS object.
+        roots_for_reclaim = Some(roots.clone());
         let owner = if cfg.experimental_ownerfs_workspace_bind {
             let egress_root = cfg
                 .ownerfs_workspace_egress_root
@@ -1891,6 +1898,52 @@ async fn run_node(
         dfs: dfs_instance,
     });
     let mut services = Services::new();
+    #[cfg(feature = "ownerfs")]
+    if let (Some(roots), true) = (roots_for_reclaim, cfg.ownerfs) {
+        let stop = services.stop.subscribe();
+        let period = std::time::Duration::from_millis(cfg.ownerfs_reclaim_interval_ms);
+        services.spawn(async move {
+            let mut tick = tokio::time::interval(period);
+            // Skip the immediate tick: startup reconciliation already ran, and
+            // an instant sweep would race the first mount requests.
+            tick.tick().await;
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let shutdown = cancelled(stop);
+            tokio::pin!(shutdown);
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown => return Ok(()),
+                    _ = tick.tick() => {
+                        let roots = roots.clone();
+                        // remove_dir is a blocking syscall; keep it off the
+                        // async workers.
+                        match tokio::task::spawn_blocking(move || roots.reclaim_deferred()).await {
+                            Ok(Ok((removed, pending))) if removed > 0 || pending > 0 => {
+                                afs_logging::info!(
+                                    "ownerfs.reclaim.swept";
+                                    "removed" => removed,
+                                    "pending" => pending
+                                );
+                            }
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                afs_logging::warn!(
+                                    "ownerfs.reclaim.failed";
+                                    "error" => error.to_string()
+                                );
+                            }
+                            Err(error) => {
+                                afs_logging::warn!(
+                                    "ownerfs.reclaim.worker_failed";
+                                    "error" => error.to_string()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
     {
         let stop = services.stop.subscribe();
         let readiness = readiness.clone();

@@ -681,8 +681,10 @@ generation_grace_ms = 120000         # 可选，默认 120000；H11 旧代目录
                                      # 约束：≥ max(interval_ms×10, actimeo×2)
 # full_rescan_interval_ms = 60000    # 可选，默认不启用；定期强制全量以清理 ghost
 
-[outlet_reclaim]
-reclaim_interval_ms = 60000          # 可选，默认 60000；§8.3 物理回收轮询间隔
+# 回收扫描周期。实际实现为 afs-node 的顶层配置项（CLI 为
+# --ownerfs-reclaim-interval-ms），不是 outlet 专有命名空间：
+# 它作用于 OwnerFs 数据根，即使未启用 outlet 也有意义。
+ownerfs_reclaim_interval_ms = 60000  # 可选，默认 60000；合法范围 10..=3600000
 ```
 
 - **H12**：节点侧 outlet 组件不读取 `outlet_users_root` 内容（数据路径
