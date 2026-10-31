@@ -53,6 +53,14 @@ class KubernetesTransportTests(unittest.TestCase):
                     self.connect()
                 self.setUp()
 
+    def test_sdk_fixture_can_share_only_its_frozen_container_mount_namespace(self):
+        self.config['mount_namespace'] = 'container'
+        _, factory = self.connect()
+        self.assertNotIn('unshare', factory.call_args.args[0])
+        self.config['mount_namespace'] = 'host'
+        with self.assertRaises(ValueError):
+            self.connect()
+
     def test_kubernetes_topology_accepts_two_kernels_without_claiming_distinct_vms(self):
         from fixtures.common import Case
         from fixtures.multivm import Cluster, validate

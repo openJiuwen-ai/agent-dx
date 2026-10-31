@@ -221,6 +221,9 @@ python3 afs/tests/run.py run --suite cluster-manyread --env /absolute/namespaces
 
 ### CI1真实运行：旧包故障、修复与新候选复测
 
+本轮用户已允许接入SDK：仅改测试/部署配置/CI包装，不改ADX、AFS或SDK生产源码。新增`afs-sdk`定向目标复用现有Local Mount及Node指定能力，验证OwnerFs/DFS；AFS ON普通验收包装同时要求公共、组件、SDK三部分。当前为实现待实跑，不把工具测试当真实SDK结果；CI2/CI3的真实成绩在本节追加，线上webhook/合入保护另记。
+
+
 本次CI0/CI1独立交付保留最新master的读写专项。测试资产另带`tools/`和`runner_tests/`的Python文件，全部进身份清单；工具合同在同步后的M Pod（Python3.12）执行，控制端仍兼容Python3.8。不复制OwnerFs生产修复，受影响内核须使用已包含[MR !126](https://gitcode.com/openJiuwen/agent-dx/merge_requests/126)的候选，或此前已验证的#223固定产品。SDK/CI2暂缓，本次不接默认必需冒烟或扩功能Full。
 
 

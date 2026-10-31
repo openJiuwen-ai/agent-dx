@@ -268,3 +268,27 @@ marked skipped and cleanup reported independently. A failed command or timeout
 still fails the acceptance.
 
 The `local-first` case switches only API Server into local-first mode, checks SDK concurrent create/execute/delete and confirmed local-claim evidence, then restores central mode. This case requires newly built artifacts; earlier seven-case runs do not validate it. [Buildkite #30](../../../docs/testing/2026-09-18-runtime-environment-k8s.md) passed the previous eight-case OCI profile. The current default basic profile is the bounded five-case gate; `data-plane`, `lifecycle`, `node-failure`, `sandboxd-restart`, `restart`, and `stop` run under `full` and local `standalone`.
+
+## AFS SDK target and required ON gate
+
+`--profile full --case afs-sdk` uses the existing installed SDK `Mount(host_path=...)`
+with pinned node placement. It prepares AFS Meta in an owned M Pod and A/B in the
+existing ADX node Pods. A/B explicitly share only their container mount namespace
+with sandboxd; matching namespace, source device/inode and Environment mountinfo
+are required. The ordinary component target keeps its private worker namespaces.
+
+OwnerFs and DFS run separately: bidirectional write/fsync/new-open reads, three
+versions with complete content checks, non-root EACCES, read-only EROFS, deletion,
+Environment reclaim and normal AFS cleanup. Runtime image warmup precedes the
+AFS worker mount baseline; runtime leftovers must not be hidden by Pod deletion.
+No product binary, SDK API or production source is changed for this fixture.
+
+For AFS ON, `.buildkite/run-e2e.sh` without a diagnostic selector runs
+`afs_gate.py`: public profile -> five AFS component cases -> both SDK variants.
+Every required result and cleanup must exist and pass; zero process exit alone
+is insufficient. OFF preserves the public path. Explicit targeted builds stay
+marked diagnostic, and do not count as this required gate. Repository webhook
+and merge-protection policy are separate from this in-pipeline requirement.
+
+This SDK/gate extension is implemented for validation; real CI results are
+recorded in the canonical strategy before claiming runtime acceptance.

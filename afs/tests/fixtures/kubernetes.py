@@ -8,6 +8,9 @@ from fixtures.common import Blocked, Channel, HERE
 
 
 def connect(config):
+    mount_namespace = config.get('mount_namespace', 'private')
+    if mount_namespace not in ('private', 'container'):
+        raise ValueError('mount_namespace must be private or container')
     prefix = config.get('kubectl')
     if not isinstance(prefix, list) or not prefix or not all(isinstance(x, str) and x for x in prefix):
         raise ValueError('literal kubectl argv is required')
@@ -33,8 +36,9 @@ def connect(config):
     command = prefix + ['-n', namespace, 'exec', '-i', pod, '-c', 'platform', '--', 'env']
     for name in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'):
         command += ['-u', name]
-    command += ['unshare', '--mount', '--propagation', 'private', '--', 'python3', '-u', '-c',
-                (HERE / 'worker.py').read_text()]
+    if mount_namespace == 'private':
+        command += ['unshare', '--mount', '--propagation', 'private', '--']
+    command += ['python3', '-u', '-c', (HERE / 'worker.py').read_text()]
     channel = Channel(command, timeout=60)
     channel.kubernetes_identity = {
         'namespace': namespace, 'namespace_uid': config['namespace_uid'],

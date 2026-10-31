@@ -1,0 +1,96 @@
+"""AFS SDK fixtures and required gate contracts, without product execution."""
+
+import importlib.util
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import Mock, patch
+import sys
+
+HERE = Path(__file__).resolve().parents[1]
+
+
+def load(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class ProductContracts(unittest.TestCase):
+    def test_sdk_topology_keeps_public_nodes_and_adds_only_owned_fuse_and_meta(self):
+        product = load('afs_product_test', HERE / 'kubernetes/afs_product.py')
+        manifest = load('afs_manifest_test', HERE / 'kubernetes/manifest.py')
+        image = 'registry/node@sha256:' + 'a' * 64
+        base = manifest.resources('adx-e2e-fixture', image, 'amd64')
+        objects = product.resources(base, 'adx-e2e-fixture', image, 'amd64')
+        pods = [p for p in objects if p['kind'] == 'Pod']
+        self.assertEqual([p['metadata']['name'] for p in pods], ['node1', 'node2', 'afs-m'])
+        for pod in pods:
+            self.assertFalse(pod['spec']['automountServiceAccountToken'])
+            hosts = [v['hostPath'] for v in pod['spec']['volumes'] if 'hostPath' in v]
+            self.assertEqual(hosts, [{'path': '/dev/fuse', 'type': 'CharDevice'}])
+            platform = pod['spec']['containers'][0]
+            self.assertIn({'name': 'state', 'mountPath': '/a'}, platform['volumeMounts'])
+        self.assertFalse(any(v.get('hostPath') for p in base if p['kind'] == 'Pod'
+                             for v in p['spec']['volumes']))
+
+    def test_sdk_success_requires_exact_cases_real_identity_and_confirmed_cleanup(self):
+        product = load('afs_product_result_test', HERE / 'kubernetes/afs_product.py')
+        report = {'status': 'passed', 'mode': 'dfs', 'cleanup_errors': [],
+                  'cases': [{'id': name, 'status': 'passed'} for name in product.SDK_CASES]}
+        product.validate_sdk_result(report, 'dfs')
+        for bad in (dict(report, cases=report['cases'][:-1]), dict(report, mode='ownerfs'),
+                    dict(report, cleanup_errors=['environment still running'])):
+            with self.assertRaises(ValueError):
+                product.validate_sdk_result(bad, 'dfs')
+
+    def test_default_afs_gate_cannot_pass_from_zero_exit_or_missing_sdk_results(self):
+        gate = load('afs_gate_test', HERE / 'kubernetes/afs_gate.py')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'result.json').write_text(json.dumps({
+                'status': 'passed', 'checks': [], 'required_checks': [],
+                'missing_checks': [], 'cleanup_errors': [], 'cases': [],
+            }))
+            with self.assertRaises(ValueError):
+                gate.verify_part(root, ('afs-sdk-ownerfs', 'afs-sdk-dfs'))
+
+    def test_gate_keeps_zero_exit_missing_required_work_red(self):
+        gate = load('afs_gate_main_test', HERE / 'kubernetes/afs_gate.py')
+        kubernetes = load('afs_gate_kube_test', HERE / 'kubernetes/run.py')
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'gate'
+
+            def child(command):
+                part = Path(command[command.index('--output') + 1])
+                part.mkdir()
+                (part / 'result.json').write_text(json.dumps({'status': 'passed', 'cases': []}))
+                return Mock(wait=Mock(return_value=0), poll=Mock(return_value=0))
+
+            argv = ['gate', '--bundle', '/fixture/bundle.json', '--registry-images', '/fixture/images.json',
+                    '--kubeconfig', '/fixture/kubeconfig', '--output', str(output), '--profile', 'l0']
+            with patch.object(sys, 'argv', argv), patch.dict(sys.modules, {'run': kubernetes}), \
+                    patch.object(gate.subprocess, 'Popen', side_effect=child):
+                self.assertEqual(gate.main(), 1)
+            result = json.loads((output / 'result.json').read_text())
+            self.assertEqual(result['status'], 'failed')
+            self.assertIn('afs-sdk', result['missing_checks'])
+
+    def test_sdk_target_is_explicit_and_cannot_become_an_off_or_default_pass(self):
+        kubernetes = load('afs_sdk_selection_test', HERE / 'kubernetes/run.py')
+        self.assertEqual(kubernetes.selected_checks('full', 'afs-sdk'), ('afs-sdk-ownerfs', 'afs-sdk-dfs'))
+        with self.assertRaises(ValueError):
+            kubernetes.selected_checks('l0', 'afs-sdk')
+        with tempfile.TemporaryDirectory() as directory:
+            run = kubernetes.KubernetesRun(Path(directory), Path('/fixture/kubeconfig'),
+                                           profile='full', selected_case='afs-sdk')
+            with patch.object(run, 'kube') as kube:
+                with self.assertRaises(ValueError):
+                    run.deploy({'package': {'with_afs': False}}, {}, {})
+                kube.assert_not_called()
+
+
+if __name__ == '__main__':
+    unittest.main()

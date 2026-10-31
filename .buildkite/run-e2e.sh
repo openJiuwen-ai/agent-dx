@@ -49,7 +49,11 @@ if [[ -n ${ADX_E2E_NODE_NAMES:-} ]]; then
   IFS=',' read -r -a node_names <<< "$ADX_E2E_NODE_NAMES"
   for node in "${node_names[@]}"; do args+=(--node-name "$node"); done
 fi
-if [[ -n ${ADX_E2E_TARGET_CASES:-} ]]; then
+if [[ ${ADX_E2E_TARGET_CASE:-} == afs-required-smoke ]]; then
+  [[ ${ADX_WITH_AFS:-0} == 1 ]] || { echo 'AFS required smoke needs ADX_WITH_AFS=1' >&2; exit 1; }
+  python3 -u build/e2e/kubernetes/afs_gate.py "${args[@]}" \
+    --output out/buildkite/acceptance --profile l0
+elif [[ -n ${ADX_E2E_TARGET_CASES:-} ]]; then
   [[ ${ADX_E2E_PROFILE:-full} == full ]] || {
     echo 'Targeted suite requires ADX_E2E_PROFILE=full' >&2
     exit 1
@@ -82,5 +86,9 @@ else
   if [[ -n ${ADX_E2E_REDIS_STORAGE_CLASS:-} ]]; then
     args+=(--redis-storage-class "$ADX_E2E_REDIS_STORAGE_CLASS")
   fi
-  python3 -u build/e2e/kubernetes/run.py "${args[@]}"
+  if [[ ${ADX_WITH_AFS:-0} == 1 && -z ${ADX_E2E_TARGET_CASE:-} ]]; then
+    python3 -u build/e2e/kubernetes/afs_gate.py "${args[@]}"
+  else
+    python3 -u build/e2e/kubernetes/run.py "${args[@]}"
+  fi
 fi
