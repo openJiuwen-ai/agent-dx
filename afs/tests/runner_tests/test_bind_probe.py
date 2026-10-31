@@ -133,6 +133,21 @@ class BindProbeTests(unittest.TestCase):
         cluster.python.assert_called_once()
         self.assertEqual(cluster.record.call_args.args[0], 'ownerfs.bind_diagnostic')
 
+    def test_owner_bind_rejects_missing_mount_policy_after_attachment(self):
+        import json
+        from fixtures.multivm import Cluster
+        cluster = object.__new__(Cluster)
+        cluster.mode, cluster.roles = 'ownerfs', ['M', 'A']
+        cluster.workspace = Mock(return_value='/owned/egress/workspace')
+        cluster.command = Mock(return_value={'stdout': json.dumps({'filesystems': [{
+            'fstype': 'ext4', 'options': 'rw,relatime', 'propagation': 'private',
+        }]})})
+        cluster.python = Mock()
+        cluster.role_dir = Mock(return_value='/owned/node-a')
+        cluster.record = Mock()
+        with self.assertRaisesRegex(AssertionError, 'owner bind policy'):
+            cluster.topology()
+
 
 if __name__ == '__main__':
     unittest.main()

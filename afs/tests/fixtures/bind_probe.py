@@ -67,7 +67,7 @@ class Native:
         self.legacy_mount(None, target, 1 << 18)
 
     def legacy_policy(self, target, bind_remount=False):
-        # The product currently requests MS_REMOUNT|NOSUID|NODEV, without MS_BIND.
+        # Reproduce the pre-fix flags, with an explicit per-bind control for diagnosis.
         self.legacy_mount(None, target, 32 | 2 | 4 | (4096 if bind_remount else 0))
 
 

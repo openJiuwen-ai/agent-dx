@@ -366,18 +366,19 @@ mod linux {
             };
 
             attach_tree(&tree, target)?;
-            drop(tree);
 
             // If mount_setattr was unavailable, apply NOSUID|NODEV via remount.
+            // Keep the attached tree alive: target still refers to the covered directory.
             // attach_tree 成功后挂载已生效：remount 失败必须 lazy_unmount
             // 回滚，否则 bind 残留在 namespace 中且上层只把错误降级为
             // FuseOnly，挂载无法回收（review: 挂载生效后的错误路径没有回滚）。
-            if !policy_applied && let Err(error) = apply_policy_legacy_remount(target) {
-                if let Ok(path) = fd_proc_path(target) {
+            if !policy_applied && let Err(error) = apply_policy_legacy_remount(&tree) {
+                if let Ok(path) = fd_proc_path(&tree) {
                     let _ = lazy_unmount(&path);
                 }
                 return Err(error);
             }
+            drop(tree);
 
             Ok(mount)
         }
@@ -870,7 +871,10 @@ mod linux {
 
     /// Apply NOSUID|NODEV policy via legacy mount(2) remount on a File descriptor.
     fn apply_policy_legacy_remount(target: &File) -> io::Result<()> {
-        mount_remount_nosuid_nodev(fd_proc_path(target)?.as_c_str())
+        // The held tree descriptor follows the attached mount; the covered target does not.
+        let path = fd_proc_path(target)?;
+        make_private(path.as_c_str())?;
+        mount_remount_nosuid_nodev(path.as_c_str())
     }
 
     /// Resolve a file descriptor to a `/proc/thread-self/fd/<fd>` path usable as
@@ -925,13 +929,14 @@ mod linux {
 
     #[allow(unsafe_code)]
     fn mount_remount_nosuid_nodev(target: &std::ffi::CStr) -> io::Result<()> {
+        // MS_BIND restricts this policy change to the export, not the backing filesystem.
         // SAFETY: target is a NUL-terminated C string that lives for the call.
         let result = unsafe {
             libc::mount(
                 std::ptr::null(),
                 target.as_ptr(),
                 std::ptr::null(),
-                libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV,
+                libc::MS_BIND | libc::MS_REMOUNT | libc::MS_NOSUID | libc::MS_NODEV,
                 std::ptr::null(),
             )
         };
