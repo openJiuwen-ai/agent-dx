@@ -545,6 +545,10 @@ pub struct RootManager {
     control_valid: AtomicBool,
     roots: RwLock<HashMap<RootId, Arc<LocalRoot>>>,
     workspace_locks: Mutex<HashMap<RootId, Weak<Mutex<()>>>>,
+    /// H11: how long a superseded data directory must stay resolvable before
+    /// it may be deleted. Defaults to the spec value; `with_retirement_grace`
+    /// overrides it from configuration.
+    retirement_grace_ms: u64,
 }
 
 impl RootManager {
@@ -584,9 +588,21 @@ impl RootManager {
             control_valid: AtomicBool::new(true),
             roots: RwLock::new(HashMap::new()),
             workspace_locks: Mutex::new(HashMap::new()),
+            retirement_grace_ms: DEFAULT_RETIREMENT_GRACE_MS,
         };
         manager.reconcile_on_startup()?;
         Ok(manager)
+    }
+
+    /// Override the H11 retirement grace window.
+    ///
+    /// Kept as a builder rather than a constructor parameter because thirteen
+    /// call sites (mostly tests) have no opinion about it, and a default that
+    /// matches the spec is the safe choice for all of them.
+    #[must_use]
+    pub fn with_retirement_grace(mut self, grace_ms: u64) -> Self {
+        self.retirement_grace_ms = grace_ms;
+        self
     }
 
     /// Compatibility constructor used by existing tests and temporary Node wiring.
@@ -1369,6 +1385,21 @@ impl RootManager {
             }
             Err(error) if error.code() == afs_error::IO_DIRECTORY_NOT_EMPTY => {
                 // H20：不是失败，是"现在不能删"。留下 catalog 记录供回收循环重试。
+                //
+                // 同时写入弃用标记（H11）：宽限期从这里开始计时。不标记的话
+                // 回收循环只能靠"目录非空"反复试探，无法区分"刚被弃用"与
+                // "已存在很久"，也就无法保证 spec 要求的 `generation_grace_ms`
+                // 最小存活时间。
+                if let Err(mark_error) = self.catalog.mark_retired(&record.data_dir, now_unix_ms())
+                {
+                    // 标记失败不改变删除结果：目录本来就删不掉，回收退化为
+                    // 每轮试探（等价于旧行为），不应让 rmdir 报错。
+                    afs_logging::warn!(
+                        "root.delete_root.retire_mark_failed";
+                        "root_id" => ?id,
+                        "error" => mark_error.to_string(),
+                    );
+                }
                 afs_logging::warn!(
                     "root.delete_root.dir_busy";
                     "root_id" => ?id,
@@ -1396,22 +1427,23 @@ impl RootManager {
         Ok(())
     }
 
-    /// 回收一次延迟删除的数据目录（H21）。
+    /// 回收一次延迟删除的数据目录（H11/H21）。
     ///
-    /// **只回收"有 catalog 记录但 Meta 已无该 root"的目录**，不从目录名推断。
+    /// **两条独立的回收路径**：
     ///
-    /// 曾按"不在 roots 缓存 ∪ catalog 的并集内即可回收"实现，这会把**同名
-    /// 换代后的旧代目录**当作孤儿删除——旧代在重建时被新 epoch 的记录覆盖，
-    /// 于是既不在缓存也不在 catalog。而对端 NFS 客户端可能仍 bind 在旧代上，
-    /// 删除会让运行中的容器当场失去数据（spec §7.5 的换代窗口）。在没有
-    /// H11 宽限期之前，这种推断方式不安全。
+    /// 1. **catalog 记录的目录**：说明它曾被本节点激活、现已不活跃。
+    ///    `delete_root` 删不掉它时（ENOTEMPTY）会写入弃用标记，本方法据
+    ///    `retired_at + grace` 判断何时可以真正删除。
+    /// 2. **无 catalog 证据的旧代目录**：同名换代后旧代既不在缓存也不在
+    ///    catalog。这类目录**只有带弃用标记才回收**；没有标记一律不动——
+    ///    我们无法判断它是否仍被 NFS 客户端 bind（H23）。
     ///
-    /// 现在的判定需要两个正面证据：
-    /// 1. catalog 有一条记录指向该 `data_dir`（说明它曾被本节点激活）；
-    /// 2. `roots` 缓存中没有该 root（说明它当前不活跃）。
+    /// 宽限期（H11）解决的是一个与时序有关的竞态：`/public` 的 symlink 换成
+    /// 新代是即时的，但（a）其他节点的 symlink 更新是最终一致的，（b）NFS
+    /// 目录缓存让新代可见性滞后至多 `actimeo`。窗口内新启动的容器可能仍读到
+    /// 旧代 target，若旧代目录已被删除就会 ENOENT。
     ///
-    /// 两个条件都不满足的目录（例如换代前的旧代）**保持不动**，交给未来的
-    /// 宽限期机制处理。宁可泄漏磁盘，也不删可能仍在服务的数据。
+    /// 返回 `(removed, pending)`。不持 `roots` 锁跨越磁盘操作。
     pub fn reclaim_deferred(&self) -> Result<(usize, usize)> {
         let cached: std::collections::HashSet<String> = {
             let roots = self
@@ -1423,27 +1455,93 @@ impl RootManager {
                 .map(|root| root.data_dir.as_path().to_string_lossy().into_owned())
                 .collect()
         };
+        let now = now_unix_ms();
+        let grace = self.retirement_grace_ms;
+
+        // 明确被弃用的目录：这是唯一允许"无 catalog 证据也删除"的入口。
+        let retired = self.catalog.scan_retired()?;
+        let mut retired_by_dir: HashMap<String, u64> = HashMap::new();
+        for (data_dir, at) in retired {
+            retired_by_dir.insert(data_dir.as_path().to_string_lossy().into_owned(), at);
+        }
 
         let mut removed = 0;
         let mut pending = 0;
+        let mut attempted: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // 路径 1：catalog 记录。
         for record in self.catalog.scan_roots()? {
             let dir = record.data_dir.as_path().to_string_lossy().into_owned();
-            // 仍活跃：不属回收范围。
             if cached.contains(&dir) {
                 continue;
+            }
+            attempted.insert(dir.clone());
+            match retired_by_dir.get(&dir) {
+                // 尚未过宽限期：等。
+                Some(at) if now.saturating_sub(*at) < grace => {
+                    pending += 1;
+                    continue;
+                }
+                // 已过宽限期，或从未标记（旧版本遗留的记录）：直接尝试。
+                _ => {}
             }
             match self.remove_abandoned_dir(&record.data_dir) {
                 Ok(()) => {
                     self.catalog.remove_prepared_root(&record)?;
+                    if retired_by_dir.contains_key(&dir) {
+                        self.catalog.clear_retired(&record.data_dir)?;
+                    }
                     removed += 1;
                     afs_logging::info!("root.reclaim.completed"; "data_dir" => dir);
                 }
                 Err(error) if error.code() == afs_error::IO_DIRECTORY_NOT_EMPTY => {
-                    // 对端仍持有句柄，下一轮再试。
+                    // 对端仍持有句柄。首次遇到时标记弃用，让宽限期开始计时。
+                    if !retired_by_dir.contains_key(&dir) {
+                        self.catalog.mark_retired(&record.data_dir, now)?;
+                    }
                     pending += 1;
                 }
                 Err(error) if error.code() == afs_error::IO_NOT_FOUND => {
                     self.catalog.remove_prepared_root(&record)?;
+                    if retired_by_dir.contains_key(&dir) {
+                        self.catalog.clear_retired(&record.data_dir)?;
+                    }
+                }
+                Err(error) => {
+                    afs_logging::warn!(
+                        "root.reclaim.failed";
+                        "data_dir" => dir,
+                        "error" => error.to_string(),
+                    );
+                    return Err(error);
+                }
+            }
+        }
+
+        // 路径 2：只有弃用标记、没有 catalog 记录的旧代（同名换代的产物）。
+        for (dir, at) in &retired_by_dir {
+            if attempted.contains(dir) || cached.contains(dir) {
+                continue;
+            }
+            if now.saturating_sub(*at) < grace {
+                pending += 1;
+                continue;
+            }
+            let Ok(data_dir) = StoragePath::new(dir) else {
+                continue;
+            };
+            match self.remove_abandoned_dir(&data_dir) {
+                Ok(()) => {
+                    self.catalog.clear_retired(&data_dir)?;
+                    removed += 1;
+                    afs_logging::info!("root.reclaim.superseded_removed"; "data_dir" => dir);
+                }
+                Err(error) if error.code() == afs_error::IO_DIRECTORY_NOT_EMPTY => {
+                    // 宽限期过后仍被占用：保持标记，下一轮再试。
+                    pending += 1;
+                }
+                Err(error) if error.code() == afs_error::IO_NOT_FOUND => {
+                    self.catalog.clear_retired(&data_dir)?;
                 }
                 Err(error) => {
                     afs_logging::warn!(
@@ -1900,6 +1998,22 @@ pub trait RootLifecycle: Send + Sync {
     fn create_root(&self, name: &OsStr, mode: u32) -> Result<RootUse>;
     fn lookup_root(&self, name: &OsStr) -> Result<Option<RootUse>>;
     fn reconcile_on_startup(&self) -> Result<()>;
+}
+
+// H11 default: 120000ms = max(interval_ms x 10, actimeo x 2) for the default
+// 250ms interval and 60s actimeo.
+const DEFAULT_RETIREMENT_GRACE_MS: u64 = 120_000;
+
+/// Wall-clock milliseconds for retirement deadlines.
+///
+/// Wall time rather than a monotonic clock because the deadline must survive a
+/// restart: the marker is persisted and compared after the process comes back,
+/// where a monotonic baseline is gone.
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn invalid_grant(message: &'static str) -> Error {
@@ -3160,10 +3274,30 @@ mod tests {
         assert_eq!((removed, pending), (0, 1));
         assert!(temp.path().join(data_dir.as_path()).exists());
 
-        // 对端释放句柄（目录清空）→ 下一轮回收成功出队。
+        // 对端释放句柄（目录清空）。此时仍**不能**回收：H11 宽限期从
+        // `delete_root` 遇到 ENOTEMPTY 起计时，默认 2 分钟内旧代必须保持可
+        // 解析，否则窗口内新启动的容器会 bind 到已消失的目录。
         std::fs::remove_file(temp.path().join(data_dir.as_path()).join("payload")).unwrap();
         let (removed, pending) = manager.reclaim_deferred().unwrap();
-        assert_eq!((removed, pending), (1, 0));
+        assert_eq!(
+            (removed, pending),
+            (0, 1),
+            "the grace window has not elapsed yet"
+        );
+        assert!(temp.path().join(data_dir.as_path()).exists());
+        drop(manager);
+
+        // 宽限期归零后同一目录可回收（模拟宽限期已过）。
+        let manager = RootManager::open(
+            "node-a".into(),
+            "session-a".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap()
+        .with_retirement_grace(0);
+        let (removed, _pending) = manager.reclaim_deferred().unwrap();
+        assert_eq!(removed, 1, "expired grace must reclaim the directory");
         assert!(!temp.path().join(data_dir.as_path()).exists());
 
         drop(manager);
@@ -3226,6 +3360,122 @@ mod tests {
             .lock_and_open()
             .unwrap();
         assert!(locked.scan_roots().unwrap().is_empty());
+    }
+
+    /// H11：宽限期内不得删除已弃用的目录。
+    ///
+    /// 竞态在于：`/public` 的 symlink 换成新代是即时的，但其他节点的 symlink
+    /// 更新是最终一致的，NFS 目录缓存还会滞后至多 `actimeo`。窗口内新启动
+    /// 的容器可能仍解析到旧代 target，此时删掉旧代目录就是 ENOENT。
+    #[test]
+    fn retired_directory_survives_the_grace_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let name = OsStr::new("agent1");
+        let id = root_id_from_name(name).unwrap();
+        let data_dir = root_data_dir(name, 1).unwrap();
+        disk.mkdir(&data_dir, 0o700).unwrap();
+        disk.sync_root().unwrap();
+        // 目录非空：否则启动对账会直接删掉它（进程刚启动时不存在"已 bind
+        // 到旧代的容器"，空目录没有保留价值）。本测试关心的是运行期回收。
+        std::fs::write(temp.path().join(data_dir.as_path()).join("held"), b"x").unwrap();
+
+        // 有 catalog 记录、无 roots 缓存，且已被标记为刚弃用。
+        let catalog = LocalFsRootCatalog::new(disk.clone());
+        let locked = catalog.lock_and_open().unwrap();
+        locked
+            .persist_prepared_root(&LocalRootRecord {
+                id: id.clone(),
+                name: name.into(),
+                epoch: 1,
+                data_dir: data_dir.clone(),
+                local_prepare_id: "prepare-1".into(),
+            })
+            .unwrap();
+        let now = now_unix_ms();
+        locked.mark_retired(&data_dir, now).unwrap();
+        drop(locked);
+
+        let meta = Arc::new(RecoveryMeta::default());
+        // 宽限期很长：本轮不得删除。
+        let manager = RootManager::open(
+            "node-a".into(),
+            "session-a".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap()
+        .with_retirement_grace(3_600_000);
+
+        let (removed, pending) = manager.reclaim_deferred().unwrap();
+        assert_eq!((removed, pending), (0, 1), "must wait out the grace window");
+        assert!(
+            temp.path().join(data_dir.as_path()).exists(),
+            "a freshly retired directory must survive"
+        );
+        drop(manager);
+
+        // 宽限期为 0：目录清空后立即可回收。
+        std::fs::remove_file(temp.path().join(data_dir.as_path()).join("held")).unwrap();
+        let manager = RootManager::open("node-a".into(), "session-a".into(), meta, disk.clone())
+            .unwrap()
+            .with_retirement_grace(0);
+        let (removed, _pending) = manager.reclaim_deferred().unwrap();
+        assert_eq!(removed, 1, "expired grace must allow reclaim");
+        assert!(!temp.path().join(data_dir.as_path()).exists());
+    }
+
+    /// 宽限期过后若目录仍非空，保持标记并继续等待，不放弃。
+    #[test]
+    fn expired_retirement_still_waits_when_the_directory_is_busy() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let name = OsStr::new("agent1");
+        let data_dir = root_data_dir(name, 1).unwrap();
+        disk.mkdir(&data_dir, 0o700).unwrap();
+        disk.sync_root().unwrap();
+        std::fs::write(temp.path().join(data_dir.as_path()).join("held"), b"x").unwrap();
+
+        let catalog = LocalFsRootCatalog::new(disk.clone());
+        let locked = catalog.lock_and_open().unwrap();
+        locked
+            .persist_prepared_root(&LocalRootRecord {
+                id: root_id_from_name(name).unwrap(),
+                name: name.into(),
+                epoch: 1,
+                data_dir: data_dir.clone(),
+                local_prepare_id: "prepare-1".into(),
+            })
+            .unwrap();
+        locked.mark_retired(&data_dir, 0).unwrap();
+        drop(locked);
+
+        let meta = Arc::new(RecoveryMeta::default());
+        let manager = RootManager::open("node-a".into(), "session-a".into(), meta, disk.clone())
+            .unwrap()
+            .with_retirement_grace(0);
+
+        let (removed, pending) = manager.reclaim_deferred().unwrap();
+        assert_eq!((removed, pending), (0, 1), "a busy directory stays pending");
+        assert!(temp.path().join(data_dir.as_path()).exists());
+    }
+
+    /// 弃用标记必须幂等且保留最早时刻：重复标记不得延长目录寿命。
+    #[test]
+    fn retirement_marks_keep_the_earliest_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let data_dir = root_data_dir(OsStr::new("agent1"), 1).unwrap();
+        disk.mkdir(&data_dir, 0o700).unwrap();
+        disk.sync_root().unwrap();
+
+        let catalog = LocalFsRootCatalog::new(disk.clone());
+        let locked = catalog.lock_and_open().unwrap();
+        locked.mark_retired(&data_dir, 1_000).unwrap();
+        locked.mark_retired(&data_dir, 9_000).unwrap();
+        let marks = locked.scan_retired().unwrap();
+        assert_eq!(marks.len(), 1);
+        assert_eq!(marks[0].1, 1_000, "the earlier time must win");
     }
 
     /// 回收范围必须保守：只删"有 catalog 证据且已不活跃"的目录。

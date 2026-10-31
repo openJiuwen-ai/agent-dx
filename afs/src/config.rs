@@ -268,6 +268,10 @@ pub struct Cli {
     /// Convergence period of the outlet mirror (10..=60000ms), default 250.
     #[arg(long)]
     pub outlet_mirror_interval_ms: Option<u64>,
+    /// Minimum time a superseded data directory stays resolvable before it may
+    /// be reclaimed (1000..=604800000ms), default 120000.
+    #[arg(long)]
+    pub outlet_generation_grace_ms: Option<u64>,
     #[arg(long)]
     pub dfs_mount: Option<PathBuf>,
     /// FUSE receive threads shared by OwnerFs and DFS (1..=64).
@@ -482,6 +486,7 @@ struct FileConfig {
     outlet_public_root: Option<PathBuf>,
     outlet_import_root: Option<PathBuf>,
     outlet_mirror_interval_ms: Option<u64>,
+    outlet_generation_grace_ms: Option<u64>,
     dfs_mount: Option<PathBuf>,
     fuse_threads: Option<u16>,
     fuse_clone_fd: Option<bool>,
@@ -666,6 +671,8 @@ pub struct OutletConfig {
     pub import_root: PathBuf,
     /// Convergence period. Affects publish latency only, never the data path.
     pub mirror_interval_ms: u64,
+    /// H11: minimum lifetime of a superseded generation directory.
+    pub generation_grace_ms: u64,
 }
 
 impl OutletConfig {
@@ -1125,10 +1132,20 @@ impl Config {
                         if !(10..=60_000).contains(&interval_ms) {
                             return Err(invalid("outlet mirror interval must be 10..=60000ms"));
                         }
+                        let grace_ms = cli
+                            .outlet_generation_grace_ms
+                            .or(file.outlet_generation_grace_ms)
+                            .unwrap_or(120_000);
+                        if !(1_000..=604_800_000).contains(&grace_ms) {
+                            return Err(invalid(
+                                "outlet generation grace must be 1000..=604800000ms",
+                            ));
+                        }
                         Some(OutletConfig {
                             public_root: public,
                             import_root,
                             mirror_interval_ms: interval_ms,
+                            generation_grace_ms: grace_ms,
                         })
                     }
                     // all-or-none: a half-configured name layer would publish
@@ -2170,6 +2187,37 @@ mod outlet_config_tests {
         )
         .unwrap_err();
         assert!(format!("{same:?}").contains("must differ"), "{same:?}");
+    }
+
+    #[test]
+    fn outlet_generation_grace_defaults_and_validates() {
+        let base = [
+            "afs-node",
+            "--fs",
+            "ownerfs",
+            "--outlet-public-root",
+            "/mnt/adx/public",
+            "--outlet-import-root",
+            "/mnt/adx/imports",
+        ];
+        let cfg = Config::resolve(Role::Node, Cli::parse_from(base)).unwrap();
+        assert_eq!(cfg.outlet.unwrap().generation_grace_ms, 120_000);
+
+        let mut with_grace = base.to_vec();
+        with_grace.extend(["--outlet-generation-grace-ms", "5000"]);
+        let cfg = Config::resolve(Role::Node, Cli::parse_from(with_grace)).unwrap();
+        assert_eq!(cfg.outlet.unwrap().generation_grace_ms, 5_000);
+
+        // 过小的宽限期等于没有保护；过大的值会让磁盘长期滞留。
+        for ms in ["999", "604800001"] {
+            let mut args = base.to_vec();
+            args.extend(["--outlet-generation-grace-ms", ms]);
+            let error = Config::resolve(Role::Node, Cli::parse_from(args)).unwrap_err();
+            assert!(
+                format!("{error:?}").contains("generation grace"),
+                "unexpected error for {ms}: {error:?}"
+            );
+        }
     }
 
     #[test]

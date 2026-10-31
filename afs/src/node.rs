@@ -1451,14 +1451,21 @@ async fn run_node(
         });
         outlet_meta = Some(root_meta.clone() as Arc<dyn vfs::ownerfs::root::RootMeta>);
         let recovery_root_meta = root_meta.clone();
+        // H11 grace comes from configuration; the builder keeps the default
+        // for the other constructors (mostly tests).
+        let retirement_grace_ms = cfg.outlet.as_ref().map(|outlet| outlet.generation_grace_ms);
         let roots = Arc::new(
             tokio::task::spawn_blocking(move || {
-                vfs::ownerfs::root::RootManager::open(
+                let manager = vfs::ownerfs::root::RootManager::open(
                     recovery_node_id,
                     recovery_session_id,
                     recovery_root_meta,
                     recovery_disk,
-                )
+                )?;
+                Ok::<_, afs_error::Error>(match retirement_grace_ms {
+                    Some(grace) => manager.with_retirement_grace(grace),
+                    None => manager,
+                })
             })
             .await??,
         );
