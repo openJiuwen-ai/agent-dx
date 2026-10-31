@@ -1,0 +1,122 @@
+{
+  "kind": "namespaces",
+  "uid": 10001,
+  "gid": 10001,
+  "other_uid": 10002,
+  "other_gid": 10002,
+  "roles": {
+    "M": {
+      "host": "ns-m",
+      "address": "10.203.0.10"
+    },
+    "A": {
+      "host": "ns-a",
+      "address": "10.203.0.20"
+    },
+    "B": {
+      "host": "ns-b",
+      "address": "10.203.0.21"
+    }
+  },
+  "hosts": {
+    "ns-m": {
+      "transport": "exec",
+      "command_prefix": [
+        "sudo",
+        "-n",
+        "env",
+        "-u",
+        "HTTP_PROXY",
+        "-u",
+        "HTTPS_PROXY",
+        "-u",
+        "ALL_PROXY",
+        "-u",
+        "http_proxy",
+        "-u",
+        "https_proxy",
+        "-u",
+        "all_proxy",
+        "ip",
+        "netns",
+        "exec",
+        "afst-m",
+        "unshare",
+        "--mount",
+        "--propagation",
+        "private",
+        "--pid",
+        "--fork",
+        "--mount-proc",
+        "--"
+      ],
+      "base": "/var/tmp/afst/m"
+    },
+    "ns-a": {
+      "transport": "exec",
+      "command_prefix": [
+        "sudo",
+        "-n",
+        "env",
+        "-u",
+        "HTTP_PROXY",
+        "-u",
+        "HTTPS_PROXY",
+        "-u",
+        "ALL_PROXY",
+        "-u",
+        "http_proxy",
+        "-u",
+        "https_proxy",
+        "-u",
+        "all_proxy",
+        "ip",
+        "netns",
+        "exec",
+        "afst-a",
+        "unshare",
+        "--mount",
+        "--propagation",
+        "private",
+        "--pid",
+        "--fork",
+        "--mount-proc",
+        "--"
+      ],
+      "base": "/var/tmp/afst/a"
+    },
+    "ns-b": {
+      "transport": "exec",
+      "command_prefix": [
+        "sudo",
+        "-n",
+        "env",
+        "-u",
+        "HTTP_PROXY",
+        "-u",
+        "HTTPS_PROXY",
+        "-u",
+        "ALL_PROXY",
+        "-u",
+        "http_proxy",
+        "-u",
+        "https_proxy",
+        "-u",
+        "all_proxy",
+        "ip",
+        "netns",
+        "exec",
+        "afst-b",
+        "unshare",
+        "--mount",
+        "--propagation",
+        "private",
+        "--pid",
+        "--fork",
+        "--mount-proc",
+        "--"
+      ],
+      "base": "/var/tmp/afst/b"
+    }
+  }
+}

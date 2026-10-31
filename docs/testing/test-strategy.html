@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="light dark"><title>ADX／AFS 测试规范 · 五步验证路径</title><style>
+:root{color-scheme:light dark;--bg:#f5f7f8;--surface:#fff;--text:#1f3340;--muted:#61727c;--line:#dce4e7;--accent:#176b60;--soft:#edf5f2;--code:#f0f3f5;--badge:#e8f2ed;--warn:#8a5e19}*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:90px}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.85 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}button,input{font:inherit}button{cursor:pointer;border:1px solid var(--line);border-radius:6px;background:var(--surface);color:var(--text);padding:7px 12px}button:hover{border-color:var(--accent)}:focus-visible{outline:3px solid var(--accent);outline-offset:3px}[hidden]{display:none!important}.shell{max-width:1500px;margin:auto;padding:0 36px}.topline{display:flex;justify-content:space-between;gap:20px;align-items:center;padding:22px 0;border-bottom:1px solid var(--line);font-size:12px;letter-spacing:.04em;color:var(--muted)}.toplinks{display:flex;gap:18px}.hero{padding:35px 0 20px}.eyebrow,.kicker{color:var(--accent);font-size:12px;letter-spacing:.08em}h1{font-size:35px;line-height:1.35;letter-spacing:-.02em;margin:8px 0 12px}h2{font-size:23px;line-height:1.45;margin:0 0 14px}h3{font-size:19px;line-height:1.5;margin:30px 0 12px}h4{font-size:16px;margin:24px 0 10px}.lead{font-size:18px;margin:0 0 16px}.meta{display:flex;flex-wrap:wrap;gap:8px}.pill,.badge{display:inline-block;background:var(--badge);border-radius:5px;padding:3px 9px;font-size:12px;white-space:nowrap;color:var(--accent)}.pill.neutral{background:var(--code);color:var(--muted)}.principles{padding:15px 0 22px}.principles>p:first-child{font-size:17px}.principles ol{padding-left:24px;margin:15px 0}.principles li{padding:10px 0 10px 5px;border-bottom:1px solid var(--line)}.principles>p:last-child{font-size:13px;color:var(--muted);max-width:1200px}.journey{display:flex;gap:7px;flex-wrap:wrap;padding:12px 0;background:var(--bg);position:sticky;top:0;z-index:5;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}.journey a{padding:6px 13px;border:1px solid var(--line);background:var(--surface);border-radius:6px;font-size:14px}.section-heading{display:flex;justify-content:space-between;gap:16px;align-items:baseline;margin:32px 0 10px}.section-heading h2{margin:0}.muted{color:var(--muted);font-size:13px}.overview{margin-bottom:25px}.detail-table{overflow:auto;max-width:100%;border:1px solid var(--line);border-radius:8px;background:var(--surface);margin:15px 0}table{width:100%;min-width:1080px;table-layout:fixed;border-collapse:separate;border-spacing:0;font-size:13px;line-height:1.8}th,td{padding:14px;vertical-align:top;text-align:left;border-right:1px solid var(--line);border-bottom:1px solid var(--line);overflow-wrap:anywhere}th{background:var(--code);font-weight:650}th:last-child,td:last-child{border-right:0}tr:last-child td{border-bottom:0}.overview table{min-width:1220px}.overview th:first-child,.overview td:first-child{width:135px}.overview th:last-child,.overview td:last-child{width:145px}.overview td:last-child{background:var(--soft)}code{font: .88em/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--code);border-radius:4px;padding:2px 5px;overflow-wrap:anywhere}pre{background:var(--code);border:1px solid var(--line);border-radius:7px;padding:18px;overflow:auto;max-width:100%;line-height:1.65}pre code{background:transparent;padding:0;white-space:pre;overflow-wrap:normal}.shared{padding:3px 0 25px;font-size:14px}.shared li{margin:10px 0}.tools{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;margin:8px 0 15px}.tools-left{display:flex;gap:8px;flex-wrap:wrap}.search{background:var(--surface);color:var(--text);border:1px solid var(--line);border-radius:6px;padding:8px 12px;width:280px}.step-detail,.reference{background:var(--surface);border:1px solid var(--line);border-radius:9px;margin:13px 0;scroll-margin-top:85px}.step-detail>summary,.reference>summary{list-style:none;display:flex;align-items:center;gap:18px;cursor:pointer;padding:20px 23px}.step-detail>summary::-webkit-details-marker,.reference>summary::-webkit-details-marker{display:none}.number{font:22px/1 ui-monospace,monospace;color:var(--accent)}.summary-copy{flex:1;min-width:0}summary h2{font-size:20px;margin:0 0 4px}summary small{display:block;color:var(--muted);font-size:13px;line-height:1.7}.chevron{font-size:22px;font-weight:400;color:var(--muted)}details[open]>summary .chevron{font-size:0}details[open]>summary .chevron:after{content:'−';font-size:22px}.detail-body{border-top:1px solid var(--line);padding:15px 25px 30px}.detail-body p{margin:12px 0}.detail-body li{margin:8px 0}.detail-body>h3{padding-top:18px;border-top:1px solid var(--line);margin-top:32px}.detail-body>h3:first-child{border:0;margin-top:0}.reference{margin-top:28px;background:transparent}.reference>summary{justify-content:space-between}.reference table{min-width:2450px}.reference .detail-body{background:var(--surface)}.empty{padding:20px;border:1px dashed var(--line);border-radius:8px;color:var(--muted)}footer{font-size:12px;color:var(--muted);padding:27px 0 35px;display:flex;justify-content:space-between;gap:20px;flex-wrap:wrap}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0)}
+@media(prefers-color-scheme:dark){:root{--bg:#142128;--surface:#1b2b34;--text:#e0e9ed;--muted:#9cafb9;--line:#354750;--accent:#86d1bd;--soft:#1b3933;--code:#23363f;--badge:#254039;--warn:#e3c17c}}@media(max-width:800px){.shell{padding:0 22px}.journey{position:static}.step-detail>summary{padding:18px;gap:12px}.detail-body{padding:10px 18px 24px}}@media(max-width:560px){.shell{padding:0 16px}h1{font-size:29px}.hero{padding-top:24px}.lead{font-size:16px}.topline{align-items:flex-start}.toplinks{gap:10px}.journey a{padding:6px 9px}.section-heading{display:block}summary h2{font-size:18px}.number{font-size:18px}.step-detail>summary{flex-wrap:wrap}.summary-copy{flex-basis:calc(100% - 50px)}.step-detail .badge{margin-left:30px}.step-detail .chevron{margin-left:auto}.search{width:100%;font-size:16px}.tools-right{width:100%}.detail-body{padding:8px 14px 22px}.section-heading h2{font-size:21px}}@media print{@page{size:A3 landscape;margin:12mm}:root{color-scheme:light;--bg:#fff;--surface:#fff;--text:#172a35;--muted:#516471;--line:#bbc9d0;--accent:#215e51;--code:#eef2f3;--soft:#edf5f2;--badge:#edf5f2}.shell{max-width:none;padding:0}.journey,.tools,.toplinks,.chevron,.empty{display:none!important}.hero{padding:15px 0}.principles{break-after:page}.detail-table{overflow:visible;border:0}table,.overview table,.reference table{min-width:0;font-size:9pt;table-layout:fixed}th,td{padding:6px}thead{display:table-header-group}tr{break-inside:avoid}details{border:0}.detail-body{padding:0;border:0}.step-detail{break-before:page}.step-detail>summary{padding:10px 0}.reference{break-before:page}pre,pre code{white-space:pre-wrap;overflow-wrap:anywhere}footer{padding:15px 0}}
+</style></head><body><main class="shell" id="top">
+<header class="topline"><span>AGENT DX / TEST STRATEGY</span><div class="toplinks"><a href="test-strategy.md">Markdown原文</a><button id="print" type="button">打印／PDF</button></div></header>
+<section class="hero"><div class="eyebrow">已确认规范 · 单页收敛</div><h1>ADX／AFS 五步测试规范</h1><p class="lead">开发自检 → 共享CI门禁 → 固定包验收</p><div class="meta"><span class="pill">第二/三步基础已实现 · CI/产品接线待补</span><span class="pill neutral">2026-10-31</span><span class="pill neutral">事实基线 1e9ae5f2</span></div></section>
+<section class="principles" aria-labelledby="principles-title"><h2 id="principles-title">先把五步逻辑讲清楚</h2><p>开发时先把基础问题拦住，提交后由公共CI守住集成底线，拿到固定包后再做更充分的版本验收。</p>
+<ol>
+<li><strong>基础UT／LLT：先取得代码级保证。</strong> 开发者在Linux运行 <code>make afs-test</code> 或选定包的 <code>cargo test</code>；命令会编译并运行普通测试，<code>cargo build</code>本身不运行测试。复用现有入口，新功能随代码补UT。
+</li>
+<li><strong>单VM集成：有条件就验证真实组件协作。</strong> 默认在隔离Linux VM内，经AFS统一入口启动Meta/Node和真实挂载，验证读写、权限、可见性、正常恢复与清理。
+</li>
+<li><strong>多namespace集成：一台VM验证隔离节点的协作。</strong> 使用公共环境的M/A/B/C网络、PID和挂载namespace，复用同一入口验证真实TCP/mTLS、恢复和多读者；不要求另备三／四台VM，也不外推为跨宿主故障隔离。
+</li>
+<li><strong>Buildkite门禁：用已有CI环境保护共享集成。</strong> 在ADX既有目标K8s部署AFS，选核心用例进冒烟、更完整功能进Full，并验证ADX实际使用AFS；不调用开发者VM。
+</li>
+<li><strong>固定包验收：开发者和测试人员都能自主闭环。</strong> 拿固定包及配套制品，在合格环境中复用公共E2E跑全量、专项；小时／天级长稳和受控性能另补公共能力与AFS负载。
+</li></ol>
+<p>第2/3步按开发者条件选择，没条件可以不跑并注明未验证；实际失败不能伪装成环境跳过。当前AFS完整CI/产品接线仍待补，不能当作已有兜底。两步都默认在一台Linux VM内：第二步同guest多进程，第三步隔离namespace。可选SSH多VM适配仍保留，未纳入本轮实测；这不是AFS不能容器化的声明。</p></section>
+<nav class="journey" aria-label="五步同页导航"><a href="#step-1">1 基础UT／LLT</a><a href="#step-2">2 单VM集成</a><a href="#step-3">3 多namespace集成</a><a href="#step-4">4 Buildkite门禁</a><a href="#step-5">5 固定包验收</a><a href="#layer-inventory">分层参考</a></nav>
+<section id="overview" class="overview"><div class="section-heading"><h2>五步总表</h2><span class="muted">原则 · 现状 · 环境与入口 · 待补 · 优先级</span></div><p>先用这张表看清原则、现状和工作顺序；目录、用例与命令在下方同页展开。</p>
+<div class="detail-table"><table><thead><tr><th scope="col">步骤</th><th scope="col">原则／要拦截的问题</th><th scope="col">当前现状（事实）</th><th scope="col">环境、目录与入口</th><th scope="col">待补项（未实施）</th><th scope="col">优先级</th></tr></thead><tbody><tr><td>① 基础UT／LLT</td><td>尽早发现模块规则、错误传播、状态机及接口合同回归</td><td>已有8个AFS crate测试入口；普通非ignored测试已接ON组件构建</td><td>Linux；UT在源文件，LLT在域内tests；<code>make afs-test</code>／选包 <code>cargo test</code></td><td>固定推荐范围、说明feature/ignored边界；新功能按代码补UT，不另造runner</td><td>维护基线；P0明确范围</td></tr><tr><td>② 单VM集成</td><td>验证真实Meta/Node、FUSE/bind、数据/权限/缓存和正常恢复/清理</td><td>已实现统一入口和11个基础case；本轮冻结产物真实运行11/11通过</td><td>一台Linux VM；<code>afs/tests/run.py</code>＋<code>suites/</code>＋local/exec适配</td><td>当前候选的新Rust构建阻塞单独保留；未来变更持续补回归</td><td>P0基础已完成</td></tr><tr><td>③ 多namespace集成</td><td>验证隔离节点的真实TCP/mTLS、远端数据路径、恢复和多读者</td><td>用户确认一VM多namespace；三角色基础＋C读者共9case，本轮9/9通过</td><td>一VM的M/A/B/C隔离角色；标准Linux环境说明；<code>cluster-basic</code>／<code>cluster-manyread</code>；同run.py</td><td>可选SSH真实多VM适配未实跑；不宣称VM断电/宿主故障隔离</td><td>P1基础已完成</td></tr><tr><td>④ Buildkite门禁</td><td>防止共享候选包破坏AFS和ADX基本功能；组件/产品分别举证</td><td>ON时8crate普通测试已接；公共K8s L0与独立Full已有；真实AFS集成/产品变体未接</td><td>CI执行集群→已有目标K8s；现有 <code>.buildkite/run-e2e.sh</code>及公共K8s runner</td><td>复用②③断言、补CI适配/测试资产传递；接冒烟/Full与AFS产品变体；明确ON触发和失败门禁</td><td>P0打通冒烟；P1扩Full</td></tr><tr><td>⑤ 固定包验收</td><td>人或AI可自主部署、验收和复现，扩大版本质量验证</td><td>公共K8s Full、Docker单宿主11组和专项已有；只有5分钟soak/90秒采样，完整长稳未闭环</td><td>先备固定包/SDK/backend/bundle及合格环境；直接公共E2E或独立Full代跑</td><td>标准拿包指引/配置；扩AFS产品全量与专项；整理兼容/测量资产；补公共长稳/受控性能能力及AFS负载</td><td>P1可复现全量/专项；P2长稳/性能</td></tr></tbody></table></div></section>
+<section class="shared"><h2>统一口径与实施优先级</h2><ul>
+<li><strong>已定原则／决策</strong>：组件UT/集成归AFS，真实组件测试统一目标 <code>afs/tests/</code>；ADX公开SDK及完整产品场景归 <code>build/e2e/</code>。本地、CI、拿包验收复用断言和结果语义，按环境适配，不复制一套Buildkite专用业务用例。
+</li>
+<li><strong>事实</strong>是已有代码/调用；<strong>已有规划</strong>是原仓内目标但未闭环；<strong>待补项</strong>是后续实现范围；<strong>待验证</strong>是尚未实测的环境/触发条件。总体规范已确认，不表示具体CLI文件、CI接线或所有场景已存在。
+</li>
+<li><strong>当前</strong>第二/三步基础已落地，P0/P1的本地入口与节点隔离验证完成；<strong>后续P0</strong>接CI真实AFS冒烟，<strong>P1</strong>扩产品Full、拿包复现和专项，<strong>P2</strong>建设完整长稳及受控性能。实现顺序不把本地VM变成所有开发者的提交前强制条件。
+</li>
+<li><strong>通过标准</strong>：选中的必需项必须实际执行，0匹配、ignored、未执行、BLOCKED不能记PASS；定向通过不冒称完整Full，含AFS二进制不证明产品使用了AFS；正常清理也必须举证。
+</li>
+<li><strong>环境与结果范围</strong>：VM、Docker、K8s分别记录；Pod跨worker不能冒充多VM/断电验证；功能、正常恢复、故障、长稳及性能分别报告。CI缺必需环境不能静默跳过为成功。
+</li></ul></section>
+<section aria-labelledby="detail-title"><div class="section-heading"><h2 id="detail-title">再按步骤查看细节</h2><span class="muted" id="search-status" role="status" aria-live="polite">5步详细规范</span></div><div class="tools"><div class="tools-left"><button id="expand" type="button">展开五步</button><button id="collapse" type="button">收起细节</button></div><div class="tools-right"><label><span class="sr-only">搜索五步详细规范</span><input id="search" class="search" type="search" placeholder="搜索用例、目录、脚本、环境…"></label></div></div><details id="step-1" class="step-detail"><summary><span class="number">01</span><span class="summary-copy"><h2>第一步：基础UT／LLT</h2><small>现有命令先取得基础保证；明确选包、feature和ignored边界。</small></span><span class="badge">维护基线</span><span class="chevron" aria-hidden="true">＋</span></summary><div class="detail-body"><p><strong>原则</strong>：复用自然的编译/测试工具，在开发期快速定位基础问题，不新增测试平台。</p>
+<p><strong>现状／事实</strong>：<code>make afs-test</code>已选择8个AFS crate及all-targets；单独 <code>cargo test -p afs</code>只选择主crate，不能当作整个AFS域都跑过。Cargo测试可自行编译；单独编译不会自动测试。普通LLT与UT均可能参与Cargo，不能仅按命令名称统称纯UT。</p>
+<p><strong>待补与优先级</strong>：P0固定推荐命令和范围说明；后续行为变更补相应UT/LLT。真实挂载、外部依赖、ignored及特殊feature明确转入第2/3步或定向扩展，不能从普通Cargo通过推导它们也通过。</p>
+<h3>现有入口、目录和边界</h3>
+<pre><code># 现有命令，须在Linux执行；本轮未运行
+make afs-test JOBS=4
+# 只选主crate的定向开发验证
+cargo test --locked -p afs</code></pre>
+<p>8个crate为 <code>afs</code>、<code>afs-client</code>、<code>afs-error</code>、<code>afs-logging</code>、<code>afs-metrics</code>、<code>afs-protocol</code>、<code>afs-tracing</code>、<code>afs-transport</code>。 UT在 <code>afs/src/**</code>、<code>afs/client/src/**</code>、<code>afs/common/*/src/**</code>；LLT在 <code>afs/tests/*_contract.rs</code>、<code>local_sdk.rs</code>、<code>storage_localfs.rs</code>及域内crate的tests。普通测试在Linux构建环境直接执行；受影响真实环境集合另选。 CI的 <code>component-tests.sh afs</code>也选择这8个crate，但与Makefile的target/参数并非逐字完全相同；具体以各自脚本为准。CI仅ON选择AFS构建，默认组件测试可配置关闭。</p>
+<p>依据：<a href="../../Makefile">Makefile</a>、<a href="../../.buildkite/component-tests.sh">组件测试</a>、<a href="afs-test-inventory.md">AFS逐项盘点</a>。</p></div></details><details id="step-2" class="step-detail"><summary><span class="number">02</span><span class="summary-copy"><h2>第二步：单VM基础集成</h2><small>真实Meta/Node与挂载；11基础case及统一入口已实现。</small></span><span class="badge">P0</span><span class="chevron" aria-hidden="true">＋</span></summary><div class="detail-body"><p><strong>原则</strong>：在一台Linux VM里跑真实组件，先确认基础读写、权限、可见性、恢复和清理。开发者有条件就跑；条件不足可以不跑并注明未验证。</p>
+<p><strong>现状／事实（2026-10-31）</strong>：<code>afs/tests/run.py</code>、实际 <code>suites/</code>、local/namespace/SSH执行适配、环境模板、身份与结果/清理协议已实现。单机11case、第三步9case合计20基础case在公共VM真实通过；Linux工具合同24项通过。</p>
+<p><strong>输入边界</strong>：产品复用冻结ARM64产物，源码输入摘要 <code>7b76ba244970509625c8fad2f45e8fc51ba577de24c7e8ba54cbc161f5e6f0e0</code>；受控内核测试ELF为已有 <code>cdb104a8d013f490cd3e72abc827935b514e9bf6cc58b3f9316fe0befff9dfc6</code>。本轮不改生产Rust；新构建的网络/离线缺依赖原始失败保留，不能升格为新生产代码编译通过。第四/五步尚未接入。</p>
+<h3>第二、三步实施对照与验收出口</h3>
+<p>通用VM从依赖安装到namespace创建/运行/回收的操作说明及标准命令模板见 <a href="../../afs/tests/README.md#从普通linux-vm准备环境">AFS组件集成README</a>，不依赖个人路径或外部环境管理工具。通用setup/PYENV与预检、20项基础用例已在Ubuntu 24.04 ARM64上重新通过；测试shell及namespace模板清除继承代理，首轮代理导致的失败原样保留。该验证从已有VM开始，不声称空白镜像安装或所有平台均已验证。</p>
+<p>两步共同设计并已按下表闭环。用户在实施时明确第三步默认改成一VM内的namespace，不再要求独立三/四VM。角色执行/业务断言不依赖具体接入方式；本地、公共环境exec和可选SSH共用同一套逻辑。</p>
+<div class="detail-table"><table><thead><tr><th scope="col">批次</th><th scope="col">已实现内容</th><th scope="col">本轮出口与边界</th></tr></thead><tbody><tr><td>B0／P0</td><td>发现/选择、能力检查、稳定ID/标签、matrix环境映射、身份与退出/结果协议</td><td>Linux24项工具合同通过，含namespace消歧、混合输入拒绝、失败合并、迟到回复与清理</td></tr><tr><td>B1／P0</td><td>OwnerFs单机真实bind/远端FUSE、基本操作、非root/setid、正常恢复</td><td>4case通过；A使用独立egress bind，不能把OwnerFs元数据FUSE目录当成本地bind</td></tr><tr><td>B2／P1</td><td>单VM内M/A/B独立network/PID/mount namespace、OwnerFs跨节点同断言</td><td>4个OwnerFs case＋拓扑清理case通过；不是独立VM或宿主隔离验收</td></tr><tr><td>B3／P1</td><td>DFS同guest与隔离节点部署、发布/版本/权限、正常恢复与独立C读者</td><td>单机DFS5case、namespace DFS4case通过；R1不承诺Home停机时仍可读未缓存数据</td></tr><tr><td>B4／P1</td><td>精确Rust内核顺序/busy调用、Python真实DFS H1/H2/H3、完整组计数与正常清理</td><td>内核2case含3个实际Rust test通过；与其它case合计20/20、LB01–08/MV01–08齐全，清理错误0</td></tr></tbody></table></div>
+<p>当前是基础组件集成出口，不是完整ADX产品/全部后端/长稳/性能通过。旧失败与调试记录保留；最终20例使用同一冻结测试输入。可选真实DFS Rust交叉验证因旧ELF无该selector而保持未验收，不计入基础集合，也不以Python结果冒充该Rust通过。</p>
+<h3>单机基础集合：8组对应11case</h3>
+<div class="detail-table"><table><thead><tr><th scope="col">组</th><th scope="col">解决的问题</th><th scope="col">当前实现／证据</th></tr></thead><tbody><tr><td>LB01 启动与拓扑</td><td>真实Meta/Node、OwnerFs A egress/ext4 bind与B FUSE、DFS A/B/C挂载</td><td>fixture每例验证真实挂载；OwnerFs核对物理inode；不以health/PID替代</td></tr><tr><td>LB02 文件与目录</td><td>mkdir/list/stat、读写/覆盖/truncate、rename/unlink/rmdir、ENOENT</td><td><code>ownerfs.basic.namespace</code>、<code>dfs.basic.namespace</code>，跨Node读回和错误检查</td></tr><tr><td>LB03 OwnerFs互通</td><td>三轮64KiB不同内容、A bind↔B FUSE、fsync后重开及删除</td><td><code>ownerfs.basic.read_write</code>，双向长度/完整SHA核对</td></tr><tr><td>LB04 权限与错误</td><td>owner成功、other拒绝、mode000新OPEN拒绝/恢复；OwnerFs setid/CAP_FSETID合同</td><td><code>ownerfs.permissions.deny_other_uid</code>、<code>dfs.visibility.new_open_permissions</code>；独立降权进程</td></tr><tr><td>LB05 DFS一写多读</td><td>R1下A写、B/C并发读，三版本和删除</td><td><code>dfs.basic.one_writer_many_readers</code>；内容校验与实际peer_read_ranges调用增量分别记录</td></tr><tr><td>LB06 内核顺序/缓存</td><td>同fd write/truncate顺序、增长/截短；真实同inodeV2/H1尾部/H2/H3和权限</td><td><code>fuse.contracts.ordering</code>显式调用两个Rust选择器；<code>dfs.visibility.real_cross_handle_cache</code>用非root Python跑16MiB/完整SHA/EOF和READ计数</td></tr><tr><td>LB07 正常恢复</td><td>成功确认数据在正常停启/同目录重启后保持，身份/权限/内容一致</td><td>OwnerFs/DFS各自 <code>recovery.normal_restart</code>；不替代SIGKILL/断电验收</td></tr><tr><td>LB08 正常清理/busy</td><td>正常退出、先Node后Meta、无新增挂载/自有监听；busy拒绝不偷偷detach</td><td>每例强制清理检查；<code>fuse.contracts.busy_unmount</code>运行精确Rust内核合同</td></tr></tbody></table></div>
+<p>Rust受控backend选择器仍为 <code>fuse_ftruncate_on_same_handle_waits_for_prior_write</code>、<code>dfs_buffered_reopen_refreshes_growth_and_truncation_with_new_heads</code>、<code>fuse_normal_join_rejects_busy_mount_without_detaching</code>。目标先 <code>--list --exact</code> 核对，再 <code>--ignored --exact</code> 实际执行，拒绝0测试PASS。受控backend与真实DFS证据分开。</p>
+<p>真实DFS缓存probe在同一非root进程可见的A/B两挂载下执行；B自有FUSE BDI的readahead临时置0并恢复，校验16MiB、V2不换inode、H1未缓存尾部、H2新页、H3同版本缓存复用、mode000新OPEN拒绝及恢复。原Rust同语义test留作可选 <code>local-extended</code> 交叉验证；跨namespace不能把两条路径当作同进程可见，改用第三步的角色协作断言。</p>
+<h3>环境与输入标准</h3>
+<ul>
+<li>VM/root、<code>/dev/fuse</code>、FUSE3、原生ext4、私有mount namespace、已有工具与明确UID/GID由环境维护者准备；目录至少1GiB空闲，编译空间另计。不将Mac共享路径当Linux数据盘，不自动安装包/创建用户或修改全局配置。
+</li>
+<li><code>base</code>是已有专用Linux目录；每case使用run-ID＋短摘要新目录，避免UDS超过108字节；不覆盖历史目录、不终止未知进程。默认串行，独占自有资源。
+</li>
+<li>同候选native ELF、产品source身份与实际SHA由已有构建流程提供；同目录 <code>artifact-identity.json</code> 核对产品及测试ELF，传输前后再验SHA。只有SHA一致而没有有效构建来源，也不能自称新版本已构建通过。
+</li>
+<li>默认local-file Meta、真实mTLS、OwnerFs bind/远端FUSE、DFS R1；不需要完整ADX、S3、etcd、Redis、RDMA。相关后端/设备变更仍要另选扩展。
+</li>
+<li>单机可在guest内用local transport；Mac编排可用exec prefix进入公共VM的mgmt节点，所有文件系统/产品操作仍在Linux内执行。不把控制端的Path/open用于访问远端挂载。
+</li>
+<li>VM是参考工程环境；未来容器须另有FUSE/权限/ext4准入，不能从“能启动容器”推导本集合已通过。
+</li></ul>
+<h3>唯一入口与目录（已落地）</h3>
+<pre><code>afs/tests/
+├── README.md
+├── run.py                         # list/check-env/run，选择、调度与结果
+├── suites/                        # 实际用例，没有scenarios层
+│   ├── ownerfs/                   # 基本/权限/恢复/跨节点
+│   ├── dfs/                       # 基本/权限/恢复/缓存与多读者
+│   │   └── real_cache.py          # 真实DFS非root H1/H2/H3 probe
+│   ├── fuse/test_contracts.py     # 精确调用已有Rust内核合同
+│   ├── cluster/test_multivm.py    # 拓扑与清理，历史文件名保留
+│   └── operations.py             # 按角色复用业务断言
+├── fixtures/
+│   ├── common.py                 # case发现/选择、身份、带request ID的通道
+│   ├── worker.py                 # Linux父进程真实wait、私有挂载与角色操作
+│   ├── singlevm.py               # guest本机接入
+│   ├── namespaces.py             # 公共受管角色的literal argv接入
+│   ├── ssh.py                    # 可选SSH入口，保持已有主机信任
+│   ├── multivm.py                # 共用Cluster fixture，支持三种环境
+│   ├── singlevm.example.json
+│   ├── namespaces-3.example.json
+│   ├── namespaces-4.example.json
+│   ├── matrix.example.json       # 引用local/cluster两份环境
+│   └── multivm-3/4.example.json   # 可选真实VM模板，未实跑
+├── runner_tests/                 # 工具合同测试，不冒称产品通过
+├── support/                      # 已有Rust探针，原位保留
+└── *_contract.rs 等              # 已有Rust合同，原位保留</code></pre>
+<p>现有单机driver的配置/业务/正常退出断言用于迁移对照，Rust合同原位调用；旧跨机/cohort的etcd/粗kill/lazy卸载/R3测量及固定身份不照搬。旧driver保留已有辅助接口和历史用途，新基础验收只维护上述统一入口。精确CLI、产物清单、模板及<a href="../../afs/tests/README.md#用例组织与后续添加规则">添加用例规则</a>见组件README；当前20项是基础集合，不代表全量覆盖。</p>
+<h3>选择、执行与结果</h3>
+<pre><code>python3 afs/tests/run.py list
+python3 afs/tests/run.py check-env --suite all-basic --env /absolute/matrix.json --binary-dir /absolute/bin
+python3 afs/tests/run.py run --suite all-basic --env /absolute/matrix.json --binary-dir /absolute/bin --work-root /absolute/new-results
+# 定向：--case ownerfs.basic.read_write，或 --case &#x27;ownerfs.basic.*&#x27;
+# 多个--case取并集、按ID去重，任一0匹配拒绝</code></pre>
+<p><code>local-basic</code>为11case；<code>cluster-basic</code>为三角色8case；<code>cluster-manyread</code>为基础＋C读者共9case；<code>all-basic</code>通过matrix合并20基础case。<code>run</code>无选择器默认local-basic，<code>list</code>无选择器列全注册。<code>--all</code>还包含可选诊断/交叉验证，不能静默跳过缺输入项；需要全部基础时明确选all-basic。</p>
+<p>每次新work-root保存身份、实际环境/配置、每case/组结果、原始错误、日志、真实wait和清理；退出0仅表示声明范围通过，1为失败/超时/清理错误，2为环境或输入BLOCKED。case/glob是partial，不冒称整套。每例先停所有Node、确认实际退出，再停Meta；非零但已确认退出不遗留Meta，停止未知则保留并报告。失败且清理确认后可继续独立例，清理不明/环境阻塞后其余NOT_RUN。控制端中断、迟到RPC响应不得伪装清理成功。</p>
+<p>当前默认每例预算600秒（可设置60–3600），仅超时保护；Meta/Home正常恢复允许有界30秒会话/缓存收敛，保留暂态错误，内容损坏立即失败。全部配置与日志在清理后保留，控制端临时私钥正常删除；运行数据验后导出核对再按本任务归属清理。</p></div></details><details id="step-3" class="step-detail"><summary><span class="number">03</span><span class="summary-copy"><h2>第三步：单VM多namespace集成</h2><small>同VM隔离节点基础＋第二读者；共用run.py，已实测通过。</small></span><span class="badge">P1</span><span class="chevron" aria-hidden="true">＋</span></summary><div class="detail-body"><p><strong>原则／用户决定</strong>：使用一台VM内的namespace即可，不要求另搭三或四台独立VM。第二步同guest直接跑进程，第三步M/A/B/C分别进入独立network/PID/mount namespace，验证真实TCP/mTLS与隔离节点行为；两步共用同一run.py、角色操作、业务断言和结果协议。</p>
+<p><strong>现状／事实</strong>：通用模板通过标准<code>ip netns</code>/<code>unshare</code>进入M/A/B/C；环境由执行者按README预先准备。首次实测使用已有受管VM提供的mgmt和worker入口，属于可替换的exec接入示例。fixture只部署本轮产品、分发输入/配置、取证与清理，不安装公共环境或创建VM。实测namespace基础9case通过，包括额外C读者；每case核对同一boot内各角色net/PID/mount身份不同。SSH真实多VM适配仍是可选，未作本轮通过声明。</p>
+<h3>角色、环境与责任</h3>
+<div class="detail-table"><table><thead><tr><th scope="col">角色</th><th scope="col">默认公共节点</th><th scope="col">产品职责</th><th scope="col">隔离/输入要求</th></tr></thead><tbody><tr><td>M</td><td>mgmt</td><td>local-file Meta、测试证书下的管理/RPC</td><td>与A/B/C独立namespace；自己的state/监听/日志</td></tr><tr><td>A</td><td>worker-1</td><td>OwnerFs真实egress bind/Home；DFS R1 writer</td><td>原生ext4，自有挂载/UID、真实mTLS与固定候选</td></tr><tr><td>B</td><td>worker-2</td><td>OwnerFs远端FUSE；DFS新鲜读者</td><td>独立进程/网络/挂载，内容与实际peer调用证据</td></tr><tr><td>C</td><td>worker-3，可选扩展</td><td>第二个独立DFS reader</td><td>三角色基础不需要；四角色集合必须有且实际读回</td></tr></tbody></table></div>
+<p>VM和公共节点namespace由环境维护者/公共工具准备；使用者先登记、open并保存session。项目提供模板、检查所选能力、分发/部署本轮AFS并回收；结束后使用者导出核对、close、清理本任务临时盘、release。控制端可为Mac或Linux，不增加一台“控制VM”，不在运行节点重编译产品。</p>
+<h3>跨节点基础：7组＋1扩展</h3>
+<p>MV是保留的验收组编号；本轮实际拓扑是单VM多namespace，<strong>不是独立VM通过</strong>。</p>
+<div class="detail-table"><table><thead><tr><th scope="col">组</th><th scope="col">必须解决的问题</th><th scope="col">当前用例</th></tr></thead><tbody><tr><td>MV01</td><td>候选一致、角色隔离、真实挂载与服务路径</td><td><code>cluster.topology_cleanup</code>＋每例fixture</td></tr><tr><td>MV02</td><td>A bind↔B FUSE双向同步读写、版本/长度/SHA/删除</td><td><code>ownerfs.cluster.read_write</code></td></tr><tr><td>MV03</td><td>命名空间、旧FD在rename/unlink/名称复用后仍正确、单一Home、EXDEV</td><td><code>ownerfs.cluster.namespace</code>，含同步FD握手而非猜测sleep</td></tr><tr><td>MV04</td><td>DFS R1发布、新鲜B读回三版本、删除、实际远端取数</td><td><code>dfs.cluster.read_write</code>；RPC调用计数与成功内容分别举证</td></tr><tr><td>MV05</td><td>新OPEN得到新版本和长度；非root权限拒绝/恢复</td><td><code>dfs.cluster.visibility</code>、<code>ownerfs.cluster.permissions</code></td></tr><tr><td>MV06</td><td>正常Meta/Home进程重启与同目录恢复；不可达时有错误、恢复后可读</td><td>OwnerFs/DFS各自 <code>cluster.restart</code>；R1不承诺A停机时未缓存内容可用</td></tr><tr><td>MV07</td><td>各节点真实退出、无自有挂载/监听，失败/中断仍取证</td><td>每例统一清理与拓扑case；未知不记PASS</td></tr><tr><td>MV08</td><td>A发布后独立B/C并发读回同版本与删除，各自数据路径正确</td><td><code>dfs.cluster.many_readers</code>，四角色集合同时包含前7组</td></tr></tbody></table></div>
+<p>根创建竞争要求一个成功且实际Home唯一，保留竞争失败者errno，不将此结果冒充完整POSIX错误码兼容。普通进程重启不是VM断电；同一宿主不能证明宿主故障隔离、跨物理机HA或精确性能。</p>
+<h3>复用同一入口</h3>
+<pre><code>python3 afs/tests/run.py run --suite cluster-basic --env /absolute/namespaces-3.json --binary-dir /absolute/bin --work-root /absolute/new-three-role-results
+python3 afs/tests/run.py run --suite cluster-manyread --env /absolute/namespaces-4.json --binary-dir /absolute/bin --work-root /absolute/new-four-role-results
+# 与第二步一起：--suite all-basic --env /absolute/matrix.json</code></pre>
+<p>具体角色地址/command-prefix均在仓外环境文件；不把个人session、凭据或当前机器状态写死进产品用例。<code>namespaces-3/4.example.json</code>为模板，须填实际公共工具和session；<code>matrix.example.json</code>引用local/cluster配置。只有真实不同net/PID/mount身份才准入，不能给同一进程取三个host别名冒充隔离。可选SSH配置按已有信任接入，不创建用户/密钥或修改机器identity。</p>
+<p><strong>当前边界与后续</strong>：第二/三步基础闭环已通过本轮冻结输入；下一项是第四步CI环境适配和产品真实AFS接线，不自动启动。独立VM、VM断电、复杂后端/设备矩阵、长稳和性能按需求另验收，不从本轮结果外推。</p></div></details><details id="step-4" class="step-detail"><summary><span class="number">04</span><span class="summary-copy"><h2>第四步：Buildkite共享门禁</h2><small>CI用既有目标K8s；先通AFS冒烟，再扩Full。</small></span><span class="badge">P0 → P1</span><span class="chevron" aria-hidden="true">＋</span></summary><div class="detail-body"><p><strong>本步原则、现状与优先级</strong>：原则：复用既有CI目标K8s，部署AFS并选集；不调用个人VM。现状：普通Cargo已接，真实AFS和产品变体未接。待补：CI环境/资产/选集/失败门禁与真实产品路径。优先级：P0冒烟、P1 Full。</p>
+<p><strong>状态</strong>：五步总体逻辑已确认；以下目录/命令中标注目标或待补者尚未实施。</p>
+<h3>先讲清五条原则</h3>
+<ol>
+<li><strong>第二、三步默认用开发者准备的Linux VM；第四步使用CI自己的环境。</strong> 当前x86构建作业在CI K8s集群的Pod中运行，产品E2E由部署作业向已有的目标K8s集群部署ADX。没有调用开发者VM的链路。
+</li>
+<li><strong>用例可以复用，环境准备要适配。</strong> AFS组件断言仍归 <code>afs/tests/</code>，CI也可以调用同一个 <code>run.py</code>；需要补K8s适配，不能直接把singlevm或SSH多VM配置交给CI。Buildkite负责调度、选集和结果门禁。
+</li>
+<li><strong>冒烟保护集成底线，全量扩大功能覆盖。</strong> 冒烟选真实启动、核心读写、基本拒绝和清理；全量再选缓存/顺序、命名空间、正常恢复、多读者等。两者均不自动代表长稳、精确性能或所有后端/硬件矩阵。
+</li>
+<li><strong>AFS组件通过与ADX产品通过分别举证。</strong> 前者直接验证AFS；后者必须通过公开SDK，证明真实产品已经使用AFS并正确完成用户行为。仅编译AFS、带上二进制或普通文件读写通过，都不能证明产品接入了AFS。
+</li>
+<li><strong>选入门禁的必需项必须有明确结果。</strong> CI环境由门禁维护者准备；缺FUSE/权限/拓扑时应明确阻塞或失败，不能静默跳过后报成功。本地因条件不足不跑，与CI必需项的结果语义不同。
+</li></ol>
+<p>总体环境与融合方向已对齐；下列具体选集和接线仍为<strong>待补方案</strong>。下面的现状仅指仓内已经检入的调用关系，不冒充线上最新一次执行结果。</p>
+<h3>当前ADX究竟在哪里、怎么跑</h3>
+<p><strong>事实：有两层K8s环境，测试节点是目标集群中的Pod。</strong> 基础设施中的worker可能本来就是VM，但它们不使用开发者第二、三步的个人VM清单。</p>
+<pre><code>Buildkite
+  └─ CI执行K8s集群
+       ├─ 构建Pod：Cargo测试、编译、组包
+       ├─ 镜像准备Pod：固定包/SDK/backend → 镜像 → registry
+       └─ 部署Pod：run-e2e.sh，持有目标集群kubeconfig
+            └─ 已有目标K8s集群
+                 └─ 本次独立 adx-e2e-* namespace
+                      ├─ node1 Pod：ADX进程、sandboxd、真实runc/Execd
+                      ├─ node2 Pod：ADX进程、sandboxd、真实runc/Execd
+                      └─ 公开SDK场景 → 结果/日志 → 停服务并删除namespace</code></pre>
+<p>部署器负责创建本次namespace/Pod、配置和启动服务、执行用例、取证与清理；<strong>不负责购买机器或新建K8s集群</strong>。目标集群、可调度worker、registry与kubeconfig权限须事先具备。</p>
+<p>当前两个测试Pod的platform容器已经是root＋privileged，不能再把“新增privileged”写成AFS必需改造。现有ADX preflight检查OCI runtime及bridge netfilter；**尚无AFS专门的 <code>/dev/fuse</code>、FUSE挂载、ext4目录、非root身份和正常卸载准入闭环**，这些能力在目标Pod里是否满足仍待验证。</p>
+<p>当前L0不要求两个Pod分处不同worker；Full在调度后强制检查两个不同K8s worker。代码核验的是不同worker节点名，不能据此断言云基础设施底层绝无共宿物理机。它也不能替代多VM独立guest内核、VM重启/断电等证据。</p>
+<p>依据：<a href="../../.buildkite/pipeline-package.yml">基础流水线</a>、<a href="../../.buildkite/pipeline-full.yml">Full流水线</a>、<a href="../../build/e2e/kubernetes/run.py">K8s部署器</a>、<a href="../../build/e2e/kubernetes/manifest.py">Pod定义</a>。</p>
+<h3>当前阶段、入口与AFS覆盖（事实）</h3>
+<div class="detail-table"><table><thead><tr><th scope="col">阶段</th><th scope="col">当前调用链与执行内容</th><th scope="col">当前AFS覆盖／缺口</th></tr></thead><tbody><tr><td>源码/工具检查，与组件构建并行</td><td><code>pipeline-package.yml</code> → <code>source-gate.sh</code> → API合同、<code>unittest discover -s build/e2e/tests</code>、<code>build/release/tests</code>、<code>make rust-check</code></td><td>有AFS模式的工程/发布工具合同；ON时加入AFS lint。不是实际挂载、组件集群或产品AFS功能测试</td></tr><tr><td>AFS组件测试与编译</td><td><code>build-afs</code> 仅在 <code>ADX_WITH_AFS=1</code> 时选择 → <code>build-component.sh afs</code> → <code>component-tests.sh afs</code> → Cargo测试 → release编译</td><td>普通Rust UT及适用非ignored LLT已接；测试默认开启，可用 <code>ADX_COMPONENT_TESTS=0</code> 关闭。没有自动运行所有feature、ignored真实FUSE或外置Python集成驱动</td></tr><tr><td>组包与安装检查</td><td><code>platform-build</code> → <code>package-components.sh</code>，等待对应组件、source-gate、SDK/admin候选</td><td>ON/OFF清单、AFS组件身份/二进制和安装合同检查已有；不启动AFS文件系统</td></tr><tr><td>包上传</td><td><code>publish-amd64</code> → <code>publish-amd-package.sh</code>，等待组包</td><td><strong>当前OBS上传早于产品L0</strong>；不能说“上传的包都已过E2E”。整体流水线成功才包括后续必需作业</td></tr><tr><td>E2E镜像准备</td><td><code>platform-images</code> → <code>package-smoke.sh</code> → <code>package-e2e.sh</code> → <code>prepare.py</code> / <code>kubernetes/publish_images.py</code></td><td>基础线固定使用本次base/SDK候选并准备镜像；校验AFS包模式。<code>package-smoke.sh</code>名字不表示在此执行用户冒烟</td></tr><tr><td>基础产品冒烟</td><td><code>platform-e2e</code> → <code>run-e2e.sh</code> → <code>build/e2e/kubernetes/run.py --profile l0</code> → 共享场景</td><td>当前选择 <code>l0</code>＋<code>auth</code>：创建/查询Environment、命令stdout/stderr/退出码、二进制文件往返、删除及鉴权隔离。没有明确配置并验证真实AFS存储的场景</td></tr><tr><td>独立功能Full</td><td><code>agent-dx-full-test</code> → <code>pipeline-full.yml</code> → 准备或复用固定镜像 → 同一 <code>run-e2e.sh</code> → K8s <code>run.py --profile full</code></td><td>当前默认11组公共功能；与基础L0是不同流水线。没有AFS组件全量/产品存储变体的完整接线</td></tr><tr><td>定向专项</td><td><code>ADX_E2E_TARGET_CASE</code> → 同一K8s入口；多选 <code>ADX_E2E_TARGET_CASES</code> → <code>targeted_suite.py</code> → 每例独立namespace</td><td>已有公共定向机制；不是“有AFS脚本就会自动被选中”。长稳与受控性能仍有公共能力缺口</td></tr></tbody></table></div>
+<p>当前AFS Cargo选择是：<code>afs</code>、<code>afs-client</code>、<code>afs-error</code>、<code>afs-logging</code>、<code>afs-metrics</code>、<code>afs-protocol</code>、<code>afs-tracing</code>、<code>afs-transport</code>，用 <code>cargo test --locked -j ... -p ...</code> 执行。没有 <code>--ignored</code> / <code>--all-features</code>；不能从静态定义数量推导本次运行数量。普通合同文件内的非ignored测试会按其cfg/feature参与；真实挂载等显式ignored部分不自然执行。</p>
+<p>公开产品冒烟的具体业务入口：<code>build/e2e/run.py</code> 的profile/调度 → Pod内 <code>build/e2e/scenarios.py l0</code> → <code>sdk_smoke.py</code>；鉴权为 <code>scenarios.py auth</code>。已有文件测试使用SDK读写 <code>/tmp/adx-e2e.bin</code>，该事实本身不证明文件落在AFS上。</p>
+<p>Full默认11组为：<code>sdk</code>、<code>data-plane</code>、<code>lifecycle</code>、<code>auth</code>、<code>capacity</code>、<code>placement</code>、<code>local-first</code>、<code>node-failure</code>、<code>sandboxd-restart</code>、<code>restart</code>、<code>stop</code>。其它可选故障、<code>mixed-soak</code>、<code>load-performance</code>等不是默认全部执行。现有短soak默认300秒，不能称为全天长稳。</p>
+<p><strong>范围限制</strong>：上述主要是x86路径。ARM构建由macOS agent上的Linux ARM64 Docker builder承载，测试默认关闭，需 <code>ADX_ARM_TESTS=1</code> 开启；当前正式K8s E2E路径为amd64。upstream合入/PR/webhook、分支过滤、nightly及必需状态的线上设置本轮未查询；仓内只能证明流水线启动后运行什么，不能保证每次合入都已选中AFS ON。</p>
+<p>依据：<a href="../../.buildkite/component-tests.sh">组件测试</a>、<a href="../../.buildkite/build-component.sh">组件构建</a>、<a href="../../.buildkite/source-gate.sh">源码门禁</a>、<a href="../../.buildkite/package-smoke.sh">镜像准备包装</a>、<a href="../../.buildkite/run-e2e.sh">产品执行包装</a>、<a href="../../build/e2e/run.py">共享profile</a>、<a href="../../build/e2e/scenarios.py">业务场景</a>、<a href="../../build/e2e/sdk_smoke.py">SDK冒烟</a>。</p>
+<h3>第二、三步哪些断言进入冒烟／全量（待补方案）</h3>
+<p>原则是复用<strong>可追溯的行为断言</strong>，用CI环境执行；不是把VM整套部署原封不动搬进K8s。下表的LB/MV编号仅标注来源；Pod运行必须记录自己的环境和拓扑，不能报成“多VM通过”。同一代表行为不因来自两个集合重复运行两遍。</p>
+<div class="detail-table"><table><thead><tr><th scope="col">来源与要拦截的问题</th><th scope="col">冒烟：最小代表</th><th scope="col">功能全量：扩展覆盖</th><th scope="col">现状与需要补的部分</th></tr></thead><tbody><tr><td>LB01、MV01：真实AFS进程/挂载/路径是否存在</td><td>OwnerFs bind＋远端FUSE、DFS真实挂载；同候选、真实网络寻址</td><td>保留准入并记录跨worker放置、完整角色和节点身份</td><td>单机配置/挂载探针可复用；CI拓扑、FUSE/ext4/TLS和路径证明未接</td></tr><tr><td>LB02/03、MV02：基本操作与OwnerFs互通</td><td>小文件目录创建、读写/长度/哈希、fsync后重开、rename/删除；OwnerFs双向读写</td><td>覆盖/截短、属性/目录和边界错误；多个版本变化</td><td>OwnerFs驱动已有核心断言；完整最低操作链及统一用例入口待整理</td></tr><tr><td>LB05、MV04：DFS发布与远端可读</td><td>R1下一写一远端读，成功fsync、新OPEN版本/长度/哈希和删除；证明确实发生远端取数</td><td>扩充读者/版本组合，保留真实数据路径证据</td><td>单机三Node driver已有读写校验；跨Pod部署/远端路径、结果注册待补</td></tr><tr><td>LB04、MV05部分：权限拒绝与新鲜度</td><td>一个授权非root读写、一个越权新OPEN拒绝、ENOENT；短新版本重开校验</td><td>setid/CAP_FSETID、权限修改/恢复、缓存拒绝/刷新等完整合同</td><td>OwnerFs UID/setid断言、真实DFS权限断言可复用；CI身份/挂载适配未接</td></tr><tr><td>LB06、MV05部分：内核顺序与缓存</td><td>只保留上面短重开代表；不默认执行全部16MiB缓存探针</td><td>显式选择真实内核顺序、增长/截短、真实DFS keep-cache及计数断言</td><td>ignored选择器需显式执行；Rust测试ELF和依赖未送达目标环境；同机双挂载例不能直接跨Pod运行</td></tr><tr><td>MV03：命名空间和对象身份</td><td>上面基本rename/unlink已选；不追加整组</td><td>旧FD经rename/unlink/名称复用仍正确、并发单一Home、跨root EXDEV</td><td>OwnerFs跨机driver部分断言已有，需统一worker协议和当前拓扑适配</td></tr><tr><td>LB07、MV06：正常停启与恢复</td><td>暂不纳入最小产品冒烟</td><td>正常全停/同目录恢复、Meta/Home正常进程重启，已确认数据/权限可恢复</td><td>OwnerFs已有部分；DFS真实恢复待补；K8s emptyDir下进程重启保留目录，不等同于Pod删除或VM断电恢复</td></tr><tr><td>LB08、MV07：回收与挂载残留</td><td><strong>所有执行均必须正常排空、卸载、退出且无自有残留</strong></td><td>再加入busy拒绝、异常退出/中断后的结果与清理核验</td><td>单机退出/mountinfo断言可复用；CI须在删除namespace前保留AFS正常卸载证据，不能用删Pod掩盖失败</td></tr><tr><td>LB05完整、MV08：一写两独立读者</td><td>单远端读者代表即可</td><td>一写两读者并发、同版本/删除及各读者路径证明</td><td>当前公共只有两ADX node Pod；需显式定义额外AFS Node/读者角色和放置，不把VM数等同于Pod数；未支持前须列缺口</td></tr><tr><td>公共ADX产品行为：上述组件通过是否真的惠及用户</td><td>在已有L0/鉴权场景加入AFS支持的存储变体，证明SDK实际写入/读回/删除经过AFS、隔离/清理正确</td><td>在既有11组中按支持边界扩展AFS相关生命周期、放置、故障/恢复和资源回收</td><td>产品挂载/配置/路径断言缺失；不能把AFS组件用例替代SDK场景，也不能要求与AFS无关的每组都重写</td></tr></tbody></table></div>
+<p>Full包括已登记的冒烟必需断言；扩大覆盖不等于 <code>run.py --all</code> 无条件执行所有环境/专项。RDMA、S3/etcd矩阵、VM断电、HA、POSIX大套件、小时/天级长稳和精确性能继续按能力与判据登记专项；不自动塞进本轮冒烟/功能全量。R1正常恢复也不承诺Home停机时未缓存数据仍可读。</p>
+<h3>接线落在什么阶段、用哪个入口（待补方案，不是当前实现）</h3>
+<p><strong>保留现有两条公共流水线，AFS真实集成放在固定包和镜像准备完成后的验收阶段。</strong> 构建阶段继续跑现有Cargo测试；不让普通构建容器默认承担真实挂载。</p>
+<pre><code>基础 pipeline-package.yml / platform-e2e（已有）
+  run-e2e.sh（已有，待扩展AFS分支）
+    ├─ AFS ON：afs/tests/run.py 选择冒烟断言＋CI K8s环境适配（待补）
+    └─ 现有K8s run.py --profile l0 ＋真实AFS产品存储变体（变体待补）
+
+独立 pipeline-full.yml / platform-e2e（已有）
+  run-e2e.sh（同一包装，待扩展AFS分支）
+    ├─ AFS ON：同一AFS runner选择功能全量＋CI K8s环境适配（待补）
+    └─ 现有K8s run.py --profile full ＋真实AFS产品存储变体（变体待补）</code></pre>
+<p>这定义了拟接入的阶段和入口，不新增一套AFS产品流水线。AFS组件环境与产品环境应隔离运行/清理，复用固定候选包及镜像；任一必需项失败须使该验收作业不通过。是否需要拆并行job、CI选集标签名及AFS Pod布局留到实施设计评阅，当前均未检入。</p>
+<div class="detail-table"><table><thead><tr><th scope="col">优先级</th><th scope="col">接线缺口／归属</th><th scope="col">完成后才能声称什么</th></tr></thead><tbody><tr><td>P0</td><td>AFS：复用已实现的 <code>afs/tests/run.py</code>、<code>suites/</code> 和选择/结果协议，增加CI环境适配；singlevm/namespace不直接冒充CI环境</td><td>本地与CI选中同一行为断言，但各自环境证据独立</td></tr><tr><td>P0</td><td>公共K8s＋AFS适配：实测并固化FUSE/ext4/UID权限/TLS/挂载/正常清理准入；定义OwnerFs/DFS角色和寻址</td><td>当前目标worker/Pod具备运行AFS必需用例的环境；目前privileged只是已有条件</td></tr><tr><td>P0</td><td>制品/harness：将AFS suites/支持代码及选中Rust测试ELF显式送到CI运行位置，记录产品/测试commit、架构和SHA；目标节点不重编译产品</td><td>测到的是声明的候选，断言与制品可追溯。现有 <code>stage_harness()</code> 仅复制 <code>build/e2e/</code>，不会自动带入新 <code>afs/tests/</code></td></tr><tr><td>P0</td><td>公共验收包装：扩展现有 <code>run-e2e.sh</code>/验收编排，注册AFS冒烟与必需结果；公共E2E补支持的AFS存储配置及路径断言</td><td>AFS ON冒烟既测到AFS本身，也测到ADX实际使用AFS</td></tr><tr><td>P0</td><td>CI策略/线上配置：明确哪些变更必须覆盖ON候选、测试禁止关闭的门禁配置、触发与必需状态；保留OFF包边界检查</td><td>不会因默认OFF或关闭测试，使AFS/共享改动长期没有AFS门禁；当前自动触发规则待核实</td></tr><tr><td>P1</td><td>复用Full入口扩大选集；将已有正常恢复、权限/缓存/命名空间、多读者断言接入CI，并补产品侧缺口</td><td>已登记支持范围内的AFS功能Full；未接项须明示，不以公共11组通过代替</td></tr><tr><td>P1/P2</td><td>复用已有定向机制，补AFS专项负载/故障/兼容判据；公共长稳/精确性能能力不足另登记</td><td>对应专项结论；不因为基础流水线成功就自动获得这些保证</td></tr></tbody></table></div>
+<p><strong>已有规划与本轮待补的区别</strong>：仓内既有门禁文档提出nightly/release、Full和1–24小时soak等目标；独立Full和定向调用机制确实已实现，但定时触发未核实，完整全天长稳仍无闭环。AFS runner及本地基础集合已在第二/三步实现；上表CI适配、产品变体和调用扩展仍待补，不能标成ADX原有能力。</p>
+<p>总体方向已确认但未实施；具体选集、环境适配和实现安排按本页优先级推进。拿固定包直接验收的现状及待补见 <a href="#step-5">第五步规范</a>。本轮不创建runner、fixture、测试、镜像或流水线改动。</p></div></details><details id="step-5" class="step-detail"><summary><span class="number">05</span><span class="summary-copy"><h2>第五步：固定包的全量、专项与长稳</h2><small>先让固定包可自主跑全量／专项，再补长稳和受控性能。</small></span><span class="badge">P1 → P2</span><span class="chevron" aria-hidden="true">＋</span></summary><div class="detail-body"><p><strong>本步原则、现状与优先级</strong>：原则：固定包＋合格环境，开发者/测试/AI可复用公共E2E自主闭环。现状：功能Full/专项已有，长稳/受控性能有缺口。待补：拿包指引、AFS全量/专项、兼容测量工具收口、公共长稳与AFS负载。优先级：P1全量/专项、P2长稳/性能。</p>
+<p><strong>状态</strong>：五步总体逻辑已确认；以下目录/命令中标注目标或待补者尚未实施。</p>
+<h3>先讲清使用逻辑</h3>
+<p><strong>第五步是拿固定版本做进一步验收：开发者、AI协助的开发者和测试人员都能调用仓内入口，不必等待测试人员代跑。</strong> 第四步关注候选版本的共享门禁；第五步关注某个版本、更大范围或某类问题。两者可以使用同一套公共用例和K8s部署器，也可以由同一条Full流水线执行，不按执行者身份另造一套工具。</p>
+<ol>
+<li><strong>先选定版本和要验证的范围。</strong> 固定产品包、独立SDK候选、backend与镜像，选择功能Full、定向故障/压力或其它专项；结果不能越过本次实际选集和环境范围。
+</li>
+<li><strong>先有合格环境，再交给脚本部署。</strong> 有现成目标K8s可直接复用；没有时需要环境维护者另行提供。现有脚本不创建云机器/K8s集群。只有一台合格Linux Docker主机时，也可做单宿主完整产品功能复现。
+</li>
+<li><strong>公共E2E自动部署、运行、取证和清理。</strong> 在提供的宿主/K8s中创建本次隔离环境，使用包内二进制和已安装SDK，启动ADX及真实runtime，执行用户行为；不是只探测进程是否存活。
+</li>
+<li><strong>Full、专项、长稳分别出结论。</strong> Full是已登记功能集合；专项检查选择的故障/负载/设备条件。连续小时/天级长稳需要持续负载与资源趋势合同，不能用一批短测或重复建环境代替。
+</li>
+<li><strong>AFS融入公共产品验收，保留组件专项归属。</strong> ADX产品场景仍归 <code>build/e2e/</code>，增加真实AFS存储变体及相关断言；纯文件系统兼容、恢复等组件合同归AFS测试体系。复用现有工具，具体缺口单独列出。
+</li></ol>
+<p>以上为已确认的使用逻辑。下面的“事实”表示已有代码和调用，不表示本轮已经完成运行验收；也不推断仓外测试团队一定有或没有另一套系统。</p>
+<h3>环境怎么准备、脚本负责到哪里（事实）</h3>
+<div class="detail-table"><table><thead><tr><th scope="col">现有路径</th><th scope="col">使用者/环境维护者先准备</th><th scope="col">脚本自动完成</th><th scope="col">当前能力边界</th></tr></thead><tbody><tr><td>公共K8s功能Full/专项，优先复用已有目标环境</td><td>至少两个可调度Linux worker、匹配架构、跨节点网络和registry访问、允许privileged/nested runc的能力、可创建namespace及exec/copy/log/删除的kubeconfig；固定bundle与镜像引用</td><td>发布器可推送镜像；runner建独立namespace、两个ADX节点Pod及Service/Secret，同步harness、启动ADX和独立sandboxd、运行SDK、取证、停服务并确认清理</td><td>Full检查两个不同K8s worker节点名；不证明云底层物理宿主分离。普通emptyDir不证明Pod删除后持久恢复。AFS专门FUSE/ext4/权限准入尚缺</td></tr><tr><td>单机Linux Docker产品复现</td><td>专用Linux主机或Linux VM、同架构Docker、privileged/cgroup/网络能力、固定bundle；按OCI/EROFS模式准备对应内核能力</td><td>runner创建两个privileged节点容器和网络，启动真实ADX/runtime，运行共享11组并回收</td><td><code>standalone</code>是单宿主两个逻辑节点，不是跨VM/跨worker Full；不是在macOS宿主直接运行内核验收</td></tr><tr><td>公共ADX三VM产品拓扑</td><td>一control＋两worker VM、SSH、固定安装包/SDK、配置/TLS、已部署ADX和两个sandboxd</td><td>已有inventory、若干用例driver、suite/汇总/verify；可对已部署环境执行子集</td><td><strong>完整自动部署adapter仍缺</strong>；不能宣称提供VM后已有统一一键完整部署验收。不同于第三步AFS专有Meta/Node组件拓扑</td></tr><tr><td>条件专项环境</td><td>按例增加动态StorageClass/PVC、runsc、KVM/Firecracker kit、设备与驱动或可控网络故障能力</td><td>已有对应条件driver和部分接线</td><td>条件未满足不等于基础Full覆盖。GPU/NPU有独立SDK验证工具，但普通K8s manifest未提供设备部署fixture</td></tr></tbody></table></div>
+<p>目标K8s文档已有每worker 4vCPU/8GiB、至少30GiB可用磁盘等<strong>建议值</strong>；这是当前普通ADX fixture的运行建议，不是实测AFS容量准入。AFS接入后要按角色/数据/缓存重新核验。提供已有合格集群时，开发者无需另建个人VM；选择Docker或真实多VM拓扑时，才需要对应宿主/VM。</p>
+<p>当前公共runner会创建并管理自己的测试部署；不是只给任意现网集群一个API地址，就能对它无改动执行默认11组和故障注入。三VM子集及设备等driver对已有部署的使用方式，要遵循各自环境和独占边界。</p>
+<p>依据：<a href="../../build/e2e/kubernetes/README.md">K8s前提与资源建议</a>、<a href="../../build/e2e/kubernetes/manifest.py">Pod定义</a>、<a href="../../build/e2e/README.md">公共Docker入口</a>、<a href="../../build/e2e/multivm/README.md">三VM现状</a>、<a href="../../build/e2e/device/README.md">设备专项</a>。</p>
+<h3>拿到包还需要哪些输入（事实）</h3>
+<p><strong>当前不是只有一个产品压缩包就能直接跑所有E2E。</strong> 使用者需要公共测试harness，并提供匹配的SDK wheel及candidate身份、固定backend、运行时基础镜像和本次所需的条件fixture。已有验证过的bundle/registry镜像时可复用；测试运行节点不重新编译产品。</p>
+<p>本地镜像准备入口是 <code>build/e2e/prepare.py</code>，必需输入包括 <code>--package</code>、<code>--backend</code>、<code>--sdk-wheel</code>、<code>--sdk-candidate</code>、<code>--runtime-base</code>、<code>--execd-base</code>、<code>--output</code>。它验证输入并组装测试镜像/bundle，需要有Docker的准备环境。K8s再通过 <code>build/e2e/kubernetes/publish_images.py --bundle ... --repository ...</code> 发布不可变镜像引用；准备/发布和目标部署可以在不同机器完成。</p>
+<p>也可复用Buildkite准备产物：独立Full流水线支持精确base/SDK构建ID，或用 <code>ADX_E2E_ARTIFACT_BUILD</code>＋<code>ADX_E2E_ARTIFACT_COMMIT</code> 复用已有镜像bundle。直接脚本接受已取得的文件/镜像输入，不会自动替用户从任意位置找到包和凭据。产品commit与测试harness commit分别记录，不能把“固定包”误解成测试代码也一定相同。</p>
+<p>AFS ON候选须使用明确包含AFS的统一包并校验模式；“包里有AFS”与“产品配置真正使用AFS”仍是两项证据。</p>
+<p>依据：<a href="../../build/e2e/prepare.py">prepare输入</a>、<a href="../../build/e2e/kubernetes/publish_images.py">镜像发布</a>、<a href="../../.buildkite/run-e2e.sh">现有Full包装</a>、<a href="../../.buildkite/pipeline-full.yml">Full流水线</a>。</p>
+<h3>全量、专项、长稳：当前哪些已有（事实）</h3>
+<div class="detail-table"><table><thead><tr><th scope="col">目标</th><th scope="col">当前入口和覆盖</th><th scope="col">已有／没有的边界</th></tr></thead><tbody><tr><td>K8s功能Full</td><td><code>build/e2e/kubernetes/run.py --profile full</code>；或独立 <code>agent-dx-full-test</code> 流水线代跑</td><td>已有部署、默认11组、逐case/JUnit/清理结果；不是所有optional case、兼容套件、性能和长稳总和</td></tr><tr><td>单宿主产品功能集</td><td><code>build/e2e/run.py --profile standalone</code></td><td>已有共享11组和自动部署/清理；可用于固定包复现，不宣称跨worker Full</td></tr><tr><td>单个故障/功能专项</td><td>K8s <code>run.py --profile full --case &lt;name&gt;</code>；Docker只支持其自身注册的case</td><td>已有Redis/Coordinator/API入口重启、响应丢失、网络分区等定向选择；实际故障范围以driver为准，不等于整VM断电或整节点HA</td></tr><tr><td>多个定向专项</td><td><code>build/e2e/kubernetes/targeted_suite.py --case ... --case ...</code>；CI用 <code>ADX_E2E_TARGET_CASES</code></td><td>已有共享固定bundle、每例独立namespace/结果和清理后续跑；direct总预算≤10800秒。预算不是持续负载时长，清理不明不得继续</td></tr><tr><td>短混合稳定性</td><td><code>--case mixed-soak</code> → <code>mixed_soak.py</code></td><td>已有持续300秒命令/文件和创建删除混合负载、错误/计数/延迟及清理；底层函数仅允许1–900秒，公共入口没有任意小时级时长选项，不在默认Full内</td></tr><tr><td>短时性能采样</td><td>K8s <code>--profile full --case load-performance</code> → <code>load/performance.py</code></td><td>已有90秒吞吐/延迟样本、P50/P95/P99等；没有对未指定集群强加固定SLA，不等于受控性能回归/AFS专用性能验收</td></tr><tr><td>容量压力</td><td>K8s <code>--profile full --case load-pressure</code></td><td>已有两节点容量占满、8个请求排队后释放、归属和回收断言；是容量压力场景，不是持续高压长稳</td></tr><tr><td>小时/天级连续长稳</td><td>既有门禁文档 <code>FD-SOAK-01</code> 规划1–24小时、反复故障与无资源增长</td><td><strong>规划已有，当前没有对应完整连续执行/资源趋势判据/中断恢复闭环</strong>。不能用重复运行5分钟、定向suite三小时预算或本地历史记录冒充</td></tr><tr><td>条件专项</td><td>PVC Redis Pod替换、异构runtime、Firecracker、GPU/NPU工具等各自入口</td><td>部分driver/接线已有；需额外资产与环境，部分目标环境验收仍待完成。普通Full不自动覆盖</td></tr><tr><td>AFS组件兼容/测量资产</td><td>当前 <code>build/e2e/afs/acceptance/</code> 标准套件adapter，<code>build/e2e/afs/perf/dfs_compare.py</code> 双口径对照等</td><td>工具已有；旧acceptance runner ARM64/root guard、Full ENV verifier始终BLOCKED；perf依赖外部fixture/挂载与固定基线，不创建机器/后端。不能称为公共产品全量/长稳已融入</td></tr></tbody></table></div>
+<p>默认11组是：<code>sdk</code>、<code>data-plane</code>、<code>lifecycle</code>、<code>auth</code>、<code>capacity</code>、<code>placement</code>、<code>local-first</code>、<code>node-failure</code>、<code>sandboxd-restart</code>、<code>restart</code>、<code>stop</code>。定向结果标记为targeted，不能因使用 <code>--profile full --case ...</code> 就汇报“完整Full通过”。</p>
+<p>依据：<a href="../../build/e2e/run.py">profile与结果</a>、<a href="../../build/e2e/kubernetes/targeted_suite.py">定向suite</a>、<a href="../../build/e2e/mixed_soak.py">短soak</a>、<a href="../../build/e2e/load/README.md">负载合同</a>、<a href="../../build/e2e/load/performance.py">性能代码</a>、<a href="test-inventory-and-buildkite-gates.md">已有长稳规划</a>、<a href="../../build/e2e/afs/acceptance/README.md">AFS旧验收限制</a>、<a href="../../build/e2e/afs/perf/README.md">AFS测量工具</a>。</p>
+<h3>使用者实际调用哪个入口（现有命令形状）</h3>
+<p>下面仅展示入口。示例路径须替换为事先取得的真实输入；输出目录必须新建，<strong>本轮未执行</strong>。</p>
+<pre><code># 已有Linux Docker宿主及已准备的bundle：单宿主完整产品功能集
+python3 build/e2e/run.py \
+  --bundle /path/to/bundle --profile standalone \
+  --output /path/to/new-standalone-results
+
+# 已有合格目标K8s及发布镜像：功能Full
+python3 build/e2e/kubernetes/run.py \
+  --bundle /path/to/bundle/bundle.json \
+  --registry-images /path/to/bundle/registry-images.json \
+  --kubeconfig /path/to/kubeconfig --profile full \
+  --output /path/to/new-full-results</code></pre>
+<p>K8s单个专项使用同一条命令增加 <code>--case coordinator-restart</code> 或 <code>--case mixed-soak</code> 等，换新的输出目录。多专项入口为：</p>
+<pre><code>python3 build/e2e/kubernetes/targeted_suite.py \
+  --bundle /path/to/bundle/bundle.json \
+  --registry-images /path/to/bundle/registry-images.json \
+  --kubeconfig /path/to/kubeconfig \
+  --case load-performance --case load-pressure --case mixed-soak \
+  --budget-seconds 10800 --output /path/to/new-targeted-results</code></pre>
+<p>私有registry/context/节点限制按现有CLI加参数；<code>redis-pod-restart</code>有独立PVC准入且不能直接混入上述多选suite。选择Buildkite代跑则使用现有Full流水线和 <code>ADX_E2E_TARGET_CASE</code> / <code>ADX_E2E_TARGET_CASES</code>，不用再写一套业务用例。</p>
+<p>结果看 <code>result.json</code>、<code>case-results.json</code>、JUnit、case专项报告、部署身份/放置及清理证据；目录内仅有日志或Pod Ready不能算通过。没执行的必需项、失败、超时、无法确认清理都不能升级为完整通过。拿到失败证据后，开发者可固定同一包和case复现，修改后的新包须另记身份。</p>
+<h3>AFS怎么融入、还补什么（待补方案）</h3>
+<div class="detail-table"><table><thead><tr><th scope="col">优先级</th><th scope="col">复用的现有能力</th><th scope="col">AFS待补／公共缺口</th><th scope="col">用例归属</th></tr></thead><tbody><tr><td>P0</td><td>第四步同一包、bundle、K8s部署/清理、SDK场景与结果协议</td><td>将第四步AFS部署适配和产品存储变体开放给直接调用；明确ON包、OwnerFs/DFS配置、FUSE/ext4/UID、挂载/路径证明及正常清理前提，不绑定CI私有默认值</td><td>产品fixture/场景继续 <code>build/e2e/</code>；AFS组件runner归 <code>afs/tests/</code>且已实现，目标环境adapter仍待补</td></tr><tr><td>P0</td><td>公共默认11组及定向case选择</td><td>补实际AFS支持的文件读写/隔离/持久性/正常恢复/清理断言；按支持边界纳入Full，组件通过与产品通过分别记录</td><td>ADX产品行为融入共享场景；直接AFS合同复用第二/三步用例</td></tr><tr><td>P1</td><td>公共故障、压力、短soak、90秒采样</td><td>接入AFS读写工作负载，保留fsync/版本/内容校验、错误计数和相应资源观测；原ADX故障不自动等于AFS Meta/Home故障矩阵</td><td>产品专项在公共E2E；纯Meta/Node故障在组件集合</td></tr><tr><td>P1</td><td>AFS现有pjdfstest/LTP/FSx adapter与对照测量工具</td><td>整理当前包/环境/基线身份和完整计数；解除需解除的平台绑定与Full ENV缺口；复用外部fixture，不复制另一套实验室部署体系</td><td>当前工具原址保留；组件归属沿已对齐AFS测试规范，迁移另行实施</td></tr><tr><td>P1/P2</td><td>已有长稳目标与短负载基元</td><td><strong>公共先补</strong>可配置持续时长、连续负载、持续资源趋势/阈值、错误与故障策略、取消/清理和中断证据；<strong>AFS再补</strong>相应负载与挂载/FD/内存/磁盘等指标判据。不得宣称已有一键24小时</td><td>公共长稳能力融入ADX，AFS提供适用负载和观测，不另造AFS独家长稳平台</td></tr><tr><td>P1/P2</td><td>公共负载采样与AFS已有测量方法</td><td>区分共享集群诊断与受控基准；固定资源/版本/缓存/数据/比较基线、计时边界及门槛，再输出性能结论</td><td>产品性能复用公共专项；纯文件系统性能保留AFS专用工具与合同</td></tr></tbody></table></div>
+<p>第四步已由用户确认总体方向：复用现有CI部署、部署AFS并选集运行，不使用开发者VM；具体接线仍未实施。第五步承接这些适配，让人或AI在已准备环境上直接运行同一能力。<strong>当前最完整的是固定版本的功能Full和定向专项；统一小时/天级长稳与受控性能验收仍有明确缺口。</strong></p>
+<p>五步总体逻辑已确认；后续按本页优先级另行安排实现，不因规范收口启动全量、专项、长稳或环境操作。</p></div></details><p id="empty" class="empty" hidden>没有匹配的步骤，请调整关键词。</p></section><details id="layer-inventory" class="reference"><summary><span><span class="kicker">按需查阅</span><h2>分层现状与源码参考</h2><small>原13集合×9列 · 原有规划 · 精确调用证据</small></span><span class="chevron" aria-hidden="true">＋</span></summary><div class="detail-body"><p>以下为原13集合的细分映射和调用证据，供需要追查时展开；五步优先级以本页上方总表为准。</p>
+<h3>读表口径与归属</h3>
+<ul>
+<li><strong>现状／事实</strong>：已经检入的脚本、场景、配置和调用关系；不代表本轮或某个当前版本实际跑过。
+</li>
+<li><strong>已有规划</strong>：本次讨论前仓内文档提出的目标、频率或建议。没有对应实现/触发证据时，不能写成已有能力。
+</li>
+<li><strong>AFS待补</strong>：当前接入缺口与后续工作范围，均未实施；冒烟/全量范围与接入阶段按本页第四步原则执行；具体用例登记、专项判据、CI选集标签和Pod布局尚待落实。
+</li>
+<li><strong>决策／已实现范围</strong>：AFS维护自己的UT和组件集成；真实FUSE/bind、单机多进程和namespace节点基础已归 <code>afs/tests/</code>，旧外置driver保留辅助/专项用途。完整产品场景复用现有ADX公共E2E。
+</li>
+<li>表中“谁来跑”按本次对齐的使用角色表述；仓内脚本不规定团队具体人员。环境前提由执行者与环境维护者
+ 提供，驱动已自动完成的部署/清理另行注明。Buildkite是执行/调度入口，不是用例的新层级或专属目录。
+</li>
+<li>UT/LLT/产品E2E说明被测边界；VM/Docker/K8s说明环境；冒烟/Full/专项说明选择集合。
+ 同一断言可以在多个时机复用。故障、兼容、资源、性能、长稳按被测边界归组件或产品，不能只凭名称决定目录。
+</li></ul>
+<h4>分层现状参考（13集合×9列）</h4>
+<p>目录相对ADX仓根；CI调用省略日志/registry包装器，精确参数及源码依据见表后。</p>
+<div class="detail-table"><table><thead><tr><th scope="col">时机／测试集合</th><th scope="col">要拦截的问题与边界</th><th scope="col">用例放哪里：当前／已对齐归属</th><th scope="col">谁来跑／何时跑</th><th scope="col">环境如何准备：前提与自动化</th><th scope="col">现有脚本与Buildkite调用（事实）</th><th scope="col">AFS已接／现状缺口</th><th scope="col">ADX已有规划（区别于实现）</th><th scope="col">AFS待补（未实施）</th></tr></thead><tbody><tr><td><strong>①开发自检：UT／普通LLT</strong></td><td>在提交前定位模块规则、状态机、错误传播、接口/RPC组合、数据校验及资源释放问题；不证明完整产品已部署</td><td>UT在 <code>afs/src/**</code>、<code>afs/client/src/**</code>、<code>afs/common/*/src/**</code>；LLT在 <code>afs/tests/*_contract.rs</code>、<code>local_sdk.rs</code>、<code>storage_localfs.rs</code> 及域内crate <code>tests/</code></td><td>开发者修改后在Linux运行受影响集合；同一集合也由②CI代跑</td><td>开发者提供已有Linux VM及Rust工具链；测试按例启动进程/socket、临时目录；需外部后端的例另备fixture；不必每例一个VM</td><td>本地 <code>cargo test --locked -p &lt;crate&gt; ...</code>；CI复用 <code>.buildkite/component-tests.sh afs</code> 的8个crate选择；不是先执行cargo build才允许测试</td><td>普通非ignored集合已接；已有预算/校验/取消、Meta/VFS/mTLS/UDS/SHM等断言；部分是替身，feature/ignored例不会自然全跑</td><td>既有文档将UT/组件测试列为代码门禁；不把此集合当作L0或Full</td><td>按附件补基础断言；明确feature/ignored/后端适用性，避免“有定义即有运行”的遗漏</td></tr><tr><td><strong>①开发自检：真实后端、FUSE/bind及单机子系统集成</strong></td><td>在提交前拦截真实持久确认、重开/重放、挂载权限/版本缓存、Meta与多个Node读写发布/删除/清理错误；与真实跨宿主故障分开</td><td>已有 <code>afs/tests/{meta,redis,fuse}_contract.rs</code>、源内hook；外置 <code>build/e2e/afs/scripts/ownerfs/bind-two-node-localfile.py</code>、<code>scripts/dfs/three_node_core.py</code>；已对齐统一归 <code>afs/tests/</code>，尚未迁移</td><td>开发者在受影响的真实语义变更后定向运行；并非每次修改都先部署完整ADX</td><td>已有一台Linux/ext4 VM，按例具备FUSE、root/mount权限及Redis/etcd；现有单机驱动用 <code>--binary-dir</code> 和新的 <code>--work-root</code>，生成配置/证书并起Meta＋2/3 Node进程，不要求每Node一个容器</td><td>Rust显式选择相应test/ignored；两个现有Python脚本可直接调用；普通Cargo只运行适用非ignored部分；当前没有完整显式特权集成Buildkite链</td><td>真实挂载/跨句柄/权限及单机访问驱动已有；许多例ignored；后端与挂载矩阵、包身份及CI调度未统一</td><td>没有已实现的“普通编译自动运行全部真实后端/挂载”机制；旧AFS文档保留复杂可靠性后置范围</td><td>统一AFS集成归属、输入/环境要求和选集；明确开发自检及CI分别选择哪些现有场景；不在本文预设新runner/step名称</td></tr><tr><td><strong>①开发自检：跨节点AFS集成（默认namespace）</strong></td><td>在提交前定向发现真实网络/远端源、独立Node视图和节点恢复问题；不能用单机多进程代替</td><td>当前统一 <code>afs/tests/run.py</code>、suites与fixture；旧 <code>build/e2e/afs/</code> driver/cohort保留历史及专项用途</td><td>开发者涉及跨节点合同变更时；也可由版本专项复用</td><td>执行者先提供多台已有Linux VM/主机、SSH、二进制/配置/后端和挂载；各机直接运行AFS进程；旧工具存在历史环境默认值，尚无统一新部署适配</td><td>直接调用既有driver/cohort；本地已提供cluster集合，Buildkite仍无跨节点AFS组件接线</td><td>驱动已有，候选/环境绑定分散；不表示当前包或完整故障矩阵已验收</td><td>旧acceptance有smoke/full清单，但其环境限制和旧身份不能当作公共ADX设计</td><td>去除隐含历史身份依赖、明确部署/清理与适用集合；保留跨节点证据；归入同一AFS集成体系</td></tr><tr><td><strong>①开发自检／③版本复现：本地ADX产品E2E</strong></td><td>发现公共SDK→Environment→真实runtime/Execd的命令、文件、生命周期和清理回归；支持CI失败复现</td><td>已有 <code>build/e2e/run.py</code>、<code>scenarios.py</code>、<code>sdk_smoke.py</code>、<code>functional_data_plane.py</code>，fixture <code>node.py</code>；继续作为公共产品用例</td><td>开发者需要完整产品自检或复现；测试人员也可直接运行</td><td>先提供匹配架构的Linux Docker主机、固定包/SDK/backend及镜像；<code>prepare.py</code> 生成bundle；<code>run.py</code> 自动建两privileged节点容器/网络、启动平台与sandboxd、执行并清理；不创建宿主机</td><td><code>build/e2e/prepare.py</code> → <code>build/e2e/run.py --bundle &lt;目录&gt; --profile l0/standalone</code>；Buildkite基础线使用K8s driver，业务场景共享</td><td>原有ADX入口可用；尚缺公共场景明确配置/使用真实AFS并验证其路径；AFS组件PASS不能代替这里的PASS</td><td>已有Standalone完整11组合同与本地复现说明；不代表Multi-VM/跨物理宿主验收</td><td>让真实AFS存储变体进入共享产品场景及fixture，本地与K8s复用业务断言；不复制一套AFS产品E2E</td></tr><tr><td><strong>②主线／候选回归：代码及组件门禁</strong></td><td>在共享版本构建中发现基础组件行为、工具、API合同及工程检查回归；保护其他组件与AFS相互影响</td><td>组件自有UT/LLT；工具自测 <code>build/e2e/tests/</code>、<code>build/release/tests/</code>；门禁脚本 <code>.buildkite/</code></td><td>选中基础流水线后由Buildkite agent运行；开发者负责失败定位；外部合入触发配置尚未核实</td><td>CI使用既有构建agent/Pod和bootstrap工具链/cache；实际测试是Linux进程；AFS编译能力不等于具备特权挂载条件</td><td><code>pipeline-package.yml</code> 并行source-gate与组件作业；<code>build-afs</code> → <code>build-component.sh afs</code> → <code>component-tests.sh afs</code> → Cargo测试后release编译；<code>source-gate.sh</code> → 公共工具测试/API/Rust检查</td><td><code>ADX_WITH_AFS=1</code>时已接AFS8crate普通测试；<code>ADX_COMPONENT_TESTS</code>默认1、可关；公共Python discovery不覆盖所有外置AFS测试；ignored未自动执行</td><td>既有门禁文档要求UT/组件失败阻断；触发频率建议不等于外部已配置。ARM用Linux ARM64 Docker builder，<code>ADX_ARM_TESTS</code>默认0</td><td>将组件工具自测纳入正确发现入口；登记ON/OFF、架构、feature和未执行项；明确AFS真实集成如何被选中，尚未修改CI</td></tr><tr><td><strong>②主线／候选回归：制品组装与交接检查</strong></td><td>发现组件遗漏、错架构、manifest/hash、安装和测试制品错配；不证明业务功能可用</td><td><code>.buildkite/package-components.sh</code>、<code>build/release/</code>及其自测；产品安装/CLI合同在所属组件</td><td>Buildkite在组件/源码/SDK等前置成功后运行</td><td>使用同build组件制品，临时prefix安装和CLI help；镜像作业准备Docker/runtime bundle；不在此执行完整用户场景</td><td><code>platform-build</code> → <code>package-components.sh</code>；<code>publish-amd64</code> → <code>publish-amd-package.sh</code>；<code>platform-images</code> → <code>package-smoke.sh</code> → <code>package-e2e.sh</code>；随后才L0</td><td>AFS ON/OFF包内容和交接模式有检查；<strong>包含AFS二进制不等于启动或使用AFS</strong>；旧AFS DEP driver依赖旧包/afs-processctl，不能直接复用验新包</td><td>已有公共制品/安装门禁；没有已确认的新增AFS发布前step或test-kit方案</td><td>补齐当前统一包下实际AFS服务/存储行为验证；测试资产与产品身份对应；不复活旧交付体系</td></tr><tr><td><strong>②主线／候选回归：K8s L0基本冒烟</strong></td><td>尽早发现真实发布包/SDK组合破坏创建、执行、文件、删除及鉴权等最小用户闭环；保护共享主线的基本可用性</td><td>已有 <code>build/e2e/kubernetes/{run,manifest}.py</code>；共享公共 <code>run.py</code>、<code>scenarios.py</code>、<code>sdk_smoke.py</code></td><td>Buildkite自动执行选定的基础流水线；同一用例可本地复现。合入后运行发现的是已进入主线的回归，不是合入前阻断</td><td>目标K8s、Linux worker、registry/kubeconfig/权限由既有环境提供；driver自动建namespace/两ADX Pod与Service、同步harness、启动/测试/取证/清理；不创建集群</td><td>基础 <code>pipeline-package.yml: platform-e2e</code> → <code>.buildkite/run-e2e.sh</code> → <code>build/e2e/kubernetes/run.py --profile l0</code>；当前选择 <code>l0</code>＋<code>auth</code>，不自动跑Full</td><td>公共L0已存在；AFS候选模式/包可交接，但未见明确选中真实AFS挂载/后端的公共闭环；尚不能宣称已守住AFS双向回归</td><td>旧门禁文档曾建议提交级L0或5组k8s-basic；<strong>实际YAML为l0</strong>；webhook/分支触发和合入保护未核验</td><td>选定AFS最小产品冒烟场景，证明实际使用AFS并核对核心行为/清理；补fixture与能力选择；选集范围见本页第四步，不为CI复制断言</td></tr><tr><td><strong>③固定版本验收：K8s功能Full</strong></td><td>在明确版本上系统检查公共功能面、两worker放置、生命周期、基础故障及物理资源清理；不是所有专项的总称</td><td>公共 <code>build/e2e/run.py</code> 的STANDARD11组和 <code>scenarios.py</code>；部署 <code>build/e2e/kubernetes/</code></td><td>测试人员或拿版本的开发者主动选择；可触发独立Full，也可直接运行现有K8s入口</td><td>先提供目标K8s与两个不同Linux K8s worker、权限/registry；选择不可变产品包/SDK，或复用既有镜像bundle；driver自动部署/运行/取证/清理，不在被测节点重编译产品</td><td><code>agent-dx-full-test</code> → <code>pipeline-full.yml</code>：<code>platform-images</code> → <code>package-e2e.sh</code>，后 <code>platform-e2e</code> → <code>run-e2e.sh</code> → K8s <code>run.py --profile full</code>；镜像复用时跳过准备；直接运行也可</td><td>公共Full已实现；未明确绑定AFS产品存储变体。AFS旧acceptance的Full环境BLOCKED是另一套工具限制，不能当作ADX Full不存在</td><td>原文档提出主分支/合入候选/发布候选运行Full；基础出包未自动串独立Full，定时/事件触发外部配置未核实</td><td>将AFS公共用户行为、实际挂载/后端及模式适用性融入既有Full；组件与产品结果分别可追溯，不因出包ON就算覆盖</td></tr><tr><td><strong>③固定版本验收：故障／资源／短时性能及压力专项</strong></td><td>在版本上定位重启、网络分区、恢复/路由、资源队列/超分、短时吞吐与延迟问题；定向PASS不代替完整Full</td><td>公共 <code>build/e2e/</code> 故障场景、<code>load/performance.py</code>、<code>load/pressure.py</code>、<code>mixed_soak.py</code>；AFS纯组件异常仍在源内/<code>afs/tests/</code>与外置probe</td><td>测试人员/开发者按问题选择；Buildkite可代跑相同case；不要求每次提交全跑</td><td>复用Full固定bundle与K8s能力；多case每例独立namespace和清理。<code>load-performance</code>90秒采样；pressure验证两节点占满后8请求排队/释放；当前无统一固定时延SLA</td><td>直接K8s <code>run.py --profile full --case &lt;case&gt;</code>；CI <code>ADX_E2E_TARGET_CASE</code> → 同入口；<code>ADX_E2E_TARGET_CASES</code> → <code>targeted_suite.py</code>逐例调用；已有，不必新建专项调度体系</td><td>ADX公共故障/负载场景已有；AFS低层重放/损坏/预算断言部分已有，但不代表公共专项已验证AFS数据/挂载/回收</td><td>既有文档将条件专项放在相关变更/nightly/release；性能/压力文档标有实现、待正式部署运行，不能据脚本存在宣称已验收</td><td>按组件/产品边界补AFS故障与资源断言；把真实AFS负载绑定既有产品专项；登记固定输入、环境、判据和未执行项</td></tr><tr><td><strong>③固定版本验收：持续长稳／受控性能验收</strong></td><td>发现小时/天级累积泄漏、资源持续增长、反复故障后的劣化及可重复性能回退；短功能PASS不能覆盖</td><td>已有公共 <code>build/e2e/mixed_soak.py</code>、<code>load/performance.py</code> 只是短测；AFS已有测量/probe资产，不等于正式统一长稳/性能套件</td><td>测试人员或开发者在稳定、受控环境做版本验收；当前没有可直接宣称完成1–24小时合同的公共入口</td><td>执行者需稳定资源/固定版本、持续负载与观测、清理/故障边界、比较基线及预定判据；现有mixed-soak默认300秒、函数仅允许1–900秒，公共入口未开放任意时长；perf仅90秒</td><td>现有入口仍是上述定向case；direct targeted_suite总预算≤3小时、CI预算660–7800秒；<strong>不能把suite预算当持续soak时长，也不能把循环重建当连续长稳</strong></td><td>AFS长期/精确性能未因代码合入获得公共保障；既有AFS测量和历史对照保留原版本/环境身份</td><td><code>FD-SOAK-01</code>已有1–24小时、无资源增长目标；nightly/release为既有规划。当前未见对应完整持续执行/判据闭环；统一精确性能SLA尚无已实现合同</td><td>先分清公共能力缺口与AFS负载/指标缺口，再补AFS适配和判据；不在此另造AFS独家长稳平台，不声称已有“一键全天长稳”</td></tr><tr><td><strong>③固定版本验收：AFS标准兼容专项</strong></td><td>发现POSIX/随机操作/差分中的语义、错误码、完整性与计数问题；按AFS组件边界验收</td><td>当前 <code>build/e2e/afs/acceptance/{drivers,probes,suites}/</code>；pjdfstest/LTP/FSx等adapter；已对齐组件部分目标同归 <code>afs/tests/</code></td><td>测试人员或开发者在版本专项中运行适用集合；必要短例是否入开发/冒烟另行选择</td><td>先准备真实Linux AFS挂载、套件版本/参考实现/seed及root/非root身份；不要求为了直接文件系统合同部署完整ADX</td><td>现有AFS acceptance runner/adapter；Linux ARM64 guard、Full ENV verifier返回BLOCKED；当前无默认公共Buildkite L0/Full完整运行这些套件的链</td><td>adapter已有，READY不是PASS；旧69 active全标smoke.required不能照搬；环境/完整计数与当前制品绑定未闭合</td><td>旧AFS文档保留pjdfstest/固定LTP子集/短FSx兜底及复杂矩阵后置；不等于已完成公共接入</td><td>整理当前有效adapter/环境/完整计数；纳入AFS集成归属与适用专项集合；公共产品兼容行为另进共享SDK场景</td></tr><tr><td><strong>③固定版本验收：Multi-VM拓扑专项</strong></td><td>发现独立VM身份/放置、真实网络、控制/worker故障与恢复问题；补足单机容器不能证明的边界</td><td>已有 <code>build/e2e/multivm/</code> inventory/contract、SDK/鉴权/故障等driver、<code>suite.py</code>/<code>assemble.py</code>/<code>verify.py</code></td><td>测试人员/开发者在专用三VM环境执行；没有完整公共Buildkite一键部署验收链</td><td>先由执行者/环境维护者准备一control＋两worker VM、SSH并安装包/配置ADX和sandboxd；目录不创建机器。可执行子集依赖已部署环境</td><td>已有 <code>sdk_accept.py</code> 等定向driver及suite/结果汇总/verify；当前不在基础K8s L0或Full的隐含链中</td><td>公共合同与子集存在；README明确完整部署适配仍缺，部分case未实机验证；AFS跨VM组件driver不能充当完整ADX三VM产品验收</td><td>原README明确下一自动部署adapter应复用adxctl/公开SDK，不能用SSH进程探活代替业务验收</td><td>有该产品拓扑需求时复用公共三VM合同并补AFS行为；公共部署缺口单独登记，不能写成AFS已有能力</td></tr><tr><td><strong>③固定版本验收：KVM／设备条件专项</strong></td><td>验证需要特定runtime/device的checkpoint/snapshot/故障行为；不属于通用冒烟或默认Full</td><td>已有 <code>build/e2e/firecracker/kubernetes.py</code> 等FC场景；GPU/NPU在当前公共manifest尚不可执行</td><td>测试人员/开发者选择能力和对应专用worker；CI可代跑已实现FC步骤</td><td>先具备明确KVM worker、<code>/dev/kvm</code>、匹配FC kit/包/镜像及特权Pod；设备专项另需真实硬件/驱动/暴露，普通worker不具备</td><td>Full已有条件 <code>platform-fc-e2e</code> → <code>firecracker-step.sh</code> → <code>run-firecracker.sh</code> → FC K8s driver；需 <code>ADX_E2E_CHECKPOINT=1</code> 等条件及 <code>ADX_FC_K8S_NODE</code></td><td>FC公共入口已有，不表示AFS与checkpoint/设备组合已覆盖；GPU/NPU不能由普通Full通过替代</td><td>既有规划将checkpoint/设备相关变更与对应条件环境关联；没有证据证明所有自动触发已配置</td><td>仅在支持/需求明确时补AFS相关产品组合；不把设备能力设为所有AFS测试的强制前提</td></tr></tbody></table></div>
+<h3>现有调用关系和环境准备细节（事实）</h3>
+<h4>① 开发自检：同一套用例可以本地或CI执行</h4>
+<p>本地使用Linux VM运行受影响Cargo测试；需要真实语义时显式准备后端/挂载fixture。 真实AFS单机驱动现有参数均包含 <code>--repo</code>、<code>--binary-dir</code>、<code>--work-root</code>； 后者要求新的Linux ext4工作/证据目录。驱动启动真实AFS进程，不负责购买或创建VM。 跨节点驱动须按各自现有参数绑定实际主机，尚无可假定的一套统一新入口。</p>
+<p>开发自检优先快速定位；本地VM也能承载专项，但普通UT/LLT没有提供长稳时长、受控负载、 资源测量和性能比较证据。<code>cargo test</code>可自行编译测试，<code>cargo build</code>不会自动运行UT。</p>
+<h4>② 主线回归：基础流水线的实际顺序</h4>
+<p><code>agent-dx</code> 经 <code>.buildkite/select-pipeline.sh</code> 选择 <code>.buildkite/pipeline-package.yml</code>：</p>
+<ol>
+<li>source-gate与组件/SDK/admin作业先行。x86 <code>build-afs</code> 仅在 <code>ADX_WITH_AFS=1</code> 时选择；
+ <code>build-component.sh</code> 显式执行组件测试（默认开启）后release编译。
+</li>
+<li><code>platform-build</code> 等待前置作业，<code>package-components.sh</code> 组包、验证、临时安装并检查CLI help。
+</li>
+<li><code>publish-amd64</code> → <code>publish-amd-package.sh</code> 上传OBS（可关闭）；<strong>当前上传早于L0</strong>。
+</li>
+<li><code>platform-images</code> 等待组包/上传 → <code>package-smoke.sh</code> → <code>package-e2e.sh</code> 准备bundle和镜像。
+ <code>package-smoke.sh</code>的名称不表示在此运行用户冒烟；artifact-manifest是上传后的并行旁支。
+</li>
+<li><code>platform-e2e</code> → <code>run-e2e.sh</code> → <code>build/e2e/kubernetes/run.py --profile l0</code>，运行 <code>l0</code>、<code>auth</code>。
+ 基础线可选SDK/admin PyPI发布等待此作业。
+</li></ol>
+<p><strong>待验证</strong>：仓内配置证明“流水线启动后做什么”；upstream合入的webhook、分支过滤、nightly调度、 必需状态及合入保护由外部配置决定，本轮没有查询。不能将规划频率写成事实；合入后执行只能发现 已进入主线的回归。ARM组件由macOS agent承载Linux ARM64 Docker builder，测试默认关闭， 不能从x86通过推导ARM运行通过。</p>
+<h4>③ 固定版本验收：取包、部署、选集、结果和清理已有公共路径</h4>
+<p><strong>环境先决条件</strong>：环境维护者/使用者先提供目标K8s、可调度Linux worker、kubeconfig权限及registry访问。 目标K8s与承载Buildkite作业的Agent Stack集群分开。Full需两个ADX Pod实际位于不同K8s worker； 落在同一K8s worker将失败；未核验云底层物理机放置。privileged、cgroup、网络命名空间、nested runc等能力须通过preflight。</p>
+<p><strong>已有环境准备工具</strong>：<code>.buildkite/pipeline-maintenance.yml</code> 已有 <code>platform-node-prepare</code>， 显式设置 <code>ADX_K8S_NODE_PREPARE_ONLY=1</code>、<code>ADX_K8S_PREPARE_NODE_NAMES</code> 和 <code>ADX_E2E_ARTIFACT_BUILD</code> 后调用 <code>.buildkite/prepare-k8s-node.sh</code>。 它只在已有指定worker上用维护Pod配置 <code>br_netfilter</code> 与 <code>net.bridge.bridge-nf-call-iptables=1</code>， 保存证据并清理维护namespace；<strong>不创建机器/集群，也不自动补全全部内核/权限能力</strong>。 普通构建/E2E不会代为改宿主机设置。本轮没有执行该工具。</p>
+<p><strong>制品与部署</strong>：独立 <code>agent-dx-full-test</code> 选择 <code>pipeline-full.yml</code>；通常传 <code>ADX_BASE_PACKAGE_BUILD_ID</code>、<code>ADX_SDK_BUILD_ID</code>，由 <code>package-e2e.sh</code> 校验固定包/SDK/backend， <code>prepare.py</code>和<code>kubernetes/publish_images.py</code>准备并发布不可变镜像。 AFS ON候选须显式 <code>ADX_WITH_AFS=1</code>，校验模式与manifest匹配。 也可设置 <code>ADX_E2E_ARTIFACT_BUILD</code>＋<code>ADX_E2E_ARTIFACT_COMMIT</code> 复用既有镜像bundle，跳过镜像准备。 <code>run-e2e.sh</code> 下载制品/镜像清单并调用K8s runner；runner自动创建namespace/资源、启动平台和runtime、 运行公开SDK场景、保存结果/JUnit/日志、停止服务并确认删除。测试节点不编译或替换产品二进制。 当前测试harness与固定产品制品可有不同commit，结果记录两者身份。</p>
+<p><strong>已有选择器</strong>：</p>
+<ul>
+<li>默认 <code>--profile full</code> 为STANDARD11组：<code>sdk</code>、<code>data-plane</code>、<code>lifecycle</code>、<code>auth</code>、<code>capacity</code>、
+ <code>placement</code>、<code>local-first</code>、<code>node-failure</code>、<code>sandboxd-restart</code>、<code>restart</code>、<code>stop</code>。
+</li>
+<li><code>ADX_E2E_TARGET_CASE=&lt;case&gt;</code>：<code>run-e2e.sh</code> → K8s <code>run.py --profile full --case ...</code>；
+ 直接执行同一K8s脚本也可，不强制经过Buildkite。
+</li>
+<li><code>ADX_E2E_TARGET_CASES=&lt;case1,case2&gt;</code>：要求Full → 已有 <code>targeted_suite.py</code> → 逐例K8s <code>run.py</code>；
+ 每例独立部署/清理，未知清理/超时会停止后续。<code>redis-pod-restart</code>带独立StorageClass要求，不能混入此多选suite。
+</li>
+<li>可选故障及 <code>mixed-soak</code> 不随默认11组全部执行；<code>load-performance</code>、<code>load-pressure</code>是Full-only定向项。
+ CI多选预算默认7200秒、允许660–7800秒；direct suite≤3小时，均预留清理时间；预算不等于负载持续时长。
+</li>
+<li>FC由独立条件步骤调用 <code>firecracker/kubernetes.py</code>；不纳入默认Full，镜像复用模式下当前FC步骤条件不会选中。
+</li></ul>
+<p><strong>本地复现</strong>：已有Linux Docker主机上以固定package、backend、独立SDK候选运行 <code>build/e2e/prepare.py</code>， 再用公共 <code>build/e2e/run.py --bundle &lt;目录&gt; --profile l0/standalone</code> 自动部署/执行/清理。 与K8s共用业务场景和结果语义。Multi-VM的完整部署适配仍缺；不把K8s已有能力套用于该目录。</p>
+<h3>已有规划与待补项的使用约束</h3>
+<p>既有 <a href="test-inventory-and-buildkite-gates.md">公共门禁文档</a> 的频率和nightly/release段落为规划/建议， 其中 <code>FD-SOAK-01</code> 是1–24小时目标；目前 <code>mixed-soak</code> 默认300秒、函数允许1–900秒， 性能用例90秒且无通用固定SLA。这些能力差距是公共体系已有欠账，不能当作AFS接入已解决。</p>
+<p><strong>决策</strong>：AFS补例按表中三个时机分别说明保护什么风险；组件断言归自身，产品链路融入公共场景； CI和本地复用断言，不创建专属于Buildkite的一份业务用例。实际迁移目录、明确冒烟/Full清单、 配置支持后端/权限/设备、实现AFS适配以及核准公共缺口的实施归属，均为后续任务，未在本轮执行。 不预设新的公共流水线、发布依赖、test-kit或脚本名字。</p>
+<p><strong>证据规则</strong>：源码已有断言、工具READY、历史通过、当前版本实测通过分开登记；ignored/未选择/missing/ BLOCKED不能记PASS；定向结果不能冒充完整Full；含AFS二进制不能代替真实使用AFS的证据。 性能、功能、正常重启、故障恢复和长稳分别报告。旧AFS acceptance的Linux ARM64 guard及Full ENV BLOCKED保留为工具事实，不提升为公共ADX架构要求。旧69项全为smoke.required不能直接成为新冒烟集合。</p>
+<h3>可追溯源码</h3>
+<ul>
+<li>开发/组件：<a href="afs.md">AFS测试合同</a>、<a href="../../.buildkite/component-tests.sh">组件测试</a>、
+ <a href="../../.buildkite/build-component.sh">组件构建</a>、<a href="../../.buildkite/source-gate.sh">源码门禁</a>、
+ <a href="../../build/e2e/afs/scripts/ownerfs/bind-two-node-localfile.py">OwnerFs单机</a>、
+ <a href="../../build/e2e/afs/scripts/dfs/three_node_core.py">DFS单机</a>。
+</li>
+<li>主线：<a href="../../.buildkite/pipeline-package.yml">基础pipeline</a>、<a href="../../.buildkite/select-pipeline.sh">选择器</a>、
+ <a href="../../.buildkite/package-components.sh">统一包</a>、<a href="../../.buildkite/publish-amd-package.sh">上传</a>、
+ <a href="../../.buildkite/package-e2e.sh">镜像准备</a>、<a href="../../.buildkite/run-e2e.sh">E2E调用</a>。
+</li>
+<li>版本验收：<a href="../../.buildkite/pipeline-full.yml">Full pipeline</a>、<a href="../../.buildkite/README.md">Buildkite说明</a>、
+ <a href="../../build/e2e/kubernetes/run.py">K8s部署/清理</a>、<a href="../../build/e2e/kubernetes/README.md">环境前提</a>、
+ <a href="../../build/e2e/kubernetes/targeted_suite.py">定向suite</a>、<a href="../../build/e2e/run.py">共享选集</a>、
+ <a href="../../build/e2e/scenarios.py">公共场景</a>、<a href="../../build/e2e/load/README.md">负载合同</a>、
+ <a href="../../build/e2e/mixed_soak.py">短soak</a>、<a href="../../build/e2e/load/performance.py">短性能</a>。
+</li>
+<li>环境/拓扑：<a href="../../.buildkite/pipeline-maintenance.yml">维护pipeline</a>、<a href="../../.buildkite/prepare-k8s-node.sh">worker准备</a>、
+ <a href="../../build/e2e/README.md">本地Docker</a>、<a href="../../build/e2e/multivm/README.md">Multi-VM缺口</a>、
+ <a href="../../.buildkite/run-firecracker.sh">FC调用</a>。
+</li>
+<li><a href="afs-test-inventory.md">AFS静态盘点附件</a>：旧70 ID、文件/断言证据及逐项缺口；建议不代表公共设计已实现。
+</li></ul>
+<p>HTML由本Markdown生成：在仓库根目录执行 <code>python3 build/docs/render_test_strategy.py</code>；无需本地环境工具或个人路径。</p></div></details><footer><span>第二/三步基础已实现并验证 · 第四/五步CI与产品接线未实施</span><span>源码已有断言、历史通过与当前实测分别登记</span></footer></main><script>
+'use strict';
+const items=[...document.querySelectorAll('.step-detail')];
+const allDetails=[...document.querySelectorAll('main details')];
+const search=document.getElementById('search');
+const status=document.getElementById('search-status');
+function openTarget(){let target;try{target=document.getElementById(decodeURIComponent(location.hash.slice(1)));}catch(e){return;}if(!target)return;let node=target;while(node){if(node.tagName==='DETAILS')node.open=true;node=node.parentElement;}target.scrollIntoView({block:'start'});}
+window.addEventListener('hashchange',openTarget);
+document.querySelectorAll('a[href^="#"]').forEach(link=>link.addEventListener('click',()=>{if(search.value){search.value='';applySearch();}if(link.hash===location.hash)openTarget();}));
+function applySearch(){const q=search.value.trim().toLowerCase();let shown=0;items.forEach(item=>{const match=!q||item.textContent.toLowerCase().includes(q);item.hidden=!match;if(match){shown++;if(q)item.open=true;}});status.textContent=q?'匹配 '+shown+' / 5 步':'5 步详细规范 · 按需展开';document.getElementById('empty').hidden=shown!==0;}
+search.addEventListener('input',applySearch);
+document.getElementById('expand').addEventListener('click',()=>items.filter(x=>!x.hidden).forEach(x=>x.open=true));
+document.getElementById('collapse').addEventListener('click',()=>allDetails.forEach(x=>x.open=false));
+let beforePrint=[];
+window.addEventListener('beforeprint',()=>{beforePrint=allDetails.map(x=>({open:x.open,hidden:x.hidden}));allDetails.forEach(x=>{x.hidden=false;x.open=true;});});
+window.addEventListener('afterprint',()=>allDetails.forEach((x,i)=>{if(beforePrint[i]){x.open=beforePrint[i].open;x.hidden=beforePrint[i].hidden;}}));
+document.getElementById('print').addEventListener('click',()=>window.print());
+applySearch();if(location.hash)openTarget();
+</script></body></html>

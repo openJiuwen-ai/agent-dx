@@ -1,0 +1,7 @@
+{
+  "kind": "matrix",
+  "environments": {
+    "local": "singlevm.json",
+    "cluster": "namespaces-4.json"
+  }
+}

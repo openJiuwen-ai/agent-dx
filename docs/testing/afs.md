@@ -1,5 +1,18 @@
 # Agent FS（AFS） 测试与验收
 
+本文维护 AFS 专有技术合同和运行限制；开发自检、主线回归、固定版本验收三个时机的
+用例归属、现有入口、冒烟/全量、已有规划和待补项见
+[ADX 测试体系现状](test-strategy.md)，静态现状、缺失与优先级见 [AFS 用例盘点](afs-test-inventory.md)。
+AFS 拥有自己的 UT 和组件集成测试；部署及公共用户 E2E 统一纳入 ADX。
+三类组件集成（真实 FUSE/bind、单机多进程、跨节点）的目标统一为 `afs/tests/`；
+基础组件集成已落地 [afs/tests/run.py](../../afs/tests/README.md)，同guest与多namespace共用入口；旧外置driver保留辅助/专项用途。Buildkite真实AFS接线仍未实施。
+下文旧 acceptance runner 的 ARM64/full 限制是现有工具事实，不是 ADX 共用测试的架构要求。
+
+五步原则、现状、待补与优先级统一维护在 [同页测试规范](test-strategy.html)；
+可直接定位 [单VM](test-strategy.html#step-2)、[多namespace](test-strategy.html#step-3)、
+[Buildkite](test-strategy.html#step-4) 和 [固定包验收](test-strategy.html#step-5)。
+第二/三步基础已实现，冻结产物真实20case通过；当前源码新Rust构建阻塞、可选SSH多VM未实跑，CI产品接线仍待补。
+
 Agent FS（AFS） 在目标仓中的验收按“目标仓源码、目标仓二进制、目标仓环境证据”登记。DMS/AFS 历史证据保留来源版本、环境和判据，可用于追溯和风险判断，但不自动升级为 Agent DX 当前候选结论。
 
 ## 平台与入口矩阵
@@ -9,12 +22,13 @@ Rust 构建、Cargo metadata、格式、Clippy、单元测试、FUSE 运行、mo
 | 入口 | 当前可执行平台 | 能形成的结论 |
 | --- | --- | --- |
 | 根构建／组件包 | Linux x86_64 与 Linux ARM64 | 对应架构的编译、清单和安装合同；ARM 默认不运行全部测试 |
+| `afs/tests/run.py` 组件基础集合 | 合格Linux VM；同guest或多namespace；当前实测ARM64 | 声明的组件基础集合与清理结果；不等于ADX产品/旧acceptance Full |
 | `acceptance/runner.py --list` 与工具单测 | 任意受支持 Python 环境（平台相关项可 skip） | 清单/调度/拒绝路径，不是文件系统运行通过 |
 | `acceptance/runner.py` case 执行 | **专用 Linux ARM64 root 环境** | 仅本轮 lock、case、matrix 与 profile 的结果 |
 | `scripts/ownerfs/bind-two-node-localfile.py`、`scripts/dfs/three_node_core.py` | 满足脚本 preflight 的 Linux root/FUSE 环境 | 单 VM 小规模定向功能证据，不等于通用 runner 或 Full |
 | Full profile | Linux ARM64 runner 且完整 FROZEN lock；当前通用 ENV verifier 未完成 | 当前仍 BLOCKED，不得以 smoke/定向 driver 替代 |
 
-通用 runner 的 ARM64 guard 是其现有探针、rootfs、LTP 和实验环境合同，不代表
+旧 `build/e2e/afs/acceptance/runner.py` 的 ARM64 guard 是其现有探针、rootfs、LTP 和实验环境合同，不代表
 AFS 产品二进制只支持 ARM64，也不代表 x86_64 包或定向 Linux driver 已通过 Full。
 在逐项验证 runner 依赖前不得删除该 guard。
 

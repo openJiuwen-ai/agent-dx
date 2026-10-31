@@ -1,5 +1,9 @@
 # AFS E2E 工具（OwnerFs / DFS）
 
+单机与多namespace的基础组件验收现统一使用 [afs/tests/run.py](../../../afs/tests/README.md)。
+旧单机driver和acceptance工具保留其历史合同/辅助接口，不代表新基础集合已执行；
+本页的安装、后端及性能专项仍按各自边界使用。
+
 本目录承载 Agent DX AFS 的可维护验收工具。它不是历史证据归档，也不是产品发布包的一部分；来源映射仅在文末供追溯。
 
 ## 范围

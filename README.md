@@ -176,6 +176,12 @@ Checkpoint storage supports local only, S3 with a node cache, and direct AFS fil
 
 ## 🛠️ Development and test
 
+The agreed five-step principles, current coverage, pending work, priorities and
+CI call chains are recorded in the [ADX/AFS testing strategy](docs/testing/test-strategy.md)
+([single-page HTML](docs/testing/test-strategy.html)). The
+[AFS inventory](docs/testing/afs-test-inventory.md) records existing assets and integration gaps;
+deployment and user-facing E2E share the ADX test system.
+
 The root Cargo workspace contains the platform and Agent components. Python packages build independently. Build outputs belong under `out/` or a configured external cache.
 
 ```sh

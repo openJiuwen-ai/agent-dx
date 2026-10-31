@@ -1,18 +1,22 @@
 # ADX 端到端用例分层与 Buildkite 门禁
 
-UT 与 E2E 分开管理：UT 按代码模块运行；E2E 按业务闭环和部署拓扑逐级扩展。
+现有调用链与AFS归属见 [ADX 测试体系现状总表](test-strategy.md)。本文保留公共 E2E
+业务集合、拓扑和历史执行记录；AFS 的当前资产与接入缺口见 [AFS 用例盘点](afs-test-inventory.md)。
+组件拥有自己的 UT/集成测试；安装、部署和公共用户流程统一进入 ADX 验收，不为 AFS 另建产品体系。
+smoke/full 是运行集合，L0 是最小用户闭环，Standalone/Multi-VM/目标部署是拓扑，不能混成单一等级。
 
 跨层级的错误、Deadline、sandboxd、adxlet 和节点故障契约见[系统可靠性门禁](system-reliability-gates.md)。这些场景按所需拓扑分别进入 Standalone、Multi-VM 和 Full Deployment，不能只用组件测试宣称完成。
 
-## 1. UT 不纳入 E2E 层级
+## 1. 代码门禁：UT 与组件集成不冒充产品 E2E
 
-UT 包含 Rust workspace、Agent、Environment SDK、构建驱动器，以及使用测试进程或隔离 Redis
-验证组件契约的用例。它们用于快速定位规则和接口错误，但不代表完整平台已经部署。
+代码门禁覆盖 Rust workspace、Agent、Environment SDK 和构建驱动器的 UT，也包含使用测试进程、
+真实 socket 或隔离 Redis 验证组件契约的集成测试。后者按共用规范登记为集成/LLT，
+不能仅因由 cargo/pytest 执行而统称纯 UT；它们不代表完整平台已经部署。
 
-| UT 类别 | 当前规模／入口 | 作用 |
+| 代码门禁类别 | 入口与边界 | 作用 |
 |---|---|---|
-| Rust | 404 个静态测试定义；`cargo test --workspace --all-features` | API Server、Coordinator、adxlet、Execd、Gateway、CLI 和公共 crates |
-| Python | 528 个静态测试定义 | Agent、Environment SDK、构建和测试驱动器 |
+| Rust | 以 Makefile 和 `.buildkite/component-tests.sh` 的组件选择为准；AFS 显式 ON，默认 feature、all-features lint 和真实 ignored 执行分别登记 | API Server、Coordinator、adxlet、Execd、Gateway、CLI、AFS 和公共 crates |
+| Python | 按责任包及工具 discovery 入口登记；静态定义数不代表发现/运行数 | Agent、Environment SDK、构建和测试驱动器 |
 | 状态与 RPC 契约 | `storage`、`control-rpc`、`api-control`、`interop` suite | Redis/AOF、mTLS、进程 RPC 和 Execd Socket 协作 |
 
 这些测试都应进入 Buildkite 的代码门禁，但报告为 `UT / component tests`，不使用 L0、
@@ -258,6 +262,11 @@ worker 时把 `FD-05` 设为合入门槛；Multi-VM、FC、XPU 和长稳按 nigh
 
 ## 10. Buildkite 门禁建议
 
+**已有规划，非实际触发配置。** 本节保留原有频率建议；当前基础pipeline显式运行`l0`，
+独立Full另行选择。upstream webhook、nightly调度和合入保护本轮未核验。
+`FD-SOAK-01`的1–24小时为目标，现有mixed-soak为300秒短测。按实际入口核对见
+[三个使用时机总表](test-strategy.md)。
+
 Buildkite 保留 UT 和 E2E 两条清晰的结果线：
 
 1. **UT gate**：Rust、Agent、Environment SDK、驱动器、真实 Redis/mTLS/Execd 组件契约；任何失败阻断。
@@ -266,7 +275,8 @@ Buildkite 保留 UT 和 E2E 两条清晰的结果线：
 4. **Conditional profiles**：checkpoint/snapshot 变更触发 KVM；设备调度变更触发 GPU/NPU worker。
 5. **Nightly / release**：本地多 VM、跨物理宿主、性能、压力、长稳和重复故障注入。
 
-默认每次提交执行五组 `k8s-basic`。完整十一组保留在主分支、合入候选和发布前：本地实测中
+原建议每次提交执行五组 `k8s-basic`，完整十一组用于主分支、合入候选和发布前；
+当前基础YAML实际选`l0`、独立Full选`full`，不能把本节建议当作已配置频率。原取舍依据：本地实测中
 `node-failure` 约 33 秒，`lifecycle`、`data-plane`、`stop` 各约 11–14 秒；其中
 `node-failure`、`lifecycle`、`stop` 包含固定等待、故障注入或完整停机。分层只减少基础门禁
 时间，不降低完整实际部署验收范围。
