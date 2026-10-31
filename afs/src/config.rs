@@ -281,6 +281,10 @@ pub struct Cli {
     /// be reclaimed (1000..=604800000ms), default 120000.
     #[arg(long)]
     pub outlet_generation_grace_ms: Option<u64>,
+    /// Largest `actimeo` configured on any import mount (0..=3600000ms),
+    /// default 60000. Used only to validate the generation grace floor.
+    #[arg(long)]
+    pub outlet_max_import_actimeo_ms: Option<u64>,
     #[arg(long)]
     pub dfs_mount: Option<PathBuf>,
     /// FUSE receive threads shared by OwnerFs and DFS (1..=64).
@@ -514,6 +518,7 @@ struct FileConfig {
     outlet_import_root: Option<PathBuf>,
     outlet_mirror_interval_ms: Option<u64>,
     outlet_generation_grace_ms: Option<u64>,
+    outlet_max_import_actimeo_ms: Option<u64>,
     dfs_mount: Option<PathBuf>,
     fuse_threads: Option<u16>,
     fuse_clone_fd: Option<bool>,
@@ -700,6 +705,9 @@ pub struct OutletConfig {
     pub mirror_interval_ms: u64,
     /// H11: minimum lifetime of a superseded generation directory.
     pub generation_grace_ms: u64,
+    /// Largest actimeo on any import mount; informational, backs the grace
+    /// floor check.
+    pub max_import_actimeo_ms: u64,
 }
 
 impl OutletConfig {
@@ -1168,11 +1176,31 @@ impl Config {
                                 "outlet generation grace must be 1000..=604800000ms",
                             ));
                         }
+                        // H11 (spec TC18): the window must cover mirror fan-out
+                        // (interval x 10) and NFS directory-cache lag
+                        // (actimeo x 2). `actimeo` is not configured here — it
+                        // belongs to each import mount — so the deployer
+                        // supplies the largest one in use; default 60s matches
+                        // the deployment examples.
+                        let actimeo_ms = cli
+                            .outlet_max_import_actimeo_ms
+                            .or(file.outlet_max_import_actimeo_ms)
+                            .unwrap_or(60_000);
+                        let floor = interval_ms
+                            .saturating_mul(10)
+                            .max(actimeo_ms.saturating_mul(2));
+                        if grace_ms < floor {
+                            return Err(invalid(format!(
+                                "outlet generation grace ({grace_ms}ms) must be at least \
+                                 max(mirror interval x 10, import actimeo x 2) = {floor}ms"
+                            )));
+                        }
                         Some(OutletConfig {
                             public_root: public,
                             import_root,
                             mirror_interval_ms: interval_ms,
                             generation_grace_ms: grace_ms,
+                            max_import_actimeo_ms: actimeo_ms,
                         })
                     }
                     // all-or-none: a half-configured name layer would publish
@@ -2230,10 +2258,11 @@ mod outlet_config_tests {
         let cfg = Config::resolve(Role::Node, Cli::parse_from(base)).unwrap();
         assert_eq!(cfg.outlet.unwrap().generation_grace_ms, 120_000);
 
+        // 200000 高于默认下限 max(250x10, 60000x2)=120000，可接受。
         let mut with_grace = base.to_vec();
-        with_grace.extend(["--outlet-generation-grace-ms", "5000"]);
+        with_grace.extend(["--outlet-generation-grace-ms", "200000"]);
         let cfg = Config::resolve(Role::Node, Cli::parse_from(with_grace)).unwrap();
-        assert_eq!(cfg.outlet.unwrap().generation_grace_ms, 5_000);
+        assert_eq!(cfg.outlet.unwrap().generation_grace_ms, 200_000);
 
         // 过小的宽限期等于没有保护；过大的值会让磁盘长期滞留。
         for ms in ["999", "604800001"] {
@@ -2245,6 +2274,53 @@ mod outlet_config_tests {
                 "unexpected error for {ms}: {error:?}"
             );
         }
+    }
+
+    /// TC18：宽限期必须 ≥ max(interval×10, actimeo×2)。调大 interval 或
+    /// actimeo 而不改 grace 时，启动必须失败并指明约束。
+    #[test]
+    fn outlet_generation_grace_must_cover_interval_and_actimeo_floor() {
+        let base = [
+            "afs-node",
+            "--fs",
+            "ownerfs",
+            "--outlet-public-root",
+            "/mnt/adx/public",
+            "--outlet-import-root",
+            "/mnt/adx/imports",
+        ];
+        // 默认组合（250ms interval，60s actimeo）下默认 120s grace 合法。
+        let cfg = Config::resolve(Role::Node, Cli::parse_from(base)).unwrap();
+        assert_eq!(cfg.outlet.unwrap().generation_grace_ms, 120_000);
+
+        // interval 调大到 60000 → 下限 600000 > 120000 默认值 → 必须拒绝。
+        let mut big_interval = base.to_vec();
+        big_interval.extend(["--outlet-mirror-interval-ms", "60000"]);
+        let error = Config::resolve(Role::Node, Cli::parse_from(big_interval)).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("mirror interval x 10"),
+            "unexpected error: {error:?}"
+        );
+
+        // actimeo 调大到 300000 → 下限 600000 → 必须拒绝。
+        let mut big_actimeo = base.to_vec();
+        big_actimeo.extend(["--outlet-max-import-actimeo-ms", "300000"]);
+        let error = Config::resolve(Role::Node, Cli::parse_from(big_actimeo)).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("import actimeo x 2"),
+            "unexpected error: {error:?}"
+        );
+
+        // 显式给足 grace 后通过。
+        let mut fixed = base.to_vec();
+        fixed.extend([
+            "--outlet-mirror-interval-ms",
+            "60000",
+            "--outlet-generation-grace-ms",
+            "600000",
+        ]);
+        let cfg = Config::resolve(Role::Node, Cli::parse_from(fixed)).unwrap();
+        assert_eq!(cfg.outlet.unwrap().generation_grace_ms, 600_000);
     }
 
     #[test]
