@@ -155,13 +155,14 @@ def run(connection, image, config, output):
 
 
 def main():
-    from adx_environment import ConnectionConfig
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--input', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     secrets = Path('/secrets')
     os.environ['SSL_CERT_FILE'] = str(secrets / 'tls/ca.pem')
+    from adx_environment import ConnectionConfig
+
     connection = ConnectionConfig(server_address='127.0.0.1:8443', token=(secrets / 'api-key').read_text().strip(),
                                   use_tls=True, verify_tls=True)
     report = run(connection, (secrets / 'image').read_text().strip(), json.loads(args.input.read_text()), args.output)
