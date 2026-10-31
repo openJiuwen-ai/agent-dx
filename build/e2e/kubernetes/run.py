@@ -39,6 +39,7 @@ spec.loader.exec_module(common)
 sys.path.insert(0, str(HERE))
 from manifest import LABEL, resources
 from afs_component import Component as AfsComponent
+from afs_product import Product as AfsProduct, resources as afs_product_resources
 
 
 def validate_physical_placement(placement, required):
@@ -154,6 +155,10 @@ def credentials(directory, image, runtime_image):
 
 
 def selected_checks(profile, selected_case):
+    if selected_case == 'afs-sdk':
+        if profile != 'full':
+            raise ValueError('afs-sdk requires the full Kubernetes profile')
+        return ('afs-sdk-ownerfs', 'afs-sdk-dfs')
     if selected_case == 'afs-component':
         if profile != 'full':
             raise ValueError('afs-component requires the full Kubernetes profile as a targeted case')
@@ -231,6 +236,7 @@ class KubernetesRun(common.Run):
         self.redis_storage_class = redis_storage_class
         self.redis_pod_manifest = None
         self.afs_component = AfsComponent(self) if selected_case == 'afs-component' else None
+        self.afs_product = AfsProduct(self) if selected_case == 'afs-sdk' else None
         self.stop_evidence = 'stop' in selected_checks(profile, selected_case)
 
     def kube(self, *args, timeout=180):
@@ -262,7 +268,7 @@ class KubernetesRun(common.Run):
     def sdk_instances(self):
         return json.loads(self.execute('node1', 'cat', '/evidence/sdk/sdk-result.json'))['instances']
 
-    def sync_harness(self, commit, product_commit=None, package_manifest=None):
+    def sync_harness(self, commit, product_commit=None, package_manifest=None, nodes=None):
         with tempfile.TemporaryDirectory(prefix='adx-e2e-harness-') as directory:
             harness = Path(directory) / 'e2e'
             files = stage_harness(harness, package_manifest, commit)
@@ -287,7 +293,7 @@ class KubernetesRun(common.Run):
                 "if hashlib.sha256((root/name).read_bytes()).hexdigest()!=digest];"
                 "assert not bad,bad"
             )
-            for node in self.nodes:
+            for node in self.nodes if nodes is None else nodes:
                 if with_afs:
                     # Replace only test-owned assets from the image; product bytes remain immutable.
                     self.execute(node, 'rm', '-rf', '/opt/adx/e2e/afs-tests', timeout=30)
@@ -311,6 +317,8 @@ class KubernetesRun(common.Run):
             self.afs_component.deploy(m, refs, registry_auth, node_names, require_distinct_workers,
                                       harness_commit or source_commit())
             return
+        if self.afs_product and not m['package'].get('with_afs'):
+            raise ValueError('SDK-on-AFS requires an AFS ON candidate')
         print('--- Kubernetes deployment', flush=True)
         self.event('[DEPLOY] namespace=' + self.id + '; eligible nodes=' + ','.join(node_names))
         # Check credentials/connectivity before creating any test resource.
@@ -364,6 +372,9 @@ class KubernetesRun(common.Run):
         objects = resources(
             self.id, refs['node'], m['architecture'], registry_auth is not None, node_names, self.redis_storage_class
         )
+        if self.afs_product:
+            objects = afs_product_resources(objects, self.id, refs['node'], m['architecture'],
+                                            registry_auth is not None, node_names)
         # Public manifest contains Secret references, never Secret contents.
         (self.output / 'resources.json').write_text(
             json.dumps({'apiVersion': 'v1', 'kind': 'List', 'items': objects}, indent=2)
@@ -394,6 +405,8 @@ class KubernetesRun(common.Run):
             for pod in pods if pod['metadata']['name'] in self.nodes
         ]
         self.sync_harness(harness_commit or source_commit(), m['package']['commit'], m['package'])
+        if self.afs_product:
+            self.afs_product.configure(m['package'], pods, harness_commit or source_commit())
         self.event('[DEPLOY] Checking OCI runtime and bridge netfilter prerequisites')
         for node in self.nodes:
             self.execute(node, 'python3', '-u', '/opt/adx/e2e/preflight.py', '--runtime-source', 'image')
@@ -410,6 +423,8 @@ class KubernetesRun(common.Run):
                 'setup',
                 node,
             )
+            if self.afs_product:
+                self.afs_product.configure_runtime(node)
             self.execute(
                 node,
                 'sh',
@@ -459,6 +474,9 @@ class KubernetesRun(common.Run):
         if self.afs_component:
             self.afs_component.scenarios(checks)
             return
+        if self.afs_product:
+            self.afs_product.scenarios(checks)
+            return
         if required != ('redis-pod-restart',):
             super().scenarios(checks, required)
             return
@@ -499,6 +517,8 @@ class KubernetesRun(common.Run):
         print('--- Kubernetes cleanup', flush=True)
         self.event('[CLEANUP] Collect diagnostics, stop services and delete ' + self.id)
         errors = []
+        if self.afs_product:
+            errors += self.afs_product.cleanup()
         if not self.namespace_attempted:
             return errors
         try:
@@ -629,6 +649,10 @@ def main():
             for sig in (signal.SIGTERM, signal.SIGINT):
                 signal.signal(sig, signal.SIG_IGN)
             cleanup_errors = run.cleanup()
+            if not run.afs_component:
+                (output / 'kubernetes-cleanup.json').write_text(json.dumps({
+                    'status': 'FAIL' if cleanup_errors else 'PASS', 'errors': cleanup_errors,
+                }, indent=2))
     report = common.finish_report(error, cleanup_errors, checks, required)
     report.update(
         run_id=run.id,

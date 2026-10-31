@@ -8,11 +8,16 @@ from fixtures.common import Blocked, Channel, HERE
 
 
 def connect(config):
+    mount_namespace = config.get('mount_namespace', 'private')
+    if mount_namespace not in ('private', 'container'):
+        raise ValueError('mount_namespace must be private or container')
     prefix = config.get('kubectl')
     if not isinstance(prefix, list) or not prefix or not all(isinstance(x, str) and x for x in prefix):
         raise ValueError('literal kubectl argv is required')
     namespace, pod = config.get('namespace', ''), config.get('pod', '')
-    if not re.fullmatch(r'adx-e2e-[a-z0-9-]{1,40}', namespace) or not re.fullmatch(r'afs-[mabc]', pod):
+    product_node = mount_namespace == 'container' and pod in ('node1', 'node2')
+    if not re.fullmatch(r'adx-e2e-[a-z0-9-]{1,40}', namespace) or not (
+            re.fullmatch(r'afs-[mabc]', pod) or product_node):
         raise ValueError('an owned AFS namespace and role Pod are required')
     if config.get('container') != 'platform':
         raise ValueError('AFS worker container must be platform')
@@ -24,6 +29,8 @@ def connect(config):
                                               text=True, timeout=30))
     if any(meta.get('labels', {}).get('adx.e2e.run') != namespace for meta in (ns['metadata'], item['metadata'])):
         raise Blocked('Kubernetes role ownership changed')
+    if product_node and item['metadata']['labels'].get('afs.e2e.data') != 'true':
+        raise Blocked('Kubernetes product role has not opted into the AFS SDK fixture')
     if ns['metadata'].get('uid') != config['namespace_uid'] or item['metadata'].get('uid') != config['pod_uid']:
         raise Blocked('Kubernetes namespace or Pod was replaced')
     if item.get('status', {}).get('phase') != 'Running' or item['status'].get('podIP') != config['pod_ip']:
@@ -33,8 +40,9 @@ def connect(config):
     command = prefix + ['-n', namespace, 'exec', '-i', pod, '-c', 'platform', '--', 'env']
     for name in ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy'):
         command += ['-u', name]
-    command += ['unshare', '--mount', '--propagation', 'private', '--', 'python3', '-u', '-c',
-                (HERE / 'worker.py').read_text()]
+    if mount_namespace == 'private':
+        command += ['unshare', '--mount', '--propagation', 'private', '--']
+    command += ['python3', '-u', '-c', (HERE / 'worker.py').read_text()]
     channel = Channel(command, timeout=60)
     channel.kubernetes_identity = {
         'namespace': namespace, 'namespace_uid': config['namespace_uid'],

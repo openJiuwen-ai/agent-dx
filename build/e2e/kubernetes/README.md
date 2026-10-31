@@ -268,3 +268,43 @@ marked skipped and cleanup reported independently. A failed command or timeout
 still fails the acceptance.
 
 The `local-first` case switches only API Server into local-first mode, checks SDK concurrent create/execute/delete and confirmed local-claim evidence, then restores central mode. This case requires newly built artifacts; earlier seven-case runs do not validate it. [Buildkite #30](../../../docs/testing/2026-09-18-runtime-environment-k8s.md) passed the previous eight-case OCI profile. The current default basic profile is the bounded five-case gate; `data-plane`, `lifecycle`, `node-failure`, `sandboxd-restart`, `restart`, and `stop` run under `full` and local `standalone`.
+
+## AFS SDK target and required ON gate
+
+`--profile full --case afs-sdk` uses the existing installed SDK `Mount(host_path=...)`
+with pinned node placement. It prepares AFS Meta in an owned M Pod and A/B in the
+existing ADX node Pods. A/B explicitly share only their container mount namespace
+with sandboxd; matching namespace, source device/inode and Environment mountinfo
+are required. The ordinary component target keeps its private worker namespaces.
+
+OwnerFs and DFS run separately: bidirectional write/fsync/new-open reads, three
+versions with complete content checks, non-root EACCES, read-only EROFS, deletion,
+Environment reclaim and normal AFS cleanup. Runtime image warmup precedes the
+AFS worker mount baseline; runtime leftovers must not be hidden by Pod deletion.
+No product binary, SDK API or production source is changed for this fixture.
+The current sandboxd backend rejects tool user/group overrides. Environments
+therefore use the supported default identity; SDK commands explicitly drop the
+workload UID/GID and verify the effective UID before POSIX operations. This
+tests AFS permission enforcement without claiming tool override support.
+Only this SDK target configures sandboxd's existing `basic_spec` option with
+`afs_runc_spec.json`: the backend's three default capabilities plus `SETUID`,
+`SETGID` and `DAC_OVERRIDE`. The last capability lets the root SDK Files API
+access the private UID-10000 workspace; POSIX workload commands drop identity
+and must show zero effective, permitted and ambient capabilities before running. It does not change the shared deployment defaults. A failed credential
+switch fails explicitly; the test does not continue as root. This deployment
+configuration is a prerequisite, not evidence that the default backend permits
+identity switching.
+
+For AFS ON, `.buildkite/run-e2e.sh` without a diagnostic selector runs
+`afs_gate.py`: public profile -> five AFS component cases -> both SDK variants.
+The root report carries the identical, verified child harness/product identities,
+and uses the existing CI summary contract. When the public profile includes
+`stop`, its Collector, Gateway metrics and trace receipts remain required in
+the child directory; nesting cannot bypass the original Full evidence gate.
+Every required result and cleanup must exist and pass; zero process exit alone
+is insufficient. OFF preserves the public path. Explicit targeted builds stay
+marked diagnostic, and do not count as this required gate. Repository webhook
+and merge-protection policy are separate from this in-pipeline requirement.
+
+This SDK/gate extension is implemented for validation; real CI results are
+recorded in the canonical strategy before claiming runtime acceptance.

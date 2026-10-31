@@ -415,8 +415,15 @@ AFS manifest beside `harness.json` in acceptance evidence.
 Full #72 verified this handoff in the real image build; #73 verified the
 current harness with those images in Kubernetes. The explicit K8s target `afs-component` now reuses the same AFS runner
 for five component assertions, described below. Base #223 / Full #76 later verified the fixed AFS component candidate and normal
-cleanup. SDK storage variants and required smoke/Full wiring remain separate
-work. OwnerFs native policy repair is delivered in MR !126; this test change
+cleanup. SDK storage variants and required AFS ON smoke wiring are now implemented:
+normal ON `run-e2e.sh` calls `afs_gate.py` for the public profile, five component
+cases and both SDK variants. Explicit targets remain diagnostics. The reserved
+`ADX_E2E_TARGET_CASE=afs-required-smoke` replays L0 through the existing Full
+pipeline; #85 passed with runtime test commit `6660ffc1` and fixed Base #223
+products. It is not a new Base build or a public eleven-group Full result.
+See the [canonical five-step specification](../docs/testing/test-strategy.html)
+for evidence, prerequisites and remaining CI4 work.
+OwnerFs native policy repair is delivered in MR !126; this test change
 does not duplicate the production fix.
 A selected Rust contract still needs a separately
 identified, matching `fuse_contract` test ELF; the handoff does not fabricate one.
