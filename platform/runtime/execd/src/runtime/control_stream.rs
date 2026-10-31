@@ -178,6 +178,43 @@ mod tests {
             Ok(identity.clone())
         }
     }
+
+    #[tokio::test]
+    async fn stalled_http2_peer_cannot_consume_the_runtime_readiness_deadline() {
+        let identity = RuntimeIdentity {
+            environment_id: "stalled-control-peer".into(),
+            runtime_id: "stalled-control-peer-1".into(),
+            ownership_generation: 1,
+        };
+        let controller = Controller::new(identity, Arc::new(Hooks)).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (accepted, acceptance) = tokio::sync::oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = accepted.send(());
+            std::future::pending::<()>().await;
+            drop(stream);
+        });
+        let result = tokio::time::timeout(
+            Duration::from_millis(2300),
+            session(
+                controller,
+                ControlStreamConfig {
+                    address,
+                    token: "a".repeat(64),
+                },
+            ),
+        )
+        .await;
+        peer.abort();
+        assert!(
+            acceptance.await.is_ok(),
+            "The test peer must accept a real control TCP connection"
+        );
+        assert!(result.is_ok(), "TCP acceptance without HTTP/2/Hello completion must leave time for control reconnect before the Environment readiness deadline");
+        assert!(result.unwrap().is_err());
+    }
     #[tokio::test]
     async fn activity_burst_updates_stream_without_lifecycle_revision_change() {
         use adx_protocol::runtime_stream::execution_token;
@@ -196,14 +233,9 @@ mod tests {
             address: format!("http://{}", listener.local_addr().unwrap()),
             token: execution_token(secret, &identity).unwrap(),
         };
-        let service =
-            pb::runtime_control_service_server::RuntimeControlServiceServer::new(hub.clone());
+        let server_hub = hub.clone();
         let server = tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(service)
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-                .await
-                .unwrap();
+            server_hub.serve(listener).await.unwrap();
         });
         let current = controller.clone();
         let client = tokio::spawn(async move {

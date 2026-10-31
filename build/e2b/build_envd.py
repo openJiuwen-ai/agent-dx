@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import shutil
+import signal
 import subprocess
 import tempfile
 from pathlib import Path
@@ -28,6 +29,23 @@ def git_output(source, *args):
     ).strip()
 
 
+def run_git(command, *, timeout):
+    """Bound the complete Git process group, including its HTTPS transport."""
+    environment = {**os.environ, 'GIT_TERMINAL_PROMPT': '0'}
+    process = subprocess.Popen(command, env=environment, start_new_session=True)
+    try:
+        code = process.wait(timeout=timeout)
+    finally:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+    if code:
+        raise subprocess.CalledProcessError(code, command)
+
+
 def build(source, output, jobs=4):
     """Build an explicit checkout, or fetch the pin into a temporary checkout."""
     if source is not None:
@@ -38,10 +56,19 @@ def build(source, output, jobs=4):
         raise FileNotFoundError('Git executable is required')
     with tempfile.TemporaryDirectory(prefix='adx-envd-source-') as directory:
         source = Path(directory)
-        subprocess.run([git, 'init', str(source)], check=True, timeout=30)
-        subprocess.run([git, '-C', str(source), 'fetch', '--depth=1', pin['repository'], pin['revision']],
-                       check=True, timeout=300)
-        subprocess.run([git, '-C', str(source), 'checkout', '--detach', 'FETCH_HEAD'], check=True, timeout=60)
+        run_git([git, 'init', str(source)], timeout=30)
+        run_git([git, '-C', str(source), 'remote', 'add', 'origin', pin['repository']], timeout=30)
+        # Git 2.17 requires an explicit partial-clone repository before fetch
+        # accepts --filter. Keep checkout patterns compatible with pre-2.25 Git.
+        for key, value in (('core.repositoryformatversion', '1'), ('extensions.partialClone', 'origin'),
+                           ('core.partialCloneFilter', 'blob:none'), ('remote.origin.promisor', 'true'),
+                           ('remote.origin.partialCloneFilter', 'blob:none'), ('core.sparseCheckout', 'true')):
+            run_git([git, '-C', str(source), 'config', key, value], timeout=30)
+        (source / '.git/info/sparse-checkout').write_text('/*\n!/*/\n/packages/\n!/packages/*/\n'
+                                                       '/packages/envd/\n/packages/shared/\n')
+        run_git([git, '-C', str(source), 'fetch', '--depth=1', '--filter=blob:none', 'origin', pin['revision']],
+                timeout=300)
+        run_git([git, '-C', str(source), 'checkout', '--detach', 'FETCH_HEAD'], timeout=60)
         return _build(source, output, jobs)
 
 

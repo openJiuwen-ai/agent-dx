@@ -532,20 +532,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     adx_observability::info!("adxlet RPC listener ready");
     let control_server = async {
         if let (Some(listener), Some((_, hub))) = (stream_listener, &stream_setup) {
-            use adx_protocol::{
-                runtime::runtime_control_service_server::RuntimeControlServiceServer,
-                runtime_stream::MAX_CONTROL_MESSAGE_BYTES,
-            };
-            tonic::transport::Server::builder()
-                .http2_keepalive_interval(Some(Duration::from_secs(30)))
-                .http2_keepalive_timeout(Some(Duration::from_secs(10)))
-                .add_service(
-                    RuntimeControlServiceServer::new(hub.clone())
-                        .max_decoding_message_size(MAX_CONTROL_MESSAGE_BYTES)
-                        .max_encoding_message_size(MAX_CONTROL_MESSAGE_BYTES),
-                )
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-                .await?;
+            hub.clone().serve(listener).await?;
         } else {
             std::future::pending::<()>().await;
         }

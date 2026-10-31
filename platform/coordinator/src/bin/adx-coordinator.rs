@@ -78,7 +78,7 @@ where
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _logging_guard = adx_observability::logging::init("adx-coordinator", false)?;
     let config: Config = read_config()?;

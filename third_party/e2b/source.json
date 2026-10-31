@@ -1,5 +1,5 @@
 {
-  "repository": "https://github.com/e2b-dev/infra.git",
+  "repository": "https://github.com/e2b-dev/runtime.git",
   "revision": "92197909dce5a1bef33e764ae4af76f0732fd7a8",
   "envd_version": "0.9.0",
   "go_toolchain": "go1.26.8",

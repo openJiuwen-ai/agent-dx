@@ -2401,7 +2401,7 @@ mod reconciliation_tests {
 
 #[cfg(test)]
 #[path = "../tests/common/mod.rs"]
-mod cancellation_test_redis;
+pub(crate) mod cancellation_test_redis;
 
 #[cfg(test)]
 mod cancellation_tests {

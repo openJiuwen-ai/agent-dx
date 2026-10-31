@@ -17,12 +17,16 @@ mod node_retirement;
 mod observability;
 #[path = "storage/publication.rs"]
 mod publication;
+#[path = "storage/publication_catalog.rs"]
+mod publication_catalog;
 #[path = "storage/publication_regressions.rs"]
 mod publication_regressions;
 #[path = "storage/receipt_expiry.rs"]
 mod receipt_expiry;
 #[path = "storage/snapshot_preparation.rs"]
 mod snapshot_preparation;
+#[path = "storage/transport_recovery.rs"]
+mod transport_recovery;
 use adx_coordinator::{storage::StoredNode, Coordinator, Node, Placement};
 use adx_core::{
     Assignment, EnvironmentRecord, EnvironmentSpec, EnvironmentState, Error, Resources,
@@ -470,7 +474,11 @@ async fn restart_recovers_assignment_and_fences_old_writer() {
     first.commit(r.clone()).await.unwrap();
     let version = first.snapshot().await.unwrap().revision;
     first.commit(r.clone()).await.unwrap();
-    assert!(first.snapshot().await.unwrap().revision > version);
+    assert_eq!(
+        first.snapshot().await.unwrap().revision,
+        version,
+        "an unchanged replay is not a new publication"
+    );
     let second = db.begin(2).await.unwrap();
     assert_eq!(first.commit(r.clone()).await, Err(Error::Conflict));
     let snapshot = second.snapshot().await.unwrap();

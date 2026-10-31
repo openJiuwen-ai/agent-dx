@@ -1,5 +1,7 @@
 //! One shared publication view, refreshed from committed storage only.
-use crate::storage::{ControlChange, Session, StoredEnvironment, StoredNode};
+use crate::storage::{
+    ControlChange, PublicationReset, PublicationValue, Session, StoredEnvironment, StoredNode,
+};
 use adx_core::{Error, Result};
 use adx_protocol::{
     auth::{Peers, Principal},
@@ -28,10 +30,16 @@ fn security(value: adx_core::execution::DataPlaneSecurityMode) -> i32 {
         }
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PublicationState {
+    CatchingUp,
+    Ready,
+}
 struct View {
     revision: Option<u64>,
-    available: bool,
-    nodes: BTreeMap<String, StoredNode>,
+    state: PublicationState,
+    nodes: BTreeMap<String, Arc<StoredNode>>,
+    sources: BTreeMap<String, Arc<StoredEnvironment>>,
     routes: BTreeMap<String, pb::PublishedRoute>,
     environments: BTreeMap<String, pb::PublishedEnvironment>,
 }
@@ -40,6 +48,7 @@ pub struct RoutePublisher {
     session: Session,
     peers: Peers,
     view: Arc<Mutex<View>>,
+    refresh_lock: Arc<Mutex<()>>,
     committed: Arc<Mutex<Option<broadcast::Receiver<ControlChange>>>>,
     changes: broadcast::Sender<pb::RouteFrame>,
     environment_changes: broadcast::Sender<pb::EnvironmentDirectoryFrame>,
@@ -55,12 +64,14 @@ impl RoutePublisher {
             peers,
             view: Arc::new(Mutex::new(View {
                 revision: None,
-                available: false,
+                state: PublicationState::CatchingUp,
                 nodes: BTreeMap::new(),
+                sources: BTreeMap::new(),
                 routes: BTreeMap::new(),
                 environments: BTreeMap::new(),
             })),
             committed: Arc::new(Mutex::new(Some(committed))),
+            refresh_lock: Arc::new(Mutex::new(())),
             changes,
             environment_changes,
             closing: watch::channel(false).0,
@@ -72,9 +83,13 @@ impl RoutePublisher {
         self.closing.send_replace(true);
     }
     pub async fn refresh(&self) -> Result<()> {
+        let _refresh = self.refresh_lock.lock().await;
+        if self.view.lock().await.revision.is_none() {
+            self.session.publication_reset(PublicationReset::Startup, 0);
+        }
         let result = self.refresh_inner().await;
         if result.is_err() {
-            self.view.lock().await.available = false;
+            self.view.lock().await.state = PublicationState::CatchingUp;
         }
         result
     }
@@ -84,55 +99,25 @@ impl RoutePublisher {
     /// Redis revision while healthy can race with event delivery and turn an
     /// ordinary commit into a full control-hash scan.
     pub async fn recover(&self) -> Result<()> {
-        if self.view.lock().await.available {
+        if self.view.lock().await.state == PublicationState::Ready
+            && self.session.publication_ready()
+        {
             return Ok(());
         }
         self.refresh().await
     }
     async fn refresh_inner(&self) -> Result<()> {
-        let revision = self.session.revision().await?;
-        {
-            let mut view = self.view.lock().await;
-            if view.revision == Some(revision) {
-                view.available = true;
-                return Ok(());
-            }
-        }
-        let snapshot = self.session.snapshot().await?;
+        self.session.repair_publication().await?;
+        let (snapshot, receiver) = self.session.publication_snapshot()?;
         let mut next = BTreeMap::new();
-        for r in snapshot.routes()? {
-            let i = &snapshot.environments[&r.environment_id];
-            let record = i.result.as_ref().ok_or(Error::Conflict)?;
-            next.insert(
-                r.environment_id.clone(),
-                pb::PublishedRoute {
-                    compatibility: route_compatibility(i),
-                    environment_id: r.environment_id,
-                    tenant_id: i.spec.tenant_id.clone(),
-                    runtime_id: record.runtime.id.clone(),
-                    runtime_ip: record.runtime.ip.ok_or(Error::Conflict)?.to_string(),
-                    relay_address: r.proxy_address,
-                    generation: r.generation,
-                    environment_revision: r.environment_revision,
-                    tunnel_security_mode: security(i.spec.execution.data_plane.tunnel),
-                    port_forward_security_mode: security(i.spec.execution.data_plane.port_forward),
-                    private_service_ports: i
-                        .spec
-                        .execution
-                        .private_service_ports
-                        .iter()
-                        .copied()
-                        .map(u32::from)
-                        .collect(),
-                    forwarded_ports: i
-                        .spec
-                        .execution
-                        .ports
-                        .iter()
-                        .map(|port| u32::from(*port))
-                        .collect(),
-                },
-            );
+        for (id, environment) in &snapshot.environments {
+            let node = snapshot
+                .nodes
+                .get(&environment.assignment.node_id)
+                .ok_or(Error::Conflict)?;
+            if let Some(route) = published_route(environment, node)? {
+                next.insert(id.clone(), route);
+            }
         }
         let mut next_environments = BTreeMap::new();
         for (id, environment) in &snapshot.environments {
@@ -140,7 +125,10 @@ impl RoutePublisher {
                 continue;
             }
             let record = environment.effective_record();
-            let node = &snapshot.nodes[&environment.assignment.node_id];
+            let node = snapshot
+                .nodes
+                .get(&environment.assignment.node_id)
+                .ok_or(Error::Conflict)?;
             next_environments.insert(
                 id.clone(),
                 pb::PublishedEnvironment {
@@ -156,47 +144,33 @@ impl RoutePublisher {
             epoch: self.session.epoch(),
             revision: snapshot.revision,
             base_revision: view.revision.unwrap_or(0),
-            reset: false,
-            upserts: next
-                .iter()
-                .filter(|(id, r)| view.routes.get(*id) != Some(r))
-                .map(|(_, r)| r.clone())
-                .collect(),
-            deleted: view
-                .routes
-                .keys()
-                .filter(|id| !next.contains_key(*id))
-                .cloned()
-                .collect(),
+            reset: true,
+            upserts: next.values().cloned().collect(),
+            deleted: vec![],
         };
         let environment_frame = pb::EnvironmentDirectoryFrame {
             epoch: self.session.epoch(),
             revision: snapshot.revision,
             base_revision: view.revision.unwrap_or(0),
-            reset: false,
-            upserts: next_environments
-                .iter()
-                .filter(|(id, environment)| view.environments.get(*id) != Some(environment))
-                .map(|(_, environment)| environment.clone())
-                .collect(),
-            deleted: view
-                .environments
-                .keys()
-                .filter(|id| !next_environments.contains_key(*id))
-                .cloned()
-                .collect(),
+            reset: true,
+            upserts: next_environments.values().cloned().collect(),
+            deleted: vec![],
         };
         view.routes = next;
         view.environments = next_environments;
         view.nodes = snapshot.nodes;
+        view.sources = snapshot.environments;
         view.revision = Some(snapshot.revision);
-        view.available = true;
+        view.state = PublicationState::Ready;
+        self.session.publication_applied(snapshot.revision);
+        *self.committed.lock().await = Some(receiver);
         let _ = self.changes.send(frame);
         let _ = self.environment_changes.send(environment_frame);
         Ok(())
     }
 
     async fn refresh_incremental(&self, changes: Vec<ControlChange>) -> Result<()> {
+        let _refresh = self.refresh_lock.lock().await;
         let base_revision = self.view.lock().await.revision.ok_or(Error::Conflict)?;
         let changes: Vec<_> = changes
             .into_iter()
@@ -213,45 +187,27 @@ impl RoutePublisher {
                 Some(contiguous)
             })
             .any(|contiguous| !contiguous)
-            || changes.iter().any(|change| change.fields.is_empty())
+            || changes
+                .iter()
+                .any(|change| change.dirty || change.epoch != self.session.epoch())
         {
-            return self.refresh_inner().await;
+            return Err(Error::Conflict);
         }
         let revision = changes.last().expect("nonempty changes").revision;
-        let mut environment_ids = BTreeSet::new();
-        let mut node_ids = BTreeSet::new();
-        for field in changes.into_iter().flat_map(|change| change.fields) {
-            if let Some(id) = field.strip_prefix("environment:") {
-                environment_ids.insert(id.to_owned());
-            } else if let Some(id) = field.strip_prefix("node:") {
-                node_ids.insert(id.to_owned());
-            } else {
-                return self.refresh_inner().await;
-            }
-        }
-
         let mut nodes = BTreeMap::new();
-        for id in &node_ids {
-            nodes.insert(id.clone(), self.session.get_node(id).await?);
-        }
         let mut environments = BTreeMap::new();
-        for id in &environment_ids {
-            let environment = match self.session.get(id).await {
-                Ok(environment) => Some(environment),
-                Err(Error::NotFound) => None,
-                Err(error) => return Err(error),
-            };
-            if let Some(environment) = &environment {
-                let node_id = environment.assignment.node_id.clone();
-                if !nodes.contains_key(&node_id) {
-                    nodes.insert(node_id.clone(), self.session.get_node(&node_id).await?);
+        for value in changes.into_iter().flat_map(|change| change.values) {
+            match value {
+                PublicationValue::Node(id, node) => {
+                    nodes.insert(id, node);
+                }
+                PublicationValue::Environment(id, environment) => {
+                    environments.insert(id, environment);
                 }
             }
-            environments.insert(id.clone(), environment);
         }
-
         let mut view = self.view.lock().await;
-        if view.revision != Some(base_revision) {
+        if view.state != PublicationState::Ready || view.revision != Some(base_revision) {
             return Err(Error::Conflict);
         }
         let mut route_upserts = BTreeMap::new();
@@ -259,8 +215,28 @@ impl RoutePublisher {
         let mut environment_upserts = BTreeMap::new();
         let mut environment_deleted = BTreeSet::new();
 
-        for id in node_ids {
-            let node = nodes.get(&id).ok_or(Error::NotFound)?;
+        for (id, node) in nodes {
+            let Some(node) = node else {
+                view.nodes.remove(&id);
+                let affected: Vec<_> = view
+                    .environments
+                    .iter()
+                    .filter(|(_, e)| {
+                        e.record
+                            .as_ref()
+                            .and_then(|r| r.assignment.as_ref())
+                            .is_some_and(|a| a.node_id == id)
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in affected {
+                    view.environments.remove(&id);
+                    view.sources.remove(&id);
+                    environment_deleted.insert(id.clone());
+                    apply_route(&id, None, &mut view, &mut route_upserts, &mut route_deleted);
+                }
+                continue;
+            };
             let changed = view.nodes.get(&id).is_none_or(|previous| {
                 previous.address != node.address
                     || previous.proxy_address != node.proxy_address
@@ -272,28 +248,23 @@ impl RoutePublisher {
                 continue;
             }
             let affected: Vec<_> = view
-                .environments
+                .sources
                 .iter()
-                .filter(|(_, environment)| {
-                    environment
-                        .record
-                        .as_ref()
-                        .and_then(|record| record.assignment.as_ref())
-                        .is_some_and(|assignment| assignment.node_id == id)
-                })
-                .map(|(environment_id, environment)| (environment_id.clone(), environment.clone()))
+                .filter(|(_, environment)| environment.assignment.node_id == id)
+                .map(|(id, environment)| (id.clone(), environment.clone()))
                 .collect();
-            for (environment_id, mut published) in affected {
-                published.node_address = node.address.clone();
-                published.relay_address = node.proxy_address.clone();
-                if view.environments.get(&environment_id) != Some(&published) {
-                    view.environments
-                        .insert(environment_id.clone(), published.clone());
-                    environment_upserts.insert(environment_id.clone(), published.clone());
+            for (environment_id, environment) in affected {
+                if environment.effective_record().state != adx_core::EnvironmentState::Deleted {
+                    let published = published_environment(&environment, &node)?;
+                    if view.environments.get(&environment_id) != Some(&published) {
+                        view.environments
+                            .insert(environment_id.clone(), published.clone());
+                        environment_upserts.insert(environment_id.clone(), published);
+                    }
                 }
                 apply_route(
                     &environment_id,
-                    route_from_published(&published, node)?,
+                    published_route(&environment, &node)?,
                     &mut view,
                     &mut route_upserts,
                     &mut route_deleted,
@@ -303,6 +274,7 @@ impl RoutePublisher {
 
         for (id, environment) in environments {
             let Some(environment) = environment else {
+                view.sources.remove(&id);
                 environment_upserts.remove(&id);
                 if view.environments.remove(&id).is_some() {
                     environment_deleted.insert(id.clone());
@@ -310,18 +282,19 @@ impl RoutePublisher {
                 apply_route(&id, None, &mut view, &mut route_upserts, &mut route_deleted);
                 continue;
             };
-            let node = nodes
+            view.sources.insert(id.clone(), environment.clone());
+            let node = view
+                .nodes
                 .get(&environment.assignment.node_id)
+                .cloned()
                 .ok_or(Error::NotFound)?;
-            view.nodes
-                .insert(environment.assignment.node_id.clone(), node.clone());
             if environment.effective_record().state == adx_core::EnvironmentState::Deleted {
                 environment_upserts.remove(&id);
                 if view.environments.remove(&id).is_some() {
                     environment_deleted.insert(id.clone());
                 }
             } else {
-                let published = published_environment(&environment, node)?;
+                let published = published_environment(&environment, &node)?;
                 if view.environments.get(&id) != Some(&published) {
                     view.environments.insert(id.clone(), published.clone());
                     environment_upserts.insert(id.clone(), published);
@@ -329,7 +302,7 @@ impl RoutePublisher {
             }
             apply_route(
                 &id,
-                published_route(&environment, node)?,
+                published_route(&environment, &node)?,
                 &mut view,
                 &mut route_upserts,
                 &mut route_deleted,
@@ -353,8 +326,8 @@ impl RoutePublisher {
             deleted: environment_deleted.into_iter().collect(),
         };
         view.revision = Some(revision);
-        view.available = true;
-        drop(view);
+        view.state = PublicationState::Ready;
+        self.session.publication_applied(revision);
         let _ = self.changes.send(frame);
         let _ = self.environment_changes.send(environment_frame);
         Ok(())
@@ -362,53 +335,111 @@ impl RoutePublisher {
 
     pub async fn run(self, interval: Duration) {
         let mut tick = tokio::time::interval(interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut committed = self
             .committed
             .lock()
             .await
             .take()
             .expect("route publisher may only run once");
+        let mut warned = false;
         loop {
-            let changes = tokio::select! {
-                biased;
-                changed = committed.recv() => {
-                    let first = match changed {
-                        Ok(change) => change,
-                        Err(broadcast::error::RecvError::Lagged(_)) => {
-                            if self.refresh().await.is_err() { tracing_unavailable(); }
-                            continue;
-                        }
-                        Err(broadcast::error::RecvError::Closed) => return,
-                    };
-                    // Coalesce nearby commits without postponing publication
-                    // indefinitely when writes remain continuous.
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    let mut changes = vec![first];
-                    loop {
-                        match committed.try_recv() {
-                            Ok(change) => changes.push(change),
-                            Err(broadcast::error::TryRecvError::Empty) => break,
-                            Err(broadcast::error::TryRecvError::Lagged(_)) => {
-                                changes.clear();
-                                break;
-                            }
-                            Err(broadcast::error::TryRecvError::Closed) => return,
-                        }
+            // A failed reset stays in CatchingUp. Never let an ordinary batch
+            // turn the old view Ready while the missing history is unresolved.
+            if self.view.lock().await.state == PublicationState::CatchingUp {
+                match self.refresh().await {
+                    Ok(()) => {
+                        committed = self
+                            .committed
+                            .lock()
+                            .await
+                            .take()
+                            .expect("reset installs cursor");
+                        warned = false;
                     }
-                    Some(changes)
+                    Err(_) => {
+                        if !warned {
+                            tracing_unavailable();
+                            warned = true;
+                        }
+                        tokio::time::sleep(interval).await;
+                    }
                 }
-                _ = tick.tick() => None,
-            };
-            let result = match changes {
-                Some(changes) if !changes.is_empty() => self.refresh_incremental(changes).await,
-                _ => self.recover().await,
-            };
-            if result.is_err() {
-                self.view.lock().await.available = false;
-                tracing_unavailable();
+                continue;
+            }
+            let mut reset = false;
+            let mut reason = PublicationReset::Discontinuity;
+            let mut skipped = 0;
+            let mut batch = Vec::new();
+            tokio::select! {
+                changed = committed.recv() => match changed {
+                    Ok(change) => batch.push(change),
+                    Err(broadcast::error::RecvError::Lagged(count)) => { reset = true; reason = PublicationReset::ReceiveLag; skipped = count; },
+                    Err(broadcast::error::RecvError::Closed) => return,
+                },
+                _ = tick.tick() => {
+                    reset = !self.session.publication_ready();
+                    reason = PublicationReset::AmbiguousWrite;
+                },
+            }
+            // Drain promptly and yield after a bounded amount of work. Sleeping
+            // at the oldest retained cursor can overflow the queue again before
+            // the first recovered batch is consumed.
+            if !reset {
+                if let Err((lost_reason, count)) = drain_changes(&mut committed, &mut batch) {
+                    reset = true;
+                    reason = lost_reason;
+                    skipped = count;
+                }
+            }
+            if !reset && !batch.is_empty() {
+                reset = self.refresh_incremental(batch).await.is_err();
+            }
+            if reset {
+                self.session.publication_reset(reason, skipped);
+                // Both recv and drain loss explicitly enter CatchingUp. Readiness
+                // of the previous view cannot suppress a known missing history.
+                self.view.lock().await.state = PublicationState::CatchingUp;
+                match self.refresh().await {
+                    Ok(()) => {
+                        committed = self
+                            .committed
+                            .lock()
+                            .await
+                            .take()
+                            .expect("reset installs cursor");
+                    }
+                    Err(_) => {
+                        if !warned {
+                            tracing_unavailable();
+                            warned = true;
+                        }
+                        tokio::time::sleep(interval).await;
+                    }
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+fn drain_changes(
+    receiver: &mut broadcast::Receiver<ControlChange>,
+    batch: &mut Vec<ControlChange>,
+) -> std::result::Result<(), (PublicationReset, u64)> {
+    let started = std::time::Instant::now();
+    while batch.len() < 256 && started.elapsed() < Duration::from_millis(2) {
+        match receiver.try_recv() {
+            Ok(change) => batch.push(change),
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                break
+            }
+            Err(broadcast::error::TryRecvError::Lagged(count)) => {
+                return Err((PublicationReset::BatchLag, count))
             }
         }
     }
+    Ok(())
 }
 
 fn published_environment(
@@ -463,6 +494,12 @@ fn published_route(
 ) -> Result<Option<pb::PublishedRoute>> {
     let Some(record) = environment.result.as_ref().filter(|record| {
         record.state == adx_core::EnvironmentState::Running
+            && environment
+                .volume_execution
+                .as_ref()
+                .is_none_or(|execution| {
+                    !execution.released && execution.runtime_id == record.runtime.id
+                })
             && node.session.as_ref().is_none_or(|session| session.routable)
     }) else {
         return Ok(None);
@@ -493,46 +530,6 @@ fn published_route(
             .iter()
             .map(|port| u32::from(*port))
             .collect(),
-    }))
-}
-
-fn route_from_published(
-    environment: &pb::PublishedEnvironment,
-    node: &StoredNode,
-) -> Result<Option<pb::PublishedRoute>> {
-    let Some(record) = environment.record.as_ref().filter(|record| {
-        record.state == pb::EnvironmentState::Running as i32
-            && node.session.as_ref().is_none_or(|session| session.routable)
-    }) else {
-        return Ok(None);
-    };
-    let spec = record.spec.as_ref().ok_or(Error::Conflict)?;
-    let assignment = record.assignment.as_ref().ok_or(Error::Conflict)?;
-    let runtime = record.runtime.as_ref().ok_or(Error::Conflict)?;
-    let execution = spec.execution.as_ref().ok_or(Error::Conflict)?;
-    let data_plane = execution.data_plane.as_ref().ok_or(Error::Conflict)?;
-    let inherited = pb::DataPlaneSecurityMode::DataPlaneSecurityTlsToken as i32;
-    Ok(Some(pb::PublishedRoute {
-        compatibility: environment.compatibility.clone(),
-        environment_id: spec.id.clone(),
-        tenant_id: spec.tenant_id.clone(),
-        runtime_id: runtime.id.clone(),
-        runtime_ip: runtime.ip.clone(),
-        relay_address: node.proxy_address.clone(),
-        generation: assignment.generation,
-        environment_revision: record.revision,
-        tunnel_security_mode: if data_plane.tunnel == 0 {
-            inherited
-        } else {
-            data_plane.tunnel
-        },
-        port_forward_security_mode: if data_plane.port_forward == 0 {
-            inherited
-        } else {
-            data_plane.port_forward
-        },
-        forwarded_ports: execution.ports.clone(),
-        private_service_ports: execution.private_service_ports.clone(),
     }))
 }
 
@@ -575,7 +572,7 @@ impl pb::environment_directory_service_server::EnvironmentDirectoryService for R
             return Err(Status::unavailable("Coordinator shutting down"));
         }
         let view = self.view.lock().await;
-        if !view.available {
+        if view.state != PublicationState::Ready {
             return Err(Status::unavailable("environment publication not ready"));
         }
         let mut updates = self.environment_changes.subscribe();
@@ -643,7 +640,7 @@ impl pb::route_service_server::RouteService for RoutePublisher {
             return Err(Status::unavailable("Coordinator shutting down"));
         }
         let view = self.view.lock().await;
-        if !view.available {
+        if view.state != PublicationState::Ready {
             return Err(Status::unavailable("route publication not ready"));
         }
         // Subscribe under the same lock as the full snapshot so there is no list/watch gap.
@@ -696,6 +693,46 @@ impl pb::route_service_server::RouteService for RoutePublisher {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn overflow_between_first_receive_and_batch_drain_requires_reset() {
+        let (sender, mut receiver) = broadcast::channel(1024);
+        let change = |revision| ControlChange {
+            revision,
+            values: vec![],
+            dirty: false,
+            fields: vec![],
+            epoch: 1,
+        };
+        sender.send(change(1)).unwrap();
+        let mut batch = vec![receiver.recv().await.unwrap()];
+        for revision in 2..=1030 {
+            sender.send(change(revision)).unwrap();
+        }
+        assert!(matches!(
+            drain_changes(&mut receiver, &mut batch),
+            Err((PublicationReset::BatchLag, 5))
+        ));
+    }
+    #[test]
+    fn batch_budget_does_not_drain_a_continuously_busy_receiver() {
+        let (sender, mut receiver) = broadcast::channel(1024);
+        for revision in 1..=1024 {
+            sender
+                .send(ControlChange {
+                    revision,
+                    values: vec![],
+                    dirty: false,
+                    fields: vec![],
+                    epoch: 1,
+                })
+                .unwrap();
+        }
+        let mut batch = vec![];
+        assert!(drain_changes(&mut receiver, &mut batch).is_ok());
+        assert!(!batch.is_empty());
+        assert!(batch.len() <= 256);
+        assert!(!receiver.is_empty());
+    }
 
     #[test]
     fn route_uses_authoritative_envd_auth_and_preserves_sdk_signing_key() {

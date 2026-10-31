@@ -93,15 +93,13 @@ impl Session {
             .arg(id)
             .arg(encode(&tombstone)?)
             .arg(counters.argument()?);
-            if self.store.query::<u8>(cmd).await? == 1 {
-                self.store
-                    .connection
-                    .live_nodes
-                    .write()
-                    .expect("node overlay lock poisoned")
-                    .remove(id);
-                // Membership deletion requires a full route/directory refresh.
-                self.store.notify_committed_change(0, vec![]);
+            let write = self
+                .store
+                .publication_write(self.epoch, vec![field.clone()])
+                .await;
+            let applied = self.store.query::<u8>(cmd).await? == 1;
+            write.finish(applied, vec![PublicationValue::Node(id.into(), None)]);
+            if applied {
                 return Ok(true);
             }
         }
@@ -171,10 +169,19 @@ impl Session {
         .arg(expected)
         .arg(encode(&record)?)
         .arg(session.map_or("", |s| s.id.as_str()));
-        if self.store.query::<u8>(cmd).await? == 1 {
-            self.observe_node(record.clone());
-            self.store
-                .notify_committed_change(0, vec![format!("node:{id}")]);
+        let write = self
+            .store
+            .publication_write(self.epoch, vec![format!("node:{id}")])
+            .await;
+        let applied = self.store.query::<u8>(cmd).await? == 1;
+        write.finish(
+            applied,
+            vec![PublicationValue::Node(
+                id.into(),
+                Some(Arc::new(record.clone())),
+            )],
+        );
+        if applied {
             Ok(Some(record))
         } else {
             Ok(None)

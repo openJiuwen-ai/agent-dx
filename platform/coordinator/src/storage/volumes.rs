@@ -833,17 +833,15 @@ impl Session {
                 .arg(artifacts::artifact_key(&artifact))
                 .arg(encode(&artifact)?);
         }
+        let values = RedisStore::publication_values(
+            fields.iter().map(|(f, v)| (f.as_str(), Some(v.as_str()))),
+        )?;
+        let write = self
+            .store
+            .publication_write(self.epoch, fields.iter().map(|(f, _)| f.clone()).collect())
+            .await;
         let applied = self.store.query::<u8>(command).await? == 1;
-        if applied {
-            self.store.notify_committed_change(
-                0,
-                fields
-                    .iter()
-                    .map(|(field, _)| field.clone())
-                    .chain(catalog.change_fields())
-                    .collect(),
-            );
-        }
+        write.finish_with_fields(applied, values, catalog.change_fields().collect());
         Ok(applied)
     }
 

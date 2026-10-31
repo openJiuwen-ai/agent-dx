@@ -2837,7 +2837,16 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
     use adx_checkpoint_storage::{CheckpointAccess, LocalCheckpointStore};
     use adx_core::snapshots::{Reference, Snapshot, SnapshotState};
     let redis = common::Redis::new().await;
-    let session = redis.store().await.begin(1).await.unwrap();
+    // The later 250ms WRITE pause orders retirement against publication. Keep
+    // Redis's pause/cron granularity inside the operation budget; this test
+    // checks their CAS race, while transport_recovery covers unknown writes.
+    let session =
+        adx_coordinator::storage::RedisStore::connect(&redis.url, "test", Duration::from_secs(2))
+            .await
+            .unwrap()
+            .begin(1)
+            .await
+            .unwrap();
     let root = tempfile::tempdir().unwrap();
     let store = Arc::new(LocalCheckpointStore::new(root.path().into()).unwrap());
     let path = store.begin_capture().await.unwrap();

@@ -31,6 +31,7 @@ fn key(identity: &RuntimeIdentity) -> Key {
 type Reply = oneshot::Sender<Result<RuntimeStatus>>;
 struct Session {
     id: u64,
+    transport: Option<transport::Connection>,
     commands: mpsc::Sender<std::result::Result<pb::RuntimeCommand, Status>>,
     pending: HashMap<u64, Reply>,
 }
@@ -392,6 +393,9 @@ fn poisoned<T>(_: std::sync::PoisonError<T>) -> Error {
     unavailable("runtime control lock poisoned")
 }
 fn close(session: Session) {
+    if let Some(transport) = session.transport {
+        transport.close();
+    }
     for (_, reply) in session.pending {
         let _ = reply.send(Err(unavailable(
             "runtime control connection replaced or disconnected",
@@ -411,6 +415,11 @@ impl pb::runtime_control_service_server::RuntimeControlService for RuntimeContro
         &self,
         request: Request<tonic::Streaming<pb::RuntimeEvent>>,
     ) -> std::result::Result<Response<Self::OpenControlStream>, Status> {
+        let transport = request
+            .extensions()
+            .get::<transport::Connection>()
+            .cloned()
+            .ok_or_else(|| Status::internal("runtime control requires its managed listener"))?;
         let mut incoming = request.into_inner();
         let first = tokio::time::timeout(self.0.timeout, incoming.message())
             .await
@@ -448,11 +457,25 @@ impl pb::runtime_control_service_server::RuntimeControlService for RuntimeContro
             if slot.retired.load(Ordering::Acquire) {
                 return Err(Status::failed_precondition("execution retired"));
             }
-            if let Some(old) = current.replace(Session {
+            transport.claim(&identity).map_err(|error| match error {
+                Error::Conflict => {
+                    Status::failed_precondition("runtime connection belongs to another execution")
+                }
+                error => Status::unavailable(error.to_string()),
+            })?;
+            if let Some(mut old) = current.replace(Session {
                 id: session_id,
+                transport: Some(transport.clone()),
                 commands,
                 pending: HashMap::new(),
             }) {
+                if old
+                    .transport
+                    .as_ref()
+                    .is_some_and(|previous| previous.same(&transport))
+                {
+                    old.transport = None;
+                }
                 close(old);
             }
             slot.status.send_replace(None);
@@ -468,6 +491,7 @@ impl pb::runtime_control_service_server::RuntimeControlService for RuntimeContro
 }
 
 mod config;
+mod transport;
 pub use config::StreamConfig;
 
 #[cfg(test)]
@@ -504,6 +528,7 @@ mod tests {
         let (commands, _receiver) = mpsc::channel(16);
         *slot.session.lock().unwrap() = Some(Session {
             id: 1,
+            transport: None,
             commands,
             pending: HashMap::new(),
         });
@@ -537,6 +562,7 @@ mod tests {
         let (commands, mut receiver) = mpsc::channel(16);
         *slot.session.lock().unwrap() = Some(Session {
             id: 1,
+            transport: None,
             commands,
             pending: HashMap::new(),
         });
@@ -569,6 +595,7 @@ mod tests {
         let (commands, _receiver) = mpsc::channel(16);
         *slot.session.lock().unwrap() = Some(Session {
             id: 2,
+            transport: None,
             commands,
             pending: HashMap::new(),
         });

@@ -95,9 +95,10 @@ impl Session {
             .arg(self.epoch.to_string())
             .arg(&field)
             .arg(old);
-        if self.store.query::<u8>(command).await? == 1 {
-            self.store.notify_committed_change(0, vec![field]);
-        }
+        let values = RedisStore::publication_values([(field.as_str(), None)])?;
+        let write = self.store.publication_write(self.epoch, vec![field]).await;
+        let applied = self.store.query::<u8>(command).await? == 1;
+        write.finish(applied, values);
         Ok(())
     }
 
@@ -296,20 +297,26 @@ impl Session {
                     .arg(artifacts::artifact_key(artifact))
                     .arg(encode(artifact)?);
             }
+            let values = vec![PublicationValue::Environment(
+                record.spec.id.clone(),
+                Some(Arc::new(next.clone())),
+            )];
+            let write = self
+                .store
+                .publication_write(self.epoch, vec![field.clone()])
+                .await;
             let (code, raw): (i8, String) = self.store.query(command).await?;
+            write.finish_with_fields(
+                code == 1,
+                values,
+                catalog
+                    .iter()
+                    .flat_map(volumes::Catalog::change_fields)
+                    .collect(),
+            );
             match code {
                 1 | 2 => {
                     let winner: StoredEnvironment = decode(&raw)?;
-                    self.store.notify_committed_change(
-                        0,
-                        vec![format!("environment:{}", winner.spec.id)],
-                    );
-                    if code == 1 {
-                        if let Some(catalog) = &catalog {
-                            self.store
-                                .notify_committed_change(0, catalog.change_fields().collect());
-                        }
-                    }
                     if code == 2 {
                         return self.resolve_receipt(winner).await;
                     }

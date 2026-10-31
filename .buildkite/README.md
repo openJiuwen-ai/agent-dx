@@ -49,6 +49,9 @@ manifest; the latter records the binary SHA256, revision, version and toolchain.
 revision. On the macOS ARM worker, this host directory is mounted read-only at
 `/mnt/adx-envd-source` and its path is translated for the Linux container.
 Without an override, both architectures fetch inside their Linux builder.
+The pinned checkout uses Git's partial fetch and materializes only envd/shared
+packages plus root metadata. Fetch/checkout timeouts terminate their complete Git
+process group so an HTTPS child cannot keep the build open after a failure.
 The standalone `build/release/build.sh` remains opt-in through `ADX_ENVD_SOURCE`.
 
 | Variable | Default | Applies to / responsibility |

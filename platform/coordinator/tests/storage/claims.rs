@@ -247,7 +247,8 @@ async fn batched_local_claims_allocate_one_contiguous_generation_range() {
     assert_eq!(generations.last(), Some(&(base + 128)));
     let after = s.snapshot().await.unwrap();
     assert_eq!(after.generation, base + 128);
-    assert_eq!(after.revision, before.revision + 128);
+    // One atomic batch publishes one cursor containing all 128 committed values.
+    assert_eq!(after.revision, before.revision + 1);
     assert_eq!(after.environments.len(), 128);
 }
 

@@ -222,14 +222,9 @@ impl Fixture {
         let identity = RuntimeControlClient::identity(&record);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());
-        let service =
-            pb::runtime_control_service_server::RuntimeControlServiceServer::new(hub.clone());
+        let server_hub = hub.clone();
         let server = tokio::spawn(async move {
-            tonic::transport::Server::builder()
-                .add_service(service)
-                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-                .await
-                .unwrap();
+            server_hub.serve(listener).await.unwrap();
         });
         Self {
             node,
@@ -262,6 +257,18 @@ impl Fixture {
         mpsc::Sender<pb::RuntimeEvent>,
         tonic::Streaming<pb::RuntimeCommand>,
     ) {
+        self.connect_result(status).await.unwrap()
+    }
+    async fn connect_result(
+        &self,
+        status: RuntimeStatus,
+    ) -> std::result::Result<
+        (
+            mpsc::Sender<pb::RuntimeEvent>,
+            tonic::Streaming<pb::RuntimeCommand>,
+        ),
+        tonic::Status,
+    > {
         let mut client = pb::runtime_control_service_client::RuntimeControlServiceClient::connect(
             self.address.clone(),
         )
@@ -278,10 +285,9 @@ impl Fixture {
         .unwrap();
         let commands = client
             .open_control(tokio_stream::wrappers::ReceiverStream::new(receive))
-            .await
-            .unwrap()
+            .await?
             .into_inner();
-        (send, commands)
+        Ok((send, commands))
     }
     async fn failed(&self) -> EnvironmentRecord {
         let mut records = self.backend.records.subscribe();
@@ -362,7 +368,9 @@ async fn stream_reconnect_keeps_execution_and_replays_latest_failure() {
     let mut status = test.status();
     status.phase = RuntimePhase::Failed;
     status.revision = 2;
-    let (_send, _commands) = test.connect(status).await;
+    // A terminal Hello can retire its TCP transport before response headers
+    // arrive. The replay must still commit failure without a backend poll.
+    let _connection = test.connect_result(status).await;
     test.failed().await;
     assert_eq!(test.backend.observations.load(Ordering::SeqCst), baseline);
 }

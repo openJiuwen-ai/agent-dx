@@ -135,6 +135,7 @@ impl CoordinatorRpc {
             self.0.created.load(std::sync::atomic::Ordering::Relaxed)
         ));
         output.push_str(&self.business_metrics(&state)?);
+        output.push_str(&state.session.publication_metrics()?);
         Ok(output)
     }
 }

@@ -1,8 +1,11 @@
 //! Single-Coordinator Redis persistence. Lua only compares opaque bytes and performs
 //! atomic hash writes; JSON and u64 counters are validated in Rust, never Lua doubles.
+mod catalog;
+pub(crate) use catalog::{PublicationReset, PublicationValue};
 mod checkpoint_cleanup;
 mod claims;
 mod publication;
+mod transport;
 pub use claims::{ClaimOutcome, LocalClaim};
 mod artifacts;
 pub use artifacts::ArtifactDeletionGuard;
@@ -26,7 +29,6 @@ use adx_core::{
     scheduling::validate_device_assignment, Assignment, EnvironmentRecord, EnvironmentSpec,
     EnvironmentState, Error, Result,
 };
-use redis::{aio::MultiplexedConnection, FromRedisValue};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -605,19 +607,25 @@ fn next_result(old: &StoredEnvironment, r: &EnvironmentRecord) -> Result<bool> {
 
 struct Connection {
     client: redis::Client,
-    current: Mutex<Option<MultiplexedConnection>>,
+    current: Mutex<Option<Arc<transport::Lease>>>,
     timeout: Duration,
     committed_changes: broadcast::Sender<ControlChange>,
     publication_sequence: AtomicU64,
     active_epoch: AtomicU64,
     live_nodes: std::sync::RwLock<BTreeMap<String, StoredNode>>,
+    catalog: std::sync::Mutex<catalog::Catalog>,
+    publication_locks:
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<Mutex<()>>>>,
     artifact_locks: std::sync::Mutex<BTreeMap<String, std::sync::Weak<tokio::sync::RwLock<()>>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ControlChange {
     pub(crate) revision: u64,
+    pub(crate) values: Vec<PublicationValue>,
+    pub(crate) dirty: bool,
     pub(crate) fields: Vec<String>,
+    pub(crate) epoch: u64,
 }
 
 #[derive(Clone)]
@@ -626,17 +634,18 @@ pub struct RedisStore {
     key: String,
 }
 impl RedisStore {
-    fn notify_committed_change(&self, revision: u64, fields: Vec<String>) {
-        let _ = revision;
-        let revision = self
+    fn notify_committed_change(&self, _revision: u64, fields: Vec<String>) {
+        // Volume waiters share this bus. Their events carry an empty directory
+        // delta, preserving cursor continuity without a full routing scan.
+        debug_assert!(fields
+            .iter()
+            .all(|f| !f.starts_with("environment:") && !f.starts_with("node:")));
+        let mut catalog = self
             .connection
-            .publication_sequence
-            .fetch_add(1, Ordering::AcqRel)
-            + 1;
-        let _ = self
-            .connection
-            .committed_changes
-            .send(ControlChange { revision, fields });
+            .catalog
+            .lock()
+            .expect("publication catalog invariant");
+        self.send_publication(&mut catalog, vec![], false, fields);
     }
 
     pub async fn connect(url: &str, namespace: &str, duration: Duration) -> Result<Self> {
@@ -660,6 +669,8 @@ impl RedisStore {
                 timeout: duration,
                 committed_changes,
                 artifact_locks: Default::default(),
+                catalog: Default::default(),
+                publication_locks: Default::default(),
                 publication_sequence: AtomicU64::new(0),
                 active_epoch: AtomicU64::new(0),
                 live_nodes: Default::default(),
@@ -668,38 +679,6 @@ impl RedisStore {
         };
         let _: String = store.query(redis::cmd("PING")).await?;
         Ok(store)
-    }
-    async fn query<T: FromRedisValue>(&self, cmd: redis::Cmd) -> Result<T> {
-        let operation = async {
-            let mut guard = self.connection.current.lock().await;
-            if guard.is_none() {
-                // The outer budget covers connection setup and the response.
-                // Disable driver defaults that could truncate that same budget.
-                let config = redis::AsyncConnectionConfig::new()
-                    .set_connection_timeout(None)
-                    .set_response_timeout(None);
-                *guard = Some(
-                    self.connection
-                        .client
-                        .get_multiplexed_async_connection_with_config(&config)
-                        .await?,
-                );
-            }
-            let mut conn = guard.as_ref().expect("connection initialized").clone();
-            drop(guard);
-            cmd.query_async(&mut conn).await
-        };
-        match timeout(self.connection.timeout, operation).await {
-            Ok(Ok(value)) => Ok(value),
-            _ => {
-                *self.connection.current.lock().await = None;
-                // A timeout may follow an applied write. Never replay it blindly:
-                // the caller retries the same identity/result through CAS.
-                Err(Error::Unavailable(
-                    "Redis operation unavailable or timed out".into(),
-                ))
-            }
-        }
     }
     async fn fields<const N: usize>(&self, fields: [String; N]) -> Result<[Option<String>; N]> {
         let mut cmd = redis::cmd("HMGET");
@@ -736,6 +715,7 @@ impl RedisStore {
             .as_ref()
             .map(|(name, _)| vec![(*name).to_owned()])
             .unwrap_or_default();
+        let values = Self::publication_values(field.iter().map(|(f, v)| (*f, Some(v.as_str()))))?;
         let artifacts = match &field {
             Some((name, value)) if name.starts_with("environment:") => {
                 decode::<StoredEnvironment>(value)?
@@ -765,13 +745,12 @@ impl RedisStore {
         if header_only {
             cmd.arg(header.epoch.to_string());
         }
+        let write = self.publication_write(header.epoch, changed).await;
         let applied: u8 = self.query(cmd).await?;
         if applied == 2 {
             return Err(Error::Conflict);
         }
-        if applied == 1 {
-            self.notify_committed_change(header.revision, changed);
-        }
+        write.finish(applied == 1, values);
         Ok(applied == 1)
     }
     /// Compare only the touched record under a stable process epoch.
@@ -790,6 +769,7 @@ impl RedisStore {
         counters: Option<&CounterUpdate>,
     ) -> Result<bool> {
         let (name, old, next) = field.ok_or(Error::Conflict)?;
+        let values = Self::publication_values([(name, Some(next.as_str()))])?;
         let artifacts = if name.starts_with("environment:") {
             decode::<StoredEnvironment>(&next)?
                 .result
@@ -885,11 +865,11 @@ impl RedisStore {
             cmd.arg(artifacts::artifact_key(&artifact))
                 .arg(encode(&artifact)?);
         }
-        let result = self.query::<u8>(cmd).await?;
-        let applied = result == 1;
-        if applied {
-            self.notify_committed_change(0, vec![name.to_owned()]);
-        }
+        let write = self
+            .publication_write(header.epoch, vec![name.into()])
+            .await;
+        let applied = self.query::<u8>(cmd).await? == 1;
+        write.finish(applied, values);
         Ok(applied)
     }
     fn deleted_receipt_key(&self, id: &str) -> String {
@@ -967,20 +947,22 @@ impl RedisStore {
         } else {
             cmd.arg("").arg("");
         }
+        let values = Self::publication_values([(field.as_str(), None)])?;
+        let write = self
+            .publication_write(header.epoch, vec![field.clone()])
+            .await;
         let applied: u8 = self.query(cmd).await?;
         if applied == 2 {
             return Err(Error::Conflict);
         }
-        if applied == 1 {
-            let changed = std::iter::once(field.to_owned())
-                .chain(
-                    catalog
-                        .into_iter()
-                        .flat_map(volumes::Catalog::change_fields),
-                )
-                .collect();
-            self.notify_committed_change(header.revision, changed);
-        }
+        write.finish_with_fields(
+            applied == 1,
+            values,
+            catalog
+                .into_iter()
+                .flat_map(volumes::Catalog::change_fields)
+                .collect(),
+        );
         Ok(applied == 1)
     }
     /// Called once per Coordinator startup, never on a Redis reconnect. A new epoch
@@ -1070,10 +1052,13 @@ impl RedisStore {
                         h.epoch.checked_mul(1_u64 << 32).ok_or(Error::Conflict)?,
                     )),
                 };
-                let mut active = raw;
-                for field in retired {
-                    active.remove(&field);
-                }
+                // Object CAS does not advance the shared header. An old writer
+                // can therefore commit after the pre-fence scan but before the
+                // epoch change. Read once after fencing; no new Session is yet
+                // exposed and all old-epoch Redis writes are now rejected.
+                let active = self.raw().await?;
+                session.header(&active.get(HEADER).cloned())?;
+                self.seed_publication(h.epoch, snapshot(&active)?);
                 session.compact_retired_counters(&active).await?;
                 return Ok(session);
             }
@@ -1376,24 +1361,50 @@ impl Session {
             "publication snapshot changed; retry".into(),
         ))
     }
-    pub(crate) fn observe_node(&self, node: StoredNode) {
-        if self.store.connection.active_epoch.load(Ordering::Acquire) != self.epoch {
+    pub(crate) fn observe_node(&self, mut node: StoredNode) {
+        // The Coordinator validates heartbeat sessions before this call. The
+        // catalog lock also fences a delayed memory-only observation against a
+        // concurrent persisted registration, retirement or operator override.
+        let mut catalog = self
+            .store
+            .connection
+            .catalog
+            .lock()
+            .expect("publication catalog invariant");
+        if catalog.epoch != self.epoch
+            || self.store.connection.active_epoch.load(Ordering::Acquire) != self.epoch
+        {
             return;
         }
-        let mut nodes = self
-            .store
+        let id = node.node.id.clone();
+        let Some(current) = catalog.nodes.get(&id) else {
+            return;
+        };
+        if current.session.as_ref().map(|s| &s.id) != node.session.as_ref().map(|s| &s.id)
+            || current
+                .session
+                .as_ref()
+                .zip(node.session.as_ref())
+                .is_some_and(|(old, new)| old.sequence > new.sequence)
+            || current.retirement.as_ref().is_some_and(|r| r.unregistered)
+        {
+            return;
+        }
+        node.scheduling_paused = current.scheduling_paused;
+        node.node.available &= !node.scheduling_paused;
+        if **current == node {
+            return;
+        }
+        let value = PublicationValue::Node(id.clone(), Some(Arc::new(node.clone())));
+        catalog.nodes.insert(id.clone(), Arc::new(node.clone()));
+        self.store
             .connection
             .live_nodes
             .write()
-            .expect("node overlay lock poisoned");
-        let changed = nodes.get(&node.node.id) != Some(&node);
-        let id = node.node.id.clone();
-        nodes.insert(id.clone(), node);
-        drop(nodes);
-        if changed {
-            self.store
-                .notify_committed_change(0, vec![format!("node:{id}")]);
-        }
+            .expect("node overlay invariant")
+            .insert(id, node);
+        self.store
+            .send_publication(&mut catalog, vec![value], false, vec![]);
     }
     pub(crate) fn next_generation(&self) -> Result<u64> {
         let base = self.epoch.checked_mul(1_u64 << 32).ok_or(Error::Conflict)?;
@@ -1467,7 +1478,19 @@ impl Session {
                 .arg(session_id)
                 .arg(encode(&registered)?)
                 .arg(active.as_deref().unwrap_or(""));
-            if self.store.query::<u8>(command).await? == 1 {
+            let write = self
+                .store
+                .publication_write(self.epoch, vec![field.clone()])
+                .await;
+            let applied = self.store.query::<u8>(command).await? == 1;
+            write.finish(
+                applied,
+                vec![PublicationValue::Node(
+                    id.into(),
+                    Some(Arc::new(registered)),
+                )],
+            );
+            if applied {
                 return Ok(());
             }
         }
@@ -1740,7 +1763,6 @@ impl Session {
                 }
             };
             if applied {
-                self.observe_node(record.clone());
                 return Ok(record);
             }
         }
@@ -1768,7 +1790,6 @@ impl Session {
             let mut record = self.get_node(id).await?;
             let available = available && !paused;
             if record.scheduling_paused == paused && record.node.available == available {
-                self.observe_node(record.clone());
                 return Ok(record);
             }
             record.scheduling_paused = paused;
@@ -1784,7 +1805,6 @@ impl Session {
                 )
                 .await?
             {
-                self.observe_node(record.clone());
                 return Ok(record);
             }
         }
@@ -2105,7 +2125,7 @@ impl Session {
                 || result.state == EnvironmentState::Running && stored_environment.resume.is_some())
                 && stopped.is_empty()
             {
-                self.store.notify_committed_change(0, vec![field.clone()]);
+                // A replay is not a new commit and must not republish an older value.
                 return Ok(CommittedEnvironment {
                     result,
                     stored: Some(stored_environment),
@@ -2190,5 +2210,59 @@ impl Session {
         Err(Error::Unavailable(
             "concurrent environment commit; retry request".into(),
         ))
+    }
+}
+
+#[cfg(test)]
+use crate::rpc::cancellation_test_redis as transport_test_redis;
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    async fn client_id(store: &RedisStore) -> u64 {
+        let mut command = redis::cmd("CLIENT");
+        command.arg("ID");
+        store.query(command).await.unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated Redis; set ADX_TEST_REDIS_SERVER"]
+    async fn redis_command_error_does_not_discard_ordered_transport() {
+        let redis = transport_test_redis::Redis::new().await;
+        let store = redis.store().await;
+        let before = client_id(&store).await;
+        let mut command = redis::cmd("EVAL");
+        command
+            .arg("return redis.error_reply('validation rejected')")
+            .arg(0);
+        assert!(store.query::<u8>(command).await.is_err());
+        assert_eq!(
+            client_id(&store).await,
+            before,
+            "a command rejection must preserve the transport ordering of other pending writes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires isolated Redis; set ADX_TEST_REDIS_SERVER"]
+    async fn delayed_failure_of_old_transport_preserves_reconnected_client() {
+        let redis = transport_test_redis::Redis::new().await;
+        let store = redis.store().await;
+        let before = client_id(&store).await;
+        let old = store.connection.current.lock().await.clone().unwrap();
+        let control = RedisStore::connect(&redis.url, "control", Duration::from_secs(2))
+            .await
+            .unwrap();
+        let mut kill = redis::cmd("CLIENT");
+        kill.arg("KILL").arg("ID").arg(before);
+        assert_eq!(control.query::<u8>(kill).await.unwrap(), 1);
+        let _: String = store.query(redis::cmd("PING")).await.unwrap();
+        let replacement = client_id(&store).await;
+        assert_ne!(replacement, before);
+        // Resume the failure callback of a second request on the old transport
+        // only after a real disconnect/reconnect has installed its replacement.
+        store.discard_connection(&old).await;
+        assert_eq!(client_id(&store).await, replacement);
     }
 }

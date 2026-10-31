@@ -387,7 +387,14 @@ async fn unregister_node_preserves_recovery_context_until_failed_environment_is_
 #[ignore = "requires dedicated real Redis; build/ci/run.py control-rpc"]
 async fn unregister_node_finishes_after_its_rpc_caller_disconnects() {
     let rig = common::Redis::new().await;
-    let session = rig.store().await.begin(1).await.unwrap();
+    // Keep the departure in flight long enough to cancel its RPC caller, while
+    // separating that cancellation contract from the default 300ms Redis budget.
+    // Delayed/applied/cancelled Redis writes have their own transport fault tests.
+    let store =
+        adx_coordinator::storage::RedisStore::connect(&rig.url, "test", Duration::from_secs(2))
+            .await
+            .unwrap();
+    let session = store.begin(1).await.unwrap();
     let rpc = service(session.clone()).await;
     ready(&rpc, "boot-one").await;
     let client = redis::Client::open(rig.url.as_str()).unwrap();
@@ -415,13 +422,17 @@ async fn unregister_node_finishes_after_its_rpc_caller_disconnects() {
     assert!(!caller.is_finished());
     caller.abort();
     assert!(caller.await.unwrap_err().is_cancelled());
-    tokio::time::timeout(Duration::from_secs(2), async {
+    let completion = tokio::time::timeout(Duration::from_secs(2), async {
         while session.snapshot().await.unwrap().nodes.contains_key("old") {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
-    .await
-    .expect("cancelled caller abandoned node retirement");
+    .await;
+    assert!(
+        completion.is_ok(),
+        "cancelled caller abandoned node retirement: {:?}",
+        session.snapshot().await.unwrap().nodes.get("old")
+    );
     assert!(!metrics(&rpc).await.contains("node_id=\"old\""));
     assert_eq!(
         session.business_counters().await.unwrap().worker_incidents,

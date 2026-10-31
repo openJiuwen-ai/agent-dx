@@ -2528,13 +2528,9 @@ async fn workload_retry_case(failure: WorkloadRetryFailure) {
     hub.expect(&identity).unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = format!("http://{}", listener.local_addr().unwrap());
-    let service = pb::runtime_control_service_server::RuntimeControlServiceServer::new(hub.clone());
+    let server_hub = hub.clone();
     let server = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(service)
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await
-            .unwrap();
+        server_hub.serve(listener).await.unwrap();
     });
     let mut client =
         pb::runtime_control_service_client::RuntimeControlServiceClient::connect(address)

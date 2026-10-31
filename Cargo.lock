@@ -12,9 +12,9 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 name = "adx-activator"
 version = "0.1.0"
 dependencies = [
- "adx-core",
  "adx-agent-core",
  "adx-agent-store",
+ "adx-core",
  "async-trait",
  "axum 0.7.9",
  "base64 0.22.1",
@@ -67,8 +67,8 @@ version = "0.1.0"
 dependencies = [
  "adx-agent-core",
  "async-trait",
- "futures-util",
  "base64 0.22.1",
+ "futures-util",
  "redis",
  "serde",
  "serde_json",
@@ -100,6 +100,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "lru-slab",
  "opentelemetry 0.31.0",
  "opentelemetry_sdk 0.31.0",
  "percent-encoding",
@@ -379,9 +380,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "socket2 0.6.5",
  "tempfile",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tonic 0.12.3",
  "tonic-build 0.12.3",
  "tower 0.5.3",
@@ -5488,6 +5491,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "libc",
  "pin-project-lite",
  "tokio",

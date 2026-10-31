@@ -20,6 +20,8 @@ uuid = { version = "1", features = ["v4"] }
 adx-discovery = { path = "../crates/discovery" }
 serde = { version = "1", features = ["derive"] }
 tokio-stream = { version = "0.1", features = ["net"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+socket2 = "0.6"
 adx-core = { path = "../crates/core" }
 adx-protocol = { path = "../crates/protocol" }
 adx-process = { path = "../../crates/process" }

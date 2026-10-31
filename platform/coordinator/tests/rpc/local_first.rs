@@ -1073,6 +1073,10 @@ async fn environment_directory_streams_full_then_incremental_ownership() {
                     .as_ref()
                     .and_then(|record| record.spec.as_ref())
                     .is_some_and(|spec| spec.id == "directory-case")
+                    && entry.record.as_ref().is_some_and(|r| {
+                        r.state == pb::EnvironmentState::Running as i32
+                            && r.revision >= created.revision
+                    })
             }) {
                 break entry.clone();
             }

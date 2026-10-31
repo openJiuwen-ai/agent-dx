@@ -4,10 +4,7 @@ use adx_execd::runtime::{
     control::{CheckpointHooks, Controller, Handoff, HandoffOutcome},
     control_stream::{run, ControlStreamConfig},
 };
-use adx_protocol::{
-    runtime::runtime_control_service_server::RuntimeControlServiceServer,
-    runtime_stream::{execution_token, ControlOperation},
-};
+use adx_protocol::runtime_stream::{execution_token, ControlOperation};
 use adxlet::control_stream::RuntimeControlHub;
 use std::{
     io,
@@ -60,13 +57,9 @@ async fn setup(token: Option<String>, armed: bool) -> Test {
     }
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = format!("http://{}", listener.local_addr().unwrap());
-    let service = RuntimeControlServiceServer::new(hub.clone());
+    let server_hub = hub.clone();
     let server = tokio::spawn(async move {
-        tonic::transport::Server::builder()
-            .add_service(service)
-            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
-            .await
-            .unwrap();
+        server_hub.serve(listener).await.unwrap();
     });
     let (tx, rx) = oneshot::channel();
     let controller = Controller::new(identity(), Arc::new(Hooks(Mutex::new(Some(rx))))).unwrap();

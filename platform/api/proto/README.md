@@ -132,6 +132,23 @@ resubscribes for a new full frame. Normal lifecycle lookups use this local
 directory. `CoordinatorService.GetEnvironment` remains a targeted read-after-write and
 uncertain-result recovery operation.
 
+Coordinator seeds its publication catalog from Redis once at startup. A successful
+object CAS updates the catalog and enqueues its typed value or deletion under one
+short lock; unchanged replays do not republish old results. Each atomic batch has
+one publication cursor. Recovery captures the in-memory snapshot, subscription
+and watermark together; it does not scan Redis or wait for other writers to stop.
+Both receive and batch-drain overflow reset this cursor. Ambiguous writes are
+repaired by bounded, object-locked reads of the affected keys. Publication recovery
+does not change node admission. The Coordinator runtime uses four worker threads;
+deployments should budget four CPUs for sustained concurrent publication.
+
+Redis requests that time out or are cancelled invalidate their transport lease.
+Before replacement serves reads or repairs, it confirms that the old Redis client
+has terminated; a delayed write cannot overtake repair on a new connection.
+Healthy command-error responses retain the connection. Only safe reads retry at
+the transport layer; mutation retries retain their existing identity and CAS.
+
+
 `CoordinatorService.WatchNodes` publishes every live node with an explicit
 `accepting_allocations` bit. API Server keeps the complete view for resource
 queries and only rotates accepting nodes as local-first creation entries.

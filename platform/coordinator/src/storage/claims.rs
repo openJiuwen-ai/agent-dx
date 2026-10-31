@@ -217,9 +217,17 @@ impl Session {
                 .arg(claim_fence.as_deref().unwrap_or("0"))
                 .arg(format!("node-session:{}", candidate.node_id))
                 .arg(&candidate.node_session_id);
-            if self.store.query::<u8>(command).await? == 1 {
-                self.store
-                    .notify_committed_change(header.revision, vec![field]);
+            let values = vec![PublicationValue::Environment(
+                record.spec.id.clone(),
+                Some(Arc::new(record.clone())),
+            )];
+            let write = self
+                .store
+                .publication_write(self.epoch, vec![field.clone()])
+                .await;
+            let applied = self.store.query::<u8>(command).await? == 1;
+            write.finish(applied, values);
+            if applied {
                 return Ok(ClaimOutcome::Owned(record));
             }
         }
@@ -432,14 +440,28 @@ impl Session {
             } else {
                 command.arg("").arg("").arg(0);
             }
-            if self.store.query::<u8>(command).await? == 1 {
-                if let Some(catalog) = &catalog {
-                    self.store
-                        .notify_committed_change(0, catalog.change_fields().collect());
-                }
-                for (field, _, revision) in writes {
-                    self.store.notify_committed_change(revision, vec![field]);
-                }
+            let values = RedisStore::publication_values(
+                writes
+                    .iter()
+                    .map(|(f, v, _)| (f.as_str(), Some(v.as_str()))),
+            )?;
+            let write = self
+                .store
+                .publication_write(
+                    self.epoch,
+                    writes.iter().map(|(f, _, _)| f.clone()).collect(),
+                )
+                .await;
+            let applied = self.store.query::<u8>(command).await? == 1;
+            write.finish_with_fields(
+                applied,
+                values,
+                catalog
+                    .iter()
+                    .flat_map(volumes::Catalog::change_fields)
+                    .collect(),
+            );
+            if applied {
                 return Ok(results);
             }
         }
