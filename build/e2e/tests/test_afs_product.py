@@ -7,6 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 import sys
+from types import ModuleType, SimpleNamespace
 
 HERE = Path(__file__).resolve().parents[1]
 
@@ -90,6 +91,41 @@ class ProductContracts(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     run.deploy({'package': {'with_afs': False}}, {}, {})
                 kube.assert_not_called()
+
+    def test_sdk_uses_supported_creation_and_checks_workload_identity_separately(self):
+        sdk = load('afs_sdk_installed_test', HERE / 'afs_sdk.py')
+        records, calls = {}, []
+
+        class Environment:
+            def __init__(self, **options):
+                calls.append(options)
+                assert 'user' not in options and 'group' not in options
+                self.id = 'fixture-' + str(len(calls))
+                records['environment:' + self.id] = json.dumps({'assignment': {'node_id': options['node_id']}})
+                self.commands = Mock()
+                self.commands.run.side_effect = lambda cmd, **_kw: SimpleNamespace(
+                    exit_code=0, stdout='0' if cmd == 'id -u' else ('SDK-WARM' if 'SDK-WARM' in cmd else '10000'),
+                    stderr='',
+                )
+
+            def kill(self):
+                records.pop('environment:' + self.id, None)
+
+            def close(self):
+                pass
+
+        module = ModuleType('adx_environment')
+        module.Environment, module.Mount = Environment, Mock()
+        module.__file__ = '/opt/adx/client/lib/python3.12/site-packages/adx_environment/__init__.py'
+        node = ModuleType('node')
+        node.catalog = lambda: records
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(sys.modules, {'adx_environment': module, 'node': node}), \
+                patch.object(sdk.importlib.metadata, 'version', return_value='candidate'):
+            report = sdk.run(None, 'fixture/image', {'mode': 'warm'}, Path(directory) / 'result.json')
+        self.assertEqual(report['status'], 'passed', report)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(p['backend_uid'] == 0 and p['workload_uid'] == 10000 for p in report['placements']))
 
 
 if __name__ == '__main__':

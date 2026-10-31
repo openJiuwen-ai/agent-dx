@@ -282,6 +282,10 @@ versions with complete content checks, non-root EACCES, read-only EROFS, deletio
 Environment reclaim and normal AFS cleanup. Runtime image warmup precedes the
 AFS worker mount baseline; runtime leftovers must not be hidden by Pod deletion.
 No product binary, SDK API or production source is changed for this fixture.
+The current sandboxd backend rejects tool user/group overrides. Environments
+therefore use the supported default identity; SDK commands explicitly drop the
+workload UID/GID and verify the effective UID before POSIX operations. This
+tests AFS permission enforcement without claiming tool override support.
 
 For AFS ON, `.buildkite/run-e2e.sh` without a diagnostic selector runs
 `afs_gate.py`: public profile -> five AFS component cases -> both SDK variants.

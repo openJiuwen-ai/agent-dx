@@ -12,8 +12,10 @@ import time
 SDK_CASES = ('mount-identity', 'bidirectional-publish', 'permissions', 'readonly', 'remove', 'environment-cleanup')
 
 
-def perl(code, *arguments):
-    return ' '.join(shlex.quote(str(v)) for v in ('perl', '-MIO::Handle', '-e', code, *arguments))
+def perl(code, *arguments, uid=10000):
+    identity = (f'POSIX::setgid({uid})==0 or die $!;$)="{uid} {uid}";'
+                f'POSIX::setuid({uid})==0 or die $!;die "wrong UID" unless $<=={uid} && $>=={uid};')
+    return ' '.join(shlex.quote(str(v)) for v in ('perl', '-MIO::Handle', '-MPOSIX', '-e', identity + code, *arguments))
 
 
 def command(instance, code):
@@ -30,12 +32,12 @@ def write_synced(instance, path, data):
     ))
 
 
-def denied(instance, path, expected, write=False):
+def denied(instance, path, expected, write=False, uid=10000):
     mode = '>' if write else '<'
     command(instance, perl(
         'my $p=shift;my $ok=open(my $f,"' + mode + '",$p);'
         'my $e=0+$!;if($ok){close($f);die "unexpected access";}die "wrong errno $e" unless $e==shift;',
-        path, expected,
+        path, expected, uid=uid,
     ))
 
 
@@ -47,7 +49,8 @@ def run(connection, image, config, output):
     mode = config['mode']
     report = {'status': 'failed', 'mode': mode, 'cases': [], 'instances': [], 'placements': [],
               'cleanup_errors': [], 'sdk_version': importlib.metadata.version('adx-environment'),
-              'sdk_source': adx_environment.__file__, 'mounts': {}, 'versions': []}
+              'sdk_source': adx_environment.__file__, 'mounts': {}, 'versions': [],
+              'identity_mode': 'SDK default backend identity; commands explicitly drop workload UID/GID'}
     if not str(Path(adx_environment.__file__).resolve()).startswith('/opt/adx/client/'):
         raise ValueError('acceptance requires the installed candidate SDK')
     handles, killed = [], set()
@@ -60,15 +63,17 @@ def run(connection, image, config, output):
         handle = Environment(
             image=image, runtime='runc', node_id='node1' if role == 'A' else 'node2',
             cpu=250, memory=128, idle_timeout=0, create_timeout=150, connection=connection,
-            mounts=mounts, user=str(uid), group=str(uid),
+            mounts=mounts,
         )
         handles.append(handle)
         report['instances'].append(handle.id)
         record = json.loads(catalog()['environment:' + handle.id])
         actual = record['assignment']['node_id']
         assert actual == ('node1' if role == 'A' else 'node2'), record['assignment']
-        assert command(handle, 'id -u').strip() == str(uid)
-        report['placements'].append({'id': handle.id, 'node': actual, 'uid': uid})
+        backend_uid = int(command(handle, 'id -u').strip())
+        assert command(handle, perl('print $>;', uid=uid)).strip() == str(uid)
+        report['placements'].append({'id': handle.id, 'node': actual,
+                                     'backend_uid': backend_uid, 'workload_uid': uid})
         return handle
 
     def passed(name):
@@ -102,11 +107,11 @@ def run(connection, image, config, output):
                 report['versions'].append({'generation': generation, 'bytes': len(actual),
                                            'sha256': hashlib.sha256(actual).hexdigest()})
             left.files.write('/afs/sdk-api.bin', b'sdk-files-api\x00\xff')
-            command(left, perl('open(my $f,"+<",shift) or die $!;$f->sync() or die $!;', '/afs/sdk-api.bin'))
+            command(left, perl('open(my $f,"+<",shift) or die $!;$f->sync() or die $!;', '/afs/sdk-api.bin', uid=0))
             assert right.files.read('/afs/sdk-api.bin', format='bytes') == b'sdk-files-api\x00\xff'
             passed('bidirectional-publish')
             other = create('B', uid=10001)
-            denied(other, '/afs/published.bin', 13)
+            denied(other, '/afs/published.bin', 13, uid=10001)
             other.kill()
             killed.add(other.id)
             passed('permissions')
