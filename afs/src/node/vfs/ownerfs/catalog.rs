@@ -292,6 +292,27 @@ impl LockedLocalRootCatalog for LockedLocalFsRootCatalog {
         let final_path = Self::record_path(&record.id)?;
         match self.read_record(&final_path) {
             Ok(existing) if existing == *record => return Ok(()),
+            Ok(existing) if existing.epoch != record.epoch => {
+                // 同 root_id（名字派生）但 epoch 不同的旧记录，只可能来自
+                // "已逻辑删除、目录仍待回收"（ENOTEMPTY 时保留 catalog 作为
+                // 回收凭证）或旧一代的残留。Meta 的 epoch 单调递增且永不重用，
+                // 因此较旧 epoch 的记录一定不再对应任何 active root，可以让位。
+                //
+                // 不允许让位会使该名字在旧目录被回收前无法重建；而对端句柄
+                // 可能长期不释放，等于名字永久不可用——比保留回收凭证更糟。
+                if existing.epoch > record.epoch {
+                    return Err(Error::coded(
+                        afs_error::NODE_OWNER_INVALID_GRANT,
+                        "local root record has a newer epoch than the request",
+                    ));
+                }
+                afs_logging::info!(
+                    "ownerfs.catalog_supersede_stale_record";
+                    "root_id" => ?record.id,
+                    "old_epoch" => existing.epoch,
+                    "new_epoch" => record.epoch,
+                );
+            }
             Ok(_) => {
                 return Err(Error::coded(
                     afs_error::NODE_OWNER_INVALID_GRANT,

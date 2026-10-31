@@ -1332,50 +1332,69 @@ impl RootManager {
         Ok(())
     }
 
-    /// 回收一次延迟删除的目录（H21）。
+    /// 回收一次延迟删除的数据目录（H21）。
     ///
-    /// 只处理 catalog 中已逻辑删除（Meta 无 active 记录）但物理目录仍存在的
-    /// 条目。调用方按 `outlet_reclaim.reclaim_interval_ms` 周期性调用；
-    /// 本方法不持 `roots` 锁、不阻塞请求路径。
+    /// **扫描数据根目录，而不是 catalog。** catalog 以 `root_id` 为主键，而
+    /// `root_id` 由名字派生，因此同名重建会覆盖旧代的条目——catalog 天生不能
+    /// 同时承担"活跃记录"与"按代次区分的删除队列"两个职责。若把待回收代次
+    /// 记在 catalog，同名重建要么被冲突拒绝（该名字在对端句柄释放前不可用），
+    /// 要么覆盖后丢失回收凭证。改为按目录名发现待回收代次，catalog 回归单一
+    /// 职责。
     ///
-    /// 返回 `(removed, pending)`：本轮成功回收数与仍待回收数。
-    /// 未知错误（非 ENOENT/ENOTEMPTY）中止本轮并上抛，交由调用方告警。
+    /// 判定一个 `root-<hex>-e<epoch>` 目录可回收的条件（全部满足）：
+    /// 1. 命名合法（与 `root_data_dir` / `pending_data_dir` 同源）；
+    /// 2. 不属于 `roots` 缓存中的任何 root（缓存持有 = 当前活跃代次）；
+    /// 3. 不属于 catalog 中任何记录指向的 `data_dir`（含 pending 准备目录）。
+    ///
+    /// 返回 `(removed, pending)`。不持 `roots` 锁跨越磁盘操作。
     pub fn reclaim_deferred(&self) -> Result<(usize, usize)> {
-        let mut removed = 0;
-        let mut pending = 0;
-        for record in self.catalog.scan_roots()? {
-            // 仍被 Meta 视为 active 的 root 不属回收范围（删到一半而 Meta
-            // 未成功 deactivate 的情形由 rmdir 重试处理）。
-            if self
+        // 快照活跃代次：roots 缓存 + catalog 记录。两者都不含"已逻辑删除"的
+        // 代次，因此它们的并集之外的数据目录即为待回收。
+        let mut active: std::collections::HashSet<String> = std::collections::HashSet::new();
+        {
+            let roots = self
                 .roots
                 .read()
-                .map_err(|_| invalid_grant("root cache lock poisoned"))?
-                .contains_key(&record.id)
-            {
+                .map_err(|_| invalid_grant("root cache lock poisoned"))?;
+            for root in roots.values() {
+                active.insert(root.data_dir.as_path().to_string_lossy().into_owned());
+            }
+        }
+        for record in self.catalog.scan_roots()? {
+            active.insert(record.data_dir.as_path().to_string_lossy().into_owned());
+        }
+
+        let mut removed = 0;
+        let mut pending = 0;
+        for name in self
+            .disk
+            .read_dir(&StoragePath::root())
+            .map_err(Error::from)?
+        {
+            let Some(name) = name.to_str() else { continue };
+            if !is_data_dir_name(name) {
                 continue;
             }
-            match self.remove_abandoned_dir(&record.data_dir) {
+            if active.contains(name) {
+                continue;
+            }
+            let Ok(data_dir) = StoragePath::new(name) else {
+                continue;
+            };
+            match self.remove_abandoned_dir(&data_dir) {
                 Ok(()) => {
-                    self.catalog.remove_prepared_root(&record)?;
                     removed += 1;
-                    afs_logging::info!(
-                        "root.reclaim.completed";
-                        "root_id" => ?record.id,
-                        "data_dir" => ?record.data_dir,
-                    );
+                    afs_logging::info!("root.reclaim.completed"; "data_dir" => name);
                 }
                 Err(error) if error.code() == afs_error::IO_DIRECTORY_NOT_EMPTY => {
+                    // 对端仍持有句柄，下一轮再试。
                     pending += 1;
                 }
-                Err(error) if error.code() == afs_error::IO_NOT_FOUND => {
-                    // 目录已不在：条目失去意义，直接出队。
-                    self.catalog.remove_prepared_root(&record)?;
-                    removed += 1;
-                }
+                Err(error) if error.code() == afs_error::IO_NOT_FOUND => {}
                 Err(error) => {
                     afs_logging::warn!(
                         "root.reclaim.failed";
-                        "root_id" => ?record.id,
+                        "data_dir" => name,
                         "error" => error.to_string(),
                     );
                     return Err(error);
@@ -1506,26 +1525,27 @@ impl RootManager {
             let Some(location) = active.get(&record.id) else {
                 // 两种来源：(1) Abort CAS 后崩溃、本地清理前的 pending reservation；
                 // (2) delete_root 已提交 Meta deactivate 但物理目录/catalog 清理被
-                // 中断（含非空目录删除失败）。两者都表示该 root 已逻辑删除。
+                // 中断（含非空目录删除失败）。两者都表示该 root 已逻辑删除：
+                // 收敛为移除 catalog 条目；物理目录非空（ENOTEMPTY）时记录警告
+                // 并保留，等待人工清理，不阻塞启动（review: 非空 root 删除失败
+                // 会丢失控制面记录）。
                 //
-                // 非空目录（ENOTEMPTY）时**保留 catalog 记录**（H19）：它是"该
-                // 目录仍待回收"的唯一持久证据，丢弃它会把目录变成无主孤儿。
-                // 记录保留后由 `reclaim_deferred` 周期性重试，不再依赖人工清理。
+                // 保留目录由 `reclaim_deferred` 按目录名发现并回收，不依赖
+                // catalog 条目——catalog 以 root_id 为主键，同名重建会覆盖旧代，
+                // 不能兼作删除队列。
                 match self.remove_abandoned_dir(&record.data_dir) {
-                    Ok(()) => {
-                        self.catalog.remove_prepared_root(&record)?;
-                    }
+                    Ok(()) => {}
                     Err(error) if error.code() == afs_error::IO_DIRECTORY_NOT_EMPTY => {
                         afs_logging::warn!(
-                            "root.reconcile.deferred_data_dir";
+                            "root.reconcile.leftover_data_dir";
                             "root_id" => ?record.id,
                             "data_dir" => ?record.data_dir,
                             "error" => error.to_string(),
                         );
-                        // catalog 条目保留，等待 reclaim_deferred 回收。
                     }
                     Err(error) => return Err(error),
                 }
+                self.catalog.remove_prepared_root(&record)?;
                 continue;
             };
             if location.epoch != record.epoch || location.home_node_id != self.local_node_id {
@@ -1615,6 +1635,26 @@ impl RootManager {
             })
             .unwrap_or_default()
     }
+}
+
+/// True for `<root_id>-e<epoch>` data directory names.
+///
+/// Mirrors `root_data_dir` / `pending_data_dir` shape without allocating a
+/// `StoragePath`: `root-` + even-length lowercase hex + `-e` + decimal epoch.
+/// Used by reclaim to recognise candidate directories while scanning the data
+/// root, so unrelated entries are never considered.
+fn is_data_dir_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("root-") else {
+        return false;
+    };
+    let Some((encoded, epoch)) = rest.rsplit_once("-e") else {
+        return false;
+    };
+    !encoded.is_empty()
+        && encoded.len() % 2 == 0
+        && encoded.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !epoch.is_empty()
+        && epoch.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn pending_data_dir(reservation: &RootReservation) -> Result<StoragePath> {

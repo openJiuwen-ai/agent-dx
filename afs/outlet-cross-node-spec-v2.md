@@ -562,30 +562,49 @@ ENOTEMPTY 的残留是**可回收的**（有 catalog 记录 + 回收循环）；
 
 ### 8.3 第二段：物理回收（异步、幂等、可重试）
 
-home 节点按固定间隔扫 catalog，回收"Meta 已无记录、目录仍在"的条目。
-**不新增持久化字段**：catalog 的 `LocalRootRecord` 保持不变（加
-`defer_until`/`attempts` 会改 `WireRootRecord` 格式，代价不值得——退避由
-轮询间隔本身承担，见 §8.4）。
+**按目录名发现待回收代次，不用 catalog 当删除队列。** 这是本节最关键的决定，
+来自一个实现时踩到的坑：catalog 以 `root_id` 为主键，而 `root_id` 由名字派生
+（`root-<hex(name)>`），所以同名重建会命中同一条记录。若把待回收代次记在
+catalog，只有两种结局：
+
+- 记录冲突 → `persist_prepared_root` 返回 `conflicting local root record
+  already exists`，**该名字在对端句柄释放前永久不可用**；
+- 允许覆盖 → 旧代次的回收凭证被新一代覆盖，旧目录变孤儿。
+
+两者都不可接受。因此 catalog 回归单一职责（活跃记录），回收靠目录名发现：
 
 ```
 每 outlet_reclaim.reclaim_interval_ms（默认 60000），调用
 RootManager::reclaim_deferred()：
-  for record in catalog.scan_roots():
-    if roots 缓存仍含 record.id: continue        // Meta 仍 Active，不属回收
-    match disk.remove_dir(record.data_dir):
-      Ok        → catalog.remove_prepared_root(record)   // 出队
-      NotFound  → catalog.remove_prepared_root(record)   // 已消失，出队
-      ENOTEMPTY → 跳过，计入 pending（不是错误）
+  active = {roots 缓存中每个 root 的 data_dir} ∪ {catalog 每条记录的 data_dir}
+  for name in read_dir(数据根):
+    if !is_data_dir_name(name): continue          // root-<hex>-e<epoch> 形状
+    if active.contains(name): continue            // 活跃代次或 pending 准备目录
+    match disk.remove_dir(name):
+      Ok        → removed += 1
+      NotFound  → 忽略（已不在）
+      ENOTEMPTY → pending += 1（对端仍持有，下轮再试）
       other     → 告警 root.reclaim.failed，中止本轮并上抛
   返回 (removed, pending)
 ```
 
-**硬规则 H21**：回收循环不得阻塞任何请求路径，不得持有 `roots` 锁跨越
-磁盘操作（只需一次读锁做成员判断）。它只读写 catalog 与磁盘。
+`active` 的并集就是"不该删"的全集：`roots` 缓存代表当前准入代次，catalog
+记录覆盖"已 prepare 未 activate"的 pending 目录与活跃记录。**不在此并集中的
+`root-*-e*` 目录只可能来自已逻辑删除的代次。**
+
+**配套改动 H19 的语义**：`persist_prepared_root` 遇到同 `root_id` 但**更旧
+epoch** 的记录时允许取代（`existing.epoch < record.epoch`），并记录
+`ownerfs.catalog_supersede_stale_record`；遇到更新的 epoch 仍拒绝（那说明
+本地状态被回退，属错误）。epoch 单调递增且永不重用，因此"更旧"等价于
+"已被 Meta 逻辑删除"。
+
+**硬规则 H21**：回收循环不得阻塞请求路径、不持 `roots` 锁跨越磁盘操作
+（只在开头做一次读锁快照）。它只读 catalog 与磁盘。
 
 **为什么不复用 `reconcile_on_startup`**：那个函数（a）只在启动时跑一次，
-（b）在 ENOTEMPTY 时丢弃 catalog 记录。回收循环是它的运行期补位，且不做
-丢弃——两者的关键差别就在 H19。
+（b）按既有约定在 ENOTEMPTY 时移除 catalog 条目并保留目录、不阻塞启动——
+那个行为本身是对的（留下有告警的目录优于阻塞启动），本规范不修改它；
+运行期由 `reclaim_deferred` 补位把它清掉。
 
 ### 8.4 退避与可观测性
 
@@ -696,7 +715,7 @@ reclaim_interval_ms = 60000          # 可选，默认 60000；§8.3 物理回�
 | T4 | 配置与接线 | 三路径 all-or-none 校验、`node.rs` 启动接线、`[outlet_mirror]`、H11 取值校验 | 配置校验测试、启动 fail-fast 测试、grace 下限校验测试 |
 | T5 | 部署资产 | 两节点部署脚本（fstab 示例含 `softerr` 等参数、nfsd 导出示例含**导出 IP 与成员表一致性检查**、挂载点 0555）、`docs/deployment/afs.md`、架构文档、README、**存量迁移步骤（H17）** | `python3 build/docs/check.py`、`git diff --check`、导出范围核对脚本（TC20） |
 | T6 | 双节点运行验证 | §13 全部用例 | 验证报告（明确"非多 VM/HA 证明"的边界声明） |
-| T7 | 两段式删除 | ENOTEMPTY 不再上抛 + catalog 记录贯穿保存（H19/H20，含修 `reconcile_on_startup` 丢弃条目的缺陷）+ `reclaim_deferred` 回收循环（H21）+ `[outlet_reclaim]` 配置 | 单元测试：ENOTEMPTY 时 delete_root 返回 Ok、Meta 已删、catalog 保留、重启对账不丢弃、回收重试成功出队；目标 0 残留 |
+| T7 | 两段式删除 | ENOTEMPTY 不上抛（H20）+ `persist_prepared_root` 允许取代更旧 epoch（H19 配套，保证同名重建）+ `reclaim_deferred` 按目录名扫描回收（H21）+ `[outlet_reclaim]` 配置 | 单元测试：ENOTEMPTY 时 delete_root 返回 Ok、Meta 已删、目录保留；**同名重建成功且新旧目录并存**；句柄释放后回收删除旧目录；`reconcile_on_startup` 行为保持基线（移除 catalog、保留目录、不阻塞） |
 
 提交按 conventional commits + 单条 Signed-off-by；T1-T4 一组（行为），
 T5-T6 一组（资产与证据），不混入无关变更。
@@ -727,7 +746,7 @@ T5-T6 一组（资产与证据），不混入无关变更。
 | TC19 | NFS 路径不经 AFS 授权（§6.5) | 在 B 上对 `/public/<name>` 做 IO：A 的 `afs-node` 日志无 `validate_root_access` / `ValidateRootAccess` 调用；B 侧无任何 `RootGrant` |
 | TC20 | 导出范围核对（H18） | 部署检查脚本：`/etc/exports` 的客户端集合与成员表一致；加入非成员 IP 时脚本报错 |
 | TC21 | 删除时有远端句柄（H19/H20） | B 容器持有 agent1 内文件句柄，A 执行 rmdir：FUSE 返回成功（不报 ENOTEMPTY）、`/public/agent1` ≤250ms 摘除、Meta 记录已删、**catalog 记录保留**、物理目录仍在 |
-| TC22 | 回收重试（H21） | 句柄释放后下一轮回收成功：目录删除、catalog 出队、`outlet_pending_deletions` 归零 |
+| TC22 | 回收重试（H21） | 句柄释放后下一轮回收成功：旧代目录被删除，活跃代次与 pending 准备目录不受影响，`outlet_pending_deletions` 归零 |
 | TC23 | 同名重建与待回收并存（§8.5） | 旧代待回收期间同名重建：新代可正常读写；旧代回收只删旧代 epoch 目录，新一代不受影响 |
 | TC24 | 回收指标（H22） | 持续 ENOTEMPTY 时 `outlet_pending_deletions` 与 `outlet_reclaim_oldest_age_seconds` 正确增长 |
 
@@ -766,6 +785,10 @@ T5-T6 一组（资产与证据），不混入无关变更。
   目录会长期滞留。指标 `outlet_reclaim_oldest_age_seconds > 24h` 是唯一的
   发现手段。明确不做强制回收——在 NFS 数据面上强制删除会让对端收到 ESTALE，
   比磁盘泄漏更糟。
+  **同名重建不受残留阻塞**：回收按目录名而非 catalog 发现待回收代次，且
+  `persist_prepared_root` 允许取代更旧 epoch，因此旧目录滞留不影响该名字
+  重新使用（见 §8.3）。这一条是实现时发现的：最初把待回收代次记在 catalog，
+  会让同名重建直接失败。
 - **R10 僵尸 root 优于残留目录（已定序）**：Meta deactivate 保持在物理
   删除之前。若反过来先删目录，Meta 不可达时会留下"Meta 仍 Active、数据已
   不存在"的僵尸 root——名字继续发布、消费者 bind 到空路径、且 cache 已移除
