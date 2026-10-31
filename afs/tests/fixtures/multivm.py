@@ -13,7 +13,7 @@ import shutil
 import time
 
 from fixtures import singlevm, ssh, namespaces
-from fixtures.common import Blocked, sha256, write_json
+from fixtures.common import Blocked, DfsProfile, needs_reader_c, performance_parameters, sha256, write_json
 
 ROLES = ("M", "A", "B", "C")
 NAMES = {"M": "meta", "A": "node-a", "B": "node-b", "C": "node-c"}
@@ -30,10 +30,19 @@ def validate(config, cases):
     roles = config.get("roles", {})
     hosts = config.get("hosts", {})
     needed = set("MAB")
-    if (config["kind"] == "singlevm" and any(c.mode == "dfs" for c in cases)) or any(
-        c.id.endswith(".many_readers") for c in cases
-    ):
+    if any(needs_reader_c(c, config["kind"]) for c in cases):
         needed.add("C")
+    for case in cases:
+        if not isinstance(case.observe_cache, bool) or (case.observe_cache and case.mode != "dfs"):
+            raise ValueError("cache-open observation is a boolean DFS-only test option")
+        if case.profile is not None and (case.mode != "dfs" or not isinstance(case.profile, DfsProfile)):
+            raise ValueError("typed DFS profiles belong only to DFS cases")
+        if case.purpose not in ("functional", "performance"):
+            raise ValueError("unknown case purpose")
+        if case.purpose == "performance":
+            performance_parameters(config)
+        if case.profile is not None and case.profile.node_count == 3:
+            needed.add("C")
     if not needed <= set(roles):
         raise Blocked("selected cases require roles: " + ",".join(sorted(needed)))
     for role, item in roles.items():
@@ -88,13 +97,14 @@ class Cluster:
         self.evidence = []
         self.started = False
         self.roles = ["M", "A", "B"]
-        if config["kind"] == "singlevm" or case.id.endswith(".many_readers"):
+        if needs_reader_c(case, config["kind"]) or (case.profile is not None and case.profile.node_count == 3):
             self.roles.append("C")
         if self.mode == "ownerfs":
             self.roles = ["M", "A", "B"]
         self.uid = config["uid"]
         self.gid = config["gid"]
         self.bind = False
+        self.helpers = {}
 
     def record(self, name, value):
         self.evidence.append({"check": name, "value": value})
@@ -127,7 +137,7 @@ class Cluster:
             raise AssertionError(f"{role}: command failed: {value}")
         return value
 
-    def python(self, role, code, *args, owner=True, check=True, stdin=None):
+    def python(self, role, code, *args, owner=True, check=True, stdin=None, timeout=30):
         return self.command(
             role,
             ["python3", "-c", "import os,sys,json,hashlib,errno,stat\n" + code, *args],
@@ -135,7 +145,63 @@ class Cluster:
             gid=self.gid if owner else None,
             check=check,
             stdin=stdin,
+            timeout=timeout,
         )
+
+    def spawn_python(self, role, name, code, *args):
+        """Own the probe before it can retain a FUSE FD or wait for fault recovery."""
+        if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", name) or name in self.helpers:
+            raise ValueError("invalid or duplicate helper name")
+        directory = self.role_dir(role) + "/helper-" + name
+        self.python(
+            role,
+            'os.mkdir(sys.argv[1],0o700);os.chown(sys.argv[1],int(sys.argv[2]),int(sys.argv[3]))',
+            directory, self.uid, self.gid, owner=False,
+        )
+        value = self.channel(role).call(
+            "helper_start", name=name,
+            argv=["python3", "-c", "import os,sys,json,hashlib,errno,stat\n" + code, directory, *map(str, args)],
+            log=self.root(role) + "/helper-" + name + ".log", uid=self.uid, gid=self.gid,
+        )
+        self.helpers[name] = (role, directory)
+        return self.record("helper.start." + name, value)
+
+    def helper_signal(self, name, signal_name, value):
+        role, directory = self.helpers[name]
+        if not re.fullmatch(r"[a-z][a-z0-9-]*", signal_name):
+            raise ValueError("invalid helper signal")
+        path = directory + "/" + signal_name + ".json"
+        value = self.channel(role).call(
+            "put", path=path + ".pending",
+            data=base64.b64encode(json.dumps(value).encode()).decode(), mode=0o644,
+        )
+        self.python(role, "os.replace(sys.argv[1],sys.argv[2])", path + ".pending", path, owner=False)
+        return value
+
+    def await_helper_signal(self, name, signal_name, timeout=60):
+        role, directory = self.helpers[name]
+        if not re.fullmatch(r"[a-z][a-z0-9-]*", signal_name):
+            raise ValueError("invalid helper signal")
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            result = self.python(
+                role, 'from pathlib import Path\np=Path(sys.argv[1]);print(p.read_text() if p.exists() else "null")',
+                directory + "/" + signal_name + ".json",
+            )
+            value = json.loads(result["stdout"])
+            if value is not None:
+                return self.record("helper.signal." + name + "." + signal_name, value)
+            state = self.channel(role).call("status").get("H:" + name)
+            if state is None or state["returncode"] is not None:
+                raise AssertionError("helper exited before signal: " + repr(state))
+            time.sleep(0.1)
+        raise TimeoutError("helper did not produce signal: " + signal_name)
+
+    def wait_helper(self, name, timeout=60):
+        role, _ = self.helpers[name]
+        value = self.channel(role).call("wait", role="H:" + name, timeout=timeout)
+        del self.helpers[name]
+        return self.record("helper.wait." + name, value)
 
     def mount(self, role):
         return self.role_dir(role) + "/mount/" + self.mode
@@ -211,7 +277,11 @@ class Cluster:
             "binaries": {n: sha256(self.binary_dir / n) for n in binaries},
             "case": self.case.id,
             "kind": self.config["kind"],
-            "scope": "component integration, not ADX product or performance",
+            "scope": (
+                "component measurement workload correctness; performance acceptance NOT_EVALUATED"
+                if self.case.purpose == "performance"
+                else "component integration, not ADX product or performance"
+            ),
         }
         artifact_identity = self.binary_dir / "artifact-identity.json"
         if not artifact_identity.is_file():
@@ -362,6 +432,7 @@ class Cluster:
                     ch.upload(p, self.roots[host] + "/tls/" + p.name, 0o600 if p.suffix == ".key" else 0o644)
 
     def _configs(self):
+        log_level = "info" if self.case.observe_cache else "warn"
         for role in self.roles:
             root = self.root(role)
             data = self.role_dir(role)
@@ -369,7 +440,7 @@ class Cluster:
             cert = root + "/tls/" + NAMES[role]
             common = (
                 f'grpc_listen = "{self.address(role)}:{grpc}"\nrest_listen = "{self.address(role)}:{rest}"\n'
-                f'data_dir = "{data}/state"\nlog_level = "warn"\ntrace_enabled = false\n'
+                f'data_dir = "{data}/state"\nlog_level = "{log_level}"\ntrace_enabled = false\n'
                 f'tls_ca_certificate = "{root}/tls/ca.pem"\ntls_identity_certificate = "{cert}.pem"\n'
                 f'tls_identity_private_key = "{cert}.key"\ntls_server_name = "afs-meta"\n'
             )
@@ -378,10 +449,10 @@ class Cluster:
             )
             common += "trusted_node_certs = {" + trusted + "}\n"
             if role == "M":
+                policy = self.case.profile or DfsProfile()
                 config = (
                     'id = "meta-ctl"\nfs = "all"\nmeta_store = "local-file"\n'
-                    "dfs_desired_copies = 1\ndfs_sync_required_copies = 1\ndfs_min_distinct_nodes = 1\n"
-                    'dfs_min_distinct_failure_domains = 1\ndfs_local_copy = "required"\n' + common
+                    + policy.meta_config() + common
                 )
             else:
                 config = (
@@ -390,6 +461,8 @@ class Cluster:
                     f'advertise_endpoint = "https://{self.address(role)}:{grpc}"\ndata_mode = "grpc"\n'
                     f'uds_path = "{data}/run/node.sock"\n{self.mode}_mount = "{self.mount(role)}"\n' + common
                 )
+                if self.case.profile is not None:
+                    config += self.case.profile.node_config()
                 if role == "A" and self.mode == "ownerfs" and self.bind:
                     config += (
                         "\nexperimental_ownerfs_workspace_bind = true\nownerfs_workspace_egress_root = "
@@ -408,12 +481,14 @@ class Cluster:
                 self.mount(role) if role != "M" else data + "/mount",
                 owner=False,
             )
-            self.command(
+            effective = self.command(
                 role, [root + "/bin/afs-" + ("meta" if role == "M" else "node"), "--config", path, "--print-config"]
             )
+            self.record("config.effective." + role, json.loads(effective["stdout"]))
 
     def health(self, role, path="/health"):
-        code = "import urllib.request\nwith urllib.request.urlopen(sys.argv[1],timeout=2) as r:print(r.read().decode())"
+        code = ("import urllib.request\no=urllib.request.build_opener(urllib.request.ProxyHandler({}))\n"
+                "with o.open(sys.argv[1],timeout=2) as r:print(r.read().decode())")
         response = self.python(
             role, code, "http://" + self.address(role) + ":" + str(self.ports(role)[1]) + path, owner=False
         )
@@ -492,7 +567,8 @@ class Cluster:
     def write(self, role, name, data):
         self.python(
             role,
-            'p=sys.argv[1];d=bytes.fromhex(sys.stdin.read());f=open(p,"wb");f.write(d);f.flush();os.fsync(f.fileno());f.close()',
+            'p=sys.argv[1];d=bytes.fromhex(sys.stdin.read());f=open(p,"wb");f.write(d);'
+            'f.flush();os.fsync(f.fileno());f.close()',
             self.workspace(role) + "/" + name,
             stdin=data.hex(),
         )
@@ -501,6 +577,14 @@ class Cluster:
     def cleanup(self):
         results = {}
         errors = []
+        # Helper FDs must be retired before normal FUSE unmount, on every host.
+        for host, ch in self.channels.items():
+            try:
+                helper_cleanup = ch.call("stop_helpers", timeout=35)
+                if helper_cleanup["status"] != "PASS":
+                    errors.extend(host + ": " + error for error in helper_cleanup["errors"])
+            except Exception as exc:
+                errors.append(host + ": helper cleanup unconfirmed: " + str(exc))
         # Stop all Nodes on all guests before stopping Meta, even after partial setup.
         for role in reversed(self.roles[1:]):
             if self.config["roles"][role]["host"] not in self.channels:

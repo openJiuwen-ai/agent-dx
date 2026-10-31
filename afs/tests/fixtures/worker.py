@@ -8,6 +8,8 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
+import signal
 import shutil
 import socket
 import subprocess
@@ -78,6 +80,17 @@ class Worker:
             pid_namespace=os.readlink("/proc/self/ns/pid"),
         )
 
+    @staticmethod
+    def command_argv(req):
+        argv = req["argv"]
+        if req.get("uid") is not None:
+            drop = (
+                "import os,sys;os.setgroups([]);os.setgid(int(sys.argv[2]));os.setuid"
+                "(int(sys.argv[1]));os.execvpe(sys.argv[3],sys.argv[3:],os.environ)"
+            )
+            argv = ["python3", "-c", drop, str(req["uid"]), str(req["gid"])] + argv
+        return argv
+
     def dispatch(self, req):
         action = req["action"]
         if action == "inspect":
@@ -130,6 +143,20 @@ class Worker:
                 raise ValueError("parallel is restricted to bounded commands")
             with ThreadPoolExecutor(max_workers=len(req["requests"])) as pool:
                 return list(pool.map(self.dispatch, req["requests"]))
+        if action == "helper_start":
+            name = req["name"]
+            if not re.fullmatch(r"[a-z][a-z0-9-]{0,31}", name):
+                raise ValueError("invalid helper name")
+            return self.dispatch(dict(req, action="start", role="H:" + name))
+        if action == "stop_helpers":
+            waits, errors = [], []
+            for role in list(self.processes):
+                if role.startswith("H:"):
+                    try:
+                        waits.append(self.stop(role, req.get("timeout", 30)))
+                    except Exception as exc:
+                        errors.append(str(exc))
+            return {"status": "FAIL" if errors else "PASS", "waits": waits, "errors": errors}
         if action == "start":
             role = req["role"]
             if role in self.processes:
@@ -137,7 +164,10 @@ class Worker:
             log = self.owned(req["log"])
             log.parent.mkdir(parents=True, exist_ok=True)
             with log.open("ab") as stream:
-                proc = subprocess.Popen(req["argv"], stdout=stream, stderr=stream, start_new_session=True)
+                proc = subprocess.Popen(
+                    self.command_argv(req), stdout=stream, stderr=stream,
+                    env={**os.environ, **req.get("env", {})}, start_new_session=True,
+                )
             self.processes[role] = proc
             self.listeners.extend(req.get("listeners", []))
             return {"pid": proc.pid, "role": role}
@@ -178,14 +208,23 @@ class Worker:
             self.receipts.append(record)
             raise RuntimeError("normal stop timed out: " + role)
         record = {"role": role, "pid": proc.pid, "wait_status": code}
+        cancelled_helper = role.startswith("H:") and terminate and code == -signal.SIGTERM
+        if cancelled_helper:
+            record["cancelled_helper"] = True
         self.receipts.append(record)
         del self.processes[role]
-        if code != 0:
+        if code != 0 and not cancelled_helper:
             raise RuntimeError("product did not exit normally: " + repr(record))
         return record
 
     def cleanup(self):
         errors = []
+        for role in list(self.processes):
+            if role.startswith("H:"):
+                try:
+                    self.stop(role)
+                except Exception as exc:
+                    errors.append(str(exc))
         for role in list(self.processes):
             if role == "M":
                 continue

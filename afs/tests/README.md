@@ -21,7 +21,9 @@
 - 显式选择 owner/other 的非 root 数字 UID/GID，不自动创建用户。运行文件操作在独立降权进程中进行。
 - 多 VM 预先提供 SSH 信任/认证、guest 地址互通及专用目录；不接受交互认证，不关闭主机密钥校验。
 
-默认使用 local-file Meta、真实 mTLS、OwnerFs 本地 egress bind/远端 FUSE、DFS NodeReplicated R1。
+默认使用local-file Meta、真实双向证书认证、OwnerFs本地egress bind/远端FUSE、DFS NodeReplicated R1。
+应用数据持续加密以有效`tls_encryption_enabled`配置为准，当前生产默认关闭；证书认证不代表正文持续加密。
+实际解析配置保留在每例证据中，不为说明文字调整运行模式。
 S3、etcd、Redis、RDMA、VM 断电、HA、长稳和性能不在这些基础集合的验收范围。
 
 ## 输入准备
@@ -165,7 +167,7 @@ python3 afs/tests/run.py run --suite all-basic \
 ```
 
 READY只代表预检满足，实际PASS看本次结果；退出2/BLOCKED须补环境或输入，不能当作通过。
-完整基础集合为单机11＋namespace9，不包含`--all`的可选扩展合同。
+完整基础集合为单机13＋namespace9，不包含`--all`的可选扩展合同。
 
 ### 5. 导出证据，再回收自己的环境
 
@@ -193,7 +195,8 @@ SH
 再由执行者删除自己的临时数据并记录前后`du -sh`。输入、结果、数据盘、VM生命周期分别管理；
 只有本次独占VM且不再需要时才关闭/删除VM。不要在共享环境执行`ip -all netns delete`、全局kill、lazy卸载或磁盘prune。
 
-通用setup/PYENV、预检与20项基础用例已在本轮Ubuntu 24.04 ARM64 Linux环境实测通过；
+初版通用setup/PYENV、预检与20项基础用例曾在Ubuntu 24.04 ARM64 Linux环境实测通过；
+该历史记录不包含后来新增的缓存复用和热缓存权限两项，当前注册基础集合为22项。
 代理继承导致的初次失败已保留，清除代理后完整重跑通过。该验证是在已有VM内按本文准备新namespace，
 不表示从空白镜像安装软件包、所有架构/虚拟化平台均已逐项验收。
 
@@ -302,7 +305,7 @@ Home/Meta重启允许有界30秒会话/缓存收敛，记录全部暂态错误�
 ## 用例组织与后续添加规则
 
 本README是AFS组件测试的使用和扩展总入口；测试分层、Buildkite和完整ADX产品行为仍遵循
-[五步总规范](../../docs/testing/test-strategy.md)。当前20项是第二/三步的**基础集合**，不是AFS全量覆盖。
+[五步总规范](../../docs/testing/test-strategy.md)。当前22项是第二/三步的**基础集合**，不是AFS全量覆盖。
 `--all`仅表示全部已登记case，不能据此宣称功能、兼容性、故障、长稳和性能均已覆盖。
 当前列表以`python3 afs/tests/run.py list`为准，覆盖缺口和优先级记入总规范，不另建一份平行清单。
 
@@ -402,3 +405,90 @@ python3 -m unittest discover -s afs/tests/runner_tests -v
 代码提供local/受管namespace/可选SSH适配、matrix调度和全部基础集合；真实通过、旧冻结输入验证、当前源码构建阻塞以及缺少多VM环境
 必须分别登记。当前运行记录见 [五步测试规范](../../docs/testing/test-strategy.md#step-2)，
 AFS技术边界见 [测试合同](../../docs/testing/afs.md)。本入口不调用或宣称已接通第四、五步产品/CI。
+
+## 读写专项与性能资产
+
+基础集合为22项（原20项及独立的缓存复用、热缓存权限两项）；以下是可选扩展，不自动进入Buildkite、基础冒烟或产品Full。
+用例ID和实际profile以`run.py list`为准；本节只说明归属，不维护第二份独立注册表。
+
+| 集合 | 当前行为范围 | 配置与边界 |
+| --- | --- | --- |
+| `local-write-special` / `cluster-write-special` | 跨fd覆盖/截断顺序；O_SYNC/O_DSYNC/close-only/并发append；有界接纳下同文件及独立文件fsync推进；必需副本失败恢复；失败close退役 | 各5项。显式64MiB前台额度；R2例只启动A/B两个Node并要求两个不同Node的持久副本。256MiB压力不冒充实测队列峰值、严格公平性或时延SLA |
+| `local-read-special` / `cluster-read-special` | off/receiver/both三种CRC模式下的远端非对齐/跨块/EOF正确性；显式direct顺序读触发预取、seek/close后缓冲释放；cached首读/同fd/重开正确性及direct专用预取门控 | 各5项。固定open授权显式开启以覆盖原生句柄路径；不加强旧fd一致性。不把正向CRC测试记成损坏注入/坏副本恢复，也不把cached内容正确当作缓存驻留或零RPC证明 |
+| `all-special` | 上述单机和隔离节点专项的并集 | 20项，使用matrix环境；不含性能，不替代`all-basic`或完整AFS验收 |
+| `local-performance` | 顺序写交付/同步完成测量资产及远端读测量资产 | 两个测量入口，默认拒绝执行。不是受控基线比较或性能准入，不能用PASS代表性能无退化 |
+
+### 用同一入口选择
+
+```sh
+python3 afs/tests/run.py list --suite all-special
+python3 afs/tests/run.py check-env --suite all-special \
+  --env /absolute/matrix.json --binary-dir /absolute/bin
+python3 afs/tests/run.py run --suite all-special \
+  --env /absolute/matrix.json --binary-dir /absolute/bin \
+  --work-root /absolute/new-special-results
+# 只定位一项；定向结果仍为partial。
+python3 afs/tests/run.py run --case dfs.write.local.required_replica_recovery \
+  --env /absolute/singlevm.json --binary-dir /absolute/bin \
+  --work-root /absolute/new-recovery-results
+```
+
+`DfsProfile`只接受经过范围检查的副本数/Node数、前台额度、读CRC、原生open授权、
+内核预读、B预取距离和keep_cache参数，不接受任意TOML或个人环境路径。
+原基础用例不指定profile时仍用原R1/默认参数；有效产品配置保留在checks/config证据中。
+单机与namespace用同一业务函数、分别注册稳定ID，仍由角色API执行，不把控制端文件访问当远端证据。
+
+需要持有FD等待副本恢复的辅助进程通过fixture的`spawn_python`接管。
+故障控制采用已登记Node的正常停止/恢复；辅助进程先于Node退休，实际wait状态保留。
+取消辅助进程明确记`cancelled_helper`，不能冒充其业务成功；断言、超时、异常退出和清理错误均使本例失败。
+这不提供SIGKILL、断电、独立宿主或完整多副本修复结论。
+
+### 性能资产须单独显式执行
+
+本次迁移只验证性能资产的发现、拒绝规则和小数据功能正确性，不执行新的性能对照。
+源码见[测量工具说明](tools/README.md)。使用者以后执行前，先在专门的singlevm环境JSON中加入：
+
+```json
+{"performance": {"bytes": 1073741824, "request_bytes": 1048576}}
+```
+
+该片段不是完整环境配置。仅当明确安排性能工作时再显式使用：
+
+```sh
+python3 afs/tests/run.py list --suite local-performance
+python3 afs/tests/run.py run --suite local-performance --allow-performance \
+  --env /absolute/singlevm-performance.json --binary-dir /absolute/bin \
+  --case-timeout 1800 --work-root /absolute/new-measurement-results
+```
+
+没有`--allow-performance`时，`run`和`check-env`在启动产品前返回BLOCKED，`--all`也不能隐式绕过。
+没有固定数据量/请求粒度同样BLOCKED。结果逐项标`purpose=performance`及
+`performance_acceptance=NOT_EVALUATED`：通过只表示负载完成且内容/账本有效，不判断加速或退化。
+需要固定基线、交错顺序、资源/缓存资格和阈值的正式性能比较，继续按第五步复用公共受控性能能力。
+
+原始cohort、旧源码/ELF、进度写盘/BPF等诊断证据仍留仓外。源码仓不提交实际环境JSON、
+证书私钥、二进制、运行正文或大日志。历史批次成绩不转移到当前代码或不同计时口径。
+
+
+## 缓存用例的前提与证据
+
+三项基础检查独立出结果，不用一次断言失败遮住后面的权限结果：
+
+| ID | 条件与硬断言 |
+| --- | --- |
+| `dfs.visibility.real_cross_handle_cache` | 旧V1句柄仍存活时发布V2；核对实际open日志，H2/H3应走安全direct回退，必须读到正确V2且确有FUSE读；保留原legacy配置下旧句柄未缓存尾部的检查，不增加通用旧fd一致性承诺 |
+| `dfs.cache.same_version_reopen` | 独立fixture，无冲突旧句柄。预热必须获缓存准入；同fd复读零新增READ；关闭后同版本重开必须cached=true、keep_cache=true，仍严格要求零新增FUSE READ |
+| `dfs.cache.warm_permission_change` | 确认缓存已热后改mode000，新open必须EACCES；恢复权限后内容/长度/SHA/EOF正确，不要求已有fd即时撤销 |
+
+仅这些case设置`Case.observe_cache=true`，fixture将已有日志级别设为Info，读取原有
+`dfs.fuse_cache_open`的ino/fh/versioned_read/cached/keep_cache字段；不改产品代码或缓存策略。
+请求显式为O_RDONLY、没有O_DIRECT，versioned_read必须为true；该条件下实际cached结果用于核对缓存准入/回退。
+日志缺失、类型不对或意外direct均失败，不推断成已经准入，也不算通过。
+
+驻留用Linux `mincore`对本UID所有的文件做非触碰MAP_PRIVATE映射观测，保存逐页向量、页数和驻留数；
+完整预热后、重开但尚未读正文、再次读完后三次均要求全量驻留。OPEN丢页会在正文重新预热前失败。
+每项使用新目录与独立正常回收的fixture；旧冲突fixture已清理后才进入另一项，无固定sleep或重试OPEN来取得有利结果。
+精确计数期间临时把自有B挂载的BDI预读设为0并finally恢复，不改源盘或全局系统配置；这只是功能合同，不是性能对照。
+所有阶段在断言前输出JSON，失败时也保留实际日志、驻留向量和计数；零READ没有改成允许少量READ。
+
+本批实现的冻结功能结果、制品身份与发布边界见[读写专项验证记录](../../docs/testing/afs-io-specials-validation-20261031.md)。
