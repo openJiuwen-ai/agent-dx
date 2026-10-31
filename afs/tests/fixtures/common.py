@@ -23,6 +23,60 @@ class Blocked(RuntimeError):
     pass
 
 
+def is_integer(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+@dataclass(frozen=True)
+class DfsProfile:
+    """Small, typed per-case product inputs; never arbitrary TOML or host policy."""
+
+    copies: int = 1
+    node_count: int = 2
+    write_queue_bytes: int | None = None
+    read_crc_mode: str | None = None
+    readahead_max_bytes: int | None = None
+    keep_cache: bool | None = None
+    kernel_readahead_bytes: int | None = None
+    native_open_authority: bool | None = None
+
+    def __post_init__(self):
+        if not is_integer(self.node_count) or self.node_count not in (2, 3):
+            raise ValueError("DFS profile needs two or three Nodes")
+        if not is_integer(self.copies) or not 1 <= self.copies <= self.node_count:
+            raise ValueError("DFS copies must fit the declared Node count")
+        for name, value, minimum, maximum in (
+            ("write_queue_bytes", self.write_queue_bytes, 8 * 1024**2, 1024**4),
+            ("readahead_max_bytes", self.readahead_max_bytes, 0, 32 * 1024**2),
+            ("kernel_readahead_bytes", self.kernel_readahead_bytes, 0, 16 * 1024**2),
+        ):
+            if value is not None and (not is_integer(value) or not minimum <= value <= maximum):
+                raise ValueError("invalid DFS profile " + name)
+        if self.read_crc_mode not in (None, "off", "receiver", "both"):
+            raise ValueError("invalid DFS read CRC mode")
+        for name, value in (("keep_cache", self.keep_cache), ("native_open_authority", self.native_open_authority)):
+            if value is not None and not isinstance(value, bool):
+                raise ValueError(name + " must be a boolean")
+
+    def meta_config(self):
+        return (
+            f"dfs_desired_copies = {self.copies}\ndfs_sync_required_copies = {self.copies}\n"
+            f"dfs_min_distinct_nodes = {self.copies}\ndfs_min_distinct_failure_domains = 1\n"
+            'dfs_local_copy = "required"\n'
+        )
+
+    def node_config(self):
+        values = (
+            ("dfs_write_queue_bytes", self.write_queue_bytes),
+            ("dfs_read_crc_mode", self.read_crc_mode),
+            ("dfs_readahead_max_bytes", self.readahead_max_bytes),
+            ("dfs_fuse_keep_cache", self.keep_cache),
+            ("fuse_max_readahead_bytes", self.kernel_readahead_bytes),
+            ("dfs_native_open_read_authority", self.native_open_authority),
+        )
+        return "".join(f"{key} = {json.dumps(value)}\n" for key, value in values if value is not None)
+
+
 @dataclass(frozen=True)
 class Case:
     id: str
@@ -31,6 +85,27 @@ class Case:
     groups: tuple[str, ...]
     function: object
     rust: bool = False
+    profile: DfsProfile | None = None
+    purpose: str = "functional"
+    observe_cache: bool = False
+
+
+def needs_reader_c(case, kind):
+    return case.id.endswith(".many_readers") or (
+        kind == "singlevm" and case.mode == "dfs" and (case.profile is None or case.profile.node_count == 3)
+    )
+
+
+def performance_parameters(config):
+    values = config.get("performance")
+    if not isinstance(values, dict):
+        raise Blocked("explicit performance input requires bytes and request_bytes; no implicit experiment")
+    size, request = values.get("bytes"), values.get("request_bytes")
+    if not is_integer(size) or not 4096 <= size <= 1024**3 or size % 4096:
+        raise Blocked("performance bytes must be declared, 4KiB..1GiB and page aligned")
+    if not is_integer(request) or not 4096 <= request <= 1024**2 or request % 4096:
+        raise Blocked("performance request_bytes must be declared, 4KiB..1MiB and page aligned")
+    return size, request
 
 
 def discover():
@@ -46,6 +121,11 @@ def discover():
                 raise ValueError("duplicate case ID: " + case.id)
             if "local-basic" in case.tags or "cluster-manyread" in case.tags:
                 case = replace(case, tags=case.tags + ("all-basic",))
+            special_tags = (
+                "local-write-special", "cluster-write-special", "local-read-special", "cluster-read-special",
+            )
+            if any(tag in case.tags for tag in special_tags):
+                case = replace(case, tags=case.tags + ("all-special",))
             seen.add(case.id)
             cases.append(case)
     return cases

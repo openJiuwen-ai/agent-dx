@@ -28,6 +28,10 @@ def parser():
     p.add_argument("--binary-dir", type=Path)
     p.add_argument("--work-root", type=Path)
     p.add_argument("--case-timeout", type=int, default=600)
+    p.add_argument(
+        "--allow-performance", action="store_true",
+        help="explicit measurement opt-in; does not establish a performance SLA",
+    )
     return p
 
 
@@ -87,13 +91,23 @@ def main(argv=None):
         print(
             json.dumps(
                 [
-                    {"id": c.id, "suites": c.tags, "mode": c.mode, "groups": c.groups, "requires_rust_test_elf": c.rust}
+                    {"id": c.id, "suites": c.tags, "mode": c.mode, "groups": c.groups,
+                     "requires_rust_test_elf": c.rust, "purpose": c.purpose,
+                     "observes_cache_opens": c.observe_cache,
+                     "requires_performance_opt_in": c.purpose == "performance",
+                     "dfs_profile": vars(c.profile) if c.profile is not None else None}
                     for c in selected
                 ],
                 indent=2,
             )
         )
         return 0
+    if any(c.purpose == "performance" for c in selected) and not args.allow_performance:
+        print(json.dumps({
+            "status": "BLOCKED",
+            "error": "performance requires explicit --allow-performance; no workload started",
+        }), file=sys.stderr)
+        return 2
     if args.env is None or args.binary_dir is None:
         p.error("--env and --binary-dir are required")
     try:
@@ -155,7 +169,7 @@ def main(argv=None):
     }
     sources = {
         str(f.relative_to(Path(__file__).parent)): sha256(f)
-        for folder in ("fixtures", "suites")
+        for folder in ("fixtures", "suites", "tools")
         for f in (Path(__file__).parent / folder).rglob("*.py")
     }
     sources["run.py"] = sha256(__file__)
@@ -169,7 +183,12 @@ def main(argv=None):
             "mode": case.mode,
             "kind": configs[case.id]["kind"],
             "status": "NOT_RUN",
+            "purpose": case.purpose,
+            "observes_cache_opens": case.observe_cache,
+            "dfs_profile": vars(case.profile) if case.profile is not None else None,
         }
+        if case.purpose == "performance":
+            entry["performance_acceptance"] = "NOT_EVALUATED"
         report["cases"].append(entry)
         if stop:
             continue

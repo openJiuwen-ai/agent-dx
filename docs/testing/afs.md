@@ -11,7 +11,8 @@ AFS 拥有自己的 UT 和组件集成测试；部署及公共用户 E2E 统一�
 五步原则、现状、待补与优先级统一维护在 [同页测试规范](test-strategy.html)；
 可直接定位 [单VM](test-strategy.html#step-2)、[多namespace](test-strategy.html#step-3)、
 [Buildkite](test-strategy.html#step-4) 和 [固定包验收](test-strategy.html#step-5)。
-第二/三步基础已实现，冻结产物真实20case通过；当前源码新Rust构建阻塞、可选SSH多VM未实跑，CI产品接线仍待补。
+第二/三步共用入口已实现；当前基础注册为22case。旧冻结产物20case通过只属于历史批次；
+新增缓存/权限检查的实际资格以当前候选结果为准。可选SSH多VM与CI产品接线仍须独立验收。
 
 Agent FS（AFS） 在目标仓中的验收按“目标仓源码、目标仓二进制、目标仓环境证据”登记。DMS/AFS 历史证据保留来源版本、环境和判据，可用于追溯和风险判断，但不自动升级为 Agent DX 当前候选结论。
 
