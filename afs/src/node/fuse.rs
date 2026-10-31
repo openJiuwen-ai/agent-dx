@@ -336,6 +336,38 @@ fn configure_readahead(
     Ok(())
 }
 
+thread_local! {
+    /// Per-thread scratch buffer for inline local reads.
+    ///
+    /// A single global `Mutex<Vec<u8>>` used to guard this buffer, and because
+    /// `inline_local_read_data` returns `Cow::Borrowed` over it the guard had to
+    /// stay alive until `reply.data()` finished. That serialised handle lookup,
+    /// the backend read and the `/dev/fuse` reply across *all* files on the
+    /// mount. Taking the buffer out of the thread-local and returning it after
+    /// the reply keeps the reuse without holding any lock across I/O.
+    static INLINE_READ_SCRATCH: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Take this thread's scratch buffer, leaving an empty one behind.
+fn take_inline_read_scratch() -> Vec<u8> {
+    INLINE_READ_SCRATCH.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+}
+
+/// Return the buffer, dropping it when it grew past the inline limit so a single
+/// oversized read cannot pin a big allocation per thread.
+fn return_inline_read_scratch(buffer: Vec<u8>) {
+    if buffer.capacity() > MAX_INLINE_LOCAL_READ_SCRATCH {
+        return;
+    }
+    INLINE_READ_SCRATCH.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.capacity() < buffer.capacity() {
+            *slot = buffer;
+        }
+    });
+}
+
 fn inline_local_read_data(
     scratch: &mut Vec<u8>,
     size: usize,
@@ -1704,7 +1736,6 @@ pub struct AfsFuse {
     page_cache_ids: Arc<Mutex<PageCacheIdentities>>,
     active_cached_views: Arc<Mutex<ActiveCachedViews>>,
     inode_cache_gates: Arc<InodeCacheGates>,
-    inline_local_read_scratch: Mutex<Vec<u8>>,
     state: Arc<Mutex<FuseState>>,
     file_handle_inodes: Arc<Mutex<HashMap<u64, u64>>>,
     dispatch: FuseDispatch,
@@ -1747,7 +1778,6 @@ impl AfsFuse {
             page_cache_ids: Arc::new(Mutex::new(PageCacheIdentities::default())),
             active_cached_views: Arc::new(Mutex::new(ActiveCachedViews::default())),
             inode_cache_gates: Arc::new(InodeCacheGates::default()),
-            inline_local_read_scratch: Mutex::new(Vec::new()),
             state,
             file_handle_inodes: Arc::new(Mutex::new(HashMap::new())),
             dispatch: FuseDispatch::with_capacity(
@@ -2926,7 +2956,7 @@ impl Filesystem for AfsFuse {
             returned_bytes = tracing::field::Empty,
         );
         if inline_local_read {
-            let mut scratch = self.inline_local_read_scratch.lock().unwrap();
+            let mut scratch = take_inline_read_scratch();
             let result = fuse_span.in_scope(|| {
                 tracing::info_span!("node.fuse.read.execute").in_scope(|| {
                     fuse_span.record("queue_wait_us", 0_u64);
@@ -2960,6 +2990,7 @@ impl Filesystem for AfsFuse {
                     Err(error) => reply.error(fuse_errno(error)),
                 },
             );
+            return_inline_read_scratch(scratch);
             return;
         }
         let run = move || {
