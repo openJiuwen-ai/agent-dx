@@ -3,6 +3,7 @@
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -17,6 +18,10 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
+
+_afs_spec = importlib.util.spec_from_file_location('afs_handoff', Path(__file__).with_name('afs_handoff.py'))
+afs_handoff = importlib.util.module_from_spec(_afs_spec)
+_afs_spec.loader.exec_module(afs_handoff)
 
 BASIC = ('sdk', 'auth', 'capacity', 'placement', 'local-first')
 STANDARD = (
@@ -130,6 +135,7 @@ def validate_identity(package, architecture, commit, ci):
 
 def verify_bundle(directory):
     m = json.loads((directory / 'bundle.json').read_text())
+    afs_handoff.verify_bundle(directory, m)
     if m.get('schema_version') != 1 or sha(directory / 'images.tar') != m.get('archive_sha256'):
         raise ValueError('bundle integrity check failed')
     if sha(directory / 'execd.tar') != m.get('execd_archive_sha256'):

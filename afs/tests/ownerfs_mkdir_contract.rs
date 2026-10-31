@@ -66,8 +66,20 @@ impl Certificates {
                 String::from_utf8_lossy(&output.stderr)
             );
         };
+        // A private config avoids duplicate CA extensions from the host config plus -addext.
+        std::fs::write(
+            dir.join("ca.cnf"),
+            concat!(
+                "[req]\ndistinguished_name=dn\nx509_extensions=ca\nprompt=no\n",
+                "[dn]\nCN=AFS mkdir test CA\n[ca]\n",
+                "basicConstraints=critical,CA:TRUE\nkeyUsage=critical,keyCertSign,cRLSign\n",
+            ),
+        )
+        .unwrap();
         openssl(&[
             "req",
+            "-config",
+            "ca.cnf",
             "-x509",
             "-newkey",
             "rsa:2048",
@@ -76,15 +88,21 @@ impl Certificates {
             "2",
             "-subj",
             "/CN=AFS mkdir test CA",
-            "-addext",
-            "basicConstraints=critical,CA:TRUE",
-            "-addext",
-            "keyUsage=critical,keyCertSign,cRLSign",
             "-keyout",
             "ca.key",
             "-out",
             "ca.pem",
         ]);
+        let ca = Command::new("openssl")
+            .current_dir(&dir)
+            .args(["x509", "-in", "ca.pem", "-noout", "-text"])
+            .output()
+            .unwrap();
+        assert!(ca.status.success());
+        let ca_text = String::from_utf8_lossy(&ca.stdout);
+        assert_eq!(ca_text.matches("X509v3 Basic Constraints").count(), 1);
+        assert_eq!(ca_text.matches("X509v3 Key Usage").count(), 1);
+        assert!(ca_text.contains("CA:TRUE"));
         std::fs::write(dir.join("leaf.ext"),
             "basicConstraints=critical,CA:FALSE\nsubjectAltName=DNS:localhost\nextendedKeyUsage=serverAuth,clientAuth\n").unwrap();
         let mut trusted = HashMap::new();
