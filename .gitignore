@@ -55,3 +55,6 @@ env/
 
 # Local cloud access keys
 credentials*.csv
+
+# Local multi-host validation scratch (scripts, logs, binaries)
+.validation/

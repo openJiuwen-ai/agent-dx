@@ -157,6 +157,15 @@ impl DfsExternalBackendConfig {
 #[command(version, about = "AFS process foundation")]
 /// 命令行输入层。None 表示用户未传入，因此应继续考虑 TOML 与最终默认值。
 pub struct Cli {
+    /// Print the compiled-in build provenance and exit.
+    ///
+    /// The crate version alone cannot distinguish two builds of the same
+    /// source tree, which matters when several users share a host and need to
+    /// prove which binary is running. This reports the commit, whether the
+    /// working tree was dirty, and the build timestamp captured at compile
+    /// time by `build.rs`.
+    #[arg(long)]
+    pub build_info: bool,
     #[arg(long)]
     pub config: Option<PathBuf>,
     #[arg(long)]
@@ -403,6 +412,24 @@ impl Cli {
     /// Parse the process arguments with standard Clap exit codes and formatting.
     /// Retired backend options get a migration hint before the original error;
     /// they are never accepted or mapped to a different authority implicitly.
+    /// Provenance of the running binary, for `--build-info`.
+    ///
+    /// Reports identity rather than the crate version: on a shared host the
+    /// version is identical across unrelated builds, so it cannot answer
+    /// "is this the binary I just built".
+    #[must_use]
+    pub fn build_info() -> String {
+        let commit = option_env!("AFS_BUILD_COMMIT").unwrap_or("unknown");
+        let dirty = option_env!("AFS_BUILD_DIRTY").unwrap_or("unknown");
+        let built = option_env!("AFS_BUILD_TIME").unwrap_or("unknown");
+        format!(
+            "afs {} ({commit}, {dirty}, built {built}, {}/{})",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        )
+    }
+
     pub fn parse_process() -> Self {
         let arguments: Vec<_> = std::env::args_os().collect();
         match Self::try_parse_from(&arguments) {

@@ -8,7 +8,12 @@ use afs::{
 };
 #[tokio::main]
 async fn main() -> Result<(), BoxError> {
-    let cfg = Config::resolve(Role::Meta, Cli::parse_process())?;
+    let cli = Cli::parse_process();
+    if cli.build_info {
+        println!("{}", Cli::build_info());
+        return Ok(());
+    }
+    let cfg = Config::resolve(Role::Meta, cli)?;
     if cfg.print_config {
         println!("{}", serde_json::to_string_pretty(&cfg)?);
         return Ok(());

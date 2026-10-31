@@ -12,7 +12,12 @@ use afs::{
 static ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() -> Result<(), BoxError> {
-    let cfg = Config::resolve(Role::Node, Cli::parse_process())?;
+    let cli = Cli::parse_process();
+    if cli.build_info {
+        println!("{}", Cli::build_info());
+        return Ok(());
+    }
+    let cfg = Config::resolve(Role::Node, cli)?;
     if cfg.print_config {
         println!("{}", serde_json::to_string_pretty(&cfg)?);
         return Ok(());
