@@ -192,6 +192,7 @@ impl GrpcChunkTransfer {
             .unwrap_or(self.timeout);
         let result = async {
             tokio::time::timeout(timeout, async {
+                let prepare_started = std::time::Instant::now();
                 let channel = self
                     .peers
                     .channel(
@@ -234,6 +235,7 @@ impl GrpcChunkTransfer {
                     .read_ranges(wire_request)
                     .await
                     .map_err(peer_status_error)?;
+                self.observe_phase("prepare", prepare_started.elapsed());
                 self.note_native_batch_capability(batch, response.metadata());
                 let fast_accepted = fast_requested
                     && response
@@ -251,8 +253,32 @@ impl GrpcChunkTransfer {
                 decoder.metrics = self.peers.read_work_metrics.clone();
                 decoder.mode = self.peers.read_crc_mode;
                 decoder.fast_open = fast_accepted;
-                while let Some(frame) = stream.message().await.map_err(peer_status_error)? {
-                    decoder.accept(frame)?;
+                let mut transfer = Duration::ZERO;
+                let mut stream_error = None;
+                loop {
+                    let wait_started = std::time::Instant::now();
+                    let next = stream.message().await.map_err(peer_status_error);
+                    transfer += wait_started.elapsed();
+                    match next {
+                        Ok(Some(frame)) => {
+                            if let Err(error) = decoder.accept(frame) {
+                                stream_error = Some(error);
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            stream_error = Some(error);
+                            break;
+                        }
+                    }
+                }
+                let (validate, scatter) = decoder.take_phases();
+                self.observe_phase("transfer", transfer);
+                self.observe_phase("validate", validate);
+                self.observe_phase("scatter", scatter);
+                if let Some(error) = stream_error {
+                    return Err(error);
                 }
                 decoder.finish()?;
                 if fast_accepted {
@@ -309,6 +335,10 @@ pub(super) struct CrcRangeDecoder<'a> {
     cursor: usize,
     complete: bool,
     metrics: Option<ReadWorkMetrics>,
+    /// Descriptor and checksum verification time of this attempt.
+    validate: Duration,
+    /// Frame-to-destination copy time of this attempt.
+    scatter: Duration,
 }
 
 impl<'a> CrcRangeDecoder<'a> {
@@ -331,6 +361,8 @@ impl<'a> CrcRangeDecoder<'a> {
             cursor: 0,
             complete: false,
             metrics: None,
+            validate: Duration::ZERO,
+            scatter: Duration::ZERO,
         })
     }
     pub(super) fn new_fast(
@@ -376,6 +408,7 @@ impl<'a> CrcRangeDecoder<'a> {
                 if self.fast_open && self.mode == crate::config::DfsReadCrcMode::Off {
                     return Ok(());
                 }
+                let validate_started = std::time::Instant::now();
                 if let Some(metrics) = &self.metrics {
                     metrics.check(crate::node::read_work::ReadCheck::DescriptorDecode);
                 }
@@ -392,6 +425,7 @@ impl<'a> CrcRangeDecoder<'a> {
                     ));
                 }
                 self.table = Some(table);
+                self.validate += validate_started.elapsed();
             }
             Some(dfs_read_ranges_frame::Body::Data(data)) => {
                 if !self.header_seen
@@ -400,6 +434,7 @@ impl<'a> CrcRangeDecoder<'a> {
                 {
                     return Err(dfs_protocol_error("CRC data order/frame size mismatch"));
                 }
+                let scatter_started = std::time::Instant::now();
                 let next = self
                     .cursor
                     .checked_add(data.len())
@@ -416,8 +451,10 @@ impl<'a> CrcRangeDecoder<'a> {
                     metrics.copy("frame_to_attempt", data.len() as u64);
                 }
                 self.cursor = next;
+                self.scatter += scatter_started.elapsed();
             }
             Some(dfs_read_ranges_frame::Body::Completion(done)) => {
+                let validate_started = std::time::Instant::now();
                 let complete_segments = op.chunk_offset.is_multiple_of(SEGMENT as u64)
                     && (op.length.is_multiple_of(SEGMENT as u64)
                         || op.chunk_offset.checked_add(op.length) == Some(self.chunk.length));
@@ -502,10 +539,18 @@ impl<'a> CrcRangeDecoder<'a> {
                     }
                 }
                 self.complete = true;
+                self.validate += validate_started.elapsed();
             }
             None => return Err(dfs_protocol_error("empty CRC frame")),
         }
         Ok(())
+    }
+    /// Returns the verification and copy time accumulated by this attempt.
+    pub(super) fn take_phases(&mut self) -> (Duration, Duration) {
+        (
+            std::mem::take(&mut self.validate),
+            std::mem::take(&mut self.scatter),
+        )
     }
     pub(super) fn finish(self) -> afs_error::Result<()> {
         if !self.complete {
@@ -596,6 +641,27 @@ mod tests {
             }
         }
         (chunk, request, frames, expected)
+    }
+
+    #[test]
+    fn crc_stream_accumulates_validate_and_scatter_phases() {
+        let len = SEGMENT * 2;
+        let (chunk, request, frames, _expected) =
+            mode_frames(0, len, crate::config::DfsReadCrcMode::Both, false);
+        let mut out = vec![0u8; len];
+        let mut decoder = CrcRangeDecoder::new(&request, &chunk, &mut out).unwrap();
+        for frame in frames {
+            decoder.accept(frame).unwrap();
+        }
+        let (validate, scatter) = decoder.take_phases();
+        assert!(
+            scatter > Duration::ZERO,
+            "frame copies are timed: {scatter:?}"
+        );
+        assert!(
+            validate > Duration::ZERO,
+            "descriptor and segment checks are timed: {validate:?}"
+        );
     }
     #[test]
     fn crc_read_modes_receiver_detects_corruption_off_explicitly_does_not() {
