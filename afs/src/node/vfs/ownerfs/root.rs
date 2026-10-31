@@ -1226,14 +1226,26 @@ impl RootManager {
 
     /// D4: 完整删除一个 active root。
     ///
-    /// 调用顺序：revoke → 缓存移除 → Meta deactivate → 物理目录 → catalog。
+    /// 调用顺序：revoke → 缓存移除 → 物理目录 → Meta deactivate → catalog。
     /// 每步幂等，部分失败可安全重试。并发 rmdir 中，缓存移除是线性化点：
     /// 第二个调用在缓存中找不到 root，返回 invalid_grant（FUSE 层转 ENOENT）。
-    /// 物理目录删除先于 catalog 移除：非空目录使 remove_dir 返回 ENOTEMPTY 时
-    /// catalog 记录仍保留，root 可被重启 reconcile 继续收敛，不会成为
-    /// 控制面记录先于数据被清除的孤儿（review: 非空 root 删除失败会丢失控制面记录）。
-    /// Meta 不可达时在 deactivate 处失败并保持 catalog/物理目录不变，
-    /// 残留记录由 reconcile_on_startup 的 zombie 检测在下次启动时清理。
+    ///
+    /// 关键点是 **ENOTEMPTY 时保留 catalog 记录**（H19），不是调整步骤顺序。
+    /// AFS 的 `revoke_root` 能撤掉 AFS peer 的授权，但撤不到内核 NFS 客户端
+    /// ——outlet 让"目录仍被打开"成为常态，`remove_dir` 返回 ENOTEMPTY 是
+    /// 预期而非异常。此前实现在 ENOTEMPTY 时保留 catalog，但
+    /// `reconcile_on_startup` 会在下次启动时把它丢弃，导致目录变成无主孤儿。
+    /// 现在 catalog 记录贯穿保存，由 [`RootManager::reclaim_deferred`] 回收。
+    ///
+    /// Meta deactivate 保持在物理删除之前：若反过来，Meta 不可达时目录已删，
+    /// 会留下"Meta 仍 Active、数据已不存在"的僵尸 root。
+    ///
+    /// **ENOTEMPTY 不算失败**（H20）：目录暂不可删时仍完成控制面删除（名字
+    /// 应从所有节点消失），并保留 catalog 记录作为"该目录仍需回收"的持久证据，
+    /// 由 [`RootManager::reclaim_deferred`] 异步重试。对调用者返回成功。
+    ///
+    /// Meta 不可达时在 deactivate 处失败，此时物理目录可能已删；catalog 记录
+    /// 保留，reconcile_on_startup 的 zombie 检测会在下次启动时收敛。
     pub fn delete_root(&self, id: &RootId) -> Result<()> {
         afs_logging::info!("root.delete_root.start"; "root_id" => ?id);
         let result = self.delete_root_inner(id);
@@ -1269,26 +1281,108 @@ impl RootManager {
         }
         afs_logging::info!("root.delete_root.cache_removed"; "root_id" => ?id);
 
-        // 3. Meta deactivate（epoch 从 catalog 获取）。
         let records = self.catalog.scan_roots()?;
         let record = records
             .into_iter()
             .find(|record| &record.id == id)
             .ok_or_else(|| invalid_grant("root catalog record not found"))?;
+
+        // 3. Meta deactivate（epoch 来自 catalog）。名字由此从所有节点消失。
+        //
+        // 必须先于物理删除：Meta 不可达时这里失败并提前返回，此时目录与
+        // catalog 均完好、状态一致可重试。若反过来先删目录，Meta 失败就会
+        // 留下"Meta 仍 Active、数据已不存在"的僵尸 root——名字继续发布，
+        // 消费者 bind 到空路径，比保留一个待回收目录糟得多。
         self.meta
             .deactivate_root(id, record.epoch, &self.local_node_id, &self.session_id)?;
         afs_logging::info!("root.delete_root.meta_deactivated"; "root_id" => ?id, "epoch" => record.epoch);
 
-        // 4. 删除物理目录。先于 catalog 移除：目录删除失败（如非空）时
-        //    catalog 记录仍存在，root 可被重启 reconcile 重新收敛或继续清理。
-        self.remove_abandoned_dir(&record.data_dir)?;
-        afs_logging::info!("root.delete_root.dir_removed"; "root_id" => ?id, "data_dir" => ?record.data_dir);
+        // 4. 尝试物理删除。
+        let dir_removed = match self.remove_abandoned_dir(&record.data_dir) {
+            Ok(()) => {
+                afs_logging::info!("root.delete_root.dir_removed"; "root_id" => ?id, "data_dir" => ?record.data_dir);
+                true
+            }
+            Err(error) if error.code() == afs_error::IO_DIRECTORY_NOT_EMPTY => {
+                // H20：不是失败，是"现在不能删"。留下 catalog 记录供回收循环重试。
+                afs_logging::warn!(
+                    "root.delete_root.dir_busy";
+                    "root_id" => ?id,
+                    "data_dir" => ?record.data_dir,
+                );
+                false
+            }
+            Err(error) => return Err(error),
+        };
 
-        // 5. 清除 catalog 条目。
-        self.catalog.remove_prepared_root(&record)?;
-        afs_logging::info!("root.delete_root.catalog_removed"; "root_id" => ?id);
+        // 5. 仅在物理目录确实删掉时移除 catalog 条目（H19）。
+        //    未删掉时保留记录：它是"该目录仍待回收"的唯一持久证据，
+        //    由 reclaim_deferred 周期性重试。
+        if dir_removed {
+            self.catalog.remove_prepared_root(&record)?;
+            afs_logging::info!("root.delete_root.catalog_removed"; "root_id" => ?id);
+        } else {
+            afs_logging::info!(
+                "root.delete_root.catalog_deferred";
+                "root_id" => ?id,
+                "data_dir" => ?record.data_dir,
+            );
+        }
 
         Ok(())
+    }
+
+    /// 回收一次延迟删除的目录（H21）。
+    ///
+    /// 只处理 catalog 中已逻辑删除（Meta 无 active 记录）但物理目录仍存在的
+    /// 条目。调用方按 `outlet_reclaim.reclaim_interval_ms` 周期性调用；
+    /// 本方法不持 `roots` 锁、不阻塞请求路径。
+    ///
+    /// 返回 `(removed, pending)`：本轮成功回收数与仍待回收数。
+    /// 未知错误（非 ENOENT/ENOTEMPTY）中止本轮并上抛，交由调用方告警。
+    pub fn reclaim_deferred(&self) -> Result<(usize, usize)> {
+        let mut removed = 0;
+        let mut pending = 0;
+        for record in self.catalog.scan_roots()? {
+            // 仍被 Meta 视为 active 的 root 不属回收范围（删到一半而 Meta
+            // 未成功 deactivate 的情形由 rmdir 重试处理）。
+            if self
+                .roots
+                .read()
+                .map_err(|_| invalid_grant("root cache lock poisoned"))?
+                .contains_key(&record.id)
+            {
+                continue;
+            }
+            match self.remove_abandoned_dir(&record.data_dir) {
+                Ok(()) => {
+                    self.catalog.remove_prepared_root(&record)?;
+                    removed += 1;
+                    afs_logging::info!(
+                        "root.reclaim.completed";
+                        "root_id" => ?record.id,
+                        "data_dir" => ?record.data_dir,
+                    );
+                }
+                Err(error) if error.code() == afs_error::IO_DIRECTORY_NOT_EMPTY => {
+                    pending += 1;
+                }
+                Err(error) if error.code() == afs_error::IO_NOT_FOUND => {
+                    // 目录已不在：条目失去意义，直接出队。
+                    self.catalog.remove_prepared_root(&record)?;
+                    removed += 1;
+                }
+                Err(error) => {
+                    afs_logging::warn!(
+                        "root.reclaim.failed";
+                        "root_id" => ?record.id,
+                        "error" => error.to_string(),
+                    );
+                    return Err(error);
+                }
+            }
+        }
+        Ok((removed, pending))
     }
 
     /// 本进程会话确认失效时封闭全部根，不能继续用旧授权准入。
@@ -1412,22 +1506,26 @@ impl RootManager {
             let Some(location) = active.get(&record.id) else {
                 // 两种来源：(1) Abort CAS 后崩溃、本地清理前的 pending reservation；
                 // (2) delete_root 已提交 Meta deactivate 但物理目录/catalog 清理被
-                // 中断（含非空目录删除失败）。两者都表示该 root 已逻辑删除：收敛为
-                // 移除 catalog 条目；物理目录非空（ENOTEMPTY）时记录警告并保留，
-                // 等待人工清理，不阻塞启动（review: 非空 root 删除失败会丢失控制面记录）。
+                // 中断（含非空目录删除失败）。两者都表示该 root 已逻辑删除。
+                //
+                // 非空目录（ENOTEMPTY）时**保留 catalog 记录**（H19）：它是"该
+                // 目录仍待回收"的唯一持久证据，丢弃它会把目录变成无主孤儿。
+                // 记录保留后由 `reclaim_deferred` 周期性重试，不再依赖人工清理。
                 match self.remove_abandoned_dir(&record.data_dir) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        self.catalog.remove_prepared_root(&record)?;
+                    }
                     Err(error) if error.code() == afs_error::IO_DIRECTORY_NOT_EMPTY => {
                         afs_logging::warn!(
-                            "root.reconcile.leftover_data_dir";
+                            "root.reconcile.deferred_data_dir";
                             "root_id" => ?record.id,
                             "data_dir" => ?record.data_dir,
                             "error" => error.to_string(),
                         );
+                        // catalog 条目保留，等待 reclaim_deferred 回收。
                     }
                     Err(error) => return Err(error),
                 }
-                self.catalog.remove_prepared_root(&record)?;
                 continue;
             };
             if location.epoch != record.epoch || location.home_node_id != self.local_node_id {
@@ -2942,21 +3040,29 @@ mod tests {
         // 制造非空目录：删除必然 ENOTEMPTY。
         std::fs::write(temp.path().join(data_dir.as_path()).join("payload"), b"x").unwrap();
 
-        // 删除在物理目录一步失败：Meta 已 deactivate、缓存已移除，
-        // 但 catalog 记录必须保留，否则数据成为无法重新准入的孤儿。
-        let err = manager.delete_root(&id).unwrap_err();
-        assert_eq!(err.code(), afs_error::IO_DIRECTORY_NOT_EMPTY);
+        // ENOTEMPTY 不是失败（H20）：控制面删除仍然完成，调用者得到 Ok。
+        manager.delete_root(&id).unwrap();
 
-        // catalog 记录仍在（manager 持有独占锁，先释放再验证）。
+        // Meta 记录已删 → 名字从所有节点消失。
+        assert!(meta.0.lock().unwrap().active.is_none());
+        // 缓存已移除 → 本节点不再准入。
+        assert!(manager.cached_local_roots().unwrap().is_empty());
+        // 物理目录仍在（对端仍持有，删不掉）。
+        assert!(temp.path().join(data_dir.as_path()).exists());
+
+        // catalog 记录必须保留（H19）：它是"该目录仍待回收"的唯一持久证据。
         drop(manager);
         let locked = LocalFsRootCatalog::new(disk.clone())
             .lock_and_open()
             .unwrap();
-        assert_eq!(locked.scan_roots().unwrap().len(), 1);
+        assert_eq!(
+            locked.scan_roots().unwrap().len(),
+            1,
+            "catalog entry must survive so reclaim can find the directory"
+        );
         drop(locked);
 
-        // 重启 reconcile：catalog 有记录但 Meta 无 active，收敛为移除
-        // catalog 条目；非空目录被保留并告警，不阻塞启动。
+        // 重启 reconcile 也必须保留该条目，不能像旧实现那样丢弃。
         let manager = RootManager::open(
             "node-a".into(),
             "session-a".into(),
@@ -2965,7 +3071,73 @@ mod tests {
         )
         .unwrap();
         assert!(manager.cached_local_roots().unwrap().is_empty());
+
+        // 回收：句柄仍在 → 仍是 ENOTEMPTY，报告 pending 而不是删除条目。
+        let (removed, pending) = manager.reclaim_deferred().unwrap();
+        assert_eq!((removed, pending), (0, 1));
+        assert!(temp.path().join(data_dir.as_path()).exists());
+
+        // 对端释放句柄（目录清空）→ 下一轮回收成功出队。
+        std::fs::remove_file(temp.path().join(data_dir.as_path()).join("payload")).unwrap();
+        let (removed, pending) = manager.reclaim_deferred().unwrap();
+        assert_eq!((removed, pending), (1, 0));
+        assert!(!temp.path().join(data_dir.as_path()).exists());
+
+        drop(manager);
+        let locked = LocalFsRootCatalog::new(disk.clone())
+            .lock_and_open()
+            .unwrap();
+        assert!(
+            locked.scan_roots().unwrap().is_empty(),
+            "successful reclaim must drain the catalog entry"
+        );
+    }
+
+    /// H19：物理删除成功后，catalog 条目应与目录一同消失，不残留待回收项。
+    #[test]
+    fn delete_root_drains_catalog_when_dir_removed() {
+        let temp = tempfile::tempdir().unwrap();
+        let disk = Arc::new(LocalFs::open(temp.path()).unwrap());
+        let meta = Arc::new(RecoveryMeta::default());
+        let name = OsStr::new("clean");
+        let id = root_id_from_name(name).unwrap();
+        let data_dir = root_data_dir(name, 1).unwrap();
+        disk.mkdir(&data_dir, 0o700).unwrap();
+        disk.sync_root().unwrap();
+        meta.0.lock().unwrap().active = Some(RootLocation {
+            id: id.clone(),
+            epoch: 1,
+            home_node_id: "node-a".into(),
+            home_session_id: "session-a".into(),
+        });
+        meta.0.lock().unwrap().active_prepare_id = Some("prepare-1:session-a".into());
+        let catalog = LocalFsRootCatalog::new(disk.clone());
+        let locked = catalog.lock_and_open().unwrap();
+        locked
+            .persist_prepared_root(&LocalRootRecord {
+                id: id.clone(),
+                name: name.into(),
+                epoch: 1,
+                data_dir: data_dir.clone(),
+                local_prepare_id: "prepare-1:session-a".into(),
+            })
+            .unwrap();
+        drop(locked);
+
+        let manager = RootManager::open(
+            "node-a".into(),
+            "session-a".into(),
+            meta.clone(),
+            disk.clone(),
+        )
+        .unwrap();
+        manager.delete_root(&id).unwrap();
+        assert!(!temp.path().join(data_dir.as_path()).exists());
         assert!(meta.0.lock().unwrap().active.is_none());
+
+        // 无待回收项：回收循环应为空转。
+        assert_eq!(manager.reclaim_deferred().unwrap(), (0, 0));
+
         drop(manager);
         let locked = LocalFsRootCatalog::new(disk.clone())
             .lock_and_open()

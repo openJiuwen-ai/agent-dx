@@ -526,16 +526,15 @@ ENOTEMPTY，状态变成"Meta 已无记录、物理目录仍在、catalog 记录
 ### 8.2 第一段：控制面 + 名字面（同步，必须成功）
 
 ```
-1. revoke_root                                  阻止新 enter_root
-2. roots 缓存移除                                并发 rmdir 线性化点
-3. 物理目录 remove_dir：
+1. revoke_root                        阻止新 enter_root
+2. roots 缓存移除                      并发 rmdir 线性化点
+3. Meta deactivate_root               名字从所有节点消失
+4. 物理目录 remove_dir：
      Ok            → 继续
      ENOENT        → 继续（已不存在）
-     ENOTEMPTY     → 继续，标记"待回收"（不是失败）
-     其他          → 返回错误，Meta 记录保持不动（可重试）
-4. Meta deactivate_root                          名字从所有节点消失
-5. catalog 记录：仅在步骤 3 成功时移除；
-   待回收时保留，并写入 defer_until
+     ENOTEMPTY     → 继续，保留 catalog 记录（不是失败）
+     其他          → 返回错误
+5. catalog 记录：仅在步骤 4 成功时移除
 ```
 
 **硬规则 H19**：物理目录**未能删除**时，**不得**移除 catalog 记录。
@@ -544,39 +543,59 @@ catalog 记录是"这个目录还该被清"的唯一持久证据，删掉它就�
 **硬规则 H20**：`ENOTEMPTY` 在本路径上**不是失败**，是"现在不能删"。
 不得向 FUSE 返回 ENOTEMPTY，也不得放弃回收。
 
-注意顺序调整的方向：把 `Meta deactivate` 从步骤 3 之前挪到之后。代价是
-"删除过程中名字仍可见"（读者可能拿到一个即将消失的 workspace），收益是
-**物理删除失败时 Meta 记录还在，下一轮 rmdir 或对账可继续**。在 fail-open
-语义下前者可接受——home 死了名字本来也不消失。
+**顺序为何是 Meta 先、物理目录后（而不是反过来）。** 这看起来有违直觉——
+先删 Meta 意味着 ENOTEMPTY 时会留下"Meta 无记录、目录仍在"。但反过来更糟：
+
+| 顺序 | Meta 不可达时的结果 |
+|---|---|
+| **Meta 先（本规范）** | 步骤 3 失败并提前返回，**目录、catalog 均完好**，状态一致可重试 |
+| 目录先 | 目录已删、Meta 仍 Active → **僵尸 root**：名字继续发布，消费者 bind 到空路径，且再也无法通过 rmdir 修复（cache 已移除） |
+
+ENOTEMPTY 的残留是**可回收的**（有 catalog 记录 + 回收循环）；
+僵尸 root 是**不可修复的**。因此保留现有顺序，只修 catalog 的生命周期。
+
+**真正的缺陷与修复。** 现有实现在 ENOTEMPTY 时确实保留了 catalog 记录
+（`delete_root_inner` 步骤 5 未执行），但 `reconcile_on_startup`
+（`root.rs:1211`）在下次启动时**把它丢弃**（记 `leftover_data_dir` 警告后
+无条件 `remove_prepared_root`）。这才是孤儿目录的成因：记录只多活到下一次
+重启。修复即让 catalog 记录贯穿保存，由 §8.3 的回收循环清空。
 
 ### 8.3 第二段：物理回收（异步、幂等、可重试）
 
-home 节点维护**本地删除队列**，条目来源是 catalog 中 `defer_until` 非零的
-记录（不新增持久化结构，复用现有 catalog）。
+home 节点按固定间隔扫 catalog，回收"Meta 已无记录、目录仍在"的条目。
+**不新增持久化字段**：catalog 的 `LocalRootRecord` 保持不变（加
+`defer_until`/`attempts` 会改 `WireRootRecord` 格式，代价不值得——退避由
+轮询间隔本身承担，见 §8.4）。
 
 ```
-每 reclaim_interval_ms（默认 60000）：
-  for record in catalog.deferred():
-    if now < record.defer_until: continue
+每 outlet_reclaim.reclaim_interval_ms（默认 60000），调用
+RootManager::reclaim_deferred()：
+  for record in catalog.scan_roots():
+    if roots 缓存仍含 record.id: continue        // Meta 仍 Active，不属回收
     match disk.remove_dir(record.data_dir):
-      Ok       → catalog.remove_prepared_root(record)       // 出队
-      NotFound → catalog.remove_prepared_root(record)       // 已消失，出队
-      ENOTEMPTY→ record.attempts += 1
-                 record.defer_until = now + backoff(attempts)
-                 指标 outlet_pending_deletions.inc()
-      other    → 告警 outlet.reclaim.failed，保留条目，下轮重试
+      Ok        → catalog.remove_prepared_root(record)   // 出队
+      NotFound  → catalog.remove_prepared_root(record)   // 已消失，出队
+      ENOTEMPTY → 跳过，计入 pending（不是错误）
+      other     → 告警 root.reclaim.failed，中止本轮并上抛
+  返回 (removed, pending)
 ```
 
-**硬规则 H21**：回收循环不得阻塞任何请求路径，不得持有 `roots` 锁。
-它只读写 catalog 与磁盘。
+**硬规则 H21**：回收循环不得阻塞任何请求路径，不得持有 `roots` 锁跨越
+磁盘操作（只需一次读锁做成员判断）。它只读写 catalog 与磁盘。
+
+**为什么不复用 `reconcile_on_startup`**：那个函数（a）只在启动时跑一次，
+（b）在 ENOTEMPTY 时丢弃 catalog 记录。回收循环是它的运行期补位，且不做
+丢弃——两者的关键差别就在 H19。
 
 ### 8.4 退避与可观测性
 
-对端句柄可能持续数小时（B 的容器一直开着文件），因此退避不能太激进：
+对端句柄可能持续数小时（B 的容器一直开着文件）。首版**不做逐条退避记账**
+——`reclaim_interval_ms`（默认 60s）本身就是退避粒度：每轮只尝试一次，
+ENOTEMPTY 的下轮再来。这在句柄持续数小时的场景下开销可忽略（每分钟一次
+`rmdir` 系统调用），而省掉了持久化 `attempts`/`defer_until` 的复杂度。
 
-```
-backoff(attempts) = min(60s × 2^(attempts-1), 30min)
-```
+需要更细的逐条退避时（例如待回收条目达到数百），再引入记账；届时应作为
+catalog 的**可选**字段并带 `#[serde(default)]`，避免破坏既有记录。
 
 **硬规则 H22**：必须暴露指标：
 
@@ -645,7 +664,6 @@ generation_grace_ms = 120000         # 可选，默认 120000；H11 旧代目录
 
 [outlet_reclaim]
 reclaim_interval_ms = 60000          # 可选，默认 60000；§8.3 物理回收轮询间隔
-backoff_max_minutes = 30             # 可选，默认 30；§8.4 退避上限
 ```
 
 - **H12**：节点侧 outlet 组件不读取 `outlet_users_root` 内容（数据路径
@@ -678,7 +696,7 @@ backoff_max_minutes = 30             # 可选，默认 30；§8.4 退避上限
 | T4 | 配置与接线 | 三路径 all-or-none 校验、`node.rs` 启动接线、`[outlet_mirror]`、H11 取值校验 | 配置校验测试、启动 fail-fast 测试、grace 下限校验测试 |
 | T5 | 部署资产 | 两节点部署脚本（fstab 示例含 `softerr` 等参数、nfsd 导出示例含**导出 IP 与成员表一致性检查**、挂载点 0555）、`docs/deployment/afs.md`、架构文档、README、**存量迁移步骤（H17）** | `python3 build/docs/check.py`、`git diff --check`、导出范围核对脚本（TC20） |
 | T6 | 双节点运行验证 | §13 全部用例 | 验证报告（明确"非多 VM/HA 证明"的边界声明） |
-| T7 | 两段式删除 | `delete_root_inner` 重排顺序（H19/H20）+ 回收循环（H21）+ 指标（H22）+ `[outlet_reclaim]` 配置 | 单元测试：ENOTEMPTY 时 Meta 记录保留、catalog 不移除、回收重试成功；指标存在性测试 |
+| T7 | 两段式删除 | ENOTEMPTY 不再上抛 + catalog 记录贯穿保存（H19/H20，含修 `reconcile_on_startup` 丢弃条目的缺陷）+ `reclaim_deferred` 回收循环（H21）+ `[outlet_reclaim]` 配置 | 单元测试：ENOTEMPTY 时 delete_root 返回 Ok、Meta 已删、catalog 保留、重启对账不丢弃、回收重试成功出队；目标 0 残留 |
 
 提交按 conventional commits + 单条 Signed-off-by；T1-T4 一组（行为），
 T5-T6 一组（资产与证据），不混入无关变更。
@@ -708,7 +726,7 @@ T5-T6 一组（资产与证据），不混入无关变更。
 | TC18 | H11 取值约束 | `interval_ms` 或 `actimeo` 调大至违反 `grace ≥ max(interval×10, actimeo×2)` 时，启动失败并指明约束 |
 | TC19 | NFS 路径不经 AFS 授权（§6.5) | 在 B 上对 `/public/<name>` 做 IO：A 的 `afs-node` 日志无 `validate_root_access` / `ValidateRootAccess` 调用；B 侧无任何 `RootGrant` |
 | TC20 | 导出范围核对（H18） | 部署检查脚本：`/etc/exports` 的客户端集合与成员表一致；加入非成员 IP 时脚本报错 |
-| TC21 | 删除时有远端句柄（H19/H20） | B 容器持有 agent1 内文件句柄，A 执行 rmdir：`/public/agent1` ≤250ms 摘除、**Meta 记录保留**、catalog 记录保留且 `defer_until` 已设置；FUSE 不返回 ENOTEMPTY |
+| TC21 | 删除时有远端句柄（H19/H20） | B 容器持有 agent1 内文件句柄，A 执行 rmdir：FUSE 返回成功（不报 ENOTEMPTY）、`/public/agent1` ≤250ms 摘除、Meta 记录已删、**catalog 记录保留**、物理目录仍在 |
 | TC22 | 回收重试（H21） | 句柄释放后下一轮回收成功：目录删除、catalog 出队、`outlet_pending_deletions` 归零 |
 | TC23 | 同名重建与待回收并存（§8.5） | 旧代待回收期间同名重建：新代可正常读写；旧代回收只删旧代 epoch 目录，新一代不受影响 |
 | TC24 | 回收指标（H22） | 持续 ENOTEMPTY 时 `outlet_pending_deletions` 与 `outlet_reclaim_oldest_age_seconds` 正确增长 |
@@ -748,12 +766,11 @@ T5-T6 一组（资产与证据），不混入无关变更。
   目录会长期滞留。指标 `outlet_reclaim_oldest_age_seconds > 24h` 是唯一的
   发现手段。明确不做强制回收——在 NFS 数据面上强制删除会让对端收到 ESTALE，
   比磁盘泄漏更糟。
-- **R10 删除期间名字仍可见**：H19 把 Meta deactivate 挪到物理删除之后，
-  因此"正在删除"的窗口内（一次 `remove_dir` 的耗时，通常亚毫秒，最坏
-  受 `softerr` 的 `timeo × retrans` 约束）该名字仍可能被消费方拿到。
-  在 fail-open 语义下可接受：拿到的名字随即可用性由数据面决定，
-  且窗口结束后必然消失。若需严格"删除即不可见"，须把 Meta deactivate
-  提前，代价是回到孤儿目录问题。
+- **R10 僵尸 root 优于残留目录（已定序）**：Meta deactivate 保持在物理
+  删除之前。若反过来先删目录，Meta 不可达时会留下"Meta 仍 Active、数据已
+  不存在"的僵尸 root——名字继续发布、消费者 bind 到空路径、且 cache 已移除
+  导致 rmdir 无法重试修复。相比之下，ENOTEMPTY 留下的目录有 catalog 记录
+  且可被回收循环清掉。两者不可修复性不同，本文选择可修复的那个。
 
 - **R8 NFS 导出即可见性边界（H18，接受）**：NFS 数据面绕过 AFS 授权
   （§6.5），因此 AFS 无法对 B 侧访问做 workspace 级授权，
