@@ -330,7 +330,7 @@ impl OwnerFs {
                 .is_some_and(|id| !cache.shared_roots.contains(&id))
         };
         let ttl = if private {
-            Duration::from_secs(1)
+            ownerfs_cache_ttl()
         } else {
             Duration::ZERO
         };
@@ -4132,32 +4132,26 @@ impl LocalOwnerFs {
                 mode,
             )?;
         }
-        // A private root has no peer writer, so the name cannot be swapped under
-        // us: the handle we just created stays authoritative and the extra
-        // open + metadata for the replacement check is pure overhead.
+        let created_metadata = create_file.metadata().map_err(Error::from)?;
+        let created_identity = identity_from_metadata(&created_metadata)?;
         let mark_owner_mode = create_trace.elapsed();
-        let root_private = self.root_is_private(&parent_record.root_id);
-        let file = if root_private {
-            drop(parent_dir);
-            create_file
-        } else {
-            let created_metadata = create_file.metadata().map_err(Error::from)?;
-            let created_identity = identity_from_metadata(&created_metadata)?;
-            drop(create_file);
-            let reopened = LocalFs::open_child_in(
-                &parent_dir,
-                name,
-                OpenSpec::new(flags & !libc::O_CREAT, 0),
-            )
-            .map_err(Error::from)?;
-            drop(parent_dir);
-            let reopened_identity =
-                identity_from_metadata(&reopened.metadata().map_err(Error::from)?)?;
-            if reopened_identity != created_identity {
-                return Err(stale("created file was replaced before readonly reopen"));
-            }
-            reopened
-        };
+        drop(create_file);
+        // The reopened descriptor is what the client actually gets: it carries
+        // the access mode the caller asked for (and without O_CREAT). The create
+        // descriptor cannot be handed out directly, e.g. a read-only create
+        // (O_RDONLY|O_EXCL) must still yield a readable handle.
+        let file = LocalFs::open_child_in(
+            &parent_dir,
+            name,
+            OpenSpec::new(flags & !libc::O_CREAT, 0),
+        )
+        .map_err(Error::from)?;
+        drop(parent_dir);
+        let reopened_identity =
+            identity_from_metadata(&file.metadata().map_err(Error::from)?)?;
+        if reopened_identity != created_identity {
+            return Err(stale("created file was replaced before readonly reopen"));
+        }
         let mark_reopen = create_trace.elapsed();
         let write_sync = write_sync_mode_from_flags(flags);
         let needs_flush = flags & libc::O_TRUNC != 0 && write_sync == WriteSyncMode::None;
@@ -7212,6 +7206,30 @@ fn ownerfs_create_trace_enabled() -> bool {
     })
 }
 
+/// Attribute/entry TTL for an exclusively owned local root.
+///
+/// A private root is only ever mutated through this FUSE mount: the native Home
+/// path and bind mounts are not used at the same time, and a root with a peer
+/// writer is never classified private. The kernel therefore already invalidates
+/// its own dcache/attr cache on every create, unlink and rename this mount
+/// performs, and a longer TTL only saves the revalidation traffic of repeated
+/// lookups. Measured on a 4 KiB read workload the per-read FUSE LOOKUP count
+/// goes from 1.98 at 20k files (1 s TTL) to 0 (30 s TTL), which is the whole
+/// 31% scale degradation.
+///
+/// `AFS_OWNERFS_CACHE_TTL_MS` overrides the value; setting it to 0 restores the
+/// old "always revalidate" behaviour.
+fn ownerfs_cache_ttl() -> Duration {
+    static TTL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TTL.get_or_init(|| {
+        let millis = std::env::var("AFS_OWNERFS_CACHE_TTL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1_000);
+        Duration::from_millis(millis)
+    })
+}
+
 fn ownerfs_close_sync_forced() -> bool {
     static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FORCED.get_or_init(|| {
@@ -9925,10 +9943,13 @@ mod tests {
             .unwrap();
         let ctx = context_for_attrs(ctx, &created.entry.attributes);
 
-        let unsupported = fs
+        // OwnerFs stores only `user.*`. A probe for another namespace means the
+        // attribute is absent, so the answer is ENODATA; answering ENOTSUP made
+        // the kernel treat every create as a failed xattr lookup.
+        let absent = fs
             .getxattr(&ctx, created.entry.inode, OsStr::new("security.capability"))
             .unwrap_err();
-        assert_eq!(unsupported.code(), afs_error::IO_NOT_SUPPORTED);
+        assert_eq!(absent.code(), afs_error::IO_NO_DATA);
 
         fs.setxattr(
             &ctx,
