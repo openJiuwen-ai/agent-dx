@@ -1,9 +1,29 @@
 steps:
-- label: ':pipeline: Select ADX pipeline'
-  key: select-pipeline
-  agents:
-    queue: default
-    os: linux
-    arch: amd64
-  command: bash .buildkite/select-pipeline.sh
-  timeout_in_minutes: 5
+- label: 'Export fixed Base236 images; no product compilation or deployment'
+  key: export-images
+  agents: {queue: default, os: linux, arch: amd64}
+  command: bash .buildkite/export-pk1-assets.sh
+  timeout_in_minutes: 25
+  artifact_paths:
+  - out/buildkite/offline-images/*
+  - out/buildkite/bundle/*.json
+  - out/buildkite/logs/*
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/sandbox-packager:v20260506_kubectl
+          securityContext: {privileged: true}
+          volumeMounts:
+          - {name: docker-graph, mountPath: /var/lib/docker}
+          resources:
+            requests: {cpu: '4', memory: 8Gi}
+            limits: {cpu: '4', memory: 8Gi}
+          env:
+          - name: SWR_DOCKER_CONFIG_JSON
+            valueFrom:
+              secretKeyRef: {name: swr-pull-secret, key: .dockerconfigjson}
+        volumes:
+        - {name: docker-graph, emptyDir: {}}
