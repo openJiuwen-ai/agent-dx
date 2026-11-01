@@ -769,8 +769,8 @@ With AFS ON, the normal Full profile keeps all eleven public groups and then req
 cases and six SDK assertions per mode. Specials, performance, hour/day soak and
 power-loss/HA are separate scopes. Real CI4 results are pending in this candidate.
 
-The x86 AFS Base build freezes the already built `fuse_contract` test ELF using
-Cargo's exact artifact record, strips debug sections and verifies four exact
+The x86 AFS Base build freezes the `fuse_contract` test ELF using
+Cargo `test --no-run`'s exact artifact record, strips debug sections and verifies four exact
 selectors without running them. It publishes `out/buildkite/afs-contracts/*`
 separately from the product component/package. Image preparation verifies the
 source/target/product-binary/ELF/archive hashes, stages the ELF in
@@ -785,3 +785,12 @@ worker but has its own Pod/mount identity. SDK Full adds old-FD namespace identi
 and exact growth/truncation/EOF readback. Same-directory restart is process
 recovery on emptyDir, not Pod/VM persistence. Full includes all mandatory smoke
 assertions and normal cleanup; targeted success is not a complete Full result.
+
+CI4 targets use `ADX_E2E_TARGET_CASE=afs-component-full` or `afs-sdk-full`;
+AFS targets are not part of the existing public `ADX_E2E_TARGET_CASES` campaign.
+Only the Full local M Pod binds `/sys/devices/virtual/bdi` writable. Cache probes
+adjust and restore only their own FUSE mount's BDI, not a host disk or global
+sysctl. Base resources are unchanged. Full86/87 failures are retained; SDK
+Full88 passed on candidate230. Candidate231 contains the corrected Rust test,
+but its new complete Full is pending behind the public Platform Redis issue71.
+See the single `docs/testing/test-strategy.html` for current dated evidence.
