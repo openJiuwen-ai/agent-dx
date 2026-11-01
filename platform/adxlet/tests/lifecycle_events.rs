@@ -25,6 +25,7 @@ struct Backend {
     cleanup_failures: AtomicUsize,
     reopens: AtomicUsize,
     activations: AtomicUsize,
+    retirements: AtomicUsize,
     proxy: watch::Sender<u64>,
 }
 impl Default for Backend {
@@ -38,6 +39,7 @@ impl Default for Backend {
             cleanup_failures: AtomicUsize::new(0),
             reopens: AtomicUsize::new(0),
             activations: AtomicUsize::new(0),
+            retirements: AtomicUsize::new(0),
             proxy: watch::channel(1).0,
         }
     }
@@ -124,6 +126,7 @@ impl Routes for Backend {
         Ok(())
     }
     async fn retire(&self, _: &EnvironmentRecord) -> Result<()> {
+        self.retirements.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
     async fn activity_changed(
@@ -346,6 +349,35 @@ async fn explicit_control_failure_commits_without_a_monitor_tick() {
     .unwrap();
     assert!(!test.failed().await.resources_held);
 }
+#[tokio::test]
+async fn required_service_failure_retires_route_without_a_monitor_tick() {
+    let test = Fixture::new().await;
+    let mut status = test.status();
+    status.required_services.insert(
+        "helper".into(),
+        RequiredServiceStatus {
+            phase: RequiredServicePhase::Ready,
+            version: None,
+            error: None,
+        },
+    );
+    let (send, _commands) = test.connect(status.clone()).await;
+    test.hub.wait_ready(&test.identity).await.unwrap();
+    let baseline = test.backend.retirements.load(Ordering::SeqCst);
+    status.revision += 1;
+    status.required_services.get_mut("helper").unwrap().phase = RequiredServicePhase::Failed;
+    // Execd remains Running so diagnostics and explicit cleanup stay available.
+    send.send(pb::RuntimeEvent {
+        event: Some(pb::runtime_event::Event::StatusJson(
+            serde_json::to_vec(&status).unwrap(),
+        )),
+    })
+    .await
+    .unwrap();
+    assert!(!test.failed().await.resources_held);
+    assert!(test.backend.retirements.load(Ordering::SeqCst) > baseline);
+}
+
 #[tokio::test]
 async fn stream_reconnect_keeps_execution_and_replays_latest_failure() {
     let test = Fixture::new().await;
