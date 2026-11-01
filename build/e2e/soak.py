@@ -304,8 +304,8 @@ def main(argv=None):
 
     forwarded = [value for flag in ('bundle', 'registry-images', 'image-export', 'artifact-commit', 'output')
                  for value in ('--' + flag, getattr(args, flag.replace('-', '_')))]
-    return docker_run.common.main([*forwarded, '--profile', 'standalone', '--case', 'afs-sdk-soak', '--cgroupns', 'host'],
-                                  native_factory=ContinuousRun, required_checks=(CHECK,))
+    forwarded += ['--profile', 'standalone', '--case', 'afs-sdk-soak', '--cgroupns', 'host']
+    return docker_run.common.main(forwarded, native_factory=ContinuousRun, required_checks=(CHECK,))
 
 
 if __name__ == '__main__':
