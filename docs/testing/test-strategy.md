@@ -1,7 +1,7 @@
 <a id="top"></a>
 # ADX／AFS 测试规范：五步验证路径
 
-状态：2026-11-01。MR !126、!127、!128均已合入master `a76a97c6`；Base #224已从合入代码完成amd64 AFS ON组件、SDK、统一包、新镜像及默认必需冒烟，全流程通过。只读核对确认：GitCode未开启“流水线成功才允许合入”，自动触发AFS ON也尚无可核验闭环。
+状态：2026-11-01。默认AFS ON候选已在Base #227完成编译、新包/镜像及公共＋AFS冒烟，显式OFF的#226也通过，改动尚未合入。AFS专属串行冒烟本次2分45秒；完整CI时差受到公共Redis首败与重试干扰，不能当成稳定AFS增量。共享默认分支、外部触发与合入规则未改。
 
 [OwnerFs MR !126](https://gitcode.com/openJiuwen/agent-dx/merge_requests/126)、[CI0/CI1 MR !127](https://gitcode.com/openJiuwen/agent-dx/merge_requests/127)、[SDK/冒烟 MR !128](https://gitcode.com/openJiuwen/agent-dx/merge_requests/128)均已合入。早期Base #223固定包验证保留原身份；当前正式集成验证采用master `a76a97c6`和Base #224新制品。本轮仅运行验证和更新规范，未修改生产/测试/CI实现、共享默认分支或合入保护。当前结果、待补项与历史失败同页记录，组件、产品和门禁分别举证。
 
@@ -15,7 +15,7 @@
 4. **Buildkite门禁：用已有CI环境保护共享集成。** 在ADX既有目标K8s部署AFS，选核心用例进冒烟、更完整功能进Full，并验证ADX实际使用AFS；不调用开发者VM。
 5. **固定包验收：开发者和测试人员都能自主闭环。** 拿固定包及配套制品，在合格环境中复用公共E2E跑全量、专项；小时／天级长稳和受控性能另补公共能力与AFS负载。
 
-第2/3步按开发者条件选择，没条件可以不跑并注明未验证；实际失败不能伪装成环境跳过。当前已通过AFS组件定向CI；本分支已补SDK产品路径与必需包装，真实SDK与固定包组合门禁均已通过；接线已合入，正式新包#224全流程已通过；只读审计确认合入pipeline-success要求为false，自动AFS ON触发未形成可核验闭环，不能当作已生效的自动合入保护。两步都默认在一台Linux VM内：第二步同guest多进程，第三步隔离namespace。可选SSH多VM适配仍保留，未纳入本轮实测；这不是AFS不能容器化的声明。
+第2/3步按开发者条件选择，没条件可以不跑并注明未验证；实际失败不能伪装成环境跳过。当前已通过AFS组件定向CI；本分支已补SDK产品路径与必需包装，真实SDK与固定包组合门禁均已通过；接线已合入，正式新包#224通过；本轮默认ON候选#227与显式OFF#226均通过，候选待合入。它决定已触发构建的AFS模式，不新增事件触发；合入pipeline-success要求仍为false，不能当作已生效的自动合入保护。两步都默认在一台Linux VM内：第二步同guest多进程，第三步隔离namespace。可选SSH多VM适配仍保留，未纳入本轮实测；这不是AFS不能容器化的声明。
 
 ## 五步总表
 
@@ -26,7 +26,7 @@
 | ① 基础UT／LLT | 尽早发现模块规则、错误传播、状态机及接口合同回归 | 已有8个AFS crate测试入口；普通非ignored测试已接ON组件构建 | Linux；UT在源文件，LLT在域内tests；`make afs-test`／选包 `cargo test` | 固定推荐范围、说明feature/ignored边界；新功能按代码补UT，不另造runner | 维护基线；P0明确范围 |
 | ② 单VM集成 | 验证真实Meta/Node、FUSE/bind、数据/权限/缓存和正常恢复/清理 | 已实现统一入口和11个基础case；本轮冻结产物真实运行11/11通过 | 一台Linux VM；`afs/tests/run.py`＋`suites/`＋local/exec适配 | 此前冻结输入的新构建阻塞保留为历史；后续新版本持续跑对应本地集合 | P0基础已完成 |
 | ③ 多namespace集成 | 验证隔离节点的真实TCP/mTLS、远端数据路径、恢复和多读者 | 用户确认一VM多namespace；三角色基础＋C读者共9case，本轮9/9通过 | 一VM的M/A/B/C隔离角色；标准Linux环境说明；`cluster-basic`／`cluster-manyread`；同run.py | 可选SSH真实多VM适配未实跑；不宣称VM断电/宿主故障隔离 | P1基础已完成 |
-| ④ Buildkite门禁 | 防止共享候选包破坏AFS/ADX基本功能；流水线内必测、合入后自动回归、合入前硬门禁分别验收 | MR126/127/128已合入；旧候选#85组合通过；正式新包Base224源码/组件/SDK/组包/新镜像/默认必需冒烟全流程通过。仓库合入pipeline-success要求为false | 既有CI目标K8s；`run-e2e.sh` → `afs_gate.py`；本次master精确commit＋AFS ON，无旧制品或诊断选择器 | 后续明确自动触发和合入必需状态；CI4 Full／PK0专项 | P0正式候选/触发闭环；P1 Full |
+| ④ Buildkite流水线验证 | 防止共享候选包破坏AFS/ADX基本功能；流水线内必测、事件触发、合入保护分别验收 | MR126/127/128已合入；Base224正式新包通过。本轮Base默认ON的227与显式OFF的226均通过，候选待合入；Full缺省模式已对齐并通过合同检查。合入pipeline-success仍false | 既有CI目标K8s；`run-e2e.sh` → `afs_gate.py`；Base本次固定22c7f9b3，未传旧制品或诊断选择器 | 默认ON候选评审合入；外部触发仍单独核实；CI4 Full／PK0专项 | P0默认ON合入；P1 Full |
 | ⑤ 固定包验收 | 人或AI可自主部署、验收和复现，扩大版本质量验证 | 公共K8s Full、Docker单宿主11组和专项已有；只有5分钟soak/90秒采样，完整长稳未闭环 | 先备固定包/SDK/backend/bundle及合格环境；直接公共E2E或独立Full代跑 | PK0–PK4：拿包复现→产品Full→专项→公共长稳→受控性能；复用第四步适配，补说明/负载/判据 | P1可复现全量/专项；P2长稳/性能 |
 
 ## 统一口径与优先级
@@ -215,15 +215,31 @@ python3 afs/tests/run.py run --suite cluster-manyread --env /absolute/namespaces
 
 **状态**：五步总体逻辑已确认；以下目录/命令中标注目标或待补者尚未实施。
 
-### Base默认AFS冒烟与时延验证（2026-11-01，本轮候选）
+### Base／Full默认AFS冒烟与时延验证（2026-11-01，候选待合入）
 
-普通ADX Base构建应默认编译AFS并运行冒烟，用于发现AFS与公共组件互相影响的问题。仓内目前没有按改动范围选组件的接线，因此本轮候选在`.buildkite/pipeline-package.yml`顶层用`${ADX_WITH_AFS:-1}`统一模式，未传参数即ON，显式`0`仍可关闭。此改动尚待下述真实构建验证并合入，不能称线上默认已生效。
+**默认覆盖所有进入现有流水线的改动，只跑AFS既定冒烟。** 仓内没有按改动范围选择AFS组件的机制，因此候选在`.buildkite/pipeline-package.yml`顶层用`${ADX_WITH_AFS:-1}`统一模式：不传参数即ON，显式`0`仍可关闭。历史master #221确有省略AFS参数的调用；其它专项构建中显式OFF的调用仍有效。本候选尚未合入，不能称线上默认已生效。
 
-复用原Base依赖链和`l0`入口：`build-afs`普通UT/编译→同次组包/镜像→`.buildkite/run-e2e.sh`→`build/e2e/kubernetes/afs_gate.py`，运行公共L0/auth、组件5项及OwnerFs/DFS SDK各6项；组件/SDK子驱动的`full --case`表示精确选中该冒烟目标，不表示运行AFS全量或公共11组Full。ARM是否构建/测试仍由原有开关控制。Full、SDK、admin、maintenance及独立Makefile/release的默认值不扩大，共享默认分支和合入规则不变。
+**复用入口，不复制用例。** Base保持原依赖链：`build-afs`普通UT/编译、source-gate AFS lint→同次组包/镜像→`.buildkite/run-e2e.sh`→`build/e2e/kubernetes/afs_gate.py`，依次运行公共L0/auth、原组件5项、OwnerFs/DFS SDK两模式各6项断言。组件/SDK子驱动的`full --case`是精确选中冒烟目标，不表示运行AFS全量或公共11组Full。ARM是否构建/测试继续由原开关控制。
 
-时延验证固定同一提交、同一amd64 Base参数，一次不传AFS参数以验证默认ON，一次显式OFF作对照；都新编译/组包/镜像，不复用旧候选。记录AFS作业、UT与release编译阶段、组件/SDK冒烟、排队、依赖等待和总墙钟。并行的AFS编译耗时不能直接加到总耗时；另外计算它相对其它组包前置步骤的额外等待。共享缓存保留，不清缓存制造冷编译；单组对照只报告本次观察，不能把排队/下载/缓存波动或两条总时差全部归因于AFS。当前真实结果待补。
+**Full同步匹配候选模式。** Base默认ON包会被原Full默认OFF的模式校验拒绝，因此`.buildkite/pipeline-full.yml`也设置同一缺省值；消费旧OFF包/镜像需显式`ADX_WITH_AFS=0`。Full原公共profile/steps不变，只在原公共集合后追加同一组AFS冒烟；不运行AFS功能Full、专项或长稳。SDK/admin/maintenance、独立Makefile/release默认不改。
 
-本轮只改变已进入Base后的默认模式。现有外部触发方若显式传OFF，仍会关闭AFS；没有创建构建的事件也不会因这个默认值自动触发。上一轮外部relay未知、GitCode合入强制为false的审计结论独立保留，不能用默认ON代替触发或合入保护配置。
+**已完成的验证。** [Base #226 OFF](https://buildkite.com/agent-dx/agent-dx/builds/226)和[Base #227 默认ON](https://buildkite.com/agent-dx/agent-dx/builds/227)固定同一提交`22c7f9b36f424c2f9db3ece8beb1481fcffd8c5e`，顺序执行，均新编译/组包/镜像；无旧候选或target/profile覆盖。ON请求故意省略AFS参数，服务器与关键job实际均为1；OFF为0且AFS job未启动，包/镜像排除AFS。ON完成AFS普通测试2058 PASS/58 ignored、公共2项、组件5项和SDK两模式12子断言，根结果/JUnit/summary及各层清理通过。最终候选的Base YAML解析结果与实跑22c完全相同，仅改注释；Full仅增加顶层模式缺省，通过54项合同检查，**本轮未触发Full，也未验收公共11组或ARM**。
+
+| 观察项 | 本次实测 | 如何理解 |
+| --- | --- | --- |
+| AFS源码check/clippy | 74.867秒，约1分15秒 | 并行source-gate内的AFS追加段，不直接累加到总CI |
+| AFS组件作业 | 202.661秒，约3分23秒 | 含测试编译/UT156.111秒、release编译29.024秒，以及环境、打包/传输等；不要再把子段重复相加 |
+| AFS组件冒烟 | 57.911秒，约58秒 | 5项真实用例及该子驱动的部署/正常清理 |
+| AFS SDK冒烟 | 107.194秒，约1分47秒 | OwnerFs/DFS两模式、warmup、12断言及回收/清理 |
+| AFS专属串行冒烟合计 | **165.105秒，约2分45秒** | 本次最明确的额外串行等待；不含公共L0/auth，不代表稳定总增量 |
+| 组包前直接等待AFS编译 | 0秒 | AFS比其它前置更早结束，本次最后前置是Platform retry；不能由此断言AFS总影响为0 |
+| 完整Base墙钟 | OFF792.193秒（13:12）；ON1226.674秒（20:27）；观察差+434.481秒 | ON包含公共Redis首败与完整作业重试，**不是干净的AFS因果对照** |
+
+**保留失败，不用重试掩盖成本。** 首次默认ON [#225](https://buildkite.com/agent-dx/agent-dx/builds/225)在公共Execd固定envd Git fetch连续两次超时300秒，组包/冒烟未执行，单独保留而不作为干净样本。#227在公共Coordinator real-Redis的`node_retirement_new_boot_readiness_closes_the_previous_departure_durably`返回Unavailable/timeout，测试连接/操作超时为300ms；未修改产品、超时、并发或断言，原条件重试该Platform作业后7项通过。首败结束至retry创建170.633秒、至启动176.171秒，retry作业267.200秒；不能将这些随意相加减推算稳定AFS增量。Redis小日志未见明确服务退出/持久化错误，根因未确定，不把它预先归为AFS或环境问题。
+
+**时延结论的边界。** 当前可以确认AFS专属冒烟本次增加约2分45秒串行工作，编译和lint在并行路径。完整总增量尚不能由这一对构建精确归因：公共失败/人工重试间隔、包和镜像传输、排队、共享缓存/资源均可能影响墙钟。共享缓存没有清空，此处不是冷编译、稳定分位数或性能SLA；若后续需要总时延预算，应使用无重试的正常构建继续积累同口径数据。
+
+**外部触发与合入规则保持独立。** 缺省ON只作用于已经读取本配置的Base/Full构建，不创建webhook，不覆盖显式OFF，不改变共享默认分支或合入规则。旧的外部relay未知、GitCode合入强制false结论仍保留，不用这次Buildkite成功替代触发/保护配置。
 
 ### 合入后正式候选与线上门禁核对（2026-11-01）
 

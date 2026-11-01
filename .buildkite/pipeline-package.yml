@@ -1,5 +1,5 @@
 # Keep the Base candidate and its required smoke in the same AFS mode.
-# Explicit build parameters may still opt out; other pipelines stay opt-in.
+# Explicit build parameters may still opt out.
 env:
   ADX_WITH_AFS: '${ADX_WITH_AFS:-1}'
 

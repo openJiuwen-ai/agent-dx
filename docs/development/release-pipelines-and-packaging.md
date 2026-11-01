@@ -30,8 +30,10 @@ Agent FS（AFS）在 Base 流水线默认开启；仓内目前没有按改动路
 组装下载 AFS 组件并把 `--with-afs` 传给包清单、build manifest
 和 OBS 发布校验。带 AFS 包写入 `with_afs: true` 并包含 `bin/afs-meta`、`bin/afs-node`
 和 `etc/examples/afs/*`；OFF 包校验会拒绝这些文件。Base 在公共 L0/auth 后运行现有组件5项
-和 OwnerFs/DFS SDK 冒烟，不运行 AFS 功能全量、专项或长稳。独立 Makefile/release、Full/SDK/admin
-流水线的 AFS 默认值及 Full profile 保持原合同；共享默认分支、外部触发与合入规则不在此修改。
+和 OwnerFs/DFS SDK 冒烟，不运行 AFS 功能全量、专项或长稳。Full 在自己的 YAML 入口默认同为 ON，
+消费新 Base 候选并在原公共 Full profile 后追加同一组 AFS 冒烟；消费旧 OFF 包/镜像需显式传
+`ADX_WITH_AFS=0`，防止候选模式校验冲突。独立 Makefile/release、SDK/admin 流水线的 AFS 默认值
+及公共 Full profile 保持原合同；共享默认分支、外部触发与合入规则不在此修改。
 已有触发方若显式传 OFF，仍会关闭 AFS，不能把仓内默认 ON 等价成所有外部事件都会运行 AFS。
 普通产品构建不编译 AFS
 examples/验收探针；RDMA/all-features lint 需要 `ADX_AFS_ALL_FEATURES=1` 且先通过
@@ -78,6 +80,10 @@ Buildkite pipeline slug 为 `agent-dx`，配置入口为
 `.buildkite/pipeline-package.yml`。
 
 ### 触发
+
+以下是既有触发策略设计，外部事件到 Buildkite 的实际接线仍须单独核实。
+仓内默认 ON 只决定已经创建的 Base/Full 构建如何运行，不创建 webhook，也不保证每次
+master/MR 事件已经自动触发；线上触发与合入保护的核对见[测试规范](../testing/test-strategy.md)。
 
 - Pull Request：影响控制面、Gateway、部署、内部协议、Runtime Pack 或打包逻辑时触发。
 - 主分支提交：总是触发，保留候选制品。

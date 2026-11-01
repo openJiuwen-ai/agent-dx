@@ -1,3 +1,7 @@
+# Match the Base candidate default; explicit OFF still accepts OFF candidates.
+env:
+  ADX_WITH_AFS: '${ADX_WITH_AFS:-1}'
+
 steps:
 - label: 'Images · Environment Full Acceptance'
   key: platform-images
