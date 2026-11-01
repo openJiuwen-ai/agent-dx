@@ -51,7 +51,7 @@ class SpecialContracts(unittest.TestCase):
     def test_pressure_success_requires_all_operations_and_real_expected_errno(self):
         scope = load('special_pressure_contract', HERE / 'afs_specials.py')
         report = {'status': 'passed', 'mode': 'dfs', 'special': 'pressure', 'cleanup_errors': [],
-                  'peer_reads': {'before': 1, 'after': 2},
+                  'peer_reads': {'before': 1.0, 'after': 2.0},
                   'cases': [{'id': n, 'status': 'passed'} for n in scope.SDK_CHECKS['pressure']],
                   'pressure': {'workers': 4, 'operations': 32, 'payload_bytes': 65536,
                                'verified_bytes': 2097152, 'errors': [], 'exclusive_errno': 17}}

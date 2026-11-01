@@ -1,6 +1,7 @@
 """Declared fixed-package specials; functional assertions, never an HA/performance SLA."""
 
 import json
+import math
 from pathlib import Path
 import sys
 import tempfile
@@ -33,7 +34,9 @@ def validate_sdk(report, mode, special):
         raise ValueError('special SDK assertions or normal cleanup are incomplete')
     if mode == 'dfs':
         peer = report.get('peer_reads', {})
-        if not isinstance(peer.get('before'), int) or peer.get('after', 0) <= peer['before']:
+        values = (peer.get('before'), peer.get('after'))
+        if (any(not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v) or v < 0
+                for v in values) or values[1] <= values[0]):
             raise ValueError('DFS special did not prove the remote peer read path')
     if special == 'pressure':
         p = report.get('pressure', {})
