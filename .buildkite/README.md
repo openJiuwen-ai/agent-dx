@@ -57,7 +57,7 @@ The standalone `build/release/build.sh` remains opt-in through `ADX_ENVD_SOURCE`
 | Variable | Default | Applies to / responsibility |
 |---|---|---|
 | `ADX_OBS_UPLOAD` | base `1`, SDK `0` | `0` disables OBS upload for the selected pipeline |
-| `ADX_WITH_AFS` | `0` | Base: `1` adds the optional AFS component to both architecture packages; OFF packages exclude AFS |
+| `ADX_WITH_AFS` | Base `1`, others `0` | Base builds AFS in each enabled architecture, adds AFS lint/UT and runs the required component/SDK smoke after public L0/auth. Explicit `0` excludes AFS. Full remains opt-in and keeps its existing profile. |
 | `ADX_ARM_BUILD` | `1` | Base: `0` defers all ARM compile, assembly, publication and index steps; x86 and shared gates still run |
 | `ADX_ARM_TESTS` | `0` | Base: `1` runs Rust component tests and install smoke on ARM, as on x86 |
 | `ADX_ARM_OBS_UPLOAD` | inherits `ADX_OBS_UPLOAD` | Base: override only ARM final OBS publication; ARM Buildkite artifacts remain available |
@@ -107,8 +107,16 @@ Rust component tests and release install smoke. ARM defaults to compilation and
 package integrity checks; `ADX_ARM_TESTS=1` enables the same tests on ARM.
 With `ADX_WITH_AFS=1`, source-gate adds AFS lint and each architecture also
 waits for its AFS component; component manifests, package assembly and
-publication verification use the same `--with-afs` contract. This does not change ARM
-backend policy (`backend: null`) or the default OFF package.
+publication verification use the same `--with-afs` contract. Base resolves this
+mode once in `pipeline-package.yml` using `${ADX_WITH_AFS:-1}`, so an omitted
+parameter enables AFS and an explicit `0` preserves the OFF package. The
+selector currently has no changed-path component routing. The normal Base
+profile stays `l0`: public L0/auth, five AFS component cases and OwnerFs/DFS SDK
+smoke; it does not select AFS Full, specials or soak. This does not change ARM
+backend policy (`backend: null`), standalone Makefile/release defaults, the
+Full/SDK/admin/maintenance defaults, repository triggers, shared default
+branches or merge protection. Existing trigger callers that explicitly pass
+`ADX_WITH_AFS=0` still opt out and must be reviewed separately.
 AFS durability regressions require `strace` and child-process tracing in the
 public Rust build image; the image verifier checks this before compilation.
 ARM uses an `os=macos, arch=arm64` worker with Docker to execute native Linux ARM64.

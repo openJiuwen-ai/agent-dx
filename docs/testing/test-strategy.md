@@ -1,9 +1,9 @@
 <a id="top"></a>
 # ADX／AFS 测试规范：五步验证路径
 
-状态：2026-11-01。第二、三步基础及CI0/CI1组件定向闭环已通过；本分支CI2 SDK-on-AFS、CI3流水线内必需冒烟已实现并真实通过。最终运行是Full #85／测试commit `6660ffc1`，固定产品/SDK为Base #223，未重编或替换产品。
+状态：2026-11-01。MR !126、!127、!128均已合入master `a76a97c6`；Base #224已从合入代码完成amd64 AFS ON组件、SDK、统一包、新镜像及默认必需冒烟，全流程通过。只读核对确认：GitCode未开启“流水线成功才允许合入”，自动触发AFS ON也尚无可核验闭环。
 
-本次只补测试、部署配置与CI接线，不改ADX、AFS或SDK生产源码。基于[CI0/CI1 MR !127](https://gitcode.com/openJiuwen/agent-dx/merge_requests/127)，OwnerFs生产修复继续由[MR !126](https://gitcode.com/openJiuwen/agent-dx/merge_requests/126)独立交付；固定使用已含修复的Base #223产品和SDK，测试commit另记。共享默认分支及线上合入保护配置不改。各阶段当前结果、待补项和历史失败都在本页，组件通过、产品通过和必需门禁通过分别举证。
+[OwnerFs MR !126](https://gitcode.com/openJiuwen/agent-dx/merge_requests/126)、[CI0/CI1 MR !127](https://gitcode.com/openJiuwen/agent-dx/merge_requests/127)、[SDK/冒烟 MR !128](https://gitcode.com/openJiuwen/agent-dx/merge_requests/128)均已合入。早期Base #223固定包验证保留原身份；当前正式集成验证采用master `a76a97c6`和Base #224新制品。本轮仅运行验证和更新规范，未修改生产/测试/CI实现、共享默认分支或合入保护。当前结果、待补项与历史失败同页记录，组件、产品和门禁分别举证。
 
 ## 先看五步的逻辑
 
@@ -15,7 +15,7 @@
 4. **Buildkite门禁：用已有CI环境保护共享集成。** 在ADX既有目标K8s部署AFS，选核心用例进冒烟、更完整功能进Full，并验证ADX实际使用AFS；不调用开发者VM。
 5. **固定包验收：开发者和测试人员都能自主闭环。** 拿固定包及配套制品，在合格环境中复用公共E2E跑全量、专项；小时／天级长稳和受控性能另补公共能力与AFS负载。
 
-第2/3步按开发者条件选择，没条件可以不跑并注明未验证；实际失败不能伪装成环境跳过。当前已通过AFS组件定向CI；本分支已补SDK产品路径与必需包装，真实SDK与固定包组合门禁均已通过；接线尚待评审合入，线上触发/必需状态未核验，不能当作已经生效的自动合入保护。两步都默认在一台Linux VM内：第二步同guest多进程，第三步隔离namespace。可选SSH多VM适配仍保留，未纳入本轮实测；这不是AFS不能容器化的声明。
+第2/3步按开发者条件选择，没条件可以不跑并注明未验证；实际失败不能伪装成环境跳过。当前已通过AFS组件定向CI；本分支已补SDK产品路径与必需包装，真实SDK与固定包组合门禁均已通过；接线已合入，正式新包#224全流程已通过；只读审计确认合入pipeline-success要求为false，自动AFS ON触发未形成可核验闭环，不能当作已生效的自动合入保护。两步都默认在一台Linux VM内：第二步同guest多进程，第三步隔离namespace。可选SSH多VM适配仍保留，未纳入本轮实测；这不是AFS不能容器化的声明。
 
 ## 五步总表
 
@@ -26,14 +26,14 @@
 | ① 基础UT／LLT | 尽早发现模块规则、错误传播、状态机及接口合同回归 | 已有8个AFS crate测试入口；普通非ignored测试已接ON组件构建 | Linux；UT在源文件，LLT在域内tests；`make afs-test`／选包 `cargo test` | 固定推荐范围、说明feature/ignored边界；新功能按代码补UT，不另造runner | 维护基线；P0明确范围 |
 | ② 单VM集成 | 验证真实Meta/Node、FUSE/bind、数据/权限/缓存和正常恢复/清理 | 已实现统一入口和11个基础case；本轮冻结产物真实运行11/11通过 | 一台Linux VM；`afs/tests/run.py`＋`suites/`＋local/exec适配 | 此前冻结输入的新构建阻塞保留为历史；后续新版本持续跑对应本地集合 | P0基础已完成 |
 | ③ 多namespace集成 | 验证隔离节点的真实TCP/mTLS、远端数据路径、恢复和多读者 | 用户确认一VM多namespace；三角色基础＋C读者共9case，本轮9/9通过 | 一VM的M/A/B/C隔离角色；标准Linux环境说明；`cluster-basic`／`cluster-manyread`；同run.py | 可选SSH真实多VM适配未实跑；不宣称VM断电/宿主故障隔离 | P1基础已完成 |
-| ④ Buildkite门禁 | 防止共享候选包破坏AFS和ADX基本功能；组件/产品分别举证 | 固定#223候选；SDK定向#81两模式12项通过；最终#85公共L0/auth＋组件5＋SDK两模式、根报告/JUnit/CI summary通过 | 既有CI目标K8s；`.buildkite/run-e2e.sh` → `afs_gate.py` → 公共K8s runner，复用原用例 | 依赖MR126/127及本批测试接线评审；合入后按正式候选重跑，核验线上ON触发/合入保护；P1扩Full | P0流水线内已通；P1 Full |
+| ④ Buildkite门禁 | 防止共享候选包破坏AFS/ADX基本功能；流水线内必测、合入后自动回归、合入前硬门禁分别验收 | MR126/127/128已合入；旧候选#85组合通过；正式新包Base224源码/组件/SDK/组包/新镜像/默认必需冒烟全流程通过。仓库合入pipeline-success要求为false | 既有CI目标K8s；`run-e2e.sh` → `afs_gate.py`；本次master精确commit＋AFS ON，无旧制品或诊断选择器 | 后续明确自动触发和合入必需状态；CI4 Full／PK0专项 | P0正式候选/触发闭环；P1 Full |
 | ⑤ 固定包验收 | 人或AI可自主部署、验收和复现，扩大版本质量验证 | 公共K8s Full、Docker单宿主11组和专项已有；只有5分钟soak/90秒采样，完整长稳未闭环 | 先备固定包/SDK/backend/bundle及合格环境；直接公共E2E或独立Full代跑 | PK0–PK4：拿包复现→产品Full→专项→公共长稳→受控性能；复用第四步适配，补说明/负载/判据 | P1可复现全量/专项；P2长稳/性能 |
 
 ## 统一口径与优先级
 
 - **已定原则／决策**：组件UT/集成归AFS，真实组件测试统一目标 `afs/tests/`；ADX公开SDK及完整产品场景归 `build/e2e/`。本地、CI、拿包验收复用断言和结果语义，按环境适配，不复制一套Buildkite专用业务用例。
 - **事实**是已有代码/调用；**已有规划**是原仓内目标但未闭环；**待补项**是后续实现范围；**待验证**是尚未实测的环境/触发条件。总体规范已确认，不表示具体CLI文件、CI接线或所有场景已存在。
-- **当前**第二/三步基础及CI0/CI1组件定向闭环已通过；**P0**接线评审/依赖合入后按正式候选回归，并核验线上触发/保护策略；SDK与流水线内冒烟已通过，**P1**扩产品Full、拿包复现和专项，**P2**建设完整长稳及受控性能。实现顺序不把本地VM变成所有开发者的提交前强制条件。
+- **当前**第二/三步基础及CI0/CI1组件定向闭环已通过；**P0**正式候选#224已通过；自动触发和合入强制策略尚未闭合（本次只读核实，不改共享设置）；SDK与流水线内冒烟已通过，**P1**扩产品Full、拿包复现和专项，**P2**建设完整长稳及受控性能。实现顺序不把本地VM变成所有开发者的提交前强制条件。
 - **通过标准**：选中的必需项必须实际执行，0匹配、ignored、未执行、BLOCKED不能记PASS；定向通过不冒称完整Full，含AFS二进制不证明产品使用了AFS；正常清理也必须举证。
 - **环境与结果范围**：VM、Docker、K8s分别记录；Pod跨worker不能冒充多VM/断电验证；功能、正常恢复、故障、长稳及性能分别报告。CI缺必需环境不能静默跳过为成功。
 
@@ -211,13 +211,43 @@ python3 afs/tests/run.py run --suite cluster-manyread --env /absolute/namespaces
 <a id="step-4"></a>
 ## 第四步：Buildkite共享门禁
 
-**本步原则、现状与优先级**：原则：复用既有CI目标K8s，部署AFS并选集；不调用个人VM。现状：普通Cargo、CI0资产/环境和CI1真实组件定向已通过，SDK产品路径本分支Full #81已通过；必需包装在#85以固定包通过。待补：接线评审合入、正式候选重跑、线上触发/保护核验和完整Full选集。优先级：P0冒烟、P1 Full。
+**本步原则、现状与优先级**：原则：复用既有CI目标K8s，部署AFS并选集；不调用个人VM。现状：普通Cargo、CI0资产/环境和CI1真实组件定向已通过，SDK产品路径本分支Full #81已通过；必需包装在#85以固定包通过。接线已合入且正式候选#224全流程通过；当前缺口是自动触发/合入必需状态和CI4完整Full选集。优先级：P0冒烟、P1 Full。
 
 **状态**：五步总体逻辑已确认；以下目录/命令中标注目标或待补者尚未实施。
 
+### Base默认AFS冒烟与时延验证（2026-11-01，本轮候选）
+
+普通ADX Base构建应默认编译AFS并运行冒烟，用于发现AFS与公共组件互相影响的问题。仓内目前没有按改动范围选组件的接线，因此本轮候选在`.buildkite/pipeline-package.yml`顶层用`${ADX_WITH_AFS:-1}`统一模式，未传参数即ON，显式`0`仍可关闭。此改动尚待下述真实构建验证并合入，不能称线上默认已生效。
+
+复用原Base依赖链和`l0`入口：`build-afs`普通UT/编译→同次组包/镜像→`.buildkite/run-e2e.sh`→`build/e2e/kubernetes/afs_gate.py`，运行公共L0/auth、组件5项及OwnerFs/DFS SDK各6项；组件/SDK子驱动的`full --case`表示精确选中该冒烟目标，不表示运行AFS全量或公共11组Full。ARM是否构建/测试仍由原有开关控制。Full、SDK、admin、maintenance及独立Makefile/release的默认值不扩大，共享默认分支和合入规则不变。
+
+时延验证固定同一提交、同一amd64 Base参数，一次不传AFS参数以验证默认ON，一次显式OFF作对照；都新编译/组包/镜像，不复用旧候选。记录AFS作业、UT与release编译阶段、组件/SDK冒烟、排队、依赖等待和总墙钟。并行的AFS编译耗时不能直接加到总耗时；另外计算它相对其它组包前置步骤的额外等待。共享缓存保留，不清缓存制造冷编译；单组对照只报告本次观察，不能把排队/下载/缓存波动或两条总时差全部归因于AFS。当前真实结果待补。
+
+本轮只改变已进入Base后的默认模式。现有外部触发方若显式传OFF，仍会关闭AFS；没有创建构建的事件也不会因这个默认值自动触发。上一轮外部relay未知、GitCode合入强制为false的审计结论独立保留，不能用默认ON代替触发或合入保护配置。
+
+### 合入后正式候选与线上门禁核对（2026-11-01）
+
+**先分清三个问题**：明确启动AFS ON后必须跑哪些用例，是仓内流水线规则；合入后是否自动启动它，是触发规则；未通过是否阻止合入，是仓库保护规则。一次手动API构建通过，只能证明第一条实际运行，不能代替后两条。
+
+本次固定master `a76a97c6a7bef93d0f8df47e7b615c434de228c8`，三份MR的原head均在祖先链中。[Base #224](https://buildkite.com/agent-dx/agent-dx/builds/224)使用`ADX_WITH_AFS=1`、`ADX_COMPONENT_TESTS=1`、`ADX_ARM_BUILD=0`，不传旧package/SDK/image build ID，不传targetcase/profile覆盖，尊重branch filter。复用共享缓存，但构建/制品身份必须属于本次build；ARM、外部OBS/PyPI发布及公共11组Full不在本轮范围。
+
+| 层次 | 当前可核实的事实 | 能得出的结论 |
+| --- | --- | --- |
+| 流水线内部 | AFS默认OFF；明确ON且没有诊断选择器时，正常Base L0包装串公共L0/auth、组件5项、两个SDK模式；原source/普通组件测试、新组包/镜像也在依赖链中 | 已接通AFS ON本次运行内部必测；不能据此声称所有提交都会自动选ON |
+| 合入后自动回归 | GitCode默认分支为master；Buildkite基础和Full共享默认仍refactor、provider为private。现有3个hook指向CodeArts/OpenLibing，部分监听push/MR，最近HTTP200；未见直接Buildkite hook，未知是否存在间接relay。近期各30条记录里新master只有本次明确API请求的224 | 尚无master合入后自动选择AFS ON并触发Buildkite的可核验闭环。API source不等于人工来源，不能只靠该字段判断；未知外部relay不能写成不存在 |
+| 合入前强制 | master受保护；官方GET PR设置返回`only_allow_merge_if_pipeline_succeeds=false` | 当前未启用流水线成功才允许合入；分支保护本身不等于AFS Buildkite硬门禁 |
+
+这些共享设置本轮只读，没有修改默认分支、hook、合入规则或全局AFS OFF默认值。后续缺口是触发策略明确branch/ref/commit与何时传AFS ON，并把正确的非诊断AFS结果绑定到合入必需状态；泛化的“CI成功”或一次API运行不能替代这条链。
+
+**本次真实结果**：AFS普通测试2058通过、58 ignored，source-gate及其它amd64构建通过。第一次Execd在固定envd源commit `92197909` 的Git fetch超时300秒，组包/冒烟当时未执行；原失败日志与制品收齐后，仅原条件重试该job，第2次已通过，原失败保留。最终同build组件/SDK/统一包、索引、新镜像及正常AFS ON L0全流程通过；实际选择公共L0/auth、组件5项、OwnerFs/DFS SDK两模式各6项，根报告/JUnit/CI summary与最终作业通过。它不是旧包重放，也不代表ARM或公共11组Full、长稳性能已验收。
+
+本次release archive SHA为`529aabb89fdeca2d3d0ee5c366cd25824389940de493a83e41636465c2641602`，SDK wheel SHA为`c1521bd5e1aebdabc186463a471cab1d6e6a5b7d8ed2697f22604694a40f87fc`；build manifest声明source为a76、with_afs=true，release manifest声明source为a76、dirty=false；SDK candidate声明同一source及当前build224。AFS ELF已由真实运行角色核对，三组测试的正常清理及namespace删除也通过，不以清单声明代替实物校验。
+
+接口来源：[GitCode PR设置GET](https://docs.gitcode.com/docs/apis/get-api-v-5-repos-owner-repo-pull-request-settings/)、[保护分支GET](https://docs.gitcode.com/docs/apis/get-api-v-5-repos-owner-repo-protect-branches/)。实际仓库设置、脱敏hooks、分支与近期构建原件分别保留在本轮证据中；只保留事实和读取范围，不公开hook凭据，也不把不适用接口的非JSON错误当成无配置。
+
 ### CI2／CI3当前实现与验证
 
-当前实现仅补测试、部署配置与CI包装，不修改ADX、AFS或SDK生产源码。依赖[CI0/CI1 MR !127](https://gitcode.com/openJiuwen/agent-dx/merge_requests/127)，受影响内核另需[OwnerFs MR !126](https://gitcode.com/openJiuwen/agent-dx/merge_requests/126)的产品修复；当前真实运行复用已含修复的Base #223固定包。实现复用已安装SDK的`Mount(host_path=...)`和`node_id`，没有增加AFS专属API；A/B在现有ADX `node1/node2` Pod中，与本节点sandboxd共用容器挂载namespace，M独立Pod。公共组件目标继续保留私有worker挂载namespace。
+CI2/CI3实现仅补测试、部署配置与CI包装，不修改ADX、AFS或SDK生产源码。依赖[CI0/CI1 MR !127](https://gitcode.com/openJiuwen/agent-dx/merge_requests/127)，受影响内核另需[OwnerFs MR !126](https://gitcode.com/openJiuwen/agent-dx/merge_requests/126)的产品修复；早期验证复用Base #223固定包，下表保留这些历史记录，合入后正式新包结果见上节Base #224。实现复用已安装SDK的`Mount(host_path=...)`和`node_id`，没有增加AFS专属API；A/B在现有ADX `node1/node2` Pod中，与本节点sandboxd共用容器挂载namespace，M独立Pod。公共组件目标继续保留私有worker挂载namespace。
 
 | 内容 | 当前入口与合同 | 验证状态／边界 |
 | --- | --- | --- |
@@ -242,7 +272,7 @@ python3 afs/tests/run.py run --suite cluster-manyread --env /absolute/namespaces
 
 本批本地公共工具150项、K8s传输mock6项、固定Python预检（master差异19文件／父提交差异8文件）通过。回归包含成功gate由既有CI summary.collect/render消费、缺结果/错身份/清理失败判红及公共Full stop收据不丢失。早期#78–80、#82–83失败均保留；不修改既有CI guard来放过缺失身份。最终文档提交与上述实跑runtime提交分开记录。
 
-**本批出口与下一项**：AFS ON流水线内必需冒烟在固定候选上已接通；尚未改共享默认分支、webhook或合入保护。MR !126、!127和本批测试接线评审合入后，应按正式候选重跑Base/包路径；CI4完整公共11组＋已登记AFS Full集合、第五步PK0–PK4、取消实跑、长稳与性能仍另行验收。不能用#85外推新head已编译打包或公共Full已通过。
+**本批出口与下一项**：AFS ON流水线内必需冒烟在固定候选上已接通；尚未改共享默认分支、webhook或合入保护。三份MR现已合入，正式Base/包路径已在本轮#224全流程通过；CI4完整公共11组＋已登记AFS Full集合、第五步PK0–PK4、取消实跑、长稳与性能仍另行验收。不能用#85外推新head已编译打包或公共Full已通过。
 
 ### CI0／CI1历史运行：旧包故障、修复与新候选复测
 
