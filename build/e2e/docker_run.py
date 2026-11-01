@@ -23,15 +23,17 @@ common = load('docker_common_driver', HERE / 'run.py')
 artifacts = load('docker_fixed_candidate', HERE / 'candidate.py')
 harness = load('docker_shared_harness', HERE / 'harness.py')
 afs = load('docker_afs_adapters', HERE / 'docker_afs.py')
+specials = load('docker_afs_specials', HERE / 'afs_specials.py')
 
 
 def selected_checks(profile, case=None):
-    if case in ('afs-component', 'afs-component-full', 'afs-sdk', 'afs-sdk-full'):
+    if case in ('afs-component', 'afs-component-full', 'afs-sdk', 'afs-sdk-full', *specials.CAMPAIGN_CASES):
         if profile != 'standalone':
             raise ValueError('AFS Docker targets require the standalone profile')
         if case.startswith('afs-component'):
             return (case,)
-        suffix = '-full' if case.endswith('-full') else ''
+        suffix = '-' + case.removeprefix('afs-sdk-') if case in specials.CAMPAIGN_CASES else (
+            '-full' if case.endswith('-full') else '')
         return ('afs-sdk-ownerfs' + suffix, 'afs-sdk-dfs' + suffix)
     return common.selected_checks(profile, case)
 
@@ -74,8 +76,13 @@ class DockerRun(common.Run):
         self.state = output / 'native-state'
         self.initialized = []
         full = bool(selected_case and selected_case.endswith('-full'))
-        self.afs_component = afs.Component(self, full=full) if selected_case and 'component' in selected_case else None
+        case_ids = specials.COMPONENT_CASES if selected_case == 'afs-component-specials' else None
+        self.afs_component = afs.Component(self, full=full, case_ids=case_ids) if (
+            selected_case and 'component' in selected_case) else None
         self.afs_product = afs.Product(self, full=full) if selected_case and 'afs-sdk' in selected_case else None
+        if self.afs_product:
+            self.afs_product.special = selected_case.removeprefix('afs-sdk-') if (
+                selected_case in specials.CAMPAIGN_CASES) else None
 
     def docker(self, *args, timeout=180, stream=True):
         if not os.path.isabs(self.docker_argv[0]):

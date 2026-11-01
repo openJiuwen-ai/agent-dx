@@ -130,6 +130,56 @@ Keep one original result/log/identity set and the frozen input; after successful
 verification remove this run's derived runtime tar, native state and redundant
 transfer copies. Do not prune shared Docker images or other tasks' caches.
 
+### Fixed-package specials (PK2 candidate)
+
+The explicit Docker cases `afs-component-specials`, `afs-sdk-restart` and
+`afs-sdk-pressure` extend fixed-package functional diagnostics. They are not
+part of default smoke or Full. Runtime qualification is recorded by candidate
+and environment in the canonical strategy; implementation alone is not PASS.
+
+`afs-component-specials` reuses five existing AFS runner cases: OwnerFs/DFS
+normal restart, DFS bounded-sync progress through the declared 64 MiB queue
+profile, required-replica recovery, and failed-close retirement. It uses the
+same Meta/Node binaries and normal process/mount cleanup as Full.
+
+The SDK restart case keeps one real Environment on each AFS data role. An
+SDK-launched background workload performs checked, synced file I/O while the
+second Adxlet is paused; the fixture then resumes it, restarts both Adxlets
+through the existing fault helper, and requires new process/session identities,
+unchanged external runtime identities, further mounted I/O progress and full
+SDK content verification. Explicit Environment deletion precedes AFS unmount.
+
+The SDK pressure case runs four workers with eight independent 64 KiB files
+each, checks every byte through the opposite AFS role, checks `EEXIST` for
+exclusive creation, and removes the files and Environments. This is a bounded
+functional workload: it does not prove disk exhaustion, fairness, memory SLA,
+throughput, crash durability or long-running reliability.
+
+Reuse the existing targeted-suite scheduler through its public native entry:
+
+```sh
+python3 build/e2e/targeted_suite.py \
+  --bundle /absolute/fixed-bundle/bundle.json \
+  --registry-images /absolute/fixed-bundle/registry-images.json \
+  --image-export /absolute/offline-images/image-export.json \
+  --artifact-commit REPLACE_WITH_PRODUCT_COMMIT \
+  --case afs-component-specials --case afs-sdk-restart --case afs-sdk-pressure \
+  --budget-seconds 3600 --case-timeout-seconds 900 --cgroupns host \
+  --output /absolute/new-special-result
+```
+
+Each case receives a fresh deployment and output. The suite verifies the
+frozen harness, exact required assertions and explicit normal cleanup receipts;
+a zero exit or container removal cannot replace them. A product case failure
+may be followed by another independent case only after cleanup is confirmed;
+the campaign remains failed. Timeout, missing identity or unconfirmed cleanup
+stops the campaign. To reproduce just one group, use the same fixed inputs
+with `build/e2e/run.py --profile standalone --case CASE` and a fresh output.
+
+The legacy standard-suite runner retains its ARM64 and full-environment
+guards. This native x86_64 campaign does not run pjdfstest/LTP/FSx/random
+compatibility suites or claim their execution counts.
+
 ### Fixed AFS component package on one Linux VM
 
 Provide a Linux VM whose native architecture matches the component, Python

@@ -70,8 +70,8 @@ def resources(namespace, image, architecture, registry_auth=False, node_names=()
     return objects
 
 
-def validate_result(report, cleanup, full=False):
-    expected = FULL_CASES if full else CASES
+def validate_result(report, cleanup, full=False, case_ids=None):
+    expected = case_ids if case_ids is not None else (FULL_CASES if full else CASES)
     records = report.get('cases', [])
     actual = [item.get('id') for item in records]
     if (report.get('status') != 'PASS' or report.get('cleanup_errors') or cleanup.get('status') != 'PASS'
@@ -86,9 +86,10 @@ def validate_result(report, cleanup, full=False):
 
 
 class Component:
-    def __init__(self, run, full=False):
+    def __init__(self, run, full=False, case_ids=None):
         self.run = run
         self.full = full
+        self.case_ids = case_ids
         self.roles = dict(ROLES, C='afs-c') if full else ROLES
         self.attempted_cases = False
         self.normal_cleanup = None
@@ -161,7 +162,9 @@ class Component:
 
     def scenarios(self, checks):
         run = self.run
-        with run.case('afs-component-full' if self.full else 'afs-component', checks) as record, \
+        name = 'afs-component-specials' if self.case_ids is not None else (
+            'afs-component-full' if self.full else 'afs-component')
+        with run.case(name, checks) as record, \
                 tempfile.TemporaryDirectory(prefix='adx-afs-inputs-') as temp:
             inputs = Path(temp)
             for name in ('afs-meta', 'afs-node'):
@@ -198,7 +201,7 @@ class Component:
                 if self.full:
                     args += ['--suite', 'ci-full']
                 else:
-                    for name in CASES:
+                    for name in self.case_ids if self.case_ids is not None else CASES:
                         args += ['--case', name]
                 handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGALRM)}
                 self.attempted_cases = True
@@ -216,7 +219,7 @@ class Component:
                                    for entry in report.get('cases', [])]
             if code:
                 raise ValueError('AFS component runner failed or was BLOCKED; see afs/result.json')
-            validate_result(report, self.normal_cleanup, full=self.full)
+            validate_result(report, self.normal_cleanup, full=self.full, case_ids=self.case_ids)
 
     def cleanup(self):
         run = self.run

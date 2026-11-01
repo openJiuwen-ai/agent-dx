@@ -20,6 +20,7 @@ def load(name, path):
 
 component_core = load('docker_component_assertions', KUBE / 'afs_component.py')
 product_core = load('docker_product_assertions', KUBE / 'afs_product.py')
+specials = load('docker_special_assertions', ROOT / 'build/e2e/afs_specials.py')
 
 
 def topology(run, roles, sdk=False):
@@ -69,6 +70,13 @@ class Component(component_core.Component):
 
 
 class Product(product_core.Product):
+    special = None
+
+    def scenarios(self, checks):
+        if self.special:
+            return specials.scenarios(self, checks, self.special)
+        return super().scenarios(checks)
+
     def configure(self, package, _inventory=None, harness_commit=None):
         if not package.get('with_afs'):
             raise ValueError('SDK-on-AFS requires an AFS ON candidate')
