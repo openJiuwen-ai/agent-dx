@@ -44,20 +44,27 @@ class EnvdBuildTests(unittest.TestCase):
             pin.write_text(json.dumps({"repository": str(upstream), "revision": revision}))
             observed = []
 
-            def compile_source(source, output, jobs):
-                observed.append(source)
-                self.assertEqual(builder.git_output(source, "rev-parse", "HEAD"), revision)
-                self.assertEqual(builder.git_output(source, "status", "--porcelain"), "")
-                self.assertEqual((source / "content").read_text(), "pinned")
-                self.assertTrue((source / 'packages/envd/source.go').is_file())
-                self.assertTrue((source / 'packages/shared/shared.go').is_file())
-                self.assertFalse((source / 'unrelated/asset').exists())
-                self.assertEqual((output, jobs), (root / "output", 2))
+            original_config = (upstream / '.git/config').read_bytes()
+            for protocol in (None, '2'):
 
-            with patch.object(builder, "ROOT", root), patch.object(builder, "_build", compile_source):
-                builder.build(None, root / "output", 2)
-            self.assertEqual(len(observed), 1)
-            self.assertFalse(observed[0].exists())
+                def compile_source(source, output, jobs, expected_protocol=protocol):
+                    observed.append(source)
+                    config = builder.git_output(source, 'config', '--local', '--list')
+                    self.assertEqual('protocol.version=2' in config.splitlines(), expected_protocol == '2')
+                    self.assertEqual(builder.git_output(source, "rev-parse", "HEAD"), revision)
+                    self.assertEqual(builder.git_output(source, "status", "--porcelain"), "")
+                    self.assertEqual((source / "content").read_text(), "pinned")
+                    self.assertTrue((source / 'packages/envd/source.go').is_file())
+                    self.assertTrue((source / 'packages/shared/shared.go').is_file())
+                    self.assertFalse((source / 'unrelated/asset').exists())
+                    self.assertEqual((output, jobs), (root / "output", 2))
+
+                with self.subTest(protocol=protocol), patch.object(builder, 'ROOT', root), \
+                        patch.object(builder, '_build', compile_source):
+                    builder.build(None, root / 'output', 2, git_protocol=protocol)
+                    self.assertFalse(observed[-1].exists())
+                    self.assertEqual((upstream / '.git/config').read_bytes(), original_config)
+            self.assertEqual(len(observed), 2)
 
     @unittest.skipUnless(os.name == 'posix', 'Linux source builder uses process groups')
     def test_git_timeout_terminates_its_child_processes(self):
@@ -76,7 +83,7 @@ class EnvdBuildTests(unittest.TestCase):
     def test_explicit_source_is_not_fetched_or_modified(self):
         source, output = Path("/explicit/source"), Path("/output")
         with patch.object(builder, "_build") as compile_source, patch.object(builder, "run_git") as run:
-            builder.build(source, output, 3)
+            builder.build(source, output, 3, git_protocol='2')
         compile_source.assert_called_once_with(source, output, 3)
         run.assert_not_called()
 
@@ -89,6 +96,20 @@ class EnvdBuildTests(unittest.TestCase):
                     patch.object(builder.subprocess, "run") as run:
                 with self.assertRaisesRegex(ValueError, "clean pinned revision"):
                     builder.build(Path("/source"), Path("/output"))
+                run.assert_not_called()
+
+    def test_pinned_source_checksum_is_rejected_before_go(self):
+        pin = json.loads((builder.ROOT / 'third_party/e2b/source.json').read_text())
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            first = source / pin['files'][0]['source']
+            first.parent.mkdir(parents=True, exist_ok=True)
+            first.write_bytes(b'content that differs from the pinned source')
+            with patch.object(builder.platform, 'system', return_value='Linux'), \
+                    patch.object(builder, 'git_output', side_effect=[pin['revision'], '']), \
+                    patch.object(builder.subprocess, 'run') as run:
+                with self.assertRaisesRegex(ValueError, 'pinned source checksum mismatch'):
+                    builder.build(source, source / 'output')
                 run.assert_not_called()
 
 
