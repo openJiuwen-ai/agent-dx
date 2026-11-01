@@ -342,6 +342,37 @@ windows/trends, the matching installed-SDK workload with
 normal cleanup receipts. The parent/JUnit must also pass. A failed or cancelled
 run remains failed; a normal cleanup alone cannot establish acceptance.
 
+### Recorded formal attempts (fixed Base236)
+
+The first v1 attempt (source `c9724a70`, fixed Base236) failed at 70.181902s
+OwnerFs and 205.250455s DFS on the cross-mount `runtime_disk_bytes` peak; neither
+is a one-hour pass. Both had zero workload errors and normal cleanup. A separate
+controlled diagnostic added/deleted one backend: EROFS/overlay mount views raised
+logical size by415,249,086B and restored it on deletion, while backing allocation
+rose only57,344B. The correction is a versioned measurement fix, with original
+failures retained, not a relaxed threshold or a product patch. A diagnostic
+operator import-path failure is retained separately.
+
+Fresh v2 admission used harness `d32a3dcf`, the tracked contract SHA
+`466b903f05c94e6fcb0dc5a91d99983dcd2eece2a14023c668a0f306e295e02c`,
+570 public-tool and 67 AFS-runner tests, and a separately audited 60.352433s
+observer qualification. Both actual formal targets remained 3600s:
+
+| Mode | Actual workload | First resource violation | Outcome |
+| --- | --- | --- | --- |
+| OwnerFs | 2209.735926s, 2287 cycles, 383 create/delete pairs, 133 samples | node1 total FDs 136 to 267, growth 131 above 128; afs-node FDs 28 to 160 | FAILED early; normal SDK/backend, AFS and Docker cleanup passed |
+| DFS | 272.604138s, 281 cycles, 49 create/delete pairs, 17 samples | node1 total FDs 134 to 271, growth 137 above 128; afs-node FDs 25 to 164 | FAILED early; all normal cleanup passed |
+
+Both had zero SDK/content errors, unchanged persistent identities and no OOM.
+The resource gate cancelled the worker; neither run completed an hour or all ten
+steady-state windows. The campaign remains failed, with no automatic retry or
+threshold change. Two host-procfs snapshots additionally found 19 more descriptors
+to one OwnerFs workspace root in the same afs-node process; they establish the
+observed growth, not its root cause. DFS descriptor targets were not captured.
+Investigate the fixed-product FD lifecycle before qualifying a repaired candidate;
+this test-only change does not patch production code. See the results and next
+steps in the [same five-step strategy](../../docs/testing/test-strategy.md#step-5).
+
 ### Fixed AFS component package on one Linux VM
 
 Provide a Linux VM whose native architecture matches the component, Python
@@ -871,13 +902,3 @@ python3 build/e2e/backend_start_timeout.py \
 ```
 
 Both image and runtime internal timers must fire at least ten seconds before the overall create budget. JSON and SSE must return `504 / DEADLINE_EXCEEDED / never / terminal` with the precise backend stage, and both original-request replay and authoritative failed-record replay must retain the exact message. The same real registry also returns missing-image, permission-denied, authentication-failure and rate-limit responses; JSON/SSE must retain their 404/403/401/429 categories and original message. Healthy create/delete calls before and after the faults verify runtime recovery. Evidence includes each response and an aggregate JSON verdict. This test injects faults only into the labelled disposable container.
-
-The first v1 attempt (source `c9724a70`, fixed Base236) failed at 70.181902s
-OwnerFs and 205.250455s DFS on the cross-mount `runtime_disk_bytes` peak; neither
-is a one-hour pass. Both had zero workload errors and normal cleanup. A separate
-controlled diagnostic added/deleted one backend: EROFS/overlay mount views raised
-logical size by415,249,086B and restored it on deletion, while backing allocation
-rose only57,344B. The correction is a versioned measurement fix, with original
-failures retained, not a relaxed threshold or a product patch. A diagnostic
-operator import-path failure is retained separately. Fresh v2 runs require their
-own frozen harness, complete tool/observer admission and actual3600s per mode.
