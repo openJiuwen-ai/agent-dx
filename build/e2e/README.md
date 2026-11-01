@@ -130,12 +130,17 @@ Keep one original result/log/identity set and the frozen input; after successful
 verification remove this run's derived runtime tar, native state and redundant
 transfer copies. Do not prune shared Docker images or other tasks' caches.
 
-### Fixed-package specials (PK2 candidate)
+### Fixed-package specials (PK2 minimum scope)
 
 The explicit Docker cases `afs-component-specials`, `afs-sdk-restart` and
 `afs-sdk-pressure` extend fixed-package functional diagnostics. They are not
-part of default smoke or Full. Runtime qualification is recorded by candidate
-and environment in the canonical strategy; implementation alone is not PASS.
+part of default smoke or Full. On 2026-11-01, fixed Base236 product `f93e2fb0`
+and test-source `ec144088aa82544e3b8fd5f85c93cc75145234cb` passed one complete
+three-group campaign on the same Linux6.8/x86_64/ext4 Docker VM, in 240.975
+seconds: five component cases, eight SDK restart assertions per mode, and five
+SDK pressure assertions per mode, including normal cleanup. The initial failed
+campaign and the stricter qualification are recorded separately in the canonical
+strategy. Other candidates and environments require their own runs.
 
 `afs-component-specials` reuses five existing AFS runner cases: OwnerFs/DFS
 normal restart, DFS bounded-sync progress through the declared 64 MiB queue
