@@ -64,7 +64,7 @@ def validate_samples(samples, limits, interval, *, baseline=None, require_progre
             raise ValueError('workload progress regressed')
         if sample['cycles'] > last_cycles:
             last_progress, last_cycles = now, sample['cycles']
-        if now - last_progress > max(30, interval * 3):
+        if sample.get('active', True) and now - last_progress > max(30, interval * 3):
             raise ValueError('workload heartbeat stalled')
         for node, observed in sample['nodes'].items():
             initial = (baseline or samples[0])['nodes'][node]
@@ -207,6 +207,7 @@ def scenarios(run, checks, options, limits, policy=None):
                 deadline = time.monotonic() + options['seconds'] + 600
                 next_sample = 0
                 last_cycles, last_progress_at = 0, time.monotonic()
+                retiring_at = None
                 while not (directory / 'ended.json').exists():
                     if time.monotonic() >= deadline:
                         raise subprocess.TimeoutExpired('continuous SDK workload', options['seconds'] + 600)
@@ -215,8 +216,13 @@ def scenarios(run, checks, options, limits, policy=None):
                         if progress['cycles'] > 0:
                             if progress['cycles'] > last_cycles:
                                 last_cycles, last_progress_at = progress['cycles'], time.monotonic()
-                            elif time.monotonic() - last_progress_at > max(30, options['sample_seconds'] * 3):
+                            elif (progress['status'] == 'running'
+                                  and time.monotonic() - last_progress_at > max(30, options['sample_seconds'] * 3)):
                                 raise ValueError('workload heartbeat stalled')
+                            if progress['status'] != 'running':
+                                retiring_at = retiring_at or time.monotonic()
+                                if time.monotonic() - retiring_at > 180:
+                                    raise ValueError('SDK terminal cleanup exceeded 180 seconds')
                             observed = observe_resources(run, progress)
                             if policy and mode == 'dfs':
                                 observed['peer_reads'] = peer_counter(cluster, 'B')
@@ -228,6 +234,11 @@ def scenarios(run, checks, options, limits, policy=None):
                                                  baseline=samples[0], require_progress=False)
                             if policy:
                                 acceptance.check_sample(observed, samples[0], policy)
+                                if (len(samples) > 1
+                                        and observed['observed_monotonic_seconds']
+                                        - samples[-2]['observed_monotonic_seconds']
+                                        > policy['maximum_sample_gap_seconds']):
+                                    raise ValueError('one-hour resource sampling gap exceeded 45 seconds')
                             run.event(f'SOAK {mode} elapsed={progress["elapsed_seconds"]:.1f}s '
                                       f'cycles={progress["cycles"]}')
                             next_sample = time.monotonic() + options['sample_seconds']

@@ -152,6 +152,28 @@ class FormalSoakContracts(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'coverage'):
             policy.evaluate(values, self.work(), 'dfs', policy.contract())
 
+    def test_swapped_observer_cgroup_and_unbound_final_counters_fail(self):
+        policy = module()
+        values = samples()
+        values[10]['nodes']['node1']['runtime_cgroup'] = '/another/empty/cgroup'
+        with self.assertRaisesRegex(ValueError, 'identity'):
+            policy.evaluate(values, self.work(), 'dfs', policy.contract())
+        values = samples()
+        values[-1]['cycles'] -= 1
+        with self.assertRaisesRegex(ValueError, 'coverage'):
+            policy.evaluate(values, self.work(), 'dfs', policy.contract())
+
+    def test_sampling_continues_during_cleanup_without_calling_it_active_io(self):
+        policy = module()
+        values = samples()
+        for observed in (3615, 3630, 3645, 3660):
+            terminal = deepcopy(values[-1])
+            terminal['observed_monotonic_seconds'] = observed
+            values.append(terminal)
+        report = policy.evaluate(values, self.work(), 'dfs', policy.contract())
+        self.assertEqual(report['status'], 'passed')
+        self.assertEqual(len(report['windows']), 10)
+
 
 if __name__ == '__main__':
     unittest.main()

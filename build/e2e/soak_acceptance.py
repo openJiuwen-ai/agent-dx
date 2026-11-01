@@ -42,6 +42,8 @@ def check_sample(sample, baseline, policy):
             raise ValueError('acceptance container identity changed: ' + node)
         if not observed.get('memory_cgroup') or (node != 'afs-m' and not observed.get('runtime_cgroup')):
             raise ValueError(node + ' cgroup memory coverage missing')
+        if any(observed.get(key) != initial.get(key) for key in ('memory_cgroup', 'runtime_cgroup')):
+            raise ValueError(node + ' cgroup observation identity changed')
         if node != 'afs-m' and observed.get('runtime_disk_present') is not True:
             raise ValueError(node + ' runtime disk coverage missing')
         for field, maximum in policy['peak_growth'].items():
@@ -96,7 +98,9 @@ def evaluate(samples, work, mode, policy):
             or counts.get('file') != counts.get('command')):
         raise ValueError('one-hour workload duration/content/counts/error/cleanup contract incomplete')
     if (len(samples) < 2 or samples[0]['elapsed_seconds'] > policy['maximum_boundary_gap_seconds']
-            or samples[-1]['elapsed_seconds'] < policy['seconds']):
+            or samples[-1]['elapsed_seconds'] < policy['seconds']
+            or samples[-1]['elapsed_seconds'] != work['elapsed_seconds']
+            or samples[-1]['cycles'] != cycles or samples[-1].get('operations') != counts):
         raise ValueError('one-hour resource coverage incomplete')
     baseline = samples[0]
     last_progress_time = baseline['observed_monotonic_seconds']
@@ -111,7 +115,7 @@ def evaluate(samples, work, mode, policy):
             raise ValueError('one-hour sampling gap or regressed workload progress')
         if sample['cycles'] > last_cycles:
             last_cycles, last_progress_time = sample['cycles'], now
-        if now - last_progress_time > policy['maximum_progress_stall_seconds']:
+        if sample.get('active') is True and now - last_progress_time > policy['maximum_progress_stall_seconds']:
             raise ValueError('one-hour workload stalled')
         previous = sample
     if baseline['instances'] != work.get('instances'):
