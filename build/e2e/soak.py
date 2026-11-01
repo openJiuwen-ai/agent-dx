@@ -14,6 +14,10 @@ import uuid
 _spec = importlib.util.spec_from_file_location('soak_docker_adapter', Path(__file__).with_name('docker_run.py'))
 docker_run = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(docker_run)
+_acceptance_spec = importlib.util.spec_from_file_location('soak_formal_acceptance',
+                                                       Path(__file__).with_name('soak_acceptance.py'))
+acceptance = importlib.util.module_from_spec(_acceptance_spec)
+_acceptance_spec.loader.exec_module(acceptance)
 
 CHECK = 'afs-continuous-soak'
 NODES = ('node1', 'node2', 'afs-m')
@@ -81,37 +85,40 @@ def validate_samples(samples, limits, interval, *, baseline=None, require_progre
                     raise ValueError(node + ' persistent process identity changed: ' + name)
 
 
-PROBE = '''from pathlib import Path
-import json, os, shutil, subprocess
-processes={};fds=0
-for path in Path('/proc').iterdir():
- if not path.name.isdigit(): continue
- try:
-  command=(path/'comm').read_text().strip()
-  names=('afs-meta','afs-node','adxlet','adx-coordinator','adx-apiserver','adx-ingress','sandboxd','envd')
-  if command not in names: continue
-  status=(path/'status').read_text().splitlines()
-  rss=next((int(s.split()[1])*1024 for s in status if s.startswith('VmRSS:')),0)
-  count=len(list((path/'fd').iterdir()));fds+=count
-  processes[command+':'+path.name]={'pid':int(path.name),'start_ticks':int((path/'stat').read_text().rsplit(')',1)[1].split()[19]),'rss_bytes':rss,'fds':count}
- except FileNotFoundError: continue
-print(json.dumps({'processes':processes,'fds':fds,'mounts':len(Path('/proc/self/mountinfo').read_text().splitlines()),'disk_bytes':int(subprocess.check_output(['du','-sb','/a'],text=True).split()[0]),'free_bytes':shutil.disk_usage('/a').free}))
-'''
+
+def cgroup_resources(path):
+    stat = dict(line.split() for line in (path / 'memory.stat').read_text().splitlines())
+    events = {key: int(value) for key, value in
+              (line.split() for line in (path / 'memory.events').read_text().splitlines())}
+    return {'bytes': int((path / 'memory.current').read_text()), 'anon_bytes': int(stat['anon']),
+            'file_bytes': int(stat['file']), 'events': events, 'path': str(path)}
 
 
 def observe_resources(run, progress):
     nodes = {}
     for node in NODES:
-        observed = json.loads(run.execute(node, 'python3', '-c', PROBE, timeout=30))
+        observed = json.loads(run.execute(node, 'python3', '/opt/adx/e2e/soak_probe.py', timeout=30))
         item = json.loads(run.docker('inspect', run.owned[node], stream=False))[0]
         pid = item['State']['Pid']
         group = next(line.split(':', 2)[2] for line in Path(f'/proc/{pid}/cgroup').read_text().splitlines()
                      if line.startswith('0::'))
-        observed['memory_bytes'] = int((Path('/sys/fs/cgroup') / group.lstrip('/') / 'memory.current').read_text())
+        memory = cgroup_resources(Path('/sys/fs/cgroup') / group.lstrip('/'))
+        observed.update(memory_bytes=memory['bytes'], memory_anon_bytes=memory['anon_bytes'],
+                        memory_file_bytes=memory['file_bytes'], memory_events=memory['events'],
+                        memory_cgroup=memory['path'])
+        if node != 'afs-m':
+            runtime = cgroup_resources(Path('/sys/fs/cgroup') / (run.id + '-' + node))
+            observed.update(runtime_memory_bytes=runtime['bytes'], runtime_anon_bytes=runtime['anon_bytes'],
+                            runtime_file_bytes=runtime['file_bytes'], runtime_memory_events=runtime['events'],
+                            runtime_cgroup=runtime['path'])
+        else:
+            observed.update(runtime_memory_bytes=0, runtime_anon_bytes=0, runtime_file_bytes=0,
+                            runtime_memory_events={'oom': 0, 'oom_kill': 0}, runtime_cgroup=None)
         observed['container_id'] = item['Id']
         nodes[node] = observed
     return {'elapsed_seconds': progress['elapsed_seconds'], 'observed_monotonic_seconds': time.monotonic(),
-            'cycles': progress['cycles'], 'nodes': nodes}
+            'cycles': progress['cycles'], 'operations': progress['operations'], 'instances': progress['instances'],
+            'active': progress['status'] == 'running', 'nodes': nodes}
 
 
 def worker_gone(run, receipt):
@@ -142,8 +149,10 @@ def stop_worker(run, directory, receipt):
     raise ValueError('SDK worker failed to terminate normally within 180 seconds')
 
 
-def scenarios(run, checks, options, limits):
+def scenarios(run, checks, options, limits, policy=None):
     product = run.afs_product
+    if policy:
+        (run.output / 'soak-contract.json').write_bytes(acceptance.CONTRACT_PATH.read_bytes())
     product.sdk({'mode': 'warm'}, run.output / 'afs-sdk-warm.json')
     sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'afs/tests'))
     try:
@@ -168,7 +177,9 @@ def scenarios(run, checks, options, limits):
             product.active = cluster
             samples, receipt = [], None
             report = {'status': 'failed', 'options': options, 'limits': limits, 'samples': 0,
-                      'qualification_only': True, 'cleanup_errors': [], 'mode': mode}
+                      'qualification_only': policy is None, 'cleanup_errors': [], 'mode': mode,
+                      'contract_id': policy['id'] if policy else None,
+                      'contract_sha256': options.get('contract_sha256')}
             try:
                 cluster.prepare()
                 peer_before = peer_counter(cluster, 'B') if mode == 'dfs' else None
@@ -207,12 +218,16 @@ def scenarios(run, checks, options, limits):
                             elif time.monotonic() - last_progress_at > max(30, options['sample_seconds'] * 3):
                                 raise ValueError('workload heartbeat stalled')
                             observed = observe_resources(run, progress)
+                            if policy and mode == 'dfs':
+                                observed['peer_reads'] = peer_counter(cluster, 'B')
                             samples.append(observed)
                             with (run.output / 'soak-samples.jsonl').open('a') as stream:
                                 stream.write(json.dumps(observed) + '\n')
                             if len(samples) > 1:
                                 validate_samples(samples[-2:], limits, options['sample_seconds'],
                                                  baseline=samples[0], require_progress=False)
+                            if policy:
+                                acceptance.check_sample(observed, samples[0], policy)
                             run.event(f'SOAK {mode} elapsed={progress["elapsed_seconds"]:.1f}s '
                                       f'cycles={progress["cycles"]}')
                             next_sample = time.monotonic() + options['sample_seconds']
@@ -220,6 +235,8 @@ def scenarios(run, checks, options, limits):
                 workload = json.loads((directory / 'workload.json').read_text())
                 report['workload'] = workload
                 final_sample = observe_resources(run, workload)
+                if policy and mode == 'dfs':
+                    final_sample['peer_reads'] = peer_counter(cluster, 'B')
                 samples.append(final_sample)
                 with (run.output / 'soak-samples.jsonl').open('a') as stream:
                     stream.write(json.dumps(final_sample) + '\n')
@@ -227,6 +244,8 @@ def scenarios(run, checks, options, limits):
                     raise ValueError('workload result identity mismatch')
                 validate_workload(workload, options['seconds'])
                 validate_samples(samples, limits, options['sample_seconds'])
+                if policy:
+                    report['acceptance'] = acceptance.evaluate(samples, workload, mode, policy)
                 if mode == 'dfs':
                     report['peer_reads'] = {'before': peer_before, 'after': peer_counter(cluster, 'B')}
                     if report['peer_reads']['after'] <= peer_before:
@@ -261,10 +280,23 @@ def scenarios(run, checks, options, limits):
                 report['cleanup_errors'] = list(product.cleanup_errors)
                 if product.cleanup_errors:
                     report['status'] = 'failed'
+                if policy:
+                    report.setdefault('acceptance', {'status': 'failed', 'error': report.get('error'),
+                                                     'qualification_only': False})
+                    report['acceptance'].update(contract_id=policy['id'],
+                                                contract_sha256=options['contract_sha256'],
+                                                cleanup_errors=list(product.cleanup_errors))
+                    if product.cleanup_errors:
+                        report['acceptance']['status'] = 'failed'
+                    (run.output / 'soak-acceptance.json').write_text(
+                        json.dumps(report['acceptance'], indent=2) + '\n')
                 (run.output / 'soak-result.json').write_text(json.dumps(report, indent=2) + '\n')
-                record['subcases'] = [{'id': n, 'status': report['status']} for n in (
+                assertions = (
                     'continuous-confirmed-content', 'command-file-and-churn', 'duration',
-                    'resource-sampling-and-bounds', 'stable-identities', 'normal-cleanup')]
+                    'resource-sampling-and-bounds', 'stable-identities', 'normal-cleanup')
+                if policy:
+                    assertions += ('steady-resource-trends', 'per-window-work-and-peer-progress', 'no-oom')
+                record['subcases'] = [{'id': n, 'status': report['status']} for n in assertions]
                 if report['status'] != 'passed' and 'error' not in report:
                     raise ValueError('continuous soak cleanup failed')
     finally:
@@ -276,8 +308,9 @@ def main(argv=None):
     for flag in ('bundle', 'registry-images', 'image-export', 'artifact-commit', 'output'):
         parser.add_argument('--' + flag, required=True)
     parser.add_argument('--mode', choices=('ownerfs', 'dfs'), required=True)
+    parser.add_argument('--acceptance', choices=('qualification', 'one-hour'), default='qualification')
     parser.add_argument('--seconds', type=int, required=True)
-    parser.add_argument('--sample-seconds', type=int, default=10)
+    parser.add_argument('--sample-seconds', type=int)
     parser.add_argument('--max-memory-growth-mib', type=int, default=512)
     parser.add_argument('--max-disk-growth-mib', type=int, default=256)
     parser.add_argument('--max-fd-growth', type=int, default=128)
@@ -286,8 +319,11 @@ def main(argv=None):
     parser.add_argument('--qualify-fail-after-cycles', type=int, default=0,
                         help='deliberately fail the test worker; never eligible for PASS')
     args = parser.parse_args(argv)
-    options = {'mode': args.mode, 'seconds': args.seconds, 'sample_seconds': args.sample_seconds,
-               'fail_after_cycles': args.qualify_fail_after_cycles}
+    policy = acceptance.contract() if args.acceptance == 'one-hour' else None
+    options = {'mode': args.mode, 'seconds': args.seconds,
+               'sample_seconds': args.sample_seconds if args.sample_seconds is not None else (15 if policy else 10),
+               'fail_after_cycles': args.qualify_fail_after_cycles, 'acceptance': args.acceptance,
+               'contract_sha256': acceptance.contract_sha() if policy else None}
     try:
         validate_options(options)
         limits = {'memory_bytes': args.max_memory_growth_mib * 1024**2,
@@ -295,12 +331,18 @@ def main(argv=None):
                   'mounts': args.max_mount_growth, 'min_free_bytes': args.min_free_mib * 1024**2}
         if any(value < 0 for value in limits.values()) or options['fail_after_cycles'] < 0:
             raise ValueError('resource limits and failure cycle count must be nonnegative')
+        if policy:
+            expected = {key: policy['peak_growth'][key] for key in limits if key != 'min_free_bytes'}
+            expected['min_free_bytes'] = policy['min_free_bytes']
+            if (options['seconds'] != policy['seconds'] or options['sample_seconds'] != policy['sample_seconds']
+                    or options['fail_after_cycles'] != 0 or limits != expected):
+                raise ValueError('one-hour acceptance requires the exact frozen duration, sampling and resource bounds')
     except ValueError as exc:
         parser.error(str(exc))
 
     class ContinuousRun(docker_run.DockerRun):
         def scenarios(self, checks, required=None):
-            return scenarios(self, checks, options, limits)
+            return scenarios(self, checks, options, limits, policy)
 
     forwarded = [value for flag in ('bundle', 'registry-images', 'image-export', 'artifact-commit', 'output')
                  for value in ('--' + flag, getattr(args, flag.replace('-', '_')))]

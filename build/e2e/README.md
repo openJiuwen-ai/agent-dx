@@ -254,11 +254,77 @@ Unconfirmed normal cleanup fails even if container removal succeeds.
 
 Read `result.json`, `soak-result.json`, `soak-sdk/workload.json`, samples,
 `soak-afs/cleanup.json`, `afs-sdk-cleanup.json`, `docker-cleanup.json` and JUnit
-together. `qualification_only` is always true in this first entry: configured
+together. The default entry retains `qualification_only=true`: configured
 hours or days do not establish formal long-run acceptance. Freeze an appropriate
 resource/trend/error/fault policy and actually complete the declared duration
 before making that claim. K8s, cross-VM failure isolation and precise performance
 are outside this implementation. Default smoke and Full selections are unchanged.
+
+### Frozen one-hour acceptance
+
+`--acceptance one-hour` selects the tracked
+[one-hour-v1 contract](soak-contracts/one-hour-v1.json). It requires exactly
+3600 seconds, 15-second sampling, no deliberate fault and unchanged peak bounds;
+the CLI rejects altered duration, sampling or relaxed limits. Run OwnerFs and
+DFS sequentially with the same fixed package and separate new outputs:
+
+```sh
+python3 build/e2e/soak.py \
+  --bundle /absolute/fixed-bundle/bundle.json \
+  --registry-images /absolute/fixed-bundle/registry-images.json \
+  --image-export /absolute/offline-images/image-export.json \
+  --artifact-commit REPLACE_WITH_PRODUCT_COMMIT \
+  --mode ownerfs --acceptance one-hour --seconds 3600 \
+  --output /absolute/new-ownerfs-one-hour-result
+```
+
+The one-hour workload is the same bounded, alternating 16 KiB fsync/cross-role
+read, confirmed-content verification, SDK command/file round trip and temporary
+Environment churn. Two anchor Environments and the AFS cluster remain live.
+Require >=600 verified publishing cycles and >=300 completed churns in total;
+each steady five-minute window needs >=25 cycles and >=10 completed churns.
+These minimums ensure sustained work, not a throughput SLA. There is no restart,
+fault injection, automatic retry, package change or threshold adjustment.
+
+All 3600 seconds are load time. The first 600 seconds are warmup for trend
+analysis only; peak/error/OOM/identity checks still apply then. Evaluate every
+one of the ten following 300-second windows with >=12 active samples each,
+<=45-second observation/progress gaps and <=30-second outer coverage gaps.
+DFS peer reads must increase in every steady window. Missing windows or counters
+cannot be omitted. Resource medians use active workload samples; the post-cleanup
+sample does not hide load-time growth.
+
+Observe Docker-node cgroups and sibling external-runtime cgroups separately,
+including anonymous/file memory and OOM events. Observe persistent process
+PID/start/RSS/FD, mounts, apparent AFS/data bytes versus logs, runtime state and
+retained stream bytes. A filesystem walk skips concurrently retired entries,
+counts hard links once and never follows external symlinks; other read errors
+fail sampling. Any OOM, changed anchor/container/process identity, content or
+SDK error, missing observation, exceeded peak or unconfirmed cleanup fails.
+
+The frozen JSON defines peak caps and the following limits for the ten window
+medians. Both last-minus-first and an ordinary least-squares slope over all
+window midpoints must pass; positive slopes are expressed per hour:
+
+| Metric per role | Maximum end delta | Maximum slope per hour |
+| --- | --- | --- |
+| Docker anonymous memory, aggregate persistent-process RSS, AFS data, runtime disk | 32 MiB | 16 MiB |
+| External-runtime anonymous memory, each persistent process RSS | 16 MiB | 8 MiB |
+| Persistent-process FDs | 4 | 4 |
+| Mount count | 1 | 1 |
+
+Page-cache observations remain visible but are bounded by the separate total
+memory peak, rather than mislabeled as anonymous leakage. Log bytes have a
+separate 128 MiB peak-growth allowance; data trend limits exclude those AFS logs.
+These v1 bounds define this fixed-working-set, one-hour test. Passing does not
+prove absence of smaller/slower leaks, 24-hour stability, internal GC/backlog
+correctness, fault recovery, cross-VM isolation or performance.
+
+Require `soak-contract.json` and its SHA, `soak-acceptance.json` with all ten
+windows/trends, the matching installed-SDK workload with
+`qualification_only=false`, samples, fixed product/harness identity and all
+normal cleanup receipts. The parent/JUnit must also pass. A failed or cancelled
+run remains failed; a normal cleanup alone cannot establish acceptance.
 
 ### Fixed AFS component package on one Linux VM
 

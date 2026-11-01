@@ -28,7 +28,8 @@ def run(connection, image, config, directory, stop):
               'requested_seconds': config['seconds'], 'elapsed_seconds': 0, 'cycles': 0,
               'operations': {key: 0 for key in ('command', 'file', 'create', 'delete')},
               'verified_bytes': 0, 'instances': {}, 'remaining': [], 'owner': config['owner'],
-              'mode': config['mode'], 'qualification_only': True,
+              'mode': config['mode'], 'qualification_only': config.get('acceptance', 'qualification') != 'one-hour',
+              'contract_sha256': config.get('contract_sha256'),
               'injected_failure_after_cycles': config['fail_after_cycles']}
 
     def publish():
@@ -59,6 +60,7 @@ def run(connection, image, config, directory, stop):
         report['sdk_source'] = prepared['sdk_source']
         report['sdk_version'] = prepared['sdk_version']
         started = time.monotonic()
+        report['status'] = 'running'
         deadline = started + config['seconds']
         next_churn = started
         while time.monotonic() < deadline and not stop.is_set() and not control.exists():
