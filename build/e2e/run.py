@@ -1274,7 +1274,7 @@ def write_junit(path, report, suite_name='platform-e2e'):
     ET.ElementTree(suite).write(path, encoding='utf-8', xml_declaration=True)
 
 
-def main():
+def main(argv=None, *, native_factory=None, required_checks=None):
     p = argparse.ArgumentParser()
     p.add_argument('--bundle', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
@@ -1284,7 +1284,7 @@ def main():
     p.add_argument('--profile', choices=('l0', 'standalone'), default='standalone')
     p.add_argument('--case', help='run one case as a targeted diagnostic, not a profile gate')
     p.add_argument('--cgroupns', choices=('private', 'host'), default='private')
-    a = p.parse_args()
+    a = p.parse_args(argv)
     out = a.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
     native = a.image_export is not None
@@ -1295,15 +1295,19 @@ def main():
                                                            Path(__file__).with_name('docker_run.py'))
         driver = importlib.util.module_from_spec(native_spec)
         native_spec.loader.exec_module(driver)
-        run = driver.DockerRun(out, cgroupns=a.cgroupns, selected_case=a.case)
+        factory = native_factory or driver.DockerRun
+        run = factory(out, cgroupns=a.cgroupns, selected_case=a.case)
     else:
         run = Run(out, cgroupns=a.cgroupns, selected_case=a.case)
     error = None
     checks = []
     m = None
-    required = driver.selected_checks(a.profile, a.case) if native else selected_checks(a.profile, a.case)
+    required = required_checks or (driver.selected_checks(a.profile, a.case) if native
+                                   else selected_checks(a.profile, a.case))
 
     def cancel(signum, frame):
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, signal.SIG_IGN)
         raise InterruptedError(f'canceled by signal {signum}')
 
     for s in (signal.SIGTERM, signal.SIGINT):
