@@ -369,11 +369,6 @@ metadata = {
     "retained_reference_columns": 9,
     "normative_html_pages": 1,
     "offline": True,
-    "component_integration_implemented": True,
-    "ci_asset_handoff_implemented": True,
-    "ci_component_adapter_implemented": True,
-    "ci_runtime_validated": True,
-    "ci_runtime_scope": "Full #77 targeted AFS components, fixed product #223; product path and required gate pending",
-    "ci_product_cases_integrated": False,
+    "runtime_validation": "not performed by renderer; see dated build evidence in the source",
 }
 print(json.dumps(metadata, ensure_ascii=False, indent=2))

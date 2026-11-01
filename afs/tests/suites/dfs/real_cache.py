@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+from fixtures.common import is_single_host
+
 from suites.dfs.cache_probe import assert_cached_reuse as assert_cached_reuse
 from suites.dfs.cache_probe import assert_conflict_direct as assert_conflict_direct
 from suites.dfs.cache_probe import parse_cache_open as parse_cache_open
@@ -11,7 +13,7 @@ PROBE = (Path(__file__).resolve().parent / "cache_probe.py").read_text()
 
 
 def run_probe(c, action):
-    assert c.config["kind"] == "singlevm", "cache probe needs both real mounts and reader log"
+    assert is_single_host(c.config), "cache probe needs both real mounts and reader log"
     assert c.case.observe_cache, "cache evidence requires existing Info-level open records"
     c.python("A", "os.chown(sys.argv[1],int(sys.argv[2]),int(sys.argv[3]))", c.mount("A"), c.uid, c.gid, owner=False)
     code = (

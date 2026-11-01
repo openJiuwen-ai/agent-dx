@@ -117,6 +117,7 @@ steps:
   timeout_in_minutes: 45
   artifact_paths:
   - out/buildkite/logs/**/*
+  - out/buildkite/afs-contracts/*
   env:
     BUILDKITE_AGENT_NAME: agent-stack-k8s
     ADX_WITH_AFS: '1'

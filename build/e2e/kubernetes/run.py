@@ -79,6 +79,7 @@ def stage_harness(destination, package_manifest=None, harness_commit=None):
 def identity(bundle, registry, commit=None, ci=False):
     m = json.loads(bundle.read_text())
     common.afs_handoff.verify_bundle(bundle.parent, m)
+    common.afs_contracts.verify_bundle(bundle.parent, m)
     r = json.loads(registry.read_text())
     if m.get('schema_version') != 1 or r.get('schema_version') != 1:
         raise ValueError('invalid Kubernetes artifact manifest')
@@ -155,14 +156,15 @@ def credentials(directory, image, runtime_image):
 
 
 def selected_checks(profile, selected_case):
-    if selected_case == 'afs-sdk':
+    if selected_case in ('afs-sdk', 'afs-sdk-full'):
         if profile != 'full':
             raise ValueError('afs-sdk requires the full Kubernetes profile')
-        return ('afs-sdk-ownerfs', 'afs-sdk-dfs')
-    if selected_case == 'afs-component':
+        suffix = '-full' if selected_case.endswith('-full') else ''
+        return ('afs-sdk-ownerfs' + suffix, 'afs-sdk-dfs' + suffix)
+    if selected_case in ('afs-component', 'afs-component-full'):
         if profile != 'full':
             raise ValueError('afs-component requires the full Kubernetes profile as a targeted case')
-        return ('afs-component',)
+        return (selected_case,)
     if selected_case == 'redis-pod-restart':
         if profile != 'full':
             raise ValueError('redis-pod-restart requires the full Kubernetes profile')
@@ -235,8 +237,10 @@ class KubernetesRun(common.Run):
         self.selected_case = selected_case
         self.redis_storage_class = redis_storage_class
         self.redis_pod_manifest = None
-        self.afs_component = AfsComponent(self) if selected_case == 'afs-component' else None
-        self.afs_product = AfsProduct(self) if selected_case == 'afs-sdk' else None
+        self.afs_component = (AfsComponent(self, full=selected_case.endswith('-full'))
+                              if selected_case in ('afs-component', 'afs-component-full') else None)
+        self.afs_product = (AfsProduct(self, full=selected_case.endswith('-full'))
+                            if selected_case in ('afs-sdk', 'afs-sdk-full') else None)
         self.stop_evidence = 'stop' in selected_checks(profile, selected_case)
 
     def kube(self, *args, timeout=180):

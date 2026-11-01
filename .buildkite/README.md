@@ -760,3 +760,41 @@ and `PIP_DEFAULT_TIMEOUT`, like the SDK package job. The image builder forwards
 these settings through a temporary BuildKit secret, outside its build context;
 index credentials are not stored in Docker build arguments or image layers.
 When no overrides are set, the runtime base image keeps its pip configuration.
+
+## AFS CI4 functional Full (validated candidate, MR130 pending merge)
+
+With AFS ON, the normal Full profile keeps all eleven public groups and then requires
+`afs-component-full` (the registered 24 functional cases) and `afs-sdk-full`
+(OwnerFs/DFS, eight assertions each). Base L0 keeps the existing five component
+cases and six SDK assertions per mode. Specials, performance, hour/day soak and
+power-loss/HA are separate scopes. The candidate passed normal Full90 with public11 + component24 + SDK16; MR130 is still open.
+
+The x86 AFS Base build freezes the `fuse_contract` test ELF using
+Cargo `test --no-run`'s exact artifact record, strips debug sections and verifies four exact
+selectors without running them. It publishes `out/buildkite/afs-contracts/*`
+separately from the product component/package. Image preparation verifies the
+source/target/product-binary/ELF/archive hashes, stages the ELF in
+`/opt/adx/e2e/afs-contracts/`, and binds `afs-contracts.json` in the bundle.
+Normal Full rejects missing/foreign assets before deployment. Old candidates
+remain usable for explicit smoke diagnostics; a CI4 Full candidate must be built
+with the new asset tooling. No product is rebuilt inside a test Pod.
+
+Components use one M Pod for local kernel/two-mount contracts and M/A/B/C Pods
+for cluster contracts; A/B must occupy different workers, while C may share a
+worker but has its own Pod/mount identity. SDK Full adds old-FD namespace identity
+and exact growth/truncation/EOF readback. Same-directory restart is process
+recovery on emptyDir, not Pod/VM persistence. Full includes all mandatory smoke
+assertions and normal cleanup; targeted success is not a complete Full result.
+
+CI4 targets use `ADX_E2E_TARGET_CASE=afs-component-full` or `afs-sdk-full`;
+AFS targets are not part of the existing public `ADX_E2E_TARGET_CASES` campaign.
+Only the Full local M Pod binds `/sys/devices/virtual/bdi` writable. Cache probes
+adjust and restore only their own FUSE mount's BDI, not a host disk or global
+sysctl. Base resources are unchanged. Full86/87 failures are retained.
+Base231 passed after two public Platform Redis
+failures and unchanged retries; issue71 remains open. Targeted component Full89
+passed all 24 cases and four exact kernel tests using the new frozen ELF.
+Normal Full90 (harness27d6a65e, product4954413e/images231, no selectors/profile
+bypass) passed public11 + component24 + SDK16, required receipts and normal
+cleanup. The candidate is validated; upstream integration awaits MR130 review.
+See the single `docs/testing/test-strategy.html` for dated evidence and scope.

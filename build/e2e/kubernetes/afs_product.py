@@ -12,6 +12,7 @@ ROOT = HERE.parents[2]
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 from afs_component import resources as component_resources
+SDK_FULL_EXTRA = ('namespace-identity', 'truncate-visibility')
 SDK_CASES = ('mount-identity', 'bidirectional-publish', 'permissions', 'readonly', 'remove', 'environment-cleanup')
 
 
@@ -34,17 +35,21 @@ def resources(objects, namespace, image, architecture, registry_auth=False, node
     return objects
 
 
-def validate_sdk_result(report, mode):
+def validate_sdk_result(report, mode, full=False):
+    expected = SDK_CASES + SDK_FULL_EXTRA if full else SDK_CASES
     cases = report.get('cases', [])
     if (report.get('status') != 'passed' or report.get('mode') != mode or report.get('cleanup_errors')
-            or len(cases) != len(SDK_CASES) or {c.get('id') for c in cases} != set(SDK_CASES)
+            or len(cases) != len(expected) or {c.get('id') for c in cases} != set(expected)
             or any(c.get('status') != 'passed' for c in cases)):
         raise ValueError('SDK AFS assertions or Environment cleanup did not pass completely')
+    if full and report.get('full') is not True:
+        raise ValueError('SDK Full evidence is required')
 
 
 class Product:
-    def __init__(self, run):
+    def __init__(self, run, full=False):
         self.run = run
+        self.full = full
         self.config = None
         self.active = None
         self.cleanup_errors = []
@@ -121,7 +126,7 @@ class Product:
                     case = Case('afs.sdk.' + mode, ('cluster-sdk',), mode, (), None)
                     cluster = Cluster(self.config, inputs, output, case, 'afs-test-' + uuid.uuid4().hex)
                     self.active = cluster
-                    with run.case('afs-sdk-' + mode, checks) as record:
+                    with run.case('afs-sdk-' + mode + ('-full' if self.full else ''), checks) as record:
                         try:
                             cluster.prepare()
                             identities = {}
@@ -134,9 +139,10 @@ class Product:
                                 identities[role] = json.loads(visible['stdout'])
                             cluster.record('sandboxd.mount_namespace_visible', identities)
                             before = peer_counter(cluster, 'B') if mode == 'dfs' else None
-                            report = self.sdk({'mode': mode, 'paths': {r: cluster.workspace(r) for r in ('A', 'B')},
+                            report = self.sdk({'mode': mode, 'full': self.full,
+                                               'paths': {r: cluster.workspace(r) for r in ('A', 'B')},
                                                'identities': identities}, output / 'sdk-result.json')
-                            validate_sdk_result(report, mode)
+                            validate_sdk_result(report, mode, full=self.full)
                             if mode == 'dfs':
                                 after = peer_counter(cluster, 'B')
                                 assert after > before, (before, after)

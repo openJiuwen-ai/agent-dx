@@ -77,6 +77,12 @@ case "$component" in
     for binary in afs-meta afs-node; do
       cp "$CARGO_TARGET_DIR/release/$binary" "$output/$binary"
     done
+    if [[ $ADX_RELEASE_TARGET == x86_64-unknown-linux-gnu ]]; then
+      echo '--- :package: Freeze FUSE contract test assets (not product payload)'
+      rm -rf out/buildkite/afs-contracts
+      python3 build/e2e/afs_contracts.py --commit "$BUILDKITE_COMMIT" --target "$ADX_RELEASE_TARGET" \
+        --meta "$output/afs-meta" --node "$output/afs-node" --output out/buildkite/afs-contracts
+    fi
     ;;
   *)
     echo "unknown build component: $component" >&2

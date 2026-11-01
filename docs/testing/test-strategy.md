@@ -1,9 +1,9 @@
 <a id="top"></a>
 # ADX／AFS 测试规范：五步验证路径
 
-状态：2026-11-01。默认AFS ON候选已在Base #227完成编译、新包/镜像及公共＋AFS冒烟，显式OFF的#226也通过，改动尚未合入。AFS专属串行冒烟本次2分45秒；完整CI时差受到公共Redis首败与重试干扰，不能当成稳定AFS增量。共享默认分支、外部触发与合入规则未改。
+状态：2026-11-01。CI0–CI3及默认AFS冒烟已合入；CI4候选[MR130](https://gitcode.com/openJiuwen/agent-dx/merge_requests/130)已通过正常Full，尚未合入。
 
-[OwnerFs MR !126](https://gitcode.com/openJiuwen/agent-dx/merge_requests/126)、[CI0/CI1 MR !127](https://gitcode.com/openJiuwen/agent-dx/merge_requests/127)、[SDK/冒烟 MR !128](https://gitcode.com/openJiuwen/agent-dx/merge_requests/128)均已合入。早期Base #223固定包验证保留原身份；当前正式集成验证采用master `a76a97c6`和Base #224新制品。本轮仅运行验证和更新规范，未修改生产/测试/CI实现、共享默认分支或合入保护。当前结果、待补项与历史失败同页记录，组件、产品和门禁分别举证。
+先按下方五步理解验证时机，再用同页总表看现状与待补项；目录、环境、入口、具体版本及失败证据在对应步骤展开。
 
 ## 先看五步的逻辑
 
@@ -15,7 +15,7 @@
 4. **Buildkite门禁：用已有CI环境保护共享集成。** 在ADX既有目标K8s部署AFS，选核心用例进冒烟、更完整功能进Full，并验证ADX实际使用AFS；不调用开发者VM。
 5. **固定包验收：开发者和测试人员都能自主闭环。** 拿固定包及配套制品，在合格环境中复用公共E2E跑全量、专项；小时／天级长稳和受控性能另补公共能力与AFS负载。
 
-第2/3步按开发者条件选择，没条件可以不跑并注明未验证；实际失败不能伪装成环境跳过。当前已通过AFS组件定向CI；本分支已补SDK产品路径与必需包装，真实SDK与固定包组合门禁均已通过；接线已合入，正式新包#224通过；本轮默认ON候选#227与显式OFF#226均通过，候选待合入。它决定已触发构建的AFS模式，不新增事件触发；合入pipeline-success要求仍为false，不能当作已生效的自动合入保护。两步都默认在一台Linux VM内：第二步同guest多进程，第三步隔离namespace。可选SSH多VM适配仍保留，未纳入本轮实测；这不是AFS不能容器化的声明。
+第2/3步按环境条件选择，不强制每位开发者都跑；实际失败必须保留。第4步复用ADX的K8s环境，第5步复用固定版本和同一套断言。不同环境、版本和验证范围不能继承通过结果。
 
 ## 五步总表
 
@@ -24,16 +24,16 @@
 | 步骤 | 原则／要拦截的问题 | 当前现状（事实） | 环境、目录与入口 | 待补项（未实施） | 优先级 |
 | --- | --- | --- | --- | --- | --- |
 | ① 基础UT／LLT | 尽早发现模块规则、错误传播、状态机及接口合同回归 | 已有8个AFS crate测试入口；普通非ignored测试已接ON组件构建 | Linux；UT在源文件，LLT在域内tests；`make afs-test`／选包 `cargo test` | 固定推荐范围、说明feature/ignored边界；新功能按代码补UT，不另造runner | 维护基线；P0明确范围 |
-| ② 单VM集成 | 验证真实Meta/Node、FUSE/bind、数据/权限/缓存和正常恢复/清理 | 已实现统一入口和11个基础case；本轮冻结产物真实运行11/11通过 | 一台Linux VM；`afs/tests/run.py`＋`suites/`＋local/exec适配 | 此前冻结输入的新构建阻塞保留为历史；后续新版本持续跑对应本地集合 | P0基础已完成 |
-| ③ 多namespace集成 | 验证隔离节点的真实TCP/mTLS、远端数据路径、恢复和多读者 | 用户确认一VM多namespace；三角色基础＋C读者共9case，本轮9/9通过 | 一VM的M/A/B/C隔离角色；标准Linux环境说明；`cluster-basic`／`cluster-manyread`；同run.py | 可选SSH真实多VM适配未实跑；不宣称VM断电/宿主故障隔离 | P1基础已完成 |
-| ④ Buildkite流水线验证 | 防止共享候选包破坏AFS/ADX基本功能；流水线内必测、事件触发、合入保护分别验收 | MR126/127/128已合入；Base224正式新包通过。本轮Base默认ON的227与显式OFF的226均通过，候选待合入；Full缺省模式已对齐并通过合同检查。合入pipeline-success仍false | 既有CI目标K8s；`run-e2e.sh` → `afs_gate.py`；Base本次固定22c7f9b3，未传旧制品或诊断选择器 | 默认ON候选评审合入；外部触发仍单独核实；CI4 Full／PK0专项 | P0默认ON合入；P1 Full |
+| ② 单VM集成 | 验证真实Meta/Node、FUSE/bind、数据/权限/缓存和正常恢复/清理 | 统一入口已实现；历史冻结候选基础11/11通过；当前登记13基础＋2扩展，按实际制品/环境分别验收 | 一台Linux VM；`afs/tests/run.py`＋`suites/`＋local/exec适配 | 此前冻结输入的新构建阻塞保留为历史；后续新版本持续跑对应本地集合 | P0基础已完成 |
+| ③ 多namespace集成 | 验证隔离节点的真实TCP/mTLS、远端数据路径、恢复和多读者 | 一VM多namespace已实现；历史冻结候选三角色基础＋C读者9/9通过，不继承为当前其它环境的成绩 | 一VM的M/A/B/C隔离角色；标准Linux环境说明；`cluster-basic`／`cluster-manyread`；同run.py | 可选SSH真实多VM适配未实跑；不宣称VM断电/宿主故障隔离 | P1基础已完成 |
+| ④ Buildkite流水线验证 | 防止共享候选包破坏AFS/ADX；流水线内必测、事件触发、合入保护分别验收 | 上游MR126–129已合入、默认ON原冒烟通过；CI4候选Full90完整公共11＋组件24＋SDK16及清理通过，MR130尚未合入 | 既有目标K8s；`run-e2e.sh` → `afs_gate.py`；组件复用AFS `run.py`，SDK融入ADX公共E2E | 评审合入MR130及合入后新候选验证；公共Redis Issue71独立跟踪；外部relay/合入强制另核 | P1候选合入与PK0拿包复现 |
 | ⑤ 固定包验收 | 人或AI可自主部署、验收和复现，扩大版本质量验证 | 公共K8s Full、Docker单宿主11组和专项已有；只有5分钟soak/90秒采样，完整长稳未闭环 | 先备固定包/SDK/backend/bundle及合格环境；直接公共E2E或独立Full代跑 | PK0–PK4：拿包复现→产品Full→专项→公共长稳→受控性能；复用第四步适配，补说明/负载/判据 | P1可复现全量/专项；P2长稳/性能 |
 
 ## 统一口径与优先级
 
 - **已定原则／决策**：组件UT/集成归AFS，真实组件测试统一目标 `afs/tests/`；ADX公开SDK及完整产品场景归 `build/e2e/`。本地、CI、拿包验收复用断言和结果语义，按环境适配，不复制一套Buildkite专用业务用例。
 - **事实**是已有代码/调用；**已有规划**是原仓内目标但未闭环；**待补项**是后续实现范围；**待验证**是尚未实测的环境/触发条件。总体规范已确认，不表示具体CLI文件、CI接线或所有场景已存在。
-- **当前**第二/三步基础及CI0/CI1组件定向闭环已通过；**P0**正式候选#224已通过；自动触发和合入强制策略尚未闭合（本次只读核实，不改共享设置）；SDK与流水线内冒烟已通过，**P1**扩产品Full、拿包复现和专项，**P2**建设完整长稳及受控性能。实现顺序不把本地VM变成所有开发者的提交前强制条件。
+- **当前**第二/三步基础、CI0–CI3与Base默认ON已实现并有对应冻结候选证据；**P1**CI4候选Full90已通过，待评审合入并继续PK0拿包复现和专项；**P2**完整长稳及受控性能。公共Redis间歇问题单独跟踪，不改ADX生产实现或隐藏失败。自动触发和合入强制另验，不把本地VM变成所有开发者的提交前强制条件。
 - **通过标准**：选中的必需项必须实际执行，0匹配、ignored、未执行、BLOCKED不能记PASS；定向通过不冒称完整Full，含AFS二进制不证明产品使用了AFS；正常清理也必须举证。
 - **环境与结果范围**：VM、Docker、K8s分别记录；Pod跨worker不能冒充多VM/断电验证；功能、正常恢复、故障、长稳及性能分别报告。CI缺必需环境不能静默跳过为成功。
 
@@ -211,19 +211,60 @@ python3 afs/tests/run.py run --suite cluster-manyread --env /absolute/namespaces
 <a id="step-4"></a>
 ## 第四步：Buildkite共享门禁
 
-**本步原则、现状与优先级**：原则：复用既有CI目标K8s，部署AFS并选集；不调用个人VM。现状：普通Cargo、CI0资产/环境和CI1真实组件定向已通过，SDK产品路径本分支Full #81已通过；必需包装在#85以固定包通过。接线已合入且正式候选#224全流程通过；当前缺口是自动触发/合入必需状态和CI4完整Full选集。优先级：P0冒烟、P1 Full。
+**本步原则、现状与优先级**：复用ADX既有目标K8s和部署入口，不调用个人VM；Base保留原冒烟，Full明确扩展基础功能。CI0–CI3、默认ON和Base230新制品冒烟已通过；CI4候选Full90已通过，当前仍待评审合入；已有实测和公共问题见下表。优先级P1：候选合入与PK0拿包复现；线上事件触发/强制合入策略分别核实，不从流水线通过推断。
 
 **状态**：五步总体逻辑已确认；以下目录/命令中标注目标或待补者尚未实施。
 
-### Base／Full默认AFS冒烟与时延验证（2026-11-01，候选待合入）
+### CI4候选已验证：组件24项与SDK16项融入公共Full
 
-**默认覆盖所有进入现有流水线的改动，只跑AFS既定冒烟。** 仓内没有按改动范围选择AFS组件的机制，因此候选在`.buildkite/pipeline-package.yml`顶层用`${ADX_WITH_AFS:-1}`统一模式：不传参数即ON，显式`0`仍可关闭。历史master #221确有省略AFS参数的调用；其它专项构建中显式OFF的调用仍有效。本候选尚未合入，不能称线上默认已生效。
+MR129已合入master `7b3cb9f9`。本轮先以新master默认ON验证既有冒烟，再用CI4候选的新包、SDK、
+镜像和独立测试ELF运行真实Full，不更换共享默认分支、hook、合入规则或生产代码。
+
+原则是分清集合与环境：当前源码注册46项，24项基础/扩展功能、20项读写专项、2项性能资产。
+CI4首批明确登记24项功能（13本地＋9跨角色＋2扩展），包含原冒烟；不以`--all`代替规范，不把专项/性能纳入日常门禁。
+本分支已在[正常Full90](https://buildkite.com/agent-dx/agent-dx-full-test/builds/90)完成真实验收；MR130尚未合入。通过范围为明确登记的集合和实际环境，不代表所有46项或后端矩阵已验收。
+
+| 内容 | 入口／位置 | 当前实现和验收边界 |
+| --- | --- | --- |
+| 明确的组件Full选集 | `afs/tests/suites/ci_full.py`统一登记ID；`python3 afs/tests/run.py run --suite ci-full`复用原断言 | 24项核心/扩展，含namespace、正常恢复、权限/缓存、多读者、顺序/busy；必需case或清理缺失判红 |
+| 单Pod内核环境 | `afs/tests/fixtures/kubernetes.py`＋`afs/tests/fixtures/multivm.py` | 记录kubernetes/local，M Pod内多进程和双挂载；仅Full M挂载可写BDI目录，探针只改自有FUSE BDI并恢复；适用13基础＋2扩展 |
+| 跨Pod环境 | `build/e2e/kubernetes/afs_component.py` | M/A/B/C独立Pod，A/B跨worker；C独立读者且如实报告worker，不要求虚构第三worker |
+| 测试ELF交接 | `build/e2e/afs_contracts.py`；Base `build-afs`独立artifact | Linux builder冻结同源`fuse_contract`、四精确selector；包外测试资产，绑定源码/架构/产品binary/ELF/archive SHA；缺资产正常Full在部署前失败 |
+| Full SDK存储行为 | `build/e2e/kubernetes/afs_product.py`／`build/e2e/afs_sdk.py` | 保留六项冒烟，另加旧FD经rename/unlink身份、增长/截短/EOF，共每模式8项；不修改SDK/ADX生产接口 |
+| 公共Full编排 | `.buildkite/pipeline-full.yml: platform-e2e`，候选镜像就绪后调用`.buildkite/run-e2e.sh` → `build/e2e/kubernetes/afs_gate.py --profile full` | 原11组＋afs-component-full＋afs-sdk-full；Base l0仍原5＋2×6；每组/root/JUnit/summary和正常清理分别验收 |
+
+以下为本分支候选的独立构建证据；上游当前仍为MR129冒烟范围，CI4需MR130评审合入。
+
+| 构建／身份 | 已有结果 | 当前结论 |
+| --- | --- | --- |
+| Base228，master7b3cb9f9 | 默认ON既有冒烟通过；envd下载首次失败和原条件retry保留 | MR129合入后基线，不含CI4 ELF |
+| Base229，40947929 | cargo代理名解析错误；Execd外部fetch超时，原件分别保留 | 失败，已修复资产脚本 |
+| Base230，e5b56e03 | 无重试PASS；新包/SDK/镜像、独立ELF及原public2＋组件5＋SDK12、各层清理通过 | 旧测试ELF候选有效；四selector仅list时不记实跑 |
+| Full86，harness2e73738b／产品230 | 24项全执行，20PASS/4FAIL；缓存准备遇sysfs只读；正常清理通过 | 已补仅Full M的BDI挂载，不删除case |
+| Full87，harness8b088e2b／产品230 | 23PASS/1FAIL；旧H1存活时旧Rust用例仍要求H3零READ，39对21；清理通过 | 测试混合了互斥前提；保持冲突回退和正确性，独立inode严格验证同版本零READ |
+| Full88，harness8b088e2b／产品230 | SDK OwnerFs/DFS各8项通过，清理通过 | SDK定向通过，不等于公共11组或完整CI4通过 |
+| [Base231](https://buildkite.com/agent-dx/agent-dx/builds/231)，4954413e | 新ELF/包/SDK/镜像及原冒烟通过；普通AFS2058PASS/58ignored，源码Python14/510/37/8；Platform前两次不同Redis失败保留，第三次原条件通过 | 同源新候选有效；Issue71继续开放，不因重试成功称公共问题根治 |
+| [Full89](https://buildkite.com/agent-dx/agent-dx-full-test/builds/89)，harness27d6a65e／产品231 | 组件24/24及四内核均实跑PASS、0ignored；组件断言128.004秒；正常AFS和K8s清理通过 | 新ELF648ac566与产品495/架构/二进制SHA绑定；冲突21→39，独立inode同版本4136→4136；仍是组件定向范围 |
+| [正常Full90](https://buildkite.com/agent-dx/agent-dx-full-test/builds/90)，harness27d6a65e／产品231 | 无target/profile覆盖，省略AFS参数实际ON；公共11＋组件24＋SDK16、正常AFS/Env/backend/K8s清理及最终作业通过 | root及三子harness完整338文件对象一致，product495；Root/JUnit/CI summary、公共Full stop六份观测收据均为必需验收 |
+
+定向入口用`ADX_E2E_TARGET_CASE=afs-component-full`或`afs-sdk-full`，没有扩展公共campaign的`ADX_E2E_TARGET_CASES`集合。
+普通新Base镜像携带独立测试资产供Full复用；产品制品原transport不改，测试资产当前单独走Buildkite。
+旧Rust合同修正只涉及`afs/tests/fuse_contract.rs`：旧句柄冲突时必须实际回退到FUSE且数据正确；无冲突独立inode上仍严格要求零新增READ，权限、完整内容与EOF检查保留。
+
+本轮先完成组件24与SDK16定向验证，再在Full90无target覆盖运行正常Full；每个结果绑定实际source/product/SDK/镜像/ELF/harness身份，不把定向成绩替代整体成绩。Base231的两次公共Redis失败与重试单独保留，[Issue71](https://gitcode.com/openJiuwen/agent-dx/issues/71)仍开放。230→231两个AFS产品二进制SHA一致，只有测试ELF由f208290c变为648ac566；未修改生产缓存策略或降低零READ要求。
+同目录正常进程恢复不外推emptyDir被删后的持久性、VM故障、HA；长稳、兼容大套件、RDMA/S3/etcd矩阵和精确性能仍不在本批。
+
+**CI4本批耗时口径**：Base只新增测试资产准备，没有运行24项。冻结资产在#230为63.461秒、#231热缓存样本为13.097秒，archive约6.9MiB；不据两个样本推导稳定总CI增量。正常Full90三段（含各自部署/清理）分别为公共269.517秒、组件139.710秒、SDK118.199秒。Base231墙钟1622.396秒包含两次公共失败及重试，不能当作无失败基线，也不是精确性能验收。
+
+### MR129默认AFS冒烟与时延基线（历史验证，已合入）
+
+**默认覆盖所有进入现有流水线的改动，只跑AFS既定冒烟。** 仓内没有按改动范围选择AFS组件的机制，因此候选在`.buildkite/pipeline-package.yml`顶层用`${ADX_WITH_AFS:-1}`统一模式：不传参数即ON，显式`0`仍可关闭。历史master #221确有省略AFS参数的调用；其它专项构建中显式OFF的调用仍有效。MR129已合入；是否由每种外部事件触发仍须分别核实。
 
 **复用入口，不复制用例。** Base保持原依赖链：`build-afs`普通UT/编译、source-gate AFS lint→同次组包/镜像→`.buildkite/run-e2e.sh`→`build/e2e/kubernetes/afs_gate.py`，依次运行公共L0/auth、原组件5项、OwnerFs/DFS SDK两模式各6项断言。组件/SDK子驱动的`full --case`是精确选中冒烟目标，不表示运行AFS全量或公共11组Full。ARM是否构建/测试继续由原开关控制。
 
-**Full同步匹配候选模式。** Base默认ON包会被原Full默认OFF的模式校验拒绝，因此`.buildkite/pipeline-full.yml`也设置同一缺省值；消费旧OFF包/镜像需显式`ADX_WITH_AFS=0`。Full原公共profile/steps不变，只在原公共集合后追加同一组AFS冒烟；不运行AFS功能Full、专项或长稳。SDK/admin/maintenance、独立Makefile/release默认不改。
+**Full同步匹配候选模式。** Base默认ON包会被原Full默认OFF的模式校验拒绝，因此`.buildkite/pipeline-full.yml`也设置同一缺省值；消费旧OFF包/镜像需显式`ADX_WITH_AFS=0`。MR129当时只在公共集合后追加同一组AFS冒烟，未实现AFS功能Full；本轮CI4候选将Full升级为上文明确24＋16集合，Base仍保持原冒烟。专项或长稳仍独立。SDK/admin/maintenance、独立Makefile/release默认不改。
 
-**已完成的验证。** [Base #226 OFF](https://buildkite.com/agent-dx/agent-dx/builds/226)和[Base #227 默认ON](https://buildkite.com/agent-dx/agent-dx/builds/227)固定同一提交`22c7f9b36f424c2f9db3ece8beb1481fcffd8c5e`，顺序执行，均新编译/组包/镜像；无旧候选或target/profile覆盖。ON请求故意省略AFS参数，服务器与关键job实际均为1；OFF为0且AFS job未启动，包/镜像排除AFS。ON完成AFS普通测试2058 PASS/58 ignored、公共2项、组件5项和SDK两模式12子断言，根结果/JUnit/summary及各层清理通过。最终候选的Base YAML解析结果与实跑22c完全相同，仅改注释；Full仅增加顶层模式缺省，通过54项合同检查，**本轮未触发Full，也未验收公共11组或ARM**。
+**已完成的验证。** [Base #226 OFF](https://buildkite.com/agent-dx/agent-dx/builds/226)和[Base #227 默认ON](https://buildkite.com/agent-dx/agent-dx/builds/227)固定同一提交`22c7f9b36f424c2f9db3ece8beb1481fcffd8c5e`，顺序执行，均新编译/组包/镜像；无旧候选或target/profile覆盖。ON请求故意省略AFS参数，服务器与关键job实际均为1；OFF为0且AFS job未启动，包/镜像排除AFS。ON完成AFS普通测试2058 PASS/58 ignored、公共2项、组件5项和SDK两模式12子断言，根结果/JUnit/summary及各层清理通过。最终候选的Base YAML解析结果与实跑22c完全相同，仅改注释；Full仅增加顶层模式缺省，通过54项合同检查，**MR129时延对照那一轮未触发Full；当前CI4候选的公共11组已由Full90验收，ARM仍未验收**。
 
 | 观察项 | 本次实测 | 如何理解 |
 | --- | --- | --- |
@@ -273,7 +314,7 @@ CI2/CI3实现仅补测试、部署配置与CI包装，不修改ADX、AFS或SDK�
 | 正常AFS ON门禁 | `.buildkite/run-e2e.sh`未选定向目标时 → `afs_gate.py`：公共原profile → 原五项AFS组件 → 两个SDK模式；缺结果/缺项/失败/清理不明即失败，三子harness整体必须一致 | #84/#85以固定包重放L0组合并通过原CI summary身份检查；OFF沿用公共路径。公共Full嵌套时保留stop的Collector/Gateway指标/trace收据要求；该Full分支只有工具回归，未实跑公共11组 |
 | 固定包重放冒烟 | `ADX_E2E_TARGET_CASE=afs-required-smoke`，同一wrapper以`l0`执行上述三部分 | 已在#85用已有Full管道重放Base等价冒烟；不重编或替换产品，不因此声称新head已跑完Base构建、公共11组Full或线上合入保护 |
 
-当前固定产品/SDK：Base #223，`00f1695bd25bac01e44c8dd1f452cf42c47b5c77`；固定镜像bundle来自Full #77。harness单独按当前commit同步、哈希验证。工具测试和Python静态检查只证明测试工具合同，不代替真实SDK结果。
+早期SDK/冒烟记录的固定产品/SDK：Base #223，`00f1695bd25bac01e44c8dd1f452cf42c47b5c77`；固定镜像bundle来自Full #77。harness单独按当前commit同步、哈希验证。工具测试和Python静态检查只证明测试工具合同，不代替真实SDK结果。
 
 | 真实运行 | 结果与未执行范围 | 清理边界 |
 | --- | --- | --- |
@@ -364,7 +405,7 @@ CI2/CI3实现仅补测试、部署配置与CI包装，不修改ADX、AFS或SDK�
 
 本地工具验证覆盖ON/OFF、身份错配、文件篡改、错架构、镜像准备和harness同步；Docker/K8s调用为mock或禁止访问，ELF为不执行的测试数据。**不是镜像构建、K8s部署、真实FUSE或AFS冒烟通过。** 完整记录见工作区`adx/evidence/afs-ci0-handoff-20261031/`。
 
-**当前出口与剩余缺口**：新候选的CI0输入/组件环境准入和CI1定向5项已通过。还缺SDK-on-AFS、默认必需冒烟与完整功能Full的选择/汇总。Full若选入Rust内核合同，需独立交付同架构`fuse_contract`测试ELF；不把尚未选入的ELF算作本轮已验收。
+**CI1当时的出口与缺口（历史；后续进展见本页CI2–CI4）**：新候选的CI0输入/组件环境准入和CI1定向5项已通过。还缺SDK-on-AFS、默认必需冒烟与完整功能Full的选择/汇总。Full若选入Rust内核合同，需独立交付同架构`fuse_contract`测试ELF；不把尚未选入的ELF算作本轮已验收。
 
 ### CI0此前只读盘点快照（2026-10-31，交接编码前）
 
@@ -393,11 +434,11 @@ CI2/CI3实现仅补测试、部署配置与CI包装，不修改ADX、AFS或SDK�
 
 依据：[候选组包/校验](../../.buildkite/package-e2e.sh)、[AFS交付文件集](../../build/release/component.py)、[runner输入合同](../../afs/tests/fixtures/multivm.py)、[harness范围](../../build/e2e/kubernetes/run.py)、[运行镜像配方](../../build/images/Dockerfile.e2e-runtime)、[现有runtime准入](../../build/e2e/preflight.py)。本节是编码前盘点快照；下方计划除上节已实现的交接子项外仍待实施。
 
-### 第四步实施计划：组件、产品与门禁分别验收（CI0–CI3流水线内已通过，CI4及线上策略待完成或核验）
+### 第四步实施计划与历史基线：组件、产品、门禁分别验收（CI4候选Full90通过，待合入）
 
 **先看顺序**：固定候选与CI环境 → 真实AFS组件读写/清理 → SDK实际使用AFS → 接入必需冒烟 → 扩展功能Full。沿用现有两条公共流水线；CI组件结果、ADX产品结果和最终门禁状态分别可追溯，前一批通过不冒充后一批已经完成。
 
-本计划按 `02d1a06f` 检出核对。第二/三步的runner、worker、业务断言和结果协议已经存在，不再从旧脚本另做一套；此前ARM64冻结产物的20项通过只保留原身份，**不能代替正式amd64 CI候选、K8s能力或产品路径验收**。CI0/CI1已用Base #223新候选在Full #76/#77定向通过；CI2已在Full #81验证两个SDK模式；CI3已在#84/#85完成固定包组合门禁，根报告/JUnit/CI summary和最终作业均通过；CI4功能Full与线上触发/保护策略仍待完成或核验。
+本计划按 `02d1a06f` 检出核对。第二/三步的runner、worker、业务断言和结果协议已经存在，不再从旧脚本另做一套；此前ARM64冻结产物的20项通过只保留原身份，**不能代替正式amd64 CI候选、K8s能力或产品路径验收**。CI0/CI1已用Base #223新候选在Full #76/#77定向通过；CI2已在Full #81验证两个SDK模式；CI3已在#84/#85完成固定包组合门禁，根报告/JUnit/CI summary和最终作业均通过；该时点CI4与线上策略未闭合；本分支CI4后续已在Full90验收，线上触发/保护策略仍单独核验。
 
 #### 最小闭环分批实施
 
@@ -407,7 +448,7 @@ CI2/CI3实现仅补测试、部署配置与CI包装，不修改ADX、AFS或SDK�
 | CI1／P0：AFS组件纵向闭环 | `afs/tests/run.py`、`suites/operations.py`、现有读写/权限/版本/清理断言及worker协议 | 已通过：`afs/tests/fixtures/kubernetes.py`角色接入和环境描述；#76原5项与加强的bind策略断言通过；公共K8s工具提供Pod/exec/copy与资源生命周期，复用同一worker执行M/A/B角色。复用本次已补的 `afs/tests/` 分发和已校验候选输入；不在目标Pod编译产品 | 先分别通过OwnerFs A本地egress bind↔B FUSE、DFS A发布/B远端读回与删除；证明真实挂载、peer路径、实际退出和无自有残留。旧#75已真实验证失败被保留、作业判红且正常清理；取消尚未实测。此时只报K8s组件定向通过，尚未接入必需门禁 |
 | CI2／P0：最小ADX产品路径（已通过） | 已有两ADX node Pod、独立sandboxd、SDK `Mount(host_path=...)`、共享 `scenarios.py` / `sdk_smoke.py` | 已由 `build/e2e/kubernetes/afs_product.py` / `afs_sdk.py` 管理M/A/B，复用原SDK Local Mount及节点放置；OwnerFs/DFS分开运行，源身份与runtime挂载对应。仅SDK测试Pod使用已有basic_spec配置；普通UID实际降权且零capability，SDK Files接口root身份单独说明 | Full #81已通过两个SDK模式、各六项断言，三版本双向完整内容；实际EACCES/EROFS、删除/Environment回收及正常AFS/ADX/K8s清理通过。用mountinfo/device/inode及DFS peer 0→4证明路径；组件PASS不替代产品PASS |
 | CI3／P0：必需冒烟接线（流水线内已通过） | 基础 `pipeline-package.yml: platform-e2e`、`.buildkite/run-e2e.sh`、公共L0/auth、JUnit及artifact上报 | 本分支已实现 `.buildkite/run-e2e.sh` → `afs_gate.py`，AFS ON正常入口串公共原profile、五项组件与两种SDK；OFF沿用公共入口。#82/#83汇总失败保留，#84/#85修复后整条通过；未因包装丢失原Full stop观测收据要求。仍须另核验ON触发范围、不可关闭/必需状态等线上策略，不改共享默认分支 | 已用明确ON候选在#85真实跑通必需冒烟；失败/缺项/错身份/清理失败判红由工具回归和真实失败运行共同举证，未执行不能变绿；OFF分支结果不被标为AFS通过。若webhook/必需状态未落实，只能称流水线内接通，不能称自动合入保护已完成 |
-| CI4／P1：功能Full接线 | 独立 `pipeline-full.yml`、同一验收包装、公共11组及AFS现有基础/扩展断言 | 增加明确登记的CI Full选集、单Pod内核合同环境和跨Pod角色环境；按需加入C读者，补同目录恢复、权限/缓存、命名空间/busy合同。公共11组继续复用，AFS产品变体扩展相关行为；不机械复制每组、不直接用 `--all` 代替合同 | Full包含已登记冒烟必需断言；对应单Pod/跨Pod环境、选中Rust ELF和每个case都有实际证据。公共Full保持两worker检查，AFS跨worker声明另验角色实际放置。缺必需资产/拓扑不得删项后报Full；不外推Pod删除持久恢复、VM故障、长稳或性能 |
+| CI4／P1：功能Full接线（候选Full90已通过） | 独立 `pipeline-full.yml`、同一验收包装、公共11组及AFS现有基础/扩展断言 | 增加明确登记的CI Full选集、单Pod内核合同环境和跨Pod角色环境；按需加入C读者，补同目录恢复、权限/缓存、命名空间/busy合同。公共11组继续复用，AFS产品变体扩展相关行为；不机械复制每组、不直接用 `--all` 代替合同 | Full包含已登记冒烟必需断言；对应单Pod/跨Pod环境、选中Rust ELF和每个case都有实际证据。公共Full保持两worker检查，AFS跨worker声明另验角色实际放置。缺必需资产/拓扑不得删项后报Full；不外推Pod删除持久恢复、VM故障、长稳或性能 |
 
 CI0/CI1的环境适配与第五步拿包输入可同时设计，做到后可先直接调用验证，不必等线上触发策略就绪；但CI3的真实调用、失败传播和线上条件分别验收，不能用本地运行补齐它们的结果。
 

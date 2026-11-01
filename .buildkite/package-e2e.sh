@@ -120,9 +120,16 @@ if [[ ${ADX_E2E_CHECKPOINT:-0} == 1 ]]; then
   : "${ADX_FC_KIT_DIR:?checkpoint profile requires a verified native Firecracker kit directory or artifact build}"
   fc_args=(--firecracker-kit "$ADX_FC_KIT_DIR")
 fi
+contract_args=()
+if [[ ${ADX_WITH_AFS:-0} == 1 ]]; then
+  if [[ -z ${ADX_E2E_TARGET_CASE:-}${ADX_E2E_TARGET_CASES:-} || ${ADX_E2E_TARGET_CASE:-} == afs-component-full ]]; then
+    buildkite-agent artifact download 'out/buildkite/afs-contracts/*' . --step build-afs --build "$ADX_BASE_PACKAGE_BUILD_ID"
+    contract_args=(--afs-contracts out/buildkite/afs-contracts)
+  fi
+fi
 python3 -u build/e2e/prepare.py --package out/buildkite/package --backend out/buildkite/backend \
   --sdk-wheel "${sdk_wheels[0]}" --sdk-candidate out/buildkite/sdk/sdk-candidate.json \
   --runtime-base "$ADX_E2E_RUNTIME_BASE" --execd-base "$ADX_E2E_EXECD_BASE" \
-  --output out/buildkite/bundle "${fc_args[@]}" "${runtime_args[@]}" 2>&1 | tee out/buildkite/logs/prepare.log
+  --output out/buildkite/bundle "${fc_args[@]}" "${runtime_args[@]}" "${contract_args[@]}" 2>&1 | tee out/buildkite/logs/prepare.log
 echo "--- :docker: Push immutable image references"
 python3 -u build/e2e/kubernetes/publish_images.py --bundle out/buildkite/bundle --repository "$ADX_E2E_IMAGE_REPOSITORY" 2>&1 | tee out/buildkite/logs/publish-images.log

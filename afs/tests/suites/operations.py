@@ -4,7 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 import time
-from fixtures.common import Blocked
+from fixtures.common import Blocked, is_single_host
 
 
 def peer_counter(cluster, role):
@@ -180,7 +180,7 @@ def recovery(c):
         )["stdout"]
     )
     assert before == after, (before, after)
-    if c.config["kind"] in ("multivm", "namespaces"):
+    if not is_single_host(c.config):
         c.restart(["M"])
         wait_read(c, "B", "durable", data)
         # Verify an unprimed name fails while the one R1 Home is unavailable.
@@ -337,7 +337,7 @@ def rust_contract(c, selectors):
         env = {}
         uid = None
         if selector.startswith("real_dfs_keep_cache_contract::"):
-            assert c.config["kind"] == "singlevm"
+            assert is_single_host(c.config)
             c.python(
                 "A", "os.chown(sys.argv[1],int(sys.argv[2]),int(sys.argv[3]))", c.mount("A"), c.uid, c.gid, owner=False
             )
