@@ -52,6 +52,13 @@ def resources(namespace, image, architecture, registry_auth=False, node_names=()
         spec['containers'] = [container]
         spec['volumes'] = [{'name': 'state', 'emptyDir': {}},
                            {'name': 'fuse', 'hostPath': {'path': '/dev/fuse', 'type': 'CharDevice'}}]
+        if full and role == 'M':
+            # /sys/class/bdi links here. Cache probes change only their own FUSE BDI
+            # and restore its value; no host block-device or global sysctl writes.
+            spec['volumes'].append({'name': 'bdi', 'hostPath': {
+                'path': '/sys/devices/virtual/bdi', 'type': 'Directory'}})
+            container['volumeMounts'].append({'name': 'bdi', 'mountPath': '/sys/devices/virtual/bdi',
+                                              'readOnly': False})
         if role in ('A', 'B') and distinct_workers:
             pod['metadata']['labels']['afs.e2e.data'] = 'true'
             pod['metadata']['labels']['afs.e2e.primary-data'] = 'true'

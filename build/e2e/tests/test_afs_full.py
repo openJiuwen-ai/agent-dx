@@ -49,6 +49,22 @@ class FullTests(unittest.TestCase):
             with self.subTest(case=name), self.assertRaisesRegex(ValueError, 'incomplete ci-full'):
                 select([c for c in cases if c.id != name], suite='ci-full')
 
+    def test_only_full_local_pod_has_writable_owned_fuse_bdi_access(self):
+        component = load('full_bdi_resources', 'build/e2e/kubernetes/afs_component.py')
+        for full in (False, True):
+            pods = component.resources('adx-e2e-bdi', 'reg/node@sha256:' + 'a' * 64, 'amd64', full=full)
+            for pod in pods:
+                volumes = [v for v in pod['spec']['volumes'] if v['name'] == 'bdi']
+                mounts = [m for m in pod['spec']['containers'][0]['volumeMounts'] if m['name'] == 'bdi']
+                if full and pod['metadata']['name'] == 'afs-m':
+                    self.assertEqual(volumes, [{'name': 'bdi', 'hostPath': {
+                        'path': '/sys/devices/virtual/bdi', 'type': 'Directory'}}])
+                    self.assertEqual(mounts, [{'name': 'bdi', 'mountPath': '/sys/devices/virtual/bdi',
+                                               'readOnly': False}])
+                else:
+                    self.assertFalse(volumes)
+                    self.assertFalse(mounts)
+
     def test_kubernetes_local_records_one_pod_without_claiming_a_vm(self):
         config = {'kind': 'kubernetes', 'topology': 'local', 'uid': 10000, 'gid': 10000,
                   'other_uid': 10001, 'other_gid': 10001,
