@@ -2000,8 +2000,25 @@ mod real_dfs_keep_cache_contract {
         assert!(after_h1 > after_h2, "H1 uncached tail did not enter FUSE");
         h2.seek(SeekFrom::Start(0))?;
         let root = assert_full_read(&mut h2, &expected)?;
+        // H1 still owns the old fixed view: another OPEN must keep taking the
+        // safe direct path instead of mixing two versions in one inode cache.
+        let before_conflicting_reopen = read_counter(metrics)?;
+        let mut conflicting_reopen = File::open(&path_b)?;
+        assert_eq!(assert_full_read(&mut conflicting_reopen, &expected)?, root);
+        let after_conflicting_reopen = read_counter(metrics)?;
+        assert!(
+            after_conflicting_reopen > before_conflicting_reopen,
+            "a conflicting old view must prevent shared page-cache admission"
+        );
+        // Test zero-READ same-version reuse on an independent inode, where no
+        // old-version handle can force that fallback. Keep the strict equality.
+        let stable_a = directory.path().join("same-version.bin");
+        let stable_b = reader.join(relative).join("same-version.bin");
+        durable_write(&stable_a, &expected, true)?;
+        let mut warm = File::open(&stable_b)?;
+        assert_eq!(assert_full_read(&mut warm, &expected)?, root);
         let before_h3 = read_counter(metrics)?;
-        let mut h3 = File::open(&path_b)?;
+        let mut h3 = File::open(&stable_b)?;
         assert_eq!(assert_full_read(&mut h3, &expected)?, root);
         let after_h3 = read_counter(metrics)?;
         assert_eq!(
@@ -2026,12 +2043,15 @@ mod real_dfs_keep_cache_contract {
                 "blake3": root.to_hex().to_string(), "eof": true,
                 "read_callbacks": {"before_v2": before_v2, "after_h2": after_h2,
                     "after_h1_tail": after_h1, "before_h3": before_h3, "after_h3": after_h3},
+                "conflicting_reopen": {"before": before_conflicting_reopen,
+                    "after": after_conflicting_reopen, "direct_fallback_required": true},
+                "h3_scope": "independent inode, unchanged version, no conflicting handles",
                 "new_open_mode_000_denied": true, "old_handle_snapshot_promised": false,
                 "topology": "one Linux host, two real Nodes, external local-file Meta fixture",
                 "performance_claim": false
             })
         );
-        drop((h1, h2, h3, restored));
+        drop((h1, h2, conflicting_reopen, warm, h3, restored));
         directory.close()?;
         Ok(())
     }
