@@ -3,13 +3,16 @@
 import argparse
 import hashlib
 import json
+import logging
 import platform
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tarfile
 
 ROOT = Path(__file__).resolve().parents[2]
+LOGGER = logging.getLogger(__name__)
 SELECTORS = (
     'fuse_ftruncate_on_same_handle_waits_for_prior_write',
     'dfs_buffered_reopen_refreshes_growth_and_truncation_with_new_heads',
@@ -93,10 +96,12 @@ def unpack(directory, package, destination):
     destination.mkdir(parents=True, exist_ok=False)
     with tarfile.open(archive, 'r:gz') as stream:
         entries = stream.getmembers()
-        if (len(entries) != 1 or entries[0].name != 'fuse_contract' or not entries[0].isfile()
-                or entries[0].size > 512 * 1024**2):
+        if len(entries) != 1:
             raise ValueError('unexpected test archive member')
-        with stream.extractfile(entries[0]) as source, (destination / 'fuse_contract').open('wb') as output:
+        entry = entries[0]
+        if entry.name != 'fuse_contract' or not entry.isfile() or entry.size > 512 * 1024**2:
+            raise ValueError('unexpected test archive member')
+        with stream.extractfile(entry) as source, (destination / 'fuse_contract').open('wb') as output:
             shutil.copyfileobj(source, output)
     (destination / 'fuse_contract').chmod(0o755)
     (destination / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
@@ -130,6 +135,21 @@ def verify_bundle(directory, bundle, required=False):
     return validate(json.loads(path.read_text()), bundle['package'])
 
 
+def compiler_artifact(stdout):
+    matches = []
+    for line in stdout.splitlines():
+        if not line.startswith('{'):
+            continue
+        record = json.loads(line)
+        if record.get('reason') != 'compiler-artifact' or record.get('target', {}).get('name') != 'fuse_contract':
+            continue
+        if record.get('executable'):
+            matches.append(Path(record['executable']))
+    if len(matches) != 1:
+        raise ValueError('one exact fuse_contract compiler artifact required')
+    return matches[0]
+
+
 def build(arguments):
     if platform.system() != 'Linux':
         raise ValueError('Rust test ELF compilation requires the Linux CI builder')
@@ -140,15 +160,11 @@ def build(arguments):
     result = subprocess.run([executable('cargo'), 'test', '--locked', '-p', 'afs', '--test', 'fuse_contract',
                              '--no-run', '--message-format=json'], cwd=ROOT, check=True, stdout=subprocess.PIPE,
                             text=True, timeout=1800)
-    records = [json.loads(line) for line in result.stdout.splitlines() if line.startswith('{')]
-    matches = [Path(r['executable']) for r in records if r.get('reason') == 'compiler-artifact'
-               and r.get('target', {}).get('name') == 'fuse_contract' and r.get('executable')]
-    if len(matches) != 1:
-        raise ValueError('one exact fuse_contract compiler artifact required')
+    artifact = compiler_artifact(result.stdout)
     import tempfile
     with tempfile.TemporaryDirectory(prefix='adx-fuse-contract-') as temp:
         binary = Path(temp) / 'fuse_contract'
-        shutil.copyfile(matches[0], binary)
+        shutil.copyfile(artifact, binary)
         binary.chmod(0o755)
         subprocess.run([executable('strip'), '--strip-debug', str(binary)], check=True, timeout=120)
         for selector in SELECTORS:
@@ -158,10 +174,11 @@ def build(arguments):
         package = {'with_afs': True, 'commit': head, 'target': arguments.target,
                    'files': {'bin/afs-meta': sha(arguments.meta), 'bin/afs-node': sha(arguments.node)}}
         manifest = pack(binary, arguments.output, package)
-    print(json.dumps(manifest), flush=True)
+    LOGGER.info(json.dumps(manifest))
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stdout)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--commit', required=True)
     parser.add_argument('--target', required=True)

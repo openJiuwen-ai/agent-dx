@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import Mock
 
 ROOT = Path(__file__).resolve().parents[3]
-sys.path.insert(0, str(ROOT / 'afs/tests'))
+sys.path.append(str(ROOT / 'afs/tests'))
 from fixtures.common import discover, select
 from fixtures.common import Blocked
 from fixtures.multivm import validate

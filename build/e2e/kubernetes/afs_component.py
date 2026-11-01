@@ -94,6 +94,7 @@ class Component:
         self.normal_cleanup = None
         self.config = None
         self.package = None
+        self.contract_manifest_sha = None
 
     def deploy(self, bundle, refs, registry_auth, node_names, distinct_workers, harness_commit):
         run = self.run

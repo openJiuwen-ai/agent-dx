@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -54,6 +55,39 @@ class ContractAssetsTests(unittest.TestCase):
         (self.directory / 'fuse-contract.tar.gz').write_bytes(b'corrupt')
         with self.assertRaises(ValueError):
             self.assets.unpack(self.directory, self.package, self.root / 'bad')
+
+    def test_archive_rejects_missing_extra_or_unsafe_members(self):
+        regular = tarfile.TarInfo('fuse_contract')
+        other = tarfile.TarInfo('../outside')
+        link = tarfile.TarInfo('fuse_contract')
+        link.type, link.linkname = tarfile.SYMTYPE, '../outside'
+        archive = self.directory / 'fuse-contract.tar.gz'
+        for index, entries in enumerate(([], [regular, regular], [other], [link])):
+            with self.subTest(index=index):
+                with tarfile.open(archive, 'w:gz') as stream:
+                    for entry in entries:
+                        stream.addfile(entry)
+                manifest = dict(self.manifest, archive={
+                    'name': archive.name, 'sha256': self.assets.sha(archive), 'bytes': archive.stat().st_size})
+                (self.directory / 'manifest.json').write_text(json.dumps(manifest))
+                with self.assertRaises(ValueError):
+                    self.assets.unpack(self.directory, self.package, self.root / str(index))
+                self.assertFalse((self.root / str(index) / 'fuse_contract').exists())
+                self.assertFalse((self.root / 'outside').exists())
+
+    def test_cargo_artifact_selection_rejects_missing_and_duplicate_matches(self):
+        artifact = {'reason': 'compiler-artifact', 'target': {'name': 'fuse_contract'},
+                    'executable': '/target/fuse_contract-123'}
+        unrelated = [dict(artifact, reason='compiler-message'),
+                     dict(artifact, target={'name': 'another_test'}), dict(artifact, executable=None)]
+        for count in (0, 1, 2):
+            with self.subTest(count=count):
+                stdout = 'cargo progress\n' + '\n'.join(json.dumps(item) for item in unrelated + [artifact] * count)
+                if count == 1:
+                    self.assertEqual(self.assets.compiler_artifact(stdout), Path(artifact['executable']))
+                else:
+                    with self.assertRaises(ValueError):
+                        self.assets.compiler_artifact(stdout)
 
     def test_full_requires_an_explicit_small_bundle_handoff(self):
         bundle = {'package': self.package}
