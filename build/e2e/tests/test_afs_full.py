@@ -43,6 +43,12 @@ class FullTests(unittest.TestCase):
             else:
                 self.assertFalse(terms)
 
+    def test_standalone_full_rejects_a_missing_extended_case(self):
+        cases = discover()
+        for name in ('ownerfs.extended.namespace_identity', 'dfs.visibility.real_cross_handle_cache'):
+            with self.subTest(case=name), self.assertRaisesRegex(ValueError, 'incomplete ci-full'):
+                select([c for c in cases if c.id != name], suite='ci-full')
+
     def test_kubernetes_local_records_one_pod_without_claiming_a_vm(self):
         config = {'kind': 'kubernetes', 'topology': 'local', 'uid': 10000, 'gid': 10000,
                   'other_uid': 10001, 'other_gid': 10001,

@@ -1,4 +1,4 @@
-"""Run existing AFS component assertions in three owned role Pods."""
+"""Run existing AFS component assertions in owned local and cross-Pod environments."""
 
 import base64
 from copy import deepcopy
@@ -17,16 +17,10 @@ from manifest import LABEL, resources as platform_resources
 
 CASES = ('ownerfs.cluster.read_write', 'ownerfs.cluster.permissions',
          'dfs.cluster.read_write', 'dfs.cluster.visibility', 'cluster.topology_cleanup')
-FULL_CASES = (
-    'cluster.topology_cleanup', 'dfs.basic.one_writer_many_readers', 'dfs.basic.namespace',
-    'dfs.cluster.read_write', 'dfs.cluster.visibility', 'dfs.cluster.restart', 'dfs.cluster.many_readers',
-    'dfs.recovery.normal_restart', 'dfs.visibility.new_open_permissions', 'dfs.visibility.real_cross_handle_cache',
-    'dfs.cache.same_version_reopen', 'dfs.cache.warm_permission_change', 'fuse.contracts.ordering',
-    'fuse.contracts.real_dfs_cache', 'fuse.contracts.busy_unmount', 'ownerfs.basic.read_write',
-    'ownerfs.extended.namespace_identity', 'ownerfs.basic.namespace', 'ownerfs.cluster.read_write',
-    'ownerfs.cluster.namespace', 'ownerfs.cluster.permissions', 'ownerfs.cluster.restart',
-    'ownerfs.permissions.deny_other_uid', 'ownerfs.recovery.normal_restart',
-)
+scope_spec = importlib.util.spec_from_file_location('afs_ci_full_scope', ROOT / 'afs/tests/suites/ci_full.py')
+scope = importlib.util.module_from_spec(scope_spec)
+scope_spec.loader.exec_module(scope)
+FULL_CASES = scope.CASE_IDS
 ROLES = {'M': 'afs-m', 'A': 'afs-a', 'B': 'afs-b'}
 
 

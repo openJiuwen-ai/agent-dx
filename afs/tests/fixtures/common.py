@@ -15,6 +15,8 @@ import subprocess
 import threading
 import time
 
+from suites.ci_full import CASE_IDS as CI_FULL_CASES
+
 HERE = Path(__file__).resolve().parent
 TESTS = HERE.parent
 
@@ -128,7 +130,7 @@ def discover():
                 raise ValueError("duplicate case ID: " + case.id)
             if "local-basic" in case.tags or "cluster-manyread" in case.tags:
                 case = replace(case, tags=case.tags + ("all-basic",))
-            if any(tag in case.tags for tag in ("local-basic", "local-extended", "cluster-manyread")):
+            if case.id in CI_FULL_CASES:
                 case = replace(case, tags=case.tags + ("ci-full",))
             special_tags = (
                 "local-write-special", "cluster-write-special", "local-read-special", "cluster-read-special",
@@ -155,6 +157,8 @@ def select(cases, *, all_cases=False, suite=None, patterns=None):
         return list(cases)
     tag = suite or "local-basic"
     found = [c for c in cases if tag in c.tags]
+    if tag == "ci-full" and (len(found) != len(CI_FULL_CASES) or {c.id for c in found} != set(CI_FULL_CASES)):
+        raise ValueError("incomplete ci-full registry: every declared case must be present exactly once")
     if not found:
         raise ValueError("unknown or empty suite: " + tag)
     return found

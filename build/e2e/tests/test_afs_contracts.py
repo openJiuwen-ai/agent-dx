@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -27,6 +28,12 @@ class ContractAssetsTests(unittest.TestCase):
                         'files': {'bin/afs-meta': 'b' * 64, 'bin/afs-node': 'c' * 64}}
         self.directory = self.root / 'assets'
         self.manifest = self.assets.pack(self.elf, self.directory, self.package)
+
+    def test_tool_lookup_preserves_multicall_proxy_name(self):
+        proxy = self.root / 'cargo'
+        proxy.symlink_to(self.elf)
+        with patch.object(self.assets.shutil, 'which', return_value=str(proxy)):
+            self.assertEqual(self.assets.executable('cargo'), str(proxy))
 
     def test_transport_is_separate_and_preserves_frozen_elf(self):
         dest = self.root / 'unpacked'

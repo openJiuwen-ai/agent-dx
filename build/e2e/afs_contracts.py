@@ -30,7 +30,8 @@ def executable(name):
     value = shutil.which(name)
     if value is None:
         raise FileNotFoundError('required tool: ' + name)
-    return str(Path(value).resolve())
+    # Rustup dispatches by argv[0]; resolving cargo's symlink invokes rustup itself.
+    return str(Path(value).absolute())
 
 
 def elf(path, target):

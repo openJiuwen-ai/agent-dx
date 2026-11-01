@@ -226,7 +226,7 @@ CI4首批明确登记24项功能（13本地＋9跨角色＋2扩展），包含�
 
 | 内容 | 入口／位置 | 当前实现和验收边界 |
 | --- | --- | --- |
-| 明确的组件Full选集 | `afs/tests/run.py --suite ci-full`；原`suites/`断言 | 24项核心/扩展，含namespace、正常恢复、权限/缓存、多读者、顺序/busy；必需case或清理缺失判红 |
+| 明确的组件Full选集 | `python3 afs/tests/run.py run --suite ci-full`；原`suites/`断言 | 24项核心/扩展，含namespace、正常恢复、权限/缓存、多读者、顺序/busy；必需case或清理缺失判红 |
 | 单Pod内核环境 | `fixtures/kubernetes.py`＋`multivm.py` | 记录kubernetes/local，M Pod内多进程和双挂载，不宣称VM；适用13本地及2扩展 |
 | 跨Pod环境 | `build/e2e/kubernetes/afs_component.py` | M/A/B/C独立Pod，A/B跨worker；C独立读者且如实报告worker，不要求虚构第三worker |
 | 测试ELF交接 | `build/e2e/afs_contracts.py`；Base `build-afs`独立artifact | Linux builder冻结同源`fuse_contract`、四精确selector；包外测试资产，绑定源码/架构/产品binary/ELF/archive SHA；缺资产正常Full在部署前失败 |
