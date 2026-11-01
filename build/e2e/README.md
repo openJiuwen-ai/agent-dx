@@ -369,9 +369,21 @@ steady-state windows. The campaign remains failed, with no automatic retry or
 threshold change. Two host-procfs snapshots additionally found 19 more descriptors
 to one OwnerFs workspace root in the same afs-node process; they establish the
 observed growth, not its root cause. DFS descriptor targets were not captured.
-Investigate the fixed-product FD lifecycle before qualifying a repaired candidate;
-this test-only change does not patch production code. See the results and next
-steps in the [same five-step strategy](../../docs/testing/test-strategy.md#step-5).
+A subsequent short component diagnostic reused the exact Base236 AFS binaries
+and existing Cluster fixture. A local directory control added no Home FDs;
+100 remote directory open/close operations left exactly 100 extra Home directory
+FDs, matching the missing remote `releasedir` call in OwnerFs. Separately, 768
+local DFS publications/fsyncs and complete reads (per-file DONTNEED) produced
+chunk-FD counts 128/256/256/256/256/256; old descriptors were evicted, and 100
+same-object reads added none. These are `DIAGNOSTIC_ONLY` findings, with seven
+normal process exits, not a successful SDK hour or a registered new suite.
+
+The cold-start +128 FD limit is below the verified 256-entry reader-cache
+capacity. Keep both original v2 runs failed. Repair OwnerFs separately and freeze
+a versioned FD contract that accounts for bounded cache warmup, in-flight holders
+and steady growth before testing a new candidate; no revised contract or product
+patch has been implemented here. See the evidence scope and next steps in the
+[same five-step strategy](../../docs/testing/test-strategy.md#step-5).
 
 ### Fixed AFS component package on one Linux VM
 
