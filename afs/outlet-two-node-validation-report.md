@@ -108,6 +108,32 @@ workspace，并逐一校验内容哈希。
 （实测 node-a 需要约 2 秒、node-b 类似）。**验证或编排必须以
 `mountpoint` + 一次可读 `ls` 作为就绪判据**，不能用固定的短等待。
 
+## 第五轮：双节点对等发布与双向可见性（2026-11-01 11:41–11:55 CST）
+
+前四轮只在一个节点（B）上启用了 outlet 镜像，A 上以 `/public` 不存在。
+本轮给 A 也加上 `outlet_public_root` / `outlet_import_root`，让两端各自
+独立发布同一份 Meta 快照，验证**对等性**与**双向可见性**。
+
+前置（A 侧）：`/public` 独立 tmpfs；`imports/node-a/users` 用 bind 挂本机
+数据树、`imports/node-b/users` 用 NFS 挂对端；B 侧补 `exportfs` 导出自己的树。
+
+| 用例 | 观测 | 结果 |
+|---|---|---|
+| 两端 `/public` 链接数 | A=402 / B=402 | ✅ |
+| 两端按 home 归属 | A-homed 201 / B-homed 201（两边相同） | ✅ |
+| 断链数（`-xtype l`） | A=0 / B=0 | ✅ |
+| **逐条对比**（名字 → 代次） | `diff` 退出码 0，404 行完全一致 | ✅ |
+| **A 创建 → B 可见** | B 侧链接指向 `imports/node-a/users/root-…-e404`，内容 `payload-from-A` | ✅ <1s |
+| **B 创建 → A 可见** | A 侧链接指向 `imports/node-b/users/root-…-e405`，内容 `payload-from-B` | ✅ <1s |
+| A 经 `/public` 写 B 的 workspace | B 在自己磁盘上读到 `written-by-A` | ✅ |
+| B 经 `/public` 写 A 的 workspace | A 在自己磁盘上读到 `written-by-B` | ✅ |
+| **A 删除 → B 摘除** | 1s 内两端均 `no` | ✅ |
+| **B 删除 → A 摘除** | 1s 内两端均 `no` | ✅ |
+
+**结论**：outlet 的对等式部署成立——两端各自跑镜像，得到完全一致的
+名字视图（含代次），创建与删除都双向传播，跨节点读写穿透到对端 home
+的磁盘。这补上了前四轮"单侧发布"未覆盖的设计面。
+
 ## 过程中发现并即时处理的问题
 
 
@@ -147,7 +173,11 @@ workspace，并逐一校验内容哈希。
   已死的 daemon 并失败（`EINVAL`），`statfs` 报 `Function not implemented`。
   **判断 FUSE 是否存活必须用写探测**，读探测会给出假阳性。清残留用
   `fusermount3 -uz` + `umount -fl`。
-11. **`pgrep -f` / `pkill -f` 会匹配到自身**：脚本命令行里含配置文件名时，
+11. **outlet 配置必须写在顶层表**：把 `outlet_*` 追加到文件末尾会落进
+  其前的 `[trusted_node_certs]` 表，被当作证书路径解析，报
+  `invalid type: integer 250, expected path string`。**必须插在第一个
+  `[table]` 之前**，否则错误信息指向的值与真实原因不在同一层。
+12. **`pgrep -f` / `pkill -f` 会匹配到自身**：脚本命令行里含配置文件名时，
   `pkill -f "etc/node-b.toml"` 会杀掉执行脚本的 shell 自身，导致后续启动
   从未执行（表现为"重启后进程不存在、日志为空"）。**必须从监听端口反查
   PID 再 kill**。
