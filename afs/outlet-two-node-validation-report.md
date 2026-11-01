@@ -82,6 +82,32 @@ workspace，并逐一校验内容哈希。
 **结论**：outlet 名字层在 401 root 规模下功能正确；跨节点写入路径
 （`/public` symlink → NFS import → home 磁盘）全部生效。
 
+## 第四轮：afs-node 重启验证（2026-11-01 11:13–11:35 CST）
+
+在 401 workspace 的既有规模上验证重启，覆盖三种起点：正常停止后重启、
+进程崩溃后残留 FUSE 的重启、以及连续多轮重启的可重复性。
+
+| 场景 | 检查项 | 结果 |
+|---|---|---|
+| **node-a 重启**（200 root） | 停止干净、FUSE 重新挂载、**200 workspace 全部恢复**、可写 | ✅ 挂载 2s 内就绪 |
+| **node-b 重启**（201 root + outlet） | FUSE 恢复、200 本地 workspace、`/public` 401 保持、可写 | ✅ |
+| **连续重启** node-a ×2 / node-b ×2 | 每一轮都恢复，无累积劣化 | ✅ 4/4 |
+| **重启后跨节点数据面** | A 新建 → B 镜像发布（401→402）→ B 经 `/public` 读 | ✅ |
+| **重启后反向写入** | B 经 `/public` 写 A-homed workspace → **A 在自己磁盘上看到** | ✅ |
+| 错误审计 | 无 mirror 失败、无 topology 告警、无 WARN | ✅ |
+
+**重启后观测到的已知良性错误**（与重启无关，均为操作竞态或 xattr 噪音）：
+
+- `OwnerFs currently supports only user.* xattrs`：`cp -r` / 文件操作会探测
+  `security.capability` 等扩展属性，OwnerFs 只支持 `user.*`。数据不受影响。
+- `No such file or directory` / `root is not registered in Meta`：删除探针
+  文件后 FUSE 仍完成了一次 lookup。属正常竞态。
+
+**重启时序的重要发现**：`node.ready` 日志打印在 FUSE 挂载**之前**，
+端口监听更早。以「端口可连」判断就绪会在 200 root 规模下误判为未挂载
+（实测 node-a 需要约 2 秒、node-b 类似）。**验证或编排必须以
+`mountpoint` + 一次可读 `ls` 作为就绪判据**，不能用固定的短等待。
+
 ## 过程中发现并即时处理的问题
 
 
@@ -116,6 +142,15 @@ workspace，并逐一校验内容哈希。
 9. **NFS 导出/挂载的 rw 忘记切换**：验证初期用 `ro` 导出，401 份拷贝在
   A-homed 的 200 个上报 `Read-only file system`。改 `exportfs rw` +
   重挂后通过。
+10. **崩溃后残留 FUSE 会误导诊断**：daemon 已死但挂载仍在时，`readdir` /
+  `stat` / `cat` 可能命中内核页缓存而"成功"返回，只有 `write` 必然触达
+  已死的 daemon 并失败（`EINVAL`），`statfs` 报 `Function not implemented`。
+  **判断 FUSE 是否存活必须用写探测**，读探测会给出假阳性。清残留用
+  `fusermount3 -uz` + `umount -fl`。
+11. **`pgrep -f` / `pkill -f` 会匹配到自身**：脚本命令行里含配置文件名时，
+  `pkill -f "etc/node-b.toml"` 会杀掉执行脚本的 shell 自身，导致后续启动
+  从未执行（表现为"重启后进程不存在、日志为空"）。**必须从监听端口反查
+  PID 再 kill**。
 
 ## 边界声明
 
