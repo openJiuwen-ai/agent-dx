@@ -32,14 +32,20 @@ successful direct-package deployment. Record the actual candidate, target and
 selected cases for every run. Kubernetes evidence does not qualify the Docker,
 SSH multi-VM, soak or performance paths.
 
-### Non-K8s SDK and required Full (PK1 candidate)
+### Non-K8s SDK and required Full (PK1)
 
 The local Docker adapter reuses the existing two-node deployment, public
 scenarios, SDK-on-AFS assertions and AFS component runner. Its input is the
 original fixed bundle/registry/AFS manifests plus a verified offline image
 export, not a newly compiled product. The SDK remains the wheel installed in
-the fixed node image. This adapter is a validation candidate until a dated
-actual run below or in the canonical strategy qualifies the selected scope.
+the fixed node image. On 2026-11-01, fixed Base236 product commit
+`f93e2fb04f423c7004532f38f1f1ca34de0ab782` and test-source commit
+`e786bc440786102b0046ef03d1c5dd88c23525ee` passed targeted SDK Full and
+one combined public11/component24/SDK16 Full on an x86_64 Linux 6.8/ext4 VM,
+with normal cleanup. The combined run took 470.942 seconds. This qualifies
+that single-VM Docker functional scope; other candidates and environments
+require their own runs. The canonical [strategy](../../docs/testing/test-strategy.md)
+records the initial environment failures and evidence boundary.
 
 The image-export step uses `export_images.py` on an authenticated preparation
 host. It pulls only the three immutable references from the matching bundle,
@@ -61,8 +67,24 @@ recommended for the sequential functional run; this is not a performance
 qualification. Public nodes retain their 3 CPU/4 GiB limits. Use the provider's
 reservation/run ownership before starting and its normal return procedure.
 
+The VM administrator must make the kernel prerequisites available before
+deployment: EROFS with a real loop mount, bridge netfilter with
+`bridge-nf-call-iptables=1`, and working legacy IPv4/IPv6 filter tables for
+the fixed sandboxd network ACL. A privileged container does not supply missing
+host kernel modules. On the qualified Ubuntu 6.8 VM, the installed `erofs`,
+`br_netfilter` and `ip6table_filter` modules needed explicit loading; no host
+firewall rules or persistent sysctl configuration were changed. The runner
+preflight checks EROFS/bridge prerequisites; sandboxd enforces its ACL
+prerequisites at startup. Neither configures the host automatically.
+
 From a clean frozen test-source checkout, supply one fixed product commit and
-fresh output paths:
+fresh output paths.
+
+For an extracted Git archive without `.git`, first verify the archive SHA and
+its externally recorded full test-source commit, then set
+`ADX_E2E_HARNESS_COMMIT` to that commit. Keep this separate from
+`--artifact-commit`, which identifies the fixed product. Do not set Buildkite
+identity variables to pretend that a direct run is a CI job.
 
 ```sh
 # Both OwnerFs and DFS, eight actual SDK assertions per mode.
