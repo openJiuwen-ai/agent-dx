@@ -13,6 +13,22 @@ BASH = shutil.which("bash")
 
 
 class IndependentPipelineTests(unittest.TestCase):
+    def test_base_defaults_to_afs_without_expanding_the_smoke_profile(self):
+        base = yaml.safe_load((ROOT / ".buildkite/pipeline-package.yml").read_text())
+        self.assertEqual(base["env"]["ADX_WITH_AFS"], "${ADX_WITH_AFS:-1}")
+        steps = {step["key"]: step for step in base["steps"]}
+        self.assertEqual(steps["platform-e2e"]["env"]["ADX_E2E_PROFILE"], "l0")
+        for step in steps.values():
+            self.assertNotIn("ADX_E2E_TARGET_CASE", step.get("env", {}))
+            self.assertNotIn("ADX_E2E_TARGET_CASES", step.get("env", {}))
+        full = yaml.safe_load((ROOT / ".buildkite/pipeline-full.yml").read_text())
+        self.assertEqual(full["env"]["ADX_WITH_AFS"], base["env"]["ADX_WITH_AFS"])
+        full_steps = {step["key"]: step for step in full["steps"]}
+        self.assertEqual(full_steps["platform-e2e"]["env"]["ADX_E2E_PROFILE"], "full")
+        for name in ("sdk", "admin", "maintenance"):
+            pipeline = yaml.safe_load((ROOT / f".buildkite/pipeline-{name}.yml").read_text())
+            self.assertNotIn("ADX_WITH_AFS", pipeline.get("env", {}), name)
+
     def test_arm_execd_maps_optional_host_source_into_linux_container(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

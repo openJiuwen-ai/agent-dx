@@ -17,20 +17,25 @@ Python SDK 使用 `.buildkite/pipeline-sdk.yml`，adxadmin 使用 `.buildkite/pi
 入口 `.buildkite/pipeline.yml` 按 pipeline slug 分派。Full 显式指定基础包与 SDK build UUID，
 核对提交、候选清单和 SHA256，只消费制品，不重编译产品。
 
-基础出包包含六个并行门禁：Platform、Gateway、Execd 各自先运行 UT 再编译出包，
+基础出包包含公共门禁及默认开启的 AFS 门禁：Platform、Gateway、Execd 各自先运行 UT 再编译出包，
 SDK 与 adxadmin 分别运行 UT、wheel/sdist 构建及安装检查，source gate 检查 fmt/Clippy 和构建脚本。
 公共 Rust crate 测试归 Platform，Agent crate 测试归 Gateway，分组测试检查整个 workspace
 没有漏项或重复。被显式忽略的环境依赖测试仍由专项验收负责，不计为本轮 UT 已通过。
 adxadmin 复用 SDK 的 Python 3.12 容器执行器，不使用 Rust 构建镜像的 Python 3.9。
 
-Agent FS（AFS） 是可选文件系统组件。默认 source gate、基础包组装、镜像和部署不包含
-`afs-meta`、`afs-node`、AFS 配置示例或 FUSE 专属系统依赖。`afs/**`、根 Cargo/Make
-入口或 source gate 本身变化时，默认 pipeline 仍走 `.buildkite/source-gate.sh`；显式
-`ADX_WITH_AFS=1` 时，source gate 在公共 fmt/Clippy/tooling 检查中追加 AFS lint，但不改变默认包
-或部署制品。显式文件系统包使用同一个 `ADX_WITH_AFS=1` 合同，Buildkite 才启用
-`build-afs` 和 `build-afs-arm64` 可选组件步，组装时下载 AFS 组件并把 `--with-afs` 传给包清单、build manifest
+Agent FS（AFS）在 Base 流水线默认开启；仓内目前没有按改动路径选择组件的机制。
+`.buildkite/pipeline-package.yml` 用 `${ADX_WITH_AFS:-1}` 统一设置模式，显式
+`ADX_WITH_AFS=0` 仍可关闭。ON 时 source gate 追加 AFS lint，`build-afs` 运行普通组件测试和编译；
+已启用架构的 `build-afs-arm64` 编译 AFS，是否测试仍由 `ADX_ARM_TESTS` 控制。
+组装下载 AFS 组件并把 `--with-afs` 传给包清单、build manifest
 和 OBS 发布校验。带 AFS 包写入 `with_afs: true` 并包含 `bin/afs-meta`、`bin/afs-node`
-和 `etc/examples/afs/*`；默认包校验会拒绝这些文件。普通产品构建不编译 AFS
+和 `etc/examples/afs/*`；OFF 包校验会拒绝这些文件。Base 在公共 L0/auth 后运行现有组件5项
+和 OwnerFs/DFS SDK 冒烟，不运行 AFS 功能全量、专项或长稳。Full 在自己的 YAML 入口默认同为 ON，
+消费新 Base 候选并在原公共 Full profile 后追加同一组 AFS 冒烟；消费旧 OFF 包/镜像需显式传
+`ADX_WITH_AFS=0`，防止候选模式校验冲突。独立 Makefile/release、SDK/admin 流水线的 AFS 默认值
+及公共 Full profile 保持原合同；共享默认分支、外部触发与合入规则不在此修改。
+已有触发方若显式传 OFF，仍会关闭 AFS，不能把仓内默认 ON 等价成所有外部事件都会运行 AFS。
+普通产品构建不编译 AFS
 examples/验收探针；RDMA/all-features lint 需要 `ADX_AFS_ALL_FEATURES=1` 且先通过
 `libibverbs` 开发文件检查。
 
@@ -75,6 +80,10 @@ Buildkite pipeline slug 为 `agent-dx`，配置入口为
 `.buildkite/pipeline-package.yml`。
 
 ### 触发
+
+以下是既有触发策略设计，外部事件到 Buildkite 的实际接线仍须单独核实。
+仓内默认 ON 只决定已经创建的 Base/Full 构建如何运行，不创建 webhook，也不保证每次
+master/MR 事件已经自动触发；线上触发与合入保护的核对见[测试规范](../testing/test-strategy.md)。
 
 - Pull Request：影响控制面、Gateway、部署、内部协议、Runtime Pack 或打包逻辑时触发。
 - 主分支提交：总是触发，保留候选制品。
