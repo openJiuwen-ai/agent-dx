@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import logging
 import os
 import platform
 import shutil
@@ -12,6 +13,7 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+LOGGER = logging.getLogger(__name__)
 
 
 def digest(path):
@@ -46,8 +48,10 @@ def run_git(command, *, timeout):
         raise subprocess.CalledProcessError(code, command)
 
 
-def build(source, output, jobs=4):
+def build(source, output, jobs=4, git_protocol=None):
     """Build an explicit checkout, or fetch the pin into a temporary checkout."""
+    if git_protocol not in (None, '2'):
+        raise ValueError('git_protocol must be omitted or 2')
     if source is not None:
         return _build(source, output, jobs)
     pin = json.loads((ROOT / 'third_party/e2b/source.json').read_text())
@@ -60,15 +64,22 @@ def build(source, output, jobs=4):
         run_git([git, '-C', str(source), 'remote', 'add', 'origin', pin['repository']], timeout=30)
         # Git 2.17 requires an explicit partial-clone repository before fetch
         # accepts --filter. Keep checkout patterns compatible with pre-2.25 Git.
+        # CI opts into v2 locally: both fetch and checkout's lazy blob fetches
+        # inherit it, without changing other callers or global Git settings.
+        if git_protocol:
+            run_git([git, '-C', str(source), 'config', 'protocol.version', git_protocol], timeout=30)
         for key, value in (('core.repositoryformatversion', '1'), ('extensions.partialClone', 'origin'),
                            ('core.partialCloneFilter', 'blob:none'), ('remote.origin.promisor', 'true'),
                            ('remote.origin.partialCloneFilter', 'blob:none'), ('core.sparseCheckout', 'true')):
             run_git([git, '-C', str(source), 'config', key, value], timeout=30)
         (source / '.git/info/sparse-checkout').write_text('/*\n!/*/\n/packages/\n!/packages/*/\n'
                                                        '/packages/envd/\n/packages/shared/\n')
+        LOGGER.info('Fetch pinned envd source %s (Git protocol %s)', pin['revision'], git_protocol or 'default')
         run_git([git, '-C', str(source), 'fetch', '--depth=1', '--filter=blob:none', 'origin', pin['revision']],
                 timeout=300)
+        LOGGER.info('Materialize pinned envd checkout, including sparse blobs')
         run_git([git, '-C', str(source), 'checkout', '--detach', 'FETCH_HEAD'], timeout=60)
+        LOGGER.info('Pinned envd checkout complete; verifying source before compilation')
         return _build(source, output, jobs)
 
 
@@ -112,9 +123,13 @@ def _build(source, output, jobs):
 
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format='%(message)s')
     parser = argparse.ArgumentParser()
     parser.add_argument('--source', type=Path, help='clean pinned checkout; omitted: fetch the pin temporarily')
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--jobs', type=int, default=4)
+    parser.add_argument('--git-protocol', choices=('2',),
+                        help='opt into protocol v2 in the temporary checkout (Git 2.18+)')
     parsed_args = parser.parse_args()
-    build(parsed_args.source.resolve() if parsed_args.source else None, parsed_args.output.resolve(), parsed_args.jobs)
+    build(parsed_args.source.resolve() if parsed_args.source else None, parsed_args.output.resolve(), parsed_args.jobs,
+          git_protocol=parsed_args.git_protocol)

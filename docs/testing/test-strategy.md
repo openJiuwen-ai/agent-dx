@@ -1,7 +1,7 @@
 <a id="top"></a>
 # ADX／AFS 测试规范：五步验证路径
 
-状态：2026-11-01。CI0–CI3及默认AFS冒烟已合入；CI4候选[MR130](https://gitcode.com/openJiuwen/agent-dx/merge_requests/130)已通过正常Full，尚未合入。
+状态：2026-11-01。CI0–CI4及默认AFS冒烟已合入，[MR130](https://gitcode.com/openJiuwen/agent-dx/merge_requests/130)对应master `4bbc6b26`。合入前Full90通过；合入后Base232的envd获取阻塞另提[MR131](https://gitcode.com/openJiuwen/agent-dx/merge_requests/131)修复。修复候选Base235默认冒烟首次通过，正常Full91也已首次通过并完成严格附件复核；MR131尚未合入，不称master已完成本轮复核。
 
 先按下方五步理解验证时机，再用同页总表看现状与待补项；目录、环境、入口、具体版本及失败证据在对应步骤展开。
 
@@ -26,14 +26,14 @@
 | ① 基础UT／LLT | 尽早发现模块规则、错误传播、状态机及接口合同回归 | 已有8个AFS crate测试入口；普通非ignored测试已接ON组件构建 | Linux；UT在源文件，LLT在域内tests；`make afs-test`／选包 `cargo test` | 固定推荐范围、说明feature/ignored边界；新功能按代码补UT，不另造runner | 维护基线；P0明确范围 |
 | ② 单VM集成 | 验证真实Meta/Node、FUSE/bind、数据/权限/缓存和正常恢复/清理 | 统一入口已实现；历史冻结候选基础11/11通过；当前登记13基础＋2扩展，按实际制品/环境分别验收 | 一台Linux VM；`afs/tests/run.py`＋`suites/`＋local/exec适配 | 此前冻结输入的新构建阻塞保留为历史；后续新版本持续跑对应本地集合 | P0基础已完成 |
 | ③ 多namespace集成 | 验证隔离节点的真实TCP/mTLS、远端数据路径、恢复和多读者 | 一VM多namespace已实现；历史冻结候选三角色基础＋C读者9/9通过，不继承为当前其它环境的成绩 | 一VM的M/A/B/C隔离角色；标准Linux环境说明；`cluster-basic`／`cluster-manyread`；同run.py | 可选SSH真实多VM适配未实跑；不宣称VM断电/宿主故障隔离 | P1基础已完成 |
-| ④ Buildkite流水线验证 | 防止共享候选包破坏AFS/ADX；流水线内必测、事件触发、合入保护分别验收 | 上游MR126–129已合入、默认ON原冒烟通过；CI4候选Full90完整公共11＋组件24＋SDK16及清理通过，MR130尚未合入 | 既有目标K8s；`run-e2e.sh` → `afs_gate.py`；组件复用AFS `run.py`，SDK融入ADX公共E2E | 评审合入MR130及合入后新候选验证；公共Redis Issue71独立跟踪；外部relay/合入强制另核 | P1候选合入与PK0拿包复现 |
+| ④ Buildkite流水线验证 | 防止共享候选包破坏AFS/ADX；流水线内必测、事件触发、合入保护分别验收 | 上游MR126–130已合入；envd工具修复候选Base235新包/默认公共2＋AFS5＋SDK12首次通过；正常Full91公共11＋AFS24＋SDK16及正常清理首次通过，MR131待合入 | 既有目标K8s；`run-e2e.sh` → `afs_gate.py`；组件复用AFS `run.py`，SDK融入ADX公共E2E | 评审合入MR131及合入后正式候选复核，再进入PK0；公共Redis Issue71、外部relay/合入强制分别核验 | P1修复候选验收／合入；后续PK0 |
 | ⑤ 固定包验收 | 人或AI可自主部署、验收和复现，扩大版本质量验证 | 公共K8s Full、Docker单宿主11组和专项已有；只有5分钟soak/90秒采样，完整长稳未闭环 | 先备固定包/SDK/backend/bundle及合格环境；直接公共E2E或独立Full代跑 | PK0–PK4：拿包复现→产品Full→专项→公共长稳→受控性能；复用第四步适配，补说明/负载/判据 | P1可复现全量/专项；P2长稳/性能 |
 
 ## 统一口径与优先级
 
 - **已定原则／决策**：组件UT/集成归AFS，真实组件测试统一目标 `afs/tests/`；ADX公开SDK及完整产品场景归 `build/e2e/`。本地、CI、拿包验收复用断言和结果语义，按环境适配，不复制一套Buildkite专用业务用例。
 - **事实**是已有代码/调用；**已有规划**是原仓内目标但未闭环；**待补项**是后续实现范围；**待验证**是尚未实测的环境/触发条件。总体规范已确认，不表示具体CLI文件、CI接线或所有场景已存在。
-- **当前**第二/三步基础、CI0–CI3与Base默认ON已实现并有对应冻结候选证据；**P1**CI4候选Full90已通过，待评审合入并继续PK0拿包复现和专项；**P2**完整长稳及受控性能。公共Redis间歇问题单独跟踪，不改ADX生产实现或隐藏失败。自动触发和合入强制另验，不把本地VM变成所有开发者的提交前强制条件。
+- **当前**第二/三步基础、CI0–CI3与Base默认ON已实现并有对应冻结候选证据；**P1**CI4已合入；envd修复候选Base235已通过默认冒烟，正常Full91也已通过，待MR131合入及正式候选复核后进入PK0拿包复现和专项；**P2**完整长稳及受控性能。公共Redis间歇问题单独跟踪，不改ADX生产实现或隐藏失败。自动触发和合入强制另验，不把本地VM变成所有开发者的提交前强制条件。
 - **通过标准**：选中的必需项必须实际执行，0匹配、ignored、未执行、BLOCKED不能记PASS；定向通过不冒称完整Full，含AFS二进制不证明产品使用了AFS；正常清理也必须举证。
 - **环境与结果范围**：VM、Docker、K8s分别记录；Pod跨worker不能冒充多VM/断电验证；功能、正常恢复、故障、长稳及性能分别报告。CI缺必需环境不能静默跳过为成功。
 
@@ -211,18 +211,53 @@ python3 afs/tests/run.py run --suite cluster-manyread --env /absolute/namespaces
 <a id="step-4"></a>
 ## 第四步：Buildkite共享门禁
 
-**本步原则、现状与优先级**：复用ADX既有目标K8s和部署入口，不调用个人VM；Base保留原冒烟，Full明确扩展基础功能。CI0–CI3、默认ON和Base230新制品冒烟已通过；CI4候选Full90已通过，当前仍待评审合入；已有实测和公共问题见下表。优先级P1：候选合入与PK0拿包复现；线上事件触发/强制合入策略分别核实，不从流水线通过推断。
+**本步原则、现状与优先级**：复用ADX既有目标K8s和部署入口，不调用个人VM；Base保留原冒烟，Full明确扩展基础功能。CI0–CI4与默认ON已合入，合入前Full90已通过；合入后Base232失败保留；envd工具修复候选Base235已首次通过新包/默认冒烟，正常Full91也已通过。优先级P1：合入MR131并复核正式候选后进入PK0拿包复现；线上事件触发/强制合入策略分别核实，不从流水线通过推断。
 
 **状态**：五步总体逻辑已确认；以下目录/命令中标注目标或待补者尚未实施。
 
-### CI4候选已验证：组件24项与SDK16项融入公共Full
+### 固定envd获取修复候选：Base235与正常Full91已验证
+
+修复只落在构建工具：[Issue72](https://gitcode.com/openJiuwen/agent-dx/issues/72)／[MR131](https://gitcode.com/openJiuwen/agent-dx/merge_requests/131)。运行候选source/harness为`9767533bcdab6fcdbd027f57f32b194aa8d7681e`，基于master4bbc6b26，ADX/AFS/SDK生产目录未改；共享默认分支、hook和合入规则不改。MR131仍待评审合入。
+
+| 环节 | 已有实现／本轮结果 | 边界与验收口径 |
+| --- | --- | --- |
+| 最小修复 | `.buildkite/build-component.sh`显式传`--git-protocol 2`；`build/e2b/build_envd.py`只对新建临时repo设置本地`protocol.version=2`，fetch与sparse checkout懒取blob都继承；增加阶段日志 | 普通调用默认行为保留；显式`--source`不改调用者checkout；Git 2.18+，本次原builder Git2.25.1。不是全局Git配置修改 |
+| 版本与源码校验 | envd0.9.0、revision92197909dce5a1bef33e764ae4af76f0732fd7a8、Go1.26.8及六项源码SHA不变；fetch300s/checkout60s不变；原编译/版本/提交/摘要校验函数未改 | 没有替换预编译二进制、镜像或归档输入，也没有放宽失败判定 |
+| 诊断证据 | 233的三种Git获取均40s超时；234两次显式v2实际fetch取得固定HEAD（2.000/1.608s），v0/v2 refs GET235950/191B。完整官方源码归档GET及6项SHA也通过，仅用于独立来源核对 | 233/234是顺序样本，不排他认定协议为唯一网络根因；诊断fetch不替代完整checkout、Go编译或产品验收 |
+| 真实envd链路 | Base235首次通过固定SHA fetch、sparse/lazy blob物化、六项源码校验、Go编译、`--version`/`--commit`检查；fetch＋checkout阶段本次3.684s | 新包envd-manifest.json完整SHA为cc371c12…，与231记录完全一致；未独立读取native envd二进制重hash，不虚构其SHA值。单次耗时不是SLA |
+| 新包与默认冒烟 | [Base235](https://buildkite.com/agent-dx/agent-dx/builds/235)全部首次PASS、无retry；省略AFS参数实际ON。普通AFS2058PASS/58ignored；源码Python14/512/37/9；公共2＋AFS组件5＋SDK12实际通过 | 新包/SDK/images/ELF同source976及同build235；root/JUnit4/0/0/summary一致，69份关键附件root再次重hash；25条AFS正常wait0、10个SDK Env、4个backend stop_empty、3个namespace删除通过 |
+| 正常Full | [Full91](https://buildkite.com/agent-dx/agent-dx-full-test/builds/91)复用Base235固定产物，source/harness976；未传AFS/target/profile覆盖，首次PASS、无retry；公共11＋AFS24＋SDK16全部实际通过 | 四内核各1PASS/0ignored、fresh648资产，root/三子338文件harness一致；root/JUnit/summary、公共stop六份观测、121条AFS正常wait0、10个SDK Env、4个backend stop_empty和3个namespace删除均通过。155份必要小附件逐项size/SHA，关键附件root再hash，未继承旧Full90 |
+| 工具与平台检查 | 本地5项构建工具回归、完整PR固定Ruff/Pylint通过；MR131运行代码head976的独立静态/Ruff/禁用词/防投毒/合规和CLA已通过 | 5项包含默认None/显式2固定源码稀疏检出与清理、显式source不改、超时杀子进程、版本/脏目录/摘要拒绝；Mac仅工具测试，Rust/Go/FUSE结论来自Linux CI |
+
+GitHub对协议v2的支持和客户端要求见[官方说明](https://github.blog/changelog/2018-11-07-git-protocol-v2-support/)。本次范围仍是amd64功能集合，不扩ARM/后端矩阵、长稳、HA或精确性能；envd构建和版本一致不能外推E2B全部产品场景已验收。公共Redis Issue71技术根因未确认；当前API已为closed，MR130正文的关联关闭列表含71，不能据关闭状态或本次Base首次通过认定根治。本批未修改该公共问题的生产实现或Issue状态。
+
+本次Base235和Full91的实际代码／产品身份均为9767533b；最终交付若追加规范／README文档提交，只按文档差异记录，不将旧测试来源改写成新HEAD。Base235默认冒烟三段（含部署和清理）分别91.535/60.650/106.326s；Full91分别263.662/138.287/109.003s。这些是单次样本，不等于稳定CI总增量或性能SLA。
+
+**下一步**：MR131评审合入后复核正式master候选，再进入PK0拿包自测；本批未启动PK0、专项、长稳或性能验收。
+
+### MR130合入后Base232：保留原envd获取阻塞记录
+
+MR130于2026-11-01 12:28:50合入，固定master `4bbc6b2619eabdcd019f229e08c4097e628db644`，源码树与评审head `bee689fc`相同。本轮[Base232](https://buildkite.com/agent-dx/agent-dx/builds/232)显式指定master/commit、故意省略AFS参数；服务器及关键作业均取到ON。共享默认分支、hook、合入规则和生产源码未改。
+
+| 环节 | 本轮实际结果 | 验收边界／下一步 |
+| --- | --- | --- |
+| AFS及源码门禁 | 普通AFS2058 PASS/58 ignored；Python14/512/37/8；fmt及AFS默认feature check/clippy通过；Gateway/SDK/admin通过 | 不外推AFS all-features/RDMA或真实挂载执行 |
+| FUSE测试资产 | 新manifest source4bbc，ELF `648ac566…`、archive `8c18a1b6…`／7,289,261B；冻结准备13.413s | 四selector仅list确认，实际执行数0；测试资产保持包外，不能记作内核合同PASS |
+| Platform | 首轮node-retirement两项Redis Unavailable/timeout；原条件重试后该组6/6及作业PASS | 原失败/日志保留，根因未确认，该问题未在本批修复；不是无失败Base |
+| Execd | 两轮Rust测试/编译通过，随后拉取固定envd提交 `92197909…`各超时300s，两次作业均FAILED | pin不变、无第三次盲重试；未改超时、断言或并发。源提交可读和相同proxy env均不能证明CI worker出网正常 |
+| 包、镜像、默认冒烟及正常Full | 依赖Execd，未组装/未执行 | Base232本身无完整候选，不用旧231/Full90顶替；后续修复候选235与正常Full91单列于上节 |
+| 环境和收尾 | 本轮未部署产品测试namespace，也未触发Full；失败job临时源码由构建脚本finally回收 | 管理kubeconfig精确只读GET超时，未改网络/VPN/隧道；不冒称独立远端磁盘已审计 |
+
+**该批历史结论**：Base232失败及未执行项保留。后续选择临时Git检出本地协议v2作为最小修复，未实施源码缓存／归档替代；新候选235及Full91各按自身身份验收，Base232不改绿。
+
+### CI4已合入：组件24项与SDK16项融入公共Full
 
 MR129已合入master `7b3cb9f9`。本轮先以新master默认ON验证既有冒烟，再用CI4候选的新包、SDK、
 镜像和独立测试ELF运行真实Full，不更换共享默认分支、hook、合入规则或生产代码。
 
 原则是分清集合与环境：当前源码注册46项，24项基础/扩展功能、20项读写专项、2项性能资产。
 CI4首批明确登记24项功能（13本地＋9跨角色＋2扩展），包含原冒烟；不以`--all`代替规范，不把专项/性能纳入日常门禁。
-本分支已在[正常Full90](https://buildkite.com/agent-dx/agent-dx-full-test/builds/90)完成真实验收；MR130尚未合入。通过范围为明确登记的集合和实际环境，不代表所有46项或后端矩阵已验收。
+合入前候选已在[正常Full90](https://buildkite.com/agent-dx/agent-dx-full-test/builds/90)完成真实验收；MR130现已合入master `4bbc6b26`，合入后Base232受阻；envd工具修复候选235与Full91在上节单列，不能把旧Full90当作新master成绩。通过范围为明确登记的集合和实际环境，不代表所有46项或后端矩阵已验收。
 
 | 内容 | 入口／位置 | 当前实现和验收边界 |
 | --- | --- | --- |
@@ -233,7 +268,7 @@ CI4首批明确登记24项功能（13本地＋9跨角色＋2扩展），包含�
 | Full SDK存储行为 | `build/e2e/kubernetes/afs_product.py`／`build/e2e/afs_sdk.py` | 保留六项冒烟，另加旧FD经rename/unlink身份、增长/截短/EOF，共每模式8项；不修改SDK/ADX生产接口 |
 | 公共Full编排 | `.buildkite/pipeline-full.yml: platform-e2e`，候选镜像就绪后调用`.buildkite/run-e2e.sh` → `build/e2e/kubernetes/afs_gate.py --profile full` | 原11组＋afs-component-full＋afs-sdk-full；Base l0仍原5＋2×6；每组/root/JUnit/summary和正常清理分别验收 |
 
-以下为本分支候选的独立构建证据；上游当前仍为MR129冒烟范围，CI4需MR130评审合入。
+以下为合入前候选的独立构建证据；实现已随MR130合入，合入后Base232结果单列于下节。
 
 | 构建／身份 | 已有结果 | 当前结论 |
 | --- | --- | --- |
@@ -251,7 +286,7 @@ CI4首批明确登记24项功能（13本地＋9跨角色＋2扩展），包含�
 普通新Base镜像携带独立测试资产供Full复用；产品制品原transport不改，测试资产当前单独走Buildkite。
 旧Rust合同修正只涉及`afs/tests/fuse_contract.rs`：旧句柄冲突时必须实际回退到FUSE且数据正确；无冲突独立inode上仍严格要求零新增READ，权限、完整内容与EOF检查保留。
 
-本轮先完成组件24与SDK16定向验证，再在Full90无target覆盖运行正常Full；每个结果绑定实际source/product/SDK/镜像/ELF/harness身份，不把定向成绩替代整体成绩。Base231的两次公共Redis失败与重试单独保留，[Issue71](https://gitcode.com/openJiuwen/agent-dx/issues/71)仍开放。230→231两个AFS产品二进制SHA一致，只有测试ELF由f208290c变为648ac566；未修改生产缓存策略或降低零READ要求。
+本轮先完成组件24与SDK16定向验证，再在Full90无target覆盖运行正常Full；每个结果绑定实际source/product/SDK/镜像/ELF/harness身份，不把定向成绩替代整体成绩。Base231的两次公共Redis失败与重试单独保留，该合入前时点[Issue71](https://gitcode.com/openJiuwen/agent-dx/issues/71)仍开放；当前Issue状态与未确认根因见前面的envd修复候选说明。230→231两个AFS产品二进制SHA一致，只有测试ELF由f208290c变为648ac566；未修改生产缓存策略或降低零READ要求。
 同目录正常进程恢复不外推emptyDir被删后的持久性、VM故障、HA；长稳、兼容大套件、RDMA/S3/etcd矩阵和精确性能仍不在本批。
 
 **CI4本批耗时口径**：Base只新增测试资产准备，没有运行24项。冻结资产在#230为63.461秒、#231热缓存样本为13.097秒，archive约6.9MiB；不据两个样本推导稳定总CI增量。正常Full90三段（含各自部署/清理）分别为公共269.517秒、组件139.710秒、SDK118.199秒。Base231墙钟1622.396秒包含两次公共失败及重试，不能当作无失败基线，也不是精确性能验收。
@@ -434,7 +469,7 @@ CI2/CI3实现仅补测试、部署配置与CI包装，不修改ADX、AFS或SDK�
 
 依据：[候选组包/校验](../../.buildkite/package-e2e.sh)、[AFS交付文件集](../../build/release/component.py)、[runner输入合同](../../afs/tests/fixtures/multivm.py)、[harness范围](../../build/e2e/kubernetes/run.py)、[运行镜像配方](../../build/images/Dockerfile.e2e-runtime)、[现有runtime准入](../../build/e2e/preflight.py)。本节是编码前盘点快照；下方计划除上节已实现的交接子项外仍待实施。
 
-### 第四步实施计划与历史基线：组件、产品、门禁分别验收（CI4候选Full90通过，待合入）
+### 第四步实施计划与历史基线：组件、产品、门禁分别验收（CI4已合入；envd工具修复候选235/91已通过，待合入）
 
 **先看顺序**：固定候选与CI环境 → 真实AFS组件读写/清理 → SDK实际使用AFS → 接入必需冒烟 → 扩展功能Full。沿用现有两条公共流水线；CI组件结果、ADX产品结果和最终门禁状态分别可追溯，前一批通过不冒充后一批已经完成。
 
