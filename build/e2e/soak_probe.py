@@ -8,6 +8,56 @@ import stat
 import sys
 
 NAMES = ('afs-meta', 'afs-node', 'adxlet', 'adx-coordinator', 'adx-apiserver', 'adx-ingress', 'sandboxd', 'envd')
+STORAGE_SCOPE = 'allocated-backing-fs-v2'
+
+
+def mount_paths(text):
+    def decode(path):
+        for escaped, plain in (('\\040', ' '), ('\\011', '\t'), ('\\012', '\n'), ('\\134', '\\')):
+            path = path.replace(escaped, plain)
+        return path
+    return {decode(line.split(' - ', 1)[0].split()[4]) for line in text.splitlines()}
+
+
+def backing_storage(directory, mounts):
+    """Allocated blocks on the owning filesystem; prune RO/merged/tmpfs/bind views."""
+    directory = Path(directory)
+    if directory.is_symlink():
+        raise ValueError('backing measurement root cannot be a symlink')
+    if not directory.exists():
+        return {'bytes': 0, 'device': None, 'excluded_mounts': [], 'entries': 0}
+    device = directory.stat().st_dev
+    excluded = {path for path in mounts if path.startswith(str(directory) + '/')}
+    total, seen = 0, set()
+    def fail(error):
+        if not isinstance(error, FileNotFoundError):
+            raise error
+    for root, dirs, files in os.walk(directory, followlinks=False, onerror=fail):
+        retained = []
+        for name in dirs:
+            path = Path(root) / name
+            try:
+                value = path.lstat()
+            except FileNotFoundError:
+                continue
+            if str(path) not in excluded and value.st_dev == device:
+                retained.append(name)
+        dirs[:] = retained
+        entries = [Path(root), *(Path(root) / name for name in files),
+                   *(Path(root) / name for name in dirs if (Path(root) / name).is_symlink())]
+        for path in entries:
+            if str(path) in excluded:
+                continue
+            try:
+                value = path.lstat()
+            except FileNotFoundError:
+                continue
+            identity = (value.st_dev, value.st_ino)
+            if value.st_dev != device or identity in seen:
+                continue
+            seen.add(identity)
+            total += value.st_blocks * 512
+    return {'bytes': total, 'device': device, 'excluded_mounts': sorted(excluded), 'entries': len(seen)}
 
 
 def process_info(pid):
@@ -77,6 +127,10 @@ def observe(environment_id=None):
     total, logs = storage('/a')
     runtime = Path('/tmp/adx-e2e/sandboxd')
     streams = storage('/opt/adx/logs/runtime')[0]
+    mountinfo = Path('/proc/self/mountinfo').read_text()
+    mounts = mount_paths(mountinfo)
+    backing = backing_storage(runtime, mounts)
+    stream_backing = backing_storage('/opt/adx/logs/runtime', mounts)
     anchor = anchor_runtime(environment_id) if environment_id else None
     return {'processes': processes, 'anchor_runtime': anchor,
             'fds': sum(p['fds'] for p in processes.values()) + (anchor['fds'] if anchor else 0),
@@ -84,6 +138,8 @@ def observe(environment_id=None):
             'mounts': len(Path('/proc/self/mountinfo').read_text().splitlines()),
             'disk_bytes': total, 'log_bytes': logs, 'disk_data_bytes': total - logs,
             'runtime_disk_bytes': storage(runtime)[0] + streams, 'runtime_stream_bytes': streams,
+            'runtime_backing_bytes': backing['bytes'] + stream_backing['bytes'],
+            'runtime_backing': backing, 'runtime_stream_backing': stream_backing, 'storage_scope': STORAGE_SCOPE,
             'runtime_disk_present': runtime.is_dir(), 'free_bytes': shutil.disk_usage('/a').free}
 
 

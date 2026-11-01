@@ -10,8 +10,32 @@ import threading
 import time
 
 from afs_special_sdk import CONFIRMED, _cleanup, _save, run_phase
-from afs_sdk import write_synced
+from afs_sdk import command, perl
 from mixed_soak import exercise, verify_assignment
+PAYLOAD_STAGE = '/tmp/afs-soak-input'
+PAYLOAD_TRANSPORT = 'sdk-stage-short-copy-fsync-v2'
+
+
+def prepare_payload(environment):
+    environment.files.write(PAYLOAD_STAGE, b'')
+    command(environment, perl('chmod(0644,shift)==1 or die $!;', PAYLOAD_STAGE, uid=0))
+
+
+def publish_payload(environment, payload):
+    """Keep the 16 KiB data out of the one-hour retained command registry."""
+    if len(payload) != 16384:
+        raise ValueError('soak publication requires exactly 16 KiB')
+    environment.files.write(PAYLOAD_STAGE, payload)
+    operation = perl(
+        'open(my $r,"<",shift) or die $!;binmode($r);'
+        'defined(my $n=read($r,my $d,16384)) or die $!;die "short staging data" unless $n==16384;'
+        'defined(my $extra=read($r,my $tail,1)) or die $!;die "trailing staging data" if $extra;close($r) or die $!;'
+        'open(my $w,">",shift) or die $!;binmode($w);print $w $d or die $!;'
+        '$w->flush() or die $!;$w->sync() or die $!;close($w) or die $!;', PAYLOAD_STAGE, '/afs/soak-current')
+    if len(operation.encode()) > 2048:
+        raise ValueError('soak publication control command exceeded 2 KiB')
+    command(environment, operation)
+    return len(operation.encode())
 
 
 def run(connection, image, config, directory, stop):
@@ -30,6 +54,7 @@ def run(connection, image, config, directory, stop):
               'verified_bytes': 0, 'instances': {}, 'remaining': [], 'owner': config['owner'],
               'mode': config['mode'], 'qualification_only': config.get('acceptance', 'qualification') != 'one-hour',
               'contract_sha256': config.get('contract_sha256'),
+              'payload_transport': PAYLOAD_TRANSPORT, 'maximum_publish_command_bytes': 0,
               'injected_failure_after_cycles': config['fail_after_cycles']}
 
     def publish():
@@ -57,6 +82,7 @@ def run(connection, image, config, directory, stop):
         report['operations']['create'] += len(owned)
         for role in ('A', 'B'):
             handles.append(Environment.from_id(prepared['instances'][role], connection=connection))
+            prepare_payload(handles[-1])
         report['sdk_source'] = prepared['sdk_source']
         report['sdk_version'] = prepared['sdk_version']
         started = time.monotonic()
@@ -71,7 +97,8 @@ def run(connection, image, config, directory, stop):
             for handle in handles:
                 if handle.files.read('/afs/confirmed', format='bytes') != CONFIRMED:
                     raise AssertionError('previously confirmed content changed')
-            write_synced(left, '/afs/soak-current', payload)
+            size = publish_payload(left, payload)
+            report['maximum_publish_command_bytes'] = max(report['maximum_publish_command_bytes'], size)
             if right.files.read('/afs/soak-current', format='bytes') != payload:
                 raise AssertionError('cross-role synced content changed')
             report['verified_bytes'] += len(payload)

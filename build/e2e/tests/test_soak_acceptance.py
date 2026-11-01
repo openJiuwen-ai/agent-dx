@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 import contextlib
 import io
+import json
 
 
 def module():
@@ -25,8 +26,9 @@ def samples():
             process = 'afs-meta:2' if name == 'afs-m' else 'afs-node:2'
             nodes[name] = dict.fromkeys(('memory_bytes', 'memory_anon_bytes', 'runtime_memory_bytes',
                                         'runtime_anon_bytes', 'disk_bytes', 'disk_data_bytes', 'log_bytes',
-                                        'runtime_disk_bytes', 'rss_bytes'), 1024**2)
+                                        'runtime_disk_bytes', 'runtime_backing_bytes', 'rss_bytes'), 1024**2)
             nodes[name].update(fds=10, mounts=10, free_bytes=8 * 1024**3, container_id=name,
+                               storage_scope='allocated-backing-fs-v2',
                                memory_cgroup='/docker/' + name,
                                runtime_cgroup='/runtime/' + name if name != 'afs-m' else None,
                                runtime_disk_present=name != 'afs-m',
@@ -59,7 +61,8 @@ class FormalSoakContracts(unittest.TestCase):
         self.real_workload = workload
 
     def work(self):
-        return dict(self.real_workload(), contract_sha256=module().contract_sha())
+        return dict(self.real_workload(), contract_sha256=module().contract_sha(),
+                    payload_transport='sdk-stage-short-copy-fsync-v2', maximum_publish_command_bytes=1000)
 
     def test_steady_complete_hour_passes_with_ten_five_minute_windows(self):
         policy = module()
@@ -185,6 +188,16 @@ class FormalSoakContracts(unittest.TestCase):
             values[30]['nodes']['node1']['anchor_runtime'][field] = changed
             with self.assertRaisesRegex(ValueError, 'physical anchor'):
                 policy.evaluate(values, self.work(), 'dfs', policy.contract())
+
+    def test_v2_changes_measurement_units_without_weakening_any_numeric_or_workload_rule(self):
+        policy = module()
+        original = json.loads((policy.CONTRACT_PATH.parent / 'one-hour-v1.json').read_text())
+        current = policy.contract()
+        current['id'] = original['id']
+        current.pop('measurement')
+        for group in ('peak_growth', 'trends'):
+            current[group]['runtime_disk_bytes'] = current[group].pop('runtime_backing_bytes')
+        self.assertEqual(current, original)
 
 
 if __name__ == '__main__':

@@ -7,7 +7,7 @@ from pathlib import Path
 import statistics
 
 NODES = ('node1', 'node2', 'afs-m')
-CONTRACT_PATH = Path(__file__).with_name('soak-contracts') / 'one-hour-v1.json'
+CONTRACT_PATH = Path(__file__).with_name('soak-contracts') / 'one-hour-v2.json'
 
 
 def contract():
@@ -46,6 +46,8 @@ def check_sample(sample, baseline, policy):
             raise ValueError(node + ' cgroup observation identity changed')
         if node != 'afs-m' and observed.get('runtime_disk_present') is not True:
             raise ValueError(node + ' runtime disk coverage missing')
+        if observed.get('storage_scope') != policy['measurement']['storage_scope']:
+            raise ValueError(node + ' backing storage measurement scope missing')
         for field, maximum in policy['peak_growth'].items():
             current = number(observed.get(field), node + '.' + field)
             if current - number(initial.get(field), node + '.baseline.' + field) > maximum:
@@ -101,6 +103,8 @@ def evaluate(samples, work, mode, policy):
             or not isinstance(cycles, int) or cycles < policy['minimum_total_cycles']
             or work.get('verified_bytes') != cycles * 16384
             or work.get('contract_sha256') != contract_sha()
+            or work.get('payload_transport') != policy['measurement']['payload_transport']
+            or not 0 < number(work.get('maximum_publish_command_bytes'), 'control command bytes') <= 2048
             or work.get('errors') != [] or work.get('cleanup_errors') != [] or work.get('remaining') != []
             or work.get('injected_failure_after_cycles') != 0
             or number(counts.get('create'), 'create') - 2 < policy['minimum_total_churn']

@@ -260,10 +260,10 @@ resource/trend/error/fault policy and actually complete the declared duration
 before making that claim. K8s, cross-VM failure isolation and precise performance
 are outside this implementation. Default smoke and Full selections are unchanged.
 
-### Frozen one-hour acceptance
+### Frozen one-hour acceptance v2
 
 `--acceptance one-hour` selects the tracked
-[one-hour-v1 contract](soak-contracts/one-hour-v1.json). It requires exactly
+[one-hour-v2 contract](soak-contracts/one-hour-v2.json). It requires exactly
 3600 seconds, 15-second sampling, no deliberate fault and unchanged peak bounds;
 the CLI rejects altered duration, sampling or relaxed limits. Run OwnerFs and
 DFS sequentially with the same fixed package and separate new outputs:
@@ -278,9 +278,13 @@ python3 build/e2e/soak.py \
   --output /absolute/new-ownerfs-one-hour-result
 ```
 
-The one-hour workload is the same bounded, alternating 16 KiB fsync/cross-role
+The one-hour workload keeps the same alternating 16 KiB fsync/cross-role
 read, confirmed-content verification, SDK command/file round trip and temporary
-Environment churn. Two anchor Environments and the AFS cluster remain live.
+Environment churn. Raw publication data uses a fixed SDK staging file; a <=2 KiB
+UID10000 command copies it into AFS and fsyncs. The product retains command
+strings by default for 3600 seconds, so embedding each changing payload as a
+32 KiB hex argument would manufacture control-memory growth in this fixed-set
+test. No production retention setting is changed. Two anchor Environments and the AFS cluster remain live.
 Require >=600 verified publishing cycles and >=300 completed churns in total;
 each steady five-minute window needs >=25 cycles and >=10 completed churns.
 These minimums ensure sustained work, not a throughput SLA. There is no restart,
@@ -297,8 +301,13 @@ sample does not hide load-time growth.
 Observe Docker-node cgroups and sibling external-runtime cgroups separately,
 including anonymous/file memory and OOM events. Observe persistent process
 PID/start/RSS/FD, each anchor's labeled runc ID/PID/start/RSS/FD, mounts,
-apparent AFS/data bytes versus logs, runtime state and
-retained stream bytes. A filesystem walk skips concurrently retired entries,
+apparent AFS/data bytes versus logs, runtime backing allocation and
+retained stream allocation. Keep the legacy cross-mount apparent runtime size
+as a diagnostic counter. `runtime_backing_bytes` counts st_blocks*512 once per
+inode on the owning filesystem and prunes all submount views, including same-
+device bind mounts, EROFS/overlay rootfs and tmpfs caches. Writable backing
+upperdirs and retained stdout/stderr files remain counted. Memory-backed caches
+remain observed through their cgroup memory counters. A filesystem walk skips concurrently retired entries,
 counts hard links once and never follows external symlinks; other read errors
 fail sampling. Any OOM, changed anchor/container/process identity, content or
 SDK error, missing observation, exceeded peak or unconfirmed cleanup fails.
@@ -313,7 +322,7 @@ window midpoints must pass; positive slopes are expressed per hour:
 
 | Metric per role | Maximum end delta | Maximum slope per hour |
 | --- | --- | --- |
-| Docker anonymous memory, aggregate persistent-process RSS, AFS data, runtime disk | 32 MiB | 16 MiB |
+| Docker anonymous memory, aggregate persistent-process RSS, AFS data, runtime backing allocation | 32 MiB | 16 MiB |
 | External-runtime anonymous memory, each persistent process RSS | 16 MiB | 8 MiB |
 | Persistent-process FDs | 4 | 4 |
 | Mount count | 1 | 1 |
@@ -321,7 +330,9 @@ window midpoints must pass; positive slopes are expressed per hour:
 Page-cache observations remain visible but are bounded by the separate total
 memory peak, rather than mislabeled as anonymous leakage. Log bytes have a
 separate 128 MiB peak-growth allowance; data trend limits exclude those AFS logs.
-These v1 bounds define this fixed-working-set, one-hour test. Passing does not
+The v2 numeric limits and workload minimums are identical to v1; a regression
+assertion enforces that equivalence after the runtime metric rename. They define
+this fixed-working-set, one-hour test. Passing does not
 prove absence of smaller/slower leaks, 24-hour stability, internal GC/backlog
 correctness, fault recovery, cross-VM isolation or performance.
 
@@ -860,3 +871,13 @@ python3 build/e2e/backend_start_timeout.py \
 ```
 
 Both image and runtime internal timers must fire at least ten seconds before the overall create budget. JSON and SSE must return `504 / DEADLINE_EXCEEDED / never / terminal` with the precise backend stage, and both original-request replay and authoritative failed-record replay must retain the exact message. The same real registry also returns missing-image, permission-denied, authentication-failure and rate-limit responses; JSON/SSE must retain their 404/403/401/429 categories and original message. Healthy create/delete calls before and after the faults verify runtime recovery. Evidence includes each response and an aggregate JSON verdict. This test injects faults only into the labelled disposable container.
+
+The first v1 attempt (source `c9724a70`, fixed Base236) failed at 70.181902s
+OwnerFs and 205.250455s DFS on the cross-mount `runtime_disk_bytes` peak; neither
+is a one-hour pass. Both had zero workload errors and normal cleanup. A separate
+controlled diagnostic added/deleted one backend: EROFS/overlay mount views raised
+logical size by415,249,086B and restored it on deletion, while backing allocation
+rose only57,344B. The correction is a versioned measurement fix, with original
+failures retained, not a relaxed threshold or a product patch. A diagnostic
+operator import-path failure is retained separately. Fresh v2 runs require their
+own frozen harness, complete tool/observer admission and actual3600s per mode.
