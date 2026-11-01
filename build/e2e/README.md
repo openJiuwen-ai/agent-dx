@@ -189,6 +189,77 @@ The legacy standard-suite runner retains its ARM64 and full-environment
 guards. This native x86_64 campaign does not run pjdfstest/LTP/FSx/random
 compatibility suites or claim their execution counts.
 
+### Continuous fixed-package qualification (PK3)
+
+The explicit public `soak.py` entry reuses the PK1 offline Docker deployment,
+candidate checks, installed SDK and PK2 AFS mount preparation. It keeps one
+Environment per data role and the same AFS cluster throughout the requested
+workload; it does not loop over fresh deployments. This is separate from the
+legacy 300-second `mixed-soak` and the three-hour targeted-suite budget.
+
+```sh
+python3 build/e2e/soak.py \
+  --bundle /absolute/fixed-bundle/bundle.json \
+  --registry-images /absolute/fixed-bundle/registry-images.json \
+  --image-export /absolute/offline-images/image-export.json \
+  --artifact-commit REPLACE_WITH_PRODUCT_COMMIT \
+  --mode ownerfs --seconds 60 --sample-seconds 5 \
+  --output /absolute/new-soak-result
+```
+
+On 2026-11-01, frozen test source `6e7c87b8` and fixed Base236 product
+`f93e2fb0` completed OwnerFs 60.510062s/65 cycles and DFS 60.386944s/64
+cycles, plus deliberate-failure and external-cancellation qualifications. Each
+normal run had 13 resource samples; all four completed normal cleanup. Negative
+runs retained failed parent results. This qualifies the entry, not long-run
+reliability or performance. See the canonical testing strategy for evidence scope.
+
+Choose `ownerfs` or `dfs` explicitly; each has its own result. The installed
+candidate SDK repeatedly verifies previously synced content, publishes a bounded
+16 KiB working file with fsync, checks every byte from the opposite role, runs
+the existing mixed-load command/binary-file primitive, and creates/deletes a
+temporary Environment about every five seconds. Anchor IDs remain stable.
+The temporary command files are removed each cycle. There is no automatic retry,
+fault injection, restart, package build or version substitution.
+
+The duration flag accepts 1..86400 seconds; PASS also requires at least two
+completed cycles, one churn and two resource samples. Very short requests may
+therefore fail admission. Timing starts after SDK mount preparation and stops
+before cleanup. The controller allows a separate 600-second preparation/final
+operation reserve; shutdown allows 180 seconds for the SDK worker. Each in-node
+resource probe has a 30-second deadline; Docker transport keeps the adapter's
+existing deadlines. This entry bypasses neither SDK call
+timeouts nor the caller's outer job budget: reserve deployment and cleanup time
+in addition to the requested duration. Background-worker PID/start identity,
+progress, terminal receipt and normal cleanup are checked explicitly.
+
+`soak-samples.jsonl` records each role's cgroup memory, persistent process
+PID/start time/RSS/FDs, mount count, owned `/a` disk bytes and free disk. Defaults
+are **qualification bounds**, frozen in `soak-result.json`: growth from the
+first active sample <=512 MiB memory, <=256 MiB disk, <=128 FDs, <=8 mounts,
+and >=2048 MiB free. Override using `--max-memory-growth-mib`,
+`--max-disk-growth-mib`, `--max-fd-growth`, `--max-mount-growth`, `--min-free-mib`.
+Sample gaps must be <=3 intervals+30 seconds; missing progress for more than
+max(30 seconds, 3 intervals), resource overflow, changed persistent process
+identity, content mismatch or any SDK error fails immediately. These broad
+bounds and short samples are not a leak-free or performance acceptance contract.
+Internal backlog/GC queues and formal long-term trend criteria remain unqualified.
+
+`SIGTERM`/`SIGINT` requests SDK stop, waits for worker termination and explicit
+Environment deletion, verifies empty runtimes, normally stops/unmounts AFS,
+then removes owned Docker resources. Cancellation remains a failed parent run
+with a cancelled workload. For a negative qualification use
+`--qualify-fail-after-cycles 3`; the deliberate failure must also stay failed.
+Unconfirmed normal cleanup fails even if container removal succeeds.
+
+Read `result.json`, `soak-result.json`, `soak-sdk/workload.json`, samples,
+`soak-afs/cleanup.json`, `afs-sdk-cleanup.json`, `docker-cleanup.json` and JUnit
+together. `qualification_only` is always true in this first entry: configured
+hours or days do not establish formal long-run acceptance. Freeze an appropriate
+resource/trend/error/fault policy and actually complete the declared duration
+before making that claim. K8s, cross-VM failure isolation and precise performance
+are outside this implementation. Default smoke and Full selections are unchanged.
+
 ### Fixed AFS component package on one Linux VM
 
 Provide a Linux VM whose native architecture matches the component, Python
