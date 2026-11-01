@@ -144,6 +144,15 @@ impl Controller {
             self.record.failure = status.failure.clone().map(Into::into);
             return self.unexpected_exit().await;
         }
+        // Required guest services are part of the runtime's readiness contract,
+        // even while Execd remains available for control and diagnostics.
+        if status.phase == RuntimePhase::Running
+            && status
+                .validate_required_services(self.record.spec.required_services())
+                .is_err()
+        {
+            return self.unexpected_exit().await;
+        }
         self.remember_workload(&status);
         self.events.runtime = Some(status);
         self.continue_workload().await?;
