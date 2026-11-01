@@ -38,6 +38,148 @@ Profiles are explicit:
   the two platform Pods to be placed on distinct physical workers. Actual Pod
   to worker placement is checked after scheduling and retained as evidence.
 
+## Fixed-package direct run
+
+This is the direct CLI path for a developer, tester or AI operator. It uses the
+same deployment and assertions as CI, with caller-provided credentials and
+fixed inputs. Deployment never compiles the product. An available command is
+not evidence that a particular package or environment has passed it.
+
+### Collect one matching candidate
+
+Obtain these files from one trusted successful image-composition build. Preserve
+their recorded SHA256 values and source build ID; do not mix files from separate
+builds merely because their product commit names match.
+
+| Input | Required identity / purpose |
+|---|---|
+| `bundle.json` | Clean product commit, target/architecture, package file digests, independent SDK candidate, pinned sandboxd backend and base images |
+| `registry-images.json` | Binds the exact bundle SHA256 and image IDs to immutable node/EXECD/entrypoint registry digests |
+| `afs-tests.json`, beside `bundle.json` | Required for AFS ON; its digest and product/target identity must match the bundle |
+| `afs-contracts.json`, beside `bundle.json` | Required for AFS component Full; same product/binary/target and frozen ELF/archive digests; optional for the shorter component set unless already bound by the bundle |
+| Clean test-source checkout | Freeze and record the harness commit separately from the product; it contains the public E2E and `afs/tests/` assets |
+| Target kubeconfig and optional Docker registry-auth JSON | Supplied privately by the operator; do not copy them into results or source control |
+
+For an existing Buildkite candidate these manifests are the
+`out/buildkite/bundle/*.json` assets from its `platform-images` step. Download
+only that selected build's manifests using the artifact UI/API or existing
+authenticated downloader, then check their recorded size/SHA. No Buildkite
+token or agent is needed by the deployment driver once inputs are delivered.
+The package, installed SDK/backend and frozen ELF are already in the immutable
+images. This registry-reuse path does not require downloading `images.tar`,
+product archives, SDK wheels or the test ELF to the control host. Registry
+retention and pull permission must still cover every referenced image.
+
+If no compatible image bundle exists, use the existing `prepare.py` and
+`publish_images.py` build-stage commands above with the fixed package, matching
+SDK wheel/candidate and pinned backend. This is a separate preparation step;
+do not substitute new product compilation during a deployment run.
+
+### Check the environment, then check inputs
+
+Use a Linux controller with Python 3.8+, Git, OpenSSL, tar and kubectl; the
+controller does not need Docker when reusing published images. Use a clean
+harness checkout, and run outside a Buildkite job environment. The kubeconfig
+must address the **target** cluster rather than merely the Agent Stack cluster.
+Choose a fresh results directory for each command.
+
+```sh
+ADX_CANDIDATE=/absolute/path/to/fixed-bundle
+ADX_PRODUCT_COMMIT=REPLACE_WITH_40_CHARACTER_PRODUCT_COMMIT
+ADX_TARGET_KUBECONFIG=/private/path/to/target-kubeconfig
+ADX_RESULTS=/absolute/path/to/new-results-parent
+
+command -v python3 git openssl tar kubectl
+python3 --version
+kubectl --kubeconfig "$ADX_TARGET_KUBECONFIG" --request-timeout=10s get --raw /version
+kubectl --kubeconfig "$ADX_TARGET_KUBECONFIG" auth can-i create namespaces
+kubectl --kubeconfig "$ADX_TARGET_KUBECONFIG" get nodes -o wide
+
+# Offline manifest admission: no kubeconfig, registry query or cluster mutation.
+python3 build/e2e/kubernetes/run.py \
+  --bundle "$ADX_CANDIDATE/bundle.json" \
+  --registry-images "$ADX_CANDIDATE/registry-images.json" \
+  --artifact-commit "$ADX_PRODUCT_COMMIT" \
+  --profile full --case afs-component --verify-only \
+  --output "$ADX_RESULTS/inputs-component"
+```
+
+The input check rejects a wrong/dirty product commit, inconsistent architecture,
+missing SDK identity, mismatched backend target/pin, altered bundle/registry
+binding, AFS OFF or missing/corrupt AFS sidecars. Use `--case afs-component-full`
+for Full input admission; it additionally requires the frozen contract manifest.
+It checks the delivered manifest chain, not registry availability, real image
+bytes, worker capacity or FUSE capability. `inputs.json` explicitly records
+`scope: fixed-candidate-inputs` and `deployment_performed: false`; success here
+cannot be reported as an E2E pass. Deployment verifies the image/product/test
+bytes and actual environment through the existing runtime checks.
+
+Cluster admission additionally requires namespace-scoped Pod/Service/Secret
+create/get/delete and Pod exec/copy/log access. The cluster must permit the
+test's privileged Pods. At least two ready Linux workers of the candidate
+architecture must be available for the Full-profile AFS target, with A/B on
+different workers. Meet the resource, cgroup v2, registry/network and FUSE/native
+ext4 requirements below. AFS component Full also mounts the worker BDI directory
+for its existing cache probe. The driver does not prepare host modules or create
+cluster machines. A timeout or missing permission stops deployment qualification;
+an offline input pass does not override it.
+
+### Deploy and run the selected scope
+
+Start with the bounded five-case component group. It exercises real OwnerFs and
+DFS processes/mounts and normal cleanup; it does not prove SDK integration.
+
+```sh
+python3 build/e2e/kubernetes/run.py \
+  --bundle "$ADX_CANDIDATE/bundle.json" \
+  --registry-images "$ADX_CANDIDATE/registry-images.json" \
+  --artifact-commit "$ADX_PRODUCT_COMMIT" \
+  --kubeconfig "$ADX_TARGET_KUBECONFIG" \
+  --profile full --case afs-component --output "$ADX_RESULTS/component"
+```
+
+For actual SDK-on-AFS use the same command with `--case afs-sdk` and a fresh
+output directory; it runs both OwnerFs and DFS product variants. Add
+`--registry-auth /private/path/to/docker-config.json` when private pulls require
+it, `--context NAME` for explicit context selection, and repeated
+`--node-name WORKER` to restrict the eligible worker pool.
+
+The public runner's ordinary `--profile full` alone selects the eleven public
+groups. Use the existing AFS gate to include the AFS component and SDK sets:
+
+```sh
+# Full: public eleven groups + declared AFS ci-full + both SDK Full variants.
+python3 build/e2e/kubernetes/afs_gate.py \
+  --bundle "$ADX_CANDIDATE/bundle.json" \
+  --registry-images "$ADX_CANDIDATE/registry-images.json" \
+  --artifact-commit "$ADX_PRODUCT_COMMIT" \
+  --kubeconfig "$ADX_TARGET_KUBECONFIG" \
+  --profile full --output "$ADX_RESULTS/full"
+```
+
+For the shorter required smoke, use this gate with `--profile l0` and a new
+output directory. It runs public L0/auth, five component cases and both SDK
+smoke variants. A targeted component/SDK result is not a complete Full result;
+the declared `ci-full` set is not every registered special/performance case.
+
+### Read results and finish cleanup
+
+Require exit 0 **and** complete successful `result.json`, required case counts,
+JUnit and cleanup receipts for the selected scope. Keep `harness.json`, bundle
+and registry identities, actual placement, per-case checks/environment/waits,
+AFS normal cleanup and `kubernetes-cleanup.json`. For the combined gate also
+check each child result and the SDK Env/backend cleanup; parent status alone
+does not replace these records. Missing, blocked, skipped-required or unknown
+cleanup is not PASS.
+
+The driver owns only its unique `adx-e2e-*` namespace and normally deletes it
+after stopping/unmounting AFS and releasing SDK backends. Allow SIGTERM/SIGINT
+cleanup to finish. If cleanup fails, retain the reported run ID/namespace UID
+and original failure for investigation rather than deleting another run's
+resources. Keep one necessary original log/identity/result set; remove this
+run's confirmed redundant downloads or scratch data after verification, and
+record before/after disk use. Keep credentials outside that evidence set.
+
 ## AFS component target (CI1)
 
 `--profile full --case afs-component` is an explicit component target;

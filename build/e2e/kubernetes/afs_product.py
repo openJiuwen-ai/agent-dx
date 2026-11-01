@@ -76,7 +76,7 @@ class Product:
         (run.output / 'afs-sdk-environment.json').write_text(json.dumps(self.config, indent=2))
 
     def configure_runtime(self, node):
-        # Only these disposable SDK-test Pods use identity-switch capabilities.
+        # Only these disposable SDK-test nodes use identity-switch capabilities.
         # Reuse sandboxd's existing basic_spec deployment option, before it starts.
         self.run.execute(node, 'python3', '-c',
                          'from pathlib import Path;import sys;'
@@ -86,6 +86,10 @@ class Product:
                          '/tmp/adx-e2e/sandboxd/config.toml',
                          '[plugin.runtime.basic_spec]\nrunc = ""',
                          '[plugin.runtime.basic_spec]\nrunc = "/opt/adx/e2e/afs_runc_spec.json"')
+
+    def copy_from(self, node, source, destination, timeout=120):
+        self.run.kube('-n', self.run.id, 'cp', node + ':' + source,
+                      str(destination), '-c', 'platform', timeout=timeout)
 
     def sdk(self, config, destination):
         run = self.run
@@ -116,8 +120,7 @@ class Product:
                 inputs = Path(temp)
                 for name in ('afs-meta', 'afs-node', 'artifact-identity.json'):
                     source = '/opt/adx/e2e/afs-tests/inputs/' if name.endswith('.json') else '/opt/adx/package/bin/'
-                    run.kube('-n', run.id, 'cp', 'node1:' + source + name,
-                             str(inputs / name), '-c', 'platform', timeout=120)
+                    self.copy_from('node1', source + name, inputs / name)
                     if name != 'artifact-identity.json':
                         (inputs / name).chmod(0o755)
                 for mode in ('ownerfs', 'dfs'):

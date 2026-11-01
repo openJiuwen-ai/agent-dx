@@ -155,26 +155,31 @@ class Component:
             self.config = {'kind': 'matrix', 'environments': {'local': local, 'cluster': self.config}}
             (run.output / 'afs-environment.json').write_text(json.dumps(self.config, indent=2))
 
+    def copy_from(self, node, source, destination, timeout=120):
+        self.run.kube('-n', self.run.id, 'cp', node + ':' + source,
+                      str(destination), '-c', 'platform', timeout=timeout)
+
     def scenarios(self, checks):
         run = self.run
         with run.case('afs-component-full' if self.full else 'afs-component', checks) as record, \
                 tempfile.TemporaryDirectory(prefix='adx-afs-inputs-') as temp:
             inputs = Path(temp)
             for name in ('afs-meta', 'afs-node'):
-                run.kube('-n', run.id, 'cp', ROLES['M'] + ':/opt/adx/package/bin/' + name,
-                         str(inputs / name), '-c', 'platform', timeout=120)
+                self.copy_from(ROLES['M'], '/opt/adx/package/bin/' + name, inputs / name)
                 (inputs / name).chmod(0o755)
-            run.kube('-n', run.id, 'cp', ROLES['M'] + ':/opt/adx/e2e/afs-tests/inputs/artifact-identity.json',
-                     str(inputs / 'artifact-identity.json'), '-c', 'platform', timeout=60)
+            self.copy_from(ROLES['M'], '/opt/adx/e2e/afs-tests/inputs/artifact-identity.json',
+                           inputs / 'artifact-identity.json', timeout=60)
             if self.full:
                 contract_dir = inputs / 'contracts'
                 contract_dir.mkdir()
                 for name in ('fuse_contract', 'manifest.json'):
-                    run.kube('-n', run.id, 'cp', ROLES['M'] + ':/opt/adx/e2e/afs-contracts/' + name,
-                             str(contract_dir / name), '-c', 'platform', timeout=120)
-                from run import common
-                manifest = common.afs_contracts.installed(contract_dir, self.package)
-                if common.afs_contracts.sha(contract_dir / 'manifest.json') != self.contract_manifest_sha:
+                    self.copy_from(ROLES['M'], '/opt/adx/e2e/afs-contracts/' + name, contract_dir / name)
+                contract_spec = importlib.util.spec_from_file_location('component_contracts',
+                                                                     ROOT / 'build/e2e/afs_contracts.py')
+                contracts = importlib.util.module_from_spec(contract_spec)
+                contract_spec.loader.exec_module(contracts)
+                manifest = contracts.installed(contract_dir, self.package)
+                if contracts.sha(contract_dir / 'manifest.json') != self.contract_manifest_sha:
                     raise ValueError('runtime test asset manifest differs from bundle')
                 (contract_dir / 'fuse_contract').chmod(0o755)
                 (contract_dir / 'fuse_contract').rename(inputs / 'fuse_contract')

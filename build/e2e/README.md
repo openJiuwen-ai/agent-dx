@@ -4,6 +4,204 @@ Buildkite deploys to **Kubernetes** through [kubernetes/run.py](kubernetes/READM
 It creates a dedicated namespace with two node Pods and Services, using immutable
 images from the build step. Each Pod runs the platform as processes.
 
+## Fixed-package acceptance without Buildkite scheduling
+
+For an initial AFS component closure, use the fixed AFS component package and
+the existing `afs/tests/run.py` inside one Linux VM as described below. This
+requires neither Kubernetes nor Docker. It qualifies component behavior only.
+For the complete ADX product path, reuse the Kubernetes driver on a qualified
+target or the separately qualified native Linux Docker path. Product compilation
+is not part of deployment; the drivers do not create VMs or a Kubernetes cluster.
+
+Freeze the clean product commit, package/SDK/backend identities, image digests
+and test-source commit before running. The reusable registry path only needs
+the small matching bundle manifests and registry access, rather than another
+download/build of the product. AFS ON additionally needs its hashed test-asset
+sidecar, and AFS Full needs the matching frozen contract manifest and image.
+Keep credentials outside the checkout and results.
+
+The [fixed-package Kubernetes procedure](kubernetes/README.md#fixed-package-direct-run)
+lists the inputs, environment checks, offline admission, direct component and
+SDK cases, required smoke/Full commands, and evidence/cleanup rules. Use
+`--artifact-commit` to enforce the fixed clean product outside CI.
+`--verify-only` checks input manifests without deployment; its `inputs.json`
+is not a functional or environment qualification result.
+
+The available commands and unit contracts do not by themselves establish a
+successful direct-package deployment. Record the actual candidate, target and
+selected cases for every run. Kubernetes evidence does not qualify the Docker,
+SSH multi-VM, soak or performance paths.
+
+### Non-K8s SDK and required Full (PK1 candidate)
+
+The local Docker adapter reuses the existing two-node deployment, public
+scenarios, SDK-on-AFS assertions and AFS component runner. Its input is the
+original fixed bundle/registry/AFS manifests plus a verified offline image
+export, not a newly compiled product. The SDK remains the wheel installed in
+the fixed node image. This adapter is a validation candidate until a dated
+actual run below or in the canonical strategy qualifies the selected scope.
+
+The image-export step uses `export_images.py` on an authenticated preparation
+host. It pulls only the three immutable references from the matching bundle,
+verifies their configuration IDs and architecture, and produces
+`images.tar.gz` plus `image-export.json`. The latter binds the original bundle
+and registry SHA, exact image IDs/references and derived archive size/SHA.
+Keep original manifests unchanged: this archive is a separate transport, whose
+bytes need not equal the original `prepare.py` archive. Deliver the export via
+a trusted artifact channel and verify its recorded digest before use. Registry
+credentials stay on the preparation host. The native runtime host does not
+need SWR credentials, Kubernetes tools or cloud-cluster access.
+
+Use an available native Linux Docker VM with the candidate architecture,
+Python 3.10+, OpenSSL, tar, Git, cgroup v2, the existing sandboxd runtime
+prerequisites and `/dev/fuse`. AFS state/output must be native ext4 with at
+least 8 GiB free; budget additional space for the image archive, Docker layers
+and temporary runtime archive. At least 4 CPUs/12 GiB available memory are
+recommended for the sequential functional run; this is not a performance
+qualification. Public nodes retain their 3 CPU/4 GiB limits. Use the provider's
+reservation/run ownership before starting and its normal return procedure.
+
+From a clean frozen test-source checkout, supply one fixed product commit and
+fresh output paths:
+
+```sh
+# Both OwnerFs and DFS, eight actual SDK assertions per mode.
+python3 build/e2e/run.py \
+  --bundle /absolute/fixed-bundle/bundle.json \
+  --registry-images /absolute/fixed-bundle/registry-images.json \
+  --image-export /absolute/offline-images/image-export.json \
+  --artifact-commit REPLACE_WITH_PRODUCT_COMMIT \
+  --profile standalone --case afs-sdk-full --cgroupns host \
+  --output /absolute/new-sdk-result
+
+# One required gate: public eleven groups, AFS ci-full24, SDK two modes16.
+python3 build/e2e/afs_gate.py \
+  --bundle /absolute/fixed-bundle/bundle.json \
+  --registry-images /absolute/fixed-bundle/registry-images.json \
+  --image-export /absolute/offline-images/image-export.json \
+  --artifact-commit REPLACE_WITH_PRODUCT_COMMIT \
+  --profile full --cgroupns host --output /absolute/new-full-result
+```
+
+Use `--case afs-component-full` with the first runner command for an explicitly
+targeted component Full. It reuses the registered 24 cases and frozen Rust
+test ELF already delivered in the fixed image; it never runs Cargo. No case
+flag on the native `standalone` runner still selects only the public eleven
+groups; the gate is required to include all three parts. A targeted SDK or
+component pass is not a combined Full pass.
+
+Every role is a test-owned privileged Docker container. The adapter freezes
+container/network IDs and addresses before worker access; replacement or
+ownership mismatch blocks reuse and deletion. AFS data binds only fresh
+owned ext4 directories. SDK data roles explicitly share their own container's
+mount namespace with sandboxd; other workers create private mount namespaces.
+Component Full additionally exposes the existing BDI cache-probe directory to
+its M role. These containers share one VM kernel/storage and do not establish
+cross-host placement or failure isolation.
+
+Require the parent and every child report, exact required case counts, matching
+product/harness/file identities and JUnit; public Full retains its six stop
+observability receipts. Require normal AFS process/mount cleanup, SDK
+Environment/backend cleanup and `docker-cleanup.json` for owned containers,
+network and cgroups. Removing a container cannot replace normal AFS cleanup.
+Keep one original result/log/identity set and the frozen input; after successful
+verification remove this run's derived runtime tar, native state and redundant
+transfer copies. Do not prune shared Docker images or other tasks' caches.
+
+### Fixed AFS component package on one Linux VM
+
+Provide a Linux VM whose native architecture matches the component, Python
+3.10+, OpenSSL, root or `sudo -n`, a working `/dev/fuse`, util-linux/fuse3 tools
+and a short dedicated native ext4 data directory. Follow the existing
+[AFS environment prerequisites](../../afs/tests/README.md#运行条件).
+This path runs Meta and multiple Node processes plus real FUSE/bind mounts in
+one VM; it does not install the complete ADX stack or exercise its SDK.
+
+Freeze the following separately: the product component's complete commit and
+target, trusted archive SHA256/build ID, the clean test-source commit and file
+digests, selected case IDs and environment configuration. A Buildkite Base
+candidate publishes the complete AFS component as
+`out/buildkite/components/afs.tar.gz`; it contains `afs-meta`, `afs-node` and
+their component `manifest.json`. This is an optional delivery artifact distinct
+from the complete `adx-release.tar.gz`. Use the manifest-bound AFS binaries
+inside the full release instead when validating that delivery form, and label
+the actual package scope in results.
+
+Run from the frozen test-source root inside the VM. These variables are
+operator-provided paths/identities, not shared CI defaults:
+
+```sh
+AFS_ARCHIVE=/absolute/path/to/afs.tar.gz
+AFS_ARCHIVE_SHA256=REPLACE_WITH_TRUSTED_ARCHIVE_SHA256
+AFS_PRODUCT_COMMIT=REPLACE_WITH_40_CHARACTER_PRODUCT_COMMIT
+AFS_TARGET=x86_64-unknown-linux-gnu  # use aarch64-unknown-linux-gnu for ARM64
+AFS_INPUT=/absolute/path/to/new-fixed-inputs
+AFS_DATA=/var/tmp/afsp001            # new, owned, short, native ext4
+AFS_RESULTS=/absolute/path/to/new-component-result
+export AFS_INPUT AFS_DATA
+
+printf '%s  %s\n' "$AFS_ARCHIVE_SHA256" "$AFS_ARCHIVE" | sha256sum -c -
+mkdir "$AFS_INPUT"
+mkdir "$AFS_INPUT/component" "$AFS_INPUT/bin"
+tar -xzf "$AFS_ARCHIVE" -C "$AFS_INPUT/component"
+python3 build/release/component.py verify --component afs \
+  --directory "$AFS_INPUT/component" \
+  --commit "$AFS_PRODUCT_COMMIT" --target "$AFS_TARGET"
+
+# Adapt the verified component identity to the existing runner input contract.
+python3 - <<'PY'
+import json, os, subprocess
+from pathlib import Path
+root = Path(os.environ['AFS_INPUT']).resolve()
+manifest = json.loads((root / 'component/manifest.json').read_text())
+harness = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+identity = {'schema_version': 1, 'commit': manifest['commit'], 'target': manifest['target'],
+            'binaries': manifest['files'], 'harness_commit': harness,
+            'package_scope': 'verified AFS component package'}
+for name in ('afs-meta', 'afs-node'):
+    (root / 'bin' / name).symlink_to(root / 'component' / name)
+(root / 'bin/artifact-identity.json').write_text(json.dumps(identity, indent=2) + '\n')
+config = json.loads(Path('afs/tests/fixtures/singlevm.example.json').read_text())
+config['hosts']['guest']['base'] = os.environ['AFS_DATA']
+(root / 'singlevm.json').write_text(json.dumps(config, indent=2) + '\n')
+PY
+
+# Create only the new dedicated data directory, then qualify the selected scope.
+sudo -n mkdir -m 0755 "$AFS_DATA"
+python3 afs/tests/run.py check-env --env "$AFS_INPUT/singlevm.json" \
+  --binary-dir "$AFS_INPUT/bin" \
+  --case ownerfs.basic.read_write --case ownerfs.permissions.deny_other_uid \
+  --case dfs.basic.namespace --case dfs.basic.one_writer_many_readers
+python3 afs/tests/run.py run --env "$AFS_INPUT/singlevm.json" \
+  --binary-dir "$AFS_INPUT/bin" --work-root "$AFS_RESULTS" \
+  --case ownerfs.basic.read_write --case ownerfs.permissions.deny_other_uid \
+  --case dfs.basic.namespace --case dfs.basic.one_writer_many_readers
+```
+
+The input/output directories and data base must be new and owned by this run.
+Check extraction tools, archive member ownership and the trusted digest before
+using a package; do not derive its trusted SHA from the just-downloaded bytes.
+Do not change the sample UID/GID to a real user's identity merely to pass a
+permission check. A managed environment may supply an equivalent private
+mount/namespace transport, but its data must still be native ext4 and its
+actual isolation/resource limits recorded. An AFS UDS path must fit Linux's
+108-byte limit; a long management path is not a product failure.
+
+Require all four selected cases to execute and pass with matching binary/source
+identities, zero cleanup errors and normal process/unmount receipts. Preserve
+`result.json`, per-case `identity.json`, `environment.json`, `checks.json`,
+`waits.json`, `cleanup.json` and raw logs. `check-env` exit 2 means BLOCKED; READY/exit 0 is environment admission only,
+not a functional pass. This selection excludes the Rust contract ELF, complete local
+suite, ADX SDK/Full, cross-VM fault isolation, soak and performance. The existing
+AFS runner can select wider suites when their inputs and environment qualify;
+do not claim those scopes from this four-case run.
+
+Before returning the VM, verify/export necessary results, normally stop/unmount
+all owned processes and mounts, and remove verified redundant execution copies
+and generated data. Retain one frozen package/identity and original failure
+evidence. Follow the VM provider's normal close/release procedure; do not clean
+other projects or shared caches.
+
 ## Activator deployment acceptance
 
 The native Linux Docker driver supports complete Activator deployment acceptance in

@@ -12,7 +12,7 @@ import subprocess
 import shutil
 import time
 
-from fixtures import singlevm, ssh, namespaces, kubernetes
+from fixtures import singlevm, ssh, namespaces, kubernetes, docker
 from fixtures.common import (
     Blocked, DfsProfile, HERE, is_single_host, needs_reader_c, performance_parameters, sha256, write_json,
 )
@@ -22,8 +22,8 @@ NAMES = {"M": "meta", "A": "node-a", "B": "node-b", "C": "node-c"}
 
 
 def validate(config, cases):
-    if config.get("kind") not in ("singlevm", "multivm", "namespaces", "kubernetes"):
-        raise ValueError("kind must be singlevm, namespaces, multivm or kubernetes")
+    if config.get("kind") not in ("singlevm", "multivm", "namespaces", "kubernetes", "docker"):
+        raise ValueError("kind must be singlevm, namespaces, multivm, kubernetes or docker")
     for field in ("uid", "gid", "other_uid", "other_gid"):
         if not isinstance(config.get(field), int) or config[field] <= 0:
             raise ValueError("explicit positive numeric identity required: " + field)
@@ -62,10 +62,12 @@ def validate(config, cases):
     for name, host in hosts.items():
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name):
             raise ValueError("unsafe host ID")
-        if host.get("transport") not in ("local", "ssh", "exec", "kubernetes"):
+        if host.get("transport") not in ("local", "ssh", "exec", "kubernetes", "docker"):
             raise ValueError("unknown transport on " + name)
         if config['kind'] == 'kubernetes' and host.get('transport') != 'kubernetes':
             raise ValueError('Kubernetes topology requires Kubernetes role transport')
+        if config['kind'] == 'docker' and host.get('transport') != 'docker':
+            raise ValueError('Docker topology requires immutable Docker role transport')
         base = Path(host.get("base", ""))
         if (
             not base.is_absolute()
@@ -74,16 +76,16 @@ def validate(config, cases):
             or any(c in str(base) for c in ("\n", "\r", '"', "\\"))
         ):
             raise ValueError("host base must be a dedicated existing absolute directory")
-    if config["kind"] == "kubernetes" and config.get("topology", "cluster") not in ("local", "cluster"):
-        raise ValueError("Kubernetes topology must be local or cluster")
+    if config["kind"] in ("kubernetes", "docker") and config.get("topology", "cluster") not in ("local", "cluster"):
+        raise ValueError("container topology must be local or cluster")
     selected_hosts = [roles[r]["host"] for r in needed]
-    if is_single_host(config) and config["kind"] == "kubernetes":
+    if is_single_host(config) and config["kind"] in ("kubernetes", "docker"):
         loopback = all(ipaddress.ip_address(roles[r]["address"]).is_loopback for r in needed)
         if len(set(selected_hosts)) != 1 or not loopback:
             raise Blocked("single-Pod local cases require one Pod and loopback role addresses")
         if any(any(t.startswith("cluster-") for t in c.tags) for c in cases):
             raise Blocked("single-Pod topology cannot establish cross-Pod evidence")
-    elif config["kind"] in ("multivm", "namespaces", "kubernetes"):
+    elif config["kind"] in ("multivm", "namespaces", "kubernetes", "docker"):
         if len(set(selected_hosts)) != len(needed):
             raise Blocked("multivm requires a distinct guest for every selected role")
         if any(any(t.startswith("local-") for t in c.tags) for c in cases):
@@ -231,7 +233,7 @@ class Cluster:
             cfg = self.config["hosts"][host]
             try:
                 connector = {"local": singlevm.connect, "ssh": ssh.connect, "exec": namespaces.connect,
-                             "kubernetes": kubernetes.connect}[
+                             "kubernetes": kubernetes.connect, "docker": docker.connect}[
                     cfg["transport"]
                 ]
                 self.channels[host] = connector(cfg)
@@ -246,6 +248,8 @@ class Cluster:
                     if info.get('pod_uid') != cfg['pod_uid']:
                         raise Blocked('worker Pod identity differs from the frozen Kubernetes role')
                     info['kubernetes'] = self.channels[host].kubernetes_identity
+                if self.config['kind'] == 'docker':
+                    info['docker'] = self.channels[host].docker_identity
             except (OSError, RuntimeError) as exc:
                 raise Blocked("cannot establish selected worker prerequisites: " + str(exc)) from exc
             infos[host] = info
@@ -264,7 +268,7 @@ class Cluster:
                 raise Blocked(
                     "independent guest identities are ambiguous; duplicate clone machine-id needs distinct VM UUIDs"
                 )
-        if self.config["kind"] == "namespaces":
+        if self.config["kind"] in ("namespaces", "docker"):
             if len({v["boot_id"] for v in infos.values()}) != 1:
                 raise Blocked("namespaces topology must remain inside one actual Linux kernel/VM")
             for field in ("network_namespace", "pid_namespace", "mount_namespace"):

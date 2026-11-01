@@ -9,6 +9,7 @@ import logging
 import os
 import shlex
 import signal
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -371,7 +372,7 @@ class Run:
     def deploy(self, m, bundle, secrets):
         if self.selected_case in ('activator-standalone', 'activator-embedded') and 'activator_archive_sha256' not in m:
             raise ValueError('Activator E2E requires a bundle prepared with --activator')
-        self.docker('load', '-i', bundle / 'images.tar', timeout=600)
+        self.load_images(m, bundle)
         for identity in m['image_ids'].values():
             info = json.loads(self.docker('image', 'inspect', identity))[0]
             if info['Id'] != identity or info['Architecture'] != m['architecture']:
@@ -415,12 +416,15 @@ class Run:
                 args += ['-v', f'{bundle / "workload-probes.tar"}:/workload-probes.tar:ro']
             if os.getenv('ADX_E2E_RUNTIME_CONTROL') == '1':
                 args += ['-e', 'ADX_E2E_RUNTIME_CONTROL=1']
+            args += self.container_args(node)
             self.docker(*args, m['image_ids']['node'])
+        self.before_setup(m, bundle, secrets)
         # Both DNS aliases are required when configuring authenticated peer access.
         for node in self.nodes:
             self.execute(
                 node, 'env', *setup_environment(self.selected_case), 'python3', '/opt/adx/e2e/node.py', 'setup', node
             )
+            self.after_setup(node)
             self.execute(
                 node,
                 'sh',
@@ -441,6 +445,18 @@ class Run:
         if self.selected_case == 'activator-standalone':
             for node in self.nodes:
                 self.helper(node, 'activator-start', node, timeout=60)
+
+    def load_images(self, _manifest, bundle):
+        self.docker('load', '-i', bundle / 'images.tar', timeout=600)
+
+    def container_args(self, _node):
+        return []
+
+    def before_setup(self, _manifest, _bundle, _secrets):
+        pass
+
+    def after_setup(self, _node):
+        pass
 
     def scenarios(self, checks, required=None):
         required = tuple(required or STANDARD)
@@ -1262,17 +1278,30 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument('--bundle', type=Path, required=True)
     p.add_argument('--output', type=Path, required=True)
+    p.add_argument('--registry-images', type=Path)
+    p.add_argument('--image-export', type=Path)
+    p.add_argument('--artifact-commit')
     p.add_argument('--profile', choices=('l0', 'standalone'), default='standalone')
     p.add_argument('--case', help='run one case as a targeted diagnostic, not a profile gate')
     p.add_argument('--cgroupns', choices=('private', 'host'), default='private')
     a = p.parse_args()
     out = a.output.resolve()
     out.mkdir(parents=True, exist_ok=False)
-    run = Run(out, cgroupns=a.cgroupns, selected_case=a.case)
+    native = a.image_export is not None
+    if native:
+        if not a.registry_images or not a.artifact_commit:
+            p.error('--image-export requires --registry-images and --artifact-commit')
+        native_spec = importlib.util.spec_from_file_location('native_docker_driver',
+                                                           Path(__file__).with_name('docker_run.py'))
+        driver = importlib.util.module_from_spec(native_spec)
+        native_spec.loader.exec_module(driver)
+        run = driver.DockerRun(out, cgroupns=a.cgroupns, selected_case=a.case)
+    else:
+        run = Run(out, cgroupns=a.cgroupns, selected_case=a.case)
     error = None
     checks = []
     m = None
-    required = selected_checks(a.profile, a.case)
+    required = driver.selected_checks(a.profile, a.case) if native else selected_checks(a.profile, a.case)
 
     def cancel(signum, frame):
         raise InterruptedError(f'canceled by signal {signum}')
@@ -1281,12 +1310,21 @@ def main():
         signal.signal(s, cancel)
     with tempfile.TemporaryDirectory(prefix='adx-e2e-secrets-') as private:
         try:
-            m = verify_bundle(a.bundle.resolve())
+            if native:
+                bundle = a.bundle if a.bundle.is_file() else a.bundle / 'bundle.json'
+                m, export, archive = driver.verify_export(bundle, a.registry_images, a.image_export,
+                                                          a.artifact_commit,
+                                                          contracts_required=a.case == 'afs-component-full')
+                run.registry, run.image_archive = export, archive
+                shutil.copyfile(a.registry_images, out / 'registry-images.json')
+                shutil.copyfile(a.image_export, out / 'image-export.json')
+            else:
+                m = verify_bundle(a.bundle.resolve())
             validate_identity(
                 m['package'], m['architecture'], os.getenv('BUILDKITE_COMMIT'), bool(os.getenv('BUILDKITE'))
             )
             (out / 'bundle.json').write_text(json.dumps(m, indent=2))
-            run.deploy(m, a.bundle.resolve(), Path(private))
+            run.deploy(m, (a.bundle.parent if a.bundle.is_file() else a.bundle).resolve(), Path(private))
             run.scenarios(checks, required)
         except Exception as e:
             error = f'{type(e).__name__}: {e}'
@@ -1305,6 +1343,11 @@ def main():
         cgroupns=a.cgroupns,
         cases=run.case_results,
     )
+    if native:
+        report['harness'] = run.harness
+        report['fixed_product_commit'] = a.artifact_commit
+        report['offline_export_sha256'] = sha(a.image_export)
+
     (out / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
     write_junit(out / 'junit.xml', report)
     print(json.dumps(report))
