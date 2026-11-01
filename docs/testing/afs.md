@@ -97,6 +97,84 @@ cargo test --locked -p afs --all-features --lib node::dfs_read::tests
 及共享指针断言分别说明其范围，不能冒充全链仅两把锁、跨VM文件I/O或已达性能门槛。
 新版本不自动继承旧候选性能；BLAKE3、权限、fsync和close-to-open合同继续独立验证。
 
+### 并发基准工具 afs-bench
+
+`afs/client/src/bin/afs-bench.rs` 是双臂同尺的 DFS 并发基准：FUSE 臂走挂载点（POSIX 语义），
+SDK 臂走节点 uds（usrbio 数据面），同一确定性 payload、同口径计时，结果直接可比。首个
+workload 为多文件并发读写。工具只产生吞吐数字与校验结果；功能通过、测量完成、稳定性与
+性能达标必须分开登记，工具输出本身不构成任何验收结论。
+
+```sh
+cargo build --locked --release -p afs-client --bin afs-bench
+./target/release/afs-bench <mountpoint> --sock <node.sock> --arm fuse --mode rw \
+  --files 16 --file-bytes 256M --threads 16 --rounds 3 --settle-secs 65 --json bench.json
+```
+
+参数与默认值：`--arm fuse|sdk|both`（默认 both）、`--mode rw|write|read|mixed`（默认 rw，
+mixed 要求至少 2 个文件）、`--files 16`、`--file-bytes 256M`、`--block 4M`、`--threads 16`、
+`--q 1`（SDK 批内块数）、`--rounds 3`、`--settle-secs 65`、`--json <path>`、`--gc-log <node.log>`、
+`--node-cgroup <dir>`、`--max-node-mem <MiB>`（0=关闭）、`--keep`。尺寸单位支持 `k/ki/m/mi/g/gi/b`。
+非法参数（零字节、零块、不可整除、`--q` 超过 SDK u32 块数上限、`--q × --block` 超过 1GiB
+批次上限、`--max-node-mem` 的 MiB→字节换算溢出）在启动前以退出码 2 拒绝，
+且不创建、修改或清理任何 bench 文件。
+
+测量合同：
+
+- **完整文件基准**：写入前把每个文件建立为精确的 `--file-bytes` 长度（清掉旧尾部）；
+  读相位逐块校验整个 `[0, file_bytes)` 区间。纯读准备阶段只检查文件存在且长度精确，
+  不重建或截断输入；不符即退出码 1 报错且保留原输入。成功后默认清理 bench 文件，
+  需要保留成功输入时显式传 `--keep`。mixed 的只读集合也建立精确长度，
+  在计时外预写确定性 payload 并 sync。
+- **计时**：每文件分 setup（打开/连接/建环）/io/sync（FUSE `sync_all`、SDK `FullSync`）三段；
+  payload 生成与逐字节校验都计入 io 段。三段之和不是 end-to-end wall：线程与运行时创建、
+  缓冲分配、SDK 销毁在段外、计入总 wall。每相位 wall 在业务完成时冻结，指标线程回收
+  不延长测量窗口。SDK 线程 `cpu_s` 在异步任务两端采样，因任务可在 worker 间迁移，只作
+  近似参考；node/meta 进程 CPU 独立采样。
+- **统计**：轮间保留原始值，汇总取中位数，偶数轮取上中位。mixed 输出写、读两行，各自只
+  统计其文件集合的字节数，分母共享整段 mixed wall；两行字节之和等于全部文件一次操作量。
+- **校验三态**：`ok`（全部通过）、`FAIL`（任一块不匹配）、`-`（未校验，纯写相位）。
+  JSON 保留 `null/true/false`。任一 case 为 FAIL 时：输出完整 JSON 与结果表后以退出码 1
+  退出，默认保留 bench 文件供诊断并报告保留路径。运行中途的业务错误不会输出此前已完成
+  轮的 JSON（错误信息与退出码 1 仍然保留），已知的证据保留边界。
+- **GC 平静**：给定 `--gc-log` 则轮询节点日志停增——缺失或中途不可读按错误处理（退出码
+  1）；预算（`--settle-secs`，最小 10s）耗尽则如实报告"未观察到安静"后继续；日志回缩视为
+  轮转，重置基线不算安静。不给 `--gc-log` 就是盲睡 `--settle-secs`，工具不声称观察到 GC
+  状态。
+- **节点内存**：默认按发现的 `afs-node` 进程 RSS（`/proc/<pid>/statm`）之和观测；
+  `--node-cgroup <dir>` 改读指定 cgroup 的 `memory.current`。两者是不同口径，输出注明实际
+  采样来源与 PID/路径；选定 RSS 集合中任一进程不可读时，不以剩余进程之和替代。
+  JSON schema 2 的 `node_mem_peak_bytes` 是已成功采样的最大值（完全没有样本时为 `null`），
+  `node_mem_observation_complete` 表示该相位是否从未出现采样失败，`node_mem_source` 记录来源。
+  人类输出内存值后带 `?` 表示观测不完整，`-` 表示没有可用样本。`--max-node-mem` 启用时，
+  启动前不可观测即拒绝运行；相位内任一次采样失败或峰值超限，均在下一相位前中止。
+  100ms 采样不能证明两次采样之间没有瞬时峰值。
+
+SDK 正常 I/O 与错误返回使用相同的资源回收路径：先销毁环并确认 worker 停止，
+再注销注册项、关闭文件、销毁 iov。注销首次失败时仅重试一次资源注销，不重放数据 I/O；
+即使该重试恢复，首次清理错误仍导致非零退出。其他安全可做的清理会继续，原始业务错误保留。
+若环销毁失败、无法确认 worker 已停止，则保留它可能使用的注册项、文件与 iov 并明确报错；
+不声称控制面持续不可用时仍能保证远端资源回收，也不强行提前释放在途共享内存。
+
+SDK 臂需要节点 uds（`--sock`）。新 workload 通过实现 `Workload` trait（`name` + `run`）并在
+`registry()` 注册加入，CLI 与输出层无需改动。
+
+验证边界：单元测试覆盖 payload 确定性与非退化、参数解析与边界、中位数、JSON 输出、任务
+分片、文件集合划分、输入校验、GC 观测状态、内存目标与保护语义。真实 FUSE 在单节点 Linux
+（local-file Meta + 单 DFS Node）验证过分臂读写与全量校验通过；该运行只证明工具可执行、
+校验成立，不构成跨 VM、多副本或性能门槛结论。本轮固定候选复验覆盖两臂 1/4 文件 rw、
+两轮原始值与上中位数、SDK q=3 尾批、3/4 文件 mixed 旧输入、损坏读、隔离客户端内存保护、
+观测失效与非法参数。首次注销失败及连续 short read 使用明确的负向测试场景，检查回收后
+资源计数和后续健康读；这些故障结果不作为无故障性能样本。
+
+不含 [MR !121] 的节点有已知写状态租约重新授予问题。本工具不修复该节点问题。
+已记录的失败场景是纯 upstream master 上单进程双臂在 FUSE→SDK 切换处被写状态拒绝
+（"newer lease epoch"），后续运行返回 EBUSY。短间隔 `both` 在另一组单节点 native ext4
+验证中可通过；因此不能只凭同进程或分进程推断所有参数、后端与等待时间下的结果。
+已验证的分进程规避范围包括 1/4 文件 rw、4×64M mixed、N=1/2 双臂复验；这不是所有组合的
+充分条件。!121 实际合入后，仍须在包含该版本的固定候选上重跑原失败条件，再更新此限制。
+
+[MR !121]: https://gitcode.com/openJiuwen/agent-dx/merge_requests/121
+
 ### 已知验证欠账与测量边界
 
 真实 DFS 跨句柄合同已放入 `afs/tests/fuse_contract.rs`：
