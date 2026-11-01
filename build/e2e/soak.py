@@ -97,7 +97,9 @@ def cgroup_resources(path):
 def observe_resources(run, progress):
     nodes = {}
     for node in NODES:
-        observed = json.loads(run.execute(node, 'python3', '/opt/adx/e2e/soak_probe.py', timeout=30))
+        arguments = [progress['instances']['A' if node == 'node1' else 'B']] if (
+            node != 'afs-m' and progress['status'] == 'running') else []
+        observed = json.loads(run.execute(node, 'python3', '/opt/adx/e2e/soak_probe.py', *arguments, timeout=30))
         item = json.loads(run.docker('inspect', run.owned[node], stream=False))[0]
         pid = item['State']['Pid']
         group = next(line.split(':', 2)[2] for line in Path(f'/proc/{pid}/cgroup').read_text().splitlines()

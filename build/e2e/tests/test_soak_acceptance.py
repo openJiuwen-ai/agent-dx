@@ -33,6 +33,10 @@ def samples():
                                memory_events={'oom': 0, 'oom_kill': 0},
                                runtime_memory_events={'oom': 0, 'oom_kill': 0},
                                processes={process: {'pid': 2, 'start_ticks': 100, 'rss_bytes': 1024**2}})
+            nodes[name]['anchor_runtime'] = ({
+                'environment_id': 'a' if name == 'node1' else 'b', 'runtime_id': name + '-runc',
+                'pid': 5, 'start_ticks': 500, 'rss_bytes': 1024**2, 'fds': 3,
+            } if name != 'afs-m' and elapsed < 3600 else None)
         churn = elapsed // 6
         values.append({'elapsed_seconds': elapsed, 'observed_monotonic_seconds': elapsed,
                        'cycles': elapsed, 'active': elapsed < 3600,
@@ -173,6 +177,14 @@ class FormalSoakContracts(unittest.TestCase):
         report = policy.evaluate(values, self.work(), 'dfs', policy.contract())
         self.assertEqual(report['status'], 'passed')
         self.assertEqual(len(report['windows']), 10)
+
+    def test_same_environment_id_cannot_hide_physical_backend_replacement(self):
+        policy = module()
+        for field, changed in (('runtime_id', 'new-backend'), ('pid', 6), ('start_ticks', 501)):
+            values = samples()
+            values[30]['nodes']['node1']['anchor_runtime'][field] = changed
+            with self.assertRaisesRegex(ValueError, 'physical anchor'):
+                policy.evaluate(values, self.work(), 'dfs', policy.contract())
 
 
 if __name__ == '__main__':

@@ -66,6 +66,17 @@ def check_sample(sample, baseline, policy):
             if any(process.get(key) != initial['processes'][name][key] for key in ('pid', 'start_ticks')):
                 raise ValueError(node + ' process identity changed: ' + name)
             number(process.get('rss_bytes'), node + '.' + name + '.rss_bytes')
+        if sample.get('active') is True and node != 'afs-m':
+            anchor, initial_anchor = observed.get('anchor_runtime'), initial.get('anchor_runtime')
+            if (not anchor or not initial_anchor or any(anchor.get(key) != initial_anchor.get(key)
+                    for key in ('environment_id', 'runtime_id', 'pid', 'start_ticks'))):
+                raise ValueError(node + ' physical anchor runtime identity changed or missing')
+            if anchor['environment_id'] != sample['instances']['A' if node == 'node1' else 'B']:
+                raise ValueError(node + ' physical backend is not the declared anchor')
+            for metric in ('rss_bytes', 'fds'):
+                if (number(anchor.get(metric), 'anchor.' + metric) - initial_anchor[metric]
+                        > policy['peak_growth'][metric]):
+                    raise ValueError(node + ' anchor peak resource growth: ' + metric)
 
 
 def trend(times, values, bounds, label):
@@ -143,7 +154,10 @@ def evaluate(samples, work, mode, policy):
                                          for field in policy['trends']} for node in NODES},
                         'processes': {node: {name: statistics.median(s['nodes'][node]['processes'][name]['rss_bytes']
                                                                    for s in selected)
-                                             for name in baseline['nodes'][node]['processes']} for node in NODES}})
+                                             for name in baseline['nodes'][node]['processes']} for node in NODES},
+                        'anchors': {node: {field: statistics.median(s['nodes'][node]['anchor_runtime'][field]
+                                                                   for s in selected) for field in ('rss_bytes', 'fds')}
+                                    for node in ('node1', 'node2')}})
     times = [(window['start_seconds'] + window['end_seconds']) / 2 for window in windows]
     trends = {}
     for node in NODES:
@@ -153,6 +167,12 @@ def evaluate(samples, work, mode, policy):
             name: trend(times, [w['processes'][node][name] for w in windows],
                         policy['process_rss_trend'], node + '.' + name)
             for name in baseline['nodes'][node]['processes']}
+        if node != 'afs-m':
+            trends[node]['anchor_runtime_rss'] = trend(
+                times, [w['anchors'][node]['rss_bytes'] for w in windows],
+                policy['process_rss_trend'], node + '.anchor.rss')
+            trends[node]['anchor_runtime_fds'] = trend(
+                times, [w['anchors'][node]['fds'] for w in windows], policy['trends']['fds'], node + '.anchor.fds')
     return {'status': 'passed', 'contract_id': policy['id'], 'qualification_only': False,
             'actual_seconds': work['elapsed_seconds'], 'windows': windows, 'trends': trends,
             'fault_recovery_claimed': False, 'performance_acceptance': False}

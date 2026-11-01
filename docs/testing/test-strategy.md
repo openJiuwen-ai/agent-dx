@@ -666,13 +666,13 @@ Full包括已登记的冒烟必需断言；扩大覆盖不等于 `run.py --all` 
 | --- | --- |
 | 时长／负载 | `build/e2e/soak.py --acceptance one-hour --seconds 3600`，固定15秒采样；相同两个常驻Environment、AFS挂载及16KiB同步发布／跨端完整读取、确认内容、SDK命令／文件和临时Environment创建删除。不含部署／清理时间；总计至少600轮发布、300次临时创建删除 |
 | 持续性 | 前600秒仅从趋势统计中排除，仍持续负载且检查峰值／错误；随后十个300秒窗口每窗≥12份活动采样、≥25轮发布和≥10次完整churn。采样／进展间隙≤45秒、首份采样≤30秒，末份覆盖实际3600秒。DFS每个稳态窗口peer读都必须增加 |
-| 峰值／错误／身份 | 固定JSON中的全部峰值上限及2GiB磁盘余量；Docker和外置runtime的内存／匿名量／OOM分别取样，另采进程RSS／FD、挂载、AFS数据／日志和runtime磁盘。任何SDK／内容错误、OOM、常驻Environment／容器／进程替换、缺观测或超限均失败，不用中位数掩盖预热期峰值 |
+| 峰值／错误／身份 | 固定JSON中的全部峰值上限及2GiB磁盘余量；Docker和外置runtime的内存／匿名量／OOM分别取样，另采进程RSS／FD、挂载、AFS数据／日志和runtime磁盘。任何SDK／内容错误、OOM、常驻Environment／backend的runc ID／PID／start及容器／进程替换、缺观测或超限均失败，不用中位数掩盖预热期峰值 |
 | 稳态资源趋势 | 十个窗口均参与，以每窗中位数做末段减首段及全部窗口中点OLS斜率，两者都须过线。Docker匿名量／汇总RSS／AFS数据／runtime盘：末差≤32MiB、斜率≤16MiB/小时；runtime匿名量／每个进程RSS：≤16MiB、≤8MiB/小时；FD≤4、≤4/小时；挂载≤1、≤1/小时。页缓存、日志单独报告并受峰值限制，不混作匿名内存泄漏 |
 | 退出／结论 | SDK worker确认终态、Environment显式删除、backend为空、AFS进程／挂载正常退场及Docker回收均通过；parent/JUnit与 `soak-acceptance.json` 也必须通过。结果绑定合同ID／SHA、固定产品与harness，正式结果为 `qualification_only=false`。失败／取消保留FAILED，不自动重跑、不换包、不在看数据后放宽阈值 |
 
 完整机器可读合同：[one-hour-v1.json](../../build/e2e/soak-contracts/one-hour-v1.json)，入口和资源含义见[公共E2E README](../../build/e2e/README.md)。阈值是这一固定工作集的一小时验收界限；通过也不证明更慢／更小的泄漏、24小时稳定性、内部GC／积压正确性、故障恢复、跨VM隔离或性能。本轮不注入故障；原PK2和短资格的故障／取消结论保持各自范围。
 
-**运行现状**：OwnerFs一小时、DFS一小时均未开始。最新只读核验中cloud1由其它MR构建占用，cloud2仍有其它项目有效预约；未接管、清理或中断他人环境。先完成判据／候选入口冻结，在合格环境空闲且正常登记后再顺序执行，原始状态、结果与环境归还将更新本页，不能把环境阻塞记为产品PASS或FAIL。
+**运行现状**：OwnerFs一小时、DFS一小时均未开始。此前两机有效预约冲突已如实保留；用户说明cloud2释放后，重新live确认idle/free，现已正常登记独立workspace并核准固定输入和三个镜像ID。cloud1任务不动。新增backend物理身份观测使用新冻结测试源码重新验收；先完成一分钟观测资格和独立审计，再按同一合同顺序跑两轮实际一小时。原始结果与环境归还将更新本页，不把环境／工具准入当产品长稳PASS。
 
 第五步可以和第四步并行准备输入、文档及直接复现；其AFS组件部署依赖CI1、产品路径依赖CI2、完整功能集依赖CI4的选集/适配，但不要求先完成线上webhook设置。直接运行通过不反向宣称CI门禁、自动触发或发布资格已完成。
 

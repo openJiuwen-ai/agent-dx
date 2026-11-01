@@ -2,10 +2,14 @@
 
 import importlib.util
 import os
+import json
+import sys
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from unittest.mock import Mock
+from types import ModuleType
 
 
 class SoakStorageProbe(unittest.TestCase):
@@ -56,6 +60,30 @@ class SoakStorageProbe(unittest.TestCase):
             total, logs = self.module().storage(root)
             self.assertEqual(logs, 50)
             self.assertGreaterEqual(total - logs, 100)
+
+    def test_anchor_lookup_uses_existing_label_and_bounded_runc_queries(self):
+        probe = self.module()
+        node = ModuleType('node')
+        node.P = Path('/tmp/adx-e2e')
+        node.command = Mock(side_effect=['ID STATUS\nphysical-1 running\n',
+                                         json.dumps({'id': 'physical-1', 'status': 'running', 'pid': 33})])
+        with patch.dict(sys.modules, {'node': node}), patch.object(probe, 'process_info', return_value={
+                'pid': 33, 'start_ticks': 9, 'rss_bytes': 100, 'fds': 3}):
+            value = probe.anchor_runtime('environment-a')
+        self.assertEqual(value['runtime_id'], 'physical-1')
+        self.assertEqual(value['environment_id'], 'environment-a')
+        self.assertEqual(value['pid'], 33)
+        self.assertIn('adx.environment_id=environment-a', node.command.call_args_list[0].args[0])
+        self.assertTrue(all(call.kwargs['timeout'] == 5 for call in node.command.call_args_list))
+
+    def test_missing_or_ambiguous_backend_and_stopped_runc_are_not_accepted(self):
+        probe = self.module()
+        for replies in (['ID STATUS\n'], ['ID STATUS\na running\nb running\n'],
+                        ['ID STATUS\na running\n', json.dumps({'id': 'a', 'status': 'stopped', 'pid': 33})]):
+            node = ModuleType('node')
+            node.P, node.command = Path('/tmp/adx-e2e'), Mock(side_effect=replies)
+            with patch.dict(sys.modules, {'node': node}), self.assertRaises(ValueError):
+                probe.anchor_runtime('environment-a')
 
 
 if __name__ == '__main__':

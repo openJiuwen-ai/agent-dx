@@ -296,11 +296,16 @@ sample does not hide load-time growth.
 
 Observe Docker-node cgroups and sibling external-runtime cgroups separately,
 including anonymous/file memory and OOM events. Observe persistent process
-PID/start/RSS/FD, mounts, apparent AFS/data bytes versus logs, runtime state and
+PID/start/RSS/FD, each anchor's labeled runc ID/PID/start/RSS/FD, mounts,
+apparent AFS/data bytes versus logs, runtime state and
 retained stream bytes. A filesystem walk skips concurrently retired entries,
 counts hard links once and never follows external symlinks; other read errors
 fail sampling. Any OOM, changed anchor/container/process identity, content or
 SDK error, missing observation, exceeded peak or unconfirmed cleanup fails.
+Only active samples query the two anchors, so ordinary post-workload deletion
+does not look like an unexpected backend replacement. Anchor physical identities
+must remain unchanged during the active hour; their RSS/FD medians participate
+in the same per-process bounds below.
 
 The frozen JSON defines peak caps and the following limits for the ten window
 medians. Both last-minus-first and an ordinary least-squares slope over all
