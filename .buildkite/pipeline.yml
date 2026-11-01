@@ -1,9 +1,37 @@
 steps:
-- label: ':pipeline: Select ADX pipeline'
-  key: select-pipeline
+- label: Diagnose pinned envd source acquisition
+  key: envd-fetch-diagnostic
   agents:
     queue: default
     os: linux
     arch: amd64
-  command: bash .buildkite/select-pipeline.sh
-  timeout_in_minutes: 5
+  concurrency: 1
+  concurrency_group: adx/envd-fetch-diagnostic
+  command: python3 -u build/e2b/diagnose_fetch.py
+  timeout_in_minutes: 8
+  artifact_paths:
+  - out/buildkite/logs/envd-fetch/**/*
+  env:
+    BUILDKITE_AGENT_NAME: agent-stack-k8s
+  plugins:
+  - kubernetes:
+      podSpec:
+        imagePullSecrets:
+        - name: swr-pull-secret
+        containers:
+        - image: swr.cn-southwest-2.myhuaweicloud.com/yuanrong-dev/adx-build@sha256:7cd63f1d779963576ba3ddbf258a01af9fad289fb4f0e848a34dfb75d5139ade
+          volumeMounts:
+          - name: build-cache
+            mountPath: /mnt/paas
+          resources:
+            requests:
+              cpu: '4'
+              memory: 8Gi
+            limits:
+              cpu: '8'
+              memory: 16Gi
+        volumes:
+        - name: build-cache
+          hostPath:
+            path: /mnt/paas
+            type: DirectoryOrCreate
