@@ -798,3 +798,19 @@ Normal Full90 (harness27d6a65e, product4954413e/images231, no selectors/profile
 bypass) passed public11 + component24 + SDK16, required receipts and normal
 cleanup. The candidate is validated; upstream integration awaits MR130 review.
 See the single `docs/testing/test-strategy.html` for dated evidence and scope.
+
+## Pinned envd acquisition
+
+The Execd component job passes `--git-protocol 2` to
+`build/e2b/build_envd.py` on the pinned Git 2.25.1 builder. The option sets
+`protocol.version=2` only in the new temporary checkout, covering the initial
+fetch and sparse checkout lazy blob fetches. Other callers retain their default
+Git behavior; an explicit `--source` checkout is verified without modification.
+The option requires Git 2.18 or newer. The source revision, six checksums,
+envd version, Go toolchain and fetch/checkout deadlines remain pinned as before.
+The builder logs fetch, materialization and source-verification phases.
+
+See the [single testing specification](../docs/testing/test-strategy.md) for
+Base232 failures, the isolated diagnostics, and the fresh candidate acceptance
+records. Diagnostic fetch success alone does not establish a verified build or
+product acceptance.
