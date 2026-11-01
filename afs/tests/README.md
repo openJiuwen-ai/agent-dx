@@ -20,7 +20,7 @@ K8s角色按namespace/Pod UID、实际worker UID和隔离身份核验，
 这些都是AFS ON测试资产，不进入产品包；Rust源码、缓存和私有环境配置不分发。
 选择Rust合同还需另交付同架构测试ELF。
 
-## CI4功能Full候选（真实结果待验证）
+## CI4功能Full候选（已验证，待MR130合入）
 
 `suites/ci_full.py`统一登记24个ID，`run.py run --suite ci-full`逐项校验完整性，选择当前24项基础/扩展功能用例：13项本地、9项跨角色、2项扩展。
 它包含已有冒烟，排除20项读写专项和2项性能资产；不是`--all`。本轮候选在K8s准备matrix：
@@ -30,7 +30,7 @@ K8s本地集合记录`kind=kubernetes, topology=local`，不改名为singlevm来
 仅Full M Pod额外挂载`/sys/devices/virtual/bdi`为可写；探针只修改自有FUSE BDI并finally恢复，
 不修改宿主块设备或全局sysctl。sysfs只读不能通过忽略精确计数检查来绕过。
 
-Full复用原24项断言，含4个精确Rust测试selector（3个外层case）；测试ELF由Linux Base AFS
+Full复用现有24项用例（旧Rust合同按冲突/无冲突分别修正前提），含4个精确Rust测试selector（3个外层case）；测试ELF由Linux Base AFS
 构建器从当前同源Cargo测试产物冻结、去除debug段后单独打包，manifest绑定product commit、
 架构、两个产品二进制SHA、ELF和archive SHA。制品在`out/buildkite/afs-contracts/`，不进入产品包。
 目标Pod只执行已冻结ELF，不运行Cargo；缺资产、错身份、缺case、BLOCKED、非正常清理均使Full失败。
@@ -39,8 +39,9 @@ Full复用原24项断言，含4个精确Rust测试selector（3个外层case）�
 ADX Full的`afs_gate.py --profile full`在原公共11组后选择该24项组件集及`afs-sdk-full`；
 SDK Full新增namespace-identity和truncate-visibility，每模式8断言。Base L0继续原组件5项＋SDK两模式6断言，
 不运行ci-full；旧候选仍可用显式`afs-component`/`afs-sdk`诊断，正常Full须准备带新测试资产的候选。
-SDK Full88已在冻结候选230通过两模式16项；组件Full87的旧Rust前提错误及修正后的候选231均在原规范登记，
-修正后的ELF未实跑前不记24项完成。冲突旧句柄的安全回退与独立inode同版本零READ分别严格检查。
+Base231冻结同源新ELF；Full89组件24/24与四内核实跑通过。正常Full90无target覆盖完成公共11＋组件24＋SDK16，
+正常清理与各层汇总通过，候选MR130尚未合入。Full86/87及公共Platform两次Redis失败完整保留（Issue71仍开放）。
+冲突旧句柄的安全回退与独立inode同版本零READ分别严格检查；未放宽阈值或修改产品实现。
 本轮只覆盖正常进程恢复，不代表Pod删除持久性、VM断电、HA、兼容大套件、长稳或性能验收。
 
 ## 运行条件

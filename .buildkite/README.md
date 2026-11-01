@@ -761,13 +761,13 @@ these settings through a temporary BuildKit secret, outside its build context;
 index credentials are not stored in Docker build arguments or image layers.
 When no overrides are set, the runtime base image keeps its pip configuration.
 
-## AFS CI4 functional Full candidate
+## AFS CI4 functional Full (validated candidate, MR130 pending merge)
 
 With AFS ON, the normal Full profile keeps all eleven public groups and then requires
 `afs-component-full` (the registered 24 functional cases) and `afs-sdk-full`
 (OwnerFs/DFS, eight assertions each). Base L0 keeps the existing five component
 cases and six SDK assertions per mode. Specials, performance, hour/day soak and
-power-loss/HA are separate scopes. Real CI4 results are pending in this candidate.
+power-loss/HA are separate scopes. The candidate passed normal Full90 with public11 + component24 + SDK16; MR130 is still open.
 
 The x86 AFS Base build freezes the `fuse_contract` test ELF using
 Cargo `test --no-run`'s exact artifact record, strips debug sections and verifies four exact
@@ -790,7 +790,11 @@ CI4 targets use `ADX_E2E_TARGET_CASE=afs-component-full` or `afs-sdk-full`;
 AFS targets are not part of the existing public `ADX_E2E_TARGET_CASES` campaign.
 Only the Full local M Pod binds `/sys/devices/virtual/bdi` writable. Cache probes
 adjust and restore only their own FUSE mount's BDI, not a host disk or global
-sysctl. Base resources are unchanged. Full86/87 failures are retained; SDK
-Full88 passed on candidate230. Candidate231 contains the corrected Rust test,
-but its new complete Full is pending behind the public Platform Redis issue71.
-See the single `docs/testing/test-strategy.html` for current dated evidence.
+sysctl. Base resources are unchanged. Full86/87 failures are retained.
+Base231 passed after two public Platform Redis
+failures and unchanged retries; issue71 remains open. Targeted component Full89
+passed all 24 cases and four exact kernel tests using the new frozen ELF.
+Normal Full90 (harness27d6a65e, product4954413e/images231, no selectors/profile
+bypass) passed public11 + component24 + SDK16, required receipts and normal
+cleanup. The candidate is validated; upstream integration awaits MR130 review.
+See the single `docs/testing/test-strategy.html` for dated evidence and scope.
