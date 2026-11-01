@@ -58,7 +58,8 @@ def validate_sdk(report, mode, special):
         workload = report.get('workload', {})
         if (workload.get('paused_state') != 'T' or workload.get('paused_pid') != restart['node2']['before_pid']
                 or workload.get('before_restart', 0) < 1
-                or workload.get('after_restart', 0) <= workload.get('before_restart', 0)):
+                or workload.get('at_ready', -1) < workload.get('before_restart', 0)
+                or workload.get('after_restart', 0) <= workload.get('at_ready', 0)):
             raise ValueError('SDK-launched mounted workload did not progress during pause and after restart')
 
 
@@ -125,7 +126,8 @@ def _restart(product, cluster):
             'before_backend': json.loads((run.output / ('backend-before-' + node + '.json')).read_text()),
             'after_backend': json.loads((run.output / ('backend-after-' + node + '.json')).read_text()),
         }
-    paused['after_restart'] = _progress(cluster, paused['before_restart'])
+    paused['at_ready'] = _progress(cluster, paused['before_restart'] - 1)
+    paused['after_restart'] = _progress(cluster, paused['at_ready'])
     cluster.write('A', 'pk2-stop', b'stop')
     return identities, paused
 

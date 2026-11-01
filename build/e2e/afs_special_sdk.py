@@ -12,8 +12,10 @@ import time
 CONFIRMED = b'pk2-confirmed:' * 1024
 WORKER_ID = 'afs-special-mounted-io'
 WORKER = (
-    'use Time::HiRes qw(time usleep);my $end=time()+180;'
-    'while(!-e "/afs/pk2-go"){die "go timeout" if time()>$end;usleep(100000);}'
+    'my $end=time()+180;open(my $ready,">","/afs/pk2-worker-ready") or die $!;'
+    'print $ready "ready" or die $!;$ready->flush() or die $!;$ready->sync() or die $!;'
+    'close($ready) or die $!;'
+    'while(!-e "/afs/pk2-go"){die "go timeout" if time()>$end;select(undef,undef,undef,0.1);}'
     'my $n=0;while(!-e "/afs/pk2-stop") {'
     'die "workload timeout" if time()>$end;'
     'open(my $r,"<","/afs/confirmed") or die $!;local $/;my $d=<$r>;close($r);'
@@ -22,7 +24,7 @@ WORKER = (
     '$w->flush() or die $!;$w->sync() or die $!;close($w) or die $!;'
     '$n++;open(my $p,">","/afs/pk2-progress.tmp") or die $!;print $p $n or die $!;'
     '$p->flush() or die $!;$p->sync() or die $!;close($p) or die $!;'
-    'rename("/afs/pk2-progress.tmp","/afs/pk2-progress") or die $!;usleep(100000);'
+    'rename("/afs/pk2-progress.tmp","/afs/pk2-progress") or die $!;select(undef,undef,undef,0.1);'
     '}die "no workload" unless $n>0;print "MOUNTED_IO_OK $n";'
 )
 
@@ -105,6 +107,16 @@ def run_phase(connection, image, config, phase, state_path, output):
         report['cases'].append({'id': name, 'status': 'passed'})
     try:
         if phase == 'cleanup':
+            if config['special'] == 'restart' and 'B' in state['instances']:
+                try:
+                    observer = Environment.from_id(state['instances']['B'], connection=connection)
+                    handles.append(observer)
+                    result = observer.commands.get(WORKER_ID).wait(timeout=0.1)
+                    report['background_diagnostic'] = {
+                        'exit_code': result.exit_code, 'stdout': result.stdout, 'stderr': result.stderr,
+                    }
+                except Exception as exc:
+                    report['background_diagnostic'] = {'unavailable': str(exc)}
             _cleanup(connection, state, Environment, catalog)
             passed('environment-cleanup')
         elif phase == 'prepare':
@@ -131,6 +143,18 @@ def run_phase(connection, image, config, phase, state_path, output):
             if config['special'] == 'restart':
                 passed('confirmed-before-restart')
                 handles[1].commands.run(perl(WORKER), background=True, timeout=180, command_id=WORKER_ID)
+                deadline = time.monotonic() + 15
+                while True:
+                    result = handles[1].commands.get(WORKER_ID).wait(timeout=0.01)
+                    if result.exit_code is not None:
+                        raise AssertionError(('background exited before fault', result.exit_code,
+                                              result.stdout, result.stderr))
+                    ready = command(handles[1], perl('print(-e "/afs/pk2-worker-ready" ? "1" : "0");'))
+                    if ready == '1':
+                        break
+                    if time.monotonic() >= deadline:
+                        raise ValueError('background SDK workload did not acknowledge startup')
+                    time.sleep(0.1)
         else:
             if set(state['instances']) != {'A', 'B'}:
                 raise ValueError('special needs exactly two previously created Environments')

@@ -73,13 +73,13 @@ class SpecialContracts(unittest.TestCase):
         report = {'status': 'passed', 'mode': 'ownerfs', 'special': 'restart', 'cleanup_errors': [],
                   'cases': [{'id': n, 'status': 'passed'} for n in scope.SDK_CHECKS['restart']],
                   'restart': restart, 'workload': {'paused_state': 'T', 'paused_pid': 10,
-                                                  'before_restart': 2, 'after_restart': 3}}
+                                                  'before_restart': 2, 'at_ready': 2, 'after_restart': 3}}
         scope.validate_sdk(report, 'ownerfs', 'restart')
         for field, value in (('after_pid', 10), ('after_session', 'old'), ('after_backend', ['replacement'])):
             bad = dict(report, restart=dict(restart, node1=dict(restart['node1'], **{field: value})))
             with self.assertRaises(ValueError):
                 scope.validate_sdk(bad, 'ownerfs', 'restart')
-        for change in ({'paused_state': 'R'}, {'before_restart': 0}, {'after_restart': 2}):
+        for change in ({'paused_state': 'R'}, {'before_restart': 0}, {'after_restart': 2}, {'at_ready': 3}):
             with self.assertRaises(ValueError):
                 scope.validate_sdk(dict(report, workload=dict(report['workload'], **change)), 'ownerfs', 'restart')
 
@@ -147,6 +147,46 @@ class SpecialContracts(unittest.TestCase):
                                         'instances': {'A': 'do-not-delete'}}))
             with self.assertRaisesRegex(ValueError, 'different run'):
                 sdk._owned_state({'owner': 'mine', 'mode': 'dfs', 'special': 'restart'}, path)
+
+    def test_partial_sdk_creation_deletes_the_created_environment(self):
+        sdk = load('special_partial_creation', HERE / 'afs_special_sdk.py')
+        records, closed = {}, []
+
+        class Environment:
+            def __init__(self, **options):
+                if records:
+                    raise RuntimeError('second create failed')
+                self.id = 'created-first'
+                records['environment:' + self.id] = json.dumps({'assignment': {'node_id': options['node_id']}})
+
+            def close(self):
+                closed.append(self.id)
+
+            @classmethod
+            def delete(cls, identity, **_kwargs):
+                records.pop('environment:' + identity)
+
+        module, helpers, node = ModuleType('adx_environment'), ModuleType('afs_sdk'), ModuleType('node')
+        module.Environment, module.Mount = Environment, Mock()
+        module.__file__ = '/opt/adx/client/lib/python3.12/site-packages/adx_environment/__init__.py'
+        helpers.perl = lambda code, *_args, **_kwargs: code
+        helpers.command = lambda _handle, code: ('10000' if 'print $>' in code else (
+            '1 0 0:1 / /afs rw - ext4 /dev/x rw' if code.startswith('cat ') else '1 2'))
+        helpers.write_synced = Mock()
+        node.catalog = lambda: records
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.dict(sys.modules, {'adx_environment': module, 'afs_sdk': helpers, 'node': node}), \
+                patch.object(sdk.importlib.metadata, 'version', return_value='candidate'):
+            root = Path(directory)
+            report = sdk.run_phase(None, 'fixed-image', {
+                'owner': 'mine', 'mode': 'ownerfs', 'special': 'restart',
+                'paths': {'A': '/fixture/a', 'B': '/fixture/b'}, 'identities': {'A': [1, 2], 'B': [3, 4]},
+            }, 'prepare', root / 'state.json', root / 'result.json')
+            self.assertEqual(report['status'], 'failed')
+            self.assertIn('second create failed', report['error'])
+            self.assertEqual(records, {})
+            self.assertEqual(closed, ['created-first'])
+            self.assertEqual(report['cleanup_errors'], [])
 
 
 if __name__ == '__main__':

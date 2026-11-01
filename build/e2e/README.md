@@ -148,6 +148,10 @@ second Adxlet is paused; the fixture then resumes it, restarts both Adxlets
 through the existing fault helper, and requires new process/session identities,
 unchanged external runtime identities, further mounted I/O progress and full
 SDK content verification. Explicit Environment deletion precedes AFS unmount.
+The background command acknowledges startup before fault injection, uses only
+the fixed image's existing Perl core support, and preserves command diagnostics
+before deletion. After both Adxlets are ready, take a new progress baseline and
+require another increment; earlier activity cannot stand in for post-ready I/O.
 
 The SDK pressure case runs four workers with eight independent 64 KiB files
 each, checks every byte through the opposite AFS role, checks `EEXIST` for
