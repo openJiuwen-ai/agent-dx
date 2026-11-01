@@ -13,7 +13,9 @@ import shutil
 import time
 
 from fixtures import singlevm, ssh, namespaces, kubernetes
-from fixtures.common import Blocked, DfsProfile, HERE, needs_reader_c, performance_parameters, sha256, write_json
+from fixtures.common import (
+    Blocked, DfsProfile, HERE, is_single_host, needs_reader_c, performance_parameters, sha256, write_json,
+)
 
 ROLES = ("M", "A", "B", "C")
 NAMES = {"M": "meta", "A": "node-a", "B": "node-b", "C": "node-c"}
@@ -30,7 +32,7 @@ def validate(config, cases):
     roles = config.get("roles", {})
     hosts = config.get("hosts", {})
     needed = set("MAB")
-    if any(needs_reader_c(c, config["kind"]) for c in cases):
+    if any(needs_reader_c(c, config["kind"], config.get("topology")) for c in cases):
         needed.add("C")
     for case in cases:
         if not isinstance(case.observe_cache, bool) or (case.observe_cache and case.mode != "dfs"):
@@ -72,8 +74,16 @@ def validate(config, cases):
             or any(c in str(base) for c in ("\n", "\r", '"', "\\"))
         ):
             raise ValueError("host base must be a dedicated existing absolute directory")
+    if config["kind"] == "kubernetes" and config.get("topology", "cluster") not in ("local", "cluster"):
+        raise ValueError("Kubernetes topology must be local or cluster")
     selected_hosts = [roles[r]["host"] for r in needed]
-    if config["kind"] in ("multivm", "namespaces", "kubernetes"):
+    if is_single_host(config) and config["kind"] == "kubernetes":
+        loopback = all(ipaddress.ip_address(roles[r]["address"]).is_loopback for r in needed)
+        if len(set(selected_hosts)) != 1 or not loopback:
+            raise Blocked("single-Pod local cases require one Pod and loopback role addresses")
+        if any(any(t.startswith("cluster-") for t in c.tags) for c in cases):
+            raise Blocked("single-Pod topology cannot establish cross-Pod evidence")
+    elif config["kind"] in ("multivm", "namespaces", "kubernetes"):
         if len(set(selected_hosts)) != len(needed):
             raise Blocked("multivm requires a distinct guest for every selected role")
         if any(any(t.startswith("local-") for t in c.tags) for c in cases):
@@ -99,7 +109,8 @@ class Cluster:
         self.evidence = []
         self.started = False
         self.roles = ["M", "A", "B"]
-        if needs_reader_c(case, config["kind"]) or (case.profile is not None and case.profile.node_count == 3):
+        if (needs_reader_c(case, config["kind"], config.get("topology"))
+                or (case.profile is not None and case.profile.node_count == 3)):
             self.roles.append("C")
         if self.mode == "ownerfs":
             self.roles = ["M", "A", "B"]
@@ -271,7 +282,8 @@ class Cluster:
         self.infos = infos
         write_json(
             self.output / "environment.json",
-            {"kind": self.config["kind"], "hosts": infos, "roles": self.config["roles"], "mode": self.mode},
+            {"kind": self.config["kind"], "topology": self.config.get("topology"),
+             "hosts": infos, "roles": self.config["roles"], "mode": self.mode},
         )
         return infos
 
@@ -342,6 +354,7 @@ class Cluster:
             self.output / "environment.json",
             {
                 "kind": self.config["kind"],
+                "topology": self.config.get("topology"),
                 "hosts": infos,
                 "roots": self.roots,
                 "roles": self.config["roles"],

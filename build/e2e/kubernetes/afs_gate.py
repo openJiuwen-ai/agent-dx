@@ -46,23 +46,31 @@ def verify_part(directory, expected):
                 evidence = json.loads((directory / node / f'{kind}-{node}.json').read_text())
                 if evidence.get('status') != 'passed':
                     raise ValueError('public Full stop observability failed: ' + node + '/' + kind)
-    if expected == ('afs-component',):
+    if expected in (('afs-component',), ('afs-component-full',)):
         from afs_component import validate_result
         validate_result(json.loads((directory / 'afs/result.json').read_text()),
-                        json.loads((directory / 'afs/cleanup.json').read_text()))
-    if 'afs-sdk-ownerfs' in expected:
+                        json.loads((directory / 'afs/cleanup.json').read_text()),
+                        full=expected == ('afs-component-full',))
+    if any(name.startswith('afs-sdk-ownerfs') for name in expected):
         from afs_product import validate_sdk_result
         for mode in ('ownerfs', 'dfs'):
             path = directory / 'afs-sdk' / mode
-            validate_sdk_result(json.loads((path / 'sdk-result.json').read_text()), mode)
+            validate_sdk_result(json.loads((path / 'sdk-result.json').read_text()), mode,
+                                full=expected[0].endswith('-full'))
             normal = json.loads((path / 'cleanup.json').read_text())
             if normal.get('status') != 'PASS' or normal.get('errors'):
                 raise ValueError('AFS normal cleanup failed: ' + mode)
     return report
 
 
+def plans(profile):
+    suffix = '-full' if profile == 'full' else ''
+    return [('public', profile, None), ('afs-component' + suffix, 'full', 'afs-component' + suffix),
+            ('afs-sdk' + suffix, 'full', 'afs-sdk' + suffix)]
+
+
 def main():
-    from run import selected_checks, source_commit, write_junit
+    from run import common, selected_checks, source_commit, write_junit
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('bundle', 'registry-images', 'kubeconfig', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
@@ -73,10 +81,10 @@ def main():
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    plans = [('public', args.profile, None), ('afs-component', 'full', 'afs-component'),
-             ('afs-sdk', 'full', 'afs-sdk')]
-    report = {'status': 'failed', 'profile': 'afs-required-smoke', 'source_profile': args.profile,
-              'required_checks': [p[0] for p in plans], 'checks': [], 'cleanup_errors': [], 'cases': [], 'error': None}
+    plan = plans(args.profile)
+    report = {'status': 'failed', 'profile': 'afs-required-full' if args.profile == 'full' else 'afs-required-smoke',
+              'source_profile': args.profile,
+              'required_checks': [p[0] for p in plan], 'checks': [], 'cleanup_errors': [], 'cases': [], 'error': None}
     commit = source_commit()
 
     def cancel(signum, _frame):
@@ -84,7 +92,7 @@ def main():
 
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, cancel)
-    for name, profile, case in plans:
+    for name, profile, case in plan:
         started = time.monotonic()
         record = {'name': name, 'status': 'failed'}
         report['cases'].append(record)
@@ -101,6 +109,9 @@ def main():
             command += ['--node-name', node]
         child = None
         try:
+            if name == 'public' and args.profile == 'full':
+                common.afs_contracts.verify_bundle(
+                    args.bundle.parent, json.loads(args.bundle.read_text()), required=True)
             child = subprocess.Popen(command)
             code = child.wait()
             if code:

@@ -90,9 +90,16 @@ class Case:
     observe_cache: bool = False
 
 
-def needs_reader_c(case, kind):
+def is_single_host(config):
+    return config["kind"] == "singlevm" or (
+        config["kind"] == "kubernetes" and config.get("topology") == "local"
+    )
+
+
+def needs_reader_c(case, kind, topology=None):
     return case.id.endswith(".many_readers") or (
-        kind == "singlevm" and case.mode == "dfs" and (case.profile is None or case.profile.node_count == 3)
+        (kind == "singlevm" or (kind == "kubernetes" and topology == "local"))
+        and case.mode == "dfs" and (case.profile is None or case.profile.node_count == 3)
     )
 
 
@@ -121,6 +128,8 @@ def discover():
                 raise ValueError("duplicate case ID: " + case.id)
             if "local-basic" in case.tags or "cluster-manyread" in case.tags:
                 case = replace(case, tags=case.tags + ("all-basic",))
+            if any(tag in case.tags for tag in ("local-basic", "local-extended", "cluster-manyread")):
+                case = replace(case, tags=case.tags + ("ci-full",))
             special_tags = (
                 "local-write-special", "cluster-write-special", "local-read-special", "cluster-read-special",
             )

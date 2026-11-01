@@ -1,0 +1,70 @@
+"""Frozen test ELF transport; no Rust compilation or FUSE execution here."""
+
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parents[3]
+
+
+class ContractAssetsTests(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location('contract_assets', ROOT / 'build/e2e/afs_contracts.py')
+        self.assets = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.assets)
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.elf = self.root / 'test-elf'
+        header = bytearray(64)
+        header[:6] = b'\x7fELF\x02\x01'
+        header[18:20] = (62).to_bytes(2, 'little')
+        self.elf.write_bytes(header)
+        self.package = {'with_afs': True, 'commit': 'a' * 40, 'target': 'x86_64-unknown-linux-gnu',
+                        'files': {'bin/afs-meta': 'b' * 64, 'bin/afs-node': 'c' * 64}}
+        self.directory = self.root / 'assets'
+        self.manifest = self.assets.pack(self.elf, self.directory, self.package)
+
+    def test_transport_is_separate_and_preserves_frozen_elf(self):
+        dest = self.root / 'unpacked'
+        self.assets.unpack(self.directory, self.package, dest)
+        self.assertEqual((dest / 'fuse_contract').read_bytes(), self.elf.read_bytes())
+        self.assertTrue((dest / 'fuse_contract').stat().st_mode & 0o111)
+        self.assertEqual(set(p.name for p in self.directory.iterdir()), {'manifest.json', 'fuse-contract.tar.gz'})
+
+    def test_foreign_product_source_binary_or_target_cannot_be_accepted(self):
+        for package in (dict(self.package, commit='d' * 40),
+                        dict(self.package, target='aarch64-unknown-linux-gnu'),
+                        dict(self.package, files=dict(self.package['files'], **{'bin/afs-node': 'd' * 64})),
+                        dict(self.package, with_afs=False)):
+            with self.subTest(package=package), self.assertRaises(ValueError):
+                self.assets.validate(self.manifest, package)
+
+    def test_corrupt_archive_is_rejected_before_extraction(self):
+        (self.directory / 'fuse-contract.tar.gz').write_bytes(b'corrupt')
+        with self.assertRaises(ValueError):
+            self.assets.unpack(self.directory, self.package, self.root / 'bad')
+
+    def test_full_requires_an_explicit_small_bundle_handoff(self):
+        bundle = {'package': self.package}
+        self.assertIsNone(self.assets.verify_bundle(self.root, bundle))
+        with self.assertRaises(ValueError):
+            self.assets.verify_bundle(self.root, bundle, required=True)
+        path = self.root / 'afs-contracts.json'
+        path.write_text(json.dumps(self.manifest))
+        bundle['afs_contracts'] = {'manifest': path.name, 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+        self.assertEqual(self.assets.verify_bundle(self.root, bundle, required=True), self.manifest)
+
+    def test_actual_installed_elf_must_match_small_manifest(self):
+        dest = self.root / 'unpacked'
+        self.assets.unpack(self.directory, self.package, dest)
+        (dest / 'fuse_contract').write_bytes(b'foreign')
+        with self.assertRaises(ValueError):
+            self.assets.installed(dest, self.package)
+
+
+if __name__ == '__main__':
+    unittest.main()

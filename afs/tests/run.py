@@ -78,6 +78,7 @@ def main(argv=None):
             "cluster-manyread": {f"MV{i:02}" for i in range(1, 9)},
         }
         required["all-basic"] = required["local-basic"] | required["cluster-manyread"]
+        required["ci-full"] = required["all-basic"]
         tag = args.suite or ("local-basic" if not (args.all or args.case) else None)
         missing = required.get(tag, set()) - {g for c in selected for g in c.groups}
         if missing:

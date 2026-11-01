@@ -35,6 +35,9 @@ spec.loader.exec_module(package)
 afs_spec = importlib.util.spec_from_file_location('afs_handoff', ROOT / 'build/e2e/afs_handoff.py')
 afs_handoff = importlib.util.module_from_spec(afs_spec)
 afs_spec.loader.exec_module(afs_handoff)
+contract_spec = importlib.util.spec_from_file_location('afs_contracts', Path(__file__).with_name('afs_contracts.py'))
+afs_contracts = importlib.util.module_from_spec(contract_spec)
+contract_spec.loader.exec_module(afs_contracts)
 BACKEND_BINARIES = ('sandboxd', 'sbox', 'runc', 'runc-shim', 'sandbox-logger', 'redis-cli')
 
 
@@ -116,6 +119,7 @@ def main():
     p.add_argument('--execd-base', required=True)
     p.add_argument('--activator', action='store_true', help='include the inherited Activator business workload')
     p.add_argument('--workload-probes', action='store_true', help='include the managed probe workload fixture')
+    p.add_argument('--afs-contracts', type=Path, help='frozen same-product FUSE test assets, outside the release')
     p.add_argument('--firecracker-kit', type=Path)
     p.add_argument('--runsc-bin', type=Path, help='optional verified native runsc for the heterogeneous runtime E2E')
     a = p.parse_args()
@@ -188,6 +192,9 @@ def main():
             shutil.copyfile(context / 'e2e/afs-tests/manifest.json', a.output / 'afs-tests.json')
             for name in afs_handoff.BINARIES:
                 (context / 'package/bin' / name).chmod(0o755)
+        if a.afs_contracts:
+            afs_contracts.unpack(a.afs_contracts, manifest, context / 'e2e/afs-contracts')
+            shutil.copyfile(a.afs_contracts / 'manifest.json', a.output / 'afs-contracts.json')
         if fc_kit:
             for name in fc_kit['files']:
                 output = context / 'fc-kit' / name
@@ -327,6 +334,8 @@ def main():
     result['collector'] = {**collector, 'image': collector_image}
     if afs_handoff.enabled(manifest):
         result['afs_tests'] = {'manifest': 'afs-tests.json', 'sha256': sha(a.output / 'afs-tests.json')}
+    if a.afs_contracts:
+        result['afs_contracts'] = {'manifest': 'afs-contracts.json', 'sha256': sha(a.output / 'afs-contracts.json')}
     if a.activator:
         result['activator_archive_sha256'] = sha(a.output / 'activator.tar')
     if a.workload_probes:

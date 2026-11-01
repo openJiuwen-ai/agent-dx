@@ -760,3 +760,28 @@ and `PIP_DEFAULT_TIMEOUT`, like the SDK package job. The image builder forwards
 these settings through a temporary BuildKit secret, outside its build context;
 index credentials are not stored in Docker build arguments or image layers.
 When no overrides are set, the runtime base image keeps its pip configuration.
+
+## AFS CI4 functional Full candidate
+
+With AFS ON, the normal Full profile keeps all eleven public groups and then requires
+`afs-component-full` (the registered 24 functional cases) and `afs-sdk-full`
+(OwnerFs/DFS, eight assertions each). Base L0 keeps the existing five component
+cases and six SDK assertions per mode. Specials, performance, hour/day soak and
+power-loss/HA are separate scopes. Real CI4 results are pending in this candidate.
+
+The x86 AFS Base build freezes the already built `fuse_contract` test ELF using
+Cargo's exact artifact record, strips debug sections and verifies four exact
+selectors without running them. It publishes `out/buildkite/afs-contracts/*`
+separately from the product component/package. Image preparation verifies the
+source/target/product-binary/ELF/archive hashes, stages the ELF in
+`/opt/adx/e2e/afs-contracts/`, and binds `afs-contracts.json` in the bundle.
+Normal Full rejects missing/foreign assets before deployment. Old candidates
+remain usable for explicit smoke diagnostics; a CI4 Full candidate must be built
+with the new asset tooling. No product is rebuilt inside a test Pod.
+
+Components use one M Pod for local kernel/two-mount contracts and M/A/B/C Pods
+for cluster contracts; A/B must occupy different workers, while C may share a
+worker but has its own Pod/mount identity. SDK Full adds old-FD namespace identity
+and exact growth/truncation/EOF readback. Same-directory restart is process
+recovery on emptyDir, not Pod/VM persistence. Full includes all mandatory smoke
+assertions and normal cleanup; targeted success is not a complete Full result.

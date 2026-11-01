@@ -17,18 +17,30 @@ from manifest import LABEL, resources as platform_resources
 
 CASES = ('ownerfs.cluster.read_write', 'ownerfs.cluster.permissions',
          'dfs.cluster.read_write', 'dfs.cluster.visibility', 'cluster.topology_cleanup')
+FULL_CASES = (
+    'cluster.topology_cleanup', 'dfs.basic.one_writer_many_readers', 'dfs.basic.namespace',
+    'dfs.cluster.read_write', 'dfs.cluster.visibility', 'dfs.cluster.restart', 'dfs.cluster.many_readers',
+    'dfs.recovery.normal_restart', 'dfs.visibility.new_open_permissions', 'dfs.visibility.real_cross_handle_cache',
+    'dfs.cache.same_version_reopen', 'dfs.cache.warm_permission_change', 'fuse.contracts.ordering',
+    'fuse.contracts.real_dfs_cache', 'fuse.contracts.busy_unmount', 'ownerfs.basic.read_write',
+    'ownerfs.extended.namespace_identity', 'ownerfs.basic.namespace', 'ownerfs.cluster.read_write',
+    'ownerfs.cluster.namespace', 'ownerfs.cluster.permissions', 'ownerfs.cluster.restart',
+    'ownerfs.permissions.deny_other_uid', 'ownerfs.recovery.normal_restart',
+)
 ROLES = {'M': 'afs-m', 'A': 'afs-a', 'B': 'afs-b'}
 
 
-def resources(namespace, image, architecture, registry_auth=False, node_names=(), distinct_workers=False):
+def resources(namespace, image, architecture, registry_auth=False, node_names=(), distinct_workers=False, full=False):
     # Reuse the public placement, registry and namespace/image validation contract.
     template = next(item for item in platform_resources(namespace, image, architecture, registry_auth, node_names)
                     if item['kind'] == 'Pod')
     objects = []
-    for role, name in ROLES.items():
+    roles = dict(ROLES, C='afs-c') if full else ROLES
+    for role, name in roles.items():
         pod = deepcopy(template)
         pod['metadata'] = {'name': name, 'namespace': namespace, 'labels': {LABEL: namespace, 'afs.e2e.role': role}}
         spec = pod['spec']
+        spec['affinity'].pop('podAntiAffinity', None)
         container = spec['containers'][0]
         container['env'] = [
             {'name': 'PYTHONDONTWRITEBYTECODE', 'value': '1'},
@@ -40,32 +52,43 @@ def resources(namespace, image, architecture, registry_auth=False, node_names=()
             # This Pod runs only Meta, rather than the full ADX platform stack.
             container['resources'] = {'requests': {'cpu': '250m', 'memory': '256Mi'},
                                       'limits': {'cpu': '1', 'memory': '1Gi'}}
+        if full and role == 'M':
+            container['resources'] = {'requests': {'cpu': '1', 'memory': '2Gi'},
+                                      'limits': {'cpu': '4', 'memory': '4Gi'}}
         spec['containers'] = [container]
         spec['volumes'] = [{'name': 'state', 'emptyDir': {}},
                            {'name': 'fuse', 'hostPath': {'path': '/dev/fuse', 'type': 'CharDevice'}}]
-        if role != 'M' and distinct_workers:
+        if role in ('A', 'B') and distinct_workers:
             pod['metadata']['labels']['afs.e2e.data'] = 'true'
+            pod['metadata']['labels']['afs.e2e.primary-data'] = 'true'
             spec['affinity']['podAntiAffinity'] = {'requiredDuringSchedulingIgnoredDuringExecution': [{
-                'labelSelector': {'matchLabels': {LABEL: namespace, 'afs.e2e.data': 'true'}},
+                'labelSelector': {'matchLabels': {LABEL: namespace, 'afs.e2e.primary-data': 'true'}},
                 'topologyKey': 'kubernetes.io/hostname',
             }]}
         objects.append(pod)
     return objects
 
 
-def validate_result(report, cleanup):
+def validate_result(report, cleanup, full=False):
+    expected = FULL_CASES if full else CASES
     records = report.get('cases', [])
     actual = [item.get('id') for item in records]
     if (report.get('status') != 'PASS' or report.get('cleanup_errors') or cleanup.get('status') != 'PASS'
-            or cleanup.get('errors') or set(report.get('selected_cases', [])) != set(CASES)
-            or len(actual) != len(CASES) or set(actual) != set(CASES)
+            or cleanup.get('errors') or set(report.get('selected_cases', [])) != set(expected)
+            or len(actual) != len(expected) or set(actual) != set(expected)
             or any(item.get('status') != 'PASS' for item in records)):
         raise ValueError('AFS required component assertions or normal cleanup did not pass completely')
+    if full and (report.get('suite') != 'ci-full' or report.get('partial') is not False):
+        raise ValueError('complete declared ci-full suite required')
+    if len(report.get('selected_cases', [])) != len(expected):
+        raise ValueError('duplicate selected AFS cases')
 
 
 class Component:
-    def __init__(self, run):
+    def __init__(self, run, full=False):
         self.run = run
+        self.full = full
+        self.roles = dict(ROLES, C='afs-c') if full else ROLES
         self.attempted_cases = False
         self.normal_cleanup = None
         self.config = None
@@ -74,12 +97,16 @@ class Component:
     def deploy(self, bundle, refs, registry_auth, node_names, distinct_workers, harness_commit):
         run = self.run
         self.package = bundle['package']
+        if self.full:
+            if not bundle.get('afs_contracts'):
+                raise ValueError('AFS Full requires frozen Rust contract assets')
+            self.contract_manifest_sha = bundle['afs_contracts']['sha256']
         if not self.package.get('with_afs'):
             raise ValueError('AFS component acceptance requires an AFS ON candidate')
         if sys.version_info < (3, 8):
             raise ValueError('AFS controller requires Python 3.8 or newer')
         objects = resources(run.id, refs['node'], bundle['architecture'], registry_auth is not None,
-                            node_names, distinct_workers)
+                            node_names, distinct_workers, full=self.full)
         run.kube('version', '-o', 'json', timeout=30)
         run.namespace_attempted = True
         run.apply({'apiVersion': 'v1', 'kind': 'Namespace', 'metadata': {'name': run.id, 'labels': {
@@ -101,7 +128,7 @@ class Component:
         inventory = json.loads(run.kube('-n', run.id, 'get', 'pods', '-o', 'json'))['items']
         pods = {p['metadata']['name']: p for p in inventory}
         placement = [{'pod': name, 'uid': pods[name]['metadata']['uid'], 'host': pods[name]['spec']['nodeName'],
-                      'ip': pods[name]['status']['podIP'], 'role': role} for role, name in ROLES.items()]
+                      'ip': pods[name]['status']['podIP'], 'role': role} for role, name in self.roles.items()]
         (run.output / 'placement.json').write_text(json.dumps(placement, indent=2))
         if distinct_workers and len({p['host'] for p in placement if p['role'] in ('A', 'B')}) != 2:
             raise ValueError('AFS A/B roles require two distinct Kubernetes workers')
@@ -119,10 +146,17 @@ class Component:
             } for item in placement},
         }
         (run.output / 'afs-environment.json').write_text(json.dumps(self.config, indent=2))
+        if self.full:
+            local = dict(self.config, topology='local', roles={
+                role: {'host': 'local', 'address': '127.0.0.' + str(i)} for i, role in enumerate('MABC', 2)},
+                hosts={'local': self.config['hosts']['m']})
+            self.config = {'kind': 'matrix', 'environments': {'local': local, 'cluster': self.config}}
+            (run.output / 'afs-environment.json').write_text(json.dumps(self.config, indent=2))
 
     def scenarios(self, checks):
         run = self.run
-        with run.case('afs-component', checks) as record, tempfile.TemporaryDirectory(prefix='adx-afs-inputs-') as temp:
+        with run.case('afs-component-full' if self.full else 'afs-component', checks) as record, \
+                tempfile.TemporaryDirectory(prefix='adx-afs-inputs-') as temp:
             inputs = Path(temp)
             for name in ('afs-meta', 'afs-node'):
                 run.kube('-n', run.id, 'cp', ROLES['M'] + ':/opt/adx/package/bin/' + name,
@@ -130,6 +164,22 @@ class Component:
                 (inputs / name).chmod(0o755)
             run.kube('-n', run.id, 'cp', ROLES['M'] + ':/opt/adx/e2e/afs-tests/inputs/artifact-identity.json',
                      str(inputs / 'artifact-identity.json'), '-c', 'platform', timeout=60)
+            if self.full:
+                contract_dir = inputs / 'contracts'
+                contract_dir.mkdir()
+                for name in ('fuse_contract', 'manifest.json'):
+                    run.kube('-n', run.id, 'cp', ROLES['M'] + ':/opt/adx/e2e/afs-contracts/' + name,
+                             str(contract_dir / name), '-c', 'platform', timeout=120)
+                from run import common
+                manifest = common.afs_contracts.installed(contract_dir, self.package)
+                if common.afs_contracts.sha(contract_dir / 'manifest.json') != self.contract_manifest_sha:
+                    raise ValueError('runtime test asset manifest differs from bundle')
+                (contract_dir / 'fuse_contract').chmod(0o755)
+                (contract_dir / 'fuse_contract').rename(inputs / 'fuse_contract')
+                identity_path = inputs / 'artifact-identity.json'
+                identity = json.loads(identity_path.read_text())
+                identity['test_elf'] = manifest['test_elf']
+                identity_path.write_text(json.dumps(identity, indent=2))
             path = str(ROOT / 'afs/tests')
             sys.path.insert(0, path)
             try:
@@ -138,8 +188,11 @@ class Component:
                 spec.loader.exec_module(runner)
                 args = ['run', '--env', str(run.output / 'afs-environment.json'), '--binary-dir', str(inputs),
                         '--work-root', str(run.output / 'afs'), '--case-timeout', '300']
-                for name in CASES:
-                    args += ['--case', name]
+                if self.full:
+                    args += ['--suite', 'ci-full']
+                else:
+                    for name in CASES:
+                        args += ['--case', name]
                 handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGALRM)}
                 self.attempted_cases = True
                 try:
@@ -156,7 +209,7 @@ class Component:
                                    for entry in report.get('cases', [])]
             if code:
                 raise ValueError('AFS component runner failed or was BLOCKED; see afs/result.json')
-            validate_result(report, self.normal_cleanup)
+            validate_result(report, self.normal_cleanup, full=self.full)
 
     def cleanup(self):
         run = self.run

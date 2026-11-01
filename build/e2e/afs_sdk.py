@@ -56,6 +56,7 @@ def run(connection, image, config, output):
     report = {'status': 'failed', 'mode': mode, 'cases': [], 'instances': [], 'placements': [],
               'cleanup_errors': [], 'sdk_version': importlib.metadata.version('adx-environment'),
               'sdk_source': adx_environment.__file__, 'mounts': {}, 'versions': [],
+              'full': config.get('full', False),
               'identity_mode': 'SDK default backend identity; commands explicitly drop workload UID/GID'}
     if not str(Path(adx_environment.__file__).resolve()).startswith('/opt/adx/client/'):
         raise ValueError('acceptance requires the installed candidate SDK')
@@ -116,6 +117,36 @@ def run(connection, image, config, output):
             command(left, perl('open(my $f,"+<",shift) or die $!;$f->sync() or die $!;', '/afs/sdk-api.bin', uid=0))
             assert right.files.read('/afs/sdk-api.bin', format='bytes') == b'sdk-files-api\x00\xff'
             passed('bidirectional-publish')
+            if config.get('full', False):
+                # One live FD survives rename/name reuse and unlink inside the real mounted namespace.
+                command(right, perl(
+                    'my $p="/afs/fd-old";open(my $w,">",$p) or die $!;print $w "original";'
+                    '$w->flush() or die $!;$w->sync() or die $!;close($w) or die $!;'
+                    'open(my $f,"<",$p) or die $!;my $ino=(stat($f))[1];'
+                    'rename($p,"/afs/fd-moved") or die $!;'
+                    'open(my $n,">",$p) or die $!;print $n "replacement";close($n) or die $!;'
+                    'local $/;my $v=<$f>;die "old fd changed" unless $v eq "original";'
+                    'unlink("/afs/fd-moved") or die $!;seek($f,0,0) or die $!;'
+                    'die "unlinked fd changed" unless <$f> eq "original";'
+                    'die "old inode changed" unless (stat($f))[1]==$ino;'
+                    'close($f) or die $!;unlink($p) or die $!;',
+                ))
+                passed('namespace-identity')
+                lengths = []
+                for length in (65537, 7, 131073, 0):
+                    data = bytes(i % 251 for i in range(length))
+                    command(left, perl(
+                        'my $p=shift;my $n=shift;my $d=join("",map {chr($_%251)} (0..$n-1));'
+                        'open(my $f,">",$p) or die $!;binmode($f);print $f $d or die $!;'
+                        '$f->flush() or die $!;$f->sync() or die $!;close($f) or die $!;',
+                        '/afs/size-change', length,
+                    ))
+                    actual = right.files.read('/afs/size-change', format='bytes')
+                    assert actual == data, (length, len(actual))
+                    lengths.append({'bytes': length, 'sha256': hashlib.sha256(actual).hexdigest()})
+                report['truncation_versions'] = lengths
+                right.files.remove('/afs/size-change')
+                passed('truncate-visibility')
             other = create('B', uid=10001)
             denied(other, '/afs/published.bin', 13, uid=10001)
             other.kill()

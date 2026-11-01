@@ -22,6 +22,9 @@ from pathlib import Path
 _afs_spec = importlib.util.spec_from_file_location('afs_handoff', Path(__file__).with_name('afs_handoff.py'))
 afs_handoff = importlib.util.module_from_spec(_afs_spec)
 _afs_spec.loader.exec_module(afs_handoff)
+_contract_spec = importlib.util.spec_from_file_location('afs_contracts', Path(__file__).with_name('afs_contracts.py'))
+afs_contracts = importlib.util.module_from_spec(_contract_spec)
+_contract_spec.loader.exec_module(afs_contracts)
 
 BASIC = ('sdk', 'auth', 'capacity', 'placement', 'local-first')
 STANDARD = (
