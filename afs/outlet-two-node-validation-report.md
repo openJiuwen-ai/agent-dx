@@ -316,9 +316,11 @@ test321          -> imports/node-b/users/root-74657374333231-e3
 5. **build-info 缓存事故**：commit 变更后 cargo 未重跑 build.rs，
   `--build-info` 报告旧 commit。发现于 checksum 变化而 commit 不变；
   修复为 `cargo:rerun-if-env-changed`（be657ecb）。
-6. **`/public` 是单点拓扑**：outlet 镜像只部署在 B 上，A 没有镜像也没有
-  `/public`。跨节点批量操作必须在运行镜像的节点上经 `/public` 执行——
-  在 A 上 glob `/public/root-*` 会拿到字面目录名并把 400 份拷进一个目录。
+6. **早期只在一端部署镜像，导致跨节点操作踩坑**：第一至四轮只在 B 上
+  启用 outlet，A 没有 `/public`，于是在 A 上 glob `/public/root-*` 拿到的是
+  字面目录名，把 400 份配置拷进了同一个目录。第五轮改为**两端各自发布**
+  后此问题消失。结论：**每台需要读该名字视图的节点都应启用镜像**，不要
+  依赖单一节点代劳。
 7. **每个 home 都必须出现在 `imports/<node>/users`**：B 自己的 workspace
   的 symlink 指向 `imports/node-b/users/...`，漏挂时全部断链（spec §5.2
   的部署要求，容易只挂远端漏本机）。本机用 `mount --bind` 补挂即恢复。
@@ -346,10 +348,15 @@ test321          -> imports/node-b/users/root-74657374333231-e3
 
 ## 边界声明
 
-- 两轮合计：24 个 spec 用例中 **10 个在真机完整验证**（TC1/2/4/5/7/9/13/19/21/22/23），
-  6 个由单元测试覆盖（TC10/11/15/16/17/18），TC24 以日志代替指标，
-  其余需容器层/故障注入/部署脚本（T5）。
-- 这是**两节点、单 workspace、NFSv4.1 over TCP** 的功能验证，
+- 八轮累计：24 个 spec 用例中 **10 个在真机完整验证**
+  （TC1/2/4/5/7/9/13/19/21/22/23），6 个由单元测试覆盖
+  （TC10/11/15/16/17/18），TC24 以日志代替指标，其余需容器层 /
+  故障注入 / 部署脚本（T5）。
+- **仍未覆盖**：TC6（A 宕机，需故障注入）、TC12（容器 provisioning
+  层的启动门禁）、TC14（整棵 `/public` 挂入容器的违约现象）。
+- 规模：功能验证单 workspace 起步，第三轮扩到 401 个 workspace 验证
+  并发建号与多 root 回收；第七轮在该规模上做了性能计时。
+- 这是**两节点、NFSv4.1 over TCP** 的功能与规模验证，
   **不是**多 VM 压测、HA 或故障注入证明。
 - `softerr`/`actimeo` 组合未在弱网下测试；换代替换、ghost 隔离、
   挂载漂移告警仅在单元测试覆盖，未在真机复现。
