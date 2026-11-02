@@ -195,7 +195,7 @@ token 输入上限为 16 KiB，密钥及登记内容各为 64 KiB。显式密钥
 
 | 能力 | 当前处理 |
 | --- | --- |
-| 业务启动与就绪检查、路由可达保证 | Agent 模板把 `readiness_probe` 透传到 Platform；Jiuwen SFS 模板以 3 秒初始延迟、3 秒周期和 2 秒单次超时探测 TCP 18092，30 秒初始化期限内成功后才发布 Running 和绑定路由。AgentServer 在内部 Runtime warming 前即监听，因此该配置只保证前端端口可连接；业务请求仍使用现有 warming、失败及超时事件，周期 healthcheck 尚未接入模板 |
+| 业务启动与就绪检查、路由可达保证 | Agent 模板把 `readiness_probe` 透传到 Platform；Jiuwen SFS 模板以 0 秒初始延迟、3 秒周期和 2 秒单次超时探测 TCP 18092，30 秒初始化期限内成功后才发布 Running 和绑定路由。AgentServer 在内部 Runtime warming 前即监听，因此该配置只保证前端端口可连接；业务请求仍使用现有 warming、失败及超时事件，周期 healthcheck 尚未接入模板 |
 | 部署侧 runtime profile 与启动配置 | Platform 已有能力；本轮接通 Agent/Gateway 创建映射，覆盖独立及嵌入式 Activator，验证业务镜像和进程配置；仅额外包含用户授权的 Execd 启动锁修复，超出现有契约的能力另列待完善 |
 | 挂载、数据持久化与恢复 | 明确历史、文件、资产登记和密钥的位置及实际保留范围；稳定 ID 不代表 Environment 重建后数据可恢复，不承诺尚未验证的恢复能力 |
 | verified 底层读取增强 | 本轮不改 Execd 文件读取；保留用户归属、token 与资产登记校验，接受并明确记录符号链接及检查/打开竞争差异，不以此单独阻塞下载功能验收 |
