@@ -779,8 +779,33 @@ impl RootManager {
                     "conflicting local catalog record already exists",
                 ));
             }
-            self.remove_abandoned_dir(&record.data_dir)?;
-            self.catalog.remove_prepared_root(record)?;
+            // The current reservation was verified under the workspace lock.
+            // Three cases for an obsolete generation:
+            //
+            //  * empty  -> delete it and drop the record; the rebuild is clean.
+            //  * non-empty but already retired -> a reader is still using it on
+            //    another node (H11). Leave both the directory and its record;
+            //    `persist_prepared_root` supersedes the stale epoch, and the
+            //    reclaim sweep clears them once the grace window allows.
+            //  * non-empty and not retired -> nobody owns this payload, so
+            //    refuse rather than silently drop it.
+            match self.remove_abandoned_dir(&record.data_dir) {
+                Ok(()) => {
+                    self.catalog.clear_retired(&record.data_dir).unwrap_or(());
+                    self.catalog.remove_prepared_root(record)?;
+                }
+                Err(error) if error.code() == afs_error::IO_DIRECTORY_NOT_EMPTY => {
+                    let retired = self
+                        .catalog
+                        .scan_retired()?
+                        .into_iter()
+                        .any(|(dir, _)| dir == record.data_dir);
+                    if !retired {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
             local_record = None;
         }
         if let Some(record) = local_record {

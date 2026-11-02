@@ -636,9 +636,9 @@ impl State {
                     node_id: node_id.clone(),
                 })
             }
-            MetaRead::CurrentNodeSessions
-            | MetaRead::RootState { .. }
-            | MetaRead::ActiveRoots => None,
+            MetaRead::CurrentNodeSessions | MetaRead::RootState { .. } | MetaRead::ActiveRoots => {
+                None
+            }
             MetaRead::Root { root_id } => state.entities.get(&MetaKey::Root {
                 root_id: root_id.clone(),
             }),

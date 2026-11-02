@@ -8217,6 +8217,7 @@ mod outlet_active_roots_tests {
                     grpc_addr: "g".into(),
                     data_addr: "d".into(),
                     rest_addr: "r".into(),
+                    ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(300),
                 },
@@ -8256,6 +8257,8 @@ mod outlet_active_roots_tests {
                     session_id: reservation.home_session_id.clone(),
                     create_intent_id: reservation.create_intent_id.clone(),
                     prepare_token: reservation.prepare_token.clone(),
+                    requester_node_id: reservation.home_node_id.clone(),
+                    requester_session_id: reservation.home_session_id.clone(),
                 },
             })
             .await
@@ -8414,6 +8417,7 @@ mod outlet_digest_tests {
                     grpc_addr: "g".into(),
                     data_addr: "d".into(),
                     rest_addr: "r".into(),
+                    ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(300),
                 },
@@ -8461,6 +8465,8 @@ mod outlet_digest_tests {
                     session_id: reservation.home_session_id.clone(),
                     create_intent_id: reservation.create_intent_id.clone(),
                     prepare_token: reservation.prepare_token.clone(),
+                    requester_node_id: reservation.home_node_id.clone(),
+                    requester_session_id: reservation.home_session_id.clone(),
                 },
             })
             .await
@@ -8529,6 +8535,7 @@ mod outlet_digest_tests {
                     grpc_addr: "g2".into(),
                     data_addr: "d2".into(),
                     rest_addr: "r2".into(),
+                    ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(300),
                 },
@@ -8593,6 +8600,7 @@ mod outlet_digest_tests {
                     grpc_addr: "g".into(),
                     data_addr: "d".into(),
                     rest_addr: "r".into(),
+                    ownerfs_enabled: true,
                     storage_devices: Vec::new(),
                     lease_ttl: Duration::from_secs(300),
                 },
