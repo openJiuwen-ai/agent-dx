@@ -224,6 +224,21 @@ NFS 客户端的 fd 本身不会让 `rmdir` 失败（客户端句柄在服务端
 （329KB 数据在千兆链路上不足 3ms）。NFS 挂载为 `vers=4.1, rsize/wsize=1M,
 actimeo=2, softerr`，延迟来自协议往返与属性同步，而非传输量。
 
+### 隔离测试：outlet 层开销可忽略
+
+为区分「outlet 名字层」与「NFS 本身」的成本，对同一个 A-homed 目录做三条
+路径的对照（每项 5 次，取中位数，源树 30 文件 / 329KB）：
+
+| 路径 | 耗时样本（ms） | 中位数 |
+|---|---|---|
+| NFS 直连（`imports/node-a/users/root-…`，不经 symlink） | 87, 81, 89, 84, 83 | **84 ms** |
+| 经 `/public` symlink | 82, 78, 84, 86, 80 | **82 ms** |
+| 本地磁盘（对照） | 1, 1, 2, 1, 1 | **1 ms** |
+
+**`/public` 的 symlink 开销在噪声范围内**（82 vs 84ms）。symlink 只解析
+一次，之后由内核 dentry 缓存承接，因此 outlet 名字层不构成额外成本——
+批量写入的耗时就是 NFS 的原始耗时。
+
 ### 结论与建议
 
 - outlet 名字层本身开销可忽略：发布 200 个 root 一轮完成，`/public` 解析
