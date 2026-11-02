@@ -168,7 +168,7 @@ class Component:
                 tempfile.TemporaryDirectory(prefix='adx-afs-inputs-') as temp:
             inputs = Path(temp)
             for name in ('afs-meta', 'afs-node'):
-                self.copy_from(ROLES['M'], '/opt/adx/package/bin/' + name, inputs / name)
+                self.copy_from(ROLES['M'], str(Path('/opt/adx/package/bin') / name), inputs / name)
                 (inputs / name).chmod(0o755)
             self.copy_from(ROLES['M'], '/opt/adx/e2e/afs-tests/inputs/artifact-identity.json',
                            inputs / 'artifact-identity.json', timeout=60)
@@ -176,7 +176,7 @@ class Component:
                 contract_dir = inputs / 'contracts'
                 contract_dir.mkdir()
                 for name in ('fuse_contract', 'manifest.json'):
-                    self.copy_from(ROLES['M'], '/opt/adx/e2e/afs-contracts/' + name, contract_dir / name)
+                    self.copy_from(ROLES['M'], str(Path('/opt/adx/e2e/afs-contracts') / name), contract_dir / name)
                 contract_spec = importlib.util.spec_from_file_location('component_contracts',
                                                                      ROOT / 'build/e2e/afs_contracts.py')
                 contracts = importlib.util.module_from_spec(contract_spec)

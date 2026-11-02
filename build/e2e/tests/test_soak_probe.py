@@ -39,6 +39,7 @@ class SoakStorageProbe(unittest.TestCase):
             root = Path(temporary)
             (root / 'retired.log').write_bytes(b'x')
             original = Path.lstat
+
             def disappearing(path):
                 if path.name == 'retired.log':
                     raise FileNotFoundError(str(path))

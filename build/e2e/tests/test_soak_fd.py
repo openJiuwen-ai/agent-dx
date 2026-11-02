@@ -15,7 +15,7 @@ def module():
 def observed(count=0, mode='dfs'):
     census = {'scope': 'afs-fd-census-v1', 'comm': 'afs-node', 'pid': 2, 'start_ticks': 100,
               'cache_root': {'path': '/owned/chunks', 'device': 9, 'inode': 2} if mode == 'dfs' else None,
-              'entries': [{'fd': i, 'target': '/owned/chunks/' + str(i), 'device': 9,
+              'entries': [{'fd': i, 'target': str(Path('/owned/chunks') / str(i)), 'device': 9,
                            'inode': i + 10, 'kind': stat.S_IFREG} for i in range(count)]}
     process = {'pid': 2, 'start_ticks': 100, 'fds': count, 'fd_census': census}
     return {'processes': {'afs-node:2': process}, 'anchor_runtime': None, 'fds': count}
@@ -65,7 +65,7 @@ class FdAccounting(unittest.TestCase):
             fd.attach(value, 'dfs')
         # Eligible cache handles are intentional. Convert them to noncache targets.
         for entry in changed['processes']['afs-node:2']['fd_census']['entries']:
-            entry['target'] = '/outside/' + str(entry['fd'])
+            entry['target'] = str(Path('/outside') / str(entry['fd']))
         fd.attach(changed, 'dfs')
         with self.assertRaisesRegex(ValueError, 'process.*peak'):
             fd.verify(changed, initial, 'dfs', 128)

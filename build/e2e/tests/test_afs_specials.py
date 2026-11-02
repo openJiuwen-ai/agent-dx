@@ -85,6 +85,7 @@ class SpecialContracts(unittest.TestCase):
 
     def test_native_campaign_requires_an_explicit_cleanup_receipt(self):
         suite = load('special_suite_cleanup', HERE / 'kubernetes/targeted_suite.py')
+
         def execute(case, command, _log, _timeout, _deadline):
             path = Path(command[-1])
             path.mkdir()
@@ -104,8 +105,12 @@ class SpecialContracts(unittest.TestCase):
         sdk = load('special_explicit_delete', HERE / 'afs_special_sdk.py')
         records = {'environment:a': {}, 'environment:b': {}}
         environment = Mock()
-        environment.delete.side_effect = lambda identity, **_kw: records.pop('environment:' + identity)
-        sdk._cleanup(None, {'instances': {'A': 'a', 'B': 'b'}}, environment, lambda: records)
+
+        def delete_record(identity, **_kw):
+            return records.pop('environment:' + identity)
+
+        environment.delete.side_effect = delete_record
+        sdk.cleanup_environments(None, {'instances': {'A': 'a', 'B': 'b'}}, environment, lambda: records)
         self.assertEqual(environment.delete.call_count, 2)
         environment.kill.assert_not_called()
         self.assertEqual(records, {})
@@ -120,7 +125,7 @@ class SpecialContracts(unittest.TestCase):
         helpers.command, helpers.perl = Mock(), Mock()
         with patch.dict(sys.modules, {'adx_environment': module, 'afs_sdk': helpers}):
             with self.assertRaisesRegex(RuntimeError, 'second attach'):
-                sdk._pressure_worker(None, {'A': 'a', 'B': 'b'}, 0)
+                sdk.pressure_worker(None, {'A': 'a', 'B': 'b'}, 0)
         first.close.assert_called_once()
 
     def test_pressure_corruption_is_not_retried_or_counted_as_success(self):
@@ -134,7 +139,7 @@ class SpecialContracts(unittest.TestCase):
         helpers.command, helpers.perl = Mock(), Mock()
         with patch.dict(sys.modules, {'adx_environment': module, 'afs_sdk': helpers}):
             with self.assertRaisesRegex(AssertionError, 'content mismatch'):
-                sdk._pressure_worker(None, {'A': 'a', 'B': 'b'}, 0)
+                sdk.pressure_worker(None, {'A': 'a', 'B': 'b'}, 0)
         second.files.read.assert_called_once()
         first.close.assert_called_once()
         second.close.assert_called_once()
@@ -146,7 +151,7 @@ class SpecialContracts(unittest.TestCase):
             path.write_text(json.dumps({'owner': 'other', 'mode': 'dfs', 'special': 'restart',
                                         'instances': {'A': 'do-not-delete'}}))
             with self.assertRaisesRegex(ValueError, 'different run'):
-                sdk._owned_state({'owner': 'mine', 'mode': 'dfs', 'special': 'restart'}, path)
+                sdk.owned_state({'owner': 'mine', 'mode': 'dfs', 'special': 'restart'}, path)
 
     def test_partial_sdk_creation_deletes_the_created_environment(self):
         sdk = load('special_partial_creation', HERE / 'afs_special_sdk.py')
@@ -169,11 +174,22 @@ class SpecialContracts(unittest.TestCase):
         module, helpers, node = ModuleType('adx_environment'), ModuleType('afs_sdk'), ModuleType('node')
         module.Environment, module.Mount = Environment, Mock()
         module.__file__ = '/opt/adx/client/lib/python3.12/site-packages/adx_environment/__init__.py'
-        helpers.perl = lambda code, *_args, **_kwargs: code
-        helpers.command = lambda _handle, code: ('10000' if 'print $>' in code else (
-            '1 0 0:1 / /afs rw - ext4 /dev/x rw' if code.startswith('cat ') else '1 2'))
+
+        def perl(code, *_args, **_kwargs):
+            return code
+
+        def command(_handle, code):
+            if 'print $>' in code:
+                return '10000'
+            return '1 0 0:1 / /afs rw - ext4 /dev/x rw' if code.startswith('cat ') else '1 2'
+
+        def catalog():
+            return records
+
+        helpers.perl = perl
+        helpers.command = command
         helpers.write_synced = Mock()
-        node.catalog = lambda: records
+        node.catalog = catalog
         with tempfile.TemporaryDirectory() as directory, \
                 patch.dict(sys.modules, {'adx_environment': module, 'afs_sdk': helpers, 'node': node}), \
                 patch.object(sdk.importlib.metadata, 'version', return_value='candidate'):

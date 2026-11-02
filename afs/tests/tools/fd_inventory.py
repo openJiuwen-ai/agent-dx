@@ -2,6 +2,8 @@
 
 import argparse
 import json
+import logging
+import sys
 import os
 from pathlib import Path
 import stat
@@ -76,6 +78,7 @@ def census(pid, cache_root=None):
     """Retry a racing FD table at most three times; PID replacement always fails."""
     integer(pid, 2)
     process = Path('/proc') / str(pid)
+
     def identity():
         return int((process / 'stat').read_text().rsplit(')', 1)[1].split()[19])
 
@@ -117,7 +120,8 @@ def main():
     parser.add_argument('--pid', required=True, type=int)
     parser.add_argument('--cache-root')
     args = parser.parse_args()
-    print(json.dumps(census(args.pid, args.cache_root)))
+    logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stdout, force=True)
+    logging.info('%s', json.dumps(census(args.pid, args.cache_root)))
 
 
 if __name__ == '__main__':

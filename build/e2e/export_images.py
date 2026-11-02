@@ -4,6 +4,8 @@ import argparse
 import gzip
 import hashlib
 import json
+import logging
+import sys
 from pathlib import Path
 import re
 import shutil
@@ -61,7 +63,8 @@ def main():
               'archive': {'name': archive.name, 'bytes': archive.stat().st_size, 'sha256': sha(archive)},
               'scope': 'derived offline image transport; original bundle and product bytes unchanged'}
     (args.output / 'image-export.json').write_text(json.dumps(result, indent=2) + '\n')
-    print(json.dumps(result), flush=True)
+    logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stdout, force=True)
+    logging.info('%s', json.dumps(result))
 
 
 if __name__ == '__main__':

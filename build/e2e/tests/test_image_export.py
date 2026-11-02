@@ -6,6 +6,7 @@ SPEC = importlib.util.spec_from_file_location('fixed_export', Path(__file__).res
 EXPORT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(EXPORT)
 
+
 class ImageExportTests(unittest.TestCase):
     def test_exact_image_id_architecture_and_registry_digest_are_all_required(self):
         ref = 'registry.example/image@sha256:' + 'a' * 64

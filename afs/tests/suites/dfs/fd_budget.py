@@ -20,7 +20,7 @@ for index in range(int(sys.argv[2]),int(sys.argv[3])):
  try:
   os.posix_fadvise(fd,0,0,os.POSIX_FADV_DONTNEED)
   with os.fdopen(os.dup(fd),'rb') as stream:got=stream.read()
-  assert got==data,(index,len(got))
+  if got != data:raise AssertionError((index,len(got)))
  finally:os.close(fd)
 print(json.dumps({'cycles':int(sys.argv[3])-int(sys.argv[2]),'bytes_per_cycle':16384}))
 '''
@@ -31,7 +31,7 @@ for _ in range(100):
  try:
   os.posix_fadvise(fd,0,0,os.POSIX_FADV_DONTNEED)
   with os.fdopen(os.dup(fd),'rb') as stream:got=stream.read()
-  assert got==expected
+  if got != expected:raise AssertionError('same-object content changed')
  finally:os.close(fd)
 '''
 
@@ -39,36 +39,54 @@ for _ in range(100):
 def local_probes(text):
     values = [float(line.rsplit(' ', 1)[1]) for line in text.splitlines()
               if line.startswith('afs_dfs_read_checks_total{stage="local_probe"} ')]
-    if len(values) != 1 or not math.isfinite(values[0]) or values[0] < 0 or not values[0].is_integer():
+    if (len(values) != 1
+            or not math.isfinite(values[0])
+            or values[0] < 0):
+        raise AssertionError('one exact nonnegative local-probe counter is required')
+    if (not values[0].is_integer()):
         raise AssertionError('one exact nonnegative local-probe counter is required')
     return int(values[0])
 
 
 def validate(observations, probes_before, probes_after):
     """Use raw FD device/inode identities, never just the reported total curve."""
-    assert len(observations) == 8, 'baseline, six batches and same-object checkpoint required'
+    if not (len(observations) == 8):
+        raise AssertionError('baseline, six batches and same-object checkpoint required')
     initial = observations[0]['nodes']
     tables = []
     for index, row in enumerate(observations):
-        assert set(row['nodes']) == {'A', 'B'}
+        if not (set(row['nodes']) == {'A', 'B'}):
+            raise AssertionError('required test condition failed')
         for role, census in row['nodes'].items():
-            assert all(census[key] == initial[role][key] for key in ('pid', 'start_ticks', 'cache_root'))
+            if not (all(census[key] == initial[role][key] for key in ('pid', 'start_ticks', 'cache_root'))):
+                raise AssertionError('required test condition failed')
             fd_inventory.classify(census, CAPACITY)
         table = fd_inventory.classify(row['nodes']['A'], CAPACITY)
         tables.append(table)
-        assert table['duplicates'] == table['excess'] == 0, 'duplicate or excess physical chunk FD'
-        assert table['noncache'] <= tables[0]['noncache'] + 4, 'non-cache FD growth during closed checkpoints'
-        assert fd_inventory.classify(row['nodes']['B'], CAPACITY)['eligible'] == 0
+        if not (table['duplicates'] == table['excess'] == 0):
+            raise AssertionError('duplicate or excess physical chunk FD')
+        if not (table['noncache'] <= tables[0]['noncache'] + 4):
+            raise AssertionError('non-cache FD growth during closed checkpoints')
+        if not (fd_inventory.classify(row['nodes']['B'], CAPACITY)['eligible'] == 0):
+            raise AssertionError('required test condition failed')
         if 1 <= index <= 6:
-            assert row['verified_cycles'] == index * BATCH
-            assert table['eligible'] == min(index * BATCH, CAPACITY), 'reader cache did not reach its declared bound'
+            if not (row['verified_cycles'] == index * BATCH):
+                raise AssertionError('required test condition failed')
+            if not (table['eligible'] == min(index * BATCH, CAPACITY)):
+                raise AssertionError('reader cache did not reach its declared bound')
     sets = [set(row['targets']) for row in tables[1:7]]
-    assert len(set.union(*sets)) == CYCLES, 'different content did not exercise distinct physical readers'
-    assert not sets[0] & sets[-1], 'oldest readers were retained'
-    assert all(len(sets[i] - sets[i + 1]) == BATCH for i in range(1, 5)), 'eviction did not release old descriptors'
-    assert tables[-1]['targets'] == tables[-2]['targets'], 'same-object reuse changed cached FD ownership'
-    assert tables[-1]['noncache'] <= tables[-2]['noncache'] + 4, 'same-object reads accumulated other FDs'
-    assert probes_after - probes_before >= CYCLES + 100, 'kernel cache hid the AFS read path'
+    if not (len(set.union(*sets)) == CYCLES):
+        raise AssertionError('different content did not exercise distinct physical readers')
+    if not (not sets[0] & sets[-1]):
+        raise AssertionError('oldest readers were retained')
+    if not (all(len(sets[i] - sets[i + 1]) == BATCH for i in range(1, 5))):
+        raise AssertionError('eviction did not release old descriptors')
+    if not (tables[-1]['targets'] == tables[-2]['targets']):
+        raise AssertionError('same-object reuse changed cached FD ownership')
+    if not (tables[-1]['noncache'] <= tables[-2]['noncache'] + 4):
+        raise AssertionError('same-object reads accumulated other FDs')
+    if not (probes_after - probes_before >= CYCLES + 100):
+        raise AssertionError('kernel cache hid the AFS read path')
     return {'capacity': CAPACITY, 'verified_cycles': CYCLES, 'bytes_per_cycle': 16384,
             'local_probe_growth': probes_after - probes_before,
             'chunk_fd_counts': [row['eligible'] for row in tables[1:7]],
@@ -78,27 +96,31 @@ def validate(observations, probes_before, probes_after):
 
 def run(cluster):
     observations = []
+
     def observe(verified_cycles):
         nodes = {}
         for role in ('A', 'B'):
             state = cluster.channel(role).call('status')[role]
-            assert state['returncode'] is None, 'owned AFS Node is not running'
+            if state['returncode'] is not None:
+                raise AssertionError('owned AFS Node is not running')
+            cache_root = str(Path(cluster.role_dir(role)) / 'state' / 'dfs' / 'chunks')
             result = cluster.command(role, ['python3', '-c', PROBE, '--pid', str(state['pid']),
-                                          '--cache-root', cluster.role_dir(role) + '/state/dfs/chunks'])
+                                          '--cache-root', cache_root])
             nodes[role] = json.loads(result['stdout'])
         value = {'verified_cycles': verified_cycles, 'nodes': nodes}
         observations.append(value)
         write_json(cluster.output / 'fd-observations.json', observations)
         cluster.record('fd.checkpoint.' + str(len(observations)),
-                       {'cycles': verified_cycles, 'A': fd_inventory.classify(nodes['A'], CAPACITY),
-                        'B': fd_inventory.classify(nodes['B'], CAPACITY)})
+                       {'cycles': verified_cycles, 'A': fd_inventory.classify(nodes.get('A'), CAPACITY),
+                        'B': fd_inventory.classify(nodes.get('B'), CAPACITY)})
     before = cluster.health('A', '/metrics')
     (cluster.output / 'fd-metrics-before.txt').write_text(before)
     observe(0)
-    path = cluster.workspace('A') + '/reader-fd-budget.bin'
+    path = str(Path(cluster.workspace('A')) / 'reader-fd-budget.bin')
     for end in range(BATCH, CYCLES + 1, BATCH):
         result = cluster.python('A', PUBLISH, path, str(end - BATCH), str(end), timeout=180)
-        assert json.loads(result['stdout']) == {'cycles': BATCH, 'bytes_per_cycle': 16384}
+        if not (json.loads(result['stdout']) == {'cycles': BATCH, 'bytes_per_cycle': 16384}):
+            raise AssertionError('required test condition failed')
         observe(end)
     cluster.python('A', REUSE, path, timeout=60)
     observe(CYCLES)

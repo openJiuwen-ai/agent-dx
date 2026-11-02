@@ -203,18 +203,20 @@ def run_suite(
                 errors.append(f'{case}: driver result and process exit disagree')
                 stopped = True
         child_cases = child.get('cases', []) if child else []
-        if native and child and child.get('status') == 'passed' and (
-                child.get('required_checks') != list(expected_checks[case])
-                or len(child_cases) != len(expected_checks[case])
-                or {v.get('name') for v in child_cases} != set(expected_checks[case])
-                or any(v.get('status') != 'passed' for v in child_cases)):
-            if case in checks:
-                checks.remove(case)
-            if case not in failed_cases:
-                failed_cases.append(case)
-            passed = False
-            stopped = True
-            errors.append(f'{case}: required child case records missing or failed')
+        if native and child and child.get('status') == 'passed':
+            required = list(expected_checks[case])
+            malformed = child.get('required_checks') != required or len(child_cases) != len(required)
+            if not malformed:
+                malformed = ({v.get('name') for v in child_cases} != set(required)
+                             or any(v.get('status') != 'passed' for v in child_cases))
+            if malformed:
+                if case in checks:
+                    checks.remove(case)
+                if case not in failed_cases:
+                    failed_cases.append(case)
+                passed = False
+                stopped = True
+                errors.append(f'{case}: required child case records missing or failed')
         child_case = child_cases[0] if child_cases else {}
         record = {
             'name': case,
@@ -288,7 +290,11 @@ def main(default_deployment='kubernetes'):
     if native:
         if not args.image_export or not args.artifact_commit:
             parser.error('local-docker requires --image-export and --artifact-commit')
-        if args.kubeconfig or args.context or args.node_name or args.registry_auth:
+        if (args.kubeconfig
+                or args.context
+                or args.node_name):
+            parser.error('local-docker does not consume Kubernetes or registry credentials')
+        if (args.registry_auth):
             parser.error('local-docker does not consume Kubernetes or registry credentials')
     elif args.kubeconfig is None:
         parser.error('--kubeconfig is required for Kubernetes')

@@ -1,6 +1,7 @@
 """FD classification must not disguise duplicates, deleted files or foreign paths."""
 from copy import deepcopy
 import stat
+from pathlib import Path
 import unittest
 
 from tools import fd_inventory
@@ -9,7 +10,7 @@ from tools import fd_inventory
 def snapshot(count=0):
     return {'scope': 'afs-fd-census-v1', 'pid': 20, 'start_ticks': 100, 'comm': 'afs-node',
             'cache_root': {'path': '/owned/dfs/chunks', 'device': 9, 'inode': 2},
-            'entries': [{'fd': i + 3, 'target': '/owned/dfs/chunks/c-' + str(i),
+            'entries': [{'fd': i + 3, 'target': str(Path('/owned/dfs/chunks') / f'c-{i}'),
                          'kind': stat.S_IFREG, 'device': 9, 'inode': i + 10} for i in range(count)]}
 
 

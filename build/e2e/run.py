@@ -226,6 +226,8 @@ class Run:
         self.command_lock = threading.Lock()
         self.redactions = set()
         self.case_results = []
+        self.registry = None
+        self.image_archive = None
 
     def event(self, message):
         print(time.strftime('%H:%M:%S', time.gmtime()) + ' ' + self.redact(message), flush=True)
@@ -449,7 +451,8 @@ class Run:
     def load_images(self, _manifest, bundle):
         self.docker('load', '-i', bundle / 'images.tar', timeout=600)
 
-    def container_args(self, _node):
+    @staticmethod
+    def container_args(_node):
         return []
 
     def before_setup(self, _manifest, _bundle, _secrets):

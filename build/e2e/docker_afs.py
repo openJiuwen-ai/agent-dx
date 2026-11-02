@@ -8,7 +8,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[2]
 KUBE = ROOT / 'build/e2e/kubernetes'
 if str(KUBE) not in sys.path:
-    sys.path.insert(0, str(KUBE))
+    sys.path.append(str(KUBE))
 
 
 def load(name, path):

@@ -1,6 +1,9 @@
 """Cache resource regressions require real progress, distinct objects and retirement."""
 from copy import deepcopy
 import unittest
+import subprocess
+import sys
+from pathlib import Path
 
 from fixtures.common import discover, select
 from suites.dfs.fd_budget import validate
@@ -12,7 +15,7 @@ def observations():
     for end in [0, 128, 256, 384, 512, 640, 768, 768]:
         value = snapshot()
         for index in range(max(0, end - 256), end):
-            value['entries'].append({'fd': index + 3, 'target': '/owned/dfs/chunks/c-' + str(index),
+            value['entries'].append({'fd': index + 3, 'target': str(Path('/owned/dfs/chunks') / f'c-{index}'),
                                      'kind': 32768, 'device': 9, 'inode': index + 10})
         result.append({'verified_cycles': end, 'nodes': {'A': value, 'B': snapshot()}})
     return result
@@ -43,3 +46,21 @@ class ReaderFdBudgetContracts(unittest.TestCase):
                 values.pop(2)
             with self.subTest(modify=modify), self.assertRaises(AssertionError):
                 validate(values, 0, probes)
+
+
+class OptimizedReaderValidation(unittest.TestCase):
+    def test_incomplete_backend_reads_fail_with_python_optimization(self):
+        code = """
+from suites.dfs.fd_budget import validate
+from test_fd_budget import observations
+try:
+    validate(observations(), 0, 767)
+except AssertionError:
+    print('REJECTED')
+else:
+    print('ACCEPTED')
+"""
+        paths = [str(Path(__file__).resolve().parents[1]), str(Path(__file__).resolve().parent)]
+        program = 'import sys;sys.path.extend(' + repr(paths) + ');' + code
+        result = subprocess.run([sys.executable, '-O', '-c', program], capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout.strip(), 'REJECTED')

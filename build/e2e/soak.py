@@ -33,18 +33,32 @@ def validate_options(options):
 def validate_workload(report, seconds):
     counts = report.get('operations', {})
     elapsed = report.get('elapsed_seconds')
-    if (report.get('status') != 'passed' or report.get('reason') != 'duration-complete'
-            or report.get('injected_failure_after_cycles', 0) != 0
-            or report.get('requested_seconds') != seconds
-            or not isinstance(elapsed, (int, float)) or isinstance(elapsed, bool)
-            or not math.isfinite(elapsed) or elapsed < seconds
-            or report.get('cycles', 0) < 2 or report.get('errors') != [] or report.get('cleanup_errors') != []
-            or report.get('remaining') != [] or set(report.get('instances', {})) != {'A', 'B'}
-            or len(set(report['instances'].values())) != 2
-            or any(not isinstance(counts.get(n), int) or isinstance(counts[n], bool) for n in
-                   ('command', 'file', 'create', 'delete'))
-            or any(counts.get(n, 0) < 2 for n in ('command', 'file'))
-            or counts.get('create', 0) < 3 or counts.get('create') != counts.get('delete')):
+    if (report.get('status') != 'passed'
+            or report.get('reason') != 'duration-complete'
+            or report.get('injected_failure_after_cycles', 0) != 0):
+        raise ValueError('continuous workload duration/work/counts/cleanup incomplete')
+    if (report.get('requested_seconds') != seconds
+            or not isinstance(elapsed, (int, float))
+            or isinstance(elapsed, bool)):
+        raise ValueError('continuous workload duration/work/counts/cleanup incomplete')
+    if (not math.isfinite(elapsed)
+            or elapsed < seconds
+            or report.get('cycles', 0) < 2):
+        raise ValueError('continuous workload duration/work/counts/cleanup incomplete')
+    if (report.get('errors') != []
+            or report.get('cleanup_errors') != []
+            or report.get('remaining') != []):
+        raise ValueError('continuous workload duration/work/counts/cleanup incomplete')
+    if (set(report.get('instances', {})) != {'A', 'B'}
+            or len(set(report['instances'].values())) != 2):
+        raise ValueError('continuous workload duration/work/counts/cleanup incomplete')
+    for name in ('command', 'file', 'create', 'delete'):
+        value = counts.get(name)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError('continuous workload duration/work/counts/cleanup incomplete')
+    if (any(counts.get(n, 0) < 2 for n in ('command', 'file'))
+            or counts.get('create', 0) < 3
+            or counts.get('create') != counts.get('delete')):
         raise ValueError('continuous workload duration/work/counts/cleanup incomplete')
 
 
@@ -71,8 +85,11 @@ def validate_samples(samples, limits, interval, *, baseline=None, require_progre
             for field in ('memory_bytes', 'disk_bytes', 'fds', 'mounts', 'free_bytes'):
                 metric = fd_metric if field == 'fds' else field
                 value = observed.get(metric)
-                if (not isinstance(value, (int, float)) or isinstance(value, bool)
-                        or not math.isfinite(value) or value < 0):
+                if (not isinstance(value, (int, float))
+                        or isinstance(value, bool)
+                        or not math.isfinite(value)):
+                    raise ValueError('invalid resource counter: ' + field)
+                if (value < 0):
                     raise ValueError('invalid resource counter: ' + field)
                 if field != 'free_bytes' and value - initial[metric] > limits[field]:
                     raise ValueError(node + ' resource growth exceeded: ' + field)
@@ -89,8 +106,10 @@ def validate_samples(samples, limits, interval, *, baseline=None, require_progre
 
 def cgroup_resources(path):
     stat = dict(line.split() for line in (path / 'memory.stat').read_text().splitlines())
-    events = {key: int(value) for key, value in
-              (line.split() for line in (path / 'memory.events').read_text().splitlines())}
+    events = {}
+    for line in (path / 'memory.events').read_text().splitlines():
+        key, value = line.split()
+        events[key] = int(value)
     return {'bytes': int((path / 'memory.current').read_text()), 'anon_bytes': int(stat['anon']),
             'file_bytes': int(stat['file']), 'events': events, 'path': str(path)}
 
@@ -161,7 +180,7 @@ def scenarios(run, checks, options, limits, policy=None):
     if policy:
         (run.output / 'soak-contract.json').write_bytes(acceptance.CONTRACT_PATH.read_bytes())
     product.sdk({'mode': 'warm'}, run.output / 'afs-sdk-warm.json')
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'afs/tests'))
+    sys.path.append(str(Path(__file__).resolve().parents[2] / 'afs/tests'))
     try:
         from fixtures.common import Case
         from fixtures.multivm import Cluster
@@ -190,7 +209,7 @@ def scenarios(run, checks, options, limits, policy=None):
             try:
                 cluster.prepare()
                 fd_roots = ({'mode': mode, **({
-                    node: cluster.role_dir(role) + '/state/dfs/chunks'
+                    node: str(Path(cluster.role_dir(role)) / 'state' / 'dfs' / 'chunks')
                     for node, role in (('node1', 'A'), ('node2', 'B'))} if mode == 'dfs' else {})}
                     if policy else None)
                 peer_before = peer_counter(cluster, 'B') if mode == 'dfs' else None
@@ -211,7 +230,8 @@ def scenarios(run, checks, options, limits, policy=None):
                     'p=subprocess.Popen(["/opt/adx/client/bin/python","-B","/opt/adx/e2e/soak_sdk.py",'
                     '"--input",str(d/"input.json")],stdin=subprocess.DEVNULL,stdout=f,stderr=subprocess.STDOUT,'
                     'start_new_session=True);'
-                    'v={"pid":p.pid,"start_ticks":int(Path(f"/proc/{p.pid}/stat").read_text().rsplit(")",1)[1].split()[19])};'
+                    'pstat=Path("/proc")/str(p.pid)/"stat";'
+                    'v={"pid":p.pid,"start_ticks":int(pstat.read_text().rsplit(")",1)[1].split()[19])};'
                     '(d/"worker.json").write_text(json.dumps(v));print(json.dumps(v))')
                 receipt = json.loads(raw)
                 # Preparation and bounded final SDK call have separate reserves, never counted as load duration.
@@ -358,8 +378,11 @@ def main(argv=None):
         if policy:
             expected = {key: policy['peak_growth'][key] for key in limits if key != 'min_free_bytes'}
             expected['min_free_bytes'] = policy['min_free_bytes']
-            if (options['seconds'] != policy['seconds'] or options['sample_seconds'] != policy['sample_seconds']
-                    or options['fail_after_cycles'] != 0 or limits != expected):
+            if (options['seconds'] != policy['seconds']
+                    or options['sample_seconds'] != policy['sample_seconds']
+                    or options['fail_after_cycles'] != 0):
+                raise ValueError('one-hour acceptance requires the exact frozen duration, sampling and resource bounds')
+            if (limits != expected):
                 raise ValueError('one-hour acceptance requires the exact frozen duration, sampling and resource bounds')
     except ValueError as exc:
         parser.error(str(exc))

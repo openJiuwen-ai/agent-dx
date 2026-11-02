@@ -1,6 +1,7 @@
 """Frozen one-hour acceptance must reject gaps, resource drift, OOM and partial work."""
 
 from copy import deepcopy
+from builtins import SystemExit as CliExit
 from functools import lru_cache
 import importlib.util
 from pathlib import Path
@@ -24,8 +25,8 @@ def module():
 def census(count, cached=0):
     return {'scope': 'afs-fd-census-v1', 'comm': 'afs-node', 'pid': 2, 'start_ticks': 100,
             'cache_root': {'path': '/owned/chunks', 'device': 9, 'inode': 2},
-            'entries': [{'fd': i, 'target': ('/owned/chunks/' if i >= count-cached else '/outside/') + str(i),
-                         'device': 9, 'inode': i+10, 'kind': stat.S_IFREG} for i in range(count)]}
+            'entries': [{'fd': i, 'target': str(Path('/owned/chunks' if i >= count - cached else '/outside') / str(i)),
+                         'device': 9, 'inode': i + 10, 'kind': stat.S_IFREG} for i in range(count)]}
 
 
 def change_fds(node, noncache=0, cached=0):
@@ -47,8 +48,8 @@ def samples():
                                         'runtime_disk_bytes', 'runtime_backing_bytes', 'rss_bytes'), 1024**2)
             nodes[name].update(fds=10, mounts=10, free_bytes=8 * 1024**3, container_id=name,
                                storage_scope='allocated-backing-fs-v2',
-                               memory_cgroup='/docker/' + name,
-                               runtime_cgroup='/runtime/' + name if name != 'afs-m' else None,
+                               memory_cgroup=str(Path('/docker') / name),
+                               runtime_cgroup=str(Path('/runtime') / name) if name != 'afs-m' else None,
                                runtime_disk_present=name != 'afs-m',
                                memory_events={'oom': 0, 'oom_kill': 0},
                                runtime_memory_events={'oom': 0, 'oom_kill': 0},
@@ -163,12 +164,12 @@ class FormalSoakContracts(unittest.TestCase):
         cli = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cli)
         arguments = [value for name in ('bundle', 'registry-images', 'image-export', 'artifact-commit', 'output')
-                     for value in ('--' + name, '/fixed/' + name)]
+                     for value in ('--' + name, str(Path('/fixed') / name))]
         arguments += ['--mode', 'ownerfs', '--acceptance', 'one-hour']
         for extra in (['--seconds', '60'], ['--seconds', '3600', '--sample-seconds', '5'],
                       ['--seconds', '3600', '--max-fd-growth', '129'],
                       ['--seconds', '3600', '--qualify-fail-after-cycles', '3']):
-            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(CliExit):
                 cli.main(arguments + extra)
         with patch.object(cli.docker_run.common, 'main', return_value=7):
             self.assertEqual(cli.main(arguments + ['--seconds', '3600']), 7)
@@ -237,7 +238,7 @@ class FormalSoakContracts(unittest.TestCase):
         policy = module()
         values = samples()
         for value in values:
-            change_fds(value['nodes']['node1'], cached=min(256, value['elapsed_seconds']//10))
+            change_fds(value['nodes']['node1'], cached=min(256, value['elapsed_seconds'] // 10))
         result = policy.evaluate(values, self.work(), 'dfs', policy.contract())
         self.assertGreater(result['trends']['node1']['raw_fds_diagnostic']['end_delta'], 4)
         self.assertEqual(result['trends']['node1']['fds']['end_delta'], 0)
@@ -257,7 +258,7 @@ class FormalSoakContracts(unittest.TestCase):
         policy = module()
         values = samples()
         for value in values:
-            change_fds(value['nodes']['node1'], noncache=value['elapsed_seconds']//10)
+            change_fds(value['nodes']['node1'], noncache=value['elapsed_seconds'] // 10)
             for node in ('node1', 'node2'):
                 item = value['nodes'][node]
                 item['processes']['afs-node:2']['fd_census']['cache_root'] = None

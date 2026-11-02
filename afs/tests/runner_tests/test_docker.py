@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 TESTS = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(TESTS))
+sys.path.append(str(TESTS))
 
 
 class DockerTransportTests(unittest.TestCase):

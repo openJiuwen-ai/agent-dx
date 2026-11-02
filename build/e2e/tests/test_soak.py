@@ -38,6 +38,7 @@ class SoakContracts(unittest.TestCase):
     def test_missing_samples_and_growth_cannot_be_reported_as_qualified(self):
         value = module()
         limits = {'memory_bytes': 100, 'disk_bytes': 100, 'fds': 2, 'mounts': 1, 'min_free_bytes': 100}
+
         def sample(memory=10, elapsed=0, cycles=1):
             return {'elapsed_seconds': elapsed, 'cycles': cycles, 'nodes': {
                 n: {'memory_bytes': memory, 'disk_bytes': 10, 'fds': 2, 'mounts': 1, 'free_bytes': 1000,

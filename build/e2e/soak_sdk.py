@@ -9,7 +9,7 @@ import signal
 import threading
 import time
 
-from afs_special_sdk import CONFIRMED, _cleanup, _save, run_phase
+from afs_special_sdk import CONFIRMED, cleanup_environments, save_json, run_phase
 from afs_sdk import command, perl
 from mixed_soak import exercise, verify_assignment
 PAYLOAD_STAGE = '/tmp/afs-soak-input'
@@ -59,16 +59,16 @@ def run(connection, image, config, directory, stop):
 
     def publish():
         report['elapsed_seconds'] = round(time.monotonic() - started, 6) if started is not None else 0
-        _save(progress, report)
+        save_json(progress, report)
 
     def one(environment, marker):
         exercise(environment, marker)
-        environment.files.remove('/tmp/adx-soak-' + marker + '.bin')
+        environment.files.remove(str(Path('/tmp') / f'adx-soak-{marker}.bin'))
         for name in ('command', 'file'):
             report['operations'][name] += 1
 
     def delete(identity):
-        _cleanup(connection, {'instances': {'owned': identity}}, Environment, catalog)
+        cleanup_environments(connection, {'instances': {'owned': identity}}, Environment, catalog)
         report['operations']['delete'] += 1
         owned.pop(identity)
 
@@ -109,7 +109,7 @@ def run(connection, image, config, directory, stop):
                                         idle_timeout=0, create_timeout=150, connection=connection)
                 # Journal the ID before any assertion or work on the new Environment.
                 owned[transient.id] = True
-                _save(directory / 'owned.json', {'owner': config['owner'], 'instances': list(owned)})
+                save_json(directory / 'owned.json', {'owner': config['owner'], 'instances': list(owned)})
                 try:
                     verify_assignment(transient.id, node, catalog)
                     report['operations']['create'] += 1
@@ -154,7 +154,7 @@ def run(connection, image, config, directory, stop):
         report['remaining'] = list(owned)
         if report['cleanup_errors'] or report['remaining']:
             report['status'] = 'failed'
-        _save(directory / 'workload.json', report)
+        save_json(directory / 'workload.json', report)
     return report
 
 
@@ -179,7 +179,7 @@ def main():
         report = run(connection, (secrets / 'image').read_text().strip(), config, directory, stop)
         code = 0 if report['status'] == 'passed' else 1
     finally:
-        _save(directory / 'ended.json', {'owner': config['owner'], 'exit_code': code, 'pid': os.getpid()})
+        save_json(directory / 'ended.json', {'owner': config['owner'], 'exit_code': code, 'pid': os.getpid()})
     return code
 
 

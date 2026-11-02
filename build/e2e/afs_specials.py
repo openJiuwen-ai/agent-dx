@@ -27,16 +27,25 @@ SDK_CHECKS = {
 
 def validate_sdk(report, mode, special):
     cases = report.get('cases', [])
-    if (report.get('status') != 'passed' or report.get('mode') != mode or report.get('special') != special
-            or report.get('cleanup_errors') or len(cases) != len(SDK_CHECKS[special])
-            or {c.get('id') for c in cases} != set(SDK_CHECKS[special])
-            or any(c.get('status') != 'passed' for c in cases)):
+    if (report.get('status') != 'passed'
+            or report.get('mode') != mode
+            or report.get('special') != special):
+        raise ValueError('special SDK assertions or normal cleanup are incomplete')
+    if (report.get('cleanup_errors')
+            or len(cases) != len(SDK_CHECKS[special])
+            or {c.get('id') for c in cases} != set(SDK_CHECKS[special])):
+        raise ValueError('special SDK assertions or normal cleanup are incomplete')
+    if (any(c.get('status') != 'passed' for c in cases)):
         raise ValueError('special SDK assertions or normal cleanup are incomplete')
     if mode == 'dfs':
         peer = report.get('peer_reads', {})
         values = (peer.get('before'), peer.get('after'))
-        if (any(not isinstance(v, (int, float)) or isinstance(v, bool) or not math.isfinite(v) or v < 0
-                for v in values) or values[1] <= values[0]):
+        for value in values:
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError('DFS special did not prove the remote peer read path')
+            if not math.isfinite(value) or value < 0:
+                raise ValueError('DFS special did not prove the remote peer read path')
+        if values[1] <= values[0]:
             raise ValueError('DFS special did not prove the remote peer read path')
     if special == 'pressure':
         p = report.get('pressure', {})
@@ -49,16 +58,26 @@ def validate_sdk(report, mode, special):
         if set(restart) != {'node1', 'node2'}:
             raise ValueError('both Adxlet restart identities required')
         for value in restart.values():
-            if (not isinstance(value.get('before_pid'), int) or value['before_pid'] <= 1
-                    or not isinstance(value.get('after_pid'), int) or value['after_pid'] <= 1
-                    or value['before_pid'] == value['after_pid'] or not value.get('before_session')
-                    or not value.get('after_session') or value['before_session'] == value['after_session']
-                    or not value.get('before_backend') or value['before_backend'] != value.get('after_backend')):
+            if (not isinstance(value.get('before_pid'), int)
+                    or value['before_pid'] <= 1
+                    or not isinstance(value.get('after_pid'), int)):
+                raise ValueError('Adxlet process/session did not change or its live backend was replaced')
+            if (value['after_pid'] <= 1
+                    or value['before_pid'] == value['after_pid']
+                    or not value.get('before_session')):
+                raise ValueError('Adxlet process/session did not change or its live backend was replaced')
+            if (not value.get('after_session')
+                    or value['before_session'] == value['after_session']
+                    or not value.get('before_backend')):
+                raise ValueError('Adxlet process/session did not change or its live backend was replaced')
+            if (value['before_backend'] != value.get('after_backend')):
                 raise ValueError('Adxlet process/session did not change or its live backend was replaced')
         workload = report.get('workload', {})
-        if (workload.get('paused_state') != 'T' or workload.get('paused_pid') != restart['node2']['before_pid']
-                or workload.get('before_restart', 0) < 1
-                or workload.get('at_ready', -1) < workload.get('before_restart', 0)
+        if (workload.get('paused_state') != 'T'
+                or workload.get('paused_pid') != restart['node2']['before_pid']
+                or workload.get('before_restart', 0) < 1):
+            raise ValueError('SDK-launched mounted workload did not progress during pause and after restart')
+        if (workload.get('at_ready', -1) < workload.get('before_restart', 0)
                 or workload.get('after_restart', 0) <= workload.get('at_ready', 0)):
             raise ValueError('SDK-launched mounted workload did not progress during pause and after restart')
 
@@ -66,7 +85,8 @@ def validate_sdk(report, mode, special):
 def _phase(product, config, phase, output):
     run = product.run
     prefix = 'afs-special-' + config['special'] + '-' + config['mode']
-    remote_input, remote_output = '/evidence/' + prefix + '-input.json', '/evidence/' + prefix + '-' + phase + '.json'
+    remote_input = str(Path('/evidence') / f'{prefix}-input.json')
+    remote_output = str(Path('/evidence') / f'{prefix}-{phase}.json')
     run.execute('node1', 'python3', '-c',
                 'from pathlib import Path;import sys;Path(sys.argv[1]).write_text(sys.argv[2])',
                 remote_input, json.dumps(config))
@@ -83,7 +103,7 @@ def _progress(cluster, minimum):
     while True:
         result = cluster.python('B',
             'from pathlib import Path\np=Path(sys.argv[1]);print(p.read_text() if p.exists() else "0")',
-            cluster.workspace('B') + '/pk2-progress')
+            str(Path(cluster.workspace('B')) / 'pk2-progress'))
         value = int(result['stdout'])
         if value > minimum:
             return value
@@ -137,7 +157,7 @@ def scenarios(product, checks, special):
     run = product.run
     product.sdk({'mode': 'warm'}, run.output / 'afs-sdk-warm.json')
     path = str(ROOT / 'afs/tests')
-    sys.path.insert(0, path)
+    sys.path.append(path)
     try:
         from fixtures.common import Case
         from fixtures.multivm import Cluster
@@ -146,7 +166,7 @@ def scenarios(product, checks, special):
             inputs = Path(temporary)
             for name in ('afs-meta', 'afs-node', 'artifact-identity.json'):
                 base = '/opt/adx/e2e/afs-tests/inputs/' if name.endswith('.json') else '/opt/adx/package/bin/'
-                product.copy_from('node1', base + name, inputs / name)
+                product.copy_from('node1', str(Path(base) / name), inputs / name)
                 if not name.endswith('.json'):
                     (inputs / name).chmod(0o755)
             for mode in ('ownerfs', 'dfs'):
@@ -175,9 +195,9 @@ def scenarios(product, checks, special):
                         report['instances'] = prepared['instances']
                         if special == 'restart':
                             report['restart'], report['workload'] = _restart(product, cluster)
-                            report['cases'] += [{'id': n, 'status': 'passed'} for n in (
-                                'workload-during-control-pause', 'adxlet-session-changed',
-                                'backend-identity-preserved')]
+                            for name in ('workload-during-control-pause', 'adxlet-session-changed',
+                                         'backend-identity-preserved'):
+                                report['cases'].append({'id': name, 'status': 'passed'})
                             report['cases'] += _phase(product, config, 'verify', output)['cases']
                         else:
                             pressure = _phase(product, config, 'pressure', output)

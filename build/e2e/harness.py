@@ -13,11 +13,13 @@ _spec = importlib.util.spec_from_file_location("harness_handoff", ROOT / "build/
 afs_handoff = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(afs_handoff)
 
+
 def _executable(name):
     value = shutil.which(name)
     if value is None:
         raise FileNotFoundError(name)
     return os.path.abspath(value)
+
 
 def source_commit():
     commit = os.getenv('ADX_E2E_HARNESS_COMMIT', os.getenv('BUILDKITE_COMMIT'))

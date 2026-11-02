@@ -24,8 +24,11 @@ def contract_sha():
 
 
 def number(value, label):
-    if (not isinstance(value, (int, float)) or isinstance(value, bool)
-            or not math.isfinite(value) or value < 0):
+    if (not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)):
+        raise ValueError('missing/invalid acceptance counter: ' + label)
+    if (value < 0):
         raise ValueError('missing/invalid acceptance counter: ' + label)
     return value
 
@@ -106,25 +109,39 @@ def evaluate(samples, work, mode, policy):
     """Every required window and raw sample participates; never select best intervals."""
     counts = work.get('operations', {})
     cycles = number(work.get('cycles'), 'cycles')
-    if (work.get('status') != 'passed' or work.get('reason') != 'duration-complete'
-            or work.get('qualification_only') is not False or work.get('requested_seconds') != policy['seconds']
-            or number(work.get('elapsed_seconds'), 'duration') < policy['seconds']
-            or not isinstance(cycles, int) or cycles < policy['minimum_total_cycles']
-            or work.get('verified_bytes') != cycles * 16384
-            or work.get('contract_sha256') != contract_sha()
-            or work.get('payload_transport') != policy['measurement']['payload_transport']
-            or not 0 < number(work.get('maximum_publish_command_bytes'), 'control command bytes') <= 2048
-            or work.get('errors') != [] or work.get('cleanup_errors') != [] or work.get('remaining') != []
-            or work.get('injected_failure_after_cycles') != 0
-            or number(counts.get('create'), 'create') - 2 < policy['minimum_total_churn']
-            or counts.get('create') != counts.get('delete')
-            or counts.get('command') != cycles + counts['create'] - 2
-            or counts.get('file') != counts.get('command')):
+    if (work.get('status') != 'passed'
+            or work.get('reason') != 'duration-complete'
+            or work.get('qualification_only') is not False):
         raise ValueError('one-hour workload duration/content/counts/error/cleanup contract incomplete')
-    if (len(samples) < 2 or samples[0]['elapsed_seconds'] > policy['maximum_boundary_gap_seconds']
-            or samples[-1]['elapsed_seconds'] < policy['seconds']
-            or samples[-1]['elapsed_seconds'] != work['elapsed_seconds']
-            or samples[-1]['cycles'] != cycles or samples[-1].get('operations') != counts):
+    if (work.get('requested_seconds') != policy['seconds']
+            or number(work.get('elapsed_seconds'), 'duration') < policy['seconds']
+            or not isinstance(cycles, int)):
+        raise ValueError('one-hour workload duration/content/counts/error/cleanup contract incomplete')
+    if (cycles < policy['minimum_total_cycles']
+            or work.get('verified_bytes') != cycles * 16384
+            or work.get('contract_sha256') != contract_sha()):
+        raise ValueError('one-hour workload duration/content/counts/error/cleanup contract incomplete')
+    if (work.get('payload_transport') != policy['measurement']['payload_transport']
+            or not 0 < number(work.get('maximum_publish_command_bytes'), 'control command bytes') <= 2048
+            or work.get('errors') != []):
+        raise ValueError('one-hour workload duration/content/counts/error/cleanup contract incomplete')
+    if (work.get('cleanup_errors') != []
+            or work.get('remaining') != []
+            or work.get('injected_failure_after_cycles') != 0):
+        raise ValueError('one-hour workload duration/content/counts/error/cleanup contract incomplete')
+    if (number(counts.get('create'), 'create') - 2 < policy['minimum_total_churn']
+            or counts.get('create') != counts.get('delete')
+            or counts.get('command') != cycles + counts['create'] - 2):
+        raise ValueError('one-hour workload duration/content/counts/error/cleanup contract incomplete')
+    if (counts.get('file') != counts.get('command')):
+        raise ValueError('one-hour workload duration/content/counts/error/cleanup contract incomplete')
+    if (len(samples) < 2
+            or samples[0]['elapsed_seconds'] > policy['maximum_boundary_gap_seconds']
+            or samples[-1]['elapsed_seconds'] < policy['seconds']):
+        raise ValueError('one-hour resource coverage incomplete')
+    if (samples[-1]['elapsed_seconds'] != work['elapsed_seconds']
+            or samples[-1]['cycles'] != cycles
+            or samples[-1].get('operations') != counts):
         raise ValueError('one-hour resource coverage incomplete')
     baseline = samples[0]
     last_progress_time = baseline['observed_monotonic_seconds']
@@ -199,8 +216,8 @@ def evaluate(samples, work, mode, policy):
         center = statistics.mean(times)
         trends[node]['raw_fds_diagnostic'] = {
             'window_medians': raw, 'end_delta': raw[-1] - raw[0],
-            'slope_per_hour': sum((x-center)*(y-statistics.mean(raw)) for x,y in zip(times,raw))
-                / sum((x-center)**2 for x in times) * 3600, 'gated': False}
+            'slope_per_hour': sum((x - center) * (y - statistics.mean(raw)) for x, y in zip(times,raw))
+                / sum((x - center)**2 for x in times) * 3600, 'gated': False}
         if node != 'afs-m':
             trends[node]['anchor_runtime_rss'] = trend(
                 times, [w['anchors'][node]['rss_bytes'] for w in windows],

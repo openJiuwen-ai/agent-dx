@@ -6,17 +6,21 @@ import re
 
 ROOT = Path(__file__).resolve().parents[2]
 
+
 def load(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
+
 afs_handoff = load('candidate_handoff', ROOT / 'build/e2e/afs_handoff.py')
 afs_contracts = load('candidate_contracts', ROOT / 'build/e2e/afs_contracts.py')
 
+
 def sha(path):
     return afs_handoff.sha(path)
+
 
 def validate_identity(package, architecture, commit, ci):
     expected = {'x86_64-unknown-linux-gnu': 'amd64', 'aarch64-unknown-linux-gnu': 'arm64'}.get(package['target'])
@@ -24,6 +28,7 @@ def validate_identity(package, architecture, commit, ci):
         raise ValueError('runtime architecture differs from package')
     if ci and (package['dirty'] or package['commit'] != commit):
         raise ValueError('CI package is dirty or from another commit')
+
 
 def identity(bundle, registry, commit=None, ci=False):
     m = json.loads(bundle.read_text())

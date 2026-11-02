@@ -5,6 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import importlib.metadata
 import json
+import logging
+import sys
 import os
 from pathlib import Path
 import time
@@ -29,13 +31,13 @@ WORKER = (
 )
 
 
-def _save(path, value):
+def save_json(path, value):
     temporary = path.with_suffix('.tmp')
     temporary.write_text(json.dumps(value, indent=2) + '\n')
     temporary.replace(path)
 
 
-def _owned_state(config, path):
+def owned_state(config, path):
     if not path.exists():
         return {'owner': config['owner'], 'mode': config['mode'], 'special': config['special'], 'instances': {}}
     state = json.loads(path.read_text())
@@ -47,7 +49,7 @@ def _owned_state(config, path):
     return state
 
 
-def _cleanup(connection, state, environment, catalog):
+def cleanup_environments(connection, state, environment, catalog):
     """from_id handles are detached: kill() must never stand in for explicit delete()."""
     for identity in reversed(list(state['instances'].values())):
         if 'environment:' + identity in catalog():
@@ -62,7 +64,7 @@ def _cleanup(connection, state, environment, catalog):
         time.sleep(0.1)
 
 
-def _pressure_worker(connection, instances, worker):
+def pressure_worker(connection, instances, worker):
     from adx_environment import Environment
     from afs_sdk import command, perl
     handles = []
@@ -98,11 +100,12 @@ def run_phase(connection, image, config, phase, state_path, output):
         raise ValueError('special requires the installed candidate SDK')
     if phase == 'prepare' and state_path.exists():
         raise ValueError('special prepare state already exists; refusing replay')
-    state = _owned_state(config, state_path)
+    state = owned_state(config, state_path)
     report = {'status': 'failed', 'phase': phase, 'mode': config['mode'], 'special': config['special'],
               'cases': [], 'cleanup_errors': [], 'sdk_source': adx_environment.__file__,
               'sdk_version': importlib.metadata.version('adx-environment')}
     handles = []
+
     def passed(name):
         report['cases'].append({'id': name, 'status': 'passed'})
     try:
@@ -117,29 +120,34 @@ def run_phase(connection, image, config, phase, state_path, output):
                     }
                 except Exception as exc:
                     report['background_diagnostic'] = {'unavailable': str(exc)}
-            _cleanup(connection, state, Environment, catalog)
+            cleanup_environments(connection, state, Environment, catalog)
             passed('environment-cleanup')
         elif phase == 'prepare':
-            _save(state_path, state)
+            save_json(state_path, state)
             for role in ('A', 'B'):
                 handle = Environment(image=image, runtime='runc', node_id='node1' if role == 'A' else 'node2',
                                      cpu=250, memory=128, idle_timeout=0, create_timeout=150, connection=connection,
                                      mounts=[Mount(target='/afs', host_path=config['paths'][role], options=('rw',))])
                 handles.append(handle)
                 state['instances'][role] = handle.id
-                _save(state_path, state)
+                save_json(state_path, state)
                 assignment = json.loads(catalog()['environment:' + handle.id])['assignment']['node_id']
-                assert assignment == ('node1' if role == 'A' else 'node2')
-                assert command(handle, perl('print $>;')).strip() == '10000'
+                if not (assignment == ('node1' if role == 'A' else 'node2')):
+                    raise AssertionError('required test condition failed')
+                if not (command(handle, perl('print $>;')).strip() == '10000'):
+                    raise AssertionError('required test condition failed')
                 actual = command(handle, perl('my @s=stat("/afs");die $! unless @s;print "$s[0] $s[1]";'))
-                assert [int(v) for v in actual.split()] == config['identities'][role]
+                if not ([int(v) for v in actual.split()] == config['identities'][role]):
+                    raise AssertionError('required test condition failed')
                 mounts = [line for line in command(handle, 'cat /proc/self/mountinfo').splitlines()
                           if line.split()[4] == '/afs']
                 expected = 'ext4' if config['mode'] == 'ownerfs' and role == 'A' else 'fuse'
-                assert len(mounts) == 1 and mounts[0].split(' - ', 1)[1].split()[0] == expected, mounts
+                if not (len(mounts) == 1 and mounts[0].split(' - ', 1)[1].split()[0] == expected):
+                    raise AssertionError(mounts)
             passed('mount-identity')
             write_synced(handles[0], '/afs/confirmed', CONFIRMED)
-            assert handles[1].files.read('/afs/confirmed', format='bytes') == CONFIRMED
+            if not (handles[1].files.read('/afs/confirmed', format='bytes') == CONFIRMED):
+                raise AssertionError('required test condition failed')
             if config['special'] == 'restart':
                 passed('confirmed-before-restart')
                 handles[1].commands.run(perl(WORKER), background=True, timeout=180, command_id=WORKER_ID)
@@ -162,22 +170,27 @@ def run_phase(connection, image, config, phase, state_path, output):
                 for role in ('A', 'B'):
                     handles.append(Environment.from_id(state['instances'][role], connection=connection))
                 result = handles[1].commands.get(WORKER_ID).wait(timeout=30)
-                assert result.exit_code == 0 and result.stdout.startswith('MOUNTED_IO_OK '), (
-                    result.exit_code, result.stdout, result.stderr)
+                if not (result.exit_code == 0 and result.stdout.startswith('MOUNTED_IO_OK ')):
+                    raise AssertionError((
+                    result.exit_code, result.stdout, result.stderr))
                 for handle in handles:
-                    assert handle.files.read('/afs/confirmed', format='bytes') == CONFIRMED
-                    assert handle.files.read('/afs/during', format='bytes') == CONFIRMED
+                    if not (handle.files.read('/afs/confirmed', format='bytes') == CONFIRMED):
+                        raise AssertionError('required test condition failed')
+                    if not (handle.files.read('/afs/during', format='bytes') == CONFIRMED):
+                        raise AssertionError('required test condition failed')
                 passed('confirmed-after-restart')
                 after = b'after-restart\x00\xff' * 512
                 write_synced(handles[1], '/afs/after-restart', after)
-                assert handles[0].files.read('/afs/after-restart', format='bytes') == after
+                if not (handles[0].files.read('/afs/after-restart', format='bytes') == after):
+                    raise AssertionError('required test condition failed')
                 passed('publish-after-restart')
                 report['background_exit_code'] = result.exit_code
             elif phase == 'pressure':
                 with ThreadPoolExecutor(max_workers=4) as pool:
-                    futures = [pool.submit(_pressure_worker, connection, state['instances'], n) for n in range(4)]
+                    futures = [pool.submit(pressure_worker, connection, state['instances'], n) for n in range(4)]
                     results = [item for future in futures for item in future.result()]
-                assert len(results) == 32
+                if not (len(results) == 32):
+                    raise AssertionError('required test condition failed')
                 passed('bounded-concurrent-publish')
                 handle = Environment.from_id(state['instances']['A'], connection=connection)
                 handles.append(handle)
@@ -187,10 +200,12 @@ def run_phase(connection, image, config, phase, state_path, output):
                     'my $ok=sysopen(my $b,$p,O_WRONLY|O_CREAT|O_EXCL,0600);my $e=0+$!;'
                     'die "exclusive create unexpectedly succeeded" if $ok;'
                     'die "wrong errno $e" unless $e==17;unlink($p) or die $!;print $e;'))
-                assert errno.strip() == '17'
+                if not (errno.strip() == '17'):
+                    raise AssertionError('required test condition failed')
                 passed('exclusive-create-error')
                 verified = sum(v['bytes'] for v in results)
-                assert verified == 4 * 8 * 65536
+                if not (verified == 4 * 8 * 65536):
+                    raise AssertionError('required test condition failed')
                 report['pressure'] = {'workers': 4, 'operations': len(results), 'payload_bytes': 65536,
                                       'verified_bytes': verified, 'exclusive_errno': int(errno), 'errors': [],
                                       'files': results, 'capacity_exhaustion_claimed': False,
@@ -203,7 +218,7 @@ def run_phase(connection, image, config, phase, state_path, output):
         report['error'] = f'{type(exc).__name__}: {exc}'
         if phase == 'prepare':
             try:
-                _cleanup(connection, state, Environment, catalog)
+                cleanup_environments(connection, state, Environment, catalog)
             except Exception as error:
                 report['cleanup_errors'].append(str(error))
     finally:
@@ -215,7 +230,7 @@ def run_phase(connection, image, config, phase, state_path, output):
         report['instances'] = state['instances']
         if report['cleanup_errors']:
             report['status'] = 'failed'
-        _save(output, report)
+        save_json(output, report)
     return report
 
 
@@ -235,7 +250,8 @@ def main():
                                   use_tls=True, verify_tls=True)
     state = Path('/evidence') / ('afs-special-' + config['special'] + '-' + config['mode'] + '-state.json')
     report = run_phase(connection, (secrets / 'image').read_text().strip(), config, args.phase, state, args.output)
-    print(json.dumps(report), flush=True)
+    logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stdout, force=True)
+    logging.info('%s', json.dumps(report))
     return 0 if report['status'] == 'passed' else 1
 
 

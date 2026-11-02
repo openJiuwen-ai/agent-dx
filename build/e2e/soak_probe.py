@@ -3,6 +3,8 @@
 import argparse
 import importlib.util
 import json
+import logging
+import sys
 import os
 from pathlib import Path
 import shutil
@@ -33,6 +35,7 @@ def backing_storage(directory, mounts):
     device = directory.stat().st_dev
     excluded = {path for path in mounts if path.startswith(str(directory) + '/')}
     total, seen = 0, set()
+
     def fail(error):
         if not isinstance(error, FileNotFoundError):
             raise error
@@ -90,8 +93,12 @@ def anchor_runtime(environment_id):
     if len(identities) != 1:
         raise ValueError('anchor must have exactly one physical backend')
     state = json.loads(command(['runc', '--root', P / 'sandboxd/runc', 'state', identities[0]], timeout=5))
-    if (state.get('id') != identities[0] or state.get('status') != 'running'
-            or not isinstance(state.get('pid'), int) or isinstance(state['pid'], bool) or state['pid'] <= 1):
+    if (state.get('id') != identities[0]
+            or state.get('status') != 'running'
+            or not isinstance(state.get('pid'), int)):
+        raise ValueError('anchor runc identity is not running')
+    if (isinstance(state['pid'], bool)
+            or state['pid'] <= 1):
         raise ValueError('anchor runc identity is not running')
     return dict(process_info(state['pid']), runtime_id=identities[0], environment_id=environment_id)
 
@@ -166,4 +173,5 @@ if __name__ == '__main__':
     args = parser.parse_args()
     if args.cache_root and args.mode != 'dfs':
         parser.error('cache root is valid only for DFS')
-    print(json.dumps(observe(args.environment_id, mode=args.mode, cache_root=args.cache_root)))
+    logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stdout, force=True)
+    logging.info('%s', json.dumps(observe(args.environment_id, mode=args.mode, cache_root=args.cache_root)))
