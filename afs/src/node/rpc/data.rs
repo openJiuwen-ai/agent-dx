@@ -850,7 +850,7 @@ impl DfsReadAuthorizer for DenyDfsReadAuthorizer {
     }
 }
 
-#[cfg(feature = "dfs")]
+#[cfg(all(feature = "dfs", test))]
 pub fn make_dfs_chunks_server(
     local_chunks: Option<Arc<LocalChunkStore>>,
     authenticator: Arc<dyn PeerAuthenticator>,

@@ -399,7 +399,8 @@ impl LockTable {
         Ok(LockWaiterOutcome::Unknown)
     }
 
-    /// Compatibility wrapper for FUSE interrupts that only need errno mapping.
+    /// Test convenience wrapper; production callers use `cancel_waiter_with_outcome`.
+    #[cfg(test)]
     pub fn cancel_waiter(&self, waiter_id: LockWaiterId) -> Result<(), LockError> {
         self.cancel_waiter_with_outcome(waiter_id).map(|_| ())
     }

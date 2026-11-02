@@ -185,6 +185,7 @@ impl<'output> CompletedPeerDiskRead<'output> {
     pub fn root_digest(&self) -> &[u8; 32] {
         &self.root_digest
     }
+    #[cfg(test)]
     pub fn private_output(&self) -> &'output [u8] {
         self.output
     }
