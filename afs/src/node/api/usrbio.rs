@@ -1150,6 +1150,8 @@ pub(crate) mod tests {
         next_handle: StdMutex<u64>,
         /// 记录后端实际收到的同步屏障，用来断言 SDK 没有把 DataOnly 悄悄降级成 Full 或反之。
         last_sync: StdMutex<Option<types::SyncMode>>,
+        /// 记录句柄生命周期调用（flush / release），用来固定 SDK close 的现状语义。
+        handle_calls: StdMutex<Vec<&'static str>>,
     }
 
     impl MemoryBackend {
@@ -1161,6 +1163,7 @@ pub(crate) mod tests {
                 handles: StdMutex::new(HashMap::new()),
                 next_handle: StdMutex::new(1),
                 last_sync: StdMutex::new(None),
+                handle_calls: StdMutex::new(Vec::new()),
             }
         }
 
@@ -1297,7 +1300,19 @@ pub(crate) mod tests {
             Ok(())
         }
 
+        fn flush(&self, _ctx: &types::RequestContext, _handle: FileHandle) -> Result<(), Error> {
+            self.handle_calls
+                .lock()
+                .expect("handle calls")
+                .push("flush");
+            Ok(())
+        }
+
         fn release(&self, _ctx: &types::RequestContext, handle: FileHandle) -> Result<(), Error> {
+            self.handle_calls
+                .lock()
+                .expect("handle calls")
+                .push("release");
             self.handles.lock().expect("handles").remove(&handle.0);
             Ok(())
         }
@@ -1443,6 +1458,24 @@ pub(crate) mod tests {
         hub.close(&handle).expect("close");
         hub.destroy_ring(ring_id).expect("destroy ring");
         hub.destroy_iov(iov_id).expect("destroy iov");
+    }
+
+    /// S0 特征测试（决策 12 将改变）：SDK 路径式 close 现在只 `release`，不 `flush`。
+    /// DFS 的 flush 才做 DataOnly 提交，所以路径式 close 后的可见性要等后台提交。
+    /// 阶段 E 按 3FS 语义补 flush 时，同一改动里把断言改成先 flush 后 release。
+    #[test]
+    fn s0_sdk_path_close_releases_without_flush_today() {
+        let backend = Arc::new(MemoryBackend::new(16));
+        let hub = UsrbioHub::new(backend.clone(), None);
+        let (handle, _) = hub
+            .open("test", "/data.bin", OpenAccess::ReadWrite)
+            .expect("open");
+        hub.close(&handle).expect("close");
+        assert_eq!(
+            *backend.handle_calls.lock().expect("handle calls"),
+            vec!["release"]
+        );
+        assert!(backend.last_sync.lock().expect("last sync").is_none());
     }
 
     #[test]
