@@ -23,6 +23,9 @@ use super::root::RootId;
 use crate::node::storage::{FileStore, LocalFs, StoragePath};
 
 const CATALOG_DIR: &str = ".ownerfs-roots";
+/// Retirement markers live in their own subdirectory so `scan_roots` (which
+/// reads every `*.json` directly under `CATALOG_DIR`) never picks them up.
+const RETIRED_DIR: &str = ".ownerfs-roots/.retired";
 const CATALOG_LOCK: &str = ".ownerfs-root-catalog.lock";
 const RECORD_VERSION: u32 = 1;
 static NEXT_TEMP_RECORD: AtomicU64 = AtomicU64::new(0);
@@ -61,6 +64,29 @@ pub trait LockedLocalRootCatalog: Send + Sync {
     /// Read one canonical root record without scanning unrelated records.
     /// Invalid durable identity or a filename/key mismatch returns an error.
     fn lookup_root(&self, id: &RootId) -> Result<Option<LocalRootRecord>>;
+
+    /// Record that a data directory was superseded and may be reclaimed after
+    /// a grace window. Idempotent: re-marking keeps the earliest time.
+    ///
+    /// Kept separate from `LocalRootRecord` because that record is keyed by
+    /// `root_id`, which a same-name rebuild reuses. The marker is keyed by the
+    /// data directory name (which carries the epoch), so a new generation
+    /// cannot overwrite the old generation's retirement time.
+    fn mark_retired(&self, data_dir: &StoragePath, retired_at_unix_ms: u64) -> Result<()> {
+        let _ = (data_dir, retired_at_unix_ms);
+        Ok(())
+    }
+
+    /// Retirement markers, as `(data_dir, retired_at_unix_ms)`.
+    fn scan_retired(&self) -> Result<Vec<(StoragePath, u64)>> {
+        Ok(Vec::new())
+    }
+
+    /// Drop a retirement marker after the directory is gone.
+    fn clear_retired(&self, data_dir: &StoragePath) -> Result<()> {
+        let _ = data_dir;
+        Ok(())
+    }
 }
 
 /// 由 OwnerFs 实现的本机持久记录接口，不属于通用 Storage。
@@ -292,6 +318,27 @@ impl LockedLocalRootCatalog for LockedLocalFsRootCatalog {
         let final_path = Self::record_path(&record.id)?;
         match self.read_record(&final_path) {
             Ok(existing) if existing == *record => return Ok(()),
+            Ok(existing) if existing.epoch != record.epoch => {
+                // 同 root_id（名字派生）但 epoch 不同的旧记录，只可能来自
+                // "已逻辑删除、目录仍待回收"（ENOTEMPTY 时保留 catalog 作为
+                // 回收凭证）或旧一代的残留。Meta 的 epoch 单调递增且永不重用，
+                // 因此较旧 epoch 的记录一定不再对应任何 active root，可以让位。
+                //
+                // 不允许让位会使该名字在旧目录被回收前无法重建；而对端句柄
+                // 可能长期不释放，等于名字永久不可用——比保留回收凭证更糟。
+                if existing.epoch > record.epoch {
+                    return Err(Error::coded(
+                        afs_error::NODE_OWNER_INVALID_GRANT,
+                        "local root record has a newer epoch than the request",
+                    ));
+                }
+                afs_logging::info!(
+                    "ownerfs.catalog_supersede_stale_record";
+                    "root_id" => ?record.id,
+                    "old_epoch" => existing.epoch,
+                    "new_epoch" => record.epoch,
+                );
+            }
             Ok(_) => {
                 return Err(Error::coded(
                     afs_error::NODE_OWNER_INVALID_GRANT,
@@ -374,6 +421,132 @@ impl LockedLocalRootCatalog for LockedLocalFsRootCatalog {
             Err(error) => Err(error),
         }
     }
+
+    fn mark_retired(&self, data_dir: &StoragePath, retired_at_unix_ms: u64) -> Result<()> {
+        let _mutation = self.mutation.lock().map_err(|_| {
+            Error::coded(
+                afs_error::NODE_OWNER_INVALID_GRANT,
+                "root catalog lock poisoned",
+            )
+        })?;
+        let dir = StoragePath::new(RETIRED_DIR).map_err(Error::from)?;
+        match self.disk.mkdir(&dir, 0o700) {
+            Ok(()) => self.disk.sync_root().map_err(Error::from)?,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(Error::from(error)),
+        }
+        let path = retired_path(data_dir)?;
+        // Keep the earliest retirement time: a repeated supersede of the same
+        // directory must not extend its life.
+        if let Ok(existing) = self.read_retired(&path)
+            && existing <= retired_at_unix_ms
+        {
+            return Ok(());
+        }
+        let wire = WireRetired {
+            version: RETIRED_VERSION,
+            data_dir: data_dir.as_path().to_string_lossy().into_owned(),
+            retired_at_unix_ms,
+        };
+        let bytes = serde_json::to_vec(&wire).map_err(catalog_encode_error)?;
+        let absolute = self.disk.root_path().join(path.as_path());
+        write_atomic(&absolute, &bytes)
+    }
+
+    fn scan_retired(&self) -> Result<Vec<(StoragePath, u64)>> {
+        let dir = StoragePath::new(RETIRED_DIR).map_err(Error::from)?;
+        let entries = match self.disk.read_dir(&dir) {
+            Ok(entries) => entries,
+            // No marker directory yet: nothing has been retired.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(Error::from(error)),
+        };
+        let mut retired = Vec::new();
+        for name in entries {
+            if !name.as_bytes().ends_with(b".json") {
+                continue;
+            }
+            let path = dir.join_component(&name).map_err(Error::from)?;
+            let absolute = self.disk.root_path().join(path.as_path());
+            let mut bytes = Vec::new();
+            File::open(&absolute)
+                .and_then(|mut file| file.read_to_end(&mut bytes))
+                .map_err(Error::from)?;
+            let wire: WireRetired = serde_json::from_slice(&bytes).map_err(catalog_decode_error)?;
+            if wire.version != RETIRED_VERSION {
+                return Err(Error::coded(
+                    afs_error::NODE_OWNER_INVALID_GRANT,
+                    "unsupported root retirement marker version",
+                ));
+            }
+            retired.push((
+                StoragePath::new(&wire.data_dir).map_err(Error::from)?,
+                wire.retired_at_unix_ms,
+            ));
+        }
+        retired.sort_by(|left, right| left.0.as_path().cmp(right.0.as_path()));
+        Ok(retired)
+    }
+
+    fn clear_retired(&self, data_dir: &StoragePath) -> Result<()> {
+        let _mutation = self.mutation.lock().map_err(|_| {
+            Error::coded(
+                afs_error::NODE_OWNER_INVALID_GRANT,
+                "root catalog lock poisoned",
+            )
+        })?;
+        let path = retired_path(data_dir)?;
+        match self.disk.remove_file(&path) {
+            Ok(()) => self.disk.sync_root().map_err(Error::from),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(Error::from(error)),
+        }
+    }
+}
+
+const RETIRED_VERSION: u32 = 1;
+
+#[derive(Deserialize, Serialize)]
+struct WireRetired {
+    version: u32,
+    data_dir: String,
+    retired_at_unix_ms: u64,
+}
+
+impl LockedLocalFsRootCatalog {
+    fn read_retired(&self, path: &StoragePath) -> Result<u64> {
+        let absolute = self.disk.root_path().join(path.as_path());
+        let mut bytes = Vec::new();
+        File::open(absolute)
+            .and_then(|mut file| file.read_to_end(&mut bytes))
+            .map_err(Error::from)?;
+        let wire: WireRetired = serde_json::from_slice(&bytes).map_err(catalog_decode_error)?;
+        Ok(wire.retired_at_unix_ms)
+    }
+}
+
+/// Marker filename derives from the data directory name, which carries the
+/// epoch — so a same-name rebuild cannot collide with the old generation.
+fn retired_path(data_dir: &StoragePath) -> Result<StoragePath> {
+    let leaf = data_dir
+        .as_path()
+        .file_name()
+        .ok_or_else(|| Error::coded(afs_error::NODE_OWNER_INVALID_GRANT, "empty data dir"))?;
+    let name = format!("{}.json", hex(leaf.as_bytes()));
+    StoragePath::new(RETIRED_DIR)
+        .and_then(|base| base.join_component(std::ffi::OsStr::new(&name)))
+        .map_err(Error::from)
+}
+
+/// Write via a temporary file and rename so a crash cannot leave a half marker.
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    let tmp = path.with_extension("tmp");
+    {
+        let mut file = File::create(&tmp).map_err(Error::from)?;
+        file.write_all(bytes).map_err(Error::from)?;
+        file.sync_all().map_err(Error::from)?;
+    }
+    fs::rename(&tmp, path).map_err(Error::from)
 }
 
 #[derive(Deserialize, Serialize)]

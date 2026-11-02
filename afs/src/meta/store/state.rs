@@ -636,7 +636,9 @@ impl State {
                     node_id: node_id.clone(),
                 })
             }
-            MetaRead::CurrentNodeSessions | MetaRead::RootState { .. } => None,
+            MetaRead::CurrentNodeSessions | MetaRead::RootState { .. } | MetaRead::ActiveRoots => {
+                None
+            }
             MetaRead::Root { root_id } => state.entities.get(&MetaKey::Root {
                 root_id: root_id.clone(),
             }),
@@ -783,6 +785,30 @@ impl State {
                     sessions
                         .into_iter()
                         .map(|(_, _, versioned)| versioned.entity)
+                        .collect(),
+                )
+            }
+            MetaRead::ActiveRoots => {
+                let mut roots = state
+                    .entities
+                    .starting_at(MetaKey::Root {
+                        root_id: String::new(),
+                    })
+                    .take_while(|(key, _)| matches!(key, MetaKey::Root { .. }))
+                    .filter_map(|(_, versioned)| match &versioned.entity {
+                        MetaEntity::Root(root) => Some((root.root_id.clone(), versioned.clone())),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                roots.sort_by(|left, right| left.0.cmp(&right.0));
+                let revision = roots
+                    .iter()
+                    .fold(state.revision, |max, (_, entity)| max.max(entity.revision));
+                (
+                    revision,
+                    roots
+                        .into_iter()
+                        .map(|(_, versioned)| versioned.entity)
                         .collect(),
                 )
             }

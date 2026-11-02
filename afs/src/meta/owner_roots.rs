@@ -22,6 +22,16 @@ pub trait OwnerRootAuthority: Send + Sync {
     fn deactivate_root(&self, input: DeactivateRootInput) -> MetaFuture<'_, ()>;
     fn lookup_root(&self, input: LookupRootInput) -> MetaFuture<'_, RootLookupState>;
     fn list_owner_roots(&self, input: ListOwnerRootsInput) -> MetaFuture<'_, ListOwnerRootsOutput>;
+    /// 全局 Active root 快照，供各节点 outlet 镜像 worker 使用。
+    ///
+    /// 与 `list_owner_roots` 的区别：后者按 home 节点过滤、同时返回待激活
+    /// reservation，服务 OwnerFs 恢复；本方法是跨节点全局视图，只返回
+    /// Active（= Root 实体存在）的 root，用于把 `/public/<name>` 映射为
+    /// 远端路径文本。调用方必须持有 live 会话（RPC 层校验）。
+    fn list_active_outlet_roots(
+        &self,
+        input: ListActiveOutletRootsInput,
+    ) -> MetaFuture<'_, ListActiveOutletRootsOutput>;
     fn acquire_root(&self, input: AcquireRootInput) -> MetaFuture<'_, RootAccessGrant>;
     fn validate_root_access(
         &self,
@@ -66,6 +76,13 @@ impl OwnerRootAuthority for MissingOwnerRootAuthority {
         &self,
         _input: ListOwnerRootsInput,
     ) -> MetaFuture<'_, ListOwnerRootsOutput> {
+        Box::pin(async { Err(unavailable_meta_store()) })
+    }
+
+    fn list_active_outlet_roots(
+        &self,
+        _input: ListActiveOutletRootsInput,
+    ) -> MetaFuture<'_, ListActiveOutletRootsOutput> {
         Box::pin(async { Err(unavailable_meta_store()) })
     }
 
@@ -658,6 +675,45 @@ impl OwnerRootAuthority for StoreOwnerRootAuthority {
         })
     }
 
+    fn list_active_outlet_roots(
+        &self,
+        input: ListActiveOutletRootsInput,
+    ) -> MetaFuture<'_, ListActiveOutletRootsOutput> {
+        Box::pin(async move {
+            let snapshot = self.store.read(MetaRead::ActiveRoots).await?;
+            let revision = snapshot.revision;
+            let mut roots = snapshot
+                .entities
+                .into_iter()
+                .filter_map(|entity| match entity {
+                    MetaEntity::Root(root) => Some(root),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            roots.sort_by(|left, right| left.root_id.cmp(&right.root_id));
+            // Digest of the answer itself, not of the log position.
+            //
+            // A global `revision` cannot serve as the cache key: every Put and
+            // Delete advances it, including DFS inode writes and GC updates, so
+            // on a cluster with DFS traffic a client would see "changed" every
+            // round and always re-fetch. Digesting the sorted
+            // (root_id, root_epoch, home_node_id) triples is scoped to exactly
+            // the state the mirror cares about and is a pure function of the
+            // answer, so it stays stable across restarts without persisting
+            // anything: recover the same roots, get the same digest.
+            let digest = active_roots_digest(&roots);
+            let unchanged = input.known_digest.is_some_and(|known| known == digest);
+            Ok(ListActiveOutletRootsOutput {
+                revision,
+                digest,
+                unchanged,
+                // `unchanged` replies carry no payload: the caller keeps its
+                // last snapshot and does not diff.
+                roots: if unchanged { Vec::new() } else { roots },
+            })
+        })
+    }
+
     fn acquire_root(&self, input: AcquireRootInput) -> MetaFuture<'_, RootAccessGrant> {
         Box::pin(async move {
             let root = self
@@ -1204,6 +1260,40 @@ pub struct ListOwnerRootsOutput {
     pub authority_revision: StoreRevision,
     pub active_roots: Vec<RootRecord>,
     pub pending_reservations: Vec<RootReservationRecord>,
+}
+
+/// 全局 Active root 快照（outlet 镜像面输入）。
+pub struct ListActiveOutletRootsOutput {
+    pub revision: StoreRevision,
+    /// Digest of the returned root set; see `active_roots_digest`.
+    pub digest: String,
+    /// True when the caller's `known_digest` matched, in which case `roots` is empty.
+    pub unchanged: bool,
+    pub roots: Vec<RootRecord>,
+}
+
+pub struct ListActiveOutletRootsInput {
+    /// Digest the caller already holds; `None` forces a full snapshot.
+    pub known_digest: Option<String>,
+}
+
+/// Stable digest of an Active root set, independent of storage internals.
+///
+/// Inputs are exactly the facts the outlet mirror publishes — identity,
+/// generation and home — so a change in any of them changes the digest, and a
+/// change in anything else (grants, sessions, DFS, commands) does not.
+///
+/// Lengths are length-prefixed so `("ab","c")` cannot collide with `("a","bc")`.
+pub(super) fn active_roots_digest(roots: &[RootRecord]) -> String {
+    let mut hasher = blake3::Hasher::new();
+    for root in roots {
+        for field in [&root.root_id, &root.home_node_id] {
+            hasher.update(&(field.len() as u64).to_le_bytes());
+            hasher.update(field.as_bytes());
+        }
+        hasher.update(&root.root_epoch.to_le_bytes());
+    }
+    hasher.finalize().to_hex()[..32].to_string()
 }
 
 pub struct AcquireRootInput {

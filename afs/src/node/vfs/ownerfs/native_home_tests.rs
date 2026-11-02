@@ -667,6 +667,64 @@ fn rmdir_root_then_recreate_same_name_succeeds() {
     assert!(second_data_dir.join("new").exists());
 }
 
+/// ENOTEMPTY 后同名重建必须仍然可用。
+///
+/// 删除时若有远端句柄（ENOTEMPTY），catalog 记录被保留以供回收。但 root_id
+/// 由名字派生，同名重建会撞上这条旧 epoch 的记录；若 `persist_prepared_root`
+/// 把它当成冲突，该名字就会被永久占用直到目录被回收——在对端句柄长期不释放
+/// 的场景下等于名字不可用。因此重建路径必须允许覆盖"已逻辑删除"的旧记录。
+#[test]
+fn recreate_same_name_succeeds_while_old_dir_pending_reclaim() {
+    let (temp, owner, ctx, _disk) = fixture(false);
+    mkdir_root(&owner, &ctx, "d7");
+    let (first_id, first_dir) = root_snapshot(&owner, temp.path(), "d7");
+    let first_epoch = owner
+        .require_local()
+        .unwrap()
+        .roots
+        .lookup_root_location(&first_id)
+        .unwrap()
+        .unwrap()
+        .epoch;
+
+    // 制造非空目录：删除走 ENOTEMPTY 路径，目录与 catalog 记录均保留。
+    std::fs::write(first_dir.join("held"), b"x").unwrap();
+    Backend::rmdir(&owner, &ctx, owner.root_inode(), OsStr::new("d7")).unwrap();
+    assert!(first_dir.exists(), "directory must be parked, not deleted");
+
+    // 同名重建：必须成功，且得到新的 epoch 与新的数据目录。
+    let second = mkdir_root(&owner, &ctx, "d7");
+    let (second_id, second_dir) = root_snapshot(&owner, temp.path(), "d7");
+    let second_epoch = owner
+        .require_local()
+        .unwrap()
+        .roots
+        .lookup_root_location(&second_id)
+        .unwrap()
+        .unwrap()
+        .epoch;
+    assert_eq!(first_id, second_id);
+    assert_ne!(first_epoch, second_epoch);
+    assert_ne!(first_dir, second_dir);
+
+    // 新 root 可正常读写。
+    let created = Backend::create(
+        &owner,
+        &ctx,
+        second.inode,
+        OsStr::new("new"),
+        0o600,
+        libc::O_RDWR,
+    )
+    .unwrap();
+    Backend::write(&owner, &ctx, created.handle, 0, b"y").unwrap();
+    Backend::flush(&owner, &ctx, created.handle).unwrap();
+    assert!(second_dir.join("new").exists());
+
+    // 旧代仍在等待回收，且其 catalog 记录不得影响新 root 的准入。
+    assert!(first_dir.exists());
+}
+
 /// VC-D4：并发 rmdir 恰好一个成功，另一个在解析或缓存线性化点失败
 /// （ENOENT 或 invalid grant 错误）。
 #[test]

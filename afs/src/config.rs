@@ -157,6 +157,15 @@ impl DfsExternalBackendConfig {
 #[command(version, about = "AFS process foundation")]
 /// 命令行输入层。None 表示用户未传入，因此应继续考虑 TOML 与最终默认值。
 pub struct Cli {
+    /// Print the compiled-in build provenance and exit.
+    ///
+    /// The crate version alone cannot distinguish two builds of the same
+    /// source tree, which matters when several users share a host and need to
+    /// prove which binary is running. This reports the commit, whether the
+    /// working tree was dirty, and the build timestamp captured at compile
+    /// time by `build.rs`.
+    #[arg(long)]
+    pub build_info: bool,
     #[arg(long)]
     pub config: Option<PathBuf>,
     #[arg(long)]
@@ -254,6 +263,28 @@ pub struct Cli {
     /// ownerfs_mount and data_dir, required when experimental_ownerfs_workspace_bind.
     #[arg(long)]
     pub ownerfs_workspace_egress_root: Option<PathBuf>,
+    /// Period of the OwnerFs data-root reclaim sweep, in ms (10..=3600000).
+    /// Defaults to 60000. Only swept when OwnerFs is enabled.
+    #[arg(long)]
+    pub ownerfs_reclaim_interval_ms: Option<u64>,
+    /// tmpfs directory that holds the outlet public names. All three outlet
+    /// paths must be set together; leaving them unset disables the feature.
+    #[arg(long)]
+    pub outlet_public_root: Option<PathBuf>,
+    /// Root under which per-home data trees are mounted.
+    #[arg(long)]
+    pub outlet_import_root: Option<PathBuf>,
+    /// Convergence period of the outlet mirror (10..=60000ms), default 250.
+    #[arg(long)]
+    pub outlet_mirror_interval_ms: Option<u64>,
+    /// Minimum time a superseded data directory stays resolvable before it may
+    /// be reclaimed (1000..=604800000ms), default 120000.
+    #[arg(long)]
+    pub outlet_generation_grace_ms: Option<u64>,
+    /// Largest `actimeo` configured on any import mount (0..=3600000ms),
+    /// default 60000. Used only to validate the generation grace floor.
+    #[arg(long)]
+    pub outlet_max_import_actimeo_ms: Option<u64>,
     #[arg(long)]
     pub dfs_mount: Option<PathBuf>,
     /// FUSE receive threads shared by OwnerFs and DFS (1..=64).
@@ -385,6 +416,24 @@ impl Cli {
     /// Parse the process arguments with standard Clap exit codes and formatting.
     /// Retired backend options get a migration hint before the original error;
     /// they are never accepted or mapped to a different authority implicitly.
+    /// Provenance of the running binary, for `--build-info`.
+    ///
+    /// Reports identity rather than the crate version: on a shared host the
+    /// version is identical across unrelated builds, so it cannot answer
+    /// "is this the binary I just built".
+    #[must_use]
+    pub fn build_info() -> String {
+        let commit = option_env!("AFS_BUILD_COMMIT").unwrap_or("unknown");
+        let dirty = option_env!("AFS_BUILD_DIRTY").unwrap_or("unknown");
+        let built = option_env!("AFS_BUILD_TIME").unwrap_or("unknown");
+        format!(
+            "afs {} ({commit}, {dirty}, built {built}, {}/{})",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        )
+    }
+
     pub fn parse_process() -> Self {
         let arguments: Vec<_> = std::env::args_os().collect();
         match Self::try_parse_from(&arguments) {
@@ -464,6 +513,12 @@ struct FileConfig {
     experimental_ownerfs_workspace_bind: Option<bool>,
     ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
     ownerfs_workspace_egress_root: Option<PathBuf>,
+    ownerfs_reclaim_interval_ms: Option<u64>,
+    outlet_public_root: Option<PathBuf>,
+    outlet_import_root: Option<PathBuf>,
+    outlet_mirror_interval_ms: Option<u64>,
+    outlet_generation_grace_ms: Option<u64>,
+    outlet_max_import_actimeo_ms: Option<u64>,
     dfs_mount: Option<PathBuf>,
     fuse_threads: Option<u16>,
     fuse_clone_fd: Option<bool>,
@@ -576,6 +631,11 @@ pub struct Config {
     pub experimental_ownerfs_workspace_bind: bool,
     pub ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
     pub ownerfs_workspace_egress_root: Option<PathBuf>,
+    /// OwnerFs data-root reclaim sweep period (10..=3600000ms).
+    pub ownerfs_reclaim_interval_ms: u64,
+    /// Outlet public (name) layer. `Some` only when all three outlet paths are
+    /// configured; the feature is off otherwise.
+    pub outlet: Option<OutletConfig>,
     pub dfs_mount: Option<PathBuf>,
     pub fuse_threads: u16,
     pub fuse_clone_fd: bool,
@@ -629,6 +689,34 @@ pub struct Config {
     #[serde(skip)]
     pub print_config: bool,
 }
+
+/// Cross-node outlet name layer.
+///
+/// Configured as a unit. A partially configured layer would publish names
+/// pointing at an import layout the deployer never described, so resolution
+/// rejects it rather than guessing defaults for the missing half.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OutletConfig {
+    /// tmpfs mount holding the published `name -> target` symlinks.
+    pub public_root: PathBuf,
+    /// Root under which `<home>/users/<data_dir>` trees are mounted.
+    pub import_root: PathBuf,
+    /// Convergence period. Affects publish latency only, never the data path.
+    pub mirror_interval_ms: u64,
+    /// H11: minimum lifetime of a superseded generation directory.
+    pub generation_grace_ms: u64,
+    /// Largest actimeo on any import mount; informational, backs the grace
+    /// floor check.
+    pub max_import_actimeo_ms: u64,
+}
+
+impl OutletConfig {
+    #[must_use]
+    pub fn mirror_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.mirror_interval_ms)
+    }
+}
+
 impl Config {
     /// 按默认值 < TOML < 显式 CLI 合并；所有可发现的配置错误在监听服务之前返回。
     /// Meta 可以没有文件后端；Node 至少启用一个。未指定 fs 时使用当前编译进去的集合。
@@ -1060,6 +1148,80 @@ impl Config {
             ownerfs_workspace_egress_root: cli
                 .ownerfs_workspace_egress_root
                 .or(file.ownerfs_workspace_egress_root),
+            outlet: {
+                let public = cli.outlet_public_root.or(file.outlet_public_root);
+                let imports = cli.outlet_import_root.or(file.outlet_import_root);
+                match (public, imports) {
+                    (None, None) => None,
+                    (Some(public), Some(import_root)) => {
+                        if !public.is_absolute() || !import_root.is_absolute() {
+                            return Err(invalid("outlet paths must be absolute"));
+                        }
+                        if public == import_root {
+                            return Err(invalid("outlet public root and import root must differ"));
+                        }
+                        let interval_ms = cli
+                            .outlet_mirror_interval_ms
+                            .or(file.outlet_mirror_interval_ms)
+                            .unwrap_or(250);
+                        if !(10..=60_000).contains(&interval_ms) {
+                            return Err(invalid("outlet mirror interval must be 10..=60000ms"));
+                        }
+                        let grace_ms = cli
+                            .outlet_generation_grace_ms
+                            .or(file.outlet_generation_grace_ms)
+                            .unwrap_or(120_000);
+                        if !(1_000..=604_800_000).contains(&grace_ms) {
+                            return Err(invalid(
+                                "outlet generation grace must be 1000..=604800000ms",
+                            ));
+                        }
+                        // H11 (spec TC18): the window must cover mirror fan-out
+                        // (interval x 10) and NFS directory-cache lag
+                        // (actimeo x 2). `actimeo` is not configured here — it
+                        // belongs to each import mount — so the deployer
+                        // supplies the largest one in use; default 60s matches
+                        // the deployment examples.
+                        let actimeo_ms = cli
+                            .outlet_max_import_actimeo_ms
+                            .or(file.outlet_max_import_actimeo_ms)
+                            .unwrap_or(60_000);
+                        let floor = interval_ms
+                            .saturating_mul(10)
+                            .max(actimeo_ms.saturating_mul(2));
+                        if grace_ms < floor {
+                            return Err(invalid(format!(
+                                "outlet generation grace ({grace_ms}ms) must be at least \
+                                 max(mirror interval x 10, import actimeo x 2) = {floor}ms"
+                            )));
+                        }
+                        Some(OutletConfig {
+                            public_root: public,
+                            import_root,
+                            mirror_interval_ms: interval_ms,
+                            generation_grace_ms: grace_ms,
+                            max_import_actimeo_ms: actimeo_ms,
+                        })
+                    }
+                    // all-or-none: a half-configured name layer would publish
+                    // names pointing at an unknown import layout.
+                    _ => {
+                        return Err(invalid(
+                            "outlet_public_root and outlet_import_root must be set together",
+                        ));
+                    }
+                }
+            },
+            ownerfs_reclaim_interval_ms: {
+                let ms = cli
+                    .ownerfs_reclaim_interval_ms
+                    .or(file.ownerfs_reclaim_interval_ms)
+                    .unwrap_or(60_000);
+                if !(10..=3_600_000).contains(&ms) {
+                    return Err(invalid("OwnerFs reclaim interval must be 10..=3600000ms"));
+                }
+                ms
+            },
             dfs_mount: cli.dfs_mount.or(file.dfs_mount),
             fuse_threads,
             fuse_clone_fd: cli.fuse_clone_fd.or(file.fuse_clone_fd).unwrap_or(true),
@@ -1942,5 +2104,247 @@ mod read_concurrency_config_tests {
         let cli =
             Cli::try_parse_from(["afs-node", "--fs", "dfs", "--fuse-max-tasks", "0"]).unwrap();
         assert!(Config::resolve(Role::Node, cli).is_err());
+    }
+}
+
+/// OwnerFs 回收扫描周期：默认值与边界校验。
+#[cfg(test)]
+mod ownerfs_reclaim_config_tests {
+    use super::*;
+
+    #[test]
+    fn reclaim_interval_defaults_to_sixty_seconds() {
+        let cfg =
+            Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--fs", "ownerfs"])).unwrap();
+        assert_eq!(cfg.ownerfs_reclaim_interval_ms, 60_000);
+    }
+
+    #[test]
+    fn reclaim_interval_accepts_the_documented_range() {
+        for ms in ["10", "60000", "3600000"] {
+            let cfg = Config::resolve(
+                Role::Node,
+                Cli::parse_from([
+                    "afs-node",
+                    "--fs",
+                    "ownerfs",
+                    "--ownerfs-reclaim-interval-ms",
+                    ms,
+                ]),
+            )
+            .unwrap();
+            assert_eq!(cfg.ownerfs_reclaim_interval_ms, ms.parse::<u64>().unwrap());
+        }
+    }
+
+    /// 过小的周期会放大扫描开销，过大的周期会让延迟删除长期不被回收；
+    /// 两者都在启动时拒绝，而不是运行期静默使用。
+    #[test]
+    fn reclaim_interval_rejects_out_of_range_values() {
+        for ms in ["0", "9", "3600001"] {
+            let error = Config::resolve(
+                Role::Node,
+                Cli::parse_from([
+                    "afs-node",
+                    "--fs",
+                    "ownerfs",
+                    "--ownerfs-reclaim-interval-ms",
+                    ms,
+                ]),
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:?}").contains("OwnerFs reclaim interval"),
+                "unexpected error for {ms}: {error:?}"
+            );
+        }
+    }
+}
+
+/// outlet 名字面的三件套：all-or-none、绝对路径、周期范围。
+#[cfg(test)]
+mod outlet_config_tests {
+    use super::*;
+
+    #[test]
+    fn outlet_is_disabled_when_unset() {
+        let cfg =
+            Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--fs", "ownerfs"])).unwrap();
+        assert!(cfg.outlet.is_none());
+    }
+
+    #[test]
+    fn outlet_defaults_the_mirror_interval_to_250ms() {
+        let cfg = Config::resolve(
+            Role::Node,
+            Cli::parse_from([
+                "afs-node",
+                "--fs",
+                "ownerfs",
+                "--outlet-public-root",
+                "/mnt/adx/public",
+                "--outlet-import-root",
+                "/mnt/adx/imports",
+            ]),
+        )
+        .unwrap();
+        let outlet = cfg.outlet.expect("configured");
+        assert_eq!(outlet.mirror_interval_ms, 250);
+        assert_eq!(outlet.public_root, PathBuf::from("/mnt/adx/public"));
+    }
+
+    /// 只配置一半时必须拒绝：否则名字会被发布到一个部署方从未描述过的
+    /// import 布局上。
+    #[test]
+    fn half_configured_outlet_is_rejected() {
+        for partial in [
+            vec!["--outlet-public-root", "/mnt/adx/public"],
+            vec!["--outlet-import-root", "/mnt/adx/imports"],
+        ] {
+            let mut args = vec!["afs-node", "--fs", "ownerfs"];
+            args.extend(partial);
+            let error = Config::resolve(Role::Node, Cli::parse_from(args)).unwrap_err();
+            assert!(
+                format!("{error:?}").contains("must be set together"),
+                "unexpected error: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn outlet_paths_must_be_absolute_and_distinct() {
+        let relative = Config::resolve(
+            Role::Node,
+            Cli::parse_from([
+                "afs-node",
+                "--fs",
+                "ownerfs",
+                "--outlet-public-root",
+                "public",
+                "--outlet-import-root",
+                "/mnt/adx/imports",
+            ]),
+        )
+        .unwrap_err();
+        assert!(format!("{relative:?}").contains("absolute"), "{relative:?}");
+
+        let same = Config::resolve(
+            Role::Node,
+            Cli::parse_from([
+                "afs-node",
+                "--fs",
+                "ownerfs",
+                "--outlet-public-root",
+                "/mnt/adx/x",
+                "--outlet-import-root",
+                "/mnt/adx/x",
+            ]),
+        )
+        .unwrap_err();
+        assert!(format!("{same:?}").contains("must differ"), "{same:?}");
+    }
+
+    #[test]
+    fn outlet_generation_grace_defaults_and_validates() {
+        let base = [
+            "afs-node",
+            "--fs",
+            "ownerfs",
+            "--outlet-public-root",
+            "/mnt/adx/public",
+            "--outlet-import-root",
+            "/mnt/adx/imports",
+        ];
+        let cfg = Config::resolve(Role::Node, Cli::parse_from(base)).unwrap();
+        assert_eq!(cfg.outlet.unwrap().generation_grace_ms, 120_000);
+
+        // 200000 高于默认下限 max(250x10, 60000x2)=120000，可接受。
+        let mut with_grace = base.to_vec();
+        with_grace.extend(["--outlet-generation-grace-ms", "200000"]);
+        let cfg = Config::resolve(Role::Node, Cli::parse_from(with_grace)).unwrap();
+        assert_eq!(cfg.outlet.unwrap().generation_grace_ms, 200_000);
+
+        // 过小的宽限期等于没有保护；过大的值会让磁盘长期滞留。
+        for ms in ["999", "604800001"] {
+            let mut args = base.to_vec();
+            args.extend(["--outlet-generation-grace-ms", ms]);
+            let error = Config::resolve(Role::Node, Cli::parse_from(args)).unwrap_err();
+            assert!(
+                format!("{error:?}").contains("generation grace"),
+                "unexpected error for {ms}: {error:?}"
+            );
+        }
+    }
+
+    /// TC18：宽限期必须 ≥ max(interval×10, actimeo×2)。调大 interval 或
+    /// actimeo 而不改 grace 时，启动必须失败并指明约束。
+    #[test]
+    fn outlet_generation_grace_must_cover_interval_and_actimeo_floor() {
+        let base = [
+            "afs-node",
+            "--fs",
+            "ownerfs",
+            "--outlet-public-root",
+            "/mnt/adx/public",
+            "--outlet-import-root",
+            "/mnt/adx/imports",
+        ];
+        // 默认组合（250ms interval，60s actimeo）下默认 120s grace 合法。
+        let cfg = Config::resolve(Role::Node, Cli::parse_from(base)).unwrap();
+        assert_eq!(cfg.outlet.unwrap().generation_grace_ms, 120_000);
+
+        // interval 调大到 60000 → 下限 600000 > 120000 默认值 → 必须拒绝。
+        let mut big_interval = base.to_vec();
+        big_interval.extend(["--outlet-mirror-interval-ms", "60000"]);
+        let error = Config::resolve(Role::Node, Cli::parse_from(big_interval)).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("mirror interval x 10"),
+            "unexpected error: {error:?}"
+        );
+
+        // actimeo 调大到 300000 → 下限 600000 → 必须拒绝。
+        let mut big_actimeo = base.to_vec();
+        big_actimeo.extend(["--outlet-max-import-actimeo-ms", "300000"]);
+        let error = Config::resolve(Role::Node, Cli::parse_from(big_actimeo)).unwrap_err();
+        assert!(
+            format!("{error:?}").contains("import actimeo x 2"),
+            "unexpected error: {error:?}"
+        );
+
+        // 显式给足 grace 后通过。
+        let mut fixed = base.to_vec();
+        fixed.extend([
+            "--outlet-mirror-interval-ms",
+            "60000",
+            "--outlet-generation-grace-ms",
+            "600000",
+        ]);
+        let cfg = Config::resolve(Role::Node, Cli::parse_from(fixed)).unwrap();
+        assert_eq!(cfg.outlet.unwrap().generation_grace_ms, 600_000);
+    }
+
+    #[test]
+    fn outlet_mirror_interval_range_is_enforced() {
+        for ms in ["9", "60001"] {
+            let error = Config::resolve(
+                Role::Node,
+                Cli::parse_from([
+                    "afs-node",
+                    "--fs",
+                    "ownerfs",
+                    "--outlet-public-root",
+                    "/mnt/adx/public",
+                    "--outlet-import-root",
+                    "/mnt/adx/imports",
+                    "--outlet-mirror-interval-ms",
+                    ms,
+                ]),
+            )
+            .unwrap_err();
+            assert!(
+                format!("{error:?}").contains("outlet mirror interval"),
+                "unexpected error for {ms}: {error:?}"
+            );
+        }
     }
 }

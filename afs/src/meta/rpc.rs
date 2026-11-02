@@ -25,20 +25,20 @@ use afs_protocol::meta::{
     DfsXattrSetMode as PbDfsXattrSetMode, GetDfsChunkSourcesReply, GetDfsChunkSourcesRequest,
     GetDfsInodeReply, GetDfsInodeRequest, GetDfsPlacementSnapshotReply,
     GetDfsPlacementSnapshotRequest, GetFileVersionReply, GetFileVersionRequest,
-    ListOwnerRootsReply, ListOwnerRootsRequest, LookupNodeReply, LookupNodeRequest,
-    LookupRootReply, LookupRootRequest, MetaBackendPersistence, NodeDescriptor, NodeEndpoint,
-    OpenDfsWriteReply, OpenDfsWriteRequest, PingReply, PingRequest, PollRootCommandBatchRequest,
-    PresentedRootAccess, RecoverRootReply, RecoverRootRequest, RegisterNodeReply,
-    RegisterNodeRequest, RenewDfsWriteLeaseRequest, ReserveRootReply, ReserveRootRequest,
-    ResolveDfsLockAuthorityReply, ResolveDfsLockAuthorityRequest, ResolveDfsWriteAuthorityReply,
-    ResolveDfsWriteAuthorityRequest, RootCommand, RootCommandBatchCompacted,
-    RootCommandBatchEvents, RootCommandBatchReply, RootCommandBatchUnsupported,
-    RootCommandRecoveryCursor, RootCommandRecoveryReason, RootCommandType, RootLocation,
-    RootReservation, RootRight as PbRootRight, SyncDfsInodeMetadataReply,
-    SyncDfsInodeMetadataRequest, ValidateDfsReplicaWriteReply, ValidateDfsReplicaWriteRequest,
-    ValidateRootAccessReply, ValidateRootAccessRequest, WatchRootCommandsRequest,
-    dfs_meta_server::DfsMeta as DfsMetaService, meta_server::Meta as MetaService,
-    owner_roots_server::OwnerRoots as OwnerRootsService,
+    ListActiveOutletRootsReply, ListActiveOutletRootsRequest, ListOwnerRootsReply,
+    ListOwnerRootsRequest, LookupNodeReply, LookupNodeRequest, LookupRootReply, LookupRootRequest,
+    MetaBackendPersistence, NodeDescriptor, NodeEndpoint, OpenDfsWriteReply, OpenDfsWriteRequest,
+    PingReply, PingRequest, PollRootCommandBatchRequest, PresentedRootAccess, RecoverRootReply,
+    RecoverRootRequest, RegisterNodeReply, RegisterNodeRequest, RenewDfsWriteLeaseRequest,
+    ReserveRootReply, ReserveRootRequest, ResolveDfsLockAuthorityReply,
+    ResolveDfsLockAuthorityRequest, ResolveDfsWriteAuthorityReply, ResolveDfsWriteAuthorityRequest,
+    RootCommand, RootCommandBatchCompacted, RootCommandBatchEvents, RootCommandBatchReply,
+    RootCommandBatchUnsupported, RootCommandRecoveryCursor, RootCommandRecoveryReason,
+    RootCommandType, RootLocation, RootReservation, RootRight as PbRootRight,
+    SyncDfsInodeMetadataReply, SyncDfsInodeMetadataRequest, ValidateDfsReplicaWriteReply,
+    ValidateDfsReplicaWriteRequest, ValidateRootAccessReply, ValidateRootAccessRequest,
+    WatchRootCommandsRequest, dfs_meta_server::DfsMeta as DfsMetaService,
+    meta_server::Meta as MetaService, owner_roots_server::OwnerRoots as OwnerRootsService,
 };
 use std::{pin::Pin, sync::Arc, time::Duration};
 use tokio_stream::Stream;
@@ -673,6 +673,37 @@ impl OwnerRootsService for OwnerRootsRpc {
                 .map(wire_reservation)
                 .collect(),
             authority_revision: output.authority_revision.0,
+        }))
+    }
+
+    async fn list_active_outlet_roots(
+        &self,
+        request: Request<ListActiveOutletRootsRequest>,
+    ) -> Result<Response<ListActiveOutletRootsReply>, Status> {
+        // 只读快照：任何已认证 live 会话都可以读，不绑定 home 节点。
+        // enforce_peer_identity 开启时必须有可信 mTLS 证书（与其它 authority RPC 一致）。
+        // 返回值是调用方 node id，本 RPC 不需要它，但身份校验本身必须执行。
+        let _caller = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        require_text(&request.request_id, "request_id")?;
+        let known_digest = if request.known_digest.is_empty() {
+            None
+        } else {
+            Some(request.known_digest)
+        };
+        let output = self
+            .0
+            .owner_roots
+            .list_active_outlet_roots(super::owner_roots::ListActiveOutletRootsInput {
+                known_digest,
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(ListActiveOutletRootsReply {
+            active_roots: output.roots.into_iter().map(wire_location).collect(),
+            authority_revision: output.revision.0,
+            digest: output.digest,
+            unchanged: output.unchanged,
         }))
     }
 
@@ -3164,5 +3195,57 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.code(), Code::InvalidArgument);
+    }
+    #[tokio::test]
+    async fn list_active_outlet_roots_requires_request_id() {
+        use super::super::store::{
+            Store,
+            journal::{LogLimits, MemoryLog},
+        };
+        let store = Arc::new(
+            Store::open_log(Arc::new(MemoryLog::new(LogLimits::default()).unwrap()))
+                .await
+                .unwrap(),
+        );
+        let meta = Arc::new(super::super::Meta::with_store(
+            "outlet-test".into(),
+            crate::runtime::Observability::new().unwrap(),
+            store,
+        ));
+        let error = OwnerRootsRpc(meta)
+            .list_active_outlet_roots(Request::new(ListActiveOutletRootsRequest {
+                request_id: String::new(),
+                known_digest: String::new(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn list_active_outlet_roots_returns_empty_snapshot_without_roots() {
+        use super::super::store::{
+            Store,
+            journal::{LogLimits, MemoryLog},
+        };
+        let store = Arc::new(
+            Store::open_log(Arc::new(MemoryLog::new(LogLimits::default()).unwrap()))
+                .await
+                .unwrap(),
+        );
+        let meta = Arc::new(super::super::Meta::with_store(
+            "outlet-test".into(),
+            crate::runtime::Observability::new().unwrap(),
+            store,
+        ));
+        let reply = OwnerRootsRpc(meta)
+            .list_active_outlet_roots(Request::new(ListActiveOutletRootsRequest {
+                request_id: "req-1".into(),
+                known_digest: String::new(),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(reply.active_roots.is_empty());
     }
 }

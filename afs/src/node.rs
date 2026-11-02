@@ -27,6 +27,8 @@ pub mod gc;
 mod native_prefetch;
 #[cfg(feature = "ownerfs")]
 mod native_workspace;
+#[cfg(feature = "ownerfs")]
+pub mod outlet;
 #[cfg(feature = "dfs")]
 pub mod peer_cache;
 mod read_activity;
@@ -475,13 +477,13 @@ pub(crate) fn current_visible_afs_mount_id_in_mountinfo(
     }
 }
 
-struct MountinfoEntry<'a> {
-    mount_id: &'a [u8],
-    fs_type: &'a [u8],
-    source: &'a [u8],
+pub(crate) struct MountinfoEntry<'a> {
+    pub(crate) mount_id: &'a [u8],
+    pub(crate) fs_type: &'a [u8],
+    pub(crate) source: &'a [u8],
 }
 
-fn parse_exact_mountinfo_line<'a>(
+pub(crate) fn parse_exact_mountinfo_line<'a>(
     line: &'a [u8],
     encoded_path: &[u8],
 ) -> Option<MountinfoEntry<'a>> {
@@ -1390,6 +1392,13 @@ async fn run_node(
 
     #[cfg(feature = "ownerfs")]
     let mut workspace_bind_root_control = None;
+    // Reclaim sweep handle, taken from the OwnerFs construction site.
+    #[cfg(feature = "ownerfs")]
+    let mut roots_for_reclaim = None;
+    // Meta handle for the outlet mirror, taken before the OwnerFs wiring
+    // consumes `root_meta`.
+    #[cfg(feature = "ownerfs")]
+    let mut outlet_meta = None;
     #[cfg(feature = "ownerfs")]
     let ownerfs_instance = if cfg.ownerfs {
         let endpoint = meta_endpoint.expect("OwnerFs checked meta_endpoint");
@@ -1440,15 +1449,23 @@ async fn run_node(
                 rpc::peer::OWNER_RDMA_MAX_CLIENT_WINDOWS,
             )),
         });
+        outlet_meta = Some(root_meta.clone() as Arc<dyn vfs::ownerfs::root::RootMeta>);
         let recovery_root_meta = root_meta.clone();
+        // H11 grace comes from configuration; the builder keeps the default
+        // for the other constructors (mostly tests).
+        let retirement_grace_ms = cfg.outlet.as_ref().map(|outlet| outlet.generation_grace_ms);
         let roots = Arc::new(
             tokio::task::spawn_blocking(move || {
-                vfs::ownerfs::root::RootManager::open(
+                let manager = vfs::ownerfs::root::RootManager::open(
                     recovery_node_id,
                     recovery_session_id,
                     recovery_root_meta,
                     recovery_disk,
-                )
+                )?;
+                Ok::<_, afs_error::Error>(match retirement_grace_ms {
+                    Some(grace) => manager.with_retirement_grace(grace),
+                    None => manager,
+                })
             })
             .await??,
         );
@@ -1459,6 +1476,10 @@ async fn run_node(
             workspace_bind_root_control = Some((root_meta, roots.clone()));
         }
         let roots_for_startup = roots.clone();
+        // Reclaim sweeps directories left behind by a root deletion whose
+        // physical removal was deferred (see `RootManager::reclaim_deferred`).
+        // Kept outside `owner` so the sweep does not depend on the VFS object.
+        roots_for_reclaim = Some(roots.clone());
         let owner = if cfg.experimental_ownerfs_workspace_bind {
             let egress_root = cfg
                 .ownerfs_workspace_egress_root
@@ -1891,6 +1912,93 @@ async fn run_node(
         dfs: dfs_instance,
     });
     let mut services = Services::new();
+    // Cross-node outlet name layer. Runs before the reclaim sweep below so a
+    // startup gate failure aborts before any background task is spawned.
+    #[cfg(feature = "ownerfs")]
+    if let (Some(outlet), Some(meta)) = (cfg.outlet.as_ref(), outlet_meta) {
+        let mountinfo = std::fs::read("/proc/self/mountinfo").map_err(|error| {
+            afs_error::Error::coded(
+                afs_error::CONFIG_INVALID,
+                format!("outlet requires /proc/self/mountinfo: {error}"),
+            )
+        })?;
+        crate::node::outlet::live::ensure_public_root_is_tmpfs(&outlet.public_root, &mountinfo)?;
+        crate::node::outlet::live::prepare(&outlet.public_root)?;
+        let config = crate::node::outlet::live::MirrorConfig {
+            public_root: outlet.public_root.clone(),
+            import_root: outlet.import_root.to_string_lossy().into_owned(),
+            interval: outlet.mirror_interval(),
+        };
+        afs_logging::info!(
+            "outlet.mirror.starting";
+            "public_root" => outlet.public_root.display().to_string(),
+            "import_root" => outlet.import_root.display().to_string(),
+            "interval_ms" => outlet.mirror_interval_ms
+        );
+        let stop = services.stop.subscribe();
+        let mirror_config = config.clone();
+        services.spawn(async move {
+            let shutdown = cancelled(stop);
+            tokio::pin!(shutdown);
+            crate::node::outlet::live::run(mirror_config, meta, shutdown).await;
+            Ok(())
+        });
+        // Read-only topology diagnosis. A separate task so a slow mount scan
+        // can never delay publication (spec H3).
+        let stop = services.stop.subscribe();
+        services.spawn(async move {
+            let shutdown = cancelled(stop);
+            tokio::pin!(shutdown);
+            crate::node::outlet::live::run_diagnosis(config, shutdown).await;
+            Ok(())
+        });
+    }
+    #[cfg(feature = "ownerfs")]
+    if let (Some(roots), true) = (roots_for_reclaim, cfg.ownerfs) {
+        let stop = services.stop.subscribe();
+        let period = std::time::Duration::from_millis(cfg.ownerfs_reclaim_interval_ms);
+        services.spawn(async move {
+            let mut tick = tokio::time::interval(period);
+            // Skip the immediate tick: startup reconciliation already ran, and
+            // an instant sweep would race the first mount requests.
+            tick.tick().await;
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let shutdown = cancelled(stop);
+            tokio::pin!(shutdown);
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown => return Ok(()),
+                    _ = tick.tick() => {
+                        let roots = roots.clone();
+                        // remove_dir is a blocking syscall; keep it off the
+                        // async workers.
+                        match tokio::task::spawn_blocking(move || roots.reclaim_deferred()).await {
+                            Ok(Ok((removed, pending))) if removed > 0 || pending > 0 => {
+                                afs_logging::info!(
+                                    "ownerfs.reclaim.swept";
+                                    "removed" => removed,
+                                    "pending" => pending
+                                );
+                            }
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                afs_logging::warn!(
+                                    "ownerfs.reclaim.failed";
+                                    "error" => error.to_string()
+                                );
+                            }
+                            Err(error) => {
+                                afs_logging::warn!(
+                                    "ownerfs.reclaim.worker_failed";
+                                    "error" => error.to_string()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
     {
         let stop = services.stop.subscribe();
         let readiness = readiness.clone();

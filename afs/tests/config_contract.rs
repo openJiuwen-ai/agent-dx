@@ -2099,3 +2099,44 @@ fn tls_encryption_cli_file_precedence_and_identity_are_independent() {
         .is_err()
     );
 }
+
+/// `ownerfs_reclaim_interval_ms` 必须同时受 CLI 与 TOML 控制，且非法值在
+/// 启动时拒绝——静默钳到范围内会让运维误以为配置生效。
+#[test]
+fn ownerfs_reclaim_interval_is_accepted_from_cli_and_file_and_validated() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("node.toml");
+    std::fs::write(&path, "fs='dfs'\nownerfs_reclaim_interval_ms=15000\n").unwrap();
+    let from_file = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+    .unwrap();
+    assert_eq!(from_file.ownerfs_reclaim_interval_ms, 15_000);
+
+    // CLI 覆盖 TOML。
+    let overridden = Config::resolve(
+        Role::Node,
+        Cli::parse_from([
+            "afs-node",
+            "--config",
+            path.to_str().unwrap(),
+            "--ownerfs-reclaim-interval-ms",
+            "90",
+        ]),
+    )
+    .unwrap();
+    assert_eq!(overridden.ownerfs_reclaim_interval_ms, 90);
+
+    // TOML 中的非法值同样在启动时拒绝。
+    std::fs::write(&path, "fs='dfs'\nownerfs_reclaim_interval_ms=1\n").unwrap();
+    let error = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:?}").contains("OwnerFs reclaim interval"),
+        "unexpected error: {error:?}"
+    );
+}

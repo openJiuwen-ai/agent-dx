@@ -9,8 +9,8 @@ use super::ownerfs::{reservation_from_wire, reservation_wire};
 use crate::node::vfs::ownerfs::{
     catalog::LocalRootRecord,
     root::{
-        OwnerRootInventory, PreparedRoot, PresentedRootAccess, RootGrant, RootId, RootLocation,
-        RootLookupState, RootMeta, RootReservation, RootRight,
+        ActiveOutletRoots, OutletRoot, OwnerRootInventory, PreparedRoot, PresentedRootAccess,
+        RootGrant, RootId, RootLocation, RootLookupState, RootMeta, RootReservation, RootRight,
     },
 };
 #[cfg(any(feature = "ownerfs", feature = "dfs"))]
@@ -21,9 +21,9 @@ use afs_error::{
 #[cfg(feature = "ownerfs")]
 use afs_protocol::meta::{
     AbortRootRequest, AcquireRootRequest, ActivateRootRequest, DeactivateRootRequest,
-    ListOwnerRootsRequest, LookupNodeRequest, LookupRootRequest, PollRootCommandBatchRequest,
-    RecoverRootRequest, ReserveConflictPolicy, ReserveRootRequest, ValidateRootAccessRequest,
-    owner_roots_client::OwnerRootsClient,
+    ListActiveOutletRootsRequest, ListOwnerRootsRequest, LookupNodeRequest, LookupRootRequest,
+    PollRootCommandBatchRequest, RecoverRootRequest, ReserveConflictPolicy, ReserveRootRequest,
+    ValidateRootAccessRequest, owner_roots_client::OwnerRootsClient,
 };
 use afs_protocol::meta::{
     MetaBackendPersistence, PingRequest, RegisterNodeReply, RegisterNodeRequest,
@@ -811,6 +811,31 @@ impl RootMeta for GrpcRootMeta {
             home_node_id: value.home_node_id,
             home_session_id: value.home_session_id,
         }))
+    }
+
+    fn list_active_outlet_roots(&self, known_digest: Option<&str>) -> Result<ActiveOutletRoots> {
+        let mut client = self.client();
+        let reply = self
+            .run(
+                client.list_active_outlet_roots(ListActiveOutletRootsRequest {
+                    request_id: self.request_id(),
+                    known_digest: known_digest.unwrap_or_default().to_owned(),
+                }),
+            )?
+            .into_inner();
+        Ok(ActiveOutletRoots {
+            roots: reply
+                .active_roots
+                .into_iter()
+                .map(|value| OutletRoot {
+                    root_id: RootId(value.root_id),
+                    root_epoch: value.root_epoch,
+                    home_node_id: value.home_node_id,
+                })
+                .collect(),
+            digest: reply.digest,
+            unchanged: reply.unchanged,
+        })
     }
 
     fn list_owner_roots(&self, home_node_id: &str) -> Result<OwnerRootInventory> {
