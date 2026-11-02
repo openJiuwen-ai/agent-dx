@@ -875,8 +875,9 @@ pub struct DfsReadPhaseMetrics {
 }
 
 /// Fixed read stages; never node, chunk or address labels.
-pub(crate) const READ_PHASES: [&str; 7] = [
-    "prepare", "allocate", "transfer", "scatter", "validate", "release", "buffers",
+pub(crate) const READ_PHASES: [&str; 9] = [
+    "admit", "connect", "prepare", "transfer", "scatter", "validate", "release", "buffers",
+    "verify",
 ];
 
 impl DfsReadPhaseMetrics {

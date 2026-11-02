@@ -41,7 +41,7 @@ use afs_protocol::node_data::{
 #[cfg(feature = "dfs")]
 pub mod hixl;
 #[cfg(feature = "dfs")]
-pub mod prepared;
+pub mod snapshot;
 
 #[cfg(feature = "dfs")]
 use afs_protocol::node_data::{
@@ -72,9 +72,9 @@ use crate::node::{
     storage::{MAX_TRANSFER_BYTES, Storage, StorageError},
 };
 #[cfg(all(feature = "dfs", test))]
-use prepared::packed_dfs_read_length;
+use snapshot::packed_dfs_read_length;
 #[cfg(all(feature = "dfs", any(test, feature = "rdma")))]
-use prepared::{read_packed_dfs_ranges, validate_packed_dfs_read};
+use snapshot::{read_packed_dfs_ranges, validate_packed_dfs_read};
 
 #[cfg(feature = "dfs")]
 use afs_protocol::node_data::{
