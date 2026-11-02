@@ -3,7 +3,6 @@
 
 import argparse
 import base64
-import hashlib
 import importlib.util
 import ipaddress
 import json
@@ -48,50 +47,49 @@ def validate_physical_placement(placement, required):
         raise RuntimeError('full profile requires two distinct Kubernetes workers')
 
 
+_harness_spec = importlib.util.spec_from_file_location('shared_e2e_harness', HERE.parent / 'harness.py')
+shared_harness = importlib.util.module_from_spec(_harness_spec)
+_harness_spec.loader.exec_module(shared_harness)
+_candidate_spec = importlib.util.spec_from_file_location('shared_e2e_candidate', HERE.parent / 'candidate.py')
+candidate = importlib.util.module_from_spec(_candidate_spec)
+_candidate_spec.loader.exec_module(candidate)
+
+
 def source_commit():
-    commit = os.getenv('BUILDKITE_COMMIT')
-    if commit is None:
-        commit = subprocess.check_output(
-            [_executable('git'), '-C', str(ROOT), 'rev-parse', 'HEAD'],
-            text=True,
-        ).strip()
-    if not re.fullmatch(r'[0-9a-f]{40}', commit):
-        raise ValueError('test harness commit must be a 40-character Git commit')
-    return commit
+    return shared_harness.source_commit()
 
 
 def stage_harness(destination, package_manifest=None, harness_commit=None):
-    shutil.copytree(
-        ROOT / 'build/e2e',
-        destination,
-        ignore=shutil.ignore_patterns('__pycache__', 'tests', '*.pyc'),
-    )
-    shutil.copy2(ROOT / 'build/ci/rpc_certificates.py', destination / 'rpc_certificates.py')
-    shutil.copy2(ROOT / 'build/release/package.py', destination / 'package.py')
-    if package_manifest is not None and common.afs_handoff.enabled(package_manifest):
-        common.afs_handoff.stage(ROOT / 'afs/tests', destination / 'afs-tests', package_manifest, harness_commit)
-    files = {}
-    for path in sorted(item for item in destination.rglob('*') if item.is_file()):
-        files[str(path.relative_to(destination))] = hashlib.sha256(path.read_bytes()).hexdigest()
-    return files
+    return shared_harness.stage_harness(destination, package_manifest, harness_commit)
 
 
 def identity(bundle, registry, commit=None, ci=False):
-    m = json.loads(bundle.read_text())
-    common.afs_handoff.verify_bundle(bundle.parent, m)
-    common.afs_contracts.verify_bundle(bundle.parent, m)
-    r = json.loads(registry.read_text())
-    if m.get('schema_version') != 1 or r.get('schema_version') != 1:
-        raise ValueError('invalid Kubernetes artifact manifest')
-    if r.get('bundle_sha256') != common.sha(bundle) or r.get('image_ids') != m['image_ids']:
-        raise ValueError('registry images do not match the build bundle')
-    if set(r.get('references', {})) != {'node', 'execd', 'entrypoint'}:
-        raise ValueError('node, EXECD and entrypoint test images required')
-    for image in r['references'].values():
-        if not re.fullmatch(r'[^\s]+@sha256:[0-9a-f]{64}', image):
-            raise ValueError('immutable image references required')
-    common.validate_identity(m['package'], m['architecture'], commit, ci)
-    return m, r
+    return candidate.identity(bundle, registry, commit, ci)
+
+
+def fixed_candidate(bundle, registry, commit, afs_required=False, contracts_required=False):
+    return candidate.fixed_candidate(bundle, registry, commit, afs_required, contracts_required)
+
+
+def verify_only(args, output):
+    """Write input admission evidence without accessing Kubernetes or registry APIs."""
+    report = {'scope': 'fixed-candidate-inputs', 'deployment_performed': False, 'status': 'failed'}
+    try:
+        manifest, published = fixed_candidate(
+            args.bundle, args.registry_images, args.artifact_commit,
+            afs_required=bool(args.case and args.case.startswith('afs-')),
+            contracts_required=args.case == 'afs-component-full',
+        )
+        report.update(status='passed', product_commit=manifest['package']['commit'],
+                      target=manifest['package']['target'], architecture=manifest['architecture'],
+                      with_afs=common.afs_handoff.enabled(manifest['package']),
+                      sdk=manifest['sdk'], backend=manifest['backend'],
+                      bundle_sha256=common.sha(args.bundle), references=published['references'])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        report['error'] = f'{type(exc).__name__}: {exc}'
+    (output / 'inputs.json').write_text(json.dumps(report, indent=2) + '\n')
+    print(json.dumps(report), flush=True)
+    return 0 if report['status'] == 'passed' else 1
 
 
 def credentials(directory, image, runtime_image):
@@ -594,8 +592,11 @@ def write_junit(path, report):
 
 def main():
     p = argparse.ArgumentParser()
-    for arg in ('bundle', 'registry-images', 'kubeconfig', 'output'):
+    for arg in ('bundle', 'registry-images', 'output'):
         p.add_argument('--' + arg, type=Path, required=True)
+    p.add_argument('--kubeconfig', type=Path)
+    p.add_argument('--artifact-commit', help='require this exact clean product commit, including outside CI')
+    p.add_argument('--verify-only', action='store_true', help='verify fixed input manifests; do not deploy')
     p.add_argument('--context')
     p.add_argument('--node-name', action='append', default=[], help='eligible Kubernetes node; repeat for a pool')
     p.add_argument('--registry-auth', type=Path)
@@ -604,10 +605,16 @@ def main():
     p.add_argument('--redis-storage-class', help='StorageClass for the targeted Redis Pod/PVC recovery case')
     a = p.parse_args()
     required = selected_checks(a.profile, a.case)
+    if a.verify_only and not a.artifact_commit:
+        p.error('--verify-only requires --artifact-commit')
+    if not a.verify_only and a.kubeconfig is None:
+        p.error('--kubeconfig is required for deployment')
     if a.redis_storage_class and a.case != 'redis-pod-restart':
         p.error('--redis-storage-class is only used by --case redis-pod-restart')
     output = a.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
+    if a.verify_only:
+        return verify_only(a, output)
     checks = []
     run = KubernetesRun(
         output,
@@ -630,6 +637,12 @@ def main():
                 raise ValueError('target kubeconfig does not exist')
             expected_commit = os.getenv('ADX_E2E_ARTIFACT_COMMIT', os.getenv('BUILDKITE_COMMIT'))
             m, published = identity(a.bundle, a.registry_images, expected_commit, bool(os.getenv('BUILDKITE')))
+            if a.artifact_commit:
+                m, published = fixed_candidate(
+                    a.bundle, a.registry_images, a.artifact_commit,
+                    afs_required=bool(a.case and a.case.startswith('afs-')),
+                    contracts_required=a.case == 'afs-component-full',
+                )
             (output / 'bundle.json').write_text(json.dumps(m, indent=2))
             (output / 'registry-images.json').write_text(json.dumps(published, indent=2))
             user_image = m['base_images']['execd']

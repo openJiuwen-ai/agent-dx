@@ -4,6 +4,508 @@ Buildkite deploys to **Kubernetes** through [kubernetes/run.py](kubernetes/READM
 It creates a dedicated namespace with two node Pods and Services, using immutable
 images from the build step. Each Pod runs the platform as processes.
 
+## Fixed-package acceptance without Buildkite scheduling
+
+For an initial AFS component closure, use the fixed AFS component package and
+the existing `afs/tests/run.py` inside one Linux VM as described below. This
+requires neither Kubernetes nor Docker. It qualifies component behavior only.
+For the complete ADX product path, reuse the Kubernetes driver on a qualified
+target or the separately qualified native Linux Docker path. Product compilation
+is not part of deployment; the drivers do not create VMs or a Kubernetes cluster.
+
+Freeze the clean product commit, package/SDK/backend identities, image digests
+and test-source commit before running. The reusable registry path only needs
+the small matching bundle manifests and registry access, rather than another
+download/build of the product. AFS ON additionally needs its hashed test-asset
+sidecar, and AFS Full needs the matching frozen contract manifest and image.
+Keep credentials outside the checkout and results.
+
+The [fixed-package Kubernetes procedure](kubernetes/README.md#fixed-package-direct-run)
+lists the inputs, environment checks, offline admission, direct component and
+SDK cases, required smoke/Full commands, and evidence/cleanup rules. Use
+`--artifact-commit` to enforce the fixed clean product outside CI.
+`--verify-only` checks input manifests without deployment; its `inputs.json`
+is not a functional or environment qualification result.
+
+The available commands and unit contracts do not by themselves establish a
+successful direct-package deployment. Record the actual candidate, target and
+selected cases for every run. Kubernetes evidence does not qualify the Docker,
+SSH multi-VM, soak or performance paths.
+
+### Non-K8s SDK and required Full (PK1)
+
+The local Docker adapter reuses the existing two-node deployment, public
+scenarios, SDK-on-AFS assertions and AFS component runner. Its input is the
+original fixed bundle/registry/AFS manifests plus a verified offline image
+export, not a newly compiled product. The SDK remains the wheel installed in
+the fixed node image. On 2026-11-01, fixed Base236 product commit
+`f93e2fb04f423c7004532f38f1f1ca34de0ab782` and test-source commit
+`e786bc440786102b0046ef03d1c5dd88c23525ee` passed targeted SDK Full and
+one combined public11/component24/SDK16 Full on an x86_64 Linux 6.8/ext4 VM,
+with normal cleanup. The combined run took 470.942 seconds. This qualifies
+that single-VM Docker functional scope; other candidates and environments
+require their own runs. The canonical [strategy](../../docs/testing/test-strategy.md)
+records the initial environment failures and evidence boundary.
+
+The image-export step uses `export_images.py` on an authenticated preparation
+host. It pulls only the three immutable references from the matching bundle,
+verifies their configuration IDs and architecture, and produces
+`images.tar.gz` plus `image-export.json`. The latter binds the original bundle
+and registry SHA, exact image IDs/references and derived archive size/SHA.
+Keep original manifests unchanged: this archive is a separate transport, whose
+bytes need not equal the original `prepare.py` archive. Deliver the export via
+a trusted artifact channel and verify its recorded digest before use. Registry
+credentials stay on the preparation host. The native runtime host does not
+need SWR credentials, Kubernetes tools or cloud-cluster access.
+
+Use an available native Linux Docker VM with the candidate architecture,
+Python 3.10+, OpenSSL, tar, Git, cgroup v2, the existing sandboxd runtime
+prerequisites and `/dev/fuse`. AFS state/output must be native ext4 with at
+least 8 GiB free; budget additional space for the image archive, Docker layers
+and temporary runtime archive. At least 4 CPUs/12 GiB available memory are
+recommended for the sequential functional run; this is not a performance
+qualification. Public nodes retain their 3 CPU/4 GiB limits. Use the provider's
+reservation/run ownership before starting and its normal return procedure.
+
+The VM administrator must make the kernel prerequisites available before
+deployment: EROFS with a real loop mount, bridge netfilter with
+`bridge-nf-call-iptables=1`, and working legacy IPv4/IPv6 filter tables for
+the fixed sandboxd network ACL. A privileged container does not supply missing
+host kernel modules. On the qualified Ubuntu 6.8 VM, the installed `erofs`,
+`br_netfilter` and `ip6table_filter` modules needed explicit loading; no host
+firewall rules or persistent sysctl configuration were changed. The runner
+preflight checks EROFS/bridge prerequisites; sandboxd enforces its ACL
+prerequisites at startup. Neither configures the host automatically.
+
+From a clean frozen test-source checkout, supply one fixed product commit and
+fresh output paths.
+
+For an extracted Git archive without `.git`, first verify the archive SHA and
+its externally recorded full test-source commit, then set
+`ADX_E2E_HARNESS_COMMIT` to that commit. Keep this separate from
+`--artifact-commit`, which identifies the fixed product. Do not set Buildkite
+identity variables to pretend that a direct run is a CI job.
+
+```sh
+# Both OwnerFs and DFS, eight actual SDK assertions per mode.
+python3 build/e2e/run.py \
+  --bundle /absolute/fixed-bundle/bundle.json \
+  --registry-images /absolute/fixed-bundle/registry-images.json \
+  --image-export /absolute/offline-images/image-export.json \
+  --artifact-commit REPLACE_WITH_PRODUCT_COMMIT \
+  --profile standalone --case afs-sdk-full --cgroupns host \
+  --output /absolute/new-sdk-result
+
+# One required gate: public eleven groups, AFS ci-full24, SDK two modes16.
+python3 build/e2e/afs_gate.py \
+  --bundle /absolute/fixed-bundle/bundle.json \
+  --registry-images /absolute/fixed-bundle/registry-images.json \
+  --image-export /absolute/offline-images/image-export.json \
+  --artifact-commit REPLACE_WITH_PRODUCT_COMMIT \
+  --profile full --cgroupns host --output /absolute/new-full-result
+```
+
+Use `--case afs-component-full` with the first runner command for an explicitly
+targeted component Full. It reuses the registered 24 cases and frozen Rust
+test ELF already delivered in the fixed image; it never runs Cargo. No case
+flag on the native `standalone` runner still selects only the public eleven
+groups; the gate is required to include all three parts. A targeted SDK or
+component pass is not a combined Full pass.
+
+Every role is a test-owned privileged Docker container. The adapter freezes
+container/network IDs and addresses before worker access; replacement or
+ownership mismatch blocks reuse and deletion. AFS data binds only fresh
+owned ext4 directories. SDK data roles explicitly share their own container's
+mount namespace with sandboxd; other workers create private mount namespaces.
+Component Full additionally exposes the existing BDI cache-probe directory to
+its M role. These containers share one VM kernel/storage and do not establish
+cross-host placement or failure isolation.
+
+Require the parent and every child report, exact required case counts, matching
+product/harness/file identities and JUnit; public Full retains its six stop
+observability receipts. Require normal AFS process/mount cleanup, SDK
+Environment/backend cleanup and `docker-cleanup.json` for owned containers,
+network and cgroups. Removing a container cannot replace normal AFS cleanup.
+Keep one original result/log/identity set and the frozen input; after successful
+verification remove this run's derived runtime tar, native state and redundant
+transfer copies. Do not prune shared Docker images or other tasks' caches.
+
+### Fixed-package specials (PK2 minimum scope)
+
+The explicit Docker cases `afs-component-specials`, `afs-sdk-restart` and
+`afs-sdk-pressure` extend fixed-package functional diagnostics. They are not
+part of default smoke or Full. On 2026-11-01, fixed Base236 product `f93e2fb0`
+and test-source `ec144088aa82544e3b8fd5f85c93cc75145234cb` passed one complete
+three-group campaign on the same Linux6.8/x86_64/ext4 Docker VM, in 240.975
+seconds: five component cases, eight SDK restart assertions per mode, and five
+SDK pressure assertions per mode, including normal cleanup. The initial failed
+campaign and the stricter qualification are recorded separately in the canonical
+strategy. Other candidates and environments require their own runs.
+
+`afs-component-specials` reuses five existing AFS runner cases: OwnerFs/DFS
+normal restart, DFS bounded-sync progress through the declared 64 MiB queue
+profile, required-replica recovery, and failed-close retirement. It uses the
+same Meta/Node binaries and normal process/mount cleanup as Full.
+
+The SDK restart case keeps one real Environment on each AFS data role. An
+SDK-launched background workload performs checked, synced file I/O while the
+second Adxlet is paused; the fixture then resumes it, restarts both Adxlets
+through the existing fault helper, and requires new process/session identities,
+unchanged external runtime identities, further mounted I/O progress and full
+SDK content verification. Explicit Environment deletion precedes AFS unmount.
+The background command acknowledges startup before fault injection, uses only
+the fixed image's existing Perl core support, and preserves command diagnostics
+before deletion. After both Adxlets are ready, take a new progress baseline and
+require another increment; earlier activity cannot stand in for post-ready I/O.
+
+The SDK pressure case runs four workers with eight independent 64 KiB files
+each, checks every byte through the opposite AFS role, checks `EEXIST` for
+exclusive creation, and removes the files and Environments. This is a bounded
+functional workload: it does not prove disk exhaustion, fairness, memory SLA,
+throughput, crash durability or long-running reliability.
+
+Reuse the existing targeted-suite scheduler through its public native entry:
+
+```sh
+python3 build/e2e/targeted_suite.py \
+  --bundle /absolute/fixed-bundle/bundle.json \
+  --registry-images /absolute/fixed-bundle/registry-images.json \
+  --image-export /absolute/offline-images/image-export.json \
+  --artifact-commit REPLACE_WITH_PRODUCT_COMMIT \
+  --case afs-component-specials --case afs-sdk-restart --case afs-sdk-pressure \
+  --budget-seconds 3600 --case-timeout-seconds 900 --cgroupns host \
+  --output /absolute/new-special-result
+```
+
+Each case receives a fresh deployment and output. The suite verifies the
+frozen harness, exact required assertions and explicit normal cleanup receipts;
+a zero exit or container removal cannot replace them. A product case failure
+may be followed by another independent case only after cleanup is confirmed;
+the campaign remains failed. Timeout, missing identity or unconfirmed cleanup
+stops the campaign. To reproduce just one group, use the same fixed inputs
+with `build/e2e/run.py --profile standalone --case CASE` and a fresh output.
+
+The legacy standard-suite runner retains its ARM64 and full-environment
+guards. This native x86_64 campaign does not run pjdfstest/LTP/FSx/random
+compatibility suites or claim their execution counts.
+
+### Continuous fixed-package qualification (PK3)
+
+The explicit public `soak.py` entry reuses the PK1 offline Docker deployment,
+candidate checks, installed SDK and PK2 AFS mount preparation. It keeps one
+Environment per data role and the same AFS cluster throughout the requested
+workload; it does not loop over fresh deployments. This is separate from the
+legacy 300-second `mixed-soak` and the three-hour targeted-suite budget.
+
+```sh
+python3 build/e2e/soak.py \
+  --bundle /absolute/fixed-bundle/bundle.json \
+  --registry-images /absolute/fixed-bundle/registry-images.json \
+  --image-export /absolute/offline-images/image-export.json \
+  --artifact-commit REPLACE_WITH_PRODUCT_COMMIT \
+  --mode ownerfs --seconds 60 --sample-seconds 5 \
+  --output /absolute/new-soak-result
+```
+
+On 2026-11-01, frozen test source `6e7c87b8` and fixed Base236 product
+`f93e2fb0` completed OwnerFs 60.510062s/65 cycles and DFS 60.386944s/64
+cycles, plus deliberate-failure and external-cancellation qualifications. Each
+normal run had 13 resource samples; all four completed normal cleanup. Negative
+runs retained failed parent results. This qualifies the entry, not long-run
+reliability or performance. See the canonical testing strategy for evidence scope.
+
+Choose `ownerfs` or `dfs` explicitly; each has its own result. The installed
+candidate SDK repeatedly verifies previously synced content, publishes a bounded
+16 KiB working file with fsync, checks every byte from the opposite role, runs
+the existing mixed-load command/binary-file primitive, and creates/deletes a
+temporary Environment about every five seconds. Anchor IDs remain stable.
+The temporary command files are removed each cycle. There is no automatic retry,
+fault injection, restart, package build or version substitution.
+
+The duration flag accepts 1..86400 seconds; PASS also requires at least two
+completed cycles, one churn and two resource samples. Very short requests may
+therefore fail admission. Timing starts after SDK mount preparation and stops
+before cleanup. The controller allows a separate 600-second preparation/final
+operation reserve; shutdown allows 180 seconds for the SDK worker. Each in-node
+resource probe has a 30-second deadline; Docker transport keeps the adapter's
+existing deadlines. This entry bypasses neither SDK call
+timeouts nor the caller's outer job budget: reserve deployment and cleanup time
+in addition to the requested duration. Background-worker PID/start identity,
+progress, terminal receipt and normal cleanup are checked explicitly.
+
+`soak-samples.jsonl` records each role's cgroup memory, persistent process
+PID/start time/RSS/FDs, mount count, owned `/a` disk bytes and free disk. Defaults
+are **qualification bounds**, frozen in `soak-result.json`: growth from the
+first active sample <=512 MiB memory, <=256 MiB disk, <=128 FDs, <=8 mounts,
+and >=2048 MiB free. Override using `--max-memory-growth-mib`,
+`--max-disk-growth-mib`, `--max-fd-growth`, `--max-mount-growth`, `--min-free-mib`.
+Sample gaps must be <=3 intervals+30 seconds; missing progress for more than
+max(30 seconds, 3 intervals), resource overflow, changed persistent process
+identity, content mismatch or any SDK error fails immediately. These broad
+bounds and short samples are not a leak-free or performance acceptance contract.
+Internal backlog/GC queues and formal long-term trend criteria remain unqualified.
+
+`SIGTERM`/`SIGINT` requests SDK stop, waits for worker termination and explicit
+Environment deletion, verifies empty runtimes, normally stops/unmounts AFS,
+then removes owned Docker resources. Cancellation remains a failed parent run
+with a cancelled workload. For a negative qualification use
+`--qualify-fail-after-cycles 3`; the deliberate failure must also stay failed.
+Unconfirmed normal cleanup fails even if container removal succeeds.
+
+Read `result.json`, `soak-result.json`, `soak-sdk/workload.json`, samples,
+`soak-afs/cleanup.json`, `afs-sdk-cleanup.json`, `docker-cleanup.json` and JUnit
+together. The default entry retains `qualification_only=true`: configured
+hours or days do not establish formal long-run acceptance. Freeze an appropriate
+resource/trend/error/fault policy and actually complete the declared duration
+before making that claim. K8s, cross-VM failure isolation and precise performance
+are outside this implementation. Default smoke and Full selections are unchanged.
+
+### Frozen one-hour acceptance v3
+
+`--acceptance one-hour` selects the tracked
+[one-hour-v3 contract](soak-contracts/one-hour-v3.json). It requires exactly
+3600 seconds, 15-second sampling, no deliberate fault and the explicit FD accounting below;
+the CLI rejects altered duration, sampling or relaxed limits. Run OwnerFs and
+DFS sequentially with the same fixed package and separate new outputs:
+
+```sh
+python3 build/e2e/soak.py \
+  --bundle /absolute/fixed-bundle/bundle.json \
+  --registry-images /absolute/fixed-bundle/registry-images.json \
+  --image-export /absolute/offline-images/image-export.json \
+  --artifact-commit REPLACE_WITH_PRODUCT_COMMIT \
+  --mode ownerfs --acceptance one-hour --seconds 3600 \
+  --output /absolute/new-ownerfs-one-hour-result
+```
+
+The one-hour workload keeps the same alternating 16 KiB fsync/cross-role
+read, confirmed-content verification, SDK command/file round trip and temporary
+Environment churn. Raw publication data uses a fixed SDK staging file; a <=2 KiB
+UID10000 command copies it into AFS and fsyncs. The product retains command
+strings by default for 3600 seconds, so embedding each changing payload as a
+32 KiB hex argument would manufacture control-memory growth in this fixed-set
+test. No production retention setting is changed. Two anchor Environments and the AFS cluster remain live.
+Require >=600 verified publishing cycles and >=300 completed churns in total;
+each steady five-minute window needs >=25 cycles and >=10 completed churns.
+These minimums ensure sustained work, not a throughput SLA. There is no restart,
+fault injection, automatic retry, package change or threshold adjustment.
+
+All 3600 seconds are load time. The first 600 seconds are warmup for trend
+analysis only; peak/error/OOM/identity checks still apply then. Evaluate every
+one of the ten following 300-second windows with >=12 active samples each,
+<=45-second observation/progress gaps and <=30-second outer coverage gaps.
+DFS peer reads must increase in every steady window. Missing windows or counters
+cannot be omitted. Resource medians use active workload samples; the post-cleanup
+sample does not hide load-time growth.
+
+Observe Docker-node cgroups and sibling external-runtime cgroups separately,
+including anonymous/file memory and OOM events. Observe persistent process
+PID/start/RSS/FD, each anchor's labeled runc ID/PID/start/RSS/FD, mounts,
+apparent AFS/data bytes versus logs, runtime backing allocation and
+retained stream allocation. Keep the legacy cross-mount apparent runtime size
+as a diagnostic counter. `runtime_backing_bytes` counts st_blocks*512 once per
+inode on the owning filesystem and prunes all submount views, including same-
+device bind mounts, EROFS/overlay rootfs and tmpfs caches. Writable backing
+upperdirs and retained stdout/stderr files remain counted. Memory-backed caches
+remain observed through their cgroup memory counters. A filesystem walk skips concurrently retired entries,
+counts hard links once and never follows external symlinks; other read errors
+fail sampling. Any OOM, changed anchor/container/process identity, content or
+SDK error, missing observation, exceeded peak or unconfirmed cleanup fails.
+Only active samples query the two anchors, so ordinary post-workload deletion
+does not look like an unexpected backend replacement. Anchor physical identities
+must remain unchanged during the active hour; their RSS/FD medians participate
+in the same per-process bounds below.
+
+The frozen JSON defines peak caps and the following limits for the ten window
+medians. Both last-minus-first and an ordinary least-squares slope over all
+window midpoints must pass; positive slopes are expressed per hour:
+
+| Metric per role | Maximum end delta | Maximum slope per hour |
+| --- | --- | --- |
+| Docker anonymous memory, aggregate persistent-process RSS, AFS data, runtime backing allocation | 32 MiB | 16 MiB |
+| External-runtime anonymous memory, each persistent process RSS | 16 MiB | 8 MiB |
+| Node and each persistent process noncache FDs; raw anchor FDs | 4 | 4 |
+| Mount count | 1 | 1 |
+
+The v3 FD rule gives only an owned DFS `afs-node` cache credit of at most 256
+unique live regular-file dev/inode identities directly under its explicit,
+stable canonical chunk directory. Raw `/proc/<pid>/fd` entries and PID/start/root
+path/device/inode identities are retained and independently recomputed.
+Duplicates, deleted files, foreign paths, and OwnerFs/Meta/platform/anchor FDs
+receive no credit. `fds_noncache = raw_fds - min(eligible_unique_chunks, 256)`;
+excess physical readers remain charged, including inflight holders. Missing or
+inconsistent accounting fails. A census may make at most three bounded attempts
+if procfs changes during capture; all race reasons are retained, and exhausted
+capture fails the sample. This never retries a failed workload or omits a sample.
+
+The original +128 peak bound and 4 end-delta / 4-per-hour steady bounds now
+apply to node AND each persistent process **noncache** FDs. A separate raw cap
+is +128 for OwnerFs/Meta/other processes, or +128+256 for an owned DFS Node.
+Every five-minute steady window must have median excess above the 256 credit
+of zero; transient excess is still charged against noncache limits. Raw node
+window medians/slopes remain visible as diagnostics. Anchors retain their
+original raw bounds. This change allows verified bounded cache fill; it does
+not exempt continuing growth or claim that the whole process has only 256 FDs.
+All workload, time, RSS/memory, storage, mount, error and cleanup rules remain
+identical to v2, enforced by a tool regression.
+
+Page-cache observations remain visible but are bounded by the separate total
+memory peak, rather than mislabeled as anonymous leakage. Log bytes have a
+separate 128 MiB peak-growth allowance; data trend limits exclude those AFS logs.
+The v2 numeric limits and workload minimums are identical to v1; a regression
+assertion enforces that equivalence after the runtime metric rename. They define
+this fixed-working-set, one-hour test. Passing does not
+prove absence of smaller/slower leaks, 24-hour stability, internal GC/backlog
+correctness, fault recovery, cross-VM isolation or performance.
+
+Require `soak-contract.json` and its SHA, `soak-acceptance.json` with all ten
+windows/trends, the matching installed-SDK workload with
+`qualification_only=false`, samples, fixed product/harness identity and all
+normal cleanup receipts. The parent/JUnit must also pass. A failed or cancelled
+run remains failed; a normal cleanup alone cannot establish acceptance.
+
+### Recorded formal attempts (fixed Base236)
+
+The first v1 attempt (source `c9724a70`, fixed Base236) failed at 70.181902s
+OwnerFs and 205.250455s DFS on the cross-mount `runtime_disk_bytes` peak; neither
+is a one-hour pass. Both had zero workload errors and normal cleanup. A separate
+controlled diagnostic added/deleted one backend: EROFS/overlay mount views raised
+logical size by415,249,086B and restored it on deletion, while backing allocation
+rose only57,344B. The correction is a versioned measurement fix, with original
+failures retained, not a relaxed threshold or a product patch. A diagnostic
+operator import-path failure is retained separately.
+
+Fresh v2 admission used harness `d32a3dcf`, the tracked contract SHA
+`466b903f05c94e6fcb0dc5a91d99983dcd2eece2a14023c668a0f306e295e02c`,
+570 public-tool and 67 AFS-runner tests, and a separately audited 60.352433s
+observer qualification. Both actual formal targets remained 3600s:
+
+| Mode | Actual workload | First resource violation | Outcome |
+| --- | --- | --- | --- |
+| OwnerFs | 2209.735926s, 2287 cycles, 383 create/delete pairs, 133 samples | node1 total FDs 136 to 267, growth 131 above 128; afs-node FDs 28 to 160 | FAILED early; normal SDK/backend, AFS and Docker cleanup passed |
+| DFS | 272.604138s, 281 cycles, 49 create/delete pairs, 17 samples | node1 total FDs 134 to 271, growth 137 above 128; afs-node FDs 25 to 164 | FAILED early; all normal cleanup passed |
+
+Both had zero SDK/content errors, unchanged persistent identities and no OOM.
+The resource gate cancelled the worker; neither run completed an hour or all ten
+steady-state windows. The campaign remains failed, with no automatic retry or
+threshold change. Two host-procfs snapshots additionally found 19 more descriptors
+to one OwnerFs workspace root in the same afs-node process; they establish the
+observed growth, not its root cause. DFS descriptor targets were not captured.
+A subsequent short component diagnostic reused the exact Base236 AFS binaries
+and existing Cluster fixture. A local directory control added no Home FDs;
+100 remote directory open/close operations left exactly 100 extra Home directory
+FDs, matching the missing remote `releasedir` call in OwnerFs. Separately, 768
+local DFS publications/fsyncs and complete reads (per-file DONTNEED) produced
+chunk-FD counts 128/256/256/256/256/256; old descriptors were evicted, and 100
+same-object reads added none. These are `DIAGNOSTIC_ONLY` findings, with seven
+normal process exits, not a successful SDK hour or a registered new suite.
+
+The cold-start +128 FD limit is below the verified 256-entry reader-cache
+capacity. Both original v2 runs remain failed and the v1/v2 JSON files stay
+byte-identical. The follow-up registers `dfs.resources.reader_fd_budget` in the
+AFS component runner and versions only the formal FD accounting as v3; production
+code/settings, default smoke, and Full case selections are unchanged.
+OwnerFs repair is tracked separately in [Issue73](https://gitcode.com/openJiuwen/agent-dx/issues/73).
+This contract freeze is not an actual v3 SDK observer admission or one-hour pass.
+After obtaining a fixed repair package, repeat short observer admission with v3,
+then start fresh OwnerFs and DFS one-hour runs. Never reinterpret or concatenate
+old failures. See the evidence scope and next steps in the
+[same five-step strategy](../../docs/testing/test-strategy.md#step-5).
+
+### Fixed AFS component package on one Linux VM
+
+Provide a Linux VM whose native architecture matches the component, Python
+3.10+, OpenSSL, root or `sudo -n`, a working `/dev/fuse`, util-linux/fuse3 tools
+and a short dedicated native ext4 data directory. Follow the existing
+[AFS environment prerequisites](../../afs/tests/README.md#运行条件).
+This path runs Meta and multiple Node processes plus real FUSE/bind mounts in
+one VM; it does not install the complete ADX stack or exercise its SDK.
+
+Freeze the following separately: the product component's complete commit and
+target, trusted archive SHA256/build ID, the clean test-source commit and file
+digests, selected case IDs and environment configuration. A Buildkite Base
+candidate publishes the complete AFS component as
+`out/buildkite/components/afs.tar.gz`; it contains `afs-meta`, `afs-node` and
+their component `manifest.json`. This is an optional delivery artifact distinct
+from the complete `adx-release.tar.gz`. Use the manifest-bound AFS binaries
+inside the full release instead when validating that delivery form, and label
+the actual package scope in results.
+
+Run from the frozen test-source root inside the VM. These variables are
+operator-provided paths/identities, not shared CI defaults:
+
+```sh
+AFS_ARCHIVE=/absolute/path/to/afs.tar.gz
+AFS_ARCHIVE_SHA256=REPLACE_WITH_TRUSTED_ARCHIVE_SHA256
+AFS_PRODUCT_COMMIT=REPLACE_WITH_40_CHARACTER_PRODUCT_COMMIT
+AFS_TARGET=x86_64-unknown-linux-gnu  # use aarch64-unknown-linux-gnu for ARM64
+AFS_INPUT=/absolute/path/to/new-fixed-inputs
+AFS_DATA=/var/tmp/afsp001            # new, owned, short, native ext4
+AFS_RESULTS=/absolute/path/to/new-component-result
+export AFS_INPUT AFS_DATA
+
+printf '%s  %s\n' "$AFS_ARCHIVE_SHA256" "$AFS_ARCHIVE" | sha256sum -c -
+mkdir "$AFS_INPUT"
+mkdir "$AFS_INPUT/component" "$AFS_INPUT/bin"
+tar -xzf "$AFS_ARCHIVE" -C "$AFS_INPUT/component"
+python3 build/release/component.py verify --component afs \
+  --directory "$AFS_INPUT/component" \
+  --commit "$AFS_PRODUCT_COMMIT" --target "$AFS_TARGET"
+
+# Adapt the verified component identity to the existing runner input contract.
+python3 - <<'PY'
+import json, os, subprocess
+from pathlib import Path
+root = Path(os.environ['AFS_INPUT']).resolve()
+manifest = json.loads((root / 'component/manifest.json').read_text())
+harness = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+identity = {'schema_version': 1, 'commit': manifest['commit'], 'target': manifest['target'],
+            'binaries': manifest['files'], 'harness_commit': harness,
+            'package_scope': 'verified AFS component package'}
+for name in ('afs-meta', 'afs-node'):
+    (root / 'bin' / name).symlink_to(root / 'component' / name)
+(root / 'bin/artifact-identity.json').write_text(json.dumps(identity, indent=2) + '\n')
+config = json.loads(Path('afs/tests/fixtures/singlevm.example.json').read_text())
+config['hosts']['guest']['base'] = os.environ['AFS_DATA']
+(root / 'singlevm.json').write_text(json.dumps(config, indent=2) + '\n')
+PY
+
+# Create only the new dedicated data directory, then qualify the selected scope.
+sudo -n mkdir -m 0755 "$AFS_DATA"
+python3 afs/tests/run.py check-env --env "$AFS_INPUT/singlevm.json" \
+  --binary-dir "$AFS_INPUT/bin" \
+  --case ownerfs.basic.read_write --case ownerfs.permissions.deny_other_uid \
+  --case dfs.basic.namespace --case dfs.basic.one_writer_many_readers
+python3 afs/tests/run.py run --env "$AFS_INPUT/singlevm.json" \
+  --binary-dir "$AFS_INPUT/bin" --work-root "$AFS_RESULTS" \
+  --case ownerfs.basic.read_write --case ownerfs.permissions.deny_other_uid \
+  --case dfs.basic.namespace --case dfs.basic.one_writer_many_readers
+```
+
+The input/output directories and data base must be new and owned by this run.
+Check extraction tools, archive member ownership and the trusted digest before
+using a package; do not derive its trusted SHA from the just-downloaded bytes.
+Do not change the sample UID/GID to a real user's identity merely to pass a
+permission check. A managed environment may supply an equivalent private
+mount/namespace transport, but its data must still be native ext4 and its
+actual isolation/resource limits recorded. An AFS UDS path must fit Linux's
+108-byte limit; a long management path is not a product failure.
+
+Require all four selected cases to execute and pass with matching binary/source
+identities, zero cleanup errors and normal process/unmount receipts. Preserve
+`result.json`, per-case `identity.json`, `environment.json`, `checks.json`,
+`waits.json`, `cleanup.json` and raw logs. `check-env` exit 2 means BLOCKED; READY/exit 0 is environment admission only,
+not a functional pass. This selection excludes the Rust contract ELF, complete local
+suite, ADX SDK/Full, cross-VM fault isolation, soak and performance. The existing
+AFS runner can select wider suites when their inputs and environment qualify;
+do not claim those scopes from this four-case run.
+
+Before returning the VM, verify/export necessary results, normally stop/unmount
+all owned processes and mounts, and remove verified redundant execution copies
+and generated data. Retain one frozen package/identity and original failure
+evidence. Follow the VM provider's normal close/release procedure; do not clean
+other projects or shared caches.
+
 ## Activator deployment acceptance
 
 The native Linux Docker driver supports complete Activator deployment acceptance in

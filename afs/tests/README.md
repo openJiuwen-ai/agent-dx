@@ -549,3 +549,32 @@ python3 afs/tests/run.py run --suite local-performance --allow-performance \
 所有阶段在断言前输出JSON，失败时也保留实际日志、驻留向量和计数；零READ没有改成允许少量READ。
 
 本批实现的冻结功能结果、制品身份与发布边界见[读写专项验证记录](../../docs/testing/afs-io-specials-validation-20261031.md)。
+
+
+### DFS reader FD有界回归
+
+`dfs.resources.reader_fd_budget`位于`suites/dfs/test_resources.py`，测试步骤在
+`suites/dfs/fd_budget.py`，只读FD分类工具在`tools/fd_inventory.py`。复用既有
+singlevm的Meta＋A/B进程、真实FUSE及正常卸载／退出协议；同架构固定组件包、
+合格Linux VM、Python3.10+、root权限和原运行条件不变，不需要SDK或K8s。
+
+```sh
+python3 afs/tests/run.py run --case dfs.resources.reader_fd_budget \
+  --env /absolute/singlevm.json --binary-dir /absolute/fixed-component \
+  --work-root /absolute/new-fd-results
+# 也可使用 --case 'dfs.resources.*' 或 --suite local-resources
+```
+
+固定768轮不同16KiB内容写入／fsync／DONTNEED后完整读取，六个128轮检查点
+要求物理chunk FD为128／256／256／256／256／256，观察768个不同对象，后四批
+每批淘汰128个旧句柄；再DONTNEED读取同对象100次，集合不变。
+要求local_probe至少增加868、PID/start和chunk根身份不变、B无本地reader、
+检查点无重复／超容量句柄，A其它FD相对基线最多增加4。
+结果保留原始FD表、metrics前后值、内容断言、源码／产品身份与正常cleanup。
+失败不自动重试；验收断言使用显式错误，Python `-O`也不能绕过读取计数检查。
+工具单测不能替代Linux真实运行。
+
+本例是定向组件回归，本轮不加入`local-basic`、`all-basic`、`ci-full`或默认CI冒烟。
+它验证关闭负载检查点的封顶、淘汰和复用；不证明SDK一小时、在途并发上界、
+所有泄漏路径或性能。公共正式长稳FD合同另见
+[one-hour-v3](../../build/e2e/soak-contracts/one-hour-v3.json)。

@@ -70,8 +70,8 @@ def resources(namespace, image, architecture, registry_auth=False, node_names=()
     return objects
 
 
-def validate_result(report, cleanup, full=False):
-    expected = FULL_CASES if full else CASES
+def validate_result(report, cleanup, full=False, case_ids=None):
+    expected = case_ids if case_ids is not None else (FULL_CASES if full else CASES)
     records = report.get('cases', [])
     actual = [item.get('id') for item in records]
     if (report.get('status') != 'PASS' or report.get('cleanup_errors') or cleanup.get('status') != 'PASS'
@@ -86,9 +86,10 @@ def validate_result(report, cleanup, full=False):
 
 
 class Component:
-    def __init__(self, run, full=False):
+    def __init__(self, run, full=False, case_ids=None):
         self.run = run
         self.full = full
+        self.case_ids = case_ids
         self.roles = dict(ROLES, C='afs-c') if full else ROLES
         self.attempted_cases = False
         self.normal_cleanup = None
@@ -155,26 +156,33 @@ class Component:
             self.config = {'kind': 'matrix', 'environments': {'local': local, 'cluster': self.config}}
             (run.output / 'afs-environment.json').write_text(json.dumps(self.config, indent=2))
 
+    def copy_from(self, node, source, destination, timeout=120):
+        self.run.kube('-n', self.run.id, 'cp', node + ':' + source,
+                      str(destination), '-c', 'platform', timeout=timeout)
+
     def scenarios(self, checks):
         run = self.run
-        with run.case('afs-component-full' if self.full else 'afs-component', checks) as record, \
+        name = 'afs-component-specials' if self.case_ids is not None else (
+            'afs-component-full' if self.full else 'afs-component')
+        with run.case(name, checks) as record, \
                 tempfile.TemporaryDirectory(prefix='adx-afs-inputs-') as temp:
             inputs = Path(temp)
             for name in ('afs-meta', 'afs-node'):
-                run.kube('-n', run.id, 'cp', ROLES['M'] + ':/opt/adx/package/bin/' + name,
-                         str(inputs / name), '-c', 'platform', timeout=120)
+                self.copy_from(ROLES['M'], str(Path('/opt/adx/package/bin') / name), inputs / name)
                 (inputs / name).chmod(0o755)
-            run.kube('-n', run.id, 'cp', ROLES['M'] + ':/opt/adx/e2e/afs-tests/inputs/artifact-identity.json',
-                     str(inputs / 'artifact-identity.json'), '-c', 'platform', timeout=60)
+            self.copy_from(ROLES['M'], '/opt/adx/e2e/afs-tests/inputs/artifact-identity.json',
+                           inputs / 'artifact-identity.json', timeout=60)
             if self.full:
                 contract_dir = inputs / 'contracts'
                 contract_dir.mkdir()
                 for name in ('fuse_contract', 'manifest.json'):
-                    run.kube('-n', run.id, 'cp', ROLES['M'] + ':/opt/adx/e2e/afs-contracts/' + name,
-                             str(contract_dir / name), '-c', 'platform', timeout=120)
-                from run import common
-                manifest = common.afs_contracts.installed(contract_dir, self.package)
-                if common.afs_contracts.sha(contract_dir / 'manifest.json') != self.contract_manifest_sha:
+                    self.copy_from(ROLES['M'], str(Path('/opt/adx/e2e/afs-contracts') / name), contract_dir / name)
+                contract_spec = importlib.util.spec_from_file_location('component_contracts',
+                                                                     ROOT / 'build/e2e/afs_contracts.py')
+                contracts = importlib.util.module_from_spec(contract_spec)
+                contract_spec.loader.exec_module(contracts)
+                manifest = contracts.installed(contract_dir, self.package)
+                if contracts.sha(contract_dir / 'manifest.json') != self.contract_manifest_sha:
                     raise ValueError('runtime test asset manifest differs from bundle')
                 (contract_dir / 'fuse_contract').chmod(0o755)
                 (contract_dir / 'fuse_contract').rename(inputs / 'fuse_contract')
@@ -193,7 +201,7 @@ class Component:
                 if self.full:
                     args += ['--suite', 'ci-full']
                 else:
-                    for name in CASES:
+                    for name in self.case_ids if self.case_ids is not None else CASES:
                         args += ['--case', name]
                 handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGALRM)}
                 self.attempted_cases = True
@@ -211,7 +219,7 @@ class Component:
                                    for entry in report.get('cases', [])]
             if code:
                 raise ValueError('AFS component runner failed or was BLOCKED; see afs/result.json')
-            validate_result(report, self.normal_cleanup, full=self.full)
+            validate_result(report, self.normal_cleanup, full=self.full, case_ids=self.case_ids)
 
     def cleanup(self):
         run = self.run

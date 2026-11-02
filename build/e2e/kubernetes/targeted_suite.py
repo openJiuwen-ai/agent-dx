@@ -65,14 +65,33 @@ def run_suite(
     execute=execute_case,
     clock=time.monotonic,
     case_timeout_seconds=DEFAULT_CASE_TIMEOUT_SECONDS,
+    deployment='kubernetes',
 ):
-    """Continue after a case failure only when its Kubernetes cleanup is verified."""
+    """Continue after a case failure only when its selected deployment is cleaned."""
     cases = tuple(cases)
     if not cases or len(set(cases)) != len(cases):
         raise ValueError('targeted cases must be nonempty and distinct')
+    native = deployment == 'local-docker'
+    if deployment not in ('kubernetes', 'local-docker'):
+        raise ValueError('unsupported targeted deployment')
+    driver = None
+    identity_gate = None
+    native_identity = {}
+    if native:
+        spec = importlib.util.spec_from_file_location('targeted_native', HERE.parent / 'docker_run.py')
+        driver = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(driver)
+        identity_gate = driver.load('targeted_identity_gate', HERE / 'afs_gate.py')
+    expected_checks = {}
     for case in cases:
-        if common.selected_checks('full', case) != (case,):
+        if native:
+            if case not in driver.specials.CAMPAIGN_CASES:
+                raise ValueError('unsupported native special: ' + case)
+            expected_checks[case] = driver.selected_checks('standalone', case)
+        elif common.selected_checks('full', case) != (case,):
             raise ValueError(f'{case} is not a Full E2E case')
+        else:
+            expected_checks[case] = (case,)
         if case == 'redis-pod-restart':
             raise ValueError('redis-pod-restart needs a dedicated storage class run')
     if not 0 < budget_seconds <= MAX_BUDGET_SECONDS:
@@ -105,10 +124,10 @@ def run_suite(
         command = [
             sys.executable,
             '-u',
-            str(HERE / 'run.py'),
+            str((HERE.parent if native else HERE) / 'run.py'),
             *shared_args,
             '--profile',
-            'full',
+            'standalone' if native else 'full',
             '--case',
             case,
             '--output',
@@ -126,11 +145,27 @@ def run_suite(
         child = _read_json(destination / 'result.json')
         if not isinstance(child, dict):
             child = None
-        child_cleanup = child.get('cleanup_errors', []) if child else []
+        child_cleanup = list(child.get('cleanup_errors', [])) if child else []
+        if native:
+            cleanup = _read_json(destination / 'docker-cleanup.json')
+            if not cleanup or cleanup.get('status') != 'PASS' or cleanup.get('errors'):
+                child_cleanup.append('explicit Docker cleanup receipt missing or failed')
+            if child and child.get('status') == 'passed':
+                try:
+                    driver.specials.verify_part(destination, case)
+                except (OSError, ValueError, KeyError, TypeError) as error:
+                    errors.append(f'{case}: required special evidence: {error}')
+                    stopped = True
         if child_cleanup:
             cleanup_errors.extend(f'{case}: {error}' for error in child_cleanup)
         if child:
             child_harness = child.get('harness')
+            if native:
+                try:
+                    identity_gate.accept_harness(native_identity, child, driver.harness.source_commit())
+                except ValueError as error:
+                    errors.append(f'{case}: frozen native harness identity: {error}')
+                    stopped = True
             if not child_harness:
                 errors.append(f'{case}: missing harness identity')
                 stopped = True
@@ -155,7 +190,7 @@ def run_suite(
             and exit_code == 0
             and not timed_out
             and child.get('status') == 'passed'
-            and child.get('checks') == [case]
+            and child.get('checks') == list(expected_checks[case])
             and not child.get('missing_checks')
             and not child_cleanup
             and not stopped
@@ -167,11 +202,26 @@ def run_suite(
             if child and child.get('status') == 'passed' and not stopped:
                 errors.append(f'{case}: driver result and process exit disagree')
                 stopped = True
-        child_case = child['cases'][0] if child and child.get('cases') else {}
+        child_cases = child.get('cases', []) if child else []
+        if native and child and child.get('status') == 'passed':
+            required = list(expected_checks[case])
+            malformed = child.get('required_checks') != required or len(child_cases) != len(required)
+            if not malformed:
+                malformed = ({v.get('name') for v in child_cases} != set(required)
+                             or any(v.get('status') != 'passed' for v in child_cases))
+            if malformed:
+                if case in checks:
+                    checks.remove(case)
+                if case not in failed_cases:
+                    failed_cases.append(case)
+                passed = False
+                stopped = True
+                errors.append(f'{case}: required child case records missing or failed')
+        child_case = child_cases[0] if child_cases else {}
         record = {
             'name': case,
             'status': 'passed' if passed else 'failed',
-            'seconds': child_case.get('seconds', 0),
+            'seconds': sum(v.get('seconds', 0) for v in child_cases) if native else child_case.get('seconds', 0),
             'error': None
             if passed
             else (child.get('error') if child else None) or child_case.get('error') or f'driver exited {exit_code}',
@@ -179,7 +229,10 @@ def run_suite(
             'timed_out': timed_out,
             'evidence': str(destination.relative_to(output)),
         }
-        if child_case:
+        if native:
+            record['subcases'] = [dict(v, id=item['name'] + '/' + v['id']) for item in child_cases
+                                  for v in item.get('subcases', [])]
+        elif child_case:
             record['subcases'] = child_case.get('subcases', [])
         records.append(record)
         print(
@@ -191,9 +244,9 @@ def run_suite(
     missing = [case for case in cases if case not in checks]
     report = {
         'status': 'passed' if not missing and not cleanup_errors and not errors else 'failed',
-        'deployment': 'kubernetes',
+        'deployment': deployment,
         'profile': 'targeted-suite',
-        'source_profile': 'full',
+        'source_profile': 'standalone' if native else 'full',
         'selected_cases': list(cases),
         'budget_seconds': budget_seconds,
         'required_checks': list(cases),
@@ -208,7 +261,7 @@ def run_suite(
     }
     (output / 'result.json').write_text(json.dumps(report, indent=2) + '\n')
     (output / 'placement.json').write_text(json.dumps(placements, indent=2) + '\n')
-    common.write_junit(output / 'junit.xml', report, 'platform-kubernetes-targeted-suite')
+    common.write_junit(output / 'junit.xml', report, 'platform-' + deployment + '-targeted-suite')
     print(
         f"[RESULT] {report['status'].upper()}: {len(checks)}/{len(cases)} cases passed; "
         f"elapsed={report['wall_elapsed_seconds']:.1f}/{budget_seconds}s",
@@ -217,10 +270,15 @@ def run_suite(
     return report
 
 
-def main():
+def main(default_deployment='kubernetes'):
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ('bundle', 'registry-images', 'kubeconfig', 'output'):
+    for name in ('bundle', 'registry-images', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
+    parser.add_argument('--deployment', choices=('kubernetes', 'local-docker'), default=default_deployment)
+    parser.add_argument('--kubeconfig', type=Path)
+    parser.add_argument('--image-export', type=Path)
+    parser.add_argument('--artifact-commit')
+    parser.add_argument('--cgroupns', choices=('private', 'host'), default='host')
     parser.add_argument('--case', action='append', required=True)
     parser.add_argument('--context')
     parser.add_argument('--node-name', action='append', default=[])
@@ -228,15 +286,31 @@ def main():
     parser.add_argument('--budget-seconds', type=int, default=MAX_BUDGET_SECONDS)
     parser.add_argument('--case-timeout-seconds', type=int, default=DEFAULT_CASE_TIMEOUT_SECONDS)
     args = parser.parse_args()
+    native = args.deployment == 'local-docker'
+    if native:
+        if not args.image_export or not args.artifact_commit:
+            parser.error('local-docker requires --image-export and --artifact-commit')
+        if (args.kubeconfig
+                or args.context
+                or args.node_name):
+            parser.error('local-docker does not consume Kubernetes or registry credentials')
+        if (args.registry_auth):
+            parser.error('local-docker does not consume Kubernetes or registry credentials')
+    elif args.kubeconfig is None:
+        parser.error('--kubeconfig is required for Kubernetes')
     shared = []
-    for name in ('bundle', 'registry_images', 'kubeconfig', 'context', 'registry_auth'):
+    for name in ('bundle', 'registry_images', 'kubeconfig', 'context', 'registry_auth',
+                 'image_export', 'artifact_commit'):
         value = getattr(args, name)
         if value is not None:
             shared.extend(('--' + name.replace('_', '-'), str(value)))
     for name in args.node_name:
         shared.extend(('--node-name', name))
+    if native:
+        shared.extend(('--cgroupns', args.cgroupns))
     report = run_suite(
-        args.case, args.output, shared, args.budget_seconds, case_timeout_seconds=args.case_timeout_seconds
+        args.case, args.output, shared, args.budget_seconds, case_timeout_seconds=args.case_timeout_seconds,
+        deployment=args.deployment,
     )
     return 0 if report['status'] == 'passed' else 1
 
