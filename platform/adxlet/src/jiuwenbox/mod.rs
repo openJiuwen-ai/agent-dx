@@ -787,14 +787,14 @@ impl Jiuwenbox {
         lock: tokio::sync::OwnedMutexGuard<()>,
     ) -> tokio::task::JoinHandle<Result<()>> {
         let driver = self.clone();
-        tokio::spawn(async move {
+        tokio::spawn(adx_observability::trace::with_current_context(async move {
             let _lock = lock;
             let result = driver.cleanup(&id).await;
             if let Err(error) = &result {
                 adx_observability::warn!(runtime_id=%id, %error, "Jiuwenbox execution cleanup pending");
             }
             result
-        })
+        }))
     }
 
     async fn running_conch(&self) -> Result<BTreeSet<String>> {
@@ -923,6 +923,9 @@ fn sandbox_id(id: &str) -> String {
 
 #[async_trait]
 impl RuntimeDriver for Jiuwenbox {
+    async fn sandbox_id(&self, runtime_id: &str) -> Option<String> {
+        Some(sandbox_id(runtime_id))
+    }
     async fn start(
         &self,
         spec: &EnvironmentSpec,
@@ -992,12 +995,14 @@ impl RuntimeDriver for Jiuwenbox {
         let owned_spec = spec.clone();
         let owned_id = id.to_owned();
         let owned_devices = devices.to_vec();
-        let task = tokio::spawn(async move {
+        // Keep the sandbox.create context on the start task so failure cleanup
+        // logs emitted by start_owned stay correlated.
+        let task = tokio::spawn(adx_observability::trace::with_current_context(async move {
             let _lock = lock;
             driver
                 .start_owned(owned_spec, owned_id, generation, owned_devices, deadline)
                 .await
-        });
+        }));
         match tokio::time::timeout_at(deadline, task).await {
             Ok(result) => result.map_err(unavailable)?,
             Err(_) => {

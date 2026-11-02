@@ -9,8 +9,9 @@ ADX 使用 OpenTelemetry SDK 和 W3C `traceparent` / `tracestate`。采样与导
 - Coordinator 在创建、查询、提交和快照 RPC 入口接收上下文；独立创建/提交任务显式携带子 Span。周期节点注册/心跳及内部调度轮次不创建 Span。中心排队耗时仍包含在该请求的 `coordinator.create` Span 中，不额外导出服务多个请求的调度轮次。
 - adxlet 对用户生命周期命令在入队时保存 `environment.queue` Span，在出队时结束它；随后使用保留的上下文创建 `environment.execute`。queue 仅计入入队背压和串行等待，execute 计入实际处理，两者时间不重叠。执行 Span 的父节点仍为对应的已结束队列 Span。创建链路在执行 Span 内继续划分 `environment.runtime.start`、`environment.runtime.ready`、`environment.route.activate` 和 `environment.state.commit`，分别覆盖执行后端启动、Execd 就绪、本机路由绑定和持久化提交。调用方断开后，已接受操作继续保持原上下文；状态提交继续向 Coordinator 透传。
 - 周期 Tick 和恢复点有效期扫描不生成 queue/execute Span。巡检确认退出时创建 `environment.unexpected_exit`，触发自动暂停时创建 `environment.auto_pause`，实际状态提交、恢复和启动保留生命周期 Span。
-- Relay 为 CONNECT 生命周期记录 Span。它转发的是字节流，Execd 的 HTTP Span 延续 Ingress 注入的上下文；两者可能是同一请求的并列子 Span。
-- Execd 对没有入站 Trace 上下文的 `GET /healthz`、`GET /metrics` 和 `GET /control/v1/status` 不创建 Span；带上下文的诊断请求和其他操作继续跟踪。Execd 在解析 HTTP 头后创建以 HTTP 方法和接口模板命名的 Span，Environment ID 作为属性；`/invoke` 另外记录有界的 `rpc.method` 操作名。此 Span 覆盖 HTTP 操作处理；异步提交命令之后的用户进程运行时间尚不属于该 HTTP Span。
+- Relay 的 `relay.connect` Span 只覆盖建连段（策略/路由校验、TCP 拨号、CONNECT 成功响应），随后显式结束；后续字节泵不在该 Span 内。Execd 的 HTTP Span 延续 Ingress 注入的上下文，是同一请求下与建连 Span 并列的子 Span。
+- Execd 对没有入站 Trace 上下文的 `GET /healthz`、`GET /metrics` 和 `GET /control/v1/status` 不创建 Span；带上下文的诊断请求和其他操作继续跟踪。Execd 在解析 HTTP 头后创建以 HTTP 方法和接口模板命名的 Span，Environment ID 作为属性；`/invoke` 另外记录有界的 `rpc.method` 操作名和 `http.response.status_code`，5xx 标记 Error。此 Span 覆盖 HTTP 操作处理；异步提交命令之后的用户进程运行时间尚不属于该 HTTP Span。
+- 文件 API、数字人 WebSocket 后端握手、adxlet→Execd 控制请求与 adxlet→Relay 路由控制都会注入当前 W3C 上下文；CONNECT 之后的原始字节流不再解析或注入。
 
 创建总耗时统一使用 API Server 的 `environment.create` Span，与
 `adx_environment_create_duration_seconds` 的应用服务边界一致：参数转换后进入创建服务，
@@ -18,6 +19,11 @@ ADX 使用 OpenTelemetry SDK 和 W3C `traceparent` / `tracestate`。采样与导
 JSON、SSE 和内嵌创建共用此埋点；重放也记录本次调用耗时，不冒充第一次创建耗时。
 `environment.create.outcome` 区分 success、failure、unknown、cancelled，失败结果标记 Error；
 unknown/cancelled 不表示已确认实例创建失败。`environment_create_completed` 日志使用同一服务边界。
+创建终结时同时写入 `result`、`error.code`、`error.message`、`instance_id`、`user.id`（当前取租户）
+与 `newly_created`；阶段 Span（`apiserver.create`、`coordinator.create_environment`、`node.create_environment`、
+`environment.execute`、`environment.runtime.*`、`environment.state.commit`）写入 `environment.id`，
+失败分支写入 `result=fail` 与有界错误信息。`environment.runtime.start` 内部另有 `sandbox.create` Span，
+记录 `sandbox.backend`、`environment.id` 与结果。
 SDK 连接、传输、重试退避、身份认证和参数转换不计入此服务耗时；完整 SDK 调用仍需客户端计时。
 SSE 保留请求上下文，在最终结果交给流之前完成创建 Span，客户端读取耗时另算。
 
@@ -27,24 +33,45 @@ HTTP Span 包含 `http.request.method`、`http.route`，Ingress/API Server 返�
 
 sandboxd 是独立运行时服务。本版本在 adxlet→sandboxd 的 gRPC 边界停止 Trace 传播；sandboxd 原有的资源指标和日志采集不依赖该传播，也不将 sandboxd span 计入本版本的端到端 Trace 验收。
 
+## 入口相关性 ID 与 Span 内容边界
+
+HTTP 入口同时接受 W3C `traceparent`/`tracestate`。没有 `traceparent` 时，入口按 `X-Trace-Id`（其次 `X-Request-Id`）确定性地派生 32 位十六进制 Trace ID；两个头都不存在时仍生成新的根 Trace。处于记录态的请求在响应中回写 `X-Trace-Id`，便于用同一编号检索日志与 Trace；关闭态不添加该响应头。
+
+Span 字符串属性超过 1024 字节时保留首尾并插入省略号；请求体、文件内容、URL 和凭据不得写入属性。失败 Span 可记录 `exception` 事件（`exception.type` / `exception.message`），并使用有界错误描述作为状态消息。
+
+请求作用域内（`Trace::run` 或 `scope` 仍在执行）的组件日志自动附加 `trace_id`/`span_id`：JSON 日志写入同名字段，文本日志追加在行尾。作用域外的日志（例如异步关闭回调）需要显式传递编号。WebSocket 握手或 JSON 隧道头需要携带上下文时使用 `adx_observability::trace::propagation_headers()`；CONNECT 建立后的字节流是 L4 透传，不解析也不注入，只有 CONNECT 头与握手帧可以携带 `traceparent`。
+
 ## 配置与部署
 
-通过统一部署配置中对应服务的 `env` 设置：
+部署级 `tracing` 策略统一控制各组件（OTLP/HTTP，默认关闭）：
+
+```yaml
+tracing:
+  endpoints: ["127.0.0.1:4318"]   # 空列表 = 关闭（默认）；非空 = 开启（100%）；多项取第一项
+```
+
+`adxctl` 渲染时为每个服务（Redis 与 AFS 除外）写入：
 
 ```json
 {
   "ADX_TRACE_ENABLED": "true",
-  "ADX_TRACE_SAMPLE_RATIO": "0.1",
-  "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "http://127.0.0.1:4318/v1/traces",
-  "OTEL_BSP_MAX_QUEUE_SIZE": "2048",
-  "OTEL_BSP_MAX_EXPORT_BATCH_SIZE": "512",
-  "OTEL_BSP_SCHEDULE_DELAY": "1000"
+  "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT": "http://127.0.0.1:4318/v1/traces"
 }
 ```
+
+adxlet 同时把这些变量写入 `execd_env`，并补 `ADX_NODE_ID` 与 `ADX_ENV`，使 Runtime 内 Execd 使用同一 Collector 与资源标识。endpoint 接受 `host:port` 或 `http://host:port[/v1/traces]`；仅支持 OTLP/HTTP，不接受 gRPC 或 `https://`。`endpoints` 是唯一开关：非空即开启且按 100% 采样，空列表即关闭。非法配置在加载阶段失败。
+
+如需比例采样，可在具体服务的 `env` 中显式设置 `ADX_TRACE_SAMPLE_RATIO`（0–1，默认 1）；部署级 `tracing` 不写入该变量，因此服务级配置可覆盖。
+
+每个 Span 的资源属性包含 `service.name`、`service.instance.id`、`node.id`（存在 `ADX_NODE_ID` 时）与 `adx_env`（存在 `ADX_ENV` 时）；嵌入 Ingress 的 Span 另带 `adx.component=ingress`。`build/observability/collector.json` 的 traces 流水线通过 `resource/adx` 处理器补齐 `adx_env` 与 `adx.node.id`。
 
 `ADX_TRACE_SAMPLE_RATIO` 在 0–1 之间。开启时使用父采样决定，根请求按比例采样；要完全关闭导出，应设置 `ADX_TRACE_ENABLED=false`。不合法的布尔值或比例使启动失败。
 
 `build/observability/collector.json` 增加 OTLP HTTP 接收及 Trace 导出流水线，默认监听 `127.0.0.1:4318`。节点服务可访问本机 Collector；Execd 使用 adxlet 配置的 `execd_env` 设置上述变量，地址须为实例网络可达的节点/Collector 地址，不能把实例自己的 localhost 当作宿主 Collector。按部署的私网边界调整监听地址和访问规则。
+
+### AFS 边界
+
+仓库级 tracing 开关不覆盖 AFS。AFS 是独立可选组件（默认 `ADX_WITH_AFS=0`，发布包与 supervisor 不含 AFS），使用自有 TOML 的 `trace_enabled` / `trace_endpoint` / `trace_sample_ratio`，默认关闭；开启后经 OTLP/gRPC（默认 4317）导出，而本仓库 Collector 默认只接收 OTLP/HTTP 4318。启用 AFS 时需单独配置其 TOML 与 Collector 接收端；部署级 `tracing` 不会改写 AFS 配置文件。
 
 本地及基础 K8s 验收使用 Collector sidecar/独立进程的 14317 接口，发送到测试接收端；这些测试地址不是产品默认值。
 

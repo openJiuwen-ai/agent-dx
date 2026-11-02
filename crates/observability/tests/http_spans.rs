@@ -26,6 +26,7 @@ async fn http_interface_names_keep_method_route_parent_and_hide_user_input() {
             "/api/environment/v1/snapshots/private-snapshot",
             "/api/environment/v1/snapshots/{id}",
         ),
+        ("/api/instances?instance_id=private-id", "/api/instances"),
         ("/invoke?path=private-file", "/invoke"),
         ("/download?path=private-file", "/download"),
         ("/global-scheduler/resources", "/global-scheduler/resources"),
@@ -39,7 +40,7 @@ async fn http_interface_names_keep_method_route_parent_and_hide_user_input() {
     }
     provider.force_flush().unwrap();
     let spans = exporter.get_finished_spans().unwrap();
-    assert_eq!(spans.len(), 9);
+    assert_eq!(spans.len(), 10);
     for span in spans {
         assert!(span.name.starts_with("POST /"));
         assert!(!span.name.contains("private") && !span.name.contains("secret"));

@@ -94,6 +94,22 @@
       "timeout": "1s",
       "send_batch_size": 128,
       "send_batch_max_size": 256
+    },
+    "resource/adx": {
+      "attributes": [
+        {
+          "key": "adx_env",
+          "value": "${env:ADX_ENV}",
+          "default_value": "unknown",
+          "action": "upsert"
+        },
+        {
+          "key": "adx.node.id",
+          "value": "${env:ADX_NODE_ID}",
+          "default_value": "unknown",
+          "action": "upsert"
+        }
+      ]
     }
   },
   "exporters": {
@@ -154,6 +170,7 @@
         ],
         "processors": [
           "memory_limiter",
+          "resource/adx",
           "batch"
         ],
         "exporters": [

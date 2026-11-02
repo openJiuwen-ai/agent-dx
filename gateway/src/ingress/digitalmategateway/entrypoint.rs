@@ -421,7 +421,11 @@ impl DigitalMateGatewayApi {
             )
             .await;
         };
-        tokio::spawn(task.instrument(span));
+        // `Instrument` carries only the tracing span, not the OTel context.
+        // Forward the entry request's context so session logs stay correlated.
+        tokio::spawn(adx_observability::trace::with_current_context(
+            task.instrument(span),
+        ));
         let (parts, _) = response.into_parts();
         Response::from_parts(parts, body(Bytes::new()))
     }

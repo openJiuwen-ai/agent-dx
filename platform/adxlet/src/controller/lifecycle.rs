@@ -659,16 +659,19 @@ impl Controller {
             })
         {
             if request.expected_revision != operation.expected_revision {
-                eprintln!(
-                    "{}",
-                    serde_json::json!({
-                        "event": "checkpoint recovery operation reused",
-                        "environment_id": self.record.spec.id,
-                        "operation_id": request.operation_id,
-                        "progress_revision": request.expected_revision,
-                        "operation_expected_revision": operation.expected_revision,
-                    })
-                );
+                let (trace_id, span_id) = adx_observability::trace::log_context();
+                let mut event = serde_json::json!({
+                    "event": "checkpoint recovery operation reused",
+                    "environment_id": self.record.spec.id,
+                    "operation_id": request.operation_id,
+                    "progress_revision": request.expected_revision,
+                    "operation_expected_revision": operation.expected_revision,
+                });
+                if !trace_id.is_empty() {
+                    event["trace_id"] = trace_id.into();
+                    event["span_id"] = span_id.into();
+                }
+                eprintln!("{event}");
             }
             request.expected_revision = operation.expected_revision;
         }
@@ -684,7 +687,14 @@ impl Controller {
                 && !self.held
                 && !self.record.resources_held
             {
-                eprintln!("checkpoint recovery failed: {error}");
+                let (trace_id, span_id) = adx_observability::trace::log_context();
+                if trace_id.is_empty() {
+                    eprintln!("checkpoint recovery failed: {error}");
+                } else {
+                    eprintln!(
+                        "checkpoint recovery failed: {error} trace_id={trace_id} span_id={span_id}"
+                    );
+                }
                 self.transition(Event::Fail)?;
                 return self.sync().await;
             }

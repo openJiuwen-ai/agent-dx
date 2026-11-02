@@ -231,7 +231,7 @@ assignment: Some(pb::Assignment { environment_id: spec.id.clone(), node_id: self
         if error != tonic::Code::Ok {
             return Err(Status::new(error, "injected missing create response"));
         }
-        Ok(Response::new(pb::EnvironmentResult { newly_created, record: Some(record), durability: pb::Durability::Published as i32 }))
+        Ok(Response::new(pb::EnvironmentResult { newly_created, record: Some(record), durability: pb::Durability::Published as i32 , ..Default::default()}))
     }
     async fn ensure_running(&self, request: Request<pb::EnsureRunningRequest>) -> Result<Response<pb::GetEnvironmentResponse>, Status> {
         let request = request.into_inner();
@@ -701,7 +701,7 @@ async fn snapshot_create_uses_coordinator_even_with_a_live_local_first_entry() {
             .clients
             .create_environment(request, Duration::from_secs(2)),
     );
-    let (first, replay) = (first.unwrap(), replay.unwrap());
+    let ((first, _), (replay, _)) = (first.unwrap(), replay.unwrap());
     assert_eq!(first.record, replay.record);
     assert_eq!(first.durability, replay.durability);
     assert_ne!(first.newly_created, replay.newly_created);
@@ -2606,6 +2606,23 @@ async fn create_total_span_matches_metric_boundary_for_json_sse_and_embedded() {
             .iter()
             .any(|a| a.key.as_str() == "environment.id"
                 && a.value.to_string() == "default-trace-create"));
+        assert!(create
+            .attributes
+            .iter()
+            .any(|a| a.key.as_str() == "result" && a.value.to_string() == "success"));
+        assert!(create
+            .attributes
+            .iter()
+            .any(|a| a.key.as_str() == "instance_id"
+                && a.value.to_string() == "default-trace-create"));
+        assert!(create
+            .attributes
+            .iter()
+            .any(|a| a.key.as_str() == "user.id" && a.value.to_string() == "tenant"));
+        assert!(create
+            .attributes
+            .iter()
+            .any(|a| a.key.as_str() == "newly_created" && a.value.to_string() == "true"));
         let elapsed = create
             .end_time
             .duration_since(create.start_time)
@@ -2674,6 +2691,44 @@ async fn create_rpc_server_spans_are_children_of_the_matching_client_span() {
 }
 
 #[tokio::test]
+async fn local_first_create_propagates_trace_into_node_rpc() {
+    let _serial = TRACE_TEST_LOCK.lock().await;
+    let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+    let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+        .with_simple_exporter(exporter.clone())
+        .build();
+    opentelemetry::global::set_tracer_provider(provider.clone());
+
+    let (spans, _) = traced_create(&exporter, "json", false, true).await;
+    let create = spans
+        .iter()
+        .find(|span| span.name == "environment.create")
+        .expect("total create span missing");
+    assert!(create.attributes.iter().any(|a| {
+        a.key.as_str() == "source" && a.value.to_string() == "local-first"
+    }));
+    let select = spans
+        .iter()
+        .find(|span| span.name == "apiserver.select_local")
+        .expect("local-first selection span missing");
+    let client = spans
+        .iter()
+        .find(|span| span.name == "apiserver.create_local")
+        .expect("local-first create client span missing");
+    let server = spans
+        .iter()
+        .find(|span| span.name == "test.node.create_local_environment")
+        .expect("local-first node server span missing");
+    assert_eq!(select.parent_span_id, create.span_context.span_id());
+    assert_eq!(client.parent_span_id, create.span_context.span_id());
+    assert_eq!(server.parent_span_id, client.span_context.span_id());
+    assert_eq!(
+        server.span_context.trace_id(),
+        create.span_context.trace_id()
+    );
+}
+
+#[tokio::test]
 async fn create_total_span_records_errors_for_json_sse_and_embedded() {
     let _serial = TRACE_TEST_LOCK.lock().await;
     let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
@@ -2691,6 +2746,22 @@ async fn create_total_span_records_errors_for_json_sse_and_embedded() {
             matches!(create.status, opentelemetry::trace::Status::Error { .. }),
             "{mode}: {:?}",
             create.status
+        );
+        assert!(create
+            .attributes
+            .iter()
+            .any(|a| a.key.as_str() == "result" && a.value.to_string() == "fail"));
+        assert!(create
+            .attributes
+            .iter()
+            .any(|a| a.key.as_str() == "error.code"));
+        assert!(create
+            .attributes
+            .iter()
+            .any(|a| a.key.as_str() == "error.message"));
+        assert!(
+            create.events.iter().any(|event| event.name == "exception"),
+            "{mode}: create total span is missing the exception event"
         );
     }
 }

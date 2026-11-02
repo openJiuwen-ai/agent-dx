@@ -205,21 +205,24 @@ fn reap_timed_out_child(
                     pid,
                     REAP_GRACE.as_millis()
                 );
+                // The reaper thread outlives the dispatch call. Capture the
+                // active span context so the deferred wait logs carry trace_id.
+                let context = adx_observability::trace::current_context();
                 std::thread::spawn(move || {
-                    match child.wait() {
-                    Ok(status) => execd_info!(
-                        "[execd-command] phase=wait_done traceid={} pid={} exit_code={} timed_out=true deferred=true",
-                        sanitize_log_field(&trace_id),
-                        pid,
-                        status.code().unwrap_or(-1)
-                    ),
-                    Err(e) => execd_error!(
-                        "[execd-command] phase=wait_failed traceid={} pid={} deferred=true error={}",
-                        sanitize_log_field(&trace_id),
-                        pid,
-                        sanitize_log_field(&e.to_string())
-                    ),
-                }
+                    adx_observability::trace::attach_context(&context, || match child.wait() {
+                        Ok(status) => execd_info!(
+                            "[execd-command] phase=wait_done traceid={} pid={} exit_code={} timed_out=true deferred=true",
+                            sanitize_log_field(&trace_id),
+                            pid,
+                            status.code().unwrap_or(-1)
+                        ),
+                        Err(e) => execd_error!(
+                            "[execd-command] phase=wait_failed traceid={} pid={} deferred=true error={}",
+                            sanitize_log_field(&trace_id),
+                            pid,
+                            sanitize_log_field(&e.to_string())
+                        ),
+                    })
                 });
                 return Ok(None);
             }

@@ -77,25 +77,31 @@ impl Api {
         {
             self.environment_service.creation_metrics.http_request();
         }
-        let trace = trace::Trace::http(
+        let correlation = trace::correlation_id(
+            header(&request, "x-trace-id"),
+            header(&request, "x-request-id"),
+        );
+        let trace = trace::Trace::http_with_correlation(
             request.method().as_str(),
             trace::http_route(request.uri().path()),
             header(&request, "traceparent"),
             header(&request, "tracestate"),
+            correlation,
         );
+        let trace_id_header = if trace.is_recording() {
+            trace.trace_id()
+        } else {
+            None
+        };
         let started = Instant::now();
         let method = request.method().to_string();
         let route = route_name(request.uri().path());
+        // Request identity is independent from the trace id. Deriving it from
+        // the trace id would make idempotent replay keyed by tracing context.
         let request_id = header(&request, "x-request-id")
             .filter(|s| !s.trim().is_empty())
             .map(str::to_string)
-            .unwrap_or_else(|| {
-                trace
-                    .scope(|| {
-                        trace::traceparent().and_then(|p| p.split('-').nth(1).map(str::to_string))
-                    })
-                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
-            });
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let mut request = request;
         let request_context = RequestContext {
             request_id,
@@ -106,13 +112,18 @@ impl Api {
         let context = trace.scope(trace::traceparent).unwrap_or_default();
         let mut response = trace
             .run(async {
-                let response = Box::pin(self.handle(request)).await;
+                let mut response = Box::pin(self.handle(request)).await;
                 trace::attribute(
                     "http.response.status_code",
                     response.status().as_u16().to_string(),
                 );
                 if response.status().is_server_error() {
                     trace::error();
+                }
+                if let Some(trace_id) = trace_id_header.as_deref() {
+                    if let Ok(value) = trace_id.parse() {
+                        response.headers_mut().insert("x-trace-id", value);
+                    }
                 }
                 response
             })
@@ -1377,6 +1388,17 @@ mod error_contract_tests {
                 .to_bytes(),
         )
         .expect("JSON error body")
+    }
+
+    #[test]
+    fn probe_failure_keeps_conflict_status() {
+        let failure = adx_core::probes::ProbeFailure::timeout("readiness deadline exceeded");
+        let status = Status::with_details(
+            Code::FailedPrecondition,
+            "readiness deadline exceeded",
+            serde_json::to_vec(&failure).expect("probe failure serializes").into(),
+        );
+        assert_eq!(status_code(&status), 409);
     }
 
     #[test]

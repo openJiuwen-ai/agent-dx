@@ -91,6 +91,11 @@ pub async fn connect_ingress(config: ConnectClientConfig) -> io::Result<TokioIo<
         .header(header::HOST, &authority)
         .header(H_ACCESS_KIND, config.access_kind.as_str())
         .header(H_REQUEST_ID, &config.request_id);
+    let mut trace_headers = http::HeaderMap::new();
+    adx_observability::trace::inject_headers(&mut trace_headers);
+    for (name, value) in trace_headers.iter() {
+        builder = builder.header(name, value);
+    }
     if !config.bearer_token.trim().is_empty() {
         builder = builder.header(
             header::AUTHORIZATION,

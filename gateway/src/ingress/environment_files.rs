@@ -491,7 +491,7 @@ impl Files {
                     hyper::client::conn::http1::handshake::<_, Full<Bytes>>(TokioIo::new(stream))
                         .await
                         .map_err(|_| ReadError::Protocol)?;
-                let request = Request::builder()
+                let mut request = Request::builder()
                     .method(method)
                     .uri(uri)
                     .header("host", "execd.internal")
@@ -500,6 +500,11 @@ impl Files {
                     .header("connection", "close")
                     .header("content-type", "application/json")
                     .header("content-length", body.len());
+                let mut trace_headers = http::HeaderMap::new();
+                adx_observability::trace::inject_headers(&mut trace_headers);
+                for (name, value) in trace_headers.iter() {
+                    request = request.header(name, value);
+                }
                 let request = if let Some((start, end, _)) = range {
                     request.header("range", format!("bytes={start}-{end}"))
                 } else {
