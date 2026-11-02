@@ -51,9 +51,14 @@ If the execution backend itself is OOM-killed, `environment.get_info().failure`
 contains an `EnvironmentFailure(reason="OomKilled", exit_code=..., message=...)`
 after the terminal state is committed. A failed direct invocation can raise
 `EnvironmentError` with `code="ENVIRONMENT_OOM"`, `retry="never"`, `outcome="terminal"`
-and `failure` details. Before publication, the caller may receive
-`OUTCOME_UNKNOWN`; query `get_info()` instead of interpreting route errors as
-OOM. Successful calls do not perform an additional catalog query.
+and `failure` details. A committed Failed record with another structured reason
+raises `ENVIRONMENT_FAILED` with the same terminal contract. These exceptions
+retain `request_id`, `operation_id`, `environment_id` and `first_error` (the first
+transport failure). An unavailable route known not to have accepted the operation
+raises `ENVIRONMENT_UNAVAILABLE` / `same_operation` / `not_started`. Otherwise,
+before failure publication the result can remain `OUTCOME_UNKNOWN`; query
+`get_info()` instead of interpreting route errors as OOM. Successful calls do
+not perform an additional catalog query.
 
 ## Working directory
 
@@ -337,8 +342,10 @@ routes never trigger an implicit control-plane invoke: the current API Server
 does not implement that operation. After bounded direct retries, the SDK checks
 the authenticated Environment catalog and preserves a confirmed OOM or runtime
 failure, including the original operation identity and first transport failure.
-A still-running or unavailable catalog leaves the data-path outcome unresolved;
-it does not disable later direct calls. Retry-After and jitter apply between demand retries.
+A still-running or unavailable catalog cannot confirm a terminal backend failure:
+known-unsent requests remain `not_started`, and ambiguous execution remains
+`unknown`. Neither case disables later direct calls. Retry-After and jitter apply
+between demand retries.
 Exhaustion raises `EnvironmentHTTPError` with the same `ENV_RESUMING` contract; callers
 can choose to try again. No sticky Ingress routing is required: replicas share the
 Coordinator intent and independently subscribe to the committed route.
