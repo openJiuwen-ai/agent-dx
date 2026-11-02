@@ -14,6 +14,7 @@ BINARIES = (
     "adxlet",
     "adx-apiserver",
     "adx-activator",
+    "adx-credential-crypto",
     "adx-ingress",
     "adx-relay",
 )

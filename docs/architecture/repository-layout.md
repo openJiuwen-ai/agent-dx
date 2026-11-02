@@ -19,6 +19,8 @@ Agent API 在 Gateway Ingress 内处理产品请求。独立模式通过 Activat
 
 API Server 仍保留原有九条 `/api/agent` 兼容转发路由，由 `agent_address` 指向外部 Agent 服务；这是平台侧既有入口，不属于当前 Ingress Agent API／Activator 链路，本轮保持不变。
 
+可选 `agent/credential-crypto` 在用户环境外提供工作区凭证信封加解密；密文仍存用户工作区，主密钥仅在服务侧。服务授权摘要引用原有 AgentBinding/generation，由 Activator 逐次校验。它发布为独立 ADX Template/固定 Binding，经现有 Environment 能力托管；不新增生命周期控制器。可选 `ADX_CREDENTIAL_CRYPTO_CONFIG` 使 Gateway 先验证用户工作区身份，再经共享 Relay 连接配置中心并校验后端 TLS。Gateway 复用既有 ActivatorClient/LocalControl 校验身份，HTTP/TLS 复用共享后端连接池与 transport；独立 Crypto 服务持 verify-only 身份。Gateway 不持 KEK，保留既有 Agent 控制权限并属于可信控制面；服务私有目录与用户只读身份目录分离。默认不启用，不迁移已有实例；配置、密钥信任边界及验收限制见[部署说明](../deployment/credential-crypto.md)。
+
 平台内部以 **Environment + Runtime** 建模。Environment 是跨节点、暂停恢复和故障接管期间保持不变的逻辑身份，持有期望规格、生命周期、归属和 checkpoint 引用；Runtime 是运行时后端在某个节点创建的一次物理执行，具有独立 `runtime_id`，重启、恢复或接管时可以替换。二者通过 `RuntimeIdentity { environment_id, runtime_id, ownership_generation }` 绑定，adxlet 只允许当前 generation 的 Runtime 对外提供服务。
 
 Coordinator 在启动或权威写入恢复时从 Redis 载入记录；正常节点对账使用提交后同步更新的缓存，只比较归属、版本及制品引用。节点启动／会话恢复执行完整运行时对账；进程 crash 后，旧会话未过期且未退役、相同节点 ID 与 RPC/Relay 地址经身份校验通过时，才可接管现存 Runtime。SIGTERM 执行 planned unregister 并使旧 owner 会话失效；节点或后端计划升级先 Pause 并确认持久化恢复点，或迁移／删除实例完成排空，再退出升级和恢复。正常生命周期由 Execd 主动控制流、Relay 活动增量、后端退出通知及 owner 内存中的每实例单调时钟推进；独立资源采样默认每 15 秒采集 CPU、内存，不推进生命周期。异常断流先等待重连，再按需确认后端状态；创建结果不明确时保留带退避的定向清理重试。部署要求配置 `runtime_control`，并同步更新 rootfs 中的 Execd。
@@ -45,6 +47,7 @@ agent-dx/
 ├── agent/
 │   ├── api/                       # Gateway 产品入口
 │   ├── activator/                 # 无状态产品管理与按需激活
+│   ├── credential-crypto/         # 工作区凭证加解密、密钥维护 CLI；可独立模板托管
 │   └── crates/                    # core 协议模型、store 产品状态；测试随各 crate 放置
 ├── afs/                           # 可选 Agent FS，ADX_WITH_AFS=1 显式启用
 │   ├── src/node/vfs/ownerfs/       # OwnerFs workspace / Home 路径

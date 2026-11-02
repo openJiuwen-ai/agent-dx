@@ -108,7 +108,7 @@ activator-e2e:
 	$(PYTHON) build/e2e/run.py --bundle "$(BUNDLE)" --output "$(OUT)/activator-standalone" --profile standalone --case activator-standalone --cgroupns $(E2E_CGROUPNS)
 	$(PYTHON) build/e2e/run.py --bundle "$(BUNDLE)" --output "$(OUT)/activator-embedded" --profile standalone --case activator-embedded --cgroupns $(E2E_CGROUPNS)
 agent-test:
-	$(CARGO) test --locked -p adx-agent-core -p adx-agent-store -p adx-agent-api -p adx-activator -p adx-cli --features adx-agent-store/test-memory -j $(JOBS) -- --test-threads=$(JOBS)
+	$(CARGO) test --locked -p adx-agent-core -p adx-agent-store -p adx-agent-api -p adx-activator -p adx-cli -p adx-credential-crypto --features adx-agent-store/test-memory -j $(JOBS) -- --test-threads=$(JOBS)
 	$(CARGO) test --locked -p data-plane-gateway --features agent-api --lib -j $(JOBS) -- --test-threads=$(JOBS)
 environment-sdk-test:
 	PYTHONPATH=platform/sdk/environment/python $(PYTHON) -m pytest -q -c platform/sdk/environment/pytest.ini platform/sdk/environment/python/tests $(PYTEST_ARGS)

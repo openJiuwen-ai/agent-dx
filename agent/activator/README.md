@@ -8,6 +8,20 @@ Agent 的 `CreateEnvironment`/`ExecutionSpec` 在本 crate 的 `environment_requ
 
 独立进程启动读取 `ADX_ACTIVATOR_CONFIG` 指向的 JSON，示例见 [local.json](examples/local.json)。入口服务凭据为 `ADX_ACTIVATOR_SERVICE_TOKEN`。`environment_url` 指向 API Server（示例端口 8081 须与其 `listen` 配置一致），`environment_api_key_envs` 将租户映射到保存该租户 Platform API Key 的环境变量名，例如 `{"tenant":"ADX_PLATFORM_TENANT_API_KEY"}`。这里的 Platform API Key 用于 Environment 管理，与最终用户的模型 API Key 无关。凭据内容不写入 JSON；未配置租户的查询返回 NotFound，创建/删除在提交请求前返回 Unavailable。每项 key 必须属于对应租户，不能使用跨租户管理员 key；现有查询响应不含租户字段，Activator 无法独立验证配置归属。HTTP 明文必须显式允许，否则客户端需要 TLS 和受信任 CA。
 
+## 工作区服务授权
+
+可选配置 `credential_grants_token_env` 指向独立的“只校验授权”服务密钥环境变量，示例见 [credential-grants.json](examples/credential-grants.json)。启用后增加以下私有端点；该密钥必须与 `ADX_ACTIVATOR_SERVICE_TOKEN` 不同，且只交给用户环境外的加解密服务。
+
+| POST `/internal/adx/v1/` 后缀 | 身份 | 行为 |
+| --- | --- | --- |
+| `service-grants/issue` | 既有私有控制服务凭据 | scope、expected_generation、purpose、ttl_seconds；对已有 Binding 签发受限凭据，返回一次性明文凭据、摘要、从 Binding 推导的 context 和到期时间 |
+| `service-grants/verify` | 独立只校验凭据 | credential、expected；点查授权及现有 Binding，校验 audience/purpose、generation、Active 状态、workspace 和期限，返回 `{allowed}` |
+| `service-grants/revoke` | 既有私有控制服务凭据 | credential_digest；幂等撤销 |
+
+工作区归属仍由既有 AgentBinding 的 `parameters.workspace` 决定；Redis 新增记录只引用 scope/generation 并保存用途、到期时间，不复制用户—工作区—Environment 主表。不使用 Platform 租户 API Key 作为沙箱服务身份。授权签发条件写同时检查 Binding revision，删除、换代、过期、撤销及错误上下文均拒绝访问。服务校验不经过激活成功缓存；Redis 故障返回不可用，无文件或允许访问的兜底。已通过校验的在途请求可能在并发撤销后完成。
+
+独立进程按上述可选配置合并路由；内嵌部署可将 `service_grants::router` 挂载到同一个 Activator 的私有监听，需由部署方装配，当前没有自动改 Gateway 内嵌监听。此处只补 Agent 层服务授权；不新增 Platform 生命周期控制器，不改用户业务登录。独立进程可配置 `credential_delivery`，在 Binding 提交后、DigitalMate 启动前按 `DIGITALMATE_SECRET_STORE` / `DIGITALMATE_CRYPTO_*` 向显式共享身份卷交付受限身份。启动时检查，随后按续期窗口一半与 300 秒中的较小间隔检查；发布身份前持久化待撤销摘要，撤销失败或结果未知时在后续请求及重启后幂等重试；细节和隔离云部署证据见[凭证模块](../credential-crypto/README.md)。配置该能力的模板绕过激活热缓存，以便请求触发检查身份；其他模板的缓存语义不变。可信人工签发/撤销使用已有私有服务授权 API。
+
 内部端点统一为 POST `/internal/adx/v1/`：
 
 | 后缀 | 请求 | 行为 |

@@ -1,9 +1,11 @@
 //! Stateless AgentBinding activation. Platform owns Environment lifecycle and readiness.
 mod creation;
+pub mod credential_delivery;
 pub mod environment_request;
 pub mod local_environment;
 pub mod reconciliation;
 pub mod server;
+pub mod service_grants;
 pub mod transport;
 use adx_agent_core::environment::{
     Environment, EnvironmentError, EnvironmentObservation, EnvironmentPhase,
@@ -47,6 +49,7 @@ pub struct Activator {
     bindings: Mutex<LinkedHashMap<Scope, Binding>>,
     cache: CacheSettings,
     subscription_ready: std::sync::atomic::AtomicBool,
+    credential_delivery: Option<credential_delivery::CredentialDelivery>,
 }
 impl Activator {
     pub fn new(state: AgentState, environment: Arc<dyn Environment>) -> Self {
@@ -56,6 +59,7 @@ impl Activator {
             bindings: Mutex::new(LinkedHashMap::new()),
             cache: CacheSettings::default(),
             subscription_ready: std::sync::atomic::AtomicBool::new(true),
+            credential_delivery: None,
         }
     }
     /// Returns Invalid for a zero idle timeout. Capacity zero disables the cache.
@@ -157,6 +161,7 @@ impl Activator {
             .render_env(&binding.parameters)
             .map_err(Error::Invalid)?;
         self.environment.validate_execution(&execution)?;
+        self.deliver_for_execution(&binding, &execution).await?;
         let volumes = creation::definitions(&template, &binding.parameters, &execution.mounts)?;
         let observed = self
             .activate_environment(
@@ -391,6 +396,10 @@ impl Activator {
                 .subscription_ready
                 .load(std::sync::atomic::Ordering::Acquire);
             if !bypass_cache
+                && self
+                    .credential_delivery
+                    .as_ref()
+                    .is_none_or(|config| config.template != scope.template)
                 && (subscription_ready
                     || matches!(scope.template_ref, adx_agent_core::TemplateRef::Version(_)))
             {
@@ -479,6 +488,7 @@ impl Activator {
             .render_env(&binding.parameters)
             .map_err(Error::Invalid)?;
         self.environment.validate_execution(&execution)?;
+        self.deliver_for_execution(&binding, &execution).await?;
         let volumes = creation::definitions(&template, &binding.parameters, &execution.mounts)?;
         let observed = self
             .activate_environment(

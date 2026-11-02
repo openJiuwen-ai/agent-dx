@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 default-members = [
+    "agent/credential-crypto",
     "agent/crates/core",
     "agent/crates/store",
     "agent/activator",
@@ -23,6 +24,7 @@ default-members = [
     "platform/adxlet",
 ]
 members = [
+    "agent/credential-crypto",
     "agent/crates/core",
     "agent/crates/store",
     "agent/activator",

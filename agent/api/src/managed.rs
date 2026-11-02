@@ -19,6 +19,25 @@ pub struct ManagedService {
     templates: Mutex<BoundedCache<TemplateKey, Arc<OnceCell<TemplateVersion>>>>,
 }
 impl ManagedService {
+    /// Read fresh Binding authority through the same local/remote Activator transport.
+    /// Verification never activates a workload and retains its smaller admission budget.
+    pub async fn verify_service_grant(
+        &self,
+        ctx: &RequestContext,
+        request: &adx_agent_core::service_grants::VerifyServiceGrant,
+    ) -> Result<bool> {
+        ctx.run(async {
+            tokio::time::timeout(
+                adx_agent_core::limits::SERVICE_VERIFY_TIMEOUT,
+                self.control.verify_service_grant(ctx, request),
+            )
+            .await
+            .map_err(|_| Error::Unavailable("service authorization timed out".into()))?
+            .map(|decision| decision.allowed)
+        })
+        .await
+    }
+
     pub fn new(control: Arc<dyn Control>) -> Self {
         Self {
             control,

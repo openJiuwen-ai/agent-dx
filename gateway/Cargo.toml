@@ -33,13 +33,14 @@ default = ["activity-client"]
 activity-client = ["dep:prost", "dep:tonic", "dep:tower"]
 etcd-watch = ["dep:etcd-client"]
 mock-e2e = []
-agent-api = ["activity-client", "dep:adx-agent-core", "dep:adx-agent-api", "dep:russh", "dep:reqwest", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:deadpool-postgres", "dep:webpki-roots", "dep:jsonwebtoken"]
+agent-api = ["activity-client", "dep:adx-agent-core", "dep:adx-agent-api", "dep:adx-credential-crypto", "dep:russh", "dep:reqwest", "dep:tokio-postgres", "dep:tokio-postgres-rustls", "dep:deadpool-postgres", "dep:webpki-roots", "dep:jsonwebtoken"]
 
 [dependencies]
 adx-core = { path = "../platform/crates/core" }
 russh = { version = "0.63.3", default-features = false, features = ["ring"], optional = true }
 adx-agent-core = { path = "../agent/crates/core", optional = true }
 adx-agent-api = { path = "../agent/api", optional = true }
+adx-credential-crypto = { path = "../agent/credential-crypto", optional = true }
 adx-observability = { path = "../crates/observability" }
 adx-process = { path = "../crates/process" }
 adx-transport = { path = "../crates/transport" }

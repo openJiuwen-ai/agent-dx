@@ -55,4 +55,7 @@ pub mod digitalmategateway;
 pub mod agent_service;
 
 #[cfg(feature = "agent-api")]
+pub mod credential_crypto;
+
+#[cfg(feature = "agent-api")]
 pub mod accounts;

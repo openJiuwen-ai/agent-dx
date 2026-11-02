@@ -3,7 +3,7 @@ use redis::aio::MultiplexedConnection;
 use std::time::Duration;
 
 // Validate all preconditions before mutation. Values remain opaque JSON strings;
-// only the revision string is decoded, so application u64 fields never pass through Lua numbers.
+// Only envelope revision/expiry are decoded; application values stay opaque.
 const CAS: &str = r#"
 local count = tonumber(ARGV[1])
 for i = count + 1, #KEYS do
@@ -30,7 +30,12 @@ for i = 1, count do
     redis.call('DEL', key)
     for _, index in ipairs(indexes) do redis.call('ZREM', KEYS[index], key) end
   elseif replacement ~= '' then
-    redis.call('SET', key, replacement)
+    local expiry = cjson.decode(replacement).expires_at_unix_seconds
+    if expiry then
+      redis.call('SET', key, replacement, 'EXAT', string.format('%.0f', expiry))
+    else
+      redis.call('SET', key, replacement)
+    end
     for _, index in ipairs(indexes) do redis.call('ZADD', KEYS[index], 0, key) end
   end
 end

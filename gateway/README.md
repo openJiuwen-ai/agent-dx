@@ -26,6 +26,28 @@ The typed public Ingress → Relay → EXECD operations are defined by the
 Generic port forwarding and reverse tunnels carry application-defined protocols
 and remain outside that typed API.
 
+With `agent-api`, `ADX_CREDENTIAL_CRYPTO_CONFIG` optionally registers TLS
+`POST /v1/seal` and `/v1/open`. The [configuration](../build/config/examples/credential-crypto-gateway.json)
+selects a fixed service `scope`/declared HTTP `port`, backend TLS `server_name`/`ca_file`,
+with verification reusing the existing `ADX_AGENT_CONFIG` ActivatorClient/LocalControl; no additional authorization URL/token is configured.
+Gateway retains its existing Agent control authority and remains a trusted control-plane component.
+The adapter verifies each workspace grant/context before activation through the existing Agent facade, uses `AgentV2Access`
+and the shared Relay stream, then verifies backend TLS. Crypto verifies the grant again using its separate verify-only credential.
+Gateway holds no encryption key; DigitalMate receives no tenant API key. Only workspace
+Bearer and required HTTP headers are sent upstream; queries, upgrades and ambiguous
+Authorization are rejected. Request/response limits are 512 KiB each, concurrency 128,
+and the whole exchange deadline is `timeout_seconds` (default 60, range 1–300).
+HTTP uses the shared backend pool (including its endpoint limit, default 64); one-shot
+requests do not reuse idle connections across TLS identities. Verification has a 3-second
+cap and 16 KiB response bound through the existing Activator transport.
+Unknown outcomes are not replayed. Admission authority failure returns `503 AUTHORITY_UNAVAILABLE`;
+selection, TLS, exchange and deadline failures return `503 CRYPTO_UNAVAILABLE`.
+Crypto's other status/code responses are preserved with `Cache-Control: no-store`.
+Other paths keep existing dispatch; no crypto administration or health route is added.
+Missing configuration leaves these optional routes unregistered. Enforce internal network
+policy; a hostname on a shared Gateway does not provide isolation. Publication, private
+mounts and distinct frontend/backend CA files are covered in the [deployment guide](../docs/deployment/credential-crypto.md#adx-模板托管).
+
 The default `activity-client` feature builds the managed Ingress and Relay entrypoints. Embedded and standalone Ingress both use `ingress::IngressService`; only the owning process changes. Standalone Ingress requires `ADX_INGRESS_CONTROL_CONFIG` pointing to [ingress-control.json](../build/config/examples/ingress-control.json). Coordinator must map the Ingress client certificate to the `ingress` role. Public listener TLS and Ingress-to-Node security remain separate settings. The optional `etcd-watch` library and legacy test fixtures are retained separately; the managed Ingress entrypoint uses the new Coordinator route service.
 
 The gateway is a member of the root Cargo workspace. Run from repository root:

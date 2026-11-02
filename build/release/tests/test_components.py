@@ -31,8 +31,12 @@ class ComponentManifestTests(unittest.TestCase):
             (root / "adx-ingress").write_bytes(b"fixture")
             (root / "adx-relay").write_bytes(b"fixture")
             (root / "adx-activator").write_bytes(b"fixture")
+            (root / "adx-credential-crypto").write_bytes(b"fixture")
             manifest = component.create_manifest("gateway", root, "a" * 40, "x86_64-unknown-linux-gnu")
-            self.assertEqual(set(manifest["files"]), {"adx-apiserver", "adx-ingress", "adx-relay", "adx-activator"})
+            self.assertEqual(
+                set(manifest["files"]),
+                {"adx-apiserver", "adx-ingress", "adx-relay", "adx-activator", "adx-credential-crypto"},
+            )
             component.verify_manifest(root)
             (root / "adx-data-plane-forward").write_bytes(b"unexpected")
             with self.assertRaises(ValueError):

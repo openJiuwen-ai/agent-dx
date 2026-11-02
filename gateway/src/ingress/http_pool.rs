@@ -1,5 +1,6 @@
 use bytes::Bytes;
 use http::{header, HeaderValue, Request, Response};
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt};
 use hyper::body::{Body, Frame, Incoming};
 use hyper::client::conn::http1::SendRequest;
 use hyper_util::rt::TokioIo;
@@ -15,6 +16,9 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+type RequestBody = UnsyncBoxBody<Bytes, BoxError>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendHttpPoolConfig {
@@ -47,6 +51,18 @@ pub struct BackendHttpPoolKey {
     pub workload_id: String,
     pub target_ip: std::net::IpAddr,
     pub target_port: u16,
+}
+
+impl From<&super::resolver::RouteHandle> for BackendHttpPoolKey {
+    fn from(route: &super::resolver::RouteHandle) -> Self {
+        Self {
+            relay_address: route.relay_address.clone(),
+            instance_id: route.target.instance_id.clone(),
+            workload_id: route.target.workload_id.clone(),
+            target_ip: route.target.target_ip,
+            target_port: route.target.target_port,
+        }
+    }
 }
 
 impl PartialEq for BackendHttpPoolKey {
@@ -100,7 +116,7 @@ struct EndpointPool {
 }
 
 struct IdleConnection {
-    sender: SendRequest<Incoming>,
+    sender: SendRequest<RequestBody>,
     idle_since: Instant,
 }
 
@@ -152,16 +168,18 @@ impl BackendHttpPool {
         self.inner.remove_matching(|_| true);
     }
 
-    pub async fn send<F, Fut, T>(
+    pub async fn send<F, Fut, T, B>(
         &self,
         key: BackendHttpPoolKey,
-        request: Request<Incoming>,
+        request: Request<B>,
         open: F,
     ) -> Result<Response<PooledResponseBody>, BackendHttpPoolError>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = io::Result<T>>,
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<BoxError>,
     {
         self.send_recoverable(key, request, open)
             .await
@@ -170,21 +188,24 @@ impl BackendHttpPool {
 
     /// Return ownership only if no business request has been sent. Callers may safely re-resolve
     /// a target in that case, but may never replay an ambiguous send_request failure.
-    pub async fn send_recoverable<F, Fut, T>(
+    pub async fn send_recoverable<F, Fut, T, B>(
         &self,
         key: BackendHttpPoolKey,
-        mut request: Request<Incoming>,
+        mut request: Request<B>,
         open: F,
-    ) -> Result<Response<PooledResponseBody>, (BackendHttpPoolError, Option<Request<Incoming>>)>
+    ) -> Result<Response<PooledResponseBody>, (BackendHttpPoolError, Option<Request<B>>)>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = io::Result<T>>,
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+        B: Body<Data = Bytes> + Send + 'static,
+        B::Error: Into<BoxError>,
     {
         // The pool always opens HTTP/1.1 connections to the sandbox. An
         // HTTP/2 client request therefore must not retain its inbound version
         // when Hyper serializes it on that backend connection.
         normalize_http1_request(&mut request);
+        let request_allows_reuse = !has_connection_close(request.headers());
         let prepared = async {
             let endpoint = self.inner.endpoint(&key);
             let permit = timeout(
@@ -201,7 +222,12 @@ impl BackendHttpPool {
             .map_err(|_| BackendHttpPoolError::Closed)?;
 
             let sender = loop {
-                let Some(mut idle) = self.inner.take_idle(&endpoint) else {
+                // An explicitly one-shot exchange must not inherit a pooled connection's
+                // transport identity (for example HTTP versus service-verified TLS).
+                let idle = request_allows_reuse
+                    .then(|| self.inner.take_idle(&endpoint))
+                    .flatten();
+                let Some(mut idle) = idle else {
                     let stream = open().await.map_err(BackendHttpPoolError::Connect)?;
                     let (sender, connection) =
                         hyper::client::conn::http1::handshake(TokioIo::new(stream))
@@ -229,7 +255,6 @@ impl BackendHttpPool {
             Ok(value) => value,
             Err(error) => return Err((error, Some(request))),
         };
-        let request_allows_reuse = !has_connection_close(request.headers());
         if let Some(processing) = request
             .extensions()
             .get::<super::processing::ProcessingDeadline>()
@@ -237,7 +262,7 @@ impl BackendHttpPool {
             processing.forwarded();
         }
         let response = sender
-            .send_request(request)
+            .send_request(request.map(|body| body.map_err(Into::into).boxed_unsync()))
             .await
             .map_err(|error| (BackendHttpPoolError::Request(error), None))?;
         let response_allows_reuse = !has_connection_close(response.headers());
@@ -294,7 +319,7 @@ impl PoolInner {
         None
     }
 
-    fn return_idle(&self, endpoint: &EndpointPool, sender: SendRequest<Incoming>) {
+    fn return_idle(&self, endpoint: &EndpointPool, sender: SendRequest<RequestBody>) {
         if !endpoint.valid.load(Ordering::Acquire) || sender.is_closed() {
             self.discarded_total.fetch_add(1, Ordering::Relaxed);
             return;
@@ -362,7 +387,7 @@ impl PoolInner {
 }
 
 struct ConnectionLease {
-    sender: Option<SendRequest<Incoming>>,
+    sender: Option<SendRequest<RequestBody>>,
     endpoint: Arc<EndpointPool>,
     pool: std::sync::Weak<PoolInner>,
     permit: Option<OwnedSemaphorePermit>,
@@ -510,7 +535,7 @@ mod retry_tests {
             hyper::server::conn::http1::Builder::new()
                 .serve_connection(
                     TokioIo::new(incoming),
-                    service_fn(move |request| {
+                    service_fn(move |request: Request<Incoming>| {
                         let pool = pool.clone();
                         async move {
                             let key = BackendHttpPoolKey {

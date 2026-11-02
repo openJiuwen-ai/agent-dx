@@ -2,11 +2,14 @@
 
 Agent 层使用 Rust，产品 API 嵌入统一 Gateway。Activator 可独立部署，也可与 API Server 和 Ingress 共进程；多个副本使用相同产品状态命名空间。
 
+新增的[凭证加解密模块](credential-crypto/README.md)提供工作区限定的信封加解密，在用户环境外运行。用户/工作区/环境归属沿用 AgentBinding，新增最小服务授权引用既有 Binding scope/generation 并保存于同一 Redis；由 Activator 校验归属、过期、撤销和绑定换代。凭证密文仍由用户应用保存，主密钥只在加解密服务侧。独立 Activator 可显式启用共享卷身份下发和续期；部署步骤与限制见[通用部署说明](../docs/deployment/credential-crypto.md)。
+
 | 目录 | 职责 |
 | --- | --- |
 | `crates/core` | 产品类型、协议、Environment 能力边界及通用校验 |
-| `crates/store` | Template/AliasConfig/AgentBinding 元数据、Redis 原子条件写；内存实现仅供测试 |
+| `crates/store` | Template/AliasConfig/AgentBinding 与服务授权元数据、Redis 原子条件写；内存实现仅供测试 |
 | `activator` | 产品管理、稳定逻辑身份激活及别名目标态收敛；不做 Environment 健康恢复 |
+| `credential-crypto` | 用户环境外的工作区凭证加解密、密钥维护 CLI 与内部 HTTPS 服务；独立 ADX 模板/固定 Binding 托管 |
 | `api` | Activator HTTP 客户端或本地模块调用、AgentBinding 身份选择、解析结果校验 |
 | `cli` | Rust 用户命令行 `adx`；Template 发布/查询、AgentBinding 分页查询/删除、HTTP 流式调用、SSH 交互终端 |
 

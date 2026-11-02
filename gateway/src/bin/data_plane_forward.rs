@@ -3,8 +3,7 @@ use data_plane_gateway::client::{connect_ingress, ConnectClientConfig, IngressTl
 use data_plane_gateway::common::listener::accept_with_backoff;
 use data_plane_gateway::ingress::AccessKind;
 use rustls::pki_types::ServerName;
-use std::fs::File;
-use std::io::{self, BufReader};
+use std::io;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -194,19 +193,9 @@ fn tls_from_env(ingress_address: &str) -> io::Result<Option<IngressTlsConfig>> {
     if ca_path.trim().is_empty() {
         return Ok(None);
     }
-    let mut roots = rustls::RootCertStore::empty();
-    let mut reader = BufReader::new(File::open(ca_path.trim())?);
-    let certificates = rustls_pemfile::certs(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| invalid(&format!("read Ingress TLS CA: {error}")))?;
-    if certificates.is_empty() {
-        return Err(invalid("Ingress TLS CA contains no certificates"));
-    }
-    for certificate in certificates {
-        roots
-            .add(certificate)
-            .map_err(|error| invalid(&format!("add Ingress TLS CA: {error}")))?;
-    }
+    let client =
+        adx_transport::tls::http_client_config(&std::fs::read(ca_path.trim())?, None, vec![])
+            .map_err(|error| invalid(&format!("Ingress TLS: {error}")))?;
     let server_name = std::env::var("ADX_DATA_PLANE_FORWARD_TLS_SERVER_NAME")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -214,11 +203,7 @@ fn tls_from_env(ingress_address: &str) -> io::Result<Option<IngressTlsConfig>> {
     ServerName::try_from(server_name.clone())
         .map_err(|error| invalid(&format!("invalid Ingress TLS server name: {error}")))?;
     Ok(Some(IngressTlsConfig {
-        client: Arc::new(
-            rustls::ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
-        ),
+        client: Arc::new(client),
         server_name,
     }))
 }
