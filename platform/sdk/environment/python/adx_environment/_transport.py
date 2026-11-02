@@ -58,6 +58,7 @@ class EnvironmentError(RuntimeError):
         failure: Optional[Dict[str, Any]] = None,
         scheduling_failure: Optional[Dict[str, Any]] = None,
         probe_failure: Optional[Dict[str, Any]] = None,
+        first_error: Optional[BaseException] = None,
     ):
         super().__init__(message)
         self.request_id = request_id
@@ -70,6 +71,7 @@ class EnvironmentError(RuntimeError):
         self.failure = failure
         self.scheduling_failure = scheduling_failure
         self.probe_failure = probe_failure
+        self.first_error = first_error
 
 
 class EnvironmentNotFound(EnvironmentError):
@@ -836,8 +838,10 @@ class EnvironmentClient:
             None if processing_deadline is None else processing_deadline + self._connection.communication_margin_seconds
         )
 
-        # Prefer the /direct path; fall back to the control-plane invoke path.
-        if self._direct_enabled and not self._direct_disabled:
+        # Current gateways expose operations only on /direct. A missing
+        # Environment route is not evidence that control-plane invoke exists.
+        # Keep explicit legacy opt-out, but never select it after a failure.
+        if self._direct_enabled:
             result, fell_back = self._invoke_direct(
                 environment_id,
                 action,
@@ -887,15 +891,15 @@ class EnvironmentClient:
         processing_deadline: Optional[float] = None,
         processing_timeout: Optional[float] = None,
     ) -> "tuple[Dict[str, Any], bool]":
-        """Try the /direct path. Returns ``(result, fell_back)``.
+        """Try the /direct path. Successful calls return ``(result, False)``.
 
         All attempts for one logical action reuse ``request_id``. EXECD deduplicates
         direct requests by that id, so a retry can wait for or replay the first
-        execution instead of repeating a side effect. ``fell_back=True`` is
-        returned only after connect/pool failures (known not sent) are exhausted,
-        or when the server reports that the direct route does not exist. An
-        exhausted unknown-outcome failure is surfaced to the caller and is never
-        replayed through the Frontend invoke path.
+        execution instead of repeating a side effect. Exhausted direct failures
+        consult the authenticated catalog for a terminal Environment cause.
+        They never select control-plane invoke or sticky-disable future direct
+        requests. An unknown execution outcome remains unknown unless the
+        catalog confirms that the Environment has failed.
 
         Unlike Frontend invoke, the EXECD HTTP server returns raw result JSON (no
         base64 ``BuildJobResponse`` envelope); action-level errors live inside
@@ -906,6 +910,7 @@ class EnvironmentClient:
         last_failure_safe = False
         outcome_unknown = False
         attempts = 0
+        first_error: Optional[BaseException] = None
 
         pending_resume: Optional[EnvironmentHTTPError] = None
         attempt_limit = self._connection.request_max_attempts
@@ -955,6 +960,7 @@ class EnvironmentClient:
                     outcome="unknown",
                     operation_id=request_id,
                     environment_id=environment_id,
+                    first_error=first_error or exc,
                 ) from exc
             else:
                 if resp.status_code == 404:
@@ -976,49 +982,43 @@ class EnvironmentClient:
                             request_id=request_id,
                         )
                         break
-                    self._direct_route_misses += 1
-                    if self._direct_route_misses > _DIRECT_ROUTE_MISS_BUDGET and not self._direct_disabled:
-                        self._direct_disabled = True
-                        logger.warning(
-                            "direct invoke disabled; all subsequent invokes "
-                            "will use frontend fallback after consecutive "
-                            "route misses "
-                            "request_id=%s action=%s route_misses=%d",
-                            request_id,
-                            action,
-                            self._direct_route_misses,
-                        )
-                    return {}, True
-                self._direct_route_misses = 0
-                error = self._http_error(resp, request_id=request_id) if resp.status_code >= 400 else None
-                if error is not None and error.retry == "never":
-                    raise error
-                if error is not None and self._is_resuming(resp, error, request_id):
-                    pending_resume = error
-                    last_error = error
+                    last_error = self._http_error(resp, request_id=request_id)
                     last_failure_safe = True
-                    retry_after = self._resume_retry_delay(resp)
-                elif resp.status_code in _RETRYABLE_GATEWAY_STATUS_CODES:
-                    last_error = _RetryableHTTPStatus(self._http_error(resp, request_id=request_id))
-                    last_failure_safe = False
-                    outcome_unknown = True
-                elif resp.status_code >= 400:
-                    raise self._http_error(resp, request_id=request_id)
                 else:
-                    try:
-                        parsed = resp.json()
-                    except ValueError as exc:
-                        last_error = EnvironmentError(
-                            f"direct invoke returned invalid JSON: {exc}",
-                            request_id=request_id,
-                        )
+                    self._direct_route_misses = 0
+                    error = self._http_error(resp, request_id=request_id) if resp.status_code >= 400 else None
+                    if error is not None:
+                        error.first_error = first_error
+                    if error is not None and error.retry == "never":
+                        raise error
+                    if error is not None and self._is_resuming(resp, error, request_id):
+                        pending_resume = error
+                        last_error = error
+                        last_failure_safe = True
+                        retry_after = self._resume_retry_delay(resp)
+                    elif resp.status_code in _RETRYABLE_GATEWAY_STATUS_CODES:
+                        last_error = _RetryableHTTPStatus(self._http_error(resp, request_id=request_id))
                         last_failure_safe = False
                         outcome_unknown = True
+                    elif resp.status_code >= 400:
+                        raise error
                     else:
-                        if not isinstance(parsed, dict):
-                            parsed = {"value": parsed}
-                        return parsed, False
+                        try:
+                            parsed = resp.json()
+                        except ValueError as exc:
+                            last_error = EnvironmentError(
+                                f"direct invoke returned invalid JSON: {exc}",
+                                request_id=request_id,
+                            )
+                            last_failure_safe = False
+                            outcome_unknown = True
+                        else:
+                            if not isinstance(parsed, dict):
+                                parsed = {"value": parsed}
+                            return parsed, False
 
+            if first_error is None and last_error is not None:
+                first_error = last_error
             if attempt >= attempt_limit:
                 break
             backoff = max(retry_after, _DIRECT_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1)))
@@ -1044,11 +1044,8 @@ class EnvironmentClient:
         if pending_resume is not None and not outcome_unknown:
             # No attempt reached the application. Keep this authoritative outcome;
             # never turn demand waiting into a control-plane invocation fallback.
+            pending_resume.first_error = first_error if first_error is not pending_resume else None
             raise pending_resume
-        if last_failure_safe and not outcome_unknown and last_error is not None:
-            # Every attempt failed before request bytes could reach EXECD.
-            self._direct_disabled = True
-            return {}, True
         detail = last_error or "invoke deadline exhausted"
         # The failed data connection alone cannot classify OOM. Consult the
         # authenticated catalog only on this recovery path, within the same
@@ -1059,15 +1056,31 @@ class EnvironmentClient:
                 info = self.environment_info(
                     environment_id, timeout=min(2.0, remaining) if remaining is not None else 2.0
                 )
+            except EnvironmentNotFound as error:
+                if not outcome_unknown:
+                    error.request_id = request_id
+                    error.operation_id = request_id
+                    error.first_error = first_error
+                    raise error from last_error
+                info = {}
             except (EnvironmentError, httpx.RequestError):
                 info = {}
             failure = info.get("failure")
-            if info.get("status") == "failed" and isinstance(failure, dict) and failure.get("reason") == "OomKilled":
+            if info.get("status") == "failed" and isinstance(failure, dict):
+                oom = isinstance(failure, dict) and failure.get("reason") == "OomKilled"
                 raise EnvironmentError(
-                    "environment backend was OOM-killed",
-                    request_id=request_id, code="ENVIRONMENT_OOM", retry="never", outcome="terminal",
-                    operation_id=request_id, environment_id=environment_id, failure=failure,
+                    "environment backend was OOM-killed" if oom else "environment backend failed",
+                    request_id=request_id, code="ENVIRONMENT_OOM" if oom else "ENVIRONMENT_FAILED",
+                    retry="never", outcome="terminal", operation_id=request_id,
+                    environment_id=environment_id, failure=failure, first_error=first_error,
                 ) from last_error
+        if last_failure_safe and not outcome_unknown and last_error is not None:
+            raise EnvironmentError(
+                f"environment direct route unavailable after {attempts} attempts (requestId={request_id}): {detail}",
+                request_id=request_id, code="ENVIRONMENT_UNAVAILABLE", retry="same_operation",
+                outcome="not_started", operation_id=request_id, environment_id=environment_id,
+                first_error=first_error,
+            ) from last_error
         raise EnvironmentError(
             (f"direct invoke outcome is unknown after {attempts} attempts (requestId={request_id}): {detail}"),
             request_id=request_id,
@@ -1076,6 +1089,7 @@ class EnvironmentClient:
             outcome="unknown",
             operation_id=request_id,
             environment_id=environment_id,
+            first_error=first_error,
         ) from last_error
 
     @staticmethod

@@ -2,8 +2,8 @@
 
 No cluster required: an httpx.MockTransport stands in for both the direct route
 (raw-result JSON) and the frontend (base64 BuildJobResponse envelope), so we
-can assert direct-vs-fallback routing, response parsing, and the sticky
-disable. Run: ``python tests/test_transport_direct.py`` (or via pytest).
+can assert routing, response parsing, and failure recovery without an implicit
+control-plane replay. Run: ``python tests/test_transport_direct.py`` (or via pytest).
 """
 
 import ast
@@ -1117,138 +1117,63 @@ def test_direct_invalid_json_retries_with_same_request_id():
     print("ok: invalid direct response retries with one request id ->", calls)
 
 
-def test_direct_connect_error_falls_back():
+def _transport_failure_stays_on_direct(failure_type):
     calls = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
+    def handler(request):
+        if request.url.path == "/api/instances":
+            return httpx.Response(200, json=[{"id": "environment-demo", "status": "running"}])
+        if request.url.path != "/direct/environment-demo/invoke":
+            raise AssertionError("unsupported control-plane fallback")
         body = json.loads(request.content)
-        calls.append(
-            (
-                request.url.path,
-                request.headers.get("x-adx-request-id"),
-                body.get("requestId"),
-            )
-        )
-        if request.url.path.startswith("/api/environment/v1"):
-            return httpx.Response(200, json=_envelope({"ok": 1}))
-        raise httpx.ConnectError("direct route down")
+        calls.append((request.headers.get("x-adx-request-id"), body["requestId"]))
+        raise failure_type("fixture route unavailable", request=request)
 
     c = _make_client(handler)
-    out = c.invoke("environment-demo", "file.exists", {"path": "/"})
-    _check(out == {"ok": 1}, f"connect-error fallback: {out}")
-    _check(c._direct_disabled is True, "connect error should sticky-disable")
-    _check(
-        len(calls) == 4 and all(call[0] == "/direct/environment-demo/invoke" for call in calls[:3]),
-        f"connect error should retry direct three times: {calls}",
-    )
-    _check(calls[3][0].startswith("/api/environment/v1"), f"fallback: {calls}")
-    _check(
-        len({call[1] for call in calls}) == 1 and all(call[1] == call[2] for call in calls),
-        f"fallback must reuse the logical request id: {calls}",
-    )
-    print("ok: connect-error fallback ->", calls)
+    with patch("adx_environment._transport.time.sleep"):
+        try:
+            c.invoke("environment-demo", "file.exists", {"path": "/"})
+        except EnvironmentError as error:
+            _check(error.code == "ENVIRONMENT_UNAVAILABLE", str(error))
+            _check(error.outcome == "not_started", str(error))
+            _check(isinstance(error.first_error, failure_type), "lost initial failure")
+        else:
+            raise AssertionError("unavailable direct operation was accepted")
+    _check(len(calls) == 3, f"retry count: {calls}")
+    _check(len({x for row in calls for x in row}) == 1, f"operation identity changed: {calls}")
+    _check(c._direct_disabled is False, "transient failure disabled future direct calls")
 
 
-def test_direct_pool_timeout_retries_then_falls_back():
+def test_direct_connect_error_stays_on_direct():
+    _transport_failure_stays_on_direct(httpx.ConnectError)
+
+
+def test_direct_pool_timeout_stays_on_direct():
+    _transport_failure_stays_on_direct(httpx.PoolTimeout)
+
+
+def test_direct_missing_route_does_not_select_control_plane():
     calls = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        calls.append(
-            (
-                request.url.path,
-                request.headers.get("x-adx-request-id"),
-                body.get("requestId"),
-            )
-        )
-        if request.url.path.startswith("/api/environment/v1"):
-            return httpx.Response(200, json=_envelope({"ok": 1}))
-        raise httpx.PoolTimeout("connection pool exhausted", request=request)
+    def handler(request):
+        calls.append(request.url.path)
+        if request.url.path == "/api/instances":
+            return httpx.Response(200, json=[{"id": "environment-demo", "status": "failed", "failure": {"reason": "OomKilled"}}])
+        if request.url.path == "/direct/environment-demo/invoke":
+            return httpx.Response(404, text="environment route not found")
+        raise AssertionError("failed Environment must not replay to control plane")
 
     c = _make_client(handler)
-    out = c.invoke("environment-demo", "file.exists", {"path": "/"})
-    _check(out == {"ok": 1}, f"pool-timeout fallback: {out}")
-    _check(c._direct_disabled is True, "pool timeout should sticky-disable")
-    _check(
-        len(calls) == 4
-        and all(call[0] == "/direct/environment-demo/invoke" for call in calls[:3])
-        and calls[3][0].startswith("/api/environment/v1"),
-        f"pool timeout retry/fallback calls: {calls}",
-    )
-    _check(
-        len({call[1] for call in calls}) == 1 and all(call[1] == call[2] for call in calls),
-        f"pool-timeout fallback must reuse request id: {calls}",
-    )
-    print("ok: pool timeout retries then falls back ->", calls)
-
-
-def test_direct_fallback_when_frontend_direct_missing():
-    os.environ.pop("ADX_GATEWAY_ADDRESS", None)
-    calls = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content)
-        calls.append(
-            (
-                request.url.path,
-                request.headers.get("x-adx-request-id"),
-                body.get("requestId"),
-            )
-        )
-        if request.url.path.startswith("/api/environment/v1"):
-            return httpx.Response(200, json=_envelope({"exists": False}))
-        return httpx.Response(404, json={"error": "direct route missing"})
-
-    os.environ["ADX_TLS"] = "0"
-    c = EnvironmentClient()
-    c._http = httpx.Client(transport=httpx.MockTransport(handler), headers={"X-Auth": "t"})
-    _check(
-        c.direct_enabled is True,
-        "direct should default on through frontend /direct",
-    )
-    with patch("adx_environment._transport.logger.warning") as warning:
-        for invocation in range(1, 5):
-            out = c.invoke("environment-demo", "file.exists", {"path": "/"})
-            _check(out == {"exists": False}, f"frontend-only result: {out}")
-            _check(
-                c._direct_disabled is (invocation > 3),
-                f"unexpected direct state after 404 #{invocation}",
-            )
-            _check(
-                warning.call_count == (1 if invocation > 3 else 0),
-                f"warning must only be emitted when direct is disabled: {warning.call_args_list}",
-            )
-
-        # Once the fourth consecutive miss exhausts the failure budget, later
-        # invokes use the frontend path without probing direct or warning again.
-        out = c.invoke("environment-demo", "file.exists", {"path": "/"})
-        _check(out == {"exists": False}, f"disabled-direct result: {out}")
-        _check(
-            warning.call_count == 1,
-            f"duplicate disable warning: {warning.call_args_list}",
-        )
-    _check(
-        calls[0][0] == "/direct/environment-demo/invoke",
-        f"first call direct: {calls}",
-    )
-    _check(calls[1][0].startswith("/api/environment/v1"), f"fallback: {calls}")
-    _check(len(calls) == 9, f"unexpected direct/fallback call count: {calls}")
-    for offset in range(0, 8, 2):
-        direct_call = calls[offset]
-        fallback_call = calls[offset + 1]
-        _check(
-            direct_call[0] == "/direct/environment-demo/invoke" and fallback_call[0].startswith("/api/environment/v1"),
-            f"404 must immediately fall back: {calls}",
-        )
-        _check(
-            direct_call[1] == direct_call[2] == fallback_call[1] == fallback_call[2],
-            f"404 fallback must reuse the logical request id: {calls}",
-        )
-    _check(
-        calls[-1][0].startswith("/api/environment/v1"),
-        f"disabled direct should use frontend only: {calls}",
-    )
-    print("ok: direct disables only after four consecutive 404s ->", calls)
+    with patch("adx_environment._transport.time.sleep"):
+        for _ in range(5):
+            try:
+                c.invoke("environment-demo", "file.exists", {"path": "/"})
+            except EnvironmentError as error:
+                _check(error.code == "ENVIRONMENT_OOM", str(error))
+            else:
+                raise AssertionError("OOM was not reported")
+            _check(not c._direct_disabled, "missing routes disabled direct")
+    _check(calls.count("/direct/environment-demo/invoke") == 15, str(calls))
 
 
 def test_direct_command_not_found_is_not_treated_as_route_miss():
@@ -1279,32 +1204,22 @@ def test_direct_command_not_found_is_not_treated_as_route_miss():
     print("ok: structured direct command not-found is preserved")
 
 
-def test_direct_success_resets_route_miss_count():
-    direct_statuses = [404, 404, 200, 404, 404, 404, 200]
-    direct_calls = 0
+def test_direct_success_after_transient_missing_routes():
+    statuses = iter([404, 404, 200, 404, 404, 200])
+    calls = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        nonlocal direct_calls
-        if request.url.path.startswith("/api/environment/v1"):
-            return httpx.Response(200, json=_envelope({"via": "fallback"}))
-        status = direct_statuses[direct_calls]
-        direct_calls += 1
-        if status == 404:
-            return httpx.Response(404, json={"error": "direct route missing"})
-        return httpx.Response(200, json={"via": "direct"})
+    def handler(request):
+        _check(request.url.path == "/direct/environment-demo/invoke", "unexpected control request")
+        calls.append(json.loads(request.content)["requestId"])
+        return httpx.Response(next(statuses), json={"via": "direct"})
 
     c = _make_client(handler)
-    results = [c.invoke("environment-demo", "file.exists", {"path": "/"}) for _ in direct_statuses]
-
-    _check(direct_calls == len(direct_statuses), f"direct calls: {direct_calls}")
-    _check(results[2] == {"via": "direct"}, f"first direct success: {results}")
-    _check(results[-1] == {"via": "direct"}, f"second direct success: {results}")
-    _check(c._direct_route_misses == 0, "direct success must reset route misses")
-    _check(
-        c._direct_disabled is False,
-        "separated route-miss runs must not disable direct",
-    )
-    print("ok: direct success resets route-miss count ->", results)
+    with patch("adx_environment._transport.time.sleep"):
+        for _ in range(2):
+            _check(c.invoke("environment-demo", "file.exists", {"path": "/"}) == {"via": "direct"}, "did not recover direct route")
+    _check(len(set(calls[:3])) == len(set(calls[3:])) == 1, "retry identities changed")
+    _check(calls[0] != calls[3], "independent operations reused identity")
+    _check(not c._direct_disabled, "transient route misses disabled direct")
 
 
 def test_direct_binary_upload_success():
@@ -2022,11 +1937,11 @@ if __name__ == "__main__":
     test_direct_mixed_failures_preserve_unknown_outcome()
     test_direct_non_retryable_http_errors_do_not_fallback()
     test_direct_invalid_json_retries_with_same_request_id()
-    test_direct_connect_error_falls_back()
-    test_direct_pool_timeout_retries_then_falls_back()
-    test_direct_fallback_when_frontend_direct_missing()
+    test_direct_connect_error_stays_on_direct()
+    test_direct_pool_timeout_stays_on_direct()
+    test_direct_missing_route_does_not_select_control_plane()
     test_direct_command_not_found_is_not_treated_as_route_miss()
-    test_direct_success_resets_route_miss_count()
+    test_direct_success_after_transient_missing_routes()
     test_direct_binary_upload_success()
     test_files_write_bytes_uses_direct_upload()
     test_files_write_text_uses_direct_upload()

@@ -332,9 +332,13 @@ forwarding, Ingress returns HTTP 503 with `X-ADX-Error-Code: ENV_RESUMING`,
 SDK retries retain the request ID and body; **each allowed retry gets the same
 configured timeout plus communication margin**. Retry count is configurable via
 `ConnectionConfig.request_max_attempts` / `ADX_REQUEST_MAX_ATTEMPTS` (default 3,
-including the first data-path attempt). Known-unsent connection failures and absent
-direct routes retain their existing single control-plane fallback; `ENV_RESUMING`
-never takes that fallback. Retry-After and jitter apply between demand retries.
+including the first data-path attempt). Connection failures and absent direct
+routes never trigger an implicit control-plane invoke: the current API Server
+does not implement that operation. After bounded direct retries, the SDK checks
+the authenticated Environment catalog and preserves a confirmed OOM or runtime
+failure, including the original operation identity and first transport failure.
+A still-running or unavailable catalog leaves the data-path outcome unresolved;
+it does not disable later direct calls. Retry-After and jitter apply between demand retries.
 Exhaustion raises `EnvironmentHTTPError` with the same `ENV_RESUMING` contract; callers
 can choose to try again. No sticky Ingress routing is required: replicas share the
 Coordinator intent and independently subscribe to the committed route.
