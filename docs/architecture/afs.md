@@ -803,13 +803,40 @@ transfer 重叠）尚未实现。多设备按 peer 绑定 lane，实测只作为
 
 HIXL 参数面不具备 AFS mTLS 的 Node 身份绑定，注册池的访问边界也不是每个 grant。
 只能在管理员控制、隔离的可信节点网络使用，不能据此宣称租户 MR 级隔离。
-首期不改变 Meta source schema、OwnerFs、dirty-owner 读、复制写入或持久 receipt。
+DFS HIXL 不改变 Meta source schema、dirty-owner 读、复制写入或持久 receipt。
 `data_mode` 继续控制这些原有路径，独立的 `[hixl].dfs_read_mode` 默认 `off`。
 
 当前代码与软件状态机检查不构成 A2 RoCE、更多源、并发读写或故障恢复的通过证据。
 请求级快照、合并扫描、多设备调度和 ACL lease 已通过本地 Linux/WSL 构建及 CPU/fake SDK
 回归；A3 HCCS 四机双源的 1 GiB 顺序读已完成真机验收，配置、数值与口径见
 [部署文档](../deployment/afs.md#hixl-dfs-远端读)。
+
+## HIXL OwnerFs 只读预读窗口
+
+`[hixl].ownerfs_read_mode`（默认 `off`）为 OwnerFs 远端只读打开提供 per-open 预读窗口，
+与 DFS 共享同一 `HixlRuntimeGroup`、槽池和 quarantine 失败域。可写打开、`data_mode = rdma/auto`
+和 off 模式的读路径不变。
+
+- 资格：`OwnerPeerClient` 在 OPEN 回复时登记只读、非 `O_PATH`/`O_DIRECT` 的句柄；`preferred`
+  另要求 open 时文件不小于 `ownerfs_min_file_bytes`。登记以 opaque handle 为键，release 删除，
+  生命周期与 OPEN 预取相同。
+- 获取：READ 未命中窗口时，reader 经 OwnerFiles 的 `PrepareReadHixl` 请 Home 读取
+  `[offset, offset + W)`。Home 的 `OwnerHixlService` 用 `OwnerFsPeerExecutor` 执行与
+  `OwnerFiles.Read` 相同的 grant、RemoteFile scope 与句柄校验，读入 staging，逐槽 BLAKE3 后导出；
+  reader 一次 native batch READ 拉回全部槽、逐槽校验，Release 在后台持有该 Home 的租约完成。
+- 窗口：顺序访问从一个槽翻倍到 `ownerfs_window_bytes`；跨窗口 READ 继续获取下一窗口，只有记录
+  EOF 的窗口才产生短读。`ownerfs_max_inflight = 2` 时预取下一窗口；进程级预算约束全部窗口。
+- 一致性：窗口是 Prepare 时刻的 Home 内容，只在同一次打开内复用；同一客户端的写入或 setattr
+  按 `FileIdentity` 失效窗口。
+- 会话：`NegotiateHixl` 携带一个 `RootAccess` 并经 `authorize_transport` 校验，会话只是传输租约，
+  绑定 mTLS peer、`home_session_id` 与 reader engine；每 Home 同时只准入一次窗口获取。Prepare
+  以 reader 生成的 `read_id` 支持同一请求的重放；Release 结果为 Unknown/Failed、关闭时仍有未释放槽、
+  过期或 drain 超时都 quarantine 共享 runtime。
+- 回退：`preferred` 只在非顺序读、预算不足、dispatch 前 capability unsupported 或槽位不足时改用
+  原 gRPC 单区间读，已从窗口复制的前缀保留；`required` 不回退。
+
+该路径已通过本地 Linux/WSL 的 fake native 与 tonic 回环测试，尚无真机吞吐和故障恢复证据。
+设计取舍见 [OwnerFs HIXL 只读预读窗口设计](../development/ownerfs-hixl-data-plane-design.md)。
 
 ## OwnerFs workspace bind mount
 

@@ -99,7 +99,7 @@ python3 build/ci/run.py afs
 
 SHM 的 memfd、sealing 与原子 CLOEXEC FD 传递实现及对应运行测试只在 Linux 编译。macOS 上返回 `ShmError::Unsupported`，仅检查该不支持契约；这不代表 AFS/FUSE 在 macOS 可运行。
 
-HIXL 的首版代码仅加速 DFS 已提交不可变 chunk 的远端读。默认不编译 native HIXL；
+HIXL 加速 DFS 已提交不可变 chunk 的远端读，并可选为 OwnerFs 远端只读打开提供预读窗口。默认不编译 native HIXL；
 支持要求为 CANN ≥ 9.1.0、HDK ≥ 25.5.0，CANN、HDK 与设备型号需使用配套组合。
 在已安装匹配 HIXL/ACL 头文件及共享库的 Linux 环境中，可运行
 `make afs-check ADX_WITH_AFS=1 ADX_AFS_WITH_HIXL=1 ADX_CANN_PATH=/opt/ascend/cann`。
@@ -151,7 +151,23 @@ SHA-256 校验，且 DFS 会为 reader 后台补齐本地副本，测量前必�
 完整口径与限制见[部署文档](../docs/deployment/afs.md#hixl-dfs-远端读)。
 同卡多进程可通过可选 `[hixl].device_listen_port` 分离 SDK 设备侧监听端口，
 其取值为 1..65535，与 `engine_id` 的 Host 端口独立；未配置时沿用 SDK 默认。
-OwnerFs、DFS dirty-owner 读和复制写入仍使用原 `data_mode`。
+DFS dirty-owner 读和复制写入仍使用原 `data_mode`。
+
+OwnerFs 远端读可通过 `[hixl].ownerfs_read_mode = "preferred" | "required"` 启用 HIXL 预读窗口
+（默认 `"off"`，要求 `data_mode = "grpc"`）。只有只读、非 `O_PATH`/`O_DIRECT` 的远端打开参与：
+READ 未命中时，Home 以该打开句柄和与 `OwnerFiles.Read` 相同的授权读取一段窗口，切成 HIXL 导出槽
+并逐槽计算 BLAKE3；reader 一次 native batch READ 拉回、逐槽校验、释放后缓存在该次打开内，后续
+READ 在窗口内本地复制。顺序访问时窗口从一个槽翻倍到 `ownerfs_window_bytes`（默认 16 MiB）；
+`ownerfs_max_inflight = 2` 时后台预取下一窗口；全部窗口受 `ownerfs_host_budget_bytes` 约束。
+窗口是 Home 在 Prepare 时刻的内容，只在同一次打开内复用（与 OPEN 预取一致，满足 close-to-open）；
+本节点写入或 setattr 同一文件会使其失效。`preferred` 下小于 `ownerfs_min_file_bytes`（默认 1 MiB）
+的文件、非顺序读、Home 不支持或槽位不足仍走原 gRPC 单区间读；`required` 不回退。可写打开始终走
+原路径。OwnerFs 与 DFS 共享同一 HIXL runtime、槽池与 quarantine 失败域。
+`afs_ownerfs_hixl_reads_total{outcome}` 与 `afs_ownerfiles_payload_bytes_total{plane="hixl"}`
+记录窗口命中、获取、预取命中和回退。该路径目前只有本地 CPU/fake native 回环测试，尚无真机
+吞吐或与 gRPC 的对照证据；设计与验收计划见
+[OwnerFs HIXL 只读预读窗口设计](../docs/development/ownerfs-hixl-data-plane-design.md)。
+
 这版代码尚未经过 A2 RoCE、两个以上源节点或并发 reader 的扩展与故障恢复验收；
 A3 HCCS 双机单源与四机双源读路径已完成真机验证，配置与信任边界见
 [部署文档](../docs/deployment/afs.md#hixl-dfs-远端读)。

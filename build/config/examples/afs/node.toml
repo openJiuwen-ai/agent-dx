@@ -163,6 +163,20 @@ session_idle_ms = 300000
 # the first read skips negotiation. Requires preferred or required read mode;
 # the idle policy above still governs an unused pre-warmed session.
 # prewarm_nodes = ["node-a"]
+# OwnerFs read-ahead windows for read-only remote opens: "off" (default),
+# "preferred" (small files, random reads and pre-dispatch refusals stay on
+# gRPC) or "required". Needs data_mode = "grpc"; DFS and OwnerFs share this
+# runtime, its slot pools and its quarantine failure domain.
+ownerfs_read_mode = "off"
+# Largest window one prepare exports: a multiple of window_bytes, <= 64 MiB
+# and <= min(receive_slots, export_slots) windows.
+ownerfs_window_bytes = 16777216
+# 1 fetches windows on demand; 2 also prefetches the next window.
+ownerfs_max_inflight = 1
+# Process budget for cached and prefetching windows.
+ownerfs_host_budget_bytes = 268435456
+# Preferred mode enables windows only for files at least this large at open.
+ownerfs_min_file_bytes = 1048576
 # Optional ordered extra lanes; primary plus extras are limited to 16 SDK
 # logical devices. Both peers pair by lane order. Hardware validation is pending.
 # Multi-device mode requires distinct explicit listener ports on every lane,

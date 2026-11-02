@@ -435,6 +435,52 @@ SDK 两组池的配置容量，不是实测使用量；无 runtime 时为 0、do
 同步中转 READ 一旦进入 SDK，超时、失败或异常同样不能证明远端 DMA 已停止，
 Host 窗口、HBM 池与整个 engine 会保留并停止准入；不重试、不降级、不自动释放。
 
+### OwnerFs 远端只读预读窗口
+
+`[hixl].ownerfs_read_mode` 独立于 `dfs_read_mode`，默认 `"off"`；任一模式非 off 时 Node 启动
+共享的 HIXL runtime。启用 OwnerFs 模式要求 Node 开启 OwnerFs、`data_mode = "grpc"`（与
+OwnerFs RDMA 互斥）、具体单播 `engine_id`、完整 mTLS 与 `trusted_node_certs`；`required` 还要求
+编译 `hixl` feature。Home 与 reader 两端都需要启用，Home 未启用时 reader 收到 capability
+unsupported：`preferred` 回退 gRPC 并在 60 秒内不再向该 Home 协商，`required` 让该 READ 失败。
+
+```toml
+[hixl]
+ownerfs_read_mode = "preferred"
+ownerfs_window_bytes = 16777216
+ownerfs_max_inflight = 1
+ownerfs_host_budget_bytes = 268435456
+ownerfs_min_file_bytes = 1048576
+```
+
+- `ownerfs_window_bytes`：单次 Prepare 的最大窗口，`window_bytes` 的整数倍，不超过 64 MiB，
+  且不超过 `min(receive_slots, export_slots) × window_bytes`；运行时再按协商后的远端 lane
+  导出槽数收紧。顺序访问时窗口从一个槽起翻倍到该值。
+- `ownerfs_max_inflight`：1 或 2，默认 1；2 在消费越过当前窗口一半后后台预取下一窗口。
+- `ownerfs_host_budget_bytes`：进程级窗口内存预算，覆盖已缓存窗口与在途预取，
+  不小于 `ownerfs_window_bytes × ownerfs_max_inflight`，最大 4 GiB。Home 侧另有固定 256 MiB
+  的 staging 预算（读源文件到导出前的私有副本）。
+- `ownerfs_min_file_bytes`：`preferred` 下 open 时文件不小于该值才启用窗口，默认 1 MiB，
+  `required` 忽略。
+
+只有只读、非 `O_PATH`/`O_DIRECT` 的远端打开参与；可写打开、OPEN 预取命中（≤ 4096 字节）
+和 RDMA/auto 保持原路径。窗口内容是 Home 执行 Prepare 时的结果，只在同一次打开内复用，
+release 时丢弃；本节点经同一 OwnerFiles 客户端写入或 setattr 该文件会使全部窗口失效，其他节点
+在本次打开之后的写入不保证可见（close-to-open）。`preferred` 下非顺序读、预算不足、Home 槽位
+不足（dispatch 前）走 gRPC；授权/句柄错误原样返回，checksum 不符、协议违例和 native 结果未知
+都返回错误并重建会话，结果未知时隔离本地 runtime。
+
+OwnerFs 与 DFS 共享同一 runtime、Host 槽池和 quarantine 失败域：一方占满槽位会使另一方
+Prepare 失败，任一方的未知结果会让整个代际停止准入。性能对照需在 OwnerFs-only 或暂停 DFS
+流量的条件下进行。Home 端会话 30 秒无活动关闭，reader 在 20 秒空闲后主动重新协商；关闭时
+仍有未释放槽、未知 Release 结果或停机 drain 超时（5 秒，与 DFS 源端并行）都会 quarantine。
+
+`/health` 的 `checks.hixl.ownerfs_mode` 报告该模式；`required` 无 runtime 时未就绪。
+`afs_ownerfs_hixl_reads_total{outcome="window_hit|fetch|prefetch_hit|fallback"}`、
+`afs_ownerfiles_payload_bytes_total{plane="hixl"}`、
+`afs_ownerfiles_rpc_duration_seconds{method="read_hixl_window"|"OwnerFiles.PrepareReadHixl"}`
+与共享的 `afs_hixl_*` 指标用于证明数据面与命中率。当前只有本地 CPU/fake native 回环测试，
+尚无真机吞吐、gRPC 同轮对照、故障注入或资源泄漏证据，不能据此宣称性能收益。
+
 ## 运维边界
 
 启动前一次性检查二进制身份、配置 SHA、端口、TLS、数据目录、运行目录、日志目录、挂载目录、FUSE 设备、`fusermount3`/`umount`、旧 PID、旧 UDS、旧挂载和磁盘余量。遇到环境阻塞时保存证据并停止受影响项，不把环境修补混入产品结论。

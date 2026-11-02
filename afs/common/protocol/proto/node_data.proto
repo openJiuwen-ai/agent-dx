@@ -473,6 +473,11 @@ service OwnerFiles {
   rpc ReleaseDir(OwnerReleaseDirRequest) returns (OwnerReleaseDirReply);
   rpc Symlink(OwnerSymlinkRequest) returns (OwnerSymlinkReply);
   rpc Link(OwnerLinkRequest) returns (OwnerLinkReply);
+  // Optional HIXL read-ahead windows for read-only remote opens.
+  rpc NegotiateHixl(OwnerNegotiateHixlRequest) returns (OwnerNegotiateHixlReply);
+  rpc PrepareReadHixl(OwnerPrepareReadHixlRequest) returns (OwnerPrepareReadHixlReply);
+  rpc ReleaseHixlRead(OwnerReleaseHixlReadRequest) returns (OwnerReleaseHixlReadReply);
+  rpc CloseHixl(OwnerCloseHixlRequest) returns (OwnerCloseHixlReply);
 }
 
 // RootAccess 是一次 OwnerFs 远端访问的防陈旧身份。
@@ -852,6 +857,89 @@ message OwnerReleaseRequest {
 }
 
 message OwnerReleaseReply {}
+
+// OwnerFs HIXL read-ahead windows. The session is only a transport lease that
+// the authenticated peer opened with one valid RootAccess; every prepare
+// carries its own RootAccess and open handle and is authorized like Read.
+// Transport, lane and release types are shared with the DFS HIXL protocol.
+message OwnerNegotiateHixlRequest {
+  RootAccess access = 1;
+  string client_engine_id = 2;
+  uint64 client_engine_generation = 3;
+  uint32 protocol_version = 4;
+  DfsHixlTransport transport = 5;
+  uint32 buffer_pool_count = 6;
+  uint32 buffer_pool_size_mib = 7;
+  optional uint64 hccs_domain_id = 8;
+  uint32 lane_count = 9;
+}
+
+message OwnerNegotiateHixlReply {
+  uint64 session_id = 1;
+  string home_session_id = 2;
+  uint32 protocol_version = 3;
+  DfsHixlTransport transport = 4;
+  uint32 buffer_pool_count = 5;
+  uint32 buffer_pool_size_mib = 6;
+  optional uint64 hccs_domain_id = 7;
+  repeated DfsHixlLane lanes = 8;
+}
+
+// read_id is reader-generated and stays identical across transport retries of
+// one attempt; Home replays the admitted reply for an identical request.
+message OwnerPrepareReadHixlRequest {
+  uint64 session_id = 1;
+  string read_id = 2;
+  RootAccess access = 3;
+  OwnerHandle handle = 4;
+  uint64 offset = 5;
+  uint64 length = 6;
+  uint32 lane_id = 7;
+}
+
+// One exported Host slot. Slots are contiguous in file order.
+message OwnerHixlSlot {
+  uint64 slot_id = 1;
+  uint64 slot_generation = 2;
+  uint64 address = 3;
+  uint64 length = 4;
+  // BLAKE3 of the exported slot bytes.
+  bytes checksum = 5;
+}
+
+message OwnerPrepareReadHixlReply {
+  uint64 session_id = 1;
+  string read_id = 2;
+  uint32 lane_id = 3;
+  string engine_id = 4;
+  uint64 engine_generation = 5;
+  // Bytes read at prepare time; read < length means EOF was reached.
+  uint64 read = 6;
+  bool eof = 7;
+  repeated OwnerHixlSlot slots = 8;
+}
+
+message OwnerReleaseHixlReadRequest {
+  uint64 session_id = 1;
+  string read_id = 2;
+  uint64 engine_generation = 3;
+  DfsHixlReleaseOutcome outcome = 4;
+  bool content_validated = 5;
+}
+
+message OwnerReleaseHixlReadReply {
+  bool consumed = 1;
+  bool already_released = 2;
+}
+
+message OwnerCloseHixlRequest {
+  uint64 session_id = 1;
+}
+
+message OwnerCloseHixlReply {
+  bool admitted = 1;
+  bool drained = 2;
+}
 
 message OwnerOpendirRequest {
   RootAccess access = 1;

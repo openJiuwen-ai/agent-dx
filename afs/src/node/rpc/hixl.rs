@@ -268,6 +268,7 @@ pub struct HixlMetrics {
     source_checksums_computed: IntCounter,
     cold_fallbacks: IntCounter,
     crc_fallbacks: IntCounter,
+    ownerfs_reads: IntCounterVec,
     allocated: IntGauge,
     relay_hbm_budget: IntGauge,
     quarantined: IntGauge,
@@ -362,6 +363,13 @@ impl HixlMetrics {
                 "afs_hixl_crc_tcp_fallbacks_total",
                 "CRC32C reads served by the gRPC adapter because native windows verify BLAKE3 digests only.",
             )?;
+            let ownerfs_reads = IntCounterVec::new(
+                afs_metrics::Opts::new(
+                    "afs_ownerfs_hixl_reads_total",
+                    "OwnerFs reads of eligible read-only opens by window outcome.",
+                ),
+                &["outcome"],
+            )?;
             let allocated = IntGauge::new(
                 "afs_hixl_allocated_bytes",
                 "Fixed ACL Host pool allocation.",
@@ -397,6 +405,7 @@ impl HixlMetrics {
             register_collector(registry, &source_checksums_computed)?;
             register_collector(registry, &cold_fallbacks)?;
             register_collector(registry, &crc_fallbacks)?;
+            register_collector(registry, &ownerfs_reads)?;
             for gauge in [
                 &allocated,
                 &relay_hbm_budget,
@@ -422,6 +431,7 @@ impl HixlMetrics {
                 source_checksums_computed,
                 cold_fallbacks,
                 crc_fallbacks,
+                ownerfs_reads,
                 allocated,
                 relay_hbm_budget,
                 quarantined,
@@ -498,6 +508,11 @@ impl HixlMetrics {
     /// Records a CRC32C range the native window protocol cannot verify.
     pub fn observe_crc_fallback(&self) {
         self.crc_fallbacks.inc();
+    }
+
+    /// Records one OwnerFs window read outcome; labels are a fixed set.
+    pub fn observe_ownerfs_read(&self, outcome: &'static str) {
+        self.ownerfs_reads.with_label_values(&[outcome]).inc();
     }
 
     pub fn snapshot(&self, status: &RuntimeStatus) {

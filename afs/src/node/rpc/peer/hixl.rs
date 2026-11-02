@@ -48,7 +48,7 @@ type CompletedWindow = (usize, ReadWindow, Vec<u8>);
 type LaneResult = (usize, ReadWindow, Result<Vec<u8>, WindowFailure>);
 
 /// Native calls are the only replaceable boundary in the reader control path.
-trait ReadLane: Send + Sync {
+pub(super) trait ReadLane: Send + Sync {
     fn connect(&self, peer: &str, deadline: Instant) -> Result<(), HixlError>;
     fn prepare_read_buffer(&self, length: usize) -> Result<Vec<u8>, HixlError>;
     /// Allocates the private output for one native multi-window batch. The
@@ -107,7 +107,7 @@ impl ReadLane for HixlRuntime {
     }
 }
 
-trait ReadRuntime: Send + Sync {
+pub(super) trait ReadRuntime: Send + Sync {
     fn info(&self) -> EngineInfo;
     fn infos(&self) -> Vec<EngineInfo>;
     fn lane_count(&self) -> usize;
@@ -596,7 +596,7 @@ fn validate_crc_descriptor(
 /// Bounded hash pool for native window verification. Every window is hashed
 /// independently, so a group completes in roughly one window's hash time
 /// instead of the sum of its windows.
-fn validation_pool() -> Option<&'static rayon_core::ThreadPool> {
+pub(crate) fn validation_pool() -> Option<&'static rayon_core::ThreadPool> {
     static POOL: std::sync::OnceLock<Option<rayon_core::ThreadPool>> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
         let workers = std::thread::available_parallelism()
@@ -1238,7 +1238,7 @@ async fn wait_owned_task<T>(
     result
 }
 
-fn remaining(deadline: Instant) -> afs_error::Result<Duration> {
+pub(super) fn remaining(deadline: Instant) -> afs_error::Result<Duration> {
     deadline
         .checked_duration_since(Instant::now())
         .filter(|value| !value.is_zero())
@@ -1345,7 +1345,7 @@ fn validate_lanes(reply: &DfsNegotiateHixlReply, local: &[EngineInfo]) -> afs_er
     Ok(())
 }
 
-fn engine_transport_parameters(
+pub(super) fn engine_transport_parameters(
     info: &EngineInfo,
 ) -> afs_error::Result<(DfsHixlTransport, u32, u32, Option<u64>)> {
     match info.transport {

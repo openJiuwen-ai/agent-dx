@@ -268,19 +268,32 @@ fn hixl_check(
     infos: &[afs_transport::hixl::EngineInfo],
     lane_statuses: &[afs_transport::hixl::RuntimeStatus],
 ) -> CheckResult {
-    use crate::config::HixlDfsReadMode;
+    use crate::config::{HixlDfsReadMode, HixlOwnerFsReadMode};
     use afs_transport::hixl::RuntimeState;
     let mode = config.dfs_read_mode;
-    let configured = mode != HixlDfsReadMode::Off;
-    let ready = match mode {
+    let ownerfs_mode = config.ownerfs_read_mode;
+    let configured = mode != HixlDfsReadMode::Off || ownerfs_mode != HixlOwnerFsReadMode::Off;
+    let running = status.is_some_and(|status| status.state == RuntimeState::Running);
+    let dfs_ready = match mode {
         HixlDfsReadMode::Off => true,
         HixlDfsReadMode::Preferred if status.is_none() => true,
-        _ => status.is_some_and(|status| status.state == RuntimeState::Running),
+        _ => running,
     };
+    let ownerfs_ready = match ownerfs_mode {
+        HixlOwnerFsReadMode::Off => true,
+        HixlOwnerFsReadMode::Preferred if status.is_none() => true,
+        _ => running,
+    };
+    let ready = dfs_ready && ownerfs_ready;
     let mode_label = match mode {
         HixlDfsReadMode::Off => "off",
         HixlDfsReadMode::Preferred => "preferred",
         HixlDfsReadMode::Required => "required",
+    };
+    let ownerfs_mode_label = match ownerfs_mode {
+        HixlOwnerFsReadMode::Off => "off",
+        HixlOwnerFsReadMode::Preferred => "preferred",
+        HixlOwnerFsReadMode::Required => "required",
     };
     let devices = config.device_configs();
     #[cfg(feature = "dfs")]
@@ -324,6 +337,7 @@ fn hixl_check(
         ready,
         body: json!({
             "configured": configured, "ready": ready, "mode": mode_label,
+            "ownerfs_mode": ownerfs_mode_label,
             "transport": config.transport,
             "relay_hbm_budget_bytes": status.map_or(0, |status| status.relay_hbm_budget_bytes),
             "hccs_domain_id": status.and_then(|status| status.hccs_domain_id),
@@ -333,7 +347,10 @@ fn hixl_check(
             "state": status
                 .map(|status| status.state.to_string())
                 .unwrap_or_else(|| if configured {"unsupported"} else {"off"}.into()),
-            "fallback": if mode == HixlDfsReadMode::Preferred && status.is_none() {
+            "fallback": if status.is_none()
+                && (mode == HixlDfsReadMode::Preferred
+                    || ownerfs_mode == HixlOwnerFsReadMode::Preferred)
+            {
                 Some("grpc")
             } else {
                 None
@@ -614,5 +631,27 @@ mod hixl_health_tests {
         assert_eq!(check.body["lane_count"], 0);
         assert!(check.body["internal_protocol_version"].is_null());
         assert_eq!(check.body["lanes"].as_array().unwrap().len(), 0);
+        assert_eq!(check.body["ownerfs_mode"], "off");
+    }
+
+    #[test]
+    fn ownerfs_required_without_runtime_is_not_ready() {
+        let required = HixlConfig {
+            ownerfs_read_mode: crate::config::HixlOwnerFsReadMode::Required,
+            ..HixlConfig::default()
+        };
+        let check = hixl_check(&required, None, 0, &[], &[]);
+        assert!(check.configured);
+        assert!(!check.ready);
+        assert_eq!(check.body["mode"], "off");
+        assert_eq!(check.body["ownerfs_mode"], "required");
+
+        let preferred = HixlConfig {
+            ownerfs_read_mode: crate::config::HixlOwnerFsReadMode::Preferred,
+            ..HixlConfig::default()
+        };
+        let check = hixl_check(&preferred, None, 0, &[], &[]);
+        assert!(check.ready);
+        assert_eq!(check.body["fallback"], "grpc");
     }
 }

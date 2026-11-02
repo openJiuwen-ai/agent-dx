@@ -1545,7 +1545,7 @@ pub(crate) trait ExportProvider: Send + Sync {
     fn quarantine(&self) -> Result<(), HixlError>;
 }
 
-struct PendingExport<'a> {
+pub(super) struct PendingExport<'a> {
     provider: &'a dyn ExportProvider,
     window: ExportWindow,
     lane_id: usize,
@@ -1554,7 +1554,7 @@ struct PendingExport<'a> {
 }
 
 impl<'a> PendingExport<'a> {
-    fn new(
+    pub(super) fn new(
         provider: &'a dyn ExportProvider,
         lane_id: usize,
         window: ExportWindow,
@@ -1569,7 +1569,7 @@ impl<'a> PendingExport<'a> {
         }
     }
 
-    fn disarm(mut self) {
+    pub(super) fn disarm(mut self) {
         self.armed = false;
     }
 }
@@ -1589,6 +1589,11 @@ impl Drop for PendingExport<'_> {
 
 struct RuntimeExportProvider {
     runtime: Arc<HixlRuntimeGroup>,
+}
+
+/// The production export boundary shared by the DFS and OwnerFs sources.
+pub(super) fn runtime_export_provider(runtime: Arc<HixlRuntimeGroup>) -> Arc<dyn ExportProvider> {
+    Arc::new(RuntimeExportProvider { runtime })
 }
 
 impl ExportProvider for RuntimeExportProvider {
@@ -2040,7 +2045,7 @@ fn validate_hixl_identity(
     Ok(())
 }
 
-fn negotiated_transport(
+pub(super) fn negotiated_transport(
     info: &EngineInfo,
 ) -> Result<(DfsHixlTransport, u32, u32, Option<u64>), Status> {
     match info.transport {
@@ -2117,7 +2122,7 @@ fn validate_transport_request(
     Ok(())
 }
 
-fn effective_export_slots(slots: usize) -> Result<u32, Status> {
+pub(super) fn effective_export_slots(slots: usize) -> Result<u32, Status> {
     let slots = slots.min(MAX_HIXL_WINDOWS);
     if slots == 0 {
         return Err(coded_status(
@@ -2159,7 +2164,7 @@ fn validate_release_identity(
     Ok(())
 }
 
-fn runtime_status(error: HixlError) -> Status {
+pub(super) fn runtime_status(error: HixlError) -> Status {
     error_to_status(crate::node::rpc::hixl::runtime_error(error))
 }
 

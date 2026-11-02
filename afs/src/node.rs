@@ -256,6 +256,20 @@ where
     Ok((guard, registration))
 }
 
+/// Either read mode needs the shared HIXL runtime group.
+#[cfg(feature = "dfs")]
+fn hixl_runtime_configured(config: &crate::config::HixlConfig) -> bool {
+    config.dfs_read_mode != crate::config::HixlDfsReadMode::Off
+        || config.ownerfs_read_mode != crate::config::HixlOwnerFsReadMode::Off
+}
+
+/// A required mode keeps startup fail-closed when the local capability is absent.
+#[cfg(feature = "dfs")]
+fn hixl_runtime_required(config: &crate::config::HixlConfig) -> bool {
+    config.dfs_read_mode == crate::config::HixlDfsReadMode::Required
+        || config.ownerfs_read_mode == crate::config::HixlOwnerFsReadMode::Required
+}
+
 #[cfg(feature = "dfs")]
 fn cleanup_hixl_startup_runtime(runtime: Option<Arc<afs_transport::hixl::HixlRuntimeGroup>>) {
     if let Some(runtime) = runtime
@@ -569,6 +583,8 @@ struct OwnerFilesFactory {
     rdma_device: Option<String>,
     timeout: std::time::Duration,
     rdma_admission: Arc<tokio::sync::Semaphore>,
+    #[cfg(feature = "dfs")]
+    hixl: Option<Arc<rpc::peer::owner_hixl::OwnerHixlReader>>,
 }
 
 #[cfg(feature = "ownerfs")]
@@ -619,16 +635,20 @@ impl vfs::ownerfs::RemoteFilesFactory for OwnerFilesFactory {
         let long_wait_channel =
             self.runtime
                 .block_on(self.peers.long_wait_channel(home_node_id, node_epoch, &uri))?;
-        Ok(Arc::new(
-            rpc::peer::owner_files_client_from_channel_with_runtime_and_metrics(
-                channel,
-                self.runtime.clone(),
-                Some(self.metrics.clone()),
-            )
-            .with_data_transport(self.data_mode, self.rdma_device.clone(), self.timeout)
-            .with_rdma_admission(self.rdma_admission.clone())
-            .with_long_wait_channel(long_wait_channel),
-        ))
+        let client = rpc::peer::owner_files_client_from_channel_with_runtime_and_metrics(
+            channel,
+            self.runtime.clone(),
+            Some(self.metrics.clone()),
+        )
+        .with_data_transport(self.data_mode, self.rdma_device.clone(), self.timeout)
+        .with_rdma_admission(self.rdma_admission.clone())
+        .with_long_wait_channel(long_wait_channel);
+        #[cfg(feature = "dfs")]
+        let client = match &self.hixl {
+            Some(reader) => client.with_hixl(reader.clone(), home_node_id.to_owned()),
+            None => client,
+        };
+        Ok(Arc::new(client))
     }
 }
 
@@ -1745,8 +1765,10 @@ async fn run_node(
     let (mut hixl_startup_guard, initial_registration) =
         initialize_hixl_and_register_node(
             || async {
+                // DFS and OwnerFs share one runtime group (and its failure
+                // domain); either mode starts it.
                 let hixl_runtime =
-                    if cfg.hixl.dfs_read_mode != crate::config::HixlDfsReadMode::Off {
+                    if hixl_runtime_configured(&cfg.hixl) {
                         let options = cfg.hixl.runtime_options_per_device();
                         match tokio::task::spawn_blocking(move || {
                             afs_transport::hixl::HixlRuntimeGroup::start(options)
@@ -1755,8 +1777,7 @@ async fn run_node(
                         {
                             Ok(runtime) => Some(runtime),
                             Err(error)
-                                if cfg.hixl.dfs_read_mode
-                                    == crate::config::HixlDfsReadMode::Preferred
+                                if !hixl_runtime_required(&cfg.hixl)
                                     && error.kind
                                         == afs_transport::hixl::HixlErrorKind::Unsupported =>
                             {
@@ -1781,6 +1802,42 @@ async fn run_node(
     let (registered_node_epoch, registered_node_at, registered_readiness) = initial_registration;
     #[cfg(feature = "dfs")]
     let hixl_runtime = hixl_startup_guard.resource().cloned().flatten();
+    #[cfg(feature = "dfs")]
+    let hixl_metrics = if hixl_runtime_configured(&cfg.hixl) {
+        let metrics = rpc::hixl::HixlMetrics::register(&obs.registry)?;
+        if let Some(runtime) = &hixl_runtime {
+            metrics.snapshot(&runtime.status());
+        } else {
+            metrics.observe(rpc::hixl::Operation::Fallback, Duration::ZERO, true);
+        }
+        Some(metrics)
+    } else {
+        None
+    };
+    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    let owner_hixl_reader = match (&hixl_runtime, cfg.hixl.ownerfs_read_mode) {
+        (Some(runtime), mode) if mode != crate::config::HixlOwnerFsReadMode::Off => {
+            let mut reader = rpc::peer::owner_hixl::OwnerHixlReader::new(
+                runtime.clone(),
+                cfg.id.clone(),
+                rpc::peer::owner_hixl::OwnerHixlPolicy {
+                    mode,
+                    max_window_bytes: cfg.hixl.ownerfs_window_bytes,
+                    max_inflight: cfg.hixl.ownerfs_max_inflight,
+                    host_budget_bytes: cfg.hixl.ownerfs_host_budget_bytes,
+                    min_file_bytes: cfg.hixl.ownerfs_min_file_bytes,
+                    receive_slots: cfg.hixl.receive_slots,
+                },
+                timeout,
+            )?
+            .with_owner_metrics(owner_rpc_metrics.clone());
+            if let Some(metrics) = &hixl_metrics {
+                reader = reader.with_metrics(metrics.clone());
+            }
+            Some(Arc::new(reader))
+        }
+        _ => None,
+    };
     #[cfg(feature = "dfs")]
     let dfs_read_authority = if cfg.dfs {
         let registration = registered_readiness.as_ref().ok_or_else(|| {
@@ -1869,6 +1926,8 @@ async fn run_node(
             rdma_admission: Arc::new(tokio::sync::Semaphore::new(
                 rpc::peer::OWNER_RDMA_MAX_CLIENT_WINDOWS,
             )),
+            #[cfg(feature = "dfs")]
+            hixl: owner_hixl_reader.clone(),
         });
         let recovery_root_meta = root_meta.clone();
         let roots = Arc::new(
@@ -1955,30 +2014,23 @@ async fn run_node(
     };
     #[cfg(feature = "dfs")]
     let dfs_data_mode = parse_data_mode(&cfg.data_mode);
+    // The DFS source serves only DFS mode; an OwnerFs-only runtime must not
+    // expose DFS windows.
     #[cfg(feature = "dfs")]
-    let hixl_metrics = if cfg.hixl.dfs_read_mode != crate::config::HixlDfsReadMode::Off {
-        let metrics = rpc::hixl::HixlMetrics::register(&obs.registry)?;
-        if let Some(runtime) = &hixl_runtime {
-            metrics.snapshot(&runtime.status());
-        } else {
-            metrics.observe(rpc::hixl::Operation::Fallback, Duration::ZERO, true);
-        }
-        Some(metrics)
-    } else {
-        None
-    };
-    #[cfg(feature = "dfs")]
-    let hixl_source = hixl_runtime.as_ref().map(|runtime| {
-        let mut source = rpc::data::hixl::HixlReadService::new(
-            runtime.clone(),
-            cfg.id.clone(),
-            registered_node_epoch,
-        );
-        if let Some(metrics) = &hixl_metrics {
-            source = source.with_metrics(metrics.clone());
-        }
-        Arc::new(source)
-    });
+    let hixl_source = hixl_runtime
+        .as_ref()
+        .filter(|_| cfg.hixl.dfs_read_mode != crate::config::HixlDfsReadMode::Off)
+        .map(|runtime| {
+            let mut source = rpc::data::hixl::HixlReadService::new(
+                runtime.clone(),
+                cfg.id.clone(),
+                registered_node_epoch,
+            );
+            if let Some(metrics) = &hixl_metrics {
+                source = source.with_metrics(metrics.clone());
+            }
+            Arc::new(source)
+        });
     #[cfg(feature = "dfs")]
     let dfs_rdma_pool = if cfg.dfs {
         if let Some(device) = dfs_rdma_startup_device(dfs_data_mode, cfg.rdma_device.as_deref())? {
@@ -2419,6 +2471,40 @@ async fn run_node(
         hixl_metrics: hixl_metrics.clone(),
     });
     let mut services = Services::new();
+    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    let owner_hixl_source = match (&hixl_runtime, state.ownerfs.as_ref()) {
+        (Some(runtime), Some(ownerfs))
+            if cfg.hixl.ownerfs_read_mode != crate::config::HixlOwnerFsReadMode::Off =>
+        {
+            let mut source = rpc::data::owner_hixl::OwnerHixlService::new(
+                runtime.clone(),
+                ownerfs.peer_executor()?,
+            )
+            .with_owner_metrics(owner_rpc_metrics.clone());
+            if let Some(metrics) = &hixl_metrics {
+                source = source.with_metrics(metrics.clone());
+            }
+            Some(Arc::new(source))
+        }
+        _ => None,
+    };
+    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    if let Some(source) = &owner_hixl_source {
+        let source = source.clone();
+        let stop = services.stop.subscribe();
+        services.spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let shutdown = cancelled(stop);
+            tokio::pin!(shutdown);
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown => return Ok(()),
+                    _ = tick.tick() => source.expire().await.map_err(afs_transport::grpc::error_status::status_to_error)?,
+                }
+            }
+        });
+    }
     #[cfg(feature = "dfs")]
     if let Some(source) = &hixl_source {
         let source = source.clone();
@@ -2811,12 +2897,15 @@ async fn run_node(
             .collect::<afs_error::Result<Vec<_>>>()?;
         let authenticator = Arc::new(rpc::data::MtlsPeerAuthenticator::new(trusted)?);
         let handler = rpc::data::make_owner_files_handler(ownerfs.peer_executor()?);
-        rpc::data::make_owner_files_server_with_handler_metrics_and_rdma(
-            handler,
-            authenticator,
-            owner_rpc_metrics.clone(),
-            owner_rdma_sessions.clone(),
-        )
+        let service = rpc::data::OwnerFilesService::new(handler, authenticator)
+            .with_metrics(owner_rpc_metrics.clone())
+            .with_rdma_sessions(owner_rdma_sessions.clone());
+        #[cfg(feature = "dfs")]
+        let service = match &owner_hixl_source {
+            Some(source) => service.with_hixl(source.clone()),
+            None => service,
+        };
+        rpc::data::make_owner_files_server_from(service)
     } else {
         rpc::data::make_owner_files_server()
     };
@@ -2848,11 +2937,23 @@ async fn run_node(
             cancelled(stop).await;
             // Keep release RPCs available while source admission is closed.
             // This grace period stays inside the Services ten-second deadline.
-            let result = match hixl_source {
-                Some(source) => source.drain(Duration::from_secs(5)).await,
-                None => Ok(()),
+            let dfs = async {
+                match hixl_source {
+                    Some(source) => source.drain(Duration::from_secs(5)).await,
+                    None => Ok(()),
+                }
             };
-            let _ = drain_sender.send(result);
+            #[cfg(feature = "ownerfs")]
+            let owner = async {
+                match owner_hixl_source {
+                    Some(source) => source.drain(Duration::from_secs(5)).await,
+                    None => Ok(()),
+                }
+            };
+            #[cfg(not(feature = "ownerfs"))]
+            let owner = async { Ok::<(), tonic::Status>(()) };
+            let (dfs, owner) = tokio::join!(dfs, owner);
+            let _ = drain_sender.send(dfs.and(owner));
         };
         #[cfg(not(feature = "dfs"))]
         let shutdown = cancelled(stop);
