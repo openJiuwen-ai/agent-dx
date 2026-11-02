@@ -1491,33 +1491,18 @@ impl FuseDispatch {
     /// Wait for this handle's FIFO turn, then execute without owning or copying
     /// its input. Only a bounded wakeup marker crosses to a worker. This blocks
     /// the receive callback, but holds no queue/state lock during backend I/O.
-    /// Run `job` on the calling (receive) thread when the handle's turn is free,
-    /// otherwise hand it to a worker. Never blocks waiting for the turn, so a
-    /// receive thread cannot stall behind a job that still needs a worker.
+    /// Hand the job to a keyed worker.
+    ///
+    /// This used to run the job on the calling (receive) thread whenever the
+    /// handle's turn happened to be free. That put backend work - `state.lock()`
+    /// plus the ownerfs getattr path - on a receive thread, so a slow backend
+    /// stopped the mount from admitting any other request, including the kernel's
+    /// writeback. Measurements showed the inline variant was inside the noise, so
+    /// there is nothing to trade a blocked receive thread for: every request now
+    /// goes to a worker, and the per-handle turn is still honoured through
+    /// `submit_keyed`.
     fn try_run_keyed(&self, key: u64, job: impl FnOnce() + Send + 'static) {
-        let queue = match self.shared.queue.lock() {
-            Ok(queue) => queue,
-            Err(_) => return,
-        };
-        if queue.closed || queue.active.contains_key(&key) || queue.jobs >= self.capacity {
-            drop(queue);
-            self.submit_keyed(key, job);
-            return;
-        }
-        let mut queue = queue;
-        queue.jobs += 1;
-        queue
-            .active
-            .insert(key, FuseActive::Exclusive);
-        drop(queue);
-        job();
-        Self::finish(
-            &self.shared,
-            Some(FuseTurn {
-                key,
-                access: FuseAccess::Exclusive,
-            }),
-        );
+        self.submit_keyed(key, job);
     }
 
     fn run_borrowed_keyed(&self, key: u64, job: impl FnOnce()) {
@@ -1953,16 +1938,6 @@ impl AfsFuse {
         );
     }
 
-    /// Experimental: run a request for a locally owned root on the FUSE receive
-    /// thread instead of handing it to a worker. Enabled with
-    /// `AFS_OWNERFS_INLINE=1`; it drops the per-handle dispatch serialisation.
-    fn inline_ownerfs_local(&self, ino: u64) -> bool {
-        if !ownerfs_inline_enabled() {
-            return false;
-        }
-        self.ownerfs_private_local(ino)
-    }
-
     /// True when OwnerFs answers this inode from an exclusively owned local
     /// root, so the request may run on the receive thread under the per-handle
     /// turn bookkeeping instead of paying for a worker handoff.
@@ -2350,7 +2325,7 @@ impl Filesystem for AfsFuse {
                 Err(error) => reply.error(fuse_errno(error)),
             }
         };
-        if let Some(fh) = fh.filter(|_| !inline_local_read && !self.inline_ownerfs_local(ino)) {
+        if let Some(fh) = fh.filter(|_| !inline_local_read) {
             if self.ownerfs_private_local(ino) {
                 // Keep the per-handle turn, but run it here when the turn is
                 // free: a private local root answers from memory, so a worker
@@ -3314,10 +3289,6 @@ impl Filesystem for AfsFuse {
                 Err(error) => reply.error(fuse_errno(error)),
             }
         };
-        if self.inline_ownerfs_local(ino) {
-            run(data);
-            return;
-        }
         match input {
             None => {
                 self.dispatch
@@ -3441,7 +3412,7 @@ impl Filesystem for AfsFuse {
         };
         let dispatch_key = self.file_dispatch_key(ino, fh);
         let entry_at = std::time::Instant::now();
-        let inline_local = inline_local_read || self.inline_ownerfs_local(ino);
+        let inline_local = inline_local_read;
         self.front_recover(ino, false, move |_front_guard, front_result| {
             if _front_guard.is_none()
                 && let Err(error) = front_result
@@ -3524,7 +3495,7 @@ impl Filesystem for AfsFuse {
         let dispatch_key = self.file_dispatch_key(ino, fh);
         let front_queue = self.front_write.clone();
         let entry_at = std::time::Instant::now();
-        let inline_local = inline_local_read || self.inline_ownerfs_local(ino);
+        let inline_local = inline_local_read;
         self.front_recover(ino, true, move |_front_guard, front_result| {
             let run = move || {
                 let _front_guard = _front_guard;
@@ -3598,12 +3569,6 @@ impl Filesystem for AfsFuse {
         self.record_request("fsync");
         let ino = ino.0;
         let fh = fh.0;
-        let inline_local_read = self
-            .state
-            .lock()
-            .unwrap()
-            .file_handle(fh)
-            .is_some_and(|file| file.inline_local_read);
         let backend = self.backend.clone();
         let state = self.state.clone();
         let context = Self::context(req, 0);
@@ -3612,7 +3577,13 @@ impl Filesystem for AfsFuse {
             normal_capacity: self.front_write.is_none().then_some(self.dispatch.capacity),
         };
         let dispatch_key = self.file_dispatch_key(ino, fh);
-        let inline_local = inline_local_read || self.inline_ownerfs_local(ino);
+        // fsync is a durability barrier: `sync_data`/`sync_all` can block for tens
+        // of milliseconds. It must never run on a receive thread, or the whole
+        // mount stops admitting requests (including the writeback that the fsync
+        // itself may be waiting for). A read-only handle is not exempt: an fsync
+        // on an O_RDONLY descriptor still flushes data dirtied by another writer of
+        // the same file. This is the rule `write_admission_mode` documents for
+        // writes ("anything that may wait stays on a worker") applied to fsync.
         self.front_recover(ino, false, move |_front_guard, front_result| {
             if _front_guard.is_none()
                 && let Err(error) = front_result
@@ -3635,11 +3606,7 @@ impl Filesystem for AfsFuse {
 
                 reply_empty(reply, combine_empty_results(front_result, result));
             };
-            if inline_local {
-                run();
-            } else {
-                dispatch.submit(dispatch_key, run);
-            }
+            dispatch.submit(dispatch_key, run);
         });
     }
 
@@ -4290,15 +4257,6 @@ fn fuse_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var("AFS_FUSE_TRACE")
-            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    })
-}
-
-fn ownerfs_inline_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("AFS_OWNERFS_INLINE")
             .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
     })

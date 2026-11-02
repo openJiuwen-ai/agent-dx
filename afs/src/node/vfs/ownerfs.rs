@@ -94,6 +94,19 @@ struct PrivateFuseCache {
 }
 
 impl PrivateFuseCache {
+    /// True only when this node is the sole observer of the root: it holds the
+    /// active local grant and no peer has ever been admitted to it.
+    ///
+    /// A local grant only says this node may write. A peer read grant is
+    /// admitted through `validate_peer`, which records the root here and never
+    /// reverts for the rest of the daemon session, so this is the conservative
+    /// answer to "could somebody else observe this file". Both the attribute TTL
+    /// and the close-time sync decision must use this one predicate: they used to
+    /// disagree, and that disagreement let a shared root skip the close sync.
+    fn root_is_exclusive(&self, roots: &RootManager, root_id: &RootId) -> bool {
+        roots.has_active_local_root(root_id) && !self.shared_roots.contains(root_id)
+    }
+
     fn new() -> Self {
         Self::with_native_home_eligibility(false)
     }
@@ -324,10 +337,11 @@ impl OwnerFs {
         let private = if inode.value == OWNERFS_ROOT_INODE {
             true
         } else {
-            self.local
-                .as_ref()
-                .and_then(|local| local.private_root_for_inode(inode.value))
-                .is_some_and(|id| !cache.shared_roots.contains(&id))
+            self.local.as_ref().is_some_and(|local| {
+                local
+                    .private_root_for_inode(inode.value)
+                    .is_some_and(|id| cache.root_is_exclusive(&local.roots, &id))
+            })
         };
         let ttl = if private {
             ownerfs_cache_ttl()
@@ -1176,8 +1190,17 @@ impl Backend for OwnerFs {
         let Ok(slot) = local.open_file_handle(handle) else {
             return WriteAdmissionMode::Queued;
         };
-        let Ok(slot) = slot.lock() else {
-            return WriteAdmissionMode::Queued;
+        // Never wait for this handle here. `write_with_options` holds the slot
+        // lock across the real `write_at` and, for `O_SYNC`/`O_DSYNC` handles,
+        // across `sync_data` as well. Blocking on it would park the FUSE receive
+        // thread that is admitting this request, which is exactly what this
+        // admission decision exists to avoid: a writeback write still in flight
+        // would then stall every unrelated request on the mount. If the handle is
+        // busy, hand the write to a worker instead of inspecting it.
+        let slot = match slot.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => return WriteAdmissionMode::Queued,
+            Err(std::sync::TryLockError::Poisoned(_)) => return WriteAdmissionMode::Queued,
         };
         match &slot.file {
             OpenFileHandle::Local(file)
@@ -2212,6 +2235,25 @@ impl LocalOwnerFs {
     /// peer writer can mutate the file while this node holds the handle.
     fn root_is_private(&self, root_id: &RootId) -> bool {
         self.roots.has_active_local_root(root_id)
+    }
+
+    /// True only when this node is the sole party that can observe the root:
+    /// it holds the active local grant *and* no peer has ever validated access
+    /// to it.
+    ///
+    /// `has_active_local_root` alone only says this node may write; it says
+    /// nothing about concurrent readers. A peer read grant is admitted through
+    /// `validate_peer`, which records the root in `shared_roots` for the rest of
+    /// the daemon session, so that set is the conservative answer to "could
+    /// somebody else read this file through another path". Skipping the
+    /// close-time sync is only safe when the answer is no.
+    fn root_is_exclusive_local(&self, root_id: &RootId) -> bool {
+        match self.private_cache.lock() {
+            Ok(cache) => cache.root_is_exclusive(&self.roots, root_id),
+            // Poisoned cache: keep the durability guarantee rather than the
+            // optimisation.
+            Err(_) => false,
+        }
     }
 
     /// Whether this node owns the inode's root exclusively, so a metadata answer
@@ -4395,15 +4437,23 @@ impl LocalOwnerFs {
         match &mut file.file {
             OpenFileHandle::Local(file) if file.needs_flush => {
                 file.check_no_fatal_sync_error()?;
-                // Closing a handle on an exclusively owned local root needs no
-                // data sync: the write already sits in the page cache and the
-                // kernel writeback thread persists it, exactly like a local
-                // filesystem that was never fsync'ed. Roots shared with peers
-                // keep the synchronous close so a remote reader never observes
-                // a stale file once the writer's close has returned.
+                // Closing a handle needs no data sync only when this node is
+                // the sole observer of the root: the write already sits in the
+                // page cache and the kernel writeback thread persists it, just
+                // like a local filesystem that was never fsync'ed.
+                //
+                // The exclusivity test must cover readers, not just writers.
+                // Holding the local write grant does not stop a peer from
+                // taking a read grant on the same root and reading the file
+                // through a path that bypasses this node's page cache; in that
+                // case skipping the sync lets the peer observe a stale or short
+                // file after our close has returned. `root_is_exclusive_local`
+                // therefore also requires that no peer has ever been admitted
+                // to the root.
+                //
                 // AFS_OWNERFS_CLOSE_SYNC=1 restores the old behaviour.
                 if file.write_sync == WriteSyncMode::None
-                    && self.roots.has_active_local_root(&file.handle.root_id)
+                    && self.root_is_exclusive_local(&file.handle.root_id)
                     && !ownerfs_close_sync_forced()
                 {
                     file.needs_flush = false;
@@ -9172,6 +9222,42 @@ mod tests {
             access_generation: grant.access_generation,
             fencing_token: grant.fencing_token.clone(),
         }
+    }
+
+    #[test]
+    fn close_sync_is_only_skipped_for_roots_no_peer_can_read() {
+        let (_temp, fs, ctx) = fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let workspace = fs
+            .mkdir(&ctx, root, OsStr::new("job-close-sync"), 0o755)
+            .unwrap();
+
+        let local = fs.require_local().unwrap();
+        let root_id = local.record(workspace.inode.value).unwrap().root_id.clone();
+
+        // A brand new private root: nobody else can observe it, so the close-time
+        // sync may be skipped.
+        assert!(local.root_is_exclusive_local(&root_id));
+
+        // Once a peer has been admitted to the root, a read grant can coexist
+        // with the local write grant and the peer may read through a path that
+        // bypasses this node's page cache. The close must sync again.
+        local
+            .private_cache
+            .lock()
+            .unwrap()
+            .shared_roots
+            .insert(root_id.clone());
+        assert!(
+            !local.root_is_exclusive_local(&root_id),
+            "a root a peer can read must keep the synchronous close"
+        );
+
+        // The attribute TTL predicate must agree with the close-sync predicate.
+        let cache = local.private_cache.lock().unwrap();
+        assert!(!cache.root_is_exclusive(&local.roots, &root_id));
     }
 
     #[test]

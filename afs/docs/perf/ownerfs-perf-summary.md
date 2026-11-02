@@ -229,7 +229,7 @@ inline 读路径原先复用一把挂在挂载点上的 `Mutex<Vec<u8>>`。由�
 | 路径解析（openat + openat2 + 父目录复用） | 中 | 深路径、多文件 | +7.5%；openat 9.7->8.7、close 13.9->12.0 per file |
 | 挂载根 attr TTL（0 -> 1 s） | 中 | **热读、重复访问**（省重复 LOOKUP） | 单文件回调 20->12；热读 +15-37% |
 | write 借用式准入（对齐 DFS） | 小 | 私有 root 本地写 | 排队 38.7 -> 19.4 µs |
-| getattr `try_run_keyed` | 噪声内 | 带 fh 的 getattr | 无可测差异 |
+| getattr 走 worker（不再内联） | 噪声内 | 带 fh 的 getattr | 无可测差异；为的是不阻塞接收线程 |
 | inline 读改线程本地 buffer | 噪声内（清坏味道） | 并发读 | 4 并发热读 85,548 -> 86,700（+1.3%） |
 | 调 `fuse_threads`/`fuse_workers` | **不采纳** | — | 单线程客户端下 1/4 比 4/32 快 25%，但当不了并发参数的证据 |
 | TTL 默认提到 30 s | **回退** | — | 20k 反复读 +50%，但属文档契约变更，改由配置决定 |
@@ -276,8 +276,8 @@ inline 读路径原先复用一把挂在挂载点上的 `Mutex<Vec<u8>>`。由�
 | 改动 | 作用 |
 |---|---|
 | `AFS_FUSE_TRACE=1` 门控的逐回调打点（op/ino/fh/耗时/排队等待）+ create 六段计时 | 默认零开销；正是靠它把 create 的 106 µs 拆到 `inode_for_path` 29.7 µs 等具体行 |
-| `try_run_keyed`：轮次空闲就地执行、忙则回队列，**绝不阻塞接收线程** | getattr 少一次跨线程交接（先做过阻塞版，实测退化 1244/1280 files/s，已改） |
-| `AFS_OWNERFS_INLINE=1` | 仅对照用；它会丢 per-fh 串行化，**不可转正** |
+| `try_run_keyed` 退化为纯委派到 `submit_keyed`（内联执行已删除） | 接收线程不再跑 backend；实测内联版本本就在噪声内 |
+| ~~`AFS_OWNERFS_INLINE=1`~~ | **已删除**（检视意见 #2：它绕过 per-handle dispatch key，与 read/copy_file_range/setattr 存在竞态） |
 
 ### 另有 4 个前置修复（本轮之前已提交）
 
