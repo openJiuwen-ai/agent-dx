@@ -571,7 +571,8 @@ python3 afs/tests/run.py run --case dfs.resources.reader_fd_budget \
 要求local_probe至少增加868、PID/start和chunk根身份不变、B无本地reader、
 检查点无重复／超容量句柄，A其它FD相对基线最多增加4。
 结果保留原始FD表、metrics前后值、内容断言、源码／产品身份与正常cleanup。
-失败不自动重试；工具单测不能替代Linux真实运行。
+失败不自动重试；验收断言使用显式错误，Python `-O`也不能绕过读取计数检查。
+工具单测不能替代Linux真实运行。
 
 本例是定向组件回归，本轮不加入`local-basic`、`all-basic`、`ci-full`或默认CI冒烟。
 它验证关闭负载检查点的封顶、淘汰和复用；不证明SDK一小时、在途并发上界、

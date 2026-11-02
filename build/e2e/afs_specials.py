@@ -49,8 +49,9 @@ def validate_sdk(report, mode, special):
             raise ValueError('DFS special did not prove the remote peer read path')
     if special == 'pressure':
         p = report.get('pressure', {})
-        if (any(p.get(k) != v for k, v in {'workers': 4, 'operations': 32, 'payload_bytes': 65536,
-                                           'verified_bytes': 2097152, 'exclusive_errno': 17}.items())
+        expected_pressure = {'workers': 4, 'operations': 32, 'payload_bytes': 65536,
+                             'verified_bytes': 2097152, 'exclusive_errno': 17}
+        if (any(p.get(k) != v for k, v in expected_pressure.items())
                 or p.get('errors') != []):
             raise ValueError('bounded pressure did not complete its exact workload and errno checks')
     else:

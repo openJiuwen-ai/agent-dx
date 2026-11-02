@@ -216,7 +216,7 @@ def evaluate(samples, work, mode, policy):
         center = statistics.mean(times)
         trends[node]['raw_fds_diagnostic'] = {
             'window_medians': raw, 'end_delta': raw[-1] - raw[0],
-            'slope_per_hour': sum((x - center) * (y - statistics.mean(raw)) for x, y in zip(times,raw))
+            'slope_per_hour': sum((x - center) * (y - statistics.mean(raw)) for x, y in zip(times, raw))
                 / sum((x - center)**2 for x in times) * 3600, 'gated': False}
         if node != 'afs-m':
             trends[node]['anchor_runtime_rss'] = trend(

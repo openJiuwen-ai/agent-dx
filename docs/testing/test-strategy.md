@@ -1,7 +1,7 @@
 <a id="top"></a>
 # ADX／AFS 测试规范：五步验证路径
 
-状态：2026-11-02。CI0–CI4及默认AFS冒烟已合入。固定Base236的非K8s拿包路径已完成：先跑通组件，再通过ADX SDK和组合功能Full。首批恢复和有界压力专项也已跑通。PK3正式一小时合同已冻结并实跑：OwnerFs、DFS均因AFS Node的FD增长超限提前失败，未取得一小时PASS。后续短诊断已确认OwnerFs远端目录释放缺口，以及DFS读缓存256项封顶；OwnerFs修复交由Issue73跟进；DFS有界缓存已注册组件回归，FD合同v3单独冻结。旧失败不改绿，v3的新SDK观测准入和修复包正式长稳仍待执行。标准兼容、跨VM、全天长稳和性能仍分别验收。具体候选、失败记录和边界见本页对应步骤。
+状态：2026-11-02。CI0–CI4及默认AFS冒烟已合入。固定Base236的非K8s拿包路径已完成：先跑通组件，再通过ADX SDK和组合功能Full。首批恢复和有界压力专项也已跑通。PK3正式一小时合同已冻结并实跑：OwnerFs、DFS均因AFS Node的FD增长超限提前失败，未取得一小时PASS。后续短诊断已确认OwnerFs远端目录释放缺口，以及DFS读缓存256项封顶；OwnerFs修复交由Issue73跟进；DFS有界缓存已注册组件回归，FD合同v3单独冻结。旧失败不改绿，v3的新SDK观测准入和修复包正式长稳仍待执行。标准兼容、跨VM、全天长稳和性能仍分别验收。已验证的PK1／PK2／PK3测试资产通过[MR135](https://gitcode.com/openJiuwen/agent-dx/merge_requests/135)独立交付，OwnerFs修复不作为这些测试资产合入的前置条件；正式长稳仍单独验收。具体候选、失败记录和边界见本页对应步骤。
 
 先按下方五步理解验证时机，再用同页总表看现状与待补项；目录、环境、入口、具体版本及失败证据在对应步骤展开。
 
@@ -705,6 +705,8 @@ v2把runtime门禁字段明确改为`runtime_backing_bytes`，原表观字段保
 | 复用／覆盖范围 | 默认`local-basic`／`all-basic`、CI冒烟和`ci-full`24项保持原集合；本例先作为定向组件回归，不新增独立CI平台。OwnerFs真实释放缺口归[Issue73](https://gitcode.com/openJiuwen/agent-dx/issues/73)，由同事修复 | 组件回归和工具检查不等于新版SDK probe实跑准入、SDK一小时、跨VM／K8s、全天长稳或性能。没有生产代码／生产配置修改，不提MR／不合入，后面与PK1／PK2一起审查 |
 
 **本轮验证**：最终冻结测试源码的Linux公共工具580项、AFS runner73项通过；72份必要原件3,123,228B及34项实际运行源码已独立逐SHA核对；原FD表重算A其它句柄8个检查点均为23，3次AFS正常wait均0。Mac因缺Linux procfs的9项ERROR另存，不计验收。v1/v2合同与默认集合未变，生产代码差异为0。新版SDK观测短准入和正式一小时未执行；原失败保持原结论。
+
+**测试资产发布（2026-11-02）**：PK1固定包SDK/Full、PK2专项、PK3连续入口及DFS回归／FD v3统一由[MR135](https://gitcode.com/openJiuwen/agent-dx/merge_requests/135)交付，复用ADX原部署和用例，不等待OwnerFs产品修复。平台规范检查的测试断言已改为显式失败，补充`-O`模式下错误计数仍须拒绝的回归；正式v1/v2/v3 JSON、默认CI/Full选集及生产代码均不改。发布复验的Linux公共工具580项、AFS runner74项和定向DFS实跑各有独立记录；先前“暂不提MR”属于前批快照，当前资产交付和后续版本长稳结果分开判断。
 
 **下一项／P1**：等待同事提供OwnerFs修复并交付固定包；先核候选／SDK／backend／镜像／harness／v3合同身份，重新做短SDK观测准入（验证新版探针在完整ADX部署中的覆盖和时延），再从头运行OwnerFs、DFS各一小时。旧v1/v2合同和全部FAILED／取消／操作失败记录原样保留，不拼接时长、不事后重判；这轮只冻结v3，不启动正式长稳。本轮证据归仓外`adx/evidence/afs-dfs-fd-v3-20261102/`，原一小时及因果诊断继续保留在各自证据目录。此前一小时合同那批3705份必要原件、原包和活动worktree均不清理。
 
