@@ -185,6 +185,9 @@ ownerfs_max_inflight = 1
 ownerfs_host_budget_bytes = 268435456
 # Preferred mode enables windows only for files at least this large at open.
 ownerfs_min_file_bytes = 1048576
+# Reader control sessions per Home (1..=4); each admits one window fetch, and
+# pooled sessions split the lane's export slots for one window.
+ownerfs_sessions_per_home = 1
 # Optional ordered extra lanes; primary plus extras are limited to 16 SDK
 # logical devices. Both peers pair by lane order. Hardware validation is pending.
 # Multi-device mode requires distinct explicit listener ports on every lane,

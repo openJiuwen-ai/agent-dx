@@ -126,6 +126,7 @@ impl PeerAuthenticator for AllowPeer {
 struct FileHandler {
     source: Arc<MemorySource>,
     grpc_reads: AtomicUsize,
+    opens: AtomicUsize,
 }
 
 impl OwnerFilesHandler for FileHandler {
@@ -135,10 +136,12 @@ impl OwnerFilesHandler for FileHandler {
         let identity = afs_protocol::node_data::FileIdentity {
             opaque: b"identity-a".to_vec(),
         };
+        // Every OPEN is a distinct Home handle, like the real executor.
+        let open = self.opens.fetch_add(1, Ordering::SeqCst);
+        let mut handle = OPEN_HANDLE.to_vec();
+        handle.extend_from_slice(format!("-{open}").as_bytes());
         Ok(OwnerOpenReply {
-            handle: Some(OwnerHandle {
-                opaque: OPEN_HANDLE.to_vec(),
-            }),
+            handle: Some(OwnerHandle { opaque: handle }),
             file_identity: Some(identity.clone()),
             owner_session_id: "home-session-a".to_owned(),
             attr: Some(OwnerFileAttr {
@@ -218,6 +221,7 @@ fn policy(mode: HixlOwnerFsReadMode) -> OwnerHixlPolicy {
         host_budget_bytes: 1024 * 1024,
         min_file_bytes: 1,
         receive_slots: 16,
+        sessions_per_home: 1,
     }
 }
 
@@ -240,11 +244,16 @@ fn content() -> Vec<u8> {
 }
 
 async fn fixture(policy: OwnerHixlPolicy, home_hixl: bool) -> Fixture {
+    fixture_with(policy, home_hixl, MemorySource::new(content(), 3000)).await
+}
+
+async fn fixture_with(policy: OwnerHixlPolicy, home_hixl: bool, source: MemorySource) -> Fixture {
     let exports = Arc::new(MemoryExports::new(SLOT, 8));
-    let source = Arc::new(MemorySource::new(content(), 3000));
+    let source = Arc::new(source);
     let handler = Arc::new(FileHandler {
         source: source.clone(),
         grpc_reads: AtomicUsize::new(0),
+        opens: AtomicUsize::new(0),
     });
     let mut service = OwnerFilesService::new(handler.clone(), Arc::new(AllowPeer));
     if home_hixl {
@@ -358,22 +367,77 @@ async fn sequential_reads_fill_growing_windows_and_stop_at_eof() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn preferred_keeps_random_reads_on_grpc_until_access_turns_sequential() {
+async fn preferred_opens_a_window_only_after_two_sequential_reads() {
     let fixture = fixture(policy(HixlOwnerFsReadMode::Preferred), true).await;
     let client = fixture.client.clone();
-    let (random, sequential) = blocking(move || {
+    let reads = blocking(move || {
         let file = open(&client, libc::O_RDONLY);
-        let random = read(&client, &file, 20_000, 1000).unwrap();
-        let sequential = read(&client, &file, 21_000, 1000).unwrap();
-        (random, sequential)
+        // A random read, then the kernel readahead that follows it, then the
+        // read that confirms the stream is sequential.
+        [20_000, 21_000, 22_000].map(|offset| read(&client, &file, offset, 1000).unwrap())
     })
     .await;
-    assert_eq!(random, content()[20_000..21_000]);
-    assert_eq!(sequential, content()[21_000..22_000]);
-    assert_eq!(fixture.handler.grpc_reads.load(Ordering::SeqCst), 1);
+    for (index, data) in reads.iter().enumerate() {
+        let offset = 20_000 + index * 1000;
+        assert_eq!(*data, content()[offset..offset + 1000]);
+    }
+    assert_eq!(fixture.handler.grpc_reads.load(Ordering::SeqCst), 2);
     assert_eq!(fixture.native.batches.load(Ordering::SeqCst), 1);
-    assert_eq!(fixture.reads("fallback"), 1);
+    assert_eq!(fixture.reads("fallback"), 2);
     assert_eq!(fixture.reads("fetch"), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn required_offset_zero_and_window_continuations_need_no_streak() {
+    let fixture = fixture(policy(HixlOwnerFsReadMode::Required), true).await;
+    let client = fixture.client.clone();
+    blocking(move || {
+        let file = open(&client, libc::O_RDONLY);
+        // Offset 0 opens a window at once; the jump fetches only its length.
+        assert_eq!(read(&client, &file, 0, 1000).unwrap(), content()[..1000]);
+        assert_eq!(
+            read(&client, &file, 30_000, 1000).unwrap(),
+            content()[30_000..31_000]
+        );
+    })
+    .await;
+    assert_eq!(fixture.native.batches.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.handler.grpc_reads.load(Ordering::SeqCst), 0);
+}
+
+/// Two opens of one Home prepare concurrently only with a session pool.
+async fn peak_home_prepares(sessions_per_home: usize) -> usize {
+    let mut pooled = policy(HixlOwnerFsReadMode::Required);
+    pooled.sessions_per_home = sessions_per_home;
+    let source = MemorySource::new(content(), 3000).with_overlap_probe(2);
+    let fixture = fixture_with(pooled, true, source).await;
+    let readers = (0..2).map(|_| {
+        let client = fixture.client.clone();
+        tokio::task::spawn_blocking(move || {
+            let file = open(&client, libc::O_RDONLY);
+            read(&client, &file, 0, 1000).unwrap()
+        })
+    });
+    for reader in readers.collect::<Vec<_>>() {
+        assert_eq!(reader.await.unwrap(), content()[..1000]);
+    }
+    fixture.wait_released().await;
+    fixture.source.peak_overlap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_session_pool_overlaps_window_prepares_on_one_home() {
+    assert_eq!(peak_home_prepares(1).await, 1);
+    assert_eq!(peak_home_prepares(2).await, 2);
+}
+
+#[test]
+fn pooled_sessions_split_the_remote_export_slots() {
+    assert_eq!(window_slots(16, 16, 1), 16);
+    assert_eq!(window_slots(16, 16, 4), 4);
+    assert_eq!(window_slots(8, 16, 2), 4);
+    assert_eq!(window_slots(16, 4, 2), 4);
+    assert_eq!(window_slots(2, 16, 4), 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -108,11 +108,14 @@ pub struct HixlConfig {
     pub ownerfs_host_budget_bytes: u64,
     /// Preferred mode only enables windows for files at least this large at open.
     pub ownerfs_min_file_bytes: u64,
+    /// Reader control sessions per Home; each admits one window fetch at a time.
+    pub ownerfs_sessions_per_home: usize,
 }
 
 const MAX_OWNERFS_HIXL_WINDOW_BYTES: usize = 64 * 1024 * 1024;
 const MAX_OWNERFS_HIXL_HOST_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_OWNERFS_HIXL_MIN_FILE_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+const MAX_OWNERFS_HIXL_SESSIONS_PER_HOME: usize = 4;
 
 impl Default for HixlConfig {
     fn default() -> Self {
@@ -136,6 +139,7 @@ impl Default for HixlConfig {
             ownerfs_max_inflight: 1,
             ownerfs_host_budget_bytes: 256 * 1024 * 1024,
             ownerfs_min_file_bytes: 1024 * 1024,
+            ownerfs_sessions_per_home: 1,
         }
     }
 }
@@ -223,15 +227,17 @@ impl HixlConfig {
 
     /// OwnerFs windows are bounded by both local slot pools: one prepare
     /// exports at most one window per remote export slot, and one native batch
-    /// READ occupies one receive slot per window.
+    /// READ occupies one receive slot per window. Pooled sessions of one Home
+    /// can each hold a window at once, so they split the export pool.
     fn validate_ownerfs(&self, role: Role, ownerfs: bool, grpc_data: bool) -> Result<()> {
         // Off keeps every existing [hixl] table valid, including small slot pools.
         if self.ownerfs_read_mode == HixlOwnerFsReadMode::Off {
             return Ok(());
         }
+        let sessions = self.ownerfs_sessions_per_home;
         let slot_capacity = self
             .receive_slots
-            .min(self.export_slots)
+            .min(self.export_slots / sessions.max(1))
             .checked_mul(self.window_bytes);
         let inflight_bytes = u64::try_from(self.ownerfs_window_bytes)
             .ok()
@@ -245,12 +251,13 @@ impl HixlConfig {
             || !self.ownerfs_window_bytes.is_multiple_of(self.window_bytes)
             || slot_capacity.is_none_or(|capacity| self.ownerfs_window_bytes > capacity)
             || !(1..=2).contains(&self.ownerfs_max_inflight)
+            || !(1..=MAX_OWNERFS_HIXL_SESSIONS_PER_HOME).contains(&sessions)
             || inflight_bytes.is_none_or(|bytes| self.ownerfs_host_budget_bytes < bytes)
             || self.ownerfs_host_budget_bytes > MAX_OWNERFS_HIXL_HOST_BUDGET_BYTES
             || self.ownerfs_min_file_bytes > MAX_OWNERFS_HIXL_MIN_FILE_BYTES
         {
             return Err(invalid(
-                "hixl.ownerfs_window_bytes must be a multiple of window_bytes up to 64 MiB and min(receive_slots, export_slots) windows, ownerfs_max_inflight must be 1 or 2, ownerfs_host_budget_bytes must cover every in-flight window up to 4 GiB, and ownerfs_min_file_bytes must be <= 1 TiB",
+                "hixl.ownerfs_window_bytes must be a multiple of window_bytes up to 64 MiB and min(receive_slots, export_slots / ownerfs_sessions_per_home) windows, ownerfs_sessions_per_home must be 1..=4, ownerfs_max_inflight must be 1 or 2, ownerfs_host_budget_bytes must cover every in-flight window up to 4 GiB, and ownerfs_min_file_bytes must be <= 1 TiB",
             ));
         }
         if role != Role::Node || !ownerfs {
@@ -2192,6 +2199,23 @@ mod hixl_config_tests {
             ..preferred
         };
         assert!(prefetch.validate(Role::Node, deployment).is_ok());
+    }
+
+    #[test]
+    fn pooled_sessions_split_the_export_slots_of_one_window() {
+        let deployment = ownerfs_deployment();
+        let pooled = |sessions, export_slots| HixlConfig {
+            ownerfs_sessions_per_home: sessions,
+            export_slots,
+            ..ownerfs_config(HixlOwnerFsReadMode::Preferred)
+        };
+        // 16 MiB windows need four 4 MiB slots per session.
+        assert!(pooled(4, 16).validate(Role::Node, deployment).is_ok());
+        assert!(pooled(4, 12).validate(Role::Node, deployment).is_err());
+        assert!(pooled(2, 8).validate(Role::Node, deployment).is_ok());
+        assert!(pooled(0, 16).validate(Role::Node, deployment).is_err());
+        assert!(pooled(5, 64).validate(Role::Node, deployment).is_err());
+        assert_eq!(HixlConfig::default().ownerfs_sessions_per_home, 1);
     }
 
     #[test]

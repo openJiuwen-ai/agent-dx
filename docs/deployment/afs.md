@@ -450,11 +450,17 @@ ownerfs_window_bytes = 16777216
 ownerfs_max_inflight = 1
 ownerfs_host_budget_bytes = 268435456
 ownerfs_min_file_bytes = 1048576
+ownerfs_sessions_per_home = 1
 ```
 
 - `ownerfs_window_bytes`：单次 Prepare 的最大窗口，`window_bytes` 的整数倍，不超过 64 MiB，
-  且不超过 `min(receive_slots, export_slots) × window_bytes`；运行时再按协商后的远端 lane
-  导出槽数收紧。顺序访问时窗口从一个槽起翻倍到该值。
+  且不超过 `min(receive_slots, export_slots / ownerfs_sessions_per_home) × window_bytes`；运行时
+  再按协商后的远端 lane 导出槽数收紧。顺序访问时窗口从一个槽起翻倍到该值；从偏移 0 开始的
+  读立即开窗，跳转之后需连续两次顺序 READ 才开窗。
+- `ownerfs_sessions_per_home`：1..=4，默认 1。reader 对每个 Home 的控制会话数，每个会话同时
+  只准入一次窗口获取；大于 1 时同一 Home 的多个打开可并发 Prepare，单窗口最多使用远端导出槽
+  的 `1 / ownerfs_sessions_per_home`，因此通常需要同时调大 `receive_slots`/`export_slots`
+  （Host 池上限 512 MiB）。DFS 与 OwnerFs 共享这些槽。
 - `ownerfs_max_inflight`：1 或 2，默认 1；2 在消费越过当前窗口一半后后台预取下一窗口。
 - `ownerfs_host_budget_bytes`：进程级窗口内存预算，覆盖已缓存窗口与在途预取，
   不小于 `ownerfs_window_bytes × ownerfs_max_inflight`，最大 4 GiB。Home 侧另有固定 256 MiB

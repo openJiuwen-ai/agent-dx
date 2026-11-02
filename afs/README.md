@@ -158,7 +158,9 @@ OwnerFs 远端读可通过 `[hixl].ownerfs_read_mode = "preferred" | "required"`
 READ 未命中时，Home 以该打开句柄和与 `OwnerFiles.Read` 相同的授权读取一段窗口，切成 HIXL 导出槽
 并逐槽计算 BLAKE3；reader 一次 native batch READ 拉回、逐槽校验、释放后缓存在该次打开内，后续
 READ 在窗口内本地复制。顺序访问时窗口从一个槽翻倍到 `ownerfs_window_bytes`（默认 16 MiB）；
-`ownerfs_max_inflight = 2` 时后台预取下一窗口；全部窗口受 `ownerfs_host_budget_bytes` 约束。
+跳转之后需连续两次顺序 READ 才开窗；`ownerfs_max_inflight = 2` 时后台预取下一窗口；全部窗口受
+`ownerfs_host_budget_bytes` 约束。`ownerfs_sessions_per_home`（1..=4，默认 1）允许同一 Home 的多个
+打开并发获取窗口，各会话分摊该 lane 的导出槽。
 窗口是 Home 在 Prepare 时刻的内容，只在同一次打开内复用（与 OPEN 预取一致，满足 close-to-open）；
 本节点写入或 setattr 同一文件会使其失效。`preferred` 下小于 `ownerfs_min_file_bytes`（默认 1 MiB）
 的文件、非顺序读、Home 不支持或槽位不足仍走原 gRPC 单区间读；`required` 不回退。可写打开始终走

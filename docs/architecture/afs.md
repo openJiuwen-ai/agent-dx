@@ -824,12 +824,15 @@ DFS HIXL 不改变 Meta source schema、dirty-owner 读、复制写入或持久 
   `[offset, offset + W)`。Home 的 `OwnerHixlService` 用 `OwnerFsPeerExecutor` 执行与
   `OwnerFiles.Read` 相同的 grant、RemoteFile scope 与句柄校验，读入 staging，逐槽 BLAKE3 后导出；
   reader 一次 native batch READ 拉回全部槽、逐槽校验，Release 在后台持有该 Home 的租约完成。
-- 窗口：顺序访问从一个槽翻倍到 `ownerfs_window_bytes`；跨窗口 READ 继续获取下一窗口，只有记录
+- 窗口：顺序访问从一个槽翻倍到 `ownerfs_window_bytes`；跳转之后需连续两次顺序 READ 才开窗，
+  偏移 0 立即开窗；跨窗口 READ 继续获取下一窗口，只有记录
   EOF 的窗口才产生短读。`ownerfs_max_inflight = 2` 时预取下一窗口；进程级预算约束全部窗口。
 - 一致性：窗口是 Prepare 时刻的 Home 内容，只在同一次打开内复用；同一客户端的写入或 setattr
   按 `FileIdentity` 失效窗口。
 - 会话：`NegotiateHixl` 携带一个 `RootAccess` 并经 `authorize_transport` 校验，会话只是传输租约，
-  绑定 mTLS peer、`home_session_id` 与 reader engine；每 Home 同时只准入一次窗口获取。Prepare
+  绑定 mTLS peer、`home_session_id` 与 reader engine；reader 对每个 Home 维护
+  `ownerfs_sessions_per_home` 个会话（默认 1），每个会话同时只准入一次窗口获取，池内会话分摊
+  该 lane 的导出槽。Prepare
   以 reader 生成的 `read_id` 支持同一请求的重放；Release 结果为 Unknown/Failed、关闭时仍有未释放槽、
   过期或 drain 超时都 quarantine 共享 runtime。
 - 回退：`preferred` 只在非顺序读、预算不足、dispatch 前 capability unsupported 或槽位不足时改用

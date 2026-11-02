@@ -39,6 +39,8 @@ const SESSION_REUSE_LIMIT: Duration = Duration::from_secs(20);
 /// this long, so preferred-mode fallbacks do not pay a negotiation each.
 const UNSUPPORTED_RETRY: Duration = Duration::from_secs(60);
 const PREPARE_ATTEMPTS: usize = 3;
+/// Mirrors the `[hixl].ownerfs_sessions_per_home` configuration bound.
+pub const MAX_OWNER_HIXL_SESSIONS_PER_HOME: usize = 4;
 const RELEASE_ATTEMPTS: usize = 3;
 
 /// Window sizing shared by every open of this process.
@@ -51,6 +53,9 @@ pub struct OwnerHixlPolicy {
     pub min_file_bytes: u64,
     /// Local receive slots of each lane: one native batch READ needs one per slot.
     pub receive_slots: usize,
+    /// Control sessions per Home. Each session admits one window fetch, so
+    /// N sessions let N opens of one Home prepare and transfer concurrently.
+    pub sessions_per_home: usize,
 }
 
 /// Process-wide reader state: one control session per Home, engine bindings,
@@ -61,7 +66,7 @@ pub struct OwnerHixlReader {
     policy: OwnerHixlPolicy,
     timeout: Duration,
     budget: Arc<WindowBudget>,
-    homes: StdMutex<HashMap<String, Arc<Mutex<HomeSlot>>>>,
+    homes: StdMutex<HashMap<String, Arc<HomePool>>>,
     engines: StdMutex<HashMap<String, (String, u64)>>,
     lane_bindings: StdMutex<HashMap<String, usize>>,
     next_read: AtomicU64,
@@ -93,6 +98,7 @@ impl OwnerHixlReader {
             || policy.max_window_bytes == 0
             || policy.receive_slots == 0
             || !(1..=2).contains(&policy.max_inflight)
+            || !(1..=MAX_OWNER_HIXL_SESSIONS_PER_HOME).contains(&policy.sessions_per_home)
         {
             return Err(afs_error::Error::coded(
                 afs_error::NODE_TRANSFER_INVALID,
@@ -188,13 +194,13 @@ impl OwnerHixlReader {
         ))
     }
 
-    fn home_slot(&self, home: &str) -> afs_error::Result<Arc<Mutex<HomeSlot>>> {
+    fn home_pool(&self, home: &str) -> afs_error::Result<Arc<HomePool>> {
         let mut homes = self
             .homes
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(slot) = homes.get(home) {
-            return Ok(slot.clone());
+        if let Some(pool) = homes.get(home) {
+            return Ok(pool.clone());
         }
         if homes.len() >= MAX_OWNER_HIXL_HOMES {
             return Err(afs_error::Error::coded(
@@ -202,13 +208,15 @@ impl OwnerHixlReader {
                 "OwnerFs HIXL Home budget exhausted",
             ));
         }
-        let slot = Arc::new(Mutex::new(HomeSlot::default()));
-        homes.insert(home.to_owned(), slot.clone());
-        Ok(slot)
+        let pool = Arc::new(HomePool::new(self.policy.sessions_per_home));
+        homes.insert(home.to_owned(), pool.clone());
+        Ok(pool)
     }
 
-    /// Leases the Home's control session, negotiating it when absent, stale
-    /// or about to expire on Home. `None` means Home lacks the capability.
+    /// Leases one of the Home's control sessions, negotiating it when absent,
+    /// stale or about to expire on Home. `None` means Home lacks the
+    /// capability. The pool permit bounds concurrent fetches per Home; the
+    /// slot guard proves every earlier window of that session was released.
     async fn acquire(
         &self,
         home: &str,
@@ -216,19 +224,34 @@ impl OwnerHixlReader {
         access: &RootAccess,
         deadline: Instant,
     ) -> afs_error::Result<Option<HomeLease>> {
-        let slot = self.home_slot(home)?;
-        let mut guard = tokio::time::timeout(remaining(deadline)?, slot.lock_owned())
-            .await
-            .map_err(|_| {
-                afs_error::Error::coded(
-                    afs_error::CLIENT_DEADLINE_EXCEEDED,
-                    "OwnerFs HIXL Home admission exceeded the read deadline",
-                )
-            })?;
-        if guard
-            .unsupported_until
-            .is_some_and(|until| Instant::now() < until)
-        {
+        let pool = self.home_pool(home)?;
+        if pool.unsupported() {
+            return Ok(None);
+        }
+        let admission = || {
+            afs_error::Error::coded(
+                afs_error::CLIENT_DEADLINE_EXCEEDED,
+                "OwnerFs HIXL Home admission exceeded the read deadline",
+            )
+        };
+        let permit =
+            tokio::time::timeout(remaining(deadline)?, pool.permits.clone().acquire_owned())
+                .await
+                .map_err(|_| admission())?
+                .map_err(|_| protocol_error("OwnerFs HIXL Home pool is closed"))?;
+        // One permit per slot, and a lease drops its slot guard before its
+        // permit, so a permit holder always finds an unlocked slot.
+        let guard = pool
+            .slots
+            .iter()
+            .find_map(|slot| slot.clone().try_lock_owned().ok());
+        let mut guard = match guard {
+            Some(guard) => guard,
+            None => tokio::time::timeout(remaining(deadline)?, pool.slots[0].clone().lock_owned())
+                .await
+                .map_err(|_| admission())?,
+        };
+        if pool.unsupported() {
             return Ok(None);
         }
         let idle = guard
@@ -248,10 +271,10 @@ impl OwnerHixlReader {
             match self.establish(home, client, access, deadline).await? {
                 Some(session) => {
                     guard.session = Some(Arc::new(session));
-                    guard.unsupported_until = None;
+                    pool.set_unsupported(None);
                 }
                 None => {
-                    guard.unsupported_until = Instant::now().checked_add(UNSUPPORTED_RETRY);
+                    pool.set_unsupported(Instant::now().checked_add(UNSUPPORTED_RETRY));
                     return Ok(None);
                 }
             }
@@ -264,6 +287,7 @@ impl OwnerHixlReader {
         Ok(Some(HomeLease {
             session,
             _guard: guard,
+            _permit: permit,
         }))
     }
 
@@ -420,10 +444,11 @@ impl OwnerHixlReader {
         let slot_bytes = usize::try_from(remote.window_bytes)
             .map_err(|_| protocol_error("OwnerFs HIXL remote window overflow"))?
             .min(self.slot_bytes());
-        let slots = usize::try_from(remote.export_slots)
-            .unwrap_or(0)
-            .min(self.policy.receive_slots)
-            .min(MAX_OWNER_HIXL_SLOTS);
+        let slots = window_slots(
+            usize::try_from(remote.export_slots).unwrap_or(0),
+            self.policy.receive_slots,
+            self.policy.sessions_per_home,
+        );
         let capacity = slot_bytes.saturating_mul(slots);
         let length = request.size.min(capacity);
         if length == 0 {
@@ -643,7 +668,49 @@ impl ReadOutcome {
 struct HomeSlot {
     session: Option<Arc<HomeSession>>,
     touched: Option<Instant>,
-    unsupported_until: Option<Instant>,
+}
+
+/// Up to `sessions_per_home` control sessions of one Home.
+struct HomePool {
+    permits: Arc<tokio::sync::Semaphore>,
+    slots: Vec<Arc<Mutex<HomeSlot>>>,
+    unsupported_until: StdMutex<Option<Instant>>,
+}
+
+impl HomePool {
+    fn new(sessions: usize) -> Self {
+        let sessions = sessions.max(1);
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(sessions)),
+            slots: (0..sessions)
+                .map(|_| Arc::new(Mutex::new(HomeSlot::default())))
+                .collect(),
+            unsupported_until: StdMutex::new(None),
+        }
+    }
+
+    fn unsupported(&self) -> bool {
+        self.unsupported_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    fn set_unsupported(&self, until: Option<Instant>) {
+        *self
+            .unsupported_until
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = until;
+    }
+}
+
+/// Slots one window may use. Every pooled session can hold a window on the
+/// Home lane at once, so the sessions split that lane's export pool; one
+/// native batch READ needs one local receive slot per window slot.
+fn window_slots(remote_export_slots: usize, receive_slots: usize, sessions: usize) -> usize {
+    (remote_export_slots / sessions.max(1))
+        .min(receive_slots)
+        .min(MAX_OWNER_HIXL_SLOTS)
 }
 
 struct HomeSession {
@@ -652,10 +719,12 @@ struct HomeSession {
     poisoned: Arc<AtomicBool>,
 }
 
-/// Holding the guard proves every earlier window of this Home was released.
+/// Holding the guard proves every earlier window of this session was
+/// released. Fields drop in order: the slot unlocks before its permit returns.
 struct HomeLease {
     session: Arc<HomeSession>,
     _guard: OwnedMutexGuard<HomeSlot>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
 struct FetchRequest {
@@ -1011,7 +1080,14 @@ struct WindowState {
     pending: Option<PendingWindow>,
     next_offset: u64,
     ramp: usize,
+    /// READs in a row that started where the previous one ended.
+    streak: u32,
 }
+
+/// Consecutive sequential READs that confirm a stream after a jump. The kernel
+/// readahead that follows one random read is a single sequential READ, so it
+/// alone does not open a window.
+const SEQUENTIAL_STREAK: u32 = 2;
 
 struct OpenEntry {
     identity: Vec<u8>,
@@ -1122,6 +1198,14 @@ impl OwnerHixlFiles {
         {
             state.pending = None;
         }
+        state.streak = if offset == state.next_offset {
+            state.streak.saturating_add(1)
+        } else {
+            0
+        };
+        // A stream starts at offset 0, or continues after a confirmed streak.
+        let stream =
+            offset == state.next_offset && (offset == 0 || state.streak >= SEQUENTIAL_STREAK);
         let reader = &self.reader;
         let policy = reader.policy;
         let mut served = 0_usize;
@@ -1140,7 +1224,7 @@ impl OwnerHixlFiles {
                 }
             }
             let wanted = out.len() - served;
-            let sequential = served > 0 || cursor == state.next_offset;
+            let sequential = served > 0 || stream;
             if let Some(pending) = state.pending.take()
                 && pending.offset == cursor
             {

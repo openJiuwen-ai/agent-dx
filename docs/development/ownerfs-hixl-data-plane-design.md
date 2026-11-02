@@ -14,7 +14,8 @@ OwnerFs 远端读接入 HIXL 的单位改为**每次 open 独立的只读预读�
   读取 `[offset, offset + W)`，校验与普通 `OwnerFiles.Read` 相同；Home 把读到的字节
   切成若干个 HIXL 导出槽，逐槽计算 BLAKE3。reader 用一次 native batch READ 拉回全部
   槽，逐槽校验后释放，再把整段放进该句柄的窗口，随后的 FUSE READ 在窗口内本地复制。
-- 窗口大小随顺序访问翻倍（一个 HIXL 槽起步，上限 `ownerfs_window_bytes`）；
+- 窗口大小随顺序访问翻倍（一个 HIXL 槽起步，上限 `ownerfs_window_bytes`）；从偏移 0 开始
+  的读立即开窗，跳转之后需连续两次顺序 READ 才开窗；
   `ownerfs_max_inflight = 2` 时在消费当前窗口后半段时后台预取下一窗口。
 - `preferred` 下小文件、非顺序读和 dispatch 前的 `Unsupported`/槽位不足仍走原 gRPC
   单区间读；`required` 不回退。
@@ -77,15 +78,17 @@ ownerfs_window_bytes = 16777216    # 单次 Prepare 的最大窗口
 ownerfs_max_inflight = 1           # 1 串行；2 预取下一窗口
 ownerfs_host_budget_bytes = 268435456
 ownerfs_min_file_bytes = 1048576   # preferred 下 open 时文件不小于此值才启用
+ownerfs_sessions_per_home = 1      # reader 对每个 Home 的控制会话数，1..=4
 ```
 
 | 字段 | 约束 |
 | --- | --- |
 | `ownerfs_read_mode` | 非 off 时要求 Node、OwnerFs、`data_mode = "grpc"`、具体单播 `engine_id`、mTLS 与 `trusted_node_certs`；`required` 还要求编译 `hixl` feature。HIXL runtime 位于 `dfs` feature 内，未编译 `dfs` 时拒绝启用 |
-| `ownerfs_window_bytes` | `window_bytes` 的整数倍，`window_bytes..=64 MiB`，且不超过 `min(receive_slots, export_slots) × window_bytes` |
+| `ownerfs_window_bytes` | `window_bytes` 的整数倍，`window_bytes..=64 MiB`，且不超过 `min(receive_slots, export_slots / ownerfs_sessions_per_home) × window_bytes` |
 | `ownerfs_max_inflight` | 1 或 2，默认 1 |
 | `ownerfs_host_budget_bytes` | ≥ `ownerfs_window_bytes × ownerfs_max_inflight`，≤ 4 GiB |
 | `ownerfs_min_file_bytes` | ≤ 1 TiB；`required` 忽略该阈值 |
+| `ownerfs_sessions_per_home` | 1..=4，默认 1；每个会话同时只准入一次窗口获取（见 D5） |
 
 `data_mode` 与 `ownerfs_read_mode` 是不同的轴：RDMA/auto 与 OwnerFs HIXL 互斥。
 DFS 的 `dfs_read_mode` 与 OwnerFs 模式各自独立；任一非 off 时启动共享 HIXL runtime。
@@ -106,7 +109,9 @@ DFS 的 `dfs_read_mode` 与 OwnerFs 模式各自独立；任一非 off 时启动
 
 ### D3 窗口大小与预取
 
-- 句柄记录下一顺序偏移（初值 0）与上次窗口大小。命中顺序偏移的未命中按
+- 句柄记录下一顺序偏移（初值 0）、上次窗口大小和连续顺序 READ 次数。偏移 0 的 READ、
+  跨窗口续读，或跳转后连续第二次顺序 READ，才算顺序流；随机 `pread` 之后内核紧跟的一次
+  readahead 不再打开窗口。顺序流的未命中按
   `max(window_bytes, 2 × 上次)` 翻倍，上限为 `ownerfs_window_bytes`、协商后的远端 lane
   导出槽容量与本地接收槽容量中的最小值；请求本身更长时至少覆盖请求。
 - 非顺序未命中：`preferred` 交给原 gRPC 读并重置翻倍；`required` 只取请求长度。
@@ -137,7 +142,14 @@ gRPC 读完成，不重入 `LocalOwnerFs::read`。
   `peer_read` 相同的 `validate_peer`、RemoteFile scope 与句柄归属检查后才读文件。
 - 会话绑定 mTLS 认证的 peer Node ID、Home 的 `home_session_id` 与 reader engine 身份；
   Home 重启后旧会话不存在，reader 发现 `home_session_id` 变化或会话未知即重新协商。
-- 每个 Home 一个 reader 会话，同一时刻只准入一个窗口获取（与 DFS 每 peer 单读一致）。
+- reader 对每个 Home 维护最多 `ownerfs_sessions_per_home` 个会话（默认 1）。每个会话
+  同时只准入一个窗口获取，持有它的租约证明该会话之前的窗口都已释放；多个会话让同一 Home
+  的不同打开并发 Prepare，Home 读源与 BLAKE3 可与另一窗口的 native READ 重叠。同一 lane
+  的 native READ 仍在其 ACL owner 线程上串行。
+- 池内会话共享该 lane 的导出槽：单窗口槽数取
+  `min(远端 export_slots / ownerfs_sessions_per_home, receive_slots, 64)`，避免本 reader
+  自己的并发窗口在 Home 上挤占导出槽。Home 侧 staging 预算 256 MiB 恰好容纳 4 个 64 MiB
+  窗口；DFS 共享同一槽池（D6）。
 
 ### D6 资源共享（D7-A）
 
@@ -188,14 +200,14 @@ rpc CloseHixl(OwnerCloseHixlRequest) returns (OwnerCloseHixlReply);
 
 ## 7 Reader 侧
 
-- `rpc/peer/owner_hixl.rs` 的 `OwnerHixlReader` 进程级共享：每 Home 一个控制会话槽、
-  engine 地址绑定、peer→lane 绑定、窗口预算与指标。
+- `rpc/peer/owner_hixl.rs` 的 `OwnerHixlReader` 进程级共享：每 Home 一个会话池（信号量
+  加 `ownerfs_sessions_per_home` 个会话槽）、engine 地址绑定、peer→lane 绑定、窗口预算与指标。
 - `OwnerPeerClient::with_hixl` 注入 reader；只有注入且 `data_mode = grpc` 时，open
   记录资格、read 走窗口逻辑、write/setattr 做失效、release 清理状态。未注入时这些
   分支全部跳过，现有路径不变。
 - 窗口获取在独立 Tokio 任务中执行并拥有全部缓冲与租约；调用方超时只返回错误，
   任务继续完成 Release/隔离，并标记会话需重建。
-- Release 在后台执行并持有该 Home 的租约，下一次获取在其完成后才准入。
+- Release 在后台执行并持有该会话的租约，同一会话的下一次获取在其完成后才准入。
 
 ## 8 指标与健康
 
@@ -273,14 +285,24 @@ OwnerFs 不在 open 之间保留页缓存，因此每轮都是冷读；指标在
   4 路并发把在途请求提到 4，聚合约 700 MiB/s。
 - HIXL 的 native 传输只占每窗口 3–6 ms（5.5–11 GB/s）；瓶颈在 Home 的读源与 BLAKE3/导出，
   以及每窗口一次的 prepare 往返。窗口从 16 MiB 提到 64 MiB 把单流从 742 提到 901 MiB/s。
-- 并发 4 路时收益收窄：reader 对同一 Home 只持有一个会话租约，窗口获取在 Home 串行，
-  每窗口墙钟从 22 ms 涨到 67 ms（16 MiB）与 103 ms（64 MiB），多出的是排队。gRPC 随并发
-  线性获益，相对优势因此从 2.2× 降到 1.3×。
+- 并发 4 路时收益收窄：该轮二进制的 reader 对同一 Home 只持有一个会话租约，窗口获取
+  在 Home 串行，每窗口墙钟从 22 ms 涨到 67 ms（16 MiB）与 103 ms（64 MiB），多出的是排队。
+  gRPC 随并发线性获益，相对优势因此从 2.2× 降到 1.3×。随后加入的
+  `ownerfs_sessions_per_home`（第 9.2 节）针对这一点，尚未复测。
 - 限制：单机对、单设备、单 reader，Home 页缓存命中（数据刚写入）；共享宿主机轮间 max/min
   达 1.37，只能比较同轮交替的中位数。64 MiB 窗口需显式配置。
 
 未执行：多设备 lane、Home 冷盘读、随机/小文件吞吐、故障注入与资源泄漏复测。
 在这些证据出现前，不得把上述数字外推到其他拓扑。
+
+### 9.2 每 Home 会话池与顺序流判定（软件验证）
+
+- `ownerfs_sessions_per_home`：回环测试用 Home 侧读源并发探针证明，1 个会话时两个打开的
+  Prepare 不重叠（峰值 1），2 个会话时重叠（峰值 2）；配置校验覆盖槽数切分与 1..=4 边界。
+- 顺序流判定：`preferred` 下随机读、其后一次 readahead 均走 gRPC，第三次顺序 READ 才开窗；
+  偏移 0 与 `required` 跳转行为不变。
+- 尚未执行：真机 4 路并发与单流复测（会话数 1/2/4 × 窗口 16/64 MiB，需把收发槽调到 32
+  或 64）、DFS 同时负载下的槽位竞争。
 
 建议验收：
 
@@ -293,6 +315,5 @@ OwnerFs 不在 open 之间保留页缓存，因此每轮都是冷读；指标在
 
 ## 10 后续工作
 
-- 每 Home 多会话（允许 Home 侧 Prepare 与另一窗口的 native READ 重叠）。
 - Home 侧 file→slot 直填，去掉 staging 复制。
 - 依据 PERF-11 结果调整 `ownerfs_min_file_bytes` 默认值。

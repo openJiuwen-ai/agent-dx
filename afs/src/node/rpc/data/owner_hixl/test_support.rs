@@ -163,11 +163,22 @@ impl ExportProvider for MemoryExports {
 }
 
 /// One Home file behind the `open-1` handle of root `root-a`.
+/// Every open of the file uses a handle that starts with `OPEN_HANDLE`.
 pub(crate) struct MemorySource {
     pub(crate) data: Mutex<Vec<u8>>,
     /// Non-empty source reads; empty reads are pure authorization checks.
     pub(crate) reads: AtomicUsize,
     max_chunk: usize,
+    overlap: Option<OverlapProbe>,
+}
+
+/// Holds the first source reads until `target` of them run at once or the
+/// deadline passes, and records the largest concurrency it observed.
+struct OverlapProbe {
+    target: usize,
+    deadline: Mutex<Option<Instant>>,
+    active: AtomicUsize,
+    peak: AtomicUsize,
 }
 
 impl MemorySource {
@@ -176,6 +187,46 @@ impl MemorySource {
             data: Mutex::new(data),
             reads: AtomicUsize::new(0),
             max_chunk,
+            overlap: None,
+        }
+    }
+
+    pub(crate) fn with_overlap_probe(mut self, target: usize) -> Self {
+        self.overlap = Some(OverlapProbe {
+            target,
+            deadline: Mutex::new(None),
+            active: AtomicUsize::new(0),
+            peak: AtomicUsize::new(0),
+        });
+        self
+    }
+
+    /// The largest number of source reads that ran at the same time.
+    pub(crate) fn peak_overlap(&self) -> usize {
+        self.overlap
+            .as_ref()
+            .map_or(0, |probe| probe.peak.load(Ordering::SeqCst))
+    }
+
+    fn enter_probe(&self) {
+        let Some(probe) = &self.overlap else {
+            return;
+        };
+        let active = probe.active.fetch_add(1, Ordering::SeqCst) + 1;
+        probe.peak.fetch_max(active, Ordering::SeqCst);
+        let deadline = *probe
+            .deadline
+            .lock()
+            .unwrap()
+            .get_or_insert_with(|| Instant::now() + std::time::Duration::from_millis(500));
+        while Instant::now() < deadline && probe.peak.load(Ordering::SeqCst) < probe.target {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    fn exit_probe(&self) {
+        if let Some(probe) = &self.overlap {
+            probe.active.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
@@ -204,7 +255,7 @@ impl OwnerWindowSource for MemorySource {
         out: &mut [u8],
     ) -> afs_error::Result<usize> {
         self.authorize_transport(peer, access)?;
-        if file.handle != OPEN_HANDLE {
+        if !file.handle.starts_with(OPEN_HANDLE) {
             return Err(afs_error::Error::coded(
                 afs_error::NODE_OWNER_STALE_HANDLE,
                 "unknown open handle",
@@ -214,7 +265,9 @@ impl OwnerWindowSource for MemorySource {
             return Ok(0);
         }
         self.reads.fetch_add(1, Ordering::SeqCst);
-        let data = self.data.lock().unwrap();
+        self.enter_probe();
+        let data = self.data.lock().unwrap().clone();
+        self.exit_probe();
         let start = usize::try_from(offset)
             .unwrap_or(usize::MAX)
             .min(data.len());

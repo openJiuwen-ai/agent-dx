@@ -1827,6 +1827,7 @@ async fn run_node(
                     host_budget_bytes: cfg.hixl.ownerfs_host_budget_bytes,
                     min_file_bytes: cfg.hixl.ownerfs_min_file_bytes,
                     receive_slots: cfg.hixl.receive_slots,
+                    sessions_per_home: cfg.hixl.ownerfs_sessions_per_home,
                 },
                 timeout,
             )?
