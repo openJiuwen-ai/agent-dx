@@ -568,41 +568,6 @@ fn invalid_limits_and_uncompiled_mode_fail() {
 }
 
 #[test]
-fn p3_cli_retired_backend_errors_explain_safe_migration() {
-    for args in [
-        vec!["--meta-store", "etcd"],
-        vec!["--meta-store=redis"],
-        vec!["--etcd-endpoint", "http://127.0.0.1:2379"],
-        vec!["--redis-endpoint=redis://127.0.0.1:6379/0"],
-    ] {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_afs-meta"))
-            .args(args)
-            .output()
-            .unwrap();
-        assert_eq!(output.status.code(), Some(2));
-        let text = String::from_utf8(output.stderr).unwrap();
-        assert!(
-            text.contains("retired")
-                && text.contains("empty directory")
-                && text.contains("original binary"),
-            "missing safe migration guidance: {text}"
-        );
-    }
-    for flag in ["--help", "--version"] {
-        let output = std::process::Command::new(env!("CARGO_BIN_EXE_afs-meta"))
-            .arg(flag)
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        assert!(
-            !String::from_utf8(output.stderr)
-                .unwrap()
-                .contains("retired")
-        );
-    }
-}
-
-#[test]
 fn p3_settings_default_is_local_file_without_retired_endpoints() {
     let cfg = Config::resolve(Role::Meta, Cli::parse_from(["afs-meta"])).unwrap();
     assert_eq!(cfg.meta_store, MetaStoreBackend::LocalFile);

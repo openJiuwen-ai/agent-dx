@@ -168,7 +168,6 @@ pub struct Cli {
     #[arg(long)]
     pub meta_endpoint: Option<String>,
     /// Meta authority: local-file (default, new-format directory) or volatile memory.
-    /// Retired etcd/Redis data requires its original binary; it is not imported.
     #[arg(long, value_enum)]
     pub meta_store: Option<MetaStoreBackend>,
     /// Maximum bytes of one framed Meta operation-log record.
@@ -380,44 +379,6 @@ pub struct Cli {
     pub trace_sample_ratio: Option<f64>,
     #[arg(long)]
     pub print_config: bool,
-}
-impl Cli {
-    /// Parse the process arguments with standard Clap exit codes and formatting.
-    /// Retired backend options get a migration hint before the original error;
-    /// they are never accepted or mapped to a different authority implicitly.
-    pub fn parse_process() -> Self {
-        let arguments: Vec<_> = std::env::args_os().collect();
-        match Self::try_parse_from(&arguments) {
-            Ok(cli) => cli,
-            Err(error) => {
-                let retired = arguments.windows(2).any(|pair| {
-                    pair[0] == "--meta-store" && (pair[1] == "etcd" || pair[1] == "redis")
-                }) || arguments.iter().any(|argument| {
-                    let argument = argument.to_string_lossy();
-                    matches!(
-                        argument.as_ref(),
-                        "--meta-store=etcd"
-                            | "--meta-store=redis"
-                            | "--etcd-endpoint"
-                            | "--redis-endpoint"
-                    ) || argument.starts_with("--etcd-endpoint=")
-                        || argument.starts_with("--redis-endpoint=")
-                });
-                if retired
-                    && !matches!(
-                        error.kind(),
-                        clap::error::ErrorKind::DisplayHelp
-                            | clap::error::ErrorKind::DisplayVersion
-                    )
-                {
-                    eprintln!(
-                        "Meta etcd/Redis options are retired. Use local-file with an empty directory; retain the original binary and directory to recover old data. No implicit authority migration is performed."
-                    );
-                }
-                error.exit()
-            }
-        }
-    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -634,9 +595,8 @@ impl Config {
     /// Meta 可以没有文件后端；Node 至少启用一个。未指定 fs 时使用当前编译进去的集合。
     pub fn resolve(role: Role, cli: Cli) -> Result<Self> {
         let file: FileConfig = match cli.config {
-            Some(path) => toml::from_str(&std::fs::read_to_string(path)?).map_err(|error| {
-                invalid(format!("{error}; Meta supports local-file (new-format/empty directory) or volatile memory; retired backend data must use its original binary and directory"))
-            })?,
+            Some(path) => toml::from_str(&std::fs::read_to_string(path)?)
+                .map_err(|error| invalid(error.to_string()))?,
             None => FileConfig::default(),
         };
         if role == Role::Node
