@@ -835,7 +835,11 @@ DFS HIXL 不改变 Meta source schema、dirty-owner 读、复制写入或持久 
 - 回退：`preferred` 只在非顺序读、预算不足、dispatch 前 capability unsupported 或槽位不足时改用
   原 gRPC 单区间读，已从窗口复制的前缀保留；`required` 不回退。
 
-该路径已通过本地 Linux/WSL 的 fake native 与 tonic 回环测试，尚无真机吞吐和故障恢复证据。
+该路径已通过本地 Linux/WSL 的 fake native 与 tonic 回环测试，以及 A3 双机 HCCS 单设备的
+功能验证（内容一致、回退与预取生效、槽位释放）和 1 GiB 顺序读的交替吞吐对照：单流 gRPC
+405、HIXL（64 MiB 窗口 + 预取）901 MiB/s，4 路并发 665 与 863 MiB/s。native 传输只占每窗口
+3–6 ms，瓶颈在 Home 侧读源、BLAKE3 与每窗口 prepare；每 Home 单会话租约限制了并发下的窗口获取。
+多设备、冷盘读与故障恢复仍未验证。
 设计取舍见 [OwnerFs HIXL 只读预读窗口设计](../development/ownerfs-hixl-data-plane-design.md)。
 
 ## OwnerFs workspace bind mount

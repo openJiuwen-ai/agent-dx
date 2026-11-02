@@ -478,8 +478,14 @@ Prepare 失败，任一方的未知结果会让整个代际停止准入。性能
 `afs_ownerfs_hixl_reads_total{outcome="window_hit|fetch|prefetch_hit|fallback"}`、
 `afs_ownerfiles_payload_bytes_total{plane="hixl"}`、
 `afs_ownerfiles_rpc_duration_seconds{method="read_hixl_window"|"OwnerFiles.PrepareReadHixl"}`
-与共享的 `afs_hixl_*` 指标用于证明数据面与命中率。当前只有本地 CPU/fake native 回环测试，
-尚无真机吞吐、gRPC 同轮对照、故障注入或资源泄漏证据，不能据此宣称性能收益。
+与共享的 `afs_hixl_*` 指标用于证明数据面与命中率。A3 双机（216 Home、217 reader，HCCS 中转，
+单设备，二进制 `df24475d`）已完成 `required`、`preferred` 与 `required` + 预取三组功能验证：
+内容一致、gRPC 读字节在 `required` 下为 0、回退与预取命中计数出现、Home 导出槽归零且无
+quarantine，停止后无遗留进程与挂载。1 GiB 顺序读的交替对照（单流 / 4 路并发，中位）：gRPC 405/665 MiB/s，
+HIXL 16 MiB 窗口 667/760、16 MiB 窗口 + `ownerfs_max_inflight = 2` 742/744、64 MiB 窗口 + 预取
+901/863 MiB/s。窗口越大，Home 侧 prepare 的固定开销摊得越薄；并发时 reader 对同一 Home 只有一个
+会话租约，窗口获取串行，因此 HIXL 的相对收益随并发收窄。这些数字来自单机对、单设备、Home 页缓存
+命中的共享实验机，不能外推到其他拓扑；Home 冷盘读、多设备、故障注入与资源泄漏复测仍未执行。
 
 ## 运维边界
 

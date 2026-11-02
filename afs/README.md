@@ -164,8 +164,14 @@ READ 在窗口内本地复制。顺序访问时窗口从一个槽翻倍到 `owne
 的文件、非顺序读、Home 不支持或槽位不足仍走原 gRPC 单区间读；`required` 不回退。可写打开始终走
 原路径。OwnerFs 与 DFS 共享同一 HIXL runtime、槽池与 quarantine 失败域。
 `afs_ownerfs_hixl_reads_total{outcome}` 与 `afs_ownerfiles_payload_bytes_total{plane="hixl"}`
-记录窗口命中、获取、预取命中和回退。该路径目前只有本地 CPU/fake native 回环测试，尚无真机
-吞吐或与 gRPC 的对照证据；设计与验收计划见
+记录窗口命中、获取、预取命中和回退。A3 双机（HCCS 中转、单设备，二进制 `df24475d`）已完成功能
+验证：256 MiB/3 MiB/200 KiB 文件的顺序读、1 MiB `dd`、随机 `pread` 与 close-to-open 改写的内容
+均与 Home 一致，`preferred` 回退与 `ownerfs_max_inflight = 2` 的预取命中均出现，结束时导出槽全部
+释放且无 quarantine。1 GiB 顺序读的交替对照（单流 / 4 路并发，中位）为 gRPC 405/665 MiB/s、
+HIXL 16 MiB 窗口 667/760、16 MiB 窗口 + 预取 742/744、64 MiB 窗口 + 预取 901/863 MiB/s；
+gRPC 的单流上限来自每 1 MiB 一次往返（2.14 ms），HIXL 的 native 传输只占每窗口 3–6 ms，
+瓶颈在 Home 侧读源与校验。并发收益受每 Home 单会话租约限制。单机对、单设备、Home 页缓存命中，
+不能外推到其他拓扑。设计与验收计划见
 [OwnerFs HIXL 只读预读窗口设计](../docs/development/ownerfs-hixl-data-plane-design.md)。
 
 这版代码尚未经过 A2 RoCE、两个以上源节点或并发 reader 的扩展与故障恢复验收；

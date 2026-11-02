@@ -222,8 +222,65 @@ rpc CloseHixl(OwnerCloseHixlRequest) returns (OwnerCloseHixlReply);
   `invalidate_hixl`）后重新获取、`ownerfs_max_inflight = 2` 的预取命中。
 - 配置校验（含 off 模式不受 OwnerFs 约束）、`/health` 字段，以及 afs 全量 lib 与集成测试回归。
 
-未执行：A3 真机 HIXL 端到端吞吐、与 gRPC 的同轮对照、故障注入与资源泄漏复测。
-在真机证据出现前，不得宣称 OwnerFs HIXL 的性能收益。
+A3 真机（2026-10-31，二进制 `df24475d`，`afs-node` sha256 `a58afc65…`）：
+
+- 216 上 `cargo build --release -p afs --bins --features hixl`、
+  `cargo clippy -p afs --all-targets --features hixl -- -D warnings` 通过，`--features hixl`
+  下 owner_hixl/hixl/crc32c/配置/健康相关 167 个测试通过。
+- 216 运行 Meta 与 node-a（Home），217 运行 node-b（reader），两端 `hccs-buffer-pool`、
+  单设备、4 MiB 槽、16 个收发槽、`ownerfs_window_bytes = 16 MiB`；驱动为
+  `out/validation/owner_hixl_func.py`（仓外验证工具）。
+
+| 运行 | 结果 | 关键计数（reader） |
+| --- | --- | --- |
+| `required`，inflight 1 | 顺序读、1 MiB `dd`、64 次随机 `pread`、close-to-open 改写均与 Home 一致 | HIXL 交付 566.6 MB，gRPC 读 0；fetch 123，window_hit 8613；native 647.0 MB |
+| `preferred`，inflight 1 | 同上 | fallback 64，gRPC 读 23.4 MB（随机读与 200 KiB 小文件），HIXL 543.2 MB |
+| `required`，inflight 2 | 同上 | prefetch_hit 34，fetch 89 |
+
+三轮结束时 Home `afs_hixl_export_slots_in_use = 0`，两端 `afs_hixl_quarantined_bytes = 0`，
+停止后无遗留 AFS 进程与 FUSE 挂载。观察到 native 拉取量比交付量多约 80 MB：随机 `pread`
+之后的内核 readahead 被视为顺序续读并打开 4 MiB 窗口，这部分预读未被消费，留待性能阶段评估
+（例如要求连续两次顺序读才开窗）。
+
+### 9.1 吞吐与分阶段对照（2026-11-02）
+
+环境同第 9 节，HCCS 中转、单设备、4 MiB 槽、16 收发槽。数据集为 1 GiB 随机内容，写入一次；
+每轮按轮转顺序重启两端节点，先做 1 MiB 预热读（不计时），再在 reader 上 `dd bs=1M` 读一遍。
+OwnerFs 不在 open 之间保留页缓存，因此每轮都是冷读；指标在计时读后立即采样，每轮数据面恰为
+1025 MiB。单流 4 轮、并发 4 路 3 轮，配置在同一轮内交替以抵消共享宿主机漂移。
+
+| 配置 | 单流（MiB/s，中位[min..max]） | 并发 4 路 |
+| --- | --- | --- |
+| gRPC（`ownerfs_read_mode = "off"`） | 404.5 [363.5..498.2] | 665.0 [660.5..724.6] |
+| HIXL，16 MiB 窗口，`max_inflight = 1` | 666.6 [652.1..697.8] | 759.8 [720.6..866.3] |
+| HIXL，16 MiB 窗口，`max_inflight = 2` | 742.1 [691.9..892.7] | 743.9 [733.0..763.0] |
+| HIXL，64 MiB 窗口，`max_inflight = 2` | 900.9 [835.4..1140.9] | 863.0 [816.7..871.9] |
+
+分阶段（每窗口平均，单流；64 MiB 一列同为单流，最后一列为并发 4 路）：
+
+| 阶段 | gRPC / 1 MiB | HIXL 16 MiB | HIXL 64 MiB | HIXL 64 MiB，4 路 |
+| --- | --- | --- | --- | --- |
+| reader 请求/窗口耗时 | 2.144 ms | 22.320 ms | 55.821 ms | 103.382 ms |
+| Home 处理 | 0.529 ms | 12.332 ms | 34.849 ms | 21.775 ms |
+| 其中 Home 读源文件 | 未单列 | 7.839 ms | 23.143 ms | 14.631 ms |
+| native 传输 | — | 2.918 ms | 5.920 ms | 4.149 ms |
+| BLAKE3 校验（reader） | — | 3.270 ms | 5.604 ms | 4.387 ms |
+| Release | — | 0.473 ms | 0.694 ms | 0.604 ms |
+
+结论：
+
+- gRPC 的单流上限由每 1 MiB 一次往返决定（2.14 ms ≈ 468 MiB/s），Home 处理只占 0.53 ms；
+  4 路并发把在途请求提到 4，聚合约 700 MiB/s。
+- HIXL 的 native 传输只占每窗口 3–6 ms（5.5–11 GB/s）；瓶颈在 Home 的读源与 BLAKE3/导出，
+  以及每窗口一次的 prepare 往返。窗口从 16 MiB 提到 64 MiB 把单流从 742 提到 901 MiB/s。
+- 并发 4 路时收益收窄：reader 对同一 Home 只持有一个会话租约，窗口获取在 Home 串行，
+  每窗口墙钟从 22 ms 涨到 67 ms（16 MiB）与 103 ms（64 MiB），多出的是排队。gRPC 随并发
+  线性获益，相对优势因此从 2.2× 降到 1.3×。
+- 限制：单机对、单设备、单 reader，Home 页缓存命中（数据刚写入）；共享宿主机轮间 max/min
+  达 1.37，只能比较同轮交替的中位数。64 MiB 窗口需显式配置。
+
+未执行：多设备 lane、Home 冷盘读、随机/小文件吞吐、故障注入与资源泄漏复测。
+在这些证据出现前，不得把上述数字外推到其他拓扑。
 
 建议验收：
 
