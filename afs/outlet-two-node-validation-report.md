@@ -252,6 +252,50 @@ actimeo=2, softerr`，延迟来自协议往返与属性同步，而非传输量�
 **注意**：本轮 `/public` 已达 811 个链接（含历史测试目录），高于用户要求
 的 400。耗时数据按实际目录数记录，每目录成本可直接外推。
 
+## 第八轮：`/public/<name>` 落地后的完整重跑（2026-11-02 14:48 CST）
+
+命名从 `root-<hex>` 改为 `<name>` 之后，在干净环境上重跑完整双向验证。
+
+| 检查组 | 用例 | 结果 |
+|---|---|---|
+| 起点对等 | 两端各 4 条、0 断链、无 `root-` 前缀 | ✅ 5/5 |
+| **A 创建 → B 可见** | B 出现同名条目，内容 `payload-A` | ✅ 2/2 |
+| **B 创建 → A 可见** | A 出现同名条目，内容 `payload-B` | ✅ 2/2 |
+| 跨节点写穿透 | 各自 disk 上看到对端写入（`byB` / `byA`） | ✅ 2/2 |
+| **按名 bind** | `mount --bind /public/<name>` 后读到正确内容 | ✅ 2/2 |
+| `ll` 不卡 | `ls -alF` 跟随链接，2ms | ✅ 1/1 |
+| 删除双向传播 | 两端在 1s 内摘除 | ✅ 2/2 |
+| 终态 | 两端列表一致、0 断链 | ✅ 3/3 |
+
+**合计 19/19 通过。**
+
+`/public` 内容（两端相同）：
+
+```
+fromA-1793600288 -> imports/node-a/users/root-66726f6d412d...-e4
+fromB-1793600291 -> imports/node-b/users/root-66726f6d422d...-e5
+job-42           -> imports/node-a/users/root-6a6f622d3432-e1
+test321          -> imports/node-b/users/root-74657374333231-e3
+```
+
+关键点：链接名是**调用方创建时的名字**，target 仍是编码后的数据目录。消费方
+可以 `mount --bind /public/job-42`，不需要手工 hex 编码。
+
+### 排查记录：`ll /public` 超时
+
+验证初期 `ll /public`（即 `ls -alF --color=auto`）会挂住 8 秒以上，而
+`ls -la` 只要 1ms。原因链：
+
+1. `-F` 需要 stat 每个条目的 target 来判断类型，`-la` 不跟随链接；
+2. 当时 A 上所有 target 都不可达，于是每个条目各等一次 NFS 超时；
+3. target 不可达是因为清理环境时 `rm -rf data/node-*` 后**目录 inode 变了**，
+   而 `imports/node-a/users`（bind）与 `imports/node-b/users`（NFS）仍然
+   指向旧 inode / 旧 filehandle。
+
+修复是重挂这两处 import，并在 B 上 `exportfs -ra` 刷新导出。**这不是 outlet
+或代码问题，是清理环境时未先卸载依赖挂载留下的残留。** 正确顺序应为：
+先 `umount imports/*`，再删数据目录，重建后再重挂。
+
 ## 过程中发现并即时处理的问题
 
 
