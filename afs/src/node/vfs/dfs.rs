@@ -32955,5 +32955,65 @@ mod tests {
         )
         .unwrap();
     }
+
+    /// S0 characterization for ledger Q01: the owner-side idempotency table for
+    /// proxied writes has a fixed capacity and no eviction, so a long-lived owner
+    /// rejects new proxied writes once it has remembered that many operations.
+    #[test]
+    fn s0_q01_owner_operation_table_fills_and_rejects_new_proxied_writes() {
+        let (_temp, _meta, fs) = test_fs();
+        let open = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
+            &fs,
+            "node-b",
+            afs_protocol::node_control::DfsOwnerOpenRequest {
+                namespace_id: "default".into(),
+                inode_id: "inode:test".into(),
+                owner_node_id: "node-a".into(),
+                owner_session_id: "session-a".into(),
+                lease_epoch: 1,
+                caller_session_id: "session-b".into(),
+                open_flags: libc::O_RDWR,
+                kill_suidgid: false,
+                open_seq: 1,
+            },
+        )
+        .unwrap();
+        let handle = open.handle.expect("owner open returns handle");
+        let data_handle = DistributedFs::data_owner_handle(&handle);
+        let write = |index: usize| afs_protocol::node_data::DfsOwnerWriteRequest {
+            handle: Some(data_handle.clone()),
+            operation_id: format!("node-b-op-{index}"),
+            offset: 0,
+            data: vec![b'x'],
+            append: false,
+            kill_suidgid: false,
+        };
+        for index in 0..MAX_REMOTE_OPERATION_RESULTS {
+            <DistributedFs as crate::node::rpc::data::DfsOwnerFilesHandler>::write(
+                &fs,
+                "node-b",
+                write(index),
+            )
+            .unwrap();
+        }
+        let error = <DistributedFs as crate::node::rpc::data::DfsOwnerFilesHandler>::write(
+            &fs,
+            "node-b",
+            write(MAX_REMOTE_OPERATION_RESULTS),
+        )
+        .unwrap_err();
+        assert!(
+            error.message().contains("remote operation table is full"),
+            "{error:?}"
+        );
+        <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release(
+            &fs,
+            "node-b",
+            afs_protocol::node_control::DfsOwnerReleaseRequest {
+                handle: Some(handle),
+            },
+        )
+        .unwrap();
+    }
     include!("dfs/unified_tests.inc.rs");
 }
