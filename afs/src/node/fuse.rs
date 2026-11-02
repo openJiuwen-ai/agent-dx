@@ -5934,6 +5934,63 @@ mod dispatch_tests {
         assert_eq!(dispatch.shared.queue.lock().unwrap().jobs, 0);
     }
 
+    /// Runtime half of the write-admission review: a slow write on one handle
+    /// must not stop the receive path from admitting an unrelated file.
+    ///
+    /// OwnerFs now always answers `Queued`, so admitting a write is a queue push
+    /// that cannot wait for the data copy or the `pwrite`. While the removed
+    /// shortcut existed the receive thread ran the same-handle FIFO turn itself,
+    /// so this shape would have parked it until the slow write finished.
+    #[test]
+    fn slow_write_on_one_handle_still_admits_another_file() {
+        let dispatch = Arc::new(FuseDispatch::new(2));
+        let (started, started_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        let slow = dispatch.clone();
+        std::thread::spawn(move || {
+            slow.submit_keyed(41, move || {
+                started.send(()).unwrap();
+                // Stand-in for a slow `pwrite` inside the worker.
+                release_rx.recv().unwrap();
+            });
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("slow write must start");
+
+        // Unrelated inode: admission must return promptly, and the work must
+        // finish while the slow write is still holding its worker.
+        let (done, done_rx) = std::sync::mpsc::channel();
+        let started_at = std::time::Instant::now();
+        dispatch.submit_keyed(42, move || {
+            done.send(()).unwrap();
+        });
+        let admission = started_at.elapsed();
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(1)).is_ok(),
+            "an unrelated file's request must complete while a slow write is in flight"
+        );
+        assert!(
+            admission < Duration::from_millis(100),
+            "admitting an unrelated request took {admission:?}"
+        );
+
+        // Same-handle ordering is untouched: the tail of handle 41 still waits.
+        let (tail, tail_rx) = std::sync::mpsc::channel();
+        dispatch.submit_keyed(41, move || {
+            tail.send(()).unwrap();
+        });
+        assert!(
+            tail_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "same-handle work must stay behind the slow write"
+        );
+        release.send(()).unwrap();
+        tail_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("queued tail must run once the slow write finishes");
+        dispatch.close_and_drain();
+    }
+
     #[test]
     fn kernel_writeback_does_not_hold_the_fuse_receiver() {
         use crate::node::vfs::WriteAdmissionMode;

@@ -394,4 +394,23 @@ FUSE 收发  ≈ 56 µs   6.6 次回调 × 8.5 µs（bindfs 约 10–12 µs/次�
 |---|---|---|
 | 长路径退化（openat2 只对 `ENOSYS` 回退） | `ENAMETOOLONG` 也回退到逐组件 `openat` 遍历，安全边界不变 | `node::storage::localfs::relative_path_longer_than_path_max_falls_back_to_component_walk`、`deep_path_fallback_keeps_no_symlink_policy` |
 | 普通写阻塞接收线程 | 删除 OwnerFs 的 `Borrowed` 准入，所有写经 keyed worker 队列（保序 + 有界 + 背压不变） | `node::vfs::ownerfs::plain_write_is_never_admitted_on_the_receive_thread` |
-| 构建版本号不可靠 | 用 `git rev-parse --git-path` 跟踪真实 HEAD/index，dirty 只看跟踪文件，归档由 `AFS_BUILD_ID` 或 `unknown` | `tests/build_identity.rs`（3 项，含 linked worktree 回归断言） |
+| 构建版本号不可靠 | 用 `git rev-parse --git-path` 跟踪真实 HEAD/index/**分支 loose ref**，dirty 只看跟踪文件；归档由 `make afs-archive` 注入 `AFS_BUILD_ID`，无身份时输出 `unknown` | `tests/build_identity.rs`（当前 checkout 断言）+ `afs/scripts/check-build-identity.sh`（实际构造 linked worktree / 同分支新提交 / 无 .git 归档三种场景） |
+
+### 10.5 材料溯源与缺口
+
+| 项 | 状态 |
+|---|---|
+| 源码身份 | 优化后 = `722fe96c`；优化前 = `a19b3041`（node 与 meta 同版本） |
+| 二进制 | 当年构建产物**未保留**，无法给出 sha256；复现需按 §9 重新构建（`cargo build --release --offline --features ownerfs --bin afs-node` / `--bin afs-meta`） |
+| 客户端 | 写/读用 C 客户端（无 fork+exec，单 `write`+`close` 循环）；`cp -a` 用系统 coreutils；shell 客户端数据只出现在已被否决的早期结论中 |
+| 原始样本 | 远端 `/home/lzq/afs-baseline/logs`、语料 `/home/lzq/src-corpus`、`/tmp/config`；逐轮原始输出**未归档**，本文只有中位数与离群值记录 |
+| 环境 | 单节点 1.94.246.161，每轮 `drop_caches`；MooseFS 3.0.117 同机部署（其 fsync/冷读不可比） |
+
+缺口（未做，别把本文读成完整验收）：
+
+- 未跑完整 `make rust-check`；AFS 范围的 `make afs-lint` 已跑。`--all-features` 需要
+  `libibverbs` 开发文件，本机缺失。
+- 未做深目录（单路径 > `PATH_MAX`）修复后的性能回归，只做了功能回归。
+- 未在新二进制上重测显式 `fsync`、`O_SYNC` 句柄吞吐。
+- 未做端到端落盘错误注入（只有既有 EIO 注入单测）。
+- 构建身份的三个场景由脚本构造验证，不是在 cargo 完整构建中逐场景复跑。

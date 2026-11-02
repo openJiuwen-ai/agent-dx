@@ -7195,10 +7195,10 @@ fn poisoned() -> Error {
     Error::coded(afs_error::RUNTIME_INTERNAL, "OwnerFs state lock poisoned")
 }
 
-/// Escape hatch for A/B measurement: `AFS_OWNERFS_CLOSE_SYNC=1` restores the
-/// per-close `fdatasync` that private local roots now skip.
-/// Escape hatch for A/B measurement: `AFS_OWNERFS_CLOSE_SYNC=1` restores the
-/// per-close `fdatasync` that private local roots now skip.
+/// Whether per-create stage timing is logged.
+///
+/// Set `AFS_FUSE_TRACE=1` to emit the `create` stage breakdown; the same switch
+/// gates the per-request trace in the FUSE frontend.
 fn ownerfs_create_trace_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -7232,6 +7232,9 @@ fn ownerfs_cache_ttl() -> Duration {
     })
 }
 
+/// Escape hatch for A/B measurement and for callers that need the old
+/// guarantee: `AFS_OWNERFS_CLOSE_SYNC=1` restores the per-close `fdatasync`
+/// that an exclusively owned local root skips by default.
 fn ownerfs_close_sync_forced() -> bool {
     static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FORCED.get_or_init(|| {

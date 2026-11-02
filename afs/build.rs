@@ -30,6 +30,16 @@ fn git(args: &[&str]) -> Option<String> {
 /// any of them move, otherwise a commit (or a `git add`) leaves the old id in
 /// place for as long as the Rust sources are untouched.
 fn watch_identity_inputs() {
+    // A symbolic HEAD keeps the same content (`ref: refs/heads/<branch>`) across
+    // commits inside one branch, so the loose ref it points at has to be tracked
+    // as well; otherwise only the index mtime could trigger a rebuild, which is
+    // not a dependable signal.
+    if let Some(reference) = git(&["symbolic-ref", "--quiet", "HEAD"])
+        && let Some(path) = git(&["rev-parse", "--git-path", &reference])
+        && Path::new(&path).exists()
+    {
+        println!("cargo:rerun-if-changed={path}");
+    }
     for spec in ["HEAD", "index"] {
         let Some(path) = git(&["rev-parse", "--git-path", spec]) else {
             continue;

@@ -266,7 +266,9 @@ cryptographic confidentiality or integrity. See
 有额度时接住正文后直接写reply；没有额度时保留正文并暂不回复，接收回调先返回，
 待额度恢复后回复。不额外经过独立回复队列或线程。队列满时背压，后台保留原 CRC、副本和 Meta 业务。
 写成功只代表内存接纳；`fsync`、`flush` 和关闭仍等待原同步语义，失败必须检查返回值。
-同步写、追加、远端 owner、内核 writeback 和 OwnerFS 保留原返回点。
+本节范围是 DFS 与远端 owner：OwnerFS 独占本地 root 的关闭语义不同，默认不再 `fdatasync`，
+见上文「OwnerFs 关闭语义」，需要旧保证时设 `AFS_OWNERFS_CLOSE_SYNC=1`。
+同步写、追加、远端 owner、内核 writeback 保留原返回点。
 按文件收窄等待；正文保留共享FIFO和单消费者。fsync/flush/release登记恢复任务，不占正文额度。
 后台失败按文件保留并报告，不关闭整个挂载；USRBIO交接前等待此前正文处理。
 完整内存、顺序、错误及历史性能口径见[写入接纳合同](../docs/performance/afs-write-owned-admission.md)。

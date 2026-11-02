@@ -778,7 +778,12 @@ fn openat_raw(parent: &File, leaf: &OsStr, flags: i32, mode: u32) -> io::Result<
 ///
 /// `RESOLVE_IN_ROOT` keeps the lookup confined to the root descriptor even for
 /// `..`, and `RESOLVE_NO_SYMLINKS` preserves the `O_NOFOLLOW` policy the
-/// component walk applied. Returns `None` when the kernel lacks openat2.
+/// component walk applied.
+///
+/// Returns `None` when the caller must fall back to the component walk: the
+/// kernel lacks openat2 (`ENOSYS`), or the whole relative path does not fit the
+/// kernel path limit (`ENAMETOOLONG`) while every single component still does.
+/// Every other error is returned to the caller unchanged.
 #[allow(unsafe_code)]
 fn openat2_dir(root: &File, relative: &OsStr) -> Option<io::Result<File>> {
     let name = std::ffi::CString::new(relative.as_encoded_bytes()).ok()?;
@@ -798,11 +803,19 @@ fn openat2_dir(root: &File, relative: &OsStr) -> Option<io::Result<File>> {
         )
     };
     if fd >= 0 {
-        // SAFETY: fd is a non-negative descriptor the kernel just returned to
-        // this process; nothing else owns it, so it can be adopted here.
-        return Some(Ok(unsafe {
-            std::os::fd::FromRawFd::from_raw_fd(fd as i32)
-        }));
+        // `syscall` returns `c_long`; a descriptor outside `c_int` cannot be a
+        // `RawFd`, so refuse instead of truncating. The kernel never returns
+        // one, which is why the error path does not try to close it.
+        let Ok(raw_fd) = i32::try_from(fd) else {
+            debug_assert!(
+                false,
+                "openat2 returned a descriptor wider than c_int: {fd}"
+            );
+            return Some(Err(io::Error::from_raw_os_error(libc::EOVERFLOW)));
+        };
+        // SAFETY: raw_fd is the non-negative descriptor the kernel just
+        // returned to this process; nothing else owns it, so it is adopted here.
+        return Some(Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(raw_fd) }));
     }
     let error = io::Error::last_os_error();
     // Fall back to the component walk when openat2 is unavailable *and* when the
@@ -875,8 +888,6 @@ fn renameat2_no_replace(
     // StoragePath/open_parent. The syscall does not retain these pointers after
     // returning, and RENAME_NOREPLACE gives the required atomic no-clobber
     // semantics that cannot be implemented with a prior existence check.
-    // SAFETY: both directory descriptors and NUL-terminated path components stay live for
-    // the synchronous syscall.
     let result = unsafe {
         libc::renameat2(
             from_parent.as_raw_fd(),
