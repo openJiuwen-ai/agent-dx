@@ -2066,6 +2066,60 @@ pub fn root_id_from_name(name: &OsStr) -> Result<RootId> {
     Ok(RootId(format!("root-{}", hex(bytes))))
 }
 
+/// Recover the workspace name from a root id.
+///
+/// The encoding is injective (`root-` + hex of the raw name bytes), so this is
+/// the exact inverse of [`root_id_from_name`]. The outlet mirror needs it to
+/// publish `/public/<name>`: the name a caller used to create the workspace is
+/// the only name they can bind, and Meta deliberately does not store it
+/// separately.
+pub fn root_name_from_id(id: &RootId) -> Result<OsString> {
+    let hex_part = id.0.strip_prefix("root-").ok_or_else(|| {
+        Error::coded(
+            afs_error::NODE_VFS_INVALID,
+            "root id lacks the root- prefix",
+        )
+    })?;
+    if hex_part.is_empty() || hex_part.len() % 2 != 0 {
+        return Err(Error::coded(
+            afs_error::NODE_VFS_INVALID,
+            "root id hex part must be non-empty and even-length",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(hex_part.len() / 2);
+    let raw = hex_part.as_bytes();
+    for pair in raw.chunks_exact(2) {
+        let hi = hex_digit(pair[0])?;
+        let lo = hex_digit(pair[1])?;
+        bytes.push((hi << 4) | lo);
+    }
+    // Reject anything the forward function could not have produced, so a
+    // malformed id can never surface as a name with a separator in it.
+    if bytes.is_empty()
+        || bytes == b"."
+        || bytes == b".."
+        || bytes.contains(&b'/')
+        || bytes.contains(&0)
+    {
+        return Err(Error::coded(
+            afs_error::NODE_VFS_INVALID,
+            "root id does not decode to a single path component",
+        ));
+    }
+    Ok(OsString::from_vec(bytes))
+}
+
+fn hex_digit(byte: u8) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        _ => Err(Error::coded(
+            afs_error::NODE_VFS_INVALID,
+            "root id contains a non-lowercase-hex character",
+        )),
+    }
+}
+
 /// Physical data directory for a root generation: `root-<hex(name)>-e<epoch>`.
 ///
 /// `pub(crate)` so the outlet mirror can cross-check its path formula against
@@ -2090,6 +2144,51 @@ mod tests {
     use super::*;
     use crate::node::storage::FileStore;
     use std::os::unix::fs::MetadataExt;
+
+    /// The outlet mirror republishes `/public/<name>` by decoding the id, so
+    /// the encode/decode pair must round-trip exactly — including bytes that
+    /// are not valid UTF-8, since workspace names are arbitrary path
+    /// components rather than strings.
+    #[test]
+    fn root_id_and_name_round_trip() {
+        for name in [
+            "job-42",
+            "a",
+            "perfA001",
+            "with space",
+            "dot.in.name",
+            "中文名",
+            "-leading-dash",
+            "trailing.dot.",
+        ] {
+            let os = OsStr::new(name);
+            let id = root_id_from_name(os).unwrap();
+            let back = root_name_from_id(&id).unwrap();
+            assert_eq!(back, os, "round trip failed for {name}");
+        }
+        // Non-UTF-8 bytes must survive too.
+        let raw = OsStr::from_bytes(b"bad-\xff\xfe-utf8");
+        let id = root_id_from_name(raw).unwrap();
+        assert_eq!(root_name_from_id(&id).unwrap(), raw);
+    }
+
+    #[test]
+    fn root_name_from_id_rejects_malformed_ids() {
+        for bad in [
+            "nope",
+            "root-",
+            "root-6",
+            "root-zz",
+            "root-2e2e", // ".." must not come back as a name
+            "root-2f",   // "/" must not come back as a name
+        ] {
+            let id = RootId(bad.to_owned());
+            assert!(
+                root_name_from_id(&id).is_err(),
+                "malformed id {bad} must be rejected"
+            );
+        }
+    }
 
     struct FixedMeta {
         activate: RootGrant,

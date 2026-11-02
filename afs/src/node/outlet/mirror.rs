@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::node::vfs::ownerfs::root::OutletRoot;
+use crate::node::vfs::ownerfs::root::{OutletRoot, root_name_from_id};
 
 /// One filesystem action the mirror must perform.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,45 +80,62 @@ pub fn plan(
 ) -> Vec<Action> {
     let mut actions = Vec::new();
 
-    // Expectation keyed by name. Later duplicates cannot occur: Meta returns at
-    // most one Active record per root_id, and the name is derived from it.
-    let mut wanted: BTreeMap<&str, &OutletRoot> = BTreeMap::new();
+    // Expectation keyed by the workspace name. Meta returns at most one Active
+    // record per root_id and the id is an injective encoding of the name, so
+    // two roots can never claim the same entry here.
+    //
+    // Publishing under the workspace name is the point of the layer: a caller
+    // binds the name they created, and `root-<hex(name)>` is not something a
+    // caller ever wrote. An id that fails to decode cannot be published under
+    // any name a caller could use, so it is skipped rather than guessed at.
+    let mut wanted: BTreeMap<String, &OutletRoot> = BTreeMap::new();
+    let mut undecodable: Vec<&str> = Vec::new();
     for root in active {
-        wanted.insert(root.root_id.0.as_str(), root);
+        match root_name_from_id(&root.root_id) {
+            Ok(name) => {
+                wanted.insert(name.to_string_lossy().into_owned(), root);
+            }
+            Err(_) => undecodable.push(root.root_id.0.as_str()),
+        }
+    }
+    for id in &undecodable {
+        afs_logging::warn!(
+            "outlet.mirror.undecodable_root_id";
+            "root_id" => *id
+        );
     }
 
     for (name, root) in &wanted {
         let target = target_path(import_root, root);
-        match present.get(*name) {
+        match present.get(name) {
             Some(PresentEntry::Symlink { target: current }) if current == &target => {}
             // A wrong target is republished in place: stale after a generation
             // change, or left over from a previous import layout.
             Some(PresentEntry::Symlink { .. }) => actions.push(Action::Publish {
-                name: (*name).to_owned(),
+                name: name.clone(),
                 target,
             }),
             Some(PresentEntry::Foreign) => {
                 // Move it aside first; publishing over a real directory fails.
-                actions.push(Action::Quarantine {
-                    name: (*name).to_owned(),
-                });
+                actions.push(Action::Quarantine { name: name.clone() });
                 actions.push(Action::Publish {
-                    name: (*name).to_owned(),
+                    name: name.clone(),
                     target,
                 });
             }
             None => actions.push(Action::Publish {
-                name: (*name).to_owned(),
+                name: name.clone(),
                 target,
             }),
         }
     }
 
+    let published: BTreeSet<&str> = wanted.keys().map(String::as_str).collect();
     for name in present.keys() {
         if RESERVED.contains(&name.as_str()) {
             continue;
         }
-        if wanted.contains_key(name.as_str()) {
+        if published.contains(name.as_str()) {
             continue;
         }
         // Not in the snapshot: either deactivated, or a ghost from a consumer.
@@ -201,7 +218,7 @@ mod tests {
         assert_eq!(
             actions,
             vec![Action::Publish {
-                name: "root-61".into(),
+                name: "a".into(),
                 target: "/imports/node-a/users/root-61-e7".into(),
             }]
         );
@@ -212,7 +229,7 @@ mod tests {
         let actions = plan(
             "/imports",
             &[root("root-61", 7, "node-a")],
-            &present(&[("root-61", symlink("/imports/node-a/users/root-61-e7"))]),
+            &present(&[("a", symlink("/imports/node-a/users/root-61-e7"))]),
         );
         assert!(actions.is_empty(), "converged state must be a no-op");
     }
@@ -223,12 +240,12 @@ mod tests {
         let actions = plan(
             "/imports",
             &[root("root-61", 8, "node-a")],
-            &present(&[("root-61", symlink("/imports/node-a/users/root-61-e7"))]),
+            &present(&[("a", symlink("/imports/node-a/users/root-61-e7"))]),
         );
         assert_eq!(
             actions,
             vec![Action::Publish {
-                name: "root-61".into(),
+                name: "a".into(),
                 target: "/imports/node-a/users/root-61-e8".into(),
             }],
             "a generation bump must be one publish, not remove+publish"
@@ -240,14 +257,9 @@ mod tests {
         let actions = plan(
             "/imports",
             &[],
-            &present(&[("root-61", symlink("/imports/node-a/users/root-61-e7"))]),
+            &present(&[("a", symlink("/imports/node-a/users/root-61-e7"))]),
         );
-        assert_eq!(
-            actions,
-            vec![Action::Remove {
-                name: "root-61".into()
-            }]
-        );
+        assert_eq!(actions, vec![Action::Remove { name: "a".into() }]);
     }
 
     /// 消费方违约（真实目录占位）必须先隔离再发布，否则 symlinkat 永远 EEXIST。
@@ -256,16 +268,14 @@ mod tests {
         let actions = plan(
             "/imports",
             &[root("root-61", 7, "node-a")],
-            &present(&[("root-61", PresentEntry::Foreign)]),
+            &present(&[("a", PresentEntry::Foreign)]),
         );
         assert_eq!(
             actions,
             vec![
-                Action::Quarantine {
-                    name: "root-61".into()
-                },
+                Action::Quarantine { name: "a".into() },
                 Action::Publish {
-                    name: "root-61".into(),
+                    name: "a".into(),
                     target: "/imports/node-a/users/root-61-e7".into(),
                 },
             ],
@@ -292,9 +302,9 @@ mod tests {
     fn applying_the_plan_leaves_nothing_to_do() {
         let active = vec![root("root-61", 7, "node-a"), root("root-62", 3, "node-b")];
         let start = present(&[
-            ("root-61", symlink("/stale/target")),
-            ("root-63", symlink("/imports/node-c/users/root-63-e1")),
-            ("root-64", PresentEntry::Foreign),
+            ("a", symlink("/stale/target")),
+            ("c", symlink("/imports/node-c/users/root-63-e1")),
+            ("d", PresentEntry::Foreign),
         ]);
         let actions = plan("/imports", &active, &start);
 
@@ -340,7 +350,7 @@ mod tests {
                 Action::Quarantine { name } => name.as_str(),
             })
             .collect();
-        assert_eq!(names, vec!["root-61", "root-62", "root-63"]);
+        assert_eq!(names, vec!["a", "b", "c"]);
     }
 
     #[test]

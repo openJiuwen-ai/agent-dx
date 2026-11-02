@@ -455,7 +455,7 @@ mod tests {
 
         let applied = converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
         assert_eq!(applied, 1);
-        let link = dir.path().join("root-61");
+        let link = dir.path().join("a");
         assert_eq!(
             std::fs::read_link(&link).unwrap(),
             Path::new("/imports/node-a/users/root-61-e7")
@@ -479,7 +479,7 @@ mod tests {
 
         assert_eq!(applied, 0, "unchanged round must do nothing");
         assert!(
-            dir.path().join("root-61").symlink_metadata().is_ok(),
+            dir.path().join("a").symlink_metadata().is_ok(),
             "H14: an unchanged reply must not be read as 'no active roots'"
         );
         // 第二轮必须把上一轮的 digest 传上去，否则服务端永远回全量。
@@ -505,7 +505,7 @@ mod tests {
         converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
 
         assert_eq!(
-            std::fs::read_link(dir.path().join("root-61")).unwrap(),
+            std::fs::read_link(dir.path().join("a")).unwrap(),
             Path::new("/imports/node-a/users/root-61-e8")
         );
     }
@@ -524,7 +524,7 @@ mod tests {
         converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
         converge(&config(dir.path()), &meta, &mut digest, &mut roots).unwrap();
 
-        assert!(dir.path().join("root-61").symlink_metadata().is_err());
+        assert!(dir.path().join("a").symlink_metadata().is_err());
     }
 
     /// ghost（真实目录占位）先隔离再发布，且原内容不丢。
@@ -532,7 +532,7 @@ mod tests {
     fn foreign_directory_is_quarantined_not_destroyed() {
         let dir = tempfile::tempdir().unwrap();
         prepare(dir.path()).unwrap();
-        let ghost = dir.path().join("root-61");
+        let ghost = dir.path().join("a");
         std::fs::create_dir(&ghost).unwrap();
         std::fs::write(ghost.join("evidence"), b"x").unwrap();
 
@@ -543,7 +543,7 @@ mod tests {
 
         // 名字现在是 symlink，原目录被移入隔离区而不是被删掉。
         assert_eq!(
-            std::fs::read_link(dir.path().join("root-61")).unwrap(),
+            std::fs::read_link(dir.path().join("a")).unwrap(),
             Path::new("/imports/node-a/users/root-61-e7")
         );
         let quarantined: Vec<_> = std::fs::read_dir(dir.path().join(QUARANTINE_DIR))
@@ -568,7 +568,7 @@ mod tests {
         let result = converge(&config(dir.path()), &meta, &mut digest, &mut roots);
         assert!(result.is_err());
         assert!(
-            dir.path().join("root-61").symlink_metadata().is_ok(),
+            dir.path().join("a").symlink_metadata().is_ok(),
             "a failed round must not retract names"
         );
     }
@@ -640,7 +640,7 @@ mod tests {
         // import 根下什么都没有 → 应当报告，但名字面不受影响。
         let findings = diagnose(&config(dir.path()), b"");
         assert!(
-            dir.path().join("root-61").symlink_metadata().is_ok(),
+            dir.path().join("a").symlink_metadata().is_ok(),
             "diagnosis must never retract names"
         );
         // 该临时目录不是 tmpfs 挂载点，因此 public 也应有 finding。
