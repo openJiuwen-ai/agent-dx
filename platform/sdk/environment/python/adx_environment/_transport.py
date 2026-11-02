@@ -911,6 +911,7 @@ class EnvironmentClient:
         outcome_unknown = False
         attempts = 0
         first_error: Optional[BaseException] = None
+        terminal_route_error: Optional[EnvironmentHTTPError] = None
 
         pending_resume: Optional[EnvironmentHTTPError] = None
         attempt_limit = self._connection.request_max_attempts
@@ -990,6 +991,13 @@ class EnvironmentClient:
                     if error is not None:
                         error.first_error = first_error
                     if error is not None and error.retry == "never":
+                        if error.code == "ENV_UNAVAILABLE":
+                            # A gateway rejection can hide a committed backend
+                            # failure. Enrich once without retrying this operation.
+                            terminal_route_error = error
+                            last_error = error
+                            first_error = first_error or error
+                            break
                         raise error
                     if error is not None and self._is_resuming(resp, error, request_id):
                         pending_resume = error
@@ -1041,7 +1049,7 @@ class EnvironmentClient:
                 processing_deadline = time.monotonic() + processing_timeout
                 deadline = processing_deadline + self._connection.communication_margin_seconds
 
-        if pending_resume is not None and not outcome_unknown:
+        if pending_resume is not None and not outcome_unknown and terminal_route_error is None:
             # No attempt reached the application. Keep this authoritative outcome;
             # never turn demand waiting into a control-plane invocation fallback.
             pending_resume.first_error = first_error if first_error is not pending_resume else None
@@ -1057,7 +1065,7 @@ class EnvironmentClient:
                     environment_id, timeout=min(2.0, remaining) if remaining is not None else 2.0
                 )
             except EnvironmentNotFound as error:
-                if not outcome_unknown:
+                if not outcome_unknown and terminal_route_error is None:
                     error.request_id = request_id
                     error.operation_id = request_id
                     error.first_error = first_error
@@ -1074,6 +1082,10 @@ class EnvironmentClient:
                     retry="never", outcome="terminal", operation_id=request_id,
                     environment_id=environment_id, failure=failure, first_error=first_error,
                 ) from last_error
+        if terminal_route_error is not None:
+            # An expired/unavailable checkpoint remains authoritative when the
+            # catalog cannot confirm a backend failure. Do not enable retries.
+            raise terminal_route_error
         if last_failure_safe and not outcome_unknown and last_error is not None:
             raise EnvironmentError(
                 f"environment direct route unavailable after {attempts} attempts (requestId={request_id}): {detail}",

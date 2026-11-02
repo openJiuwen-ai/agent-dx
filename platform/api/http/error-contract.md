@@ -174,6 +174,7 @@ OOM 分为命令级与 Environment 级，不由 HTTP 502/503 或 exit_code=137 �
 - **整个运行环境**：Adxlet 观察到后端 Exited 后、删除前调用 sandboxd `Wait`，仅将后端提供的 OOM message 转换为 `failure.reason=OomKilled`，同时保留后端 `exit_code`。原因与同一个 Environment 记录一起持久化、发布到订阅目录。`GET /api/instances?instance_id=...` 和 SDK `get_info().failure` 可读取；成功启动/恢复的新执行清除旧原因。
 - SDK direct invoke 重试耗尽后，在原 deadline 剩余时间内进行一次最长 2 秒的认证目录查询。仅当目录已经提交 `status=failed` 且 `failure.reason=OomKilled` 时返回 `EnvironmentError(code=ENVIRONMENT_OOM, retry=never, outcome=terminal)`，`failure` 属性保留详情。这是 SDK 对已确认 Environment 终态的分类，不是新的管理面 gRPC 状态，也不改变数据网关的通用 502/503 响应。
 - 当目录已提交 `status=failed` 且存在其他结构化 `failure` 时，返回 `ENVIRONMENT_FAILED / never / terminal`，不把普通退出猜测成 OOM。异常保留 `request_id`、`operation_id`、`environment_id`、`failure` 与首次数据路径错误 `first_error`。
+- 网关直接拒绝 `ENV_UNAVAILABLE / never` 时，也会在剩余 deadline 内查询一次目录以补全已提交的后端失败原因，不重试被拒绝的操作。若目录没有确认后端失败，保持网关原错误及其 retry/outcome 语义。
 - 原因尚未提交或目录 API 暂不可用时，不自动重放到不支持 invoke 的控制面接口，也不永久禁用后续 direct 调用。仅有已确认未发送的连接错误、连接池超时或缺失路由时，返回 `ENVIRONMENT_UNAVAILABLE / same_operation / not_started`；存在执行歧义时继续保留 `OUTCOME_UNKNOWN / same_operation / unknown`。失败查询不会刷新 deadline。之后可用 `get_info()` 确认原因，普通成功调用不会增加目录查询。
 - 普通退出记录 `failure.reason=Exited`；后端已消失且没有可读取退出记录时为 `Missing`，不猜测 OOM。SDK 未知结果查询的权限与普通实例查询相同，不能跨租户读取原因。
 

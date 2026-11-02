@@ -342,6 +342,9 @@ routes never trigger an implicit control-plane invoke: the current API Server
 does not implement that operation. After bounded direct retries, the SDK checks
 the authenticated Environment catalog and preserves a confirmed OOM or runtime
 failure, including the original operation identity and first transport failure.
+A terminal gateway `ENV_UNAVAILABLE` rejection also checks the catalog once for
+this cause without retrying the rejected operation. If no backend failure is
+confirmed, its original error and retry/outcome contract remain authoritative.
 A still-running or unavailable catalog cannot confirm a terminal backend failure:
 known-unsent requests remain `not_started`, and ambiguous execution remains
 `unknown`. Neither case disables later direct calls. Retry-After and jitter apply

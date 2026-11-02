@@ -6,7 +6,11 @@ import httpx
 import pytest
 
 from adx_environment import _transport
-from adx_environment._transport import EnvironmentClient, EnvironmentError, EnvironmentHTTPError
+from adx_environment._transport import (
+    EnvironmentClient,
+    EnvironmentError,
+    EnvironmentHTTPError,
+)
 
 
 def client_for(monkeypatch, handler):
@@ -25,13 +29,17 @@ def client_for(monkeypatch, handler):
         ({"reason": "Exited", "exit_code": 128}, "ENVIRONMENT_FAILED"),
     ],
 )
-def test_failed_environment_retains_cause_without_control_replay(monkeypatch, fault, failure, expected_code):
+def test_failed_environment_retains_cause_without_control_replay(
+    monkeypatch, fault, failure, expected_code
+):
     calls = []
 
     def handler(request):
         calls.append(request)
         if request.url.path == "/api/instances":
-            return httpx.Response(200, json=[{"id": "owned", "status": "failed", "failure": failure}])
+            return httpx.Response(
+                200, json=[{"id": "owned", "status": "failed", "failure": failure}]
+            )
         if request.url.path == "/direct/owned/invoke":
             if fault == "connect":
                 raise httpx.ConnectError("fixture unavailable", request=request)
@@ -50,7 +58,9 @@ def test_failed_environment_retains_cause_without_control_replay(monkeypatch, fa
         assert error.first_error is not None
         direct = [r for r in calls if r.method == "POST"]
         assert direct
-        assert {json.loads(r.content)["requestId"] for r in direct} == {error.request_id}
+        assert {json.loads(r.content)["requestId"] for r in direct} == {
+            error.request_id
+        }
         assert {r.headers["X-ADX-Request-ID"] for r in direct} == {error.request_id}
         assert not client._direct_disabled
     finally:
@@ -66,7 +76,11 @@ def test_transient_missing_route_does_not_disable_later_invokes(monkeypatch):
         if request.url.path == "/api/instances":
             return httpx.Response(200, json=[{"id": "owned", "status": "running"}])
         if request.url.path == "/direct/owned/invoke":
-            return httpx.Response(200, json={"created": True}) if healthy else httpx.Response(404)
+            return (
+                httpx.Response(200, json={"created": True})
+                if healthy
+                else httpx.Response(404)
+            )
         raise AssertionError("Implicit control-plane fallback is unsupported")
 
     client = client_for(monkeypatch, handler)
@@ -77,7 +91,9 @@ def test_transient_missing_route_does_not_disable_later_invokes(monkeypatch):
         assert raised.value.outcome == "not_started"
         assert raised.value.retry == "same_operation"
         healthy = True
-        assert client.invoke("owned", "file.make_dir", {"path": "/tmp/evidence"}) == {"created": True}
+        assert client.invoke("owned", "file.make_dir", {"path": "/tmp/evidence"}) == {
+            "created": True
+        }
         assert calls[-1] == "/direct/owned/invoke"
     finally:
         client.close()
@@ -111,7 +127,9 @@ def test_operation_not_found_is_not_an_environment_route_failure(monkeypatch):
 
     def handler(request):
         calls.append(request.url.path)
-        return httpx.Response(404, json={"error_code": "COMMAND_NOT_FOUND", "message": "gone"})
+        return httpx.Response(
+            404, json={"error_code": "COMMAND_NOT_FOUND", "message": "gone"}
+        )
 
     client = client_for(monkeypatch, handler)
     try:
@@ -119,5 +137,113 @@ def test_operation_not_found_is_not_an_environment_route_failure(monkeypatch):
             client.invoke("owned", "process.get", {"command_id": "missing"})
         assert raised.value.status_code == 404
         assert calls == ["/direct/owned/invoke"]
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("status_code", [409, 502])
+@pytest.mark.parametrize("outcome", ["terminal", "not_started"])
+@pytest.mark.parametrize("resuming", [False, True])
+@pytest.mark.parametrize(
+    "reason,code", [("OomKilled", "ENVIRONMENT_OOM"), ("Exited", "ENVIRONMENT_FAILED")]
+)
+def test_terminal_gateway_unavailable_keeps_committed_backend_cause(
+    monkeypatch, status_code, outcome, resuming, reason, code
+):
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        if request.url.path == "/api/instances":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "owned",
+                        "status": "failed",
+                        "failure": {"reason": reason, "exit_code": 137},
+                    }
+                ],
+            )
+        if request.url.path == "/direct/owned/invoke":
+            if resuming and calls.count(request.url.path) == 1:
+                return httpx.Response(
+                    503,
+                    headers={"X-ADX-Error-Code": "ENV_RESUMING"},
+                    json={
+                        "error": {
+                            "code": "ENV_RESUMING",
+                            "retry": "same_operation",
+                            "outcome": "not_started",
+                            "requestForwarded": False,
+                            "requestId": request.headers["X-ADX-Request-ID"],
+                        }
+                    },
+                )
+            return httpx.Response(
+                status_code,
+                json={
+                    "error": {
+                        "code": "ENV_UNAVAILABLE",
+                        "retry": "never",
+                        "outcome": outcome,
+                        "requestId": request.headers["X-ADX-Request-ID"],
+                    }
+                },
+            )
+        raise AssertionError("no control replay")
+
+    client = client_for(monkeypatch, handler)
+    try:
+        with pytest.raises(EnvironmentError) as raised:
+            client.invoke("owned", "process.get", {"command_id": "owned-command"})
+        error = raised.value
+        assert error.code == code
+        assert error.failure["reason"] == reason
+        assert error.first_error.code == (
+            "ENV_RESUMING" if resuming else "ENV_UNAVAILABLE"
+        )
+        assert calls == ["/direct/owned/invoke"] * (2 if resuming else 1) + [
+            "/api/instances"
+        ]
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("catalog", ["running", "missing", "outage"])
+def test_terminal_gateway_rejection_without_backend_failure_stays_authoritative(
+    monkeypatch, catalog
+):
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        if request.url.path == "/api/instances":
+            if catalog == "missing":
+                return httpx.Response(200, json=[])
+            if catalog == "outage":
+                return httpx.Response(503, text="catalog down")
+            return httpx.Response(200, json=[{"id": "owned", "status": "running"}])
+        return httpx.Response(
+            409,
+            json={
+                "error": {
+                    "code": "ENV_UNAVAILABLE",
+                    "retry": "never",
+                    "outcome": "terminal",
+                    "message": "checkpoint expired",
+                }
+            },
+        )
+
+    client = client_for(monkeypatch, handler)
+    try:
+        with pytest.raises(EnvironmentHTTPError) as raised:
+            client.invoke("owned", "process.get", {"command_id": "owned-command"})
+        assert raised.value.code == "ENV_UNAVAILABLE"
+        assert raised.value.retry == "never"
+        assert raised.value.outcome == "terminal"
+        assert "checkpoint expired" in str(raised.value)
+        assert calls.count("/direct/owned/invoke") == 1
     finally:
         client.close()
