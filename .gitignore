@@ -58,3 +58,8 @@ credentials*.csv
 
 # Local multi-host validation scratch (scripts, logs, binaries)
 .validation/
+
+# Outlet design notes and the two-host validation report stay local: they are
+# working material for this deployment, not part of the engine's contract.
+afs/outlet-cross-node-spec-v2.md
+afs/outlet-two-node-validation-report.md
