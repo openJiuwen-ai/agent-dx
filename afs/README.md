@@ -172,8 +172,9 @@ READ 在窗口内本地复制。顺序访问时窗口从一个槽翻倍到 `owne
 释放且无 quarantine。1 GiB 顺序读的交替对照（单流 / 4 路并发，中位）为 gRPC 405/665 MiB/s、
 HIXL 16 MiB 窗口 667/760、16 MiB 窗口 + 预取 742/744、64 MiB 窗口 + 预取 901/863 MiB/s；
 gRPC 的单流上限来自每 1 MiB 一次往返（2.14 ms），HIXL 的 native 传输只占每窗口 3–6 ms，
-瓶颈在 Home 侧读源与校验。并发收益受每 Home 单会话租约限制。单机对、单设备、Home 页缓存命中，
-不能外推到其他拓扑。设计与验收计划见
+瓶颈在 Home 侧读源与校验。`ownerfs_sessions_per_home` 解除了每 Home 单会话的串行：复测中 4 路并发、
+16 MiB 窗口、收发槽 32 时 1/2/4 会话为 982/1618/2944 MiB/s（同轮 gRPC 809），单流不受会话数影响
+（677–735 MiB/s）。单机对、单设备、Home 页缓存命中，不能外推到其他拓扑。设计与验收计划见
 [OwnerFs HIXL 只读预读窗口设计](../docs/development/ownerfs-hixl-data-plane-design.md)。
 
 这版代码尚未经过 A2 RoCE、两个以上源节点或并发 reader 的扩展与故障恢复验收；
