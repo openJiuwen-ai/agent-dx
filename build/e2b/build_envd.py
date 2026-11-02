@@ -9,8 +9,10 @@ import platform
 import shutil
 import signal
 import subprocess
+import tarfile
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[2]
 LOGGER = logging.getLogger(__name__)
@@ -48,13 +50,60 @@ def run_git(command, *, timeout):
         raise subprocess.CalledProcessError(code, command)
 
 
-def build(source, output, jobs=4, git_protocol=None):
+def unpack_archive(archive, source, pin):
+    """Verify the complete pinned archive before extracting required regular files."""
+    artifact = pin['archive']
+    if archive.stat().st_size != artifact['bytes'] or digest(archive) != artifact['sha256']:
+        raise ValueError('envd source archive integrity mismatch')
+    prefix = 'runtime-' + pin['revision']
+    with tarfile.open(archive, 'r:gz') as bundle:
+        seen = set()
+        for member in bundle:
+            path = PurePosixPath(member.name)
+            if path.is_absolute() or '..' in path.parts or not path.parts or path.parts[0] != prefix:
+                raise ValueError('unsafe envd archive path')
+            relative = PurePosixPath(*path.parts[1:])
+            selected = relative == PurePosixPath('LICENSE') or relative.parts[:2] in (
+                ('packages', 'envd'), ('packages', 'shared'))
+            if not selected or member.isdir():
+                continue
+            if not member.isfile() or relative in seen:
+                raise ValueError('unsafe or duplicate envd archive entry')
+            seen.add(relative)
+            destination = source.joinpath(*relative.parts)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with bundle.extractfile(member) as src, destination.open('wb') as dst:
+                shutil.copyfileobj(src, dst)
+
+
+def build(source, output, jobs=4, git_protocol=None, obs_source=False):
     """Build an explicit checkout, or fetch the pin into a temporary checkout."""
     if git_protocol not in (None, '2'):
         raise ValueError('git_protocol must be omitted or 2')
     if source is not None:
         return _build(source, output, jobs)
     pin = json.loads((ROOT / 'third_party/e2b/source.json').read_text())
+    if obs_source:
+        artifact = pin['archive']
+        url = urlsplit(artifact['url'])
+        if (url.scheme != 'https' or not url.hostname or '.obs.' not in url.hostname
+                or not url.hostname.endswith('.myhuaweicloud.com') or url.username or url.password
+                or url.query or url.fragment):
+            raise ValueError('invalid envd OBS source URL')
+        with tempfile.TemporaryDirectory(prefix='adx-envd-obs-') as directory:
+            root = Path(directory)
+            archive = root / 'source.tar.gz'
+            LOGGER.info('Download pinned envd source archive from OBS')
+            curl = shutil.which('curl')
+            if curl is None:
+                raise FileNotFoundError('curl executable is required')
+            subprocess.run([curl, '--fail', '--location', '--silent', '--show-error', '--proto', '=https',
+                            '--proto-redir', '=https', '--retry', '3', '--connect-timeout', '15',
+                            '--max-time', '180', '--retry-max-time', '360', '--output', str(archive),
+                            artifact['url']], check=True)
+            source = root / 'source'
+            unpack_archive(archive, source, pin)
+            return _build(source, output, jobs, archive_revision=pin['revision'])
     git = shutil.which('git')
     if git is None:
         raise FileNotFoundError('Git executable is required')
@@ -83,12 +132,12 @@ def build(source, output, jobs=4, git_protocol=None):
         return _build(source, output, jobs)
 
 
-def _build(source, output, jobs):
+def _build(source, output, jobs, archive_revision=None):
     if platform.system() != 'Linux' or jobs < 1:
         raise ValueError('native Linux builder and positive jobs required')
     pin = json.loads((ROOT / 'third_party/e2b/source.json').read_text())
-    revision = git_output(source, 'rev-parse', 'HEAD')
-    dirty = git_output(source, 'status', '--porcelain')
+    revision = archive_revision if archive_revision is not None else git_output(source, 'rev-parse', 'HEAD')
+    dirty = '' if archive_revision is not None else git_output(source, 'status', '--porcelain')
     if revision != pin['revision'] or dirty:
         raise ValueError('envd source must match the clean pinned revision')
     for entry in pin['files']:
@@ -130,6 +179,9 @@ if __name__ == '__main__':
     parser.add_argument('--jobs', type=int, default=4)
     parser.add_argument('--git-protocol', choices=('2',),
                         help='opt into protocol v2 in the temporary checkout (Git 2.18+)')
+    parser.add_argument('--obs-source', action='store_true', help='download the checksum-pinned OBS source archive')
     parsed_args = parser.parse_args()
+    if parsed_args.source and parsed_args.obs_source:
+        parser.error('--source and --obs-source are mutually exclusive')
     build(parsed_args.source.resolve() if parsed_args.source else None, parsed_args.output.resolve(), parsed_args.jobs,
-          git_protocol=parsed_args.git_protocol)
+          git_protocol=parsed_args.git_protocol, obs_source=parsed_args.obs_source)

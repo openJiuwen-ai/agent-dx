@@ -3,6 +3,11 @@
   "revision": "92197909dce5a1bef33e764ae4af76f0732fd7a8",
   "envd_version": "0.9.0",
   "go_toolchain": "go1.26.8",
+  "archive": {
+    "url": "https://agent-dx.obs.cn-southwest-2.myhuaweicloud.com/adx/dependencies/e2b/runtime/92197909dce5a1bef33e764ae4af76f0732fd7a8/source-88148d5658d75c7d4537f842f84089e94f3d643f5114f56b11ee0d691bdd1e16.tar.gz",
+    "bytes": 4805583,
+    "sha256": "88148d5658d75c7d4537f842f84089e94f3d643f5114f56b11ee0d691bdd1e16"
+  },
   "files": [
     {
       "source": "LICENSE",

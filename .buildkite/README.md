@@ -40,18 +40,18 @@ Base builds publish verified candidates to OBS by default. PyPI publication rema
 Set these variables on a Buildkite build or in that pipeline's environment settings.
 
 Both architecture Execd components include the pinned upstream envd in
-`adx-runtime-rootfs.img`. The Linux builder fetches the exact revision from
-`third_party/e2b/source.json` into a temporary checkout, verifies source hashes,
-and builds with its pinned Go toolchain. A fetch, checksum or build failure
+`adx-runtime-rootfs.img`. The Linux builder downloads the source archive pinned in
+`third_party/e2b/source.json` from OBS, verifies its size and SHA-256 and the
+selected source hashes, and builds with its pinned Go toolchain. A download, checksum or build failure
 fails the component. The component and unified release retain envd LICENSE and
 manifest; the latter records the binary SHA256, revision, version and toolchain.
 `ADX_ENVD_SOURCE` optionally supplies an existing clean checkout of that same
 revision. On the macOS ARM worker, this host directory is mounted read-only at
 `/mnt/adx-envd-source` and its path is translated for the Linux container.
-Without an override, both architectures fetch inside their Linux builder.
-The pinned checkout uses Git's partial fetch and materializes only envd/shared
-packages plus root metadata. Fetch/checkout timeouts terminate their complete Git
-process group so an HTTPS child cannot keep the build open after a failure.
+Without an override, both architectures download the same pinned archive inside
+their Linux builder. The archive contains upstream public source and is identified
+by both the upstream revision and archive digest; updating the revision requires
+publishing and verifying a new archive and updating the pin.
 The standalone `build/release/build.sh` remains opt-in through `ADX_ENVD_SOURCE`.
 
 | Variable | Default | Applies to / responsibility |
@@ -801,14 +801,10 @@ See the single `docs/testing/test-strategy.html` for dated evidence and scope.
 
 ## Pinned envd acquisition
 
-The Execd component job passes `--git-protocol 2` to
-`build/e2b/build_envd.py` on the pinned Git 2.25.1 builder. The option sets
-`protocol.version=2` only in the new temporary checkout, covering the initial
-fetch and sparse checkout lazy blob fetches. Other callers retain their default
-Git behavior; an explicit `--source` checkout is verified without modification.
-The option requires Git 2.18 or newer. The source revision, six checksums,
-envd version, Go toolchain and fetch/checkout deadlines remain pinned as before.
-The builder logs fetch, materialization and source-verification phases.
+The Execd component job downloads the pinned OBS source archive and verifies its
+size, SHA-256 and selected source checksums before compiling. An explicit
+`ADX_ENVD_SOURCE` checkout is verified without modification. Other callers can
+still fetch the pinned Git revision using `build/e2b/build_envd.py`.
 
 See the [single testing specification](../docs/testing/test-strategy.md) for
 Base232 failures, the isolated diagnostics, and the fresh candidate acceptance
