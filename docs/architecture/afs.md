@@ -516,9 +516,8 @@ bind 与远端访问共享底层文件，新打开的可见性及权限仍需按
 ## 跨节点 Workspace 出口（outlet）
 
 outlet 让集群内任一节点用**同一个平坦名字**访问某 workspace，而数据权威仍在
-Home 节点的本地盘上，不做复制。整体设计见
-[outlet 跨节点规范](../../afs/outlet-cross-node-spec-v2.md)；本节只记录已实现的
-Meta 契约。
+Home 节点的本地盘上，不做复制。每台需要读该名字视图的节点各自跑一份镜像，
+输入都是同一份 Meta 快照。本节只记录已实现的 Meta 契约。
 
 **已实现**：`OwnerRoots.ListActiveOutletRoots` 是 outlet 镜像面的唯一输入，
 返回全局 Active root 全量快照（`root_id`、`root_epoch`、`home_node_id`），

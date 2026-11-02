@@ -4,7 +4,9 @@
 //! 由 Meta 的 Active root 快照驱动收敛。本模块只做本节点内的名字面，
 //! 不涉及数据面挂载，也不签发任何授权。
 //!
-//! 设计要点见 `afs/outlet-cross-node-spec-v2.md`；本文只记录实现契约。
+//! 名字面只发布 `/public/<name>`：调用方用创建时的名字绑定，而不是内部的
+//! `root-<hex(name)>` 编码。名字与 root id 的互转见
+//! `ownerfs::root::{root_id_from_name, root_name_from_id}`。
 
 pub mod live;
 pub mod mirror;
