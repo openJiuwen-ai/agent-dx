@@ -867,80 +867,38 @@ impl DfsReadTransportMetrics {
     }
 }
 
-/// Prepared payload bandwidth samples committed only after successful validation and release.
+/// Observation-only read stage timings. Labels are fixed phases, never node,
+/// chunk or address identities.
 #[derive(Clone)]
-pub struct DfsReadPayloadMetrics {
-    duration: afs_metrics::HistogramVec,
-    bytes: afs_metrics::IntCounterVec,
+pub struct DfsReadPhaseMetrics {
     phase: afs_metrics::HistogramVec,
 }
 
-/// Fixed prepared-read stages; never node, chunk or address labels.
-pub(crate) const PREPARED_READ_PHASES: [&str; 7] = [
+/// Fixed read stages; never node, chunk or address labels.
+pub(crate) const READ_PHASES: [&str; 7] = [
     "prepare", "allocate", "transfer", "scatter", "validate", "release", "buffers",
 ];
 
-impl DfsReadPayloadMetrics {
+impl DfsReadPhaseMetrics {
     pub fn register(
         registry: &afs_metrics::Registry,
     ) -> std::result::Result<Self, afs_metrics::MetricsError> {
         registry.get_or_register(|registry| {
-            let duration = afs_metrics::HistogramVec::new(
-                afs_metrics::HistogramOpts::new(
-                    "afs_dfs_read_payload_seconds",
-                    "Prepared Host-to-Host payload delivery wall time, excluding preparation, validation and release.",
-                ),
-                &["transport", "result"],
-            )?;
-            let bytes = afs_metrics::IntCounterVec::new(
-                afs_metrics::Opts::new(
-                    "afs_dfs_read_payload_bytes_total",
-                    "Validated bytes delivered by prepared payload samples.",
-                ),
-                &["transport"],
-            )?;
             let phase = afs_metrics::HistogramVec::new(
                 afs_metrics::HistogramOpts::new(
                     "afs_dfs_read_phase_seconds",
-                    "Prepared read stage wall time, by transport and fixed phase.",
+                    "Read stage wall time, by transport and fixed phase.",
                 ),
                 &["transport", "phase"],
             )?;
-            afs_metrics::register_collector(registry, &duration)?;
-            afs_metrics::register_collector(registry, &bytes)?;
             afs_metrics::register_collector(registry, &phase)?;
             for transport in ["grpc", "hixl"] {
-                for result in ["ok", "error"] {
-                    duration.with_label_values(&[transport, result]);
-                }
-                bytes.with_label_values(&[transport]);
-                for phase_name in PREPARED_READ_PHASES {
+                for phase_name in READ_PHASES {
                     phase.with_label_values(&[transport, phase_name]);
                 }
             }
-            Ok(Self {
-                duration,
-                bytes,
-                phase,
-            })
+            Ok(Self { phase })
         })
-    }
-
-    pub(crate) fn observe(
-        &self,
-        transport: &'static str,
-        result: &'static str,
-        bytes: usize,
-        elapsed: Duration,
-    ) {
-        self.duration
-            .with_label_values(&[transport, result])
-            .observe(elapsed.as_secs_f64());
-        if result == "ok" {
-            self.bytes
-                .with_label_values(&[transport])
-                .inc_by(bytes as u64);
-        }
     }
 
     pub(crate) fn observe_phase(
@@ -10499,7 +10457,7 @@ mod tests {
     #[test]
     fn prepared_phase_metrics_use_bounded_transport_and_phase_labels() {
         let registry = afs_metrics::Registry::new();
-        let metrics = DfsReadPayloadMetrics::register(&registry).unwrap();
+        let metrics = DfsReadPhaseMetrics::register(&registry).unwrap();
         metrics.observe_phase("grpc", "prepare", Duration::from_millis(2));
         metrics.observe_phase("hixl", "scatter", Duration::from_millis(3));
         let text = afs_metrics::encode_text(&registry).unwrap();
@@ -10624,29 +10582,6 @@ mod tests {
         );
         assert!(
             text.contains("afs_dfs_read_transport_bytes_total{transport=\"grpc\"} 0"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn payload_metrics_count_only_validated_success_bytes() {
-        let registry = afs_metrics::Registry::new();
-        let metrics = DfsReadPayloadMetrics::register(&registry).unwrap();
-        metrics.observe("grpc", "ok", 1024, Duration::from_millis(2));
-        metrics.observe("grpc", "error", 2048, Duration::from_millis(3));
-        let text = afs_metrics::encode_text(&registry).unwrap();
-        assert!(
-            text.contains("afs_dfs_read_payload_bytes_total{transport=\"grpc\"} 1024"),
-            "{text}"
-        );
-        assert!(
-            text.contains("afs_dfs_read_payload_seconds_count{result=\"ok\",transport=\"grpc\"} 1"),
-            "{text}"
-        );
-        assert!(
-            text.contains(
-                "afs_dfs_read_payload_seconds_count{result=\"error\",transport=\"grpc\"} 1"
-            ),
             "{text}"
         );
     }

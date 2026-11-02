@@ -72,12 +72,8 @@ HIXL prepared 路径生效；RDMA 数据面继续使用原逐批预算。seek、
 可见性变化会丢弃预取窗口并重新验证，预取命中的请求不重复计入传输字节。边界见
 [架构说明](../docs/architecture/afs.md)。
 
-带宽对照可显式设置 Node 根配置 `dfs_read_measurement_mode = "prepared-payload"`
-（CLI：`--dfs-read-measurement-mode prepared-payload`），默认 `"baseline"` 保留原流式读取。
-该实验模式支持 `data_mode = "grpc"` 与 HIXL `off`/`required`，拒绝自动回退；
-TCP 使用认证的 Prepare/Fetch/Release，HIXL 在原有准备窗口后计时。共同指标
-`afs_dfs_read_payload_seconds` 与 `afs_dfs_read_payload_bytes_total` 只用校验、释放成功的
-字节计算带宽。
+读取阶段墙钟由 `afs_dfs_read_phase_seconds{transport,phase}` 按 transport 与固定相位记录，
+只用于定位瓶颈，不参与成功判定。
 
 ## 构建入口
 

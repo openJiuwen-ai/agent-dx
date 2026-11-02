@@ -8,7 +8,7 @@ use crate::node::rpc::hixl::batch::{pack_read_batch, pack_read_group};
 use crate::{
     config::HixlDfsReadMode,
     node::{
-        dfs_read::{ChunkTransfer, DfsReadPayloadMetrics, PeerReadBatch, ReadGroupPolicy},
+        dfs_read::{ChunkTransfer, DfsReadPhaseMetrics, PeerReadBatch, ReadGroupPolicy},
         rpc::hixl::{HIXL_PROTOCOL_VERSION, HixlMetrics, Operation, runtime_error},
     },
 };
@@ -47,24 +47,6 @@ type PreparedWindow = (usize, ReadWindow, DfsPrepareReadRangesHixlReply, usize);
 type CompletedWindow = (usize, ReadWindow, Vec<u8>);
 type LaneResult = (usize, ReadWindow, Result<Vec<u8>, WindowFailure>);
 
-struct TimedReadResult {
-    ordinal: usize,
-    window: ReadWindow,
-    reply: DfsPrepareReadRangesHixlReply,
-    lane_id: usize,
-    transfer: Result<HixlReadOutcome, HixlError>,
-    elapsed: Duration,
-}
-
-struct TimedReadSubmission {
-    ordinal: usize,
-    window: ReadWindow,
-    reply: DfsPrepareReadRangesHixlReply,
-    lane_id: usize,
-    native: Arc<dyn ReadLane>,
-    output: Vec<u8>,
-}
-
 /// Native calls are the only replaceable boundary in the reader control path.
 trait ReadLane: Send + Sync {
     fn connect(&self, peer: &str, deadline: Instant) -> Result<(), HixlError>;
@@ -81,13 +63,6 @@ trait ReadLane: Send + Sync {
         length: usize,
         deadline: Instant,
     ) -> Result<Vec<u8>, HixlError>;
-    fn read_timed_into(
-        &self,
-        peer: &str,
-        address: u64,
-        output: Vec<u8>,
-        deadline: Instant,
-    ) -> Result<HixlReadOutcome, HixlError>;
     /// Submits every window through one native SDK batch call.
     fn read_batch_timed_into(
         &self,
@@ -119,16 +94,6 @@ impl ReadLane for HixlRuntime {
 
     fn prepare_read_batch_buffer(&self, length: usize) -> Result<Vec<u8>, HixlError> {
         HixlRuntime::prepare_read_batch_buffer(self, length)
-    }
-
-    fn read_timed_into(
-        &self,
-        peer: &str,
-        address: u64,
-        output: Vec<u8>,
-        deadline: Instant,
-    ) -> Result<HixlReadOutcome, HixlError> {
-        self.read_timed_into(peer, address, output, deadline)
     }
 
     fn read_batch_timed_into(
@@ -805,7 +770,7 @@ struct ReadContext {
     engines: EngineBindings,
     metrics: Option<HixlMetrics>,
     move_metrics: Option<crate::node::dfs_read::DfsReadMoveMetrics>,
-    payload_metrics: Option<DfsReadPayloadMetrics>,
+    phase_metrics: Option<DfsReadPhaseMetrics>,
     group: Option<ReadGroupPolicy>,
     receive_slots: usize,
     session_idle: Option<Duration>,
@@ -856,7 +821,7 @@ impl HixlChunkTransfer {
                 engines: Arc::new(Mutex::new(HashMap::new())),
                 metrics: None,
                 move_metrics: None,
-                payload_metrics: None,
+                phase_metrics: None,
                 group: None,
                 receive_slots: 16,
                 session_idle: None,
@@ -902,10 +867,10 @@ impl HixlChunkTransfer {
         self
     }
 
-    /// Enables prepared HIXL payload measurement. Buffers are reserved before
-    /// each prepared wave's payload interval; the baseline path stays unchanged.
-    pub fn with_payload_metrics(mut self, metrics: DfsReadPayloadMetrics) -> Self {
-        self.context.payload_metrics = Some(metrics);
+    /// Attaches observation-only phase sampling for native windows and the
+    /// control steps around them.
+    pub fn with_phase_metrics(mut self, metrics: DfsReadPhaseMetrics) -> Self {
+        self.context.phase_metrics = Some(metrics);
         self
     }
 
@@ -1078,7 +1043,6 @@ impl HixlChunkTransfer {
         let peer_identity = (node_id.clone(), *node_epoch);
         let cancel = Arc::new(Cancellation::default());
         let output_len = out.len();
-        let prepared = self.context.payload_metrics.is_some();
         let crc = crc_lookup(batch, crc_chunk);
         let result = self.runtime.block_on(async move {
             let command_cancel = cancel.clone();
@@ -1089,7 +1053,6 @@ impl HixlChunkTransfer {
                         address,
                         request,
                         output_len,
-                        prepared,
                         deadline,
                         crc,
                         command_cancel,
@@ -1436,7 +1399,7 @@ impl ReadContext {
     }
 
     fn observe_phase(&self, phase: &'static str, elapsed: Duration) {
-        if let Some(metrics) = &self.payload_metrics {
+        if let Some(metrics) = &self.phase_metrics {
             metrics.observe_phase("hixl", phase, elapsed);
         }
     }
@@ -1831,14 +1794,10 @@ impl ReadContext {
         address: String,
         authority: DfsReadRangesRequest,
         output_len: usize,
-        prepared: bool,
         deadline: Instant,
         crc: Option<CrcLookup>,
         cancel: Arc<Cancellation>,
     ) -> afs_error::Result<ReadResult> {
-        let prepared_output_len = prepared.then_some(output_len);
-        let prepared_measurement = prepared_output_len.is_some();
-        let mut payload_elapsed = Duration::ZERO;
         let mut lease = match self
             .acquire(
                 &peer_identity.0,
@@ -1867,21 +1826,6 @@ impl ReadContext {
             pack_read_group(authority.clone())?
         } else {
             pack_read_batch(authority.clone())?
-        };
-        let payload_bytes = if prepared_measurement {
-            Some(
-                batch
-                    .operations
-                    .iter()
-                    .try_fold(0_usize, |sum, operation| {
-                        usize::try_from(operation.length)
-                            .ok()
-                            .and_then(|length| sum.checked_add(length))
-                            .ok_or_else(|| dfs_protocol_error("HIXL payload byte count overflow"))
-                    })?,
-            )
-        } else {
-            None
         };
         let capacity = parallel_window_capacity(&batch, capacity, lane_count)?;
         let lane = self.bind_lane(&(peer_identity.0.clone(), peer_identity.1, address.clone()));
@@ -1983,7 +1927,6 @@ impl ReadContext {
             let prepared = match prepared {
                 Ok(prepared) => prepared,
                 Err(failure) => {
-                    self.observe_prepared_payload_error(payload_elapsed);
                     report_wave_failure(
                         "prepare",
                         planned.len(),
@@ -1994,32 +1937,19 @@ impl ReadContext {
                     return Err(self.abort_batch(&mut lease, failure).await);
                 }
             };
-            if group_windows.is_some() || prepared_output_len.is_some() {
-                let read = if group_windows.is_some() {
-                    self.read_prepared_group(
+            if group_windows.is_some() {
+                let read = self
+                    .read_prepared_group(
                         &lease.session,
                         prepared,
                         output_len,
                         deadline,
-                        &mut payload_elapsed,
                         crc.as_ref(),
                     )
-                    .await
-                } else {
-                    self.read_prepared_wave(
-                        &lease.session,
-                        prepared,
-                        output_len,
-                        deadline,
-                        &mut payload_elapsed,
-                        crc.as_ref(),
-                    )
-                    .await
-                };
+                    .await;
                 match read {
                     Ok(mut chunks) => prepared_chunks.append(&mut chunks),
                     Err(failure) => {
-                        self.observe_prepared_payload_error(payload_elapsed);
                         report_wave_failure(
                             "read",
                             planned.len(),
@@ -2051,25 +1981,11 @@ impl ReadContext {
             }
         }
         lease.guard.touched = Instant::now();
-        if let Err(error) = remaining(deadline) {
-            self.observe_prepared_payload_error(payload_elapsed);
-            return Err(error);
-        }
-        if let (Some(metrics), Some(bytes)) = (&self.payload_metrics, payload_bytes) {
-            metrics.observe("hixl", "ok", bytes, payload_elapsed);
-        }
-        if group_windows.is_some() || prepared_output_len.is_some() {
+        remaining(deadline)?;
+        if group_windows.is_some() {
             Ok(ReadResult::PreparedComplete(prepared_chunks))
         } else {
             Ok(ReadResult::Complete(completed))
-        }
-    }
-
-    fn observe_prepared_payload_error(&self, elapsed: Duration) {
-        if !elapsed.is_zero()
-            && let Some(metrics) = &self.payload_metrics
-        {
-            metrics.observe("hixl", "error", 0, elapsed);
         }
     }
 
@@ -2328,235 +2244,12 @@ impl ReadContext {
         Ok(bytes)
     }
 
-    async fn read_prepared_wave(
-        &self,
-        session: &PeerSession,
-        prepared: Vec<PreparedWindow>,
-        output_len: usize,
-        deadline: Instant,
-        payload_elapsed: &mut Duration,
-        crc: Option<&CrcLookup>,
-    ) -> Result<Vec<PreparedChunk>, WindowFailure> {
-        let mut submissions = Vec::with_capacity(prepared.len());
-        let mut preparation_failure = None;
-        let buffers_started = Instant::now();
-        for (ordinal, window, reply, lane_id) in &prepared {
-            if let Err(error) = validate_output_scatter(window, output_len) {
-                preparation_failure = Some(WindowFailure::from(error));
-                break;
-            }
-            let Some(native) = self.native.lane(*lane_id) else {
-                preparation_failure = Some(WindowFailure::from(dfs_protocol_error(
-                    "HIXL prepared lane disappeared",
-                )));
-                break;
-            };
-            match native.prepare_read_buffer(window.length) {
-                Ok(output) => submissions.push(TimedReadSubmission {
-                    ordinal: *ordinal,
-                    window: window.clone(),
-                    reply: reply.clone(),
-                    lane_id: *lane_id,
-                    native,
-                    output,
-                }),
-                Err(error) => {
-                    preparation_failure = Some(WindowFailure::from_native(error, false));
-                    break;
-                }
-            }
-        }
-        self.observe_phase("buffers", buffers_started.elapsed());
-        if let Some(mut failure) = preparation_failure {
-            failure.fence_peer |= self.release_not_submitted_wave(session, &prepared).await;
-            return Err(failure);
-        }
-
-        let started = Instant::now();
-        let mut tasks = tokio::task::JoinSet::new();
-        for submission in submissions {
-            let peer = submission.reply.engine_id.clone();
-            tasks.spawn(async move {
-                let TimedReadSubmission {
-                    ordinal,
-                    window,
-                    reply,
-                    lane_id,
-                    native,
-                    output,
-                } = submission;
-                let read_started = Instant::now();
-                let transfer = tokio::task::spawn_blocking(move || {
-                    native.read_timed_into(&peer, reply.address, output, deadline)
-                })
-                .await;
-                let elapsed = read_started.elapsed();
-                match transfer {
-                    Ok(transfer) => Ok(TimedReadResult {
-                        ordinal,
-                        window,
-                        reply,
-                        lane_id,
-                        transfer,
-                        elapsed,
-                    }),
-                    Err(error) => Err(WindowFailure::worker_failed(error.to_string())),
-                }
-            });
-        }
-
-        let mut results = Vec::with_capacity(prepared.len());
-        let mut failure = None;
-        while let Some(joined) = tasks.join_next().await {
-            match joined {
-                Ok(Ok(result)) => results.push(result),
-                Ok(Err(error)) => merge_window_failure(&mut failure, error),
-                Err(error) => merge_window_failure(
-                    &mut failure,
-                    WindowFailure::worker_failed(error.to_string()),
-                ),
-            }
-        }
-
-        // Publish only after every window has been validated, so a failed
-        // window leaves the caller buffer untouched.
-        results.sort_by_key(|result| result.ordinal);
-        let all_transfers_succeeded = failure.is_none()
-            && results.len() == prepared.len()
-            && results.iter().all(|result| result.transfer.is_ok());
-        let lengths_match = all_transfers_succeeded
-            && results.iter().all(|result| {
-                result
-                    .transfer
-                    .as_ref()
-                    .is_ok_and(|outcome| outcome.bytes.len() == result.window.length)
-            });
-        *payload_elapsed = payload_elapsed.saturating_add(started.elapsed());
-
-        for result in &results {
-            self.observe(Operation::Read, result.elapsed, result.transfer.is_ok());
-            self.observe_phase("transfer", result.elapsed);
-            if let Some(metrics) = &self.metrics {
-                metrics.observe_lane_read(result.lane_id, result.elapsed, result.transfer.is_ok());
-            }
-            if let (Some(metrics), Ok(outcome)) = (&self.metrics, &result.transfer) {
-                metrics.observe_read_timing(&outcome.timing);
-            }
-        }
-
-        static EMPTY_BYTES: [u8; 0] = [];
-        let ranges = results
-            .iter()
-            .map(|result| match &result.transfer {
-                Ok(outcome) => (&result.reply, outcome.bytes.as_slice()),
-                Err(_) => (&result.reply, EMPTY_BYTES.as_slice()),
-            })
-            .collect::<Vec<_>>();
-        let mut validations = Vec::with_capacity(results.len());
-        let validate_started = Instant::now();
-        let window_validations = validate_windows(&ranges, crc);
-        self.observe_phase("validate", validate_started.elapsed());
-        for (result, (elapsed, validation)) in results.iter().zip(window_validations) {
-            if result.transfer.is_err() {
-                validations.push(Ok(()));
-                continue;
-            }
-            self.observe(Operation::Validate, elapsed, validation.is_ok());
-            validations.push(validation);
-        }
-        if all_transfers_succeeded && !lengths_match {
-            merge_window_failure(
-                &mut failure,
-                WindowFailure::from(dfs_protocol_error(
-                    "HIXL native READ returned an unexpected buffer length",
-                )),
-            );
-        }
-        let can_publish = lengths_match && validations.iter().all(|validation| validation.is_ok());
-        let mut chunks = Vec::with_capacity(results.len());
-
-        for (result, validation) in results.into_iter().zip(validations) {
-            let window_length = result.window.length;
-            let (release_outcome, transfer_failure) = match &result.transfer {
-                Ok(_) => (DfsHixlReleaseOutcome::Completed, None),
-                Err(error) => (
-                    if error.read_may_be_in_flight {
-                        DfsHixlReleaseOutcome::Unknown
-                    } else {
-                        DfsHixlReleaseOutcome::NotSubmitted
-                    },
-                    Some(error.clone()),
-                ),
-            };
-            let content_validated = result.transfer.is_ok() && validation.is_ok();
-            let mut client = session.client.clone();
-            let release_started = Instant::now();
-            let released = release_window(
-                &mut client,
-                release_request(session, &result.reply, release_outcome, content_validated),
-                self.timeout,
-            )
-            .await;
-            let release_elapsed = release_started.elapsed();
-            self.observe(Operation::Release, release_elapsed, released.is_ok());
-            self.observe_phase("release", release_elapsed);
-            let release_succeeded = released.is_ok();
-
-            if let Some(error) = transfer_failure {
-                merge_window_failure(
-                    &mut failure,
-                    WindowFailure::from_native(error, released.is_err()),
-                );
-            }
-            if let Err(error) = validation {
-                merge_window_failure(&mut failure, WindowFailure::from(error));
-            }
-            if let Err(error) = released {
-                merge_window_failure(&mut failure, WindowFailure::from(error));
-            }
-
-            if content_validated
-                && release_succeeded
-                && let Some(metrics) = &self.metrics
-            {
-                match u64::try_from(window_length) {
-                    Ok(byte_count) => {
-                        metrics.record_validated_bytes(byte_count);
-                        metrics.record_lane_validated_bytes(result.lane_id, byte_count);
-                    }
-                    Err(_) => merge_window_failure(
-                        &mut failure,
-                        WindowFailure::from(dfs_protocol_error("HIXL metric byte count overflow")),
-                    ),
-                }
-            }
-            if can_publish
-                && content_validated
-                && let Ok(outcome) = result.transfer
-            {
-                chunks.push(PreparedChunk {
-                    bytes: outcome.bytes,
-                    windows: vec![result.window],
-                });
-            }
-        }
-
-        match failure {
-            Some(failure) => Err(failure),
-            None => Ok(chunks),
-        }
-    }
-
-    /// One native SDK call over every prepared window of a single lane. Each
-    /// window keeps its own checksum and release record; the validated native
-    /// buffer is returned for one scatter into the caller output.
     async fn read_prepared_group(
         &self,
         session: &PeerSession,
         prepared: Vec<PreparedWindow>,
         output_len: usize,
         deadline: Instant,
-        payload_elapsed: &mut Duration,
         crc: Option<&CrcLookup>,
     ) -> Result<Vec<PreparedChunk>, WindowFailure> {
         let Some((_, _, first_reply, lane_id)) = prepared.first() else {
@@ -2608,7 +2301,6 @@ impl ReadContext {
         })
         .await;
         let elapsed = started.elapsed();
-        *payload_elapsed = payload_elapsed.saturating_add(elapsed);
         self.observe_phase("transfer", elapsed);
 
         let outcome = match transfer {
@@ -4337,25 +4029,6 @@ mod tests {
                 Ok(output)
             }
 
-            fn read_timed_into(
-                &self,
-                peer: &str,
-                address: u64,
-                mut output: Vec<u8>,
-                deadline: Instant,
-            ) -> Result<HixlReadOutcome, HixlError> {
-                let bytes = self.read(peer, address, output.len(), deadline)?;
-                output.copy_from_slice(&bytes);
-                Ok(HixlReadOutcome {
-                    bytes: output,
-                    timing: afs_transport::hixl::HixlReadTiming {
-                        owner_queue: Duration::from_micros(1),
-                        sdk_transfer: Some(Duration::from_micros(2)),
-                        output_copy: Some(Duration::from_micros(1)),
-                    },
-                })
-            }
-
             fn read_batch_timed_into(
                 &self,
                 peer: &str,
@@ -5378,17 +5051,9 @@ mod tests {
                 prepared.push((ordinal, window, reply, 0_usize));
             }
             let mut output = vec![0_u8; 8];
-            let mut payload = Duration::ZERO;
             let chunks = expect_window(
                 context
-                    .read_prepared_group(
-                        &session,
-                        prepared,
-                        output.len(),
-                        deadline,
-                        &mut payload,
-                        None,
-                    )
+                    .read_prepared_group(&session, prepared, output.len(), deadline, None)
                     .await,
                 "group native read",
             );
@@ -5396,7 +5061,6 @@ mod tests {
 
             assert_eq!(output, b"abcdefgh");
             assert_eq!(native.batch_reads.load(Ordering::SeqCst), 1);
-            assert!(payload > Duration::ZERO);
             let sessions = source_hixl::test_support::sessions(&source);
             assert_eq!(sessions.len(), 1);
             assert_eq!(sessions[0].prepared_bytes, 0);
@@ -5411,7 +5075,7 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn baseline_group_aggregates_one_native_batch_without_payload_metrics() {
+        async fn baseline_group_aggregates_one_native_batch() {
             use crate::node::dfs_read::ReadGroupPolicy;
             let Harness {
                 _temp,
@@ -5452,16 +5116,14 @@ mod tests {
                 .node_data_endpoint()
                 .unwrap()
                 .to_owned();
-            // The baseline path carries no payload metrics, yet a grouped wave
-            // must still submit one Prepare round trip and one native batch
-            // instead of one SDK read per window.
+            // A grouped wave must still submit one Prepare round trip and one
+            // native batch instead of one SDK read per window.
             let result = context
                 .read_batch(
                     (node_id.clone(), *node_epoch),
                     address,
                     authority,
                     8,
-                    false,
                     deadline,
                     None,
                     Arc::new(Cancellation::default()),
@@ -5552,17 +5214,9 @@ mod tests {
                 "both windows share one verified parent snapshot"
             );
             let mut output = vec![0_u8; 8];
-            let mut payload = Duration::ZERO;
             let chunks = expect_window(
                 context
-                    .read_prepared_group(
-                        &session,
-                        prepared,
-                        output.len(),
-                        deadline,
-                        &mut payload,
-                        None,
-                    )
+                    .read_prepared_group(&session, prepared, output.len(), deadline, None)
                     .await,
                 "group native read",
             );
@@ -5574,184 +5228,6 @@ mod tests {
             assert_eq!(sessions[0].prepared_bytes, 0);
             assert!(native.memory.lock().unwrap().active.is_empty());
             drop(lease);
-            stop.send(()).unwrap();
-            tokio::time::timeout(Duration::from_secs(1), server)
-                .await
-                .unwrap()
-                .unwrap();
-        }
-
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn prepared_payload_metrics_cover_native_wave_and_caller_scatter() {
-            let Harness {
-                _temp,
-                native,
-                source,
-                reader,
-                mut batch,
-                stop,
-                server,
-                ..
-            } = harness().await;
-            batch.operations[0].op.length = 4;
-            let registry = afs_metrics::Registry::new();
-            let payload_metrics = DfsReadPayloadMetrics::register(&registry).unwrap();
-            let reader = Arc::new(
-                HixlChunkTransfer::from_runtime(
-                    reader.context.peers.clone(),
-                    Arc::new(ReaderNative {
-                        boundary: native.clone(),
-                        lanes: 2,
-                        window_bytes: 2,
-                    }),
-                    HixlDfsReadMode::Required,
-                    Duration::from_secs(5),
-                )
-                .unwrap()
-                .with_payload_metrics(payload_metrics),
-            );
-            let output = tokio::task::spawn_blocking(move || {
-                let mut output = vec![b'!'; 10];
-                reader.read_ranges(&batch, &mut output).unwrap();
-                output
-            })
-            .await
-            .unwrap();
-
-            assert_eq!(output, b"!abcd!!!!!");
-            let families: HashMap<_, _> = registry
-                .gather()
-                .into_iter()
-                .map(|family| (family.name().to_owned(), family))
-                .collect();
-            let payload = &families["afs_dfs_read_payload_seconds"];
-            let successful_payload = payload
-                .get_metric()
-                .iter()
-                .find(|metric| {
-                    metric
-                        .get_label()
-                        .iter()
-                        .any(|label| label.name() == "transport" && label.value() == "hixl")
-                        && metric
-                            .get_label()
-                            .iter()
-                            .any(|label| label.name() == "result" && label.value() == "ok")
-                })
-                .unwrap();
-            assert_eq!(successful_payload.get_histogram().get_sample_count(), 1);
-            assert_eq!(
-                families["afs_dfs_read_payload_bytes_total"]
-                    .get_metric()
-                    .iter()
-                    .find(|metric| {
-                        metric
-                            .get_label()
-                            .iter()
-                            .any(|label| label.name() == "transport" && label.value() == "hixl")
-                    })
-                    .unwrap()
-                    .get_counter()
-                    .get_value(),
-                4.0
-            );
-            let sessions = source_hixl::test_support::sessions(&source);
-            assert_eq!(sessions.len(), 1);
-            assert_eq!(sessions[0].prepared_bytes, 0);
-            assert_eq!(sessions[0].active_windows, 0);
-            assert!(native.memory.lock().unwrap().active.is_empty());
-            stop.send(()).unwrap();
-            tokio::time::timeout(Duration::from_secs(1), server)
-                .await
-                .unwrap()
-                .unwrap();
-        }
-
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn prepared_payload_failure_has_no_success_bytes_or_publication() {
-            let Harness {
-                _temp,
-                native,
-                source,
-                reader,
-                batch,
-                stop,
-                server,
-                ..
-            } = harness().await;
-            let registry = afs_metrics::Registry::new();
-            let payload_metrics = DfsReadPayloadMetrics::register(&registry).unwrap();
-            let reader = Arc::new(
-                HixlChunkTransfer::from_runtime(
-                    reader.context.peers.clone(),
-                    Arc::new(ReaderNative {
-                        boundary: native.clone(),
-                        lanes: 2,
-                        window_bytes: 2,
-                    }),
-                    HixlDfsReadMode::Required,
-                    Duration::from_secs(5),
-                )
-                .unwrap()
-                .with_payload_metrics(payload_metrics),
-            );
-            let (result, output) = tokio::task::spawn_blocking(move || {
-                let mut output = vec![b'!'; 10];
-                let result = reader.read_ranges(&batch, &mut output);
-                (result, output)
-            })
-            .await
-            .unwrap();
-
-            assert_eq!(
-                result.unwrap_err().code(),
-                afs_error::NODE_TRANSFER_RESOURCE_EXHAUSTED
-            );
-            assert_eq!(output, b"!!!!!!!!!!");
-            let families: HashMap<_, _> = registry
-                .gather()
-                .into_iter()
-                .map(|family| (family.name().to_owned(), family))
-                .collect();
-            let samples = &families["afs_dfs_read_payload_seconds"];
-            let count_for =
-                |transport: &str, result: &str| {
-                    samples
-                        .get_metric()
-                        .iter()
-                        .find(|metric| {
-                            metric.get_label().iter().any(|label| {
-                                label.name() == "transport" && label.value() == transport
-                            }) && metric
-                                .get_label()
-                                .iter()
-                                .any(|label| label.name() == "result" && label.value() == result)
-                        })
-                        .unwrap()
-                        .get_histogram()
-                        .get_sample_count()
-                };
-            assert_eq!(count_for("hixl", "ok"), 0);
-            assert_eq!(count_for("hixl", "error"), 1);
-            let hixl_bytes = families["afs_dfs_read_payload_bytes_total"]
-                .get_metric()
-                .iter()
-                .find(|metric| {
-                    metric
-                        .get_label()
-                        .iter()
-                        .any(|label| label.name() == "transport" && label.value() == "hixl")
-                })
-                .unwrap()
-                .get_counter()
-                .get_value();
-            assert_eq!(hixl_bytes, 0.0);
-            let sessions = source_hixl::test_support::sessions(&source);
-            assert_eq!(sessions.len(), 1);
-            assert!(sessions[0].closed);
-            assert_eq!(sessions[0].prepared_bytes, 0);
-            assert_eq!(sessions[0].active_windows, 0);
-            assert!(native.memory.lock().unwrap().active.is_empty());
             stop.send(()).unwrap();
             tokio::time::timeout(Duration::from_secs(1), server)
                 .await

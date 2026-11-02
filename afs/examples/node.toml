@@ -61,8 +61,6 @@ dfs_fuse_read_mode = "cached"
 # default; 4096..=8388608 in 4096-byte steps. The kernel may clamp it, and the
 # observed READ distribution must be checked from FUSE metrics.
 dfs_fuse_max_io_bytes = 1048576
-# Opt-in prepared Host-to-Host payload measurement; baseline preserves streaming.
-dfs_read_measurement_mode = "baseline"
 # Sequential read aggregation: off (default) or sequential. When enabled, a
 # direct read-ahead group of dfs_read_group_bytes is prefetched per handle and
 # may be submitted as one native HIXL batch. Ranges: 1..=128 MiB, 4096-aligned.

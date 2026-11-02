@@ -29,14 +29,6 @@ pub enum DfsFuseReadMode {
     Cached,
     Direct,
 }
-/// Explicit boundary for DFS transport bandwidth experiments.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "kebab-case")]
-pub enum DfsReadMeasurementMode {
-    #[default]
-    Baseline,
-    PreparedPayload,
-}
 /// Optional immutable DFS read transport. Replication and OwnerFs retain data_mode.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -640,9 +632,6 @@ pub struct Cli {
     /// DFS FUSE INIT request-capacity target in bytes; CLI overrides TOML.
     #[arg(long)]
     pub dfs_fuse_max_io_bytes: Option<u32>,
-    /// Prepare source data before timing transport payload delivery.
-    #[arg(long, value_enum)]
-    pub dfs_read_measurement_mode: Option<DfsReadMeasurementMode>,
     /// Filesystem-wide immutable DFS replica target count. Applied by Meta at initialization.
     #[arg(long)]
     pub dfs_desired_copies: Option<u16>,
@@ -821,7 +810,6 @@ struct FileConfig {
     dfs_write_buffer_idle_bytes: Option<u64>,
     dfs_fuse_read_mode: Option<DfsFuseReadMode>,
     dfs_fuse_max_io_bytes: Option<u32>,
-    dfs_read_measurement_mode: Option<DfsReadMeasurementMode>,
     dfs_desired_copies: Option<u16>,
     dfs_sync_required_copies: Option<u16>,
     dfs_min_distinct_nodes: Option<u16>,
@@ -943,7 +931,6 @@ pub struct Config {
     pub dfs_write_buffer_idle_bytes: u64,
     pub dfs_fuse_read_mode: DfsFuseReadMode,
     pub dfs_fuse_max_io_bytes: u32,
-    pub dfs_read_measurement_mode: DfsReadMeasurementMode,
     pub dfs_desired_copies: u16,
     pub dfs_sync_required_copies: u16,
     pub dfs_min_distinct_nodes: u16,
@@ -1489,10 +1476,6 @@ impl Config {
                 .or(file.dfs_fuse_read_mode)
                 .unwrap_or_default(),
             dfs_fuse_max_io_bytes,
-            dfs_read_measurement_mode: cli
-                .dfs_read_measurement_mode
-                .or(file.dfs_read_measurement_mode)
-                .unwrap_or_default(),
             dfs_desired_copies,
             dfs_sync_required_copies,
             dfs_min_distinct_nodes,
@@ -1747,13 +1730,6 @@ impl Config {
         cfg.meta_log_limits()?;
         cfg.meta_maintenance_policy()?;
         cfg.meta_history_limits()?;
-        if cfg.dfs_read_measurement_mode == DfsReadMeasurementMode::PreparedPayload
-            && (cfg.data_mode != "grpc" || cfg.hixl.dfs_read_mode == HixlDfsReadMode::Preferred)
-        {
-            return Err(invalid(
-                "prepared-payload requires data_mode=grpc and HIXL off or required, without fallback",
-            ));
-        }
         cfg.hixl.validate(
             role,
             cfg.dfs,

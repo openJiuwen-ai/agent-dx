@@ -2500,37 +2500,6 @@ fn dfs_fuse_max_io_bytes_cannot_exceed_the_dfs_inflight_budget() {
 }
 
 #[test]
-fn prepared_payload_measurement_is_explicit_and_rejects_ambiguous_transport() {
-    let baseline = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
-    assert_eq!(
-        serde_json::to_value(baseline).unwrap()["dfs_read_measurement_mode"],
-        "baseline"
-    );
-    let prepared = Cli::try_parse_from([
-        "afs-node",
-        "--dfs-read-measurement-mode",
-        "prepared-payload",
-    ])
-    .unwrap();
-    let prepared = Config::resolve(Role::Node, prepared).unwrap();
-    assert_eq!(
-        serde_json::to_value(prepared).unwrap()["dfs_read_measurement_mode"],
-        "prepared-payload"
-    );
-    for mode in ["auto", "rdma"] {
-        let cli = Cli::try_parse_from([
-            "afs-node",
-            "--dfs-read-measurement-mode",
-            "prepared-payload",
-            "--data-mode",
-            mode,
-        ])
-        .unwrap();
-        assert!(Config::resolve(Role::Node, cli).is_err());
-    }
-}
-
-#[test]
 fn dfs_read_group_defaults_and_rejects_invalid_budgets() {
     let cfg = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
     let printed = serde_json::to_value(&cfg).unwrap();

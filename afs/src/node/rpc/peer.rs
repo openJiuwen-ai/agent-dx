@@ -37,8 +37,6 @@ use crate::{
     },
 };
 pub mod hixl;
-#[cfg(feature = "dfs")]
-mod prepared;
 
 #[cfg(any(feature = "ownerfs", feature = "dfs", feature = "rdma", test))]
 use std::sync::Arc;
@@ -1228,10 +1226,8 @@ pub struct GrpcChunkTransfer {
     timeout: Duration,
     next_read: std::sync::atomic::AtomicU64,
     move_metrics: Option<crate::node::dfs_read::DfsReadMoveMetrics>,
-    payload_metrics: Option<crate::node::dfs_read::DfsReadPayloadMetrics>,
-    /// Observation-only phase sampling for the plain streaming path; unlike
-    /// `payload_metrics` it never selects the prepared-payload route.
-    phase_metrics: Option<crate::node::dfs_read::DfsReadPayloadMetrics>,
+    /// Observation-only phase sampling for the streaming read path.
+    phase_metrics: Option<crate::node::dfs_read::DfsReadPhaseMetrics>,
     group_bytes: Option<u64>,
 }
 
@@ -1261,7 +1257,6 @@ impl GrpcChunkTransfer {
             open_read_peers,
             fast_open_ready: std::sync::Mutex::new(std::collections::HashSet::new()),
             move_metrics: None,
-            payload_metrics: None,
             phase_metrics: None,
             group_bytes: None,
         })
@@ -1273,14 +1268,6 @@ impl GrpcChunkTransfer {
         self
     }
 
-    pub fn with_payload_metrics(
-        mut self,
-        metrics: crate::node::dfs_read::DfsReadPayloadMetrics,
-    ) -> Self {
-        self.payload_metrics = Some(metrics);
-        self
-    }
-
     /// Attaches the shared payload-movement measurement handle. Without it the
     /// transport keeps its previous behaviour and records no movement samples.
     pub fn with_move_metrics(mut self, metrics: crate::node::dfs_read::DfsReadMoveMetrics) -> Self {
@@ -1288,11 +1275,10 @@ impl GrpcChunkTransfer {
         self
     }
 
-    /// Attaches observation-only phase sampling for the plain streaming path.
-    /// Selection of the prepared-payload route stays tied to `payload_metrics`.
+    /// Attaches observation-only phase sampling for the streaming read path.
     pub fn with_phase_metrics(
         mut self,
-        metrics: crate::node::dfs_read::DfsReadPayloadMetrics,
+        metrics: crate::node::dfs_read::DfsReadPhaseMetrics,
     ) -> Self {
         self.phase_metrics = Some(metrics);
         self
@@ -1399,12 +1385,6 @@ impl GrpcChunkTransfer {
                 let mut client = DfsChunksClient::new(channel)
                     .max_encoding_message_size(self.peers.config.max_encoding_message_bytes)
                     .max_decoding_message_size(self.peers.config.max_decoding_message_bytes);
-                if chunk.is_none()
-                    && let Some(metrics) = &self.payload_metrics
-                {
-                    prepared::read(&mut client, &request, out, self.timeout, metrics).await?;
-                    return Ok(None);
-                }
                 let mut rpc_request = request_with_current_context(request.clone());
                 rpc_request.set_timeout(timeout);
                 if let Some(metrics) = &self.peers.read_work_metrics {
@@ -3028,7 +3008,7 @@ async fn consume_peer_read_stream<'a, S>(
     mut stream: S,
     metrics: Option<&ReadWorkMetrics>,
     move_metrics: Option<&crate::node::dfs_read::DfsReadMoveMetrics>,
-    phase_metrics: Option<&crate::node::dfs_read::DfsReadPayloadMetrics>,
+    phase_metrics: Option<&crate::node::dfs_read::DfsReadPhaseMetrics>,
     proof_budget: Option<Arc<OutboardBudget>>,
 ) -> afs_error::Result<Option<VerifiedPeerChunk<'a>>>
 where
@@ -3094,7 +3074,6 @@ struct ReadFrameDecoder<'a> {
     producer_outboard_installed: bool,
     root_mode: PeerRootMode,
     work_metrics: Option<ReadWorkMetrics>,
-    deferred: Option<Vec<afs_protocol::node_data::DfsReadRangesCompletion>>,
 }
 
 #[cfg(feature = "dfs")]
@@ -3159,36 +3138,7 @@ impl<'a> ReadFrameDecoder<'a> {
             producer_outboard_installed: false,
             root_mode: PeerRootMode::Producer,
             work_metrics: None,
-            deferred: None,
         }
-    }
-
-    fn prepared(request: &'a DfsReadRangesRequest) -> Self {
-        let mut decoder = Self::new(request);
-        decoder.deferred = Some(Vec::with_capacity(request.operations.len()));
-        decoder
-    }
-
-    fn finish_prepared(mut self, out: &[u8]) -> afs_error::Result<()> {
-        let completions = self
-            .deferred
-            .take()
-            .ok_or_else(|| dfs_protocol_error("decoder is not prepared"))?;
-        for completion in completions {
-            let op = &self.request.operations[completion.operation_index as usize];
-            let start = usize::try_from(op.destination_offset)
-                .map_err(|_| dfs_protocol_error("destination overflow"))?;
-            let length =
-                usize::try_from(op.length).map_err(|_| dfs_protocol_error("length overflow"))?;
-            let bytes = start
-                .checked_add(length)
-                .and_then(|end| out.get(start..end))
-                .ok_or_else(|| dfs_protocol_error("prepared range exceeds private buffer"))?;
-            if blake3::hash(bytes).as_bytes().as_slice() != completion.range_checksum {
-                return Err(dfs_corrupt_error("prepared payload checksum mismatch"));
-            }
-        }
-        self.finish()
     }
 
     fn for_object(
@@ -3420,8 +3370,7 @@ impl<'a> ReadFrameDecoder<'a> {
                     start,
                     end,
                     cursor: start,
-                    checksum: (self.deferred.is_none()
-                        && !self.producer_root_pending
+                    checksum: (!self.producer_root_pending
                         && self.root_mode == PeerRootMode::Producer)
                         .then(blake3::Hasher::new),
                 });
@@ -3449,9 +3398,7 @@ impl<'a> ReadFrameDecoder<'a> {
                     ));
                 }
                 let digest =
-                    if self.deferred.is_some() {
-                        None
-                    } else if self.producer_root_pending {
+                    if self.producer_root_pending {
                         Some(blake3::Hash::from(
                             <[u8; 32]>::try_from(completion.range_checksum.as_slice()).map_err(
                                 |_| dfs_corrupt_error("peer read completion checksum mismatch"),
@@ -3490,9 +3437,6 @@ impl<'a> ReadFrameDecoder<'a> {
                     }
                 }
                 self.completed[active.index] = true;
-                if let Some(completions) = &mut self.deferred {
-                    completions.push(completion);
-                }
             }
             None => return Err(dfs_protocol_error("empty peer frame")),
         }
@@ -3978,7 +3922,7 @@ fn validate_dfs_rdma_read_reply(
 fn grpc_with_move_metrics(
     transfer: GrpcChunkTransfer,
     metrics: Option<crate::node::dfs_read::DfsReadMoveMetrics>,
-    phase_metrics: Option<crate::node::dfs_read::DfsReadPayloadMetrics>,
+    phase_metrics: Option<crate::node::dfs_read::DfsReadPhaseMetrics>,
 ) -> GrpcChunkTransfer {
     let transfer = match metrics {
         Some(metrics) => transfer.with_move_metrics(metrics),
@@ -3997,7 +3941,7 @@ pub fn make_chunk_transfer(
     timeout: Duration,
     rdma: Option<Arc<DfsRdmaPool>>,
     move_metrics: Option<crate::node::dfs_read::DfsReadMoveMetrics>,
-    phase_metrics: Option<crate::node::dfs_read::DfsReadPayloadMetrics>,
+    phase_metrics: Option<crate::node::dfs_read::DfsReadPhaseMetrics>,
 ) -> afs_error::Result<Arc<dyn crate::node::dfs_read::ChunkTransfer>> {
     match mode {
         DataMode::Rdma => Ok(Arc::new(RdmaChunkTransfer::new(
@@ -7309,32 +7253,6 @@ mod tests {
                     > + Send,
             >,
         >;
-        type FetchPreparedReadStream = std::pin::Pin<
-            Box<
-                dyn tokio_stream::Stream<
-                        Item = Result<afs_protocol::node_data::DfsReadRangesFrame, Status>,
-                    > + Send,
-            >,
-        >;
-        async fn prepare_read_ranges(
-            &self,
-            _request: Request<DfsReadRangesRequest>,
-        ) -> Result<Response<afs_protocol::node_data::DfsPreparedReadReply>, Status> {
-            Err(Status::unimplemented("unused fixture RPC"))
-        }
-        async fn fetch_prepared_read(
-            &self,
-            _request: Request<afs_protocol::node_data::DfsFetchPreparedReadRequest>,
-        ) -> Result<Response<Self::FetchPreparedReadStream>, Status> {
-            Err(Status::unimplemented("unused fixture RPC"))
-        }
-        async fn release_prepared_read(
-            &self,
-            _request: Request<afs_protocol::node_data::DfsReleasePreparedReadRequest>,
-        ) -> Result<Response<afs_protocol::node_data::DfsReleasePreparedReadReply>, Status>
-        {
-            Err(Status::unimplemented("unused fixture RPC"))
-        }
         async fn negotiate_hixl(
             &self,
             _request: Request<afs_protocol::node_data::DfsNegotiateHixlRequest>,
@@ -10376,7 +10294,7 @@ mod tests {
             .collect();
         let (chunk, request, frames) = verified_object_frames(&body);
         let registry = afs_metrics::Registry::new();
-        let payload = crate::node::dfs_read::DfsReadPayloadMetrics::register(&registry).unwrap();
+        let payload = crate::node::dfs_read::DfsReadPhaseMetrics::register(&registry).unwrap();
         let mut out = vec![0; body.len()];
         let verified = consume_peer_read_stream(
             &request,
@@ -10398,14 +10316,6 @@ mod tests {
             quote = '"',
         );
         assert!(text.contains(&verify_line), "{text}");
-        // Observation-only sampling must not record prepared-payload delivery
-        // samples for the plain streaming path.
-        assert!(
-            text.contains(
-                "afs_dfs_read_payload_seconds_count{result=\"ok\",transport=\"grpc\"} 0\n"
-            ),
-            "{text}"
-        );
     }
     #[cfg(feature = "dfs")]
     #[tokio::test]
@@ -10554,23 +10464,6 @@ mod tests {
             );
             assert_eq!(LegacyFrame::decode(new_wire.as_slice()).unwrap(), legacy);
         }
-    }
-
-    #[cfg(feature = "dfs")]
-    #[test]
-    fn prepared_decoder_defers_hashing_but_rejects_corrupt_private_payload() {
-        let request = range_request();
-        let mut out = vec![0; 32];
-        let mut decoder = ReadFrameDecoder::prepared(&request);
-        for mut frame in (0..2).flat_map(|index| range_frames(&request, index)) {
-            if let Some(dfs_read_ranges_frame::Body::Data(bytes)) = frame.body.as_mut() {
-                let mut corrupted = bytes.to_vec();
-                corrupted[0] ^= 1;
-                *bytes = corrupted.into();
-            }
-            decoder.accept(frame, &mut out).unwrap();
-        }
-        assert!(decoder.finish_prepared(&out).is_err());
     }
 
     #[cfg(feature = "dfs")]

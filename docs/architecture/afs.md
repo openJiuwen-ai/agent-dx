@@ -113,15 +113,9 @@ DFS batch，不从配置或 INIT 记录推导。
 `afs_fuse_callback_size_bytes{filesystem,operation}` 记录内核回调字节数的直方图，
 包含失败回调；其 sum 不是成功读取字节数，INIT 日志中的上限也不是实际请求分布。
 
-DFS 传输计量默认 `dfs_read_measurement_mode = "baseline"`。显式的实验模式
-`"prepared-payload"` 为 TCP 增加经同一 mTLS/grant 授权的 Prepare/Fetch/Release：
-Prepare 完成不可变快照与范围 checksum，Fetch 单次消费，Release 幂等确认回收。
-TCP 快照独立限制为 128 MiB/批、8 项/256 MiB，准备与传输持有预算至实际数据释放；
-Ready 租约最多 5 秒且不超过 grant 过期时间。它不复用 HIXL 会话权威或独立 64 MiB
-快照预算。两条 reader 路径在源准备和接收分配完成后，计量到私有 Host 缓冲的数据交付；
-HIXL 按 wave 墙钟累计为 batch 样本，校验、释放成功后提交指标与数据。该模式要求
-`data_mode = "grpc"` 且 HIXL 为 off/required，拒绝 fallback 歧义；不改变现有 lane
-调度及逐请求完整性验证。
+读取阶段墙钟由 `afs_dfs_read_phase_seconds{transport,phase}` 按 transport 与固定相位
+（prepare、allocate、transfer、scatter、validate、release、buffers）记录，只用于定位
+瓶颈，不改变读取结果与成功判定。
 
 顺序预读组由根配置 `dfs_read_group_mode = "sequential"` 开启，默认 `"off"` 保持原路径。
 只读 direct 句柄收到连续读时，把当前需求及其后最多 `dfs_read_group_bytes` 的连续范围

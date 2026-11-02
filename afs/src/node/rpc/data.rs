@@ -46,14 +46,13 @@ pub mod prepared;
 #[cfg(feature = "dfs")]
 use afs_protocol::node_data::{
     DfsCloseHixlReply, DfsCloseHixlRequest, DfsCloseRdmaReply, DfsCloseRdmaRequest,
-    DfsConfirmReplicaRequest, DfsFetchPreparedReadRequest, DfsNegotiateHixlReply,
-    DfsNegotiateHixlRequest, DfsNegotiateRdmaReply, DfsNegotiateRdmaRequest,
-    DfsPrepareReadRangesHixlGroupReply, DfsPrepareReadRangesHixlGroupRequest,
-    DfsPrepareReadRangesHixlReply, DfsPrepareReadRangesHixlRequest, DfsPreparedReadReply,
-    DfsPutReplicaFrame, DfsPutReplicaRdmaRequest, DfsPutReplicaReply, DfsReadRangesCompletion,
-    DfsReadRangesFrame, DfsReadRangesHeader, DfsReadRangesRdmaReply, DfsReadRangesRdmaRequest,
-    DfsReadRangesRequest, DfsReleaseHixlReadReply, DfsReleaseHixlReadRequest,
-    DfsReleasePreparedReadReply, DfsReleasePreparedReadRequest, DfsReplicaAck,
+    DfsConfirmReplicaRequest, DfsNegotiateHixlReply, DfsNegotiateHixlRequest,
+    DfsNegotiateRdmaReply, DfsNegotiateRdmaRequest, DfsPrepareReadRangesHixlGroupReply,
+    DfsPrepareReadRangesHixlGroupRequest, DfsPrepareReadRangesHixlReply,
+    DfsPrepareReadRangesHixlRequest, DfsPutReplicaFrame, DfsPutReplicaRdmaRequest,
+    DfsPutReplicaReply, DfsReadRangesCompletion, DfsReadRangesFrame, DfsReadRangesHeader,
+    DfsReadRangesRdmaReply, DfsReadRangesRdmaRequest, DfsReadRangesRequest,
+    DfsReleaseHixlReadReply, DfsReleaseHixlReadRequest, DfsReplicaAck,
     dfs_chunks_server::{DfsChunks, DfsChunksServer},
     dfs_read_ranges_frame,
 };
@@ -553,7 +552,6 @@ pub struct DfsChunksService {
     rdma_sessions: super::control::RdmaSessionRegistry,
     payload_metrics: Option<DfsPayloadMetrics>,
     hixl: Option<Arc<hixl::HixlReadService>>,
-    prepared_reads: Arc<prepared::PreparedReadRegistry>,
 }
 
 /// Verifies grant authenticity, caller epoch, namespace/version/layout membership
@@ -936,7 +934,6 @@ pub fn make_dfs_chunks_server_with_transport(
         rdma_sessions: resources.rdma_sessions,
         payload_metrics: resources.payload_metrics,
         hixl: resources.hixl,
-        prepared_reads: Arc::new(prepared::PreparedReadRegistry::new()),
     })
 }
 
@@ -958,30 +955,6 @@ impl DfsChunks for DfsChunksService {
 
     type ReadRangesStream =
         Pin<Box<dyn Stream<Item = Result<DfsReadRangesFrame, Status>> + Send + 'static>>;
-    type FetchPreparedReadStream =
-        Pin<Box<dyn Stream<Item = Result<DfsReadRangesFrame, Status>> + Send + 'static>>;
-
-    async fn prepare_read_ranges(
-        &self,
-        request: Request<DfsReadRangesRequest>,
-    ) -> Result<Response<DfsPreparedReadReply>, Status> {
-        self.prepare_prepared_read(request).await
-    }
-
-    async fn fetch_prepared_read(
-        &self,
-        request: Request<DfsFetchPreparedReadRequest>,
-    ) -> Result<Response<Self::FetchPreparedReadStream>, Status> {
-        self.fetch_prepared_read_snapshot(request).await
-    }
-
-    async fn release_prepared_read(
-        &self,
-        request: Request<DfsReleasePreparedReadRequest>,
-    ) -> Result<Response<DfsReleasePreparedReadReply>, Status> {
-        self.release_prepared_read_snapshot(request).await
-    }
-
     async fn put_replica_stream(
         &self,
         request: Request<tonic::Streaming<DfsPutReplicaFrame>>,
@@ -7821,7 +7794,6 @@ mod tests {
             rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
             payload_metrics: None,
             hixl: None,
-            prepared_reads: Arc::new(prepared::PreparedReadRegistry::new()),
         }
     }
 
@@ -7886,7 +7858,6 @@ mod tests {
             rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
             payload_metrics: None,
             hixl: None,
-            prepared_reads: Arc::new(prepared::PreparedReadRegistry::new()),
         };
         assert!(
             denied
@@ -7909,7 +7880,6 @@ mod tests {
             rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
             payload_metrics: None,
             hixl: None,
-            prepared_reads: Arc::new(prepared::PreparedReadRegistry::new()),
         };
         let mut stream = allowed
             .read_ranges(Request::new(request))
@@ -8009,7 +7979,6 @@ mod tests {
             rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
             payload_metrics: None,
             hixl: None,
-            prepared_reads: Arc::new(prepared::PreparedReadRegistry::new()),
         };
 
         let status = service

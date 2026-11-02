@@ -54,9 +54,6 @@ service DfsChunks {
   rpc PutReplicaRdma(DfsPutReplicaRdmaRequest) returns (DfsPutReplicaReply);
   rpc ConfirmReplica(DfsConfirmReplicaRequest) returns (DfsReplicaAck);
   rpc ReadRanges(DfsReadRangesRequest) returns (stream DfsReadRangesFrame);
-  rpc PrepareReadRanges(DfsReadRangesRequest) returns (DfsPreparedReadReply);
-  rpc FetchPreparedRead(DfsFetchPreparedReadRequest) returns (stream DfsReadRangesFrame);
-  rpc ReleasePreparedRead(DfsReleasePreparedReadRequest) returns (DfsReleasePreparedReadReply);
   rpc NegotiateRdma(DfsNegotiateRdmaRequest) returns (DfsNegotiateRdmaReply);
   rpc CloseRdma(DfsCloseRdmaRequest) returns (DfsCloseRdmaReply);
   rpc ReadRangesRdma(DfsReadRangesRdmaRequest) returns (DfsReadRangesRdmaReply);
@@ -401,32 +398,6 @@ message DfsReadRangesRequest {
   // Only a full-object reader holding the trusted Meta ChunkObject requests
   // optional outboard metadata. Ordinary and legacy reads keep this false.
   bool include_blake3_outboard = 7;
-}
-
-// A bounded, authenticated source snapshot. Preparation returns completions
-// before any payload is sent; FetchPreparedRead consumes the opaque ID once.
-message DfsPreparedReadReply {
-  string prepared_read_id = 1;
-  string read_id = 2;
-  string attempt_id = 3;
-  uint64 packed_length = 4;
-  repeated DfsReadRangesCompletion completions = 5;
-}
-
-message DfsFetchPreparedReadRequest {
-  string prepared_read_id = 1;
-  string read_id = 2;
-  string attempt_id = 3;
-}
-
-message DfsReleasePreparedReadRequest {
-  string prepared_read_id = 1;
-  string read_id = 2;
-  string attempt_id = 3;
-}
-
-message DfsReleasePreparedReadReply {
-  bool released = 1;
 }
 
 message DfsReadRangesHeader {

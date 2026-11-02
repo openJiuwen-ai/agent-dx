@@ -204,13 +204,8 @@ CLI 为 `--dfs-fuse-max-io-bytes`；范围 4096..=8388608，必须为 4096 的�
 大小。验收需同时查看 `afs_fuse_callback_size_bytes{operation="read"}`、
 `afs_dfs_read_transport_*` 和真实 DFS batch。
 
-Node 根配置 `dfs_read_measurement_mode` 默认为 `"baseline"`，CLI 同名参数采用短横线。
-实验性 `"prepared-payload"` 要求 `data_mode = "grpc"`，且 `[hixl].dfs_read_mode`
-为 `"off"` 或 `"required"`；`preferred` 和 RDMA/auto 被拒绝，避免回退污染对照。
-该模式先准备源端已验证快照和接收缓冲，再统计到私有目标缓冲的传输墙钟，校验与释放
-在计时外。TCP 快照独立限制 128 MiB/批、8 项/256 MiB、最长 5 秒且不超过授权到期；
-HIXL 原有 64 MiB 快照预算独立保留，组批次使用 128 MiB 独立预算。
-两端测试配置须使用相同 measurement mode，脚本会核对身份和指标。
+读取阶段墙钟由 `afs_dfs_read_phase_seconds{transport,phase}` 记录，只用于定位瓶颈；
+两端配置需一致才能比较同一相位。
 
 顺序预读组由 Node 根配置 `dfs_read_group_mode` 开启，默认 `"off"`，CLI 为
 `--dfs-read-group-mode sequential`。其他相关字段：

@@ -2112,31 +2112,21 @@ async fn run_node(
                     .unwrap_or(usize::MAX),
             });
         let dfs_read_move_metrics = dfs_read::DfsReadMoveMetrics::register(&obs.registry)?;
-        let dfs_read_payload_metrics = dfs_read::DfsReadPayloadMetrics::register(&obs.registry)?;
-        let prepared_payload =
-            cfg.dfs_read_measurement_mode == crate::config::DfsReadMeasurementMode::PreparedPayload;
+        let dfs_read_phase_metrics = dfs_read::DfsReadPhaseMetrics::register(&obs.registry)?;
         let grpc_group = read_group.map(|group| group.bytes as u64);
         // Only aggregate at the DFS layer when the selected transport accepts
         // group-sized logical batches; RDMA keeps its legacy per-batch budget.
         let transport_group = read_group.filter(|_| {
-            prepared_payload
-                || cfg.hixl.dfs_read_mode != crate::config::HixlDfsReadMode::Off
+            cfg.hixl.dfs_read_mode != crate::config::HixlDfsReadMode::Off
                 || dfs_data_mode == rpc::peer::DataMode::Grpc
         });
         let transfer: Arc<dyn dfs_read::ChunkTransfer> =
             if cfg.hixl.dfs_read_mode == crate::config::HixlDfsReadMode::Off {
-                if prepared_payload {
+                if grpc_group.is_some() && dfs_data_mode == rpc::peer::DataMode::Grpc {
                     Arc::new(
                         rpc::peer::GrpcChunkTransfer::new(peer_connections.clone(), timeout)?
                             .with_move_metrics(dfs_read_move_metrics.clone())
-                            .with_payload_metrics(dfs_read_payload_metrics.clone())
-                            .with_read_group(grpc_group),
-                    )
-                } else if grpc_group.is_some() && dfs_data_mode == rpc::peer::DataMode::Grpc {
-                    Arc::new(
-                        rpc::peer::GrpcChunkTransfer::new(peer_connections.clone(), timeout)?
-                            .with_move_metrics(dfs_read_move_metrics.clone())
-                            .with_phase_metrics(dfs_read_payload_metrics.clone())
+                            .with_phase_metrics(dfs_read_phase_metrics.clone())
                             .with_read_group(grpc_group),
                     )
                 } else {
@@ -2146,7 +2136,7 @@ async fn run_node(
                         timeout,
                         dfs_rdma_pool.clone(),
                         Some(dfs_read_move_metrics.clone()),
-                        Some(dfs_read_payload_metrics.clone()),
+                        Some(dfs_read_phase_metrics.clone()),
                     )?
                 }
             } else if let Some(runtime) = &hixl_runtime {
@@ -2160,9 +2150,7 @@ async fn run_node(
                 if let Some(metrics) = &hixl_metrics {
                     transfer = transfer.with_metrics(metrics.clone());
                 }
-                if prepared_payload {
-                    transfer = transfer.with_payload_metrics(dfs_read_payload_metrics.clone());
-                }
+                transfer = transfer.with_phase_metrics(dfs_read_phase_metrics.clone());
                 transfer = transfer.with_session_idle(cfg.hixl.session_idle_ms);
                 if let Some(group) = read_group {
                     transfer = transfer.with_read_group(group, cfg.hixl.receive_slots);
