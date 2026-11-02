@@ -85,6 +85,25 @@ class SoakStorageProbe(unittest.TestCase):
             with patch.dict(sys.modules, {'node': node}), self.assertRaises(ValueError):
                 probe.anchor_runtime('environment-a')
 
+    def test_afs_probe_uses_one_census_count_and_refuses_replaced_process(self):
+        probe = self.module()
+        info = {'pid': 22, 'start_ticks': 90, 'rss_bytes': 100, 'fds': 99}
+        census = {'pid': 22, 'start_ticks': 90, 'entries': [1, 2, 3]}
+        with patch.object(probe, 'process_info', return_value=info.copy()), patch.object(
+                probe.fd.inventory, 'census', return_value=census) as collect:
+            result = probe.persistent_process(22, 'afs-node', 'dfs', '/owned/chunks')
+            self.assertEqual(result['fds'], 3)
+            self.assertEqual(result['fd_census'], census)
+            collect.assert_called_once_with(22, '/owned/chunks')
+        census['start_ticks'] += 1
+        with patch.object(probe, 'process_info', return_value=info.copy()), patch.object(
+                probe.fd.inventory, 'census', return_value=census), self.assertRaisesRegex(ValueError, 'changed'):
+            probe.persistent_process(22, 'afs-node', 'ownerfs')
+        with patch.object(probe, 'process_info', return_value=info.copy()), patch.object(
+                probe.fd.inventory, 'census') as collect:
+            self.assertNotIn('fd_census', probe.persistent_process(22, 'adxlet', 'dfs'))
+            collect.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

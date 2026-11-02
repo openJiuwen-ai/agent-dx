@@ -1,13 +1,18 @@
 """Frozen one-hour acceptance, distinct from short entry qualification."""
 
 import hashlib
+import importlib.util
 import json
 import math
 from pathlib import Path
 import statistics
 
 NODES = ('node1', 'node2', 'afs-m')
-CONTRACT_PATH = Path(__file__).with_name('soak-contracts') / 'one-hour-v2.json'
+CONTRACT_PATH = Path(__file__).with_name('soak-contracts') / 'one-hour-v3.json'
+
+_SPEC = importlib.util.spec_from_file_location('soak_fd_acceptance', Path(__file__).with_name('soak_fd.py'))
+fd = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(fd)
 
 
 def contract():
@@ -25,7 +30,7 @@ def number(value, label):
     return value
 
 
-def check_sample(sample, baseline, policy):
+def check_sample(sample, baseline, policy, mode):
     if set(sample.get('nodes', {})) != set(NODES):
         raise ValueError('acceptance resource role missing')
     if sample.get('instances') != baseline['instances'] or set(sample['instances']) != {'A', 'B'}:
@@ -48,9 +53,16 @@ def check_sample(sample, baseline, policy):
             raise ValueError(node + ' runtime disk coverage missing')
         if observed.get('storage_scope') != policy['measurement']['storage_scope']:
             raise ValueError(node + ' backing storage measurement scope missing')
+        expected = 'afs-meta:' if node == 'afs-m' else 'afs-node:'
+        if sum(name.startswith(expected) for name in observed.get('processes', {})) != 1:
+            raise ValueError(node + ' exactly one owned AFS process is required')
+        if node == 'afs-m' and any(name.startswith('afs-node:') for name in observed['processes']):
+            raise ValueError('Meta role cannot claim DFS reader credit')
+        fd.verify(observed, initial, mode, policy['peak_growth']['fds'])
         for field, maximum in policy['peak_growth'].items():
-            current = number(observed.get(field), node + '.' + field)
-            if current - number(initial.get(field), node + '.baseline.' + field) > maximum:
+            metric = 'fds_noncache' if field == 'fds' else field
+            current = number(observed.get(metric), node + '.' + metric)
+            if current - number(initial.get(metric), node + '.baseline.' + metric) > maximum:
                 raise ValueError(node + ' peak resource growth: ' + field)
         if number(observed.get('free_bytes'), 'free_bytes') < policy['min_free_bytes']:
             raise ValueError(node + ' disk reserve exhausted')
@@ -61,9 +73,6 @@ def check_sample(sample, baseline, policy):
         processes = observed.get('processes', {})
         if set(processes) != set(initial['processes']):
             raise ValueError(node + ' persistent process set changed')
-        expected = 'afs-meta:' if node == 'afs-m' else 'afs-node:'
-        if not any(name.startswith(expected) for name in processes):
-            raise ValueError(node + ' AFS process observation missing')
         for name, process in processes.items():
             if any(process.get(key) != initial['processes'][name][key] for key in ('pid', 'start_ticks')):
                 raise ValueError(node + ' process identity changed: ' + name)
@@ -122,7 +131,7 @@ def evaluate(samples, work, mode, policy):
     last_cycles = baseline['cycles']
     previous = baseline
     for sample in samples:
-        check_sample(sample, baseline, policy)
+        check_sample(sample, baseline, policy, mode)
         now = number(sample.get('observed_monotonic_seconds'), 'observer monotonic time')
         elapsed = number(sample.get('elapsed_seconds'), 'workload elapsed')
         if (not 0 <= now - previous['observed_monotonic_seconds'] <= policy['maximum_sample_gap_seconds']
@@ -151,14 +160,25 @@ def evaluate(samples, work, mode, policy):
         if (mode == 'dfs'
                 and number(right.get('peer_reads'), 'peer_reads') <= number(left.get('peer_reads'), 'peer_reads')):
             raise ValueError('DFS peer path made no progress in window: ' + str(start))
+        for node in NODES:
+            for name in baseline['nodes'][node]['processes']:
+                if statistics.median(s['nodes'][node]['processes'][name]['fd_accounting']['excess']
+                                     for s in selected) > policy['fd_accounting']['steady_excess_median']:
+                    raise ValueError(node + '.' + name + ' steady cache capacity excess')
         windows.append({'start_seconds': start, 'end_seconds': end, 'samples': len(selected),
                         'cycles': right['cycles'] - left['cycles'],
                         'churn': right['operations']['delete'] - left['operations']['delete'],
-                        'nodes': {node: {field: statistics.median(s['nodes'][node][field] for s in selected)
+                        'nodes': {node: {field: statistics.median(
+                            s['nodes'][node]['fds_noncache' if field == 'fds' else field] for s in selected)
                                          for field in policy['trends']} for node in NODES},
                         'processes': {node: {name: statistics.median(s['nodes'][node]['processes'][name]['rss_bytes']
                                                                    for s in selected)
                                              for name in baseline['nodes'][node]['processes']} for node in NODES},
+                        'process_fds': {node: {name: statistics.median(
+                            s['nodes'][node]['processes'][name]['fd_accounting']['noncache'] for s in selected)
+                            for name in baseline['nodes'][node]['processes']} for node in NODES},
+                        'raw_fds': {node: statistics.median(s['nodes'][node]['fds'] for s in selected)
+                                    for node in NODES},
                         'anchors': {node: {field: statistics.median(s['nodes'][node]['anchor_runtime'][field]
                                                                    for s in selected) for field in ('rss_bytes', 'fds')}
                                     for node in ('node1', 'node2')}})
@@ -171,6 +191,16 @@ def evaluate(samples, work, mode, policy):
             name: trend(times, [w['processes'][node][name] for w in windows],
                         policy['process_rss_trend'], node + '.' + name)
             for name in baseline['nodes'][node]['processes']}
+        trends[node]['process_noncache_fds'] = {
+            name: trend(times, [w['process_fds'][node][name] for w in windows],
+                        policy['trends']['fds'], node + '.' + name + '.noncache_fds')
+            for name in baseline['nodes'][node]['processes']}
+        raw = [w['raw_fds'][node] for w in windows]
+        center = statistics.mean(times)
+        trends[node]['raw_fds_diagnostic'] = {
+            'window_medians': raw, 'end_delta': raw[-1] - raw[0],
+            'slope_per_hour': sum((x-center)*(y-statistics.mean(raw)) for x,y in zip(times,raw))
+                / sum((x-center)**2 for x in times) * 3600, 'gated': False}
         if node != 'afs-m':
             trends[node]['anchor_runtime_rss'] = trend(
                 times, [w['anchors'][node]['rss_bytes'] for w in windows],

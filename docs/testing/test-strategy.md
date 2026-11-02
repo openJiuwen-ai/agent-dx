@@ -1,7 +1,7 @@
 <a id="top"></a>
 # ADX／AFS 测试规范：五步验证路径
 
-状态：2026-11-01。CI0–CI4及默认AFS冒烟已合入。固定Base236的非K8s拿包路径已完成：先跑通组件，再通过ADX SDK和组合功能Full。首批恢复和有界压力专项也已跑通。PK3正式一小时合同已冻结并实跑：OwnerFs、DFS均因AFS Node的FD增长超限提前失败，未取得一小时PASS。后续短诊断已确认OwnerFs远端目录释放缺口，以及DFS读缓存256项封顶；修复与FD预算合同修订另行交付，旧失败不改绿。标准兼容、跨VM、全天长稳和性能仍分别验收。具体候选、失败记录和边界见本页对应步骤。
+状态：2026-11-02。CI0–CI4及默认AFS冒烟已合入。固定Base236的非K8s拿包路径已完成：先跑通组件，再通过ADX SDK和组合功能Full。首批恢复和有界压力专项也已跑通。PK3正式一小时合同已冻结并实跑：OwnerFs、DFS均因AFS Node的FD增长超限提前失败，未取得一小时PASS。后续短诊断已确认OwnerFs远端目录释放缺口，以及DFS读缓存256项封顶；OwnerFs修复交由Issue73跟进；DFS有界缓存已注册组件回归，FD合同v3单独冻结。旧失败不改绿，v3的新SDK观测准入和修复包正式长稳仍待执行。标准兼容、跨VM、全天长稳和性能仍分别验收。具体候选、失败记录和边界见本页对应步骤。
 
 先按下方五步理解验证时机，再用同页总表看现状与待补项；目录、环境、入口、具体版本及失败证据在对应步骤展开。
 
@@ -695,7 +695,18 @@ v2把runtime门禁字段明确改为`runtime_backing_bytes`，原表观字段保
 
 本次两case均正常回收，7次AFS正常wait均为0，私有短路径alias已正常卸载／删除；诊断后已正常down／cleanup／release，cloud2终态idle/free；守卫清理本任务9项可再生正文／输入副本222,927,073B，保留必要原件及原包，4个模块始终未改。独立审计核对77份必要原件2,074,842B、69项测试输入及原包两ELF。先前一次输出位置选错，在只读工作区创建结果目录时被拒绝，尚未挂载alias或启动产品，原操作失败保留；更正到公共节点可写data目录后用全新输出运行。另有一次管理sidecar检查格式断言失败，也单独保留，不归因产品。证据归仓外`adx/evidence/afs-fd-diag-20261101/`；live读取的上游master为`f3794a77`，相关OwnerFs／DFS读引擎／chunk源文件与固定包f93相同，未把旧问题误称已在最新源码修复。
 
-**下一项／P1（待实施）**：先补OwnerFs远端目录释放回归并独立修复；将DFS缓存封顶诊断固化为组件回归，再依据已验证的容量／在途／稳态边界冻结**新版本**FD预算合同。当前v2的冷启动增长上限128低于该缓存容量256，旧两轮仍是v2合同下的FAILED，不能事后改阈值刷绿。后续必须明确新合同版本及依据，固定修复候选重新完成观测准入，再从头运行两模式各一小时；短组件诊断、局部回收或拼接旧失败均不能替代。以上修复、注册用例及新合同均未实施，本批不改ADX生产代码。原始结果、全部失败、因果诊断及清理记录归仓外`adx/evidence/afs-pk3-hour-20261101/`。PK1／PK2／PK3仍按既定安排后续一起审查，本轮不提MR／不合入。 此前一小时合同那批8次运行及两版控制记录共3705份必要原件（98,253,219B）逐SHA核对，失败证据保留；已清理本任务运行正文、展开源码及重复输入，恢复4个临时模块，并正常down／cleanup／release，cloud2终态idle/free。cloud1原固定输入、其它任务和共享镜像／缓存未改动。
+**DFS回归及FD合同v3（2026-11-02，本轮测试体系交付）**：先把“读缓存封顶、淘汰会释放FD”变成开发者可直接选择的组件用例，再让公共长稳按真实资源归属计量。它不修OwnerFs，也不把旧失败改绿；正式一小时等修复包再重新运行。
+
+| 项目 | 本轮已落地 | 结果与边界 |
+| --- | --- | --- |
+| 定向组件回归 | `afs/tests/run.py run --case dfs.resources.reader_fd_budget`；也可`--case 'dfs.resources.*'`或`--suite local-resources`。用例在`afs/tests/suites/dfs/test_resources.py`／`fd_budget.py`；只读FD工具在`afs/tests/tools/fd_inventory.py`。复用singlevm的Meta＋A/B进程／真实FUSE和正常回收，无SDK或K8s依赖 | 本轮固定Base236两ELF的Linux实跑首次PASS（15.8095秒），正常清理PASS、未重试。实际local_probe增长868，FD曲线和淘汰／复用均达标；768轮不同16KiB内容发布／fsync／DONTNEED完整读，六批chunk FD应为128／256／256／256／256／256，观察768个不同对象且后四批每批淘汰128旧项；同对象再DONTNEED读100次集合不变，local_probe至少增长868。检查点无超额／重复，A其它FD增长≤4、B本地reader为0，PID/start/root身份稳定 |
+| 新正式FD合同 | [one-hour-v3.json](../../build/e2e/soak-contracts/one-hour-v3.json)，ID`afs-continuous-1h-v3`，SHA256 `b1643e86dcf0b367e9a2db32ccaebac0b815b83f7fa1bad3a1909392085e947c`。`build/e2e/soak.py --acceptance one-hour`默认选v3；`soak_probe.py`采原始FD表，`soak_fd.py`重算；从实际Cluster取得A/B chunk根，不靠路径中出现dfs就豁免 | 仅DFS的唯一owned `afs-node`可抵扣最多256个“显式chunk根目录内、同device、存活regular file的唯一dev/inode”。重复FD、已删除、其它路径／进程、OwnerFs、Meta和anchor都无抵扣。保留原始总数、每FD目标／类型／dev／inode及进程PID/start、根path/device/inode；缺失、不一致或身份替换即失败 |
+| 峰值与稳态 | 每节点／每常驻进程的`noncache = raw − min(eligible,256)`，增长仍≤128；另保留raw增长上限：OwnerFs／Meta／其它进程≤128，DFS Node≤128＋256。超额cache／在途句柄仍计入noncache，稳态每窗超额中位数必须为0。节点及逐进程noncache十窗口末差≤4、OLS≤4/小时；anchor仍用原raw标准；raw节点中位数／斜率继续单独报告 | 这是版本化资源归属修正，不把整个进程FD上限改成256或无条件放宽到384。前600秒只免趋势，峰值／身份／错误仍检查；时长、工作量、内存／RSS、磁盘、挂载、错误、清理均与v2完全相同，工具测试逐项对比 |
+| 复用／覆盖范围 | 默认`local-basic`／`all-basic`、CI冒烟和`ci-full`24项保持原集合；本例先作为定向组件回归，不新增独立CI平台。OwnerFs真实释放缺口归[Issue73](https://gitcode.com/openJiuwen/agent-dx/issues/73)，由同事修复 | 组件回归和工具检查不等于新版SDK probe实跑准入、SDK一小时、跨VM／K8s、全天长稳或性能。没有生产代码／生产配置修改，不提MR／不合入，后面与PK1／PK2一起审查 |
+
+**本轮验证**：最终冻结测试源码的Linux公共工具580项、AFS runner73项通过；72份必要原件3,123,228B及34项实际运行源码已独立逐SHA核对；原FD表重算A其它句柄8个检查点均为23，3次AFS正常wait均0。Mac因缺Linux procfs的9项ERROR另存，不计验收。v1/v2合同与默认集合未变，生产代码差异为0。新版SDK观测短准入和正式一小时未执行；原失败保持原结论。
+
+**下一项／P1**：等待同事提供OwnerFs修复并交付固定包；先核候选／SDK／backend／镜像／harness／v3合同身份，重新做短SDK观测准入（验证新版探针在完整ADX部署中的覆盖和时延），再从头运行OwnerFs、DFS各一小时。旧v1/v2合同和全部FAILED／取消／操作失败记录原样保留，不拼接时长、不事后重判；这轮只冻结v3，不启动正式长稳。本轮证据归仓外`adx/evidence/afs-dfs-fd-v3-20261102/`，原一小时及因果诊断继续保留在各自证据目录。此前一小时合同那批3705份必要原件、原包和活动worktree均不清理。
 
 第五步可以和第四步并行准备输入、文档及直接复现；其AFS组件部署依赖CI1、产品路径依赖CI2、完整功能集依赖CI4的选集/适配，但不要求先完成线上webhook设置。直接运行通过不反向宣称CI门禁、自动触发或发布资格已完成。
 

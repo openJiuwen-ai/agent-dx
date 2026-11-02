@@ -1,14 +1,18 @@
 """Read only owned container resources, tolerating normal concurrent file retirement."""
 
+import argparse
+import importlib.util
 import json
 import os
 from pathlib import Path
 import shutil
 import stat
-import sys
 
 NAMES = ('afs-meta', 'afs-node', 'adxlet', 'adx-coordinator', 'adx-apiserver', 'adx-ingress', 'sandboxd', 'envd')
 STORAGE_SCOPE = 'allocated-backing-fs-v2'
+_SPEC = importlib.util.spec_from_file_location('soak_fd_probe', Path(__file__).with_name('soak_fd.py'))
+fd = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(fd)
 
 
 def mount_paths(text):
@@ -68,6 +72,16 @@ def process_info(pid):
             'fds': len(list((path / 'fd').iterdir()))}
 
 
+def persistent_process(pid, name, mode=None, cache_root=None):
+    process = process_info(pid)
+    if mode and name == 'afs-node':
+        census = fd.inventory.census(pid, cache_root)
+        if any(census[key] != process[key] for key in ('pid', 'start_ticks')):
+            raise ValueError('AFS process changed during observation')
+        process.update(fd_census=census, fds=len(census['entries']))
+    return process
+
+
 def anchor_runtime(environment_id):
     from node import P, command
     lines = command(['sbox', '-a', P / 'sandboxd/sandboxd.sock', 'list',
@@ -112,7 +126,7 @@ def storage(directory):
     return total, logs
 
 
-def observe(environment_id=None):
+def observe(environment_id=None, *, mode=None, cache_root=None):
     processes = {}
     for path in Path('/proc').iterdir():
         if not path.name.isdigit():
@@ -121,7 +135,7 @@ def observe(environment_id=None):
             name = (path / 'comm').read_text().strip()
             if name not in NAMES:
                 continue
-            processes[name + ':' + path.name] = process_info(int(path.name))
+            processes[name + ':' + path.name] = persistent_process(int(path.name), name, mode, cache_root)
         except FileNotFoundError:
             continue
     total, logs = storage('/a')
@@ -132,7 +146,7 @@ def observe(environment_id=None):
     backing = backing_storage(runtime, mounts)
     stream_backing = backing_storage('/opt/adx/logs/runtime', mounts)
     anchor = anchor_runtime(environment_id) if environment_id else None
-    return {'processes': processes, 'anchor_runtime': anchor,
+    observed = {'processes': processes, 'anchor_runtime': anchor,
             'fds': sum(p['fds'] for p in processes.values()) + (anchor['fds'] if anchor else 0),
             'rss_bytes': sum(p['rss_bytes'] for p in processes.values()) + (anchor['rss_bytes'] if anchor else 0),
             'mounts': len(Path('/proc/self/mountinfo').read_text().splitlines()),
@@ -141,7 +155,15 @@ def observe(environment_id=None):
             'runtime_backing_bytes': backing['bytes'] + stream_backing['bytes'],
             'runtime_backing': backing, 'runtime_stream_backing': stream_backing, 'storage_scope': STORAGE_SCOPE,
             'runtime_disk_present': runtime.is_dir(), 'free_bytes': shutil.disk_usage('/a').free}
+    return fd.attach(observed, mode) if mode else observed
 
 
 if __name__ == '__main__':
-    print(json.dumps(observe(sys.argv[1] if len(sys.argv) > 1 else None)))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('environment_id', nargs='?')
+    parser.add_argument('--mode', choices=('ownerfs', 'dfs'))
+    parser.add_argument('--cache-root')
+    args = parser.parse_args()
+    if args.cache_root and args.mode != 'dfs':
+        parser.error('cache root is valid only for DFS')
+    print(json.dumps(observe(args.environment_id, mode=args.mode, cache_root=args.cache_root)))

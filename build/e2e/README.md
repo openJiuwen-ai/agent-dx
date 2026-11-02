@@ -260,11 +260,11 @@ resource/trend/error/fault policy and actually complete the declared duration
 before making that claim. K8s, cross-VM failure isolation and precise performance
 are outside this implementation. Default smoke and Full selections are unchanged.
 
-### Frozen one-hour acceptance v2
+### Frozen one-hour acceptance v3
 
 `--acceptance one-hour` selects the tracked
-[one-hour-v2 contract](soak-contracts/one-hour-v2.json). It requires exactly
-3600 seconds, 15-second sampling, no deliberate fault and unchanged peak bounds;
+[one-hour-v3 contract](soak-contracts/one-hour-v3.json). It requires exactly
+3600 seconds, 15-second sampling, no deliberate fault and the explicit FD accounting below;
 the CLI rejects altered duration, sampling or relaxed limits. Run OwnerFs and
 DFS sequentially with the same fixed package and separate new outputs:
 
@@ -324,8 +324,30 @@ window midpoints must pass; positive slopes are expressed per hour:
 | --- | --- | --- |
 | Docker anonymous memory, aggregate persistent-process RSS, AFS data, runtime backing allocation | 32 MiB | 16 MiB |
 | External-runtime anonymous memory, each persistent process RSS | 16 MiB | 8 MiB |
-| Persistent-process FDs | 4 | 4 |
+| Node and each persistent process noncache FDs; raw anchor FDs | 4 | 4 |
 | Mount count | 1 | 1 |
+
+The v3 FD rule gives only an owned DFS `afs-node` cache credit of at most 256
+unique live regular-file dev/inode identities directly under its explicit,
+stable canonical chunk directory. Raw `/proc/<pid>/fd` entries and PID/start/root
+path/device/inode identities are retained and independently recomputed.
+Duplicates, deleted files, foreign paths, and OwnerFs/Meta/platform/anchor FDs
+receive no credit. `fds_noncache = raw_fds - min(eligible_unique_chunks, 256)`;
+excess physical readers remain charged, including inflight holders. Missing or
+inconsistent accounting fails. A census may make at most three bounded attempts
+if procfs changes during capture; all race reasons are retained, and exhausted
+capture fails the sample. This never retries a failed workload or omits a sample.
+
+The original +128 peak bound and 4 end-delta / 4-per-hour steady bounds now
+apply to node AND each persistent process **noncache** FDs. A separate raw cap
+is +128 for OwnerFs/Meta/other processes, or +128+256 for an owned DFS Node.
+Every five-minute steady window must have median excess above the 256 credit
+of zero; transient excess is still charged against noncache limits. Raw node
+window medians/slopes remain visible as diagnostics. Anchors retain their
+original raw bounds. This change allows verified bounded cache fill; it does
+not exempt continuing growth or claim that the whole process has only 256 FDs.
+All workload, time, RSS/memory, storage, mount, error and cleanup rules remain
+identical to v2, enforced by a tool regression.
 
 Page-cache observations remain visible but are bounded by the separate total
 memory peak, rather than mislabeled as anonymous leakage. Log bytes have a
@@ -379,10 +401,15 @@ same-object reads added none. These are `DIAGNOSTIC_ONLY` findings, with seven
 normal process exits, not a successful SDK hour or a registered new suite.
 
 The cold-start +128 FD limit is below the verified 256-entry reader-cache
-capacity. Keep both original v2 runs failed. Repair OwnerFs separately and freeze
-a versioned FD contract that accounts for bounded cache warmup, in-flight holders
-and steady growth before testing a new candidate; no revised contract or product
-patch has been implemented here. See the evidence scope and next steps in the
+capacity. Both original v2 runs remain failed and the v1/v2 JSON files stay
+byte-identical. The follow-up registers `dfs.resources.reader_fd_budget` in the
+AFS component runner and versions only the formal FD accounting as v3; production
+code/settings, default smoke, and Full case selections are unchanged.
+OwnerFs repair is tracked separately in [Issue73](https://gitcode.com/openJiuwen/agent-dx/issues/73).
+This contract freeze is not an actual v3 SDK observer admission or one-hour pass.
+After obtaining a fixed repair package, repeat short observer admission with v3,
+then start fresh OwnerFs and DFS one-hour runs. Never reinterpret or concatenate
+old failures. See the evidence scope and next steps in the
 [same five-step strategy](../../docs/testing/test-strategy.md#step-5).
 
 ### Fixed AFS component package on one Linux VM

@@ -48,7 +48,7 @@ def validate_workload(report, seconds):
         raise ValueError('continuous workload duration/work/counts/cleanup incomplete')
 
 
-def validate_samples(samples, limits, interval, *, baseline=None, require_progress=True):
+def validate_samples(samples, limits, interval, *, baseline=None, require_progress=True, fd_metric='fds'):
     if len(samples) < 2 or (require_progress and samples[-1]['cycles'] <= samples[0]['cycles']):
         raise ValueError('resource samples or sustained workload progress missing')
     last_progress = samples[0].get('observed_monotonic_seconds', samples[0]['elapsed_seconds'])
@@ -69,11 +69,12 @@ def validate_samples(samples, limits, interval, *, baseline=None, require_progre
         for node, observed in sample['nodes'].items():
             initial = (baseline or samples[0])['nodes'][node]
             for field in ('memory_bytes', 'disk_bytes', 'fds', 'mounts', 'free_bytes'):
-                value = observed.get(field)
+                metric = fd_metric if field == 'fds' else field
+                value = observed.get(metric)
                 if (not isinstance(value, (int, float)) or isinstance(value, bool)
                         or not math.isfinite(value) or value < 0):
                     raise ValueError('invalid resource counter: ' + field)
-                if field != 'free_bytes' and value - initial[field] > limits[field]:
+                if field != 'free_bytes' and value - initial[metric] > limits[field]:
                     raise ValueError(node + ' resource growth exceeded: ' + field)
             if observed['free_bytes'] < limits['min_free_bytes']:
                 raise ValueError(node + ' free disk below frozen reserve')
@@ -94,11 +95,15 @@ def cgroup_resources(path):
             'file_bytes': int(stat['file']), 'events': events, 'path': str(path)}
 
 
-def observe_resources(run, progress):
+def observe_resources(run, progress, fd_roots=None):
     nodes = {}
     for node in NODES:
         arguments = [progress['instances']['A' if node == 'node1' else 'B']] if (
             node != 'afs-m' and progress['status'] == 'running') else []
+        if fd_roots is not None:
+            arguments += ['--mode', fd_roots['mode']]
+            if node in fd_roots:
+                arguments += ['--cache-root', fd_roots[node]]
         observed = json.loads(run.execute(node, 'python3', '/opt/adx/e2e/soak_probe.py', *arguments, timeout=30))
         item = json.loads(run.docker('inspect', run.owned[node], stream=False))[0]
         pid = item['State']['Pid']
@@ -184,6 +189,10 @@ def scenarios(run, checks, options, limits, policy=None):
                       'contract_sha256': options.get('contract_sha256')}
             try:
                 cluster.prepare()
+                fd_roots = ({'mode': mode, **({
+                    node: cluster.role_dir(role) + '/state/dfs/chunks'
+                    for node, role in (('node1', 'A'), ('node2', 'B'))} if mode == 'dfs' else {})}
+                    if policy else None)
                 peer_before = peer_counter(cluster, 'B') if mode == 'dfs' else None
                 config = dict(options, owner=run.id, special='soak', paths={}, identities={})
                 for role in ('A', 'B'):
@@ -225,7 +234,7 @@ def scenarios(run, checks, options, limits, policy=None):
                                 retiring_at = retiring_at or time.monotonic()
                                 if time.monotonic() - retiring_at > 180:
                                     raise ValueError('SDK terminal cleanup exceeded 180 seconds')
-                            observed = observe_resources(run, progress)
+                            observed = observe_resources(run, progress, fd_roots)
                             if policy and mode == 'dfs':
                                 observed['peer_reads'] = peer_counter(cluster, 'B')
                             samples.append(observed)
@@ -233,9 +242,10 @@ def scenarios(run, checks, options, limits, policy=None):
                                 stream.write(json.dumps(observed) + '\n')
                             if len(samples) > 1:
                                 validate_samples(samples[-2:], limits, options['sample_seconds'],
-                                                 baseline=samples[0], require_progress=False)
+                                                 baseline=samples[0], require_progress=False,
+                                                 fd_metric='fds_noncache' if policy else 'fds')
                             if policy:
-                                acceptance.check_sample(observed, samples[0], policy)
+                                acceptance.check_sample(observed, samples[0], policy, mode)
                                 if (len(samples) > 1
                                         and observed['observed_monotonic_seconds']
                                         - samples[-2]['observed_monotonic_seconds']
@@ -247,7 +257,7 @@ def scenarios(run, checks, options, limits, policy=None):
                     time.sleep(0.25)
                 workload = json.loads((directory / 'workload.json').read_text())
                 report['workload'] = workload
-                final_sample = observe_resources(run, workload)
+                final_sample = observe_resources(run, workload, fd_roots)
                 if policy and mode == 'dfs':
                     final_sample['peer_reads'] = peer_counter(cluster, 'B')
                 samples.append(final_sample)
@@ -256,7 +266,8 @@ def scenarios(run, checks, options, limits, policy=None):
                 if workload.get('owner') != run.id or workload.get('mode') != mode:
                     raise ValueError('workload result identity mismatch')
                 validate_workload(workload, options['seconds'])
-                validate_samples(samples, limits, options['sample_seconds'])
+                validate_samples(samples, limits, options['sample_seconds'],
+                                 fd_metric='fds_noncache' if policy else 'fds')
                 if policy:
                     report['acceptance'] = acceptance.evaluate(samples, workload, mode, policy)
                 if mode == 'dfs':

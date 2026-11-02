@@ -1,6 +1,7 @@
 """Frozen one-hour acceptance must reject gaps, resource drift, OOM and partial work."""
 
 from copy import deepcopy
+from functools import lru_cache
 import importlib.util
 from pathlib import Path
 import unittest
@@ -8,14 +9,31 @@ from unittest.mock import patch
 import contextlib
 import io
 import json
+import stat
 
 
+@lru_cache(maxsize=1)
 def module():
     spec = importlib.util.spec_from_file_location('soak_acceptance_tests',
                                                 Path(__file__).resolve().parents[1] / 'soak_acceptance.py')
     value = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(value)
     return value
+
+
+def census(count, cached=0):
+    return {'scope': 'afs-fd-census-v1', 'comm': 'afs-node', 'pid': 2, 'start_ticks': 100,
+            'cache_root': {'path': '/owned/chunks', 'device': 9, 'inode': 2},
+            'entries': [{'fd': i, 'target': ('/owned/chunks/' if i >= count-cached else '/outside/') + str(i),
+                         'device': 9, 'inode': i+10, 'kind': stat.S_IFREG} for i in range(count)]}
+
+
+def change_fds(node, noncache=0, cached=0):
+    process = node['processes']['afs-node:2']
+    process['fds'] = 7 + noncache + cached
+    process['fd_census'] = census(process['fds'], cached)
+    node['fds'] = process['fds'] + (node['anchor_runtime']['fds'] if node['anchor_runtime'] else 0)
+    module().fd.attach(node, 'dfs')
 
 
 def samples():
@@ -34,11 +52,16 @@ def samples():
                                runtime_disk_present=name != 'afs-m',
                                memory_events={'oom': 0, 'oom_kill': 0},
                                runtime_memory_events={'oom': 0, 'oom_kill': 0},
-                               processes={process: {'pid': 2, 'start_ticks': 100, 'rss_bytes': 1024**2}})
+                               processes={process: {'pid': 2, 'start_ticks': 100, 'rss_bytes': 1024**2,
+                                                    'fds': 10 if name == 'afs-m' else 7}})
             nodes[name]['anchor_runtime'] = ({
                 'environment_id': 'a' if name == 'node1' else 'b', 'runtime_id': name + '-runc',
                 'pid': 5, 'start_ticks': 500, 'rss_bytes': 1024**2, 'fds': 3,
             } if name != 'afs-m' and elapsed < 3600 else None)
+            if name != 'afs-m':
+                nodes[name]['fds'] = 10 if elapsed < 3600 else 7
+                nodes[name]['processes'][process]['fd_census'] = census(7)
+            module().fd.attach(nodes[name], 'dfs')
         churn = elapsed // 6
         values.append({'elapsed_seconds': elapsed, 'observed_monotonic_seconds': elapsed,
                        'cycles': elapsed, 'active': elapsed < 3600,
@@ -95,7 +118,7 @@ class FormalSoakContracts(unittest.TestCase):
         policy = module()
         values = samples()
         for value in values:
-            value['nodes']['node1']['fds'] += value['elapsed_seconds'] // 300
+            change_fds(value['nodes']['node1'], noncache=value['elapsed_seconds'] // 300)
         with self.assertRaisesRegex(ValueError, 'trend'):
             policy.evaluate(values, self.work(), 'dfs', policy.contract())
 
@@ -192,12 +215,70 @@ class FormalSoakContracts(unittest.TestCase):
     def test_v2_changes_measurement_units_without_weakening_any_numeric_or_workload_rule(self):
         policy = module()
         original = json.loads((policy.CONTRACT_PATH.parent / 'one-hour-v1.json').read_text())
-        current = policy.contract()
+        current = json.loads((policy.CONTRACT_PATH.parent / 'one-hour-v2.json').read_text())
         current['id'] = original['id']
         current.pop('measurement')
         for group in ('peak_growth', 'trends'):
             current[group]['runtime_disk_bytes'] = current[group].pop('runtime_backing_bytes')
         self.assertEqual(current, original)
+
+    def test_v3_only_changes_explicit_fd_measurement_and_keeps_other_rules(self):
+        policy = module()
+        old = json.loads((policy.CONTRACT_PATH.parent / 'one-hour-v2.json').read_text())
+        current = policy.contract()
+        current['id'] = old['id']
+        current.pop('fd_accounting')
+        current['measurement'].pop('fd_scope')
+        current['measurement'].pop('fds')
+        self.assertEqual(current, old)
+        self.assertEqual(policy.contract()['fd_accounting']['dfs_reader_capacity_per_afs_node'], policy.fd.CAPACITY)
+
+    def test_bounded_cache_fill_passes_while_raw_drift_is_visible(self):
+        policy = module()
+        values = samples()
+        for value in values:
+            change_fds(value['nodes']['node1'], cached=min(256, value['elapsed_seconds']//10))
+        result = policy.evaluate(values, self.work(), 'dfs', policy.contract())
+        self.assertGreater(result['trends']['node1']['raw_fds_diagnostic']['end_delta'], 4)
+        self.assertEqual(result['trends']['node1']['fds']['end_delta'], 0)
+
+    def test_persistent_excess_or_noncache_peak_still_fails(self):
+        policy = module()
+        for excess in (True, False):
+            values = samples()
+            for value in values:
+                change_fds(value['nodes']['node1'], noncache=0 if excess else 129, cached=257 if excess else 256)
+            # Preserve a genuine cold baseline, rather than accepting an already leaking baseline.
+            change_fds(values[0]['nodes']['node1'])
+            with self.subTest(excess=excess), self.assertRaisesRegex(ValueError, 'excess|peak'):
+                policy.evaluate(values, self.work(), 'dfs', policy.contract())
+
+    def test_ownerfs_has_zero_credit_and_original_fd_failure_remains_failure(self):
+        policy = module()
+        values = samples()
+        for value in values:
+            change_fds(value['nodes']['node1'], noncache=value['elapsed_seconds']//10)
+            for node in ('node1', 'node2'):
+                item = value['nodes'][node]
+                item['processes']['afs-node:2']['fd_census']['cache_root'] = None
+                policy.fd.attach(item, 'ownerfs')
+            policy.fd.attach(value['nodes']['afs-m'], 'ownerfs')
+        with self.assertRaisesRegex(ValueError, 'peak'):
+            policy.evaluate(values, self.work(), 'ownerfs', policy.contract())
+
+    def test_extra_afs_process_cannot_multiply_cache_allowance(self):
+        policy = module()
+        for role in ('node1', 'afs-m'):
+            values = samples()
+            node = values[0]['nodes'][role]
+            duplicate = deepcopy(values[0]['nodes']['node1']['processes']['afs-node:2'])
+            duplicate.update(pid=3, start_ticks=200)
+            duplicate['fd_census'].update(pid=3, start_ticks=200)
+            node['processes']['afs-node:3'] = duplicate
+            node['fds'] += duplicate['fds']
+            policy.fd.attach(node, 'dfs')
+            with self.assertRaisesRegex(ValueError, 'owned AFS|Meta role'):
+                policy.evaluate(values, self.work(), 'dfs', policy.contract())
 
 
 if __name__ == '__main__':
