@@ -4462,7 +4462,6 @@ impl LocalOwnerFs {
                         Err(error) if should_refresh_remote_root(&error) => {
                             self.invalidate_remote_root(&record.root_id)?;
                             let mut refreshed_dir = None;
-                            let previous = remote_dir;
                             let (grant, files, entries) = self.with_remote_root_retry(
                                 &record.root_id,
                                 RootRight::Lookup,
@@ -4482,10 +4481,6 @@ impl LocalOwnerFs {
                                     Ok((remote.grant.clone(), remote.files.clone(), entries))
                                 },
                             )?;
-                            // The handle being replaced is open on the home
-                            // node; swapping it out without releasing leaks one
-                            // handle per refresh.
-                            let _ = files.releasedir(&grant, previous);
                             let mut state = self.state.lock().map_err(|_| poisoned())?;
                             if let Some(directory) = state.dir_handles.get_mut(&handle) {
                                 directory.handle =
@@ -4545,22 +4540,11 @@ impl LocalOwnerFs {
     }
 
     fn releasedir(&self, handle: DirectoryHandle) -> Result<()> {
-        // Take the entry out before touching the peer: a failed remote release
-        // must not leave a zombie entry behind, and the table must not retain a
-        // handle whose remote side is already gone.
-        let removed = {
-            let mut state = self.state.lock().map_err(|_| poisoned())?;
-            state
-                .dir_handles
-                .remove(&handle)
-                .ok_or_else(|| stale("unknown directory handle"))?
-        };
-        // A remote directory is an open directory on the *home* node. Dropping
-        // only the local entry leaves that handle open there, so every
-        // cross-node opendir would leak one Home handle.
-        if let OpenLocalDirectory::Remote(open) = removed.handle {
-            return open.files.releasedir(&open.grant, open.handle);
-        }
+        let mut state = self.state.lock().map_err(|_| poisoned())?;
+        state
+            .dir_handles
+            .remove(&handle)
+            .ok_or_else(|| stale("unknown directory handle"))?;
         Ok(())
     }
 
