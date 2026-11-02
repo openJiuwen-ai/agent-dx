@@ -665,7 +665,6 @@ pub struct ReplicaAck {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum CopyRole {
-    #[serde(alias = "Durable", alias = "DurableReplica")]
     #[default]
     DurableReplica,
     VerifiedCache,
@@ -679,7 +678,6 @@ pub enum CopyState {
     /// state, so old staging records can never become readable Ready copies.
     #[serde(rename = "Staging")]
     LegacyStaging,
-    #[serde(alias = "Durable", alias = "DurableReplica")]
     #[default]
     Ready,
     Corrupt,
@@ -722,25 +720,6 @@ pub struct CopyRecord {
 }
 
 impl CopyRecord {
-    pub fn node_location(&self) -> Option<CopyLocation> {
-        match &self.location {
-            CopyLocation::Node {
-                node_id,
-                node_epoch,
-                device_id,
-                device_epoch,
-                catalog_revision,
-            } => Some(CopyLocation::Node {
-                node_id: node_id.clone(),
-                node_epoch: *node_epoch,
-                device_id: device_id.clone(),
-                device_epoch: *device_epoch,
-                catalog_revision: *catalog_revision,
-            }),
-            CopyLocation::External { .. } => None,
-        }
-    }
-
     pub fn is_ready_durable(&self) -> bool {
         self.role == CopyRole::DurableReplica && self.state.is_readable()
     }
@@ -758,7 +737,6 @@ pub enum PlacementHealth {
 pub struct PlacementRecord {
     pub chunk_id: ChunkId,
     pub replica_group_id: ReplicaGroupId,
-    #[serde(alias = "epoch")]
     pub placement_epoch: u64,
     #[serde(default = "one_copy")]
     pub desired_copies: u16,

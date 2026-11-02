@@ -68,8 +68,7 @@ pub mod connection;
 pub use connection::{
     DfsAccess, DfsFileHandle, DfsIov, DfsLocalClient, DfsLocalClientConfig, DfsOpenFile,
     DfsRegisteredFd, DfsRegistration, DfsRing, DfsSyncMode, DfsSyncResult, DiagnosticLocalClient,
-    DiagnosticLocalClientConfig, LocalClient, LocalClientConfig, LocalClientError,
-    max_parallel_shm_operations,
+    DiagnosticLocalClientConfig, LocalClientConfig, LocalClientError, max_parallel_shm_operations,
 };
 
 /// SDK callers can inspect native machine identities without depending on Tonic.

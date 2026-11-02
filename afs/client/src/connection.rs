@@ -88,10 +88,6 @@ pub struct DiagnosticLocalClient {
     request_timeout: Duration,
 }
 
-/// Compatibility name for the diagnostics-only Storage probe client.
-/// New DFS integrations must use `DfsLocalClient`.
-pub type LocalClient = DiagnosticLocalClient;
-
 /// 默认 namespace：本机 node 只服务一个挂载点，SDK 因此把它固定在连接上。
 const DEFAULT_NAMESPACE: &str = "default";
 

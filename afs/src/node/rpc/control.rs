@@ -708,19 +708,6 @@ pub fn make_control_server(registry: RdmaSessionRegistry) -> NodeControlServer<N
     NodeControlServer::new(NodeControlService::new(registry))
 }
 
-#[cfg(feature = "dfs")]
-pub fn make_control_server_with_dfs_owner(
-    registry: RdmaSessionRegistry,
-    handler: Arc<dyn DfsOwnerLifecycleHandler>,
-    authenticator: Arc<dyn PeerAuthenticator>,
-) -> NodeControlServer<NodeControlService> {
-    NodeControlServer::new(NodeControlService::with_dfs_owner(
-        registry,
-        handler,
-        authenticator,
-    ))
-}
-
 #[tonic::async_trait]
 impl NodeControl for NodeControlService {
     async fn prepare_owner_root(

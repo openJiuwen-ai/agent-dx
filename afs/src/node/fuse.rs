@@ -622,14 +622,6 @@ pub fn mount_dfs_with_options(
     )
 }
 
-pub fn mount_dfs_with_metrics(
-    backend: Arc<dyn Backend>,
-    path: &Path,
-    metrics: FuseRequestMetrics,
-) -> Result<MountedFuse> {
-    mount_dfs_with_metrics_and_options(backend, path, metrics, FuseMountOptions::default())
-}
-
 pub fn mount_dfs_with_metrics_and_options(
     backend: Arc<dyn Backend>,
     path: &Path,
@@ -645,35 +637,6 @@ pub fn mount_dfs_with_metrics_and_options(
         options,
         None,
     )
-}
-
-/// The ordinary mount APIs keep detailed read diagnostics disabled. This
-/// opt-in shares a bounded journal with the Node's Meta and Peer adapters.
-#[cfg(feature = "dfs")]
-pub fn mount_dfs_with_read_diagnostics(
-    backend: Arc<dyn Backend>,
-    path: &Path,
-    metrics: FuseRequestMetrics,
-    read_work: crate::node::read_work::ReadWorkMetrics,
-) -> Result<MountedFuse> {
-    mount_dfs_with_read_diagnostics_and_options(
-        backend,
-        path,
-        metrics,
-        read_work,
-        FuseMountOptions::default(),
-    )
-}
-
-#[cfg(feature = "dfs")]
-pub fn mount_dfs_with_read_diagnostics_and_options(
-    backend: Arc<dyn Backend>,
-    path: &Path,
-    metrics: FuseRequestMetrics,
-    read_work: crate::node::read_work::ReadWorkMetrics,
-    options: FuseMountOptions,
-) -> Result<MountedFuse> {
-    mount_dfs_inner(backend, path, Some(metrics), Some(read_work), options, None)
 }
 
 /// Mount the same Backend served by a local SDK, with existing-fd controls.

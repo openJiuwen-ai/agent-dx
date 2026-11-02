@@ -955,12 +955,6 @@ impl NodeReadiness {
             ReadinessObservation::from_sample(rdma_available, "RDMA sysfs sampler", rdma_error);
     }
 
-    pub fn force_sampler_in_flight_for_tests(&self) {
-        self.sampler_in_flight.store(true, Ordering::Release);
-        *self.sampler_started_at.lock().unwrap() =
-            Some(Instant::now() - READINESS_SAMPLER_BLOCKED_AFTER - Duration::from_secs(1));
-    }
-
     pub fn force_stale_registration_for_tests(&self) {
         if let Some(observed_at) = self.node_registration_last_success.lock().unwrap().as_mut() {
             *observed_at =
