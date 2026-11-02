@@ -1158,7 +1158,10 @@ def test_direct_missing_route_does_not_select_control_plane():
     def handler(request):
         calls.append(request.url.path)
         if request.url.path == "/api/instances":
-            return httpx.Response(200, json=[{"id": "environment-demo", "status": "failed", "failure": {"reason": "OomKilled"}}])
+            return httpx.Response(200, json=[{
+                "id": "environment-demo", "status": "failed",
+                "failure": {"reason": "OomKilled"},
+            }])
         if request.url.path == "/direct/environment-demo/invoke":
             return httpx.Response(404, text="environment route not found")
         raise AssertionError("failed Environment must not replay to control plane")
@@ -1216,7 +1219,8 @@ def test_direct_success_after_transient_missing_routes():
     c = _make_client(handler)
     with patch("adx_environment._transport.time.sleep"):
         for _ in range(2):
-            _check(c.invoke("environment-demo", "file.exists", {"path": "/"}) == {"via": "direct"}, "did not recover direct route")
+            result = c.invoke("environment-demo", "file.exists", {"path": "/"})
+            _check(result == {"via": "direct"}, "did not recover direct route")
     _check(len(set(calls[:3])) == len(set(calls[3:])) == 1, "retry identities changed")
     _check(calls[0] != calls[3], "independent operations reused identity")
     _check(not c._direct_disabled, "transient route misses disabled direct")
