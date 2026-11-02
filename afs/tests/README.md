@@ -328,6 +328,10 @@ python3 afs/tests/run.py run --case 'ownerfs.basic.*' --case 'dfs.basic.*' \
 - `all-basic`：local-basic＋cluster-manyread，共用matrix环境，完整结果包含LB01–08与MV01–08。
   MV是沿用的验收组编号，实际拓扑以每case的kind/namespace证据为准，不表示多VM通过。
 - `local-extended`：单VM执行额外OwnerFs对象身份/根创建竞争断言，供多机逻辑的本机定向诊断；不属于默认基础集合。
+- `s0-semantics`：DFS文件语义特征测试（A写，B/C经各自Node与FUSE读），断言**当前**行为：
+  提交后新OPEN可见、已打开读者在提交后能看到新版本（重构决策4a将改为open到close固定版本）、
+  unlink已打开文件后数据仍可读、close后他人stat立即看到新长度和mtime、fsync/fdatasync成功、
+  文件锁不跨节点互斥（决策11本轮不支持）。按决策改变的断言在对应重构步骤中同步更新；不属于默认基础集合。
 
 DFS远端路径记录新鲜读者的内容/长度/哈希和 `peer_read_ranges` RPC调用增量。
 RPC计数本身包含失败，不等于服务端成功；必须结合新鲜读者、内容正确、无外部后端来解释。
