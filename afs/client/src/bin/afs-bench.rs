@@ -126,7 +126,37 @@ struct Args {
     node_cgroup: Option<PathBuf>,
     max_node_mem_mib: u64,
     keep: bool,
+    workload: WorkloadSel,
+    ops: usize,
+    small_bytes: u64,
+    dir_entries: usize,
 }
+
+/// 选择运行哪些 workload；默认只跑原有的多文件读写，保持既有命令语义不变。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkloadSel {
+    MultiFile,
+    SmallFile,
+    Meta,
+    Txn,
+    All,
+}
+
+impl WorkloadSel {
+    fn includes(self, name: &str) -> bool {
+        match self {
+            WorkloadSel::All => true,
+            WorkloadSel::MultiFile => name == "multifile",
+            WorkloadSel::SmallFile => name == "smallfile",
+            WorkloadSel::Meta => name == "meta",
+            WorkloadSel::Txn => name == "txn",
+        }
+    }
+}
+
+const DEFAULT_OPS: usize = 2000;
+const DEFAULT_SMALL_BYTES: u64 = 4 * 1024;
+const DEFAULT_DIR_ENTRIES: usize = 10_000;
 
 fn parse_size(text: &str) -> Result<u64, String> {
     let text = text.trim();
@@ -175,6 +205,10 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut node_cgroup: Option<PathBuf> = None;
     let mut max_node_mem_mib: u64 = 0;
     let mut keep = false;
+    let mut workload = WorkloadSel::MultiFile;
+    let mut ops = DEFAULT_OPS;
+    let mut small_bytes = DEFAULT_SMALL_BYTES;
+    let mut dir_entries = DEFAULT_DIR_ENTRIES;
     let mut index = 0;
     while index < argv.len() {
         let flag = argv[index].clone();
@@ -235,6 +269,25 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
                     .map_err(|_| "invalid --max-node-mem".to_string())?
             }
             "--keep" => keep = true,
+            "--workload" => match value(&mut index)?.as_str() {
+                "multifile" => workload = WorkloadSel::MultiFile,
+                "smallfile" => workload = WorkloadSel::SmallFile,
+                "meta" => workload = WorkloadSel::Meta,
+                "txn" => workload = WorkloadSel::Txn,
+                "all" => workload = WorkloadSel::All,
+                other => return Err(format!("unknown workload: {other}")),
+            },
+            "--ops" => {
+                ops = value(&mut index)?
+                    .parse()
+                    .map_err(|_| "invalid --ops".to_string())?
+            }
+            "--small-bytes" => small_bytes = parse_size(&value(&mut index)?)?,
+            "--dir-entries" => {
+                dir_entries = value(&mut index)?
+                    .parse()
+                    .map_err(|_| "invalid --dir-entries".to_string())?
+            }
             "--help" | "-h" => return Err(String::new()),
             other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
             other => {
@@ -255,6 +308,12 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     }
     if files == 0 || threads == 0 || q == 0 || rounds == 0 {
         return Err("--files/--threads/--q/--rounds must be positive".into());
+    }
+    if ops == 0 || small_bytes == 0 || dir_entries == 0 {
+        return Err("--ops/--small-bytes/--dir-entries must be positive".into());
+    }
+    if usize::try_from(small_bytes).is_err() {
+        return Err("--small-bytes overflows usize".into());
     }
     if max_node_mem_mib.checked_mul(1024 * 1024).is_none() {
         return Err("--max-node-mem overflows the supported byte range".into());
@@ -292,6 +351,10 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         node_cgroup,
         max_node_mem_mib,
         keep,
+        workload,
+        ops,
+        small_bytes,
+        dir_entries,
     })
 }
 
@@ -299,7 +362,8 @@ fn usage() -> &'static str {
     "usage: afs-bench <mountpoint> [--sock <uds>] [--arm fuse|sdk|both] [--mode rw|write|read|mixed]\n\
      [--files N] [--file-bytes B] [--block B] [--threads N] [--q Q] [--rounds R]\n\
      [--settle-secs S] [--json <path>] [--gc-log <node.log>] [--node-cgroup <dir>]\n\
-     [--max-node-mem MiB] [--keep]"
+     [--max-node-mem MiB] [--keep]\n\
+     [--workload multifile|smallfile|meta|txn|all] [--ops N] [--small-bytes B] [--dir-entries N]"
 }
 
 // ---------------------------------------------------------------------------
@@ -451,6 +515,35 @@ struct PhaseStat {
     node_mem_source: String,
     verified: Option<bool>,
     threads: Vec<ThreadStat>,
+    /// 逐操作 workload 才有：完成的操作数与延迟分位（微秒）。
+    ops: Option<u64>,
+    latency: Option<LatencySummary>,
+}
+
+/// 逐操作延迟的分位汇总；样本在业务线程内按单调时钟采集。
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct LatencySummary {
+    p50_us: f64,
+    p99_us: f64,
+    max_us: f64,
+}
+
+impl LatencySummary {
+    fn from_micros(samples: &mut [f64]) -> Option<Self> {
+        if samples.is_empty() {
+            return None;
+        }
+        samples.sort_by(|a, b| a.total_cmp(b));
+        let pick = |q: f64| {
+            let rank = ((samples.len() as f64) * q).ceil() as usize;
+            samples[rank.clamp(1, samples.len()) - 1]
+        };
+        Some(LatencySummary {
+            p50_us: pick(0.50),
+            p99_us: pick(0.99),
+            max_us: samples[samples.len() - 1],
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -486,7 +579,12 @@ trait Workload {
 }
 
 fn registry() -> Vec<Box<dyn Workload>> {
-    vec![Box::new(MultiFileRw)]
+    vec![
+        Box::new(MultiFileRw),
+        Box::new(SmallFileRw),
+        Box::new(MetaOps),
+        Box::new(SyncTxn),
+    ]
 }
 
 fn settle(ctx: &BenchCtx, label: &str) -> Result<(), BoxError> {
@@ -1076,6 +1174,372 @@ impl Workload for MultiFileRw {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 逐操作 workload：小文件、元数据、open-fsync-close 小事务（FUSE 臂）
+//
+// 这些负载以单次 POSIX 操作为单位计时，报告 ops/s 与 p50/p99 延迟；数据面走挂载点，
+// 结果只对 FUSE 臂有意义（SDK 没有元数据接口）。--arm sdk 时这些 workload 跳过。
+// 工作目录固定在挂载点下 `afs-bench-<name>/`，每轮前清空重建，计时外完成。
+// ---------------------------------------------------------------------------
+
+fn op_dir(args: &Args, name: &str) -> PathBuf {
+    args.mountpoint.join(format!("afs-bench-{name}"))
+}
+
+/// 计时外重建空目录；目录不存在不报错，其他错误照常返回。
+fn reset_dir(dir: &Path) -> Result<(), BoxError> {
+    match std::fs::remove_dir_all(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    std::fs::create_dir_all(dir)?;
+    Ok(())
+}
+
+/// 一轮逐操作负载的原始结果：每线程的延迟样本（微秒）与是否校验通过。
+struct OpRun {
+    wall_s: f64,
+    node_cpu_s: f64,
+    meta_cpu_s: f64,
+    memory: MemoryObservation,
+    memory_source: String,
+    samples: Vec<f64>,
+    verified: Option<bool>,
+    bytes: u64,
+}
+
+/// 在 `threads` 个线程上并发跑 `per_thread(thread_index)`，统一采集 CPU、内存与墙钟。
+fn dispatch_ops<F>(ctx: &BenchCtx, threads: usize, per_thread: F) -> Result<OpRun, BoxError>
+where
+    F: Fn(usize) -> Result<(Vec<f64>, Option<bool>, u64), String> + Send + Sync + 'static,
+{
+    let per_thread = std::sync::Arc::new(per_thread);
+    let mem_sampler = MemorySampler::start(ctx.memory_target.clone());
+    let node_cpu0 = pids_cpu_seconds(&ctx.node_pids);
+    let meta_cpu0 = pids_cpu_seconds(&ctx.meta_pids);
+    let started = Instant::now();
+    let handles: Vec<_> = (0..threads)
+        .map(|thread_index| {
+            let work = per_thread.clone();
+            std::thread::spawn(move || work(thread_index))
+        })
+        .collect();
+    let mut samples = Vec::new();
+    let mut verified: Option<bool> = None;
+    let mut bytes = 0u64;
+    let mut first_error = None;
+    for handle in handles {
+        match handle.join() {
+            Ok(Ok((thread_samples, flag, thread_bytes))) => {
+                samples.extend(thread_samples);
+                if let Some(flag) = flag {
+                    verified = Some(verified.unwrap_or(true) && flag);
+                }
+                bytes += thread_bytes;
+            }
+            Ok(Err(error)) => {
+                first_error.get_or_insert(error);
+            }
+            Err(_) => {
+                first_error.get_or_insert_with(|| "op worker panicked".to_string());
+            }
+        }
+    }
+    let wall_s = started.elapsed().as_secs_f64();
+    let node_cpu_s = pids_cpu_seconds(&ctx.node_pids) - node_cpu0;
+    let meta_cpu_s = pids_cpu_seconds(&ctx.meta_pids) - meta_cpu0;
+    let memory = mem_sampler.stop();
+    if let Some(error) = first_error {
+        return Err(error.into());
+    }
+    Ok(OpRun {
+        wall_s,
+        node_cpu_s,
+        meta_cpu_s,
+        memory,
+        memory_source: ctx.memory_target.describe(),
+        samples,
+        verified,
+        bytes,
+    })
+}
+
+fn op_phase_stat(mut run: OpRun) -> PhaseStat {
+    let ops = run.samples.len() as u64;
+    PhaseStat {
+        wall_s: run.wall_s,
+        bytes: run.bytes,
+        throughput_bytes_per_s: if run.wall_s > 0.0 {
+            run.bytes as f64 / run.wall_s
+        } else {
+            0.0
+        },
+        node_cpu_s: run.node_cpu_s,
+        meta_cpu_s: run.meta_cpu_s,
+        node_mem_peak_bytes: run.memory.peak_bytes,
+        node_mem_observation_complete: run.memory.complete,
+        node_mem_source: run.memory_source.clone(),
+        verified: run.verified,
+        threads: Vec::new(),
+        ops: Some(ops),
+        latency: LatencySummary::from_micros(&mut run.samples),
+    }
+}
+
+/// 把 `ops` 个操作尽量均分到 `threads` 个线程，返回本线程负责的 [start, end)。
+fn op_range(ops: usize, threads: usize, thread_index: usize) -> (usize, usize) {
+    let base = ops / threads;
+    let extra = ops % threads;
+    let start = thread_index * base + thread_index.min(extra);
+    let len = base + usize::from(thread_index < extra);
+    (start, start + len)
+}
+
+fn micros_since(started: Instant) -> f64 {
+    started.elapsed().as_secs_f64() * 1e6
+}
+
+fn small_payload(index: usize, len: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; len];
+    payload_block(index, u64::MAX, &mut buf);
+    buf
+}
+
+/// 小文件：create+write+fsync+close（写相位），再 open+read+校验+close（读相位）。
+struct SmallFileRw;
+
+impl Workload for SmallFileRw {
+    fn name(&self) -> &'static str {
+        "smallfile"
+    }
+
+    fn run(&self, ctx: &BenchCtx) -> Result<Vec<CaseReport>, BoxError> {
+        if !ctx.args().arm.labels().contains(&"fuse") {
+            eprintln!("[afs-bench] smallfile runs on the fuse arm only; skipped");
+            return Ok(Vec::new());
+        }
+        let mut write_report = CaseReport {
+            name: "smallfile",
+            arm: "fuse",
+            phase: "write",
+            mode: "op",
+            rounds: Vec::new(),
+        };
+        let mut read_report = CaseReport {
+            name: "smallfile",
+            arm: "fuse",
+            phase: "read",
+            mode: "op",
+            rounds: Vec::new(),
+        };
+        for round in 0..ctx.args().rounds {
+            let dir = op_dir(ctx.args(), "smallfile");
+            reset_dir(&dir)?;
+            settle(ctx, &format!("smallfile round {}", round + 1))?;
+            let args = ctx.args().clone();
+            let write_dir = dir.clone();
+            let write = dispatch_ops(ctx, args.threads, move |thread_index| {
+                let (start, end) = op_range(args.ops, args.threads, thread_index);
+                let len = usize::try_from(args.small_bytes).map_err(|error| error.to_string())?;
+                let mut samples = Vec::with_capacity(end - start);
+                for index in start..end {
+                    let payload = small_payload(index, len);
+                    let started = Instant::now();
+                    let mut file = File::create(write_dir.join(format!("f{index:07}")))
+                        .map_err(|error| error.to_string())?;
+                    file.write_all(&payload)
+                        .map_err(|error| error.to_string())?;
+                    file.sync_all().map_err(|error| error.to_string())?;
+                    drop(file);
+                    samples.push(micros_since(started));
+                }
+                Ok((samples, None, (end - start) as u64 * args.small_bytes))
+            })?;
+            write_report.rounds.push(op_phase_stat(write));
+            let args = ctx.args().clone();
+            let read_dir = dir.clone();
+            let read = dispatch_ops(ctx, args.threads, move |thread_index| {
+                let (start, end) = op_range(args.ops, args.threads, thread_index);
+                let len = usize::try_from(args.small_bytes).map_err(|error| error.to_string())?;
+                let mut samples = Vec::with_capacity(end - start);
+                let mut verified = true;
+                let mut buf = vec![0u8; len];
+                for index in start..end {
+                    let started = Instant::now();
+                    let file = File::open(read_dir.join(format!("f{index:07}")))
+                        .map_err(|error| error.to_string())?;
+                    file.read_exact_at(&mut buf, 0)
+                        .map_err(|error| error.to_string())?;
+                    drop(file);
+                    samples.push(micros_since(started));
+                    verified &= buf == small_payload(index, len);
+                }
+                Ok((
+                    samples,
+                    Some(verified),
+                    (end - start) as u64 * args.small_bytes,
+                ))
+            })?;
+            read_report.rounds.push(op_phase_stat(read));
+        }
+        if !ctx.args().keep {
+            reset_dir(&op_dir(ctx.args(), "smallfile"))?;
+            std::fs::remove_dir(op_dir(ctx.args(), "smallfile"))?;
+        }
+        Ok(vec![write_report, read_report])
+    }
+}
+
+/// 元数据：在一个预先填充 `--dir-entries` 个文件的大目录里，逐操作计时
+/// create、stat、rename、unlink；另测 readdir 整目录一次的耗时。
+struct MetaOps;
+
+impl Workload for MetaOps {
+    fn name(&self) -> &'static str {
+        "meta"
+    }
+
+    fn run(&self, ctx: &BenchCtx) -> Result<Vec<CaseReport>, BoxError> {
+        if !ctx.args().arm.labels().contains(&"fuse") {
+            eprintln!("[afs-bench] meta runs on the fuse arm only; skipped");
+            return Ok(Vec::new());
+        }
+        let phases = ["create", "stat", "rename", "unlink", "readdir"];
+        let mut reports: Vec<CaseReport> = phases
+            .iter()
+            .map(|phase| CaseReport {
+                name: "meta",
+                arm: "fuse",
+                phase,
+                mode: "op",
+                rounds: Vec::new(),
+            })
+            .collect();
+        for round in 0..ctx.args().rounds {
+            let dir = op_dir(ctx.args(), "meta");
+            reset_dir(&dir)?;
+            // 计时外把目录填到 --dir-entries 个条目，测"大目录下"的元数据开销。
+            for index in 0..ctx.args().dir_entries {
+                File::create(dir.join(format!("fill{index:07}")))?;
+            }
+            settle(ctx, &format!("meta round {}", round + 1))?;
+            for (position, phase) in phases.iter().enumerate() {
+                let args = ctx.args().clone();
+                let phase_dir = dir.clone();
+                let phase = *phase;
+                let threads = if phase == "readdir" { 1 } else { args.threads };
+                let run = dispatch_ops(ctx, threads, move |thread_index| {
+                    let (start, end) = if phase == "readdir" {
+                        (0, 1)
+                    } else {
+                        op_range(args.ops, args.threads, thread_index)
+                    };
+                    let mut samples = Vec::with_capacity(end - start);
+                    let mut verified = true;
+                    for index in start..end {
+                        let name = phase_dir.join(format!("m{index:07}"));
+                        let started = Instant::now();
+                        match phase {
+                            "create" => {
+                                File::create(&name).map_err(|error| error.to_string())?;
+                            }
+                            "stat" => {
+                                std::fs::metadata(&name).map_err(|error| error.to_string())?;
+                            }
+                            "rename" => {
+                                std::fs::rename(&name, phase_dir.join(format!("r{index:07}")))
+                                    .map_err(|error| error.to_string())?;
+                            }
+                            "unlink" => {
+                                std::fs::remove_file(phase_dir.join(format!("r{index:07}")))
+                                    .map_err(|error| error.to_string())?;
+                            }
+                            _ => {
+                                let count = std::fs::read_dir(&phase_dir)
+                                    .map_err(|error| error.to_string())?
+                                    .count();
+                                verified &= count == args.dir_entries;
+                            }
+                        }
+                        samples.push(micros_since(started));
+                    }
+                    let flag = (phase == "readdir").then_some(verified);
+                    Ok((samples, flag, 0))
+                })?;
+                reports[position].rounds.push(op_phase_stat(run));
+            }
+        }
+        if !ctx.args().keep {
+            let dir = op_dir(ctx.args(), "meta");
+            reset_dir(&dir)?;
+            std::fs::remove_dir(&dir)?;
+        }
+        Ok(reports)
+    }
+}
+
+/// open-write-fsync-close 小事务：对同一组已存在的文件反复覆盖写一小段并 fsync，
+/// 衡量"一次可靠小写入"的端到端延迟（含提交与持久屏障）。
+struct SyncTxn;
+
+impl Workload for SyncTxn {
+    fn name(&self) -> &'static str {
+        "txn"
+    }
+
+    fn run(&self, ctx: &BenchCtx) -> Result<Vec<CaseReport>, BoxError> {
+        if !ctx.args().arm.labels().contains(&"fuse") {
+            eprintln!("[afs-bench] txn runs on the fuse arm only; skipped");
+            return Ok(Vec::new());
+        }
+        let mut report = CaseReport {
+            name: "txn",
+            arm: "fuse",
+            phase: "fsync",
+            mode: "op",
+            rounds: Vec::new(),
+        };
+        for round in 0..ctx.args().rounds {
+            let dir = op_dir(ctx.args(), "txn");
+            reset_dir(&dir)?;
+            for thread_index in 0..ctx.args().threads {
+                File::create(dir.join(format!("t{thread_index:03}")))?;
+            }
+            settle(ctx, &format!("txn round {}", round + 1))?;
+            let args = ctx.args().clone();
+            let txn_dir = dir.clone();
+            let run = dispatch_ops(ctx, args.threads, move |thread_index| {
+                let (start, end) = op_range(args.ops, args.threads, thread_index);
+                let len = usize::try_from(args.small_bytes).map_err(|error| error.to_string())?;
+                let path = txn_dir.join(format!("t{thread_index:03}"));
+                let mut samples = Vec::with_capacity(end - start);
+                for index in start..end {
+                    let payload = small_payload(index, len);
+                    let started = Instant::now();
+                    let file = OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .map_err(|error| error.to_string())?;
+                    file.write_all_at(&payload, 0)
+                        .map_err(|error| error.to_string())?;
+                    file.sync_all().map_err(|error| error.to_string())?;
+                    drop(file);
+                    samples.push(micros_since(started));
+                }
+                Ok((samples, None, (end - start) as u64 * args.small_bytes))
+            })?;
+            report.rounds.push(op_phase_stat(run));
+        }
+        if !ctx.args().keep {
+            let dir = op_dir(ctx.args(), "txn");
+            reset_dir(&dir)?;
+            std::fs::remove_dir(&dir)?;
+        }
+        Ok(vec![report])
+    }
+}
+
 /// 一个 (phase, file 集合) 任务；同任务内文件串行，跨任务并发。
 #[derive(Clone)]
 struct Job {
@@ -1527,7 +1991,7 @@ fn json_escape(text: &str) -> String {
 
 fn emit_report(identity: &EnvIdentity, reports: &[CaseReport]) -> String {
     let mut out = String::new();
-    out.push_str("{\n  \"tool\": \"afs-bench\",\n  \"schema\": 2,\n");
+    out.push_str("{\n  \"tool\": \"afs-bench\",\n  \"schema\": 3,\n");
     out.push_str(&format!(
         "  \"env\": {{\"host\": \"{}\", \"kernel\": \"{}\", \"arch\": \"{}\", \"nproc\": {}, \"argv\": \"{}\"}},\n",
         json_escape(&identity.host),
@@ -1563,7 +2027,7 @@ fn emit_report(identity: &EnvIdentity, reports: &[CaseReport]) -> String {
                 })
                 .collect();
             out.push_str(&format!(
-                "       {{\"wall_s\": {:.6}, \"bytes\": {}, \"throughput_bytes_per_s\": {:.1}, \"node_cpu_s\": {:.3}, \"meta_cpu_s\": {:.3}, \"node_mem_peak_bytes\": {}, \"node_mem_observation_complete\": {}, \"node_mem_source\": \"{}\", \"verified\": {}, \"threads\": [{}]}}{}\n",
+                "       {{\"wall_s\": {:.6}, \"bytes\": {}, \"throughput_bytes_per_s\": {:.1}, \"node_cpu_s\": {:.3}, \"meta_cpu_s\": {:.3}, \"node_mem_peak_bytes\": {}, \"node_mem_observation_complete\": {}, \"node_mem_source\": \"{}\", \"verified\": {}, \"ops\": {}, \"latency_us\": {}, \"threads\": [{}]}}{}\n",
                 round.wall_s,
                 round.bytes,
                 round.throughput_bytes_per_s,
@@ -1573,6 +2037,11 @@ fn emit_report(identity: &EnvIdentity, reports: &[CaseReport]) -> String {
                 round.node_mem_observation_complete,
                 json_escape(&round.node_mem_source),
                 round.verified.map(|flag| flag.to_string()).unwrap_or_else(|| "null".into()),
+                round.ops.map(|value| value.to_string()).unwrap_or_else(|| "null".into()),
+                round.latency.map(|lat| format!(
+                    "{{\"p50\": {:.1}, \"p99\": {:.1}, \"max\": {:.1}}}",
+                    lat.p50_us, lat.p99_us, lat.max_us
+                )).unwrap_or_else(|| "null".into()),
                 threads.join(", "),
                 if round_position + 1 < report.rounds.len() { "," } else { "" }
             ));
@@ -1712,6 +2181,9 @@ fn run(argv: &[String], args: Args) -> Result<(), BoxError> {
     };
     let mut reports = Vec::new();
     for workload in registry() {
+        if !ctx.args().workload.includes(workload.name()) {
+            continue;
+        }
         eprintln!("[afs-bench] workload {}", workload.name());
         reports.extend(workload.run(&ctx)?);
     }
@@ -1825,6 +2297,83 @@ mod tests {
         assert!(build(&["/mnt", "--arm", "nope"]).is_err());
         assert!(build(&["/mnt", "--file-bytes", "1M", "--block", "4097"]).is_err());
         assert!(build(&["/mnt", "--threads", "0"]).is_err());
+    }
+
+    #[test]
+    fn latency_summary_uses_nearest_rank() {
+        let mut samples: Vec<f64> = (1..=100).map(f64::from).collect();
+        let summary = LatencySummary::from_micros(&mut samples).unwrap();
+        assert_eq!(summary.p50_us, 50.0);
+        assert_eq!(summary.p99_us, 99.0);
+        assert_eq!(summary.max_us, 100.0);
+        assert!(LatencySummary::from_micros(&mut []).is_none());
+        let mut one = vec![7.0];
+        let single = LatencySummary::from_micros(&mut one).unwrap();
+        assert_eq!(
+            (single.p50_us, single.p99_us, single.max_us),
+            (7.0, 7.0, 7.0)
+        );
+    }
+
+    #[test]
+    fn op_range_covers_every_op_once() {
+        for (ops, threads) in [(10, 3), (3, 8), (2000, 16), (1, 1)] {
+            let mut covered = vec![0u32; ops];
+            for thread_index in 0..threads {
+                let (start, end) = op_range(ops, threads, thread_index);
+                for slot in &mut covered[start..end] {
+                    *slot += 1;
+                }
+            }
+            assert!(
+                covered.iter().all(|count| *count == 1),
+                "ops={ops} threads={threads}"
+            );
+        }
+    }
+
+    #[test]
+    fn workload_selection_defaults_to_multifile_only() {
+        let args = parse_args(&["/mnt".to_string()]).unwrap();
+        assert_eq!(args.workload, WorkloadSel::MultiFile);
+        assert!(args.workload.includes("multifile"));
+        assert!(!args.workload.includes("meta"));
+        let all = parse_args(&["/mnt".into(), "--workload".into(), "all".into()]).unwrap();
+        for name in ["multifile", "smallfile", "meta", "txn"] {
+            assert!(all.workload.includes(name));
+        }
+        assert!(parse_args(&["/mnt".into(), "--ops".into(), "0".into()]).is_err());
+    }
+
+    #[test]
+    fn emit_report_includes_ops_and_latency() {
+        let report = CaseReport {
+            name: "meta",
+            arm: "fuse",
+            phase: "create",
+            mode: "op",
+            rounds: vec![PhaseStat {
+                wall_s: 1.0,
+                ops: Some(3),
+                latency: Some(LatencySummary {
+                    p50_us: 10.0,
+                    p99_us: 20.0,
+                    max_us: 30.0,
+                }),
+                ..Default::default()
+            }],
+        };
+        let identity = EnvIdentity {
+            host: "h".into(),
+            kernel: "k".into(),
+            arch: "x".into(),
+            nproc: 1,
+            argv: "a".into(),
+        };
+        let json = emit_report(&identity, &[report]);
+        assert!(json.contains("\"schema\": 3"));
+        assert!(json.contains("\"ops\": 3"));
+        assert!(json.contains("\"p99\": 20.0"));
     }
 
     #[test]
@@ -2474,7 +3023,7 @@ mod finish_regressions {
             }],
         };
         let json = emit_report(&identity, &[report]);
-        assert!(json.contains("\"schema\": 2"));
+        assert!(json.contains("\"schema\": 3"));
         assert!(json.contains("\"node_mem_peak_bytes\": 1024"));
         assert!(json.contains("\"node_mem_observation_complete\": false"));
         assert!(json.contains("\"node_mem_source\": \"test source\""));
