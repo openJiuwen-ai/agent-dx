@@ -81,6 +81,16 @@ SHM 的 memfd、sealing 与原子 CLOEXEC FD 传递实现及对应运行测试�
 
 必要正确性边界仍需保留：读写新鲜度、close-to-open、权限和 suid/sgid 清除、错误传播、持久化屏障、direct-I/O mmap 能力协商、正常卸载和受管引用排空。
 
+OwnerFs 的关闭语义与上一条边界的关系需要单独说明，因为默认行为已改变：
+
+- 独占本地 root（本节点持有 local grant 且没有任何 peer 校验过该 root）上的普通 `close`/`flush`
+  不再对文件执行 `fdatasync`。`close` 成功只表示数据已交给本机内核页缓存，掉电或内核崩溃可能丢失
+  最近写入；这不是"已落盘"的保证。
+- 需要"close 即持久"时设置 `AFS_OWNERFS_CLOSE_SYNC=1`，逐 handle 恢复同步；peer 共享的 root
+  始终保留 close 同步，不受该开关影响。
+- 显式 `fsync`/`fdatasync` 与 `O_SYNC`/`O_DSYNC` 句柄的持久保证不因该开关改变。
+- 跨节点可见性仍由 Meta 提交序列与 `validate_peer` 决定，不依赖 close 同步。
+
 原生DFS新open取得fresh状态，已打开读视图最多复用5秒、命中不续期；Node/session
 授权与版本视图分别检查，已知失效停止交付。A当前已验证对象单槽最多4MiB，与在途
 正文共用8MiB容量；B可显式启用可丢弃的磁盘读缓存，不新增常驻正文RAM缓存。具体期限、断链、失效与资源范围见

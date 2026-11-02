@@ -1938,26 +1938,6 @@ impl AfsFuse {
         );
     }
 
-    /// True when OwnerFs answers this inode from an exclusively owned local
-    /// root, so the request may run on the receive thread under the per-handle
-    /// turn bookkeeping instead of paying for a worker handoff.
-    fn ownerfs_private_local(&self, ino: u64) -> bool {
-        let Ok(inode) = self.backend_inode(ino) else {
-            return false;
-        };
-        #[cfg(feature = "ownerfs")]
-        {
-            self.ownerfs
-                .as_ref()
-                .is_some_and(|ownerfs| ownerfs.is_private_local_inode(inode))
-        }
-        #[cfg(not(feature = "ownerfs"))]
-        {
-            let _ = inode;
-            false
-        }
-    }
-
     fn record_io_request(&self, operation: &'static str, bytes: usize) {
         if let Some((metrics, filesystem)) = &self.requests {
             metrics.record_io(filesystem, operation, bytes);
@@ -2326,16 +2306,12 @@ impl Filesystem for AfsFuse {
             }
         };
         if let Some(fh) = fh.filter(|_| !inline_local_read) {
-            if self.ownerfs_private_local(ino) {
-                // Keep the per-handle turn, but run it here when the turn is
-                // free: a private local root answers from memory, so a worker
-                // handoff costs more than the work itself.
-                self.dispatch
-                    .try_run_keyed(self.file_dispatch_key(ino, fh), run);
-            } else {
-                self.dispatch
-                    .submit_keyed(self.file_dispatch_key(ino, fh), run);
-            }
+            // Every read that needs the per-handle turn goes through the worker
+            // queue. Running the turn on the receive thread would park it behind
+            // the copy and the backend read of an unrelated file, so there is no
+            // "private local root" shortcut here.
+            self.dispatch
+                .try_run_keyed(self.file_dispatch_key(ino, fh), run);
         } else {
             run();
         }

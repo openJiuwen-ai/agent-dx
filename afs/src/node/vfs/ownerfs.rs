@@ -28,8 +28,7 @@ use fuser::Notifier;
 
 use self::root::{PresentedRootAccess, RootGrant, RootId, RootManager, RootRight};
 use super::{
-    Backend,
-    WriteAdmissionMode,
+    Backend, WriteAdmissionMode,
     locks::{LockError, LockRequest, LockTable, LockTableLimits, LockWaiterId, LockWaiterOutcome},
     types::{
         AttributeChange, BackendInode, CreatedFile, DirectoryEntry, DirectoryHandle, Entry,
@@ -271,19 +270,6 @@ impl OwnerFs {
             .as_ref()
             .and_then(|local| local.private_root_for_inode(inode.value))
             .is_some()
-    }
-
-    /// An inode this node answers purely from its own disk while holding the
-    /// exclusive grant, so a stale answer cannot come from a peer writer.
-    /// Used to decide whether a callback can run on the FUSE receive thread.
-    pub(crate) fn is_private_local_inode(&self, inode: BackendInode) -> bool {
-        let Some(local) = self.local.as_deref() else {
-            return false;
-        };
-        if local.native_home_enabled() {
-            return false;
-        }
-        local.is_private_local_inode(inode.value)
     }
 
     /// Periodic Home-side cleanup for peer process sessions that Meta has
@@ -1175,43 +1161,24 @@ impl Backend for OwnerFs {
             .write_with_options(handle, offset, data, options)
     }
 
-    /// Mirror the DFS admission policy: a write that cannot block on
-    /// publication, peer capacity or a durability barrier runs on the FUSE
-    /// receive thread, keeping the same per-handle turn bookkeeping. Anything
-    /// that may wait stays on a worker so the receiver can keep admitting
-    /// unrelated requests and writeback.
-    fn write_admission_mode(&self, handle: FileHandle) -> WriteAdmissionMode {
-        let Some(local) = self.local.as_deref() else {
-            return WriteAdmissionMode::Queued;
-        };
-        if local.native_home_enabled() {
-            return WriteAdmissionMode::Queued;
-        }
-        let Ok(slot) = local.open_file_handle(handle) else {
-            return WriteAdmissionMode::Queued;
-        };
-        // Never wait for this handle here. `write_with_options` holds the slot
-        // lock across the real `write_at` and, for `O_SYNC`/`O_DSYNC` handles,
-        // across `sync_data` as well. Blocking on it would park the FUSE receive
-        // thread that is admitting this request, which is exactly what this
-        // admission decision exists to avoid: a writeback write still in flight
-        // would then stall every unrelated request on the mount. If the handle is
-        // busy, hand the write to a worker instead of inspecting it.
-        let slot = match slot.try_lock() {
-            Ok(slot) => slot,
-            Err(std::sync::TryLockError::WouldBlock) => return WriteAdmissionMode::Queued,
-            Err(std::sync::TryLockError::Poisoned(_)) => return WriteAdmissionMode::Queued,
-        };
-        match &slot.file {
-            OpenFileHandle::Local(file)
-                if file.write_sync == WriteSyncMode::None
-                    && file.fatal_sync_error.is_none()
-                    && local.root_is_private(&file.handle.root_id) =>
-            {
-                WriteAdmissionMode::Borrowed
-            }
-            _ => WriteAdmissionMode::Queued,
-        }
+    /// Every write is dispatched to a worker.
+    ///
+    /// The DFS policy this used to mirror admits a write to the receive thread
+    /// when it "cannot block". For OwnerFs that condition is not decidable up
+    /// front: a local write takes the per-handle lock and performs a synchronous
+    /// `pwrite`, and with `Borrowed` admission the receive thread first waits for
+    /// that handle's FIFO turn on `run_borrowed_keyed`. `try_lock` only removes
+    /// the wait on the lock probe; it cannot make the following write, or the
+    /// turn wait in front of it, non-blocking. A single slow write would
+    /// therefore stop the receive thread from admitting unrelated requests,
+    /// including the kernel writeback that a dirty-page workload depends on.
+    ///
+    /// Ordering, bounded memory and backpressure are all preserved by the keyed
+    /// worker queue: `submit_keyed` keeps the per-handle FIFO turn, and an owned
+    /// (copied) input buffer keeps the receiver's data lifetime independent of
+    /// the request.
+    fn write_admission_mode(&self, _handle: FileHandle) -> WriteAdmissionMode {
+        WriteAdmissionMode::Queued
     }
 
     fn flush(&self, _: &RequestContext, handle: FileHandle) -> Result<()> {
@@ -2231,12 +2198,6 @@ impl LocalOwnerFs {
         self.roots.has_active_local_root(&id).then_some(id)
     }
 
-    /// True when this node holds the exclusive local grant for the root, so no
-    /// peer writer can mutate the file while this node holds the handle.
-    fn root_is_private(&self, root_id: &RootId) -> bool {
-        self.roots.has_active_local_root(root_id)
-    }
-
     /// True only when this node is the sole party that can observe the root:
     /// it holds the active local grant *and* no peer has ever validated access
     /// to it.
@@ -2254,15 +2215,6 @@ impl LocalOwnerFs {
             // optimisation.
             Err(_) => false,
         }
-    }
-
-    /// Whether this node owns the inode's root exclusively, so a metadata answer
-    /// cannot be stale relative to a peer writer.
-    pub(crate) fn is_private_local_inode(&self, inode: u64) -> bool {
-        if inode == OWNERFS_ROOT_INODE {
-            return true;
-        }
-        self.private_root_for_inode(inode).is_some()
     }
 
     fn remote_for_record(&self, record: &NodeRecord, right: RootRight) -> Result<RemoteRoot> {
@@ -2521,7 +2473,10 @@ impl LocalOwnerFs {
         data_dir: &StoragePath,
         parent: &StoragePath,
         expected: &files::FileIdentity,
-    ) -> Result<(FileAttributes, <LocalFs as crate::node::storage::FileStore>::Directory)> {
+    ) -> Result<(
+        FileAttributes,
+        <LocalFs as crate::node::storage::FileStore>::Directory,
+    )> {
         let physical = data_dir.join_path(parent).map_err(Error::from)?;
         let dir = self.disk.open_dir(&physical).map_err(Error::from)?;
         let metadata = dir.metadata().map_err(Error::from)?;
@@ -4163,8 +4118,9 @@ impl LocalOwnerFs {
         if created_new {
             authorize_create_in_directory(ctx, &parent_attributes)?;
         }
-        let create_file = LocalFs::open_child_in(&parent_dir, name, OpenSpec::new(create_flags, mode))
-            .map_err(Error::from)?;
+        let create_file =
+            LocalFs::open_child_in(&parent_dir, name, OpenSpec::new(create_flags, mode))
+                .map_err(Error::from)?;
         let mark_create_open = create_trace.elapsed();
         if created_new {
             apply_created_file_owner_and_mode(
@@ -4182,15 +4138,11 @@ impl LocalOwnerFs {
         // the access mode the caller asked for (and without O_CREAT). The create
         // descriptor cannot be handed out directly, e.g. a read-only create
         // (O_RDONLY|O_EXCL) must still yield a readable handle.
-        let file = LocalFs::open_child_in(
-            &parent_dir,
-            name,
-            OpenSpec::new(flags & !libc::O_CREAT, 0),
-        )
-        .map_err(Error::from)?;
+        let file =
+            LocalFs::open_child_in(&parent_dir, name, OpenSpec::new(flags & !libc::O_CREAT, 0))
+                .map_err(Error::from)?;
         drop(parent_dir);
-        let reopened_identity =
-            identity_from_metadata(&file.metadata().map_err(Error::from)?)?;
+        let reopened_identity = identity_from_metadata(&file.metadata().map_err(Error::from)?)?;
         if reopened_identity != created_identity {
             return Err(stale("created file was replaced before readonly reopen"));
         }
@@ -12432,6 +12384,40 @@ mod tests {
         let mut new = [0_u8; 4];
         fs.read(&ctx, second.handle, 0, &mut new).unwrap();
         assert_eq!(&new, b"BBBB");
+    }
+
+    /// Regression for the receive-thread blockage: a plain write used to be
+    /// admitted on the FUSE receive thread whenever the handle looked idle,
+    /// because `try_lock` made the probe non-blocking. That decision cannot see
+    /// the FIFO turn wait and the synchronous `pwrite` behind it, so it is gone
+    /// and every write must be dispatched to a worker.
+    #[test]
+    fn plain_write_is_never_admitted_on_the_receive_thread() {
+        let (_temp, fs, ctx) = fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let workspace = fs.mkdir(&ctx, root, OsStr::new("job-77"), 0o755).unwrap();
+        let created = fs
+            .create(
+                &ctx,
+                workspace.inode,
+                OsStr::new("plain.txt"),
+                0o644,
+                libc::O_RDWR,
+            )
+            .unwrap();
+
+        // A private local root with a non-syncing handle is exactly the shape the
+        // removed shortcut used to claim as "cannot block".
+        assert_eq!(
+            fs.write_admission_mode(created.handle),
+            WriteAdmissionMode::Queued
+        );
+
+        // A second idle handle on the same file must not reopen the shortcut.
+        let second = fs.open(&ctx, created.entry.inode, libc::O_WRONLY).unwrap();
+        assert_eq!(fs.write_admission_mode(second), WriteAdmissionMode::Queued);
     }
 
     #[test]
