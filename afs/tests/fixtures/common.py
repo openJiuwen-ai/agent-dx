@@ -94,13 +94,13 @@ class Case:
 
 def is_single_host(config):
     return config["kind"] == "singlevm" or (
-        config["kind"] == "kubernetes" and config.get("topology") == "local"
+        config["kind"] in ("kubernetes", "docker") and config.get("topology") == "local"
     )
 
 
 def needs_reader_c(case, kind, topology=None):
     return case.id.endswith(".many_readers") or (
-        (kind == "singlevm" or (kind == "kubernetes" and topology == "local"))
+        (kind == "singlevm" or (kind in ("kubernetes", "docker") and topology == "local"))
         and case.mode == "dfs" and (case.profile is None or case.profile.node_count == 3)
     )
 

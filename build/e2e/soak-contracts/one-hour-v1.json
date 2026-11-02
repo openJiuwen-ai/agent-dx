@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "id": "afs-continuous-1h-v1",
+  "scope": "OwnerFs or DFS continuous fixed-package SDK I/O and lifecycle; no injected faults or performance SLA",
+  "seconds": 3600,
+  "sample_seconds": 15,
+  "maximum_sample_gap_seconds": 45,
+  "maximum_progress_stall_seconds": 45,
+  "maximum_boundary_gap_seconds": 30,
+  "warmup_seconds": 600,
+  "window_seconds": 300,
+  "minimum_window_samples": 12,
+  "minimum_window_cycles": 25,
+  "minimum_window_churn": 10,
+  "minimum_total_cycles": 600,
+  "minimum_total_churn": 300,
+  "min_free_bytes": 2147483648,
+  "peak_growth": {
+    "memory_bytes": 536870912,
+    "memory_anon_bytes": 134217728,
+    "runtime_memory_bytes": 134217728,
+    "runtime_anon_bytes": 67108864,
+    "rss_bytes": 134217728,
+    "disk_bytes": 268435456,
+    "disk_data_bytes": 67108864,
+    "log_bytes": 134217728,
+    "runtime_disk_bytes": 134217728,
+    "fds": 128,
+    "mounts": 8
+  },
+  "trends": {
+    "memory_anon_bytes": {"maximum_end_delta": 33554432, "maximum_slope_per_hour": 16777216},
+    "runtime_anon_bytes": {"maximum_end_delta": 16777216, "maximum_slope_per_hour": 8388608},
+    "rss_bytes": {"maximum_end_delta": 33554432, "maximum_slope_per_hour": 16777216},
+    "disk_data_bytes": {"maximum_end_delta": 33554432, "maximum_slope_per_hour": 16777216},
+    "runtime_disk_bytes": {"maximum_end_delta": 33554432, "maximum_slope_per_hour": 16777216},
+    "fds": {"maximum_end_delta": 4, "maximum_slope_per_hour": 4},
+    "mounts": {"maximum_end_delta": 1, "maximum_slope_per_hour": 1}
+  },
+  "process_rss_trend": {"maximum_end_delta": 16777216, "maximum_slope_per_hour": 8388608},
+  "error_policy": "fail on first error; no retries, replacements, omitted samples, intentional restart or weakened thresholds",
+  "cleanup_policy": "SDK worker terminal, explicit Environment deletion, empty backend, normal AFS unmount/process exit, then Docker cleanup; all required"
+}

@@ -1,7 +1,7 @@
 <a id="top"></a>
 # ADX／AFS 测试规范：五步验证路径
 
-状态：2026-11-01。CI0–CI4及默认AFS冒烟已合入，[MR130](https://gitcode.com/openJiuwen/agent-dx/merge_requests/130)对应master `4bbc6b26`。合入前Full90通过；合入后Base232的envd获取阻塞另提[MR131](https://gitcode.com/openJiuwen/agent-dx/merge_requests/131)修复。修复候选Base235默认冒烟首次通过，正常Full91也已首次通过并完成严格附件复核；MR131尚未合入，不称master已完成本轮复核。
+状态：2026-11-02。CI0–CI4及默认AFS冒烟已合入。固定Base236的非K8s拿包路径已完成：先跑通组件，再通过ADX SDK和组合功能Full。首批恢复和有界压力专项也已跑通。PK3正式一小时合同已冻结并实跑：OwnerFs、DFS均因AFS Node的FD增长超限提前失败，未取得一小时PASS。后续短诊断已确认OwnerFs远端目录释放缺口，以及DFS读缓存256项封顶；OwnerFs修复交由Issue73跟进；DFS有界缓存已注册组件回归，FD合同v3单独冻结。旧失败不改绿，v3的新SDK观测准入和修复包正式长稳仍待执行。标准兼容、跨VM、全天长稳和性能仍分别验收。已验证的PK1／PK2／PK3测试资产通过[MR135](https://gitcode.com/openJiuwen/agent-dx/merge_requests/135)独立交付，OwnerFs修复不作为这些测试资产合入的前置条件；正式长稳仍单独验收。具体候选、失败记录和边界见本页对应步骤。
 
 先按下方五步理解验证时机，再用同页总表看现状与待补项；目录、环境、入口、具体版本及失败证据在对应步骤展开。
 
@@ -26,15 +26,16 @@
 | ① 基础UT／LLT | 尽早发现模块规则、错误传播、状态机及接口合同回归 | 已有8个AFS crate测试入口；普通非ignored测试已接ON组件构建 | Linux；UT在源文件，LLT在域内tests；`make afs-test`／选包 `cargo test` | 固定推荐范围、说明feature/ignored边界；新功能按代码补UT，不另造runner | 维护基线；P0明确范围 |
 | ② 单VM集成 | 验证真实Meta/Node、FUSE/bind、数据/权限/缓存和正常恢复/清理 | 统一入口已实现；历史冻结候选基础11/11通过；当前登记13基础＋2扩展，按实际制品/环境分别验收 | 一台Linux VM；`afs/tests/run.py`＋`suites/`＋local/exec适配 | 此前冻结输入的新构建阻塞保留为历史；后续新版本持续跑对应本地集合 | P0基础已完成 |
 | ③ 多namespace集成 | 验证隔离节点的真实TCP/mTLS、远端数据路径、恢复和多读者 | 一VM多namespace已实现；历史冻结候选三角色基础＋C读者9/9通过，不继承为当前其它环境的成绩 | 一VM的M/A/B/C隔离角色；标准Linux环境说明；`cluster-basic`／`cluster-manyread`；同run.py | 可选SSH真实多VM适配未实跑；不宣称VM断电/宿主故障隔离 | P1基础已完成 |
-| ④ Buildkite流水线验证 | 防止共享候选包破坏AFS/ADX；流水线内必测、事件触发、合入保护分别验收 | 上游MR126–130已合入；envd工具修复候选Base235新包/默认公共2＋AFS5＋SDK12首次通过；正常Full91公共11＋AFS24＋SDK16及正常清理首次通过，MR131待合入 | 既有目标K8s；`run-e2e.sh` → `afs_gate.py`；组件复用AFS `run.py`，SDK融入ADX公共E2E | 评审合入MR131及合入后正式候选复核，再进入PK0；公共Redis Issue71、外部relay/合入强制分别核验 | P1修复候选验收／合入；后续PK0 |
-| ⑤ 固定包验收 | 人或AI可自主部署、验收和复现，扩大版本质量验证 | 公共K8s Full、Docker单宿主11组和专项已有；只有5分钟soak/90秒采样，完整长稳未闭环 | 先备固定包/SDK/backend/bundle及合格环境；直接公共E2E或独立Full代跑 | PK0–PK4：拿包复现→产品Full→专项→公共长稳→受控性能；复用第四步适配，补说明/负载/判据 | P1可复现全量/专项；P2长稳/性能 |
+| ④ Buildkite流水线验证 | 防止共享候选包破坏AFS/ADX；流水线内必测、事件触发、合入保护分别验收 | 上游MR126–130已合入；envd工具修复候选Base235新包/默认公共2＋AFS5＋SDK12首次通过；正常Full91公共11＋AFS24＋SDK16及正常清理首次通过，MR131已合入；Base236保留envd首败、一次原条件retry后新包和默认冒烟通过，69项关键回执独立核验 | 既有目标K8s；`run-e2e.sh` → `afs_gate.py`；组件复用AFS `run.py`，SDK融入ADX公共E2E | 维护默认门禁；envd间歇获取、公共Redis Issue71、外部relay/合入强制分别核验 | 维护默认门禁；P1专项 |
+| ⑤ 固定包验收 | 人或AI可自主部署、验收和复现，扩大版本质量验证 | PK0非K8s组件4例通过；PK1固定Base236在单Linux VM／Docker的公共11组＋AFS24项＋SDK16项组合Full通过，正常清理通过；PK2首批恢复／压力代表通过；PK3短资格通过；正式一小时两模式均被FD增长上限拦截，未跑满，原失败与正常清理证据保留 | 固定包/SDK/backend/bundle＋合格环境；公共 `build/e2e/run.py` 定向运行，`build/e2e/afs_gate.py` 运行Docker组合Full；K8s仍走原入口 | PK2标准兼容仍待；P1修OwnerFs远端目录释放并补回归；DFS按已验证的256项缓存修订FD预算合同，再固定修复候选重验；PK4受控性能另验；K8s直接运行新增参数仍只有工具验证，不继承Docker结果 | P1专项；P2长稳/性能 |
 
 ## 统一口径与优先级
 
 - **已定原则／决策**：组件UT/集成归AFS，真实组件测试统一目标 `afs/tests/`；ADX公开SDK及完整产品场景归 `build/e2e/`。本地、CI、拿包验收复用断言和结果语义，按环境适配，不复制一套Buildkite专用业务用例。
 - **事实**是已有代码/调用；**已有规划**是原仓内目标但未闭环；**待补项**是后续实现范围；**待验证**是尚未实测的环境/触发条件。总体规范已确认，不表示具体CLI文件、CI接线或所有场景已存在。
-- **当前**第二/三步基础、CI0–CI3与Base默认ON已实现并有对应冻结候选证据；**P1**CI4已合入；envd修复候选Base235已通过默认冒烟，正常Full91也已通过，待MR131合入及正式候选复核后进入PK0拿包复现和专项；**P2**完整长稳及受控性能。公共Redis间歇问题单独跟踪，不改ADX生产实现或隐藏失败。自动触发和合入强制另验，不把本地VM变成所有开发者的提交前强制条件。
+- **当前**第二/三步基础、CI0–CI4与Base默认ON已有对应冻结候选证据；MR131已合入，Base236首次envd获取失败及一次原条件重试后默认冒烟通过的记录保留。PK0非K8s组件4例、PK1固定Base236的Docker SDK／组合Full均已通过；PK2首批恢复／压力三类代表、PK3连续入口和短资格已通过；PK3正式一小时两模式均FD越界FAILED，长稳不放行。**P1**修OwnerFs远端目录释放、修订DFS有界缓存FD预算合同及补标准兼容，**P2**小时／全天持续验收和受控性能。公共Redis间歇问题单独跟踪，不改ADX生产实现或隐藏失败。自动触发和合入强制另验，不把本地VM变成所有开发者的提交前强制条件。
 - **通过标准**：选中的必需项必须实际执行，0匹配、ignored、未执行、BLOCKED不能记PASS；定向通过不冒称完整Full，含AFS二进制不证明产品使用了AFS；正常清理也必须举证。
+- **诊断与验收分开**：产品泄漏、有界缓存预热和探针口径错误分别以机制及受控对照确认；判据修订须先冻结新版本和资源依据，旧运行保持原判定，不能凭门禁失败直接认定同一类产品缺陷。
 - **环境与结果范围**：VM、Docker、K8s分别记录；Pod跨worker不能冒充多VM/断电验证；功能、正常恢复、故障、长稳及性能分别报告。CI缺必需环境不能静默跳过为成功。
 
 <a id="step-1"></a>
@@ -211,13 +212,13 @@ python3 afs/tests/run.py run --suite cluster-manyread --env /absolute/namespaces
 <a id="step-4"></a>
 ## 第四步：Buildkite共享门禁
 
-**本步原则、现状与优先级**：复用ADX既有目标K8s和部署入口，不调用个人VM；Base保留原冒烟，Full明确扩展基础功能。CI0–CI4与默认ON已合入，合入前Full90已通过；合入后Base232失败保留；envd工具修复候选Base235已首次通过新包/默认冒烟，正常Full91也已通过。优先级P1：合入MR131并复核正式候选后进入PK0拿包复现；线上事件触发/强制合入策略分别核实，不从流水线通过推断。
+**本步原则、现状与优先级**：复用ADX既有目标K8s和部署入口，不调用个人VM；Base保留原冒烟，Full明确扩展基础功能。CI0–CI4与默认ON已合入，合入前Full90已通过；合入后Base232失败保留；envd工具修复候选Base235已首次通过新包/默认冒烟，正常Full91也已通过。MR131已合入；master Base236一次原条件重试后默认冒烟通过，PK0非K8s组件四例也已通过。优先级P1：产品拿包Full和专项；线上事件触发/强制合入策略分别核实，不从流水线通过推断。
 
 **状态**：五步总体逻辑已确认；以下目录/命令中标注目标或待补者尚未实施。
 
 ### 固定envd获取修复候选：Base235与正常Full91已验证
 
-修复只落在构建工具：[Issue72](https://gitcode.com/openJiuwen/agent-dx/issues/72)／[MR131](https://gitcode.com/openJiuwen/agent-dx/merge_requests/131)。运行候选source/harness为`9767533bcdab6fcdbd027f57f32b194aa8d7681e`，基于master4bbc6b26，ADX/AFS/SDK生产目录未改；共享默认分支、hook和合入规则不改。MR131仍待评审合入。
+修复只落在构建工具：[Issue72](https://gitcode.com/openJiuwen/agent-dx/issues/72)／[MR131](https://gitcode.com/openJiuwen/agent-dx/merge_requests/131)。运行候选source/harness为`9767533bcdab6fcdbd027f57f32b194aa8d7681e`，基于master4bbc6b26，ADX/AFS/SDK生产目录未改；共享默认分支、hook和合入规则不改。MR131已合入master f93e2fb0；上述235/91仍按实际运行源码976记录，后续236及VM结果另行记录。
 
 | 环节 | 已有实现／本轮结果 | 边界与验收口径 |
 | --- | --- | --- |
@@ -233,7 +234,7 @@ GitHub对协议v2的支持和客户端要求见[官方说明](https://github.blo
 
 本次Base235和Full91的实际代码／产品身份均为9767533b；最终交付若追加规范／README文档提交，只按文档差异记录，不将旧测试来源改写成新HEAD。Base235默认冒烟三段（含部署和清理）分别91.535/60.650/106.326s；Full91分别263.662/138.287/109.003s。这些是单次样本，不等于稳定CI总增量或性能SLA。
 
-**下一步**：MR131评审合入后复核正式master候选，再进入PK0拿包自测；本批未启动PK0、专项、长稳或性能验收。
+**下一步**：MR131已合入，固定Base236记录envd首败及一次原条件retry后默认冒烟通过；PK0非K8s组件4例及PK1 Docker SDK／组合Full已通过，PK2首批恢复／压力专项已通过，标准兼容、长稳、性能未验收。
 
 ### MR130合入后Base232：保留原envd获取阻塞记录
 
@@ -469,7 +470,7 @@ CI2/CI3实现仅补测试、部署配置与CI包装，不修改ADX、AFS或SDK�
 
 依据：[候选组包/校验](../../.buildkite/package-e2e.sh)、[AFS交付文件集](../../build/release/component.py)、[runner输入合同](../../afs/tests/fixtures/multivm.py)、[harness范围](../../build/e2e/kubernetes/run.py)、[运行镜像配方](../../build/images/Dockerfile.e2e-runtime)、[现有runtime准入](../../build/e2e/preflight.py)。本节是编码前盘点快照；下方计划除上节已实现的交接子项外仍待实施。
 
-### 第四步实施计划与历史基线：组件、产品、门禁分别验收（CI4已合入；envd工具修复候选235/91已通过，待合入）
+### 第四步实施计划与历史基线：组件、产品、门禁分别验收（CI4及MR131已合入；master236默认冒烟通过，首败与retry保留）
 
 **先看顺序**：固定候选与CI环境 → 真实AFS组件读写/清理 → SDK实际使用AFS → 接入必需冒烟 → 扩展功能Full。沿用现有两条公共流水线；CI组件结果、ADX产品结果和最终门禁状态分别可追溯，前一批通过不冒充后一批已经完成。
 
@@ -631,9 +632,83 @@ Full包括已登记的冒烟必需断言；扩大覆盖不等于 `run.py --all` 
 
 **状态**：五步总体逻辑已确认；以下目录/命令中标注目标或待补者尚未实施。
 
-### 第五步实施计划：先能拿包复现，再扩专项、长稳和性能（2026-10-31，未实施）
+### 第五步实施计划：先能拿包复现，再扩专项、长稳和性能
+
+**PK0执行状态（2026-11-01，先验非K8s组件路径）**：固定master `f93e2fb0`／Base236，使用其完整AFS组件包（20,343,317B／SHA256 `6583bbe56426e8bd996149bc858639c1a65a8340cac106a85dead510ee636830`），无产品重编译。经现有公共云VM登记/up和原 `afs/tests/run.py`，单次完成 `ownerfs.basic.read_write`、`ownerfs.permissions.deny_other_uid`、`dfs.basic.namespace`、`dfs.basic.one_writer_many_readers` 四例，全部PASS；实际Linux6.8/x86_64/ext4/FUSE、UID10000/10001、两个二进制身份、16次正常wait=0、空进程/空挂载均已核验，48份必要JSON/日志404,886B逐项独立重hash。环境与包身份、输入准备、定向命令和清理指引归公共E2E README，不新增部署器。该结果仅证明**固定AFS组件包的单VM最小使用闭环**；它不是完整ADX安装、SDK/Full、全部local-basic、真实跨VM或非功能验收。
+
+**K8s直接调用候选（尚未实部署）**：公共 `run.py` 新增 `--artifact-commit` 和无部署 `--verify-only`；`afs_gate.py` 透传固定提交并在启动公共子任务前校验AFS/Full资产。新增11项回归和固定Ruff/Pylint通过；完整工具523项中520项通过，3项macOS Docker插件断言在未修改旧树复现，原失败保留。已用历史235真实清单验证正确提交通过、错误提交/重排版bundle拒绝；不改写为236运行成绩。本机K8s内网连接超时，但用户已选择先用上述VM路径，不作为本次组件闭环阻塞。
+
+**PK1执行结果（2026-11-01，非K8s功能Full通过）**：固定Base236产品 `f93e2fb04f423c7004532f38f1f1ca34de0ab782`，测试代码独立冻结为 `e786bc440786102b0046ef03d1c5dd88c23525ee`。在一台Linux6.8／x86_64／ext4云VM内，复用公共双节点部署和原业务断言，定向SDK OwnerFs／DFS各8项先通过；随后**同一次组合Full**的公共11组、AFS `ci-full`24项、SDK16项全部通过，耗时470.942秒，正常AFS、Environment/backend和Docker清理均通过。公共、组件、SDK的JUnit分别为50／25／17项，父gate另4项；这些计数包含清理，不能当成业务用例数相加比较不同拓扑。
+
+**接入与输入**：公共 `build/e2e/run.py` 支持定向SDK／组件；`build/e2e/afs_gate.py` 顺序调用public standalone→AFS component Full→SDK Full，沿用原gate验证和失败传播；AFS断言仍在 `afs/tests/`。仅增加固定包输入、Docker角色和正常清理适配，未修改ADX／AFS／SDK生产代码、共享默认分支或合入规则。CI导出原3个固定镜像作为离线transport，没有重编译产品，也没有把SWR凭据带到VM；原bundle／registry／AFS manifests不改写。入口、环境和执行方法见[公共E2E README](../../build/e2e/README.md)。
+
+**失败与环境边界**：首轮预检因EROFS／bridge netfilter模块未加载而失败；第二轮外部sandboxd因IPv6 legacy filter模块未加载而启动失败，正常runtime stop也报错；两轮均未进入SDK断言，原失败未隐藏。管理员加载VM已安装模块后，第三轮SDK及后续单次组合Full通过；未修改host firewall规则或持久sysctl。还保留一次无实际SDK执行的脚本提交错误、首次archive单测缓存发现错误及镜像导出checkout失败。固定候选、原始结果、逐文件SHA及复现脚本归仓外 `adx/evidence/afs-pk1-nonk8s-20261101/`。该结论只覆盖**单VM／Docker功能路径**，不外推为K8s新CLI、跨VM、专项、长稳、性能或envd获取稳定性通过。
 
 **先看顺序**：固定输入与使用说明 → 自主跑功能Full → 定向专项 → 连续长稳 → 受控性能。复用第四步的候选清单、AFS部署/产品变体与选集，不为开发者或测试人员再建另一套部署工具。CI调用与直接调用共享代码，权限/凭据从执行者环境显式提供；后者不依赖Buildkite私有Secret、个人VM地址或在线构建会话。
+
+**PK2首批最小闭环（2026-11-01，三类代表通过）**：沿用固定Base236产品 `f93e2fb0`，严格运行测试源码 `ec144088aa82544e3b8fd5f85c93cc75145234cb`。公共 `build/e2e/targeted_suite.py` 复用原专项调度器，单次完整campaign三组均通过，耗时240.975秒：`afs-component-specials` 复用5个已有AFS正常恢复／有界同步进展／必需副本失败恢复与失败close退场用例；`afs-sdk-restart` 在OwnerFs／DFS各通过8项，证明SDK挂载后台I/O在Adxlet暂停期间继续、两Adxlet重启后PID/session改变而backend不变，并在ready后重新取基线确认I/O仍增加，随后SDK确认完整内容、继续发布和正常回收；`afs-sdk-pressure` 在两模式各通过5项，分别完成4并发×8次×64KiB逐内容校验、EEXIST和正常回收。两种SDK场景的DFS均有实际peer读计数。Linux工具541项及AFS runner67项通过，所有必需项、身份和正常清理均通过。
+
+**复用、失败与边界**：三组都使用同一固定包、配套SDK/backend和镜像，复用PK1部署、原AFS业务用例、SDK文件/命令工具以及原专项预算/失败传播；只有测试入口、断言和调度适配改动，没有产品代码、共享默认分支或合入规则改动，默认冒烟／Full集合不变。首个实际campaign（3ead5cee）为FAILED：组件与压力通过，后台I/O无进展的重启组失败，正常清理后原调度器继续独立压力组，母结果没有改绿。相同固定execd镜像编译原辅助脚本复现缺Time::HiRes；测试脚本改用已有Perl内置能力，新增后台启动握手、清理前诊断和独立post-ready基线后，以新冻结源码重新跑完整campaign。原失败、语法/依赖探针、逐文件SHA和严格结果归仓外 `adx/evidence/afs-pk2-nonk8s-20261101/`。PK1/PK2暂不提MR，后续一起审查。该资格仅覆盖单VM／Docker的首批三类代表；旧标准兼容ARM64／full ENV guard保留，没有pjdfstest/LTP/FSx/随机套件执行计数，也未验收磁盘ENOSPC、R1 HA、真实跨VM、长稳或性能。
+
+**PK3最小闭环（2026-11-01短资格阶段记录，正式结果见下）**：现在可以拿固定包，在合格Linux VM内复用公共Docker部署启动同一组ADX／AFS实例，持续运行SDK负载、采样并正常退出。入口为公共 `build/e2e/soak.py`，本轮OwnerFs／DFS是首批存储变体；纯AFS断言仍在 `afs/tests/`。不经K8s、不触发Buildkite、不改ADX／AFS／SDK生产代码，原冒烟／Full选集不变。产品仍固定Base236／`f93e2fb0`，实际运行测试源码为 `6e7c87b8072c5e8159f9946eff72864a009aa3f0`；Linux工具545项、AFS runner67项通过。
+
+| 短资格 | 实际运行与拦截结果 | 回收 |
+| --- | --- | --- |
+| OwnerFs正常持续 | 60.510062秒、65轮；command／file各76次，Environment创建／删除各13次，13次资源采样，PASS | Environment／backend、AFS进程／挂载、Docker均正常回收 |
+| DFS正常持续 | 60.386944秒、64轮；command／file各75次，创建／删除各13次，13次采样，实际peer读0→33，PASS | 同上 |
+| 故意失败 | 3轮已确认I/O后触发测试端故意错误；父结果与workload都保留FAILED，没有继续凑满时长或改绿 | 同上；证明错误传播及失败退场 |
+| 主动取消 | 确认3轮后向controller发SIGTERM；最终4轮，workload为cancelled、父结果保留FAILED | SDK worker确认退出、显式删除Environment后正常卸载／回收 |
+
+**复用、判据与边界**：复用PK1固定包／部署及PK2挂载身份、已确认内容和SDK清理工具；负载使用既有mixed-load命令／二进制文件基元，增加双向fsync发布、逐字节读取及有界临时Environment创建／删除。全程保持相同常驻Environment与AFS挂载，不用循环重建充当持续运行。显式时长1–86400秒，准备／最终操作和退出另有预算；记录cgroup内存、进程PID／start／RSS／FD、磁盘／空闲量和挂载数。第一份活动采样为基线，默认允许内存增长≤512MiB、磁盘≤256MiB、FD≤128、挂载≤8，并保留≥2GiB空闲；缺采样、进展停滞、内容错误、资源越界或正常回收未知均不能通过。上述是本轮入口资格边界，结果明确 `qualification_only=true`，**不是长期无泄漏或性能标准**。该短资格阶段没有完成正式持续验收；以下已补一小时持续／峰值／趋势／错误合同并记录实跑失败。内部积压／GC队列、持续故障合同和全天验收仍待；参数支持24小时不等于已验收24小时。原始结果、取消／失败记录、逐文件SHA及独立审计归仓外 `adx/evidence/afs-pk3-nonk8s-20261101/`；PK1／PK2／PK3后续一起审查，本轮不提MR／不合入。命令和环境仍统一见[公共E2E README](../../build/e2e/README.md)。
+
+**PK3正式一小时判据v2（已实跑，两模式FD越界FAILED）**：这一轮要证明固定包在同一部署内连续一小时持续做事，并且资源在预先规定的边界内保持稳定。OwnerFs、DFS各一轮，顺序运行；不会把两轮相加成单模式两小时，也不会把60秒资格改名为一小时通过。产品仍固定Base236／`f93e2fb0`，测试和文档改动独立冻结；不改产品、默认冒烟／Full或共享策略。本段先给出冻结判据，随后登记真实结果；**两轮均被资源门禁提前拦截，没有一小时PASS，也没有完成十窗口趋势验收**。
+
+| 判据 | 本轮冻结标准 |
+| --- | --- |
+| 时长／负载 | `build/e2e/soak.py --acceptance one-hour --seconds 3600`，固定15秒采样；相同两个常驻Environment、AFS挂载及16KiB同步发布／跨端完整读取、确认内容、SDK命令／文件和临时Environment创建删除。数据通过固定SDK staging文件交付，≤2KiB短命令以UID10000复制／fsync，不把每轮数据存进默认保留一小时的命令历史。不含部署／清理时间；总计至少600轮发布、300次临时创建删除 |
+| 持续性 | 前600秒仅从趋势统计中排除，仍持续负载且检查峰值／错误；随后十个300秒窗口每窗≥12份活动采样、≥25轮发布和≥10次完整churn。采样／进展间隙≤45秒、首份采样≤30秒，末份覆盖实际3600秒。DFS每个稳态窗口peer读都必须增加 |
+| 峰值／错误／身份 | 固定JSON中的全部峰值上限及2GiB磁盘余量；Docker和外置runtime的内存／匿名量／OOM分别取样，另采进程RSS／FD、挂载、AFS数据／日志和runtime实际backing分配量；后者按同一所属文件系统的st_blocks×512计数，排除EROFS／overlay／tmpfs／bind子挂载视图，真实writable upper和保留输出仍计入，原跨挂载表观值只作诊断。任何SDK／内容错误、OOM、常驻Environment／backend的runc ID／PID／start及容器／进程替换、缺观测或超限均失败，不用中位数掩盖预热期峰值 |
+| 稳态资源趋势 | 十个窗口均参与，以每窗中位数做末段减首段及全部窗口中点OLS斜率，两者都须过线。Docker匿名量／汇总RSS／AFS数据／runtime backing实际分配：末差≤32MiB、斜率≤16MiB/小时；runtime匿名量／每个进程RSS：≤16MiB、≤8MiB/小时；FD≤4、≤4/小时；挂载≤1、≤1/小时。页缓存、日志单独报告并受峰值限制，不混作匿名内存泄漏 |
+| 退出／结论 | SDK worker确认终态、Environment显式删除、backend为空、AFS进程／挂载正常退场及Docker回收均通过；parent/JUnit与 `soak-acceptance.json` 也必须通过。结果绑定合同ID／SHA、固定产品与harness，正式结果为 `qualification_only=false`。失败／取消保留FAILED，不自动重跑、不换包、不在看数据后放宽阈值 |
+
+完整机器可读合同：[one-hour-v2.json](../../build/e2e/soak-contracts/one-hour-v2.json)，入口和资源含义见[公共E2E README](../../build/e2e/README.md)。阈值是这一固定工作集的一小时验收界限；通过也不证明更慢／更小的泄漏、24小时稳定性、内部GC／积压正确性、故障恢复、跨VM隔离或性能。本轮不注入故障；原PK2和短资格的故障／取消结论保持各自范围。
+
+**v1实际执行与修复依据（原失败不改绿）**：固定Base236／`f93e2fb0`、测试源码`c9724a70`，Linux工具563＋67项及一分钟观测资格通过；随后OwnerFs在70.181902秒／74轮、DFS在205.250455秒／218轮被`runtime_disk_bytes`峰值拦截，二者均为FAILED，未跑满一小时。读写／内容自身无错误，Environment／backend、AFS／Docker正常回收均通过。这只能说明原判据被触发，不代表磁盘真实增长或产品长稳通过。
+
+独立诊断显式新增／删除一个backend，稳定集合1→2→1；新增EROFS lower和overlay rootfs两处共享视图。跨挂载表观量增加415,249,086B后回到原值，而单文件系统实际块仅增加57,344B、宿主空间只减少126,976B。已证明原探针把共享软件视图作为新磁盘增长。第一次诊断因operator漏模块路径未进入对照即退出，该操作错误也原样保留；修正后的120秒诊断正常退场，仅用于因果确认，不冒充正式小时。
+
+v2把runtime门禁字段明确改为`runtime_backing_bytes`，原表观字段保留作诊断；所有原有数值、时长／密度／峰值／趋势／清理规则保持原样，工具测试逐项断言未放宽。另根据生产源码中默认命令历史TTL3600秒且保留cmd字符串的既有设计，把16KiB测试数据从长命令参数移到固定SDK文件，仍以UID10000完成同样的写入／fsync和跨端逐字节核验，不改产品TTL或生产配置。新合同ID／SHA与测试源码重新冻结，原v1两个FAILED和必要原件完整保留。v2在cloud2重新通过Linux工具570项＋AFS runner67项，以及60.352433秒／63轮的观测资格和独立准入核对；随后用同一固定包各启动一次3600秒正式目标。实际测试源码为`d32a3dcf32bda6aee4949a77ff71413255ecb44a`，合同`afs-continuous-1h-v2`／SHA256 `466b903f05c94e6fcb0dc5a91d99983dcd2eece2a14023c668a0f306e295e02c`。未触发CI、重编译或更换产品，也未改生产代码、默认集合和共享策略。
+
+| v2正式目标（每模式3600秒） | 实际负载／采样 | 拦截证据（首活动样本为基线） | 结论与正常清理 |
+| --- | --- | --- | --- |
+| OwnerFs | 2209.735926秒（36分50秒）、2287轮；命令／文件各2668次，Environment创建／删除各383次；133份资源样本 | node1总FD136→267，增长131＞128；首次超限样本2206.915716秒。增长集中在同一`afs-node`进程FD28→160；node2总FD峰值只增2 | **FAILED，提前结束，未跑满一小时**。workload因父门禁取消，内容／SDK错误为空；Environment／backend、AFS进程／挂载、Docker正常清理均PASS |
+| DFS | 272.604138秒（4分33秒）、281轮；命令／文件各328次，创建／删除各49次；17份资源样本 | node1总FD134→271，增长137＞128；首次超限样本269.486666秒。同一`afs-node`进程FD25→164；node2总FD峰值只增1 | **FAILED，提前结束，未跑满一小时**。同样无内容／SDK错误，全部正常清理PASS；母campaign保持FAILED，不重跑／不改阈值 |
+
+**已确认与未确认**：两轮固定harness的355项文件、合同／产品身份、逐文件SHA、原始资源样本、父结果／JUnit及正常清理均经独立复核；节点FD峰值失败可由原始样本直接重算。OwnerFs还保留两次相隔约309秒的宿主procfs只读快照：同一AFS Node进程FD100→119，新增19个句柄均指向同一OwnerFs workspace根目录，node2为25→25；未在容器内启动额外诊断进程。这批快照确认了增长归属和目标，**首次失败时尚未确认根因，后续短诊断见下**；旧DFS运行未采到同类FD路径快照，不据此断言两模式原因相同。没有OOM、进程／backend替换或内容错误；这不覆盖未运行的剩余时长、十个完整稳态窗口、24小时或性能。
+
+**FD后续定位（2026-11-01，同一Base236，短组件诊断已独立核验）**：这次把两个现象分开验证：OwnerFs确有目录句柄释放缺口；DFS的已验证读缓存有界，不能把预热增长直接叫泄漏。继续使用原AFS二进制（与上述正式运行的实际SHA完全一致）和d32的69项组件测试文件，复用原`Cluster`单VM／真实FUSE部署与正常回收。未改产品、生产配置或一小时v2合同。以下是独立诊断，**不替代SDK一小时验收，也未新增已注册的公共suite或CI用例**。
+
+| 对象 | 源码机制与受控对照 | 本轮可以得出的结论 | 待补项／归属 |
+| --- | --- | --- | --- |
+| OwnerFs远端目录关闭 | [OwnerFs](../../afs/src/node/vfs/ownerfs.rs)中远端opendir在Home保存真实目录FD，访问端`releasedir`却只删除自己的记录，未调用已存在的远端释放RPC。受控本地扫描100次，Home目录FD不增；B端5批各20次scandir并关闭后，同一Home根目录FD依次增加20／40／60／80／100，B端FD保持25，PID／start不变 | **已复现产品释放缺口**。历史资源采样每次多1个FD与其一致；只读扫描也会触发真实产品问题，不能靠停止观测规避 | P1：AFS生产修复独立交付；`ownerfs.rs`内补远端目录close配对UT，`afs/tests/suites/ownerfs/`固化真实远端目录循环回归。还须覆盖释放错误／重复关闭及重开交接边界，不能只验证本地目录close |
+| DFS本地reader缓存 | [DFS读引擎](../../afs/src/node/dfs_read.rs)按ChunkId持有最多256个`PinnedChunkReader`，每项持有真实File；路径相同但内容改变可产生新Chunk。A端768次16KiB发布／fsync／完整读取，逐文件DONTNEED确保进入AFS后端，local_probe增加768；物理chunk FD为128／256／256／256／256／256，观察到768个不同chunk，后四批每批精确淘汰128个旧句柄；同对象再读100次FD不增 | **该缓存路径已证明封顶和淘汰**；旧SDK样本“约每两轮多1个FD”与预热吻合，不足以认定无界泄漏。256仅是该缓存自己持有的项数，在途Arc和其它FD另计；本轮不排除其它泄漏或替代旧SDK剩余时长 | P1：`afs/tests/suites/dfs/`固化有界缓存／淘汰回归；公共`build/e2e/soak_probe.py`及后续合同需区分有界缓存预热、在途FD与稳态增长，不能通过缩小生产缓存来迁就测试 |
+
+本次两case均正常回收，7次AFS正常wait均为0，私有短路径alias已正常卸载／删除；诊断后已正常down／cleanup／release，cloud2终态idle/free；守卫清理本任务9项可再生正文／输入副本222,927,073B，保留必要原件及原包，4个模块始终未改。独立审计核对77份必要原件2,074,842B、69项测试输入及原包两ELF。先前一次输出位置选错，在只读工作区创建结果目录时被拒绝，尚未挂载alias或启动产品，原操作失败保留；更正到公共节点可写data目录后用全新输出运行。另有一次管理sidecar检查格式断言失败，也单独保留，不归因产品。证据归仓外`adx/evidence/afs-fd-diag-20261101/`；live读取的上游master为`f3794a77`，相关OwnerFs／DFS读引擎／chunk源文件与固定包f93相同，未把旧问题误称已在最新源码修复。
+
+**DFS回归及FD合同v3（2026-11-02，本轮测试体系交付）**：先把“读缓存封顶、淘汰会释放FD”变成开发者可直接选择的组件用例，再让公共长稳按真实资源归属计量。它不修OwnerFs，也不把旧失败改绿；正式一小时等修复包再重新运行。
+
+| 项目 | 本轮已落地 | 结果与边界 |
+| --- | --- | --- |
+| 定向组件回归 | `afs/tests/run.py run --case dfs.resources.reader_fd_budget`；也可`--case 'dfs.resources.*'`或`--suite local-resources`。用例在`afs/tests/suites/dfs/test_resources.py`／`fd_budget.py`；只读FD工具在`afs/tests/tools/fd_inventory.py`。复用singlevm的Meta＋A/B进程／真实FUSE和正常回收，无SDK或K8s依赖 | 本轮固定Base236两ELF的Linux实跑首次PASS（15.8095秒），正常清理PASS、未重试。实际local_probe增长868，FD曲线和淘汰／复用均达标；768轮不同16KiB内容发布／fsync／DONTNEED完整读，六批chunk FD应为128／256／256／256／256／256，观察768个不同对象且后四批每批淘汰128旧项；同对象再DONTNEED读100次集合不变，local_probe至少增长868。检查点无超额／重复，A其它FD增长≤4、B本地reader为0，PID/start/root身份稳定 |
+| 新正式FD合同 | [one-hour-v3.json](../../build/e2e/soak-contracts/one-hour-v3.json)，ID`afs-continuous-1h-v3`，SHA256 `b1643e86dcf0b367e9a2db32ccaebac0b815b83f7fa1bad3a1909392085e947c`。`build/e2e/soak.py --acceptance one-hour`默认选v3；`soak_probe.py`采原始FD表，`soak_fd.py`重算；从实际Cluster取得A/B chunk根，不靠路径中出现dfs就豁免 | 仅DFS的唯一owned `afs-node`可抵扣最多256个“显式chunk根目录内、同device、存活regular file的唯一dev/inode”。重复FD、已删除、其它路径／进程、OwnerFs、Meta和anchor都无抵扣。保留原始总数、每FD目标／类型／dev／inode及进程PID/start、根path/device/inode；缺失、不一致或身份替换即失败 |
+| 峰值与稳态 | 每节点／每常驻进程的`noncache = raw − min(eligible,256)`，增长仍≤128；另保留raw增长上限：OwnerFs／Meta／其它进程≤128，DFS Node≤128＋256。超额cache／在途句柄仍计入noncache，稳态每窗超额中位数必须为0。节点及逐进程noncache十窗口末差≤4、OLS≤4/小时；anchor仍用原raw标准；raw节点中位数／斜率继续单独报告 | 这是版本化资源归属修正，不把整个进程FD上限改成256或无条件放宽到384。前600秒只免趋势，峰值／身份／错误仍检查；时长、工作量、内存／RSS、磁盘、挂载、错误、清理均与v2完全相同，工具测试逐项对比 |
+| 复用／覆盖范围 | 默认`local-basic`／`all-basic`、CI冒烟和`ci-full`24项保持原集合；本例先作为定向组件回归，不新增独立CI平台。OwnerFs真实释放缺口归[Issue73](https://gitcode.com/openJiuwen/agent-dx/issues/73)，由同事修复 | 组件回归和工具检查不等于新版SDK probe实跑准入、SDK一小时、跨VM／K8s、全天长稳或性能。没有生产代码／生产配置修改，不提MR／不合入，后面与PK1／PK2一起审查 |
+
+**本轮验证**：最终冻结测试源码的Linux公共工具580项、AFS runner73项通过；72份必要原件3,123,228B及34项实际运行源码已独立逐SHA核对；原FD表重算A其它句柄8个检查点均为23，3次AFS正常wait均0。Mac因缺Linux procfs的9项ERROR另存，不计验收。v1/v2合同与默认集合未变，生产代码差异为0。新版SDK观测短准入和正式一小时未执行；原失败保持原结论。
+
+**测试资产发布（2026-11-02）**：PK1固定包SDK/Full、PK2专项、PK3连续入口及DFS回归／FD v3统一由[MR135](https://gitcode.com/openJiuwen/agent-dx/merge_requests/135)交付，复用ADX原部署和用例，不等待OwnerFs产品修复。平台规范检查的测试断言已改为显式失败，补充`-O`模式下错误计数仍须拒绝的回归；正式v1/v2/v3 JSON、默认CI/Full选集及生产代码均不改。发布复验的Linux公共工具580项、AFS runner74项和定向DFS实跑各有独立记录；先前“暂不提MR”属于前批快照，当前资产交付和后续版本长稳结果分开判断。
+
+**下一项／P1**：等待同事提供OwnerFs修复并交付固定包；先核候选／SDK／backend／镜像／harness／v3合同身份，重新做短SDK观测准入（验证新版探针在完整ADX部署中的覆盖和时延），再从头运行OwnerFs、DFS各一小时。旧v1/v2合同和全部FAILED／取消／操作失败记录原样保留，不拼接时长、不事后重判；这轮只冻结v3，不启动正式长稳。本轮证据归仓外`adx/evidence/afs-dfs-fd-v3-20261102/`，原一小时及因果诊断继续保留在各自证据目录。此前一小时合同那批3705份必要原件、原包和活动worktree均不清理。
 
 第五步可以和第四步并行准备输入、文档及直接复现；其AFS组件部署依赖CI1、产品路径依赖CI2、完整功能集依赖CI4的选集/适配，但不要求先完成线上webhook设置。直接运行通过不反向宣称CI门禁、自动触发或发布资格已完成。
 
@@ -641,27 +716,27 @@ Full包括已登记的冒烟必需断言；扩大覆盖不等于 `run.py --all` 
 
 | 批次／优先级 | 复用什么 | 这一批要补什么、放哪里 | 如何验收／通过能说明什么 |
 | --- | --- | --- | --- |
-| PK0／P1：拿包与环境操作闭环 | 现有 `prepare.py`、`kubernetes/publish_images.py`、bundle与镜像复用机制、K8s/本地Docker说明及CI0输入合同 | 在公共 `build/e2e/README.md`、`kubernetes/README.md` 补固定包＋SDK/backend/测试代码/ELF/镜像的配套清单，给出不带秘密的AFS配置示例、准入命令、全量/专项命令与结果阅读/回收说明；产品包与harness分别标识，缺项明确拒绝 | 在一套已有合格环境上，由直接CLI按文档检查输入→准备或复用镜像→部署→一组AFS读写→取证→清理；错误SHA/模式/架构/缺依赖拒绝，不临时编译产品。此时只算可自主复现一个case，不算完整Full |
-| PK1／P1：固定版本功能Full | CI1/CI2的AFS环境与产品变体、CI4的Full选集、现有K8s `run.py --profile full` 和单宿主 `run.py --profile standalone` | 将AFS模式/候选/环境选择通过公共CLI显式传入；复用同一注册和结果协议，补支持范围内的SDK挂载读写、权限、新版本、正常恢复/清理。K8s和Docker声明各自准入，不强行要求一套环境兼具所有能力 | 选定固定包，在其实际支持的目标拓扑跑完整必需集；公共基础＋AFS所选变体逐case及cleanup通过，才能报对应Full。另按文档独立重放一个固定case，身份与结果可追溯；不要求失败后反复重跑来取得通过。Docker若纳入支持，再独立验收，不能继承K8s PASS |
+| PK0／P1：拿包与环境操作闭环 | 原 `afs/tests/run.py`、`component.py verify` 与单VM环境（本次已实跑）；产品侧现有 `prepare.py`、`kubernetes/publish_images.py`、bundle与镜像复用机制、K8s/本地Docker说明及CI0输入合同 | 在公共 `build/e2e/README.md`、`kubernetes/README.md` 补固定包＋SDK/backend/测试代码/ELF/镜像的配套清单，给出不带秘密的AFS配置示例、准入命令、全量/专项命令与结果阅读/回收说明；产品包与harness分别标识，缺项明确拒绝 | 在一套已有合格环境上，由直接CLI按文档检查输入→准备或复用镜像→部署→一组AFS读写→取证→清理；错误SHA/模式/架构/缺依赖拒绝，不临时编译产品。此时只算可自主复现一个case，不算完整Full |
+| PK1／P1：固定版本功能Full | CI1/CI2的AFS环境与产品变体、CI4的Full选集、现有K8s `run.py --profile full` 和单宿主 `run.py --profile standalone` | 将AFS模式/候选/环境选择通过公共CLI显式传入；复用同一注册和结果协议，补支持范围内的SDK挂载读写、权限、新版本、正常恢复/清理。K8s和Docker声明各自准入，不强行要求一套环境兼具所有能力 | 选定固定包，在其实际支持的目标拓扑跑完整必需集；公共基础＋AFS所选变体逐case及cleanup通过，才能报对应Full。另按文档独立重放一个固定case，身份与结果可追溯；不要求失败后反复重跑来取得通过。已支持的Docker路径也要按候选独立验收，不能继承K8s PASS |
 | PK2／P1：定向故障/压力与兼容专项 | 现有 `--case`、`targeted_suite.py`、进程重启/压力/短soak，AFS现有恢复/权限/命名空间及标准套件adapter | 先登记三类代表：AFS Meta/Home正常进程重启后的确认数据恢复；ADX进程重启期间的AFS文件访问/回收；有界并发/容量压力下的内容/错误/资源一致性。产品类在公共E2E，纯AFS合同仍由组件runner执行；兼容adapter补当前候选/挂载/工具版本与完整计数 | 每类一次事先选定的目标运行，故障前/期间/后断言和恢复/清理证据完整；不同case独立结果。R1不可达允许明确错误，不承诺未支持的HA。标准套件必须有实际执行计数；旧ARM64/Full ENV限制不自动解除，若未补相应能力就明示缺口 |
-| PK3／P2：公共连续长稳 | `mixed_soak.py`的命令/文件/创建删除负载基元、现有SDK调用与结果/清理方法 | 在公共 `build/e2e/` 增加长稳profile/配置，贯通持续时长、父子进程超时/保活与取消、持续资源趋势、错误/故障策略和证据输出；AFS接入版本/内容/持久确认及FD、内存、磁盘、挂载/积压等观测和预定判据。不是另建AFS长稳平台 | 先以短资格运行验证定时、计数、采样、取消/失败清理，再做一次预先冻结时长的真实持续验收；24小时结论须实际完成24小时及预定判据。短资格/多次重新部署/三小时suite总预算均不能代替。没有冻结资源趋势/错误判据时不进入正式PASS验收 |
+| PK3／P2：公共连续长稳（入口／短资格通过，一小时失败） | `mixed_soak.py`的命令/文件/创建删除负载基元、现有SDK调用与结果/清理方法 | 已增加公共 `soak.py`／`soak_sdk.py`，复用同一固定包部署、SDK／AFS常驻负载，贯通显式时长、保活／退出／取消、逐期采样；一小时持续／峰值／十窗口趋势／身份／清理合同已实现并冻结，真实运行因FD越界提前失败。内部积压及持续故障合同仍待。不是另建AFS长稳平台 | 先以短资格运行验证定时、计数、采样、取消/失败清理，再做一次预先冻结时长的真实持续验收；24小时结论须实际完成24小时及预定判据。短资格/多次重新部署/三小时suite总预算均不能代替。没有冻结资源趋势/错误判据时不进入正式PASS验收 |
 | PK4／P2：受控性能验收 | 公共 `load-performance`诊断负载、AFS `perf/dfs_compare.py`已定义的计时/缓存/校验/配对方法 | 将共享集群短诊断与正式基准分开；固定版本、资源、后端、负载、缓存条件、测量边界、观察器与比较基线/阈值；纯文件系统复用AFS工具，ADX完整用户链复用公共专项。配置与结果记录全部条件，不复制一套对照工具 | 先验证内容/长度/EOF及实际路径，再按冻结合同的轮数/顺序一次完成全部原始样本；输出失败、波动、绝对数和配对结果。功能正确、测量完成、稳定性及性能达标分别判定；不从90秒采样、短Full或挑出的快样本推导性能通过 |
 
-PK0/PK1先解决“拿到某个包就能按说明完成验收/复现”的使用闭环；PK2扩问题类型；PK3/PK4的公共能力与判据先具备，再开展正式运行。各批完成条件是未来验收计划，当前未执行其中任何步骤。
+PK0/PK1先解决“拿到某个包就能按说明完成验收/复现”的使用闭环；PK2扩问题类型；PK3/PK4的公共能力与判据先具备，再开展正式运行。各批完成条件是验收标准。PK0非K8s组件4例及PK1单VM／Docker SDK与组合Full已完成相应验收；PK2首批三类恢复／压力代表及PK3连续入口／短资格已完成；K8s新增CLI、标准兼容仍待各自验收；PK3一小时实跑失败，先定位FD增长并在修复候选上重验，PK4另验。
 
 #### 最小交付物与复用位置
 
 | 交付物 | 放在哪里／通过哪个入口使用 | 与第四步复用的关系 |
 | --- | --- | --- |
 | 一份拿包和环境说明、无秘密配置示例 | 现有公共E2E README / K8s README；实际包、env、kubeconfig及证据在执行者仓外目录 | 使用CI0同一输入/能力合同；现有bundle可复用，不要求每次重建镜像 |
-| 产品功能Full和定向case | 现有 `build/e2e/run.py`、`kubernetes/run.py`、`scenarios.py`及产品fixture；AFS角色/断言继续复用 `afs/tests/` | 与CI1–CI4共用；直接CLI与Buildkite只更换调度/凭据来源，不复制业务测试 |
+| 产品功能Full和定向case | `build/e2e/run.py`、Docker组合 `afs_gate.py`、原 `kubernetes/run.py`／`kubernetes/afs_gate.py`、`scenarios.py`及产品fixture；AFS角色/断言继续复用 `afs/tests/` | 与CI1–CI4共用业务断言；直接CLI与Buildkite只更换部署适配、调度/凭据来源，不复制业务测试 |
 | 多专项编排与case结果 | 现有 `kubernetes/targeted_suite.py`；组件专项直接用AFS runner，各自汇入可追溯结果 | 支持的产品case沿用现有选择/namespace清理；不能把组件结果命名成SDK产品通过 |
 | 长稳/受控性能扩展 | 公共 `build/e2e/` 负载与运行编排、AFS适用负载/指标和已有测量工具 | 是公共能力扩展，AFS提供实际存储变体；不强行纳入默认L0/功能Full |
 
 #### 环境、预算、结果和磁盘验收
 
 - **环境责任**：K8s、Linux Docker、真实SSH多VM、条件硬件分别选择并准入；先交付已支持路径，未验证路径明确标记。第三步已有namespace结果不提升为K8s、真实SSH多VM或故障隔离验收；公共三VM完整自动部署仍缺，不列作首批一键能力。
-- **时长链路**：当前mixed-soak是300秒、函数上限900秒，调用方也有超时；direct targeted suite总预算最多3小时、CI还有自己的作业预算。PK3必须明确采用公共长稳入口或贯通调整整条预算链，不能只加一个时长参数就声称可跑24小时。实际持续负载时长与部署/准备/清理时间分别记录。
+- **时长链路**：旧mixed-soak仍为300秒、函数上限900秒，direct targeted suite仍最多3小时。PK3新增独立公共 `build/e2e/soak.py`，显式选择OwnerFs／DFS、1–86400秒和采样／资源边界；复用固定包Docker部署，持续期间不重新部署。准备／最终SDK操作预留600秒、SDK退出预留180秒，外层任务另需部署／清理预算。短资格和时长参数均不能代替真实小时／天级验收；工作负载时间与准备／清理分开记录。
 - **结果合同**：固定产品/SDK/backend/镜像/测试commit与SHA，记录选集和环境；保留逐case原始结果、首个错误、资源趋势及清理结论。基准和候选分开，完整与定向分开；BLOCKED/缺计数/采样缺失/清理未知不得通过，不能将不同运行的绿色子项拼成一次完整PASS。
 - **性能观察**：复用既有测量合同，记录观察器与缓存/预读状态；避免用同数据盘高频进度写污染计时。阈值和样本数在正式运行前冻结，失败不自动补样或更换负载；不把共享集群的吞吐统计当固定硬件SLA。
 - **磁盘闭环**：每批开始前估算输入、测试正文/副本、日志/趋势和清理余量；明确数据复用或验后回收。结束前逐目录核对归属，保留一份必要身份/输入摘要、原始结果/日志及失败记录，清理可确认重复传输、解包、成功用例可再生数据；记录清理目录、前后占用和保留项。唯一冻结二进制、必要失败现场/用户指定保留数据不自动删除，不全局prune或清空共享缓存。
@@ -670,7 +745,7 @@ PK0/PK1先解决“拿到某个包就能按说明完成验收/复现”的使用
 
 PK1通过才能声称“该固定版本、该拓扑的AFS产品功能Full已验收”；PK2按专项分别出结果。PK3只认实际完成时长及全部持续性判据，PK4只认其冻结基准与性能合同；这两项不因功能Full通过而自动完成。已发布的说明应让人或AI在不依赖私有CI状态的前提下重复部署和选定case，定位问题并正常回收。
 
-事实入口：[公共E2E](../../build/e2e/README.md)、[K8s部署](../../build/e2e/kubernetes/README.md)、[现有负载](../../build/e2e/load/README.md)、[短soak源码](../../build/e2e/mixed_soak.py)、[现有suite预算](../../build/e2e/kubernetes/targeted_suite.py)、[AFS测量合同](../../build/e2e/afs/perf/README.md)、[标准兼容工具边界](../../build/e2e/afs/acceptance/README.md)。完整长稳和受控性能仍是待补，不是本轮新增的现有能力。
+事实入口：[公共E2E](../../build/e2e/README.md)、[K8s部署](../../build/e2e/kubernetes/README.md)、[现有负载](../../build/e2e/load/README.md)、[短soak源码](../../build/e2e/mixed_soak.py)、[现有suite预算](../../build/e2e/kubernetes/targeted_suite.py)、[AFS测量合同](../../build/e2e/afs/perf/README.md)、[标准兼容工具边界](../../build/e2e/afs/acceptance/README.md)。PK3公共连续入口与短资格在本轮单独登记；正式长稳与受控性能仍待验收，不能继承功能Full。
 
 ### 先讲清使用逻辑
 
@@ -722,7 +797,7 @@ AFS ON候选须使用明确包含AFS的统一包并校验模式；“包里有AF
 | 短混合稳定性 | `--case mixed-soak` → `mixed_soak.py` | 已有持续300秒命令/文件和创建删除混合负载、错误/计数/延迟及清理；底层函数仅允许1–900秒，公共入口没有任意小时级时长选项，不在默认Full内 |
 | 短时性能采样 | K8s `--profile full --case load-performance` → `load/performance.py` | 已有90秒吞吐/延迟样本、P50/P95/P99等；没有对未指定集群强加固定SLA，不等于受控性能回归/AFS专用性能验收 |
 | 容量压力 | K8s `--profile full --case load-pressure` | 已有两节点容量占满、8个请求排队后释放、归属和回收断言；是容量压力场景，不是持续高压长稳 |
-| 小时/天级连续长稳 | 既有门禁文档 `FD-SOAK-01` 规划1–24小时、反复故障与无资源增长 | **规划已有，当前没有对应完整连续执行/资源趋势判据/中断恢复闭环**。不能用重复运行5分钟、定向suite三小时预算或本地历史记录冒充 |
+| 小时/天级连续长稳 | 既有 `FD-SOAK-01` 规划；本轮PK3新增公共 `build/e2e/soak.py` 固定包连续入口 | 连续负载、定时／资源采样、失败／取消及正常回收先做短资格；资格边界在本页PK3记录。一小时合同已实现且实跑，但OwnerFs／DFS均FD超限提前FAILED，**未取得小时／全天及十窗口趋势验收**；持续故障合同仍待，重复短测／suite三小时预算不能代替 |
 | 条件专项 | PVC Redis Pod替换、异构runtime、Firecracker、GPU/NPU工具等各自入口 | 部分driver/接线已有；需额外资产与环境，部分目标环境验收仍待完成。普通Full不自动覆盖 |
 | AFS组件兼容/测量资产 | 当前 `build/e2e/afs/acceptance/` 标准套件adapter，`build/e2e/afs/perf/dfs_compare.py` 双口径对照等 | 工具已有；旧acceptance runner ARM64/root guard、Full ENV verifier始终BLOCKED；perf依赖外部fixture/挂载与固定基线，不创建机器/后端。不能称为公共产品全量/长稳已融入 |
 
@@ -811,7 +886,7 @@ python3 build/e2e/kubernetes/targeted_suite.py \
 | **②主线／候选回归：K8s L0基本冒烟** | 尽早发现真实发布包/SDK组合破坏创建、执行、文件、删除及鉴权等最小用户闭环；保护共享主线的基本可用性 | 已有 `build/e2e/kubernetes/{run,manifest}.py`；共享公共 `run.py`、`scenarios.py`、`sdk_smoke.py` | Buildkite自动执行选定的基础流水线；同一用例可本地复现。合入后运行发现的是已进入主线的回归，不是合入前阻断 | 目标K8s、Linux worker、registry/kubeconfig/权限由既有环境提供；driver自动建namespace/两ADX Pod与Service、同步harness、启动/测试/取证/清理；不创建集群 | 基础 `pipeline-package.yml: platform-e2e` → `.buildkite/run-e2e.sh` → `build/e2e/kubernetes/run.py --profile l0`；当前选择 `l0`＋`auth`，不自动跑Full | 公共L0已存在；AFS候选模式/包可交接，但未见明确选中真实AFS挂载/后端的公共闭环；尚不能宣称已守住AFS双向回归 | 旧门禁文档曾建议提交级L0或5组k8s-basic；**实际YAML为l0**；webhook/分支触发和合入保护未核验 | 选定AFS最小产品冒烟场景，证明实际使用AFS并核对核心行为/清理；补fixture与能力选择；选集范围见本页第四步，不为CI复制断言 |
 | **③固定版本验收：K8s功能Full** | 在明确版本上系统检查公共功能面、两worker放置、生命周期、基础故障及物理资源清理；不是所有专项的总称 | 公共 `build/e2e/run.py` 的STANDARD11组和 `scenarios.py`；部署 `build/e2e/kubernetes/` | 测试人员或拿版本的开发者主动选择；可触发独立Full，也可直接运行现有K8s入口 | 先提供目标K8s与两个不同Linux K8s worker、权限/registry；选择不可变产品包/SDK，或复用既有镜像bundle；driver自动部署/运行/取证/清理，不在被测节点重编译产品 | `agent-dx-full-test` → `pipeline-full.yml`：`platform-images` → `package-e2e.sh`，后 `platform-e2e` → `run-e2e.sh` → K8s `run.py --profile full`；镜像复用时跳过准备；直接运行也可 | 公共Full已实现；未明确绑定AFS产品存储变体。AFS旧acceptance的Full环境BLOCKED是另一套工具限制，不能当作ADX Full不存在 | 原文档提出主分支/合入候选/发布候选运行Full；基础出包未自动串独立Full，定时/事件触发外部配置未核实 | 将AFS公共用户行为、实际挂载/后端及模式适用性融入既有Full；组件与产品结果分别可追溯，不因出包ON就算覆盖 |
 | **③固定版本验收：故障／资源／短时性能及压力专项** | 在版本上定位重启、网络分区、恢复/路由、资源队列/超分、短时吞吐与延迟问题；定向PASS不代替完整Full | 公共 `build/e2e/` 故障场景、`load/performance.py`、`load/pressure.py`、`mixed_soak.py`；AFS纯组件异常仍在源内/`afs/tests/`与外置probe | 测试人员/开发者按问题选择；Buildkite可代跑相同case；不要求每次提交全跑 | 复用Full固定bundle与K8s能力；多case每例独立namespace和清理。`load-performance`90秒采样；pressure验证两节点占满后8请求排队/释放；当前无统一固定时延SLA | 直接K8s `run.py --profile full --case <case>`；CI `ADX_E2E_TARGET_CASE` → 同入口；`ADX_E2E_TARGET_CASES` → `targeted_suite.py`逐例调用；已有，不必新建专项调度体系 | ADX公共故障/负载场景已有；AFS低层重放/损坏/预算断言部分已有，但不代表公共专项已验证AFS数据/挂载/回收 | 既有文档将条件专项放在相关变更/nightly/release；性能/压力文档标有实现、待正式部署运行，不能据脚本存在宣称已验收 | 按组件/产品边界补AFS故障与资源断言；把真实AFS负载绑定既有产品专项；登记固定输入、环境、判据和未执行项 |
-| **③固定版本验收：持续长稳／受控性能验收** | 发现小时/天级累积泄漏、资源持续增长、反复故障后的劣化及可重复性能回退；短功能PASS不能覆盖 | 已有公共 `build/e2e/mixed_soak.py`、`load/performance.py` 只是短测；AFS已有测量/probe资产，不等于正式统一长稳/性能套件 | 测试人员或开发者在稳定、受控环境做版本验收；当前没有可直接宣称完成1–24小时合同的公共入口 | 执行者需稳定资源/固定版本、持续负载与观测、清理/故障边界、比较基线及预定判据；现有mixed-soak默认300秒、函数仅允许1–900秒，公共入口未开放任意时长；perf仅90秒 | 现有入口仍是上述定向case；direct targeted_suite总预算≤3小时、CI预算660–7800秒；**不能把suite预算当持续soak时长，也不能把循环重建当连续长稳** | AFS长期/精确性能未因代码合入获得公共保障；既有AFS测量和历史对照保留原版本/环境身份 | `FD-SOAK-01`已有1–24小时、无资源增长目标；nightly/release为既有规划。当前未见对应完整持续执行/判据闭环；统一精确性能SLA尚无已实现合同 | 先分清公共能力缺口与AFS负载/指标缺口，再补AFS适配和判据；不在此另造AFS独家长稳平台，不声称已有“一键全天长稳” |
+| **③固定版本验收：持续长稳／受控性能验收** | 发现小时/天级累积泄漏、资源持续增长、反复故障后的劣化及可重复性能回退；短功能PASS不能覆盖 | 已有公共 `build/e2e/mixed_soak.py`、`load/performance.py` 只是短测；AFS已有测量/probe资产，不等于正式统一长稳/性能套件 | 测试人员或开发者在稳定、受控环境做版本验收；PK3新增公共 `build/e2e/soak.py` 连续入口，短资格已过；一小时合同已实现并实跑，双模式FD超限FAILED，未跑满；24小时仍待 | 执行者需稳定资源/固定版本、持续负载与观测、清理/故障边界、比较基线及预定判据；旧mixed-soak仍仅1–900秒；PK3独立入口显式1–86400秒及资源界限，一小时合同已冻结，正式结果仍须实际跑满并满足全部判据；perf仅90秒 | 短定向仍用原入口及≤3小时suite；PK3走公共 `soak.py` 的独立持续预算，不接现有CI作业。**不能把suite预算或循环重建当连续长稳** | AFS长期/精确性能未因代码合入获得公共保障；既有AFS测量和历史对照保留原版本/环境身份 | `FD-SOAK-01`已有1–24小时、无资源增长目标；nightly/release为既有规划。一小时判据现已实现但实跑失败；全天持续执行尚无通过闭环；统一精确性能SLA尚无已实现合同 | 先分清公共能力缺口与AFS负载/指标缺口，再补AFS适配和判据；不在此另造AFS独家长稳平台，不声称已有“一键全天长稳” |
 | **③固定版本验收：AFS标准兼容专项** | 发现POSIX/随机操作/差分中的语义、错误码、完整性与计数问题；按AFS组件边界验收 | 当前 `build/e2e/afs/acceptance/{drivers,probes,suites}/`；pjdfstest/LTP/FSx等adapter；已对齐组件部分目标同归 `afs/tests/` | 测试人员或开发者在版本专项中运行适用集合；必要短例是否入开发/冒烟另行选择 | 先准备真实Linux AFS挂载、套件版本/参考实现/seed及root/非root身份；不要求为了直接文件系统合同部署完整ADX | 现有AFS acceptance runner/adapter；Linux ARM64 guard、Full ENV verifier返回BLOCKED；当前无默认公共Buildkite L0/Full完整运行这些套件的链 | adapter已有，READY不是PASS；旧69 active全标smoke.required不能照搬；环境/完整计数与当前制品绑定未闭合 | 旧AFS文档保留pjdfstest/固定LTP子集/短FSx兜底及复杂矩阵后置；不等于已完成公共接入 | 整理当前有效adapter/环境/完整计数；纳入AFS集成归属与适用专项集合；公共产品兼容行为另进共享SDK场景 |
 | **③固定版本验收：Multi-VM拓扑专项** | 发现独立VM身份/放置、真实网络、控制/worker故障与恢复问题；补足单机容器不能证明的边界 | 已有 `build/e2e/multivm/` inventory/contract、SDK/鉴权/故障等driver、`suite.py`/`assemble.py`/`verify.py` | 测试人员/开发者在专用三VM环境执行；没有完整公共Buildkite一键部署验收链 | 先由执行者/环境维护者准备一control＋两worker VM、SSH并安装包/配置ADX和sandboxd；目录不创建机器。可执行子集依赖已部署环境 | 已有 `sdk_accept.py` 等定向driver及suite/结果汇总/verify；当前不在基础K8s L0或Full的隐含链中 | 公共合同与子集存在；README明确完整部署适配仍缺，部分case未实机验证；AFS跨VM组件driver不能充当完整ADX三VM产品验收 | 原README明确下一自动部署adapter应复用adxctl/公开SDK，不能用SSH进程探活代替业务验收 | 有该产品拓扑需求时复用公共三VM合同并补AFS行为；公共部署缺口单独登记，不能写成AFS已有能力 |
 | **③固定版本验收：KVM／设备条件专项** | 验证需要特定runtime/device的checkpoint/snapshot/故障行为；不属于通用冒烟或默认Full | 已有 `build/e2e/firecracker/kubernetes.py` 等FC场景；GPU/NPU在当前公共manifest尚不可执行 | 测试人员/开发者选择能力和对应专用worker；CI可代跑已实现FC步骤 | 先具备明确KVM worker、`/dev/kvm`、匹配FC kit/包/镜像及特权Pod；设备专项另需真实硬件/驱动/暴露，普通worker不具备 | Full已有条件 `platform-fc-e2e` → `firecracker-step.sh` → `run-firecracker.sh` → FC K8s driver；需 `ADX_E2E_CHECKPOINT=1` 等条件及 `ADX_FC_K8S_NODE` | FC公共入口已有，不表示AFS与checkpoint/设备组合已覆盖；GPU/NPU不能由普通Full通过替代 | 既有规划将checkpoint/设备相关变更与对应条件环境关联；没有证据证明所有自动触发已配置 | 仅在支持/需求明确时补AFS相关产品组合；不把设备能力设为所有AFS测试的强制前提 |
