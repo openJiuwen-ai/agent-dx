@@ -60,7 +60,9 @@ def unpack_archive(archive, source, pin):
         seen = set()
         for member in bundle:
             path = PurePosixPath(member.name)
-            if path.is_absolute() or '..' in path.parts or not path.parts or path.parts[0] != prefix:
+            if path.is_absolute() or '..' in path.parts or not path.parts:
+                raise ValueError('unsafe envd archive path')
+            if path.parts[0] != prefix:
                 raise ValueError('unsafe envd archive path')
             relative = PurePosixPath(*path.parts[1:])
             selected = relative == PurePosixPath('LICENSE') or relative.parts[:2] in (
@@ -86,9 +88,12 @@ def build(source, output, jobs=4, git_protocol=None, obs_source=False):
     if obs_source:
         artifact = pin['archive']
         url = urlsplit(artifact['url'])
-        if (url.scheme != 'https' or not url.hostname or '.obs.' not in url.hostname
-                or not url.hostname.endswith('.myhuaweicloud.com') or url.username or url.password
-                or url.query or url.fragment):
+        host = url.hostname or ''
+        if url.scheme != 'https' or '.obs.' not in host or not host.endswith('.myhuaweicloud.com'):
+            raise ValueError('invalid envd OBS source URL')
+        if url.username or url.password or url.query:
+            raise ValueError('invalid envd OBS source URL')
+        if url.fragment:
             raise ValueError('invalid envd OBS source URL')
         with tempfile.TemporaryDirectory(prefix='adx-envd-obs-') as directory:
             root = Path(directory)
