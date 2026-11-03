@@ -355,6 +355,7 @@ pub struct Ingress {
     default_tunnel_port: u16,
     port_host_domain: Option<String>,
     e2b_enabled: bool,
+    e2b_allow_http: bool,
     frontend_address: String,
     reverse_proxy: ReverseProxy,
     proxy_routes: Arc<Vec<ProxyRoute>>,
@@ -396,6 +397,7 @@ impl Ingress {
             default_tunnel_port,
             port_host_domain: None,
             e2b_enabled: false,
+            e2b_allow_http: false,
             frontend_address: frontend_address.into(),
             reverse_proxy: ReverseProxy::new(ReverseProxyConfig::default()),
             proxy_routes: Arc::new(Vec::new()),
@@ -456,6 +458,12 @@ impl Ingress {
 
     pub fn with_e2b_enabled(mut self, enabled: bool) -> Self {
         self.e2b_enabled = enabled;
+        self
+    }
+
+    /// Opt in to E2B routes over unencrypted HTTP. Native transport policies remain unchanged.
+    pub fn with_e2b_allow_http(mut self, allow: bool) -> Self {
+        self.e2b_allow_http = allow;
         self
     }
 
@@ -902,25 +910,13 @@ impl Ingress {
         let gateway = self;
         let service =
             service_fn(move |request| gateway.clone().handle_http(request, ingress_security, peer));
-        match ingress_security {
-            IngressSecurity::Tls => {
-                if let Err(error) =
-                    hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-                        .serve_connection_with_upgrades(TokioIo::new(stream), service)
-                        .await
-                {
-                    tracing::debug!(%peer, %error, "Ingress HTTP connection closed");
-                }
-            }
-            IngressSecurity::Plaintext => {
-                if let Err(error) = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(TokioIo::new(stream), service)
-                    .with_upgrades()
-                    .await
-                {
-                    tracing::debug!(%peer, %error, "Ingress HTTP connection closed");
-                }
-            }
+        // Official E2B transports may use cleartext HTTP/2. Protocol detection
+        // does not change the listener's security identity or route admission.
+        if let Err(error) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+            .serve_connection_with_upgrades(TokioIo::new(stream), service)
+            .await
+        {
+            tracing::debug!(%peer, %error, "Ingress HTTP connection closed");
         }
     }
 
@@ -1351,13 +1347,30 @@ impl Ingress {
             || (self.e2b_enabled && is_e2b_management_path(path))
     }
 
+    fn e2b_http_allowed(&self) -> bool {
+        self.e2b_enabled && self.e2b_allow_http
+    }
+
+    fn e2b_http_management_allowed(&self, path: &str) -> bool {
+        // Only canonical E2B paths may cross the plaintext management boundary.
+        // Do not let upstream URI normalization turn an admitted E2B prefix
+        // into a native or administrator path.
+        self.e2b_http_allowed()
+            && is_e2b_management_path(path)
+            && !path.contains(['%', '\\'])
+            && !path.contains("//")
+            && !path.split('/').any(|segment| matches!(segment, "." | ".."))
+    }
+
     async fn proxy_control_plane(
         &self,
         request: Request<Incoming>,
         ingress_security: IngressSecurity,
         peer: std::net::SocketAddr,
     ) -> Response<ProxyBody> {
-        if ingress_security == IngressSecurity::Plaintext {
+        if ingress_security == IngressSecurity::Plaintext
+            && !self.e2b_http_management_allowed(request.uri().path())
+        {
             return tls_required();
         }
         let route = ProxyRoute {
@@ -2059,7 +2072,7 @@ impl Ingress {
         ingress_security: IngressSecurity,
         target: E2bTarget,
     ) -> Response<ProxyBody> {
-        if ingress_security == IngressSecurity::Plaintext {
+        if ingress_security == IngressSecurity::Plaintext && !self.e2b_http_allowed() {
             return tls_required();
         }
         let request_id = header_string(&request, "x-request-id");
@@ -2085,7 +2098,7 @@ impl Ingress {
         ingress_security: IngressSecurity,
         route: RouteHandle,
     ) -> Response<ProxyBody> {
-        if ingress_security == IngressSecurity::Plaintext {
+        if ingress_security == IngressSecurity::Plaintext && !self.e2b_http_allowed() {
             return tls_required();
         }
         // An opaque tunnel could carry unchecked envd control requests. Execd
@@ -3727,3 +3740,7 @@ mod watch_close_contract_tests {
         task.await.unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "server/e2b_http_tests.rs"]
+mod e2b_http_tests;
