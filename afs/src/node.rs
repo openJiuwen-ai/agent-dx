@@ -1562,7 +1562,8 @@ async fn run_node(
         })?;
     #[cfg(feature = "dfs")]
     let dfs_write_buffers = if cfg.dfs_external_backend.is_some() {
-        // S3 keeps its existing sealed-body and bounded-window pipeline.
+        // S3 objects keep no local BLAKE3 outboard, so S3 buffers carry no
+        // outboard budget.
         chunk::WriteBufferPool::new(dfs_write_buffer_idle_bytes)
     } else {
         chunk::WriteBufferPool::new_with_outboard_budget(
@@ -1730,26 +1731,31 @@ async fn run_node(
         .with_version_cache_bytes(cfg.dfs_version_cache_bytes)
         .with_write_buffer_pool(dfs_write_buffers.clone())
         .with_inode_lock_metrics(&obs.registry)?;
-        let fs = if cfg.dfs_external_backend.is_none() {
-            fs.with_native_write_pipeline(
-                chunk::NativeWriteBudget::new(
-                    usize::try_from(cfg.dfs_dirty_budget_bytes).map_err(|_| {
-                        afs_error::Error::coded(
-                            afs_error::CONFIG_INVALID,
-                            "native dirty budget does not fit this platform",
-                        )
-                    })?,
-                ),
-                vfs::dfs::NativeWriteConfig {
-                    unpublished_descriptors: cfg.dfs_unpublished_descriptors,
-                    upload_inflight_chunks: cfg.dfs_upload_inflight_chunks,
-                },
-                tokio::runtime::Handle::current(),
-                Some(dfs_read_work_metrics.clone()),
-            )?
+        // Every DFS store, local or S3, writes through the native pipeline. S3 has
+        // only `MAX_UPLOADS` concurrent PUTs; deeper native upload queues would wait
+        // on those permits inside the request timeout.
+        let upload_inflight_chunks = if cfg.dfs_external_backend.is_some() {
+            cfg.dfs_upload_inflight_chunks
+                .min(external_chunk::MAX_UPLOADS)
         } else {
-            fs
+            cfg.dfs_upload_inflight_chunks
         };
+        let fs = fs.with_native_write_pipeline(
+            chunk::NativeWriteBudget::new(usize::try_from(cfg.dfs_dirty_budget_bytes).map_err(
+                |_| {
+                    afs_error::Error::coded(
+                        afs_error::CONFIG_INVALID,
+                        "native dirty budget does not fit this platform",
+                    )
+                },
+            )?),
+            vfs::dfs::NativeWriteConfig {
+                unpublished_descriptors: cfg.dfs_unpublished_descriptors,
+                upload_inflight_chunks,
+            },
+            tokio::runtime::Handle::current(),
+            Some(dfs_read_work_metrics.clone()),
+        )?;
         Some(Arc::new(fs))
     } else {
         None

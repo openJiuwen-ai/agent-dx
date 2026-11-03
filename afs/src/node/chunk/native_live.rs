@@ -1,4 +1,4 @@
-//! Native payload allocation ownership only; S3 has a separate budget.
+//! DFS write-pipeline payload allocation ownership (native and S3 storage).
 
 use std::{
     sync::{Arc, Condvar, Mutex},

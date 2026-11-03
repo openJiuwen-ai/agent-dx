@@ -84,7 +84,8 @@ tls_identity_certificate = "/opt/adx/config/afs/tls/node-a.pem"
 tls_identity_private_key = "/opt/adx/config/afs/tls/node-a-key.pem"
 tls_server_name = "afs-cluster"
 
-# Native DFS live uploads and unpublished metadata. S3 keeps its separate budgets.
+# DFS live uploads and unpublished metadata (native and S3 storage alike).
+# With S3, uploads are capped at 4 in flight.
 # Front-owned ordinary-write payload across all files; not whole-process memory.
 # Automatic waiting reserve: min(dfs_write_queue_bytes / 8, 32MiB).
 dfs_write_queue_bytes = 2147483648

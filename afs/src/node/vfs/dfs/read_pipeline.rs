@@ -220,19 +220,6 @@ impl DistributedFs {
                     .await;
             }
             if let Some(state) = self.write_state(&snapshot.inode_id)? {
-                // Publishing accepted writes is the existing write barrier. Only
-                // that write operation uses its synchronous adapter; reading its
-                // resulting committed data below remains fully asynchronous.
-                if self.deferred_publication_enabled() {
-                    let published = crate::node::read_pipeline::local_io(|| {
-                        self.publish_accepted_writes_for_local_read(handle, &snapshot.inode_id)
-                    })?;
-                    if let Some(inode) = published {
-                        return self
-                            .read_committed_async(&inode, request, None, false)
-                            .await;
-                    }
-                }
                 let view = {
                     let state = state
                         .lock()

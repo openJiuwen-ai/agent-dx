@@ -823,8 +823,6 @@ pub struct StagedChunk {
     // descriptor. CRC descriptors bind segment checksums, not cryptographic body proofs.
     #[cfg(feature = "dfs")]
     sealed_chunk: ChunkObject,
-    #[cfg(feature = "dfs")]
-    write_budget: Vec<WriteBudgetReservation>,
 }
 
 impl StagedChunk {
@@ -911,8 +909,6 @@ impl StagedChunk {
                 bytes,
                 outboard,
                 segment_crc: None,
-                #[cfg(feature = "dfs")]
-                write_budget: Vec::new(),
             }
         })
     }
@@ -961,8 +957,6 @@ impl StagedChunk {
             bytes,
             outboard: None,
             segment_crc: Some(Arc::new(table)),
-            #[cfg(feature = "dfs")]
-            write_budget: Vec::new(),
         })
     }
 
@@ -978,22 +972,12 @@ impl StagedChunk {
     }
 
     #[cfg(feature = "dfs")]
-    pub(super) fn write_budget_reservations(&self) -> &[WriteBudgetReservation] {
-        &self.write_budget
-    }
-
-    #[cfg(feature = "dfs")]
-    pub(super) fn retain_write_budget(&mut self, reservations: &[WriteBudgetReservation]) {
-        self.write_budget.extend_from_slice(reservations);
-    }
-
-    #[cfg(feature = "dfs")]
     pub(crate) fn shared_bytes(&self) -> SharedChunkBytes {
         self.bytes.clone()
     }
 
     /// Heap capacity owned by the staged metadata, excluding the separately
-    /// charged final body, shared outboard and shared budget owners. Callers
+    /// charged final body and shared outboard. Callers
     /// account for the inline StagedChunk/container storage themselves.
     #[cfg(feature = "dfs")]
     pub(crate) fn native_retained_metadata_bytes(&self) -> usize {
@@ -1007,11 +991,6 @@ impl StagedChunk {
                     + 16
                     + t.checksums.capacity() * 4
             }))
-            .saturating_add(
-                self.write_budget
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<WriteBudgetReservation>()),
-            )
     }
 }
 
@@ -1019,91 +998,6 @@ impl StagedChunk {
 impl AsRef<[u8]> for StagedChunk {
     fn as_ref(&self) -> &[u8] {
         self.bytes()
-    }
-}
-
-// The VFS owns admission limits. These typed leases live beside their immutable
-// payload so HTTP body/retry ownership can outlive a ticket or a dirty window.
-#[cfg(feature = "dfs")]
-#[derive(Debug, Default)]
-pub(super) struct DeferredWriteBudget {
-    pub(super) state: Mutex<DeferredWriteBudgetState>,
-}
-
-#[cfg(feature = "dfs")]
-#[derive(Debug, Default)]
-pub(super) struct DeferredWriteBudgetState {
-    pub(super) normal_bytes: u64,
-    pub(super) publisher_bytes: u64,
-    pub(super) descriptor_bytes: u64,
-    pub(super) descriptors: usize,
-}
-
-#[cfg(feature = "dfs")]
-#[derive(Clone, Debug)]
-pub(super) struct WriteBudgetReservation {
-    _inner: Arc<WriteBudgetReservationInner>,
-}
-
-#[cfg(feature = "dfs")]
-#[derive(Debug)]
-struct WriteBudgetReservationInner {
-    budget: Arc<DeferredWriteBudget>,
-    normal_bytes: u64,
-    publisher_bytes: u64,
-    descriptor_bytes: u64,
-    descriptors: usize,
-}
-
-#[cfg(feature = "dfs")]
-impl WriteBudgetReservation {
-    pub(super) fn reduce_normal_to(&mut self, bytes: u64) -> Result<()> {
-        let inner = Arc::get_mut(&mut self._inner)
-            .ok_or_else(|| invalid("shared payload lease cannot be resized"))?;
-        if bytes > inner.normal_bytes {
-            return Err(invalid("payload lease reduction cannot grow its charge"));
-        }
-        let mut state = inner.budget.state.lock().map_err(|_| {
-            Error::coded(
-                afs_error::NODE_VFS_UNAVAILABLE,
-                "DFS deferred write budget is poisoned",
-            )
-        })?;
-        state.normal_bytes = state
-            .normal_bytes
-            .saturating_sub(inner.normal_bytes - bytes);
-        inner.normal_bytes = bytes;
-        Ok(())
-    }
-
-    pub(super) fn new(
-        budget: Arc<DeferredWriteBudget>,
-        normal_bytes: u64,
-        publisher_bytes: u64,
-        descriptor_bytes: u64,
-        descriptors: usize,
-    ) -> Self {
-        Self {
-            _inner: Arc::new(WriteBudgetReservationInner {
-                budget,
-                normal_bytes,
-                publisher_bytes,
-                descriptor_bytes,
-                descriptors,
-            }),
-        }
-    }
-}
-
-#[cfg(feature = "dfs")]
-impl Drop for WriteBudgetReservationInner {
-    fn drop(&mut self) {
-        if let Ok(mut state) = self.budget.state.lock() {
-            state.normal_bytes = state.normal_bytes.saturating_sub(self.normal_bytes);
-            state.publisher_bytes = state.publisher_bytes.saturating_sub(self.publisher_bytes);
-            state.descriptor_bytes = state.descriptor_bytes.saturating_sub(self.descriptor_bytes);
-            state.descriptors = state.descriptors.saturating_sub(self.descriptors);
-        }
     }
 }
 
@@ -1160,19 +1054,6 @@ pub trait ChunkStore: Send + Sync {
         ))
     }
 
-    fn supports_deferred_put(&self) -> bool {
-        false
-    }
-
-    /// Submit owned chunks without waiting for persistence. Unsupported backends
-    /// reject explicitly; callers must check supports_deferred_put first.
-    fn put_batch_deferred(&self, _staged: Vec<StagedChunk>) -> Result<Box<dyn DeferredChunkPut>> {
-        Err(Error::coded(
-            afs_error::NODE_VFS_UNIMPLEMENTED,
-            "deferred chunk PUT is unsupported for this backend",
-        ))
-    }
-
     fn put(&self, staged: StagedChunk) -> Result<ChunkReceipt> {
         self.put_batch(vec![staged])?
             .pop()
@@ -1187,14 +1068,6 @@ pub trait ChunkStore: Send + Sync {
             "ChunkStore capacity is unsupported for this backend",
         ))
     }
-}
-
-pub trait DeferredChunkPut: Send {
-    fn try_wait(&mut self) -> Result<Option<Vec<ChunkReceipt>>> {
-        Ok(None)
-    }
-
-    fn wait(self: Box<Self>) -> Result<Vec<ChunkReceipt>>;
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

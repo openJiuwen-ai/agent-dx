@@ -403,7 +403,6 @@ fn p2_w2_native_default_receipts_never_claim_required_local_release() {
     assert_eq!(receipts[0].receipt.chunk, staged.chunk);
     assert_eq!(receipts[0].receipt.operation_id, staged.operation_id);
     assert!(!receipts[0].local_required_and_durable);
-    assert!(!store.supports_deferred_put());
     let mut output = [9; 3];
     assert_eq!(
         store

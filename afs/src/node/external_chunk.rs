@@ -39,13 +39,14 @@ use crate::{
         SourceCandidate, external_object_key,
     },
     node::{
-        chunk::{ChunkStore, DeferredChunkPut, MAX_STAGED_CHUNK_BYTES, StagedChunk},
+        chunk::{ChunkStore, MAX_STAGED_CHUNK_BYTES, StagedChunk},
         dfs_read::{ExternalChunkReader, VerifiedExternalChunk},
     },
 };
 
 const MAX_BATCH: usize = 128;
-const MAX_UPLOADS: usize = 4;
+/// Concurrent object PUTs; the Node's native upload depth is capped to this.
+pub(crate) const MAX_UPLOADS: usize = 4;
 const MAX_ACTIVE_REQUESTS: usize = 32;
 const MAX_CREDENTIAL_BYTES: u64 = 16 * 1024;
 const MAX_CACHE_JOBS: usize = 128;
@@ -1089,34 +1090,6 @@ struct S3ChunkCache {
     _lock: File,
 }
 
-struct S3DeferredPut {
-    receiver: Option<mpsc::Receiver<Result<Reply>>>,
-    timeout: Duration,
-}
-
-impl S3DeferredPut {
-    fn put_receipts_from_reply(response: Result<Reply>) -> Result<Vec<ChunkReceipt>> {
-        match response? {
-            Reply::Put(receipts) => Ok(receipts),
-            Reply::Read(_) => Err(invalid("S3 worker returned the wrong response")),
-        }
-    }
-
-    fn try_wait_put(&mut self) -> Result<Option<Vec<ChunkReceipt>>> {
-        let Some(receiver) = self.receiver.take() else {
-            return Err(invalid("deferred S3 PUT was already consumed"));
-        };
-        match receiver.try_recv() {
-            Ok(response) => Self::put_receipts_from_reply(response).map(Some),
-            Err(mpsc::TryRecvError::Empty) => {
-                self.receiver = Some(receiver);
-                Ok(None)
-            }
-            Err(mpsc::TryRecvError::Disconnected) => Err(unavailable("S3 worker stopped")),
-        }
-    }
-}
-
 struct CacheShared {
     options: S3ChunkCacheOptions,
     store_id: String,
@@ -2042,7 +2015,7 @@ impl Drop for S3ChunkCache {
     }
 }
 
-/// One owned asynchronous worker serves synchronous and deferred requests.
+/// One owned asynchronous worker serves every PUT request.
 /// All requests share four upload permits; completing one PUT immediately
 /// makes its permit available to the next chunk, including another batch.
 /// The bounded queue applies backpressure rather than reporting a storage
@@ -2247,31 +2220,6 @@ impl S3ChunkStore {
     }
 }
 
-impl DeferredChunkPut for S3DeferredPut {
-    fn try_wait(&mut self) -> Result<Option<Vec<ChunkReceipt>>> {
-        self.try_wait_put()
-    }
-
-    fn wait(mut self: Box<Self>) -> Result<Vec<ChunkReceipt>> {
-        let wait_span = tracing::info_span!("node.dfs.s3.deferred_put_wait");
-        let receiver = self
-            .receiver
-            .take()
-            .ok_or_else(|| invalid("deferred S3 PUT was already consumed"))?;
-        let response = wait_span.in_scope(|| {
-            receiver
-                .recv_timeout(self.timeout)
-                .map_err(|error| match error {
-                    mpsc::RecvTimeoutError::Timeout => {
-                        Error::coded(afs_error::IO_TIMEOUT, "S3 deferred PUT timed out")
-                    }
-                    mpsc::RecvTimeoutError::Disconnected => unavailable("S3 worker stopped"),
-                })
-        })?;
-        S3DeferredPut::put_receipts_from_reply(response)
-    }
-}
-
 impl Drop for S3ChunkStore {
     fn drop(&mut self) {
         drop(self.cache.take());
@@ -2287,40 +2235,20 @@ impl Drop for S3ChunkStore {
 }
 
 impl ChunkStore for S3ChunkStore {
-    fn supports_deferred_put(&self) -> bool {
-        true
-    }
-
-    fn put_batch_deferred(&self, staged: Vec<StagedChunk>) -> Result<Box<dyn DeferredChunkPut>> {
-        if staged.is_empty() {
-            return Ok(Box::new(ReadyExternalDeferredPut {
-                receipts: Some(Vec::new()),
-            }));
-        }
-        if staged.len() > MAX_BATCH {
-            return Err(invalid("S3 batch allows at most 128 chunks"));
-        }
-        for value in &staged {
-            if value.chunk.is_segment_crc32c() {
-                return Err(Error::coded(
-                    afs_error::IO_NOT_SUPPORTED,
-                    "CRC32C external object writes are unsupported",
-                ));
-            }
-            validate_chunk(&value.chunk)?;
-            if !value.has_sealed_identity() {
-                return Err(invalid("staged Chunk metadata changed after sealing"));
-            }
-            if let Some(cache) = &self.cache {
-                cache.schedule_from_write(&value.chunk, value.bytes());
-            }
-        }
-        let (receiver, _, _, _) = self.enqueue(Request::Put(staged))?;
-        Ok(Box::new(S3DeferredPut {
-            receiver: Some(receiver),
-            timeout: self.options.request_timeout * (MAX_ACTIVE_REQUESTS as u32 + 2)
-                + Duration::from_secs(1),
-        }))
+    /// Same envelope as replicated stores (receipt x 8 plus 8 KiB for descriptor
+    /// state, layout clones and publication scratch), with the external commit
+    /// strings in place of replica ACKs. The object key is derived from store id,
+    /// generation and the canonical BLAKE3 chunk id (about 90 bytes).
+    fn native_descriptor_reservation_bytes(&self, operation_id: &OperationId) -> Result<usize> {
+        let receipt = std::mem::size_of::<ChunkReceipt>()
+            + std::mem::size_of::<ExternalCommitReceipt>()
+            + operation_id.0.capacity()
+            + 2 * (self.options.store_id.len() + self.options.generation.len())
+            + 256;
+        receipt
+            .checked_mul(8)
+            .and_then(|bytes| bytes.checked_add(8192))
+            .ok_or_else(|| invalid("S3 native descriptor reservation overflow"))
     }
 
     fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
@@ -2362,25 +2290,6 @@ impl ChunkStore for S3ChunkStore {
         let length = out.len().min(bytes.len() - start);
         out[..length].copy_from_slice(&bytes[start..start + length]);
         Ok(length)
-    }
-}
-
-struct ReadyExternalDeferredPut {
-    receipts: Option<Vec<ChunkReceipt>>,
-}
-
-impl DeferredChunkPut for ReadyExternalDeferredPut {
-    fn try_wait(&mut self) -> Result<Option<Vec<ChunkReceipt>>> {
-        self.receipts
-            .take()
-            .map(Some)
-            .ok_or_else(|| invalid("deferred S3 PUT was already consumed"))
-    }
-
-    fn wait(mut self: Box<Self>) -> Result<Vec<ChunkReceipt>> {
-        self.receipts
-            .take()
-            .ok_or_else(|| invalid("deferred S3 PUT was already consumed"))
     }
 }
 
@@ -4125,87 +4034,6 @@ mod tests {
     }
 
     #[test]
-    fn upload_body_retry_clone_keeps_write_budget_until_last_owner() {
-        use crate::node::chunk::DeferredWriteBudget;
-
-        let budget = Arc::new(DeferredWriteBudget::default());
-        let reservation = budget.reserve_normal(2048).unwrap();
-        let mut staged = StagedChunk::new(OperationId::new("body-pin"), vec![7; 1024]);
-        staged.retain_write_budget(std::slice::from_ref(&reservation));
-        let body = upload_payload(&staged).unwrap();
-        let retry_body = body.clone();
-        assert_eq!(
-            body.iter().next().unwrap().as_ptr(),
-            staged.bytes().as_ptr()
-        );
-        drop(staged);
-        drop(reservation);
-        assert_eq!(budget.state.lock().unwrap().normal_bytes, 2048);
-        drop(body);
-        assert_eq!(budget.state.lock().unwrap().normal_bytes, 2048);
-        drop(retry_body);
-        assert_eq!(budget.state.lock().unwrap().normal_bytes, 0);
-    }
-
-    #[test]
-    fn timed_out_upload_keeps_budget_while_transport_retains_body() {
-        use crate::node::chunk::DeferredWriteBudget;
-        use std::sync::atomic::Ordering::SeqCst;
-
-        let budget = Arc::new(DeferredWriteBudget::default());
-        let backend = ObservedStore::new(None, Duration::from_secs(5));
-        backend.activity.retain_payloads.store(true, SeqCst);
-        let mut config = options();
-        config.request_timeout = Duration::from_millis(30);
-        let store = S3ChunkStore::with_backend(config, backend.clone()).unwrap();
-        let mut staged = upload_batch(4, 1024);
-        for chunk in &mut staged {
-            let reservation = budget.reserve_normal(2048).unwrap();
-            chunk.retain_write_budget(std::slice::from_ref(&reservation));
-        }
-        assert_eq!(
-            store.put_batch(staged).unwrap_err().code(),
-            afs_error::IO_TIMEOUT
-        );
-        assert_eq!(backend.activity.active.load(SeqCst), 0);
-        assert_eq!(backend.activity.retained_payloads.lock().unwrap().len(), 4);
-        drop(store);
-        assert_eq!(budget.state.lock().unwrap().normal_bytes, 8192);
-        backend.activity.retained_payloads.lock().unwrap().clear();
-        assert_eq!(budget.state.lock().unwrap().normal_bytes, 0);
-    }
-
-    #[test]
-    fn abandoned_ticket_keeps_budget_while_worker_owns_payload() {
-        use crate::node::chunk::DeferredWriteBudget;
-        use std::sync::atomic::Ordering::SeqCst;
-
-        let budget = Arc::new(DeferredWriteBudget::default());
-        let backend = ObservedStore::new(None, Duration::from_millis(1));
-        backend.activity.hold.store(true, SeqCst);
-        let store = S3ChunkStore::with_backend(options(), backend.clone()).unwrap();
-        let mut staged = upload_batch(4, 1024);
-        for chunk in &mut staged {
-            let reservation = budget.reserve_normal(2048).unwrap();
-            chunk.retain_write_budget(std::slice::from_ref(&reservation));
-        }
-        drop(store.put_batch_deferred(staged).unwrap());
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while backend.activity.started.load(SeqCst) < 4 && std::time::Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(backend.activity.started.load(SeqCst), 4);
-        assert_eq!(budget.state.lock().unwrap().normal_bytes, 8192);
-        backend.activity.hold.store(false, SeqCst);
-        drop(store);
-        // The in-memory fixture may itself retain the supplied immutable Bytes.
-        // Release that final backend owner as well, rather than treating drain
-        // or ticket cancellation as proof that no body remains alive.
-        drop(backend);
-        assert_eq!(budget.state.lock().unwrap().normal_bytes, 0);
-    }
-
-    #[test]
     fn valid_but_replaced_public_identity_does_not_replace_content_proof() {
         let store = S3ChunkStore {
             options: options(),
@@ -4221,15 +4049,7 @@ mod tests {
         original.chunk = different.chunk;
         validate_chunk(&original.chunk).unwrap();
         assert_eq!(
-            store.put_batch(vec![original.clone()]).unwrap_err().code(),
-            afs_error::IO_INVALID
-        );
-        assert_eq!(
-            store
-                .put_batch_deferred(vec![original])
-                .err()
-                .unwrap()
-                .code(),
+            store.put_batch(vec![original]).unwrap_err().code(),
             afs_error::IO_INVALID
         );
     }
@@ -4295,15 +4115,19 @@ mod tests {
     }
 
     #[test]
-    fn deferred_batches_share_four_slots_and_replace_completed_uploads() {
+    fn concurrent_puts_share_four_slots_and_replace_completed_uploads() {
+        // Native S3 writes call put_batch concurrently from blocking-pool threads.
         use std::sync::atomic::Ordering::SeqCst;
         let backend = ObservedStore::new(None, Duration::from_millis(10));
         backend.activity.hold_first.store(true, SeqCst);
-        let store = S3ChunkStore::with_backend(options(), backend.clone()).unwrap();
-        let mut tickets = Vec::new();
-        for staged in upload_batch(12, 1024) {
-            tickets.push(store.put_batch_deferred(vec![staged]).unwrap());
-        }
+        let store = Arc::new(S3ChunkStore::with_backend(options(), backend.clone()).unwrap());
+        let writers: Vec<_> = upload_batch(12, 1024)
+            .into_iter()
+            .map(|staged| {
+                let store = store.clone();
+                thread::spawn(move || store.put_batch(vec![staged]))
+            })
+            .collect();
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
         while backend.activity.started.load(SeqCst) < 5 && std::time::Instant::now() < deadline {
             thread::sleep(Duration::from_millis(1));
@@ -4312,181 +4136,52 @@ mod tests {
             backend.activity.started.load(SeqCst) >= 5,
             "completed PUT must admit another chunk while the first PUT is held"
         );
-        assert!(!backend.activity.finished.lock().unwrap().contains(&0));
         assert_eq!(backend.activity.maximum.load(SeqCst), MAX_UPLOADS);
         backend.activity.hold_first.store(false, SeqCst);
-        // Drop must finish all submitted work, including uncollected tickets.
+        let mut operations: Vec<_> = writers
+            .into_iter()
+            .map(|writer| {
+                let receipts = writer.join().unwrap().unwrap();
+                assert_eq!(receipts.len(), 1);
+                receipts[0].operation_id.0.clone()
+            })
+            .collect();
+        operations.sort();
+        let mut expected: Vec<_> = (0..12).map(|index| format!("upload-{index}")).collect();
+        expected.sort();
+        assert_eq!(operations, expected);
         drop(store);
-        for (index, ticket) in tickets.into_iter().enumerate() {
-            let receipts = ticket.wait().unwrap();
-            assert_eq!(receipts.len(), 1);
-            assert_eq!(
-                receipts[0].operation_id,
-                OperationId::new(format!("upload-{index}"))
-            );
-        }
         assert_eq!(backend.activity.started.load(SeqCst), 12);
         assert_eq!(backend.activity.active.load(SeqCst), 0);
     }
 
     #[test]
-    fn deferred_try_wait_reports_empty_then_consumes_success_once() {
-        use std::sync::atomic::Ordering::SeqCst;
-
-        let backend = ObservedStore::new(None, Duration::from_millis(1));
-        backend.activity.hold.store(true, SeqCst);
-        let store = S3ChunkStore::with_backend(options(), backend.clone()).unwrap();
-        let mut ticket = store.put_batch_deferred(upload_batch(4, 1024)).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while backend.activity.started.load(SeqCst) < 4 && std::time::Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(backend.activity.started.load(SeqCst), 4);
-        assert!(
-            ticket.try_wait().unwrap().is_none(),
-            "unfinished deferred PUT must leave the receiver reusable"
-        );
-
-        backend.activity.hold.store(false, SeqCst);
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        let receipts = loop {
-            if let Some(receipts) = ticket.try_wait().unwrap() {
-                break receipts;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "deferred PUT did not finish before timeout"
-            );
-            thread::sleep(Duration::from_millis(1));
-        };
-        assert_eq!(receipts.len(), 4);
-        assert_eq!(ticket.try_wait().unwrap_err().code(), afs_error::IO_INVALID);
-        drop(store);
-        assert_eq!(backend.activity.active.load(SeqCst), 0);
-    }
-
-    #[test]
-    fn deferred_try_wait_surfaces_upload_failure_once() {
-        let backend = ObservedStore::new(Some(1), Duration::from_millis(1));
-        let store = S3ChunkStore::with_backend(options(), backend).unwrap();
-        let mut ticket = store.put_batch_deferred(upload_batch(4, 1024)).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        let error = loop {
-            match ticket.try_wait() {
-                Ok(None) => thread::sleep(Duration::from_millis(1)),
-                Ok(Some(_)) => panic!("failed deferred PUT must not produce receipts"),
-                Err(error) => break error,
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "deferred PUT failure did not arrive before timeout"
-            );
-        };
-        assert_eq!(error.code(), afs_error::IO_UNAVAILABLE);
-        assert_eq!(ticket.try_wait().unwrap_err().code(), afs_error::IO_INVALID);
-    }
-
-    #[test]
-    fn deferred_try_wait_empty_preserves_wait_timeout() {
-        use std::sync::atomic::Ordering::SeqCst;
-
-        let backend = ObservedStore::new(None, Duration::from_secs(5));
-        backend.activity.hold.store(true, SeqCst);
-        let mut config = options();
-        config.request_timeout = Duration::from_millis(30);
-        let store = S3ChunkStore::with_backend(config, backend.clone()).unwrap();
-        let mut ticket = store.put_batch_deferred(upload_batch(4, 1024)).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while backend.activity.started.load(SeqCst) < 4 && std::time::Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(1));
-        }
-        assert_eq!(backend.activity.started.load(SeqCst), 4);
-        assert!(ticket.try_wait().unwrap().is_none());
-        assert_eq!(ticket.wait().unwrap_err().code(), afs_error::IO_TIMEOUT);
-        backend.activity.hold.store(false, SeqCst);
-        drop(store);
-        assert_eq!(backend.activity.active.load(SeqCst), 0);
-    }
-
-    #[test]
-    fn deferred_try_wait_rejects_wrong_reply_and_disconnect_once() {
-        let staged = StagedChunk::new(OperationId::new("wrong-reply"), b"payload".to_vec());
-        let (sender, receiver) = mpsc::sync_channel(1);
-        sender.send(Ok(Reply::Read(verified(&staged)))).unwrap();
-        let mut wrong = S3DeferredPut {
-            receiver: Some(receiver),
-            timeout: Duration::from_secs(1),
-        };
-        assert_eq!(wrong.try_wait().unwrap_err().code(), afs_error::IO_INVALID);
-        assert_eq!(wrong.try_wait().unwrap_err().code(), afs_error::IO_INVALID);
-
-        let (sender, receiver) = mpsc::sync_channel(1);
-        drop(sender);
-        let mut disconnected = S3DeferredPut {
-            receiver: Some(receiver),
-            timeout: Duration::from_secs(1),
-        };
-        assert_eq!(
-            disconnected.try_wait().unwrap_err().code(),
-            afs_error::IO_UNAVAILABLE
-        );
-        assert_eq!(
-            disconnected.try_wait().unwrap_err().code(),
-            afs_error::IO_INVALID
-        );
-    }
-
-    #[test]
-    fn ready_deferred_try_wait_consumes_success_once() {
-        let mut ready = ReadyExternalDeferredPut {
-            receipts: Some(Vec::new()),
-        };
-        assert!(ready.try_wait().unwrap().unwrap().is_empty());
-        assert_eq!(ready.try_wait().unwrap_err().code(), afs_error::IO_INVALID);
-    }
-
-    #[test]
-    fn abandoned_deferred_ticket_does_not_prevent_store_drain() {
-        use std::sync::atomic::Ordering::SeqCst;
-        let backend = ObservedStore::new(None, Duration::from_millis(5));
-        let store = S3ChunkStore::with_backend(options(), backend.clone()).unwrap();
-        for staged in upload_batch(8, 1024) {
-            drop(store.put_batch_deferred(vec![staged]).unwrap());
-        }
-        drop(store);
-        assert_eq!(backend.activity.started.load(SeqCst), 8);
-        assert_eq!(backend.activity.active.load(SeqCst), 0);
-        assert_eq!(backend.activity.maximum.load(SeqCst), MAX_UPLOADS);
-    }
-
-    #[test]
     fn upload_queue_backpressure_waits_without_a_false_storage_error() {
-        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        // More concurrent writers than active request slots: the surplus waits
+        // instead of failing, and only MAX_UPLOADS PUTs ever run at once.
+        use std::sync::atomic::Ordering::SeqCst;
         let backend = ObservedStore::new(None, Duration::from_millis(1));
         backend.activity.hold.store(true, SeqCst);
         let store = Arc::new(S3ChunkStore::with_backend(options(), backend.clone()).unwrap());
-        let submitted = Arc::new(AtomicUsize::new(0));
-        let producer_store = store.clone();
-        let producer_submitted = submitted.clone();
-        let producer = thread::spawn(move || {
-            let mut tickets = Vec::new();
-            for staged in upload_batch((MAX_ACTIVE_REQUESTS + 2) as u8, 1024) {
-                tickets.push(producer_store.put_batch_deferred(vec![staged]).unwrap());
-                producer_submitted.fetch_add(1, SeqCst);
-            }
-            tickets
-        });
+        let writers: Vec<_> = upload_batch((MAX_ACTIVE_REQUESTS + 2) as u8, 1024)
+            .into_iter()
+            .map(|staged| {
+                let store = store.clone();
+                thread::spawn(move || store.put_batch(vec![staged]))
+            })
+            .collect();
         let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        while submitted.load(SeqCst) < MAX_ACTIVE_REQUESTS + 1
+        while backend.activity.started.load(SeqCst) < MAX_UPLOADS
             && std::time::Instant::now() < deadline
         {
             thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(submitted.load(SeqCst), MAX_ACTIVE_REQUESTS + 1);
+        thread::sleep(Duration::from_millis(50));
         assert_eq!(backend.activity.maximum.load(SeqCst), MAX_UPLOADS);
+        assert!(writers.iter().all(|writer| !writer.is_finished()));
         backend.activity.hold.store(false, SeqCst);
-        for ticket in producer.join().unwrap() {
-            assert_eq!(ticket.wait().unwrap().len(), 1);
+        for writer in writers {
+            assert_eq!(writer.join().unwrap().unwrap().len(), 1);
         }
         drop(store);
         assert_eq!(backend.activity.active.load(SeqCst), 0);

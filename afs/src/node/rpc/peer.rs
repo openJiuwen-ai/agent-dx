@@ -6878,10 +6878,8 @@ mod tests {
 
     #[cfg(feature = "dfs")]
     #[test]
-    fn cancelled_replica_frames_retain_allocation_and_all_write_leases_until_last_owner() {
-        use crate::node::chunk::{
-            ChunkBuilder, DeferredWriteBudget, StagedChunk, WriteBudgetReservation, WriteBufferPool,
-        };
+    fn cancelled_replica_frames_retain_allocation_until_last_owner() {
+        use crate::node::chunk::{ChunkBuilder, StagedChunk, WriteBufferPool};
         use afs_protocol::node_data::dfs_put_replica_frame::Body;
 
         let capacity = 3 * super::super::data::DFS_REPLICA_FRAME_BYTES;
@@ -6893,25 +6891,10 @@ mod tests {
             let frozen = builder.freeze();
             let generation = frozen.allocation_id();
             let pointer = frozen.as_ptr();
-            let mut staged = StagedChunk::from_shared(
+            let staged = StagedChunk::from_shared(
                 crate::dfs::OperationId::new("replica-frame-lease"),
                 frozen,
             );
-            let budget = Arc::new(DeferredWriteBudget::default());
-            {
-                let mut state = budget.state.lock().unwrap();
-                state.normal_bytes = capacity as u64;
-                state.publisher_bytes = 4096;
-                state.descriptor_bytes = 128;
-                state.descriptors = 1;
-            }
-            staged.retain_write_budget(&[WriteBudgetReservation::new(
-                budget.clone(),
-                capacity as u64,
-                4096,
-                128,
-                1,
-            )]);
             let mut frames = replica_data_frames(staged.clone());
             let first = frames.next().unwrap();
             let second = frames.next().unwrap();
@@ -6928,38 +6911,13 @@ mod tests {
             };
             assert_eq!(data.as_ptr(), pointer);
             assert_eq!(&data[..], &payload[..data.len()]);
-            {
-                let state = budget.state.lock().unwrap();
-                assert_eq!(
-                    (
-                        state.normal_bytes,
-                        state.publisher_bytes,
-                        state.descriptor_bytes,
-                        state.descriptors
-                    ),
-                    (capacity as u64, 4096, 128, 1)
-                );
-            }
             drop(first);
             assert_eq!(pool.snapshot().live_bytes, capacity);
-            assert_eq!(budget.state.lock().unwrap().normal_bytes, capacity as u64);
             if stop_pool {
                 pool.stop();
             }
             drop(last_holder);
             assert_eq!(pool.snapshot().live_bytes, 0);
-            {
-                let state = budget.state.lock().unwrap();
-                assert_eq!(
-                    (
-                        state.normal_bytes,
-                        state.publisher_bytes,
-                        state.descriptor_bytes,
-                        state.descriptors
-                    ),
-                    (0, 0, 0, 0)
-                );
-            }
             if stop_pool {
                 assert_eq!(pool.snapshot().idle_bytes, 0);
                 assert_eq!(pool.snapshot().released_bytes, capacity as u64);
