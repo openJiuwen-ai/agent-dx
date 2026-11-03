@@ -11,6 +11,7 @@ pub mod dfs;
 pub mod owner_roots;
 pub mod rest;
 pub mod rpc;
+mod rpc_metrics;
 pub mod store;
 mod watch;
 use crate::{
@@ -243,8 +244,10 @@ pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
     let security = afs_transport::grpc::SecurityManager::new(cfg.tls_config())?;
     let incoming = security.incoming(incoming)?;
     let server = grpc_config.configure_server(tonic::transport::Server::builder());
+    let rpc_counts = rpc_metrics::MetaRpcCountLayer::register(&state.observability.registry)?;
     services.spawn(async move {
         server
+            .layer(rpc_counts)
             .layer(afs_tracing::GrpcServerTraceLayer::default())
             .add_service(meta_service)
             .add_service(owner_service)

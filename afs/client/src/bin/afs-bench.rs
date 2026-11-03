@@ -130,6 +130,9 @@ struct Args {
     ops: usize,
     small_bytes: u64,
     dir_entries: usize,
+    /// 结构成本：Node / Meta 的 Prometheus `/metrics` 地址（host:port），相位前后各抓一次求差。
+    node_metrics: Option<String>,
+    meta_metrics: Option<String>,
 }
 
 /// 选择运行哪些 workload；默认只跑原有的多文件读写，保持既有命令语义不变。
@@ -209,6 +212,8 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     let mut ops = DEFAULT_OPS;
     let mut small_bytes = DEFAULT_SMALL_BYTES;
     let mut dir_entries = DEFAULT_DIR_ENTRIES;
+    let mut node_metrics = None;
+    let mut meta_metrics = None;
     let mut index = 0;
     while index < argv.len() {
         let flag = argv[index].clone();
@@ -288,6 +293,8 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
                     .parse()
                     .map_err(|_| "invalid --dir-entries".to_string())?
             }
+            "--node-metrics" => node_metrics = Some(value(&mut index)?.to_string()),
+            "--meta-metrics" => meta_metrics = Some(value(&mut index)?.to_string()),
             "--help" | "-h" => return Err(String::new()),
             other if other.starts_with("--") => return Err(format!("unknown flag: {other}")),
             other => {
@@ -355,6 +362,8 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         ops,
         small_bytes,
         dir_entries,
+        node_metrics,
+        meta_metrics,
     })
 }
 
@@ -363,7 +372,8 @@ fn usage() -> &'static str {
      [--files N] [--file-bytes B] [--block B] [--threads N] [--q Q] [--rounds R]\n\
      [--settle-secs S] [--json <path>] [--gc-log <node.log>] [--node-cgroup <dir>]\n\
      [--max-node-mem MiB] [--keep]\n\
-     [--workload multifile|smallfile|meta|txn|all] [--ops N] [--small-bytes B] [--dir-entries N]"
+     [--workload multifile|smallfile|meta|txn|all] [--ops N] [--small-bytes B] [--dir-entries N]\n\
+     [--node-metrics host:port] [--meta-metrics host:port]"
 }
 
 // ---------------------------------------------------------------------------
@@ -518,6 +528,8 @@ struct PhaseStat {
     /// 逐操作 workload 才有：完成的操作数与延迟分位（微秒）。
     ops: Option<u64>,
     latency: Option<LatencySummary>,
+    /// 结构成本计数在本相位内的增量（未配置 `--*-metrics` 时为 None）。
+    cost: Option<CostDelta>,
 }
 
 /// 逐操作延迟的分位汇总；样本在业务线程内按单调时钟采集。
@@ -1207,6 +1219,7 @@ struct OpRun {
     samples: Vec<f64>,
     verified: Option<bool>,
     bytes: u64,
+    cost: Option<CostDelta>,
 }
 
 /// 在 `threads` 个线程上并发跑 `per_thread(thread_index)`，统一采集 CPU、内存与墙钟。
@@ -1215,6 +1228,7 @@ where
     F: Fn(usize) -> Result<(Vec<f64>, Option<bool>, u64), String> + Send + Sync + 'static,
 {
     let per_thread = std::sync::Arc::new(per_thread);
+    let cost0 = CostSnapshot::scrape(ctx.args())?;
     let mem_sampler = MemorySampler::start(ctx.memory_target.clone());
     let node_cpu0 = pids_cpu_seconds(&ctx.node_pids);
     let meta_cpu0 = pids_cpu_seconds(&ctx.meta_pids);
@@ -1253,6 +1267,7 @@ where
     if let Some(error) = first_error {
         return Err(error.into());
     }
+    let cost = cost_delta(CostSnapshot::scrape(ctx.args())?, cost0);
     Ok(OpRun {
         wall_s,
         node_cpu_s,
@@ -1262,6 +1277,7 @@ where
         samples,
         verified,
         bytes,
+        cost,
     })
 }
 
@@ -1284,6 +1300,7 @@ fn op_phase_stat(mut run: OpRun) -> PhaseStat {
         threads: Vec::new(),
         ops: Some(ops),
         latency: LatencySummary::from_micros(&mut run.samples),
+        cost: run.cost.take(),
     }
 }
 
@@ -1638,9 +1655,11 @@ struct RawRun {
     memory: MemoryObservation,
     memory_source: String,
     results: DispatchResults,
+    cost: Option<CostDelta>,
 }
 
 fn dispatch(ctx: &BenchCtx, arm: &'static str, jobs: Vec<Job>) -> Result<RawRun, BoxError> {
+    let cost0 = CostSnapshot::scrape(ctx.args())?;
     let mem_sampler = MemorySampler::start(ctx.memory_target.clone());
     let node_cpu0 = pids_cpu_seconds(&ctx.node_pids);
     let meta_cpu0 = pids_cpu_seconds(&ctx.meta_pids);
@@ -1655,13 +1674,16 @@ fn dispatch(ctx: &BenchCtx, arm: &'static str, jobs: Vec<Job>) -> Result<RawRun,
     let node_cpu_s = pids_cpu_seconds(&ctx.node_pids) - node_cpu0;
     let meta_cpu_s = pids_cpu_seconds(&ctx.meta_pids) - meta_cpu0;
     let memory = mem_sampler.stop();
+    let results = results?;
+    let cost = cost_delta(CostSnapshot::scrape(ctx.args())?, cost0);
     Ok(RawRun {
         wall_s,
         node_cpu_s,
         meta_cpu_s,
         memory,
         memory_source: ctx.memory_target.describe(),
-        results: results?,
+        results,
+        cost,
     })
 }
 
@@ -1844,6 +1866,7 @@ fn phase_stat(raw: &RawRun, phase: Phase, file_bytes: u64) -> Result<PhaseStat, 
         node_mem_peak_bytes: raw.memory.peak_bytes,
         node_mem_observation_complete: raw.memory.complete,
         node_mem_source: raw.memory_source.clone(),
+        cost: raw.cost.clone(),
         ..Default::default()
     };
     let mut verified: Option<bool> = None;
@@ -2027,7 +2050,7 @@ fn emit_report(identity: &EnvIdentity, reports: &[CaseReport]) -> String {
                 })
                 .collect();
             out.push_str(&format!(
-                "       {{\"wall_s\": {:.6}, \"bytes\": {}, \"throughput_bytes_per_s\": {:.1}, \"node_cpu_s\": {:.3}, \"meta_cpu_s\": {:.3}, \"node_mem_peak_bytes\": {}, \"node_mem_observation_complete\": {}, \"node_mem_source\": \"{}\", \"verified\": {}, \"ops\": {}, \"latency_us\": {}, \"threads\": [{}]}}{}\n",
+                "       {{\"wall_s\": {:.6}, \"bytes\": {}, \"throughput_bytes_per_s\": {:.1}, \"node_cpu_s\": {:.3}, \"meta_cpu_s\": {:.3}, \"node_mem_peak_bytes\": {}, \"node_mem_observation_complete\": {}, \"node_mem_source\": \"{}\", \"verified\": {}, \"ops\": {}, \"latency_us\": {}, \"cost\": {}, \"threads\": [{}]}}{}\n",
                 round.wall_s,
                 round.bytes,
                 round.throughput_bytes_per_s,
@@ -2042,6 +2065,7 @@ fn emit_report(identity: &EnvIdentity, reports: &[CaseReport]) -> String {
                     "{{\"p50\": {:.1}, \"p99\": {:.1}, \"max\": {:.1}}}",
                     lat.p50_us, lat.p99_us, lat.max_us
                 )).unwrap_or_else(|| "null".into()),
+                round.cost.as_ref().map(CostDelta::to_json).unwrap_or_else(|| "null".into()),
                 threads.join(", "),
                 if round_position + 1 < report.rounds.len() { "," } else { "" }
             ));
@@ -2234,9 +2258,178 @@ fn cleanup(args: &Args) -> Result<(), BoxError> {
 // 测试
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 结构成本：相位前后各抓一次 Node / Meta 的 Prometheus 文本，求选定计数的增量。
+// 抓取在计时窗口之外；未配置地址时完全不抓。
+
+/// 计入结构成本的计数：(来源, 指标名)。带标签的序列按名字求和；Meta RPC 另按方法拆开。
+const COST_METRICS: &[(&str, &str)] = &[
+    ("meta", "afs_meta_rpc_requests_total"),
+    ("meta", "afs_meta_wal_records_total"),
+    ("meta", "afs_meta_wal_batches_total"),
+    ("node", "afs_dfs_write_buffer_input_copy_bytes_total"),
+    ("node", "afs_dfs_write_buffer_input_copies_total"),
+    ("node", "afs_dfs_write_buffer_allocations_total"),
+    ("node", "afs_dfs_write_buffer_reuses_total"),
+    ("node", "afs_dfs_read_copy_bytes_total"),
+    ("node", "afs_dfs_inode_lock_contended_total"),
+    ("node", "afs_dfs_inode_lock_wait_nanoseconds_total"),
+];
+
+#[derive(Debug, Default, Clone, PartialEq)]
+struct CostSnapshot(std::collections::BTreeMap<String, f64>);
+
+#[derive(Debug, Default, Clone, PartialEq)]
+struct CostDelta(std::collections::BTreeMap<String, f64>);
+
+impl CostSnapshot {
+    /// 未配置任何地址时返回 None；配置了但抓取失败是错误，不以 0 冒充。
+    fn scrape(args: &Args) -> Result<Option<Self>, BoxError> {
+        if args.node_metrics.is_none() && args.meta_metrics.is_none() {
+            return Ok(None);
+        }
+        let mut snapshot = Self::default();
+        for (source, address) in [("node", &args.node_metrics), ("meta", &args.meta_metrics)] {
+            if let Some(address) = address {
+                snapshot.absorb(source, &fetch_metrics(address)?);
+            }
+        }
+        Ok(Some(snapshot))
+    }
+
+    fn absorb(&mut self, source: &str, text: &str) {
+        for line in text.lines() {
+            if line.starts_with('#') || line.trim().is_empty() {
+                continue;
+            }
+            let name_end = line.find(['{', ' ']).unwrap_or(line.len());
+            let name = &line[..name_end];
+            if !COST_METRICS.contains(&(source, name)) {
+                continue;
+            }
+            let Some(value) = line.rsplit(' ').next().and_then(|v| v.parse::<f64>().ok()) else {
+                continue;
+            };
+            *self.0.entry(name.to_string()).or_default() += value;
+            if name == "afs_meta_rpc_requests_total"
+                && let Some(method) = label_value(line, "method")
+            {
+                *self
+                    .0
+                    .entry(format!("{name}{{method={method}}}"))
+                    .or_default() += value;
+            }
+        }
+    }
+
+    fn delta_since(self, before: Option<Self>) -> Option<CostDelta> {
+        let before = before?;
+        Some(CostDelta(
+            self.0
+                .into_iter()
+                .map(|(name, after)| {
+                    let base = before.0.get(&name).copied().unwrap_or(0.0);
+                    (name, after - base)
+                })
+                .filter(|(_, delta)| *delta != 0.0)
+                .collect(),
+        ))
+    }
+}
+
+fn cost_delta(after: Option<CostSnapshot>, before: Option<CostSnapshot>) -> Option<CostDelta> {
+    after?.delta_since(before)
+}
+
+impl CostDelta {
+    fn to_json(&self) -> String {
+        let fields: Vec<String> = self
+            .0
+            .iter()
+            .map(|(name, value)| format!("\"{}\": {}", json_escape(name), value))
+            .collect();
+        format!("{{{}}}", fields.join(", "))
+    }
+}
+
+fn label_value<'a>(line: &'a str, label: &str) -> Option<&'a str> {
+    let start = line.find(&format!("{label}=\""))? + label.len() + 2;
+    let end = start + line[start..].find('"')?;
+    Some(&line[start..end])
+}
+
+/// 本机回环上的最小 HTTP/1.0 GET，只用于抓 `/metrics` 文本。
+fn fetch_metrics(address: &str) -> Result<String, BoxError> {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(address)?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    write!(stream, "GET /metrics HTTP/1.0\r\nHost: {address}\r\n\r\n")?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or("metrics response has no header terminator")?;
+    let ok = head.starts_with("HTTP/1.")
+        && head
+            .split_whitespace()
+            .nth(1)
+            .is_some_and(|code| code == "200");
+    if !ok {
+        return Err(format!(
+            "metrics endpoint {address} answered: {}",
+            head.lines().next().unwrap_or("")
+        )
+        .into());
+    }
+    Ok(body.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cost_snapshot_sums_selected_series_and_splits_meta_rpc_methods() {
+        let mut snapshot = CostSnapshot::default();
+        snapshot.absorb(
+            "meta",
+            "# HELP afs_meta_rpc_requests_total x\n\
+             afs_meta_rpc_requests_total{method=\"afs.meta.v1.DfsMeta/GetInode\"} 3\n\
+             afs_meta_rpc_requests_total{method=\"other\"} 1\n\
+             afs_meta_wal_records_total 7\n\
+             afs_meta_revision 99\n",
+        );
+        snapshot.absorb("node", "afs_dfs_write_buffer_input_copy_bytes_total 4096\n");
+        // Node metrics under a Meta source are ignored, and vice versa.
+        snapshot.absorb("node", "afs_meta_wal_records_total 100\n");
+        assert_eq!(snapshot.0["afs_meta_rpc_requests_total"], 4.0);
+        assert_eq!(
+            snapshot.0["afs_meta_rpc_requests_total{method=afs.meta.v1.DfsMeta/GetInode}"],
+            3.0
+        );
+        assert_eq!(snapshot.0["afs_meta_wal_records_total"], 7.0);
+        assert_eq!(
+            snapshot.0["afs_dfs_write_buffer_input_copy_bytes_total"],
+            4096.0
+        );
+        assert!(!snapshot.0.contains_key("afs_meta_revision"));
+    }
+
+    #[test]
+    fn cost_delta_keeps_only_changed_counters() {
+        let mut before = CostSnapshot::default();
+        before.0.insert("a".into(), 5.0);
+        before.0.insert("b".into(), 2.0);
+        let mut after = before.clone();
+        after.0.insert("a".into(), 9.0);
+        after.0.insert("c".into(), 1.0);
+        let delta = cost_delta(Some(after), Some(before)).unwrap();
+        assert_eq!(delta.0.len(), 2);
+        assert_eq!(delta.0["a"], 4.0);
+        assert_eq!(delta.0["c"], 1.0);
+        assert_eq!(delta.to_json(), "{\"a\": 4, \"c\": 1}");
+        assert!(cost_delta(None, None).is_none());
+    }
 
     #[test]
     fn payload_is_deterministic_per_file_and_block() {
@@ -2588,6 +2781,7 @@ mod review132_regressions {
                 complete: false,
             },
             memory_source: "unavailable test source".into(),
+            cost: None,
             results: vec![
                 (
                     Job {

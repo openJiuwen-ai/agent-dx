@@ -1728,7 +1728,8 @@ async fn run_node(
         .with_remote_owner_factory(remote_factory)
         .with_version_cache_capacity(cfg.dfs_version_cache_entries)
         .with_version_cache_bytes(cfg.dfs_version_cache_bytes)
-        .with_write_buffer_pool(dfs_write_buffers.clone());
+        .with_write_buffer_pool(dfs_write_buffers.clone())
+        .with_inode_lock_metrics(&obs.registry)?;
         let fs = if cfg.dfs_external_backend.is_none() {
             fs.with_native_write_pipeline(
                 chunk::NativeWriteBudget::new(

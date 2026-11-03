@@ -67,6 +67,9 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 fuser = { version = "=0.18.0", default-features = false }
 
+# Meta 服务端 RPC 计数层（`meta/rpc_metrics.rs`）。
+tower = { version = "0.5", features = ["util"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = { version = "=0.7.0", optional = true, default-features = false, features = ["background_threads_runtime_support", "stats"] }
 tikv-jemalloc-ctl = { version = "=0.7.0", optional = true, features = ["use_std", "stats"] }
@@ -76,7 +79,6 @@ tempfile = "3"
 afs-client = { path = "client" }
 hyper-util = { version = "0.1", features = ["tokio"] }
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "trace"] }
-tower = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true

@@ -228,9 +228,45 @@ type SharedInodeWriteState = Arc<InodeWriteStateCell>;
 struct InodeWriteStateCell {
     state: Mutex<InodeWriteState>,
     cv: Condvar,
+    lock_wait: Option<Arc<InodeLockWait>>,
+}
+
+/// Structural-cost counters for inode write-state lock contention. Only an
+/// acquisition that has to wait is timed; an uncontended one costs a `try_lock`.
+struct InodeLockWait {
+    contended: afs_metrics::IntCounter,
+    wait_nanoseconds: afs_metrics::IntCounter,
+}
+
+impl InodeLockWait {
+    fn register(
+        registry: &afs_metrics::Registry,
+    ) -> std::result::Result<Self, afs_metrics::MetricsError> {
+        let contended = afs_metrics::IntCounter::new(
+            "afs_dfs_inode_lock_contended_total",
+            "Inode write-state lock acquisitions that had to wait for another holder.",
+        )?;
+        let wait_nanoseconds = afs_metrics::IntCounter::new(
+            "afs_dfs_inode_lock_wait_nanoseconds_total",
+            "Time spent waiting in contended inode write-state lock acquisitions.",
+        )?;
+        afs_metrics::register_collector(registry, &contended)?;
+        afs_metrics::register_collector(registry, &wait_nanoseconds)?;
+        Ok(Self {
+            contended,
+            wait_nanoseconds,
+        })
+    }
+
+    fn record(&self, waited: Duration) {
+        self.contended.inc();
+        self.wait_nanoseconds
+            .inc_by(u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX));
+    }
 }
 
 pub struct DistributedFs {
+    inode_lock_wait: Option<Arc<InodeLockWait>>,
     namespace_id: NamespaceId,
     node_id: String,
     session_id: String,
@@ -2720,11 +2756,29 @@ impl InodeWriteStateCell {
         Self {
             state: Mutex::new(state),
             cv: Condvar::new(),
+            lock_wait: None,
         }
     }
 
+    fn with_lock_wait(mut self, lock_wait: Option<Arc<InodeLockWait>>) -> Self {
+        self.lock_wait = lock_wait;
+        self
+    }
+
     fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, InodeWriteState>> {
-        self.state.lock()
+        let Some(lock_wait) = &self.lock_wait else {
+            return self.state.lock();
+        };
+        match self.state.try_lock() {
+            Ok(guard) => Ok(guard),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Err(poisoned),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                let started = Instant::now();
+                let result = self.state.lock();
+                lock_wait.record(started.elapsed());
+                result
+            }
+        }
     }
 
     fn wait<'a>(
@@ -2758,6 +2812,7 @@ impl DistributedFs {
         #[cfg(test)]
         let pending_trace = None;
         Self {
+            inode_lock_wait: None,
             namespace_id,
             node_id,
             session_id,
@@ -2888,6 +2943,15 @@ impl DistributedFs {
             return Ok(batch.chunks.len());
         }
         Ok(0)
+    }
+
+    /// Register inode write-state lock contention counters with the Node registry.
+    pub(crate) fn with_inode_lock_metrics(
+        mut self,
+        registry: &afs_metrics::Registry,
+    ) -> std::result::Result<Self, afs_metrics::MetricsError> {
+        self.inode_lock_wait = Some(Arc::new(InodeLockWait::register(registry)?));
+        Ok(self)
     }
 
     pub(crate) fn with_native_write_pipeline(
@@ -4318,35 +4382,38 @@ impl DistributedFs {
         }
         let (base_version, base_layout) = self.load_version(inode.head_version.as_ref())?;
         let logical_length = base_version.as_ref().map_or(0, |version| version.length);
-        let state = Arc::new(InodeWriteStateCell::new(InodeWriteState {
-            write_lease,
-            base_version,
-            base_layout,
-            logical_length,
-            metadata_dirty: false,
-            kill_suidgid_dirty: false,
-            dirty_extents: DirtyExtentMap::default(),
-            dirty_budget_reservations: Vec::new(),
-            publication_window: None,
-            in_flight: None,
-            commit_busy: false,
-            operation_busy: false,
-            native_queue: NativeTicketQueue::default(),
-            native_thread: None,
-            native_owner: NativeWriteOwner::new(),
-            native_due: false,
-            native_due_through: 0,
-            inode: inode.clone(),
-            dirty: false,
-            next_write_seq: 0,
-            visible_write_seq: 0,
-            durable_write_seq: 0,
-            committed_write_seq: 0,
-            open_writers: 0,
-            last_writer_background_requested: false,
-            background_error: None,
-            terminal_error: None,
-        }));
+        let state = Arc::new(
+            InodeWriteStateCell::new(InodeWriteState {
+                write_lease,
+                base_version,
+                base_layout,
+                logical_length,
+                metadata_dirty: false,
+                kill_suidgid_dirty: false,
+                dirty_extents: DirtyExtentMap::default(),
+                dirty_budget_reservations: Vec::new(),
+                publication_window: None,
+                in_flight: None,
+                commit_busy: false,
+                operation_busy: false,
+                native_queue: NativeTicketQueue::default(),
+                native_thread: None,
+                native_owner: NativeWriteOwner::new(),
+                native_due: false,
+                native_due_through: 0,
+                inode: inode.clone(),
+                dirty: false,
+                next_write_seq: 0,
+                visible_write_seq: 0,
+                durable_write_seq: 0,
+                committed_write_seq: 0,
+                open_writers: 0,
+                last_writer_background_requested: false,
+                background_error: None,
+                terminal_error: None,
+            })
+            .with_lock_wait(self.inode_lock_wait.clone()),
+        );
         self.inode_writes
             .write(&inode.inode_id)
             .map_err(|_| unavailable("DFS inode write table is poisoned"))?
@@ -19086,6 +19153,46 @@ mod tests {
     fn native_builder_preupload_retry_preserves_object_but_layout_excludes_old_tail_and_patch() {
         native_preupload_retry_with_integrity(false);
     }
+    /// S1a-2 structural cost: only lock acquisitions that wait are counted and timed.
+    #[test]
+    fn s1a_inode_lock_contention_is_counted_only_when_a_lock_waits() {
+        let registry = afs_metrics::Registry::new();
+        let (_temp, meta, fs) = test_fs();
+        let fs = fs.with_inode_lock_metrics(&registry).unwrap();
+        fs.create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("lock-wait.bin"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        let cell = fs.write_state(&inode_id).unwrap().unwrap();
+        let wait = fs.inode_lock_wait.clone().unwrap();
+        let before = wait.contended.get();
+        drop(cell.lock().unwrap());
+        assert_eq!(
+            wait.contended.get(),
+            before,
+            "uncontended lock is not counted"
+        );
+
+        let guard = cell.lock().unwrap();
+        let waiter_cell = cell.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            drop(waiter_cell.lock().unwrap());
+        });
+        ready_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        drop(guard);
+        waiter.join().unwrap();
+        assert_eq!(wait.contended.get(), before + 1);
+        assert!(wait.wait_nanoseconds.get() >= 10_000_000);
+    }
+
     /// S1a-1 特征测试（R56，S2 修）：生产模式（带 runtime 的 native 流水线）下，一次后台上传
     /// 失败对同一句柄报告两次：一次由等待该上传的 fsync 取走，一次经 inode 的后台错误游标由下一次
     /// 句柄操作报告。之后重试成功；之后打开的句柄不受影响。修复时改为只报告一次。
