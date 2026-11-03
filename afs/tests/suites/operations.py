@@ -3,6 +3,9 @@
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import os
+from pathlib import Path
+import stat
 import time
 from fixtures.common import Blocked, is_single_host
 
@@ -257,6 +260,84 @@ open(sys.argv[2]+"/done","w").write("passed")
         c.channel("B").call("wait", role=role)
         c.read("B", "old", b"new-object")
     c.record("old_fd", "rename and unlink/name reuse retain original object")
+
+
+FD_CENSUS = (Path(__file__).resolve().parents[1] / "tools" / "fd_inventory.py").read_text()
+REMOTE_DIR_SCAN = """import os,sys
+path=sys.argv[1]
+for _ in range(int(sys.argv[2])):
+    with os.scandir(path) as entries:
+        names=[entry.name for entry in entries]
+    if 'entry.txt' not in names:
+        raise AssertionError('remote directory content missing')
+"""
+
+
+def ownerfs_remote_dir_close(cluster):
+    """Repeated remote open/close must not strand Home directory FDs."""
+    payload = b"ownerfs-remote-dir-close"
+    cluster.write("A", "seed.txt", payload)
+    cluster.python(
+        "A",
+        "import os,sys;os.mkdir(sys.argv[1]);open(os.path.join(sys.argv[1],'entry.txt'),'wb').write(b'x'*4096)",
+        os.path.join(cluster.workspace("A"), "scan"),
+    )
+    remote = os.path.join(cluster.workspace("B"), "scan")
+    cluster.python("B", "import os,sys;assert 'entry.txt' in os.listdir(sys.argv[1])", remote)
+    cluster.read("B", "seed.txt", payload)
+
+    state = cluster.channel("A").call("status")["A"]
+    if state["returncode"] is not None:
+        raise AssertionError("owned AFS Node is not running")
+    pid = state["pid"]
+    ownerfs = str(Path(cluster.role_dir("A")) / "state" / "ownerfs")
+    ownerfs_prefix = os.path.join(ownerfs, "")
+
+    def census():
+        result = cluster.command("A", ["python3", "-c", FD_CENSUS, "--pid", str(pid)])
+        snapshot = json.loads(result["stdout"])
+        if snapshot["pid"] != pid or snapshot["comm"] != "afs-node":
+            raise AssertionError("FD census did not observe the owned Home Node")
+        descriptors = []
+        for entry in snapshot["entries"]:
+            if entry["kind"] != stat.S_IFDIR:
+                continue
+            target = entry["target"]
+            if target == ownerfs or target.startswith(ownerfs_prefix):
+                descriptors.append(entry)
+        return snapshot, descriptors
+
+    baseline, baseline_fds = census()
+    baseline_counts = {}
+    for entry in baseline_fds:
+        baseline_counts[entry["target"]] = baseline_counts.get(entry["target"], 0) + 1
+    rounds = 0
+    checkpoints = 0
+    for _ in range(50):
+        cluster.python("B", REMOTE_DIR_SCAN, remote, "20", timeout=120)
+        deadline = time.monotonic() + 5
+        while True:
+            snapshot, descriptors = census()
+            if snapshot["start_ticks"] != baseline["start_ticks"]:
+                raise AssertionError("Home Node restarted during the remote scan loop")
+            counts = {}
+            for entry in descriptors:
+                counts[entry["target"]] = counts.get(entry["target"], 0) + 1
+            excess = {target: count for target, count in counts.items() if count > baseline_counts.get(target, 0)}
+            if not excess:
+                break
+            if time.monotonic() > deadline:
+                raise AssertionError("Home retained directory FDs after remote close: " + repr(excess))
+            time.sleep(0.02)
+        rounds += 20
+        checkpoints += 1
+        if rounds in (100, 1000):
+            cluster.read("B", "seed.txt", payload)
+            cluster.python("B", "import os,sys;assert 'entry.txt' in os.listdir(sys.argv[1])", remote)
+    cluster.record(
+        "ownerfs.remote_dir_close",
+        {"rounds": rounds, "checkpoints": checkpoints, "baseline_dir_fds": len(baseline_fds), "home_dir_fd_growth": 0},
+    )
 
 
 def _wait(c, path):
