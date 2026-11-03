@@ -2730,15 +2730,59 @@ enum AppliedCommit {
     },
 }
 
-#[derive(Clone, Copy)]
+/// Why a commit runs. A foreground commit is part of a caller's barrier and
+/// waits its turn behind the inode's admitted work; a background commit is
+/// best effort and never waits. Each policy difference is one method below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CommitReason {
+    Foreground(ForegroundCommit),
+    Background(BackgroundCommit),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ForegroundCommit {
+    /// fdatasync, and data barriers inside other operations (resize, setattr).
     DataSync,
-    DirtyBudget,
+    /// fsync: data plus a full metadata barrier.
     FullSync,
+    /// FUSE flush on close(2); data only (decision 5).
     Close,
-    Background,
-    LastWriter,
+    /// Node shutdown.
     NodeDrain,
+    /// S3 write-budget pressure inside a write.
+    DirtyBudget,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BackgroundCommit {
+    Periodic,
+    /// The last writer closed; flush what it left behind.
+    LastWriter,
+}
+
+/// How a commit step orders itself against operations already admitted on the
+/// inode.
+#[derive(Clone, Copy, Debug)]
+enum CommitWait {
+    /// Wait for admitted operations (the normal entry from outside).
+    AfterOperations,
+    /// Called from inside an admitted operation on the same inode.
+    InsideOperation,
+    /// Like `AfterOperations`, but give up once the deadline passes.
+    Until(Instant),
+}
+
+impl CommitWait {
+    fn waits_for_operations(self) -> bool {
+        !matches!(self, Self::InsideOperation)
+    }
+
+    fn deadline(self) -> Option<Instant> {
+        match self {
+            Self::Until(deadline) => Some(deadline),
+            Self::AfterOperations | Self::InsideOperation => None,
+        }
+    }
 }
 
 impl InFlightCommit {
@@ -3085,7 +3129,9 @@ impl DistributedFs {
                 );
             } else {
                 drop(state);
-                if let Some(seq) = self.commit_inode(inode, CommitReason::Background)? {
+                if let Some(seq) =
+                    self.commit_inode(inode, CommitReason::BACKGROUND, CommitWait::AfterOperations)?
+                {
                     self.update_handles_after_commit(inode, seq)?;
                 }
             }
@@ -3380,9 +3426,9 @@ impl DistributedFs {
         // Keep the FIFO ticket, but release every short operation guard before
         // waiting for the persistent barrier. Preparing may finish meanwhile.
         if snapshot.flags & libc::O_SYNC == libc::O_SYNC {
-            self.commit_handle_inside_operation(handle, CommitReason::FullSync)?;
+            self.sync_handle(handle, CommitReason::FULL_SYNC, CommitWait::InsideOperation)?;
         } else if has_o_dsync(snapshot.flags) {
-            self.commit_handle_inside_operation(handle, CommitReason::DataSync)?;
+            self.sync_handle(handle, CommitReason::DATA_SYNC, CommitWait::InsideOperation)?;
         }
         drop(ticket);
         Ok(*accepted)
@@ -3858,7 +3904,11 @@ impl DistributedFs {
                 state.native_due || state.last_writer_background_requested
             };
             if due {
-                match self.commit_inode(&inode, CommitReason::Background) {
+                match self.commit_inode(
+                    &inode,
+                    CommitReason::BACKGROUND,
+                    CommitWait::AfterOperations,
+                ) {
                     Ok(Some(seq)) => {
                         self.update_handles_after_commit(&inode, seq)?;
                         committed += 1;
@@ -4914,7 +4964,7 @@ impl DistributedFs {
         if !needs_barrier {
             return Ok(None);
         }
-        self.commit_handle(handle, CommitReason::DataSync)?;
+        self.sync_handle(handle, CommitReason::DATA_SYNC, CommitWait::AfterOperations)?;
         let inode = state
             .lock()
             .map_err(|_| unavailable("DFS inode write state is poisoned"))?
@@ -5252,24 +5302,19 @@ impl DistributedFs {
         DfsFileHandleSnapshot::from_handle(&handle)
     }
 
-    fn commit_handle(&self, handle: FileHandle, reason: CommitReason) -> Result<()> {
-        self.commit_handle_with_operation_gate(handle, reason, true)
-    }
-
-    fn commit_handle_inside_operation(
+    /// Barrier: commit until every write this handle's inode had accepted when
+    /// the call started is committed (and, for fsync, its metadata synced).
+    /// Built from repeated `commit_inode` steps; has no deadline.
+    fn sync_handle(
         &self,
         handle: FileHandle,
         reason: CommitReason,
+        wait: CommitWait,
     ) -> Result<()> {
-        self.commit_handle_with_operation_gate(handle, reason, false)
-    }
-
-    fn commit_handle_with_operation_gate(
-        &self,
-        handle: FileHandle,
-        reason: CommitReason,
-        wait_for_operation: bool,
-    ) -> Result<()> {
+        if let CommitWait::Until(_) = wait {
+            return Err(invalid("a DFS sync barrier has no deadline"));
+        }
+        let wait_for_operation = wait.waits_for_operations();
         self.observe_handle_error(handle)?;
         let snapshot = self.handle_snapshot(handle)?;
         let Some(state) = self.write_state(&snapshot.inode_id)? else {
@@ -5300,13 +5345,13 @@ impl DistributedFs {
                 .lock()
                 .map_err(|_| unavailable("DFS inode write state is poisoned"))?
                 .committed_write_seq;
-            let metadata_pending = matches!(reason, CommitReason::FullSync)
-                && self.needs_full_metadata_sync(&state)?;
+            let metadata_pending =
+                reason.full_metadata_barrier() && self.needs_full_metadata_sync(&state)?;
             if synced >= target_seq && !metadata_pending {
                 break;
             }
             let committed_seq =
-                self.commit_inode_with_operation_gate(&snapshot.inode_id, reason, false, None)?;
+                self.commit_inode(&snapshot.inode_id, reason, CommitWait::InsideOperation)?;
             if let Some(committed_seq) = committed_seq {
                 self.update_handles_after_commit(&snapshot.inode_id, committed_seq)?;
                 continue;
@@ -5329,37 +5374,20 @@ impl DistributedFs {
         Ok(())
     }
 
-    fn commit_inode(&self, inode_id: &InodeId, reason: CommitReason) -> Result<Option<u64>> {
-        self.commit_inode_with_operation_gate(inode_id, reason, true, None)
-    }
-
-    fn commit_inode_inside_operation(
+    /// The single commit step: send at most one pending commit for this inode
+    /// and return the committed write sequence, or `None` when there was nothing
+    /// to do (or a background commit found the inode busy).
+    fn commit_inode(
         &self,
         inode_id: &InodeId,
         reason: CommitReason,
+        wait: CommitWait,
     ) -> Result<Option<u64>> {
-        self.commit_inode_with_operation_gate(inode_id, reason, false, None)
-    }
-
-    fn commit_inode_until(
-        &self,
-        inode_id: &InodeId,
-        reason: CommitReason,
-        deadline: Instant,
-    ) -> Result<Option<u64>> {
-        self.commit_inode_with_operation_gate(inode_id, reason, true, Some(deadline))
-    }
-
-    fn commit_inode_with_operation_gate(
-        &self,
-        inode_id: &InodeId,
-        reason: CommitReason,
-        wait_for_operation: bool,
-        deadline: Option<Instant>,
-    ) -> Result<Option<u64>> {
+        let wait_for_operation = wait.waits_for_operations();
+        let deadline = wait.deadline();
         let commit_span = tracing::info_span!(
             "node.dfs.commit",
-            reason = reason.operation_prefix(),
+            reason = reason.label(),
             inode_id = %inode_id.0,
             wait_for_operation,
             has_deadline = deadline.is_some(),
@@ -5376,8 +5404,7 @@ impl DistributedFs {
 
         loop {
             let action = 'action: {
-                let maintenance =
-                    matches!(reason, CommitReason::Background | CommitReason::LastWriter);
+                let maintenance = reason.is_background();
                 let mut state = if maintenance {
                     match cell.state.try_lock() {
                         Ok(state) => state,
@@ -5442,26 +5469,15 @@ impl DistributedFs {
                     state.commit_busy = true;
                     break 'action CommitAction::Send(pending);
                 } else {
-                    // Data-only commits can advance the data sequence while
-                    // leaving timestamps pending. Once the last writer closes,
-                    // flush that metadata even when both sequences are equal;
-                    // otherwise lease renewal keeps unlinked versions forever.
+                    // See `CommitReason::flushes_pending_metadata`.
                     let sync_metadata_only = state.metadata_dirty
-                        && (matches!(
-                            reason,
-                            CommitReason::DataSync
-                                | CommitReason::FullSync
-                                | CommitReason::Close
-                                | CommitReason::NodeDrain
-                        ) && state.visible_write_seq > state.committed_write_seq
-                            || state.open_writers == 0
-                                && matches!(
-                                    reason,
-                                    CommitReason::Background | CommitReason::LastWriter
-                                ));
+                        && reason.flushes_pending_metadata(
+                            state.visible_write_seq > state.committed_write_seq,
+                            state.open_writers,
+                        );
                     if !(state.dirty
                         || sync_metadata_only
-                        || matches!(reason, CommitReason::FullSync) && state.metadata_dirty
+                        || reason.full_metadata_barrier() && state.metadata_dirty
                         || state.kill_suidgid_dirty)
                     {
                         return Ok(None);
@@ -5603,7 +5619,7 @@ impl DistributedFs {
             };
             commit_span.record("branch", branch);
             let committed = self.finish_commit(cell.clone(), pending, timeout, branch)?;
-            if matches!(reason, CommitReason::FullSync) && self.needs_full_metadata_sync(&cell)? {
+            if reason.full_metadata_barrier() && self.needs_full_metadata_sync(&cell)? {
                 continue;
             }
             return Ok(committed);
@@ -5875,7 +5891,11 @@ impl DistributedFs {
                 });
             }
             drop(state);
-            if let Some(seq) = self.commit_inode(inode_id, CommitReason::Background)? {
+            if let Some(seq) = self.commit_inode(
+                inode_id,
+                CommitReason::BACKGROUND,
+                CommitWait::AfterOperations,
+            )? {
                 self.update_handles_after_commit(inode_id, seq)?;
             }
         }
@@ -5910,7 +5930,11 @@ impl DistributedFs {
                 });
             }
             drop(state);
-            self.commit_inode(inode_id, CommitReason::Background)?;
+            self.commit_inode(
+                inode_id,
+                CommitReason::BACKGROUND,
+                CommitWait::AfterOperations,
+            )?;
         }
     }
 
@@ -6056,7 +6080,7 @@ impl DistributedFs {
         let dirty_bytes = frozen.dirty_extents.dirty_data_bytes();
         let span = tracing::info_span!(
             "node.dfs.commit.prepare",
-            reason = reason.operation_prefix(),
+            reason = reason.label(),
             inode_id = %frozen.inode.inode_id.0,
             logical_length = frozen.logical_length,
             dirty_bytes,
@@ -6098,7 +6122,7 @@ impl DistributedFs {
                     .as_ref()
                     .map(|window| window.operation_id.clone())
             })
-            .unwrap_or_else(|| self.operation_id(reason.operation_prefix()));
+            .unwrap_or_else(|| self.operation_id(reason.label()));
         let gc_pin = match (&frozen.dirty_extents.native_gc_pin, &self.gc_references) {
             (Some(pin), _) => Some(pin.clone()),
             (None, Some(references)) => Some(
@@ -6199,7 +6223,7 @@ impl DistributedFs {
             span.record("unique_bytes", unique_bytes);
             let receipts = tracing::info_span!(
                 "node.dfs.commit.put_batch",
-                reason = reason.operation_prefix(),
+                reason = reason.label(),
                 chunks = unique.len(),
                 bytes = unique_bytes,
                 reused_receipts = 0_u64,
@@ -6717,7 +6741,11 @@ impl DistributedFs {
                 state.publication_window.is_some()
             };
             if drain_before_resize
-                && let Some(committed_seq) = self.commit_inode(inode_id, CommitReason::DataSync)?
+                && let Some(committed_seq) = self.commit_inode(
+                    inode_id,
+                    CommitReason::DATA_SYNC,
+                    CommitWait::AfterOperations,
+                )?
             {
                 self.update_handles_after_commit(inode_id, committed_seq)?;
             }
@@ -8331,16 +8359,16 @@ impl DistributedFs {
                     || state.in_flight.is_some())
             {
                 let reason = if state.last_writer_background_requested {
-                    CommitReason::LastWriter
+                    CommitReason::LAST_WRITER
                 } else {
-                    CommitReason::Background
+                    CommitReason::BACKGROUND
                 };
                 drop(state);
                 if attempted >= max_ops || Instant::now() >= deadline {
                     break;
                 }
                 attempted = attempted.saturating_add(1);
-                match self.commit_inode_until(&inode_id, reason, deadline) {
+                match self.commit_inode(&inode_id, reason, CommitWait::Until(deadline)) {
                     Ok(Some(seq)) => {
                         self.update_handles_after_commit(&inode_id, seq)?;
                         committed += 1;
@@ -8439,7 +8467,11 @@ impl DistributedFs {
         if self.current_write_pipeline_bytes()? <= DEFERRED_PIPELINE_BUDGET_BYTES {
             return Ok(None);
         }
-        match self.commit_inode_inside_operation(inode_id, CommitReason::DirtyBudget)? {
+        match self.commit_inode(
+            inode_id,
+            CommitReason::DIRTY_BUDGET,
+            CommitWait::InsideOperation,
+        )? {
             Some(seq) => Ok(Some(seq)),
             None => self.commit_deferred_budget_victim(Some(inode_id)),
         }
@@ -8465,8 +8497,11 @@ impl DistributedFs {
         if let Some(seq) = self.freeze_deferred_window_inside_operation(cell)? {
             return Ok(Some(seq));
         }
-        let Some(committed_seq) =
-            self.commit_inode_inside_operation(inode_id, CommitReason::DirtyBudget)?
+        let Some(committed_seq) = self.commit_inode(
+            inode_id,
+            CommitReason::DIRTY_BUDGET,
+            CommitWait::InsideOperation,
+        )?
         else {
             return Ok(None);
         };
@@ -8546,7 +8581,11 @@ impl DistributedFs {
                     || state.in_flight.is_some());
             drop(state);
             if eligible
-                && let Some(seq) = self.commit_inode(&inode_id, CommitReason::DirtyBudget)?
+                && let Some(seq) = self.commit_inode(
+                    &inode_id,
+                    CommitReason::DIRTY_BUDGET,
+                    CommitWait::AfterOperations,
+                )?
             {
                 self.update_handles_after_commit(&inode_id, seq)?;
                 return Ok(Some(seq));
@@ -8627,7 +8666,11 @@ impl DistributedFs {
                     }
                 }
                 drop(state);
-                return self.commit_inode_inside_operation(inode_id, CommitReason::DirtyBudget);
+                return self.commit_inode(
+                    inode_id,
+                    CommitReason::DIRTY_BUDGET,
+                    CommitWait::InsideOperation,
+                );
             }
         };
         for chunk in &mut staged {
@@ -8872,7 +8915,11 @@ impl DistributedFs {
                     if synced_seq >= target_seq {
                         break;
                     }
-                    if let Some(seq) = self.commit_inode(&inode_id, CommitReason::NodeDrain)? {
+                    if let Some(seq) = self.commit_inode(
+                        &inode_id,
+                        CommitReason::NODE_DRAIN,
+                        CommitWait::AfterOperations,
+                    )? {
                         self.update_handles_after_commit(&inode_id, seq)?;
                         committed += 1;
                     } else {
@@ -11136,15 +11183,61 @@ impl Drop for DistributedFs {
 }
 
 impl CommitReason {
-    fn operation_prefix(self) -> &'static str {
+    const DATA_SYNC: Self = Self::Foreground(ForegroundCommit::DataSync);
+    const FULL_SYNC: Self = Self::Foreground(ForegroundCommit::FullSync);
+    const CLOSE: Self = Self::Foreground(ForegroundCommit::Close);
+    const NODE_DRAIN: Self = Self::Foreground(ForegroundCommit::NodeDrain);
+    const DIRTY_BUDGET: Self = Self::Foreground(ForegroundCommit::DirtyBudget);
+    const BACKGROUND: Self = Self::Background(BackgroundCommit::Periodic);
+    const LAST_WRITER: Self = Self::Background(BackgroundCommit::LastWriter);
+
+    /// Label for operation ids, spans and logs.
+    fn label(self) -> &'static str {
         match self {
-            Self::DataSync => "fdatasync",
-            Self::DirtyBudget => "dirty-budget",
-            Self::FullSync => "fsync",
-            Self::Close => "close",
-            Self::Background => "background",
-            Self::LastWriter => "last-writer",
-            Self::NodeDrain => "node-drain",
+            Self::Foreground(ForegroundCommit::DataSync) => "fdatasync",
+            Self::Foreground(ForegroundCommit::DirtyBudget) => "dirty-budget",
+            Self::Foreground(ForegroundCommit::FullSync) => "fsync",
+            Self::Foreground(ForegroundCommit::Close) => "close",
+            Self::Foreground(ForegroundCommit::NodeDrain) => "node-drain",
+            Self::Background(BackgroundCommit::Periodic) => "background",
+            Self::Background(BackgroundCommit::LastWriter) => "last-writer",
+        }
+    }
+
+    /// Best effort: never waits for the inode lock or for in-progress work.
+    fn is_background(self) -> bool {
+        matches!(self, Self::Background(_))
+    }
+
+    /// Whether a commit with no dirty data still flushes pending metadata.
+    /// DataOnly commits advance the data sequence but leave timestamps pending.
+    /// Foreground barriers flush them once the data sequence moved past the last
+    /// commit; background commits flush them once no writer is left open, even
+    /// when both sequences are equal (otherwise lease renewal keeps unlinked
+    /// versions pinned forever). Budget pressure never does.
+    fn flushes_pending_metadata(self, data_advanced: bool, open_writers: u64) -> bool {
+        match self {
+            Self::Foreground(ForegroundCommit::DirtyBudget) => false,
+            Self::Foreground(_) => data_advanced,
+            Self::Background(_) => open_writers == 0,
+        }
+    }
+
+    /// fsync also commits dirty metadata on its own and repeats until the
+    /// inode's metadata is fully synchronized.
+    fn full_metadata_barrier(self) -> bool {
+        self == Self::FULL_SYNC
+    }
+
+    fn metadata_mode(self) -> CommitMetadataMode {
+        match self {
+            Self::Foreground(
+                ForegroundCommit::DataSync
+                | ForegroundCommit::DirtyBudget
+                | ForegroundCommit::Close,
+            ) => CommitMetadataMode::DataOnly,
+            Self::Foreground(ForegroundCommit::FullSync | ForegroundCommit::NodeDrain)
+            | Self::Background(_) => CommitMetadataMode::Full,
         }
     }
 
@@ -11154,7 +11247,7 @@ impl CommitReason {
         ctime_unix_ms: u64,
         kill_suidgid: bool,
     ) -> CommitMetadataDelta {
-        if !matches!(self, Self::DataSync | Self::DirtyBudget | Self::Close) {
+        if self.metadata_mode() == CommitMetadataMode::Full {
             CommitMetadataDelta {
                 mode: CommitMetadataMode::Full,
                 mtime_unix_ms: Some(mtime_unix_ms),
@@ -11720,7 +11813,11 @@ impl Backend for DistributedFs {
                 change.mode = None;
             }
         } else if change.mode.is_some() && self.has_pending_killpriv(&inode_id)? {
-            self.commit_inode(&inode_id, CommitReason::DataSync)?;
+            self.commit_inode(
+                &inode_id,
+                CommitReason::DATA_SYNC,
+                CommitWait::AfterOperations,
+            )?;
         }
         if change.mode.is_some()
             || change.uid.is_some()
@@ -11752,7 +11849,11 @@ impl Backend for DistributedFs {
             )?;
             if change.size.is_none() {
                 if killpriv_setattr {
-                    self.commit_inode(&inode_id, CommitReason::DataSync)?;
+                    self.commit_inode(
+                        &inode_id,
+                        CommitReason::DATA_SYNC,
+                        CommitWait::AfterOperations,
+                    )?;
                     let updated =
                         self.refresh_inode_record(self.meta.get_inode(&inode_id)?, true, true)?;
                     return self.visible_attributes(&updated);
@@ -11763,7 +11864,11 @@ impl Backend for DistributedFs {
 
         let Some(length) = change.size else {
             if killpriv_setattr {
-                self.commit_inode(&inode_id, CommitReason::DataSync)?;
+                self.commit_inode(
+                    &inode_id,
+                    CommitReason::DATA_SYNC,
+                    CommitWait::AfterOperations,
+                )?;
             }
             return self.getattr(ctx, inode, handle);
         };
@@ -12278,7 +12383,11 @@ impl Backend for DistributedFs {
             if !drain_before_deferred {
                 break starts_at_eof;
             }
-            match self.commit_inode_inside_operation(&snapshot.inode_id, CommitReason::DataSync)? {
+            match self.commit_inode(
+                &snapshot.inode_id,
+                CommitReason::DATA_SYNC,
+                CommitWait::InsideOperation,
+            )? {
                 Some(committed_seq) => {
                     self.update_handles_after_commit(&snapshot.inode_id, committed_seq)?;
                 }
@@ -12408,9 +12517,10 @@ impl Backend for DistributedFs {
                 match admission {
                     Ok(reservation) => reservation,
                     Err(error) => {
-                        match self.commit_inode_inside_operation(
+                        match self.commit_inode(
                             &snapshot.inode_id,
-                            CommitReason::DirtyBudget,
+                            CommitReason::DIRTY_BUDGET,
+                            CommitWait::InsideOperation,
                         ) {
                             Ok(Some(committed_seq)) => {
                                 self.update_handles_after_commit(
@@ -12637,9 +12747,11 @@ impl Backend for DistributedFs {
                         }
                     }
                 }
-                match self
-                    .commit_inode_inside_operation(&snapshot.inode_id, CommitReason::DirtyBudget)
-                {
+                match self.commit_inode(
+                    &snapshot.inode_id,
+                    CommitReason::DIRTY_BUDGET,
+                    CommitWait::InsideOperation,
+                ) {
                     Ok(Some(committed_seq)) => {
                         self.update_handles_after_commit(&snapshot.inode_id, committed_seq)?;
                         self.update_handle_write_progress(handle, seq)?;
@@ -12667,9 +12779,9 @@ impl Backend for DistributedFs {
             self.update_handle_write_progress(handle, seq)?;
         }
         if snapshot.flags & libc::O_SYNC == libc::O_SYNC {
-            self.commit_handle_inside_operation(handle, CommitReason::FullSync)?;
+            self.sync_handle(handle, CommitReason::FULL_SYNC, CommitWait::InsideOperation)?;
         } else if has_o_dsync(snapshot.flags) {
-            self.commit_handle_inside_operation(handle, CommitReason::DataSync)?;
+            self.sync_handle(handle, CommitReason::DATA_SYNC, CommitWait::InsideOperation)?;
         }
         Ok(total_written)
     }
@@ -12711,7 +12823,11 @@ impl Backend for DistributedFs {
         }
         // Snapshot the source before acquiring destination admission, avoiding
         // cross-copy deadlock. Concurrent later writes create another version.
-        self.commit_inode(&source.inode_id, CommitReason::FullSync)?;
+        self.commit_inode(
+            &source.inode_id,
+            CommitReason::FULL_SYNC,
+            CommitWait::AfterOperations,
+        )?;
         let inode = self.validate_inode(self.meta.get_inode(&source.inode_id)?)?;
         let Some(version_id) = inode.head_version else {
             return Ok(0);
@@ -12728,7 +12844,11 @@ impl Backend for DistributedFs {
             .write_state(&destination.inode_id)?
             .ok_or_else(|| stale("destination write state is missing"))?;
         let _operation = self.begin_inode_operation(&destination.inode_id, cell.clone())?;
-        self.commit_inode_inside_operation(&destination.inode_id, CommitReason::FullSync)?;
+        self.commit_inode(
+            &destination.inode_id,
+            CommitReason::FULL_SYNC,
+            CommitWait::InsideOperation,
+        )?;
         let pending = {
             let mut state = cell
                 .lock()
@@ -12787,7 +12907,7 @@ impl Backend for DistributedFs {
                 layout_root: layout,
                 chunk_receipts: Vec::new(),
                 clone_source: Some(clone_source),
-                metadata_delta: CommitReason::FullSync.metadata_delta(
+                metadata_delta: CommitReason::FULL_SYNC.metadata_delta(
                     now,
                     now,
                     state.kill_suidgid_dirty,
@@ -12832,7 +12952,7 @@ impl Backend for DistributedFs {
             if session.remote.is_some() {
                 self.remote_sync(session, SyncMode::DataOnly).map(|_| ())
             } else {
-                self.commit_handle(handle, CommitReason::Close)
+                self.sync_handle(handle, CommitReason::CLOSE, CommitWait::AfterOperations)
             }
         } else {
             self.observe_handle_error(handle)
@@ -12846,12 +12966,13 @@ impl Backend for DistributedFs {
         {
             self.remote_sync(session, mode).map(|_| ())
         } else {
-            self.commit_handle(
+            self.sync_handle(
                 handle,
                 match mode {
-                    SyncMode::DataOnly => CommitReason::DataSync,
-                    SyncMode::Full => CommitReason::FullSync,
+                    SyncMode::DataOnly => CommitReason::DATA_SYNC,
+                    SyncMode::Full => CommitReason::FULL_SYNC,
                 },
+                CommitWait::AfterOperations,
             )
         }
     }
@@ -19153,6 +19274,74 @@ mod tests {
     fn native_builder_preupload_retry_preserves_object_but_layout_excludes_old_tail_and_patch() {
         native_preupload_retry_with_integrity(false);
     }
+    /// S1a-4 characterization: every native commit trigger reaches Meta with a
+    /// fixed metadata mode. Native commits carry the write generation's operation
+    /// id, so the trigger itself is not visible to Meta; the refactor must keep
+    /// these modes.
+    #[test]
+    fn s1a_commit_triggers_keep_their_metadata_mode() {
+        type Trigger = fn(&DistributedFs, FileHandle);
+        let cases: [(&str, Trigger, CommitMetadataMode); 6] = [
+            (
+                "fsync",
+                |fs, handle| fs.fsync(&context(), handle, SyncMode::Full).unwrap(),
+                CommitMetadataMode::Full,
+            ),
+            (
+                "fdatasync",
+                |fs, handle| fs.fsync(&context(), handle, SyncMode::DataOnly).unwrap(),
+                CommitMetadataMode::DataOnly,
+            ),
+            (
+                "flush",
+                |fs, handle| fs.flush(&context(), handle).unwrap(),
+                CommitMetadataMode::DataOnly,
+            ),
+            (
+                "drain",
+                |fs, _| {
+                    fs.drain().unwrap();
+                },
+                CommitMetadataMode::Full,
+            ),
+            (
+                "background",
+                |fs, _| {
+                    fs.writeback_pending().unwrap();
+                },
+                CommitMetadataMode::Full,
+            ),
+            (
+                "last writer",
+                |fs, handle| {
+                    fs.release(&context(), handle).unwrap();
+                    fs.writeback_pending().unwrap();
+                },
+                CommitMetadataMode::Full,
+            ),
+        ];
+        for (name, trigger, mode) in cases {
+            let (_temp, meta, fs) = test_fs();
+            let created = fs
+                .create(
+                    &context(),
+                    fs.root_inode(),
+                    OsStr::new("trigger.bin"),
+                    0o640,
+                    libc::O_RDWR,
+                )
+                .unwrap();
+            fs.write(&context(), created.handle, 0, &[7; 4096]).unwrap();
+            trigger(&fs, created.handle);
+            let commits = meta.commits.lock().unwrap();
+            let last = commits
+                .last()
+                .unwrap_or_else(|| panic!("{name}: no commit reached Meta"));
+            assert_eq!(last.metadata_delta.mode, mode, "{name}");
+            assert_eq!(last.file_version.length, 4096, "{name}");
+        }
+    }
+
     /// S1a-2 structural cost: only lock acquisitions that wait are counted and timed.
     #[test]
     fn s1a_inode_lock_contention_is_counted_only_when_a_lock_waits() {
@@ -23045,7 +23234,12 @@ mod tests {
         )
         .unwrap();
         let inode = fs.handle_snapshot(created.handle).unwrap().inode_id;
-        fs.commit_inode(&inode, CommitReason::DirtyBudget).unwrap();
+        fs.commit_inode(
+            &inode,
+            CommitReason::DIRTY_BUDGET,
+            CommitWait::AfterOperations,
+        )
+        .unwrap();
         {
             let commits = meta.commits.lock().unwrap();
             assert_eq!(commits.len(), 1);
