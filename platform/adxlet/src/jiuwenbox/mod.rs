@@ -1,4 +1,5 @@
-//! Jiuwenbox process and Conch adapters. The external backends are unmodified.
+//! Jiuwenbox process and Conch adapters.
+mod cgroups;
 mod client;
 pub mod host;
 pub mod policy;
@@ -173,6 +174,15 @@ impl Config {
                     )));
                 }
             }
+            if name == "supervisor" {
+                if let Some(mode) = class.policy.get("cgroup").and_then(|c| c.get("backend")) {
+                    if !matches!(mode.as_str(), Some("auto" | "v1" | "v2")) {
+                        return Err(Error::Invalid(
+                            "supervisor cgroup.backend must be auto, v1 or v2".into(),
+                        ));
+                    }
+                }
+            }
             if name == "conch" && self.conch_socket.as_ref().is_none_or(|p| !absolute(p)) {
                 return Err(Error::Invalid("Conch recovery socket is required".into()));
             }
@@ -209,6 +219,11 @@ impl Config {
 
 impl Jiuwenbox {
     pub async fn connect(config: Config, launch: LaunchConfig) -> Result<Self> {
+        config.validate()?;
+        if let Some(class) = config.classes.get("supervisor") {
+            let mode = class.policy["cgroup"]["backend"].as_str().unwrap_or("auto");
+            cgroups::SupervisorCgroups::new("/sys/fs/cgroup").validate_mode(mode)?;
+        }
         let driver = Self::with_host(config, launch, Arc::new(LinuxHost)).await?;
         driver.prepare_bootstrap().await?;
         Ok(driver)

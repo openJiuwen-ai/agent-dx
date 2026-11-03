@@ -4,7 +4,7 @@
 `9e0569f4fd047e510f4ee4ff28c26c54aaec5066` 和 Conch master
 `a9a756d86e4e48305c4a19cc3a63bd53ae972659` 的现有接口。Conch dev
 `a83e40fc3bf29792eeeafbd61585afad86426e36` 的 SDK 和 agent proto 与该 master 相同。
-本变更仅修改 ADX，不修改外部仓库，不提供此驱动的 checkpoint/restore。
+此驱动不提供 checkpoint/restore；显式 cgroup 后端选择需匹配支持该字段的 Jiuwenbox。
 
 ## 启动和配置
 
@@ -24,7 +24,8 @@ ADX 通过现有 `/api/v1/timeout` 验证 idle reaper 已关闭，不修改其�
 
 同一节点的 Jiuwenbox/conchd 实例及其 `adx-*` 资源必须由本 ADXlet 独占管理，不能让
 其他节点或另一个 ADXlet 共用这些后端。非 ADX 前缀实例不参与孤儿回收。
-节点上安装 mount、iproute2，使用支持 `cgroup.kill` 的 cgroup v2；Jiuwenbox/Conch
+节点上安装 mount、iproute2。Supervisor 支持 cgroup v1（需要 Linux pidfd 系统调用）或
+支持 `cgroup.kill` 的 cgroup v2；两种模式均需 memory、cpu、pids controller。Jiuwenbox/Conch
 自身所需的防火墙工具由其部署提供。ADXlet 需要只读 EROFS 挂载、读取和清理 supervisor
 cgroup/netns/veth 的权限；其宿主挂载、网络和 PID/cgroup 视图须与
 Jiuwenbox/conchd 一致。容器部署还需要正确的挂载传播，不能仅在 adxlet 私有命名空间
@@ -35,6 +36,21 @@ bootstrap.image 是独立 Execd EROFS，sha256 必须替换为安装产物的真
 只读挂载后再次确认 loop backing image；再转换为 supervisor bind 或 Conch volume。
 同一驱动按摘要首次使用时校验并挂载，后续创建直接复用；环境归零及驱动退出后仍保留
 EROFS 挂载，重启复用时重新校验。旧制品挂载的维护回收由运维在确认不再使用后执行。
+
+Supervisor 的可选配置位于 `jiuwenbox.classes.supervisor.policy.cgroup.backend`：
+
+```yaml
+cgroup:
+  backend: v1  # auto | v1 | v2
+```
+
+省略时保持 `auto`，与 Jiuwenbox 一样优先选择具备所需 controller 的 v2，否则使用 v1。
+显式 `v1`/`v2` 不会静默回退。配置 Supervisor 的节点在连接驱动时检查所选能力；
+v1 缺少 pidfd 支持时拒绝启动，避免无法安全回收执行。
+显式 backend 需要同时使用支持 `CgroupPolicy.backend` 的 Jiuwenbox；旧版会拒绝该 policy 字段。
+恢复和清理始终检查两种实际目录布局，修改新建策略不会隐藏此前创建的资源。
+ADXlet 与 Jiuwenbox 必须共享宿主 PID/cgroup 视图；运行中的组不得被其他管理程序迁移进程。
+该字段只影响 Supervisor，不改变 Conch 的运行时配置。
 
 classes 的键只允许 supervisor/conch。每个 classes.images 显式绑定公开 Environment
 image 名称；它不会自动拉取 OCI image。supervisor 的程序和依赖由宿主及 Jiuwenbox
@@ -90,7 +106,9 @@ ADX 资源；删除失败或创建仍在进行时本轮对账失败，下轮重�
 Linux 通过 socket、SO_PEERCRED PID、进程 start time 和 boot ID 识别后端代次。
 ADXlet 重启且 Jiuwenbox 注册表仍在时，可根据权威目录恢复现有已发布执行。
 Jiuwenbox 重启后不热接管其丢失的后台 job：Conch 从原生 list/get/delete 清理后冷重建；
-supervisor 从 cgroup/netns 发现孤儿，通过所属 cgroup.kill 终止进程，再清理 netns/veth/cgroup。
+supervisor 从 v1 各 controller、v2 统一层级及 netns 发现孤儿。v2 通过所属 cgroup.kill
+终止进程；v1 打开 pidfd 后复核进程仍属于执行的 cgroup，再用 pidfd 发送 SIGKILL，
+循环确认所有子组退出后清理 cgroup/netns/veth。读取失败不视作退出，也不退回裸 PID kill。
 正常创建、Execd 启动和策略更新仍经 Jiuwenbox，原生 Conch API 仅用于资源发现及清理。
 
 存活判断优先使用 Execd 自身控制状态并验证完整执行身份，健康检查断连不是退出。
