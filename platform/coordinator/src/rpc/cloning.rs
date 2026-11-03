@@ -45,6 +45,14 @@ fn inherit_template(
     let template = &snapshot.template;
     request.runtime_profile = template.runtime_profile.clone().map(Into::into);
     inherit_service_protection(&mut request, template)?;
+    // This flag also controls the managed image-process metadata mount. Keep
+    // its geometry when restoring; Execd resumes its saved process rather than
+    // starting the entrypoint again.
+    let execution = request.execution.get_or_insert_with(Default::default);
+    execution.inherit_entrypoint = template.execution.inherit_entrypoint;
+    if execution.inherit_entrypoint && execution.rootfs.is_none() {
+        execution.rootfs = template.execution.rootfs.clone().map(Into::into);
+    }
     if request.image.is_empty() {
         request.image = template.image.clone();
     }

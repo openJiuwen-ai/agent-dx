@@ -215,6 +215,8 @@ Snapshot ID string. It performs the normal environment create request with a
 `snapshotId`, so the result is a new `Environment` handle that reaches RUNNING in
 the usual way.
 
+Restoration retains the source environment's inherited-entrypoint setting and its managed image-process metadata mount. The captured workload resumes from memory; the entrypoint is not dispatched again. Callers still omit `inherit_entrypoint` when creating from a Snapshot rather than treating restoration as fresh initialization.
+
 ```python
 clone = Environment.create(
     snapshot,
