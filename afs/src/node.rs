@@ -2448,11 +2448,27 @@ async fn run_node(
     let mut shutdown_error = if let Some(error) = native_workspace_startup_error {
         Some(drain_started_services(services, on_shutdown, error).await)
     } else {
+        // Deployment identity: every test must confirm the running binary matches
+        // the expected source revision before trusting any measurement.
+        afs_logging::info!(
+            "build.info";
+            "git" => env!("AFS_BUILD_ID"),
+            "pkg_version" => env!("CARGO_PKG_VERSION"),
+            "exe" => std::env::current_exe().ok().map(|p| p.display().to_string()).unwrap_or_default()
+        );
         afs_logging::info!("node.ready";"grpc"=>cfg.grpc_listen.to_string(),"rest"=>cfg.rest_listen.to_string(),"uds"=>cfg.uds_path.display().to_string(),"ownerfs"=>cfg.ownerfs,"dfs"=>cfg.dfs);
         services.run_with_shutdown(on_shutdown).await.err()
     };
     #[cfg(not(feature = "ownerfs"))]
     let mut shutdown_error = {
+        // Deployment identity: every test must confirm the running binary matches
+        // the expected source revision before trusting any measurement.
+        afs_logging::info!(
+            "build.info";
+            "git" => env!("AFS_BUILD_ID"),
+            "pkg_version" => env!("CARGO_PKG_VERSION"),
+            "exe" => std::env::current_exe().ok().map(|p| p.display().to_string()).unwrap_or_default()
+        );
         afs_logging::info!("node.ready";"grpc"=>cfg.grpc_listen.to_string(),"rest"=>cfg.rest_listen.to_string(),"uds"=>cfg.uds_path.display().to_string(),"ownerfs"=>cfg.ownerfs,"dfs"=>cfg.dfs);
         services.run_with_shutdown(on_shutdown).await.err()
     };

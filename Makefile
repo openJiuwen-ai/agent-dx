@@ -52,7 +52,7 @@ else
 $(error ADX_AFS_ALL_FEATURES must be 0 or 1)
 endif
 
-.PHONY: help cargo-cache-info cargo-cache-env cargo-cache-isolated-env generate build test rust-check rust-test afs-check afs-build afs-lint afs-all-features-lint afs-test scheduler-bench python-test agent-test activator-e2e environment-sdk-test admin-test package ci data-plane-gateway data-plane-gateway-dev data-plane-gateway-ut
+.PHONY: help cargo-cache-info cargo-cache-env cargo-cache-isolated-env generate build test rust-check rust-test afs-check afs-build afs-build-identity afs-archive afs-lint afs-all-features-lint afs-test scheduler-bench python-test agent-test activator-e2e environment-sdk-test admin-test package ci data-plane-gateway data-plane-gateway-dev data-plane-gateway-ut
 help:
 	@echo 'generate | build | test | package | ci SUITE=<suite>; set ADX_WITH_AFS=1 for Agent FS (AFS); tests: rust-check rust-test scheduler-bench python-test; cache: cargo-cache-info cargo-cache-env cargo-cache-isolated-env'
 	@echo 'Python precheck: make python-check PYTHON_CHECK_BASE=<target-branch-ref> (requires uv)'
@@ -81,9 +81,39 @@ rust-test:
 	@if [ "$(ADX_WITH_AFS)" = "1" ]; then \
 		$(MAKE) afs-test JOBS=$(JOBS) PYTHON='$(PYTHON)' CARGO='$(CARGO)'; \
 	fi
-afs-check: afs-build afs-lint afs-test
+afs-check: afs-build afs-lint afs-build-identity afs-test
 afs-build:
 	$(CARGO) build --locked -p afs --bins -j $(JOBS)
+# Build-identity regression: linked worktree, a commit on the same branch, an
+# uncommitted tracked change and a source archive without `.git`. Pure shell: it
+# compiles afs/build.rs standalone, so it costs about a second and never writes
+# to CARGO_TARGET_DIR.
+afs-build-identity:
+	bash afs/scripts/check-build-identity.sh
+# Build from `git archive` output instead of the checkout. A source archive has
+# no `.git`, so the build script can only report `unknown`; this entry point is
+# what supplies the identity (`AFS_BUILD_ID`), defaulting to the current commit.
+# The archive tree compiles the same packages as the checkout, so it needs its
+# own target directory: sharing CARGO_TARGET_DIR would overwrite the checkout's
+# artefacts and leave `dist/` debuginfo paths inside them.
+AFS_ARCHIVE_DIR ?= dist/afs-archive
+AFS_ARCHIVE_TARGET ?= $(OUT)/afs-archive-target
+AFS_BUILD_ID ?= $(shell git rev-parse --short=9 HEAD 2>/dev/null)
+afs-archive:
+	@test -n "$(AFS_BUILD_ID)" || { \
+		echo 'afs-archive: no git metadata; pass AFS_BUILD_ID=<identity>' >&2; exit 2; \
+	}
+	@if [ "$(abspath $(AFS_ARCHIVE_TARGET))" = "$(abspath $(ADX_SHARED_CARGO_TARGET))" ]; then \
+		echo 'afs-archive requires an isolated AFS_ARCHIVE_TARGET; do not reuse the shared cargo cache' >&2; \
+		exit 2; \
+	fi
+	rm -rf $(AFS_ARCHIVE_DIR)
+	mkdir -p $(AFS_ARCHIVE_DIR)
+	git archive --format=tar HEAD | tar -x -C $(AFS_ARCHIVE_DIR)
+	cd $(AFS_ARCHIVE_DIR) && CARGO_TARGET_DIR=$(abspath $(AFS_ARCHIVE_TARGET)) \
+		AFS_BUILD_ID=$(AFS_BUILD_ID) \
+		$(CARGO) build --locked -p afs --bins -j $(JOBS)
+	@echo "afs-archive: built $(AFS_BUILD_ID) in $(abspath $(AFS_ARCHIVE_TARGET))"
 afs-lint:
 	$(CARGO) check --locked $(AFS_PACKAGES) --all-targets -j $(JOBS)
 	$(CARGO) clippy --locked $(AFS_PACKAGES) --all-targets -j $(JOBS) -- -D warnings
