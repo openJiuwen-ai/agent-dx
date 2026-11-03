@@ -146,25 +146,19 @@ impl DistributedFs {
                 .await
                 .inspect_err(|e| self.invalidate_native_handle_view_on_error(handle, e))?;
             #[cfg(test)]
-            if opened.open_read_inode.is_none()
-                && let Some(hook) = self.native_read_before_delivery.lock().unwrap().take()
-            {
+            if let Some(hook) = self.native_read_before_delivery.lock().unwrap().take() {
                 hook();
             }
             self.check_native_read_view(&operation)?;
-            if let Some(authority) = opened.open_read_authority.as_ref() {
-                self.read_engine.check_open_read_epoch(authority)?;
-            }
             if opened.closed.load(Ordering::Acquire) {
                 return Err(stale("DFS file handle is no longer open"));
             }
-            if opened.open_read_inode.is_none()
-                && opened
-                    .state
-                    .lock()
-                    .map_err(|_| unavailable("DFS handle state poisoned"))?
-                    .native_denial_serial
-                    != snapshot.native_denial_serial
+            if opened
+                .state
+                .lock()
+                .map_err(|_| unavailable("DFS handle state poisoned"))?
+                .native_denial_serial
+                != snapshot.native_denial_serial
             {
                 return Err(unavailable(
                     "DFS native read authorization changed before delivery",
@@ -193,38 +187,26 @@ impl DistributedFs {
             lifetime: lifetime.clone(),
         };
         let opened = &snapshot.handle;
-        if let Some(inode) = opened.open_read_inode.as_ref() {
-            if let Some(authority) = opened.open_read_authority.as_ref() {
-                self.read_engine.check_open_read_epoch(authority)?;
-            }
-            return self
-                .read_committed_async(
-                    inode,
-                    request,
-                    opened
-                        ._gc_pin
-                        .as_ref()
-                        .and_then(|p| p.open_read_reference())
-                        .map(str::to_owned),
-                    false,
-                )
-                .await;
-        }
         if snapshot.native_denial_serial == u64::MAX {
             return Err(unavailable("DFS native read denial serial exhausted"));
         }
-        if opened.dynamic_read_route.load(Ordering::Acquire) {
-            if let Some(provider) = self.remote_provider_visible_for_reads(&snapshot.inode_id)? {
-                return self
-                    .remote_read_async(provider, offset, size, deadline)
-                    .await;
-            }
-            if let Some(state) = self.write_state(&snapshot.inode_id)? {
-                let view = {
-                    let state = state
-                        .lock()
-                        .map_err(|_| unavailable("DFS inode write state poisoned"))?;
-                    ResolvedReadView {
+        let dynamic = opened.dynamic_read_route.load(Ordering::Acquire);
+        if dynamic
+            && let Some(provider) = self.remote_provider_visible_for_reads(&snapshot.inode_id)?
+        {
+            return self
+                .remote_read_async(provider, offset, size, deadline)
+                .await;
+        }
+        // This Node's write activity is visible to every handle (4a); without
+        // it the handle reads its pinned version below.
+        if let Some(state) = self.write_state(&snapshot.inode_id)? {
+            let view = {
+                let state = state
+                    .lock()
+                    .map_err(|_| unavailable("DFS inode write state poisoned"))?;
+                if state.has_local_write_activity() {
+                    Some(ResolvedReadView {
                         committed: state.base_version.as_ref().map(|v| v.id.clone()),
                         length: state.logical_length,
                         layout: state.base_layout.clone(),
@@ -233,8 +215,12 @@ impl DistributedFs {
                             .as_ref()
                             .and_then(InFlightCommit::dirty_extents),
                         active: state.dirty_extents.snapshot_range(offset, size)?,
-                    }
-                };
+                    })
+                } else {
+                    None
+                }
+            };
+            if let Some(view) = view {
                 if offset >= view.length || size == 0 {
                     return Ok(prost::bytes::Bytes::new());
                 }
@@ -268,7 +254,6 @@ impl DistributedFs {
                     deadline: deadline.min(view.deadline),
                     ..request
                 },
-                None,
                 true,
             )
             .await?;
@@ -280,7 +265,6 @@ impl DistributedFs {
         &self,
         inode: &InodeRecord,
         request: NativeReadRequest<'_>,
-        reference: Option<String>,
         prefetch: bool,
     ) -> Result<prost::bytes::Bytes> {
         let NativeReadRequest {
@@ -299,7 +283,9 @@ impl DistributedFs {
             return Ok(prost::bytes::Bytes::new());
         }
         let count = (version.layout.file_length - offset).min(size as u64) as usize;
-        if reference.is_some()
+        // Speculative parts are cached per handle and keyed by offset only, so
+        // only a handle whose version never moved may use them.
+        if !snapshot.handle.dynamic_read_route.load(Ordering::Acquire)
             && crate::node::native_prefetch::eligible(snapshot.flags)
             && let Some((budget, window)) = self.read_engine.native_prefetch_policy()
         {
@@ -309,11 +295,9 @@ impl DistributedFs {
             let fetch = controller.fetch(|| {
                 let engine = self.read_engine.clone();
                 let version = version.clone();
-                let reference = reference.clone();
                 Arc::new(move |a, n, read_deadline, life| {
                     let engine = engine.clone();
                     let version = version.clone();
-                    let reference = reference.clone();
                     Box::pin(async move {
                         let batch =
                             version.native_read_batch(a, n, engine.source_lookahead_chunks())?;
@@ -321,7 +305,7 @@ impl DistributedFs {
                             .read_native_unified_async(
                                 batch,
                                 n,
-                                reference,
+                                None,
                                 read_deadline,
                                 handle.0,
                                 life,
@@ -389,7 +373,7 @@ impl DistributedFs {
         };
         let result = self
             .read_engine
-            .read_native_unified_async(batch, count, reference, deadline, handle.0, lifetime)
+            .read_native_unified_async(batch, count, None, deadline, handle.0, lifetime)
             .await?;
         #[cfg(test)]
         if let Some(hook) = self.native_read_after_committed.lock().unwrap().take() {

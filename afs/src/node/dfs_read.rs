@@ -1891,24 +1891,6 @@ impl DfsReadEngine {
         }
         Ok(())
     }
-    pub(super) fn close_open_read_context(&self, reference: &str) -> Result<()> {
-        {
-            let mut cache = self
-                .fixed_open_routes
-                .lock()
-                .map_err(|_| unavailable("fixed open route cache poisoned"))?;
-            cache.entries.retain(|(key, _), _| key != reference);
-            cache.bytes = cache.entries.values().map(|(_, bytes)| *bytes).sum();
-        }
-        self.transfer.close_open_read_context(reference)
-    }
-    pub(super) fn check_open_read_epoch(&self, opened: &NativeReadAuthoritySnapshot) -> Result<()> {
-        let current = self.capture_native_read_authority()?;
-        if current.epoch != opened.epoch {
-            return Err(external_denied("opened read node epoch changed"));
-        }
-        Ok(())
-    }
     pub fn has_external_backend(&self) -> bool {
         self.external_backend.is_some()
     }
@@ -5890,8 +5872,6 @@ mod tests {
             3,
             "one failed attempt then two successful reads"
         );
-        engine.close_open_read_context("read-open:fixed").unwrap();
-        assert!(engine.fixed_open_routes.lock().unwrap().entries.is_empty());
     }
 
     fn put_local_chunk(local: &LocalChunkStore, operation: &str, bytes: &[u8]) -> ChunkId {

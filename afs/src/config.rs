@@ -355,8 +355,6 @@ pub struct Cli {
     /// Bounded coarse read timing for explicit diagnosis only; disabled by default.
     #[arg(long)]
     pub dfs_read_diagnostics_enabled: Option<bool>,
-    #[arg(long)]
-    pub dfs_native_open_read_authority: Option<bool>,
     /// Native gRPC read CRC policy (default off); receiver opts in to B checks.
     /// All serving peers must use the same mode.
     #[arg(long)]
@@ -465,7 +463,6 @@ struct FileConfig {
     dfs_source_lookahead_chunks: Option<usize>,
     dfs_source_cache_bytes: Option<usize>,
     dfs_read_diagnostics_enabled: Option<bool>,
-    dfs_native_open_read_authority: Option<bool>,
     dfs_read_crc_mode: Option<DfsReadCrcMode>,
     dfs_crc32c_writes: Option<bool>,
     dfs_optimistic_gc_commit: Option<bool>,
@@ -578,7 +575,6 @@ pub struct Config {
     pub dfs_source_lookahead_chunks: usize,
     pub dfs_source_cache_bytes: usize,
     pub dfs_read_diagnostics_enabled: bool,
-    pub dfs_native_open_read_authority: bool,
     pub dfs_read_crc_mode: DfsReadCrcMode,
     pub dfs_crc32c_writes: bool,
     pub dfs_optimistic_gc_commit: bool,
@@ -1065,10 +1061,6 @@ impl Config {
             dfs_source_lookahead_chunks,
             dfs_source_cache_bytes,
             dfs_read_crc_mode,
-            dfs_native_open_read_authority: cli
-                .dfs_native_open_read_authority
-                .or(file.dfs_native_open_read_authority)
-                .unwrap_or(false),
             dfs_read_diagnostics_enabled: cli
                 .dfs_read_diagnostics_enabled
                 .or(file.dfs_read_diagnostics_enabled)
@@ -1535,7 +1527,6 @@ mod certificate_tests {
         assert_eq!(cfg.dfs_read_pipeline.max_reply_bytes, 256 * 1024 * 1024);
         assert_eq!(cfg.fuse_max_readahead_bytes, 16 * 1024 * 1024);
         assert_eq!(cfg.dfs_readahead_max_bytes, 0);
-        assert!(!cfg.dfs_native_open_read_authority);
         assert!(cfg.dfs_crc32c_writes);
         assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Off);
         let cli = Cli::try_parse_from([

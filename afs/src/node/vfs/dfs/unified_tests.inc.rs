@@ -53,8 +53,7 @@ fn unified_local_fs(
         meta.clone(),
         local,
         Arc::new(engine),
-    )
-    .with_native_open_read_authority(true);
+    );
     (temp, meta, Arc::new(fs))
 }
 async fn unified_reply(
@@ -166,30 +165,4 @@ async fn unified_native_dirty_overlay_sparse_reuse_eof_and_committed_view_match(
     );
     fs.release(&context(), reader).unwrap();
     fs.release(&context(), created.handle).unwrap();
-}
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unified_cancelled_refresh_unlinks_flight_and_retains_original_result() {
-    let (_temp, _meta, fs) = unified_local_fs(crate::config::DfsReadCrcMode::Off, false);
-    let file = fs
-        .create(
-            &context(),
-            fs.root_inode(),
-            OsStr::new("refresh-drop"),
-            0o640,
-            libc::O_RDWR,
-        )
-        .unwrap();
-    let opened = fs.handle_snapshot(file.handle).unwrap().handle;
-    let flight = Arc::new(NativeReadRefresh::new());
-    opened.state.lock().unwrap().refresh = Some(flight.clone());
-    let retirement = NativeRefreshLeader {
-        opened: opened.clone(),
-        flight: flight.clone(),
-        completed: false,
-    };
-    drop(retirement);
-    assert!(opened.state.lock().unwrap().refresh.is_none());
-    let operation = fs.capture_native_read_view().unwrap();
-    assert!(flight.wait_async(&fs, &operation).await.is_err());
-    fs.release(&context(), file.handle).unwrap();
 }

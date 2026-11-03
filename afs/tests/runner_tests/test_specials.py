@@ -31,7 +31,6 @@ class ProfileTests(unittest.TestCase):
             {"write_queue_bytes": 0}, {"write_queue_bytes": 2**40 + 1},
             {"read_crc_mode": 'off"\ndata_dir="/tmp/other'},
             {"keep_cache": "false"}, {"kernel_readahead_bytes": 2**30},
-            {"native_open_authority": "true"},
             {"readahead_max_bytes": -1},
         ]:
             with self.subTest(values=values), self.assertRaises(ValueError):

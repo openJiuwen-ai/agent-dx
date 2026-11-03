@@ -65,26 +65,26 @@ def committed_write_visible_to_new_open(c):
     c.record("semantics.visible_after_commit", {"row": "v2 5.2 visibility", "status": "current == decided"})
 
 
-def open_reader_sees_later_commit_today(c):
-    """Decision 4a will change this: an already-open reader is pinned to its open-time version.
+def open_reader_keeps_open_time_version(c):
+    """Decision 4a (S1a-6): an already-open reader is pinned to its open-time version.
 
-    Today (default dfs_native_open_read_authority=false) an open reader refreshes its view
-    within about 5 seconds and can see a version committed after it opened.
+    A version committed on another node after the reader opened becomes visible only to a
+    new open; the open reader keeps reading the old bytes until close.
     """
     c.write("A", "sem-pinned", b"old" * 10)
     path = c.workspace("B") + "/sem-pinned"
     holder = _hold_open(c, "B", "sem-pinned-holder", path)
     c.write("A", "sem-pinned", b"NEW" * 20)
-    time.sleep(6)  # beyond the 5 s read-view TTL
+    time.sleep(6)  # beyond the removed 5 s refresh, so a regression would show
     result = _release(c, "B", "sem-pinned-holder", holder)
     saw_new = result["second"] == 60 and result["second_head"] == b"NEWNEWNE".hex()
     c.record("semantics.open_reader_after_commit", {
         "first_bytes": result["first"], "second_bytes": result["second"], "saw_new_version": saw_new,
-        "changed_by": "decision 4a (open_to_close pin)", "row": "v2 5.2 visibility (open readers)",
+        "changed_by": "decision 4a (open_to_close pin), S1a-6", "row": "v2 5.2 visibility (open readers)",
     })
     assert result["first"] == 30, result
-    # Current behavior: the open reader eventually observes the newer committed version.
-    assert saw_new, result
+    assert result["second"] == 30 and not saw_new, result
+    c.read("B", "sem-pinned", b"NEW" * 20)
 
 
 def unlink_open_file_keeps_data(c):
@@ -149,7 +149,7 @@ def file_locks_are_local_only(c):
 
 CASES = (
     Case("dfs.semantics.visible_after_commit", ("s0-semantics",), "dfs", (), committed_write_visible_to_new_open),
-    Case("dfs.semantics.open_reader_after_commit", ("s0-semantics",), "dfs", (), open_reader_sees_later_commit_today),
+    Case("dfs.semantics.open_reader_after_commit", ("s0-semantics",), "dfs", (), open_reader_keeps_open_time_version),
     Case("dfs.semantics.unlink_open_file", ("s0-semantics",), "dfs", (), unlink_open_file_keeps_data),
     Case("dfs.semantics.close_mtime", ("s0-semantics",), "dfs", (), close_mtime_visibility_today),
     Case("dfs.semantics.fsync", ("s0-semantics",), "dfs", (), fsync_error_free_path),

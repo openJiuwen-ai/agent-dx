@@ -1723,9 +1723,6 @@ async fn run_node(
         .with_gc_references(gc_references)
         .with_optimistic_gc_commit(cfg.dfs_optimistic_gc_commit)
         .with_crc32c_writes(cfg.dfs_crc32c_writes)
-        .with_native_open_read_authority(
-            cfg.dfs_native_open_read_authority && cfg.data_mode == "grpc",
-        )
         .with_remote_owner_factory(remote_factory)
         .with_version_cache_capacity(cfg.dfs_version_cache_entries)
         .with_version_cache_bytes(cfg.dfs_version_cache_bytes)

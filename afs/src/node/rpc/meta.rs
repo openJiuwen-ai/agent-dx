@@ -4731,17 +4731,6 @@ impl crate::node::gc::GcControl for GrpcDfsMeta {
     ) -> Result<()> {
         self.update_gc(id, Some(inode), version, publication, Vec::new(), false)
     }
-    fn retain_open_read(
-        &self,
-        id: &str,
-        inode: &crate::dfs::InodeId,
-        identity: &crate::dfs::OpenReadIdentity,
-    ) -> Result<()> {
-        self.update_open_read(id, Some(inode), Some(identity), false)
-    }
-    fn close_open_read(&self, id: &str) -> Result<()> {
-        self.update_open_read(id, None, None, true)
-    }
     fn retain_fenced(
         &self,
         id: &str,
@@ -4817,55 +4806,6 @@ impl crate::node::gc::GcControl for GrpcDfsMeta {
 }
 #[cfg(feature = "dfs")]
 impl GrpcDfsMeta {
-    fn update_open_read(
-        &self,
-        id: &str,
-        inode: Option<&crate::dfs::InodeId>,
-        identity: Option<&crate::dfs::OpenReadIdentity>,
-        close: bool,
-    ) -> Result<()> {
-        let _scope = self
-            .read_work
-            .as_ref()
-            .map(|m| m.authorization_scope(if close { "close_meta" } else { "open_meta" }));
-
-        self.record_read_rpc(if close {
-            "close_open_read_context"
-        } else {
-            "open_read_context"
-        });
-        let open_read = identity
-            .map(serde_json::to_vec)
-            .transpose()
-            .map_err(|_| {
-                afs_error::Error::coded(
-                    afs_error::CLIENT_ARGUMENT_INVALID,
-                    "open read identity encoding failed",
-                )
-            })?
-            .unwrap_or_default();
-        self.run(self.client().update_gc_reference(
-            afs_protocol::meta::UpdateDfsGcReferenceRequest {
-                node_id: self.node_id.clone(),
-                session_id: self.session_id.clone(),
-                reference_id: id.into(),
-                inode_id: inode.map(|v| v.0.clone()).unwrap_or_default(),
-                version_id: identity.map(|v| v.version_id.0.clone()).unwrap_or_default(),
-                publication: false,
-                chunks: Vec::new(),
-                release: false,
-                admission_deadline_unix_ms: if close {
-                    0
-                } else {
-                    crate::meta::store::now_unix_ms().saturating_add(30_000)
-                },
-                capture_gc_fence: false,
-                open_read,
-                close_open_read: close,
-            },
-        ))?;
-        Ok(())
-    }
     fn update_gc(
         &self,
         id: &str,

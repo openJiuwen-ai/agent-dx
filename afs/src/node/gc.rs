@@ -26,17 +26,6 @@ pub trait GcControl: Send + Sync {
             "fenced GC retain is unsupported",
         ))
     }
-    fn retain_open_read(
-        &self,
-        id: &str,
-        inode: &InodeId,
-        identity: &crate::dfs::OpenReadIdentity,
-    ) -> Result<()> {
-        self.retain(id, inode, Some(&identity.version_id), false)
-    }
-    fn close_open_read(&self, _id: &str) -> Result<()> {
-        Ok(())
-    }
     fn release(&self, id: &str) -> Result<()>;
     fn reserve_publication(
         &self,
@@ -51,21 +40,11 @@ pub struct GcReferences {
     sequence: AtomicU64,
 }
 pub struct GcPin {
-    open_read: Option<crate::dfs::OpenReadIdentity>,
     fence: Option<crate::dfs::GcFence>,
     id: String,
     owner: Arc<GcReferences>,
 }
 impl GcPin {
-    pub(crate) fn open_read_reference(&self) -> Option<&str> {
-        self.open_read.as_ref().map(|_| self.id.as_str())
-    }
-    pub(crate) fn close_open_read(&self) -> Result<()> {
-        if self.open_read.is_some() {
-            self.owner.control.close_open_read(&self.id)?;
-        }
-        Ok(())
-    }
     pub(crate) fn fence(&self) -> Option<crate::dfs::GcFence> {
         self.fence
     }
@@ -91,28 +70,6 @@ impl GcReferences {
             pending: Mutex::new(Vec::new()),
             sequence: AtomicU64::new(1),
         })
-    }
-    pub(crate) fn pin_open_read(
-        self: &Arc<Self>,
-        inode: &InodeId,
-        identity: crate::dfs::OpenReadIdentity,
-    ) -> Result<Arc<GcPin>> {
-        let id = format!(
-            "read-open:{}",
-            crate::meta::store::timed_request_id(format!(
-                "{}-{}",
-                std::process::id(),
-                self.sequence.fetch_add(1, Ordering::Relaxed)
-            ))
-        );
-        let pin = Arc::new(GcPin {
-            open_read: Some(identity.clone()),
-            fence: None,
-            id,
-            owner: self.clone(),
-        });
-        self.control.retain_open_read(&pin.id, inode, &identity)?;
-        Ok(pin)
     }
     pub fn pin(
         self: &Arc<Self>,
@@ -163,7 +120,6 @@ impl GcReferences {
         };
         // Queue cleanup even when an admission reply is lost.
         let mut pin = GcPin {
-            open_read: None,
             fence: None,
             id,
             owner: self.clone(),
@@ -235,29 +191,6 @@ mod tests {
         fn collect(&self, _: u64, _: Vec<ChunkObject>) -> Result<GcState> {
             Ok(GcState::default())
         }
-    }
-    #[test]
-    fn open_authority_close_keeps_physical_pin_for_inflight_user() {
-        let control = Arc::new(Control::default());
-        let refs = GcReferences::new(control.clone());
-        let handle = refs
-            .pin_open_read(
-                &InodeId::new("i"),
-                crate::dfs::OpenReadIdentity {
-                    version_id: FileVersionId::new("v"),
-                    layout_root_id: crate::dfs::LayoutRootId::new("l"),
-                    closed: false,
-                },
-            )
-            .unwrap();
-        let inflight = handle.clone();
-        handle.close_open_read().unwrap();
-        drop(handle);
-        refs.flush().unwrap();
-        assert!(control.releases.lock().unwrap().is_empty());
-        drop(inflight);
-        refs.flush().unwrap();
-        assert_eq!(control.releases.lock().unwrap().len(), 1);
     }
     #[test]
     fn in_flight_access_retains_pin_and_failed_release_is_retried() {

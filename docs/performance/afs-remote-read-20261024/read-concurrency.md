@@ -13,7 +13,6 @@ Example (native DFS, gRPC; resource settings are optional):
 ```toml
 fuse_workers = 1
 fuse_max_tasks = 32
-dfs_native_open_read_authority = true
 dfs_read_crc_mode = "off"
 
 [dfs_read_pipeline]
