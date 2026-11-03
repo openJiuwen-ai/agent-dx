@@ -41,6 +41,19 @@ pub struct LocalFs {
 }
 
 impl LocalFs {
+    /// Open a direct child of an already-open directory handle.
+    ///
+    /// The path-based `open_file` walks every component from the filesystem
+    /// root again; callers that already hold the parent directory use this to
+    /// resolve the leaf in a single step.
+    pub(crate) fn open_child_in(
+        directory: &LocalDirectory,
+        name: &OsStr,
+        spec: OpenSpec,
+    ) -> io::Result<LocalFile> {
+        open_child_file(&directory.dir, name, spec).map(|file| LocalFile { file })
+    }
+
     pub fn open(root: impl AsRef<Path>) -> io::Result<Self> {
         fs::create_dir_all(root.as_ref())?;
         let root_path = root.as_ref().canonicalize()?;
@@ -80,6 +93,11 @@ impl LocalFs {
     fn open_path_dir(&self, path: &StoragePath) -> io::Result<File> {
         if path.is_root() {
             return self.root.try_clone();
+        }
+        // One openat2 instead of one openat per component. The resolve flags
+        // keep the same confinement and no-symlink policy as the walk.
+        if let Some(result) = openat2_dir(&self.root, path.as_path().as_os_str()) {
+            return result;
         }
         self.open_dir_components(&split_components(path)?)
     }
@@ -350,6 +368,38 @@ pub struct LocalDirectory {
 impl DirectoryHandle for LocalDirectory {
     fn metadata(&self) -> io::Result<fs::Metadata> {
         self.dir.metadata()
+    }
+
+    fn child_present(&self, name: &OsStr) -> io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        let candidate = std::path::Path::new(name);
+        if name.is_empty() || candidate.components().count() != 1 {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+        let cname = std::ffi::CString::new(name.as_encoded_bytes())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        // SAFETY: libc::stat is plain old data, so the all-zero bit pattern is
+        // a valid (empty) value that fstatat then overwrites.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: self.dir is a live directory descriptor, cname is a
+        // NUL-terminated single component, and stat is a valid out-parameter for
+        // the duration of the call.
+        let rc = unsafe {
+            libc::fstatat(
+                self.dir.as_raw_fd(),
+                cname.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::NotFound {
+            return Ok(false);
+        }
+        Err(error)
     }
 
     fn read_dir(&self) -> io::Result<Vec<OsString>> {
@@ -686,10 +736,99 @@ fn open_dir_path(path: &Path) -> io::Result<File> {
 }
 
 fn open_child_dir(parent: &File, leaf: &OsStr) -> io::Result<File> {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(proc_child(parent, leaf))
+    openat_raw(
+        parent,
+        leaf,
+        libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        0,
+    )
+}
+
+/// `openat` against a live directory descriptor.
+///
+/// The previous implementation opened `/proc/self/fd/<fd>/<name>`, which costs
+/// the kernel an extra procfs path walk and symlink resolution per component.
+#[allow(unsafe_code)]
+fn openat_raw(parent: &File, leaf: &OsStr, flags: i32, mode: u32) -> io::Result<File> {
+    let name = std::ffi::CString::new(leaf.as_encoded_bytes())
+        .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+    loop {
+        // SAFETY: `parent` owns a live directory descriptor and `name` is
+        // NUL-terminated; the returned descriptor is adopted immediately.
+        let fd = unsafe {
+            libc::openat(
+                std::os::fd::AsRawFd::as_raw_fd(parent),
+                name.as_ptr(),
+                flags | libc::O_CLOEXEC,
+                mode as libc::c_uint,
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: `fd` is a freshly returned descriptor owned by this call.
+            return Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) });
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// Resolve a whole relative path below `root` in one `openat2` call.
+///
+/// `RESOLVE_IN_ROOT` keeps the lookup confined to the root descriptor even for
+/// `..`, and `RESOLVE_NO_SYMLINKS` preserves the `O_NOFOLLOW` policy the
+/// component walk applied.
+///
+/// Returns `None` when the caller must fall back to the component walk: the
+/// kernel lacks openat2 (`ENOSYS`), or the whole relative path does not fit the
+/// kernel path limit (`ENAMETOOLONG`) while every single component still does.
+/// Every other error is returned to the caller unchanged.
+#[allow(unsafe_code)]
+fn openat2_dir(root: &File, relative: &OsStr) -> Option<io::Result<File>> {
+    let name = std::ffi::CString::new(relative.as_encoded_bytes()).ok()?;
+    // SAFETY: libc::open_how is plain old data; the all-zero value is a valid
+    // struct and every field used below is assigned before the syscall.
+    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
+    how.flags = (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY) as u64;
+    how.resolve = libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS;
+    // SAFETY: `how` is a fully initialised open_how and `name` is NUL-terminated.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            std::os::fd::AsRawFd::as_raw_fd(root),
+            name.as_ptr(),
+            &how,
+            std::mem::size_of::<libc::open_how>(),
+        )
+    };
+    if fd >= 0 {
+        // `syscall` returns `c_long`; a descriptor outside `c_int` cannot be a
+        // `RawFd`, so refuse instead of truncating. The kernel never returns
+        // one, which is why the error path does not try to close it.
+        let Ok(raw_fd) = i32::try_from(fd) else {
+            debug_assert!(
+                false,
+                "openat2 returned a descriptor wider than c_int: {fd}"
+            );
+            return Some(Err(io::Error::from_raw_os_error(libc::EOVERFLOW)));
+        };
+        // SAFETY: raw_fd is the non-negative descriptor the kernel just
+        // returned to this process; nothing else owns it, so it is adopted here.
+        return Some(Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(raw_fd) }));
+    }
+    let error = io::Error::last_os_error();
+    // Fall back to the component walk when openat2 is unavailable *and* when the
+    // whole relative path does not fit the kernel's path limit. A tree of legal
+    // 200-byte directory names can exceed PATH_MAX as one string while every
+    // component stays valid, and the component walk opens them one at a time.
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::ENOSYS) | Some(libc::ENAMETOOLONG)
+    ) {
+        return None;
+    }
+    Some(Err(error))
 }
 
 fn open_child_file(parent: &File, leaf: &OsStr, spec: OpenSpec) -> io::Result<File> {
@@ -699,33 +838,19 @@ fn open_child_file(parent: &File, leaf: &OsStr, spec: OpenSpec) -> io::Result<Fi
             "open_file does not accept O_DIRECTORY",
         ));
     }
-
-    let mut options = OpenOptions::new();
-    match spec.flags & libc::O_ACCMODE {
-        libc::O_RDONLY => {
-            options.read(true);
-        }
-        libc::O_WRONLY => {
-            options.write(true);
-        }
-        libc::O_RDWR => {
-            options.read(true).write(true);
-        }
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "unsupported access mode",
-            ));
-        }
+    let access = spec.flags & libc::O_ACCMODE;
+    if !matches!(access, libc::O_RDONLY | libc::O_WRONLY | libc::O_RDWR) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsupported access mode",
+        ));
     }
-    options
-        .create(spec.flags & libc::O_CREAT != 0)
-        .create_new(spec.flags & libc::O_CREAT != 0 && spec.flags & libc::O_EXCL != 0)
-        .truncate(spec.flags & libc::O_TRUNC != 0)
-        .append(spec.flags & libc::O_APPEND != 0)
-        .mode(spec.mode)
-        .custom_flags(passthrough_flags(spec.flags) | libc::O_CLOEXEC | libc::O_NOFOLLOW)
-        .open(proc_child(parent, leaf))
+    let flags = access
+        | spec.flags & (libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC | libc::O_APPEND)
+        | passthrough_flags(spec.flags)
+        | libc::O_CLOEXEC
+        | libc::O_NOFOLLOW;
+    openat_raw(parent, leaf, flags, spec.mode)
 }
 
 fn passthrough_flags(flags: i32) -> i32 {
@@ -763,8 +888,6 @@ fn renameat2_no_replace(
     // StoragePath/open_parent. The syscall does not retain these pointers after
     // returning, and RENAME_NOREPLACE gives the required atomic no-clobber
     // semantics that cannot be implemented with a prior existence check.
-    // SAFETY: both directory descriptors and NUL-terminated path components stay live for
-    // the synchronous syscall.
     let result = unsafe {
         libc::renameat2(
             from_parent.as_raw_fd(),
@@ -801,5 +924,84 @@ mod tests {
         assert!(capacity.namelen > 0);
         assert!(capacity.blocks >= capacity.bfree);
         assert!(capacity.bfree >= capacity.bavail);
+    }
+
+    /// A tree whose components are all legal can still exceed `PATH_MAX` as a
+    /// single string: 25 directories of 200 bytes make a 5024-byte relative
+    /// path. `openat2` rejects that with `ENAMETOOLONG`, which must fall back to
+    /// the component walk instead of ending the walk with an error.
+    #[test]
+    fn relative_path_longer_than_path_max_falls_back_to_component_walk() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = LocalFs::open(temp.path()).unwrap();
+
+        let name = "d".repeat(200);
+        create_deep_chain(&local.root, &name, 25);
+        let mut relative = std::path::PathBuf::new();
+        for _ in 0..25 {
+            relative.push(&name);
+        }
+        assert!(relative.as_os_str().len() > 4096);
+
+        let path = StoragePath::new(&relative).unwrap();
+        let opened = local
+            .open_path_dir(&path)
+            .expect("deep path must stay reachable through the component walk");
+        assert!(opened.metadata().unwrap().is_dir());
+    }
+
+    /// The fallback must not weaken confinement: a symlink component still has
+    /// to be refused, however deep the path is.
+    #[test]
+    fn deep_path_fallback_keeps_no_symlink_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = LocalFs::open(temp.path()).unwrap();
+
+        let name = "d".repeat(200);
+        let depth = 25;
+        // The chain itself cannot be created through one host path (> PATH_MAX),
+        // so build it component by component exactly like a real deep tree.
+        create_deep_chain(&local.root, &name, depth);
+        std::os::unix::fs::symlink(temp.path().join(&name), temp.path().join("link")).unwrap();
+
+        let mut escaped = std::path::PathBuf::from("link");
+        for _ in 0..depth {
+            escaped.push(&name);
+        }
+        assert!(escaped.as_os_str().len() > 4096);
+        let error = local
+            .open_path_dir(&StoragePath::new(&escaped).unwrap())
+            .expect_err("symlink component must be rejected");
+        // `O_NOFOLLOW | O_DIRECTORY` on a symlink to a directory reports
+        // ENOTDIR on Linux; either errno is a refusal, never a silent follow.
+        assert!(matches!(
+            error.raw_os_error(),
+            Some(libc::ELOOP) | Some(libc::ENOTDIR)
+        ));
+    }
+
+    /// Create `<root>/<name>/<name>/...` `depth` levels deep, one `mkdirat` at a
+    /// time, because the concatenated path is longer than `PATH_MAX`.
+    fn create_deep_chain(root: &std::fs::File, name: &str, depth: usize) {
+        let name_c = std::ffi::CString::new(name).unwrap();
+        let mut dir = root.try_clone().unwrap();
+        for _ in 0..depth {
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&dir);
+            // SAFETY: `fd` is a live directory descriptor owned by `dir` and
+            // `name_c` is a NUL-terminated component name.
+            let created = unsafe { libc::mkdirat(fd, name_c.as_ptr(), 0o755) };
+            assert_eq!(created, 0, "mkdirat failed: {}", io::Error::last_os_error());
+            // SAFETY: same live descriptor and NUL-terminated name.
+            let opened = unsafe {
+                libc::openat(
+                    fd,
+                    name_c.as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+                )
+            };
+            assert!(opened >= 0, "openat failed: {}", io::Error::last_os_error());
+            // SAFETY: `opened` is a freshly returned descriptor owned by this call.
+            dir = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(opened) };
+        }
     }
 }
