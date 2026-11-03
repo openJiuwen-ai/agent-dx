@@ -61,8 +61,8 @@ case "$component" in
     cp "$CARGO_TARGET_DIR/$musl_target/release/adx-execd" "$output/adx-execd"
     rootfs_args=(--binary "$output/adx-execd" --output "$output/adx-runtime-rootfs.img")
     echo "--- :package: Build pinned envd"
-    envd_args=(--output "$output/envd-build" --jobs "$jobs" --git-protocol 2)
-    if [[ -n "${ADX_ENVD_SOURCE:-}" ]]; then envd_args+=(--source "$ADX_ENVD_SOURCE"); fi
+    envd_args=(--output "$output/envd-build" --jobs "$jobs")
+    if [[ -n "${ADX_ENVD_SOURCE:-}" ]]; then envd_args+=(--source "$ADX_ENVD_SOURCE"); else envd_args+=(--obs-source); fi
     python3 build/e2b/build_envd.py "${envd_args[@]}"
     cp "$output/envd-build/manifest.json" "$output/envd-manifest.json"
     cp "$output/envd-build/LICENSE" "$output/envd-LICENSE"

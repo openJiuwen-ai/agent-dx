@@ -7,6 +7,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tarfile
+import io
 import time
 import unittest
 from pathlib import Path
@@ -19,6 +21,71 @@ GIT = shutil.which("git")
 
 
 class EnvdBuildTests(unittest.TestCase):
+    def test_obs_source_downloads_verified_archive_without_git(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / 'fixture.tar.gz'
+            with tarfile.open(archive, 'w:gz') as bundle:
+                for name in ('runtime-pin/packages/envd/main.go', 'runtime-pin/packages/shared/shared.go'):
+                    entry = tarfile.TarInfo(name)
+                    entry.size = 1
+                    bundle.addfile(entry, io.BytesIO(b'x'))
+            pin = {'revision': 'pin', 'archive': {'url': 'https://agent-dx.obs.test.myhuaweicloud.com/source',
+                                                   'bytes': archive.stat().st_size,
+                                                   'sha256': builder.digest(archive)}}
+            pin_path = root / 'third_party/e2b/source.json'
+            pin_path.parent.mkdir(parents=True)
+            pin_path.write_text(json.dumps(pin))
+
+            def download(command, **kwargs):
+                shutil.copyfile(archive, command[command.index('--output') + 1])
+
+            def compile_source(source, output, jobs, archive_revision):
+                self.assertEqual(archive_revision, 'pin')
+                self.assertTrue((source / 'packages/envd/main.go').is_file())
+                self.assertTrue((source / 'packages/shared/shared.go').is_file())
+
+            with patch.object(builder, 'ROOT', root), patch.object(builder.subprocess, 'run', side_effect=download), \
+                    patch.object(builder, '_build', side_effect=compile_source) as compile_mock, \
+                    patch.object(builder, 'run_git') as run_git:
+                builder.build(None, root / 'output', 2, obs_source=True)
+            compile_mock.assert_called_once()
+            run_git.assert_not_called()
+
+    def test_archive_integrity_and_safe_extraction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / 'source.tar.gz'
+            with tarfile.open(archive, 'w:gz') as bundle:
+                for name, content in [('runtime-pin/packages/envd/main.go', b'envd'),
+                                      ('runtime-pin/packages/shared/shared.go', b'shared')]:
+                    entry = tarfile.TarInfo(name)
+                    entry.size = len(content)
+                    bundle.addfile(entry, io.BytesIO(content))
+            pin = {'revision': 'pin', 'archive': {'bytes': archive.stat().st_size,
+                                                   'sha256': builder.digest(archive)}}
+            source = root / 'source'
+            builder.unpack_archive(archive, source, pin)
+            self.assertEqual((source / 'packages/envd/main.go').read_bytes(), b'envd')
+            self.assertEqual((source / 'packages/shared/shared.go').read_bytes(), b'shared')
+            pin['archive']['sha256'] = '0' * 64
+            with self.assertRaisesRegex(ValueError, 'integrity'):
+                builder.unpack_archive(archive, root / 'bad', pin)
+
+    def test_archive_rejects_path_traversal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / 'source.tar.gz'
+            with tarfile.open(archive, 'w:gz') as bundle:
+                entry = tarfile.TarInfo('runtime-pin/packages/envd/../../escape')
+                entry.size = 1
+                bundle.addfile(entry, io.BytesIO(b'x'))
+            pin = {'revision': 'pin', 'archive': {'bytes': archive.stat().st_size,
+                                                   'sha256': builder.digest(archive)}}
+            with self.assertRaisesRegex(ValueError, 'unsafe'):
+                builder.unpack_archive(archive, root / 'source', pin)
+            self.assertFalse((root / 'escape').exists())
+
     def test_default_source_fetches_exact_pin_and_removes_temporary_checkout(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
