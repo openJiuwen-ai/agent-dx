@@ -2265,7 +2265,7 @@ impl NativeTicketQueue {
 struct NativeWritePipeline {
     budget: Arc<NativeWriteBudget>,
     metadata: Arc<NativeMetadataBudget>,
-    runtime: Option<tokio::runtime::Handle>,
+    runtime: tokio::runtime::Handle,
     notify: Arc<tokio::sync::Notify>,
     metrics: Option<crate::node::read_work::ReadWorkMetrics>,
     closed: AtomicBool,
@@ -2279,7 +2279,7 @@ impl NativeWritePipeline {
     fn new(
         budget: Arc<NativeWriteBudget>,
         config: NativeWriteConfig,
-        runtime: Option<tokio::runtime::Handle>,
+        runtime: tokio::runtime::Handle,
         metrics: Option<crate::node::read_work::ReadWorkMetrics>,
     ) -> Self {
         let notify = Arc::new(tokio::sync::Notify::new());
@@ -2750,16 +2750,9 @@ impl DistributedFs {
     ) -> Self {
         let node_id = node_id.into();
         let session_id = session_id.into();
-        let native_pipeline = (!read_engine.has_external_backend()
-            && !chunk_store.supports_deferred_put())
-        .then(|| {
-            Arc::new(NativeWritePipeline::new(
-                NativeWriteBudget::new(64 * 1024 * 1024),
-                NativeWriteConfig::default(),
-                None,
-                None,
-            ))
-        });
+        // 原生存储的写流水线由装配方用 `with_native_write_pipeline` 装上（需要 Node runtime）；
+        // 构造时不装，避免出现只在测试里存在的"无 runtime 流水线"。
+        let native_pipeline = None;
         #[cfg(not(test))]
         let pending_trace = PendingTrace::from_env(&namespace_id.0, &node_id, &session_id);
         #[cfg(test)]
@@ -2913,10 +2906,7 @@ impl DistributedFs {
             return Err(invalid("invalid native write pipeline configuration"));
         }
         self.native_pipeline = Some(Arc::new(NativeWritePipeline::new(
-            budget,
-            config,
-            Some(runtime),
-            metrics,
+            budget, config, runtime, metrics,
         )));
         self.observe_native_resources();
         Ok(self)
@@ -3198,13 +3188,7 @@ impl DistributedFs {
                             }
                             if descriptor.is_none() {
                                 self.request_native_pressure(&cell, true)?;
-                                let progressed = self.progress_native_writeback()?;
-                                if pipeline.runtime.is_none() && progressed == 0 {
-                                    return Err(Error::coded(
-                                        afs_error::IO_CAPACITY,
-                                        "native descriptor admission needs externally driven writeback or a Node runtime",
-                                    ));
-                                }
+                                self.progress_native_writeback()?;
                                 let epoch = pipeline.budget.snapshot().epoch;
                                 pipeline
                                     .budget
@@ -3240,22 +3224,8 @@ impl DistributedFs {
                                 }
                             }
                             NativeWriteAdmission::Wait { epoch } => {
-                                if pipeline.runtime.is_none() {
-                                    while let Some(upload) =
-                                        Self::next_native_upload_for_cell(&cell)?
-                                    {
-                                        self.wait_native_upload(&upload)?;
-                                    }
-                                }
                                 self.request_native_pressure(&cell, false)?;
                                 self.progress_native_writeback()?;
-                                if pipeline.runtime.is_none()
-                                    && pipeline.budget.snapshot().epoch == epoch
-                                {
-                                    return Err(unavailable(
-                                        "native admission needs externally driven writeback or a Node runtime",
-                                    ));
-                                }
                                 pipeline
                                     .budget
                                     .wait_for_change(epoch, Duration::from_millis(10));
@@ -3524,7 +3494,7 @@ impl DistributedFs {
         Ok(None)
     }
 
-    fn start_native_upload(&self, upload: &Arc<NativeUpload>, blocking: bool) -> Result<bool> {
+    fn start_native_upload(&self, upload: &Arc<NativeUpload>) -> Result<bool> {
         let pipeline = self
             .native_pipeline
             .as_ref()
@@ -3543,9 +3513,6 @@ impl DistributedFs {
         let Some(body) = state.body.clone() else {
             return Err(unavailable("native upload lost its body"));
         };
-        if pipeline.runtime.is_none() && !blocking {
-            return Ok(false);
-        }
         let mut task_table = pipeline
             .tasks
             .lock()
@@ -3579,25 +3546,9 @@ impl DistributedFs {
         if staged.chunk != upload.chunk {
             return Err(invalid("native upload changed its immutable object"));
         }
-        if let Some(runtime) = &pipeline.runtime {
-            let notify = pipeline.notify.clone();
-            state.task = Some(runtime.spawn_blocking(move || {
-                let _permit = permit;
-                let result = store
-                    .put_native_batch(vec![staged])
-                    .and_then(|mut receipts| {
-                        if receipts.len() != 1 {
-                            return Err(invalid("native upload returned the wrong receipt count"));
-                        }
-                        Ok(receipts.remove(0))
-                    });
-                notify.notify_one();
-                result
-            }));
-            task_table.push(upload.clone());
-        } else {
-            drop(state);
-            drop(task_table);
+        let notify = pipeline.notify.clone();
+        state.task = Some(pipeline.runtime.spawn_blocking(move || {
+            let _permit = permit;
             let result = store
                 .put_native_batch(vec![staged])
                 .and_then(|mut receipts| {
@@ -3606,11 +3557,10 @@ impl DistributedFs {
                     }
                     Ok(receipts.remove(0))
                 });
-            drop(permit);
-            if let Some(error) = self.install_native_receipt(upload, result)? {
-                return Err(error);
-            }
-        }
+            notify.notify_one();
+            result
+        }));
+        task_table.push(upload.clone());
         Ok(true)
     }
 
@@ -3745,8 +3695,6 @@ impl DistributedFs {
             if let Some(task) = task {
                 let result = pipeline
                     .runtime
-                    .as_ref()
-                    .ok_or_else(|| unavailable("native upload runtime is missing"))?
                     .block_on(task)
                     .map_err(|error| unavailable(format!("native upload worker failed: {error}")))
                     .and_then(|result| result);
@@ -3790,7 +3738,7 @@ impl DistributedFs {
 
     fn start_native_uploads(&self) -> Result<()> {
         while let Some(upload) = self.next_native_upload()? {
-            if !self.start_native_upload(&upload, false)? {
+            if !self.start_native_upload(&upload)? {
                 break;
             }
         }
@@ -3815,24 +3763,7 @@ impl DistributedFs {
                     return Err(error);
                 }
             }
-            if let Err(error) = self.start_native_upload(upload, true) {
-                // A synchronous (no-runtime) upload already delivered this
-                // failure to its caller. Keep the immutable object for retry,
-                // but do not report the same attempt twice.
-                if self
-                    .native_pipeline
-                    .as_ref()
-                    .is_some_and(|pipeline| pipeline.runtime.is_none())
-                {
-                    upload
-                        .state
-                        .lock()
-                        .map_err(|_| unavailable("native upload state is poisoned"))?
-                        .error
-                        .take();
-                }
-                return Err(error);
-            }
+            self.start_native_upload(upload)?;
             let state = upload
                 .state
                 .lock()
@@ -9196,6 +9127,10 @@ impl DirtyExtentMap {
         }
     }
 
+    /// Test driver for map-level index and builder tests. Production native writes
+    /// go through `write_native_prepared`; the pipeline-less native write path that
+    /// used this was removed in S1a-1 (R53), and R33 decides its fate in S1b.
+    #[cfg(test)]
     fn write_native_at(
         &mut self,
         offset: u64,
@@ -12249,48 +12184,40 @@ impl Backend for DistributedFs {
         if self.native_pipeline.is_some() {
             return self.native_ordinary_write(handle, &snapshot, state, offset, data, options);
         }
-        let deferred_publication = self.deferred_publication_enabled();
-        let mut use_deferred_publication = deferred_publication;
-        let _deferred_write_gate = if deferred_publication {
-            Some(
-                self.write_pipeline_budget_gate
-                    .lock()
-                    .map_err(|_| unavailable("DFS write pipeline budget gate is poisoned"))?,
-            )
-        } else {
-            None
-        };
-        let _operation = self.begin_inode_operation(&snapshot.inode_id, state.clone())?;
-        if deferred_publication {
-            loop {
-                let (drain_before_deferred, starts_at_eof) = {
-                    let state = state
-                        .lock()
-                        .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-                    let append = snapshot.flags & libc::O_APPEND != 0;
-                    let starts_at_eof = append || offset == state.logical_length;
-                    let has_legacy_dirty =
-                        state.publication_window.is_none() && !state.dirty_extents.is_empty();
-                    let conflicting_window = state.publication_window.is_some() && !starts_at_eof;
-                    (has_legacy_dirty || conflicting_window, starts_at_eof)
-                };
-                if !drain_before_deferred {
-                    use_deferred_publication = starts_at_eof;
-                    break;
-                }
-                match self
-                    .commit_inode_inside_operation(&snapshot.inode_id, CommitReason::DataSync)?
-                {
-                    Some(committed_seq) => {
-                        self.update_handles_after_commit(&snapshot.inode_id, committed_seq)?;
-                    }
-                    None => {
-                        use_deferred_publication = false;
-                        break;
-                    }
-                }
-            }
+        if !self.deferred_publication_enabled() {
+            return Err(unavailable(
+                "DFS native storage has no native write pipeline configured",
+            ));
         }
+        // From here on only the S3 backend writes: EOF writes use the deferred
+        // publication window, other writes land in the dirty-extent map.
+        let _deferred_write_gate = self
+            .write_pipeline_budget_gate
+            .lock()
+            .map_err(|_| unavailable("DFS write pipeline budget gate is poisoned"))?;
+        let _operation = self.begin_inode_operation(&snapshot.inode_id, state.clone())?;
+        let use_deferred_publication = loop {
+            let (drain_before_deferred, starts_at_eof) = {
+                let state = state
+                    .lock()
+                    .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                let append = snapshot.flags & libc::O_APPEND != 0;
+                let starts_at_eof = append || offset == state.logical_length;
+                let has_legacy_dirty =
+                    state.publication_window.is_none() && !state.dirty_extents.is_empty();
+                let conflicting_window = state.publication_window.is_some() && !starts_at_eof;
+                (has_legacy_dirty || conflicting_window, starts_at_eof)
+            };
+            if !drain_before_deferred {
+                break starts_at_eof;
+            }
+            match self.commit_inode_inside_operation(&snapshot.inode_id, CommitReason::DataSync)? {
+                Some(committed_seq) => {
+                    self.update_handles_after_commit(&snapshot.inode_id, committed_seq)?;
+                }
+                None => break false,
+            }
+        };
         let span = tracing::info_span!(
             "node.dfs.write",
             inode_id = %snapshot.inode_id.0,
@@ -12376,9 +12303,7 @@ impl Backend for DistributedFs {
                     )
                     .unwrap_or(usize::MAX),
                 );
-                if deferred_publication {
-                    take = take.min(COMMIT_CHUNK_BYTES as usize);
-                }
+                take = take.min(COMMIT_CHUNK_BYTES as usize);
                 if use_deferred_publication {
                     let pending = state
                         .publication_window
@@ -12388,7 +12313,7 @@ impl Backend for DistributedFs {
                 }
                 take
             };
-            let requested_deferred_reservation = if deferred_publication {
+            let requested_deferred_reservation = {
                 let admission = (|| {
                     let factor = if use_deferred_publication { 1 } else { 2 };
                     let raw = self.write_pipeline_budget.reserve_normal(
@@ -12414,7 +12339,7 @@ impl Backend for DistributedFs {
                     Ok((raw, pending))
                 })();
                 match admission {
-                    Ok(reservation) => Some(reservation),
+                    Ok(reservation) => reservation,
                     Err(error) => {
                         match self.commit_inode_inside_operation(
                             &snapshot.inode_id,
@@ -12448,15 +12373,11 @@ impl Backend for DistributedFs {
                         }
                     }
                 }
-            } else {
-                None
             };
             let (written, seq, over_budget) = {
+                let (raw_reservation, pending_request) = requested_deferred_reservation;
                 let (mut deferred_reservation, mut pending_reservation) =
-                    match requested_deferred_reservation {
-                        Some((raw, pending)) => (Some(raw), pending),
-                        None => (None, None),
-                    };
+                    (Some(raw_reservation), pending_request);
                 let mut state = state
                     .lock()
                     .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
@@ -12517,18 +12438,7 @@ impl Backend for DistributedFs {
                     }
                     written
                 } else {
-                    let logical_length = state.logical_length;
-                    let written = if deferred_publication {
-                        state.dirty_extents.write_at(file_offset, chunk, next_seq)?
-                    } else {
-                        state.dirty_extents.write_native_at(
-                            file_offset,
-                            chunk,
-                            next_seq,
-                            &self.write_buffer_pool,
-                            logical_length,
-                        )?
-                    };
+                    let written = state.dirty_extents.write_at(file_offset, chunk, next_seq)?;
                     if let Some(reservation) = deferred_reservation.take() {
                         state
                             .dirty_extents
@@ -15775,6 +15685,9 @@ mod tests {
             2,
             "both tails reached real durable storage"
         );
+        // R56：生产模式下同一次上传失败对同一句柄报告两次；先取走重复的那次（经后台错误游标，
+        // 由下一次句柄操作报告）。R56 修复时删掉这一步。
+        assert!(fs.fsync(&context(), file.handle, SyncMode::Full).is_err());
         let inode_id = meta.inode.lock().unwrap().inode_id.clone();
         let cell = fs.write_state(&inode_id).unwrap().unwrap();
         {
@@ -15918,8 +15831,52 @@ mod tests {
         let meta = Arc::new(RecordingMeta::new());
         let temp = tempfile::tempdir().unwrap();
         let chunks = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
-        let fs = distributed_fs_with_chunk_store(meta.clone(), chunks.clone(), chunks, budget);
+        let store = Arc::new(LocalRequiredChunkStore(chunks.clone()));
+        let fs = distributed_fs_with_chunk_store(meta.clone(), chunks, store, budget);
         (temp, meta, fs)
+    }
+
+    /// 生产默认（单副本、`dfs_local_copy = "required"`）下 `DfsChunkStore` 给 native 上传的回执标
+    /// `local_required_and_durable`，上传完成即释放内存正文；测试的本地仓同样标记，
+    /// 否则测的是"非本地副本、正文保留到发布"那一支。
+    struct LocalRequiredChunkStore(Arc<LocalChunkStore>);
+
+    impl ChunkStore for LocalRequiredChunkStore {
+        fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
+            self.0.put_batch(staged)
+        }
+        fn put_native_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<NativeChunkReceipt>> {
+            self.0.put_batch(staged).map(|receipts| {
+                receipts
+                    .into_iter()
+                    .map(|receipt| NativeChunkReceipt {
+                        receipt,
+                        local_required_and_durable: true,
+                    })
+                    .collect()
+            })
+        }
+        fn read_native_uploaded_at(
+            &self,
+            receipt: &ChunkReceipt,
+            offset: u64,
+            out: &mut [u8],
+        ) -> Result<usize> {
+            self.0
+                .open_receipt_reader(&receipt.chunk)?
+                .read_at(offset, out)
+        }
+        fn read_at(
+            &self,
+            chunk: &crate::dfs::ChunkId,
+            offset: u64,
+            out: &mut [u8],
+        ) -> Result<usize> {
+            self.0.read_at(chunk, offset, out)
+        }
+        fn capacity(&self) -> Result<FilesystemCapacity> {
+            ChunkStore::capacity(self.0.as_ref())
+        }
     }
 
     fn distributed_fs_with_chunk_store(
@@ -15936,7 +15893,8 @@ mod tests {
             Arc::new(crate::node::dfs_read::UnimplementedChunkTransfer),
             crate::node::dfs_read::DfsReadConfig::default(),
         ));
-        DistributedFs::new(
+        // `budget` 只作用于 S3 写路径（`dirty_budget_bytes`）；native 写路径用生产默认预算。
+        test_dfs_new(
             NamespaceId::new("default"),
             "node-a",
             "session-a",
@@ -15946,6 +15904,62 @@ mod tests {
         )
         .with_dirty_budget_bytes(budget)
     }
+
+    /// 测试共享的 Node runtime：生产里 native 上传跑在 Node 的 tokio runtime 上。
+    fn test_node_runtime() -> tokio::runtime::Handle {
+        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        RUNTIME
+            .get_or_init(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .unwrap()
+            })
+            .handle()
+            .clone()
+    }
+
+    /// 与生产装配一致（`node.rs` 原生存储分支）：原生存储一律装带 runtime 的 native 写流水线，
+    /// 配置取生产默认值；S3 后端不装。`DistributedFs::new` 默认的无 runtime 流水线只在测试里出现，
+    /// 不代表生产行为（R53）。
+    fn test_dfs_new(
+        namespace_id: NamespaceId,
+        node_id: impl Into<String>,
+        session_id: impl Into<String>,
+        meta: Arc<dyn DfsMeta>,
+        chunk_store: Arc<dyn ChunkStore>,
+        read_engine: Arc<DfsReadEngine>,
+    ) -> DistributedFs {
+        let native_storage =
+            !read_engine.has_external_backend() && !chunk_store.supports_deferred_put();
+        let fs = DistributedFs::new(
+            namespace_id,
+            node_id,
+            session_id,
+            meta,
+            chunk_store,
+            read_engine,
+        );
+        if !native_storage {
+            return fs;
+        }
+        fs.with_native_write_pipeline(
+            NativeWriteBudget::new(PRODUCTION_NATIVE_BUDGET_BYTES as usize),
+            NativeWriteConfig {
+                unpublished_descriptors: PRODUCTION_UNPUBLISHED_DESCRIPTORS,
+                upload_inflight_chunks: PRODUCTION_UPLOAD_INFLIGHT_CHUNKS,
+            },
+            test_node_runtime(),
+            None,
+        )
+        .unwrap()
+    }
+
+    /// 生产 `dfs_dirty_budget_bytes`、`dfs_unpublished_descriptors`、`dfs_upload_inflight_chunks` 的默认值。
+    const PRODUCTION_NATIVE_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+    const PRODUCTION_UNPUBLISHED_DESCRIPTORS: usize = 1024;
+    const PRODUCTION_UPLOAD_INFLIGHT_CHUNKS: usize = 8;
 
     fn test_fs_with_native_authority() -> (
         tempfile::TempDir,
@@ -15971,7 +15985,7 @@ mod tests {
             )
             .with_read_authority(authority.clone()),
         );
-        let fs = DistributedFs::new(
+        let fs = test_dfs_new(
             NamespaceId::new("default"),
             "node-a",
             "session-a",
@@ -16287,7 +16301,7 @@ mod tests {
             )
             .with_external_backend(fixture.clone(), fixture.clone()),
         );
-        let fs = DistributedFs::new(
+        let fs = test_dfs_new(
             NamespaceId::new("default"),
             "node-a",
             "session-a",
@@ -18085,7 +18099,7 @@ mod tests {
         let pipeline = Arc::new(NativeWritePipeline::new(
             NativeWriteBudget::new(4 * 1024 * 1024),
             NativeWriteConfig::default(),
-            None,
+            test_node_runtime(),
             None,
         ));
         let mut queue = NativeTicketQueue::default();
@@ -18373,38 +18387,6 @@ mod tests {
     }
 
     #[test]
-    fn p2_w2_no_runtime_constructor_requires_explicit_writeback_without_waiting_forever() {
-        let (_temp, meta, mut fs) = test_fs();
-        fs.native_pipeline = Some(Arc::new(NativeWritePipeline::new(
-            NativeWriteBudget::new(4 * 1024 * 1024),
-            NativeWriteConfig::default(),
-            None,
-            None,
-        )));
-        let file = fs
-            .create(
-                &context(),
-                fs.root_inode(),
-                OsStr::new("w2-no-runtime"),
-                0o640,
-                libc::O_RDWR,
-            )
-            .unwrap();
-        fs.write(&context(), file.handle, 0, b"a").unwrap();
-        let error = fs.write(&context(), file.handle, 4096, b"b").unwrap_err();
-        assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE);
-        assert!(error.to_string().contains("externally driven writeback"));
-        assert!(
-            meta.commits.lock().unwrap().is_empty(),
-            "Required live pressure alone must not add a publication entry"
-        );
-        fs.writeback_pending().unwrap();
-        assert_eq!(fs.write(&context(), file.handle, 4096, b"b").unwrap(), 1);
-        fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
-        fs.release(&context(), file.handle).unwrap();
-    }
-
-    #[test]
     fn p2_w2_empty_generation_truncate_then_extend_fsync_keeps_holes_and_eof() {
         for size in [4096, 4 * 1024 * 1024] {
             let (_temp, meta, fs, _runtime, _store) =
@@ -18460,56 +18442,6 @@ mod tests {
             );
             fs.release(&context(), file.handle).unwrap();
         }
-    }
-
-    #[test]
-    fn p2_w2_no_runtime_shared_descriptor_pressure_requires_external_progress() {
-        let (_first_temp, first_meta, mut first) = test_fs();
-        let (_second_temp, second_meta, mut second) = test_fs();
-        second_meta.inode.lock().unwrap().inode_id = InodeId::new("inode:second");
-        second_meta.lease.lock().unwrap().inode_id = InodeId::new("inode:second");
-        let pipeline = Arc::new(NativeWritePipeline::new(
-            NativeWriteBudget::new(8 * 1024 * 1024),
-            NativeWriteConfig {
-                unpublished_descriptors: 1,
-                upload_inflight_chunks: 1,
-            },
-            None,
-            None,
-        ));
-        first.native_pipeline = Some(pipeline.clone());
-        second.native_pipeline = Some(pipeline.clone());
-        let a = first
-            .create(
-                &context(),
-                first.root_inode(),
-                OsStr::new("w2-owner-a"),
-                0o640,
-                libc::O_RDWR,
-            )
-            .unwrap();
-        let b = second
-            .create(
-                &context(),
-                second.root_inode(),
-                OsStr::new("w2-owner-b"),
-                0o640,
-                libc::O_RDWR,
-            )
-            .unwrap();
-        first.write(&context(), a.handle, 0, b"a").unwrap();
-        let error = second.write(&context(), b.handle, 0, b"b").unwrap_err();
-        assert_eq!(error.code(), afs_error::IO_CAPACITY);
-        assert!(error.to_string().contains("externally driven writeback"));
-        assert!(first_meta.commits.lock().unwrap().is_empty());
-        assert!(second_meta.commits.lock().unwrap().is_empty());
-        assert_eq!(pipeline.metadata.state.lock().unwrap().descriptors, 1);
-        first.writeback_pending().unwrap();
-        assert_eq!(second.write(&context(), b.handle, 0, b"b").unwrap(), 1);
-        second.fsync(&context(), b.handle, SyncMode::Full).unwrap();
-        assert_eq!(pipeline.metadata.state.lock().unwrap().descriptors, 0);
-        first.release(&context(), a.handle).unwrap();
-        second.release(&context(), b.handle).unwrap();
     }
 
     #[test]
@@ -18647,28 +18579,25 @@ mod tests {
         assert_eq!(b_meta.commits.lock().unwrap()[1].file_version.length, 8);
     }
 
+    /// 生产模式下 Node 级的上传轮询可能收割另一个 inode 的上传结果，失败只能归属到它自己的 inode：
+    /// B 的写入与 fsync 不报告 A 的上传失败；A 的 fsync 报告该失败，重试后提交。
     #[test]
-    fn p2_review_no_runtime_wait_never_consumes_another_inode_upload_error() {
-        let (_a_temp, a_meta, mut a_fs, _runtime, store) =
-            native_pipeline_fixture(false, 4 * 1024 * 1024, 8);
+    fn p2_review_node_wide_poll_never_reports_another_inode_upload_error() {
+        // Room for A's retained 4 MiB body plus B: without the Node's background
+        // commit loop nothing retries A, so a shared 4 MiB budget would park B.
+        let (_a_temp, a_meta, a_fs, _runtime, store) =
+            native_pipeline_fixture(false, 8 * 1024 * 1024, 8);
         let (_b_temp, b_meta, mut b_fs) = test_fs();
-        b_meta.inode.lock().unwrap().inode_id = InodeId::new("inode:no-runtime-b");
-        b_meta.lease.lock().unwrap().inode_id = InodeId::new("inode:no-runtime-b");
-        let pipeline = Arc::new(NativeWritePipeline::new(
-            NativeWriteBudget::new(4 * 1024 * 1024),
-            NativeWriteConfig::default(),
-            None,
-            None,
-        ));
-        a_fs.native_pipeline = Some(pipeline.clone());
-        b_fs.native_pipeline = Some(pipeline.clone());
+        b_meta.inode.lock().unwrap().inode_id = InodeId::new("inode:shared-poll-b");
+        b_meta.lease.lock().unwrap().inode_id = InodeId::new("inode:shared-poll-b");
+        b_fs.native_pipeline = a_fs.native_pipeline.clone();
         b_fs.chunk_store = store.clone();
         b_fs.next_operation.store(10_000, Ordering::SeqCst);
         let a = a_fs
             .create(
                 &context(),
                 a_fs.root_inode(),
-                OsStr::new("no-runtime-a"),
+                OsStr::new("shared-poll-a"),
                 0o640,
                 libc::O_RDWR,
             )
@@ -18677,52 +18606,48 @@ mod tests {
             .create(
                 &context(),
                 b_fs.root_inode(),
-                OsStr::new("no-runtime-b"),
+                OsStr::new("shared-poll-b"),
                 0o640,
                 libc::O_RDWR,
             )
             .unwrap();
         let a_id = a_fs.inode_id(a.entry.inode).unwrap();
         let a_cell = a_fs.write_state(&a_id).unwrap().unwrap();
-        // The existing single-inode Meta fixture uses separate facades; share
-        // its real cell as well as the store/pipeline to exercise a Node-wide scan.
-        b_fs.inode_writes.insert(a_id, a_cell.clone()).unwrap();
+        // The single-inode Meta fixture uses separate facades; share A's real cell
+        // as well as the store/pipeline so B's poll scans a Node-wide task table.
+        b_fs.inode_writes.insert(a_id, a_cell).unwrap();
+        store.fail_next.store(true, Ordering::SeqCst);
         a_fs.write(&context(), a.handle, 0, &vec![0x48; 4 * 1024 * 1024])
             .unwrap();
-        let upload = a_fs.next_native_upload().unwrap().unwrap();
-        let operation = upload.operation_id.clone();
-        let chunk = upload.chunk.clone();
-        store.fail_next.store(true, Ordering::SeqCst);
-        let error = b_fs.write(&context(), b.handle, 0, b"b").unwrap_err();
-        assert!(
-            error.to_string().contains("externally driven writeback"),
-            "B must report its own capacity limitation rather than A's upload failure: {error}"
-        );
-        assert_eq!(
-            store.calls.load(Ordering::SeqCst),
-            0,
-            "B must not execute A's failing synchronous upload"
-        );
-        assert!(upload.state.lock().unwrap().error.is_none());
-        assert!(a_meta.commits.lock().unwrap().is_empty());
-        assert!(b_meta.commits.lock().unwrap().is_empty());
-        assert!(
-            a_fs.fsync(&context(), a.handle, SyncMode::Full)
-                .unwrap_err()
-                .to_string()
-                .contains("injected native upload failure")
-        );
-        assert!(a_meta.commits.lock().unwrap().is_empty());
-        a_fs.fsync(&context(), a.handle, SyncMode::Full).unwrap();
-        assert_eq!(a_meta.commits.lock().unwrap()[0].operation_id, operation);
-        assert_eq!(
-            a_meta.commits.lock().unwrap()[0].chunk_receipts[0].chunk,
-            chunk
-        );
-        drop(upload);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while store.calls.load(Ordering::SeqCst) == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "A's full chunk upload never started"
+            );
+            a_fs.progress_native_writeback().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
         assert_eq!(b_fs.write(&context(), b.handle, 0, b"b").unwrap(), 1);
         b_fs.fsync(&context(), b.handle, SyncMode::Full).unwrap();
         assert_eq!(b_meta.commits.lock().unwrap().len(), 1);
+        assert!(a_meta.commits.lock().unwrap().is_empty());
+        // R56: the same failure can be reported twice to A's handle; it must be
+        // reported at least once and must never reach B.
+        let mut a_failures = 0;
+        while let Err(error) = a_fs.fsync(&context(), a.handle, SyncMode::Full) {
+            assert!(
+                error.to_string().contains("injected native upload failure"),
+                "{error}"
+            );
+            a_failures += 1;
+            assert!(
+                a_failures <= 2,
+                "one upload failure reported more than twice"
+            );
+        }
+        assert!(a_failures >= 1);
+        assert_eq!(a_meta.commits.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -18814,7 +18739,7 @@ mod tests {
             output, [0xa5; 16],
             "terminal diagnostic receipt must not enable a read"
         );
-        assert!(fs.start_native_upload(&upload, true).is_err());
+        assert!(fs.start_native_upload(&upload).is_err());
         let before = Instant::now();
         for _ in 0..2 {
             assert!(fs.wait_native_upload(&upload).is_err());
@@ -19161,6 +19086,75 @@ mod tests {
     fn native_builder_preupload_retry_preserves_object_but_layout_excludes_old_tail_and_patch() {
         native_preupload_retry_with_integrity(false);
     }
+    /// S1a-1 特征测试（R56，S2 修）：生产模式（带 runtime 的 native 流水线）下，一次后台上传
+    /// 失败对同一句柄报告两次：一次由等待该上传的 fsync 取走，一次经 inode 的后台错误游标由下一次
+    /// 句柄操作报告。之后重试成功；之后打开的句柄不受影响。修复时改为只报告一次。
+    #[test]
+    fn s1a_native_upload_failure_is_reported_twice_to_the_same_handle_today() {
+        struct FailOnceStore {
+            inner: Arc<LocalChunkStore>,
+            fail: AtomicBool,
+        }
+        impl ChunkStore for FailOnceStore {
+            fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
+                if self.fail.swap(false, Ordering::SeqCst) {
+                    return Err(unavailable("injected upload failure"));
+                }
+                self.inner.put_batch(staged)
+            }
+            fn read_at(
+                &self,
+                chunk_id: &crate::dfs::ChunkId,
+                offset: u64,
+                out: &mut [u8],
+            ) -> Result<usize> {
+                self.inner.read_at(chunk_id, offset, out)
+            }
+        }
+        let meta = Arc::new(RecordingMeta::new());
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let store = Arc::new(FailOnceStore {
+            inner: local.clone(),
+            fail: AtomicBool::new(true),
+        });
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local,
+            store,
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let created = fs
+            .create(
+                &context(),
+                fs.root_inode(),
+                OsStr::new("twice.bin"),
+                0o640,
+                libc::O_RDWR,
+            )
+            .unwrap();
+        let data = vec![5; COMMIT_CHUNK_BYTES as usize];
+        let reports = usize::from(fs.write(&context(), created.handle, 0, &data).is_err())
+            + (0..2)
+                .filter(|_| {
+                    fs.fsync(&context(), created.handle, SyncMode::Full)
+                        .is_err()
+                })
+                .count();
+        assert_eq!(
+            reports, 2,
+            "one upload failure, reported twice to one handle"
+        );
+        assert_eq!(meta.commit_count(), 0);
+        fs.fsync(&context(), created.handle, SyncMode::Full)
+            .unwrap();
+        assert_eq!(meta.commit_count(), 1);
+        let other = fs
+            .open(&context(), created.entry.inode, libc::O_RDWR)
+            .unwrap();
+        fs.fsync(&context(), other, SyncMode::Full).unwrap();
+    }
+
     #[test]
     fn crc32c_native_preupload_retry_preserves_immutable_id() {
         native_preupload_retry_with_integrity(true);
@@ -19220,7 +19214,16 @@ mod tests {
         let half = COMMIT_CHUNK_BYTES as usize / 2;
         let mut original = vec![5; COMMIT_CHUNK_BYTES as usize];
         original[half..].fill(9);
-        fs.write(&context(), created.handle, 0, &original).unwrap();
+        // 生产模式（带 runtime）下满块在写入期间就开始后台上传，注入的失败可能先由 write 观察到，
+        // 也可能由 fsync 报告；两处都是合法的错误出口。要求的是失败一定被报告且不产生提交。
+        if fs.write(&context(), created.handle, 0, &original).is_ok() {
+            assert!(
+                fs.fsync(&context(), created.handle, SyncMode::Full)
+                    .is_err()
+            );
+        }
+        // R56：生产模式下同一次上传失败对同一句柄报告两次（上传等待一次、后台错误游标一次）。
+        // 这里先把重复的那次报告取走；R56 修复时删掉这一步。
         assert!(
             fs.fsync(&context(), created.handle, SyncMode::Full)
                 .is_err()
@@ -19824,7 +19827,7 @@ mod tests {
         (
             meta.clone(),
             chunks.clone(),
-            DistributedFs::new(
+            test_dfs_new(
                 NamespaceId::new("default"),
                 node_id,
                 session_id,
@@ -24200,7 +24203,7 @@ mod tests {
             owner: fs_a.clone(),
             peer: "node-b".into(),
         }) as Arc<dyn RemoteDfsOwner>;
-        let fs_b = DistributedFs::new(
+        let fs_b = test_dfs_new(
             NamespaceId::new("default"),
             "node-b",
             "session-b",
@@ -24270,7 +24273,7 @@ mod tests {
             owner: fs_a.clone(),
             peer: "node-b".into(),
         }) as Arc<dyn RemoteDfsOwner>;
-        let fs_b = DistributedFs::new(
+        let fs_b = test_dfs_new(
             NamespaceId::new("default"),
             "node-b",
             "session-b",
@@ -24365,7 +24368,7 @@ mod tests {
             owner: fs_a.clone(),
             peer: "node-b".into(),
         }) as Arc<dyn RemoteDfsOwner>;
-        let fs_b = DistributedFs::new(
+        let fs_b = test_dfs_new(
             NamespaceId::new("default"),
             "node-b",
             "session-b",
@@ -24424,7 +24427,7 @@ mod tests {
         ));
         let remote_owner = scripted.clone() as Arc<dyn RemoteDfsOwner>;
         let fs_b = Arc::new(
-            DistributedFs::new(
+            test_dfs_new(
                 NamespaceId::new("default"),
                 "node-b",
                 "session-b",
@@ -24495,7 +24498,7 @@ mod tests {
         scripted.set_read_pause(read_pause.clone());
         let remote_owner = scripted.clone() as Arc<dyn RemoteDfsOwner>;
         let fs_b = Arc::new(
-            DistributedFs::new(
+            test_dfs_new(
                 NamespaceId::new("default"),
                 "node-b",
                 "session-b",
@@ -24617,7 +24620,7 @@ mod tests {
             owner: fs_a.clone(),
             peer: "node-b".into(),
         }) as Arc<dyn RemoteDfsOwner>;
-        let fs_b = DistributedFs::new(
+        let fs_b = test_dfs_new(
             NamespaceId::new("default"),
             "node-b",
             "session-b",
@@ -24689,7 +24692,7 @@ mod tests {
             ))],
         ));
         let remote_owner = scripted.clone() as Arc<dyn RemoteDfsOwner>;
-        let fs_b = DistributedFs::new(
+        let fs_b = test_dfs_new(
             NamespaceId::new("default"),
             "node-b",
             "session-b",
@@ -24748,7 +24751,7 @@ mod tests {
             ))],
         ));
         let remote_owner = scripted.clone() as Arc<dyn RemoteDfsOwner>;
-        let fs_b = DistributedFs::new(
+        let fs_b = test_dfs_new(
             NamespaceId::new("default"),
             "node-b",
             "session-b",
@@ -25082,7 +25085,7 @@ mod tests {
             owner: fs_a.clone(),
             peer: "node-b".into(),
         }) as Arc<dyn RemoteDfsOwner>;
-        let fs_b = DistributedFs::new(
+        let fs_b = test_dfs_new(
             NamespaceId::new("default"),
             "node-b",
             "session-b",
@@ -25554,7 +25557,7 @@ mod tests {
             second_entered_tx,
         ));
         let fs_b = Arc::new(
-            DistributedFs::new(
+            test_dfs_new(
                 NamespaceId::new("default"),
                 "node-b",
                 "session-b",
@@ -25653,7 +25656,7 @@ mod tests {
                 "injected open ACK loss",
             ))],
         ));
-        let fs_b = DistributedFs::new(
+        let fs_b = test_dfs_new(
             NamespaceId::new("default"),
             "node-b",
             "session-b",
@@ -25715,7 +25718,7 @@ mod tests {
                 ScriptedOpenAction::DelegateThenErr(unavailable("injected companion ACK loss")),
             ],
         ));
-        let fs_b = DistributedFs::new(
+        let fs_b = test_dfs_new(
             NamespaceId::new("default"),
             "node-b",
             "session-b",
@@ -25892,7 +25895,7 @@ mod tests {
             peer: "node-b".into(),
         }) as Arc<dyn RemoteDfsOwner>;
         let fs_b = Arc::new(
-            DistributedFs::new(
+            test_dfs_new(
                 NamespaceId::new("default"),
                 "node-b",
                 "session-b",
@@ -26006,7 +26009,7 @@ mod tests {
         }) as Arc<dyn RemoteDfsOwner>;
         let scripted = Arc::new(ScriptedReleaseRemoteDfsOwner::new(loopback, Vec::new()));
         let remote_owner = scripted.clone() as Arc<dyn RemoteDfsOwner>;
-        let fs_b = DistributedFs::new(
+        let fs_b = test_dfs_new(
             NamespaceId::new("default"),
             "node-b",
             "session-b",
@@ -26103,7 +26106,7 @@ mod tests {
             Arc::new(crate::node::dfs_read::UnimplementedChunkTransfer),
             crate::node::dfs_read::DfsReadConfig::default(),
         ));
-        let fs_b = Arc::new(DistributedFs::new(
+        let fs_b = Arc::new(test_dfs_new(
             NamespaceId::new("default"),
             "node-b",
             "session-b",
@@ -26172,7 +26175,7 @@ mod tests {
             owner: fs_a.clone(),
             peer: "node-b".into(),
         }) as Arc<dyn RemoteDfsOwner>;
-        let fs_b = DistributedFs::new(
+        let fs_b = test_dfs_new(
             NamespaceId::new("default"),
             "node-b",
             "session-b",
@@ -26956,7 +26959,7 @@ mod tests {
                     DfsReadConfig::default(),
                 ));
                 Arc::new(
-                    DistributedFs::new(
+                    test_dfs_new(
                         NamespaceId::new("default"),
                         "node-b",
                         "session-b",
@@ -27216,7 +27219,7 @@ mod tests {
                     .collect(),
                 Vec::new(),
             );
-            let fs = Arc::new(DistributedFs::new(
+            let fs = Arc::new(test_dfs_new(
                 NamespaceId::new("default"),
                 "node-a",
                 "session-a",

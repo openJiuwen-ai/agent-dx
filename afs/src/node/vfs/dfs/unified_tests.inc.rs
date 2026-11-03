@@ -46,7 +46,7 @@ fn unified_local_fs(
             .unwrap(),
         ));
     }
-    let fs = DistributedFs::new(
+    let fs = test_dfs_new(
         NamespaceId::new("default"),
         "node-a",
         "session-a",
@@ -128,12 +128,15 @@ async fn unified_native_dirty_overlay_sparse_reuse_eof_and_committed_view_match(
             libc::O_RDWR,
         )
         .unwrap();
-    fs.write(&context(), created.handle, 0, b"base").unwrap();
-    fs.fsync(&context(), created.handle, SyncMode::DataOnly)
-        .unwrap();
-    fs.write(&context(), created.handle, 65536, b"tail")
-        .unwrap();
-    fs.write(&context(), created.handle, 1, b"NEW").unwrap();
+    // 同步 Backend 接口在生产里跑在 FUSE 线程或 spawn_blocking 上，不在异步 worker 上。
+    tokio::task::block_in_place(|| {
+        fs.write(&context(), created.handle, 0, b"base").unwrap();
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+        fs.write(&context(), created.handle, 65536, b"tail")
+            .unwrap();
+        fs.write(&context(), created.handle, 1, b"NEW").unwrap();
+    });
     let reader = fs
         .open(&context(), created.entry.inode, libc::O_RDONLY)
         .unwrap();
@@ -144,8 +147,10 @@ async fn unified_native_dirty_overlay_sparse_reuse_eof_and_committed_view_match(
     let actual = unified_reply(&fs, reader, 0, 70000).await.unwrap();
     assert_eq!(&actual[..], &expected);
     drop(actual);
-    fs.fsync(&context(), created.handle, SyncMode::DataOnly)
-        .unwrap();
+    tokio::task::block_in_place(|| {
+        fs.fsync(&context(), created.handle, SyncMode::DataOnly)
+            .unwrap();
+    });
     // Recycle a nonzero private buffer, then verify sparse regions do not leak it.
     let actual = unified_reply(&fs, reader, 0, 70000).await.unwrap();
     assert_eq!(&actual[..], &expected);

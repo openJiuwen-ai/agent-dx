@@ -195,14 +195,27 @@ async fn real_dfs(temp: &std::path::Path) -> (Arc<DistributedFs>, tokio::task::J
             meta_client.clone(),
             replica_plane,
         ));
-    let dfs = Arc::new(DistributedFs::new(
-        namespace,
-        "node-a",
-        session_id,
-        meta_client,
-        chunk_store,
-        read_engine,
-    ));
+    // 生产装配给原生存储装带 runtime 的 native 写流水线（`node.rs`），这里按生产默认值装。
+    let dfs = Arc::new(
+        DistributedFs::new(
+            namespace,
+            "node-a",
+            session_id,
+            meta_client,
+            chunk_store,
+            read_engine,
+        )
+        .with_native_write_pipeline(
+            crate::node::chunk::NativeWriteBudget::new(64 * 1024 * 1024),
+            crate::node::vfs::dfs::NativeWriteConfig {
+                unpublished_descriptors: 1024,
+                upload_inflight_chunks: 8,
+            },
+            tokio::runtime::Handle::current(),
+            None,
+        )
+        .expect("native write pipeline"),
+    );
     (dfs, server)
 }
 
