@@ -856,7 +856,9 @@ async fn creates_conch_with_erofs_volume_and_fenced_execd_identity() {
 
 #[tokio::test]
 async fn supervisor_uses_native_cgroup_and_same_operation_is_not_replayed() {
-    let fixture = Fixture::new();
+    let mut fixture = Fixture::new();
+    fixture.config.classes.get_mut("supervisor").unwrap().policy =
+        json!({"cgroup":{"backend":"v1"}});
     let driver = fixture.driver().await;
     let wanted = spec("supervisor");
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -885,6 +887,7 @@ async fn supervisor_uses_native_cgroup_and_same_operation_is_not_replayed() {
     assert_eq!(body["sandbox_runtime"], "bwrap");
     assert_eq!(body["policy"]["cgroup"]["cpu_max"], json!("100000 100000"));
     assert_eq!(body["policy"]["cgroup"]["memory_max"], 134217728);
+    assert_eq!(body["policy"]["cgroup"]["backend"], "v1");
     let mut changed = wanted.clone();
     changed.env.insert("changed".into(), "value".into());
     assert!(matches!(
@@ -1716,5 +1719,15 @@ async fn errored_backend_phase_is_a_terminal_failure_and_is_cleaned() {
         assert!(!calls
             .iter()
             .any(|(_, p, _)| p.ends_with("/exec_background")));
+    }
+}
+
+#[tokio::test]
+async fn supervisor_rejects_unknown_cgroup_selector() {
+    let mut fixture = Fixture::new();
+    for mode in [json!("unknown"), json!(null), json!(7)] {
+        fixture.config.classes.get_mut("supervisor").unwrap().policy =
+            json!({"cgroup":{"backend":mode}});
+        assert!(fixture.config.validate().is_err());
     }
 }
