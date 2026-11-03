@@ -4471,26 +4471,58 @@ impl LocalOwnerFs {
                                         record.relative.as_path().as_os_str(),
                                         Some(&record.identity),
                                     )?;
-                                    let entries = remote.files.readdir(
+                                    let entries = match remote.files.readdir(
                                         &remote.grant,
                                         &directory,
                                         cookie,
                                         max_entries,
-                                    )?;
+                                    ) {
+                                        Ok(entries) => entries,
+                                        Err(error) => {
+                                            // Best effort: the original error must still
+                                            // drive the refresh retry.
+                                            let _ =
+                                                remote.files.releasedir(&remote.grant, directory);
+                                            return Err(error);
+                                        }
+                                    };
                                     refreshed_dir = Some(directory);
                                     Ok((remote.grant.clone(), remote.files.clone(), entries))
                                 },
                             )?;
-                            let mut state = self.state.lock().map_err(|_| poisoned())?;
-                            if let Some(directory) = state.dir_handles.get_mut(&handle) {
-                                directory.handle =
-                                    OpenLocalDirectory::Remote(OpenRemoteDirectory {
-                                        grant,
-                                        files,
-                                        handle: refreshed_dir.ok_or_else(|| {
-                                            stale("remote readdir did not reopen directory")
-                                        })?,
-                                    });
+                            let refreshed = OpenRemoteDirectory {
+                                grant,
+                                files,
+                                handle: refreshed_dir.ok_or_else(|| {
+                                    stale("remote readdir did not reopen directory")
+                                })?,
+                            };
+                            let previous = {
+                                let mut state = self.state.lock().map_err(|_| poisoned())?;
+                                state.dir_handles.get_mut(&handle).map(|slot| {
+                                    std::mem::replace(
+                                        &mut slot.handle,
+                                        OpenLocalDirectory::Remote(OpenRemoteDirectory {
+                                            grant: refreshed.grant.clone(),
+                                            files: refreshed.files.clone(),
+                                            handle: refreshed.handle.clone(),
+                                        }),
+                                    )
+                                })
+                            };
+                            match previous {
+                                Some(OpenLocalDirectory::Remote(previous)) => {
+                                    // The old grant just failed; the Home reclaims
+                                    // this cursor with the peer session.
+                                    let _ =
+                                        previous.files.releasedir(&previous.grant, previous.handle);
+                                }
+                                Some(_) => {}
+                                None => {
+                                    let _ = refreshed
+                                        .files
+                                        .releasedir(&refreshed.grant, refreshed.handle);
+                                }
                             }
                             entries
                         }
@@ -4540,12 +4572,18 @@ impl LocalOwnerFs {
     }
 
     fn releasedir(&self, handle: DirectoryHandle) -> Result<()> {
-        let mut state = self.state.lock().map_err(|_| poisoned())?;
-        state
-            .dir_handles
-            .remove(&handle)
-            .ok_or_else(|| stale("unknown directory handle"))?;
-        Ok(())
+        let directory = {
+            let mut state = self.state.lock().map_err(|_| poisoned())?;
+            state
+                .dir_handles
+                .remove(&handle)
+                .ok_or_else(|| stale("unknown directory handle"))?
+        };
+        // Release outside the state lock: a remote close is a network round trip.
+        match directory.handle {
+            OpenLocalDirectory::OwnerRoot | OpenLocalDirectory::Local(_) => Ok(()),
+            OpenLocalDirectory::Remote(open) => open.files.releasedir(&open.grant, open.handle),
+        }
     }
 
     // Local mkdir and remote preparation share the existing best-effort
@@ -7616,6 +7654,12 @@ mod tests {
         fail_statfs_permission: AtomicBool,
         open_calls: AtomicUsize,
         last_open_killpriv: AtomicBool,
+        opendir_calls: AtomicUsize,
+        readdir_calls: AtomicUsize,
+        releasedir_calls: AtomicUsize,
+        releasedir_handles: Mutex<Vec<Vec<u8>>>,
+        fail_readdir_once: AtomicBool,
+        fail_releasedir_once: AtomicBool,
     }
 
     impl RestartingRemoteFiles {
@@ -8313,11 +8357,18 @@ mod tests {
 
         fn opendir(
             &self,
-            _: &RootGrant,
+            grant: &RootGrant,
             _: &OsStr,
             _: Option<&files::FileIdentity>,
         ) -> Result<files::RemoteDirectory> {
-            Err(Error::coded(afs_error::NODE_VFS_UNIMPLEMENTED, "test"))
+            self.opendir_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(files::RemoteDirectory {
+                root_id: self.root_id.clone(),
+                owner_node_id: grant.home_node_id.clone(),
+                owner_session_id: grant.home_session_id.clone(),
+                identity: self.entry(FileKind::Directory).identity,
+                handle: vec![self.opendir_calls.load(Ordering::SeqCst) as u8],
+            })
         }
 
         fn readdir(
@@ -8327,14 +8378,32 @@ mod tests {
             _: u64,
             _: usize,
         ) -> Result<Vec<remote::RemoteDirectoryEntry>> {
-            Err(Error::coded(afs_error::NODE_VFS_UNIMPLEMENTED, "test"))
+            self.readdir_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_readdir_once.swap(false, Ordering::SeqCst) {
+                return Err(Error::coded(
+                    afs_error::NODE_OWNER_INVALID_GRANT,
+                    "injected remote readdir grant loss",
+                ));
+            }
+            Ok(Vec::new())
         }
 
         fn fsyncdir(&self, _: &RootGrant, _: &files::RemoteDirectory, _: bool) -> Result<()> {
             Err(Error::coded(afs_error::NODE_VFS_UNIMPLEMENTED, "test"))
         }
 
-        fn releasedir(&self, _: &RootGrant, _: files::RemoteDirectory) -> Result<()> {
+        fn releasedir(&self, _: &RootGrant, directory: files::RemoteDirectory) -> Result<()> {
+            self.releasedir_calls.fetch_add(1, Ordering::SeqCst);
+            self.releasedir_handles
+                .lock()
+                .map_err(|_| poisoned())?
+                .push(directory.handle);
+            if self.fail_releasedir_once.swap(false, Ordering::SeqCst) {
+                return Err(Error::coded(
+                    afs_error::IO_OTHER,
+                    "injected remote releasedir failure",
+                ));
+            }
             Ok(())
         }
     }
@@ -8379,6 +8448,12 @@ mod tests {
             fail_statfs_permission: AtomicBool::new(false),
             open_calls: AtomicUsize::new(0),
             last_open_killpriv: AtomicBool::new(false),
+            opendir_calls: AtomicUsize::new(0),
+            readdir_calls: AtomicUsize::new(0),
+            releasedir_calls: AtomicUsize::new(0),
+            releasedir_handles: Mutex::new(Vec::new()),
+            fail_readdir_once: AtomicBool::new(false),
+            fail_releasedir_once: AtomicBool::new(false),
         });
         let roots = Arc::new(RootManager::new(
             "node-b".into(),
@@ -11332,6 +11407,100 @@ mod tests {
     }
 
     #[test]
+    fn remote_directory_close_releases_home_handle() {
+        let (_temp, fs, ctx, _meta, remote, _root_id) = remote_fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let workspace = fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+        let handle = fs.opendir(&ctx, workspace.inode).unwrap();
+        assert_eq!(remote.opendir_calls.load(Ordering::SeqCst), 1);
+
+        fs.releasedir(&ctx, handle).unwrap();
+
+        assert_eq!(remote.releasedir_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            remote.releasedir_handles.lock().unwrap().as_slice(),
+            &[vec![1u8]]
+        );
+        let error = fs.releasedir(&ctx, handle).unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_OWNER_STALE_HANDLE);
+        assert_eq!(remote.releasedir_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn local_directory_close_never_calls_remote_release() {
+        let (_temp, fs, ctx, _meta, remote, _root_id) = remote_fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let handle = fs.opendir(&ctx, root).unwrap();
+        fs.releasedir(&ctx, handle).unwrap();
+        assert_eq!(remote.releasedir_calls.load(Ordering::SeqCst), 0);
+
+        let (_local_temp, local_fs, local_ctx) = fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let created = local_fs
+            .mkdir(&local_ctx, root, OsStr::new("local-dir"), 0o755)
+            .unwrap();
+        let handle = local_fs.opendir(&local_ctx, created.inode).unwrap();
+        local_fs.releasedir(&local_ctx, handle).unwrap();
+        let error = local_fs.releasedir(&local_ctx, handle).unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_OWNER_STALE_HANDLE);
+    }
+
+    #[test]
+    fn remote_directory_close_surfaces_home_release_failure() {
+        let (_temp, fs, ctx, _meta, remote, _root_id) = remote_fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let workspace = fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+        let handle = fs.opendir(&ctx, workspace.inode).unwrap();
+        remote.fail_releasedir_once.store(true, Ordering::SeqCst);
+
+        let error = fs.releasedir(&ctx, handle).unwrap_err();
+
+        assert_eq!(error.code(), afs_error::IO_OTHER);
+        assert_eq!(remote.releasedir_calls.load(Ordering::SeqCst), 1);
+        // A failed release still drops the handle, so a retry cannot mask it.
+        assert_eq!(
+            fs.releasedir(&ctx, handle).unwrap_err().code(),
+            afs_error::NODE_OWNER_STALE_HANDLE
+        );
+    }
+
+    #[test]
+    fn remote_readdir_refresh_releases_superseded_directory() {
+        let (_temp, fs, ctx, _meta, remote, _root_id) = remote_fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let workspace = fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+        let handle = fs.opendir(&ctx, workspace.inode).unwrap();
+        remote.fail_readdir_once.store(true, Ordering::SeqCst);
+        // The old grant is rejected, so the superseded cursor cannot be released.
+        remote.fail_releasedir_once.store(true, Ordering::SeqCst);
+
+        let entries = fs.readdir(&ctx, handle, 0, 16).unwrap();
+
+        assert!(entries.is_empty());
+        assert_eq!(remote.opendir_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(remote.readdir_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            remote.releasedir_handles.lock().unwrap().as_slice(),
+            &[vec![1u8]]
+        );
+        fs.releasedir(&ctx, handle).unwrap();
+        assert_eq!(
+            remote.releasedir_handles.lock().unwrap().as_slice(),
+            &[vec![1u8], vec![2u8]]
+        );
+    }
+
+    #[test]
     fn remote_open_receives_kernel_killpriv_cause() {
         let (_temp, fs, ctx, _meta, remote, root_id) = remote_fixture();
         let root = BackendInode {
@@ -12523,6 +12692,12 @@ mod tests {
             fail_statfs_permission: AtomicBool::new(false),
             open_calls: AtomicUsize::new(0),
             last_open_killpriv: AtomicBool::new(false),
+            opendir_calls: AtomicUsize::new(0),
+            readdir_calls: AtomicUsize::new(0),
+            releasedir_calls: AtomicUsize::new(0),
+            releasedir_handles: Mutex::new(Vec::new()),
+            fail_readdir_once: AtomicBool::new(false),
+            fail_releasedir_once: AtomicBool::new(false),
         });
         let (remote_file, _) = remote::RemoteFiles::open(
             remote.as_ref(),
@@ -12616,6 +12791,35 @@ mod tests {
             pf1_assert(&fs, &fence).owned_refs["peer_home_handles"],
             PrivatePf1Class::ObservedDrained
         );
+    }
+
+    #[test]
+    fn home_peer_releasedir_retry_is_stale_and_keeps_sibling_handles() {
+        let (_temp, fs, _ctx, _root, binding) = pf1_fixture();
+        let access = pf1_peer(&fs, &binding);
+        let local = fs.require_local().unwrap();
+        let closed = local
+            .peer_opendir("node-b", &access, OsStr::new(""), None)
+            .unwrap();
+        let sibling = local
+            .peer_opendir("node-b", &access, OsStr::new(""), None)
+            .unwrap();
+
+        local
+            .peer_releasedir("node-b", &access, closed.clone())
+            .unwrap();
+        // A retry after a lost ACK must see stale, not close another handle.
+        assert_eq!(
+            local
+                .peer_releasedir("node-b", &access, closed)
+                .unwrap_err()
+                .code(),
+            afs_error::NODE_OWNER_STALE_HANDLE
+        );
+        local
+            .peer_readdir("node-b", &access, &sibling, 0, 16)
+            .unwrap();
+        local.peer_releasedir("node-b", &access, sibling).unwrap();
     }
 
     #[test]

@@ -4707,6 +4707,39 @@ impl OwnerPeerClient {
             .clone())
     }
 
+    /// Keeps a Home-side close in a bounded background job so a transient
+    /// transport failure does not leak the Home handle. `Ok` only means the
+    /// job took the close; after the last retry the Home reclaims the handle
+    /// with the peer session.
+    fn submit_release(&self, request: OwnerRelease) -> afs_error::Result<()> {
+        if let OwnerRuntime::Existing(runtime) = &self.runtime
+            && reserve_release_slot(&self.pending_releases)
+        {
+            let mut client = match self.cloned_client() {
+                Ok(client) => client,
+                Err(error) => {
+                    self.pending_releases.fetch_sub(1, AtomicOrdering::AcqRel);
+                    return Err(error.0);
+                }
+            };
+            let pending = self.pending_releases.clone();
+            let metrics = self.metrics.clone();
+            runtime.spawn(async move {
+                let _ = release_with_retry(&mut client, request, metrics).await;
+                pending.fetch_sub(1, AtomicOrdering::AcqRel);
+            });
+            return Ok(());
+        }
+        let mut client = self.cloned_client().map_err(|error| error.0)?;
+        self.runtime
+            .block_on(release_with_retry(
+                &mut client,
+                request,
+                self.metrics.clone(),
+            ))
+            .map_err(Into::into)
+    }
+
     #[cfg(feature = "rdma")]
     async fn negotiate_owner_rdma(&self, grant: &RootGrant) -> PeerResult<OwnerRdmaWindow> {
         let device = self.rdma_device.clone().ok_or_else(|| {
@@ -5879,50 +5912,15 @@ impl RemoteFiles for OwnerPeerClient {
             .lock()
             .map_err(|_| protocol_error("OwnerFiles prefetch cache lock poisoned"))?
             .remove(&file.handle);
-        let request = OwnerReleaseRequest {
+        // All writes and explicit sync/flush calls have already received their
+        // own result before this cleanup request. A FUSE RELEASE is not a
+        // durability barrier; waiting for its RPC only adds close latency.
+        self.submit_release(OwnerRelease::File(OwnerReleaseRequest {
             access: Some(root_access(grant)),
             handle: Some(OwnerHandle {
                 opaque: file.handle,
             }),
-        };
-        // All writes and explicit sync/flush calls have already received their
-        // own result before this cleanup request. A FUSE RELEASE is not a
-        // durability barrier; waiting for its RPC only adds close latency. We
-        // still keep the handle in a bounded background job so transient
-        // transport failures do not leak Home-side opens after a single packet
-        // loss or reconnect window.
-        if let OwnerRuntime::Existing(runtime) = &self.runtime
-            && reserve_release_slot(&self.pending_releases)
-        {
-            let mut client = match self.cloned_client() {
-                Ok(client) => client,
-                Err(error) => {
-                    self.pending_releases.fetch_sub(1, AtomicOrdering::AcqRel);
-                    return Err(error.0);
-                }
-            };
-            let pending = self.pending_releases.clone();
-            let metrics = self.metrics.clone();
-            runtime.spawn(async move {
-                if let Err(error) = release_with_retry(&mut client, request, metrics).await {
-                    afs_logging::warn!(
-                        "ownerfs.release_failed";
-                        "error" => error.to_string(),
-                        "code" => error.code().to_string()
-                    );
-                }
-                pending.fetch_sub(1, AtomicOrdering::AcqRel);
-            });
-            return Ok(());
-        }
-        let mut client = self.cloned_client().map_err(|error| error.0)?;
-        self.runtime
-            .block_on(release_with_retry(
-                &mut client,
-                request,
-                self.metrics.clone(),
-            ))
-            .map_err(Into::into)
+        }))
     }
 
     fn opendir(
@@ -6004,17 +6002,42 @@ impl RemoteFiles for OwnerPeerClient {
     }
 
     fn releasedir(&self, grant: &RootGrant, directory: RemoteDirectory) -> afs_error::Result<()> {
-        let _reply = owner_rpc!(
-            self,
-            release_dir,
-            OwnerReleaseDirRequest {
-                access: Some(root_access(grant)),
-                handle: Some(OwnerDirectoryHandle {
-                    opaque: directory.handle,
-                }),
-            }
-        );
-        Ok(())
+        self.submit_release(OwnerRelease::Directory(OwnerReleaseDirRequest {
+            access: Some(root_access(grant)),
+            handle: Some(OwnerDirectoryHandle {
+                opaque: directory.handle,
+            }),
+        }))
+    }
+}
+
+/// Retrying is safe: the Home answers a repeated close as a stale handle.
+#[cfg(feature = "ownerfs")]
+enum OwnerRelease {
+    File(OwnerReleaseRequest),
+    Directory(OwnerReleaseDirRequest),
+}
+
+#[cfg(feature = "ownerfs")]
+impl OwnerRelease {
+    fn method(&self) -> &'static str {
+        match self {
+            Self::File(_) => "release",
+            Self::Directory(_) => "release_dir",
+        }
+    }
+
+    async fn send(&self, client: &mut OwnerFilesClient<Channel>) -> Result<(), tonic::Status> {
+        match self {
+            Self::File(request) => client
+                .release(request_with_current_context(request.clone()))
+                .await
+                .map(|_| ()),
+            Self::Directory(request) => client
+                .release_dir(request_with_current_context(request.clone()))
+                .await
+                .map(|_| ()),
+        }
     }
 }
 
@@ -6030,19 +6053,15 @@ fn reserve_release_slot(pending: &AtomicUsize) -> bool {
 #[cfg(feature = "ownerfs")]
 async fn release_with_retry(
     client: &mut OwnerFilesClient<Channel>,
-    request: OwnerReleaseRequest,
+    request: OwnerRelease,
     metrics: Option<super::OwnerRpcMetrics>,
 ) -> PeerResult<()> {
     let mut backoff = RELEASE_INITIAL_BACKOFF;
     for attempt in 1..=RELEASE_MAX_ATTEMPTS {
         let started = Instant::now();
-        let result = client
-            .release(request_with_current_context(request.clone()))
-            .await
-            .map(|_| ())
-            .map_err(PeerError::from);
+        let result = request.send(client).await.map_err(PeerError::from);
         if let Some(metrics) = &metrics {
-            metrics.observe("client", "release", started.elapsed());
+            metrics.observe("client", request.method(), started.elapsed());
         }
         match result {
             Ok(()) => return Ok(()),
@@ -6051,7 +6070,17 @@ async fn release_with_retry(
                 tokio::time::sleep(backoff).await;
                 backoff = backoff.saturating_mul(2).min(RELEASE_MAX_BACKOFF);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                // Log here so the inline path is visible even when the caller
+                // only attempts the close.
+                afs_logging::warn!(
+                    "ownerfs.release_failed";
+                    "method" => request.method(),
+                    "error" => error.to_string(),
+                    "code" => error.code().to_string()
+                );
+                return Err(error);
+            }
         }
     }
     unreachable!("release retry loop always returns from its final attempt")
@@ -6994,7 +7023,7 @@ mod tests {
     };
     #[cfg(feature = "ownerfs")]
     use crate::node::vfs::ownerfs::{
-        files::{FileIdentity, RemoteFile},
+        files::{FileIdentity, RemoteDirectory, RemoteFile},
         remote::RemoteFiles,
         root::{RootGrant, RootId, RootRight},
     };
@@ -7004,7 +7033,8 @@ mod tests {
     };
     #[cfg(feature = "ownerfs")]
     use afs_protocol::node_data::{
-        OwnerReadReply, OwnerReadRequest, OwnerReleaseReply, OwnerWriteReply, OwnerWriteRequest,
+        OwnerReadReply, OwnerReadRequest, OwnerReleaseDirReply, OwnerReleaseReply, OwnerWriteReply,
+        OwnerWriteRequest,
     };
     #[cfg(feature = "ownerfs")]
     use std::sync::atomic::{AtomicUsize as TestAtomicUsize, Ordering as TestOrdering};
@@ -8592,6 +8622,51 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    #[cfg(feature = "ownerfs")]
+    async fn owner_releasedir_retries_transient_failure_until_home_releases() {
+        let handler = std::sync::Arc::new(ReleaseTestHandler::transient_failures(1));
+        let (channel, server) = spawn_owner_release_server(handler.clone()).await;
+        let client = owner_files_client_from_channel_with_runtime(
+            channel,
+            tokio::runtime::Handle::current(),
+        );
+
+        client
+            .releasedir(&test_grant(), test_remote_directory(b"dir-retry".to_vec()))
+            .unwrap();
+
+        wait_until(Duration::from_secs(2), || {
+            client.pending_releases.load(AtomicOrdering::Acquire) == 0
+        })
+        .await;
+        assert_eq!(handler.release_dir_calls(), 2);
+        assert_eq!(handler.seen_handles(), vec![b"dir-retry".to_vec(); 2]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "ownerfs")]
+    async fn owner_releasedir_persistent_failure_stops_after_bounded_attempts() {
+        let handler = std::sync::Arc::new(ReleaseTestHandler::transient_failures(usize::MAX));
+        let (channel, server) = spawn_owner_release_server(handler.clone()).await;
+        let client = owner_files_client_from_channel_with_runtime(
+            channel,
+            tokio::runtime::Handle::current(),
+        );
+
+        client
+            .releasedir(&test_grant(), test_remote_directory(b"dir-down".to_vec()))
+            .unwrap();
+
+        wait_until(Duration::from_secs(2), || {
+            client.pending_releases.load(AtomicOrdering::Acquire) == 0
+        })
+        .await;
+        assert_eq!(handler.release_dir_calls(), RELEASE_MAX_ATTEMPTS);
+        server.abort();
+    }
+
     #[cfg(all(feature = "ownerfs", feature = "rdma"))]
     #[tokio::test]
     async fn owner_rdma_client_admission_rejects_before_endpoint_open() {
@@ -9119,6 +9194,7 @@ mod tests {
         mode: ReleaseFailureMode,
         attempts: TestAtomicUsize,
         seen_handles: StdMutex<Vec<Vec<u8>>>,
+        release_dir_calls: TestAtomicUsize,
     }
 
     #[cfg(feature = "ownerfs")]
@@ -9130,6 +9206,7 @@ mod tests {
                 },
                 attempts: TestAtomicUsize::new(0),
                 seen_handles: StdMutex::new(Vec::new()),
+                release_dir_calls: TestAtomicUsize::new(0),
             }
         }
 
@@ -9138,6 +9215,7 @@ mod tests {
                 mode: ReleaseFailureMode::Stale,
                 attempts: TestAtomicUsize::new(0),
                 seen_handles: StdMutex::new(Vec::new()),
+                release_dir_calls: TestAtomicUsize::new(0),
             }
         }
 
@@ -9147,6 +9225,10 @@ mod tests {
 
         fn seen_handles(&self) -> Vec<Vec<u8>> {
             self.seen_handles.lock().unwrap().clone()
+        }
+
+        fn release_dir_calls(&self) -> usize {
+            self.release_dir_calls.load(TestOrdering::SeqCst)
         }
     }
 
@@ -9188,6 +9270,24 @@ mod tests {
                     "stale release handle",
                 )),
             }
+        }
+
+        fn release_dir(
+            &self,
+            authenticated_peer_node_id: &str,
+            request: OwnerReleaseDirRequest,
+        ) -> afs_error::Result<OwnerReleaseDirReply> {
+            self.release_dir_calls.fetch_add(1, TestOrdering::SeqCst);
+            self.release(
+                authenticated_peer_node_id,
+                OwnerReleaseRequest {
+                    access: request.access,
+                    handle: request.handle.map(|handle| OwnerHandle {
+                        opaque: handle.opaque,
+                    }),
+                },
+            )?;
+            Ok(OwnerReleaseDirReply {})
         }
     }
 
@@ -9307,6 +9407,17 @@ mod tests {
     #[cfg(feature = "ownerfs")]
     fn test_remote_file(handle: Vec<u8>) -> RemoteFile {
         RemoteFile {
+            root_id: RootId("root-a".to_owned()),
+            owner_node_id: "node-a".to_owned(),
+            owner_session_id: "home-session-a".to_owned(),
+            identity: FileIdentity(b"identity-a".to_vec()),
+            handle,
+        }
+    }
+
+    #[cfg(feature = "ownerfs")]
+    fn test_remote_directory(handle: Vec<u8>) -> RemoteDirectory {
+        RemoteDirectory {
             root_id: RootId("root-a".to_owned()),
             owner_node_id: "node-a".to_owned(),
             owner_session_id: "home-session-a".to_owned(),
