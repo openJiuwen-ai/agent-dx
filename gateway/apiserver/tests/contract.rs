@@ -71,6 +71,25 @@ fn clone_preserves_omitted_geometry_and_does_not_invent_image() {
     assert_eq!(spec.resources.unwrap().cpu_millis, 0);
 }
 #[test]
+fn clone_request_does_not_turn_omitted_limits_into_scheduling_requests() {
+    let spec = create_spec(
+        json!({"snapshotId":"snapshot-1", "cpu":10, "memory":64, "storageMb":20480}),
+        &caller(),
+    )
+    .unwrap();
+    let limits = spec.execution.unwrap().limits.unwrap();
+    assert_eq!(limits.cpu_millis, 0);
+    assert_eq!(limits.memory_bytes, 0);
+    assert_eq!(limits.disk_bytes, 0);
+    for override_value in [
+        json!({"snapshotId":"snapshot-1", "cpu":10, "cpu_limit":5}),
+        json!({"snapshotId":"snapshot-1", "memory":64, "mem_limit":32}),
+        json!({"snapshotId":"snapshot-1", "storageMb":20480, "storage_limit_mb":10240}),
+    ] {
+        assert!(create_spec(override_value, &caller()).is_err());
+    }
+}
+#[test]
 fn sandboxd_options_are_typed_and_preserved() {
     let spec = create_spec(json!({
         "image":"registry.example/app:v1",

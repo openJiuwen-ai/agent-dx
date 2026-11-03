@@ -747,22 +747,25 @@ pub fn create_spec_with_environment(
     // declaration validated while the originating SDK handle uses it to guard
     // get_port_url().
     let ports = validate_ports(&r.ports)?;
-    let cpu_limit = if r.cpu_limit == 0 {
+    let cpu_limit = if r.cpu_limit == 0 && snapshot.is_none() {
         cpu
     } else {
         positive(r.cpu_limit, 1)?
     };
-    let memory_limit = if r.mem_limit == 0 {
+    let memory_limit = if r.mem_limit == 0 && snapshot.is_none() {
         memory
     } else {
         positive(r.mem_limit, 1048576)?
     };
-    let disk_limit = if r.storage_limit_mb == 0 {
+    let disk_limit = if r.storage_limit_mb == 0 && snapshot.is_none() {
         disk
     } else {
         positive(r.storage_limit_mb, 1048576)?
     };
-    if cpu_limit < cpu || memory_limit < memory || disk_limit < disk {
+    if (cpu_limit != 0 && cpu_limit < cpu)
+        || (memory_limit != 0 && memory_limit < memory)
+        || (disk_limit != 0 && disk_limit < disk)
+    {
         return Err(invalid("resource limits cannot be below requests"));
     }
     let readonly = root

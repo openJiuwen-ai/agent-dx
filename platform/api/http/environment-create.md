@@ -26,3 +26,9 @@ no longer identifies an earlier creation. An existing Environment ID still
 reuses its current result; if the earlier Environment was deleted, a request
 after the replay window can create a new Environment. Receipt expiry does not
 delete an Environment or release its resources.
+
+Reusable snapshot restores inherit scheduling reservations and execution limits
+independently. An omitted or zero CPU, memory or writable-storage limit inherits
+the saved limit; it must not become the smaller scheduling request. Explicit
+positive limits remain subject to runtime compatibility and request validation.
+Fresh creation retains the existing zero-limit behavior of following its request.

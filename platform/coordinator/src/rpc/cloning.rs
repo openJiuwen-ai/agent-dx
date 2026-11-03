@@ -50,6 +50,20 @@ fn inherit_template(
     // starting the entrypoint again.
     let execution = request.execution.get_or_insert_with(Default::default);
     execution.inherit_entrypoint = template.execution.inherit_entrypoint;
+    // Requests reserve scheduling capacity; execution limits cap the actual
+    // runtime. Restoring only the former can turn an overcommitted 8 GiB
+    // sandbox into a 64 MiB cgroup and OOM while loading its checkpoint.
+    let limits = execution.limits.get_or_insert_with(Default::default);
+    let saved_limits = &template.execution.limits;
+    if limits.cpu_millis == 0 {
+        limits.cpu_millis = saved_limits.cpu_millis;
+    }
+    if limits.memory_bytes == 0 {
+        limits.memory_bytes = saved_limits.memory_bytes;
+    }
+    if limits.disk_bytes == 0 {
+        limits.disk_bytes = saved_limits.disk_bytes;
+    }
     if execution.inherit_entrypoint && execution.rootfs.is_none() {
         execution.rootfs = template.execution.rootfs.clone().map(Into::into);
     }
@@ -250,6 +264,61 @@ mod tests {
             snapshot_id: Some(snapshot.id.clone()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn clone_inherits_execution_limits_separately_from_scheduling_requests() {
+        let mut snapshot = source("local");
+        snapshot.template.resources.cpu_millis = 10;
+        snapshot.template.resources.memory_bytes = 64 * 1024 * 1024;
+        snapshot.template.resources.disk_bytes = 20 * 1024 * 1024 * 1024;
+        snapshot.template.execution.limits = adx_core::execution::ResourceLimits {
+            cpu_millis: 2000,
+            memory_bytes: 8192 * 1024 * 1024,
+            disk_bytes: 24 * 1024 * 1024 * 1024,
+        };
+        let mut request = clone_request(&snapshot);
+        request.execution = Some(pb::ExecutionOptions {
+            // The public API serializes omitted limits as zero. Their meaning
+            // during restore is inheritance, not reducing caps to requests.
+            limits: Some(pb::ResourceLimits::default()),
+            ..Default::default()
+        });
+        let restored = inherit_template(request, &snapshot, None).unwrap();
+        assert_eq!(restored.resources, snapshot.template.resources);
+        assert_eq!(
+            restored.execution.limits,
+            snapshot.template.execution.limits
+        );
+
+        let without_execution =
+            inherit_template(clone_request(&snapshot), &snapshot, None).unwrap();
+        assert_eq!(
+            without_execution.execution.limits,
+            snapshot.template.execution.limits
+        );
+    }
+
+    #[test]
+    fn clone_preserves_explicit_limit_overrides_and_inherits_other_limits() {
+        let mut snapshot = source("s3");
+        snapshot.template.execution.limits = adx_core::execution::ResourceLimits {
+            cpu_millis: 2000,
+            memory_bytes: 8192,
+            disk_bytes: 4096,
+        };
+        let mut request = clone_request(&snapshot);
+        request.execution = Some(pb::ExecutionOptions {
+            limits: Some(pb::ResourceLimits {
+                cpu_millis: 3000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let restored = inherit_template(request, &snapshot, None).unwrap();
+        assert_eq!(restored.execution.limits.cpu_millis, 3000);
+        assert_eq!(restored.execution.limits.memory_bytes, 8192);
+        assert_eq!(restored.execution.limits.disk_bytes, 4096);
     }
 
     #[test]
