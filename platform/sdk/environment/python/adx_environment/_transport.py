@@ -121,6 +121,7 @@ class EnvironmentHTTPError(EnvironmentError):
         scheduling_failure: Optional[Dict[str, Any]] = None,
         probe_failure: Optional[Dict[str, Any]] = None,
         request_forwarded: Optional[bool] = None,
+        first_error: Optional[BaseException] = None,
     ):
         super().__init__(
             message,
@@ -133,6 +134,7 @@ class EnvironmentHTTPError(EnvironmentError):
             scheduling_failure=scheduling_failure,
             probe_failure=probe_failure,
             request_forwarded=request_forwarded,
+            first_error=first_error,
         )
         self.status_code = status_code
         self.payload = payload
@@ -338,6 +340,7 @@ class EnvironmentClient:
         request_body["name"] = request_name
         deadline = time.monotonic() + request_timeout
         last_error: Optional[BaseException] = None
+        first_error: Optional[BaseException] = None
         attempts = 0
 
         for attempt in range(1, _CREATE_MAX_ATTEMPTS + 1):
@@ -353,6 +356,8 @@ class EnvironmentClient:
                 )
             except _CREATE_RETRYABLE_ERRORS as exc:
                 last_error = exc
+                if first_error is None:
+                    first_error = exc
                 if attempt >= _CREATE_MAX_ATTEMPTS:
                     break
                 remaining = deadline - time.monotonic()
@@ -372,6 +377,11 @@ class EnvironmentClient:
                 )
                 time.sleep(backoff)
                 continue
+            except EnvironmentError as exc:
+                # Preserve the authoritative final contract. A terminal replay
+                # response must not erase the first failed create attempt.
+                exc.first_error = first_error
+                raise
 
             self._last_create = data
             return data
@@ -389,6 +399,7 @@ class EnvironmentClient:
                 scheduling_failure=last_error.scheduling_failure,
                 probe_failure=last_error.probe_failure,
                 request_forwarded=last_error.request_forwarded,
+                first_error=first_error,
             ) from last_error
         contract_error = last_error if isinstance(last_error, EnvironmentError) else None
         raise EnvironmentError(
@@ -402,6 +413,7 @@ class EnvironmentClient:
             outcome=(contract_error.outcome if contract_error else None) or "unknown",
             operation_id=contract_error.operation_id if contract_error else None,
             environment_id=(contract_error.environment_id if contract_error else None) or request_name,
+            first_error=first_error,
         ) from last_error
 
     def _create_info_attempt(

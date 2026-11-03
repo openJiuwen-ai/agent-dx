@@ -803,3 +803,10 @@ storage/runtime acceptance remains in P7.
 Volume IDs accept 1–256 ASCII letters, digits, dots, underscores or hyphens;
 `.` and `..` are rejected because URL clients normalize those path segments.
 The SDK validates both definitions and lookup/deletion IDs before sending requests.
+
+
+Create retries retain the authoritative final error type/status, request identity,
+retry and outcome fields, and expose the initial failed attempt as `first_error`.
+An unsuccessful capability query preserves its transport/domain exception; only
+a confirmed response missing the required capabilities is `UnsupportedFeature`.
+These diagnostics do not change operation replay or source ownership rules.
