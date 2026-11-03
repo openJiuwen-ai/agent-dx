@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Build-identity regression: exercises the real afs/build.rs in the three shapes
+# Build-identity regression: exercises the real afs/build.rs in the four shapes
 # that broke, or were never covered, by the original implementation.
 #
 #   1. linked worktree                 - HEAD lives under .git/worktrees/<name>
 #   2. same-branch commit in that tree - symbolic HEAD never changes, so the
 #                                        loose branch ref has to be watched
-#   3. source archive without .git     - identity must be supplied by the build
+#   3. uncommitted tracked change      - the id must carry the `-dirty` suffix
+#   4. source archive without .git     - identity must be supplied by the build
 #                                        entry point or reported as `unknown`
 #
 # build.rs is compiled standalone and run with the package directory as cwd,
@@ -80,7 +81,14 @@ fingerprint2=$(watch_fingerprint "$scratch/wt")
     fail "no watched path changed after a same-branch commit; Cargo would keep the stale id"
 echo "ok: same-branch commit moved id=$id2 and changed a watched input"
 
-# ---- scenario 3: archive without .git --------------------------------------
+# ---- scenario 3: uncommitted tracked change must mark the id dirty ---------
+( cd "$scratch/wt" && echo y >> afs/build.rs )
+dirty_id=$(run_identity "$scratch/wt" | sed -n 's/^cargo:rustc-env=AFS_BUILD_ID=//p')
+[ "$dirty_id" = "$(id_of "$scratch/wt")-dirty" ] ||
+    fail "uncommitted tracked change reported $dirty_id instead of <HEAD>-dirty"
+echo "ok: uncommitted tracked change reports $dirty_id"
+
+# ---- scenario 4: archive without .git --------------------------------------
 mkdir -p "$scratch/archive"
 tar -C "$scratch/repo" --exclude=.git -cf - . | tar -C "$scratch/archive" -xf -
 [ ! -e "$scratch/archive/.git" ] || fail "archive copy still contains .git"

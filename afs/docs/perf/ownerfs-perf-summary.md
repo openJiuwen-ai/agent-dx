@@ -394,7 +394,7 @@ FUSE 收发  ≈ 56 µs   6.6 次回调 × 8.5 µs（bindfs 约 10–12 µs/次�
 |---|---|---|
 | 长路径退化（openat2 只对 `ENOSYS` 回退） | `ENAMETOOLONG` 也回退到逐组件 `openat` 遍历，安全边界不变 | `node::storage::localfs::relative_path_longer_than_path_max_falls_back_to_component_walk`、`deep_path_fallback_keeps_no_symlink_policy` |
 | 普通写阻塞接收线程 | 删除 OwnerFs 的 `Borrowed` 准入，所有写经 keyed worker 队列（保序 + 有界 + 背压不变） | `node::vfs::ownerfs::plain_write_is_never_admitted_on_the_receive_thread` |
-| 构建版本号不可靠 | 用 `git rev-parse --git-path` 跟踪真实 HEAD/index/**分支 loose ref**，dirty 只看跟踪文件；归档由 `make afs-archive` 注入 `AFS_BUILD_ID`，无身份时输出 `unknown` | `tests/build_identity.rs`（当前 checkout 断言）+ `afs/scripts/check-build-identity.sh`（实际构造 linked worktree / 同分支新提交 / 无 .git 归档三种场景） |
+| 构建版本号不可靠 | 用 `git rev-parse --git-path` 跟踪真实 HEAD/index/**分支 loose ref**，dirty 只看跟踪文件；归档由构建入口注入 `AFS_BUILD_ID`，无身份时输出 `unknown` | `tests/build_identity.rs`（当前 checkout 断言）+ `afs/scripts/check-build-identity.sh`（实际构造 linked worktree / 同分支新提交 / 未提交跟踪修改 / 无 .git 归档四种场景，已接入 `afs-check`） |
 
 ### 10.5 材料溯源与缺口
 
@@ -413,4 +413,4 @@ FUSE 收发  ≈ 56 µs   6.6 次回调 × 8.5 µs（bindfs 约 10–12 µs/次�
 - 未做深目录（单路径 > `PATH_MAX`）修复后的性能回归，只做了功能回归。
 - 未在新二进制上重测显式 `fsync`、`O_SYNC` 句柄吞吐。
 - 未做端到端落盘错误注入（只有既有 EIO 注入单测）。
-- 构建身份的三个场景由脚本构造验证，不是在 cargo 完整构建中逐场景复跑。
+- 构建身份的四个场景由脚本构造验证，不是在 cargo 完整构建中逐场景复跑。
