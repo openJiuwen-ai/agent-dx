@@ -794,4 +794,4 @@ NodeReplicated DFS 默认启动每 5 秒一次的安全回收；关闭引用有�
 | `AFS_FUSE_TRACE` | 未设置 | 设为 `1`/`true` 时打印逐请求 trace 与 `create` 阶段计时，仅用于诊断，不要在生产常开。 |
 
 关闭语义的完整说明见 `afs/README.md` 的「OwnerFs 关闭语义」一节，性能归因见
-`afs/docs/perf/ownerfs-perf-summary.md` §10。
+`afs/docs/perf/ownerfs-perf-summary.md`。

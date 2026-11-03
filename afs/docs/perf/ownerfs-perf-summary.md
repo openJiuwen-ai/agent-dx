@@ -6,8 +6,8 @@
 > 本文只回答两件事：**做了什么**、**效果如何**。
 >
 > **口径修正（PR !134 评审后）**：下文 11x 量级的写提升，绝大部分来自"独占本地 root 的 close
-> 不再执行 `fdatasync`"这一**默认语义变更**，不是同语义下的等价优化。§10 给出修正后的归因、
-> 按秒计的 `cp -a` 对照、以及本轮明确未测量的边界。引用倍率前请先读 §10。
+> 不再执行 `fdatasync`"这一**默认语义变更**，不是同语义下的等价优化；逐项归因见 §六，
+> 语义说明见 `README.md` 的"OwnerFs 关闭语义"。
 
 ## 一、结论先行：规模 × 并发 × 参照实现
 
@@ -15,7 +15,7 @@
 除矩阵表外，其余每格为多轮中位；门槛列给出该组 `max/min`（<=1.10 通过）。
 
 下表的"提升"列**混入了语义变更**：优化前的写路径每个文件 close 时都 `fdatasync`，优化后独占本地
-root 默认不再同步（见 §10 与 `README.md` 的"OwnerFs 关闭语义"）。因此这一列应读作
+root 默认不再同步（见 §六 与 `README.md` 的"OwnerFs 关闭语义"）。因此这一列应读作
 "从 close 即持久 到 close 只到页缓存 的端到端差异"，不能读作纯实现优化。
 
 ### 1.1 单进程与 4 并发（2k/10k/20k）
@@ -350,67 +350,3 @@ FUSE 收发  ≈ 56 µs   6.6 次回调 × 8.5 µs（bindfs 约 10–12 µs/次�
 
 **构建**：`cargo build --release --offline --features ownerfs --bin afs-node`（**必须 release**，debug 数据不可用于比较）。
 **部署**：务必从 `afs/target/release/` 或工作区根 `target/release/` 取二进制，两者是不同产物（曾因此误部署旧二进制，导致多项优化"看似无效"）。
-
-## 十、评审后修正：关闭语义、归因与未测量边界
-
-### 10.1 归因修正
-
-| 项 | 原表述 | 修正后 |
-|---|---|---|
-| 11x 写入提升 | "性能优化" | 主要是**默认关闭语义变更**（独占本地 root 的 close 不再 `fdatasync`）；同语义下其余九项合计约 2% |
-| O1 的适用范围 | 全面优化 | 只覆盖独占本地 root 且无 `O_SYNC` 的普通 close；peer 共享 root 与同步句柄路径不变 |
-| 语义代价 | 未单列 | close 成功不再代表落盘；掉电可丢最近写入。需要旧保证时设 `AFS_OWNERFS_CLOSE_SYNC=1` |
-| 稳定性 | 部分格子标注通过 | 优化后 P=1 / P=8 未过 `max/min<=1.10`（1.46 / 1.62），只有 P=16 通过（1.05）；P=1 的 11x 需按"最好一轮"理解 |
-
-### 10.2 `cp -a` 400 份配置树（12,000 个文件、126 MiB），按秒计
-
-同一台远端节点、同一 `drop_caches` 纪律、3-6 轮，单位秒（越小越好）。
-
-| 实现 | P=1 | P=8 | P=16 |
-|---|---|---|---|
-| ownerfs 优化前（`a19b3041`，node+meta 同版本） | 26.588 | 6.823 | 5.321 |
-| ownerfs 优化后（`722fe96c` 及其前身） | 5.175 | 2.130 | 2.171 |
-| MooseFS 3.0.117 | 6.896 | 2.741 | 1.801 |
-| 本地 ext4 | 0.493 | 0.094 | 0.094 |
-
-- ownerfs 优化前三组 `max/min` 为 1.016-1.034（稳定）；优化后 P=1/P=8 波动 1.46/1.62，
-  只有 P=16 通过门槛，因此优化后两列只能作为量级参考。
-- MooseFS 的 P=8/P=16 由 files/s 反算（4,379 / 6,663 f/s）；其 fsync 与冷读受同机
-  master/chunkserver 页缓存污染，不与 ownerfs 比较。
-- `fuse_threads` 4/8/16 无收益（16 反而慢约 15%），默认值未改动。
-
-### 10.3 本轮明确未测量
-
-- 显式 `fsync`/`fdatasync`、`O_SYNC` 句柄在新二进制上的吞吐：未重测；历史 release 期为
-  1 GiB 顺序写 1,749 MB/s、加 `conv=fsync` 255 MB/s（单轮，未做多轮门槛）。
-- close 策略三态（`always` / `group` / `never`）：设计存在，未实现、未测量。
-- 落盘错误传播：仅由既有 EIO 注入单测（如 `local_fdatasync_eio_poison_*`）覆盖，
-  未做端到端故障注入。
-- 深目录（单路径 > `PATH_MAX`）修复后未做性能回归；只做了功能回归（见 §10.4）。
-
-### 10.4 本轮代码修复对应的回归
-
-| 问题 | 修复 | 回归 |
-|---|---|---|
-| 长路径退化（openat2 只对 `ENOSYS` 回退） | `ENAMETOOLONG` 也回退到逐组件 `openat` 遍历，安全边界不变 | `node::storage::localfs::relative_path_longer_than_path_max_falls_back_to_component_walk`、`deep_path_fallback_keeps_no_symlink_policy` |
-| 普通写阻塞接收线程 | 删除 OwnerFs 的 `Borrowed` 准入，所有写经 keyed worker 队列（保序 + 有界 + 背压不变） | `node::vfs::ownerfs::plain_write_is_never_admitted_on_the_receive_thread` |
-| 构建版本号不可靠 | 用 `git rev-parse --git-path` 跟踪真实 HEAD/index/**分支 loose ref**，dirty 只看跟踪文件；归档由构建入口注入 `AFS_BUILD_ID`，无身份时输出 `unknown` | `tests/build_identity.rs`（当前 checkout 断言）+ `afs/scripts/check-build-identity.sh`（实际构造 linked worktree / 同分支新提交 / 未提交跟踪修改 / 无 .git 归档四种场景，已接入 `afs-check`） |
-
-### 10.5 材料溯源与缺口
-
-| 项 | 状态 |
-|---|---|
-| 源码身份 | 优化后 = `722fe96c`；优化前 = `a19b3041`（node 与 meta 同版本） |
-| 二进制 | 当年构建产物**未保留**，无法给出 sha256；复现需按 §9 重新构建（`cargo build --release --offline --features ownerfs --bin afs-node` / `--bin afs-meta`） |
-| 客户端 | 写/读用 C 客户端（无 fork+exec，单 `write`+`close` 循环）；`cp -a` 用系统 coreutils；shell 客户端数据只出现在已被否决的早期结论中 |
-| 原始样本 | 远端 `/home/lzq/afs-baseline/logs`、语料 `/home/lzq/src-corpus`、`/tmp/config`；逐轮原始输出**未归档**，本文只有中位数与离群值记录 |
-| 环境 | 单节点 1.94.246.161，每轮 `drop_caches`；MooseFS 3.0.117 同机部署（其 fsync/冷读不可比） |
-
-缺口（未做，别把本文读成完整验收）：
-
-- 未跑完整 `make rust-check`；AFS 范围的 `make afs-lint` 已跑。`--all-features` 需要
-  `libibverbs` 开发文件，本机缺失。
-- 未做深目录（单路径 > `PATH_MAX`）修复后的性能回归，只做了功能回归。
-- 未在新二进制上重测显式 `fsync`、`O_SYNC` 句柄吞吐。
-- 未做端到端落盘错误注入（只有既有 EIO 注入单测）。
-- 构建身份的四个场景由脚本构造验证，不是在 cargo 完整构建中逐场景复跑。

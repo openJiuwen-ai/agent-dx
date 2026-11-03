@@ -93,18 +93,27 @@ afs-build-identity:
 # Build from `git archive` output instead of the checkout. A source archive has
 # no `.git`, so the build script can only report `unknown`; this entry point is
 # what supplies the identity (`AFS_BUILD_ID`), defaulting to the current commit.
+# The archive tree compiles the same packages as the checkout, so it needs its
+# own target directory: sharing CARGO_TARGET_DIR would overwrite the checkout's
+# artefacts and leave `dist/` debuginfo paths inside them.
 AFS_ARCHIVE_DIR ?= dist/afs-archive
+AFS_ARCHIVE_TARGET ?= $(OUT)/afs-archive-target
 AFS_BUILD_ID ?= $(shell git rev-parse --short=9 HEAD 2>/dev/null)
 afs-archive:
 	@test -n "$(AFS_BUILD_ID)" || { \
 		echo 'afs-archive: no git metadata; pass AFS_BUILD_ID=<identity>' >&2; exit 2; \
 	}
+	@if [ "$(abspath $(AFS_ARCHIVE_TARGET))" = "$(abspath $(ADX_SHARED_CARGO_TARGET))" ]; then \
+		echo 'afs-archive requires an isolated AFS_ARCHIVE_TARGET; do not reuse the shared cargo cache' >&2; \
+		exit 2; \
+	fi
 	rm -rf $(AFS_ARCHIVE_DIR)
 	mkdir -p $(AFS_ARCHIVE_DIR)
 	git archive --format=tar HEAD | tar -x -C $(AFS_ARCHIVE_DIR)
-	cd $(AFS_ARCHIVE_DIR) && AFS_BUILD_ID=$(AFS_BUILD_ID) \
+	cd $(AFS_ARCHIVE_DIR) && CARGO_TARGET_DIR=$(abspath $(AFS_ARCHIVE_TARGET)) \
+		AFS_BUILD_ID=$(AFS_BUILD_ID) \
 		$(CARGO) build --locked -p afs --bins -j $(JOBS)
-	@echo "afs-archive: built with AFS_BUILD_ID=$(AFS_BUILD_ID)"
+	@echo "afs-archive: built $(AFS_BUILD_ID) in $(abspath $(AFS_ARCHIVE_TARGET))"
 afs-lint:
 	$(CARGO) check --locked $(AFS_PACKAGES) --all-targets -j $(JOBS)
 	$(CARGO) clippy --locked $(AFS_PACKAGES) --all-targets -j $(JOBS) -- -D warnings
