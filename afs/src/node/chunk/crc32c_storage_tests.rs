@@ -171,3 +171,45 @@ fn crc32c_missing_body_recovery_quarantines_without_recursion() {
         LocalChunkState::Quarantined
     );
 }
+
+/// R17: a persisted CRC32C descriptor of another `format` is identified at
+/// startup before its shape and digest (inner layer, after the catalog
+/// line's own checksum).
+#[test]
+fn crc_descriptor_format_is_identified_before_its_shape_and_digest() {
+    let temp = tempfile::tempdir().unwrap();
+    {
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        store.put(staged()).unwrap();
+    }
+    let path = temp.path().join("catalog.wal");
+    let mut rewritten = Vec::new();
+    let mut tables = 0;
+    for line in fs::read_to_string(&path).unwrap().lines() {
+        let txn: CatalogTxn = serde_json::from_str(line).unwrap();
+        let mut records = txn.records;
+        for record in &mut records {
+            if let Some(table) = &mut record.segment_crc {
+                assert_eq!(table.format, 1);
+                table.format = 2;
+                tables += 1;
+            }
+        }
+        rewritten
+            .extend(serde_json::to_vec(&CatalogTxn::new(txn.revision, records).unwrap()).unwrap());
+        rewritten.push(b'\n');
+    }
+    assert!(tables > 0);
+    fs::write(&path, rewritten).unwrap();
+    let error = LocalChunkStore::open(temp.path(), "node-a")
+        .and_then(|store| store.recover().map(|_| ()))
+        .unwrap_err();
+    assert_eq!(error.code(), afs_error::STORAGE_FORMAT_INCOMPATIBLE);
+    for part in [
+        "Node CRC32C segment descriptor",
+        "version 2",
+        "supports version 1",
+    ] {
+        assert!(error.message().contains(part), "{part}: {error}");
+    }
+}

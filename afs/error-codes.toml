@@ -458,6 +458,14 @@ subsystem = "Store"
 description = "Meta 操作日志已被更高 term 的新写者接管，旧写者句柄的追加被拒绝且未写入；Store 随即失效，需由新写者服务"
 
 [[error]]
+name = "META_NODE_PROTOCOL_VERSION"
+value = "0x03050001"
+kind = "FailedPrecondition"
+component = "Meta"
+subsystem = "NodeRegistration"
+description = "Node 注册携带的 Node↔Meta 协议版本与 Meta 不一致（缺省 0 视为旧实现），注册被拒绝；需部署同一版本的 Node 与 Meta"
+
+[[error]]
 name = "CONFIG_INVALID"
 value = "0x04010001"
 kind = "InvalidArgument"
@@ -488,6 +496,14 @@ kind = "Internal"
 component = "Runtime"
 subsystem = "Process"
 description = "指标注册或编码失败"
+
+[[error]]
+name = "STORAGE_FORMAT_INCOMPATIBLE"
+value = "0x04040001"
+kind = "FailedPrecondition"
+component = "Runtime"
+subsystem = "Format"
+description = "持久数据的格式版本与本二进制不符（Meta 与 Node 共用）；版本先于完整性校验识别，不迁移、不自动删除，需重建数据目录或使用匹配的二进制"
 
 [[error]]
 name = "IO_NOT_FOUND"

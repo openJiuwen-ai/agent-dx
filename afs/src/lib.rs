@@ -7,6 +7,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod dfs;
+pub mod format;
 pub mod meta;
 pub mod node;
 

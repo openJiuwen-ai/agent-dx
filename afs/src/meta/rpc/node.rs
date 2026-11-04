@@ -24,6 +24,20 @@ impl MetaService for MetaRpc {
         self.0.observability.record("meta", "register_node", true);
         let authenticated = authenticated_node_id(&self.0, &request)?;
         let request = request.into_inner();
+        // K4: protocol admission before anything is read or written. Every
+        // Node (DFS and OwnerFs) registers here, so this gates the cluster.
+        crate::format::check(
+            crate::format::FormatKind::NodeMetaProtocol,
+            format_args!(
+                "from node {:?}",
+                request
+                    .node
+                    .as_ref()
+                    .map_or("", |node| node.node_id.as_str())
+            ),
+            u64::from(request.protocol_version),
+        )
+        .map_err(afs_transport::grpc::error_status::error_to_status)?;
         let node = request
             .node
             .ok_or_else(|| invalid("node descriptor is required"))?;

@@ -213,6 +213,9 @@ impl DfsService {
     }
 }
 
+/// `FormatKind::MetaRequestDigest`: the digest is stored in WAL records and
+/// checkpoints, so the JSON of every digested request is a storage format
+/// without a version field, pinned by `request_digest_golden_tests`.
 pub(super) fn namespace_request_digest(request: &impl serde::Serialize) -> Result<[u8; 32]> {
     let bytes = serde_json::to_vec(request)
         .map_err(|_| invalid("DFS namespace request cannot be encoded"))?;

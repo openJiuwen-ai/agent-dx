@@ -9,7 +9,9 @@ pub const FRAME_OVERHEAD: usize = 40;
 /// Upper bound on records in one atomic `append_and_sync` group. Every backend
 /// accepts at most this many; Store gathers at most this many ready requests.
 pub const BATCH_RECORDS_MAX: usize = 64;
-const VERSION: u16 = 2;
+/// The frame envelope version (`FormatKind::MetaWalEnvelope`); the record
+/// hash domain `afs.meta.record.v2` belongs to it.
+const VERSION: u16 = crate::format::version::META_WAL_ENVELOPE;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct StoreIdentity {
@@ -252,6 +254,9 @@ struct Envelope {
     previous_hash: [u8; 32],
     decision: Record,
 }
+/// The `Envelope` fields before `decision`, in order: decoded first so the
+/// record's own schema is identified before the full decode (inner layer).
+type EnvelopeHead = (u16, StoreIdentity, u64, u64, u64, [u8; 32]);
 #[derive(Serialize)]
 struct EnvelopeRef<'a> {
     version: u16,
@@ -291,6 +296,19 @@ pub(super) fn invalid_log(message: impl Into<String>) -> Error {
         afs_error::CONFIG_INVALID,
         format!("Meta operation log: {}", message.into()),
     )
+}
+/// Adds `context` (file, offset) to a log error. A format incompatibility
+/// keeps `STORAGE_FORMAT_INCOMPATIBLE` so operators can tell a binary/data
+/// mismatch from corruption; every other error stays an invalid log, as before.
+pub(super) fn log_context(error: Error, context: impl std::fmt::Display) -> Error {
+    if error.code() == afs_error::STORAGE_FORMAT_INCOMPATIBLE {
+        Error::coded(
+            afs_error::STORAGE_FORMAT_INCOMPATIBLE,
+            format!("Meta operation log: {context}: {}", error.message()),
+        )
+    } else {
+        invalid_log(format!("{context}: {error}"))
+    }
 }
 pub(super) fn unavailable(message: impl Into<String>) -> Error {
     Error::coded(afs_error::IO_UNAVAILABLE, message)
@@ -398,6 +416,13 @@ pub(super) fn decode_frame(
     if frame.len() != frame_length(frame, limit)? {
         return Err(invalid_log("incomplete/trailing frame"));
     }
+    // Version first (outer layer): the envelope version is the payload's
+    // first varint and is read before the CRC, hash and full decode.
+    crate::format::check_postcard_u16(
+        crate::format::FormatKind::MetaWalEnvelope,
+        "frame",
+        &frame[8..frame.len() - 32],
+    )?;
     let crc_bytes: [u8; 4] = frame[4..8]
         .try_into()
         .map_err(|_| invalid_log("CRC width"))?;
@@ -414,6 +439,10 @@ pub(super) fn decode_frame(
     let hash = *hasher.finalize().as_bytes();
     if frame[body_end..] != hash {
         return Err(invalid_log("record hash mismatch"));
+    }
+    // Inner layer: after the frame's integrity, before the full decode.
+    if let Ok((_, record)) = postcard::take_from_bytes::<EnvelopeHead>(payload) {
+        Record::check_schema(record)?;
     }
     let (envelope, tail): (Envelope, _) = postcard::take_from_bytes(payload)
         .map_err(|e| invalid_log(format!("decode envelope: {e}")))?;
@@ -966,7 +995,9 @@ mod tests {
             }
             let mut frame = unchecked_frame(&payload);
             if case == "crc" {
-                frame[8] ^= 1;
+                // Byte 8 is the envelope version, identified before the CRC;
+                // corrupt the first identity byte instead.
+                frame[9] ^= 1;
             }
             if case == "hash" {
                 let last = frame.len() - 1;
@@ -1074,7 +1105,8 @@ mod tests {
             .is_err()
         );
         let mut hash_bad = frame.clone();
-        hash_bad[8] ^= 1;
+        // Byte 8 is the envelope version (checked first); flip an identity byte.
+        hash_bad[9] ^= 1;
         let crc = crc32c::crc32c_append(crc32c::crc32c(&hash_bad[..4]), &hash_bad[8..]);
         hash_bad[4..8].copy_from_slice(&crc.to_be_bytes());
         assert!(

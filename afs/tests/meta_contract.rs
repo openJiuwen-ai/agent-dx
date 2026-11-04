@@ -921,6 +921,7 @@ async fn node_rpc_store_local_file_recovers_committed_session_and_reply() {
             storage_devices: Vec::new(),
         }),
         lease_seconds: 30,
+        protocol_version: afs::format::version::NODE_META_PROTOCOL,
     };
     let registered = rpc::MetaRpc(meta)
         .register_node(Request::new(request.clone()))
@@ -1013,6 +1014,7 @@ async fn contract_rpc_does_not_issue_fake_grants_without_store() {
                 storage_devices: Vec::new(),
             }),
             lease_seconds: 30,
+            protocol_version: afs::format::version::NODE_META_PROTOCOL,
         }))
         .await
         .unwrap_err();
@@ -1109,6 +1111,7 @@ async fn owner_authority_reserve_activate_acquire_validate_and_recover() {
                     storage_devices: Vec::new(),
                 }),
                 lease_seconds: 30,
+                protocol_version: afs::format::version::NODE_META_PROTOCOL,
             }))
             .await
             .unwrap()
@@ -1315,6 +1318,7 @@ async fn owner_authority_reserve_activate_acquire_validate_and_recover() {
                 storage_devices: Vec::new(),
             }),
             lease_seconds: 30,
+            protocol_version: afs::format::version::NODE_META_PROTOCOL,
         }))
         .await
         .unwrap();
@@ -1402,6 +1406,7 @@ async fn owner_authority_stale_abort_cannot_delete_new_pending_reservation() {
                 storage_devices: Vec::new(),
             }),
             lease_seconds: 30,
+            protocol_version: afs::format::version::NODE_META_PROTOCOL,
         }))
         .await
         .unwrap();
@@ -1663,6 +1668,7 @@ async fn n2b1_register_node(meta_rpc: &rpc::MetaRpc) {
                 storage_devices: Vec::new(),
             }),
             lease_seconds: 30,
+            protocol_version: afs::format::version::NODE_META_PROTOCOL,
         }))
         .await
         .unwrap();
@@ -2295,6 +2301,7 @@ async fn register_dfs_storage_node_with_catalog(
             }],
         }),
         lease_seconds: 30,
+        protocol_version: afs::format::version::NODE_META_PROTOCOL,
     }))
     .await
     .unwrap();
@@ -2321,6 +2328,7 @@ async fn register_dfs_compute_node(
             storage_devices: Vec::new(),
         }),
         lease_seconds: 30,
+        protocol_version: afs::format::version::NODE_META_PROTOCOL,
     }))
     .await
     .unwrap();

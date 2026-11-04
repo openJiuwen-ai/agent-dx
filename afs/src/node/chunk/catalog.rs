@@ -2,6 +2,9 @@
 
 use super::*;
 
+/// One `catalog.wal` line (`FormatKind::NodeChunkCatalogWal`). The line has
+/// no version field, so its encoding is pinned by the chunk goldens only;
+/// changing it bumps the registry version and must add one (format rule 4).
 #[derive(Debug, Deserialize, Serialize)]
 pub(super) struct CatalogTxn {
     pub(super) revision: u64,

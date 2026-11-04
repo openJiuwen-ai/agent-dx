@@ -18,10 +18,11 @@ use super::{
     journal::{
         AppendLimits, BATCH_RECORDS_MAX, CheckpointLimits, LogCursor, LogStatus, LogTip, MetaLog,
         RecoveredCheckpoint, RecoveredLog, StoreIdentity, chain_term, decode_frame, encode_batch,
-        fenced, frame_length, full, invalid_log, unavailable,
+        fenced, frame_length, full, invalid_log, log_context, unavailable,
     },
     log::Record,
 };
+use crate::format::{self, FormatKind};
 
 /// Fixed size of each local WAL segment header (static header plus tail slots).
 pub const LOG_HEADER_BYTES: u64 = 4096;
@@ -203,8 +204,7 @@ fn create_dir(path: &Path) -> Result<()> {
 }
 fn identity_bytes(identity: StoreIdentity) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(90);
-    bytes.extend_from_slice(b"AFSI");
-    bytes.extend_from_slice(&1u16.to_be_bytes());
+    bytes.extend_from_slice(&format::META_IDENTITY_HEADER);
     bytes.extend_from_slice(&identity.store_id);
     bytes.extend_from_slice(&identity.cluster_id);
     bytes.extend_from_slice(&identity.incarnation);
@@ -219,12 +219,25 @@ fn read_identity(dir: &Path) -> Result<StoreIdentity> {
 }
 fn read_identity_file(path: &Path) -> Result<StoreIdentity> {
     let mut file = open_file(path, false)?;
-    if file.metadata()?.len() != 90 {
+    let length = file.metadata()?.len();
+    // Version first: the six-byte tag is read before the length, hash and CRC.
+    if length >= 6 {
+        let mut tag = [0; 6];
+        file.read_exact(&mut tag)?;
+        format::check_tagged_header(
+            FormatKind::MetaIdentity,
+            format::META_IDENTITY_MAGIC,
+            path.display(),
+            &tag,
+        )?;
+        file.seek(SeekFrom::Start(0))?;
+    }
+    if length != 90 {
         return Err(invalid_log("IDENTITY length"));
     }
     let mut bytes = [0; 90];
     file.read_exact(&mut bytes)?;
-    if &bytes[..6] != b"AFSI\0\x01"
+    if bytes[..6] != format::META_IDENTITY_HEADER
         || bytes[86..] != crc32c::crc32c(&bytes[..86]).to_be_bytes()
         || bytes[54..86] != *blake3::hash(&bytes[..54]).as_bytes()
     {
@@ -242,8 +255,10 @@ fn read_identity_file(path: &Path) -> Result<StoreIdentity> {
 }
 fn static_header(identity: StoreIdentity, base: LogTip) -> [u8; STATIC_BYTES] {
     let mut bytes = [0; STATIC_BYTES];
-    bytes[..4].copy_from_slice(b"AFSW");
-    bytes[4..6].copy_from_slice(&1u16.to_be_bytes());
+    bytes[..6].copy_from_slice(&format::tagged_header(
+        format::META_WAL_SEGMENT_MAGIC,
+        format::version::META_WAL_SEGMENT,
+    ));
     bytes[6..22].copy_from_slice(&identity.store_id);
     bytes[22..38].copy_from_slice(&identity.cluster_id);
     bytes[38..54].copy_from_slice(&identity.incarnation);
@@ -313,6 +328,13 @@ fn header(file: &mut File, identity: StoreIdentity, base: LogTip) -> Result<Tail
     file.seek(SeekFrom::Start(0))?;
     let mut bytes = [0; LOG_HEADER_BYTES as usize];
     file.read_exact(&mut bytes)?;
+    // Version first: before the byte-exact header, identity, hash and CRC.
+    format::check_tagged_header(
+        FormatKind::MetaWalSegment,
+        format::META_WAL_SEGMENT_MAGIC,
+        wal_name(base)?,
+        &bytes,
+    )?;
     if bytes[..STATIC_BYTES] != static_header(identity, base)
         || bytes[STATIC_BYTES + 2 * SLOT_BYTES..]
             .iter()
@@ -390,9 +412,9 @@ fn preserve_tail(dir: &Path, file: &mut File, start: u64, end: u64) -> Result<()
 const IMAGE_HEADER: usize = 146;
 const CURRENT: &str = "CURRENT";
 const MANIFEST_MAX: usize = 64 * 1024;
-/// CURRENT v3 carries the writer term. v2 (no term) is refused, never adopted.
-const CURRENT_MAGIC: &[u8; 6] = b"AFSM\0\x03";
-const CURRENT_MAGIC_V2: &[u8; 6] = b"AFSM\0\x02";
+/// CURRENT v3 carries the writer term. Any other version (v2 had no term) is
+/// refused by the version-first check, never adopted.
+const CURRENT_MAGIC: &[u8; 6] = &format::META_CURRENT_HEADER;
 #[derive(Clone, Copy, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
 struct CheckpointRef {
     covered: LogTip,
@@ -638,7 +660,7 @@ fn image_header(
     bytes: &[u8],
 ) -> ([u8; IMAGE_HEADER], CheckpointRef) {
     let mut header = [0u8; IMAGE_HEADER];
-    header[..6].copy_from_slice(b"AFSC\0\x01");
+    header[..6].copy_from_slice(&format::META_CHECKPOINT_HEADER);
     header[6..22].copy_from_slice(&identity.store_id);
     header[22..38].copy_from_slice(&identity.cluster_id);
     header[38..54].copy_from_slice(&identity.incarnation);
@@ -673,6 +695,19 @@ fn read_image(
     let name = image_name(reference);
     let read = || -> Result<RecoveredCheckpoint> {
         let mut file = open_file(&dir.join(&name), false)?;
+        // Version first: the file tag is read before its length, identity,
+        // hash and CRC, and before the payload's own schema.
+        if file.metadata()?.len() >= 6 {
+            let mut tag = [0; 6];
+            file.read_exact(&mut tag)?;
+            format::check_tagged_header(
+                FormatKind::MetaCheckpointFile,
+                format::META_CHECKPOINT_MAGIC,
+                "file",
+                &tag,
+            )?;
+            file.seek(SeekFrom::Start(0))?;
+        }
         let length = usize::try_from(reference.bytes)
             .map_err(|_| invalid_log("checkpoint length overflow"))?;
         if length > limits.image_max_bytes
@@ -687,7 +722,7 @@ fn read_image(
         }
         let mut actual = [0u8; IMAGE_HEADER];
         file.read_exact(&mut actual)?;
-        if actual[..6] != *b"AFSC\0\x01"
+        if actual[..6] != format::META_CHECKPOINT_HEADER
             || actual[6..22] != identity.store_id
             || actual[22..38] != identity.cluster_id
             || actual[38..54] != identity.incarnation
@@ -720,10 +755,10 @@ fn read_image(
         })
     };
     read().map_err(|error| {
-        invalid_log(format!(
-            "{name} sequence {}: {error}",
-            reference.covered.sequence
-        ))
+        log_context(
+            error,
+            format!("{name} sequence {}", reference.covered.sequence),
+        )
     })
 }
 fn encode_current(current: &Current) -> Result<Vec<u8>> {
@@ -757,11 +792,13 @@ fn read_current(dir: &Path, identity: StoreIdentity) -> Result<Option<Current>> 
     }
     let mut bytes = vec![0; length];
     file.read_exact(&mut bytes)?;
-    if bytes[..6] == *CURRENT_MAGIC_V2 {
-        return Err(invalid_log(
-            "CURRENT is format v2 (no writer term); this binary reads only v3. Old format: rebuild the Meta data directory; originals retained",
-        ));
-    }
+    // Version first: before the hash, CRC and postcard decode.
+    format::check_tagged_header(
+        FormatKind::MetaCurrent,
+        format::META_CURRENT_MAGIC,
+        path.display(),
+        &bytes,
+    )?;
     let hash_start = length - 36;
     let mut hash = blake3::Hasher::new();
     hash.update(b"afs.meta.current.v1");
@@ -1018,6 +1055,11 @@ fn select_checkpoint(
     for reference in references {
         match read_image(dir, identity, *reference, checkpoint_limits) {
             Ok(image) => return Ok(Some(image)),
+            // A listed image of another version means the directory and the
+            // binary do not match: refuse instead of falling back.
+            Err(error) if error.code() == afs_error::STORAGE_FORMAT_INCOMPATIBLE => {
+                return Err(error);
+            }
             Err(error) => errors.push(error.to_string()),
         }
     }
@@ -1114,10 +1156,10 @@ fn replay_segment(
                 ))
             })
             .map_err(|error| {
-                invalid_log(format!(
-                    "{name} offset {offset} after sequence {}: {error}",
-                    tip.sequence
-                ))
+                log_context(
+                    error,
+                    format!("{name} offset {offset} after sequence {}", tip.sequence),
+                )
             })?;
         if record.revision_before() != revision {
             return Err(invalid_log(format!(
@@ -1379,7 +1421,7 @@ fn cleanup_unreferenced_images(
             }
             // Cleanup needs proven ownership/integrity, never adoption. Stream
             // the complete envelope without allocating/decoding another image.
-            if bytes[..6] != *b"AFSC\0\x01"
+            if bytes[..6] != format::META_CHECKPOINT_HEADER
                 || bytes[6..22] != manifest.identity.store_id
                 || bytes[22..38] != manifest.identity.cluster_id
                 || bytes[38..54] != manifest.identity.incarnation
@@ -1533,7 +1575,7 @@ fn initialize_marked(dir: &Path, limits: LocalCheckpointLimits) -> Result<StoreI
                 let mut bytes = vec![0; length as usize];
                 file.read_exact(&mut bytes)?;
                 let n = bytes.len().min(6);
-                if bytes[..n] != b"AFSI\0\x01"[..n] {
+                if bytes[..n] != format::META_IDENTITY_HEADER[..n] {
                     return Err(invalid_log("foreign partial identity temporary retained"));
                 }
                 // The marker and absence of all data prove this is only an
@@ -3519,12 +3561,17 @@ mod tests {
         let error = LocalLog::open(dir.path(), LocalLogOptions::default())
             .err()
             .expect("v2 CURRENT must be refused");
-        assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+        assert_eq!(error.code(), afs_error::STORAGE_FORMAT_INCOMPATIBLE);
         let message = error.to_string();
-        assert!(
-            message.contains("format v2") && message.contains("rebuild the Meta data directory"),
-            "{message}"
-        );
+        for part in [
+            "Meta CURRENT manifest",
+            "CURRENT",
+            "version 2",
+            "supports version 3",
+            "rebuild the data directory",
+        ] {
+            assert!(message.contains(part), "{part}: {message}");
+        }
         assert_eq!(fs::read(dir.path().join(CURRENT)).unwrap(), v2);
     }
 
@@ -3565,3 +3612,6 @@ mod tests {
 
 #[cfg(test)]
 mod format_golden_tests;
+
+#[cfg(test)]
+mod format_version_tests;

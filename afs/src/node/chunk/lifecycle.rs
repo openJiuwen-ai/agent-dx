@@ -217,7 +217,7 @@ mod tests {
             CopyRole::ExternalCommitted,
         ] {
             assert_eq!(
-                CopyPhase::of_meta(role, CopyState::LegacyStaging),
+                CopyPhase::of_meta(role, CopyState::Reserved0),
                 CopyPhase::Staged
             );
             assert_eq!(

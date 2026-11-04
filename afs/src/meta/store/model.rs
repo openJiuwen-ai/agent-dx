@@ -197,11 +197,8 @@ pub enum RootRight {
     Admin,
 }
 
-/// Durable root command type.
-///
-/// Existing serialized command records did not carry a type; they are
-/// interpreted as revoke-access commands for compatibility with the original
-/// watch stream and ACK path.
+/// Durable root command type. Its variant index is part of the Meta storage
+/// format (pinned by the G1 table).
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum RootCommandType {
     #[default]

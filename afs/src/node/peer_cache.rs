@@ -59,10 +59,12 @@ pub const MAX_PEER_CACHE_PROOF_BYTES: u64 = 1024 * 1024;
 #[cfg(test)]
 const COVERAGE_GROUP_BYTES: usize = 32 * 1024;
 const MAX_OUTBOARD_BYTES: usize = 8192;
-const MARKER: &str = ".afs-peer-cache-v1";
+const MARKER: &str = crate::format::NODE_PEER_CACHE_MARKER_FILE;
 const PENDING: &str = ".afs-peer-cache.pending";
-const MAGIC: &[u8; 8] = b"AFSPC002";
-const OLD_MAGIC: &[u8; 8] = b"AFSPC001";
+const MAGIC: &[u8; 8] = &crate::format::NODE_PEER_CACHE_MAGIC;
+/// Entry header version (`FormatKind::NodePeerCacheEntry`), also stored in
+/// the JSON header.
+const VERSION: u32 = crate::format::version::NODE_PEER_CACHE_ENTRY;
 
 #[derive(Clone, Debug)]
 pub struct PeerCacheOptions {
@@ -71,11 +73,28 @@ pub struct PeerCacheOptions {
     pub namespace_id: NamespaceId,
 }
 
+/// Version-first probe of an entry: `Some(found)` when the file starts with
+/// the Peer cache magic of another version (`AFSPC` and three digits). The
+/// file position is restored. Anything else is left to `read_header`.
+fn other_entry_version(file: &mut File) -> Result<Option<u64>> {
+    let mut magic = [0_u8; 8];
+    let read = file.read_exact(&mut magic);
+    file.seek(SeekFrom::Start(0)).map_err(Error::from)?;
+    if read.is_err() || magic[..5] != crate::format::NODE_PEER_CACHE_MAGIC_PREFIX || &magic == MAGIC
+    {
+        return Ok(None);
+    }
+    Ok(std::str::from_utf8(&magic[5..])
+        .ok()
+        .filter(|digits| digits.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|digits| digits.parse().ok()))
+}
+
 fn read_header(file: &mut File) -> Result<(Header, u64)> {
     let mut prefix = [0_u8; 12];
     file.read_exact(&mut prefix)
         .map_err(|_| corrupt("Peer cache header is truncated"))?;
-    if &prefix[..8] != MAGIC && &prefix[..8] != OLD_MAGIC {
+    if &prefix[..8] != MAGIC {
         return Err(corrupt("Peer cache header magic differs"));
     }
     let count = u32::from_le_bytes([prefix[8], prefix[9], prefix[10], prefix[11]]) as usize;
@@ -87,23 +106,17 @@ fn read_header(file: &mut File) -> Result<(Header, u64)> {
         .map_err(|_| corrupt("Peer cache header is truncated"))?;
     let header: Header =
         serde_json::from_slice(&header).map_err(|_| corrupt("Peer cache header is invalid"))?;
-    if &prefix[..8] == MAGIC {
-        if header.version != 2 || count > MAX_HEADER_BYTES - 12 {
-            return Err(corrupt("Peer cache v2 header shape differs"));
-        }
-        let mut padding = [0_u8; MAX_HEADER_BYTES];
-        let padding = &mut padding[..MAX_HEADER_BYTES - 12 - count];
-        file.read_exact(padding)
-            .map_err(|_| corrupt("Peer cache header padding is truncated"))?;
-        if padding.iter().any(|byte| *byte != 0) {
-            return Err(corrupt("Peer cache header padding differs"));
-        }
-        Ok((header, MAX_HEADER_BYTES as u64))
-    } else if header.version == 1 {
-        Ok((header, 12 + count as u64))
-    } else {
-        Err(corrupt("Peer cache legacy header shape differs"))
+    if header.version != VERSION || count > MAX_HEADER_BYTES - 12 {
+        return Err(corrupt("Peer cache v2 header shape differs"));
     }
+    let mut padding = [0_u8; MAX_HEADER_BYTES];
+    let padding = &mut padding[..MAX_HEADER_BYTES - 12 - count];
+    file.read_exact(padding)
+        .map_err(|_| corrupt("Peer cache header padding is truncated"))?;
+    if padding.iter().any(|byte| *byte != 0) {
+        return Err(corrupt("Peer cache header padding differs"));
+    }
+    Ok((header, MAX_HEADER_BYTES as u64))
 }
 
 fn validate_chunk(chunk: &ChunkObject) -> Result<()> {

@@ -18,8 +18,10 @@ fn crc_read_modes_server_honours_requested_mode() {
     );
     let mut metadata = tonic::metadata::MetadataMap::new();
     metadata.insert("x-afs-read-crc-mode", "unknown".parse().unwrap());
-    assert_eq!(
-        requested_crc_read_mode(&metadata).unwrap_err().code(),
-        tonic::Code::InvalidArgument
-    );
+    let status = requested_crc_read_mode(&metadata).unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    // B3: the rejection carries the AFS error detail, not a bare status.
+    let error = afs_transport::grpc::error_status::status_to_error(status);
+    assert_eq!(error.code(), afs_error::NODE_TRANSFER_INVALID);
+    assert!(error.message().contains("unknown read CRC mode"), "{error}");
 }

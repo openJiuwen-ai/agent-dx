@@ -18,8 +18,13 @@ use crate::dfs::{
     ReplicationTaskId,
 };
 
-const SCHEMA: u16 = 1;
-const IMAGE_SCHEMA: u16 = 2;
+use crate::format::{self, FormatKind};
+
+/// `RecordDecision` schema: inner layer of a WAL record (`MetaRecordDecision`).
+const SCHEMA: u16 = format::version::META_RECORD_DECISION;
+/// `StateImage` schema: inner layer of a checkpoint file (`MetaStateImage`).
+const IMAGE_SCHEMA: u16 = format::version::META_STATE_IMAGE;
+const IMAGE_MAGIC: [u8; 4] = format::META_STATE_IMAGE_MAGIC;
 const MAX_NESTING: usize = 128;
 const MAX_ITEMS: usize = 65_536;
 
@@ -821,6 +826,18 @@ impl From<RecordDecision> for Record {
     }
 }
 impl Record {
+    /// Version-first probe of an encoded record (inner layer): a `Decision`
+    /// (variant 0, pinned by the G1 table) starts with its `RecordDecision`
+    /// schema. `History` deltas carry no own version. An undecodable prefix
+    /// is left to the full decode.
+    pub(super) fn check_schema(encoded: &[u8]) -> Result<()> {
+        match postcard::take_from_bytes::<u32>(encoded) {
+            Ok((0, decision)) => {
+                format::check_postcard_u16(FormatKind::MetaRecordDecision, "record", decision)
+            }
+            _ => Ok(()),
+        }
+    }
     pub(super) fn validate(&self) -> Result<()> {
         match self {
             Self::Decision { decision, history } => {
@@ -946,6 +963,7 @@ impl RecordDecision {
         if bytes.len() > byte_limit {
             return Err(invalid_contract("canonical decision exceeds byte limit"));
         }
+        format::check_postcard_u16(FormatKind::MetaRecordDecision, "decision", bytes)?;
         let (record, tail): (Self, _) = postcard::take_from_bytes(bytes)
             .map_err(|e| invalid_contract(format!("decode canonical decision: {e}")))?;
         if !tail.is_empty() {
@@ -1267,6 +1285,13 @@ impl StateImage {
         if bytes.len() > limit {
             return Err(invalid_contract("checkpoint exceeds encoded byte limit"));
         }
+        // Version first: magic and schema lead the payload; read them before
+        // the full decode and validation.
+        if let Ok(((magic, schema), _)) = postcard::take_from_bytes::<([u8; 4], u16)>(bytes)
+            && magic == IMAGE_MAGIC
+        {
+            format::check(FormatKind::MetaStateImage, "payload", u64::from(schema))?;
+        }
         let (image, tail): (Self, _) = postcard::take_from_bytes(bytes)
             .map_err(|e| invalid_contract(format!("decode checkpoint: {e}")))?;
         if !tail.is_empty() {
@@ -1343,7 +1368,7 @@ impl StateImage {
             });
         }
         let image = Self {
-            magic: *b"AFSC",
+            magic: IMAGE_MAGIC,
             schema: IMAGE_SCHEMA,
             revision: state.revision,
             compacted_to: state.compacted_to,
@@ -1399,7 +1424,7 @@ impl StateImage {
     }
     /// Magic, schema, revision cursor, item counts and the event ordinal base.
     fn validate_bounds(&self) -> Result<()> {
-        if self.magic != *b"AFSC"
+        if self.magic != IMAGE_MAGIC
             || self.schema != IMAGE_SCHEMA
             || self.compacted_to > self.revision
             || [
@@ -3101,6 +3126,64 @@ mod tests {
             let bytes: Vec<u8> = (0..size).map(|x| (x as u8).wrapping_mul(37)).collect();
             assert!(super::StateImage::decode(&bytes, 128).is_err());
         }
+    }
+
+    fn assert_incompatible(error: afs_error::Error, name: &str, found: &str, supported: &str) {
+        assert_eq!(
+            error.code(),
+            afs_error::STORAGE_FORMAT_INCOMPATIBLE,
+            "{error}"
+        );
+        let message = error.to_string();
+        for part in [name, found, supported] {
+            assert!(message.contains(part), "missing {part:?}: {message}");
+        }
+    }
+
+    /// Inner payload versions are read from the leading bytes; the rest of
+    /// the payload is cut off so a decode-first reader would fail differently.
+    #[test]
+    fn image_and_decision_versions_are_identified_before_the_full_decode() {
+        let state = State::default()
+            .prepare_txn_record(create_txn("one", root_entity()), 50, LIMIT)
+            .unwrap()
+            .0;
+        let mut image = super::StateImage::encode(&state, LIMIT).unwrap();
+        // postcard: four magic bytes, then the schema varint.
+        assert_eq!(image[..4], super::IMAGE_MAGIC);
+        assert_eq!(u16::from(image[4]), super::IMAGE_SCHEMA);
+        image[4] = 3;
+        image.truncate(5);
+        assert_incompatible(
+            super::StateImage::validate_encoded(&image, LIMIT).unwrap_err(),
+            "Meta checkpoint state image",
+            "version 3",
+            "supports version 2",
+        );
+
+        let entity = root_entity();
+        let outcomes = vec![outcome(root_result(&entity))];
+        let record = decision(&[event(entity, 0)], &outcomes);
+        let mut bytes = record.encode(LIMIT).unwrap();
+        assert_eq!(u16::from(bytes[0]), super::SCHEMA);
+        bytes[0] = 2;
+        bytes.truncate(1);
+        assert_incompatible(
+            RecordDecision::decode(&bytes, LIMIT).unwrap_err(),
+            "Meta WAL record decision",
+            "version 2",
+            "supports version 1",
+        );
+        let mut framed = postcard::to_allocvec(&super::Record::from(record)).unwrap();
+        assert_eq!((framed[0], u16::from(framed[1])), (0, super::SCHEMA));
+        framed[1] = 2;
+        assert_incompatible(
+            super::Record::check_schema(&framed).unwrap_err(),
+            "Meta WAL record decision",
+            "version 2",
+            "supports version 1",
+        );
+        super::Record::check_schema(&postcard::to_allocvec(&1u32).unwrap()).unwrap();
     }
 }
 

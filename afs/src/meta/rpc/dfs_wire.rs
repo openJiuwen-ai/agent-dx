@@ -373,7 +373,7 @@ fn wire_source_candidate(
             crate::dfs::CopyState::Ready => afs_protocol::meta::DfsCopyState::Ready as i32,
             crate::dfs::CopyState::Corrupt => afs_protocol::meta::DfsCopyState::Corrupt as i32,
             crate::dfs::CopyState::Deleting => afs_protocol::meta::DfsCopyState::Deleting as i32,
-            crate::dfs::CopyState::LegacyStaging => {
+            crate::dfs::CopyState::Reserved0 => {
                 afs_protocol::meta::DfsCopyState::Unspecified as i32
             }
         },

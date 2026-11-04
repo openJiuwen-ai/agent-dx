@@ -4004,6 +4004,9 @@ async fn fenced_log_poisons_store_and_newer_writer_keeps_prefix() {
         .register_node_session(RequestKey::new("node-a", "r2"), lease("session-2"))
         .await
         .unwrap_err();
+    // The in-flight request keeps the fencing code instead of a generic
+    // unavailability, so callers can tell a takeover from an outage.
+    assert_eq!(error.code(), afs_error::META_LOG_FENCED, "{error}");
     assert!(
         error.to_string().contains("found term 1, current term 2"),
         "{error}"

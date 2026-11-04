@@ -70,7 +70,7 @@ impl DiskPeerCache {
                         "Peer cache refuses an unmarked non-empty directory",
                     ));
                 }
-                file.write_all(b"AFS disposable Peer cache v1\n")
+                file.write_all(crate::format::NODE_PEER_CACHE_MARKER_CONTENTS.as_bytes())
                     .map_err(Error::from)?;
                 file.sync_all().map_err(Error::from)?;
                 file
@@ -94,7 +94,21 @@ impl DiskPeerCache {
             .take(128)
             .read_to_string(&mut contents)
             .map_err(Error::from)?;
-        if contents != "AFS disposable Peer cache v1\n" {
+        // Version first: a marker of another version is a format mismatch.
+        // The directory is disposable but never deleted automatically.
+        if contents != crate::format::NODE_PEER_CACHE_MARKER_CONTENTS
+            && let Some(found) = contents
+                .strip_prefix(crate::format::NODE_PEER_CACHE_MARKER_PREFIX)
+                .and_then(|rest| rest.strip_suffix('\n'))
+                .and_then(|digits| digits.parse::<u64>().ok())
+        {
+            crate::format::check(
+                crate::format::FormatKind::NodePeerCacheMarker,
+                options.directory.join(MARKER).display(),
+                found,
+            )?;
+        }
+        if contents != crate::format::NODE_PEER_CACHE_MARKER_CONTENTS {
             return Err(invalid("Peer cache marker is not recognized"));
         }
         let cache = Self {
@@ -381,9 +395,18 @@ impl DiskPeerCache {
         }
         for (key, metadata) in ready {
             let (mut file, _) = open_private(&self.path(&key))?;
+            // Derived data (format rule 3): an entry of another version is
+            // recognised by its magic and discarded before its header is
+            // parsed; the authoritative LocalChunkStore is elsewhere.
+            if other_entry_version(&mut file)?.is_some() {
+                drop(file);
+                fs::remove_file(self.path(&key)).map_err(Error::from)?;
+                state.used_bytes = state.used_bytes.saturating_sub(allocated(&metadata)?);
+                continue;
+            }
             let (header, body_start) = read_header(&mut file)?;
             validate_chunk(&header.chunk)?;
-            if !matches!(header.version, 1 | 2)
+            if header.version != VERSION
                 || header.namespace_id != self.options.namespace_id
                 || self.key(&header.chunk)? != key
                 || header.chunk.length > MAX_OBJECT_BYTES
@@ -428,13 +451,6 @@ impl DiskPeerCache {
             );
             state.entry_metadata_bytes += entry_metadata_charge(&key, &header.chunk);
             refresh_metadata(&mut state);
-            if header.version == 1 {
-                // This directory is explicitly disposable. Retire only recognized
-                // old cache objects; authoritative LocalChunkStore is elsewhere.
-                drop(file);
-                self.bootstrap_remove_entry(&mut state, &key, false)?;
-                continue;
-            }
             let before = file.metadata().map_err(Error::from)?;
             let result = (|| {
                 validate_file_length(&header, &before)?;

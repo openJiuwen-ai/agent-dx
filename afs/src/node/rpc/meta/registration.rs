@@ -206,6 +206,7 @@ pub async fn register_node_with_readiness(
             )),
             node: Some(node),
             lease_seconds: NODE_REGISTRATION_LEASE_SECONDS,
+            protocol_version: crate::format::version::NODE_META_PROTOCOL,
         })
         .await
         .map_err(afs_transport::grpc::error_status::status_to_error)?

@@ -88,10 +88,12 @@ catalog! {
     META_OWNER_HOME_UNAVAILABLE = 0x03040003 => Unavailable;
     META_STORE_UNIMPLEMENTED = 0x03020001 => Unimplemented;
     META_LOG_FENCED = 0x03020002 => FailedPrecondition;
+    META_NODE_PROTOCOL_VERSION = 0x03050001 => FailedPrecondition;
     CONFIG_INVALID = 0x04010001 => InvalidArgument;
     RUNTIME_INTERNAL = 0x04020001 => Internal;
     DIAGNOSTICS_NOT_CONFIGURED = 0x04020002 => FailedPrecondition;
     METRICS_FAILED = 0x04020003 => Internal;
+    STORAGE_FORMAT_INCOMPATIBLE = 0x04040001 => FailedPrecondition;
     IO_NOT_FOUND = 0x04030001 => NotFound;
     IO_PERMISSION_DENIED = 0x04030002 => PermissionDenied;
     IO_ALREADY_EXISTS = 0x04030003 => AlreadyExists;

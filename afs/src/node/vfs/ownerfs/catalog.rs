@@ -24,7 +24,9 @@ use crate::node::storage::{FileStore, LocalFs, StoragePath};
 
 const CATALOG_DIR: &str = ".ownerfs-roots";
 const CATALOG_LOCK: &str = ".ownerfs-root-catalog.lock";
-const RECORD_VERSION: u32 = 1;
+/// `FormatKind::OwnerFsRootRecord`. A mismatch still reports
+/// `NODE_OWNER_INVALID_GRANT` (B4, owned by the OwnerFs maintainers).
+const RECORD_VERSION: u32 = crate::format::version::OWNERFS_ROOT_RECORD;
 static NEXT_TEMP_RECORD: AtomicU64 = AtomicU64::new(0);
 
 /// 一个本机候选根的持久身份；不是访问授权。

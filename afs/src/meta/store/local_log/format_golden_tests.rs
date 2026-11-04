@@ -145,8 +145,8 @@ fn current_v2_golden_is_refused() {
         .collect::<Vec<_>>();
     std::fs::write(temp.path().join(CURRENT), bytes).unwrap();
     let error = read_current(temp.path(), identity()).unwrap_err();
-    assert_eq!(error.code(), afs_error::CONFIG_INVALID);
-    assert!(error.to_string().contains("format v2"), "{error}");
+    assert_eq!(error.code(), afs_error::STORAGE_FORMAT_INCOMPATIBLE);
+    assert!(error.to_string().contains("version 2"), "{error}");
 }
 
 #[test]

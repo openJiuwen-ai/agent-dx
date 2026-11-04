@@ -28,6 +28,9 @@ unsafe fn crc_arm(mut bytes: &[u8]) -> u32 {
     }
     !crc
 }
+/// Descriptor `format` (`FormatKind::NodeCrcSegmentTable`); the digest domain
+/// `AFS-CRC32C-SEGMENTS-v1` belongs to it.
+const FORMAT: u32 = crate::format::version::NODE_CRC_SEGMENT_TABLE;
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct CrcTable {
     pub(crate) format: u32,
@@ -44,7 +47,7 @@ impl CrcTable {
             ));
         }
         Ok(Self {
-            format: 1,
+            format: FORMAT,
             length: bytes.len() as u64,
             segment_bytes: SEGMENT as u32,
             checksums: bytes.chunks(SEGMENT).map(checksum).collect(),
@@ -69,10 +72,19 @@ impl CrcTable {
             bytes: *h.finalize().as_bytes(),
         }
     }
+    /// Version-first check of a persisted descriptor, before `valid_shape`
+    /// and the descriptor digest.
+    pub(crate) fn check_format(&self, object: impl std::fmt::Display) -> Result<()> {
+        crate::format::check(
+            crate::format::FormatKind::NodeCrcSegmentTable,
+            object,
+            u64::from(self.format),
+        )
+    }
     pub(crate) fn valid_shape(&self, length: u64) -> bool {
         length > 0
             && length <= 4 * 1024 * 1024
-            && self.format == 1
+            && self.format == FORMAT
             && self.length == length
             && self.segment_bytes == SEGMENT as u32
             && self.checksums.len() == (length as usize).div_ceil(SEGMENT)

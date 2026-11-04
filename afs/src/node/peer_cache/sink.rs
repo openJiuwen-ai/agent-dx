@@ -273,7 +273,7 @@ impl PeerStreamSink<'_> {
         write_header(
             file,
             &Header {
-                version: 2,
+                version: VERSION,
                 namespace_id: self.cache.options.namespace_id.clone(),
                 chunk: self.chunk.clone(),
                 outboard_length: 0,
@@ -377,7 +377,7 @@ impl PeerStreamSink<'_> {
             write_header(
                 file,
                 &Header {
-                    version: 2,
+                    version: VERSION,
                     namespace_id: self.cache.options.namespace_id.clone(),
                     chunk: self.chunk.clone(),
                     outboard_length: trailer.len() as u32,

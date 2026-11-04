@@ -68,17 +68,20 @@ WAL硬上限同时计入保留、待删除和已准备的孤立日志文件，�
 
 当前CURRENT内部格式为v3，最大64KiB；WAL记录信封为v2，状态image为schema2。
 v3 在 v2 基础上增加写者 term（`AFSM\0\x03`），帧布局、WAL段、checkpoint与实体编码不变。
-**格式变化：v2 CURRENT 直接拒绝启动**（`CONFIG_INVALID`，消息含“format v2”与“rebuild the
-Meta data directory”），原文件保留。此前创建的 local-file Meta 数据目录（OwnerFs 与 DFS
+**格式变化：v2 CURRENT 直接拒绝启动**（`STORAGE_FORMAT_INCOMPATIBLE`，`0x04040001`，消息含
+格式名、文件、发现版本 2、支持版本 3 与“rebuild the data directory”），原文件保留。此前创建的 local-file Meta 数据目录（OwnerFs 与 DFS
 共用同一 Meta WAL，OwnerFs-only 部署同样受影响）需停服后改用新的空数据目录重建，不提供迁移。
 不提供早期实验v1清单／记录或schema1 image的自动导入；格式不匹配时拒绝恢复，
-保留原目录及证据，不能手改格式或拼接目录。
+保留原目录及证据，不能手改格式或拼接目录。Meta 的 IDENTITY、WAL 段头、帧信封、记录 schema、CURRENT、
+checkpoint 文件头与状态 image，以及 Node 的 `catalog.snapshot`、CRC32C 段描述，版本不符都在完整性校验之前
+识别并统一返回 `STORAGE_FORMAT_INCOMPATIBLE`，与 CRC／hash／身份不符（`CONFIG_INVALID` 或 Node 存储错误码）
+区分；处置是换用匹配的二进制或重建数据目录。规则见架构文档“持久格式与协议版本规则”。
 
 每次以写者身份打开 Meta 日志都会把 term 加一，并在 CURRENT 与目录同步落盘后才开始恢复后的服务；
 新库从 term 1 开始，每帧记录写入它的 term。恢复时帧 term 必须不递减且不超过 CURRENT 的
 term，否则拒绝启动（`CONFIG_INVALID`）。持有旧 term 的句柄（已被更新的写者接管）任何追加、
 准入及其它日志操作都返回 `META_LOG_FENCED`（`0x03020002`，消息含 found／current term），
-不写入任何字节，Store 随即按现有规则失效，在途请求返回不可用。目录锁 `LOCK` 仍是本机互斥手段，
+不写入任何字节，Store 随即按现有规则失效；在途请求同样返回 `META_LOG_FENCED`，之后的请求返回不可用。目录锁 `LOCK` 仍是本机互斥手段，
 term 只在锁失效时兜底。`memory` 后端同样按 term 检查，但重启不保留。管理记录可推进日志位置而不改变业务revision。
 canonical路径已接入历史计账和运行时清理。请求结果及事件历史可通过
 [操作日志策略参数](#meta-操作日志有限策略)配置；下表列默认值，待处理输入与准备身份仍为内部边界：
@@ -668,6 +671,11 @@ Meta 注册回复提供实际已持久化租约的相对剩余期限 `lease_rema
 
 需配套升级 Meta 与 Node。旧 Meta 未返回相对期限时，新 Node 明确拒绝注册授权，
 不回退到跨机墙钟或任意30秒授权。Meta persistence readiness 的判定保持独立。
+
+注册请求携带 Node↔Meta 协议版本 `protocol_version`（当前为 1）。Meta 在登记会话前校验，
+不符或缺省（0，旧 Node）返回 `META_NODE_PROTOCOL_VERSION`（`0x03050001`，FailedPrecondition），
+不写入任何状态；该错误不属于首次注册的可重试类别，Node 直接启动失败。DFS 与 OwnerFs Node
+同受此约束，Meta 与 Node 必须使用同一版本发布。
 
 ### Native Peer 准入等待
 

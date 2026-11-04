@@ -524,7 +524,8 @@ pub fn external_object_key(
     };
     let (digest, _) = content_addressed_parts(chunk_id).ok_or_else(invalid)?;
     Ok(format!(
-        "afs/v1/{store_id}/{generation}/chunks/{}/{}",
+        "afs/v{}/{store_id}/{generation}/chunks/{}/{}",
+        crate::format::version::NODE_EXTERNAL_OBJECT_KEY,
         &digest[..2],
         chunk_id.0
     ))
@@ -733,11 +734,12 @@ pub enum CopyRole {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum CopyState {
-    /// Decode-only compatibility for snapshots written before staging was
-    /// removed from the Meta catalog. New code never creates or serves this
-    /// state, so old staging records can never become readable Ready copies.
+    /// Reserved: holds postcard index 0 so the indices of the other variants
+    /// (the Meta storage format) stay unchanged. Never created or served; it
+    /// is not readable. The JSON name stays `Staging`. Removing it changes
+    /// the encoding and needs a format version bump (`crate::format`).
     #[serde(rename = "Staging")]
-    LegacyStaging,
+    Reserved0,
     #[default]
     Ready,
     Corrupt,
@@ -755,7 +757,7 @@ impl CopyState {
 ///
 /// | Phase | Node representation | Meta representation |
 /// |---|---|---|
-/// | `Staged` | `StagedChunk`, native upload body, `.tmp` file | `CopyState::LegacyStaging` (decode only) |
+/// | `Staged` | `StagedChunk`, native upload body, `.tmp` file | none (`CopyState::Reserved0` is never created) |
 /// | `Durable` | `LocalChunkState::Durable` (+ `ReplicaAck`) | `{DurableReplica \| ExternalCommitted, Ready}` |
 /// | `VerifiedCache` | peer cache entry, S3 chunk cache | `{VerifiedCache, Ready}` |
 /// | `Quarantined` | `LocalChunkState::Quarantined` | `CopyState::Corrupt` once reported |
@@ -780,7 +782,7 @@ impl CopyPhase {
     /// The phase of a Meta copy record, for comparing the two authorities.
     pub fn of_meta(role: CopyRole, state: CopyState) -> Self {
         match (state, role) {
-            (CopyState::LegacyStaging, _) => Self::Staged,
+            (CopyState::Reserved0, _) => Self::Staged,
             (CopyState::Ready, CopyRole::VerifiedCache) => Self::VerifiedCache,
             (CopyState::Ready, CopyRole::DurableReplica | CopyRole::ExternalCommitted) => {
                 Self::Durable

@@ -916,7 +916,9 @@ fn disk_peer_cache_only_retires_recognized_legacy_disposable_file() {
         .mode(0o600)
         .open(&path)
         .unwrap();
-    file.write_all(OLD_MAGIC).unwrap();
+    // A former (v1) entry: recognised by its magic and discarded as derived
+    // data, without parsing its header.
+    file.write_all(b"AFSPC001").unwrap();
     file.write_all(&(header.len() as u32).to_le_bytes())
         .unwrap();
     file.write_all(&header).unwrap();
@@ -929,6 +931,66 @@ fn disk_peer_cache_only_retires_recognized_legacy_disposable_file() {
     assert_eq!(cache.stats().unwrap().entries, 0);
     assert!(!cache.path(&key).exists());
     assert_eq!(fs::read(persistent).unwrap(), staged.bytes());
+}
+
+/// R17 derived-data rule: an entry of any other version (here a future one
+/// with an unknown header layout) is discarded and its space released.
+#[test]
+fn disk_peer_cache_discards_entries_of_another_version() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = options(temp.path().join("cache"));
+    let staged = StagedChunk::new(OperationId::new("future-cache"), vec![52; 64 * 1024]);
+    let cache = DiskPeerCache::open(config.clone()).unwrap();
+    let key = cache.key(&staged.chunk).unwrap();
+    let path = cache.path(&key);
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(&path)
+        .unwrap();
+    file.write_all(b"AFSPC003\xff\xff\xff\xffnot a v2 header")
+        .unwrap();
+    drop(file);
+    drop(cache);
+    let cache = DiskPeerCache::open(config.clone()).unwrap();
+    assert_eq!(cache.stats().unwrap().entries, 0);
+    assert_eq!(cache.state.lock().unwrap().used_bytes, 0);
+    assert!(!cache.path(&key).exists());
+    drop(cache);
+    // A foreign magic is still not adopted or deleted. (`cache.path` is
+    // relative to the cache's directory descriptor; use the configured path.)
+    let path = config.directory.join(format!("{key}.ready"));
+    fs::write(&path, b"NOTPEER!").unwrap();
+    let mut permissions = fs::metadata(&path).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o600);
+    fs::set_permissions(&path, permissions).unwrap();
+    assert!(DiskPeerCache::open(config).is_err());
+    assert!(path.exists());
+}
+
+/// A directory marker of another version is a format mismatch; the
+/// directory is never emptied automatically.
+#[test]
+fn disk_peer_cache_marker_of_another_version_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = options(temp.path().join("cache"));
+    drop(DiskPeerCache::open(config.clone()).unwrap());
+    let marker = config.directory.join(MARKER);
+    fs::write(&marker, b"AFS disposable Peer cache v2\n").unwrap();
+    let error = DiskPeerCache::open(config).err().unwrap();
+    assert_eq!(error.code(), afs_error::STORAGE_FORMAT_INCOMPATIBLE);
+    for part in [
+        "Node Peer cache directory marker",
+        "version 2",
+        "supports version 1",
+    ] {
+        assert!(error.message().contains(part), "{part}: {error}");
+    }
+    assert_eq!(
+        fs::read(&marker).unwrap(),
+        b"AFS disposable Peer cache v2\n"
+    );
 }
 
 #[test]

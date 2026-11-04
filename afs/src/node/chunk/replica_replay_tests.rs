@@ -1978,6 +1978,46 @@ fn pr60_corrupt_sidecar_repairs_once_without_rewriting_body_or_catalog() {
     );
 }
 
+/// R17 derived-data rule: a sidecar of another version is recognised,
+/// discarded and rebuilt from the verified body, like a damaged one.
+#[test]
+fn sidecar_of_another_version_is_discarded_and_rebuilt() {
+    let temp = tempfile::tempdir().unwrap();
+    let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
+    let staged = pooled_outboard_chunks(&budget, 1, 128 * 1024)
+        .pop()
+        .unwrap();
+    let store = LocalChunkStore::open(temp.path(), "node-a")
+        .unwrap()
+        .with_outboard_budget(budget);
+    store.put(staged.clone()).unwrap();
+    store.sidecar_installer.wait_idle();
+    let path = store
+        .outboards
+        .join(format!("{}.bao", safe_id(&staged.chunk.id.0)));
+    let mut bytes = fs::read(&path).unwrap();
+    assert_eq!(bytes[8..10], 1_u16.to_le_bytes());
+    bytes[8] = 2;
+    let error = ChunkOutboard::validate_encoded_shape(&staged.chunk, &bytes).unwrap_err();
+    assert_eq!(error.code(), afs_error::NODE_TRANSFER_CORRUPT_DATA);
+    for part in [
+        "Node Bao sidecar",
+        "version 2",
+        "supports version 1",
+        "discarded and rebuilt",
+    ] {
+        assert!(error.message().contains(part), "{part}: {error}");
+    }
+    fs::write(&path, bytes).unwrap();
+    take_store_outboard_persist_io(&store);
+    drop(store.open_verified(&staged.chunk.id).unwrap());
+    assert_eq!(take_store_outboard_persist_io(&store).renames, 1);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        staged.outboard.as_ref().unwrap().encoded()
+    );
+}
+
 #[test]
 fn pr60_capacity_fallback_preserves_healthy_pinned_proof_and_sidecar() {
     let temp = tempfile::tempdir().unwrap();

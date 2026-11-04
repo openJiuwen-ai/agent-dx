@@ -344,7 +344,7 @@ impl<'a> PeerCacheOperation<'a> {
                 return Err(invalid("Peer cache ready file was replaced"));
             }
             let (header, body_start) = read_header(&mut file)?;
-            if header.version != 2
+            if header.version != VERSION
                 || header.namespace_id != self.cache.options.namespace_id
                 || header.chunk != *chunk
             {
@@ -554,7 +554,7 @@ impl<'a> PeerCacheOperation<'a> {
                 return Err(invalid("Peer cache ready file was replaced"));
             }
             let (header, body_start) = read_header(&mut file)?;
-            if header.version != 2
+            if header.version != VERSION
                 || header.namespace_id != self.cache.options.namespace_id
                 || header.chunk != *chunk
             {
@@ -630,7 +630,7 @@ impl<'a> PeerCacheOperation<'a> {
             write_header(
                 &mut file,
                 &Header {
-                    version: 2,
+                    version: VERSION,
                     namespace_id: sink.cache.options.namespace_id.clone(),
                     chunk: verified.chunk.clone(),
                     outboard_length: trailer.len() as u32,

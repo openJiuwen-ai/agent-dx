@@ -445,7 +445,7 @@ async fn persist_log_group(
             Err(error) => {
                 visible.poisoned.store(true, Ordering::Release);
                 for (reply, _) in replies.drain(..) {
-                    let _ = reply.send(Err(unavailable(format!("WAL admission failed: {error}"))));
+                    let _ = reply.send(Err(group_failure("WAL admission failed", &error)));
                 }
                 return Err(error);
             }
@@ -513,9 +513,7 @@ async fn persist_log_group(
                 visible.metrics.wal_failures.inc();
                 visible.poisoned.store(true, Ordering::Release);
                 for (reply, _) in replies.drain(..) {
-                    let _ = reply.send(Err(unavailable(format!(
-                        "operation log commit failed: {error}"
-                    ))));
+                    let _ = reply.send(Err(group_failure("operation log commit failed", &error)));
                 }
                 return Err(error);
             }
@@ -886,6 +884,18 @@ fn tracing_result(result: std::result::Result<&TxnOutcome, &Error>) -> &'static 
 
 pub(super) fn unavailable(message: impl Into<String>) -> Error {
     Error::coded(afs_error::IO_UNAVAILABLE, message)
+}
+
+/// The error each request of a failed log group receives. A fencing refusal
+/// keeps `META_LOG_FENCED` (nothing was written; a newer writer owns the
+/// log); every other failure stays unavailable, as before.
+fn group_failure(context: &str, error: &Error) -> Error {
+    let code = if error.code() == afs_error::META_LOG_FENCED {
+        afs_error::META_LOG_FENCED
+    } else {
+        afs_error::IO_UNAVAILABLE
+    };
+    Error::coded(code, format!("{context}: {error}"))
 }
 
 impl MetaStore for Store {

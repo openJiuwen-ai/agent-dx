@@ -116,6 +116,36 @@ true 在握手后继续使用标准 TLS。Node、Meta、读写、副本、控制
 可被观察或主动修改。初始证书身份不等于明文流的持续防篡改，CRC不能替代该保护。
 默认模式适用于受控且无主动攻击者的网络；需要抵抗链路攻击时统一开启加密。
 
+### 持久格式与协议版本规则
+
+每种持久格式或带版本的协议在 `afs/src/format.rs` 有且只有一个 `FormatKind` 及当前版本常量
+（Meta：WAL 帧信封、WAL 段头、IDENTITY、CURRENT、checkpoint 文件头、`StateImage`、
+`RecordDecision`、namespace 请求摘要；Node：`catalog.wal`、`catalog.snapshot`、CRC32C 段描述、
+Bao sidecar、Peer cache 条目与目录标记、外部对象 key 前缀、OwnerFs 本地根记录；协议：Node↔Meta、
+RDMA 握手）。读写两端都用这些常量，不再散落 magic／版本字面量。
+
+- **版本先于完整性**：固定头读前 6 字节（`magic` + 大端 u16），postcard 负载读首个 varint，
+  JSON 先探测版本字段；版本不符报 `STORAGE_FORMAT_INCOMPATIBLE`（`0x04040001`，
+  FailedPrecondition），消息固定含格式名、文件／对象、发现版本、支持版本与处置建议。
+  版本相符时其余 CRC、hash、身份与解码检查及其消息不变。版本字段本身被损坏时同样按版本不符报告；
+  原文件保留，不影响判断“不迁移、不删除”。
+- **权威数据不迁移、不自动删除**：需重建数据目录或换用匹配的二进制。CURRENT 列出的 checkpoint
+  版本不符时直接拒绝，不回退到上一快照。
+- **派生／可丢弃数据识别后丢弃重建**：Bao sidecar 版本不符仍按损坏类处理（本地读丢弃后全量校验
+  并重写，peer 证明拒收）；Peer cache 条目只要是 `AFSPC` 其它版本即删除并释放额度；Peer cache
+  目录标记版本不符报格式错误，不自动清空目录。
+- **外层容器与内层负载各管一层**：checkpoint 文件头管文件、`StateImage` schema 管负载；WAL 帧信封
+  管帧、`RecordDecision` schema 管决策。外层版本在外层完整性之前检查，内层版本在外层完整性之后、
+  内层完整解码之前检查。
+- **改编码必升版本**：字段或变体增删改序、serde 属性、postcard 升级、hash 域串变化，都必须同时升
+  对应版本并重新生成 golden；变体下标表（G1）与 golden bytes（G2）在编码变化时失败。没有版本字段的
+  `catalog.wal` 与请求摘要只由 golden 钉住。
+- **未上线不做兼容**：旧格式直接拒绝，不提供迁移或旧版本识别分支。
+- **协议**：`RegisterNodeRequest.protocol_version` 由 Node 填当前版本；Meta 在读写任何状态前校验，
+  不符（含缺省 0）返回 `META_NODE_PROTOCOL_VERSION`（`0x03050001`，FailedPrecondition）且不登记会话，
+  Node 初始注册不重试该错误。DFS 与 OwnerFs Node 走同一注册路径。Node↔Node 通道本身不握手，
+  依赖经 Meta 准入的同版本部署；RDMA 握手版本沿用 `NODE_RDMA_HANDSHAKE_VERSION`。
+
 ### OwnerFs Root 授权的代际与回收
 
 RootGrant 按 Root、holder node/session 保存。同 session 的重新 acquire 更新原条目；

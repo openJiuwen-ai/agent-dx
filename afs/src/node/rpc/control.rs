@@ -63,7 +63,7 @@ use std::sync::atomic::AtomicU64;
 #[cfg(feature = "rdma")]
 const MAX_RDMA_SESSIONS: usize = 64;
 /// RDMA SEND_WITH_IMM 探测握手版本；双方都确认后才创建/使用探测资源。
-pub const RDMA_HANDSHAKE_VERSION: u32 = 1;
+pub const RDMA_HANDSHAKE_VERSION: u32 = crate::format::version::RDMA_HANDSHAKE;
 #[cfg(feature = "rdma")]
 const PROBE_TIMEOUT_MS: u32 = 5000;
 const SESSION_TTL: Duration = Duration::from_secs(600);

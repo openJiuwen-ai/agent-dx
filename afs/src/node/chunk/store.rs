@@ -332,6 +332,11 @@ impl LocalChunkStore {
             .map_err(|_| invalid("local chunk catalog lock is poisoned"))?;
         let mut damaged = Vec::new();
         for record in catalog.records.values() {
+            // Version first: every persisted descriptor is identified before
+            // its shape and digest; later reads use these checked records.
+            if let Some(table) = &record.segment_crc {
+                table.check_format(format_args!("of chunk {}", record.chunk.id.0))?;
+            }
             if record.chunk.is_segment_crc32c()
                 && (!record.chunk.valid_immutable_identity()
                     || !record.segment_crc.as_ref().is_some_and(|t| {

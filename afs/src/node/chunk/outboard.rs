@@ -401,7 +401,8 @@ impl Drop for OutboardLease {
 
 pub(crate) type SharedOutboard = Arc<ChunkOutboard>;
 const HEADER: usize = 64;
-const MAGIC: &[u8; 8] = b"AFSBAO1\0";
+const MAGIC: &[u8; 8] = &crate::format::NODE_CHUNK_SIDECAR_MAGIC;
+const VERSION: u16 = crate::format::version::NODE_CHUNK_SIDECAR;
 const MAX_OBJECT_BYTES: u64 = 4 * 1024 * 1024;
 const GROUP_LOG: u8 = 5;
 fn tree(length: u64) -> BaoTree {
@@ -470,11 +471,28 @@ impl ChunkOutboard {
     /// remain untrusted until the official Bao range validator checks them.
     pub(crate) fn validate_encoded_shape(expected: &ChunkObject, encoded: &[u8]) -> Result<()> {
         let bad = || super::corrupt(&expected.id, "outboard format/root binding mismatch");
+        // Version first. A sidecar is derived data (`Disposition::Discard`):
+        // another version stays a corruption-class error, so every caller
+        // keeps today's handling — a local reader discards it, verifies the
+        // body in full and rewrites the sidecar; a peer proof is refused.
+        if encoded.len() >= 10 && &encoded[..8] == MAGIC {
+            let found = u16::from_le_bytes([encoded[8], encoded[9]]);
+            if found != VERSION {
+                return Err(super::corrupt(
+                    &expected.id,
+                    &crate::format::message(
+                        crate::format::FormatKind::NodeChunkSidecar,
+                        "header",
+                        u64::from(found),
+                    ),
+                ));
+            }
+        }
         if expected.length > MAX_OBJECT_BYTES
             || encoded.len() < HEADER
             || encoded.len() > MAX_ENCODED_OUTBOARD_BYTES
             || &encoded[..8] != MAGIC
-            || encoded[8..10] != 1_u16.to_le_bytes()
+            || encoded[8..10] != VERSION.to_le_bytes()
             || encoded[10] != GROUP_LOG
             || encoded[11..16] != [0; 5]
             || encoded[60..64] != [0; 4]
@@ -1339,7 +1357,7 @@ impl OutboardBuilder {
                 let raw_size = tree(self.length).outboard_size() as usize;
                 encoded.copy_within(0..raw_size, HEADER);
                 encoded[..8].copy_from_slice(MAGIC);
-                encoded[8..10].copy_from_slice(&1_u16.to_le_bytes());
+                encoded[8..10].copy_from_slice(&VERSION.to_le_bytes());
                 encoded[10] = GROUP_LOG;
                 encoded[11..16].fill(0);
                 encoded[16..24].copy_from_slice(&self.length.to_le_bytes());

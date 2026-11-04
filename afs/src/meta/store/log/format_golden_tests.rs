@@ -321,7 +321,7 @@ fn dfs_persisted_enum_variant_indices_are_pinned() {
         2: CopyRole::ExternalCommitted => CopyRole::ExternalCommitted,
     });
     pin_variants!(CopyState {
-        0: CopyState::LegacyStaging => CopyState::LegacyStaging,
+        0: CopyState::Reserved0 => CopyState::Reserved0,
         1: CopyState::Ready => CopyState::Ready,
         2: CopyState::Corrupt => CopyState::Corrupt,
         3: CopyState::Deleting => CopyState::Deleting,

@@ -330,6 +330,7 @@ impl Fixture {
                     ..Default::default()
                 }),
                 lease_seconds: 300,
+                protocol_version: afs::format::version::NODE_META_PROTOCOL,
             })
             .await
             .unwrap();

@@ -38,16 +38,22 @@ pub(super) fn requested_crc_read_mode(
     metadata: &tonic::metadata::MetadataMap,
 ) -> Result<crate::config::DfsReadCrcMode, Status> {
     use crate::config::DfsReadCrcMode;
+    let invalid = |message: &str| {
+        error_to_status(afs_error::Error::coded(
+            afs_error::NODE_TRANSFER_INVALID,
+            message,
+        ))
+    };
     let requested = metadata
         .get("x-afs-read-crc-mode")
         .map(|v| v.to_str())
         .transpose()
-        .map_err(|_| Status::invalid_argument("invalid read CRC mode metadata"))?;
+        .map_err(|_| invalid("invalid read CRC mode metadata"))?;
     match requested {
         None | Some("both") => Ok(DfsReadCrcMode::Both),
         Some("receiver") => Ok(DfsReadCrcMode::Receiver),
         Some("off") => Ok(DfsReadCrcMode::Off),
-        Some(_) => Err(Status::invalid_argument("unknown read CRC mode")),
+        Some(_) => Err(invalid("unknown read CRC mode")),
     }
 }
 
