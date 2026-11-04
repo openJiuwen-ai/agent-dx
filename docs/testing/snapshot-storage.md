@@ -178,6 +178,16 @@ Linux 回归 `storage::inspection::tests::node_inspection_clone_budget` 在独�
 64 个已删除、一个其他节点和两个本节点有效记录，每份携带 2 MiB 模板数据，限制巡检
 新增峰值小于 16 MiB；这验证复制范围，不代表 Coordinator 的总内存预算或集群容量。
 
+已初始化目录的 Session 在读取 Snapshot 列表、节点所有权和回收候选时，先校验当前
+epoch，再从同一个已提交目录筛选并复制结果；不会为每次操作通过 Redis HVALS 重读
+全部历史 tombstone。未初始化目录的独立存储 Session 保留原有持久化查询与数据校验。
+可复用快照发布只借用目录判断同 storage/location 是否已有非 Deleted 所有者，不复制
+全部保留记录；Deleting 仍占有制品。目录因取消或不确定写入而不可用时，此判断返回
+Unavailable，必须先恢复，不能把目录缺失解释为“无人使用”。来源记录、节点会话与
+最终提交的 epoch/CAS 校验保持不变。
+真实 Redis 回归覆盖发布、列表和一次 GC 不重读历史目录，以及 Deleting/Deleted
+所有权、未恢复目录和旧 epoch 拒绝；这不替代部署后的并发或故障验收。
+
 ## 共享回收与故障
 
 Coordinator 在 Redis 持久化共享制品清单。每轮检查 Environment 恢复点、执行输入、

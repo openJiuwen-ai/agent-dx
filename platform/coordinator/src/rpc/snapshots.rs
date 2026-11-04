@@ -267,14 +267,9 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                     ));
                 }
                 if session
-                    .retained_snapshots()
+                    .snapshot_artifact_owned(&snapshot.artifact)
                     .await
                     .map_err(status)?
-                    .iter()
-                    .any(|s| {
-                        s.artifact.storage == snapshot.artifact.storage
-                            && s.artifact.location == snapshot.artifact.location
-                    })
                 {
                     return Err(Status::failed_precondition(
                         "snapshot artifact already owned",

@@ -259,6 +259,21 @@ impl Session {
     ) -> Result<Vec<Snapshot>> {
         let [header_value] = self.store.fields([HEADER.into()]).await?;
         self.header(&header_value)?;
+        // The active Coordinator maintains this committed view under the same
+        // latch as snapshot CAS. Filter before cloning so Deleted history is
+        // neither transferred from Redis nor copied for each catalog query.
+        // Standalone storage sessions without an initialized view retain their
+        // authoritative durable read, including validation of stored records.
+        if let Some(inventory) = self.inspection.lock().await.as_ref() {
+            let mut result: Vec<_> = inventory
+                .snapshots
+                .values()
+                .filter(|snapshot| include(snapshot))
+                .cloned()
+                .collect();
+            result.sort_by(|a, b| a.id.cmp(&b.id));
+            return Ok(result);
+        }
         let mut command = redis::cmd("HVALS");
         command.arg(self.snapshots_key());
         let raw: Vec<String> = self.store.query(command).await?;

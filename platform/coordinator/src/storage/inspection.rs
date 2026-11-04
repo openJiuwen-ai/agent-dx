@@ -119,6 +119,25 @@ impl Session {
         self.inspection.is_ready()
     }
 
+    /// Publication needs an ownership predicate, not copies of every retained
+    /// Snapshot. An ambiguous/cancelled write must recover before answering.
+    pub(crate) async fn snapshot_artifact_owned(
+        &self,
+        artifact: &adx_core::CheckpointArtifact,
+    ) -> Result<bool> {
+        let [header] = self.store.fields([HEADER.into()]).await?;
+        self.header(&header)?;
+        let inventory = self.inspection.lock().await;
+        let inventory = inventory
+            .as_ref()
+            .ok_or_else(|| Error::Unavailable("inspection inventory requires recovery".into()))?;
+        Ok(inventory.snapshots.values().any(|snapshot| {
+            snapshot.state != adx_core::snapshots::SnapshotState::Deleted
+                && snapshot.artifact.storage == artifact.storage
+                && snapshot.artifact.location == artifact.location
+        }))
+    }
+
     pub(crate) async fn node_inspection_inventory(
         &self,
         node_id: &str,
@@ -137,6 +156,37 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires isolated real Redis"]
+    async fn snapshot_ownership_requires_a_recovered_inventory_and_current_epoch() {
+        let rig = crate::rpc::cancellation_test_redis::Redis::new().await;
+        let store = rig.store().await;
+        let session = store.begin(1).await.unwrap();
+        let artifact = adx_core::CheckpointArtifact {
+            storage: "shared".into(),
+            scope: String::new(),
+            location: "unowned".into(),
+            size_bytes: 1,
+        };
+        assert!(matches!(
+            session.snapshot_artifact_owned(&artifact).await,
+            Err(Error::Unavailable(_))
+        ));
+        session.refresh_inspection_inventory().await.unwrap();
+        assert!(!session.snapshot_artifact_owned(&artifact).await.unwrap());
+        *session.inspection.lock().await = None;
+        assert!(matches!(
+            session.snapshot_artifact_owned(&artifact).await,
+            Err(Error::Unavailable(_))
+        ));
+        session.refresh_inspection_inventory().await.unwrap();
+        let _replacement = store.begin(1).await.unwrap();
+        assert!(matches!(
+            session.snapshot_artifact_owned(&artifact).await,
+            Err(Error::Conflict)
+        ));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

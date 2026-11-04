@@ -299,3 +299,116 @@ async fn concurrent_snapshot_ids_cannot_claim_the_same_artifact() {
     assert_eq!(usize::from(one.is_ok()) + usize::from(two.is_ok()), 1);
     assert_eq!(session.retained_snapshots().await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+#[ignore = "requires isolated real Redis"]
+async fn snapshot_publication_and_listing_do_not_reload_the_historical_catalog() {
+    let (redis, rpc, session, snapshot, _) = fixture().await;
+    // History remains durable, but must not be transferred and decoded again
+    // for each independent capture, list, or collector pass.
+    for index in 0..64 {
+        let mut historical = snapshot.clone();
+        historical.id = format!("history-{index}");
+        historical.artifact.location = format!("history-artifact-{index}");
+        historical
+            .template
+            .env
+            .insert("history".into(), "x".repeat(4096));
+        session.publish_snapshot(historical.clone()).await.unwrap();
+        session
+            .delete_snapshot(&historical.id, "tenant")
+            .await
+            .unwrap();
+        session
+            .finish_snapshot_deletion(&historical.id, 2)
+            .await
+            .unwrap();
+    }
+    let mut control = redis::Client::open(redis.url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let _: String = redis::cmd("CONFIG")
+        .arg("RESETSTAT")
+        .query_async(&mut control)
+        .await
+        .unwrap();
+    rpc.publish_snapshot(node_request(pb::PublishSnapshotRequest {
+        snapshot: Some(snapshot.clone().try_into().unwrap()),
+        node_session_id: "boot".into(),
+    }))
+    .await
+    .unwrap();
+    let listed = rpc
+        .list_snapshots(api_request(pb::ListSnapshotsRequest {
+            caller: Some(pb::CallerContext {
+                tenant_id: "tenant".into(),
+                administrator: false,
+            }),
+            ..Default::default()
+        }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(listed.snapshots.len(), 1);
+    assert_eq!(listed.snapshots[0].id, snapshot.id);
+    assert_eq!(rpc.collect_snapshots().await.unwrap(), 0);
+    let stats: redis::InfoDict = redis::cmd("INFO")
+        .arg("COMMANDSTATS")
+        .query_async(&mut control)
+        .await
+        .unwrap();
+    // HVALS of the tiny execution-hold catalog is unrelated to snapshot
+    // history. One collector pass may read that catalog once.
+    let hvals = stats.get::<String>("cmdstat_hvals").unwrap_or_default();
+    let hgetall = stats.get::<String>("cmdstat_hgetall").unwrap_or_default();
+    eprintln!("snapshot hot-path command stats: HVALS={hvals}, HGETALL={hgetall}");
+    assert!(
+        hvals.is_empty() || hvals.starts_with("calls=1,"),
+        "capture/list/GC reloaded snapshot history: {hvals}"
+    );
+    assert!(
+        hgetall.is_empty(),
+        "hot paths reloaded all metadata: {hgetall}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated real Redis"]
+async fn snapshot_artifact_ownership_tracks_committed_deletion() {
+    let (_redis, rpc, session, first, _) = fixture().await;
+    rpc.publish_snapshot(node_request(pb::PublishSnapshotRequest {
+        snapshot: Some(first.clone().try_into().unwrap()),
+        node_session_id: "boot".into(),
+    }))
+    .await
+    .unwrap();
+    session.delete_snapshot(&first.id, "tenant").await.unwrap();
+    let mut second = first.clone();
+    second.id = "new-owner".into();
+    let publish = || {
+        node_request(pb::PublishSnapshotRequest {
+            snapshot: Some(second.clone().try_into().unwrap()),
+            node_session_id: "boot".into(),
+        })
+    };
+    assert_eq!(
+        rpc.publish_snapshot(publish()).await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition,
+        "Deleting still owns the artifact"
+    );
+    session
+        .finish_snapshot_deletion(&first.id, 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        rpc.publish_snapshot(publish())
+            .await
+            .unwrap()
+            .into_inner()
+            .id,
+        second.id,
+        "Deleted must release ownership"
+    );
+}
