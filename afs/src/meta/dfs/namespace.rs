@@ -470,20 +470,14 @@ impl DfsService {
         }
         validate_name(&old_name)?;
         validate_name(&new_name)?;
-        let old_parent = self
-            .directory_for_mutation(&namespace_id, &old_parent_inode_id)
+        let (old_parent, new_parent) = self
+            .rename_parents(
+                &caller,
+                &namespace_id,
+                &old_parent_inode_id,
+                &new_parent_inode_id,
+            )
             .await?;
-        let new_parent = self
-            .directory_for_mutation(&namespace_id, &new_parent_inode_id)
-            .await?;
-        if let Some(parent) = &old_parent {
-            ensure_directory_create_access(&caller, parent)?;
-        }
-        if old_parent_inode_id != new_parent_inode_id
-            && let Some(parent) = &new_parent
-        {
-            ensure_directory_create_access(&caller, parent)?;
-        }
         let old_key = DentryKey {
             namespace_id: namespace_id.clone(),
             parent_inode_id: old_parent_inode_id.clone(),
@@ -530,148 +524,88 @@ impl DfsService {
         let mut replaced_inode = None;
         let mut target_directory_empty_condition = None;
         if let Some(target) = &target_dentry {
-            let target_inode =
-                inode_from_view(&view, &namespace_id, target.inode_id.clone()).await?;
-            ensure_sticky_parent_allows(&caller, new_parent.as_ref(), &target_inode)?;
-            if target_inode.inode_id == source_inode.inode_id {
-                return self
-                    .record_rename_noop(
-                        caller_id,
-                        operation_id,
-                        source_dentry,
-                        source_inode,
-                        request_digest,
-                    )
-                    .await;
-            }
-            if source_inode.kind == InodeKind::Directory
-                || target_inode.kind == InodeKind::Directory
+            match rename_target_rules(
+                &view,
+                &caller,
+                &namespace_id,
+                new_parent.as_ref(),
+                &source_inode,
+                target,
+            )
+            .await?
             {
-                if source_inode.kind == InodeKind::Directory
-                    && target_inode.kind != InodeKind::Directory
-                {
-                    return Err(not_directory(
-                        "DFS rename cannot replace a directory with a non-directory",
-                    ));
+                RenameTargetRule::SameInode => {
+                    return self
+                        .record_rename_noop(
+                            caller_id,
+                            operation_id,
+                            source_dentry,
+                            source_inode,
+                            request_digest,
+                        )
+                        .await;
                 }
-                if source_inode.kind != InodeKind::Directory
-                    && target_inode.kind == InodeKind::Directory
-                {
-                    return Err(is_directory(
-                        "DFS rename cannot replace a non-directory with a directory",
-                    ));
+                RenameTargetRule::Replace {
+                    target_inode,
+                    empty_directory,
+                } => {
+                    target_directory_empty_condition = empty_directory;
+                    replaced_inode = Some(*target_inode);
                 }
-                let target_empty =
-                    directory_entries_from_view(&view, &namespace_id, &target_inode.inode_id)
-                        .await?;
-                if !target_empty.is_empty() {
-                    return Err(directory_not_empty(
-                        "DFS rename cannot replace a non-empty directory",
-                    ));
-                }
-                target_directory_empty_condition = Some(target_inode.inode_id.clone());
             }
-            replaced_inode = Some(target_inode);
         }
 
-        let request = RequestKey::new(caller_id, operation_id.0.clone());
-        let mut renamed_inode = source_inode.clone();
-        renamed_inode.attributes.ctime_unix_ms = now_unix_ms();
-        renamed_inode.revision = renamed_inode.revision.saturating_add(1);
-        if let Some(inode) = replaced_inode.as_mut() {
-            inode.attributes.nlink = if inode.kind == InodeKind::Directory {
-                0
-            } else {
-                inode.attributes.nlink.saturating_sub(1)
-            };
-            inode.attributes.ctime_unix_ms = now_unix_ms();
-            inode.revision = inode.revision.saturating_add(1);
-        }
-        let outcome_value = RenameOutcome {
-            inode: renamed_inode.clone(),
-            replaced_inode: replaced_inode.clone(),
-        };
-        let outcome = RequestOutcome {
-            request: request.clone(),
-            operation: StoreOperation::DfsRename,
-            result: namespace_result(request_digest, OperationResult::DfsRename(outcome_value)),
-        };
-        let mut txn = MetaTxn::new(request.clone(), StoreOperation::DfsRename);
-        txn.conditions.extend([
-            TxnCondition::RequestAbsent(request),
-            TxnCondition::EntityEquals(MetaEntity::DfsDentry(source_dentry.clone())),
-            TxnCondition::EntityEquals(MetaEntity::DfsInode(source_inode.clone())),
-            TxnCondition::Missing(MetaKey::DfsDentry(new_key.clone())),
-        ]);
-        if let Some(target) = &target_dentry {
-            txn.conditions.pop();
-            txn.conditions
-                .push(TxnCondition::EntityEquals(MetaEntity::DfsDentry(
-                    target.clone(),
-                )));
-        }
-        if source_inode.kind == InodeKind::Directory {
-            txn.conditions.push(TxnCondition::DfsNotDescendant {
-                namespace_id: namespace_id.clone(),
-                ancestor_inode_id: source_inode.inode_id.clone(),
-                child_inode_id: new_parent_inode_id.clone(),
-            });
-        }
-        if let Some(target_inode_id) = target_directory_empty_condition {
-            txn.conditions.push(TxnCondition::DfsDirectoryEmpty {
-                namespace_id: namespace_id.clone(),
-                parent_inode_id: target_inode_id,
-            });
-        }
-        txn.mutations
-            .push(TxnMutation::Delete(MetaKey::DfsDentry(old_key)));
-        if let Some(target) = &target_dentry {
-            txn.mutations
-                .push(TxnMutation::Delete(MetaKey::DfsDentry(target.key.clone())));
-            if let Some(inode) = replaced_inode.clone() {
-                let original =
-                    inode_from_view(&view, &namespace_id, inode.inode_id.clone()).await?;
-                txn.conditions
-                    .push(TxnCondition::EntityEquals(MetaEntity::DfsInode(original)));
-                txn.mutations
-                    .push(TxnMutation::Put(MetaEntity::DfsInode(inode)));
-            }
-        }
-        txn.mutations
-            .push(TxnMutation::Put(MetaEntity::DfsDentry(Dentry {
-                key: new_key,
-                inode_id: source_inode.inode_id.clone(),
-            })));
-        txn.mutations
-            .push(TxnMutation::Put(MetaEntity::DfsInode(renamed_inode)));
-        let moving_directory = source_inode.kind == InodeKind::Directory;
-        let replacing_directory = replaced_inode
-            .as_ref()
-            .is_some_and(|inode| inode.kind == InodeKind::Directory);
-        if old_parent_inode_id == new_parent_inode_id {
-            push_parent_namespace_change(
-                &mut txn,
+        let same_parent = old_parent_inode_id == new_parent_inode_id;
+        let txn = rename_txn(
+            &view,
+            RenamePlan {
+                request: RequestKey::new(caller_id, operation_id.0.clone()),
+                request_digest,
+                namespace_id,
+                old_key,
+                new_key,
+                new_parent_inode_id,
+                source_dentry,
+                source_inode,
+                target_dentry,
+                replaced_inode,
+                target_directory_empty_condition,
                 old_parent,
-                if replacing_directory { -1 } else { 0 },
-            );
-        } else {
-            push_parent_namespace_change(
-                &mut txn,
-                old_parent,
-                if moving_directory { -1 } else { 0 },
-            );
-            push_parent_namespace_change(
-                &mut txn,
                 new_parent,
-                i32::from(moving_directory) - i32::from(replacing_directory),
-            );
-        }
-        txn.mutations
-            .push(TxnMutation::RecordRequestOutcome(outcome));
+                same_parent,
+            },
+        )
+        .await?;
         rename_outcome(
             validate_namespace_outcome(self.store.compare_and_commit(txn).await?, request_digest)?,
             StoreOperation::DfsRename,
         )
+    }
+
+    /// Reads both parent directories (old first) and checks create access on
+    /// each distinct one.
+    async fn rename_parents(
+        &self,
+        caller: &CallerContext,
+        namespace_id: &NamespaceId,
+        old_parent_inode_id: &InodeId,
+        new_parent_inode_id: &InodeId,
+    ) -> Result<(Option<InodeRecord>, Option<InodeRecord>)> {
+        let old_parent = self
+            .directory_for_mutation(namespace_id, old_parent_inode_id)
+            .await?;
+        let new_parent = self
+            .directory_for_mutation(namespace_id, new_parent_inode_id)
+            .await?;
+        if let Some(parent) = &old_parent {
+            ensure_directory_create_access(caller, parent)?;
+        }
+        if old_parent_inode_id != new_parent_inode_id
+            && let Some(parent) = &new_parent
+        {
+            ensure_directory_create_access(caller, parent)?;
+        }
+        Ok((old_parent, new_parent))
     }
 
     async fn remove_namespace_entry(
@@ -1285,4 +1219,185 @@ impl DfsService {
             StoreOperation::DfsRename,
         )
     }
+}
+
+/// What an existing rename target means for the rename.
+enum RenameTargetRule {
+    /// The target names the source inode: a recorded no-op.
+    SameInode,
+    /// The target inode is replaced; an empty directory target is pinned by
+    /// a `DfsDirectoryEmpty` condition.
+    Replace {
+        target_inode: Box<InodeRecord>,
+        empty_directory: Option<InodeId>,
+    },
+}
+
+/// Replacement rules for an existing target: sticky parent, same inode,
+/// directory/non-directory type match and empty directory.
+async fn rename_target_rules(
+    view: &MetaReadView,
+    caller: &CallerContext,
+    namespace_id: &NamespaceId,
+    new_parent: Option<&InodeRecord>,
+    source_inode: &InodeRecord,
+    target: &Dentry,
+) -> Result<RenameTargetRule> {
+    let target_inode = inode_from_view(view, namespace_id, target.inode_id.clone()).await?;
+    ensure_sticky_parent_allows(caller, new_parent, &target_inode)?;
+    if target_inode.inode_id == source_inode.inode_id {
+        return Ok(RenameTargetRule::SameInode);
+    }
+    let mut empty_directory = None;
+    if source_inode.kind == InodeKind::Directory || target_inode.kind == InodeKind::Directory {
+        if source_inode.kind == InodeKind::Directory && target_inode.kind != InodeKind::Directory {
+            return Err(not_directory(
+                "DFS rename cannot replace a directory with a non-directory",
+            ));
+        }
+        if source_inode.kind != InodeKind::Directory && target_inode.kind == InodeKind::Directory {
+            return Err(is_directory(
+                "DFS rename cannot replace a non-directory with a directory",
+            ));
+        }
+        let target_empty =
+            directory_entries_from_view(view, namespace_id, &target_inode.inode_id).await?;
+        if !target_empty.is_empty() {
+            return Err(directory_not_empty(
+                "DFS rename cannot replace a non-empty directory",
+            ));
+        }
+        empty_directory = Some(target_inode.inode_id.clone());
+    }
+    Ok(RenameTargetRule::Replace {
+        target_inode: Box::new(target_inode),
+        empty_directory,
+    })
+}
+
+/// Everything the rename transaction is assembled from, all read beforehand
+/// except the replaced inode's original record (re-read from the same view).
+struct RenamePlan {
+    request: RequestKey,
+    request_digest: [u8; 32],
+    namespace_id: NamespaceId,
+    old_key: DentryKey,
+    new_key: DentryKey,
+    new_parent_inode_id: InodeId,
+    source_dentry: Dentry,
+    source_inode: InodeRecord,
+    target_dentry: Option<Dentry>,
+    replaced_inode: Option<InodeRecord>,
+    target_directory_empty_condition: Option<InodeId>,
+    old_parent: Option<InodeRecord>,
+    new_parent: Option<InodeRecord>,
+    same_parent: bool,
+}
+
+async fn rename_txn(view: &MetaReadView, plan: RenamePlan) -> Result<MetaTxn> {
+    let RenamePlan {
+        request,
+        request_digest,
+        namespace_id,
+        old_key,
+        new_key,
+        new_parent_inode_id,
+        source_dentry,
+        source_inode,
+        target_dentry,
+        mut replaced_inode,
+        target_directory_empty_condition,
+        old_parent,
+        new_parent,
+        same_parent,
+    } = plan;
+    let mut renamed_inode = source_inode.clone();
+    renamed_inode.attributes.ctime_unix_ms = now_unix_ms();
+    renamed_inode.revision = renamed_inode.revision.saturating_add(1);
+    if let Some(inode) = replaced_inode.as_mut() {
+        inode.attributes.nlink = if inode.kind == InodeKind::Directory {
+            0
+        } else {
+            inode.attributes.nlink.saturating_sub(1)
+        };
+        inode.attributes.ctime_unix_ms = now_unix_ms();
+        inode.revision = inode.revision.saturating_add(1);
+    }
+    let outcome_value = RenameOutcome {
+        inode: renamed_inode.clone(),
+        replaced_inode: replaced_inode.clone(),
+    };
+    let outcome = RequestOutcome {
+        request: request.clone(),
+        operation: StoreOperation::DfsRename,
+        result: namespace_result(request_digest, OperationResult::DfsRename(outcome_value)),
+    };
+    let mut txn = MetaTxn::new(request.clone(), StoreOperation::DfsRename);
+    txn.conditions.extend([
+        TxnCondition::RequestAbsent(request),
+        TxnCondition::EntityEquals(MetaEntity::DfsDentry(source_dentry.clone())),
+        TxnCondition::EntityEquals(MetaEntity::DfsInode(source_inode.clone())),
+        TxnCondition::Missing(MetaKey::DfsDentry(new_key.clone())),
+    ]);
+    if let Some(target) = &target_dentry {
+        txn.conditions.pop();
+        txn.conditions
+            .push(TxnCondition::EntityEquals(MetaEntity::DfsDentry(
+                target.clone(),
+            )));
+    }
+    if source_inode.kind == InodeKind::Directory {
+        txn.conditions.push(TxnCondition::DfsNotDescendant {
+            namespace_id: namespace_id.clone(),
+            ancestor_inode_id: source_inode.inode_id.clone(),
+            child_inode_id: new_parent_inode_id.clone(),
+        });
+    }
+    if let Some(target_inode_id) = target_directory_empty_condition {
+        txn.conditions.push(TxnCondition::DfsDirectoryEmpty {
+            namespace_id: namespace_id.clone(),
+            parent_inode_id: target_inode_id,
+        });
+    }
+    txn.mutations
+        .push(TxnMutation::Delete(MetaKey::DfsDentry(old_key)));
+    if let Some(target) = &target_dentry {
+        txn.mutations
+            .push(TxnMutation::Delete(MetaKey::DfsDentry(target.key.clone())));
+        if let Some(inode) = replaced_inode.clone() {
+            let original = inode_from_view(view, &namespace_id, inode.inode_id.clone()).await?;
+            txn.conditions
+                .push(TxnCondition::EntityEquals(MetaEntity::DfsInode(original)));
+            txn.mutations
+                .push(TxnMutation::Put(MetaEntity::DfsInode(inode)));
+        }
+    }
+    txn.mutations
+        .push(TxnMutation::Put(MetaEntity::DfsDentry(Dentry {
+            key: new_key,
+            inode_id: source_inode.inode_id.clone(),
+        })));
+    txn.mutations
+        .push(TxnMutation::Put(MetaEntity::DfsInode(renamed_inode)));
+    let moving_directory = source_inode.kind == InodeKind::Directory;
+    let replacing_directory = replaced_inode
+        .as_ref()
+        .is_some_and(|inode| inode.kind == InodeKind::Directory);
+    if same_parent {
+        push_parent_namespace_change(
+            &mut txn,
+            old_parent,
+            if replacing_directory { -1 } else { 0 },
+        );
+    } else {
+        push_parent_namespace_change(&mut txn, old_parent, if moving_directory { -1 } else { 0 });
+        push_parent_namespace_change(
+            &mut txn,
+            new_parent,
+            i32::from(moving_directory) - i32::from(replacing_directory),
+        );
+    }
+    txn.mutations
+        .push(TxnMutation::RecordRequestOutcome(outcome));
+    Ok(txn)
 }

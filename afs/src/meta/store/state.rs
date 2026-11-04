@@ -621,8 +621,42 @@ impl State {
                 entities: Vec::new(),
             });
         }
+        let entity = self.point_entity(&read);
+        let request_outcome = match &read {
+            MetaRead::RequestOutcome(key) => self.requests.get(key).cloned(),
+            _ => None,
+        };
+        let (revision, entities) = match &read {
+            MetaRead::RootState { root_id } => self.read_root_state(root_id),
+            MetaRead::DfsDirectory {
+                namespace_id,
+                parent_inode_id,
+            } => self.read_dfs_directory(namespace_id, parent_inode_id),
+            MetaRead::CurrentNodeSessions => self.read_current_node_sessions(),
+            MetaRead::DfsPlacements => self.read_dfs_placements(),
+            MetaRead::DfsReplicationTasks => self.read_dfs_replication_tasks(),
+            MetaRead::RootGrants { root_id } => self.read_root_grants(root_id),
+            _ => (
+                // A conditional update compares the entity's mod revision,
+                // not the store-wide revision of unrelated later writes.
+                entity
+                    .map(|versioned| versioned.revision)
+                    .unwrap_or(self.revision),
+                Vec::new(),
+            ),
+        };
+        Ok(MetaSnapshot {
+            revision,
+            entity: entity.map(|versioned| versioned.entity.clone()),
+            request_outcome,
+            entities,
+        })
+    }
+
+    /// The single entity a point read names; `None` for range reads.
+    fn point_entity(&self, read: &MetaRead) -> Option<&VersionedEntity> {
         let state = self;
-        let entity = match &read {
+        match read {
             MetaRead::RootEpochWatermark => None,
             MetaRead::NodeSession {
                 node_id,
@@ -705,181 +739,169 @@ impl State {
             MetaRead::DfsReplicationTasks => None,
             MetaRead::DfsWriteLease(id) => state.entities.get(&MetaKey::DfsWriteLease(id.clone())),
             MetaRead::DfsGc => state.entities.get(&MetaKey::DfsGc),
-        };
-        let request_outcome = match &read {
-            MetaRead::RequestOutcome(key) => state.requests.get(key).cloned(),
-            _ => None,
-        };
-        let (revision, entities) = match &read {
-            MetaRead::RootState { root_id } => {
-                let entities = [
-                    MetaKey::Root {
-                        root_id: root_id.clone(),
-                    },
-                    MetaKey::RootReservation {
-                        root_id: root_id.clone(),
-                    },
-                ]
-                .iter()
-                .filter_map(|key| state.entities.get(key).map(|v| v.entity.clone()))
-                .collect();
-                (state.revision, entities)
-            }
+        }
+    }
 
-            MetaRead::DfsDirectory {
-                namespace_id,
-                parent_inode_id,
-            } => {
-                let mut entries = state
-                    .entities
-                    .starting_at(MetaKey::DfsDentry(crate::dfs::DentryKey { namespace_id:namespace_id.clone(), parent_inode_id:parent_inode_id.clone(), name:Vec::new() }))
-                    .take_while(|(key, _)| matches!(key, MetaKey::DfsDentry(key) if key.namespace_id == *namespace_id && key.parent_inode_id == *parent_inode_id))
-                    .filter_map(|(_, versioned)| match &versioned.entity {
-                        MetaEntity::DfsDentry(dentry)
-                            if dentry.key.namespace_id == *namespace_id
-                                && dentry.key.parent_inode_id == *parent_inode_id =>
-                        {
-                            Some((dentry.key.name.clone(), versioned.clone()))
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                entries.sort_by(|left, right| left.0.cmp(&right.0));
-                let revision = entries
-                    .iter()
-                    .fold(state.revision, |max, (_, entity)| max.max(entity.revision));
-                (
-                    revision,
-                    entries
-                        .into_iter()
-                        .map(|(_, versioned)| versioned.entity)
-                        .collect(),
-                )
-            }
-            MetaRead::CurrentNodeSessions => {
-                let mut sessions = state
-                    .entities
-                    .starting_at(MetaKey::CurrentNodeSession {
-                        node_id: String::new(),
-                    })
-                    .take_while(|(key, _)| matches!(key, MetaKey::CurrentNodeSession { .. }))
-                    .filter_map(|(key, versioned)| match (key, &versioned.entity) {
-                        (MetaKey::CurrentNodeSession { .. }, MetaEntity::NodeSession(session)) => {
-                            Some((
-                                session.node_id.clone(),
-                                session.session_id.clone(),
-                                versioned.clone(),
-                            ))
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                sessions.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
-                let revision = sessions.iter().fold(state.revision, |max, (_, _, entity)| {
-                    max.max(entity.revision)
-                });
-                (
-                    revision,
-                    sessions
-                        .into_iter()
-                        .map(|(_, _, versioned)| versioned.entity)
-                        .collect(),
-                )
-            }
-            MetaRead::DfsPlacements => {
-                let mut placements = state
-                    .entities
-                    .starting_at(MetaKey::DfsPlacement(crate::dfs::ChunkId(String::new())))
-                    .take_while(|(key, _)| matches!(key, MetaKey::DfsPlacement(_)))
-                    .filter_map(|(key, versioned)| match (key, &versioned.entity) {
-                        (MetaKey::DfsPlacement(chunk_id), MetaEntity::DfsPlacement(_)) => {
-                            Some((chunk_id.clone(), versioned.clone()))
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                placements.sort_by(|left, right| left.0.cmp(&right.0));
-                let revision = placements
-                    .iter()
-                    .fold(state.revision, |max, (_, entity)| max.max(entity.revision));
-                (
-                    revision,
-                    placements
-                        .into_iter()
-                        .map(|(_, versioned)| versioned.entity)
-                        .collect(),
-                )
-            }
-            MetaRead::DfsReplicationTasks => {
-                let mut tasks = state
-                    .entities
-                    .starting_at(MetaKey::DfsReplicationTask(crate::dfs::ReplicationTaskId(
-                        String::new(),
-                    )))
-                    .take_while(|(key, _)| matches!(key, MetaKey::DfsReplicationTask(_)))
-                    .filter_map(|(key, versioned)| match (key, &versioned.entity) {
-                        (MetaKey::DfsReplicationTask(id), MetaEntity::DfsReplicationTask(_)) => {
-                            Some((id.clone(), versioned.clone()))
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                tasks.sort_by(|left, right| left.0.cmp(&right.0));
-                let revision = tasks
-                    .iter()
-                    .fold(state.revision, |max, (_, entity)| max.max(entity.revision));
-                (
-                    revision,
-                    tasks
-                        .into_iter()
-                        .map(|(_, versioned)| versioned.entity)
-                        .collect(),
-                )
-            }
-            MetaRead::RootGrants { root_id } => {
-                let mut grants = state
-                    .entities
-                    .starting_at(MetaKey::RootGrant { root_id:root_id.clone(),holder_node_id:String::new(),holder_session_id:String::new() })
-                    .take_while(|(key, _)| matches!(key, MetaKey::RootGrant { root_id:key_root, .. } if key_root == root_id))
-                    .filter_map(|(key, versioned)| match (key, &versioned.entity) {
-                        (
-                            MetaKey::RootGrant {
-                                root_id: key_root, ..
-                            },
-                            MetaEntity::RootGrant(grant),
-                        ) if key_root == root_id => {
-                            Some((grant.holder_node_id.clone(), versioned.clone()))
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                grants.sort_by(|left, right| left.0.cmp(&right.0));
-                let revision = grants
-                    .iter()
-                    .fold(state.revision, |max, (_, entity)| max.max(entity.revision));
-                (
-                    revision,
-                    grants
-                        .into_iter()
-                        .map(|(_, versioned)| versioned.entity)
-                        .collect(),
-                )
-            }
-            _ => (
-                // A conditional update compares the entity's mod revision,
-                // not the store-wide revision of unrelated later writes.
-                entity
-                    .map(|versioned| versioned.revision)
-                    .unwrap_or(state.revision),
-                Vec::new(),
-            ),
-        };
-        Ok(MetaSnapshot {
+    fn read_root_state(&self, root_id: &str) -> (StoreRevision, Vec<MetaEntity>) {
+        let state = self;
+        let entities = [
+            MetaKey::Root {
+                root_id: root_id.to_owned(),
+            },
+            MetaKey::RootReservation {
+                root_id: root_id.to_owned(),
+            },
+        ]
+        .iter()
+        .filter_map(|key| state.entities.get(key).map(|v| v.entity.clone()))
+        .collect();
+        (state.revision, entities)
+    }
+
+    fn read_dfs_directory(
+        &self,
+        namespace_id: &crate::dfs::NamespaceId,
+        parent_inode_id: &crate::dfs::InodeId,
+    ) -> (StoreRevision, Vec<MetaEntity>) {
+        let state = self;
+        let mut entries = state
+            .entities
+            .starting_at(MetaKey::DfsDentry(crate::dfs::DentryKey { namespace_id:namespace_id.clone(), parent_inode_id:parent_inode_id.clone(), name:Vec::new() }))
+            .take_while(|(key, _)| matches!(key, MetaKey::DfsDentry(key) if key.namespace_id == *namespace_id && key.parent_inode_id == *parent_inode_id))
+            .filter_map(|(_, versioned)| match &versioned.entity {
+                MetaEntity::DfsDentry(dentry)
+                    if dentry.key.namespace_id == *namespace_id
+                        && dentry.key.parent_inode_id == *parent_inode_id =>
+                {
+                    Some((dentry.key.name.clone(), versioned.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let revision = entries
+            .iter()
+            .fold(state.revision, |max, (_, entity)| max.max(entity.revision));
+        (
             revision,
-            entity: entity.map(|versioned| versioned.entity.clone()),
-            request_outcome,
-            entities,
-        })
+            entries
+                .into_iter()
+                .map(|(_, versioned)| versioned.entity)
+                .collect(),
+        )
+    }
+
+    fn read_current_node_sessions(&self) -> (StoreRevision, Vec<MetaEntity>) {
+        let state = self;
+        let mut sessions = state
+            .entities
+            .starting_at(MetaKey::CurrentNodeSession {
+                node_id: String::new(),
+            })
+            .take_while(|(key, _)| matches!(key, MetaKey::CurrentNodeSession { .. }))
+            .filter_map(|(key, versioned)| match (key, &versioned.entity) {
+                (MetaKey::CurrentNodeSession { .. }, MetaEntity::NodeSession(session)) => Some((
+                    session.node_id.clone(),
+                    session.session_id.clone(),
+                    versioned.clone(),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        sessions.sort_by(|left, right| left.0.cmp(&right.0).then(left.1.cmp(&right.1)));
+        let revision = sessions.iter().fold(state.revision, |max, (_, _, entity)| {
+            max.max(entity.revision)
+        });
+        (
+            revision,
+            sessions
+                .into_iter()
+                .map(|(_, _, versioned)| versioned.entity)
+                .collect(),
+        )
+    }
+
+    fn read_dfs_placements(&self) -> (StoreRevision, Vec<MetaEntity>) {
+        let state = self;
+        let mut placements = state
+            .entities
+            .starting_at(MetaKey::DfsPlacement(crate::dfs::ChunkId(String::new())))
+            .take_while(|(key, _)| matches!(key, MetaKey::DfsPlacement(_)))
+            .filter_map(|(key, versioned)| match (key, &versioned.entity) {
+                (MetaKey::DfsPlacement(chunk_id), MetaEntity::DfsPlacement(_)) => {
+                    Some((chunk_id.clone(), versioned.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        placements.sort_by(|left, right| left.0.cmp(&right.0));
+        let revision = placements
+            .iter()
+            .fold(state.revision, |max, (_, entity)| max.max(entity.revision));
+        (
+            revision,
+            placements
+                .into_iter()
+                .map(|(_, versioned)| versioned.entity)
+                .collect(),
+        )
+    }
+
+    fn read_dfs_replication_tasks(&self) -> (StoreRevision, Vec<MetaEntity>) {
+        let state = self;
+        let mut tasks = state
+            .entities
+            .starting_at(MetaKey::DfsReplicationTask(crate::dfs::ReplicationTaskId(
+                String::new(),
+            )))
+            .take_while(|(key, _)| matches!(key, MetaKey::DfsReplicationTask(_)))
+            .filter_map(|(key, versioned)| match (key, &versioned.entity) {
+                (MetaKey::DfsReplicationTask(id), MetaEntity::DfsReplicationTask(_)) => {
+                    Some((id.clone(), versioned.clone()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        tasks.sort_by(|left, right| left.0.cmp(&right.0));
+        let revision = tasks
+            .iter()
+            .fold(state.revision, |max, (_, entity)| max.max(entity.revision));
+        (
+            revision,
+            tasks
+                .into_iter()
+                .map(|(_, versioned)| versioned.entity)
+                .collect(),
+        )
+    }
+
+    fn read_root_grants(&self, root_id: &str) -> (StoreRevision, Vec<MetaEntity>) {
+        let state = self;
+        let mut grants = state
+            .entities
+            .starting_at(MetaKey::RootGrant { root_id:root_id.to_owned(),holder_node_id:String::new(),holder_session_id:String::new() })
+            .take_while(|(key, _)| matches!(key, MetaKey::RootGrant { root_id:key_root, .. } if key_root == root_id))
+            .filter_map(|(key, versioned)| match (key, &versioned.entity) {
+                (
+                    MetaKey::RootGrant {
+                        root_id: key_root, ..
+                    },
+                    MetaEntity::RootGrant(grant),
+                ) if key_root == root_id => Some((grant.holder_node_id.clone(), versioned.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        grants.sort_by(|left, right| left.0.cmp(&right.0));
+        let revision = grants
+            .iter()
+            .fold(state.revision, |max, (_, entity)| max.max(entity.revision));
+        (
+            revision,
+            grants
+                .into_iter()
+                .map(|(_, versioned)| versioned.entity)
+                .collect(),
+        )
     }
 
     fn apply_validated(&mut self, txn: MetaTxn) -> Result<TxnOutcome> {

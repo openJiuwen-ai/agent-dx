@@ -1377,6 +1377,28 @@ impl StateImage {
         Self::parse(bytes, limit)?.restore()
     }
     fn validate(&self) -> Result<()> {
+        self.validate_bounds()?;
+        self.validate_event_completion()?;
+        self.validate_pool()?;
+        let mut referenced = PoolMarks(vec![false; self.values.len()]);
+        self.validate_entities(&mut referenced)?;
+        self.validate_requests(&mut referenced)?;
+        self.validate_events(&mut referenced)?;
+        self.validate_node_epochs()?;
+        for value in &self.values {
+            for id in value.references() {
+                referenced.mark(id)?;
+            }
+        }
+        if referenced.0.iter().any(|used| !used) {
+            return Err(invalid_contract(
+                "checkpoint contains unreachable pooled content",
+            ));
+        }
+        Ok(())
+    }
+    /// Magic, schema, revision cursor, item counts and the event ordinal base.
+    fn validate_bounds(&self) -> Result<()> {
         if self.magic != *b"AFSC"
             || self.schema != IMAGE_SCHEMA
             || self.compacted_to > self.revision
@@ -1401,6 +1423,10 @@ impl StateImage {
         {
             return Err(invalid_contract("checkpoint event ordinal bound invalid"));
         }
+        Ok(())
+    }
+    /// One original completion time per retained event revision group.
+    fn validate_event_completion(&self) -> Result<()> {
         let mut previous_group = None;
         let mut group_count = 0usize;
         for event in &self.events {
@@ -1430,6 +1456,10 @@ impl StateImage {
             }
             previous_completion = *revision;
         }
+        Ok(())
+    }
+    /// Pool values only reference earlier values, decode, and are unique.
+    fn validate_pool(&self) -> Result<()> {
         let mut unique: BTreeMap<[u8; 32], Vec<usize>> = BTreeMap::new();
         for (index, value) in self.values.iter().enumerate() {
             if value.references().iter().any(|id| id.0 as usize >= index) {
@@ -1450,13 +1480,9 @@ impl StateImage {
             }
             previous.push(index);
         }
-        let mut referenced = vec![false; self.values.len()];
-        let mut mark = |id: ValueId| -> Result<()> {
-            *referenced
-                .get_mut(id.0 as usize)
-                .ok_or_else(|| invalid_contract("checkpoint reference out of range"))? = true;
-            Ok(())
-        };
+        Ok(())
+    }
+    fn validate_entities(&self, referenced: &mut PoolMarks) -> Result<()> {
         let mut previous_key = None;
         for entry in &self.entities {
             if previous_key.is_some_and(|previous: &MetaKey| previous >= &entry.key)
@@ -1468,9 +1494,12 @@ impl StateImage {
             if !self.matches_key(&entry.key, entry.value) {
                 return Err(invalid_contract("checkpoint entity key/value mismatch"));
             }
-            mark(entry.value)?;
+            referenced.mark(entry.value)?;
             previous_key = Some(&entry.key);
         }
+        Ok(())
+    }
+    fn validate_requests(&self, referenced: &mut PoolMarks) -> Result<()> {
         let mut previous_request = None;
         for entry in &self.requests {
             let key = &entry.outcome.request;
@@ -1485,10 +1514,15 @@ impl StateImage {
             }
             entry.outcome.restore(&self.values)?;
             for id in entry.outcome.references() {
-                mark(id)?;
+                referenced.mark(id)?;
             }
             previous_request = Some(key);
         }
+        Ok(())
+    }
+    /// Event order, key/value agreement, and that each key's latest event
+    /// agrees with the authoritative entity set.
+    fn validate_events(&self, referenced: &mut PoolMarks) -> Result<()> {
         let mut previous_event = None;
         let mut latest: BTreeMap<MetaKey, &ImageEvent> = BTreeMap::new();
         for event in &self.events {
@@ -1507,7 +1541,7 @@ impl StateImage {
                     if !self.matches_key(key, *value) {
                         return Err(invalid_contract("checkpoint event key/value mismatch"));
                     }
-                    mark(*value)?;
+                    referenced.mark(*value)?;
                     key
                 }
                 Change::Delete { key } => key,
@@ -1544,6 +1578,11 @@ impl StateImage {
                 Change::Delete { .. } => {}
             }
         }
+        Ok(())
+    }
+    /// Node epochs are ordered and positive, and every stored session (and
+    /// current-session alias) stays within its node's epoch.
+    fn validate_node_epochs(&self) -> Result<()> {
         let mut previous_node = None;
         for (node, epoch) in &self.node_epochs {
             if node.is_empty()
@@ -1586,16 +1625,6 @@ impl StateImage {
                     }
                 }
             }
-        }
-        for value in &self.values {
-            for id in value.references() {
-                mark(id)?;
-            }
-        }
-        if referenced.iter().any(|used| !used) {
-            return Err(invalid_contract(
-                "checkpoint contains unreachable pooled content",
-            ));
         }
         Ok(())
     }
@@ -1656,6 +1685,19 @@ impl StateImage {
         state.node_epochs.extend(self.node_epochs.iter().cloned());
         state.rebuild_history_index()?;
         Ok(state)
+    }
+}
+
+/// Which pooled values a checkpoint image reaches; every value must be.
+struct PoolMarks(Vec<bool>);
+
+impl PoolMarks {
+    fn mark(&mut self, id: ValueId) -> Result<()> {
+        *self
+            .0
+            .get_mut(id.0 as usize)
+            .ok_or_else(|| invalid_contract("checkpoint reference out of range"))? = true;
+        Ok(())
     }
 }
 
