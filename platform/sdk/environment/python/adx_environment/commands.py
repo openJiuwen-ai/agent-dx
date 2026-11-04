@@ -364,17 +364,9 @@ class Commands:
     def _require_recovery_capability(self, command_id: str = "") -> None:
         if self._capabilities_checked:
             return
-        try:
-            response = self._client.invoke(self._sid, "process.capabilities", {})
-        except Exception as error:
-            if isinstance(error, EnvironmentError) and error.code == "ENVIRONMENT_OOM" and error.outcome == "terminal":
-                raise
-            raise UnsupportedFeature(
-                "environment runtime does not expose the recoverable command capability",
-                environment_id=self._sid,
-                command_id=command_id,
-                request_id=getattr(error, "request_id", None),
-            ) from error
+        # A failed query says nothing about runtime support. Keep the original
+        # transport/domain error and its retry, outcome and request metadata.
+        response = self._client.invoke(self._sid, "process.capabilities", {})
         capabilities = set(response.get("capabilities", ()))
         required = {"stable-command-id", "recoverable-command-result", "multiplexed-command-watch"}
         if response.get("protocol_version") != 1 or not required.issubset(capabilities):
@@ -451,7 +443,11 @@ class Commands:
                     ) from error
                 raise RuntimeError(str(error.payload.get("error", error))) from error
             except Exception as error:
-                if isinstance(error, EnvironmentError) and error.code == "ENVIRONMENT_OOM" and error.outcome == "terminal":
+                if (
+                    isinstance(error, EnvironmentError)
+                    and error.code in {"ENVIRONMENT_OOM", "ENVIRONMENT_FAILED"}
+                    and error.outcome == "terminal"
+                ):
                     raise
                 raise CommandSubmissionError(
                     f"command submission outcome is unknown: {error}",
