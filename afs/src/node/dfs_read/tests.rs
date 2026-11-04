@@ -7220,3 +7220,95 @@ fn external_backend_preserves_holes_without_requesting_a_source() {
     assert_eq!(*fixture.authorizations.lock().unwrap(), 0);
     assert_eq!(*fixture.fetches.lock().unwrap(), 0);
 }
+
+/// S1c-6 read hot-path microbenchmark (release, ignored). Measures per-call
+/// latency of a local read and a peer read through `StaticTransfer`; prints
+/// p50/p90/p99 per round. Run before and after a read-path refactor.
+#[test]
+#[ignore = "microbenchmark; run with --ignored --nocapture in release"]
+fn s1c6_read_hot_path_latency_microbench() {
+    s1c6_read_hot_path_round(4 * 1024, "4k");
+    s1c6_read_hot_path_round(64 * 1024, "64k");
+}
+
+type BenchCase<'a> = (&'static str, &'a dyn Fn(&mut [u8]));
+
+fn s1c6_read_hot_path_round(len: usize, label: &str) {
+    const WARMUP: usize = 2_000;
+    const ROUNDS: usize = 5;
+    const CALLS: usize = 20_000;
+    let payload: Vec<u8> = (0..len).map(|index| (index % 251) as u8).collect();
+    let temp = tempfile::tempdir().unwrap();
+    let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+    let local_chunk = put_local_chunk(&local, "bench-local", &payload);
+    let peer_chunk = ChunkId::new("bench-peer");
+    let sources = Arc::new(StaticSources::new(DfsChunkSourcesReply {
+        revision: 1,
+        chunks: vec![ChunkSources {
+            allowed_ranges: Vec::new(),
+            chunk: None,
+            chunk_id: peer_chunk.clone(),
+            sources: vec![source("peer-b", &peer_chunk, "node-b")],
+        }],
+    }));
+    let engine = DfsReadEngine::new(
+        crate::dfs::NamespaceId::new("default"),
+        "node-a".into(),
+        local,
+        sources,
+        Arc::new(StaticTransfer {
+            bytes: payload.clone(),
+            fail_first: Mutex::new(false),
+        }),
+        DfsReadConfig::default(),
+    );
+    let batch = |chunk_id: &ChunkId, version: Option<&str>| ReadBatch {
+        lookahead: Vec::new(),
+        file_version_id: version.map(FileVersionId::new),
+        layout_root_id: LayoutRootId::new("layout"),
+        ops: vec![ChunkReadOp {
+            chunk_id: chunk_id.clone(),
+            chunk_offset: 0,
+            length: len as u64,
+            output_offset: 0,
+        }],
+    };
+    let local_batch = batch(&local_chunk, Some("version"));
+    let peer_batch = batch(&peer_chunk, Some("version"));
+    let mut out = vec![0; len];
+    let cases: [BenchCase<'_>; 3] = [
+        ("local_read_batch", &|out| {
+            engine.read_batch(&local_batch, out).unwrap()
+        }),
+        ("peer_read_batch", &|out| {
+            engine.read_batch(&peer_batch, out).unwrap()
+        }),
+        ("peer_private_owned", &|out| {
+            engine
+                .read_batch_native_into_private(&peer_batch, out)
+                .unwrap()
+        }),
+    ];
+    for (name, call) in cases {
+        for _ in 0..WARMUP {
+            call(&mut out);
+        }
+        assert_eq!(out, payload, "{name} returned wrong bytes");
+        for round in 0..ROUNDS {
+            let mut samples = Vec::with_capacity(CALLS);
+            for _ in 0..CALLS {
+                let started = Instant::now();
+                call(&mut out);
+                samples.push(started.elapsed().as_nanos() as u64);
+            }
+            samples.sort_unstable();
+            let pick = |q: f64| samples[((samples.len() - 1) as f64 * q) as usize];
+            println!(
+                "s1c6-bench case={name}_{label} round={round} calls={CALLS} p50_ns={} p90_ns={} p99_ns={}",
+                pick(0.50),
+                pick(0.90),
+                pick(0.99)
+            );
+        }
+    }
+}

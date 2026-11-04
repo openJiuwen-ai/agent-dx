@@ -657,89 +657,26 @@ impl DfsReadEngine {
             validations: Vec::new(),
             missing_sources: Vec::new(),
         };
-        let mut permits = Vec::with_capacity(packed.ops.len());
-        let mut authorizations = Vec::with_capacity(packed.ops.len());
-        let mut misses = Vec::new();
-        let invalidation_generation;
-        {
-            let mut cache = self
-                .external_authority_cache
-                .lock()
-                .map_err(|_| unavailable("DFS external authority cache is poisoned"))?;
-            invalidation_generation = cache.invalidation_generation;
-            for op in &packed.ops {
-                let key = self.external_authority_key(inode_id, &packed, &op.chunk_id)?;
-                let permit = cache.lookup(&key, op.chunk_offset, op.length, &local);
-                authorizations.push(
-                    permit
-                        .as_ref()
-                        .map(|entry| Self::authorization_from_cache(entry, op)),
-                );
-                if permit.is_none() {
-                    misses.push(DfsMissingReadSource {
-                        chunk_id: op.chunk_id.clone(),
-                        chunk_offset: op.chunk_offset,
-                        length: op.length,
-                    });
-                }
-                permits.push(permit);
-            }
-        }
+        let ExternalVersionPermits {
+            mut permits,
+            mut authorizations,
+            misses,
+            invalidation_generation,
+        } = self.collect_cached_version_permits(inode_id, &packed, &local)?;
         span.record("auth_hits", (packed.ops.len() - misses.len()) as u64);
         span.record("auth_misses", misses.len() as u64);
         let source_timing = self.source_cache_timing()?;
-        let rpc_started = source_timing.sent;
-        let mut new_deadline = None;
-        if !misses.is_empty() {
-            let count = misses.len();
-            let reply = tracing::info_span!("node.dfs.read.version_auth_rpc", requests = count)
-                .in_scope(|| {
-                    backend.authorizer.authorize_external_version_read(
-                        AuthorizeExternalVersionRead {
-                            caller_id: self.local_node_id.clone(),
-                            inode_id: inode_id.clone(),
-                            namespace_id: self.namespace_id.clone(),
-                            file_version_id: version.clone(),
-                            layout_root_id: packed.layout_root_id.clone(),
-                            requests: misses,
-                        },
-                    )
-                });
-            let reply = match reply {
-                Ok(Some(reply)) => reply,
-                Ok(None) => return Ok(None),
-                Err(error) => {
-                    if crate::node::fault::classify::read_authority_rejected(&error) {
-                        self.invalidate_external_authority(inode_id, version)?;
-                    }
-                    return Err(error);
-                }
-            };
-            if reply.authorizations.len() != count
-                || reply.remaining_validity_ms == 0
-                || reply.remaining_validity_ms > 5_000
-            {
-                self.invalidate_external_authority(inode_id, version)?;
-                return Err(external_denied(
-                    "external version authority reply is incomplete or expired",
-                ));
-            }
-            // SEND-time anchoring already subtracts the complete RPC duration.
-            // Do not grant a fresh five seconds to a delayed response.
-            let deadline = rpc_started + Duration::from_millis(reply.remaining_validity_ms);
-            if deadline <= Instant::now() {
-                return Err(external_denied(
-                    "external version authority expired during RPC",
-                ));
-            }
-            new_deadline = Some(deadline);
-            let mut fresh = reply.authorizations.into_iter();
-            for authorization in &mut authorizations {
-                if authorization.is_none() {
-                    *authorization = fresh.next();
-                }
-            }
-        }
+        let new_deadline = match self.authorize_version_misses(
+            backend,
+            inode_id,
+            &packed,
+            misses,
+            &mut authorizations,
+            source_timing.sent,
+        )? {
+            VersionMissAuthorization::Unsupported => return Ok(None),
+            VersionMissAuthorization::Authorized(deadline) => deadline,
+        };
         let mut deadline = new_deadline;
         if let Some(session_deadline) = local.expires_at {
             deadline = Some(deadline.map_or(session_deadline, |value| value.min(session_deadline)));
@@ -809,53 +746,186 @@ impl DfsReadEngine {
             ));
         }
         // Cache only freshly admitted contexts. Hits never renew deadlines.
-        for (index, authorization) in authorized.iter().enumerate() {
-            if permits[index].is_none()
-                && let Some(fresh_deadline) = new_deadline
-            {
-                let key =
-                    self.external_authority_key(inode_id, &packed, &packed.ops[index].chunk_id)?;
-                let mut cutoff = fresh_deadline;
-                if let Some(session_deadline) = local.expires_at {
-                    cutoff = cutoff.min(session_deadline);
-                }
-                let wall_remaining = authorization
-                    .authorized
-                    .expires_at_unix_ms
-                    .saturating_sub(now_unix_ms());
-                cutoff = cutoff.min(Instant::now() + Duration::from_millis(wall_remaining));
-                let mut bytes = external_authority_entry_bytes(
-                    &key,
-                    &authorization.chunk,
-                    &authorization.authorized.validation.grant,
-                    &authorization.location,
-                    &authorization.authorized.allowed_ranges,
-                );
-                // Conservatively reserve the key copy, Arc/map overhead, copy ID
-                // and bounded projections held by the current batch as well.
-                bytes = bytes
-                    .saturating_add(authorization.authorized.validation.copy_id.0.capacity())
-                    .saturating_mul(4)
-                    .saturating_add(256);
-                permits[index] = cache.insert(ExternalAuthorityEntry {
-                    key,
-                    chunk: authorization.chunk.clone(),
-                    copy_id: authorization.authorized.validation.copy_id.clone(),
-                    location: authorization.location.clone(),
-                    grant: authorization.authorized.validation.grant.clone(),
-                    allowed_ranges: authorization.authorized.allowed_ranges.clone(),
-                    expires_at_unix_ms: authorization.authorized.expires_at_unix_ms,
-                    deadline: cutoff,
-                    node_epoch: authorization.authorized.validation.grant.caller_node_epoch,
-                    bytes,
-                    invalidated: AtomicBool::new(false),
-                    _reservation: None,
-                });
+        if let Some(fresh_deadline) = new_deadline {
+            let mut cutoff = fresh_deadline;
+            if let Some(session_deadline) = local.expires_at {
+                cutoff = cutoff.min(session_deadline);
             }
+            self.install_version_authorities(
+                &mut cache,
+                inode_id,
+                &packed,
+                &authorized,
+                &mut permits,
+                cutoff,
+            )?;
         }
         // Invalidation takes the same locks: transferring this private result
         // or copying into a borrowed output is the publication boundary.
         Ok(Some(publish(staged)))
+    }
+
+    /// Cached authority per nonempty op under one cache lock; misses are the
+    /// ranges that need a Meta authorization.
+    fn collect_cached_version_permits(
+        &self,
+        inode_id: &crate::dfs::InodeId,
+        packed: &ReadBatch,
+        local: &NativeReadAuthoritySnapshot,
+    ) -> Result<ExternalVersionPermits> {
+        let mut permits = Vec::with_capacity(packed.ops.len());
+        let mut authorizations = Vec::with_capacity(packed.ops.len());
+        let mut misses = Vec::new();
+        let mut cache = self
+            .external_authority_cache
+            .lock()
+            .map_err(|_| unavailable("DFS external authority cache is poisoned"))?;
+        let invalidation_generation = cache.invalidation_generation;
+        for op in &packed.ops {
+            let key = self.external_authority_key(inode_id, packed, &op.chunk_id)?;
+            let permit = cache.lookup(&key, op.chunk_offset, op.length, local);
+            authorizations.push(
+                permit
+                    .as_ref()
+                    .map(|entry| Self::authorization_from_cache(entry, op)),
+            );
+            if permit.is_none() {
+                misses.push(DfsMissingReadSource {
+                    chunk_id: op.chunk_id.clone(),
+                    chunk_offset: op.chunk_offset,
+                    length: op.length,
+                });
+            }
+            permits.push(permit);
+        }
+        Ok(ExternalVersionPermits {
+            permits,
+            authorizations,
+            misses,
+            invalidation_generation,
+        })
+    }
+
+    /// One Meta authorization for every cache miss, anchored at send time.
+    /// Fills the missing `authorizations` in order.
+    fn authorize_version_misses(
+        &self,
+        backend: &ExternalReadBackend,
+        inode_id: &crate::dfs::InodeId,
+        packed: &ReadBatch,
+        misses: Vec<DfsMissingReadSource>,
+        authorizations: &mut [Option<DfsExternalAuthorizedRead>],
+        rpc_started: Instant,
+    ) -> Result<VersionMissAuthorization> {
+        if misses.is_empty() {
+            return Ok(VersionMissAuthorization::Authorized(None));
+        }
+        let version = packed
+            .file_version_id
+            .as_ref()
+            .ok_or_else(|| invalid("external read requires a version"))?;
+        let count = misses.len();
+        let reply = tracing::info_span!("node.dfs.read.version_auth_rpc", requests = count)
+            .in_scope(|| {
+                backend
+                    .authorizer
+                    .authorize_external_version_read(AuthorizeExternalVersionRead {
+                        caller_id: self.local_node_id.clone(),
+                        inode_id: inode_id.clone(),
+                        namespace_id: self.namespace_id.clone(),
+                        file_version_id: version.clone(),
+                        layout_root_id: packed.layout_root_id.clone(),
+                        requests: misses,
+                    })
+            });
+        let reply = match reply {
+            Ok(Some(reply)) => reply,
+            Ok(None) => return Ok(VersionMissAuthorization::Unsupported),
+            Err(error) => {
+                if crate::node::fault::classify::read_authority_rejected(&error) {
+                    self.invalidate_external_authority(inode_id, version)?;
+                }
+                return Err(error);
+            }
+        };
+        if reply.authorizations.len() != count
+            || reply.remaining_validity_ms == 0
+            || reply.remaining_validity_ms > 5_000
+        {
+            self.invalidate_external_authority(inode_id, version)?;
+            return Err(external_denied(
+                "external version authority reply is incomplete or expired",
+            ));
+        }
+        // SEND-time anchoring already subtracts the complete RPC duration.
+        // Do not grant a fresh five seconds to a delayed response.
+        let deadline = rpc_started + Duration::from_millis(reply.remaining_validity_ms);
+        if deadline <= Instant::now() {
+            return Err(external_denied(
+                "external version authority expired during RPC",
+            ));
+        }
+        let mut fresh = reply.authorizations.into_iter();
+        for authorization in authorizations.iter_mut() {
+            if authorization.is_none() {
+                *authorization = fresh.next();
+            }
+        }
+        Ok(VersionMissAuthorization::Authorized(Some(deadline)))
+    }
+
+    /// Retain the freshly authorized contexts, none past `fresh_cutoff` (the
+    /// fresh and session deadlines). Runs under the publication locks the
+    /// caller holds.
+    fn install_version_authorities(
+        &self,
+        cache: &mut ExternalAuthorityCache,
+        inode_id: &crate::dfs::InodeId,
+        packed: &ReadBatch,
+        authorized: &[DfsExternalAuthorizedRead],
+        permits: &mut [Option<Arc<ExternalAuthorityEntry>>],
+        fresh_cutoff: Instant,
+    ) -> Result<()> {
+        for (index, authorization) in authorized.iter().enumerate() {
+            if permits[index].is_some() {
+                continue;
+            }
+            let key = self.external_authority_key(inode_id, packed, &packed.ops[index].chunk_id)?;
+            let mut cutoff = fresh_cutoff;
+            let wall_remaining = authorization
+                .authorized
+                .expires_at_unix_ms
+                .saturating_sub(now_unix_ms());
+            cutoff = cutoff.min(Instant::now() + Duration::from_millis(wall_remaining));
+            let mut bytes = external_authority_entry_bytes(
+                &key,
+                &authorization.chunk,
+                &authorization.authorized.validation.grant,
+                &authorization.location,
+                &authorization.authorized.allowed_ranges,
+            );
+            // Conservatively reserve the key copy, Arc/map overhead, copy ID
+            // and bounded projections held by the current batch as well.
+            bytes = bytes
+                .saturating_add(authorization.authorized.validation.copy_id.0.capacity())
+                .saturating_mul(4)
+                .saturating_add(256);
+            permits[index] = cache.insert(ExternalAuthorityEntry {
+                key,
+                chunk: authorization.chunk.clone(),
+                copy_id: authorization.authorized.validation.copy_id.clone(),
+                location: authorization.location.clone(),
+                grant: authorization.authorized.validation.grant.clone(),
+                allowed_ranges: authorization.authorized.allowed_ranges.clone(),
+                expires_at_unix_ms: authorization.authorized.expires_at_unix_ms,
+                deadline: cutoff,
+                node_epoch: authorization.authorized.validation.grant.caller_node_epoch,
+                bytes,
+                invalidated: AtomicBool::new(false),
+                _reservation: None,
+            });
+        }
+        Ok(())
     }
 
     fn external_authority_key(
@@ -1413,4 +1483,19 @@ impl DfsReadEngine {
         }
         Ok(())
     }
+}
+
+/// Cached version authority looked up under one cache lock.
+struct ExternalVersionPermits {
+    permits: Vec<Option<Arc<ExternalAuthorityEntry>>>,
+    authorizations: Vec<Option<DfsExternalAuthorizedRead>>,
+    misses: Vec<DfsMissingReadSource>,
+    invalidation_generation: u64,
+}
+
+enum VersionMissAuthorization {
+    /// The authorizer does not support fixed-version authorization.
+    Unsupported,
+    /// Every miss is authorized; the fresh deadline when there were misses.
+    Authorized(Option<Instant>),
 }

@@ -39,6 +39,7 @@ use crate::{
 };
 
 mod authority;
+mod chunk_source;
 mod external;
 mod fanout;
 mod local;
@@ -47,6 +48,7 @@ mod prefetch;
 mod remote;
 mod sources;
 pub(super) use authority::{LocalReadAuthority, NativeReadAuthoritySnapshot};
+use chunk_source::*;
 use external::*;
 pub use external::{CurrentExternalReadOutcome, VerifiedExternalChunk};
 #[cfg(test)]
@@ -749,12 +751,12 @@ impl DfsReadEngine {
     ) -> Result<()> {
         self.validate_native_read_size(out.len())?;
         batch.validate_for_output(out.len(), &self.config)?;
-        if self.external_backend.is_some() {
+        let ChunkSource::Native(native) = self.chunk_source() else {
             return Err(Error::coded(
                 afs_error::NODE_TRANSFER_UNSUPPORTED,
                 "private native read cannot use an external backend",
             ));
-        }
+        };
         // Native layout operations are disjoint. Reject overlaps explicitly:
         // direct local grouping must not change the old scatter precedence.
         for (index, left) in batch.ops.iter().enumerate() {
@@ -771,7 +773,8 @@ impl DfsReadEngine {
             }
         }
         let authority = self.capture_native_read_authority()?;
-        self.read_batch_into_private(batch, out, true, deadline)
+        native
+            .read(batch, out, true, deadline)
             .inspect_err(|error| {
                 self.invalidate_native_batch_on_error(batch, error);
             })?;
@@ -787,15 +790,16 @@ impl DfsReadEngine {
     ) -> Result<()> {
         self.validate_native_read_size(out.len())?;
         batch.validate_for_output(out.len(), &self.config)?;
-        if self.external_backend.is_some() {
+        let ChunkSource::Native(native) = self.chunk_source() else {
             return Err(Error::coded(
                 afs_error::NODE_TRANSFER_UNSUPPORTED,
                 "private native read cannot use an external backend",
             ));
-        }
+        };
         self.validate_private_native_ranges(batch)?;
         let authority = self.capture_native_read_authority()?;
-        self.read_batch_into_private(batch, out, true, deadline)
+        native
+            .read(batch, out, true, deadline)
             .inspect_err(|error| {
                 self.invalidate_native_batch_on_error(batch, error);
             })?;
@@ -837,7 +841,8 @@ impl DfsReadEngine {
         );
         let _entered = span.enter();
         batch.validate_for_output(out.len(), &self.config)?;
-        let native_authority = if self.external_backend.is_none() {
+        let route = self.chunk_source();
+        let native_authority = if matches!(route, ChunkSource::Native(_)) {
             Some(self.capture_native_read_authority()?)
         } else {
             None
@@ -852,14 +857,16 @@ impl DfsReadEngine {
             length += op.length as usize;
         }
         let mut staged = vec![0; length];
-        let expires_at = if let Some(backend) = &self.external_backend {
-            self.read_external_batch(backend, &staged_batch, &mut staged)?
-        } else {
-            self.read_batch_into(&staged_batch, &mut staged)
-                .inspect_err(|error| {
-                    self.invalidate_native_batch_on_error(batch, error);
-                })?;
-            None
+        let expires_at = match route {
+            ChunkSource::External(source) => source.read(&staged_batch, &mut staged)?,
+            ChunkSource::Native(source) => {
+                source
+                    .read(&staged_batch, &mut staged, false, None)
+                    .inspect_err(|error| {
+                        self.invalidate_native_batch_on_error(batch, error);
+                    })?;
+                None
+            }
         };
         // Full-object fetches may outlive the authorization that allowed them.
         // Check again at the publication boundary, including cached sources.
@@ -922,8 +929,10 @@ impl DfsReadEngine {
             return Err(invalid("DFS owned read exceeds inflight byte budget"));
         }
         batch.validate_for_output(output_len, &self.config)?;
-        if self.external_backend.is_some()
-            || batch.ops.len() != 1
+        let ChunkSource::Native(native) = self.chunk_source() else {
+            return Ok(None);
+        };
+        if batch.ops.len() != 1
             || batch.ops[0].output_offset != 0
             || batch.ops[0].length != output_len as u64
         {
@@ -942,7 +951,8 @@ impl DfsReadEngine {
         let mut result = self
             .reply_buffer_pool
             .take(output_len, self.local.read_work_metrics().cloned())?;
-        self.read_batch_into_private(batch, &mut result, true, deadline)
+        native
+            .read(batch, &mut result, true, deadline)
             .inspect_err(|error| {
                 self.invalidate_native_batch_on_error(batch, error);
             })?;

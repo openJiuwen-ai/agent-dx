@@ -1,40 +1,19 @@
-//! The native read entry: local copies first, then the remote mask.
+//! `LocalSource`: verified local copies; failures leave a remote mask.
 
 use super::*;
 
 impl DfsReadEngine {
-    pub(super) fn read_batch_into(&self, batch: &ReadBatch, out: &mut [u8]) -> Result<()> {
-        self.read_batch_into_private(batch, out, false, None)
-    }
-
-    pub(super) fn read_batch_into_private(
+    /// `LocalSource`: serve every operation whose chunk has a verified local
+    /// copy. Failed and short local reads quarantine a copy that is really bad
+    /// and leave their operations in the remote mask.
+    pub(super) fn read_local_copies(
         &self,
         batch: &ReadBatch,
         out: &mut [u8],
-        final_owned: bool,
-        deadline: Option<Instant>,
-    ) -> Result<()> {
-        self.transfer
-            .block_on_read(Box::pin(self.read_batch_into_private_async(
-                batch,
-                out,
-                final_owned,
-                deadline,
-                Arc::new(()),
-            )))
-    }
-
-    pub(super) async fn read_batch_into_private_async(
-        &self,
-        batch: &ReadBatch,
-        out: &mut [u8],
-        final_owned: bool,
-        deadline: Option<Instant>,
-        lifetime: super::super::read_pipeline::ReadLifetime,
-    ) -> Result<()> {
+    ) -> Result<SourceOutcome> {
         self.local
             .record_read_check(super::super::read_work::ReadCheck::BatchGroup);
-        let remote = crate::node::bridge::local_io(|| -> Result<Vec<bool>> {
+        let remote = crate::node::bridge::local_io(|| -> Result<RemoteMask> {
             let mut groups: Vec<(ChunkId, Vec<usize>)> = Vec::new();
             let mut positions: HashMap<ChunkId, usize> = HashMap::new();
             for (index, op) in batch.ops.iter().enumerate() {
@@ -48,107 +27,90 @@ impl DfsReadEngine {
                     groups.push((op.chunk_id.clone(), vec![index]));
                 }
             }
-            let mut remote = vec![false; batch.ops.len()];
+            let mut remote = RemoteMask::new(batch.ops.len());
             for (chunk_id, indices) in groups {
-                let reader = match self.local_reader(&chunk_id) {
-                    Ok(reader) => reader,
-                    Err(error) => {
-                        self.handle_local_read_failure(&chunk_id, &error)?;
-                        for index in indices {
-                            remote[index] = true;
-                        }
-                        continue;
-                    }
-                };
-                // Published layout ChunkIds are trusted content addresses. The
-                // local catalog/pinned descriptor cannot substitute a different
-                // standard root or object shape for that Meta layout identity.
-                let expected = if batch.file_version_id.is_some() {
-                    ChunkObject::from_content_addressed_id(&chunk_id)
-                } else {
-                    None
-                };
-                if let Some(expected) = &expected {
-                    validate_local_object_identity(expected, reader.chunk())?;
-                }
-                let mut ranges = Vec::with_capacity(indices.len());
-                for &index in &indices {
-                    let op = &batch.ops[index];
-                    let length = usize::try_from(op.length)
-                        .map_err(|_| invalid("DFS read length is too large"))?;
-                    ranges.push(VerifiedRangeCopy {
-                        chunk_offset: op.chunk_offset,
-                        length,
-                        output_offset: op.output_offset,
-                    });
-                }
-                let read = if expected.is_some() {
-                    reader.read_ranges_at_uncommitted(&ranges, out)
-                } else {
-                    // Legacy IDs and unpublished local reads retain the previous
-                    // complete-root path; they do not claim a Meta-anchored proof.
-                    reader.read_ranges_at_uncommitted_fullscan(&ranges, out)
-                };
-                match read {
-                    Ok(counts) => {
-                        let mut short = false;
-                        for (&index, count) in indices.iter().zip(counts) {
-                            let expected = usize::try_from(batch.ops[index].length)
-                                .map_err(|_| invalid("DFS read length is too large"))?;
-                            if count != expected {
-                                remote[index] = true;
-                                short = true;
-                            }
-                        }
-                        if short {
-                            let error = corrupt("local Chunk ended before the requested range");
-                            self.handle_local_read_failure(&chunk_id, &error)?;
-                        }
-                    }
-                    Err(error) => {
-                        self.handle_local_read_failure(&chunk_id, &error)?;
-                        for index in indices {
-                            remote[index] = true;
-                        }
-                    }
-                }
+                self.read_local_group(batch, &chunk_id, &indices, out, &mut remote)?;
             }
             Ok(remote)
         })?;
-        let remote_ops = batch
-            .ops
-            .iter()
-            .enumerate()
-            .filter(|(index, _op)| remote[*index])
-            .map(|(_, op)| op.clone())
-            .collect::<Vec<_>>();
-        if remote_ops.is_empty() {
-            return Ok(());
-        }
-        let remote_batch = ReadBatch {
-            lookahead: batch.lookahead.clone(),
-            file_version_id: batch.file_version_id.clone(),
-            layout_root_id: batch.layout_root_id.clone(),
-            ops: remote_ops,
+        Ok(if remote.is_empty() {
+            SourceOutcome::Done
+        } else {
+            SourceOutcome::Partial(remote)
+        })
+    }
+
+    /// One chunk's operations from its local copy, or into the remote mask.
+    fn read_local_group(
+        &self,
+        batch: &ReadBatch,
+        chunk_id: &ChunkId,
+        indices: &[usize],
+        out: &mut [u8],
+        remote: &mut RemoteMask,
+    ) -> Result<()> {
+        let reader = match self.local_reader(chunk_id) {
+            Ok(reader) => reader,
+            Err(error) => {
+                self.handle_local_read_failure(chunk_id, &error)?;
+                for &index in indices {
+                    remote.mark(index);
+                }
+                return Ok(());
+            }
         };
-        let deadline = deadline.unwrap_or_else(|| Instant::now() + self.read_pipeline_timeout());
-        let sources = self
-            .sources_for_attempt_async(&remote_batch, true, deadline, lifetime)
-            .await?;
-        let authority = self.capture_native_read_authority()?;
-        if authority.epoch != 0
-            && sources
-                .iter()
-                .flat_map(|set| &set.sources)
-                .any(|source| source.read_grant.caller_node_epoch != authority.epoch)
-        {
-            self.invalidate_native_batch_authority(batch);
-            return Err(external_denied(
-                "DFS source caller epoch differs from the registered session",
-            ));
+        // Published layout ChunkIds are trusted content addresses. The
+        // local catalog/pinned descriptor cannot substitute a different
+        // standard root or object shape for that Meta layout identity.
+        let expected = if batch.file_version_id.is_some() {
+            ChunkObject::from_content_addressed_id(chunk_id)
+        } else {
+            None
+        };
+        if let Some(expected) = &expected {
+            validate_local_object_identity(expected, reader.chunk())?;
         }
-        self.read_remote_batch_async(&remote_batch, &sources, out, final_owned, Some(deadline))
-            .await?;
+        let mut ranges = Vec::with_capacity(indices.len());
+        for &index in indices {
+            let op = &batch.ops[index];
+            let length =
+                usize::try_from(op.length).map_err(|_| invalid("DFS read length is too large"))?;
+            ranges.push(VerifiedRangeCopy {
+                chunk_offset: op.chunk_offset,
+                length,
+                output_offset: op.output_offset,
+            });
+        }
+        let read = if expected.is_some() {
+            reader.read_ranges_at_uncommitted(&ranges, out)
+        } else {
+            // Legacy IDs and unpublished local reads retain the previous
+            // complete-root path; they do not claim a Meta-anchored proof.
+            reader.read_ranges_at_uncommitted_fullscan(&ranges, out)
+        };
+        match read {
+            Ok(counts) => {
+                let mut short = false;
+                for (&index, count) in indices.iter().zip(counts) {
+                    let expected = usize::try_from(batch.ops[index].length)
+                        .map_err(|_| invalid("DFS read length is too large"))?;
+                    if count != expected {
+                        remote.mark(index);
+                        short = true;
+                    }
+                }
+                if short {
+                    let error = corrupt("local Chunk ended before the requested range");
+                    self.handle_local_read_failure(chunk_id, &error)?;
+                }
+            }
+            Err(error) => {
+                self.handle_local_read_failure(chunk_id, &error)?;
+                for &index in indices {
+                    remote.mark(index);
+                }
+            }
+        }
         Ok(())
     }
 

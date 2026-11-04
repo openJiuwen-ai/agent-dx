@@ -70,6 +70,8 @@ use catalog::*;
 use lifecycle::*;
 pub use lifecycle::{CopyPhase, QuarantineTrigger};
 use outboard_file::*;
+#[cfg(feature = "dfs")]
+pub(crate) use peer_serve::PeerGroupReader;
 #[cfg(feature = "rdma")]
 pub(crate) use peer_serve::PeerReadReservation;
 use peer_serve::*;

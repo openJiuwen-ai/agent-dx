@@ -143,15 +143,10 @@ impl DfsReadEngine {
             if covered != output_len {
                 reply.buffer.fill(0);
             }
-            self.read_batch_into_private_async(
-                &batch,
-                &mut reply.buffer,
-                true,
-                Some(deadline),
-                lifetime,
-            )
-            .await
-            .inspect_err(|error| self.invalidate_native_batch_on_error(&batch, error))?;
+            self.native_sources()
+                .read_async(&batch, &mut reply.buffer, true, Some(deadline), lifetime)
+                .await
+                .inspect_err(|error| self.invalidate_native_batch_on_error(&batch, error))?;
             self.check_native_read_authority(&authority)?;
             Ok(reply.into_bytes())
         })
@@ -186,14 +181,9 @@ impl DfsReadEngine {
             };
             let mut reply = allocation.allocate(deadline).await?;
             reply.buffer.fill(0);
-            self.read_batch_into_private_async(
-                &batch,
-                &mut reply.buffer,
-                true,
-                Some(deadline),
-                lifetime,
-            )
-            .await?;
+            self.native_sources()
+                .read_async(&batch, &mut reply.buffer, true, Some(deadline), lifetime)
+                .await?;
             crate::node::bridge::local_io(|| overlay(&mut reply.buffer))?;
             self.check_native_read_authority(&authority)?;
             Ok(reply.into_bytes())

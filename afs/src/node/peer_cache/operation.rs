@@ -2,7 +2,7 @@
 
 use super::*;
 
-impl PeerCacheOperation<'_> {
+impl<'a> PeerCacheOperation<'a> {
     pub(crate) fn has_control_capacity(&self) -> bool {
         self._metadata.is_some()
     }
@@ -228,57 +228,7 @@ impl PeerCacheOperation<'_> {
             return self.read_range_root_fallback(chunk, offset, out);
         }
         let prepare_started = Instant::now();
-        let selected = (|| {
-            self.cache.check_root()?;
-            validate_chunk(chunk)?;
-            if offset
-                .checked_add(out.len() as u64)
-                .is_none_or(|end| end > chunk.length)
-            {
-                return Err(invalid("Peer cache range exceeds immutable object"));
-            }
-            let key = self.cache.key(chunk)?;
-            let selected = {
-                let state = self.cache.lock_state()?;
-                state.entries.get(&key).map(|entry| {
-                    (
-                        entry.chunk.clone(),
-                        entry.charge,
-                        entry.identity,
-                        entry.touched,
-                        entry.proof.clone(),
-                        entry.generation.clone(),
-                    )
-                })
-            };
-            let Some((object, charge, identity, touched, proof, generation)) = selected else {
-                self.state.stats.misses = self.state.stats.misses.saturating_add(1);
-                return Ok(None);
-            };
-            if object != *chunk {
-                return Err(invalid("Peer cache index identity differs"));
-            }
-            let pin = EntryPin {
-                cache: self.cache,
-                generation: Some(generation),
-            };
-            self.state.entries.insert(
-                key.clone(),
-                Entry {
-                    chunk: object,
-                    charge,
-                    identity,
-                    touched,
-                    proof,
-                    generation: Arc::new(()),
-                    _metadata: None,
-                    #[cfg(test)]
-                    drop_observation: None,
-                },
-            );
-            Ok(Some((key, identity, pin)))
-        })();
-        let (key, expected, pin) = match selected {
+        let selected = match self.select_entry(chunk, offset, out.len()) {
             Ok(Some(selected)) => selected,
             early => {
                 self.state.stats.read_stages.prepare_ns = self
@@ -301,124 +251,217 @@ impl PeerCacheOperation<'_> {
                 &chunk.id.0,
             )
         });
-        let path = self.cache.path(&key);
         let mut finalize_started = None;
-        let result = (|| {
-            let prepared = (|| {
-                let (mut file, before) = open_private(&path)?;
-                if (before.dev(), before.ino()) != expected {
-                    return Err(invalid("Peer cache ready file was replaced"));
+        let result = self.read_verified_range(
+            chunk,
+            offset,
+            out,
+            &selected,
+            prepare_started,
+            &mut finalize_started,
+        );
+        let finalize_started = finalize_started.unwrap_or_else(Instant::now);
+        self.settle_range_read(result, selected, finalize_started, object_diagnostic)
+    }
+
+    /// Look up the indexed entry and pin its generation; a miss is `None`.
+    fn select_entry(
+        &mut self,
+        chunk: &ChunkObject,
+        offset: u64,
+        out_len: usize,
+    ) -> Result<Option<SelectedEntry<'a>>> {
+        self.cache.check_root()?;
+        validate_chunk(chunk)?;
+        if offset
+            .checked_add(out_len as u64)
+            .is_none_or(|end| end > chunk.length)
+        {
+            return Err(invalid("Peer cache range exceeds immutable object"));
+        }
+        let key = self.cache.key(chunk)?;
+        let selected = {
+            let state = self.cache.lock_state()?;
+            state.entries.get(&key).map(|entry| {
+                (
+                    entry.chunk.clone(),
+                    entry.charge,
+                    entry.identity,
+                    entry.touched,
+                    entry.proof.clone(),
+                    entry.generation.clone(),
+                )
+            })
+        };
+        let Some((object, charge, identity, touched, proof, generation)) = selected else {
+            self.state.stats.misses = self.state.stats.misses.saturating_add(1);
+            return Ok(None);
+        };
+        if object != *chunk {
+            return Err(invalid("Peer cache index identity differs"));
+        }
+        let pin = EntryPin {
+            cache: self.cache,
+            generation: Some(generation),
+        };
+        self.state.entries.insert(
+            key.clone(),
+            Entry {
+                chunk: object,
+                charge,
+                identity,
+                touched,
+                proof,
+                generation: Arc::new(()),
+                _metadata: None,
+                #[cfg(test)]
+                drop_observation: None,
+            },
+        );
+        Ok(Some(SelectedEntry {
+            key,
+            expected: identity,
+            pin,
+        }))
+    }
+
+    /// Open the pinned file, check its identity and header, then verify the
+    /// requested range against a reusable proof or a complete root scan.
+    fn read_verified_range(
+        &mut self,
+        chunk: &ChunkObject,
+        offset: u64,
+        out: &mut [u8],
+        selected: &SelectedEntry<'a>,
+        prepare_started: Instant,
+        finalize_started: &mut Option<Instant>,
+    ) -> Result<()> {
+        let key = selected.key.as_str();
+        let path = self.cache.path(key);
+        let prepared = (|| {
+            let (mut file, before) = open_private(&path)?;
+            if (before.dev(), before.ino()) != selected.expected {
+                return Err(invalid("Peer cache ready file was replaced"));
+            }
+            let (header, body_start) = read_header(&mut file)?;
+            if header.version != 2
+                || header.namespace_id != self.cache.options.namespace_id
+                || header.chunk != *chunk
+            {
+                return Err(corrupt("Peer cache header identity differs"));
+            }
+            validate_file_length(&header, &before)?;
+            let identity = file_identity(&before);
+            let reusable = self.state.entries.get(key).and_then(|entry| {
+                entry
+                    .proof
+                    .as_ref()
+                    .filter(|proof| proof.identity == identity)
+                    .map(|proof| proof.outboard.clone())
+            });
+            Ok((file, before, body_start, header, reusable))
+        })();
+        self.state.stats.read_stages.prepare_ns = self
+            .state
+            .stats
+            .read_stages
+            .prepare_ns
+            .saturating_add(elapsed_ns(prepare_started));
+        let (mut file, before, body_start, header, reusable) = prepared?;
+        let fresh = if let Some(outboard) = reusable {
+            match scan_outboard(
+                &file,
+                body_start,
+                chunk,
+                offset,
+                out,
+                &outboard,
+                &mut self.state.stats,
+            ) {
+                Ok(()) => None,
+                Err(error) if error.code() == afs_error::IO_CAPACITY => {
+                    self.state.budget.record_range_fullscan_fallback();
+                    // Optional proof work must not create a new read failure
+                    // when another live proof temporarily holds the ledger.
+                    let started = Instant::now();
+                    let result = scan_body(
+                        &mut file,
+                        body_start,
+                        chunk,
+                        offset,
+                        out,
+                        &mut self.state.stats,
+                        None,
+                    );
+                    self.state.stats.read_stages.stream_read_verify_ns = self
+                        .state
+                        .stats
+                        .read_stages
+                        .stream_read_verify_ns
+                        .saturating_add(elapsed_ns(started));
+                    result?
                 }
-                let (header, body_start) = read_header(&mut file)?;
-                if header.version != 2
-                    || header.namespace_id != self.cache.options.namespace_id
-                    || header.chunk != *chunk
-                {
-                    return Err(corrupt("Peer cache header identity differs"));
-                }
-                validate_file_length(&header, &before)?;
-                let identity = file_identity(&before);
-                let reusable = self.state.entries.get(&key).and_then(|entry| {
-                    entry
-                        .proof
-                        .as_ref()
-                        .filter(|proof| proof.identity == identity)
-                        .map(|proof| proof.outboard.clone())
-                });
-                Ok((file, before, body_start, header, reusable))
-            })();
-            self.state.stats.read_stages.prepare_ns = self
+                Err(error) => return Err(error),
+            }
+        } else {
+            // Metadata changes invalidate old summaries before a complete root scan.
+            let started = Instant::now();
+            if let Some(entry) = self.state.entries.get_mut(key) {
+                entry.proof = None;
+            }
+            refresh_metadata(&mut self.state);
+            let index = proof_can_fit(&self.state);
+            let peer = if index {
+                read_disk_outboard(&mut file, &header, &self.state.budget)?
+            } else {
+                None
+            };
+            // Without the retained complete FileIdentity we cannot claim
+            // unchanged bytes merely because a trailer is well shaped.
+            self.state.budget.record_range_fullscan_unretained();
+            let result = scan_body(
+                &mut file,
+                body_start,
+                chunk,
+                offset,
+                out,
+                &mut self.state.stats,
+                index.then(|| (self.cache.proof_budget(), peer)),
+            );
+            self.state.stats.read_stages.stream_read_verify_ns = self
                 .state
                 .stats
                 .read_stages
-                .prepare_ns
-                .saturating_add(elapsed_ns(prepare_started));
-            let (mut file, before, body_start, header, reusable) = prepared?;
-            let fresh = if let Some(outboard) = reusable {
-                match scan_outboard(
-                    &file,
-                    body_start,
-                    chunk,
-                    offset,
-                    out,
-                    &outboard,
-                    &mut self.state.stats,
-                ) {
-                    Ok(()) => None,
-                    Err(error) if error.code() == afs_error::IO_CAPACITY => {
-                        self.state.budget.record_range_fullscan_fallback();
-                        // Optional proof work must not create a new read failure
-                        // when another live proof temporarily holds the ledger.
-                        let started = Instant::now();
-                        let result = scan_body(
-                            &mut file,
-                            body_start,
-                            chunk,
-                            offset,
-                            out,
-                            &mut self.state.stats,
-                            None,
-                        );
-                        self.state.stats.read_stages.stream_read_verify_ns = self
-                            .state
-                            .stats
-                            .read_stages
-                            .stream_read_verify_ns
-                            .saturating_add(elapsed_ns(started));
-                        result?
-                    }
-                    Err(error) => return Err(error),
-                }
-            } else {
-                // Metadata changes invalidate old summaries before a complete root scan.
-                let started = Instant::now();
-                if let Some(entry) = self.state.entries.get_mut(&key) {
-                    entry.proof = None;
-                }
-                refresh_metadata(&mut self.state);
-                let index = proof_can_fit(&self.state);
-                let peer = if index {
-                    read_disk_outboard(&mut file, &header, &self.state.budget)?
-                } else {
-                    None
-                };
-                // Without the retained complete FileIdentity we cannot claim
-                // unchanged bytes merely because a trailer is well shaped.
-                self.state.budget.record_range_fullscan_unretained();
-                let result = scan_body(
-                    &mut file,
-                    body_start,
-                    chunk,
-                    offset,
-                    out,
-                    &mut self.state.stats,
-                    index.then(|| (self.cache.proof_budget(), peer)),
-                );
-                self.state.stats.read_stages.stream_read_verify_ns = self
-                    .state
-                    .stats
-                    .read_stages
-                    .stream_read_verify_ns
-                    .saturating_add(elapsed_ns(started));
-                result?
-            };
-            finalize_started = Some(Instant::now());
-            let after = file.metadata().map_err(Error::from)?;
-            let current = fs::symlink_metadata(&path).map_err(Error::from)?;
-            if file_identity(&before) != file_identity(&after)
-                || file_identity(&before) != file_identity(&current)
-            {
-                return Err(corrupt("Peer cache file changed during verified read"));
-            }
-            if fresh.is_some() {
-                install_proof(&mut self.state, &key, file_identity(&after), fresh);
-            }
-            Ok(())
-        })();
-        let finalize_started = finalize_started.unwrap_or_else(Instant::now);
+                .stream_read_verify_ns
+                .saturating_add(elapsed_ns(started));
+            result?
+        };
+        *finalize_started = Some(Instant::now());
+        let after = file.metadata().map_err(Error::from)?;
+        let current = fs::symlink_metadata(&path).map_err(Error::from)?;
+        if file_identity(&before) != file_identity(&after)
+            || file_identity(&before) != file_identity(&current)
+        {
+            return Err(corrupt("Peer cache file changed during verified read"));
+        }
+        if fresh.is_some() {
+            install_proof(&mut self.state, key, file_identity(&after), fresh);
+        }
+        Ok(())
+    }
+
+    /// Count the hit or retire a corrupt entry, then publish the verified
+    /// proof back to the shared index while the pin's generation is current.
+    fn settle_range_read(
+        &mut self,
+        result: Result<()>,
+        selected: SelectedEntry<'a>,
+        finalize_started: Instant,
+        object_diagnostic: Option<super::super::read_work::ReadObjectDiagnosticSpan>,
+    ) -> Result<bool> {
         let outcome = (|| match result {
             Ok(()) => {
-                if let Some(entry) = self.state.entries.get_mut(&key) {
+                if let Some(entry) = self.state.entries.get_mut(&selected.key) {
                     entry.touched = self.cache.bucket();
                 }
                 self.state.stats.hits = self.state.stats.hits.saturating_add(1);
@@ -427,7 +470,8 @@ impl PeerCacheOperation<'_> {
             Err(error) if crate::node::fault::classify::cached_copy_is_invalid(&error) => {
                 self.state.stats.corruptions = self.state.stats.corruptions.saturating_add(1);
                 self.state.stats.misses = self.state.stats.misses.saturating_add(1);
-                self.cache.retire(&key, pin.generation.as_ref(), false)?;
+                self.cache
+                    .retire(&selected.key, selected.pin.generation.as_ref(), false)?;
                 Ok(false)
             }
             Err(error) => Err(error),
@@ -438,11 +482,12 @@ impl PeerCacheOperation<'_> {
             .read_stages
             .finalize_ns
             .saturating_add(elapsed_ns(finalize_started));
-        let local_entry = self.state.entries.remove(&key);
+        let local_entry = self.state.entries.remove(&selected.key);
         let old_proof = if outcome.as_ref().is_ok_and(|hit| *hit) {
             let mut state = self.cache.lock_state()?;
-            if let Some(entry) = state.entries.get_mut(&key)
-                && pin
+            if let Some(entry) = state.entries.get_mut(&selected.key)
+                && selected
+                    .pin
                     .generation
                     .as_ref()
                     .is_some_and(|generation| Arc::ptr_eq(generation, &entry.generation))
@@ -460,7 +505,7 @@ impl PeerCacheOperation<'_> {
         };
         drop(old_proof);
         drop(local_entry);
-        drop(pin);
+        drop(selected.pin);
         if let Some(diagnostic) = object_diagnostic {
             diagnostic.finish(outcome.as_ref().is_ok_and(|hit| *hit));
         }
@@ -1048,4 +1093,12 @@ impl Drop for PeerCacheOperation<'_> {
             );
         }
     }
+}
+
+/// An indexed entry selected for a verified range read, pinned to its
+/// generation until the read settles.
+struct SelectedEntry<'a> {
+    key: String,
+    expected: (u64, u64),
+    pin: EntryPin<'a>,
 }

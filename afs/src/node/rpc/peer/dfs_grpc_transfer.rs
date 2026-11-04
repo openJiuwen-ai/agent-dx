@@ -201,13 +201,164 @@ impl GrpcChunkTransfer {
             return Ok(None);
         }
         let read_owner = self.admit_borrowed_read().await?;
+        let Some(target) = self.peer_stream_target(batch, chunk, requested_offset, out.len())?
+        else {
+            return Ok(None);
+        };
+        let PeerStreamTarget {
+            node_id,
+            node_epoch,
+            endpoint,
+            request,
+        } = target;
+        let handle = match &self.runtime {
+            PeerRuntime::Existing(handle) => handle.clone(),
+            PeerRuntime::Owned(runtime) => runtime.handle().clone(),
+        };
+        let peers = self.peers.clone();
+        let timeout = crate::node::read_pipeline::current_read_scope()
+            .map(|s| crate::node::read_pipeline::remaining_read_budget(s.deadline, self.timeout))
+            .transpose()?
+            .unwrap_or(self.timeout);
+        let deadline = std::time::Instant::now() + timeout;
+        let output_binding = sink.bind_output(requested_offset, out)?;
+        // Capture tracing metadata on the caller before crossing the task boundary.
+        let mut producer_request = request_with_current_context(request.clone());
+        producer_request.set_timeout(timeout);
+        // Acquire before spawning, and retain through producer join and all
+        // queued/consumer blocks. Every block also pins this operation ticket.
+        if let Some(control) = prefetch {
+            control.check()?;
+        }
+        let Some(active) = self
+            .admit_peer_stream(&node_id, node_epoch, &endpoint, deadline, prefetch)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let controls = active.session.controls.clone();
+        let producer_active = active.clone();
+        if let Some(metrics) = &self.peers.read_work_metrics {
+            metrics.peer_stream_private_output(out.len());
+        }
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::channel::<afs_error::Result<OwnedPeerStreamMessage>>(1);
+        if let Some(metrics) = &self.peers.read_work_metrics {
+            metrics.peer_read_event("stream_pipeline");
+        }
+        // Request and original payload owners are ready before this parent begins.
+        // The journal stores metadata only and never extends a payload lifetime.
+        let diagnostic = self
+            .peers
+            .read_work_metrics
+            .as_ref()
+            .and_then(|metrics| metrics.diagnostic(ReadDiagnosticStage::PeerObject));
+        let consumer_diagnostic = diagnostic.as_ref().map(|span| span.token());
+        let producer = PeerStreamProducer {
+            sender,
+            controls,
+            peers,
+            active: producer_active,
+            control: prefetch.cloned(),
+            diagnostic: consumer_diagnostic.clone(),
+            deadline,
+            expected_body_bytes: chunk.length,
+        };
+        let payload = PeerStreamPayload {
+            request: producer_request,
+            chunk: chunk.clone(),
+            proof_budget: sink.proof_budget(),
+            binding: output_binding.clone(),
+        };
+        let producer = handle.spawn(produce_peer_stream(read_owner, producer, payload));
+        let received = consume_peer_stream(
+            &mut receiver,
+            PeerStreamConsumer {
+                request: &request,
+                chunk,
+                metrics: self.peers.read_work_metrics.as_ref(),
+                diagnostic: consumer_diagnostic.as_ref(),
+                requested_offset,
+                deadline,
+                prefetch,
+            },
+            output_binding,
+            out,
+            sink,
+        )
+        .await;
+        drop(receiver);
+        if received.is_err() {
+            producer.abort();
+        }
+        // Join/drain before output proof, sink cleanup or ownership retirement.
+        let joined = producer.await;
+        let (decoder, consumer_work) = received?;
+        let observation = PeerConsumerObservation {
+            metrics: self.peers.read_work_metrics.as_ref(),
+            diagnostic: consumer_work.as_ref(),
+        };
+        let root = joined.map_err(|error| {
+            afs_error::Error::coded(
+                afs_error::CLIENT_WORKER_FAILED,
+                format!("Peer stream producer join failed: {error}"),
+            )
+        })??;
+        peer_stream_deadline(deadline)?;
+        let root_intervals = root.root_intervals;
+        let finish_start = consumer_diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.now());
+        let proof = crate::node::bridge::local_io(|| {
+            decoder.finish_stream_from_producer(
+                chunk,
+                root,
+                sink,
+                requested_offset,
+                out,
+                observation,
+            )
+        });
+        if let (Some(diagnostic), Some(start)) = (&consumer_diagnostic, finish_start) {
+            diagnostic.consumer(start);
+        }
+        let segment_intervals = consumer_work
+            .as_ref()
+            .map(ReadDiagnosticConsumer::segment_intervals);
+        drop(consumer_work);
+        if let (Some(diagnostic), Some(root_intervals), Some(segment_intervals)) =
+            (&consumer_diagnostic, &root_intervals, &segment_intervals)
+        {
+            diagnostic.root_segment_overlap(root_intervals, segment_intervals);
+        }
+        let proof = proof?;
+        peer_stream_deadline(deadline)?;
+        if let Some(control) = prefetch {
+            control.check()?;
+        }
+        let result = sink.seal_completed(proof, requested_offset, out).map(Some);
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.finish(result.is_ok());
+        }
+        result
+    }
+
+    /// Validate the object request and build its single-object stream RPC.
+    /// `None` is "unsupported": metadata too large for the stream bounds.
+    fn peer_stream_target(
+        &self,
+        batch: &crate::node::dfs_read::PeerReadBatch,
+        chunk: &ChunkObject,
+        requested_offset: u64,
+        out_len: usize,
+    ) -> afs_error::Result<Option<PeerStreamTarget>> {
         crate::node::dfs_read::validate_verified_peer_object_request(
             batch,
             chunk,
             chunk.length as usize,
         )?;
         if requested_offset
-            .checked_add(out.len() as u64)
+            .checked_add(out_len as u64)
             .is_none_or(|end| end > chunk.length)
         {
             return Err(dfs_protocol_error(
@@ -293,404 +444,396 @@ impl GrpcChunkTransfer {
         if request_capacity > STREAM_REQUEST_METADATA_BYTES {
             return Ok(None);
         }
-        let handle = match &self.runtime {
-            PeerRuntime::Existing(handle) => handle.clone(),
-            PeerRuntime::Owned(runtime) => runtime.handle().clone(),
+        Ok(Some(PeerStreamTarget {
+            node_id,
+            node_epoch,
+            endpoint,
+            request,
+        }))
+    }
+
+    /// Stream work admission for this peer, bounded by `deadline` and, for a
+    /// prefetch, by its cancellation. `None` is a stopped background pool.
+    async fn admit_peer_stream(
+        &self,
+        node_id: &str,
+        node_epoch: u64,
+        endpoint: &str,
+        deadline: std::time::Instant,
+        prefetch: Option<&crate::node::dfs_read::PrefetchControl>,
+    ) -> afs_error::Result<Option<Arc<PeerStreamActive>>> {
+        let admit = async {
+            tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                if prefetch.is_some() {
+                    self.peers
+                        .acquire_stream_work_mode(node_id, node_epoch, endpoint, true)
+                        .await
+                } else {
+                    self.peers
+                        .acquire_stream_work(node_id, node_epoch, endpoint)
+                        .await
+                        .map(Some)
+                }
+            })
+            .await
+            .map_err(|_| {
+                afs_error::Error::coded(
+                    afs_error::CLIENT_DEADLINE_EXCEEDED,
+                    "Peer stream admission deadline exceeded",
+                )
+            })?
         };
-        let peers = self.peers.clone();
-        let timeout = crate::node::read_pipeline::current_read_scope()
-            .map(|s| crate::node::read_pipeline::remaining_read_budget(s.deadline, self.timeout))
-            .transpose()?
-            .unwrap_or(self.timeout);
-        let deadline = std::time::Instant::now() + timeout;
-        let output_binding = sink.bind_output(requested_offset, out)?;
-        // Capture tracing metadata on the caller before crossing the task boundary.
-        let mut producer_request = request_with_current_context(request.clone());
-        producer_request.set_timeout(timeout);
-        // Acquire before spawning, and retain through producer join and all
-        // queued/consumer blocks. Every block also pins this operation ticket.
         if let Some(control) = prefetch {
+            tokio::select! {
+                result = admit => result,
+                _ = control.cancelled() => Err(afs_error::Error::coded(afs_error::IO_UNAVAILABLE, "Peer prefetch cancelled before admission")),
+            }
+        } else {
+            admit.await
+        }
+    }
+}
+
+/// A validated single-object stream request and the peer it targets.
+#[cfg(feature = "dfs")]
+struct PeerStreamTarget {
+    node_id: String,
+    node_epoch: u64,
+    endpoint: String,
+    request: DfsReadRangesRequest,
+}
+
+/// Owned state of the spawned stream producer task.
+#[cfg(feature = "dfs")]
+struct PeerStreamProducer {
+    sender: tokio::sync::mpsc::Sender<afs_error::Result<OwnedPeerStreamMessage>>,
+    controls: Arc<tokio::sync::Semaphore>,
+    peers: Arc<PeerConnectionPool>,
+    active: Arc<PeerStreamActive>,
+    control: Option<crate::node::dfs_read::PrefetchControl>,
+    diagnostic: Option<crate::node::read_work::ReadDiagnosticToken>,
+    deadline: std::time::Instant,
+    expected_body_bytes: u64,
+}
+
+/// What the producer consumes once: the RPC and the root-proof inputs.
+#[cfg(feature = "dfs")]
+struct PeerStreamPayload {
+    request: tonic::Request<DfsReadRangesRequest>,
+    chunk: ChunkObject,
+    proof_budget: Arc<crate::node::chunk::OutboardBudget>,
+    binding: crate::node::peer_cache::PeerStreamBinding,
+}
+
+/// Borrowed inputs of the consumer half on the caller's task.
+#[cfg(feature = "dfs")]
+struct PeerStreamConsumer<'c> {
+    request: &'c DfsReadRangesRequest,
+    chunk: &'c ChunkObject,
+    metrics: Option<&'c ReadWorkMetrics>,
+    diagnostic: Option<&'c crate::node::read_work::ReadDiagnosticToken>,
+    requested_offset: u64,
+    deadline: std::time::Instant,
+    prefetch: Option<&'c crate::node::dfs_read::PrefetchControl>,
+}
+
+/// The spawned producer: read frames within the deadline (and prefetch
+/// cancellation), hand blocks and controls to the consumer, return the root.
+#[cfg(feature = "dfs")]
+async fn produce_peer_stream(
+    read_owner: crate::node::read_pipeline::ReadLifetime,
+    producer: PeerStreamProducer,
+    payload: PeerStreamPayload,
+) -> afs_error::Result<PeerRootReceipt> {
+    let _read_owner = read_owner;
+    let receive = async {
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(producer.deadline),
+            producer.receive_frames(payload),
+        )
+        .await
+        .map_err(|_| {
+            afs_error::Error::coded(
+                afs_error::CLIENT_DEADLINE_EXCEEDED,
+                "Peer stream producer deadline exceeded",
+            )
+        })?
+    };
+    let result: afs_error::Result<PeerRootReceipt> = if let Some(control) = &producer.control {
+        tokio::select! {
+            result = receive => result,
+            _ = control.cancelled() => Err(afs_error::Error::coded(afs_error::IO_UNAVAILABLE, "Peer prefetch cancelled")),
+        }
+    } else {
+        receive.await
+    };
+    if let Err(error) = &result {
+        // The joined producer result carries the same failure. Never
+        // wait again outside its deadline/cancellation boundary merely
+        // to notify a consumer whose bounded queue may already be full.
+        let _ = producer.sender.try_send(Err(error.clone()));
+    }
+    result
+}
+
+#[cfg(feature = "dfs")]
+impl PeerStreamProducer {
+    async fn receive_frames(
+        &self,
+        payload: PeerStreamPayload,
+    ) -> afs_error::Result<PeerRootReceipt> {
+        let peers = &self.peers;
+        if let Some(control) = &self.control {
             control.check()?;
         }
-        let active = async {
-            let admit = async {
-                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
-                    if prefetch.is_some() {
-                        self.peers.acquire_stream_work_mode(&node_id, node_epoch, &endpoint, true).await
-                    } else {
-                        self.peers.acquire_stream_work(&node_id, node_epoch, &endpoint).await.map(Some)
-                    }
-                }).await.map_err(|_| afs_error::Error::coded(afs_error::CLIENT_DEADLINE_EXCEEDED,
-                    "Peer stream admission deadline exceeded"))?
-            };
-            if let Some(control) = prefetch {
-                tokio::select! {
-                    result = admit => result,
-                    _ = control.cancelled() => Err(afs_error::Error::coded(afs_error::IO_UNAVAILABLE, "Peer prefetch cancelled before admission")),
-                }
-            } else { admit.await }
-        }.await?;
-        let Some(active) = active else {
-            return Ok(None);
-        };
-        let controls = active.session.controls.clone();
-        let producer_active = active.clone();
-        if let Some(metrics) = &self.peers.read_work_metrics {
-            metrics.peer_stream_private_output(out.len());
+        let mut client = DfsChunksClient::new(self.active.session.channel.clone())
+            .max_encoding_message_size(peers.config.max_encoding_message_bytes)
+            .max_decoding_message_size(
+                peers
+                    .config
+                    .max_decoding_message_bytes
+                    .min(STREAM_MESSAGE_BYTES),
+            );
+        let request = payload.request;
+        if let Some(metrics) = &peers.read_work_metrics {
+            metrics.read_rpc("peer_read_ranges");
         }
-        let (sender, mut receiver) =
-            tokio::sync::mpsc::channel::<afs_error::Result<OwnedPeerStreamMessage>>(1);
-        if let Some(metrics) = &self.peers.read_work_metrics {
-            metrics.peer_read_event("stream_pipeline");
-        }
-        // Request and original payload owners are ready before this parent begins.
-        // The journal stores metadata only and never extends a payload lifetime.
-        let diagnostic = self
-            .peers
-            .read_work_metrics
-            .as_ref()
-            .and_then(|metrics| metrics.diagnostic(ReadDiagnosticStage::PeerObject));
-        let consumer_diagnostic = diagnostic.as_ref().map(|span| span.token());
-        let producer_diagnostic = consumer_diagnostic.clone();
-        let expected_body_bytes = chunk.length;
-        let producer_chunk = chunk.clone();
-        let producer_proof_budget = sink.proof_budget();
-        let producer_binding = output_binding.clone();
-        let producer_control = prefetch.cloned();
-        let producer = handle.spawn(async move {
-            let _read_owner = read_owner;
-            let receive = async {
-                tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
-                    if let Some(control) = &producer_control { control.check()?; }
-                    let mut client = DfsChunksClient::new(producer_active.session.channel.clone())
-                        .max_encoding_message_size(peers.config.max_encoding_message_bytes)
-                        .max_decoding_message_size(
-                            peers
-                                .config
-                                .max_decoding_message_bytes
-                                .min(STREAM_MESSAGE_BYTES),
-                        );
-                    let request = producer_request;
-                    if let Some(metrics) = &peers.read_work_metrics {
-                        metrics.read_rpc("peer_read_ranges");
-                    }
-                    let mut stream = client
-                        .read_ranges(request)
-                        .await
-                        .map_err(afs_transport::grpc::error_status::status_to_error)?
-                        .into_inner();
-                    let mut root = PeerRootProducer::new(
-                        expected_body_bytes,
-                        producer_binding,
-                        producer_diagnostic.clone().map(ReadDiagnosticProducer::new),
-                        deadline,
-                    )
-                    .with_outboard_context(producer_chunk, producer_proof_budget);
-                    let mut current: Option<PeerStreamBlockLease> = None;
-                    let mut received_bytes = 0usize;
-                    while let Some(frame) = stream.next().await {
-                        if let Some(control) = &producer_control { control.check()?; }
-                        let frame =
-                            frame.map_err(afs_transport::grpc::error_status::status_to_error)?;
-                        if let Some(metrics) = &peers.read_work_metrics {
-                            metrics.peer_read_event("stream_frame");
-                        }
-                        match frame.body {
-                            Some(dfs_read_ranges_frame::Body::Header(mut header)) => {
-                                root.accept_outboard_header(
-                                    &mut header,
-                                    peers.read_work_metrics.as_ref(),
-                                )?;
-                                send_peer_stream_control(
-                                    afs_protocol::node_data::DfsReadRangesFrame {
-                                        body: Some(dfs_read_ranges_frame::Body::Header(header)),
-                                    },
-                                    &mut current,
-                                    &sender,
-                                    &controls,
-                                    peers.read_work_metrics.as_ref(),
-                                    &mut root,
-                                )
-                                .await?;
-                            }
-                            Some(dfs_read_ranges_frame::Body::Data(data)) => {
-                                if !root.outboard_header_seen {
-                                    return Err(dfs_protocol_error(
-                                        "Peer stream body precedes header",
-                                    ));
-                                }
-                                if data.len() > STREAM_DATA_BYTES {
-                                    return Err(dfs_protocol_error(
-                                        "Peer streaming data frame exceeds 64KiB bound",
-                                    ));
-                                }
-                                if data.is_empty() {
-                                    send_peer_stream_control(
-                                        afs_protocol::node_data::DfsReadRangesFrame {
-                                            body: Some(dfs_read_ranges_frame::Body::Data(data)),
-                                        },
-                                        &mut current,
-                                        &sender,
-                                        &controls,
-                                        peers.read_work_metrics.as_ref(),
-                                        &mut root,
-                                    )
-                                    .await?;
-                                    continue;
-                                }
-                                if let Some(diagnostic) = &producer_diagnostic {
-                                    // First nonempty decoded body, before staging/copy/hash.
-                                    diagnostic.first_data();
-                                }
-                                // The transport endpoint is decoded body completion,
-                                // before frame-to-block copying, hashing or cache writes.
-                                // EOF and trusted proof remain separate later events.
-                                if let Some(diagnostic) = &producer_diagnostic
-                                    && (received_bytes as u64).checked_add(data.len() as u64)
-                                        == Some(expected_body_bytes)
-                                {
-                                    diagnostic.body_complete();
-                                }
-                                // Do not split a wire frame across owners. An irregular
-                                // frame can flush a short block; its decoded backing is
-                                // still charged to the decoder, never queued as payload.
-                                if current.as_ref().is_some_and(|block| {
-                                    block.bytes.len() + data.len() > STREAM_FRAME_BACKING_BYTES
-                                }) {
-                                    send_peer_stream_block(
-                                        &mut current,
-                                        &sender,
-                                        peers.read_work_metrics.as_ref(),
-                                        &mut root,
-                                    )
-                                    .await?;
-                                }
-                                if current.is_none() {
-                                    let wait =
-                                        peers.read_work_metrics.as_ref().and_then(|metrics| {
-                                            metrics.coarse_diagnostic("peer_block_wait", 0)
-                                        });
-                                    let mut block = producer_active.block().await?;
-                                    drop(wait);
-                                    block.bytes.clear();
-                                    block.offset = received_bytes;
-                                    current = Some(block);
-                                }
-                                let block = current.as_mut().ok_or_else(|| {
-                                    dfs_protocol_error("Peer stream block is missing")
-                                })?;
-                                {
-                                    let _copy =
-                                        peers.read_work_metrics.as_ref().and_then(|metrics| {
-                                            metrics.coarse_diagnostic(
-                                                "peer_frame_handoff_copy",
-                                                data.len() as u64,
-                                            )
-                                        });
-                                    block.bytes.extend_from_slice(&data);
-                                }
-                                received_bytes =
-                                    received_bytes.checked_add(data.len()).ok_or_else(|| {
-                                        dfs_protocol_error("Peer stream byte count overflow")
-                                    })?;
-                                if let Some(metrics) = &peers.read_work_metrics {
-                                    metrics.copy("peer_frame_to_block", data.len() as u64);
-                                }
-                                // The original decoder Bytes never enters the handoff.
-                                drop(data);
-                                if block.bytes.len() == STREAM_FRAME_BACKING_BYTES {
-                                    send_peer_stream_block(
-                                        &mut current,
-                                        &sender,
-                                        peers.read_work_metrics.as_ref(),
-                                        &mut root,
-                                    )
-                                    .await?;
-                                }
-                            }
-                            body => {
-                                send_peer_stream_control(
-                                    afs_protocol::node_data::DfsReadRangesFrame { body },
-                                    &mut current,
-                                    &sender,
-                                    &controls,
-                                    peers.read_work_metrics.as_ref(),
-                                    &mut root,
-                                )
-                                .await?;
-                            }
-                        }
-                    }
-                    if let Some(diagnostic) = &producer_diagnostic {
-                        diagnostic.eof();
-                    }
-                    // Flush truncated tails too: they still cannot mint a proof.
-                    send_peer_stream_block(
+        let mut stream = client
+            .read_ranges(request)
+            .await
+            .map_err(afs_transport::grpc::error_status::status_to_error)?
+            .into_inner();
+        let mut root = PeerRootProducer::new(
+            self.expected_body_bytes,
+            payload.binding,
+            self.diagnostic.clone().map(ReadDiagnosticProducer::new),
+            self.deadline,
+        )
+        .with_outboard_context(payload.chunk, payload.proof_budget);
+        let mut current: Option<PeerStreamBlockLease> = None;
+        let mut received_bytes = 0usize;
+        while let Some(frame) = stream.next().await {
+            if let Some(control) = &self.control {
+                control.check()?;
+            }
+            let frame = frame.map_err(afs_transport::grpc::error_status::status_to_error)?;
+            if let Some(metrics) = &peers.read_work_metrics {
+                metrics.peer_read_event("stream_frame");
+            }
+            match frame.body {
+                Some(dfs_read_ranges_frame::Body::Header(mut header)) => {
+                    root.accept_outboard_header(&mut header, peers.read_work_metrics.as_ref())?;
+                    self.send_control(
+                        Some(dfs_read_ranges_frame::Body::Header(header)),
                         &mut current,
-                        &sender,
-                        peers.read_work_metrics.as_ref(),
                         &mut root,
                     )
                     .await?;
-                    root.finish_after_eof()
-                })
-                .await
-                .map_err(|_| {
-                    afs_error::Error::coded(
-                        afs_error::CLIENT_DEADLINE_EXCEEDED,
-                        "Peer stream producer deadline exceeded",
-                    )
-                })?
-            };
-            let result: afs_error::Result<PeerRootReceipt> = if let Some(control) = &producer_control {
-                tokio::select! {
-                    result = receive => result,
-                    _ = control.cancelled() => Err(afs_error::Error::coded(afs_error::IO_UNAVAILABLE, "Peer prefetch cancelled")),
                 }
-            } else { receive.await };
-            if let Err(error) = &result {
-                // The joined producer result carries the same failure. Never
-                // wait again outside its deadline/cancellation boundary merely
-                // to notify a consumer whose bounded queue may already be full.
-                let _ = sender.try_send(Err(error.clone()));
-            }
-            result
-        });
-        let received: afs_error::Result<(ReadFrameDecoder<'_>, Option<ReadDiagnosticConsumer>)> =
-            async {
-                let consumer_work = consumer_diagnostic.clone().map(ReadDiagnosticConsumer::new);
-                let mut decoder = ReadFrameDecoder::for_producer_object(&request, chunk)?;
-                decoder.stream_binding = Some(output_binding);
-                while let Some(message) = receiver.recv().await {
-                    let observation = PeerConsumerObservation {
-                        metrics: self.peers.read_work_metrics.as_ref(),
-                        diagnostic: consumer_work.as_ref(),
-                    };
-                    if let Some(control) = prefetch {
-                        control.check()?;
-                    }
-                    match message? {
-                        OwnedPeerStreamMessage::Control(control) => {
-                            let OwnedPeerStreamControl {
-                                frame,
-                                outboard_builder,
-                                _permit,
-                            } = *control;
-                            if matches!(&frame.body, Some(dfs_read_ranges_frame::Body::Header(_))) {
-                                decoder.install_producer_outboard(outboard_builder)?;
-                            } else if outboard_builder.is_some() {
-                                return Err(dfs_protocol_error(
-                                    "outboard metadata must accompany its header",
-                                ));
-                            }
-                            let consume_start = consumer_diagnostic
-                                .as_ref()
-                                .map(|diagnostic| diagnostic.now());
-                            let result = crate::node::bridge::local_io(|| {
-                                consume_peer_frame_into_sink(
-                                    &mut decoder,
-                                    frame,
-                                    requested_offset,
-                                    out,
-                                    sink,
-                                    deadline,
-                                    observation,
-                                )
-                            });
-                            if let (Some(diagnostic), Some(start)) =
-                                (&consumer_diagnostic, consume_start)
-                            {
-                                diagnostic.consumer(start);
-                            }
-                            result?;
-                        }
-                        OwnedPeerStreamMessage::Block(block) => {
-                            let consume_start = consumer_diagnostic
-                                .as_ref()
-                                .map(|diagnostic| diagnostic.now());
-                            let result = crate::node::bridge::local_io(|| {
-                                consume_peer_input_into_sink(
-                                    &mut decoder,
-                                    PeerSinkInput::Block {
-                                        offset: block.offset,
-                                        bytes: &block.bytes,
-                                    },
-                                    requested_offset,
-                                    out,
-                                    sink,
-                                    deadline,
-                                    observation,
-                                )
-                            });
-                            if let (Some(diagnostic), Some(start)) =
-                                (&consumer_diagnostic, consume_start)
-                            {
-                                diagnostic.consumer(start);
-                            }
-                            result?;
-                            // RAII returns the shared block on success and every error.
-                            drop(block);
-                        }
-                    }
+                Some(dfs_read_ranges_frame::Body::Data(data)) => {
+                    self.forward_data(data, &mut current, &mut root, &mut received_bytes)
+                        .await?;
                 }
-                Ok((decoder, consumer_work))
+                body => self.send_control(body, &mut current, &mut root).await?,
             }
-            .await;
-        drop(receiver);
-        if received.is_err() {
-            producer.abort();
         }
-        // Join/drain before output proof, sink cleanup or ownership retirement.
-        let joined = producer.await;
-        let (decoder, consumer_work) = received?;
+        if let Some(diagnostic) = &self.diagnostic {
+            diagnostic.eof();
+        }
+        // Flush truncated tails too: they still cannot mint a proof.
+        send_peer_stream_block(
+            &mut current,
+            &self.sender,
+            peers.read_work_metrics.as_ref(),
+            &mut root,
+        )
+        .await?;
+        root.finish_after_eof()
+    }
+
+    async fn send_control(
+        &self,
+        body: Option<dfs_read_ranges_frame::Body>,
+        current: &mut Option<PeerStreamBlockLease>,
+        root: &mut PeerRootProducer,
+    ) -> afs_error::Result<()> {
+        send_peer_stream_control(
+            afs_protocol::node_data::DfsReadRangesFrame { body },
+            current,
+            &self.sender,
+            &self.controls,
+            self.peers.read_work_metrics.as_ref(),
+            root,
+        )
+        .await
+    }
+
+    /// Copy one decoded data frame into the current shared block, handing
+    /// blocks off whole. A wire frame is never split across owners.
+    async fn forward_data(
+        &self,
+        data: prost::bytes::Bytes,
+        current: &mut Option<PeerStreamBlockLease>,
+        root: &mut PeerRootProducer,
+        received_bytes: &mut usize,
+    ) -> afs_error::Result<()> {
+        let metrics = self.peers.read_work_metrics.as_ref();
+        if !root.outboard_header_seen {
+            return Err(dfs_protocol_error("Peer stream body precedes header"));
+        }
+        if data.len() > STREAM_DATA_BYTES {
+            return Err(dfs_protocol_error(
+                "Peer streaming data frame exceeds 64KiB bound",
+            ));
+        }
+        if data.is_empty() {
+            return self
+                .send_control(Some(dfs_read_ranges_frame::Body::Data(data)), current, root)
+                .await;
+        }
+        if let Some(diagnostic) = &self.diagnostic {
+            // First nonempty decoded body, before staging/copy/hash.
+            diagnostic.first_data();
+        }
+        // The transport endpoint is decoded body completion,
+        // before frame-to-block copying, hashing or cache writes.
+        // EOF and trusted proof remain separate later events.
+        if let Some(diagnostic) = &self.diagnostic
+            && (*received_bytes as u64).checked_add(data.len() as u64)
+                == Some(self.expected_body_bytes)
+        {
+            diagnostic.body_complete();
+        }
+        // Do not split a wire frame across owners. An irregular
+        // frame can flush a short block; its decoded backing is
+        // still charged to the decoder, never queued as payload.
+        if current
+            .as_ref()
+            .is_some_and(|block| block.bytes.len() + data.len() > STREAM_FRAME_BACKING_BYTES)
+        {
+            send_peer_stream_block(current, &self.sender, metrics, root).await?;
+        }
+        if current.is_none() {
+            let wait = metrics.and_then(|metrics| metrics.coarse_diagnostic("peer_block_wait", 0));
+            let mut block = self.active.block().await?;
+            drop(wait);
+            block.bytes.clear();
+            block.offset = *received_bytes;
+            *current = Some(block);
+        }
+        let block = current
+            .as_mut()
+            .ok_or_else(|| dfs_protocol_error("Peer stream block is missing"))?;
+        {
+            let _copy = metrics.and_then(|metrics| {
+                metrics.coarse_diagnostic("peer_frame_handoff_copy", data.len() as u64)
+            });
+            block.bytes.extend_from_slice(&data);
+        }
+        *received_bytes = received_bytes
+            .checked_add(data.len())
+            .ok_or_else(|| dfs_protocol_error("Peer stream byte count overflow"))?;
+        if let Some(metrics) = metrics {
+            metrics.copy("peer_frame_to_block", data.len() as u64);
+        }
+        // The original decoder Bytes never enters the handoff.
+        drop(data);
+        if block.bytes.len() == STREAM_FRAME_BACKING_BYTES {
+            send_peer_stream_block(current, &self.sender, metrics, root).await?;
+        }
+        Ok(())
+    }
+}
+
+/// The consumer half on the caller's task: decode every handed-off control
+/// and block into the sink and the private output, in order.
+#[cfg(feature = "dfs")]
+async fn consume_peer_stream<'c>(
+    receiver: &mut tokio::sync::mpsc::Receiver<afs_error::Result<OwnedPeerStreamMessage>>,
+    consumer: PeerStreamConsumer<'c>,
+    output_binding: crate::node::peer_cache::PeerStreamBinding,
+    out: &mut [u8],
+    sink: &mut PeerStreamSink<'_>,
+) -> afs_error::Result<(ReadFrameDecoder<'c>, Option<ReadDiagnosticConsumer>)> {
+    let PeerStreamConsumer {
+        request,
+        chunk,
+        metrics,
+        diagnostic: consumer_diagnostic,
+        requested_offset,
+        deadline,
+        prefetch,
+    } = consumer;
+    let consumer_work = consumer_diagnostic
+        .cloned()
+        .map(ReadDiagnosticConsumer::new);
+    let mut decoder = ReadFrameDecoder::for_producer_object(request, chunk)?;
+    decoder.stream_binding = Some(output_binding);
+    while let Some(message) = receiver.recv().await {
         let observation = PeerConsumerObservation {
-            metrics: self.peers.read_work_metrics.as_ref(),
+            metrics,
             diagnostic: consumer_work.as_ref(),
         };
-        let root = joined.map_err(|error| {
-            afs_error::Error::coded(
-                afs_error::CLIENT_WORKER_FAILED,
-                format!("Peer stream producer join failed: {error}"),
-            )
-        })??;
-        peer_stream_deadline(deadline)?;
-        let root_intervals = root.root_intervals;
-        let finish_start = consumer_diagnostic
-            .as_ref()
-            .map(|diagnostic| diagnostic.now());
-        let proof = crate::node::bridge::local_io(|| {
-            decoder.finish_stream_from_producer(
-                chunk,
-                root,
-                sink,
-                requested_offset,
-                out,
-                observation,
-            )
-        });
-        if let (Some(diagnostic), Some(start)) = (&consumer_diagnostic, finish_start) {
-            diagnostic.consumer(start);
-        }
-        let segment_intervals = consumer_work
-            .as_ref()
-            .map(ReadDiagnosticConsumer::segment_intervals);
-        drop(consumer_work);
-        if let (Some(diagnostic), Some(root_intervals), Some(segment_intervals)) =
-            (&consumer_diagnostic, &root_intervals, &segment_intervals)
-        {
-            diagnostic.root_segment_overlap(root_intervals, segment_intervals);
-        }
-        let proof = proof?;
-        peer_stream_deadline(deadline)?;
         if let Some(control) = prefetch {
             control.check()?;
         }
-        let result = sink.seal_completed(proof, requested_offset, out).map(Some);
-        if let Some(diagnostic) = diagnostic {
-            diagnostic.finish(result.is_ok());
+        match message? {
+            OwnedPeerStreamMessage::Control(control) => {
+                let OwnedPeerStreamControl {
+                    frame,
+                    outboard_builder,
+                    _permit,
+                } = *control;
+                if matches!(&frame.body, Some(dfs_read_ranges_frame::Body::Header(_))) {
+                    decoder.install_producer_outboard(outboard_builder)?;
+                } else if outboard_builder.is_some() {
+                    return Err(dfs_protocol_error(
+                        "outboard metadata must accompany its header",
+                    ));
+                }
+                let consume_start = consumer_diagnostic.map(|diagnostic| diagnostic.now());
+                let result = crate::node::bridge::local_io(|| {
+                    consume_peer_frame_into_sink(
+                        &mut decoder,
+                        frame,
+                        requested_offset,
+                        out,
+                        sink,
+                        deadline,
+                        observation,
+                    )
+                });
+                if let (Some(diagnostic), Some(start)) = (consumer_diagnostic, consume_start) {
+                    diagnostic.consumer(start);
+                }
+                result?;
+            }
+            OwnedPeerStreamMessage::Block(block) => {
+                let consume_start = consumer_diagnostic.map(|diagnostic| diagnostic.now());
+                let result = crate::node::bridge::local_io(|| {
+                    consume_peer_input_into_sink(
+                        &mut decoder,
+                        PeerSinkInput::Block {
+                            offset: block.offset,
+                            bytes: &block.bytes,
+                        },
+                        requested_offset,
+                        out,
+                        sink,
+                        deadline,
+                        observation,
+                    )
+                });
+                if let (Some(diagnostic), Some(start)) = (consumer_diagnostic, consume_start) {
+                    diagnostic.consumer(start);
+                }
+                result?;
+                // RAII returns the shared block on success and every error.
+                drop(block);
+            }
         }
-        result
     }
+    Ok((decoder, consumer_work))
 }
 
 #[cfg(feature = "dfs")]

@@ -585,28 +585,7 @@ impl ChunkOutboard {
         if file.metadata().map_err(Error::from)?.len() < end {
             return Err(super::corrupt(&expected.id, "outboard body truncated"));
         }
-        let mut groups = [false; 128];
-        let mut counts = Vec::with_capacity(ranges.len());
-        for range in ranges {
-            let allowed = self
-                .length
-                .saturating_sub(range.chunk_offset)
-                .min(range.length as u64) as usize;
-            let output_end = range
-                .output_offset
-                .checked_add(allowed)
-                .filter(|end| *end <= out.len())
-                .ok_or_else(|| super::invalid("outboard output range exceeds buffer"))?;
-            let _ = output_end;
-            counts.push(allowed);
-            if allowed != 0 {
-                let first = range.chunk_offset / OUTBOARD_GROUP_BYTES as u64;
-                let last = (range.chunk_offset + allowed as u64 - 1) / OUTBOARD_GROUP_BYTES as u64;
-                for group in first..=last {
-                    groups[group as usize] = true;
-                }
-            }
-        }
+        let (groups, counts) = self.range_groups(ranges, out.len())?;
         let observed = RefCell::new(OutboardReadWork::default());
         let source = OffsetFile {
             file,
@@ -615,11 +594,6 @@ impl ChunkOutboard {
             work: &observed,
         };
         let root = blake3::Hash::from(self.digest.bytes);
-        let bao = PreOrderMemOutboard {
-            root,
-            tree: tree(self.length),
-            data: self.raw_cv_bytes(),
-        };
         // Only complete coverage groups can use the borrowed view: the public
         // validator then reads each selected group into its fixed scratch once,
         // without constructing a partial-leaf wire response. The caller owns
@@ -633,38 +607,7 @@ impl ChunkOutboard {
                     .is_multiple_of(OUTBOARD_GROUP_BYTES as u64)
                 && (stop.is_multiple_of(OUTBOARD_GROUP_BYTES as u64) || stop == self.length)
             {
-                let result = (|| {
-                    let bytes = &mut out[range.output_offset..range.output_offset + *allowed];
-                    source
-                        .read_exact_at(range.chunk_offset, bytes)
-                        .map_err(Error::from)?;
-                    observed.borrow_mut().scratch_peak = OUTBOARD_GROUP_BYTES;
-                    let input = BorrowedRange {
-                        bytes,
-                        start: range.chunk_offset,
-                        work: &observed,
-                    };
-                    let checked = ObservedOutboard {
-                        inner: bao,
-                        work: &observed,
-                    };
-                    let query = ChunkRanges::from(
-                        ChunkNum(range.chunk_offset / 1024)..ChunkNum::chunks(stop),
-                    );
-                    let verify_started = Instant::now();
-                    let verified = bao_tree::io::sync::encode_ranges_validated(
-                        input,
-                        checked,
-                        &query,
-                        io::sink(),
-                    )
-                    .map_err(|error| match error {
-                        bao_tree::io::EncodeError::Io(error) => Error::from(error),
-                        other => bad_proof(&format!("Bao range verification failed: {other}")),
-                    });
-                    observed.borrow_mut().verify_ns += nanos(verify_started);
-                    verified
-                })();
+                let result = self.verify_aligned_range(&source, root, range, *allowed, stop, out);
                 work.add(&observed.into_inner());
                 return result.map(|()| counts);
             }
@@ -683,135 +626,230 @@ impl ChunkOutboard {
             // bytes go straight from the file into its existing group scratch.
             // Tiny edge-only reads and aliasing destinations/sources retain the
             // original codec; the metadata walk is bounded to 128 ranges.
-            let result = (|| {
-                for (range, allowed) in ranges.iter().zip(&counts) {
-                    if *allowed != 0 {
-                        source
-                            .read_exact_at(
-                                range.chunk_offset,
-                                &mut out[range.output_offset..range.output_offset + *allowed],
-                            )
-                            .map_err(Error::from)?;
-                    }
-                }
-                observed.borrow_mut().scratch_peak = OUTBOARD_GROUP_BYTES;
-                let mut group = 0;
-                while group < groups.len() {
-                    if !groups[group] {
-                        group += 1;
-                        continue;
-                    }
-                    let first = group;
-                    while group < groups.len() && groups[group] {
-                        group += 1;
-                    }
-                    let start = first as u64 * OUTBOARD_GROUP_BYTES as u64;
-                    let stop = (group as u64 * OUTBOARD_GROUP_BYTES as u64).min(self.length);
-                    let query = ChunkRanges::from(ChunkNum(start / 1024)..ChunkNum::chunks(stop));
-                    let checked = ObservedOutboard {
-                        inner: PreOrderMemOutboard {
-                            root,
-                            tree: tree(self.length),
-                            data: self.raw_cv_bytes(),
-                        },
-                        work: &observed,
-                    };
-                    let input = PrivateRanges {
-                        source: &source,
-                        bytes: out,
-                        ranges,
-                        counts: &counts,
-                    };
-                    let verify_started = Instant::now();
-                    let verified = bao_tree::io::sync::encode_ranges_validated(
-                        input,
-                        checked,
-                        &query,
-                        io::sink(),
-                    )
-                    .map_err(|error| match error {
-                        bao_tree::io::EncodeError::Io(error) => Error::from(error),
-                        other => bad_proof(&format!("Bao range verification failed: {other}")),
-                    });
-                    observed.borrow_mut().verify_ns += nanos(verify_started);
-                    verified?;
-                }
-                Ok(counts)
-            })();
+            let result = self.verify_private_ranges(&source, root, ranges, &counts, &groups, out);
             work.add(&observed.into_inner());
-            return result;
+            return result.map(|()| counts);
         }
         let mut encoded = Vec::new();
         encoded
             .try_reserve_exact(OUTBOARD_GROUP_BYTES + MAX_ENCODED_OUTBOARD_BYTES)
             .map_err(|_| capacity())?;
-        let result = (|| {
-            for (group, selected) in groups.into_iter().enumerate() {
-                if !selected {
-                    continue;
+        let result = self.verify_by_reencode(&source, ranges, &counts, groups, &mut encoded, out);
+        work.add(&observed.into_inner());
+        result.map(|()| counts)
+    }
+
+    /// Per-range allowed lengths and the coverage groups they touch.
+    fn range_groups(
+        &self,
+        ranges: &[VerifiedRangeCopy],
+        out_len: usize,
+    ) -> Result<([bool; 128], Vec<usize>)> {
+        let mut groups = [false; 128];
+        let mut counts = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let allowed = self
+                .length
+                .saturating_sub(range.chunk_offset)
+                .min(range.length as u64) as usize;
+            let output_end = range
+                .output_offset
+                .checked_add(allowed)
+                .filter(|end| *end <= out_len)
+                .ok_or_else(|| super::invalid("outboard output range exceeds buffer"))?;
+            let _ = output_end;
+            counts.push(allowed);
+            if allowed != 0 {
+                let first = range.chunk_offset / OUTBOARD_GROUP_BYTES as u64;
+                let last = (range.chunk_offset + allowed as u64 - 1) / OUTBOARD_GROUP_BYTES as u64;
+                for group in first..=last {
+                    groups[group as usize] = true;
                 }
-                let start = group as u64 * OUTBOARD_GROUP_BYTES as u64;
-                let stop = (start + OUTBOARD_GROUP_BYTES as u64).min(self.length);
-                let query = ChunkRanges::from(ChunkNum(start / 1024)..ChunkNum::chunks(stop));
-                encoded.clear();
-                observed.borrow_mut().scratch_peak = encoded.capacity() + OUTBOARD_GROUP_BYTES;
-                bao_tree::io::sync::encode_ranges(&source, &bao, &query, &mut encoded)
-                    .map_err(|error| Error::from(io::Error::from(error)))?;
-                observed.borrow_mut().copied_bytes += stop - start;
-                let verify_started = Instant::now();
-                let verified = (|| {
-                    for item in
-                        DecodeResponseIter::new(root, tree(self.length), &encoded[..], &query)
-                    {
-                        let item = match item {
-                            Ok(item) => item,
-                            Err(error) => {
-                                if matches!(error, bao_tree::io::DecodeError::ParentHashMismatch(_))
-                                {
-                                    observed.borrow_mut().parent_hash_bytes += 64;
-                                }
-                                if matches!(error, bao_tree::io::DecodeError::LeafHashMismatch(_)) {
-                                    let mut work = observed.borrow_mut();
-                                    work.hash_bytes += stop - start;
-                                    work.copied_bytes += stop - start;
-                                }
-                                return Err(bad_proof(&format!(
-                                    "Bao response verification failed: {error}"
-                                )));
+            }
+        }
+        Ok((groups, counts))
+    }
+
+    /// One group-aligned range validated in place from the private output.
+    fn verify_aligned_range(
+        &self,
+        source: &OffsetFile<'_>,
+        root: blake3::Hash,
+        range: &VerifiedRangeCopy,
+        allowed: usize,
+        stop: u64,
+        out: &mut [u8],
+    ) -> Result<()> {
+        let bao = PreOrderMemOutboard {
+            root,
+            tree: tree(self.length),
+            data: self.raw_cv_bytes(),
+        };
+        let bytes = &mut out[range.output_offset..range.output_offset + allowed];
+        source
+            .read_exact_at(range.chunk_offset, bytes)
+            .map_err(Error::from)?;
+        source.work.borrow_mut().scratch_peak = OUTBOARD_GROUP_BYTES;
+        let input = BorrowedRange {
+            bytes,
+            start: range.chunk_offset,
+            work: source.work,
+        };
+        let checked = ObservedOutboard {
+            inner: bao,
+            work: source.work,
+        };
+        let query = ChunkRanges::from(ChunkNum(range.chunk_offset / 1024)..ChunkNum::chunks(stop));
+        let verify_started = Instant::now();
+        let verified =
+            bao_tree::io::sync::encode_ranges_validated(input, checked, &query, io::sink())
+                .map_err(|error| match error {
+                    bao_tree::io::EncodeError::Io(error) => Error::from(error),
+                    other => bad_proof(&format!("Bao range verification failed: {other}")),
+                });
+        source.work.borrow_mut().verify_ns += nanos(verify_started);
+        verified
+    }
+
+    /// Requested bytes filled once; each contiguous group run validated over
+    /// the private results plus file-backed edges.
+    fn verify_private_ranges(
+        &self,
+        source: &OffsetFile<'_>,
+        root: blake3::Hash,
+        ranges: &[VerifiedRangeCopy],
+        counts: &[usize],
+        groups: &[bool; 128],
+        out: &mut [u8],
+    ) -> Result<()> {
+        for (range, allowed) in ranges.iter().zip(counts) {
+            if *allowed != 0 {
+                source
+                    .read_exact_at(
+                        range.chunk_offset,
+                        &mut out[range.output_offset..range.output_offset + *allowed],
+                    )
+                    .map_err(Error::from)?;
+            }
+        }
+        source.work.borrow_mut().scratch_peak = OUTBOARD_GROUP_BYTES;
+        let mut group = 0;
+        while group < groups.len() {
+            if !groups[group] {
+                group += 1;
+                continue;
+            }
+            let first = group;
+            while group < groups.len() && groups[group] {
+                group += 1;
+            }
+            let start = first as u64 * OUTBOARD_GROUP_BYTES as u64;
+            let stop = (group as u64 * OUTBOARD_GROUP_BYTES as u64).min(self.length);
+            let query = ChunkRanges::from(ChunkNum(start / 1024)..ChunkNum::chunks(stop));
+            let checked = ObservedOutboard {
+                inner: PreOrderMemOutboard {
+                    root,
+                    tree: tree(self.length),
+                    data: self.raw_cv_bytes(),
+                },
+                work: source.work,
+            };
+            let input = PrivateRanges {
+                source,
+                bytes: out,
+                ranges,
+                counts,
+            };
+            let verify_started = Instant::now();
+            let verified =
+                bao_tree::io::sync::encode_ranges_validated(input, checked, &query, io::sink())
+                    .map_err(|error| match error {
+                        bao_tree::io::EncodeError::Io(error) => Error::from(error),
+                        other => bad_proof(&format!("Bao range verification failed: {other}")),
+                    });
+            source.work.borrow_mut().verify_ns += nanos(verify_started);
+            verified?;
+        }
+        Ok(())
+    }
+
+    /// The original codec: re-encode each selected group and decode-verify it
+    /// into the requested output ranges.
+    fn verify_by_reencode(
+        &self,
+        source: &OffsetFile<'_>,
+        ranges: &[VerifiedRangeCopy],
+        counts: &[usize],
+        groups: [bool; 128],
+        encoded: &mut Vec<u8>,
+        out: &mut [u8],
+    ) -> Result<()> {
+        let root = blake3::Hash::from(self.digest.bytes);
+        let bao = PreOrderMemOutboard {
+            root,
+            tree: tree(self.length),
+            data: self.raw_cv_bytes(),
+        };
+        for (group, selected) in groups.into_iter().enumerate() {
+            if !selected {
+                continue;
+            }
+            let start = group as u64 * OUTBOARD_GROUP_BYTES as u64;
+            let stop = (start + OUTBOARD_GROUP_BYTES as u64).min(self.length);
+            let query = ChunkRanges::from(ChunkNum(start / 1024)..ChunkNum::chunks(stop));
+            encoded.clear();
+            source.work.borrow_mut().scratch_peak = encoded.capacity() + OUTBOARD_GROUP_BYTES;
+            bao_tree::io::sync::encode_ranges(source, &bao, &query, &mut *encoded)
+                .map_err(|error| Error::from(io::Error::from(error)))?;
+            source.work.borrow_mut().copied_bytes += stop - start;
+            let verify_started = Instant::now();
+            let verified = (|| {
+                for item in DecodeResponseIter::new(root, tree(self.length), &encoded[..], &query) {
+                    let item = match item {
+                        Ok(item) => item,
+                        Err(error) => {
+                            if matches!(error, bao_tree::io::DecodeError::ParentHashMismatch(_)) {
+                                source.work.borrow_mut().parent_hash_bytes += 64;
                             }
-                        };
-                        if matches!(item, BaoContentItem::Parent(_)) {
-                            observed.borrow_mut().parent_hash_bytes += 64;
+                            if matches!(error, bao_tree::io::DecodeError::LeafHashMismatch(_)) {
+                                let mut work = source.work.borrow_mut();
+                                work.hash_bytes += stop - start;
+                                work.copied_bytes += stop - start;
+                            }
+                            return Err(bad_proof(&format!(
+                                "Bao response verification failed: {error}"
+                            )));
                         }
-                        if let BaoContentItem::Leaf(leaf) = item {
-                            observed.borrow_mut().hash_bytes += leaf.data.len() as u64;
-                            observed.borrow_mut().copied_bytes += leaf.data.len() as u64;
-                            let leaf_end = leaf.offset + leaf.data.len() as u64;
-                            for (range, allowed) in ranges.iter().zip(&counts) {
-                                let from = range.chunk_offset.max(leaf.offset);
-                                let to = (range.chunk_offset + *allowed as u64).min(leaf_end);
-                                if from < to {
-                                    let n = (to - from) as usize;
-                                    let dst =
-                                        range.output_offset + (from - range.chunk_offset) as usize;
-                                    out[dst..dst + n].copy_from_slice(
-                                        &leaf.data[(from - leaf.offset) as usize
-                                            ..(to - leaf.offset) as usize],
-                                    );
-                                    observed.borrow_mut().copied_bytes += n as u64;
-                                }
+                    };
+                    if matches!(item, BaoContentItem::Parent(_)) {
+                        source.work.borrow_mut().parent_hash_bytes += 64;
+                    }
+                    if let BaoContentItem::Leaf(leaf) = item {
+                        source.work.borrow_mut().hash_bytes += leaf.data.len() as u64;
+                        source.work.borrow_mut().copied_bytes += leaf.data.len() as u64;
+                        let leaf_end = leaf.offset + leaf.data.len() as u64;
+                        for (range, allowed) in ranges.iter().zip(counts) {
+                            let from = range.chunk_offset.max(leaf.offset);
+                            let to = (range.chunk_offset + *allowed as u64).min(leaf_end);
+                            if from < to {
+                                let n = (to - from) as usize;
+                                let dst =
+                                    range.output_offset + (from - range.chunk_offset) as usize;
+                                out[dst..dst + n].copy_from_slice(
+                                    &leaf.data[(from - leaf.offset) as usize
+                                        ..(to - leaf.offset) as usize],
+                                );
+                                source.work.borrow_mut().copied_bytes += n as u64;
                             }
                         }
                     }
-                    Ok(())
-                })();
-                observed.borrow_mut().verify_ns += nanos(verify_started);
-                verified?;
-            }
-            Ok(counts)
-        })();
-        work.add(&observed.into_inner());
-        result
+                }
+                Ok(())
+            })();
+            source.work.borrow_mut().verify_ns += nanos(verify_started);
+            verified?;
+        }
+        Ok(())
     }
 }
 

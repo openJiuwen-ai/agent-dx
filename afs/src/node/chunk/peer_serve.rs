@@ -1290,6 +1290,21 @@ impl LocalChunkStore {
             self.ensure_peer_serve_open()?;
             return Ok(payload);
         }
+        let (flight, leading) = self.join_peer_serve_flight(chunk_id, deadline)?;
+        if !leading {
+            return self.serve_peer_follower(&flight, chunk_id, offset, length, deadline, crc_mode);
+        }
+        self.serve_peer_leader(flight, chunk_id, offset, length, deadline, crc_mode)
+    }
+
+    /// Join the object's flight, or install a new one as its leader (true),
+    /// waiting for a free fixed slot until `deadline`.
+    #[cfg(any(feature = "dfs", test))]
+    fn join_peer_serve_flight(
+        &self,
+        chunk_id: &ChunkId,
+        deadline: Instant,
+    ) -> Result<(Arc<PeerServeFlight>, bool)> {
         let existing = {
             let state = self
                 .peer_read_cache
@@ -1302,97 +1317,121 @@ impl LocalChunkStore {
                 .find(|flight| flight.chunk_id == *chunk_id)
                 .cloned()
         };
-        let (flight, leading) = if let Some(flight) = existing {
-            (flight, false)
-        } else {
-            // Fixed slots bound table storage. Charge keys/terminal error and Arc
-            // allocation before retention; no proof-ledger or body-budget loan.
-            let control = self.reserve_peer_control_until(
-                std::mem::size_of::<PeerServeFlight>() + PEER_SERVE_ID_LIMIT + 512 + 128,
-                deadline,
-            )?;
-            let id = chunk_id.clone();
-            if id.0.capacity() > PEER_SERVE_ID_LIMIT {
+        if let Some(flight) = existing {
+            return Ok((flight, false));
+        }
+        // Fixed slots bound table storage. Charge keys/terminal error and Arc
+        // allocation before retention; no proof-ledger or body-budget loan.
+        let control = self.reserve_peer_control_until(
+            std::mem::size_of::<PeerServeFlight>() + PEER_SERVE_ID_LIMIT + 512 + 128,
+            deadline,
+        )?;
+        let id = chunk_id.clone();
+        if id.0.capacity() > PEER_SERVE_ID_LIMIT {
+            return Err(peer_payload_capacity());
+        }
+        let candidate = Arc::new(PeerServeFlight {
+            chunk_id: id,
+            result: Mutex::new(None),
+            changed: Condvar::new(),
+            _control: control,
+        });
+        let mut state = self
+            .peer_read_cache
+            .lock()
+            .map_err(|_| peer_serve_unavailable("Peer serve state poisoned"))?;
+        loop {
+            if state.closed {
+                return Err(peer_serve_unavailable("Peer serve is stopped"));
+            }
+            if let Some(flight) = state
+                .flights
+                .iter()
+                .flatten()
+                .find(|flight| flight.chunk_id == *chunk_id)
+                .cloned()
+            {
+                drop(state);
+                drop(candidate);
+                return Ok((flight, false));
+            }
+            if let Some(free) = state.flights.iter_mut().find(|flight| flight.is_none()) {
+                *free = Some(candidate.clone());
+                self.observe_peer_serve(&state);
+                return Ok((candidate, true));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
                 return Err(peer_payload_capacity());
             }
-            let candidate = Arc::new(PeerServeFlight {
-                chunk_id: id,
-                result: Mutex::new(None),
-                changed: Condvar::new(),
-                _control: control,
-            });
-            let mut state = self
-                .peer_read_cache
-                .lock()
-                .map_err(|_| peer_serve_unavailable("Peer serve state poisoned"))?;
-            loop {
-                if state.closed {
-                    return Err(peer_serve_unavailable("Peer serve is stopped"));
-                }
-                if let Some(flight) = state
-                    .flights
-                    .iter()
-                    .flatten()
-                    .find(|flight| flight.chunk_id == *chunk_id)
-                    .cloned()
-                {
-                    drop(state);
-                    drop(candidate);
-                    break (flight, false);
-                }
-                if let Some(free) = state.flights.iter_mut().find(|flight| flight.is_none()) {
-                    *free = Some(candidate.clone());
-                    self.observe_peer_serve(&state);
-                    break (candidate, true);
-                }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Err(peer_payload_capacity());
-                }
-                let _wait = self.coarse_diagnostic("peer_slot_wait", 0);
-                state = self
-                    .peer_serve_changed
-                    .wait_timeout(state, remaining)
-                    .map_err(|_| peer_serve_unavailable("Peer serve admission wait poisoned"))?
-                    .0;
-            }
-        };
-        if !leading {
-            let waited = self.coarse_diagnostic("peer_slot_wait", 0);
-            let ready = loop {
-                self.ensure_peer_serve_open()?;
-                let outcome = flight
-                    .result
-                    .lock()
-                    .map_err(|_| peer_serve_unavailable("Peer object flight poisoned"))?;
-                if let Some(outcome) = outcome.as_ref() {
-                    break outcome.clone()?;
-                }
-                drop(
-                    flight
-                        .changed
-                        .wait_timeout(outcome, Duration::from_millis(25))
-                        .map_err(|_| peer_serve_unavailable("Peer object flight wait poisoned"))?,
-                );
-            };
-            drop(waited);
-            // A full immutable object can serve all ranges after the existing
-            // catalog/file checks. Exact partial results remain request-private.
-            #[cfg(test)]
-            {
-                let block = self.peer_ready_test_block.lock().unwrap().take();
-                if let Some((entered, release)) = block {
-                    entered.send(()).unwrap();
-                    release.recv_timeout(Duration::from_secs(5)).unwrap();
-                }
-            }
-            let mut slot = ready;
-            let payload = self.read_peer_range_private(
-                chunk_id, offset, length, &mut slot, true, deadline, crc_mode,
-            )?;
-            self.ensure_peer_serve_open()?;
-            return Ok(payload);
+            let _wait = self.coarse_diagnostic("peer_slot_wait", 0);
+            state = self
+                .peer_serve_changed
+                .wait_timeout(state, remaining)
+                .map_err(|_| peer_serve_unavailable("Peer serve admission wait poisoned"))?
+                .0;
         }
+    }
+
+    /// Wait for the leader's result, then serve this range from it.
+    #[cfg(any(feature = "dfs", test))]
+    fn serve_peer_follower(
+        &self,
+        flight: &PeerServeFlight,
+        chunk_id: &ChunkId,
+        offset: u64,
+        length: usize,
+        deadline: Instant,
+        crc_mode: crate::config::DfsReadCrcMode,
+    ) -> Result<PeerReadPayload> {
+        let waited = self.coarse_diagnostic("peer_slot_wait", 0);
+        let ready = loop {
+            self.ensure_peer_serve_open()?;
+            let outcome = flight
+                .result
+                .lock()
+                .map_err(|_| peer_serve_unavailable("Peer object flight poisoned"))?;
+            if let Some(outcome) = outcome.as_ref() {
+                break outcome.clone()?;
+            }
+            drop(
+                flight
+                    .changed
+                    .wait_timeout(outcome, Duration::from_millis(25))
+                    .map_err(|_| peer_serve_unavailable("Peer object flight wait poisoned"))?,
+            );
+        };
+        drop(waited);
+        // A full immutable object can serve all ranges after the existing
+        // catalog/file checks. Exact partial results remain request-private.
+        #[cfg(test)]
+        {
+            let block = self.peer_ready_test_block.lock().unwrap().take();
+            if let Some((entered, release)) = block {
+                entered.send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }
+        let mut slot = ready;
+        let payload = self.read_peer_range_private(
+            chunk_id, offset, length, &mut slot, true, deadline, crc_mode,
+        )?;
+        self.ensure_peer_serve_open()?;
+        Ok(payload)
+    }
+
+    /// Read as the flight leader, then install a complete current object as
+    /// resident and finish the flight for its followers.
+    #[cfg(any(feature = "dfs", test))]
+    fn serve_peer_leader(
+        &self,
+        flight: Arc<PeerServeFlight>,
+        chunk_id: &ChunkId,
+        offset: u64,
+        length: usize,
+        deadline: Instant,
+        crc_mode: crate::config::DfsReadCrcMode,
+    ) -> Result<PeerReadPayload> {
         let mut leader = PeerServeLeader {
             store: self,
             flight,
@@ -1498,279 +1537,15 @@ impl LocalChunkStore {
         });
         let mut repair_proof = None;
         self.record_read_check(super::super::read_work::ReadCheck::CatalogFence);
-        let result = (|| {
-            let record = self.peer_catalog_record(chunk_id)?;
-            let file = File::open(self.path_for_record(&record)?).map_err(Error::from)?;
-            let before = PeerFileIdentity::read(&file)?;
-            if before.length != record.chunk.length {
-                return Err(corrupt(chunk_id, "length mismatch"));
-            }
-            let allowed = usize::try_from(
-                record
-                    .chunk
-                    .length
-                    .saturating_sub(offset)
-                    .min(length as u64),
-            )
-            .map_err(|_| invalid("Chunk read length is too large"))?;
-            if record.chunk.is_segment_crc32c() {
-                let scratch = super::super::chunk_crc32c::SEGMENT;
-                let mut reservation = self
-                    .reserve_peer_read_payload_until(allowed.saturating_add(scratch), deadline)?;
-                let mut bytes = self
-                    .peer_buffer_pool
-                    .take(allowed, self.read_work.clone())?;
-                reservation.retain_capacity(bytes.capacity().saturating_add(scratch))?;
-                let mut reader = self.open_cataloged(chunk_id)?;
-                let segment = super::super::chunk_crc32c::SEGMENT as u64;
-                let complete = offset.is_multiple_of(segment)
-                    && ((allowed as u64).is_multiple_of(segment)
-                        || offset + allowed as u64 == record.chunk.length);
-                let verify_body = crc_mode == crate::config::DfsReadCrcMode::Both
-                    || (crc_mode == crate::config::DfsReadCrcMode::Receiver && !complete);
-                reader.verify_crc_body = verify_body;
-                if reader.read_ranges_at_uncommitted(
-                    &[VerifiedRangeCopy {
-                        chunk_offset: offset,
-                        length: allowed,
-                        output_offset: 0,
-                    }],
-                    &mut bytes,
-                )? != vec![allowed]
-                    || self.peer_catalog_record(chunk_id)? != record
-                    || PeerFileIdentity::read(&file)? != before
-                    || PeerFileIdentity::read(&File::open(self.path_for_record(&record)?)?)?
-                        != before
-                {
-                    return Err(corrupt(
-                        chunk_id,
-                        "CRC peer range changed during verification",
-                    ));
-                }
-                return Ok(PeerReadPayload {
-                    object: Arc::new(PeerVerifiedObject {
-                        bytes,
-                        outboard: None,
-                        _reservation: reservation,
-                        identity: None,
-                        _control: self.peer_object_control(None, deadline)?,
-                    }),
-                    start: 0,
-                    length: allowed,
-                });
-            }
-            if let Some(object) = slot.as_ref()
-                && object.identity.as_ref() == Some(&(record.clone(), before.clone()))
-            {
-                if self.peer_catalog_record(chunk_id)? != record
-                    || PeerFileIdentity::read(&file)? != before
-                {
-                    return Err(corrupt(chunk_id, "identity changed during cached read"));
-                }
-                if let Some(metrics) = &self.read_work {
-                    metrics.peer_object_cache("hit");
-                }
-                return Ok(PeerReadPayload {
-                    object: object.clone(),
-                    start: usize::try_from(offset.min(record.chunk.length))
-                        .map_err(|_| invalid("Chunk offset is too large"))?,
-                    length: allowed,
-                });
-            }
-            // A changed identity for the same formerly verified object must
-            // re-establish its complete root before any proof can be reused.
-            let invalidated_current = slot.as_ref().is_some_and(|object| {
-                object
-                    .identity
-                    .as_ref()
-                    .is_some_and(|(old, _)| old.chunk.id == *chunk_id)
-            });
-            if invalidated_current {
-                self.retire_observed_peer_resident(slot.as_ref());
-            }
-            if let Some(metrics) = &self.read_work {
-                metrics.peer_object_cache("miss");
-            }
-            #[cfg(test)]
-            {
-                // Remove the hook under its own mutex, then wait without that
-                // mutex: it must not introduce serialization of its own.
-                let block = self.peer_fill_test_blocks.lock().unwrap().remove(chunk_id);
-                if let Some((entered, release)) = block {
-                    entered.send(()).unwrap();
-                    release.recv_timeout(Duration::from_secs(5)).unwrap();
-                }
-            }
-            let mut capacity_fallback = false;
-            if !invalidated_current
-                && (offset != 0 || allowed as u64 != record.chunk.length)
-                && ChunkObject::from_content_addressed_id(chunk_id).as_ref() == Some(&record.chunk)
-            {
-                let reader = self.open_cataloged(chunk_id)?;
-                let loaded = self
-                    .outboard_budget
-                    .reserve_range_work(
-                        &[VerifiedRangeCopy {
-                            chunk_offset: offset,
-                            length: allowed,
-                            output_offset: 0,
-                        }],
-                        record.chunk.length,
-                    )
-                    .ok_or_else(outboard_capacity)
-                    .and_then(|working| reader.load_outboard().map(|proof| (proof, working)));
-                match loaded {
-                    Ok((Some(proof), working)) => {
-                        let mut reservation =
-                            match self.reserve_peer_read_payload_until(allowed, deadline) {
-                                Ok(reservation) => reservation,
-                                Err(error) => {
-                                    // An unrelated slot is retained for ordinary range
-                                    // reads, but may be reclaimed when admission needs
-                                    // its genuinely unpinned body capacity.
-                                    if slot
-                                        .as_ref()
-                                        .is_some_and(|object| Arc::strong_count(object) == 1)
-                                    {
-                                        slot.take();
-                                    }
-                                    self.reserve_peer_read_payload_until(allowed, deadline)
-                                        .map_err(|_| error)?
-                                }
-                            };
-                        let mut bytes = Vec::new();
-                        bytes
-                            .try_reserve_exact(allowed)
-                            .map_err(|_| peer_payload_capacity())?;
-                        reservation.retain_capacity(bytes.capacity())?;
-                        bytes.resize(allowed, 0);
-                        let mut work = OutboardReadWork::default();
-                        let verified = proof.read_ranges_into_with_reserved_work(
-                            &file,
-                            0,
-                            &record.chunk,
-                            &[VerifiedRangeCopy {
-                                chunk_offset: offset,
-                                length: allowed,
-                                output_offset: 0,
-                            }],
-                            &mut bytes,
-                            OutboardReadContext {
-                                work: &mut work,
-                                working,
-                            },
-                        );
-                        #[cfg(test)]
-                        VERIFIED_SCAN_BYTES.with(|count| count.set(count.get() + work.hash_bytes));
-                        if let Some(metrics) = &self.read_work {
-                            metrics.hash("outboard_body_hash", work.hash_bytes);
-                            metrics.hash("outboard_parent_hash", work.parent_hash_bytes);
-                            metrics.copy("outboard_range_delivery", work.copied_bytes);
-                        }
-                        if verified.is_ok()
-                            && PeerFileIdentity::read(&file)? == before
-                            && self.peer_catalog_record(chunk_id)? == record
-                        {
-                            return Ok(PeerReadPayload {
-                                object: Arc::new(PeerVerifiedObject {
-                                    bytes: bytes.into(),
-                                    outboard: None,
-                                    _reservation: reservation,
-                                    identity: None,
-                                    _control: self.peer_object_control(None, deadline)?,
-                                }),
-                                start: 0,
-                                length: allowed,
-                            });
-                        }
-                        capacity_fallback = verified
-                            .as_ref()
-                            .is_err_and(|error| error.code() == afs_error::IO_CAPACITY);
-                        // Drop the exact-range private allocation before the old
-                        // full-root fallback attempts its original body admission.
-                        drop(bytes);
-                        drop(reservation);
-                    }
-                    Err(error) if error.code() == afs_error::IO_CAPACITY => {
-                        capacity_fallback = true;
-                    }
-                    _ => {}
-                }
-            }
-            // Only a full fill needs this slot's body capacity. A successful
-            // partial range above must not evict an unrelated healthy object.
-            // Externally held old allocations remain charged until last drop.
-            slot.take();
-            let resident = cacheable && record.chunk.length <= PEER_READ_OBJECT_LIMIT as u64;
-            let allocation = if resident {
-                usize::try_from(record.chunk.length).map_err(|_| peer_payload_capacity())?
-            } else {
-                allowed
-            };
-            let mut reservation = self.reserve_peer_read_payload_until(allocation, deadline)?;
-            let mut bytes = Vec::new();
-            bytes
-                .try_reserve_exact(allocation)
-                .map_err(|_| peer_payload_capacity())?;
-            reservation.retain_capacity(bytes.capacity())?;
-            bytes.resize(allocation, 0);
-            let builder = (!capacity_fallback
-                && ChunkObject::from_content_addressed_id(chunk_id).as_ref()
-                    == Some(&record.chunk))
-            .then(|| OutboardBuilder::new(record.chunk.length, self.outboard_budget.clone()));
-            if capacity_fallback {
-                self.outboard_budget.record_range_fullscan_fallback();
-            }
-            let (_, outboard) = verified_ranges_into_building(
-                &file,
-                &record.chunk,
-                &[VerifiedRangeCopy {
-                    chunk_offset: if resident { 0 } else { offset },
-                    length: allocation,
-                    output_offset: 0,
-                }],
-                &mut bytes,
-                true,
-                self.read_work.as_ref(),
-                builder,
-            )?;
-            if PeerFileIdentity::read(&file)? != before
-                || self.peer_catalog_record(chunk_id)? != record
-            {
-                return Err(corrupt(chunk_id, "identity changed during verification"));
-            }
-            // Reopen the path as well: a pinned old descriptor must not seed a
-            // cache after another inode has replaced its cataloged pathname.
-            let current = File::open(self.path_for_record(&record)?).map_err(Error::from)?;
-            if PeerFileIdentity::read(&current)? != before {
-                return Err(corrupt(chunk_id, "path changed during verification"));
-            }
-            // Residency is a subset of the same proof lease, not an extra
-            // allocation/ledger. Refusal keeps the complete-root body result.
-            repair_proof = outboard.as_ref().map(Arc::clone);
-            let outboard = outboard.filter(|proof| proof.try_mark_resident());
-            let control = self.peer_object_control(resident.then_some(&record), deadline)?;
-            let object = Arc::new(PeerVerifiedObject {
-                bytes: bytes.into(),
-                outboard,
-                _reservation: reservation,
-                identity: resident.then_some((record, before)),
-                _control: control,
-            });
-            if resident {
-                *slot = Some(object.clone());
-            }
-            Ok(PeerReadPayload {
-                object,
-                start: if resident {
-                    usize::try_from(offset.min(allocation as u64))
-                        .map_err(|_| invalid("Chunk offset is too large"))?
-                } else {
-                    0
-                },
-                length: allowed,
-            })
-        })();
+        let request = PeerRangeRequest {
+            chunk_id,
+            offset,
+            length,
+            cacheable,
+            deadline,
+            crc_mode,
+        };
+        let result = self.read_peer_range_verified(&request, slot, &mut repair_proof);
         if result.is_err()
             && slot.as_ref().is_some_and(|object| {
                 object
@@ -1805,4 +1580,443 @@ impl LocalChunkStore {
         }
         result
     }
+
+    /// Catalog/file identity, then the first applicable way to serve the
+    /// range: CRC-format range, the resident object, an exact verified range,
+    /// or a complete-root fill.
+    #[cfg(any(feature = "dfs", test))]
+    fn read_peer_range_verified(
+        &self,
+        request: &PeerRangeRequest<'_>,
+        slot: &mut Option<Arc<PeerVerifiedObject>>,
+        repair_proof: &mut Option<SharedOutboard>,
+    ) -> Result<PeerReadPayload> {
+        let PeerRangeRequest {
+            chunk_id,
+            offset,
+            length,
+            cacheable: _,
+            deadline: _,
+            crc_mode: _,
+        } = *request;
+        let record = self.peer_catalog_record(chunk_id)?;
+        let file = File::open(self.path_for_record(&record)?).map_err(Error::from)?;
+        let before = PeerFileIdentity::read(&file)?;
+        if before.length != record.chunk.length {
+            return Err(corrupt(chunk_id, "length mismatch"));
+        }
+        let allowed = usize::try_from(
+            record
+                .chunk
+                .length
+                .saturating_sub(offset)
+                .min(length as u64),
+        )
+        .map_err(|_| invalid("Chunk read length is too large"))?;
+        let view = PeerObjectView {
+            record,
+            file,
+            before,
+            allowed,
+        };
+        if view.record.chunk.is_segment_crc32c() {
+            return self.read_peer_crc_range(request, &view);
+        }
+        if let Some(payload) = self.read_peer_resident(request, slot, &view)? {
+            return Ok(payload);
+        }
+        // A changed identity for the same formerly verified object must
+        // re-establish its complete root before any proof can be reused.
+        let invalidated_current = slot.as_ref().is_some_and(|object| {
+            object
+                .identity
+                .as_ref()
+                .is_some_and(|(old, _)| old.chunk.id == *chunk_id)
+        });
+        if invalidated_current {
+            self.retire_observed_peer_resident(slot.as_ref());
+        }
+        if let Some(metrics) = &self.read_work {
+            metrics.peer_object_cache("miss");
+        }
+        #[cfg(test)]
+        {
+            // Remove the hook under its own mutex, then wait without that
+            // mutex: it must not introduce serialization of its own.
+            let block = self.peer_fill_test_blocks.lock().unwrap().remove(chunk_id);
+            if let Some((entered, release)) = block {
+                entered.send(()).unwrap();
+                release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }
+        let mut capacity_fallback = false;
+        if !invalidated_current
+            && (offset != 0 || view.allowed as u64 != view.record.chunk.length)
+            && ChunkObject::from_content_addressed_id(chunk_id).as_ref() == Some(&view.record.chunk)
+        {
+            match self.read_peer_exact_range(request, slot, &view)? {
+                ExactRange::Served(payload) => return Ok(payload),
+                ExactRange::Fallback {
+                    capacity_fallback: capacity,
+                } => capacity_fallback = capacity,
+            }
+        }
+        self.read_peer_full_fill(request, slot, view, capacity_fallback, repair_proof)
+    }
+
+    /// CRC-format objects: request-private, never shared through the flight.
+    #[cfg(any(feature = "dfs", test))]
+    fn read_peer_crc_range(
+        &self,
+        request: &PeerRangeRequest<'_>,
+        view: &PeerObjectView,
+    ) -> Result<PeerReadPayload> {
+        let PeerRangeRequest {
+            chunk_id,
+            offset,
+            length: _,
+            cacheable: _,
+            deadline,
+            crc_mode,
+        } = *request;
+        let PeerObjectView {
+            record,
+            file,
+            before,
+            allowed,
+        } = view;
+        let allowed = *allowed;
+        let scratch = super::super::chunk_crc32c::SEGMENT;
+        let mut reservation =
+            self.reserve_peer_read_payload_until(allowed.saturating_add(scratch), deadline)?;
+        let mut bytes = self
+            .peer_buffer_pool
+            .take(allowed, self.read_work.clone())?;
+        reservation.retain_capacity(bytes.capacity().saturating_add(scratch))?;
+        let mut reader = self.open_cataloged(chunk_id)?;
+        let segment = super::super::chunk_crc32c::SEGMENT as u64;
+        let complete = offset.is_multiple_of(segment)
+            && ((allowed as u64).is_multiple_of(segment)
+                || offset + allowed as u64 == record.chunk.length);
+        let verify_body = crc_mode == crate::config::DfsReadCrcMode::Both
+            || (crc_mode == crate::config::DfsReadCrcMode::Receiver && !complete);
+        reader.verify_crc_body = verify_body;
+        if reader.read_ranges_at_uncommitted(
+            &[VerifiedRangeCopy {
+                chunk_offset: offset,
+                length: allowed,
+                output_offset: 0,
+            }],
+            &mut bytes,
+        )? != vec![allowed]
+            || self.peer_catalog_record(chunk_id)? != *record
+            || PeerFileIdentity::read(file)? != *before
+            || PeerFileIdentity::read(&File::open(self.path_for_record(record)?)?)? != *before
+        {
+            return Err(corrupt(
+                chunk_id,
+                "CRC peer range changed during verification",
+            ));
+        }
+        Ok(PeerReadPayload {
+            object: Arc::new(PeerVerifiedObject {
+                bytes,
+                outboard: None,
+                _reservation: reservation,
+                identity: None,
+                _control: self.peer_object_control(None, deadline)?,
+            }),
+            start: 0,
+            length: allowed,
+        })
+    }
+
+    /// The resident verified object when its identity is still current.
+    #[cfg(any(feature = "dfs", test))]
+    fn read_peer_resident(
+        &self,
+        request: &PeerRangeRequest<'_>,
+        slot: &Option<Arc<PeerVerifiedObject>>,
+        view: &PeerObjectView,
+    ) -> Result<Option<PeerReadPayload>> {
+        let PeerRangeRequest {
+            chunk_id,
+            offset,
+            length: _,
+            cacheable: _,
+            deadline: _,
+            crc_mode: _,
+        } = *request;
+        let PeerObjectView {
+            record,
+            file,
+            before,
+            allowed,
+        } = view;
+        let allowed = *allowed;
+        if let Some(object) = slot.as_ref()
+            && object.identity.as_ref() == Some(&(record.clone(), before.clone()))
+        {
+            if self.peer_catalog_record(chunk_id)? != *record
+                || PeerFileIdentity::read(file)? != *before
+            {
+                return Err(corrupt(chunk_id, "identity changed during cached read"));
+            }
+            if let Some(metrics) = &self.read_work {
+                metrics.peer_object_cache("hit");
+            }
+            return Ok(Some(PeerReadPayload {
+                object: object.clone(),
+                start: usize::try_from(offset.min(record.chunk.length))
+                    .map_err(|_| invalid("Chunk offset is too large"))?,
+                length: allowed,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// A partial range of a content-addressed object through its stored
+    /// outboard proof, without a complete-root scan.
+    #[cfg(any(feature = "dfs", test))]
+    fn read_peer_exact_range(
+        &self,
+        request: &PeerRangeRequest<'_>,
+        slot: &mut Option<Arc<PeerVerifiedObject>>,
+        view: &PeerObjectView,
+    ) -> Result<ExactRange> {
+        let PeerRangeRequest {
+            chunk_id,
+            offset,
+            length: _,
+            cacheable: _,
+            deadline,
+            crc_mode: _,
+        } = *request;
+        let PeerObjectView {
+            record,
+            file,
+            before,
+            allowed,
+        } = view;
+        let allowed = *allowed;
+        let reader = self.open_cataloged(chunk_id)?;
+        let loaded = self
+            .outboard_budget
+            .reserve_range_work(
+                &[VerifiedRangeCopy {
+                    chunk_offset: offset,
+                    length: allowed,
+                    output_offset: 0,
+                }],
+                record.chunk.length,
+            )
+            .ok_or_else(outboard_capacity)
+            .and_then(|working| reader.load_outboard().map(|proof| (proof, working)));
+        match loaded {
+            Ok((Some(proof), working)) => {
+                let mut reservation = match self.reserve_peer_read_payload_until(allowed, deadline)
+                {
+                    Ok(reservation) => reservation,
+                    Err(error) => {
+                        // An unrelated slot is retained for ordinary range
+                        // reads, but may be reclaimed when admission needs
+                        // its genuinely unpinned body capacity.
+                        if slot
+                            .as_ref()
+                            .is_some_and(|object| Arc::strong_count(object) == 1)
+                        {
+                            slot.take();
+                        }
+                        self.reserve_peer_read_payload_until(allowed, deadline)
+                            .map_err(|_| error)?
+                    }
+                };
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve_exact(allowed)
+                    .map_err(|_| peer_payload_capacity())?;
+                reservation.retain_capacity(bytes.capacity())?;
+                bytes.resize(allowed, 0);
+                let mut work = OutboardReadWork::default();
+                let verified = proof.read_ranges_into_with_reserved_work(
+                    file,
+                    0,
+                    &record.chunk,
+                    &[VerifiedRangeCopy {
+                        chunk_offset: offset,
+                        length: allowed,
+                        output_offset: 0,
+                    }],
+                    &mut bytes,
+                    OutboardReadContext {
+                        work: &mut work,
+                        working,
+                    },
+                );
+                #[cfg(test)]
+                VERIFIED_SCAN_BYTES.with(|count| count.set(count.get() + work.hash_bytes));
+                if let Some(metrics) = &self.read_work {
+                    metrics.hash("outboard_body_hash", work.hash_bytes);
+                    metrics.hash("outboard_parent_hash", work.parent_hash_bytes);
+                    metrics.copy("outboard_range_delivery", work.copied_bytes);
+                }
+                if verified.is_ok()
+                    && PeerFileIdentity::read(file)? == *before
+                    && self.peer_catalog_record(chunk_id)? == *record
+                {
+                    return Ok(ExactRange::Served(PeerReadPayload {
+                        object: Arc::new(PeerVerifiedObject {
+                            bytes: bytes.into(),
+                            outboard: None,
+                            _reservation: reservation,
+                            identity: None,
+                            _control: self.peer_object_control(None, deadline)?,
+                        }),
+                        start: 0,
+                        length: allowed,
+                    }));
+                }
+                let capacity_fallback = verified
+                    .as_ref()
+                    .is_err_and(|error| error.code() == afs_error::IO_CAPACITY);
+                // Drop the exact-range private allocation before the old
+                // full-root fallback attempts its original body admission.
+                drop(bytes);
+                drop(reservation);
+                Ok(ExactRange::Fallback { capacity_fallback })
+            }
+            Err(error) if error.code() == afs_error::IO_CAPACITY => Ok(ExactRange::Fallback {
+                capacity_fallback: true,
+            }),
+            _ => Ok(ExactRange::Fallback {
+                capacity_fallback: false,
+            }),
+        }
+    }
+
+    /// Complete-root verified fill; a cacheable small object becomes the
+    /// resident slot and may seed a proof for sidecar repair.
+    #[cfg(any(feature = "dfs", test))]
+    fn read_peer_full_fill(
+        &self,
+        request: &PeerRangeRequest<'_>,
+        slot: &mut Option<Arc<PeerVerifiedObject>>,
+        view: PeerObjectView,
+        capacity_fallback: bool,
+        repair_proof: &mut Option<SharedOutboard>,
+    ) -> Result<PeerReadPayload> {
+        let PeerRangeRequest {
+            chunk_id,
+            offset,
+            length: _,
+            cacheable,
+            deadline,
+            crc_mode: _,
+        } = *request;
+        let PeerObjectView {
+            record,
+            file,
+            before,
+            allowed,
+        } = view;
+        // Only a full fill needs this slot's body capacity. A successful
+        // partial range above must not evict an unrelated healthy object.
+        // Externally held old allocations remain charged until last drop.
+        slot.take();
+        let resident = cacheable && record.chunk.length <= PEER_READ_OBJECT_LIMIT as u64;
+        let allocation = if resident {
+            usize::try_from(record.chunk.length).map_err(|_| peer_payload_capacity())?
+        } else {
+            allowed
+        };
+        let mut reservation = self.reserve_peer_read_payload_until(allocation, deadline)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(allocation)
+            .map_err(|_| peer_payload_capacity())?;
+        reservation.retain_capacity(bytes.capacity())?;
+        bytes.resize(allocation, 0);
+        let builder = (!capacity_fallback
+            && ChunkObject::from_content_addressed_id(chunk_id).as_ref() == Some(&record.chunk))
+        .then(|| OutboardBuilder::new(record.chunk.length, self.outboard_budget.clone()));
+        if capacity_fallback {
+            self.outboard_budget.record_range_fullscan_fallback();
+        }
+        let (_, outboard) = verified_ranges_into_building(
+            &file,
+            &record.chunk,
+            &[VerifiedRangeCopy {
+                chunk_offset: if resident { 0 } else { offset },
+                length: allocation,
+                output_offset: 0,
+            }],
+            &mut bytes,
+            true,
+            self.read_work.as_ref(),
+            builder,
+        )?;
+        if PeerFileIdentity::read(&file)? != before || self.peer_catalog_record(chunk_id)? != record
+        {
+            return Err(corrupt(chunk_id, "identity changed during verification"));
+        }
+        // Reopen the path as well: a pinned old descriptor must not seed a
+        // cache after another inode has replaced its cataloged pathname.
+        let current = File::open(self.path_for_record(&record)?).map_err(Error::from)?;
+        if PeerFileIdentity::read(&current)? != before {
+            return Err(corrupt(chunk_id, "path changed during verification"));
+        }
+        // Residency is a subset of the same proof lease, not an extra
+        // allocation/ledger. Refusal keeps the complete-root body result.
+        *repair_proof = outboard.as_ref().map(Arc::clone);
+        let outboard = outboard.filter(|proof| proof.try_mark_resident());
+        let control = self.peer_object_control(resident.then_some(&record), deadline)?;
+        let object = Arc::new(PeerVerifiedObject {
+            bytes: bytes.into(),
+            outboard,
+            _reservation: reservation,
+            identity: resident.then_some((record, before)),
+            _control: control,
+        });
+        if resident {
+            *slot = Some(object.clone());
+        }
+        Ok(PeerReadPayload {
+            object,
+            start: if resident {
+                usize::try_from(offset.min(allocation as u64))
+                    .map_err(|_| invalid("Chunk offset is too large"))?
+            } else {
+                0
+            },
+            length: allowed,
+        })
+    }
+}
+
+/// One peer range request as received by `read_peer_range_private`.
+#[cfg(any(feature = "dfs", test))]
+#[derive(Clone, Copy)]
+struct PeerRangeRequest<'r> {
+    chunk_id: &'r ChunkId,
+    offset: u64,
+    length: usize,
+    cacheable: bool,
+    deadline: Instant,
+    crc_mode: crate::config::DfsReadCrcMode,
+}
+
+/// The cataloged record and the opened file whose identity every way of
+/// serving the range rechecks.
+#[cfg(any(feature = "dfs", test))]
+struct PeerObjectView {
+    record: LocalChunkRecord,
+    file: File,
+    before: PeerFileIdentity,
+    allowed: usize,
+}
+
+#[cfg(any(feature = "dfs", test))]
+enum ExactRange {
+    Served(PeerReadPayload),
+    Fallback { capacity_fallback: bool },
 }
