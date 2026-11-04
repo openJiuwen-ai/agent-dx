@@ -50,12 +50,29 @@ def test_capability_missing_in_confirmed_response_remains_unsupported():
         Commands(client, "environment-a")._require_recovery_capability()
 
 
-def make_client(handler):
-    client = EnvironmentClient(
-        connection=ConnectionConfig(server_address="frontend:8889", token="test-token")
-    )
-    client._http = httpx.Client(transport=httpx.MockTransport(handler))
-    return client
+@pytest.fixture(name="make_client")
+def client_factory():
+    clients = []
+
+    def factory(handler):
+        client = EnvironmentClient(
+            connection=ConnectionConfig(server_address="frontend:8889", token="test-token")
+        )
+        clients.append(client)
+        client._http.close()
+        client._http = httpx.Client(transport=httpx.MockTransport(handler))
+        return client
+
+    yield factory
+    for client in clients:
+        client.close()
+
+
+def test_retryable_http_wrapper_keeps_first_error():
+    first = httpx.ReadTimeout("first failed attempt")
+    original = EnvironmentHTTPError(503, {}, "later failure", first_error=first)
+    wrapped = _transport._RetryableHTTPStatus(original)
+    assert wrapped.first_error is first
 
 
 def service_error(status, message, request, *, terminal=False):
@@ -75,7 +92,7 @@ def service_error(status, message, request, *, terminal=False):
     )
 
 
-def test_create_terminal_retry_preserves_first_failure_and_final_contract(monkeypatch):
+def test_create_terminal_retry_preserves_first_failure_and_final_contract(monkeypatch, make_client):
     monkeypatch.setattr(_transport.time, "sleep", lambda _: None)
     seen = []
 
@@ -100,7 +117,7 @@ def test_create_terminal_retry_preserves_first_failure_and_final_contract(monkey
     assert len(seen) == 2 and len(set(seen)) == 1
 
 
-def test_create_retry_exhaustion_keeps_first_response(monkeypatch):
+def test_create_retry_exhaustion_keeps_first_response(monkeypatch, make_client):
     monkeypatch.setattr(_transport.time, "sleep", lambda _: None)
     seen = []
 
@@ -118,7 +135,7 @@ def test_create_retry_exhaustion_keeps_first_response(monkeypatch):
     assert raised.value.first_error.outcome == "unknown"
 
 
-def test_create_transport_then_terminal_keeps_transport_cause(monkeypatch):
+def test_create_transport_then_terminal_keeps_transport_cause(monkeypatch, make_client):
     monkeypatch.setattr(_transport.time, "sleep", lambda _: None)
     first = httpx.ReadError("SSE connection lost")
     attempts = []
@@ -136,7 +153,7 @@ def test_create_transport_then_terminal_keeps_transport_cause(monkeypatch):
     assert len(attempts) == 2
 
 
-def test_create_initial_terminal_failure_has_no_previous_failure():
+def test_create_initial_terminal_failure_has_no_previous_failure(make_client):
     with pytest.raises(EnvironmentHTTPError) as raised:
         make_client(
             lambda r: service_error(409, "terminal", r, terminal=True)
@@ -145,7 +162,7 @@ def test_create_initial_terminal_failure_has_no_previous_failure():
 
 
 @pytest.mark.parametrize("terminal", [False, True])
-def test_capability_invoke_retries_keep_first_gateway_error(monkeypatch, terminal):
+def test_capability_invoke_retries_keep_first_gateway_error(monkeypatch, terminal, make_client):
     monkeypatch.setattr(_transport.time, "sleep", lambda _: None)
     attempts = []
 

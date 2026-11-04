@@ -344,7 +344,12 @@ the authenticated Environment catalog and preserves a confirmed OOM or runtime
 failure, including the original operation identity and first transport failure.
 A terminal gateway `ENV_UNAVAILABLE` rejection also checks the catalog once for
 this cause without retrying the rejected operation. If no backend failure is
-confirmed, its original error and retry/outcome contract remain authoritative.
+confirmed, its HTTP status, error code and retry prohibition remain authoritative.
+If an earlier attempt may have executed, the SDK reports `outcome="unknown"`
+even when the last gateway response says `not_started` or `terminal`; the raw
+`payload` retains that last response for diagnosis. This does not enable another
+retry. The initial failure remains available as `first_error`, including when
+a later attempt receives an operation-level 404 or an HTTP error is wrapped.
 A still-running or unavailable catalog cannot confirm a terminal backend failure:
 known-unsent requests remain `not_started`, and ambiguous execution remains
 `unknown`. Neither case disables later direct calls. Retry-After and jitter apply

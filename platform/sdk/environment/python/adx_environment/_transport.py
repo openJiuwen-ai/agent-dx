@@ -169,6 +169,7 @@ class _RetryableHTTPStatus(EnvironmentHTTPError):
             scheduling_failure=error.scheduling_failure,
             probe_failure=error.probe_failure,
             request_forwarded=error.request_forwarded,
+            first_error=error.first_error,
         )
 
 
@@ -986,7 +987,9 @@ class EnvironmentClient:
                         # It is an authoritative result from the resolved
                         # Environment route, not evidence that /direct is absent.
                         self._direct_route_misses = 0
-                        raise self._http_error(resp, request_id=request_id)
+                        error = self._http_error(resp, request_id=request_id)
+                        error.first_error = first_error
+                        raise error
                     if outcome_unknown:
                         # An earlier attempt may already have executed. Route
                         # disappearance does not make Frontend replay safe.
@@ -1095,8 +1098,11 @@ class EnvironmentClient:
                     environment_id=environment_id, failure=failure, first_error=first_error,
                 ) from last_error
         if terminal_route_error is not None:
-            # An expired/unavailable checkpoint remains authoritative when the
-            # catalog cannot confirm a backend failure. Do not enable retries.
+            # The last rejection forbids further retries, but cannot prove that
+            # an earlier ambiguous attempt did not execute. Preserve its raw
+            # response payload while reporting the logical operation's outcome.
+            if outcome_unknown:
+                terminal_route_error.outcome = "unknown"
             raise terminal_route_error
         if last_failure_safe and not outcome_unknown and last_error is not None:
             raise EnvironmentError(

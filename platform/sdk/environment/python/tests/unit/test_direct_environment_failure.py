@@ -67,6 +67,79 @@ def test_failed_environment_retains_cause_without_control_replay(
         client.close()
 
 
+@pytest.mark.parametrize("catalog", ["running", "missing", "outage", "failed"])
+@pytest.mark.parametrize("reported_outcome", ["not_started", "terminal"])
+def test_terminal_route_after_unknown_attempt_preserves_logical_outcome(
+    monkeypatch, catalog, reported_outcome
+):
+    calls = []
+    first = httpx.ReadTimeout("reply lost after submission")
+
+    def handler(request):
+        calls.append(request)
+        if request.url.path == "/api/instances":
+            if catalog == "outage":
+                return httpx.Response(503, text="catalog unavailable")
+            if catalog == "missing":
+                return httpx.Response(200, json=[])
+            record = {"id": "owned", "status": catalog}
+            if catalog == "failed":
+                record["failure"] = {"reason": "OomKilled", "exit_code": 137}
+            return httpx.Response(200, json=[record])
+        assert request.url.path == "/direct/owned/invoke"
+        if len(calls) == 1:
+            raise first
+        return httpx.Response(409, json={"error": {
+            "code": "ENV_UNAVAILABLE", "retry": "never", "outcome": reported_outcome,
+            "message": "route unavailable", "requestId": request.headers["X-ADX-Request-ID"],
+        }})
+
+    client = client_for(monkeypatch, handler)
+    try:
+        with pytest.raises(EnvironmentError) as raised:
+            client.invoke("owned", "process.start", {"cmd": "fixture"})
+        error = raised.value
+        assert error.first_error is first
+        assert error.retry == "never"
+        assert error.outcome == ("terminal" if catalog == "failed" else "unknown")
+        assert error.code == ("ENVIRONMENT_OOM" if catalog == "failed" else "ENV_UNAVAILABLE")
+        if catalog != "failed":
+            assert isinstance(error, EnvironmentHTTPError)
+            assert error.status_code == 409
+            assert error.payload["error"]["outcome"] == reported_outcome
+        direct = [request for request in calls if request.method == "POST"]
+        assert len(direct) == 2
+        assert {json.loads(request.content)["requestId"] for request in direct} == {error.request_id}
+        assert [request.url.path for request in calls] == [
+            "/direct/owned/invoke", "/direct/owned/invoke", "/api/instances"
+        ]
+    finally:
+        client.close()
+
+
+def test_operation_not_found_after_retry_keeps_first_failure(monkeypatch):
+    calls = []
+    first = httpx.ReadTimeout("reply lost")
+
+    def handler(request):
+        calls.append(request)
+        assert request.url.path == "/direct/owned/invoke"
+        if len(calls) == 1:
+            raise first
+        return httpx.Response(404, json={"error_code": "COMMAND_NOT_FOUND", "message": "gone"})
+
+    client = client_for(monkeypatch, handler)
+    try:
+        with pytest.raises(EnvironmentHTTPError) as raised:
+            client.invoke("owned", "process.get", {"command_id": "missing"})
+        assert raised.value.status_code == 404
+        assert raised.value.first_error is first
+        assert len(calls) == 2
+        assert {json.loads(request.content)["requestId"] for request in calls} == {raised.value.request_id}
+    finally:
+        client.close()
+
+
 def test_transient_missing_route_does_not_disable_later_invokes(monkeypatch):
     healthy = False
     calls = []
