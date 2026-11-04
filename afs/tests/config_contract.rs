@@ -721,7 +721,7 @@ fn p3_log_limits_defaults_cli_override_and_invalid_bounds() {
             cfg.meta_wal_max_bytes,
         )
     }
-    let defaults = afs::meta::store::journal::LogLimits::default();
+    let defaults = afs::meta::store::local_log::LocalLogOptions::default();
     assert_eq!(
         limits(&Config::resolve(Role::Meta, Cli::parse_from(["afs-meta"])).unwrap()),
         (
@@ -1306,12 +1306,51 @@ fn fuse_execution_and_dfs_cache_defaults_are_explicit() {
         ("fuse_threads", serde_json::json!(4)),
         ("fuse_clone_fd", serde_json::json!(true)),
         ("fuse_workers", serde_json::json!(32)),
-        ("dfs_fuse_keep_cache", serde_json::json!(true)),
-        ("dfs_fuse_entry_ttl_ms", serde_json::json!(0)),
-        ("dfs_fuse_attr_ttl_ms", serde_json::json!(0)),
         ("fuse_max_readahead_bytes", serde_json::json!(16777216)),
     ] {
         assert_eq!(value.get(key), Some(&expected), "missing/wrong {key}");
+    }
+    // Retired switches (S1a-7): keep_cache is always on, TTLs are always 0.
+    for key in [
+        "dfs_fuse_keep_cache",
+        "dfs_fuse_entry_ttl_ms",
+        "dfs_fuse_attr_ttl_ms",
+    ] {
+        assert!(value.get(key).is_none(), "retired {key} still resolved");
+    }
+}
+
+#[test]
+fn retired_dfs_fuse_cache_switches_are_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("node.toml");
+    for line in [
+        "dfs_fuse_keep_cache=false",
+        "dfs_fuse_entry_ttl_ms=0",
+        "dfs_fuse_attr_ttl_ms=0",
+    ] {
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+        assert!(
+            Config::resolve(
+                Role::Node,
+                Cli {
+                    config: Some(path.clone()),
+                    ..Cli::default()
+                },
+            )
+            .is_err(),
+            "retired file key accepted: {line}"
+        );
+    }
+    for flag in [
+        "--dfs-fuse-keep-cache",
+        "--dfs-fuse-entry-ttl-ms",
+        "--dfs-fuse-attr-ttl-ms",
+    ] {
+        assert!(
+            Cli::try_parse_from(["afs-node", flag, "0"]).is_err(),
+            "retired flag accepted: {flag}"
+        );
     }
 }
 
@@ -1321,8 +1360,9 @@ fn fuse_execution_settings_merge_file_cli_and_validate_boundaries() {
     let path = root.path().join("node.toml");
     std::fs::write(
         &path,
-        "fuse_threads=1\nfuse_clone_fd=false\nfuse_workers=1\ndfs_fuse_keep_cache=false\ndfs_fuse_entry_ttl_ms=60000\ndfs_fuse_attr_ttl_ms=60000\nfuse_max_readahead_bytes=16777216\n",
-    ).unwrap();
+        "fuse_threads=1\nfuse_clone_fd=false\nfuse_workers=1\nfuse_max_readahead_bytes=16777216\n",
+    )
+    .unwrap();
     let cfg = Config::resolve(
         Role::Node,
         Cli::try_parse_from([
@@ -1333,8 +1373,6 @@ fn fuse_execution_settings_merge_file_cli_and_validate_boundaries() {
             "64",
             "--fuse-workers",
             "1024",
-            "--dfs-fuse-entry-ttl-ms",
-            "0",
         ])
         .expect("public FUSE options must be recognized"),
     )
@@ -1343,9 +1381,6 @@ fn fuse_execution_settings_merge_file_cli_and_validate_boundaries() {
     assert_eq!(value["fuse_threads"], 64);
     assert_eq!(value["fuse_workers"], 1024);
     assert_eq!(value["fuse_clone_fd"], false);
-    assert_eq!(value["dfs_fuse_keep_cache"], false);
-    assert_eq!(value["dfs_fuse_entry_ttl_ms"], 0);
-    assert_eq!(value["dfs_fuse_attr_ttl_ms"], 60000);
     assert_eq!(value["fuse_max_readahead_bytes"], 16777216);
 }
 
@@ -1358,8 +1393,6 @@ fn fuse_execution_settings_reject_out_of_range_values_before_startup() {
         ("fuse_threads", 65),
         ("fuse_workers", 0),
         ("fuse_workers", 1025),
-        ("dfs_fuse_entry_ttl_ms", 60001),
-        ("dfs_fuse_attr_ttl_ms", 60001),
         ("fuse_max_readahead_bytes", 16777217),
     ] {
         std::fs::write(&path, format!("{key}={number}\n")).unwrap();
