@@ -370,7 +370,7 @@ impl LocalChunkStore {
         }
         drop(catalog);
         for record in damaged {
-            self.quarantine_if_invalid(&record.chunk.id)?;
+            self.lifecycle().quarantine_checked(&record.chunk.id)?;
         }
         for entry in fs::read_dir(&self.chunks).map_err(Error::from)? {
             let entry = entry.map_err(Error::from)?;
@@ -629,7 +629,8 @@ impl LocalChunkStore {
             .read_at(offset, out)
             .inspect_err(|error| {
                 if verified_copy_is_invalid(error) {
-                    self.try_quarantine(chunk_id);
+                    self.lifecycle()
+                        .quarantine(chunk_id, QuarantineTrigger::LocalRead);
                 }
             })
     }
@@ -659,7 +660,8 @@ impl LocalChunkStore {
         );
         result.map(|counts| counts[0]).inspect_err(|error| {
             if verified_copy_is_invalid(error) {
-                self.try_quarantine(chunk_id);
+                self.lifecycle()
+                    .quarantine(chunk_id, QuarantineTrigger::UncommittedRangeRead);
             }
         })
     }
@@ -668,7 +670,8 @@ impl LocalChunkStore {
         let reader = self.open_cataloged(chunk_id)?;
         reader.verify_full_and_build().inspect_err(|error| {
             if verified_copy_is_invalid(error) {
-                self.try_quarantine(chunk_id);
+                self.lifecycle()
+                    .quarantine(chunk_id, QuarantineTrigger::VerifiedOpen);
             }
         })?;
         Ok(reader)
@@ -734,7 +737,8 @@ impl LocalChunkStore {
             .map_err(Error::from)
             .inspect_err(|error| {
                 if verified_copy_is_invalid(error) {
-                    self.try_quarantine(chunk_id);
+                    self.lifecycle()
+                        .quarantine(chunk_id, QuarantineTrigger::CatalogOpen);
                 }
             })?;
         if let Some(expected) = ChunkObject::from_content_addressed_id(chunk_id)

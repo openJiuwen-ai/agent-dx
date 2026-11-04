@@ -603,7 +603,7 @@ impl DfsReadEngine {
             .lock()
             .map_err(|_| unavailable("source cache poisoned"))?
             .retain(|_, _| false);
-        self.local.collect_generation(generation, chunks)
+        self.local.lifecycle().retire_generation(generation, chunks)
     }
 
     pub fn new(

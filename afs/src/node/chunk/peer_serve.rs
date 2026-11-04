@@ -642,7 +642,9 @@ impl PeerGroupReader<'_> {
             if verified_copy_is_invalid(&error) {
                 self.store.record_peer_read_event("stream_group_corrupt");
                 self.retire_failed_proof();
-                self.store.try_quarantine(&self.record.chunk.id);
+                self.store
+                    .lifecycle()
+                    .quarantine(&self.record.chunk.id, QuarantineTrigger::PeerStreamGroup);
             }
             return Err(error);
         }
@@ -1789,7 +1791,7 @@ impl LocalChunkStore {
         if result.is_ok()
             && let Some(proof) = repair_proof.as_ref()
         {
-            repair_outboard_if_needed(
+            repair_sidecar_on_read(
                 &self.outboards.join(format!("{}.bao", safe_id(&chunk_id.0))),
                 proof,
                 &self.outboard_repairs,
@@ -1798,7 +1800,8 @@ impl LocalChunkStore {
         if let Err(error) = &result
             && verified_copy_is_invalid(error)
         {
-            self.try_quarantine(chunk_id);
+            self.lifecycle()
+                .quarantine(chunk_id, QuarantineTrigger::PeerRangeServe);
         }
         result
     }

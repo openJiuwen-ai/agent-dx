@@ -60,25 +60,7 @@ pub(super) fn outboard_file_matches(path: &Path, proof: &SharedOutboard) -> Resu
     Ok(file.metadata().map_err(Error::from)?.len() == proof.encoded().len() as u64)
 }
 
-pub(super) fn repair_outboard_if_needed(
-    path: &Path,
-    proof: &SharedOutboard,
-    gates: &OutboardRepairGates,
-) {
-    let mut hash = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut hash);
-    let index = (hash.finish() % OUTBOARD_REPAIR_SHARDS as u64) as usize;
-    let Ok(_repair) = gates[index].lock() else {
-        return;
-    };
-    // Compare again under the shared gate: another reader may have repaired
-    // this exact sidecar after our body scan. No catalog or body is rewritten.
-    if !outboard_file_matches(path, proof).unwrap_or(false) {
-        let _ = persist_outboard_file(path, proof);
-    }
-}
-
-fn persist_outboard_file(path: &Path, proof: &SharedOutboard) -> Result<()> {
+pub(super) fn persist_outboard_file(path: &Path, proof: &SharedOutboard) -> Result<()> {
     install_outboard_file(path, proof)?;
     let parent = path
         .parent()

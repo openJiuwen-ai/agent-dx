@@ -513,9 +513,10 @@ impl DistributedFs {
         let mut state = state
             .lock()
             .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-        if should_renew(&state.write_lease) {
-            state.write_lease = self.meta.renew_write_lease(state.write_lease.clone())?;
-        }
+        // J4: a fresh lease is part of this call's contract (see fault::lease_keeper).
+        ensure_fresh(&mut state.write_lease, |lease| {
+            self.meta.renew_write_lease(lease)
+        })?;
         state.open_writers = state.open_writers.saturating_add(1);
         state.last_writer_background_requested = false;
         let session_id = DfsWriteSessionId::new(format!(

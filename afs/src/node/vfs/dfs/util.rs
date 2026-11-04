@@ -10,14 +10,10 @@ pub(super) fn owner_request_context() -> RequestContext {
     }
 }
 
-pub(super) fn should_renew(lease: &WriteLease) -> bool {
-    lease.expires_at_unix_ms <= now_unix_ms().saturating_add(5_000)
-}
-
-pub(super) fn should_background_renew(lease: &WriteLease) -> bool {
-    let renew_before_expiry_ms = DFS_WRITE_LEASE_SECONDS.saturating_mul(1_000) * 2 / 3;
-    lease.expires_at_unix_ms <= now_unix_ms().saturating_add(renew_before_expiry_ms)
-}
+// Renewal thresholds belong to the fault layer's lease keeper.
+pub(super) use crate::node::fault::lease_keeper::{
+    ensure_fresh, should_background_renew, should_renew,
+};
 
 pub(super) fn has_o_dsync(flags: i32) -> bool {
     #[cfg(any(target_os = "linux", target_os = "android"))]

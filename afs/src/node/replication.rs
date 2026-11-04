@@ -8,21 +8,23 @@ use std::{collections::HashSet, sync::Arc};
 
 use afs_error::{Error, Result};
 
-use crate::node::fault::classify::{
-    corruption_report_definitively_rejected, repair_report_definitively_rejected,
-    repair_request_definitively_rejected, repair_source_is_invalid,
-};
-
 use crate::{
     dfs::{
         ChunkId, ChunkReceipt, EffectiveLocalCopy, OperationId, PlacementSnapshot, ReplicaAck,
         ReplicaGroup, ReplicaGroupId, ReplicaTarget, ReplicaWriteGrant, ReplicationConfig,
     },
     node::{
-        chunk::{BodyRelease, ChunkSink, LocalChunkStore, PutIntent, StagedChunk, StoredChunk},
+        chunk::{
+            BodyRelease, ChunkSink, LocalChunkStore, PutIntent, QuarantineTrigger, StagedChunk,
+            StoredChunk,
+        },
         vfs::types::FilesystemCapacity,
     },
 };
+
+// Background repair lives in the fault layer; the names stay reachable here.
+#[doc(inline)]
+pub use crate::node::fault::repair::{ReplicationTaskAuthority, ReplicationWorker};
 
 pub trait PlacementProvider: Send + Sync {
     fn snapshot(&self) -> Result<Arc<PlacementSnapshot>>;
@@ -269,7 +271,7 @@ impl ReplicationPlan {
             .find(|target| target.node_id == local_node_id)
     }
 
-    fn sync_target_count(&self) -> Result<usize> {
+    pub(crate) fn sync_target_count(&self) -> Result<usize> {
         let minimum = self
             .ack_requirement
             .min_acks
@@ -286,7 +288,7 @@ impl ReplicationPlan {
         ))
     }
 
-    fn validate_initiator(&self, local_node_id: &str) -> Result<()> {
+    pub(crate) fn validate_initiator(&self, local_node_id: &str) -> Result<()> {
         let mut nodes = HashSet::new();
         if self
             .ordered_targets
@@ -366,7 +368,7 @@ struct ReplicationPlanGroup {
 /// forward to the peers, then prove the result against the plan's
 /// [`AckRequirement`]. Normal writes and repair share it; repair only adds the
 /// Meta claim that every hop carries.
-struct ReplicaChain {
+pub(crate) struct ReplicaChain {
     node_id: String,
     node_epoch: u64,
     local: Arc<LocalChunkStore>,
@@ -374,7 +376,7 @@ struct ReplicaChain {
 }
 
 impl ReplicaChain {
-    fn new(
+    pub(crate) fn new(
         node_id: String,
         node_epoch: u64,
         local: Arc<LocalChunkStore>,
@@ -491,7 +493,7 @@ impl ReplicaChain {
     }
 
     /// One chunk along a repair plan the caller has checked is source-first.
-    fn put_repair(
+    pub(crate) fn put_repair(
         &self,
         plan: &ReplicationPlan,
         staged: &StagedChunk,
@@ -819,7 +821,9 @@ impl ChunkSink for DfsChunkSink {
             // This rechecks the actual local object before quarantining; a
             // caller's expected-root mismatch above never quarantines it. A
             // failed quarantine is logged (R52) and the read error still wins.
-            self.local.try_quarantine(&receipt.chunk.id);
+            self.local
+                .lifecycle()
+                .quarantine(&receipt.chunk.id, QuarantineTrigger::UploadedReadBack);
         }
         result
     }
@@ -970,314 +974,6 @@ fn unsupported_capacity(message: impl Into<String>) -> Error {
     Error::coded(afs_error::NODE_VFS_UNIMPLEMENTED, message)
 }
 
-/// Background repair uses Meta's durable task identity rather than an inode
-/// write lease. Only a node with an existing live source copy claims the task;
-/// no file bytes pass through Meta and no FileVersion is changed by repair.
-pub trait ReplicationTaskAuthority: Send + Sync {
-    fn report_corrupt_chunk(&self, request: crate::dfs::ReportChunkCorruption) -> Result<()>;
-    fn claim(
-        &self,
-        request: crate::dfs::ClaimReplicationTask,
-    ) -> Result<Option<crate::dfs::ReplicationClaim>>;
-    fn report(
-        &self,
-        request: crate::dfs::ReportReplicationTask,
-    ) -> Result<crate::dfs::ReplicationTask>;
-}
-
-#[derive(Clone)]
-enum PendingRepair {
-    Corruption(Box<crate::dfs::ReportChunkCorruption>),
-    Claiming(crate::dfs::ClaimReplicationTask),
-    Reporting(Box<crate::dfs::ReportReplicationTask>),
-}
-
-/// One task and one bounded chunk buffer per worker. An unknown Meta response
-/// retains the exact request; restarting a node leaves the persisted claim to
-/// expire/reassign. A receiver ACK alone never promotes a Meta copy record.
-pub struct ReplicationWorker {
-    node_id: String,
-    node_epoch: u64,
-    session_id: String,
-    local: Arc<LocalChunkStore>,
-    authority: Arc<dyn ReplicationTaskAuthority>,
-    chain: ReplicaChain,
-    pending: std::sync::Mutex<Option<PendingRepair>>,
-    reported_quarantines: std::sync::Mutex<HashSet<(ChunkId, u64)>>,
-    sequence: std::sync::atomic::AtomicU64,
-}
-
-impl ReplicationWorker {
-    pub fn new(
-        node_id: String,
-        node_epoch: u64,
-        session_id: String,
-        local: Arc<LocalChunkStore>,
-        authority: Arc<dyn ReplicationTaskAuthority>,
-        data_plane: Arc<dyn ReplicaDataPlane>,
-    ) -> Self {
-        Self {
-            chain: ReplicaChain::new(node_id.clone(), node_epoch, local.clone(), data_plane),
-            node_id,
-            node_epoch,
-            session_id,
-            local,
-            authority,
-            pending: std::sync::Mutex::new(None),
-            reported_quarantines: std::sync::Mutex::new(HashSet::new()),
-            sequence: std::sync::atomic::AtomicU64::new(1),
-        }
-    }
-
-    fn operation_id(&self, kind: &str) -> crate::dfs::OperationId {
-        use std::sync::atomic::Ordering;
-        crate::dfs::OperationId::new(format!(
-            "repair-{kind}:{}:{}",
-            self.session_id,
-            self.sequence.fetch_add(1, Ordering::Relaxed)
-        ))
-    }
-
-    /// Called from a blocking worker, never from the Tokio reactor. Serialize
-    /// this worker's claim/report requests so a timeout cannot launch another
-    /// transfer while the original outcome is unknown.
-    pub fn run_once(&self) -> Result<Option<crate::dfs::ReplicationTask>> {
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| invalid("replication worker state lock is poisoned"))?;
-        if pending.is_none() {
-            let records = self.local.quarantined_chunks()?;
-            let active: HashSet<_> = records
-                .iter()
-                .map(|record| (record.chunk.id.clone(), record.catalog_revision))
-                .collect();
-            let mut reported = self
-                .reported_quarantines
-                .lock()
-                .map_err(|_| invalid("corruption report state lock is poisoned"))?;
-            reported.retain(|key| active.contains(key));
-            if let Some(record) = records.iter().find(|record| {
-                !reported.contains(&(record.chunk.id.clone(), record.catalog_revision))
-            }) {
-                *pending = Some(PendingRepair::Corruption(Box::new(
-                    crate::dfs::ReportChunkCorruption {
-                        caller_id: self.node_id.clone(),
-                        caller_session_id: self.session_id.clone(),
-                        caller_node_epoch: self.node_epoch,
-                        operation_id: self.operation_id("corrupt"),
-                        chunk_id: record.chunk.id.clone(),
-                        device_id: record.device_id.clone(),
-                        device_epoch: record.device_epoch,
-                        catalog_revision: record.catalog_revision,
-                    },
-                )));
-            }
-        }
-        if let Some(PendingRepair::Corruption(request)) = pending.as_ref() {
-            // Unknown ACK, timeout or CAS conflict retains this exact request.
-            // It cannot accuse another node and contains no file bytes.
-            if let Err(error) = self
-                .authority
-                .report_corrupt_chunk(request.as_ref().clone())
-            {
-                if corruption_report_definitively_rejected(&error) {
-                    // A definitive refusal is not an unknown commit. Keep the
-                    // local quarantine, suppress this identity for this worker
-                    // incarnation and allow other repair work to progress.
-                    self.reported_quarantines
-                        .lock()
-                        .map_err(|_| invalid("corruption report state lock is poisoned"))?
-                        .insert((request.chunk_id.clone(), request.catalog_revision));
-                    afs_logging::warn!("dfs.local_corruption_report_rejected";
-                        "chunk" => request.chunk_id.0.clone(),
-                        "catalog_revision" => request.catalog_revision,
-                        "error" => error.to_string());
-                    *pending = None;
-                }
-                return Err(error);
-            }
-            self.reported_quarantines
-                .lock()
-                .map_err(|_| invalid("corruption report state lock is poisoned"))?
-                .insert((request.chunk_id.clone(), request.catalog_revision));
-            afs_logging::warn!("dfs.local_corruption_reported";
-                "chunk" => request.chunk_id.0.clone(),
-                "catalog_revision" => request.catalog_revision);
-            *pending = None;
-            return Ok(None);
-        }
-        let current = pending.get_or_insert_with(|| {
-            PendingRepair::Claiming(crate::dfs::ClaimReplicationTask {
-                caller_id: self.node_id.clone(),
-                caller_session_id: self.session_id.clone(),
-                caller_node_epoch: self.node_epoch,
-                operation_id: self.operation_id("claim"),
-                lease_seconds: 120,
-            })
-        });
-        if let PendingRepair::Claiming(request) = current {
-            let claim = match self.authority.claim(request.clone()) {
-                Ok(Some(claim)) => claim,
-                Ok(None) => {
-                    *pending = None;
-                    return Ok(None);
-                }
-                Err(error) => {
-                    if repair_request_definitively_rejected(&error) {
-                        *pending = None;
-                    }
-                    return Err(error);
-                }
-            };
-            if claim.operation_id != request.operation_id
-                || claim.worker_node_id != self.node_id
-                || claim.worker_node_epoch != self.node_epoch
-                || claim.worker_session_id != self.session_id
-            {
-                // A mismatched authority result must never become a transfer.
-                return Err(invalid("Meta repair claim does not bind this request"));
-            }
-            let now = unix_ms()?;
-            if claim.expires_at_unix_ms <= now {
-                // Exact replay can confirm a previously accepted but now stale
-                // claim. Start a fresh poll; do not transfer under that claim.
-                *pending = None;
-                return Ok(None);
-            }
-            let (durable_acks, error, source_invalid) = match self.replicate(&claim) {
-                Ok(acks) => (acks, None, false),
-                Err((error, source_invalid)) => {
-                    (Vec::new(), Some(error.to_string()), source_invalid)
-                }
-            };
-            *pending = Some(PendingRepair::Reporting(Box::new(
-                crate::dfs::ReportReplicationTask {
-                    caller_id: self.node_id.clone(),
-                    caller_session_id: self.session_id.clone(),
-                    caller_node_epoch: self.node_epoch,
-                    operation_id: self.operation_id("report"),
-                    claim,
-                    durable_acks,
-                    error,
-                    source_invalid,
-                },
-            )));
-        }
-        let Some(PendingRepair::Reporting(request)) = pending.as_ref() else {
-            return Err(invalid("repair worker lost the original claim"));
-        };
-        match self.authority.report(request.as_ref().clone()) {
-            Ok(task) => {
-                if task.id != request.claim.task_id
-                    || task.chunk_id != request.claim.chunk.id
-                    || (task.state == crate::dfs::ReplicationTaskState::Completed
-                        && task.placement_epoch != request.claim.replica_group.placement_epoch)
-                    || usize::from(task.desired_copies) != request.claim.replica_group.targets.len()
-                    || !matches!(
-                        task.state,
-                        crate::dfs::ReplicationTaskState::Completed
-                            | crate::dfs::ReplicationTaskState::RetryWaiting
-                            | crate::dfs::ReplicationTaskState::BlockedNoSource
-                    )
-                {
-                    // Keep the exact report pending: an unrelated response does
-                    // not confirm this transfer or authorize the next task.
-                    return Err(invalid("Meta repair report does not bind this task"));
-                }
-                *pending = None;
-                Ok(Some(task))
-            }
-            Err(error) => {
-                if repair_report_definitively_rejected(&error) {
-                    *pending = None;
-                }
-                Err(error)
-            }
-        }
-    }
-
-    fn replicate(
-        &self,
-        claim: &crate::dfs::ReplicationClaim,
-    ) -> std::result::Result<Vec<ReplicaAck>, (Error, bool)> {
-        let length = usize::try_from(claim.chunk.length)
-            .map_err(|_| (invalid("repair chunk length overflows this node"), false))?;
-        if length == 0 || length > crate::node::chunk::MAX_STAGED_CHUNK_BYTES {
-            return Err((invalid("repair chunk exceeds the staging budget"), false));
-        }
-        // Local source failures cannot be conflated with remote transport or
-        // capacity errors. Mark corrupt only for missing/invalid durable data,
-        // not permission, transient I/O, ENOSPC, or an unavailable peer.
-        let reader = self.local.open_verified(&claim.chunk.id).map_err(|error| {
-            let source_invalid = repair_source_is_invalid(&error);
-            (error, source_invalid)
-        })?;
-        let mut bytes = vec![0; length];
-        let mut offset = 0;
-        while offset < length {
-            let count = reader
-                .read_at(offset as u64, &mut bytes[offset..])
-                .map_err(|error| {
-                    let source_invalid = error.kind() == afs_error::ErrorKind::DataLoss
-                        || error.kind() == afs_error::ErrorKind::NotFound;
-                    if source_invalid {
-                        self.local.try_quarantine(&claim.chunk.id);
-                    }
-                    (error, source_invalid)
-                })?;
-            if count == 0 {
-                return Err((
-                    invalid("repair source ended before its immutable length"),
-                    true,
-                ));
-            }
-            offset += count;
-        }
-        let staged = StagedChunk::from_replica(claim.operation_id.clone(), &claim.chunk, bytes)
-            .map_err(|error| (error, true))?;
-        if staged.chunk != claim.chunk {
-            return Err((invalid("repair source identity or digest differs"), true));
-        }
-        // Meta forced Required on this claim because a repair source must head
-        // its chain: a chain constraint, not user policy, so it never follows an
-        // effective value. The explicit check below states it again.
-        let local_copy = EffectiveLocalCopy::declared(&claim.replication);
-        let plan = ReplicationPlan {
-            chunk_id: claim.chunk.id.clone(),
-            placement_revision: claim.placement_revision,
-            placement_epoch: claim.replica_group.placement_epoch,
-            replica_group_id: claim.replica_group.id.clone(),
-            config: claim.replication.clone(),
-            local_copy,
-            ack_requirement: AckRequirement::strict(&claim.replication, local_copy),
-            ordered_targets: claim.replica_group.targets.clone(),
-        };
-        plan.validate_initiator(&self.node_id)
-            .map_err(|error| (error, false))?;
-        if !plan.ordered_targets.first().is_some_and(|target| {
-            target.node_id == self.node_id && target.node_epoch == self.node_epoch
-        }) || plan.sync_target_count().map_err(|error| (error, false))?
-            != plan.ordered_targets.len()
-        {
-            return Err((
-                invalid("repair claim does not execute its full source-first chain"),
-                false,
-            ));
-        }
-        self.chain
-            .put_repair(&plan, &staged, claim)
-            .map_err(|error| (error, false))
-    }
-}
-
-fn unix_ms() -> Result<u64> {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|time| time.as_millis() as u64)
-        .map_err(|_| invalid("system clock is before epoch"))
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -1285,6 +981,7 @@ mod tests {
     use super::*;
     use crate::dfs::{LocalCopyPolicy, OperationId, StorageDeviceDescriptor};
     use crate::node::chunk::StagedChunk;
+    use crate::node::fault::repair::unix_ms;
 
     struct StaticPlacement {
         snapshot: Arc<PlacementSnapshot>,

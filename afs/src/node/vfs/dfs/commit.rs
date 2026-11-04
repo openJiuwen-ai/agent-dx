@@ -290,9 +290,10 @@ impl DistributedFs {
         {
             return Ok(None);
         }
-        if should_renew(&state.write_lease) {
-            state.write_lease = self.meta.renew_write_lease(state.write_lease.clone())?;
-        }
+        // J4: a fresh lease is part of this call's contract (see fault::lease_keeper).
+        ensure_fresh(&mut state.write_lease, |lease| {
+            self.meta.renew_write_lease(lease)
+        })?;
         if !state.dirty {
             let sync = Box::new(self.full_metadata_sync(&state));
             let through_seq = state.visible_write_seq;

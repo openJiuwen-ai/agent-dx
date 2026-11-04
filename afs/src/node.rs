@@ -2010,39 +2010,8 @@ async fn run_node(
     }
     #[cfg(feature = "dfs")]
     if let Some(dfs) = state.dfs.clone() {
-        let gc_fs = dfs.clone();
-        let gc_stop = services.stop.subscribe();
-        services.spawn(async move {
-            let mut tick=tokio::time::interval(std::time::Duration::from_secs(5));
-            let shutdown=cancelled(gc_stop);tokio::pin!(shutdown);
-            loop {tokio::select!{_=&mut shutdown=>return Ok(()),_=tick.tick()=>{
-                let fs=gc_fs.clone();match crate::node::bridge::spawn_blocking(move||fs.collect_garbage()).await {
-                    Ok(Ok(count)) if count>0=>afs_logging::info!("dfs.gc_collected";"chunks"=>count),
-                    Ok(Ok(_))=>{},Ok(Err(error))=>afs_logging::warn!("dfs.gc_retry";"error"=>error.to_string()),
-                    Err(error)=>afs_logging::warn!("dfs.gc_worker_failed";"error"=>error.to_string()),
-                }
-            }}}
-        });
-        let renew_fs = dfs.clone();
-        let renew_stop = services.stop.subscribe();
-        services.spawn(async move {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
-            let shutdown = cancelled(renew_stop);
-            tokio::pin!(shutdown);
-            loop {
-                tokio::select! {
-                    _ = &mut shutdown => return Ok(()),
-                    _ = tick.tick() => {
-                        let fs = renew_fs.clone();
-                        match crate::node::bridge::spawn_blocking(move || fs.renew_active_write_leases()).await {
-                            Ok(Ok(_)) => {},
-                            Ok(Err(error)) => afs_logging::warn!("dfs.writer_renewal_retry"; "error" => error.to_string()),
-                            Err(error) => afs_logging::warn!("dfs.writer_renewal_worker_failed"; "error" => error.to_string()),
-                        }
-                    }
-                }
-            }
-        });
+        fault::reaper::Reaper::new(dfs.clone()).start(&mut services);
+        fault::lease_keeper::LeaseKeeper::new(dfs.clone()).start(&mut services);
         let stop = services.stop.subscribe();
         let native_notify = dfs.native_writeback_notify();
         let native_commit_period = std::time::Duration::from_millis(cfg.dfs_background_commit_ms);
@@ -2293,49 +2262,15 @@ async fn run_node(
         local_chunk_store,
         cfg.dfs_external_backend.as_ref(),
     ) {
-        let worker = Arc::new(replication::ReplicationWorker::new(
+        fault::repair::RepairService::new(replication::ReplicationWorker::new(
             cfg.id.clone(),
             registered_node_epoch,
             state.session_id.clone(),
             local,
             meta,
             dfs_replica_plane,
-        ));
-        let stop = services.stop.subscribe();
-        services.spawn(async move {
-            let shutdown = cancelled(stop);
-            tokio::pin!(shutdown);
-            let mut delay = std::time::Duration::from_secs(1);
-            loop {
-                tokio::select! {
-                    _ = &mut shutdown => return Ok(()),
-                    _ = tokio::time::sleep(delay) => {}
-                }
-                let worker = worker.clone();
-                // The worker owns an exact pending request until its Meta
-                // outcome is confirmed. A started blocking transfer is not
-                // detached on a tick or replaced by another task.
-                match crate::node::bridge::spawn_blocking(move || worker.run_once()).await {
-                    Ok(Ok(Some(task))) => {
-                        afs_logging::info!("dfs.replication_task_reported";
-                            "task" => task.id.0,
-                            "state" => format!("{:?}", task.state),
-                            "attempt" => task.attempt);
-                        delay = std::time::Duration::from_millis(1);
-                    }
-                    Ok(Ok(None)) => delay = std::time::Duration::from_secs(1),
-                    Ok(Err(error)) => {
-                        afs_logging::warn!("dfs.replication_task_retry"; "error" => error.to_string());
-                        delay = std::time::Duration::from_secs(1);
-                    }
-                    Err(error) => {
-                        // A panic can invalidate the worker's exact state.
-                        // Fail the service instead of launching a duplicate.
-                        return Err(error.into());
-                    }
-                }
-            }
-        });
+        ))
+        .start(&mut services);
     }
     #[cfg(feature = "dfs")]
     let dfs_for_drain = state.dfs.clone();

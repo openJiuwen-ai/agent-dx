@@ -153,11 +153,11 @@ impl DfsReadEngine {
     }
 
     fn handle_local_read_failure(&self, chunk_id: &ChunkId, error: &Error) -> Result<()> {
-        if matches!(
-            error.kind(),
-            afs_error::ErrorKind::DataLoss | afs_error::ErrorKind::NotFound
-        ) {
-            self.local.try_quarantine(chunk_id);
+        if crate::node::fault::classify::verified_copy_is_invalid(error) {
+            self.local.lifecycle().quarantine(
+                chunk_id,
+                crate::node::chunk::QuarantineTrigger::DfsLocalRead,
+            );
         }
         // A cached pin can outlive a corrupt file's replacement. Drop it on
         // failure so the next attempt opens the current physical copy instead

@@ -858,9 +858,10 @@ impl Backend for DistributedFs {
             let mut state = cell
                 .lock()
                 .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-            if should_renew(&state.write_lease) {
-                state.write_lease = self.meta.renew_write_lease(state.write_lease.clone())?;
-            }
+            // J4: a fresh lease is part of this call's contract (see fault::lease_keeper).
+            ensure_fresh(&mut state.write_lease, |lease| {
+                self.meta.renew_write_lease(lease)
+            })?;
             let clone_source = crate::dfs::CloneFileRange {
                 version: version_id,
                 source_offset: range.source_offset,

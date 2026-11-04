@@ -187,7 +187,7 @@ impl PinnedChunkReader {
         if let Some(proof) = proof {
             // Transient proof remains in the original total ledger throughout
             // repair; a full resident subset must not prevent bounded repair.
-            repair_outboard_if_needed(&self.outboard_path, &proof, &self.outboard_repairs);
+            repair_sidecar_on_read(&self.outboard_path, &proof, &self.outboard_repairs);
             if proof.try_mark_resident()
                 && let Ok(mut cached) = self.outboard.lock()
             {

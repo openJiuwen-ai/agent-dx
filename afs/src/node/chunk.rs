@@ -68,6 +68,7 @@ mod write_buffer;
 pub use catalog::LocalCatalog;
 use catalog::*;
 use lifecycle::*;
+pub use lifecycle::{CopyPhase, QuarantineTrigger};
 use outboard_file::*;
 #[cfg(feature = "rdma")]
 pub(crate) use peer_serve::PeerReadReservation;

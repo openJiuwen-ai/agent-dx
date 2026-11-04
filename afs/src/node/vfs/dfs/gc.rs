@@ -1,6 +1,7 @@
 use super::*;
 
 /// GC reference pins and the gate that serialises local collection passes.
+/// The pass itself is the fault layer's reaper (`node::fault::reaper`).
 /// Handles, directory handles, writes and commits all pin through
 /// `references`; `gate` only orders `collect` against itself.
 #[derive(Default)]
@@ -25,17 +26,7 @@ impl GcCoordinator {
             .gate
             .lock()
             .map_err(|_| unavailable("GC worker poisoned"))?;
-        references.flush()?;
-        let completed = read_engine.gc_generation()?;
-        let batch = references
-            .control
-            .collect(completed, read_engine.gc_inventory()?)?;
-        if batch.waiting_nodes.iter().any(|node| node == node_id) && batch.generation > completed {
-            read_engine.collect_generation(batch.generation, &batch.chunks)?;
-            references.control.collect(batch.generation, Vec::new())?;
-            return Ok(batch.chunks.len());
-        }
-        Ok(0)
+        crate::node::fault::reaper::collect_once(references, read_engine, node_id)
     }
 }
 
