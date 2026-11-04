@@ -1,4 +1,5 @@
-// Included inside the existing test module so fixtures remain test-only.
+use super::*;
+
 struct UnifiedLocalTransfer;
 impl crate::node::dfs_read::ChunkTransfer for UnifiedLocalTransfer {
     fn supports_async_native_read(&self) -> bool {

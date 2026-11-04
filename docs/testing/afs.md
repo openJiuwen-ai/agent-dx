@@ -89,7 +89,7 @@ LOOKUP旧长度与OPEN新版本的竞争；旧READ延迟回复不污染新OPEN�
 
 ```sh
 cargo test --locked -p afs --all-features --test fuse_contract dfs_buffered_ -- --ignored --test-threads=1
-cargo test --locked -p afs --all-features --lib node::vfs::dfs::tests::p1_ -- --test-threads=1
+cargo test --locked -p afs --all-features --lib -- node::vfs::dfs::tests::read_views::p1_ node::vfs::dfs::tests::version_cache::p1_ --test-threads=1
 cargo test --locked -p afs --all-features --lib node::dfs_read::tests
 ```
 
