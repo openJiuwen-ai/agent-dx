@@ -90,7 +90,7 @@ mounts:
 
 Activator 在准备和激活时渲染 mounts；HTTP 与嵌入式 Sandbox 适配器发送相同的具体挂载，Environment 创建请求不传 parameters 或业务 user_id；Volume 管理的 owner_id 使用对应 Env 引用的实际 Environment ID，不代表业务用户。Jiuwen 根据认证身份的 `[tenant, template, user_id]` JSON 数组 SHA-256 生成 `w-<完整十六进制摘要>`，版本、Binding 和 Sandbox ID 不参与目录标识。
 
-[Jiuwen 模板例子](activator/examples/jiuwen-sfs-template.json)将应用数据和 HOME 收敛到 `/home/jiuwen`，仍采用内联挂载，尚未切换到受管 Volume；SFS 挂载由部署准备，目录创建由上述挂载声明控制。使用 SQLite/WAL 的工作区必须保证旧 Sandbox 完全停止访问后才启用后继，不能同时运行新旧版本。详见[工作区设计](../docs/development/user-workspace-volumes-design.md)和[Volume 方案](../docs/development/platform-volume-design.md)。
+[Jiuwen 模板例子](activator/examples/jiuwen-sfs-template.json)将应用数据和 HOME 收敛到 `/home/jiuwen`，仍采用内联挂载，尚未切换到受管 Volume；SFS 挂载由部署准备，目录创建由上述挂载声明控制。模板对 AgentServer TCP 18092 的 readiness 使用 0 秒初始延迟、3 秒周期和 2 秒单次超时，启动和恢复时立即开始端口就绪检查，成功后才发布 Running。使用 SQLite/WAL 的工作区必须保证旧 Sandbox 完全停止访问后才启用后继，不能同时运行新旧版本。详见[工作区设计](../docs/development/user-workspace-volumes-design.md)和[Volume 方案](../docs/development/platform-volume-design.md)。
 
 ## 进程配置
 
