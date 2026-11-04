@@ -55,6 +55,11 @@ pub(super) struct PublicationWrite {
     completed: bool,
 }
 impl PublicationWrite {
+    /// Arm ambiguity tracking immediately before submitting the durable write.
+    /// Read-only preparation can fail or be cancelled without dirtying the catalog.
+    pub(super) fn begin_write(&mut self) {
+        self.completed = false;
+    }
     pub(super) fn finish(self, applied: bool, values: Vec<PublicationValue>) {
         self.finish_with_fields(applied, values, vec![]);
     }
@@ -109,6 +114,15 @@ impl RedisStore {
         epoch: u64,
         fields: Vec<String>,
     ) -> PublicationWrite {
+        let mut write = self.publication_prepare(epoch, fields).await;
+        write.begin_write();
+        write
+    }
+    pub(super) async fn publication_prepare(
+        &self,
+        epoch: u64,
+        fields: Vec<String>,
+    ) -> PublicationWrite {
         let fields: Vec<_> = fields
             .into_iter()
             .filter(|f| f.starts_with("node:") || f.starts_with("environment:"))
@@ -143,7 +157,6 @@ impl RedisStore {
         for lock in locks {
             write._guards.push(lock.lock_owned().await);
         }
-        write.completed = false;
         write
     }
     pub(super) fn send_publication(
@@ -494,6 +507,52 @@ mod tests {
             .await;
         write.finish(true, vec![PublicationValue::Node("next".into(), None)]);
         assert_eq!(next_receiver.recv().await.unwrap().revision, revision + 1);
+    }
+    #[tokio::test]
+    async fn cancelled_preparation_stays_clean_until_durable_write_begins() {
+        let session = session();
+        let (before, mut events) = session.publication_snapshot().unwrap();
+        let store = session.store.clone();
+        let (ready, waiting) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _write = store
+                .publication_prepare(1, vec!["environment:prepare".into()])
+                .await;
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        waiting.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(session.publication_ready());
+        assert_eq!(
+            session.publication_snapshot().unwrap().0.revision,
+            before.revision
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(session
+            .store
+            .connection
+            .publication_locks
+            .lock()
+            .unwrap()
+            .is_empty());
+
+        let mut write = session
+            .store
+            .publication_prepare(1, vec!["environment:submitted".into()])
+            .await;
+        write.begin_write();
+        drop(write);
+        assert!(!session.publication_ready());
+        assert_eq!(
+            session.store.connection.catalog.lock().unwrap().dirty,
+            BTreeSet::from(["environment:submitted".into()])
+        );
+        assert!(events.try_recv().unwrap().dirty);
     }
     #[tokio::test]
     async fn cancellation_marks_only_touched_objects_and_old_epoch_cannot_publish() {

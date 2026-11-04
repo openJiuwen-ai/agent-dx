@@ -1863,3 +1863,107 @@ async fn concurrent_snapshot_catalog_updates_preserve_every_volume_hold() {
         Err(adx_core::Error::NotFound)
     ));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn concurrent_initial_volume_publications_preserve_references_and_receipts() {
+    use adx_core::{EnvironmentRecord, EnvironmentState, Runtime};
+    use std::{sync::Arc, time::Duration};
+    const COUNT: usize = 64;
+    let rig = common::Redis::new().await;
+    let session = RedisStore::connect(&rig.url, "test", Duration::from_secs(5))
+        .await
+        .unwrap()
+        .begin(1)
+        .await
+        .unwrap();
+    let mut candidate = claimant(&session, "node-a").await;
+    let definition = session
+        .ensure_volume(volume("workspace", "workspaces/tenant/burst"), &domains())
+        .await
+        .unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(COUNT));
+    let mut tasks = vec![];
+    for index in 0..COUNT {
+        let mut spec = environment(&format!("volume-burst-{index}"), "workspace");
+        spec.resources.cpu_millis = 1;
+        spec.resources.memory_bytes = 1;
+        candidate.request_id = format!("volume-request-{index}");
+        session.pin_volumes(&spec).await.unwrap();
+        let stored = session
+            .claim(spec, &candidate)
+            .await
+            .unwrap()
+            .record()
+            .clone();
+        let mut record = EnvironmentRecord {
+            runtime: Runtime {
+                id: format!("{}-{}", stored.spec.id, stored.assignment.generation),
+                ip: None,
+            },
+            spec: stored.spec,
+            assignment: stored.assignment,
+            state: EnvironmentState::Starting,
+            revision: 1,
+            resources_held: true,
+            observation: None,
+            snapshot_source: None,
+            failure: None,
+            checkpoint: None,
+            last_operation: None,
+            restart_attempts: 0,
+            restart_pending: false,
+            execution_artifacts: vec![],
+        };
+        session
+            .authorize_volumes(&record, &record.runtime.id, &candidate.node_session_id)
+            .await
+            .unwrap();
+        record.state = EnvironmentState::Running;
+        record.runtime.ip = Some("127.0.0.1".parse().unwrap());
+        record.revision += 1;
+        let session = session.clone();
+        let barrier = barrier.clone();
+        let candidate = candidate.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let result = session
+                .publish_initial(
+                    record.clone(),
+                    &candidate.request_id,
+                    &candidate.node_session_id,
+                )
+                .await;
+            (record, candidate.request_id, result)
+        }));
+    }
+    let mut failures = vec![];
+    for task in tasks {
+        let (record, request, result) = task.await.unwrap();
+        match result {
+            Ok(published) => {
+                assert_eq!(published, record);
+                assert_eq!(
+                    session.get(&record.spec.id).await.unwrap().result,
+                    Some(record.clone())
+                );
+                assert_eq!(
+                    session.published_request("tenant", &request).await.unwrap(),
+                    Some(record)
+                );
+            }
+            Err(error) => failures.push(error),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "initial Volume publication failures: {failures:?}"
+    );
+    let held = session.get_volume("tenant", "workspace").await.unwrap();
+    assert_eq!(held.volume.uid, definition.uid);
+    assert_eq!(held.references.len(), COUNT);
+    assert!(held.occupancy.is_none());
+    for index in 0..COUNT {
+        assert!(held.references.contains(&format!("volume-burst-{index}")));
+    }
+}

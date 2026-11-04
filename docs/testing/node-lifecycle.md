@@ -140,3 +140,9 @@ Rust 用例位于 adxlet 的 `journal.rs`、`resources.rs`、`pause_resume.rs` �
 
 同一轮最终目录中实例全部 Deleted，资源已释放，sandboxd 清单与 checkpoint 目录为空，服务正常停止。
 证据位于 `out/ci/pause-resume/fc-r7/evidence/`，包括 `sdk/result.json`、`lifecycle/result.json`、`catalog-final.json`、`inventory-final.txt` 和 `result.json`；构建/部署完整日志位于 `out/ci/stage-2/{linux-2,package-2,fc-r7}.log`。回归日志为 `rust-5.log`（141 项测试，Clippy 通过）及 `clients-4.log`（Go 检查及 138 项 SDK 测试）。这些是本地证据，Kubernetes 验收尚未包含新增生命周期场景。
+
+首次 Running 结果发布在读取 header、Volume catalog 和计数器前取得同一对象的发布锁；
+准备期间只有读取，读取失败或等待取消不会污染已提交的目录。仅在提交 Redis EVAL 前
+启用不确定写入跟踪，此后超时或取消仍要求对账，不能当作未写入处理。
+本地回归覆盖 512 个制品结果和 64 个共享 Volume 结果并发发布，校验每个结果、
+请求回执和 Volume 引用；这不代表集群启动／恢复吞吐已经完成验收。

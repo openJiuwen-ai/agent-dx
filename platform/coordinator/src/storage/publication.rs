@@ -189,9 +189,9 @@ impl Session {
             // Match artifact -> object publication -> inspection ordering used
             // by failure recovery. Header comparisons must be read after joining
             // the metadata queue, rather than racing every restored execution.
-            let write = self
+            let mut write = self
                 .store
-                .publication_write(self.epoch, vec![field.clone()])
+                .publication_prepare(self.epoch, vec![field.clone()])
                 .await;
             let inspection = if attaches_artifacts || volumes::has_volumes(&record.spec) {
                 Some(self.inspection.lock().await)
@@ -315,6 +315,7 @@ impl Session {
                 record.spec.id.clone(),
                 Some(Arc::new(next.clone())),
             )];
+            write.begin_write();
             let (code, raw): (i8, String) = self.store.query(command).await?;
             write.finish_with_fields(
                 code == 1,
