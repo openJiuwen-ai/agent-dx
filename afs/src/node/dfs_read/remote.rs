@@ -142,11 +142,7 @@ impl DfsReadEngine {
                     }
                     Err(error) => {
                         self.invalidate_native_batch_on_error(batch, &error);
-                        if matches!(
-                            error.kind(),
-                            afs_error::ErrorKind::PermissionDenied
-                                | afs_error::ErrorKind::Unauthenticated
-                        ) {
+                        if crate::node::fault::classify::read_authority_rejected(&error) {
                             return Err(error);
                         }
                         self.capture_native_read_authority()?;
@@ -189,10 +185,8 @@ impl DfsReadEngine {
                                     }
                                     Err(error) => {
                                         self.invalidate_native_batch_on_error(batch, &error);
-                                        if matches!(
-                                            error.kind(),
-                                            afs_error::ErrorKind::PermissionDenied
-                                                | afs_error::ErrorKind::Unauthenticated
+                                        if crate::node::fault::classify::read_authority_rejected(
+                                            &error,
                                         ) {
                                             return Err(error);
                                         }

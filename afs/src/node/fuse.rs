@@ -33,7 +33,7 @@ use self::dispatch::{FuseDispatch, FuseRecoverySender};
 use self::mount::{configure_readahead, mount_bounds_error, negotiated_init_flags};
 use self::page_cache::{ActiveCachedViews, InodeCacheGates, PageCacheIdentities};
 use self::reply::{
-    add_backend_entries, backend_cookie, backend_read_data, complete_read_reply, errno,
+    FuseOp, add_backend_entries, backend_cookie, backend_read_data, complete_read_reply, errno_in,
     errno_xattr, file_attr, fuse_errno, inline_local_read_data, native_open_reply_flags,
     reply_empty, reply_statfs, reply_xattr,
 };
@@ -390,7 +390,7 @@ impl AfsFuse {
 
     fn release_lock_session(&self) {
         if let Err(error) = self.backend.release_lock_session(&self.ingress_session_id) {
-            let errno = errno(error.clone());
+            let errno = crate::error::errno(&error);
             self.cleanup_error.lock().unwrap().get_or_insert(error);
             afs_logging::error!("fuse.lock_session_cleanup_failed"; "errno" => errno);
         }
@@ -548,7 +548,9 @@ impl Filesystem for AfsFuse {
         let mount_policy = self.policy.clone();
         let run = move || {
             let _front_guard = _front_guard;
-            let result = backend.lookup(&context, parent_inode, &name).map_err(errno);
+            let result = backend
+                .lookup(&context, parent_inode, &name)
+                .map_err(errno_in(FuseOp::Lookup));
             match result {
                 Ok(entry) => {
                     let ino = state.lock().unwrap().remember_lookup(&entry);
@@ -611,7 +613,7 @@ impl Filesystem for AfsFuse {
                             backend
                                 .getattr(&context, inode, handle.map(|handle| handle.handle))
                                 .map(|attributes| file_attr(ino, &attributes))
-                                .map_err(errno)
+                                .map_err(errno_in(FuseOp::Getattr))
                         })
                 }
                 None => Err(libc::ESTALE),
@@ -657,7 +659,7 @@ impl Filesystem for AfsFuse {
             let _front_guard = _front_guard;
             match backend.statfs(&context, inode) {
                 Ok(capacity) => reply_statfs(reply, capacity),
-                Err(error) => reply.error(fuse_errno(errno(error))),
+                Err(error) => reply.error(fuse_errno(errno_in(FuseOp::Statfs)(error))),
             }
         };
         if inline_local_statfs {
@@ -725,7 +727,7 @@ impl Filesystem for AfsFuse {
                 }
                 let current = backend
                     .getattr(&context, inode, handle.map(|handle| handle.handle))
-                    .map_err(errno)?;
+                    .map_err(errno_in(FuseOp::Setattr))?;
                 let options = SetAttrOptions {
                     kill_suidgid: is_legacy_privilege_clear(&current, &change),
                     timestamps_now,
@@ -739,7 +741,7 @@ impl Filesystem for AfsFuse {
                             &change,
                             options,
                         )
-                        .map_err(errno)
+                        .map_err(errno_in(FuseOp::Setattr))
                 })
             });
             match result {
@@ -773,7 +775,7 @@ impl Filesystem for AfsFuse {
                 backend
                     .readlink(&Self::context(req, 0), inode)
                     .map(|target| os_str_bytes(target.as_os_str()).to_vec())
-                    .map_err(errno)
+                    .map_err(errno_in(FuseOp::Readlink))
             })
         });
         match result {
@@ -802,7 +804,7 @@ impl Filesystem for AfsFuse {
             Ok(self.backend.as_ref()).and_then(|backend| {
                 backend
                     .mkdir(&Self::context(req, umask), parent_inode, name, mode)
-                    .map_err(errno)
+                    .map_err(errno_in(FuseOp::Mkdir))
             })
         });
         match result {
@@ -832,7 +834,7 @@ impl Filesystem for AfsFuse {
             Ok(self.backend.as_ref()).and_then(|backend| {
                 backend
                     .unlink(&Self::context(req, 0), parent_inode, name)
-                    .map_err(errno)
+                    .map_err(errno_in(FuseOp::Unlink))
             })
         });
         reply_empty(reply, result);
@@ -850,7 +852,7 @@ impl Filesystem for AfsFuse {
             Ok(self.backend.as_ref()).and_then(|backend| {
                 backend
                     .rmdir(&Self::context(req, 0), parent_inode, name)
-                    .map_err(errno)
+                    .map_err(errno_in(FuseOp::Rmdir))
             })
         });
         reply_empty(reply, result);
@@ -880,7 +882,7 @@ impl Filesystem for AfsFuse {
                         name,
                         target.as_os_str(),
                     )
-                    .map_err(errno)
+                    .map_err(errno_in(FuseOp::Symlink))
             })
         });
         match result {
@@ -935,7 +937,7 @@ impl Filesystem for AfsFuse {
                         newname,
                         RenameFlags(flags.bits()),
                     )
-                    .map_err(errno)
+                    .map_err(errno_in(FuseOp::Rename))
             })
         });
         reply_empty(reply, result);
@@ -961,7 +963,7 @@ impl Filesystem for AfsFuse {
             Ok(self.backend.as_ref()).and_then(|backend| {
                 backend
                     .link(&Self::context(req, 0), inode, parent, newname)
-                    .map_err(errno)
+                    .map_err(errno_in(FuseOp::Link))
             })
         });
         match result {
@@ -1003,7 +1005,7 @@ impl Filesystem for AfsFuse {
             let result = Ok(self.backend.as_ref()).and_then(|backend| {
                 backend
                     .open_with_options(&Self::context(req, 0), inode, flags, options)
-                    .map_err(errno)
+                    .map_err(errno_in(FuseOp::Open))
             });
             match result {
                 Ok(handle) => {
@@ -1082,7 +1084,7 @@ impl Filesystem for AfsFuse {
             let result = tracing::info_span!("node.fuse.open.backend").in_scope(|| {
                 backend
                     .open_with_options(&context, inode, flags, options)
-                    .map_err(errno)
+                    .map_err(errno_in(FuseOp::Open))
             });
             match result {
                 Ok(handle) => {
@@ -1222,7 +1224,7 @@ impl Filesystem for AfsFuse {
                         Ok(file) => inline_local_read_data(&mut scratch, size as usize, |out| {
                             backend
                                 .read(&context, file.handle, offset, out)
-                                .map_err(errno)
+                                .map_err(errno_in(FuseOp::Read))
                         }),
                         Err(error) => Err(error),
                     }
@@ -1294,7 +1296,7 @@ impl Filesystem for AfsFuse {
                         offset,
                         size as usize,
                     )
-                    .map_err(errno)
+                    .map_err(errno_in(FuseOp::Read))
                 })
             });
             #[cfg(any(feature = "dfs", test))]
@@ -1536,7 +1538,7 @@ impl Filesystem for AfsFuse {
                                 length: len,
                             },
                         )
-                        .map_err(errno)
+                        .map_err(errno_in(FuseOp::CopyFileRange))
                 })();
                 match result {
                     Ok(copied) => match u32::try_from(copied) {
@@ -1586,7 +1588,9 @@ impl Filesystem for AfsFuse {
                 let file = state.lock().unwrap().file_handle(fh);
                 let result = file.ok_or(libc::ESTALE).and_then(|file| {
                     AfsFuse::validate_handle_inode_in(&state, ino)?;
-                    let flushed = backend.flush(&context, file.handle).map_err(errno);
+                    let flushed = backend
+                        .flush(&context, file.handle)
+                        .map_err(errno_in(FuseOp::Flush));
                     let released = backend
                         .release_locks(
                             &context,
@@ -1599,7 +1603,7 @@ impl Filesystem for AfsFuse {
                             owner,
                             ReleaseKind::PosixOwner,
                         )
-                        .map_err(errno);
+                        .map_err(errno_in(FuseOp::Flush));
                     combine_empty_results(flushed, released)
                 });
                 reply_empty(reply, combine_empty_results(front_result, result));
@@ -1681,9 +1685,11 @@ impl Filesystem for AfsFuse {
                                 owner,
                                 ReleaseKind::FlockOwner,
                             )
-                            .map_err(errno)
+                            .map_err(errno_in(FuseOp::Release))
                     });
-                    let released_handle = backend.release(&context, file.handle).map_err(errno);
+                    let released_handle = backend
+                        .release(&context, file.handle)
+                        .map_err(errno_in(FuseOp::Release));
                     combine_empty_results(released_flock, released_handle)
                 });
                 reply_empty(reply, combine_empty_results(front_result, result));
@@ -1737,7 +1743,7 @@ impl Filesystem for AfsFuse {
                     Ok(backend.as_ref()).and_then(|backend| {
                         backend
                             .fsync(&context, file.handle, sync_mode(datasync))
-                            .map_err(errno)
+                            .map_err(errno_in(FuseOp::Fsync))
                     })
                 });
 
@@ -1766,7 +1772,7 @@ impl Filesystem for AfsFuse {
                 let result = self.backend_inode(ino).and_then(|inode| {
                     self.backend
                         .opendir(&Self::context(req, 0), inode)
-                        .map_err(errno)
+                        .map_err(errno_in(FuseOp::Opendir))
                 });
                 match result {
                     Ok(handle) => {
@@ -1807,7 +1813,7 @@ impl Filesystem for AfsFuse {
                     Ok(self.backend.as_ref()).and_then(|backend| {
                         backend
                             .readdir(&Self::context(req, 0), directory.handle, cookie, 128)
-                            .map_err(errno)
+                            .map_err(errno_in(FuseOp::Readdir))
                     })
                 });
                 match result {
@@ -1851,7 +1857,7 @@ impl Filesystem for AfsFuse {
             Ok(self.backend.as_ref()).and_then(|backend| {
                 backend
                     .releasedir(&Self::context(req, 0), directory.handle)
-                    .map_err(errno)
+                    .map_err(errno_in(FuseOp::Releasedir))
             })
         });
         reply_empty(reply, result);
@@ -1884,7 +1890,7 @@ impl Filesystem for AfsFuse {
                         directory.handle,
                         sync_mode(datasync),
                     )
-                    .map_err(errno)
+                    .map_err(errno_in(FuseOp::Fsyncdir))
             })
         });
         reply_empty(reply, result);
@@ -1916,7 +1922,7 @@ impl Filesystem for AfsFuse {
             Ok(self.backend.as_ref()).and_then(|backend| {
                 backend
                     .create_with_options(&context, parent_inode, name, mode, flags, options)
-                    .map_err(errno)
+                    .map_err(errno_in(FuseOp::Create))
             })
         });
         match result {
@@ -2039,23 +2045,23 @@ impl Filesystem for AfsFuse {
                             permissions,
                             libc::O_CREAT | libc::O_EXCL | libc::O_WRONLY,
                         )
-                        .map_err(errno)?;
+                        .map_err(errno_in(FuseOp::Mknod))?;
                     // mknod has no application FD whose close could flush this handle.
                     // Finish the create boundary and release our temporary handle.
                     let flushed = self.backend.flush(&context, created.handle);
                     let released = self.backend.release(&context, created.handle);
-                    flushed.map_err(errno)?;
-                    released.map_err(errno)?;
+                    flushed.map_err(errno_in(FuseOp::Mknod))?;
+                    released.map_err(errno_in(FuseOp::Mknod))?;
                     Ok(created.entry)
                 }
                 libc::S_IFIFO => self
                     .backend
                     .mknod(&context, parent, name, SpecialFileKind::Fifo, permissions)
-                    .map_err(errno),
+                    .map_err(errno_in(FuseOp::Mknod)),
                 libc::S_IFSOCK => self
                     .backend
                     .mknod(&context, parent, name, SpecialFileKind::Socket, permissions)
-                    .map_err(errno),
+                    .map_err(errno_in(FuseOp::Mknod)),
                 libc::S_IFBLK => self
                     .backend
                     .mknod(
@@ -2067,7 +2073,7 @@ impl Filesystem for AfsFuse {
                         },
                         permissions,
                     )
-                    .map_err(errno),
+                    .map_err(errno_in(FuseOp::Mknod)),
                 libc::S_IFCHR => self
                     .backend
                     .mknod(
@@ -2079,7 +2085,7 @@ impl Filesystem for AfsFuse {
                         },
                         permissions,
                     )
-                    .map_err(errno),
+                    .map_err(errno_in(FuseOp::Mknod)),
                 _ => Err(libc::EINVAL),
             });
         match result {
@@ -2128,10 +2134,10 @@ impl Filesystem for AfsFuse {
         self.submit_file_metadata(ino.0, scoped, move || {
             let _front_guard = _front_guard;
             match backend.getxattr(&context, inode, &name) {
-                Ok(data) => reply_xattr(reply, size, Ok(data)),
+                Ok(data) => reply_xattr(reply, FuseOp::Getxattr, size, Ok(data)),
                 Err(error) => reply.error(fuse_errno(errno_xattr(
                     error,
-                    "getxattr",
+                    FuseOp::Getxattr,
                     inode.value,
                     &name,
                     &context,
@@ -2157,7 +2163,12 @@ impl Filesystem for AfsFuse {
         let scoped = _front_guard.is_some();
         self.submit_file_metadata(ino.0, scoped, move || {
             let _front_guard = _front_guard;
-            reply_xattr(reply, size, backend.listxattr(&context, inode));
+            reply_xattr(
+                reply,
+                FuseOp::Listxattr,
+                size,
+                backend.listxattr(&context, inode),
+            );
         });
     }
 
@@ -2202,7 +2213,9 @@ impl Filesystem for AfsFuse {
                 reply,
                 backend
                     .setxattr(&context, inode, &name, &value, flags)
-                    .map_err(|error| errno_xattr(error, "setxattr", inode.value, &name, &context)),
+                    .map_err(|error| {
+                        errno_xattr(error, FuseOp::Setxattr, inode.value, &name, &context)
+                    }),
             );
         });
     }
@@ -2230,7 +2243,7 @@ impl Filesystem for AfsFuse {
                 backend
                     .removexattr(&context, inode, &name)
                     .map_err(|error| {
-                        errno_xattr(error, "removexattr", inode.value, &name, &context)
+                        errno_xattr(error, FuseOp::Removexattr, inode.value, &name, &context)
                     }),
             );
         });
@@ -2242,6 +2255,9 @@ mod mount_path_tests;
 
 #[cfg(test)]
 mod dispatch_tests;
+
+#[cfg(test)]
+mod failure_grade_tests;
 
 #[cfg(test)]
 mod local_reply_tests;

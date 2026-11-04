@@ -23,6 +23,7 @@ mod dfs_fetch;
 pub mod dfs_read;
 #[cfg(feature = "dfs")]
 pub mod external_chunk;
+pub(crate) mod fault;
 pub mod fuse;
 #[cfg(feature = "dfs")]
 pub mod gc;

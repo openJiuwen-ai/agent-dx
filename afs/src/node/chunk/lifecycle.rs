@@ -73,9 +73,4 @@ impl LocalChunkStore {
     }
 }
 
-pub(super) fn verified_copy_is_invalid(error: &Error) -> bool {
-    matches!(
-        error.kind(),
-        afs_error::ErrorKind::DataLoss | afs_error::ErrorKind::NotFound
-    )
-}
+pub(super) use crate::node::fault::classify::verified_copy_is_invalid;

@@ -2,7 +2,7 @@
 
 use super::metrics::FuseRequestMetrics;
 use super::page_cache::PageCacheIdentities;
-use super::reply::{errno, fuse_errno};
+use super::reply::{FuseOp, errno_in, fuse_errno};
 use super::state::{FuseNode, FuseState};
 use super::{AfsFuse, front_write, state};
 use crate::node::vfs::types::{RequestContext, WriteOptions};
@@ -118,7 +118,7 @@ impl DispatchedWrite {
                             data,
                             self.options,
                         )
-                        .map_err(errno)
+                        .map_err(errno_in(FuseOp::Write))
                 })
             })
         });
@@ -230,7 +230,7 @@ impl AfsFuse {
                                     &owned[consumed..],
                                     options,
                                 )
-                                .map_err(errno)?;
+                                .map_err(errno_in(FuseOp::Write))?;
                             if written == 0 || written > owned.len() - consumed {
                                 return Err(libc::EIO);
                             }

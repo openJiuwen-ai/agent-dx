@@ -455,11 +455,7 @@ impl DfsReadEngine {
                         Err(error) => {
                             self.local.record_peer_disk_cache_event("fill_failed");
                             self.invalidate_native_batch_on_error(batch, &error);
-                            if matches!(
-                                error.kind(),
-                                afs_error::ErrorKind::PermissionDenied
-                                    | afs_error::ErrorKind::Unauthenticated
-                            ) {
+                            if crate::node::fault::classify::read_authority_rejected(&error) {
                                 return Err(error);
                             }
                             self.check_native_read_authority(&authority)?;
@@ -547,11 +543,7 @@ impl DfsReadEngine {
                     Err(error) => {
                         self.local.record_peer_disk_cache_event("fill_failed");
                         self.invalidate_native_batch_on_error(batch, &error);
-                        if matches!(
-                            error.kind(),
-                            afs_error::ErrorKind::PermissionDenied
-                                | afs_error::ErrorKind::Unauthenticated
-                        ) {
+                        if crate::node::fault::classify::read_authority_rejected(&error) {
                             return Err(error);
                         }
                         self.check_native_read_authority(&authority)?;
@@ -566,10 +558,7 @@ impl DfsReadEngine {
             // An individual leader's grant/session decision cannot revoke an
             // independently authorized follower. No Ready is installed when
             // the precommit check fails; followers take their own safe path.
-            let outcome = if matches!(
-                error.kind(),
-                afs_error::ErrorKind::PermissionDenied | afs_error::ErrorKind::Unauthenticated
-            ) {
+            let outcome = if crate::node::fault::classify::read_authority_rejected(error) {
                 crate::node::peer_cache::FillOutcome::Uncached
             } else {
                 crate::node::peer_cache::FillOutcome::Failed(error.clone())

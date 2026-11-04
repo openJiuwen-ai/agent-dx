@@ -20,8 +20,41 @@ impl From<Error> for RestError {
 impl IntoResponse for RestError {
     fn into_response(self) -> Response {
         let error = self.0;
-        afs_logging::error!("request failed"; "code"=>error.code().raw(), "kind"=>format!("{:?}", error.kind()), "message"=>error.message());
-        (http_status(error.kind()), Json(json!({"error": {"code": error.code().raw(), "kind": format!("{:?}", error.kind()), "message": error.message()}}))).into_response()
+        let status = http_status(error.kind());
+        macro_rules! record {
+            ($level:ident) => {
+                afs_logging::$level!("request failed"; "status"=>status.as_u16(), "code"=>error.code().raw(), "kind"=>format!("{:?}", error.kind()), "message"=>error.message())
+            };
+        }
+        match rest_failure_grade(status) {
+            FailureGrade::Debug => record!(debug),
+            FailureGrade::Warn => record!(warn),
+            FailureGrade::Error => record!(error),
+        }
+        (status, Json(json!({"error": {"code": error.code().raw(), "kind": format!("{:?}", error.kind()), "message": error.message()}}))).into_response()
+    }
+}
+/// Log level for a failed request at a process edge (FUSE or REST). Only the
+/// log changes with the grade; the errno or HTTP status returned never does.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FailureGrade {
+    /// Expected answer (ENOENT on lookup, EEXIST on mkdir, HTTP 404).
+    Debug,
+    /// Permission, conflict or staleness outcome: normal under probing or
+    /// concurrency, but may reveal misconfiguration, so it stays visible at the
+    /// default `warn` level.
+    Warn,
+    /// Everything else, as before.
+    Error,
+}
+/// REST grading: 404 answers a lookup, 409 is a create/concurrency conflict
+/// and 403 a permission answer (J5); every other status, including all 5xx,
+/// stays at ERROR as before.
+pub(crate) fn rest_failure_grade(status: StatusCode) -> FailureGrade {
+    match status {
+        StatusCode::NOT_FOUND => FailureGrade::Debug,
+        StatusCode::CONFLICT | StatusCode::FORBIDDEN => FailureGrade::Warn,
+        _ => FailureGrade::Error,
     }
 }
 pub fn http_status(kind: ErrorKind) -> StatusCode {
@@ -116,5 +149,55 @@ pub fn errno(error: &Error) -> i32 {
         DeadlineExceeded => libc::ETIMEDOUT,
         Cancelled => libc::EINTR,
         Unknown | Internal | DataLoss => libc::EIO,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rest_grade_lowers_only_not_found_conflict_and_forbidden() {
+        use ErrorKind::*;
+        let cases = [
+            (NotFound, StatusCode::NOT_FOUND, FailureGrade::Debug),
+            (AlreadyExists, StatusCode::CONFLICT, FailureGrade::Warn),
+            (Aborted, StatusCode::CONFLICT, FailureGrade::Warn),
+            (PermissionDenied, StatusCode::FORBIDDEN, FailureGrade::Warn),
+            (
+                InvalidArgument,
+                StatusCode::BAD_REQUEST,
+                FailureGrade::Error,
+            ),
+            (
+                Unauthenticated,
+                StatusCode::UNAUTHORIZED,
+                FailureGrade::Error,
+            ),
+            (
+                FailedPrecondition,
+                StatusCode::PRECONDITION_FAILED,
+                FailureGrade::Error,
+            ),
+            (
+                Unavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                FailureGrade::Error,
+            ),
+            (
+                Internal,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                FailureGrade::Error,
+            ),
+            (
+                DataLoss,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                FailureGrade::Error,
+            ),
+        ];
+        for (kind, status, grade) in cases {
+            assert_eq!(http_status(kind), status, "{kind:?}");
+            assert_eq!(rest_failure_grade(status), grade, "{kind:?}");
+        }
     }
 }

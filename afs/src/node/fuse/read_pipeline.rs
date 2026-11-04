@@ -168,9 +168,9 @@ impl AfsFuse {
                                 deadline,
                                 completion.hold(),
                             )
-                            .map_err(errno)?
+                            .map_err(errno_in(FuseOp::Read))?
                         {
-                            Some(future) => future.await.map_err(errno),
+                            Some(future) => future.await.map_err(errno_in(FuseOp::Read)),
                             None => Err(libc::ENOTSUP),
                         }
                     }

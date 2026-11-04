@@ -424,10 +424,7 @@ impl PeerCacheOperation<'_> {
                 self.state.stats.hits = self.state.stats.hits.saturating_add(1);
                 Ok(true)
             }
-            Err(error)
-                if error.code() == afs_error::NODE_TRANSFER_CORRUPT_DATA
-                    || error.kind() == afs_error::ErrorKind::NotFound =>
-            {
+            Err(error) if crate::node::fault::classify::cached_copy_is_invalid(&error) => {
                 self.state.stats.corruptions = self.state.stats.corruptions.saturating_add(1);
                 self.state.stats.misses = self.state.stats.misses.saturating_add(1);
                 self.cache.retire(&key, pin.generation.as_ref(), false)?;
@@ -546,10 +543,7 @@ impl PeerCacheOperation<'_> {
                 self.state.stats.hits += 1;
                 Ok(true)
             }
-            Err(error)
-                if error.code() == afs_error::NODE_TRANSFER_CORRUPT_DATA
-                    || error.kind() == afs_error::ErrorKind::NotFound =>
-            {
+            Err(error) if crate::node::fault::classify::cached_copy_is_invalid(&error) => {
                 self.state.stats.corruptions += 1;
                 self.state.stats.misses += 1;
                 self.cache.retire(&key, pin.generation.as_ref(), false)?;

@@ -709,11 +709,7 @@ impl DfsReadEngine {
                 Ok(Some(reply)) => reply,
                 Ok(None) => return Ok(None),
                 Err(error) => {
-                    if matches!(
-                        error.kind(),
-                        afs_error::ErrorKind::PermissionDenied
-                            | afs_error::ErrorKind::Unauthenticated
-                    ) {
+                    if crate::node::fault::classify::read_authority_rejected(&error) {
                         self.invalidate_external_authority(inode_id, version)?;
                     }
                     return Err(error);

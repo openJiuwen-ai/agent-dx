@@ -146,10 +146,7 @@ impl DfsReadEngine {
     }
 
     pub(super) fn invalidate_native_batch_on_error(&self, batch: &ReadBatch, error: &Error) {
-        if matches!(
-            error.kind(),
-            afs_error::ErrorKind::PermissionDenied | afs_error::ErrorKind::Unauthenticated
-        ) {
+        if crate::node::fault::classify::read_authority_rejected(error) {
             self.invalidate_native_batch_authority(batch);
         }
     }

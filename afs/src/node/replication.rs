@@ -8,6 +8,11 @@ use std::{collections::HashSet, sync::Arc};
 
 use afs_error::{Error, Result};
 
+use crate::node::fault::classify::{
+    corruption_report_definitively_rejected, repair_report_definitively_rejected,
+    repair_request_definitively_rejected, repair_source_is_invalid,
+};
+
 use crate::{
     dfs::{
         ChunkId, ChunkReceipt, LocalCopyPolicy, OperationId, PlacementSnapshot, ReplicaAck,
@@ -710,8 +715,9 @@ impl ChunkStore for DfsChunkStore {
         let result = reader.read_at(offset, out);
         if result.is_err() {
             // This rechecks the actual local object before quarantining; a
-            // caller's expected-root mismatch above never quarantines it.
-            let _ = self.local.quarantine_if_invalid(&receipt.chunk.id);
+            // caller's expected-root mismatch above never quarantines it. A
+            // failed quarantine is logged (R52) and the read error still wins.
+            self.local.try_quarantine(&receipt.chunk.id);
         }
         result
     }
@@ -1085,14 +1091,7 @@ impl ReplicationWorker {
                 Ok(Some(task))
             }
             Err(error) => {
-                if error.code() == afs_error::META_DFS_REPAIR_SUPERSEDED
-                    || matches!(
-                        error.kind(),
-                        afs_error::ErrorKind::InvalidArgument
-                            | afs_error::ErrorKind::PermissionDenied
-                            | afs_error::ErrorKind::Unauthenticated
-                    )
-                {
+                if repair_report_definitively_rejected(&error) {
                     *pending = None;
                 }
                 Err(error)
@@ -1113,9 +1112,7 @@ impl ReplicationWorker {
         // capacity errors. Mark corrupt only for missing/invalid durable data,
         // not permission, transient I/O, ENOSPC, or an unavailable peer.
         let reader = self.local.open_verified(&claim.chunk.id).map_err(|error| {
-            let source_invalid = error.code() == afs_error::NODE_STORAGE_INVALID
-                || error.kind() == afs_error::ErrorKind::NotFound
-                || error.kind() == afs_error::ErrorKind::DataLoss;
+            let source_invalid = repair_source_is_invalid(&error);
             (error, source_invalid)
         })?;
         let mut bytes = vec![0; length];
@@ -1192,32 +1189,6 @@ impl ReplicationWorker {
         validate_acks(&plan, &staged, &acks, &self.node_id).map_err(|error| (error, false))?;
         Ok(acks)
     }
-}
-
-fn corruption_report_definitively_rejected(error: &Error) -> bool {
-    // Meta CAS conflicts are retryable even though their error kind is
-    // FailedPrecondition. Aborted and transport failures retain exact identity.
-    error.code() != afs_error::META_DFS_CONFLICT
-        && matches!(
-            error.kind(),
-            afs_error::ErrorKind::InvalidArgument
-                | afs_error::ErrorKind::PermissionDenied
-                | afs_error::ErrorKind::Unauthenticated
-                | afs_error::ErrorKind::FailedPrecondition
-                | afs_error::ErrorKind::NotFound
-        )
-}
-
-fn repair_request_definitively_rejected(error: &Error) -> bool {
-    matches!(
-        error.kind(),
-        afs_error::ErrorKind::InvalidArgument
-            | afs_error::ErrorKind::PermissionDenied
-            | afs_error::ErrorKind::Unauthenticated
-            | afs_error::ErrorKind::FailedPrecondition
-            | afs_error::ErrorKind::Aborted
-            | afs_error::ErrorKind::NotFound
-    )
 }
 
 fn unix_ms() -> Result<u64> {
