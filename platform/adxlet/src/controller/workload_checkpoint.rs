@@ -51,6 +51,12 @@ impl Controller {
     }
 
     pub(super) async fn workload_checkpoint(&mut self) -> Result<bool> {
+        // Runtime events and monitoring bypass lifecycle request replay. Defer
+        // their capture too: preparation cleanup must not release a pending
+        // reusable snapshot's staged reservation or retained input holds.
+        if self.snapshot_publication.is_some() {
+            return Ok(false);
+        }
         let Some(services) = self.services.checkpoint.clone() else {
             return Ok(false);
         };

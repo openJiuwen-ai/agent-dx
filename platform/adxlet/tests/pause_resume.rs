@@ -16,6 +16,7 @@ use std::{
 
 #[derive(Default)]
 struct Backend {
+    journal_after_capture: Mutex<bool>,
     snapshot_journal_failures: Mutex<usize>,
     snapshot_hold_error: Mutex<Option<Error>>,
     rejected_snapshot_records: Mutex<Vec<EnvironmentRecord>>,
@@ -168,6 +169,9 @@ impl RuntimeDriver for Backend {
             return Err(Error::Unavailable("reply lost".into()));
         }
         std::fs::write(path.join("memory"), b"actual saved memory").unwrap();
+        if *self.journal_after_capture.lock().unwrap() {
+            *self.unavailable_commit.lock().unwrap() = true;
+        }
         Ok(())
     }
     async fn restore_from(
@@ -1437,22 +1441,36 @@ async fn reusable_snapshot_rounds_remaining_capture_budget_to_seconds() {
 
 #[tokio::test]
 async fn reusable_snapshot_publication_wait_keeps_the_original_deadline() {
-    snapshot_publication_timeout_retry("runsc").await;
+    snapshot_publication_timeout_retry("runsc", false).await;
 }
 
 #[tokio::test]
 async fn reusable_snapshot_retained_capture_retries_publication_without_recapture() {
-    snapshot_publication_timeout_retry("firecracker").await;
+    snapshot_publication_timeout_retry("firecracker", false).await;
 }
 
-async fn snapshot_publication_timeout_retry(runtime_class: &str) {
+#[tokio::test]
+async fn pending_snapshot_publication_defers_workload_checkpoint() {
+    snapshot_publication_timeout_retry("runsc", true).await;
+}
+
+#[tokio::test]
+async fn pending_snapshot_publication_defers_workload_with_retained_capture() {
+    snapshot_publication_timeout_retry("firecracker", true).await;
+}
+
+async fn snapshot_publication_timeout_retry(runtime_class: &str, workload_pending: bool) {
     use adxlet::checkpoint::SnapshotRequest;
     let (temp, backend, _, mut spec, assignment) = fixture();
     spec.runtime_class = runtime_class.into();
     let (node, journal) = snapshot_journal_node(&temp, &backend, spec.resources);
     let handle = node.environment(spec, assignment).unwrap();
     let running = handle.create().await.unwrap();
-    *backend.snapshot_journal_failures.lock().unwrap() = usize::MAX;
+    if workload_pending {
+        *backend.journal_after_capture.lock().unwrap() = true;
+    } else {
+        *backend.snapshot_journal_failures.lock().unwrap() = usize::MAX;
+    }
     let request = SnapshotRequest {
         kind: adx_core::snapshots::SnapshotKind::Regular,
         operation_id: "snapshot-journal-deadline".into(),
@@ -1479,8 +1497,40 @@ async fn snapshot_publication_timeout_retry(runtime_class: &str) {
         1,
     );
     *backend.snapshot_journal_failures.lock().unwrap() = 0;
+    *backend.journal_after_capture.lock().unwrap() = false;
+    *backend.unavailable_commit.lock().unwrap() = false;
     let flushed = handle.sync().await.unwrap();
     assert_eq!(flushed.durability, Durability::Published);
+    if workload_pending {
+        let held = flushed.record.execution_artifacts.clone();
+        assert!(!held.is_empty());
+        if runtime_class == "runsc" {
+            assert!(held.iter().all(|artifact| artifact.size_bytes == 0));
+        }
+        let events = backend.events.lock().unwrap().clone();
+        *backend.workload_request.lock().unwrap() = Some("deferred-workload".into());
+        *backend.fail_prepare.lock().unwrap() = true;
+        handle.tick().await.unwrap();
+        node.observe_runtime_event(&adx_core::runtime::RuntimeIdentity {
+            environment_id: flushed.record.spec.id.clone(),
+            runtime_id: flushed.record.runtime.id.clone(),
+            ownership_generation: flushed.record.assignment.generation,
+        })
+        .await
+        .unwrap();
+        assert_eq!(backend.events.lock().unwrap().as_slice(), events);
+        let deferred = handle.sync().await.unwrap();
+        assert_eq!(deferred.record.revision, flushed.record.revision);
+        assert_eq!(deferred.record.execution_artifacts, held);
+        assert_eq!(deferred.record.state, EnvironmentState::Running);
+        assert_eq!(backend.running.lock().unwrap().len(), 1);
+        assert_eq!(
+            backend.workload_request.lock().unwrap().as_deref(),
+            Some("deferred-workload"),
+            "deferred workload must remain pending, without capture, abort or ACK"
+        );
+        *backend.fail_prepare.lock().unwrap() = false;
+    }
     assert_eq!(
         handle
             .pause(PauseRequest {
@@ -1513,6 +1563,28 @@ async fn snapshot_publication_timeout_retry(runtime_class: &str) {
         1,
         "retry must publish the retained capture without recapturing"
     );
+    if workload_pending {
+        handle.tick().await.unwrap();
+        let after = handle.sync().await.unwrap();
+        assert_eq!(after.record.state, EnvironmentState::Running);
+        assert!(after.record.checkpoint.is_some());
+        assert!(backend.workload_request.lock().unwrap().is_none());
+        assert_eq!(
+            backend
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| *event == "checkpoint-running")
+                .count(),
+            2,
+            "workload checkpoint may proceed only after snapshot publication completes"
+        );
+        assert_eq!(
+            backend.snapshots.lock().unwrap()[&saved.snapshot.id],
+            saved.snapshot
+        );
+    }
     handle.delete().await.unwrap();
 }
 
