@@ -3059,6 +3059,15 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         }
         .into(),
     );
+    let saved_probe = adx_core::probes::ProbeSpec {
+        action: adx_core::probes::ProbeAction::TcpSocket { port: 8080 },
+        initial_delay_seconds: 0,
+        period_seconds: 1,
+        timeout_seconds: 1,
+        failure_threshold: 1,
+    };
+    execution.readiness_probe = Some(Box::new(saved_probe.clone().into()));
+    execution.healthcheck_probe = Some(Box::new(saved_probe.into()));
     let source = api
         .create_environment(source_request)
         .await
@@ -3157,6 +3166,17 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
             .unwrap()
             .inherit_entrypoint,
         "restoration must keep the managed entrypoint metadata mount"
+    );
+    let captured_execution = source.spec.as_ref().unwrap().execution.as_ref().unwrap();
+    let restored_execution = created.spec.as_ref().unwrap().execution.as_ref().unwrap();
+    assert_eq!(restored_execution.rootfs, captured_execution.rootfs);
+    assert_eq!(
+        restored_execution.readiness_probe,
+        captured_execution.readiness_probe
+    );
+    assert_eq!(
+        restored_execution.healthcheck_probe,
+        captured_execution.healthcheck_probe
     );
     assert_eq!(
         created.spec.as_ref().unwrap().resources,

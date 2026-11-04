@@ -71,9 +71,34 @@ fn inherit_template(
     if limits.disk_bytes == 0 {
         limits.disk_bytes = saved_limits.disk_bytes;
     }
-    if execution.inherit_entrypoint && execution.rootfs.is_none() {
-        execution.rootfs = template.execution.rootfs.clone().map(Into::into);
+    let captured: pb::ExecutionOptions = template.execution.clone().into();
+    if execution
+        .rootfs
+        .as_ref()
+        .is_some_and(|rootfs| Some(rootfs) != captured.rootfs.as_ref())
+    {
+        return Err(Error::Invalid(
+            "snapshot rootfs configuration must match its source".into(),
+        ));
     }
+    execution.rootfs = captured.rootfs;
+    // Execd restores its probe supervisor with the original process. Retain
+    // the same policy in Adxlet so terminal probe failures remain observable.
+    if execution
+        .readiness_probe
+        .as_ref()
+        .is_some_and(|probe| Some(probe) != captured.readiness_probe.as_ref())
+        || execution
+            .healthcheck_probe
+            .as_ref()
+            .is_some_and(|probe| Some(probe) != captured.healthcheck_probe.as_ref())
+    {
+        return Err(Error::Invalid(
+            "snapshot probes must match their source".into(),
+        ));
+    }
+    execution.readiness_probe = captured.readiness_probe;
+    execution.healthcheck_probe = captured.healthcheck_probe;
     if request.image.is_empty() {
         request.image = template.image.clone();
     }
@@ -301,6 +326,100 @@ mod tests {
             let replay =
                 inherit_template(inherited.clone().into(), &snapshot, Some(&inherited)).unwrap();
             assert_eq!(replay, inherited);
+        }
+    }
+
+    #[test]
+    fn clone_preserves_rootfs_and_rejects_explicit_geometry_changes() {
+        use adx_core::execution::{Rootfs, StorageSource};
+        for entrypoint in [false, true] {
+            let mut snapshot = source("local");
+            snapshot.template.execution.inherit_entrypoint = entrypoint;
+            snapshot.template.execution.rootfs = Some(Rootfs {
+                readonly: false,
+                source: StorageSource::Image(snapshot.template.image.clone()),
+            });
+            let inherited = inherit_template(clone_request(&snapshot), &snapshot, None).unwrap();
+            assert_eq!(
+                inherited.execution.rootfs,
+                snapshot.template.execution.rootfs
+            );
+            let replay: pb::EnvironmentSpec = inherited.clone().into();
+            assert_eq!(
+                inherit_template(replay.clone(), &snapshot, Some(&inherited)).unwrap(),
+                inherited
+            );
+            let mut mismatch = replay;
+            mismatch
+                .execution
+                .as_mut()
+                .unwrap()
+                .rootfs
+                .as_mut()
+                .unwrap()
+                .readonly = true;
+            assert!(matches!(
+                inherit_template(mismatch, &snapshot, None),
+                Err(Error::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn clone_inherits_probes_and_rejects_changed_or_new_checks() {
+        use adx_core::probes::{ProbeAction, ProbeSpec};
+        let mut snapshot = source("local");
+        snapshot.template.execution.inherit_entrypoint = true;
+        snapshot.template.execution.rootfs = Some(adx_core::execution::Rootfs {
+            readonly: false,
+            source: adx_core::execution::StorageSource::Image(snapshot.template.image.clone()),
+        });
+        let probe = ProbeSpec {
+            action: ProbeAction::TcpSocket { port: 8080 },
+            initial_delay_seconds: 0,
+            period_seconds: 2,
+            timeout_seconds: 1,
+            failure_threshold: 1,
+        };
+        snapshot.template.execution.readiness_probe = Some(probe.clone());
+        snapshot.template.execution.healthcheck_probe = Some(probe);
+        let inherited = inherit_template(clone_request(&snapshot), &snapshot, None).unwrap();
+        assert_eq!(
+            inherited.execution.readiness_probe,
+            snapshot.template.execution.readiness_probe
+        );
+        assert_eq!(
+            inherited.execution.healthcheck_probe,
+            snapshot.template.execution.healthcheck_probe
+        );
+        let replay: pb::EnvironmentSpec = inherited.clone().into();
+        assert_eq!(
+            inherit_template(replay.clone(), &snapshot, Some(&inherited)).unwrap(),
+            inherited
+        );
+        for readiness in [false, true] {
+            let mut changed = replay.clone();
+            let execution = changed.execution.as_mut().unwrap();
+            let check = if readiness {
+                &mut execution.readiness_probe
+            } else {
+                &mut execution.healthcheck_probe
+            };
+            check.as_mut().unwrap().period_seconds += 1;
+            assert!(matches!(
+                inherit_template(changed, &snapshot, None),
+                Err(Error::Invalid(_))
+            ));
+            let mut absent = snapshot.clone();
+            if readiness {
+                absent.template.execution.readiness_probe = None;
+            } else {
+                absent.template.execution.healthcheck_probe = None;
+            }
+            assert!(matches!(
+                inherit_template(replay.clone(), &absent, None),
+                Err(Error::Invalid(_))
+            ));
         }
     }
 
