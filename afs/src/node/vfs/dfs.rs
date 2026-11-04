@@ -157,6 +157,8 @@ pub struct DistributedFs {
     #[cfg(test)]
     handle_registration_after_route_check: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
+    remote_operation_before_apply: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
     readonly_version_before_install: Mutex<Option<Arc<std::sync::Barrier>>>,
     lock_session_reap_cursor: AtomicU64,
     owner_handle_reap_cursor: AtomicU64,
@@ -165,7 +167,8 @@ pub struct DistributedFs {
     writeback_after_prepare_pause: Mutex<Option<Duration>>,
     closed_lock_sessions: Mutex<HashSet<String>>,
     closed_lock_session_admission_closed: AtomicBool,
-    remote_operation_results: Mutex<HashMap<RemoteOperationKey, RemoteOperationResult>>,
+    /// Owner-side replay table for proxied write/resize/sync (R54).
+    remote_operation_results: Mutex<OwnerOperationTable>,
     readonly_version_cache: Arc<Mutex<ReadOnlyVersionCache>>,
     readonly_version_gates: Arc<crate::node::read_pipeline::ReadKeyGates>,
     readonly_empty_version: Arc<ReadOnlyVersion>,
@@ -182,6 +185,7 @@ pub struct DistributedFs {
 
 const DFS_HANDLE_SHARDS: usize = 64;
 
+/// Process-wide cap on owner replay slots, checked before an operation applies.
 const MAX_REMOTE_OPERATION_RESULTS: usize = 4096;
 const MAX_LOCK_AUTHORITIES: usize = 8192;
 const MAX_REMOTE_LOCK_AUTHORITIES: usize = 8192;
@@ -245,6 +249,8 @@ impl DistributedFs {
             #[cfg(test)]
             handle_registration_after_route_check: Mutex::new(None),
             #[cfg(test)]
+            remote_operation_before_apply: Mutex::new(None),
+            #[cfg(test)]
             readonly_version_before_install: Mutex::new(None),
             lock_session_reap_cursor: AtomicU64::new(0),
             owner_handle_reap_cursor: AtomicU64::new(0),
@@ -253,7 +259,7 @@ impl DistributedFs {
             writeback_after_prepare_pause: Mutex::new(None),
             closed_lock_sessions: Mutex::new(HashSet::new()),
             closed_lock_session_admission_closed: AtomicBool::new(false),
-            remote_operation_results: Mutex::new(HashMap::new()),
+            remote_operation_results: Mutex::new(OwnerOperationTable::default()),
             readonly_version_gates: Arc::new(Default::default()),
             readonly_version_cache: Arc::new(Mutex::new(ReadOnlyVersionCache::new(
                 DEFAULT_VERSION_CACHE_ENTRIES,

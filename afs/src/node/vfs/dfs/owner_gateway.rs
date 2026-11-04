@@ -81,12 +81,10 @@ impl OwnerOpenFinishPause {
     }
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(super) struct RemoteOperationKey {
-    peer: String,
-    caller_session_id: String,
-    operation_id: OperationId,
-}
+/// Results an owner handle keeps for proxied write/resize/sync replay (R54).
+/// The oldest completed result is evicted to make room; in-flight
+/// placeholders are never evicted.
+pub(super) const OWNER_OPERATION_RESULTS_PER_HANDLE: usize = 64;
 
 #[derive(Clone)]
 pub(super) enum RemoteOperationResult {
@@ -104,62 +102,271 @@ pub(super) enum RemoteOperationResult {
     },
 }
 
-impl DistributedFs {
-    fn remote_operation_cached(
-        &self,
-        key: &RemoteOperationKey,
+impl RemoteOperationResult {
+    fn fingerprint(&self) -> [u8; 32] {
+        match self {
+            Self::Write { fingerprint, .. }
+            | Self::Resize { fingerprint, .. }
+            | Self::Sync { fingerprint, .. } => *fingerprint,
+        }
+    }
+}
+
+enum OwnerOperationSlot {
+    /// The operation is being applied; `token` identifies the claim that owns it.
+    InFlight {
         fingerprint: [u8; 32],
-    ) -> Result<Option<RemoteOperationResult>> {
-        let cached = self
+        token: u64,
+    },
+    Done(RemoteOperationResult),
+}
+
+#[derive(Default)]
+struct OwnerHandleOperations {
+    /// Operation ids in arrival order (oldest first); same set as `entries`.
+    order: VecDeque<OperationId>,
+    entries: HashMap<OperationId, OwnerOperationSlot>,
+}
+
+/// Owner-side idempotency table for proxied mutating operations (ledger R54).
+///
+/// Invariants:
+/// - Keyed by the owner-side `FileHandle`. Handle ids are never reused and the
+///   table is only consulted after `validate_owner_handle` bound the caller
+///   node/session to the handle, so the key is at least as narrow as the old
+///   `(peer, caller_session, operation_id)` key.
+/// - Each handle keeps at most `OWNER_OPERATION_RESULTS_PER_HANDLE` slots;
+///   admitting a new operation evicts that handle's oldest `Done` slot.
+/// - The process-wide slot count never exceeds `MAX_REMOTE_OPERATION_RESULTS`;
+///   an operation that would grow past it is rejected *before* it is applied.
+/// - A slot is `InFlight` from admission until the operation finishes; a
+///   duplicate arriving meanwhile gets a retryable error. A failed operation
+///   removes its placeholder, so errors are never cached.
+/// - All slots of a handle are dropped when the owner handle is released,
+///   its open is cancelled, or it is reaped with its caller session.
+#[derive(Default)]
+pub(super) struct OwnerOperationTable {
+    handles: HashMap<FileHandle, OwnerHandleOperations>,
+    total: usize,
+    next_token: u64,
+}
+
+pub(super) enum OwnerOperationBegin {
+    Cached(RemoteOperationResult),
+    Apply(u64),
+}
+
+impl OwnerOperationTable {
+    fn begin(
+        &mut self,
+        file: FileHandle,
+        operation_id: &OperationId,
+        fingerprint: [u8; 32],
+    ) -> Result<OwnerOperationBegin> {
+        if let Some(slot) = self
+            .handles
+            .get(&file)
+            .and_then(|ops| ops.entries.get(operation_id))
+        {
+            let recorded = match slot {
+                OwnerOperationSlot::InFlight { fingerprint, .. } => *fingerprint,
+                OwnerOperationSlot::Done(result) => result.fingerprint(),
+            };
+            if recorded != fingerprint {
+                return Err(invalid(
+                    "DFS remote operation id was reused with a different request body",
+                ));
+            }
+            return match slot {
+                OwnerOperationSlot::InFlight { .. } => Err(unavailable(
+                    "DFS remote operation is still in progress; retry later",
+                )),
+                OwnerOperationSlot::Done(result) => Ok(OwnerOperationBegin::Cached(result.clone())),
+            };
+        }
+        let held = self.handles.get(&file).map_or(0, |ops| ops.entries.len());
+        if held < OWNER_OPERATION_RESULTS_PER_HANDLE {
+            if self.total >= MAX_REMOTE_OPERATION_RESULTS {
+                return Err(unavailable(
+                    "DFS remote operation table is at capacity; retry later",
+                ));
+            }
+        } else {
+            let ops = self.handles.get_mut(&file).expect("held > 0 implies entry");
+            let oldest_done = ops
+                .order
+                .iter()
+                .position(|id| matches!(ops.entries.get(id), Some(OwnerOperationSlot::Done(_))));
+            let Some(index) = oldest_done else {
+                return Err(unavailable(
+                    "DFS owner handle has too many operations in progress; retry later",
+                ));
+            };
+            let evicted = ops.order.remove(index).expect("index from position");
+            ops.entries.remove(&evicted);
+            self.total -= 1;
+        }
+        self.next_token = self.next_token.wrapping_add(1);
+        let token = self.next_token;
+        let ops = self.handles.entry(file).or_default();
+        ops.order.push_back(operation_id.clone());
+        ops.entries.insert(
+            operation_id.clone(),
+            OwnerOperationSlot::InFlight { fingerprint, token },
+        );
+        self.total += 1;
+        Ok(OwnerOperationBegin::Apply(token))
+    }
+
+    fn claimed_slot(
+        &mut self,
+        file: FileHandle,
+        operation_id: &OperationId,
+        token: u64,
+    ) -> Option<&mut OwnerOperationSlot> {
+        self.handles
+            .get_mut(&file)?
+            .entries
+            .get_mut(operation_id)
+            .filter(|slot| {
+                matches!(slot, OwnerOperationSlot::InFlight { token: owned, .. } if *owned == token)
+            })
+    }
+
+    fn complete(
+        &mut self,
+        file: FileHandle,
+        operation_id: &OperationId,
+        token: u64,
+        result: RemoteOperationResult,
+    ) {
+        // The handle may have been released while the operation ran; its
+        // slots are gone then and there is nothing left to replay against.
+        if let Some(slot) = self.claimed_slot(file, operation_id, token) {
+            *slot = OwnerOperationSlot::Done(result);
+        }
+    }
+
+    fn abandon(&mut self, file: FileHandle, operation_id: &OperationId, token: u64) {
+        if self.claimed_slot(file, operation_id, token).is_none() {
+            return;
+        }
+        let ops = self
+            .handles
+            .get_mut(&file)
+            .expect("claimed slot implies entry");
+        ops.entries.remove(operation_id);
+        ops.order.retain(|id| id != operation_id);
+        self.total -= 1;
+        if ops.entries.is_empty() {
+            self.handles.remove(&file);
+        }
+    }
+
+    fn clear_handle(&mut self, file: FileHandle) {
+        if let Some(ops) = self.handles.remove(&file) {
+            self.total -= ops.entries.len();
+        }
+    }
+
+    fn handle_ids(&self) -> Vec<FileHandle> {
+        self.handles.keys().copied().collect()
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.total
+    }
+}
+
+/// An admitted operation's in-flight placeholder. Dropping it without
+/// `complete` (error or panic while applying) removes the placeholder so the
+/// same operation id can be applied again.
+struct OwnerOperationClaim<'a> {
+    fs: &'a DistributedFs,
+    file: FileHandle,
+    operation_id: OperationId,
+    token: u64,
+    done: bool,
+}
+
+impl OwnerOperationClaim<'_> {
+    fn complete(mut self, result: RemoteOperationResult) {
+        self.done = true;
+        // A poisoned table already fails every later admission, so dropping
+        // the record here cannot turn into a silent second apply.
+        if let Ok(mut table) = self.fs.remote_operation_results.lock() {
+            table.complete(self.file, &self.operation_id, self.token, result);
+        }
+    }
+}
+
+impl Drop for OwnerOperationClaim<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        if let Ok(mut table) = self.fs.remote_operation_results.lock() {
+            table.abandon(self.file, &self.operation_id, self.token);
+        }
+    }
+}
+
+enum OwnerOperationStart<'a> {
+    Cached(RemoteOperationResult),
+    Apply(OwnerOperationClaim<'a>),
+}
+
+impl DistributedFs {
+    /// Admits a proxied mutating operation on a validated owner handle: either
+    /// returns the remembered result of a completed duplicate, or installs an
+    /// in-flight placeholder that the caller must `complete` after applying.
+    fn begin_remote_operation(
+        &self,
+        file: FileHandle,
+        operation_id: OperationId,
+        fingerprint: [u8; 32],
+    ) -> Result<OwnerOperationStart<'_>> {
+        let begin = self
             .remote_operation_results
             .lock()
             .map_err(|_| unavailable("DFS remote operation table is poisoned"))?
-            .get(key)
-            .cloned();
-        let Some(result) = cached else {
-            return Ok(None);
-        };
-        let cached_fingerprint = match &result {
-            RemoteOperationResult::Write { fingerprint, .. }
-            | RemoteOperationResult::Resize { fingerprint, .. }
-            | RemoteOperationResult::Sync { fingerprint, .. } => *fingerprint,
-        };
-        if cached_fingerprint != fingerprint {
-            return Err(invalid(
-                "DFS remote operation id was reused with a different request body",
-            ));
-        }
-        Ok(Some(result))
+            .begin(file, &operation_id, fingerprint)?;
+        Ok(match begin {
+            OwnerOperationBegin::Cached(result) => OwnerOperationStart::Cached(result),
+            OwnerOperationBegin::Apply(token) => OwnerOperationStart::Apply(OwnerOperationClaim {
+                fs: self,
+                file,
+                operation_id,
+                token,
+                done: false,
+            }),
+        })
     }
 
-    fn remember_remote_operation(
-        &self,
-        key: RemoteOperationKey,
-        result: RemoteOperationResult,
-    ) -> Result<()> {
-        let mut operations = self
-            .remote_operation_results
+    /// Drops every remembered operation of an owner handle that is gone.
+    fn forget_owner_handle_operations(&self, file: FileHandle) -> Result<()> {
+        self.remote_operation_results
             .lock()
-            .map_err(|_| unavailable("DFS remote operation table is poisoned"))?;
-        if operations.len() >= MAX_REMOTE_OPERATION_RESULTS && !operations.contains_key(&key) {
-            return Err(unavailable(
-                "DFS remote operation table is full; retry later",
-            ));
-        }
-        operations.insert(key, result);
+            .map_err(|_| unavailable("DFS remote operation table is poisoned"))?
+            .clear_handle(file);
         Ok(())
     }
 
-    fn remote_operation_key(
-        peer: &str,
-        handle: &afs_protocol::node_control::DfsOwnerHandle,
-        operation_id: OperationId,
-    ) -> RemoteOperationKey {
-        RemoteOperationKey {
-            peer: peer.to_owned(),
-            caller_session_id: handle.caller_session_id.clone(),
-            operation_id,
+    /// Safety net for release paths that do not go through the owner gateway:
+    /// drop slots of handles that no longer exist.
+    fn prune_released_owner_operations(&self) -> Result<()> {
+        let tracked = self
+            .remote_operation_results
+            .lock()
+            .map_err(|_| unavailable("DFS remote operation table is poisoned"))?
+            .handle_ids();
+        for file in tracked {
+            if self.handles.get(file.0)?.is_none() {
+                self.forget_owner_handle_operations(file)?;
+            }
         }
+        Ok(())
     }
 
     fn fingerprint_remote_write(
@@ -224,6 +431,10 @@ impl DistributedFs {
         }
         hasher.update(&handle.lease_epoch.to_be_bytes());
     }
+}
+
+fn remote_operation_kind_mismatch() -> Error {
+    invalid("DFS remote operation id was reused for a different operation kind")
 }
 
 pub(super) enum DfsOwnerOpenAdmissionStart {
@@ -350,11 +561,13 @@ impl crate::node::rpc::control::DfsOwnerLifecycleHandler for DistributedFs {
                             if release_error.code() == afs_error::NODE_DFS_STALE_HANDLE => {}
                         Err(release_error) => return Err(release_error),
                     }
+                    self.forget_owner_handle_operations(handle)?;
                     return Err(error);
                 }
             };
         if cancelled {
             <Self as Backend>::release(self, &owner_request_context(), handle)?;
+            self.forget_owner_handle_operations(handle)?;
             self.finish_owner_open_identity_retirement(peer, &wire)?;
             return Err(stale("DFS owner open admission was cancelled"));
         }
@@ -626,6 +839,7 @@ impl crate::node::rpc::control::DfsOwnerLifecycleHandler for DistributedFs {
                 let file = self.owner_release_file_handle(peer, &active)?;
                 let file = file.ok_or_else(|| stale("DFS owner release handle is not active"))?;
                 <Self as Backend>::release(self, &owner_request_context(), file)?;
+                self.forget_owner_handle_operations(file)?;
                 self.finish_owner_open_identity_retirement(peer, &active)?;
             }
             return Ok(afs_protocol::node_control::DfsOwnerReleaseReply {});
@@ -633,6 +847,7 @@ impl crate::node::rpc::control::DfsOwnerLifecycleHandler for DistributedFs {
         self.validate_owner_release_session_current(peer, &handle)?;
         if let Some(file) = self.owner_release_file_handle(peer, &handle)? {
             <Self as Backend>::release(self, &owner_request_context(), file)?;
+            self.forget_owner_handle_operations(file)?;
         }
         self.finish_owner_open_identity_retirement(peer, &handle)?;
         Ok(afs_protocol::node_control::DfsOwnerReleaseReply {})
@@ -681,7 +896,6 @@ impl crate::node::rpc::data::DfsOwnerFilesHandler for DistributedFs {
         let handle = Self::control_owner_handle(&handle);
         let file = self.validate_owner_handle(peer, &handle)?;
         let operation_id = OperationId::new(request.operation_id.clone());
-        let key = Self::remote_operation_key(peer, &handle, operation_id);
         let fingerprint = Self::fingerprint_remote_write(
             &handle,
             request.offset,
@@ -689,11 +903,15 @@ impl crate::node::rpc::data::DfsOwnerFilesHandler for DistributedFs {
             &request.data,
             request.kill_suidgid,
         );
-        if let Some(RemoteOperationResult::Write { reply, .. }) =
-            self.remote_operation_cached(&key, fingerprint)?
-        {
-            return Ok(reply);
-        }
+        let claim = match self.begin_remote_operation(file, operation_id, fingerprint)? {
+            OwnerOperationStart::Cached(RemoteOperationResult::Write { reply, .. }) => {
+                return Ok(reply);
+            }
+            OwnerOperationStart::Cached(_) => return Err(remote_operation_kind_mismatch()),
+            OwnerOperationStart::Apply(claim) => claim,
+        };
+        #[cfg(test)]
+        self.run_remote_operation_before_apply_hook();
         let offset = if request.append {
             let snapshot = self.handle_snapshot(file)?;
             self.visible_attributes(&snapshot.opened_inode)?.size
@@ -720,7 +938,7 @@ impl crate::node::rpc::data::DfsOwnerFilesHandler for DistributedFs {
             accepted_write_seq: accepted,
             effective_offset: offset,
         };
-        self.remember_remote_operation(key, RemoteOperationResult::Write { fingerprint, reply })?;
+        claim.complete(RemoteOperationResult::Write { fingerprint, reply });
         Ok(reply)
     }
 
@@ -736,14 +954,15 @@ impl crate::node::rpc::data::DfsOwnerFilesHandler for DistributedFs {
         let handle = Self::control_owner_handle(&handle);
         let file = self.validate_owner_handle(peer, &handle)?;
         let operation_id = OperationId::new(request.operation_id.clone());
-        let key = Self::remote_operation_key(peer, &handle, operation_id);
         let fingerprint =
             Self::fingerprint_remote_resize(&handle, request.length, request.kill_suidgid);
-        if let Some(RemoteOperationResult::Resize { reply, .. }) =
-            self.remote_operation_cached(&key, fingerprint)?
-        {
-            return Ok(reply);
-        }
+        let claim = match self.begin_remote_operation(file, operation_id, fingerprint)? {
+            OwnerOperationStart::Cached(RemoteOperationResult::Resize { reply, .. }) => {
+                return Ok(reply);
+            }
+            OwnerOperationStart::Cached(_) => return Err(remote_operation_kind_mismatch()),
+            OwnerOperationStart::Apply(claim) => claim,
+        };
         let snapshot = self.handle_snapshot(file)?;
         let accepted =
             self.resize_dirty_inode(&snapshot.inode_id, request.length, request.kill_suidgid)?;
@@ -751,7 +970,7 @@ impl crate::node::rpc::data::DfsOwnerFilesHandler for DistributedFs {
         let reply = afs_protocol::node_data::DfsOwnerResizeReply {
             accepted_write_seq: accepted,
         };
-        self.remember_remote_operation(key, RemoteOperationResult::Resize { fingerprint, reply })?;
+        claim.complete(RemoteOperationResult::Resize { fingerprint, reply });
         Ok(reply)
     }
 
@@ -767,14 +986,15 @@ impl crate::node::rpc::data::DfsOwnerFilesHandler for DistributedFs {
         let handle = Self::control_owner_handle(&handle);
         let file = self.validate_owner_handle(peer, &handle)?;
         let operation_id = OperationId::new(request.operation_id.clone());
-        let key = Self::remote_operation_key(peer, &handle, operation_id);
         let fingerprint =
             Self::fingerprint_remote_sync(&handle, request.through_write_seq, request.data_only);
-        if let Some(RemoteOperationResult::Sync { reply, .. }) =
-            self.remote_operation_cached(&key, fingerprint)?
-        {
-            return Ok(reply);
-        }
+        let claim = match self.begin_remote_operation(file, operation_id, fingerprint)? {
+            OwnerOperationStart::Cached(RemoteOperationResult::Sync { reply, .. }) => {
+                return Ok(reply);
+            }
+            OwnerOperationStart::Cached(_) => return Err(remote_operation_kind_mismatch()),
+            OwnerOperationStart::Apply(claim) => claim,
+        };
         <Self as Backend>::fsync(
             self,
             &owner_request_context(),
@@ -803,13 +1023,10 @@ impl crate::node::rpc::data::DfsOwnerFilesHandler for DistributedFs {
                 })
                 .unwrap_or_default(),
         };
-        self.remember_remote_operation(
-            key,
-            RemoteOperationResult::Sync {
-                fingerprint,
-                reply: reply.clone(),
-            },
-        )?;
+        claim.complete(RemoteOperationResult::Sync {
+            fingerprint,
+            reply: reply.clone(),
+        });
         Ok(reply)
     }
 }
@@ -818,6 +1035,24 @@ impl DistributedFs {
     #[cfg(test)]
     pub(super) fn set_owner_open_finish_pause(&self, pause: Option<Arc<OwnerOpenFinishPause>>) {
         *self.owner_open_finish_pause.lock().unwrap() = pause;
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_remote_operation_before_apply(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self.remote_operation_before_apply.lock().unwrap() = Some(hook);
+    }
+
+    #[cfg(test)]
+    fn run_remote_operation_before_apply_hook(&self) {
+        let hook = self.remote_operation_before_apply.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn remote_operation_entry_count(&self) -> usize {
+        self.remote_operation_results.lock().unwrap().len()
     }
 
     #[cfg(test)]
@@ -1225,6 +1460,7 @@ impl DistributedFs {
     }
 
     pub fn reap_expired_peer_owner_handles(&self) -> Result<usize> {
+        self.prune_released_owner_operations()?;
         let sessions_by_node = self.peer_owner_handle_sessions()?;
         let mut peers = sessions_by_node.into_iter().collect::<Vec<_>>();
         peers.sort_by(|left, right| left.0.cmp(&right.0));
@@ -1290,9 +1526,17 @@ impl DistributedFs {
         let mut reaped = 0usize;
         let mut first_error = None;
         for file in handles {
-            match <Self as Backend>::release(self, &owner_request_context(), file) {
-                Ok(()) => reaped = reaped.saturating_add(1),
-                Err(error) if error.code() == afs_error::NODE_DFS_STALE_HANDLE => {}
+            let released = match <Self as Backend>::release(self, &owner_request_context(), file) {
+                Ok(()) => {
+                    reaped = reaped.saturating_add(1);
+                    Ok(())
+                }
+                Err(error) if error.code() == afs_error::NODE_DFS_STALE_HANDLE => Ok(()),
+                Err(error) => Err(error),
+            }
+            .and_then(|()| self.forget_owner_handle_operations(file));
+            match released {
+                Ok(()) => {}
                 Err(error) => {
                     first_error.get_or_insert(error);
                 }

@@ -1479,62 +1479,247 @@ fn remote_owner_append_retry_is_idempotent_and_dirty_read_is_visible() {
     .unwrap();
 }
 
-/// S0 characterization for ledger Q01: the owner-side idempotency table for
-/// proxied writes has a fixed capacity and no eviction, so a long-lived owner
-/// rejects new proxied writes once it has remembered that many operations.
-#[test]
-fn s0_q01_owner_operation_table_fills_and_rejects_new_proxied_writes() {
-    let (_temp, _meta, fs) = test_fs();
-    let open = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
-        &fs,
+// Ledger R54: owner-side idempotency table for proxied write/resize/sync.
+
+fn r54_open(
+    fs: &DistributedFs,
+    open_seq: u64,
+    flags: i32,
+) -> afs_protocol::node_control::DfsOwnerHandle {
+    <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
+        fs,
         "node-b",
-        afs_protocol::node_control::DfsOwnerOpenRequest {
-            namespace_id: "default".into(),
-            inode_id: "inode:test".into(),
-            owner_node_id: "node-a".into(),
-            owner_session_id: "session-a".into(),
-            lease_epoch: 1,
-            caller_session_id: "session-b".into(),
-            open_flags: libc::O_RDWR,
-            kill_suidgid: false,
-            open_seq: 1,
+        dfs_owner_open_request(open_seq, flags),
+    )
+    .unwrap()
+    .handle
+    .expect("owner open returns handle")
+}
+
+fn r54_write(
+    handle: &afs_protocol::node_control::DfsOwnerHandle,
+    operation_id: &str,
+    offset: u64,
+    data: &[u8],
+    append: bool,
+) -> afs_protocol::node_data::DfsOwnerWriteRequest {
+    afs_protocol::node_data::DfsOwnerWriteRequest {
+        handle: Some(DistributedFs::data_owner_handle(handle)),
+        operation_id: operation_id.into(),
+        offset,
+        data: data.to_vec(),
+        append,
+        kill_suidgid: false,
+    }
+}
+
+fn r54_send(
+    fs: &DistributedFs,
+    request: afs_protocol::node_data::DfsOwnerWriteRequest,
+) -> Result<afs_protocol::node_data::DfsOwnerWriteReply> {
+    <DistributedFs as crate::node::rpc::data::DfsOwnerFilesHandler>::write(fs, "node-b", request)
+}
+
+fn r54_read_all(
+    fs: &DistributedFs,
+    handle: &afs_protocol::node_control::DfsOwnerHandle,
+) -> Vec<u8> {
+    <DistributedFs as crate::node::rpc::data::DfsOwnerFilesHandler>::read(
+        fs,
+        "node-b",
+        afs_protocol::node_data::DfsOwnerReadRequest {
+            handle: Some(DistributedFs::data_owner_handle(handle)),
+            offset: 0,
+            length: 1 << 20,
         },
     )
-    .unwrap();
-    let handle = open.handle.expect("owner open returns handle");
-    let data_handle = DistributedFs::data_owner_handle(&handle);
-    let write = |index: usize| afs_protocol::node_data::DfsOwnerWriteRequest {
-        handle: Some(data_handle.clone()),
-        operation_id: format!("node-b-op-{index}"),
-        offset: 0,
-        data: vec![b'x'],
-        append: false,
-        kill_suidgid: false,
-    };
-    for index in 0..MAX_REMOTE_OPERATION_RESULTS {
-        <DistributedFs as crate::node::rpc::data::DfsOwnerFilesHandler>::write(
-            &fs,
-            "node-b",
-            write(index),
-        )
-        .unwrap();
-    }
-    let error = <DistributedFs as crate::node::rpc::data::DfsOwnerFilesHandler>::write(
-        &fs,
-        "node-b",
-        write(MAX_REMOTE_OPERATION_RESULTS),
-    )
-    .unwrap_err();
-    assert!(
-        error.message().contains("remote operation table is full"),
-        "{error:?}"
-    );
+    .unwrap()
+    .data
+}
+
+fn r54_release(fs: &DistributedFs, handle: afs_protocol::node_control::DfsOwnerHandle) {
     <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release(
-        &fs,
+        fs,
         "node-b",
         afs_protocol::node_control::DfsOwnerReleaseRequest {
             handle: Some(handle),
         },
     )
     .unwrap();
+}
+
+/// R54: more proxied writes than the old process-wide capacity all succeed on
+/// one handle, the handle keeps a bounded window of results, and a retry of a
+/// retained operation is answered from the table without re-applying.
+#[test]
+fn owner_operation_table_is_bounded_per_handle_and_never_rejects_long_runs() {
+    let (_temp, _meta, fs) = test_fs();
+    let handle = r54_open(&fs, 1, libc::O_RDWR | libc::O_APPEND);
+    let total = MAX_REMOTE_OPERATION_RESULTS + 904;
+    let mut replies = Vec::with_capacity(total);
+    for index in 0..total {
+        let reply = r54_send(
+            &fs,
+            r54_write(&handle, &format!("node-b-op-{index}"), 0, b"x", true),
+        )
+        .unwrap_or_else(|error| panic!("proxied write {index} failed: {error:?}"));
+        replies.push(reply);
+    }
+    assert!(
+        fs.remote_operation_entry_count() <= 64,
+        "per-handle retention must stay bounded, got {}",
+        fs.remote_operation_entry_count()
+    );
+    let last = total - 1;
+    let retry = r54_send(
+        &fs,
+        r54_write(&handle, &format!("node-b-op-{last}"), 0, b"x", true),
+    )
+    .unwrap();
+    assert_eq!(retry, replies[last]);
+    let oldest_retained = total - 64;
+    let retry = r54_send(
+        &fs,
+        r54_write(
+            &handle,
+            &format!("node-b-op-{oldest_retained}"),
+            0,
+            b"x",
+            true,
+        ),
+    )
+    .unwrap();
+    assert_eq!(retry, replies[oldest_retained]);
+    assert_eq!(
+        r54_read_all(&fs, &handle).len(),
+        total,
+        "retries must not re-apply"
+    );
+    r54_release(&fs, handle);
+}
+
+/// R54: releasing an owner handle drops every remembered result for it.
+#[test]
+fn owner_release_clears_handle_operation_results() {
+    let (_temp, _meta, fs) = test_fs();
+    let handle = r54_open(&fs, 1, libc::O_RDWR);
+    for index in 0..3 {
+        r54_send(
+            &fs,
+            r54_write(&handle, &format!("op-{index}"), index, b"x", false),
+        )
+        .unwrap();
+    }
+    assert_eq!(fs.remote_operation_entry_count(), 3);
+    r54_release(&fs, handle);
+    assert_eq!(fs.remote_operation_entry_count(), 0);
+}
+
+/// R54: the cleanup-identity release (caller lost the open reply and retires
+/// the admission) also drops the handle's results.
+#[test]
+fn owner_cleanup_release_clears_handle_operation_results() {
+    let (_temp, _meta, fs) = test_fs();
+    let handle = r54_open(&fs, 1, libc::O_RDWR);
+    r54_send(&fs, r54_write(&handle, "op-1", 0, b"x", false)).unwrap();
+    assert_eq!(fs.remote_operation_entry_count(), 1);
+    r54_release(&fs, dfs_owner_cleanup_handle(1));
+    assert!(fs.handles.is_empty());
+    assert_eq!(fs.remote_operation_entry_count(), 0);
+}
+
+/// R54: reaping the handles of a replaced caller session drops their results.
+#[test]
+fn owner_session_reap_clears_handle_operation_results() {
+    let (_temp, meta, fs) = test_fs();
+    let handle = r54_open(&fs, 1, libc::O_RDWR);
+    r54_send(&fs, r54_write(&handle, "op-1", 0, b"x", false)).unwrap();
+    assert_eq!(fs.remote_operation_entry_count(), 1);
+    meta.set_node_session("node-b", Some("session-b2"));
+    assert_eq!(fs.reap_expired_peer_owner_handles().unwrap(), 1);
+    assert!(fs.handles.is_empty());
+    assert_eq!(fs.remote_operation_entry_count(), 0);
+}
+
+/// R54: a duplicate of an operation that is still being applied is told to
+/// retry instead of applying a second time; the later retry is answered from
+/// the table.
+#[test]
+fn owner_concurrent_duplicate_operation_is_retryable_and_applied_once() {
+    let (_temp, _meta, fs_raw) = test_fs();
+    let fs = Arc::new(fs_raw);
+    let handle = r54_open(&fs, 1, libc::O_RDWR | libc::O_APPEND);
+    let pause = Arc::new(OwnerOpenFinishPause::new());
+    let hook_pause = pause.clone();
+    fs.set_remote_operation_before_apply(Box::new(move || hook_pause.pause()));
+    let first = {
+        let fs = fs.clone();
+        let request = r54_write(&handle, "op-dup", 0, b"ab", true);
+        std::thread::spawn(move || r54_send(&fs, request))
+    };
+    pause.wait_until_reached();
+    let duplicate = r54_send(&fs, r54_write(&handle, "op-dup", 0, b"ab", true));
+    pause.resume();
+    let first = first.join().unwrap().unwrap();
+    let error = duplicate.expect_err("concurrent duplicate must not apply");
+    assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE, "{error:?}");
+    assert_eq!(r54_read_all(&fs, &handle), b"ab");
+    let retry = r54_send(&fs, r54_write(&handle, "op-dup", 0, b"ab", true)).unwrap();
+    assert_eq!(retry, first);
+    assert_eq!(r54_read_all(&fs, &handle), b"ab");
+    r54_release(&fs, handle);
+}
+
+/// R54: when the process-wide cap is reached the owner rejects a new operation
+/// before applying it (retryable, no side effect); a handle that can evict its
+/// own oldest result keeps working, and releasing a handle frees capacity.
+#[test]
+fn owner_operation_global_cap_rejects_before_applying() {
+    let (_temp, _meta, fs) = test_fs();
+    let per_handle = 64usize;
+    let full_handles = MAX_REMOTE_OPERATION_RESULTS / per_handle;
+    let handles = (1..=full_handles as u64 + 1)
+        .map(|open_seq| r54_open(&fs, open_seq, libc::O_RDWR))
+        .collect::<Vec<_>>();
+    for (slot, handle) in handles.iter().take(full_handles).enumerate() {
+        for index in 0..per_handle {
+            r54_send(
+                &fs,
+                r54_write(handle, &format!("h{slot}-op-{index}"), 0, b"x", false),
+            )
+            .unwrap_or_else(|error| panic!("write h{slot}/{index} failed: {error:?}"));
+        }
+    }
+    assert_eq!(
+        fs.remote_operation_entry_count(),
+        MAX_REMOTE_OPERATION_RESULTS
+    );
+    let extra = handles.last().unwrap().clone();
+    let error = r54_send(&fs, r54_write(&extra, "extra-op", 100, b"Z", false))
+        .expect_err("global cap must reject");
+    assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE, "{error:?}");
+    assert_eq!(
+        r54_read_all(&fs, &extra),
+        b"x",
+        "rejected write must not apply"
+    );
+    assert_eq!(
+        fs.remote_operation_entry_count(),
+        MAX_REMOTE_OPERATION_RESULTS
+    );
+
+    r54_send(&fs, r54_write(&handles[0], "h0-op-extra", 1, b"y", false)).unwrap();
+    assert_eq!(
+        fs.remote_operation_entry_count(),
+        MAX_REMOTE_OPERATION_RESULTS
+    );
+
+    let mut handles = handles;
+    r54_release(&fs, handles.remove(1));
+    r54_send(&fs, r54_write(&extra, "extra-op", 100, b"Z", false)).unwrap();
+    assert_eq!(r54_read_all(&fs, &extra).len(), 101);
+    for handle in handles {
+        r54_release(&fs, handle);
+    }
+    assert_eq!(fs.remote_operation_entry_count(), 0);
 }
