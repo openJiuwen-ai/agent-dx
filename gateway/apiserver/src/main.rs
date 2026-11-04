@@ -43,18 +43,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(config.listen).await?;
     let mut embedded_ingress = if config.ingress_mode == IngressMode::Embedded {
         let environment_service = embedded_environment_service(&api)?;
-        Some(
-            EmbeddedIngress::start(
-                config
-                    .ingress_control
-                    .clone()
-                    .ok_or("embedded Ingress control configuration missing")?,
-                environment_service,
-                api.environment_service.clone(),
-            )
-            .await
-            .map_err(local_error)?,
+        // The embedded Ingress shares the host's shutdown budget and starts
+        // draining at the same instant (SIGTERM), per the joint-exit
+        // contract: one budget for management HTTP, background creates,
+        // embedded Activator operations and the Ingress drain alike.
+        let ingress = EmbeddedIngress::start(
+            config
+                .ingress_control
+                .clone()
+                .ok_or("embedded Ingress control configuration missing")?,
+            environment_service,
+            api.environment_service.clone(),
+            config.shutdown_timeout(),
         )
+        .await
+        .map_err(local_error)?;
+        // Fold the embedded Ingress's admission readiness (route sync,
+        // enabled entry paths — including the embedded Activator's — and
+        // not draining) into this host's `/readyz`.
+        let readiness = ingress.readiness().clone();
+        api.set_embedded_readiness(Box::new(move || readiness.ready()));
+        Some(ingress)
     } else {
         None
     };
@@ -125,19 +134,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    // Draining first: new management operations are rejected before
+    // acceptance with the structured not-started contract ("交接中，
+    // 未接收") and `/readyz` turns not-ready; already-accepted requests
+    // continue below.
+    api.begin_draining();
     let _ = stop.send(true);
-    if tokio::time::timeout(Duration::from_secs(15), async {
+    // Trigger the embedded Ingress drain immediately so it runs in parallel
+    // with management HTTP shutdown, instead of serially after it. Total exit
+    // is ~max(management wait, ingress drain) rather than their sum; the
+    // Ingress's drain timeout was aligned to the same budget at start.
+    if let Some(ingress) = embedded_ingress.as_mut() {
+        ingress.begin_drain();
+    }
+    // Joint exit, one budget started at the same instant (SIGTERM):
+    // management HTTP tasks, background create-stream tasks, and in-process
+    // embedded Activator operations (activations/bindings running inside
+    // Ingress connection tasks — the management HTTP count cannot see
+    // them). Abort stragglers when the budget expires.
+    let shutdown_budget = config.shutdown_timeout();
+    let drained = tokio::time::timeout(shutdown_budget, async {
         while tasks.join_next().await.is_some() {}
+        {
+            let mut background = api.background.lock().await;
+            while background.join_next().await.is_some() {}
+        }
+        while api.environment_service.embedded_operations() > 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     })
     .await
-    .is_err()
-    {
+    .is_ok();
+    if !drained {
         tasks.abort_all();
         while tasks.join_next().await.is_some() {}
+        let mut background = api.background.lock().await;
+        background.abort_all();
+        while background.join_next().await.is_some() {}
     }
-    if let Some(ingress) = embedded_ingress {
+    // Await the already-draining embedded Ingress; its own drain_timeout
+    // bounds the active-session/frontend wait inside serve().
+    if let Some(mut ingress) = embedded_ingress {
         if ingress_failure.is_none() {
-            ingress.shutdown().await.map_err(local_error)?;
+            ingress.await_completion().await.map_err(local_error)?;
         }
     }
     if let Some(error) = ingress_failure {
