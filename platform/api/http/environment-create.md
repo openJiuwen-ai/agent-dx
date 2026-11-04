@@ -32,3 +32,16 @@ independently. An omitted or zero CPU, memory or writable-storage limit inherits
 the saved limit; it must not become the smaller scheduling request. Explicit
 positive limits remain subject to runtime compatibility and request validation.
 Fresh creation retains the existing zero-limit behavior of following its request.
+
+`inheritEntrypoint=true` is a fresh-create option, not a snapshot override.
+Combining it with `snapshotId` is rejected with HTTP 400, matching the native
+Python SDK. For snapshot restores, omit it or supply `false`: neither disables
+the captured image-process metadata. The Coordinator inherits the saved flag
+and required rootfs metadata so Execd resumes the original processes without
+starting the entrypoint again. Execution-limit overrides above do not permit
+changing this captured process geometry.
+
+Internal normalized requests may already carry the inherited flag. A `true`
+flag must match a source snapshot with the flag enabled; enabling it for a
+snapshot whose flag is `false` is rejected. A `false` protobuf value is treated
+as unspecified during inheritance because that field has no presence bit.

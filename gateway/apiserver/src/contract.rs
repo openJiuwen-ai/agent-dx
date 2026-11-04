@@ -669,6 +669,13 @@ pub fn create_spec_with_environment(
         root.r#type = "image".into();
     }
     let snapshot = (!r.snapshot_id.trim().is_empty()).then(|| r.snapshot_id.trim().to_string());
+    // Match the native SDK: this option starts a fresh image workload. Restore
+    // resumes captured processes and inherits their metadata from the snapshot.
+    if snapshot.is_some() && r.inherit {
+        return Err(invalid(
+            "inheritEntrypoint=true cannot be combined with snapshotId",
+        ));
+    }
     if snapshot.is_none()
         && runtime_profile.is_none()
         && root.imageurl.trim().is_empty()

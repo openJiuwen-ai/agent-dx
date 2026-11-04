@@ -71,6 +71,33 @@ fn clone_preserves_omitted_geometry_and_does_not_invent_image() {
     assert_eq!(spec.resources.unwrap().cpu_millis, 0);
 }
 #[test]
+fn snapshot_restore_rejects_fresh_entrypoint_start_option() {
+    for value in [
+        json!({"snapshotId":"snapshot-1", "image":"image", "inheritEntrypoint":true}),
+        json!({"snapshotId":"snapshot-1", "inheritEntrypoint":true}),
+    ] {
+        let error = create_spec(value, &caller()).unwrap_err();
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        assert!(error.message().contains("inheritEntrypoint"));
+    }
+
+    for value in [
+        json!({"snapshotId":"snapshot-1"}),
+        json!({"snapshotId":"snapshot-1", "inheritEntrypoint":false}),
+    ] {
+        let spec = create_spec(value, &caller()).unwrap();
+        assert!(!spec.execution.unwrap().inherit_entrypoint);
+        assert_eq!(spec.snapshot_id.as_deref(), Some("snapshot-1"));
+    }
+    let fresh = create_spec(
+        json!({"image":"image", "inheritEntrypoint":true}),
+        &caller(),
+    )
+    .unwrap();
+    assert!(fresh.execution.unwrap().inherit_entrypoint);
+}
+
+#[test]
 fn clone_request_does_not_turn_omitted_limits_into_scheduling_requests() {
     let spec = create_spec(
         json!({"snapshotId":"snapshot-1", "cpu":10, "memory":64, "storageMb":20480}),

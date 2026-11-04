@@ -49,6 +49,13 @@ fn inherit_template(
     // its geometry when restoring; Execd resumes its saved process rather than
     // starting the entrypoint again.
     let execution = request.execution.get_or_insert_with(Default::default);
+    // A normalized retry may carry true, but it cannot enable metadata absent
+    // from the source. Protobuf false has no presence bit and means inherit.
+    if execution.inherit_entrypoint && !template.execution.inherit_entrypoint {
+        return Err(Error::Invalid(
+            "snapshot entrypoint configuration must match its source".into(),
+        ));
+    }
     execution.inherit_entrypoint = template.execution.inherit_entrypoint;
     // Requests reserve scheduling capacity; execution limits cap the actual
     // runtime. Restoring only the former can turn an overcommitted 8 GiB
@@ -263,6 +270,37 @@ mod tests {
             tenant_id: "tenant".into(),
             snapshot_id: Some(snapshot.id.clone()),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn clone_cannot_enable_entrypoint_metadata_absent_from_snapshot() {
+        let snapshot = source("local");
+        let mut request = clone_request(&snapshot);
+        request.execution = Some(pb::ExecutionOptions {
+            inherit_entrypoint: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            inherit_template(request, &snapshot, None),
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn clone_inherits_entrypoint_geometry_and_accepts_normalized_replay() {
+        for saved in [false, true] {
+            let mut snapshot = source("local");
+            snapshot.template.execution.inherit_entrypoint = saved;
+            snapshot.template.execution.rootfs = Some(adx_core::execution::Rootfs {
+                readonly: false,
+                source: adx_core::execution::StorageSource::Image(snapshot.template.image.clone()),
+            });
+            let inherited = inherit_template(clone_request(&snapshot), &snapshot, None).unwrap();
+            assert_eq!(inherited.execution.inherit_entrypoint, saved);
+            let replay =
+                inherit_template(inherited.clone().into(), &snapshot, Some(&inherited)).unwrap();
+            assert_eq!(replay, inherited);
         }
     }
 
