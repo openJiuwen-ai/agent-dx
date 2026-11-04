@@ -170,14 +170,32 @@ impl InodeWriteStateCell {
     }
 }
 
-impl DistributedFs {
-    pub(super) fn write_state(&self, inode_id: &InodeId) -> Result<Option<SharedInodeWriteState>> {
+/// Per-inode write state cells. Each cell carries its own `Mutex`+`Condvar`;
+/// the sharded table lock only guards membership and is never held while a
+/// cell is locked by this table.
+#[derive(Default)]
+pub(super) struct InodeWriteTable {
+    pub(super) states: ShardedMap<InodeId, SharedInodeWriteState>,
+    /// Contention counters attached to every newly installed cell.
+    pub(super) lock_wait: Option<Arc<InodeLockWait>>,
+    /// Rotation cursor so lease renewal is fair across passes.
+    pub(super) lease_cursor: AtomicU64,
+}
+
+impl InodeWriteTable {
+    pub(super) fn get(&self, inode_id: &InodeId) -> Result<Option<SharedInodeWriteState>> {
         Ok(self
-            .inode_writes
+            .states
             .read(inode_id)
             .map_err(|_| unavailable("DFS inode write table is poisoned"))?
             .get(inode_id)
             .cloned())
+    }
+}
+
+impl DistributedFs {
+    pub(super) fn write_state(&self, inode_id: &InodeId) -> Result<Option<SharedInodeWriteState>> {
+        self.writes.get(inode_id)
     }
 
     pub(super) fn write_state_can_adopt_fresh_lease(state: &InodeWriteState) -> bool {
@@ -461,9 +479,10 @@ impl DistributedFs {
                 background_error: None,
                 terminal_error: None,
             })
-            .with_lock_wait(self.inode_lock_wait.clone()),
+            .with_lock_wait(self.writes.lock_wait.clone()),
         );
-        self.inode_writes
+        self.writes
+            .states
             .write(&inode.inode_id)
             .map_err(|_| unavailable("DFS inode write table is poisoned"))?
             .entry(inode.inode_id.clone())
@@ -512,8 +531,8 @@ impl DistributedFs {
         state.last_writer_background_requested = false;
         let session_id = DfsWriteSessionId::new(format!(
             "{}-write-session-{}",
-            self.session_id,
-            self.next_operation.fetch_add(1, Ordering::Relaxed)
+            self.identity.session_id,
+            self.identity.next_operation.fetch_add(1, Ordering::Relaxed)
         ));
         let session = write_session(&state, open_flags, session_id);
         let inode = state.inode.clone();

@@ -34,7 +34,7 @@ fn remote_owner_write_after_local_close_rebinds_metadata_dirty_state() {
         lease.lease_epoch
     };
 
-    let open = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
+    let open = <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
         &fs,
         "node-b",
         afs_protocol::node_control::DfsOwnerOpenRequest {
@@ -52,7 +52,7 @@ fn remote_owner_write_after_local_close_rebinds_metadata_dirty_state() {
     .unwrap();
     let handle = open.handle.expect("owner open returns handle");
     let data_handle = DistributedFs::data_owner_handle(&handle);
-    let write = <DistributedFs as crate::node::rpc::data::DfsOwnerFilesHandler>::write(
+    let write = <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerFilesHandler>::write(
         &fs,
         "node-b",
         afs_protocol::node_data::DfsOwnerWriteRequest {
@@ -66,7 +66,7 @@ fn remote_owner_write_after_local_close_rebinds_metadata_dirty_state() {
     )
     .unwrap();
     assert_eq!(write.written, 12);
-    <DistributedFs as crate::node::rpc::data::DfsOwnerFilesHandler>::resize(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerFilesHandler>::resize(
         &fs,
         "node-b",
         afs_protocol::node_data::DfsOwnerResizeRequest {
@@ -77,7 +77,7 @@ fn remote_owner_write_after_local_close_rebinds_metadata_dirty_state() {
         },
     )
     .unwrap();
-    <DistributedFs as crate::node::rpc::data::DfsOwnerFilesHandler>::sync(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerFilesHandler>::sync(
         &fs,
         "node-b",
         afs_protocol::node_data::DfsOwnerSyncRequest {
@@ -88,7 +88,7 @@ fn remote_owner_write_after_local_close_rebinds_metadata_dirty_state() {
         },
     )
     .unwrap();
-    <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::release(
         &fs,
         "node-b",
         afs_protocol::node_control::DfsOwnerReleaseRequest {

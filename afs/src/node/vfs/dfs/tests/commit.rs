@@ -321,7 +321,8 @@ fn active_writer_lease_renewal_skips_closed_clean_states_and_rejects_fencing() {
         false,
         false,
     );
-    fs.inode_writes
+    fs.writes
+        .states
         .insert(lease.inode_id.clone(), cell.clone())
         .unwrap();
     assert_eq!(fs.renew_active_write_leases().unwrap(), 0);
@@ -351,7 +352,8 @@ fn active_writer_lease_renewal_late_reply_cannot_replace_newer_authority() {
         false,
         false,
     );
-    fs.inode_writes
+    fs.writes
+        .states
         .insert(lease.inode_id.clone(), cell.clone())
         .unwrap();
     let pause = meta.pause_next_renew();
@@ -587,7 +589,7 @@ fn pending_trace_unknown_retention_retry_and_actual_clear() {
         .unwrap();
     let inode = fs.inode_id(created.entry.inode).unwrap();
     let output = temp.path().join("trace.jsonl");
-    fs.pending_trace = Some(PendingTrace::test_gate(
+    fs.commit.pending_trace = Some(PendingTrace::test_gate(
         &output,
         "default",
         "node-a",
@@ -663,7 +665,7 @@ fn pending_trace_late_arm_does_not_fabricate_first_send() {
     let output = temp.path().join("late-arm.jsonl");
     let trace = PendingTrace::test_gate(&output, "default", "node-a", "session-a", &inode.0);
     trace.test_unarm();
-    fs.pending_trace = Some(trace);
+    fs.commit.pending_trace = Some(trace);
     fs.write(&context(), created.handle, 0, b"data").unwrap();
     meta.fail_next_commit();
     fs.fsync(&context(), created.handle, SyncMode::DataOnly)
@@ -682,7 +684,11 @@ fn pending_trace_late_arm_does_not_fabricate_first_send() {
             .load(Ordering::Relaxed),
         1
     );
-    fs.pending_trace.as_ref().unwrap().test_arm_target(&inode.0);
+    fs.commit
+        .pending_trace
+        .as_ref()
+        .unwrap()
+        .test_arm_target(&inode.0);
     fs.fsync(&context(), created.handle, SyncMode::DataOnly)
         .unwrap();
     let rows: Vec<serde_json::Value> = std::fs::read_to_string(&output)
@@ -717,7 +723,7 @@ fn pending_trace_send_counter_overflow_disables_only_diagnostics() {
         .unwrap();
     let inode = fs.inode_id(created.entry.inode).unwrap();
     let output = temp.path().join("counter-overflow.jsonl");
-    fs.pending_trace = Some(PendingTrace::test_gate(
+    fs.commit.pending_trace = Some(PendingTrace::test_gate(
         &output,
         "default",
         "node-a",
@@ -770,7 +776,7 @@ fn pending_trace_definite_rejection_and_diagnostic_failure_preserve_fs_results()
         if bounded {
             trace.test_exhaust_records();
         }
-        fs.pending_trace = Some(trace);
+        fs.commit.pending_trace = Some(trace);
         fs.write(&context(), created.handle, 0, b"data").unwrap();
         meta.fail_next_commit_with(Error::coded(
             afs_error::META_DFS_CONFLICT,
@@ -813,7 +819,7 @@ fn pending_trace_rejects_stale_send_clone_without_changing_pending_or_rpc_result
         .unwrap();
     let inode = fs.inode_id(created.entry.inode).unwrap();
     let output = temp.path().join("trace.jsonl");
-    fs.pending_trace = Some(PendingTrace::test_gate(
+    fs.commit.pending_trace = Some(PendingTrace::test_gate(
         &output,
         "default",
         "node-a",
@@ -834,7 +840,7 @@ fn pending_trace_rejects_stale_send_clone_without_changing_pending_or_rpc_result
         };
         Arc::make_mut(&mut stale.batch.commit).operation_id =
             OperationId::new("wrong-stale-operation");
-        fs.pending_trace.as_ref().unwrap().observe(
+        fs.commit.pending_trace.as_ref().unwrap().observe(
             "dfs_pending_commit_unknown_retained",
             "pending_reuse",
             &state,

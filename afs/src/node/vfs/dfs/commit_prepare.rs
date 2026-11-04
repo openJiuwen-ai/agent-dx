@@ -12,7 +12,7 @@ impl DistributedFs {
                 .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
             while state.operation_busy
                 || state.commit_busy
-                    && (self.native_pipeline.is_none()
+                    && (self.native.pipeline.is_none()
                         || Self::in_flight_blocks_mutation(&state.in_flight))
             {
                 state = cell
@@ -53,7 +53,7 @@ impl DistributedFs {
                 .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
             while state.operation_busy
                 || state.commit_busy
-                    && (self.native_pipeline.is_none()
+                    && (self.native.pipeline.is_none()
                         || Self::in_flight_blocks_mutation(&state.in_flight))
             {
                 state = cell
@@ -241,8 +241,8 @@ impl DistributedFs {
                     .as_ref()
                     .and_then(|pin| pin.write_operation_id())
             })
-            .unwrap_or_else(|| self.operation_id(reason.label()));
-        let gc_pin = match (&frozen.dirty_extents.native_gc_pin, &self.gc_references) {
+            .unwrap_or_else(|| self.identity.operation_id(reason.label()));
+        let gc_pin = match (&frozen.dirty_extents.native_gc_pin, &self.gc.references) {
             (Some(pin), _) => Some(pin.clone()),
             (None, Some(references)) => Some(
                 references
@@ -255,13 +255,14 @@ impl DistributedFs {
             ),
             (None, None) => None,
         };
-        if self.gc_references.is_some() {
+        if self.gc.references.is_some() {
             // Length-only generations have no write-time pin. Freeze their
             // captured fence as well; preparation retries never refresh it.
             frozen.dirty_extents.native_gc_pin = gc_pin.clone();
         }
-        let generation = self.next_operation.fetch_add(1, Ordering::Relaxed);
-        let layout_id = LayoutRootId::new(format!("{}-layout-{generation}", self.session_id));
+        let generation = self.identity.next_operation.fetch_add(1, Ordering::Relaxed);
+        let layout_id =
+            LayoutRootId::new(format!("{}-layout-{generation}", self.identity.session_id));
 
         let mut native_uploads = Vec::new();
         let (layout_root, receipts) = if frozen.dirty_extents.native_operation_id.is_some() {
@@ -299,7 +300,7 @@ impl DistributedFs {
         span.record("receipts", receipts.len() as u64);
         let now = now_unix_ms();
         let version = FileVersion {
-            id: FileVersionId::new(format!("{}-version-{generation}", self.session_id)),
+            id: FileVersionId::new(format!("{}-version-{generation}", self.identity.session_id)),
             inode_id: frozen.inode.inode_id.clone(),
             parent_version: frozen
                 .base_version
@@ -310,7 +311,7 @@ impl DistributedFs {
             created_at_unix_ms: now,
         };
         let gc_fence = gc_pin.as_ref().and_then(|pin| pin.fence());
-        if self.gc_references.is_some() && gc_fence.is_none() {
+        if self.gc.references.is_some() && gc_fence.is_none() {
             return Err(PrepareCommitError {
                 error: unavailable("optimistic commit has no frozen GC fence"),
             });
@@ -343,7 +344,8 @@ impl DistributedFs {
                     .any(|extent| extent.native_descriptor.is_some()))
         {
             let pipeline = self
-                .native_pipeline
+                .native
+                .pipeline
                 .as_ref()
                 .ok_or_else(|| PrepareCommitError {
                     error: unavailable("native write pipeline is missing"),

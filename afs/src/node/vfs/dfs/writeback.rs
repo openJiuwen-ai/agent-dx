@@ -5,10 +5,10 @@ impl DistributedFs {
     /// close contract. Failures remain attached to the inode and are reported
     /// once per open writer by a later write/flush/sync operation.
     pub fn writeback_pending(&self) -> Result<usize> {
-        if self.native_pipeline.is_none() {
+        if self.native.pipeline.is_none() {
             return Ok(0);
         }
-        for (_, cell) in self.inode_writes.snapshot()? {
+        for (_, cell) in self.writes.states.snapshot()? {
             let mut state = cell
                 .lock()
                 .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
@@ -23,10 +23,10 @@ impl DistributedFs {
     pub fn renew_active_write_leases(&self) -> Result<usize> {
         // Open idle writers and unknown commits still depend on their lease.
         // Renew independently of writeback, without changing a frozen request.
-        let mut entries = self.inode_writes.snapshot()?;
+        let mut entries = self.writes.states.snapshot()?;
         entries.sort_by(|left, right| left.0.0.cmp(&right.0.0));
         if !entries.is_empty() {
-            let start = self.write_lease_cursor.load(Ordering::Relaxed) as usize % entries.len();
+            let start = self.writes.lease_cursor.load(Ordering::Relaxed) as usize % entries.len();
             entries.rotate_left(start);
         }
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -79,14 +79,21 @@ impl DistributedFs {
                 }
             }
         }
-        self.write_lease_cursor
+        self.writes
+            .lease_cursor
             .fetch_add(examined, Ordering::Relaxed);
         first_error.map_or(Ok(renewed_count), Err)
     }
 
     #[cfg(test)]
     pub(super) fn pause_after_writeback_prepare(&self) {
-        if let Some(duration) = self.writeback_after_prepare_pause.lock().unwrap().take() {
+        if let Some(duration) = self
+            .hooks
+            .writeback_after_prepare_pause
+            .lock()
+            .unwrap()
+            .take()
+        {
             std::thread::sleep(duration);
         }
     }
@@ -107,7 +114,7 @@ impl DistributedFs {
     }
 
     fn join_native_uploads_for_drain(&self) -> Result<Option<Error>> {
-        let Some(pipeline) = &self.native_pipeline else {
+        let Some(pipeline) = &self.native.pipeline else {
             return Ok(None);
         };
         let mut first_error = None;
@@ -136,7 +143,7 @@ impl DistributedFs {
         // consume a different owner's error. Node shutdown has closed admission.
         let mut join_error = self.join_native_uploads_for_drain()?;
         let result = (|| -> Result<usize> {
-            let inode_ids = self.inode_writes.keys_snapshot()?;
+            let inode_ids = self.writes.states.keys_snapshot()?;
             let mut committed = 0;
             for inode_id in inode_ids {
                 loop {

@@ -1110,7 +1110,7 @@ async fn real_grpc_unknown_file_commit_ack_blocks_inode_and_replays_exact_reques
     let handle_a = created_a.handle;
     let inode_a = fs_a.inode_id(inode_backend_a).unwrap();
     let trace_output = _temp.path().join("real-meta-pending-trace.jsonl");
-    Arc::get_mut(&mut fs_a).unwrap().pending_trace = Some(PendingTrace::test_gate(
+    Arc::get_mut(&mut fs_a).unwrap().commit.pending_trace = Some(PendingTrace::test_gate(
         &trace_output,
         "default",
         "node-a",

@@ -226,6 +226,24 @@ impl NativeTicketQueue {
     }
 }
 
+/// Native write resources: the upload pipeline (installed by the Node
+/// assembly, absent in plain unit fixtures) and the staging buffer pool.
+pub(super) struct NativeWrites {
+    pub(super) pipeline: Option<Arc<NativeWritePipeline>>,
+    pub(super) buffer_pool: Arc<WriteBufferPool>,
+}
+
+impl Default for NativeWrites {
+    fn default() -> Self {
+        Self {
+            // 原生存储的写流水线由装配方用 `with_native_write_pipeline` 装上（需要 Node runtime）；
+            // 构造时不装，避免出现只在测试里存在的"无 runtime 流水线"。
+            pipeline: None,
+            buffer_pool: WriteBufferPool::new(128 * 1024 * 1024),
+        }
+    }
+}
+
 pub(super) struct NativeWritePipeline {
     pub(super) budget: Arc<NativeWriteBudget>,
     pub(super) metadata: Arc<NativeMetadataBudget>,

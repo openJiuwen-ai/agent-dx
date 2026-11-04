@@ -70,397 +70,42 @@ impl Backend for DistributedFs {
 
     fn getlk(
         &self,
-        _: &RequestContext,
+        ctx: &RequestContext,
         inode: BackendInode,
         handle: FileHandle,
         request: LockRequest,
     ) -> Result<Option<FileLockConflict>> {
-        let (inode_id, _) = self.validate_lock_handle(inode, handle, Some(&request))?;
-        let request = self.scoped_local_lock_request(request)?;
-        self.ensure_lock_session_open(&request.owner.ingress_session_id)?;
-        match self.lock_authority_for(&inode_id)? {
-            DfsLockTarget::Local(authority) => {
-                self.check_lock_renewal(&authority)?;
-                authority
-                    .table
-                    .getlk(&request)
-                    .map_err(lock_error)
-                    .map(|conflict| conflict.map(Self::raw_lock_conflict))
-            }
-            DfsLockTarget::Remote(remote) => {
-                let reply =
-                    remote
-                        .owner
-                        .get_lock(afs_protocol::node_control::DfsOwnerGetLockRequest {
-                            authority: Some(remote.authority),
-                            lock: Some(Self::wire_lock_request(&request)),
-                        })?;
-                reply
-                    .conflict
-                    .map(Self::file_lock_conflict_from_wire)
-                    .transpose()
-            }
-        }
+        self.lock_entry_getlk(ctx, inode, handle, request)
     }
 
     fn setlk(
         &self,
-        _: &RequestContext,
+        ctx: &RequestContext,
         inode: BackendInode,
         handle: FileHandle,
         request: LockRequest,
         waiter: Option<LockWaiterId>,
     ) -> Result<()> {
-        let (inode_id, _) = self.validate_lock_handle(inode, handle, Some(&request))?;
-        let request = self.scoped_local_lock_request(request)?;
-        let waiter = waiter
-            .map(|waiter| self.scoped_local_lock_waiter(waiter))
-            .transpose()?;
-        if request.lock_type != FileLockType::Unlock {
-            self.ensure_lock_session_open(&request.owner.ingress_session_id)?;
-        }
-        if let Some(waiter) = waiter.as_ref() {
-            if waiter.ingress_session_id != request.owner.ingress_session_id {
-                return Err(invalid("DFS lock waiter scope does not match owner scope"));
-            }
-            if request.lock_type != FileLockType::Unlock {
-                self.ensure_lock_session_open(&waiter.ingress_session_id)?;
-            }
-        }
-        match self.lock_authority_for(&inode_id)? {
-            DfsLockTarget::Local(authority) => {
-                self.check_lock_renewal(&authority)?;
-                if let Some(waiter_id) = waiter.clone() {
-                    self.register_lock_waiter(&authority, &waiter_id)?;
-                    let result = authority
-                        .table
-                        .setlk_blocking(request.clone(), waiter_id.clone())
-                        .map_err(lock_error);
-                    self.unpin_lock_waiter(&authority, waiter.as_ref())?;
-                    if result.is_ok() {
-                        self.register_local_lock_success(&authority, &request)?;
-                        authority
-                            .table
-                            .acknowledge_waiter(&waiter_id)
-                            .map_err(lock_error)?;
-                        self.check_lock_renewal_after_mutation(&authority)?;
-                    } else if result
-                        .as_ref()
-                        .err()
-                        .is_some_and(|error| error.code() == afs_error::IO_INTERRUPTED)
-                    {
-                        authority
-                            .table
-                            .acknowledge_waiter(&waiter_id)
-                            .map_err(lock_error)?;
-                    }
-                    result
-                } else {
-                    let result = authority
-                        .table
-                        .setlk_nonblocking(request.clone())
-                        .map_err(lock_error);
-                    if result.is_ok() {
-                        self.register_local_lock_success(&authority, &request)?;
-                        self.check_lock_renewal_after_mutation(&authority)?;
-                    }
-                    result
-                }
-            }
-            DfsLockTarget::Remote(remote) => {
-                let pins_remote_session = request.lock_type != FileLockType::Unlock;
-                let remote_session_was_new = if pins_remote_session {
-                    self.note_remote_lock_session(&inode_id, &request.owner.ingress_session_id)?
-                } else {
-                    false
-                };
-                if let Some(waiter_id) = waiter.as_ref()
-                    && let Err(error) =
-                        self.register_remote_lock_waiter_route(waiter_id, remote.clone())
-                {
-                    if remote_session_was_new {
-                        self.forget_remote_lock_session(
-                            &inode_id,
-                            &request.owner.ingress_session_id,
-                        )?;
-                    }
-                    return Err(error);
-                }
-                let result =
-                    remote
-                        .owner
-                        .set_lock(afs_protocol::node_control::DfsOwnerSetLockRequest {
-                            authority: Some(remote.authority.clone()),
-                            lock: Some(Self::wire_lock_request(&request)),
-                            waiter: waiter.as_ref().map(Self::wire_lock_waiter),
-                        });
-                if result
-                    .as_ref()
-                    .err()
-                    .is_some_and(|error| error.code() == afs_error::IO_INTERRUPTED)
-                    && let Some(waiter_id) = waiter.as_ref()
-                {
-                    self.mark_cancelled_remote_lock_waiter(waiter_id)?;
-                    if remote_session_was_new {
-                        self.forget_remote_lock_session(
-                            &inode_id,
-                            &request.owner.ingress_session_id,
-                        )?;
-                    }
-                    return Err(lock_error(LockError::Interrupted));
-                }
-                if result.is_err()
-                    && waiter.is_some()
-                    && let Some(waiter_id) = waiter.as_ref()
-                {
-                    match remote.owner.cancel_lock_wait(
-                        afs_protocol::node_control::DfsOwnerCancelLockWaitRequest {
-                            authority: Some(remote.authority.clone()),
-                            waiter: Some(Self::wire_lock_waiter(waiter_id)),
-                        },
-                    ) {
-                        Ok(reply) if reply.outcome == 1 => {
-                            let ack = remote.owner.acknowledge_lock_wait(
-                                afs_protocol::node_control::DfsOwnerAcknowledgeLockWaitRequest {
-                                    authority: Some(remote.authority.clone()),
-                                    waiter: Some(Self::wire_lock_waiter(waiter_id)),
-                                },
-                            );
-                            if ack.is_err() {
-                                self.mark_cancelled_remote_lock_waiter(waiter_id)?;
-                                return Err(unavailable(
-                                    "DFS remote lock cancellation could not be acknowledged; waiter identity retained",
-                                ));
-                            }
-                            self.cleanup_acknowledged_remote_lock_waiter(waiter_id)?;
-                            if remote_session_was_new {
-                                self.forget_remote_lock_session(
-                                    &inode_id,
-                                    &request.owner.ingress_session_id,
-                                )?;
-                            }
-                            return Err(lock_error(LockError::Interrupted));
-                        }
-                        Ok(reply) if reply.outcome == 2 => {
-                            let ack = remote.owner.acknowledge_lock_wait(
-                                afs_protocol::node_control::DfsOwnerAcknowledgeLockWaitRequest {
-                                    authority: Some(remote.authority.clone()),
-                                    waiter: Some(Self::wire_lock_waiter(waiter_id)),
-                                },
-                            );
-                            if ack.is_ok() {
-                                self.cleanup_acknowledged_remote_lock_waiter(waiter_id)?;
-                            } else {
-                                self.mark_cancelled_remote_lock_waiter(waiter_id)?;
-                            }
-                            return Ok(());
-                        }
-                        _ => {
-                            return Err(unavailable(
-                                "DFS remote lock cancellation outcome is unknown; waiter identity retained",
-                            ));
-                        }
-                    }
-                }
-                if result.is_ok()
-                    && let Some(waiter_id) = waiter.as_ref()
-                {
-                    let ack = remote.owner.acknowledge_lock_wait(
-                        afs_protocol::node_control::DfsOwnerAcknowledgeLockWaitRequest {
-                            authority: Some(remote.authority.clone()),
-                            waiter: Some(Self::wire_lock_waiter(waiter_id)),
-                        },
-                    );
-                    if ack.is_ok() {
-                        self.cleanup_acknowledged_remote_lock_waiter(waiter_id)?;
-                    } else {
-                        self.mark_cancelled_remote_lock_waiter(waiter_id)?;
-                    }
-                }
-                result.map(|_| ())
-            }
-        }
+        self.lock_entry_setlk(ctx, inode, handle, request, waiter)
     }
 
     fn cancel_lock_wait(&self, waiter: LockWaiterId) -> Result<()> {
-        let waiter = self.scoped_local_lock_waiter(waiter)?;
-        if let Some(remote) = self.take_remote_lock_waiter_route_or_precancel(waiter.clone())? {
-            let authority = remote.authority.clone();
-            let reply = remote.owner.cancel_lock_wait(
-                afs_protocol::node_control::DfsOwnerCancelLockWaitRequest {
-                    authority: Some(authority.clone()),
-                    waiter: Some(Self::wire_lock_waiter(&waiter)),
-                },
-            )?;
-            match reply.outcome {
-                1 => {
-                    match remote.owner.acknowledge_lock_wait(
-                        afs_protocol::node_control::DfsOwnerAcknowledgeLockWaitRequest {
-                            authority: Some(authority.clone()),
-                            waiter: Some(Self::wire_lock_waiter(&waiter)),
-                        },
-                    ) {
-                        Ok(_) => {
-                            self.cleanup_acknowledged_remote_lock_waiter(&waiter)?;
-                        }
-                        Err(error) => {
-                            self.mark_cancelled_remote_lock_waiter(&waiter)?;
-                            return Err(error);
-                        }
-                    }
-                }
-                2 => {
-                    let ack = remote.owner.acknowledge_lock_wait(
-                        afs_protocol::node_control::DfsOwnerAcknowledgeLockWaitRequest {
-                            authority: Some(authority),
-                            waiter: Some(Self::wire_lock_waiter(&waiter)),
-                        },
-                    );
-                    if ack.is_ok() {
-                        self.cleanup_acknowledged_remote_lock_waiter(&waiter)?;
-                    } else {
-                        self.mark_cancelled_remote_lock_waiter(&waiter)?;
-                    }
-                }
-                _ => {
-                    return Err(Error::coded(
-                        afs_error::IO_OTHER,
-                        "DFS remote lock cancellation outcome is unknown",
-                    ));
-                }
-            }
-            return Ok(());
-        }
-        let authorities = self.lock_authorities.values_snapshot()?;
-        let mut last_error = None;
-        for authority in authorities {
-            match authority
-                .table
-                .cancel_waiter_with_outcome(waiter.clone())
-                .map_err(lock_error)
-            {
-                Ok(LockWaiterOutcome::Unknown) => {
-                    last_error = Some(Error::coded(
-                        afs_error::IO_OTHER,
-                        "DFS local lock cancellation outcome is unknown",
-                    ));
-                }
-                Ok(LockWaiterOutcome::Cancelled | LockWaiterOutcome::Granted) => {}
-                Err(error) => last_error = Some(error),
-            }
-            authority
-                .state
-                .lock()
-                .map_err(|_| unavailable("DFS lock authority state is poisoned"))?
-                .waiters
-                .remove(&waiter);
-        }
-        if let Some(error) = last_error {
-            return Err(error);
-        }
-        Ok(())
+        self.lock_entry_cancel_lock_wait(waiter)
     }
 
     fn release_locks(
         &self,
-        _: &RequestContext,
+        ctx: &RequestContext,
         inode: BackendInode,
         handle: FileHandle,
         owner: FileLockOwner,
         kind: ReleaseKind,
     ) -> Result<()> {
-        let (inode_id, _) = self.validate_lock_handle(inode, handle, None)?;
-        let owner = self.scoped_local_lock_owner(owner)?;
-        match self.existing_lock_authority_for(&inode_id)? {
-            Some(DfsLockTarget::Local(authority)) => {
-                match kind {
-                    ReleaseKind::PosixOwner => authority.table.release_posix_owner(&owner),
-                    ReleaseKind::FlockOwner => authority.table.release_flock_owner(&owner),
-                }
-                .map_err(lock_error)?;
-                self.unpin_owner_if_inactive(
-                    &authority,
-                    &owner,
-                    Some(match kind {
-                        ReleaseKind::PosixOwner => FileLockKind::Posix,
-                        ReleaseKind::FlockOwner => FileLockKind::Flock,
-                    }),
-                )?;
-                Ok(())
-            }
-            Some(DfsLockTarget::Remote(remote)) => {
-                remote.owner.release_locks(
-                    afs_protocol::node_control::DfsOwnerReleaseLocksRequest {
-                        authority: Some(remote.authority),
-                        owner: Some(Self::wire_lock_owner(&owner)),
-                        release_kind: Self::wire_lock_release_kind(kind) as i32,
-                    },
-                )?;
-                // Keep remote session presence until explicit session close. Releasing one
-                // kernel owner does not prove that this mount has no remaining locks.
-                Ok(())
-            }
-            None => Ok(()),
-        }
+        self.lock_entry_release_locks(ctx, inode, handle, owner, kind)
     }
 
     fn release_lock_session(&self, ingress_session_id: &str) -> Result<()> {
-        let scoped_session = Self::lock_scope(&self.node_id, &self.session_id, ingress_session_id)?;
-        let ingress_session_id = scoped_session.as_str();
-        self.note_closed_lock_session(ingress_session_id)?;
-        let authorities = self.lock_authorities.values_snapshot()?;
-        let mut errors = Vec::new();
-        for authority in authorities {
-            if let Err(error) = authority
-                .table
-                .release_session(ingress_session_id)
-                .map_err(lock_error)
-            {
-                errors.push(error);
-                continue;
-            }
-            let mut state = authority
-                .state
-                .lock()
-                .map_err(|_| unavailable("DFS lock authority state is poisoned"))?;
-            state
-                .pinned_owners
-                .retain(|owner| owner.ingress_session_id != ingress_session_id);
-            state
-                .waiters
-                .retain(|waiter| waiter.ingress_session_id != ingress_session_id);
-        }
-        let remotes = self
-            .remote_lock_authorities
-            .lock()
-            .map_err(|_| unavailable("DFS remote lock authority table is poisoned"))?
-            .iter()
-            .map(|(inode_id, remote)| (inode_id.clone(), remote.clone()))
-            .collect::<Vec<_>>();
-        for (inode_id, remote) in &remotes {
-            let has_session = self
-                .remote_lock_authority_sessions
-                .lock()
-                .map_err(|_| unavailable("DFS remote lock authority session table is poisoned"))?
-                .get(inode_id)
-                .is_some_and(|sessions| sessions.contains_key(ingress_session_id));
-            if !has_session {
-                continue;
-            }
-            self.mark_remote_lock_session_pending_close(inode_id, ingress_session_id)?;
-            if let Err(error) = self.release_remote_lock_session_once(
-                inode_id,
-                remote,
-                ingress_session_id,
-                REMOTE_RELEASE_RPC_BUDGET,
-            ) {
-                errors.push(error);
-            }
-        }
-        if let Some(error) = errors.into_iter().next() {
-            return Err(error);
-        }
-        Ok(())
+        self.lock_entry_release_lock_session(ingress_session_id)
     }
 
     fn lookup(&self, _: &RequestContext, parent: BackendInode, name: &OsStr) -> Result<Entry> {
@@ -556,7 +201,7 @@ impl Backend for DistributedFs {
         let mut killpriv_setattr = false;
         let _native_ticket = if let Some(cell) = self.write_state(&inode_id)? {
             let ticket = self.native_ticket(&cell)?;
-            if self.native_pipeline.is_some() {
+            if self.native.pipeline.is_some() {
                 drop(self.begin_inode_operation(&inode_id, cell)?);
             }
             ticket
@@ -599,8 +244,8 @@ impl Backend for DistributedFs {
             let current = self.validate_inode(self.meta.get_inode(&inode_id)?)?;
             let updated = self.refresh_inode_record(
                 self.meta.set_inode_attributes(SetInodeAttrRequest {
-                    caller_id: self.node_id.clone(),
-                    operation_id: self.operation_id("setattr"),
+                    caller_id: self.identity.node_id.clone(),
+                    operation_id: self.identity.operation_id("setattr"),
                     caller: caller_context(ctx),
                     inode_id: inode_id.clone(),
                     expected_inode_revision: current.revision,
@@ -672,8 +317,8 @@ impl Backend for DistributedFs {
             if record.kind != InodeKind::Regular {
                 return Err(Error::from(std::io::Error::from_raw_os_error(libc::EISDIR)));
             }
-            if write_lease.owner_node_id == self.node_id
-                && write_lease.owner_session_id == self.session_id
+            if write_lease.owner_node_id == self.identity.node_id
+                && write_lease.owner_session_id == self.identity.session_id
             {
                 self.install_write_state(record.clone(), write_lease)?;
                 self.resize_dirty_inode(&record.inode_id, length, options.kill_suidgid)?;
@@ -751,7 +396,7 @@ impl Backend for DistributedFs {
             mode
         };
         let (inode, write_lease) = self.meta.create(
-            &self.operation_id("create"),
+            &self.identity.operation_id("create"),
             &self.inode_id(parent)?,
             name.as_encoded_bytes(),
             InodeAttributes {
@@ -798,9 +443,9 @@ impl Backend for DistributedFs {
     ) -> Result<Entry> {
         let now = now_unix_ms();
         let inode = self.validate_inode(self.meta.mknod(MknodRequest {
-            caller_id: self.node_id.clone(),
-            operation_id: self.operation_id("mknod"),
-            namespace_id: self.namespace_id.clone(),
+            caller_id: self.identity.node_id.clone(),
+            operation_id: self.identity.operation_id("mknod"),
+            namespace_id: self.identity.namespace_id.clone(),
             parent_inode_id: self.inode_id(parent)?,
             name: name.as_encoded_bytes().to_vec(),
             kind: dfs_special_kind(kind),
@@ -854,8 +499,8 @@ impl Backend for DistributedFs {
         let (opened_inode, write_session) = if writable {
             let (inode, write_lease) = self.meta.resolve_write_authority(&inode_id)?;
             let inode = self.validate_inode(inode)?;
-            let session = if write_lease.owner_node_id == self.node_id
-                && write_lease.owner_session_id == self.session_id
+            let session = if write_lease.owner_node_id == self.identity.node_id
+                && write_lease.owner_session_id == self.identity.session_id
             {
                 self.install_write_state(inode.clone(), write_lease.clone())?;
                 let session = self.open_write_session(&inode, flags)?;
@@ -1049,7 +694,7 @@ impl Backend for DistributedFs {
     }
 
     fn accepts_queued_writes(&self, handle: FileHandle) -> bool {
-        self.native_pipeline.is_some()
+        self.native.pipeline.is_some()
             && self.handle_snapshot(handle).ok().is_some_and(|snapshot| {
                 snapshot.flags & libc::O_ACCMODE != libc::O_RDONLY
                     && snapshot.flags & libc::O_APPEND == 0
@@ -1066,7 +711,7 @@ impl Backend for DistributedFs {
         // Native admission may wait for mutation/publication or shared body
         // capacity. Keep those waits on a worker so the FUSE receiver can
         // admit unrelated reads and writeback needed to make progress.
-        if self.native_pipeline.is_some() {
+        if self.native.pipeline.is_some() {
             return WriteAdmissionMode::Queued;
         }
         if self
@@ -1114,7 +759,7 @@ impl Backend for DistributedFs {
         if data.is_empty() {
             return Ok(0);
         }
-        if self.native_pipeline.is_none() {
+        if self.native.pipeline.is_none() {
             return Err(unavailable(
                 "DFS store has no native write pipeline configured",
             ));
@@ -1198,12 +843,15 @@ impl Backend for DistributedFs {
                 destination_offset: range.destination_offset,
                 length,
             };
-            let generation = self.next_operation.fetch_add(1, Ordering::Relaxed);
+            let generation = self.identity.next_operation.fetch_add(1, Ordering::Relaxed);
             let layout = crate::dfs::clone_file_layout(
                 &state.base_layout,
                 &source_layout,
                 &clone_source,
-                LayoutRootId::new(format!("{}-cow-layout-{generation}", self.session_id)),
+                LayoutRootId::new(format!(
+                    "{}-cow-layout-{generation}",
+                    self.identity.session_id
+                )),
             )?;
             let now = now_unix_ms();
             state.next_write_seq = state.next_write_seq.saturating_add(1);
@@ -1225,13 +873,16 @@ impl Backend for DistributedFs {
             };
             let commit = CommitFileVersion {
                 gc_fence: None,
-                operation_id: self.operation_id("cow-copy"),
+                operation_id: self.identity.operation_id("cow-copy"),
                 inode_id: destination.inode_id.clone(),
                 write_lease: state.write_lease.clone(),
                 expected_inode_revision: state.inode.revision,
                 expected_head_version: state.inode.head_version.clone(),
                 file_version: FileVersion {
-                    id: FileVersionId::new(format!("{}-cow-version-{generation}", self.session_id)),
+                    id: FileVersionId::new(format!(
+                        "{}-cow-version-{generation}",
+                        self.identity.session_id
+                    )),
                     inode_id: destination.inode_id.clone(),
                     parent_version: state.inode.head_version.clone(),
                     length: layout.file_length,
@@ -1257,6 +908,7 @@ impl Backend for DistributedFs {
                     _native_uploads: Vec::new(),
                 },
                 trace_send_attempt: self
+                    .commit
                     .pending_trace
                     .as_ref()
                     .map(|_| Arc::new(AtomicU64::new(0))),
@@ -1345,8 +997,9 @@ impl Backend for DistributedFs {
             .into_iter()
             .map(|entry| self.directory_entry(entry))
             .collect::<Result<Vec<_>>>()?;
-        let id = self.next_handle.fetch_add(1, Ordering::Relaxed);
-        self.dir_handles
+        let id = self.handles.next_id();
+        self.handles
+            .directories
             .lock()
             .map_err(|_| unavailable("DFS directory handle table is poisoned"))?
             .insert(
@@ -1354,7 +1007,8 @@ impl Backend for DistributedFs {
                 DfsDirectoryHandle {
                     entries,
                     _gc_pin: self
-                        .gc_references
+                        .gc
+                        .references
                         .as_ref()
                         .map(|references| references.pin(&inode_id, None, None))
                         .transpose()?,
@@ -1371,7 +1025,8 @@ impl Backend for DistributedFs {
         max_entries: usize,
     ) -> Result<Vec<DirectoryEntry>> {
         let handles = self
-            .dir_handles
+            .handles
+            .directories
             .lock()
             .map_err(|_| unavailable("DFS directory handle table is poisoned"))?;
         let directory = handles
@@ -1382,7 +1037,8 @@ impl Backend for DistributedFs {
 
     fn fsyncdir(&self, _: &RequestContext, handle: DirectoryHandle, _: SyncMode) -> Result<()> {
         let handles = self
-            .dir_handles
+            .handles
+            .directories
             .lock()
             .map_err(|_| unavailable("DFS directory handle table is poisoned"))?;
         handles
@@ -1392,7 +1048,8 @@ impl Backend for DistributedFs {
     }
 
     fn releasedir(&self, _: &RequestContext, handle: DirectoryHandle) -> Result<()> {
-        self.dir_handles
+        self.handles
+            .directories
             .lock()
             .map_err(|_| unavailable("DFS directory handle table is poisoned"))?
             .remove(&handle.0)
@@ -1409,7 +1066,7 @@ impl Backend for DistributedFs {
     ) -> Result<Entry> {
         let now = now_unix_ms();
         let inode = self.validate_inode(self.meta.mkdir(
-            &self.operation_id("mkdir"),
+            &self.identity.operation_id("mkdir"),
             &self.inode_id(parent)?,
             name.as_encoded_bytes(),
             InodeAttributes {
@@ -1432,7 +1089,7 @@ impl Backend for DistributedFs {
     fn unlink(&self, ctx: &RequestContext, parent: BackendInode, name: &OsStr) -> Result<()> {
         self.refresh_inode_record(
             self.meta.unlink(
-                &self.operation_id("unlink"),
+                &self.identity.operation_id("unlink"),
                 &self.inode_id(parent)?,
                 name.as_encoded_bytes(),
                 caller_context(ctx),
@@ -1446,7 +1103,7 @@ impl Backend for DistributedFs {
     fn rmdir(&self, ctx: &RequestContext, parent: BackendInode, name: &OsStr) -> Result<()> {
         self.refresh_inode_record(
             self.meta.rmdir(
-                &self.operation_id("rmdir"),
+                &self.identity.operation_id("rmdir"),
                 &self.inode_id(parent)?,
                 name.as_encoded_bytes(),
                 caller_context(ctx),
@@ -1468,7 +1125,7 @@ impl Backend for DistributedFs {
     ) -> Result<()> {
         let mode = rename_mode(flags)?;
         let outcome = self.meta.rename(
-            &self.operation_id("rename"),
+            &self.identity.operation_id("rename"),
             &self.inode_id(from_parent)?,
             from_name.as_encoded_bytes(),
             &self.inode_id(to_parent)?,
@@ -1492,9 +1149,9 @@ impl Backend for DistributedFs {
     ) -> Result<Entry> {
         let now = now_unix_ms();
         let inode = self.validate_inode(self.meta.symlink(SymlinkRequest {
-            caller_id: self.node_id.clone(),
-            operation_id: self.operation_id("symlink"),
-            namespace_id: self.namespace_id.clone(),
+            caller_id: self.identity.node_id.clone(),
+            operation_id: self.identity.operation_id("symlink"),
+            namespace_id: self.identity.namespace_id.clone(),
             parent_inode_id: self.inode_id(parent)?,
             name: name.as_encoded_bytes().to_vec(),
             target: target.as_encoded_bytes().to_vec(),
@@ -1517,7 +1174,7 @@ impl Backend for DistributedFs {
 
     fn readlink(&self, _: &RequestContext, inode: BackendInode) -> Result<OsString> {
         let target = self.meta.read_link(ReadLinkRequest {
-            namespace_id: self.namespace_id.clone(),
+            namespace_id: self.identity.namespace_id.clone(),
             inode_id: self.inode_id(inode)?,
         })?;
         Ok(OsString::from_vec(target))
@@ -1534,7 +1191,7 @@ impl Backend for DistributedFs {
         let current = self.validate_inode(self.meta.get_inode(&inode_id)?)?;
         let linked = self.refresh_inode_record(
             self.meta.link(
-                &self.operation_id("link"),
+                &self.identity.operation_id("link"),
                 &inode_id,
                 current.revision,
                 &self.inode_id(new_parent)?,
@@ -1595,8 +1252,8 @@ impl Backend for DistributedFs {
         let current = self.validate_inode(self.meta.get_inode(&inode_id)?)?;
         self.refresh_inode_record(
             self.meta.set_xattr(SetXattrRequest {
-                caller_id: self.node_id.clone(),
-                operation_id: self.operation_id("setxattr"),
+                caller_id: self.identity.node_id.clone(),
+                operation_id: self.identity.operation_id("setxattr"),
                 caller: caller_context(ctx),
                 inode_id,
                 expected_inode_revision: current.revision,
@@ -1615,8 +1272,8 @@ impl Backend for DistributedFs {
         let current = self.validate_inode(self.meta.get_inode(&inode_id)?)?;
         self.refresh_inode_record(
             self.meta.remove_xattr(RemoveXattrRequest {
-                caller_id: self.node_id.clone(),
-                operation_id: self.operation_id("removexattr"),
+                caller_id: self.identity.node_id.clone(),
+                operation_id: self.identity.operation_id("removexattr"),
                 caller: caller_context(ctx),
                 inode_id,
                 expected_inode_revision: current.revision,

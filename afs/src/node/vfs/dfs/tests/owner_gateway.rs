@@ -4,12 +4,13 @@ use super::*;
 fn owner_open_open_write_failure_clears_inflight_admission() {
     let (_temp, meta, fs) = test_fs();
     meta.fail_next_open_write_with(unavailable("injected open_write failure"));
-    let error = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
-        &fs,
-        "node-b",
-        dfs_owner_open_request(1, libc::O_RDWR),
-    )
-    .unwrap_err();
+    let error =
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
+            &fs,
+            "node-b",
+            dfs_owner_open_request(1, libc::O_RDWR),
+        )
+        .unwrap_err();
     assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE);
     let routes = fs.owner_open_routes.lock().unwrap();
     let state = routes.values().next().unwrap();
@@ -25,12 +26,13 @@ fn owner_open_resolves_fresh_authority_without_legacy_open_write() {
     let opens_before = meta.open_write_calls.load(Ordering::SeqCst);
     let resolve_before = meta.resolve_write_calls.load(Ordering::SeqCst);
 
-    let reply = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
-        &fs,
-        "node-b",
-        dfs_owner_open_request(1, libc::O_RDWR),
-    )
-    .unwrap();
+    let reply =
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
+            &fs,
+            "node-b",
+            dfs_owner_open_request(1, libc::O_RDWR),
+        )
+        .unwrap();
     assert!(reply.handle.is_some());
 
     assert_eq!(
@@ -54,7 +56,7 @@ fn owner_open_rejects_stale_request_epoch_after_fresh_write_authority_reacquire(
         lease.expires_at_unix_ms = now_unix_ms().saturating_add(30_000);
     }
 
-    let error = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
+    let error = <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
             &fs,
             "node-b",
             dfs_owner_open_request(1, libc::O_RDWR),
@@ -87,7 +89,7 @@ fn owner_open_rejects_epoch_changed_by_legacy_reacquire_after_resolver_reply() {
     epoch_two.expires_at_unix_ms = now_unix_ms().saturating_add(30_000);
     meta.queue_open_write_result(Ok((inode, epoch_two)));
 
-    let error = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
+    let error = <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
             &fs,
             "node-b",
             dfs_owner_open_request(1, libc::O_RDWR),
@@ -108,12 +110,13 @@ fn owner_open_rejects_epoch_changed_by_legacy_reacquire_after_resolver_reply() {
     let state = fs.write_state(&inode_id).unwrap().unwrap();
     assert_eq!(state.lock().unwrap().open_writers, 0);
 
-    let replay = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
-        &fs,
-        "node-b",
-        dfs_owner_open_request(1, libc::O_RDWR),
-    )
-    .expect_err("failed owner admission sequence must be retired");
+    let replay =
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
+            &fs,
+            "node-b",
+            dfs_owner_open_request(1, libc::O_RDWR),
+        )
+        .expect_err("failed owner admission sequence must be retired");
     assert_eq!(replay.code(), afs_error::NODE_DFS_STALE_HANDLE);
     assert!(fs.handles.is_empty());
 }
@@ -122,12 +125,13 @@ fn owner_open_rejects_epoch_changed_by_legacy_reacquire_after_resolver_reply() {
 fn owner_open_validate_inode_failure_clears_inflight_admission() {
     let (_temp, meta, fs) = test_fs();
     meta.return_bad_namespace_on_next_open_write();
-    let error = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
-        &fs,
-        "node-b",
-        dfs_owner_open_request(1, libc::O_RDWR),
-    )
-    .unwrap_err();
+    let error =
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
+            &fs,
+            "node-b",
+            dfs_owner_open_request(1, libc::O_RDWR),
+        )
+        .unwrap_err();
     assert_eq!(error.code(), afs_error::NODE_VFS_INVALID);
     let routes = fs.owner_open_routes.lock().unwrap();
     let state = routes.values().next().unwrap();
@@ -141,29 +145,32 @@ fn owner_open_validate_inode_failure_clears_inflight_admission() {
 fn owner_open_replay_returns_same_handle_and_changed_fingerprint_is_rejected() {
     let (_temp, _meta, fs) = test_fs();
     let request = dfs_owner_open_request(1, libc::O_RDWR);
-    let first = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
-        &fs,
-        "node-b",
-        request.clone(),
-    )
-    .unwrap()
-    .handle
-    .unwrap();
-    let replay = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
-        &fs, "node-b", request,
-    )
-    .unwrap()
-    .handle
-    .unwrap();
+    let first =
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
+            &fs,
+            "node-b",
+            request.clone(),
+        )
+        .unwrap()
+        .handle
+        .unwrap();
+    let replay =
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
+            &fs, "node-b", request,
+        )
+        .unwrap()
+        .handle
+        .unwrap();
     assert_eq!(replay.opaque_handle, first.opaque_handle);
     assert_eq!(fs.handles.len(), 1);
 
-    let changed = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
-        &fs,
-        "node-b",
-        dfs_owner_open_request(1, libc::O_WRONLY),
-    )
-    .unwrap_err();
+    let changed =
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
+            &fs,
+            "node-b",
+            dfs_owner_open_request(1, libc::O_WRONLY),
+        )
+        .unwrap_err();
     assert_eq!(changed.code(), afs_error::NODE_DFS_STALE_HANDLE);
     assert_eq!(fs.handles.len(), 1);
 }
@@ -171,7 +178,7 @@ fn owner_open_replay_returns_same_handle_and_changed_fingerprint_is_rejected() {
 #[test]
 fn owner_open_cleanup_identity_cancels_late_open_without_allocation() {
     let (_temp, _meta, fs) = test_fs();
-    <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::release(
         &fs,
         "node-b",
         afs_protocol::node_control::DfsOwnerReleaseRequest {
@@ -180,7 +187,7 @@ fn owner_open_cleanup_identity_cancels_late_open_without_allocation() {
     )
     .unwrap();
 
-    let late = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
+    let late = <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
         &fs,
         "node-b",
         dfs_owner_open_request(1, libc::O_RDWR),
@@ -190,7 +197,7 @@ fn owner_open_cleanup_identity_cancels_late_open_without_allocation() {
     assert!(fs.handles.is_empty());
 
     let phantom = DistributedFs::data_owner_handle(&dfs_owner_cleanup_handle(2));
-    let read = <DistributedFs as crate::node::rpc::data::DfsOwnerFilesHandler>::read(
+    let read = <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerFilesHandler>::read(
         &fs,
         "node-b",
         afs_protocol::node_data::DfsOwnerReadRequest {
@@ -207,7 +214,7 @@ fn owner_open_cleanup_identity_cancels_late_open_without_allocation() {
 fn long_lived_low_open_sequence_does_not_block_later_admissions() {
     let (_temp, _meta, fs) = test_fs();
     for seq in 1..=5000 {
-        <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
             &fs,
             "node-b",
             dfs_owner_open_request(seq, libc::O_RDWR),
@@ -221,7 +228,7 @@ fn long_lived_low_open_sequence_does_not_block_later_admissions() {
 fn owner_open_unknown_cleanup_advances_highwater_without_tombstone_growth() {
     let (_temp, _meta, fs) = test_fs();
     for seq in 1..=MAX_PENDING_REMOTE_RELEASES as u64 + 10 {
-        <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::release(
             &fs,
             "node-b",
             afs_protocol::node_control::DfsOwnerReleaseRequest {
@@ -236,14 +243,14 @@ fn owner_open_unknown_cleanup_advances_highwater_without_tombstone_growth() {
     assert_eq!(state.inflight.len(), 0);
     assert_eq!(state.highwater, MAX_PENDING_REMOTE_RELEASES as u64 + 10);
     drop(routes);
-    let old = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
+    let old = <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
         &fs,
         "node-b",
         dfs_owner_open_request(1, libc::O_RDWR),
     )
     .unwrap_err();
     assert_eq!(old.code(), afs_error::NODE_DFS_STALE_HANDLE);
-    <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
         &fs,
         "node-b",
         dfs_owner_open_request(MAX_PENDING_REMOTE_RELEASES as u64 + 11, libc::O_RDWR),
@@ -262,21 +269,22 @@ fn owner_open_inflight_cleanup_wrong_scope_does_not_cancel() {
     ));
     let mut wrong = dfs_owner_cleanup_handle(1);
     wrong.inode_id = "inode:wrong".into();
-    let error = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release(
-        &fs,
-        "node-b",
-        afs_protocol::node_control::DfsOwnerReleaseRequest {
-            handle: Some(wrong),
-        },
-    )
-    .unwrap_err();
+    let error =
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::release(
+            &fs,
+            "node-b",
+            afs_protocol::node_control::DfsOwnerReleaseRequest {
+                handle: Some(wrong),
+            },
+        )
+        .unwrap_err();
     assert_eq!(error.code(), afs_error::NODE_DFS_STALE_HANDLE);
     let routes = fs.owner_open_routes.lock().unwrap();
     let state = routes.values().next().unwrap();
     assert_eq!(state.cancelled.len(), 0);
     assert_eq!(state.inflight.len(), 1);
     drop(routes);
-    <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::release(
         &fs,
         "node-b",
         afs_protocol::node_control::DfsOwnerReleaseRequest {
@@ -293,32 +301,35 @@ fn owner_open_inflight_cleanup_wrong_scope_does_not_cancel() {
 fn owner_open_cleanup_wrong_scope_does_not_close_active_handle() {
     let (_temp, _meta, fs) = test_fs();
     let request = dfs_owner_open_request(1, libc::O_RDWR);
-    let handle = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
-        &fs,
-        "node-b",
-        request.clone(),
-    )
-    .unwrap()
-    .handle
-    .unwrap();
+    let handle =
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
+            &fs,
+            "node-b",
+            request.clone(),
+        )
+        .unwrap()
+        .handle
+        .unwrap();
     let mut wrong = dfs_owner_cleanup_handle(1);
     wrong.inode_id = "inode:wrong".into();
-    let error = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release(
-        &fs,
-        "node-b",
-        afs_protocol::node_control::DfsOwnerReleaseRequest {
-            handle: Some(wrong),
-        },
-    )
-    .unwrap_err();
+    let error =
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::release(
+            &fs,
+            "node-b",
+            afs_protocol::node_control::DfsOwnerReleaseRequest {
+                handle: Some(wrong),
+            },
+        )
+        .unwrap_err();
     assert_eq!(error.code(), afs_error::NODE_DFS_STALE_HANDLE);
     assert_eq!(fs.handles.len(), 1);
-    let replay = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
-        &fs, "node-b", request,
-    )
-    .unwrap()
-    .handle
-    .unwrap();
+    let replay =
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
+            &fs, "node-b", request,
+        )
+        .unwrap()
+        .handle
+        .unwrap();
     assert_eq!(replay.opaque_handle, handle.opaque_handle);
 }
 
@@ -326,37 +337,40 @@ fn owner_open_cleanup_wrong_scope_does_not_close_active_handle() {
 fn owner_open_cleanup_release_failure_retains_active_identity() {
     let (_temp, _meta, fs) = test_fs();
     let request = dfs_owner_open_request(1, libc::O_RDWR);
-    let handle = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
-        &fs,
-        "node-b",
-        request.clone(),
-    )
-    .unwrap()
-    .handle
-    .unwrap();
+    let handle =
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
+            &fs,
+            "node-b",
+            request.clone(),
+        )
+        .unwrap()
+        .handle
+        .unwrap();
     fs.handles.clear();
-    let error = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release(
-        &fs,
-        "node-b",
-        afs_protocol::node_control::DfsOwnerReleaseRequest {
-            handle: Some(dfs_owner_cleanup_handle(1)),
-        },
-    )
-    .unwrap_err();
+    let error =
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::release(
+            &fs,
+            "node-b",
+            afs_protocol::node_control::DfsOwnerReleaseRequest {
+                handle: Some(dfs_owner_cleanup_handle(1)),
+            },
+        )
+        .unwrap_err();
     assert_eq!(error.code(), afs_error::NODE_DFS_STALE_HANDLE);
-    let replay = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
-        &fs, "node-b", request,
-    )
-    .unwrap()
-    .handle
-    .unwrap();
+    let replay =
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
+            &fs, "node-b", request,
+        )
+        .unwrap()
+        .handle
+        .unwrap();
     assert_eq!(replay.opaque_handle, handle.opaque_handle);
 }
 
 #[test]
 fn owner_open_replay_state_retires_with_authoritative_caller_session() {
     let (_temp, meta, fs) = test_fs();
-    <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::release(
         &fs,
         "node-b",
         afs_protocol::node_control::DfsOwnerReleaseRequest {
@@ -368,14 +382,15 @@ fn owner_open_replay_state_retires_with_authoritative_caller_session() {
     meta.set_node_session("node-b", Some("session-b2"));
     assert_eq!(fs.reap_expired_peer_owner_handles().unwrap(), 0);
     assert!(fs.owner_open_routes.lock().unwrap().is_empty());
-    let stale = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release(
-        &fs,
-        "node-b",
-        afs_protocol::node_control::DfsOwnerReleaseRequest {
-            handle: Some(dfs_owner_cleanup_handle(2)),
-        },
-    )
-    .unwrap_err();
+    let stale =
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::release(
+            &fs,
+            "node-b",
+            afs_protocol::node_control::DfsOwnerReleaseRequest {
+                handle: Some(dfs_owner_cleanup_handle(2)),
+            },
+        )
+        .unwrap_err();
     assert_eq!(stale.code(), afs_error::NODE_DFS_STALE_HANDLE);
     assert!(fs.owner_open_routes.lock().unwrap().is_empty());
 }
@@ -493,7 +508,7 @@ fn owner_open_finish_after_session_reaper_cleans_allocated_handle() {
     fs.set_owner_open_finish_pause(Some(pause.clone()));
     let fs_open = fs.clone();
     let open = std::thread::spawn(move || {
-        <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
             fs_open.as_ref(),
             "node-b",
             dfs_owner_open_request(1, libc::O_RDWR),
@@ -634,7 +649,7 @@ fn writeonly_read_companion_ack_loss_has_independent_cleanup_identity() {
 #[test]
 fn old_owner_lease_data_ops_are_denied_but_release_cleans_resource() {
     let (_temp, meta, fs) = test_fs();
-    let open = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
+    let open = <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
         &fs,
         "node-b",
         afs_protocol::node_control::DfsOwnerOpenRequest {
@@ -656,7 +671,7 @@ fn old_owner_lease_data_ops_are_denied_but_release_cleans_resource() {
     state.lock().unwrap().write_lease.lease_epoch = 2;
     meta.lease.lock().unwrap().lease_epoch = 2;
     let data_handle = DistributedFs::data_owner_handle(&handle);
-    let error = <DistributedFs as crate::node::rpc::data::DfsOwnerFilesHandler>::write(
+    let error = <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerFilesHandler>::write(
         &fs,
         "node-b",
         afs_protocol::node_data::DfsOwnerWriteRequest {
@@ -670,7 +685,7 @@ fn old_owner_lease_data_ops_are_denied_but_release_cleans_resource() {
     )
     .unwrap_err();
     assert_eq!(error.code(), afs_error::NODE_DFS_STALE_HANDLE);
-    <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::release(
         &fs,
         "node-b",
         afs_protocol::node_control::DfsOwnerReleaseRequest {
@@ -684,7 +699,7 @@ fn old_owner_lease_data_ops_are_denied_but_release_cleans_resource() {
 #[test]
 fn owner_handle_reap_requires_definite_caller_session_replacement() {
     let (_temp, meta, fs) = test_fs();
-    let open = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
+    let open = <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
         &fs,
         "node-b",
         afs_protocol::node_control::DfsOwnerOpenRequest {
@@ -712,35 +727,37 @@ fn owner_handle_reap_requires_definite_caller_session_replacement() {
 #[test]
 fn wrong_peer_cannot_release_live_owner_handle() {
     let (_temp, _meta, fs) = test_fs();
-    let handle = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
-        &fs,
-        "node-b",
-        afs_protocol::node_control::DfsOwnerOpenRequest {
-            namespace_id: "default".into(),
-            inode_id: "inode:test".into(),
-            owner_node_id: "node-a".into(),
-            owner_session_id: "session-a".into(),
-            lease_epoch: 1,
-            caller_session_id: "session-b".into(),
-            open_flags: libc::O_RDWR,
-            kill_suidgid: false,
-            open_seq: 1,
-        },
-    )
-    .unwrap()
-    .handle
-    .unwrap();
-    let error = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release(
-        &fs,
-        "node-c",
-        afs_protocol::node_control::DfsOwnerReleaseRequest {
-            handle: Some(handle.clone()),
-        },
-    )
-    .unwrap_err();
+    let handle =
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
+            &fs,
+            "node-b",
+            afs_protocol::node_control::DfsOwnerOpenRequest {
+                namespace_id: "default".into(),
+                inode_id: "inode:test".into(),
+                owner_node_id: "node-a".into(),
+                owner_session_id: "session-a".into(),
+                lease_epoch: 1,
+                caller_session_id: "session-b".into(),
+                open_flags: libc::O_RDWR,
+                kill_suidgid: false,
+                open_seq: 1,
+            },
+        )
+        .unwrap()
+        .handle
+        .unwrap();
+    let error =
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::release(
+            &fs,
+            "node-c",
+            afs_protocol::node_control::DfsOwnerReleaseRequest {
+                handle: Some(handle.clone()),
+            },
+        )
+        .unwrap_err();
     assert_eq!(error.code(), afs_error::NODE_DFS_STALE_HANDLE);
     assert_eq!(fs.handles.len(), 1);
-    <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::release(
         &fs,
         "node-b",
         afs_protocol::node_control::DfsOwnerReleaseRequest {
@@ -843,7 +860,7 @@ fn writeonly_remote_provider_supports_fresh_readonly_reader() {
     }
     let hook_fs = fs_b.clone();
     let hook_meta = meta.clone();
-    *fs_b.native_read_before_delivery.lock().unwrap() = Some(Box::new(move || {
+    *fs_b.hooks.native_read_before_delivery.lock().unwrap() = Some(Box::new(move || {
         hook_meta.fail_next_current_session_with(Error::coded(
             afs_error::IO_PERMISSION_DENIED,
             "proxy revoked",
@@ -1402,7 +1419,7 @@ impl RemoteDfsOwner for ScriptedOpenRemoteDfsOwner {
 #[test]
 fn remote_owner_append_retry_is_idempotent_and_dirty_read_is_visible() {
     let (_temp, _meta, fs) = test_fs();
-    let open = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
+    let open = <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
         &fs,
         "node-b",
         afs_protocol::node_control::DfsOwnerOpenRequest {
@@ -1429,13 +1446,13 @@ fn remote_owner_append_retry_is_idempotent_and_dirty_read_is_visible() {
         append: true,
         kill_suidgid: false,
     };
-    let first = <DistributedFs as crate::node::rpc::data::DfsOwnerFilesHandler>::write(
+    let first = <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerFilesHandler>::write(
         &fs,
         "node-b",
         write.clone(),
     )
     .unwrap();
-    let retry = <DistributedFs as crate::node::rpc::data::DfsOwnerFilesHandler>::write(
+    let retry = <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerFilesHandler>::write(
         &fs,
         "node-b",
         write.clone(),
@@ -1449,7 +1466,7 @@ fn remote_owner_append_retry_is_idempotent_and_dirty_read_is_visible() {
     };
     changed.operation_id = "node-b-op-1".into();
     assert!(
-        <DistributedFs as crate::node::rpc::data::DfsOwnerFilesHandler>::write(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerFilesHandler>::write(
             &fs, "node-b", changed
         )
         .unwrap_err()
@@ -1457,7 +1474,7 @@ fn remote_owner_append_retry_is_idempotent_and_dirty_read_is_visible() {
         .contains("reused with a different request body")
     );
 
-    let reply = <DistributedFs as crate::node::rpc::data::DfsOwnerFilesHandler>::read(
+    let reply = <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerFilesHandler>::read(
         &fs,
         "node-b",
         afs_protocol::node_data::DfsOwnerReadRequest {
@@ -1469,7 +1486,7 @@ fn remote_owner_append_retry_is_idempotent_and_dirty_read_is_visible() {
     .unwrap();
     assert_eq!(reply.data, b"hi");
 
-    <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::release(
         &fs,
         "node-b",
         afs_protocol::node_control::DfsOwnerReleaseRequest {
@@ -1486,7 +1503,7 @@ fn r54_open(
     open_seq: u64,
     flags: i32,
 ) -> afs_protocol::node_control::DfsOwnerHandle {
-    <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
         fs,
         "node-b",
         dfs_owner_open_request(open_seq, flags),
@@ -1517,14 +1534,16 @@ fn r54_send(
     fs: &DistributedFs,
     request: afs_protocol::node_data::DfsOwnerWriteRequest,
 ) -> Result<afs_protocol::node_data::DfsOwnerWriteReply> {
-    <DistributedFs as crate::node::rpc::data::DfsOwnerFilesHandler>::write(fs, "node-b", request)
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerFilesHandler>::write(
+        fs, "node-b", request,
+    )
 }
 
 fn r54_read_all(
     fs: &DistributedFs,
     handle: &afs_protocol::node_control::DfsOwnerHandle,
 ) -> Vec<u8> {
-    <DistributedFs as crate::node::rpc::data::DfsOwnerFilesHandler>::read(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerFilesHandler>::read(
         fs,
         "node-b",
         afs_protocol::node_data::DfsOwnerReadRequest {
@@ -1538,7 +1557,7 @@ fn r54_read_all(
 }
 
 fn r54_release(fs: &DistributedFs, handle: afs_protocol::node_control::DfsOwnerHandle) {
-    <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::release(
         fs,
         "node-b",
         afs_protocol::node_control::DfsOwnerReleaseRequest {

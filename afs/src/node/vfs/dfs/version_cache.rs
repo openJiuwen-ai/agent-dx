@@ -407,6 +407,85 @@ pub(super) fn extent_read_op(
     }))
 }
 
+/// Immutable (version id -> layout) cache shared by every read path, with the
+/// per-version single-flight gates used by the asynchronous read entry.
+pub(super) struct VersionCache {
+    pub(super) cache: Arc<Mutex<ReadOnlyVersionCache>>,
+    pub(super) gates: Arc<crate::node::read_pipeline::ReadKeyGates>,
+    pub(super) empty: Arc<ReadOnlyVersion>,
+}
+
+impl Default for VersionCache {
+    fn default() -> Self {
+        Self {
+            cache: Arc::new(Mutex::new(ReadOnlyVersionCache::new(
+                DEFAULT_VERSION_CACHE_ENTRIES,
+                DEFAULT_VERSION_CACHE_BYTES,
+            ))),
+            gates: Arc::new(Default::default()),
+            empty: Arc::new(ReadOnlyVersion::empty()),
+        }
+    }
+}
+
+impl VersionCache {
+    fn locked(&self) -> Result<std::sync::MutexGuard<'_, ReadOnlyVersionCache>> {
+        record_metadata_table_lock();
+        self.cache
+            .lock()
+            .map_err(|_| unavailable("DFS readonly version cache is poisoned"))
+    }
+
+    pub(super) fn get(&self, version_id: &FileVersionId) -> Result<Option<Arc<ReadOnlyVersion>>> {
+        Ok(self.locked()?.get(version_id).cloned())
+    }
+
+    /// Installs a freshly loaded version unless a concurrent loader won; the
+    /// winner must describe the same immutable version.
+    pub(super) fn admit(
+        &self,
+        version_id: &FileVersionId,
+        cached: Arc<ReadOnlyVersion>,
+    ) -> Result<Arc<ReadOnlyVersion>> {
+        let mut cache = self.locked()?;
+        if let Some(existing) = cache.get(version_id) {
+            if existing.version != cached.version || existing.layout != cached.layout {
+                return Err(invalid(
+                    "DFS immutable version changed during concurrent cache admission",
+                ));
+            }
+            return Ok(existing.clone());
+        }
+        cache.insert(version_id.clone(), cached.clone());
+        Ok(cached)
+    }
+
+    /// Admits a locally known committed version if it is not cached yet.
+    pub(super) fn seed(
+        &self,
+        version_id: &FileVersionId,
+        version: FileVersion,
+        layout: LayoutRoot,
+    ) -> Result<()> {
+        let mut cache = self.locked()?;
+        if cache.get(version_id).is_none() {
+            let cached = Arc::new(ReadOnlyVersion::checked(version_id, version, layout)?);
+            cache.insert(version_id.clone(), cached);
+        }
+        Ok(())
+    }
+
+    pub(super) fn set_capacity(&self, capacity: usize) {
+        let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
+        *cache = ReadOnlyVersionCache::new(capacity, cache.byte_limit);
+    }
+
+    pub(super) fn set_byte_limit(&self, bytes: u64) {
+        let mut cache = self.cache.lock().unwrap_or_else(|error| error.into_inner());
+        *cache = ReadOnlyVersionCache::new(cache.capacity, usize::try_from(bytes).unwrap_or(0));
+    }
+}
+
 impl DistributedFs {
     pub(super) fn load_version(
         &self,
@@ -432,18 +511,11 @@ impl DistributedFs {
         version_id: Option<&FileVersionId>,
     ) -> Result<Arc<ReadOnlyVersion>> {
         let Some(version_id) = version_id else {
-            return Ok(self.readonly_empty_version.clone());
+            return Ok(self.versions.empty.clone());
         };
         let span = tracing::info_span!("node.dfs.read.head", version_id = %version_id.0,
             branch = "readonly_version", cached = tracing::field::Empty);
-        record_metadata_table_lock();
-        if let Some(cached) = self
-            .readonly_version_cache
-            .lock()
-            .map_err(|_| unavailable("DFS readonly version cache is poisoned"))?
-            .get(version_id)
-            .cloned()
-        {
+        if let Some(cached) = self.versions.get(version_id)? {
             span.record("cached", true);
             return Ok(cached);
         }
@@ -453,26 +525,17 @@ impl DistributedFs {
         let cached = Arc::new(ReadOnlyVersion::checked(version_id, version, layout)?);
         #[cfg(test)]
         {
-            let barrier = self.readonly_version_before_install.lock().unwrap().clone();
+            let barrier = self
+                .hooks
+                .readonly_version_before_install
+                .lock()
+                .unwrap()
+                .clone();
             if let Some(barrier) = barrier {
                 barrier.wait();
             }
         }
-        record_metadata_table_lock();
-        let mut cache = self
-            .readonly_version_cache
-            .lock()
-            .map_err(|_| unavailable("DFS readonly version cache is poisoned"))?;
-        if let Some(existing) = cache.get(version_id) {
-            if existing.version != cached.version || existing.layout != cached.layout {
-                return Err(invalid(
-                    "DFS immutable version changed during concurrent cache admission",
-                ));
-            }
-            return Ok(existing.clone());
-        }
-        cache.insert(version_id.clone(), cached.clone());
-        Ok(cached)
+        self.versions.admit(version_id, cached)
     }
 
     /// Admit this Node's committed write base into the readonly version cache
@@ -496,16 +559,7 @@ impl DistributedFs {
                 _ => return Ok(()),
             }
         };
-        record_metadata_table_lock();
-        let mut cache = self
-            .readonly_version_cache
-            .lock()
-            .map_err(|_| unavailable("DFS readonly version cache is poisoned"))?;
-        if cache.get(version_id).is_none() {
-            let cached = Arc::new(ReadOnlyVersion::checked(version_id, version, layout)?);
-            cache.insert(version_id.clone(), cached);
-        }
-        Ok(())
+        self.versions.seed(version_id, version, layout)
     }
 
     pub(super) fn readonly_version_for_inode(

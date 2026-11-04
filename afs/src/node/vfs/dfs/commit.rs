@@ -1,5 +1,13 @@
 use super::*;
 
+/// Commit engine state. Commits run on the caller's thread under the inode
+/// write-state cell, so the engine owns no lock of its own; it only carries
+/// the optional pending-commit diagnostics trace.
+#[derive(Default)]
+pub(super) struct CommitEngine {
+    pub(super) pending_trace: Option<PendingTrace>,
+}
+
 #[derive(Clone)]
 pub(super) struct FrozenCommit {
     pub(super) through_seq: u64,
@@ -141,7 +149,7 @@ impl DistributedFs {
         } else {
             None
         };
-        let _operation = if wait_for_operation && self.native_pipeline.is_none() {
+        let _operation = if wait_for_operation && self.native.pipeline.is_none() {
             Some(self.begin_inode_operation(&snapshot.inode_id, state.clone())?)
         } else {
             None
@@ -289,7 +297,7 @@ impl DistributedFs {
                     }
                     if !state.dirty {
                         let sync = SyncInodeMetadata {
-                            operation_id: self.operation_id("fsync-metadata"),
+                            operation_id: self.identity.operation_id("fsync-metadata"),
                             inode_id: state.inode.inode_id.clone(),
                             write_lease: state.write_lease.clone(),
                             expected_inode_revision: state.inode.revision,
@@ -330,6 +338,7 @@ impl DistributedFs {
                                 frozen: *frozen,
                                 batch,
                                 trace_send_attempt: self
+                                    .commit
                                     .pending_trace
                                     .as_ref()
                                     .map(|_| Arc::new(AtomicU64::new(0))),
@@ -338,7 +347,7 @@ impl DistributedFs {
                             let mut state = cell
                                 .lock()
                                 .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-                            while self.native_pipeline.is_some()
+                            while self.native.pipeline.is_some()
                                 && wait_for_operation
                                 && state.operation_busy
                             {
@@ -413,7 +422,7 @@ impl DistributedFs {
                     } else {
                         None
                     };
-                if let Some(trace) = &self.pending_trace
+                if let Some(trace) = &self.commit.pending_trace
                     && let Ok(state) = cell.lock()
                 {
                     trace.observe("dfs_pending_commit_send", branch, &state, pending, None);
@@ -543,7 +552,7 @@ impl DistributedFs {
                 if committed_kill_suidgid && !has_later_dirty {
                     state.kill_suidgid_dirty = false;
                 }
-                if let Some(trace) = &self.pending_trace
+                if let Some(trace) = &self.commit.pending_trace
                     && let InFlightCommit::File(sent) = &pending
                 {
                     trace.observe(
@@ -573,7 +582,7 @@ impl DistributedFs {
                 if is_definite_commit_rejection(&error) {
                     state.in_flight = None;
                     state.terminal_error = Some(error.clone());
-                    if let Some(trace) = &self.pending_trace
+                    if let Some(trace) = &self.commit.pending_trace
                         && let InFlightCommit::File(sent) = &pending
                     {
                         trace.observe(
@@ -590,7 +599,7 @@ impl DistributedFs {
                             .restore_before(pending.frozen.dirty_extents);
                         state.dirty = !state.dirty_extents.is_empty();
                     }
-                } else if let Some(trace) = &self.pending_trace
+                } else if let Some(trace) = &self.commit.pending_trace
                     && let InFlightCommit::File(sent) = &pending
                 {
                     trace.observe(

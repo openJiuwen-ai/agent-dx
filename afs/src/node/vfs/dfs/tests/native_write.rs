@@ -152,7 +152,8 @@ fn native_wait_uploads(fs: &DistributedFs, completed: u64) {
     loop {
         fs.progress_native_writeback().unwrap();
         if fs
-            .native_pipeline
+            .native
+            .pipeline
             .as_ref()
             .unwrap()
             .metadata
@@ -312,7 +313,8 @@ fn p2_w2_required_upload_retires_body_and_dirty_read_uses_anchored_local_object(
     assert_eq!(store.calls.load(Ordering::SeqCst), 1);
     assert_eq!(meta.commits.lock().unwrap().len(), 0);
     assert_eq!(
-        fs.native_pipeline
+        fs.native
+            .pipeline
             .as_ref()
             .unwrap()
             .budget
@@ -329,7 +331,8 @@ fn p2_w2_required_upload_retires_body_and_dirty_read_uses_anchored_local_object(
     fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
     assert_eq!(meta.commits.lock().unwrap().len(), 1);
     assert_eq!(
-        fs.native_pipeline
+        fs.native
+            .pipeline
             .as_ref()
             .unwrap()
             .metadata
@@ -358,7 +361,8 @@ fn p2_w2_nonrequired_upload_keeps_body_until_publication_and_pressure_progresses
     fs.write(&context(), file.handle, 0, &body).unwrap();
     native_wait_uploads(&fs, 1);
     assert_eq!(
-        fs.native_pipeline
+        fs.native
+            .pipeline
             .as_ref()
             .unwrap()
             .budget
@@ -379,7 +383,7 @@ fn p2_w2_nonrequired_upload_keeps_body_until_publication_and_pressure_progresses
     );
     fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
     assert_eq!(meta.commits.lock().unwrap().len(), 2);
-    let pipeline = fs.native_pipeline.as_ref().unwrap();
+    let pipeline = fs.native.pipeline.as_ref().unwrap();
     assert_eq!(pipeline.budget.snapshot().live_bytes, 0);
     assert!(pipeline.metadata.state.lock().unwrap().pressure_live > 0);
     fs.release(&context(), file.handle).unwrap();
@@ -404,7 +408,7 @@ fn p2_w2_descriptor_pressure_publishes_before_accepting_the_next_descriptor() {
     fs.write(&context(), file.handle, body.len() as u64, &body)
         .unwrap();
     assert_eq!(meta.commits.lock().unwrap().len(), 1);
-    let pipeline = fs.native_pipeline.as_ref().unwrap();
+    let pipeline = fs.native.pipeline.as_ref().unwrap();
     assert_eq!(
         pipeline
             .metadata
@@ -446,7 +450,8 @@ fn p2_w2_timer_and_stop_drain_publish_tails_but_closed_admission_rejects_new_inp
     assert_eq!(fs.drain().unwrap(), 1);
     assert_eq!(meta.commits.lock().unwrap().len(), 2);
     assert_eq!(
-        fs.native_pipeline
+        fs.native
+            .pipeline
             .as_ref()
             .unwrap()
             .budget
@@ -508,7 +513,8 @@ fn p2_w2_unknown_request_keeps_original_identity_and_body_until_exact_retry() {
     fs.fsync(&context(), file.handle, SyncMode::Full).unwrap();
     assert_eq!(meta.commits.lock().unwrap()[0], failed);
     assert!(
-        fs.native_pipeline
+        fs.native
+            .pipeline
             .as_ref()
             .unwrap()
             .budget
@@ -519,7 +525,8 @@ fn p2_w2_unknown_request_keeps_original_identity_and_body_until_exact_retry() {
     );
     drop(owner);
     assert_eq!(
-        fs.native_pipeline
+        fs.native
+            .pipeline
             .as_ref()
             .unwrap()
             .budget
@@ -595,7 +602,7 @@ fn p2_w2_large_existing_layout_small_patch_keeps_the_original_fsync_capability()
         .collect();
     meta.publish_external_version_with_receipts(131_072, extents, Vec::new());
     let inode = fs.inode_id(file.entry.inode).unwrap();
-    fs.inode_writes.write(&inode).unwrap().remove(&inode);
+    fs.writes.states.write(&inode).unwrap().remove(&inode);
     let writer = fs.open(&context(), file.entry.inode, libc::O_RDWR).unwrap();
     fs.write(&context(), writer, 8192, &[0x92; 4096]).unwrap();
     fs.fsync(&context(), writer, SyncMode::Full).unwrap();
@@ -622,7 +629,7 @@ fn p2_w2_actual_cross_block_allocation_failure_returns_the_visible_prefix() {
         .unwrap();
     fs.write(&context(), file.handle, 0, &vec![1; 1024 * 1024])
         .unwrap();
-    fs.write_buffer_pool.fail_next_allocation();
+    fs.native.buffer_pool.fail_next_allocation();
     assert_eq!(
         fs.write(
             &context(),
@@ -640,7 +647,7 @@ fn p2_w2_actual_cross_block_allocation_failure_returns_the_visible_prefix() {
         4 * 1024 * 1024
     );
     assert_eq!(
-        fs.write_buffer_pool.snapshot().copied_bytes,
+        fs.native.buffer_pool.snapshot().copied_bytes,
         4 * 1024 * 1024
     );
     fs.release(&context(), file.handle).unwrap();
@@ -665,7 +672,8 @@ fn p2_w2_budget_waiter_fifo_does_not_block_timer_or_the_following_sync() {
     let worker = std::thread::spawn(move || worker_fs.write(&context(), other, 4096, b"b"));
     let deadline = Instant::now() + Duration::from_secs(5);
     while fs
-        .native_pipeline
+        .native
+        .pipeline
         .as_ref()
         .unwrap()
         .allocation_queue
@@ -720,7 +728,8 @@ fn p2_w2_upload_failure_reaches_the_sync_barrier_without_publishing() {
     assert!(fs.fsync(&context(), file.handle, SyncMode::Full).is_err());
     assert!(meta.commits.lock().unwrap().is_empty());
     assert_eq!(
-        fs.native_pipeline
+        fs.native
+            .pipeline
             .as_ref()
             .unwrap()
             .budget
@@ -885,8 +894,8 @@ fn p2_w2_upload_error_is_owned_by_its_inode_while_drain_still_aggregates() {
         native_pipeline_fixture(false, 16 * 1024 * 1024, 8);
     b_meta.inode.lock().unwrap().inode_id = InodeId::new("inode:unrelated-b");
     b_meta.lease.lock().unwrap().inode_id = InodeId::new("inode:unrelated-b");
-    b_fs.native_pipeline = a_fs.native_pipeline.clone();
-    b_fs.next_operation.store(10_000, Ordering::SeqCst);
+    b_fs.native.pipeline = a_fs.native.pipeline.clone();
+    b_fs.identity.next_operation.store(10_000, Ordering::SeqCst);
     let a = a_fs
         .create(
             &context(),
@@ -905,7 +914,7 @@ fn p2_w2_upload_error_is_owned_by_its_inode_while_drain_still_aggregates() {
             libc::O_RDWR,
         )
         .unwrap();
-    let pipeline = a_fs.native_pipeline.as_ref().unwrap();
+    let pipeline = a_fs.native.pipeline.as_ref().unwrap();
     let a_cell = a_fs
         .write_state(&a_fs.inode_id(a.entry.inode).unwrap())
         .unwrap()
@@ -1023,9 +1032,9 @@ fn p2_review_node_wide_poll_never_reports_another_inode_upload_error() {
     let (_b_temp, b_meta, mut b_fs) = test_fs();
     b_meta.inode.lock().unwrap().inode_id = InodeId::new("inode:shared-poll-b");
     b_meta.lease.lock().unwrap().inode_id = InodeId::new("inode:shared-poll-b");
-    b_fs.native_pipeline = a_fs.native_pipeline.clone();
+    b_fs.native.pipeline = a_fs.native.pipeline.clone();
     b_fs.chunk_store = store.clone();
-    b_fs.next_operation.store(10_000, Ordering::SeqCst);
+    b_fs.identity.next_operation.store(10_000, Ordering::SeqCst);
     let a = a_fs
         .create(
             &context(),
@@ -1048,7 +1057,7 @@ fn p2_review_node_wide_poll_never_reports_another_inode_upload_error() {
     let a_cell = a_fs.write_state(&a_id).unwrap().unwrap();
     // The single-inode Meta fixture uses separate facades; share A's real cell
     // as well as the store/pipeline so B's poll scans a Node-wide task table.
-    b_fs.inode_writes.insert(a_id, a_cell).unwrap();
+    b_fs.writes.states.insert(a_id, a_cell).unwrap();
     store.fail_next.store(true, Ordering::SeqCst);
     a_fs.write(&context(), a.handle, 0, &vec![0x48; 4 * 1024 * 1024])
         .unwrap();
@@ -1097,7 +1106,7 @@ fn p2_review_structural_install_failure_cleans_join_without_retiring_body() {
         .unwrap();
     fs.write(&context(), file.handle, 0, &vec![0x72; 4 * 1024 * 1024])
         .unwrap();
-    let pipeline = fs.native_pipeline.as_ref().unwrap().clone();
+    let pipeline = fs.native.pipeline.as_ref().unwrap().clone();
     let upload = pipeline.tasks.lock().unwrap()[0].clone();
     let operation = upload.operation_id.clone();
     let chunk = upload.chunk.clone();

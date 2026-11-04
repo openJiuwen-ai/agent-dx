@@ -485,7 +485,7 @@ fn s1a_inode_lock_contention_is_counted_only_when_a_lock_waits() {
     .unwrap();
     let inode_id = meta.inode.lock().unwrap().inode_id.clone();
     let cell = fs.write_state(&inode_id).unwrap().unwrap();
-    let wait = fs.inode_lock_wait.clone().unwrap();
+    let wait = fs.writes.lock_wait.clone().unwrap();
     let before = wait.contended.get();
     drop(cell.lock().unwrap());
     assert_eq!(

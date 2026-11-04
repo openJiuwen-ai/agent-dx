@@ -171,7 +171,7 @@ fn p2_version_cache_bytes_evict_fragmented_lru_without_retiring_active_reader() 
     assert_eq!(expected.len(), 2);
     let weak = Arc::downgrade(&held);
     {
-        let mut cache = fs.readonly_version_cache.lock().unwrap();
+        let mut cache = fs.versions.cache.lock().unwrap();
         cache.insert(first_id.clone(), held.clone());
         cache.insert(second_id.clone(), second);
         assert!(cache.get(&first_id).is_some());
@@ -227,7 +227,7 @@ fn p2_version_cache_bytes_counts_reserved_extent_and_index_capacity() {
                 .reserve_exact(LIMIT / std::mem::size_of::<Extent>());
         }
         let id = version.version.as_ref().unwrap().id.clone();
-        let mut cache = fs.readonly_version_cache.lock().unwrap();
+        let mut cache = fs.versions.cache.lock().unwrap();
         cache.insert(id.clone(), version.clone());
         assert!(
             cache.get(&id).is_none(),
@@ -260,7 +260,7 @@ fn p2_version_cache_bytes_counts_string_capacity_and_same_key_replacement() {
     let second_id = second.version.as_ref().unwrap().id.clone();
     let third = p2_byte_cache_version("replacement-third", 24_000);
     let third_id = third.version.as_ref().unwrap().id.clone();
-    let mut cache = fs.readonly_version_cache.lock().unwrap();
+    let mut cache = fs.versions.cache.lock().unwrap();
     cache.insert(id.clone(), inflated.clone());
     cache.insert(second_id.clone(), second);
     cache.insert(id.clone(), compact);
@@ -307,7 +307,7 @@ fn p2_version_cache_bytes_counts_version_layout_and_key_string_capacity() {
         };
         string.reserve_exact(LIMIT);
         let lookup = key.clone();
-        let mut cache = fs.readonly_version_cache.lock().unwrap();
+        let mut cache = fs.versions.cache.lock().unwrap();
         cache.insert(key, value.clone());
         assert!(
             cache.get(&lookup).is_none(),
@@ -335,7 +335,7 @@ fn p2_version_cache_bytes_small_limit_survives_both_configuration_orders() {
         assert!(!Arc::ptr_eq(&first, &second));
         assert_eq!(first.layout.file_length, 17);
         assert_eq!(meta.file_version_load_count() - before, 2);
-        assert_eq!(fs.readonly_version_cache.lock().unwrap().len(), 0);
+        assert_eq!(fs.versions.cache.lock().unwrap().len(), 0);
     }
 }
 
@@ -359,13 +359,7 @@ fn p2_version_cache_bytes_oversized_version_remains_usable_without_retention() {
         "an overlarge version is not retained"
     );
     assert_eq!(meta.file_version_load_count() - before, 2);
-    assert!(
-        fs.readonly_version_cache
-            .lock()
-            .unwrap()
-            .get(&head)
-            .is_none()
-    );
+    assert!(fs.versions.cache.lock().unwrap().get(&head).is_none());
 }
 
 #[test]
@@ -466,14 +460,14 @@ fn p1_version_cache_concurrent_admission_shares_canonical_arc_and_rejects_change
             .lock()
             .unwrap()
             .extend([original, other]);
-        *fs.readonly_version_before_install.lock().unwrap() =
+        *fs.hooks.readonly_version_before_install.lock().unwrap() =
             Some(Arc::new(std::sync::Barrier::new(2)));
         let (first, second) = std::thread::scope(|scope| {
             let first = scope.spawn(|| fs.load_readonly_version(Some(&head)));
             let second = scope.spawn(|| fs.load_readonly_version(Some(&head)));
             (first.join().unwrap(), second.join().unwrap())
         });
-        *fs.readonly_version_before_install.lock().unwrap() = None;
+        *fs.hooks.readonly_version_before_install.lock().unwrap() = None;
         assert_eq!(
             meta.file_version_load_count(),
             2,
@@ -554,7 +548,7 @@ fn p1_version_cache_lru_preserves_hot_entries_and_retired_arc() {
     ));
     fs.load_readonly_version(Some(&third)).unwrap();
     {
-        let mut cache = fs.readonly_version_cache.lock().unwrap();
+        let mut cache = fs.versions.cache.lock().unwrap();
         assert_eq!(cache.len(), 2);
         assert!(cache.get(&second).is_none());
         assert!(Arc::ptr_eq(cache.get(&first).unwrap(), &held));

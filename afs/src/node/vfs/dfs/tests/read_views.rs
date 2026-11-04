@@ -483,7 +483,8 @@ fn p1_handle_snapshots_share_immutable_inode_payload() {
 fn p1_backend_inode_parallel_first_lookup_is_bijective() {
     let (_temp, _meta, fs) = test_fs();
     let inode = InodeId::new("inode:p1-concurrent-first-lookup");
-    *fs.backend_inode_after_missing.lock().unwrap() = Some(Arc::new(std::sync::Barrier::new(2)));
+    *fs.hooks.backend_inode_after_missing.lock().unwrap() =
+        Some(Arc::new(std::sync::Barrier::new(2)));
     let (first, second) = std::thread::scope(|scope| {
         let first = scope.spawn(|| fs.backend_inode(&inode));
         let second = scope.spawn(|| fs.backend_inode(&inode));
@@ -492,7 +493,7 @@ fn p1_backend_inode_parallel_first_lookup_is_bijective() {
             second.join().unwrap().unwrap(),
         )
     });
-    *fs.backend_inode_after_missing.lock().unwrap() = None;
+    *fs.hooks.backend_inode_after_missing.lock().unwrap() = None;
     assert_eq!(
         first, second,
         "one DFS inode must have one backend identity"
@@ -580,7 +581,8 @@ fn s1a6_inflight_and_later_reads_keep_the_pinned_version_across_view_renewal() {
     let pause = Arc::new(NativeReadPause::default());
     let _resume = ResumeNativeReadOnDrop(pause.clone());
     let read_pause = pause.clone();
-    *fs.native_read_after_committed.lock().unwrap() = Some(Box::new(move || read_pause.block()));
+    *fs.hooks.native_read_after_committed.lock().unwrap() =
+        Some(Box::new(move || read_pause.block()));
     let read_fs = fs.clone();
     let read = std::thread::spawn(move || read_fs.read_owned(&context(), reader, 0, 32));
     pause.wait_until_reached();
@@ -608,7 +610,8 @@ fn p1_native_known_denial_rejects_inflight_committed_output() {
     let pause = Arc::new(NativeReadPause::default());
     let _resume = ResumeNativeReadOnDrop(pause.clone());
     let read_pause = pause.clone();
-    *fs.native_read_after_committed.lock().unwrap() = Some(Box::new(move || read_pause.block()));
+    *fs.hooks.native_read_after_committed.lock().unwrap() =
+        Some(Box::new(move || read_pause.block()));
     let read_fs = fs.clone();
     let read = std::thread::spawn(move || {
         let mut output = [0xa5; 16];
@@ -645,7 +648,8 @@ fn open_authority_release_racing_delivery_never_exposes_partial_output() {
     let pause = Arc::new(NativeReadPause::default());
     let _resume = ResumeNativeReadOnDrop(pause.clone());
     let read_pause = pause.clone();
-    *fs.native_read_after_committed.lock().unwrap() = Some(Box::new(move || read_pause.block()));
+    *fs.hooks.native_read_after_committed.lock().unwrap() =
+        Some(Box::new(move || read_pause.block()));
     let read_fs = fs.clone();
     let read = std::thread::spawn(move || {
         let mut output = [0xa5; 16];
@@ -689,7 +693,8 @@ fn p1_native_release_racing_delivery_never_exposes_partial_output() {
     let pause = Arc::new(NativeReadPause::default());
     let _resume = ResumeNativeReadOnDrop(pause.clone());
     let read_pause = pause.clone();
-    *fs.native_read_after_committed.lock().unwrap() = Some(Box::new(move || read_pause.block()));
+    *fs.hooks.native_read_after_committed.lock().unwrap() =
+        Some(Box::new(move || read_pause.block()));
     let read_fs = fs.clone();
     let read = std::thread::spawn(move || {
         let mut output = [0xa5; 16];
@@ -899,8 +904,10 @@ fn p1_handle_registration_racing_local_or_proxy_install_preserves_dirty_visibili
         let pause = Arc::new(NativeReadPause::default());
         let _resume = ResumeNativeReadOnDrop(pause.clone());
         let registration_pause = pause.clone();
-        *fs.handle_registration_after_route_check.lock().unwrap() =
-            Some(Box::new(move || registration_pause.block()));
+        *fs.hooks
+            .handle_registration_after_route_check
+            .lock()
+            .unwrap() = Some(Box::new(move || registration_pause.block()));
         let read_fs = fs.clone();
         let opening = std::thread::spawn(move || read_fs.open(&context(), inode, libc::O_RDONLY));
         pause.wait_until_reached();
@@ -1462,7 +1469,7 @@ fn readonly_native_dirty_late_denial_does_not_publish_output() {
     let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
     let hook_fs = fs.clone();
     let hook_meta = meta.clone();
-    *fs.native_read_before_delivery.lock().unwrap() = Some(Box::new(move || {
+    *fs.hooks.native_read_before_delivery.lock().unwrap() = Some(Box::new(move || {
         hook_meta.fail_next_get_inode_with(Error::coded(
             afs_error::IO_PERMISSION_DENIED,
             "late revoked",

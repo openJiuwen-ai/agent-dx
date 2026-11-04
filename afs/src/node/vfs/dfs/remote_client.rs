@@ -150,7 +150,9 @@ pub(super) struct DfsRemoteWriteSession {
 
 impl DistributedFs {
     pub(super) fn ensure_local_write_owner(&self, lease: &WriteLease) -> Result<()> {
-        if lease.owner_node_id != self.node_id || lease.owner_session_id != self.session_id {
+        if lease.owner_node_id != self.identity.node_id
+            || lease.owner_session_id != self.identity.session_id
+        {
             return Err(stale("DFS write lease is owned by another node session"));
         }
         Ok(())
@@ -184,12 +186,12 @@ impl DistributedFs {
         let owner = self.remote_owner(lease)?;
         self.reserve_remote_release_capacity(release_slots)?;
         let open_request = afs_protocol::node_control::DfsOwnerOpenRequest {
-            namespace_id: self.namespace_id.0.clone(),
+            namespace_id: self.identity.namespace_id.0.clone(),
             inode_id: inode.inode_id.0.clone(),
             owner_node_id: lease.owner_node_id.clone(),
             owner_session_id: lease.owner_session_id.clone(),
             lease_epoch: lease.lease_epoch,
-            caller_session_id: self.session_id.clone(),
+            caller_session_id: self.identity.session_id.clone(),
             open_flags,
             kill_suidgid: options.kill_suidgid,
             open_seq: 0,
@@ -202,12 +204,12 @@ impl DistributedFs {
         )?;
         let read_handle = if open_flags & libc::O_ACCMODE == libc::O_WRONLY {
             let read_open_request = afs_protocol::node_control::DfsOwnerOpenRequest {
-                namespace_id: self.namespace_id.0.clone(),
+                namespace_id: self.identity.namespace_id.0.clone(),
                 inode_id: inode.inode_id.0.clone(),
                 owner_node_id: lease.owner_node_id.clone(),
                 owner_session_id: lease.owner_session_id.clone(),
                 lease_epoch: lease.lease_epoch,
-                caller_session_id: self.session_id.clone(),
+                caller_session_id: self.identity.session_id.clone(),
                 open_flags: libc::O_RDONLY,
                 kill_suidgid: false,
                 open_seq: 0,
@@ -243,8 +245,8 @@ impl DistributedFs {
             local: DfsWriteSession {
                 id: DfsWriteSessionId::new(format!(
                     "{}-remote-write-session-{}",
-                    self.session_id,
-                    self.next_operation.fetch_add(1, Ordering::Relaxed)
+                    self.identity.session_id,
+                    self.identity.next_operation.fetch_add(1, Ordering::Relaxed)
                 )),
                 inode_id: inode.inode_id.clone(),
                 open_flags,
@@ -288,7 +290,10 @@ impl DistributedFs {
                         if Self::remote_release_error_is_retryable(&error) {
                             self.queue_pending_remote_release(
                                 owner.clone(),
-                                Self::cleanup_handle_for_open_request(&self.node_id, &request)?,
+                                Self::cleanup_handle_for_open_request(
+                                    &self.identity.node_id,
+                                    &request,
+                                )?,
                                 true,
                             )?;
                             if reserved_slots > 1 {
@@ -303,7 +308,7 @@ impl DistributedFs {
                 let Some(handle) = reply.handle else {
                     self.queue_pending_remote_release(
                         owner.clone(),
-                        Self::cleanup_handle_for_open_request(&self.node_id, &request)?,
+                        Self::cleanup_handle_for_open_request(&self.identity.node_id, &request)?,
                         true,
                     )?;
                     if reserved_slots > 1 {
@@ -314,7 +319,7 @@ impl DistributedFs {
                 if let Err(error) = self.validate_remote_open_reply_handle(&request, &handle) {
                     self.queue_pending_remote_release(
                         owner.clone(),
-                        Self::cleanup_handle_for_open_request(&self.node_id, &request)?,
+                        Self::cleanup_handle_for_open_request(&self.identity.node_id, &request)?,
                         true,
                     )?;
                     if reserved_slots > 1 {
@@ -338,8 +343,8 @@ impl DistributedFs {
         action: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
         let route = DfsOwnerOpenRouteKey {
-            caller_node_id: self.node_id.clone(),
-            caller_session_id: self.session_id.clone(),
+            caller_node_id: self.identity.node_id.clone(),
+            caller_session_id: self.identity.session_id.clone(),
             owner_node_id: owner_node_id.to_owned(),
             owner_session_id: owner_session_id.to_owned(),
         };
@@ -405,8 +410,8 @@ impl DistributedFs {
             || handle.owner_node_id != request.owner_node_id
             || handle.owner_session_id != request.owner_session_id
             || handle.lease_epoch != request.lease_epoch
-            || handle.caller_node_id != self.node_id
-            || handle.caller_session_id != self.session_id
+            || handle.caller_node_id != self.identity.node_id
+            || handle.caller_session_id != self.identity.session_id
             || handle.open_seq != request.open_seq
             || handle.opaque_handle.is_empty()
         {
@@ -491,7 +496,7 @@ impl DistributedFs {
             .remote
             .as_ref()
             .ok_or_else(|| invalid("DFS write session is local"))?;
-        let operation_id = self.operation_id("remote-write");
+        let operation_id = self.identity.operation_id("remote-write");
         let reply = remote
             .owner
             .write(afs_protocol::node_data::DfsOwnerWriteRequest {
@@ -519,7 +524,7 @@ impl DistributedFs {
             .owner
             .resize(afs_protocol::node_data::DfsOwnerResizeRequest {
                 handle: Some(Self::data_owner_handle(&remote.handle)),
-                operation_id: self.operation_id("remote-resize").0,
+                operation_id: self.identity.operation_id("remote-resize").0,
                 length,
                 kill_suidgid: options.kill_suidgid,
             })?;
@@ -539,7 +544,7 @@ impl DistributedFs {
             .owner
             .sync(afs_protocol::node_data::DfsOwnerSyncRequest {
                 handle: Some(Self::data_owner_handle(&remote.handle)),
-                operation_id: self.operation_id("remote-sync").0,
+                operation_id: self.identity.operation_id("remote-sync").0,
                 through_write_seq: session.local.last_accepted_seq,
                 data_only: matches!(mode, SyncMode::DataOnly),
             })
@@ -1152,10 +1157,10 @@ impl DistributedFs {
         open_seq: u64,
     ) -> afs_protocol::node_control::DfsOwnerHandle {
         afs_protocol::node_control::DfsOwnerHandle {
-            namespace_id: self.namespace_id.0.clone(),
+            namespace_id: self.identity.namespace_id.0.clone(),
             inode_id: inode.inode_id.0.clone(),
-            owner_node_id: self.node_id.clone(),
-            owner_session_id: self.session_id.clone(),
+            owner_node_id: self.identity.node_id.clone(),
+            owner_session_id: self.identity.session_id.clone(),
             lease_epoch: lease.lease_epoch,
             caller_node_id: peer.to_owned(),
             caller_session_id,

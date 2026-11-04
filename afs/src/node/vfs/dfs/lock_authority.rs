@@ -18,10 +18,33 @@ pub(super) struct DfsLockRenewal {
     running: Arc<AtomicBool>,
 }
 
-#[derive(Clone)]
-pub(super) struct DfsRemoteLockAuthority {
-    pub(super) owner: Arc<dyn RemoteDfsOwner>,
-    pub(super) authority: afs_protocol::node_control::DfsOwnerLockAuthority,
+/// Lock state of this mount. Each table carries its own lock; `admission`
+/// serialises creation/replacement of entries in `authorities` (it guards
+/// that table only). `proxy` is the frozen remote-lock proxy state (H1).
+pub(super) struct LockService {
+    pub(super) authorities: ShardedMap<InodeId, Arc<DfsLockAuthority>>,
+    pub(super) admission: Mutex<()>,
+    pub(super) renewal: Arc<DfsLockRenewal>,
+    /// Lock sessions closed on this owner; admission tombstones.
+    pub(super) closed_sessions: Mutex<HashSet<String>>,
+    pub(super) closed_session_admission_closed: AtomicBool,
+    /// Rotation cursor shared by the lock-session maintenance passes.
+    pub(super) session_reap_cursor: AtomicU64,
+    pub(super) proxy: LockProxyState,
+}
+
+impl Default for LockService {
+    fn default() -> Self {
+        Self {
+            authorities: ShardedMap::default(),
+            admission: Mutex::new(()),
+            renewal: Arc::new(DfsLockRenewal::new()),
+            closed_sessions: Mutex::new(HashSet::new()),
+            closed_session_admission_closed: AtomicBool::new(false),
+            session_reap_cursor: AtomicU64::new(0),
+            proxy: LockProxyState::default(),
+        }
+    }
 }
 
 pub(super) enum DfsLockTarget {
@@ -338,7 +361,9 @@ impl DistributedFs {
                 "DFS lock authority returned an invalid lease identity",
             ));
         }
-        if lease.owner_node_id == self.node_id && lease.owner_session_id == self.session_id {
+        if lease.owner_node_id == self.identity.node_id
+            && lease.owner_session_id == self.identity.session_id
+        {
             self.ensure_local_write_owner(&lease)?;
             let authority = self.local_lock_authority(&inode.inode_id, lease)?;
             Ok(DfsLockTarget::Local(authority))
@@ -354,7 +379,8 @@ impl DistributedFs {
         inode_id: &InodeId,
     ) -> Result<Option<DfsLockTarget>> {
         if let Some(authority) = self
-            .lock_authorities
+            .locks
+            .authorities
             .read(inode_id)
             .map_err(|_| unavailable("DFS lock authority table is poisoned"))?
             .get(inode_id)
@@ -363,7 +389,9 @@ impl DistributedFs {
             return Ok(Some(DfsLockTarget::Local(authority)));
         }
         Ok(self
-            .remote_lock_authorities
+            .locks
+            .proxy
+            .authorities
             .lock()
             .map_err(|_| unavailable("DFS remote lock authority table is poisoned"))?
             .get(inode_id)
@@ -371,9 +399,10 @@ impl DistributedFs {
             .map(DfsLockTarget::Remote))
     }
 
-    fn reclaim_idle_lock_authorities(&self) -> Result<()> {
+    pub(super) fn reclaim_idle_lock_authorities(&self) -> Result<()> {
         let idle = self
-            .lock_authorities
+            .locks
+            .authorities
             .snapshot()?
             .into_iter()
             .filter(|(_, authority)| {
@@ -383,7 +412,8 @@ impl DistributedFs {
             .collect::<Vec<_>>();
         for (inode_id, authority) in idle {
             let mut authorities = self
-                .lock_authorities
+                .locks
+                .authorities
                 .write(&inode_id)
                 .map_err(|_| unavailable("DFS lock authority table is poisoned"))?;
             let current_is_idle = authorities.get(&inode_id).is_some_and(|current| {
@@ -396,7 +426,7 @@ impl DistributedFs {
             }
             drop(authorities);
             if current_is_idle {
-                let _ = self.lock_renewal.untrack_if_current(&inode_id, &authority);
+                let _ = self.locks.renewal.untrack_if_current(&inode_id, &authority);
             }
         }
         Ok(())
@@ -417,7 +447,8 @@ impl DistributedFs {
             state.waiters.clear();
         }
         let authority = Arc::new(DfsLockAuthority::new(lease));
-        self.lock_renewal
+        self.locks
+            .renewal
             .track(inode_id.clone(), authority.clone())?;
         Ok(authority)
     }
@@ -428,13 +459,15 @@ impl DistributedFs {
         lease: WriteLease,
     ) -> Result<Arc<DfsLockAuthority>> {
         let admission = self
-            .lock_authority_admission
+            .locks
+            .admission
             .lock()
             .map_err(|_| unavailable("DFS lock authority admission is poisoned"))?;
         self.reclaim_idle_lock_authorities()?;
-        let count = self.lock_authorities.len()?;
+        let count = self.locks.authorities.len()?;
         let mut authorities = self
-            .lock_authorities
+            .locks
+            .authorities
             .write(inode_id)
             .map_err(|_| unavailable("DFS lock authority table is poisoned"))?;
         if let Some(authority) = authorities.get(inode_id).cloned() {
@@ -461,75 +494,12 @@ impl DistributedFs {
             return Err(Error::from(std::io::Error::from_raw_os_error(libc::ENOLCK)));
         }
         let authority = Arc::new(DfsLockAuthority::new(lease));
-        self.lock_renewal
+        self.locks
+            .renewal
             .track(inode_id.clone(), authority.clone())?;
         authorities.insert(inode_id.clone(), authority.clone());
         drop(authorities);
         Ok(authority)
-    }
-
-    fn reclaim_idle_remote_lock_authorities(&self) -> Result<()> {
-        let active_session_inodes = self
-            .remote_lock_authority_sessions
-            .lock()
-            .map_err(|_| unavailable("DFS remote lock authority session table is poisoned"))?
-            .iter()
-            .filter(|&(_inode_id, sessions)| !sessions.is_empty())
-            .map(|(inode_id, _sessions)| inode_id.clone())
-            .collect::<HashSet<_>>();
-        let active_waiter_inodes = self
-            .remote_lock_waiters
-            .lock()
-            .map_err(|_| unavailable("DFS remote lock waiter table is poisoned"))?
-            .values()
-            .map(|remote| InodeId::new(remote.authority.inode_id.clone()))
-            .collect::<HashSet<_>>();
-        self.remote_lock_authorities
-            .lock()
-            .map_err(|_| unavailable("DFS remote lock authority table is poisoned"))?
-            .retain(|inode_id, _| {
-                active_session_inodes.contains(inode_id) || active_waiter_inodes.contains(inode_id)
-            });
-        Ok(())
-    }
-
-    fn remote_lock_authority(
-        &self,
-        inode_id: &InodeId,
-        lease: &WriteLease,
-    ) -> Result<DfsRemoteLockAuthority> {
-        self.reclaim_idle_remote_lock_authorities()?;
-        let owner = self.remote_owner(lease)?;
-        let remote = DfsRemoteLockAuthority {
-            owner,
-            authority: self.lock_authority_wire(inode_id, lease),
-        };
-        let mut authorities = self
-            .remote_lock_authorities
-            .lock()
-            .map_err(|_| unavailable("DFS remote lock authority table is poisoned"))?;
-        if !authorities.contains_key(inode_id) && authorities.len() >= MAX_REMOTE_LOCK_AUTHORITIES {
-            return Err(Error::from(std::io::Error::from_raw_os_error(libc::ENOLCK)));
-        }
-        authorities.insert(inode_id.clone(), remote.clone());
-        Ok(remote)
-    }
-
-    fn lock_authority_wire(
-        &self,
-        inode_id: &InodeId,
-        lease: &WriteLease,
-    ) -> afs_protocol::node_control::DfsOwnerLockAuthority {
-        afs_protocol::node_control::DfsOwnerLockAuthority {
-            namespace_id: self.namespace_id.0.clone(),
-            inode_id: inode_id.0.clone(),
-            owner_node_id: lease.owner_node_id.clone(),
-            owner_session_id: lease.owner_session_id.clone(),
-            lease_epoch: lease.lease_epoch,
-            lease_expires_at_unix_ms: lease.expires_at_unix_ms,
-            caller_node_id: self.node_id.clone(),
-            caller_session_id: self.session_id.clone(),
-        }
     }
 
     pub(super) fn lock_scope(
@@ -555,7 +525,7 @@ impl DistributedFs {
         scoped.rsplit('\0').next().unwrap_or(scoped)
     }
 
-    fn scoped_lock_process_session(scoped: &str) -> Option<(String, String)> {
+    pub(super) fn scoped_lock_process_session(scoped: &str) -> Option<(String, String)> {
         let mut parts = scoped.splitn(3, '\0');
         let node_id = parts.next()?;
         let session_id = parts.next()?;
@@ -567,8 +537,8 @@ impl DistributedFs {
     pub(super) fn scoped_local_lock_owner(&self, owner: FileLockOwner) -> Result<FileLockOwner> {
         Ok(FileLockOwner {
             ingress_session_id: Self::lock_scope(
-                &self.node_id,
-                &self.session_id,
+                &self.identity.node_id,
+                &self.identity.session_id,
                 &owner.ingress_session_id,
             )?,
             kernel_owner: owner.kernel_owner,
@@ -578,44 +548,8 @@ impl DistributedFs {
     pub(super) fn scoped_local_lock_waiter(&self, waiter: LockWaiterId) -> Result<LockWaiterId> {
         Ok(LockWaiterId {
             ingress_session_id: Self::lock_scope(
-                &self.node_id,
-                &self.session_id,
-                &waiter.ingress_session_id,
-            )?,
-            request_id: waiter.request_id,
-        })
-    }
-
-    pub(super) fn scoped_remote_lock_owner(
-        peer: &str,
-        caller_session_id: &str,
-        owner: afs_protocol::node_control::DfsOwnerLockOwner,
-    ) -> Result<FileLockOwner> {
-        if owner.ingress_session_id.is_empty() {
-            return Err(invalid("DFS lock owner session is empty"));
-        }
-        Ok(FileLockOwner {
-            ingress_session_id: Self::lock_scope(
-                peer,
-                caller_session_id,
-                &owner.ingress_session_id,
-            )?,
-            kernel_owner: owner.kernel_owner,
-        })
-    }
-
-    pub(super) fn scoped_remote_lock_waiter(
-        peer: &str,
-        caller_session_id: &str,
-        waiter: afs_protocol::node_control::DfsOwnerLockWaiter,
-    ) -> Result<LockWaiterId> {
-        if waiter.ingress_session_id.is_empty() {
-            return Err(invalid("DFS lock waiter session is empty"));
-        }
-        Ok(LockWaiterId {
-            ingress_session_id: Self::lock_scope(
-                peer,
-                caller_session_id,
+                &self.identity.node_id,
+                &self.identity.session_id,
                 &waiter.ingress_session_id,
             )?,
             request_id: waiter.request_id,
@@ -628,258 +562,5 @@ impl DistributedFs {
     ) -> Result<LockRequest> {
         request.owner = self.scoped_local_lock_owner(request.owner)?;
         Ok(request)
-    }
-
-    pub(super) fn scoped_remote_lock_request(
-        peer: &str,
-        caller_session_id: &str,
-        request: afs_protocol::node_control::DfsOwnerLockRequest,
-    ) -> Result<LockRequest> {
-        Ok(LockRequest {
-            kind: Self::file_lock_kind_from_wire(request.kind)?,
-            owner: Self::scoped_remote_lock_owner(
-                peer,
-                caller_session_id,
-                request
-                    .owner
-                    .ok_or_else(|| invalid("DFS lock owner is missing"))?,
-            )?,
-            pid: request.pid,
-            range: Self::file_lock_range_from_wire(
-                request
-                    .range
-                    .ok_or_else(|| invalid("DFS lock range is missing"))?,
-            )?,
-            lock_type: Self::file_lock_type_from_wire(request.lock_type)?,
-        })
-    }
-
-    fn validate_lock_authority(
-        &self,
-        peer: &str,
-        authority: &afs_protocol::node_control::DfsOwnerLockAuthority,
-    ) -> Result<WriteLease> {
-        if authority.namespace_id != self.namespace_id.0
-            || authority.owner_node_id != self.node_id
-            || authority.owner_session_id != self.session_id
-            || authority.caller_node_id != peer
-            || authority.caller_session_id.is_empty()
-            || authority.lease_epoch == 0
-        {
-            return Err(stale(
-                "DFS lock authority identity does not match this owner",
-            ));
-        }
-        if peer.contains('\0') || authority.caller_session_id.contains('\0') {
-            return Err(invalid("DFS lock authority contains an invalid NUL byte"));
-        }
-        match self.meta.current_node_session(peer)? {
-            Some(session_id) if session_id == authority.caller_session_id => {}
-            _ => {
-                return Err(stale(
-                    "DFS lock authority caller session is no longer current",
-                ));
-            }
-        }
-        let lease = WriteLease {
-            inode_id: InodeId::new(authority.inode_id.clone()),
-            owner_node_id: authority.owner_node_id.clone(),
-            owner_session_id: authority.owner_session_id.clone(),
-            lease_epoch: authority.lease_epoch,
-            expires_at_unix_ms: authority.lease_expires_at_unix_ms,
-        };
-        let renewed = self.meta.renew_write_lease(lease)?;
-        if renewed.owner_node_id != self.node_id
-            || renewed.owner_session_id != self.session_id
-            || renewed.lease_epoch != authority.lease_epoch
-        {
-            return Err(stale("DFS lock authority lease is no longer current"));
-        }
-        Ok(renewed)
-    }
-
-    pub(super) fn cached_local_authority_from_wire(
-        &self,
-        peer: &str,
-        authority: afs_protocol::node_control::DfsOwnerLockAuthority,
-    ) -> Result<Option<(InodeId, Arc<DfsLockAuthority>)>> {
-        if authority.namespace_id != self.namespace_id.0
-            || authority.owner_node_id != self.node_id
-            || authority.owner_session_id != self.session_id
-            || authority.caller_node_id != peer
-            || authority.caller_session_id.is_empty()
-            || authority.lease_epoch == 0
-        {
-            return Err(stale(
-                "DFS lock authority identity does not match this owner",
-            ));
-        }
-        if peer.contains('\0') || authority.caller_session_id.contains('\0') {
-            return Err(invalid("DFS lock authority contains an invalid NUL byte"));
-        }
-        let inode_id = InodeId::new(authority.inode_id);
-        let existing = self
-            .lock_authorities
-            .read(&inode_id)
-            .map_err(|_| unavailable("DFS lock authority table is poisoned"))?
-            .get(&inode_id)
-            .cloned();
-        let Some(existing) = existing else {
-            return Ok(None);
-        };
-        let epoch = existing
-            .state
-            .lock()
-            .map_err(|_| unavailable("DFS lock authority state is poisoned"))?
-            .lease
-            .lease_epoch;
-        if epoch != authority.lease_epoch {
-            return Ok(None);
-        }
-        Ok(Some((inode_id, existing)))
-    }
-
-    pub(super) fn local_authority_from_wire(
-        &self,
-        peer: &str,
-        authority: afs_protocol::node_control::DfsOwnerLockAuthority,
-    ) -> Result<(InodeId, Arc<DfsLockAuthority>)> {
-        let lease = self.validate_lock_authority(peer, &authority)?;
-        let inode_id = InodeId::new(authority.inode_id);
-        Ok((
-            inode_id.clone(),
-            self.local_lock_authority(&inode_id, lease)?,
-        ))
-    }
-
-    fn collect_peer_lock_scopes(&self) -> Result<HashMap<(String, String), HashSet<String>>> {
-        let authorities = self.lock_authorities.values_snapshot()?;
-        let mut scopes: HashMap<(String, String), HashSet<String>> = HashMap::new();
-        for authority in authorities {
-            let state = authority
-                .state
-                .lock()
-                .map_err(|_| unavailable("DFS lock authority state is poisoned"))?;
-            for scope in state
-                .pinned_owners
-                .iter()
-                .map(|owner| owner.ingress_session_id.as_str())
-                .chain(
-                    state
-                        .waiters
-                        .iter()
-                        .map(|waiter| waiter.ingress_session_id.as_str()),
-                )
-            {
-                if let Some(peer_session) = Self::scoped_lock_process_session(scope) {
-                    scopes
-                        .entry(peer_session)
-                        .or_default()
-                        .insert(scope.to_owned());
-                }
-            }
-        }
-        Ok(scopes)
-    }
-
-    pub(super) fn release_scoped_lock_sessions(&self, scopes: HashSet<String>) -> Result<usize> {
-        if scopes.is_empty() {
-            return Ok(0);
-        }
-        for scope in &scopes {
-            self.note_closed_lock_session(scope)?;
-        }
-        let authorities = self.lock_authorities.values_snapshot()?;
-        let mut first_error = None;
-        for authority in authorities {
-            for scope in &scopes {
-                if let Err(error) = authority.table.release_session(scope).map_err(lock_error) {
-                    first_error.get_or_insert(error);
-                }
-            }
-            let mut state = authority
-                .state
-                .lock()
-                .map_err(|_| unavailable("DFS lock authority state is poisoned"))?;
-            state
-                .pinned_owners
-                .retain(|owner| !scopes.contains(&owner.ingress_session_id));
-            state
-                .waiters
-                .retain(|waiter| !scopes.contains(&waiter.ingress_session_id));
-        }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(scopes.len())
-    }
-
-    pub fn reap_expired_peer_lock_sessions(&self) -> Result<usize> {
-        self.reclaim_idle_lock_authorities()?;
-        let deadline = std::time::Instant::now() + LOCK_SESSION_REAP_BUDGET;
-        let mut scoped_by_peer = self
-            .collect_peer_lock_scopes()?
-            .into_iter()
-            .collect::<Vec<_>>();
-        scoped_by_peer.sort_by(|left, right| left.0.cmp(&right.0));
-        if !scoped_by_peer.is_empty() {
-            let start = (self
-                .lock_session_reap_cursor
-                .fetch_add(1, Ordering::Relaxed) as usize)
-                % scoped_by_peer.len();
-            scoped_by_peer.rotate_left(start);
-        }
-        let mut reclaimed = 0usize;
-        let mut first_error = None;
-        let mut checked = 0usize;
-        for ((node_id, session_id), scopes) in scoped_by_peer {
-            if checked >= LOCK_SESSION_REAP_MAX_OPS || std::time::Instant::now() >= deadline {
-                break;
-            }
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let timeout = remaining.min(REMOTE_RELEASE_RPC_BUDGET);
-            if timeout.is_zero() {
-                break;
-            }
-            checked = checked.saturating_add(1);
-            match self
-                .meta
-                .current_node_session_with_timeout(&node_id, timeout)
-            {
-                Ok(current) if current.as_deref() != Some(session_id.as_str()) => {
-                    match self.release_scoped_lock_sessions(scopes) {
-                        Ok(count) => reclaimed = reclaimed.saturating_add(count),
-                        Err(error) => {
-                            first_error.get_or_insert(error);
-                        }
-                    }
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    first_error.get_or_insert(error);
-                }
-            }
-        }
-        match self.retry_closed_remote_lock_sessions_until(
-            deadline,
-            LOCK_SESSION_REAP_MAX_OPS.saturating_sub(checked),
-        ) {
-            Ok(count) => reclaimed = reclaimed.saturating_add(count),
-            Err(error) => {
-                first_error.get_or_insert(error);
-            }
-        }
-        match self
-            .retry_cancelled_remote_lock_waiter_acks_until(deadline, LOCK_SESSION_REAP_MAX_OPS)
-        {
-            Ok(count) => reclaimed = reclaimed.saturating_add(count),
-            Err(error) => {
-                first_error.get_or_insert(error);
-            }
-        }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(reclaimed)
     }
 }

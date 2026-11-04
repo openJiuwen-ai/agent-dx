@@ -29,6 +29,10 @@ use std::{
 #[cfg(any(feature = "ownerfs", feature = "dfs"))]
 use crate::node::rpc::data::{PeerAuthenticator, authenticate_peer};
 #[cfg(feature = "dfs")]
+use crate::node::vfs::dfs::owner_api::{
+    DfsOwnerLifecycleHandler, dfs_owner_lifecycle_unimplemented,
+};
+#[cfg(feature = "dfs")]
 use crate::node::vfs::types::OpenOptions;
 use afs_protocol::node_control::{
     CloseDataReply, CloseDataRequest, DfsOwnerAcknowledgeLockWaitReply,
@@ -415,100 +419,6 @@ impl RdmaSession {
             last_used: StdMutex::new(Instant::now()),
         }
     }
-}
-
-#[cfg(feature = "dfs")]
-pub trait DfsOwnerLifecycleHandler: Send + Sync + 'static {
-    fn open(
-        &self,
-        _peer: &str,
-        _request: DfsOwnerOpenRequest,
-    ) -> afs_error::Result<DfsOwnerOpenReply> {
-        Err(dfs_owner_lifecycle_unimplemented())
-    }
-
-    fn open_with_options(
-        &self,
-        peer: &str,
-        request: DfsOwnerOpenRequest,
-        options: OpenOptions,
-    ) -> afs_error::Result<DfsOwnerOpenReply> {
-        if options.kill_suidgid {
-            return Err(dfs_owner_lifecycle_unimplemented());
-        }
-        self.open(peer, request)
-    }
-    fn getattr(
-        &self,
-        _peer: &str,
-        _request: DfsOwnerGetAttrRequest,
-    ) -> afs_error::Result<DfsOwnerGetAttrReply> {
-        Err(dfs_owner_lifecycle_unimplemented())
-    }
-    fn mknod(
-        &self,
-        _peer: &str,
-        _request: DfsOwnerMknodRequest,
-    ) -> afs_error::Result<DfsOwnerMknodReply> {
-        Err(dfs_owner_lifecycle_unimplemented())
-    }
-    fn get_lock(
-        &self,
-        _peer: &str,
-        _request: DfsOwnerGetLockRequest,
-    ) -> afs_error::Result<DfsOwnerGetLockReply> {
-        Err(dfs_owner_lifecycle_unimplemented())
-    }
-    fn set_lock(
-        &self,
-        _peer: &str,
-        _request: DfsOwnerSetLockRequest,
-    ) -> afs_error::Result<DfsOwnerSetLockReply> {
-        Err(dfs_owner_lifecycle_unimplemented())
-    }
-    fn cancel_lock_wait(
-        &self,
-        _peer: &str,
-        _request: DfsOwnerCancelLockWaitRequest,
-    ) -> afs_error::Result<DfsOwnerCancelLockWaitReply> {
-        Err(dfs_owner_lifecycle_unimplemented())
-    }
-    fn acknowledge_lock_wait(
-        &self,
-        _peer: &str,
-        _request: DfsOwnerAcknowledgeLockWaitRequest,
-    ) -> afs_error::Result<DfsOwnerAcknowledgeLockWaitReply> {
-        Err(dfs_owner_lifecycle_unimplemented())
-    }
-    fn release_locks(
-        &self,
-        _peer: &str,
-        _request: DfsOwnerReleaseLocksRequest,
-    ) -> afs_error::Result<DfsOwnerReleaseLocksReply> {
-        Err(dfs_owner_lifecycle_unimplemented())
-    }
-    fn release_lock_session(
-        &self,
-        _peer: &str,
-        _request: DfsOwnerReleaseLockSessionRequest,
-    ) -> afs_error::Result<DfsOwnerReleaseLockSessionReply> {
-        Err(dfs_owner_lifecycle_unimplemented())
-    }
-    fn release(
-        &self,
-        _peer: &str,
-        _request: DfsOwnerReleaseRequest,
-    ) -> afs_error::Result<DfsOwnerReleaseReply> {
-        Err(dfs_owner_lifecycle_unimplemented())
-    }
-}
-
-#[cfg(feature = "dfs")]
-fn dfs_owner_lifecycle_unimplemented() -> afs_error::Error {
-    afs_error::Error::coded(
-        afs_error::NODE_VFS_UNIMPLEMENTED,
-        "DFS remote inode owner lifecycle is not wired",
-    )
 }
 
 #[cfg(any(feature = "ownerfs", feature = "dfs"))]

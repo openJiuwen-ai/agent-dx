@@ -283,7 +283,7 @@ impl OwnerOperationTable {
 /// `complete` (error or panic while applying) removes the placeholder so the
 /// same operation id can be applied again.
 struct OwnerOperationClaim<'a> {
-    fs: &'a DistributedFs,
+    table: &'a Mutex<OwnerOperationTable>,
     file: FileHandle,
     operation_id: OperationId,
     token: u64,
@@ -295,7 +295,7 @@ impl OwnerOperationClaim<'_> {
         self.done = true;
         // A poisoned table already fails every later admission, so dropping
         // the record here cannot turn into a silent second apply.
-        if let Ok(mut table) = self.fs.remote_operation_results.lock() {
+        if let Ok(mut table) = self.table.lock() {
             table.complete(self.file, &self.operation_id, self.token, result);
         }
     }
@@ -306,7 +306,7 @@ impl Drop for OwnerOperationClaim<'_> {
         if self.done {
             return;
         }
-        if let Ok(mut table) = self.fs.remote_operation_results.lock() {
+        if let Ok(mut table) = self.table.lock() {
             table.abandon(self.file, &self.operation_id, self.token);
         }
     }
@@ -335,7 +335,7 @@ impl DistributedFs {
         Ok(match begin {
             OwnerOperationBegin::Cached(result) => OwnerOperationStart::Cached(result),
             OwnerOperationBegin::Apply(token) => OwnerOperationStart::Apply(OwnerOperationClaim {
-                fs: self,
+                table: &self.remote_operation_results,
                 file,
                 operation_id,
                 token,
@@ -447,15 +447,15 @@ pub(super) enum DfsOwnerOpenAdmissionStart {
     },
 }
 
-impl crate::node::rpc::control::DfsOwnerLifecycleHandler for DistributedFs {
-    fn open(
+impl DistributedFs {
+    pub(super) fn owner_open(
         &self,
         peer: &str,
         request: afs_protocol::node_control::DfsOwnerOpenRequest,
     ) -> Result<afs_protocol::node_control::DfsOwnerOpenReply> {
-        if request.namespace_id != self.namespace_id.0
-            || request.owner_node_id != self.node_id
-            || request.owner_session_id != self.session_id
+        if request.namespace_id != self.identity.namespace_id.0
+            || request.owner_node_id != self.identity.node_id
+            || request.owner_session_id != self.identity.session_id
         {
             return Err(stale("DFS owner open targets another owner session"));
         }
@@ -495,8 +495,8 @@ impl crate::node::rpc::control::DfsOwnerLifecycleHandler for DistributedFs {
                 return Err(error);
             }
         };
-        if lease.owner_node_id != self.node_id
-            || lease.owner_session_id != self.session_id
+        if lease.owner_node_id != self.identity.node_id
+            || lease.owner_session_id != self.identity.session_id
             || lease.lease_epoch != request.lease_epoch
         {
             self.finish_failed_owner_open_admission(&route, open_seq)?;
@@ -574,7 +574,7 @@ impl crate::node::rpc::control::DfsOwnerLifecycleHandler for DistributedFs {
         Ok(afs_protocol::node_control::DfsOwnerOpenReply { handle: Some(wire) })
     }
 
-    fn getattr(
+    pub(super) fn owner_getattr(
         &self,
         peer: &str,
         request: afs_protocol::node_control::DfsOwnerGetAttrRequest,
@@ -590,241 +590,7 @@ impl crate::node::rpc::control::DfsOwnerLifecycleHandler for DistributedFs {
         })
     }
 
-    fn get_lock(
-        &self,
-        peer: &str,
-        request: afs_protocol::node_control::DfsOwnerGetLockRequest,
-    ) -> Result<afs_protocol::node_control::DfsOwnerGetLockReply> {
-        let authority = request
-            .authority
-            .ok_or_else(|| stale("DFS owner lock authority is missing"))?;
-        let lock = request
-            .lock
-            .ok_or_else(|| invalid("DFS owner lock request is missing"))?;
-        let caller_session_id = authority.caller_session_id.clone();
-        let (_, authority) = self.local_authority_from_wire(peer, authority)?;
-        let lock = Self::scoped_remote_lock_request(peer, &caller_session_id, lock)?;
-        self.check_lock_renewal(&authority)?;
-        let conflict = authority
-            .table
-            .getlk(&lock)
-            .map_err(lock_error)?
-            .map(Self::wire_lock_conflict);
-        Ok(afs_protocol::node_control::DfsOwnerGetLockReply { conflict })
-    }
-
-    fn set_lock(
-        &self,
-        peer: &str,
-        request: afs_protocol::node_control::DfsOwnerSetLockRequest,
-    ) -> Result<afs_protocol::node_control::DfsOwnerSetLockReply> {
-        let authority_wire = request
-            .authority
-            .ok_or_else(|| stale("DFS owner lock authority is missing"))?;
-        let lock = request
-            .lock
-            .ok_or_else(|| invalid("DFS owner lock request is missing"))?;
-        let caller_session_id = authority_wire.caller_session_id.clone();
-        let waiter = request
-            .waiter
-            .map(|waiter| Self::scoped_remote_lock_waiter(peer, &caller_session_id, waiter))
-            .transpose()?;
-        let (_, authority) = self.local_authority_from_wire(peer, authority_wire)?;
-        let lock = Self::scoped_remote_lock_request(peer, &caller_session_id, lock)?;
-        self.ensure_lock_session_open(&lock.owner.ingress_session_id)?;
-        if let Some(waiter_id) = waiter.as_ref() {
-            if waiter_id.ingress_session_id != lock.owner.ingress_session_id {
-                return Err(invalid("DFS lock waiter scope does not match owner scope"));
-            }
-            self.ensure_lock_session_open(&waiter_id.ingress_session_id)?;
-        }
-        self.check_lock_renewal(&authority)?;
-        let result = if let Some(waiter_id) = waiter.clone() {
-            self.register_lock_waiter(&authority, &waiter_id)?;
-            let result = authority
-                .table
-                .setlk_blocking(lock.clone(), waiter_id.clone())
-                .map_err(lock_error);
-            self.unpin_lock_waiter(&authority, waiter.as_ref())?;
-            result
-        } else {
-            authority
-                .table
-                .setlk_nonblocking(lock.clone())
-                .map_err(lock_error)
-        };
-        if result.is_ok() {
-            self.register_local_lock_success(&authority, &lock)?;
-            self.check_lock_renewal_after_mutation(&authority)?;
-        }
-        result?;
-        Ok(afs_protocol::node_control::DfsOwnerSetLockReply {})
-    }
-
-    fn cancel_lock_wait(
-        &self,
-        peer: &str,
-        request: afs_protocol::node_control::DfsOwnerCancelLockWaitRequest,
-    ) -> Result<afs_protocol::node_control::DfsOwnerCancelLockWaitReply> {
-        let authority_wire = request
-            .authority
-            .ok_or_else(|| stale("DFS owner lock authority is missing"))?;
-        let caller_session_id = authority_wire.caller_session_id.clone();
-        let waiter = Self::scoped_remote_lock_waiter(
-            peer,
-            &caller_session_id,
-            request
-                .waiter
-                .ok_or_else(|| invalid("DFS owner lock waiter is missing"))?,
-        )?;
-        let Some((_, authority)) = self.cached_local_authority_from_wire(peer, authority_wire)?
-        else {
-            self.note_precancelled_lock_waiter(waiter)?;
-            return Ok(afs_protocol::node_control::DfsOwnerCancelLockWaitReply { outcome: 1 });
-        };
-        let outcome = authority
-            .table
-            .cancel_waiter_with_outcome(waiter.clone())
-            .map_err(lock_error)?;
-        authority
-            .state
-            .lock()
-            .map_err(|_| unavailable("DFS lock authority state is poisoned"))?
-            .waiters
-            .remove(&waiter);
-        Ok(afs_protocol::node_control::DfsOwnerCancelLockWaitReply {
-            outcome: match outcome {
-                LockWaiterOutcome::Cancelled => 1,
-                LockWaiterOutcome::Granted => 2,
-                LockWaiterOutcome::Unknown => 3,
-            },
-        })
-    }
-
-    fn acknowledge_lock_wait(
-        &self,
-        peer: &str,
-        request: afs_protocol::node_control::DfsOwnerAcknowledgeLockWaitRequest,
-    ) -> Result<afs_protocol::node_control::DfsOwnerAcknowledgeLockWaitReply> {
-        let authority_wire = request
-            .authority
-            .ok_or_else(|| stale("DFS owner lock authority is missing"))?;
-        let caller_session_id = authority_wire.caller_session_id.clone();
-        let waiter = Self::scoped_remote_lock_waiter(
-            peer,
-            &caller_session_id,
-            request
-                .waiter
-                .ok_or_else(|| invalid("DFS owner lock waiter is missing"))?,
-        )?;
-        let Some((_, authority)) = self.cached_local_authority_from_wire(peer, authority_wire)?
-        else {
-            return Ok(afs_protocol::node_control::DfsOwnerAcknowledgeLockWaitReply {});
-        };
-        authority
-            .table
-            .acknowledge_waiter(&waiter)
-            .map_err(lock_error)?;
-        authority
-            .state
-            .lock()
-            .map_err(|_| unavailable("DFS lock authority state is poisoned"))?
-            .waiters
-            .remove(&waiter);
-        Ok(afs_protocol::node_control::DfsOwnerAcknowledgeLockWaitReply {})
-    }
-
-    fn release_locks(
-        &self,
-        peer: &str,
-        request: afs_protocol::node_control::DfsOwnerReleaseLocksRequest,
-    ) -> Result<afs_protocol::node_control::DfsOwnerReleaseLocksReply> {
-        let authority_wire = request
-            .authority
-            .ok_or_else(|| stale("DFS owner lock authority is missing"))?;
-        let caller_session_id = authority_wire.caller_session_id.clone();
-        let owner = Self::scoped_remote_lock_owner(
-            peer,
-            &caller_session_id,
-            request
-                .owner
-                .ok_or_else(|| invalid("DFS owner lock owner is missing"))?,
-        )?;
-        let kind = Self::lock_release_kind_from_wire(request.release_kind)?;
-        let Some((_, authority)) = self.cached_local_authority_from_wire(peer, authority_wire)?
-        else {
-            return Ok(afs_protocol::node_control::DfsOwnerReleaseLocksReply {});
-        };
-        match kind {
-            ReleaseKind::PosixOwner => authority.table.release_posix_owner(&owner),
-            ReleaseKind::FlockOwner => authority.table.release_flock_owner(&owner),
-        }
-        .map_err(lock_error)?;
-        self.unpin_owner_if_inactive(
-            &authority,
-            &owner,
-            Some(match kind {
-                ReleaseKind::PosixOwner => FileLockKind::Posix,
-                ReleaseKind::FlockOwner => FileLockKind::Flock,
-            }),
-        )?;
-        Ok(afs_protocol::node_control::DfsOwnerReleaseLocksReply {})
-    }
-
-    fn release_lock_session(
-        &self,
-        peer: &str,
-        request: afs_protocol::node_control::DfsOwnerReleaseLockSessionRequest,
-    ) -> Result<afs_protocol::node_control::DfsOwnerReleaseLockSessionReply> {
-        let authority_wire = request
-            .authority
-            .ok_or_else(|| stale("DFS owner lock authority is missing"))?;
-        if request.ingress_session_id.is_empty() {
-            return Err(invalid("DFS owner release lock session is empty"));
-        }
-        let caller_session_id = authority_wire.caller_session_id.clone();
-        let scoped_session =
-            Self::lock_scope(peer, &caller_session_id, &request.ingress_session_id)?;
-        self.note_closed_lock_session(&scoped_session)?;
-        let Some((_, authority)) = self.cached_local_authority_from_wire(peer, authority_wire)?
-        else {
-            return Ok(afs_protocol::node_control::DfsOwnerReleaseLockSessionReply {});
-        };
-        let known_session = {
-            let state = authority
-                .state
-                .lock()
-                .map_err(|_| unavailable("DFS lock authority state is poisoned"))?;
-            state
-                .pinned_owners
-                .iter()
-                .any(|owner| owner.ingress_session_id == scoped_session)
-                || state
-                    .waiters
-                    .iter()
-                    .any(|waiter| waiter.ingress_session_id == scoped_session)
-        };
-        if !known_session {
-            return Ok(afs_protocol::node_control::DfsOwnerReleaseLockSessionReply {});
-        }
-        authority
-            .table
-            .release_session(&scoped_session)
-            .map_err(lock_error)?;
-        let mut state = authority
-            .state
-            .lock()
-            .map_err(|_| unavailable("DFS lock authority state is poisoned"))?;
-        state
-            .pinned_owners
-            .retain(|owner| owner.ingress_session_id != scoped_session);
-        state
-            .waiters
-            .retain(|waiter| waiter.ingress_session_id != scoped_session);
-        Ok(afs_protocol::node_control::DfsOwnerReleaseLockSessionReply {})
-    }
-
-    fn release(
+    pub(super) fn owner_release(
         &self,
         peer: &str,
         request: afs_protocol::node_control::DfsOwnerReleaseRequest,
@@ -854,8 +620,8 @@ impl crate::node::rpc::control::DfsOwnerLifecycleHandler for DistributedFs {
     }
 }
 
-impl crate::node::rpc::data::DfsOwnerFilesHandler for DistributedFs {
-    fn read(
+impl DistributedFs {
+    pub(super) fn owner_read(
         &self,
         peer: &str,
         request: afs_protocol::node_data::DfsOwnerReadRequest,
@@ -884,7 +650,7 @@ impl crate::node::rpc::data::DfsOwnerFilesHandler for DistributedFs {
         })
     }
 
-    fn write(
+    pub(super) fn owner_write(
         &self,
         peer: &str,
         request: afs_protocol::node_data::DfsOwnerWriteRequest,
@@ -942,7 +708,7 @@ impl crate::node::rpc::data::DfsOwnerFilesHandler for DistributedFs {
         Ok(reply)
     }
 
-    fn resize(
+    pub(super) fn owner_resize(
         &self,
         peer: &str,
         request: afs_protocol::node_data::DfsOwnerResizeRequest,
@@ -974,7 +740,7 @@ impl crate::node::rpc::data::DfsOwnerFilesHandler for DistributedFs {
         Ok(reply)
     }
 
-    fn sync(
+    pub(super) fn owner_sync(
         &self,
         peer: &str,
         request: afs_protocol::node_data::DfsOwnerSyncRequest,
@@ -1034,17 +800,22 @@ impl crate::node::rpc::data::DfsOwnerFilesHandler for DistributedFs {
 impl DistributedFs {
     #[cfg(test)]
     pub(super) fn set_owner_open_finish_pause(&self, pause: Option<Arc<OwnerOpenFinishPause>>) {
-        *self.owner_open_finish_pause.lock().unwrap() = pause;
+        *self.hooks.owner_open_finish_pause.lock().unwrap() = pause;
     }
 
     #[cfg(test)]
     pub(super) fn set_remote_operation_before_apply(&self, hook: Box<dyn FnOnce() + Send>) {
-        *self.remote_operation_before_apply.lock().unwrap() = Some(hook);
+        *self.hooks.remote_operation_before_apply.lock().unwrap() = Some(hook);
     }
 
     #[cfg(test)]
     fn run_remote_operation_before_apply_hook(&self) {
-        let hook = self.remote_operation_before_apply.lock().unwrap().take();
+        let hook = self
+            .hooks
+            .remote_operation_before_apply
+            .lock()
+            .unwrap()
+            .take();
         if let Some(hook) = hook {
             hook();
         }
@@ -1057,7 +828,7 @@ impl DistributedFs {
 
     #[cfg(test)]
     fn pause_before_owner_open_finish(&self) {
-        let pause = self.owner_open_finish_pause.lock().unwrap().clone();
+        let pause = self.hooks.owner_open_finish_pause.lock().unwrap().clone();
         if let Some(pause) = pause {
             pause.pause();
         }
@@ -1224,9 +995,9 @@ impl DistributedFs {
         if handle.open_seq == 0 {
             return Err(stale("DFS owner open sequence is missing"));
         }
-        if handle.namespace_id != self.namespace_id.0
-            || handle.owner_node_id != self.node_id
-            || handle.owner_session_id != self.session_id
+        if handle.namespace_id != self.identity.namespace_id.0
+            || handle.owner_node_id != self.identity.node_id
+            || handle.owner_session_id != self.identity.session_id
             || handle.caller_node_id != peer
             || handle.caller_session_id.is_empty()
             || handle.lease_epoch == 0
@@ -1334,9 +1105,9 @@ impl DistributedFs {
         peer: &str,
         handle: &afs_protocol::node_control::DfsOwnerHandle,
     ) -> Result<()> {
-        if handle.namespace_id != self.namespace_id.0
-            || handle.owner_node_id != self.node_id
-            || handle.owner_session_id != self.session_id
+        if handle.namespace_id != self.identity.namespace_id.0
+            || handle.owner_node_id != self.identity.node_id
+            || handle.owner_session_id != self.identity.session_id
             || handle.caller_node_id != peer
             || handle.caller_session_id.is_empty()
             || handle.lease_epoch == 0
@@ -1370,8 +1141,8 @@ impl DistributedFs {
             .lock()
             .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
         if state.write_lease.lease_epoch != handle.lease_epoch
-            || state.write_lease.owner_node_id != self.node_id
-            || state.write_lease.owner_session_id != self.session_id
+            || state.write_lease.owner_node_id != self.identity.node_id
+            || state.write_lease.owner_session_id != self.identity.session_id
         {
             return Err(stale("DFS owner lease epoch is stale"));
         }
@@ -1383,9 +1154,9 @@ impl DistributedFs {
         peer: &str,
         handle: &afs_protocol::node_control::DfsOwnerHandle,
     ) -> Result<(InodeId, FileHandle)> {
-        if handle.namespace_id != self.namespace_id.0
-            || handle.owner_node_id != self.node_id
-            || handle.owner_session_id != self.session_id
+        if handle.namespace_id != self.identity.namespace_id.0
+            || handle.owner_node_id != self.identity.node_id
+            || handle.owner_session_id != self.identity.session_id
             || handle.caller_node_id != peer
             || handle.lease_epoch == 0
             || handle.open_seq == 0
@@ -1551,8 +1322,105 @@ impl DistributedFs {
             .retain(|route, _| {
                 !(route.caller_node_id == node_id
                     && route.caller_session_id == session_id
-                    && route.owner_session_id == self.session_id)
+                    && route.owner_session_id == self.identity.session_id)
             });
         Ok(reaped)
+    }
+}
+
+impl owner_api::DfsOwnerLifecycleHandler for DistributedFs {
+    fn open(
+        &self,
+        peer: &str,
+        request: afs_protocol::node_control::DfsOwnerOpenRequest,
+    ) -> Result<afs_protocol::node_control::DfsOwnerOpenReply> {
+        self.owner_open(peer, request)
+    }
+    fn getattr(
+        &self,
+        peer: &str,
+        request: afs_protocol::node_control::DfsOwnerGetAttrRequest,
+    ) -> Result<afs_protocol::node_control::DfsOwnerGetAttrReply> {
+        self.owner_getattr(peer, request)
+    }
+    fn get_lock(
+        &self,
+        peer: &str,
+        request: afs_protocol::node_control::DfsOwnerGetLockRequest,
+    ) -> Result<afs_protocol::node_control::DfsOwnerGetLockReply> {
+        self.owner_get_lock(peer, request)
+    }
+    fn set_lock(
+        &self,
+        peer: &str,
+        request: afs_protocol::node_control::DfsOwnerSetLockRequest,
+    ) -> Result<afs_protocol::node_control::DfsOwnerSetLockReply> {
+        self.owner_set_lock(peer, request)
+    }
+    fn cancel_lock_wait(
+        &self,
+        peer: &str,
+        request: afs_protocol::node_control::DfsOwnerCancelLockWaitRequest,
+    ) -> Result<afs_protocol::node_control::DfsOwnerCancelLockWaitReply> {
+        self.owner_cancel_lock_wait(peer, request)
+    }
+    fn acknowledge_lock_wait(
+        &self,
+        peer: &str,
+        request: afs_protocol::node_control::DfsOwnerAcknowledgeLockWaitRequest,
+    ) -> Result<afs_protocol::node_control::DfsOwnerAcknowledgeLockWaitReply> {
+        self.owner_acknowledge_lock_wait(peer, request)
+    }
+    fn release_locks(
+        &self,
+        peer: &str,
+        request: afs_protocol::node_control::DfsOwnerReleaseLocksRequest,
+    ) -> Result<afs_protocol::node_control::DfsOwnerReleaseLocksReply> {
+        self.owner_release_locks(peer, request)
+    }
+    fn release_lock_session(
+        &self,
+        peer: &str,
+        request: afs_protocol::node_control::DfsOwnerReleaseLockSessionRequest,
+    ) -> Result<afs_protocol::node_control::DfsOwnerReleaseLockSessionReply> {
+        self.owner_release_lock_session(peer, request)
+    }
+    fn release(
+        &self,
+        peer: &str,
+        request: afs_protocol::node_control::DfsOwnerReleaseRequest,
+    ) -> Result<afs_protocol::node_control::DfsOwnerReleaseReply> {
+        self.owner_release(peer, request)
+    }
+}
+
+impl owner_api::DfsOwnerFilesHandler for DistributedFs {
+    fn read(
+        &self,
+        peer: &str,
+        request: afs_protocol::node_data::DfsOwnerReadRequest,
+    ) -> Result<afs_protocol::node_data::DfsOwnerReadReply> {
+        self.owner_read(peer, request)
+    }
+    fn write(
+        &self,
+        peer: &str,
+        request: afs_protocol::node_data::DfsOwnerWriteRequest,
+    ) -> Result<afs_protocol::node_data::DfsOwnerWriteReply> {
+        self.owner_write(peer, request)
+    }
+    fn resize(
+        &self,
+        peer: &str,
+        request: afs_protocol::node_data::DfsOwnerResizeRequest,
+    ) -> Result<afs_protocol::node_data::DfsOwnerResizeReply> {
+        self.owner_resize(peer, request)
+    }
+    fn sync(
+        &self,
+        peer: &str,
+        request: afs_protocol::node_data::DfsOwnerSyncRequest,
+    ) -> Result<afs_protocol::node_data::DfsOwnerSyncReply> {
+        self.owner_sync(peer, request)
     }
 }

@@ -362,7 +362,8 @@ fn dfs_release_scoped_session_cleans_scope_when_closed_tombstones_are_full() {
         )
         .unwrap();
     for index in 0..MAX_CLOSED_LOCK_SESSIONS {
-        fs.closed_lock_sessions
+        fs.locks
+            .closed_sessions
             .lock()
             .unwrap()
             .insert(format!("closed-{index}"));
@@ -402,12 +403,13 @@ fn dfs_release_scoped_session_cleans_scope_when_closed_tombstones_are_full() {
     scopes.insert(released_scope.clone());
     assert_eq!(fs.release_scoped_lock_sessions(scopes).unwrap(), 1);
 
-    let closed = fs.closed_lock_sessions.lock().unwrap();
+    let closed = fs.locks.closed_sessions.lock().unwrap();
     assert_eq!(closed.len(), MAX_CLOSED_LOCK_SESSIONS);
     assert!(!closed.contains(&released_scope));
     drop(closed);
     assert!(
-        fs.closed_lock_session_admission_closed
+        fs.locks
+            .closed_session_admission_closed
             .load(Ordering::Acquire)
     );
     assert!(fs.ensure_lock_session_open("new-mount").is_err());
@@ -477,14 +479,17 @@ fn dfs_remote_lock_session_release_failure_retains_identity_for_retry() {
         ingress_session_id: scoped_session.clone(),
         request_id: 7,
     };
-    fs.remote_lock_authorities
+    fs.locks
+        .proxy
+        .authorities
         .lock()
         .unwrap()
         .insert(inode_id.clone(), remote.clone());
     fs.note_remote_lock_session(&inode_id, &scoped_session)
         .unwrap();
     for index in 0..MAX_CLOSED_LOCK_SESSIONS {
-        fs.closed_lock_sessions
+        fs.locks
+            .closed_sessions
             .lock()
             .unwrap()
             .insert(format!("closed-remote-{index}"));
@@ -497,12 +502,14 @@ fn dfs_remote_lock_session_release_failure_retains_identity_for_retry() {
         afs_error::NODE_VFS_UNAVAILABLE
     );
     assert_eq!(owner.call_count(), 1);
-    let closed = fs.closed_lock_sessions.lock().unwrap();
+    let closed = fs.locks.closed_sessions.lock().unwrap();
     assert_eq!(closed.len(), MAX_CLOSED_LOCK_SESSIONS);
     assert!(!closed.contains(&scoped_session));
     drop(closed);
     assert_eq!(
-        fs.remote_lock_authority_sessions
+        fs.locks
+            .proxy
+            .authority_sessions
             .lock()
             .unwrap()
             .get(&inode_id)
@@ -516,9 +523,11 @@ fn dfs_remote_lock_session_release_failure_retains_identity_for_retry() {
             .code(),
         afs_error::IO_INTERRUPTED
     );
-    assert!(fs.remote_lock_waiters.lock().unwrap().contains_key(&waiter));
+    assert!(fs.locks.proxy.waiters.lock().unwrap().contains_key(&waiter));
     assert!(
-        fs.remote_lock_authorities
+        fs.locks
+            .proxy
+            .authorities
             .lock()
             .unwrap()
             .contains_key(&inode_id)
@@ -527,14 +536,18 @@ fn dfs_remote_lock_session_release_failure_retains_identity_for_retry() {
     assert_eq!(fs.reap_expired_peer_lock_sessions().unwrap(), 1);
     assert_eq!(owner.call_count(), 2);
     assert!(
-        !fs.remote_lock_authority_sessions
+        !fs.locks
+            .proxy
+            .authority_sessions
             .lock()
             .unwrap()
             .contains_key(&inode_id)
     );
-    assert!(!fs.remote_lock_waiters.lock().unwrap().contains_key(&waiter));
+    assert!(!fs.locks.proxy.waiters.lock().unwrap().contains_key(&waiter));
     assert!(
-        !fs.remote_lock_authorities
+        !fs.locks
+            .proxy
+            .authorities
             .lock()
             .unwrap()
             .contains_key(&inode_id)
@@ -579,7 +592,7 @@ fn dfs_remote_lock_precancel_survives_replayed_waiter_identity() {
             .code(),
         afs_error::IO_INTERRUPTED
     );
-    assert!(fs.remote_lock_waiters.lock().unwrap().is_empty());
+    assert!(fs.locks.proxy.waiters.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -610,7 +623,7 @@ fn dfs_remote_lock_waiter_route_rejects_duplicate_identity() {
         .unwrap_err();
 
     assert_eq!(error.code(), afs_error::IO_OTHER);
-    assert_eq!(fs.remote_lock_waiters.lock().unwrap().len(), 1);
+    assert_eq!(fs.locks.proxy.waiters.lock().unwrap().len(), 1);
 }
 
 #[test]
@@ -660,7 +673,8 @@ fn dfs_local_posix_locks_conflict_and_release_by_owner() {
     )
     .unwrap_err();
     let authority = fs
-        .lock_authorities
+        .locks
+        .authorities
         .read(&InodeId::new("inode:test"))
         .unwrap()
         .get(&InodeId::new("inode:test"))
@@ -715,14 +729,14 @@ fn dfs_owner_lock_authority_is_bound_to_authenticated_peer() {
             lock_range(0, 0),
         ))),
     };
-    <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::get_lock(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::get_lock(
         &fs,
         "node-b",
         request.clone(),
     )
     .unwrap();
     assert_eq!(
-        <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::get_lock(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::get_lock(
             &fs, "node-c", request,
         )
         .unwrap_err()
@@ -741,7 +755,7 @@ fn dfs_owner_lock_release_is_scoped_by_authenticated_process_session() {
         70,
         lock_range(0, 99),
     );
-    <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::set_lock(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::set_lock(
         &fs,
         "node-b",
         afs_protocol::node_control::DfsOwnerSetLockRequest {
@@ -754,7 +768,7 @@ fn dfs_owner_lock_release_is_scoped_by_authenticated_process_session() {
 
     let mut forged_authority = authority.clone();
     forged_authority.caller_session_id = "session-other".into();
-    <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release_locks(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::release_locks(
         &fs,
         "node-b",
         afs_protocol::node_control::DfsOwnerReleaseLocksRequest {
@@ -766,7 +780,7 @@ fn dfs_owner_lock_release_is_scoped_by_authenticated_process_session() {
     .unwrap();
 
     let conflict =
-        <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::get_lock(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::get_lock(
             &fs,
             "node-b",
             afs_protocol::node_control::DfsOwnerGetLockRequest {
@@ -787,7 +801,7 @@ fn dfs_owner_lock_release_is_scoped_by_authenticated_process_session() {
         .expect("forged release must not drop another process session's lock");
     assert_eq!(conflict.owner, lock.owner);
 
-    <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release_locks(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::release_locks(
         &fs,
         "node-b",
         afs_protocol::node_control::DfsOwnerReleaseLocksRequest {
@@ -798,7 +812,7 @@ fn dfs_owner_lock_release_is_scoped_by_authenticated_process_session() {
     )
     .unwrap();
     assert!(
-        <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::get_lock(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::get_lock(
             &fs,
             "node-b",
             afs_protocol::node_control::DfsOwnerGetLockRequest {
@@ -823,12 +837,14 @@ fn dfs_remote_lock_session_presence_is_not_refcounted_by_lock_count() {
     let inode_id = InodeId::new("inode:remote-presence");
     assert!(fs.note_remote_lock_session(&inode_id, "mount-a").unwrap());
     assert!(!fs.note_remote_lock_session(&inode_id, "mount-a").unwrap());
-    let sessions = fs.remote_lock_authority_sessions.lock().unwrap();
+    let sessions = fs.locks.proxy.authority_sessions.lock().unwrap();
     assert_eq!(sessions.get(&inode_id).unwrap().get("mount-a"), Some(&1));
     drop(sessions);
     fs.forget_remote_lock_session(&inode_id, "mount-a").unwrap();
     assert!(
-        !fs.remote_lock_authority_sessions
+        !fs.locks
+            .proxy
+            .authority_sessions
             .lock()
             .unwrap()
             .contains_key(&inode_id)
@@ -878,13 +894,17 @@ fn remote_interrupted_lock_wait_does_not_issue_redundant_cancel_ack() {
         request_id: 94,
     };
     assert!(
-        fs.remote_lock_waiters
+        fs.locks
+            .proxy
+            .waiters
             .lock()
             .unwrap()
             .contains_key(&scoped_waiter)
     );
     assert!(
-        fs.cancelled_remote_lock_waiters
+        fs.locks
+            .proxy
+            .cancelled_waiters
             .lock()
             .unwrap()
             .contains(&scoped_waiter)
@@ -893,13 +913,17 @@ fn remote_interrupted_lock_wait_does_not_issue_redundant_cancel_ack() {
     assert_eq!(fs.reap_expired_peer_lock_sessions().unwrap(), 1);
     assert_eq!(remote.acknowledge_call_count(), 1);
     assert!(
-        !fs.remote_lock_waiters
+        !fs.locks
+            .proxy
+            .waiters
             .lock()
             .unwrap()
             .contains_key(&scoped_waiter)
     );
     assert!(
-        !fs.cancelled_remote_lock_waiters
+        !fs.locks
+            .proxy
+            .cancelled_waiters
             .lock()
             .unwrap()
             .contains(&scoped_waiter)
@@ -949,13 +973,17 @@ fn remote_cancel_ack_failure_retains_waiter_for_background_retry() {
         request_id: 95,
     };
     assert!(
-        fs.remote_lock_waiters
+        fs.locks
+            .proxy
+            .waiters
             .lock()
             .unwrap()
             .contains_key(&scoped_waiter)
     );
     assert!(
-        fs.cancelled_remote_lock_waiters
+        fs.locks
+            .proxy
+            .cancelled_waiters
             .lock()
             .unwrap()
             .contains(&scoped_waiter)
@@ -964,13 +992,17 @@ fn remote_cancel_ack_failure_retains_waiter_for_background_retry() {
     assert_eq!(fs.reap_expired_peer_lock_sessions().unwrap(), 1);
     assert_eq!(remote.acknowledge_call_count(), 2);
     assert!(
-        !fs.remote_lock_waiters
+        !fs.locks
+            .proxy
+            .waiters
             .lock()
             .unwrap()
             .contains_key(&scoped_waiter)
     );
     assert!(
-        !fs.cancelled_remote_lock_waiters
+        !fs.locks
+            .proxy
+            .cancelled_waiters
             .lock()
             .unwrap()
             .contains(&scoped_waiter)
@@ -987,7 +1019,7 @@ fn dfs_owner_lock_session_release_is_scoped_by_authenticated_process_session() {
         80,
         lock_range(0, 99),
     );
-    <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::set_lock(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::set_lock(
         &fs,
         "node-b",
         afs_protocol::node_control::DfsOwnerSetLockRequest {
@@ -1000,7 +1032,7 @@ fn dfs_owner_lock_session_release_is_scoped_by_authenticated_process_session() {
 
     let mut forged_authority = authority.clone();
     forged_authority.caller_session_id = "session-other".into();
-    <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release_lock_session(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::release_lock_session(
         &fs,
         "node-b",
         afs_protocol::node_control::DfsOwnerReleaseLockSessionRequest {
@@ -1010,7 +1042,7 @@ fn dfs_owner_lock_session_release_is_scoped_by_authenticated_process_session() {
     )
     .unwrap();
     assert!(
-        <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::get_lock(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::get_lock(
             &fs,
             "node-b",
             afs_protocol::node_control::DfsOwnerGetLockRequest {
@@ -1028,7 +1060,7 @@ fn dfs_owner_lock_session_release_is_scoped_by_authenticated_process_session() {
         .is_some()
     );
 
-    <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release_lock_session(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::release_lock_session(
         &fs,
         "node-b",
         afs_protocol::node_control::DfsOwnerReleaseLockSessionRequest {
@@ -1038,7 +1070,7 @@ fn dfs_owner_lock_session_release_is_scoped_by_authenticated_process_session() {
     )
     .unwrap();
     assert!(
-        <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::get_lock(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::get_lock(
             &fs,
             "node-b",
             afs_protocol::node_control::DfsOwnerGetLockRequest {
@@ -1066,7 +1098,7 @@ fn dfs_owner_cancel_before_authority_precancels_replayed_waiter() {
         request_id: 91,
     };
     let cancel =
-        <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::cancel_lock_wait(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::cancel_lock_wait(
             &fs,
             "node-b",
             afs_protocol::node_control::DfsOwnerCancelLockWaitRequest {
@@ -1083,16 +1115,17 @@ fn dfs_owner_cancel_before_authority_precancels_replayed_waiter() {
         91,
         lock_range(0, 99),
     );
-    let error = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::set_lock(
-        &fs,
-        "node-b",
-        afs_protocol::node_control::DfsOwnerSetLockRequest {
-            authority: Some(authority),
-            lock: Some(DistributedFs::wire_lock_request(&lock)),
-            waiter: Some(waiter),
-        },
-    )
-    .unwrap_err();
+    let error =
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::set_lock(
+            &fs,
+            "node-b",
+            afs_protocol::node_control::DfsOwnerSetLockRequest {
+                authority: Some(authority),
+                lock: Some(DistributedFs::wire_lock_request(&lock)),
+                waiter: Some(waiter),
+            },
+        )
+        .unwrap_err();
     assert_eq!(error.code(), afs_error::IO_INTERRUPTED);
 }
 
@@ -1108,7 +1141,7 @@ fn interrupted_owner_lock_wait_does_not_run_post_mutation_renewal() {
         92,
         lock_range(0, 99),
     );
-    <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::set_lock(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::set_lock(
         fs.as_ref(),
         "node-b",
         afs_protocol::node_control::DfsOwnerSetLockRequest {
@@ -1135,7 +1168,7 @@ fn interrupted_owner_lock_wait_does_not_run_post_mutation_renewal() {
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let join = std::thread::spawn(move || {
         let result =
-            <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::set_lock(
+            <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::set_lock(
                 fs_for_waiter.as_ref(),
                 "node-b",
                 afs_protocol::node_control::DfsOwnerSetLockRequest {
@@ -1150,7 +1183,8 @@ fn interrupted_owner_lock_wait_does_not_run_post_mutation_renewal() {
     let mut registered = false;
     for _ in 0..100 {
         registered = fs
-            .lock_authorities
+            .locks
+            .authorities
             .values_snapshot()
             .unwrap()
             .iter()
@@ -1165,7 +1199,8 @@ fn interrupted_owner_lock_wait_does_not_run_post_mutation_renewal() {
         "waiter should be registered before cancellation"
     );
     let local_authority = fs
-        .lock_authorities
+        .locks
+        .authorities
         .read(&inode_id)
         .unwrap()
         .get(&inode_id)
@@ -1179,7 +1214,7 @@ fn interrupted_owner_lock_wait_does_not_run_post_mutation_renewal() {
         .expires_at_unix_ms = now_unix_ms().saturating_add(4_000);
     let renews_after_waiter_registered = meta.renew_call_count();
     let pause = meta.pause_next_renew();
-    <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::cancel_lock_wait(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::cancel_lock_wait(
         fs.as_ref(),
         "node-b",
         afs_protocol::node_control::DfsOwnerCancelLockWaitRequest {
@@ -1217,19 +1252,20 @@ fn dfs_owner_lock_waiter_must_share_owner_ingress_scope() {
         90,
         lock_range(0, 99),
     );
-    let error = <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::set_lock(
-        &fs,
-        "node-b",
-        afs_protocol::node_control::DfsOwnerSetLockRequest {
-            authority: Some(authority),
-            lock: Some(DistributedFs::wire_lock_request(&lock)),
-            waiter: Some(afs_protocol::node_control::DfsOwnerLockWaiter {
-                ingress_session_id: "mount-other".into(),
-                request_id: 90,
-            }),
-        },
-    )
-    .unwrap_err();
+    let error =
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::set_lock(
+            &fs,
+            "node-b",
+            afs_protocol::node_control::DfsOwnerSetLockRequest {
+                authority: Some(authority),
+                lock: Some(DistributedFs::wire_lock_request(&lock)),
+                waiter: Some(afs_protocol::node_control::DfsOwnerLockWaiter {
+                    ingress_session_id: "mount-other".into(),
+                    request_id: 90,
+                }),
+            },
+        )
+        .unwrap_err();
     assert_eq!(error.code(), afs_error::NODE_VFS_INVALID);
 }
 
@@ -1795,7 +1831,8 @@ fn dfs_local_setlk_postgrant_transient_renewal_keeps_lock() {
     .unwrap();
 
     let authority = fs
-        .lock_authorities
+        .locks
+        .authorities
         .read(&InodeId::new("inode:test"))
         .unwrap()
         .get(&InodeId::new("inode:test"))
@@ -1844,7 +1881,7 @@ fn dfs_owner_set_lock_postgrant_transient_renewal_keeps_lock() {
         50,
         lock_range(0, 99),
     );
-    <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::set_lock(
+    <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::set_lock(
         &fs,
         "node-b",
         afs_protocol::node_control::DfsOwnerSetLockRequest {
@@ -1856,7 +1893,8 @@ fn dfs_owner_set_lock_postgrant_transient_renewal_keeps_lock() {
     .unwrap();
 
     let authority = fs
-        .lock_authorities
+        .locks
+        .authorities
         .read(&InodeId::new("inode:test"))
         .unwrap()
         .get(&InodeId::new("inode:test"))
@@ -2065,8 +2103,8 @@ fn dfs_release_locks_without_authority_does_not_open_write() {
         ReleaseKind::PosixOwner,
     )
     .unwrap();
-    assert!(fs.lock_authorities.is_empty());
-    assert!(fs.remote_lock_authorities.lock().unwrap().is_empty());
+    assert!(fs.locks.authorities.is_empty());
+    assert!(fs.locks.proxy.authorities.lock().unwrap().is_empty());
 }
 
 #[test]

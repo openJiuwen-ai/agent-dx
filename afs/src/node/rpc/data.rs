@@ -63,47 +63,8 @@ use afs_protocol::node_data::{
     dfs_owner_files_server::{DfsOwnerFiles, DfsOwnerFilesServer},
 };
 
-/// Framework boundary only: handlers own lease/handle validation, sequencing,
-/// deduplication and result-unknown recovery. A transport ACK is never fsync.
 #[cfg(feature = "dfs")]
-pub trait DfsOwnerFilesHandler: Send + Sync + 'static {
-    fn read(
-        &self,
-        _peer: &str,
-        _request: DfsOwnerReadRequest,
-    ) -> afs_error::Result<DfsOwnerReadReply> {
-        Err(dfs_owner_unimplemented())
-    }
-    fn write(
-        &self,
-        _peer: &str,
-        _request: DfsOwnerWriteRequest,
-    ) -> afs_error::Result<DfsOwnerWriteReply> {
-        Err(dfs_owner_unimplemented())
-    }
-    fn resize(
-        &self,
-        _peer: &str,
-        _request: DfsOwnerResizeRequest,
-    ) -> afs_error::Result<DfsOwnerResizeReply> {
-        Err(dfs_owner_unimplemented())
-    }
-    fn sync(
-        &self,
-        _peer: &str,
-        _request: DfsOwnerSyncRequest,
-    ) -> afs_error::Result<DfsOwnerSyncReply> {
-        Err(dfs_owner_unimplemented())
-    }
-}
-
-#[cfg(feature = "dfs")]
-fn dfs_owner_unimplemented() -> afs_error::Error {
-    afs_error::Error::coded(
-        afs_error::NODE_VFS_UNIMPLEMENTED,
-        "DFS remote inode owner execution is not wired",
-    )
-}
+use crate::node::vfs::dfs::owner_api::{DfsOwnerFilesHandler, dfs_owner_unimplemented};
 
 #[cfg(feature = "dfs")]
 #[derive(Clone, Default)]

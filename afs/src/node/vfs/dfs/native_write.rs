@@ -15,17 +15,18 @@ impl DistributedFs {
     }
 
     pub(crate) fn native_writeback_notify(&self) -> Option<Arc<tokio::sync::Notify>> {
-        self.native_pipeline
+        self.native
+            .pipeline
             .as_ref()
             .map(|pipeline| pipeline.notify.clone())
     }
 
     pub(crate) fn close_native_write_admission(&self) {
-        if let Some(pipeline) = &self.native_pipeline {
+        if let Some(pipeline) = &self.native.pipeline {
             pipeline.closed.store(true, Ordering::Release);
             pipeline.budget.stop();
             pipeline.notify.notify_waiters();
-            if let Ok(states) = self.inode_writes.snapshot() {
+            if let Ok(states) = self.writes.states.snapshot() {
                 for (_, state) in states {
                     state.notify_all();
                 }
@@ -45,7 +46,7 @@ impl DistributedFs {
         cell: &SharedInodeWriteState,
         cleanup: bool,
     ) -> Result<Option<NativeMutationTicket>> {
-        let Some(pipeline) = &self.native_pipeline else {
+        let Some(pipeline) = &self.native.pipeline else {
             return Ok(None);
         };
         if !cleanup && pipeline.closed.load(Ordering::Acquire) {
@@ -85,12 +86,12 @@ impl DistributedFs {
     }
 
     pub(super) fn observe_native_resources(&self) {
-        let Some(pipeline) = &self.native_pipeline else {
+        let Some(pipeline) = &self.native.pipeline else {
             return;
         };
         pipeline.observe();
         if let Some(metrics) = &pipeline.metrics
-            && let Ok(states) = self.inode_writes.snapshot()
+            && let Ok(states) = self.writes.states.snapshot()
         {
             let mut pending = 0_u64;
             for (_, cell) in states {
@@ -137,7 +138,7 @@ impl DistributedFs {
 
     fn native_owner_limit(&self, pipeline: &NativeWritePipeline) -> Result<usize> {
         let mut writers = 0;
-        for (_, cell) in self.inode_writes.snapshot()? {
+        for (_, cell) in self.writes.states.snapshot()? {
             let state = cell
                 .lock()
                 .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
@@ -190,7 +191,8 @@ impl DistributedFs {
     ) -> Result<usize> {
         let (offset, data, options) = input;
         let pipeline = self
-            .native_pipeline
+            .native
+            .pipeline
             .as_ref()
             .ok_or_else(|| unavailable("native write pipeline is missing"))?
             .clone();
@@ -240,7 +242,7 @@ impl DistributedFs {
             };
             let operation_id = generation
                 .clone()
-                .unwrap_or_else(|| self.operation_id("native-generation"));
+                .unwrap_or_else(|| self.identity.operation_id("native-generation"));
             let mut prepared = None;
             let mut descriptor = None;
             if selection.is_none() {
@@ -310,7 +312,7 @@ impl DistributedFs {
                         {
                             NativeWriteAdmission::Reserved(lease) => {
                                 match ChunkBuilder::with_native_lease(
-                                    self.write_buffer_pool.clone(),
+                                    self.native.buffer_pool.clone(),
                                     capacity,
                                     lease,
                                 ) {
@@ -349,7 +351,8 @@ impl DistributedFs {
                 }
             }
             let gc_pin = if generation.is_none() {
-                self.gc_references
+                self.gc
+                    .references
                     .as_ref()
                     .map(|references| {
                         references.pin_generation(&snapshot.inode_id, None, &operation_id)
@@ -430,7 +433,7 @@ impl DistributedFs {
         cell: &SharedInodeWriteState,
         descriptor: bool,
     ) -> Result<()> {
-        let Some(pipeline) = &self.native_pipeline else {
+        let Some(pipeline) = &self.native.pipeline else {
             return Ok(());
         };
         let mut state = cell
@@ -466,7 +469,7 @@ impl DistributedFs {
     }
 
     fn seal_native_full_builders(&self, cell: &SharedInodeWriteState) -> Result<()> {
-        let Some(pipeline) = &self.native_pipeline else {
+        let Some(pipeline) = &self.native.pipeline else {
             return Ok(());
         };
         let mut state = cell
@@ -559,7 +562,7 @@ impl DistributedFs {
         // Existing inode registry snapshots are shared lifecycle metadata, not
         // a second W2 payload or per-object queue. Hold no registry lock while
         // examining an inode or waiting for an upload.
-        for (_, cell) in self.inode_writes.snapshot()? {
+        for (_, cell) in self.writes.states.snapshot()? {
             if let Some(upload) = Self::next_native_upload_for_cell(&cell)? {
                 return Ok(Some(upload));
             }
@@ -597,7 +600,8 @@ impl DistributedFs {
 
     pub(super) fn start_native_upload(&self, upload: &Arc<NativeUpload>) -> Result<bool> {
         let pipeline = self
-            .native_pipeline
+            .native
+            .pipeline
             .as_ref()
             .ok_or_else(|| unavailable("native write pipeline is missing"))?;
         let mut state = upload
@@ -671,7 +675,8 @@ impl DistributedFs {
         result: Result<NativeChunkReceipt>,
     ) -> Result<Option<Error>> {
         let pipeline = self
-            .native_pipeline
+            .native
+            .pipeline
             .as_ref()
             .ok_or_else(|| unavailable("native write pipeline is missing"))?;
         // Do not move a successful receipt until every fallible structural lock
@@ -769,7 +774,7 @@ impl DistributedFs {
     }
 
     pub(super) fn poll_native_uploads(&self) -> Result<Option<Error>> {
-        let Some(pipeline) = &self.native_pipeline else {
+        let Some(pipeline) = &self.native.pipeline else {
             return Ok(None);
         };
         let tasks: [Option<Arc<NativeUpload>>; 8] = {
@@ -881,13 +886,13 @@ impl DistributedFs {
     }
 
     pub(crate) fn progress_native_writeback(&self) -> Result<usize> {
-        if self.native_pipeline.is_none() {
+        if self.native.pipeline.is_none() {
             return Ok(0);
         }
         let _ = self.poll_native_uploads()?;
         self.start_native_uploads()?;
         let mut committed = 0;
-        for (inode, cell) in self.inode_writes.snapshot()? {
+        for (inode, cell) in self.writes.states.snapshot()? {
             let due = {
                 let state = cell
                     .lock()

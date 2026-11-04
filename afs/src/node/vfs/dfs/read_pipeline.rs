@@ -20,10 +20,10 @@ impl DistributedFs {
     ) -> Result<Arc<ReadOnlyVersion>> {
         let engine = self.read_engine.clone();
         let meta = self.meta.clone();
-        let cache = self.readonly_version_cache.clone();
-        let gates = self.readonly_version_gates.clone();
+        let cache = self.versions.cache.clone();
+        let gates = self.versions.gates.clone();
         let query_timeout = engine.read_pipeline_timeout();
-        let empty = self.readonly_empty_version.clone();
+        let empty = self.versions.empty.clone();
         let version = if let Some(id) = inode.head_version.as_ref() {
             let existing = cache
                 .lock()
@@ -145,7 +145,13 @@ impl DistributedFs {
                 .await
                 .inspect_err(|e| self.invalidate_native_handle_view_on_error(handle, e))?;
             #[cfg(test)]
-            if let Some(hook) = self.native_read_before_delivery.lock().unwrap().take() {
+            if let Some(hook) = self
+                .hooks
+                .native_read_before_delivery
+                .lock()
+                .unwrap()
+                .take()
+            {
                 hook();
             }
             self.check_native_read_view(&operation)?;
@@ -366,7 +372,13 @@ impl DistributedFs {
             .read_native_unified_async(batch, count, deadline, lifetime)
             .await?;
         #[cfg(test)]
-        if let Some(hook) = self.native_read_after_committed.lock().unwrap().take() {
+        if let Some(hook) = self
+            .hooks
+            .native_read_after_committed
+            .lock()
+            .unwrap()
+            .take()
+        {
             hook();
         }
         if let Some(batch) = hint {

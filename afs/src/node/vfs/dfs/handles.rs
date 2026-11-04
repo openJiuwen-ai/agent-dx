@@ -77,9 +77,15 @@ type InodeHandleIndex = Mutex<HashMap<InodeId, HashMap<u64, Weak<DfsHandle>>>>;
 /// the inode index before the handle shard; callers drop both before HandleMut,
 /// inode write state, or RPCs. No HandleMut guard may cross an RPC or acquire an
 /// inode write state guard. Lifecycle snapshots contain metadata owners, not data.
+///
+/// The table also owns the id counter shared by file and directory handles
+/// and the directory-handle map (a separate lock, never nested with the file
+/// shards).
 pub(super) struct DfsHandleTable {
     shards: [HandleShard; DFS_HANDLE_SHARDS],
     by_inode: [InodeHandleIndex; DFS_HANDLE_SHARDS],
+    next_handle: AtomicU64,
+    pub(super) directories: Mutex<HashMap<u64, DfsDirectoryHandle>>,
 }
 
 impl Default for DfsHandleTable {
@@ -87,11 +93,18 @@ impl Default for DfsHandleTable {
         Self {
             shards: std::array::from_fn(|_| RwLock::new(HashMap::new())),
             by_inode: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            next_handle: AtomicU64::new(1),
+            directories: Mutex::new(HashMap::new()),
         }
     }
 }
 
 impl DfsHandleTable {
+    /// Next file or directory handle id; ids are never reused.
+    pub(super) fn next_id(&self) -> u64 {
+        self.next_handle.fetch_add(1, Ordering::Relaxed)
+    }
+
     fn inode_shard(inode_id: &InodeId) -> usize {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         inode_id.hash(&mut hash);
@@ -247,9 +260,9 @@ pub(super) struct DfsDirectoryHandle {
 
 impl DistributedFs {
     pub(super) fn allocate_handle(&self, mut handle: DfsFileHandle) -> Result<FileHandle> {
-        let id = self.next_handle.fetch_add(1, Ordering::Relaxed);
+        let id = self.handles.next_id();
         let inode_id = handle.inode_id.clone();
-        if let Some(references) = &self.gc_references {
+        if let Some(references) = &self.gc.references {
             // An inode-level reference protects every version of the inode,
             // including the one this handle pins until close.
             handle.gc_pin =
@@ -262,6 +275,7 @@ impl DistributedFs {
             #[cfg(test)]
             {
                 let hook = self
+                    .hooks
                     .handle_registration_after_route_check
                     .lock()
                     .unwrap()

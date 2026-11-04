@@ -1258,7 +1258,7 @@ fn test_fs_on_fake_s3() -> (
         read_engine,
     );
     assert!(
-        fs.native_pipeline.is_some(),
+        fs.native.pipeline.is_some(),
         "S3 writes through the native pipeline"
     );
     (temp, meta, fs, store)
@@ -1503,7 +1503,7 @@ impl RemoteDfsOwner for LoopbackRemoteDfsOwner {
         &self,
         request: afs_protocol::node_control::DfsOwnerOpenRequest,
     ) -> Result<afs_protocol::node_control::DfsOwnerOpenReply> {
-        <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::open(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
             self.owner.as_ref(),
             &self.peer,
             request,
@@ -1514,7 +1514,7 @@ impl RemoteDfsOwner for LoopbackRemoteDfsOwner {
         &self,
         request: afs_protocol::node_control::DfsOwnerGetAttrRequest,
     ) -> Result<afs_protocol::node_control::DfsOwnerGetAttrReply> {
-        <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::getattr(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::getattr(
             self.owner.as_ref(),
             &self.peer,
             request,
@@ -1525,7 +1525,7 @@ impl RemoteDfsOwner for LoopbackRemoteDfsOwner {
         &self,
         request: afs_protocol::node_control::DfsOwnerReleaseRequest,
     ) -> Result<afs_protocol::node_control::DfsOwnerReleaseReply> {
-        <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::release(
             self.owner.as_ref(),
             &self.peer,
             request,
@@ -1536,7 +1536,7 @@ impl RemoteDfsOwner for LoopbackRemoteDfsOwner {
         &self,
         request: afs_protocol::node_control::DfsOwnerGetLockRequest,
     ) -> Result<afs_protocol::node_control::DfsOwnerGetLockReply> {
-        <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::get_lock(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::get_lock(
             self.owner.as_ref(),
             &self.peer,
             request,
@@ -1547,7 +1547,7 @@ impl RemoteDfsOwner for LoopbackRemoteDfsOwner {
         &self,
         request: afs_protocol::node_control::DfsOwnerSetLockRequest,
     ) -> Result<afs_protocol::node_control::DfsOwnerSetLockReply> {
-        <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::set_lock(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::set_lock(
             self.owner.as_ref(),
             &self.peer,
             request,
@@ -1558,7 +1558,7 @@ impl RemoteDfsOwner for LoopbackRemoteDfsOwner {
         &self,
         request: afs_protocol::node_control::DfsOwnerCancelLockWaitRequest,
     ) -> Result<afs_protocol::node_control::DfsOwnerCancelLockWaitReply> {
-        <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::cancel_lock_wait(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::cancel_lock_wait(
             self.owner.as_ref(),
             &self.peer,
             request,
@@ -1569,7 +1569,7 @@ impl RemoteDfsOwner for LoopbackRemoteDfsOwner {
         &self,
         request: afs_protocol::node_control::DfsOwnerAcknowledgeLockWaitRequest,
     ) -> Result<afs_protocol::node_control::DfsOwnerAcknowledgeLockWaitReply> {
-        <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::acknowledge_lock_wait(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::acknowledge_lock_wait(
                 self.owner.as_ref(),
                 &self.peer,
                 request,
@@ -1580,7 +1580,7 @@ impl RemoteDfsOwner for LoopbackRemoteDfsOwner {
         &self,
         request: afs_protocol::node_control::DfsOwnerReleaseLocksRequest,
     ) -> Result<afs_protocol::node_control::DfsOwnerReleaseLocksReply> {
-        <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release_locks(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::release_locks(
             self.owner.as_ref(),
             &self.peer,
             request,
@@ -1591,7 +1591,7 @@ impl RemoteDfsOwner for LoopbackRemoteDfsOwner {
         &self,
         request: afs_protocol::node_control::DfsOwnerReleaseLockSessionRequest,
     ) -> Result<afs_protocol::node_control::DfsOwnerReleaseLockSessionReply> {
-        <DistributedFs as crate::node::rpc::control::DfsOwnerLifecycleHandler>::release_lock_session(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::release_lock_session(
             self.owner.as_ref(),
             &self.peer,
             request,
@@ -1602,7 +1602,7 @@ impl RemoteDfsOwner for LoopbackRemoteDfsOwner {
         &self,
         request: afs_protocol::node_data::DfsOwnerReadRequest,
     ) -> Result<afs_protocol::node_data::DfsOwnerReadReply> {
-        <DistributedFs as crate::node::rpc::data::DfsOwnerFilesHandler>::read(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerFilesHandler>::read(
             self.owner.as_ref(),
             &self.peer,
             request,
@@ -1613,7 +1613,7 @@ impl RemoteDfsOwner for LoopbackRemoteDfsOwner {
         &self,
         request: afs_protocol::node_data::DfsOwnerWriteRequest,
     ) -> Result<afs_protocol::node_data::DfsOwnerWriteReply> {
-        <DistributedFs as crate::node::rpc::data::DfsOwnerFilesHandler>::write(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerFilesHandler>::write(
             self.owner.as_ref(),
             &self.peer,
             request,
@@ -1624,7 +1624,7 @@ impl RemoteDfsOwner for LoopbackRemoteDfsOwner {
         &self,
         request: afs_protocol::node_data::DfsOwnerResizeRequest,
     ) -> Result<afs_protocol::node_data::DfsOwnerResizeReply> {
-        <DistributedFs as crate::node::rpc::data::DfsOwnerFilesHandler>::resize(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerFilesHandler>::resize(
             self.owner.as_ref(),
             &self.peer,
             request,
@@ -1635,7 +1635,7 @@ impl RemoteDfsOwner for LoopbackRemoteDfsOwner {
         &self,
         request: afs_protocol::node_data::DfsOwnerSyncRequest,
     ) -> Result<afs_protocol::node_data::DfsOwnerSyncReply> {
-        <DistributedFs as crate::node::rpc::data::DfsOwnerFilesHandler>::sync(
+        <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerFilesHandler>::sync(
             self.owner.as_ref(),
             &self.peer,
             request,
