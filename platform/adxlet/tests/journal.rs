@@ -126,6 +126,90 @@ fn artifact() -> CheckpointArtifact {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_outage_results_are_journaled_and_recover_after_restart() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct Outage {
+        concurrent: AtomicBool,
+        gate: tokio::sync::Barrier,
+    }
+
+    #[async_trait]
+    impl StateSink for Outage {
+        async fn commit(&self, _record: &EnvironmentRecord) -> Result<Durability> {
+            if self.concurrent.load(Ordering::SeqCst) {
+                tokio::time::timeout(std::time::Duration::from_secs(10), self.gate.wait())
+                    .await
+                    .unwrap();
+            }
+            Err(Error::Unavailable(
+                "coordinator temporarily unavailable".into(),
+            ))
+        }
+    }
+
+    const WRITERS: usize = 64;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("journal.sqlite");
+    let upstream = Arc::new(Outage {
+        concurrent: AtomicBool::new(false),
+        gate: tokio::sync::Barrier::new(WRITERS),
+    });
+    let sink = Arc::new(JournalSink::new(path.clone(), upstream.clone()));
+    let mut catalog = vec![record(2)];
+    assert_eq!(
+        sink.commit(&catalog[0]).await.unwrap(),
+        Durability::Journaled
+    );
+    upstream.concurrent.store(true, Ordering::SeqCst);
+    for round in 0..4 {
+        let mut writers = tokio::task::JoinSet::new();
+        for number in 0..WRITERS {
+            let mut value = record(2);
+            value.spec.id = format!("outage-{round}-{number}");
+            value.assignment.environment_id = value.spec.id.clone();
+            value.runtime.id = format!("{}-1", value.spec.id);
+            catalog.push(value.clone());
+            let sink = sink.clone();
+            writers.spawn(async move { sink.commit(&value).await });
+        }
+        let mut errors = vec![];
+        while let Some(answer) = writers.join_next().await {
+            match answer.unwrap() {
+                Ok(Durability::Journaled) => (),
+                result => errors.push(result),
+            }
+        }
+        assert!(
+            errors.is_empty(),
+            "Concurrent journal writes failed: {errors:?}"
+        );
+        assert_eq!(sink.pending().await.unwrap(), catalog.len());
+    }
+    drop(sink);
+    let coordinator = Arc::new(Coordinator::default());
+    let recovered = JournalSink::new(path, coordinator.clone());
+    // The outage results are revision 2; the authoritative catalog still has
+    // revision 1. Supplying revision 2 would correctly acknowledge them as
+    // already published instead of replaying them to the test Coordinator.
+    for value in &mut catalog {
+        value.revision = 1;
+    }
+    recovered.recover(&catalog).await.unwrap();
+    assert_eq!(recovered.pending().await.unwrap(), 0);
+    let published = coordinator.records.lock().unwrap();
+    assert_eq!(published.len(), catalog.len());
+    assert!(published.iter().all(|value| value.revision == 2));
+    assert_eq!(
+        published
+            .iter()
+            .map(|value| &value.spec.id)
+            .collect::<std::collections::BTreeSet<_>>(),
+        catalog.iter().map(|value| &value.spec.id).collect()
+    );
+}
+
 #[tokio::test]
 async fn recovery_replays_cleanup_proof_even_when_the_failed_result_was_already_committed() {
     let tmp = tempfile::tempdir().unwrap();
