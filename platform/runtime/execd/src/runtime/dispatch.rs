@@ -209,7 +209,8 @@ fn reap_timed_out_child(
                 // active span context so the deferred wait logs carry trace_id.
                 let context = adx_observability::trace::current_context();
                 std::thread::spawn(move || {
-                    adx_observability::trace::attach_context(&context, || match child.wait() {
+                    adx_observability::trace::attach_context(&context, || {
+                        match child.wait() {
                         Ok(status) => execd_info!(
                             "[execd-command] phase=wait_done traceid={} pid={} exit_code={} timed_out=true deferred=true",
                             sanitize_log_field(&trace_id),
@@ -222,6 +223,7 @@ fn reap_timed_out_child(
                             pid,
                             sanitize_log_field(&e.to_string())
                         ),
+                    }
                     })
                 });
                 return Ok(None);

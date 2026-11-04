@@ -178,10 +178,7 @@ impl Readiness for ExecdReadiness {
 /// After the ready deadline, prefer the terminal probe failure Execd reported
 /// over a generic retryable deadline. This keeps probe failures terminal even
 /// if the notification arrived just after the local timeout fired.
-async fn readiness_timeout(
-    readiness: &ExecdReadiness,
-    record: &EnvironmentRecord,
-) -> Result<()> {
+async fn readiness_timeout(readiness: &ExecdReadiness, record: &EnvironmentRecord) -> Result<()> {
     match readiness.probe_failure(record).await {
         Ok(Some(failure)) => Err(Error::ProbeFailed(failure)),
         _ => Err(Error::DeadlineExceeded(

@@ -137,7 +137,13 @@ impl Clients {
             && request.spec.as_ref().is_none_or(|spec| spec.snapshot_id.is_none())
         {
             let select = trace::Trace::child("apiserver.select_local");
-            select.attribute("environment.id", request.spec.as_ref().map_or_else(String::new, |spec| spec.id.clone()));
+            select.attribute(
+                "environment.id",
+                request
+                    .spec
+                    .as_ref()
+                    .map_or_else(String::new, |spec| spec.id.clone()),
+            );
             let node = select
                 .scope_future(async {
                     match request.spec.as_ref() {
@@ -706,7 +712,9 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code(), Code::DeadlineExceeded);
-        assert!(error.message().contains("control RPC response deadline exceeded"));
+        assert!(error
+            .message()
+            .contains("control RPC response deadline exceeded"));
 
         provider.force_flush().unwrap();
         let spans = exporter.get_finished_spans().unwrap();
@@ -812,7 +820,8 @@ mod tests {
             newly_created: false,
             record: owned("capsule", "tenant").record,
             durability: pb::Durability::Published as i32,
-         ..Default::default()};
+            ..Default::default()
+        };
 
         let owner = local_owner(&node, &result).unwrap().unwrap();
 
@@ -833,7 +842,8 @@ mod tests {
             newly_created: false,
             record: owned("capsule", "tenant").record,
             durability: pb::Durability::Published as i32,
-         ..Default::default()};
+            ..Default::default()
+        };
 
         assert!(local_owner(&node, &result).unwrap().is_none());
     }
@@ -850,7 +860,8 @@ mod tests {
             newly_created: false,
             record: owned("capsule", "tenant").record,
             durability: pb::Durability::Journaled as i32,
-         ..Default::default()};
+            ..Default::default()
+        };
 
         assert!(local_owner(&node, &result).unwrap().is_none());
     }

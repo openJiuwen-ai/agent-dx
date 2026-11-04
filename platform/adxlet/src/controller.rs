@@ -1233,10 +1233,7 @@ impl Controller {
         let durability = timeout(
             self.services.operation_timeout,
             adx_observability::trace::Trace::child("environment.state.commit").run_result(async {
-                adx_observability::trace::attribute(
-                    "environment.id",
-                    self.record.spec.id.clone(),
-                );
+                adx_observability::trace::attribute("environment.id", self.record.spec.id.clone());
                 if self.record.state == EnvironmentState::Deleted {
                     self.services
                         .sink

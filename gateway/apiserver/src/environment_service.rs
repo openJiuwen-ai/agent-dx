@@ -593,10 +593,7 @@ fn write_create_target(record: &pb::EnvironmentRecord, source: &str) {
 }
 
 fn write_retry_result_attributes(result: &pb::EnvironmentResult) {
-    adx_observability::trace::attribute(
-        "schedule.attempts",
-        result.create_attempts.to_string(),
-    );
+    adx_observability::trace::attribute("schedule.attempts", result.create_attempts.to_string());
     adx_observability::trace::attribute("retry.count", result.retry_count.to_string());
     if !result.retry_first_error_code.is_empty() {
         adx_observability::trace::attribute(

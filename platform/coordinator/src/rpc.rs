@@ -845,7 +845,8 @@ impl CoordinatorRpc {
                 newly_created: false,
                 record: Some(record.try_into().map_err(status)?),
                 durability: pb::Durability::Published as i32,
-             ..Default::default()}));
+                ..Default::default()
+            }));
         }
         let spec = match session.get(&raw.id).await {
             Ok(stored) if stored.spec.tenant_id != raw.tenant_id => {
@@ -867,7 +868,8 @@ impl CoordinatorRpc {
                     newly_created: false,
                     record: Some(record.try_into().map_err(status)?),
                     durability: pb::Durability::Published as i32,
-                 ..Default::default()}));
+                    ..Default::default()
+                }));
             }
             Ok(_) | Err(Error::NotFound) => {
                 cloning::normalize(&session, raw).await.map_err(status)?
@@ -1048,7 +1050,11 @@ impl CoordinatorRpc {
         trace.attribute("schedule.attempts", attempts.to_string());
         trace.attribute("schedule.rounds", rounds.to_string());
         trace.attribute("retry.count", retries.to_string());
-        let first_error = stats.first_error.lock().ok().and_then(|value| value.clone());
+        let first_error = stats
+            .first_error
+            .lock()
+            .ok()
+            .and_then(|value| value.clone());
         if let Some((code, message)) = &first_error {
             trace.attribute("retry.first_error_code", code.clone());
             trace.attribute("retry.first_error_message", message.clone());
@@ -1093,7 +1099,8 @@ impl CoordinatorRpc {
                 newly_created: false,
                 record: Some(record.try_into().map_err(status)?),
                 durability: pb::Durability::Published as i32,
-             ..Default::default()});
+                ..Default::default()
+            });
         }
         match session.get(&spec.id).await {
             Ok(stored) if stored.spec.tenant_id != spec.tenant_id => {
@@ -1114,7 +1121,8 @@ impl CoordinatorRpc {
                     newly_created: false,
                     record: Some(record.try_into().map_err(status)?),
                     durability: pb::Durability::Published as i32,
-                 ..Default::default()});
+                    ..Default::default()
+                });
             }
             Err(Error::NotFound) => {
                 let mut state = self.0.state.lock().await;
@@ -1271,7 +1279,8 @@ impl CoordinatorRpc {
                         newly_created: false,
                         record: Some(result.try_into().map_err(status)?),
                         durability: pb::Durability::Published as i32,
-                     ..Default::default()});
+                        ..Default::default()
+                    });
                 }
                 let node = state
                     .nodes
@@ -2380,8 +2389,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 if self.0.peers.authenticate(&request)? != Principal::ApiServer {
                     return Err(Status::permission_denied("Frontend caller required"));
                 }
-                let result =
-                    Box::pin(self.create_from_request(request.into_inner())).await;
+                let result = Box::pin(self.create_from_request(request.into_inner())).await;
                 match &result {
                     Ok(_) => adx_observability::trace::attribute("result", "success".into()),
                     Err(error) => {

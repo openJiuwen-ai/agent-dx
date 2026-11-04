@@ -1028,7 +1028,8 @@ mod tests {
                 newly_created: false,
                 record: Some(record.try_into().unwrap()),
                 durability: pb::Durability::Published as i32,
-             ..Default::default()}),
+                ..Default::default()
+            }),
         };
         validate_preparation_capture(&response, &spec, "snapshot", "base", &assignment).unwrap();
         let mut uncertain = response.clone();
