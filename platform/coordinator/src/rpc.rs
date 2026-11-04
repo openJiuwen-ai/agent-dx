@@ -1915,7 +1915,10 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             }
             let session = state.session.clone();
             drop(state);
-            let (cached_snapshots, holds) = session.inspection_inventory().await.map_err(status)?;
+            let (cached_snapshots, holds) = session
+                .node_inspection_inventory(&r.node_id)
+                .await
+                .map_err(status)?;
             let mut state = self.0.state.lock().await;
             state.healthy().map_err(status)?;
             let live = state.live.get(&r.node_id).ok_or_else(|| {
@@ -1970,10 +1973,6 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 .map_err(status)?;
             let snapshots = cached_snapshots
                 .into_iter()
-                .filter(|snapshot| {
-                    snapshot.source_node_id == r.node_id
-                        && snapshot.state != adx_core::snapshots::SnapshotState::Deleted
-                })
                 .map(TryInto::try_into)
                 .collect::<Result<Vec<_>>>()
                 .map_err(status)?;
