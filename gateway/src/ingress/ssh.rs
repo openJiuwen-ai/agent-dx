@@ -270,8 +270,9 @@ impl SessionTarget {
                 trace,
             });
         }
-        let scope = ManagedService::binding_scope(tenant, &route.target)
-            .map_err(|e| Error::Invalid(e.to_string()))?;
+        let scope =
+            ManagedService::binding_scope(tenant, &route.target, route.binding_id.as_deref())
+                .map_err(|e| Error::Invalid(e.to_string()))?;
         Ok(Self::Managed {
             scope,
             port: route.port,
@@ -284,7 +285,7 @@ impl SessionTarget {
         };
         let urn = Target::from(scope);
         Some(format!(
-            "AgentBinding ID: {}\r\nAgentBinding URN: {urn}\r\n",
+            "AgentBinding ID: {}\r\nTarget: {urn}\r\n",
             scope.binding_id
         ))
     }

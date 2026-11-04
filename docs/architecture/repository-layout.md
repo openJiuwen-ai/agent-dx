@@ -147,7 +147,7 @@ Proxy 首次启动关闭 Environment 准入，adxlet 完成权威对账与全量
 
 通用 HTTP/WS 接入的 `X-ADX-Parameters` 使用 URL 表单编码。Ingress 将原始字节交给共享解析/激活流程，只有 Binding 不存在时才解析、校验并原子保存参数；已有 Binding 忽略新输入，包括格式错误。并发首次访问复用成功落库的 Binding。Template.env 和 mounts.host_path 使用持久化参数渲染，挂载参数仍受路径约束；Binding 参数当前明文保存。内置 Jiuwen 通过共享流程按需提供业务参数，不再有独立 prepare 阶段、私有 launch 快照或模型专用覆盖逻辑。参数 Header 在转发前移除。
 
-模板发布定义不携带版本号；Agent 用同一持久化 CAS 事务推进 tenant/template 序列并保存数字版本快照。统一 template/binding URN 中的纯数字 reference 选择版本，非数字 reference 选择 Alias。内部 Scope 继续保存显式类型。Orbit 入口配置 `template_ref` 字符串并复用此解析，用户和 workspace 身份不变；其模板通过受管 Volume 挂载原目录。已有字符串模板转成同名 Alias 由独立的人工运维流程完成，不在运行时自动迁移。
+模板发布定义不携带版本号；Agent 用同一持久化 CAS 事务推进 tenant/template 序列并保存数字版本快照。统一 template URN 中的纯数字 reference 选择版本，非数字 reference 选择 Alias；Binding ID 独立放在 HTTP/WS 的 `X-ADX-Binding-Id` Header 或 SSH 的 `binding_id` 路由选项。内部 Scope 继续保存显式类型。Orbit 入口配置 `template_ref` 字符串并复用此解析，用户和 workspace 身份不变；其模板通过受管 Volume 挂载原目录。已有字符串模板转成同名 Alias 由独立的人工运维流程完成，不在运行时自动迁移。
 
 ## 协议与持久化
 

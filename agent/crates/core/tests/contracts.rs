@@ -48,9 +48,15 @@ fn binding_identity_round_trips_between_wire_scope_and_target() {
     let resolved: adx_agent_core::activator::Target = serde_json::from_value(wire.clone()).unwrap();
     assert_eq!(serde_json::to_value(resolved).unwrap(), wire);
 
-    let urn = "urn:adx:binding:assistant:v1:user%3Aa%2F%E4%B8%AD%E6%96%87";
+    let urn = "urn:adx:template:assistant:1";
     let target: adx_agent_core::target::Target = urn.parse().unwrap();
     assert_eq!(target.to_string(), urn);
+    let encoded = target::encode_binding_id(&scope.binding_id).unwrap();
+    assert_eq!(encoded, "user%3Aa%2F%E4%B8%AD%E6%96%87");
+    assert_eq!(
+        target::decode_binding_id(&encoded).unwrap(),
+        scope.binding_id
+    );
 }
 
 #[test]

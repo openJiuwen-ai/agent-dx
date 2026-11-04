@@ -37,19 +37,19 @@ fn terminal_notice_returns_a_reusable_binding_identity() {
     assert!(notice.contains(&scope.binding_id));
     let urn = notice
         .lines()
-        .find_map(|line| line.strip_prefix("AgentBinding URN: "))
+        .find_map(|line| line.strip_prefix("Target: "))
         .unwrap();
     assert_eq!(
         urn.parse::<Target>().unwrap(),
-        Target::Binding {
+        Target::Template {
             name: "demo".into(),
             template_ref: adx_agent_core::TemplateRef::Version("1".into()),
-            id: scope.binding_id.clone()
         }
     );
     let again = SessionTarget::new(
         &SshRoute {
             target: urn.parse().unwrap(),
+            binding_id: Some(scope.binding_id.clone()),
             port: None,
             trace: None,
         },

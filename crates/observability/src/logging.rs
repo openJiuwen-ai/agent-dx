@@ -58,6 +58,7 @@ pub fn init(
                     .json()
                     .with_ansi(false)
                     .with_target(true)
+                    .with_writer(TraceMakeWriter::new(std::io::stdout))
                     .with_filter(filter_fn(move |metadata| {
                         stdout
                             && include_general_log_target(
@@ -116,6 +117,7 @@ pub fn init(
     let stdout_layer = config.stdout.then(|| {
         tracing_subscriber::fmt::layer()
             .with_target(true)
+            .with_writer(TraceMakeWriter::new(std::io::stdout))
             .with_filter(filter_fn(move |metadata| {
                 include_general_log_target(
                     ingress_component,
@@ -131,7 +133,7 @@ pub fn init(
         tracing_subscriber::fmt::layer()
             .with_ansi(false)
             .with_target(true)
-            .with_writer(writer)
+            .with_writer(TraceMakeWriter::new(writer))
             .with_filter(filter_fn(move |metadata| {
                 include_general_log_target(
                     ingress_component,
@@ -148,7 +150,7 @@ pub fn init(
             .compact()
             .with_ansi(false)
             .with_target(true)
-            .with_writer(writer)
+            .with_writer(TraceMakeWriter::new(writer))
             .with_filter(filter_fn(move |metadata| {
                 (matches!(metadata.target(), "adx_access") && ingress_access_enabled)
                     || (matches!(metadata.target(), "adx_audit") && ingress_audit_enabled)
@@ -407,6 +409,112 @@ impl Drop for EventWriter {
             }
         }
     }
+}
+
+/// Wraps a `MakeWriter` so every formatted log line emitted inside a traced
+/// request carries the current trace and span ids.
+#[derive(Clone)]
+struct TraceMakeWriter<W> {
+    inner: W,
+}
+
+impl<W> TraceMakeWriter<W> {
+    fn new(inner: W) -> Self {
+        Self { inner }
+    }
+}
+
+impl<'a, W> MakeWriter<'a> for TraceMakeWriter<W>
+where
+    W: MakeWriter<'a>,
+{
+    type Writer = TraceEventWriter<W::Writer>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        TraceEventWriter {
+            inner: self.inner.make_writer(),
+            buffer: Vec::with_capacity(512),
+        }
+    }
+}
+
+struct TraceEventWriter<W: Write> {
+    inner: W,
+    buffer: Vec<u8>,
+}
+
+impl<W: Write> Write for TraceEventWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.buffer.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.emit()
+    }
+}
+
+impl<W: Write> Drop for TraceEventWriter<W> {
+    fn drop(&mut self) {
+        let _ = self.emit();
+    }
+}
+
+impl<W: Write> TraceEventWriter<W> {
+    fn emit(&mut self) -> io::Result<()> {
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        let record = std::mem::take(&mut self.buffer);
+        let (trace_id, span_id) = crate::trace::log_context();
+        let annotated = annotate_lines(&record, &trace_id, &span_id);
+        self.inner.write_all(&annotated)
+    }
+}
+
+fn annotate_lines(buffer: &[u8], trace_id: &str, span_id: &str) -> Vec<u8> {
+    if buffer.is_empty() || trace_id.is_empty() || span_id.is_empty() {
+        return buffer.to_vec();
+    }
+    let text = String::from_utf8_lossy(buffer);
+    let mut output = String::with_capacity(text.len() + 64);
+    for line in text.split_inclusive('\n') {
+        let (content, ending) = if let Some(content) = line.strip_suffix("\r\n") {
+            (content, "\r\n")
+        } else if let Some(content) = line.strip_suffix('\n') {
+            (content, "\n")
+        } else {
+            (line, "")
+        };
+        output.push_str(&annotate_line(content, trace_id, span_id));
+        output.push_str(ending);
+    }
+    output.into_bytes()
+}
+
+fn annotate_line(line: &str, trace_id: &str, span_id: &str) -> String {
+    if line.trim().is_empty() || line.contains("trace_id=") || line.contains("\"trace_id\"") {
+        return line.to_owned();
+    }
+    let trimmed = line.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+            if let Some(object) = value.as_object_mut() {
+                object.insert(
+                    "trace_id".into(),
+                    serde_json::Value::String(trace_id.to_owned()),
+                );
+                object.insert(
+                    "span_id".into(),
+                    serde_json::Value::String(span_id.to_owned()),
+                );
+                if let Ok(encoded) = serde_json::to_string(&value) {
+                    return encoded;
+                }
+            }
+        }
+    }
+    format!("{line} trace_id={trace_id} span_id={span_id}")
 }
 
 impl WorkerGuard {
@@ -1059,6 +1167,34 @@ mod tests {
             false,
             "adx_access"
         ));
+    }
+
+    #[test]
+    fn trace_annotation_preserves_text_and_json_log_lines() {
+        assert_eq!(
+            annotate_lines(b"hello\n", "abc", "def"),
+            b"hello trace_id=abc span_id=def\n".to_vec()
+        );
+        assert_eq!(
+            annotate_lines(b"one\r\ntwo\r\n", "abc", "def"),
+            b"one trace_id=abc span_id=def\r\ntwo trace_id=abc span_id=def\r\n".to_vec()
+        );
+
+        let json = annotate_lines(br#"{"message":"hi"}"#, "abc", "def");
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(value["message"], "hi");
+        assert_eq!(value["trace_id"], "abc");
+        assert_eq!(value["span_id"], "def");
+
+        assert_eq!(annotate_lines(b"hello\n", "", ""), b"hello\n".to_vec());
+        assert_eq!(
+            annotate_lines(b"hello trace_id=old span_id=old\n", "abc", "def"),
+            b"hello trace_id=old span_id=old\n".to_vec()
+        );
+        assert_eq!(
+            annotate_lines(br#"{"trace_id":"old"}"#, "abc", "def"),
+            br#"{"trace_id":"old"}"#.to_vec()
+        );
     }
 
     fn read_gzip(path: PathBuf) -> Vec<u8> {

@@ -336,11 +336,11 @@ pub(super) async fn validate_with_iam(
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
         .map_err(|error| AuthError::IamUnavailable(error.to_string()))?;
-    tokio::spawn(async move {
+    tokio::spawn(adx_observability::trace::with_current_context(async move {
         if let Err(error) = connection.await {
             tracing::debug!(%error, "IAM validation connection closed");
         }
-    });
+    }));
     let request = Request::builder()
         .method("GET")
         .uri("/iam-server/v1/token/auth")

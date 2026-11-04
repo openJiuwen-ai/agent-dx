@@ -367,10 +367,14 @@ impl Relay {
         mut connection_closed: watch::Receiver<()>,
     ) {
         if !self.ready() {
+            adx_observability::trace::attribute("result", "fail".into());
+            adx_observability::trace::record_error("relay", "relay is not ready");
             send_error(&mut respond, StatusCode::SERVICE_UNAVAILABLE);
             return;
         }
         if request.method() != http::Method::CONNECT {
+            adx_observability::trace::attribute("result", "fail".into());
+            adx_observability::trace::record_error("relay", "CONNECT method required");
             let _ = respond.send_response(
                 Response::builder()
                     .status(StatusCode::METHOD_NOT_ALLOWED)
@@ -383,10 +387,15 @@ impl Relay {
         let target = match ConnectTarget::from_headers(request.headers()) {
             Ok(target) => target,
             Err(error) => {
+                adx_observability::trace::attribute("result", "fail".into());
+                adx_observability::trace::record_error("relay", error.to_string());
                 send_error(&mut respond, status_for_protocol_error(&error));
                 return;
             }
         };
+        adx_observability::trace::attribute("instance.id", target.instance_id.clone());
+        adx_observability::trace::attribute("target.port", target.target_port.to_string());
+        let (trace_id, span_id) = adx_observability::trace::log_context();
         let passive = request
             .headers()
             .get(crate::common::protocol::H_ACTIVITY_CLASS)
@@ -408,6 +417,8 @@ impl Relay {
                 reason = %error,
                 "Relay target denied"
             );
+            adx_observability::trace::attribute("result", "fail".into());
+            adx_observability::trace::record_error("relay", "relay target denied by policy");
             send_error(&mut respond, status_for_protocol_error(&error));
             return;
         }
@@ -435,6 +446,8 @@ impl Relay {
                 .unwrap_or_else(|p| p.into_inner());
             let Some(binding) = routes.get(&key) else {
                 self.metrics.route_mismatch.fetch_add(1, Ordering::Relaxed);
+                adx_observability::trace::attribute("result", "fail".into());
+                adx_observability::trace::record_error("relay", "relay route binding missing");
                 send_error(&mut respond, StatusCode::CONFLICT);
                 return;
             };
@@ -445,6 +458,8 @@ impl Relay {
                         tracker.deactivate(&target.instance_id);
                     }
                 }
+                adx_observability::trace::attribute("result", "fail".into());
+                adx_observability::trace::record_error("relay", "relay route binding mismatch");
                 send_error(&mut respond, StatusCode::CONFLICT);
                 return;
             }
@@ -473,6 +488,11 @@ impl Relay {
                     %error,
                     "environment TCP connect failed"
                 );
+                adx_observability::trace::attribute("result", "fail".into());
+                adx_observability::trace::record_error(
+                    "relay",
+                    format!("relay dial failed: {error}"),
+                );
                 send_error(&mut respond, StatusCode::BAD_GATEWAY);
                 return;
             }
@@ -488,6 +508,8 @@ impl Relay {
                     bindings_ready = self.ready(),
                     "sandbox TCP connect timed out"
                 );
+                adx_observability::trace::attribute("result", "fail".into());
+                adx_observability::trace::record_error("relay", "relay dial timed out");
                 send_error(&mut respond, StatusCode::GATEWAY_TIMEOUT);
                 return;
             }
@@ -498,6 +520,10 @@ impl Relay {
             Err(_) => return,
         };
         self.metrics.connect_total.fetch_add(1, Ordering::Relaxed);
+        adx_observability::trace::attribute("result", "success".into());
+        // The relay span covers connection establishment only; byte pumping
+        // runs outside it so streaming sessions do not inflate the span.
+        adx_observability::trace::end_current();
         let mut route_rx = route_rx;
         let relay_stats = RelayStats::default();
         let _traffic = relay_stats.track(&self.metrics.traffic);
@@ -518,6 +544,8 @@ impl Relay {
                 instance_id = %target.instance_id,
                 workload_id = %target.workload_id,
                 request_id = %target.request_id,
+                trace_id = %trace_id,
+                span_id = %span_id,
                 bytes_up,
                 bytes_down,
                 %error,
