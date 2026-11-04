@@ -3048,3 +3048,6 @@ mod tests {
         assert!(LocalLog::open(dir.path(), LogLimits::default()).is_err());
     }
 }
+
+#[cfg(test)]
+mod format_golden_tests;

@@ -223,3 +223,6 @@ fn corrupt(message: impl Into<String>) -> Error {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod format_golden_tests;

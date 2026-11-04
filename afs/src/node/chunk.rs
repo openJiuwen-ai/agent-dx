@@ -229,6 +229,9 @@ pub struct RecoveryReport {
 #[cfg(test)]
 mod catalog_tail_recovery_tests;
 
+#[cfg(test)]
+mod format_golden_tests;
+
 #[derive(Debug)]
 pub struct LocalChunkStore {
     node_id: String,

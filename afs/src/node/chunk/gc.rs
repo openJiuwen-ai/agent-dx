@@ -40,7 +40,7 @@ pub(super) fn load_checkpoint(path: &Path) -> Result<Option<LocalCatalog>> {
         records,
     }))
 }
-fn save_checkpoint(root: &Path, catalog: &LocalCatalog) -> Result<()> {
+pub(super) fn save_checkpoint(root: &Path, catalog: &LocalCatalog) -> Result<()> {
     let mut records = catalog.records.values().cloned().collect::<Vec<_>>();
     records.sort_by(|a, b| a.chunk.id.cmp(&b.chunk.id));
     let checksum = checksum(catalog.revision, catalog.gc_generation, &records)?;

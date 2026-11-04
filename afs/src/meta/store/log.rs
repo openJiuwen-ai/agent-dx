@@ -3061,3 +3061,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+pub(super) mod format_golden_tests;

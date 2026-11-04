@@ -8707,3 +8707,9 @@ mod placement_hash_tests;
 
 #[cfg(all(test, feature = "dfs"))]
 mod effective_local_copy_tests;
+
+#[cfg(all(test, feature = "dfs"))]
+mod txn_snapshot_tests;
+
+#[cfg(all(test, feature = "dfs"))]
+mod request_digest_golden_tests;
