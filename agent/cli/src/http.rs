@@ -156,9 +156,13 @@ pub async fn execute(
             }
         })?;
     let status = response.status();
-    if let Some(value) = response.headers().get(BINDING_ID_HEADER) {
-        let id = decode_binding_id(value.to_str().map_err(|_| Error::Unavailable)?)
-            .map_err(|_| Error::Unavailable)?;
+    // A malformed identity notice must not hide an already received business response.
+    if let Some(id) = response
+        .headers()
+        .get(BINDING_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| decode_binding_id(value).ok())
+    {
         output
             .write_all(format!("AgentBinding: {id}\n").as_bytes())
             .await?;

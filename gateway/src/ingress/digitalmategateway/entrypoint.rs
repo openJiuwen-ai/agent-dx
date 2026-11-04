@@ -1,5 +1,6 @@
 //! Authenticated Jiuwen business entrypoints. ADX management credentials are separate.
 use super::{
+    application_ws::Application,
     connection::{Connection, ConnectionError},
     download_config::{absolute_directory, DownloadConfig},
     download_http::Download,
@@ -157,8 +158,13 @@ impl DigitalMateGatewayConfig {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
-        for application in [&self.orbit, &self.digitalmate].into_iter().flatten() {
-            application.validate(&self.tenant)?;
+        for (application, config) in [
+            (Application::Orbit, &self.orbit),
+            (Application::DigitalMate, &self.digitalmate),
+        ] {
+            if let Some(config) = config {
+                config.validate(&self.tenant, application)?;
+            }
         }
         self.scope("validation")?
             .validate()

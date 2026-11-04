@@ -73,11 +73,11 @@ impl ApplicationWsConfig {
         Ok(scope)
     }
 
-    pub(super) fn validate(&self, tenant: &str) -> Result<(), Error> {
+    pub(super) fn validate(&self, tenant: &str, application: Application) -> Result<(), Error> {
         if !(1..=86400).contains(&self.request_timeout_seconds) {
             return Err(invalid());
         }
-        self.scope(tenant, "validation", Application::Orbit)?;
+        self.scope(tenant, "validation", application)?;
         let uri: Uri = self.backend_path.parse().map_err(|_| invalid())?;
         if self.service_port == 0
             || !self.backend_path.starts_with('/')
@@ -261,7 +261,7 @@ mod tests {
             "backend_path": "/ws", "service_port": 18092
         }))
         .unwrap();
-        config.validate("tenant").unwrap();
+        config.validate("tenant", Application::Orbit).unwrap();
         let alias = config.scope("tenant", "alice", Application::Orbit).unwrap();
         assert_eq!(alias.binding_id, fixed.binding_id);
         assert_eq!(alias.template, fixed.template);
@@ -292,14 +292,16 @@ mod tests {
     }
 
     #[test]
-    fn orbit_template_reference_requires_one_valid_version_or_alias() {
+    fn application_template_reference_requires_one_valid_version_or_alias() {
         for reference in [serde_json::json!("1"), serde_json::json!("production")] {
             let config: ApplicationWsConfig = serde_json::from_value(serde_json::json!({
                 "template": "orbit", "template_ref": reference,
                 "backend_path": "/ws", "service_port": 18092
             }))
             .unwrap();
-            config.validate("tenant").unwrap();
+            for application in [Application::Orbit, Application::DigitalMate] {
+                config.validate("tenant", application).unwrap();
+            }
         }
         for reference in [
             serde_json::json!({}),
@@ -311,7 +313,11 @@ mod tests {
                 "template": "orbit", "template_ref": reference,
                 "backend_path": "/ws", "service_port": 18092
             }));
-            assert!(config.is_err() || config.unwrap().validate("tenant").is_err());
+            if let Ok(config) = config {
+                for application in [Application::Orbit, Application::DigitalMate] {
+                    assert!(config.validate("tenant", application).is_err());
+                }
+            }
         }
     }
 
@@ -416,7 +422,7 @@ mod tests {
     }
 
     #[test]
-    fn orbit_configuration_rejects_nonlocal_destinations() {
+    fn application_configuration_rejects_nonlocal_destinations() {
         for path in [
             "http://example/ws",
             "//example/ws",
@@ -426,11 +432,15 @@ mod tests {
         ] {
             let mut config = config();
             config.backend_path = path.into();
-            assert!(config.validate("tenant").is_err(), "{path}");
+            for application in [Application::Orbit, Application::DigitalMate] {
+                assert!(config.validate("tenant", application).is_err(), "{path}");
+            }
         }
         let mut config = config();
         config.service_port = 0;
-        assert!(config.validate("tenant").is_err());
+        for application in [Application::Orbit, Application::DigitalMate] {
+            assert!(config.validate("tenant", application).is_err());
+        }
     }
 
     #[test]

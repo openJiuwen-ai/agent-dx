@@ -129,6 +129,84 @@ fn http_validates_business_paths_and_preserves_explicit_binding() {
     assert!(url.query_pairs().any(|(k, v)| k == "port" && v == "8080"));
 }
 
+async fn assert_invalid_binding_notice_preserves_response(status: axum::http::StatusCode) {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    for value in ["", "%", "%GG", "%FF", "%0A", "raw 中文"] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-adx-binding-id",
+            axum::http::HeaderValue::from_bytes(value.as_bytes()).unwrap(),
+        );
+        let app = axum::Router::new().fallback(move |request: axum::extract::Request| {
+            count.fetch_add(1, Ordering::SeqCst);
+            let headers = headers.clone();
+            async move {
+                assert_eq!(request.method(), "POST");
+                assert_eq!(
+                    axum::body::to_bytes(request.into_body(), 1024)
+                        .await
+                        .unwrap(),
+                    "business request"
+                );
+                (status, headers, "business response\n")
+            }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let cli = Cli::try_parse_from([
+            "adx",
+            "http",
+            "--template",
+            "demo",
+            "--version",
+            "1",
+            "--method",
+            "POST",
+            "--data",
+            "business request",
+        ])
+        .unwrap();
+        let Command::Http(args) = &cli.command else {
+            panic!("http command")
+        };
+        let config =
+            Configuration::new(&endpoint, "key".into(), None, Duration::from_secs(3), true)
+                .unwrap();
+        let mut output = Vec::new();
+        let result = http::execute(args, &config, &mut output).await;
+        server.abort();
+
+        assert_eq!(output, b"business response\n", "header: {value:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "header: {value:?}");
+        if status.is_success() {
+            assert!(result.is_ok(), "header: {value:?}, result: {result:?}");
+        } else {
+            assert!(
+                matches!(result, Err(adx_cli::Error::Server { status: code, .. }) if code == status.as_u16()),
+                "header: {value:?}, result: {result:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn invalid_binding_notice_preserves_successful_post_response() {
+    assert_invalid_binding_notice_preserves_response(axum::http::StatusCode::OK).await;
+}
+
+#[tokio::test]
+async fn invalid_binding_notice_preserves_failed_post_response() {
+    assert_invalid_binding_notice_preserves_response(axum::http::StatusCode::SERVICE_UNAVAILABLE)
+        .await;
+}
+
 #[tokio::test]
 async fn response_stream_outlives_header_deadline_and_redirect_is_not_replayed() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
