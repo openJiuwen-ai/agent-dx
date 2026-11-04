@@ -25,10 +25,10 @@ Activator 通过 Environment 能力接口访问生命周期：独立部署使用
 
 ```text
 urn:adx:template:<template>:<reference>
-urn:adx:binding:<template>:<reference>:<binding_id>
+X-ADX-Binding-Id: <binding_id>
 ```
 
-数字 reference 示例为 `1`，Alias 示例为 `production`。template 目标由入口生成新 Binding ID；binding 目标创建或复用指定逻辑实例。tenant 来自认证，不放入 URN。已有字符串版本、索引及序列的转换由独立运维流程完成，服务启动不扫描或自动迁移旧数据。
+数字 reference 示例为 `1`，Alias 示例为 `production`。HTTP/WS 使用独立的 `X-ADX-Binding-Id` Header 创建或复用指定逻辑实例，省略时由入口生成新 Binding ID。Header 值按 UTF-8 百分号编码。tenant 来自认证，不放入 URN。已有字符串版本、索引及序列的转换由独立运维流程完成，服务启动不扫描或自动迁移旧数据。
 
 ## 3 Alias 配置与稳定选择
 
@@ -82,7 +82,7 @@ current 与 secondary 保存在同一记录中并通过 CAS 更新，最多保�
 
 ## 5 访问解析与文件操作
 
-HTTP 使用 `/agent/http`，WS 使用 `/agent/ws`；SSH 使用统一目标 URN。Ingress 选择逻辑 scope 后，将协议、可选端口和初始化输入交给 Activator resolve。
+HTTP 使用 `/agent/http`，WS 使用 `/agent/ws`；SSH 使用相同 template 目标 URN，Binding ID 放在独立的 `binding_id` 路由选项。Ingress 选择逻辑 scope 后，将协议、可选端口和初始化输入交给 Activator resolve。
 
 - 成功激活缓存命中时，Activator 校验请求服务并返回缓存目标。
 - 冷查询发现已有 Binding 时，使用 current 的真实版本，不在每次请求重新按 Alias 权重选择。

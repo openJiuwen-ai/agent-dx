@@ -7,7 +7,7 @@ fn binding_selection_generates_an_identity_and_reuses_an_explicit_one() {
         name: "demo".into(),
         template_ref: adx_agent_core::TemplateRef::Version("1".into()),
     };
-    let selected = ManagedService::binding_scope("tenant-a", &template).unwrap();
+    let selected = ManagedService::binding_scope("tenant-a", &template, None).unwrap();
     uuid::Uuid::parse_str(&selected.binding_id).unwrap();
     assert_eq!(
         selected,
@@ -18,29 +18,24 @@ fn binding_selection_generates_an_identity_and_reuses_an_explicit_one() {
             binding_id: selected.binding_id.clone(),
         }
     );
-    let explicit = Target::Binding {
-        name: "demo".into(),
-        template_ref: adx_agent_core::TemplateRef::Version("1".into()),
-        id: selected.binding_id.clone(),
-    };
     assert_eq!(
-        ManagedService::binding_scope("tenant-a", &explicit).unwrap(),
+        ManagedService::binding_scope("tenant-a", &template, Some(&selected.binding_id)).unwrap(),
         selected
     );
     assert_ne!(
-        ManagedService::binding_scope("tenant-a", &template)
+        ManagedService::binding_scope("tenant-a", &template, None)
             .unwrap()
             .binding_id,
         selected.binding_id
     );
     assert_eq!(
-        ManagedService::binding_scope("tenant-b", &explicit)
+        ManagedService::binding_scope("tenant-b", &template, Some(&selected.binding_id))
             .unwrap()
             .tenant,
         "tenant-b"
     );
     assert!(matches!(
-        ManagedService::binding_scope("", &explicit),
+        ManagedService::binding_scope("", &template, Some(&selected.binding_id)),
         Err(Error::Invalid(_))
     ));
 }
@@ -81,7 +76,7 @@ fn service_selection_matches_protocol_and_requires_an_unambiguous_port() {
 }
 
 #[test]
-fn unified_binding_targets_select_numeric_versions_and_named_aliases() {
+fn template_targets_and_binding_ids_select_numeric_versions_and_named_aliases() {
     for (reference, expected) in [
         ("12", adx_agent_core::TemplateRef::Version("12".into())),
         (
@@ -93,10 +88,10 @@ fn unified_binding_targets_select_numeric_versions_and_named_aliases() {
             adx_agent_core::TemplateRef::Alias("v1-workspace".into()),
         ),
     ] {
-        let target = format!("urn:adx:binding:orbit:{reference}:user")
+        let target = format!("urn:adx:template:orbit:{reference}")
             .parse()
             .unwrap();
-        let scope = ManagedService::binding_scope("tenant", &target).unwrap();
+        let scope = ManagedService::binding_scope("tenant", &target, Some("user")).unwrap();
         assert_eq!(scope.template_ref, expected);
         assert_eq!(scope.binding_id, "user");
         assert_eq!(Target::from(&scope), target);

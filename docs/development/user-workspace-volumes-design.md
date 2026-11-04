@@ -78,7 +78,8 @@ Agent 继续通过公共 Sandbox capability 的 HTTP 或同进程适配器访问
 Jiuwen 首次访问通用入口时提交初始化参数，例如：
 
 ```http
-GET /agent/ws?target=urn:adx:binding:coding:v2:jiuwen-example
+GET /agent/ws?target=urn:adx:template:coding:v2
+X-ADX-Binding-Id: jiuwen-example
 Authorization: Bearer <ADX platform key>
 X-ADX-Parameters: workspace=w-0123456789abcdef
 ```
