@@ -18,7 +18,7 @@ use crate::common::protocol::{
 };
 use bytes::Bytes;
 use futures_util::{SinkExt, StreamExt};
-use http::{header, Request, Response, StatusCode};
+use http::{header, Request, Response, StatusCode, Version};
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Empty, Full};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
@@ -392,6 +392,32 @@ pub struct Ingress {
     control_plane_routes: Arc<Vec<StaticRoute>>,
     draining: Arc<AtomicBool>,
     active_sessions: Arc<AtomicUsize>,
+    /// Frontend connection/relay accounting (HTTP, WS upgrade tunnels,
+    /// CONNECT tunnels, command-watch sessions). Drain waits on the active
+    /// gauge in addition to `active_sessions` so in-flight frontend work is
+    /// bounded by the drain budget instead of being cut off by runtime exit;
+    /// the monotonic opened counter proves a replica stopped receiving new
+    /// frontend connections (rollout withdrawal evidence).
+    frontend_work: Arc<FrontendWork>,
+    /// How existing long-lived frontend connections behave once draining
+    /// begins — WS/command-watch/CONNECT tunnels and built-in SSH
+    /// terminals either run to the drain deadline or close at drain
+    /// start. Client recovery varies by connection class (the resumable
+    /// tunnel and command-watch reconnect on their own; PTY and SSH
+    /// terminals are stateful sessions that end at the cut), so
+    /// operators pick the mode against that matrix.
+    pub(super) ws_drain_mode: crate::config::WsDrainMode,
+    /// Drain budget deadline recorded by `start_drain_at`.
+    /// ContinueUntilDeadline paths (the built-in SSH terminals) cut at
+    /// this instant instead of at the shutdown signal; None until drain
+    /// begins, and hosts that shut down without a drain budget leave it
+    /// None so those paths fall back to cutting at the signal.
+    drain_deadline: Arc<Mutex<Option<tokio::time::Instant>>>,
+    /// Outbound channels of active external command-watch connections, so
+    /// drain (CloseImmediate) can deliver a RECONNECT frame before the
+    /// server closes the socket. Clients then reconnect to a fresh replica
+    /// instead of waiting for the drain deadline to cut the tunnel.
+    command_watch_outbounds: Arc<Mutex<HashMap<Uuid, CommandWatchOutbound>>>,
     sessions: Arc<Mutex<HashMap<Uuid, ActiveSession>>>,
     allowed_client_networks: Arc<Vec<ipnet::IpNet>>,
     allow_any_client: bool,
@@ -445,6 +471,10 @@ impl Ingress {
             control_plane_routes: Arc::new(control_plane_routes),
             draining: Arc::new(AtomicBool::new(false)),
             active_sessions: Arc::new(AtomicUsize::new(0)),
+            frontend_work: Arc::new(FrontendWork::default()),
+            ws_drain_mode: crate::config::WsDrainMode::default(),
+            drain_deadline: Arc::new(Mutex::new(None)),
+            command_watch_outbounds: Arc::new(Mutex::new(HashMap::new())),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             allowed_client_networks: Arc::new(Vec::new()),
             allow_any_client: false,
@@ -477,6 +507,11 @@ impl Ingress {
     pub fn with_command_watch_config(mut self, config: CommandWatchConfig) -> Self {
         self.command_watch_config = config;
         self.command_watch = CommandWatchHub::new(config, Arc::clone(&self.command_watch_metrics));
+        self
+    }
+
+    pub fn with_ws_drain_mode(mut self, mode: crate::config::WsDrainMode) -> Self {
+        self.ws_drain_mode = mode;
         self
     }
 
@@ -558,16 +593,164 @@ impl Ingress {
     }
 
     pub fn ready(&self) -> bool {
-        self.resolver.ready() && !self.draining.load(Ordering::Acquire)
+        self.resolver.ready()
+            && self.enabled_paths_ready()
+            && !self.draining.load(Ordering::Acquire)
+    }
+
+    /// Initialization criteria for conditionally enabled entry paths
+    /// (audit against 01-Ingress §3.3 "启用路径的依赖可达"):
+    ///
+    /// | Path | Criterion | Why it is initialization-only |
+    /// | --- | --- | --- |
+    /// | direct/WS/CONNECT/cw/SSH | route store first sync (`replace()`) | covered by `resolver.ready()` |
+    /// | agent-api (embedded Activator) | `LocalControl::connect` completed at construction | startup fails otherwise |
+    /// | agent-api (independent Activator) | first membership discovery read | latch; later refresh failures keep last snapshot |
+    /// | environment-files (ExecdAccess) | none — no startup I/O | api-server is a per-request runtime dependency |
+    /// | DigitalMateGateway | `AccountService::connect` completed at bind | bind fails otherwise |
+    /// | reverse/control-plane proxy | static configuration | upstreams are runtime dependencies |
+    ///
+    /// Every criterion is a one-way startup signal. Runtime failures never
+    /// flip readiness back: a shared-dependency outage must not pull every
+    /// replica out of load balancing at once — callers retry instead.
+    fn enabled_paths_ready(&self) -> bool {
+        #[cfg(feature = "agent-api")]
+        if let Some(api) = &self.agent_api {
+            if !api.ready() {
+                return false;
+            }
+        }
+        true
     }
 
     pub fn start_drain(&self) {
         self.draining.store(true, Ordering::Release);
         self.http_pool.clear();
+        // CloseImmediate cancels outstanding backend streams so existing
+        // WS/command-watch/CONNECT tunnels close at drain start instead of
+        // running to the drain deadline. ContinueUntilDeadline leaves them
+        // alone; the drain wait still bounds them via `frontend_work`.
+        // Built-in SSH terminals enforce the same mode in their connection
+        // loop (see ssh.rs) — they are not backend sessions to cancel.
+        if self.ws_drain_mode == crate::config::WsDrainMode::CloseImmediate {
+            self.cancel_all_sessions();
+            self.reconnect_command_watch_clients();
+        }
+    }
+
+    /// Begin draining and record the budget deadline. The deadline is
+    /// stored before the draining latch flips so drain-aware paths (the
+    /// built-in SSH terminal listener under ContinueUntilDeadline) read
+    /// a cut instant as soon as they observe the drain; hosts must call
+    /// this before broadcasting shutdown. A bare `start_drain` leaves
+    /// the deadline unset, which those paths treat as "cut at the
+    /// shutdown signal" — the previous behavior, kept for tests and for
+    /// hosts that shut down without a drain budget.
+    pub(in crate::ingress) fn start_drain_at(&self, deadline: tokio::time::Instant) {
+        *self
+            .drain_deadline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(deadline);
+        self.start_drain();
+    }
+
+    /// The drain budget deadline recorded by `start_drain_at`, if the
+    /// host supplied one. None while running or after a bare
+    /// `start_drain`; drain-aware paths fall back to cutting at the
+    /// shutdown signal when it is None. Only the agent-api SSH terminal
+    /// listener reads it, hence the feature gate.
+    #[cfg(feature = "agent-api")]
+    pub(in crate::ingress) fn drain_deadline(&self) -> Option<tokio::time::Instant> {
+        *self
+            .drain_deadline
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Push a connection-level RECONNECT state to every active external
+    /// command-watch connection. Each connection loop forwards the frame to
+    /// the frontend and then closes the socket, so clients re-subscribe
+    /// against a fresh replica as soon as the old one starts draining,
+    /// without waiting for backend stream cancellation to propagate.
+    /// Connections still inside their negotiation window close without the
+    /// frame (see the outbound branch in `run_external_command_watch`);
+    /// a saturated outbound queue drops the frame with a warn below and
+    /// signals the connection-level cancel, so the connection still
+    /// closes at drain start.
+    fn reconnect_command_watch_clients(&self) {
+        let outbounds = self
+            .command_watch_outbounds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (connection_id, outbound) in outbounds.iter() {
+            match outbound.outbound.try_send(WatchState {
+                op: "state",
+                environment_id: String::new(),
+                command_id: String::new(),
+                status: "RECONNECT".into(),
+                state_version: 0,
+                error: None,
+            }) {
+                Ok(()) => {}
+                // A full queue means the connection is not keeping up with
+                // its outbound states; drop the frame instead of blocking
+                // drain — and signal the connection-level cancel so
+                // CloseImmediate still closes the connection rather than
+                // running it to the drain deadline. Without this log, an
+                // operator cannot tell why a replica's client missed the
+                // RECONNECT and fell back to timeout-driven reconnect.
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(
+                        connection_id = %connection_id,
+                        "command-watch outbound queue full at drain: RECONNECT frame dropped, \
+                         closing the connection; the client falls back to reconnect",
+                    );
+                    outbound.cancel.notify_one();
+                }
+                // Closed: the connection task ended moments ago and its
+                // registration guard has not dropped yet — benign.
+                Err(mpsc::error::TrySendError::Closed(_)) => {}
+            }
+        }
     }
 
     pub fn active_sessions(&self) -> usize {
         self.active_sessions.load(Ordering::Relaxed)
+    }
+
+    /// Active frontend connection/relay tasks that drain must wait on.
+    pub fn frontend_connections(&self) -> usize {
+        self.frontend_work.active.load(Ordering::Relaxed)
+    }
+
+    /// Monotonic count of frontend connection/relay tasks ever opened. A
+    /// rollout may advance to the next batch only once this stops growing on
+    /// an endpoint-removed replica — request rates keep moving on keep-alive
+    /// connections, so increments, not traffic, are the withdrawal evidence.
+    pub fn frontend_connections_opened_total(&self) -> u64 {
+        self.frontend_work.opened_total.load(Ordering::Relaxed)
+    }
+    /// Wait for in-flight work to finish within the drain budget: backend
+    /// streams (`active_sessions`) AND frontend connection/relay tasks
+    /// (`frontend_connections`). The previous behavior only waited on
+    /// backend streams, so frontend HTTP/WS/CONNECT tasks could be cut off
+    /// by runtime exit before finishing. An HTTP/1.1 keep-alive connection
+    /// holds its connection task open, so it keeps counting until the client
+    /// disconnects — connection-level granularity is part of the
+    /// ContinueUntilDeadline semantics.
+    pub(in crate::ingress) async fn wait_drained(&self, deadline: tokio::time::Instant) {
+        while (self.active_sessions() > 0 || self.frontend_connections() > 0)
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    /// Cloned handle to the frontend work accounting, so other ingress
+    /// submodules (the agent-api proxy path and the SSH terminal listener)
+    /// can count their frontend tasks for the drain wait.
+    pub(in crate::ingress) fn frontend_work_handle(&self) -> Arc<FrontendWork> {
+        self.frontend_work.clone()
     }
 
     pub fn physical_connections(&self) -> usize {
@@ -754,6 +937,15 @@ impl Ingress {
                 .sessions
                 .lock()
                 .map_err(|_| io::Error::other("active session lock poisoned"))?;
+            // Re-check draining under the session lock: cancel_all_sessions
+            // takes the same lock, so a drain that started between the entry
+            // check and this insert cannot strand an un-cancelled session.
+            if self.draining.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "Ingress is draining",
+                ));
+            }
             // Hold the session lock across the snapshot and registration: a later
             // revocation must not be consumed before this session becomes visible.
             let revision = self
@@ -1003,6 +1195,7 @@ impl Ingress {
                     let tls_acceptor = tls_acceptor.clone();
                     let options = options.clone();
                     tokio::spawn(async move {
+                        let _frontend = FrontendGuard::new(gateway.frontend_work.clone());
                         match tls_acceptor {
                             Some(acceptor) => {
                                 if let Some(stream) = accept_ingress_tls(acceptor, stream, peer).await {
@@ -1285,6 +1478,14 @@ impl Ingress {
         ingress_security: IngressSecurity,
         peer: std::net::SocketAddr,
     ) -> Result<Response<ProxyBody>, Infallible> {
+        // Once draining, reject new business work on every main-listener path
+        // (HTTP, WS upgrade, command-watch, CONNECT, control-plane and reverse
+        // proxy). Existing in-flight tasks continue and are bounded by the
+        // drain budget. The Ingress's own probes are served on the separate
+        // health listener and are unaffected.
+        if self.draining.load(Ordering::Acquire) {
+            return Ok(draining_rejection(request.version()));
+        }
         let _in_flight = AtomicMetricGuard::new(&self.request_metrics.in_flight);
         let started = Instant::now();
         let request_id = ensure_request_id(&mut request);
@@ -1672,6 +1873,9 @@ impl Ingress {
                      data_plane_ingress_route_watch_lag_seconds {}\n\
                      data_plane_ingress_route_point_get_total {}\n\
                      data_plane_ingress_active_sessions {}\n\
+                     data_plane_ingress_frontend_connections {}\n\
+                     data_plane_ingress_frontend_connections_opened_total {}\n\
+                     data_plane_ingress_draining {}\n\
                      data_plane_ingress_h2_physical_connections {}\n\
                      data_plane_ingress_route_forced_close_total {}\n\
                      data_plane_ingress_backend_http_idle_connections {}\n\
@@ -1693,6 +1897,9 @@ impl Ingress {
                     self.resolver.watch_lag_seconds(),
                     self.resolver.point_get_total(),
                     self.active_sessions(),
+                    self.frontend_connections(),
+                    self.frontend_connections_opened_total(),
+                    usize::from(self.draining.load(Ordering::Acquire)),
                     self.physical_connections(),
                     self.forced_close_total.load(Ordering::Relaxed),
                     pool.idle_connections,
@@ -1771,6 +1978,7 @@ impl Ingress {
         // The upgrade task outlives the entry span. Capture its context now so
         // the session-close logs remain correlated with the originating request.
         tokio::spawn(adx_observability::trace::with_current_context(async move {
+            let _frontend = FrontendGuard::adopted(gateway.frontend_work.clone());
             match upgraded.await {
                 Ok(upgraded) => {
                     let websocket = tokio_tungstenite::WebSocketStream::from_raw_socket(
@@ -1814,7 +2022,26 @@ impl Ingress {
     {
         let (outbound_tx, mut outbound_rx) =
             mpsc::channel::<WatchState>(self.command_watch_config.queue_capacity);
+        let connection_cancel = Arc::new(tokio::sync::Notify::new());
+        let _outbound_registration = CommandWatchOutboundGuard::new(
+            self.command_watch_outbounds.clone(),
+            CommandWatchOutbound {
+                outbound: outbound_tx.clone(),
+                cancel: connection_cancel.clone(),
+            },
+        );
         let _connection = AtomicMetricGuard::new(&self.command_watch_metrics.connections);
+        // A drain that started while this connection was still completing
+        // its upgrade never saw it in start_drain's sweep (the registration
+        // above happened after). Close immediately under CloseImmediate:
+        // the pre-negotiation close is the crash path clients already
+        // recover from by reconnecting.
+        if self.ws_drain_mode == crate::config::WsDrainMode::CloseImmediate
+            && self.draining.load(Ordering::Acquire)
+        {
+            websocket.close(None).await?;
+            return Ok(());
+        }
         let mut subscriptions: HashMap<(String, String), ExternalSubscription> = HashMap::new();
         let mut version_negotiated = false;
         let expiry = expires_at_unix.map(|expires_at| {
@@ -1840,6 +2067,15 @@ impl Ingress {
                         code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Policy,
                         reason: "JWT expired".into(),
                     })).await?;
+                    break;
+                }
+                _ = connection_cancel.notified() => {
+                    // The outbound queue was saturated when drain started, so
+                    // the RECONNECT frame was dropped with a warn (see
+                    // reconnect_command_watch_clients): close now so
+                    // CloseImmediate does not run this connection to the
+                    // drain deadline on a dropped frame.
+                    websocket.close(None).await?;
                     break;
                 }
                 incoming = websocket.next() => {
@@ -1904,11 +2140,30 @@ impl Ingress {
                     }
                 }
                 Some(state) = outbound_rx.recv() => {
-                    if state.status == "RECONNECT" {
+                    let reconnect = state.status == "RECONNECT";
+                    // Pre-negotiation, the only possible producer on this
+                    // channel is the drain-synthesized RECONNECT
+                    // (subscriptions — the other producers — require a
+                    // negotiated connection). The protocol makes `ready`
+                    // the first frame a client ever receives, and the SDK
+                    // rejects a state frame before it ("ingress sent
+                    // command state before protocol negotiation"), so
+                    // close without delivering: a close during negotiation
+                    // is the crash path clients already recover from by
+                    // reconnecting.
+                    if !version_negotiated {
                         websocket.close(None).await?;
                         break;
                     }
+                    // Deliver the state first — including RECONNECT, so the
+                    // client can tell a drain-induced reconnect apart from an
+                    // abrupt cut — then close the socket to force
+                    // re-subscription against a fresh replica.
                     websocket.send(tokio_tungstenite::tungstenite::Message::Text(serde_json::to_string(&state)?)).await?;
+                    if reconnect {
+                        websocket.close(None).await?;
+                        break;
+                    }
                 }
             }
         }
@@ -2050,7 +2305,9 @@ impl Ingress {
                 let access_kind = access_kind.as_str();
                 // The CONNECT byte pump outlives the entry span; keep the
                 // captured context so the stream-close log carries trace_id.
+                let frontend_work = self.frontend_work.clone();
                 tokio::spawn(adx_observability::trace::with_current_context(async move {
+                    let _frontend = FrontendGuard::adopted(frontend_work);
                     let relay = async {
                         match on_upgrade.await {
                             Ok(upgraded) => {
@@ -2165,7 +2422,14 @@ impl Ingress {
                     request.headers_mut().remove(name);
                 }
                 let cancelled = stream.cancelled.clone();
-                return proxy_http(request, stream, "environment", Some(cancelled)).await;
+                return proxy_http(
+                    request,
+                    stream,
+                    "environment",
+                    Some(cancelled),
+                    self.frontend_work.clone(),
+                )
+                .await;
             }
         }
         loop {
@@ -2322,7 +2586,14 @@ impl Ingress {
                 }
             };
             let cancelled = stream.cancelled.clone();
-            return Ok(proxy_http(request, stream, "environment", Some(cancelled)).await);
+            return Ok(proxy_http(
+                request,
+                stream,
+                "environment",
+                Some(cancelled),
+                self.frontend_work.clone(),
+            )
+            .await);
         }
 
         let upgrade_requested = request.headers().contains_key(header::UPGRADE);
@@ -2335,7 +2606,14 @@ impl Ingress {
                 }
             };
             let cancelled = stream.cancelled.clone();
-            return Ok(proxy_http(request, stream, "environment", Some(cancelled)).await);
+            return Ok(proxy_http(
+                request,
+                stream,
+                "environment",
+                Some(cancelled),
+                self.frontend_work.clone(),
+            )
+            .await);
         }
 
         if let Err(error) = self.authorize(&route, &tenant_id) {
@@ -2519,7 +2797,14 @@ impl Ingress {
                 Err(error) => return error_response(IngressOpenError::Connect(error)),
             };
             let cancelled = stream.cancelled.clone();
-            return proxy_http(request, stream, "envd-or-application", Some(cancelled)).await;
+            return proxy_http(
+                request,
+                stream,
+                "envd-or-application",
+                Some(cancelled),
+                self.frontend_work.clone(),
+            )
+            .await;
         }
         strip_hop_by_hop_headers(request.headers_mut());
         let Some(route_revision) = self.resolver.current_route_revision(&route) else {
@@ -2914,6 +3199,47 @@ async fn run_downstream_watch<S>(
     }
 }
 
+/// A command-watch connection's outbound channel plus its connection-level
+/// cancel signal: drain can always close the connection, even when the
+/// outbound queue is saturated and the RECONNECT frame had to be dropped.
+struct CommandWatchOutbound {
+    outbound: mpsc::Sender<WatchState>,
+    cancel: Arc<tokio::sync::Notify>,
+}
+
+/// Keeps a command-watch connection's outbound channel registered in the
+/// Ingress for as long as the connection task runs, so drain can reach it.
+struct CommandWatchOutboundGuard {
+    outbounds: Arc<Mutex<HashMap<Uuid, CommandWatchOutbound>>>,
+    connection_id: Uuid,
+}
+
+impl CommandWatchOutboundGuard {
+    fn new(
+        outbounds: Arc<Mutex<HashMap<Uuid, CommandWatchOutbound>>>,
+        outbound: CommandWatchOutbound,
+    ) -> Self {
+        let connection_id = Uuid::new_v4();
+        outbounds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(connection_id, outbound);
+        Self {
+            outbounds,
+            connection_id,
+        }
+    }
+}
+
+impl Drop for CommandWatchOutboundGuard {
+    fn drop(&mut self) {
+        self.outbounds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.connection_id);
+    }
+}
+
 struct AtomicMetricGuard<'a>(&'a std::sync::atomic::AtomicU64);
 
 impl<'a> AtomicMetricGuard<'a> {
@@ -3023,6 +3349,7 @@ pub(super) async fn proxy_http<T>(
     stream: T,
     upstream_name: &'static str,
     cancelled: Option<watch::Receiver<bool>>,
+    frontend_work: Arc<FrontendWork>,
 ) -> Response<ProxyBody>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
@@ -3062,6 +3389,7 @@ where
         if let Some(downstream_upgrade) = downstream_upgrade {
             let upstream_upgrade = hyper::upgrade::on(&mut response);
             tokio::spawn(async move {
+                let _frontend = FrontendGuard::adopted(frontend_work);
                 let relay = async move {
                     let downstream = downstream_upgrade
                         .await
@@ -3236,6 +3564,46 @@ impl Drop for SessionGuard {
     }
 }
 
+/// Frontend connection/relay accounting shared by all connection tasks: the
+/// active-task gauge the drain wait polls, plus the monotonic counter proving
+/// a replica stopped receiving new frontend connections.
+#[derive(Default)]
+pub(in crate::ingress) struct FrontendWork {
+    active: AtomicUsize,
+    opened_total: AtomicU64,
+}
+
+/// Counts an active frontend connection/relay task against the drain gauge.
+/// Created when a connection task starts, dropped when it ends, so `serve()`
+/// can wait for in-flight frontend work within the drain budget. Each task
+/// also ticks the opened counter once, on creation.
+pub(in crate::ingress) struct FrontendGuard {
+    work: Arc<FrontendWork>,
+}
+
+impl FrontendGuard {
+    pub(in crate::ingress) fn new(work: Arc<FrontendWork>) -> Self {
+        work.active.fetch_add(1, Ordering::Relaxed);
+        work.opened_total.fetch_add(1, Ordering::Relaxed);
+        Self { work }
+    }
+    /// For a task that outlives the connection task which already counted
+    /// this frontend's opening (the WS upgrade, CONNECT and command-watch
+    /// relay pumps): keeps the drain gauge accurate without double-counting
+    /// the monotonic opened counter, and without ticking it for upgrades
+    /// that raced a drain.
+    fn adopted(work: Arc<FrontendWork>) -> Self {
+        work.active.fetch_add(1, Ordering::Relaxed);
+        Self { work }
+    }
+}
+
+impl Drop for FrontendGuard {
+    fn drop(&mut self) {
+        self.work.active.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub struct IngressStream {
     stream: H2ConnectStream,
     cancelled: watch::Receiver<bool>,
@@ -3393,6 +3761,23 @@ fn record_ingress_error(error: &IngressOpenError) {
     }
 }
 
+/// The draining rejection for one request. Load balancers pin an
+/// established connection to this replica, so a keep-alive 503 would absorb
+/// every client retry into the drain window until the process exits.
+/// `Connection: close` makes the retry a fresh connection, which routes to
+/// a healthy replica as soon as the endpoints update. HTTP/1.x only: h2
+/// forbids connection-specific headers, and its connection-level retirement
+/// (GOAWAY) would need per-connection handles the serve loop does not keep.
+fn draining_rejection(version: Version) -> Response<ProxyBody> {
+    let mut response = error_response(IngressOpenError::Draining);
+    if version < Version::HTTP_2 {
+        response
+            .headers_mut()
+            .insert(header::CONNECTION, http::HeaderValue::from_static("close"));
+    }
+    response
+}
+
 fn error_response(error: IngressOpenError) -> Response<ProxyBody> {
     // RouteChanged is emitted only before CONNECT or the business send. Keep
     // that typed evidence so clients can retry; never classify by message text.
@@ -3510,6 +3895,56 @@ mod tests {
             "route changed while opening the stream",
         )));
         assert!(response.headers().get("x-adx-error-code").is_none());
+    }
+
+    #[test]
+    fn frontend_guard_counts_active_tasks_and_releases_on_drop() {
+        let work = Arc::new(FrontendWork::default());
+        assert_eq!(work.active.load(Ordering::Relaxed), 0);
+        assert_eq!(work.opened_total.load(Ordering::Relaxed), 0);
+        let guard = FrontendGuard::new(work.clone());
+        assert_eq!(work.active.load(Ordering::Relaxed), 1);
+        let guard_two = FrontendGuard::new(work.clone());
+        assert_eq!(work.active.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            work.opened_total.load(Ordering::Relaxed),
+            2,
+            "opened counter is monotonic and never decremented"
+        );
+        drop(guard);
+        assert_eq!(work.active.load(Ordering::Relaxed), 1);
+        assert_eq!(work.opened_total.load(Ordering::Relaxed), 2);
+        drop(guard_two);
+        assert_eq!(work.active.load(Ordering::Relaxed), 0);
+        assert_eq!(work.opened_total.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn frontend_guard_adopted_holds_active_without_ticking_opened_total() {
+        // The WS upgrade / CONNECT / command-watch pumps take over a
+        // frontend the admission task already counted. They must keep the
+        // drain gauge accurate without ticking the withdrawal-evidence
+        // counter a second time for the same connection.
+        let work = Arc::new(FrontendWork::default());
+        let admitted = FrontendGuard::new(work.clone());
+        assert_eq!(work.active.load(Ordering::Relaxed), 1);
+        assert_eq!(work.opened_total.load(Ordering::Relaxed), 1);
+        let adopted = FrontendGuard::adopted(work.clone());
+        assert_eq!(work.active.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            work.opened_total.load(Ordering::Relaxed),
+            1,
+            "an upgrade relay adopts an already-counted frontend"
+        );
+        drop(admitted);
+        assert_eq!(
+            work.active.load(Ordering::Relaxed),
+            1,
+            "the relay keeps holding the drain gauge after the connection task ends"
+        );
+        drop(adopted);
+        assert_eq!(work.active.load(Ordering::Relaxed), 0);
+        assert_eq!(work.opened_total.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -4111,6 +4546,544 @@ mod processing_tests;
 
 #[cfg(test)]
 mod access_policy_tests;
+#[cfg(test)]
+mod command_watch_drain_tests {
+    use super::*;
+    use crate::ingress::{H2PoolConfig, IngressRouteResolver, RouteStore};
+
+    fn drain_gateway(mode: crate::config::WsDrainMode) -> Arc<Ingress> {
+        let store = Arc::new(RouteStore::new());
+        store.set_ready(true);
+        Arc::new(
+            Ingress::new(
+                Arc::new(IngressRouteResolver::new(store)),
+                DataPlaneL4Connector::new(H2PoolConfig::default()),
+                IngressAuthenticator::disabled(),
+                50090,
+                8765,
+                "127.0.0.1:1",
+                vec![],
+            )
+            .with_ws_drain_mode(mode),
+        )
+    }
+
+    /// Frontend side of an external command-watch connection, plus the task
+    /// running the server side of it against `gateway`.
+    async fn command_watch_connection(
+        gateway: &Arc<Ingress>,
+    ) -> (
+        tokio_tungstenite::WebSocketStream<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<Result<(), BoxError>>,
+    ) {
+        use tokio_tungstenite::{tungstenite::protocol::Role, WebSocketStream};
+        let (frontend, server) = tokio::io::duplex(64 * 1024);
+        let frontend = WebSocketStream::from_raw_socket(frontend, Role::Client, None).await;
+        let server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        let gateway = Arc::clone(gateway);
+        let task = tokio::spawn(async move {
+            gateway
+                .run_external_command_watch(server, "tenant".into(), None)
+                .await
+        });
+        (frontend, task)
+    }
+
+    async fn negotiate(frontend: &mut tokio_tungstenite::WebSocketStream<tokio::io::DuplexStream>) {
+        use tokio_tungstenite::tungstenite::Message;
+        frontend
+            .send(Message::Text(
+                serde_json::json!({"protocolVersion": 1, "op": "subscribe", "commands": []})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+        let ready = tokio::time::timeout(std::time::Duration::from_secs(5), frontend.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let ready = match ready {
+            Message::Text(text) => text,
+            other => panic!("expected ready frame, got {other:?}"),
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&ready).unwrap()["op"],
+            "ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_immediate_drain_delivers_reconnect_frame_then_closes() {
+        use tokio_tungstenite::tungstenite::Message;
+        let gateway = drain_gateway(crate::config::WsDrainMode::CloseImmediate);
+        let (mut frontend, watch) = command_watch_connection(&gateway).await;
+        negotiate(&mut frontend).await;
+        assert_eq!(
+            gateway.command_watch_outbounds.lock().unwrap().len(),
+            1,
+            "connection registers its outbound channel"
+        );
+
+        gateway.start_drain();
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), frontend.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let frame = match frame {
+            Message::Text(text) => text,
+            other => panic!("expected reconnect frame, got {other:?}"),
+        };
+        let state: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(state["status"], "RECONNECT");
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), frontend.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(closed, Message::Close(_)),
+            "server closes after the reconnect frame"
+        );
+        watch.await.unwrap().unwrap();
+        assert!(
+            gateway.command_watch_outbounds.lock().unwrap().is_empty(),
+            "connection deregisters its outbound channel on exit"
+        );
+    }
+
+    #[tokio::test]
+    async fn continue_until_deadline_drain_leaves_command_watch_connected() {
+        use tokio_tungstenite::tungstenite::Message;
+        let gateway = drain_gateway(crate::config::WsDrainMode::default());
+        let (mut frontend, watch) = command_watch_connection(&gateway).await;
+        negotiate(&mut frontend).await;
+
+        gateway.start_drain();
+
+        // No reconnect frame and no close: the session keeps running until
+        // the drain deadline bounds it via the frontend gauge.
+        match tokio::time::timeout(std::time::Duration::from_millis(200), frontend.next()).await {
+            Err(_elapsed) => {}
+            Ok(message) => panic!("unexpected frame in ContinueUntilDeadline drain: {message:?}"),
+        }
+        assert!(!watch.is_finished());
+        // The frontend disconnects with the standard closing handshake; an
+        // abrupt socket drop would surface as a protocol error server-side.
+        frontend.send(Message::Close(None)).await.unwrap();
+        drop(frontend);
+        tokio::time::timeout(std::time::Duration::from_secs(5), watch)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_immediate_drain_during_negotiation_closes_without_state_frames() {
+        use tokio_tungstenite::tungstenite::Message;
+        let gateway = drain_gateway(crate::config::WsDrainMode::CloseImmediate);
+        // No negotiate frame is sent: drain starts while the connection is
+        // still inside its negotiation window, before `ready` went out.
+        let (mut frontend, watch) = command_watch_connection(&gateway).await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while gateway.command_watch_outbounds.lock().unwrap().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("connection registers its outbound channel");
+
+        gateway.start_drain();
+
+        // `ready` is the first frame a client ever receives, and the SDK
+        // rejects a state frame before it ("ingress sent command state
+        // before protocol negotiation"). The drain close must therefore
+        // arrive as a bare Close with no state frame in front of it.
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), frontend.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(closed, Message::Close(_)),
+            "expected a bare close during negotiation, got {closed:?}"
+        );
+        watch.await.unwrap().unwrap();
+        assert!(
+            gateway.command_watch_outbounds.lock().unwrap().is_empty(),
+            "connection deregisters its outbound channel on exit"
+        );
+    }
+
+    #[test]
+    fn saturated_outbound_queue_drops_the_drain_reconnect() {
+        let gateway = drain_gateway(crate::config::WsDrainMode::CloseImmediate);
+        let (outbound, mut queued) = mpsc::channel::<WatchState>(1);
+        // Occupy the single queue slot with a state the "connection" has
+        // not consumed, then register the sender as a connection task
+        // would.
+        outbound
+            .try_send(WatchState {
+                op: "state",
+                environment_id: "environment".into(),
+                command_id: "command".into(),
+                status: "RUNNING".into(),
+                state_version: 1,
+                error: None,
+            })
+            .unwrap();
+        gateway.command_watch_outbounds.lock().unwrap().insert(
+            Uuid::new_v4(),
+            CommandWatchOutbound {
+                outbound,
+                cancel: Arc::new(tokio::sync::Notify::new()),
+            },
+        );
+
+        gateway.start_drain();
+
+        // The RECONNECT is dropped (queue full) rather than overwriting or
+        // blocking: the connection still closes at drain start, and the
+        // client falls back to its timeout-driven reconnect. The warn log
+        // in `reconnect_command_watch_clients` is the ops-side evidence for
+        // that fallback; it is not asserted here.
+        assert_eq!(
+            queued.try_recv().unwrap().status,
+            "RUNNING",
+            "the queued state is left untouched"
+        );
+        assert!(
+            queued.try_recv().is_err(),
+            "no RECONNECT was queued behind the saturated queue"
+        );
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use crate::ingress::{H2PoolConfig, IngressRouteResolver, RouteStore};
+
+    fn drain_gateway(mode: crate::config::WsDrainMode) -> Arc<Ingress> {
+        let store = Arc::new(RouteStore::new());
+        store.set_ready(true);
+        Arc::new(
+            Ingress::new(
+                Arc::new(IngressRouteResolver::new(store)),
+                DataPlaneL4Connector::new(H2PoolConfig::default()),
+                IngressAuthenticator::disabled(),
+                50090,
+                8765,
+                "127.0.0.1:1",
+                vec![],
+            )
+            .with_ws_drain_mode(mode)
+            .with_client_acl(Vec::new(), true),
+        )
+    }
+
+    /// A registered backend session mirroring `open_current_stream`'s
+    /// registration: the cancel watch the drain paths fire, the map entry
+    /// the drain paths walk, and the `active_sessions` guard.
+    fn registered_session(gateway: &Arc<Ingress>) -> (SessionGuard, watch::Receiver<bool>) {
+        let session_id = Uuid::new_v4();
+        let (cancel, cancelled) = watch::channel(false);
+        let guard = SessionGuard {
+            session_id,
+            active_sessions: gateway.active_sessions.clone(),
+            sessions: gateway.sessions.clone(),
+        };
+        gateway.active_sessions.fetch_add(1, Ordering::Relaxed);
+        gateway.sessions.lock().unwrap().insert(
+            session_id,
+            ActiveSession {
+                instance_id: "instance".into(),
+                workload_id: "workload".into(),
+                relay_address: "127.0.0.1:1".into(),
+                target_ip: "127.0.0.1".parse().unwrap(),
+                // Drain tests never route binding changes at this session, so
+                // the binding revision stays at its initial value.
+                revision: 0,
+                route: RouteHandle {
+                    needs_resume: false,
+                    processing: None,
+                    access_kind: AccessKind::Direct,
+                    relay_address: "127.0.0.1:1".into(),
+                    tenant_id: "tenant".into(),
+                    tunnel_security_mode: Default::default(),
+                    port_forward_auth_mode: Default::default(),
+                    private_service_ports: Vec::new(),
+                    e2b: None,
+                    target: crate::common::protocol::ConnectTarget {
+                        instance_id: "instance".into(),
+                        workload_id: "workload".into(),
+                        target_ip: "127.0.0.1".parse().unwrap(),
+                        target_port: 8080,
+                        request_id: "request".into(),
+                    },
+                },
+                cancel,
+            },
+        );
+        (guard, cancelled)
+    }
+
+    #[tokio::test]
+    async fn drain_wait_holds_until_backend_and_frontend_work_finish() {
+        let gateway = drain_gateway(crate::config::WsDrainMode::default());
+        let (backend, _cancelled) = registered_session(&gateway);
+        let frontend = FrontendGuard::new(gateway.frontend_work.clone());
+        assert_eq!(gateway.active_sessions(), 1);
+        assert_eq!(gateway.frontend_connections(), 1);
+
+        gateway.start_drain();
+        let waited = tokio::spawn({
+            let gateway = gateway.clone();
+            async move {
+                gateway
+                    .wait_drained(tokio::time::Instant::now() + std::time::Duration::from_secs(30))
+                    .await
+            }
+        });
+        // Both an outstanding backend session and a frontend task hold the
+        // drain: the wait must not complete while either is in flight.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !waited.is_finished(),
+            "drain must hold while work is in flight"
+        );
+        drop(frontend);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !waited.is_finished(),
+            "drain must hold on a backend session alone"
+        );
+        // Double zero: backend and frontend both finished, so the wait
+        // completes well within the budget.
+        drop(backend);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waited)
+            .await
+            .expect("drain wait completes once both gauges are zero")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn drain_wait_expires_at_the_budget_when_work_never_finishes() {
+        let gateway = drain_gateway(crate::config::WsDrainMode::default());
+        let (_backend, _cancelled) = registered_session(&gateway);
+        gateway.start_drain();
+        let started = tokio::time::Instant::now();
+        gateway
+            .wait_drained(started + std::time::Duration::from_millis(250))
+            .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= std::time::Duration::from_millis(250),
+            "the drain budget must bound the wait"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "the wait must not hang past the budget"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_connection_tasks_count_as_frontend_work() {
+        let gateway = drain_gateway(crate::config::WsDrainMode::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server = gateway.clone();
+        tokio::spawn(async move { server.serve_http(listener, shutdown_rx).await });
+
+        let client = TcpStream::connect(address).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while gateway.frontend_connections() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("an accepted connection counts as in-flight frontend work");
+        // A connected-but-idle HTTP/1.1 client holds its connection task
+        // open (keep-alive semantics): it keeps counting toward the drain
+        // until it disconnects.
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while gateway.frontend_connections() > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the connection task ends with the client");
+        shutdown_tx.send(true).unwrap();
+    }
+
+    #[test]
+    fn draining_rejection_closes_http1_and_leaves_h2_alone() {
+        // L4 balancers pin an established connection to the draining
+        // replica: a keep-alive 503 would absorb every retry into the drain
+        // window. The HTTP/1.x rejection must carry Connection: close so
+        // the retry lands on a fresh (healthy) connection; h2 forbids the
+        // header.
+        for (version, expect_close) in [
+            (Version::HTTP_10, true),
+            (Version::HTTP_11, true),
+            (Version::HTTP_2, false),
+        ] {
+            let response = draining_rejection(version);
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let closed = response
+                .headers()
+                .get(header::CONNECTION)
+                .is_some_and(|value| value == "close");
+            assert_eq!(
+                closed, expect_close,
+                "Connection: close must be HTTP/1.x only"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn draining_http1_request_gets_503_with_connection_close() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let gateway = drain_gateway(crate::config::WsDrainMode::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let server = gateway.clone();
+        tokio::spawn(async move { server.serve_http(listener, shutdown_rx).await });
+        gateway.start_drain();
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut raw = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = client.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&buf[..n]);
+                let head = String::from_utf8_lossy(&raw);
+                if head.contains("\r\n\r\n") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the draining rejection must answer");
+        let head = String::from_utf8_lossy(&raw);
+        assert!(head.starts_with("HTTP/1.1 503"), "{head}");
+        assert!(
+            head.to_ascii_lowercase().contains("connection: close"),
+            "the retry must move to a fresh connection: {head}"
+        );
+        shutdown_tx.send(true).unwrap();
+    }
+
+    #[tokio::test]
+    async fn close_immediate_cancels_registered_backend_sessions() {
+        let gateway = drain_gateway(crate::config::WsDrainMode::CloseImmediate);
+        let (_backend, mut cancelled) = registered_session(&gateway);
+        assert_eq!(gateway.active_sessions(), 1);
+
+        gateway.start_drain();
+
+        // CloseImmediate cancels outstanding backend streams at drain start
+        // so existing WS/command-watch/CONNECT tunnels close instead of
+        // running to the drain deadline.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            cancelled.wait_for(|cancelled| *cancelled),
+        )
+        .await
+        .expect("drain cancels the registered session")
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn continue_until_deadline_leaves_backend_sessions_running() {
+        let gateway = drain_gateway(crate::config::WsDrainMode::default());
+        let (_backend, mut cancelled) = registered_session(&gateway);
+        assert_eq!(gateway.active_sessions(), 1);
+
+        gateway.start_drain();
+
+        // ContinueUntilDeadline leaves existing tunnels running: no
+        // cancellation is issued; the drain deadline bounds them instead.
+        let cancellation = cancelled.wait_for(|cancelled| *cancelled);
+        match tokio::time::timeout(std::time::Duration::from_millis(200), cancellation).await {
+            Err(_elapsed) => {}
+            Ok(_) => panic!("ContinueUntilDeadline must not cancel sessions at drain start"),
+        };
+    }
+}
+
+#[cfg(test)]
+mod ready_tests {
+    use super::*;
+    use crate::ingress::{H2PoolConfig, IngressRouteResolver, RouteStore};
+
+    fn gateway_with_store() -> (Arc<Ingress>, Arc<RouteStore>) {
+        let store = Arc::new(RouteStore::new());
+        let gateway = Arc::new(Ingress::new(
+            Arc::new(IngressRouteResolver::new(store.clone())),
+            DataPlaneL4Connector::new(H2PoolConfig::default()),
+            IngressAuthenticator::disabled(),
+            50090,
+            8765,
+            "127.0.0.1:1",
+            vec![],
+        ));
+        (gateway, store)
+    }
+
+    #[test]
+    fn ready_follows_route_store_sync_and_draining() {
+        // Runs in every feature configuration. With agent-api enabled but
+        // not configured (`agent_api: None`) this covers the `if let Some`
+        // miss branch of `enabled_paths_ready`; with the feature disabled
+        // it duplicates the compiled-out guard below.
+        let (gateway, store) = gateway_with_store();
+        assert!(
+            !gateway.ready(),
+            "an unsynchronized route store keeps the replica out of load"
+        );
+        store.set_ready(true);
+        assert!(
+            gateway.ready(),
+            "ready flips once the route store completes its first sync"
+        );
+        gateway.start_drain();
+        assert!(!gateway.ready(), "draining pulls the replica out of load");
+    }
+
+    #[cfg(not(feature = "agent-api"))]
+    #[test]
+    fn ready_flips_with_the_agent_api_path_compiled_out() {
+        // Direct guard for the SSH/direct-only build (agent-api is not a
+        // default feature): the enabled-path readiness check must be a
+        // no-op with the feature off, or /readyz — and with it LB
+        // admission for every entry path — would never flip. Runs under
+        // plain `cargo test -p data-plane-gateway`.
+        let (gateway, store) = gateway_with_store();
+        assert!(!gateway.ready());
+        store.set_ready(true);
+        assert!(
+            gateway.ready(),
+            "no enabled-path latch may hold readiness back with agent-api compiled out"
+        );
+        gateway.start_drain();
+        assert!(!gateway.ready());
+    }
+}
 
 #[cfg(test)]
 mod watch_close_contract_tests {
