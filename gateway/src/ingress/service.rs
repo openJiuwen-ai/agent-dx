@@ -224,6 +224,16 @@ impl IngressService {
         })
     }
 
+    /// Narrow readiness view of the bound (not yet served) Ingress, for
+    /// hosts that must fold the Ingress's admission state into their own
+    /// probe — e.g. the API Server embedding the Ingress reports
+    /// `/readyz = directory sync && embedded Ingress readiness`.
+    pub fn readiness(&self) -> IngressReadiness {
+        IngressReadiness {
+            gateway: self.gateway.clone(),
+        }
+    }
+
     pub async fn serve(
         self,
         shutdown: impl Future<Output = ()> + Send,
@@ -327,6 +337,21 @@ fn load_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor, Ser
         None,
         vec![b"h2".to_vec(), b"http/1.1".to_vec()],
     )
+}
+
+/// Readiness handle to a bound Ingress service, valid before and after
+/// `serve` consumes the service (the handle clones the gateway Arc).
+#[derive(Clone)]
+pub struct IngressReadiness {
+    gateway: Arc<Ingress>,
+}
+
+impl IngressReadiness {
+    /// The Ingress's own admission readiness: route store synchronized and
+    /// not draining.
+    pub fn ready(&self) -> bool {
+        self.gateway.ready()
+    }
 }
 
 fn send_error(error: Box<dyn std::error::Error>) -> ServiceError {
