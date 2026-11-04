@@ -8663,3 +8663,6 @@ mod external_policy_tests {
 
 #[cfg(all(test, feature = "dfs"))]
 mod gc_fence_tests;
+
+#[cfg(all(test, feature = "dfs"))]
+mod placement_hash_tests;

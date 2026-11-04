@@ -2175,6 +2175,141 @@ mod tests {
         }
     }
 
+    /// Two-node chain whose hop or prepare fails for one selected Chunk.
+    struct SelectiveFailPlane {
+        peer: Arc<LocalChunkStore>,
+        fail_prepare: Option<ChunkId>,
+        fail_hop: Option<ChunkId>,
+        sent: Mutex<Vec<ChunkId>>,
+    }
+
+    impl ReplicaDataPlane for SelectiveFailPlane {
+        fn mode(&self) -> ReplicaTransferMode {
+            ReplicaTransferMode::GrpcStream
+        }
+
+        fn prepare_peer(&self, op: &ReplicaPeerOp) -> Result<()> {
+            if self.fail_prepare.as_ref() == Some(&op.chunk_id) {
+                return Err(Error::coded(
+                    afs_error::NODE_TRANSFER_UNAVAILABLE,
+                    "injected prepare failure",
+                ));
+            }
+            Ok(())
+        }
+
+        fn put_peer_replica(
+            &self,
+            op: &ReplicaPeerOp,
+            staged: &StagedChunk,
+        ) -> Result<Vec<ReplicaAck>> {
+            self.sent.lock().unwrap().push(staged.chunk.id.clone());
+            if self.fail_hop.as_ref() == Some(&staged.chunk.id) {
+                return Err(Error::coded(
+                    afs_error::NODE_TRANSFER_UNAVAILABLE,
+                    "injected hop failure",
+                ));
+            }
+            Ok(vec![self.peer.persist(
+                staged,
+                &op.target,
+                op.placement_revision,
+                op.placement_epoch,
+            )?])
+        }
+    }
+
+    struct SelectiveFailFixture {
+        _temp: tempfile::TempDir,
+        local: Arc<LocalChunkStore>,
+        plane: Arc<SelectiveFailPlane>,
+        store: DfsChunkStore,
+    }
+
+    fn selective_fail_fixture(
+        fail_prepare: Option<ChunkId>,
+        fail_hop: Option<ChunkId>,
+    ) -> SelectiveFailFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path().join("a"), "a").unwrap());
+        let peer = Arc::new(LocalChunkStore::open(temp.path().join("b"), "b").unwrap());
+        let snapshot = Arc::new(PlacementSnapshot {
+            revision: 7,
+            replication: config(2),
+            replica_groups: vec![ReplicaGroup {
+                id: ReplicaGroupId::new("g"),
+                placement_epoch: 8,
+                targets: vec![
+                    target("a", local.device_descriptor().unwrap()),
+                    target("b", peer.device_descriptor().unwrap()),
+                ],
+            }],
+        });
+        let plane = Arc::new(SelectiveFailPlane {
+            peer,
+            fail_prepare,
+            fail_hop,
+            sent: Mutex::new(Vec::new()),
+        });
+        let store = DfsChunkStore::new_with_epoch(
+            "a".into(),
+            1,
+            local.clone(),
+            Arc::new(StaticPlacement { snapshot }),
+            plane.clone(),
+        );
+        SelectiveFailFixture {
+            _temp: temp,
+            local,
+            plane,
+            store,
+        }
+    }
+
+    fn holds(store: &LocalChunkStore, item: &StagedChunk) -> bool {
+        let mut bytes = vec![0; item.bytes().len()];
+        store.read_at(&item.chunk.id, 0, &mut bytes).is_ok()
+    }
+
+    #[test]
+    fn characterize_write_batch_one_failed_hop_fails_whole_batch_without_rollback() {
+        let items = [staged("batch-1"), staged("batch-2"), staged("batch-3")];
+        let f = selective_fail_fixture(None, Some(items[1].chunk.id.clone()));
+
+        let error = f.store.put_batch(items.to_vec()).unwrap_err();
+
+        // One hop failure discards every receipt, including the finished Chunk.
+        assert_eq!(error.code(), afs_error::NODE_TRANSFER_UNAVAILABLE);
+        // No hop retry, and the Chunks after the failed one are never sent.
+        assert_eq!(
+            *f.plane.sent.lock().unwrap(),
+            vec![items[0].chunk.id.clone(), items[1].chunk.id.clone()]
+        );
+        // Nothing rolls back: the head persisted the whole group before the
+        // first hop, and the finished peer copy stays as an orphan for GC.
+        for item in &items {
+            assert!(holds(&f.local, item));
+        }
+        assert!(holds(&f.plane.peer, &items[0]));
+        assert!(!holds(&f.plane.peer, &items[1]));
+        assert!(!holds(&f.plane.peer, &items[2]));
+    }
+
+    #[test]
+    fn characterize_write_batch_prepare_failure_has_no_durable_side_effect() {
+        let items = [staged("prepare-1"), staged("prepare-2")];
+        let f = selective_fail_fixture(Some(items[1].chunk.id.clone()), None);
+
+        let error = f.store.put_batch(items.to_vec()).unwrap_err();
+
+        assert_eq!(error.code(), afs_error::NODE_TRANSFER_UNAVAILABLE);
+        assert!(f.plane.sent.lock().unwrap().is_empty());
+        for item in &items {
+            assert!(!holds(&f.local, item));
+            assert!(!holds(&f.plane.peer, item));
+        }
+    }
+
     struct RepairFixtureAuthority {
         claim: crate::dfs::ReplicationClaim,
         claims: Mutex<Vec<crate::dfs::ClaimReplicationTask>>,
