@@ -188,3 +188,13 @@ export bounded labels rather than raw error messages. See the
 ### Volume 管理错误
 
 Volume 管理沿用上述错误结构。ensure 与删除应答未知时用相同 tenant/Volume ID 或 owner ID 重试；不能从超时推断定义或关联未提交。删除有引用、关联或占用的卷返回 CONFLICT，数据目录始终保留。接口见 [Volume API](volumes.md)。
+
+
+### E2B HTTP admission
+
+The Ingress returns426 for plaintext E2B management/service requests by default.
+The explicit `ADX_DATA_PLANE_INGRESS_E2B_ALLOW_HTTP=true` opt-in admits only E2B
+routes; missing or invalid credentials still produce401, and tenant/service
+policy violations retain403/404. Envd not-ready and unavailable routes retain
+the existing error mapping. Native control and administrator paths continue to
+require TLS. Noncanonical management paths cannot use the plaintext opt-in.

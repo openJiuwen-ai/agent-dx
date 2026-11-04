@@ -654,8 +654,8 @@ For TLS termination at an external load balancer, bind the existing HTTP listene
 with `ADX_DATA_PLANE_INGRESS_PLAIN_BIND=0.0.0.0:8080`, route the business Service
 port 80 to port 8080 using HTTP, and retain HTTPS/WSS at the public listener.
 Restrict the HTTP port to the deployment's internal network and configure public
-domains and paths at the load balancer. This does not change the existing TLS-only
-management routes or Ingress-to-Node mTLS.
+domains and paths at the load balancer. This does not change native/Agent TLS-only management routes or Ingress-to-Node
+mTLS; the explicit E2B HTTP opt-in is documented separately below.
 
 `POST /api/v1/auth/huawei/login` exchanges an Account Kit authorization code and returns
 an opaque business token. `POST /api/v1/auth/agc/login` accepts
@@ -820,3 +820,14 @@ its `userId` without starting an Environment. It follows DigitalMateGateway's
 business authentication; management API keys remain separate from business sessions.
 
 命令状态订阅 `/api/environment/v1/commands/watch` 在已配置 Execd access 时，会在后端 WebSocket 握手前检查 Environment 归属并注入服务端 Execd 令牌；调用方的业务凭据不会转发给 Execd。该认证与 `/direct` HTTP 路径共用同一配置。
+
+
+### Explicit HTTP E2B deployments
+
+E2B management and envd/application routes require TLS by default. An operator
+may explicitly set `ADX_DATA_PLANE_INGRESS_E2B_ALLOW_HTTP=true` together with
+E2B enabled to admit those routes on the existing plaintext listener, including
+HTTP/2. API keys, sandbox envd tokens, private-port traffic credentials, route
+fencing and Relay restrictions remain enforced. Native control/administrator,
+Execd, Agent and CONNECT policies remain unchanged. No forwarded header can
+assert this opt-in. See the [configuration and limits](../docs/deployment/e2b-compatibility.md#显式-http-入口).
