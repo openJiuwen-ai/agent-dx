@@ -40,6 +40,10 @@ impl Session {
         } else {
             None
         };
+        // The inspection latch already serializes these commits. Read the
+        // compared header after joining that queue, rather than letting each
+        // waiter carry a header made stale by the writers ahead of it.
+        let mut inventory = self.inspection.lock().await;
         let header_value = match catalog {
             Some(catalog) => Some(catalog.header_value.clone()),
             None => self.store.fields([HEADER.into()]).await?[0].clone(),
@@ -95,7 +99,6 @@ impl Session {
         } else {
             command.arg(0);
         }
-        let mut inventory = self.inspection.lock().await;
         let mut committed = inventory.take();
         match self.store.query::<u64>(command).await {
             Ok(1) => {

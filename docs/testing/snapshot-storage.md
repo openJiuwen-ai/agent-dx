@@ -164,6 +164,11 @@ SDK 的 `EnvironmentHTTPError.sandbox_ids` / `template_ids` 提供这些列表�
 无使用者时，Redis CAS 将 Snapshot 置为 Deleting，关闭新引用。后台执行物理删除并提交 Deleted；
 存储失败或应答丢失会幂等重试。共享删除不要求源 adxlet 在线。
 
+同一 Coordinator Session 的 Snapshot 提交沿用 inspection 互斥，并在取得互斥后读取
+CAS 比较的全局 header。并发更新不同 Snapshot 的引用时，等待者以队列前序提交完成后
+的 header 构建比较值。epoch、完整 Snapshot 记录、来源记录与 Volume catalog 的比较、
+全局 revision 推进及既有32次重试预算保持不变。
+
 ## 共享回收与故障
 
 Coordinator 在 Redis 持久化共享制品清单。每轮检查 Environment 恢复点、执行输入、

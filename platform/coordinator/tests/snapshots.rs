@@ -38,6 +38,82 @@ fn snapshot() -> Snapshot {
     )
     .unwrap()
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires dedicated real Redis"]
+async fn independent_snapshot_references_survive_concurrent_header_updates() {
+    const COUNT: usize = 512;
+    let rig = common::Redis::new().await;
+    let session = std::sync::Arc::new(rig.store().await.begin(1).await.unwrap());
+    let mut ids = vec![];
+    for index in 0..COUNT {
+        let mut value = snapshot();
+        value.id = format!("independent-{index}");
+        value.names = vec![value.id.clone()];
+        value.artifact.location = uuid::Uuid::new_v4().to_string();
+        session.publish_snapshot(value.clone()).await.unwrap();
+        ids.push(value.id);
+    }
+    let gate = std::sync::Arc::new(tokio::sync::Barrier::new(COUNT));
+    let mut operations = tokio::task::JoinSet::new();
+    for (index, id) in ids.iter().enumerate() {
+        let session = session.clone();
+        let gate = gate.clone();
+        let id = id.clone();
+        operations.spawn(async move {
+            gate.wait().await;
+            session
+                .acquire_snapshot(
+                    &id,
+                    "tenant",
+                    Reference::Restore {
+                        environment_id: format!("restore-{index}"),
+                    },
+                )
+                .await
+        });
+    }
+    let mut errors = vec![];
+    while let Some(result) = operations.join_next().await {
+        if let Err(error) = result.unwrap() {
+            errors.push(error);
+        }
+    }
+    assert!(
+        errors.is_empty(),
+        "Independent snapshot acquisitions failed: {errors:?}"
+    );
+    for (index, id) in ids.iter().enumerate() {
+        let value = session.get_snapshot(id).await.unwrap();
+        assert_eq!(value.state, SnapshotState::Ready);
+        assert_eq!(value.references.len(), 1);
+        assert!(value.references.contains(&Reference::Restore {
+            environment_id: format!("restore-{index}"),
+        }));
+    }
+    let gate = std::sync::Arc::new(tokio::sync::Barrier::new(COUNT));
+    let mut operations = tokio::task::JoinSet::new();
+    for (index, id) in ids.into_iter().enumerate() {
+        let session = session.clone();
+        let gate = gate.clone();
+        operations.spawn(async move {
+            gate.wait().await;
+            session
+                .release_snapshot(
+                    &id,
+                    Reference::Restore {
+                        environment_id: format!("restore-{index}"),
+                    },
+                )
+                .await
+        });
+    }
+    while let Some(result) = operations.join_next().await {
+        let value = result.unwrap().unwrap();
+        assert!(value.references.is_empty());
+        assert_eq!(value.state, SnapshotState::Ready);
+    }
+}
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
 async fn snapshot_busy_delete_is_rejected_and_survives_coordinator_restart() {
