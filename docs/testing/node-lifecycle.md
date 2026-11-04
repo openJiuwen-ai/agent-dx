@@ -2,6 +2,12 @@
 
 adxlet 拥有实例串行状态机。Coordinator 提供归属校验、Redis 持久化和路由发布；暂停等节点操作由 API Server 缓存命中后直达节点；手动恢复与 Ingress 流量唤醒统一调用 Coordinator `EnsureRunning`。
 
+快照目录的发布、查询、删除、巡检和回收等待存储时，不持有 Coordinator 全局调度状态锁，避免慢元数据操作阻塞正常心跳。发布在读取归属后，仍由同一 Redis CAS 比较 epoch、原始 Environment 记录和 `node-session` 标记；节点替换或源实例变化会拒绝迟到的发布。同一 artifact 的发布单独串行，避免两个快照 ID 重复认领。回收已消费的输入引用时，也比较原始持久归属，防止扫描后实例更新或重建导致误释放。
+
+调度恢复检查通过独立的原子标记判断 inspection inventory 是否已初始化，避免仅检查就绪状态也排在元数据写锁后。目录内容仍等待原锁，不能读取未提交视图；写入失败或取消时，guard 释放会关闭标记并要求权威恢复。
+
+`rpc::snapshot_publication_tests` 使用私有真实 Redis 暂停写入，同时提交目录读取、删除、节点巡检和 GC，验证普通心跳仍能完成；并覆盖持久节点会话替换及相同 artifact 的并发发布。RPC 快照回归继续校验租户隔离、失效源实例、引用保留和物理回收确认。
+
 ## 运行策略
 
 `EnvironmentSpec.lifecycle` 包含 `idle_timeout_seconds`、`idle_action`（默认 delete）、可选 `pause` 和可选 `restart`。HTTP 对应 `idleTimeoutSeconds`、`idleAction`、`pauseOptions`、`restartPolicy`；Python SDK 对应 `idle_timeout`、`IdleAction`、`PausePolicy`、`RestartPolicy`。自动和手动暂停后的鉴权业务流量均可唤醒，无需额外开关。

@@ -443,7 +443,7 @@ mod tests {
         Session {
             store,
             epoch: 1,
-            inspection: Arc::new(Mutex::new(None)),
+            inspection: Arc::new(super::inspection::InspectionCache::default()),
             generations: Arc::new(AtomicU64::new(1_u64 << 32)),
         }
     }
