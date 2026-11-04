@@ -1992,6 +1992,7 @@ mod real_dfs_keep_cache_contract {
         h1.read_exact(&mut page)?;
         assert_eq!(page, expected[..PAGE_BYTES]);
         let before_v2 = read_counter(metrics)?;
+        let v1 = expected.clone();
         for byte in &mut expected {
             *byte = 255 - *byte;
         }
@@ -2003,10 +2004,12 @@ mod real_dfs_keep_cache_contract {
         assert_eq!(page, expected[..PAGE_BYTES]);
         let after_h2 = read_counter(metrics)?;
         assert!(after_h2 > before_v2, "H2 reused V1's cached page");
+        // Decision 4a (S1a-6): H1 stays pinned to V1, also for bytes it never
+        // cached.
         h1.read_exact_at(&mut page, TAIL_OFFSET)?;
         assert_eq!(
             page,
-            expected[TAIL_OFFSET as usize..TAIL_OFFSET as usize + PAGE_BYTES]
+            v1[TAIL_OFFSET as usize..TAIL_OFFSET as usize + PAGE_BYTES]
         );
         let after_h1 = read_counter(metrics)?;
         assert!(after_h1 > after_h2, "H1 uncached tail did not enter FUSE");
