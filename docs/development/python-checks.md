@@ -23,6 +23,10 @@ CodeCheck 的平台规则另行检查。处理 Python 代码时尤其注意：
 - 类型校验使用 `isinstance`，字典分隔符保留空格；新增或修改的条件语句最多包含 3 个布尔表达式。
 - 嵌套函数或类定义前保留一个空行；平台会检查本地默认规则未启用的 E306。
 - 跨模块测试调用明确的公共校验入口，避免访问其他模块的下划线成员；平台会检查受保护成员访问。
+  例如通过 `Commands.get()` 验证能力查询失败及重试，通过请求记录验证路由，不读取内部标志；
+  HTTP 测试在客户端获取入口注入 MockTransport，不替换实例的 `_http` 字段。
+- 导入与 Python 内置名称同名的 SDK 异常时使用别名，例如 `EnvironmentError as SDKEnvironmentError`，
+  避免触发 `redefined-builtin`；不要为通过检查而改动公共异常类型。
 - URL 使用 `urllib.parse` 构建和编码，CIDR 使用 `ipaddress` 构造；动态字典查找显式处理键缺失。
 - 运行日志使用 `logging`；循环内定义的回调通过参数显式绑定循环变量，避免延迟绑定。
 - CLI 若输出机器读取的 JSON，使用 `logging` 时应显式保留原来的输出流和无前缀格式。
