@@ -68,7 +68,7 @@ def verify(directory: Path, *, enforce_host_architecture: bool = False) -> dict:
     backend_prefix = "runtime/sandboxd/"
     backend_files = {backend_prefix + name for name in (*SANDBOXD_BINARIES, "manifest.json")}
     backend_files.update(
-        f"etc/examples/sandboxd/{name}" for name in ("adx-sandboxd.service", "sandboxd.toml")
+        f"etc/examples/sandboxd/{name}" for name in ("sandboxd.service", "sandboxd.toml")
     )
     if with_sandboxd:
         required.update(backend_files)

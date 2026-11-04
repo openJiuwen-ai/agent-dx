@@ -70,7 +70,7 @@ def assemble(
     if backend_dir is not None:
         for name in (*SANDBOXD_BINARIES, "manifest.json"):
             inputs[f"runtime/sandboxd/{name}"] = backend_dir / name
-        for name in ("adx-sandboxd.service", "sandboxd.toml"):
+        for name in ("sandboxd.service", "sandboxd.toml"):
             inputs[f"etc/examples/sandboxd/{name}"] = ROOT / "build/release/sandboxd" / name
     for source in inputs.values():
         if source.is_symlink() or not source.is_file():

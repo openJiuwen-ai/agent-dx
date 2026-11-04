@@ -104,7 +104,7 @@ class PackageTests(unittest.TestCase):
             pkg.assemble(binaries, redis, redis_cli, wheel, output, "a" * 40, False, target, "release",
                          backend_dir=backend)
             self.assertTrue(pkg.verify(output)["with_sandboxd"])
-            self.assertTrue((output / "etc/examples/sandboxd/adx-sandboxd.service").is_file())
+            self.assertTrue((output / "etc/examples/sandboxd/sandboxd.service").is_file())
 
             metadata["target"] = "aarch64-unknown-linux-gnu"
             (backend / "manifest.json").write_text(json.dumps(metadata))

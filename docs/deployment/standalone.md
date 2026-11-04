@@ -42,9 +42,9 @@ overlayfs。x86_64 后端需要 glibc 2.34 或更高版本。若部署使用 Nyd
 sudo install -d -m 0755 /etc/adx
 sudo install -m 0600 /opt/adx/current/etc/examples/sandboxd/sandboxd.toml /etc/adx/sandboxd.toml
 sudoedit /etc/adx/sandboxd.toml
-sudo install -m 0644 /opt/adx/current/etc/examples/sandboxd/adx-sandboxd.service /etc/systemd/system/adx-sandboxd.service
+sudo install -m 0644 /opt/adx/current/etc/examples/sandboxd/sandboxd.service /etc/systemd/system/sandboxd.service
 sudo systemctl daemon-reload
-sudo systemctl enable --now adx-sandboxd.service
+sudo systemctl enable --now sandboxd.service
 sudo /opt/adx/current/runtime/sandboxd/sbox -a /run/sandboxd/sandboxd.sock check
 ```
 
