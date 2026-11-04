@@ -1087,19 +1087,12 @@ impl GrpcDfsMeta {
         ))
     }
 
+    /// Blocks the calling thread, under its `call_deadline` scope if any.
     fn run<T>(
         &self,
         future: impl std::future::Future<Output = std::result::Result<T, tonic::Status>>,
     ) -> afs_error::Result<T> {
-        self.run_with_timeout(future, self.timeout)
-    }
-
-    fn run_with_timeout<T>(
-        &self,
-        future: impl std::future::Future<Output = std::result::Result<T, tonic::Status>>,
-        timeout: Duration,
-    ) -> afs_error::Result<T> {
-        let timeout = timeout.min(self.timeout);
+        let timeout = crate::node::call_deadline::bounded(self.timeout);
         self.runtime.block_on(async {
             tokio::time::timeout(timeout, future)
                 .await
@@ -1946,30 +1939,19 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         &self,
         lease: crate::dfs::WriteLease,
     ) -> afs_error::Result<crate::dfs::WriteLease> {
-        self.renew_write_lease_with_timeout(lease, self.timeout)
-    }
-
-    fn renew_write_lease_with_timeout(
-        &self,
-        lease: crate::dfs::WriteLease,
-        timeout: Duration,
-    ) -> afs_error::Result<crate::dfs::WriteLease> {
         self.read_diagnostic(
             crate::node::read_work::ReadDiagnosticStage::MetaRenewWriteLease,
             || {
                 let reply = self
-                    .run_with_timeout(
-                        self.client().renew_write_lease(
-                            afs_protocol::meta::RenewDfsWriteLeaseRequest {
-                                caller_id: self.node_id.clone(),
-                                owner_session_id: self.session_id.clone(),
-                                operation_id: self.request_id(),
-                                current_lease: Some(wire_dfs_write_lease(lease)),
-                                lease_seconds: crate::node::vfs::dfs::DFS_WRITE_LEASE_SECONDS,
-                            },
-                        ),
-                        timeout,
-                    )?
+                    .run(self.client().renew_write_lease(
+                        afs_protocol::meta::RenewDfsWriteLeaseRequest {
+                            caller_id: self.node_id.clone(),
+                            owner_session_id: self.session_id.clone(),
+                            operation_id: self.request_id(),
+                            current_lease: Some(wire_dfs_write_lease(lease)),
+                            lease_seconds: crate::node::vfs::dfs::DFS_WRITE_LEASE_SECONDS,
+                        },
+                    ))?
                     .into_inner();
                 Ok(domain_dfs_write_lease(required(
                     reply.write_lease,
@@ -2000,34 +1982,6 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
                 required(reply.inode, "GetDfsInode.inode").and_then(domain_dfs_inode)
             },
         )
-    }
-
-    fn get_inode_async(
-        &self,
-        inode_id: crate::dfs::InodeId,
-    ) -> crate::node::read_pipeline::ReadFuture<'_, crate::dfs::InodeRecord> {
-        Box::pin(async move {
-            self.record_read_rpc("get_inode");
-            let mut client = self.client();
-            let reply = tokio::time::timeout(
-                self.timeout,
-                client.get_inode(afs_tracing::request_with_current_context(
-                    afs_protocol::meta::GetDfsInodeRequest {
-                        inode_id: inode_id.0,
-                    },
-                )),
-            )
-            .await
-            .map_err(|_| {
-                afs_error::Error::coded(
-                    afs_error::CLIENT_DEADLINE_EXCEEDED,
-                    "async inode lookup deadline exceeded",
-                )
-            })?
-            .map_err(afs_transport::grpc::error_status::status_to_error)?
-            .into_inner();
-            required(reply.inode, "GetDfsInode.inode").and_then(domain_dfs_inode)
-        })
     }
 
     fn get_file_version_async(
@@ -2091,19 +2045,11 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         &self,
         sync: crate::dfs::SyncInodeMetadata,
     ) -> afs_error::Result<crate::dfs::InodeRecord> {
-        self.sync_inode_metadata_with_timeout(sync, self.timeout)
-    }
-
-    fn sync_inode_metadata_with_timeout(
-        &self,
-        sync: crate::dfs::SyncInodeMetadata,
-        timeout: Duration,
-    ) -> afs_error::Result<crate::dfs::InodeRecord> {
         self.read_diagnostic(
             crate::node::read_work::ReadDiagnosticStage::MetaSyncInodeMetadata,
             || {
                 let reply = self
-                    .run_with_timeout(
+                    .run(
                         self.client().sync_inode_metadata(
                             afs_protocol::meta::SyncDfsInodeMetadataRequest {
                                 caller_id: self.node_id.clone(),
@@ -2117,7 +2063,6 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
                                 metadata_delta: Some(wire_dfs_metadata_delta(sync.metadata_delta)),
                             },
                         ),
-                        timeout,
                     )?
                     .into_inner();
                 required(reply.inode, "SyncInodeMetadata.inode").and_then(domain_dfs_inode)
@@ -2248,22 +2193,13 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
     }
 
     fn current_node_session(&self, node_id: &str) -> afs_error::Result<Option<String>> {
-        self.current_node_session_with_timeout(node_id, self.timeout)
-    }
-
-    fn current_node_session_with_timeout(
-        &self,
-        node_id: &str,
-        timeout: Duration,
-    ) -> afs_error::Result<Option<String>> {
         let reply = self
-            .run_with_timeout(
+            .run(
                 self.root_client()
                     .lookup_node(afs_protocol::meta::LookupNodeRequest {
                         request_id: self.request_id(),
                         node_id: node_id.to_owned(),
                     }),
-                timeout,
             )?
             .into_inner();
         if !reply.found {
@@ -2283,16 +2219,8 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         &self,
         commit: crate::dfs::CommitFileVersion,
     ) -> afs_error::Result<crate::dfs::InodeRecord> {
-        self.commit_file_version_with_timeout(commit, self.timeout)
-    }
-
-    fn commit_file_version_with_timeout(
-        &self,
-        commit: crate::dfs::CommitFileVersion,
-        timeout: Duration,
-    ) -> afs_error::Result<crate::dfs::InodeRecord> {
         let reply = self
-            .run_with_timeout(
+            .run(
                 self.client()
                     .commit_file_version(afs_tracing::request_with_current_context(
                         afs_protocol::meta::CommitFileVersionRequest {
@@ -2323,7 +2251,6 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
                             }),
                         },
                     )),
-                timeout,
             )?
             .into_inner();
         required(reply.inode, "CommitFileVersion.inode").and_then(domain_dfs_inode)
@@ -4670,39 +4597,44 @@ mod tests {
         let focused = Duration::from_millis(40);
 
         let meta = std::sync::Arc::new(test_meta(&endpoint, configured_long));
+        use crate::node::call_deadline::within_timeout as within;
         let lease_meta = meta.clone();
         assert_deadline_elapsed("renew lease timeout", move || {
-            DfsMeta::renew_write_lease_with_timeout(lease_meta.as_ref(), test_lease(), focused)
-                .map(|_| ())
+            within(focused, || {
+                DfsMeta::renew_write_lease(lease_meta.as_ref(), test_lease()).map(|_| ())
+            })
         })
         .await;
 
         let sync_meta = meta.clone();
         assert_deadline_elapsed("metadata sync timeout", move || {
-            DfsMeta::sync_inode_metadata_with_timeout(
-                sync_meta.as_ref(),
-                test_metadata_sync(),
-                focused,
-            )
-            .map(|_| ())
+            within(focused, || {
+                DfsMeta::sync_inode_metadata(sync_meta.as_ref(), test_metadata_sync()).map(|_| ())
+            })
         })
         .await;
 
         let commit_meta = meta.clone();
         assert_deadline_elapsed("file commit timeout", move || {
-            DfsMeta::commit_file_version_with_timeout(commit_meta.as_ref(), test_commit(), focused)
-                .map(|_| ())
+            within(focused, || {
+                DfsMeta::commit_file_version(commit_meta.as_ref(), test_commit()).map(|_| ())
+            })
+        })
+        .await;
+
+        let session_meta = meta.clone();
+        assert_deadline_elapsed("node session timeout", move || {
+            within(focused, || {
+                DfsMeta::current_node_session(session_meta.as_ref(), "node-a").map(|_| ())
+            })
         })
         .await;
 
         let configured_short = std::sync::Arc::new(test_meta(&endpoint, focused));
         assert_deadline_elapsed("configured timeout remains a cap", move || {
-            DfsMeta::renew_write_lease_with_timeout(
-                configured_short.as_ref(),
-                test_lease(),
-                configured_long,
-            )
-            .map(|_| ())
+            within(configured_long, || {
+                DfsMeta::renew_write_lease(configured_short.as_ref(), test_lease()).map(|_| ())
+            })
         })
         .await;
 

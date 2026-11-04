@@ -703,9 +703,9 @@ impl WriteCoordinator {
                 cached
             } else {
                 let timeout = remaining.min(REMOTE_RELEASE_RPC_BUDGET);
-                let result = self
-                    .meta
-                    .current_node_session_with_timeout(&key.owner_node_id, timeout);
+                let result = crate::node::call_deadline::within_timeout(timeout, || {
+                    self.meta.current_node_session(&key.owner_node_id)
+                });
                 session_cache.insert(session_key, result.clone());
                 result
             };
@@ -738,8 +738,10 @@ impl WriteCoordinator {
                 break;
             }
             let timeout = remaining.min(REMOTE_RELEASE_RPC_BUDGET);
-            match Self::remote_release_handle_with_timeout(&pending.owner, &pending.handle, timeout)
-            {
+            let release = crate::node::call_deadline::within_timeout(timeout, || {
+                Self::remote_release_handle(&pending.owner, &pending.handle)
+            });
+            match release {
                 Ok(()) => {
                     if self.remove_pending_remote_release_if_current(&key, &pending)? {
                         released = released.saturating_add(1);
@@ -854,20 +856,6 @@ impl WriteCoordinator {
         owner.release(afs_protocol::node_control::DfsOwnerReleaseRequest {
             handle: Some(handle.clone()),
         })?;
-        Ok(())
-    }
-
-    fn remote_release_handle_with_timeout(
-        owner: &Arc<dyn RemoteDfsOwner>,
-        handle: &afs_protocol::node_control::DfsOwnerHandle,
-        timeout: std::time::Duration,
-    ) -> Result<()> {
-        owner.release_with_timeout(
-            afs_protocol::node_control::DfsOwnerReleaseRequest {
-                handle: Some(handle.clone()),
-            },
-            timeout,
-        )?;
         Ok(())
     }
 

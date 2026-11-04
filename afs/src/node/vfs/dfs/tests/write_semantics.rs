@@ -555,10 +555,10 @@ fn native_builder_slow_put_and_transport_retry_keep_pool_live_until_last_owner()
         held: Mutex<Option<StagedChunk>>,
     }
     impl ChunkStore for SlowStore {
-        fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
+        fn put_chunks(&self, staged: Vec<StagedChunk>, _: PutIntent) -> Result<Vec<StoredChunk>> {
             *self.held.lock().unwrap() = staged.first().cloned();
             self.pause.block();
-            self.inner.put_batch(staged)
+            self.inner.put_chunks(staged, PutIntent::Commit)
         }
         fn read_at(
             &self,

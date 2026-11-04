@@ -12,6 +12,8 @@
 //! REST diagnostics/SDK→Storage 仍是独立诊断链，不属于任何文件系统的数据面。
 
 pub mod api;
+#[cfg(feature = "dfs")]
+pub(crate) mod call_deadline;
 pub mod chunk;
 pub(crate) mod chunk_crc32c;
 #[cfg(feature = "dfs")]

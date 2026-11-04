@@ -398,7 +398,9 @@ fn p2_w2_native_default_receipts_never_claim_required_local_release() {
             .unwrap(),
         16 * 1024
     );
-    let receipts = store.put_native_batch(vec![staged.clone()]).unwrap();
+    let receipts = store
+        .put_chunks(vec![staged.clone()], PutIntent::NativeUpload)
+        .unwrap();
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0].receipt.chunk, staged.chunk);
     assert_eq!(receipts[0].receipt.operation_id, staged.operation_id);

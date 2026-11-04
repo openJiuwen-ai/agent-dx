@@ -2843,18 +2843,7 @@ impl Filesystem for AfsFuse {
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
-        let queued = ordinary_queued_write(flags, write_flags)
-            && self
-                .state
-                .lock()
-                .ok()
-                .and_then(|state| state.file_handle(fh.0))
-                .is_some_and(|file| self.backend.accepts_queued_writes(file.handle));
-        let ordering = if queued {
-            FrontOrdering::WriteAdmission
-        } else {
-            FrontOrdering::WriteBarrier
-        };
+        let ordering = self.write_front_ordering(fh.0, flags, write_flags);
         let (_front_guard, front_result) = self.front_callback(ordering, Some(ino.0), false);
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
@@ -2889,70 +2878,19 @@ impl Filesystem for AfsFuse {
                     reply.error(fuse_errno(libc::ESTALE));
                     return;
                 };
-                if let Err(error) = Self::validate_handle_inode_in(&state, ino) {
-                    reply.error(fuse_errno(error));
-                    return;
-                }
-                if offset.checked_add(data.len() as u64).is_none()
-                    || u32::try_from(data.len()).is_err()
-                {
-                    reply.error(fuse_errno(libc::EFBIG));
-                    return;
-                }
-                let length = data.len();
-                let cache_ids = self.page_cache_ids.clone();
-                let options = WriteOptions {
-                    kill_suidgid: write_kill_suidgid(write_flags),
-                };
-                let timing = self.requests.clone();
-                let queued_at = std::time::Instant::now();
-                queue.submit_deferred_with(
-                    ino,
-                    fh,
-                    length,
-                    || {
-                        let mut owned = Vec::new();
-                        owned.try_reserve_exact(length).map_err(|_| libc::ENOMEM)?;
-                        owned.extend_from_slice(data);
-                        let mut consumed = 0usize;
-                        Ok(Box::new(move || {
-                            let _timer = timing.as_ref().map(|(metrics, filesystem)| {
-                                metrics
-                                    .write_duration
-                                    .with_label_values(&[filesystem, "write_call", "queue"])
-                                    .observe(queued_at.elapsed().as_secs_f64());
-                                metrics
-                                    .write_duration
-                                    .with_label_values(&[filesystem, "write_call", "execute"])
-                                    .start_timer()
-                            });
-                            (|| {
-                                while consumed < owned.len() {
-                                    let written = backend
-                                        .write_with_options(
-                                            &context,
-                                            file.handle,
-                                            offset + consumed as u64,
-                                            &owned[consumed..],
-                                            options,
-                                        )
-                                        .map_err(errno)?;
-                                    if written == 0 || written > owned.len() - consumed {
-                                        return Err(libc::EIO);
-                                    }
-                                    consumed += written;
-                                }
-                                if let Ok(mut cache) = cache_ids.lock() {
-                                    cache.remove(ino);
-                                }
-                                Ok(())
-                            })()
-                        }))
+                self.submit_front_queued_write(
+                    queue,
+                    FrontQueuedWrite {
+                        backend,
+                        ino,
+                        fh,
+                        offset,
+                        data,
+                        write_flags,
+                        context,
+                        file,
                     },
-                    move |result| match result {
-                        Ok(()) => reply.written(length as u32),
-                        Err(error) => reply.error(fuse_errno(error)),
-                    },
+                    reply,
                 );
                 return;
             }
@@ -2969,22 +2907,7 @@ impl Filesystem for AfsFuse {
             }),
             write_flags,
         );
-        afs_logging::debug!(
-            "FUSE write admission";
-            "event" => "fuse_write_admission",
-            "ino" => ino,
-            "fh" => fh,
-            "offset" => offset,
-            "requested_bytes" => data.len() as u64,
-            "admission" => match admission {
-                WriteAdmissionMode::Queued => "queued",
-                WriteAdmissionMode::Borrowed => "borrowed",
-            },
-        );
-        let copy_span_parent = request_span.clone();
-        let options = WriteOptions {
-            kill_suidgid: write_kill_suidgid(write_flags),
-        };
+        log_write_admission(ino, fh, offset, data.len() as u64, admission);
         let enqueue_at = std::time::Instant::now();
         let requested_bytes = data.len() as u64;
         let filesystem = self.filesystem_label();
@@ -3001,7 +2924,7 @@ impl Filesystem for AfsFuse {
         );
         let input = if admission == WriteAdmissionMode::Queued {
             let input = tracing::info_span!(
-                parent: &copy_span_parent,
+                parent: &request_span,
                 "node.fuse.write.input_copy",
                 copied_bytes = data.len() as u64,
             )
@@ -3016,66 +2939,39 @@ impl Filesystem for AfsFuse {
         } else {
             None
         };
-        let cache_ids = self.page_cache_ids.clone();
-        let timing = self.requests.clone();
-        let source = if write_flags.contains(WriteFlags::FUSE_WRITE_CACHE) {
-            "page_cache"
-        } else {
-            "write_call"
-        };
-        let run = move |data: &[u8]| {
-            let _front_guard = _front_guard;
-            if let Some((metrics, filesystem)) = &timing {
-                metrics
-                    .write_duration
-                    .with_label_values(&[filesystem, source, "queue"])
-                    .observe(enqueue_at.elapsed().as_secs_f64());
-            }
-            let executing = std::time::Instant::now();
-            let result = fuse_span.in_scope(|| {
-                tracing::info_span!("node.fuse.write.execute").in_scope(|| {
-                    fuse_span.record("queue_wait_us", enqueue_at.elapsed().as_micros() as u64);
-                    let file = state.lock().unwrap().file_handle(fh).ok_or(libc::ESTALE)?;
-                    AfsFuse::validate_handle_inode_in(&state, ino)?;
-                    Ok(backend.as_ref()).and_then(|backend| {
-                        backend
-                            .write_with_options(&context, file.handle, offset, data, options)
-                            .map_err(errno)
-                    })
-                })
-            });
-            if let Some((metrics, filesystem)) = &timing {
-                metrics
-                    .write_duration
-                    .with_label_values(&[filesystem, source, "execute"])
-                    .observe(executing.elapsed().as_secs_f64());
-            }
-            match result {
-                Ok(written) => match u32::try_from(written) {
-                    Ok(written) => {
-                        if let Ok(mut cache) = cache_ids.lock() {
-                            cache.remove(ino);
-                        }
-                        fuse_span.record("returned_bytes", written as u64);
-                        tracing::info_span!(parent: &request_span, "node.fuse.write.reply", returned_bytes = written as u64)
-                            .in_scope(|| reply.written(written))
-                    }
-                    Err(_) => reply.error(fuse_errno(libc::EIO)),
-                },
-                Err(error) => reply.error(fuse_errno(error)),
-            }
+        let dispatched = DispatchedWrite {
+            front_guard: _front_guard,
+            backend,
+            state,
+            context,
+            ino,
+            fh,
+            offset,
+            options: WriteOptions {
+                kill_suidgid: write_kill_suidgid(write_flags),
+            },
+            enqueue_at,
+            source: if write_flags.contains(WriteFlags::FUSE_WRITE_CACHE) {
+                "page_cache"
+            } else {
+                "write_call"
+            },
+            timing: self.requests.clone(),
+            cache_ids: self.page_cache_ids.clone(),
+            fuse_span,
+            request_span,
+            reply,
         };
         match input {
             None => {
                 self.dispatch
-                    .run_borrowed_keyed(self.file_dispatch_key(ino, fh), || run(data));
+                    .run_borrowed_keyed(self.file_dispatch_key(ino, fh), || dispatched.run(data));
             }
             Some(data) => {
                 self.dispatch
-                    .submit_keyed(
-                        self.file_dispatch_key(ino, fh),
-                        move || run(data.as_slice()),
-                    );
+                    .submit_keyed(self.file_dispatch_key(ino, fh), move || {
+                        dispatched.run(data.as_slice())
+                    });
             }
         }
     }
@@ -3856,7 +3752,224 @@ impl Filesystem for AfsFuse {
     }
 }
 
+fn log_write_admission(
+    ino: u64,
+    fh: u64,
+    offset: u64,
+    requested_bytes: u64,
+    admission: WriteAdmissionMode,
+) {
+    afs_logging::debug!(
+        "FUSE write admission";
+        "event" => "fuse_write_admission",
+        "ino" => ino,
+        "fh" => fh,
+        "offset" => offset,
+        "requested_bytes" => requested_bytes,
+        "admission" => match admission {
+            WriteAdmissionMode::Queued => "queued",
+            WriteAdmissionMode::Borrowed => "borrowed",
+        },
+    );
+}
+
+/// An ordinary write eligible for the front queue, before its body is copied.
+struct FrontQueuedWrite<'a> {
+    backend: Arc<dyn Backend>,
+    ino: u64,
+    fh: u64,
+    offset: u64,
+    data: &'a [u8],
+    write_flags: WriteFlags,
+    context: RequestContext,
+    file: state::FuseFileHandle,
+}
+
+/// Everything a dispatched non-front-queued write needs on its worker. The
+/// callback guard is held until the worker finishes the write.
+struct DispatchedWrite {
+    front_guard: Option<front_write::CallbackGuard>,
+    backend: Arc<dyn Backend>,
+    state: Arc<Mutex<FuseState>>,
+    context: RequestContext,
+    ino: u64,
+    fh: u64,
+    offset: u64,
+    options: WriteOptions,
+    enqueue_at: std::time::Instant,
+    source: &'static str,
+    timing: Option<(FuseRequestMetrics, &'static str)>,
+    cache_ids: Arc<Mutex<PageCacheIdentities>>,
+    fuse_span: tracing::Span,
+    request_span: tracing::Span,
+    reply: ReplyWrite,
+}
+
+impl DispatchedWrite {
+    fn run(self, data: &[u8]) {
+        let _front_guard = self.front_guard;
+        let source = self.source;
+        if let Some((metrics, filesystem)) = &self.timing {
+            metrics
+                .write_duration
+                .with_label_values(&[filesystem, source, "queue"])
+                .observe(self.enqueue_at.elapsed().as_secs_f64());
+        }
+        let executing = std::time::Instant::now();
+        let result = self.fuse_span.in_scope(|| {
+            tracing::info_span!("node.fuse.write.execute").in_scope(|| {
+                self.fuse_span.record(
+                    "queue_wait_us",
+                    self.enqueue_at.elapsed().as_micros() as u64,
+                );
+                let file = self
+                    .state
+                    .lock()
+                    .unwrap()
+                    .file_handle(self.fh)
+                    .ok_or(libc::ESTALE)?;
+                AfsFuse::validate_handle_inode_in(&self.state, self.ino)?;
+                Ok(self.backend.as_ref()).and_then(|backend| {
+                    backend
+                        .write_with_options(
+                            &self.context,
+                            file.handle,
+                            self.offset,
+                            data,
+                            self.options,
+                        )
+                        .map_err(errno)
+                })
+            })
+        });
+        if let Some((metrics, filesystem)) = &self.timing {
+            metrics
+                .write_duration
+                .with_label_values(&[filesystem, source, "execute"])
+                .observe(executing.elapsed().as_secs_f64());
+        }
+        let reply = self.reply;
+        match result {
+            Ok(written) => match u32::try_from(written) {
+                Ok(written) => {
+                    if let Ok(mut cache) = self.cache_ids.lock() {
+                        cache.remove(self.ino);
+                    }
+                    self.fuse_span.record("returned_bytes", written as u64);
+                    tracing::info_span!(parent: &self.request_span, "node.fuse.write.reply", returned_bytes = written as u64)
+                        .in_scope(|| reply.written(written))
+                }
+                Err(_) => reply.error(fuse_errno(libc::EIO)),
+            },
+            Err(error) => reply.error(fuse_errno(error)),
+        }
+    }
+}
+
 impl AfsFuse {
+    fn write_front_ordering(
+        &self,
+        fh: u64,
+        flags: OpenFlags,
+        write_flags: WriteFlags,
+    ) -> FrontOrdering {
+        let queued = ordinary_queued_write(flags, write_flags)
+            && self
+                .state
+                .lock()
+                .ok()
+                .and_then(|state| state.file_handle(fh))
+                .is_some_and(|file| self.backend.accepts_queued_writes(file.handle));
+        if queued {
+            FrontOrdering::WriteAdmission
+        } else {
+            FrontOrdering::WriteBarrier
+        }
+    }
+
+    /// Copy the body and admit it to the front queue, which replies once the
+    /// bytes are accepted. Ordering among queued writes belongs to the queue.
+    fn submit_front_queued_write(
+        &self,
+        queue: &front_write::FrontWriteQueue,
+        write: FrontQueuedWrite<'_>,
+        reply: ReplyWrite,
+    ) {
+        let FrontQueuedWrite {
+            backend,
+            ino,
+            fh,
+            offset,
+            data,
+            write_flags,
+            context,
+            file,
+        } = write;
+        if let Err(error) = Self::validate_handle_inode_in(&self.state, ino) {
+            reply.error(fuse_errno(error));
+            return;
+        }
+        if offset.checked_add(data.len() as u64).is_none() || u32::try_from(data.len()).is_err() {
+            reply.error(fuse_errno(libc::EFBIG));
+            return;
+        }
+        let length = data.len();
+        let cache_ids = self.page_cache_ids.clone();
+        let options = WriteOptions {
+            kill_suidgid: write_kill_suidgid(write_flags),
+        };
+        let timing = self.requests.clone();
+        let queued_at = std::time::Instant::now();
+        queue.submit_deferred_with(
+            ino,
+            fh,
+            length,
+            || {
+                let mut owned = Vec::new();
+                owned.try_reserve_exact(length).map_err(|_| libc::ENOMEM)?;
+                owned.extend_from_slice(data);
+                let mut consumed = 0usize;
+                Ok(Box::new(move || {
+                    let _timer = timing.as_ref().map(|(metrics, filesystem)| {
+                        metrics
+                            .write_duration
+                            .with_label_values(&[filesystem, "write_call", "queue"])
+                            .observe(queued_at.elapsed().as_secs_f64());
+                        metrics
+                            .write_duration
+                            .with_label_values(&[filesystem, "write_call", "execute"])
+                            .start_timer()
+                    });
+                    (|| {
+                        while consumed < owned.len() {
+                            let written = backend
+                                .write_with_options(
+                                    &context,
+                                    file.handle,
+                                    offset + consumed as u64,
+                                    &owned[consumed..],
+                                    options,
+                                )
+                                .map_err(errno)?;
+                            if written == 0 || written > owned.len() - consumed {
+                                return Err(libc::EIO);
+                            }
+                            consumed += written;
+                        }
+                        if let Ok(mut cache) = cache_ids.lock() {
+                            cache.remove(ino);
+                        }
+                        Ok(())
+                    })()
+                }))
+            },
+            move |result| match result {
+                Ok(()) => reply.written(length as u32),
+                Err(error) => reply.error(fuse_errno(error)),
+            },
+        );
+    }
+
     fn validate_handle_inode(&self, ino: u64) -> std::result::Result<(), i32> {
         Self::validate_handle_inode_in(&self.state, ino)
     }

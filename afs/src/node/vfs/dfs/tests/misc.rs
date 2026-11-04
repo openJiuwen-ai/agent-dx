@@ -173,32 +173,25 @@ fn pr88_fix_crc32c_tail_partial_success_retry_keeps_ids_and_receipts() {
         attempts: Mutex<Vec<ChunkObject>>,
     }
     impl ChunkStore for LostSecondReceipt {
-        fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
+        fn put_chunks(
+            &self,
+            staged: Vec<StagedChunk>,
+            intent: PutIntent,
+        ) -> Result<Vec<StoredChunk>> {
             assert_eq!(staged.len(), 1);
             let call = {
                 let mut attempts = self.attempts.lock().unwrap();
                 attempts.push(staged[0].chunk.clone());
                 attempts.len()
             };
-            let receipts = self.inner.put_batch(staged)?;
+            let mut stored = self.inner.put_chunks(staged, PutIntent::Commit)?;
             if call == 2 {
                 return Err(unavailable("injected lost second durable receipt"));
             }
-            Ok(receipts)
-        }
-        fn put_native_batch(
-            &self,
-            staged: Vec<StagedChunk>,
-        ) -> Result<Vec<crate::node::chunk::NativeChunkReceipt>> {
-            self.put_batch(staged).map(|receipts| {
-                receipts
-                    .into_iter()
-                    .map(|receipt| crate::node::chunk::NativeChunkReceipt {
-                        receipt,
-                        local_required_and_durable: true,
-                    })
-                    .collect()
-            })
+            for stored in &mut stored {
+                stored.local_required_and_durable = intent == PutIntent::NativeUpload;
+            }
+            Ok(stored)
         }
         fn read_native_uploaded_at(
             &self,
@@ -387,8 +380,8 @@ struct UnsupportedCapacityChunkStore {
 
 #[cfg(feature = "dfs")]
 impl ChunkStore for UnsupportedCapacityChunkStore {
-    fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<crate::dfs::ChunkReceipt>> {
-        self.inner.put_batch(staged)
+    fn put_chunks(&self, staged: Vec<StagedChunk>, _: PutIntent) -> Result<Vec<StoredChunk>> {
+        self.inner.put_chunks(staged, PutIntent::Commit)
     }
 
     fn read_at(
@@ -519,11 +512,11 @@ fn s1a_native_upload_failure_is_reported_twice_to_the_same_handle_today() {
         fail: AtomicBool,
     }
     impl ChunkStore for FailOnceStore {
-        fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
+        fn put_chunks(&self, staged: Vec<StagedChunk>, _: PutIntent) -> Result<Vec<StoredChunk>> {
             if self.fail.swap(false, Ordering::SeqCst) {
                 return Err(unavailable("injected upload failure"));
             }
-            self.inner.put_batch(staged)
+            self.inner.put_chunks(staged, PutIntent::Commit)
         }
         fn read_at(
             &self,
@@ -581,7 +574,7 @@ fn crc32c_native_preupload_retry_preserves_immutable_id() {
         attempts: Mutex<Vec<Vec<ChunkObject>>>,
     }
     impl ChunkStore for FailOnceStore {
-        fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
+        fn put_chunks(&self, staged: Vec<StagedChunk>, _: PutIntent) -> Result<Vec<StoredChunk>> {
             self.attempts
                 .lock()
                 .unwrap()
@@ -589,7 +582,7 @@ fn crc32c_native_preupload_retry_preserves_immutable_id() {
             if self.fail.swap(false, Ordering::SeqCst) {
                 return Err(unavailable("injected prepare put failure"));
             }
-            self.inner.put_batch(staged)
+            self.inner.put_chunks(staged, PutIntent::Commit)
         }
         fn read_at(
             &self,

@@ -460,6 +460,9 @@ impl DfsMeta for RecordingMeta {
     }
 
     fn renew_write_lease(&self, lease: WriteLease) -> Result<WriteLease> {
+        if let Some(remaining) = crate::node::call_deadline::remaining() {
+            self.renew_timeouts.lock().unwrap().push(remaining);
+        }
         self.renew_calls.fetch_add(1, Ordering::SeqCst);
         if let Some(pause) = self.renew_pause.lock().unwrap().take() {
             pause.block();
@@ -475,16 +478,10 @@ impl DfsMeta for RecordingMeta {
         Ok(stored.clone())
     }
 
-    fn renew_write_lease_with_timeout(
-        &self,
-        lease: WriteLease,
-        timeout: Duration,
-    ) -> Result<WriteLease> {
-        self.renew_timeouts.lock().unwrap().push(timeout);
-        self.renew_write_lease(lease)
-    }
-
     fn sync_inode_metadata(&self, sync: SyncInodeMetadata) -> Result<InodeRecord> {
+        if let Some(remaining) = crate::node::call_deadline::remaining() {
+            self.metadata_timeouts.lock().unwrap().push(remaining);
+        }
         let next_error = self.next_metadata_sync_error.lock().unwrap().take();
         if let Some(error) = next_error {
             self.failed_metadata_syncs.lock().unwrap().push(sync);
@@ -507,16 +504,10 @@ impl DfsMeta for RecordingMeta {
         Ok(inode.clone())
     }
 
-    fn sync_inode_metadata_with_timeout(
-        &self,
-        sync: SyncInodeMetadata,
-        timeout: Duration,
-    ) -> Result<InodeRecord> {
-        self.metadata_timeouts.lock().unwrap().push(timeout);
-        self.sync_inode_metadata(sync)
-    }
-
     fn commit_file_version(&self, commit: CommitFileVersion) -> Result<InodeRecord> {
+        if let Some(remaining) = crate::node::call_deadline::remaining() {
+            self.commit_timeouts.lock().unwrap().push(remaining);
+        }
         let next_error = self.next_commit_error.lock().unwrap().take();
         if let Some(error) = next_error {
             self.failed_commits.lock().unwrap().push(commit);
@@ -559,15 +550,6 @@ impl DfsMeta for RecordingMeta {
         }
         self.commits.lock().unwrap().push(commit);
         Ok(inode.clone())
-    }
-
-    fn commit_file_version_with_timeout(
-        &self,
-        commit: CommitFileVersion,
-        timeout: Duration,
-    ) -> Result<InodeRecord> {
-        self.commit_timeouts.lock().unwrap().push(timeout);
-        self.commit_file_version(commit)
     }
 
     fn mkdir(
@@ -777,19 +759,12 @@ fn test_fs() -> (tempfile::TempDir, Arc<RecordingMeta>, DistributedFs) {
 struct LocalRequiredChunkStore(Arc<LocalChunkStore>);
 
 impl ChunkStore for LocalRequiredChunkStore {
-    fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
-        self.0.put_batch(staged)
-    }
-    fn put_native_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<NativeChunkReceipt>> {
-        self.0.put_batch(staged).map(|receipts| {
-            receipts
-                .into_iter()
-                .map(|receipt| NativeChunkReceipt {
-                    receipt,
-                    local_required_and_durable: true,
-                })
-                .collect()
-        })
+    fn put_chunks(&self, staged: Vec<StagedChunk>, intent: PutIntent) -> Result<Vec<StoredChunk>> {
+        let mut stored = self.0.put_chunks(staged, intent)?;
+        for stored in &mut stored {
+            stored.local_required_and_durable = intent == PutIntent::NativeUpload;
+        }
+        Ok(stored)
     }
     fn read_native_uploaded_at(
         &self,
@@ -1163,7 +1138,7 @@ impl ExternalChunkReader for CurrentExternalFixture {
 
 /// S3 stand-in for the native pipeline (S1a-5): objects land in the external
 /// read fixture, receipts are external commits and never local-durable, like
-/// `S3ChunkStore` through the default `put_native_batch`.
+/// `S3ChunkStore`.
 struct FakeS3Store {
     fixture: Arc<CurrentExternalFixture>,
     puts: AtomicUsize,
@@ -1177,7 +1152,7 @@ impl FakeS3Store {
 }
 
 impl ChunkStore for FakeS3Store {
-    fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
+    fn put_chunks(&self, staged: Vec<StagedChunk>, _: PutIntent) -> Result<Vec<StoredChunk>> {
         if self.fail_next.swap(false, Ordering::SeqCst) {
             return Err(unavailable("injected S3 PUT failure"));
         }
@@ -1187,7 +1162,7 @@ impl ChunkStore for FakeS3Store {
                 self.puts.fetch_add(1, Ordering::SeqCst);
                 self.fixture
                     .insert_chunk(chunk.chunk.clone(), chunk.bytes().to_vec());
-                ChunkReceipt {
+                StoredChunk::unreleased(ChunkReceipt {
                     operation_id: chunk.operation_id.clone(),
                     external_commit: Some(crate::dfs::ExternalCommitReceipt {
                         store_id: "fake-s3".into(),
@@ -1201,7 +1176,7 @@ impl ChunkStore for FakeS3Store {
                     placement_epoch: 0,
                     replica_group_id: crate::dfs::ReplicaGroupId::new(""),
                     durable_acks: Vec::new(),
-                }
+                })
             })
             .collect())
     }
@@ -1294,14 +1269,14 @@ impl CountingChunkStore {
 
 #[cfg(feature = "dfs")]
 impl ChunkStore for CountingChunkStore {
-    fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<crate::dfs::ChunkReceipt>> {
+    fn put_chunks(&self, staged: Vec<StagedChunk>, _: PutIntent) -> Result<Vec<StoredChunk>> {
         self.put_batches.fetch_add(1, Ordering::SeqCst);
         if staged.is_empty() && self.fail_empty_prepare.swap(false, Ordering::SeqCst) {
             return Err(unavailable(
                 "injected PR93 preparation failure after admission",
             ));
         }
-        self.inner.put_batch(staged)
+        self.inner.put_chunks(staged, PutIntent::Commit)
     }
 
     fn read_at(

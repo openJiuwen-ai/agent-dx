@@ -39,7 +39,7 @@ use crate::{
         SourceCandidate, external_object_key,
     },
     node::{
-        chunk::{ChunkStore, MAX_STAGED_CHUNK_BYTES, StagedChunk},
+        chunk::{ChunkStore, MAX_STAGED_CHUNK_BYTES, PutIntent, StagedChunk, StoredChunk},
         dfs_read::{ExternalChunkReader, VerifiedExternalChunk},
     },
 };
@@ -2251,7 +2251,7 @@ impl ChunkStore for S3ChunkStore {
             .ok_or_else(|| invalid("S3 native descriptor reservation overflow"))
     }
 
-    fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
+    fn put_chunks(&self, staged: Vec<StagedChunk>, _intent: PutIntent) -> Result<Vec<StoredChunk>> {
         if staged.is_empty() {
             return Ok(Vec::new());
         }
@@ -2274,7 +2274,7 @@ impl ChunkStore for S3ChunkStore {
             }
         }
         match self.request(Request::Put(staged))? {
-            Reply::Put(receipts) => Ok(receipts),
+            Reply::Put(receipts) => Ok(receipts.into_iter().map(StoredChunk::unreleased).collect()),
             Reply::Read(_) => Err(invalid("S3 worker returned the wrong response")),
         }
     }

@@ -303,6 +303,9 @@ fn active_writer_lease_renewal_runs_without_mutating_pending_commit() {
         cell.lock().unwrap().write_lease.expires_at_unix_ms,
         renewed_expiry
     );
+    let renewal_budgets = meta.renew_timeouts();
+    assert_eq!(renewal_budgets.len(), 1);
+    assert!(renewal_budgets[0] <= Duration::from_secs(2));
     fs.fsync(&context(), created.handle, SyncMode::Full)
         .unwrap();
     assert_eq!(meta.commits.lock().unwrap()[0], pending);

@@ -259,10 +259,10 @@ impl DistributedFs {
                 break;
             }
             checked = checked.saturating_add(1);
-            match self
-                .meta
-                .current_node_session_with_timeout(&node_id, timeout)
-            {
+            let current_session = crate::node::call_deadline::within_timeout(timeout, || {
+                self.meta.current_node_session(&node_id)
+            });
+            match current_session {
                 Ok(current) if current.as_deref() != Some(session_id.as_str()) => {
                     match self.release_scoped_lock_sessions(scopes) {
                         Ok(count) => reclaimed = reclaimed.saturating_add(count),

@@ -246,38 +246,13 @@ impl DfsMeta for CapturingDfsMeta {
         DfsMeta::renew_write_lease(self.inner.as_ref(), lease)
     }
 
-    fn renew_write_lease_with_timeout(
-        &self,
-        lease: WriteLease,
-        timeout: Duration,
-    ) -> Result<WriteLease> {
-        DfsMeta::renew_write_lease_with_timeout(self.inner.as_ref(), lease, timeout)
-    }
-
     fn sync_inode_metadata(&self, sync: SyncInodeMetadata) -> Result<InodeRecord> {
         DfsMeta::sync_inode_metadata(self.inner.as_ref(), sync)
-    }
-
-    fn sync_inode_metadata_with_timeout(
-        &self,
-        sync: SyncInodeMetadata,
-        timeout: Duration,
-    ) -> Result<InodeRecord> {
-        DfsMeta::sync_inode_metadata_with_timeout(self.inner.as_ref(), sync, timeout)
     }
 
     fn commit_file_version(&self, commit: CommitFileVersion) -> Result<InodeRecord> {
         self.commits.lock().unwrap().push(commit.clone());
         DfsMeta::commit_file_version(self.inner.as_ref(), commit)
-    }
-
-    fn commit_file_version_with_timeout(
-        &self,
-        commit: CommitFileVersion,
-        timeout: Duration,
-    ) -> Result<InodeRecord> {
-        self.commits.lock().unwrap().push(commit.clone());
-        DfsMeta::commit_file_version_with_timeout(self.inner.as_ref(), commit, timeout)
     }
 
     fn lookup_node_location(&self, node_id: &str) -> Result<Option<DfsNodeLocation>> {
@@ -286,14 +261,6 @@ impl DfsMeta for CapturingDfsMeta {
 
     fn current_node_session(&self, node_id: &str) -> Result<Option<String>> {
         DfsMeta::current_node_session(self.inner.as_ref(), node_id)
-    }
-
-    fn current_node_session_with_timeout(
-        &self,
-        node_id: &str,
-        timeout: Duration,
-    ) -> Result<Option<String>> {
-        DfsMeta::current_node_session_with_timeout(self.inner.as_ref(), node_id, timeout)
     }
 
     fn mkdir(

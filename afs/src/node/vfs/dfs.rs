@@ -103,8 +103,8 @@ use crate::{
         XattrSetMode,
     },
     node::chunk::{
-        ChunkBuilder, ChunkStore, NativeChunkReceipt, NativeWriteAdmission, NativeWriteBudget,
-        NativeWriteOwner, SharedChunkBytes, StagedChunk, WriteBufferPool,
+        ChunkBuilder, ChunkStore, NativeWriteAdmission, NativeWriteBudget, NativeWriteOwner,
+        PutIntent, SharedChunkBytes, StagedChunk, StoredChunk, WriteBufferPool,
     },
     node::dfs_read::{
         BoundedLru, ChunkReadOp, CurrentExternalReadOutcome, DfsReadEngine,

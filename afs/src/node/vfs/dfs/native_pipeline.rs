@@ -461,8 +461,8 @@ pub(super) struct NativeUpload {
 pub(super) struct NativeUploadState {
     pub(super) body: Option<SharedChunkBytes>,
     pub(super) staged: Option<StagedChunk>,
-    pub(super) task: Option<tokio::task::JoinHandle<Result<NativeChunkReceipt>>>,
-    pub(super) receipt: Option<NativeChunkReceipt>,
+    pub(super) task: Option<tokio::task::JoinHandle<Result<StoredChunk>>>,
+    pub(super) receipt: Option<StoredChunk>,
     pub(super) error: Option<Error>,
     pub(super) terminal_error: Option<Error>,
     pub(super) joining: bool,

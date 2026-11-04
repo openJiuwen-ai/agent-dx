@@ -1,5 +1,42 @@
 use super::*;
 
+/// Where a native write's next bytes go, as read before unlocked admission.
+struct NativeWriteTarget {
+    position: u64,
+    selection: Option<(usize, usize, usize)>,
+    capacity: usize,
+    generation: Option<OperationId>,
+    seq: u64,
+    owner: Arc<NativeWriteOwner>,
+}
+
+struct NativeReservationRequest<'a> {
+    turn_id: u64,
+    operation_id: &'a OperationId,
+    owner: &'a Arc<NativeWriteOwner>,
+    capacity: usize,
+    has_accepted_prefix: bool,
+}
+
+enum NativeReservation {
+    Reserved {
+        builder: ChunkBuilder,
+        descriptor: Option<Arc<Mutex<NativeMetadataLease>>>,
+    },
+    /// Out of memory with a prefix already visible: end the write short.
+    StopAccepting,
+}
+
+struct NativeWriteApply<'a> {
+    append: bool,
+    offset: u64,
+    data: &'a [u8],
+    accepted: usize,
+    kill_suidgid: bool,
+    target: NativeWriteTarget,
+    operation_id: OperationId,
+}
+
 impl DistributedFs {
     /// Native storage writes segmented-CRC32C objects; S3 stores only
     /// canonical BLAKE3 objects (decision recorded in S1a-7, F6).
@@ -199,158 +236,42 @@ impl DistributedFs {
         let ticket = self
             .native_ticket(&cell)?
             .ok_or_else(|| unavailable("native mutation ticket is missing"))?;
-        'accept: while *accepted < data.len() {
+        let append = snapshot.flags & libc::O_APPEND != 0;
+        while *accepted < data.len() {
             self.native_wait_mutation_ready(&snapshot.inode_id, &cell)?;
             if pipeline.closed.load(Ordering::Acquire) {
                 return Err(unavailable("native write admission is closed"));
             }
             let _ = self.poll_native_uploads()?;
             self.observe_handle_error(handle)?;
-            let (position, selection, capacity, generation, seq, owner) = {
-                let state = cell
-                    .lock()
-                    .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-                if let Some(error) = &state.terminal_error {
-                    return Err(error.clone());
-                }
-                let position = if snapshot.flags & libc::O_APPEND != 0 {
-                    state.logical_length
-                } else {
-                    offset
-                        .checked_add(*accepted as u64)
-                        .ok_or_else(file_too_large)?
-                };
-                position
-                    .checked_add((data.len() - *accepted) as u64)
-                    .ok_or_else(file_too_large)?;
-                let selection = state
-                    .dirty_extents
-                    .native_selection(position, state.logical_length);
-                let capacity = DirtyExtentMap::native_capacity(
-                    position,
-                    data.len() - *accepted,
-                    state.logical_length,
-                );
-                (
-                    position,
-                    selection,
-                    capacity,
-                    state.dirty_extents.native_operation_id.clone(),
-                    state.next_write_seq,
-                    state.native_owner.clone(),
-                )
-            };
-            let operation_id = generation
+            let target = Self::native_write_target(&cell, append, offset, data, *accepted)?;
+            let operation_id = target
+                .generation
                 .clone()
                 .unwrap_or_else(|| self.identity.operation_id("native-generation"));
-            let mut prepared = None;
-            let mut descriptor = None;
-            if selection.is_none() {
-                let turn_id = ticket.id;
-                {
-                    let mut queue = pipeline
-                        .allocation_queue
-                        .lock()
-                        .map_err(|_| unavailable("native allocation queue is poisoned"))?;
-                    queue.push(turn_id, &pipeline.metadata)?;
+            let (prepared, descriptor) = if target.selection.is_none() {
+                match self.reserve_native_builder(
+                    handle,
+                    &cell,
+                    &pipeline,
+                    NativeReservationRequest {
+                        turn_id: ticket.id,
+                        operation_id: &operation_id,
+                        owner: &target.owner,
+                        capacity: target.capacity,
+                        has_accepted_prefix: *accepted > 0,
+                    },
+                )? {
+                    NativeReservation::Reserved {
+                        builder,
+                        descriptor,
+                    } => (Some(builder), descriptor),
+                    NativeReservation::StopAccepting => break,
                 }
-                let _turn = NativeAllocationTurn {
-                    id: turn_id,
-                    pipeline: pipeline.clone(),
-                };
-                loop {
-                    if pipeline.closed.load(Ordering::Acquire) {
-                        return Err(unavailable("native write admission is closed"));
-                    }
-                    let is_front = pipeline
-                        .allocation_queue
-                        .lock()
-                        .map_err(|_| unavailable("native allocation queue is poisoned"))?
-                        .values
-                        .front()
-                        == Some(&turn_id);
-                    if is_front {
-                        if descriptor.is_none() {
-                            let reservation = self
-                                .chunk_store
-                                .native_descriptor_reservation_bytes(&operation_id)?;
-                            if reservation > NATIVE_DESCRIPTOR_BYTES {
-                                return Err(Error::coded(
-                                    afs_error::IO_CAPACITY,
-                                    "native descriptor and publication scratch exceed their fixed metadata budget",
-                                ));
-                            }
-                            descriptor = pipeline
-                                .metadata
-                                .reserve(reservation, true)?
-                                .map(|lease| Arc::new(Mutex::new(lease)));
-                            if let Some(owner) = &descriptor {
-                                owner
-                                    .lock()
-                                    .map_err(|_| {
-                                        unavailable("native descriptor reservation is poisoned")
-                                    })?
-                                    .set_actual(
-                                        std::mem::size_of::<Mutex<NativeMetadataLease>>()
-                                            + 2 * std::mem::size_of::<usize>(),
-                                    )?;
-                            }
-                            if descriptor.is_none() {
-                                self.request_native_pressure(&cell, true)?;
-                                self.progress_native_writeback()?;
-                                let epoch = pipeline.budget.snapshot().epoch;
-                                pipeline
-                                    .budget
-                                    .wait_for_change(epoch, Duration::from_millis(10));
-                                continue;
-                            }
-                        }
-                        let limit = self.native_owner_limit(&pipeline)?;
-                        match pipeline
-                            .budget
-                            .try_reserve_for(owner.clone(), capacity, limit)?
-                        {
-                            NativeWriteAdmission::Reserved(lease) => {
-                                match ChunkBuilder::with_native_lease(
-                                    self.native.buffer_pool.clone(),
-                                    capacity,
-                                    lease,
-                                ) {
-                                    Ok(builder) => {
-                                        prepared = Some(builder);
-                                        break;
-                                    }
-                                    Err(error)
-                                        if error.code() == afs_error::IO_OUT_OF_MEMORY
-                                            && *accepted > 0 =>
-                                    {
-                                        // The rejected tail was never accepted. Complete
-                                        // any sync barrier for the visible prefix below.
-                                        break 'accept;
-                                    }
-                                    Err(error) if error.code() == afs_error::IO_WOULD_BLOCK => {}
-                                    Err(error) => return Err(error),
-                                }
-                            }
-                            NativeWriteAdmission::Wait { epoch } => {
-                                self.request_native_pressure(&cell, false)?;
-                                self.progress_native_writeback()?;
-                                pipeline
-                                    .budget
-                                    .wait_for_change(epoch, Duration::from_millis(10));
-                            }
-                        }
-                    } else {
-                        let epoch = pipeline.budget.snapshot().epoch;
-                        pipeline
-                            .budget
-                            .wait_for_change(epoch, Duration::from_millis(10));
-                    }
-                    let _ = self.poll_native_uploads()?;
-                    self.observe_handle_error(handle)?;
-                }
-            }
-            let gc_pin = if generation.is_none() {
+            } else {
+                (None, None)
+            };
+            let gc_pin = if target.generation.is_none() {
                 self.gc
                     .references
                     .as_ref()
@@ -362,56 +283,26 @@ impl DistributedFs {
                 None
             };
             let operation = self.begin_inode_operation(&snapshot.inode_id, cell.clone())?;
-            let (written, accepted_seq) = {
-                let mut state = cell
-                    .lock()
-                    .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-                let actual_position = if snapshot.flags & libc::O_APPEND != 0 {
-                    state.logical_length
-                } else {
-                    offset + *accepted as u64
-                };
-                if state.next_write_seq != seq
-                    || state.dirty_extents.native_operation_id != generation
-                    || actual_position != position
-                    || state
-                        .dirty_extents
-                        .native_selection(position, state.logical_length)
-                        != selection
-                {
-                    drop(state);
-                    drop(operation);
-                    drop(prepared);
-                    continue;
-                }
-                let next_seq = state.next_write_seq.saturating_add(1);
-                if state.dirty_extents.native_operation_id.is_none() {
-                    state.dirty_extents.native_operation_id = Some(operation_id.clone());
-                    state.dirty_extents.native_gc_pin = gc_pin;
-                }
-                let written = state.dirty_extents.write_native_prepared(
-                    position,
-                    &data[*accepted..],
-                    next_seq,
-                    selection,
-                    prepared,
-                    descriptor,
-                )?;
-                state.logical_length = state.logical_length.max(position + written as u64);
-                state.next_write_seq = next_seq;
-                state.visible_write_seq = next_seq;
-                state.dirty = true;
-                state.metadata_dirty = true;
-                let now = now_unix_ms();
-                state.inode.attributes.mtime_unix_ms = now;
-                state.inode.attributes.ctime_unix_ms = now;
-                if options.kill_suidgid {
-                    Self::apply_kernel_killpriv_to_state(&mut state);
-                }
-                (written, next_seq)
+            let Some((written, accepted_seq)) = Self::apply_native_write(
+                &cell,
+                NativeWriteApply {
+                    append,
+                    offset,
+                    data,
+                    accepted: *accepted,
+                    kill_suidgid: options.kill_suidgid,
+                    target,
+                    operation_id,
+                },
+                prepared,
+                descriptor,
+                gc_pin,
+                operation,
+            )?
+            else {
+                continue;
             };
             *accepted += written;
-            drop(operation);
             self.update_handle_write_progress(handle, accepted_seq)?;
             self.seal_native_full_builders(&cell)?;
             self.start_native_uploads()?;
@@ -426,6 +317,245 @@ impl DistributedFs {
         }
         drop(ticket);
         Ok(*accepted)
+    }
+
+    /// Read where the next unaccepted bytes land. Admission runs unlocked after
+    /// this, so `apply_native_write` revalidates the result under the same lock.
+    fn native_write_target(
+        cell: &SharedInodeWriteState,
+        append: bool,
+        offset: u64,
+        data: &[u8],
+        accepted: usize,
+    ) -> Result<NativeWriteTarget> {
+        let state = cell
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        if let Some(error) = &state.terminal_error {
+            return Err(error.clone());
+        }
+        let position = if append {
+            state.logical_length
+        } else {
+            offset
+                .checked_add(accepted as u64)
+                .ok_or_else(file_too_large)?
+        };
+        position
+            .checked_add((data.len() - accepted) as u64)
+            .ok_or_else(file_too_large)?;
+        let selection = state
+            .dirty_extents
+            .native_selection(position, state.logical_length);
+        let capacity =
+            DirtyExtentMap::native_capacity(position, data.len() - accepted, state.logical_length);
+        Ok(NativeWriteTarget {
+            position,
+            selection,
+            capacity,
+            generation: state.dirty_extents.native_operation_id.clone(),
+            seq: state.next_write_seq,
+            owner: state.native_owner.clone(),
+        })
+    }
+
+    /// Take this writer's allocation turn and wait for its metadata reservation
+    /// and body capacity. The turn is released on every return.
+    fn reserve_native_builder(
+        &self,
+        handle: FileHandle,
+        cell: &SharedInodeWriteState,
+        pipeline: &Arc<NativeWritePipeline>,
+        request: NativeReservationRequest<'_>,
+    ) -> Result<NativeReservation> {
+        let turn_id = request.turn_id;
+        let mut descriptor = None;
+        {
+            let mut queue = pipeline
+                .allocation_queue
+                .lock()
+                .map_err(|_| unavailable("native allocation queue is poisoned"))?;
+            queue.push(turn_id, &pipeline.metadata)?;
+        }
+        let _turn = NativeAllocationTurn {
+            id: turn_id,
+            pipeline: pipeline.clone(),
+        };
+        loop {
+            if pipeline.closed.load(Ordering::Acquire) {
+                return Err(unavailable("native write admission is closed"));
+            }
+            let is_front = pipeline
+                .allocation_queue
+                .lock()
+                .map_err(|_| unavailable("native allocation queue is poisoned"))?
+                .values
+                .front()
+                == Some(&turn_id);
+            if is_front {
+                if descriptor.is_none() {
+                    descriptor = self.reserve_native_descriptor(pipeline, request.operation_id)?;
+                    if descriptor.is_none() {
+                        self.request_native_pressure(cell, true)?;
+                        self.progress_native_writeback()?;
+                        let epoch = pipeline.budget.snapshot().epoch;
+                        pipeline
+                            .budget
+                            .wait_for_change(epoch, Duration::from_millis(10));
+                        continue;
+                    }
+                }
+                let limit = self.native_owner_limit(pipeline)?;
+                match pipeline.budget.try_reserve_for(
+                    request.owner.clone(),
+                    request.capacity,
+                    limit,
+                )? {
+                    NativeWriteAdmission::Reserved(lease) => {
+                        match ChunkBuilder::with_native_lease(
+                            self.native.buffer_pool.clone(),
+                            request.capacity,
+                            lease,
+                        ) {
+                            Ok(builder) => {
+                                return Ok(NativeReservation::Reserved {
+                                    builder,
+                                    descriptor,
+                                });
+                            }
+                            Err(error)
+                                if error.code() == afs_error::IO_OUT_OF_MEMORY
+                                    && request.has_accepted_prefix =>
+                            {
+                                // The rejected tail was never accepted. Complete
+                                // any sync barrier for the visible prefix below.
+                                return Ok(NativeReservation::StopAccepting);
+                            }
+                            Err(error) if error.code() == afs_error::IO_WOULD_BLOCK => {}
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    NativeWriteAdmission::Wait { epoch } => {
+                        self.request_native_pressure(cell, false)?;
+                        self.progress_native_writeback()?;
+                        pipeline
+                            .budget
+                            .wait_for_change(epoch, Duration::from_millis(10));
+                    }
+                }
+            } else {
+                let epoch = pipeline.budget.snapshot().epoch;
+                pipeline
+                    .budget
+                    .wait_for_change(epoch, Duration::from_millis(10));
+            }
+            let _ = self.poll_native_uploads()?;
+            self.observe_handle_error(handle)?;
+        }
+    }
+
+    /// `None` means the metadata budget is full and the caller must apply
+    /// pressure and retry.
+    fn reserve_native_descriptor(
+        &self,
+        pipeline: &NativeWritePipeline,
+        operation_id: &OperationId,
+    ) -> Result<Option<Arc<Mutex<NativeMetadataLease>>>> {
+        let reservation = self
+            .chunk_store
+            .native_descriptor_reservation_bytes(operation_id)?;
+        if reservation > NATIVE_DESCRIPTOR_BYTES {
+            return Err(Error::coded(
+                afs_error::IO_CAPACITY,
+                "native descriptor and publication scratch exceed their fixed metadata budget",
+            ));
+        }
+        let descriptor = pipeline
+            .metadata
+            .reserve(reservation, true)?
+            .map(|lease| Arc::new(Mutex::new(lease)));
+        if let Some(owner) = &descriptor {
+            owner
+                .lock()
+                .map_err(|_| unavailable("native descriptor reservation is poisoned"))?
+                .set_actual(
+                    std::mem::size_of::<Mutex<NativeMetadataLease>>()
+                        + 2 * std::mem::size_of::<usize>(),
+                )?;
+        }
+        Ok(descriptor)
+    }
+
+    /// Publish one prefix under the inode state lock, returning its length and
+    /// write sequence. `None` means the target moved during unlocked admission
+    /// and the caller must retry. Consumes the operation guard so that it is
+    /// released after the state lock, whichever way this returns.
+    fn apply_native_write(
+        cell: &SharedInodeWriteState,
+        write: NativeWriteApply<'_>,
+        prepared: Option<ChunkBuilder>,
+        descriptor: Option<Arc<Mutex<NativeMetadataLease>>>,
+        gc_pin: Option<Arc<crate::node::gc::GcPin>>,
+        operation: InodeOperationGuard,
+    ) -> Result<Option<(usize, u64)>> {
+        let NativeWriteApply {
+            append,
+            offset,
+            data,
+            accepted,
+            kill_suidgid,
+            target,
+            operation_id,
+        } = write;
+        let position = target.position;
+        let mut state = cell
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        let actual_position = if append {
+            state.logical_length
+        } else {
+            offset + accepted as u64
+        };
+        if state.next_write_seq != target.seq
+            || state.dirty_extents.native_operation_id != target.generation
+            || actual_position != position
+            || state
+                .dirty_extents
+                .native_selection(position, state.logical_length)
+                != target.selection
+        {
+            drop(state);
+            drop(operation);
+            drop(prepared);
+            return Ok(None);
+        }
+        let next_seq = state.next_write_seq.saturating_add(1);
+        if state.dirty_extents.native_operation_id.is_none() {
+            state.dirty_extents.native_operation_id = Some(operation_id);
+            state.dirty_extents.native_gc_pin = gc_pin;
+        }
+        let written = state.dirty_extents.write_native_prepared(
+            position,
+            &data[accepted..],
+            next_seq,
+            target.selection,
+            prepared,
+            descriptor,
+        )?;
+        state.logical_length = state.logical_length.max(position + written as u64);
+        state.next_write_seq = next_seq;
+        state.visible_write_seq = next_seq;
+        state.dirty = true;
+        state.metadata_dirty = true;
+        let now = now_unix_ms();
+        state.inode.attributes.mtime_unix_ms = now;
+        state.inode.attributes.ctime_unix_ms = now;
+        if kill_suidgid {
+            Self::apply_kernel_killpriv_to_state(&mut state);
+        }
+        drop(state);
+        drop(operation);
+        Ok(Some((written, next_seq)))
     }
 
     fn request_native_pressure(
@@ -655,7 +785,7 @@ impl DistributedFs {
         state.task = Some(pipeline.runtime.spawn_blocking(move || {
             let _permit = permit;
             let result = store
-                .put_native_batch(vec![staged])
+                .put_chunks(vec![staged], PutIntent::NativeUpload)
                 .and_then(|mut receipts| {
                     if receipts.len() != 1 {
                         return Err(invalid("native upload returned the wrong receipt count"));
@@ -672,7 +802,7 @@ impl DistributedFs {
     fn install_native_receipt(
         &self,
         upload: &Arc<NativeUpload>,
-        result: Result<NativeChunkReceipt>,
+        result: Result<StoredChunk>,
     ) -> Result<Option<Error>> {
         let pipeline = self
             .native

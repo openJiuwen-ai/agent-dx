@@ -11,6 +11,9 @@ pub trait DfsRemoteOwnerFactory: Send + Sync {
     fn connect(&self, location: DfsNodeLocation) -> Result<Arc<dyn RemoteDfsOwner>>;
 }
 
+/// Calls run under the client's configured timeout. A caller with its own
+/// budget wraps a call in `crate::node::call_deadline`, which may only shorten
+/// it; implementations that block read that scope on the calling thread.
 pub trait DfsMeta: Send + Sync {
     fn lookup(&self, parent: &InodeId, name: &[u8]) -> Result<Option<InodeRecord>>;
     fn create(
@@ -21,13 +24,6 @@ pub trait DfsMeta: Send + Sync {
         attributes: InodeAttributes,
     ) -> Result<(InodeRecord, WriteLease)>;
     fn get_inode(&self, inode_id: &InodeId) -> Result<InodeRecord>;
-    fn get_inode_async(
-        &self,
-        inode_id: InodeId,
-    ) -> crate::node::read_pipeline::ReadFuture<'_, InodeRecord> {
-        Box::pin(async move { self.get_inode(&inode_id) })
-    }
-
     fn get_file_version(&self, version_id: &FileVersionId) -> Result<(FileVersion, LayoutRoot)>;
     fn get_file_version_async(
         &self,
@@ -44,39 +40,10 @@ pub trait DfsMeta: Send + Sync {
         self.open_write(inode_id)
     }
     fn renew_write_lease(&self, lease: WriteLease) -> Result<WriteLease>;
-    fn renew_write_lease_with_timeout(
-        &self,
-        lease: WriteLease,
-        _timeout: Duration,
-    ) -> Result<WriteLease> {
-        self.renew_write_lease(lease)
-    }
     fn sync_inode_metadata(&self, sync: SyncInodeMetadata) -> Result<InodeRecord>;
-    fn sync_inode_metadata_with_timeout(
-        &self,
-        sync: SyncInodeMetadata,
-        _timeout: Duration,
-    ) -> Result<InodeRecord> {
-        self.sync_inode_metadata(sync)
-    }
     fn commit_file_version(&self, commit: CommitFileVersion) -> Result<InodeRecord>;
-    fn commit_file_version_with_timeout(
-        &self,
-        commit: CommitFileVersion,
-        _timeout: Duration,
-    ) -> Result<InodeRecord> {
-        self.commit_file_version(commit)
-    }
     fn lookup_node_location(&self, node_id: &str) -> Result<Option<DfsNodeLocation>>;
     fn current_node_session(&self, node_id: &str) -> Result<Option<String>>;
-    fn current_node_session_with_timeout(
-        &self,
-        node_id: &str,
-        _timeout: Duration,
-    ) -> Result<Option<String>> {
-        self.current_node_session(node_id)
-    }
-
     fn mkdir(
         &self,
         operation_id: &OperationId,

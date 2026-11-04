@@ -997,17 +997,38 @@ impl AsRef<[u8]> for StagedChunk {
     }
 }
 
-/// A native persistence receipt with an explicit, conservative local release
+/// Why chunks are being stored. Everything else about the write is the store's.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PutIntent {
+    /// Published by the commit that stores them: register their GC publication
+    /// first, and make no local release decision.
+    Commit,
+    /// Background upload of a native generation, which fences itself at commit.
+    /// `DfsChunkStore` decides the local release described on [`StoredChunk`].
+    NativeUpload,
+}
+
+/// A persistence receipt with an explicit, conservative local release
 /// decision. Only the native replication implementation may establish Required
-/// policy and the matching local durable ACK; the default never grants it.
+/// policy and the matching local durable ACK; [`Self::unreleased`] never grants it.
 #[derive(Clone, Debug)]
-pub struct NativeChunkReceipt {
+pub struct StoredChunk {
     pub receipt: ChunkReceipt,
     pub local_required_and_durable: bool,
 }
 
+impl StoredChunk {
+    pub fn unreleased(receipt: ChunkReceipt) -> Self {
+        Self {
+            receipt,
+            local_required_and_durable: false,
+        }
+    }
+}
+
 pub trait ChunkStore: Send + Sync {
-    fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>>;
+    /// The single write entry.
+    fn put_chunks(&self, staged: Vec<StagedChunk>, intent: PutIntent) -> Result<Vec<StoredChunk>>;
 
     /// Reserve native control metadata before accepting a body. Production
     /// replication overrides this from its cached authoritative placement.
@@ -1024,18 +1045,6 @@ pub trait ChunkStore: Send + Sync {
         Ok(FALLBACK_BYTES)
     }
 
-    fn put_native_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<NativeChunkReceipt>> {
-        self.put_batch(staged).map(|receipts| {
-            receipts
-                .into_iter()
-                .map(|receipt| NativeChunkReceipt {
-                    receipt,
-                    local_required_and_durable: false,
-                })
-                .collect()
-        })
-    }
-
     /// Read an unpublished native object anchored by its validated receipt.
     /// Unsupported stores must keep the original body until publication.
     fn read_native_uploaded_at(
@@ -1050,6 +1059,15 @@ pub trait ChunkStore: Send + Sync {
         ))
     }
 
+    /// Commit-intent shorthand for the many tests that only want receipts.
+    #[cfg(test)]
+    fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
+        let stored = self.put_chunks(staged, PutIntent::Commit)?;
+        Ok(stored.into_iter().map(|stored| stored.receipt).collect())
+    }
+
+    /// Single-chunk form of [`Self::put_batch`], for tests.
+    #[cfg(test)]
     fn put(&self, staged: StagedChunk) -> Result<ChunkReceipt> {
         self.put_batch(vec![staged])?
             .pop()
@@ -5255,7 +5273,7 @@ fn verified_copy_is_invalid(error: &Error) -> bool {
 
 #[cfg(test)]
 impl ChunkStore for LocalChunkStore {
-    fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
+    fn put_chunks(&self, staged: Vec<StagedChunk>, _intent: PutIntent) -> Result<Vec<StoredChunk>> {
         let descriptor = self.device_descriptor()?;
         let target = ReplicaTarget {
             node_id: self.node_id.clone(),
@@ -5267,14 +5285,16 @@ impl ChunkStore for LocalChunkStore {
         Ok(staged
             .into_iter()
             .zip(acks)
-            .map(|(item, ack)| ChunkReceipt {
-                external_commit: None,
-                operation_id: item.operation_id,
-                chunk: item.chunk,
-                placement_revision: 1,
-                placement_epoch: 1,
-                replica_group_id: ReplicaGroupId::new(format!("local:{}", self.node_id)),
-                durable_acks: vec![ack],
+            .map(|(item, ack)| {
+                StoredChunk::unreleased(ChunkReceipt {
+                    external_commit: None,
+                    operation_id: item.operation_id,
+                    chunk: item.chunk,
+                    placement_revision: 1,
+                    placement_epoch: 1,
+                    replica_group_id: ReplicaGroupId::new(format!("local:{}", self.node_id)),
+                    durable_acks: vec![ack],
+                })
             })
             .collect())
     }

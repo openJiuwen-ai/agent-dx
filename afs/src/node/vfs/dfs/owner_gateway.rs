@@ -1050,10 +1050,10 @@ impl OwnerGateway {
                 break;
             }
             checked = checked.saturating_add(1);
-            match self
-                .meta
-                .current_node_session_with_timeout(&node_id, timeout)
-            {
+            let current_session = crate::node::call_deadline::within_timeout(timeout, || {
+                self.meta.current_node_session(&node_id)
+            });
+            match current_session {
                 Ok(current) => {
                     for session_id in sessions {
                         if current.as_deref() != Some(session_id.as_str()) {

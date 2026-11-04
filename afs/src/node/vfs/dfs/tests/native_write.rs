@@ -70,10 +70,10 @@ struct NativeFixtureStore {
 }
 
 impl ChunkStore for NativeFixtureStore {
-    fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
-        self.local.put_batch(staged)
-    }
-    fn put_native_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<NativeChunkReceipt>> {
+    fn put_chunks(&self, staged: Vec<StagedChunk>, intent: PutIntent) -> Result<Vec<StoredChunk>> {
+        if intent == PutIntent::Commit {
+            return self.local.put_chunks(staged, intent);
+        }
         self.calls.fetch_add(staged.len(), Ordering::SeqCst);
         if let Some(pause) = self.pause.lock().unwrap().take() {
             pause.block();
@@ -81,15 +81,11 @@ impl ChunkStore for NativeFixtureStore {
         if self.fail_next.swap(false, Ordering::SeqCst) {
             return Err(unavailable("injected native upload failure"));
         }
-        self.local.put_batch(staged).map(|receipts| {
-            receipts
-                .into_iter()
-                .map(|receipt| NativeChunkReceipt {
-                    receipt,
-                    local_required_and_durable: self.required,
-                })
-                .collect()
-        })
+        let mut stored = self.local.put_chunks(staged, intent)?;
+        for stored in &mut stored {
+            stored.local_required_and_durable = self.required;
+        }
+        Ok(stored)
     }
     fn read_native_uploaded_at(
         &self,

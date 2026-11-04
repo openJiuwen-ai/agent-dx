@@ -941,7 +941,7 @@ impl Backend for DistributedFs {
             state.commit_busy = true;
             InFlightCommit::File(Box::new(pending))
         };
-        if let Some(seq) = self.finish_commit(cell, pending, None, "cow-copy")? {
+        if let Some(seq) = self.finish_commit(cell, pending, "cow-copy")? {
             self.update_handles_after_commit(&destination.inode_id, seq)?;
             self.update_handle_write_progress(range.destination, seq)?;
         }

@@ -14,7 +14,7 @@ use crate::{
         ReplicaGroup, ReplicaGroupId, ReplicaTarget, ReplicaWriteGrant, ReplicationConfig,
     },
     node::{
-        chunk::{ChunkStore, LocalChunkStore, NativeChunkReceipt, StagedChunk},
+        chunk::{ChunkStore, LocalChunkStore, PutIntent, StagedChunk, StoredChunk},
         vfs::types::FilesystemCapacity,
     },
 };
@@ -362,7 +362,7 @@ impl ReplicationEngine {
         &self,
         staged: Vec<StagedChunk>,
         minimum_revision: u64,
-    ) -> Result<Vec<ChunkReceipt>> {
+    ) -> Result<Vec<StoredChunk>> {
         if staged.is_empty() {
             return Ok(Vec::new());
         }
@@ -416,7 +416,7 @@ impl ReplicationEngine {
                     durable_acks.extend(self.data_plane.put_peer_replica(&op, &item)?);
                 }
                 validate_acks(plan, &item, &durable_acks, &self.local_node_id)?;
-                receipts[index] = Some(ChunkReceipt {
+                receipts[index] = Some(StoredChunk::unreleased(ChunkReceipt {
                     external_commit: None,
                     operation_id: item.operation_id,
                     chunk: item.chunk,
@@ -424,7 +424,7 @@ impl ReplicationEngine {
                     placement_epoch: plan.placement_epoch,
                     replica_group_id: plan.replica_group_id.clone(),
                     durable_acks,
-                });
+                }));
             }
         }
         receipts
@@ -548,7 +548,7 @@ impl DfsChunkStore {
         &self,
         staged: Vec<StagedChunk>,
         snapshot: &PlacementSnapshot,
-    ) -> Result<Vec<ChunkReceipt>> {
+    ) -> Result<Vec<StoredChunk>> {
         if staged.is_empty() {
             return Ok(Vec::new());
         }
@@ -583,7 +583,7 @@ impl DfsChunkStore {
                 .zip(group_staged)
                 .zip(local_acks)
             {
-                receipts[index] = Some(ChunkReceipt {
+                receipts[index] = Some(StoredChunk::unreleased(ChunkReceipt {
                     external_commit: None,
                     operation_id: item.operation_id,
                     chunk: item.chunk,
@@ -591,7 +591,7 @@ impl DfsChunkStore {
                     placement_epoch: group.plan.placement_epoch,
                     replica_group_id: group.plan.replica_group_id.clone(),
                     durable_acks: vec![ack],
-                });
+                }));
             }
         }
         receipts
@@ -599,18 +599,65 @@ impl DfsChunkStore {
             .map(|receipt| receipt.ok_or_else(|| invalid("local receipt was not produced")))
             .collect()
     }
+
+    /// Under Required policy, an uploaded body may be released once this node's
+    /// exact durable copy of it is proven.
+    fn confirm_local_required_copies(&self, stored: &mut [StoredChunk]) -> Result<()> {
+        let device = self.local.device_descriptor()?;
+        for stored in stored {
+            let receipt = &stored.receipt;
+            let local_ack = receipt
+                .durable_acks
+                .iter()
+                .find(|ack| {
+                    ack.node_id == self.local_node_id
+                        && self
+                            .local_node_epoch
+                            .is_none_or(|epoch| ack.node_epoch == epoch)
+                        && ack.device_id == device.device_id
+                        && ack.device_epoch == device.device_epoch
+                })
+                .ok_or_else(|| {
+                    invalid("native Required receipt has no matching local durable ACK")
+                })?;
+            if local_ack.operation_id != receipt.operation_id
+                || local_ack.chunk_id != receipt.chunk.id
+                || local_ack.placement_revision != receipt.placement_revision
+                || local_ack.placement_epoch != receipt.placement_epoch
+                || local_ack.persisted_bytes != receipt.chunk.length
+                || local_ack.verified_digest != receipt.chunk.content_digest
+            {
+                return Err(invalid("native local ACK does not match its exact receipt"));
+            }
+            // Pinning checks catalog and content-addressed identity without
+            // another full scan. Every later local read verifies its groups.
+            self.local.open_receipt_reader(&receipt.chunk)?;
+            stored.local_required_and_durable = true;
+        }
+        Ok(())
+    }
 }
 
 impl ChunkStore for DfsChunkStore {
-    fn put_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<ChunkReceipt>> {
-        self.reserve_gc_publications(&staged)?;
+    fn put_chunks(&self, staged: Vec<StagedChunk>, intent: PutIntent) -> Result<Vec<StoredChunk>> {
+        // Native writes fence their own write generation at commit; no
+        // per-chunk publication registration (S1a-7, F6).
+        if intent == PutIntent::Commit {
+            self.reserve_gc_publications(&staged)?;
+        }
         let snapshot = self.placement.snapshot()?;
-        if snapshot.replication.is_local_fast_path() {
-            self.put_local_batch(staged, &snapshot)
+        let mut stored = if snapshot.replication.is_local_fast_path() {
+            self.put_local_batch(staged, &snapshot)?
         } else {
             self.replication
-                .put_replicated_batch(staged, snapshot.revision)
+                .put_replicated_batch(staged, snapshot.revision)?
+        };
+        if intent == PutIntent::NativeUpload
+            && snapshot.replication.local_copy == LocalCopyPolicy::Required
+        {
+            self.confirm_local_required_copies(&mut stored)?;
         }
+        Ok(stored)
     }
 
     fn native_descriptor_reservation_bytes(&self, operation_id: &OperationId) -> Result<usize> {
@@ -651,61 +698,6 @@ impl ChunkStore for DfsChunkStore {
             .checked_mul(8)
             .and_then(|bytes| bytes.checked_add(8192))
             .ok_or_else(|| invalid("native descriptor reservation overflow"))
-    }
-
-    fn put_native_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<NativeChunkReceipt>> {
-        // Native writes fence their own write generation at commit; no
-        // per-chunk publication registration (S1a-7, F6).
-        let snapshot = self.placement.snapshot()?;
-        let receipts = if snapshot.replication.is_local_fast_path() {
-            self.put_local_batch(staged, &snapshot)?
-        } else {
-            self.replication
-                .put_replicated_batch(staged, snapshot.revision)?
-        };
-        let required = snapshot.replication.local_copy == LocalCopyPolicy::Required;
-        let device = if required {
-            Some(self.local.device_descriptor()?)
-        } else {
-            None
-        };
-        receipts
-            .into_iter()
-            .map(|receipt| {
-                if let Some(device) = &device {
-                    let local_ack = receipt
-                        .durable_acks
-                        .iter()
-                        .find(|ack| {
-                            ack.node_id == self.local_node_id
-                                && self
-                                    .local_node_epoch
-                                    .is_none_or(|epoch| ack.node_epoch == epoch)
-                                && ack.device_id == device.device_id
-                                && ack.device_epoch == device.device_epoch
-                        })
-                        .ok_or_else(|| {
-                            invalid("native Required receipt has no matching local durable ACK")
-                        })?;
-                    if local_ack.operation_id != receipt.operation_id
-                        || local_ack.chunk_id != receipt.chunk.id
-                        || local_ack.placement_revision != receipt.placement_revision
-                        || local_ack.placement_epoch != receipt.placement_epoch
-                        || local_ack.persisted_bytes != receipt.chunk.length
-                        || local_ack.verified_digest != receipt.chunk.content_digest
-                    {
-                        return Err(invalid("native local ACK does not match its exact receipt"));
-                    }
-                    // Pinning checks catalog and content-addressed identity without
-                    // another full scan. Every later local read verifies its groups.
-                    self.local.open_receipt_reader(&receipt.chunk)?;
-                }
-                Ok(NativeChunkReceipt {
-                    receipt,
-                    local_required_and_durable: required,
-                })
-            })
-            .collect()
     }
 
     fn read_native_uploaded_at(
@@ -1404,7 +1396,9 @@ mod tests {
             Arc::new(FakeDataPlane::default()),
         );
         let input = staged("native-durable-body");
-        let mut receipts = store.put_native_batch(vec![input.clone()]).unwrap();
+        let mut receipts = store
+            .put_chunks(vec![input.clone()], PutIntent::NativeUpload)
+            .unwrap();
         let receipt = receipts.remove(0);
         assert!(receipt.local_required_and_durable);
         assert_eq!(receipt.receipt.chunk, input.chunk);
@@ -1431,6 +1425,81 @@ mod tests {
         );
     }
 
+    #[derive(Default)]
+    struct RecordingGcControl {
+        reservations: Mutex<Vec<OperationId>>,
+    }
+
+    impl crate::node::gc::GcControl for RecordingGcControl {
+        fn retain(
+            &self,
+            _: &str,
+            _: &crate::dfs::InodeId,
+            _: Option<&crate::dfs::FileVersionId>,
+            _: bool,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn release(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn reserve_publication(
+            &self,
+            operation: &OperationId,
+            _: Vec<crate::dfs::ChunkObject>,
+        ) -> Result<()> {
+            self.reservations.lock().unwrap().push(operation.clone());
+            Ok(())
+        }
+        fn collect(&self, _: u64, _: Vec<crate::dfs::ChunkObject>) -> Result<crate::dfs::GcState> {
+            Ok(crate::dfs::GcState::default())
+        }
+    }
+
+    /// The two differences `PutIntent` exists to express, on the same store.
+    #[test]
+    fn put_intent_selects_gc_reservation_and_local_release_decision() {
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let snapshot = Arc::new(PlacementSnapshot {
+            revision: 11,
+            replication: config(1),
+            replica_groups: vec![ReplicaGroup {
+                id: ReplicaGroupId::new("intent"),
+                placement_epoch: 12,
+                targets: vec![target_with_epoch(
+                    "node-a",
+                    1,
+                    local.device_descriptor().unwrap(),
+                )],
+            }],
+        });
+        let control = Arc::new(RecordingGcControl::default());
+        let store = DfsChunkStore::new_with_epoch(
+            "node-a".into(),
+            1,
+            local,
+            Arc::new(StaticPlacement { snapshot }),
+            Arc::new(FakeDataPlane::default()),
+        )
+        .with_gc_control(control.clone());
+
+        let committed = store
+            .put_chunks(vec![staged("intent-commit")], PutIntent::Commit)
+            .unwrap();
+        assert!(!committed[0].local_required_and_durable);
+        assert_eq!(
+            *control.reservations.lock().unwrap(),
+            vec![OperationId::new("op-intent-commit")]
+        );
+
+        let uploaded = store
+            .put_chunks(vec![staged("intent-upload")], PutIntent::NativeUpload)
+            .unwrap();
+        assert!(uploaded[0].local_required_and_durable);
+        assert_eq!(control.reservations.lock().unwrap().len(), 1);
+    }
+
     #[test]
     fn p2_w2_nonrequired_remote_receipt_never_claims_local_body_replacement() {
         let temp = tempfile::tempdir().unwrap();
@@ -1454,7 +1523,7 @@ mod tests {
             Arc::new(FakeDataPlane::default()),
         );
         let receipt = store
-            .put_native_batch(vec![staged("remote-native")])
+            .put_chunks(vec![staged("remote-native")], PutIntent::NativeUpload)
             .unwrap()
             .remove(0);
         assert!(!receipt.local_required_and_durable);
@@ -2573,5 +2642,208 @@ mod tests {
         assert!(!reports[0].source_invalid);
         assert!(reports[0].durable_acks.is_empty());
         assert!(plane.prepared.lock().unwrap().is_empty());
+    }
+
+    /// Counts allocations only while a measured call runs; a relaxed load
+    /// otherwise, so the rest of the test binary pays nothing observable.
+    struct CountingAlloc;
+    static COUNTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static ALLOCS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static ALLOC_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    fn note_alloc(bytes: usize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if COUNTING.load(Relaxed) {
+            ALLOCS.fetch_add(1, Relaxed);
+            ALLOC_BYTES.fetch_add(bytes as u64, Relaxed);
+        }
+    }
+
+    // SAFETY: every method forwards unchanged to `System`, which upholds the
+    // `GlobalAlloc` contract; the counters neither allocate nor touch the block.
+    unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            note_alloc(layout.size());
+            // SAFETY: the caller's layout contract is forwarded as is.
+            unsafe { std::alloc::System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, block: *mut u8, layout: std::alloc::Layout) {
+            // SAFETY: `block` came from `System` with this layout.
+            unsafe { std::alloc::System.dealloc(block, layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+            note_alloc(layout.size());
+            // SAFETY: the caller's layout contract is forwarded as is.
+            unsafe { std::alloc::System.alloc_zeroed(layout) }
+        }
+        unsafe fn realloc(
+            &self,
+            block: *mut u8,
+            layout: std::alloc::Layout,
+            new_size: usize,
+        ) -> *mut u8 {
+            note_alloc(new_size);
+            // SAFETY: `block` came from `System` with this layout.
+            unsafe { std::alloc::System.realloc(block, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static GLOBAL: CountingAlloc = CountingAlloc;
+
+    /// Elapsed ns, allocation count and allocated bytes of `call`. The result
+    /// is returned so that dropping it stays outside the measured region.
+    fn timed<R>(call: impl FnOnce() -> R) -> (R, u64, u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        ALLOCS.store(0, Relaxed);
+        ALLOC_BYTES.store(0, Relaxed);
+        COUNTING.store(true, Relaxed);
+        let started = std::time::Instant::now();
+        let result = call();
+        let elapsed = started.elapsed().as_nanos() as u64;
+        COUNTING.store(false, Relaxed);
+        (
+            result,
+            elapsed,
+            ALLOCS.load(Relaxed),
+            ALLOC_BYTES.load(Relaxed),
+        )
+    }
+
+    #[derive(Clone, Copy)]
+    enum BenchPlacement {
+        /// `is_local_fast_path`: one Required copy on this node.
+        LocalFastRequired,
+        /// One Preferred copy on this node: replication engine, local persist.
+        LocalPreferred,
+        /// Two Required copies: local persist plus the fake peer.
+        ReplicatedRequired,
+        /// Two Preferred copies: local persist plus the fake peer.
+        ReplicatedPreferred,
+        /// One Preferred remote copy: no disk at all, the pure in-memory path.
+        RemoteOnlyPreferred,
+    }
+
+    impl BenchPlacement {
+        fn name(self) -> &'static str {
+            match self {
+                Self::LocalFastRequired => "local_fast_required",
+                Self::LocalPreferred => "local_preferred",
+                Self::ReplicatedRequired => "replicated_required",
+                Self::ReplicatedPreferred => "replicated_preferred",
+                Self::RemoteOnlyPreferred => "remote_only_preferred",
+            }
+        }
+
+        fn store(self, local: Arc<LocalChunkStore>) -> DfsChunkStore {
+            let device = local.device_descriptor().unwrap();
+            let here = target_with_epoch("node-a", 1, device);
+            let peer = target("node-b", remote_device("remote-b"));
+            let (copies, policy, targets) = match self {
+                Self::LocalFastRequired => (1, LocalCopyPolicy::Required, vec![here]),
+                Self::LocalPreferred => (1, LocalCopyPolicy::Preferred, vec![here]),
+                Self::ReplicatedRequired => (2, LocalCopyPolicy::Required, vec![here, peer]),
+                Self::ReplicatedPreferred => (2, LocalCopyPolicy::Preferred, vec![here, peer]),
+                Self::RemoteOnlyPreferred => (1, LocalCopyPolicy::Preferred, vec![peer]),
+            };
+            let mut replication = config(copies);
+            replication.local_copy = policy;
+            let snapshot = Arc::new(PlacementSnapshot {
+                revision: 11,
+                replication,
+                replica_groups: vec![ReplicaGroup {
+                    id: ReplicaGroupId::new("bench"),
+                    placement_epoch: 12,
+                    targets,
+                }],
+            });
+            DfsChunkStore::new_with_epoch(
+                "node-a".into(),
+                1,
+                local,
+                Arc::new(StaticPlacement { snapshot }),
+                Arc::new(FakeDataPlane::default()),
+            )
+        }
+    }
+
+    fn percentile(sorted: &[u64], per_mille: usize) -> u64 {
+        sorted[(sorted.len() * per_mille / 1000).min(sorted.len() - 1)]
+    }
+
+    /// Per-call cost of the production single-chunk put (`native_write.rs`).
+    /// Each call persists a distinct CRC32C object, as native uploads do, and
+    /// each cell gets a fresh store so the catalog does not grow across cells.
+    ///
+    /// Alone in its process, so only this work is counted, and run on a native
+    /// filesystem (`TMPDIR=/workspace/ut`):
+    /// `chunk_store_put_microbench --ignored --nocapture --test-threads=1`.
+    #[test]
+    #[ignore = "性能测量，不在门禁里跑"]
+    fn chunk_store_put_microbench() {
+        const SIZES: [(&str, usize); 3] = [
+            ("4KiB", 4 * 1024),
+            ("1MiB", 1024 * 1024),
+            ("4MiB", 4 * 1024 * 1024),
+        ];
+        const WARMUP: usize = 10;
+        let iterations: usize = std::env::var("AFS_BENCH_ITERS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1000);
+        let placements = [
+            BenchPlacement::LocalFastRequired,
+            BenchPlacement::LocalPreferred,
+            BenchPlacement::ReplicatedRequired,
+            BenchPlacement::ReplicatedPreferred,
+            BenchPlacement::RemoteOnlyPreferred,
+        ];
+        for placement in placements {
+            for (size_name, size) in SIZES {
+                let body = vec![0x5a_u8; size];
+                for commit in [true, false] {
+                    let temp = tempfile::tempdir().unwrap();
+                    let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+                    let store = placement.store(local);
+                    let mut nanos = Vec::with_capacity(iterations);
+                    let mut allocs = Vec::with_capacity(iterations);
+                    let mut bytes = 0_u64;
+                    for iteration in 0..iterations + WARMUP {
+                        let operation = OperationId::new(format!("bench-{iteration}"));
+                        let staged = StagedChunk::new_crc32c(operation, body.clone()).unwrap();
+                        let (count, elapsed, call_allocs, call_bytes) = if commit {
+                            let (result, elapsed, call_allocs, call_bytes) =
+                                timed(|| store.put_chunks(vec![staged], PutIntent::Commit));
+                            (result.unwrap().len(), elapsed, call_allocs, call_bytes)
+                        } else {
+                            let (result, elapsed, call_allocs, call_bytes) =
+                                timed(|| store.put_chunks(vec![staged], PutIntent::NativeUpload));
+                            (result.unwrap().len(), elapsed, call_allocs, call_bytes)
+                        };
+                        assert_eq!(count, 1);
+                        if iteration >= WARMUP {
+                            nanos.push(elapsed);
+                            allocs.push(call_allocs);
+                            bytes += call_bytes;
+                        }
+                    }
+                    nanos.sort_unstable();
+                    allocs.sort_unstable();
+                    println!(
+                        "BENCH placement={} size={} intent={} n={} p50_ns={} p99_ns={} \
+                         allocs_p50={} allocs_max={} alloc_bytes_mean={}",
+                        placement.name(),
+                        size_name,
+                        if commit { "commit" } else { "native_upload" },
+                        iterations,
+                        percentile(&nanos, 500),
+                        percentile(&nanos, 990),
+                        percentile(&allocs, 500),
+                        allocs[allocs.len() - 1],
+                        bytes / iterations as u64,
+                    );
+                }
+            }
+        }
     }
 }

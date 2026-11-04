@@ -54,10 +54,10 @@ impl DistributedFs {
                 }
                 state.write_lease.clone()
             };
-            match self.meta.renew_write_lease_with_timeout(
-                lease.clone(),
-                deadline.saturating_duration_since(Instant::now()),
-            ) {
+            let renewal = crate::node::call_deadline::within(deadline, || {
+                self.meta.renew_write_lease(lease.clone())
+            });
+            match renewal {
                 Ok(renewed) if same_lease_identity(&lease, &renewed) => {
                     let mut state = cell
                         .lock()

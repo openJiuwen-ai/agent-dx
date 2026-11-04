@@ -217,13 +217,15 @@ impl DistributedFs {
             if timeout.is_zero() {
                 break;
             }
-            match remote.owner.acknowledge_lock_wait_with_timeout(
-                afs_protocol::node_control::DfsOwnerAcknowledgeLockWaitRequest {
-                    authority: Some(remote.authority.clone()),
-                    waiter: Some(Self::wire_lock_waiter(&waiter)),
-                },
-                timeout,
-            ) {
+            let acknowledged_wait = crate::node::call_deadline::within_timeout(timeout, || {
+                remote.owner.acknowledge_lock_wait(
+                    afs_protocol::node_control::DfsOwnerAcknowledgeLockWaitRequest {
+                        authority: Some(remote.authority.clone()),
+                        waiter: Some(Self::wire_lock_waiter(&waiter)),
+                    },
+                )
+            });
+            match acknowledged_wait {
                 Ok(_) => {
                     let inode_id = InodeId::new(remote.authority.inode_id.clone());
                     self.cleanup_acknowledged_remote_lock_waiter(&waiter)?;
@@ -397,13 +399,14 @@ impl DistributedFs {
         scoped_session: &str,
         timeout: Duration,
     ) -> Result<()> {
-        remote.owner.release_lock_session_with_timeout(
-            afs_protocol::node_control::DfsOwnerReleaseLockSessionRequest {
-                authority: Some(remote.authority.clone()),
-                ingress_session_id: Self::raw_lock_session(scoped_session).to_owned(),
-            },
-            timeout,
-        )?;
+        crate::node::call_deadline::within_timeout(timeout, || {
+            remote.owner.release_lock_session(
+                afs_protocol::node_control::DfsOwnerReleaseLockSessionRequest {
+                    authority: Some(remote.authority.clone()),
+                    ingress_session_id: Self::raw_lock_session(scoped_session).to_owned(),
+                },
+            )
+        })?;
         self.cleanup_successful_remote_lock_session(inode_id, scoped_session)
     }
 

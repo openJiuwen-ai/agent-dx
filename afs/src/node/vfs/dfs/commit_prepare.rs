@@ -228,6 +228,51 @@ impl DistributedFs {
             receipts = tracing::field::Empty,
         );
         let _entered = span.enter();
+        let (operation_id, gc_pin) = self.commit_operation_and_gc_pin(frozen, reason)?;
+        let generation = self.identity.next_operation.fetch_add(1, Ordering::Relaxed);
+        let layout_id =
+            LayoutRootId::new(format!("{}-layout-{generation}", self.identity.session_id));
+
+        let mut native_uploads = Vec::new();
+        let (layout_root, receipts) = if frozen.dirty_extents.native_operation_id.is_some() {
+            self.prepare_native_generation(frozen, &operation_id, layout_id, &mut native_uploads)
+                .map_err(|error| PrepareCommitError { error })?
+        } else {
+            self.prepare_staged_generation(frozen, &operation_id, layout_id, reason, &span)
+                .map_err(|error| PrepareCommitError { error })?
+        };
+        span.record("receipts", receipts.len() as u64);
+        let gc_fence = gc_pin.as_ref().and_then(|pin| pin.fence());
+        if self.gc.references.is_some() && gc_fence.is_none() {
+            return Err(PrepareCommitError {
+                error: unavailable("optimistic commit has no frozen GC fence"),
+            });
+        }
+        let commit = self.commit_record(
+            frozen,
+            reason,
+            generation,
+            (operation_id, gc_fence),
+            layout_root,
+            receipts,
+        );
+        let native_accounting =
+            self.reserve_native_commit_accounting(frozen, &commit, &native_uploads)?;
+        Ok(CommitBatch {
+            _gc_pin: gc_pin,
+            through_seq: frozen.through_seq,
+            _native_accounting: native_accounting,
+            _native_uploads: native_uploads,
+            commit: Arc::new(commit),
+        })
+    }
+
+    fn commit_operation_and_gc_pin(
+        &self,
+        frozen: &mut FrozenCommit,
+        reason: CommitReason,
+    ) -> std::result::Result<(OperationId, Option<Arc<crate::node::gc::GcPin>>), PrepareCommitError>
+    {
         let operation_id = frozen
             .dirty_extents
             .native_operation_id
@@ -260,44 +305,55 @@ impl DistributedFs {
             // captured fence as well; preparation retries never refresh it.
             frozen.dirty_extents.native_gc_pin = gc_pin.clone();
         }
-        let generation = self.identity.next_operation.fetch_add(1, Ordering::Relaxed);
-        let layout_id =
-            LayoutRootId::new(format!("{}-layout-{generation}", self.identity.session_id));
+        Ok((operation_id, gc_pin))
+    }
 
-        let mut native_uploads = Vec::new();
-        let (layout_root, receipts) = if frozen.dirty_extents.native_operation_id.is_some() {
-            self.prepare_native_generation(frozen, &operation_id, layout_id, &mut native_uploads)
-                .map_err(|error| PrepareCommitError { error })?
-        } else {
-            let plan = CommitPlanner
-                .plan(frozen, operation_id.clone(), layout_id)
-                .map_err(|error| PrepareCommitError { error })?;
-            let staged_chunks = plan.staged_chunks.len();
-            let staged_bytes = plan
-                .staged_chunks
-                .iter()
-                .fold(0_u64, |sum, chunk| sum.saturating_add(chunk.chunk.length));
-            span.record("staged_chunks", staged_chunks as u64);
-            span.record("staged_bytes", staged_bytes);
-            let unique = unique_staged_chunks(plan.staged_chunks)
-                .map_err(|error| PrepareCommitError { error })?;
-            let unique_bytes = unique
-                .iter()
-                .fold(0_u64, |sum, chunk| sum.saturating_add(chunk.chunk.length));
-            span.record("unique_chunks", unique.len() as u64);
-            span.record("unique_bytes", unique_bytes);
-            let receipts = tracing::info_span!(
-                "node.dfs.commit.put_batch",
-                reason = reason.label(),
-                chunks = unique.len(),
-                bytes = unique_bytes,
-                reused_receipts = 0_u64,
-            )
-            .in_scope(|| self.chunk_store.put_batch(unique))
-            .map_err(|error| PrepareCommitError { error })?;
-            (plan.layout_root, receipts)
-        };
-        span.record("receipts", receipts.len() as u64);
+    /// A generation without native uploads: plan it and store its chunks here.
+    fn prepare_staged_generation(
+        &self,
+        frozen: &FrozenCommit,
+        operation_id: &OperationId,
+        layout_id: LayoutRootId,
+        reason: CommitReason,
+        span: &tracing::Span,
+    ) -> Result<(LayoutRoot, Vec<ChunkReceipt>)> {
+        let plan = CommitPlanner.plan(frozen, operation_id.clone(), layout_id)?;
+        let staged_chunks = plan.staged_chunks.len();
+        let staged_bytes = plan
+            .staged_chunks
+            .iter()
+            .fold(0_u64, |sum, chunk| sum.saturating_add(chunk.chunk.length));
+        span.record("staged_chunks", staged_chunks as u64);
+        span.record("staged_bytes", staged_bytes);
+        let unique = unique_staged_chunks(plan.staged_chunks)?;
+        let unique_bytes = unique
+            .iter()
+            .fold(0_u64, |sum, chunk| sum.saturating_add(chunk.chunk.length));
+        span.record("unique_chunks", unique.len() as u64);
+        span.record("unique_bytes", unique_bytes);
+        let receipts = tracing::info_span!(
+            "node.dfs.commit.put_batch",
+            reason = reason.label(),
+            chunks = unique.len(),
+            bytes = unique_bytes,
+            reused_receipts = 0_u64,
+        )
+        .in_scope(|| self.chunk_store.put_chunks(unique, PutIntent::Commit))?
+        .into_iter()
+        .map(|stored| stored.receipt)
+        .collect();
+        Ok((plan.layout_root, receipts))
+    }
+
+    fn commit_record(
+        &self,
+        frozen: &FrozenCommit,
+        reason: CommitReason,
+        generation: u64,
+        (operation_id, gc_fence): (OperationId, Option<crate::dfs::GcFence>),
+        layout_root: LayoutRoot,
+        receipts: Vec<ChunkReceipt>,
+    ) -> CommitFileVersion {
         let now = now_unix_ms();
         let version = FileVersion {
             id: FileVersionId::new(format!("{}-version-{generation}", self.identity.session_id)),
@@ -310,13 +366,7 @@ impl DistributedFs {
             layout_root: layout_root.id.clone(),
             created_at_unix_ms: now,
         };
-        let gc_fence = gc_pin.as_ref().and_then(|pin| pin.fence());
-        if self.gc.references.is_some() && gc_fence.is_none() {
-            return Err(PrepareCommitError {
-                error: unavailable("optimistic commit has no frozen GC fence"),
-            });
-        }
-        let commit = CommitFileVersion {
+        CommitFileVersion {
             gc_fence,
             operation_id,
             inode_id: frozen.inode.inode_id.clone(),
@@ -335,81 +385,81 @@ impl DistributedFs {
                 frozen.inode.attributes.ctime_unix_ms,
                 frozen.kill_suidgid_dirty,
             ),
-        };
-        let native_accounting = if frozen.dirty_extents.native_operation_id.is_some()
-            && (!commit.chunk_receipts.is_empty()
-                || frozen
+        }
+    }
+
+    /// Charge the commit's metadata against scratch its descriptors already
+    /// reserved. Admission happened at write time, so this fails, never waits.
+    fn reserve_native_commit_accounting(
+        &self,
+        frozen: &FrozenCommit,
+        commit: &CommitFileVersion,
+        native_uploads: &Vec<Arc<NativeUpload>>,
+    ) -> std::result::Result<Option<Arc<NativeCommitAccounting>>, PrepareCommitError> {
+        if frozen.dirty_extents.native_operation_id.is_none()
+            || commit.chunk_receipts.is_empty()
+                && !frozen
                     .dirty_extents
                     .iter_extents()
-                    .any(|extent| extent.native_descriptor.is_some()))
+                    .any(|extent| extent.native_descriptor.is_some())
         {
-            let pipeline = self
-                .native
-                .pipeline
-                .as_ref()
-                .ok_or_else(|| PrepareCommitError {
-                    error: unavailable("native write pipeline is missing"),
-                })?;
-            let mut owners: Vec<Arc<Mutex<NativeMetadataLease>>> = Vec::new();
-            for extent in frozen.dirty_extents.iter_extents() {
-                if let Some(owner) = &extent.native_descriptor
-                    && !owners.iter().any(|other| Arc::ptr_eq(other, owner))
-                {
-                    owners.push(owner.clone());
-                }
-            }
-            let mut owned_headroom = 0usize;
-            for owner in &owners {
-                let owner = owner.lock().map_err(|_| PrepareCommitError {
-                    error: unavailable("native descriptor reservation is poisoned"),
-                })?;
-                owned_headroom =
-                    owned_headroom.saturating_add(owner.bytes.saturating_sub(owner.actual_bytes));
-            }
-            let base = native_commit_heap(&commit)
-                + owners.capacity() * std::mem::size_of::<Arc<Mutex<NativeMetadataLease>>>()
-                + native_uploads.capacity() * std::mem::size_of::<Arc<NativeUpload>>();
-            let reserved = base.saturating_mul(3);
-            let mut state = pipeline
-                .metadata
-                .state
-                .lock()
-                .map_err(|_| PrepareCommitError {
-                    error: unavailable("native metadata budget is poisoned"),
-                })?;
-            if reserved > owned_headroom
-                || reserved
-                    > state
-                        .descriptor_reserved_bytes
-                        .saturating_sub(state.descriptor_bytes)
-                        .saturating_sub(state.scratch_reserved_bytes)
+            return Ok(None);
+        }
+        let pipeline = self
+            .native
+            .pipeline
+            .as_ref()
+            .ok_or_else(|| PrepareCommitError {
+                error: unavailable("native write pipeline is missing"),
+            })?;
+        let mut owners: Vec<Arc<Mutex<NativeMetadataLease>>> = Vec::new();
+        for extent in frozen.dirty_extents.iter_extents() {
+            if let Some(owner) = &extent.native_descriptor
+                && !owners.iter().any(|other| Arc::ptr_eq(other, owner))
             {
-                return Err(PrepareCommitError {
-                    error: unavailable(
-                        "native commit cannot fit its pre-reserved publication scratch",
-                    ),
-                });
+                owners.push(owner.clone());
             }
-            state.scratch_reserved_bytes += reserved;
-            state.descriptor_bytes += base;
-            state.descriptor_peak = state.descriptor_peak.max(state.descriptor_bytes);
-            drop(state);
-            Some(Arc::new(NativeCommitAccounting {
-                budget: pipeline.metadata.clone(),
-                reserved,
-                actual: AtomicUsize::new(base),
-                _owners: owners,
-            }))
-        } else {
-            None
-        };
-        Ok(CommitBatch {
-            _gc_pin: gc_pin,
-            through_seq: frozen.through_seq,
-            _native_accounting: native_accounting,
-            _native_uploads: native_uploads,
-            commit: Arc::new(commit),
-        })
+        }
+        let mut owned_headroom = 0usize;
+        for owner in &owners {
+            let owner = owner.lock().map_err(|_| PrepareCommitError {
+                error: unavailable("native descriptor reservation is poisoned"),
+            })?;
+            owned_headroom =
+                owned_headroom.saturating_add(owner.bytes.saturating_sub(owner.actual_bytes));
+        }
+        let base = native_commit_heap(commit)
+            + owners.capacity() * std::mem::size_of::<Arc<Mutex<NativeMetadataLease>>>()
+            + native_uploads.capacity() * std::mem::size_of::<Arc<NativeUpload>>();
+        let reserved = base.saturating_mul(3);
+        let mut state = pipeline
+            .metadata
+            .state
+            .lock()
+            .map_err(|_| PrepareCommitError {
+                error: unavailable("native metadata budget is poisoned"),
+            })?;
+        if reserved > owned_headroom
+            || reserved
+                > state
+                    .descriptor_reserved_bytes
+                    .saturating_sub(state.descriptor_bytes)
+                    .saturating_sub(state.scratch_reserved_bytes)
+        {
+            return Err(PrepareCommitError {
+                error: unavailable("native commit cannot fit its pre-reserved publication scratch"),
+            });
+        }
+        state.scratch_reserved_bytes += reserved;
+        state.descriptor_bytes += base;
+        state.descriptor_peak = state.descriptor_peak.max(state.descriptor_bytes);
+        drop(state);
+        Ok(Some(Arc::new(NativeCommitAccounting {
+            budget: pipeline.metadata.clone(),
+            reserved,
+            actual: AtomicUsize::new(base),
+            _owners: owners,
+        })))
     }
 
     pub(super) fn observe_handle_error(&self, handle: FileHandle) -> Result<()> {
