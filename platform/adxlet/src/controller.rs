@@ -1079,7 +1079,17 @@ impl Controller {
         {
             // Capture RPC outcome was not durably sealed. Stop the writer before dropping its reservation.
             self.cleanup().await?;
-            self.transition(Event::Fail)?;
+            self.record.runtime.ip = None;
+            if self.record.state == EnvironmentState::Failed {
+                // Coordinator may already have invalidated this execution. Its
+                // released terminal record can still retain an unsealed input;
+                // publish cleanup at a new revision without failing it again.
+                self.record.revision =
+                    self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
+                self.durability = None;
+            } else {
+                self.transition(Event::Fail)?;
+            }
             return self.sync().await;
         }
         let observation = if self.record.state == EnvironmentState::Running {
