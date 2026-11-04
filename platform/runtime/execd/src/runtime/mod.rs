@@ -491,14 +491,27 @@ pub(crate) fn log_error(args: std::fmt::Arguments<'_>) {
     log_stderr("ERROR", args);
 }
 
+/// Execd logs are written directly to stdout/stderr instead of going through
+/// the `tracing` fmt layer, so the shared log writer cannot annotate them.
+/// Append the active span identifiers here to keep every log emitted while a
+/// request span is polled correlated with its trace.
+fn trace_suffix() -> String {
+    let (trace_id, span_id) = adx_observability::trace::log_context();
+    if trace_id.is_empty() {
+        String::new()
+    } else {
+        format!(" trace_id={trace_id} span_id={span_id}")
+    }
+}
+
 fn log_stdout(level: &str, args: std::fmt::Arguments<'_>) {
     let ts = format_local_timestamp();
-    println!("[{ts} {level}] {args}");
+    println!("[{ts} {level}] {args}{}", trace_suffix());
 }
 
 fn log_stderr(level: &str, args: std::fmt::Arguments<'_>) {
     let ts = format_local_timestamp();
-    eprintln!("[{ts} {level}] {args}");
+    eprintln!("[{ts} {level}] {args}{}", trace_suffix());
 }
 
 fn format_local_timestamp() -> String {

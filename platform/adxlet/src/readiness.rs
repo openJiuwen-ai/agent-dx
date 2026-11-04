@@ -121,13 +121,17 @@ impl Readiness for ExecdReadiness {
         }
     }
     async fn wait_ready(&self, record: &EnvironmentRecord) -> Result<()> {
-        let ready_timeout = if record.spec.execution.init_timeout_seconds > 0 {
+        // Execd enforces the probe deadline from `init_timeout_seconds`. Wait a
+        // little longer here so the terminal probe failure notification wins the
+        // race; otherwise this side reports a retryable DeadlineExceeded first.
+        let base_timeout = if record.spec.execution.init_timeout_seconds > 0 {
             Duration::from_secs(record.spec.execution.init_timeout_seconds)
         } else {
             self.ready_timeout
         };
+        let ready_timeout = base_timeout + Duration::from_secs(5);
         if self.client.uses_stream() {
-            return tokio::time::timeout(ready_timeout, async {
+            let ready = tokio::time::timeout(ready_timeout, async {
                 let status = self
                     .client
                     .wait_ready_notification(record)
@@ -139,8 +143,11 @@ impl Readiness for ExecdReadiness {
                 }
                 Ok(())
             })
-            .await
-            .map_err(|_| Error::DeadlineExceeded("Execd readiness deadline exceeded".into()))?;
+            .await;
+            return match ready {
+                Ok(result) => result,
+                Err(_) => readiness_timeout(self, record).await,
+            };
         }
         let polling = async {
             loop {
@@ -161,8 +168,24 @@ impl Readiness for ExecdReadiness {
                 tokio::time::sleep(self.poll_interval).await;
             }
         };
-        tokio::time::timeout(ready_timeout, polling)
-            .await
-            .map_err(|_| Error::DeadlineExceeded("Execd readiness deadline exceeded".into()))?
+        match tokio::time::timeout(ready_timeout, polling).await {
+            Ok(result) => result,
+            Err(_) => readiness_timeout(self, record).await,
+        }
+    }
+}
+
+/// After the ready deadline, prefer the terminal probe failure Execd reported
+/// over a generic retryable deadline. This keeps probe failures terminal even
+/// if the notification arrived just after the local timeout fired.
+async fn readiness_timeout(
+    readiness: &ExecdReadiness,
+    record: &EnvironmentRecord,
+) -> Result<()> {
+    match readiness.probe_failure(record).await {
+        Ok(Some(failure)) => Err(Error::ProbeFailed(failure)),
+        _ => Err(Error::DeadlineExceeded(
+            "Execd readiness deadline exceeded".into(),
+        )),
     }
 }

@@ -128,7 +128,7 @@ impl Clients {
         &self,
         request: pb::CreateEnvironmentRequest,
         budget: Duration,
-    ) -> Result<pb::EnvironmentResult, Status> {
+    ) -> Result<(pb::EnvironmentResult, &'static str), Status> {
         let budget = adx_transport::deadline::create_response_timeout(budget);
         if request.expected_assignment.is_none()
             && self.config.create_mode == crate::config::CreateMode::LocalFirst
@@ -136,11 +136,23 @@ impl Clients {
             // and compare eligible nodes across shards before admission.
             && request.spec.as_ref().is_none_or(|spec| spec.snapshot_id.is_none())
         {
-            let node = match request.spec.as_ref() {
-                Some(spec) => self.directory.lock().await.select_for(spec),
-                None => self.directory.lock().await.select(),
-            };
+            let select = trace::Trace::child("apiserver.select_local");
+            select.attribute("environment.id", request.spec.as_ref().map_or_else(String::new, |spec| spec.id.clone()));
+            let node = select
+                .scope_future(async {
+                    match request.spec.as_ref() {
+                        Some(spec) => self.directory.lock().await.select_for(spec),
+                        None => self.directory.lock().await.select(),
+                    }
+                })
+                .await;
+            select.attribute(
+                "result",
+                if node.is_some() { "success" } else { "fail" }.into(),
+            );
             if let Some(node) = node {
+                select.attribute("node.id", node.node_id.clone());
+                drop(select);
                 let mut client = pb::node_service_client::NodeServiceClient::new(
                     self.channel(&node.address).await?,
                 );
@@ -164,8 +176,9 @@ impl Clients {
                 // local miss is forwarded to the central scheduler with the same
                 // identity. A result assigned to another node followed that
                 // central path and is resolved through the authoritative directory.
-                return Ok(result);
+                return Ok((result, "local-first"));
             }
+            drop(select);
         }
         let mut client = pb::coordinator_service_client::CoordinatorServiceClient::new(
             self.coordinator().await?,
@@ -178,6 +191,7 @@ impl Clients {
             client.create_environment(request),
         )
         .await
+        .map(|result| (result, "central"))
     }
     pub async fn nodes(&self) -> Result<Vec<pb::NodeEndpoint>, Status> {
         self.directory
@@ -278,15 +292,24 @@ impl Clients {
         let future = Box::pin(future);
         trace::Trace::child(name)
             .run_result(async {
-                tokio::time::timeout(timeout, future)
-                    .await
-                    .map_err(|_| {
-                        Status::deadline_exceeded(format!(
-                            "{name}: control RPC response deadline exceeded"
-                        ))
-                    })?
-                    .map_err(normalize_rpc_error)
-                    .map(Response::into_inner)
+                let result = match tokio::time::timeout(timeout, future).await {
+                    Ok(result) => result
+                        .map_err(normalize_rpc_error)
+                        .map(Response::into_inner),
+                    Err(_) => Err(Status::deadline_exceeded(format!(
+                        "{name}: control RPC response deadline exceeded"
+                    ))),
+                };
+                match &result {
+                    Ok(_) => trace::attribute("result", "success".into()),
+                    Err(error) => {
+                        trace::attribute("result", "fail".into());
+                        trace::attribute("error.code", i32::from(error.code()).to_string());
+                        trace::attribute("error.message", error.message().to_owned());
+                        trace::error_with(error.message().to_owned());
+                    }
+                }
+                result
             })
             .await
     }
@@ -666,6 +689,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rpc_timeout_span_records_failure_attribution() {
+        let exporter = opentelemetry_sdk::trace::InMemorySpanExporter::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        opentelemetry::global::set_tracer_provider(provider.clone());
+
+        let clients = rpc_test_clients("http://127.0.0.1:1");
+        let error = clients
+            .rpc_with_timeout::<()>(
+                "test.timeout",
+                Duration::from_millis(20),
+                std::future::pending::<Result<Response<()>, Status>>(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), Code::DeadlineExceeded);
+        assert!(error.message().contains("control RPC response deadline exceeded"));
+
+        provider.force_flush().unwrap();
+        let spans = exporter.get_finished_spans().unwrap();
+        let span = spans
+            .iter()
+            .find(|span| span.name == "test.timeout")
+            .expect("timeout span must be exported");
+        assert!(span.attributes.iter().any(|attribute| {
+            attribute.key.as_str() == "result" && attribute.value.to_string() == "fail"
+        }));
+        assert!(span.attributes.iter().any(|attribute| {
+            attribute.key.as_str() == "error.code"
+                && attribute.value.to_string() == i32::from(Code::DeadlineExceeded).to_string()
+        }));
+        assert!(span.attributes.iter().any(|attribute| {
+            attribute.key.as_str() == "error.message"
+                && attribute.value.to_string().contains("deadline exceeded")
+        }));
+        assert!(matches!(
+            span.status,
+            opentelemetry::trace::Status::Error { .. }
+        ));
+        provider.shutdown().unwrap();
+    }
+
+    #[tokio::test]
     async fn disconnected_node_connection_is_retryable_unavailable() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());
@@ -745,7 +812,7 @@ mod tests {
             newly_created: false,
             record: owned("capsule", "tenant").record,
             durability: pb::Durability::Published as i32,
-        };
+         ..Default::default()};
 
         let owner = local_owner(&node, &result).unwrap().unwrap();
 
@@ -766,7 +833,7 @@ mod tests {
             newly_created: false,
             record: owned("capsule", "tenant").record,
             durability: pb::Durability::Published as i32,
-        };
+         ..Default::default()};
 
         assert!(local_owner(&node, &result).unwrap().is_none());
     }
@@ -783,7 +850,7 @@ mod tests {
             newly_created: false,
             record: owned("capsule", "tenant").record,
             durability: pb::Durability::Journaled as i32,
-        };
+         ..Default::default()};
 
         assert!(local_owner(&node, &result).unwrap().is_none());
     }

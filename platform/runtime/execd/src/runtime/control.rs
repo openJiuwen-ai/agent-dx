@@ -421,9 +421,9 @@ impl Controller {
                 let controller = self.clone();
                 let preparation_operation = operation_id.clone();
                 // Accepted preparation survives cancellation of either transport.
-                tokio::spawn(async move {
+                tokio::spawn(adx_observability::trace::with_current_context(async move {
                     controller.prepare_guest(preparation_operation).await;
-                });
+                }));
             }
         }
         loop {
@@ -520,9 +520,9 @@ impl Controller {
             state.reader_running = true;
         }
         let controller = self.clone();
-        tokio::spawn(async move {
+        tokio::spawn(adx_observability::trace::with_current_context(async move {
             controller.read_handoff(reader, operation_id).await;
-        });
+        }));
     }
     fn fail_preparation(&self, error: String, phase: RuntimePhase) {
         if let Ok(mut state) = self.state.lock() {
@@ -639,11 +639,11 @@ impl Controller {
         let operation_id = operation_id.to_owned();
         let identity = identity.clone();
         // Own the rollback independently of the HTTP/stream request lifetime.
-        tokio::spawn(async move {
+        tokio::spawn(adx_observability::trace::with_current_context(async move {
             controller
                 .abort_guest(&operation_id, &identity, revision)
                 .await
-        })
+        }))
         .await
         .map_err(|error| Error::Unavailable(error.to_string()))?
     }

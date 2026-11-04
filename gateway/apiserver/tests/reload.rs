@@ -108,7 +108,7 @@ service_impl!(pb::node_service_server::NodeService, {
             newly_created: false,
             record: Some(record.clone()),
             durability: pb::Durability::Published as i32,
-        };
+         ..Default::default()};
         if !replay {
             state.executions += 1;
         }
@@ -122,7 +122,7 @@ service_impl!(pb::node_service_server::NodeService, {
             newly_created: false,
             record: Some(record),
             durability: pb::Durability::Published as i32,
-        }))
+         ..Default::default()}))
     }
 }, [
     get_environment_control(NodeGetEnvironmentControlRequest) -> EnvironmentControlRecord,
