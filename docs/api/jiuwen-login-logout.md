@@ -6,7 +6,7 @@
 
 1. 客户端通过华为 Account Kit 获取一次性授权码，或从当前 AGC Auth 用户获取 access token。授权包含 `openid profile` 时，后端可从已验签 Account Kit ID Token 的 `display_name` 读取华为昵称；仅授权 `openid` 的用户仍可登录。
 2. 客户端把凭据提交给对应入口：`POST /api/v1/auth/huawei/login` 兑换 Account Kit 授权码；`POST /api/v1/auth/agc/login` 验证 AGC 用户 token。两者都建立 ADX 业务会话并返回相同格式的 Bearer token。
-3. 客户端在 `/ws`、可选的透明入口 `/orbit/ws`、文件上传下载和额度查询等业务请求中发送 `Authorization: Bearer <business-token>`。Ingress 根据会话确定用户身份。通用 `/agent` 接口仍使用租户 API Key，业务会话不能授权它。
+3. 客户端在 `/ws`、可选的透明入口 `/orbit/ws`、`/digitalmate/ws`、文件上传下载和额度查询等业务请求中发送 `Authorization: Bearer <business-token>`。Ingress 根据会话确定用户身份。通用 `/agent` 接口仍使用租户 API Key，业务会话不能授权它。
 4. 用户退出时调用 `POST /api/v1/auth/logout`，撤销当前 token，并清除客户端保存的 token。
 
 ADX 只接收客户端已经获取的 Account Kit 授权码或 AGC 用户 access token；不提供原 jiuwenswarm 的 `/api/v1/auth/authorize`、`/api/v1/auth/callback`、`/api/v1/auth/claim` 浏览器授权流程，也不通过 Cookie 返回业务会话。
@@ -167,9 +167,9 @@ curl -i 'https://<gateway-host>/api/v1/auth/quota' \
 
 ## 透明 WebSocket
 
-`ADX_JIUWEN_CONFIG` 的顶层配置了 `orbit` 块时可连接 `wss://<gateway-host>/orbit/ws`，握手携带相同的 `Authorization: Bearer <business-token>`。绑定只根据网关固定 tenant、已验证 user_id 和服务端固定模板/版本确定；同用户重连复用，不同用户隔离。不从客户端查询参数选择 Binding，也不返回 Binding ID 响应头。
+`ADX_JIUWEN_CONFIG` 的顶层配置了 `orbit` 块时可连接 `wss://<gateway-host>/orbit/ws`，配置了独立 `digitalmate` 块时可连接 `wss://<gateway-host>/digitalmate/ws`；两者复用同一透明转发实现，各自选择固定目标和用户绑定，握手携带相同的 `Authorization: Bearer <business-token>`。绑定只根据网关固定 tenant、已验证 user_id 和服务端固定模板/版本确定；同用户重连复用，不同用户隔离。不从客户端查询参数或 `X-ADX-Binding-Id` Header 选择 Binding，也不返回 Binding ID 响应头。
 
-目标模板、版本、后端路径和端口均由服务端固定，不能由客户端改选。入口只替换配置的后端路径，原样保留 query，包括 token、authorization 等应用参数；这些参数不用于网关鉴权或选路，不额外限制 query 长度。入口复用共享 Gateway Upgrade 和双向字节转发，保留业务 WebSocket 帧和关闭语义；不使用原 `/ws` 的 Jiuwen 协议转换。原 `/ws` 的模板、Binding ID 和工作区保持原规则。首次缺少绑定时，与 Jiuwen 共用模型参数和工作区参数生成逻辑；`workspace` 由 `[tenant, Orbit模板名, user_id]` 确定，模板通过 `${workspace}` 挂载用户目录。非 root 镜像可通过模板挂载的 `create_if_missing: true` 和 `create_options` 声明新目录的 UID/GID/mode；Orbit 示例使用 10001/10001/0700，已有目录不变。该能力需要升级 adxlet，尚未在测试环境部署。详细配置和转发规则见 [透明入口契约](../../gateway/README.md#transparent-business-websocket) 与 [完整配置示例](../../gateway/examples/digitalmategateway.json)。
+目标模板、版本、后端路径和端口均由服务端固定，不能由客户端改选。入口只替换配置的后端路径，原样保留 query，包括 token、authorization 等应用参数；这些参数不用于网关鉴权或选路，不额外限制 query 长度。入口复用共享 Gateway Upgrade 和双向字节转发，保留业务 WebSocket 帧和关闭语义；不使用原 `/ws` 的 Jiuwen 协议转换。原 `/ws` 的模板、Binding ID 和工作区保持原规则。首次缺少绑定时，与 Jiuwen 共用模型参数和工作区参数生成逻辑；`workspace` 由 `[tenant, 所选应用模板名, user_id]` 确定，模板通过 `${workspace}` 挂载用户目录。非 root 镜像可通过模板挂载的 `create_if_missing: true` 和 `create_options` 声明新目录的 UID/GID/mode；Orbit 示例使用 10001/10001/0700，已有目录不变。该能力需要升级 adxlet，尚未在测试环境部署。详细配置和转发规则见 [透明入口契约](../../gateway/README.md#transparent-business-websocket) 与 [完整配置示例](../../gateway/examples/digitalmategateway.json)。
 
 Jiuwen 与 Orbit 使用网关顶层固定 tenant，并共用同一份账号配置和登录会话，各自配置目标参数与请求期限。业务及共享账号入口不按 Host 或 Origin 限制准入，域名和路径的访问范围由部署层控制。透明入口保留原始 Host 和 Origin，由后端应用执行自己的 Origin 校验；后端连接地址及端口仍由服务端固定配置。该划分不增加用户级或应用级会话权限模型。
 

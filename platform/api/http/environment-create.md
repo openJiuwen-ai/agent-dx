@@ -26,3 +26,39 @@ no longer identifies an earlier creation. An existing Environment ID still
 reuses its current result; if the earlier Environment was deleted, a request
 after the replay window can create a new Environment. Receipt expiry does not
 delete an Environment or release its resources.
+
+Reusable snapshot restores inherit scheduling reservations and execution limits
+independently. An omitted or zero CPU, memory or writable-storage limit inherits
+the saved limit; it must not become the smaller scheduling request. Explicit
+positive limits remain subject to runtime compatibility and request validation.
+Fresh creation retains the existing zero-limit behavior of following its request.
+
+`inheritEntrypoint=true` is a fresh-create option, not a snapshot override.
+Combining it with `snapshotId` is rejected with HTTP 400, matching the native
+Python SDK. For snapshot restores, omit it or supply `false`: neither disables
+the captured image-process metadata. The Coordinator inherits the saved flag
+and required rootfs metadata so Execd resumes the original processes without
+starting the entrypoint again. Execution-limit overrides above do not permit
+changing this captured process geometry.
+
+Internal normalized requests may already carry the inherited flag. A `true`
+flag must match a source snapshot with the flag enabled; enabling it for a
+snapshot whose flag is `false` is rejected. A `false` protobuf value is treated
+as unspecified during inheritance because that field has no presence bit.
+
+Snapshot rootfs and workload probes are captured configuration, not restore
+options. Omitted rootfs/readiness/healthcheck fields inherit the source;
+explicit internal values must match it (including rootfs `readonly`). A mismatch
+returns InvalidArgument. Normalized internal retries with matching values remain
+valid. This also preserves rootfs geometry for snapshots without an inherited
+entrypoint. Public SDK callers omit these fields when creating from a snapshot.
+
+Restoring does not launch the image entrypoint again. The restored Execd probe
+supervisor follows its existing resume protocol: readiness runs for the new
+runtime identity, in-flight checks are cancelled and healthcheck failure counts
+reset. Adxlet retains the captured probe policy so a subsequent terminal failure
+still retires the execution and applies the environment's restart/failover policy.
+The native SDK's `wait_entrypoint()` on snapshot or `from_id()` handles discovers
+entrypoint state from Execd rather than interpreting omitted create flags as
+an explicitly disabled workload. If no managed entrypoint exists, that query
+returns an error; it never starts a new process.

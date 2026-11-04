@@ -8,11 +8,6 @@ pub enum Target {
         name: String,
         template_ref: crate::TemplateRef,
     },
-    Binding {
-        name: String,
-        template_ref: crate::TemplateRef,
-        id: String,
-    },
 }
 impl FromStr for Target {
     type Err = String;
@@ -24,12 +19,7 @@ impl FromStr for Target {
                 name: decode(name)?,
                 template_ref: decode(version)?.parse()?,
             }),
-            ["urn", "adx", "binding", name, version, id] => Ok(Self::Binding {
-                name: decode(name)?,
-                template_ref: decode(version)?.parse()?,
-                id: decode(id)?,
-            }),
-            _ => Err("target must be an ADX instance, template or binding URN".into()),
+            _ => Err("target must be an ADX instance or template URN".into()),
         }
     }
 }
@@ -45,26 +35,14 @@ impl fmt::Display for Target {
                     encode(template_ref.name())
                 )
             }
-            Self::Binding {
-                name,
-                template_ref,
-                id,
-            } => write!(
-                f,
-                "urn:adx:binding:{}:{}:{}",
-                encode(name),
-                encode(template_ref.name()),
-                encode(id)
-            ),
         }
     }
 }
 impl From<&crate::Scope> for Target {
     fn from(scope: &crate::Scope) -> Self {
-        Self::Binding {
+        Self::Template {
             name: scope.template.clone(),
             template_ref: scope.template_ref.clone(),
-            id: scope.binding_id.clone(),
         }
     }
 }
@@ -72,6 +50,7 @@ impl From<&crate::Scope> for Target {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshRoute {
     pub target: Target,
+    pub binding_id: Option<String>,
     pub port: Option<u16>,
     pub trace: Option<String>,
 }
@@ -91,10 +70,18 @@ impl FromStr for SshRoute {
         };
         let mut result = Self {
             target,
+            binding_id: None,
             port: None,
             trace: None,
         };
         for option in options {
+            if let Some(value) = option.strip_prefix("binding_id=") {
+                if result.binding_id.is_some() || matches!(result.target, Target::Instance(_)) {
+                    return Err("binding_id requires a template target and must appear once".into());
+                }
+                result.binding_id = Some(decode_binding_id(value)?);
+                continue;
+            }
             let option = legacy_field(option)?;
             match option.split_once('=') {
                 Some(("port", port)) if result.port.is_none() => {
@@ -121,6 +108,9 @@ impl fmt::Display for SshRoute {
             Target::Instance(id) => write!(f, "yr:instance:{}", encode(id))?,
             target => write!(f, "adx:target:{}", encode(&target.to_string()))?,
         }
+        if let Some(id) = &self.binding_id {
+            write!(f, ":binding_id={}", encode(id))?;
+        }
         if let Some(port) = self.port {
             write!(f, ":port={port}")?;
         }
@@ -130,6 +120,30 @@ impl fmt::Display for SshRoute {
         Ok(())
     }
 }
+/// HTTP/WS instance selector; independent of the template target URN.
+pub const BINDING_ID_HEADER: &str = "x-adx-binding-id";
+
+/// Encodes an ID for HTTP headers and SSH route options.
+/// Returns an error for an empty, oversized or control-character-containing ID.
+pub fn encode_binding_id(id: &str) -> Result<String, String> {
+    crate::identifier(id, "binding_id")?;
+    Ok(encode(id))
+}
+
+/// Decodes one percent-encoded UTF-8 ID, preserving literal '+' and '%' identities.
+/// Rejects malformed escapes, invalid IDs and unescaped whitespace or commas.
+pub fn decode_binding_id(value: &str) -> Result<String, String> {
+    if value.len() > crate::limits::IDENTIFIER_BYTES * 3
+        || !value.is_ascii()
+        || value.bytes().any(|b| b.is_ascii_whitespace() || b == b',')
+    {
+        return Err("binding_id must be a single percent-encoded identifier".into());
+    }
+    let id = decode_bytes(value)?;
+    crate::identifier(&id, "binding_id")?;
+    Ok(id)
+}
+
 fn legacy_field(value: &str) -> Result<String, String> {
     let decoded = decode(value)?;
     if decoded.len() > 256 {

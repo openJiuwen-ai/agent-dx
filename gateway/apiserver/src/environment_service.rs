@@ -228,36 +228,63 @@ impl EnvironmentService {
     ) -> Result<Value, Status> {
         let trace = adx_observability::trace::Trace::child("environment.create");
         trace.attribute("environment.id", spec.id.clone());
-        trace.attribute("environment.create.outcome", "cancelled".into());
-        trace
-            .run_result(async {
-                let environment_id = spec.id.clone();
-                let mut attempt = self.creation_metrics.attempt();
-                let started = Instant::now();
-                let result = self
-                    .create_inner(spec, input, request_id, caller, started)
-                    .await;
-                attempt.finish(&result);
-                adx_observability::trace::attribute(
-                    "environment.create.outcome",
-                    attempt.outcome().into(),
-                );
-                adx_observability::info!(
-                    event = "environment_create_completed",
-                    request_id,
-                    environment_id,
-                    duration_ms = attempt.elapsed().as_secs_f64() * 1_000.0,
-                    outcome = attempt.outcome(),
-                    succeeded = result.is_ok(),
-                    status_code = result
-                        .as_ref()
-                        .err()
-                        .map_or("OK", |error| error.code().description()),
-                    "Environment create completed"
-                );
-                result
-            })
-            .await
+        // Single writer for the terminal outcome: `finish` records the actual
+        // value, while the guard records "cancelled" if this future is dropped
+        // before completion. The OTel SDK appends duplicate keys, so seeding a
+        // fallback attribute and overwriting it later is not an option.
+        let mut outcome_guard = trace.attribute_guard("environment.create.outcome", "cancelled");
+        let tenant_id = caller.tenant_id.clone();
+        let environment_id = spec.id.clone();
+        let mut attempt = self.creation_metrics.attempt();
+        let started = Instant::now();
+        let result = trace
+            .scope_result(self.create_inner(spec, input, request_id, caller, started))
+            .await;
+        attempt.finish(&result);
+        outcome_guard.finish(attempt.outcome());
+        trace.attribute("user.id", tenant_id);
+        match &result {
+            Ok(value) => {
+                trace.attribute("result", "success".into());
+                if let Some(id) = value.get("environmentId").and_then(Value::as_str) {
+                    trace.attribute("instance_id", id.to_owned());
+                }
+                if let Some(newly) = value.get("newlyCreated").and_then(Value::as_bool) {
+                    trace.attribute("newly_created", newly.to_string());
+                }
+            }
+            Err(error) => {
+                trace.attribute("result", "fail".into());
+                trace.attribute("error.code", i32::from(error.code()).to_string());
+                trace.attribute("error.message", error.message().to_owned());
+                // Sets Error status and records the bounded `exception` event;
+                // the terminal attributes above stay unchanged.
+                trace.record_error("create", error.message().to_owned());
+                trace.scope(|| write_retry_status_attributes(error));
+            }
+        }
+        // Emit the completion log under the `environment.create` span. This
+        // keeps the terminal log attributed to the create span even when the
+        // caller (e.g. the activator) has no outer request span.
+        let duration_ms = attempt.elapsed().as_secs_f64() * 1_000.0;
+        let outcome = attempt.outcome();
+        let status_code = result
+            .as_ref()
+            .err()
+            .map_or("OK", |error| error.code().description());
+        trace.scope(|| {
+            adx_observability::info!(
+                event = "environment_create_completed",
+                request_id,
+                environment_id = %environment_id,
+                duration_ms,
+                outcome,
+                succeeded = result.is_ok(),
+                status_code,
+                "Environment create completed"
+            );
+        });
+        result
     }
 
     async fn create_inner(
@@ -401,6 +428,7 @@ impl EnvironmentService {
                             | pb::EnvironmentState::Running)
                     )
                 {
+                    write_create_target(&record, "replay");
                     return existing_running_response(spec, input, request_id, &record);
                 }
                 let assignment = record
@@ -419,7 +447,7 @@ impl EnvironmentService {
         })?;
         // The RPC future is large in debug builds; keep it off the nested
         // embedded HTTP/Activator polling stack while preserving cancellation.
-        let result = Box::pin(self.clients.create_environment(
+        let (result, source) = Box::pin(self.clients.create_environment(
             pb::CreateEnvironmentRequest {
                 request_id: request_id.to_owned(),
                 spec: Some(spec.clone()),
@@ -435,10 +463,14 @@ impl EnvironmentService {
         authorize(caller, result.record.as_ref())?;
         let record = result
             .record
+            .clone()
             .ok_or_else(|| Status::unavailable("create returned no environment record"))?;
         if result.durability != pb::Durability::Published as i32 {
             return Err(Status::unavailable("create is not durably confirmed"));
         }
+        let source = if retry_pending { "replay" } else { source };
+        write_create_target(&record, source);
+        write_retry_result_attributes(&result);
         let mut response = existing_running_response(spec, input, request_id, &record)?;
         // This bit comes from the node's creation result, never requestId echo
         // or a pre-create existence query. Cached retries retain the same bit.
@@ -549,6 +581,55 @@ fn existing_running_response(
         });
     }
     Ok(response)
+}
+
+/// Records which node owns the created environment and how the request was
+/// routed. Each key is written once per create span.
+fn write_create_target(record: &pb::EnvironmentRecord, source: &str) {
+    if let Some(assignment) = &record.assignment {
+        adx_observability::trace::attribute("node", assignment.node_id.clone());
+    }
+    adx_observability::trace::attribute("source", source.to_owned());
+}
+
+fn write_retry_result_attributes(result: &pb::EnvironmentResult) {
+    adx_observability::trace::attribute("schedule.attempts", result.create_attempts.to_string());
+    adx_observability::trace::attribute("retry.count", result.retry_count.to_string());
+    if !result.retry_first_error_code.is_empty() {
+        adx_observability::trace::attribute(
+            "retry.first_error_code",
+            result.retry_first_error_code.clone(),
+        );
+    }
+    if !result.retry_first_error_message.is_empty() {
+        adx_observability::trace::attribute(
+            "retry.first_error_message",
+            result.retry_first_error_message.clone(),
+        );
+    }
+}
+
+fn write_retry_status_attributes(status: &Status) {
+    let value = |key: &str| {
+        status
+            .metadata()
+            .get(key)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    if let Some(value) = value("adx-create-attempts") {
+        adx_observability::trace::attribute("schedule.attempts", value);
+    }
+    if let Some(value) = value("adx-retry-count") {
+        adx_observability::trace::attribute("retry.count", value);
+    }
+    if let Some(value) = value("adx-retry-first-error-code") {
+        adx_observability::trace::attribute("retry.first_error_code", value);
+    }
+    if let Some(value) = value("adx-retry-first-error-message") {
+        adx_observability::trace::attribute("retry.first_error_message", value);
+    }
 }
 
 fn owner_covers_create(

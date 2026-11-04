@@ -139,6 +139,7 @@ fn response(result: crate::OperationResult) -> Result<Response<pb::EnvironmentRe
             Durability::Published => pb::Durability::Published,
             Durability::Journaled => pb::Durability::Journaled,
         } as i32,
+        ..Default::default()
     }))
 }
 #[tonic::async_trait]
@@ -274,6 +275,15 @@ impl pb::node_service_server::NodeService for NodeRpc {
         request: Request<pb::LocalEnvironmentCreateRequest>,
     ) -> std::result::Result<Response<pb::EnvironmentResult>, Status> {
         let trace = adx_observability::trace::Trace::rpc("node.create_local_environment", &request);
+        if let Some(environment_id) = request
+            .get_ref()
+            .create
+            .as_ref()
+            .and_then(|create| create.spec.as_ref())
+            .map(|spec| spec.id.clone())
+        {
+            trace.attribute("environment.id", environment_id);
+        }
         if self.peers.authenticate(&request)? != Principal::ApiServer {
             return Err(Status::permission_denied("API Server required"));
         }
@@ -296,9 +306,25 @@ impl pb::node_service_server::NodeService for NodeRpc {
             adx_transport::deadline::Deadline::from_unix_millis(create.create_deadline_unix_millis)?
         };
         create.create_deadline_unix_millis = deadline.unix_millis();
-        tokio::spawn(
-            trace.run(async move { service.create_local(request, deadline.instant()).await }),
-        )
+        tokio::spawn(trace.run_result(async move {
+            let result = service.create_local(request, deadline.instant()).await;
+            match &result {
+                Ok(_) => adx_observability::trace::attribute("result", "success".into()),
+                Err(error) => {
+                    adx_observability::trace::attribute("result", "fail".into());
+                    adx_observability::trace::attribute(
+                        "error.code",
+                        i32::from(error.code()).to_string(),
+                    );
+                    adx_observability::trace::attribute(
+                        "error.message",
+                        error.message().to_owned(),
+                    );
+                    adx_observability::trace::error_with(error.message().to_owned());
+                }
+            }
+            result
+        }))
         .await
         .map_err(|_| Status::internal("local creation task failed"))?
     }
@@ -469,6 +495,9 @@ impl pb::node_service_server::NodeService for NodeRpc {
         request: Request<pb::StartAssignedEnvironmentRequest>,
     ) -> std::result::Result<Response<pb::EnvironmentResult>, Status> {
         let trace = adx_observability::trace::Trace::rpc("node.create_environment", &request);
+        if let Some(environment_id) = request.get_ref().spec.as_ref().map(|spec| spec.id.clone()) {
+            trace.attribute("environment.id", environment_id);
+        }
         trace
             .run_result(async {
                 if self.peers.authenticate(&request)? != Principal::Coordinator {
@@ -741,7 +770,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     let fence =
                         fence.ok_or_else(|| Status::invalid_argument("deletion fence required"))?;
                     let manager = self.manager.clone();
-                    tokio::spawn(async move {
+                    tokio::spawn(adx_observability::trace::with_current_context(async move {
                         let _lifecycle_guard = gate;
                         let result = match fence {
                             RetiredDeleteFence::Revision(revision) => {
@@ -753,7 +782,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
                         }?;
                         manager.release_published_controller_with_fence(&result, Some(fence));
                         Ok::<_, Error>(result)
-                    })
+                    }))
                     .await
                     .map_err(|_| Status::internal("Coordinator deletion task failed"))?
                 } else {
@@ -915,11 +944,20 @@ impl CoordinatorStateSink {
         let response = tokio::time::timeout(self.timeout, client.commit_environment(request))
             .await
             .map_err(|_| Error::Unavailable("state commit RPC timed out".into()))?
-            .map_err(|status| match status.code() {
-                tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => {
-                    Error::Invalid("Coordinator rejected node credentials".into())
+            .map_err(|status| {
+                adx_observability::warn!(
+                    environment_id = %record.spec.id,
+                    expected_revision = record.revision,
+                    grpc_code = ?status.code(),
+                    reason = status.message(),
+                    "Coordinator state commit rejected"
+                );
+                match status.code() {
+                    tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => {
+                        Error::Invalid("Coordinator rejected node credentials".into())
+                    }
+                    _ => dependency_status(status),
                 }
-                _ => dependency_status(status),
             })?
             .into_inner();
         let accepted: EnvironmentRecord = response
@@ -927,6 +965,14 @@ impl CoordinatorStateSink {
             .ok_or_else(|| Error::Unavailable("commit response missing record".into()))?
             .try_into()?;
         if accepted != *record {
+            adx_observability::warn!(
+                environment_id = %record.spec.id,
+                expected_revision = record.revision,
+                accepted_revision = accepted.revision,
+                expected_artifacts = record.execution_artifacts.len(),
+                accepted_artifacts = accepted.execution_artifacts.len(),
+                "Coordinator commit response differs from submitted record"
+            );
             return Err(Error::Conflict);
         }
         Ok(Durability::Published)
@@ -959,6 +1005,8 @@ impl crate::checkpoint::SnapshotCatalog for CoordinatorStateSink {
         &self,
         snapshot: adx_core::snapshots::Snapshot,
     ) -> Result<adx_core::snapshots::Snapshot> {
+        let snapshot_id = snapshot.id.clone();
+        let source_environment_id = snapshot.template.id.clone();
         let mut client = self
             .snapshots
             .read()
@@ -973,7 +1021,16 @@ impl crate::checkpoint::SnapshotCatalog for CoordinatorStateSink {
         tokio::time::timeout(self.timeout, client.publish_snapshot(request))
             .await
             .map_err(|_| Error::Unavailable("snapshot publication timed out".into()))?
-            .map_err(dependency_status)?
+            .map_err(|status| {
+                adx_observability::warn!(
+                    snapshot_id = %snapshot_id,
+                    environment_id = %source_environment_id,
+                    grpc_code = ?status.code(),
+                    reason = status.message(),
+                    "Coordinator snapshot publication rejected"
+                );
+                dependency_status(status)
+            })?
             .into_inner()
             .try_into()
     }

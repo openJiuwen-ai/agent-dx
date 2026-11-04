@@ -141,7 +141,7 @@ ADX 当前入口认证获得的是租户身份，不等于终端用户 `user_id`
 
 Agent 层业务对象已统一称为 `AgentBinding`，完整业务身份为 `(tenant, template, version, binding_id)`，保存目标 `environment_id`、绑定 generation 和删除意图。`environment_id` 就是 Platform Environment ID；只有 Platform Environment 拥有运行状态、调度、暂停恢复和 Runtime 替换语义。AgentBinding 是业务地址到该环境的映射，允许先提交绑定身份再发起平台创建，并不是另一套运行环境或平台状态机。
 
-代码中的 `Scope.binding_id` 是业务绑定 ID，不是 Platform Environment ID。Agent 的类型、方法、API 路径、target URN、请求响应及持久化字段已统一到 AgentBinding 命名：业务字段使用 `binding_id`，管理路径改为 `/api/agent/v2/templates/{name}/versions/{version}/bindings/{binding_id}`（列表路径省略最后一段），目标 URN 使用 `urn:adx:binding:{name}:{version}:{binding_id}`。同步修改调用方、测试、文档及开发约定；不保留旧名称的兼容别名、序列化映射或存量数据迁移。此命名变更已实现并通过聚焦测试；Platform 的 Environment 类型保持不变。
+代码中的 `Scope.binding_id` 是业务绑定 ID，不是 Platform Environment ID。Agent 的类型、方法、API 路径、target URN、请求响应及持久化字段已统一到 AgentBinding 命名：业务字段使用 `binding_id`，管理路径改为 `/api/agent/v2/templates/{name}/versions/{version}/bindings/{binding_id}`（列表路径省略最后一段），目标 URN 使用 `urn:adx:template:{name}:{reference}`，Binding ID 通过 `X-ADX-Binding-Id` Header（UTF-8 百分号编码）独立传递。同步修改调用方、测试、文档及开发约定；不保留旧名称的兼容别名、序列化映射或存量数据迁移。此命名变更已实现并通过聚焦测试；Platform 的 Environment 类型保持不变。
 
 同一业务 binding_id 在不同模板版本下形成不同 AgentBinding，分别绑定不同 Platform Environment。绑定删除后重建仍使用新的 generation 和 Environment ID，保留多副本创建幂等、未知结果沿用原身份、旧请求不能影响新绑定的约束。DigitalMateGateway 模块预置模板版本，临时代行 App 的版本选择；修改预置版本属于业务版本切换，不是平台自动升级。后续由 App 选择并由服务端校验版本，数据迁移、兼容性和回滚由业务负责。本轮保留现有身份与生命周期行为，不实现同一个 Environment 跨版本升级。
 
@@ -195,7 +195,7 @@ token 输入上限为 16 KiB，密钥及登记内容各为 64 KiB。显式密钥
 
 | 能力 | 当前处理 |
 | --- | --- |
-| 业务启动与就绪检查、路由可达保证 | Agent 模板把 `readiness_probe` 透传到 Platform；Jiuwen SFS 模板以 3 秒初始延迟、3 秒周期和 2 秒单次超时探测 TCP 18092，30 秒初始化期限内成功后才发布 Running 和绑定路由。AgentServer 在内部 Runtime warming 前即监听，因此该配置只保证前端端口可连接；业务请求仍使用现有 warming、失败及超时事件，周期 healthcheck 尚未接入模板 |
+| 业务启动与就绪检查、路由可达保证 | Agent 模板把 `readiness_probe` 透传到 Platform；Jiuwen SFS 模板以 0 秒初始延迟、3 秒周期和 2 秒单次超时探测 TCP 18092，30 秒初始化期限内成功后才发布 Running 和绑定路由。AgentServer 在内部 Runtime warming 前即监听，因此该配置只保证前端端口可连接；业务请求仍使用现有 warming、失败及超时事件，周期 healthcheck 尚未接入模板 |
 | 部署侧 runtime profile 与启动配置 | Platform 已有能力；本轮接通 Agent/Gateway 创建映射，覆盖独立及嵌入式 Activator，验证业务镜像和进程配置；仅额外包含用户授权的 Execd 启动锁修复，超出现有契约的能力另列待完善 |
 | 挂载、数据持久化与恢复 | 明确历史、文件、资产登记和密钥的位置及实际保留范围；稳定 ID 不代表 Environment 重建后数据可恢复，不承诺尚未验证的恢复能力 |
 | verified 底层读取增强 | 本轮不改 Execd 文件读取；保留用户归属、token 与资产登记校验，接受并明确记录符号链接及检查/打开竞争差异，不以此单独阻塞下载功能验收 |
