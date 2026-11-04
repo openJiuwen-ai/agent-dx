@@ -217,6 +217,9 @@ During a node snapshot attempt, a locally Journaled source state is republished
 until Coordinator accepts it or the attempt's checkpoint budget expires. This
 wait keeps the same record and revision and does not repeat backend capture.
 The backend receives the remaining budget, rather than a fresh full timeout.
+The Coordinator catalog-publication RPC receives that remaining budget too;
+the ordinary short control-RPC timeout does not truncate the snapshot attempt.
+This does not replay an uncertain publication or extend the original deadline.
 Publication conflicts and other errors still fail immediately. If publication
 times out after capture, local pending metadata and artifact references remain
 available for reconciliation; the SDK does not report a successful Snapshot.
