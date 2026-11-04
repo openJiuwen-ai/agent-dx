@@ -303,6 +303,7 @@ async fn terminal_case(native: bool) {
                 name: "demo".into(),
                 template_ref: adx_agent_core::TemplateRef::Version("1".into()),
             },
+            binding_id: None,
             port: None,
             trace: None,
         };
@@ -356,14 +357,13 @@ async fn terminal_case(native: bool) {
             .unwrap();
         let urn = output
             .lines()
-            .find_map(|v| v.strip_prefix("AgentBinding URN: "))
+            .find_map(|v| v.strip_prefix("Target: "))
             .unwrap();
         assert_eq!(
             urn.parse::<Target>().unwrap(),
-            Target::Binding {
+            Target::Template {
                 name: "demo".into(),
                 template_ref: adx_agent_core::TemplateRef::Version("1".into()),
-                id: id.into()
             }
         );
         let binding = state
@@ -408,6 +408,7 @@ async fn terminal_case(native: bool) {
         .unwrap();
         let route = SshRoute {
             target: urn.parse().unwrap(),
+            binding_id: Some(id.into()),
             port: None,
             trace: None,
         };
@@ -576,10 +577,7 @@ async fn terminal_case(native: bool) {
             );
             let text = std::str::from_utf8(&output.stdout).unwrap();
             assert!(text.contains("AgentBinding ID: "), "{text}");
-            assert!(
-                text.contains("AgentBinding URN: urn:adx:binding:demo:1:"),
-                "{text}"
-            );
+            assert!(text.contains("Target: urn:adx:template:demo:1"), "{text}");
             assert!(text.contains("backend-ready"), "{text}");
         }
     };

@@ -1,5 +1,6 @@
 //! Authenticated Jiuwen business entrypoints. ADX management credentials are separate.
 use super::{
+    application_ws::Application,
     connection::{Connection, ConnectionError},
     download_config::{absolute_directory, DownloadConfig},
     download_http::Download,
@@ -44,7 +45,8 @@ pub enum WorkspaceIdentity {
 pub struct DigitalMateGatewayConfig {
     pub tenant: String,
     pub jiuwen: JiuwenTarget,
-    pub orbit: Option<super::orbit_ws::OrbitWsConfig>,
+    pub orbit: Option<super::application_ws::ApplicationWsConfig>,
+    pub digitalmate: Option<super::application_ws::ApplicationWsConfig>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -156,8 +158,13 @@ impl DigitalMateGatewayConfig {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
-        if let Some(orbit) = &self.orbit {
-            orbit.validate(&self.tenant)?;
+        for (application, config) in [
+            (Application::Orbit, &self.orbit),
+            (Application::DigitalMate, &self.digitalmate),
+        ] {
+            if let Some(config) = config {
+                config.validate(&self.tenant, application)?;
+            }
         }
         self.scope("validation")?
             .validate()
@@ -228,6 +235,7 @@ impl DigitalMateGatewayApi {
             path,
             "/ws"
                 | "/orbit/ws"
+                | "/digitalmate/ws"
                 | "/file-api/download"
                 | "/file-api/upload"
                 | "/api/v1/auth/huawei/login"
@@ -242,7 +250,12 @@ impl DigitalMateGatewayApi {
         mut request: Request<Incoming>,
         ingress: Arc<Ingress>,
     ) -> Response<ProxyBody> {
-        if request.uri().path() == "/orbit/ws" && self.config.orbit.is_none() {
+        let application = match request.uri().path() {
+            "/orbit/ws" => Some(self.config.orbit.as_ref()),
+            "/digitalmate/ws" => Some(self.config.digitalmate.as_ref()),
+            _ => None,
+        };
+        if matches!(application, Some(None)) {
             return error(StatusCode::NOT_FOUND, "NOT_FOUND");
         }
         if matches!(
@@ -265,13 +278,8 @@ impl DigitalMateGatewayApi {
             Ok(Err(e)) => return auth_error(e),
             _ => return auth_error(accounts::Error::Unavailable),
         };
-        if let Some(orbit) = self
-            .config
-            .orbit
-            .as_ref()
-            .filter(|_| request.uri().path() == "/orbit/ws")
-        {
-            return orbit
+        if let Some(application) = application.flatten() {
+            return application
                 .handle(
                     request,
                     ingress,

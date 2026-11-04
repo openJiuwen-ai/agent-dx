@@ -196,7 +196,7 @@ Rust CLI 的当前管理能力与配置见 [CLI 使用说明](cli/README.md)。H
 
 ## 别名目标态与灰度升级
 
-发布接口接收不含 `version` 的 TemplateDraft，原子分配同租户/模板下递增的数字版本并返回完整 TemplateVersion。版本为规范的正 u64 十进制字符串；`0`、前导零和溢出均拒绝。Alias 名不能为纯数字。通用 template/binding URN 均使用同一 reference 段；不存在自动 latest、版本优先回退查询或另一个 Alias URN 类型。已有字符串版本需通过人工运维转为数字快照和同名 Alias，不自动迁移存储。
+发布接口接收不含 `version` 的 TemplateDraft，原子分配同租户/模板下递增的数字版本并返回完整 TemplateVersion。版本为规范的正 u64 十进制字符串；`0`、前导零和溢出均拒绝。Alias 名不能为纯数字。通用 template URN 使用 reference 段；不存在自动 latest、版本优先回退查询或另一个 Alias URN 类型。已有字符串版本需通过人工运维转为数字快照和同名 Alias，不自动迁移存储。
 
 AliasConfig 保存 `tenant/template/alias/seed/versions`，versions 为 `{version, weight}` 列表。所有版本必须已发布，版本不能重复；weight 为非负 u64 整数，总和须在 1–u64::MAX 内，不要求为 100 或 10000。按 `weight / sum(weights)` 选择稳定的 Binding 分布，不逐请求抽样，也不保证实际请求量精确等于权重。seed 在同一 Alias 生命周期内不可修改，revision 不参与选择；列表重排与同比缩放不会改变分配。
 
@@ -214,26 +214,27 @@ HTTP 使用 `/agent/http[/业务路径]`，WS 使用 `/agent/ws`；受管 WS 可
 
 | 参数 | 路径与认证 |
 | --- | --- |
-| `target=urn:adx:template:<name>:<reference>` | v2 API Key 认证；服务端生成 AgentBinding ID 并激活 |
-| `target=urn:adx:binding:<name>:<reference>:<binding_id>` | v2 API Key 认证；创建或复用指定 AgentBinding，数字 reference 为版本，非数字为 Alias |
+| `target=urn:adx:template:<name>:<reference>` | v2 API Key 认证；数字 reference 为版本，非数字为 Alias |
+| `X-ADX-Binding-Id: <binding_id>` | 可选请求 Header；创建或复用指定 AgentBinding，省略时服务端生成新 ID |
 
-URN 各段按 UTF-8 百分号编码；作为 query 参数时还需要经过 URL query 编码。租户来自认证，不放在 URN 内。受管目标的端口必须匹配 service，只有一个对应协议端口时可省略。
+URN 各段按 UTF-8 百分号编码；作为 query 参数时还需要经过 URL query 编码。Binding ID 独立于 target，不再定义 Binding URN。`X-ADX-Binding-Id` 请求和响应值均按 UTF-8 百分号编码一次，`+` 表示字面加号；空白、逗号、百分号及非 ASCII 字符需编码。解码后 ID 最多 512 字节，不能为空或含控制字符；重复 Header、空值、非法编码返回 400。该 Header 只适用于 template target，不能和 instance target 同用。租户来自认证，不放在 URN 内。受管目标的端口必须匹配 service，只有一个对应协议端口时可省略。
 
 ```sh
 curl --get 'https://gateway.example/agent/http/chat' \
   -H "Authorization: Bearer $ADX_TOKEN" \
+  -H 'X-ADX-Binding-Id: demo' \
   --data-urlencode 'target=urn:adx:template:assistant:1'
 ```
 
-受管 HTTP/SSE、WS 101 和选定身份后的失败响应都带 `X-ADX-AgentBinding-ID` 与 `X-ADX-AgentBinding-URN`；Gateway 覆盖后端同名 Header。ID 通知不代表创建成功。独立的不带 env 请求生成新 ID，同一请求的内部重试复用 ID 和 generation；后续访问应使用返回的 AgentBinding URN。
+受管 HTTP/SSE、WS 101 和选定身份后的失败响应都带 `X-ADX-Binding-Id`；Gateway 覆盖后端同名 Header，并移除后端的 `X-ADX-Binding-Urn`。ID 通知不代表创建成功。独立的不带 Binding Header 请求生成新 ID，同一请求的内部重试复用 ID 和 generation；后续访问使用相同 template target，并原样回传响应中的 Binding Header。
 
-HTTP/WS 入口使用 Platform API Key，要求 TLS。移除公开路径前缀及目标参数后，将业务路径交给 Harness，并移除平台凭据 Header。响应体按流转发，WS 升级后使用现有双向字节通道，不增加业务 envelope。Relay 连接和路由由共享 Gateway 数据面管理。直接按 Environment ID 的数据访问使用原有 `/direct`、CONNECT 等入口。
+HTTP/WS 入口使用 Platform API Key，要求 TLS。移除公开路径前缀及目标参数后，将业务路径交给 Harness，并移除平台凭据及 Binding 路由 Header。响应体按流转发，WS 升级后使用现有双向字节通道，不增加业务 envelope。Relay 连接和路由由共享 Gateway 数据面管理。直接按 Environment ID 的数据访问使用原有 `/direct`、CONNECT 等入口。
 
 ## SSH 交互终端
 
-设置 `ADX_SSH_CONFIG` 后，独立 Ingress 或 API Server 内嵌 Ingress 会启动独立 SSH 监听端口。原实例使用路由用户名 `yr:instance:<id>[:port=<port>][:trace=<id>]`，受管目标使用 `adx:target:<百分号编码的完整URN>[:port=<port>][:trace=<id>]`。两种目标共用 listener，分别检查配置中的公钥授权表；路由用户名不是租户或后端 Linux 用户。
+设置 `ADX_SSH_CONFIG` 后，独立 Ingress 或 API Server 内嵌 Ingress 会启动独立 SSH 监听端口。原实例使用路由用户名 `yr:instance:<id>[:port=<port>][:trace=<id>]`，受管目标使用 `adx:target:<百分号编码的完整template-URN>[:binding_id=<百分号编码的ID>][:port=<port>][:trace=<id>]`。两种目标共用 listener，分别检查配置中的公钥授权表；路由用户名不是租户或后端 Linux 用户。
 
-SSH 首版只提供一个连接一个交互式终端，要求 PTY 和 shell 请求，支持输入输出、窗口调整、退出码与连接关闭。受管 SSH 在鉴权和 PTY/shell 请求完成后调用 Activator resolve；服务校验失败直接拒绝，其他结果在连接后端前通过 stdout 提示选定的 AgentBinding 身份，激活失败也可能提示原身份供重试。提示不表示 Environment 已就绪或后端 SSH 握手成功。省略 env 时当前连接只生成一个 ID；携带返回的 AgentBinding URN 可再次访问。仅认证或打开 channel 不创建资源。inline 直接定位实例，默认端口 22，不调用 Activator，不生成 AgentBinding。
+SSH 首版只提供一个连接一个交互式终端，要求 PTY 和 shell 请求，支持输入输出、窗口调整、退出码与连接关闭。受管 SSH 在鉴权和 PTY/shell 请求完成后调用 Activator resolve；服务校验失败直接拒绝，其他结果在连接后端前通过 stdout 提示选定的 AgentBinding 身份，激活失败也可能提示原身份供重试。提示不表示 Environment 已就绪或后端 SSH 握手成功。省略 `binding_id` 时当前连接只生成一个 ID；终端提示 `AgentBinding ID` 和 template `Target`，重连时使用相同 target 和独立的 `binding_id` 选项。仅认证或打开 channel 不创建资源。inline 直接定位实例，默认端口 22，不调用 Activator，不生成 AgentBinding。
 
 后端复用共享 L4 connector → Relay → Environment sshd；没有新建数据通道或本地目标缓存。使用未修改的 russh 0.63.3，不发送认证 Banner。首版不提供 SSH 远程 exec、SFTP 或端口转发。已有 Environment-ID SSH/CONNECT 转发入口保持原有行为。
 
