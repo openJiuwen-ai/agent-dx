@@ -1400,6 +1400,35 @@ async fn reusable_snapshot_waits_for_journal_publication_without_recapturing() {
 }
 
 #[tokio::test]
+async fn reusable_snapshot_rounds_remaining_capture_budget_to_seconds() {
+    use adxlet::checkpoint::SnapshotRequest;
+    let (temp, backend, _, mut spec, assignment) = fixture();
+    spec.runtime_class = "runsc".into();
+    let (node, _) = snapshot_journal_node(&temp, &backend, spec.resources);
+    let handle = node.environment(spec, assignment).unwrap();
+    let running = handle.create().await.unwrap();
+    handle
+        .snapshot(SnapshotRequest {
+            kind: adx_core::snapshots::SnapshotKind::Regular,
+            operation_id: "snapshot-subsecond-budget".into(),
+            expected_revision: running.record.revision,
+            names: vec![],
+            timeout_seconds: 1,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        backend
+            .workload_checkpoint_timeouts
+            .lock()
+            .unwrap()
+            .as_slice(),
+        &[Duration::from_secs(1)]
+    );
+    handle.delete().await.unwrap();
+}
+
+#[tokio::test]
 async fn reusable_snapshot_publication_wait_keeps_the_original_deadline() {
     use adxlet::checkpoint::SnapshotRequest;
     let (temp, backend, _, mut spec, assignment) = fixture();
@@ -1465,6 +1494,31 @@ async fn reusable_snapshot_does_not_retry_a_publication_conflict() {
     assert_eq!(error, Error::Conflict);
     assert_eq!(backend.rejected_snapshot_records.lock().unwrap().len(), 1);
     assert_eq!(journal.pending().await.unwrap(), 0);
+    assert!(backend.snapshots.lock().unwrap().is_empty());
+    *backend.snapshot_hold_error.lock().unwrap() = None;
+    handle.delete().await.unwrap();
+}
+
+#[tokio::test]
+async fn reusable_snapshot_returns_unconfirmed_publication_failure_without_retry() {
+    use adxlet::checkpoint::SnapshotRequest;
+    let (_temp, backend, node, spec, assignment) = fixture();
+    let handle = node.environment(spec, assignment).unwrap();
+    let running = handle.create().await.unwrap();
+    let failure = Error::Unavailable("local durability not confirmed".into());
+    *backend.snapshot_hold_error.lock().unwrap() = Some(failure.clone());
+    let error = handle
+        .snapshot(SnapshotRequest {
+            kind: adx_core::snapshots::SnapshotKind::Regular,
+            operation_id: "snapshot-no-durability".into(),
+            expected_revision: running.record.revision,
+            names: vec![],
+            timeout_seconds: 2,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error, failure);
+    assert_eq!(backend.rejected_snapshot_records.lock().unwrap().len(), 1);
     assert!(backend.snapshots.lock().unwrap().is_empty());
     *backend.snapshot_hold_error.lock().unwrap() = None;
     handle.delete().await.unwrap();

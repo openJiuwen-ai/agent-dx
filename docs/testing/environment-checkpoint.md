@@ -80,3 +80,9 @@ python build/e2e/firecracker/sdk_checkpoint.py \
 用例检查创建、命令与文件、暂停、恢复后的内存计数器和 PID、二进制文件、删除。可通过 `--restart-command` 指定选定 adxlet 的重启及就绪检查脚本，验证暂停期间重启。进程重启脚本属于部署测试夹具，不通过 SDK 实现。
 
 真实 FC 本地验收与 Kubernetes Buildkite 验收分开记录；组件测试通过不表示后者已通过。
+
+## 可复用快照的发布等待边界
+
+可复用快照与 workload checkpoint 共用后端超时换算：正的剩余预算向上取整到整秒，最少 1 秒；已过期预算不再发起捕获。发布等待仍使用原始截止时间，不因重试重新计时。退避抖动由 Environment ID 与 ownership generation 共同确定，避免同 generation 的环境全部使用同一偏移。
+
+只有 `Durability::Journaled` 明确确认本地持久化后才等待重新发布；`sync()` 的错误（包括提交超时或本地 journal 故障）立即向调用方返回，不把不确定的持久化结果当成 Journaled。同一 Environment 的控制器仍串行处理命令，发布等待会占用该命令处理窗口直到成功、错误或请求截止时间；本改动不提供 DELETE、RunDeadline 或健康检查事件抢占快照操作的能力。需要缩短这段等待时应设置较短的快照超时，而不是绕过所有权校验或重复 capture。

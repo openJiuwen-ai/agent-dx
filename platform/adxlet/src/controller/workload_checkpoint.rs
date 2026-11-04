@@ -378,7 +378,9 @@ pub(super) fn checkpoint_deadline(
     ))
 }
 
-fn remaining_backend_timeout(deadline: Option<tokio::time::Instant>) -> Result<Duration> {
+pub(super) fn remaining_backend_timeout(
+    deadline: Option<tokio::time::Instant>,
+) -> Result<Duration> {
     let Some(deadline) = deadline else {
         return Ok(DEFAULT_BACKEND_CHECKPOINT_TIMEOUT);
     };

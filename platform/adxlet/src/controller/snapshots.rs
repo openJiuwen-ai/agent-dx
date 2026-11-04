@@ -4,13 +4,25 @@ use adx_core::{
     snapshots::{snapshot_id, Snapshot, SnapshotState},
     LifecycleKind,
 };
-use std::time::Duration;
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    time::Duration,
+};
 use tokio::time::Instant;
+
+fn publication_jitter_ms(environment_id: &str, generation: u64) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    environment_id.hash(&mut hasher);
+    generation.hash(&mut hasher);
+    hasher.finish() % 17
+}
 
 impl Controller {
     async fn publish_snapshot_state(&mut self, deadline: Instant) -> Result<OperationResult> {
         let mut delay_ms = 10_u64;
-        let jitter_ms = self.record.assignment.generation % 17;
+        let jitter_ms =
+            publication_jitter_ms(&self.record.spec.id, self.record.assignment.generation);
         loop {
             if Instant::now() >= deadline {
                 return Err(Error::Unavailable(
@@ -139,14 +151,16 @@ impl Controller {
             return Err(error);
         }
         self.capture_preparation = None;
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        let captured = if remaining.is_zero() {
-            Err(Error::Unavailable("snapshot capture budget expired".into()))
-        } else {
-            self.services
-                .runtime
-                .checkpoint_running(&self.record.runtime.id, &staged, remaining)
-                .await
+        // Sandboxd accepts whole seconds. Share the workload-checkpoint
+        // rounding contract so a positive subsecond remainder never becomes 0.
+        let captured = match super::workload_checkpoint::remaining_backend_timeout(Some(deadline)) {
+            Ok(timeout) => {
+                self.services
+                    .runtime
+                    .checkpoint_running(&self.record.runtime.id, &staged, timeout)
+                    .await
+            }
+            Err(error) => Err(error),
         };
         let captured = match captured {
             Ok(()) => {
@@ -258,5 +272,41 @@ impl super::Controller {
             origin: Some(origin),
         });
         self.create().await
+    }
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+
+    #[test]
+    fn publication_jitter_distinguishes_environments_with_the_same_generation() {
+        let values: std::collections::BTreeSet<_> = (0..64)
+            .map(|index| publication_jitter_ms(&format!("environment-{index}"), 1))
+            .collect();
+        assert!(values.len() > 1);
+        assert!(values.iter().all(|value| *value < 17));
+        assert_eq!(
+            publication_jitter_ms("environment-a", 1),
+            publication_jitter_ms("environment-a", 1)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capture_budget_rounds_up_without_reviving_an_expired_deadline() {
+        use super::super::workload_checkpoint::remaining_backend_timeout;
+        let now = Instant::now();
+        assert_eq!(
+            remaining_backend_timeout(Some(now + Duration::from_millis(1))).unwrap(),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            remaining_backend_timeout(Some(now + Duration::from_millis(1500))).unwrap(),
+            Duration::from_secs(2)
+        );
+        assert!(matches!(
+            remaining_backend_timeout(Some(now)),
+            Err(Error::Unavailable(_))
+        ));
     }
 }
