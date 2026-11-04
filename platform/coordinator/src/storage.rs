@@ -1047,7 +1047,7 @@ impl RedisStore {
                 let session = Session {
                     store: self.clone(),
                     epoch: h.epoch,
-                    inspection: Arc::new(Mutex::new(None)),
+                    inspection: Arc::new(inspection::InspectionCache::default()),
                     generations: Arc::new(AtomicU64::new(
                         h.epoch.checked_mul(1_u64 << 32).ok_or(Error::Conflict)?,
                     )),
@@ -1176,7 +1176,7 @@ fn snapshot(raw: &BTreeMap<String, String>) -> Result<StoredSnapshot> {
 pub struct Session {
     store: RedisStore,
     epoch: u64,
-    inspection: Arc<Mutex<Option<inspection::InspectionInventory>>>,
+    inspection: Arc<inspection::InspectionCache>,
     generations: Arc<AtomicU64>,
 }
 impl Session {
