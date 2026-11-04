@@ -269,11 +269,7 @@ impl Trace {
     /// An attribute that is written exactly once: `finish` records the actual
     /// value, while `Drop` records the fallback if the operation is cancelled
     /// or panics before finishing.
-    pub fn attribute_guard(
-        &self,
-        key: &'static str,
-        fallback: &'static str,
-    ) -> AttributeGuard {
+    pub fn attribute_guard(&self, key: &'static str, fallback: &'static str) -> AttributeGuard {
         AttributeGuard {
             context: self.context.clone(),
             key,

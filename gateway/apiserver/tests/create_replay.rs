@@ -2704,9 +2704,10 @@ async fn local_first_create_propagates_trace_into_node_rpc() {
         .iter()
         .find(|span| span.name == "environment.create")
         .expect("total create span missing");
-    assert!(create.attributes.iter().any(|a| {
-        a.key.as_str() == "source" && a.value.to_string() == "local-first"
-    }));
+    assert!(create
+        .attributes
+        .iter()
+        .any(|a| { a.key.as_str() == "source" && a.value.to_string() == "local-first" }));
     let select = spans
         .iter()
         .find(|span| span.name == "apiserver.select_local")

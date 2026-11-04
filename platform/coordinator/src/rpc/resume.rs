@@ -52,7 +52,8 @@ impl CoordinatorRpc {
             newly_created: false,
             record: Some(deleted.try_into().map_err(status)?),
             durability: pb::Durability::Published as i32,
-         ..Default::default()})
+            ..Default::default()
+        })
     }
     pub async fn expire_dormant(&self) -> Result<usize> {
         let mut state = self.0.state.lock().await;

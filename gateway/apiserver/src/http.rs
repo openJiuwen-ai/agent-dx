@@ -1396,7 +1396,9 @@ mod error_contract_tests {
         let status = Status::with_details(
             Code::FailedPrecondition,
             "readiness deadline exceeded",
-            serde_json::to_vec(&failure).expect("probe failure serializes").into(),
+            serde_json::to_vec(&failure)
+                .expect("probe failure serializes")
+                .into(),
         );
         assert_eq!(status_code(&status), 409);
     }

@@ -139,7 +139,8 @@ fn response(result: crate::OperationResult) -> Result<Response<pb::EnvironmentRe
             Durability::Published => pb::Durability::Published,
             Durability::Journaled => pb::Durability::Journaled,
         } as i32,
-     ..Default::default()}))
+        ..Default::default()
+    }))
 }
 #[tonic::async_trait]
 impl pb::node_service_server::NodeService for NodeRpc {
