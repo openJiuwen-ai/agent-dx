@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -26,10 +27,15 @@ def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def assemble(
-    binary_dir, redis, redis_cli, wheel, output, commit, dirty, target, profile,
-    with_afs=False, backend_dir=None, runsc=None
-):
+@dataclass(frozen=True)
+class BuildIdentity:
+    commit: str
+    dirty: bool
+    target: str
+    profile: str
+
+
+def assemble(binary_dir, redis, redis_cli, wheel, output, identity, *, with_afs=False, backend_dir=None, runsc=None):
     if output.exists():
         raise ValueError("output already exists")
     inputs = {f"bin/{name}": binary_dir / name for name in BINARIES}
@@ -62,7 +68,7 @@ def assemble(
     # Native Linux release builder supplies the EROFS payload. Debug/native macOS
     # packages retain binary-only development support.
     runtime_root = binary_dir / "adx-runtime-rootfs.img"
-    if profile == "release" and "linux" in target:
+    if identity.profile == "release" and "linux" in identity.target:
         inputs["runtime/adx-runtime-rootfs.img"] = runtime_root
     elif runtime_root.is_file():
         inputs["runtime/adx-runtime-rootfs.img"] = runtime_root
@@ -85,7 +91,7 @@ def assemble(
     for source in inputs.values():
         if source.is_symlink() or not source.is_file():
             raise ValueError("a required artifact is missing or is a symlink")
-    if not target or profile not in ("debug", "release") or len(commit) != 40:
+    if not identity.target or identity.profile not in ("debug", "release") or len(identity.commit) != 40:
         raise ValueError("build identity required")
     version = subprocess.check_output([str(redis.resolve()), "--version"], text=True)
     if "v=7.2.5 " not in version:
@@ -135,10 +141,10 @@ def assemble(
                 dest.chmod(0o755)
         manifest = {
             "schema_version": 1,
-            "commit": commit,
-            "dirty": dirty,
-            "target": target,
-            "profile": profile,
+            "commit": identity.commit,
+            "dirty": identity.dirty,
+            "target": identity.target,
+            "profile": identity.profile,
             "redis_version": "7.2.5",
             "files": {name: sha(stage / name) for name in sorted(inputs)},
         }
@@ -190,13 +196,10 @@ def main():
             args.redis_cli,
             args.wheel,
             args.output,
-            commit,
-            dirty,
-            args.target,
-            args.profile,
-            args.with_afs,
-            args.backend_dir,
-            args.runsc,
+            BuildIdentity(commit, dirty, args.target, args.profile),
+            with_afs=args.with_afs,
+            backend_dir=args.backend_dir,
+            runsc=args.runsc,
         )
     print("package verified")
 
