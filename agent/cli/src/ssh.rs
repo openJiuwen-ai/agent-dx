@@ -58,19 +58,13 @@ pub fn arguments(
     if port == 0 || ssh.port == Some(0) || host.starts_with('-') {
         return Err(Error::Invalid("无效 SSH 地址或端口".into()));
     }
-    let target = match &ssh.binding_id {
-        Some(id) => Target::Binding {
-            name: ssh.scope.template.clone(),
-            template_ref: ssh.scope.version.parse().map_err(Error::Invalid)?,
-            id: id.clone(),
-        },
-        None => Target::Template {
-            name: ssh.scope.template.clone(),
-            template_ref: ssh.scope.version.parse().map_err(Error::Invalid)?,
-        },
+    let target = Target::Template {
+        name: ssh.scope.template.clone(),
+        template_ref: ssh.scope.version.parse().map_err(Error::Invalid)?,
     };
     let route = SshRoute {
         target,
+        binding_id: ssh.binding_id.clone(),
         port: ssh.port,
         trace: None,
     }
@@ -163,12 +157,12 @@ mod tests {
         let route: SshRoute = username.parse().unwrap();
         assert_eq!(
             route.target,
-            Target::Binding {
+            Target::Template {
                 name: "demo agent".into(),
                 template_ref: adx_agent_core::TemplateRef::Version("1".into()),
-                id: "my env".into()
             }
         );
+        assert_eq!(route.binding_id.as_deref(), Some("my env"));
         assert_eq!(route.port, Some(2223));
         assert!(args
             .windows(2)

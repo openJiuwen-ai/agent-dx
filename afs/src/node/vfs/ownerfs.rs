@@ -3269,7 +3269,6 @@ impl LocalOwnerFs {
         access: &PresentedRootAccess,
         directory: files::RemoteDirectory,
     ) -> Result<()> {
-        self.validate_peer(access, peer_node_id, RootRight::Lookup)?;
         check_remote_directory_scope(access, &directory)?;
         self.check_peer_directory_handle(
             decode_directory_handle(&directory)?,
@@ -3462,12 +3461,12 @@ impl LocalOwnerFs {
         access: &PresentedRootAccess,
         file: files::RemoteFile,
     ) -> Result<()> {
-        self.validate_peer(access, peer_node_id, RootRight::Lookup)?;
+        // Same rule as peer_releasedir: the recorded open authorizes the close.
         check_remote_file_scope(access, &file)?;
         let handle = decode_file_handle(&file)?;
         // A retry after Home applied RELEASE but lost its ACK is successful.
         // Monotonic handle IDs are never reused; an existing handle still
-        // requires the full peer/root/session/identity check below.
+        // requires the full peer/root/session check below.
         if !self
             .state
             .lock()
@@ -13084,6 +13083,264 @@ mod tests {
             .peer_readdir("node-b", &access, &sibling, 0, 16)
             .unwrap();
         local.peer_releasedir("node-b", &access, sibling).unwrap();
+    }
+
+    fn assert_fenced(error: Error) {
+        assert_eq!(error.code(), afs_error::NODE_OWNER_GRANT_UNAVAILABLE);
+    }
+
+    fn peer_handle_counts(fs: &OwnerFs) -> (usize, usize) {
+        let state = fs.require_local().unwrap().state.lock().unwrap();
+        (state.dir_handles.len(), state.file_handles.len())
+    }
+
+    /// Real descriptors this process holds on `path` or below it.
+    fn open_fds_under(path: &std::path::Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                std::fs::read_link(entry.path())
+                    .ok()
+                    .is_some_and(|target| target.starts_with(path))
+            })
+            .count()
+    }
+
+    /// The wire shape the OwnerFiles adapter rebuilds for `Release`: root, node
+    /// and session come from the presented access and the file identity is left
+    /// empty, so a production close never compares identity.
+    fn rpc_file(access: &PresentedRootAccess, handle: &[u8]) -> files::RemoteFile {
+        files::RemoteFile {
+            root_id: access.id.clone(),
+            owner_node_id: access.home_node_id.clone(),
+            owner_session_id: access.home_session_id.clone(),
+            identity: files::FileIdentity(Vec::new()),
+            handle: handle.to_vec(),
+        }
+    }
+
+    /// Same reconstruction for `ReleaseDir`.
+    fn rpc_dir(access: &PresentedRootAccess, handle: &[u8]) -> files::RemoteDirectory {
+        files::RemoteDirectory {
+            root_id: access.id.clone(),
+            owner_node_id: access.home_node_id.clone(),
+            owner_session_id: access.home_session_id.clone(),
+            identity: files::FileIdentity(Vec::new()),
+            handle: handle.to_vec(),
+        }
+    }
+
+    #[test]
+    fn peer_close_after_home_revoke_drops_file_and_directory_handles() {
+        let (temp, fs, ctx, root, binding) = pf1_fixture();
+        let access = pf1_peer(&fs, &binding);
+        let created = pf1_file(&fs, &ctx, &root, libc::O_RDWR);
+        fs.release(&ctx, created.handle).unwrap();
+        let executor = fs.peer_executor().unwrap();
+        let local = fs.require_local().unwrap();
+        let baseline = open_fds_under(temp.path());
+        let directory = local
+            .peer_opendir("node-b", &access, OsStr::new(""), None)
+            .unwrap();
+        let sibling = local
+            .peer_opendir("node-b", &access, OsStr::new(""), None)
+            .unwrap();
+        let (file, _, _) = executor
+            .open("node-b", &access, OsStr::new("file"), libc::O_RDONLY, None)
+            .unwrap();
+        // Close through the same wire shape the RPC adapter builds.
+        let directory = rpc_dir(&access, &directory.handle);
+        let sibling = rpc_dir(&access, &sibling.handle);
+        let file = rpc_file(&access, &file.handle);
+        assert_eq!(peer_handle_counts(&fs), (2, 1));
+        assert_eq!(open_fds_under(temp.path()), baseline + 3);
+
+        fs.require_local()
+            .unwrap()
+            .roots
+            .revoke_root(&binding.root_id);
+
+        // The revoked grant still fences everything that is not a close.
+        assert_fenced(
+            local
+                .peer_readdir("node-b", &access, &directory, 0, 16)
+                .unwrap_err(),
+        );
+        let mut byte = [0u8; 1];
+        assert_fenced(
+            local
+                .peer_read("node-b", &access, &file, 0, &mut byte)
+                .unwrap_err(),
+        );
+
+        executor.release("node-b", &access, file.clone()).unwrap();
+        assert_eq!(
+            peer_handle_counts(&fs),
+            (2, 0),
+            "close must drop the Home file handle"
+        );
+        local
+            .peer_releasedir("node-b", &access, directory.clone())
+            .unwrap();
+        assert_eq!(
+            peer_handle_counts(&fs),
+            (1, 0),
+            "close must drop the Home directory handle"
+        );
+
+        // A retry after Home applied RELEASE but lost its ACK is still a close:
+        // the file handle is absent (success) and the directory one is stale,
+        // which the client treats as success.
+        executor.release("node-b", &access, file).unwrap();
+        assert_eq!(
+            local
+                .peer_releasedir("node-b", &access, directory)
+                .unwrap_err()
+                .code(),
+            afs_error::NODE_OWNER_STALE_HANDLE
+        );
+        assert_eq!(peer_handle_counts(&fs), (1, 0));
+
+        // A close stays bound to the recorded owner even without a grant check.
+        assert_eq!(
+            local
+                .peer_releasedir("node-c", &access, sibling.clone())
+                .unwrap_err()
+                .code(),
+            afs_error::NODE_OWNER_STALE_HANDLE
+        );
+
+        local.peer_releasedir("node-b", &access, sibling).unwrap();
+        assert_eq!(peer_handle_counts(&fs), (0, 0));
+        assert_eq!(
+            open_fds_under(temp.path()),
+            baseline,
+            "closes must drop the real fds"
+        );
+    }
+
+    #[test]
+    fn peer_close_rejects_mismatched_access_and_keeps_handles() {
+        let (_temp, fs, ctx, root, binding) = pf1_fixture();
+        let access = pf1_peer(&fs, &binding);
+        let created = pf1_file(&fs, &ctx, &root, libc::O_RDWR);
+        fs.release(&ctx, created.handle).unwrap();
+        let executor = fs.peer_executor().unwrap();
+        let local = fs.require_local().unwrap();
+        let directory = local
+            .peer_opendir("node-b", &access, OsStr::new(""), None)
+            .unwrap();
+        let (file, _, _) = executor
+            .open("node-b", &access, OsStr::new("file"), libc::O_RDONLY, None)
+            .unwrap();
+        fs.require_local()
+            .unwrap()
+            .roots
+            .revoke_root(&binding.root_id);
+
+        let mut other_session = access.clone();
+        other_session.session_id = "other-session".into();
+        let mut other_generation = access.clone();
+        other_generation.access_generation += 1;
+        let mut other_token = access.clone();
+        other_token.fencing_token = "other-token".into();
+        for wrong in [other_session, other_generation, other_token] {
+            // The wire handle is rebuilt from the wrong access, as the RPC
+            // adapter does, so only the recorded scope can reject the close.
+            assert_eq!(
+                local
+                    .peer_releasedir("node-b", &wrong, rpc_dir(&wrong, &directory.handle))
+                    .unwrap_err()
+                    .code(),
+                afs_error::NODE_OWNER_STALE_HANDLE
+            );
+            assert_eq!(
+                executor
+                    .release("node-b", &wrong, rpc_file(&wrong, &file.handle))
+                    .unwrap_err()
+                    .code(),
+                afs_error::NODE_OWNER_STALE_HANDLE
+            );
+        }
+        assert_eq!(
+            peer_handle_counts(&fs),
+            (1, 1),
+            "a rejected close must keep the Home handle"
+        );
+
+        // The access the handle was opened with still closes it.
+        local
+            .peer_releasedir("node-b", &access, rpc_dir(&access, &directory.handle))
+            .unwrap();
+        executor
+            .release("node-b", &access, rpc_file(&access, &file.handle))
+            .unwrap();
+        assert_eq!(peer_handle_counts(&fs), (0, 0));
+    }
+
+    #[test]
+    fn peer_releasedir_after_workspace_delete_drops_handle() {
+        let (_temp, fs, _ctx, _root, binding) = pf1_fixture();
+        let access = pf1_peer(&fs, &binding);
+        let local = fs.require_local().unwrap();
+        let directory = local
+            .peer_opendir("node-b", &access, OsStr::new(""), None)
+            .unwrap();
+        fs.require_local()
+            .unwrap()
+            .roots
+            .delete_root(&binding.root_id)
+            .unwrap();
+
+        local
+            .peer_releasedir("node-b", &access, rpc_dir(&access, &directory.handle))
+            .unwrap();
+        assert_eq!(peer_handle_counts(&fs), (0, 0));
+    }
+
+    #[test]
+    fn peer_releasedir_after_workspace_recreate_drops_old_handle() {
+        let (_temp, fs, ctx, _root, binding) = pf1_fixture();
+        let access = pf1_peer(&fs, &binding);
+        let local = fs.require_local().unwrap();
+        let directory = local
+            .peer_opendir("node-b", &access, OsStr::new(""), None)
+            .unwrap();
+        fs.require_local()
+            .unwrap()
+            .roots
+            .delete_root(&binding.root_id)
+            .unwrap();
+
+        // Re-creating the workspace reuses the name-derived root id but issues a
+        // new grant contract; the old handle is still recorded against the old
+        // access, which is the "re-granted root, old handle" case.
+        native_home_tests::mkdir_root(&fs, &ctx, "pf1-root");
+        let recreated = fs
+            .require_local()
+            .unwrap()
+            .roots
+            .enter_root(&binding.root_id, RootRight::Lookup)
+            .unwrap();
+        let new_binding = root::PrivateRootBinding::from_grant(recreated.grant());
+        drop(recreated);
+        assert_ne!(new_binding.root_epoch, binding.root_epoch);
+
+        local
+            .peer_releasedir("node-b", &access, rpc_dir(&access, &directory.handle))
+            .unwrap();
+        assert_eq!(peer_handle_counts(&fs), (0, 0));
+
+        // The re-created workspace still serves and releases its own handles.
+        let new_access = pf1_peer(&fs, &new_binding);
+        let fresh = local
+            .peer_opendir("node-b", &new_access, OsStr::new(""), None)
+            .unwrap();
+        local
+            .peer_releasedir("node-b", &new_access, rpc_dir(&new_access, &fresh.handle))
+            .unwrap();
+        assert_eq!(peer_handle_counts(&fs), (0, 0));
     }
 
     #[test]

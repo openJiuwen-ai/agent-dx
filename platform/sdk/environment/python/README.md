@@ -222,6 +222,17 @@ Snapshot ID string. It performs the normal environment create request with a
 `snapshotId`, so the result is a new `Environment` handle that reaches RUNNING in
 the usual way.
 
+Restoration retains the source environment's inherited-entrypoint setting and its managed image-process metadata mount. The captured workload resumes from memory; the entrypoint is not dispatched again. Callers still omit `inherit_entrypoint` when creating from a Snapshot rather than treating restoration as fresh initialization.
+
+Rootfs and readiness/healthcheck policies also inherit from the snapshot. Omit
+probe and `rootfs_readonly` options when restoring; they cannot replace captured
+configuration. Execd re-runs readiness and resets healthcheck counts through its
+existing resume protocol, and Adxlet continues handling terminal probe failures.
+`clone.wait_entrypoint()` (also on a handle returned by `Environment.from_id()`)
+polls the captured process and records its exit status. It does not launch an
+entrypoint; snapshots without one report an `EnvironmentError` from Execd.
+
+
 ```python
 clone = Environment.create(
     snapshot,

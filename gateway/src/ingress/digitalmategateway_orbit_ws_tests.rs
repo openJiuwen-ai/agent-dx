@@ -25,6 +25,22 @@ fn orbit_request(query: &str) -> Request<Full<Bytes>> {
     request
 }
 
+fn application_alias_settings(application: &str, port: u16) -> DigitalMateGatewayConfig {
+    let mut config = orbit_alias_settings(port);
+    if application == "digitalmate" {
+        let mut target = config.orbit.take().unwrap();
+        target.template = application.into();
+        config.digitalmate = Some(target);
+    }
+    config
+}
+
+fn application_request(application: &str, query: &str) -> Request<Full<Bytes>> {
+    let mut request = orbit_request(query);
+    *request.uri_mut() = format!("/{application}/ws{query}").parse().unwrap();
+    request
+}
+
 #[tokio::test]
 async fn orbit_admission_requires_session() {
     let (gateway, backend) = fixture().await;
@@ -84,7 +100,13 @@ async fn orbit_admission_requires_session() {
 }
 
 #[tokio::test]
-async fn orbit_ws_reuses_shared_forwarding_and_preserves_frames() {
+async fn application_ws_reuses_shared_forwarding_and_preserves_frames() {
+    for application in ["orbit", "digitalmate"] {
+        shared_forwarding(application).await;
+    }
+}
+
+async fn shared_forwarding(application: &'static str) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let (backend_sender, mut backends) = tokio::sync::mpsc::channel(8);
@@ -116,6 +138,7 @@ async fn orbit_ws_reuses_shared_forwarding_and_preserves_frames() {
                                     "cookie",
                                     "x-auth",
                                     "x-user-id",
+                                    "x-adx-binding-id",
                                     H_INSTANCE_ID,
                                     H_WORKLOAD_ID,
                                     H_TARGET_IP,
@@ -189,11 +212,11 @@ async fn orbit_ws_reuses_shared_forwarding_and_preserves_frames() {
         })
     };
     let state = AgentState::new(Arc::new(MemoryRepository::default()));
-    state.publish("tenant", &adx_agent_core::TemplateDraft::from(&serde_json::from_value(json!({"name":"orbit","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"ws","port":port}]})).unwrap())).await.unwrap();
+    state.publish("tenant", &adx_agent_core::TemplateDraft::from(&serde_json::from_value(json!({"name":application,"version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"ws","port":port}]})).unwrap())).await.unwrap();
     state
         .put_alias(
             &serde_json::from_value(json!({
-                "tenant":"tenant", "template":"orbit", "alias":"production", "seed":"stable",
+                "tenant":"tenant", "template":application, "alias":"production", "seed":"stable",
                 "versions":[{"version":"1", "weight":1}]
             }))
             .unwrap(),
@@ -207,10 +230,10 @@ async fn orbit_ws_reuses_shared_forwarding_and_preserves_frames() {
             state
                 .create_binding(adx_agent_core::Scope {
                     tenant: "tenant".into(),
-                    template: "orbit".into(),
+                    template: application.into(),
                     template_ref: adx_agent_core::TemplateRef::Alias("production".into()),
                     binding_id: format!(
-                        "orbit-{}",
+                        "{application}-{}",
                         hex::encode(Sha256::digest(
                             serde_json::to_vec(&["tenant", user]).unwrap()
                         ))
@@ -243,7 +266,7 @@ async fn orbit_ws_reuses_shared_forwarding_and_preserves_frames() {
             .clone()
             .with_digitalmategateway_api(Arc::new(
                 DigitalMateGatewayApi::new(
-                    orbit_alias_settings(port),
+                    application_alias_settings(application, port),
                     managed.clone(),
                     auth.clone(),
                 )
@@ -254,7 +277,7 @@ async fn orbit_ws_reuses_shared_forwarding_and_preserves_frames() {
     for (index, user) in ["alice", "alice", "bob"].iter().enumerate() {
         let (mut sender, server, client) =
             connection(gateway.clone(), IngressSecurity::Plaintext).await;
-        let mut request = orbit_request("?mode=opaque&token=discarded");
+        let mut request = application_request(application, "?mode=opaque&token=discarded");
         request.headers_mut().insert(
             "authorization",
             format!("Bearer {user}-session").parse().unwrap(),
@@ -265,6 +288,7 @@ async fn orbit_ws_reuses_shared_forwarding_and_preserves_frames() {
         for name in [
             "cookie",
             "x-user-id",
+            "x-adx-binding-id",
             H_INSTANCE_ID,
             H_WORKLOAD_ID,
             H_TARGET_IP,
@@ -344,8 +368,13 @@ async fn orbit_ws_reuses_shared_forwarding_and_preserves_frames() {
         client.abort();
     }
     // A blocked post-connect account read must consume the original admission budget.
-    let mut config = orbit_alias_settings(port);
-    config.orbit.as_mut().unwrap().request_timeout_seconds = 1;
+    let mut config = application_alias_settings(application, port);
+    for target in [&mut config.orbit, &mut config.digitalmate]
+        .into_iter()
+        .flatten()
+    {
+        target.request_timeout_seconds = 1;
+    }
     let bounded = Arc::new(
         gateway
             .as_ref()
@@ -360,7 +389,10 @@ async fn orbit_ws_reuses_shared_forwarding_and_preserves_frames() {
     let (mut sender, server, client) = connection(bounded, IngressSecurity::Plaintext).await;
     let pending = tokio::spawn(async move {
         sender
-            .send_request(orbit_request("?mode=opaque&token=discarded"))
+            .send_request(application_request(
+                application,
+                "?mode=opaque&token=discarded",
+            ))
             .await
             .unwrap()
     });
@@ -386,7 +418,7 @@ async fn orbit_ws_reuses_shared_forwarding_and_preserves_frames() {
     for route_revoked in [false, true] {
         let (mut sender, server, client) =
             connection(gateway.clone(), IngressSecurity::Plaintext).await;
-        let mut request = orbit_request("?mode=opaque");
+        let mut request = application_request(application, "?mode=opaque");
         request
             .headers_mut()
             .insert("sec-websocket-protocol", "opaque-test".parse().unwrap());

@@ -45,6 +45,60 @@ fn inherit_template(
     let template = &snapshot.template;
     request.runtime_profile = template.runtime_profile.clone().map(Into::into);
     inherit_service_protection(&mut request, template)?;
+    // This flag also controls the managed image-process metadata mount. Keep
+    // its geometry when restoring; Execd resumes its saved process rather than
+    // starting the entrypoint again.
+    let execution = request.execution.get_or_insert_with(Default::default);
+    // A normalized retry may carry true, but it cannot enable metadata absent
+    // from the source. Protobuf false has no presence bit and means inherit.
+    if execution.inherit_entrypoint && !template.execution.inherit_entrypoint {
+        return Err(Error::Invalid(
+            "snapshot entrypoint configuration must match its source".into(),
+        ));
+    }
+    execution.inherit_entrypoint = template.execution.inherit_entrypoint;
+    // Requests reserve scheduling capacity; execution limits cap the actual
+    // runtime. Restoring only the former can turn an overcommitted 8 GiB
+    // sandbox into a 64 MiB cgroup and OOM while loading its checkpoint.
+    let limits = execution.limits.get_or_insert_with(Default::default);
+    let saved_limits = &template.execution.limits;
+    if limits.cpu_millis == 0 {
+        limits.cpu_millis = saved_limits.cpu_millis;
+    }
+    if limits.memory_bytes == 0 {
+        limits.memory_bytes = saved_limits.memory_bytes;
+    }
+    if limits.disk_bytes == 0 {
+        limits.disk_bytes = saved_limits.disk_bytes;
+    }
+    let captured: pb::ExecutionOptions = template.execution.clone().into();
+    if execution
+        .rootfs
+        .as_ref()
+        .is_some_and(|rootfs| Some(rootfs) != captured.rootfs.as_ref())
+    {
+        return Err(Error::Invalid(
+            "snapshot rootfs configuration must match its source".into(),
+        ));
+    }
+    execution.rootfs = captured.rootfs;
+    // Execd restores its probe supervisor with the original process. Retain
+    // the same policy in Adxlet so terminal probe failures remain observable.
+    if execution
+        .readiness_probe
+        .as_ref()
+        .is_some_and(|probe| Some(probe) != captured.readiness_probe.as_ref())
+        || execution
+            .healthcheck_probe
+            .as_ref()
+            .is_some_and(|probe| Some(probe) != captured.healthcheck_probe.as_ref())
+    {
+        return Err(Error::Invalid(
+            "snapshot probes must match their source".into(),
+        ));
+    }
+    execution.readiness_probe = captured.readiness_probe;
+    execution.healthcheck_probe = captured.healthcheck_probe;
     if request.image.is_empty() {
         request.image = template.image.clone();
     }
@@ -242,6 +296,186 @@ mod tests {
             snapshot_id: Some(snapshot.id.clone()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn clone_cannot_enable_entrypoint_metadata_absent_from_snapshot() {
+        let snapshot = source("local");
+        let mut request = clone_request(&snapshot);
+        request.execution = Some(pb::ExecutionOptions {
+            inherit_entrypoint: true,
+            ..Default::default()
+        });
+        assert!(matches!(
+            inherit_template(request, &snapshot, None),
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn clone_inherits_entrypoint_geometry_and_accepts_normalized_replay() {
+        for saved in [false, true] {
+            let mut snapshot = source("local");
+            snapshot.template.execution.inherit_entrypoint = saved;
+            snapshot.template.execution.rootfs = Some(adx_core::execution::Rootfs {
+                readonly: false,
+                source: adx_core::execution::StorageSource::Image(snapshot.template.image.clone()),
+            });
+            let inherited = inherit_template(clone_request(&snapshot), &snapshot, None).unwrap();
+            assert_eq!(inherited.execution.inherit_entrypoint, saved);
+            let replay =
+                inherit_template(inherited.clone().into(), &snapshot, Some(&inherited)).unwrap();
+            assert_eq!(replay, inherited);
+        }
+    }
+
+    #[test]
+    fn clone_preserves_rootfs_and_rejects_explicit_geometry_changes() {
+        use adx_core::execution::{Rootfs, StorageSource};
+        for entrypoint in [false, true] {
+            let mut snapshot = source("local");
+            snapshot.template.execution.inherit_entrypoint = entrypoint;
+            snapshot.template.execution.rootfs = Some(Rootfs {
+                readonly: false,
+                source: StorageSource::Image(snapshot.template.image.clone()),
+            });
+            let inherited = inherit_template(clone_request(&snapshot), &snapshot, None).unwrap();
+            assert_eq!(
+                inherited.execution.rootfs,
+                snapshot.template.execution.rootfs
+            );
+            let replay: pb::EnvironmentSpec = inherited.clone().into();
+            assert_eq!(
+                inherit_template(replay.clone(), &snapshot, Some(&inherited)).unwrap(),
+                inherited
+            );
+            let mut mismatch = replay;
+            mismatch
+                .execution
+                .as_mut()
+                .unwrap()
+                .rootfs
+                .as_mut()
+                .unwrap()
+                .readonly = true;
+            assert!(matches!(
+                inherit_template(mismatch, &snapshot, None),
+                Err(Error::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn clone_inherits_probes_and_rejects_changed_or_new_checks() {
+        use adx_core::probes::{ProbeAction, ProbeSpec};
+        let mut snapshot = source("local");
+        snapshot.template.execution.inherit_entrypoint = true;
+        snapshot.template.execution.rootfs = Some(adx_core::execution::Rootfs {
+            readonly: false,
+            source: adx_core::execution::StorageSource::Image(snapshot.template.image.clone()),
+        });
+        let probe = ProbeSpec {
+            action: ProbeAction::TcpSocket { port: 8080 },
+            initial_delay_seconds: 0,
+            period_seconds: 2,
+            timeout_seconds: 1,
+            failure_threshold: 1,
+        };
+        snapshot.template.execution.readiness_probe = Some(probe.clone());
+        snapshot.template.execution.healthcheck_probe = Some(probe);
+        let inherited = inherit_template(clone_request(&snapshot), &snapshot, None).unwrap();
+        assert_eq!(
+            inherited.execution.readiness_probe,
+            snapshot.template.execution.readiness_probe
+        );
+        assert_eq!(
+            inherited.execution.healthcheck_probe,
+            snapshot.template.execution.healthcheck_probe
+        );
+        let replay: pb::EnvironmentSpec = inherited.clone().into();
+        assert_eq!(
+            inherit_template(replay.clone(), &snapshot, Some(&inherited)).unwrap(),
+            inherited
+        );
+        for readiness in [false, true] {
+            let mut changed = replay.clone();
+            let execution = changed.execution.as_mut().unwrap();
+            let check = if readiness {
+                &mut execution.readiness_probe
+            } else {
+                &mut execution.healthcheck_probe
+            };
+            check.as_mut().unwrap().period_seconds += 1;
+            assert!(matches!(
+                inherit_template(changed, &snapshot, None),
+                Err(Error::Invalid(_))
+            ));
+            let mut absent = snapshot.clone();
+            if readiness {
+                absent.template.execution.readiness_probe = None;
+            } else {
+                absent.template.execution.healthcheck_probe = None;
+            }
+            assert!(matches!(
+                inherit_template(replay.clone(), &absent, None),
+                Err(Error::Invalid(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn clone_inherits_execution_limits_separately_from_scheduling_requests() {
+        let mut snapshot = source("local");
+        snapshot.template.resources.cpu_millis = 10;
+        snapshot.template.resources.memory_bytes = 64 * 1024 * 1024;
+        snapshot.template.resources.disk_bytes = 20 * 1024 * 1024 * 1024;
+        snapshot.template.execution.limits = adx_core::execution::ResourceLimits {
+            cpu_millis: 2000,
+            memory_bytes: 8192 * 1024 * 1024,
+            disk_bytes: 24 * 1024 * 1024 * 1024,
+        };
+        let mut request = clone_request(&snapshot);
+        request.execution = Some(pb::ExecutionOptions {
+            // The public API serializes omitted limits as zero. Their meaning
+            // during restore is inheritance, not reducing caps to requests.
+            limits: Some(pb::ResourceLimits::default()),
+            ..Default::default()
+        });
+        let restored = inherit_template(request, &snapshot, None).unwrap();
+        assert_eq!(restored.resources, snapshot.template.resources);
+        assert_eq!(
+            restored.execution.limits,
+            snapshot.template.execution.limits
+        );
+
+        let without_execution =
+            inherit_template(clone_request(&snapshot), &snapshot, None).unwrap();
+        assert_eq!(
+            without_execution.execution.limits,
+            snapshot.template.execution.limits
+        );
+    }
+
+    #[test]
+    fn clone_preserves_explicit_limit_overrides_and_inherits_other_limits() {
+        let mut snapshot = source("s3");
+        snapshot.template.execution.limits = adx_core::execution::ResourceLimits {
+            cpu_millis: 2000,
+            memory_bytes: 8192,
+            disk_bytes: 4096,
+        };
+        let mut request = clone_request(&snapshot);
+        request.execution = Some(pb::ExecutionOptions {
+            limits: Some(pb::ResourceLimits {
+                cpu_millis: 3000,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let restored = inherit_template(request, &snapshot, None).unwrap();
+        assert_eq!(restored.execution.limits.cpu_millis, 3000);
+        assert_eq!(restored.execution.limits.memory_bytes, 8192);
+        assert_eq!(restored.execution.limits.disk_bytes, 4096);
     }
 
     #[test]

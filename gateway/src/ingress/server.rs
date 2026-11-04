@@ -355,6 +355,7 @@ pub struct Ingress {
     default_tunnel_port: u16,
     port_host_domain: Option<String>,
     e2b_enabled: bool,
+    e2b_allow_http: bool,
     frontend_address: String,
     reverse_proxy: ReverseProxy,
     proxy_routes: Arc<Vec<ProxyRoute>>,
@@ -396,6 +397,7 @@ impl Ingress {
             default_tunnel_port,
             port_host_domain: None,
             e2b_enabled: false,
+            e2b_allow_http: false,
             frontend_address: frontend_address.into(),
             reverse_proxy: ReverseProxy::new(ReverseProxyConfig::default()),
             proxy_routes: Arc::new(Vec::new()),
@@ -456,6 +458,12 @@ impl Ingress {
 
     pub fn with_e2b_enabled(mut self, enabled: bool) -> Self {
         self.e2b_enabled = enabled;
+        self
+    }
+
+    /// Opt in to E2B routes over unencrypted HTTP. Native transport policies remain unchanged.
+    pub fn with_e2b_allow_http(mut self, allow: bool) -> Self {
+        self.e2b_allow_http = allow;
         self
     }
 
@@ -902,25 +910,13 @@ impl Ingress {
         let gateway = self;
         let service =
             service_fn(move |request| gateway.clone().handle_http(request, ingress_security, peer));
-        match ingress_security {
-            IngressSecurity::Tls => {
-                if let Err(error) =
-                    hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
-                        .serve_connection_with_upgrades(TokioIo::new(stream), service)
-                        .await
-                {
-                    tracing::debug!(%peer, %error, "Ingress HTTP connection closed");
-                }
-            }
-            IngressSecurity::Plaintext => {
-                if let Err(error) = hyper::server::conn::http1::Builder::new()
-                    .serve_connection(TokioIo::new(stream), service)
-                    .with_upgrades()
-                    .await
-                {
-                    tracing::debug!(%peer, %error, "Ingress HTTP connection closed");
-                }
-            }
+        // Official E2B transports may use cleartext HTTP/2. Protocol detection
+        // does not change the listener's security identity or route admission.
+        if let Err(error) = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
+            .serve_connection_with_upgrades(TokioIo::new(stream), service)
+            .await
+        {
+            tracing::debug!(%peer, %error, "Ingress HTTP connection closed");
         }
     }
 
@@ -980,7 +976,17 @@ impl Ingress {
             "reverse-proxy" => "/application/*",
             _ => adx_observability::trace::http_route(request.uri().path()),
         };
-        let trace = adx_observability::trace::Trace::http(
+        let correlation = adx_observability::trace::correlation_id(
+            request
+                .headers()
+                .get("x-trace-id")
+                .and_then(|v| v.to_str().ok()),
+            request
+                .headers()
+                .get("x-request-id")
+                .and_then(|v| v.to_str().ok()),
+        );
+        let trace = adx_observability::trace::Trace::http_with_correlation(
             request.method().as_str(),
             route,
             request
@@ -991,7 +997,14 @@ impl Ingress {
                 .headers()
                 .get("tracestate")
                 .and_then(|v| v.to_str().ok()),
+            correlation,
         );
+        trace.attribute(adx_observability::semconv::COMPONENT, "ingress".to_owned());
+        let trace_id_header = if trace.is_recording() {
+            trace.trace_id()
+        } else {
+            None
+        };
         trace
             .run(async {
                 adx_observability::trace::inject_headers(request.headers_mut());
@@ -1032,6 +1045,11 @@ impl Ingress {
                 if response.status().is_server_error() {
                     adx_observability::trace::error();
                 }
+                if let Some(trace_id) = trace_id_header.as_deref() {
+                    if let Ok(value) = trace_id.parse() {
+                        response.headers_mut().insert("x-trace-id", value);
+                    }
+                }
                 Ok(response)
             })
             .await
@@ -1046,6 +1064,7 @@ impl Ingress {
         let _in_flight = AtomicMetricGuard::new(&self.request_metrics.in_flight);
         let started = Instant::now();
         let request_id = ensure_request_id(&mut request);
+        adx_observability::trace::attribute("request.id", request_id.clone());
         let method = request.method().to_string();
         let path = request.uri().path().to_owned();
         let (access_kind, instance_id, target_port) = self.access_fields(&request);
@@ -1351,13 +1370,30 @@ impl Ingress {
             || (self.e2b_enabled && is_e2b_management_path(path))
     }
 
+    fn e2b_http_allowed(&self) -> bool {
+        self.e2b_enabled && self.e2b_allow_http
+    }
+
+    fn e2b_http_management_allowed(&self, path: &str) -> bool {
+        // Only canonical E2B paths may cross the plaintext management boundary.
+        // Do not let upstream URI normalization turn an admitted E2B prefix
+        // into a native or administrator path.
+        self.e2b_http_allowed()
+            && is_e2b_management_path(path)
+            && !path.contains(['%', '\\'])
+            && !path.contains("//")
+            && !path.split('/').any(|segment| matches!(segment, "." | ".."))
+    }
+
     async fn proxy_control_plane(
         &self,
         request: Request<Incoming>,
         ingress_security: IngressSecurity,
         peer: std::net::SocketAddr,
     ) -> Response<ProxyBody> {
-        if ingress_security == IngressSecurity::Plaintext {
+        if ingress_security == IngressSecurity::Plaintext
+            && !self.e2b_http_management_allowed(request.uri().path())
+        {
             return tls_required();
         }
         let route = ProxyRoute {
@@ -1459,7 +1495,9 @@ impl Ingress {
         };
         let upgraded = hyper::upgrade::on(request);
         let gateway = Arc::clone(self);
-        tokio::spawn(async move {
+        // The upgrade task outlives the entry span. Capture its context now so
+        // the session-close logs remain correlated with the originating request.
+        tokio::spawn(adx_observability::trace::with_current_context(async move {
             match upgraded.await {
                 Ok(upgraded) => {
                     let websocket = tokio_tungstenite::WebSocketStream::from_raw_socket(
@@ -1481,7 +1519,7 @@ impl Ingress {
                 }
                 Err(error) => tracing::debug!(%error, "command watch upgrade failed"),
             }
-        });
+        }));
         let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
         Response::builder()
             .status(StatusCode::SWITCHING_PROTOCOLS)
@@ -1737,7 +1775,9 @@ impl Ingress {
                 let on_upgrade = hyper::upgrade::on(request);
                 let stream_started = Instant::now();
                 let access_kind = access_kind.as_str();
-                tokio::spawn(async move {
+                // The CONNECT byte pump outlives the entry span; keep the
+                // captured context so the stream-close log carries trace_id.
+                tokio::spawn(adx_observability::trace::with_current_context(async move {
                     let relay = async {
                         match on_upgrade.await {
                             Ok(upgraded) => {
@@ -1785,7 +1825,7 @@ impl Ingress {
                             "Ingress CONNECT stream closed"
                         ),
                     }
-                });
+                }));
                 empty(StatusCode::OK)
             }
             Err(error) => error_response(error),
@@ -1999,7 +2039,11 @@ impl Ingress {
             // binding. Do not pool them with business connections or demand wake.
             let stream = match self.open_authorized_stream_with_activity(route, true).await {
                 Ok(stream) => stream,
-                Err(error) => return Ok(error_response(IngressOpenError::Connect(error))),
+                Err(error) => {
+                    let failure = IngressOpenError::Connect(error);
+                    record_ingress_error(&failure);
+                    return Ok(error_response(failure));
+                }
             };
             let cancelled = stream.cancelled.clone();
             return Ok(proxy_http(request, stream, "environment", Some(cancelled)).await);
@@ -2010,6 +2054,7 @@ impl Ingress {
             let stream = match self.open_resolved_stream(route, &tenant_id).await {
                 Ok(stream) => stream,
                 Err(error) => {
+                    record_ingress_error(&error);
                     return Err((error_response(error), request));
                 }
             };
@@ -2022,7 +2067,10 @@ impl Ingress {
         }
         let route = match self.prepare_route(route, &tenant_id).await {
             Ok(route) => route,
-            Err(error) => return Err((error_response(error), request)),
+            Err(error) => {
+                record_ingress_error(&error);
+                return Err((error_response(error), request));
+            }
         };
         if !self.resolver.route_is_current(&route) {
             return Err((error_response(IngressOpenError::RouteChanged), request));
@@ -2059,7 +2107,7 @@ impl Ingress {
         ingress_security: IngressSecurity,
         target: E2bTarget,
     ) -> Response<ProxyBody> {
-        if ingress_security == IngressSecurity::Plaintext {
+        if ingress_security == IngressSecurity::Plaintext && !self.e2b_http_allowed() {
             return tls_required();
         }
         let request_id = header_string(&request, "x-request-id");
@@ -2085,7 +2133,7 @@ impl Ingress {
         ingress_security: IngressSecurity,
         route: RouteHandle,
     ) -> Response<ProxyBody> {
-        if ingress_security == IngressSecurity::Plaintext {
+        if ingress_security == IngressSecurity::Plaintext && !self.e2b_http_allowed() {
             return tls_required();
         }
         // An opaque tunnel could carry unchecked envd control requests. Execd
@@ -2618,7 +2666,9 @@ where
             Err(error) => return plain(StatusCode::BAD_GATEWAY, &error.to_string()),
         };
     let connection_cancelled = cancelled.clone();
-    tokio::spawn(async move {
+    // The connection driver outlives the request span; retain its context so
+    // the close log can be correlated.
+    tokio::spawn(adx_observability::trace::with_current_context(async move {
         tokio::select! {
             _ = wait_for_route_cancellation(connection_cancelled) => {}
             result = connection.with_upgrades() => {
@@ -2627,7 +2677,7 @@ where
                 }
             }
         }
-    });
+    }));
     if let Some(processing) = request.extensions().get::<ProcessingDeadline>() {
         processing.forwarded();
     }
@@ -2949,6 +2999,24 @@ fn strip_token_query(query: &str) -> String {
                 .filter(|(name, _)| !name.eq_ignore_ascii_case("token")),
         )
         .finish()
+}
+
+/// Connection and route failures are server-side failures; record an OTel
+/// exception on the entry span. Client errors (404, auth, forbidden) stay
+/// Unset per OTel conventions.
+fn record_ingress_error(error: &IngressOpenError) {
+    match error {
+        IngressOpenError::Connect(error) => {
+            adx_observability::trace::record_error("connection", error.to_string())
+        }
+        IngressOpenError::Resolve(ResolveError::Unavailable(message)) => {
+            adx_observability::trace::record_error("resolve", message.clone())
+        }
+        IngressOpenError::Resolve(ResolveError::MissingEndpoint) => {
+            adx_observability::trace::record_error("resolve", error.to_string())
+        }
+        _ => {}
+    }
 }
 
 fn error_response(error: IngressOpenError) -> Response<ProxyBody> {
@@ -3727,3 +3795,7 @@ mod watch_close_contract_tests {
         task.await.unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "server/e2b_http_tests.rs"]
+mod e2b_http_tests;

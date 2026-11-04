@@ -57,6 +57,10 @@ class ActivatorAcceptanceTests(unittest.TestCase):
             self.assertEqual(sum(call[2] == 'POST' for call in calls), 1)
             self.assertEqual(case.result['template_version'], '7')
             self.assertIn('/versions/7/bindings', case.base)
+            self.assertEqual(
+                urllib.parse.parse_qs(urllib.parse.urlsplit(case.data_path).query),
+                {'target': ['urn:adx:template:activator-e2e:7']},
+            )
 
     def test_missing_physical_cleanup_cannot_pass(self):
         result = {
@@ -157,7 +161,8 @@ class ActivatorAcceptanceTests(unittest.TestCase):
                 thread.join(timeout=3)
 
     def test_non_json_auth_rejection_keeps_http_status(self):
-        def reject(_environ, start_response):
+        def reject(environ, start_response):
+            self.assertEqual(environ['HTTP_X_ADX_BINDING_ID'], 'shared')
             start_response('401 Unauthorized', [('Content-Type', 'text/plain'), ('Content-Length', '12')])
             return [b'Unauthorized']
 
@@ -166,6 +171,7 @@ class ActivatorAcceptanceTests(unittest.TestCase):
         thread.start()
         client = acceptance.Acceptance.__new__(acceptance.Acceptance)
         client.token = 'invalid-test-key'
+        client.data_path = '/agent/http/echo'
         client.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
             status, _, body = client.request(f'http://127.0.0.1:{server.server_port}', '/agent/http/echo')

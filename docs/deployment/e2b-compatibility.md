@@ -61,7 +61,7 @@ runc = "/opt/adx/current/etc/examples/e2b-runc-oci-spec.json"
 
 核查实际 OCI bundle 采用该配置；sandboxd 旧加载器读取失败会回退默认值。修改基线后，在无活动沙箱的隔离 worker 重启 sandboxd、创建新沙箱，旧容器不会自动取得权限。sticky `/tmp` 的 user 文件覆盖可能受 Linux protected_regular 限制，优先使用 `/home/user` 或非 sticky 子目录。
 
-Ingress 设置 `ADX_DATA_PLANE_INGRESS_E2B_ENABLED=true`、`ADX_DATA_PLANE_INGRESS_PORT_HOST_DOMAIN=sandbox.example.com`，配置正式 HTTPS 证书、源地址 ACL、API Server 和 Relay 目标 CIDR；独立/内嵌模式共用入口实现。升级配套使用同版 Coordinator、adxlet、API Server、Ingress 和对应工件，所有相关节点升级完成后再开启 E2B；旧节点不识别新增的 envd/run_policy 字段，不能承担该配置的执行。
+Ingress 设置 `ADX_DATA_PLANE_INGRESS_E2B_ENABLED=true`、`ADX_DATA_PLANE_INGRESS_PORT_HOST_DOMAIN=sandbox.example.com`，配置正式 HTTPS 证书、源地址 ACL、API Server 和 Relay 目标 CIDR；独立/内嵌模式共用入口实现。升级配套使用同版 Coordinator、adxlet、API Server、Ingress 和对应工件，首次从不识别E2B的旧版迁移时，所有相关节点升级完成后再开启 E2B；这些旧节点不识别新增的 envd/run_policy 字段，不能承担该配置的执行。纯Ingress传输策略修复不改变RPC/schema或RuntimeProfile：已支持E2B的运行版本可在固定工件下仅更新控制角色，保留worker运行时字节，但需先用该组合完成双协议及原有Snapshot资格验证。
 
 从 master `54efe5a` 存量前向升级的删除回执合同为：保留原有 600 秒有效期，旧回执仅允许 Environment ID、generation 和完整结果摘要相同、且未提交新增 cleanup artifacts 的删除重放；空 artifact scope 不改变旧结果的序列化字节。升级验收须覆盖旧格式 Redis/节点 journal、双版本进程切换、存量实例访问和生命周期，以及 AKernel 集成，不能以数据 fixture 回归代替完整升级验收。此前未发布 PR 的中间 schema 不提供迁移；新增 E2B 能力不得在旧节点混部期间启用。
 
@@ -117,7 +117,7 @@ Sandbox.create(templateID[:tag]) → Ready snapshotId → 原生从快照创建
 
 ```mermaid
 flowchart LR
-  SDK[E2B SDK] -->|管理 HTTPS / X-API-Key| I[Ingress]
+  SDK[E2B SDK] -->|管理 TLS默认或HTTP显式开启 / X-API-Key| I[Ingress]
   I --> A[API Server E2B adapter]
   A -->|登记 / 启动 fromImage 构建| C[Coordinator / Redis]
   C -->|准备镜像 / seed / 拍快照| G[平台 Golden Snapshot]
@@ -259,3 +259,46 @@ Pod 内直接运行 envd 组件测试，若继承 oom_score_adj 高于 100，测
 已登记共享 checkpoint/capture 继续由原生 registry、Snapshot 引用、execution holds 和 GC 管理，不重复加入 cleanup outbox。本地或确实未登记制品在 Deleted 退役时原子保存最小 pending payload，逐项幂等清理并收到完整 ACK 后 HDEL；部分清理、ACK 丢失或组件重启保留待办，本地节点永久丢失也不因 TTL 自动确认成功。
 
 删除重试沿用 600 秒 DeletedReceipt，增加规范化 cleanup payload 摘要；完成后不保留独立永久 cleanup/artifact fence。journal 遇 NotFound/Conflict 时须读取 fresh assignment，确认旧归属已撤销才丢弃旧条目，不把丢弃当作原提交成功。正常 Snapshot 发布在同一 CAS 比较源记录，防止 source 已退役后的迟到发布；制品 UUID 不复用，scope 继续阻止 alias 改指 bucket/prefix 后删错物理目标。
+
+
+## 显式 HTTP 入口
+
+默认的 E2B 管理和 envd/应用路由要求 Ingress TLS listener，明文请求返回426。
+部署者可在已启用 E2B 的同一 Ingress 显式设置
+`ADX_DATA_PLANE_INGRESS_E2B_ALLOW_HTTP=true`，允许这些 E2B 路由使用现有明文
+listener。开关默认false；E2B未启用时设置它会导致配置校验失败。HTTP入口支持
+HTTP/1.1和明文HTTP/2，仍保留原生接口与现有HTTPS入口。
+
+开关只影响E2B管理路径和已发布的E2B服务路由；原生管理、管理员接口、Execd、
+Agent入口及opaque CONNECT的传输/认证规则保持原样。管理请求仍由API Server
+校验当前API key及租户，envd仍校验独立sandbox token，私有应用端口仍需要traffic
+token，执行/路由代次及Relay ACL继续校验。非规范管理路径（百分号转义、反斜杠、
+重复斜杠或点段）不允许通过HTTP边界。HTTP会明文传输API/envd凭据，须在部署者
+明确接受的网络与源地址ACL内使用；不是自动降级或TLS终止代理的信任Header。
+
+配置示例（复用现有deployment服务，不新增控制面）：
+
+```yaml
+service_overrides:
+  ingress:
+    env:
+      ADX_DATA_PLANE_INGRESS_E2B_ENABLED: "true"
+      ADX_DATA_PLANE_INGRESS_E2B_ALLOW_HTTP: "true"
+      ADX_DATA_PLANE_INGRESS_PORT_HOST_DOMAIN: sandbox.example.com
+```
+
+官方SDK使用同一HTTP origin：
+
+```python
+box = Sandbox.create("base", api_key=token, api_url="http://HOST",
+                     sandbox_url="http://HOST", timeout=600)
+try:
+    print(box.commands.run("id -u").stdout)
+finally:
+    box.kill()
+```
+
+HTTP调用不需要客户端CA配置；server的TLS listener、证书和已有native客户端不需删除
+或关闭。入口使用IP时按SDK selectors请求头转发应用端口，不由`get_host()`字符串
+推断wildcard DNS可访问。开关不改变RuntimeProfile或checkpoint输入；兼容升级仍须
+实测部署中的原有Snapshot和同一组节点。路由组件测试与真实SDK/集群验收分开记录。

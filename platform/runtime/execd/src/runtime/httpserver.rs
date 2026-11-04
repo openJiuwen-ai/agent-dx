@@ -580,6 +580,7 @@ async fn handle_command_watch(
     let _guard = WatchGuard;
     let key = parse_header(head, "sec-websocket-key").ok_or("missing websocket key")?;
     let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+    record_http_status(101);
     sock.write_all(
         format!(
             "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
@@ -722,6 +723,7 @@ async fn handle_pty(
     let cols = dimension("cols", 80);
     let key = parse_header(head, "sec-websocket-key").ok_or("missing websocket key")?;
     let accept = tokio_tungstenite::tungstenite::handshake::derive_accept_key(key.as_bytes());
+    record_http_status(101);
     sock.write_all(
         format!(
             "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
@@ -856,13 +858,18 @@ async fn execute_invoke(
     trace_id: String,
 ) -> CachedResponse {
     let normalized_action = super::dispatch::normalize_environment_action(&action);
+    // Blocking pool threads do not inherit the task's OTel context. Capture it
+    // before the hop so dispatch logs keep the request trace.
+    let context = adx_observability::trace::current_context();
     let result = tokio::task::spawn_blocking(move || {
-        super::dispatch::execute_environment_action_once(
-            request_id.as_deref(),
-            &action,
-            &kw,
-            &trace_id,
-        )
+        adx_observability::trace::attach_context(&context, || {
+            super::dispatch::execute_environment_action_once(
+                request_id.as_deref(),
+                &action,
+                &kw,
+                &trace_id,
+            )
+        })
     })
     .await;
 
@@ -1620,6 +1627,7 @@ async fn write_chunked_headers(
     status: u16,
     content_type: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    record_http_status(status);
     let resp = format!(
         "HTTP/1.1 {status} OK\r\nContent-Type: {content_type}\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n"
     );
@@ -1645,6 +1653,7 @@ async fn write_binary_headers_with_range(
     content_len: Option<u64>,
     content_range: Option<(u64, u64, u64)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    record_http_status(status);
     let reason = match status {
         200 => "OK",
         206 => "Partial Content",
@@ -1664,6 +1673,14 @@ async fn write_binary_headers_with_range(
     Ok(())
 }
 
+/// Record the status on the current Execd HTTP span exactly once per response.
+fn record_http_status(status: u16) {
+    adx_observability::trace::attribute("http.response.status_code", status.to_string());
+    if status >= 500 {
+        adx_observability::trace::error_with(format!("execd HTTP {status}"));
+    }
+}
+
 fn err_json(msg: &str) -> String {
     serde_json::json!({ "error": msg }).to_string()
 }
@@ -1673,6 +1690,7 @@ async fn write_resp(
     status: u16,
     body: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    record_http_status(status);
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",

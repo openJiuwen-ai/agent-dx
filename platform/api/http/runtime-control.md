@@ -141,3 +141,7 @@ cannot prepare a different operation while a local request is pending.
 On Adxlet restart, a prepared workload request without a matching committed
 recovery point is retired during reconciliation before routes become ready. A
 committed point survives and its completion acknowledgement may be retried.
+If Coordinator has already marked that execution Failed, reconciliation keeps
+it Failed, confirms physical cleanup, and publishes the released inputs at a
+new revision. It does not restart the workload or repeat a Failed-to-Failed
+state transition. Cleanup failure keeps node admission closed for retry.

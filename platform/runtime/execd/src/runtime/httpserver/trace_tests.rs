@@ -102,5 +102,9 @@ async fn passive_polls_do_not_export_but_requests_keep_context() {
     // Checkpoint control currently uses the bounded fallback HTTP route name.
     assert_eq!(spans[1].name, "POST /unmatched");
     assert_eq!(spans[2].name, "POST /invoke");
+    assert!(spans[2]
+        .attributes
+        .iter()
+        .any(|a| a.key.as_str() == "http.response.status_code" && a.value.to_string() == "200"));
     provider.shutdown().unwrap();
 }

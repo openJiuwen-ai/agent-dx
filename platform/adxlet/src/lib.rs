@@ -94,6 +94,11 @@ pub trait RuntimeDriver: Send + Sync {
         self.retains_checkpoint_files(runtime_class)
     }
 
+    /// Backend sandbox identifier for the runtime, when the backend exposes one.
+    async fn sandbox_id(&self, _runtime_id: &str) -> Option<String> {
+        None
+    }
+
     /// Prepare and start within the create deadline rather than the node RPC cap.
     async fn start_with_deadline(
         &self,

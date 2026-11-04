@@ -278,6 +278,12 @@ message EnvironmentResult {
   bool newly_created = 3;
   EnvironmentRecord record = 1;
   Durability durability = 2;
+  // Create retry observability. Zero/empty when the request did not enter the
+  // central scheduling loop.
+  uint32 create_attempts = 4;
+  uint32 retry_count = 5;
+  string retry_first_error_code = 6;
+  string retry_first_error_message = 7;
 }
 
 message ExecutionObservation {
