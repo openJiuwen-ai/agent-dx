@@ -85,4 +85,6 @@ python build/e2e/firecracker/sdk_checkpoint.py \
 
 可复用快照与 workload checkpoint 共用后端超时换算：正的剩余预算向上取整到整秒，最少 1 秒；已过期预算不再发起捕获。发布等待仍使用原始截止时间，不因重试重新计时。退避抖动由 Environment ID 与 ownership generation 共同确定，避免同 generation 的环境全部使用同一偏移。
 
+准备阶段耗尽预算、且尚未调用后端 capture 时，通过 `abort_unstarted` 撤销准备并保留运行中的源环境；只有撤销无法确认时才沿用失败清理。capture 已成功后的发布失败会由存活的 owner 控制器保留阶段、原操作 ID、原 expected revision、暂存路径和快照元数据；同一请求重试继续发布同一个工件，不重复 capture、已完成阶段或 revision 推进。其他生命周期写操作不能越过这项待发布操作，删除仍可清理。新一次 RPC 可使用新的超时预算，但不能改变原操作的快照类型或名称。这个进度不是跨进程的持久恢复协议：节点进程重启仍按未封存 capture 的对账规则清理或退役执行；持久化的 execution-artifact 引用继续负责保护文件和资源归属。
+
 只有 `Durability::Journaled` 明确确认本地持久化后才等待重新发布；`sync()` 的错误（包括提交超时或本地 journal 故障）立即向调用方返回，不把不确定的持久化结果当成 Journaled。同一 Environment 的控制器仍串行处理命令，发布等待会占用该命令处理窗口直到成功、错误或请求截止时间；本改动不提供 DELETE、RunDeadline 或健康检查事件抢占快照操作的能力。需要缩短这段等待时应设置较短的快照超时，而不是绕过所有权校验或重复 capture。

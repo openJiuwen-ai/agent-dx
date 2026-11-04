@@ -7,9 +7,31 @@ use adx_core::{
 use std::{
     collections::hash_map::DefaultHasher,
     hash::{Hash, Hasher},
+    path::PathBuf,
     time::Duration,
 };
 use tokio::time::Instant;
+
+#[derive(Clone, Copy)]
+enum PublicationStage {
+    Captured,
+    CaptureRecorded,
+    Sealed,
+    HoldRecorded,
+    CatalogPublished,
+    Completed,
+}
+
+// Retained by the live owner across RPC failures. Persisted execution-artifact
+// holds protect the files; restart recovery still retires an unsealed capture.
+#[derive(Clone)]
+pub(super) struct SnapshotPublication {
+    pub(super) request: SnapshotRequest,
+    snapshot: Snapshot,
+    staged: PathBuf,
+    retains_capture: bool,
+    stage: PublicationStage,
+}
 
 fn publication_jitter_ms(environment_id: &str, generation: u64) -> u64 {
     let mut hasher = DefaultHasher::new();
@@ -67,6 +89,17 @@ impl Controller {
             .snapshots
             .clone()
             .ok_or_else(|| Error::Unavailable("snapshot catalog not configured".into()))?;
+        if let Some(pending) = &self.snapshot_publication {
+            let original = &pending.request;
+            if original.operation_id != request.operation_id
+                || original.expected_revision != request.expected_revision
+                || original.kind != request.kind
+                || original.names != request.names
+            {
+                return Err(Error::Conflict);
+            }
+            return self.finish_snapshot_publication(deadline).await;
+        }
         // Probe before stopping the source; creating a cluster snapshot needs Coordinator.
         match catalog.get(&id).await {
             Ok(snapshot) => {
@@ -94,10 +127,10 @@ impl Controller {
         )?;
 
         // Validate names before any lifecycle mutation.
-        let mut snapshot = Snapshot::new_with_kind(
+        let snapshot = Snapshot::new_with_kind(
             request.kind,
             id.clone(),
-            request.names,
+            request.names.clone(),
             self.record.spec.clone(),
             self.record.assignment.node_id.clone(),
             self.record.runtime.id.clone(),
@@ -128,28 +161,33 @@ impl Controller {
         }
         self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
         self.publish_snapshot_state(deadline).await?;
-        if let Err(error) = services
+        let prepared = services
             .cooperation
             .prepare(&self.record, &request.operation_id)
             .await
-        {
-            let aborted = services
-                .cooperation
-                .abort_unstarted(&self.record, &request.operation_id)
-                .await;
-            if aborted.is_err() {
-                self.cleanup().await?;
-                self.transition(Event::Fail)?;
+            .and_then(|()| super::workload_checkpoint::remaining_backend_timeout(Some(deadline)));
+        let timeout = match prepared {
+            Ok(timeout) => timeout,
+            Err(error) => {
+                let aborted = services
+                    .cooperation
+                    .abort_unstarted(&self.record, &request.operation_id)
+                    .await;
+                if aborted.is_err() {
+                    self.cleanup().await?;
+                    self.transition(Event::Fail)?;
+                }
+                self.record
+                    .execution_artifacts
+                    .retain(|a| a.size_bytes != 0);
+                self.record.revision =
+                    self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
+                self.sync().await?;
+                services.store.discard_staged(&staged).await?;
+                self.capture_preparation = None;
+                return Err(error);
             }
-            self.record
-                .execution_artifacts
-                .retain(|a| a.size_bytes != 0);
-            self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
-            self.sync().await?;
-            services.store.discard_staged(&staged).await?;
-            self.capture_preparation = None;
-            return Err(error);
-        }
+        };
         self.capture_preparation = None;
         let source_environment_id = self.record.spec.id.clone();
         let operation_id = request.operation_id.clone();
@@ -163,18 +201,12 @@ impl Controller {
             );
             error
         };
-        // Sandboxd accepts whole seconds. Share the workload-checkpoint
-        // rounding contract so a positive subsecond remainder never becomes 0.
-        let captured = match super::workload_checkpoint::remaining_backend_timeout(Some(deadline)) {
-            Ok(timeout) => {
-                self.services
-                    .runtime
-                    .checkpoint_running(&self.record.runtime.id, &staged, timeout)
-                    .await
-            }
-            Err(error) => Err(error),
-        }
-        .map_err(|error| step_error("runtime-capture", error));
+        let captured = self
+            .services
+            .runtime
+            .checkpoint_running(&self.record.runtime.id, &staged, timeout)
+            .await
+            .map_err(|error| step_error("runtime-capture", error));
         let captured = match captured {
             Ok(()) => services
                 .cooperation
@@ -196,55 +228,117 @@ impl Controller {
             .services
             .runtime
             .retains_capture_files(&self.record.spec.runtime_class);
-        // Firecracker may still use a running capture as its incremental base.
-        // runsc captures do not replace the input held by background restore.
-        if retains_capture {
-            let captured = services.store.retain_staged(&staged).await?;
-            let original = services.store.prepare_restore(&captured).await?;
-            self.hold_artifact(captured, original);
-        }
-        self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
-        self.publish_snapshot_state(deadline)
-            .await
-            .map_err(|error| step_error("capture-state-commit", error))?;
-        snapshot.artifact = services
-            .store
-            .seal(&staged)
-            .await
-            .map_err(|error| step_error("seal-artifact", error))?;
-        // Publication requires a durable temporary hold even when the runtime
-        // does not retain capture output. Existing restore inputs move into
-        // execution_files and remain protected when this temporary hold drops.
-        let access = services
-            .store
-            .prepare_restore(&snapshot.artifact)
-            .await
-            .map_err(|error| step_error("prepare-artifact-hold", error))?;
-        self.hold_artifact(snapshot.artifact.clone(), access);
-        self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
-        self.publish_snapshot_state(deadline)
-            .await
-            .map_err(|error| step_error("artifact-hold-commit", error))?;
-        let snapshot = catalog.publish(snapshot.clone()).await?;
-        services.store.committed(&snapshot.artifact).await?;
-        if !retains_capture {
-            self.record
-                .execution_artifacts
-                .retain(|a| a != &snapshot.artifact && a.location != staged.to_string_lossy());
-            self.recovery_files = None;
-        }
-        self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
-        self.completed(
-            request.operation_id,
-            request.expected_revision,
-            LifecycleKind::Snapshot,
-        );
-        self.durability = None;
-        let environment = self.publish_snapshot_state(deadline).await?;
-        Ok(SnapshotResult {
+        self.snapshot_publication = Some(SnapshotPublication {
+            request,
             snapshot,
-            environment,
-        })
+            staged,
+            retains_capture,
+            stage: PublicationStage::Captured,
+        });
+        self.finish_snapshot_publication(deadline).await
+    }
+
+    async fn finish_snapshot_publication(&mut self, deadline: Instant) -> Result<SnapshotResult> {
+        let mut pending = self.snapshot_publication.clone().ok_or(Error::Conflict)?;
+        let services = self
+            .services
+            .checkpoint
+            .clone()
+            .ok_or_else(|| Error::Unavailable("checkpoint storage not configured".into()))?;
+        let catalog = self
+            .services
+            .snapshots
+            .clone()
+            .ok_or_else(|| Error::Unavailable("snapshot catalog not configured".into()))?;
+        let source_environment_id = self.record.spec.id.clone();
+        let operation_id = pending.request.operation_id.clone();
+        let step_error = |phase: &'static str, error: Error| {
+            adx_observability::warn!(
+                environment_id = %source_environment_id,
+                operation_id = %operation_id,
+                phase,
+                error = %error,
+                "Reusable snapshot step failed"
+            );
+            error
+        };
+        loop {
+            match pending.stage {
+                PublicationStage::Captured => {
+                    // Firecracker may still use this capture as its incremental
+                    // base. Preserve the existing background-restore input too.
+                    if pending.retains_capture {
+                        let captured = services.store.retain_staged(&pending.staged).await?;
+                        let access = services.store.prepare_restore(&captured).await?;
+                        self.hold_artifact(captured, access);
+                    }
+                    self.record.revision =
+                        self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
+                    pending.stage = PublicationStage::CaptureRecorded;
+                }
+                PublicationStage::CaptureRecorded => {
+                    self.publish_snapshot_state(deadline)
+                        .await
+                        .map_err(|error| step_error("capture-state-commit", error))?;
+                    pending.snapshot.artifact = services
+                        .store
+                        .seal(&pending.staged)
+                        .await
+                        .map_err(|error| step_error("seal-artifact", error))?;
+                    pending.stage = PublicationStage::Sealed;
+                }
+                PublicationStage::Sealed => {
+                    // Even a runtime that does not retain output needs a
+                    // published temporary hold before catalog publication.
+                    let access = services
+                        .store
+                        .prepare_restore(&pending.snapshot.artifact)
+                        .await
+                        .map_err(|error| step_error("prepare-artifact-hold", error))?;
+                    self.hold_artifact(pending.snapshot.artifact.clone(), access);
+                    self.record.revision =
+                        self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
+                    pending.stage = PublicationStage::HoldRecorded;
+                }
+                PublicationStage::HoldRecorded => {
+                    self.publish_snapshot_state(deadline)
+                        .await
+                        .map_err(|error| step_error("artifact-hold-commit", error))?;
+                    pending.snapshot = catalog.publish(pending.snapshot.clone()).await?;
+                    pending.stage = PublicationStage::CatalogPublished;
+                }
+                PublicationStage::CatalogPublished => {
+                    services.store.committed(&pending.snapshot.artifact).await?;
+                    if !pending.retains_capture {
+                        self.record.execution_artifacts.retain(|artifact| {
+                            artifact != &pending.snapshot.artifact
+                                && artifact.location != pending.staged.to_string_lossy()
+                        });
+                        self.recovery_files = None;
+                    }
+                    self.record.revision =
+                        self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
+                    self.completed(
+                        pending.request.operation_id.clone(),
+                        pending.request.expected_revision,
+                        LifecycleKind::Snapshot,
+                    );
+                    self.durability = None;
+                    pending.stage = PublicationStage::Completed;
+                }
+                PublicationStage::Completed => {
+                    let environment = self.publish_snapshot_state(deadline).await?;
+                    self.snapshot_publication = None;
+                    return Ok(SnapshotResult {
+                        snapshot: pending.snapshot,
+                        environment,
+                    });
+                }
+            }
+            // Advance exactly once before the next fallible await. A retry of
+            // the same operation resumes publication and never repeats capture.
+            self.snapshot_publication = Some(pending.clone());
+        }
     }
 }
 
