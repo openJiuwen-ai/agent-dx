@@ -1,5 +1,6 @@
 use super::*;
 use std::sync::mpsc;
+const DEFAULT_QUEUE_BYTES: usize = 2 * 1024 * 1024 * 1024;
 fn queued_fs() -> AfsFuse {
     let mut fs = AfsFuse::new(Arc::new(EmptyBackend));
     fs.front_write = Some(Arc::new(front_write::FrontWriteQueue::new(32).unwrap()));
@@ -50,12 +51,18 @@ fn synchronous_append_and_writeback_requests_keep_old_ack_boundary() {
 #[test]
 fn configured_front_write_limit_reaches_the_mount_queue() {
     let options = FuseMountOptions {
-        dfs_write_queue_bytes: 64 * 1024 * 1024,
+        dfs: DfsMountOptions {
+            write_queue_bytes: 64 * 1024 * 1024,
+            ..Default::default()
+        },
         ..Default::default()
     };
     options.validate().unwrap();
-    let mut fs = AfsFuse::with_mount_options(Arc::new(EmptyBackend), options);
-    fs.enable_write_queue().unwrap();
+    let features = FuseMountFeatures::dfs(options.dfs, None).unwrap();
+    assert!(features.kernel_cache);
+    let mut fs = AfsFuse::with_mount_options(Arc::new(EmptyBackend), options.exec);
+    fs.enable_write_queue(features.write_queue_bytes.unwrap())
+        .unwrap();
     let q = fs.front_write.as_ref().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     q.submit_deferred_with(
@@ -69,25 +76,25 @@ fn configured_front_write_limit_reaches_the_mount_queue() {
         rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
         Err(libc::E2BIG)
     );
-    assert!(
-        FuseMountOptions {
-            dfs_write_queue_bytes: 0,
+    let invalid = FuseMountOptions {
+        dfs: DfsMountOptions {
+            write_queue_bytes: 0,
             ..Default::default()
-        }
-        .validate()
-        .is_err()
-    );
+        },
+        ..Default::default()
+    };
+    assert!(invalid.validate().is_err());
+    assert!(FuseMountFeatures::dfs(invalid.dfs, None).is_err());
 }
 
 #[test]
 fn normal_dfs_setup_enables_owned_write_admission_without_an_option() {
+    let features = FuseMountFeatures::dfs(DfsMountOptions::default(), None).unwrap();
+    assert_eq!(features.write_queue_bytes, Some(2 * 1024 * 1024 * 1024));
     let mut fs = AfsFuse::new(Arc::new(EmptyBackend));
-    fs.enable_write_queue().unwrap();
+    fs.enable_write_queue(features.write_queue_bytes.unwrap())
+        .unwrap();
     assert!(fs.front_write.is_some());
-    assert_eq!(
-        fs.mount_options.dfs_write_queue_bytes,
-        2 * 1024 * 1024 * 1024
-    );
     assert!(
         !fs.backend
             .accepts_queued_writes(crate::node::vfs::types::FileHandle(1))
@@ -96,7 +103,7 @@ fn normal_dfs_setup_enables_owned_write_admission_without_an_option() {
 #[test]
 fn last_close_observes_earlier_release_before_retiring_failed_inode() {
     let mut fs = AfsFuse::new(Arc::new(EmptyBackend));
-    fs.enable_write_queue().unwrap();
+    fs.enable_write_queue(DEFAULT_QUEUE_BYTES).unwrap();
     let fs = Arc::new(fs);
     fs.file_handle_inodes
         .lock()
@@ -135,7 +142,7 @@ fn last_close_observes_earlier_release_before_retiring_failed_inode() {
 #[test]
 fn no_write_backlog_does_not_serialize_existing_read_dispatch() {
     let mut fs = AfsFuse::new(Arc::new(EmptyBackend));
-    fs.enable_write_queue().unwrap();
+    fs.enable_write_queue(DEFAULT_QUEUE_BYTES).unwrap();
     let fs = Arc::new(fs);
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();

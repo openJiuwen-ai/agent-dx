@@ -452,16 +452,13 @@ impl ObjectFetcher {
         for task in tasks {
             // Test fixture teardown may be called inside the compatibility
             // current-thread runtime, while this fetcher owns a separate live
-            // multithread runtime. Never invoke block_in_place there.
-            let result = if tokio::runtime::Handle::try_current()
-                .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
-            {
-                tokio::task::block_in_place(|| self.runtime.block_on(task))
-            } else {
-                std::thread::scope(|scope| scope.spawn(|| self.runtime.block_on(task)).join())
-                    .map_err(|_| stopped())?
-            };
-            result.map_err(|_| stopped())?;
+            // multithread runtime; the bridge leaves the runtime context first.
+            crate::node::bridge::run_sync_backend(|| {
+                crate::node::bridge::block_on(&self.runtime, async {
+                    task.await.map_err(|_| stopped())
+                })
+            })
+            .map_err(|_| stopped())?;
         }
         Ok(())
     }

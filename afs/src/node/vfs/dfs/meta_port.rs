@@ -39,11 +39,30 @@ pub trait DfsMeta: Send + Sync {
     fn resolve_write_authority(&self, inode_id: &InodeId) -> Result<(InodeRecord, WriteLease)> {
         self.open_write(inode_id)
     }
+    /// Callable on an async worker. The default leaves the worker for the sync
+    /// method; a network client overrides it with its native future.
+    fn resolve_write_authority_async(
+        &self,
+        inode_id: InodeId,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, (InodeRecord, WriteLease)> {
+        Box::pin(async move {
+            crate::node::bridge::run_sync_backend(|| self.resolve_write_authority(&inode_id))
+        })
+    }
     fn renew_write_lease(&self, lease: WriteLease) -> Result<WriteLease>;
     fn sync_inode_metadata(&self, sync: SyncInodeMetadata) -> Result<InodeRecord>;
     fn commit_file_version(&self, commit: CommitFileVersion) -> Result<InodeRecord>;
     fn lookup_node_location(&self, node_id: &str) -> Result<Option<DfsNodeLocation>>;
     fn current_node_session(&self, node_id: &str) -> Result<Option<String>>;
+    /// See [`DfsMeta::resolve_write_authority_async`].
+    fn current_node_session_async(
+        &self,
+        node_id: String,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, Option<String>> {
+        Box::pin(async move {
+            crate::node::bridge::run_sync_backend(|| self.current_node_session(&node_id))
+        })
+    }
     fn mkdir(
         &self,
         operation_id: &OperationId,

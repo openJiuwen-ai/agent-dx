@@ -782,19 +782,22 @@ impl DistributedFs {
             return Err(invalid("native upload changed its immutable object"));
         }
         let notify = pipeline.notify.clone();
-        state.task = Some(pipeline.runtime.spawn_blocking(move || {
-            let _permit = permit;
-            let result = store
-                .put_chunks(vec![staged], PutIntent::NativeUpload)
-                .and_then(|mut receipts| {
-                    if receipts.len() != 1 {
-                        return Err(invalid("native upload returned the wrong receipt count"));
-                    }
-                    Ok(receipts.remove(0))
-                });
-            notify.notify_one();
-            result
-        }));
+        state.task = Some(crate::node::bridge::spawn_blocking_on(
+            &pipeline.runtime,
+            move || {
+                let _permit = permit;
+                let result = store
+                    .put_chunks(vec![staged], PutIntent::NativeUpload)
+                    .and_then(|mut receipts| {
+                        if receipts.len() != 1 {
+                            return Err(invalid("native upload returned the wrong receipt count"));
+                        }
+                        Ok(receipts.remove(0))
+                    });
+                notify.notify_one();
+                result
+            },
+        ));
         task_table.push(upload.clone());
         Ok(true)
     }
@@ -929,11 +932,13 @@ impl DistributedFs {
                 }
             };
             if let Some(task) = task {
-                let result = pipeline
-                    .runtime
-                    .block_on(task)
-                    .map_err(|error| unavailable(format!("native upload worker failed: {error}")))
-                    .and_then(|result| result);
+                let result = crate::node::bridge::block_on(&pipeline.runtime, async {
+                    task.await
+                        .map_err(|error| {
+                            unavailable(format!("native upload worker failed: {error}"))
+                        })
+                        .and_then(|result| result)
+                });
                 let installed = self.install_native_receipt(&upload, result);
                 // A consumed JoinHandle must leave the table even when receipt
                 // installation encounters a structural error. This guard only

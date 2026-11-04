@@ -688,7 +688,7 @@ impl MountedTestBackend {
         wait_until_mounted(&mount).unwrap();
         eprintln!(
             "DFS readahead requested_bytes={} kernel_kb={}",
-            options.fuse_max_readahead_bytes,
+            options.exec.fuse_max_readahead_bytes,
             dfs_read_ahead_kb(&mount)
         );
         Self {
@@ -736,7 +736,10 @@ fn dfs_buffered_reopen_refreshes_growth_and_truncation_with_new_heads() {
         backend.clone(),
         mount.clone(),
         fuse::FuseMountOptions {
-            fuse_max_readahead_bytes: 0,
+            exec: fuse::FuseExecOptions {
+                fuse_max_readahead_bytes: 0,
+                ..Default::default()
+            },
             ..Default::default()
         },
     );
@@ -825,8 +828,11 @@ fn assert_dfs_same_descriptor_parallel_reads(workers: u16, readers: usize) {
         backend,
         mount.clone(),
         fuse::FuseMountOptions {
-            fuse_workers: workers,
-            fuse_max_readahead_bytes: 0,
+            exec: fuse::FuseExecOptions {
+                fuse_workers: workers,
+                fuse_max_readahead_bytes: 0,
+                ..Default::default()
+            },
             ..Default::default()
         },
     );
@@ -884,7 +890,10 @@ fn dfs_same_cache_bucket_open_does_not_wait_for_another_inode_read() {
                 &mount,
                 metrics,
                 fuse::FuseMountOptions {
-                    fuse_max_readahead_bytes: 0,
+                    exec: fuse::FuseExecOptions {
+                        fuse_max_readahead_bytes: 0,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
             )
@@ -963,7 +972,7 @@ fn dfs_same_cache_bucket_open_does_not_wait_for_another_inode_read() {
         inodes[0],
         inodes[64],
         elapsed.as_micros(),
-        fuse::FuseMountOptions::default().fuse_workers
+        fuse::FuseExecOptions::default().fuse_workers
     );
     // The blocked READ is the correctness barrier, independent of the elapsed
     // OPEN diagnostic. Same-inode OPEN fencing has its own retained contract.
@@ -1023,7 +1032,10 @@ fn assert_dfs_open_fences_inflight_read(workers: u16) {
                 &mount,
                 metrics,
                 fuse::FuseMountOptions {
-                    fuse_workers: workers,
+                    exec: fuse::FuseExecOptions {
+                        fuse_workers: workers,
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
             )

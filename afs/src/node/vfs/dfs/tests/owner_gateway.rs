@@ -1819,3 +1819,200 @@ fn owner_operation_global_cap_rejects_before_applying() {
     }
     assert_eq!(fs.owner_gateway.remote_operation_entry_count(), 0);
 }
+
+/// A whole proxied session through the RPC entries, as `DfsOwnerFilesService` and
+/// `NodeControlService` run them.
+async fn owner_rpc_entries_serve_a_session(meta: &RecordingMeta, fs: Arc<DistributedFs>) {
+    use crate::node::vfs::{
+        dfs::owner_api::{DfsOwnerFilesHandler, DfsOwnerLifecycleHandler},
+        types::OpenOptions,
+    };
+    let peer = || "node-b".to_owned();
+    let sessions_before = meta.current_session_calls.load(Ordering::SeqCst);
+    let resolves_before = meta.resolve_write_calls.load(Ordering::SeqCst);
+
+    let handle = fs
+        .clone()
+        .open_async(
+            peer(),
+            dfs_owner_open_request(1, libc::O_RDWR),
+            OpenOptions::default(),
+        )
+        .await
+        .unwrap()
+        .handle
+        .expect("owner open returns handle");
+    let data_handle = data_owner_handle(&handle);
+    let written = fs
+        .clone()
+        .write_async(
+            peer(),
+            afs_protocol::node_data::DfsOwnerWriteRequest {
+                handle: Some(data_handle.clone()),
+                operation_id: "async-write".into(),
+                offset: 0,
+                data: b"hi".to_vec(),
+                append: false,
+                kill_suidgid: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(written.written, 2);
+    let resized = fs
+        .clone()
+        .resize_async(
+            peer(),
+            afs_protocol::node_data::DfsOwnerResizeRequest {
+                handle: Some(data_handle.clone()),
+                operation_id: "async-resize".into(),
+                length: 2,
+                kill_suidgid: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(resized.accepted_write_seq >= written.accepted_write_seq);
+    let synced = fs
+        .clone()
+        .sync_async(
+            peer(),
+            afs_protocol::node_data::DfsOwnerSyncRequest {
+                handle: Some(data_handle.clone()),
+                operation_id: "async-sync".into(),
+                through_write_seq: resized.accepted_write_seq,
+                data_only: false,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(synced.durable_write_seq, resized.accepted_write_seq);
+    let read = fs
+        .clone()
+        .read_async(
+            peer(),
+            afs_protocol::node_data::DfsOwnerReadRequest {
+                handle: Some(data_handle),
+                offset: 0,
+                length: 2,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(read.data, b"hi");
+    let attr = fs
+        .clone()
+        .getattr_async(
+            peer(),
+            afs_protocol::node_control::DfsOwnerGetAttrRequest {
+                handle: Some(handle.clone()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(attr.attr.unwrap().size, 2);
+    fs.clone()
+        .release_async(
+            peer(),
+            afs_protocol::node_control::DfsOwnerReleaseRequest {
+                handle: Some(handle),
+            },
+        )
+        .await
+        .unwrap();
+
+    // Every Meta check of the session went through the async port: the fake's
+    // async methods delegate to its sync ones, so the two counts must agree.
+    let sessions = meta.current_session_calls.load(Ordering::SeqCst) - sessions_before;
+    assert!(
+        sessions >= 7,
+        "one check per RPC, two for release: {sessions}"
+    );
+    assert_eq!(
+        meta.current_session_async_calls.load(Ordering::SeqCst),
+        sessions
+    );
+    assert_eq!(
+        meta.resolve_write_calls.load(Ordering::SeqCst) - resolves_before,
+        1
+    );
+    assert_eq!(meta.resolve_write_async_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_rpc_entries_await_meta_on_a_multi_thread_runtime() {
+    let (_temp, meta, fs) = test_fs();
+    owner_rpc_entries_serve_a_session(&meta, Arc::new(fs)).await;
+}
+
+#[tokio::test]
+async fn owner_rpc_entries_await_meta_on_a_current_thread_runtime() {
+    let (_temp, meta, fs) = test_fs();
+    owner_rpc_entries_serve_a_session(&meta, Arc::new(fs)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_open_async_meta_failure_clears_inflight_admission() {
+    use crate::node::vfs::{dfs::owner_api::DfsOwnerLifecycleHandler, types::OpenOptions};
+    let (_temp, meta, fs) = test_fs();
+    let fs = Arc::new(fs);
+    meta.fail_next_open_write_with(unavailable("injected open_write failure"));
+    let error = fs
+        .clone()
+        .open_async(
+            "node-b".to_owned(),
+            dfs_owner_open_request(1, libc::O_RDWR),
+            OpenOptions::default(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE);
+    let routes = fs.owner_gateway.owner_open_routes.lock().unwrap();
+    let state = routes.values().next().unwrap();
+    assert_eq!(state.highwater, 1);
+    assert!(state.inflight.is_empty());
+    assert!(state.active.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn owner_write_async_rejects_a_stale_caller_session_before_applying() {
+    use crate::node::vfs::{
+        dfs::owner_api::{DfsOwnerFilesHandler, DfsOwnerLifecycleHandler},
+        types::OpenOptions,
+    };
+    let (_temp, meta, fs) = test_fs();
+    let fs = Arc::new(fs);
+    let handle = fs
+        .clone()
+        .open_async(
+            "node-b".to_owned(),
+            dfs_owner_open_request(1, libc::O_RDWR),
+            OpenOptions::default(),
+        )
+        .await
+        .unwrap()
+        .handle
+        .unwrap();
+    meta.node_sessions
+        .lock()
+        .unwrap()
+        .insert("node-b".to_owned(), Some("session-restarted".to_owned()));
+    let error = fs
+        .clone()
+        .write_async(
+            "node-b".to_owned(),
+            afs_protocol::node_data::DfsOwnerWriteRequest {
+                handle: Some(data_owner_handle(&handle)),
+                operation_id: "stale-caller".into(),
+                offset: 0,
+                data: b"x".to_vec(),
+                append: false,
+                kill_suidgid: false,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), afs_error::NODE_DFS_STALE_HANDLE);
+    assert!(error.to_string().contains("caller session is stale"));
+    assert_eq!(fs.owner_gateway.remote_operation_entry_count(), 0);
+}

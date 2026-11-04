@@ -192,9 +192,7 @@ pub trait ReadSourceProvider: Send + Sync {
         &self,
         request: DfsChunkSourcesRequest,
     ) -> super::read_pipeline::ReadFuture<'_, DfsChunkSourcesReply> {
-        Box::pin(
-            async move { super::read_pipeline::sync_read_backend(|| self.sources_for(request)) },
-        )
+        Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.sources_for(request)) })
     }
 }
 
@@ -507,25 +505,7 @@ pub trait ChunkTransfer: Send + Sync {
     /// Synchronous callers are compatibility boundaries; all scheduling logic
     /// lives in the same async core used by FUSE. Real gRPC overrides this.
     fn block_on_read(&self, future: super::read_pipeline::ReadFuture<'_, ()>) -> Result<()> {
-        std::thread::scope(|scope| {
-            scope
-                .spawn(move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|e| {
-                            Error::coded(afs_error::CLIENT_WORKER_FAILED, e.to_string())
-                        })?;
-                    runtime.block_on(future)
-                })
-                .join()
-                .map_err(|_| {
-                    Error::coded(
-                        afs_error::CLIENT_WORKER_FAILED,
-                        "sync read adapter panicked",
-                    )
-                })?
-        })
+        crate::node::bridge::block_on_scoped_runtime(future)
     }
 
     fn read_ranges_async<'a>(
@@ -534,7 +514,7 @@ pub trait ChunkTransfer: Send + Sync {
         out: &'a mut [u8],
     ) -> super::read_pipeline::ReadFuture<'a, ()> {
         Box::pin(
-            async move { super::read_pipeline::sync_read_backend(|| self.read_ranges(batch, out)) },
+            async move { crate::node::bridge::run_sync_backend(|| self.read_ranges(batch, out)) },
         )
     }
     fn read_crc32c_range_async<'a>(
@@ -544,7 +524,7 @@ pub trait ChunkTransfer: Send + Sync {
         out: &'a mut [u8],
     ) -> super::read_pipeline::ReadFuture<'a, ()> {
         Box::pin(async move {
-            super::read_pipeline::sync_read_backend(|| self.read_crc32c_range(batch, chunk, out))
+            crate::node::bridge::run_sync_backend(|| self.read_crc32c_range(batch, chunk, out))
         })
     }
 
@@ -572,7 +552,7 @@ pub trait ChunkTransfer: Send + Sync {
         proof_budget: Arc<OutboardBudget>,
     ) -> super::read_pipeline::ReadFuture<'a, VerifiedPeerChunk<'a>> {
         Box::pin(async move {
-            super::read_pipeline::sync_read_backend(|| {
+            crate::node::bridge::run_sync_backend(|| {
                 self.read_verified_object(batch, chunk, out, proof_budget)
             })
         })
@@ -587,7 +567,7 @@ pub trait ChunkTransfer: Send + Sync {
         prefetch: Option<&'a PrefetchControl>,
     ) -> super::read_pipeline::ReadFuture<'a, Option<CompletedPeerDiskRead<'output>>> {
         Box::pin(async move {
-            super::read_pipeline::sync_read_backend(|| {
+            crate::node::bridge::run_sync_backend(|| {
                 if let Some(control) = prefetch {
                     self.try_read_verified_object_to_sink(
                         batch,
@@ -3013,7 +2993,7 @@ impl DfsReadEngine {
     ) -> Result<()> {
         self.local
             .record_read_check(super::read_work::ReadCheck::BatchGroup);
-        let remote = super::read_pipeline::local_io(|| -> Result<Vec<bool>> {
+        let remote = crate::node::bridge::local_io(|| -> Result<Vec<bool>> {
             let mut groups: Vec<(ChunkId, Vec<usize>)> = Vec::new();
             let mut positions: HashMap<ChunkId, usize> = HashMap::new();
             for (index, op) in batch.ops.iter().enumerate() {
@@ -3790,7 +3770,7 @@ impl DfsReadEngine {
             clock: PeerFillClock::start(),
             active: false,
         };
-        let mut operation = match super::read_pipeline::local_io(|| cache.operation()) {
+        let mut operation = match crate::node::bridge::local_io(|| cache.operation()) {
             Ok(operation) => operation,
             Err(error) => {
                 self.local.record_peer_disk_cache_event("fallback");
@@ -3803,7 +3783,7 @@ impl DfsReadEngine {
         self.check_peer_cache_authority(batch, source, &authority)?;
         let start = op.output_offset;
         let end = start + op.length as usize; // batch validated before scheduling
-        if super::read_pipeline::local_io(|| {
+        if crate::node::bridge::local_io(|| {
             self.read_optional_peer_cache(
                 &mut operation,
                 chunk,
@@ -3849,7 +3829,7 @@ impl DfsReadEngine {
                     crate::node::peer_cache::FillOutcome::Ready => {
                         #[cfg(test)]
                         self.wait_peer_cache_recheck_for_test("follower_ready");
-                        let hit = super::read_pipeline::local_io(|| {
+                        let hit = crate::node::bridge::local_io(|| {
                             self.read_optional_peer_cache(
                                 &mut operation,
                                 chunk,
@@ -3894,7 +3874,7 @@ impl DfsReadEngine {
             // waited for the global body allowance. Recheck before any allocation.
             #[cfg(test)]
             self.wait_peer_cache_recheck_for_test("leader_recheck");
-            if super::read_pipeline::local_io(||self.read_optional_peer_cache(
+            if crate::node::bridge::local_io(||self.read_optional_peer_cache(
                 &mut operation,
                 chunk,
                 op.chunk_offset,
@@ -3961,7 +3941,7 @@ impl DfsReadEngine {
                 if use_stream {
                     // The adapter's Node-shared session owns transport work until
                     // its producers and every handed-off frame have drained.
-                    let mut sink = super::read_pipeline::local_io(||operation.begin_stream(chunk))?;
+                    let mut sink = crate::node::bridge::local_io(||operation.begin_stream(chunk))?;
                     if stream_only && !sink.is_caching() {
                         leader.finish(crate::node::peer_cache::FillOutcome::Uncached);
                         return Ok(false);
@@ -4014,7 +3994,7 @@ impl DfsReadEngine {
                             drop(preparation.take());
                             let stored = {
                                 let _store = PeerFillStage::start(&self.local, "store");
-                                super::read_pipeline::local_io(||sink.commit(completed))
+                                crate::node::bridge::local_io(||sink.commit(completed))
                             };
                             let _delivery = PeerFillStage::start(&self.local, "deliver");
                             leader.finish(if stored.as_ref().is_ok_and(|stored| *stored) {
@@ -4104,7 +4084,7 @@ impl DfsReadEngine {
                         drop(preparation.take());
                         let stored = {
                             let _store = PeerFillStage::start(&self.local, "store");
-                            super::read_pipeline::local_io(||operation.store_verified(&verified))
+                            crate::node::bridge::local_io(||operation.store_verified(&verified))
                         };
                         let _delivery = PeerFillStage::start(&self.local, "deliver");
                         leader.finish(if stored.as_ref().is_ok_and(|stored| *stored) {
@@ -4405,7 +4385,7 @@ impl DfsReadEngine {
             .chunk
             .as_ref()
             .ok_or_else(|| invalid("DFS prefetch object missing"))?;
-        match super::read_pipeline::local_io(|| cache.try_contains_ready(chunk))? {
+        match crate::node::bridge::local_io(|| cache.try_contains_ready(chunk))? {
             Some(false) => {}
             ready => {
                 leader.finish(if ready == Some(true) {
@@ -4416,11 +4396,11 @@ impl DfsReadEngine {
                 return Ok(());
             }
         }
-        let Some(mut operation) = super::read_pipeline::local_io(|| cache.try_operation())? else {
+        let Some(mut operation) = crate::node::bridge::local_io(|| cache.try_operation())? else {
             leader.finish(super::peer_cache::FillOutcome::Uncached);
             return Ok(());
         };
-        let Some(mut sink) = super::read_pipeline::local_io(|| operation.try_begin_stream(chunk))?
+        let Some(mut sink) = crate::node::bridge::local_io(|| operation.try_begin_stream(chunk))?
         else {
             leader.finish(super::peer_cache::FillOutcome::Uncached);
             return Ok(());
@@ -4472,7 +4452,7 @@ impl DfsReadEngine {
             return Ok(());
         };
         control.check()?;
-        let stored = super::read_pipeline::local_io(|| sink.commit(completed))?;
+        let stored = crate::node::bridge::local_io(|| sink.commit(completed))?;
         leader.finish(if stored {
             super::peer_cache::FillOutcome::Ready
         } else {

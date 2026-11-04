@@ -30,7 +30,7 @@ use std::{
 use crate::node::rpc::data::{PeerAuthenticator, authenticate_peer};
 #[cfg(feature = "dfs")]
 use crate::node::vfs::dfs::owner_api::{
-    DfsOwnerLifecycleHandler, dfs_owner_lifecycle_unimplemented,
+    DfsOwnerLifecycleHandler, OwnerFuture, dfs_owner_lifecycle_unimplemented,
 };
 #[cfg(feature = "dfs")]
 use crate::node::vfs::types::OpenOptions;
@@ -267,7 +267,7 @@ impl RdmaSessionRegistry {
                 // 工作任务持有 Arc 和 endpoint 锁直到 CQ 消费结束。即使 RPC future
                 // 被取消，接收缓冲和队列也不会提前释放；并发首请求只消费一次探测。
                 let pending = session.clone();
-                tokio::task::spawn_blocking(move || {
+                crate::node::bridge::spawn_blocking(move || {
                     let mut endpoint = pending.endpoint.blocking_lock();
                     if pending.poisoned.load(Ordering::SeqCst) {
                         return Err(coded_status(
@@ -519,7 +519,7 @@ impl NodeControlService {
                 .dispatch_blocking_lock_call(move || call(handler, peer, body))
                 .await;
         }
-        tokio::task::spawn_blocking(move || call(handler, peer, body))
+        crate::node::bridge::spawn_blocking(move || call(handler, peer, body))
             .await
             .map_err(|error| Status::internal(error.to_string()))?
             .map(Response::new)
@@ -584,7 +584,31 @@ impl NodeControlService {
             .ok_or_else(|| Status::permission_denied("DFS owner has no peer authenticator"))?;
         let peer = authenticate_peer(authenticator.as_ref(), &request)?;
         let request = request.into_inner();
-        tokio::task::spawn_blocking(move || call(handler, peer, request))
+        crate::node::bridge::spawn_blocking(move || call(handler, peer, request))
+            .await
+            .map_err(|error| Status::internal(error.to_string()))?
+            .map(Response::new)
+            .map_err(error_to_status)
+    }
+
+    /// Lifecycle RPCs whose handler serves them on the async worker.
+    #[cfg(feature = "dfs")]
+    async fn dispatch_dfs_owner_async<Req: Send + 'static, Reply: Send + 'static>(
+        &self,
+        request: Request<Req>,
+        call: impl FnOnce(Arc<dyn DfsOwnerLifecycleHandler>, String, Req) -> OwnerFuture<Reply>,
+    ) -> Result<Response<Reply>, Status> {
+        let handler = self
+            .dfs_owner
+            .clone()
+            .ok_or_else(|| error_to_status(dfs_owner_lifecycle_unimplemented()))?;
+        let authenticator = self
+            .dfs_authenticator
+            .as_ref()
+            .ok_or_else(|| Status::permission_denied("DFS owner has no peer authenticator"))?;
+        let peer = authenticate_peer(authenticator.as_ref(), &request)?;
+        let request = request.into_inner();
+        crate::node::bridge::run_detached(call(handler, peer, request))
             .await
             .map_err(|error| Status::internal(error.to_string()))?
             .map(Response::new)
@@ -651,7 +675,7 @@ impl NodeControl for NodeControlService {
                 gid: request.gid,
                 mode: request.mode,
             };
-            tokio::task::spawn_blocking(move || {
+            crate::node::bridge::spawn_blocking(move || {
                 owner.prepare_owner_root(&peer, &reservation, &params)
             })
             .await
@@ -907,7 +931,7 @@ impl NodeControl for NodeControlService {
                 .ok_or_else(|| Status::unimplemented("OwnerFs peer authority is not wired"))?;
             let auth_peer = peer.clone();
             let auth_access = presented_access.clone();
-            tokio::task::spawn_blocking(move || {
+            crate::node::bridge::spawn_blocking(move || {
                 handler.authorize_transport(&auth_peer, &auth_access)
             })
             .await
@@ -998,8 +1022,8 @@ impl NodeControl for NodeControlService {
         let options = OpenOptions {
             kill_suidgid: body.kill_suidgid,
         };
-        self.dispatch_dfs_owner(request, move |handler, peer, request| {
-            handler.open_with_options(&peer, request, options)
+        self.dispatch_dfs_owner_async(request, move |handler, peer, request| {
+            handler.open_async(peer, request, options)
         })
         .await
     }
@@ -1010,8 +1034,8 @@ impl NodeControl for NodeControlService {
         request: Request<DfsOwnerGetAttrRequest>,
     ) -> Result<Response<DfsOwnerGetAttrReply>, Status> {
         validate_dfs_owner_control_handle(request.get_ref().handle.as_ref())?;
-        self.dispatch_dfs_owner(request, |handler, peer, request| {
-            handler.getattr(&peer, request)
+        self.dispatch_dfs_owner_async(request, |handler, peer, request| {
+            handler.getattr_async(peer, request)
         })
         .await
     }
@@ -1141,8 +1165,8 @@ impl NodeControl for NodeControlService {
         request: Request<DfsOwnerReleaseRequest>,
     ) -> Result<Response<DfsOwnerReleaseReply>, Status> {
         validate_dfs_owner_release_handle(request.get_ref().handle.as_ref())?;
-        self.dispatch_dfs_owner(request, |handler, peer, request| {
-            handler.release(&peer, request)
+        self.dispatch_dfs_owner_async(request, |handler, peer, request| {
+            handler.release_async(peer, request)
         })
         .await
     }
@@ -1253,7 +1277,7 @@ async fn negotiate_rdma(
     }
     let admission = registry.reserve_admission().await?;
     let client_info = request.client_info;
-    let (endpoint, info) = tokio::task::spawn_blocking(move || {
+    let (endpoint, info) = crate::node::bridge::spawn_blocking(move || {
         let mut endpoint =
             RdmaEndpoint::open_with_capacity(&device, requested_capacity).map_err(native_status)?;
         let info = endpoint.info().map_err(native_status)?;
@@ -1559,7 +1583,7 @@ impl Drop for OwnerLockCancelOnDrop {
             // Cancel the exact pending request when the HTTP/2 response future
             // is dropped. A raced Granted outcome is retained; no broad unlock.
             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                runtime.spawn_blocking(move || {
+                crate::node::bridge::spawn_blocking_on(&runtime, move || {
                     let _ = handler.cancel_lock_wait(&peer, &access, waiter);
                 });
             }

@@ -115,7 +115,7 @@ fn page_cache_identity_metadata_has_entry_and_version_byte_limits() {
 
 #[test]
 fn fuse_mount_options_wire_threads_clone_and_zero_ttls() {
-    let options = super::FuseMountOptions {
+    let options = super::FuseExecOptions {
         fuse_threads: 2,
         fuse_clone_fd: true,
         fuse_workers: 1,
@@ -127,7 +127,7 @@ fn fuse_mount_options_wire_threads_clone_and_zero_ttls() {
     let single = super::configured_mount(
         "afs-unit",
         false,
-        super::FuseMountOptions {
+        super::FuseExecOptions {
             fuse_threads: 1,
             ..options
         },
@@ -138,22 +138,33 @@ fn fuse_mount_options_wire_threads_clone_and_zero_ttls() {
     assert_eq!(fs.entry_ttls(), (Duration::ZERO, Duration::ZERO));
     fs.cached_io = true;
     assert_eq!(fs.entry_ttls(), (Duration::ZERO, Duration::ZERO));
-    assert!(
-        super::FuseMountOptions {
+    let mut dfs_ttl = None;
+    super::policy::with_cache_policy(
+        &super::DfsFusePolicy,
+        crate::node::vfs::types::BackendInode { value: 7 },
+        |ttl, private| dfs_ttl = Some((ttl, private)),
+    );
+    assert_eq!(dfs_ttl, Some((Duration::ZERO, false)));
+    for invalid in [
+        super::FuseExecOptions {
             fuse_threads: 0,
             ..options
-        }
-        .validate()
-        .is_err()
-    );
-    assert!(
-        super::FuseMountOptions {
+        },
+        super::FuseExecOptions {
             fuse_workers: 0,
             ..options
-        }
-        .validate()
-        .is_err()
-    );
+        },
+    ] {
+        assert!(invalid.validate().is_err());
+        assert!(
+            super::FuseMountOptions {
+                exec: invalid,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
 }
 
 #[test]
@@ -294,7 +305,7 @@ fn inode_cache_open_fence_drains_with_small_and_production_worker_counts() {
     for workers in [
         1,
         2,
-        usize::from(super::FuseMountOptions::default().fuse_workers),
+        usize::from(super::FuseExecOptions::default().fuse_workers),
     ] {
         let dispatch = Arc::new(super::FuseDispatch::new(workers));
         let fs = super::AfsFuse::new(Arc::new(OwnedReadBackend::default()));
@@ -545,7 +556,7 @@ fn borrowed_write_and_release_follow_the_read_batch_with_production_workers() {
     for workers in [
         1,
         2,
-        usize::from(super::FuseMountOptions::default().fuse_workers),
+        usize::from(super::FuseExecOptions::default().fuse_workers),
     ] {
         let dispatch = super::FuseDispatch::new(workers);
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1285,7 +1296,7 @@ impl Drop for RejectedCallbackCapture {
 fn closing_dispatch_drops_a_blocked_callback_without_running_its_body() {
     for workers in [
         1,
-        usize::from(super::FuseMountOptions::default().fuse_workers),
+        usize::from(super::FuseExecOptions::default().fuse_workers),
     ] {
         for access in [super::FuseAccess::Exclusive, super::FuseAccess::Read] {
             let dispatch = Arc::new(FuseDispatch::new(workers));

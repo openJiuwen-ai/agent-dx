@@ -6,6 +6,7 @@
 //! 访问先通过 FUSE notifier 失效本机缓存，再由 Home 执行该请求。
 
 mod front_write;
+pub(crate) mod policy;
 #[cfg(feature = "dfs")]
 mod read_pipeline;
 mod state;
@@ -38,8 +39,6 @@ use fuser::{
 };
 use tokio::sync::RwLock;
 
-#[cfg(feature = "ownerfs")]
-use crate::node::vfs::ownerfs::OwnerFs;
 use crate::node::vfs::{
     Backend, PageCacheIdentity, WriteAdmissionMode,
     types::{
@@ -49,9 +48,10 @@ use crate::node::vfs::{
     },
 };
 
+use self::policy::{DefaultFusePolicy, DfsFusePolicy, FuseMountFeatures, FuseMountPolicy};
 use self::state::{FuseNode, FuseState, ROOT_INO};
 
-const TTL: Duration = Duration::ZERO;
+const TTL: Duration = policy::UNCACHED_TTL;
 const DIRECT_IO: FopenFlags = FopenFlags::FOPEN_DIRECT_IO;
 const MAX_INLINE_LOCAL_READ_SCRATCH: usize = 1024 * 1024;
 const PAGE_CACHE_IDENTITIES: usize = 65_536;
@@ -79,31 +79,50 @@ fn xattr_front_ordering(backend: &dyn Backend, name: &OsStr) -> FrontOrdering {
     }
 }
 
-/// Explicit execution and DFS cache policy for one mounted FUSE session.
-/// OwnerFs consumes execution settings only; its private cache policy remains
-/// owned by OwnerFs. Nonzero DFS TTLs intentionally relax remote freshness.
-#[derive(Clone, Copy, Debug)]
+/// FUSE mount settings as configured: execution settings shared by every
+/// backend plus DFS-only settings. OwnerFs mounts consume and validate only
+/// [`FuseExecOptions`]; their kernel cache policy is owned by OwnerFs.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct FuseMountOptions {
+    pub exec: FuseExecOptions,
+    pub dfs: DfsMountOptions,
+}
+
+/// Execution settings shared by every FUSE mount.
+#[derive(Clone, Copy, Debug)]
+pub struct FuseExecOptions {
     pub fuse_threads: u16,
     pub fuse_clone_fd: bool,
     pub fuse_workers: u16,
     pub fuse_max_tasks: Option<usize>,
-    pub dfs_read_pipeline: crate::node::read_pipeline::ReadPipelineLimits,
     pub fuse_max_readahead_bytes: u32,
-    /// Front-owned normal ordinary-write payload; downstream buffers are separate.
-    pub dfs_write_queue_bytes: u64,
 }
 
-impl Default for FuseMountOptions {
+/// Settings only DFS mounts use.
+#[derive(Clone, Copy, Debug)]
+pub struct DfsMountOptions {
+    pub read_pipeline: crate::node::read_pipeline::ReadPipelineLimits,
+    /// Front-owned normal ordinary-write payload; downstream buffers are separate.
+    pub write_queue_bytes: u64,
+}
+
+impl Default for FuseExecOptions {
     fn default() -> Self {
         Self {
             fuse_threads: 4,
             fuse_clone_fd: true,
             fuse_workers: 32,
             fuse_max_tasks: None,
-            dfs_read_pipeline: Default::default(),
             fuse_max_readahead_bytes: 16 * 1024 * 1024,
-            dfs_write_queue_bytes: 2 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+impl Default for DfsMountOptions {
+    fn default() -> Self {
+        Self {
+            read_pipeline: Default::default(),
+            write_queue_bytes: 2 * 1024 * 1024 * 1024,
         }
     }
 }
@@ -111,40 +130,76 @@ impl Default for FuseMountOptions {
 impl From<&crate::config::Config> for FuseMountOptions {
     fn from(config: &crate::config::Config) -> Self {
         Self {
-            fuse_threads: config.fuse_threads,
-            fuse_clone_fd: config.fuse_clone_fd,
-            fuse_workers: config.fuse_workers,
-            fuse_max_tasks: Some(config.fuse_max_tasks),
-            dfs_read_pipeline: config.dfs_read_pipeline,
-            fuse_max_readahead_bytes: config.fuse_max_readahead_bytes,
-            dfs_write_queue_bytes: config.dfs_write_queue_bytes,
+            exec: FuseExecOptions {
+                fuse_threads: config.fuse_threads,
+                fuse_clone_fd: config.fuse_clone_fd,
+                fuse_workers: config.fuse_workers,
+                fuse_max_tasks: Some(config.fuse_max_tasks),
+                fuse_max_readahead_bytes: config.fuse_max_readahead_bytes,
+            },
+            dfs: DfsMountOptions {
+                read_pipeline: config.dfs_read_pipeline,
+                write_queue_bytes: config.dfs_write_queue_bytes,
+            },
         }
     }
 }
 
+fn mount_bounds_error() -> Error {
+    Error::coded(
+        afs_error::CONFIG_INVALID,
+        "FUSE mount options exceed supported bounds",
+    )
+}
+
 impl FuseMountOptions {
+    /// Validates both parts, as a DFS mount requires.
+    fn validate(self) -> Result<Self> {
+        self.dfs.read_pipeline.validate()?;
+        if !self.exec.in_bounds() || !self.dfs.write_queue_in_bounds() {
+            return Err(mount_bounds_error());
+        }
+        Ok(self)
+    }
+}
+
+impl FuseExecOptions {
     fn task_capacity(self) -> usize {
         self.fuse_max_tasks
             .unwrap_or(usize::from(self.fuse_workers) * 8)
     }
 
-    fn validate(self) -> Result<Self> {
-        self.dfs_read_pipeline.validate()?;
-        if !(1..=64).contains(&self.fuse_threads)
-            || !(1..=1024).contains(&self.fuse_workers)
-            || self
+    fn in_bounds(self) -> bool {
+        (1..=64).contains(&self.fuse_threads)
+            && (1..=1024).contains(&self.fuse_workers)
+            && self
                 .fuse_max_tasks
-                .is_some_and(|n| !(1..=65_536).contains(&n))
-            || self.fuse_max_readahead_bytes > 16 * 1024 * 1024
-            || !(8 * 1024 * 1024..=1024 * 1024 * 1024 * 1024).contains(&self.dfs_write_queue_bytes)
-            || usize::try_from(self.dfs_write_queue_bytes).is_err()
-        {
-            return Err(Error::coded(
-                afs_error::CONFIG_INVALID,
-                "FUSE mount options exceed supported bounds",
-            ));
+                .is_none_or(|n| (1..=65_536).contains(&n))
+            && self.fuse_max_readahead_bytes <= 16 * 1024 * 1024
+    }
+
+    pub(crate) fn validate(self) -> Result<Self> {
+        if self.in_bounds() {
+            Ok(self)
+        } else {
+            Err(mount_bounds_error())
         }
-        Ok(self)
+    }
+}
+
+impl DfsMountOptions {
+    fn write_queue_in_bounds(self) -> bool {
+        (8 * 1024 * 1024..=1024 * 1024 * 1024 * 1024).contains(&self.write_queue_bytes)
+            && usize::try_from(self.write_queue_bytes).is_ok()
+    }
+
+    fn validate(self) -> Result<Self> {
+        self.read_pipeline.validate()?;
+        if self.write_queue_in_bounds() {
+            Ok(self)
+        } else {
+            Err(mount_bounds_error())
+        }
     }
 }
 
@@ -674,15 +729,44 @@ fn mount_dfs_inner(
     bridge: Option<Arc<FdBridge>>,
 ) -> Result<MountedFuse> {
     let options = options.validate()?;
+    let features = FuseMountFeatures::dfs(options.dfs, bridge)?;
+    mount_with_policy(
+        backend,
+        path,
+        Arc::new(DfsFusePolicy),
+        features,
+        options.exec,
+        metrics,
+        #[cfg(any(feature = "dfs", test))]
+        read_work,
+    )
+}
+
+/// Mount `backend` with an explicit per-mount policy and feature set. Only
+/// the shared execution options are validated here; feature constructors
+/// validate their own settings.
+pub(crate) fn mount_with_policy(
+    backend: Arc<dyn Backend>,
+    path: &Path,
+    policy: Arc<dyn FuseMountPolicy>,
+    features: FuseMountFeatures,
+    exec: FuseExecOptions,
+    metrics: Option<FuseRequestMetrics>,
+    #[cfg(any(feature = "dfs", test))] read_work: Option<crate::node::read_work::ReadWorkMetrics>,
+) -> Result<MountedFuse> {
+    let exec = exec.validate()?;
     let path = canonical_mount_path(path)?;
     reject_existing_mount(&path)?;
-    if let Some(bridge) = &bridge {
+    if let Some(bridge) = &features.fd_bridge {
         bridge.bind(&backend)?;
     }
-    let mut fs = AfsFuse::with_mount_options(backend, options);
-    fs.fd_bridge = bridge.clone();
-    fs.enable_write_queue().map_err(Error::from)?;
-    fs.requests = metrics.map(|metrics| (metrics, "dfs"));
+    let mut fs = AfsFuse::with_mount_options(backend, exec);
+    fs.requests = metrics.map(|metrics| (metrics, policy.label()));
+    fs.policy = policy.clone();
+    fs.fd_bridge = features.fd_bridge.clone();
+    if let Some(bytes) = features.write_queue_bytes {
+        fs.enable_write_queue(bytes).map_err(Error::from)?;
+    }
     #[cfg(any(feature = "dfs", test))]
     {
         if let Some(metrics) = &read_work {
@@ -690,67 +774,34 @@ fn mount_dfs_inner(
         }
         fs.read_work = read_work;
     }
-    // Cached write-through sends each syscall write to the inode owner and
-    // keeps this mount's pages coherent. KEEP_CACHE requires an exact fresh
-    // committed identity; writeback remains disabled.
-    fs.cached_io = true;
+    fs.cached_io = features.kernel_cache;
     #[cfg(feature = "dfs")]
-    fs.enable_read_pipeline()?;
+    if let Some(limits) = features.read_pipeline {
+        fs.enable_read_pipeline(limits)?;
+    }
+    #[cfg(not(feature = "dfs"))]
+    let _ = features.read_pipeline;
     let cleanup_error = fs.cleanup_error.clone();
-    let session = fuser::spawn_mount(fs, &path, &configured_mount("afs-dfs", true, options))
+    let fs_name = format!("afs-{}", policy.label());
+    let session = fuser::spawn_mount(fs, &path, &configured_mount(&fs_name, true, exec))
         .map_err(Error::from)?;
     #[cfg(target_os = "linux")]
-    configure_mount_readahead(&path, options.fuse_max_readahead_bytes);
-    if let Some(bridge) = bridge {
+    if features.kernel_cache {
+        configure_mount_readahead(&path, exec.fuse_max_readahead_bytes);
+    }
+    if let Some(bridge) = &features.fd_bridge {
         bridge.set_notifier(session.notifier());
     }
+    policy.on_mounted(session.notifier());
     MountedFuse::new(session, &path, cleanup_error)
 }
 
-/// OwnerFs 使用相同 FUSE 实现，并额外接入其本地 Home 缓存策略与 notifier。
+/// OwnerFs 使用相同 FUSE 实现；其本地 Home 缓存策略与 notifier 接线由
+/// `vfs::ownerfs` 的 FUSE 策略提供。
 #[cfg(feature = "ownerfs")]
-pub fn mount_ownerfs(ownerfs: Arc<OwnerFs>, path: &Path) -> Result<MountedFuse> {
-    mount_ownerfs_inner(ownerfs, path, None, FuseMountOptions::default())
-}
-
-#[cfg(feature = "ownerfs")]
-pub fn mount_ownerfs_with_metrics(
-    ownerfs: Arc<OwnerFs>,
-    path: &Path,
-    metrics: FuseRequestMetrics,
-) -> Result<MountedFuse> {
-    mount_ownerfs_with_metrics_and_options(ownerfs, path, metrics, FuseMountOptions::default())
-}
-
-#[cfg(feature = "ownerfs")]
-pub fn mount_ownerfs_with_metrics_and_options(
-    ownerfs: Arc<OwnerFs>,
-    path: &Path,
-    metrics: FuseRequestMetrics,
-    options: FuseMountOptions,
-) -> Result<MountedFuse> {
-    mount_ownerfs_inner(ownerfs, path, Some(metrics), options)
-}
-
-#[cfg(feature = "ownerfs")]
-fn mount_ownerfs_inner(
-    ownerfs: Arc<OwnerFs>,
-    path: &Path,
-    metrics: Option<FuseRequestMetrics>,
-    options: FuseMountOptions,
-) -> Result<MountedFuse> {
-    let options = options.validate()?;
-    let path = canonical_mount_path(path)?;
-    reject_existing_mount(&path)?;
-    let mut fs = AfsFuse::with_mount_options(ownerfs.clone(), options);
-    fs.requests = metrics.map(|metrics| (metrics, "ownerfs"));
-    fs.ownerfs = Some(ownerfs.clone());
-    let cleanup_error = fs.cleanup_error.clone();
-    let session = fuser::spawn_mount(fs, &path, &configured_mount("afs-ownerfs", true, options))
-        .map_err(Error::from)?;
-    ownerfs.register_fuse_notifier(session.notifier());
-    MountedFuse::new(session, &path, cleanup_error)
-}
+pub use crate::node::vfs::ownerfs::fuse_policy::{
+    mount_ownerfs, mount_ownerfs_with_metrics, mount_ownerfs_with_metrics_and_options,
+};
 
 #[doc(hidden)]
 pub fn mount_test_backend(backend: Arc<dyn Backend>, path: &Path) -> Result<MountedFuse> {
@@ -773,7 +824,7 @@ fn mount_config(fs_name: &str, allow_other: bool) -> Config {
     config
 }
 
-fn configured_mount(fs_name: &str, allow_other: bool, options: FuseMountOptions) -> Config {
+fn configured_mount(fs_name: &str, allow_other: bool, options: FuseExecOptions) -> Config {
     let mut config = mount_config(fs_name, allow_other);
     config.n_threads = Some(usize::from(options.fuse_threads));
     config.clone_fd = options.fuse_threads > 1 && options.fuse_clone_fd;
@@ -1581,8 +1632,9 @@ pub struct AfsFuse {
     read_work: Option<crate::node::read_work::ReadWorkMetrics>,
     requests: Option<(FuseRequestMetrics, &'static str)>,
     backend: Arc<dyn Backend>,
+    /// [`FuseMountFeatures::kernel_cache`].
     cached_io: bool,
-    mount_options: FuseMountOptions,
+    mount_options: FuseExecOptions,
     page_cache_ids: Arc<Mutex<PageCacheIdentities>>,
     active_cached_views: Arc<Mutex<ActiveCachedViews>>,
     inode_cache_gates: Arc<InodeCacheGates>,
@@ -1599,8 +1651,7 @@ pub struct AfsFuse {
     lock_session_cleaned: bool,
     callbacks_drained: bool,
     cleanup_error: Arc<Mutex<Option<Error>>>,
-    #[cfg(feature = "ownerfs")]
-    ownerfs: Option<Arc<OwnerFs>>,
+    policy: Arc<dyn FuseMountPolicy>,
 }
 
 impl AfsFuse {
@@ -1608,15 +1659,15 @@ impl AfsFuse {
     fn new(backend: Arc<dyn Backend>) -> Self {
         Self::with_mount_options(
             backend,
-            FuseMountOptions {
+            FuseExecOptions {
                 fuse_workers: 8,
                 fuse_max_tasks: Some(64),
-                ..FuseMountOptions::default()
+                ..FuseExecOptions::default()
             },
         )
     }
 
-    fn with_mount_options(backend: Arc<dyn Backend>, mount_options: FuseMountOptions) -> Self {
+    fn with_mount_options(backend: Arc<dyn Backend>, mount_options: FuseExecOptions) -> Self {
         let state = Arc::new(Mutex::new(FuseState::new(backend.root_inode())));
         Self {
             fd_bridge: None,
@@ -1645,14 +1696,11 @@ impl AfsFuse {
             lock_session_cleaned: false,
             callbacks_drained: false,
             cleanup_error: Arc::new(Mutex::new(None)),
-            #[cfg(feature = "ownerfs")]
-            ownerfs: None,
+            policy: Arc::new(DefaultFusePolicy),
         }
     }
 
-    fn enable_write_queue(&mut self) -> io::Result<()> {
-        let bytes = usize::try_from(self.mount_options.dfs_write_queue_bytes)
-            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    fn enable_write_queue(&mut self, bytes: usize) -> io::Result<()> {
         self.front_write = Some(Arc::new(
             front_write::FrontWriteQueue::new(bytes).map_err(io::Error::from_raw_os_error)?,
         ));
@@ -1766,9 +1814,8 @@ impl AfsFuse {
         }
     }
 
-    /// Entry and attribute TTLs are zero: DFS has no cross-node kernel
-    /// invalidation, so every path lookup and getattr goes to the Node
-    /// (S1a-7, F10; positive TTLs need an invalidation scheme first).
+    /// Entry and attribute TTLs for replies the mount policy does not own
+    /// (mkdir/mknod/symlink/link): zero, see [`DfsFusePolicy`].
     fn entry_ttls(&self) -> (Duration, Duration) {
         (TTL, TTL)
     }
@@ -1791,27 +1838,29 @@ impl AfsFuse {
             .map_or("unknown", |(_, filesystem)| *filesystem)
     }
 
-    fn remember_cached_inode(&self, _inode: BackendInode, ino: u64) {
-        #[cfg(feature = "ownerfs")]
-        if let Some(ownerfs) = &self.ownerfs {
-            ownerfs.remember_fuse_inode(ino);
-        }
-        #[cfg(not(feature = "ownerfs"))]
-        let _ = ino;
+    fn remember_cached_inode(&self, ino: u64) {
+        self.policy.remember_inode(ino);
     }
 
-    fn with_cache_policy<T>(
-        &self,
-        inode: BackendInode,
-        reply: impl FnOnce(Duration, bool) -> T,
-    ) -> T {
-        #[cfg(feature = "ownerfs")]
-        if let Some(ownerfs) = &self.ownerfs {
-            return ownerfs.with_fuse_cache_policy(inode, reply);
+    fn with_cache_policy(&self, inode: BackendInode, reply: impl FnOnce(Duration, bool)) {
+        policy::with_cache_policy(self.policy.as_ref(), inode, reply);
+    }
+
+    /// A read-only open of a policy-local inode replies on the receive thread.
+    fn inline_local_open(&self, inode: BackendInode, flags: i32) -> bool {
+        flags & libc::O_ACCMODE == libc::O_RDONLY && self.policy.inline_local(inode)
+    }
+
+    /// Create reply TTL and open flags. With the kernel cache feature the
+    /// mount-wide entry TTL bounds both fields (official ReplyCreate has one
+    /// TTL) and pages stay cacheable; otherwise the policy decides.
+    fn create_reply_policy(&self, ttl: Duration, private: bool) -> (Duration, FopenFlags) {
+        if self.cached_io {
+            let (entry_ttl, attr_ttl) = self.entry_ttls();
+            (entry_ttl.min(attr_ttl), open_reply_flags(false))
+        } else {
+            (ttl, open_reply_flags(!private))
         }
-        #[cfg(not(feature = "ownerfs"))]
-        let _ = inode;
-        reply(TTL, false)
     }
 
     fn context(req: &Request, umask: u32) -> RequestContext {
@@ -2005,43 +2054,25 @@ impl Filesystem for AfsFuse {
         };
         // A local Home directory lookup has no network wait. Keep it on the
         // FUSE receive thread; remote lookups still need worker concurrency.
-        #[cfg(feature = "ownerfs")]
-        let inline_local_lookup = self
-            .ownerfs
-            .as_ref()
-            .is_some_and(|ownerfs| ownerfs.is_local_inode(parent_inode));
-        #[cfg(not(feature = "ownerfs"))]
-        let inline_local_lookup = false;
+        let inline_local_lookup = self.policy.inline_local(parent_inode);
         let backend = self.backend.clone();
         let state = self.state.clone();
         let context = Self::context(req, 0);
         let name = name.to_os_string();
-        #[cfg(feature = "ownerfs")]
-        let ownerfs = self.ownerfs.clone();
-        let (entry_ttl, attr_ttl) = self.entry_ttls();
+        let mount_policy = self.policy.clone();
         let run = move || {
             let _front_guard = _front_guard;
             let result = backend.lookup(&context, parent_inode, &name).map_err(errno);
             match result {
                 Ok(entry) => {
                     let ino = state.lock().unwrap().remember_lookup(&entry);
-                    #[cfg(feature = "ownerfs")]
-                    if let Some(ownerfs) = &ownerfs {
-                        ownerfs.remember_fuse_inode(ino);
-                        ownerfs.with_fuse_cache_policy(entry.inode, |ttl, _| {
-                            // A native or remote writer may rename or unlink between
-                            // opens. Apply the freshness policy to names as well as
-                            // attributes so an old dentry cannot open a new alias.
-                            reply.entry(&ttl, &file_attr(ino, &entry.attributes), Generation(0));
-                        });
-                        return;
-                    }
-                    reply.entry_with_ttls(
-                        &attr_ttl,
-                        &entry_ttl,
-                        &file_attr(ino, &entry.attributes),
-                        Generation(0),
-                    );
+                    mount_policy.remember_inode(ino);
+                    policy::with_cache_policy(mount_policy.as_ref(), entry.inode, |ttl, _| {
+                        // A native or remote writer may rename or unlink between
+                        // opens. Apply the freshness policy to names as well as
+                        // attributes so an old dentry cannot open a new alias.
+                        reply.entry(&ttl, &file_attr(ino, &entry.attributes), Generation(0));
+                    });
                 }
                 Err(error) => reply.error(fuse_errno(error)),
             }
@@ -2081,9 +2112,7 @@ impl Filesystem for AfsFuse {
         let backend = self.backend.clone();
         let state = self.state.clone();
         let context = Self::context(req, 0);
-        #[cfg(feature = "ownerfs")]
-        let ownerfs = self.ownerfs.clone();
-        let (_, attr_ttl) = self.entry_ttls();
+        let mount_policy = self.policy.clone();
         let run = move || {
             let _front_guard = _front_guard;
             let node = state.lock().unwrap().node(ino);
@@ -2105,16 +2134,11 @@ impl Filesystem for AfsFuse {
             match result {
                 Ok(attr) => match backend_inode {
                     Some(inode) => {
-                        #[cfg(feature = "ownerfs")]
-                        if let Some(ownerfs) = &ownerfs {
-                            ownerfs.with_fuse_cache_policy(inode, |ttl, _| reply.attr(&ttl, &attr));
-                            return;
-                        }
-                        #[cfg(not(feature = "ownerfs"))]
-                        let _ = inode;
-                        reply.attr(&attr_ttl, &attr);
+                        policy::with_cache_policy(mount_policy.as_ref(), inode, |ttl, _| {
+                            reply.attr(&ttl, &attr)
+                        });
                     }
-                    None => reply.attr(&attr_ttl, &attr),
+                    None => reply.attr(&TTL, &attr),
                 },
                 Err(error) => reply.error(fuse_errno(error)),
             }
@@ -2139,13 +2163,7 @@ impl Filesystem for AfsFuse {
             reply.error(fuse_errno(libc::ESTALE));
             return;
         };
-        #[cfg(feature = "ownerfs")]
-        let inline_local_statfs = self
-            .ownerfs
-            .as_ref()
-            .is_some_and(|ownerfs| ownerfs.is_local_inode(inode));
-        #[cfg(not(feature = "ownerfs"))]
-        let inline_local_statfs = false;
+        let inline_local_statfs = self.policy.inline_local(inode);
         let backend = self.backend.clone();
         let context = Self::metadata_context(req, 0);
         let scoped = _front_guard.is_some();
@@ -2524,14 +2542,7 @@ impl Filesystem for AfsFuse {
             }
             return;
         }
-        #[cfg(feature = "ownerfs")]
-        let inline_local_read = flags & libc::O_ACCMODE == libc::O_RDONLY
-            && self
-                .ownerfs
-                .as_ref()
-                .is_some_and(|ownerfs| ownerfs.is_local_inode(inode));
-        #[cfg(not(feature = "ownerfs"))]
-        let inline_local_read = false;
+        let inline_local_read = self.inline_local_open(inode, flags);
         let fd_bridge = self.fd_bridge.clone();
         let backend = self.backend.clone();
         let state = self.state.clone();
@@ -2551,8 +2562,7 @@ impl Filesystem for AfsFuse {
             flags,
             queue_wait_us = tracing::field::Empty,
         );
-        #[cfg(feature = "ownerfs")]
-        let ownerfs = self.ownerfs.clone();
+        let mount_policy = self.policy.clone();
         let run = move || {
             // No table lock crosses Meta RPCs or reply I/O. This bounded local
             // fence drains old READ replies before a fresh OPEN changes the
@@ -2598,13 +2608,9 @@ impl Filesystem for AfsFuse {
                     if let Some(bridge) = &fd_bridge {
                         bridge.opened(fh, ino, inode, handle, context.clone(), flags, cached_io);
                     }
-                    #[cfg(feature = "ownerfs")]
-                    if let Some(ownerfs) = &ownerfs {
-                        ownerfs.with_fuse_cache_policy(inode, |_, private| {
-                            reply.opened(FuseFileHandle(fh), open_reply_flags(!private));
-                        });
+                    let Some(reply) = mount_policy.reply_opened(inode, fh, reply) else {
                         return;
-                    }
+                    };
                     let versioned_read = backend.fixed_read_view(handle)
                         || (backend.supports_async_reads()
                             && flags & libc::O_ACCMODE == libc::O_RDONLY);
@@ -3430,7 +3436,7 @@ impl Filesystem for AfsFuse {
         match result {
             Ok(created) => {
                 let ino = self.state.lock().unwrap().remember_lookup(&created.entry);
-                self.remember_cached_inode(created.entry.inode, ino);
+                self.remember_cached_inode(ino);
                 let fh = self
                     .state
                     .lock()
@@ -3452,20 +3458,13 @@ impl Filesystem for AfsFuse {
                     cache.remove(ino);
                 }
                 self.with_cache_policy(created.entry.inode, |ttl, private| {
-                    // Official ReplyCreate has one TTL for both fields. Use
-                    // the stricter DFS limit rather than relaxing either one.
-                    let ttl = if self.cached_io {
-                        let (entry_ttl, attr_ttl) = self.entry_ttls();
-                        entry_ttl.min(attr_ttl)
-                    } else {
-                        ttl
-                    };
+                    let (ttl, flags) = self.create_reply_policy(ttl, private);
                     reply.created(
                         &ttl,
                         &file_attr(ino, &created.entry.attributes),
                         Generation(0),
                         FuseFileHandle(fh),
-                        open_reply_flags(!private && !self.cached_io),
+                        flags,
                     )
                 });
             }
@@ -3600,7 +3599,7 @@ impl Filesystem for AfsFuse {
         match result {
             Ok(entry) => {
                 let ino = self.state.lock().unwrap().remember_lookup(&entry);
-                self.remember_cached_inode(entry.inode, ino);
+                self.remember_cached_inode(ino);
                 let (entry_ttl, attr_ttl) = self.entry_ttls();
                 reply.entry_with_ttls(
                     &attr_ttl,
@@ -4120,7 +4119,7 @@ fn write_kill_suidgid(write_flags: WriteFlags) -> bool {
     write_flags.contains(WriteFlags::FUSE_WRITE_KILL_SUIDGID)
 }
 
-fn open_reply_flags(direct_io: bool) -> FopenFlags {
+pub(crate) fn open_reply_flags(direct_io: bool) -> FopenFlags {
     if direct_io {
         DIRECT_IO
     } else {
@@ -4317,6 +4316,9 @@ mod dispatch_tests;
 
 #[cfg(test)]
 mod local_reply_tests;
+
+#[cfg(test)]
+mod policy_tests;
 
 #[cfg(test)]
 mod queue_default_tests;

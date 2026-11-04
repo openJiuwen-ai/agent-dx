@@ -634,7 +634,7 @@ where
     F: FnOnce() -> Result<T, afs_error::Error> + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(work)
+    crate::node::bridge::spawn_blocking(work)
         .await
         .map_err(|error| coded_status(afs_error::NODE_VFS_UNAVAILABLE, error.to_string()))?
         .map_err(error_to_status)
@@ -753,10 +753,11 @@ async fn request_grant_fd(grant: LocalShmGrant) -> Result<(OwnedFd, usize), Stat
     let token = BrokerToken::new(grant.token).map_err(shm_status)?;
     let request = FdRequest::new(token, grant.session_id, grant.region_id);
     let path = PathBuf::from(grant.broker_socket_path);
-    let fd = tokio::task::spawn_blocking(move || FdBrokerClient::request_fd(path, &request))
-        .await
-        .map_err(|error| coded_status(afs_error::NODE_SHM_INTERNAL, error.to_string()))?
-        .map_err(shm_status)?;
+    let fd =
+        crate::node::bridge::spawn_blocking(move || FdBrokerClient::request_fd(path, &request))
+            .await
+            .map_err(|error| coded_status(afs_error::NODE_SHM_INTERNAL, error.to_string()))?
+            .map_err(shm_status)?;
     Ok((fd, offset))
 }
 

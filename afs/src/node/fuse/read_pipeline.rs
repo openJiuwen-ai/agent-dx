@@ -34,10 +34,11 @@ impl ReadReply {
 pub(super) struct ReadCompletions {
     sender: Option<tokio::sync::mpsc::Sender<ReadReply>>,
     worker: Option<std::thread::JoinHandle<()>>,
+    task_timeout: Duration,
 }
 
 impl ReadCompletions {
-    fn new(capacity: usize) -> Result<Self> {
+    fn new(capacity: usize, task_timeout: Duration) -> Result<Self> {
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<ReadReply>(capacity);
         let worker = std::thread::Builder::new()
             .name("afs-read-reply".to_owned())
@@ -54,6 +55,7 @@ impl ReadCompletions {
         Ok(Self {
             sender: Some(sender),
             worker: Some(worker),
+            task_timeout,
         })
     }
 }
@@ -70,7 +72,10 @@ impl Drop for ReadCompletions {
 }
 
 impl AfsFuse {
-    pub(super) fn enable_read_pipeline(&mut self) -> Result<()> {
+    pub(super) fn enable_read_pipeline(
+        &mut self,
+        limits: crate::node::read_pipeline::ReadPipelineLimits,
+    ) -> Result<()> {
         if !self.backend.supports_async_reads() {
             return Ok(());
         }
@@ -80,7 +85,10 @@ impl AfsFuse {
                 "async FUSE reads require a live node runtime",
             )
         })?;
-        let completions = ReadCompletions::new(self.mount_options.task_capacity())?;
+        let completions = ReadCompletions::new(
+            self.mount_options.task_capacity(),
+            Duration::from_millis(limits.task_timeout_ms),
+        )?;
         self.read_runtime = Some(runtime);
         self.read_completions = Some(completions);
         Ok(())
@@ -98,10 +106,10 @@ impl AfsFuse {
         let Some(runtime) = self.read_runtime.clone() else {
             return Some(reply);
         };
-        let Some(sender) = self
+        let Some((sender, task_timeout)) = self
             .read_completions
             .as_ref()
-            .and_then(|c| c.sender.clone())
+            .and_then(|c| c.sender.clone().map(|sender| (sender, c.task_timeout)))
         else {
             return Some(reply);
         };
@@ -112,8 +120,7 @@ impl AfsFuse {
         let diagnostic = self.read_work.as_ref().and_then(|metrics| {
             metrics.diagnostic(crate::node::read_work::ReadDiagnosticStage::FuseRead)
         });
-        let deadline = std::time::Instant::now()
-            + Duration::from_millis(self.mount_options.dfs_read_pipeline.task_timeout_ms);
+        let deadline = std::time::Instant::now() + task_timeout;
         let state = self.state.clone();
         let gates = self.inode_cache_gates.clone();
         let backend = self.backend.clone();

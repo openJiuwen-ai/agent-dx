@@ -126,37 +126,7 @@ pub enum DataMode {
 }
 
 #[cfg(feature = "dfs")]
-#[derive(Clone)]
-enum PeerRuntime {
-    Existing(tokio::runtime::Handle),
-    Owned(Arc<tokio::runtime::Runtime>),
-}
-
-#[cfg(feature = "dfs")]
-impl PeerRuntime {
-    fn current_or_new() -> PeerResult<Self> {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            return Ok(Self::Existing(handle));
-        }
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| {
-                PeerError::coded(
-                    afs_error::CLIENT_WORKER_FAILED,
-                    format!("failed to build DFS peer read runtime: {error}"),
-                )
-            })?;
-        Ok(Self::Owned(Arc::new(runtime)))
-    }
-
-    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
-        match self {
-            Self::Existing(handle) => handle.block_on(future),
-            Self::Owned(runtime) => runtime.block_on(future),
-        }
-    }
-}
+use crate::node::bridge::SyncRuntime as PeerRuntime;
 
 #[cfg(feature = "dfs")]
 pub struct GrpcReplicaDataPlane {
@@ -171,9 +141,7 @@ impl GrpcReplicaDataPlane {
         Ok(Self {
             peers,
             timeout,
-            runtime: PeerRuntime::current_or_new().map_err(|error| {
-                afs_error::Error::coded(afs_error::CLIENT_WORKER_FAILED, error.to_string())
-            })?,
+            runtime: PeerRuntime::current_or_new("DFS replica data plane")?,
         })
     }
 }
@@ -384,7 +352,7 @@ impl RdmaReplicaDataPlane {
     pub fn new(pool: Arc<DfsRdmaPool>) -> afs_error::Result<Self> {
         Ok(Self {
             pool,
-            runtime: PeerRuntime::current_or_new().map_err(|error| error.0)?,
+            runtime: PeerRuntime::current_or_new("DFS peer")?,
             fallback: None,
         })
     }
@@ -396,7 +364,7 @@ impl RdmaReplicaDataPlane {
     ) -> afs_error::Result<Self> {
         Ok(Self {
             pool,
-            runtime: PeerRuntime::current_or_new().map_err(|error| error.0)?,
+            runtime: PeerRuntime::current_or_new("DFS peer")?,
             fallback: Some(GrpcReplicaDataPlane::new(peers, timeout)?),
         })
     }
@@ -472,7 +440,7 @@ impl crate::node::replication::ReplicaDataPlane for RdmaReplicaDataPlane {
                         validate_open(false, &lease.session.poisoned).map_err(|error| error.0)?;
                         let endpoint = lease.session.endpoint.clone();
                         let payload = staged.clone();
-                        tokio::task::spawn_blocking(move || {
+                        crate::node::bridge::spawn_blocking(move || {
                             endpoint.blocking_lock().put_local(payload.bytes())
                         })
                         .await
@@ -688,7 +656,7 @@ impl DfsRdmaPool {
                 )
             })?;
             let device = self.device.clone();
-            let (endpoint, info, permit) = tokio::task::spawn_blocking(move || {
+            let (endpoint, info, permit) = crate::node::bridge::spawn_blocking(move || {
                 let mut endpoint = RdmaEndpoint::open_with_capacity(
                     &device,
                     crate::node::chunk::MAX_STAGED_CHUNK_BYTES,
@@ -737,7 +705,7 @@ impl DfsRdmaPool {
                 ));
             }
             let server_info = reply.server_info;
-            let (endpoint, permit) = tokio::task::spawn_blocking(move || {
+            let (endpoint, permit) = crate::node::bridge::spawn_blocking(move || {
                 let mut endpoint = endpoint;
                 endpoint.connect(&server_info)?;
                 endpoint.send_probe(5000)?;
@@ -1209,16 +1177,7 @@ impl GrpcChunkTransfer {
     pub fn new(peers: Arc<PeerConnectionPool>, timeout: Duration) -> afs_error::Result<Self> {
         // Standalone synchronous callers own a small runtime. Production
         // reuses its existing Tokio runtime.
-        let runtime = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => PeerRuntime::Existing(handle),
-            Err(_) => PeerRuntime::Owned(Arc::new(
-                tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(1)
-                    .enable_all()
-                    .build()
-                    .map_err(afs_error::Error::from)?,
-            )),
-        };
+        let runtime = PeerRuntime::current_or_new_with_worker()?;
         Ok(Self {
             read_pipeline: std::sync::OnceLock::new(),
             peers,
@@ -2497,7 +2456,7 @@ impl GrpcChunkTransfer {
                             let consume_start = consumer_diagnostic
                                 .as_ref()
                                 .map(|diagnostic| diagnostic.now());
-                            let result = crate::node::read_pipeline::local_io(|| {
+                            let result = crate::node::bridge::local_io(|| {
                                 consume_peer_frame_into_sink(
                                     &mut decoder,
                                     frame,
@@ -2519,7 +2478,7 @@ impl GrpcChunkTransfer {
                             let consume_start = consumer_diagnostic
                                 .as_ref()
                                 .map(|diagnostic| diagnostic.now());
-                            let result = crate::node::read_pipeline::local_io(|| {
+                            let result = crate::node::bridge::local_io(|| {
                                 consume_peer_input_into_sink(
                                     &mut decoder,
                                     PeerSinkInput::Block {
@@ -2569,7 +2528,7 @@ impl GrpcChunkTransfer {
         let finish_start = consumer_diagnostic
             .as_ref()
             .map(|diagnostic| diagnostic.now());
-        let proof = crate::node::read_pipeline::local_io(|| {
+        let proof = crate::node::bridge::local_io(|| {
             decoder.finish_stream_from_producer(
                 chunk,
                 root,
@@ -3471,7 +3430,7 @@ impl RdmaChunkTransfer {
     pub fn new(pool: Arc<DfsRdmaPool>) -> afs_error::Result<Self> {
         Ok(Self {
             pool,
-            runtime: PeerRuntime::current_or_new().map_err(|error| error.0)?,
+            runtime: PeerRuntime::current_or_new("DFS peer")?,
             next_read: std::sync::atomic::AtomicU64::new(1),
             fallback: None,
         })
@@ -3484,7 +3443,7 @@ impl RdmaChunkTransfer {
     ) -> afs_error::Result<Self> {
         Ok(Self {
             pool,
-            runtime: PeerRuntime::current_or_new().map_err(|error| error.0)?,
+            runtime: PeerRuntime::current_or_new("DFS peer")?,
             next_read: std::sync::atomic::AtomicU64::new(1),
             fallback: Some(GrpcChunkTransfer::new(peers, timeout)?),
         })
@@ -3614,7 +3573,7 @@ impl RdmaChunkTransfer {
                                 .map_err(afs_transport::grpc::error_status::status_to_error)?
                                 .into_inner();
                             let endpoint = lease.session.endpoint.clone();
-                            let bytes = tokio::task::spawn_blocking(move || {
+                            let bytes = crate::node::bridge::spawn_blocking(move || {
                                 endpoint.blocking_lock().get_local(length)
                             })
                             .await
@@ -3866,9 +3825,7 @@ pub trait RemoteDfsOwner: Send + Sync {
         request: afs_protocol::node_data::DfsOwnerReadRequest,
     ) -> crate::node::read_pipeline::ReadFuture<'_, afs_protocol::node_data::DfsOwnerReadReply>
     {
-        Box::pin(
-            async move { crate::node::read_pipeline::sync_read_backend(|| self.read(request)) },
-        )
+        Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.read(request)) })
     }
     fn read(
         &self,
@@ -3886,6 +3843,51 @@ pub trait RemoteDfsOwner: Send + Sync {
         &self,
         request: afs_protocol::node_data::DfsOwnerSyncRequest,
     ) -> afs_error::Result<afs_protocol::node_data::DfsOwnerSyncReply>;
+
+    // Callable on an async worker. A default leaves the worker for the sync
+    // method; a network client overrides these with its native future.
+    fn open_async(
+        &self,
+        request: afs_protocol::node_control::DfsOwnerOpenRequest,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, afs_protocol::node_control::DfsOwnerOpenReply>
+    {
+        Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.open(request)) })
+    }
+    fn getattr_async(
+        &self,
+        request: afs_protocol::node_control::DfsOwnerGetAttrRequest,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, afs_protocol::node_control::DfsOwnerGetAttrReply>
+    {
+        Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.getattr(request)) })
+    }
+    fn release_async(
+        &self,
+        request: afs_protocol::node_control::DfsOwnerReleaseRequest,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, afs_protocol::node_control::DfsOwnerReleaseReply>
+    {
+        Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.release(request)) })
+    }
+    fn write_async(
+        &self,
+        request: afs_protocol::node_data::DfsOwnerWriteRequest,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, afs_protocol::node_data::DfsOwnerWriteReply>
+    {
+        Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.write(request)) })
+    }
+    fn resize_async(
+        &self,
+        request: afs_protocol::node_data::DfsOwnerResizeRequest,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, afs_protocol::node_data::DfsOwnerResizeReply>
+    {
+        Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.resize(request)) })
+    }
+    fn sync_async(
+        &self,
+        request: afs_protocol::node_data::DfsOwnerSyncRequest,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, afs_protocol::node_data::DfsOwnerSyncReply>
+    {
+        Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.sync(request)) })
+    }
 }
 
 #[cfg(feature = "dfs")]
@@ -3944,7 +3946,7 @@ impl GrpcDfsOwnerClient {
             node_epoch,
             endpoint,
             timeout,
-            runtime: PeerRuntime::current_or_new().map_err(|error| error.0)?,
+            runtime: PeerRuntime::current_or_new("DFS peer")?,
         })
     }
 
@@ -4066,23 +4068,30 @@ impl GrpcDfsOwnerClient {
 
 #[cfg(feature = "dfs")]
 macro_rules! dfs_owner_rpc {
-    ($method:ident, $request:ty, $reply:ty) => {
+    ($method:ident, $method_async:ident, $client:ident, $client_method:ident, $request:ty, $reply:ty) => {
         fn $method(&self, request: $request) -> afs_error::Result<$reply> {
-            if request
-                .handle
-                .as_ref()
-                .is_none_or(|handle| handle.owner_node_id != self.node_id)
-            {
-                return Err(dfs_protocol_error("DFS owner request targets another Node"));
-            }
+            self.runtime.block_on(self.$method_async(request))
+        }
+
+        fn $method_async(
+            &self,
+            request: $request,
+        ) -> crate::node::read_pipeline::ReadFuture<'_, $reply> {
             let timeout = self.call_timeout();
-            self.runtime.block_on(async {
+            Box::pin(async move {
+                if request
+                    .handle
+                    .as_ref()
+                    .is_none_or(|handle| handle.owner_node_id != self.node_id)
+                {
+                    return Err(dfs_protocol_error("DFS owner request targets another Node"));
+                }
                 tokio::time::timeout(timeout, async {
-                    let mut client = self.data_client().await?;
+                    let mut client = self.$client().await?;
                     let mut request = request_with_current_context(request);
                     request.set_timeout(timeout);
                     client
-                        .$method(request)
+                        .$client_method(request)
                         .await
                         .map(tonic::Response::into_inner)
                         .map_err(afs_transport::grpc::error_status::status_to_error)
@@ -4105,11 +4114,19 @@ impl RemoteDfsOwner for GrpcDfsOwnerClient {
         &self,
         request: afs_protocol::node_control::DfsOwnerOpenRequest,
     ) -> afs_error::Result<afs_protocol::node_control::DfsOwnerOpenReply> {
-        if request.owner_node_id != self.node_id {
-            return Err(dfs_protocol_error("DFS owner open targets another Node"));
-        }
+        self.runtime.block_on(self.open_async(request))
+    }
+
+    fn open_async(
+        &self,
+        request: afs_protocol::node_control::DfsOwnerOpenRequest,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, afs_protocol::node_control::DfsOwnerOpenReply>
+    {
         let timeout = self.call_timeout();
-        self.runtime.block_on(async {
+        Box::pin(async move {
+            if request.owner_node_id != self.node_id {
+                return Err(dfs_protocol_error("DFS owner open targets another Node"));
+            }
             tokio::time::timeout(timeout, async {
                 let mut client = self.control_client().await?;
                 let mut request = request_with_current_context(request);
@@ -4130,70 +4147,22 @@ impl RemoteDfsOwner for GrpcDfsOwnerClient {
         })
     }
 
-    fn getattr(
-        &self,
-        request: afs_protocol::node_control::DfsOwnerGetAttrRequest,
-    ) -> afs_error::Result<afs_protocol::node_control::DfsOwnerGetAttrReply> {
-        if request
-            .handle
-            .as_ref()
-            .is_none_or(|handle| handle.owner_node_id != self.node_id)
-        {
-            return Err(dfs_protocol_error("DFS owner request targets another Node"));
-        }
-        let timeout = self.call_timeout();
-        self.runtime.block_on(async {
-            tokio::time::timeout(timeout, async {
-                let mut client = self.control_client().await?;
-                let mut request = request_with_current_context(request);
-                request.set_timeout(timeout);
-                client
-                    .dfs_owner_get_attr(request)
-                    .await
-                    .map(tonic::Response::into_inner)
-                    .map_err(afs_transport::grpc::error_status::status_to_error)
-            })
-            .await
-            .map_err(|_| {
-                afs_error::Error::coded(
-                    afs_error::CLIENT_DEADLINE_EXCEEDED,
-                    "DFS owner request result may be unknown; preserve its operation ID",
-                )
-            })?
-        })
-    }
-    fn release(
-        &self,
-        request: afs_protocol::node_control::DfsOwnerReleaseRequest,
-    ) -> afs_error::Result<afs_protocol::node_control::DfsOwnerReleaseReply> {
-        if request
-            .handle
-            .as_ref()
-            .is_none_or(|handle| handle.owner_node_id != self.node_id)
-        {
-            return Err(dfs_protocol_error("DFS owner request targets another Node"));
-        }
-        let timeout = self.call_timeout();
-        self.runtime.block_on(async {
-            tokio::time::timeout(timeout, async {
-                let mut client = self.control_client().await?;
-                let mut request = request_with_current_context(request);
-                request.set_timeout(timeout);
-                client
-                    .dfs_owner_release(request)
-                    .await
-                    .map(tonic::Response::into_inner)
-                    .map_err(afs_transport::grpc::error_status::status_to_error)
-            })
-            .await
-            .map_err(|_| {
-                afs_error::Error::coded(
-                    afs_error::CLIENT_DEADLINE_EXCEEDED,
-                    "DFS owner request result may be unknown; preserve its operation ID",
-                )
-            })?
-        })
-    }
+    dfs_owner_rpc!(
+        getattr,
+        getattr_async,
+        control_client,
+        dfs_owner_get_attr,
+        afs_protocol::node_control::DfsOwnerGetAttrRequest,
+        afs_protocol::node_control::DfsOwnerGetAttrReply
+    );
+    dfs_owner_rpc!(
+        release,
+        release_async,
+        control_client,
+        dfs_owner_release,
+        afs_protocol::node_control::DfsOwnerReleaseRequest,
+        afs_protocol::node_control::DfsOwnerReleaseReply
+    );
     fn get_lock(
         &self,
         request: afs_protocol::node_control::DfsOwnerGetLockRequest,
@@ -4352,15 +4321,24 @@ impl RemoteDfsOwner for GrpcDfsOwnerClient {
     }
     dfs_owner_rpc!(
         write,
+        write_async,
+        data_client,
+        write,
         afs_protocol::node_data::DfsOwnerWriteRequest,
         afs_protocol::node_data::DfsOwnerWriteReply
     );
     dfs_owner_rpc!(
         resize,
+        resize_async,
+        data_client,
+        resize,
         afs_protocol::node_data::DfsOwnerResizeRequest,
         afs_protocol::node_data::DfsOwnerResizeReply
     );
     dfs_owner_rpc!(
+        sync,
+        sync_async,
+        data_client,
         sync,
         afs_protocol::node_data::DfsOwnerSyncRequest,
         afs_protocol::node_data::DfsOwnerSyncReply
@@ -4401,6 +4379,11 @@ impl std::fmt::Display for PeerError {
     }
 }
 impl std::error::Error for PeerError {}
+impl From<afs_error::Error> for PeerError {
+    fn from(value: afs_error::Error) -> Self {
+        Self(value)
+    }
+}
 impl From<tonic::Status> for PeerError {
     fn from(value: tonic::Status) -> Self {
         Self(afs_transport::grpc::error_status::status_to_error(value))
@@ -4457,42 +4440,10 @@ pub struct OwnerPeerClient {
 /// Runtime used by synchronous OwnerFs/FUSE callbacks to drive async tonic RPCs.
 ///
 /// `owner_files_client_from_channel` can be called from a Tokio task during tests
-/// or from a plain FUSE worker thread in production slow paths. Capturing
-/// `Handle::current()` unconditionally panics in the latter case, so we either
-/// reuse the ambient runtime or keep a small private runtime alive with the
-/// client.
+/// or from a plain FUSE worker thread in production slow paths, so it reuses the
+/// ambient runtime or keeps a small private one alive with the client.
 #[cfg(feature = "ownerfs")]
-#[derive(Clone)]
-enum OwnerRuntime {
-    Existing(tokio::runtime::Handle),
-    Owned(Arc<tokio::runtime::Runtime>),
-}
-
-#[cfg(feature = "ownerfs")]
-impl OwnerRuntime {
-    fn current_or_new() -> PeerResult<Self> {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            return Ok(Self::Existing(handle));
-        }
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| {
-                PeerError::coded(
-                    afs_error::CLIENT_WORKER_FAILED,
-                    format!("failed to build OwnerFiles client runtime: {error}"),
-                )
-            })?;
-        Ok(Self::Owned(Arc::new(runtime)))
-    }
-
-    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
-        match self {
-            Self::Existing(handle) => handle.block_on(future),
-            Self::Owned(runtime) => runtime.block_on(future),
-        }
-    }
-}
+use crate::node::bridge::SyncRuntime as OwnerRuntime;
 
 #[cfg(feature = "ownerfs")]
 pub async fn connect_owner_files_client(options: DataClientOptions) -> PeerResult<OwnerPeerClient> {
@@ -4528,7 +4479,7 @@ pub fn owner_files_client_from_channel_result(channel: Channel) -> PeerResult<Ow
         ),
         long_lock_control: None,
         client: StdMutex::new(OwnerFilesClient::new(channel)),
-        runtime: OwnerRuntime::current_or_new()?,
+        runtime: OwnerRuntime::current_or_new("OwnerFiles client")?,
         prefetched_reads: StdMutex::new(HashMap::new()),
         pending_releases: Arc::new(AtomicUsize::new(0)),
         rdma_admission: Arc::new(tokio::sync::Semaphore::new(OWNER_RDMA_MAX_CLIENT_WINDOWS)),
@@ -4659,7 +4610,7 @@ impl OwnerPeerClient {
                     "OwnerFiles RDMA client admission is full",
                 )
             })?;
-        let (resource, info, capacity) = tokio::task::spawn_blocking(move || {
+        let (resource, info, capacity) = crate::node::bridge::spawn_blocking(move || {
             let mut endpoint = RdmaEndpoint::open(&device)?;
             let info = endpoint.info()?.to_vec();
             let capacity = endpoint.capacity();
@@ -4716,7 +4667,7 @@ impl OwnerPeerClient {
             ));
         }
         let server_info = reply.server_info;
-        let resource = tokio::task::spawn_blocking(move || {
+        let resource = crate::node::bridge::spawn_blocking(move || {
             let mut resource = resource;
             resource.endpoint.connect(&server_info)?;
             resource.endpoint.send_probe(5000)?;
@@ -4778,7 +4729,7 @@ impl OwnerPeerClient {
             ));
         }
         let len = reply.read as usize;
-        let (resource_guard, bytes) = tokio::task::spawn_blocking(move || {
+        let (resource_guard, bytes) = crate::node::bridge::spawn_blocking(move || {
             let mut resource = resource;
             let bytes = resource.endpoint.get_local(len)?;
             Ok::<_, afs_transport::rdma::RdmaError>((resource, bytes))
@@ -4831,7 +4782,7 @@ impl OwnerPeerClient {
         } = window;
         let payload = data.to_vec();
         let checksum = blake3::hash(&payload).as_bytes().to_vec();
-        let resource_guard = tokio::task::spawn_blocking({
+        let resource_guard = crate::node::bridge::spawn_blocking({
             let payload = payload.clone();
             move || {
                 let mut resource = resource;
@@ -4951,8 +4902,13 @@ macro_rules! owner_rpc {
         let started = Instant::now();
         let result = $owner
             .runtime
-            .block_on(async move { client.$method(request_with_current_context($request)).await })
-            .map_err(|error| PeerError::from(error).0);
+            .block_on(async move {
+                client
+                    .$method(request_with_current_context($request))
+                    .await
+                    .map_err(PeerError::from)
+            })
+            .map_err(|error| error.0);
         if let Some(metrics) = &$owner.metrics {
             metrics.observe("client", stringify!($method), started.elapsed());
         }
@@ -5030,14 +4986,17 @@ impl RemoteFiles for OwnerPeerClient {
         };
         let result = self.runtime.block_on(async move {
             let call = client.owner_set_lock(request_with_current_context(body));
-            if blocking {
+            Ok::<_, afs_error::Error>(if blocking {
                 call.await
             } else {
-                tokio::time::timeout(Duration::from_secs(5), call)
-                    .await
-                    .map_err(|_| tonic::Status::deadline_exceeded("Owner lock control timed out"))?
-            }
-        });
+                match tokio::time::timeout(Duration::from_secs(5), call).await {
+                    Ok(reply) => reply,
+                    Err(_) => Err(tonic::Status::deadline_exceeded(
+                        "Owner lock control timed out",
+                    )),
+                }
+            })
+        })?;
         if let Err(error) = result {
             // A structured server error is a definitive business rejection;
             // preserve its errno (including EINTR/ENOLCK/permission errors).
@@ -6187,7 +6146,7 @@ impl RdmaDataClient {
         }
         let server_info = negotiate.server_info;
         // CQ 轮询属于阻塞 I/O；工作任务独占 endpoint，取消外层 future 不会释放在途资源。
-        let connected = tokio::task::spawn_blocking(move || {
+        let connected = crate::node::bridge::spawn_blocking(move || {
             endpoint.connect(&server_info)?;
             endpoint.send_probe(5000)?;
             Ok::<_, afs_transport::rdma::RdmaError>(endpoint)

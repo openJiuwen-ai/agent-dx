@@ -45,6 +45,7 @@ use crate::node::storage::{
 pub(in crate::node) mod bind_mount;
 pub mod catalog;
 pub mod files;
+pub(crate) mod fuse_policy;
 mod mount_manager;
 mod native_home;
 pub mod remote;

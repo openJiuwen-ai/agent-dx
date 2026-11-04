@@ -194,7 +194,7 @@ impl DfsReadEngine {
                 lifetime,
             )
             .await?;
-            crate::node::read_pipeline::local_io(|| overlay(&mut reply.buffer))?;
+            crate::node::bridge::local_io(|| overlay(&mut reply.buffer))?;
             self.check_native_read_authority(&authority)?;
             Ok(reply.into_bytes())
         })

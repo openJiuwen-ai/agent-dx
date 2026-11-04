@@ -22,6 +22,25 @@ use afs_protocol::{
 
 use crate::node::vfs::types::OpenOptions;
 
+/// A request being served on an async worker. It owns what it needs, so the RPC
+/// layer can run it detached from the caller's cancellation.
+pub type OwnerFuture<T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = afs_error::Result<T>> + Send + 'static>>;
+
+/// Runs synchronous handler work on the blocking pool.
+pub(crate) async fn offload_handler<T: Send + 'static>(
+    work: impl FnOnce() -> afs_error::Result<T> + Send + 'static,
+) -> afs_error::Result<T> {
+    crate::node::bridge::spawn_blocking(work)
+        .await
+        .map_err(|error| {
+            afs_error::Error::coded(
+                afs_error::CLIENT_WORKER_FAILED,
+                format!("DFS owner blocking worker failed: {error}"),
+            )
+        })?
+}
+
 /// Lifecycle (open/getattr/release) and lock RPCs served by an inode owner.
 pub trait DfsOwnerLifecycleHandler: Send + Sync + 'static {
     fn open(
@@ -43,12 +62,33 @@ pub trait DfsOwnerLifecycleHandler: Send + Sync + 'static {
         }
         self.open(peer, request)
     }
+
+    /// The RPC entry of `open_with_options`; runs on an async worker. The default
+    /// runs the sync method on the blocking pool.
+    fn open_async(
+        self: std::sync::Arc<Self>,
+        peer: String,
+        request: DfsOwnerOpenRequest,
+        options: OpenOptions,
+    ) -> OwnerFuture<DfsOwnerOpenReply> {
+        Box::pin(offload_handler(move || {
+            self.open_with_options(&peer, request, options)
+        }))
+    }
     fn getattr(
         &self,
         _peer: &str,
         _request: DfsOwnerGetAttrRequest,
     ) -> afs_error::Result<DfsOwnerGetAttrReply> {
         Err(dfs_owner_lifecycle_unimplemented())
+    }
+    /// The RPC entry of `getattr`; see [`Self::open_async`].
+    fn getattr_async(
+        self: std::sync::Arc<Self>,
+        peer: String,
+        request: DfsOwnerGetAttrRequest,
+    ) -> OwnerFuture<DfsOwnerGetAttrReply> {
+        Box::pin(offload_handler(move || self.getattr(&peer, request)))
     }
     fn mknod(
         &self,
@@ -106,6 +146,14 @@ pub trait DfsOwnerLifecycleHandler: Send + Sync + 'static {
     ) -> afs_error::Result<DfsOwnerReleaseReply> {
         Err(dfs_owner_lifecycle_unimplemented())
     }
+    /// The RPC entry of `release`; see [`Self::open_async`].
+    fn release_async(
+        self: std::sync::Arc<Self>,
+        peer: String,
+        request: DfsOwnerReleaseRequest,
+    ) -> OwnerFuture<DfsOwnerReleaseReply> {
+        Box::pin(offload_handler(move || self.release(&peer, request)))
+    }
 }
 
 pub(crate) fn dfs_owner_lifecycle_unimplemented() -> afs_error::Error {
@@ -145,6 +193,37 @@ pub trait DfsOwnerFilesHandler: Send + Sync + 'static {
         _request: DfsOwnerSyncRequest,
     ) -> afs_error::Result<DfsOwnerSyncReply> {
         Err(dfs_owner_unimplemented())
+    }
+
+    // The RPC entries; they run on an async worker. A default runs the sync
+    // method on the blocking pool.
+    fn read_async(
+        self: std::sync::Arc<Self>,
+        peer: String,
+        request: DfsOwnerReadRequest,
+    ) -> OwnerFuture<DfsOwnerReadReply> {
+        Box::pin(offload_handler(move || self.read(&peer, request)))
+    }
+    fn write_async(
+        self: std::sync::Arc<Self>,
+        peer: String,
+        request: DfsOwnerWriteRequest,
+    ) -> OwnerFuture<DfsOwnerWriteReply> {
+        Box::pin(offload_handler(move || self.write(&peer, request)))
+    }
+    fn resize_async(
+        self: std::sync::Arc<Self>,
+        peer: String,
+        request: DfsOwnerResizeRequest,
+    ) -> OwnerFuture<DfsOwnerResizeReply> {
+        Box::pin(offload_handler(move || self.resize(&peer, request)))
+    }
+    fn sync_async(
+        self: std::sync::Arc<Self>,
+        peer: String,
+        request: DfsOwnerSyncRequest,
+    ) -> OwnerFuture<DfsOwnerSyncReply> {
+        Box::pin(offload_handler(move || self.sync(&peer, request)))
     }
 }
 

@@ -132,6 +132,8 @@ struct RecordingMeta {
     node_sessions: Mutex<HashMap<String, Option<String>>>,
     next_current_session_error: Mutex<Option<Error>>,
     current_session_calls: AtomicUsize,
+    current_session_async_calls: AtomicUsize,
+    resolve_write_async_calls: AtomicUsize,
     file_version_loads: AtomicUsize,
     renew_calls: AtomicUsize,
     open_write_calls: AtomicUsize,
@@ -196,6 +198,8 @@ impl RecordingMeta {
             node_sessions: Mutex::new(HashMap::new()),
             next_current_session_error: Mutex::new(None),
             current_session_calls: AtomicUsize::new(0),
+            current_session_async_calls: AtomicUsize::new(0),
+            resolve_write_async_calls: AtomicUsize::new(0),
             file_version_loads: AtomicUsize::new(0),
             renew_calls: AtomicUsize::new(0),
             open_write_calls: AtomicUsize::new(0),
@@ -731,6 +735,24 @@ impl DfsMeta for RecordingMeta {
         }
         let suffix = node_id.strip_prefix("node-").unwrap_or("a");
         Ok(Some(format!("session-{suffix}")))
+    }
+
+    fn current_node_session_async(
+        &self,
+        node_id: String,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, Option<String>> {
+        self.current_session_async_calls
+            .fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { self.current_node_session(&node_id) })
+    }
+
+    fn resolve_write_authority_async(
+        &self,
+        inode_id: InodeId,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, (InodeRecord, WriteLease)> {
+        self.resolve_write_async_calls
+            .fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move { self.resolve_write_authority(&inode_id) })
     }
 }
 

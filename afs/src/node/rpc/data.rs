@@ -64,7 +64,9 @@ use afs_protocol::node_data::{
 };
 
 #[cfg(feature = "dfs")]
-use crate::node::vfs::dfs::owner_api::{DfsOwnerFilesHandler, dfs_owner_unimplemented};
+use crate::node::vfs::dfs::owner_api::{
+    DfsOwnerFilesHandler, OwnerFuture, dfs_owner_unimplemented,
+};
 
 #[cfg(feature = "dfs")]
 #[derive(Clone, Default)]
@@ -90,9 +92,7 @@ impl DfsOwnerFilesService {
         request: Request<Req>,
         handle: &DfsOwnerHandle,
         operation_id: Option<&str>,
-        call: impl FnOnce(Arc<dyn DfsOwnerFilesHandler>, String, Req) -> afs_error::Result<Reply>
-        + Send
-        + 'static,
+        call: impl FnOnce(Arc<dyn DfsOwnerFilesHandler>, String, Req) -> OwnerFuture<Reply>,
     ) -> Result<Response<Reply>, Status> {
         let handler = self
             .handler
@@ -119,7 +119,7 @@ impl DfsOwnerFilesService {
             ));
         }
         let request = request.into_inner();
-        tokio::task::spawn_blocking(move || call(handler, peer, request))
+        crate::node::bridge::run_detached(call(handler, peer, request))
             .await
             .map_err(|error| Status::internal(error.to_string()))?
             .map(Response::new)
@@ -148,7 +148,7 @@ impl DfsOwnerFiles for DfsOwnerFilesService {
         let handle =
             handle.ok_or_else(|| Status::permission_denied("DFS owner handle is required"))?;
         self.dispatch(request, &handle, None, |handler, peer, request| {
-            handler.read(&peer, request)
+            handler.read_async(peer, request)
         })
         .await
     }
@@ -167,7 +167,7 @@ impl DfsOwnerFiles for DfsOwnerFilesService {
             request,
             &handle.ok_or_else(|| Status::permission_denied("DFS owner handle is required"))?,
             Some(&operation),
-            |handler, peer, request| handler.write(&peer, request),
+            |handler, peer, request| handler.write_async(peer, request),
         )
         .await
     }
@@ -181,7 +181,7 @@ impl DfsOwnerFiles for DfsOwnerFilesService {
             request,
             &handle.ok_or_else(|| Status::permission_denied("DFS owner handle is required"))?,
             Some(&operation),
-            |handler, peer, request| handler.resize(&peer, request),
+            |handler, peer, request| handler.resize_async(peer, request),
         )
         .await
     }
@@ -195,7 +195,7 @@ impl DfsOwnerFiles for DfsOwnerFilesService {
             request,
             &handle.ok_or_else(|| Status::permission_denied("DFS owner handle is required"))?,
             Some(&operation),
-            |handler, peer, request| handler.sync(&peer, request),
+            |handler, peer, request| handler.sync_async(peer, request),
         )
         .await
     }
@@ -836,7 +836,7 @@ impl DfsChunks for DfsChunksService {
             let auth_header = header.clone();
             // The permit follows blocking work: cancellation cannot release a
             // slot while its unabortable authority/persistence task is running.
-            let (grant, permit) = tokio::task::spawn_blocking(move || {
+            let (grant, permit) = crate::node::bridge::spawn_blocking(move || {
                 authorizer
                     .authorize(&peer, &auth_header)
                     .map(|grant| (grant, permit))
@@ -887,7 +887,7 @@ impl DfsChunks for DfsChunksService {
                     "replica content differs from immutable identity",
                 ));
             }
-            let acks = tokio::task::spawn_blocking(move || {
+            let acks = crate::node::bridge::spawn_blocking(move || {
                 let _permit = permit;
                 persist_dfs_replica(&local, plane, grant, staged)
             })
@@ -939,7 +939,7 @@ impl DfsChunks for DfsChunksService {
                 .ok_or_else(|| Status::failed_precondition("local ChunkStore is absent"))?;
             let authorizer = self.replica_authorizer.clone();
             let auth_header = header.clone();
-            let (grant, permit) = tokio::task::spawn_blocking(move || {
+            let (grant, permit) = crate::node::bridge::spawn_blocking(move || {
                 authorizer
                     .authorize(&peer, &auth_header)
                     .map(|grant| (grant, permit))
@@ -966,7 +966,7 @@ impl DfsChunks for DfsChunksService {
             let metrics = self.payload_metrics.clone();
             let acks = tokio::time::timeout(
                 self.replica_timeout,
-                tokio::task::spawn_blocking(move || {
+                crate::node::bridge::spawn_blocking(move || {
                     let _permit = permit;
                     ensure_replica_grant_live(grant.expires_at_unix_ms)?;
                     let bytes = {
@@ -1054,7 +1054,7 @@ impl DfsChunks for DfsChunksService {
         let authority = request
             .authority
             .ok_or_else(|| Status::permission_denied("DFS RDMA negotiation authority is absent"))?;
-        let (peer, epoch, _permit) = tokio::task::spawn_blocking(move || {
+        let (peer, epoch, _permit) = crate::node::bridge::spawn_blocking(move || {
             use afs_protocol::node_data::dfs_negotiate_rdma_request::Authority;
             let epoch = match authority {
                 Authority::ReplicaHeader(header) => {
@@ -1131,7 +1131,7 @@ impl DfsChunks for DfsChunksService {
                 .try_acquire_owned()
                 .map_err(|_| Status::resource_exhausted("DFS peer read slots are full"))?;
             let authorizer = self.authorizer.clone();
-            let (read, permit) = tokio::task::spawn_blocking(move || {
+            let (read, permit) = crate::node::bridge::spawn_blocking(move || {
                 authorizer.authorize(&peer, &read).map(|()| (read, permit))
             })
             .await
@@ -1156,7 +1156,7 @@ impl DfsChunks for DfsChunksService {
             let metrics = self.payload_metrics.clone();
             let reply = tokio::time::timeout(
                 self.replica_timeout,
-                tokio::task::spawn_blocking(move || {
+                crate::node::bridge::spawn_blocking(move || {
                     let _permit = permit;
                     let packed = read_packed_dfs_ranges(&local, &read, length)?;
                     validate_dfs_read_request(&read)?;
@@ -1265,7 +1265,7 @@ impl DfsChunks for DfsChunksService {
         if let Some(local) = &local {
             local.record_peer_read_event("blocking_combined");
         }
-        tokio::task::spawn_blocking(move || {
+        crate::node::bridge::spawn_blocking(move || {
             let _permit = permit;
             if authorized.is_closed() || sender.is_closed() {
                 return;
@@ -1875,7 +1875,7 @@ async fn rdma_read_from_client(
 ) -> Result<Vec<u8>, Status> {
     let session = sessions.session(session_id).await?;
     let endpoint = session.endpoint.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = crate::node::bridge::spawn_blocking(move || {
         let mut endpoint = endpoint.blocking_lock();
         endpoint.transfer_read(len).map_err(rdma_status)?;
         endpoint.get_local(len).map_err(rdma_status)
@@ -1912,7 +1912,7 @@ async fn rdma_write_to_client(
 ) -> Result<(), Status> {
     let session = sessions.session(session_id).await?;
     let endpoint = session.endpoint.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = crate::node::bridge::spawn_blocking(move || {
         let mut endpoint = endpoint.blocking_lock();
         endpoint.put_local(&data).map_err(rdma_status)?;
         endpoint.transfer_write(data.len()).map_err(rdma_status)
@@ -3323,13 +3323,7 @@ impl OwnerFilesService {
         // file action on this worker and let Tokio hand other tasks off while
         // it blocks, avoiding a blocking-pool scheduling hop per file RPC.
         // Current-thread test runtimes still need spawn_blocking.
-        let result = if tokio::runtime::Handle::current().runtime_flavor()
-            == tokio::runtime::RuntimeFlavor::MultiThread
-        {
-            Ok(tokio::task::block_in_place(work))
-        } else {
-            tokio::task::spawn_blocking(work).await
-        };
+        let result = crate::node::bridge::offload(work).await;
         if let Some(metrics) = &self.metrics {
             metrics.observe("server", operation, started.elapsed());
         }
@@ -3500,7 +3494,7 @@ async fn owner_rdma_write_to_client(
     data: prost::bytes::Bytes,
 ) -> Result<(), Status> {
     let worker = session.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = crate::node::bridge::spawn_blocking(move || {
         let mut endpoint = worker.endpoint.blocking_lock();
         let guard = OwnerServerRdmaGuard::new(worker.clone());
         if worker.poisoned.load(Ordering::SeqCst) {
@@ -3536,7 +3530,7 @@ async fn owner_rdma_write_to_client(
 #[cfg(all(feature = "ownerfs", feature = "rdma"))]
 async fn owner_rdma_capacity(session: Arc<super::control::RdmaSession>) -> Result<usize, Status> {
     let worker = session.clone();
-    tokio::task::spawn_blocking(move || {
+    crate::node::bridge::spawn_blocking(move || {
         let endpoint = worker.endpoint.blocking_lock();
         if worker.poisoned.load(Ordering::SeqCst) {
             return Err(coded_status(
@@ -3577,7 +3571,7 @@ async fn owner_rdma_write_from_client(
     mut request: OwnerWriteRequest,
 ) -> Result<OwnerWriteReply, Status> {
     let worker = session.clone();
-    let result = tokio::task::spawn_blocking(move || {
+    let result = crate::node::bridge::spawn_blocking(move || {
         let len = request.length as usize;
         let mut endpoint = worker.endpoint.blocking_lock();
         let guard = OwnerServerRdmaGuard::new(worker.clone());
@@ -3907,7 +3901,7 @@ impl OwnerFiles for OwnerFilesService {
                 buffer_offset: 0,
             });
             let started = std::time::Instant::now();
-            let reply = tokio::task::spawn_blocking(move || handler.read(&peer, request))
+            let reply = crate::node::bridge::spawn_blocking(move || handler.read(&peer, request))
                 .await
                 .map_err(|error| {
                     coded_status(
@@ -3937,7 +3931,7 @@ impl OwnerFiles for OwnerFilesService {
             }));
         }
         let started = std::time::Instant::now();
-        let reply = tokio::task::spawn_blocking(move || {
+        let reply = crate::node::bridge::spawn_blocking(move || {
             let mut reply = handler.read(&peer, request)?;
             if reply.read as usize != reply.data.len() {
                 return Err(afs_error::Error::coded(
@@ -3999,7 +3993,7 @@ impl OwnerFiles for OwnerFilesService {
             let remote = remote_file_for_handle(&presented, handle.opaque);
             let auth_handler = handler.clone();
             let auth_peer = peer.clone();
-            tokio::task::spawn_blocking(move || {
+            crate::node::bridge::spawn_blocking(move || {
                 auth_handler.authorize_data_write(&auth_peer, &presented, &remote)
             })
             .await
@@ -4031,7 +4025,7 @@ impl OwnerFiles for OwnerFilesService {
         }
         let request_length = request.length;
         let started = std::time::Instant::now();
-        let reply = tokio::task::spawn_blocking(move || handler.write(&peer, request))
+        let reply = crate::node::bridge::spawn_blocking(move || handler.write(&peer, request))
             .await
             .map_err(|error| {
                 coded_status(

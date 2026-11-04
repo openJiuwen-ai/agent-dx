@@ -33,26 +33,6 @@ pub(crate) async fn in_read_scope<T>(
     READ_SCOPE.scope(scope, work).await
 }
 
-/// Only genuine synchronous backend adapters use this boundary. Native gRPC
-/// overrides the async methods and never sends network waiting through it.
-/// Multi-thread runtimes support a finite blocking region; current-thread
-/// compatibility drivers use a scoped thread outside all runtime contexts.
-#[cfg(feature = "dfs")]
-pub(crate) fn sync_read_backend<T: Send>(work: impl FnOnce() -> Result<T> + Send) -> Result<T> {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(work)
-        }
-        Ok(_) => std::thread::scope(|scope| scope.spawn(work).join()).map_err(|_| {
-            Error::coded(
-                afs_error::CLIENT_WORKER_FAILED,
-                "synchronous read backend panicked",
-            )
-        })?,
-        Err(_) => work(),
-    }
-}
-
 #[cfg(feature = "dfs")]
 pub(crate) struct NativeReadAllocation {
     pub(crate) length: usize,
@@ -353,20 +333,5 @@ mod unified_contract_tests {
             value.get("enabled").is_none(),
             "read resource policy must not choose sync or async"
         );
-    }
-}
-
-/// Genuine local file/codec work may borrow the private response, never a
-/// network wait. Production multi-thread runtimes replace this worker while
-/// it is in the blocking region. Synchronous/current-thread test callers run
-/// the same finite local operation inline.
-#[cfg(feature = "dfs")]
-pub(crate) fn local_io<T>(work: impl FnOnce() -> T) -> T {
-    if tokio::runtime::Handle::try_current()
-        .is_ok_and(|h| h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
-    {
-        tokio::task::block_in_place(work)
-    } else {
-        work()
     }
 }

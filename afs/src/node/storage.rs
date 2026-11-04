@@ -311,7 +311,7 @@ impl Storage {
             return Err(StorageError::TooLarge);
         }
         let path = self.resolve(name)?;
-        tokio::task::spawn_blocking(move || read_blocking(path, offset, length)).await?
+        crate::node::bridge::spawn_blocking(move || read_blocking(path, offset, length)).await?
     }
 
     /// 完成普通文件 write_all 后返回长度，不隐式 sync_data/fsync。
@@ -330,7 +330,7 @@ impl Storage {
             .ok_or(StorageError::Range)?;
         let path = self.resolve(name)?;
         // std::fs 是阻塞 API。放到 Tokio blocking pool，使慢盘等待不占异步 RPC 执行线程。
-        tokio::task::spawn_blocking(move || write_blocking(path, offset, data)).await?
+        crate::node::bridge::spawn_blocking(move || write_blocking(path, offset, data)).await?
     }
 
     fn resolve(&self, name: &str) -> Result<PathBuf, StorageError> {

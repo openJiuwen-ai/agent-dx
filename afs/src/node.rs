@@ -12,6 +12,7 @@
 //! REST diagnostics/SDK→Storage 仍是独立诊断链，不属于任何文件系统的数据面。
 
 pub mod api;
+pub(crate) mod bridge;
 #[cfg(feature = "dfs")]
 pub(crate) mod call_deadline;
 pub mod chunk;
@@ -196,7 +197,7 @@ impl vfs::ownerfs::RemoteFilesFactory for OwnerFilesFactory {
         params: &vfs::ownerfs::root::RootCreateParams,
     ) -> afs_error::Result<()> {
         let (uri, epoch) = self.meta.lookup_node_location(&reservation.home_node_id)?;
-        self.runtime.block_on(async {
+        bridge::block_on(&self.runtime, async {
             let channel = self
                 .peers
                 .channel(&reservation.home_node_id, epoch, &uri)
@@ -228,14 +229,15 @@ impl vfs::ownerfs::RemoteFilesFactory for OwnerFilesFactory {
         home_node_id: &str,
     ) -> afs_error::Result<Arc<dyn vfs::ownerfs::remote::RemoteFiles>> {
         let (uri, node_epoch) = self.meta.lookup_node_location(home_node_id)?;
-        let channel = self.runtime.block_on(self.peers.owner_files_channel(
-            home_node_id,
-            node_epoch,
-            &uri,
-        ))?;
-        let long_wait_channel =
-            self.runtime
-                .block_on(self.peers.long_wait_channel(home_node_id, node_epoch, &uri))?;
+        let channel = bridge::block_on(
+            &self.runtime,
+            self.peers
+                .owner_files_channel(home_node_id, node_epoch, &uri),
+        )?;
+        let long_wait_channel = bridge::block_on(
+            &self.runtime,
+            self.peers.long_wait_channel(home_node_id, node_epoch, &uri),
+        )?;
         Ok(Arc::new(
             rpc::peer::owner_files_client_from_channel_with_runtime_and_metrics(
                 channel,
@@ -988,7 +990,7 @@ impl NodeReadiness {
         *self.sampler_started_at.lock().unwrap() = Some(Instant::now());
         self.drop_finished_sampler_handle();
         let readiness = self.clone();
-        let handle = tokio::task::spawn_blocking(move || {
+        let handle = crate::node::bridge::spawn_blocking(move || {
             let (data_ready, data_error) = sample_data_device(&data_dir);
             let (rdma_available, rdma_error) = sample_rdma_sysfs(
                 readiness.rdma_required,
@@ -1062,7 +1064,7 @@ impl NodeReadiness {
             Some(Instant::now() - READINESS_SAMPLER_BLOCKED_AFTER - Duration::from_secs(1));
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let readiness = self.clone();
-        let handle = tokio::task::spawn_blocking(move || {
+        let handle = crate::node::bridge::spawn_blocking(move || {
             let _ = rx.blocking_recv();
             readiness.note_resource_observation(true, None, false, None);
             readiness.finish_sampler();
@@ -1418,11 +1420,13 @@ async fn run_node(
                 .rdma_device
                 .clone()
                 .expect("OwnerFs RDMA checked rdma_device");
-            tokio::task::spawn_blocking(move || afs_transport::rdma::RdmaEndpoint::open(&device))
-                .await?
-                .map_err(|error| {
-                    afs_error::Error::coded(afs_error::NODE_TRANSFER_UNAVAILABLE, error.to_string())
-                })?;
+            crate::node::bridge::spawn_blocking(move || {
+                afs_transport::rdma::RdmaEndpoint::open(&device)
+            })
+            .await?
+            .map_err(|error| {
+                afs_error::Error::coded(afs_error::NODE_TRANSFER_UNAVAILABLE, error.to_string())
+            })?;
         }
         let remote_factory = Arc::new(OwnerFilesFactory {
             meta: root_meta.clone(),
@@ -1438,7 +1442,7 @@ async fn run_node(
         });
         let recovery_root_meta = root_meta.clone();
         let roots = Arc::new(
-            tokio::task::spawn_blocking(move || {
+            crate::node::bridge::spawn_blocking(move || {
                 vfs::ownerfs::root::RootManager::open(
                     recovery_node_id,
                     recovery_session_id,
@@ -1526,7 +1530,7 @@ async fn run_node(
         if let Some(device) = dfs_rdma_startup_device(dfs_data_mode, cfg.rdma_device.as_deref())? {
             let peers = peer_connections.clone();
             Some(Arc::new(
-                tokio::task::spawn_blocking(move || {
+                crate::node::bridge::spawn_blocking(move || {
                     rpc::peer::DfsRdmaPool::new(peers, device, timeout)
                 })
                 .await??,
@@ -1616,8 +1620,10 @@ async fn run_node(
                 metrics: Some(s3_metrics),
             };
             Some(Arc::new(
-                tokio::task::spawn_blocking(move || external_chunk::S3ChunkStore::new(options))
-                    .await??,
+                crate::node::bridge::spawn_blocking(move || {
+                    external_chunk::S3ChunkStore::new(options)
+                })
+                .await??,
             ))
         } else {
             None
@@ -1672,7 +1678,7 @@ async fn run_node(
             let outboard_budget = dfs_outboard_budget.clone();
             let max_inflight_objects = cfg.dfs_fetch_max_inflight_objects;
             let cache = Arc::new(
-                tokio::task::spawn_blocking(move || {
+                crate::node::bridge::spawn_blocking(move || {
                     peer_cache::DiskPeerCache::open_with_outboard_budget(options, outboard_budget)
                         .and_then(|cache| cache.with_max_inflight_objects(max_inflight_objects))
                         .map(|cache| cache.with_read_work_metrics(cache_metrics))
@@ -1983,7 +1989,7 @@ async fn run_node(
                     _ = &mut shutdown => return Ok(()),
                     _ = tick.tick() => {
                         let fs = ownerfs.clone();
-                        match tokio::task::spawn_blocking(move || fs.reap_expired_peer_sessions()).await {
+                        match crate::node::bridge::spawn_blocking(move || fs.reap_expired_peer_sessions()).await {
                             Ok(Ok(count)) if count > 0 => {
                                 afs_logging::info!("ownerfs.peer_handles_reaped"; "count" => count);
                             }
@@ -2009,7 +2015,7 @@ async fn run_node(
             let mut tick=tokio::time::interval(std::time::Duration::from_secs(5));
             let shutdown=cancelled(gc_stop);tokio::pin!(shutdown);
             loop {tokio::select!{_=&mut shutdown=>return Ok(()),_=tick.tick()=>{
-                let fs=gc_fs.clone();match tokio::task::spawn_blocking(move||fs.collect_garbage()).await {
+                let fs=gc_fs.clone();match crate::node::bridge::spawn_blocking(move||fs.collect_garbage()).await {
                     Ok(Ok(count)) if count>0=>afs_logging::info!("dfs.gc_collected";"chunks"=>count),
                     Ok(Ok(_))=>{},Ok(Err(error))=>afs_logging::warn!("dfs.gc_retry";"error"=>error.to_string()),
                     Err(error)=>afs_logging::warn!("dfs.gc_worker_failed";"error"=>error.to_string()),
@@ -2027,7 +2033,7 @@ async fn run_node(
                     _ = &mut shutdown => return Ok(()),
                     _ = tick.tick() => {
                         let fs = renew_fs.clone();
-                        match tokio::task::spawn_blocking(move || fs.renew_active_write_leases()).await {
+                        match crate::node::bridge::spawn_blocking(move || fs.renew_active_write_leases()).await {
                             Ok(Ok(_)) => {},
                             Ok(Err(error)) => afs_logging::warn!("dfs.writer_renewal_retry"; "error" => error.to_string()),
                             Err(error) => afs_logging::warn!("dfs.writer_renewal_worker_failed"; "error" => error.to_string()),
@@ -2060,7 +2066,7 @@ async fn run_node(
                         }
                     }, if has_native_pipeline => {
                         let fs = dfs.clone();
-                        match tokio::task::spawn_blocking(move || {
+                        match crate::node::bridge::spawn_blocking(move || {
                             if due {
                                 fs.writeback_pending()
                             } else {
@@ -2081,7 +2087,7 @@ async fn run_node(
                     }
                     _ = tick.tick() => {
                         let fs = dfs.clone();
-                        match tokio::task::spawn_blocking(move || {
+                        match crate::node::bridge::spawn_blocking(move || {
                             let mut first_error = None;
                             let committed = if has_native_pipeline { 0 } else { match fs.writeback_pending() {
                                 Ok(count) => count,
@@ -2308,7 +2314,7 @@ async fn run_node(
                 // The worker owns an exact pending request until its Meta
                 // outcome is confirmed. A started blocking transfer is not
                 // detached on a tick or replaced by another task.
-                match tokio::task::spawn_blocking(move || worker.run_once()).await {
+                match crate::node::bridge::spawn_blocking(move || worker.run_once()).await {
                     Ok(Ok(Some(task))) => {
                         afs_logging::info!("dfs.replication_task_reported";
                             "task" => task.id.0,
@@ -2376,7 +2382,7 @@ async fn run_node(
             .native_workspace
             .clone()
             .expect("native config requires settings");
-        let startup = tokio::task::spawn_blocking(move || {
+        let startup = crate::node::bridge::spawn_blocking(move || {
             native_workspace::NativeWorkspace::start(owner, mount, native)
         })
         .await;
@@ -2441,7 +2447,7 @@ async fn run_node(
     // process-wide watchdog bounds a permanently busy or unresolved claim.
     #[cfg(feature = "ownerfs")]
     if let Some(worker) = native_workspace_worker {
-        let closure = tokio::task::spawn_blocking(move || worker.shutdown()).await;
+        let closure = crate::node::bridge::spawn_blocking(move || worker.shutdown()).await;
         let error: Option<BoxError> = match closure {
             Ok(Ok(())) => None,
             Ok(Err(error)) => Some(error.into()),
@@ -2463,7 +2469,7 @@ async fn run_node(
     // Dropping BackgroundSession alone detaches the thread and cannot prove this boundary.
     #[cfg(feature = "dfs")]
     if let Some(mounted) = mounted_dfs {
-        match tokio::task::spawn_blocking(move || mounted.join()).await {
+        match crate::node::bridge::spawn_blocking(move || mounted.join()).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 afs_logging::error!("node.fuse_closure_failed"; "error" => error.to_string());
@@ -2479,7 +2485,7 @@ async fn run_node(
     }
     #[cfg(feature = "ownerfs")]
     if let Some(mounted) = mounted_ownerfs {
-        match tokio::task::spawn_blocking(move || mounted.join()).await {
+        match crate::node::bridge::spawn_blocking(move || mounted.join()).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 afs_logging::error!("node.fuse_closure_failed"; "error" => error.to_string());
@@ -2495,7 +2501,7 @@ async fn run_node(
     }
     #[cfg(feature = "dfs")]
     if let Some(dfs) = dfs_for_drain {
-        match tokio::task::spawn_blocking(move || {
+        match crate::node::bridge::spawn_blocking(move || {
             let mut first_error = None;
             let committed = match dfs.drain() {
                 Ok(count) => count,
@@ -2567,7 +2573,7 @@ async fn run_node(
     }
     #[cfg(feature = "dfs")]
     if let Some(store) = dfs_sidecar_store_for_shutdown {
-        match tokio::task::spawn_blocking(move || {
+        match crate::node::bridge::spawn_blocking(move || {
             // Attempt both drains even if the first one reports a failure.
             (
                 store.shutdown_catalog_committer(),
@@ -2595,7 +2601,7 @@ async fn run_node(
     }
     #[cfg(feature = "dfs")]
     if let Some(cache) = dfs_peer_cache_for_shutdown {
-        match tokio::task::spawn_blocking(move || cache.shutdown()).await {
+        match crate::node::bridge::spawn_blocking(move || cache.shutdown()).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 afs_logging::error!("dfs.peer_cache_shutdown_failed"; "error" => error.to_string());
@@ -2609,7 +2615,7 @@ async fn run_node(
     }
     #[cfg(feature = "dfs")]
     if let Some(store) = dfs_external_store_for_shutdown {
-        match tokio::task::spawn_blocking(move || store.shutdown_verifier()).await {
+        match crate::node::bridge::spawn_blocking(move || store.shutdown_verifier()).await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 afs_logging::error!("dfs.external_store_shutdown_failed"; "error" => error.to_string());
@@ -2714,9 +2720,10 @@ async fn run_workspace_bind_root_commands(
         let meta = meta.clone();
         // Join this exact blocking RPC before another poll or shutdown. Do not
         // race/cancel it on a tick and leave detached duplicate control calls.
-        let result =
-            tokio::task::spawn_blocking(move || meta.poll_root_command_batch(after_revision))
-                .await?;
+        let result = crate::node::bridge::spawn_blocking(move || {
+            meta.poll_root_command_batch(after_revision)
+        })
+        .await?;
         if *stop.borrow() {
             return Ok(());
         }

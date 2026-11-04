@@ -607,7 +607,7 @@ impl GrpcRootMeta {
         &self,
         future: impl std::future::Future<Output = std::result::Result<T, tonic::Status>>,
     ) -> Result<T> {
-        self.runtime.block_on(async {
+        crate::node::bridge::block_on(&self.runtime, async {
             tokio::time::timeout(self.timeout, future)
                 .await
                 .map_err(|_| {
@@ -1053,6 +1053,21 @@ impl GrpcDfsMeta {
         stage: crate::node::read_work::ReadDiagnosticStage,
         call: impl FnOnce() -> afs_error::Result<T>,
     ) -> afs_error::Result<T> {
+        let (diagnostic, _coarse) = self.begin_read_diagnostic(stage);
+        let result = call();
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.finish(result.is_ok());
+        }
+        result
+    }
+
+    fn begin_read_diagnostic(
+        &self,
+        stage: crate::node::read_work::ReadDiagnosticStage,
+    ) -> (
+        Option<crate::node::read_work::ReadDiagnosticSpan>,
+        Option<crate::node::read_work::ReadCoarseDiagnosticSpan>,
+    ) {
         use crate::node::read_work::ReadDiagnosticStage;
         let diagnostic = self
             .read_work
@@ -1067,16 +1082,12 @@ impl GrpcDfsMeta {
             ReadDiagnosticStage::MetaSyncInodeMetadata => Some("meta_sync_inode_metadata_rpc"),
             _ => None,
         };
-        let _coarse = phase.and_then(|phase| {
+        let coarse = phase.and_then(|phase| {
             self.read_work
                 .as_ref()
                 .and_then(|metrics| metrics.coarse_diagnostic(phase, 0))
         });
-        let result = call();
-        if let Some(diagnostic) = diagnostic {
-            diagnostic.finish(result.is_ok());
-        }
-        result
+        (diagnostic, coarse)
     }
 
     fn request_id(&self) -> String {
@@ -1092,18 +1103,26 @@ impl GrpcDfsMeta {
         &self,
         future: impl std::future::Future<Output = std::result::Result<T, tonic::Status>>,
     ) -> afs_error::Result<T> {
+        crate::node::bridge::block_on(&self.runtime, self.run_async(future))
+    }
+
+    /// One request under the configured timeout, shortened by the polling
+    /// thread's `call_deadline` scope. `block_on` polls on the calling thread, so
+    /// a synchronous caller's scope applies here.
+    async fn run_async<T>(
+        &self,
+        future: impl std::future::Future<Output = std::result::Result<T, tonic::Status>>,
+    ) -> afs_error::Result<T> {
         let timeout = crate::node::call_deadline::bounded(self.timeout);
-        self.runtime.block_on(async {
-            tokio::time::timeout(timeout, future)
-                .await
-                .map_err(|_| {
-                    Error::coded(
-                        afs_error::CLIENT_DEADLINE_EXCEEDED,
-                        "DFS Meta request timed out",
-                    )
-                })?
-                .map_err(Self::dfs_meta_status_to_error)
-        })
+        tokio::time::timeout(timeout, future)
+            .await
+            .map_err(|_| {
+                Error::coded(
+                    afs_error::CLIENT_DEADLINE_EXCEEDED,
+                    "DFS Meta request timed out",
+                )
+            })?
+            .map_err(Self::dfs_meta_status_to_error)
     }
 
     #[cfg(feature = "dfs")]
@@ -1247,37 +1266,39 @@ impl GrpcDfsMeta {
         &self,
         request: crate::dfs::AuthorizeCurrentExternalRead,
     ) -> afs_error::Result<Option<crate::dfs::AuthorizeCurrentExternalReadReply>> {
-        let response = self.runtime.block_on(async {
-            tokio::time::timeout(
-                self.timeout,
-                self.client().authorize_current_external_read(
-                    afs_tracing::request_with_current_context(
-                        afs_protocol::meta::AuthorizeCurrentExternalReadRequest {
-                            caller_id: request.caller_id,
-                            inode_id: request.inode_id.0,
-                            namespace_id: request.namespace_id.0,
-                            expected_head_version_id: request.expected_head_version.0,
-                            layout_root_id: request.layout_root_id.0,
-                            validations: request
-                                .validations
-                                .into_iter()
-                                .map(wire_read_validation)
-                                .collect(),
-                            missing_sources: request
-                                .missing_sources
-                                .into_iter()
-                                .map(|missing| afs_protocol::meta::DfsMissingReadSource {
-                                    chunk_id: missing.chunk_id.0,
-                                    chunk_offset: missing.chunk_offset,
-                                    length: missing.length,
-                                })
-                                .collect(),
-                        },
+        let response = crate::node::bridge::block_on(&self.runtime, async {
+            Ok::<_, Error>(
+                tokio::time::timeout(
+                    self.timeout,
+                    self.client().authorize_current_external_read(
+                        afs_tracing::request_with_current_context(
+                            afs_protocol::meta::AuthorizeCurrentExternalReadRequest {
+                                caller_id: request.caller_id,
+                                inode_id: request.inode_id.0,
+                                namespace_id: request.namespace_id.0,
+                                expected_head_version_id: request.expected_head_version.0,
+                                layout_root_id: request.layout_root_id.0,
+                                validations: request
+                                    .validations
+                                    .into_iter()
+                                    .map(wire_read_validation)
+                                    .collect(),
+                                missing_sources: request
+                                    .missing_sources
+                                    .into_iter()
+                                    .map(|missing| afs_protocol::meta::DfsMissingReadSource {
+                                        chunk_id: missing.chunk_id.0,
+                                        chunk_offset: missing.chunk_offset,
+                                        length: missing.length,
+                                    })
+                                    .collect(),
+                            },
+                        ),
                     ),
-                ),
+                )
+                .await,
             )
-            .await
-        });
+        })?;
         let reply = match response {
             Err(_) => {
                 return Err(Error::coded(
@@ -1296,32 +1317,34 @@ impl GrpcDfsMeta {
         &self,
         request: crate::dfs::AuthorizeExternalVersionRead,
     ) -> afs_error::Result<crate::dfs::AuthorizeExternalVersionReadReply> {
-        let response = self.runtime.block_on(async {
-            tokio::time::timeout(
-                self.timeout,
-                self.client().authorize_external_version_read(
-                    afs_tracing::request_with_current_context(
-                        afs_protocol::meta::AuthorizeExternalVersionReadRequest {
-                            caller_id: request.caller_id,
-                            inode_id: request.inode_id.0,
-                            namespace_id: request.namespace_id.0,
-                            file_version_id: request.file_version_id.0,
-                            layout_root_id: request.layout_root_id.0,
-                            requests: request
-                                .requests
-                                .into_iter()
-                                .map(|request| afs_protocol::meta::DfsMissingReadSource {
-                                    chunk_id: request.chunk_id.0,
-                                    chunk_offset: request.chunk_offset,
-                                    length: request.length,
-                                })
-                                .collect(),
-                        },
+        let response = crate::node::bridge::block_on(&self.runtime, async {
+            Ok::<_, Error>(
+                tokio::time::timeout(
+                    self.timeout,
+                    self.client().authorize_external_version_read(
+                        afs_tracing::request_with_current_context(
+                            afs_protocol::meta::AuthorizeExternalVersionReadRequest {
+                                caller_id: request.caller_id,
+                                inode_id: request.inode_id.0,
+                                namespace_id: request.namespace_id.0,
+                                file_version_id: request.file_version_id.0,
+                                layout_root_id: request.layout_root_id.0,
+                                requests: request
+                                    .requests
+                                    .into_iter()
+                                    .map(|request| afs_protocol::meta::DfsMissingReadSource {
+                                        chunk_id: request.chunk_id.0,
+                                        chunk_offset: request.chunk_offset,
+                                        length: request.length,
+                                    })
+                                    .collect(),
+                            },
+                        ),
                     ),
-                ),
+                )
+                .await,
             )
-            .await
-        });
+        })?;
         let reply = match response {
             Err(_) => {
                 return Err(Error::coded(
@@ -1910,19 +1933,33 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         &self,
         inode_id: &crate::dfs::InodeId,
     ) -> afs_error::Result<(crate::dfs::InodeRecord, crate::dfs::WriteLease)> {
-        self.read_diagnostic(
-            crate::node::read_work::ReadDiagnosticStage::MetaResolveWriteAuthority,
-            || {
+        crate::node::bridge::block_on(
+            &self.runtime,
+            self.resolve_write_authority_async(inode_id.clone()),
+        )
+    }
+
+    fn resolve_write_authority_async(
+        &self,
+        inode_id: crate::dfs::InodeId,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, (crate::dfs::InodeRecord, crate::dfs::WriteLease)>
+    {
+        Box::pin(async move {
+            let (diagnostic, _coarse) = self.begin_read_diagnostic(
+                crate::node::read_work::ReadDiagnosticStage::MetaResolveWriteAuthority,
+            );
+            let result = async {
                 let reply = self
-                    .run(self.client().resolve_write_authority(
+                    .run_async(self.client().resolve_write_authority(
                         afs_protocol::meta::ResolveDfsWriteAuthorityRequest {
                             caller_id: self.node_id.clone(),
                             owner_session_id: self.session_id.clone(),
                             operation_id: self.request_id(),
-                            inode_id: inode_id.0.clone(),
+                            inode_id: inode_id.0,
                             lease_seconds: crate::node::vfs::dfs::DFS_WRITE_LEASE_SECONDS,
                         },
-                    ))?
+                    ))
+                    .await?
                     .into_inner();
                 Ok((
                     domain_dfs_inode(required(reply.inode, "ResolveWriteAuthority.inode")?)?,
@@ -1931,8 +1968,13 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
                         "ResolveWriteAuthority.write_lease",
                     )?),
                 ))
-            },
-        )
+            }
+            .await;
+            if let Some(diagnostic) = diagnostic {
+                diagnostic.finish(result.is_ok());
+            }
+            result
+        })
     }
 
     fn renew_write_lease(
@@ -2193,26 +2235,38 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
     }
 
     fn current_node_session(&self, node_id: &str) -> afs_error::Result<Option<String>> {
-        let reply = self
-            .run(
-                self.root_client()
-                    .lookup_node(afs_protocol::meta::LookupNodeRequest {
+        crate::node::bridge::block_on(
+            &self.runtime,
+            self.current_node_session_async(node_id.to_owned()),
+        )
+    }
+
+    fn current_node_session_async(
+        &self,
+        node_id: String,
+    ) -> crate::node::read_pipeline::ReadFuture<'_, Option<String>> {
+        Box::pin(async move {
+            let reply =
+                self.run_async(self.root_client().lookup_node(
+                    afs_protocol::meta::LookupNodeRequest {
                         request_id: self.request_id(),
-                        node_id: node_id.to_owned(),
-                    }),
-            )?
-            .into_inner();
-        if !reply.found {
-            return Ok(None);
-        }
-        let node = required(reply.node, "LookupNode.node")?;
-        if node.session_id.is_empty() {
-            return Err(Error::coded(
-                CLIENT_PROTOCOL_VIOLATION,
-                "LookupNode returned an empty process session",
-            ));
-        }
-        Ok(Some(node.session_id))
+                        node_id,
+                    },
+                ))
+                .await?
+                .into_inner();
+            if !reply.found {
+                return Ok(None);
+            }
+            let node = required(reply.node, "LookupNode.node")?;
+            if node.session_id.is_empty() {
+                return Err(Error::coded(
+                    CLIENT_PROTOCOL_VIOLATION,
+                    "LookupNode returned an empty process session",
+                ));
+            }
+            Ok(Some(node.session_id))
+        })
     }
 
     fn commit_file_version(
@@ -4139,6 +4193,32 @@ mod tests {
             TlsConfig::Disabled,
         )
         .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sync_meta_call_on_an_async_worker_is_refused_and_the_async_method_runs() {
+        let (endpoint, server) = hanging_endpoint().await;
+        let meta = test_meta(&endpoint, Duration::from_millis(30));
+        let refused = DfsMeta::current_node_session(&meta, "node-b").unwrap_err();
+        assert_eq!(refused.code(), afs_error::CLIENT_WORKER_FAILED);
+        assert!(refused.to_string().contains("Tokio runtime"), "{refused}");
+        let refused =
+            DfsMeta::resolve_write_authority(&meta, &crate::dfs::InodeId::new("i")).unwrap_err();
+        assert_eq!(refused.code(), afs_error::CLIENT_WORKER_FAILED);
+
+        let session = meta.current_node_session_async("node-b".into()).await;
+        assert_eq!(
+            session.unwrap_err().code(),
+            afs_error::CLIENT_DEADLINE_EXCEEDED
+        );
+        let authority = meta
+            .resolve_write_authority_async(crate::dfs::InodeId::new("i"))
+            .await;
+        assert_eq!(
+            authority.unwrap_err().code(),
+            afs_error::CLIENT_DEADLINE_EXCEEDED
+        );
+        server.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
