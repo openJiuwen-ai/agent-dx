@@ -1040,6 +1040,35 @@ impl GrpcDfsMeta {
         self
     }
 
+    /// Returns the registered data endpoint and Node incarnation for HIXL
+    /// pre-warm. Node location comes from the Meta registry, not from an
+    /// address self-reported inside a data request.
+    pub fn lookup_node_data_location(&self, node_id: &str) -> Result<(String, u64)> {
+        let mut client = MetaClient::new(self.channel.clone());
+        let reply = self
+            .run(client.lookup_node(LookupNodeRequest {
+                request_id: self.request_id(),
+                node_id: node_id.to_owned(),
+            }))?
+            .into_inner();
+        if !reply.found {
+            return Err(Error::coded(
+                afs_error::NODE_VFS_NOT_FOUND,
+                "pre-warm Node is not registered",
+            ));
+        }
+        let node_epoch = reply.lease_epoch;
+        let node = required(reply.node, "LookupNode.node")?;
+        let endpoint = required(node.endpoint, "LookupNode.node.endpoint")?.data_addr;
+        if endpoint.is_empty() {
+            return Err(Error::coded(
+                CLIENT_PROTOCOL_VIOLATION,
+                "pre-warm Node has no data endpoint",
+            ));
+        }
+        Ok((endpoint, node_epoch))
+    }
+
     fn record_read_rpc(&self, method: &'static str) {
         if let Some(metrics) = &self.read_work {
             metrics.read_rpc(method);

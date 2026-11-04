@@ -48,6 +48,10 @@ fn node_with_readiness(config: Config, readiness: Arc<NodeReadiness>) -> Arc<Nod
         ownerfs: None,
         #[cfg(feature = "dfs")]
         dfs: None,
+        #[cfg(feature = "dfs")]
+        hixl_runtime: None,
+        #[cfg(feature = "dfs")]
+        hixl_metrics: None,
     })
 }
 
@@ -107,6 +111,37 @@ async fn node_health_can_report_foundation_ready_without_configured_mounts() {
     assert_eq!(body["configured_filesystems_ready"], false);
     assert_eq!(body["checks"]["mounts"]["configured"], false);
     assert_eq!(body["checks"]["data_device"]["ready"], true);
+    assert_eq!(body["checks"]["hixl"]["mode"], "off");
+    assert_eq!(body["checks"]["hixl"]["ready"], true);
+}
+
+#[tokio::test]
+async fn required_hixl_without_running_generation_degrades_health() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = test_config(temp.path().to_owned());
+    config.hixl.dfs_read_mode = afs::config::HixlDfsReadMode::Required;
+    let readiness = Arc::new(NodeReadiness::new(
+        false, None, None, None, None, "grpc", None,
+    ));
+    mark_resources_ready(&readiness);
+    let (status, body) = get_health(node_with_readiness(config, readiness)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["checks"]["hixl"]["ready"], false);
+}
+
+#[tokio::test]
+async fn preferred_hixl_without_native_capability_reports_grpc_fallback() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut config = test_config(temp.path().to_owned());
+    config.hixl.dfs_read_mode = afs::config::HixlDfsReadMode::Preferred;
+    let readiness = Arc::new(NodeReadiness::new(
+        false, None, None, None, None, "grpc", None,
+    ));
+    mark_resources_ready(&readiness);
+    let (status, body) = get_health(node_with_readiness(config, readiness)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["checks"]["hixl"]["state"], "unsupported");
+    assert_eq!(body["checks"]["hixl"]["fallback"], "grpc");
 }
 
 #[tokio::test]

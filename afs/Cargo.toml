@@ -13,6 +13,7 @@ default = ["ownerfs", "dfs", "node-jemalloc"]
 ownerfs = []
 dfs = []
 rdma = ["afs-transport/rdma"]
+hixl = ["dfs", "afs-transport/hixl"]
 # Disable only for allocator comparisons; only afs-node installs it globally.
 node-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 
