@@ -81,6 +81,20 @@ impl Environment for Backend {
         value.ready = false;
         Ok(value.clone())
     }
+    async fn pause(
+        &self,
+        tenant: &str,
+        id: &str,
+        _timeout_seconds: u64,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        let mut entries = self.0.lock().unwrap();
+        let value = entries
+            .get_mut(&(tenant.into(), id.into()))
+            .ok_or(EnvironmentError::NotFound)?;
+        value.phase = EnvironmentPhase::Paused;
+        value.ready = false;
+        Ok(value.clone())
+    }
 }
 #[derive(Debug)]
 struct Identity;
@@ -1252,6 +1266,14 @@ impl Environment for RuntimeBackend {
         id: &str,
     ) -> Result<EnvironmentObservation, EnvironmentError> {
         self.inner.delete(tenant, id).await
+    }
+    async fn pause(
+        &self,
+        tenant: &str,
+        id: &str,
+        timeout_seconds: u64,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        self.inner.pause(tenant, id, timeout_seconds).await
     }
     async fn list(&self, tenant: &str) -> Result<Vec<EnvironmentInfo>, EnvironmentError> {
         self.inner.list(tenant).await

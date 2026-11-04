@@ -77,6 +77,20 @@ impl Environment for Platform {
         value.ready = false;
         Ok(value.clone())
     }
+    async fn pause(
+        &self,
+        tenant: &str,
+        id: &str,
+        _timeout_seconds: u64,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        let mut values = self.observations.lock().unwrap();
+        let value = values
+            .get_mut(&(tenant.into(), id.into()))
+            .ok_or(EnvironmentError::NotFound)?;
+        value.phase = EnvironmentPhase::Paused;
+        value.ready = false;
+        Ok(value.clone())
+    }
 }
 fn template() -> TemplateVersion {
     serde_json::from_value(serde_json::json!({"name":"app","version":"1","image":"app:1","isolation_runtime":"runc","resources":{"cpu_millis":1000,"memory_mib":512},"service":[{"protocol":"http","port":8080}]})).unwrap()
@@ -591,4 +605,149 @@ async fn listing_missing_template_or_alias_preserves_not_found() {
             Err(Error::NotFound)
         ));
     }
+}
+
+/// A dormant previous Environment is checkpointed immediately when the candidate is
+/// ready, so the switched Environment is Paused (storage only, zero runtime) rather
+/// than idling until the template pause timeout fires.
+#[tokio::test]
+async fn dormant_previous_environment_checkpoints_candidate_before_switch() {
+    use adx_agent_core::alias::{AliasConfig, VersionWeight};
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let platform = Arc::new(Platform::default());
+    let a = Activator::new(state.clone(), platform.clone());
+    let one = template();
+    let mut two = one.clone();
+    two.version = "2".into();
+    two.image = "app:2".into();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&one))
+        .await
+        .unwrap();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&two))
+        .await
+        .unwrap();
+    let mut config = AliasConfig {
+        tenant: "tenant".into(),
+        template: "app".into(),
+        alias: "production".into(),
+        seed: "stable".into(),
+        versions: vec![VersionWeight {
+            version: "1".into(),
+            weight: 1,
+        }],
+    };
+    let revision = state.put_alias(&config, None).await.unwrap();
+    let mut scope = scope("dormant-upgrade");
+    scope.template_ref = TemplateRef::Alias("production".into());
+    let deadline = adx_agent_core::unix_time_millis() + 10_000;
+    let original = a.activate(&scope, None, deadline).await.unwrap().binding;
+    // The previous Environment is dormant: paused before the switch is attempted.
+    platform
+        .observations
+        .lock()
+        .unwrap()
+        .get_mut(&("tenant".into(), original.current.environment_id.clone()))
+        .unwrap()
+        .phase = EnvironmentPhase::Paused;
+    config.versions = vec![VersionWeight {
+        version: "2".into(),
+        weight: 1,
+    }];
+    state.put_alias(&config, Some(&revision)).await.unwrap();
+    assert!(!a.reconcile_binding(&scope, deadline).await.unwrap());
+    let switched = state.binding(&scope).await.unwrap().unwrap();
+    assert_eq!(switched.generation, original.generation);
+    assert_eq!(switched.current.version, "2");
+    // The candidate was checkpointed to Paused, not left Running.
+    let observations = platform.observations.lock().unwrap();
+    assert_eq!(
+        observations[&("tenant".into(), switched.current.environment_id.clone())].phase,
+        EnvironmentPhase::Paused,
+        "dormant upgrade must checkpoint the candidate instead of leaving it idle"
+    );
+    assert!(!observations[&("tenant".into(), switched.current.environment_id.clone())].ready);
+}
+
+/// An active previous Environment keeps the candidate Running so live traffic skips a
+/// wake restore when the switch commits. This models the race where a user returns during
+/// the candidate's boot: E1 was Paused when creation was admitted, but is Running again by
+/// the time the candidate is ready.
+#[tokio::test]
+async fn active_previous_environment_keeps_candidate_running_before_switch() {
+    use adx_agent_core::alias::{AliasConfig, VersionWeight};
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    let platform = Arc::new(Platform::default());
+    let a = Activator::new(state.clone(), platform.clone());
+    let one = template();
+    let mut two = one.clone();
+    two.version = "2".into();
+    two.image = "app:2".into();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&one))
+        .await
+        .unwrap();
+    a.publish("tenant", &adx_agent_core::TemplateDraft::from(&two))
+        .await
+        .unwrap();
+    let mut config = AliasConfig {
+        tenant: "tenant".into(),
+        template: "app".into(),
+        alias: "production".into(),
+        seed: "stable".into(),
+        versions: vec![VersionWeight {
+            version: "1".into(),
+            weight: 1,
+        }],
+    };
+    let revision = state.put_alias(&config, None).await.unwrap();
+    let mut scope = scope("active-upgrade");
+    scope.template_ref = TemplateRef::Alias("production".into());
+    let deadline = adx_agent_core::unix_time_millis() + 10_000;
+    let original = a.activate(&scope, None, deadline).await.unwrap().binding;
+    // Admit candidate creation by pausing E1, then prepare the candidate.
+    platform
+        .observations
+        .lock()
+        .unwrap()
+        .get_mut(&("tenant".into(), original.current.environment_id.clone()))
+        .unwrap()
+        .phase = EnvironmentPhase::Paused;
+    config.versions = vec![VersionWeight {
+        version: "2".into(),
+        weight: 1,
+    }];
+    state.put_alias(&config, Some(&revision)).await.unwrap();
+    let prepared = state.prepare_binding(&scope).await.unwrap();
+    let candidate = prepared.secondary.as_ref().unwrap().environment.clone();
+    // The candidate already exists and is Running (get-first returns it without re-gating
+    // on E1). A user returned during boot: E1 is awake again at the decision point.
+    platform.observations.lock().unwrap().insert(
+        ("tenant".into(), candidate.environment_id.clone()),
+        EnvironmentObservation {
+            id: candidate.environment_id.clone(),
+            tenant: "tenant".into(),
+            phase: EnvironmentPhase::Running,
+            ready: true,
+            runtime_id: Some("runtime".into()),
+            message: None,
+        },
+    );
+    platform
+        .observations
+        .lock()
+        .unwrap()
+        .get_mut(&("tenant".into(), original.current.environment_id.clone()))
+        .unwrap()
+        .phase = EnvironmentPhase::Running;
+    assert!(!a.reconcile_binding(&scope, deadline).await.unwrap());
+    let switched = state.binding(&scope).await.unwrap().unwrap();
+    assert_eq!(switched.generation, original.generation);
+    assert_eq!(switched.current.version, "2");
+    assert_eq!(switched.current, candidate);
+    let observations = platform.observations.lock().unwrap();
+    assert_eq!(
+        observations[&("tenant".into(), switched.current.environment_id.clone())].phase,
+        EnvironmentPhase::Running,
+        "active upgrade must keep the candidate Running to avoid a wake restore"
+    );
+    assert!(observations[&("tenant".into(), switched.current.environment_id.clone())].ready);
 }
