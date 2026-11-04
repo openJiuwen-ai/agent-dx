@@ -22,11 +22,12 @@ fn settings() -> DigitalMateGatewayConfig {
     serde_json::from_value(json!({"tenant":"tenant","jiuwen":{"agent_type":"assistant","template":"demo","version":"1"}})).unwrap()
 }
 #[test]
-fn orbit_ws_configuration_is_optional_and_independent() {
+fn application_ws_configurations_are_optional_and_independent() {
     let config: DigitalMateGatewayConfig = serde_json::from_value(json!({
         "tenant":"tenant",
         "jiuwen":{"agent_type":"assistant", "template":"demo", "version":"1"},
-        "orbit":{"template":"orbit", "template_ref":"1", "backend_path":"/ws", "service_port":18092}
+        "orbit":{"template":"orbit", "template_ref":"1", "backend_path":"/ws", "service_port":18092},
+        "digitalmate":{"template":"digitalmate", "template_ref":"production", "backend_path":"/digitalmate/ws", "service_port":18092}
     }))
     .unwrap();
     config.validate().unwrap();
@@ -35,6 +36,7 @@ fn orbit_ws_configuration_is_optional_and_independent() {
         config.scope("alice").unwrap().template_ref,
         adx_agent_core::TemplateRef::Version("1".into())
     );
+    assert_eq!(config.orbit.as_ref().unwrap().template, "orbit");
 }
 
 #[test]
@@ -57,6 +59,7 @@ fn upgrade_request() -> Request<Full<Bytes>> {
     Request::get("/ws")
         .header("host", "localhost")
         .header("authorization", "Bearer alice-session")
+        .header("x-adx-binding-id", "untrusted")
         .header("connection", "Upgrade")
         .header("upgrade", "websocket")
         .header("sec-websocket-version", "13")
@@ -524,6 +527,7 @@ async fn jiuwen_public_routes_share_one_e2a_and_download_on_another_replica() {
                 Request::get(format!("/file-api/download?{query}"))
                     .header("host", "localhost")
                     .header("authorization", "Bearer alice-session")
+                    .header("x-adx-binding-id", "untrusted")
                     .body(Full::new(Bytes::new()))
                     .unwrap(),
             )
@@ -536,6 +540,7 @@ async fn jiuwen_public_routes_share_one_e2a_and_download_on_another_replica() {
             Request::get(format!("/file-api/download?token={token}&user_id=alice"))
                 .header("host", "localhost")
                 .header("authorization", "Bearer alice-session")
+                .header("x-adx-binding-id", "untrusted")
                 .body(Full::new(Bytes::new()))
                 .unwrap(),
         )
@@ -561,6 +566,7 @@ async fn jiuwen_public_routes_share_one_e2a_and_download_on_another_replica() {
                 Request::post(uri)
                     .header("host", "localhost")
                     .header("authorization", "Bearer alice-session")
+                    .header("x-adx-binding-id", "untrusted")
                     .header(
                         "content-type",
                         format!("multipart/form-data; boundary={boundary}"),

@@ -323,7 +323,7 @@ async fn terminal_readiness_failure_is_not_retried_as_transport_error() {
 }
 
 #[tokio::test]
-async fn explicit_probe_can_use_http_but_stream_readiness_never_polls() {
+async fn explicit_probe_and_timeout_diagnosis_use_http_without_readiness_polling() {
     let (port, _server, requests) = serve(r#"{"identity":{"environment_id":"i","runtime_id":"i-1","ownership_generation":1},"revision":2,"phase":"failed","failure":{"kind":"healthcheck_failed","message":"HTTP 503","consecutive_failures":3,"http_status":503},"checkpoint":null,"active_requests":0,"active_commands":0}"#, None).await;
     let hub =
         adxlet::control_stream::RuntimeControlHub::new(vec![7; 32], Duration::from_millis(100))
@@ -346,14 +346,30 @@ async fn explicit_probe_can_use_http_but_stream_readiness_never_polls() {
     assert_eq!(failure.http_status, Some(503));
     assert_eq!(failure.consecutive_failures, 3);
     assert_eq!(requests.load(Ordering::SeqCst), 1);
-    assert!(matches!(
-        checker.wait_ready(&record).await,
-        Err(adx_core::Error::DeadlineExceeded(_))
-    ));
+    let ready = checker.wait_ready(&record);
+    tokio::pin!(ready);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), ready.as_mut())
+            .await
+            .is_err()
+    );
     assert_eq!(
         requests.load(Ordering::SeqCst),
         1,
         "stream readiness must not poll HTTP"
+    );
+    let failure = match ready.await {
+        Err(adx_core::Error::ProbeFailed(failure)) => failure,
+        result => {
+            panic!("expected terminal probe failure after readiness deadline, got {result:?}")
+        }
+    };
+    assert_eq!(failure.http_status, Some(503));
+    assert_eq!(failure.consecutive_failures, 3);
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        2,
+        "readiness timeout must make exactly one final diagnostic HTTP request"
     );
 }
 

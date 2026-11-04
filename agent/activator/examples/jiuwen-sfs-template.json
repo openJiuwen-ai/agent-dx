@@ -25,7 +25,7 @@
     "tcp_socket": {
       "port": 18092
     },
-    "initial_delay_seconds": 3,
+    "initial_delay_seconds": 0,
     "period_seconds": 3,
     "timeout_seconds": 2
   },

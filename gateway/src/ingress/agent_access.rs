@@ -1,6 +1,9 @@
 //! Agent HTTP/WS target selection and backend path adaptation.
 use adx_agent_api::Error;
-use adx_agent_core::{target::Target, Protocol, Scope};
+use adx_agent_core::{
+    target::{decode_binding_id, encode_binding_id, Target, BINDING_ID_HEADER},
+    Protocol, Scope,
+};
 use http::{HeaderMap, Request};
 
 #[derive(Debug, Clone)]
@@ -9,6 +12,7 @@ pub(super) struct InstanceAccess(pub super::path::ParsedDirectPath);
 #[derive(Debug)]
 pub(super) struct AccessRequest {
     pub target: Target,
+    pub binding_id: Option<String>,
     pub protocol: Protocol,
     pub port: Option<u16>,
     pub backend_uri: http::Uri,
@@ -16,23 +20,21 @@ pub(super) struct AccessRequest {
 #[derive(Debug, Clone)]
 pub(super) struct BindingNotice {
     id: http::HeaderValue,
-    urn: http::HeaderValue,
 }
 impl BindingNotice {
     pub fn new(scope: &Scope) -> Result<Self, Error> {
-        let urn = Target::from(scope).to_string();
         Ok(Self {
-            id: scope.binding_id.parse().map_err(|_| {
-                Error::Invalid("AgentBinding ID is not a valid response header".into())
-            })?,
-            urn: urn
+            id: encode_binding_id(&scope.binding_id)
+                .map_err(Error::Invalid)?
                 .parse()
-                .map_err(|_| Error::Invalid("invalid AgentBinding URN".into()))?,
+                .map_err(|_| {
+                    Error::Invalid("AgentBinding ID is not a valid response header".into())
+                })?,
         })
     }
     pub fn apply(&self, headers: &mut HeaderMap) {
-        headers.insert("x-adx-binding-id", self.id.clone());
-        headers.insert("x-adx-binding-urn", self.urn.clone());
+        headers.insert(BINDING_ID_HEADER, self.id.clone());
+        headers.remove("x-adx-binding-urn");
     }
 }
 impl AccessRequest {
@@ -67,7 +69,7 @@ impl AccessRequest {
             match name.as_ref() {
                 "instance" => {
                     return Err(Error::Invalid(
-                        "managed access requires a template or binding target".into(),
+                        "managed access requires a template target".into(),
                     ))
                 }
                 "target" => target = Some(value.parse::<Target>().map_err(Error::Invalid)?),
@@ -85,6 +87,24 @@ impl AccessRequest {
             }
         }
         let target = target.ok_or_else(|| Error::Invalid("managed target required".into()))?;
+        let mut values = request.headers().get_all(BINDING_ID_HEADER).iter();
+        let binding_id = values
+            .next()
+            .map(|value| {
+                let value = value
+                    .to_str()
+                    .map_err(|_| Error::Invalid("invalid Binding ID header".into()))?;
+                decode_binding_id(value).map_err(Error::Invalid)
+            })
+            .transpose()?;
+        if values.next().is_some() {
+            return Err(Error::Invalid("duplicate Binding ID header".into()));
+        }
+        if matches!(target, Target::Instance(_)) && binding_id.is_some() {
+            return Err(Error::Invalid(
+                "Binding ID requires a template target".into(),
+            ));
+        }
         if matches!(target, Target::Instance(_)) && port.is_none() {
             return Err(Error::Invalid(
                 "instance access requires an explicit port".into(),
@@ -117,6 +137,7 @@ impl AccessRequest {
         .map_err(|_| Error::Invalid("invalid backend URI".into()))?;
         Ok(Some(Self {
             target,
+            binding_id,
             protocol,
             port,
             backend_uri,
@@ -129,19 +150,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn http_and_ws_entries_enforce_the_selected_protocol_for_all_targets() {
-        for selector in [
-            "target=urn:adx:template:demo:1",
-            "target=urn:adx:binding:demo:1:env",
+    fn binding_header_rejects_ambiguous_or_invalid_identity() {
+        for values in [
+            vec!["one", "two"],
+            vec![""],
+            vec!["%GG"],
+            vec!["%0A"],
+            vec!["%FF"],
+            vec!["one,two"],
+            vec!["%20"],
         ] {
+            let mut builder =
+                Request::builder().uri("/agent/http/chat?target=urn:adx:template:demo:1");
+            for value in &values {
+                builder = builder.header("x-adx-binding-id", *value);
+            }
+            assert!(
+                matches!(
+                    AccessRequest::parse(&builder.body(()).unwrap()),
+                    Err(Error::Invalid(_))
+                ),
+                "{values:?}"
+            );
+        }
+        let request = Request::builder()
+            .uri("/agent/ws?target=urn:adx:instance:env&port=8080")
+            .header("upgrade", "websocket")
+            .header("x-adx-binding-id", "another")
+            .body(())
+            .unwrap();
+        assert!(matches!(
+            AccessRequest::parse(&request),
+            Err(Error::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn http_and_ws_entries_enforce_the_selected_protocol_for_all_targets() {
+        for binding_id in [None, Some("env")] {
+            let selector = "target=urn:adx:template:demo:1";
+            let request = || {
+                let mut builder = Request::builder();
+                if let Some(id) = binding_id {
+                    builder = builder.header(BINDING_ID_HEADER, id);
+                }
+                builder
+            };
             for (method, path, upgrade) in [
                 ("GET", "/agent/http", true),
                 ("GET", "/agent/ws", false),
                 ("POST", "/agent/ws", true),
             ] {
-                let mut builder = Request::builder()
-                    .method(method)
-                    .uri(format!("{path}?{selector}"));
+                let mut builder = request().method(method).uri(format!("{path}?{selector}"));
                 if upgrade {
                     builder = builder.header("upgrade", "websocket");
                 }
@@ -153,7 +213,7 @@ mod tests {
                     "{method} {path}?{selector}"
                 );
             }
-            let http = Request::builder()
+            let http = request()
                 .uri(format!("/agent/http/chat?{selector}&q=1"))
                 .body(())
                 .unwrap();
@@ -161,12 +221,13 @@ mod tests {
                 AccessRequest::parse(&http).unwrap().unwrap().backend_uri,
                 "/chat?q=1"
             );
-            let ws = Request::builder()
+            let ws = request()
                 .uri(format!("/agent/ws?{selector}&q=1"))
                 .header("upgrade", "WebSocket")
                 .body(())
                 .unwrap();
             let access = AccessRequest::parse(&ws).unwrap().unwrap();
+            assert_eq!(access.binding_id.as_deref(), binding_id);
             let expected = "/?q=1";
             assert_eq!(access.backend_uri.to_string(), expected);
         }

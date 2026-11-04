@@ -20,6 +20,10 @@ Agent FS（AFS） 是 Agent DX 的可选文件系统组件。默认部署配置�
 
 发布包配置示例来自 [build/config/examples/afs/](../../build/config/examples/afs/)，源码级示例保留在 [afs/examples/](../../afs/examples/)。部署层只负责把 AFS TOML 交给 `afs-meta` 和 `afs-node`，以及进程启动、健康查询、正常停止和卸载；它不改写 AFS 自有配置 schema。
 
+### Trace 配置
+
+AFS 使用自有 TOML 的 `trace_enabled`、`trace_endpoint`、`trace_sample_ratio`，默认关闭；开启后经 OTLP/gRPC 导出（代码默认 4317）。AFS 不读取 ADX 的 `ADX_TRACE_*` / `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`，也不受部署级 `tracing` 策略控制。ADX Collector 默认只接收 OTLP/HTTP 4318，启用 AFS trace 时需为 Collector 增加 gRPC 接收端或调整 AFS endpoint。
+
 Meta 后端优先级：
 
 1. `memory`：一次性演示，重启不保留状态；

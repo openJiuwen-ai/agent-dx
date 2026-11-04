@@ -174,6 +174,11 @@ Checkpoint storage supports local only, S3 with a node cache, and direct AFS fil
 - Prometheus metrics, OpenTelemetry traces, structured component logs, and external Collector integration. Node runtime stdout/stderr is redirected to per-runtime files with terminated-log compression and GC.
 - Process deployment with managed or external Redis and Kubernetes end-to-end deployment profiles.
 
+Experimental [E2B compatibility](docs/deployment/e2b-compatibility.md) shares the
+same control plane and routing. TLS remains the default; operators can explicitly
+enable E2B-only HTTP with `ADX_DATA_PLANE_INGRESS_E2B_ALLOW_HTTP=true` while
+retaining API/envd authentication and the native transport policy.
+
 ## 🛠️ Development and test
 
 The agreed five-step principles, current coverage, pending work, priorities and

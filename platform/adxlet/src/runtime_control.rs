@@ -428,6 +428,9 @@ impl RuntimeControlClient {
                     if let Some(token) = &self.token {
                         builder = builder.header("X-Auth", token);
                     }
+                    for (name, value) in adx_observability::trace::propagation_headers() {
+                        builder = builder.header(name, value);
+                    }
                     let request = builder
                         .header("Content-Type", "application/json")
                         .body(Full::new(Bytes::copy_from_slice(&body)))
