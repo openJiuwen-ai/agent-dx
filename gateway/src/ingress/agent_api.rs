@@ -144,6 +144,15 @@ impl AgentApi {
     pub fn matches(path: &str) -> bool {
         path == "/api/agent/v2" || path.starts_with("/api/agent/v2/")
     }
+    /// Initialization readiness for the /api/agent/v2 entry path: the
+    /// independent Activator client completed its first membership
+    /// discovery read; the embedded Activator connected at construction.
+    /// Runtime dependency failures after initialization never flip this
+    /// back — callers retry instead of the replica being pulled from
+    /// load balancing.
+    pub fn ready(&self) -> bool {
+        self.managed.ready()
+    }
     pub async fn management(
         &self,
         request: Request<hyper::body::Incoming>,
