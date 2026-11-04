@@ -38,8 +38,8 @@ class RuntimeAffinityScenarioTests(unittest.TestCase):
             def close():
                 state["closed"] = True
 
-        def catalog():
-            result = {
+        def live_catalog():
+            return {
                 f"node:{node_id}": json.dumps(
                     {
                         "node": {
@@ -52,19 +52,23 @@ class RuntimeAffinityScenarioTests(unittest.TestCase):
                 )
                 for node_id in ("node1", "node2")
             }
-            if not state["deleted"]:
-                result["environment:default-runtime-affinity"] = json.dumps(
+
+        def catalog():
+            if state["deleted"]:
+                return {}
+            return {
+                "environment:default-runtime-affinity": json.dumps(
                     {
                         "spec": {"runtime_class": "runsc"},
                         "assignment": {"node_id": assigned_node},
                         "result": {"state": "Running", "resources_held": True},
                     }
                 )
-            return result
+            }
 
         modules = {
             "adx_environment": types.SimpleNamespace(Environment=Environment),
-            "node": types.SimpleNamespace(catalog=catalog),
+            "node": types.SimpleNamespace(catalog=catalog, live_catalog=live_catalog),
             "runtime_inventory": runtime_inventory,
         }
         spec = importlib.util.spec_from_file_location("runtime_affinity_case", ROOT / "runtime_affinity.py")
