@@ -1,6 +1,9 @@
 //! Deferred replies retain their dispatch turn and inode lease through the
 //! actual kernel reply. The reply executor never waits for network or disk.
+use super::dispatch::FuseCompletion;
+use super::page_cache::InodeCacheGate;
 use super::*;
+use afs_error::Result;
 
 struct ReadReply {
     reply: ReplyData,
