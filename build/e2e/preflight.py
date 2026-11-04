@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only host prerequisites for the sandboxd runc acceptance fixture."""
+"""Check host prerequisites for sandboxd runc and the ADX runtime image."""
 
 import argparse
 import json
@@ -69,5 +69,6 @@ def check(proc=Path('/proc'), erofs_image=RUNTIME_IMAGE, mount_probe=verify_erof
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--runtime-source', choices=('erofs', 'image'), default='erofs')
+    parser.add_argument('--erofs-image', type=Path, default=RUNTIME_IMAGE)
     args = parser.parse_args()
-    print(json.dumps(check(runtime_source=args.runtime_source)), flush=True)
+    print(json.dumps(check(erofs_image=args.erofs_image, runtime_source=args.runtime_source)), flush=True)

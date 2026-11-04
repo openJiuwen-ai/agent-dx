@@ -34,23 +34,46 @@ sudo adxctl config init
 部署时执行上面的 `install.sh`，它会一并验证和安装 `runtime/sandboxd/` 下的后端文件。
 
 在采用 runc 的节点上，使用随包的 systemd unit 和配置示例。以下命令适用于默认安装路径
-`/opt/adx` 的新节点。主机需要 systemd、iptables、iproute2、可写的 cgroup 和可用的
-overlayfs。x86_64 后端需要 glibc 2.34 或更高版本。若部署使用 Nydus 或 OSS 镜像，
-还需按 sandboxd 配置准备 distill_fs 及对应模板。
+`/opt/adx` 的新节点。主机需要 systemd、Python 3、iptables、iproute2、可写的 cgroup 和可用的
+overlayfs，以及与后端二进制匹配的 libseccomp 和 AppArmor 运行库。x86_64 后端需要
+glibc 2.34 或更高版本。即使只用 OCI 镜像，sandboxd 启动时也会加载随包的模板和空认证文件。
+使用 Nydus 或 OSS 镜像时还需准备 distill_fs 并配置镜像源。
+
+Buildkite 在启动 sandboxd 前检查 `net.bridge.bridge-nf-call-iptables=1`。需要准备的新节点上，
+先加载模块并持久化该设置：
 
 ```sh
-sudo install -d -m 0755 /etc/adx
-sudo install -m 0600 /opt/adx/current/etc/examples/sandboxd/sandboxd.toml /etc/adx/sandboxd.toml
-sudoedit /etc/adx/sandboxd.toml
+if [ ! -e /proc/sys/net/bridge/bridge-nf-call-iptables ]; then
+    sudo modprobe br_netfilter
+fi
+printf '%s\n' br_netfilter | sudo tee /etc/modules-load.d/adx-br-netfilter.conf
+printf '%s\n' 'net.bridge.bridge-nf-call-iptables = 1' | sudo tee /etc/sysctl.d/99-adx-bridge-netfilter.conf
+sudo sysctl -p /etc/sysctl.d/99-adx-bridge-netfilter.conf
+test "$(sysctl -n net.bridge.bridge-nf-call-iptables)" = 1
+```
+
+使用包内 EROFS 根文件系统时，在主机启用 EROFS 和 loop 设备支持后，执行挂载探测：
+
+```sh
+sudo python3 /opt/adx/current/lib/sandboxd_preflight.py --erofs-image /opt/adx/current/runtime/adx-runtime-rootfs.img
+```
+
+`sandboxd.service` 在启动前使用同一个脚本检查桥接网络。安装配置、启动服务并验证 socket：
+
+```sh
+sudo install -d -m 0700 /etc/adx/sandboxd
+sudo install -m 0600 /opt/adx/current/etc/examples/sandboxd/sandboxd.toml /opt/adx/current/etc/examples/sandboxd/*.json /etc/adx/sandboxd/
+sudoedit /etc/adx/sandboxd/sandboxd.toml
 sudo install -m 0644 /opt/adx/current/etc/examples/sandboxd/sandboxd.service /etc/systemd/system/sandboxd.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now sandboxd.service
-sudo /opt/adx/current/runtime/sandboxd/sbox -a /run/sandboxd/sandboxd.sock check
+sudo /opt/adx/current/runtime/sandboxd/sbox -a /run/sandboxd/sandboxd.sock list
 ```
 
-在启动前确认配置中的 IP 地址池与主机路由及其他运行时不冲突，并将 ADX Relay 的目标
-CIDR 与之对齐。私有 OCI 镜像的认证文件由部署方提供，配置中的默认位置是
-`/etc/adx/sandboxd-registry-auths.json`。unit 以 root 运行，默认 socket 仅供本机 root
+在启动前为各节点分配不重叠的 IP 地址池，避开主机路由及其他运行时使用的网段。
+sandboxd 要求地址池至少包含 1000 个地址，可使用示例的 `/22` 或更大的网段。
+ADX Relay 的目标 CIDR 需要覆盖实际使用的地址池。私有 OCI 镜像的认证文件由部署方提供，配置中的默认位置是
+`/etc/adx/sandboxd/registry_auths.json`。unit 以 root 运行，默认 socket 仅供本机 root
 访问。已运行 sandboxd 的节点应沿用其原有配置和 socket，升级前先按现有流程排空节点。
 自定义 ADX 安装路径时需相应调整 unit 和配置中的二进制路径。sandboxd 就绪后按下文启动
 ADX，使用 `runtime="runc"` 创建实例。

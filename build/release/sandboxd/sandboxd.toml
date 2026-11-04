@@ -2,7 +2,7 @@ rootDir = "/var/lib/adx-sandboxd/root"
 storeDir = "/var/lib/adx-sandboxd/store"
 
 [plugin.network]
-ip_range = "10.88.0.1/24"
+ip_range = "10.88.0.1/22"
 nat_backend = "iptables"
 enable_local_dnat = true
 enable_network_acl = false
@@ -32,4 +32,7 @@ runc = "/opt/adx/current/runtime/sandboxd/runc"
 
 [plugin.image]
 root = "/var/lib/adx-sandboxd/image-manager"
-registry_auths_path = "/etc/adx/sandboxd-registry-auths.json"
+oss_template = "/etc/adx/sandboxd/oss.json"
+nydus_template = "/etc/adx/sandboxd/registry.json"
+oss_auths_path = "/etc/adx/sandboxd/oss_auths.json"
+registry_auths_path = "/etc/adx/sandboxd/registry_auths.json"

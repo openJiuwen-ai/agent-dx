@@ -6,7 +6,8 @@ After=network-online.target
 [Service]
 Type=simple
 Environment=PATH=/opt/adx/current/runtime/sandboxd:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/opt/adx/current/runtime/sandboxd/sandboxd --root /var/lib/adx-sandboxd --config /etc/adx/sandboxd.toml --socket /run/sandboxd/sandboxd.sock --http-address 127.0.0.1:23099 --log-file /var/lib/adx-sandboxd/sandboxd.log
+ExecStartPre=/usr/bin/env python3 /opt/adx/current/lib/sandboxd_preflight.py --runtime-source image
+ExecStart=/opt/adx/current/runtime/sandboxd/sandboxd --root /var/lib/adx-sandboxd --config /etc/adx/sandboxd/sandboxd.toml --socket /run/sandboxd/sandboxd.sock --http-address 127.0.0.1:23099 --log-file /var/lib/adx-sandboxd/sandboxd.log
 Restart=on-failure
 RestartSec=2
 Delegate=yes

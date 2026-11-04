@@ -103,8 +103,12 @@ class PackageTests(unittest.TestCase):
             output = root / "release"
             pkg.assemble(binaries, redis, redis_cli, wheel, output, "a" * 40, False, target, "release",
                          backend_dir=backend)
-            self.assertTrue(pkg.verify(output)["with_sandboxd"])
-            self.assertTrue((output / "etc/examples/sandboxd/sandboxd.service").is_file())
+            manifest = pkg.verify(output)
+            self.assertTrue(manifest["with_sandboxd"])
+            self.assertIn("lib/sandboxd_preflight.py", manifest["files"])
+            for name in ("sandboxd.service", "sandboxd.toml", "oss.json", "registry.json",
+                         "oss_auths.json", "registry_auths.json"):
+                self.assertIn(f"etc/examples/sandboxd/{name}", manifest["files"])
 
             metadata["target"] = "aarch64-unknown-linux-gnu"
             (backend / "manifest.json").write_text(json.dumps(metadata))

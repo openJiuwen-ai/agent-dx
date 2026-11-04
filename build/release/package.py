@@ -13,7 +13,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from package_manifest import AFS_BINARIES, BINARIES, SANDBOXD_BINARIES  # noqa: E402
+from package_manifest import (  # noqa: E402
+    AFS_BINARIES,
+    BINARIES,
+    SANDBOXD_BINARIES,
+    SANDBOXD_DEPLOYMENT_FILES,
+)
 from package_manifest import verify as verify_manifest
 
 
@@ -68,9 +73,10 @@ def assemble(
         raise ValueError("an adx_environment wheel is required")
     inputs[f"sdk/{wheel.name}"] = wheel
     if backend_dir is not None:
+        inputs["lib/sandboxd_preflight.py"] = ROOT / "build/e2e/preflight.py"
         for name in (*SANDBOXD_BINARIES, "manifest.json"):
             inputs[f"runtime/sandboxd/{name}"] = backend_dir / name
-        for name in ("sandboxd.service", "sandboxd.toml"):
+        for name in SANDBOXD_DEPLOYMENT_FILES:
             inputs[f"etc/examples/sandboxd/{name}"] = ROOT / "build/release/sandboxd" / name
     for source in inputs.values():
         if source.is_symlink() or not source.is_file():

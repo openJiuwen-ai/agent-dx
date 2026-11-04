@@ -18,6 +18,14 @@ BINARIES = (
     "adx-relay",
 )
 SANDBOXD_BINARIES = ("sandboxd", "sbox", "runc", "runc-shim", "sandbox-logger", "redis-cli")
+SANDBOXD_DEPLOYMENT_FILES = (
+    "sandboxd.service",
+    "sandboxd.toml",
+    "oss.json",
+    "registry.json",
+    "oss_auths.json",
+    "registry_auths.json",
+)
 AFS_BINARIES = ("afs-meta", "afs-node")
 AFS_REQUIRED_FILES = {
     "etc/examples/afs/meta.toml",
@@ -68,8 +76,9 @@ def verify(directory: Path, *, enforce_host_architecture: bool = False) -> dict:
     backend_prefix = "runtime/sandboxd/"
     backend_files = {backend_prefix + name for name in (*SANDBOXD_BINARIES, "manifest.json")}
     backend_files.update(
-        f"etc/examples/sandboxd/{name}" for name in ("sandboxd.service", "sandboxd.toml")
+        f"etc/examples/sandboxd/{name}" for name in SANDBOXD_DEPLOYMENT_FILES
     )
+    backend_files.add("lib/sandboxd_preflight.py")
     if with_sandboxd:
         required.update(backend_files)
         required.add("third_party/sandboxd/source.json")
