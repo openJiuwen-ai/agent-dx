@@ -27,7 +27,8 @@ def sha(path):
 
 
 def assemble(
-    binary_dir, redis, redis_cli, wheel, output, commit, dirty, target, profile, with_afs=False, backend_dir=None
+    binary_dir, redis, redis_cli, wheel, output, commit, dirty, target, profile,
+    with_afs=False, backend_dir=None, runsc=None
 ):
     if output.exists():
         raise ValueError("output already exists")
@@ -72,7 +73,10 @@ def assemble(
     if not wheel.name.startswith("adx_environment-") or wheel.suffix != ".whl":
         raise ValueError("an adx_environment wheel is required")
     inputs[f"sdk/{wheel.name}"] = wheel
+    if (backend_dir is None) != (runsc is None):
+        raise ValueError("sandboxd and runsc must be packaged together")
     if backend_dir is not None:
+        inputs["runtime/sandboxd/runsc"] = runsc
         inputs["lib/sandboxd_preflight.py"] = ROOT / "build/e2e/preflight.py"
         for name in (*SANDBOXD_BINARIES, "manifest.json"):
             inputs[f"runtime/sandboxd/{name}"] = backend_dir / name
@@ -162,6 +166,7 @@ def main():
     p.add_argument("--profile", choices=("debug", "release"), required=True)
     p.add_argument("--with-afs", action="store_true", help="include OwnerFs and DistributedFs binaries")
     p.add_argument("--backend-dir", type=Path)
+    p.add_argument("--runsc", type=Path)
     v = sub.add_parser("verify")
     v.add_argument("directory", type=Path)
     args = parser.parse_args()
@@ -191,6 +196,7 @@ def main():
             args.profile,
             args.with_afs,
             args.backend_dir,
+            args.runsc,
         )
     print("package verified")
 

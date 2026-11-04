@@ -33,7 +33,7 @@ sudo adxctl config init
 `build/e2e/download_backend.py` 校验并下载同一锁定版本的 OBS 后端包。
 部署时执行上面的 `install.sh`，它会一并验证和安装 `runtime/sandboxd/` 下的后端文件。
 
-在采用 runc 的节点上，使用随包的 systemd unit 和配置示例。以下命令适用于默认安装路径
+在采用 runc 或 gVisor 的节点上，使用随包的 systemd unit 和配置示例。以下命令适用于默认安装路径
 `/opt/adx` 的新节点。主机需要 systemd、Python 3、iptables、iproute2、可写的 cgroup 和可用的
 overlayfs，以及与后端二进制匹配的 libseccomp 和 AppArmor 运行库。x86_64 后端需要
 glibc 2.34 或更高版本。即使只用 OCI 镜像，sandboxd 启动时也会加载随包的模板和空认证文件。
@@ -76,7 +76,7 @@ ADX Relay 的目标 CIDR 需要覆盖实际使用的地址池。私有 OCI 镜�
 `/etc/adx/sandboxd/registry_auths.json`。unit 以 root 运行，默认 socket 仅供本机 root
 访问。已运行 sandboxd 的节点应沿用其原有配置和 socket，升级前先按现有流程排空节点。
 自定义 ADX 安装路径时需相应调整 unit 和配置中的二进制路径。sandboxd 就绪后按下文启动
-ADX，使用 `runtime="runc"` 创建实例。
+ADX，使用 `runtime="runc"` 或 `runtime="runsc"` 创建实例。随包 runsc 为 gVisor release 20260817.0。
 
 ## 证书与初始密钥
 

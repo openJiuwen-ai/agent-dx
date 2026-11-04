@@ -92,6 +92,8 @@ class PackageTests(unittest.TestCase):
             backend.mkdir()
             for name in pkg.SANDBOXD_BINARIES:
                 (backend / name).write_bytes(b"\x7fELF\x02\x01" + bytes(12) + (62).to_bytes(2, "little"))
+            runsc = root / "runsc"
+            runsc.write_bytes(b"\x7fELF\x02\x01" + bytes(12) + (62).to_bytes(2, "little"))
             target = "x86_64-unknown-linux-gnu"
             pin = json.loads((pkg.ROOT / "third_party/sandboxd/source.json").read_text())
             metadata = {
@@ -102,7 +104,7 @@ class PackageTests(unittest.TestCase):
             (backend / "manifest.json").write_text(json.dumps(metadata))
             output = root / "release"
             pkg.assemble(binaries, redis, redis_cli, wheel, output, "a" * 40, False, target, "release",
-                         backend_dir=backend)
+                         backend_dir=backend, runsc=runsc)
             manifest = pkg.verify(output)
             self.assertTrue(manifest["with_sandboxd"])
             self.assertIn("lib/sandboxd_preflight.py", manifest["files"])
@@ -110,12 +112,21 @@ class PackageTests(unittest.TestCase):
                          "oss_auths.json", "registry_auths.json"):
                 self.assertIn(f"etc/examples/sandboxd/{name}", manifest["files"])
 
+            packaged_runsc = output / "runtime/sandboxd/runsc"
+            original_runsc = packaged_runsc.read_bytes()
+            packaged_runsc.write_bytes(original_runsc[:18] + (183).to_bytes(2, "little"))
+            manifest_path = output / "manifest.json"
+            manifest["files"]["runtime/sandboxd/runsc"] = pkg.sha(packaged_runsc)
+            manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "architecture mismatch: runsc"):
+                pkg.verify(output)
+
             metadata["target"] = "aarch64-unknown-linux-gnu"
             (backend / "manifest.json").write_text(json.dumps(metadata))
             wrong_target = root / "wrong-target"
             with self.assertRaisesRegex(ValueError, "sandboxd revision or target mismatch"):
                 pkg.assemble(binaries, redis, redis_cli, wheel, wrong_target, "a" * 40, False, target, "release",
-                             backend_dir=backend)
+                             backend_dir=backend, runsc=runsc)
             self.assertFalse(wrong_target.exists())
 
     def test_legacy_manifest_cannot_silently_disable_afs(self):

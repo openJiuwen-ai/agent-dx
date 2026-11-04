@@ -26,9 +26,11 @@ shim_binary = "/opt/adx/current/runtime/sandboxd/runc-shim"
 
 [plugin.runtime.basic_spec]
 runc = ""
+runsc = ""
 
 [plugin.runtime.runtime_binary]
 runc = "/opt/adx/current/runtime/sandboxd/runc"
+runsc = "/opt/adx/current/runtime/sandboxd/runsc"
 
 [plugin.image]
 root = "/var/lib/adx-sandboxd/image-manager"

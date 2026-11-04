@@ -89,6 +89,7 @@ fi
 if [[ "${ADX_WITH_SANDBOXD:-0}" == "1" ]]; then
   echo "--- :package: Prepare pinned sandboxd backend"
   "$PYTHON" build/e2e/download_backend.py --directory "$stage/sandboxd" --target "$host"
-  package_args+=(--backend-dir "$stage/sandboxd")
+  "$PYTHON" build/release/download_runsc.py --target "$host" --output "$stage/runsc"
+  package_args+=(--backend-dir "$stage/sandboxd" --runsc "$stage/runsc")
 fi
 "$PYTHON" "${package_args[@]}"
