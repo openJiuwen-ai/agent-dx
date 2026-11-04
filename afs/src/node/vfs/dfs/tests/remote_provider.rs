@@ -51,7 +51,7 @@ fn remote_owner_write_after_local_close_rebinds_metadata_dirty_state() {
     )
     .unwrap();
     let handle = open.handle.expect("owner open returns handle");
-    let data_handle = DistributedFs::data_owner_handle(&handle);
+    let data_handle = data_owner_handle(&handle);
     let write = <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerFilesHandler>::write(
         &fs,
         "node-b",
@@ -224,6 +224,7 @@ fn temporary_remote_resize_preserves_existing_remote_provider() {
     let inode_b = fs_b.backend_inode(&inode_id).unwrap();
     let handle = fs_b.open(&context(), inode_b, libc::O_RDWR).unwrap();
     let provider_before = fs_b
+        .write_coordinator
         .current_remote_provider(&inode_id)
         .unwrap()
         .expect("remote open installs provider");
@@ -241,13 +242,11 @@ fn temporary_remote_resize_preserves_existing_remote_provider() {
         .unwrap();
     assert_eq!(attrs.size, 3);
     let provider_after = fs_b
+        .write_coordinator
         .current_remote_provider(&inode_id)
         .unwrap()
         .expect("temporary resize restores existing provider");
-    assert!(DistributedFs::same_remote_provider(
-        &provider_after,
-        &provider_before
-    ));
+    assert!(same_remote_provider(&provider_after, &provider_before));
 
     assert_eq!(fs_b.write(&context(), handle, 0, b"XYZ").unwrap(), 3);
     assert_eq!(fs_b.getattr(&context(), inode_b, None).unwrap().size, 3);
@@ -268,7 +267,12 @@ fn temporary_remote_resize_preserves_existing_remote_provider() {
     assert_eq!(&data, b"XYZ");
 
     fs_b.release(&context(), handle).unwrap();
-    assert!(fs_b.current_remote_provider(&inode_id).unwrap().is_none());
+    assert!(
+        fs_b.write_coordinator
+            .current_remote_provider(&inode_id)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -319,15 +323,21 @@ fn remote_release_failure_after_companion_close_still_removes_provider() {
     let inode_b = fs_b.backend_inode(&inode_id).unwrap();
     let writer = fs_b.open(&context(), inode_b, libc::O_WRONLY).unwrap();
     let provider = fs_b
+        .write_coordinator
         .current_remote_provider(&inode_id)
         .unwrap()
         .expect("remote open installs provider");
     assert!(provider.read_handle.is_some());
-    let owner_writer = DistributedFs::file_handle_from_owner(&provider.handle).unwrap();
+    let owner_writer = file_handle_from_owner(&provider.handle).unwrap();
     fs_a.handles.remove(owner_writer.0).unwrap().unwrap();
 
     fs_b.release(&context(), writer).unwrap();
-    assert!(fs_b.current_remote_provider(&inode_id).unwrap().is_none());
+    assert!(
+        fs_b.write_coordinator
+            .current_remote_provider(&inode_id)
+            .unwrap()
+            .is_none()
+    );
     assert!(fs_a.handles.is_empty());
 }
 
@@ -389,7 +399,10 @@ fn paused_companion_release_retires_provider_before_fresh_read() {
     pause.wait_until_reached();
 
     assert!(
-        fs_b.current_remote_provider(&inode_id).unwrap().is_none(),
+        fs_b.write_coordinator
+            .current_remote_provider(&inode_id)
+            .unwrap()
+            .is_none(),
         "provider must be retired before the owner release RPC can expose a closed handle"
     );
     let reader = fs_b.open(&context(), inode_b, libc::O_RDONLY).unwrap();
@@ -471,7 +484,12 @@ fn retiring_provider_waits_for_inflight_fresh_read_before_owner_release() {
         result
     });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    while fs_b.current_remote_provider(&inode_id).unwrap().is_some() {
+    while fs_b
+        .write_coordinator
+        .current_remote_provider(&inode_id)
+        .unwrap()
+        .is_some()
+    {
         assert!(
             std::time::Instant::now() < deadline,
             "provider was not retired while an admitted read was paused"
@@ -571,6 +589,7 @@ fn temporary_remote_release_failure_still_restores_previous_provider() {
     let inode_b = fs_b.backend_inode(&inode_id).unwrap();
     let writer = fs_b.open(&context(), inode_b, libc::O_RDWR).unwrap();
     let previous = fs_b
+        .write_coordinator
         .current_remote_provider(&inode_id)
         .unwrap()
         .expect("remote open installs provider");
@@ -580,16 +599,17 @@ fn temporary_remote_release_failure_still_restores_previous_provider() {
         .open_remote_write_session(&record, &lease, libc::O_WRONLY, OpenOptions::default())
         .unwrap();
     let temp_remote = temp.remote.as_ref().unwrap().clone();
-    let owner_writer = DistributedFs::file_handle_from_owner(&temp_remote.handle).unwrap();
+    let owner_writer = file_handle_from_owner(&temp_remote.handle).unwrap();
     fs_a.handles.remove(owner_writer.0).unwrap().unwrap();
 
     fs_b.close_temporary_remote_write_session(&inode_id, &temp, Some(previous.clone()))
         .unwrap();
     let current = fs_b
+        .write_coordinator
         .current_remote_provider(&inode_id)
         .unwrap()
         .expect("previous provider is restored after failed temp close");
-    assert!(DistributedFs::same_remote_provider(&current, &previous));
+    assert!(same_remote_provider(&current, &previous));
     fs_b.release(&context(), writer).unwrap();
 }
 
@@ -745,9 +765,11 @@ fn pending_remote_release_retry_pass_attempts_each_existing_handle_once() {
         open_seq: 2,
         opaque_handle: b"release-two".to_vec(),
     };
-    fs.queue_pending_remote_release(owner.clone(), first.clone(), false)
+    fs.write_coordinator
+        .queue_pending_remote_release(owner.clone(), first.clone(), false)
         .unwrap();
-    fs.queue_pending_remote_release(owner, second.clone(), false)
+    fs.write_coordinator
+        .queue_pending_remote_release(owner, second.clone(), false)
         .unwrap();
 
     fs.retry_pending_remote_releases()
@@ -759,17 +781,9 @@ fn pending_remote_release_retry_pass_attempts_each_existing_handle_once() {
         "one maintenance pass must not retry the same queued release more than once"
     );
     assert_eq!(fs.pending_remote_release_count().unwrap(), 2);
-    let state = fs.pending_remote_releases.lock().unwrap();
-    assert!(
-        state
-            .entries
-            .contains_key(&DistributedFs::remote_release_key(&first))
-    );
-    assert!(
-        state
-            .entries
-            .contains_key(&DistributedFs::remote_release_key(&second))
-    );
+    let state = fs.write_coordinator.pending_remote_releases.lock().unwrap();
+    assert!(state.entries.contains_key(&remote_release_key(&first)));
+    assert!(state.entries.contains_key(&remote_release_key(&second)));
 }
 
 #[test]
@@ -801,7 +815,8 @@ fn pending_remote_release_retry_pass_caps_attempts_and_rotates_fairly() {
         })
         .collect();
     for handle in &handles {
-        fs.queue_pending_remote_release(owner.clone(), handle.clone(), false)
+        fs.write_coordinator
+            .queue_pending_remote_release(owner.clone(), handle.clone(), false)
             .unwrap();
     }
 
@@ -860,9 +875,11 @@ fn pending_remote_release_retires_replaced_or_absent_owner_session() {
         open_seq: 2,
         opaque_handle: b"retired-absent".to_vec(),
     };
-    fs.queue_pending_remote_release(owner.clone(), replaced, false)
+    fs.write_coordinator
+        .queue_pending_remote_release(owner.clone(), replaced, false)
         .unwrap();
-    fs.queue_pending_remote_release(owner, absent, false)
+    fs.write_coordinator
+        .queue_pending_remote_release(owner, absent, false)
         .unwrap();
 
     assert_eq!(fs.retry_pending_remote_releases().unwrap(), 2);
@@ -892,7 +909,8 @@ fn pending_remote_release_unknown_owner_session_retains_debt() {
         open_seq: 1,
         opaque_handle: b"unknown-session".to_vec(),
     };
-    fs.queue_pending_remote_release(owner, handle.clone(), false)
+    fs.write_coordinator
+        .queue_pending_remote_release(owner, handle.clone(), false)
         .unwrap();
 
     fs.retry_pending_remote_releases()
@@ -901,12 +919,8 @@ fn pending_remote_release_unknown_owner_session_retains_debt() {
     assert_eq!(fs.pending_remote_release_count().unwrap(), 1);
     assert_eq!(scripted.release_call_count(), 0);
     assert_eq!(meta.current_session_call_count(), 1);
-    let state = fs.pending_remote_releases.lock().unwrap();
-    assert!(
-        state
-            .entries
-            .contains_key(&DistributedFs::remote_release_key(&handle))
-    );
+    let state = fs.write_coordinator.pending_remote_releases.lock().unwrap();
+    assert!(state.entries.contains_key(&remote_release_key(&handle)));
 }
 
 #[test]
@@ -940,9 +954,12 @@ fn pending_remote_release_mixed_sessions_retire_old_and_release_same_session() {
         open_seq: 2,
         opaque_handle: b"live-session".to_vec(),
     };
-    fs.queue_pending_remote_release(owner.clone(), old, false)
+    fs.write_coordinator
+        .queue_pending_remote_release(owner.clone(), old, false)
         .unwrap();
-    fs.queue_pending_remote_release(owner, live, false).unwrap();
+    fs.write_coordinator
+        .queue_pending_remote_release(owner, live, false)
+        .unwrap();
 
     assert_eq!(fs.retry_pending_remote_releases().unwrap(), 2);
 
@@ -976,7 +993,8 @@ fn pending_remote_release_groups_retired_session_lookup_and_preserves_fair_cap()
             open_seq: index + 1,
             opaque_handle: vec![index as u8],
         };
-        fs.queue_pending_remote_release(owner.clone(), handle, false)
+        fs.write_coordinator
+            .queue_pending_remote_release(owner.clone(), handle, false)
             .unwrap();
     }
 
@@ -1032,7 +1050,11 @@ fn remote_release_capacity_rejects_new_admission_without_owner_open() {
     .with_remote_owner_factory(Arc::new(StaticRemoteOwnerFactory {
         owner: remote_owner,
     }));
-    fs_b.pending_remote_releases.lock().unwrap().reserved = MAX_PENDING_REMOTE_RELEASES;
+    fs_b.write_coordinator
+        .pending_remote_releases
+        .lock()
+        .unwrap()
+        .reserved = MAX_PENDING_REMOTE_RELEASES;
     let inode_id = meta.inode.lock().unwrap().inode_id.clone();
     let inode_b = fs_b.backend_inode(&inode_id).unwrap();
     let error = fs_b.open(&context(), inode_b, libc::O_RDWR).unwrap_err();

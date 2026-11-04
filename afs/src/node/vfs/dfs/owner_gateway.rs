@@ -1,4 +1,75 @@
+//! Owner side of the DFS write proxy.
+//!
+//! `OwnerGateway` holds what only the proxy needs (open routes, the replay
+//! table, the reap cursor) and reaches local write state, handles and the
+//! `Backend` write path exclusively through `OwnerLocalFiles`.
 use super::*;
+
+/// What the owner gateway needs from the local file layer.
+pub(super) trait OwnerLocalFiles {
+    /// Rejects an inode outside this mount's namespace.
+    fn validate_owner_inode(&self, inode: InodeRecord) -> Result<InodeRecord>;
+    /// Installs the lease's write state, opens a writer and allocates a handle
+    /// scoped to the remote caller. Fails stale if the lease moved meanwhile.
+    fn open_owner_handle(
+        &self,
+        inode: &InodeRecord,
+        lease: &WriteLease,
+        open_flags: i32,
+        kill_suidgid: bool,
+        scope: DfsOwnerHandleScope,
+    ) -> Result<FileHandle>;
+    /// The handle's inode and caller scope, `None` once the handle is gone.
+    fn owner_handle_view(&self, file: FileHandle) -> Result<Option<OwnerHandleView>>;
+    fn owner_handle_exists(&self, file: FileHandle) -> Result<bool>;
+    /// Every open handle that serves a remote caller.
+    fn owner_scoped_handles(&self) -> Result<Vec<(FileHandle, DfsOwnerHandleScope)>>;
+    /// Fails stale unless this node session still holds `lease_epoch` for the
+    /// inode's open write state.
+    fn ensure_owner_write_lease(&self, inode_id: &InodeId, lease_epoch: u64) -> Result<()>;
+    fn owner_visible_attributes(&self, file: FileHandle) -> Result<FileAttributes>;
+    /// The bytes read and the inode's visible write sequence after the read.
+    fn owner_read(
+        &self,
+        file: FileHandle,
+        inode_id: &InodeId,
+        offset: u64,
+        length: usize,
+    ) -> Result<(Vec<u8>, u64)>;
+    /// Bytes written and the handle's accepted write sequence.
+    fn owner_write(
+        &self,
+        file: FileHandle,
+        offset: u64,
+        data: &[u8],
+        options: WriteOptions,
+    ) -> Result<(usize, u64)>;
+    /// The accepted write sequence of the resize.
+    fn owner_resize(&self, file: FileHandle, length: u64, kill_suidgid: bool) -> Result<u64>;
+    /// The handle's durable write sequence and the inode's base version id.
+    fn owner_sync(&self, file: FileHandle, mode: SyncMode) -> Result<(u64, String)>;
+    fn release_owner_handle(&self, file: FileHandle) -> Result<()>;
+}
+
+/// The part of an open handle the gateway validates a wire handle against.
+pub(super) struct OwnerHandleView {
+    inode_id: InodeId,
+    owner_scope: Option<DfsOwnerHandleScope>,
+}
+
+/// Serves proxied open/IO/release RPCs for inodes this node session owns.
+pub(super) struct OwnerGateway {
+    identity: Arc<NodeIdentity>,
+    meta: Arc<dyn DfsMeta>,
+    pub(super) owner_open_routes: Mutex<HashMap<DfsOwnerOpenRouteKey, DfsOwnerOpenRouteState>>,
+    owner_handle_reap_cursor: AtomicU64,
+    /// Replay table for proxied write/resize/sync (R54).
+    remote_operation_results: Mutex<OwnerOperationTable>,
+    #[cfg(test)]
+    owner_open_finish_pause: Mutex<Option<Arc<OwnerOpenFinishPause>>>,
+    #[cfg(test)]
+    remote_operation_before_apply: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DfsOwnerHandleScope {
@@ -14,11 +85,6 @@ pub(super) struct DfsOwnerOpenRouteKey {
     pub(super) caller_session_id: String,
     pub(super) owner_node_id: String,
     pub(super) owner_session_id: String,
-}
-
-pub(super) struct DfsRemoteOpenAdmissionLock {
-    pub(super) gate: Mutex<()>,
-    pub(super) users: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -81,243 +147,21 @@ impl OwnerOpenFinishPause {
     }
 }
 
-/// Results an owner handle keeps for proxied write/resize/sync replay (R54).
-/// The oldest completed result is evicted to make room; in-flight
-/// placeholders are never evicted.
-pub(super) const OWNER_OPERATION_RESULTS_PER_HANDLE: usize = 64;
-
-#[derive(Clone)]
-pub(super) enum RemoteOperationResult {
-    Write {
-        fingerprint: [u8; 32],
-        reply: afs_protocol::node_data::DfsOwnerWriteReply,
-    },
-    Resize {
-        fingerprint: [u8; 32],
-        reply: afs_protocol::node_data::DfsOwnerResizeReply,
-    },
-    Sync {
-        fingerprint: [u8; 32],
-        reply: afs_protocol::node_data::DfsOwnerSyncReply,
-    },
-}
-
-impl RemoteOperationResult {
-    fn fingerprint(&self) -> [u8; 32] {
-        match self {
-            Self::Write { fingerprint, .. }
-            | Self::Resize { fingerprint, .. }
-            | Self::Sync { fingerprint, .. } => *fingerprint,
-        }
-    }
-}
-
-enum OwnerOperationSlot {
-    /// The operation is being applied; `token` identifies the claim that owns it.
-    InFlight {
-        fingerprint: [u8; 32],
-        token: u64,
-    },
-    Done(RemoteOperationResult),
-}
-
-#[derive(Default)]
-struct OwnerHandleOperations {
-    /// Operation ids in arrival order (oldest first); same set as `entries`.
-    order: VecDeque<OperationId>,
-    entries: HashMap<OperationId, OwnerOperationSlot>,
-}
-
-/// Owner-side idempotency table for proxied mutating operations (ledger R54).
-///
-/// Invariants:
-/// - Keyed by the owner-side `FileHandle`. Handle ids are never reused and the
-///   table is only consulted after `validate_owner_handle` bound the caller
-///   node/session to the handle, so the key is at least as narrow as the old
-///   `(peer, caller_session, operation_id)` key.
-/// - Each handle keeps at most `OWNER_OPERATION_RESULTS_PER_HANDLE` slots;
-///   admitting a new operation evicts that handle's oldest `Done` slot.
-/// - The process-wide slot count never exceeds `MAX_REMOTE_OPERATION_RESULTS`;
-///   an operation that would grow past it is rejected *before* it is applied.
-/// - A slot is `InFlight` from admission until the operation finishes; a
-///   duplicate arriving meanwhile gets a retryable error. A failed operation
-///   removes its placeholder, so errors are never cached.
-/// - All slots of a handle are dropped when the owner handle is released,
-///   its open is cancelled, or it is reaped with its caller session.
-#[derive(Default)]
-pub(super) struct OwnerOperationTable {
-    handles: HashMap<FileHandle, OwnerHandleOperations>,
-    total: usize,
-    next_token: u64,
-}
-
-pub(super) enum OwnerOperationBegin {
-    Cached(RemoteOperationResult),
-    Apply(u64),
-}
-
-impl OwnerOperationTable {
-    fn begin(
-        &mut self,
-        file: FileHandle,
-        operation_id: &OperationId,
-        fingerprint: [u8; 32],
-    ) -> Result<OwnerOperationBegin> {
-        if let Some(slot) = self
-            .handles
-            .get(&file)
-            .and_then(|ops| ops.entries.get(operation_id))
-        {
-            let recorded = match slot {
-                OwnerOperationSlot::InFlight { fingerprint, .. } => *fingerprint,
-                OwnerOperationSlot::Done(result) => result.fingerprint(),
-            };
-            if recorded != fingerprint {
-                return Err(invalid(
-                    "DFS remote operation id was reused with a different request body",
-                ));
-            }
-            return match slot {
-                OwnerOperationSlot::InFlight { .. } => Err(unavailable(
-                    "DFS remote operation is still in progress; retry later",
-                )),
-                OwnerOperationSlot::Done(result) => Ok(OwnerOperationBegin::Cached(result.clone())),
-            };
-        }
-        let held = self.handles.get(&file).map_or(0, |ops| ops.entries.len());
-        if held < OWNER_OPERATION_RESULTS_PER_HANDLE {
-            if self.total >= MAX_REMOTE_OPERATION_RESULTS {
-                return Err(unavailable(
-                    "DFS remote operation table is at capacity; retry later",
-                ));
-            }
-        } else {
-            let ops = self.handles.get_mut(&file).expect("held > 0 implies entry");
-            let oldest_done = ops
-                .order
-                .iter()
-                .position(|id| matches!(ops.entries.get(id), Some(OwnerOperationSlot::Done(_))));
-            let Some(index) = oldest_done else {
-                return Err(unavailable(
-                    "DFS owner handle has too many operations in progress; retry later",
-                ));
-            };
-            let evicted = ops.order.remove(index).expect("index from position");
-            ops.entries.remove(&evicted);
-            self.total -= 1;
-        }
-        self.next_token = self.next_token.wrapping_add(1);
-        let token = self.next_token;
-        let ops = self.handles.entry(file).or_default();
-        ops.order.push_back(operation_id.clone());
-        ops.entries.insert(
-            operation_id.clone(),
-            OwnerOperationSlot::InFlight { fingerprint, token },
-        );
-        self.total += 1;
-        Ok(OwnerOperationBegin::Apply(token))
-    }
-
-    fn claimed_slot(
-        &mut self,
-        file: FileHandle,
-        operation_id: &OperationId,
-        token: u64,
-    ) -> Option<&mut OwnerOperationSlot> {
-        self.handles
-            .get_mut(&file)?
-            .entries
-            .get_mut(operation_id)
-            .filter(|slot| {
-                matches!(slot, OwnerOperationSlot::InFlight { token: owned, .. } if *owned == token)
-            })
-    }
-
-    fn complete(
-        &mut self,
-        file: FileHandle,
-        operation_id: &OperationId,
-        token: u64,
-        result: RemoteOperationResult,
-    ) {
-        // The handle may have been released while the operation ran; its
-        // slots are gone then and there is nothing left to replay against.
-        if let Some(slot) = self.claimed_slot(file, operation_id, token) {
-            *slot = OwnerOperationSlot::Done(result);
+impl OwnerGateway {
+    pub(super) fn new(identity: Arc<NodeIdentity>, meta: Arc<dyn DfsMeta>) -> Self {
+        Self {
+            identity,
+            meta,
+            owner_open_routes: Mutex::new(HashMap::new()),
+            owner_handle_reap_cursor: AtomicU64::new(0),
+            remote_operation_results: Mutex::new(OwnerOperationTable::default()),
+            #[cfg(test)]
+            owner_open_finish_pause: Mutex::new(None),
+            #[cfg(test)]
+            remote_operation_before_apply: Mutex::new(None),
         }
     }
 
-    fn abandon(&mut self, file: FileHandle, operation_id: &OperationId, token: u64) {
-        if self.claimed_slot(file, operation_id, token).is_none() {
-            return;
-        }
-        let ops = self
-            .handles
-            .get_mut(&file)
-            .expect("claimed slot implies entry");
-        ops.entries.remove(operation_id);
-        ops.order.retain(|id| id != operation_id);
-        self.total -= 1;
-        if ops.entries.is_empty() {
-            self.handles.remove(&file);
-        }
-    }
-
-    fn clear_handle(&mut self, file: FileHandle) {
-        if let Some(ops) = self.handles.remove(&file) {
-            self.total -= ops.entries.len();
-        }
-    }
-
-    fn handle_ids(&self) -> Vec<FileHandle> {
-        self.handles.keys().copied().collect()
-    }
-
-    #[cfg(test)]
-    fn len(&self) -> usize {
-        self.total
-    }
-}
-
-/// An admitted operation's in-flight placeholder. Dropping it without
-/// `complete` (error or panic while applying) removes the placeholder so the
-/// same operation id can be applied again.
-struct OwnerOperationClaim<'a> {
-    table: &'a Mutex<OwnerOperationTable>,
-    file: FileHandle,
-    operation_id: OperationId,
-    token: u64,
-    done: bool,
-}
-
-impl OwnerOperationClaim<'_> {
-    fn complete(mut self, result: RemoteOperationResult) {
-        self.done = true;
-        // A poisoned table already fails every later admission, so dropping
-        // the record here cannot turn into a silent second apply.
-        if let Ok(mut table) = self.table.lock() {
-            table.complete(self.file, &self.operation_id, self.token, result);
-        }
-    }
-}
-
-impl Drop for OwnerOperationClaim<'_> {
-    fn drop(&mut self) {
-        if self.done {
-            return;
-        }
-        if let Ok(mut table) = self.table.lock() {
-            table.abandon(self.file, &self.operation_id, self.token);
-        }
-    }
-}
-
-enum OwnerOperationStart<'a> {
-    Cached(RemoteOperationResult),
-    Apply(OwnerOperationClaim<'a>),
-}
-
-impl DistributedFs {
     /// Admits a proxied mutating operation on a validated owner handle: either
     /// returns the remembered result of a completed duplicate, or installs an
     /// in-flight placeholder that the caller must `complete` after applying.
@@ -334,13 +178,9 @@ impl DistributedFs {
             .begin(file, &operation_id, fingerprint)?;
         Ok(match begin {
             OwnerOperationBegin::Cached(result) => OwnerOperationStart::Cached(result),
-            OwnerOperationBegin::Apply(token) => OwnerOperationStart::Apply(OwnerOperationClaim {
-                table: &self.remote_operation_results,
-                file,
-                operation_id,
-                token,
-                done: false,
-            }),
+            OwnerOperationBegin::Apply(token) => OwnerOperationStart::Apply(
+                OwnerOperationClaim::new(&self.remote_operation_results, file, operation_id, token),
+            ),
         })
     }
 
@@ -355,14 +195,14 @@ impl DistributedFs {
 
     /// Safety net for release paths that do not go through the owner gateway:
     /// drop slots of handles that no longer exist.
-    fn prune_released_owner_operations(&self) -> Result<()> {
+    fn prune_released_owner_operations(&self, local: &dyn OwnerLocalFiles) -> Result<()> {
         let tracked = self
             .remote_operation_results
             .lock()
             .map_err(|_| unavailable("DFS remote operation table is poisoned"))?
             .handle_ids();
         for file in tracked {
-            if self.handles.get(file.0)?.is_none() {
+            if !local.owner_handle_exists(file)? {
                 self.forget_owner_handle_operations(file)?;
             }
         }
@@ -447,9 +287,10 @@ pub(super) enum DfsOwnerOpenAdmissionStart {
     },
 }
 
-impl DistributedFs {
+impl OwnerGateway {
     pub(super) fn owner_open(
         &self,
+        local: &dyn OwnerLocalFiles,
         peer: &str,
         request: afs_protocol::node_control::DfsOwnerOpenRequest,
     ) -> Result<afs_protocol::node_control::DfsOwnerOpenReply> {
@@ -488,7 +329,7 @@ impl DistributedFs {
                 return Err(error);
             }
         };
-        let inode = match self.validate_inode(inode) {
+        let inode = match local.validate_owner_inode(inode) {
             Ok(inode) => inode,
             Err(error) => {
                 self.finish_failed_owner_open_admission(&route, open_seq)?;
@@ -502,38 +343,18 @@ impl DistributedFs {
             self.finish_failed_owner_open_admission(&route, open_seq)?;
             return Err(stale("DFS owner lease is no longer current"));
         }
-        let apply = (|| {
-            self.install_write_state(inode.clone(), lease.clone())?;
-            let session = self.open_write_session(&inode, request.open_flags)?;
-            if session.lease_epoch != request.lease_epoch {
-                self.release_writer(&session)?;
-                return Err(stale("DFS owner lease changed during open admission"));
-            }
-            if request.kill_suidgid {
-                let state = self
-                    .write_state(&inode.inode_id)?
-                    .ok_or_else(|| stale("DFS write state is no longer open"))?;
-                let mut state = self.lock_for_mutation(&inode.inode_id, &state)?;
-                Self::apply_kernel_killpriv_to_state(&mut state);
-            }
-            self.allocate_handle(DfsFileHandle {
-                gc_pin: None,
-                inode_id: inode.inode_id.clone(),
-                opened_inode: inode.clone(),
-                opened_page_identity: None,
-                native_read_view: None,
-                native_read_generation: 0,
-                native_denial_serial: 0,
-                write_session: Some(Self::make_local_write_session(session)),
-                flags: request.open_flags,
-                owner_scope: Some(DfsOwnerHandleScope {
-                    caller_node_id: peer.to_owned(),
-                    caller_session_id: request.caller_session_id.clone(),
-                    lease_epoch: lease.lease_epoch,
-                    open_seq,
-                }),
-            })
-        })();
+        let apply = local.open_owner_handle(
+            &inode,
+            &lease,
+            request.open_flags,
+            request.kill_suidgid,
+            DfsOwnerHandleScope {
+                caller_node_id: peer.to_owned(),
+                caller_session_id: request.caller_session_id.clone(),
+                lease_epoch: lease.lease_epoch,
+                open_seq,
+            },
+        );
         let handle = match apply {
             Ok(handle) => handle,
             Err(error) => {
@@ -555,7 +376,7 @@ impl DistributedFs {
             match self.finish_owner_open_admission(&route, open_seq, fingerprint, wire.clone()) {
                 Ok(cancelled) => cancelled,
                 Err(error) => {
-                    match <Self as Backend>::release(self, &owner_request_context(), handle) {
+                    match local.release_owner_handle(handle) {
                         Ok(()) => {}
                         Err(release_error)
                             if release_error.code() == afs_error::NODE_DFS_STALE_HANDLE => {}
@@ -566,7 +387,7 @@ impl DistributedFs {
                 }
             };
         if cancelled {
-            <Self as Backend>::release(self, &owner_request_context(), handle)?;
+            local.release_owner_handle(handle)?;
             self.forget_owner_handle_operations(handle)?;
             self.finish_owner_open_identity_retirement(peer, &wire)?;
             return Err(stale("DFS owner open admission was cancelled"));
@@ -576,22 +397,23 @@ impl DistributedFs {
 
     pub(super) fn owner_getattr(
         &self,
+        local: &dyn OwnerLocalFiles,
         peer: &str,
         request: afs_protocol::node_control::DfsOwnerGetAttrRequest,
     ) -> Result<afs_protocol::node_control::DfsOwnerGetAttrReply> {
         let handle = request
             .handle
             .ok_or_else(|| stale("DFS owner getattr missing handle"))?;
-        let file = self.validate_owner_handle(peer, &handle)?;
-        let snapshot = self.handle_snapshot(file)?;
-        let attr = self.visible_attributes(&snapshot.opened_inode)?;
+        let file = self.validate_owner_handle(local, peer, &handle)?;
+        let attr = local.owner_visible_attributes(file)?;
         Ok(afs_protocol::node_control::DfsOwnerGetAttrReply {
-            attr: Some(Self::wire_attr(attr)),
+            attr: Some(wire_attr(attr)),
         })
     }
 
     pub(super) fn owner_release(
         &self,
+        local: &dyn OwnerLocalFiles,
         peer: &str,
         request: afs_protocol::node_control::DfsOwnerReleaseRequest,
     ) -> Result<afs_protocol::node_control::DfsOwnerReleaseReply> {
@@ -602,17 +424,17 @@ impl DistributedFs {
             if let Some(active) =
                 self.prepare_owner_open_identity_retirement(peer, &handle, true)?
             {
-                let file = self.owner_release_file_handle(peer, &active)?;
+                let file = self.owner_release_file_handle(local, peer, &active)?;
                 let file = file.ok_or_else(|| stale("DFS owner release handle is not active"))?;
-                <Self as Backend>::release(self, &owner_request_context(), file)?;
+                local.release_owner_handle(file)?;
                 self.forget_owner_handle_operations(file)?;
                 self.finish_owner_open_identity_retirement(peer, &active)?;
             }
             return Ok(afs_protocol::node_control::DfsOwnerReleaseReply {});
         }
         self.validate_owner_release_session_current(peer, &handle)?;
-        if let Some(file) = self.owner_release_file_handle(peer, &handle)? {
-            <Self as Backend>::release(self, &owner_request_context(), file)?;
+        if let Some(file) = self.owner_release_file_handle(local, peer, &handle)? {
+            local.release_owner_handle(file)?;
             self.forget_owner_handle_operations(file)?;
         }
         self.finish_owner_open_identity_retirement(peer, &handle)?;
@@ -620,30 +442,23 @@ impl DistributedFs {
     }
 }
 
-impl DistributedFs {
+impl OwnerGateway {
     pub(super) fn owner_read(
         &self,
+        local: &dyn OwnerLocalFiles,
         peer: &str,
         request: afs_protocol::node_data::DfsOwnerReadRequest,
     ) -> Result<afs_protocol::node_data::DfsOwnerReadReply> {
         let handle = request
             .handle
             .ok_or_else(|| stale("DFS owner read missing handle"))?;
-        let handle = Self::control_owner_handle(&handle);
-        let file = self.validate_owner_handle(peer, &handle)?;
+        let handle = control_owner_handle(&handle);
+        let file = self.validate_owner_handle(local, peer, &handle)?;
         let length = usize::try_from(request.length)
             .map_err(|_| invalid("DFS owner read length exceeds platform limits"))?;
-        let data = <Self as Backend>::read_owned(
-            self,
-            &owner_request_context(),
-            file,
-            request.offset,
-            length,
-        )?;
-        let visible_write_seq = self
-            .write_state(&InodeId::new(handle.inode_id))?
-            .and_then(|state| state.lock().ok().map(|state| state.visible_write_seq))
-            .unwrap_or(0);
+        let inode_id = InodeId::new(handle.inode_id);
+        let (data, visible_write_seq) =
+            local.owner_read(file, &inode_id, request.offset, length)?;
         Ok(afs_protocol::node_data::DfsOwnerReadReply {
             data,
             visible_write_seq,
@@ -652,6 +467,7 @@ impl DistributedFs {
 
     pub(super) fn owner_write(
         &self,
+        local: &dyn OwnerLocalFiles,
         peer: &str,
         request: afs_protocol::node_data::DfsOwnerWriteRequest,
     ) -> Result<afs_protocol::node_data::DfsOwnerWriteReply> {
@@ -659,8 +475,8 @@ impl DistributedFs {
             .handle
             .clone()
             .ok_or_else(|| stale("DFS owner write missing handle"))?;
-        let handle = Self::control_owner_handle(&handle);
-        let file = self.validate_owner_handle(peer, &handle)?;
+        let handle = control_owner_handle(&handle);
+        let file = self.validate_owner_handle(local, peer, &handle)?;
         let operation_id = OperationId::new(request.operation_id.clone());
         let fingerprint = Self::fingerprint_remote_write(
             &handle,
@@ -679,14 +495,11 @@ impl DistributedFs {
         #[cfg(test)]
         self.run_remote_operation_before_apply_hook();
         let offset = if request.append {
-            let snapshot = self.handle_snapshot(file)?;
-            self.visible_attributes(&snapshot.opened_inode)?.size
+            local.owner_visible_attributes(file)?.size
         } else {
             request.offset
         };
-        let written = <Self as Backend>::write_with_options(
-            self,
-            &owner_request_context(),
+        let (written, accepted) = local.owner_write(
             file,
             offset,
             &request.data,
@@ -694,11 +507,6 @@ impl DistributedFs {
                 kill_suidgid: request.kill_suidgid,
             },
         )?;
-        let snapshot = self.handle_snapshot(file)?;
-        let accepted = snapshot
-            .write_session
-            .as_ref()
-            .map_or(0, |session| session.local.last_accepted_seq);
         let reply = afs_protocol::node_data::DfsOwnerWriteReply {
             written: written as u64,
             accepted_write_seq: accepted,
@@ -710,6 +518,7 @@ impl DistributedFs {
 
     pub(super) fn owner_resize(
         &self,
+        local: &dyn OwnerLocalFiles,
         peer: &str,
         request: afs_protocol::node_data::DfsOwnerResizeRequest,
     ) -> Result<afs_protocol::node_data::DfsOwnerResizeReply> {
@@ -717,8 +526,8 @@ impl DistributedFs {
             .handle
             .clone()
             .ok_or_else(|| stale("DFS owner resize missing handle"))?;
-        let handle = Self::control_owner_handle(&handle);
-        let file = self.validate_owner_handle(peer, &handle)?;
+        let handle = control_owner_handle(&handle);
+        let file = self.validate_owner_handle(local, peer, &handle)?;
         let operation_id = OperationId::new(request.operation_id.clone());
         let fingerprint =
             Self::fingerprint_remote_resize(&handle, request.length, request.kill_suidgid);
@@ -729,10 +538,7 @@ impl DistributedFs {
             OwnerOperationStart::Cached(_) => return Err(remote_operation_kind_mismatch()),
             OwnerOperationStart::Apply(claim) => claim,
         };
-        let snapshot = self.handle_snapshot(file)?;
-        let accepted =
-            self.resize_dirty_inode(&snapshot.inode_id, request.length, request.kill_suidgid)?;
-        self.update_handle_write_progress(file, accepted)?;
+        let accepted = local.owner_resize(file, request.length, request.kill_suidgid)?;
         let reply = afs_protocol::node_data::DfsOwnerResizeReply {
             accepted_write_seq: accepted,
         };
@@ -742,6 +548,7 @@ impl DistributedFs {
 
     pub(super) fn owner_sync(
         &self,
+        local: &dyn OwnerLocalFiles,
         peer: &str,
         request: afs_protocol::node_data::DfsOwnerSyncRequest,
     ) -> Result<afs_protocol::node_data::DfsOwnerSyncReply> {
@@ -749,8 +556,8 @@ impl DistributedFs {
             .handle
             .clone()
             .ok_or_else(|| stale("DFS owner sync missing handle"))?;
-        let handle = Self::control_owner_handle(&handle);
-        let file = self.validate_owner_handle(peer, &handle)?;
+        let handle = control_owner_handle(&handle);
+        let file = self.validate_owner_handle(local, peer, &handle)?;
         let operation_id = OperationId::new(request.operation_id.clone());
         let fingerprint =
             Self::fingerprint_remote_sync(&handle, request.through_write_seq, request.data_only);
@@ -761,9 +568,7 @@ impl DistributedFs {
             OwnerOperationStart::Cached(_) => return Err(remote_operation_kind_mismatch()),
             OwnerOperationStart::Apply(claim) => claim,
         };
-        <Self as Backend>::fsync(
-            self,
-            &owner_request_context(),
+        let (durable_write_seq, file_version_id) = local.owner_sync(
             file,
             if request.data_only {
                 SyncMode::DataOnly
@@ -771,23 +576,9 @@ impl DistributedFs {
                 SyncMode::Full
             },
         )?;
-        let snapshot = self.handle_snapshot(file)?;
         let reply = afs_protocol::node_data::DfsOwnerSyncReply {
-            durable_write_seq: snapshot
-                .write_session
-                .as_ref()
-                .map_or(0, |session| session.local.last_synced_seq),
-            file_version_id: self
-                .write_state(&snapshot.inode_id)?
-                .and_then(|state| {
-                    state.lock().ok().and_then(|state| {
-                        state
-                            .base_version
-                            .as_ref()
-                            .map(|version| version.id.0.clone())
-                    })
-                })
-                .unwrap_or_default(),
+            durable_write_seq,
+            file_version_id,
         };
         claim.complete(RemoteOperationResult::Sync {
             fingerprint,
@@ -797,25 +588,20 @@ impl DistributedFs {
     }
 }
 
-impl DistributedFs {
+impl OwnerGateway {
     #[cfg(test)]
     pub(super) fn set_owner_open_finish_pause(&self, pause: Option<Arc<OwnerOpenFinishPause>>) {
-        *self.hooks.owner_open_finish_pause.lock().unwrap() = pause;
+        *self.owner_open_finish_pause.lock().unwrap() = pause;
     }
 
     #[cfg(test)]
     pub(super) fn set_remote_operation_before_apply(&self, hook: Box<dyn FnOnce() + Send>) {
-        *self.hooks.remote_operation_before_apply.lock().unwrap() = Some(hook);
+        *self.remote_operation_before_apply.lock().unwrap() = Some(hook);
     }
 
     #[cfg(test)]
     fn run_remote_operation_before_apply_hook(&self) {
-        let hook = self
-            .hooks
-            .remote_operation_before_apply
-            .lock()
-            .unwrap()
-            .take();
+        let hook = self.remote_operation_before_apply.lock().unwrap().take();
         if let Some(hook) = hook {
             hook();
         }
@@ -828,19 +614,10 @@ impl DistributedFs {
 
     #[cfg(test)]
     fn pause_before_owner_open_finish(&self) {
-        let pause = self.hooks.owner_open_finish_pause.lock().unwrap().clone();
+        let pause = self.owner_open_finish_pause.lock().unwrap().clone();
         if let Some(pause) = pause {
             pause.pause();
         }
-    }
-
-    pub(super) fn validate_owner_open_seq(
-        request: &afs_protocol::node_control::DfsOwnerOpenRequest,
-    ) -> Result<u64> {
-        if request.open_seq == 0 {
-            return Err(stale("DFS owner open sequence is zero"));
-        }
-        Ok(request.open_seq)
     }
 
     fn owner_open_route(
@@ -861,7 +638,7 @@ impl DistributedFs {
         peer: &str,
         request: &afs_protocol::node_control::DfsOwnerOpenRequest,
     ) -> Result<[u8; 32]> {
-        let open_seq = Self::validate_owner_open_seq(request)?;
+        let open_seq = validate_owner_open_seq(request)?;
         let mut hasher = blake3::Hasher::new();
         for part in [
             peer.as_bytes(),
@@ -886,7 +663,7 @@ impl DistributedFs {
         peer: &str,
         request: &afs_protocol::node_control::DfsOwnerOpenRequest,
     ) -> Result<DfsOwnerOpenAdmissionStart> {
-        let open_seq = Self::validate_owner_open_seq(request)?;
+        let open_seq = validate_owner_open_seq(request)?;
         let route = Self::owner_open_route(
             peer,
             &request.caller_session_id,
@@ -935,7 +712,7 @@ impl DistributedFs {
             open_seq,
             DfsOwnerOpenInflight {
                 fingerprint,
-                cleanup_scope: Self::cleanup_handle_for_open_request(peer, request)?,
+                cleanup_scope: cleanup_handle_for_open_request(peer, request)?,
             },
         );
         Ok(DfsOwnerOpenAdmissionStart::Apply {
@@ -1124,28 +901,20 @@ impl DistributedFs {
 
     fn validate_owner_handle(
         &self,
+        local: &dyn OwnerLocalFiles,
         peer: &str,
         handle: &afs_protocol::node_control::DfsOwnerHandle,
     ) -> Result<FileHandle> {
         let (inode_id, file) = self.validate_owner_handle_basic(peer, handle)?;
-        let snapshot = self.handle_snapshot(file)?;
-        self.validate_owner_handle_scope(peer, handle, &inode_id, &snapshot)?;
+        let view = local
+            .owner_handle_view(file)?
+            .ok_or_else(|| stale("DFS file handle is no longer open"))?;
+        self.validate_owner_handle_scope(peer, handle, &inode_id, &view)?;
         let current = self.meta.current_node_session(peer)?;
         if current.as_deref() != Some(handle.caller_session_id.as_str()) {
             return Err(stale("DFS owner caller session is stale"));
         }
-        let state = self
-            .write_state(&inode_id)?
-            .ok_or_else(|| stale("DFS owner write state is not open"))?;
-        let state = state
-            .lock()
-            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-        if state.write_lease.lease_epoch != handle.lease_epoch
-            || state.write_lease.owner_node_id != self.identity.node_id
-            || state.write_lease.owner_session_id != self.identity.session_id
-        {
-            return Err(stale("DFS owner lease epoch is stale"));
-        }
+        local.ensure_owner_write_lease(&inode_id, handle.lease_epoch)?;
         Ok(file)
     }
 
@@ -1165,7 +934,7 @@ impl DistributedFs {
         }
         Ok((
             InodeId::new(handle.inode_id.clone()),
-            Self::file_handle_from_owner(handle)?,
+            file_handle_from_owner(handle)?,
         ))
     }
 
@@ -1174,12 +943,12 @@ impl DistributedFs {
         peer: &str,
         handle: &afs_protocol::node_control::DfsOwnerHandle,
         inode_id: &InodeId,
-        snapshot: &DfsFileHandleSnapshot,
+        view: &OwnerHandleView,
     ) -> Result<()> {
-        if snapshot.inode_id != *inode_id {
+        if view.inode_id != *inode_id {
             return Err(stale("DFS owner handle names another inode"));
         }
-        let Some(scope) = snapshot.owner_scope.as_ref() else {
+        let Some(scope) = view.owner_scope.as_ref() else {
             return Err(stale("DFS owner handle is not a remote caller handle"));
         };
         if scope.caller_node_id != peer
@@ -1194,27 +963,50 @@ impl DistributedFs {
 
     fn owner_release_file_handle(
         &self,
+        local: &dyn OwnerLocalFiles,
         peer: &str,
         handle: &afs_protocol::node_control::DfsOwnerHandle,
     ) -> Result<Option<FileHandle>> {
         let (inode_id, file) = self.validate_owner_handle_basic(peer, handle)?;
-        let Some(opened) = self.handles.get(file.0)? else {
+        let Some(view) = local.owner_handle_view(file)? else {
             return Ok(None);
         };
-        let snapshot = DfsFileHandleSnapshot::from_handle(&opened)?;
-        self.validate_owner_handle_scope(peer, handle, &inode_id, &snapshot)?;
+        self.validate_owner_handle_scope(peer, handle, &inode_id, &view)?;
         Ok(Some(file))
     }
 
-    fn peer_owner_handle_sessions(&self) -> Result<HashMap<String, HashSet<String>>> {
+    fn owner_handle_for(
+        &self,
+        peer: &str,
+        caller_session_id: String,
+        inode: &InodeRecord,
+        lease: &WriteLease,
+        handle: FileHandle,
+        open_seq: u64,
+    ) -> afs_protocol::node_control::DfsOwnerHandle {
+        afs_protocol::node_control::DfsOwnerHandle {
+            namespace_id: self.identity.namespace_id.0.clone(),
+            inode_id: inode.inode_id.0.clone(),
+            owner_node_id: self.identity.node_id.clone(),
+            owner_session_id: self.identity.session_id.clone(),
+            lease_epoch: lease.lease_epoch,
+            caller_node_id: peer.to_owned(),
+            caller_session_id,
+            opaque_handle: handle.0.to_be_bytes().to_vec(),
+            open_seq,
+        }
+    }
+
+    fn peer_owner_handle_sessions(
+        &self,
+        local: &dyn OwnerLocalFiles,
+    ) -> Result<HashMap<String, HashSet<String>>> {
         let mut sessions: HashMap<String, HashSet<String>> = HashMap::new();
-        for (_, handle) in self.handles.snapshot()? {
-            if let Some(scope) = handle.owner_scope.as_ref() {
-                sessions
-                    .entry(scope.caller_node_id.clone())
-                    .or_default()
-                    .insert(scope.caller_session_id.clone());
-            }
+        for (_, scope) in local.owner_scoped_handles()? {
+            sessions
+                .entry(scope.caller_node_id)
+                .or_default()
+                .insert(scope.caller_session_id);
         }
         for route in self
             .owner_open_routes
@@ -1230,9 +1022,12 @@ impl DistributedFs {
         Ok(sessions)
     }
 
-    pub fn reap_expired_peer_owner_handles(&self) -> Result<usize> {
-        self.prune_released_owner_operations()?;
-        let sessions_by_node = self.peer_owner_handle_sessions()?;
+    pub(super) fn reap_expired_peer_owner_handles(
+        &self,
+        local: &dyn OwnerLocalFiles,
+    ) -> Result<usize> {
+        self.prune_released_owner_operations(local)?;
+        let sessions_by_node = self.peer_owner_handle_sessions(local)?;
         let mut peers = sessions_by_node.into_iter().collect::<Vec<_>>();
         peers.sort_by(|left, right| left.0.cmp(&right.0));
         if peers.is_empty() {
@@ -1262,7 +1057,7 @@ impl DistributedFs {
                 Ok(current) => {
                     for session_id in sessions {
                         if current.as_deref() != Some(session_id.as_str()) {
-                            match self.reap_peer_owner_session(&node_id, &session_id) {
+                            match self.reap_peer_owner_session(local, &node_id, &session_id) {
                                 Ok(count) => reaped = reaped.saturating_add(count),
                                 Err(error) => {
                                     first_error.get_or_insert(error);
@@ -1282,22 +1077,24 @@ impl DistributedFs {
         Ok(reaped)
     }
 
-    fn reap_peer_owner_session(&self, node_id: &str, session_id: &str) -> Result<usize> {
-        let handles = self
-            .handles
-            .snapshot()?
+    fn reap_peer_owner_session(
+        &self,
+        local: &dyn OwnerLocalFiles,
+        node_id: &str,
+        session_id: &str,
+    ) -> Result<usize> {
+        let handles = local
+            .owner_scoped_handles()?
             .into_iter()
-            .filter_map(|(id, handle)| {
-                handle.owner_scope.as_ref().and_then(|scope| {
-                    (scope.caller_node_id == node_id && scope.caller_session_id == session_id)
-                        .then_some(FileHandle(id))
-                })
+            .filter_map(|(file, scope)| {
+                (scope.caller_node_id == node_id && scope.caller_session_id == session_id)
+                    .then_some(file)
             })
             .collect::<Vec<_>>();
         let mut reaped = 0usize;
         let mut first_error = None;
         for file in handles {
-            let released = match <Self as Backend>::release(self, &owner_request_context(), file) {
+            let released = match local.release_owner_handle(file) {
                 Ok(()) => {
                     reaped = reaped.saturating_add(1);
                     Ok(())
@@ -1334,14 +1131,14 @@ impl owner_api::DfsOwnerLifecycleHandler for DistributedFs {
         peer: &str,
         request: afs_protocol::node_control::DfsOwnerOpenRequest,
     ) -> Result<afs_protocol::node_control::DfsOwnerOpenReply> {
-        self.owner_open(peer, request)
+        self.owner_gateway.owner_open(self, peer, request)
     }
     fn getattr(
         &self,
         peer: &str,
         request: afs_protocol::node_control::DfsOwnerGetAttrRequest,
     ) -> Result<afs_protocol::node_control::DfsOwnerGetAttrReply> {
-        self.owner_getattr(peer, request)
+        self.owner_gateway.owner_getattr(self, peer, request)
     }
     fn get_lock(
         &self,
@@ -1390,7 +1187,7 @@ impl owner_api::DfsOwnerLifecycleHandler for DistributedFs {
         peer: &str,
         request: afs_protocol::node_control::DfsOwnerReleaseRequest,
     ) -> Result<afs_protocol::node_control::DfsOwnerReleaseReply> {
-        self.owner_release(peer, request)
+        self.owner_gateway.owner_release(self, peer, request)
     }
 }
 
@@ -1400,27 +1197,275 @@ impl owner_api::DfsOwnerFilesHandler for DistributedFs {
         peer: &str,
         request: afs_protocol::node_data::DfsOwnerReadRequest,
     ) -> Result<afs_protocol::node_data::DfsOwnerReadReply> {
-        self.owner_read(peer, request)
+        self.owner_gateway.owner_read(self, peer, request)
     }
     fn write(
         &self,
         peer: &str,
         request: afs_protocol::node_data::DfsOwnerWriteRequest,
     ) -> Result<afs_protocol::node_data::DfsOwnerWriteReply> {
-        self.owner_write(peer, request)
+        self.owner_gateway.owner_write(self, peer, request)
     }
     fn resize(
         &self,
         peer: &str,
         request: afs_protocol::node_data::DfsOwnerResizeRequest,
     ) -> Result<afs_protocol::node_data::DfsOwnerResizeReply> {
-        self.owner_resize(peer, request)
+        self.owner_gateway.owner_resize(self, peer, request)
     }
     fn sync(
         &self,
         peer: &str,
         request: afs_protocol::node_data::DfsOwnerSyncRequest,
     ) -> Result<afs_protocol::node_data::DfsOwnerSyncReply> {
-        self.owner_sync(peer, request)
+        self.owner_gateway.owner_sync(self, peer, request)
+    }
+}
+
+impl OwnerLocalFiles for DistributedFs {
+    fn validate_owner_inode(&self, inode: InodeRecord) -> Result<InodeRecord> {
+        self.validate_inode(inode)
+    }
+
+    fn open_owner_handle(
+        &self,
+        inode: &InodeRecord,
+        lease: &WriteLease,
+        open_flags: i32,
+        kill_suidgid: bool,
+        scope: DfsOwnerHandleScope,
+    ) -> Result<FileHandle> {
+        self.install_write_state(inode.clone(), lease.clone())?;
+        let session = self.open_write_session(inode, open_flags)?;
+        if session.lease_epoch != lease.lease_epoch {
+            self.release_writer(&session)?;
+            return Err(stale("DFS owner lease changed during open admission"));
+        }
+        if kill_suidgid {
+            let state = self
+                .write_state(&inode.inode_id)?
+                .ok_or_else(|| stale("DFS write state is no longer open"))?;
+            let mut state = self.lock_for_mutation(&inode.inode_id, &state)?;
+            Self::apply_kernel_killpriv_to_state(&mut state);
+        }
+        self.allocate_handle(DfsFileHandle {
+            gc_pin: None,
+            inode_id: inode.inode_id.clone(),
+            opened_inode: inode.clone(),
+            opened_page_identity: None,
+            native_read_view: None,
+            native_read_generation: 0,
+            native_denial_serial: 0,
+            write_session: Some(Self::make_local_write_session(session)),
+            flags: open_flags,
+            owner_scope: Some(scope),
+        })
+    }
+
+    fn owner_handle_view(&self, file: FileHandle) -> Result<Option<OwnerHandleView>> {
+        let Some(opened) = self.handles.get(file.0)? else {
+            return Ok(None);
+        };
+        let snapshot = DfsFileHandleSnapshot::from_handle(&opened)?;
+        Ok(Some(OwnerHandleView {
+            inode_id: snapshot.inode_id,
+            owner_scope: snapshot.owner_scope,
+        }))
+    }
+
+    fn owner_handle_exists(&self, file: FileHandle) -> Result<bool> {
+        Ok(self.handles.get(file.0)?.is_some())
+    }
+
+    fn owner_scoped_handles(&self) -> Result<Vec<(FileHandle, DfsOwnerHandleScope)>> {
+        Ok(self
+            .handles
+            .snapshot()?
+            .into_iter()
+            .filter_map(|(id, handle)| {
+                handle
+                    .owner_scope
+                    .as_ref()
+                    .map(|scope| (FileHandle(id), scope.clone()))
+            })
+            .collect())
+    }
+
+    fn ensure_owner_write_lease(&self, inode_id: &InodeId, lease_epoch: u64) -> Result<()> {
+        let state = self
+            .write_state(inode_id)?
+            .ok_or_else(|| stale("DFS owner write state is not open"))?;
+        let state = state
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        if state.write_lease.lease_epoch != lease_epoch
+            || state.write_lease.owner_node_id != self.identity.node_id
+            || state.write_lease.owner_session_id != self.identity.session_id
+        {
+            return Err(stale("DFS owner lease epoch is stale"));
+        }
+        Ok(())
+    }
+
+    fn owner_visible_attributes(&self, file: FileHandle) -> Result<FileAttributes> {
+        let snapshot = self.handle_snapshot(file)?;
+        self.visible_attributes(&snapshot.opened_inode)
+    }
+
+    fn owner_read(
+        &self,
+        file: FileHandle,
+        inode_id: &InodeId,
+        offset: u64,
+        length: usize,
+    ) -> Result<(Vec<u8>, u64)> {
+        let data =
+            <Self as Backend>::read_owned(self, &owner_request_context(), file, offset, length)?;
+        let visible_write_seq = self
+            .write_state(inode_id)?
+            .and_then(|state| state.lock().ok().map(|state| state.visible_write_seq))
+            .unwrap_or(0);
+        Ok((data, visible_write_seq))
+    }
+
+    fn owner_write(
+        &self,
+        file: FileHandle,
+        offset: u64,
+        data: &[u8],
+        options: WriteOptions,
+    ) -> Result<(usize, u64)> {
+        let written = <Self as Backend>::write_with_options(
+            self,
+            &owner_request_context(),
+            file,
+            offset,
+            data,
+            options,
+        )?;
+        let snapshot = self.handle_snapshot(file)?;
+        let accepted = snapshot
+            .write_session
+            .as_ref()
+            .map_or(0, |session| session.local.last_accepted_seq);
+        Ok((written, accepted))
+    }
+
+    fn owner_resize(&self, file: FileHandle, length: u64, kill_suidgid: bool) -> Result<u64> {
+        let snapshot = self.handle_snapshot(file)?;
+        let accepted = self.resize_dirty_inode(&snapshot.inode_id, length, kill_suidgid)?;
+        self.update_handle_write_progress(file, accepted)?;
+        Ok(accepted)
+    }
+
+    fn owner_sync(&self, file: FileHandle, mode: SyncMode) -> Result<(u64, String)> {
+        <Self as Backend>::fsync(self, &owner_request_context(), file, mode)?;
+        let snapshot = self.handle_snapshot(file)?;
+        let durable_write_seq = snapshot
+            .write_session
+            .as_ref()
+            .map_or(0, |session| session.local.last_synced_seq);
+        let file_version_id = self
+            .write_state(&snapshot.inode_id)?
+            .and_then(|state| {
+                state.lock().ok().and_then(|state| {
+                    state
+                        .base_version
+                        .as_ref()
+                        .map(|version| version.id.0.clone())
+                })
+            })
+            .unwrap_or_default();
+        Ok((durable_write_seq, file_version_id))
+    }
+
+    fn release_owner_handle(&self, file: FileHandle) -> Result<()> {
+        <Self as Backend>::release(self, &owner_request_context(), file)
+    }
+}
+
+impl DistributedFs {
+    pub fn reap_expired_peer_owner_handles(&self) -> Result<usize> {
+        self.owner_gateway.reap_expired_peer_owner_handles(self)
+    }
+}
+
+pub(super) fn validate_owner_open_seq(
+    request: &afs_protocol::node_control::DfsOwnerOpenRequest,
+) -> Result<u64> {
+    if request.open_seq == 0 {
+        return Err(stale("DFS owner open sequence is zero"));
+    }
+    Ok(request.open_seq)
+}
+
+/// The identity-only wire handle a caller releases to retire an open whose
+/// reply it never received; it has no opaque handle.
+pub(super) fn cleanup_handle_for_open_request(
+    caller_node_id: &str,
+    request: &afs_protocol::node_control::DfsOwnerOpenRequest,
+) -> Result<afs_protocol::node_control::DfsOwnerHandle> {
+    let open_seq = validate_owner_open_seq(request)?;
+    Ok(afs_protocol::node_control::DfsOwnerHandle {
+        namespace_id: request.namespace_id.clone(),
+        inode_id: request.inode_id.clone(),
+        owner_node_id: request.owner_node_id.clone(),
+        owner_session_id: request.owner_session_id.clone(),
+        lease_epoch: request.lease_epoch,
+        caller_node_id: caller_node_id.to_owned(),
+        caller_session_id: request.caller_session_id.clone(),
+        opaque_handle: Vec::new(),
+        open_seq,
+    })
+}
+
+pub(super) fn file_handle_from_owner(
+    handle: &afs_protocol::node_control::DfsOwnerHandle,
+) -> Result<FileHandle> {
+    let bytes: [u8; 8] = handle
+        .opaque_handle
+        .as_slice()
+        .try_into()
+        .map_err(|_| stale("DFS owner handle is malformed"))?;
+    Ok(FileHandle(u64::from_be_bytes(bytes)))
+}
+
+fn control_owner_handle(
+    handle: &afs_protocol::node_data::DfsOwnerHandle,
+) -> afs_protocol::node_control::DfsOwnerHandle {
+    afs_protocol::node_control::DfsOwnerHandle {
+        namespace_id: handle.namespace_id.clone(),
+        inode_id: handle.inode_id.clone(),
+        owner_node_id: handle.owner_node_id.clone(),
+        owner_session_id: handle.owner_session_id.clone(),
+        lease_epoch: handle.lease_epoch,
+        caller_node_id: handle.caller_node_id.clone(),
+        caller_session_id: handle.caller_session_id.clone(),
+        opaque_handle: handle.opaque_handle.clone(),
+        open_seq: handle.open_seq,
+    }
+}
+
+fn wire_attr(attr: FileAttributes) -> afs_protocol::node_control::DfsOwnerFileAttr {
+    let (kind, special_node) = match attr.kind {
+        FileKind::Regular => (1, None),
+        FileKind::Directory => (2, None),
+        FileKind::Symlink => (3, None),
+        FileKind::Special(kind) => {
+            let special = dfs_owner_special_node(kind);
+            (special.kind as u32, Some(special))
+        }
+    };
+    afs_protocol::node_control::DfsOwnerFileAttr {
+        size: attr.size,
+        mode: attr.mode,
+        uid: attr.uid,
+        gid: attr.gid,
+        nlink: attr.nlink,
+        atime_unix_ms: system_time_ms(attr.atime),
+        mtime_unix_ms: system_time_ms(attr.mtime),
+        ctime_unix_ms: system_time_ms(attr.ctime),
+        kind,
+        special_node,
     }
 }

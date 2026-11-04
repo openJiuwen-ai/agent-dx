@@ -12,7 +12,7 @@ fn owner_open_open_write_failure_clears_inflight_admission() {
         )
         .unwrap_err();
     assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE);
-    let routes = fs.owner_open_routes.lock().unwrap();
+    let routes = fs.owner_gateway.owner_open_routes.lock().unwrap();
     let state = routes.values().next().unwrap();
     assert_eq!(state.highwater, 1);
     assert!(state.inflight.is_empty());
@@ -64,7 +64,7 @@ fn owner_open_rejects_stale_request_epoch_after_fresh_write_authority_reacquire(
         .expect_err("stale remote owner open request must not succeed after Meta reacquires a newer lease epoch");
 
     assert_eq!(error.code(), afs_error::NODE_DFS_STALE_HANDLE);
-    let routes = fs.owner_open_routes.lock().unwrap();
+    let routes = fs.owner_gateway.owner_open_routes.lock().unwrap();
     let state = routes.values().next().unwrap();
     assert_eq!(state.highwater, 1);
     assert!(state.inflight.is_empty());
@@ -99,7 +99,7 @@ fn owner_open_rejects_epoch_changed_by_legacy_reacquire_after_resolver_reply() {
     assert_eq!(error.code(), afs_error::NODE_DFS_STALE_HANDLE);
     assert_eq!(meta.resolve_write_calls.load(Ordering::SeqCst), 1);
     assert_eq!(meta.open_write_calls.load(Ordering::SeqCst), 1);
-    let routes = fs.owner_open_routes.lock().unwrap();
+    let routes = fs.owner_gateway.owner_open_routes.lock().unwrap();
     let state = routes.values().next().unwrap();
     assert_eq!(state.highwater, 1);
     assert!(state.inflight.is_empty());
@@ -133,7 +133,7 @@ fn owner_open_validate_inode_failure_clears_inflight_admission() {
         )
         .unwrap_err();
     assert_eq!(error.code(), afs_error::NODE_VFS_INVALID);
-    let routes = fs.owner_open_routes.lock().unwrap();
+    let routes = fs.owner_gateway.owner_open_routes.lock().unwrap();
     let state = routes.values().next().unwrap();
     assert_eq!(state.highwater, 1);
     assert!(state.inflight.is_empty());
@@ -196,7 +196,7 @@ fn owner_open_cleanup_identity_cancels_late_open_without_allocation() {
     assert_eq!(late.code(), afs_error::NODE_DFS_STALE_HANDLE);
     assert!(fs.handles.is_empty());
 
-    let phantom = DistributedFs::data_owner_handle(&dfs_owner_cleanup_handle(2));
+    let phantom = data_owner_handle(&dfs_owner_cleanup_handle(2));
     let read = <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerFilesHandler>::read(
         &fs,
         "node-b",
@@ -237,7 +237,7 @@ fn owner_open_unknown_cleanup_advances_highwater_without_tombstone_growth() {
         )
         .unwrap();
     }
-    let routes = fs.owner_open_routes.lock().unwrap();
+    let routes = fs.owner_gateway.owner_open_routes.lock().unwrap();
     let state = routes.values().next().unwrap();
     assert_eq!(state.cancelled.len(), 0);
     assert_eq!(state.inflight.len(), 0);
@@ -262,7 +262,10 @@ fn owner_open_unknown_cleanup_advances_highwater_without_tombstone_growth() {
 fn owner_open_inflight_cleanup_wrong_scope_does_not_cancel() {
     let (_temp, _meta, fs) = test_fs();
     let request = dfs_owner_open_request(1, libc::O_RDWR);
-    let admission = fs.start_owner_open_admission("node-b", &request).unwrap();
+    let admission = fs
+        .owner_gateway
+        .start_owner_open_admission("node-b", &request)
+        .unwrap();
     assert!(matches!(
         admission,
         DfsOwnerOpenAdmissionStart::Apply { .. }
@@ -279,7 +282,7 @@ fn owner_open_inflight_cleanup_wrong_scope_does_not_cancel() {
         )
         .unwrap_err();
     assert_eq!(error.code(), afs_error::NODE_DFS_STALE_HANDLE);
-    let routes = fs.owner_open_routes.lock().unwrap();
+    let routes = fs.owner_gateway.owner_open_routes.lock().unwrap();
     let state = routes.values().next().unwrap();
     assert_eq!(state.cancelled.len(), 0);
     assert_eq!(state.inflight.len(), 1);
@@ -292,7 +295,7 @@ fn owner_open_inflight_cleanup_wrong_scope_does_not_cancel() {
         },
     )
     .unwrap();
-    let routes = fs.owner_open_routes.lock().unwrap();
+    let routes = fs.owner_gateway.owner_open_routes.lock().unwrap();
     let state = routes.values().next().unwrap();
     assert_eq!(state.cancelled.len(), 1);
 }
@@ -378,10 +381,16 @@ fn owner_open_replay_state_retires_with_authoritative_caller_session() {
         },
     )
     .unwrap();
-    assert_eq!(fs.owner_open_routes.lock().unwrap().len(), 1);
+    assert_eq!(fs.owner_gateway.owner_open_routes.lock().unwrap().len(), 1);
     meta.set_node_session("node-b", Some("session-b2"));
     assert_eq!(fs.reap_expired_peer_owner_handles().unwrap(), 0);
-    assert!(fs.owner_open_routes.lock().unwrap().is_empty());
+    assert!(
+        fs.owner_gateway
+            .owner_open_routes
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
     let stale =
         <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::release(
             &fs,
@@ -392,7 +401,13 @@ fn owner_open_replay_state_retires_with_authoritative_caller_session() {
         )
         .unwrap_err();
     assert_eq!(stale.code(), afs_error::NODE_DFS_STALE_HANDLE);
-    assert!(fs.owner_open_routes.lock().unwrap().is_empty());
+    assert!(
+        fs.owner_gateway
+            .owner_open_routes
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -408,22 +423,37 @@ fn remote_open_admission_lock_cleanup_keeps_reused_lock_with_users() {
         gate: Mutex::new(()),
         users: AtomicUsize::new(1),
     });
-    fs.remote_open_admission_locks
+    fs.write_coordinator
+        .channel
+        .remote_open_admission_locks
         .lock()
         .unwrap()
         .insert(route.clone(), lock.clone());
-    fs.cleanup_remote_open_admission_lock(&route, &lock)
+    fs.write_coordinator
+        .channel
+        .cleanup_remote_open_admission_lock(&route, &lock)
         .unwrap();
     assert!(
-        fs.remote_open_admission_locks
+        fs.write_coordinator
+            .channel
+            .remote_open_admission_locks
             .lock()
             .unwrap()
             .contains_key(&route)
     );
     lock.users.store(0, Ordering::Release);
-    fs.cleanup_remote_open_admission_lock(&route, &lock)
+    fs.write_coordinator
+        .channel
+        .cleanup_remote_open_admission_lock(&route, &lock)
         .unwrap();
-    assert!(fs.remote_open_admission_locks.lock().unwrap().is_empty());
+    assert!(
+        fs.write_coordinator
+            .channel
+            .remote_open_admission_locks
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -497,7 +527,14 @@ fn caller_serializes_same_route_open_admission_until_ack() {
     assert_eq!(requests.len(), 2);
     assert_eq!(requests[0].open_seq, 1);
     assert_eq!(requests[1].open_seq, 2);
-    assert!(fs_b.remote_open_admission_locks.lock().unwrap().is_empty());
+    assert!(
+        fs_b.write_coordinator
+            .channel
+            .remote_open_admission_locks
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -505,7 +542,8 @@ fn owner_open_finish_after_session_reaper_cleans_allocated_handle() {
     let (_temp, meta, fs_raw) = test_fs();
     let fs = Arc::new(fs_raw);
     let pause = Arc::new(OwnerOpenFinishPause::new());
-    fs.set_owner_open_finish_pause(Some(pause.clone()));
+    fs.owner_gateway
+        .set_owner_open_finish_pause(Some(pause.clone()));
     let fs_open = fs.clone();
     let open = std::thread::spawn(move || {
         <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler>::open(
@@ -523,8 +561,14 @@ fn owner_open_finish_after_session_reaper_cleans_allocated_handle() {
     let error = open.join().unwrap().unwrap_err();
     assert_eq!(error.code(), afs_error::NODE_DFS_STALE_HANDLE);
     assert!(fs.handles.is_empty());
-    assert!(fs.owner_open_routes.lock().unwrap().is_empty());
-    fs.set_owner_open_finish_pause(None);
+    assert!(
+        fs.owner_gateway
+            .owner_open_routes
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+    fs.owner_gateway.set_owner_open_finish_pause(None);
 }
 
 #[test]
@@ -670,7 +714,7 @@ fn old_owner_lease_data_ops_are_denied_but_release_cleans_resource() {
     let state = fs.write_state(&inode_id).unwrap().unwrap();
     state.lock().unwrap().write_lease.lease_epoch = 2;
     meta.lease.lock().unwrap().lease_epoch = 2;
-    let data_handle = DistributedFs::data_owner_handle(&handle);
+    let data_handle = data_owner_handle(&handle);
     let error = <DistributedFs as crate::node::vfs::dfs::owner_api::DfsOwnerFilesHandler>::write(
         &fs,
         "node-b",
@@ -875,7 +919,12 @@ fn writeonly_remote_provider_supports_fresh_readonly_reader() {
     assert!(fs_b.read(&context(), writer, 0, &mut data).is_err());
     fs_b.release(&context(), reader).unwrap();
     fs_b.release(&context(), writer).unwrap();
-    assert!(fs_b.current_remote_provider(&inode_id).unwrap().is_none());
+    assert!(
+        fs_b.write_coordinator
+            .current_remote_provider(&inode_id)
+            .unwrap()
+            .is_none()
+    );
     assert!(fs_a.handles.is_empty());
 }
 
@@ -949,7 +998,14 @@ fn remote_provider_retire_timeout_keeps_release_debt_until_io_guard_drops() {
     assert_eq!(scripted.release_call_count(), 0);
     assert_eq!(fs_b.pending_remote_release_count().unwrap(), 2);
     assert_eq!(fs_a.handles.len(), 2);
-    assert_eq!(fs_b.pending_remote_releases.lock().unwrap().reserved, 0);
+    assert_eq!(
+        fs_b.write_coordinator
+            .pending_remote_releases
+            .lock()
+            .unwrap()
+            .reserved,
+        0
+    );
 
     fs_b.retry_pending_remote_releases()
         .expect_err("maintenance must not release while provider IO is admitted");
@@ -962,7 +1018,14 @@ fn remote_provider_retire_timeout_keeps_release_debt_until_io_guard_drops() {
     assert_eq!(fs_b.retry_pending_remote_releases().unwrap(), 2);
     assert_eq!(scripted.release_call_count(), 2);
     assert_eq!(fs_b.pending_remote_release_count().unwrap(), 0);
-    assert_eq!(fs_b.pending_remote_releases.lock().unwrap().reserved, 0);
+    assert_eq!(
+        fs_b.write_coordinator
+            .pending_remote_releases
+            .lock()
+            .unwrap()
+            .reserved,
+        0
+    );
     assert!(fs_a.handles.is_empty());
 }
 
@@ -1045,7 +1108,12 @@ fn former_local_clean_state_does_not_shadow_remote_provider() {
     assert_eq!(&data, b"XYZ");
     fs_a.release(&context(), reader).unwrap();
     fs_a.release(&context(), writer).unwrap();
-    assert!(fs_a.current_remote_provider(&inode_id).unwrap().is_none());
+    assert!(
+        fs_a.write_coordinator
+            .current_remote_provider(&inode_id)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -1096,6 +1164,7 @@ fn temporary_remote_close_does_not_restore_released_previous_provider() {
     let inode_b = fs_b.backend_inode(&inode_id).unwrap();
     let handle = fs_b.open(&context(), inode_b, libc::O_RDWR).unwrap();
     let previous = fs_b
+        .write_coordinator
         .current_remote_provider(&inode_id)
         .unwrap()
         .expect("remote open installs provider");
@@ -1105,21 +1174,28 @@ fn temporary_remote_close_does_not_restore_released_previous_provider() {
         .open_remote_write_session(&record, &lease, libc::O_WRONLY, OpenOptions::default())
         .unwrap();
     let current = fs_b
+        .write_coordinator
         .current_remote_provider(&inode_id)
         .unwrap()
         .expect("temporary session becomes provider");
-    assert!(!DistributedFs::same_remote_provider(&current, &previous));
+    assert!(!same_remote_provider(&current, &previous));
 
     fs_b.release(&context(), handle).unwrap();
     let current = fs_b
+        .write_coordinator
         .current_remote_provider(&inode_id)
         .unwrap()
         .expect("ordinary release must not remove temporary provider");
-    assert!(!DistributedFs::same_remote_provider(&current, &previous));
+    assert!(!same_remote_provider(&current, &previous));
 
     fs_b.close_temporary_remote_write_session(&inode_id, &temp, Some(previous))
         .unwrap();
-    assert!(fs_b.current_remote_provider(&inode_id).unwrap().is_none());
+    assert!(
+        fs_b.write_coordinator
+            .current_remote_provider(&inode_id)
+            .unwrap()
+            .is_none()
+    );
 }
 
 fn dfs_owner_open_request(
@@ -1436,7 +1512,7 @@ fn remote_owner_append_retry_is_idempotent_and_dirty_read_is_visible() {
     )
     .unwrap();
     let handle = open.handle.expect("owner open returns handle");
-    let data_handle = DistributedFs::data_owner_handle(&handle);
+    let data_handle = data_owner_handle(&handle);
 
     let write = afs_protocol::node_data::DfsOwnerWriteRequest {
         handle: Some(data_handle.clone()),
@@ -1521,7 +1597,7 @@ fn r54_write(
     append: bool,
 ) -> afs_protocol::node_data::DfsOwnerWriteRequest {
     afs_protocol::node_data::DfsOwnerWriteRequest {
-        handle: Some(DistributedFs::data_owner_handle(handle)),
+        handle: Some(data_owner_handle(handle)),
         operation_id: operation_id.into(),
         offset,
         data: data.to_vec(),
@@ -1547,7 +1623,7 @@ fn r54_read_all(
         fs,
         "node-b",
         afs_protocol::node_data::DfsOwnerReadRequest {
-            handle: Some(DistributedFs::data_owner_handle(handle)),
+            handle: Some(data_owner_handle(handle)),
             offset: 0,
             length: 1 << 20,
         },
@@ -1585,9 +1661,9 @@ fn owner_operation_table_is_bounded_per_handle_and_never_rejects_long_runs() {
         replies.push(reply);
     }
     assert!(
-        fs.remote_operation_entry_count() <= 64,
+        fs.owner_gateway.remote_operation_entry_count() <= 64,
         "per-handle retention must stay bounded, got {}",
-        fs.remote_operation_entry_count()
+        fs.owner_gateway.remote_operation_entry_count()
     );
     let last = total - 1;
     let retry = r54_send(
@@ -1629,9 +1705,9 @@ fn owner_release_clears_handle_operation_results() {
         )
         .unwrap();
     }
-    assert_eq!(fs.remote_operation_entry_count(), 3);
+    assert_eq!(fs.owner_gateway.remote_operation_entry_count(), 3);
     r54_release(&fs, handle);
-    assert_eq!(fs.remote_operation_entry_count(), 0);
+    assert_eq!(fs.owner_gateway.remote_operation_entry_count(), 0);
 }
 
 /// R54: the cleanup-identity release (caller lost the open reply and retires
@@ -1641,10 +1717,10 @@ fn owner_cleanup_release_clears_handle_operation_results() {
     let (_temp, _meta, fs) = test_fs();
     let handle = r54_open(&fs, 1, libc::O_RDWR);
     r54_send(&fs, r54_write(&handle, "op-1", 0, b"x", false)).unwrap();
-    assert_eq!(fs.remote_operation_entry_count(), 1);
+    assert_eq!(fs.owner_gateway.remote_operation_entry_count(), 1);
     r54_release(&fs, dfs_owner_cleanup_handle(1));
     assert!(fs.handles.is_empty());
-    assert_eq!(fs.remote_operation_entry_count(), 0);
+    assert_eq!(fs.owner_gateway.remote_operation_entry_count(), 0);
 }
 
 /// R54: reaping the handles of a replaced caller session drops their results.
@@ -1653,11 +1729,11 @@ fn owner_session_reap_clears_handle_operation_results() {
     let (_temp, meta, fs) = test_fs();
     let handle = r54_open(&fs, 1, libc::O_RDWR);
     r54_send(&fs, r54_write(&handle, "op-1", 0, b"x", false)).unwrap();
-    assert_eq!(fs.remote_operation_entry_count(), 1);
+    assert_eq!(fs.owner_gateway.remote_operation_entry_count(), 1);
     meta.set_node_session("node-b", Some("session-b2"));
     assert_eq!(fs.reap_expired_peer_owner_handles().unwrap(), 1);
     assert!(fs.handles.is_empty());
-    assert_eq!(fs.remote_operation_entry_count(), 0);
+    assert_eq!(fs.owner_gateway.remote_operation_entry_count(), 0);
 }
 
 /// R54: a duplicate of an operation that is still being applied is told to
@@ -1670,7 +1746,8 @@ fn owner_concurrent_duplicate_operation_is_retryable_and_applied_once() {
     let handle = r54_open(&fs, 1, libc::O_RDWR | libc::O_APPEND);
     let pause = Arc::new(OwnerOpenFinishPause::new());
     let hook_pause = pause.clone();
-    fs.set_remote_operation_before_apply(Box::new(move || hook_pause.pause()));
+    fs.owner_gateway
+        .set_remote_operation_before_apply(Box::new(move || hook_pause.pause()));
     let first = {
         let fs = fs.clone();
         let request = r54_write(&handle, "op-dup", 0, b"ab", true);
@@ -1710,7 +1787,7 @@ fn owner_operation_global_cap_rejects_before_applying() {
         }
     }
     assert_eq!(
-        fs.remote_operation_entry_count(),
+        fs.owner_gateway.remote_operation_entry_count(),
         MAX_REMOTE_OPERATION_RESULTS
     );
     let extra = handles.last().unwrap().clone();
@@ -1723,13 +1800,13 @@ fn owner_operation_global_cap_rejects_before_applying() {
         "rejected write must not apply"
     );
     assert_eq!(
-        fs.remote_operation_entry_count(),
+        fs.owner_gateway.remote_operation_entry_count(),
         MAX_REMOTE_OPERATION_RESULTS
     );
 
     r54_send(&fs, r54_write(&handles[0], "h0-op-extra", 1, b"y", false)).unwrap();
     assert_eq!(
-        fs.remote_operation_entry_count(),
+        fs.owner_gateway.remote_operation_entry_count(),
         MAX_REMOTE_OPERATION_RESULTS
     );
 
@@ -1740,5 +1817,5 @@ fn owner_operation_global_cap_rejects_before_applying() {
     for handle in handles {
         r54_release(&fs, handle);
     }
-    assert_eq!(fs.remote_operation_entry_count(), 0);
+    assert_eq!(fs.owner_gateway.remote_operation_entry_count(), 0);
 }

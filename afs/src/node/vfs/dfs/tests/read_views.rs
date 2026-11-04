@@ -917,7 +917,10 @@ fn p1_handle_registration_racing_local_or_proxy_install_preserves_dirty_visibili
         let mut published = false;
         while Instant::now() < deadline {
             published = if remote {
-                fs.current_remote_provider(&inode_id).unwrap().is_some()
+                fs.write_coordinator
+                    .current_remote_provider(&inode_id)
+                    .unwrap()
+                    .is_some()
             } else {
                 fs.write_state(&inode_id).unwrap().is_some()
             };

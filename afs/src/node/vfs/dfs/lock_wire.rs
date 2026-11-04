@@ -157,28 +157,4 @@ impl DistributedFs {
             }
         }
     }
-
-    pub(super) fn wire_attr(attr: FileAttributes) -> afs_protocol::node_control::DfsOwnerFileAttr {
-        let (kind, special_node) = match attr.kind {
-            FileKind::Regular => (1, None),
-            FileKind::Directory => (2, None),
-            FileKind::Symlink => (3, None),
-            FileKind::Special(kind) => {
-                let special = dfs_owner_special_node(kind);
-                (special.kind as u32, Some(special))
-            }
-        };
-        afs_protocol::node_control::DfsOwnerFileAttr {
-            size: attr.size,
-            mode: attr.mode,
-            uid: attr.uid,
-            gid: attr.gid,
-            nlink: attr.nlink,
-            atime_unix_ms: system_time_ms(attr.atime),
-            mtime_unix_ms: system_time_ms(attr.mtime),
-            ctime_unix_ms: system_time_ms(attr.ctime),
-            kind,
-            special_node,
-        }
-    }
 }

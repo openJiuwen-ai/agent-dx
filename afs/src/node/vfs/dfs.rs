@@ -46,6 +46,7 @@ mod native_pipeline;
 mod native_write;
 pub mod owner_api;
 mod owner_gateway;
+mod owner_op_table;
 mod read_view;
 mod remote_client;
 mod sharded;
@@ -70,6 +71,7 @@ pub use meta_port::{DfsMeta, DfsNodeLocation, DfsRemoteOwnerFactory};
 pub(crate) use native_pipeline::NativeWriteConfig;
 use native_pipeline::*;
 use owner_gateway::*;
+use owner_op_table::*;
 use remote_client::*;
 use sharded::*;
 #[cfg(test)]
@@ -146,17 +148,11 @@ pub struct DistributedFs {
     meta: Arc<dyn DfsMeta>,
     chunk_store: Arc<dyn ChunkStore>,
     read_engine: Arc<DfsReadEngine>,
-    remote_owner_factory: Option<Arc<dyn DfsRemoteOwnerFactory>>,
     handles: DfsHandleTable,
-    remote_inode_providers: ShardedMap<InodeId, RemoteDfsWriteSession>,
-    pending_remote_releases: Mutex<PendingRemoteReleaseState>,
-    owner_open_routes: Mutex<HashMap<DfsOwnerOpenRouteKey, DfsOwnerOpenRouteState>>,
-    remote_open_admission_locks:
-        Mutex<HashMap<DfsOwnerOpenRouteKey, Arc<DfsRemoteOpenAdmissionLock>>>,
-    owner_handle_reap_cursor: AtomicU64,
-    /// Owner-side replay table for proxied write/resize/sync (R54).
-    remote_operation_results: Mutex<OwnerOperationTable>,
-    next_owner_open_seq: AtomicU64,
+    /// Serves proxied RPCs for inodes this node session owns.
+    owner_gateway: OwnerGateway,
+    /// Proxies writes for inodes another node session owns.
+    write_coordinator: WriteCoordinator,
 }
 
 const DFS_HANDLE_SHARDS: usize = 64;
@@ -190,8 +186,11 @@ impl DistributedFs {
         let pending_trace = PendingTrace::from_env(&namespace_id.0, &node_id, &session_id);
         #[cfg(test)]
         let pending_trace = None;
+        let identity = Arc::new(NodeIdentity::new(namespace_id, node_id, session_id));
         Self {
-            identity: Arc::new(NodeIdentity::new(namespace_id, node_id, session_id)),
+            owner_gateway: OwnerGateway::new(identity.clone(), meta.clone()),
+            write_coordinator: WriteCoordinator::new(identity.clone(), meta.clone()),
+            identity,
             inode_map: InodeMap::default(),
             versions: VersionCache::default(),
             gc: GcCoordinator::default(),
@@ -204,15 +203,7 @@ impl DistributedFs {
             meta,
             chunk_store,
             read_engine,
-            remote_owner_factory: None,
             handles: DfsHandleTable::default(),
-            remote_inode_providers: ShardedMap::default(),
-            pending_remote_releases: Mutex::new(PendingRemoteReleaseState::default()),
-            owner_open_routes: Mutex::new(HashMap::new()),
-            remote_open_admission_locks: Mutex::new(HashMap::new()),
-            owner_handle_reap_cursor: AtomicU64::new(0),
-            remote_operation_results: Mutex::new(OwnerOperationTable::default()),
-            next_owner_open_seq: AtomicU64::new(1),
         }
     }
 
@@ -270,7 +261,7 @@ impl DistributedFs {
     }
 
     pub fn with_remote_owner_factory(mut self, factory: Arc<dyn DfsRemoteOwnerFactory>) -> Self {
-        self.remote_owner_factory = Some(factory);
+        self.write_coordinator.channel.remote_owner_factory = Some(factory);
         self
     }
 }

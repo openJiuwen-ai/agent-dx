@@ -254,21 +254,10 @@ impl DistributedFs {
         &self,
         inode_id: &InodeId,
     ) -> Result<Option<RemoteDfsProviderIo>> {
-        if self.local_write_state_protects_remote_provider(inode_id)? {
-            return Ok(None);
-        }
-        for _ in 0..2 {
-            let Some(remote) = self.current_remote_provider(inode_id)? else {
-                return Ok(None);
-            };
-            if let Some(guard) = remote.lifecycle.begin_io()? {
-                return Ok(Some(RemoteDfsProviderIo {
-                    remote,
-                    _guard: guard,
-                }));
-            }
-        }
-        Ok(None)
+        self.write_coordinator.remote_provider_visible_for_reads(
+            inode_id,
+            self.local_write_state_protects_remote_provider(inode_id)?,
+        )
     }
 
     pub(super) fn write_state_should_reacquire_clean_lease(

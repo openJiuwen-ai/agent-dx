@@ -271,7 +271,10 @@ impl DistributedFs {
         let active = self.local_write_activity(&inode_id)?;
         self.handles.insert(id, handle, || {
             let dynamic = (active && self.write_state(&inode_id)?.is_some())
-                || self.current_remote_provider(&inode_id)?.is_some();
+                || self
+                    .write_coordinator
+                    .current_remote_provider(&inode_id)?
+                    .is_some();
             #[cfg(test)]
             {
                 let hook = self

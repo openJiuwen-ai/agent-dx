@@ -400,7 +400,7 @@ impl DistributedFs {
         let remote = &provider.remote;
         let handle = remote.read_handle.as_ref().unwrap_or(&remote.handle);
         let request = afs_protocol::node_data::DfsOwnerReadRequest {
-            handle: Some(Self::data_owner_handle(handle)),
+            handle: Some(data_owner_handle(handle)),
             offset,
             length: length as u64,
         };

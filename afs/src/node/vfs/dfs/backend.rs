@@ -144,9 +144,12 @@ impl Backend for DistributedFs {
                 return Ok(attributes(opened, size, blocks));
             }
             if let Some(remote) = self.remote_provider_visible_for_reads(&snapshot.inode_id)? {
-                return self.remote_getattr(&remote).inspect_err(|error| {
-                    self.invalidate_native_inode_views_on_error(&snapshot.inode_id, error);
-                });
+                return self
+                    .write_coordinator
+                    .remote_getattr(&remote)
+                    .inspect_err(|error| {
+                        self.invalidate_native_inode_views_on_error(&snapshot.inode_id, error);
+                    });
             }
             let observed = self
                 .meta
@@ -163,9 +166,12 @@ impl Backend for DistributedFs {
         }
         let inode_id = self.inode_id(inode)?;
         if let Some(remote) = self.remote_provider_visible_for_reads(&inode_id)? {
-            return self.remote_getattr(&remote).inspect_err(|error| {
-                self.invalidate_native_inode_views_on_error(&inode_id, error);
-            });
+            return self
+                .write_coordinator
+                .remote_getattr(&remote)
+                .inspect_err(|error| {
+                    self.invalidate_native_inode_views_on_error(&inode_id, error);
+                });
         }
         let observed = self.meta.get_inode(&inode_id).inspect_err(|error| {
             self.invalidate_native_inode_views_on_error(&inode_id, error);
@@ -303,7 +309,8 @@ impl Backend for DistributedFs {
                 return Err(Error::from(std::io::Error::from_raw_os_error(libc::EISDIR)));
             }
             let accepted_seq = if session.remote.is_some() {
-                self.remote_resize(session, length, options)?
+                self.write_coordinator
+                    .remote_resize(session, length, options)?
             } else {
                 self.resize_dirty_inode(&snapshot.inode_id, length, options.kill_suidgid)?
             };
@@ -323,7 +330,9 @@ impl Backend for DistributedFs {
                 self.install_write_state(record.clone(), write_lease)?;
                 self.resize_dirty_inode(&record.inode_id, length, options.kill_suidgid)?;
             } else {
-                let previous_provider = self.current_remote_provider(&record.inode_id)?;
+                let previous_provider = self
+                    .write_coordinator
+                    .current_remote_provider(&record.inode_id)?;
                 let mut session = self.open_remote_write_session(
                     &record,
                     &write_lease,
@@ -332,7 +341,10 @@ impl Backend for DistributedFs {
                         kill_suidgid: options.kill_suidgid,
                     },
                 )?;
-                match self.remote_resize(&session, length, options) {
+                match self
+                    .write_coordinator
+                    .remote_resize(&session, length, options)
+                {
                     Ok(accepted_seq) => {
                         session.local.last_accepted_seq = accepted_seq;
                     }
@@ -345,7 +357,7 @@ impl Backend for DistributedFs {
                         return Err(error);
                     }
                 }
-                if let Err(error) = self.remote_sync(&session, SyncMode::Full) {
+                if let Err(error) = self.write_coordinator.remote_sync(&session, SyncMode::Full) {
                     let _ = self.close_temporary_remote_write_session(
                         &record.inode_id,
                         &session,
@@ -521,11 +533,13 @@ impl Backend for DistributedFs {
                 }
                 session
             } else {
-                let previous_provider = self.current_remote_provider(&inode.inode_id)?;
+                let previous_provider = self
+                    .write_coordinator
+                    .current_remote_provider(&inode.inode_id)?;
                 let session =
                     self.open_remote_write_session(&inode, &write_lease, flags, options)?;
                 if flags & libc::O_TRUNC != 0
-                    && let Err(error) = self.remote_resize(
+                    && let Err(error) = self.write_coordinator.remote_resize(
                         &session,
                         0,
                         SetAttrOptions {
@@ -557,7 +571,10 @@ impl Backend for DistributedFs {
         let committed_read_only = !writable
             && opened_inode.kind == InodeKind::Regular
             && !self.local_write_activity(&inode_id)?
-            && self.current_remote_provider(&inode_id)?.is_none();
+            && self
+                .write_coordinator
+                .current_remote_provider(&inode_id)?
+                .is_none();
         let opened_page_identity = if committed_read_only {
             // The first version/layout cache miss costs one Meta RPC, outside
             // all handle locks. Authority still starts before the inode RPC.
@@ -599,7 +616,7 @@ impl Backend for DistributedFs {
             return Ok(result.len());
         }
         if let Some(remote) = self.remote_provider_visible_for_reads(&snapshot.inode_id)? {
-            return self.remote_read(&remote, offset, out);
+            return self.write_coordinator.remote_read(&remote, offset, out);
         }
         self.read_visible_from_handle_inode(
             &snapshot.inode_id,
@@ -743,12 +760,19 @@ impl Backend for DistributedFs {
             return Err(invalid("writable DFS handle has no write session"));
         };
         if write_session.remote.is_some() {
-            let written =
-                self.remote_write(write_session, snapshot.flags, offset, data, options)?;
+            let written = self.write_coordinator.remote_write(
+                write_session,
+                snapshot.flags,
+                offset,
+                data,
+                options,
+            )?;
             if snapshot.flags & libc::O_SYNC == libc::O_SYNC {
-                self.remote_sync(write_session, SyncMode::Full)?;
+                self.write_coordinator
+                    .remote_sync(write_session, SyncMode::Full)?;
             } else if has_o_dsync(snapshot.flags) {
-                self.remote_sync(write_session, SyncMode::DataOnly)?;
+                self.write_coordinator
+                    .remote_sync(write_session, SyncMode::DataOnly)?;
             }
             self.update_handle_write_progress(handle, written.1)?;
             return Ok(written.0);
@@ -935,7 +959,9 @@ impl Backend for DistributedFs {
         let snapshot = self.handle_snapshot(handle)?;
         if let Some(session) = snapshot.write_session.as_ref() {
             if session.remote.is_some() {
-                self.remote_sync(session, SyncMode::DataOnly).map(|_| ())
+                self.write_coordinator
+                    .remote_sync(session, SyncMode::DataOnly)
+                    .map(|_| ())
             } else {
                 self.sync_handle(handle, CommitReason::CLOSE, CommitWait::AfterOperations)
             }
@@ -949,7 +975,9 @@ impl Backend for DistributedFs {
         if let Some(session) = snapshot.write_session.as_ref()
             && session.remote.is_some()
         {
-            self.remote_sync(session, mode).map(|_| ())
+            self.write_coordinator
+                .remote_sync(session, mode)
+                .map(|_| ())
         } else {
             self.sync_handle(
                 handle,

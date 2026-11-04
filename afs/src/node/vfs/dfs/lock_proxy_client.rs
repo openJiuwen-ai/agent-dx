@@ -60,7 +60,7 @@ impl DistributedFs {
         lease: &WriteLease,
     ) -> Result<DfsRemoteLockAuthority> {
         self.reclaim_idle_remote_lock_authorities()?;
-        let owner = self.remote_owner(lease)?;
+        let owner = self.write_coordinator.channel.remote_owner(lease)?;
         let remote = DfsRemoteLockAuthority {
             owner,
             authority: self.lock_authority_wire(inode_id, lease),
