@@ -317,9 +317,13 @@ async fn embedded_registration_automatically_reconciles_aliases() {
         }
     }))
     .unwrap();
-    let api = AgentApi::new_embedded(config, backend.clone())
-        .await
-        .unwrap();
+    let api = AgentApi::new_embedded(
+        config,
+        backend.clone(),
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+    .await
+    .unwrap();
     let members = registry.members().await.unwrap();
     assert_eq!(members.len(), 1);
     assert_eq!(members[0].endpoint.id, "embedded-default");

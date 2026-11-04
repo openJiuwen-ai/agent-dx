@@ -2,10 +2,10 @@
 use crate::{
     image_resolution::ImageResolver,
     reconciliation::{ReconcileSettings, Reconciliation},
-    registration::RegistrationConfig,
+    registration::{ConditionSource, RegistrationConfig},
     Activator, CacheSettings, Result,
 };
-use adx_agent_core::{discovery::MemberCondition, environment::Environment, limits, network::PlatformEgress};
+use adx_agent_core::{environment::Environment, limits, network::PlatformEgress};
 use adx_agent_store::{discovery::RedisRegistry, AgentState, RedisRepository};
 use serde::Deserialize;
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -57,19 +57,24 @@ impl ActivatorConfig {
     }
 
     /// Starts reconciliation after any transport listener is bound. Propagates
-    /// membership, Redis notification and registration errors.
+    /// membership, Redis notification and registration errors. The member
+    /// lease reports the `condition` supplied by the embedding process.
     pub async fn start_reconciliation(
         self,
         activator: Arc<Activator>,
         store: RedisRepository,
+        condition: ConditionSource,
     ) -> Result<Option<Reconciliation>> {
         let Some(registration) = self.registration else {
             return Ok(None);
         };
         let registry = RedisRegistry::new(&self.redis_url, &self.namespace, REDIS_TIMEOUT)?;
         // The embedded Activator shares the API Server process and is only
-        // reached in-process: the lease may advertise the plaintext endpoint
-        // and the member stays selectable for its whole lifetime.
+        // reached in-process, so the lease may advertise the plaintext
+        // endpoint. Its condition follows the host's draining flag: once the
+        // host begins shutdown, the next lease renewal reports draining and
+        // Gateway-side selection stops routing here within one heartbeat,
+        // instead of keeping the member selectable until lease expiry.
         let worker = Reconciliation::start(
             activator,
             store,
@@ -77,7 +82,7 @@ impl ActivatorConfig {
             registration,
             ReconcileSettings::default(),
             true,
-            Arc::new(MemberCondition::default),
+            condition,
         )
         .await?;
         Ok(Some(worker))

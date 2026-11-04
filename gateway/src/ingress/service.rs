@@ -17,6 +17,7 @@ use tokio_rustls::TlsAcceptor;
 type EnvironmentOverride = Option<(
     Arc<dyn adx_agent_core::environment::Environment>,
     Arc<dyn super::environment_files::EnvironmentDirectory>,
+    Arc<std::sync::atomic::AtomicBool>,
 )>;
 #[cfg(not(feature = "agent-api"))]
 type EnvironmentOverride = ();
@@ -49,14 +50,17 @@ impl IngressService {
     }
 
     /// Use the embedding API Server's Environment application service for Agent lifecycle calls.
+    /// `draining` is the host's shutdown flag, threaded to the embedded
+    /// Activator's member condition (see `AgentApi::new_embedded`).
     #[cfg(feature = "agent-api")]
     pub async fn bind_with_environment_service(
         config: IngressConfig,
         control: ControlConfig,
         service: Arc<dyn adx_agent_core::environment::Environment>,
         directory: Arc<dyn super::environment_files::EnvironmentDirectory>,
+        draining: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, ServiceError> {
-        Self::bind_inner(config, control, Some((service, directory))).await
+        Self::bind_inner(config, control, Some((service, directory, draining))).await
     }
 
     async fn bind_inner(
@@ -106,7 +110,7 @@ impl IngressService {
             if settings.port != config.default_direct_port {
                 return Err("Environment file port must match Ingress direct port".into());
             }
-            Some(settings.build(injected.as_ref().map(|(_, directory)| directory.clone()))?)
+            Some(settings.build(injected.as_ref().map(|(_, directory, _)| directory.clone()))?)
         } else {
             None
         };
@@ -116,15 +120,13 @@ impl IngressService {
             let settings: AgentConfig = serde_json::from_slice(&std::fs::read(path)?)
                 .map_err(|_| "invalid Agent configuration")?;
             let api = if settings.embedded.is_some() {
-                AgentApi::new_embedded(
-                    settings,
-                    injected
-                        .as_ref()
-                        .map(|(service, _)| service.clone())
-                        .ok_or("embedded Activator requires a Environment service")?,
-                )
-                .await
-                .map_err(send_error)?
+                let (service, draining) = injected
+                    .as_ref()
+                    .map(|(service, _, draining)| (service.clone(), draining.clone()))
+                    .ok_or("embedded Activator requires a Environment service")?;
+                AgentApi::new_embedded(settings, service, draining)
+                    .await
+                    .map_err(send_error)?
             } else {
                 AgentApi::new(settings).map_err(send_error)?
             };
@@ -229,6 +231,16 @@ impl IngressService {
             store,
             route_changes,
         })
+    }
+
+    /// Narrow readiness view of the bound (not yet served) Ingress, for
+    /// hosts that must fold the Ingress's admission state into their own
+    /// probe — e.g. the API Server embedding the Ingress reports
+    /// `/readyz = directory sync && embedded Ingress readiness`.
+    pub fn readiness(&self) -> IngressReadiness {
+        IngressReadiness {
+            gateway: self.gateway.clone(),
+        }
     }
 
     pub async fn serve(
@@ -346,6 +358,21 @@ fn load_tls_acceptor(cert_path: &str, key_path: &str) -> Result<TlsAcceptor, Ser
         None,
         vec![b"h2".to_vec(), b"http/1.1".to_vec()],
     )
+}
+
+/// Readiness handle to a bound Ingress service, valid before and after
+/// `serve` consumes the service (the handle clones the gateway Arc).
+#[derive(Clone)]
+pub struct IngressReadiness {
+    gateway: Arc<Ingress>,
+}
+
+impl IngressReadiness {
+    /// The Ingress's own admission readiness: route store synchronized and
+    /// not draining.
+    pub fn ready(&self) -> bool {
+        self.gateway.ready()
+    }
 }
 
 fn send_error(error: Box<dyn std::error::Error>) -> ServiceError {
