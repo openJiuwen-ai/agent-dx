@@ -5,7 +5,7 @@ use crate::{
     registration::RegistrationConfig,
     Activator, CacheSettings, Result,
 };
-use adx_agent_core::{environment::Environment, limits, network::PlatformEgress};
+use adx_agent_core::{discovery::MemberCondition, environment::Environment, limits, network::PlatformEgress};
 use adx_agent_store::{discovery::RedisRegistry, AgentState, RedisRepository};
 use serde::Deserialize;
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -67,12 +67,17 @@ impl ActivatorConfig {
             return Ok(None);
         };
         let registry = RedisRegistry::new(&self.redis_url, &self.namespace, REDIS_TIMEOUT)?;
+        // The embedded Activator shares the API Server process and is only
+        // reached in-process: the lease may advertise the plaintext endpoint
+        // and the member stays selectable for its whole lifetime.
         let worker = Reconciliation::start(
             activator,
             store,
             registry,
             registration,
             ReconcileSettings::default(),
+            true,
+            Arc::new(MemberCondition::default),
         )
         .await?;
         Ok(Some(worker))

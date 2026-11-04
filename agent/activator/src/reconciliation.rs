@@ -1,6 +1,6 @@
 //! Event-driven alias convergence. Membership refresh is periodic; Binding scans are not.
 use crate::{
-    registration::{RegistrationConfig, RegistrationLease},
+    registration::{ConditionSource, RegistrationConfig, RegistrationLease},
     Activator, Error, Result,
 };
 use adx_agent_core::{
@@ -61,18 +61,46 @@ impl Drop for Reconciliation {
 impl Reconciliation {
     /// Validates notifications and membership before returning. Registration uses the same
     /// registry as request affinity. All restarts subscribe first, then scan durable state.
+    /// The member lease reports the condition supplied by the process main.
     pub async fn start(
         activator: Arc<Activator>,
         store: RedisRepository,
         registry: RedisRegistry,
         registration: RegistrationConfig,
         settings: ReconcileSettings,
+        allow_plaintext: bool,
+        condition: ConditionSource,
     ) -> Result<Self> {
         settings.validate()?;
         let changes = store.subscribe_changes().await?;
         let id = registration.instance_id.clone();
-        let lease = RegistrationLease::start(registry.clone(), registration, true).await?;
-        let members = registry.members().await?;
+        let lease =
+            RegistrationLease::start(registry.clone(), registration, allow_plaintext, condition)
+                .await?;
+        let members: Vec<ActivatorEndpoint> = match registry.members().await {
+            Ok(members) => members
+                .into_iter()
+                .filter(|member| member.condition.selectable())
+                .map(|member| member.endpoint)
+                .collect(),
+            Err(error) => {
+                // A start that already wrote its lease must remove that
+                // incarnation before the caller retries: the retry builds a
+                // fresh incarnation, and colliding with this unexpired lease
+                // is reported as Conflict, which callers treat as fatal.
+                // Best effort — if Redis stays unavailable the lease expires
+                // on its own and the retry keeps the old behavior.
+                if let Err(unregister) = lease.shutdown(Duration::from_secs(1)).await {
+                    tracing::warn!(
+                        %unregister,
+                        "Activator lease cleanup after failed start; lease will expire"
+                    );
+                }
+                // `members()` reports the store's error type; convert as the
+                // `?` this block replaced did.
+                return Err(Error::from(error));
+            }
+        };
         activator.subscription_ready.store(false, Ordering::Release);
         let task = tokio::spawn(async move {
             let mut changes = Some(changes);
@@ -111,13 +139,13 @@ impl Reconciliation {
             registration: Some(lease),
         })
     }
-    pub async fn shutdown(mut self) -> Result<()> {
+    pub async fn shutdown(mut self, budget: Duration) -> Result<()> {
         if let Some(task) = self.task.take() {
             task.abort();
             let _ = task.await;
         }
         if let Some(registration) = self.registration.take() {
-            registration.shutdown().await?;
+            registration.shutdown(budget).await?;
         }
         Ok(())
     }
@@ -198,8 +226,13 @@ async fn run(
             },
             _=refresh.tick()=>match registry.members().await {
                 Ok(mut snapshot)=>{
-                    snapshot.sort_by(|a,b|a.id.cmp(&b.id));
-                    if snapshot!=*members {
+                    snapshot.retain(|member| member.condition.selectable());
+                    let mut snapshot: Vec<_> = snapshot
+                        .into_iter()
+                        .map(|member| member.endpoint)
+                        .collect();
+                    snapshot.sort_by(|a, b| a.id.cmp(&b.id));
+                    if snapshot != *members {
                         *members=snapshot;
                         pending.retain(|scope,_|owns(scope,id,members));
                         activator.invalidate_all().await;
@@ -245,6 +278,10 @@ async fn run(
             let worker = activator.clone();
             let timeout = Duration::from_secs(settings.request_timeout_seconds);
             jobs.spawn(async move {
+                // Count the job for the embedded host's shutdown criterion:
+                // it creates Environments and commits bindings in the
+                // Activator's own task, outside any connection session.
+                let _operation = crate::OperationScope::new();
                 let deadline = adx_agent_core::transport::capped_deadline(None, timeout);
                 let result =
                     match tokio::time::timeout(timeout, worker.reconcile_binding(&scope, deadline))

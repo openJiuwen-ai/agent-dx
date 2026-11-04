@@ -1,7 +1,7 @@
 use adx_agent_api::{activator::ActivatorClient, request::RequestContext, Error};
 use adx_agent_core::{
     activator::Target,
-    discovery::{ranked_endpoints, ActivatorEndpoint},
+    discovery::{ranked_endpoints, ActivatorEndpoint, MemberCondition},
     AgentBinding, BindingPhase, Scope,
 };
 use axum::{extract::State, Json};
@@ -81,6 +81,11 @@ async fn all_env_operations_and_bypass_use_same_instance_across_gateways() {
         true,
     )
     .unwrap();
+    // A static endpoint list has no discovery step to wait for: the client
+    // is ready for admission as soon as it is constructed. Discovery-based
+    // clients stay not-ready until the first successful membership read.
+    use adx_agent_api::activator::Control as _;
+    assert!(client.ready());
     let other = ActivatorClient::new(
         vec![b.url, a.url],
         TOKEN.into(),
@@ -179,7 +184,7 @@ async fn discovery_updates_routes_retains_snapshot_on_error_and_accepts_empty_sn
     let (a, ta, _) = server("a").await;
     let (b, tb, _) = server("b").await;
     registry
-        .renew(&a, "a", Duration::from_secs(60))
+        .renew(&a, "a", Duration::from_secs(60), MemberCondition::default())
         .await
         .unwrap();
     let client = ActivatorClient::with_discovery(
@@ -217,12 +222,15 @@ async fn discovery_updates_routes_retains_snapshot_on_error_and_accepts_empty_sn
     }
     wait_for(&client, &selected, Some("a")).await;
     registry
-        .renew(&b, "b", Duration::from_secs(60))
+        .renew(&b, "b", Duration::from_secs(60), MemberCondition::default())
         .await
         .unwrap();
     wait_for(&client, &selected, Some("b")).await;
     registry.unregister("b", "b").await.unwrap();
     wait_for(&client, &selected, Some("a")).await;
+    // Admission readiness latched with the first successful membership read.
+    use adx_agent_api::activator::Control as _;
+    assert!(client.ready());
     // Corrupt only this test's lease index to make refresh fail; cached routing must survive.
     let mut admin = redis::Client::open(url)
         .unwrap()
@@ -237,6 +245,9 @@ async fn discovery_updates_routes_retains_snapshot_on_error_and_accepts_empty_sn
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(1500)).await;
+    // Refresh failures retain the last membership AND must not un-ready the
+    // Gateway: readiness is an initialization latch, not a health probe.
+    assert!(client.ready());
     assert_eq!(
         client
             .activate(&context(), &selected, None)
