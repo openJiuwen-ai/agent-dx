@@ -27,6 +27,34 @@ sudo adxctl config init
 
 将 Relay 的 `ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS` 改为 sandboxd 实际实例网络；示例 `10.88.0.0/16` 是部署输入，不是后端网络探测结果。
 
+### 使用随包的 sandboxd
+
+构建时设置 `ADX_WITH_SANDBOXD=1`。x86_64 和 ARM64 都使用 Buildkite 的
+`build/e2e/download_backend.py` 校验并下载同一锁定版本的 OBS 后端包。
+部署时执行上面的 `install.sh`，它会一并验证和安装 `runtime/sandboxd/` 下的后端文件。
+
+在采用 runc 的节点上，使用随包的 systemd unit 和配置示例。以下命令适用于默认安装路径
+`/opt/adx` 的新节点。主机需要 systemd、iptables、iproute2、可写的 cgroup 和可用的
+overlayfs。x86_64 后端需要 glibc 2.34 或更高版本。若部署使用 Nydus 或 OSS 镜像，
+还需按 sandboxd 配置准备 distill_fs 及对应模板。
+
+```sh
+sudo install -d -m 0755 /etc/adx
+sudo install -m 0600 /opt/adx/current/etc/examples/sandboxd/sandboxd.toml /etc/adx/sandboxd.toml
+sudoedit /etc/adx/sandboxd.toml
+sudo install -m 0644 /opt/adx/current/etc/examples/sandboxd/adx-sandboxd.service /etc/systemd/system/adx-sandboxd.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now adx-sandboxd.service
+sudo /opt/adx/current/runtime/sandboxd/sbox -a /run/sandboxd/sandboxd.sock check
+```
+
+在启动前确认配置中的 IP 地址池与主机路由及其他运行时不冲突，并将 ADX Relay 的目标
+CIDR 与之对齐。私有 OCI 镜像的认证文件由部署方提供，配置中的默认位置是
+`/etc/adx/sandboxd-registry-auths.json`。unit 以 root 运行，默认 socket 仅供本机 root
+访问。已运行 sandboxd 的节点应沿用其原有配置和 socket，升级前先按现有流程排空节点。
+自定义 ADX 安装路径时需相应调整 unit 和配置中的二进制路径。sandboxd 就绪后按下文启动
+ADX，使用 `runtime="runc"` 创建实例。
+
 ## 证书与初始密钥
 
 以下为默认 mTLS 模式的证书要求；network 模式只需要对外 HTTPS 证书与初始 API Key。证书由部署环境签发。内部证书需要合适的 serverAuth/clientAuth 用途，示例的内部服务名为 `adx.internal`，必须被服务端证书 SAN 覆盖。每个组件使用独立的证书和私钥。

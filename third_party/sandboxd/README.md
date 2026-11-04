@@ -16,8 +16,9 @@ maintained control-plane copy of the backend API.
 
 ## CI binary bundle
 
-[`artifacts.json`](artifacts.json) pins the OBS bundle for
-`x86_64-unknown-linux-gnu`, using the same sandboxd revision as `source.json`.
+[`artifacts.json`](artifacts.json) pins OBS bundles for
+`x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu`, using the same sandboxd
+revision as `source.json`.
 The archive contains sandboxd, sbox, runc, runc-shim, sandbox-logger, redis-cli
 and their backend manifest. It contains no ADX platform or Execd binaries.
 
@@ -32,11 +33,12 @@ per-file SHA256 and each executable's ELF machine. It rejects unsafe or duplicat
 tar entries and installs the directory only after verification. Download or
 verification failure stops package assembly.
 
-The bundle was built from the clean pinned sandboxd revision on native Linux
-AMD64 and verified against its per-file manifest, protocol hashes, runc checksum
-and Redis CLI version. Updating this dependency requires a matching source pin
-and verified replacement archive pin. ARM package jobs currently exclude this
-x86-only external runtime bundle.
+Both bundles are built from the clean pinned sandboxd revision using
+`build/e2e/build_backend.py`. Updating this dependency requires matching source
+and verified archive pins. To include the backend in the ADX release, build with
+`ADX_WITH_SANDBOXD=1 make platform-release`. This adds the backend to
+`runtime/sandboxd/` and ships the systemd unit and example configuration described
+in the [standalone deployment guide](../../docs/deployment/standalone.md#使用随包的-sandboxd).
 
 For native cleanup qualification, point `ADX_SANDBOXD_TEST_SOCKET` at a dedicated,
 empty backend and set `ADX_SANDBOXD_TEST_IMAGE` to a reachable image. Optional

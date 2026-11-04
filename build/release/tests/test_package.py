@@ -73,6 +73,47 @@ class PackageTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 pkg.assemble(binaries, redis, redis_cli, wheel, out, "a" * 40, True, "test-fixture", "debug")
 
+    def test_bundled_sandboxd_matches_pinned_revision_and_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binaries = root / "bin"
+            binaries.mkdir()
+            for name in pkg.BINARIES + ("adx-execd", "adx-runtime-rootfs.img"):
+                (binaries / name).write_bytes(b"fixture")
+            redis = root / "redis"
+            redis.write_text("#!/bin/sh\necho 'Redis server v=7.2.5 sha=fixture'\n")
+            redis.chmod(0o700)
+            redis_cli = root / "redis-cli"
+            redis_cli.write_text("#!/bin/sh\necho 'redis-cli 7.2.5'\n")
+            redis_cli.chmod(0o700)
+            wheel = root / "adx_environment-1-py3-none-any.whl"
+            wheel.write_bytes(b"fixture")
+            backend = root / "backend"
+            backend.mkdir()
+            for name in pkg.SANDBOXD_BINARIES:
+                (backend / name).write_bytes(b"\x7fELF\x02\x01" + bytes(12) + (62).to_bytes(2, "little"))
+            target = "x86_64-unknown-linux-gnu"
+            pin = json.loads((pkg.ROOT / "third_party/sandboxd/source.json").read_text())
+            metadata = {
+                "target": target,
+                "sandboxd_revision": pin["revision"],
+                "files": {name: pkg.sha(backend / name) for name in pkg.SANDBOXD_BINARIES},
+            }
+            (backend / "manifest.json").write_text(json.dumps(metadata))
+            output = root / "release"
+            pkg.assemble(binaries, redis, redis_cli, wheel, output, "a" * 40, False, target, "release",
+                         backend_dir=backend)
+            self.assertTrue(pkg.verify(output)["with_sandboxd"])
+            self.assertTrue((output / "etc/examples/sandboxd/adx-sandboxd.service").is_file())
+
+            metadata["target"] = "aarch64-unknown-linux-gnu"
+            (backend / "manifest.json").write_text(json.dumps(metadata))
+            wrong_target = root / "wrong-target"
+            with self.assertRaisesRegex(ValueError, "sandboxd revision or target mismatch"):
+                pkg.assemble(binaries, redis, redis_cli, wheel, wrong_target, "a" * 40, False, target, "release",
+                             backend_dir=backend)
+            self.assertFalse(wrong_target.exists())
+
     def test_legacy_manifest_cannot_silently_disable_afs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

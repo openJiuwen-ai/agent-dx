@@ -13,7 +13,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from package_manifest import AFS_BINARIES, BINARIES  # noqa: E402
+from package_manifest import AFS_BINARIES, BINARIES, SANDBOXD_BINARIES  # noqa: E402
 from package_manifest import verify as verify_manifest
 
 
@@ -21,7 +21,9 @@ def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target, profile, with_afs=False):
+def assemble(
+    binary_dir, redis, redis_cli, wheel, output, commit, dirty, target, profile, with_afs=False, backend_dir=None
+):
     if output.exists():
         raise ValueError("output already exists")
     inputs = {f"bin/{name}": binary_dir / name for name in BINARIES}
@@ -65,6 +67,11 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target,
     if not wheel.name.startswith("adx_environment-") or wheel.suffix != ".whl":
         raise ValueError("an adx_environment wheel is required")
     inputs[f"sdk/{wheel.name}"] = wheel
+    if backend_dir is not None:
+        for name in (*SANDBOXD_BINARIES, "manifest.json"):
+            inputs[f"runtime/sandboxd/{name}"] = backend_dir / name
+        for name in ("adx-sandboxd.service", "sandboxd.toml"):
+            inputs[f"etc/examples/sandboxd/{name}"] = ROOT / "build/release/sandboxd" / name
     for source in inputs.values():
         if source.is_symlink() or not source.is_file():
             raise ValueError("a required artifact is missing or is a symlink")
@@ -125,11 +132,13 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target,
             "redis_version": "7.2.5",
             "files": {name: sha(stage / name) for name in sorted(inputs)},
         }
+        if backend_dir is not None:
+            manifest["with_sandboxd"] = True
         if with_afs:
             manifest["with_afs"] = True
         (stage / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        verify(stage)
         stage.rename(output)
-    verify(output)
     return manifest
 
 
@@ -146,6 +155,7 @@ def main():
     p.add_argument("--target", required=True)
     p.add_argument("--profile", choices=("debug", "release"), required=True)
     p.add_argument("--with-afs", action="store_true", help="include OwnerFs and DistributedFs binaries")
+    p.add_argument("--backend-dir", type=Path)
     v = sub.add_parser("verify")
     v.add_argument("directory", type=Path)
     args = parser.parse_args()
@@ -174,6 +184,7 @@ def main():
             args.target,
             args.profile,
             args.with_afs,
+            args.backend_dir,
         )
     print("package verified")
 

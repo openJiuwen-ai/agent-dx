@@ -1,0 +1,35 @@
+rootDir = "/var/lib/adx-sandboxd/root"
+storeDir = "/var/lib/adx-sandboxd/store"
+
+[plugin.network]
+ip_range = "10.88.0.1/24"
+nat_backend = "iptables"
+enable_local_dnat = true
+enable_network_acl = false
+
+[plugin.resource]
+cpu_limit_mode = "quota"
+cgroup_cache_size = 1
+interface_cache_size = 1
+cgroup_root_name = "/adx-sandboxd"
+max_instance_num = 32
+
+[plugin.runtime]
+image_lib_dir = "/var/lib/adx-sandboxd/images"
+filestore_dir = "/var/lib/adx-sandboxd/filestore"
+loop_device_dir = "/dev"
+overlay_tmpfs_size = "64M"
+
+[plugin.runtime.runc]
+state_root = "/var/lib/adx-sandboxd/runc"
+shim_binary = "/opt/adx/current/runtime/sandboxd/runc-shim"
+
+[plugin.runtime.basic_spec]
+runc = ""
+
+[plugin.runtime.runtime_binary]
+runc = "/opt/adx/current/runtime/sandboxd/runc"
+
+[plugin.image]
+root = "/var/lib/adx-sandboxd/image-manager"
+registry_auths_path = "/etc/adx/sandboxd-registry-auths.json"
