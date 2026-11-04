@@ -3,7 +3,7 @@
 use crate::{Durability, StateSink};
 use adx_core::{CheckpointArtifact, EnvironmentRecord, Error, Result};
 use async_trait::async_trait;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, TransactionBehavior};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 
@@ -29,6 +29,7 @@ pub struct JournalSink {
     upstream: Arc<dyn StateSink>,
     ready: RwLock<bool>,
     environments: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
+    database_access: Arc<Mutex<()>>,
 }
 
 fn unavailable(error: impl std::fmt::Display) -> Error {
@@ -45,6 +46,7 @@ impl JournalSink {
             upstream,
             ready: RwLock::new(ready),
             environments: Mutex::default(),
+            database_access: Arc::default(),
         }
     }
 
@@ -54,7 +56,13 @@ impl JournalSink {
         work: impl FnOnce(Option<Connection>) -> Result<T> + Send + 'static,
     ) -> Result<T> {
         let path = self.path.clone();
+        // SQLite has one writer. Queue local work asynchronously instead of
+        // consuming its busy timeout with this process's other connections.
+        // The blocking task owns the guard so caller cancellation cannot let
+        // a second operation overlap SQL that is still executing.
+        let access = self.database_access.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || {
+            let _access = access;
             if !create && !path.exists() {
                 return work(None);
             }
@@ -131,7 +139,12 @@ impl JournalSink {
         };
         self.database(true, move |connection| {
             let mut connection = connection.ok_or_else(|| unavailable("missing database"))?;
-            let tx = connection.transaction().map_err(unavailable)?;
+            // Reserve the WAL writer before reading the prior record. A deferred
+            // read transaction cannot wait its way out of a stale-snapshot
+            // write upgrade when another environment has committed meanwhile.
+            let tx = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(unavailable)?;
             let previous = {
                 let mut query = tx.prepare("SELECT payload FROM pending WHERE environment=?1 ORDER BY sequence DESC LIMIT 1").map_err(unavailable)?;
                 let mut rows = query.query([&record.spec.id]).map_err(unavailable)?;
@@ -365,5 +378,51 @@ impl JournalSink {
             }
             Err(error) => Err(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Published;
+
+    #[async_trait]
+    impl StateSink for Published {
+        async fn commit(&self, _: &EnvironmentRecord) -> Result<Durability> {
+            Ok(Durability::Published)
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_database_caller_does_not_release_running_blocking_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let sink = Arc::new(JournalSink::new(
+            directory.path().join("journal.sqlite"),
+            Arc::new(Published),
+        ));
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let first_sink = sink.clone();
+        let first = tokio::spawn(async move {
+            first_sink
+                .database(true, move |_connection| {
+                    started.send(()).unwrap();
+                    blocked.recv().unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        running.await.unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+        let mut second = tokio::spawn(async move { sink.database(false, |_| Ok(())).await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut second)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        second.await.unwrap().unwrap();
     }
 }
