@@ -445,7 +445,7 @@ class Commands:
             except Exception as error:
                 if (
                     isinstance(error, EnvironmentError)
-                    and error.code == "ENVIRONMENT_OOM"
+                    and error.code in {"ENVIRONMENT_OOM", "ENVIRONMENT_FAILED"}
                     and error.outcome == "terminal"
                 ):
                     raise

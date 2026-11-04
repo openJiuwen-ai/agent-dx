@@ -990,6 +990,9 @@ class EnvironmentClient:
                         error = self._http_error(resp, request_id=request_id)
                         error.first_error = first_error
                         raise error
+                    # A later missing route invalidates the earlier resuming
+                    # observation. Diagnose the current catalog state instead.
+                    pending_resume = None
                     if outcome_unknown:
                         # An earlier attempt may already have executed. Route
                         # disappearance does not make Frontend replay safe.

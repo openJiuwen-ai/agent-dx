@@ -214,6 +214,50 @@ def test_operation_not_found_is_not_an_environment_route_failure(monkeypatch):
         client.close()
 
 
+@pytest.mark.parametrize("catalog", ["failed-oom", "failed-exit", "running", "outage"])
+def test_resuming_then_missing_route_consults_latest_environment_state(monkeypatch, catalog):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        if request.url.path == "/api/instances":
+            if catalog == "outage":
+                return httpx.Response(503, text="catalog unavailable")
+            record = {"id": "owned", "status": "running"}
+            if catalog.startswith("failed-"):
+                record.update(status="failed", failure={
+                    "reason": "OomKilled" if catalog == "failed-oom" else "Exited", "exit_code": 137,
+                })
+            return httpx.Response(200, json=[record])
+        assert request.url.path == "/direct/owned/invoke"
+        if len(calls) == 1:
+            return httpx.Response(503, headers={"X-ADX-Error-Code": "ENV_RESUMING"}, json={"error": {
+                "code": "ENV_RESUMING", "retry": "same_operation", "outcome": "not_started",
+                "requestForwarded": False, "requestId": request.headers["X-ADX-Request-ID"],
+            }})
+        return httpx.Response(404, text="environment route not found")
+
+    client = client_for(monkeypatch, handler)
+    try:
+        with pytest.raises(SDKEnvironmentError) as raised:
+            client.invoke("owned", "process.start", {"command_id": "command-a"})
+        error = raised.value
+        if catalog.startswith("failed-"):
+            assert error.code == ("ENVIRONMENT_OOM" if catalog == "failed-oom" else "ENVIRONMENT_FAILED")
+            assert error.outcome == "terminal" and error.retry == "never"
+            assert error.failure["reason"] == ("OomKilled" if catalog == "failed-oom" else "Exited")
+        else:
+            assert error.code == "ENVIRONMENT_UNAVAILABLE"
+            assert error.outcome == "not_started" and error.retry == "same_operation"
+        assert error.first_error.code == "ENV_RESUMING"
+        assert calls[-1].url.path == "/api/instances"
+        direct = [request for request in calls if request.method == "POST"]
+        assert len(direct) == 3
+        assert {json.loads(request.content)["requestId"] for request in direct} == {error.request_id}
+    finally:
+        client.close()
+
+
 @pytest.mark.parametrize("status_code", [409, 502])
 @pytest.mark.parametrize("outcome", ["terminal", "not_started"])
 @pytest.mark.parametrize("resuming", [False, True])

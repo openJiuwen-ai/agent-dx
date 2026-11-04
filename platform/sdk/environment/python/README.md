@@ -60,6 +60,14 @@ before failure publication the result can remain `OUTCOME_UNKNOWN`; query
 `get_info()` instead of interpreting route errors as OOM. Successful calls do
 not perform an additional catalog query.
 
+Background `commands.run(..., background=True)` preserves these confirmed
+`ENVIRONMENT_OOM` and `ENVIRONMENT_FAILED` exceptions directly, including their
+failure details and first error; it does not wrap them as an uncertain command
+submission. If a direct retry changes from `ENV_RESUMING` to a missing route,
+the SDK consults the current authenticated Environment catalog instead of
+reporting the earlier resuming state. A missing route alone still cannot prove
+backend failure or authorize a control-plane replay.
+
 ## Working directory
 
 `Environment(cwd="/workspace/task")` sends the constructor directory to the server.

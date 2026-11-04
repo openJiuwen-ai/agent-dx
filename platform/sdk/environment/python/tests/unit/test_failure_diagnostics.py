@@ -53,6 +53,32 @@ def test_capability_missing_in_confirmed_response_remains_unsupported():
         Commands(client, "environment-a").get("command-a")
 
 
+@pytest.mark.parametrize("code", ["ENVIRONMENT_OOM", "ENVIRONMENT_FAILED"])
+def test_background_submission_preserves_confirmed_backend_failure(code):
+    first = httpx.ReadTimeout("first submission reply lost")
+    failure = {"reason": "OomKilled" if code == "ENVIRONMENT_OOM" else "Exited", "exit_code": 137}
+    error = SDKEnvironmentError(
+        "confirmed backend failure", code=code, retry="never", outcome="terminal",
+        request_id="submission-request", operation_id="submission-request",
+        environment_id="environment-a", failure=failure, first_error=first,
+    )
+    client = Mock(spec=EnvironmentClient)
+    client.invoke.side_effect = [
+        {"protocol_version": 1, "capabilities": [
+            "stable-command-id", "recoverable-command-result", "multiplexed-command-watch",
+        ]},
+        error,
+    ]
+    with pytest.raises(SDKEnvironmentError) as raised:
+        Commands(client, "environment-a").run("fixture", background=True, command_id="command-a")
+    assert raised.value is error
+    assert raised.value.first_error is first
+    assert raised.value.failure == failure
+    assert raised.value.request_id == raised.value.operation_id == "submission-request"
+    assert raised.value.retry == "never" and raised.value.outcome == "terminal"
+    assert client.invoke.call_args_list[1].args[1] == "process.start"
+
+
 @pytest.fixture(name="make_client")
 def client_factory(monkeypatch):
     clients = []
