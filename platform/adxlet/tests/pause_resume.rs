@@ -43,6 +43,7 @@ struct Backend {
     fail_remove: Mutex<bool>,
     remove_then_timeout: Mutex<bool>,
     observed_failure: Mutex<Option<adx_core::RuntimeFailure>>,
+    probe_failure: Mutex<Option<adx_core::probes::ProbeFailure>>,
     checkpoint_leaves_running: Mutex<bool>,
     workload_request: Mutex<Option<String>>,
     workload_deadline_unix_millis: Mutex<Option<u64>>,
@@ -285,6 +286,12 @@ impl CheckpointCooperation for Backend {
 }
 #[async_trait]
 impl Readiness for Backend {
+    async fn probe_failure(
+        &self,
+        _: &EnvironmentRecord,
+    ) -> Result<Option<adx_core::probes::ProbeFailure>> {
+        Ok(self.probe_failure.lock().unwrap().clone())
+    }
     async fn activity(&self, _: &EnvironmentRecord) -> Result<(u64, u64)> {
         self.activity
             .lock()
@@ -3119,4 +3126,84 @@ async fn resume_applies_requested_duration_before_delayed_followup_and_consumes_
     let next_control = handle.run_control().await.unwrap();
     assert!(next_control.expires_at_unix_ms <= next_control.started_at_unix_ms + 1_000);
     handle.delete().await.unwrap();
+}
+
+#[tokio::test]
+async fn snapshot_clone_keeps_probe_failure_handling_without_restarting_entrypoint() {
+    use adx_core::{execution::*, probes::*, snapshots::*};
+    let (_temp, backend, node, mut spec, mut assignment) = fixture();
+    spec.execution.inherit_entrypoint = true;
+    spec.execution.rootfs = Some(Rootfs {
+        readonly: false,
+        source: StorageSource::Image(spec.image.clone()),
+    });
+    spec.execution.healthcheck_probe = Some(ProbeSpec {
+        action: ProbeAction::TcpSocket { port: 8080 },
+        initial_delay_seconds: 0,
+        period_seconds: 1,
+        timeout_seconds: 1,
+        failure_threshold: 3,
+    });
+    let source = node.environment(spec, assignment.clone()).unwrap();
+    let running = source.create().await.unwrap();
+    let mut snapshot = source
+        .snapshot(adxlet::checkpoint::SnapshotRequest {
+            kind: SnapshotKind::Regular,
+            operation_id: "probed-source".into(),
+            expected_revision: running.record.revision,
+            names: vec![],
+            timeout_seconds: 60,
+        })
+        .await
+        .unwrap()
+        .snapshot;
+    source.delete().await.unwrap();
+    let reference = Reference::Restore {
+        environment_id: "clone".into(),
+    };
+    snapshot.acquire("tenant", reference.clone()).unwrap();
+    // Coordinator inheritance is covered in rpc::cloning; feed its resulting
+    // captured geometry into the node's real create-from-snapshot path.
+    let mut restored_spec = snapshot.template.clone();
+    restored_spec.id = "clone".into();
+    restored_spec.snapshot_id = Some(snapshot.id.clone());
+    assignment.environment_id = restored_spec.id.clone();
+    let clone = node.environment(restored_spec, assignment).unwrap();
+    backend.events.lock().unwrap().clear();
+    let restored = clone.create_from_snapshot(snapshot.clone()).await.unwrap();
+    assert_eq!(restored.record.state, EnvironmentState::Running);
+    assert_eq!(
+        restored.record.spec.execution.healthcheck_probe,
+        snapshot.template.execution.healthcheck_probe
+    );
+    assert!(backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event == "restore"));
+    assert!(!backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event == "start"));
+    let failure = ProbeFailure {
+        kind: ProbeFailureKind::HealthcheckFailed,
+        message: "restored service unhealthy".into(),
+        consecutive_failures: 3,
+        exit_code: Some(7),
+        http_status: None,
+    };
+    *backend.probe_failure.lock().unwrap() = Some(failure.clone());
+    clone.tick().await.unwrap();
+    let failed = clone.sync().await.unwrap().record;
+    assert_eq!(failed.state, EnvironmentState::Failed);
+    assert_eq!(failed.failure, Some(failure.into()));
+    assert!(backend.running.lock().unwrap().is_empty());
+    assert_eq!(node.used(), Resources::default());
+    clone.delete().await.unwrap();
+    snapshot.release(&reference).unwrap();
+    snapshot.delete("tenant").unwrap();
+    node.collect_snapshot(&snapshot, false).await.unwrap();
 }

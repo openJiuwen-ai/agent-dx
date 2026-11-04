@@ -706,7 +706,9 @@ class Environment:
         self._cpu = cpu
         self._memory = memory
         self._cwd = cwd
-        self._inherit_entrypoint = inherit_entrypoint
+        # A snapshot inherits this setting on the server; the create argument
+        # does not describe its captured process. Discover it via Execd polling.
+        self._inherit_entrypoint: Optional[bool] = None if snapshot_id is not None else inherit_entrypoint
         self._entrypoint_exit_info: Optional[Dict[str, Any]] = None
 
         # ── ports: user port_forwardings only ─────────────────────────────
@@ -850,6 +852,8 @@ class Environment:
             environment._cpu = info.get("required_cpu")
             environment._memory = info.get("required_mem")
             environment._cwd = None
+            environment._inherit_entrypoint = None
+            environment._entrypoint_exit_info = None
             environment._forwarded_ports = set()
             environment._tunnel_client = None
             environment._tunnel_url = ""
@@ -967,9 +971,11 @@ class Environment:
         Each request is a bounded long poll so frontend and gateway request
         deadlines are never used as an unbounded wait. Signal exits use the
         conventional ``128 + signal`` code. Full terminal details remain
-        available through :attr:`entrypoint_exit_info`.
+        available through :attr:`entrypoint_exit_info`. Snapshot and attached
+        handles query the captured Execd state; an environment without a managed
+        entrypoint returns an EnvironmentError from that query.
         """
-        if not self._inherit_entrypoint:
+        if self._inherit_entrypoint is False:
             raise RuntimeError("inherit_entrypoint was not enabled for this environment")
         if self._closed:
             raise RuntimeError("environment is closed")
@@ -984,8 +990,10 @@ class Environment:
             )
             status = result.get("status")
             if status == "running":
+                self._inherit_entrypoint = True
                 continue
             if status == "exited":
+                self._inherit_entrypoint = True
                 self._entrypoint_exit_info = dict(result)
                 exit_code = result.get("shell_exit_code", result.get("exit_code"))
                 if isinstance(exit_code, bool) or not isinstance(exit_code, int):

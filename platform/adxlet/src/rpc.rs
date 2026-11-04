@@ -944,11 +944,20 @@ impl CoordinatorStateSink {
         let response = tokio::time::timeout(self.timeout, client.commit_environment(request))
             .await
             .map_err(|_| Error::Unavailable("state commit RPC timed out".into()))?
-            .map_err(|status| match status.code() {
-                tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => {
-                    Error::Invalid("Coordinator rejected node credentials".into())
+            .map_err(|status| {
+                adx_observability::warn!(
+                    environment_id = %record.spec.id,
+                    expected_revision = record.revision,
+                    grpc_code = ?status.code(),
+                    reason = status.message(),
+                    "Coordinator state commit rejected"
+                );
+                match status.code() {
+                    tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => {
+                        Error::Invalid("Coordinator rejected node credentials".into())
+                    }
+                    _ => dependency_status(status),
                 }
-                _ => dependency_status(status),
             })?
             .into_inner();
         let accepted: EnvironmentRecord = response
@@ -956,6 +965,14 @@ impl CoordinatorStateSink {
             .ok_or_else(|| Error::Unavailable("commit response missing record".into()))?
             .try_into()?;
         if accepted != *record {
+            adx_observability::warn!(
+                environment_id = %record.spec.id,
+                expected_revision = record.revision,
+                accepted_revision = accepted.revision,
+                expected_artifacts = record.execution_artifacts.len(),
+                accepted_artifacts = accepted.execution_artifacts.len(),
+                "Coordinator commit response differs from submitted record"
+            );
             return Err(Error::Conflict);
         }
         Ok(Durability::Published)
@@ -988,6 +1005,8 @@ impl crate::checkpoint::SnapshotCatalog for CoordinatorStateSink {
         &self,
         snapshot: adx_core::snapshots::Snapshot,
     ) -> Result<adx_core::snapshots::Snapshot> {
+        let snapshot_id = snapshot.id.clone();
+        let source_environment_id = snapshot.template.id.clone();
         let mut client = self
             .snapshots
             .read()
@@ -1002,7 +1021,16 @@ impl crate::checkpoint::SnapshotCatalog for CoordinatorStateSink {
         tokio::time::timeout(self.timeout, client.publish_snapshot(request))
             .await
             .map_err(|_| Error::Unavailable("snapshot publication timed out".into()))?
-            .map_err(dependency_status)?
+            .map_err(|status| {
+                adx_observability::warn!(
+                    snapshot_id = %snapshot_id,
+                    environment_id = %source_environment_id,
+                    grpc_code = ?status.code(),
+                    reason = status.message(),
+                    "Coordinator snapshot publication rejected"
+                );
+                dependency_status(status)
+            })?
             .into_inner()
             .try_into()
     }
