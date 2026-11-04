@@ -433,6 +433,7 @@ mod tests {
             connection: Arc::new(Connection {
                 client: redis::Client::open("redis://127.0.0.1/").unwrap(),
                 current: Mutex::new(None),
+                transport_generation: Arc::new(AtomicU64::new(0)),
                 timeout: Duration::from_secs(1),
                 committed_changes: changes,
                 publication_sequence: AtomicU64::new(0),
@@ -453,10 +454,13 @@ mod tests {
                 environments: BTreeMap::new(),
             },
         );
+        let inspection = Arc::new(super::inspection::InspectionCache::new(
+            store.connection.transport_generation.clone(),
+        ));
         Session {
             store,
             epoch: 1,
-            inspection: Arc::new(super::inspection::InspectionCache::default()),
+            inspection,
             generations: Arc::new(AtomicU64::new(1_u64 << 32)),
         }
     }

@@ -1,4 +1,4 @@
-//! The active Coordinator's committed artifact inventory. Reads never contact Redis.
+//! The active Coordinator's committed artifact inventory, fenced by transport identity.
 use super::*;
 use adx_core::snapshots::Snapshot;
 use std::{
@@ -12,23 +12,43 @@ use std::{
 pub(super) struct InspectionCache {
     value: Mutex<Option<InspectionInventory>>,
     ready: AtomicBool,
+    generation: AtomicU64,
+    transport_generation: Arc<AtomicU64>,
 }
 
 pub(super) struct InspectionGuard<'a> {
     value: tokio::sync::MutexGuard<'a, Option<InspectionInventory>>,
-    ready: &'a AtomicBool,
+    cache: &'a InspectionCache,
+    generation: u64,
 }
 
 impl InspectionCache {
+    pub(super) fn new(transport_generation: Arc<AtomicU64>) -> Self {
+        Self {
+            generation: AtomicU64::new(transport_generation.load(Ordering::Acquire)),
+            transport_generation,
+            ..Default::default()
+        }
+    }
+
     pub(super) async fn lock(&self) -> InspectionGuard<'_> {
+        let mut value = self.value.lock().await;
+        let generation = self.transport_generation.load(Ordering::Acquire);
+        if self.generation.load(Ordering::Acquire) != generation {
+            *value = None;
+            self.ready.store(false, Ordering::Release);
+        }
         InspectionGuard {
-            value: self.value.lock().await,
-            ready: &self.ready,
+            value,
+            cache: self,
+            generation,
         }
     }
 
     fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
+            && self.generation.load(Ordering::Acquire)
+                == self.transport_generation.load(Ordering::Acquire)
     }
 }
 
@@ -49,7 +69,15 @@ impl Drop for InspectionGuard<'_> {
     fn drop(&mut self) {
         // A successful writer restores its committed value before releasing
         // the guard. Failed/cancelled writes leave None and require recovery.
-        self.ready.store(self.value.is_some(), Ordering::Release);
+        if self.generation != self.cache.transport_generation.load(Ordering::Acquire) {
+            *self.value = None;
+        }
+        self.cache
+            .generation
+            .store(self.generation, Ordering::Release);
+        self.cache
+            .ready
+            .store(self.value.is_some(), Ordering::Release);
     }
 }
 
@@ -98,6 +126,11 @@ impl Session {
             .into_iter()
             .map(|(id, raw)| Ok((id, decode(&raw)?)))
             .collect::<Result<_>>()?;
+        if inventory.generation != self.inspection.transport_generation.load(Ordering::Acquire) {
+            return Err(Error::Unavailable(
+                "inspection transport changed during recovery".into(),
+            ));
+        }
         *inventory = Some(InspectionInventory { snapshots, holds });
         Ok(())
     }
@@ -156,6 +189,54 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn transport_replacement_fences_an_in_flight_inventory_writer() {
+        let cache = InspectionCache::default();
+        *cache.lock().await = Some(InspectionInventory::default());
+        assert!(cache.is_ready());
+        let mut writer = cache.lock().await;
+        let committed = writer.take();
+        cache.transport_generation.fetch_add(1, Ordering::AcqRel);
+        assert!(!cache.is_ready(), "readiness must not wait for the writer");
+        *writer = committed;
+        drop(writer);
+        assert!(!cache.is_ready());
+        assert!(
+            cache.lock().await.is_none(),
+            "old writer restored a stale view"
+        );
+        *cache.lock().await = Some(InspectionInventory::default());
+        assert!(cache.is_ready());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires isolated real Redis"]
+    async fn snapshot_inventory_requires_recovery_after_redis_restart() {
+        let mut rig = crate::rpc::cancellation_test_redis::Redis::new().await;
+        let store = rig.store().await;
+        let session = store.begin(1).await.unwrap();
+        let artifact = adx_core::CheckpointArtifact {
+            storage: "shared".into(),
+            scope: String::new(),
+            location: "unowned".into(),
+            size_bytes: 1,
+        };
+        session.refresh_inspection_inventory().await.unwrap();
+        assert!(!session.snapshot_artifact_owned(&artifact).await.unwrap());
+        rig.crash();
+        rig.start().await;
+        // Redis persistence may restore an older catalog after transport loss.
+        // A successful reconnect/header read cannot revalidate cached ownership.
+        let result = session.snapshot_artifact_owned(&artifact).await;
+        assert!(
+            matches!(result, Err(Error::Unavailable(_))),
+            "transport replacement reused the old committed inventory: {result:?}"
+        );
+        assert!(!session.inspection_ready().await);
+        session.refresh_inspection_inventory().await.unwrap();
+        assert!(!session.snapshot_artifact_owned(&artifact).await.unwrap());
+    }
 
     #[tokio::test]
     #[ignore = "requires isolated real Redis"]

@@ -608,6 +608,7 @@ fn next_result(old: &StoredEnvironment, r: &EnvironmentRecord) -> Result<bool> {
 struct Connection {
     client: redis::Client,
     current: Mutex<Option<Arc<transport::Lease>>>,
+    transport_generation: Arc<AtomicU64>,
     timeout: Duration,
     committed_changes: broadcast::Sender<ControlChange>,
     publication_sequence: AtomicU64,
@@ -666,6 +667,7 @@ impl RedisStore {
             connection: Arc::new(Connection {
                 client,
                 current: Mutex::new(None),
+                transport_generation: Arc::new(AtomicU64::new(0)),
                 timeout: duration,
                 committed_changes,
                 artifact_locks: Default::default(),
@@ -1047,7 +1049,9 @@ impl RedisStore {
                 let session = Session {
                     store: self.clone(),
                     epoch: h.epoch,
-                    inspection: Arc::new(inspection::InspectionCache::default()),
+                    inspection: Arc::new(inspection::InspectionCache::new(
+                        self.connection.transport_generation.clone(),
+                    )),
                     generations: Arc::new(AtomicU64::new(
                         h.epoch.checked_mul(1_u64 << 32).ok_or(Error::Conflict)?,
                     )),

@@ -95,6 +95,15 @@ impl RedisStore {
             }
             // A Redis restart changes run_id and destroys its old clients. Never
             // use an ID from that process to kill a client of the new process.
+            // Reconnecting does not revalidate committed in-memory inventories:
+            // Redis may have restored older persisted state. In-flight cache
+            // writers must also notice replacement before restoring their view.
+            self.connection
+                .transport_generation
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                    generation.checked_add(1)
+                })
+                .map_err(|_| unavailable())?;
         }
         let next = Arc::new(next);
         *current = Some(next.clone());
