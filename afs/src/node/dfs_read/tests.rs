@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     dfs::{CopyId, CopyState, DfsReadGrant, OperationId},
-    node::chunk::{ChunkBuilder, ChunkStore, StagedChunk},
+    node::chunk::{ChunkBuilder, ChunkSink, StagedChunk},
 };
 use std::{
     sync::{Arc, Condvar},

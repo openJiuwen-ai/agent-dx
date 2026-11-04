@@ -416,7 +416,7 @@ async fn grpc_dfs_test_fs(
     // Use the product R1 path and Meta placement authority. The test-only
     // LocalChunkStore trait adapter fabricates a group for mock Meta tests.
     let chunks = Arc::new(CountingChunkStore::new(Arc::new(
-        crate::node::replication::DfsChunkStore::new_with_epoch(
+        crate::node::replication::DfsChunkSink::new_with_epoch(
             node_id.to_owned(),
             1,
             local.clone(),

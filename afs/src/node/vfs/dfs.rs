@@ -103,8 +103,8 @@ use crate::{
         XattrSetMode,
     },
     node::chunk::{
-        ChunkBuilder, ChunkStore, NativeWriteAdmission, NativeWriteBudget, NativeWriteOwner,
-        PutIntent, SharedChunkBytes, StagedChunk, StoredChunk, WriteBufferPool,
+        BodyRelease, ChunkBuilder, ChunkSink, NativeWriteAdmission, NativeWriteBudget,
+        NativeWriteOwner, PutIntent, SharedChunkBytes, StagedChunk, StoredChunk, WriteBufferPool,
     },
     node::dfs_read::{
         BoundedLru, ChunkReadOp, CurrentExternalReadOutcome, DfsReadEngine,
@@ -146,7 +146,7 @@ pub struct DistributedFs {
     #[cfg(test)]
     hooks: TestHooks,
     meta: Arc<dyn DfsMeta>,
-    chunk_store: Arc<dyn ChunkStore>,
+    chunk_store: Arc<dyn ChunkSink>,
     read_engine: Arc<DfsReadEngine>,
     handles: DfsHandleTable,
     /// Serves proxied RPCs for inodes this node session owns.
@@ -177,7 +177,7 @@ impl DistributedFs {
         node_id: impl Into<String>,
         session_id: impl Into<String>,
         meta: Arc<dyn DfsMeta>,
-        chunk_store: Arc<dyn ChunkStore>,
+        chunk_store: Arc<dyn ChunkSink>,
         read_engine: Arc<DfsReadEngine>,
     ) -> Self {
         let node_id = node_id.into();

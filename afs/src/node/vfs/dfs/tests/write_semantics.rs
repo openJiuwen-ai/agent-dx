@@ -554,19 +554,11 @@ fn native_builder_slow_put_and_transport_retry_keep_pool_live_until_last_owner()
         pause: Arc<CommitPause>,
         held: Mutex<Option<StagedChunk>>,
     }
-    impl ChunkStore for SlowStore {
+    impl ChunkSink for SlowStore {
         fn put_chunks(&self, staged: Vec<StagedChunk>, _: PutIntent) -> Result<Vec<StoredChunk>> {
             *self.held.lock().unwrap() = staged.first().cloned();
             self.pause.block();
             self.inner.put_chunks(staged, PutIntent::Commit)
-        }
-        fn read_at(
-            &self,
-            chunk_id: &crate::dfs::ChunkId,
-            offset: u64,
-            out: &mut [u8],
-        ) -> Result<usize> {
-            self.inner.read_at(chunk_id, offset, out)
         }
     }
     let meta = Arc::new(RecordingMeta::new());

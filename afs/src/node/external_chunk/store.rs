@@ -224,12 +224,12 @@ impl Drop for S3ChunkStore {
     }
 }
 
-impl ChunkStore for S3ChunkStore {
+impl ChunkSink for S3ChunkStore {
     /// Same envelope as replicated stores (receipt x 8 plus 8 KiB for descriptor
     /// state, layout clones and publication scratch), with the external commit
     /// strings in place of replica ACKs. The object key is derived from store id,
     /// generation and the canonical BLAKE3 chunk id (about 90 bytes).
-    fn native_descriptor_reservation_bytes(&self, operation_id: &OperationId) -> Result<usize> {
+    fn descriptor_reservation_bytes(&self, operation_id: &OperationId) -> Result<usize> {
         let receipt = std::mem::size_of::<ChunkReceipt>()
             + std::mem::size_of::<ExternalCommitReceipt>()
             + operation_id.0.capacity()
@@ -268,8 +268,11 @@ impl ChunkStore for S3ChunkStore {
             Reply::Read(_) => Err(invalid("S3 worker returned the wrong response")),
         }
     }
+}
 
-    fn read_at(&self, chunk_id: &ChunkId, offset: u64, out: &mut [u8]) -> Result<usize> {
+#[cfg(test)]
+impl S3ChunkStore {
+    pub(super) fn read_at(&self, chunk_id: &ChunkId, offset: u64, out: &mut [u8]) -> Result<usize> {
         let chunk = chunk_from_id(chunk_id)?;
         if offset >= chunk.length || out.is_empty() {
             return Ok(0);

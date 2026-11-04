@@ -69,7 +69,7 @@ struct NativeFixtureStore {
     pause: Mutex<Option<Arc<CommitPause>>>,
 }
 
-impl ChunkStore for NativeFixtureStore {
+impl ChunkSink for NativeFixtureStore {
     fn put_chunks(&self, staged: Vec<StagedChunk>, intent: PutIntent) -> Result<Vec<StoredChunk>> {
         if intent == PutIntent::Commit {
             return self.local.put_chunks(staged, intent);
@@ -83,11 +83,15 @@ impl ChunkStore for NativeFixtureStore {
         }
         let mut stored = self.local.put_chunks(staged, intent)?;
         for stored in &mut stored {
-            stored.local_required_and_durable = self.required;
+            stored.body_release = if self.required {
+                BodyRelease::ReleaseAfterUpload
+            } else {
+                BodyRelease::RetainUntilPublish
+            };
         }
         Ok(stored)
     }
-    fn read_native_uploaded_at(
+    fn read_uploaded_at(
         &self,
         receipt: &ChunkReceipt,
         offset: u64,
@@ -96,9 +100,6 @@ impl ChunkStore for NativeFixtureStore {
         self.local
             .open_receipt_reader(&receipt.chunk)?
             .read_at(offset, out)
-    }
-    fn read_at(&self, chunk: &crate::dfs::ChunkId, offset: u64, out: &mut [u8]) -> Result<usize> {
-        self.local.read_at(chunk, offset, out)
     }
 }
 

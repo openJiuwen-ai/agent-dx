@@ -39,7 +39,7 @@ use crate::{
         SourceCandidate, external_object_key,
     },
     node::{
-        chunk::{ChunkStore, MAX_STAGED_CHUNK_BYTES, PutIntent, StagedChunk, StoredChunk},
+        chunk::{ChunkSink, MAX_STAGED_CHUNK_BYTES, PutIntent, StagedChunk, StoredChunk},
         dfs_read::{ExternalChunkReader, VerifiedExternalChunk},
     },
 };

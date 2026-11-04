@@ -94,29 +94,42 @@ pub enum PutIntent {
     /// first, and make no local release decision.
     Commit,
     /// Background upload of a native generation, which fences itself at commit.
-    /// `DfsChunkStore` decides the local release described on [`StoredChunk`].
+    /// `DfsChunkSink` decides the [`BodyRelease`] of each [`StoredChunk`].
     NativeUpload,
 }
 
-/// A persistence receipt with an explicit, conservative local release
-/// decision. Only the native replication implementation may establish Required
-/// policy and the matching local durable ACK; [`Self::unreleased`] never grants it.
+/// What the writer may do with the in-memory body once a native upload is durable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BodyRelease {
+    /// This node's exact durable copy is proven: drop the body now and serve
+    /// later reads through [`ChunkSink::read_uploaded_at`].
+    ReleaseAfterUpload,
+    /// No proven local copy: keep the body until the generation is published.
+    RetainUntilPublish,
+}
+
+/// A persistence receipt with an explicit, conservative body decision. Only the
+/// native replication implementation may prove the effective Required policy and
+/// the matching local durable ACK; [`Self::unreleased`] never grants a release.
 #[derive(Clone, Debug)]
 pub struct StoredChunk {
     pub receipt: ChunkReceipt,
-    pub local_required_and_durable: bool,
+    pub body_release: BodyRelease,
 }
 
 impl StoredChunk {
     pub fn unreleased(receipt: ChunkReceipt) -> Self {
         Self {
             receipt,
-            local_required_and_durable: false,
+            body_release: BodyRelease::RetainUntilPublish,
         }
     }
 }
 
-pub trait ChunkStore: Send + Sync {
+/// Where sealed chunks go. Reads of published data do not come through here; a
+/// sink only answers for bodies its own receipts anchor. Implementations
+/// compose: a sink may hold other sinks and decide the [`BodyRelease`] itself.
+pub trait ChunkSink: Send + Sync {
     /// The single write entry.
     fn put_chunks(&self, staged: Vec<StagedChunk>, intent: PutIntent) -> Result<Vec<StoredChunk>>;
 
@@ -124,7 +137,7 @@ pub trait ChunkStore: Send + Sync {
     /// replication overrides this from its cached authoritative placement.
     /// The fallback is only a conservative allowance for small custom stores:
     /// retained actual capacity must still be checked against that allowance.
-    fn native_descriptor_reservation_bytes(&self, operation_id: &OperationId) -> Result<usize> {
+    fn descriptor_reservation_bytes(&self, operation_id: &OperationId) -> Result<usize> {
         const FALLBACK_BYTES: usize = 16 * 1024;
         if operation_id.0.capacity() > FALLBACK_BYTES / 4 {
             return Err(Error::coded(
@@ -137,7 +150,7 @@ pub trait ChunkStore: Send + Sync {
 
     /// Read an unpublished native object anchored by its validated receipt.
     /// Unsupported stores must keep the original body until publication.
-    fn read_native_uploaded_at(
+    fn read_uploaded_at(
         &self,
         _receipt: &ChunkReceipt,
         _offset: u64,
@@ -163,8 +176,6 @@ pub trait ChunkStore: Send + Sync {
             .pop()
             .ok_or_else(|| invalid("ChunkStore returned no receipt for one staged Chunk"))
     }
-
-    fn read_at(&self, chunk_id: &ChunkId, offset: u64, out: &mut [u8]) -> Result<usize>;
 
     fn capacity(&self) -> Result<FilesystemCapacity> {
         Err(Error::coded(

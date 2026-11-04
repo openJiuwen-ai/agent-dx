@@ -490,7 +490,7 @@ impl DirtyExtentMap {
         &self,
         offset: u64,
         out: &mut [u8],
-        store: Option<&dyn ChunkStore>,
+        store: Option<&dyn ChunkSink>,
     ) -> Result<()> {
         let end = offset
             .checked_add(out.len() as u64)

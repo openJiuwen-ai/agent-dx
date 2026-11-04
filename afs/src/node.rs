@@ -1630,10 +1630,10 @@ async fn run_node(
             None
         };
         dfs_external_store_for_shutdown = external_store.clone();
-        let chunk_store: Arc<dyn chunk::ChunkStore> = match &external_store {
+        let chunk_store: Arc<dyn chunk::ChunkSink> = match &external_store {
             Some(store) => store.clone(),
             None => Arc::new(
-                replication::DfsChunkStore::new_with_epoch(
+                replication::DfsChunkSink::new_with_epoch(
                     cfg.id.clone(),
                     registered_node_epoch,
                     chunks.clone(),

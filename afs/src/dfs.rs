@@ -563,12 +563,6 @@ impl ReplicationConfig {
             && self.min_distinct_failure_domains > 0
             && self.min_distinct_failure_domains <= self.desired_copies
     }
-
-    pub fn is_local_fast_path(&self) -> bool {
-        self.desired_copies == 1
-            && self.sync_required_copies == 1
-            && self.local_copy == LocalCopyPolicy::Required
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -576,6 +570,60 @@ pub enum LocalCopyPolicy {
     Required,
     Preferred,
     NotRequired,
+}
+
+/// The local-copy rule one placement actually enforces.
+///
+/// `declared` is the immutable filesystem contract in [`ReplicationConfig`];
+/// `effective` is what this placement executes. Every "must the writer hold a
+/// copy" decision reads `effective`. Today the only production constructor is
+/// [`Self::declared`], so the two are always equal and `placement_hash` output
+/// and placement epochs are unchanged.
+///
+/// Extension point: a later stage lets Meta lower `effective` when the local
+/// device is unhealthy. It stays separate from `ReplicationConfig`, which is
+/// persisted as postcard and so cannot gain a field, and it is not on the wire:
+/// a Node derives it when decoding the placement snapshot.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EffectiveLocalCopy {
+    declared: LocalCopyPolicy,
+    effective: LocalCopyPolicy,
+}
+
+impl EffectiveLocalCopy {
+    pub fn declared(config: &ReplicationConfig) -> Self {
+        Self {
+            declared: config.local_copy,
+            effective: config.local_copy,
+        }
+    }
+
+    /// A placement whose effective rule differs from the declared one. No
+    /// production path produces this yet.
+    #[cfg(test)]
+    pub(crate) fn lowered_for_test(declared: LocalCopyPolicy, effective: LocalCopyPolicy) -> Self {
+        Self {
+            declared,
+            effective,
+        }
+    }
+
+    pub fn effective_policy(self) -> LocalCopyPolicy {
+        self.effective
+    }
+
+    /// The writer node must hold a durable copy of everything it writes.
+    pub fn requires_local(self) -> bool {
+        self.effective == LocalCopyPolicy::Required
+    }
+
+    /// The writer node heads the chain whenever it has a storage target.
+    pub fn prefers_local_head(self) -> bool {
+        matches!(
+            self.effective,
+            LocalCopyPolicy::Required | LocalCopyPolicy::Preferred
+        )
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -606,6 +654,18 @@ pub struct PlacementSnapshot {
     pub revision: u64,
     pub replication: ReplicationConfig,
     pub replica_groups: Vec<ReplicaGroup>,
+    /// Derived, never persisted: Meta assembles it for this placement and a
+    /// Node derives it again when decoding the snapshot.
+    pub local_copy: EffectiveLocalCopy,
+}
+
+impl PlacementSnapshot {
+    /// One synchronous copy that must live on the writer: no replica chain.
+    pub fn is_local_fast_path(&self) -> bool {
+        self.replication.desired_copies == 1
+            && self.replication.sync_required_copies == 1
+            && self.local_copy.requires_local()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

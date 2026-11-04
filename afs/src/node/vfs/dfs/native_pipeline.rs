@@ -471,7 +471,7 @@ pub(super) struct NativeUploadState {
 impl NativeUpload {
     pub(super) fn read_at(
         &self,
-        store: &dyn ChunkStore,
+        store: &dyn ChunkSink,
         offset: u64,
         out: &mut [u8],
     ) -> Result<usize> {
@@ -494,12 +494,12 @@ impl NativeUpload {
             .receipt
             .as_ref()
             .ok_or_else(|| unavailable("native uploaded body has no durable receipt"))?;
-        if !receipt.local_required_and_durable {
+        if receipt.body_release != BodyRelease::ReleaseAfterUpload {
             return Err(unavailable(
                 "native nonlocal body was released before publication",
             ));
         }
-        store.read_native_uploaded_at(&receipt.receipt, offset, out)
+        store.read_uploaded_at(&receipt.receipt, offset, out)
     }
 }
 

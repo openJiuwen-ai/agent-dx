@@ -16,15 +16,15 @@ use crate::dfs::{
     CallerContext, ChunkObject, ChunkSources, ClaimReplicationTask, CommitFileVersion,
     CommitMetadataMode, CopyId, CopyLocation, CopyRecord, CopyRole, CopyState, Dentry, DentryKey,
     DentryRecord, DfsChunkSourcesReply, DfsChunkSourcesRequest, DfsDurabilityPolicy, DfsReadGrant,
-    FileVersion, FileVersionId, GetXattrRequest, InodeAttributes, InodeId, InodeKind, InodeRecord,
-    LayoutRoot, LayoutRootId, LinkRequest, ListXattrRequest, LocalCopyPolicy, MkdirRequest,
-    MknodRequest, NamespaceId, OperationId, PlacementHealth, PlacementRecord, PlacementSnapshot,
-    ReadLinkRequest, RemoveXattrRequest, RenameMode, RenameOutcome, RenameRequest, ReplicaAck,
-    ReplicaGroup, ReplicaGroupId, ReplicaTarget, ReplicaWriteGrant, ReplicationClaim,
-    ReplicationConfig, ReplicationTask, ReplicationTaskId, ReplicationTaskState,
-    ReportChunkCorruption, ReportReplicationTask, RmdirRequest, SetInodeAttrRequest,
-    SetXattrRequest, SourceCandidate, SpecialNodeKind, SymlinkRequest, SyncInodeMetadata,
-    UnlinkRequest, ValidateReplicaWriteRequest, WriteLease, XattrSetMode,
+    EffectiveLocalCopy, FileVersion, FileVersionId, GetXattrRequest, InodeAttributes, InodeId,
+    InodeKind, InodeRecord, LayoutRoot, LayoutRootId, LinkRequest, ListXattrRequest,
+    LocalCopyPolicy, MkdirRequest, MknodRequest, NamespaceId, OperationId, PlacementHealth,
+    PlacementRecord, PlacementSnapshot, ReadLinkRequest, RemoveXattrRequest, RenameMode,
+    RenameOutcome, RenameRequest, ReplicaAck, ReplicaGroup, ReplicaGroupId, ReplicaTarget,
+    ReplicaWriteGrant, ReplicationClaim, ReplicationConfig, ReplicationTask, ReplicationTaskId,
+    ReplicationTaskState, ReportChunkCorruption, ReportReplicationTask, RmdirRequest,
+    SetInodeAttrRequest, SetXattrRequest, SourceCandidate, SpecialNodeKind, SymlinkRequest,
+    SyncInodeMetadata, UnlinkRequest, ValidateReplicaWriteRequest, WriteLease, XattrSetMode,
 };
 
 use super::store::{
@@ -304,11 +304,14 @@ impl DfsService {
             .cloned()
             .collect::<Vec<_>>();
 
-        let replica_groups = build_replica_groups(&caller_id, &replication, &storage_sessions)?;
+        let local_copy = EffectiveLocalCopy::declared(&replication);
+        let replica_groups =
+            build_replica_groups(&caller_id, &replication, local_copy, &storage_sessions)?;
         Ok(PlacementSnapshot {
             revision: config_snapshot.revision.0.max(sessions_snapshot.revision.0),
             replication,
             replica_groups,
+            local_copy,
         })
     }
 
@@ -1449,7 +1452,7 @@ impl DfsService {
         )
     }
 
-    /// Special inode bytes are interpreted by the Linux VFS, not ChunkStore.
+    /// Special inode bytes are interpreted by the Linux VFS, not ChunkSink.
     /// Meta atomically owns the name, mode, type and device number.
     pub async fn mknod(&self, request: MknodRequest) -> Result<InodeRecord> {
         let request_digest = namespace_request_digest(&request)?;
@@ -4159,6 +4162,11 @@ impl DfsService {
         }])
     }
 
+    /// Re-reads the current replication config at commit, not the snapshot the
+    /// writer used. That is sound only while effective equals declared: once a
+    /// later stage can lower the effective local-copy rule, a receipt written
+    /// under one value could be judged under another. That stage must bind the
+    /// value to the receipt's placement epoch, which already mixes it in.
     async fn validate_chunk_receipt(
         &self,
         caller_id: &str,
@@ -4270,7 +4278,8 @@ impl DfsService {
 
         if nodes.len() < usize::from(replication.min_distinct_nodes)
             || failure_domains.len() < usize::from(replication.min_distinct_failure_domains)
-            || (replication.local_copy == LocalCopyPolicy::Required && !nodes.contains(caller_id))
+            || (EffectiveLocalCopy::declared(replication).requires_local()
+                && !nodes.contains(caller_id))
         {
             return Err(invalid(
                 "ChunkReceipt does not satisfy Node, failure-domain or local-copy constraints",
@@ -4508,6 +4517,8 @@ impl DfsService {
         let Some(source) = source else {
             return Ok(None);
         };
+        // The repair source must head its chain. This is a chain constraint, not
+        // the user's local-copy policy, so it never follows an effective value.
         let mut repair_replication = replication.clone();
         repair_replication.sync_required_copies = repair_replication.desired_copies;
         repair_replication.local_copy = LocalCopyPolicy::Required;
@@ -4528,9 +4539,12 @@ impl DfsService {
         // Insufficient live capacity is a normal repair wait state. Backend
         // failures above still propagate; this pure placement computation
         // only checks whether the initialized policy can be satisfied now.
-        let Ok(groups) =
-            build_replica_groups(&request.caller_id, &repair_replication, &storage_sessions)
-        else {
+        let Ok(groups) = build_replica_groups(
+            &request.caller_id,
+            &repair_replication,
+            EffectiveLocalCopy::declared(&repair_replication),
+            &storage_sessions,
+        ) else {
             return Ok(None);
         };
         let group = groups
@@ -5753,6 +5767,7 @@ fn replica_ack_copy_record(ack: &ReplicaAck, chunk: &ChunkObject) -> CopyRecord 
 fn build_replica_groups(
     caller_id: &str,
     replication: &ReplicationConfig,
+    local_copy: EffectiveLocalCopy,
     sessions: &[NodeSession],
 ) -> Result<Vec<ReplicaGroup>> {
     let mut targets = sessions
@@ -5772,7 +5787,7 @@ fn build_replica_groups(
         .iter()
         .find(|target| target.node_id == caller_id)
         .cloned();
-    if replication.local_copy == LocalCopyPolicy::Required && caller_target.is_none() {
+    if local_copy.requires_local() && caller_target.is_none() {
         return Err(conflict(
             "DFS placement requires a caller-local storage target for local-copy=required",
         ));
@@ -5794,8 +5809,8 @@ fn build_replica_groups(
     }
 
     let mut groups = Vec::new();
-    match (replication.local_copy, caller_target) {
-        (LocalCopyPolicy::Required | LocalCopyPolicy::Preferred, Some(head)) => {
+    match caller_target.filter(|_| local_copy.prefers_local_head()) {
+        Some(head) => {
             let tail = targets
                 .iter()
                 .filter(|target| target.node_id != head.node_id)
@@ -5803,17 +5818,22 @@ fn build_replica_groups(
                 .collect::<Vec<_>>();
             let rotations = tail.len().max(1);
             for seed in 0..rotations {
-                if let Some(group) =
-                    build_replica_group(replication, Some(head.clone()), &tail, target_count, seed)
-                {
+                if let Some(group) = build_replica_group(
+                    replication,
+                    local_copy,
+                    Some(head.clone()),
+                    &tail,
+                    target_count,
+                    seed,
+                ) {
                     groups.push(group);
                 }
             }
         }
-        _ => {
+        None => {
             for seed in 0..targets.len() {
                 if let Some(group) =
-                    build_replica_group(replication, None, &targets, target_count, seed)
+                    build_replica_group(replication, local_copy, None, &targets, target_count, seed)
                 {
                     groups.push(group);
                 }
@@ -5849,6 +5869,7 @@ fn preferred_replica_target(session: &NodeSession) -> Option<ReplicaTarget> {
 
 fn build_replica_group(
     replication: &ReplicationConfig,
+    local_copy: EffectiveLocalCopy,
     head: Option<ReplicaTarget>,
     candidates: &[ReplicaTarget],
     target_count: usize,
@@ -5890,7 +5911,7 @@ fn build_replica_group(
     {
         return None;
     }
-    let placement_epoch = placement_hash(replication, &selected);
+    let placement_epoch = effective_placement_hash(replication, local_copy, &selected);
     Some(ReplicaGroup {
         id: ReplicaGroupId::new(format!("group:{placement_epoch:016x}")),
         placement_epoch,
@@ -5944,13 +5965,30 @@ fn replica_write_token(
     format!("dfs-replica-write:{:016x}", hash.finish_nonzero())
 }
 
+/// `placement_hash` of a placement that executes its declared local-copy rule.
+#[cfg(test)]
 fn placement_hash(replication: &ReplicationConfig, targets: &[ReplicaTarget]) -> u64 {
+    effective_placement_hash(
+        replication,
+        EffectiveLocalCopy::declared(replication),
+        targets,
+    )
+}
+
+/// Mixes the effective local-copy rule, so a placement whose rule changes gets
+/// a new epoch and its old groups stop matching. While effective equals
+/// declared the output is identical to hashing the declared rule.
+fn effective_placement_hash(
+    replication: &ReplicationConfig,
+    local_copy: EffectiveLocalCopy,
+    targets: &[ReplicaTarget],
+) -> u64 {
     let mut hash = StableHash::new();
     hash.write_u64(u64::from(replication.desired_copies));
     hash.write_u64(u64::from(replication.sync_required_copies));
     hash.write_u64(u64::from(replication.min_distinct_nodes));
     hash.write_u64(u64::from(replication.min_distinct_failure_domains));
-    hash.write_u64(match replication.local_copy {
+    hash.write_u64(match local_copy.effective_policy() {
         LocalCopyPolicy::Required => 1,
         LocalCopyPolicy::Preferred => 2,
         LocalCopyPolicy::NotRequired => 3,
@@ -6217,7 +6255,7 @@ mod read_recovery_tests {
         DfsReadValidation, Extent, LayoutRootId, StorageDeviceDescriptor, ValidateDfsReadGrants,
     };
     use crate::meta::store::{NodeSessionLease, Store, journal::MemoryLog};
-    use crate::node::chunk::{ChunkStore, LocalChunkStore, StagedChunk};
+    use crate::node::chunk::{ChunkSink, LocalChunkStore, StagedChunk};
 
     struct Fixture {
         service: DfsService,
@@ -8666,3 +8704,6 @@ mod gc_fence_tests;
 
 #[cfg(all(test, feature = "dfs"))]
 mod placement_hash_tests;
+
+#[cfg(all(test, feature = "dfs"))]
+mod effective_local_copy_tests;

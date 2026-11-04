@@ -1,6 +1,6 @@
 use afs::dfs::{
-    ChunkId, ContentDigest, DigestAlgorithm, LocalCopyPolicy, OperationId, ReplicationConfig,
-    ValidateReplicaWriteRequest,
+    ChunkId, ContentDigest, DigestAlgorithm, EffectiveLocalCopy, LocalCopyPolicy, OperationId,
+    ReplicationConfig, ValidateReplicaWriteRequest,
 };
 use afs::meta::store::{
     journal::{LogLimits, LogTip, RecoveredLog},
@@ -2849,6 +2849,10 @@ async fn dfs_placement_uses_global_live_devices_for_required_local_copy() {
 
     let first = dfs.placement_snapshot("node-a".into()).await.unwrap();
     assert!(first.revision > 0);
+    assert_eq!(
+        first.local_copy,
+        EffectiveLocalCopy::declared(&first.replication)
+    );
     assert!(!first.replica_groups.is_empty());
     for group in &first.replica_groups {
         assert_eq!(group.targets.len(), 3);

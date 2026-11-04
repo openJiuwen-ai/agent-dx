@@ -15,11 +15,11 @@ use crate::node::fault::classify::{
 
 use crate::{
     dfs::{
-        ChunkId, ChunkReceipt, LocalCopyPolicy, OperationId, PlacementSnapshot, ReplicaAck,
+        ChunkId, ChunkReceipt, EffectiveLocalCopy, OperationId, PlacementSnapshot, ReplicaAck,
         ReplicaGroup, ReplicaGroupId, ReplicaTarget, ReplicaWriteGrant, ReplicationConfig,
     },
     node::{
-        chunk::{ChunkStore, LocalChunkStore, PutIntent, StagedChunk, StoredChunk},
+        chunk::{BodyRelease, ChunkSink, LocalChunkStore, PutIntent, StagedChunk, StoredChunk},
         vfs::types::FilesystemCapacity,
     },
 };
@@ -52,6 +52,30 @@ pub trait ReplicaDataPlane: Send + Sync {
     -> Result<Vec<ReplicaAck>>;
 }
 
+/// What a replica chain must prove before a write counts as durable.
+///
+/// Extension point: degraded writes will add a weaker constructor, and need the
+/// chain protocol to return a partial prefix ([`validate_peer_acks`] still
+/// demands the exact tail). Today every plan, repair included, is strict.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AckRequirement {
+    min_acks: usize,
+    min_nodes: usize,
+    min_domains: usize,
+    require_initiator: bool,
+}
+
+impl AckRequirement {
+    pub fn strict(config: &ReplicationConfig, local_copy: EffectiveLocalCopy) -> Self {
+        Self {
+            min_acks: usize::from(config.sync_required_copies),
+            min_nodes: usize::from(config.min_distinct_nodes),
+            min_domains: usize::from(config.min_distinct_failure_domains),
+            require_initiator: local_copy.requires_local(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicationPlan {
     pub chunk_id: ChunkId,
@@ -59,6 +83,8 @@ pub struct ReplicationPlan {
     pub placement_epoch: u64,
     pub replica_group_id: ReplicaGroupId,
     pub config: ReplicationConfig,
+    pub local_copy: EffectiveLocalCopy,
+    pub ack_requirement: AckRequirement,
     pub ordered_targets: Vec<ReplicaTarget>,
 }
 
@@ -86,12 +112,17 @@ impl ReplicaPeerOp {
         if !grant.replication.is_valid() || grant.token.is_empty() {
             return Err(invalid("replica write grant has no valid authority"));
         }
+        // A grant carries no effective value yet; a stage that lowers it must
+        // add one, or receivers will judge the initiator by the declared rule.
+        let local_copy = EffectiveLocalCopy::declared(&grant.replication);
         let plan = ReplicationPlan {
             chunk_id: grant.chunk_id.clone(),
             placement_revision: grant.placement_revision,
             placement_epoch: grant.placement_epoch,
             replica_group_id: grant.replica_group_id.clone(),
             config: grant.replication.clone(),
+            local_copy,
+            ack_requirement: AckRequirement::strict(&grant.replication, local_copy),
             ordered_targets: grant.replica_group.targets.clone(),
         };
         plan.validate_initiator(&grant.initiator_node_id)?;
@@ -213,7 +244,8 @@ impl ReplicationPlan {
         }
         let group = select_replica_group(&staged.chunk.id, snapshot)
             .ok_or_else(|| invalid("placement snapshot contains no replica group"))?;
-        if group.targets.len() < usize::from(snapshot.replication.sync_required_copies) {
+        let ack_requirement = AckRequirement::strict(&snapshot.replication, snapshot.local_copy);
+        if group.targets.len() < ack_requirement.min_acks {
             return Err(Error::coded(
                 afs_error::NODE_VFS_UNIMPLEMENTED,
                 "placement has fewer targets than the configured synchronous copy count",
@@ -225,6 +257,8 @@ impl ReplicationPlan {
             placement_epoch: group.placement_epoch,
             replica_group_id: group.id.clone(),
             config: snapshot.replication.clone(),
+            local_copy: snapshot.local_copy,
+            ack_requirement,
             ordered_targets: group.targets.clone(),
         })
     }
@@ -236,17 +270,14 @@ impl ReplicationPlan {
     }
 
     fn sync_target_count(&self) -> Result<usize> {
-        let minimum = usize::from(
-            self.config
-                .sync_required_copies
-                .max(self.config.min_distinct_nodes),
-        );
+        let minimum = self
+            .ack_requirement
+            .min_acks
+            .max(self.ack_requirement.min_nodes);
         let mut domains = HashSet::new();
         for (index, target) in self.ordered_targets.iter().enumerate() {
             domains.insert(target.device.failure_domain.as_str());
-            if index + 1 >= minimum
-                && domains.len() >= usize::from(self.config.min_distinct_failure_domains)
-            {
+            if index + 1 >= minimum && domains.len() >= self.ack_requirement.min_domains {
                 return Ok(index + 1);
             }
         }
@@ -266,7 +297,7 @@ impl ReplicationPlan {
                 "placement contains multiple targets on the same node",
             ));
         }
-        if self.config.local_copy == LocalCopyPolicy::Required
+        if self.local_copy.requires_local()
             && self
                 .ordered_targets
                 .first()
@@ -319,6 +350,8 @@ impl ReplicationPlan {
             && self.placement_epoch == other.placement_epoch
             && self.replica_group_id == other.replica_group_id
             && self.config == other.config
+            && self.local_copy == other.local_copy
+            && self.ack_requirement == other.ack_requirement
             && self.ordered_targets == other.ordered_targets
     }
 }
@@ -329,61 +362,99 @@ struct ReplicationPlanGroup {
     indexes: Vec<usize>,
 }
 
-pub struct ReplicationEngine {
-    local_node_id: String,
-    local_node_epoch: u64,
+/// The ordered synchronous write: persist on this node when it heads the chain,
+/// forward to the peers, then prove the result against the plan's
+/// [`AckRequirement`]. Normal writes and repair share it; repair only adds the
+/// Meta claim that every hop carries.
+struct ReplicaChain {
+    node_id: String,
+    node_epoch: u64,
     local: Arc<LocalChunkStore>,
-    placement: Arc<dyn PlacementProvider>,
     data_plane: Arc<dyn ReplicaDataPlane>,
 }
 
-impl ReplicationEngine {
-    pub fn new(
-        local_node_id: String,
+impl ReplicaChain {
+    fn new(
+        node_id: String,
+        node_epoch: u64,
         local: Arc<LocalChunkStore>,
-        placement: Arc<dyn PlacementProvider>,
-        data_plane: Arc<dyn ReplicaDataPlane>,
-    ) -> Self {
-        Self::new_with_epoch(local_node_id, 0, local, placement, data_plane)
-    }
-
-    pub fn new_with_epoch(
-        local_node_id: String,
-        local_node_epoch: u64,
-        local: Arc<LocalChunkStore>,
-        placement: Arc<dyn PlacementProvider>,
         data_plane: Arc<dyn ReplicaDataPlane>,
     ) -> Self {
         Self {
-            local_node_id,
-            local_node_epoch,
+            node_id,
+            node_epoch,
             local,
-            placement,
             data_plane,
         }
     }
 
-    fn put_replicated_batch(
+    /// Structural peer setup, before any durable side effect.
+    fn prepare(
+        &self,
+        plan: &ReplicationPlan,
+        repair_claim: Option<&crate::dfs::ReplicationClaim>,
+    ) -> Result<Option<ReplicaPeerOp>> {
+        let mut op = plan.selected_peer_op(&self.node_id, self.node_epoch)?;
+        if let Some(op) = op.as_mut() {
+            op.repair_claim = repair_claim.cloned();
+            self.data_plane.prepare_peer(op)?;
+        }
+        Ok(op)
+    }
+
+    /// Durable on this node if it heads the chain. A later hop failing does not
+    /// roll this back; the unpublished copy is left for GC to collect.
+    fn persist_head(
+        &self,
+        plan: &ReplicationPlan,
+        staged: &[StagedChunk],
+    ) -> Result<Vec<ReplicaAck>> {
+        match plan
+            .ordered_targets
+            .first()
+            .filter(|target| target.node_id == self.node_id)
+        {
+            Some(target) => self.local.persist_batch(
+                staged,
+                target,
+                plan.placement_revision,
+                plan.placement_epoch,
+            ),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn forward(
+        &self,
+        plan: &ReplicationPlan,
+        op: Option<&ReplicaPeerOp>,
+        staged: &StagedChunk,
+        local_ack: Option<ReplicaAck>,
+    ) -> Result<Vec<ReplicaAck>> {
+        let mut durable_acks = local_ack.into_iter().collect::<Vec<_>>();
+        if let Some(op) = op {
+            durable_acks.extend(self.data_plane.put_peer_replica(op, staged)?);
+        }
+        validate_acks(plan, staged, &durable_acks, &self.node_id)?;
+        Ok(durable_acks)
+    }
+
+    fn put_batch(
         &self,
         staged: Vec<StagedChunk>,
-        minimum_revision: u64,
+        snapshot: &PlacementSnapshot,
     ) -> Result<Vec<StoredChunk>> {
-        if staged.is_empty() {
-            return Ok(Vec::new());
-        }
-        let snapshot = self.placement.refresh(minimum_revision)?;
         let plans = staged
             .iter()
-            .map(|item| ReplicationPlan::derive(item, &snapshot))
+            .map(|item| ReplicationPlan::derive(item, snapshot))
             .collect::<Result<Vec<_>>>()?;
         let groups = group_plans(&plans);
 
         // Check the whole batch before creating local durable side effects.
+        let mut ops = Vec::with_capacity(plans.len());
         for plan in &plans {
-            plan.validate_initiator(&self.local_node_id)?;
-            if let Some(op) = plan.selected_peer_op(&self.local_node_id, self.local_node_epoch)? {
-                self.data_plane.prepare_peer(&op)?;
-            }
+            plan.validate_initiator(&self.node_id)?;
+            ops.push(self.prepare(plan, None)?);
         }
 
         let mut receipts = vec![None; staged.len()];
@@ -393,20 +464,7 @@ impl ReplicationEngine {
                 .iter()
                 .map(|index| staged[*index].clone())
                 .collect::<Vec<_>>();
-            let local_acks = match group
-                .plan
-                .ordered_targets
-                .first()
-                .filter(|target| target.node_id == self.local_node_id)
-            {
-                Some(target) => self.local.persist_batch(
-                    &group_staged,
-                    target,
-                    group.plan.placement_revision,
-                    group.plan.placement_epoch,
-                )?,
-                None => Vec::new(),
-            };
+            let local_acks = self.persist_head(&group.plan, &group_staged)?;
             for ((index, item), local_ack) in group.indexes.iter().copied().zip(group_staged).zip(
                 local_acks
                     .into_iter()
@@ -414,13 +472,7 @@ impl ReplicationEngine {
                     .chain(std::iter::repeat(None)),
             ) {
                 let plan = &plans[index];
-                let mut durable_acks = local_ack.into_iter().collect::<Vec<_>>();
-                if let Some(op) =
-                    plan.selected_peer_op(&self.local_node_id, self.local_node_epoch)?
-                {
-                    durable_acks.extend(self.data_plane.put_peer_replica(&op, &item)?);
-                }
-                validate_acks(plan, &item, &durable_acks, &self.local_node_id)?;
+                let durable_acks = self.forward(plan, ops[index].as_ref(), &item, local_ack)?;
                 receipts[index] = Some(StoredChunk::unreleased(ChunkReceipt {
                     external_commit: None,
                     operation_id: item.operation_id,
@@ -437,18 +489,101 @@ impl ReplicationEngine {
             .map(|receipt| receipt.ok_or_else(|| invalid("replication receipt was not produced")))
             .collect()
     }
+
+    /// One chunk along a repair plan the caller has checked is source-first.
+    fn put_repair(
+        &self,
+        plan: &ReplicationPlan,
+        staged: &StagedChunk,
+        claim: &crate::dfs::ReplicationClaim,
+    ) -> Result<Vec<ReplicaAck>> {
+        let op = self.prepare(plan, Some(claim))?;
+        let local_ack = self
+            .persist_head(plan, std::slice::from_ref(staged))?
+            .into_iter()
+            .next();
+        self.forward(plan, op.as_ref(), staged, local_ack)
+    }
 }
 
-pub struct DfsChunkStore {
+/// One synchronous copy on this node: persist locally, nothing to forward.
+/// `DfsChunkSink` only routes here when the placement is a local fast path.
+struct LocalR1Path {
+    node_id: String,
+    local: Arc<LocalChunkStore>,
+}
+
+impl LocalR1Path {
+    fn put_batch(
+        &self,
+        staged: Vec<StagedChunk>,
+        snapshot: &PlacementSnapshot,
+    ) -> Result<Vec<StoredChunk>> {
+        if staged.is_empty() {
+            return Ok(Vec::new());
+        }
+        let plans = staged
+            .iter()
+            .map(|item| ReplicationPlan::derive(item, snapshot))
+            .collect::<Result<Vec<_>>>()?;
+        for plan in &plans {
+            plan.validate_initiator(&self.node_id)?;
+        }
+        let mut receipts = vec![None; staged.len()];
+        for group in group_plans(&plans) {
+            let target = group
+                .plan
+                .local_target(&self.node_id)
+                .ok_or_else(|| invalid("local R1 placement does not contain this node"))?;
+            let group_staged = group
+                .indexes
+                .iter()
+                .map(|index| staged[*index].clone())
+                .collect::<Vec<_>>();
+            let local_acks = self.local.persist_batch(
+                &group_staged,
+                target,
+                group.plan.placement_revision,
+                group.plan.placement_epoch,
+            )?;
+            for ((index, item), ack) in group
+                .indexes
+                .iter()
+                .copied()
+                .zip(group_staged)
+                .zip(local_acks)
+            {
+                receipts[index] = Some(StoredChunk::unreleased(ChunkReceipt {
+                    external_commit: None,
+                    operation_id: item.operation_id,
+                    chunk: item.chunk,
+                    placement_revision: group.plan.placement_revision,
+                    placement_epoch: group.plan.placement_epoch,
+                    replica_group_id: group.plan.replica_group_id.clone(),
+                    durable_acks: vec![ack],
+                }));
+            }
+        }
+        receipts
+            .into_iter()
+            .map(|receipt| receipt.ok_or_else(|| invalid("local receipt was not produced")))
+            .collect()
+    }
+}
+
+/// The native [`ChunkSink`]: routes each batch to [`LocalR1Path`] or
+/// [`ReplicaChain`] and decides the resulting [`BodyRelease`].
+pub struct DfsChunkSink {
     gc_control: Option<Arc<dyn crate::node::gc::GcControl>>,
     local_node_id: String,
     local_node_epoch: Option<u64>,
     local: Arc<LocalChunkStore>,
     placement: Arc<dyn PlacementProvider>,
-    replication: ReplicationEngine,
+    local_r1: LocalR1Path,
+    chain: ReplicaChain,
 }
 
-impl DfsChunkStore {
+impl DfsChunkSink {
     fn reserve_gc_publications(&self, staged: &[StagedChunk]) -> Result<()> {
         if let Some(control) = &self.gc_control {
             let mut operations = std::collections::BTreeMap::<_, Vec<_>>::new();
@@ -476,14 +611,7 @@ impl DfsChunkStore {
         placement: Arc<dyn PlacementProvider>,
         data_plane: Arc<dyn ReplicaDataPlane>,
     ) -> Self {
-        Self {
-            gc_control: None,
-            local_node_id: local_node_id.clone(),
-            local_node_epoch: None,
-            local: local.clone(),
-            placement: placement.clone(),
-            replication: ReplicationEngine::new(local_node_id, local, placement, data_plane),
-        }
+        Self::assemble(local_node_id, None, local, placement, data_plane)
     }
 
     pub fn new_with_epoch(
@@ -493,24 +621,57 @@ impl DfsChunkStore {
         placement: Arc<dyn PlacementProvider>,
         data_plane: Arc<dyn ReplicaDataPlane>,
     ) -> Self {
+        Self::assemble(
+            local_node_id,
+            Some(local_node_epoch),
+            local,
+            placement,
+            data_plane,
+        )
+    }
+
+    fn assemble(
+        local_node_id: String,
+        local_node_epoch: Option<u64>,
+        local: Arc<LocalChunkStore>,
+        placement: Arc<dyn PlacementProvider>,
+        data_plane: Arc<dyn ReplicaDataPlane>,
+    ) -> Self {
         Self {
             gc_control: None,
-            local_node_id: local_node_id.clone(),
-            local_node_epoch: Some(local_node_epoch),
-            local: local.clone(),
-            placement: placement.clone(),
-            replication: ReplicationEngine::new_with_epoch(
-                local_node_id,
-                local_node_epoch,
-                local,
-                placement,
+            local_r1: LocalR1Path {
+                node_id: local_node_id.clone(),
+                local: local.clone(),
+            },
+            chain: ReplicaChain::new(
+                local_node_id.clone(),
+                local_node_epoch.unwrap_or(0),
+                local.clone(),
                 data_plane,
             ),
+            local_node_id,
+            local_node_epoch,
+            local,
+            placement,
         }
     }
 
+    /// The chain always writes under freshly refreshed placement; an empty
+    /// batch asks Meta nothing.
+    fn put_replicated_batch(
+        &self,
+        staged: Vec<StagedChunk>,
+        minimum_revision: u64,
+    ) -> Result<Vec<StoredChunk>> {
+        if staged.is_empty() {
+            return Ok(Vec::new());
+        }
+        let snapshot = self.placement.refresh(minimum_revision)?;
+        self.chain.put_batch(staged, &snapshot)
+    }
+
     fn validate_local_capacity_authority(&self, snapshot: &PlacementSnapshot) -> Result<()> {
-        if !snapshot.replication.is_local_fast_path() {
+        if !snapshot.is_local_fast_path() {
             return Err(unsupported_capacity(
                 "DFS capacity requires local R1 placement authority",
             ));
@@ -549,64 +710,8 @@ impl DfsChunkStore {
         Ok(())
     }
 
-    fn put_local_batch(
-        &self,
-        staged: Vec<StagedChunk>,
-        snapshot: &PlacementSnapshot,
-    ) -> Result<Vec<StoredChunk>> {
-        if staged.is_empty() {
-            return Ok(Vec::new());
-        }
-        let plans = staged
-            .iter()
-            .map(|item| ReplicationPlan::derive(item, snapshot))
-            .collect::<Result<Vec<_>>>()?;
-        for plan in &plans {
-            plan.validate_initiator(&self.local_node_id)?;
-        }
-        let mut receipts = vec![None; staged.len()];
-        for group in group_plans(&plans) {
-            let target = group
-                .plan
-                .local_target(&self.local_node_id)
-                .ok_or_else(|| invalid("local R1 placement does not contain this node"))?;
-            let group_staged = group
-                .indexes
-                .iter()
-                .map(|index| staged[*index].clone())
-                .collect::<Vec<_>>();
-            let local_acks = self.local.persist_batch(
-                &group_staged,
-                target,
-                group.plan.placement_revision,
-                group.plan.placement_epoch,
-            )?;
-            for ((index, item), ack) in group
-                .indexes
-                .iter()
-                .copied()
-                .zip(group_staged)
-                .zip(local_acks)
-            {
-                receipts[index] = Some(StoredChunk::unreleased(ChunkReceipt {
-                    external_commit: None,
-                    operation_id: item.operation_id,
-                    chunk: item.chunk,
-                    placement_revision: group.plan.placement_revision,
-                    placement_epoch: group.plan.placement_epoch,
-                    replica_group_id: group.plan.replica_group_id.clone(),
-                    durable_acks: vec![ack],
-                }));
-            }
-        }
-        receipts
-            .into_iter()
-            .map(|receipt| receipt.ok_or_else(|| invalid("local receipt was not produced")))
-            .collect()
-    }
-
-    /// Under Required policy, an uploaded body may be released once this node's
-    /// exact durable copy of it is proven.
+    /// Under an effective Required policy, an uploaded body may be released once
+    /// this node's exact durable copy of it is proven.
     fn confirm_local_required_copies(&self, stored: &mut [StoredChunk]) -> Result<()> {
         let device = self.local.device_descriptor()?;
         for stored in stored {
@@ -637,13 +742,13 @@ impl DfsChunkStore {
             // Pinning checks catalog and content-addressed identity without
             // another full scan. Every later local read verifies its groups.
             self.local.open_receipt_reader(&receipt.chunk)?;
-            stored.local_required_and_durable = true;
+            stored.body_release = BodyRelease::ReleaseAfterUpload;
         }
         Ok(())
     }
 }
 
-impl ChunkStore for DfsChunkStore {
+impl ChunkSink for DfsChunkSink {
     fn put_chunks(&self, staged: Vec<StagedChunk>, intent: PutIntent) -> Result<Vec<StoredChunk>> {
         // Native writes fence their own write generation at commit; no
         // per-chunk publication registration (S1a-7, F6).
@@ -651,21 +756,18 @@ impl ChunkStore for DfsChunkStore {
             self.reserve_gc_publications(&staged)?;
         }
         let snapshot = self.placement.snapshot()?;
-        let mut stored = if snapshot.replication.is_local_fast_path() {
-            self.put_local_batch(staged, &snapshot)?
+        let mut stored = if snapshot.is_local_fast_path() {
+            self.local_r1.put_batch(staged, &snapshot)?
         } else {
-            self.replication
-                .put_replicated_batch(staged, snapshot.revision)?
+            self.put_replicated_batch(staged, snapshot.revision)?
         };
-        if intent == PutIntent::NativeUpload
-            && snapshot.replication.local_copy == LocalCopyPolicy::Required
-        {
+        if intent == PutIntent::NativeUpload && snapshot.local_copy.requires_local() {
             self.confirm_local_required_copies(&mut stored)?;
         }
         Ok(stored)
     }
 
-    fn native_descriptor_reservation_bytes(&self, operation_id: &OperationId) -> Result<usize> {
+    fn descriptor_reservation_bytes(&self, operation_id: &OperationId) -> Result<usize> {
         let snapshot = self.placement.snapshot()?;
         if !snapshot.replication.is_valid() || snapshot.replica_groups.is_empty() {
             return Err(invalid(
@@ -705,7 +807,7 @@ impl ChunkStore for DfsChunkStore {
             .ok_or_else(|| invalid("native descriptor reservation overflow"))
     }
 
-    fn read_native_uploaded_at(
+    fn read_uploaded_at(
         &self,
         receipt: &ChunkReceipt,
         offset: u64,
@@ -720,10 +822,6 @@ impl ChunkStore for DfsChunkStore {
             self.local.try_quarantine(&receipt.chunk.id);
         }
         result
-    }
-
-    fn read_at(&self, chunk_id: &ChunkId, offset: u64, out: &mut [u8]) -> Result<usize> {
-        self.local.read_at(chunk_id, offset, out)
     }
 
     fn capacity(&self) -> Result<FilesystemCapacity> {
@@ -847,16 +945,16 @@ fn validate_acks(
             .expect("assigned acknowledgement checked above");
         domains.insert(target.device.failure_domain.as_str());
     }
-    if acknowledged_targets.len() < usize::from(plan.config.min_distinct_nodes)
-        || domains.len() < usize::from(plan.config.min_distinct_failure_domains)
-        || (plan.config.local_copy == LocalCopyPolicy::Required
-            && !acknowledged_targets.contains(initiator))
+    let requirement = plan.ack_requirement;
+    if acknowledged_targets.len() < requirement.min_nodes
+        || domains.len() < requirement.min_domains
+        || (requirement.require_initiator && !acknowledged_targets.contains(initiator))
     {
         return Err(invalid(
             "replica acknowledgements violate node, failure-domain or local-copy constraints",
         ));
     }
-    if acknowledged_targets.len() < usize::from(plan.config.sync_required_copies) {
+    if acknowledged_targets.len() < requirement.min_acks {
         return Err(invalid(
             "replica acknowledgements do not satisfy the synchronous copy count",
         ));
@@ -903,7 +1001,7 @@ pub struct ReplicationWorker {
     session_id: String,
     local: Arc<LocalChunkStore>,
     authority: Arc<dyn ReplicationTaskAuthority>,
-    data_plane: Arc<dyn ReplicaDataPlane>,
+    chain: ReplicaChain,
     pending: std::sync::Mutex<Option<PendingRepair>>,
     reported_quarantines: std::sync::Mutex<HashSet<(ChunkId, u64)>>,
     sequence: std::sync::atomic::AtomicU64,
@@ -919,12 +1017,12 @@ impl ReplicationWorker {
         data_plane: Arc<dyn ReplicaDataPlane>,
     ) -> Self {
         Self {
+            chain: ReplicaChain::new(node_id.clone(), node_epoch, local.clone(), data_plane),
             node_id,
             node_epoch,
             session_id,
             local,
             authority,
-            data_plane,
             pending: std::sync::Mutex::new(None),
             reported_quarantines: std::sync::Mutex::new(HashSet::new()),
             sequence: std::sync::atomic::AtomicU64::new(1),
@@ -1141,12 +1239,18 @@ impl ReplicationWorker {
         if staged.chunk != claim.chunk {
             return Err((invalid("repair source identity or digest differs"), true));
         }
+        // Meta forced Required on this claim because a repair source must head
+        // its chain: a chain constraint, not user policy, so it never follows an
+        // effective value. The explicit check below states it again.
+        let local_copy = EffectiveLocalCopy::declared(&claim.replication);
         let plan = ReplicationPlan {
             chunk_id: claim.chunk.id.clone(),
             placement_revision: claim.placement_revision,
             placement_epoch: claim.replica_group.placement_epoch,
             replica_group_id: claim.replica_group.id.clone(),
             config: claim.replication.clone(),
+            local_copy,
+            ack_requirement: AckRequirement::strict(&claim.replication, local_copy),
             ordered_targets: claim.replica_group.targets.clone(),
         };
         plan.validate_initiator(&self.node_id)
@@ -1161,33 +1265,9 @@ impl ReplicationWorker {
                 false,
             ));
         }
-        let mut peer_op = plan
-            .selected_peer_op(&self.node_id, self.node_epoch)
-            .map_err(|error| (error, false))?;
-        if let Some(op) = peer_op.as_mut() {
-            op.repair_claim = Some(claim.clone());
-            self.data_plane
-                .prepare_peer(op)
-                .map_err(|error| (error, false))?;
-        }
-        let mut acks = self
-            .local
-            .persist_batch(
-                std::slice::from_ref(&staged),
-                &plan.ordered_targets[0],
-                plan.placement_revision,
-                plan.placement_epoch,
-            )
-            .map_err(|error| (error, false))?;
-        if let Some(op) = peer_op {
-            acks.extend(
-                self.data_plane
-                    .put_peer_replica(&op, &staged)
-                    .map_err(|error| (error, false))?,
-            );
-        }
-        validate_acks(&plan, &staged, &acks, &self.node_id).map_err(|error| (error, false))?;
-        Ok(acks)
+        self.chain
+            .put_repair(&plan, &staged, claim)
+            .map_err(|error| (error, false))
     }
 }
 
@@ -1348,6 +1428,7 @@ mod tests {
         let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
         let snapshot = Arc::new(PlacementSnapshot {
             revision: 11,
+            local_copy: EffectiveLocalCopy::declared(&config(1)),
             replication: config(1),
             replica_groups: vec![ReplicaGroup {
                 id: ReplicaGroupId::new("native-local"),
@@ -1359,7 +1440,7 @@ mod tests {
                 )],
             }],
         });
-        let store = DfsChunkStore::new_with_epoch(
+        let store = DfsChunkSink::new_with_epoch(
             "node-a".into(),
             1,
             local.clone(),
@@ -1371,12 +1452,12 @@ mod tests {
             .put_chunks(vec![input.clone()], PutIntent::NativeUpload)
             .unwrap();
         let receipt = receipts.remove(0);
-        assert!(receipt.local_required_and_durable);
+        assert_eq!(receipt.body_release, BodyRelease::ReleaseAfterUpload);
         assert_eq!(receipt.receipt.chunk, input.chunk);
         let mut output = [0; 7];
         assert_eq!(
             store
-                .read_native_uploaded_at(&receipt.receipt, 0, &mut output)
+                .read_uploaded_at(&receipt.receipt, 0, &mut output)
                 .unwrap(),
             output.len()
         );
@@ -1384,11 +1465,7 @@ mod tests {
         let mut wrong = receipt.receipt.clone();
         wrong.chunk.length += 1;
         let mut untouched = [0x81; 7];
-        assert!(
-            store
-                .read_native_uploaded_at(&wrong, 0, &mut untouched)
-                .is_err()
-        );
+        assert!(store.read_uploaded_at(&wrong, 0, &mut untouched).is_err());
         assert_eq!(untouched, [0x81; 7]);
         assert!(
             local.open_receipt_reader(&receipt.receipt.chunk).is_ok(),
@@ -1434,6 +1511,7 @@ mod tests {
         let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
         let snapshot = Arc::new(PlacementSnapshot {
             revision: 11,
+            local_copy: EffectiveLocalCopy::declared(&config(1)),
             replication: config(1),
             replica_groups: vec![ReplicaGroup {
                 id: ReplicaGroupId::new("intent"),
@@ -1446,7 +1524,7 @@ mod tests {
             }],
         });
         let control = Arc::new(RecordingGcControl::default());
-        let store = DfsChunkStore::new_with_epoch(
+        let store = DfsChunkSink::new_with_epoch(
             "node-a".into(),
             1,
             local,
@@ -1458,7 +1536,7 @@ mod tests {
         let committed = store
             .put_chunks(vec![staged("intent-commit")], PutIntent::Commit)
             .unwrap();
-        assert!(!committed[0].local_required_and_durable);
+        assert_eq!(committed[0].body_release, BodyRelease::RetainUntilPublish);
         assert_eq!(
             *control.reservations.lock().unwrap(),
             vec![OperationId::new("op-intent-commit")]
@@ -1467,7 +1545,7 @@ mod tests {
         let uploaded = store
             .put_chunks(vec![staged("intent-upload")], PutIntent::NativeUpload)
             .unwrap();
-        assert!(uploaded[0].local_required_and_durable);
+        assert_eq!(uploaded[0].body_release, BodyRelease::ReleaseAfterUpload);
         assert_eq!(control.reservations.lock().unwrap().len(), 1);
     }
 
@@ -1479,6 +1557,7 @@ mod tests {
         policy.local_copy = LocalCopyPolicy::Preferred;
         let snapshot = Arc::new(PlacementSnapshot {
             revision: 7,
+            local_copy: EffectiveLocalCopy::declared(&policy),
             replication: policy,
             replica_groups: vec![ReplicaGroup {
                 id: ReplicaGroupId::new("remote-only"),
@@ -1486,7 +1565,7 @@ mod tests {
                 targets: vec![target("node-b", remote_device("remote-b"))],
             }],
         });
-        let store = DfsChunkStore::new_with_epoch(
+        let store = DfsChunkSink::new_with_epoch(
             "writer".into(),
             1,
             local,
@@ -1497,7 +1576,7 @@ mod tests {
             .put_chunks(vec![staged("remote-native")], PutIntent::NativeUpload)
             .unwrap()
             .remove(0);
-        assert!(!receipt.local_required_and_durable);
+        assert_eq!(receipt.body_release, BodyRelease::RetainUntilPublish);
         assert!(
             receipt
                 .receipt
@@ -1517,6 +1596,7 @@ mod tests {
         remote.node_id = long_node;
         let snapshot = Arc::new(PlacementSnapshot {
             revision: 7,
+            local_copy: EffectiveLocalCopy::declared(&config(1)),
             replication: config(1),
             replica_groups: vec![ReplicaGroup {
                 id: ReplicaGroupId::new("reservation"),
@@ -1524,7 +1604,7 @@ mod tests {
                 targets: vec![target("node-a", local.device_descriptor().unwrap()), remote],
             }],
         });
-        let store = DfsChunkStore::new_with_epoch(
+        let store = DfsChunkSink::new_with_epoch(
             "node-a".into(),
             1,
             local,
@@ -1532,7 +1612,7 @@ mod tests {
             Arc::new(FakeDataPlane::default()),
         );
         let reserved = store
-            .native_descriptor_reservation_bytes(&OperationId::new("native-reservation"))
+            .descriptor_reservation_bytes(&OperationId::new("native-reservation"))
             .unwrap();
         assert!(
             reserved >= 8192 * 8,
@@ -1552,6 +1632,7 @@ mod tests {
         );
         let snapshot = Arc::new(PlacementSnapshot {
             revision: 11,
+            local_copy: EffectiveLocalCopy::declared(&config(1)),
             replication: config(1),
             replica_groups: vec![ReplicaGroup {
                 id: ReplicaGroupId::new("group"),
@@ -1559,7 +1640,7 @@ mod tests {
                 targets: vec![target_with_epoch("node-a", 1, device_before_write)],
             }],
         });
-        let store = DfsChunkStore::new_with_epoch(
+        let store = DfsChunkSink::new_with_epoch(
             "node-a".into(),
             1,
             local,
@@ -1611,6 +1692,7 @@ mod tests {
         for (name, replication, targets, code) in cases {
             let snapshot = Arc::new(PlacementSnapshot {
                 revision: 11,
+                local_copy: EffectiveLocalCopy::declared(&replication),
                 replication,
                 replica_groups: vec![ReplicaGroup {
                     id: ReplicaGroupId::new(format!("group-{name}")),
@@ -1618,7 +1700,7 @@ mod tests {
                     targets,
                 }],
             });
-            let store = DfsChunkStore::new_with_epoch(
+            let store = DfsChunkSink::new_with_epoch(
                 "node-a".into(),
                 1,
                 local.clone(),
@@ -1637,6 +1719,7 @@ mod tests {
         let local_device = local.device_descriptor().unwrap();
         let snapshot = Arc::new(PlacementSnapshot {
             revision: 7,
+            local_copy: EffectiveLocalCopy::declared(&config(3)),
             replication: config(3),
             replica_groups: vec![
                 ReplicaGroup {
@@ -1662,7 +1745,7 @@ mod tests {
         let first = staged_for_group(&snapshot, 1);
         let second = staged_for_group(&snapshot, 0);
         let data_plane = Arc::new(FakeDataPlane::default());
-        let store = DfsChunkStore::new(
+        let store = DfsChunkSink::new(
             "node-a".into(),
             local,
             Arc::new(StaticPlacement {
@@ -1693,6 +1776,7 @@ mod tests {
         let local_device = local.device_descriptor().unwrap();
         let snapshot = Arc::new(PlacementSnapshot {
             revision: 9,
+            local_copy: EffectiveLocalCopy::declared(&config(2)),
             replication: config(2),
             replica_groups: vec![ReplicaGroup {
                 id: ReplicaGroupId::new("group-0"),
@@ -1705,7 +1789,7 @@ mod tests {
         });
         let item = staged("non-head-local");
         let data_plane = Arc::new(FakeDataPlane::default());
-        let store = DfsChunkStore::new(
+        let store = DfsChunkSink::new(
             "node-a".into(),
             local.clone(),
             Arc::new(StaticPlacement { snapshot }),
@@ -1740,6 +1824,7 @@ mod tests {
         };
         let cached = Arc::new(PlacementSnapshot {
             revision: 7,
+            local_copy: EffectiveLocalCopy::declared(&policy),
             replication: policy.clone(),
             replica_groups: vec![ReplicaGroup {
                 id: ReplicaGroupId::new("group"),
@@ -1752,6 +1837,7 @@ mod tests {
         });
         let fresh = Arc::new(PlacementSnapshot {
             revision: 8,
+            local_copy: EffectiveLocalCopy::declared(&policy),
             replication: policy,
             replica_groups: vec![ReplicaGroup {
                 id: ReplicaGroupId::new("group"),
@@ -1769,7 +1855,7 @@ mod tests {
         });
         let plane = Arc::new(FakeDataPlane::default());
         let store =
-            DfsChunkStore::new_with_epoch("node-a".into(), 1, local, placement.clone(), plane);
+            DfsChunkSink::new_with_epoch("node-a".into(), 1, local, placement.clone(), plane);
 
         let chunks = (0..chunk_count)
             .map(|index| staged(&format!("fresh-placement-{sync_required_copies}-{index}")))
@@ -1822,6 +1908,7 @@ mod tests {
             }));
             let snapshot = Arc::new(PlacementSnapshot {
                 revision: 7,
+                local_copy: EffectiveLocalCopy::declared(&config(copies)),
                 replication: config(copies),
                 replica_groups: vec![ReplicaGroup {
                     id: ReplicaGroupId::new("group"),
@@ -1830,7 +1917,7 @@ mod tests {
                 }],
             });
             let plane = Arc::new(FakeDataPlane::default());
-            let store = DfsChunkStore::new_with_epoch(
+            let store = DfsChunkSink::new_with_epoch(
                 "node-a".into(),
                 1,
                 local,
@@ -1852,6 +1939,7 @@ mod tests {
         policy.local_copy = LocalCopyPolicy::Preferred;
         let snapshot = Arc::new(PlacementSnapshot {
             revision: 7,
+            local_copy: EffectiveLocalCopy::declared(&policy),
             replication: policy,
             replica_groups: vec![ReplicaGroup {
                 id: ReplicaGroupId::new("group"),
@@ -1863,7 +1951,7 @@ mod tests {
             }],
         });
         let plane = Arc::new(FakeDataPlane::default());
-        let store = DfsChunkStore::new_with_epoch(
+        let store = DfsChunkSink::new_with_epoch(
             "writer".into(),
             9,
             local.clone(),
@@ -1886,6 +1974,7 @@ mod tests {
         policy.min_distinct_nodes = 1;
         let snapshot = Arc::new(PlacementSnapshot {
             revision: 7,
+            local_copy: EffectiveLocalCopy::declared(&policy),
             replication: policy,
             replica_groups: vec![ReplicaGroup {
                 id: ReplicaGroupId::new("group"),
@@ -1898,7 +1987,7 @@ mod tests {
             }],
         });
         let plane = Arc::new(FakeDataPlane::default());
-        let store = DfsChunkStore::new_with_epoch(
+        let store = DfsChunkSink::new_with_epoch(
             "node-a".into(),
             1,
             local,
@@ -1925,6 +2014,7 @@ mod tests {
         targets[2].device.failure_domain = "zone-2".into();
         let snapshot = PlacementSnapshot {
             revision: 7,
+            local_copy: EffectiveLocalCopy::declared(&policy),
             replication: policy,
             replica_groups: vec![ReplicaGroup {
                 id: ReplicaGroupId::new("g"),
@@ -1941,6 +2031,7 @@ mod tests {
         let item = staged("duplicate-node");
         let snapshot = PlacementSnapshot {
             revision: 7,
+            local_copy: EffectiveLocalCopy::declared(&config(2)),
             replication: config(2),
             replica_groups: vec![ReplicaGroup {
                 id: ReplicaGroupId::new("g"),
@@ -1960,6 +2051,7 @@ mod tests {
         let item = staged("acks");
         let snapshot = PlacementSnapshot {
             revision: 7,
+            local_copy: EffectiveLocalCopy::declared(&config(2)),
             replication: config(2),
             replica_groups: vec![ReplicaGroup {
                 id: ReplicaGroupId::new("g"),
@@ -1984,6 +2076,7 @@ mod tests {
         policy.local_copy = LocalCopyPolicy::NotRequired;
         let snapshot = PlacementSnapshot {
             revision: 7,
+            local_copy: EffectiveLocalCopy::declared(&policy),
             replication: policy,
             replica_groups: vec![ReplicaGroup {
                 id: ReplicaGroupId::new("g"),
@@ -2101,6 +2194,7 @@ mod tests {
         let local = stores["a"].clone();
         let snapshot = Arc::new(PlacementSnapshot {
             revision: 7,
+            local_copy: EffectiveLocalCopy::declared(&config(3)),
             replication: config(3),
             replica_groups: vec![ReplicaGroup {
                 id: ReplicaGroupId::new("g"),
@@ -2112,7 +2206,7 @@ mod tests {
             stores,
             unavailable: Mutex::new(Some("c".into())),
         });
-        let store = DfsChunkStore::new_with_epoch(
+        let store = DfsChunkSink::new_with_epoch(
             "a".into(),
             1,
             local.clone(),
@@ -2194,7 +2288,7 @@ mod tests {
         _temp: tempfile::TempDir,
         local: Arc<LocalChunkStore>,
         plane: Arc<SelectiveFailPlane>,
-        store: DfsChunkStore,
+        store: DfsChunkSink,
     }
 
     fn selective_fail_fixture(
@@ -2206,6 +2300,7 @@ mod tests {
         let peer = Arc::new(LocalChunkStore::open(temp.path().join("b"), "b").unwrap());
         let snapshot = Arc::new(PlacementSnapshot {
             revision: 7,
+            local_copy: EffectiveLocalCopy::declared(&config(2)),
             replication: config(2),
             replica_groups: vec![ReplicaGroup {
                 id: ReplicaGroupId::new("g"),
@@ -2222,7 +2317,7 @@ mod tests {
             fail_hop,
             sent: Mutex::new(Vec::new()),
         });
-        let store = DfsChunkStore::new_with_epoch(
+        let store = DfsChunkSink::new_with_epoch(
             "a".into(),
             1,
             local.clone(),
@@ -2442,6 +2537,353 @@ mod tests {
         )
     }
 
+    /// A placement whose effective rule is set apart from the declared one. No
+    /// production path builds this; these tests show the checks read `effective`.
+    fn effective_snapshot(
+        copies: u16,
+        declared: LocalCopyPolicy,
+        effective: LocalCopyPolicy,
+        targets: Vec<ReplicaTarget>,
+    ) -> Arc<PlacementSnapshot> {
+        let mut replication = config(copies);
+        replication.local_copy = declared;
+        Arc::new(PlacementSnapshot {
+            revision: 11,
+            local_copy: EffectiveLocalCopy::lowered_for_test(declared, effective),
+            replication,
+            replica_groups: vec![ReplicaGroup {
+                id: ReplicaGroupId::new("effective"),
+                placement_epoch: 12,
+                targets,
+            }],
+        })
+    }
+
+    fn sink_on(
+        local: Arc<LocalChunkStore>,
+        snapshot: Arc<PlacementSnapshot>,
+        plane: Arc<FakeDataPlane>,
+    ) -> DfsChunkSink {
+        DfsChunkSink::new_with_epoch(
+            "node-a".into(),
+            1,
+            local,
+            Arc::new(StaticPlacement { snapshot }),
+            plane,
+        )
+    }
+
+    /// N1-N4: one copy on the writer. The fast path, the capacity authority and
+    /// the body release all follow `effective`, whatever was declared.
+    #[test]
+    fn local_head_fast_path_capacity_and_release_follow_effective_local_copy() {
+        use LocalCopyPolicy::{NotRequired, Preferred, Required};
+        for (declared, effective, follows_required) in [
+            (Required, Required, true),
+            (Required, Preferred, false),
+            (Required, NotRequired, false),
+            (Preferred, Preferred, false),
+            (Preferred, Required, true),
+            (NotRequired, NotRequired, false),
+            (NotRequired, Required, true),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+            let here = target_with_epoch("node-a", 1, local.device_descriptor().unwrap());
+            let snapshot = effective_snapshot(1, declared, effective, vec![here]);
+            assert_eq!(snapshot.is_local_fast_path(), follows_required);
+            let plane = Arc::new(FakeDataPlane::default());
+            let sink = sink_on(local.clone(), snapshot, plane.clone());
+
+            let item = staged("effective-local-head");
+            let stored = sink
+                .put_chunks(vec![item.clone()], PutIntent::NativeUpload)
+                .unwrap();
+
+            assert!(holds(&local, &item), "{declared:?}/{effective:?}");
+            assert_eq!(
+                stored[0].body_release,
+                if follows_required {
+                    BodyRelease::ReleaseAfterUpload
+                } else {
+                    BodyRelease::RetainUntilPublish
+                },
+                "{declared:?}/{effective:?}"
+            );
+            assert_eq!(
+                sink.capacity().is_ok(),
+                follows_required,
+                "{declared:?}/{effective:?}"
+            );
+            assert!(plane.prepared.lock().unwrap().is_empty());
+        }
+    }
+
+    /// N5 and N4: a remote head is refused exactly when `effective` is Required,
+    /// before any peer or local side effect.
+    #[test]
+    fn remote_head_is_judged_by_effective_local_copy() {
+        use LocalCopyPolicy::{NotRequired, Preferred, Required};
+        for (declared, effective, accepted) in [
+            (Required, Required, false),
+            (Required, Preferred, true),
+            (Required, NotRequired, true),
+            (Preferred, Preferred, true),
+            (Preferred, Required, false),
+            (NotRequired, NotRequired, true),
+            (NotRequired, Required, false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+            let peer = target("node-b", remote_device("remote-b"));
+            let snapshot = effective_snapshot(1, declared, effective, vec![peer]);
+            let plane = Arc::new(FakeDataPlane::default());
+            let sink = sink_on(local.clone(), snapshot, plane.clone());
+
+            let item = staged("effective-remote-head");
+            let result = sink.put_chunks(vec![item.clone()], PutIntent::NativeUpload);
+
+            assert!(!holds(&local, &item), "{declared:?}/{effective:?}");
+            assert_eq!(result.is_ok(), accepted, "{declared:?}/{effective:?}");
+            assert_eq!(
+                plane.prepared.lock().unwrap().len(),
+                usize::from(accepted),
+                "{declared:?}/{effective:?}"
+            );
+            if let Ok(stored) = result {
+                assert_eq!(stored[0].body_release, BodyRelease::RetainUntilPublish);
+            }
+        }
+    }
+
+    /// N6: whether the initiator must be among the ACKs comes from the plan's
+    /// `AckRequirement`, which follows `effective`.
+    #[test]
+    fn ack_requirement_follows_effective_local_copy() {
+        use LocalCopyPolicy::{Preferred, Required};
+        let item = staged("effective-acks");
+        let targets = vec![
+            target("a", remote_device("d1")),
+            target("b", remote_device("d2")),
+        ];
+        for (declared, effective, initiator_required) in
+            [(Required, Preferred, false), (Preferred, Required, true)]
+        {
+            let snapshot = effective_snapshot(2, declared, effective, targets.clone());
+            let plan = ReplicationPlan::derive(&item, &snapshot).unwrap();
+            assert_eq!(plan.local_copy, snapshot.local_copy);
+            assert_eq!(plan.ack_requirement.require_initiator, initiator_required);
+            let op = plan.selected_peer_op("a", 1).unwrap().unwrap();
+            let acks = [
+                ack_for(&plan.ordered_targets[0], &op, &item),
+                ack_for(&plan.ordered_targets[1], &op, &item),
+            ];
+            assert!(validate_acks(&plan, &item, &acks, "a").is_ok());
+            assert_eq!(
+                validate_acks(&plan, &item, &acks, "writer").is_ok(),
+                !initiator_required
+            );
+        }
+    }
+
+    #[test]
+    fn plans_with_different_effective_local_copy_do_not_share_a_batch_group() {
+        use LocalCopyPolicy::{Preferred, Required};
+        let item = staged("effective-group");
+        let targets = vec![target("a", remote_device("d1"))];
+        let required = effective_snapshot(1, Required, Required, targets.clone());
+        let preferred = effective_snapshot(1, Required, Preferred, targets);
+        let plan = ReplicationPlan::derive(&item, &required).unwrap();
+        assert!(plan.shares_batch_group(&plan.clone()));
+        assert!(!plan.shares_batch_group(&ReplicationPlan::derive(&item, &preferred).unwrap()));
+    }
+
+    /// The only production constructor keeps effective equal to declared, so
+    /// strict requirements read exactly what the config declares.
+    #[test]
+    fn declared_effective_local_copy_keeps_strict_requirement_at_config_values() {
+        for policy in [
+            LocalCopyPolicy::Required,
+            LocalCopyPolicy::Preferred,
+            LocalCopyPolicy::NotRequired,
+        ] {
+            let mut replication = config(3);
+            replication.sync_required_copies = 2;
+            replication.min_distinct_failure_domains = 2;
+            replication.local_copy = policy;
+            let local_copy = EffectiveLocalCopy::declared(&replication);
+            assert_eq!(local_copy.effective_policy(), policy);
+            assert_eq!(
+                AckRequirement::strict(&replication, local_copy),
+                AckRequirement {
+                    min_acks: 2,
+                    min_nodes: 3,
+                    min_domains: 2,
+                    require_initiator: policy == LocalCopyPolicy::Required,
+                }
+            );
+        }
+    }
+
+    /// Test-only writeback shape, proving `ChunkSink` composes: a body becomes
+    /// durable in a staging sink, then uploads through the inner sink, whose
+    /// receipt is the one published. Durable staging is what lets the composite
+    /// release the body even though the inner sink alone would retain it.
+    struct StagingSink {
+        staging: Arc<dyn ChunkSink>,
+        inner: Arc<dyn ChunkSink>,
+    }
+
+    impl ChunkSink for StagingSink {
+        fn put_chunks(
+            &self,
+            staged: Vec<StagedChunk>,
+            intent: PutIntent,
+        ) -> Result<Vec<StoredChunk>> {
+            self.staging.put_chunks(staged.clone(), intent)?;
+            let mut stored = self.inner.put_chunks(staged, intent)?;
+            for stored in &mut stored {
+                stored.body_release = BodyRelease::ReleaseAfterUpload;
+            }
+            Ok(stored)
+        }
+
+        fn descriptor_reservation_bytes(&self, operation_id: &OperationId) -> Result<usize> {
+            Ok(self
+                .staging
+                .descriptor_reservation_bytes(operation_id)?
+                .max(self.inner.descriptor_reservation_bytes(operation_id)?))
+        }
+
+        fn read_uploaded_at(
+            &self,
+            receipt: &ChunkReceipt,
+            offset: u64,
+            out: &mut [u8],
+        ) -> Result<usize> {
+            self.staging.read_uploaded_at(receipt, offset, out)
+        }
+
+        fn capacity(&self) -> Result<FilesystemCapacity> {
+            self.staging.capacity()
+        }
+    }
+
+    struct FailingSink;
+
+    impl ChunkSink for FailingSink {
+        fn put_chunks(&self, _: Vec<StagedChunk>, _: PutIntent) -> Result<Vec<StoredChunk>> {
+            Err(Error::coded(
+                afs_error::NODE_TRANSFER_UNAVAILABLE,
+                "injected sink failure",
+            ))
+        }
+    }
+
+    /// A production local-R1 sink, usable as the staging half.
+    fn staging_sink(temp: &tempfile::TempDir) -> (Arc<LocalChunkStore>, Arc<dyn ChunkSink>) {
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let here = target_with_epoch("node-a", 1, local.device_descriptor().unwrap());
+        let snapshot = effective_snapshot(
+            1,
+            LocalCopyPolicy::Required,
+            LocalCopyPolicy::Required,
+            vec![here],
+        );
+        let plane = Arc::new(FakeDataPlane::default());
+        (local.clone(), Arc::new(sink_on(local, snapshot, plane)))
+    }
+
+    /// A production remote-only chain sink, usable as the upload half.
+    fn upload_sink(temp: &tempfile::TempDir) -> (Arc<FakeDataPlane>, Arc<dyn ChunkSink>) {
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let peer = target("node-b", remote_device("remote-b"));
+        let snapshot = effective_snapshot(
+            1,
+            LocalCopyPolicy::Preferred,
+            LocalCopyPolicy::Preferred,
+            vec![peer],
+        );
+        let plane = Arc::new(FakeDataPlane::default());
+        (
+            plane.clone(),
+            Arc::new(sink_on(local, snapshot, plane.clone())),
+        )
+    }
+
+    #[test]
+    fn composite_sink_stages_then_uploads_through_the_trait() {
+        let (staging_dir, upload_dir) =
+            (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (staged_on, staging) = staging_sink(&staging_dir);
+        let (plane, inner) = upload_sink(&upload_dir);
+        let item = staged("composite-payload");
+
+        // On its own the upload half keeps the body until publication.
+        let alone = inner
+            .put_chunks(vec![staged("composite-alone")], PutIntent::NativeUpload)
+            .unwrap();
+        assert_eq!(alone[0].body_release, BodyRelease::RetainUntilPublish);
+
+        let sink: Arc<dyn ChunkSink> = Arc::new(StagingSink { staging, inner });
+        let stored = sink
+            .put_chunks(vec![item.clone()], PutIntent::NativeUpload)
+            .unwrap();
+
+        // The published receipt is the upload's; the body is durable in staging.
+        assert_eq!(stored[0].receipt.durable_acks.len(), 1);
+        assert_eq!(stored[0].receipt.durable_acks[0].node_id, "node-b");
+        assert_eq!(plane.prepared.lock().unwrap().len(), 2);
+        assert_eq!(stored[0].body_release, BodyRelease::ReleaseAfterUpload);
+        assert!(holds(&staged_on, &item));
+        let mut output = vec![0; item.bytes().len()];
+        assert_eq!(
+            sink.read_uploaded_at(&stored[0].receipt, 0, &mut output)
+                .unwrap(),
+            output.len()
+        );
+        assert_eq!(output, item.bytes());
+        // The rest of the trait goes through the composition too.
+        assert!(sink.capacity().is_ok());
+        assert!(
+            sink.descriptor_reservation_bytes(&item.operation_id)
+                .unwrap()
+                > 0
+        );
+    }
+
+    #[test]
+    fn composite_sink_failures_surface_and_keep_put_chunks_batch_semantics() {
+        let (staging_dir, upload_dir) =
+            (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let item = staged("composite-failure");
+
+        // Upload fails: the whole put fails, and the staged copy is not rolled
+        // back, as with any put_chunks that fails after a durable step.
+        let (staged_on, staging) = staging_sink(&staging_dir);
+        let sink: Arc<dyn ChunkSink> = Arc::new(StagingSink {
+            staging,
+            inner: Arc::new(FailingSink),
+        });
+        let error = sink
+            .put_chunks(vec![item.clone()], PutIntent::NativeUpload)
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_TRANSFER_UNAVAILABLE);
+        assert!(holds(&staged_on, &item));
+
+        // Staging fails: nothing reaches the upload half.
+        let (plane, inner) = upload_sink(&upload_dir);
+        let sink: Arc<dyn ChunkSink> = Arc::new(StagingSink {
+            staging: Arc::new(FailingSink),
+            inner,
+        });
+        assert!(
+            sink.put_chunks(vec![item], PutIntent::NativeUpload)
+                .is_err()
+        );
+        assert!(plane.prepared.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn repair_claim_survives_common_grpc_and_rdma_replica_header() {
         let (_temp, _local, authority, _plane) = repair_fixture("repair-payload");
@@ -2453,6 +2895,11 @@ mod tests {
             placement_epoch: claim.replica_group.placement_epoch,
             replica_group_id: claim.replica_group.id.clone(),
             config: claim.replication.clone(),
+            local_copy: EffectiveLocalCopy::declared(&claim.replication),
+            ack_requirement: AckRequirement::strict(
+                &claim.replication,
+                EffectiveLocalCopy::declared(&claim.replication),
+            ),
             ordered_targets: claim.replica_group.targets.clone(),
         };
         let mut op = plan.selected_peer_op("a", 1).unwrap().unwrap();
@@ -2490,6 +2937,11 @@ mod tests {
             placement_epoch: claim.replica_group.placement_epoch,
             replica_group_id: claim.replica_group.id.clone(),
             config: claim.replication.clone(),
+            local_copy: EffectiveLocalCopy::declared(&claim.replication),
+            ack_requirement: AckRequirement::strict(
+                &claim.replication,
+                EffectiveLocalCopy::declared(&claim.replication),
+            ),
             ordered_targets: claim.replica_group.targets.clone(),
         };
         let op = plan.selected_peer_op("a", 1).unwrap().unwrap();
@@ -2820,7 +3272,7 @@ mod tests {
     enum BenchPlacement {
         /// `is_local_fast_path`: one Required copy on this node.
         LocalFastRequired,
-        /// One Preferred copy on this node: replication engine, local persist.
+        /// One Preferred copy on this node: replica chain, local persist.
         LocalPreferred,
         /// Two Required copies: local persist plus the fake peer.
         ReplicatedRequired,
@@ -2841,7 +3293,7 @@ mod tests {
             }
         }
 
-        fn store(self, local: Arc<LocalChunkStore>) -> DfsChunkStore {
+        fn store(self, local: Arc<LocalChunkStore>) -> DfsChunkSink {
             let device = local.device_descriptor().unwrap();
             let here = target_with_epoch("node-a", 1, device);
             let peer = target("node-b", remote_device("remote-b"));
@@ -2856,6 +3308,7 @@ mod tests {
             replication.local_copy = policy;
             let snapshot = Arc::new(PlacementSnapshot {
                 revision: 11,
+                local_copy: EffectiveLocalCopy::declared(&replication),
                 replication,
                 replica_groups: vec![ReplicaGroup {
                     id: ReplicaGroupId::new("bench"),
@@ -2863,7 +3316,7 @@ mod tests {
                     targets,
                 }],
             });
-            DfsChunkStore::new_with_epoch(
+            DfsChunkSink::new_with_epoch(
                 "node-a".into(),
                 1,
                 local,

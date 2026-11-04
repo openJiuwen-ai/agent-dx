@@ -219,7 +219,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = LocalChunkStore::open(root.path(), "n").unwrap();
         let staged = StagedChunk::new(OperationId::new("p"), b"state".to_vec());
-        ChunkStore::put(&store, staged.clone()).unwrap();
+        ChunkSink::put(&store, staged.clone()).unwrap();
         let prefix = fs::read(&store.catalog_path).unwrap();
         store.collect_generation(1, &[staged.chunk.id]).unwrap();
         let mut torn = prefix.clone();
@@ -237,7 +237,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = LocalChunkStore::open(root.path(), "n").unwrap();
         let staged = StagedChunk::new(OperationId::new("upload"), b"state".to_vec());
-        ChunkStore::put(&store, staged.clone()).unwrap();
+        ChunkSink::put(&store, staged.clone()).unwrap();
         let reader = store.open_verified(&staged.chunk.id).unwrap();
         store
             .collect_generation(1, std::slice::from_ref(&staged.chunk.id))
@@ -250,7 +250,7 @@ mod tests {
         drop(store);
         let store = LocalChunkStore::open(root.path(), "n").unwrap();
         assert_eq!(store.gc_generation().unwrap(), 1);
-        ChunkStore::put(&store, staged.clone()).unwrap();
+        ChunkSink::put(&store, staged.clone()).unwrap();
         store
             .collect_generation(1, std::slice::from_ref(&staged.chunk.id))
             .unwrap();
@@ -266,7 +266,7 @@ mod tests {
                 OperationId::new(format!("p-{generation}")),
                 vec![generation as u8; 1024],
             );
-            ChunkStore::put(&store, staged.clone()).unwrap();
+            ChunkSink::put(&store, staged.clone()).unwrap();
             store
                 .collect_generation(generation, &[staged.chunk.id])
                 .unwrap();
@@ -282,7 +282,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = LocalChunkStore::open(root.path(), "n").unwrap();
         let staged = StagedChunk::new(OperationId::new("p"), vec![3; 64]);
-        ChunkStore::put(&store, staged.clone()).unwrap();
+        ChunkSink::put(&store, staged.clone()).unwrap();
         fs::create_dir(root.path().join("catalog.snapshot.tmp")).unwrap();
         assert!(
             store
@@ -301,7 +301,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let store = LocalChunkStore::open(root.path(), "n").unwrap();
         let staged = StagedChunk::new(OperationId::new("p"), vec![8; 64]);
-        ChunkStore::put(&store, staged.clone()).unwrap();
+        ChunkSink::put(&store, staged.clone()).unwrap();
         let old_wal = fs::read(&store.catalog_path).unwrap();
         store
             .collect_generation(1, std::slice::from_ref(&staged.chunk.id))

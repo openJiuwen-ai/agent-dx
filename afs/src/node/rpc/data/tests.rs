@@ -2,7 +2,7 @@ use super::*;
 #[cfg(feature = "ownerfs")]
 use super::{make_owner_files_server, make_owner_files_server_with_handler};
 #[cfg(feature = "dfs")]
-use crate::node::chunk::ChunkStore;
+use crate::node::chunk::ChunkSink;
 use crate::node::rpc::{
     control::make_control_server,
     peer::{DataClientOptions, DataMode, connect_data_client},
@@ -1463,7 +1463,7 @@ async fn run_repair_tick(
 fn read_whole_chunk(store: &LocalChunkStore, chunk: &crate::dfs::ChunkObject) -> Vec<u8> {
     let mut bytes = vec![0; chunk.length as usize];
     assert_eq!(
-        crate::node::chunk::ChunkStore::read_at(store, &chunk.id, 0, &mut bytes).unwrap(),
+        store.read_at(&chunk.id, 0, &mut bytes).unwrap(),
         bytes.len()
     );
     bytes

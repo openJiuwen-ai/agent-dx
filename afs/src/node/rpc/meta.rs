@@ -2961,12 +2961,15 @@ fn domain_replica_target(
 fn domain_placement_snapshot(
     snapshot: afs_protocol::meta::DfsPlacementSnapshot,
 ) -> afs_error::Result<crate::dfs::PlacementSnapshot> {
+    let replication = domain_replication_config(required(
+        snapshot.replication,
+        "DfsPlacementSnapshot.replication",
+    )?)?;
     Ok(crate::dfs::PlacementSnapshot {
         revision: snapshot.revision,
-        replication: domain_replication_config(required(
-            snapshot.replication,
-            "DfsPlacementSnapshot.replication",
-        )?)?,
+        // Not on the wire: effective equals declared until Meta can lower it.
+        local_copy: crate::dfs::EffectiveLocalCopy::declared(&replication),
+        replication,
         replica_groups: snapshot
             .replica_groups
             .into_iter()
@@ -3887,6 +3890,33 @@ mod tests {
     use super::*;
     use crate::node::vfs::dfs::DfsMeta;
 
+    /// The effective rule is not on the wire: a Node derives it while decoding.
+    #[test]
+    fn decoded_placement_snapshot_derives_effective_local_copy_from_declared() {
+        for policy in [
+            crate::dfs::LocalCopyPolicy::Required,
+            crate::dfs::LocalCopyPolicy::Preferred,
+            crate::dfs::LocalCopyPolicy::NotRequired,
+        ] {
+            let replication = crate::dfs::ReplicationConfig {
+                local_copy: policy,
+                ..crate::dfs::ReplicationConfig::local_single_copy()
+            };
+            let snapshot = domain_placement_snapshot(afs_protocol::meta::DfsPlacementSnapshot {
+                revision: 7,
+                replication: Some(wire_replication_config(replication.clone())),
+                replica_groups: Vec::new(),
+            })
+            .unwrap();
+            assert_eq!(snapshot.replication, replication);
+            assert_eq!(
+                snapshot.local_copy,
+                crate::dfs::EffectiveLocalCopy::declared(&replication)
+            );
+            assert_eq!(snapshot.local_copy.effective_policy(), policy);
+        }
+    }
+
     #[test]
     fn chunk_source_ranges_wire_roundtrip_and_legacy_fallback() {
         use prost::Message;
@@ -4366,6 +4396,9 @@ mod tests {
                 use crate::node::{replication::PlacementProvider, vfs::dfs::DfsMeta};
                 let cached = Arc::new(crate::dfs::PlacementSnapshot {
                     revision: 9,
+                    local_copy: crate::dfs::EffectiveLocalCopy::declared(
+                        &crate::dfs::ReplicationConfig::local_single_copy(),
+                    ),
                     replication: crate::dfs::ReplicationConfig::local_single_copy(),
                     replica_groups: Vec::new(),
                 });

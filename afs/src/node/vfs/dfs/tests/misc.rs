@@ -172,7 +172,7 @@ fn pr88_fix_crc32c_tail_partial_success_retry_keeps_ids_and_receipts() {
         inner: Arc<LocalChunkStore>,
         attempts: Mutex<Vec<ChunkObject>>,
     }
-    impl ChunkStore for LostSecondReceipt {
+    impl ChunkSink for LostSecondReceipt {
         fn put_chunks(
             &self,
             staged: Vec<StagedChunk>,
@@ -189,11 +189,15 @@ fn pr88_fix_crc32c_tail_partial_success_retry_keeps_ids_and_receipts() {
                 return Err(unavailable("injected lost second durable receipt"));
             }
             for stored in &mut stored {
-                stored.local_required_and_durable = intent == PutIntent::NativeUpload;
+                stored.body_release = if intent == PutIntent::NativeUpload {
+                    BodyRelease::ReleaseAfterUpload
+                } else {
+                    BodyRelease::RetainUntilPublish
+                };
             }
             Ok(stored)
         }
-        fn read_native_uploaded_at(
+        fn read_uploaded_at(
             &self,
             receipt: &ChunkReceipt,
             offset: u64,
@@ -202,9 +206,6 @@ fn pr88_fix_crc32c_tail_partial_success_retry_keeps_ids_and_receipts() {
             self.inner
                 .open_receipt_reader(&receipt.chunk)?
                 .read_at(offset, out)
-        }
-        fn read_at(&self, id: &crate::dfs::ChunkId, offset: u64, out: &mut [u8]) -> Result<usize> {
-            self.inner.read_at(id, offset, out)
         }
     }
     let meta = Arc::new(RecordingMeta::new());
@@ -375,22 +376,13 @@ fn crc32c_vfs_partial_overwrite_and_truncate() {
 
 #[cfg(feature = "dfs")]
 struct UnsupportedCapacityChunkStore {
-    inner: Arc<dyn ChunkStore>,
+    inner: Arc<dyn ChunkSink>,
 }
 
 #[cfg(feature = "dfs")]
-impl ChunkStore for UnsupportedCapacityChunkStore {
+impl ChunkSink for UnsupportedCapacityChunkStore {
     fn put_chunks(&self, staged: Vec<StagedChunk>, _: PutIntent) -> Result<Vec<StoredChunk>> {
         self.inner.put_chunks(staged, PutIntent::Commit)
-    }
-
-    fn read_at(
-        &self,
-        chunk_id: &crate::dfs::ChunkId,
-        offset: u64,
-        out: &mut [u8],
-    ) -> Result<usize> {
-        self.inner.read_at(chunk_id, offset, out)
     }
 }
 
@@ -511,20 +503,12 @@ fn s1a_native_upload_failure_is_reported_twice_to_the_same_handle_today() {
         inner: Arc<LocalChunkStore>,
         fail: AtomicBool,
     }
-    impl ChunkStore for FailOnceStore {
+    impl ChunkSink for FailOnceStore {
         fn put_chunks(&self, staged: Vec<StagedChunk>, _: PutIntent) -> Result<Vec<StoredChunk>> {
             if self.fail.swap(false, Ordering::SeqCst) {
                 return Err(unavailable("injected upload failure"));
             }
             self.inner.put_chunks(staged, PutIntent::Commit)
-        }
-        fn read_at(
-            &self,
-            chunk_id: &crate::dfs::ChunkId,
-            offset: u64,
-            out: &mut [u8],
-        ) -> Result<usize> {
-            self.inner.read_at(chunk_id, offset, out)
         }
     }
     let meta = Arc::new(RecordingMeta::new());
@@ -573,7 +557,7 @@ fn crc32c_native_preupload_retry_preserves_immutable_id() {
         fail: AtomicBool,
         attempts: Mutex<Vec<Vec<ChunkObject>>>,
     }
-    impl ChunkStore for FailOnceStore {
+    impl ChunkSink for FailOnceStore {
         fn put_chunks(&self, staged: Vec<StagedChunk>, _: PutIntent) -> Result<Vec<StoredChunk>> {
             self.attempts
                 .lock()
@@ -583,14 +567,6 @@ fn crc32c_native_preupload_retry_preserves_immutable_id() {
                 return Err(unavailable("injected prepare put failure"));
             }
             self.inner.put_chunks(staged, PutIntent::Commit)
-        }
-        fn read_at(
-            &self,
-            chunk_id: &crate::dfs::ChunkId,
-            offset: u64,
-            out: &mut [u8],
-        ) -> Result<usize> {
-            self.inner.read_at(chunk_id, offset, out)
         }
     }
     let meta = Arc::new(RecordingMeta::new());

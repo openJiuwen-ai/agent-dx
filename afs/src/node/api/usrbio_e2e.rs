@@ -1,6 +1,6 @@
 //! 真 DFS 后端上的 usrbio 端到端验证（crate 内用例）。
 //!
-//! 放在 crate 内而不是 `tests/`：`impl ChunkStore for LocalChunkStore` 是 `#[cfg(test)]` 的，
+//! 放在 crate 内而不是 `tests/`：`impl ChunkSink for LocalChunkStore` 是 `#[cfg(test)]` 的，
 //! 独立 crate 的集成测试看不到它，而生产路径正是用它装配 `DistributedFs`。
 //!
 //! 已有的 usrbio 用例全部跑在内存假后端上，证明的是"环与 iov 的语义"；本文件证明
@@ -165,8 +165,8 @@ async fn real_dfs(temp: &std::path::Path) -> (Arc<DistributedFs>, tokio::task::J
         Arc::new(NoPeerTransfer),
         DfsReadConfig::default(),
     ));
-    // 生产装配用的是 `DfsChunkStore`：它向 Meta 取真实 placement 再生成 receipt，
-    // 落盘仍然由本地 `LocalChunkStore` 完成。直接用 `LocalChunkStore` 当 `ChunkStore` 走的是
+    // 生产装配用的是 `DfsChunkSink`：它向 Meta 取真实 placement 再生成 receipt，
+    // 落盘仍然由本地 `LocalChunkStore` 完成。直接用 `LocalChunkStore` 当 `ChunkSink` 走的是
     // `#[cfg(test)]` 的脚手架实现（placement 是写死的假值），`fsync` 必然失败。
     let peers = Arc::new(
         crate::node::rpc::peer::PeerConnectionPool::new(
@@ -187,8 +187,8 @@ async fn real_dfs(temp: &std::path::Path) -> (Arc<DistributedFs>, tokio::task::J
         None,
     )
     .expect("replica data plane");
-    let chunk_store: Arc<dyn crate::node::chunk::ChunkStore> =
-        Arc::new(crate::node::replication::DfsChunkStore::new_with_epoch(
+    let chunk_store: Arc<dyn crate::node::chunk::ChunkSink> =
+        Arc::new(crate::node::replication::DfsChunkSink::new_with_epoch(
             "node-a".to_owned(),
             node_epoch,
             chunks,
@@ -291,7 +291,7 @@ async fn usrbio_round_trips_on_a_real_dfs_backend() {
         .expect("write on real dfs");
     assert_eq!(written, 6);
 
-    // 真实落盘：`DfsChunkStore` 会向 Meta 取真实 placement 生成 receipt，
+    // 真实落盘：`DfsChunkSink` 会向 Meta 取真实 placement 生成 receipt，
     // 数据最终由本地 `LocalChunkStore` 写到磁盘上。
     client
         .sync(&file.handle, DfsSyncMode::Data)
@@ -348,7 +348,7 @@ async fn usrbio_round_trips_on_a_real_dfs_backend() {
 /// `cargo test --release -p afs --lib usrbio_perf -- --ignored --nocapture`。
 ///
 /// 它量的是**本层**（环提交 + iov 管理 + UDS 往返）的增量，不是磁盘带宽：写入落在 DFS 的
-/// 写缓冲里（本快照缺生产版 `ChunkStore`，`fsync` 无法验证，见上面的说明）。
+/// 写缓冲里（本快照缺生产版 `ChunkSink`，`fsync` 无法验证，见上面的说明）。
 #[ignore = "性能测量，不在门禁里跑"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn usrbio_perf_single_vs_batch() {
@@ -398,7 +398,7 @@ async fn usrbio_perf_single_vs_batch() {
     let mut ring = client.create_ring(&iov, 256, 0, 500).await.expect("ring");
     let registration = client.register_file(&file).await.expect("register");
 
-    // 每种负载的总写入量都压在 2–4 MiB：本快照缺生产版 ChunkStore，累计写入到缓冲阈值后
+    // 每种负载的总写入量都压在 2–4 MiB：本快照缺生产版 ChunkSink，累计写入到缓冲阈值后
     // DFS 会触发落盘并撞上测试脚手架的假 receipt。测每 IO 成本不需要大数据量。
     for (payload_len, ops) in [(4096_usize, 512), (65536, 48)] {
         let payload = vec![0x5a_u8; payload_len];
@@ -469,7 +469,7 @@ async fn usrbio_perf_single_vs_batch() {
 
 /// 大流量吞吐：秒级测量，不靠"小样本除以条数"凑出纳秒级读数。
 ///
-/// 走内存后端而不是真 DFS —— 本快照缺生产版 `ChunkStore`，真 DFS 累计写约 8 MiB 就会触发落盘
+/// 走内存后端而不是真 DFS —— 本快照缺生产版 `ChunkSink`，真 DFS 累计写约 8 MiB 就会触发落盘
 /// 并撞上测试脚手架的假 receipt。内存后端没有这条路径，可以灌任意大的数据量，因此适合测
 /// **本层**（环提交 + iov 管理 + UDS 往返）的带宽。
 ///
@@ -803,7 +803,7 @@ async fn usrbio_writes_are_visible_through_the_backend_read_path() {
 /// 真实磁盘吞吐：写 1 GiB 到本地盘（含 fsync），再读回 1 GiB。
 ///
 /// 与 `usrbio_perf_bulk_throughput` 的区别很关键：那条走内存后端，测的是本层开销；
-/// 这条走生产装配（`DfsChunkStore` → 本地 `LocalChunkStore` → 磁盘），
+/// 这条走生产装配（`DfsChunkSink` → 本地 `LocalChunkStore` → 磁盘），
 /// 因此会真正暴露磁盘带宽与落盘代价。
 ///
 /// `cargo test --release -p afs --lib usrbio_perf_real_disk -- --ignored --nocapture --test-threads=1`

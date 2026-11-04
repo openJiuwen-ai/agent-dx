@@ -775,20 +775,24 @@ fn test_fs() -> (tempfile::TempDir, Arc<RecordingMeta>, DistributedFs) {
     (temp, meta, fs)
 }
 
-/// 生产默认（单副本、`dfs_local_copy = "required"`）下 `DfsChunkStore` 给 native 上传的回执标
-/// `local_required_and_durable`，上传完成即释放内存正文；测试的本地仓同样标记，
+/// 生产默认（单副本、`dfs_local_copy = "required"`）下 `DfsChunkSink` 给 native 上传的回执标
+/// `BodyRelease::ReleaseAfterUpload`，上传完成即释放内存正文；测试的本地仓同样标记，
 /// 否则测的是"非本地副本、正文保留到发布"那一支。
 struct LocalRequiredChunkStore(Arc<LocalChunkStore>);
 
-impl ChunkStore for LocalRequiredChunkStore {
+impl ChunkSink for LocalRequiredChunkStore {
     fn put_chunks(&self, staged: Vec<StagedChunk>, intent: PutIntent) -> Result<Vec<StoredChunk>> {
         let mut stored = self.0.put_chunks(staged, intent)?;
         for stored in &mut stored {
-            stored.local_required_and_durable = intent == PutIntent::NativeUpload;
+            stored.body_release = if intent == PutIntent::NativeUpload {
+                BodyRelease::ReleaseAfterUpload
+            } else {
+                BodyRelease::RetainUntilPublish
+            };
         }
         Ok(stored)
     }
-    fn read_native_uploaded_at(
+    fn read_uploaded_at(
         &self,
         receipt: &ChunkReceipt,
         offset: u64,
@@ -798,18 +802,15 @@ impl ChunkStore for LocalRequiredChunkStore {
             .open_receipt_reader(&receipt.chunk)?
             .read_at(offset, out)
     }
-    fn read_at(&self, chunk: &crate::dfs::ChunkId, offset: u64, out: &mut [u8]) -> Result<usize> {
-        self.0.read_at(chunk, offset, out)
-    }
     fn capacity(&self) -> Result<FilesystemCapacity> {
-        ChunkStore::capacity(self.0.as_ref())
+        ChunkSink::capacity(self.0.as_ref())
     }
 }
 
 fn distributed_fs_with_chunk_store(
     meta: Arc<RecordingMeta>,
     local: Arc<LocalChunkStore>,
-    chunk_store: Arc<dyn ChunkStore>,
+    chunk_store: Arc<dyn ChunkSink>,
 ) -> DistributedFs {
     let read_engine = Arc::new(crate::node::dfs_read::DfsReadEngine::new(
         NamespaceId::new("default"),
@@ -850,7 +851,7 @@ fn test_dfs_new(
     node_id: impl Into<String>,
     session_id: impl Into<String>,
     meta: Arc<dyn DfsMeta>,
-    chunk_store: Arc<dyn ChunkStore>,
+    chunk_store: Arc<dyn ChunkSink>,
     read_engine: Arc<DfsReadEngine>,
 ) -> DistributedFs {
     DistributedFs::new(
@@ -1173,7 +1174,7 @@ impl FakeS3Store {
     }
 }
 
-impl ChunkStore for FakeS3Store {
+impl ChunkSink for FakeS3Store {
     fn put_chunks(&self, staged: Vec<StagedChunk>, _: PutIntent) -> Result<Vec<StoredChunk>> {
         if self.fail_next.swap(false, Ordering::SeqCst) {
             return Err(unavailable("injected S3 PUT failure"));
@@ -1201,22 +1202,6 @@ impl ChunkStore for FakeS3Store {
                 })
             })
             .collect())
-    }
-
-    fn read_at(
-        &self,
-        chunk_id: &crate::dfs::ChunkId,
-        offset: u64,
-        out: &mut [u8],
-    ) -> Result<usize> {
-        let chunks = self.fixture.chunks.lock().unwrap();
-        let (_, bytes) = chunks
-            .get(chunk_id)
-            .ok_or_else(|| Error::coded(afs_error::NODE_VFS_NOT_FOUND, "no such object"))?;
-        let start = (offset as usize).min(bytes.len());
-        let size = out.len().min(bytes.len() - start);
-        out[..size].copy_from_slice(&bytes[start..start + size]);
-        Ok(size)
     }
 }
 
@@ -1263,7 +1248,7 @@ fn test_fs_on_fake_s3() -> (
 
 #[cfg(feature = "dfs")]
 struct CountingChunkStore {
-    inner: Arc<dyn ChunkStore>,
+    inner: Arc<dyn ChunkSink>,
     put_batches: AtomicUsize,
     capacity_calls: AtomicUsize,
     fail_empty_prepare: AtomicBool,
@@ -1271,7 +1256,7 @@ struct CountingChunkStore {
 
 #[cfg(feature = "dfs")]
 impl CountingChunkStore {
-    fn new(inner: Arc<dyn ChunkStore>) -> Self {
+    fn new(inner: Arc<dyn ChunkSink>) -> Self {
         Self {
             inner,
             put_batches: AtomicUsize::new(0),
@@ -1290,7 +1275,7 @@ impl CountingChunkStore {
 }
 
 #[cfg(feature = "dfs")]
-impl ChunkStore for CountingChunkStore {
+impl ChunkSink for CountingChunkStore {
     fn put_chunks(&self, staged: Vec<StagedChunk>, _: PutIntent) -> Result<Vec<StoredChunk>> {
         self.put_batches.fetch_add(1, Ordering::SeqCst);
         if staged.is_empty() && self.fail_empty_prepare.swap(false, Ordering::SeqCst) {
@@ -1299,15 +1284,6 @@ impl ChunkStore for CountingChunkStore {
             ));
         }
         self.inner.put_chunks(staged, PutIntent::Commit)
-    }
-
-    fn read_at(
-        &self,
-        chunk_id: &crate::dfs::ChunkId,
-        offset: u64,
-        out: &mut [u8],
-    ) -> Result<usize> {
-        self.inner.read_at(chunk_id, offset, out)
     }
 
     fn capacity(&self) -> Result<FilesystemCapacity> {

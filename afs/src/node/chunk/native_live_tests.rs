@@ -394,7 +394,7 @@ fn p2_w2_native_default_receipts_never_claim_required_local_release() {
     );
     assert_eq!(
         store
-            .native_descriptor_reservation_bytes(&staged.operation_id)
+            .descriptor_reservation_bytes(&staged.operation_id)
             .unwrap(),
         16 * 1024
     );
@@ -404,11 +404,11 @@ fn p2_w2_native_default_receipts_never_claim_required_local_release() {
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0].receipt.chunk, staged.chunk);
     assert_eq!(receipts[0].receipt.operation_id, staged.operation_id);
-    assert!(!receipts[0].local_required_and_durable);
+    assert_eq!(receipts[0].body_release, BodyRelease::RetainUntilPublish);
     let mut output = [9; 3];
     assert_eq!(
         store
-            .read_native_uploaded_at(&receipts[0].receipt, 0, &mut output)
+            .read_uploaded_at(&receipts[0].receipt, 0, &mut output)
             .unwrap_err()
             .code(),
         afs_error::NODE_VFS_UNIMPLEMENTED
@@ -426,7 +426,7 @@ fn p2_w2_native_custom_descriptor_allowance_rejects_oversized_actual_operation_c
     assert_eq!(operation.0.len(), 1);
     assert_eq!(
         store
-            .native_descriptor_reservation_bytes(&operation)
+            .descriptor_reservation_bytes(&operation)
             .unwrap_err()
             .code(),
         afs_error::IO_CAPACITY

@@ -463,7 +463,7 @@ impl DistributedFs {
     ) -> Result<Option<Arc<Mutex<NativeMetadataLease>>>> {
         let reservation = self
             .chunk_store
-            .native_descriptor_reservation_bytes(operation_id)?;
+            .descriptor_reservation_bytes(operation_id)?;
         if reservation > NATIVE_DESCRIPTOR_BYTES {
             return Err(Error::coded(
                 afs_error::IO_CAPACITY,
@@ -573,10 +573,9 @@ impl DistributedFs {
             extent.native_upload.as_ref().is_some_and(|upload| {
                 upload.state.lock().is_ok_and(|state| {
                     state.terminal_error.is_none()
-                        && state
-                            .receipt
-                            .as_ref()
-                            .is_some_and(|receipt| !receipt.local_required_and_durable)
+                        && state.receipt.as_ref().is_some_and(|receipt| {
+                            receipt.body_release == BodyRelease::RetainUntilPublish
+                        })
                 })
             })
         });
@@ -865,7 +864,7 @@ impl DistributedFs {
                 let Some(Ok(receipt)) = result.take() else {
                     return Err(unavailable("native installer lost its validated receipt"));
                 };
-                if receipt.local_required_and_durable {
+                if receipt.body_release == BodyRelease::ReleaseAfterUpload {
                     state.body = None;
                 }
                 state.receipt = Some(receipt);

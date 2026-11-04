@@ -781,7 +781,7 @@ impl LocalChunkStore {
 }
 
 #[cfg(test)]
-impl ChunkStore for LocalChunkStore {
+impl ChunkSink for LocalChunkStore {
     fn put_chunks(&self, staged: Vec<StagedChunk>, _intent: PutIntent) -> Result<Vec<StoredChunk>> {
         let descriptor = self.device_descriptor()?;
         let target = ReplicaTarget {
@@ -806,10 +806,6 @@ impl ChunkStore for LocalChunkStore {
                 })
             })
             .collect())
-    }
-
-    fn read_at(&self, chunk_id: &ChunkId, offset: u64, out: &mut [u8]) -> Result<usize> {
-        LocalChunkStore::read_at(self, chunk_id, offset, out)
     }
 
     fn capacity(&self) -> Result<FilesystemCapacity> {
