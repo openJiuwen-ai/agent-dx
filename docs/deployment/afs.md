@@ -187,6 +187,329 @@ path、mount ID 和 source 同时作为 readiness 身份；挂载被替换时健
 - 同一 Node 只启用管理员控制的 host bind entry；
 - 停机、root/epoch 变化或授权失效前，先停止受管用户并排空引用。
 
+## HIXL DFS 远端读
+
+DFS FUSE 的读取策略独立于传输选择。Node 根配置 `dfs_fuse_read_mode = "cached"`
+为默认值；批量顺序读可设置 `"direct"`，CLI 对应 `--dfs-fuse-read-mode direct`。
+它仅改变只读打开的 FUSE 回复，可写打开保留缓存的 write-through 和 mmap 路径。
+direct 可绕过小的内核预读窗口，但不保证每次请求达到配置的窗口容量。需要只读 mmap
+且内核不支持 `FUSE_DIRECT_IO_ALLOW_MMAP` 时保留 cached。此字段放在 TOML 根部，
+不能写入 `[hixl]`；TCP/HIXL 对照应使用相同值。完整性检查及源快照预算保持相同。
+
+HIXL 读取阶段墙钟由 `afs_dfs_read_phase_seconds{phase}` 记录，只用于定位瓶颈。
+
+顺序预读组由 Node 根配置 `dfs_read_group_mode` 开启，默认 `"off"`，CLI 为
+`--dfs-read-group-mode sequential`。其他相关字段：
+
+- `dfs_read_group_bytes`：单个组合的目标字节数，默认 8388608，范围
+  1048576..=134217728 且为 4096 的倍数。
+- `dfs_read_group_max_inflight`：1 或 2，默认 1。1 为单组串行；2 表示在消费当前
+  组的同时，用一个后台线程预取下一组（只与 FUSE 消费重叠，不增加在途传输批次数）。
+  预取失败、seek、版本或写入可见性变化、close 都会丢弃预取结果；预取线程只做已授权
+  的组读，交付前仍校验 native read view。
+- `dfs_read_group_max_descriptors`：1..=128，默认 128，并受 `[hixl].receive_slots`
+  约束；一次 native batch 最多 64 个 descriptor。
+- `dfs_read_group_host_budget_bytes`：预取窗口的共享预算，默认 1073741824，且不得
+  小于 `dfs_read_group_bytes`；native 组读每个句柄最多占两个窗口（当前窗口与预取中
+  的下一组）。
+
+该模式只对 gRPC 或 HIXL prepared 路径生效；RDMA 数据面保持原逐批预算，配置值不会
+暗中缩小 native descriptor 数。128 MiB 组读需要 `[hixl].receive_slots` 与该 peer 绑定
+lane 的源端 `[hixl].export_slots` 都至少 32；多 lane 下每个 peer 子批的波宽只按自己
+那条 lane 的 export 容量取上限，不要求单 lane 配置。
+组 batch 在节点间传输边界按 128 MiB / 512 operations 校验；8 MiB / 128 operations
+仍是发送端构造普通 batch 的预算，服务端不会因为组 batch 超过该预算而拒绝并退化为
+逐窗口重试。
+seek、倒退、重开、版本变化或写入可见性变化会丢弃预取窗口；组内存不足时退回原读取路径。
+
+HIXL 是单独的 native 编译开关，默认 `ADX_AFS_WITH_HIXL=0`。启用构建必须同时设置
+`ADX_WITH_AFS=1` 和 `ADX_CANN_PATH`，例如在 Linux/WSL 中执行：
+
+```sh
+make afs-build ADX_WITH_AFS=1 ADX_AFS_WITH_HIXL=1 ADX_CANN_PATH=/opt/ascend/cann
+make platform-release ADX_WITH_AFS=1 ADX_AFS_WITH_HIXL=1 ADX_CANN_PATH=/opt/ascend/cann
+```
+
+AFS HIXL 支持 CANN ≥ 9.1.0、HDK ≥ 25.5.0。运行节点的 CANN、HDK 与设备型号需使用
+配套组合；容器部署时，CANN 来自容器，HDK 来自宿主机。
+安装根需提供同一配套版本的 HIXL/ACL 头文件及共享库。已有软件验证使用 CANN 9.1.0。
+构建不会下载或把 CANN 复制进 ADX 包。运行节点应加载正式 CANN 环境、驱动库及 Ascend 设备；SDK 的 devlib
+stub 只可用于无硬件的编译/软件单测，不能代替驱动完成真实 READ。
+启用 HIXL 的二进制即使配置 `preferred`，仍需动态加载 CANN 依赖；它不是运行时 dlopen 插件。
+
+每个节点配置不同且可达的 engine 地址；以下为 TOML 结构示例，必须替换成节点真实地址：
+
+```toml
+[hixl]
+dfs_read_mode = "required"
+transport = "roce"
+buffer_pool_count = 4
+buffer_pool_size_mib = 8
+device_id = 0
+engine_id = "192.0.2.10:7920"
+# Optional device NIC port for sharing a device with other processes.
+# device_listen_port = 27666
+window_bytes = 4194304
+receive_slots = 16
+export_slots = 16
+# Idle peer control sessions are renegotiated after this many milliseconds.
+# Sources close a session after 30 s idle, so the range is 1..=20000.
+session_idle_ms = 20000
+# Peer Node IDs whose HIXL control sessions are pre-established at startup so
+# the first read skips negotiation. Requires preferred or required read mode;
+# retries in the background without blocking startup. The idle policy above
+# still governs how long an unused pre-warmed session survives.
+# prewarm_nodes = ["node-a"]
+```
+
+`off` 不初始化 CANN；`preferred` 只在本地明确能力缺失且清理已完成，或 peer 在任何
+数据提交前明确返回 AFS capability unsupported 时回退 gRPC；`required` 能力缺失时
+拒绝启动或读取。启动清理失败会保留资源并返回 drain incomplete，阻止继续启动。
+身份/授权错误、连接错误和提交后的错误不会通过降级重放。`preferred` 还会在 peer 尚无
+控制会话或建链进行中时，用同一授权经 gRPC 服务当前 batch，并在后台完成协商/建链；
+源端已停止准入（代际 quarantine 或 drain）而拒绝协商（`NODE_TRANSFER_UNAVAILABLE`）后，
+`preferred` 在 60 秒内对该源不再协商，读取直接走 gRPC；仍持有旧会话的那次读取返回
+`EHOSTUNREACH`，单副本时会报给应用。
+`required` 不启用该路径。配置要求 Node DFS、完整
+mTLS、`trusted_node_certs`、非零端口的具体单播 IP、正数且有界的池预算。窗口为
+1 字节至 4 MiB，两池各 1..64 slot，每设备 Host 总量最多 512 MiB；空闲会话时限为
+1..=20000 ms，默认 20000：源端会话 30 秒无活动即关闭，reader 不复用超过 20 秒的会话。
+复用的会话若首个 Prepare 被源端以已关闭/未知会话拒绝，reader 在同一读取内重新协商一次。
+不会动态增长或新建代际绕过预算。
+
+Node 在本地 HIXL 初始化完成后才首次向 Meta 注册；多设备初始化期间尚未持有 Meta 会话租约。
+注册失败时等待阻塞线程清理已初始化的 runtime，并保留原注册错误；启动取消或后续启动失败时
+由启动 guard 派发清理。正常停止仍先停消费者，再关闭全部 lanes，不重复尝试原生 shutdown。
+Node 的进程停机期限为 15 秒。期限耗尽走失败退出码 124，并绕过 C/native 退出处理器，
+避免它们在设备清理未完成时触发全局析构；正常完成路径仍执行资源清理并解除期限。
+退出码 124 不证明设备已排空，恢复测试前仍须核对遗留进程和设备状态。
+
+默认只使用主项 `device_id`。多设备时在同一配置追加有序的设备表，例如以下两设备
+HCCS 结构示例（实现已通过本地软件门禁与 A3 真机功能验证；IP 和逻辑设备号需按环境替换）：
+
+```toml
+[hixl]
+dfs_read_mode = "required"
+transport = "hccs-buffer-pool"
+device_id = 0
+engine_id = "192.0.2.10:7920"
+device_listen_port = 30600
+window_bytes = 4194304
+receive_slots = 4
+export_slots = 4
+buffer_pool_count = 4
+buffer_pool_size_mib = 8
+
+[[hixl.additional_devices]]
+device_id = 2
+engine_id = "192.0.2.10:7921"
+device_listen_port = 30601
+```
+
+主项加附加项合计 1..16 个设备，SDK 逻辑 device ID 必须非负并由运行环境识别；本地 device ID、
+engine endpoint、显式设备监听端口必须分别唯一。多设备要求每 lane 都显式配置监听
+端口。两端按列表顺序配对，数量与公共 transport/池参数相同；两端本地 device ID
+可以不同，需先核实其物理卡、NUMA 与链路拓扑。A3 真机已验证 `0,1` 与 `0,1,2,3`
+两组逻辑设备组合；`0,2` 等其他组合尚未验证。
+同一个 batch 按协商窗口容量切片，不按设备数强制均分；小 batch 保留一个窗口。
+每个 peer 连接在首次读取时绑定到当前占用最少的 lane，同一 peer 的后续 batch 固定
+使用该 lane；peer 数超过 lane 数时按占用数复用 lane。一个 batch 的所有窗口都在该
+绑定 lane 上准备、传输和释放，因此组读快路径在多 lane 配置下同样生效；每波的窗口
+数同时受 `receive_slots`、组描述符上限和源端该 lane 的 `export_slots` 限制。
+每 peer 仍只准入一个逻辑读取任务，多个 peer 各自使用不同 lane 时互不阻塞。
+上述 Host 为每 lane 32 MiB、合计 64 MiB，HCCS HBM 为每 lane
+64 MiB、合计 128 MiB。生产配置的各类聚合上限分别为 8 GiB，不包含源快照普通内存。
+将公共 transport 改为 `roce` 同样使用多 lane，此时中转 HBM 预算为 0。
+
+### 验收边界
+
+以下结果来自 A3 HCCS 双机（216 运行 meta 与源节点，217 运行全远端 reader，单 lane、单设备，
+源码 `51b0dbc2`，`afs-node` sha256 `b5f01ef9…`）。FUSE 请求上限 1 MiB、`direct`，每轮清理
+reader 数据目录，读回数据 SHA-256 全部一致，结束时 quarantine 与导出槽均为 0。对照基线为
+本轮精简之前的源码 `90b5e361`，两者同轮交替。测试机为共享环境（负载约 30），只比较同轮结果。
+
+| 1 GiB 顺序读，MiB/s，中位 [范围] | 当前 | 基线 |
+| --- | --- | --- |
+| DFS HIXL，组模式关闭（reader 对 EHOSTUNREACH 重试，见下） | 95.03 [92.98–100.95] | 94.85 [91.29–95.04] |
+| DFS HIXL，128 MiB 组，`dfs_read_group_max_inflight = 1` | 293.29 [284.38–315.63] | 293.28 [284.78–324.06] |
+| DFS HIXL，128 MiB 组，`dfs_read_group_max_inflight = 2` | 437.16 [425.86–438.87] | 444.75 [368.13–465.02] |
+| DFS gRPC，128 MiB 组，CRC32C 副本 | 402.28 [342.36–438.94] | 355.97 [268.6–417.15] |
+
+差异都落在轮间波动内。端到端数字包含测试脚本的 Python SHA-256 校验。
+
+解读口径：
+
+- HIXL 把源端读盘与 BLAKE3 校验记在 `prepare`。
+- `afs_dfs_read_phase_seconds{phase="validate"}` 记录每波校验墙钟，不再累加各窗口耗时。
+- DFS 会为 reader 后台补齐本地副本，连续读若干轮后退化为本地读；测量必须在每轮前清理
+  reader 的 Chunk，并核对 `afs_hixl_reader_native_batch_bytes_total` 随读取增长。
+
+上表之后的修复尚未在 A3 复测：读取跨过 native read view 的 5 秒期限时改为重新授权并重读（此前
+不重试的 reader 会收到 `EHOSTUNREACH`，当前版本 5 轮失败 4 轮，基线 5 轮失败 1 轮）；CRC32C 对象的
+`preferred` 冷回退；expire 失败不再停止 Node；OwnerFs 与 DFS reader 在源端拒绝准入后的回退与退避。
+
+已知问题：
+
+- `preferred` 对尚未建立会话的 peer 回退 gRPC 时，BLAKE3 对象返回
+  `read CRC mode differs between caller and server`。原因不在 HIXL：普通 gRPC 读 BLAKE3
+  对象不发送 `x-afs-read-crc-mode`，源端按 `both` 处理，而原生 DFS gRPC 默认
+  `dfs_read_crc_mode = "off"`，`data_mode = "grpc"` 下纯 gRPC 读同样失败。
+  `dfs_crc32c_writes = false` 写出的 BLAKE3 对象需要两端设置 `dfs_read_crc_mode = "both"`。
+  CRC32C 对象的冷回退此前误用 BLAKE3 流解码，返回
+  `peer read completion identity/length mismatch`，已修复。
+
+尚未验收：更多源、并发读写、单 peer 跨多 lane 的分片传输、A2 RoCE、大于 1 MiB 的 FUSE
+请求与故障恢复；多 lane 目前只作为隔离与并发余量，不是吞吐承诺。组级流水第二级（源端同时
+保留两个 prepared batch，让 prepare(N+1) 与 transfer(N) 重叠）尚未实现：落地前需要放宽每
+peer 单批准入、把 `receive_slots`/`export_slots` 扩到两组，并为协议增加多批在途语义。
+
+`window_bytes` 是每次 native 导出的容量上限，默认 4 MiB；实际窗口仍受逻辑读取长度和
+FUSE 请求拆分影响。64 KiB 是此前最小资源诊断配置，不是产品默认值或 HIXL 限制。
+源端另保留请求级已校验快照：普通逻辑 batch 最多 8 MiB、组 batch 最多 128 MiB，
+每源节点合计相应为 64 MiB / 128 MiB，预算不足在读取源数据前返回
+`NODE_TRANSFER_RESOURCE_EXHAUSTED`。每个认证 session
+同时只准备一个父 batch，各窗口必须按偏移顺序覆盖该 batch；每窗重新校验整个父请求的
+授权。完整 batch 的窗口全部终态释放后，或 close、过期、drain、quarantine 时清理快照。
+这些普通内存副本与 native Host/HBM 池分别计量；清快照不表示未知 native 传输已排空。
+当前 `/health` 和 native 内存指标只报告 Host/HBM 池，不包含快照普通内存。
+
+AFS 控制 RPC 仍使用原 gRPC endpoint；engine 地址用于 HIXL 独立参数交换。
+可选 `device_listen_port` 是 SDK 的设备侧监听端口，取值为 1..65535；
+未配置时沿用 SDK 默认。多进程共用同一设备时应分别选择未占用端口，
+避免与默认设备端口或其他任务冲突。它与 Host `engine_id` 端口独立，
+只配置本节点，不要求两端取值相同，也不写入 AFS peer 能力协商。
+RoCE 会同时保留 `roce:device` 协议选择；HCCS 仅增加设备端口，不配置 `protocol_desc`。
+默认 `transport = "roce"` 使用 `roce:device`，两端均注册 `aclrtMallocHost` 分配的
+`MEM_HOST`，显式关闭 SDK 中转池（`BufferPool=0:0`），由 owner 线程提交异步 READ 并查询完成。RoCE 路径尚未在真机验证。
+
+A3 HCCS 中转读在两端改为以下配置，其余身份、engine 地址与 Host 窗口配置沿用上例：
+
+```toml
+[hixl]
+dfs_read_mode = "required"
+transport = "hccs-buffer-pool"
+buffer_pool_count = 4
+buffer_pool_size_mib = 8
+device_id = 0
+engine_id = "192.0.2.10:7920"
+```
+
+此模式使用未注册的 ACL Host 业务窗口和 SDK 通信域引擎，在专用 ACL owner 线程执行
+`TransferSync(READ)`，将剩余读取 deadline 传给 SDK。不会同时配置 `protocol_desc` 或
+`LocalCommRes`，因为配套 HIXL 9.1.0 的该组合会选择不支持中转的 HixlCS 引擎。
+`buffer_pool_count` 和 `buffer_pool_size_mib` 各为 1..64；两组 HBM 池的合计预算为
+`2 * count * size_mib` MiB，最多 512 MiB，默认 64 MiB。RoCE 不分配中转 HBM；这些字段
+仍需满足配置范围。Host 池预算独立计算，不因开启中转而减少。
+
+启动时检查 A3 型号，并通过 `aclrtGetDeviceInfo(ACL_DEV_ATTR_SUPER_POD_ID)` 查询实际
+super-pod ID；查询失败或负数视为能力缺失。协议 v1 在授权后、分配 session 和建链前
+检查两端 lane 数、transport、池参数和 domain；domain 0 是有效值。不同域、模式或池参数返回
+协议/参数错误，不能当作 `preferred` 的 capability fallback。v1 同时携带精确父 batch、窗口
+偏移、lane 身份与每 lane 的 engine/generation/容量，并支持按 peer 子批批量释放窗口；
+节点升级需统一使用 v1。
+
+HCCS 模式要求 `HCCL_INTRA_ROCE_ENABLE` 未设置或为 `0`，
+`HCCL_INTER_HCCS_DISABLE` 未设置或为 `FALSE`，冲突配置在初始化 engine 前拒绝。
+后者的取值含义见 [HCCL 官方说明](https://www.hiascend.com/doc_center/source/zh/canncommercial/850/commlib/hcclug/hcclug_000079.html)。
+同域检查与环境检查用于阻止已知错误配置；通信域引擎仍由 SDK/HCCL 选择物理链路。
+部署必须具备同 super-pod 的 HCCS 拓扑，并通过真实 HCCS 日志和链路计数器确认路径，
+不能只凭配置值或 READ 成功声称已使用 HCCS。代码不做 RoCE/HCCS 自动切换。
+
+参数 TCP 与数据网络仅允许可信受管节点互访；隔离该网络并由管理员管理地址。
+AFS grant 不限制 HIXL 参数面暴露的注册池或中转地址访问范围。
+
+`/health` 的 `checks.hixl` 报告模式、transport、super-pod ID、代际、Host
+allocated/quarantined bytes、`relay_hbm_budget_bytes` 和 slot 使用数；资源字段为组内聚合。
+`lane_count` 和有序 `lanes` 另列配置的设备/监听端口、engine/generation、状态及资源，
+活动 runtime 的 `internal_protocol_version` 为 1。设备监听端口来自启动配置，并非 SDK
+实测端口。HBM 字段表示
+SDK 两组池的配置容量，不是实测使用量；无 runtime 时为 0、domain 为 null。
+已有代际进入 quarantine 后，即使为 `preferred` 也显示 degraded，不静默切换通道。
+DFS 与 OwnerFs 源端每 5 秒检查过期会话；该检查失败（例如 quarantine 命令未送达 native owner）
+只记录 `dfs.hixl_expiry_failed` 警告并在下一轮重试，不停止 Node，准入保持冻结；Release 结果未知或
+FAILED 等立即触发的 quarantine 未送达时，同样由下一轮检查重试。此时 runtime
+可能尚未进入 quarantine，`/health` 不一定显示 degraded；用
+`afs_hixl_operation_duration_seconds{phase="expire",result="error"}` 发现失败。
+正常停止先关闭源节点新窗口准入，保留 release RPC 最多 5 秒等待已发出的窗口；
+随后结束服务与 FUSE 消费者，再由 native owner 核验已知完成与窗口引用。
+故障情况下可能返回 `NODE_TRANSFER_DRAIN_INCOMPLETE` 并保留资源；恢复前需要经过
+硬件验证的 fencing/reset 流程。本版没有自动恢复代际能力。
+同步中转 READ 一旦进入 SDK，超时、失败或异常同样不能证明远端 DMA 已停止，
+Host 窗口、HBM 池与整个 engine 会保留并停止准入；不重试、不降级、不自动释放。
+
+### OwnerFs 远端只读预读窗口
+
+`[hixl].ownerfs_read_mode` 独立于 `dfs_read_mode`，默认 `"off"`；任一模式非 off 时 Node 启动
+共享的 HIXL runtime。启用 OwnerFs 模式要求 Node 开启 OwnerFs、`data_mode = "grpc"`（与
+OwnerFs RDMA 互斥）、具体单播 `engine_id`、完整 mTLS 与 `trusted_node_certs`；`required` 还要求
+编译 `hixl` feature。Home 与 reader 两端都需要启用，Home 未启用时 reader 收到 capability
+unsupported：`preferred` 回退 gRPC 并在 60 秒内不再向该 Home 协商，`required` 让该 READ 失败。
+
+```toml
+[hixl]
+ownerfs_read_mode = "preferred"
+ownerfs_window_bytes = 16777216
+ownerfs_max_inflight = 1
+ownerfs_host_budget_bytes = 268435456
+ownerfs_min_file_bytes = 1048576
+ownerfs_sessions_per_home = 1
+```
+
+- `ownerfs_window_bytes`：单次 Prepare 的最大窗口，`window_bytes` 的整数倍，不超过 64 MiB，
+  且不超过 `min(receive_slots, export_slots / ownerfs_sessions_per_home) × window_bytes`；运行时
+  再按协商后的远端 lane 导出槽数收紧。顺序访问时窗口从一个槽起翻倍到该值；从偏移 0 开始的
+  读立即开窗，跳转之后需连续两次顺序 READ 才开窗。
+- `ownerfs_sessions_per_home`：1..=4，默认 1。reader 对每个 Home 的控制会话数，每个会话同时
+  只准入一次窗口获取；大于 1 时同一 Home 的多个打开可并发 Prepare，单窗口最多使用远端导出槽
+  的 `1 / ownerfs_sessions_per_home`，因此通常需要同时调大 `receive_slots`/`export_slots`
+  （Host 池上限 512 MiB）。DFS 与 OwnerFs 共享这些槽。
+- `ownerfs_max_inflight`：1 或 2，默认 1；2 在消费越过当前窗口一半后后台预取下一窗口。
+- `ownerfs_host_budget_bytes`：进程级窗口内存预算，覆盖已缓存窗口与在途预取，
+  不小于 `ownerfs_window_bytes × ownerfs_max_inflight`，最大 4 GiB。Home 侧另有固定 256 MiB
+  的 staging 预算（读源文件到导出前的私有副本）。
+- `ownerfs_min_file_bytes`：`preferred` 下 open 时文件不小于该值才启用窗口，默认 1 MiB，
+  `required` 忽略。
+
+只有只读、非 `O_PATH`/`O_DIRECT` 的远端打开参与；可写打开、OPEN 预取命中（≤ 4096 字节）
+和 RDMA/auto 保持原路径。窗口内容是 Home 执行 Prepare 时的结果，只在同一次打开内复用，
+release 时丢弃；本节点经同一 OwnerFiles 客户端写入、setattr 或以 `O_TRUNC` 打开/创建该文件会使
+全部窗口失效，其他节点
+在本次打开之后的写入不保证可见（close-to-open）。`preferred` 下非顺序读、预算不足、Home 槽位
+不足（dispatch 前）或 Home 已停止准入（代际 quarantine 或 drain，`NODE_TRANSFER_UNAVAILABLE`）走 gRPC，
+后者使该 Home 60 秒内不再协商；`required` 下 Home 停止准入返回 `NODE_TRANSFER_UNAVAILABLE`（FUSE 为
+`EHOSTUNREACH`）。授权/句柄错误原样返回，checksum 不符、协议违例和 native 结果未知
+都返回错误并重建会话，结果未知时隔离本地 runtime。
+
+OwnerFs 与 DFS 共享同一 runtime、Host 槽池和 quarantine 失败域：一方占满槽位会使另一方
+Prepare 失败，任一方的未知结果会让整个代际停止准入。性能对照需在 OwnerFs-only 或暂停 DFS
+流量的条件下进行。Prepare 携带 reader 与 Home lane 窗口的较小值，Home 按它切槽，两端窗口不同也可读。
+每个窗口都按实际字节占用 `ownerfs_host_budget_bytes`，预算不足时 `preferred` 走 gRPC、`required`
+只服务本次 READ 不缓存。reader 最多跟踪 64 个 Home，满时先淘汰无租约且 60 秒未用或已标记不支持
+的 Home；仍满时该 Home 按不支持处理（`preferred` 走 gRPC）。
+Home 端会话 30 秒无活动关闭，reader 在 20 秒空闲后主动重新协商；关闭时
+仍有未释放槽、未知 Release 结果或停机 drain 超时（5 秒，与 DFS 源端并行）都会 quarantine。
+
+`/health` 的 `checks.hixl.ownerfs_mode` 报告该模式；`required` 无 runtime 时未就绪。
+`afs_ownerfs_hixl_reads_total{outcome="window_hit|fetch|prefetch_hit|fallback"}`、
+`afs_ownerfiles_payload_bytes_total{plane="hixl"}`、
+`afs_ownerfiles_rpc_duration_seconds{method="read_hixl_window"|"OwnerFiles.PrepareReadHixl"}`
+与共享的 `afs_hixl_*` 指标用于证明数据面与命中率。
+
+同一 A3 双机与源码上，`required`、`preferred`、`required` + `ownerfs_max_inflight = 2`、以及
+`ownerfs_sessions_per_home = 2` 四组功能检查全部通过：内容一致、Home 导出槽归零、无 quarantine，
+停止后无遗留进程与挂载。1 GiB 顺序读与基线同轮交替：
+
+| MiB/s，中位 [范围] | 当前 | 基线 |
+| --- | --- | --- |
+| HIXL 4 路，16 MiB 窗口、预取、4 会话、32 槽 | 2432.39 [2303.95–2515.87] | 2434.71 [1913.87–2518.13] |
+| gRPC 4 路 | 1192.22 [978.65–1359.85] | 1095.65 [1055.86–1605.99] |
+| HIXL 单流，64 MiB 窗口、预取、1 会话、64 槽 | 854.54 [659.22–945.58] | 898.17 [793.27–1158.1] |
+| gRPC 单流 | 636.24 [475.15–756.43] | 699.71 [673.93–778.75] |
+
+差异都落在轮间波动内；HIXL 单流配置 11 组配对中有 8 组当前低于基线，范围大幅重叠，不能据此判定
+回退。这些数字来自单机对、单设备、Home 页缓存命中的共享实验机，不能外推到其他拓扑；Home 冷盘读、
+多设备、故障注入与资源泄漏复测仍未执行。
+
 ## 运维边界
 
 启动前一次性检查二进制身份、配置 SHA、端口、TLS、数据目录、运行目录、日志目录、挂载目录、FUSE 设备、`fusermount3`/`umount`、旧 PID、旧 UDS、旧挂载和磁盘余量。遇到环境阻塞时保存证据并停止受影响项，不把环境修补混入产品结论。
@@ -781,17 +1104,3 @@ NodeReplicated DFS 默认启动每 5 秒一次的安全回收；关闭引用有�
 可选BLAKE3 Peer驻留/proof及磁盘缓存不适用于CRC对象；CRC直接走分段验证的范围传输。gRPC与RDMA协议均携带CRC描述，RDMA硬件运行单独验收，不能用全feature编译替代。S3及其缓存策略不在本次变更范围。
 
 `security.capability`在原inode映射检查后本地返回既有不支持错误，其余xattr保留Meta权限与错误语义。Meta的`afs_requests_total`提供`dfs_gc_capture/register/retain/release/collect`、`dfs_commit_file_version`和`dfs_get_xattr`标签，用于核对真实访问次数；不增加逐chunk正文扫描或详细调度采集。
-
-## OwnerFs 运行时开关
-
-以下环境变量由 `afs-node` 进程读取，部署脚本需要显式设置或在服务单元里声明。默认值
-即"不设置"时的行为，改动前请先读对应语义。
-
-| 变量 | 默认 | 作用与代价 |
-|---|---|---|
-| `AFS_OWNERFS_CLOSE_SYNC` | 未设置（关闭不同步） | 未设置时，独占本地 root 上的普通 `close`/`flush` 不执行 `fdatasync`，`close` 成功只表示数据进入本机页缓存，掉电或内核崩溃可能丢失最近写入。设为 `1`/`true` 恢复逐 handle 的 `fdatasync`。peer 共享的 root 始终同步，不受该开关影响。 |
-| `AFS_OWNERFS_CACHE_TTL_MS` | `1000` | 独占本地 root 的 attr/entry TTL（毫秒）。调大可减少 `getattr`/`lookup` 往返，代价是外部并发变更的可见延迟变长；该 root 一旦被 peer 校验过就不再算独占。 |
-| `AFS_FUSE_TRACE` | 未设置 | 设为 `1`/`true` 时打印逐请求 trace 与 `create` 阶段计时，仅用于诊断，不要在生产常开。 |
-
-关闭语义的完整说明见 `afs/README.md` 的「OwnerFs 关闭语义」一节，性能归因见
-`afs/docs/perf/ownerfs-perf-summary.md`。
