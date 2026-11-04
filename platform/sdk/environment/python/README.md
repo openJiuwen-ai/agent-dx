@@ -51,9 +51,22 @@ If the execution backend itself is OOM-killed, `environment.get_info().failure`
 contains an `EnvironmentFailure(reason="OomKilled", exit_code=..., message=...)`
 after the terminal state is committed. A failed direct invocation can raise
 `EnvironmentError` with `code="ENVIRONMENT_OOM"`, `retry="never"`, `outcome="terminal"`
-and `failure` details. Before publication, the caller may receive
-`OUTCOME_UNKNOWN`; query `get_info()` instead of interpreting route errors as
-OOM. Successful calls do not perform an additional catalog query.
+and `failure` details. A committed Failed record with another structured reason
+raises `ENVIRONMENT_FAILED` with the same terminal contract. These exceptions
+retain `request_id`, `operation_id`, `environment_id` and `first_error` (the first
+transport failure). An unavailable route known not to have accepted the operation
+raises `ENVIRONMENT_UNAVAILABLE` / `same_operation` / `not_started`. Otherwise,
+before failure publication the result can remain `OUTCOME_UNKNOWN`; query
+`get_info()` instead of interpreting route errors as OOM. Successful calls do
+not perform an additional catalog query.
+
+Background `commands.run(..., background=True)` preserves these confirmed
+`ENVIRONMENT_OOM` and `ENVIRONMENT_FAILED` exceptions directly, including their
+failure details and first error; it does not wrap them as an uncertain command
+submission. If a direct retry changes from `ENV_RESUMING` to a missing route,
+the SDK consults the current authenticated Environment catalog instead of
+reporting the earlier resuming state. A missing route alone still cannot prove
+backend failure or authorize a control-plane replay.
 
 ## Working directory
 
@@ -350,9 +363,23 @@ forwarding, Ingress returns HTTP 503 with `X-ADX-Error-Code: ENV_RESUMING`,
 SDK retries retain the request ID and body; **each allowed retry gets the same
 configured timeout plus communication margin**. Retry count is configurable via
 `ConnectionConfig.request_max_attempts` / `ADX_REQUEST_MAX_ATTEMPTS` (default 3,
-including the first data-path attempt). Known-unsent connection failures and absent
-direct routes retain their existing single control-plane fallback; `ENV_RESUMING`
-never takes that fallback. Retry-After and jitter apply between demand retries.
+including the first data-path attempt). Connection failures and absent direct
+routes never trigger an implicit control-plane invoke: the current API Server
+does not implement that operation. After bounded direct retries, the SDK checks
+the authenticated Environment catalog and preserves a confirmed OOM or runtime
+failure, including the original operation identity and first transport failure.
+A terminal gateway `ENV_UNAVAILABLE` rejection also checks the catalog once for
+this cause without retrying the rejected operation. If no backend failure is
+confirmed, its HTTP status, error code and retry prohibition remain authoritative.
+If an earlier attempt may have executed, the SDK reports `outcome="unknown"`
+even when the last gateway response says `not_started` or `terminal`; the raw
+`payload` retains that last response for diagnosis. This does not enable another
+retry. The initial failure remains available as `first_error`, including when
+a later attempt receives an operation-level 404 or an HTTP error is wrapped.
+A still-running or unavailable catalog cannot confirm a terminal backend failure:
+known-unsent requests remain `not_started`, and ambiguous execution remains
+`unknown`. Neither case disables later direct calls. Retry-After and jitter apply
+between demand retries.
 Exhaustion raises `EnvironmentHTTPError` with the same `ENV_RESUMING` contract; callers
 can choose to try again. No sticky Ingress routing is required: replicas share the
 Coordinator intent and independently subscribe to the committed route.
@@ -807,3 +834,10 @@ storage/runtime acceptance remains in P7.
 Volume IDs accept 1–256 ASCII letters, digits, dots, underscores or hyphens;
 `.` and `..` are rejected because URL clients normalize those path segments.
 The SDK validates both definitions and lookup/deletion IDs before sending requests.
+
+
+Create retries retain the authoritative final error type/status, request identity,
+retry and outcome fields, and expose the initial failed attempt as `first_error`.
+An unsuccessful capability query preserves its transport/domain exception; only
+a confirmed response missing the required capabilities is `UnsupportedFeature`.
+These diagnostics do not change operation replay or source ownership rules.
