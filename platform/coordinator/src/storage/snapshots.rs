@@ -13,22 +13,14 @@ impl Session {
         command.arg(self.snapshots_key()).arg(id);
         self.store.query(command).await
     }
-    async fn snapshot_cas(
-        &self,
-        id: &str,
-        old: Option<&str>,
-        next: &Snapshot,
-        catalog: Option<&volumes::Catalog>,
-    ) -> Result<bool> {
-        self.snapshot_cas_with_source(id, old, next, catalog, None)
-            .await
+    async fn snapshot_cas(&self, id: &str, old: Option<&str>, next: &mut Snapshot) -> Result<bool> {
+        self.snapshot_cas_with_source(id, old, next, None).await
     }
     async fn snapshot_cas_with_source(
         &self,
         id: &str,
         old: Option<&str>,
-        next: &Snapshot,
-        catalog: Option<&volumes::Catalog>,
+        next: &mut Snapshot,
         source: Option<(&str, &str)>,
     ) -> Result<bool> {
         next.validate()?;
@@ -44,12 +36,28 @@ impl Session {
         // compared header after joining that queue, rather than letting each
         // waiter carry a header made stale by the writers ahead of it.
         let mut inventory = self.inspection.lock().await;
-        let header_value = match catalog {
+        // Volume writes must be derived from the same fresh catalog as their
+        // compared header. Replacing only the header of a queued catalog could
+        // overwrite snapshot holds committed by an earlier writer.
+        let catalog = if volumes::has_volumes(&next.template)
+            && (old.is_none() || next.state == SnapshotState::Deleted)
+        {
+            let mut catalog = self.volume_catalog().await?;
+            if old.is_none() {
+                catalog.protect_snapshot(next)?;
+            } else {
+                catalog.release_snapshot(next)?;
+            }
+            Some(catalog)
+        } else {
+            None
+        };
+        let header_value = match catalog.as_ref() {
             Some(catalog) => Some(catalog.header_value.clone()),
             None => self.store.fields([HEADER.into()]).await?[0].clone(),
         };
         let mut current_header = self.header(&header_value)?;
-        let header = if let Some(catalog) = catalog {
+        let header = if let Some(catalog) = catalog.as_ref() {
             Some(catalog.advanced_header()?)
         } else if next.state == SnapshotState::Ready {
             current_header.advance()?;
@@ -94,7 +102,7 @@ impl Session {
         command
             .arg(source.map_or("", |(field, _)| field))
             .arg(source.map_or("", |(_, value)| value));
-        if let Some(catalog) = catalog {
+        if let Some(catalog) = catalog.as_ref() {
             catalog.append_writes(&mut command)?;
         } else {
             command.arg(0);
@@ -184,19 +192,11 @@ impl Session {
                 None
             };
             let mut next = record.clone();
-            let catalog = if volumes::has_volumes(&next.template) {
-                let mut catalog = self.volume_catalog().await?;
-                catalog.protect_snapshot(&mut next)?;
-                Some(catalog)
-            } else {
-                None
-            };
             if self
                 .snapshot_cas_with_source(
                     &record.id,
                     None,
-                    &next,
-                    catalog.as_ref(),
+                    &mut next,
                     source.as_deref().map(|raw| (source_field.as_str(), raw)),
                 )
                 .await?
@@ -261,18 +261,7 @@ impl Session {
             if next.revision == revision {
                 return Ok(next);
             }
-            let catalog =
-                if next.state == SnapshotState::Deleted && volumes::has_volumes(&next.template) {
-                    let mut catalog = self.volume_catalog().await?;
-                    catalog.release_snapshot(&next)?;
-                    Some(catalog)
-                } else {
-                    None
-                };
-            if self
-                .snapshot_cas(id, Some(&raw), &next, catalog.as_ref())
-                .await?
-            {
+            if self.snapshot_cas(id, Some(&raw), &mut next).await? {
                 return Ok(next);
             }
         }

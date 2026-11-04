@@ -169,6 +169,8 @@ CAS 比较的全局 header。并发更新不同 Snapshot 的引用时，等待�
 的 header 构建比较值。epoch、完整 Snapshot 记录、来源记录与 Volume catalog 的比较、
 全局 revision 推进及既有32次重试预算保持不变。
 
+带卷 Snapshot 的发布与最终删除也在取得 inspection 互斥后读取整份 Volume catalog，并从这份 catalog 计算卷保护增删及对应 header；不能只刷新 header 而保留排队前计算的卷写入，否则可能覆盖其他 Snapshot 的保护关系。普通 acquire/release 在 Snapshot 未进入 Deleted 时不修改 Volume catalog。相同 Session 的这些提交仍按既有互斥串行执行，锁内 Redis 往返属于当前正确性方案的成本；本改动不声称消除全局提交瓶颈或跨 Session 的全部竞争。
+
 ## 共享回收与故障
 
 Coordinator 在 Redis 持久化共享制品清单。每轮检查 Environment 恢复点、执行输入、

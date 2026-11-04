@@ -1765,3 +1765,101 @@ async fn volume_claim_batch_and_delete_preserve_request_identity_and_creation_su
     plain.id = "reused-request".into();
     assert!(session.claim(plain, &candidate).await.is_ok());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn concurrent_snapshot_catalog_updates_preserve_every_volume_hold() {
+    use adx_core::snapshots::SnapshotState;
+    use std::{collections::BTreeSet, sync::Arc};
+    const COUNT: usize = 64;
+    let rig = common::Redis::new().await;
+    let session = Arc::new(store(&rig).await.begin(1).await.unwrap());
+    let definition = session
+        .ensure_volume_for_owner(
+            volume("workspace", "workspaces/tenant/concurrent"),
+            &domains(),
+            "binding",
+        )
+        .await
+        .unwrap();
+    let source = environment("binding", "workspace");
+    session.pin_volumes(&source).await.unwrap();
+    let gate = Arc::new(tokio::sync::Barrier::new(COUNT));
+    let mut operations = tokio::task::JoinSet::new();
+    for index in 0..COUNT {
+        let session = session.clone();
+        let gate = gate.clone();
+        let source = source.clone();
+        operations.spawn(async move {
+            gate.wait().await;
+            session
+                .publish_snapshot(reusable_snapshot(&format!("concurrent-{index}"), source))
+                .await
+        });
+    }
+    let mut snapshots = vec![];
+    let mut errors = vec![];
+    while let Some(result) = operations.join_next().await {
+        match result.unwrap() {
+            Ok(snapshot) => snapshots.push(snapshot),
+            Err(error) => errors.push(error),
+        }
+    }
+    assert!(
+        errors.is_empty(),
+        "concurrent volume snapshot publication failed: {errors:?}"
+    );
+    assert_eq!(snapshots.len(), COUNT);
+    let expected: BTreeSet<_> = snapshots
+        .iter()
+        .map(|snapshot| snapshot.id.clone())
+        .collect();
+    let held = session.get_volume("tenant", "workspace").await.unwrap();
+    assert_eq!(held.volume.uid, definition.uid);
+    assert_eq!(held.snapshot_ids, expected);
+    for snapshot in &snapshots {
+        let MountSource::Volume(reference) = &snapshot.template.execution.mounts[0].source else {
+            panic!("snapshot lost its volume reference");
+        };
+        assert_eq!(reference.uid.as_deref(), Some(definition.uid.as_str()));
+    }
+    session.unpin_volumes(&source).await.unwrap();
+    session
+        .release_volume_owner("tenant", "binding")
+        .await
+        .unwrap();
+    let mut deleting = vec![];
+    for snapshot in snapshots {
+        deleting.push(
+            session
+                .delete_snapshot(&snapshot.id, "tenant")
+                .await
+                .unwrap(),
+        );
+    }
+    let gate = Arc::new(tokio::sync::Barrier::new(COUNT));
+    for snapshot in deleting {
+        let session = session.clone();
+        let gate = gate.clone();
+        operations.spawn(async move {
+            gate.wait().await;
+            session
+                .finish_snapshot_deletion(&snapshot.id, snapshot.revision)
+                .await
+        });
+    }
+    while let Some(result) = operations.join_next().await {
+        match result.unwrap() {
+            Ok(snapshot) => assert_eq!(snapshot.state, SnapshotState::Deleted),
+            Err(error) => errors.push(error),
+        }
+    }
+    assert!(
+        errors.is_empty(),
+        "concurrent volume snapshot deletion failed: {errors:?}"
+    );
+    assert!(matches!(
+        session.get_volume("tenant", "workspace").await,
+        Err(adx_core::Error::NotFound)
+    ));
+}
