@@ -5,8 +5,33 @@ use adx_core::{
     LifecycleKind,
 };
 use std::time::Duration;
+use tokio::time::Instant;
 
 impl Controller {
+    async fn publish_snapshot_state(&mut self, deadline: Instant) -> Result<OperationResult> {
+        let mut delay_ms = 10_u64;
+        let jitter_ms = self.record.assignment.generation % 17;
+        loop {
+            if Instant::now() >= deadline {
+                return Err(Error::Unavailable(
+                    "snapshot state publication timed out".into(),
+                ));
+            }
+            let result = tokio::time::timeout_at(deadline, self.sync())
+                .await
+                .map_err(|_| Error::Unavailable("snapshot state publication timed out".into()))??;
+            if result.durability == Durability::Published {
+                return Ok(result);
+            }
+            // Journaled is durable locally, but cannot authorize a reusable
+            // snapshot. Republish the same record; never repeat capture or
+            // advance its revision while waiting for Coordinator acceptance.
+            let delay = Duration::from_millis(delay_ms + jitter_ms);
+            tokio::time::sleep_until(deadline.min(Instant::now() + delay)).await;
+            delay_ms = (delay_ms * 2).min(250);
+        }
+    }
+
     pub(super) async fn snapshot(&mut self, request: SnapshotRequest) -> Result<SnapshotResult> {
         let id = snapshot_id(
             &self.record.spec.tenant_id,
@@ -19,6 +44,7 @@ impl Controller {
         {
             return Err(Error::Conflict);
         }
+        let deadline = Instant::now() + Duration::from_secs(request.timeout_seconds);
         let services = self
             .services
             .checkpoint
@@ -40,12 +66,7 @@ impl Controller {
                 {
                     return Err(Error::Conflict);
                 }
-                let environment = self.sync().await?;
-                if environment.durability != Durability::Published {
-                    return Err(Error::Unavailable(
-                        "snapshot source publication pending".into(),
-                    ));
-                }
+                let environment = self.publish_snapshot_state(deadline).await?;
                 return Ok(SnapshotResult {
                     snapshot,
                     environment,
@@ -94,11 +115,7 @@ impl Controller {
             }
         }
         self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
-        if self.sync().await?.durability != Durability::Published {
-            return Err(Error::Unavailable(
-                "capture input reservation publication pending".into(),
-            ));
-        }
+        self.publish_snapshot_state(deadline).await?;
         if let Err(error) = services
             .cooperation
             .prepare(&self.record, &request.operation_id)
@@ -122,15 +139,15 @@ impl Controller {
             return Err(error);
         }
         self.capture_preparation = None;
-        let captured = self
-            .services
-            .runtime
-            .checkpoint_running(
-                &self.record.runtime.id,
-                &staged,
-                Duration::from_secs(request.timeout_seconds),
-            )
-            .await;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let captured = if remaining.is_zero() {
+            Err(Error::Unavailable("snapshot capture budget expired".into()))
+        } else {
+            self.services
+                .runtime
+                .checkpoint_running(&self.record.runtime.id, &staged, remaining)
+                .await
+        };
         let captured = match captured {
             Ok(()) => {
                 services
@@ -161,7 +178,7 @@ impl Controller {
             self.hold_artifact(captured, original);
         }
         self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
-        self.sync().await?;
+        self.publish_snapshot_state(deadline).await?;
         snapshot.artifact = services.store.seal(&staged).await?;
         // Publication requires a durable temporary hold even when the runtime
         // does not retain capture output. Existing restore inputs move into
@@ -169,11 +186,7 @@ impl Controller {
         let access = services.store.prepare_restore(&snapshot.artifact).await?;
         self.hold_artifact(snapshot.artifact.clone(), access);
         self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
-        if self.sync().await?.durability != Durability::Published {
-            return Err(Error::Unavailable(
-                "snapshot input reference publication pending".into(),
-            ));
-        }
+        self.publish_snapshot_state(deadline).await?;
         let snapshot = catalog.publish(snapshot.clone()).await?;
         services.store.committed(&snapshot.artifact).await?;
         if !retains_capture {
@@ -189,12 +202,7 @@ impl Controller {
             LifecycleKind::Snapshot,
         );
         self.durability = None;
-        let environment = self.sync().await?;
-        if environment.durability != Durability::Published {
-            return Err(Error::Unavailable(
-                "snapshot source publication pending".into(),
-            ));
-        }
+        let environment = self.publish_snapshot_state(deadline).await?;
         Ok(SnapshotResult {
             snapshot,
             environment,

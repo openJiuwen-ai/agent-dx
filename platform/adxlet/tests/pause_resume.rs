@@ -16,6 +16,9 @@ use std::{
 
 #[derive(Default)]
 struct Backend {
+    snapshot_journal_failures: Mutex<usize>,
+    snapshot_hold_error: Mutex<Option<Error>>,
+    rejected_snapshot_records: Mutex<Vec<EnvironmentRecord>>,
     checkpoint_cleanups: Mutex<Vec<adx_core::CheckpointCleanup>>,
     execution_admission_error: Mutex<Option<Error>>,
     sampled_runtimes: Mutex<BTreeSet<String>>,
@@ -325,6 +328,29 @@ impl StateSink for Backend {
     }
     async fn commit(&self, r: &EnvironmentRecord) -> Result<Durability> {
         self.event(&format!("commit:{:?}", r.state));
+        if r.state == EnvironmentState::Running
+            && r.last_operation.is_none()
+            && r.execution_artifacts.iter().any(|a| a.size_bytes > 0)
+        {
+            if let Some(error) = self.snapshot_hold_error.lock().unwrap().clone() {
+                self.rejected_snapshot_records
+                    .lock()
+                    .unwrap()
+                    .push(r.clone());
+                return Err(error);
+            }
+            let mut remaining = self.snapshot_journal_failures.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                self.rejected_snapshot_records
+                    .lock()
+                    .unwrap()
+                    .push(r.clone());
+                return Err(Error::Unavailable(
+                    "concurrent environment commit; retry request".into(),
+                ));
+            }
+        }
         if r.checkpoint.is_some() {
             let mut failures = self.checkpoint_commit_failures.lock().unwrap();
             if *failures > 0 {
@@ -1300,6 +1326,148 @@ async fn reusable_snapshot_survives_source_deletion_and_retries_without_checkpoi
         h.snapshot(request).await.is_err(),
         "stale retry must not revive deleted source"
     );
+}
+
+fn snapshot_journal_node(
+    temp: &tempfile::TempDir,
+    backend: &Arc<Backend>,
+    resources: Resources,
+) -> (Adxlet, Arc<adxlet::journal::JournalSink>) {
+    let journal = Arc::new(adxlet::journal::JournalSink::new(
+        temp.path().join("pending.sqlite"),
+        backend.clone(),
+    ));
+    let node = Adxlet::new(
+        "node".into(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+        journal.clone(),
+    )
+    .with_checkpointing(
+        Arc::new(LocalCheckpointStore::new(temp.path().into()).unwrap()),
+        backend.clone(),
+    )
+    .unwrap()
+    .with_snapshot_catalog(backend.clone())
+    .unwrap();
+    node.update_capacity(resources, Duration::from_secs(60))
+        .unwrap();
+    (node, journal)
+}
+
+#[tokio::test]
+async fn reusable_snapshot_waits_for_journal_publication_without_recapturing() {
+    use adxlet::checkpoint::SnapshotRequest;
+    let (temp, backend, _, mut spec, assignment) = fixture();
+    spec.runtime_class = "runsc".into();
+    let (node, journal) = snapshot_journal_node(&temp, &backend, spec.resources);
+    let handle = node.environment(spec, assignment).unwrap();
+    let running = handle.create().await.unwrap();
+    *backend.snapshot_journal_failures.lock().unwrap() = 3;
+    let request = SnapshotRequest {
+        kind: adx_core::snapshots::SnapshotKind::Regular,
+        operation_id: "snapshot-journal-contention".into(),
+        expected_revision: running.record.revision,
+        names: vec![],
+        timeout_seconds: 2,
+    };
+    let saved = handle.snapshot(request.clone()).await.unwrap();
+    assert_eq!(saved.environment.durability, Durability::Published);
+    assert_eq!(
+        saved.snapshot.state,
+        adx_core::snapshots::SnapshotState::Ready
+    );
+    assert_eq!(journal.pending().await.unwrap(), 0);
+    let rejected = backend.rejected_snapshot_records.lock().unwrap().clone();
+    assert_eq!(rejected.len(), 3);
+    assert!(rejected.iter().all(|r| r == &rejected[0]));
+    assert_eq!(
+        handle.snapshot(request).await.unwrap().snapshot,
+        saved.snapshot
+    );
+    assert_eq!(
+        backend
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| *e == "checkpoint-running")
+            .count(),
+        1,
+    );
+    handle.delete().await.unwrap();
+}
+
+#[tokio::test]
+async fn reusable_snapshot_publication_wait_keeps_the_original_deadline() {
+    use adxlet::checkpoint::SnapshotRequest;
+    let (temp, backend, _, mut spec, assignment) = fixture();
+    spec.runtime_class = "runsc".into();
+    let (node, journal) = snapshot_journal_node(&temp, &backend, spec.resources);
+    let handle = node.environment(spec, assignment).unwrap();
+    let running = handle.create().await.unwrap();
+    *backend.snapshot_journal_failures.lock().unwrap() = usize::MAX;
+    let error = tokio::time::timeout(
+        Duration::from_secs(3),
+        handle.snapshot(SnapshotRequest {
+            kind: adx_core::snapshots::SnapshotKind::Regular,
+            operation_id: "snapshot-journal-deadline".into(),
+            expected_revision: running.record.revision,
+            names: vec![],
+            timeout_seconds: 1,
+        }),
+    )
+    .await
+    .expect("publication must not reset its deadline")
+    .unwrap_err();
+    assert!(matches!(error, Error::Unavailable(reason) if reason.contains("timed out")));
+    assert!(journal.pending().await.unwrap() > 0);
+    assert!(backend.snapshots.lock().unwrap().is_empty());
+    assert_eq!(backend.running.lock().unwrap().len(), 1);
+    assert_eq!(
+        backend
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| *e == "checkpoint-running")
+            .count(),
+        1,
+    );
+    *backend.snapshot_journal_failures.lock().unwrap() = 0;
+    assert_eq!(
+        handle.sync().await.unwrap().durability,
+        Durability::Published
+    );
+    handle.delete().await.unwrap();
+}
+
+#[tokio::test]
+async fn reusable_snapshot_does_not_retry_a_publication_conflict() {
+    use adxlet::checkpoint::SnapshotRequest;
+    let (temp, backend, _, mut spec, assignment) = fixture();
+    spec.runtime_class = "runsc".into();
+    let (node, journal) = snapshot_journal_node(&temp, &backend, spec.resources);
+    let handle = node.environment(spec, assignment).unwrap();
+    let running = handle.create().await.unwrap();
+    *backend.snapshot_hold_error.lock().unwrap() = Some(Error::Conflict);
+    let error = handle
+        .snapshot(SnapshotRequest {
+            kind: adx_core::snapshots::SnapshotKind::Regular,
+            operation_id: "snapshot-journal-conflict".into(),
+            expected_revision: running.record.revision,
+            names: vec![],
+            timeout_seconds: 2,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error, Error::Conflict);
+    assert_eq!(backend.rejected_snapshot_records.lock().unwrap().len(), 1);
+    assert_eq!(journal.pending().await.unwrap(), 0);
+    assert!(backend.snapshots.lock().unwrap().is_empty());
+    *backend.snapshot_hold_error.lock().unwrap() = None;
+    handle.delete().await.unwrap();
 }
 
 #[tokio::test]

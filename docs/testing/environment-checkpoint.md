@@ -48,6 +48,7 @@ sandboxd 必须支持 checkpoint／restore，并通过 runtime capabilities 提�
 - API/RPC 断线不会取消已进入实例队列的操作。暂停等节点操作重试保持原始身份/版本；恢复重试复用 Redis 中的固定意图。已暂停对象节点失效后继续休眠，等待需求、TTL 或删除。
 - 正常结果记录只保留最近成功操作。Node RPC 拒绝旧预期版本；客户端不能在一个后续操作已改变状态后，把旧请求换成新版本重新执行。
 - checkpoint 已完成而 Coordinator 提交失败时，节点按 [SQLite 降级契约](node-lifecycle.md) 保存待补交结果。同一操作重试只补交；Journaled 不返回集群成功，重启后先等待 Coordinator 权威对账。
+- 可复用 Snapshot 在同一次节点请求内等待 Journaled 状态达到 Published：只补交相同记录和版本，不重新运行后端 capture。等待占用该次 checkpoint 的剩余预算，后端收到扣除等待时间后的超时。真实归属／版本冲突立即返回；预算耗尽后保留待补交记录和制品引用，不把本地 journal 当作 Snapshot 成功。此规则不放宽 Coordinator 的 CAS、归属和制品引用校验。
 - checkpoint 调用前，准备失败可调用 Execd abort；调用后不再假设 checkpoint 未启动。无法确认停止／清理时保留资源占用并报告失败。
 - 发布制品失败时，从完整本地暂存尝试恢复运行，并返回暂停失败。回滚或清理失败不会伪装成暂停成功。
 - 恢复失败但清理成功时保留恢复点并释放此次资源；清理不确定时保留资源，等待处理。
@@ -58,6 +59,7 @@ sandboxd 必须支持 checkpoint／restore，并通过 runtime capabilities 提�
 ## 验证
 
 组件测试覆盖状态与资源转换、丢失提交回复、过期清理、恢复失败、回滚、真实 sandboxd 协议的 UDS 调用、Execd HTTP 身份切换和 Ingress 版本检查。Redis 集成测试使用独立真实 Redis。
+可复用 Snapshot 的真实 SQLite JournalSink 回归还覆盖暂时发布失败后成功、只 capture 一次、原预算耗尽及不重试永久冲突；组件结果不替代并发集群验收。
 
 ```bash
 cargo test -p adxlet -p adx-coordinator -p adx-core -p adx-protocol
