@@ -604,15 +604,33 @@ impl Rig {
         }
     }
     async fn restart_coordinator(&mut self, register_nodes: bool) {
+        self.restart_coordinator_with(
+            register_nodes,
+            Duration::from_secs(30),
+            3,
+            Duration::from_secs(600),
+        )
+        .await;
+    }
+    async fn restart_coordinator_with(
+        &mut self,
+        register_nodes: bool,
+        heartbeat_timeout: Duration,
+        unconfirmed_probe_failures: u32,
+        unconfirmed_retention: Duration,
+    ) {
         self.server.abort();
         let _ = (&mut self.server).await;
         self.session = self._redis.store().await.begin(1).await.unwrap();
-        self.rpc = CoordinatorRpc::new(
+        self.rpc = CoordinatorRpc::with_node_recovery_limits(
             self.session.clone(),
             Placement::Pack,
             Peers::network(),
             RpcClient::network(Principal::Coordinator),
             Duration::from_secs(2),
+            heartbeat_timeout,
+            unconfirmed_probe_failures,
+            unconfirmed_retention,
         )
         .await
         .unwrap();
@@ -1555,6 +1573,118 @@ async fn redis_restart_preserves_pending_wake_and_restore_point() {
     assert_eq!(rig.source.backend.restored.load(Ordering::SeqCst), 1);
 }
 
+/// relay-01: a Coordinator restart must not destroy the Envs of a node that
+/// is alive but has not re-registered within the heartbeat grace. Ownership
+/// is retained while the node is unconfirmed; a late registration confirms
+/// it without a new identity.
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn restart_retains_unconfirmed_node_ownership_until_registration() {
+    let mut rig = Rig::new(Duration::from_secs(2)).await;
+    let before = rig.session.get("sleep").await.unwrap();
+    // Restart without re-registering, with a registration grace far shorter
+    // than the node's report cadence: the false-invalidation window.
+    rig.restart_coordinator_with(
+        false,
+        Duration::from_millis(300),
+        3,
+        Duration::from_secs(600),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Past the grace the node is unconfirmed, not lost. The liveness probe
+    // finds the node process at its stored address; ownership survives.
+    assert_eq!(rig.rpc.expire_nodes().await.unwrap(), 0);
+    let retained = rig.session.get("sleep").await.unwrap();
+    assert!(!retained.invalidated);
+    assert_eq!(retained.assignment, before.assignment);
+    assert_eq!(retained.result, before.result);
+    // A registration that arrives past the grace confirms the node; the
+    // record is unchanged by the whole cycle.
+    rig.source.report.heartbeat_sequence += 1;
+    register(&rig.address, &mut rig.source).await;
+    let confirmed = rig.session.get("sleep").await.unwrap();
+    assert!(!confirmed.invalidated);
+    assert_eq!(confirmed.assignment, before.assignment);
+    assert_eq!(confirmed.result, before.result);
+}
+
+/// relay-01 negative: retention is bounded by evidence, not permanent. An
+/// unconfirmed node whose stored address stops answering is declared lost
+/// after the configured consecutive probe failures, while a live peer
+/// retained in the same pass stays untouched.
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn unconfirmed_node_declared_lost_after_failed_probes() {
+    let mut rig = Rig::new(Duration::from_secs(2)).await;
+    // The node process is gone and will not register again; the peer stays
+    // alive so the per-node isolation of the verdict is visible.
+    rig.source.task.abort();
+    let _ = (&mut rig.source.task).await;
+    rig.restart_coordinator_with(
+        false,
+        Duration::from_millis(300),
+        2,
+        Duration::from_secs(600),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    // First pass: one failed probe; retention holds.
+    assert_eq!(rig.rpc.expire_nodes().await.unwrap(), 0);
+    assert!(!rig.session.get("sleep").await.unwrap().invalidated);
+    // The second consecutive failure reaches the limit: the lost node's
+    // ownership is revoked while the answering peer is retained.
+    assert_eq!(rig.rpc.expire_nodes().await.unwrap(), 1);
+    assert!(rig.session.get("sleep").await.unwrap().invalidated);
+}
+
+/// relay-01 negative: a node that answers probes but never registers again
+/// cannot be retained forever — the hard cap revokes its ownership.
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn unconfirmed_retention_cap_expires_a_never_registering_node() {
+    let mut rig = Rig::new(Duration::from_secs(2)).await;
+    rig.restart_coordinator_with(
+        false,
+        Duration::from_millis(200),
+        1000,
+        Duration::from_millis(1500),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Alive, answering, still inside the cap: retained.
+    assert_eq!(rig.rpc.expire_nodes().await.unwrap(), 0);
+    assert!(!rig.session.get("sleep").await.unwrap().invalidated);
+    // Past the cap the ownership is revoked even though the probes succeed.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(rig.rpc.expire_nodes().await.unwrap(), 2);
+    assert!(rig.session.get("sleep").await.unwrap().invalidated);
+}
+
+/// relay-01 guard: the fix must not turn real failures off. A node that
+/// registered under this process and then went silent is expired by the
+/// pre-existing heartbeat rule, immediately, without a probe.
+#[tokio::test]
+#[ignore = "requires dedicated real Redis"]
+async fn registered_node_silence_still_expires_without_probing() {
+    let mut rig = Rig::new(Duration::from_secs(2)).await;
+    rig.restart_coordinator_with(
+        true,
+        Duration::from_millis(300),
+        3,
+        Duration::from_secs(600),
+    )
+    .await;
+    rig.source.task.abort();
+    let _ = (&mut rig.source.task).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Refresh the peer so only the silent node is expired.
+    rig.target.report.heartbeat_sequence += 1;
+    register(&rig.address, &mut rig.target).await;
+    assert_eq!(rig.rpc.expire_nodes().await.unwrap(), 1);
+    assert!(rig.session.get("sleep").await.unwrap().invalidated);
+}
+
 #[tokio::test]
 #[ignore = "requires dedicated real Redis"]
 async fn coordinator_restart_reconciles_the_durable_wake_without_new_identity() {
@@ -2124,6 +2254,7 @@ async fn delete_serializes_with_restore_and_fences_its_late_result() {
         failed_revision: None,
 
         node_session_id: String::new(),
+        coordinator_epoch: 0,
     }));
     assert!(futures_util::poll!(deleting.as_mut()).is_pending());
     gate.notify_one();
@@ -2452,6 +2583,7 @@ async fn local_checkpoint_waits_for_volume_without_rejecting_its_owner_node() {
         caller: caller(),
         failed_revision: None,
         node_session_id: String::new(),
+        coordinator_epoch: 0,
     })
     .await
     .unwrap();

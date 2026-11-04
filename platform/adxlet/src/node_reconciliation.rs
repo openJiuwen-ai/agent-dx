@@ -116,7 +116,9 @@ async fn report(
     request.set_timeout(timeout);
     let result = match bounded_rpc(timeout, coordinator.register_node(request)).await {
         Ok(response) => {
-            if let Some(control) = response.into_inner().upgrade_control {
+            let response = response.into_inner();
+            manager.observe_coordinator_epoch(response.coordinator_epoch);
+            if let Some(control) = response.upgrade_control {
                 manager
                     .apply_registration_upgrade_control(control)
                     .await
@@ -137,6 +139,7 @@ async fn report(
 }
 
 async fn inspect(
+    manager: &Adxlet,
     coordinator: &mut Coordinator,
     registration: &pb::RegisterNodeRequest,
     timeout: Duration,
@@ -146,9 +149,11 @@ async fn inspect(
         session_id: registration.session_id.clone(),
     });
     request.set_timeout(timeout);
-    Ok(bounded_rpc(timeout, coordinator.inspect_node(request))
+    let catalog = bounded_rpc(timeout, coordinator.inspect_node(request))
         .await?
-        .into_inner())
+        .into_inner();
+    manager.observe_coordinator_epoch(catalog.coordinator_epoch);
+    Ok(catalog)
 }
 
 /// Compare a complete current catalog without closing healthy live admission.
@@ -203,7 +208,7 @@ pub async fn reconcile_node(
         } else {
             None
         };
-        let catalog = inspect(coordinator, registration, timeout).await?;
+        let catalog = inspect(manager, coordinator, registration, timeout).await?;
         catalog_received = true;
         let mut invalid_catalog = |error| {
             manager.authority_reconciling.store(true, Ordering::Release);

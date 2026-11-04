@@ -84,9 +84,10 @@ pub(super) fn checkpoint_spec(
 impl CoordinatorRpc {
     pub async fn recover_environments(&self) -> Result<usize> {
         let mut blocked = None;
-        let work = {
+        let (work, coordinator_epoch) = {
             let mut state = self.0.state.lock().await;
             state.healthy()?;
+            let coordinator_epoch = state.session.epoch();
             let now = now()?;
             let upgrade = state.session.upgrade_task().await?;
             let upgrade_owned = |id: &str| {
@@ -171,10 +172,17 @@ impl CoordinatorRpc {
                 .take(16)
                 .collect();
             state.recovery_cursor = work.last().map(|(_, record, _)| record.spec.id.clone());
-            work
+            (work, coordinator_epoch)
         };
         let results = stream::iter(work.into_iter().map(|(node, record, timeout)| {
-            self.recover_record(node, record, timeout, self.0.timeout, false)
+            self.recover_record(
+                node,
+                record,
+                timeout,
+                self.0.timeout,
+                false,
+                coordinator_epoch,
+            )
         }))
         .buffer_unordered(4)
         .collect::<Vec<_>>()
@@ -194,6 +202,7 @@ impl CoordinatorRpc {
         run_timeout_seconds: Option<u64>,
         timeout: Duration,
         require_running: bool,
+        coordinator_epoch: u64,
     ) -> RpcFuture<'_, EnvironmentRecord> {
         Box::pin(async move {
             let assignment = record.assignment.clone();
@@ -214,6 +223,7 @@ impl CoordinatorRpc {
                         run_timeout_seconds,
                         record: Some(record.try_into()?),
                         node_session_id: session.clone(),
+                        coordinator_epoch,
                     })
                     .await
                     .map_err(adx_protocol::dependency_status)?

@@ -458,8 +458,14 @@ async fn lifecycle_rpc_scenario() {
         tokio::spawn(updater.run(Duration::from_millis(20))),
         serve_lifecycle_coordinator(ml, coordinator, auth, publication),
     ]);
+    let metrics_lease = adx_coordinator::lease::CoordinatorLease::new(
+        &redis.url,
+        "metrics-test",
+        Duration::from_secs(3),
+    )
+    .unwrap();
     servers.0.push(tokio::spawn(async move {
-        adx_coordinator::metrics::serve(metrics_listener, metrics_rpc)
+        adx_coordinator::metrics::serve(metrics_listener, metrics_rpc, metrics_lease)
             .await
             .unwrap();
     }));
@@ -603,7 +609,8 @@ async fn lifecycle_rpc_scenario() {
                 snapshot: None,
                 spec: Some(spec("late").into()),
                 assignment: first_record.assignment.clone(),
-                node_session_id: "old-boot".into()
+                node_session_id: "old-boot".into(),
+                coordinator_epoch: 0,
             })
             .await
             .unwrap_err()
@@ -660,7 +667,8 @@ async fn lifecycle_rpc_scenario() {
                 snapshot: None,
                 node_session_id: "boot-1".into(),
                 spec: Some(spec("first").into()),
-                assignment: Some(assignment.clone())
+                assignment: Some(assignment.clone()),
+                coordinator_epoch: 0,
             })
             .await
             .unwrap_err()
@@ -723,6 +731,7 @@ async fn lifecycle_rpc_scenario() {
         node_session_id: String::new(),
         assignment: Some(assignment.clone()),
         caller: caller(),
+        coordinator_epoch: 0,
     };
     bad_delete.caller.as_mut().unwrap().tenant_id = "other".into();
     assert_eq!(
@@ -744,6 +753,7 @@ async fn lifecycle_rpc_scenario() {
                 node_session_id: String::new(),
                 assignment: Some(stale),
                 caller: caller(),
+                coordinator_epoch: 0,
             })
             .await
             .unwrap_err()
@@ -814,6 +824,7 @@ async fn lifecycle_rpc_scenario() {
         node_session_id: String::new(),
         assignment: Some(assignment),
         caller: caller(),
+        coordinator_epoch: 0,
     };
     node_frontend
         .delete_environment(delete.clone())
@@ -863,6 +874,7 @@ async fn lifecycle_rpc_scenario() {
         node_session_id: String::new(),
         assignment: Some(second.assignment.try_into().unwrap()),
         caller: caller(),
+        coordinator_epoch: 0,
     };
     assert!(node_frontend
         .delete_environment(delete.clone())
@@ -915,6 +927,7 @@ async fn lifecycle_rpc_scenario() {
             node_session_id: String::new(),
             assignment: record.assignment,
             caller: caller(),
+            coordinator_epoch: 0,
         })
         .await
         .unwrap();
@@ -1171,6 +1184,7 @@ async fn lifecycle_rpc_scenario() {
                                         caller: caller(),
                                         failed_revision: None,
                                         node_session_id: "boot-1".into(),
+                                        coordinator_epoch: 0,
                                     })
                                     .await
                                     .unwrap();
@@ -1230,7 +1244,7 @@ async fn coordinator_process_loads_configuration_and_restores_bootstrap_credenti
     let key_file = directory.path().join("bootstrap.key");
     std::fs::write(&key_file, &key).unwrap();
     let config = serde_json::json!({
-        "listen":address.to_string(),"metrics_listen":metrics_address.to_string(),"advertised_address":format!("https://{address}"),"discovery_ttl_seconds":3,"redis_url":redis.url,"namespace":"process","scheduler_shards":1,"placement":"pack","rpc_timeout_seconds":2,
+        "listen":address.to_string(),"metrics_listen":metrics_address.to_string(),"advertised_address":format!("https://{address}"),"discovery_ttl_seconds":3,"redis_url":redis.url,"namespace":"process","scheduler_shards":1,"placement":"pack","rpc_timeout_seconds":2,"lease_seconds":1,
         "tls":{"ca":tls.join("ca.pem"),"certificate":tls.join("coordinator.pem"),"private_key":tls.join("coordinator.key"),"server_name":"localhost","peers":{"apiserver":tls.join("apiserver.der"),"node:node":tls.join("node.der")}},
         "bootstrap_credentials":[{"key_file":key_file,"tenant_id":"admin","administrator":true,"expires_at_unix_seconds":0}]
     });
@@ -1831,7 +1845,7 @@ async fn node_restart_before_expiry_requires_new_session_at_registered_endpoint(
 
 #[tokio::test]
 #[ignore = "requires isolated Redis and mTLS certificates; run control-rpc suite"]
-async fn coordinator_restart_bounds_re_registration_grace() {
+async fn coordinator_restart_retains_silent_nodes_until_a_probe_declares_them_lost() {
     use adx_core::{Assignment, EnvironmentState};
     for mode in ["timer", "late-register", "timely-register"] {
         let redis = common::Redis::new().await;
@@ -1845,7 +1859,10 @@ async fn coordinator_restart_bounds_re_registration_grace() {
             capacity: Some(spec("held").resources.into()),
             session_id: "boot".into(),
             heartbeat_sequence: 1,
-            reconciling: true,
+            // The declared-lost timer mode re-registers through a full
+            // reconciliation round-trip; the retained modes replay the
+            // registration that already made the stored session routable.
+            reconciling: mode == "timer",
             ..Default::default()
         };
         session
@@ -1893,23 +1910,26 @@ async fn coordinator_restart_bounds_re_registration_grace() {
         };
         session.commit(running.clone()).await.unwrap();
         let session = store.begin(1).await.unwrap();
-        let rpc = CoordinatorRpc::with_heartbeat_timeout(
+        let rpc = CoordinatorRpc::with_node_recovery_limits(
             session.clone(),
             Placement::Pack,
             peers(),
             client_tls("coordinator"),
             Duration::from_secs(2),
             Duration::from_secs(1),
+            1,
+            Duration::from_secs(600),
         )
         .await
         .unwrap();
-        assert!(session
-            .snapshot()
-            .await
-            .unwrap()
-            .routes()
-            .unwrap()
-            .is_empty());
+        // A primary change preserves valid routes: the stored session keeps
+        // its identity and routability instead of being re-registered
+        // unroutable, so Ingress keeps forwarding through the handover.
+        assert_eq!(
+            session.snapshot().await.unwrap().routes().unwrap().len(),
+            1,
+            "{mode}"
+        );
         assert!(!session.get("held").await.unwrap().invalidated);
         assert_eq!(rpc.expire_nodes().await.unwrap(), 0);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1934,9 +1954,19 @@ async fn coordinator_restart_bounds_re_registration_grace() {
             assert_eq!(
                 rpc.expire_nodes().await.unwrap(),
                 1,
-                "unregistered node must expire after Coordinator recovery grace"
+                "an unconfirmed node whose stored address is dead must be declared lost by probe evidence"
             );
             assert_eq!(rpc.expire_nodes().await.unwrap(), 0);
+            // A node that stays silent past the grace with nothing answering
+            // at its address is declared lost and its routes close —
+            // identical to a node dying while the primary is up.
+            assert!(session
+                .snapshot()
+                .await
+                .unwrap()
+                .routes()
+                .unwrap()
+                .is_empty());
         }
         node.register_node(report).await.unwrap();
         let catalog = node
@@ -1948,8 +1978,10 @@ async fn coordinator_restart_bounds_re_registration_grace() {
             .unwrap()
             .into_inner();
         let stored = session.get("held").await.unwrap();
-        assert_eq!(stored.invalidated, mode != "timely-register", "{mode}");
-        if mode == "timely-register" {
+        // Both a timely and a late registration confirm the recovered node
+        // (relay-01): only probe evidence of a dead address invalidates.
+        assert_eq!(stored.invalidated, mode == "timer", "{mode}");
+        if mode != "timer" {
             assert_eq!(catalog.records.len(), 1);
             let record: EnvironmentRecord = catalog.records[0].clone().try_into().unwrap();
             assert_eq!(record, running);
@@ -3095,6 +3127,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         snapshot: Some(deleting.clone().try_into().unwrap()),
         node_session_id: "gc-boot".into(),
         delegated: false,
+        coordinator_epoch: 0,
     };
     let mut frontend =
         pb::node_service_client::NodeServiceClient::new(channel(na, "apiserver").await);
@@ -3178,6 +3211,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
         expected_revision: source.revision,
         names: vec!["saved".into()],
         timeout_seconds: 60,
+        coordinator_epoch: 0,
     };
     let mut unknown_kind = request.clone();
     unknown_kind.kind = 42;
@@ -3214,6 +3248,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
             node_session_id: String::new(),
             assignment: source.assignment,
             caller: caller(),
+            coordinator_epoch: 0,
         })
         .await
         .unwrap();
@@ -3322,6 +3357,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
             node_session_id: String::new(),
             assignment: created.assignment,
             caller: caller(),
+            coordinator_epoch: 0,
         })
         .await
         .unwrap();
@@ -4102,6 +4138,7 @@ async fn shared_checkpoint_recovery(
             run_timeout_seconds: None,
             record: Some(duplicate.try_into().unwrap()),
             node_session_id: "target-boot".into(),
+            coordinator_epoch: 0,
         })
         .await
         .unwrap();
@@ -4248,4 +4285,359 @@ async fn inspect_node_uses_committed_cache_when_redis_is_unavailable() {
     // recovery check nor dormant expiration needs a fresh durable catalog.
     assert_eq!(rpc.resume_pending().await.unwrap(), 0);
     assert_eq!(rpc.expire_dormant().await.unwrap(), 0);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and mTLS certificates; run control-rpc suite"]
+async fn drained_coordinator_rejects_new_mutating_work_as_not_accepted() {
+    let redis = common::Redis::new().await;
+    let store = redis.store().await;
+    let session = store.begin(1).await.unwrap();
+    let rpc = CoordinatorRpc::with_heartbeat_timeout(
+        session.clone(),
+        Placement::Pack,
+        peers(),
+        client_tls("coordinator"),
+        Duration::from_secs(2),
+        Duration::from_millis(250),
+    )
+    .await
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let service = rpc.clone();
+    let _servers = Servers(vec![tokio::spawn(async move {
+        Server::builder()
+            .tls_config(server_tls("coordinator"))
+            .unwrap()
+            .add_service(pb::coordinator_service_server::CoordinatorServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    })]);
+    let mut apiserver = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        channel(address, "apiserver").await,
+    );
+
+    // The handover drain: new mutating work is rejected as a structured
+    // "not accepted" — Unavailable carrying the marker metadata, so the
+    // API Server may retry the same identity against the next primary —
+    // while reads keep serving through the drain.
+    rpc.begin_drain();
+    let error = apiserver
+        .create_environment(create("drained-create"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable, "{error:?}");
+    assert!(
+        adx_protocol::not_accepted_status(&error),
+        "rejection must carry the not-accepted marker: {error:?}"
+    );
+    let error = apiserver
+        .set_node_scheduling(pb::SetNodeSchedulingRequest {
+            node_id: "node".into(),
+            accepting_allocations: false,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable, "{error:?}");
+    assert!(adx_protocol::not_accepted_status(&error));
+
+    let mut node = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        channel(address, "node").await,
+    );
+    let error = node
+        .register_node(pb::RegisterNodeRequest {
+            node_id: "node".into(),
+            node_address: "127.0.0.1:9001".into(),
+            proxy_address: "127.0.0.1:9002".into(),
+            capacity: Some(spec("drained").resources.into()),
+            session_id: "first-boot".into(),
+            heartbeat_sequence: 1,
+            accepting_allocations: false,
+            reconciling: true,
+            ..Default::default()
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), tonic::Code::Unavailable, "{error:?}");
+    assert!(adx_protocol::not_accepted_status(&error));
+
+    // Reads keep serving through the drain: the scheduler queue stays
+    // queryable so operators can observe the handover.
+    let queue = apiserver
+        .get_scheduling_queue(pb::GetSchedulingQueueRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(queue.environments.is_empty());
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and mTLS certificates; run control-rpc suite"]
+async fn a_continuing_node_survives_a_primary_change_without_reconciliation() {
+    use adx_core::{Assignment, EnvironmentState};
+    let redis = common::Redis::new().await;
+    let store = redis.store().await;
+    let session = store.begin(1).await.unwrap();
+    // A node in good standing: registered with a routable session and
+    // holding one running environment.
+    let report = pb::RegisterNodeRequest {
+        node_id: "node".into(),
+        node_address: "127.0.0.1:9001".into(),
+        proxy_address: "127.0.0.1:9002".into(),
+        capacity: Some(spec("held").resources.into()),
+        session_id: "boot".into(),
+        heartbeat_sequence: 4,
+        accepting_allocations: true,
+        ..Default::default()
+    };
+    session
+        .register_session(
+            adx_coordinator::Node::try_from(report.clone()).unwrap(),
+            report.node_address.clone(),
+            report.proxy_address.clone(),
+            Some(adx_coordinator::storage::NodeSession {
+                id: "boot".into(),
+                sequence: 4,
+                routable: true,
+            }),
+        )
+        .await
+        .unwrap();
+    let assignment = Assignment {
+        environment_id: "held".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    session
+        .reserve(spec("held"), assignment.clone())
+        .await
+        .unwrap();
+    let running = EnvironmentRecord {
+        observation: None,
+        execution_artifacts: vec![],
+        snapshot_source: None,
+        failure: None,
+        restart_attempts: 0,
+        restart_pending: false,
+        spec: spec("held"),
+        assignment,
+        state: EnvironmentState::Running,
+        revision: 2,
+        runtime: adx_core::Runtime {
+            id: "held-1".into(),
+            ip: Some("10.0.0.2".parse().unwrap()),
+        },
+        resources_held: true,
+        checkpoint: None,
+        last_operation: None,
+    };
+    session.commit(running).await.unwrap();
+    // Primary change: a new epoch with the same stored node session.
+    let session = store.begin(1).await.unwrap();
+    let rpc = CoordinatorRpc::with_heartbeat_timeout(
+        session.clone(),
+        Placement::Pack,
+        peers(),
+        client_tls("coordinator"),
+        Duration::from_secs(2),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(session.snapshot().await.unwrap().routes().unwrap().len(), 1);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let service = rpc.clone();
+    let _servers = Servers(vec![tokio::spawn(async move {
+        Server::builder()
+            .tls_config(server_tls("coordinator"))
+            .unwrap()
+            .add_service(pb::coordinator_service_server::CoordinatorServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    })]);
+    let mut node = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        channel(address, "node").await,
+    );
+    // A retry of the report whose registration was already persisted (its
+    // reply was lost across the primary change) is answered from storage
+    // without writing.
+    node.register_node(report.clone()).await.unwrap();
+    let stored = session.snapshot().await.unwrap();
+    assert_eq!(
+        stored
+            .nodes
+            .get("node")
+            .unwrap()
+            .session
+            .as_ref()
+            .unwrap()
+            .sequence,
+        4
+    );
+    assert_eq!(stored.routes().unwrap().len(), 1);
+    // The next heartbeat under the same session identity — the node
+    // process never restarted — continues serving without a reconciliation
+    // round-trip, staying routable with its route open.
+    let mut next = report.clone();
+    next.heartbeat_sequence = 5;
+    node.register_node(next).await.unwrap();
+    assert_eq!(session.snapshot().await.unwrap().routes().unwrap().len(), 1);
+    assert!(!session.get("held").await.unwrap().invalidated);
+    // Monotonicity still holds under the stored session: a stale sequence
+    // is rejected.
+    let mut stale = report.clone();
+    stale.heartbeat_sequence = 3;
+    assert_eq!(
+        node.register_node(stale).await.unwrap_err().code(),
+        tonic::Code::FailedPrecondition
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis and mTLS certificates; run control-rpc suite"]
+async fn a_real_two_step_registration_survives_a_primary_change_without_reconciliation() {
+    use adx_core::{Assignment, EnvironmentState};
+    let redis = common::Redis::new().await;
+    let store = redis.store().await;
+    let session = store.begin(1).await.unwrap();
+    let rpc = CoordinatorRpc::with_heartbeat_timeout(
+        session.clone(),
+        Placement::Pack,
+        peers(),
+        client_tls("coordinator"),
+        Duration::from_secs(2),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let service = rpc.clone();
+    let _servers = Servers(vec![tokio::spawn(async move {
+        Server::builder()
+            .tls_config(server_tls("coordinator"))
+            .unwrap()
+            .add_service(pb::coordinator_service_server::CoordinatorServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    })]);
+    let mut node = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        channel(address, "node").await,
+    );
+    // The real boot handshake, not a direct storage write: the first
+    // registration reports reconciling (the node inspects its persisted
+    // state before claiming routability), the coordinator inspects, then
+    // the completion registration flips the session to routable.
+    let first = pb::RegisterNodeRequest {
+        node_id: "node".into(),
+        node_address: "127.0.0.1:9001".into(),
+        proxy_address: "127.0.0.1:9002".into(),
+        capacity: Some(spec("held").resources.into()),
+        session_id: "boot".into(),
+        heartbeat_sequence: 1,
+        accepting_allocations: false,
+        reconciling: true,
+        ..Default::default()
+    };
+    node.register_node(first.clone()).await.unwrap();
+    node.inspect_node(pb::InspectNodeRequest {
+        node_id: "node".into(),
+        session_id: "boot".into(),
+    })
+    .await
+    .unwrap();
+    let mut second = first.clone();
+    second.heartbeat_sequence = 2;
+    second.reconciling = false;
+    second.accepting_allocations = true;
+    node.register_node(second).await.unwrap();
+    // One running environment held by the node.
+    let assignment = Assignment {
+        environment_id: "held".into(),
+        node_id: "node".into(),
+        shard_id: 0,
+        generation: 1,
+        devices: vec![],
+    };
+    session
+        .reserve(spec("held"), assignment.clone())
+        .await
+        .unwrap();
+    let running = EnvironmentRecord {
+        observation: None,
+        execution_artifacts: vec![],
+        snapshot_source: None,
+        failure: None,
+        restart_attempts: 0,
+        restart_pending: false,
+        spec: spec("held"),
+        assignment,
+        state: EnvironmentState::Running,
+        revision: 2,
+        runtime: adx_core::Runtime {
+            id: "held-1".into(),
+            ip: Some("10.0.0.2".parse().unwrap()),
+        },
+        resources_held: true,
+        checkpoint: None,
+        last_operation: None,
+    };
+    session.commit(running).await.unwrap();
+    // Primary change: a fresh epoch reads the state back from Redis. The
+    // routable transition of the completing registration must have been
+    // persisted — otherwise every node reads back non-routable, the routes
+    // vanish and the whole cluster is forced back into reconciliation.
+    let session = store.begin(1).await.unwrap();
+    let snapshot = session.snapshot().await.unwrap();
+    let stored = snapshot
+        .nodes
+        .get("node")
+        .unwrap()
+        .session
+        .as_ref()
+        .unwrap();
+    assert!(stored.routable, "routable transition must be persisted");
+    assert_eq!(stored.sequence, 2, "persisted sequence must advance");
+    assert_eq!(snapshot.routes().unwrap().len(), 1);
+    let rpc = CoordinatorRpc::with_heartbeat_timeout(
+        session.clone(),
+        Placement::Pack,
+        peers(),
+        client_tls("coordinator"),
+        Duration::from_secs(2),
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let service = rpc.clone();
+    let _servers = Servers(vec![tokio::spawn(async move {
+        Server::builder()
+            .tls_config(server_tls("coordinator"))
+            .unwrap()
+            .add_service(pb::coordinator_service_server::CoordinatorServiceServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    })]);
+    let mut node = pb::coordinator_service_client::CoordinatorServiceClient::new(
+        channel(address, "node").await,
+    );
+    // The next heartbeat under the same session identity — the node
+    // process never restarted — continues serving without a reconciliation
+    // round-trip, and the route stays open.
+    let mut next = first.clone();
+    next.heartbeat_sequence = 3;
+    next.reconciling = false;
+    next.accepting_allocations = true;
+    node.register_node(next).await.unwrap();
+    assert_eq!(session.snapshot().await.unwrap().routes().unwrap().len(), 1);
 }
