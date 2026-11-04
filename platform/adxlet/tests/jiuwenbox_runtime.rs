@@ -63,6 +63,7 @@ struct Backend {
     release: Semaphore,
     reject_create: AtomicBool,
     errored_create_phase: AtomicBool,
+    legacy_create_error: AtomicBool,
     reject_delete: AtomicBool,
     block_delete: AtomicBool,
     delete_entered: Semaphore,
@@ -82,6 +83,7 @@ impl Backend {
             release: Semaphore::new(1),
             reject_create: AtomicBool::new(false),
             errored_create_phase: AtomicBool::new(false),
+            legacy_create_error: AtomicBool::new(false),
             reject_delete: AtomicBool::new(false),
             block_delete: AtomicBool::new(false),
             delete_entered: Semaphore::new(0),
@@ -122,8 +124,7 @@ impl Backend {
             } else if self.errored_create_phase.load(Ordering::SeqCst) {
                 code = StatusCode::CREATED;
                 let id = body["sandbox_id"].as_str().unwrap().to_owned();
-                let value =
-                    json!({"id":id,"phase":"error","error_message":"private backend output"});
+                let value = json!({"id":id,"phase":"error","error_message":"requested cgroup v1 backend is unavailable"});
                 self.refs.lock().unwrap().insert(id, value.clone());
                 value
             } else {
@@ -210,10 +211,14 @@ impl Backend {
         } else {
             serde_json::to_vec(&result).unwrap()
         };
-        Ok(Response::builder()
-            .status(code)
-            .body(Full::new(Bytes::from(bytes)))
-            .unwrap())
+        let mut response = Response::builder().status(code);
+        if method == "POST"
+            && path == "/api/v1/sandboxes"
+            && !self.legacy_create_error.load(Ordering::SeqCst)
+        {
+            response = response.header("X-Jiuwenbox-Public-Error", "true");
+        }
+        Ok(response.body(Full::new(Bytes::from(bytes))).unwrap())
     }
     fn count(&self, method: &str, path: &str) -> usize {
         self.calls
@@ -1672,8 +1677,16 @@ async fn identity_override_is_not_silently_ignored_by_supervisor() {
 
 #[tokio::test]
 async fn errored_backend_phase_is_a_terminal_failure_and_is_cleaned() {
-    for class in ["supervisor", "conch"] {
+    for (class, legacy) in [
+        ("supervisor", false),
+        ("conch", false),
+        ("supervisor", true),
+    ] {
         let fixture = Fixture::new();
+        fixture
+            .backend
+            .legacy_create_error
+            .store(legacy, Ordering::SeqCst);
         let driver = fixture.driver().await;
         fixture
             .backend
@@ -1699,8 +1712,13 @@ async fn errored_backend_phase_is_a_terminal_failure_and_is_cleaned() {
             ),
             "{error:?}"
         );
-        assert!(!error.to_string().contains("private backend output"));
         let status = adx_protocol::status(error);
+        let expected = if legacy {
+            "Jiuwenbox backend create reported error"
+        } else {
+            "requested cgroup v1 backend is unavailable"
+        };
+        assert_eq!(status.message(), expected);
         assert_eq!(
             status.metadata().get("adx-backend-failure").unwrap(),
             "true"

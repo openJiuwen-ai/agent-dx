@@ -90,6 +90,15 @@ API Server、Coordinator 和入口节点为创建错误回传预留最多 3 秒�
 `DEADLINE_EXCEEDED` 和原阶段文案，附带发布未确认说明；此时使用
 `outcome=unknown`、`retry=same_operation`，由后续对账补写，不能宣称已确认终态。
 
+### 沙箱后端创建失败
+
+Jiuwenbox 通过创建结果中的 `error_message` 提供可公开的失败原因。ADX 将它写入现有
+HTTP `message`，沿用现有状态码与错误详情。Jiuwenbox 通过内部响应头
+`X-Jiuwenbox-Public-Error: true` 确认该消息可公开。旧版响应仍使用通用文案。
+内部异常和进程输出保留在 Jiuwenbox 日志。
+sandboxd Start 的 gRPC 错误消息同样进入 HTTP `message`。创建完成日志同时记录错误消息
+和请求 ID。
+
 ### 调度队列到期
 
 调度队列继续等待至 `scheduleTimeoutSeconds`。Coordinator 只有在同一状态锁内确认

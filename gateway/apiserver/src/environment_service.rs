@@ -253,6 +253,7 @@ impl EnvironmentService {
                         .as_ref()
                         .err()
                         .map_or("OK", |error| error.code().description()),
+                    status_message = result.as_ref().err().map_or("", |error| error.message()),
                     "Environment create completed"
                 );
                 result
