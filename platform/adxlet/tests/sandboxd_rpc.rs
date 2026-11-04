@@ -360,6 +360,27 @@ fn spec() -> EnvironmentSpec {
     }
 }
 
+#[tokio::test]
+async fn sandboxd_create_accepts_tool_user_and_group() {
+    let server = Server::default();
+    let (adapter, _harness) = connect(server.clone()).await;
+    let mut environment = spec();
+    environment.execution.user = Some("1000".into());
+    environment.execution.group = Some("1000".into());
+
+    adapter
+        .start(&environment, "tool-environment", 1, &[])
+        .await
+        .unwrap();
+
+    let starts = server.starts.lock().unwrap();
+    assert_eq!(starts.len(), 1);
+    assert_eq!(starts[0].runtime, "runsc");
+    assert!(!starts[0]
+        .envs
+        .contains_key(adx_core::execution::WORKLOAD_PROCESS_ENV));
+}
+
 #[test]
 fn kata_start_prepares_guest_pty_without_privileged_guest_capabilities() {
     let mut spec = spec();
