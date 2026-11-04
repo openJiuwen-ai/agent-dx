@@ -17,7 +17,8 @@ RuntimeDirectory=sandboxd
 RuntimeDirectoryMode=0700
 StateDirectory=adx-sandboxd
 StateDirectoryMode=0700
-UMask=0077
+# OCI layer directories must be traversable by non-root sandbox processes.
+UMask=0022
 
 [Install]
 WantedBy=multi-user.target
