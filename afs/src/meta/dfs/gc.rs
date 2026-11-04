@@ -350,17 +350,6 @@ impl DfsService {
                         "open version was collected before reference admission",
                     ));
                 }
-                if let Some(identity) = &update.open_read
-                    && (identity.closed
-                        || update.publication
-                        || update.close_open_read
-                        || update.version_id.as_ref() != Some(&identity.version_id)
-                        || !matches!(view.lookup(&MetaKey::DfsFileVersion(identity.version_id.clone()))?.entity, Some(MetaEntity::DfsFileVersion(v)) if v.inode_id == inode_id && v.layout_root == identity.layout_root_id))
-                {
-                    return Err(invalid(
-                        "open read registration differs from its immutable version",
-                    ));
-                }
                 GcReference {
                     node_id: update.node_id.clone(),
                     session_id: update.session_id.clone(),
@@ -369,7 +358,7 @@ impl DfsService {
                     publication: update.publication,
                     chunks: Vec::new(),
                     retired_at_unix_ms: None,
-                    open_read: update.open_read.clone(),
+                    open_read: None,
                 }
             };
             if reference.retired_at_unix_ms.is_some() {
@@ -387,20 +376,6 @@ impl DfsService {
                     || update.publication != reference.publication)
             {
                 return Err(invalid("reference identity was reused for another access"));
-            }
-            if update
-                .open_read
-                .as_ref()
-                .is_some_and(|identity| reference.open_read.as_ref() != Some(identity))
-            {
-                return Err(invalid("open read reference identity changed"));
-            }
-            if update.close_open_read {
-                let identity = reference
-                    .open_read
-                    .as_mut()
-                    .ok_or_else(|| invalid("reference is not an open read context"))?;
-                identity.closed = true;
             }
             let gc = match reference_entity(&view, MetaKey::DfsGc, &mut conditions)? {
                 Some(MetaEntity::DfsGc(gc)) => gc,

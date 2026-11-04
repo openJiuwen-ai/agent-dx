@@ -150,6 +150,12 @@ sudo adxctl validate
 证书绑定表不能替代 TLS 配置；启用 OwnerFs 或 DFS 权威的 Meta 缺少 mTLS 时，
 必须在监听端口和打开持久后端前拒绝启动。
 
+Meta 的 DFS 读 RPC（`Lookup`、`ReadDir`、`ReadLink`、`GetInode`、`GetFileVersion`、
+`GetXattr`、`ListXattr`）只接受能映射到 `trusted_node_certs` 中某个 Node 的证书；同一
+CA 签发但不在该表中的证书会收到 permission denied。这些 RPC 只校验证书属于受信
+Node，不绑定请求里的调用者，也不做逐调用者授权：部署按单一信任域对待，引入多租户
+前必须补齐。
+
 组件间持续传输加密统一由顶层 `tls_encryption_enabled` 控制，Node／Meta默认均为
 false；可在TOML或CLI（`--tls-encryption-enabled true|false`）覆盖。false仍需要
 原CA、证书、私钥、服务端名称及受信节点映射：连接先完成双向证书认证，再按AFS1

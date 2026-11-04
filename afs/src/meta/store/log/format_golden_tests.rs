@@ -16,8 +16,8 @@ use serde::Serialize;
 use super::*;
 use crate::dfs::{
     ChunkEncoding, ChunkId, ContentDigest, CopyLocation, CopyRole, CopyState, DfsDurabilityPolicy,
-    DigestAlgorithm, GcFence, GcReference, GcState, InodeId, InodeKind, LocalCopyPolicy,
-    PlacementHealth, ReplicaGroupId, ReplicationTaskState, SpecialNodeKind,
+    DigestAlgorithm, GcReference, GcState, InodeId, InodeKind, LocalCopyPolicy, PlacementHealth,
+    ReplicaGroupId, ReplicationTaskState, SpecialNodeKind,
 };
 use crate::meta::store::{RootCommandType, RootRight, codec::tests::entity_fixtures, state::State};
 
@@ -351,11 +351,6 @@ fn dfs_persisted_enum_variant_indices_are_pinned() {
         2: ReplicationTaskState::RetryWaiting => ReplicationTaskState::RetryWaiting,
         3: ReplicationTaskState::Completed => ReplicationTaskState::Completed,
         4: ReplicationTaskState::BlockedNoSource => ReplicationTaskState::BlockedNoSource,
-    });
-    pin_variants!(GcFence {
-        0: GcFence::Absent => GcFence::Absent,
-        1: GcFence::Revision(_) => GcFence::Revision(1),
-        2: GcFence::WriteGeneration => GcFence::WriteGeneration,
     });
 }
 

@@ -47,9 +47,6 @@ async fn generation_fixture() -> Fixture {
 
 fn generation_admission(f: &Fixture, release: bool) -> crate::dfs::UpdateGcReference {
     crate::dfs::UpdateGcReference {
-        open_read: None,
-        close_open_read: false,
-
         node_id: "writer".into(),
         session_id: "writer-session".into(),
         reference_id: format!("write:{}", f.commit.operation_id.0),
@@ -296,7 +293,6 @@ async fn fixture() -> Fixture {
         })
         .await
         .unwrap();
-    let fence = service.current_gc_fence().await.unwrap();
     let operation_id = OperationId::new("publish-fenced");
     let staged = StagedChunk::new(operation_id.clone(), b"fenced body".to_vec());
     let placement = service.placement_snapshot("writer".into()).await.unwrap();
@@ -324,7 +320,7 @@ async fn fixture() -> Fixture {
         }],
     };
     let commit = CommitFileVersion {
-        gc_fence: Some(fence),
+        gc_fence: None,
         operation_id: operation_id.clone(),
         inode_id: inode.inode_id.clone(),
         write_lease,
@@ -396,45 +392,10 @@ async fn gc_fence_normal_real_persistence_commits_without_chunk_registrations() 
     assert_eq!(bytes, b"fenced body");
 }
 #[tokio::test]
-async fn gc_fence_completed_delete_cannot_reuse_old_receipt_after_list_clears() {
+async fn gc_fence_old_inflight_delete_rejected_without_a_generation_fence() {
     let f = fixture().await;
-    let batch = schedule_gc(&f).await;
-    f.local
-        .collect_generation(batch.generation, &batch.chunks)
-        .unwrap();
-    let cleared = f
-        .service
-        .collect_garbage(
-            "writer".into(),
-            "writer-session".into(),
-            batch.generation,
-            vec![],
-        )
-        .await
-        .unwrap();
-    assert!(cleared.chunks.is_empty());
-    assert_eq!(cleared.generation, batch.generation);
-    let error = f
-        .service
-        .commit_file_version("writer".into(), f.commit.clone())
-        .await
-        .unwrap_err();
-    assert_eq!(error.code(), afs_error::META_DFS_GC_CHANGED);
-    assert!(
-        f.service
-            .get_inode(f.commit.inode_id.clone())
-            .await
-            .unwrap()
-            .head_version
-            .is_none()
-    );
-}
-#[tokio::test]
-async fn gc_fence_old_inflight_delete_rejected_even_with_matching_state_version() {
-    let mut f = fixture().await;
     let _batch = schedule_gc(&f).await;
-    // Model a deletion already in flight when this write generation began.
-    f.commit.gc_fence = Some(f.service.current_gc_fence().await.unwrap());
+    // A deletion is already in flight when this commit is first evaluated.
     assert!(
         f.service
             .commit_file_version("writer".into(), f.commit.clone())
@@ -465,8 +426,7 @@ async fn gc_fence_atomic_condition_rejects_gc_between_check_and_publish() {
             operation: StoreOperation::DfsCommitFileVersion,
             result: OperationResult::Empty,
         }));
-    txn.conditions
-        .push(f.commit.gc_fence.unwrap().condition().unwrap());
+    txn.conditions.push(TxnCondition::Missing(MetaKey::DfsGc));
     txn.mutations
         .push(TxnMutation::Put(MetaEntity::DfsFileVersion(
             f.commit.file_version.clone(),
@@ -522,9 +482,14 @@ async fn gc_fence_lost_reply_replays_success_even_after_gc_state_changes() {
         )
         .await
         .unwrap();
-    assert_ne!(
-        Some(f.service.current_gc_fence().await.unwrap()),
-        f.commit.gc_fence
+    assert!(
+        f.store
+            .read(MetaRead::DfsGc)
+            .await
+            .unwrap()
+            .entity
+            .is_some(),
+        "GC state must have changed since the original commit"
     );
     let replay = f
         .service
@@ -535,10 +500,17 @@ async fn gc_fence_lost_reply_replays_success_even_after_gc_state_changes() {
 }
 #[test]
 fn gc_fence_wire_is_explicit_and_rejects_missing_kind() {
-    for fence in [GcFence::Absent, GcFence::Revision(9)] {
-        assert_eq!(GcFence::from_wire(fence.wire()).unwrap(), fence);
-    }
+    let fence = GcFence::WriteGeneration;
+    assert_eq!(GcFence::from_wire(fence.wire()).unwrap(), fence);
     assert!(GcFence::from_wire(afs_protocol::meta::DfsGcFence { kind: None }).is_err());
+    assert!(
+        GcFence::from_wire(afs_protocol::meta::DfsGcFence {
+            kind: Some(afs_protocol::meta::dfs_gc_fence::Kind::WriteGeneration(
+                false
+            )),
+        })
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -647,8 +619,6 @@ async fn new_operation_on_same_node_admits_normally_after_tombstone_collection()
         .unwrap();
     f.commit.operation_id = OperationId::new(crate::meta::store::timed_request_id("next-op"));
     let fresh = crate::dfs::UpdateGcReference {
-        open_read: None,
-        close_open_read: false,
         node_id: "writer".into(),
         session_id: "writer-session".into(),
         reference_id: format!("write:{}", f.commit.operation_id.0),

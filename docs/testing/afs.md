@@ -1051,7 +1051,7 @@ Full FSx和FUN/REL完整harness的未执行状态保持，已有标准、组件�
 
 ## 原生CRC与写入代次GC定向检查
 
-原生DFS Node默认启用CRC和写入代次保护，保留capability本地处理及省略逐chunk登记。`generation_`检查覆盖库存保护、无关GC变化、确切代次退休、检查后退休竞态、回复丢失重放、迟到准入与墓碑清理，以及重试保留旧收据时所有出生代次仍须有效。`META_DFS_GC_CHANGED`在CRC路径指相关代次缺失/退休；不再把无关全局GC变化当作失败。`meta::dfs::gc_fence_tests::`同时保留显式BLAKE3对照路径的原条件事务检查。
+原生DFS Node默认启用CRC和写入代次保护，保留capability本地处理及省略逐chunk登记。`generation_`检查覆盖库存保护、无关GC变化、确切代次退休、检查后退休竞态、回复丢失重放、迟到准入与墓碑清理，以及重试保留旧收据时所有出生代次仍须有效。`META_DFS_GC_CHANGED`在CRC路径指相关代次缺失/退休；不再把无关全局GC变化当作失败。`meta::dfs::gc_fence_tests::`同时保留BLAKE3对照路径（`gc_fence`为空）的GC版本条件事务检查。
 
 `crc32c_`检查覆盖描述及Meta wire、CRC向量/末段、独立ID、原ID复制/修复、catalog重开、跨段读取、损坏/缺表/错表/截断拒绝、局部覆盖、截短/扩容、部分成功后失败重试，以及远端Header/Completion身份和范围。all-features还核对RDMA CRC Completion与Meta绑定；这不是RDMA硬件运行。`meta_capability_`保持原inode映射及错误顺序，`pr88_fix_`保留组合开关和尾块重试检查。Rust检查只在Linux执行。
 

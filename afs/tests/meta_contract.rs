@@ -250,6 +250,75 @@ async fn dfs_write_authority_rpc_validates_fields_and_uses_new_endpoint() {
 }
 
 #[tokio::test]
+async fn dfs_gc_fence_capture_requires_a_write_reference_before_any_mutation() {
+    use afs::meta::store::NodeSessionLease;
+    use afs_protocol::meta::{UpdateDfsGcReferenceRequest, dfs_gc_fence::Kind};
+    let (store, _, lease, _) = lock_resolver_fixture(30).await;
+    store
+        .register_node_session(
+            RequestKey::new("node-a", "register-capture"),
+            NodeSessionLease {
+                node_id: "node-a".into(),
+                session_id: "session-a".into(),
+                grpc_addr: "http://127.0.0.1:1".into(),
+                data_addr: "http://127.0.0.1:2".into(),
+                rest_addr: "http://127.0.0.1:3".into(),
+                ownerfs_enabled: false,
+                storage_devices: vec![],
+                lease_ttl: std::time::Duration::from_secs(60),
+            },
+        )
+        .await
+        .unwrap();
+    let rpc = rpc::DfsMetaRpc(Arc::new(Meta::with_store(
+        "test".into(),
+        Observability::new().unwrap(),
+        store.clone(),
+    )));
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let capture = |reference_id: &str| UpdateDfsGcReferenceRequest {
+        node_id: "node-a".into(),
+        session_id: "session-a".into(),
+        reference_id: reference_id.into(),
+        inode_id: lease.inode_id.0.clone(),
+        publication: true,
+        capture_gc_fence: true,
+        admission_deadline_unix_ms: now_ms + 30_000,
+        ..Default::default()
+    };
+    let error = rpc
+        .update_gc_reference(Request::new(capture("publish:other")))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Code::InvalidArgument, "{error:?}");
+    // Admission has expired, so only an already retained reference could pass.
+    let mut retained = capture("publish:other");
+    retained.capture_gc_fence = false;
+    retained.admission_deadline_unix_ms = 1;
+    assert!(
+        rpc.update_gc_reference(Request::new(retained))
+            .await
+            .is_err(),
+        "a rejected capture must not retain a reference"
+    );
+    let reply = rpc
+        .update_gc_reference(Request::new(capture(&format!(
+            "write:{}",
+            afs::meta::store::timed_request_id("capture")
+        ))))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(
+        reply.gc_fence.unwrap().kind,
+        Some(Kind::WriteGeneration(true))
+    );
+}
+
+#[tokio::test]
 async fn dfs_write_authority_expired_lease_acquires_and_replays_exact_result() {
     let (store, dfs, original, backend) = lock_resolver_fixture(1).await;
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;

@@ -752,15 +752,6 @@ async fn commit_without_fence_with_gc_state() -> String {
     f.commit(&[]).await
 }
 
-// Commit J: an explicit revision fence supplies the GC condition.
-async fn commit_with_revision_fence() -> String {
-    let mut f = CommitFixture::new(single_copy()).await;
-    f.schedule_unrelated_gc().await;
-    f.commit.gc_fence = Some(f.service.current_gc_fence().await.unwrap());
-    assert!(matches!(f.commit.gc_fence, Some(GcFence::Revision(_))));
-    f.commit(&[]).await
-}
-
 // Commit E/J: a native write generation is admitted, fenced and retired.
 async fn commit_with_write_generation() -> String {
     let mut f = CommitFixture::new(single_copy()).await;
@@ -772,8 +763,6 @@ async fn commit_with_write_generation() -> String {
     f.set_receipt(chunk).await;
     f.service
         .update_gc_reference(UpdateGcReference {
-            open_read: None,
-            close_open_read: false,
             node_id: "writer".into(),
             session_id: "writer-s1".into(),
             reference_id: format!("write:{}", f.commit.operation_id.0),
@@ -846,7 +835,6 @@ snapshot_cases!(
     corruption_repeated_report_is_acknowledged,
     commit_without_fence,
     commit_without_fence_with_gc_state,
-    commit_with_revision_fence,
     commit_with_write_generation,
     commit_registers_underreplication,
 );

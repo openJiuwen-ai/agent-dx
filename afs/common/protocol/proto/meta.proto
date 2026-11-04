@@ -1150,9 +1150,8 @@ message DfsCloneFileRange {
 }
 
 message DfsGcFence {
+  reserved 1, 2;
   oneof kind {
-    uint64 state_revision = 1;
-    bool absent = 2;
     bool write_generation = 3;
   }
 }
@@ -1263,8 +1262,7 @@ message UpdateDfsGcReferenceRequest {
   uint64 admission_deadline_unix_ms = 9;
   // Capture once before the caller starts producing native receipts.
   bool capture_gc_fence = 10;
-  bytes open_read = 11;
-  bool close_open_read = 12;
+  reserved 11, 12;
 }
 message UpdateDfsGcReferenceReply { DfsGcFence gc_fence = 1; }
 message CollectDfsGarbageRequest {

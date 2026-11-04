@@ -3944,34 +3944,12 @@ fn dfs_range_request_rejects_expired_grants_and_unbounded_batches() {
 }
 #[cfg(feature = "dfs")]
 #[tokio::test]
-async fn open_authority_replacement_session_cannot_reuse_old_context() {
+async fn retired_open_read_token_gets_no_special_authority() {
     use crate::dfs::*;
-    let (meta, _local, _temp, mut request) = memory_read_authority_fixture().await;
+    let (meta, _local, _temp, request) = memory_read_authority_fixture().await;
     let service = meta.dfs.as_ref().unwrap();
-    service
-        .update_gc_reference(UpdateGcReference {
-            open_read: Some(OpenReadIdentity {
-                version_id: FileVersionId::new("version"),
-                layout_root_id: LayoutRootId::new("layout"),
-                closed: false,
-            }),
-            close_open_read: false,
-            node_id: "reader".into(),
-            session_id: "session-reader".into(),
-            reference_id: "read-open:old-process".into(),
-            inode_id: Some(InodeId::new("read-inode")),
-            version_id: Some(FileVersionId::new("version")),
-            publication: false,
-            chunks: vec![],
-            release: false,
-            admission_deadline_unix_ms: crate::meta::store::now_unix_ms() + 30_000,
-        })
-        .await
-        .unwrap();
-    request.operations[0].grant.as_mut().unwrap().token =
-        "dfs-open-v1:read-open:old-process".into();
     let grant = request.operations[0].grant.as_ref().unwrap();
-    let check = ValidateDfsReadGrants {
+    let mut check = ValidateDfsReadGrants {
         receiver_node_id: "receiver".into(),
         receiver_node_epoch: 1,
         peer_node_id: "reader".into(),
@@ -3993,32 +3971,7 @@ async fn open_authority_replacement_session_cannot_reuse_old_context() {
         }],
     };
     service.validate_read_grants(check.clone()).await.unwrap();
-    meta.store
-        .as_ref()
-        .unwrap()
-        .register_node_session(
-            crate::meta::store::RequestKey::new("reader", "replacement"),
-            crate::meta::store::NodeSessionLease {
-                node_id: "reader".into(),
-                session_id: "new-reader-process".into(),
-                grpc_addr: "http://127.0.0.1:1".into(),
-                data_addr: "http://127.0.0.1:1".into(),
-                rest_addr: "http://127.0.0.1:1".into(),
-                ownerfs_enabled: true,
-                storage_devices: vec![],
-                lease_ttl: std::time::Duration::from_secs(30),
-            },
-        )
-        .await
-        .unwrap();
-    assert!(
-        service.validate_read_grants(check.clone()).await.is_err(),
-        "old process epoch must be fenced"
-    );
-    let mut borrowed = check;
-    borrowed.validations[0].grant.caller_node_epoch = 2;
-    assert!(
-        service.validate_read_grants(borrowed).await.is_err(),
-        "replacement process cannot borrow the old session pin"
-    );
+    check.validations[0].grant.token = "dfs-open-v1:read-open:old-process".into();
+    let error = service.validate_read_grants(check).await.unwrap_err();
+    assert_eq!(error.code(), afs_error::IO_PERMISSION_DENIED);
 }

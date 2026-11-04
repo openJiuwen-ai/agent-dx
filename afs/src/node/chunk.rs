@@ -67,8 +67,8 @@ mod store;
 mod write_buffer;
 pub use catalog::LocalCatalog;
 use catalog::*;
+pub use lifecycle::QuarantineTrigger;
 use lifecycle::*;
-pub use lifecycle::{CopyPhase, QuarantineTrigger};
 use outboard_file::*;
 #[cfg(feature = "dfs")]
 pub(crate) use peer_serve::PeerGroupReader;

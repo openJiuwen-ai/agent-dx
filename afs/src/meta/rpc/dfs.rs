@@ -21,6 +21,9 @@ impl DfsMetaService for DfsMetaRpc {
                 "GC fence requires initial publication retain",
             ));
         }
+        if request.capture_gc_fence && !request.reference_id.starts_with("write:") {
+            return Err(invalid("GC fence capture requires a write: reference"));
+        }
         let observation = if request.release {
             "dfs_gc_release"
         } else if !request.chunks.is_empty() {
@@ -31,9 +34,7 @@ impl DfsMetaService for DfsMetaRpc {
             "dfs_gc_retain"
         };
         let capture = request.capture_gc_fence;
-        let generation = request.reference_id.starts_with("write:");
-        let service = dfs_service(&self.0)?;
-        service
+        dfs_service(&self.0)?
             .update_gc_reference(crate::dfs::UpdateGcReference {
                 node_id: request.node_id,
                 session_id: request.session_id,
@@ -47,35 +48,12 @@ impl DfsMetaService for DfsMetaRpc {
                     .map(domain_chunk_object)
                     .collect::<Result<Vec<_>, _>>()?,
                 release: request.release,
-                open_read: if request.open_read.is_empty() {
-                    None
-                } else {
-                    Some(
-                        serde_json::from_slice(&request.open_read)
-                            .map_err(|_| invalid("invalid open read identity"))?,
-                    )
-                },
-                close_open_read: request.close_open_read,
                 admission_deadline_unix_ms: request.admission_deadline_unix_ms,
             })
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
         // No payload is admitted by the Node until this response is received.
-        let gc_fence = if capture {
-            Some(
-                (if generation {
-                    crate::dfs::GcFence::WriteGeneration
-                } else {
-                    service
-                        .current_gc_fence()
-                        .await
-                        .map_err(afs_transport::grpc::error_status::error_to_status)?
-                })
-                .wire(),
-            )
-        } else {
-            None
-        };
+        let gc_fence = capture.then(|| crate::dfs::GcFence::WriteGeneration.wire());
         self.0.observability.record("meta", observation, true);
         Ok(Response::new(
             afs_protocol::meta::UpdateDfsGcReferenceReply { gc_fence },
@@ -114,6 +92,8 @@ impl DfsMetaService for DfsMetaRpc {
         &self,
         request: Request<DfsLookupRequest>,
     ) -> Result<Response<DfsLookupReply>, Status> {
+        // Read RPCs require a trusted-node certificate, not a per-caller binding.
+        authenticated_node_id(&self.0, &request)?;
         let request = request.into_inner();
         require_text(&request.namespace_id, "namespace_id")?;
         require_text(&request.parent_inode_id, "parent_inode_id")?;
@@ -201,6 +181,7 @@ impl DfsMetaService for DfsMetaRpc {
         &self,
         request: Request<DfsReadDirRequest>,
     ) -> Result<Response<DfsReadDirReply>, Status> {
+        authenticated_node_id(&self.0, &request)?;
         let request = request.into_inner();
         require_text(&request.namespace_id, "namespace_id")?;
         require_text(&request.parent_inode_id, "parent_inode_id")?;
@@ -424,6 +405,7 @@ impl DfsMetaService for DfsMetaRpc {
         &self,
         request: Request<DfsReadLinkRequest>,
     ) -> Result<Response<DfsReadLinkReply>, Status> {
+        authenticated_node_id(&self.0, &request)?;
         let request = request.into_inner();
         require_text(&request.namespace_id, "namespace_id")?;
         require_text(&request.inode_id, "inode_id")?;
@@ -695,6 +677,7 @@ impl DfsMetaService for DfsMetaRpc {
         &self,
         request: Request<GetDfsInodeRequest>,
     ) -> Result<Response<GetDfsInodeReply>, Status> {
+        authenticated_node_id(&self.0, &request)?;
         require_text(&request.get_ref().inode_id, "inode_id")?;
         let inode = dfs_service(&self.0)?
             .get_inode(crate::dfs::InodeId::new(request.into_inner().inode_id))
@@ -709,6 +692,7 @@ impl DfsMetaService for DfsMetaRpc {
         &self,
         request: Request<GetFileVersionRequest>,
     ) -> Result<Response<GetFileVersionReply>, Status> {
+        authenticated_node_id(&self.0, &request)?;
         require_text(&request.get_ref().version_id, "version_id")?;
         let (version, layout) = dfs_service(&self.0)?
             .get_file_version(crate::dfs::FileVersionId::new(

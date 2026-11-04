@@ -68,35 +68,6 @@ fn pin(id: &str) -> GcReference {
     }
 }
 #[test]
-fn open_authority_closed_context_keeps_gc_pin_until_last_user_and_grace() {
-    let mut entities = vec![inode("mapped", 0, "v2"), chunk("old"), chunk("new")];
-    entities.extend(version("v1", "mapped", "old"));
-    entities.extend(version("v2", "mapped", "new"));
-    let mut reference = pin("mapped");
-    reference.open_read = Some(crate::dfs::OpenReadIdentity {
-        version_id: FileVersionId::new("v1"),
-        layout_root_id: LayoutRootId::new("v1"),
-        closed: true,
-    });
-    assert!(
-        plan_collection(&entities, &[reference.clone()], 100, 10)
-            .chunks
-            .is_empty()
-    );
-    reference.retired_at_unix_ms = Some(100);
-    assert!(
-        plan_collection(&entities, &[reference.clone()], 109, 10)
-            .chunks
-            .is_empty()
-    );
-    assert_eq!(
-        plan_collection(&entities, &[reference], 110, 10)
-            .chunks
-            .len(),
-        2
-    );
-}
-#[test]
 fn cow_clone_retains_shared_chunks_after_source_is_unlinked() {
     let mut entities = vec![
         inode("source", 0, "v1"),
@@ -422,9 +393,6 @@ fn canonical_chunk() -> ChunkObject {
 }
 fn update(id: &str) -> UpdateGcReference {
     UpdateGcReference {
-        open_read: None,
-        close_open_read: false,
-
         node_id: "n".into(),
         session_id: "s".into(),
         reference_id: id.into(),

@@ -118,9 +118,6 @@ impl GrpcDfsMeta {
         let reply = self
             .run(
                 client.update_gc_reference(afs_protocol::meta::UpdateDfsGcReferenceRequest {
-                    open_read: Vec::new(),
-                    close_open_read: false,
-
                     capture_gc_fence,
                     node_id: self.node_id.clone(),
                     session_id: self.session_id.clone(),

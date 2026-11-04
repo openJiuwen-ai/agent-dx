@@ -2,8 +2,6 @@
 
 mod gc;
 
-mod open_read;
-
 use std::{
     collections::{BTreeSet, HashSet},
     sync::Arc,
@@ -43,7 +41,6 @@ mod write_lease;
 use access::*;
 use placement::*;
 pub(super) use read_auth::serving_read_copy;
-use read_auth::*;
 pub(super) use repair::external_copy_matches;
 use repair::*;
 use replay::*;

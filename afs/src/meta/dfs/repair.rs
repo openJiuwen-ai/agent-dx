@@ -420,9 +420,9 @@ impl DfsService {
                     "source_invalid can only mark the worker's bound source copy",
                 ));
             }
-            let mut corrupt = source_copy.clone();
-            corrupt.state = CopyState::Corrupt;
-            mutations.push(TxnMutation::Put(MetaEntity::DfsCopy(corrupt)));
+            mutations.push(TxnMutation::Put(MetaEntity::DfsCopy(mark_copy_corrupt(
+                &source_copy,
+            ))));
             let remaining_live_sources = self
                 .live_ready_copy_count_excluding(&placement, now, Some(&source_copy.id))
                 .await?;
@@ -596,10 +596,8 @@ impl DfsService {
                     has_superseding_same_device = true;
                 }
                 if copy.state == CopyState::Ready && *catalog_revision < request.catalog_revision {
-                    let mut corrupt = copy.clone();
-                    corrupt.state = CopyState::Corrupt;
                     changed_copy_ids.insert(copy.id.clone());
-                    changed_copies.push(corrupt);
+                    changed_copies.push(mark_copy_corrupt(&copy));
                 }
             }
             observed_copies.push(copy);
@@ -1075,6 +1073,13 @@ fn task_reactivates_completed(task: &ReplicationTask, current: &ReplicationTask)
 fn retry_backoff_ms(attempt: u32) -> u64 {
     let shift = attempt.min(6);
     1_000u64.saturating_mul(1u64 << shift)
+}
+
+/// The only Meta transition from Ready to Corrupt; the record is otherwise kept.
+fn mark_copy_corrupt(copy: &CopyRecord) -> CopyRecord {
+    let mut corrupt = copy.clone();
+    corrupt.state = CopyState::Corrupt;
+    corrupt
 }
 
 fn copy_is_on_node(copy: &CopyRecord, node_id: &str) -> bool {

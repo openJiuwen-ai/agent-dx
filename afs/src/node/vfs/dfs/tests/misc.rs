@@ -91,16 +91,12 @@ impl crate::node::gc::GcControl for Pr88GcControl {
     }
     fn retain_fenced(
         &self,
-        id: &str,
+        _: &str,
         _: &InodeId,
         _: Option<&FileVersionId>,
     ) -> Result<crate::dfs::GcFence> {
         self.captures.fetch_add(1, Ordering::SeqCst);
-        Ok(if id.starts_with("write:") {
-            crate::dfs::GcFence::WriteGeneration
-        } else {
-            crate::dfs::GcFence::Absent
-        })
+        Ok(crate::dfs::GcFence::WriteGeneration)
     }
     fn release(&self, _: &str) -> Result<()> {
         Ok(())

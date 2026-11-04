@@ -734,13 +734,6 @@ impl DfsService {
         &self,
         request: crate::dfs::ValidateDfsReadGrants,
     ) -> Result<Vec<crate::dfs::DfsAuthorizedRead>> {
-        if request
-            .validations
-            .first()
-            .is_some_and(|v| v.grant.token.starts_with("dfs-open-v1:"))
-        {
-            return self.validate_open_read_context(request).await;
-        }
         if request.validations.is_empty() || request.validations.len() > 128 {
             return Err(invalid(
                 "read grant validation batch requires 1..128 entries",
@@ -901,7 +894,7 @@ pub(in crate::meta) fn serving_read_copy(
     Some(serving_copy)
 }
 
-pub(super) async fn live_read_session(
+async fn live_read_session(
     view: &MetaReadView,
     node_id: &str,
     epoch: u64,
@@ -923,7 +916,7 @@ pub(super) async fn live_read_session(
     }
 }
 
-pub(super) fn read_chunk_intervals(
+fn read_chunk_intervals(
     layout: &LayoutRoot,
     chunk: &crate::dfs::ChunkObject,
 ) -> Result<Vec<(u64, u64)>> {
@@ -960,7 +953,7 @@ pub(super) fn read_chunk_intervals(
         .collect())
 }
 
-pub(super) fn read_range_covered(intervals: &[(u64, u64)], offset: u64, length: u64) -> bool {
+fn read_range_covered(intervals: &[(u64, u64)], offset: u64, length: u64) -> bool {
     length != 0
         && offset.checked_add(length).is_some_and(|end| {
             intervals.iter().any(|(start, len)| {

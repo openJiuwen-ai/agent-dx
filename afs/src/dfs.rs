@@ -750,6 +750,47 @@ impl CopyState {
     }
 }
 
+/// The phase of one copy, as both Node and Meta name it. Vocabulary only: no
+/// value of this type is persisted, and each side maps its own representation.
+///
+/// | Phase | Node representation | Meta representation |
+/// |---|---|---|
+/// | `Staged` | `StagedChunk`, native upload body, `.tmp` file | `CopyState::LegacyStaging` (decode only) |
+/// | `Durable` | `LocalChunkState::Durable` (+ `ReplicaAck`) | `{DurableReplica \| ExternalCommitted, Ready}` |
+/// | `VerifiedCache` | peer cache entry, S3 chunk cache | `{VerifiedCache, Ready}` |
+/// | `Quarantined` | `LocalChunkState::Quarantined` | `CopyState::Corrupt` once reported |
+/// | `Retired` | record and file removed by GC | `CopyState::Deleting`, or record removed |
+///
+/// Transitions on the Node: Staged → Durable in `persist_batch`; Durable →
+/// Quarantined and → Retired only through `CopyLifecycle`; Quarantined →
+/// Durable when `persist_batch` installs the same ID again. A Durable copy
+/// becomes published, Corrupt or Deleting only by a Meta decision.
+/// Writeback (decision 6) adds a `StagedPendingUpload` phase in stage F; S1
+/// does not introduce an unused value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CopyPhase {
+    Staged,
+    Durable,
+    VerifiedCache,
+    Quarantined,
+    Retired,
+}
+
+impl CopyPhase {
+    /// The phase of a Meta copy record, for comparing the two authorities.
+    pub fn of_meta(role: CopyRole, state: CopyState) -> Self {
+        match (state, role) {
+            (CopyState::LegacyStaging, _) => Self::Staged,
+            (CopyState::Ready, CopyRole::VerifiedCache) => Self::VerifiedCache,
+            (CopyState::Ready, CopyRole::DurableReplica | CopyRole::ExternalCommitted) => {
+                Self::Durable
+            }
+            (CopyState::Corrupt, _) => Self::Quarantined,
+            (CopyState::Deleting, _) => Self::Retired,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum CopyLocation {
     Node {
@@ -1106,15 +1147,6 @@ pub struct SyncInodeMetadata {
     pub expected_inode_revision: u64,
     pub expected_head_version: Option<FileVersionId>,
     pub metadata_delta: CommitMetadataDelta,
-}
-
-/// One bounded page of file-level authorization, delivered directly by Meta to
-/// the authenticated serving Node. It is never accepted from a reading Node.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct OpenReadSource {
-    pub chunk_id: ChunkId,
-    pub copy_ids: Vec<CopyId>,
-    pub ranges: Vec<(u64, u64)>,
 }
 
 #[cfg(test)]

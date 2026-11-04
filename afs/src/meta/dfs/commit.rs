@@ -3,15 +3,6 @@
 use super::*;
 
 impl DfsService {
-    pub(crate) async fn current_gc_fence(&self) -> Result<crate::dfs::GcFence> {
-        let snapshot = self.store.read(MetaRead::DfsGc).await?;
-        Ok(if snapshot.entity.is_some() {
-            crate::dfs::GcFence::Revision(snapshot.revision.0)
-        } else {
-            crate::dfs::GcFence::Absent
-        })
-    }
-
     pub async fn commit_file_version(
         &self,
         caller_id: String,
@@ -65,22 +56,6 @@ impl DfsService {
             return Ok(FileCommitAttempt::Committed(inode));
         }
         let gc_snapshot = self.store.read(MetaRead::DfsGc).await?;
-        if let Some(expected) = commit
-            .gc_fence
-            .filter(|f| *f != crate::dfs::GcFence::WriteGeneration)
-        {
-            let actual = if gc_snapshot.entity.is_some() {
-                crate::dfs::GcFence::Revision(gc_snapshot.revision.0)
-            } else {
-                crate::dfs::GcFence::Absent
-            };
-            if expected != actual {
-                return Err(Error::coded(
-                    afs_error::META_DFS_GC_CHANGED,
-                    "GC state changed during this write generation; old receipts cannot be refreshed",
-                ));
-            }
-        }
         let current = self.get_inode(commit.inode_id.clone()).await?;
         if commit.write_lease.inode_id != commit.inode_id
             || commit.write_lease.owner_node_id != caller_id
@@ -311,8 +286,6 @@ impl DfsService {
                 node_id: caller_id.clone(),
                 session_id: commit.write_lease.owner_session_id.clone(),
             });
-        } else if let Some(condition) = commit.gc_fence.and_then(crate::dfs::GcFence::condition) {
-            txn.conditions.push(condition);
         } else if gc_snapshot.entity.is_some() {
             txn.conditions.push(TxnCondition::RevisionEquals {
                 key: MetaKey::DfsGc,
