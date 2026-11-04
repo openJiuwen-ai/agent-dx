@@ -5,7 +5,7 @@
 //! create path independently. Neither path measures FUSE, data I/O, or network RPC.
 
 use afs::meta::store::{
-    journal::{AppendLimits, CheckpointLimits, LogStatus, LogTip, RecoveredLog},
+    journal::{AppendLimits, CheckpointLimits, LogCursor, LogStatus, LogTip, RecoveredLog},
     log::Record,
 };
 use std::{
@@ -251,7 +251,7 @@ impl MetaLog for ObservedBackend {
     fn status(&self) -> MetaFuture<'_, LogStatus> {
         self.inner.status()
     }
-    fn can_append(&self, expected: LogTip, bytes: usize) -> MetaFuture<'_, bool> {
+    fn can_append(&self, expected: LogCursor, bytes: usize) -> MetaFuture<'_, bool> {
         self.inner.can_append(expected, bytes)
     }
     fn checkpoint_limits(&self) -> CheckpointLimits {
@@ -260,7 +260,7 @@ impl MetaLog for ObservedBackend {
     fn install_checkpoint(&self, covered: LogTip, bytes: Vec<u8>) -> MetaFuture<'_, ()> {
         self.inner.install_checkpoint(covered, bytes)
     }
-    fn append_and_sync(&self, expected: LogTip, records: Vec<Record>) -> MetaFuture<'_, LogTip> {
+    fn append_and_sync(&self, expected: LogCursor, records: Vec<Record>) -> MetaFuture<'_, LogTip> {
         if !self.diagnostic {
             return self.inner.append_and_sync(expected, records);
         }

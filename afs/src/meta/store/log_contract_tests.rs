@@ -3,15 +3,15 @@
 //!
 //! Covered: (1) compare-and-append, (2) group bounds, (3) recovery and
 //! sequence, (4) checkpoint anchors, (5) read-only admission, (6) write-failure
-//! latch, (8) status upper bound.
-// TODO(S1d-5): (7) fencing — an append carrying a stale term is rejected, and
-// recovery rejects a chain whose term decreases or exceeds the current term.
+//! latch, (7) term fencing, (8) status upper bound. Recovery of a chain whose
+//! term decreases or exceeds the current term needs backend-specific damage;
+//! it is tested with each backend (`journal`, `local_log`).
 
 use super::{
     NodeSessionLease, RequestKey,
     journal::{
-        BATCH_RECORDS_MAX, LogStatus, LogTip, MemoryLog, MemoryLogOptions, MetaLog, RecoveredLog,
-        frame_size, test_records,
+        BATCH_RECORDS_MAX, LogCursor, LogStatus, LogTip, MemoryLog, MemoryLogOptions, MetaLog,
+        RecoveredLog, frame_size, test_records,
     },
     local_log::{LOG_HEADER_BYTES, LocalLog, LocalLogOptions},
     log::{Record, StateImage},
@@ -31,6 +31,8 @@ struct Fixture<L> {
     log: L,
     /// Drop the handle and reconstruct one over the same retained records.
     reopen: Box<dyn Fn(L) -> L>,
+    /// Open a newer writer over the same records while `&L` is still alive.
+    takeover: Box<dyn Fn(&L) -> L>,
     /// Make the next append fail with a real (or modelled) write failure.
     inject_write_failure: Box<dyn Fn(&L)>,
     /// Backend storage bytes outside the trait (files); empty when none.
@@ -47,6 +49,7 @@ fn memory_fixture(limits: Option<CaseLimits>) -> Fixture<MemoryLog> {
     Fixture {
         log: MemoryLog::new(options).unwrap(),
         reopen: Box::new(|log: MemoryLog| log.reopen()),
+        takeover: Box::new(MemoryLog::reopen),
         inject_write_failure: Box::new(MemoryLog::inject_write_failure),
         storage: Box::new(Vec::new),
         _dir: None,
@@ -64,12 +67,19 @@ fn local_fixture(limits: Option<CaseLimits>) -> Fixture<LocalLog> {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("meta-store");
     let reopen_path = path.clone();
+    let takeover_path = path.clone();
     let storage_path = path.clone();
     Fixture {
         log: LocalLog::open(&path, options).unwrap(),
         reopen: Box::new(move |log: LocalLog| {
             drop(log);
             LocalLog::open(&reopen_path, options).unwrap()
+        }),
+        // The directory lock would refuse a second writer; model a writer
+        // that lost local exclusivity so only the CURRENT term can fence it.
+        takeover: Box::new(move |log: &LocalLog| {
+            log.release_lock_for_takeover().unwrap();
+            LocalLog::open(&takeover_path, options).unwrap()
         }),
         inject_write_failure: Box::new(|log: &LocalLog| log.inject_write_failure().unwrap()),
         storage: Box::new(move || inventory(&storage_path)),
@@ -145,11 +155,17 @@ fn image_after(records: &[Record]) -> Vec<u8> {
     StateImage::encode(&state, 1024 * 1024).unwrap()
 }
 
-async fn append_each(log: &impl MetaLog, mut tip: LogTip, records: &[Record]) -> Vec<LogTip> {
+/// The writer term `log` holds, as its recovery reports it.
+async fn term_of(log: &impl MetaLog) -> u64 {
+    log.recover().await.unwrap().term
+}
+
+async fn append_each(log: &impl MetaLog, cursor: LogCursor, records: &[Record]) -> Vec<LogTip> {
+    let LogCursor { mut tip, term } = cursor;
     let mut tips = Vec::new();
     for record in records {
         let next = log
-            .append_and_sync(tip, vec![record.clone()])
+            .append_and_sync(tip.at(term), vec![record.clone()])
             .await
             .unwrap();
         assert_eq!(next.sequence, tip.sequence + 1, "sequence advances by one");
@@ -167,6 +183,7 @@ async fn contract_suite<L: MetaLog + 'static>(make: impl Fn(Option<CaseLimits>) 
     checkpoint_anchors(&make).await;
     read_only_admission(&make).await;
     write_failure_latch(&make).await;
+    fencing(&make).await;
     status_upper_bound(&make).await;
 }
 
@@ -175,9 +192,10 @@ async fn contract_suite<L: MetaLog + 'static>(make: impl Fn(Option<CaseLimits>) 
 async fn compare_and_append<L: MetaLog>(make: &impl Fn(Option<CaseLimits>) -> Fixture<L>) {
     let fixture = make(None);
     let log = &fixture.log;
+    let term = term_of(log).await;
     let records = test_records(3);
     let tip = log
-        .append_and_sync(LogTip::EMPTY, records[..2].to_vec())
+        .append_and_sync(LogTip::EMPTY.at(term), records[..2].to_vec())
         .await
         .unwrap();
     let before = recovered_view(&log.recover().await.unwrap());
@@ -187,17 +205,20 @@ async fn compare_and_append<L: MetaLog>(make: &impl Fn(Option<CaseLimits>) -> Fi
     };
     for stale in [LogTip::EMPTY, forged] {
         assert!(
-            log.append_and_sync(stale, vec![records[2].clone()])
+            log.append_and_sync(stale.at(term), vec![records[2].clone()])
                 .await
                 .is_err(),
             "append with stale tip {stale:?} must fail"
         );
-        assert!(log.can_append(stale, 64).await.is_err(), "stale admission");
+        assert!(
+            log.can_append(stale.at(term), 64).await.is_err(),
+            "stale admission"
+        );
     }
     assert_eq!(recovered_view(&log.recover().await.unwrap()), before);
     assert_eq!(log.status().await.unwrap().tip, tip);
     let next = log
-        .append_and_sync(tip, vec![records[2].clone()])
+        .append_and_sync(tip.at(term), vec![records[2].clone()])
         .await
         .unwrap();
     assert_eq!(next.sequence, 3);
@@ -208,20 +229,24 @@ async fn compare_and_append<L: MetaLog>(make: &impl Fn(Option<CaseLimits>) -> Fi
 async fn group_bounds<L: MetaLog>(make: &impl Fn(Option<CaseLimits>) -> Fixture<L>) {
     let fixture = make(None);
     let log = &fixture.log;
+    let term = term_of(log).await;
     assert_eq!(log.limits().batch_records_max, BATCH_RECORDS_MAX);
     let records = test_records(BATCH_RECORDS_MAX * 2 + 1);
     assert!(
-        log.append_and_sync(LogTip::EMPTY, Vec::new())
+        log.append_and_sync(LogTip::EMPTY.at(term), Vec::new())
             .await
             .is_err()
     );
     let tip = log
-        .append_and_sync(LogTip::EMPTY, records[..BATCH_RECORDS_MAX].to_vec())
+        .append_and_sync(
+            LogTip::EMPTY.at(term),
+            records[..BATCH_RECORDS_MAX].to_vec(),
+        )
         .await
         .unwrap();
     assert_eq!(tip.sequence, BATCH_RECORDS_MAX as u64);
     assert!(
-        log.append_and_sync(tip, records[BATCH_RECORDS_MAX..].to_vec())
+        log.append_and_sync(tip.at(term), records[BATCH_RECORDS_MAX..].to_vec())
             .await
             .is_err(),
         "batch_records_max + 1 records must be rejected"
@@ -229,16 +254,17 @@ async fn group_bounds<L: MetaLog>(make: &impl Fn(Option<CaseLimits>) -> Fixture<
     assert_eq!(log.recover().await.unwrap().tip, tip);
 
     let large = padded_first_record(1024);
-    let size = frame_size(LogTip::EMPTY, &large).unwrap();
+    let size = frame_size(LogTip::EMPTY.at(term), &large).unwrap();
     for (limit, accepted) in [(size, true), (size - 1, false)] {
         let fixture = make(Some(CaseLimits {
             record_max_bytes: limit,
             batch_max_bytes: limit,
             wal_max_bytes: 1024 * 1024,
         }));
+        assert_eq!(term_of(&fixture.log).await, term, "fresh backends agree");
         let result = fixture
             .log
-            .append_and_sync(LogTip::EMPTY, vec![large.clone()])
+            .append_and_sync(LogTip::EMPTY.at(term), vec![large.clone()])
             .await;
         assert_eq!(result.is_ok(), accepted, "record {size} vs limit {limit}");
         let expected = if accepted { 1 } else { 0 };
@@ -246,12 +272,13 @@ async fn group_bounds<L: MetaLog>(make: &impl Fn(Option<CaseLimits>) -> Fixture<
     }
 
     let pair = test_records(2);
-    let first = frame_size(LogTip::EMPTY, &pair[0]).unwrap();
+    let first = frame_size(LogTip::EMPTY.at(term), &pair[0]).unwrap();
     let second = frame_size(
         LogTip {
             sequence: 1,
             record_hash: [0; 32],
-        },
+        }
+        .at(term),
         &pair[1],
     )
     .unwrap();
@@ -264,9 +291,10 @@ async fn group_bounds<L: MetaLog>(make: &impl Fn(Option<CaseLimits>) -> Fixture<
             batch_max_bytes: limit,
             wal_max_bytes: 1024 * 1024,
         }));
+        assert_eq!(term_of(&fixture.log).await, term, "fresh backends agree");
         let result = fixture
             .log
-            .append_and_sync(LogTip::EMPTY, pair.clone())
+            .append_and_sync(LogTip::EMPTY.at(term), pair.clone())
             .await;
         assert_eq!(result.is_ok(), accepted, "batch {total} vs limit {limit}");
         let expected = if accepted { 2 } else { 0 };
@@ -280,12 +308,17 @@ async fn recovery_and_sequence<L: MetaLog>(make: &impl Fn(Option<CaseLimits>) ->
     let fixture = make(None);
     let log = &fixture.log;
     let empty = log.recover().await.unwrap();
+    let term = empty.term;
+    assert!(term >= 1, "a writer open always selects a term");
     assert_eq!(empty.tip, LogTip::EMPTY);
     assert!(empty.checkpoint.is_none() && empty.records.is_empty());
     let records = test_records(7);
     let mut tip = LogTip::EMPTY;
     for group in [&records[..1], &records[1..4], &records[4..]] {
-        let next = log.append_and_sync(tip, group.to_vec()).await.unwrap();
+        let next = log
+            .append_and_sync(tip.at(term), group.to_vec())
+            .await
+            .unwrap();
         assert_eq!(next.sequence, tip.sequence + group.len() as u64);
         tip = next;
     }
@@ -299,10 +332,9 @@ async fn recovery_and_sequence<L: MetaLog>(make: &impl Fn(Option<CaseLimits>) ->
         log, reopen, _dir, ..
     } = fixture;
     let reopened = reopen(log);
-    assert_eq!(
-        recovered_view(&reopened.recover().await.unwrap()),
-        recovered_view(&first)
-    );
+    let again = reopened.recover().await.unwrap();
+    assert_eq!(recovered_view(&again), recovered_view(&first));
+    assert!(again.term > term, "reconstruction is a new, larger term");
     assert_eq!(reopened.status().await.unwrap().tip, tip);
 }
 
@@ -312,8 +344,9 @@ async fn checkpoint_anchors<L: MetaLog>(make: &impl Fn(Option<CaseLimits>) -> Fi
     let fixture = make(None);
     let log = &fixture.log;
     assert!(log.supports_checkpoint(), "both backends checkpoint");
+    let term = term_of(log).await;
     let records = test_records(5);
-    let tips = append_each(log, LogTip::EMPTY, &records[..3]).await;
+    let tips = append_each(log, LogTip::EMPTY.at(term), &records[..3]).await;
     let tip = tips[2];
     let image = image_after(&records[..1]);
     let off_chain = LogTip {
@@ -362,7 +395,7 @@ async fn checkpoint_anchors<L: MetaLog>(make: &impl Fn(Option<CaseLimits>) -> Fi
         state.snapshot_bytes_with_batch(0).unwrap(),
         expected.snapshot_bytes_with_batch(0).unwrap()
     );
-    let next = append_each(log, tip, &records[3..]).await;
+    let next = append_each(log, tip.at(term), &records[3..]).await;
     let Fixture {
         log, reopen, _dir, ..
     } = fixture;
@@ -380,17 +413,18 @@ async fn read_only_admission<L: MetaLog>(make: &impl Fn(Option<CaseLimits>) -> F
         wal_max_bytes: 16 * 1024,
     }));
     let log = &fixture.log;
+    let term = term_of(log).await;
     let records = test_records(256);
     let mut tip = LogTip::EMPTY;
     let mut refused = false;
     for record in &records {
-        let size = frame_size(tip, record).unwrap();
+        let size = frame_size(tip.at(term), record).unwrap();
         let before = (
             recovered_view(&log.recover().await.unwrap()),
             log.status().await.unwrap(),
             (fixture.storage)(),
         );
-        let admitted = log.can_append(tip, size).await.unwrap();
+        let admitted = log.can_append(tip.at(term), size).await.unwrap();
         let after = (
             recovered_view(&log.recover().await.unwrap()),
             log.status().await.unwrap(),
@@ -405,7 +439,7 @@ async fn read_only_admission<L: MetaLog>(make: &impl Fn(Option<CaseLimits>) -> F
             break;
         }
         tip = log
-            .append_and_sync(tip, vec![record.clone()])
+            .append_and_sync(tip.at(term), vec![record.clone()])
             .await
             .unwrap();
     }
@@ -421,23 +455,27 @@ async fn read_only_admission<L: MetaLog>(make: &impl Fn(Option<CaseLimits>) -> F
 async fn write_failure_latch<L: MetaLog>(make: &impl Fn(Option<CaseLimits>) -> Fixture<L>) {
     let fixture = make(None);
     let log = &fixture.log;
+    let term = term_of(log).await;
     let records = test_records(4);
     let tip = log
-        .append_and_sync(LogTip::EMPTY, records[..2].to_vec())
+        .append_and_sync(LogTip::EMPTY.at(term), records[..2].to_vec())
         .await
         .unwrap();
     (fixture.inject_write_failure)(log);
     assert!(
-        log.append_and_sync(tip, vec![records[2].clone()])
+        log.append_and_sync(tip.at(term), vec![records[2].clone()])
             .await
             .is_err()
     );
     assert!(log.health().await.is_err(), "health after failed write");
     assert!(log.recover().await.is_err(), "recover after failed write");
     assert!(log.status().await.is_err(), "status after failed write");
-    assert!(log.can_append(tip, 64).await.is_err(), "admission latched");
     assert!(
-        log.append_and_sync(tip, vec![records[2].clone()])
+        log.can_append(tip.at(term), 64).await.is_err(),
+        "admission latched"
+    );
+    assert!(
+        log.append_and_sync(tip.at(term), vec![records[2].clone()])
             .await
             .is_err(),
         "append latched"
@@ -455,10 +493,112 @@ async fn write_failure_latch<L: MetaLog>(make: &impl Fn(Option<CaseLimits>) -> F
     let recovered = reopened.recover().await.unwrap();
     assert_eq!(recovered.tip, tip, "injected failure wrote nothing");
     assert_eq!(encoded(&recovered.records), encoded(&records[..2]));
+    assert!(recovered.term > term);
     reopened
-        .append_and_sync(tip, records[2..].to_vec())
+        .append_and_sync(tip.at(recovered.term), records[2..].to_vec())
         .await
         .unwrap();
+}
+
+fn assert_fenced<T: std::fmt::Debug>(
+    result: afs_error::Result<T>,
+    found: u64,
+    current: u64,
+    what: &str,
+) {
+    let error = result.expect_err(what);
+    assert_eq!(error.code(), afs_error::META_LOG_FENCED, "{what}: {error}");
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!("found term {found}"))
+            && message.contains(&format!("current term {current}")),
+        "{what}: {message}"
+    );
+}
+
+/// (7) A newer writer fences every older handle: any operation through the
+/// old handle, and append/admission carrying a non-current term, fail
+/// `META_LOG_FENCED` without writing a byte; the newer writer continues the
+/// same chain, and each reconstruction selects a strictly larger term.
+async fn fencing<L: MetaLog>(make: &impl Fn(Option<CaseLimits>) -> Fixture<L>) {
+    let fixture = make(None);
+    let old = &fixture.log;
+    let old_term = term_of(old).await;
+    let records = test_records(4);
+    let tip = old
+        .append_and_sync(LogTip::EMPTY.at(old_term), records[..2].to_vec())
+        .await
+        .unwrap();
+    let new = (fixture.takeover)(old);
+    let recovered = new.recover().await.unwrap();
+    let term = recovered.term;
+    assert!(term > old_term, "takeover term {term} after {old_term}");
+    assert_eq!(recovered.tip, tip);
+    let before = (recovered_view(&recovered), (fixture.storage)());
+    let next = vec![records[2].clone()];
+    assert_fenced(
+        old.append_and_sync(tip.at(old_term), next.clone()).await,
+        old_term,
+        term,
+        "stale handle append",
+    );
+    assert_fenced(
+        old.can_append(tip.at(old_term), 64).await,
+        old_term,
+        term,
+        "stale handle admission",
+    );
+    assert_fenced(old.health().await, old_term, term, "stale handle health");
+    assert_fenced(old.status().await, old_term, term, "stale handle status");
+    assert_fenced(
+        old.recover().await.map(|_| ()),
+        old_term,
+        term,
+        "stale recover",
+    );
+    assert_fenced(
+        old.install_checkpoint(tip, image_after(&records[..2]))
+            .await,
+        old_term,
+        term,
+        "stale handle checkpoint",
+    );
+    for (stale, what) in [(old_term, "old term"), (term + 1, "future term")] {
+        assert_fenced(
+            new.append_and_sync(tip.at(stale), next.clone()).await,
+            stale,
+            term,
+            what,
+        );
+        assert_fenced(new.can_append(tip.at(stale), 64).await, stale, term, what);
+    }
+    assert!(
+        (
+            recovered_view(&new.recover().await.unwrap()),
+            (fixture.storage)()
+        ) == before,
+        "fenced operations wrote nothing"
+    );
+    let after = new
+        .append_and_sync(tip.at(term), next.clone())
+        .await
+        .unwrap();
+    assert_fenced(
+        old.append_and_sync(after.at(old_term), vec![records[3].clone()])
+            .await,
+        old_term,
+        term,
+        "still fenced after the newer writer appended",
+    );
+    let Fixture {
+        log, reopen, _dir, ..
+    } = fixture;
+    drop(log);
+    let reopened = reopen(new);
+    let last = reopened.recover().await.unwrap();
+    assert!(last.term > term);
+    assert_eq!(last.tip, after);
+    assert_eq!(encoded(&last.records), encoded(&records[..3]));
 }
 
 /// (8) The status byte bound never falls below the true framed bytes after
@@ -466,14 +606,15 @@ async fn write_failure_latch<L: MetaLog>(make: &impl Fn(Option<CaseLimits>) -> F
 async fn status_upper_bound<L: MetaLog>(make: &impl Fn(Option<CaseLimits>) -> Fixture<L>) {
     let fixture = make(None);
     let log = &fixture.log;
+    let term = term_of(log).await;
     let records = test_records(6);
     let mut sizes = Vec::new();
     let mut tips = Vec::new();
     let mut tip = LogTip::EMPTY;
     for record in &records {
-        sizes.push(frame_size(tip, record).unwrap() as u64);
+        sizes.push(frame_size(tip.at(term), record).unwrap() as u64);
         tip = log
-            .append_and_sync(tip, vec![record.clone()])
+            .append_and_sync(tip.at(term), vec![record.clone()])
             .await
             .unwrap();
         tips.push(tip);

@@ -43,7 +43,7 @@ impl crate::meta::store::MetaLog for CountingMetaLog {
     }
     fn can_append(
         &self,
-        expected: crate::meta::store::journal::LogTip,
+        expected: crate::meta::store::journal::LogCursor,
         bytes: usize,
     ) -> crate::meta::store::MetaFuture<'_, bool> {
         self.inner.can_append(expected, bytes)
@@ -67,7 +67,7 @@ impl crate::meta::store::MetaLog for CountingMetaLog {
     }
     fn append_and_sync(
         &self,
-        expected: crate::meta::store::journal::LogTip,
+        expected: crate::meta::store::journal::LogCursor,
         records: Vec<crate::meta::store::log::Record>,
     ) -> crate::meta::store::MetaFuture<'_, crate::meta::store::journal::LogTip> {
         Box::pin(async move {

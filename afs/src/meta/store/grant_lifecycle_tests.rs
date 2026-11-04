@@ -138,7 +138,7 @@ async fn deactivation_record_does_not_scale_with_historical_grants() {
         .unwrap();
     let recovery = log.recover().await.unwrap();
     assert_eq!(recovery.tip.sequence, tip.sequence + 1);
-    let bytes = frame_size(tip, recovery.records.last().unwrap()).unwrap();
+    let bytes = frame_size(tip.at(recovery.term), recovery.records.last().unwrap()).unwrap();
     assert!(
         bytes <= 1536,
         "deactivate must remain a small record, got {bytes} bytes"

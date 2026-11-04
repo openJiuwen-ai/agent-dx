@@ -1001,7 +1001,7 @@ impl MetaLog for GatedBackend {
     fn status(&self) -> MetaFuture<'_, journal::LogStatus> {
         self.inner.status()
     }
-    fn can_append(&self, expected: journal::LogTip, bytes: usize) -> MetaFuture<'_, bool> {
+    fn can_append(&self, expected: journal::LogCursor, bytes: usize) -> MetaFuture<'_, bool> {
         self.inner.can_append(expected, bytes)
     }
     fn install_checkpoint(&self, _: journal::LogTip, _: Vec<u8>) -> MetaFuture<'_, ()> {
@@ -1009,7 +1009,7 @@ impl MetaLog for GatedBackend {
     }
     fn append_and_sync(
         &self,
-        expected: journal::LogTip,
+        expected: journal::LogCursor,
         records: Vec<log::Record>,
     ) -> MetaFuture<'_, journal::LogTip> {
         Box::pin(async move {
@@ -1053,7 +1053,7 @@ impl MetaLog for CountingBackend {
     fn status(&self) -> MetaFuture<'_, journal::LogStatus> {
         self.inner.status()
     }
-    fn can_append(&self, expected: journal::LogTip, bytes: usize) -> MetaFuture<'_, bool> {
+    fn can_append(&self, expected: journal::LogCursor, bytes: usize) -> MetaFuture<'_, bool> {
         self.inner.can_append(expected, bytes)
     }
     fn install_checkpoint(&self, _: journal::LogTip, _: Vec<u8>) -> MetaFuture<'_, ()> {
@@ -1061,7 +1061,7 @@ impl MetaLog for CountingBackend {
     }
     fn append_and_sync(
         &self,
-        expected: journal::LogTip,
+        expected: journal::LogCursor,
         records: Vec<log::Record>,
     ) -> MetaFuture<'_, journal::LogTip> {
         self.commits
@@ -1444,7 +1444,7 @@ async fn p3_retention_local_runtime_expiry_checkpoint_reopen_keeps_removal() {
         .unwrap();
     let state = store.committed().await.unwrap();
     assert_eq!(state.revision, StoreRevision(1));
-    assert_eq!(state.log_tip, tip);
+    assert_eq!(state.log_cursor.tip, tip);
     assert!(!state.requests.contains_key(&key));
     assert_eq!(state.compacted_to, StoreRevision(1));
     assert!(matches!(
@@ -1489,7 +1489,7 @@ async fn p3_retention_local_runtime_lowered_limits_persist_before_admission() {
     }
     let before = store.committed().await.unwrap();
     assert_eq!(before.requests.len(), 4);
-    let before_tip = before.log_tip;
+    let before_tip = before.log_cursor.tip;
     stop_local_retention_store(store, local).await;
 
     let local = Arc::new(
@@ -1504,8 +1504,8 @@ async fn p3_retention_local_runtime_lowered_limits_persist_before_admission() {
     assert_eq!(state.history_stats().requests, 2);
     assert_eq!(state.history_stats().events, 4);
     assert_eq!(state.compacted_to, StoreRevision(2));
-    assert!(state.log_tip.sequence > before_tip.sequence);
-    let cleaned_tip = state.log_tip;
+    assert!(state.log_cursor.tip.sequence > before_tip.sequence);
+    let cleaned_tip = state.log_cursor.tip;
     for n in 0..4 {
         assert_eq!(
             state
@@ -1524,7 +1524,7 @@ async fn p3_retention_local_runtime_lowered_limits_persist_before_admission() {
         .await
         .unwrap();
     let recovered = store.committed().await.unwrap();
-    assert_eq!(recovered.log_tip, cleaned_tip);
+    assert_eq!(recovered.log_cursor.tip, cleaned_tip);
     assert_eq!(recovered.revision, StoreRevision(4));
     assert_eq!(recovered.requests.len(), 2);
     assert_eq!(recovered.compacted_to, StoreRevision(2));
@@ -2062,7 +2062,7 @@ async fn p3_retention_runtime_cleanup_stays_private_until_ack() {
         records.push(log::Record::from(record.unwrap()));
     }
     inner
-        .append_and_sync(journal::LogTip::EMPTY, records)
+        .append_and_sync(journal::LogTip::EMPTY.at(inner.term()), records)
         .await
         .unwrap();
     let log = Arc::new(GatedLog {
@@ -2204,7 +2204,7 @@ async fn p3_retention_runtime_unknown_ack_stops_all_following_cleanup() {
         records.push(log::Record::from(record.unwrap()));
     }
     inner
-        .append_and_sync(journal::LogTip::EMPTY, records)
+        .append_and_sync(journal::LogTip::EMPTY.at(inner.term()), records)
         .await
         .unwrap();
     let log = Arc::new(GatedLog {
@@ -2294,7 +2294,7 @@ impl journal::MetaLog for CountingLog {
     fn status(&self) -> MetaFuture<'_, journal::LogStatus> {
         self.inner.status()
     }
-    fn can_append(&self, expected: journal::LogTip, bytes: usize) -> MetaFuture<'_, bool> {
+    fn can_append(&self, expected: journal::LogCursor, bytes: usize) -> MetaFuture<'_, bool> {
         self.inner.can_append(expected, bytes)
     }
     fn install_checkpoint(&self, _: journal::LogTip, _: Vec<u8>) -> MetaFuture<'_, ()> {
@@ -2302,7 +2302,7 @@ impl journal::MetaLog for CountingLog {
     }
     fn append_and_sync(
         &self,
-        expected: journal::LogTip,
+        expected: journal::LogCursor,
         records: Vec<log::Record>,
     ) -> MetaFuture<'_, journal::LogTip> {
         Box::pin(async move {
@@ -2310,7 +2310,7 @@ impl journal::MetaLog for CountingLog {
             let mut size = 0;
             for record in &records {
                 size += journal::frame_size(tip, record)?;
-                tip.sequence += 1;
+                tip.tip.sequence += 1;
             }
             let result = self.inner.append_and_sync(expected, records).await?;
             self.commits.fetch_add(1, Ordering::SeqCst);
@@ -2468,7 +2468,7 @@ impl journal::MetaLog for GatedLog {
     fn status(&self) -> MetaFuture<'_, journal::LogStatus> {
         self.inner.status()
     }
-    fn can_append(&self, expected: journal::LogTip, bytes: usize) -> MetaFuture<'_, bool> {
+    fn can_append(&self, expected: journal::LogCursor, bytes: usize) -> MetaFuture<'_, bool> {
         self.inner.can_append(expected, bytes)
     }
     fn install_checkpoint(&self, _: journal::LogTip, _: Vec<u8>) -> MetaFuture<'_, ()> {
@@ -2476,7 +2476,7 @@ impl journal::MetaLog for GatedLog {
     }
     fn append_and_sync(
         &self,
-        expected: journal::LogTip,
+        expected: journal::LogCursor,
         records: Vec<log::Record>,
     ) -> MetaFuture<'_, journal::LogTip> {
         Box::pin(async move {
@@ -3186,7 +3186,7 @@ async fn p3_root_deactivation_accepts_accumulated_grants_below_byte_budget() {
         decision.facts().unwrap().operation,
         StoreOperation::DeactivateRoot
     );
-    let framed = journal::frame_size(tip, record).unwrap();
+    let framed = journal::frame_size(tip.at(1), record).unwrap();
     assert!(
         framed < 4096,
         "logical deactivation must not scale with stored grants"
@@ -3330,9 +3330,11 @@ async fn p3_a27_typed_byte_limits_reject_atomically_and_reopen_controls() {
         let (_, _, record) = State::default()
             .prepare_txn_record(txn.clone(), 1, CONTROL_BYTES)
             .unwrap();
-        let framed =
-            journal::frame_size(journal::LogTip::EMPTY, &log::Record::from(record.unwrap()))
-                .unwrap();
+        let framed = journal::frame_size(
+            journal::LogTip::EMPTY.at(1),
+            &log::Record::from(record.unwrap()),
+        )
+        .unwrap();
         assert!(
             framed > REJECT_BYTES && framed < CONTROL_BYTES,
             "{name}: {framed}"
@@ -3983,6 +3985,54 @@ async fn failed_commit_poison_store_instead_of_exposing_stale_authority() {
     );
 }
 
+/// A newer writer fences the old Store's log: its next commit is refused
+/// before anything is written, the Store is poisoned by the existing rule,
+/// and the newer writer recovers exactly the acknowledged prefix.
+#[tokio::test]
+async fn fenced_log_poisons_store_and_newer_writer_keeps_prefix() {
+    let first = Arc::new(journal::MemoryLog::new(Default::default()).unwrap());
+    let store = Store::open_log(first.clone()).await.unwrap();
+    assert!(matches!(
+        store
+            .register_node_session(RequestKey::new("node-a", "r1"), lease("session-1"))
+            .await
+            .unwrap(),
+        TxnOutcome::Committed { .. }
+    ));
+    let newer = first.reopen();
+    let error = store
+        .register_node_session(RequestKey::new("node-a", "r2"), lease("session-2"))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("found term 1, current term 2"),
+        "{error}"
+    );
+    assert!(
+        store
+            .read(MetaRead::CurrentNodeSession {
+                node_id: "node-a".into()
+            })
+            .await
+            .is_err(),
+        "a fenced Store must not keep serving"
+    );
+    let recovered = newer.recover().await.unwrap();
+    assert_eq!((recovered.tip.sequence, recovered.term), (1, 2));
+    let reopened = Store::open_log(Arc::new(newer)).await.unwrap();
+    let Some(MetaEntity::NodeSession(session)) = reopened
+        .read(MetaRead::CurrentNodeSession {
+            node_id: "node-a".into(),
+        })
+        .await
+        .unwrap()
+        .entity
+    else {
+        panic!("acknowledged session lost");
+    };
+    assert_eq!(session.session_id, "session-1");
+}
+
 struct MaintenanceLog {
     inner: journal::MemoryLog,
     policy: journal::MaintenancePolicy,
@@ -4036,7 +4086,7 @@ impl journal::MetaLog for MaintenanceLog {
     fn status(&self) -> MetaFuture<'_, journal::LogStatus> {
         self.inner.status()
     }
-    fn can_append(&self, _expected: journal::LogTip, _bytes: usize) -> MetaFuture<'_, bool> {
+    fn can_append(&self, _expected: journal::LogCursor, _bytes: usize) -> MetaFuture<'_, bool> {
         Box::pin(async move {
             self.checked.notify_one();
             Ok(self.admitted.load(Ordering::Acquire))
@@ -4044,7 +4094,7 @@ impl journal::MetaLog for MaintenanceLog {
     }
     fn append_and_sync(
         &self,
-        tip: journal::LogTip,
+        tip: journal::LogCursor,
         records: Vec<log::Record>,
     ) -> MetaFuture<'_, journal::LogTip> {
         Box::pin(async move {
@@ -4300,12 +4350,12 @@ impl journal::MetaLog for GatedCheckpointLog {
     fn status(&self) -> MetaFuture<'_, journal::LogStatus> {
         self.inner.status()
     }
-    fn can_append(&self, expected: journal::LogTip, bytes: usize) -> MetaFuture<'_, bool> {
+    fn can_append(&self, expected: journal::LogCursor, bytes: usize) -> MetaFuture<'_, bool> {
         self.inner.can_append(expected, bytes)
     }
     fn append_and_sync(
         &self,
-        tip: journal::LogTip,
+        tip: journal::LogCursor,
         records: Vec<log::Record>,
     ) -> MetaFuture<'_, journal::LogTip> {
         self.inner.append_and_sync(tip, records)
@@ -4373,9 +4423,12 @@ async fn p3_checkpoint_cancelled_caller_retains_singleflight_and_state_anchor() 
     let recovered = log.recover().await.unwrap();
     assert_eq!(recovered.checkpoint.unwrap().covered.sequence, 1);
     assert_eq!(recovered.records.len(), 1);
-    assert_eq!(store.committed().await.unwrap().log_tip.sequence, 2);
+    assert_eq!(store.committed().await.unwrap().log_cursor.tip.sequence, 2);
     let restored = open_gated_checkpoint_store(log).await;
-    assert_eq!(restored.committed().await.unwrap().log_tip.sequence, 2);
+    assert_eq!(
+        restored.committed().await.unwrap().log_cursor.tip.sequence,
+        2
+    );
     assert_eq!(
         restored.committed().await.unwrap().node_epochs,
         store.committed().await.unwrap().node_epochs
@@ -4511,7 +4564,7 @@ impl journal::MetaLog for PressureLocalLog {
     fn status(&self) -> MetaFuture<'_, journal::LogStatus> {
         self.inner.status()
     }
-    fn can_append(&self, tip: journal::LogTip, bytes: usize) -> MetaFuture<'_, bool> {
+    fn can_append(&self, tip: journal::LogCursor, bytes: usize) -> MetaFuture<'_, bool> {
         self.inner.can_append(tip, bytes)
     }
     fn supports_checkpoint(&self) -> bool {
@@ -4519,7 +4572,7 @@ impl journal::MetaLog for PressureLocalLog {
     }
     fn append_and_sync(
         &self,
-        tip: journal::LogTip,
+        tip: journal::LogCursor,
         records: Vec<log::Record>,
     ) -> MetaFuture<'_, journal::LogTip> {
         self.inner.append_and_sync(tip, records)
@@ -4795,18 +4848,21 @@ async fn p3_a77_owned_memory_and_real_wal_resource_report() {
         assert!(matches!(outcome, TxnOutcome::Committed { .. }));
         let seed_record = log::Record::from(decision.unwrap());
         let seed_payload = codec::encoded_size(&seed_record).unwrap();
-        let seed_frame = journal::frame_size(journal::LogTip::EMPTY, &seed_record).unwrap();
+        state.log_cursor = journal::LogTip::EMPTY.at(local.term());
+        let seed_frame = journal::frame_size(state.log_cursor, &seed_record).unwrap();
         let initial_wal = disk_bytes(directory.path(), "wal-");
-        state.log_tip = local
-            .append_and_sync(journal::LogTip::EMPTY, vec![seed_record])
-            .await
-            .unwrap();
+        state.log_cursor = state.log_cursor.advanced(
+            local
+                .append_and_sync(state.log_cursor, vec![seed_record])
+                .await
+                .unwrap(),
+        );
         let after_seed_wal = disk_bytes(directory.path(), "wal-");
         assert_eq!(after_seed_wal - initial_wal, seed_frame as u64);
         let image = log::StateImage::encode(&state, checkpoint.image_max_bytes).unwrap();
         let image_payload = image.len();
         local
-            .install_checkpoint(state.log_tip, image)
+            .install_checkpoint(state.log_cursor.tip, image)
             .await
             .unwrap();
         let installed_checkpoint = disk_bytes(directory.path(), "checkpoint-");
@@ -4862,12 +4918,14 @@ async fn p3_a77_owned_memory_and_real_wal_resource_report() {
         assert!(matches!(outcome, TxnOutcome::Committed { .. }));
         let record = log::Record::from(decision.unwrap());
         let update_payload = codec::encoded_size(&record).unwrap();
-        let update_frame = journal::frame_size(state.log_tip, &record).unwrap();
+        let update_frame = journal::frame_size(state.log_cursor, &record).unwrap();
         let before_update = disk_bytes(directory.path(), "wal-");
-        updated.log_tip = local
-            .append_and_sync(state.log_tip, vec![record])
-            .await
-            .unwrap();
+        updated.log_cursor = state.log_cursor.advanced(
+            local
+                .append_and_sync(state.log_cursor, vec![record])
+                .await
+                .unwrap(),
+        );
         let after_update = disk_bytes(directory.path(), "wal-");
         assert_eq!(after_update - before_update, update_frame as u64);
         assert!(update_frame > update_payload);

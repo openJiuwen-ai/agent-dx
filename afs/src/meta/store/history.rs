@@ -1267,11 +1267,14 @@ mod tests {
         };
         let log = MemoryLog::new(Default::default()).unwrap();
         let records = super::super::journal::test_records(3);
-        let tip = log.append_and_sync(LogTip::EMPTY, records).await.unwrap();
+        let tip = log
+            .append_and_sync(LogTip::EMPTY.at(log.term()), records)
+            .await
+            .unwrap();
         let state = authority();
         let delta = removal(&state);
         let next = log
-            .append_and_sync(tip, vec![Record::History(delta)])
+            .append_and_sync(tip.at(log.term()), vec![Record::History(delta)])
             .await
             .unwrap();
         assert_eq!(next.sequence, 4);
@@ -1299,11 +1302,14 @@ mod tests {
         let log = LocalLog::open(dir.path(), Default::default()).unwrap();
         let identity = log.identity();
         let records = super::super::journal::test_records(3);
-        let tip = log.append_and_sync(LogTip::EMPTY, records).await.unwrap();
+        let tip = log
+            .append_and_sync(LogTip::EMPTY.at(log.term()), records)
+            .await
+            .unwrap();
         let state = authority();
         let delta = removal(&state);
         let covered = log
-            .append_and_sync(tip, vec![Record::History(delta.clone())])
+            .append_and_sync(tip.at(log.term()), vec![Record::History(delta.clone())])
             .await
             .unwrap();
         drop(log);
@@ -1339,7 +1345,7 @@ mod tests {
             )
             .unwrap();
         let final_tip = log
-            .append_and_sync(covered, vec![Record::from(record.unwrap())])
+            .append_and_sync(covered.at(log.term()), vec![Record::from(record.unwrap())])
             .await
             .unwrap();
         drop(log);

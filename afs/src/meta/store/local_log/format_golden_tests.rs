@@ -4,8 +4,15 @@
 //! Every value is built from fixed identities, hashes and a fixed
 //! create record. A changed byte is a durable format change: bump the owning version
 //! (Envelope `VERSION`, `AFSW`/`AFSI`/`AFSC` header versions, `AFSM` CURRENT
-//! version; S1d-5 intentionally moves CURRENT to v3) and regenerate with
+//! version) and regenerate with
 //! `cargo test -p afs --lib local_log::format_golden_tests::print_local_log_goldens -- --ignored --nocapture`.
+
+//!
+//! S1d-5 changed exactly one golden on purpose: CURRENT moved from v2 to v3 to
+//! carry the writer term (`AFSM\0\x03`, a `term` varint after the identity).
+//! The frame, segment header, tail slot, IDENTITY and checkpoint goldens are
+//! unchanged; the frame golden keeps term 0. The old v2 bytes stay below as
+//! `CURRENT_V2` and must be refused.
 
 use super::super::journal::encode_frame;
 use super::super::log::format_golden_tests::golden_record;
@@ -20,7 +27,15 @@ fn identity() -> StoreIdentity {
 }
 
 fn first_frame() -> (Vec<u8>, LogTip) {
-    encode_frame(identity(), LogTip::EMPTY, golden_record(), 1024 * 1024).unwrap()
+    // Term 0 keeps the frame golden byte-identical to its pre-term encoding:
+    // the envelope layout did not change, only the value written there.
+    encode_frame(
+        identity(),
+        LogTip::EMPTY.at(0),
+        golden_record(),
+        1024 * 1024,
+    )
+    .unwrap()
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -42,6 +57,7 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
     };
     let current = Current {
         identity: identity(),
+        term: 7,
         current: Some(checkpoint),
         previous: None,
         segments: vec![
@@ -73,7 +89,7 @@ fn cases() -> Vec<(&'static str, Vec<u8>)> {
         ),
         ("wal_tail_slot", tail_bytes(tail).to_vec()),
         ("identity", identity_bytes(identity())),
-        ("current_v2", encode_current(&current).unwrap()),
+        ("current_v3", encode_current(&current).unwrap()),
         ("checkpoint_header", image_header.to_vec()),
         ("checkpoint_name", image_name(image_ref).into_bytes()),
     ]
@@ -98,9 +114,9 @@ fn local_log_containers_match_golden() {
 #[test]
 fn golden_containers_decode_with_current_readers() {
     let (frame, tip) = first_frame();
-    let (record, decoded_tip) =
+    let (record, decoded_tip, term) =
         decode_frame(identity(), LogTip::EMPTY, &frame, 1024 * 1024).unwrap();
-    assert_eq!(decoded_tip, tip);
+    assert_eq!((decoded_tip, term), (tip, 0));
     assert_eq!(
         postcard::to_allocvec(&record).unwrap(),
         postcard::to_allocvec(&golden_record()).unwrap()
@@ -114,6 +130,23 @@ fn golden_containers_decode_with_current_readers() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join(IDENTITY), identity_bytes(identity())).unwrap();
     assert_eq!(read_identity(temp.path()).unwrap(), identity());
+}
+
+/// The last v2 CURRENT golden (before S1d-5). A v2 manifest has no writer
+/// term, so it is refused with a rebuild instruction, never adopted.
+const CURRENT_V2: &str = "4146534d0002010101010101010101010101010101010202020202020202020202020202020203030303030303030303030303030303010139f40095025a4252e31c4612b6f4f936a35070a904527fdfe3c984d957d4fc7b0112080808080808080808080808080808080808080808080808080808080808080800020000000000000000000000000000000000000000000000000000000000000000000001030139f40095025a4252e31c4612b6f4f936a35070a904527fdfe3c984d957d4fc7bf021010139f40095025a4252e31c4612b6f4f936a35070a904527fdfe3c984d957d4fc7b01000000c935e98cc216b3c866068f2cde17e74efb5ab4271e6805c522e35057b1f3298bff8f509d";
+
+#[test]
+fn current_v2_golden_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let bytes = (0..CURRENT_V2.len())
+        .step_by(2)
+        .map(|index| u8::from_str_radix(&CURRENT_V2[index..index + 2], 16).unwrap())
+        .collect::<Vec<_>>();
+    std::fs::write(temp.path().join(CURRENT), bytes).unwrap();
+    let error = read_current(temp.path(), identity()).unwrap_err();
+    assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+    assert!(error.to_string().contains("format v2"), "{error}");
 }
 
 #[test]
@@ -146,8 +179,8 @@ const GOLDEN: &[(&str, &str)] = &[
         "414653490001010101010101010101010101010101010202020202020202020202020202020203030303030303030303030303030303d79b9f8d3a7dc4b4b022ed798f60ffee6f3bac8e3e147d74faf2491e814713351155613f",
     ),
     (
-        "current_v2",
-        "4146534d0002010101010101010101010101010101010202020202020202020202020202020203030303030303030303030303030303010139f40095025a4252e31c4612b6f4f936a35070a904527fdfe3c984d957d4fc7b0112080808080808080808080808080808080808080808080808080808080808080800020000000000000000000000000000000000000000000000000000000000000000000001030139f40095025a4252e31c4612b6f4f936a35070a904527fdfe3c984d957d4fc7bf021010139f40095025a4252e31c4612b6f4f936a35070a904527fdfe3c984d957d4fc7b01000000c935e98cc216b3c866068f2cde17e74efb5ab4271e6805c522e35057b1f3298bff8f509d",
+        "current_v3",
+        "4146534d000301010101010101010101010101010101020202020202020202020202020202020303030303030303030303030303030307010139f40095025a4252e31c4612b6f4f936a35070a904527fdfe3c984d957d4fc7b0112080808080808080808080808080808080808080808080808080808080808080800020000000000000000000000000000000000000000000000000000000000000000000001030139f40095025a4252e31c4612b6f4f936a35070a904527fdfe3c984d957d4fc7bf021010139f40095025a4252e31c4612b6f4f936a35070a904527fdfe3c984d957d4fc7b010000000684004eb612935b9a681d8ceef2f51603e26a1fd7e5300e0ccfee308b699afb008e8fca",
     ),
     (
         "checkpoint_header",

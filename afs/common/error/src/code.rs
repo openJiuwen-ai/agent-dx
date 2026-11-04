@@ -87,6 +87,7 @@ catalog! {
     META_OWNER_ROOT_BUSY = 0x03040002 => FailedPrecondition;
     META_OWNER_HOME_UNAVAILABLE = 0x03040003 => Unavailable;
     META_STORE_UNIMPLEMENTED = 0x03020001 => Unimplemented;
+    META_LOG_FENCED = 0x03020002 => FailedPrecondition;
     CONFIG_INVALID = 0x04010001 => InvalidArgument;
     RUNTIME_INTERNAL = 0x04020001 => Internal;
     DIAGNOSTICS_NOT_CONFIGURED = 0x04020002 => FailedPrecondition;

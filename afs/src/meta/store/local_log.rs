@@ -16,9 +16,9 @@ use afs_error::{Error, Result};
 use super::{
     BackendPersistence, MetaFuture, StoreRevision,
     journal::{
-        AppendLimits, BATCH_RECORDS_MAX, CheckpointLimits, LogStatus, LogTip, MetaLog,
-        RecoveredCheckpoint, RecoveredLog, StoreIdentity, decode_frame, encode_batch, frame_length,
-        full, invalid_log, unavailable,
+        AppendLimits, BATCH_RECORDS_MAX, CheckpointLimits, LogCursor, LogStatus, LogTip, MetaLog,
+        RecoveredCheckpoint, RecoveredLog, StoreIdentity, chain_term, decode_frame, encode_batch,
+        fenced, frame_length, full, invalid_log, unavailable,
     },
     log::Record,
 };
@@ -390,6 +390,9 @@ fn preserve_tail(dir: &Path, file: &mut File, start: u64, end: u64) -> Result<()
 const IMAGE_HEADER: usize = 146;
 const CURRENT: &str = "CURRENT";
 const MANIFEST_MAX: usize = 64 * 1024;
+/// CURRENT v3 carries the writer term. v2 (no term) is refused, never adopted.
+const CURRENT_MAGIC: &[u8; 6] = b"AFSM\0\x03";
+const CURRENT_MAGIC_V2: &[u8; 6] = b"AFSM\0\x02";
 #[derive(Clone, Copy, Debug, serde::Deserialize, Eq, PartialEq, serde::Serialize)]
 struct CheckpointRef {
     covered: LogTip,
@@ -408,6 +411,9 @@ struct SegmentRef {
 #[derive(Clone, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 struct Current {
     identity: StoreIdentity,
+    /// Writer term: every writer open durably selects `term + 1` before it
+    /// returns; a handle whose term no longer matches is fenced.
+    term: u64,
     current: Option<CheckpointRef>,
     previous: Option<CheckpointRef>,
     #[serde(deserialize_with = "segment_refs")]
@@ -459,6 +465,7 @@ impl Current {
     fn initial(identity: StoreIdentity) -> Self {
         Self {
             identity,
+            term: 0,
             current: None,
             previous: None,
             segments: vec![SegmentRef {
@@ -722,7 +729,7 @@ fn read_image(
 fn encode_current(current: &Current) -> Result<Vec<u8>> {
     let payload = super::codec::encode_bounded(current, MANIFEST_MAX - 42)?;
     let mut bytes = Vec::with_capacity(payload.len() + 42);
-    bytes.extend_from_slice(b"AFSM\0\x02");
+    bytes.extend_from_slice(CURRENT_MAGIC);
     bytes.extend_from_slice(&payload);
     let mut hash = blake3::Hasher::new();
     hash.update(b"afs.meta.current.v1");
@@ -750,11 +757,16 @@ fn read_current(dir: &Path, identity: StoreIdentity) -> Result<Option<Current>> 
     }
     let mut bytes = vec![0; length];
     file.read_exact(&mut bytes)?;
+    if bytes[..6] == *CURRENT_MAGIC_V2 {
+        return Err(invalid_log(
+            "CURRENT is format v2 (no writer term); this binary reads only v3. Old format: rebuild the Meta data directory; originals retained",
+        ));
+    }
     let hash_start = length - 36;
     let mut hash = blake3::Hasher::new();
     hash.update(b"afs.meta.current.v1");
     hash.update(&bytes[..hash_start]);
-    if bytes[..6] != *b"AFSM\0\x02"
+    if bytes[..6] != *CURRENT_MAGIC
         || bytes[hash_start..length - 4] != *hash.finalize().as_bytes()
         || bytes[length - 4..] != crc32c::crc32c(&bytes[..length - 4]).to_be_bytes()
     {
@@ -912,7 +924,7 @@ fn verify_anchor(
             bytes.resize(length, 0);
             bytes[..8].copy_from_slice(&prefix);
             file.read_exact(&mut bytes[8..])?;
-            let (record, next) = decode_frame(identity, tip, &bytes, limits.record_max_bytes)?;
+            let (record, next, _) = decode_frame(identity, tip, &bytes, limits.record_max_bytes)?;
             if record.revision_before() != business {
                 return Err(invalid_log("checkpoint anchor business revision gap"));
             }
@@ -1020,6 +1032,10 @@ fn select_checkpoint(
 /// Replay position carried across segments.
 struct ReplayCursor<'a> {
     tip: LogTip,
+    /// Term of the last replayed frame; frame terms never decrease.
+    term: u64,
+    /// The CURRENT term; no frame may carry a larger one.
+    current_term: u64,
     revision: StoreRevision,
     references: &'a [CheckpointRef],
     /// Whether each reference's covered position was found on the chain.
@@ -1089,8 +1105,15 @@ fn replay_segment(
         file.read_exact(&mut frame[8..])?;
         let tip = cursor.tip;
         let revision = cursor.revision;
-        let (record, next) =
-            decode_frame(identity, tip, &frame, limits.record_max_bytes).map_err(|error| {
+        let (record, next, term) = decode_frame(identity, tip, &frame, limits.record_max_bytes)
+            .and_then(|(record, next, found)| {
+                Ok((
+                    record,
+                    next,
+                    chain_term(cursor.term, found, cursor.current_term)?,
+                ))
+            })
+            .map_err(|error| {
                 invalid_log(format!(
                     "{name} offset {offset} after sequence {}: {error}",
                     tip.sequence
@@ -1105,6 +1128,7 @@ fn replay_segment(
             )));
         }
         cursor.tip = next;
+        cursor.term = term;
         cursor.revision = record.revision_after();
         offset += size as u64;
         for (reference, matched) in cursor.references.iter().zip(&mut cursor.anchors) {
@@ -1215,6 +1239,8 @@ fn replay(
     let revision = manifest.segments[0].base_revision;
     let mut cursor = ReplayCursor {
         tip,
+        term: 0,
+        current_term: manifest.term,
         revision,
         references: &references,
         anchors: references
@@ -1265,6 +1291,7 @@ fn replay(
         recovered: RecoveredLog {
             checkpoint,
             tip,
+            term: manifest.term,
             records,
         },
         file,
@@ -1641,7 +1668,7 @@ impl LocalLog {
             sync_dir(&dir)?;
             initialize_marked(&dir, checkpoint_limits)?
         };
-        let replay = replay(&dir, identity, limits, checkpoint_limits)?;
+        let mut replay = replay(&dir, identity, limits, checkpoint_limits)?;
         let mut manifest = replay.manifest;
         cleanup_unreferenced_images(
             &dir,
@@ -1655,13 +1682,27 @@ impl LocalLog {
         )?;
         let (retired_segments, retired_images) =
             cleanup_retired(&dir, &manifest, limits, checkpoint_limits)?;
-        if manifest.retired_segments != retired_segments
-            || manifest.retired_images != retired_images
-        {
-            manifest.retired_segments = retired_segments;
-            manifest.retired_images = retired_images;
-            write_current(&dir, &manifest, checkpoint_limits)?;
-        }
+        manifest.retired_segments = retired_segments;
+        manifest.retired_images = retired_images;
+        // This open is a new writer: its term is durable in CURRENT (file and
+        // directory synced) before any handle exists, so every older handle
+        // is fenced at its next CURRENT check and no term is ever reused.
+        manifest.term = manifest
+            .term
+            .checked_add(1)
+            .ok_or_else(|| invalid_log("CURRENT writer term exhausted"))?;
+        #[cfg(test)]
+        super::crash_tests::pause(
+            "open_term_prepared",
+            "recovered; next writer term not yet in CURRENT",
+        );
+        write_current(&dir, &manifest, checkpoint_limits)?;
+        #[cfg(test)]
+        super::crash_tests::pause(
+            "open_term_selected",
+            "next writer term durable in CURRENT; handle not returned",
+        );
+        replay.recovered.term = manifest.term;
         let wal_bytes = wal_budget(&dir, limits, 0, 0, &manifest.retired_segments)?;
         Ok(Self {
             inner: Arc::new(Inner {
@@ -1688,6 +1729,21 @@ impl LocalLog {
     }
     pub fn identity(&self) -> StoreIdentity {
         self.inner.identity
+    }
+    /// Test-only: the writer term this handle selected at open.
+    #[cfg(test)]
+    pub(super) fn term(&self) -> u64 {
+        self.inner
+            .state
+            .lock()
+            .map_or(0, |state| state.manifest.term)
+    }
+    /// Test-only: drop this handle's directory lock while keeping the handle,
+    /// modelling a writer that lost its local exclusivity so a newer writer
+    /// can open. The newer term in CURRENT must then fence this handle.
+    #[cfg(test)]
+    pub(super) fn release_lock_for_takeover(&self) -> Result<()> {
+        Ok(self.inner._lock.unlock()?)
     }
     /// Test-only: replace the active WAL descriptor with a read-only one so the
     /// next append hits a real write(2) failure (EBADF) and latches.
@@ -1720,6 +1776,9 @@ impl LocalLog {
             .ok_or_else(|| invalid_log("missing active segment"))?;
         let selected = read_current(&inner.dir, inner.identity)?
             .ok_or_else(|| invalid_log("live CURRENT missing"))?;
+        if selected.term != state.manifest.term {
+            return Err(fenced(state.manifest.term, selected.term));
+        }
         if selected != state.manifest {
             return Err(invalid_log("live CURRENT changed"));
         }
@@ -2129,7 +2188,7 @@ impl MetaLog for LocalLog {
             .map_err(|error| unavailable(format!("WAL status task: {error}")))?
         })
     }
-    fn can_append(&self, expected: LogTip, framed_bytes: usize) -> MetaFuture<'_, bool> {
+    fn can_append(&self, expected: LogCursor, framed_bytes: usize) -> MetaFuture<'_, bool> {
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
             inner.ensure_owner()?;
@@ -2140,7 +2199,10 @@ impl MetaLog for LocalLog {
                     .lock()
                     .map_err(|_| unavailable("WAL lock poisoned"))?;
                 Self::check_files(&inner, &mut state)?;
-                if expected != state.tip {
+                if expected.term != state.manifest.term {
+                    return Err(fenced(expected.term, state.manifest.term));
+                }
+                if expected.tip != state.tip {
                     return Err(unavailable("WAL admission tip changed"));
                 }
                 let rotate = state.end > LOG_HEADER_BYTES
@@ -2220,7 +2282,7 @@ impl MetaLog for LocalLog {
             .map_err(|e| unavailable(format!("WAL recovery task: {e}")))?
         })
     }
-    fn append_and_sync(&self, expected: LogTip, records: Vec<Record>) -> MetaFuture<'_, LogTip> {
+    fn append_and_sync(&self, expected: LogCursor, records: Vec<Record>) -> MetaFuture<'_, LogTip> {
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
             inner.ensure_owner()?;
@@ -2231,7 +2293,10 @@ impl MetaLog for LocalLog {
                     .lock()
                     .map_err(|_| unavailable("local WAL lock poisoned"))?;
                 Self::check_files(&inner, &mut state)?;
-                if state.tip != expected {
+                if expected.term != state.manifest.term {
+                    return Err(fenced(expected.term, state.manifest.term));
+                }
+                if state.tip != expected.tip {
                     return Err(unavailable("local log compare-and-append tip changed"));
                 }
                 let revision = records
@@ -2511,8 +2576,10 @@ mod tests {
             log.health().await.is_err(),
             log.status().await.is_err(),
             log.recover().await.is_err(),
-            log.can_append(LogTip::EMPTY, 4096).await.is_err(),
-            log.append_and_sync(LogTip::EMPTY, test_records(1))
+            log.can_append(LogTip::EMPTY.at(log.term()), 4096)
+                .await
+                .is_err(),
+            log.append_and_sync(LogTip::EMPTY.at(log.term()), test_records(1))
                 .await
                 .is_err(),
             log.install_checkpoint(LogTip::EMPTY, image).await.is_err(),
@@ -2538,7 +2605,10 @@ mod tests {
         for record in &records {
             *state = state.replay_record(record).unwrap();
         }
-        let tip = log.append_and_sync(previous, records).await.unwrap();
+        let tip = log
+            .append_and_sync(previous.at(log.term()), records)
+            .await
+            .unwrap();
         log.install_checkpoint(
             tip,
             super::super::log::StateImage::encode(state, 1024 * 1024).unwrap(),
@@ -2602,9 +2672,14 @@ mod tests {
                 assert_eq!(found, identity);
             }
             assert!(!dir.path().join("INITIALIZING").exists());
+            // Initialization installs the term-0 initial manifest; the open
+            // that follows selects the first writer term.
             assert_eq!(
                 read_current(dir.path(), found).unwrap(),
-                Some(Current::initial(found))
+                Some(Current {
+                    term: 1,
+                    ..Current::initial(found)
+                })
             );
             assert_eq!(log.inner.state.lock().unwrap().tip, LogTip::EMPTY);
             drop(log);
@@ -2622,7 +2697,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
         let identity = log.identity();
-        log.append_and_sync(LogTip::EMPTY, test_records(1))
+        log.append_and_sync(LogTip::EMPTY.at(log.term()), test_records(1))
             .await
             .unwrap();
         drop(log);
@@ -2700,7 +2775,7 @@ mod tests {
     async fn p3_recovery_missing_current_refuses_acknowledged_wal() {
         let dir = tempfile::tempdir().unwrap();
         let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
-        log.append_and_sync(LogTip::EMPTY, test_records(1))
+        log.append_and_sync(LogTip::EMPTY.at(log.term()), test_records(1))
             .await
             .unwrap();
         drop(log);
@@ -2726,7 +2801,10 @@ mod tests {
         let initial = fs::read(dir.path().join(CURRENT)).unwrap();
         let mut tip = LogTip::EMPTY;
         for record in test_records(12) {
-            tip = log.append_and_sync(tip, vec![record]).await.unwrap();
+            tip = log
+                .append_and_sync(tip.at(log.term()), vec![record])
+                .await
+                .unwrap();
         }
         drop(log);
         let originals: Vec<_> = fs::read_dir(dir.path())
@@ -2808,7 +2886,7 @@ mod tests {
         let mut rejected = false;
         for record in test_records(24) {
             let before = snapshot();
-            match log.append_and_sync(tip, vec![record]).await {
+            match log.append_and_sync(tip.at(log.term()), vec![record]).await {
                 Ok(next) => tip = next,
                 Err(error) => {
                     assert!(error.to_string().contains("segment count"));
@@ -2894,7 +2972,10 @@ mod tests {
         for _ in 0..4 {
             let record = records.next().unwrap();
             state = state.replay_record(&record).unwrap();
-            tip = log.append_and_sync(tip, vec![record]).await.unwrap();
+            tip = log
+                .append_and_sync(tip.at(log.term()), vec![record])
+                .await
+                .unwrap();
         }
         let wal_names = || {
             fs::read_dir(dir.path())
@@ -2917,7 +2998,10 @@ mod tests {
             for _ in 0..4 {
                 let record = records.next().unwrap();
                 state = state.replay_record(&record).unwrap();
-                tip = log.append_and_sync(tip, vec![record]).await.unwrap();
+                tip = log
+                    .append_and_sync(tip.at(log.term()), vec![record])
+                    .await
+                    .unwrap();
             }
             log.install_checkpoint(
                 tip,
@@ -2973,7 +3057,10 @@ mod tests {
         let tip1 =
             install_test_image(&log, vec![records.remove(0)], LogTip::EMPTY, &mut state).await;
         let tip2 = install_test_image(&log, vec![records.remove(0)], tip1, &mut state).await;
-        let tip3 = log.append_and_sync(tip2, records).await.unwrap();
+        let tip3 = log
+            .append_and_sync(tip2.at(log.term()), records)
+            .await
+            .unwrap();
         let manifest = read_current(dir.path(), identity).unwrap().unwrap();
         assert_eq!(manifest.previous.unwrap().covered, tip1);
         let current = dir.path().join(image_name(manifest.current.unwrap()));
@@ -3049,7 +3136,7 @@ mod tests {
         // Real write(2) EBADF, rather than a hook returning an invented error.
         log.inner.state.lock().unwrap().file = File::open(dir.path().join(WAL)).unwrap();
         assert!(
-            log.append_and_sync(LogTip::EMPTY, test_records(1))
+            log.append_and_sync(LogTip::EMPTY.at(log.term()), test_records(1))
                 .await
                 .is_err()
         );
@@ -3057,7 +3144,7 @@ mod tests {
         assert!(log.health().await.is_err());
         assert!(log.recover().await.is_err());
         assert!(
-            log.append_and_sync(LogTip::EMPTY, test_records(1))
+            log.append_and_sync(LogTip::EMPTY.at(log.term()), test_records(1))
                 .await
                 .is_err()
         );
@@ -3083,7 +3170,7 @@ mod tests {
         let mut exhausted = false;
         for record in test_records(64) {
             let before = fs::read(dir.path().join(WAL)).unwrap();
-            match log.append_and_sync(tip, vec![record]).await {
+            match log.append_and_sync(tip.at(log.term()), vec![record]).await {
                 Ok(next) => tip = next,
                 Err(error) => {
                     assert!(error.to_string().contains("WAL byte budget"));
@@ -3111,7 +3198,10 @@ mod tests {
             .iter()
             .map(|r| crate::meta::store::codec::encode_bounded(r, 1024 * 1024).unwrap())
             .collect::<Vec<_>>();
-        let tip = log.append_and_sync(LogTip::EMPTY, original).await.unwrap();
+        let tip = log
+            .append_and_sync(LogTip::EMPTY.at(log.term()), original)
+            .await
+            .unwrap();
         log.health().await.unwrap();
         drop(log);
         let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
@@ -3127,7 +3217,7 @@ mod tests {
             expected
         );
         assert!(
-            log.append_and_sync(LogTip::EMPTY, test_records(1))
+            log.append_and_sync(LogTip::EMPTY.at(log.term()), test_records(1))
                 .await
                 .is_err()
         );
@@ -3140,7 +3230,9 @@ mod tests {
         let identity = log.identity();
         drop(log);
         let record = test_records(1).pop().unwrap();
-        let (frame, tip) = encode_frame(identity, LogTip::EMPTY, record, 1024 * 1024).unwrap();
+        // Written as the closed writer (term 1) would have written it.
+        let (frame, tip) =
+            encode_frame(identity, LogTip::EMPTY.at(1), record, 1024 * 1024).unwrap();
         let mut file = OpenOptions::new()
             .append(true)
             .open(dir.path().join(WAL))
@@ -3182,7 +3274,7 @@ mod tests {
     async fn p3_acknowledged_truncation_is_not_discarded() {
         let dir = tempfile::tempdir().unwrap();
         let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
-        log.append_and_sync(LogTip::EMPTY, test_records(1))
+        log.append_and_sync(LogTip::EMPTY.at(log.term()), test_records(1))
             .await
             .unwrap();
         drop(log);
@@ -3200,7 +3292,7 @@ mod tests {
     async fn p3_complete_tail_corruption_is_not_discarded() {
         let dir = tempfile::tempdir().unwrap();
         let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
-        log.append_and_sync(LogTip::EMPTY, test_records(1))
+        log.append_and_sync(LogTip::EMPTY.at(log.term()), test_records(1))
             .await
             .unwrap();
         drop(log);
@@ -3249,7 +3341,7 @@ mod tests {
         fs::copy(dir.path().join("original-wal"), dir.path().join(WAL)).unwrap();
         assert!(log.health().await.is_err());
         assert!(
-            log.append_and_sync(LogTip::EMPTY, test_records(1))
+            log.append_and_sync(LogTip::EMPTY.at(log.term()), test_records(1))
                 .await
                 .is_err()
         );
@@ -3269,6 +3361,205 @@ mod tests {
         file.sync_all().unwrap();
         drop(file);
         assert!(LocalLog::open(dir.path(), LocalLogOptions::default()).is_err());
+    }
+
+    fn current_term(dir: &Path) -> u64 {
+        read_current(dir, read_identity(dir).unwrap())
+            .unwrap()
+            .unwrap()
+            .term
+    }
+
+    /// Terms of every complete frame in the first WAL segment, in order.
+    fn wal_terms(dir: &Path) -> Vec<u64> {
+        let identity = read_identity(dir).unwrap();
+        let bytes = fs::read(dir.join(WAL)).unwrap();
+        let mut offset = LOG_HEADER_BYTES as usize;
+        let mut tip = LogTip::EMPTY;
+        let mut terms = Vec::new();
+        while offset + 8 <= bytes.len() {
+            let size = frame_length(&bytes[offset..], 1024 * 1024).unwrap();
+            let (_, next, term) =
+                decode_frame(identity, tip, &bytes[offset..offset + size], 1024 * 1024).unwrap();
+            terms.push(term);
+            tip = next;
+            offset += size;
+        }
+        terms
+    }
+
+    #[tokio::test]
+    async fn term_increases_on_every_open_and_frames_carry_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = test_records(3);
+        let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
+        assert_eq!(current_term(dir.path()), 1, "a new log starts at term 1");
+        let recovered = log.recover().await.unwrap();
+        assert_eq!(recovered.term, 1);
+        let tip = log
+            .append_and_sync(recovered.cursor(), records[..1].to_vec())
+            .await
+            .unwrap();
+        drop(log);
+        assert_eq!(
+            current_term(dir.path()),
+            1,
+            "close does not change the term"
+        );
+        let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
+        assert_eq!(current_term(dir.path()), 2);
+        assert_eq!(log.recover().await.unwrap().term, 2);
+        let tip = log
+            .append_and_sync(tip.at(2), records[1..].to_vec())
+            .await
+            .unwrap();
+        assert_eq!(wal_terms(dir.path()), [1, 2, 2]);
+        drop(log);
+        let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
+        let recovered = log.recover().await.unwrap();
+        assert_eq!((recovered.term, recovered.tip), (3, tip));
+        assert_eq!(recovered.records.len(), 3);
+    }
+
+    /// The directory lock still excludes a second writer, in this process and
+    /// from another process, and a refused open never advances the term.
+    #[tokio::test]
+    async fn flock_still_excludes_writers_and_refused_open_keeps_term() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
+        let before = fs::read(dir.path().join(CURRENT)).unwrap();
+        let error = LocalLog::open(dir.path(), LocalLogOptions::default())
+            .err()
+            .expect("a second writer must be refused");
+        assert!(error.to_string().contains("already locked"), "{error}");
+        let other_process = std::process::Command::new("flock")
+            .arg("--nonblock")
+            .arg(dir.path().join("LOCK"))
+            .arg("true")
+            .status()
+            .unwrap();
+        assert!(!other_process.success(), "another process acquired LOCK");
+        assert_eq!(fs::read(dir.path().join(CURRENT)).unwrap(), before);
+        assert_eq!(log.recover().await.unwrap().term, 1);
+        drop(log);
+        let after = std::process::Command::new("flock")
+            .arg("--nonblock")
+            .arg(dir.path().join("LOCK"))
+            .arg("true")
+            .status()
+            .unwrap();
+        assert!(after.success(), "released lock must be available");
+    }
+
+    /// Damaged data whose chain terms decrease, or exceed the CURRENT term, is
+    /// refused at open and left in place.
+    #[tokio::test]
+    async fn open_refuses_decreasing_or_future_frame_terms() {
+        for (terms, marker) in [
+            ([1, 0], "decreases below previous term 1"),
+            ([1, 2], "exceeds current term 1"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
+            let identity = log.identity();
+            drop(log);
+            let mut tip = LogTip::EMPTY;
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(dir.path().join(WAL))
+                .unwrap();
+            for (record, term) in test_records(2).into_iter().zip(terms) {
+                let (frame, next) =
+                    encode_frame(identity, tip.at(term), record, 1024 * 1024).unwrap();
+                file.write_all(&frame).unwrap();
+                tip = next;
+            }
+            file.sync_all().unwrap();
+            drop(file);
+            let before = (
+                fs::read(dir.path().join(WAL)).unwrap(),
+                fs::read(dir.path().join(CURRENT)).unwrap(),
+            );
+            let error = LocalLog::open(dir.path(), LocalLogOptions::default())
+                .err()
+                .expect("bad chain terms must be refused");
+            assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+            assert!(error.to_string().contains(marker), "{error}");
+            assert_eq!(
+                (
+                    fs::read(dir.path().join(WAL)).unwrap(),
+                    fs::read(dir.path().join(CURRENT)).unwrap(),
+                ),
+                before,
+                "refused open changed the evidence"
+            );
+        }
+    }
+
+    /// A real v2 CURRENT (the same manifest without the term field) is
+    /// refused with a rebuild instruction and left in place.
+    #[test]
+    fn open_refuses_v2_current() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap());
+        let v3 = fs::read(dir.path().join(CURRENT)).unwrap();
+        assert_eq!(v3[..6], *CURRENT_MAGIC);
+        // postcard: 48 identity bytes, then the one-byte term varint (term 1).
+        assert_eq!(v3[6 + 48], 1);
+        let mut v2 = b"AFSM\0\x02".to_vec();
+        v2.extend_from_slice(&v3[6..6 + 48]);
+        v2.extend_from_slice(&v3[6 + 49..v3.len() - 36]);
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"afs.meta.current.v1");
+        hash.update(&v2);
+        v2.extend_from_slice(hash.finalize().as_bytes());
+        let crc = crc32c::crc32c(&v2);
+        v2.extend_from_slice(&crc.to_be_bytes());
+        fs::write(dir.path().join(CURRENT), &v2).unwrap();
+        let error = LocalLog::open(dir.path(), LocalLogOptions::default())
+            .err()
+            .expect("v2 CURRENT must be refused");
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+        let message = error.to_string();
+        assert!(
+            message.contains("format v2") && message.contains("rebuild the Meta data directory"),
+            "{message}"
+        );
+        assert_eq!(fs::read(dir.path().join(CURRENT)).unwrap(), v2);
+    }
+
+    /// Same-process takeover: a handle that lost its lock is fenced by the
+    /// newer CURRENT term before it can write anything.
+    #[tokio::test]
+    async fn stale_handle_is_fenced_by_newer_current_term() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
+        let tip = old
+            .append_and_sync(LogTip::EMPTY.at(1), test_records(1))
+            .await
+            .unwrap();
+        old.release_lock_for_takeover().unwrap();
+        let new = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
+        assert_eq!(current_term(dir.path()), 2);
+        let wal = fs::read(dir.path().join(WAL)).unwrap();
+        let error = old
+            .append_and_sync(tip.at(1), test_records(2)[1..].to_vec())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::META_LOG_FENCED);
+        assert!(
+            error.to_string().contains("found term 1, current term 2"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(dir.path().join(WAL)).unwrap(),
+            wal,
+            "no byte written"
+        );
+        new.append_and_sync(tip.at(2), test_records(2)[1..].to_vec())
+            .await
+            .unwrap();
+        assert_eq!(wal_terms(dir.path()), [1, 2]);
     }
 }
 

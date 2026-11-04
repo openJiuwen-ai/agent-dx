@@ -158,7 +158,7 @@ impl StoreMetrics {
         Self::set(&self.event_bytes, retained.event_bytes);
         Self::set(&self.history_index_bytes, retained.index_base_bytes);
         Self::set(&self.revision, state.revision.0);
-        Self::set(&self.log_sequence, state.log_tip.sequence);
+        Self::set(&self.log_sequence, state.log_cursor.tip.sequence);
         Self::set(&self.compacted_revision, state.compacted_to.0);
     }
 }

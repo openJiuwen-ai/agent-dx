@@ -3,7 +3,7 @@ use afs::dfs::{
     ReplicationConfig, ValidateReplicaWriteRequest,
 };
 use afs::meta::store::{
-    journal::{AppendLimits, CheckpointLimits, LogStatus, LogTip, RecoveredLog},
+    journal::{AppendLimits, CheckpointLimits, LogCursor, LogStatus, LogTip, RecoveredLog},
     log::Record,
 };
 use afs::{
@@ -2398,7 +2398,11 @@ impl MetaLog for LostCommitResultBackend {
     fn status(&self) -> afs::meta::store::MetaFuture<'_, LogStatus> {
         self.inner.status()
     }
-    fn can_append(&self, expected: LogTip, bytes: usize) -> afs::meta::store::MetaFuture<'_, bool> {
+    fn can_append(
+        &self,
+        expected: LogCursor,
+        bytes: usize,
+    ) -> afs::meta::store::MetaFuture<'_, bool> {
         self.inner.can_append(expected, bytes)
     }
     fn install_checkpoint(&self, _: LogTip, _: Vec<u8>) -> afs::meta::store::MetaFuture<'_, ()> {
@@ -2411,7 +2415,7 @@ impl MetaLog for LostCommitResultBackend {
     }
     fn append_and_sync(
         &self,
-        expected: LogTip,
+        expected: LogCursor,
         records: Vec<Record>,
     ) -> afs::meta::store::MetaFuture<'_, LogTip> {
         Box::pin(async move {

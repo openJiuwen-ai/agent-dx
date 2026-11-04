@@ -108,7 +108,7 @@ impl Store {
             committed = committed.replay_record(&record)?;
         }
         committed.ensure_history_index()?;
-        let mut recovered_tip = recovered.tip;
+        let mut recovered_tip = recovered.tip.at(recovered.term);
         // A lowered history budget cannot expose an over-budget authority.
         // Persist exact startup removals before service admission; failure does
         // not serve a partially prepared state or erase the original chain.
@@ -132,7 +132,8 @@ impl Store {
                     "startup retention has no bounded WAL capacity",
                 ));
             }
-            recovered_tip = log.append_and_sync(recovered_tip, vec![record]).await?;
+            recovered_tip =
+                recovered_tip.advanced(log.append_and_sync(recovered_tip, vec![record]).await?);
             metrics.wal_batches.inc();
             metrics.wal_records.inc();
             metrics.wal_framed_bytes.inc_by(size as u64);
@@ -140,7 +141,7 @@ impl Store {
             metrics.event_evictions.inc_by(removed_events);
             committed = next;
         }
-        committed.log_tip = recovered_tip;
+        committed.log_cursor = recovered_tip;
         metrics.publish(&committed);
         let visible = Arc::new(Visible {
             metrics,
@@ -297,7 +298,7 @@ async fn checkpoint_visible(
             return Err(unavailable("store unavailable before checkpoint capture"));
         }
         let state = visible.committed.load_full();
-        let covered = state.log_tip;
+        let covered = state.log_cursor.tip;
         let bytes = tokio::task::spawn_blocking(move || {
             if log::StateImage::capture_charge(&state)? > capture_charge_max_bytes {
                 return Err(journal::full("checkpoint capture logical charge exceeded"));
@@ -380,7 +381,7 @@ async fn run_checkpoint_loop(
 async fn wait_log_capacity(
     visible: &Arc<Visible>,
     log: &Arc<dyn journal::MetaLog>,
-    tip: journal::LogTip,
+    tip: journal::LogCursor,
     bytes: usize,
 ) -> Result<bool> {
     if log.can_append(tip, bytes).await? {
@@ -411,7 +412,7 @@ async fn wait_log_capacity(
 }
 
 enum LogGroup {
-    Committed(journal::LogTip),
+    Committed(journal::LogCursor),
     NotAppended,
 }
 
@@ -421,7 +422,7 @@ async fn persist_log_group(
     visible: &Arc<Visible>,
     log: &Arc<dyn journal::MetaLog>,
     staged: &State,
-    tip: journal::LogTip,
+    tip: journal::LogCursor,
     records: &mut Vec<log::Record>,
     replies: &mut Vec<LogReply>,
     framed_bytes: usize,
@@ -464,6 +465,7 @@ async fn persist_log_group(
         let append_timer = profile::Timer::start();
         match log.append_and_sync(tip, std::mem::take(records)).await {
             Ok(next) => {
+                let next = tip.advanced(next);
                 let append_sync_ms = append_timer.ms();
                 let publish_timer = profile::Timer::start();
                 #[cfg(test)]
@@ -476,7 +478,7 @@ async fn persist_log_group(
                     ),
                 );
                 let mut published = staged.clone();
-                published.log_tip = next;
+                published.log_cursor = next;
                 let retained = published.history_stats();
                 tracing::debug!(
                     history.requests = retained.requests,
@@ -534,11 +536,11 @@ enum AuthorityCleanup<'a> {
 async fn persist_authority_cleanup(
     visible: &Arc<Visible>,
     log: &Arc<dyn journal::MetaLog>,
-    tip: journal::LogTip,
+    tip: journal::LogCursor,
     cleanup: AuthorityCleanup<'_>,
     history: history::Limits,
     in_flight: &Arc<InFlight>,
-) -> Result<journal::LogTip> {
+) -> Result<journal::LogCursor> {
     let limits = log.limits();
     let current = visible.committed.load_full();
     let max_deletes = history.event_count.min(history.cleanup_items);
@@ -620,9 +622,9 @@ struct CleanupCursors {
 /// `Err` stops the commit loop (the Store is then poisoned).
 async fn cleanup_tick_step(
     context: &CommitContext<'_>,
-    mut tip: journal::LogTip,
+    mut tip: journal::LogCursor,
     cursors: &mut CleanupCursors,
-) -> Result<journal::LogTip> {
+) -> Result<journal::LogCursor> {
     let CommitContext {
         visible,
         log,
@@ -682,7 +684,7 @@ fn prepare_ready_item(
     context: &CommitContext<'_>,
     staged: &State,
     operation: Mutation,
-    group: (journal::LogTip, usize),
+    group: (journal::LogCursor, usize),
     retirements: &mut Vec<InFlightGuard>,
 ) -> Result<PreparedItem> {
     let CommitContext {
@@ -723,14 +725,16 @@ fn prepare_ready_item(
     let size = match &record {
         Some(record) => {
             let sequence = tip
+                .tip
                 .sequence
                 .checked_add(grouped as u64)
                 .ok_or_else(|| journal::invalid_log("group sequence exhausted"))?;
             journal::frame_size(
                 journal::LogTip {
                     sequence,
-                    record_hash: tip.record_hash,
-                },
+                    record_hash: tip.tip.record_hash,
+                }
+                .at(tip.term),
                 record,
             )?
         }
@@ -751,7 +755,7 @@ async fn run_log_commit_loop(
     mut receiver: mpsc::Receiver<Pending>,
     visible: Arc<Visible>,
     log: Arc<dyn journal::MetaLog>,
-    mut tip: journal::LogTip,
+    mut tip: journal::LogCursor,
     history: history::Limits,
     in_flight: Arc<InFlight>,
 ) {

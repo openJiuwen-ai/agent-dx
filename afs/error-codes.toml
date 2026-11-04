@@ -450,6 +450,14 @@ subsystem = "Store"
 description = "Meta 持久权威后端尚未配置"
 
 [[error]]
+name = "META_LOG_FENCED"
+value = "0x03020002"
+kind = "FailedPrecondition"
+component = "Meta"
+subsystem = "Store"
+description = "Meta 操作日志已被更高 term 的新写者接管，旧写者句柄的追加被拒绝且未写入；Store 随即失效，需由新写者服务"
+
+[[error]]
 name = "CONFIG_INVALID"
 value = "0x04010001"
 kind = "InvalidArgument"

@@ -42,6 +42,26 @@ impl LogTip {
         sequence: 0,
         record_hash: [0; 32],
     };
+    /// This tip as seen by a writer holding `term`.
+    pub const fn at(self, term: u64) -> LogCursor {
+        LogCursor { tip: self, term }
+    }
+}
+/// A writer's append position: the expected tip and the writer term it holds.
+/// Backends accept appends only at the current tip and the current term.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LogCursor {
+    pub tip: LogTip,
+    pub term: u64,
+}
+impl LogCursor {
+    /// The same writer after its append reached `tip`.
+    pub const fn advanced(self, tip: LogTip) -> Self {
+        Self {
+            tip,
+            term: self.term,
+        }
+    }
 }
 /// Backend-neutral append bounds, in framed bytes (`frame_size`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -94,7 +114,15 @@ pub struct RecoveredCheckpoint {
 pub struct RecoveredLog {
     pub checkpoint: Option<RecoveredCheckpoint>,
     pub tip: LogTip,
+    /// The writer term this handle holds; every later append must carry it.
+    pub term: u64,
     pub records: Vec<Record>,
+}
+impl RecoveredLog {
+    /// The append position this recovery hands to its writer.
+    pub fn cursor(&self) -> LogCursor {
+        self.tip.at(self.term)
+    }
 }
 /// Store-side checkpoint schedule and WAL capacity wait. Passed to
 /// `Store::open_log_with_options`; never owned by a log backend. Background
@@ -191,7 +219,13 @@ pub struct LogStatus {
 ///   method returns an error.
 /// - **Status.** `status().uncheckpointed_bytes_upper_bound` is never below the
 ///   true framed bytes after the checkpoint.
-// TODO(S1d-5): term/fencing — appends carry a term; stale terms are rejected.
+/// - **Term/fencing.** Each writer open obtains a strictly larger term, durable
+///   before the backend is returned (`recover().term`). Every frame records
+///   its writer's term. Appends and admission carry `LogCursor { tip, term }`;
+///   a term other than the current one, or any operation through a handle
+///   whose term was superseded, fails `META_LOG_FENCED` without writing a byte.
+///   Recovery rejects a chain whose frame terms decrease or exceed the current
+///   term. Frames with term 0 (written before terms existed) remain valid.
 pub trait MetaLog: Send + Sync {
     fn persistence(&self) -> BackendPersistence;
     fn limits(&self) -> AppendLimits;
@@ -204,9 +238,9 @@ pub trait MetaLog: Send + Sync {
     fn status(&self) -> MetaFuture<'_, LogStatus>;
     /// Read-only admission: false guarantees append was not attempted. An
     /// append error itself never implies safe retry (ENOSPC can be partial).
-    fn can_append(&self, expected: LogTip, framed_bytes: usize) -> MetaFuture<'_, bool>;
+    fn can_append(&self, expected: LogCursor, framed_bytes: usize) -> MetaFuture<'_, bool>;
     fn install_checkpoint(&self, covered: LogTip, bytes: Vec<u8>) -> MetaFuture<'_, ()>;
-    fn append_and_sync(&self, expected: LogTip, records: Vec<Record>) -> MetaFuture<'_, LogTip>;
+    fn append_and_sync(&self, expected: LogCursor, records: Vec<Record>) -> MetaFuture<'_, LogTip>;
 }
 #[derive(Deserialize, Serialize)]
 struct Envelope {
@@ -228,7 +262,10 @@ struct EnvelopeRef<'a> {
     previous_hash: [u8; 32],
     decision: &'a Record,
 }
-pub(super) fn frame_size(tip: LogTip, decision: &Record) -> Result<usize> {
+/// Exact framed size of `decision` appended at `cursor` (term is a varint, so
+/// the size depends on it).
+pub(super) fn frame_size(cursor: LogCursor, decision: &Record) -> Result<usize> {
+    let LogCursor { tip, term } = cursor;
     let envelope = EnvelopeRef {
         version: VERSION,
         identity: StoreIdentity {
@@ -241,7 +278,7 @@ pub(super) fn frame_size(tip: LogTip, decision: &Record) -> Result<usize> {
             .checked_add(1)
             .ok_or_else(|| invalid_log("sequence exhausted"))?,
         base_sequence: tip.sequence,
-        term: 0,
+        term,
         previous_hash: tip.record_hash,
         decision,
     };
@@ -261,14 +298,38 @@ pub(super) fn unavailable(message: impl Into<String>) -> Error {
 pub(super) fn full(message: impl Into<String>) -> Error {
     Error::coded(afs_error::IO_CAPACITY, message)
 }
+/// A writer holding term `found` was superseded by term `current`.
+pub(super) fn fenced(found: u64, current: u64) -> Error {
+    Error::coded(
+        afs_error::META_LOG_FENCED,
+        format!(
+            "Meta operation log writer fenced: found term {found}, current term {current}; a newer writer owns the log and nothing was written"
+        ),
+    )
+}
+/// Recovery check for one frame's term against the chain and current term.
+pub(super) fn chain_term(previous: u64, found: u64, current: u64) -> Result<u64> {
+    if found < previous {
+        return Err(invalid_log(format!(
+            "record term {found} decreases below previous term {previous}"
+        )));
+    }
+    if found > current {
+        return Err(invalid_log(format!(
+            "record term {found} exceeds current term {current}"
+        )));
+    }
+    Ok(found)
+}
 
 pub(super) fn encode_frame(
     identity: StoreIdentity,
-    tip: LogTip,
+    cursor: LogCursor,
     decision: Record,
     limit: usize,
 ) -> Result<(Vec<u8>, LogTip)> {
     decision.validate()?;
+    let LogCursor { tip, term } = cursor;
     let sequence = tip
         .sequence
         .checked_add(1)
@@ -278,7 +339,7 @@ pub(super) fn encode_frame(
         identity,
         sequence,
         base_sequence: tip.sequence,
-        term: 0,
+        term,
         previous_hash: tip.record_hash,
         decision,
     };
@@ -326,12 +387,14 @@ pub(super) fn frame_length(header: &[u8], limit: usize) -> Result<usize> {
     }
     Ok(length)
 }
+/// Decode one frame after `tip`; returns the record, its tip and its term.
+/// Term ordering is the caller's chain check (`chain_term`).
 pub(super) fn decode_frame(
     identity: StoreIdentity,
     tip: LogTip,
     frame: &[u8],
     limit: usize,
-) -> Result<(Record, LogTip)> {
+) -> Result<(Record, LogTip, u64)> {
     if frame.len() != frame_length(frame, limit)? {
         return Err(invalid_log("incomplete/trailing frame"));
     }
@@ -357,7 +420,6 @@ pub(super) fn decode_frame(
     if !tail.is_empty()
         || envelope.version != VERSION
         || envelope.identity != identity
-        || envelope.term != 0
         || envelope.base_sequence != tip.sequence
         || tip.sequence.checked_add(1) != Some(envelope.sequence)
         || envelope.previous_hash != tip.record_hash
@@ -373,11 +435,12 @@ pub(super) fn decode_frame(
             sequence: envelope.sequence,
             record_hash: hash,
         },
+        envelope.term,
     ))
 }
 pub(super) fn encode_batch(
     identity: StoreIdentity,
-    tip: LogTip,
+    cursor: LogCursor,
     records: Vec<Record>,
     limits: AppendLimits,
 ) -> Result<(Vec<Vec<u8>>, LogTip, usize)> {
@@ -388,10 +451,15 @@ pub(super) fn encode_batch(
         )));
     }
     let mut frames = Vec::new();
-    let mut tip = tip;
+    let mut tip = cursor.tip;
     let mut total = 0usize;
     for record in records {
-        let (frame, next) = encode_frame(identity, tip, record, limits.record_max_bytes)?;
+        let (frame, next) = encode_frame(
+            identity,
+            tip.at(cursor.term),
+            record,
+            limits.record_max_bytes,
+        )?;
         total = total
             .checked_add(frame.len())
             .filter(|size| *size <= limits.batch_max_bytes)
@@ -405,6 +473,8 @@ pub(super) fn encode_batch(
 pub struct MemoryLog {
     identity: StoreIdentity,
     options: MemoryLogOptions,
+    /// The writer term this handle holds; superseded once `state.term` grows.
+    term: u64,
     state: std::sync::Arc<Mutex<MemoryState>>,
     /// Test-only write-failure injection; absent from production builds.
     #[cfg(test)]
@@ -452,6 +522,8 @@ struct MemoryFault {
     latched: std::sync::atomic::AtomicBool,
 }
 struct MemoryState {
+    /// Current writer term; only the newest handle may operate.
+    term: u64,
     checkpoint: Option<RecoveredCheckpoint>,
     tip: LogTip,
     base: LogTip,
@@ -464,7 +536,9 @@ impl MemoryLog {
         Ok(Self {
             identity: StoreIdentity::new()?,
             options: options.validate()?,
+            term: 1,
             state: std::sync::Arc::new(Mutex::new(MemoryState {
+                term: 1,
                 checkpoint: None,
                 tip: LogTip::EMPTY,
                 base: LogTip::EMPTY,
@@ -485,9 +559,19 @@ impl MemoryLog {
         {
             return Err(unavailable("memory log write failed; reconstruct required"));
         }
-        self.state
+        let state = self
+            .state
             .lock()
-            .map_err(|_| unavailable("memory log poisoned"))
+            .map_err(|_| unavailable("memory log poisoned"))?;
+        if state.term != self.term {
+            return Err(fenced(self.term, state.term));
+        }
+        Ok(state)
+    }
+    /// Test-only: the writer term this handle holds.
+    #[cfg(test)]
+    pub(super) fn term(&self) -> u64 {
+        self.term
     }
     /// Test-only: the next append fails before changing anything, then every
     /// operation on this handle fails, like a latched durable-write failure.
@@ -497,13 +581,19 @@ impl MemoryLog {
             .fail_next_append
             .store(true, std::sync::atomic::Ordering::Release);
     }
-    /// Test-only: a fresh handle over the same volatile records, modelling the
-    /// reconstruction a latched failure requires.
+    /// Test-only: a new writer over the same volatile records with the next
+    /// term, modelling a reopen or takeover. Every older handle is fenced.
     #[cfg(test)]
     pub(super) fn reopen(&self) -> Self {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.term += 1;
         Self {
             identity: self.identity,
             options: self.options,
+            term: state.term,
             state: std::sync::Arc::clone(&self.state),
             fault: MemoryFault::default(),
         }
@@ -538,10 +628,13 @@ impl MetaLog for MemoryLog {
             })
         })
     }
-    fn can_append(&self, expected: LogTip, framed_bytes: usize) -> MetaFuture<'_, bool> {
+    fn can_append(&self, expected: LogCursor, framed_bytes: usize) -> MetaFuture<'_, bool> {
         Box::pin(async move {
             let state = self.lock()?;
-            if expected != state.tip {
+            if expected.term != state.term {
+                return Err(fenced(expected.term, state.term));
+            }
+            if expected.tip != state.tip {
                 return Err(unavailable("memory admission tip changed"));
             }
             Ok(state
@@ -556,9 +649,11 @@ impl MetaLog for MemoryLog {
             let mut tip = state.base;
             let mut records = Vec::new();
             let mut revision = state.base_revision;
+            let mut term = 0;
             for frame in &state.frames {
-                let (record, next) =
+                let (record, next, found) =
                     decode_frame(self.identity, tip, frame, self.options.record_max_bytes)?;
+                term = chain_term(term, found, state.term)?;
                 if record.revision_before() != revision {
                     return Err(invalid_log("memory replay revision gap"));
                 }
@@ -572,6 +667,7 @@ impl MetaLog for MemoryLog {
             Ok(RecoveredLog {
                 checkpoint: state.checkpoint.clone(),
                 tip,
+                term: state.term,
                 records,
             })
         })
@@ -582,19 +678,30 @@ impl MetaLog for MemoryLog {
             drop(self.lock()?);
             let state = std::sync::Arc::clone(&self.state);
             let identity = self.identity;
+            let term = self.term;
             let record_limit = self.options.record_max_bytes;
             let limits = self.checkpoint_limits();
             tokio::task::spawn_blocking(move || {
-                install_memory_checkpoint(&state, identity, record_limit, limits, covered, bytes)
+                install_memory_checkpoint(
+                    &state,
+                    (identity, term),
+                    record_limit,
+                    limits,
+                    covered,
+                    bytes,
+                )
             })
             .await
             .map_err(|error| unavailable(format!("memory checkpoint task: {error}")))?
         })
     }
-    fn append_and_sync(&self, expected: LogTip, records: Vec<Record>) -> MetaFuture<'_, LogTip> {
+    fn append_and_sync(&self, expected: LogCursor, records: Vec<Record>) -> MetaFuture<'_, LogTip> {
         Box::pin(async move {
             let mut state = self.lock()?;
-            if state.tip != expected {
+            if expected.term != state.term {
+                return Err(fenced(expected.term, state.term));
+            }
+            if state.tip != expected.tip {
                 return Err(unavailable("log compare-and-append tip changed"));
             }
             let (frames, tip, bytes) =
@@ -624,7 +731,7 @@ impl MetaLog for MemoryLog {
 }
 fn install_memory_checkpoint(
     state: &Mutex<MemoryState>,
-    identity: StoreIdentity,
+    (identity, term): (StoreIdentity, u64),
     record_limit: usize,
     limits: CheckpointLimits,
     covered: LogTip,
@@ -635,6 +742,9 @@ fn install_memory_checkpoint(
     let mut state = state
         .lock()
         .map_err(|_| unavailable("memory log poisoned"))?;
+    if state.term != term {
+        return Err(fenced(term, state.term));
+    }
     if covered.sequence > state.tip.sequence || covered.sequence < state.base.sequence {
         return Err(invalid_log("memory checkpoint position invalid"));
     }
@@ -647,7 +757,7 @@ fn install_memory_checkpoint(
     let mut business = state.base_revision;
     let mut released = 0u64;
     for frame in state.frames.iter().take(count) {
-        let (record, next) = decode_frame(identity, anchor, frame, record_limit)?;
+        let (record, next, _) = decode_frame(identity, anchor, frame, record_limit)?;
         if record.revision_before() != business {
             return Err(invalid_log("memory checkpoint revision gap"));
         }
@@ -808,9 +918,14 @@ mod tests {
             let root = dir.join("meta-store");
             let log = LocalLog::open(&root, LocalLogOptions::default()).unwrap();
             let record = test_records(1).pop().unwrap();
-            let (original, _) =
-                encode_frame(log.identity(), LogTip::EMPTY, record.clone(), 1024 * 1024).unwrap();
-            log.append_and_sync(LogTip::EMPTY, vec![record])
+            let (original, _) = encode_frame(
+                log.identity(),
+                LogTip::EMPTY.at(log.term()),
+                record.clone(),
+                1024 * 1024,
+            )
+            .unwrap();
+            log.append_and_sync(LogTip::EMPTY.at(log.term()), vec![record])
                 .await
                 .unwrap();
             drop(log);
@@ -897,7 +1012,10 @@ mod tests {
             let log = LocalLog::open(&root, limits).unwrap();
             let mut tip = LogTip::EMPTY;
             for record in test_records(12) {
-                tip = log.append_and_sync(tip, vec![record]).await.unwrap();
+                tip = log
+                    .append_and_sync(tip.at(log.term()), vec![record])
+                    .await
+                    .unwrap();
             }
             drop(log);
             let mut segments = fs::read_dir(&root)
@@ -925,15 +1043,12 @@ mod tests {
     fn p3_frame_roundtrip_exact_size_and_checks() {
         let identity = StoreIdentity::new().unwrap();
         let record = test_records(1).pop().unwrap();
-        let size = frame_size(LogTip::EMPTY, &record).unwrap();
-        let (frame, tip) = encode_frame(identity, LogTip::EMPTY, record, 1024 * 1024).unwrap();
+        let size = frame_size(LogTip::EMPTY.at(1), &record).unwrap();
+        let (frame, tip) =
+            encode_frame(identity, LogTip::EMPTY.at(1), record, 1024 * 1024).unwrap();
         assert_eq!(frame.len(), size);
-        assert_eq!(
-            decode_frame(identity, LogTip::EMPTY, &frame, size)
-                .unwrap()
-                .1,
-            tip
-        );
+        let decoded = decode_frame(identity, LogTip::EMPTY, &frame, size).unwrap();
+        assert_eq!((decoded.1, decoded.2), (tip, 1));
         for index in [0, 4, 8, frame.len() - 1] {
             let mut broken = frame.clone();
             broken[index] ^= 1;
@@ -977,9 +1092,17 @@ mod tests {
         let first = super::super::state::State::default()
             .replay_record(&records[0])
             .unwrap();
-        let (frame, covered) =
-            encode_frame(log.identity, LogTip::EMPTY, records[0].clone(), 1024 * 1024).unwrap();
-        let tip = log.append_and_sync(LogTip::EMPTY, records).await.unwrap();
+        let (frame, covered) = encode_frame(
+            log.identity,
+            LogTip::EMPTY.at(log.term()),
+            records[0].clone(),
+            1024 * 1024,
+        )
+        .unwrap();
+        let tip = log
+            .append_and_sync(LogTip::EMPTY.at(log.term()), records)
+            .await
+            .unwrap();
         let before = log.state.lock().unwrap().bytes;
         log.install_checkpoint(
             covered,
@@ -1009,7 +1132,7 @@ mod tests {
     async fn p3_memory_log_cas_batch_recovery_and_quota() {
         let log = MemoryLog::new(MemoryLogOptions::default()).unwrap();
         let tip = log
-            .append_and_sync(LogTip::EMPTY, test_records(2))
+            .append_and_sync(LogTip::EMPTY.at(log.term()), test_records(2))
             .await
             .unwrap();
         assert_eq!(tip.sequence, 2);
@@ -1017,11 +1140,15 @@ mod tests {
         assert_eq!(recovered.records.len(), 2);
         assert_eq!(recovered.tip, tip);
         assert!(
-            log.append_and_sync(LogTip::EMPTY, test_records(1))
+            log.append_and_sync(LogTip::EMPTY.at(log.term()), test_records(1))
                 .await
                 .is_err()
         );
-        assert!(log.append_and_sync(tip, Vec::new()).await.is_err());
+        assert!(
+            log.append_and_sync(tip.at(log.term()), Vec::new())
+                .await
+                .is_err()
+        );
         assert_eq!(log.recover().await.unwrap().tip, tip);
         let tiny = MemoryLog::new(MemoryLogOptions {
             record_max_bytes: 256,
@@ -1048,9 +1175,9 @@ mod tests {
             )
             .unwrap();
         let large = Record::from(large.unwrap());
-        assert!(frame_size(LogTip::EMPTY, &large).unwrap() > tiny.limits().record_max_bytes);
+        assert!(frame_size(LogTip::EMPTY.at(1), &large).unwrap() > tiny.limits().record_max_bytes);
         assert!(
-            tiny.append_and_sync(LogTip::EMPTY, vec![large])
+            tiny.append_and_sync(LogTip::EMPTY.at(tiny.term()), vec![large])
                 .await
                 .is_err()
         );
@@ -1064,8 +1191,11 @@ mod tests {
         let mut tip = LogTip::EMPTY;
         let mut exhausted = false;
         for record in test_records(64) {
-            assert!(frame_size(tip, &record).unwrap() <= quota.limits().record_max_bytes);
-            match quota.append_and_sync(tip, vec![record]).await {
+            assert!(frame_size(tip.at(1), &record).unwrap() <= quota.limits().record_max_bytes);
+            match quota
+                .append_and_sync(tip.at(quota.term()), vec![record])
+                .await
+            {
                 Ok(next) => tip = next,
                 Err(error) => {
                     assert!(error.to_string().contains("WAL byte budget"));
@@ -1078,5 +1208,111 @@ mod tests {
         assert!(tip.sequence > 0);
         assert_eq!(quota.recover().await.unwrap().tip, tip);
         assert!(quota.state.lock().unwrap().bytes <= quota.options.wal_max_bytes);
+    }
+
+    /// A record whose framed size grows with `pad`.
+    fn padded_record(pad: usize) -> Record {
+        let (_, _, record) = super::super::state::State::default()
+            .prepare_node_record(
+                super::super::RequestKey::new("term", "padded"),
+                super::super::NodeSessionLease {
+                    node_id: "node".into(),
+                    session_id: "session".into(),
+                    grpc_addr: "g".repeat(pad),
+                    data_addr: "data".into(),
+                    rest_addr: "rest".into(),
+                    ownerfs_enabled: true,
+                    storage_devices: Vec::new(),
+                    lease_ttl: std::time::Duration::from_secs(30),
+                },
+                12345,
+                1024 * 1024,
+            )
+            .unwrap();
+        Record::from(record.unwrap())
+    }
+
+    /// The term is a postcard varint: from 128 it takes more than one byte, so
+    /// the single-record bound must be checked with the real term.
+    #[tokio::test]
+    async fn frame_size_uses_actual_term_from_128() {
+        let identity = StoreIdentity::new().unwrap();
+        let record = padded_record(512);
+        let size = |term| frame_size(LogTip::EMPTY.at(term), &record).unwrap();
+        assert_eq!(size(0), size(127));
+        assert_eq!(size(128), size(127) + 1);
+        assert_eq!(size(u64::MAX), size(0) + 9);
+        for term in [0, 127, 128, 300, u64::MAX] {
+            let (frame, tip) = encode_frame(
+                identity,
+                LogTip::EMPTY.at(term),
+                record.clone(),
+                1024 * 1024,
+            )
+            .unwrap();
+            assert_eq!(frame.len(), size(term), "term {term}");
+            let decoded = decode_frame(identity, LogTip::EMPTY, &frame, 1024 * 1024).unwrap();
+            assert_eq!((decoded.1, decoded.2), (tip, term));
+        }
+        // Exactly at the old (term < 128) size the record no longer fits once
+        // the writer term reaches 128; one byte more admits it.
+        for (limit, accepted) in [(size(127), false), (size(128), true)] {
+            let first = MemoryLog::new(MemoryLogOptions {
+                record_max_bytes: limit,
+                batch_max_bytes: limit,
+                wal_max_bytes: 1024 * 1024,
+            })
+            .unwrap();
+            let mut log = first.reopen();
+            while log.term() < 128 {
+                log = log.reopen();
+            }
+            assert_eq!(log.term(), 128);
+            let result = log
+                .append_and_sync(LogTip::EMPTY.at(128), vec![record.clone()])
+                .await;
+            assert_eq!(result.is_ok(), accepted, "limit {limit}");
+            let recovered = log.recover().await.unwrap();
+            assert_eq!(recovered.tip.sequence, u64::from(accepted));
+            assert_eq!(recovered.term, 128);
+        }
+    }
+
+    /// Recovery rejects a chain whose term decreases or exceeds the current
+    /// term; term 0 (pre-term frames) stays valid below any current term.
+    #[tokio::test]
+    async fn memory_recover_rejects_decreasing_or_future_terms() {
+        let log = MemoryLog::new(MemoryLogOptions::default()).unwrap();
+        let log = log.reopen().reopen();
+        assert_eq!(log.term(), 3);
+        let records = test_records(2);
+        for (terms, rejected) in [
+            ([0, 3], None),
+            ([3, 2], Some("decreases below previous term 3")),
+            ([1, 4], Some("exceeds current term 3")),
+        ] {
+            let mut tip = LogTip::EMPTY;
+            let mut frames = Vec::new();
+            for (record, term) in records.iter().zip(terms) {
+                let (frame, next) =
+                    encode_frame(log.identity, tip.at(term), record.clone(), 1024 * 1024).unwrap();
+                frames.push(frame);
+                tip = next;
+            }
+            {
+                let mut state = log.state.lock().unwrap();
+                state.bytes = frames.iter().map(|frame| frame.len() as u64).sum();
+                state.frames = frames;
+                state.tip = tip;
+            }
+            match (log.recover().await, rejected) {
+                (Ok(recovered), None) => assert_eq!(recovered.tip, tip),
+                (Err(error), Some(marker)) => {
+                    assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+                    assert!(error.to_string().contains(marker), "{error}");
+                }
+                (result, _) => panic!("terms {terms:?}: {:?}", result.map(|r| r.tip)),
+            }
+        }
     }
 }

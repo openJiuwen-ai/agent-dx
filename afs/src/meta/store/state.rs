@@ -168,9 +168,10 @@ fn account_command_result(
 
 #[derive(Clone, Default)]
 pub(super) struct State {
-    /// Runtime recovery anchor paired with this immutable published state.
-    /// It is framed by the backend, not duplicated in the business image.
-    pub(super) log_tip: super::journal::LogTip,
+    /// Runtime recovery anchor (tip and writer term) paired with this
+    /// immutable published state. It is framed by the backend, not duplicated
+    /// in the business image.
+    pub(super) log_cursor: super::journal::LogCursor,
     pub(super) revision: StoreRevision,
     pub(super) entities: SharedMap<MetaKey, VersionedEntity>,
     pub(super) requests: SharedMap<RequestKey, RequestOutcome>,
@@ -1657,7 +1658,7 @@ impl State {
                         return Ok(None);
                     };
                     let frame = super::log::Record::from(record.clone());
-                    if super::journal::frame_size(self.log_tip, &frame)? > byte_limit {
+                    if super::journal::frame_size(self.log_cursor, &frame)? > byte_limit {
                         return Err(super::journal::full(
                             "grant cleanup exceeds framed byte limit",
                         ));
@@ -1817,7 +1818,7 @@ impl State {
                             invalid_contract("new command cleanup unexpectedly replayed")
                         })?;
                         if super::journal::frame_size(
-                            self.log_tip,
+                            self.log_cursor,
                             &super::log::Record::from(record.clone()),
                         )? > byte_limit
                         {
@@ -2747,7 +2748,7 @@ mod grant_lifecycle_gc_tests {
         );
         assert!(
             super::super::journal::frame_size(
-                state.log_tip,
+                state.log_cursor,
                 &super::super::log::Record::from(record)
             )
             .unwrap()

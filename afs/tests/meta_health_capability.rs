@@ -1,5 +1,5 @@
 use afs::meta::store::{
-    journal::{AppendLimits, CheckpointLimits, LogStatus, LogTip, RecoveredLog},
+    journal::{AppendLimits, CheckpointLimits, LogCursor, LogStatus, LogTip, RecoveredLog},
     log::Record,
 };
 use std::sync::{
@@ -70,7 +70,7 @@ impl MetaLog for SwitchableBackend {
     fn status(&self) -> MetaFuture<'_, LogStatus> {
         self.inner.status()
     }
-    fn can_append(&self, expected: LogTip, bytes: usize) -> MetaFuture<'_, bool> {
+    fn can_append(&self, expected: LogCursor, bytes: usize) -> MetaFuture<'_, bool> {
         self.inner.can_append(expected, bytes)
     }
     fn install_checkpoint(&self, _: LogTip, _: Vec<u8>) -> MetaFuture<'_, ()> {
@@ -81,7 +81,7 @@ impl MetaLog for SwitchableBackend {
             ))
         })
     }
-    fn append_and_sync(&self, expected: LogTip, records: Vec<Record>) -> MetaFuture<'_, LogTip> {
+    fn append_and_sync(&self, expected: LogCursor, records: Vec<Record>) -> MetaFuture<'_, LogTip> {
         self.inner.append_and_sync(expected, records)
     }
     fn health(&self) -> MetaFuture<'_, ()> {

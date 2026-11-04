@@ -418,7 +418,10 @@ async fn checkpoint_child(directory: &Path) {
     for number in 1..=12 {
         let record = records.next().unwrap();
         state = state.replay_record(&record).unwrap();
-        tip = log.append_and_sync(tip, vec![record]).await.unwrap();
+        tip = log
+            .append_and_sync(tip.at(log.term()), vec![record])
+            .await
+            .unwrap();
         if number == 4 || number == 8 {
             log.install_checkpoint(
                 tip,
@@ -445,7 +448,7 @@ async fn checkpoint_child(directory: &Path) {
     )
     .unwrap();
     if std::env::var(POINT).unwrap().starts_with("rotation_") {
-        log.append_and_sync(tip, vec![records.next().unwrap()])
+        log.append_and_sync(tip.at(log.term()), vec![records.next().unwrap()])
             .await
             .unwrap();
     } else {
@@ -620,7 +623,7 @@ async fn p3_checkpoint_process_crash_matrix() {
         let record = super::journal::test_records(13).pop().unwrap();
         restored = restored.replay_record(&record).unwrap();
         let tip = log
-            .append_and_sync(witness.tip, vec![record])
+            .append_and_sync(witness.tip.at(log.term()), vec![record])
             .await
             .unwrap();
         log.install_checkpoint(
@@ -697,7 +700,7 @@ async fn p3_repeated_unselected_checkpoint_crashes_remain_recoverable() {
             .unwrap();
         state = state.replay_record(&record).unwrap();
         let tip = log
-            .append_and_sync(recovered.tip, vec![record])
+            .append_and_sync(recovered.tip.at(log.term()), vec![record])
             .await
             .unwrap();
         fs::write(
@@ -782,7 +785,7 @@ async fn p3_repeated_unselected_checkpoint_crashes_remain_recoverable() {
             .unwrap();
         state = state.replay_record(&record).unwrap();
         let tip = log
-            .append_and_sync(witness.tip, vec![record])
+            .append_and_sync(witness.tip.at(log.term()), vec![record])
             .await
             .unwrap();
         log.install_checkpoint(
@@ -813,4 +816,75 @@ async fn p3_repeated_unselected_checkpoint_crashes_remain_recoverable() {
         "only selected current/previous images may remain"
     );
     fs::remove_dir_all(directory).unwrap();
+}
+
+/// A writer open selects its term in CURRENT before returning. Killed before
+/// or after that CURRENT write, the next open recovers every acknowledged
+/// record and selects a term above every term ever made durable.
+#[tokio::test(flavor = "current_thread")]
+async fn p3_open_term_process_crash() {
+    const OPEN_TERM_TEST: &str = "meta::store::crash_tests::p3_open_term_process_crash";
+    if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new("1")) {
+        let directory = PathBuf::from(std::env::var_os(DIRECTORY).unwrap());
+        fs::write(directory.join("armed"), b"term-1 writer closed").unwrap();
+        LocalLog::open(directory.join("meta"), LocalLogOptions::default()).unwrap();
+        panic!("open term faultpoint was not reached");
+    }
+    let records = super::journal::test_records(2);
+    for (point, durable_term) in [("open_term_prepared", 1), ("open_term_selected", 2)] {
+        let directory = tempfile::tempdir().unwrap().keep();
+        eprintln!(
+            "P3 open-term crash case={point} evidence={}",
+            directory.display()
+        );
+        let root = directory.join("meta");
+        let log = LocalLog::open(&root, LocalLogOptions::default()).unwrap();
+        assert_eq!(log.term(), 1);
+        let tip = log
+            .append_and_sync(super::journal::LogTip::EMPTY.at(1), records[..1].to_vec())
+            .await
+            .unwrap();
+        drop(log);
+        let output = File::create(directory.join("child.log")).unwrap();
+        let mut child = ChildGuard(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", OPEN_TERM_TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env(POINT, point)
+                .env(DIRECTORY, &directory)
+                .stdout(Stdio::from(output.try_clone().unwrap()))
+                .stderr(Stdio::from(output))
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !directory.join("reached").is_file() {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "open-term child exited before {point}: {}",
+                fs::read_to_string(directory.join("child.log")).unwrap()
+            );
+            assert!(Instant::now() < deadline, "open-term child timeout");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        child.0.kill().unwrap();
+        assert_eq!(child.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+        let log = LocalLog::open(&root, LocalLogOptions::default()).unwrap();
+        let recovered = log.recover().await.unwrap();
+        assert_eq!(recovered.term, durable_term + 1, "{point}");
+        assert_eq!(recovered.tip, tip, "{point}: acknowledged record kept");
+        let next = log
+            .append_and_sync(recovered.cursor(), records[1..].to_vec())
+            .await
+            .unwrap();
+        drop(log);
+        let log = LocalLog::open(&root, LocalLogOptions::default()).unwrap();
+        let again = log.recover().await.unwrap();
+        assert!(again.term > recovered.term, "{point}: term stays monotonic");
+        assert_eq!(again.tip, next);
+        assert_eq!(again.records.len(), 2);
+        drop(log);
+        drop(child);
+        fs::remove_dir_all(directory).unwrap();
+    }
 }
