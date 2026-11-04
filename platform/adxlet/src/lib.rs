@@ -65,6 +65,56 @@ struct RetiredEnvironment {
     expires_at: Instant,
 }
 
+/// Highest Coordinator primary epoch this node process has observed. Commands
+/// whose epoch trails this record come from a deposed primary and are rejected.
+#[derive(Debug, Default)]
+pub(crate) struct CoordinatorEpochFence {
+    max: std::sync::atomic::AtomicU64,
+}
+
+/// Outcome of fencing one node command against the observed primary epochs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EpochFence {
+    /// Command accepted; carries the highest observed epoch after acceptance.
+    Accepted(u64),
+    /// Command epoch trails the recorded maximum: a late command from a
+    /// deposed Coordinator primary.
+    Stale { command: u64, observed: u64 },
+}
+
+impl CoordinatorEpochFence {
+    /// Record an epoch observed in a RegisterNode or InspectNode response.
+    /// Zero is the proto default for an absent field and never lowers the record.
+    pub(crate) fn observe(&self, epoch: u64) {
+        self.max
+            .fetch_max(epoch, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Fence one node command. An absent epoch (zero) cannot fence and is
+    /// accepted without advancing the record; a command epoch equal to or
+    /// above the record is accepted and advances it.
+    pub(crate) fn fence(&self, epoch: u64) -> EpochFence {
+        if epoch == 0 {
+            return EpochFence::Accepted(self.max.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        let observed = self
+            .max
+            .fetch_max(epoch, std::sync::atomic::Ordering::Relaxed);
+        if epoch < observed {
+            EpochFence::Stale {
+                command: epoch,
+                observed,
+            }
+        } else {
+            EpochFence::Accepted(epoch)
+        }
+    }
+
+    pub(crate) fn observed(&self) -> u64 {
+        self.max.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeObservation {
     pub environment_id: String,
@@ -460,6 +510,7 @@ pub struct Adxlet {
     lifecycle_ready: Arc<tokio::sync::RwLock<bool>>,
     authority_reconciling: Arc<std::sync::atomic::AtomicBool>,
     authority_initialized: Arc<std::sync::atomic::AtomicBool>,
+    coordinator_epoch: Arc<CoordinatorEpochFence>,
     retired_environments: Arc<Mutex<BTreeMap<String, RetiredEnvironment>>>,
     services: Arc<Services>,
     environments: Arc<Mutex<EnvironmentDirectory>>,
@@ -473,6 +524,19 @@ impl Adxlet {
             .checkpoint
             .as_ref()
             .map(|c| c.store.storage_alias())
+    }
+    /// Record a Coordinator primary epoch from a RegisterNode or InspectNode
+    /// response (also available to tests and diagnostics).
+    pub fn observe_coordinator_epoch(&self, epoch: u64) {
+        self.coordinator_epoch.observe(epoch);
+    }
+    /// Fence a node command against the observed Coordinator primary epochs.
+    pub(crate) fn fence_coordinator_epoch(&self, epoch: u64) -> EpochFence {
+        self.coordinator_epoch.fence(epoch)
+    }
+    /// Highest Coordinator primary epoch this node has observed (diagnostics, tests).
+    pub fn observed_coordinator_epoch(&self) -> u64 {
+        self.coordinator_epoch.observed()
     }
     pub fn new(
         node_id: String,
@@ -488,6 +552,7 @@ impl Adxlet {
             lifecycle_ready: Arc::new(tokio::sync::RwLock::new(true)),
             authority_reconciling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             authority_initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            coordinator_epoch: Arc::new(CoordinatorEpochFence::default()),
             retired_environments: Arc::default(),
             services: Arc::new(Services {
                 runtime,
@@ -998,5 +1063,66 @@ impl Adxlet {
             }
         }
         error.map_or(Ok(()), Err)
+    }
+}
+
+#[cfg(test)]
+mod coordinator_epoch_fence_tests {
+    use super::*;
+
+    #[test]
+    fn command_below_the_observed_epoch_is_rejected() {
+        let fence = CoordinatorEpochFence::default();
+        fence.observe(5);
+        assert_eq!(
+            fence.fence(4),
+            EpochFence::Stale {
+                command: 4,
+                observed: 5
+            },
+            "a command from an already superseded primary must be rejected"
+        );
+        assert_eq!(
+            fence.observed(),
+            5,
+            "a rejected command must not advance the record"
+        );
+    }
+
+    #[test]
+    fn equal_or_higher_epoch_is_accepted_and_advances_the_record() {
+        let fence = CoordinatorEpochFence::default();
+        fence.observe(3);
+        assert_eq!(fence.fence(3), EpochFence::Accepted(3));
+        assert_eq!(fence.fence(9), EpochFence::Accepted(9));
+        assert_eq!(fence.observed(), 9);
+        assert_eq!(
+            fence.fence(4),
+            EpochFence::Stale {
+                command: 4,
+                observed: 9
+            }
+        );
+    }
+
+    #[test]
+    fn absent_epoch_zero_is_accepted_without_advancing_the_record() {
+        let fence = CoordinatorEpochFence::default();
+        assert_eq!(
+            fence.fence(0),
+            EpochFence::Accepted(0),
+            "an absent field must not reject before any epoch is observed"
+        );
+        fence.observe(7);
+        assert_eq!(
+            fence.fence(0),
+            EpochFence::Accepted(7),
+            "an absent field must not reject an observed node"
+        );
+        assert_eq!(
+            fence.observed(),
+            7,
+            "an absent epoch must neither raise nor lower the record"
+        );
     }
 }

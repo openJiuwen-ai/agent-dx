@@ -2,7 +2,7 @@
 use adx_transport::rpc::{authenticated_channel, RpcChannel};
 mod local_create;
 mod volumes;
-use crate::{Adxlet, Durability, RetiredDeleteFence, StateSink};
+use crate::{Adxlet, Durability, EpochFence, RetiredDeleteFence, StateSink};
 use adx_core::{EnvironmentRecord, Error, Result};
 use adx_protocol::{
     auth::{tenant, Peers, Principal},
@@ -29,6 +29,17 @@ pub struct NodeRpc {
     >,
 }
 impl NodeRpc {
+    /// Reject commands from a Coordinator primary this node has already seen
+    /// superseded by a higher epoch (late command from a deposed primary).
+    fn fence_coordinator_epoch(&self, epoch: u64) -> std::result::Result<(), Status> {
+        match self.manager.fence_coordinator_epoch(epoch) {
+            EpochFence::Accepted(_) => Ok(()),
+            EpochFence::Stale { command, observed } => Err(Status::failed_precondition(format!(
+                "coordinator epoch {command} trails observed epoch {observed}: \
+                 rejecting a late command from a deposed primary"
+            ))),
+        }
+    }
     #[allow(clippy::result_large_err)] // tonic transport status is shared by all RPC adapters.
     fn owned_handle(
         &self,
@@ -159,6 +170,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
         if self.session_id.is_empty() || request.node_session_id != self.session_id {
             return Err(Status::failed_precondition("node process session changed"));
         }
+        self.fence_coordinator_epoch(request.coordinator_epoch)?;
         let handle = self.owned_handle(request.assignment, request.caller.as_ref())?;
         Ok(Response::new(
             handle.run_control().await.map_err(status)?.into(),
@@ -186,6 +198,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
             if self.session_id.is_empty() || request.node_session_id != self.session_id {
                 return Err(Status::failed_precondition("node process session changed"));
             }
+            self.fence_coordinator_epoch(request.coordinator_epoch)?;
             let handle = match self.owned_handle(request.assignment, request.caller.as_ref()) {
                 Ok(handle) => handle,
                 Err(error) if error.code() == tonic::Code::NotFound => continue,
@@ -216,6 +229,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
         if self.session_id.is_empty() || request.node_session_id != self.session_id {
             return Err(Status::failed_precondition("node process session changed"));
         }
+        self.fence_coordinator_epoch(request.coordinator_epoch)?;
         let handle = self.owned_handle(request.assignment, request.caller.as_ref())?;
         Ok(Response::new(
             handle
@@ -237,6 +251,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
         if r.node_session_id != self.session_id || self.session_id.is_empty() {
             return Err(Status::failed_precondition("node process session changed"));
         }
+        self.fence_coordinator_epoch(r.coordinator_epoch)?;
         let assignment: adx_core::Assignment = r
             .assignment
             .ok_or_else(|| Status::invalid_argument("assignment required"))?
@@ -343,6 +358,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
                 if r.node_session_id != self.session_id || self.session_id.is_empty() {
                     return Err(Status::failed_precondition("node process session changed"));
                 }
+                self.fence_coordinator_epoch(r.coordinator_epoch)?;
                 let record = r
                     .record
                     .ok_or_else(|| Status::invalid_argument("recovery record required"))?
@@ -400,6 +416,9 @@ impl pb::node_service_server::NodeService for NodeRpc {
                 {
                     return Err(Status::failed_precondition("node process session changed"));
                 }
+                if principal == Principal::Coordinator {
+                    self.fence_coordinator_epoch(r.coordinator_epoch)?;
+                }
                 let handle = self.owned_handle(r.assignment, r.caller.as_ref())?;
                 let saved = handle
                     .snapshot(crate::checkpoint::SnapshotRequest {
@@ -438,6 +457,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
                 if self.session_id.is_empty() || r.node_session_id != self.session_id {
                     return Err(Status::failed_precondition("node process session changed"));
                 }
+                self.fence_coordinator_epoch(r.coordinator_epoch)?;
                 let snapshot = r
                     .snapshot
                     .ok_or_else(|| Status::invalid_argument("snapshot required"))?
@@ -473,6 +493,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
                 if self.session_id.is_empty() || request.node_session_id != self.session_id {
                     return Err(Status::failed_precondition("node process session changed"));
                 }
+                self.fence_coordinator_epoch(request.coordinator_epoch)?;
                 let cleanup: adx_core::CheckpointCleanup = request
                     .cleanup
                     .ok_or_else(|| Status::invalid_argument("checkpoint cleanup required"))?
@@ -513,6 +534,7 @@ impl pb::node_service_server::NodeService for NodeRpc {
                 if self.session_id.is_empty() || r.node_session_id != self.session_id {
                     return Err(Status::failed_precondition("node process session changed"));
                 }
+                self.fence_coordinator_epoch(r.coordinator_epoch)?;
                 let deadline = if r.create_deadline_unix_millis == 0 {
                     None
                 } else {
@@ -726,6 +748,9 @@ impl pb::node_service_server::NodeService for NodeRpc {
                     && (self.session_id.is_empty() || r.node_session_id != self.session_id)
                 {
                     return Err(Status::failed_precondition("node session changed"));
+                }
+                if principal == Principal::Coordinator {
+                    self.fence_coordinator_epoch(r.coordinator_epoch)?;
                 }
                 let assignment: adx_core::Assignment = r
                     .assignment

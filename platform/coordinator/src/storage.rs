@@ -935,6 +935,14 @@ impl RedisStore {
         );
         Ok(applied == 1)
     }
+    /// Read the full control state without taking an epoch: the standby's
+    /// read-only view. Validates the hash like `begin` would, but never
+    /// writes — the header, and with it the fencing epoch, is untouched.
+    /// An empty hash (no primary has ever run) reports missing metadata.
+    pub async fn read_snapshot(&self) -> Result<StoredSnapshot> {
+        snapshot(&self.raw().await?)
+    }
+
     /// Called once per Coordinator startup, never on a Redis reconnect. A new epoch
     /// rejects old Coordinator writes; this is fencing, not leader election or HA.
     pub async fn begin(&self, shards: usize) -> Result<Session> {

@@ -49,7 +49,14 @@ pub async fn pause_lifecycle_reporting(
     drain_reporting(manager.pause_lifecycle(), async {
         loop {
             heartbeat.tick().await;
-            if let Err(error) = report(coordinator, registration, timeout, handshake_required).await
+            if let Err(error) = report(
+                manager,
+                coordinator,
+                registration,
+                timeout,
+                handshake_required,
+            )
+            .await
             {
                 // A report failure cannot abandon the drain or reopen lifecycle.
                 adx_observability::warn!(%error, "node report unavailable while lifecycle drains");
@@ -77,6 +84,7 @@ pub async fn unregister_node(
 }
 
 async fn report(
+    manager: &Adxlet,
     coordinator: &mut Coordinator,
     registration: &mut pb::RegisterNodeRequest,
     timeout: Duration,
@@ -88,19 +96,21 @@ async fn report(
         .ok_or_else(|| Status::internal("heartbeat sequence exhausted"))?;
     let mut request = Request::new(registration.clone());
     request.set_timeout(timeout);
-    let result = bounded_rpc(timeout, coordinator.register_node(request))
-        .await
-        .map(|_| ());
-    if result
-        .as_ref()
-        .is_err_and(|error| error.code() == tonic::Code::FailedPrecondition)
-    {
-        *handshake_required = true;
-    }
-    result
+    let response = match bounded_rpc(timeout, coordinator.register_node(request)).await {
+        Ok(response) => response.into_inner(),
+        Err(error) => {
+            if error.code() == tonic::Code::FailedPrecondition {
+                *handshake_required = true;
+            }
+            return Err(error);
+        }
+    };
+    manager.observe_coordinator_epoch(response.coordinator_epoch);
+    Ok(())
 }
 
 async fn inspect(
+    manager: &Adxlet,
     coordinator: &mut Coordinator,
     registration: &pb::RegisterNodeRequest,
     timeout: Duration,
@@ -110,9 +120,11 @@ async fn inspect(
         session_id: registration.session_id.clone(),
     });
     request.set_timeout(timeout);
-    Ok(bounded_rpc(timeout, coordinator.inspect_node(request))
+    let catalog = bounded_rpc(timeout, coordinator.inspect_node(request))
         .await?
-        .into_inner())
+        .into_inner();
+    manager.observe_coordinator_epoch(catalog.coordinator_epoch);
+    Ok(catalog)
 }
 
 /// Compare a complete current catalog without closing healthy live admission.
@@ -162,13 +174,13 @@ pub async fn reconcile_node(
         .await?;
     }
     let result = async {
-        report(coordinator, registration, timeout, &mut handshake_required).await?;
+        report(manager, coordinator, registration, timeout, &mut handshake_required).await?;
         let basis = if periodic {
             Some(manager.comparison_basis(report_interval).await)
         } else {
             None
         };
-        let mut catalog = inspect(coordinator, registration, timeout).await?;
+        let mut catalog = inspect(manager, coordinator, registration, timeout).await?;
         catalog_received = true;
         if let Some(journal) = journal.filter(|_| !periodic) {
             let records = catalog
@@ -181,7 +193,7 @@ pub async fn reconcile_node(
             journal.recover(&records).await.map_err(status)?;
             // Replay may change execution/checkpoint ownership. Recover both
             // from the same fresh complete Coordinator snapshot.
-            catalog = inspect(coordinator, registration, timeout).await?;
+            catalog = inspect(manager, coordinator, registration, timeout).await?;
         }
         let records = catalog
             .records
@@ -239,7 +251,7 @@ pub async fn reconcile_node(
                         registration.accepting_allocations = manager.accepting_allocations()
                             && !manager.is_draining();
                     }
-                    report(coordinator, registration, timeout, &mut handshake_required).await?;
+                    report(manager, coordinator, registration, timeout, &mut handshake_required).await?;
                 },
             }
         }
@@ -251,7 +263,7 @@ pub async fn reconcile_node(
         manager
             .authority_reconciling
             .store(false, Ordering::Release);
-        report(coordinator, registration, timeout, &mut handshake_required).await
+        report(manager, coordinator, registration, timeout, &mut handshake_required).await
     }
     .await;
     if result.is_err() && periodic && !handshake_required {
@@ -261,7 +273,14 @@ pub async fn reconcile_node(
         registration.accepting_allocations =
             manager.accepting_allocations() && !manager.is_draining();
         if catalog_retry {
-            let _ = report(coordinator, registration, timeout, &mut handshake_required).await;
+            let _ = report(
+                manager,
+                coordinator,
+                registration,
+                timeout,
+                &mut handshake_required,
+            )
+            .await;
             if handshake_required {
                 manager.authority_reconciling.store(true, Ordering::Release);
                 registration.reconciling = true;
@@ -277,8 +296,14 @@ pub async fn reconcile_node(
             registration.reconciling = false;
             registration.accepting_allocations =
                 manager.accepting_allocations() && !manager.is_draining();
-            if let Err(error) =
-                report(coordinator, registration, timeout, &mut handshake_required).await
+            if let Err(error) = report(
+                manager,
+                coordinator,
+                registration,
+                timeout,
+                &mut handshake_required,
+            )
+            .await
             {
                 manager.authority_reconciling.store(true, Ordering::Release);
                 pause_lifecycle_reporting(

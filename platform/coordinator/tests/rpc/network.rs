@@ -386,6 +386,7 @@ async fn create_retries_ready_delivery_and_lost_response_within_original_deadlin
             caller: caller(),
             node_session_id: String::new(),
             failed_revision: None,
+            coordinator_epoch: 0,
         })
         .await
         .unwrap();

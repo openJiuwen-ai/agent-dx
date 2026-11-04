@@ -25,6 +25,7 @@ pub struct Authority {
     pub stall_report: Arc<AtomicBool>,
     pub requires_handshake: Arc<AtomicBool>,
     pub block_inspect: Arc<AtomicBool>,
+    pub epoch: Arc<AtomicU64>,
     pub inspect_entered: Arc<tokio::sync::Notify>,
     pub inspect_release: Arc<tokio::sync::Notify>,
 }
@@ -60,7 +61,10 @@ impl pb::coordinator_service_server::CoordinatorService for Authority {
         if rejected {
             return Err(Status::unavailable("ready report rejected"));
         }
-        Ok(Response::new(pb::RegisterNodeResponse::default()))
+        Ok(Response::new(pb::RegisterNodeResponse {
+            coordinator_epoch: self.epoch.load(Ordering::SeqCst),
+            ..Default::default()
+        }))
     }
     async fn inspect_node(
         &self,
@@ -80,6 +84,7 @@ impl pb::coordinator_service_server::CoordinatorService for Authority {
         }
         Ok(Response::new(pb::InspectNodeResponse {
             records: self.records.lock().unwrap().clone(),
+            coordinator_epoch: self.epoch.load(Ordering::SeqCst),
             ..Default::default()
         }))
     }
