@@ -122,6 +122,18 @@ impl Controller {
             return Err(error);
         }
         self.capture_preparation = None;
+        let source_environment_id = self.record.spec.id.clone();
+        let operation_id = request.operation_id.clone();
+        let step_error = |phase: &'static str, error: Error| {
+            adx_observability::warn!(
+                environment_id = %source_environment_id,
+                operation_id = %operation_id,
+                phase,
+                error = %error,
+                "Reusable snapshot step failed"
+            );
+            error
+        };
         let captured = self
             .services
             .runtime
@@ -130,14 +142,14 @@ impl Controller {
                 &staged,
                 Duration::from_secs(request.timeout_seconds),
             )
-            .await;
+            .await
+            .map_err(|error| step_error("runtime-capture", error));
         let captured = match captured {
-            Ok(()) => {
-                services
-                    .cooperation
-                    .resumed(&self.record, &request.operation_id)
-                    .await
-            }
+            Ok(()) => services
+                .cooperation
+                .resumed(&self.record, &request.operation_id)
+                .await
+                .map_err(|error| step_error("runtime-resume-handoff", error)),
             Err(error) => Err(error),
         };
         if let Err(error) = captured {
@@ -161,15 +173,31 @@ impl Controller {
             self.hold_artifact(captured, original);
         }
         self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
-        self.sync().await?;
-        snapshot.artifact = services.store.seal(&staged).await?;
+        self.sync()
+            .await
+            .map_err(|error| step_error("capture-state-commit", error))?;
+        snapshot.artifact = services
+            .store
+            .seal(&staged)
+            .await
+            .map_err(|error| step_error("seal-artifact", error))?;
         // Publication requires a durable temporary hold even when the runtime
         // does not retain capture output. Existing restore inputs move into
         // execution_files and remain protected when this temporary hold drops.
-        let access = services.store.prepare_restore(&snapshot.artifact).await?;
+        let access = services
+            .store
+            .prepare_restore(&snapshot.artifact)
+            .await
+            .map_err(|error| step_error("prepare-artifact-hold", error))?;
         self.hold_artifact(snapshot.artifact.clone(), access);
         self.record.revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
-        if self.sync().await?.durability != Durability::Published {
+        if self
+            .sync()
+            .await
+            .map_err(|error| step_error("artifact-hold-commit", error))?
+            .durability
+            != Durability::Published
+        {
             return Err(Error::Unavailable(
                 "snapshot input reference publication pending".into(),
             ));

@@ -915,11 +915,20 @@ impl CoordinatorStateSink {
         let response = tokio::time::timeout(self.timeout, client.commit_environment(request))
             .await
             .map_err(|_| Error::Unavailable("state commit RPC timed out".into()))?
-            .map_err(|status| match status.code() {
-                tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => {
-                    Error::Invalid("Coordinator rejected node credentials".into())
+            .map_err(|status| {
+                adx_observability::warn!(
+                    environment_id = %record.spec.id,
+                    expected_revision = record.revision,
+                    grpc_code = ?status.code(),
+                    reason = status.message(),
+                    "Coordinator state commit rejected"
+                );
+                match status.code() {
+                    tonic::Code::PermissionDenied | tonic::Code::Unauthenticated => {
+                        Error::Invalid("Coordinator rejected node credentials".into())
+                    }
+                    _ => dependency_status(status),
                 }
-                _ => dependency_status(status),
             })?
             .into_inner();
         let accepted: EnvironmentRecord = response
