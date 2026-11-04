@@ -16,10 +16,19 @@ done
 JOBS=${JOBS:-2}
 PYTHON=${PYTHON:-python3}
 ADX_WITH_AFS=${ADX_WITH_AFS:-0}
+ADX_AFS_WITH_HIXL=${ADX_AFS_WITH_HIXL:-0}
 case "$ADX_WITH_AFS" in
   0|1) ;;
   *) echo 'ADX_WITH_AFS must be 0 or 1' >&2; exit 2 ;;
 esac
+case "$ADX_AFS_WITH_HIXL" in
+  0|1) ;;
+  *) echo 'ADX_AFS_WITH_HIXL must be 0 or 1' >&2; exit 2 ;;
+esac
+if [[ "$ADX_AFS_WITH_HIXL" == "1" && "$ADX_WITH_AFS" != "1" ]]; then
+  echo 'ADX_AFS_WITH_HIXL=1 requires ADX_WITH_AFS=1' >&2
+  exit 2
+fi
 root=$(cd "$(dirname "$0")/../.." && pwd)
 cd "$root"
 host=$(rustc -vV | sed -n 's/^host: //p')
@@ -45,7 +54,11 @@ for name in adx-activator adx-apiserver adx-ingress adx-relay adxctl adx-inspect
 done
 if [[ "$ADX_WITH_AFS" == "1" ]]; then
   echo "--- :file_folder: Compile Agent FS (AFS)"
-  cargo build --locked --release -j "$JOBS" -p afs --bins
+  afs_features=()
+  if [[ "$ADX_AFS_WITH_HIXL" == "1" ]]; then
+    afs_features=(--features hixl)
+  fi
+  cargo build --locked --release -j "$JOBS" -p afs --bins "${afs_features[@]}"
   for name in afs-meta afs-node; do
     cp "$CARGO_TARGET_DIR/release/$name" "$stage/$name"
   done
