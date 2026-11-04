@@ -57,6 +57,10 @@ service DfsChunks {
   rpc NegotiateRdma(DfsNegotiateRdmaRequest) returns (DfsNegotiateRdmaReply);
   rpc CloseRdma(DfsCloseRdmaRequest) returns (DfsCloseRdmaReply);
   rpc ReadRangesRdma(DfsReadRangesRdmaRequest) returns (DfsReadRangesRdmaReply);
+  rpc NegotiateHixl(DfsNegotiateHixlRequest) returns (DfsNegotiateHixlReply);
+  rpc PrepareReadRangesHixlGroup(DfsPrepareReadRangesHixlGroupRequest) returns (DfsPrepareReadRangesHixlGroupReply);
+  rpc ReleaseHixlRead(DfsReleaseHixlReadRequest) returns (DfsReleaseHixlReadReply);
+  rpc CloseHixl(DfsCloseHixlRequest) returns (DfsCloseHixlReply);
 }
 
 message DfsPutReplicaHeader {
@@ -170,6 +174,168 @@ message DfsReadRangesRdmaReply {
   string attempt_id = 2;
   repeated DfsReadRangesCompletion completions = 3;
   uint64 transferred_bytes = 4;
+}
+
+enum DfsHixlTransport {
+  DFS_HIXL_TRANSPORT_UNSPECIFIED = 0;
+  DFS_HIXL_TRANSPORT_ROCE = 1;
+  DFS_HIXL_TRANSPORT_HCCS_BUFFER_POOL = 2;
+}
+
+// HIXL rH2H source-window control messages. The AFS mTLS identity and each
+// operation's DfsReadGrant remain the authority; the HIXL descriptors only
+// describe a window that was prepared after those checks passed.
+message DfsNegotiateHixlRequest {
+  // Absent for a startup pre-warm: the session carries no read authority and
+  // every window prepare still authorizes its own grant. Node epochs stay
+  // mandatory either way.
+  DfsReadRangesRequest read_request = 1;
+  string client_engine_id = 2;
+  uint64 client_engine_generation = 3;
+  uint32 protocol_version = 4;
+  uint64 caller_node_epoch = 5;
+  uint64 source_node_epoch = 6;
+  DfsHixlTransport transport = 7;
+  uint32 buffer_pool_count = 8;
+  uint32 buffer_pool_size_mib = 9;
+  optional uint64 hccs_domain_id = 10;
+  // Ordered source/reader device lanes must have the same cardinality.
+  uint32 lane_count = 11;
+}
+
+message DfsHixlLane {
+  uint32 lane_id = 1;
+  string engine_id = 2;
+  uint64 engine_generation = 3;
+  uint64 window_bytes = 4;
+  uint32 export_slots = 5;
+}
+
+message DfsNegotiateHixlReply {
+  uint64 session_id = 1;
+  string source_node_id = 3;
+  uint64 source_node_epoch = 4;
+  string engine_id = 5;
+  uint64 engine_generation = 6;
+  uint64 window_bytes = 7;
+  uint32 export_slots = 8;
+  uint32 protocol_version = 9;
+  DfsHixlTransport transport = 10;
+  uint32 buffer_pool_count = 11;
+  uint32 buffer_pool_size_mib = 12;
+  optional uint64 hccs_domain_id = 13;
+  repeated DfsHixlLane lanes = 14;
+}
+
+message DfsHixlReadRange {
+  uint32 operation_index = 1;
+  string chunk_id = 2;
+  uint64 chunk_offset = 3;
+  uint64 length = 4;
+  uint64 packed_offset = 5;
+  string source_copy_id = 6;
+  bytes range_checksum = 7;
+  DfsDigestAlgorithm range_checksum_algorithm = 8;
+  // Serialized Meta-bound CRC32C segment table for CRC32C ranges; empty for
+  // BLAKE3 ranges. Bound like the gRPC header descriptor.
+  bytes crc32c_table = 9;
+}
+
+message DfsPrepareReadRangesHixlReply {
+  uint64 session_id = 1;
+  string read_id = 2;
+  string attempt_id = 3;
+  string source_node_id = 4;
+  uint64 source_node_epoch = 5;
+  string engine_id = 6;
+  uint64 engine_generation = 7;
+  uint64 pool_generation = 8;
+  uint64 slot_id = 9;
+  uint64 slot_generation = 10;
+  uint64 address = 11;
+  uint64 capacity = 12;
+  uint64 packed_length = 13;
+  repeated DfsHixlReadRange ranges = 14;
+  repeated DfsReadRangesCompletion completions = 15;
+}
+
+// One ordered native window of a group. All windows in a group share the
+// parent batch snapshot and are exported by a single control round trip.
+message DfsHixlGroupWindow {
+  uint64 batch_offset = 1;
+  uint32 lane_id = 2;
+  DfsReadRangesRequest read_request = 3;
+}
+
+message DfsPrepareReadRangesHixlGroupRequest {
+  uint64 session_id = 1;
+  uint64 caller_node_epoch = 2;
+  uint64 source_node_epoch = 3;
+  DfsReadRangesRequest batch_read_request = 4;
+  repeated DfsHixlGroupWindow windows = 5;
+}
+
+message DfsHixlPreparedGroupWindow {
+  uint64 batch_offset = 1;
+  uint32 lane_id = 2;
+  DfsPrepareReadRangesHixlReply reply = 3;
+}
+
+message DfsPrepareReadRangesHixlGroupReply {
+  uint64 session_id = 1;
+  repeated DfsHixlPreparedGroupWindow windows = 2;
+}
+
+enum DfsHixlReleaseOutcome {
+  DFS_HIXL_RELEASE_OUTCOME_UNSPECIFIED = 0;
+  DFS_HIXL_RELEASE_OUTCOME_COMPLETED = 1;
+  DFS_HIXL_RELEASE_OUTCOME_FAILED = 2;
+  DFS_HIXL_RELEASE_OUTCOME_UNKNOWN = 3;
+  // The authenticated reader proves this window never entered native READ.
+  DFS_HIXL_RELEASE_OUTCOME_NOT_SUBMITTED = 4;
+}
+
+// One prepared native window of a release batch. Every window in a
+// DfsReleaseHixlReadRequest shares the session, read and engine identity.
+message DfsHixlReleaseWindow {
+  string attempt_id = 1;
+  uint64 slot_id = 2;
+  uint64 slot_generation = 3;
+  DfsHixlReleaseOutcome outcome = 4;
+  bool content_validated = 5;
+}
+
+message DfsReleaseHixlReadRequest {
+  uint64 session_id = 1;
+  string read_id = 2;
+  string source_node_id = 3;
+  uint64 source_node_epoch = 4;
+  string engine_id = 5;
+  uint64 engine_generation = 6;
+  uint64 pool_generation = 7;
+  uint64 caller_node_epoch = 8;
+  repeated DfsHixlReleaseWindow windows = 9;
+}
+
+message DfsHixlReleaseWindowResult {
+  bool consumed = 1;
+  bool already_released = 2;
+}
+
+message DfsReleaseHixlReadReply {
+  repeated DfsHixlReleaseWindowResult windows = 1;
+}
+
+message DfsCloseHixlRequest {
+  uint64 session_id = 1;
+  uint64 caller_node_epoch = 2;
+  uint64 source_node_epoch = 3;
+  string engine_id = 4;
+  uint64 engine_generation = 5;
+}
+
+message DfsCloseHixlReply {
+  bool drained = 2;
 }
 
 message DfsPutReplicaReply {
@@ -292,6 +458,11 @@ service OwnerFiles {
   rpc ReleaseDir(OwnerReleaseDirRequest) returns (OwnerReleaseDirReply);
   rpc Symlink(OwnerSymlinkRequest) returns (OwnerSymlinkReply);
   rpc Link(OwnerLinkRequest) returns (OwnerLinkReply);
+  // Optional HIXL read-ahead windows for read-only remote opens.
+  rpc NegotiateHixl(OwnerNegotiateHixlRequest) returns (OwnerNegotiateHixlReply);
+  rpc PrepareReadHixl(OwnerPrepareReadHixlRequest) returns (OwnerPrepareReadHixlReply);
+  rpc ReleaseHixlRead(OwnerReleaseHixlReadRequest) returns (OwnerReleaseHixlReadReply);
+  rpc CloseHixl(OwnerCloseHixlRequest) returns (OwnerCloseHixlReply);
 }
 
 // RootAccess 是一次 OwnerFs 远端访问的防陈旧身份。
@@ -671,6 +842,91 @@ message OwnerReleaseRequest {
 }
 
 message OwnerReleaseReply {}
+
+// OwnerFs HIXL read-ahead windows. The session is only a transport lease that
+// the authenticated peer opened with one valid RootAccess; every prepare
+// carries its own RootAccess and open handle and is authorized like Read.
+// Transport, lane and release types are shared with the DFS HIXL protocol.
+message OwnerNegotiateHixlRequest {
+  RootAccess access = 1;
+  string client_engine_id = 2;
+  uint64 client_engine_generation = 3;
+  uint32 protocol_version = 4;
+  DfsHixlTransport transport = 5;
+  uint32 buffer_pool_count = 6;
+  uint32 buffer_pool_size_mib = 7;
+  optional uint64 hccs_domain_id = 8;
+  uint32 lane_count = 9;
+}
+
+message OwnerNegotiateHixlReply {
+  uint64 session_id = 1;
+  string home_session_id = 2;
+  uint32 protocol_version = 3;
+  DfsHixlTransport transport = 4;
+  uint32 buffer_pool_count = 5;
+  uint32 buffer_pool_size_mib = 6;
+  optional uint64 hccs_domain_id = 7;
+  repeated DfsHixlLane lanes = 8;
+}
+
+// read_id is reader-generated and stays identical across transport retries of
+// one attempt; Home replays the admitted reply for an identical request.
+message OwnerPrepareReadHixlRequest {
+  uint64 session_id = 1;
+  string read_id = 2;
+  RootAccess access = 3;
+  OwnerHandle handle = 4;
+  uint64 offset = 5;
+  uint64 length = 6;
+  uint32 lane_id = 7;
+  // Slot size both engines can READ: the smaller of the reader window and the
+  // Home lane window. Home cuts every slot to at most this many bytes.
+  uint64 slot_bytes = 8;
+}
+
+// One exported Host slot. Slots are contiguous in file order.
+message OwnerHixlSlot {
+  uint64 slot_id = 1;
+  uint64 slot_generation = 2;
+  uint64 address = 3;
+  uint64 length = 4;
+  // BLAKE3 of the exported slot bytes.
+  bytes checksum = 5;
+}
+
+message OwnerPrepareReadHixlReply {
+  uint64 session_id = 1;
+  string read_id = 2;
+  uint32 lane_id = 3;
+  string engine_id = 4;
+  uint64 engine_generation = 5;
+  // Bytes read at prepare time; read < length means EOF was reached.
+  uint64 read = 6;
+  bool eof = 7;
+  repeated OwnerHixlSlot slots = 8;
+}
+
+message OwnerReleaseHixlReadRequest {
+  uint64 session_id = 1;
+  string read_id = 2;
+  uint64 engine_generation = 3;
+  DfsHixlReleaseOutcome outcome = 4;
+  bool content_validated = 5;
+}
+
+message OwnerReleaseHixlReadReply {
+  bool consumed = 1;
+  bool already_released = 2;
+}
+
+message OwnerCloseHixlRequest {
+  uint64 session_id = 1;
+}
+
+message OwnerCloseHixlReply {
+  bool drained = 2;
+}
 
 message OwnerOpendirRequest {
   RootAccess access = 1;
