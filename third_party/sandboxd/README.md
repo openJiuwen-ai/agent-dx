@@ -37,7 +37,7 @@ Both bundles are built from the clean pinned sandboxd revision using
 `build/e2e/build_backend.py`. Updating this dependency requires matching source
 and verified archive pins. To include the backend in the ADX release, build with
 `ADX_WITH_SANDBOXD=1 make platform-release`. This adds the backend to
-`runtime/sandboxd/`, includes gVisor runsc release 20260817.0,
+`runtime/sandboxd/`, includes architecture-pinned AKernel runsc builds,
 and ships the systemd unit and example configuration described
 in the [standalone deployment guide](../../docs/deployment/standalone.md#使用随包的-sandboxd).
 

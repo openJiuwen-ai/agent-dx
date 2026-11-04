@@ -76,7 +76,7 @@ ADX Relay 的目标 CIDR 需要覆盖实际使用的地址池。私有 OCI 镜�
 `/etc/adx/sandboxd/registry_auths.json`。unit 以 root 运行，默认 socket 仅供本机 root
 访问。已运行 sandboxd 的节点应沿用其原有配置和 socket，升级前先按现有流程排空节点。
 自定义 ADX 安装路径时需相应调整 unit 和配置中的二进制路径。sandboxd 就绪后按下文启动
-ADX，使用 `runtime="runc"` 或 `runtime="runsc"` 创建实例。随包 runsc 为 gVisor release 20260817.0。
+ADX，使用 `runtime="runc"` 或 `runtime="runsc"` 创建实例。随包 runsc 采用 AKernel 适配版本，ARM64 为 20260817.0-akernel.2，x86_64 为 20260817.0-akernel.4-3-g87e8441b6db1。
 
 ## 证书与初始密钥
 

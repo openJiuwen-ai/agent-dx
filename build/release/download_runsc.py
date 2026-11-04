@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download the pinned gVisor runsc release for the native Linux target."""
+"""Download a checksum-pinned runsc binary for the native Linux target."""
 
 import argparse
 import hashlib
@@ -8,18 +8,21 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-RELEASE = "20260817.0"
+# Built from the AKernel runsc integration. The arm64 input was taken from
+# akernel-all-in-one:kill-retry-fix-arm64. Its image ID is
+# sha256:5d895f6f34404246e087a9e0323f18ae2d03a26dafe701cc5608559dc3829056.
+# The amd64 input came from cluster-all-in-one@sha256:8d9b2e1278eee889be71ba12100357505f0f9ba6902fe78073dfc1fd8f3224e7.
 ARTIFACTS = {
     "x86_64-unknown-linux-gnu": (
-        "x86_64",
-        "84936438d583ec976800f464e75a83e1515f0890b451b9b4db219c4472b54ca9b"
-        "106a6772ee683f1e64cce2128871d7637b14d800591f8451b8137f6c39fb2ef",
+        "amd64/392a88191ffd4bb44b0d7f4a5527b316fb8b8e0f07ec15847fe62d4eac08a86f",
+        "42a31cd92ebd70d206ee31558978079e67958d8a298be13d2a047853d930fd44"
+        "d5c58f730a91e4a25a11b04b67c2b17a30128e0f7db2f528c32744da6afae7e0",
         62,
     ),
     "aarch64-unknown-linux-gnu": (
-        "aarch64",
-        "6394fd161a4af0dc9a2c29f75c3016d05275a55744f124e12023fa7666a9f161"
-        "c68d6ce3803ad49205c6a7b5bee0ad2ccf48edff340db344fdafec678c788aa4",
+        "arm64/dd611b721ede7f6eb8f543067a5382a66ba48255726b0d2d2bc70493583d56d7",
+        "4e94ee139ec51ece0266b1b767316465a0251337019f0349a3b7a5930e79ff58c"
+        "d5af6d97dd2a9c11f905c06107c2a4ef9cbbb32aeb6906789b6df2417604fa0",
         183,
     ),
 }
@@ -31,7 +34,7 @@ def download(target, output):
         raise ValueError("runsc output already exists")
     with tempfile.TemporaryDirectory(dir=output.parent) as directory:
         staged = Path(directory) / "runsc"
-        url = f"https://storage.googleapis.com/gvisor/releases/release/{RELEASE}/{arch}/runsc"
+        url = f"https://agent-dx.obs.cn-southwest-2.myhuaweicloud.com/adx/release/runsc/{arch}/runsc"
         curl = shutil.which("curl")
         if curl is None:
             raise FileNotFoundError("curl is required to download runsc")
