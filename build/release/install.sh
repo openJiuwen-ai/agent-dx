@@ -65,6 +65,10 @@ releases="$prefix/releases"
 release="$releases/$release_id"
 current="$prefix/current"
 cli="$bin_dir/adxctl"
+sbox="$bin_dir/sbox"
+sbox_target="$current/runtime/sandboxd/sbox"
+with_sandboxd=0
+[[ ! -f "$source_dir/runtime/sandboxd/sbox" ]] || with_sandboxd=1
 if [[ -e $current && ! -L $current ]]; then
   echo "installation path is not an ADX current symlink: $current" >&2
   exit 1
@@ -80,6 +84,13 @@ if [[ -e $cli || -L $cli ]]; then
   fi
 fi
 
+if [[ $with_sandboxd == 1 && ( -e $sbox || -L $sbox ) ]]; then
+  if [[ ! -L $sbox || $(readlink -- "$sbox") != "$sbox_target" ]]; then
+    echo "refusing to replace an unmanaged command: $sbox" >&2
+    exit 1
+  fi
+fi
+
 install -d -m 0755 "$prefix" "$releases"
 install -d -m 0755 "$bin_dir"
 install -d -m 0700 "$prefix/config" "$prefix/config/tls" "$prefix/config/secrets"
@@ -87,12 +98,17 @@ install -d -m 0700 "$prefix/data" "$prefix/run"
 
 stage=$(mktemp -d "$releases/.install.XXXXXX")
 cli_link="$bin_dir/.adxctl.$$"
+sbox_link="$bin_dir/.sbox.$$"
 cleanup() {
   [[ -z ${stage:-} || ! -d $stage ]] || rm -rf -- "$stage"
   [[ -z ${cli_link:-} || ! -L $cli_link ]] || rm -f -- "$cli_link"
+  [[ -z ${sbox_link:-} || ! -L $sbox_link ]] || rm -f -- "$sbox_link"
 }
 trap cleanup EXIT INT TERM
 ln -s "$current/bin/adxctl" "$cli_link"
+if [[ $with_sandboxd == 1 ]]; then
+  ln -s "$sbox_target" "$sbox_link"
+fi
 cp -a "$source_dir"/. "$stage"/
 verify_package "$stage"
 
@@ -115,11 +131,18 @@ if ! mv -Tf -- "$link" "$current"; then
 fi
 mv -Tf -- "$cli_link" "$cli"
 cli_link=
+if [[ $with_sandboxd == 1 ]]; then
+  mv -Tf -- "$sbox_link" "$sbox"
+  sbox_link=
+elif [[ -L $sbox && $(readlink -- "$sbox") == "$sbox_target" ]]; then
+  rm -f -- "$sbox"
+fi
 
 echo "ADX release installed: $release"
 echo "Current release: $current -> releases/$release_id"
 [[ -z $backup ]] || echo "Previous copy retained at $backup"
 echo "Persistent paths: $prefix/config, $prefix/data, $prefix/run"
 echo "Command installed: $cli -> $current/bin/adxctl"
+[[ $with_sandboxd == 0 ]] || echo "Command installed: $sbox -> $sbox_target"
 echo "Next: adxctl config init --profile standalone"
 echo "Then edit $prefix/config/deployment.yaml and run: adxctl validate"

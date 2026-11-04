@@ -67,7 +67,7 @@ sudoedit /etc/adx/sandboxd/sandboxd.toml
 sudo install -m 0644 /opt/adx/current/etc/examples/sandboxd/sandboxd.service /etc/systemd/system/sandboxd.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now sandboxd.service
-sudo /opt/adx/current/runtime/sandboxd/sbox -a /run/sandboxd/sandboxd.sock list
+sudo sbox list
 ```
 
 在启动前为各节点分配不重叠的 IP 地址池，避开主机路由及其他运行时使用的网段。
