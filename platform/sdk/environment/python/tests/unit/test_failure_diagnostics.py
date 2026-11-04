@@ -1,6 +1,6 @@
 """Transport failures must not masquerade as unsupported runtime capabilities."""
 
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import httpx
 import pytest
@@ -9,7 +9,7 @@ from adx_environment import ConnectionConfig
 from adx_environment import _transport
 from adx_environment._transport import (
     EnvironmentClient,
-    EnvironmentError,
+    EnvironmentError as SDKEnvironmentError,
     EnvironmentHTTPError,
 )
 from adx_environment.commands import Commands, UnsupportedFeature
@@ -28,7 +28,7 @@ from adx_environment.commands import Commands, UnsupportedFeature
             outcome="unknown",
         ),
         httpx.ConnectTimeout("capability transport timeout"),
-        EnvironmentError("environment OOM", code="ENVIRONMENT_OOM", outcome="terminal"),
+        SDKEnvironmentError("environment OOM", code="ENVIRONMENT_OOM", outcome="terminal"),
         EnvironmentHTTPError(403, {}, "permission denied", code="PERMISSION_DENIED"),
     ],
 )
@@ -36,31 +36,34 @@ def test_capability_transport_error_keeps_original_type_and_metadata(error):
     client = Mock(spec=EnvironmentClient)
     client.invoke.side_effect = error
     commands = Commands(client, "environment-a")
-    with pytest.raises(type(error)) as raised:
-        commands._require_recovery_capability()
-    assert raised.value is error
-    assert not commands._capabilities_checked
-    client.invoke.assert_called_once_with("environment-a", "process.capabilities", {})
+    for _ in range(2):
+        with pytest.raises(type(error)) as raised:
+            commands.get("command-a")
+        assert raised.value is error
+    assert client.invoke.call_args_list == [
+        call("environment-a", "process.capabilities", {}),
+        call("environment-a", "process.capabilities", {}),
+    ]
 
 
 def test_capability_missing_in_confirmed_response_remains_unsupported():
     client = Mock(spec=EnvironmentClient)
     client.invoke.return_value = {"protocol_version": 1, "capabilities": []}
     with pytest.raises(UnsupportedFeature):
-        Commands(client, "environment-a")._require_recovery_capability()
+        Commands(client, "environment-a").get("command-a")
 
 
 @pytest.fixture(name="make_client")
-def client_factory():
+def client_factory(monkeypatch):
     clients = []
 
     def factory(handler):
+        http_client = httpx.Client(transport=httpx.MockTransport(handler))
+        monkeypatch.setattr(_transport, "acquire_shared_http_client", Mock(return_value=http_client))
         client = EnvironmentClient(
             connection=ConnectionConfig(server_address="frontend:8889", token="test-token")
         )
         clients.append(client)
-        client._http.close()
-        client._http = httpx.Client(transport=httpx.MockTransport(handler))
         return client
 
     yield factory
@@ -68,11 +71,25 @@ def client_factory():
         client.close()
 
 
-def test_retryable_http_wrapper_keeps_first_error():
+def test_retryable_http_attempt_keeps_first_error(monkeypatch, make_client):
+    monkeypatch.setattr(_transport.time, "sleep", lambda _: None)
     first = httpx.ReadTimeout("first failed attempt")
-    original = EnvironmentHTTPError(503, {}, "later failure", first_error=first)
-    wrapped = _transport._RetryableHTTPStatus(original)
-    assert wrapped.first_error is first
+    attempts = []
+
+    def handler(request):
+        attempts.append(request)
+        if len(attempts) == 1:
+            raise first
+        return service_error(503, "later failure", request)
+
+    with pytest.raises(EnvironmentHTTPError) as raised:
+        make_client(handler).create_info({"name": "environment-a"})
+    error = raised.value
+    assert error.first_error is first
+    assert error.status_code == 503
+    assert error.retry == "same_operation" and error.outcome == "unknown"
+    assert len(attempts) == 3
+    assert {request.headers["x-request-id"] for request in attempts} == {error.request_id}
 
 
 def service_error(status, message, request, *, terminal=False):
@@ -179,8 +196,8 @@ def test_capability_invoke_retries_keep_first_gateway_error(monkeypatch, termina
         )
 
     client = make_client(handler)
-    with pytest.raises(EnvironmentError) as raised:
-        Commands(client, "environment-a")._require_recovery_capability()
+    with pytest.raises(SDKEnvironmentError) as raised:
+        Commands(client, "environment-a").get("command-a")
     error = raised.value
     assert not isinstance(error, UnsupportedFeature)
     assert error.first_error.status_code == 504

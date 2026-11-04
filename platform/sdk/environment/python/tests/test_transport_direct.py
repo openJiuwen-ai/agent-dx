@@ -1119,6 +1119,7 @@ def test_direct_invalid_json_retries_with_same_request_id():
 
 def _transport_failure_stays_on_direct(failure_type):
     calls = []
+    healthy = False
 
     def handler(request):
         if request.url.path == "/api/instances":
@@ -1127,6 +1128,8 @@ def _transport_failure_stays_on_direct(failure_type):
             raise AssertionError("unsupported control-plane fallback")
         body = json.loads(request.content)
         calls.append((request.headers.get("x-adx-request-id"), body["requestId"]))
+        if healthy:
+            return httpx.Response(200, json={"exists": True})
         raise failure_type("fixture route unavailable", request=request)
 
     c = _make_client(handler)
@@ -1141,7 +1144,11 @@ def _transport_failure_stays_on_direct(failure_type):
             raise AssertionError("unavailable direct operation was accepted")
     _check(len(calls) == 3, f"retry count: {calls}")
     _check(len({x for row in calls for x in row}) == 1, f"operation identity changed: {calls}")
-    _check(c._direct_disabled is False, "transient failure disabled future direct calls")
+    healthy = True
+    _check(c.invoke("environment-demo", "file.exists", {"path": "/"}) == {"exists": True}, "direct did not recover")
+    _check(len(calls) == 4, "next operation did not use direct")
+    _check(calls[-1][0] == calls[-1][1] != calls[0][0], "next operation reused retry identity")
+    c.close()
 
 
 def test_direct_connect_error_stays_on_direct():
@@ -1175,7 +1182,6 @@ def test_direct_missing_route_does_not_select_control_plane():
                 _check(error.code == "ENVIRONMENT_OOM", str(error))
             else:
                 raise AssertionError("OOM was not reported")
-            _check(not c._direct_disabled, "missing routes disabled direct")
     _check(calls.count("/direct/environment-demo/invoke") == 15, str(calls))
 
 
@@ -1223,7 +1229,6 @@ def test_direct_success_after_transient_missing_routes():
             _check(result == {"via": "direct"}, "did not recover direct route")
     _check(len(set(calls[:3])) == len(set(calls[3:])) == 1, "retry identities changed")
     _check(calls[0] != calls[3], "independent operations reused identity")
-    _check(not c._direct_disabled, "transient route misses disabled direct")
 
 
 def test_direct_binary_upload_success():

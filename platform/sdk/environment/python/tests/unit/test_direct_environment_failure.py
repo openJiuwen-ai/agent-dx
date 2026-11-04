@@ -1,6 +1,7 @@
 """Failed data routes must not become unsupported control-plane operations."""
 
 import json
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -8,17 +9,16 @@ import pytest
 from adx_environment import _transport
 from adx_environment._transport import (
     EnvironmentClient,
-    EnvironmentError,
+    EnvironmentError as SDKEnvironmentError,
     EnvironmentHTTPError,
 )
 
 
 def client_for(monkeypatch, handler):
     monkeypatch.setattr(_transport.time, "sleep", lambda _: None)
-    client = EnvironmentClient(server="route.invalid:443", token="fixture-token")
-    client._http.close()
-    client._http = httpx.Client(transport=httpx.MockTransport(handler))
-    return client
+    http_client = httpx.Client(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(_transport, "acquire_shared_http_client", Mock(return_value=http_client))
+    return EnvironmentClient(server="route.invalid:443", token="fixture-token")
 
 
 @pytest.mark.parametrize("fault", ["missing-route", "connect"])
@@ -48,7 +48,7 @@ def test_failed_environment_retains_cause_without_control_replay(
 
     client = client_for(monkeypatch, handler)
     try:
-        with pytest.raises(EnvironmentError) as raised:
+        with pytest.raises(SDKEnvironmentError) as raised:
             client.invoke("owned", "file.make_dir", {"path": "/tmp/evidence"})
         error = raised.value
         assert error.code == expected_code
@@ -62,7 +62,7 @@ def test_failed_environment_retains_cause_without_control_replay(
             error.request_id
         }
         assert {r.headers["X-ADX-Request-ID"] for r in direct} == {error.request_id}
-        assert not client._direct_disabled
+        assert all(request.url.path == "/direct/owned/invoke" for request in direct)
     finally:
         client.close()
 
@@ -96,7 +96,7 @@ def test_terminal_route_after_unknown_attempt_preserves_logical_outcome(
 
     client = client_for(monkeypatch, handler)
     try:
-        with pytest.raises(EnvironmentError) as raised:
+        with pytest.raises(SDKEnvironmentError) as raised:
             client.invoke("owned", "process.start", {"cmd": "fixture"})
         error = raised.value
         assert error.first_error is first
@@ -158,7 +158,7 @@ def test_transient_missing_route_does_not_disable_later_invokes(monkeypatch):
 
     client = client_for(monkeypatch, handler)
     try:
-        with pytest.raises(EnvironmentError) as raised:
+        with pytest.raises(SDKEnvironmentError) as raised:
             client.invoke("owned", "file.make_dir", {"path": "/tmp/evidence"})
         assert raised.value.code == "ENVIRONMENT_UNAVAILABLE"
         assert raised.value.outcome == "not_started"
@@ -185,7 +185,7 @@ def test_catalog_outage_preserves_unknown_execution_and_first_failure(monkeypatc
 
     client = client_for(monkeypatch, handler)
     try:
-        with pytest.raises(EnvironmentError) as raised:
+        with pytest.raises(SDKEnvironmentError) as raised:
             client.invoke("owned", "process.start", {"cmd": "irreversible-tool"})
         assert raised.value.code == "OUTCOME_UNKNOWN"
         assert raised.value.outcome == "unknown"
@@ -268,7 +268,7 @@ def test_terminal_gateway_unavailable_keeps_committed_backend_cause(
 
     client = client_for(monkeypatch, handler)
     try:
-        with pytest.raises(EnvironmentError) as raised:
+        with pytest.raises(SDKEnvironmentError) as raised:
             client.invoke("owned", "process.get", {"command_id": "owned-command"})
         error = raised.value
         assert error.code == code
