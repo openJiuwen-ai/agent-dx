@@ -1,6 +1,6 @@
 //! Harness HTTP access. The header deadline never bounds the subsequent response stream.
 use crate::{Configuration, Error, Result, TemplateScope};
-use adx_agent_core::target::Target;
+use adx_agent_core::target::{decode_binding_id, encode_binding_id, Target, BINDING_ID_HEADER};
 use clap::Args;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use std::{path::PathBuf, str::FromStr};
@@ -31,16 +31,9 @@ pub struct HttpArgs {
 impl HttpArgs {
     /// Builds a Gateway URL; rejects paths or query selectors that can escape this route.
     pub fn url(&self, endpoint: &Url) -> Result<Url> {
-        let target = match &self.binding_id {
-            Some(id) => Target::Binding {
-                name: self.scope.template.clone(),
-                template_ref: self.scope.version.parse().map_err(Error::Invalid)?,
-                id: id.clone(),
-            },
-            None => Target::Template {
-                name: self.scope.template.clone(),
-                template_ref: self.scope.version.parse().map_err(Error::Invalid)?,
-            },
+        let target = Target::Template {
+            name: self.scope.template.clone(),
+            template_ref: self.scope.version.parse().map_err(Error::Invalid)?,
         };
         target
             .to_string()
@@ -90,6 +83,7 @@ impl HttpArgs {
                 key.as_str(),
                 "authorization"
                     | "x-auth"
+                    | BINDING_ID_HEADER
                     | "host"
                     | "content-length"
                     | "transfer-encoding"
@@ -103,6 +97,13 @@ impl HttpArgs {
                 key,
                 HeaderValue::from_str(value.trim())
                     .map_err(|_| Error::Invalid("无效 HTTP header 值".into()))?,
+            );
+        }
+        if let Some(id) = &self.binding_id {
+            headers.insert(
+                BINDING_ID_HEADER,
+                HeaderValue::from_str(&encode_binding_id(id).map_err(Error::Invalid)?)
+                    .map_err(|_| Error::Invalid("无效 Binding ID header".into()))?,
             );
         }
         Ok(headers)
@@ -155,18 +156,12 @@ pub async fn execute(
             }
         })?;
     let status = response.status();
-    for (header, label) in [
-        ("x-adx-binding-id", "AgentBinding"),
-        ("x-adx-binding-urn", "Target"),
-    ] {
-        if let Some(value) = response.headers().get(header).and_then(|v| v.to_str().ok()) {
-            if value.chars().any(char::is_control) {
-                return Err(Error::Unavailable);
-            }
-            output
-                .write_all(format!("{label}: {value}\n").as_bytes())
-                .await?;
-        }
+    if let Some(value) = response.headers().get(BINDING_ID_HEADER) {
+        let id = decode_binding_id(value.to_str().map_err(|_| Error::Unavailable)?)
+            .map_err(|_| Error::Unavailable)?;
+        output
+            .write_all(format!("AgentBinding: {id}\n").as_bytes())
+            .await?;
     }
     output.flush().await?;
     while let Some(chunk) = response.chunk().await.map_err(|_| Error::OutcomeUnknown)? {

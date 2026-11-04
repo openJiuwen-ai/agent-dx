@@ -10,5 +10,12 @@
     "template_ref": "production",
     "backend_path": "/ws",
     "service_port": 18092
+  },
+  "digitalmate": {
+    "template": "digitalmate",
+    "template_ref": "production",
+    "backend_path": "/digitalmate/ws",
+    "service_port": 18092,
+    "request_timeout_seconds": 180
   }
 }

@@ -36,9 +36,9 @@ adx http --template assistant --version 1 --binding-id demo --port 8080 \
 adx http --template assistant --version 1 --binding-id demo --path /health
 ```
 
-CLI 使用 `/agent/http` 和管理命令相同的租户 API Key。`--path` 为 Harness 路径，可带业务 query；不能覆盖 target、instance、port 或认证 query。`--header` 可重复，凭据、Host 和传输控制 Header 由 CLI 管理；`--data` 与 `--data-file` 二选一。文件及 stdin 请求体流式读取，HTTP/SSE 响应逐块写入 stdout。
+CLI 使用 `/agent/http` 和管理命令相同的租户 API Key。target 始终为 template URN；`--binding-id` 经百分号编码后写入 `X-ADX-Binding-Id`，省略时由服务端生成 ID。`--path` 为 Harness 路径，可带业务 query；不能覆盖 target、instance、port 或认证 query。`--header` 可重复，凭据、`X-ADX-Binding-Id`、Host 和传输控制 Header 由 CLI 管理，不能通过 `--header` 覆盖；`--data` 与 `--data-file` 二选一。文件及 stdin 请求体流式读取，HTTP/SSE 响应逐块写入 stdout。
 
-服务端返回 AgentBinding ID/URN 时，CLI 先在 stdout 打印 `AgentBinding: ...` 与 `Target: ...`，随后输出原始响应体。两行通知也可能出现在失败响应前，表示身份已确定，不表示创建成功。需要纯二进制内容时应直接使用 HTTP 客户端读取响应头和正文；CLI 的 stdout 包含身份提示。
+服务端返回 `X-ADX-Binding-Id` 时，CLI 解码后先在 stdout 打印 `AgentBinding: ...`，随后输出原始响应体。该通知也可能出现在失败响应前，表示身份已确定，不表示创建成功。需要纯二进制内容时应直接使用 HTTP 客户端读取响应头和正文；CLI 的 stdout 包含身份提示。
 
 `--timeout-seconds` 限制请求发送到收到响应头的等待时间，不截断已建立的响应流。Ctrl-C 关闭客户端连接，不能保证 Harness 业务已取消；CLI 不自动重试业务请求或跟随重定向。HTTP 非 2xx 的正文仍输出到 stdout，错误摘要输出到 stderr 并以非零状态退出。重试时使用服务端返回的 `--binding-id`，不要重新省略它。`--output` 只控制管理命令的 JSON 展示，HTTP 保持上述流式输出。
 
@@ -80,7 +80,7 @@ adx ssh --template assistant --version 1 --binding-id demo --port 22
 
 可用 `--gateway` 覆盖 `ADX_SSH_ADDRESS` 或配置文件 `ssh_address`；身份文件优先级为 `-i/--identity`、`ADX_SSH_IDENTITY`、配置文件 `ssh_identity`。没有指定身份文件时由 OpenSSH 使用用户自身配置或 ssh-agent。地址为 host:port，端口省略时为 22；`--port` 是 Template 中的后端 SSH service 端口。
 
-省略 `--binding-id` 时由 Gateway 生成 ID，在 shell 开始时打印 `AgentBinding ID` 和 `AgentBinding URN`；正常终端内容和这两行提示都在 stdout，错误诊断走 stderr。该 ID 可用于后续 `--binding-id`、查询和删除；提示不代表 Environment 已就绪，失败后仍应回查同一身份。
+省略 `--binding-id` 时由 Gateway 生成 ID，在 shell 开始时打印 `AgentBinding ID` 和 template `Target`；正常终端内容和这两行提示都在 stdout，错误诊断走 stderr。CLI 将 ID 放入 SSH 路由的独立 `binding_id` 选项；该 ID 可用于后续 `--binding-id`、查询和删除；提示不代表 Environment 已就绪，失败后仍应回查同一身份。
 
 当前冷启动可能先返回创建结果未知，或在平台报告 Running 后短暂遇到路由尚未发布。收到 ID 后连接失败时，使用 `adx binding get` 查询，并在再次连接时显式传入 `--binding-id <返回的ID>`；不要再次省略 `--binding-id`，否则会生成另一个 AgentBinding。CLI 不自动重试 SSH 连接。
 

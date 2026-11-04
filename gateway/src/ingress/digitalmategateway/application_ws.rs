@@ -16,7 +16,7 @@ use tokio::sync::watch;
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OrbitWsConfig {
+pub struct ApplicationWsConfig {
     #[serde(default = "super::entrypoint::request_timeout")]
     pub request_timeout_seconds: u64,
     pub template: String,
@@ -26,13 +26,33 @@ pub struct OrbitWsConfig {
 }
 
 fn invalid() -> Error {
-    Error::Invalid("invalid Orbit configuration or user identity".into())
+    Error::Invalid("invalid application WebSocket configuration or user identity".into())
 }
 
-impl OrbitWsConfig {
-    pub(super) fn scope(&self, tenant: &str, user_id: &str) -> Result<Scope, Error> {
+#[derive(Clone, Copy)]
+pub(super) enum Application {
+    Orbit,
+    DigitalMate,
+}
+
+impl Application {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Orbit => "orbit",
+            Self::DigitalMate => "digitalmate",
+        }
+    }
+}
+
+impl ApplicationWsConfig {
+    pub(super) fn scope(
+        &self,
+        tenant: &str,
+        user_id: &str,
+        application: Application,
+    ) -> Result<Scope, Error> {
         for value in [tenant, user_id] {
-            adx_agent_core::identifier(value, "Orbit WebSocket identity")
+            adx_agent_core::identifier(value, "application WebSocket identity")
                 .map_err(Error::Invalid)?;
             if value.len() > 256 {
                 return Err(invalid());
@@ -43,7 +63,11 @@ impl OrbitWsConfig {
             tenant: tenant.into(),
             template: self.template.clone(),
             template_ref: self.template_ref.parse().map_err(Error::Invalid)?,
-            binding_id: format!("orbit-{}", hex::encode(Sha256::digest(tuple))),
+            binding_id: format!(
+                "{}-{}",
+                application.name(),
+                hex::encode(Sha256::digest(tuple))
+            ),
         };
         scope.validate().map_err(Error::Invalid)?;
         Ok(scope)
@@ -53,7 +77,7 @@ impl OrbitWsConfig {
         if !(1..=86400).contains(&self.request_timeout_seconds) {
             return Err(invalid());
         }
-        self.scope(tenant, "validation")?;
+        self.scope(tenant, "validation", Application::Orbit)?;
         let uri: Uri = self.backend_path.parse().map_err(|_| invalid())?;
         if self.service_port == 0
             || !self.backend_path.starts_with('/')
@@ -92,7 +116,12 @@ impl OrbitWsConfig {
             Ok(value) => value,
             Err(e) => return agent_error(e),
         };
-        let scope = match self.scope(tenant, &principal.user_id) {
+        let application = if request.uri().path() == "/digitalmate/ws" {
+            Application::DigitalMate
+        } else {
+            Application::Orbit
+        };
+        let scope = match self.scope(tenant, &principal.user_id, application) {
             Ok(value) => value,
             Err(e) => return agent_error(e),
         };
@@ -212,8 +241,8 @@ impl OrbitWsConfig {
 mod tests {
     use super::*;
 
-    fn config() -> OrbitWsConfig {
-        OrbitWsConfig {
+    fn config() -> ApplicationWsConfig {
+        ApplicationWsConfig {
             request_timeout_seconds: 60,
             template: "orbit".into(),
             template_ref: "1".into(),
@@ -224,14 +253,16 @@ mod tests {
 
     #[test]
     fn orbit_alias_reference_preserves_user_binding_and_workspace_identity() {
-        let fixed = config().scope("tenant", "alice").unwrap();
-        let config: OrbitWsConfig = serde_json::from_value(serde_json::json!({
+        let fixed = config()
+            .scope("tenant", "alice", Application::Orbit)
+            .unwrap();
+        let config: ApplicationWsConfig = serde_json::from_value(serde_json::json!({
             "template": "orbit", "template_ref": "production",
             "backend_path": "/ws", "service_port": 18092
         }))
         .unwrap();
         config.validate("tenant").unwrap();
-        let alias = config.scope("tenant", "alice").unwrap();
+        let alias = config.scope("tenant", "alice", Application::Orbit).unwrap();
         assert_eq!(alias.binding_id, fixed.binding_id);
         assert_eq!(alias.template, fixed.template);
         assert_eq!(alias.tenant, fixed.tenant);
@@ -241,11 +272,17 @@ mod tests {
         );
         assert_ne!(
             alias.binding_id,
-            config.scope("tenant", "bob").unwrap().binding_id
+            config
+                .scope("tenant", "bob", Application::Orbit)
+                .unwrap()
+                .binding_id
         );
         assert_ne!(
             alias.binding_id,
-            config.scope("other", "alice").unwrap().binding_id
+            config
+                .scope("other", "alice", Application::Orbit)
+                .unwrap()
+                .binding_id
         );
         let workspace = super::super::entrypoint::workspace_parameters;
         assert_eq!(
@@ -257,7 +294,7 @@ mod tests {
     #[test]
     fn orbit_template_reference_requires_one_valid_version_or_alias() {
         for reference in [serde_json::json!("1"), serde_json::json!("production")] {
-            let config: OrbitWsConfig = serde_json::from_value(serde_json::json!({
+            let config: ApplicationWsConfig = serde_json::from_value(serde_json::json!({
                 "template": "orbit", "template_ref": reference,
                 "backend_path": "/ws", "service_port": 18092
             }))
@@ -270,7 +307,7 @@ mod tests {
             serde_json::json!(""),
             serde_json::json!("\n"),
         ] {
-            let config = serde_json::from_value::<OrbitWsConfig>(serde_json::json!({
+            let config = serde_json::from_value::<ApplicationWsConfig>(serde_json::json!({
                 "template": "orbit", "template_ref": reference,
                 "backend_path": "/ws", "service_port": 18092
             }));
@@ -323,15 +360,23 @@ mod tests {
     #[test]
     fn orbit_binding_identity_reuses_and_isolates_users() {
         let config = config();
-        let alice = config.scope("tenant", "alice").unwrap();
-        assert_eq!(alice, config.scope("tenant", "alice").unwrap());
+        let alice = config.scope("tenant", "alice", Application::Orbit).unwrap();
+        assert_eq!(
+            alice,
+            config.scope("tenant", "alice", Application::Orbit).unwrap()
+        );
         for other in [
-            config.scope("tenant", "bob").unwrap(),
-            config.scope("other", "alice").unwrap(),
+            config.scope("tenant", "bob", Application::Orbit).unwrap(),
+            config.scope("other", "alice", Application::Orbit).unwrap(),
         ] {
             assert_ne!(alice.binding_id, other.binding_id);
         }
         assert_eq!(alice.template, "orbit");
+        let digitalmate = config
+            .scope("tenant", "alice", Application::DigitalMate)
+            .unwrap();
+        assert_ne!(alice.binding_id, digitalmate.binding_id);
+        assert!(digitalmate.binding_id.starts_with("digitalmate-"));
         assert_eq!(
             alice.template_ref,
             adx_agent_core::TemplateRef::Version("1".into())
@@ -340,9 +385,14 @@ mod tests {
         next.template_ref = "2".into();
         assert_eq!(
             alice.binding_id,
-            next.scope("tenant", "alice").unwrap().binding_id
+            next.scope("tenant", "alice", Application::Orbit)
+                .unwrap()
+                .binding_id
         );
-        assert_ne!(alice, next.scope("tenant", "alice").unwrap());
+        assert_ne!(
+            alice,
+            next.scope("tenant", "alice", Application::Orbit).unwrap()
+        );
     }
 
     #[test]

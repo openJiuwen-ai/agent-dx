@@ -10,6 +10,10 @@ async fn http_routes_body_and_reports_binding_before_streaming_output() {
         assert_eq!(request.method(), "POST");
         assert_eq!(request.headers()["authorization"], "Bearer tenant-key");
         assert_eq!(request.headers()["content-type"], "application/json");
+        assert_eq!(
+            request.headers()["x-adx-binding-id"],
+            "user%3Aa%2F%E4%B8%AD%E6%96%87%25"
+        );
         assert_eq!(request.uri().path(), "/agent/http/chat");
         let pairs: Vec<_> =
             url::form_urlencoded::parse(request.uri().query().unwrap().as_bytes()).collect();
@@ -24,10 +28,7 @@ async fn http_routes_body_and_reports_binding_before_streaming_output() {
             "{\"message\":\"hi\"}"
         );
         (
-            [
-                ("x-adx-binding-id", "generated"),
-                ("x-adx-binding-urn", "urn:adx:binding:demo:1:generated"),
-            ],
+            [("x-adx-binding-id", "user%3Aa%2F%E4%B8%AD%E6%96%87%25")],
             "data: hello\n\ndata: world\n\n",
         )
     });
@@ -39,6 +40,8 @@ async fn http_routes_body_and_reports_binding_before_streaming_output() {
         "demo",
         "--version",
         "1",
+        "--binding-id",
+        "user:a/中文%",
         "--method",
         "POST",
         "--path",
@@ -64,7 +67,7 @@ async fn http_routes_body_and_reports_binding_before_streaming_output() {
     http::execute(args, &config, &mut output).await.unwrap();
     assert_eq!(
         String::from_utf8(output).unwrap(),
-        "AgentBinding: generated\nTarget: urn:adx:binding:demo:1:generated\ndata: hello\n\ndata: world\n\n"
+        "AgentBinding: user:a/中文%\ndata: hello\n\ndata: world\n\n"
     );
     server.abort();
 }
@@ -122,7 +125,7 @@ fn http_validates_business_paths_and_preserves_explicit_binding() {
     let url = args.url(&config.endpoint).unwrap();
     assert!(url
         .query_pairs()
-        .any(|(k, v)| k == "target" && v == "urn:adx:binding:demo:1:existing"));
+        .any(|(k, v)| k == "target" && v == "urn:adx:template:demo:1"));
     assert!(url.query_pairs().any(|(k, v)| k == "port" && v == "8080"));
 }
 
