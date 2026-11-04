@@ -25,6 +25,12 @@ impl ManagedService {
             templates: Mutex::new(BoundedCache::new(1024)),
         }
     }
+    /// Initialization readiness of the underlying control plane (see
+    /// [`Control::ready`]). Startup latch only; never flips back on
+    /// runtime failures.
+    pub fn ready(&self) -> bool {
+        self.control.ready()
+    }
     /// Select an AgentBinding identity without creating product or Environment state.
     /// Returns Invalid for a direct instance target or invalid scope components.
     pub fn binding_scope(

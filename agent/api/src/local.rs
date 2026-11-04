@@ -4,6 +4,7 @@ pub use adx_activator::registration::RegistrationConfig;
 use adx_activator::Activator;
 use adx_agent_core::{
     activator::{BindingList, BindingPage, Target},
+    discovery::MemberCondition,
     environment::Environment,
     AgentBinding, Scope, TemplateVersion,
 };
@@ -56,6 +57,8 @@ impl LocalControl {
             )?,
             registration,
             adx_activator::reconciliation::ReconcileSettings::default(),
+            true,
+            Arc::new(MemberCondition::default),
         )
         .await?;
         Ok(Self {

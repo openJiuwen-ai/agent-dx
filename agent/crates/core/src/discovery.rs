@@ -17,6 +17,43 @@ impl ActivatorEndpoint {
     }
 }
 
+/// Membership condition carried in registry records and honored by Gateway
+/// member selection. Fields absent from records written by older Activators
+/// default to ready-and-not-draining, so old and new versions interoperate
+/// during a rolling upgrade.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemberCondition {
+    #[serde(default = "ready_by_default")]
+    pub ready: bool,
+    #[serde(default)]
+    pub draining: bool,
+}
+fn ready_by_default() -> bool {
+    true
+}
+impl Default for MemberCondition {
+    fn default() -> Self {
+        Self {
+            ready: true,
+            draining: false,
+        }
+    }
+}
+impl MemberCondition {
+    /// A member is selectable only when initialized (ready) and not draining.
+    pub fn selectable(&self) -> bool {
+        self.ready && !self.draining
+    }
+}
+
+/// One registry member: its endpoint plus the readiness condition that
+/// Gateway-side selection filters on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Member {
+    pub endpoint: ActivatorEndpoint,
+    pub condition: MemberCondition,
+}
+
 /// Rendezvous ordering is independent of discovery order and process-local hash seeds.
 /// Hash fields are length-delimited; generation is deliberately excluded from the route key.
 pub fn ranked_endpoints(scope: &Scope, endpoints: &[ActivatorEndpoint]) -> Vec<ActivatorEndpoint> {
