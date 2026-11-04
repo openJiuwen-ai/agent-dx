@@ -4329,3 +4329,62 @@ async fn upgrade_quiescing_waits_for_snapshot_publication_and_rejects_new_captur
     assert!(handle.snapshot(rejected).await.is_err());
     assert_eq!(*backend.events.lock().unwrap(), before);
 }
+
+#[tokio::test]
+async fn a_paused_record_without_a_restorable_checkpoint_fails_individually() {
+    // 2026-11-10 test-cluster incident: a retained Paused record with no
+    // checkpoint and no snapshot source wedged the node's startup gate with
+    // a deterministic Conflict on every reconciliation cycle. Such a record
+    // must fail individually instead of blocking node readiness.
+    let (temp, backend, node, spec, assignment) = fixture();
+    let h = node.environment(spec, assignment).unwrap();
+    let created = h.create().await.unwrap();
+    let paused = h.pause(pause(created.record.revision)).await.unwrap();
+    // Corrupt the record into the incident shape: paused, nothing restorable.
+    let mut unrestorable = paused.record.clone();
+    unrestorable.checkpoint = None;
+    unrestorable.snapshot_source = None;
+
+    let restored = Adxlet::new(
+        "node".into(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+        backend.clone(),
+    )
+    .with_checkpointing(
+        Arc::new(LocalCheckpointStore::new(temp.path().into()).unwrap()),
+        backend.clone(),
+    )
+    .unwrap();
+    restored
+        .update_capacity(
+            Resources {
+                cpu_millis: 100,
+                memory_bytes: 1024,
+                disk_bytes: 1024,
+            },
+            Duration::from_secs(300),
+        )
+        .unwrap();
+    // Before the fix this returned Error::Conflict on every cycle and the
+    // node never opened its startup gate.
+    restored
+        .reconcile(vec![unrestorable.clone()])
+        .await
+        .unwrap();
+    assert!(
+        restored.accepting_allocations(),
+        "one unrestorable record must not hold the node out of readiness"
+    );
+    assert!(
+        backend
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "commit:Failed"),
+        "the environment itself must fail: {:?}",
+        *backend.events.lock().unwrap()
+    );
+}

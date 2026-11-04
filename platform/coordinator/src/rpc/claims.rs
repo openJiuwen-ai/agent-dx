@@ -441,6 +441,7 @@ impl CoordinatorRpc {
                         spec: Some(spec.into()),
                         assignment: Some(assignment.try_into().map_err(status)?),
                         node_session_id: candidate.node_session_id,
+                        coordinator_epoch: state.session.epoch(),
                         snapshot: snapshot
                             .map(TryInto::try_into)
                             .transpose()
@@ -507,6 +508,7 @@ impl CoordinatorRpc {
                     spec: Some(record.spec.into()),
                     assignment: Some(record.assignment.try_into().map_err(status)?),
                     node_session_id: candidate.node_session_id,
+                    coordinator_epoch: state.session.epoch(),
                     snapshot: snapshot
                         .map(TryInto::try_into)
                         .transpose()

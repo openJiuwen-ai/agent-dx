@@ -1239,13 +1239,28 @@ impl Controller {
             .await
             .map_err(|_| Error::Unavailable("recovery readiness timed out".into()))??;
         } else if self.record.state == EnvironmentState::Paused {
-            let cp = self
+            let restorable = self
                 .record
                 .checkpoint
                 .clone()
-                .or_else(|| self.record.snapshot_source.clone())
-                .ok_or(Error::Conflict)?;
-            let services = self.services.checkpoint.clone().ok_or(Error::Conflict)?;
+                .or_else(|| self.record.snapshot_source.clone());
+            let (cp, services) = match (restorable, self.services.checkpoint.clone()) {
+                (Some(cp), Some(services)) => (cp, services),
+                _ => {
+                    // Nothing restorable — no checkpoint, no snapshot source,
+                    // or no checkpoint backend configured on this node. Fail
+                    // this one environment (same handling as an invalid
+                    // artifact below) instead of erroring: a deterministic
+                    // per-record conflict must not wedge the whole node's
+                    // startup reconciliation gate — one such retained record
+                    // held a node out of readiness indefinitely (2026-11-10
+                    // test cluster).
+                    self.cleanup().await?;
+                    self.operation_intent(adx_core::observation::OperationIntent::Policy);
+                    self.transition(Event::Fail)?;
+                    return self.sync().await;
+                }
+            };
             let had_inputs = !self.record.execution_artifacts.is_empty();
             self.cleanup().await?;
             if had_inputs {

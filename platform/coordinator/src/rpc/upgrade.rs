@@ -1441,6 +1441,7 @@ impl CoordinatorRpc {
                         .and_then(|intent| intent.run_timeout_seconds),
                     Duration::from_secs(600),
                     true,
+                    session.epoch(),
                 )
                 .await?;
                 stored = session.get(&r.environment_id).await?;

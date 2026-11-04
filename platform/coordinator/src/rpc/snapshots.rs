@@ -147,6 +147,7 @@ impl CoordinatorRpc {
                             snapshot: Some(snapshot.clone().try_into()?),
                             node_session_id,
                             delegated,
+                            coordinator_epoch: session.epoch(),
                         })
                         .await
                         .map_err(|_| {
@@ -184,6 +185,7 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
             adx_observability::trace::Trace::rpc("coordinator.snapshot.publish_snapshot", &request);
         trace
             .run_result(async {
+                self.admission()?;
                 let principal = self.0.peers.authenticate(&request)?;
                 let Principal::Node(node_id) = principal else {
                     return Err(Status::permission_denied(
@@ -426,6 +428,7 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
             adx_observability::trace::Trace::rpc("coordinator.snapshot.delete_snapshot", &request);
         trace
             .run_result(async {
+                self.admission()?;
                 if self.0.peers.authenticate(&request)? != Principal::ApiServer {
                     return Err(Status::permission_denied("Frontend identity required"));
                 }

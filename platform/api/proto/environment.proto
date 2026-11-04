@@ -75,6 +75,9 @@ message NodeGetEnvironmentControlRequest {
   Assignment assignment = 1;
   CallerContext caller = 2;
   string node_session_id = 3;
+  // Primary epoch of the issuing Coordinator; adxlet rejects a command whose
+  // epoch trails the highest epoch it has already observed.
+  uint64 coordinator_epoch = 4;
 }
 message NodeBatchGetEnvironmentControlRequest { repeated NodeGetEnvironmentControlRequest requests = 1; }
 message NodeUpdateEnvironmentControlRequest {
@@ -83,11 +86,15 @@ message NodeUpdateEnvironmentControlRequest {
   string node_session_id = 3;
   uint64 timeout_seconds = 4;
   bool extend_only = 5;
+  // Primary epoch of the issuing Coordinator; see NodeGetEnvironmentControlRequest.
+  uint64 coordinator_epoch = 6;
 }
 message RecoverEnvironmentRequest {
   EnvironmentRecord record = 1; string node_session_id = 2;
   // One-run duration from the durable resume intent; separate from the RPC budget.
   optional uint64 run_timeout_seconds = 3;
+  // Primary epoch of the issuing Coordinator; see NodeGetEnvironmentControlRequest.
+  uint64 coordinator_epoch = 4;
 }
 message EnsureRunningRequest {
   string environment_id = 1; CallerContext caller = 2; reserved 3;
@@ -100,6 +107,8 @@ message EnsureRunningRequest {
 message EnsureEnvironmentRunningRequest {
   Assignment assignment = 1; string operation_id = 2; string node_session_id = 3;
   optional uint64 run_timeout_seconds = 4;
+  // Primary epoch of the issuing Coordinator; see NodeGetEnvironmentControlRequest.
+  uint64 coordinator_epoch = 5;
 }
 
 message GetNodeSessionRequest {}
@@ -169,6 +178,11 @@ message StartAssignedEnvironmentRequest {
   Assignment assignment = 2;
   string node_session_id = 3;
   uint64 create_deadline_unix_millis = 5;
+  // Primary epoch of the issuing Coordinator; see NodeGetEnvironmentControlRequest.
+  // Field 6 is upstream's creation_request_id (merged first). A mixed-version
+  // window skips the unrecognized field on both sides, which is the designed
+  // epoch=0 upgrade-window behavior.
+  uint64 coordinator_epoch = 7;
 }
 
 message DeleteEnvironmentRequest {
@@ -180,7 +194,13 @@ message DeleteEnvironmentRequest {
   reserved 5;
   // Coordinator-owned preparation cleanup: exact lifecycle revision, with session fencing.
   optional uint64 expected_revision = 6;
+  // Upstream retired upgrade_task_id=7/upgrade_epoch=8 in 137e2a3d and reserved
+  // both tags; this epoch therefore takes 9. A mixed-version window skips the
+  // unrecognized field on both sides, which is the designed epoch=0
+  // upgrade-window behavior.
   reserved 7, 8;
+  // Primary epoch of the issuing Coordinator; see NodeGetEnvironmentControlRequest.
+  uint64 coordinator_epoch = 9;
 }
 
 message CommitEnvironmentRequest {
@@ -200,6 +220,8 @@ message CollectCheckpointCleanupRequest {
   CheckpointCleanup cleanup = 1;
   string node_session_id = 2;
   bool delegated = 3;
+  // Primary epoch of the issuing Coordinator; see NodeGetEnvironmentControlRequest.
+  uint64 coordinator_epoch = 4;
 }
 message CollectCheckpointCleanupResponse {
   string environment_id = 1;
