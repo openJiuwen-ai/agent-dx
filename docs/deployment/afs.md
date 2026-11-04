@@ -300,9 +300,6 @@ cache ON 必须按[验收说明](../testing/afs.md#dfs-外部-s3-闭环)登记�
 | `fuse_clone_fd` | `true` | 仅多接收线程时生效 |
 | `fuse_workers` | `32` | `1..=1024`，dispatch执行线程数 |
 | `fuse_max_tasks` | 省略时`fuse_workers×8` | `1..=65536`，执行、排队、异步等待及待回复任务的已接纳总数，完成后才退账 |
-| `dfs_fuse_keep_cache` | `true` | 仅原生DFS只读、已核对提交身份的open允许保留页面 |
-| `dfs_fuse_entry_ttl_ms` | `0` | `0..=60000`，路径entry TTL |
-| `dfs_fuse_attr_ttl_ms` | `0` | `0..=60000`，属性TTL；CREATE的单TTL回复取两者较小值 |
 | `fuse_max_readahead_bytes` | `16777216` | `0..=16777216`，仅DFS的内核read-ahead请求上限，实际值受协商限制 |
 | `dfs_version_cache_entries` | `4096` | `1..=65536`，不可变版本／布局的resident元数据条目数 |
 | `dfs_version_cache_bytes` | `33554432`（32MiB） | 标量范围`1..=1073741824`；具备DFS能力的Node还校验与entries相关的最低结构预算 |
@@ -314,12 +311,13 @@ cache ON 必须按[验收说明](../testing/afs.md#dfs-外部-s3-闭环)登记�
 | `dfs_source_lookahead_chunks` | `64` | `0..=128`，仅后续源元数据；与mandatory合并请求至多128项；0仅关闭前瞻 |
 | `dfs_source_cache_bytes` | `4194304`（4MiB） | `0..=4194304`，最多1024条源元数据的保留估算上限；0不保留且不前瞻 |
 | `dfs_readahead_max_bytes` | `0` | `0..=33554432`；0不创建后台fetch任务；product可显式设8388608。这是对象调度距离，未新增正文、proof、连接或磁盘额度 |
+| `dfs_read_crc_mode` | `"off"` | 仅原生DFS且`data_mode = "grpc"`可设置，取值`"off"`或`"receiver"`。`off`：远端读正文不做CRC校验（损坏字节原样交付）；`receiver`：读取方按Meta可信CRC表校验完整32KiB分段，非对齐片段由服务方校验，同时关闭原生预取。只影响本Node发起的远端读；服务方按请求方声明的模式执行，各Node可以不同。原`both`在S1a-7删除 |
 
 Linux DFS挂载完成后仅设置自身FUSE设备的BDI `read_ahead_kb`，默认16384KiB；显式0禁用。
 INIT协商值与BDI有效值分别记录在`dfs.fuse_cache_init`和`dfs.fuse_readahead`。
 后者成功记录`applied=true`及读回值；权限不足或sysfs不可用记录`applied=false`和原因，
 继续使用内核原有限制，不承诺16MiB已经生效。不得修改源磁盘或全局BDI。
-`keep_cache=true`允许同版本重开复用，不保证页实际驻留。
+DFS读句柄open时钉住版本直到close；同一版本重开时总是保留页缓存（不保证页实际驻留），entry/attr TTL固定为0（原`dfs_fuse_keep_cache`、`dfs_fuse_entry_ttl_ms`、`dfs_fuse_attr_ttl_ms`在S1a-7删除）。
 
 回复缓冲默认总额度为256MiB，按需分配，用户可在`[dfs_read_pipeline]`中调整
 `max_reply_bytes`（8MiB..1GiB），例如512MiB为536870912；这不是进程RSS总上限。
@@ -551,8 +549,6 @@ fsync依赖原持久副本与Meta屏障。S3原有窗口、载荷／descriptor�
 | `dfs_dirty_budget_bytes` | `67108864` | 4..64MiB，Node实际live正文capacity，含仍被持有的已上传正文 |
 | `dfs_unpublished_descriptors` | `1024` | 1..1024，且受固定4MiB元数据总额限制，不能靠增大计数绕过字节上限 |
 | `dfs_upload_inflight_chunks` | `8` | 1..8，整个Node的真实任务上限，共享live正文 |
-| `dfs_optimistic_gc_commit` | 随原生CRC新写默认`true` | 首次写入登记一次代次，省略逐chunk登记；FullSync只原子核对相关代次及session，无关GC变化不拒绝提交 |
-| `dfs_crc32c_writes` | 原生DFS Node为`true` | 独立ID＋32KiB分段CRC；支持原复制策略、跨节点读和副本修复。OwnerFs-only、Meta及外部后端缺省不启用 |
 | `dfs_background_commit_ms` | `5000` | 1..60000ms，后台发布调度周期，非严格可见时间 |
 
 优先级 CLI＞TOML＞默认，非法值启动报错；仅无外部后端的 DFS 接入此流水线。
@@ -768,9 +764,7 @@ NodeReplicated DFS 默认启动每 5 秒一次的安全回收；关闭引用有�
 
 ## 原生DFS分段CRC32C与写入代次保护
 
-原生DFS Node默认启用`dfs_crc32c_writes`及`dfs_optimistic_gc_commit`。后者在CRC路径表示写入代次保护，不再固定全局GC版本。支持既有desired/sync-required、副本分布及local-copy策略；CRC要求原生存储及代次保护，非法组合在监听服务前拒绝。OwnerFs-only、Meta和外部S3后端的缺省值为false，S3仍走原完整hash路径。本次不提供旧版本数据兼容或迁移。
-
-例如在Node的顶层配置中保留缺省值即可；需要显式选择BLAKE3新写时设置`dfs_crc32c_writes = false`，未单独配置的`dfs_optimistic_gc_commit`随之为false。关闭新写CRC不关闭按持久化算法标记的CRC读取。不要把CRC对象的描述摘要当作正文hash。
+原生DFS存储固定写分段CRC32C对象并使用写入代次保护（首次写入登记一次代次，省略逐chunk登记；FullSync只原子核对相关代次及session），外部S3后端固定写BLAKE3对象；没有配置开关（原`dfs_crc32c_writes`、`dfs_optimistic_gc_commit`在S1a-7删除）。支持既有desired/sync-required、副本分布及local-copy策略。按持久化算法标记的CRC读取不受影响。不要把CRC对象的描述摘要当作正文hash。
 
 新对象ID为`crc32c-v2-<32hex出生代次>-<32hex对象号>`，32KiB分段CRC表与长度、格式一起进入原catalog WAL持久化链。`Crc32cSegmentsV1`承载描述表的小BLAKE3绑定摘要，**不是正文BLAKE3根**；不生成正文Bao/proof，也不按相同正文自动去重。复制接收端重新核验CRC描述后，完成正文、目录及catalog屏障再返回durable ACK。FullSync等待原策略要求的同步收据和Meta持久事务。
 

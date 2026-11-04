@@ -4,7 +4,6 @@ use super::*;
 
 /// Stack-only read context shared by committed and refreshed views.
 struct NativeReadRequest<'a> {
-    handle: FileHandle,
     snapshot: &'a DfsFileHandleSnapshot,
     offset: u64,
     size: usize,
@@ -179,7 +178,6 @@ impl DistributedFs {
         lifetime: crate::node::read_pipeline::ReadLifetime,
     ) -> Result<prost::bytes::Bytes> {
         let request = NativeReadRequest {
-            handle,
             snapshot,
             offset,
             size,
@@ -268,7 +266,6 @@ impl DistributedFs {
         prefetch: bool,
     ) -> Result<prost::bytes::Bytes> {
         let NativeReadRequest {
-            handle,
             snapshot,
             offset,
             size,
@@ -302,14 +299,7 @@ impl DistributedFs {
                         let batch =
                             version.native_read_batch(a, n, engine.source_lookahead_chunks())?;
                         engine
-                            .read_native_unified_async(
-                                batch,
-                                n,
-                                None,
-                                read_deadline,
-                                handle.0,
-                                life,
-                            )
+                            .read_native_unified_async(batch, n, read_deadline, life)
                             .await
                     })
                 })
@@ -373,7 +363,7 @@ impl DistributedFs {
         };
         let result = self
             .read_engine
-            .read_native_unified_async(batch, count, None, deadline, handle.0, lifetime)
+            .read_native_unified_async(batch, count, deadline, lifetime)
             .await?;
         #[cfg(test)]
         if let Some(hook) = self.native_read_after_committed.lock().unwrap().take() {

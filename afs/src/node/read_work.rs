@@ -111,15 +111,11 @@ pub(crate) enum ReadCheck {
     DescriptorEncode,
     DescriptorDecode,
     AuthorizeFull,
-    ContextReuse,
-    PeerRegister,
     LocalProbe,
     BatchGroup,
     FullGrant,
-    CompactGrant,
-    ContextRecover,
 }
-const READ_CHECK_NAMES: [&str; 14] = [
+const READ_CHECK_NAMES: [&str; 10] = [
     "request_validate",
     "serve_state",
     "catalog_open",
@@ -127,19 +123,15 @@ const READ_CHECK_NAMES: [&str; 14] = [
     "descriptor_encode",
     "descriptor_decode",
     "authorize_full",
-    "context_reuse",
-    "peer_register",
     "local_probe",
     "batch_group",
     "full_grant",
-    "compact_grant",
-    "context_recover",
 ];
 
 #[derive(Clone, Debug)]
 pub struct ReadWorkMetrics {
     pub(crate) activities: super::read_activity::Activities,
-    checks: [afs_metrics::IntCounter; 14],
+    checks: [afs_metrics::IntCounter; 10],
     #[cfg(feature = "dfs")]
     native_write_resources: afs_metrics::IntGaugeVec,
     catalog_commit_resources: afs_metrics::IntGaugeVec,
@@ -260,11 +252,11 @@ impl ReadWorkMetrics {
             )?;
             let authorization_ns = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_authorization_nanoseconds_total", "Complete authorization scope wall time; scopes can nest and overlap."), &["stage"])?;
             let authorization_calls = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_authorization_calls_total", "Authorization scope calls, including cache hits and failures."), &["stage"])?;
-            for stage in ["total", "cache_maintenance", "meta_rpc", "open_meta", "close_meta", "close_peer"] { authorization_ns.with_label_values(&[stage]); authorization_calls.with_label_values(&[stage]); }
+            for stage in ["total", "cache_maintenance", "meta_rpc"] { authorization_ns.with_label_values(&[stage]); authorization_calls.with_label_values(&[stage]); }
             afs_metrics::register_collector(registry, &authorization_ns)?;
             afs_metrics::register_collector(registry, &authorization_calls)?;
             let checks = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_checks_total", "Executed read control operations; fixed-stage counters, not elapsed time."), &["stage"])?;
-            let stages = [ReadCheck::RequestValidate, ReadCheck::ServeState, ReadCheck::CatalogOpen, ReadCheck::CatalogFence, ReadCheck::DescriptorEncode, ReadCheck::DescriptorDecode, ReadCheck::AuthorizeFull, ReadCheck::ContextReuse, ReadCheck::PeerRegister, ReadCheck::LocalProbe, ReadCheck::BatchGroup, ReadCheck::FullGrant, ReadCheck::CompactGrant, ReadCheck::ContextRecover];
+            let stages = [ReadCheck::RequestValidate, ReadCheck::ServeState, ReadCheck::CatalogOpen, ReadCheck::CatalogFence, ReadCheck::DescriptorEncode, ReadCheck::DescriptorDecode, ReadCheck::AuthorizeFull, ReadCheck::LocalProbe, ReadCheck::BatchGroup, ReadCheck::FullGrant];
             let checks_bound = std::array::from_fn(|i| checks.with_label_values(&[READ_CHECK_NAMES[stages[i] as usize]]));
             afs_metrics::register_collector(registry, &checks)?;
             let read_buffer_events = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_buffer_events_total", "Read buffer allocation/reuse/return events; zero counts explicit initialization."), &["role", "event"])?;
@@ -1274,10 +1266,6 @@ impl ReadWorkMetrics {
                 | "get_file_version"
                 | "get_chunk_sources"
                 | "validate_read_grants"
-                | "validate_open_read_context"
-                | "open_read_context"
-                | "close_open_read_context"
-                | "peer_close_open_read_context"
                 | "peer_read_ranges"
         ) {
             self.read_rpc_calls.with_label_values(&[method]).inc();

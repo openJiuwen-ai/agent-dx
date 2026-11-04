@@ -107,11 +107,6 @@ impl LocalChunkStore {
             .collect())
     }
     pub(crate) fn collect_generation(&self, generation: u64, chunks: &[ChunkId]) -> Result<usize> {
-        // No catalog lock is held while retiring open-view cache owners.
-        // Admitted IO keeps its own Arc and may drain before disk space is freed.
-        #[cfg(any(feature = "dfs", test))]
-        self.retire_fixed_peer_readers(chunks)?;
-
         // Drain installs and exclude new catalog publications through checkpoint + WAL rotation.
         let _admission = self
             .catalog_committer

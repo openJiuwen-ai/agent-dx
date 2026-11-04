@@ -148,8 +148,6 @@ def run_case(args) -> dict:
             text = cfg.read_text().replace('log_level = "warn"', 'log_level = "info"')
             values = {"dfs_desired_copies": 3, "dfs_sync_required_copies": 2, "dfs_min_distinct_nodes": 2,
                       "dfs_min_distinct_failure_domains": 1, "dfs_background_commit_ms": 60000}
-            if not args.require_defaults:
-                values.update(dfs_crc32c_writes=True, dfs_optimistic_gc_commit=True)
             for key, value in values.items():
                 encoded = str(value).lower()
                 if re.search(rf"^{key}\s*=", text, re.M):
@@ -160,8 +158,9 @@ def run_case(args) -> dict:
             role = "meta" if name == "meta" else "node"
             config = json.loads(run.command([run.binary_dir / f"afs-{role}", "--config", cfg, "--print-config"]))
             if name != "meta":
-                run.check(f"CRC and generation protection enabled {name}",
-                          config["dfs_crc32c_writes"] is True and config["dfs_optimistic_gc_commit"] is True)
+                # CRC32C writes and generation GC are fixed for native storage (S1a-7, F6).
+                run.check(f"CRC write switches retired {name}",
+                          "dfs_crc32c_writes" not in config and "dfs_optimistic_gc_commit" not in config)
         for name in ("meta", *NODES[:3]):
             run.start(name)
         before = http_text(owner.META_IP, owner.META_REST, "/metrics")

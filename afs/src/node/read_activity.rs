@@ -9,32 +9,18 @@ use std::time::Instant;
 #[derive(Clone, Copy)]
 #[repr(usize)]
 pub(crate) enum Activity {
-    SourceIo,
     RangeRpc,
-    PeerQueue,
-    PeerPending,
     ReplyBytes,
-    DiskWait,
-    SendWait,
     FuseTask,
     CompletionWait,
     ReplyWait,
-    BodyWait,
-    RpcWait,
 }
-const NAMES: [&str; 12] = [
-    "source_io",
+const NAMES: [&str; 5] = [
     "range_rpc",
-    "peer_queue",
-    "peer_pending",
     "reply_bytes",
-    "disk_wait",
-    "send_wait",
     "fuse_task",
     "completion_wait",
     "reply_wait",
-    "body_wait",
-    "rpc_wait",
 ];
 
 #[derive(Debug)]
@@ -49,10 +35,9 @@ struct Counters {
     byte_peak_metric: afs_metrics::IntCounter,
     calls: afs_metrics::IntCounter,
     nanos: afs_metrics::IntCounter,
-    completed_bytes: afs_metrics::IntCounter,
 }
 #[derive(Clone, Debug)]
-pub(crate) struct Activities([Arc<Counters>; 12]);
+pub(crate) struct Activities([Arc<Counters>; 5]);
 
 impl Activities {
     pub(crate) fn register(
@@ -93,10 +78,6 @@ impl Activities {
             "afs_dfs_read_pipeline_nanoseconds_total",
             "Sum of scope wall durations; overlaps are not additive E2E time.",
         )?;
-        let completed = counter(
-            "afs_dfs_read_pipeline_completed_bytes_total",
-            "Source bytes actually read; other stages explicitly record only their own bytes.",
-        )?;
         Ok(Self(std::array::from_fn(|i| {
             Arc::new(Counters {
                 active: AtomicU64::new(0),
@@ -109,15 +90,9 @@ impl Activities {
                 byte_peak_metric: byte_peak.with_label_values(&[NAMES[i]]),
                 calls: calls.with_label_values(&[NAMES[i]]),
                 nanos: nanos.with_label_values(&[NAMES[i]]),
-                completed_bytes: completed.with_label_values(&[NAMES[i]]),
             })
         })))
     }
-    #[cfg(test)]
-    pub(crate) fn owned_bytes(&self, activity: Activity) -> u64 {
-        self.0[activity as usize].bytes.load(Ordering::Acquire)
-    }
-
     /// Caller serializes observations; this stage measures state, not scope time.
     pub(crate) fn observe_count(&self, activity: Activity, current: u64) {
         let counters = &self.0[activity as usize];
@@ -152,11 +127,6 @@ pub(crate) struct ActivityGuard {
     counters: Arc<Counters>,
     bytes: u64,
     started: Instant,
-}
-impl ActivityGuard {
-    pub(crate) fn completed_bytes(&self, bytes: u64) {
-        self.counters.completed_bytes.inc_by(bytes);
-    }
 }
 impl Drop for ActivityGuard {
     fn drop(&mut self) {

@@ -16,11 +16,8 @@ uds_path = "/opt/adx/run/afs/node-a.sock"
 # fuse_threads = 4
 # fuse_clone_fd = true
 # fuse_workers = 32
-# Native DFS page reuse requires the exact fresh committed version and length.
-# Zero TTLs preserve strict close-to-open; positive TTLs explicitly relax it.
-# dfs_fuse_keep_cache = true
-# dfs_fuse_entry_ttl_ms = 0
-# dfs_fuse_attr_ttl_ms = 0
+# DFS readers pin their version open to close; kernel pages are reused only
+# across opens of the exact same version, and entry/attr TTLs are always zero.
 # Requested DFS kernel read-ahead limit; record the negotiated value in tests.
 # This does not enable next-object prefetch or change OwnerFs cache policy.
 # fuse_max_readahead_bytes = 16777216
@@ -37,6 +34,10 @@ dfs_catalog_commit_queue = 256
 # Native body readahead is opt-in; product profiles may explicitly use 8388608.
 # This is scheduling distance, sharing the existing proof/stream/disk budgets.
 # dfs_readahead_max_bytes = 0
+# Native gRPC remote-read body verification on this reading Node: "off"
+# (default, unchecked) or "receiver" (CRC segments checked; disables prefetch).
+# Serving Nodes follow each caller's mode, so Nodes may differ.
+# dfs_read_crc_mode = "off"
 # A-side verified Peer payloads: 2 resident objects, sharing 16MiB with live frames.
 # Payload range 4..=64MiB; eviction does not refund still-referenced data.
 # dfs_peer_serve_resident_objects = 2
@@ -47,11 +48,8 @@ dfs_catalog_commit_queue = 256
 # dfs_source_cache_max_ms = 5000
 # dfs_source_lookahead_chunks = 64
 # dfs_source_cache_bytes = 4194304
-# Native DFS Node defaults: independent IDs, 32KiB CRC32C and write-generation GC.
-# Replica counts/local-copy policy remain the existing filesystem policy.
-# S3 and OwnerFs-only do not enable these native defaults.
-# dfs_crc32c_writes = true
-# dfs_optimistic_gc_commit = true
+# Native DFS storage always writes independent IDs with 32KiB CRC32C and
+# write-generation GC; S3 always writes canonical BLAKE3 objects.
 timeout_ms = 5000
 log_level = "info"
 trace_enabled = false

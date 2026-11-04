@@ -435,7 +435,6 @@ impl ReplicationEngine {
 }
 
 pub struct DfsChunkStore {
-    optimistic_gc_commit: bool,
     gc_control: Option<Arc<dyn crate::node::gc::GcControl>>,
     local_node_id: String,
     local_node_epoch: Option<u64>,
@@ -461,11 +460,6 @@ impl DfsChunkStore {
         Ok(())
     }
 
-    pub(crate) fn with_optimistic_gc_commit(mut self, enabled: bool) -> Self {
-        self.optimistic_gc_commit = enabled;
-        self
-    }
-
     pub fn with_gc_control(mut self, control: Arc<dyn crate::node::gc::GcControl>) -> Self {
         self.gc_control = Some(control);
         self
@@ -478,7 +472,6 @@ impl DfsChunkStore {
         data_plane: Arc<dyn ReplicaDataPlane>,
     ) -> Self {
         Self {
-            optimistic_gc_commit: false,
             gc_control: None,
             local_node_id: local_node_id.clone(),
             local_node_epoch: None,
@@ -496,7 +489,6 @@ impl DfsChunkStore {
         data_plane: Arc<dyn ReplicaDataPlane>,
     ) -> Self {
         Self {
-            optimistic_gc_commit: false,
             gc_control: None,
             local_node_id: local_node_id.clone(),
             local_node_epoch: Some(local_node_epoch),
@@ -662,9 +654,8 @@ impl ChunkStore for DfsChunkStore {
     }
 
     fn put_native_batch(&self, staged: Vec<StagedChunk>) -> Result<Vec<NativeChunkReceipt>> {
-        if !self.optimistic_gc_commit {
-            self.reserve_gc_publications(&staged)?;
-        }
+        // Native writes fence their own write generation at commit; no
+        // per-chunk publication registration (S1a-7, F6).
         let snapshot = self.placement.snapshot()?;
         let receipts = if snapshot.replication.is_local_fast_path() {
             self.put_local_batch(staged, &snapshot)?
@@ -1386,78 +1377,6 @@ mod tests {
             min_distinct_failure_domains: 1,
             local_copy: LocalCopyPolicy::Required,
         }
-    }
-
-    #[test]
-    fn native_upload_requires_gc_reservation_before_writing() {
-        struct RejectGc;
-        impl crate::node::gc::GcControl for RejectGc {
-            fn retain(
-                &self,
-                _: &str,
-                _: &crate::dfs::InodeId,
-                _: Option<&crate::dfs::FileVersionId>,
-                _: bool,
-            ) -> Result<()> {
-                Ok(())
-            }
-            fn release(&self, _: &str) -> Result<()> {
-                Ok(())
-            }
-            fn reserve_publication(
-                &self,
-                _: &OperationId,
-                _: Vec<crate::dfs::ChunkObject>,
-            ) -> Result<()> {
-                Err(Error::coded(
-                    afs_error::META_DFS_GC_BUSY,
-                    "deletion in progress",
-                ))
-            }
-            fn collect(
-                &self,
-                _: u64,
-                _: Vec<crate::dfs::ChunkObject>,
-            ) -> Result<crate::dfs::GcState> {
-                Ok(crate::dfs::GcState::default())
-            }
-        }
-        let temp = tempfile::tempdir().unwrap();
-        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
-        let snapshot = Arc::new(PlacementSnapshot {
-            revision: 1,
-            replication: config(1),
-            replica_groups: vec![ReplicaGroup {
-                id: ReplicaGroupId::new("g"),
-                placement_epoch: 1,
-                targets: vec![target_with_epoch(
-                    "node-a",
-                    1,
-                    local.device_descriptor().unwrap(),
-                )],
-            }],
-        });
-        let store = DfsChunkStore::new_with_epoch(
-            "node-a".into(),
-            1,
-            local.clone(),
-            Arc::new(StaticPlacement { snapshot }),
-            Arc::new(FakeDataPlane::default()),
-        )
-        .with_gc_control(Arc::new(RejectGc));
-        let input = staged("native-gc-rejection");
-        assert_eq!(
-            store
-                .put_native_batch(vec![input.clone()])
-                .err()
-                .unwrap()
-                .code(),
-            afs_error::META_DFS_GC_BUSY
-        );
-        assert!(
-            local.open_receipt_reader(&input.chunk).is_err(),
-            "rejected upload must not install a chunk"
-        );
     }
 
     #[test]

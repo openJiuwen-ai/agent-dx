@@ -38,7 +38,6 @@ class DfsProfile:
     write_queue_bytes: int | None = None
     read_crc_mode: str | None = None
     readahead_max_bytes: int | None = None
-    keep_cache: bool | None = None
     kernel_readahead_bytes: int | None = None
 
     def __post_init__(self):
@@ -53,10 +52,8 @@ class DfsProfile:
         ):
             if value is not None and (not is_integer(value) or not minimum <= value <= maximum):
                 raise ValueError("invalid DFS profile " + name)
-        if self.read_crc_mode not in (None, "off", "receiver", "both"):
+        if self.read_crc_mode not in (None, "off", "receiver"):
             raise ValueError("invalid DFS read CRC mode")
-        if self.keep_cache is not None and not isinstance(self.keep_cache, bool):
-            raise ValueError("keep_cache must be a boolean")
 
     def meta_config(self):
         return (
@@ -70,7 +67,6 @@ class DfsProfile:
             ("dfs_write_queue_bytes", self.write_queue_bytes),
             ("dfs_read_crc_mode", self.read_crc_mode),
             ("dfs_readahead_max_bytes", self.readahead_max_bytes),
-            ("dfs_fuse_keep_cache", self.keep_cache),
             ("fuse_max_readahead_bytes", self.kernel_readahead_bytes),
         )
         return "".join(f"{key} = {json.dumps(value)}\n" for key, value in values if value is not None)

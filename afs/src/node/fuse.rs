@@ -89,9 +89,6 @@ pub struct FuseMountOptions {
     pub fuse_workers: u16,
     pub fuse_max_tasks: Option<usize>,
     pub dfs_read_pipeline: crate::node::read_pipeline::ReadPipelineLimits,
-    pub dfs_fuse_keep_cache: bool,
-    pub dfs_fuse_entry_ttl_ms: u32,
-    pub dfs_fuse_attr_ttl_ms: u32,
     pub fuse_max_readahead_bytes: u32,
     /// Front-owned normal ordinary-write payload; downstream buffers are separate.
     pub dfs_write_queue_bytes: u64,
@@ -105,9 +102,6 @@ impl Default for FuseMountOptions {
             fuse_workers: 32,
             fuse_max_tasks: None,
             dfs_read_pipeline: Default::default(),
-            dfs_fuse_keep_cache: true,
-            dfs_fuse_entry_ttl_ms: 0,
-            dfs_fuse_attr_ttl_ms: 0,
             fuse_max_readahead_bytes: 16 * 1024 * 1024,
             dfs_write_queue_bytes: 2 * 1024 * 1024 * 1024,
         }
@@ -122,9 +116,6 @@ impl From<&crate::config::Config> for FuseMountOptions {
             fuse_workers: config.fuse_workers,
             fuse_max_tasks: Some(config.fuse_max_tasks),
             dfs_read_pipeline: config.dfs_read_pipeline,
-            dfs_fuse_keep_cache: config.dfs_fuse_keep_cache,
-            dfs_fuse_entry_ttl_ms: config.dfs_fuse_entry_ttl_ms,
-            dfs_fuse_attr_ttl_ms: config.dfs_fuse_attr_ttl_ms,
             fuse_max_readahead_bytes: config.fuse_max_readahead_bytes,
             dfs_write_queue_bytes: config.dfs_write_queue_bytes,
         }
@@ -144,8 +135,6 @@ impl FuseMountOptions {
             || self
                 .fuse_max_tasks
                 .is_some_and(|n| !(1..=65_536).contains(&n))
-            || self.dfs_fuse_entry_ttl_ms > 60_000
-            || self.dfs_fuse_attr_ttl_ms > 60_000
             || self.fuse_max_readahead_bytes > 16 * 1024 * 1024
             || !(8 * 1024 * 1024..=1024 * 1024 * 1024 * 1024).contains(&self.dfs_write_queue_bytes)
             || usize::try_from(self.dfs_write_queue_bytes).is_err()
@@ -1818,15 +1807,11 @@ impl AfsFuse {
         }
     }
 
+    /// Entry and attribute TTLs are zero: DFS has no cross-node kernel
+    /// invalidation, so every path lookup and getattr goes to the Node
+    /// (S1a-7, F10; positive TTLs need an invalidation scheme first).
     fn entry_ttls(&self) -> (Duration, Duration) {
-        if self.cached_io {
-            (
-                Duration::from_millis(u64::from(self.mount_options.dfs_fuse_entry_ttl_ms)),
-                Duration::from_millis(u64::from(self.mount_options.dfs_fuse_attr_ttl_ms)),
-            )
-        } else {
-            (TTL, TTL)
-        }
+        (TTL, TTL)
     }
 
     fn record_request(&self, operation: &'static str) {
@@ -2594,7 +2579,9 @@ impl Filesystem for AfsFuse {
         let file_handle_inodes = self.file_handle_inodes.clone();
         let context = Self::context(req, 0);
         let cached_io = self.cached_io;
-        let keep_cache = cached_io && self.mount_options.dfs_fuse_keep_cache;
+        // Pages survive a reopen only for the exact same pinned version
+        // (decision 4a), so keeping them is always safe (S1a-7, F8).
+        let keep_cache = cached_io;
         let cache_ids = self.page_cache_ids.clone();
         let cache_gates = self.inode_cache_gates.clone();
         let active_cached_views = self.active_cached_views.clone();
@@ -4373,13 +4360,11 @@ mod dispatch_tests {
     }
 
     #[test]
-    fn fuse_mount_options_wire_threads_clone_and_dfs_ttls_only() {
+    fn fuse_mount_options_wire_threads_clone_and_zero_ttls() {
         let options = super::FuseMountOptions {
             fuse_threads: 2,
             fuse_clone_fd: true,
             fuse_workers: 1,
-            dfs_fuse_entry_ttl_ms: 23,
-            dfs_fuse_attr_ttl_ms: 7,
             ..Default::default()
         };
         let config = super::configured_mount("afs-unit", false, options);
@@ -4399,10 +4384,7 @@ mod dispatch_tests {
         assert_eq!(fs.dispatch.capacity, 8);
         assert_eq!(fs.entry_ttls(), (Duration::ZERO, Duration::ZERO));
         fs.cached_io = true;
-        assert_eq!(
-            fs.entry_ttls(),
-            (Duration::from_millis(23), Duration::from_millis(7))
-        );
+        assert_eq!(fs.entry_ttls(), (Duration::ZERO, Duration::ZERO));
         assert!(
             super::FuseMountOptions {
                 fuse_threads: 0,

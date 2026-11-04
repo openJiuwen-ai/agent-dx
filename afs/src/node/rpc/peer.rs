@@ -18,9 +18,6 @@ mod crc32c;
 #[cfg(feature = "dfs")]
 mod read_pipeline;
 
-#[cfg(feature = "dfs")]
-mod open_read;
-
 #[cfg(all(feature = "dfs", feature = "rdma"))]
 use crate::node::dfs_read::ChunkTransfer;
 
@@ -1201,8 +1198,6 @@ impl PeerConnectionPool {
 #[cfg(feature = "dfs")]
 pub struct GrpcChunkTransfer {
     read_pipeline: std::sync::OnceLock<Arc<read_pipeline::PeerReadPipeline>>,
-    open_read_peers: Arc<std::sync::Mutex<open_read::OpenReadPeers>>,
-    fast_open_ready: std::sync::Mutex<std::collections::HashSet<(String, String, u64)>>,
     peers: Arc<PeerConnectionPool>,
     runtime: PeerRuntime,
     timeout: Duration,
@@ -1212,8 +1207,8 @@ pub struct GrpcChunkTransfer {
 #[cfg(feature = "dfs")]
 impl GrpcChunkTransfer {
     pub fn new(peers: Arc<PeerConnectionPool>, timeout: Duration) -> afs_error::Result<Self> {
-        // Standalone synchronous callers also need close retries to progress
-        // while idle. Production reuses its existing Tokio runtime.
+        // Standalone synchronous callers own a small runtime. Production
+        // reuses its existing Tokio runtime.
         let runtime = match tokio::runtime::Handle::try_current() {
             Ok(handle) => PeerRuntime::Existing(handle),
             Err(_) => PeerRuntime::Owned(Arc::new(
@@ -1224,16 +1219,12 @@ impl GrpcChunkTransfer {
                     .map_err(afs_error::Error::from)?,
             )),
         };
-        let open_read_peers = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-        open_read::start_close_retirement(&runtime, &open_read_peers, peers.clone(), timeout);
         Ok(Self {
             read_pipeline: std::sync::OnceLock::new(),
             peers,
             runtime,
             timeout,
             next_read: std::sync::atomic::AtomicU64::new(1),
-            open_read_peers,
-            fast_open_ready: std::sync::Mutex::new(std::collections::HashSet::new()),
         })
     }
 }
@@ -1269,7 +1260,6 @@ impl GrpcChunkTransfer {
             None => batch.validate(out.len())?,
         }
         let first = &batch.operations[0].source;
-        self.remember_open_read(first)?;
         let crate::dfs::CopyLocation::Node {
             node_id,
             node_epoch,
@@ -2642,7 +2632,7 @@ impl crate::node::dfs_read::ChunkTransfer for GrpcChunkTransfer {
         Box::pin(async move {
             let _read_owner = self.admit_borrowed_read().await?;
             let deadline = crate::node::read_pipeline::current_read_scope().map(|s| s.deadline);
-            self.read_crc32c_attempt_async(batch, chunk, out, true, deadline)
+            self.read_crc32c_attempt_async(batch, chunk, out, deadline)
                 .await
         })
     }
@@ -2695,17 +2685,6 @@ impl crate::node::dfs_read::ChunkTransfer for GrpcChunkTransfer {
         self.configure_native_read_pipeline(limits)
     }
 
-    fn read_owned_native_async(
-        self: Arc<Self>,
-        read: crate::node::read_pipeline::OwnedNativeRead,
-    ) -> crate::node::read_pipeline::ReadFuture<'static, crate::node::read_pipeline::OwnedNativeRead>
-    {
-        Box::pin(async move { self.read_owned_native_pipeline(read).await })
-    }
-
-    fn close_open_read_context(&self, reference: &str) -> afs_error::Result<()> {
-        self.close_open_context_impl(reference)
-    }
     fn read_crc32c_range(
         &self,
         batch: &crate::node::dfs_read::PeerReadBatch,
@@ -7056,14 +7035,6 @@ mod tests {
     #[cfg(feature = "dfs")]
     #[tonic::async_trait]
     impl afs_protocol::node_data::dfs_chunks_server::DfsChunks for DiskStreamFixture {
-        async fn close_read_context(
-            &self,
-            _request: tonic::Request<afs_protocol::node_data::DfsCloseReadContextRequest>,
-        ) -> Result<tonic::Response<afs_protocol::node_data::DfsCloseReadContextReply>, tonic::Status>
-        {
-            Err(tonic::Status::unimplemented("fixture has no open context"))
-        }
-
         type ReadRangesStream = std::pin::Pin<
             Box<
                 dyn tokio_stream::Stream<
@@ -7112,9 +7083,6 @@ mod tests {
             request: Request<DfsReadRangesRequest>,
         ) -> Result<Response<Self::ReadRangesStream>, Status> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if self.mode == 21 {
-                tokio::time::sleep(Duration::from_millis(150)).await;
-            }
             let request = request.into_inner();
             if let Some(objects) = &self.fetch_objects {
                 if let Some((target, gate)) = &self.fetch_gate
@@ -7138,43 +7106,10 @@ mod tests {
                         changed.await;
                     }
                 }
-                if self.mode == 18 && request.operations.len() > 1 {
-                    return Err(Status::unimplemented("fixture old peer rejects group"));
-                }
-                let mut frames = fetch_fixture_frames(&request, objects)?;
-                if self.mode >= 17 {
-                    for frame in &mut frames {
-                        match &mut frame.body {
-                            Some(dfs_read_ranges_frame::Body::Header(header)) => {
-                                header.blake3_outboard = Default::default();
-                                if self.mode == 20 && request.operations.len() > 1 {
-                                    header.operation_index = 77;
-                                }
-                            }
-                            Some(dfs_read_ranges_frame::Body::Completion(done)) => {
-                                done.range_checksum = Vec::new();
-                                done.range_checksum_algorithm =
-                                    afs_protocol::node_data::DfsDigestAlgorithm::ReadUnchecked
-                                        as i32;
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                let mut frames: Vec<_> = frames.into_iter().map(Ok).collect();
-                if self.mode == 19 && request.operations.len() > 1 {
-                    frames.push(Err(Status::unavailable("fixture late group error")));
-                }
-                let mut response =
+                let frames = fetch_fixture_frames(&request, objects)?;
+                let frames: Vec<_> = frames.into_iter().map(Ok).collect();
+                let response =
                     Response::new(Box::pin(tokio_stream::iter(frames)) as Self::ReadRangesStream);
-                if self.mode >= 17 {
-                    response
-                        .metadata_mut()
-                        .insert("x-afs-open-fast", "1".parse().unwrap());
-                    response
-                        .metadata_mut()
-                        .insert("x-afs-read-batch-v1", "4".parse().unwrap());
-                }
                 return Ok(response);
             }
 
@@ -7500,9 +7435,7 @@ mod tests {
                 .read_native_unified_async(
                     first,
                     16,
-                    None,
                     std::time::Instant::now() + Duration::from_secs(3),
-                    1,
                     Arc::new(()),
                 )
                 .await
@@ -7527,9 +7460,7 @@ mod tests {
             .read_native_unified_async(
                 batch,
                 16,
-                None,
                 std::time::Instant::now() + Duration::from_secs(3),
-                1,
                 Arc::new(()),
             )
             .await
@@ -7574,9 +7505,7 @@ mod tests {
                 .read_native_unified_async(
                     batch,
                     16,
-                    None,
                     std::time::Instant::now() + Duration::from_secs(3),
-                    1,
                     lifetime,
                 )
                 .await

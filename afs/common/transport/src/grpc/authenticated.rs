@@ -395,7 +395,7 @@ pub fn peer_remote_addr<T>(request: &tonic::Request<T>) -> Option<SocketAddr> {
 }
 
 #[cfg(test)]
-#[path = "../../../../src/node/rpc/data/open_read/test_tls.rs"]
+#[path = "test_tls.rs"]
 mod test_tls;
 #[cfg(test)]
 mod tests {

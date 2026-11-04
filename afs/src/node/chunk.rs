@@ -27,8 +27,6 @@ mod native_live;
 #[cfg(test)]
 mod native_live_tests;
 pub mod outboard;
-#[cfg(any(feature = "dfs", test))]
-mod read_pipeline;
 use catalog_commit::CatalogCommitter;
 #[cfg(feature = "dfs")]
 pub(crate) use native_live::NativeWriteBudgetSnapshot;
@@ -41,8 +39,6 @@ use outboard::{
     ChunkOutboard, DEFAULT_OUTBOARD_BUDGET_BYTES, MAX_ENCODED_OUTBOARD_BYTES, OutboardBuilder,
     OutboardLease, OutboardReadContext, OutboardReadWork, SharedOutboard, SidecarOutboard,
 };
-#[cfg(any(feature = "dfs", test))]
-pub(crate) use read_pipeline::FixedReadReservation;
 
 use afs_error::{Error, Result};
 use afs_tracing::tracing;
@@ -3105,11 +3101,6 @@ impl CatalogCommitTestControl {
 #[cfg(test)]
 type PeerFillTestBlock = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
-#[cfg(any(feature = "dfs", test))]
-pub(crate) type FixedPeerReaderMap = Mutex<HashMap<ChunkId, Arc<PinnedChunkReader>>>;
-#[cfg(any(feature = "dfs", test))]
-pub(crate) type FixedPeerReaders = Arc<FixedPeerReaderMap>;
-
 #[derive(Debug)]
 pub struct LocalChunkStore {
     node_id: String,
@@ -3127,6 +3118,8 @@ pub struct LocalChunkStore {
     catalog_committer: CatalogCommitter,
     next_staging: AtomicU64,
     gc_inventory_cursor: AtomicU64,
+    /// This Node's own remote-read policy as a reader. Served peer requests
+    /// follow the caller's requested mode instead.
     peer_read_crc_mode: crate::config::DfsReadCrcMode,
     read_work: Option<super::read_work::ReadWorkMetrics>,
     sidecar_installer: SidecarInstaller,
@@ -3144,8 +3137,6 @@ pub struct LocalChunkStore {
     peer_read_budget: Arc<PeerReadBudget>,
     #[cfg(any(feature = "dfs", test))]
     peer_buffer_pool: Arc<super::read_buffer::ReadBufferPool>,
-    #[cfg(any(feature = "dfs", test))]
-    fixed_peer_readers: Mutex<Vec<Weak<FixedPeerReaderMap>>>,
     #[cfg(any(feature = "dfs", test))]
     peer_read_cache: Mutex<PeerServeState>,
     #[cfg(any(feature = "dfs", test))]
@@ -3226,8 +3217,6 @@ impl LocalChunkStore {
             peer_read_budget: Arc::new(PeerReadBudget::default()),
             #[cfg(any(feature = "dfs", test))]
             peer_buffer_pool: super::read_buffer::ReadBufferPool::new("serve"),
-            #[cfg(any(feature = "dfs", test))]
-            fixed_peer_readers: Mutex::new(Vec::new()),
             #[cfg(any(feature = "dfs", test))]
             peer_read_cache: Mutex::new(PeerServeState::default()),
             #[cfg(any(feature = "dfs", test))]
@@ -4398,9 +4387,18 @@ impl LocalChunkStore {
         offset: u64,
         length: usize,
     ) -> Result<PeerReadPayload> {
-        self.read_peer_range_until(chunk_id, offset, length, self.peer_serve_deadline())
+        self.read_peer_range_until(
+            chunk_id,
+            offset,
+            length,
+            self.peer_serve_deadline(),
+            self.peer_read_crc_mode,
+        )
     }
 
+    /// `crc_mode` is the requesting peer's policy. It only decides sender-side
+    /// body verification of CRC-format objects, whose reads stay
+    /// request-private and are never shared through the object flight.
     #[cfg(any(feature = "dfs", test))]
     pub(crate) fn read_peer_range_until(
         &self,
@@ -4408,13 +4406,15 @@ impl LocalChunkStore {
         offset: u64,
         length: usize,
         deadline: Instant,
+        crc_mode: crate::config::DfsReadCrcMode,
     ) -> Result<PeerReadPayload> {
         let _reader = self.begin_peer_serve_read()?;
         // Legacy long identities remain readable, but are not retained as keys.
         let cacheable = chunk_id.0.len() <= PEER_SERVE_ID_LIMIT;
         if !cacheable {
-            let payload =
-                self.read_peer_range_private(chunk_id, offset, length, &mut None, false, deadline)?;
+            let payload = self.read_peer_range_private(
+                chunk_id, offset, length, &mut None, false, deadline, crc_mode,
+            )?;
             self.ensure_peer_serve_open()?;
             return Ok(payload);
         }
@@ -4515,8 +4515,9 @@ impl LocalChunkStore {
                 }
             }
             let mut slot = ready;
-            let payload =
-                self.read_peer_range_private(chunk_id, offset, length, &mut slot, true, deadline)?;
+            let payload = self.read_peer_range_private(
+                chunk_id, offset, length, &mut slot, true, deadline, crc_mode,
+            )?;
             self.ensure_peer_serve_open()?;
             return Ok(payload);
         }
@@ -4532,8 +4533,9 @@ impl LocalChunkStore {
                 .map_err(|_| peer_serve_unavailable("Peer serve state poisoned"))?;
             state.resident(chunk_id)
         };
-        let result =
-            self.read_peer_range_private(chunk_id, offset, length, &mut slot, true, deadline);
+        let result = self.read_peer_range_private(
+            chunk_id, offset, length, &mut slot, true, deadline, crc_mode,
+        );
         let ready = result.as_ref().ok().and_then(|payload| {
             payload
                 .object
@@ -4602,6 +4604,7 @@ impl LocalChunkStore {
     /// The private fill works without the shared table lock. Optional proof
     /// repair keeps its existing shared gates, outside that lock as well.
     #[cfg(any(feature = "dfs", test))]
+    #[allow(clippy::too_many_arguments)]
     fn read_peer_range_private(
         &self,
         chunk_id: &ChunkId,
@@ -4610,6 +4613,7 @@ impl LocalChunkStore {
         slot: &mut Option<Arc<PeerVerifiedObject>>,
         cacheable: bool,
         deadline: Instant,
+        crc_mode: crate::config::DfsReadCrcMode,
     ) -> Result<PeerReadPayload> {
         // Includes catalog/file identity work and actual read/verification;
         // excludes slot acquisition and the optional sidecar repair below.
@@ -4650,9 +4654,8 @@ impl LocalChunkStore {
                 let complete = offset.is_multiple_of(segment)
                     && ((allowed as u64).is_multiple_of(segment)
                         || offset + allowed as u64 == record.chunk.length);
-                let verify_body = self.peer_read_crc_mode == crate::config::DfsReadCrcMode::Both
-                    || (self.peer_read_crc_mode == crate::config::DfsReadCrcMode::Receiver
-                        && !complete);
+                let verify_body = crc_mode == crate::config::DfsReadCrcMode::Both
+                    || (crc_mode == crate::config::DfsReadCrcMode::Receiver && !complete);
                 reader.verify_crc_body = verify_body;
                 if reader.read_ranges_at_uncommitted(
                     &[VerifiedRangeCopy {
@@ -4982,113 +4985,7 @@ impl LocalChunkStore {
         reader.verify_full_and_build()
     }
 
-    #[cfg(any(feature = "dfs", test))]
-    pub(crate) fn register_fixed_peer_readers(&self, readers: &FixedPeerReaders) -> Result<()> {
-        let mut caches = self
-            .fixed_peer_readers
-            .lock()
-            .map_err(|_| invalid("fixed reader registry poisoned"))?;
-        caches.retain(|cache| cache.strong_count() != 0);
-        if caches.len() >= 512 {
-            return Err(peer_payload_capacity());
-        }
-        caches.push(Arc::downgrade(readers));
-        Ok(())
-    }
-    #[cfg(any(feature = "dfs", test))]
-    pub(crate) fn retire_fixed_peer_readers(&self, chunks: &[ChunkId]) -> Result<()> {
-        let caches = {
-            let mut caches = self
-                .fixed_peer_readers
-                .lock()
-                .map_err(|_| invalid("fixed reader registry poisoned"))?;
-            caches.retain(|cache| cache.strong_count() != 0);
-            caches.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()
-        };
-        for cache in caches {
-            cache
-                .lock()
-                .map_err(|_| invalid("fixed reader cache poisoned"))?
-                .retain(|id, _| !chunks.contains(id));
-        }
-        Ok(())
-    }
-
-    /// Called only after a Meta-anchored fixed-open context admits this object.
-    #[cfg(any(feature = "dfs", test))]
-    pub(crate) fn open_fixed_peer_reader(&self, id: &ChunkId) -> Result<PinnedChunkReader> {
-        // The fixed context owns its cache lock while opening. Its caller must
-        // quarantine an open error only after releasing that lock, because
-        // quarantine invalidates the same reader cache.
-        let reader = self.open_cataloged_inner(id, false)?;
-        if !reader.chunk.is_segment_crc32c() {
-            return Err(invalid("fixed open lane needs native CRC-format object"));
-        }
-        Ok(reader)
-    }
-
-    /// CRC-off immutable range: identity is established when the reader is pinned.
-    /// No repeated path open/stat/hash; IO errors retire this reader at its owner.
-    #[cfg(any(feature = "dfs", test))]
-    #[cfg(test)]
-    pub(crate) fn read_fixed_peer_range(
-        &self,
-        reader: &PinnedChunkReader,
-        offset: u64,
-        length: usize,
-        deadline: Instant,
-    ) -> Result<PeerReadPayload> {
-        if self.peer_read_crc_mode != crate::config::DfsReadCrcMode::Off
-            || offset
-                .checked_add(length as u64)
-                .is_none_or(|end| end > reader.chunk.length)
-        {
-            return Err(invalid("fixed open range or CRC policy differs"));
-        }
-        let scratch = super::chunk_crc32c::SEGMENT;
-        let mut reservation =
-            self.reserve_peer_read_payload_until(length.saturating_add(scratch), deadline)?;
-        let mut bytes = self.peer_buffer_pool.take(length, self.read_work.clone())?;
-        reservation.retain_capacity(bytes.capacity().saturating_add(scratch))?;
-        let mut done = 0;
-        while done < length {
-            let activity = self.read_work.as_ref().map(|m| {
-                m.activities
-                    .enter(crate::node::read_activity::Activity::SourceIo, 0)
-            });
-            let result = read_positioned(&reader.file, offset + done as u64, &mut bytes[done..]);
-            if let (Some(activity), Ok(got)) = (&activity, &result) {
-                activity.completed_bytes(*got as u64);
-            }
-            drop(activity);
-            let got = result?;
-            if got == 0 {
-                return Err(corrupt(&reader.chunk.id, "fixed open object ended early"));
-            }
-            done += got;
-        }
-        Ok(PeerReadPayload {
-            object: Arc::new(PeerVerifiedObject {
-                bytes,
-                outboard: None,
-                _reservation: reservation,
-                identity: None,
-                _control: self.peer_object_control(None, deadline)?,
-            }),
-            start: 0,
-            length,
-        })
-    }
-
     fn open_cataloged(&self, chunk_id: &ChunkId) -> Result<PinnedChunkReader> {
-        self.open_cataloged_inner(chunk_id, true)
-    }
-
-    fn open_cataloged_inner(
-        &self,
-        chunk_id: &ChunkId,
-        quarantine_open_error: bool,
-    ) -> Result<PinnedChunkReader> {
         #[cfg(feature = "dfs")]
         self.record_read_check(super::read_work::ReadCheck::CatalogOpen);
         let record = self
@@ -5105,7 +5002,7 @@ impl LocalChunkStore {
         let file = File::open(self.path_for_record(&record)?)
             .map_err(Error::from)
             .inspect_err(|error| {
-                if quarantine_open_error && verified_copy_is_invalid(error) {
+                if verified_copy_is_invalid(error) {
                     self.try_quarantine(chunk_id);
                 }
             })?;
@@ -5169,8 +5066,6 @@ impl LocalChunkStore {
             return Ok(());
         };
         if record.state == LocalChunkState::Quarantined {
-            #[cfg(any(feature = "dfs", test))]
-            self.retire_fixed_peer_readers(std::slice::from_ref(chunk_id))?;
             return Ok(());
         }
         match if record.segment_crc.is_some() {
@@ -5189,10 +5084,6 @@ impl LocalChunkStore {
             Err(error) if verified_copy_is_invalid(&error) => {
                 record.state = LocalChunkState::Quarantined;
                 self.commit_catalog(&admission, vec![record])?;
-                // Publish the durable quarantine first. Opening a new cache entry
-                // now fails catalog admission; existing IO owners may drain.
-                #[cfg(any(feature = "dfs", test))]
-                self.retire_fixed_peer_readers(std::slice::from_ref(chunk_id))?;
                 Ok(())
             }
             Err(error) => Err(error),
@@ -5202,8 +5093,7 @@ impl LocalChunkStore {
     pub(crate) fn try_quarantine(&self, chunk_id: &ChunkId) {
         if let Err(error) = self.quarantine_if_invalid(chunk_id) {
             // Read fallback can still succeed. No durable quarantine or report
-            // is claimed if its catalog barrier fails. A successful quarantine
-            // retires fixed readers rather than adding hot-path catalog checks.
+            // is claimed if its catalog barrier fails.
             afs_logging::warn!("dfs.local_quarantine_failed";
                 "chunk" => chunk_id.0.clone(), "error" => error.to_string());
         }
@@ -5788,127 +5678,6 @@ mod replica_replay_tests {
         assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
     }
 
-    #[test]
-    fn retirement_quarantine_invalidates_cached_fixed_reader() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = LocalChunkStore::open(temp.path(), "node-a")
-            .unwrap()
-            .with_peer_read_crc_mode(crate::config::DfsReadCrcMode::Off);
-        let staged =
-            StagedChunk::new_crc32c(OperationId::new("quarantine-cache"), vec![31; 4096]).unwrap();
-        store.put(staged.clone()).unwrap();
-        let active = Arc::new(store.open_fixed_peer_reader(&staged.chunk.id).unwrap());
-        let weak = Arc::downgrade(&active);
-        let cache = Arc::new(Mutex::new(HashMap::from([(
-            staged.chunk.id.clone(),
-            active.clone(),
-        )])));
-        store.register_fixed_peer_readers(&cache).unwrap();
-        let record = store.peer_catalog_record(&staged.chunk.id).unwrap();
-        std::fs::write(store.path_for_record(&record).unwrap(), vec![9; 4096]).unwrap();
-        store.quarantine_if_invalid(&staged.chunk.id).unwrap();
-        assert!(
-            cache.lock().unwrap().is_empty(),
-            "quarantine must retire cached fixed readers"
-        );
-        assert!(store.open_fixed_peer_reader(&staged.chunk.id).is_err());
-        drop(active);
-        assert!(
-            weak.upgrade().is_none(),
-            "retired descriptor drains with its admitted owner"
-        );
-        store.put(staged.clone()).unwrap();
-        let repaired = store.open_fixed_peer_reader(&staged.chunk.id).unwrap();
-        assert_eq!(
-            store
-                .read_fixed_peer_range(&repaired, 0, 4096, Instant::now() + Duration::from_secs(5))
-                .unwrap()
-                .as_slice(),
-            &[31; 4096]
-        );
-    }
-    #[test]
-    fn fast_open_gc_retires_cached_files_and_drains_active_reader() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = LocalChunkStore::open(temp.path(), "node-a")
-            .unwrap()
-            .with_peer_read_crc_mode(crate::config::DfsReadCrcMode::Off);
-        let staged = StagedChunk::new_crc32c(OperationId::new("fixed-gc"), vec![31; 4096]).unwrap();
-        store.put(staged.clone()).unwrap();
-        let active = Arc::new(store.open_fixed_peer_reader(&staged.chunk.id).unwrap());
-        let weak = Arc::downgrade(&active);
-        let cache = Arc::new(Mutex::new(HashMap::from([(
-            staged.chunk.id.clone(),
-            active.clone(),
-        )])));
-        store.register_fixed_peer_readers(&cache).unwrap();
-        store
-            .collect_generation(1, std::slice::from_ref(&staged.chunk.id))
-            .unwrap();
-        assert!(cache.lock().unwrap().is_empty());
-        let bytes = store
-            .read_fixed_peer_range(&active, 0, 4096, Instant::now() + Duration::from_secs(5))
-            .unwrap();
-        assert_eq!(bytes.as_slice(), &[31; 4096]);
-        drop(bytes);
-        drop(active);
-        assert!(
-            weak.upgrade().is_none(),
-            "cached descriptor must not pin an unlinked file after IO drains"
-        );
-    }
-    #[test]
-    fn fast_open_pinned_file_survives_path_replacement_and_releases_budget() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = LocalChunkStore::open(temp.path(), "node-a")
-            .unwrap()
-            .with_peer_read_crc_mode(crate::config::DfsReadCrcMode::Off);
-        let staged =
-            StagedChunk::new_crc32c(OperationId::new("fixed-file"), vec![41; 65536]).unwrap();
-        store.put(staged.clone()).unwrap();
-        let reader = store.open_fixed_peer_reader(&staged.chunk.id).unwrap();
-        let record = store.peer_catalog_record(&staged.chunk.id).unwrap();
-        let path = store.path_for_record(&record).unwrap();
-        let old = path.with_extension("retired");
-        std::fs::rename(&path, &old).unwrap();
-        std::fs::write(&path, vec![9; 65536]).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let payload = store
-            .read_fixed_peer_range(&reader, 7, 4096, deadline)
-            .unwrap();
-        assert_eq!(
-            payload.as_slice(),
-            &[41; 4096],
-            "fixed handle keeps the opened object"
-        );
-        let owner = payload.into_shared_bytes();
-        assert!(store.peer_read_budget.used.load(Ordering::Acquire) > 0);
-        drop(owner);
-        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
-        assert!(
-            store
-                .read_fixed_peer_range(&reader, u64::MAX, 1, deadline)
-                .is_err()
-        );
-        assert!(
-            store
-                .read_fixed_peer_range(&reader, 65535, 2, deadline)
-                .is_err()
-        );
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&old)
-            .unwrap()
-            .set_len(0)
-            .unwrap();
-        assert!(
-            store
-                .read_fixed_peer_range(&reader, 0, 1, deadline)
-                .is_err(),
-            "short IO must trigger recovery rather than fabricate EOF"
-        );
-        assert_eq!(store.peer_read_budget.used.load(Ordering::Acquire), 0);
-    }
     #[test]
     fn buffer_reuse_crc_off_reads_final_payload_without_scratch_copy() {
         let temp = tempfile::tempdir().unwrap();
@@ -10733,36 +10502,46 @@ mod crc_read_modes_storage_tests {
     use super::*;
     use crate::config::DfsReadCrcMode;
     #[test]
-    fn crc_read_modes_storage_checks_and_exact_boundary_fallback() {
-        for (mode, offset, len, detects) in [
-            (DfsReadCrcMode::Both, 0, 32768, true),
-            (DfsReadCrcMode::Receiver, 0, 32768, false),
-            (DfsReadCrcMode::Receiver, 1, 7, true),
-            (DfsReadCrcMode::Off, 0, 32768, false),
-            (DfsReadCrcMode::Off, 1, 7, false),
-        ] {
-            let temp = tempfile::tempdir().unwrap();
-            let store = LocalChunkStore::open(temp.path(), "node-a")
-                .unwrap()
-                .with_peer_read_crc_mode(mode);
-            let item = StagedChunk::new_crc32c(OperationId::new("modes"), vec![73; 65536]).unwrap();
-            store.put(item.clone()).unwrap();
-            let mut changed = item.bytes().to_vec();
-            changed[2] ^= 1;
-            std::fs::write(temp.path().join("chunks").join(&item.chunk.id.0), &changed).unwrap();
-            let result = store.read_peer_range_until(
-                &item.chunk.id,
-                offset,
-                len,
-                Instant::now() + Duration::from_secs(1),
-            );
-            if detects {
-                assert!(result.is_err(), "mode={mode:?}");
-            } else {
-                assert_eq!(
-                    result.unwrap().as_slice(),
-                    &changed[offset as usize..offset as usize + len]
+    fn crc_read_modes_storage_checks_follow_requested_mode_not_configured_mode() {
+        // `Both` is the non-configurable policy requested by non-grpc nodes
+        // (rdma/auto gRPC fallback) or implied by a missing header.
+        for configured in [DfsReadCrcMode::Off, DfsReadCrcMode::Receiver] {
+            for (requested, offset, len, detects) in [
+                (DfsReadCrcMode::Both, 0, 32768, true),
+                (DfsReadCrcMode::Receiver, 0, 32768, false),
+                (DfsReadCrcMode::Receiver, 1, 7, true),
+                (DfsReadCrcMode::Off, 0, 32768, false),
+                (DfsReadCrcMode::Off, 1, 7, false),
+            ] {
+                let temp = tempfile::tempdir().unwrap();
+                let store = LocalChunkStore::open(temp.path(), "node-a")
+                    .unwrap()
+                    .with_peer_read_crc_mode(configured);
+                let item =
+                    StagedChunk::new_crc32c(OperationId::new("modes"), vec![73; 65536]).unwrap();
+                store.put(item.clone()).unwrap();
+                let mut changed = item.bytes().to_vec();
+                changed[2] ^= 1;
+                std::fs::write(temp.path().join("chunks").join(&item.chunk.id.0), &changed)
+                    .unwrap();
+                let result = store.read_peer_range_until(
+                    &item.chunk.id,
+                    offset,
+                    len,
+                    Instant::now() + Duration::from_secs(1),
+                    requested,
                 );
+                if detects {
+                    assert!(
+                        result.is_err(),
+                        "configured={configured:?} requested={requested:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        result.unwrap().as_slice(),
+                        &changed[offset as usize..offset as usize + len]
+                    );
+                }
             }
         }
     }

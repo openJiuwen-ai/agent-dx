@@ -108,13 +108,13 @@ def cached_reuse(c):
 def cases():
     result = []
     for prefix, tag in [("local", "local-read-special"), ("cluster", "cluster-read-special")]:
-        for mode in ("off", "receiver", "both"):
+        for mode in ("off", "receiver"):
             result.append(Case("dfs.read." + prefix + ".ranges_crc_" + mode, (tag,), "dfs", (), crc_ranges,
                                profile=DfsProfile(read_crc_mode=mode, kernel_readahead_bytes=0)))
         result.append(Case("dfs.read." + prefix + ".prefetch_release", (tag,), "dfs", (), prefetch_lifetime,
                            profile=DfsProfile(read_crc_mode="off", readahead_max_bytes=16 * MIB)))
         result.append(Case("dfs.read." + prefix + ".cached_reuse", (tag,), "dfs", (), cached_reuse,
-                           profile=DfsProfile(keep_cache=True, kernel_readahead_bytes=16 * MIB,
+                           profile=DfsProfile(kernel_readahead_bytes=16 * MIB,
                                               read_crc_mode="off", readahead_max_bytes=16 * MIB)))
     return tuple(result)
 

@@ -79,14 +79,6 @@ impl GcReferences {
     ) -> Result<Arc<GcPin>> {
         self.pin_mode(inode, version, publication, false, false)
     }
-    pub(crate) fn pin_fenced(
-        self: &Arc<Self>,
-        inode: &InodeId,
-        version: Option<&FileVersionId>,
-        operation: &crate::dfs::OperationId,
-    ) -> Result<Arc<GcPin>> {
-        self.pin_mode(inode, version, Some(operation), true, false)
-    }
     pub(crate) fn pin_generation(
         self: &Arc<Self>,
         inode: &InodeId,

@@ -67,22 +67,8 @@ impl GrpcChunkTransfer {
         chunk: &ChunkObject,
         out: &mut [u8],
     ) -> afs_error::Result<()> {
-        self.read_crc32c_attempt(batch, chunk, out, true)
-    }
-    fn read_crc32c_attempt(
-        &self,
-        batch: &PeerReadBatch,
-        chunk: &ChunkObject,
-        out: &mut [u8],
-        allow_compact: bool,
-    ) -> afs_error::Result<()> {
-        self.runtime.block_on(self.read_crc32c_attempt_async(
-            batch,
-            chunk,
-            out,
-            allow_compact,
-            None,
-        ))
+        self.runtime
+            .block_on(self.read_crc32c_attempt_async(batch, chunk, out, None))
     }
 
     pub(super) async fn read_crc32c_attempt_async(
@@ -90,32 +76,11 @@ impl GrpcChunkTransfer {
         batch: &PeerReadBatch,
         chunk: &ChunkObject,
         out: &mut [u8],
-        allow_compact: bool,
         deadline: Option<std::time::Instant>,
     ) -> afs_error::Result<()> {
-        let fast_requested = self.peers.read_crc_mode == crate::config::DfsReadCrcMode::Off
-            && batch.operations.len() == 1
-            && batch.operations[0]
-                .source
-                .read_grant
-                .token
-                .starts_with("dfs-open-v1:read-open:");
-        if fast_requested {
-            let op = &batch.operations[0].op;
-            if op.output_offset != 0
-                || op.length != out.len() as u64
-                || op.length == 0
-                || op.length > crate::node::dfs_read::MAX_DFS_READ_BYTES
-                || batch.file_version_id.0.is_empty()
-                || batch.layout_root_id.0.is_empty()
-            {
-                return Err(dfs_protocol_error("fixed open output range differs"));
-            }
-        } else {
-            batch.validate(out.len())?;
-        }
+        batch.validate(out.len())?;
         if !chunk.is_segment_crc32c()
-            || (!fast_requested && !chunk.valid_immutable_identity())
+            || !chunk.valid_immutable_identity()
             || batch.operations.len() != 1
         {
             return Err(dfs_protocol_error(
@@ -123,7 +88,6 @@ impl GrpcChunkTransfer {
             ));
         }
         let item = &batch.operations[0];
-        self.remember_open_read(&item.source)?;
         if item.op.chunk_id != chunk.id
             || item.source.chunk_id != chunk.id
             || item
@@ -142,29 +106,13 @@ impl GrpcChunkTransfer {
         else {
             return Err(dfs_protocol_error("CRC source is not a Node replica"));
         };
-        let context_key = (
-            item.source.read_grant.token.clone(),
-            node_id.clone(),
-            *node_epoch,
-        );
-        let compact = allow_compact
-            && fast_requested
-            && self
-                .fast_open_ready
-                .lock()
-                .map_err(|_| dfs_protocol_error("fixed open readiness table poisoned"))?
-                .contains(&context_key);
         if let Some(metrics) = &self.peers.read_work_metrics {
-            metrics.check(if compact {
-                crate::node::read_work::ReadCheck::CompactGrant
-            } else {
-                crate::node::read_work::ReadCheck::FullGrant
-            });
+            metrics.check(crate::node::read_work::ReadCheck::FullGrant);
         }
         let sequence = self
             .next_read
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut request = DfsReadRangesRequest {
+        let request = DfsReadRangesRequest {
             read_id: format!("crc-{}-{sequence}", item.source.read_grant.caller_node_id),
             attempt_id: format!("{node_id}-{node_epoch}-{sequence}"),
             file_version_id: batch.file_version_id.0.clone(),
@@ -180,117 +128,64 @@ impl GrpcChunkTransfer {
                 grant: Some(wire_dfs_read_grant(&item.source.read_grant)),
             }],
         };
-        if compact {
-            request.operations[0].grant = Some(afs_protocol::node_data::DfsReadGrant {
-                token: item.source.read_grant.token.clone(),
-                ..Default::default()
-            });
-        }
         let timeout = deadline
             .map(|d| crate::node::read_pipeline::remaining_read_budget(d, self.timeout))
             .transpose()?
             .unwrap_or(self.timeout);
-        let result = async {
-            tokio::time::timeout(timeout, async {
-                let channel = self
-                    .peers
-                    .channel(
-                        node_id,
-                        *node_epoch,
-                        item.source
-                            .data_endpoint
-                            .as_ref()
-                            .ok_or_else(|| dfs_protocol_error("CRC source endpoint missing"))?,
-                    )
-                    .await?;
-                let mut client = DfsChunksClient::new(channel)
-                    .max_encoding_message_size(self.peers.config.max_encoding_message_bytes)
-                    .max_decoding_message_size(self.peers.config.max_decoding_message_bytes);
-                let mut wire_request = tonic::Request::new(request.clone());
-                wire_request.metadata_mut().insert(
-                    "x-afs-read-crc-mode",
-                    tonic::metadata::MetadataValue::from_static(self.peers.read_crc_mode.as_str()),
-                );
-                if fast_requested {
-                    wire_request.metadata_mut().insert(
-                        "x-afs-open-fast",
-                        tonic::metadata::MetadataValue::from_static("1"),
-                    );
-                }
-                if let Some(deadline) = deadline {
-                    wire_request.set_timeout(crate::node::read_pipeline::remaining_read_budget(
-                        deadline,
-                        self.timeout,
-                    )?);
-                }
-                if let Some(metrics) = &self.peers.read_work_metrics {
-                    metrics.read_rpc("peer_read_ranges");
-                }
-                let _activity = self.peers.read_work_metrics.as_ref().map(|m| {
-                    m.activities
-                        .enter(crate::node::read_activity::Activity::RangeRpc, 0)
-                });
-                let response = client
-                    .read_ranges(wire_request)
-                    .await
-                    .map_err(peer_status_error)?;
-                self.note_native_batch_capability(batch, response.metadata());
-                let fast_accepted = fast_requested
-                    && response
-                        .metadata()
-                        .get("x-afs-open-fast")
-                        .is_some_and(|v| v == "1");
-                let mut stream = response.into_inner();
-                if compact && !fast_accepted {
-                    return Err(afs_error::Error::coded(
-                        afs_error::NODE_TRANSFER_UNAVAILABLE,
-                        "fixed open setup required",
-                    ));
-                }
-                let mut decoder = CrcRangeDecoder::new(&request, chunk, out)?;
-                decoder.metrics = self.peers.read_work_metrics.clone();
-                decoder.mode = self.peers.read_crc_mode;
-                decoder.fast_open = fast_accepted;
-                while let Some(frame) = stream.message().await.map_err(peer_status_error)? {
-                    decoder.accept(frame)?;
-                }
-                decoder.finish()?;
-                if fast_accepted {
-                    let mut ready = self
-                        .fast_open_ready
-                        .lock()
-                        .map_err(|_| dfs_protocol_error("fixed open readiness table poisoned"))?;
-                    if ready.len() < 128 * 32 {
-                        ready.insert(context_key.clone());
-                    }
-                }
-                Ok(())
-            })
-            .await
-            .map_err(|_| {
-                afs_error::Error::coded(
-                    afs_error::CLIENT_DEADLINE_EXCEEDED,
-                    "CRC range deadline exceeded",
+        tokio::time::timeout(timeout, async {
+            let channel = self
+                .peers
+                .channel(
+                    node_id,
+                    *node_epoch,
+                    item.source
+                        .data_endpoint
+                        .as_ref()
+                        .ok_or_else(|| dfs_protocol_error("CRC source endpoint missing"))?,
                 )
-            })?
-        }
-        .await;
-        if compact
-            && result
-                .as_ref()
-                .is_err_and(|e| e.code() == afs_error::NODE_TRANSFER_UNAVAILABLE)
-        {
-            if let Some(metrics) = &self.peers.read_work_metrics {
-                metrics.check(crate::node::read_work::ReadCheck::ContextRecover);
+                .await?;
+            let mut client = DfsChunksClient::new(channel)
+                .max_encoding_message_size(self.peers.config.max_encoding_message_bytes)
+                .max_decoding_message_size(self.peers.config.max_decoding_message_bytes);
+            let mut wire_request = tonic::Request::new(request.clone());
+            wire_request.metadata_mut().insert(
+                "x-afs-read-crc-mode",
+                tonic::metadata::MetadataValue::from_static(self.peers.read_crc_mode.as_str()),
+            );
+            if let Some(deadline) = deadline {
+                wire_request.set_timeout(crate::node::read_pipeline::remaining_read_budget(
+                    deadline,
+                    self.timeout,
+                )?);
             }
-            self.fast_open_ready
-                .lock()
-                .map_err(|_| dfs_protocol_error("fixed open readiness table poisoned"))?
-                .remove(&context_key);
-            return Box::pin(self.read_crc32c_attempt_async(batch, chunk, out, false, deadline))
-                .await;
-        }
-        result
+            if let Some(metrics) = &self.peers.read_work_metrics {
+                metrics.read_rpc("peer_read_ranges");
+            }
+            let _activity = self.peers.read_work_metrics.as_ref().map(|m| {
+                m.activities
+                    .enter(crate::node::read_activity::Activity::RangeRpc, 0)
+            });
+            let response = client
+                .read_ranges(wire_request)
+                .await
+                .map_err(peer_status_error)?;
+            let mut stream = response.into_inner();
+            let mut decoder = CrcRangeDecoder::new(&request, chunk, out)?;
+            decoder.metrics = self.peers.read_work_metrics.clone();
+            decoder.mode = self.peers.read_crc_mode;
+            while let Some(frame) = stream.message().await.map_err(peer_status_error)? {
+                decoder.accept(frame)?;
+            }
+            decoder.finish()?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| {
+            afs_error::Error::coded(
+                afs_error::CLIENT_DEADLINE_EXCEEDED,
+                "CRC range deadline exceeded",
+            )
+        })?
     }
 }
 
@@ -304,7 +199,6 @@ pub(super) struct CrcRangeDecoder<'a> {
     out: &'a mut [u8],
     table: Option<CrcTable>,
     header_seen: bool,
-    fast_open: bool,
     mode: crate::config::DfsReadCrcMode,
     cursor: usize,
     complete: bool,
@@ -326,24 +220,11 @@ impl<'a> CrcRangeDecoder<'a> {
             out,
             table: None,
             header_seen: false,
-            fast_open: false,
             mode: crate::config::DfsReadCrcMode::Both,
             cursor: 0,
             complete: false,
             metrics: None,
         })
-    }
-    pub(super) fn new_fast(
-        request: &'a DfsReadRangesRequest,
-        chunk: &'a ChunkObject,
-        out: &'a mut [u8],
-        metrics: Option<ReadWorkMetrics>,
-    ) -> afs_error::Result<Self> {
-        let mut decoder = Self::new(request, chunk, out)?;
-        decoder.metrics = metrics;
-        decoder.mode = crate::config::DfsReadCrcMode::Off;
-        decoder.fast_open = true;
-        Ok(decoder)
     }
 
     pub(super) fn accept(
@@ -365,7 +246,7 @@ impl<'a> CrcRangeDecoder<'a> {
                     || header.length != op.length
                     || header.source_copy_id != op.source_copy_id
                     || !header.blake3_outboard.is_empty()
-                    || (!self.fast_open && header.crc32c_table.is_empty())
+                    || header.crc32c_table.is_empty()
                     || header.crc32c_table.len() > 4096
                 {
                     return Err(dfs_protocol_error(
@@ -373,9 +254,6 @@ impl<'a> CrcRangeDecoder<'a> {
                     ));
                 }
                 self.header_seen = true;
-                if self.fast_open && self.mode == crate::config::DfsReadCrcMode::Off {
-                    return Ok(());
-                }
                 if let Some(metrics) = &self.metrics {
                     metrics.check(crate::node::read_work::ReadCheck::DescriptorDecode);
                 }
@@ -517,45 +395,6 @@ impl<'a> CrcRangeDecoder<'a> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn fast_open_descriptorless_off_is_negotiated_and_lengths_still_checked() {
-        let mode = crate::config::DfsReadCrcMode::Off;
-        let (chunk, request, mut frames, expected) = mode_frames(0, 65536, mode, false);
-        if let Some(dfs_read_ranges_frame::Body::Header(header)) = frames[0].body.as_mut() {
-            header.crc32c_table.clear();
-        }
-        let mut out = vec![0; expected.len()];
-        let mut legacy = CrcRangeDecoder::new(&request, &chunk, &mut out).unwrap();
-        legacy.mode = mode;
-        assert!(
-            legacy.accept(frames[0].clone()).is_err(),
-            "old lane does not silently accept a new envelope"
-        );
-        let mut decoder = CrcRangeDecoder::new(&request, &chunk, &mut out).unwrap();
-        decoder.mode = mode;
-        decoder.fast_open = true;
-        for frame in frames.clone() {
-            decoder.accept(frame).unwrap();
-        }
-        decoder.finish().unwrap();
-        assert_eq!(out, expected);
-        if let Some(dfs_read_ranges_frame::Body::Completion(done)) =
-            frames.last_mut().unwrap().body.as_mut()
-        {
-            done.transferred_bytes += 1;
-        }
-        let mut decoder = CrcRangeDecoder::new(&request, &chunk, &mut out).unwrap();
-        decoder.mode = mode;
-        decoder.fast_open = true;
-        let last = frames.pop().unwrap();
-        for frame in frames {
-            decoder.accept(frame).unwrap();
-        }
-        assert!(
-            decoder.accept(last).is_err(),
-            "length mismatches remain errors with CRC off"
-        );
-    }
     fn mode_frames(
         offset: usize,
         len: usize,

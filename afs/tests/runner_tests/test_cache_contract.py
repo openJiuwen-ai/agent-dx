@@ -113,7 +113,7 @@ class CacheEvidenceTests(unittest.TestCase):
             "dfs.cache.warm_permission_change",
         })
         self.assertEqual(len(select(cases, suite="all-basic")), 22)
-        self.assertEqual(len(select(cases, suite="all-special")), 20)
+        self.assertEqual(len(select(cases, suite="all-special")), 18)
 
     def test_observation_is_boolean_and_dfs_only(self):
         from fixtures.common import Case

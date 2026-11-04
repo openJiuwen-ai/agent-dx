@@ -1,7 +1,7 @@
-//! Fixed-open async range preparation; shares cache validation, authority and
+//! Async native range preparation; shares cache validation, authority and
 //! retry rules with synchronous reads, publishing only a complete private reply.
 use super::*;
-use crate::node::read_pipeline::{OwnedNativeRead, ReadPipelineLimits};
+use crate::node::read_pipeline::ReadPipelineLimits;
 
 impl DfsReadEngine {
     pub(crate) fn with_read_pipeline(mut self, limits: ReadPipelineLimits) -> Result<Self> {
@@ -109,138 +109,11 @@ impl DfsReadEngine {
         self.external_backend.is_none() && self.transfer.supports_async_native_read()
     }
 
-    async fn reserve_owned_native_read(
-        &self,
-        batch: PeerReadBatch,
-        chunk: ChunkObject,
-        length: usize,
-        deadline: Instant,
-        group_handle: u64,
-        lifetime: crate::node::read_pipeline::ReadLifetime,
-    ) -> Result<OwnedNativeRead> {
-        Ok(OwnedNativeRead {
-            batch,
-            chunk,
-            buffer: Vec::new().into(),
-            bytes: Vec::new(),
-            deadline,
-            group_handle,
-            _lifetime: lifetime,
-            activity: None,
-            allocation: Some(crate::node::read_pipeline::NativeReadAllocation {
-                length,
-                pool: self.reply_buffer_pool.clone(),
-                admission: self.reply_admission.clone(),
-                local: self.local.clone(),
-            }),
-        })
-    }
-
-    pub(crate) async fn read_fixed_open_async(
-        &self,
-        batch: &ReadBatch,
-        output_len: usize,
-        reference: String,
-        deadline: Instant,
-        group_handle: u64,
-        lifetime: crate::node::read_pipeline::ReadLifetime,
-    ) -> Result<Option<prost::bytes::Bytes>> {
-        if self.external_backend.is_some()
-            || batch.ops.len() != 1
-            || batch.ops[0].output_offset != 0
-            || batch.ops[0].length != output_len as u64
-        {
-            return Ok(None);
-        }
-        let authority = self.capture_native_read_authority()?;
-        let op = &batch.ops[0];
-        let version = batch
-            .file_version_id
-            .clone()
-            .ok_or_else(|| invalid("fixed open version absent"))?;
-        let key = (reference.clone(), op.chunk_id.clone());
-        let cached = self
-            .fixed_open_routes
-            .lock()
-            .map_err(|_| unavailable("fixed open route cache poisoned"))?
-            .entries
-            .get(&key)
-            .map(|(sources, _)| sources.clone());
-        let was_cached = cached.is_some();
-        let mut resolved = cached;
-        let mut last_error = None;
-        for attempt in 0..2 {
-            if Instant::now() >= deadline {
-                return Err(unavailable("fixed open read expired"));
-            }
-            if resolved.is_none() {
-                resolved = tokio::time::timeout_at(
-                    tokio::time::Instant::from_std(deadline),
-                    self.sources_for_attempt_async(batch, true, deadline, lifetime.clone()),
-                )
-                .await
-                .map_err(|_| unavailable("fixed source lookup expired"))??
-                .into_iter()
-                .find(|set| set.chunk_id == op.chunk_id)
-                .map(Arc::new);
-            }
-            let set = resolved
-                .take()
-                .ok_or_else(|| corrupt("fixed open object source absent"))?;
-            let Some(chunk) = set.chunk.as_ref().filter(|chunk| chunk.is_segment_crc32c()) else {
-                return Ok(None);
-            };
-            if set.sources.iter().any(|source| source.state.is_readable()
-                && matches!(&source.location, CopyLocation::Node { node_id, .. } if node_id == &self.local_node_id))
-            {
-                return Ok(None);
-            }
-            for candidate in set.sources.iter().filter(|source| source.state.is_readable()
-                && matches!(source.role, CopyRole::DurableReplica | CopyRole::VerifiedCache)
-                && matches!(&source.location, CopyLocation::Node { node_id, .. } if node_id != &self.local_node_id))
-            {
-                let mut source = candidate.clone();
-                source.read_grant.token = format!("dfs-open-v1:{reference}");
-                let request = PeerReadBatch { file_version_id: version.clone(),
-                    layout_root_id: batch.layout_root_id.clone(),
-                    operations: vec![ResolvedReadOp { op: op.clone(), source }],
-                };
-                let owned = self.reserve_owned_native_read(request, chunk.clone(), output_len, deadline, group_handle, lifetime.clone()).await?;
-                match self.transfer.clone().read_owned_native_async(owned).await {
-                    Ok(read) => {
-                        self.check_native_read_authority(&authority)?;
-                        if !was_cached || attempt != 0 {
-                            self.install_fixed_async_route(&key, &version, &batch.layout_root_id, &set)?;
-                        }
-                        return Ok(Some(read.into_reply()));
-                    }
-                    Err(error) => last_error = Some(error),
-                }
-            }
-            self.invalidate_native_batch_authority(batch);
-            {
-                let mut cache = self
-                    .fixed_open_routes
-                    .lock()
-                    .map_err(|_| unavailable("fixed open route cache poisoned"))?;
-                if let Some((_, bytes)) = cache.entries.remove(&key) {
-                    cache.bytes = cache.bytes.saturating_sub(bytes);
-                }
-            }
-            if attempt == 0 {
-                self.capture_native_read_authority()?;
-            }
-        }
-        Err(last_error.unwrap_or_else(|| corrupt("fixed open has no readable peer copy")))
-    }
-
     pub(crate) async fn read_native_unified_async(
         &self,
         batch: ReadBatch,
         output_len: usize,
-        reference: Option<String>,
         deadline: Instant,
-        group_handle: u64,
         lifetime: crate::node::read_pipeline::ReadLifetime,
     ) -> Result<prost::bytes::Bytes> {
         let scope = crate::node::read_pipeline::ReadScope {
@@ -251,22 +124,6 @@ impl DfsReadEngine {
             self.validate_native_read_size(output_len)?;
             batch.validate_for_output(output_len, &self.config)?;
             self.validate_private_native_ranges(&batch)?;
-            if self.local.peer_read_crc_mode() == crate::config::DfsReadCrcMode::Off
-                && self.peer_cache.is_none()
-                && let Some(reference) = reference.as_ref()
-                && let Some(bytes) = self
-                    .read_fixed_open_async(
-                        &batch,
-                        output_len,
-                        reference.clone(),
-                        deadline,
-                        group_handle,
-                        lifetime.clone(),
-                    )
-                    .await?
-            {
-                return Ok(bytes);
-            }
             let authority = self.capture_native_read_authority()?;
             let allocation = crate::node::read_pipeline::NativeReadAllocation {
                 length: output_len,
@@ -291,7 +148,6 @@ impl DfsReadEngine {
                 &mut reply.buffer,
                 true,
                 Some(deadline),
-                reference.as_deref(),
                 lifetime,
             )
             .await
@@ -335,7 +191,6 @@ impl DfsReadEngine {
                 &mut reply.buffer,
                 true,
                 Some(deadline),
-                None,
                 lifetime,
             )
             .await?;
@@ -386,40 +241,5 @@ impl DfsReadEngine {
             data,
             _bytes: bytes,
         }))
-    }
-
-    fn install_fixed_async_route(
-        &self,
-        key: &(String, ChunkId),
-        version: &FileVersionId,
-        layout: &LayoutRootId,
-        set: &Arc<ChunkSources>,
-    ) -> Result<()> {
-        let charge =
-            SourceCache::retained_bytes(&(version.clone(), layout.clone(), key.1.clone()), set)
-                .saturating_mul(2)
-                .saturating_add(key.0.len() + 1024);
-        let mut cache = self
-            .fixed_open_routes
-            .lock()
-            .map_err(|_| unavailable("fixed open route cache poisoned"))?;
-        if charge <= MAX_SOURCE_CACHE_BYTES {
-            if let Some((_, old)) = cache.entries.remove(key) {
-                cache.bytes = cache.bytes.saturating_sub(old);
-            }
-            while cache.entries.len() >= 512
-                || cache.bytes.saturating_add(charge) > MAX_SOURCE_CACHE_BYTES
-            {
-                let Some(old) = cache.entries.keys().next().cloned() else {
-                    break;
-                };
-                if let Some((_, bytes)) = cache.entries.remove(&old) {
-                    cache.bytes = cache.bytes.saturating_sub(bytes);
-                }
-            }
-            cache.bytes = cache.bytes.saturating_add(charge);
-            cache.entries.insert(key.clone(), (set.clone(), charge));
-        }
-        Ok(())
     }
 }

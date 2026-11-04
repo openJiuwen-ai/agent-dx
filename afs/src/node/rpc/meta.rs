@@ -1158,17 +1158,7 @@ impl GrpcDfsMeta {
         self.read_diagnostic(
             crate::node::read_work::ReadDiagnosticStage::MetaValidateReadGrants,
             || {
-                self.record_read_rpc(
-                    if request
-                        .validations
-                        .first()
-                        .is_some_and(|v| v.grant.token.starts_with("dfs-open-v1:"))
-                    {
-                        "validate_open_read_context"
-                    } else {
-                        "validate_read_grants"
-                    },
-                );
+                self.record_read_rpc("validate_read_grants");
                 let validations = request
                     .validations
                     .into_iter()

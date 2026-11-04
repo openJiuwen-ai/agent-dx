@@ -264,8 +264,6 @@ pub struct DistributedFs {
     remote_owner_factory: Option<Arc<dyn DfsRemoteOwnerFactory>>,
     handles: DfsHandleTable,
     gc_references: Option<Arc<crate::node::gc::GcReferences>>,
-    optimistic_gc_commit: bool,
-    crc32c_writes: bool,
     gc_gate: Mutex<()>,
     dir_handles: Mutex<HashMap<u64, DfsDirectoryHandle>>,
     inode_writes: ShardedMap<InodeId, SharedInodeWriteState>,
@@ -2476,8 +2474,6 @@ impl DistributedFs {
             remote_owner_factory: None,
             handles: DfsHandleTable::default(),
             gc_references: None,
-            optimistic_gc_commit: false,
-            crc32c_writes: false,
             gc_gate: Mutex::new(()),
             dir_handles: Mutex::new(HashMap::new()),
             inode_writes: ShardedMap::default(),
@@ -2537,20 +2533,17 @@ impl DistributedFs {
         self.gc_references = references;
         self
     }
-    pub(crate) fn with_crc32c_writes(mut self, enabled: bool) -> Self {
-        self.crc32c_writes = enabled;
-        self
+    /// Native storage writes segmented-CRC32C objects; S3 stores only
+    /// canonical BLAKE3 objects (decision recorded in S1a-7, F6).
+    fn crc32c_writes(&self) -> bool {
+        !self.read_engine.has_external_backend()
     }
     fn stage_native_chunk(&self, op: OperationId, bytes: SharedChunkBytes) -> Result<StagedChunk> {
-        if self.crc32c_writes {
+        if self.crc32c_writes() {
             StagedChunk::from_shared_crc32c(op, bytes)
         } else {
             Ok(StagedChunk::from_shared(op, bytes))
         }
-    }
-    pub(crate) fn with_optimistic_gc_commit(mut self, enabled: bool) -> Self {
-        self.optimistic_gc_commit = enabled;
-        self
     }
     pub fn flush_gc_releases(&self) -> Result<()> {
         if let Some(references) = &self.gc_references {
@@ -2945,13 +2938,7 @@ impl DistributedFs {
                 self.gc_references
                     .as_ref()
                     .map(|references| {
-                        if self.optimistic_gc_commit && self.crc32c_writes {
-                            references.pin_generation(&snapshot.inode_id, None, &operation_id)
-                        } else if self.optimistic_gc_commit {
-                            references.pin_fenced(&snapshot.inode_id, None, &operation_id)
-                        } else {
-                            references.pin(&snapshot.inode_id, None, Some(&operation_id))
-                        }
+                        references.pin_generation(&snapshot.inode_id, None, &operation_id)
                     })
                     .transpose()?
             } else {
@@ -4468,7 +4455,7 @@ impl DistributedFs {
         offset: u64,
         size: usize,
     ) -> Result<Vec<u8>> {
-        self.read_committed_inode_owned_hint(inode, offset, size, &mut None, None, None)
+        self.read_committed_inode_owned_hint(inode, offset, size, &mut None, None)
             .map(crate::node::read_buffer::ReadBuffer::into_vec)
     }
 
@@ -4480,7 +4467,6 @@ impl DistributedFs {
         size: usize,
         hint: &mut Option<ReadBatch>,
         deadline: Option<Instant>,
-        open_reference: Option<&str>,
     ) -> Result<crate::node::read_buffer::ReadBuffer> {
         let cached = self.readonly_version_for_inode(inode)?;
         let length = cached.layout.file_length;
@@ -4490,12 +4476,10 @@ impl DistributedFs {
         let count = usize::try_from((length - offset).min(size as u64))
             .map_err(|_| invalid("read length is too large"))?;
         let batch = cached.read_batch(offset, count, self.read_engine.source_lookahead_chunks())?;
-        if let Some(result) = self.read_engine.read_batch_native_open_owned_before(
-            &batch,
-            count,
-            deadline,
-            open_reference,
-        )? {
+        if let Some(result) = self
+            .read_engine
+            .read_batch_native_open_owned_before(&batch, count, deadline)?
+        {
             if self.read_engine.readahead_object_limit() != 0 {
                 *hint = Some(batch);
             }
@@ -4503,12 +4487,7 @@ impl DistributedFs {
         }
         let mut result = vec![0; count];
         self.read_engine
-            .read_batch_native_open_into_private_before(
-                &batch,
-                &mut result,
-                deadline,
-                open_reference,
-            )?;
+            .read_batch_native_open_into_private_before(&batch, &mut result, deadline)?;
         if self.read_engine.readahead_object_limit() != 0 {
             *hint = Some(batch);
         }
@@ -5356,7 +5335,7 @@ impl DistributedFs {
             frozen,
             operation_id.clone(),
             layout_id,
-            self.crc32c_writes,
+            self.crc32c_writes(),
         )?;
         let mut receipts: Vec<ChunkReceipt> = Vec::new();
         for extent in frozen.dirty_extents.extents.values() {
@@ -5505,30 +5484,17 @@ impl DistributedFs {
         let gc_pin = match (&frozen.dirty_extents.native_gc_pin, &self.gc_references) {
             (Some(pin), _) => Some(pin.clone()),
             (None, Some(references)) => Some(
-                (if self.optimistic_gc_commit && self.crc32c_writes {
-                    references.pin_generation(
+                references
+                    .pin_generation(
                         &frozen.inode.inode_id,
                         frozen.inode.head_version.as_ref(),
                         &operation_id,
                     )
-                } else if self.optimistic_gc_commit {
-                    references.pin_fenced(
-                        &frozen.inode.inode_id,
-                        frozen.inode.head_version.as_ref(),
-                        &operation_id,
-                    )
-                } else {
-                    references.pin(
-                        &frozen.inode.inode_id,
-                        frozen.inode.head_version.as_ref(),
-                        Some(&operation_id),
-                    )
-                })
-                .map_err(|error| PrepareCommitError { error })?,
+                    .map_err(|error| PrepareCommitError { error })?,
             ),
             (None, None) => None,
         };
-        if self.optimistic_gc_commit {
+        if self.gc_references.is_some() {
             // Length-only generations have no write-time pin. Freeze their
             // captured fence as well; preparation retries never refresh it.
             frozen.dirty_extents.native_gc_pin = gc_pin.clone();
@@ -5583,7 +5549,7 @@ impl DistributedFs {
             created_at_unix_ms: now,
         };
         let gc_fence = gc_pin.as_ref().and_then(|pin| pin.fence());
-        if self.optimistic_gc_commit && gc_fence.is_none() {
+        if self.gc_references.is_some() && gc_fence.is_none() {
             return Err(PrepareCommitError {
                 error: unavailable("optimistic commit has no frozen GC fence"),
             });
@@ -13338,10 +13304,7 @@ mod tests {
         let (_temp, meta, fs) = test_fs();
         let control = Arc::new(Pr88GcControl::default());
         let references = crate::node::gc::GcReferences::new(control.clone());
-        let fs = fs
-            .with_gc_references(Some(references.clone()))
-            .with_optimistic_gc_commit(true)
-            .with_crc32c_writes(true);
+        let fs = fs.with_gc_references(Some(references.clone()));
         let file = fs
             .create(
                 &context(),
@@ -13452,9 +13415,7 @@ mod tests {
         let control = Arc::new(Pr88GcControl::default());
         let references = crate::node::gc::GcReferences::new(control.clone());
         let fs = distributed_fs_with_chunk_store(meta.clone(), local.clone(), store.clone())
-            .with_gc_references(Some(references.clone()))
-            .with_optimistic_gc_commit(true)
-            .with_crc32c_writes(true);
+            .with_gc_references(Some(references.clone()));
         let file = fs
             .create(
                 &context(),
@@ -13560,7 +13521,6 @@ mod tests {
     #[test]
     fn crc32c_vfs_partial_overwrite_and_truncate() {
         let (_temp, meta, fs) = test_fs();
-        let fs = fs.with_crc32c_writes(true);
         let file = fs
             .create(
                 &context(),
@@ -14383,6 +14343,18 @@ mod tests {
         assert_eq!(meta.commit_count(), 1);
         assert_eq!(store.objects(), 1);
         fs.release(&context(), created.handle).unwrap();
+    }
+
+    /// The retained body of a frozen extent: inline for S3 (BLAKE3) tails, or
+    /// held by its native upload for CRC32C tails, which keep their immutable
+    /// object id across retries (S1a-7, F6).
+    fn frozen_extent_body(extent: &DirtyExtent) -> Option<SharedChunkBytes> {
+        extent.data.clone().or_else(|| {
+            extent
+                .native_upload
+                .as_ref()
+                .and_then(|upload| upload.state.lock().unwrap().body.clone())
+        })
     }
 
     fn s3_payload(chunks: usize) -> Vec<u8> {
@@ -15799,6 +15771,15 @@ mod tests {
                 self.active.lock().unwrap().insert(id.into());
                 Ok(())
             }
+            fn retain_fenced(
+                &self,
+                id: &str,
+                _: &InodeId,
+                _: Option<&FileVersionId>,
+            ) -> Result<crate::dfs::GcFence> {
+                self.active.lock().unwrap().insert(id.into());
+                Ok(crate::dfs::GcFence::WriteGeneration)
+            }
             fn release(&self, id: &str) -> Result<()> {
                 self.active.lock().unwrap().remove(id);
                 Ok(())
@@ -15834,7 +15815,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|id| id.starts_with("publish:"))
+                .filter(|id| id.starts_with("write:"))
                 .count(),
             1,
             "uploaded but unpublished generation must remain protected"
@@ -15848,7 +15829,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|id| id.starts_with("publish:"))
+                .filter(|id| id.starts_with("write:"))
                 .count(),
             0,
             "published generation must release its reference"
@@ -16049,15 +16030,7 @@ mod tests {
                 panic!("unknown request identity was not retained");
             };
             assert_eq!(pending.batch.commit.as_ref(), &failed);
-            pending
-                .frozen
-                .dirty_extents
-                .iter_extents()
-                .next()
-                .unwrap()
-                .data
-                .clone()
-                .unwrap()
+            frozen_extent_body(pending.frozen.dirty_extents.iter_extents().next().unwrap()).unwrap()
         };
         meta.fail_next_commit();
         assert!(fs.write(&context(), file.handle, 5, b"!").is_err());
@@ -17091,11 +17064,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "dfs")]
-    #[test]
-    fn native_builder_preupload_retry_preserves_object_but_layout_excludes_old_tail_and_patch() {
-        native_preupload_retry_with_integrity(false);
-    }
     /// S1a-4 characterization: every native commit trigger reaches Meta with a
     /// fixed metadata mode. Native commits carry the write generation's operation
     /// id, so the trigger itself is not visible to Meta; the refactor must keep
@@ -17270,9 +17238,6 @@ mod tests {
 
     #[test]
     fn crc32c_native_preupload_retry_preserves_immutable_id() {
-        native_preupload_retry_with_integrity(true);
-    }
-    fn native_preupload_retry_with_integrity(crc: bool) {
         struct FailOnceStore {
             inner: Arc<LocalChunkStore>,
             fail: AtomicBool,
@@ -17308,8 +17273,7 @@ mod tests {
         });
         let pool = WriteBufferPool::new(0);
         let fs = distributed_fs_with_chunk_store(meta.clone(), local, store.clone())
-            .with_write_buffer_pool(pool.clone())
-            .with_crc32c_writes(crc);
+            .with_write_buffer_pool(pool.clone());
         let created = fs
             .create(
                 &context(),
@@ -17365,32 +17329,21 @@ mod tests {
         );
         assert_eq!(attempts[2].len(), 1);
         assert_eq!(attempts[2][0].length, 4096);
-        if crc {
-            assert!(
-                attempts
-                    .iter()
-                    .flatten()
-                    .all(ChunkObject::is_segment_crc32c)
-            );
-            for (chunk, body) in [
-                (&attempts[1][0], original.as_slice()),
-                (&attempts[2][0], [7; 4096].as_slice()),
-            ] {
-                assert_eq!(
-                    chunk.content_digest,
-                    crate::node::chunk_crc32c::CrcTable::build(body)
-                        .unwrap()
-                        .descriptor_digest()
-                );
-            }
-        } else {
+        assert!(
+            attempts
+                .iter()
+                .flatten()
+                .all(ChunkObject::is_segment_crc32c)
+        );
+        for (chunk, body) in [
+            (&attempts[1][0], original.as_slice()),
+            (&attempts[2][0], [7; 4096].as_slice()),
+        ] {
             assert_eq!(
-                attempts[1][0].content_digest.bytes,
-                *blake3::hash(&original).as_bytes()
-            );
-            assert_eq!(
-                attempts[2][0].content_digest.bytes,
-                *blake3::hash(&[7; 4096]).as_bytes()
+                chunk.content_digest,
+                crate::node::chunk_crc32c::CrcTable::build(body)
+                    .unwrap()
+                    .descriptor_digest()
             );
         }
         let original_id = attempts[0][0].id.clone();
@@ -18031,11 +17984,7 @@ mod tests {
         )
         .await;
         let references = crate::node::gc::GcReferences::new(meta.inner.clone());
-        let fs = Arc::new(
-            raw.with_gc_references(Some(references.clone()))
-                .with_optimistic_gc_commit(true)
-                .with_crc32c_writes(true),
-        );
+        let fs = Arc::new(raw.with_gc_references(Some(references.clone())));
         let file = {
             let fs = fs.clone();
             run_blocking(move || {
@@ -19246,8 +19195,10 @@ mod tests {
     }
 
     #[test]
-    fn native_repeated_identical_chunks_share_receipt_but_keep_layout_references() {
-        let (_temp, meta, fs) = test_fs();
+    /// Content addressing (one receipt per identical chunk) is S3's BLAKE3
+    /// object model; native CRC32C objects carry per-generation ids (F6).
+    fn s3_repeated_identical_chunks_share_receipt_but_keep_layout_references() {
+        let (_temp, meta, fs, _store) = test_fs_on_fake_s3();
         let created = fs
             .create(
                 &context(),
@@ -19353,7 +19304,9 @@ mod tests {
     #[test]
     fn explicit_publication_unknown_commit_ack_preserves_exact_request_and_backpressures_next_write()
      {
-        let (_temp, meta, fs) = test_fs();
+        // The inline-body tail path is S3's; native CRC tails are covered by
+        // p2_w2_unknown_request_keeps_original_identity_and_body_until_exact_retry.
+        let (_temp, meta, fs, _store) = test_fs_on_fake_s3();
         let pool = WriteBufferPool::new(0);
         let fs = fs.with_write_buffer_pool(pool.clone());
         let created = fs

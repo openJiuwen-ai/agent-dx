@@ -267,14 +267,6 @@ pub struct Cli {
     /// Maximum accepted FUSE tasks, including queued and asynchronous work.
     #[arg(long)]
     pub fuse_max_tasks: Option<usize>,
-    /// Keep DFS kernel pages only across opens of the exact committed version.
-    #[arg(long)]
-    pub dfs_fuse_keep_cache: Option<bool>,
-    /// Zero preserves strict path freshness; positive values opt into relaxed caching.
-    #[arg(long)]
-    pub dfs_fuse_entry_ttl_ms: Option<u32>,
-    #[arg(long)]
-    pub dfs_fuse_attr_ttl_ms: Option<u32>,
     /// Kernel read-ahead limit, independent of the DFS object prefetch budget.
     #[arg(long)]
     pub fuse_max_readahead_bytes: Option<u32>,
@@ -355,16 +347,11 @@ pub struct Cli {
     /// Bounded coarse read timing for explicit diagnosis only; disabled by default.
     #[arg(long)]
     pub dfs_read_diagnostics_enabled: Option<bool>,
-    /// Native gRPC read CRC policy (default off); receiver opts in to B checks.
-    /// All serving peers must use the same mode.
+    /// Remote-read body verification for native DFS gRPC: `off` (default)
+    /// delivers peer bytes unchecked; `receiver` verifies them against the
+    /// Meta-trusted CRC table. Only the reading Node's setting matters.
     #[arg(long)]
     pub dfs_read_crc_mode: Option<DfsReadCrcMode>,
-    /// Write native objects with segmented CRC32C; native DFS Nodes default to true.
-    #[arg(long)]
-    pub dfs_crc32c_writes: Option<bool>,
-    /// Omit per-chunk GC registration; CRC commits fence their own write generations.
-    #[arg(long)]
-    pub dfs_optimistic_gc_commit: Option<bool>,
     #[arg(long)]
     pub timeout_ms: Option<u64>,
     #[arg(long)]
@@ -429,9 +416,6 @@ struct FileConfig {
     fuse_workers: Option<u16>,
     fuse_max_tasks: Option<usize>,
     dfs_read_pipeline: Option<crate::node::read_pipeline::ReadPipelineLimits>,
-    dfs_fuse_keep_cache: Option<bool>,
-    dfs_fuse_entry_ttl_ms: Option<u32>,
-    dfs_fuse_attr_ttl_ms: Option<u32>,
     fuse_max_readahead_bytes: Option<u32>,
     dfs_version_cache_entries: Option<usize>,
     dfs_version_cache_bytes: Option<u64>,
@@ -464,8 +448,6 @@ struct FileConfig {
     dfs_source_cache_bytes: Option<usize>,
     dfs_read_diagnostics_enabled: Option<bool>,
     dfs_read_crc_mode: Option<DfsReadCrcMode>,
-    dfs_crc32c_writes: Option<bool>,
-    dfs_optimistic_gc_commit: Option<bool>,
     timeout_ms: Option<u64>,
     log_level: Option<String>,
     trace_enabled: Option<bool>,
@@ -473,9 +455,14 @@ struct FileConfig {
     trace_sample_ratio: Option<f64>,
 }
 /// Remote native CRC-format reads only; write integrity is independent.
+/// Users choose `off` or `receiver`, and only for native DFS gRPC. `Both`
+/// (sender and receiver verify) is the fixed internal policy elsewhere and the
+/// meaning of a peer request without a mode header; it is not configurable.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum DfsReadCrcMode {
+    #[value(skip)]
+    #[serde(skip_deserializing)]
     Both,
     Receiver,
     #[default]
@@ -540,9 +527,6 @@ pub struct Config {
     pub fuse_workers: u16,
     pub fuse_max_tasks: usize,
     pub dfs_read_pipeline: crate::node::read_pipeline::ReadPipelineLimits,
-    pub dfs_fuse_keep_cache: bool,
-    pub dfs_fuse_entry_ttl_ms: u32,
-    pub dfs_fuse_attr_ttl_ms: u32,
     pub fuse_max_readahead_bytes: u32,
     pub dfs_version_cache_entries: usize,
     pub dfs_version_cache_bytes: u64,
@@ -576,8 +560,6 @@ pub struct Config {
     pub dfs_source_cache_bytes: usize,
     pub dfs_read_diagnostics_enabled: bool,
     pub dfs_read_crc_mode: DfsReadCrcMode,
-    pub dfs_crc32c_writes: bool,
-    pub dfs_optimistic_gc_commit: bool,
     pub timeout_ms: u64,
     pub log_level: String,
     pub trace_enabled: bool,
@@ -736,14 +718,6 @@ impl Config {
             .unwrap_or(usize::from(fuse_workers) * 8);
         let dfs_read_pipeline = file.dfs_read_pipeline.unwrap_or_default();
         let dfs_read_pipeline = dfs_read_pipeline.validate()?;
-        let dfs_fuse_entry_ttl_ms = cli
-            .dfs_fuse_entry_ttl_ms
-            .or(file.dfs_fuse_entry_ttl_ms)
-            .unwrap_or(0);
-        let dfs_fuse_attr_ttl_ms = cli
-            .dfs_fuse_attr_ttl_ms
-            .or(file.dfs_fuse_attr_ttl_ms)
-            .unwrap_or(0);
         let fuse_max_readahead_bytes = cli
             .fuse_max_readahead_bytes
             .or(file.fuse_max_readahead_bytes)
@@ -751,12 +725,10 @@ impl Config {
         if !(1..=64).contains(&fuse_threads)
             || !(1..=1024).contains(&fuse_workers)
             || !(1..=65_536).contains(&fuse_max_tasks)
-            || dfs_fuse_entry_ttl_ms > 60_000
-            || dfs_fuse_attr_ttl_ms > 60_000
             || fuse_max_readahead_bytes > 16 * 1024 * 1024
         {
             return Err(invalid(
-                "FUSE threads must be 1..=64, workers 1..=1024, accepted tasks 1..=65536, DFS TTLs <= 60000 ms and read-ahead <= 16 MiB",
+                "FUSE threads must be 1..=64, workers 1..=1024, accepted tasks 1..=65536 and read-ahead <= 16 MiB",
             ));
         }
         let dfs_version_cache_entries = cli
@@ -894,14 +866,6 @@ impl Config {
         let log_defaults = crate::meta::store::journal::LogLimits::default();
         let maintenance = crate::meta::store::journal::MaintenancePolicy::default();
         let history = crate::meta::store::HistoryLimits::default();
-        let dfs_crc32c_writes = cli
-            .dfs_crc32c_writes
-            .or(file.dfs_crc32c_writes)
-            .unwrap_or(role == Role::Node && dfs && file.dfs_external_backend.is_none());
-        let dfs_optimistic_gc_commit = cli
-            .dfs_optimistic_gc_commit
-            .or(file.dfs_optimistic_gc_commit)
-            .unwrap_or(dfs_crc32c_writes);
         let cfg = Self {
             grpc_listen: cli.grpc_listen.or(file.grpc_listen).unwrap_or_else(|| {
                 ([127, 0, 0, 1], if role == Role::Meta { 7400 } else { 7500 }).into()
@@ -1022,12 +986,6 @@ impl Config {
             fuse_workers,
             fuse_max_tasks,
             dfs_read_pipeline,
-            dfs_fuse_keep_cache: cli
-                .dfs_fuse_keep_cache
-                .or(file.dfs_fuse_keep_cache)
-                .unwrap_or(true),
-            dfs_fuse_entry_ttl_ms,
-            dfs_fuse_attr_ttl_ms,
             fuse_max_readahead_bytes,
             dfs_version_cache_entries,
             dfs_version_cache_bytes,
@@ -1065,8 +1023,6 @@ impl Config {
                 .dfs_read_diagnostics_enabled
                 .or(file.dfs_read_diagnostics_enabled)
                 .unwrap_or(false),
-            dfs_crc32c_writes,
-            dfs_optimistic_gc_commit,
             timeout_ms: cli.timeout_ms.or(file.timeout_ms).unwrap_or(5000),
             log_level: cli
                 .log_level
@@ -1284,29 +1240,15 @@ impl Config {
                 return Err(invalid("trusted_node_certs paths must be absolute"));
             }
         }
-        cfg.validate_crc32c_writes()?;
         if cfg.dfs_read_crc_mode != DfsReadCrcMode::Both
             && (!cfg.dfs || cfg.dfs_external_backend.is_some() || cfg.data_mode != "grpc")
         {
-            return Err(invalid(
-                "dfs_read_crc_mode overrides require native DFS grpc",
-            ));
+            return Err(invalid("dfs_read_crc_mode requires native DFS grpc"));
         }
         cfg.meta_log_limits()?;
         cfg.meta_maintenance_policy()?;
         cfg.meta_history_limits()?;
         Ok(cfg)
-    }
-
-    pub(crate) fn validate_crc32c_writes(&self) -> Result<()> {
-        if self.dfs_crc32c_writes
-            && (!self.dfs || self.dfs_external_backend.is_some() || !self.dfs_optimistic_gc_commit)
-        {
-            return Err(invalid(
-                "dfs_crc32c_writes requires native storage and dfs_optimistic_gc_commit",
-            ));
-        }
-        Ok(())
     }
 
     pub(crate) fn meta_log_limits(&self) -> Result<crate::meta::store::journal::LogLimits> {
@@ -1527,7 +1469,6 @@ mod certificate_tests {
         assert_eq!(cfg.dfs_read_pipeline.max_reply_bytes, 256 * 1024 * 1024);
         assert_eq!(cfg.fuse_max_readahead_bytes, 16 * 1024 * 1024);
         assert_eq!(cfg.dfs_readahead_max_bytes, 0);
-        assert!(cfg.dfs_crc32c_writes);
         assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Off);
         let cli = Cli::try_parse_from([
             "afs-node",
@@ -1615,64 +1556,24 @@ unsigned_payload = true
 mod crc32c_config_tests {
     use super::*;
     #[test]
-    fn crc32c_native_defaults_cover_replica_and_local_copy_policies() {
-        for policy in ["required", "preferred", "none"] {
-            let cfg = Config::resolve(
-                Role::Node,
-                Cli::parse_from([
-                    "afs-node",
-                    "--fs",
-                    "dfs",
-                    "--dfs-desired-copies",
-                    "3",
-                    "--dfs-sync-required-copies",
-                    "2",
-                    "--dfs-min-distinct-nodes",
-                    "2",
-                    "--dfs-local-copy",
-                    policy,
-                ]),
-            )
-            .unwrap();
-            assert!(cfg.dfs_crc32c_writes && cfg.dfs_optimistic_gc_commit);
+    fn crc32c_write_mode_follows_storage_and_has_no_switch() {
+        // S1a-7 (R21, F6): native storage always writes CRC32C objects with
+        // write-generation GC fences; the two switches no longer exist.
+        for flag in ["--dfs-crc32c-writes", "--dfs-optimistic-gc-commit"] {
+            assert!(Cli::try_parse_from(["afs-node", "--fs", "dfs", flag, "true"]).is_err());
         }
-        let cfg =
-            Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--fs", "dfs"])).unwrap();
-        assert!(cfg.dfs_crc32c_writes && cfg.dfs_optimistic_gc_commit);
-    }
-
-    #[test]
-    fn crc32c_defaults_exclude_other_backends_and_explicit_disable_is_coherent() {
-        for role in [Role::Node, Role::Meta] {
-            let cfg = Config::resolve(role, Cli::parse_from(["afs", "--fs", "ownerfs"])).unwrap();
-            assert!(!cfg.dfs_crc32c_writes && !cfg.dfs_optimistic_gc_commit);
+        for key in ["dfs_crc32c_writes", "dfs_optimistic_gc_commit"] {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(file.path(), format!("fs = \"dfs\"\n{key} = true\n")).unwrap();
+            let path = file.path().to_str().unwrap();
+            assert!(
+                Cli::try_parse_from(["afs-node", "--config", path])
+                    .map_err(|error| error.to_string())
+                    .and_then(|cli| Config::resolve(Role::Node, cli).map_err(|e| e.to_string()))
+                    .is_err(),
+                "{key} must be rejected"
+            );
         }
-        let cfg = Config::resolve(
-            Role::Node,
-            Cli::parse_from(["afs-node", "--fs", "dfs", "--dfs-crc32c-writes", "false"]),
-        )
-        .unwrap();
-        assert!(!cfg.dfs_crc32c_writes && !cfg.dfs_optimistic_gc_commit);
-        assert!(
-            Config::resolve(
-                Role::Node,
-                Cli::parse_from([
-                    "afs-node",
-                    "--fs",
-                    "dfs",
-                    "--dfs-optimistic-gc-commit",
-                    "false",
-                ])
-            )
-            .is_err()
-        );
-        let mut cfg =
-            Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--fs", "dfs"])).unwrap();
-        cfg.dfs_optimistic_gc_commit = false;
-        assert!(cfg.validate_crc32c_writes().is_err());
-        cfg.dfs_optimistic_gc_commit = true;
-        cfg.dfs = false;
-        assert!(cfg.validate_crc32c_writes().is_err());
     }
 }
 
@@ -1749,7 +1650,7 @@ mod crc_read_modes_validation_tests {
     use super::*;
     #[test]
     fn crc_read_modes_cli_defaults_and_scope_preserve_write_crc() {
-        for mode in ["both", "receiver", "off"] {
+        for mode in ["receiver", "off"] {
             let cfg = Config::resolve(
                 Role::Node,
                 Cli::parse_from([
@@ -1764,7 +1665,6 @@ mod crc_read_modes_validation_tests {
             )
             .unwrap();
             assert_eq!(cfg.dfs_read_crc_mode.as_str(), mode);
-            assert!(cfg.dfs_crc32c_writes && cfg.dfs_optimistic_gc_commit);
         }
         let cfg =
             Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--fs", "dfs"])).unwrap();
@@ -1798,20 +1698,34 @@ mod crc_read_default_off_tests {
             Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--fs", "dfs"])).unwrap();
         assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Off);
         assert_eq!(DfsReadCrcMode::default(), DfsReadCrcMode::Off);
-        assert!(cfg.dfs_crc32c_writes && cfg.dfs_optimistic_gc_commit);
         assert_eq!(
             serde_json::to_value(&cfg).unwrap()["dfs_read_crc_mode"],
             "off"
         );
-        for mode in ["receiver", "both", "off"] {
+        for mode in ["receiver", "off"] {
             let cfg = Config::resolve(
                 Role::Node,
                 Cli::parse_from(["afs-node", "--fs", "dfs", "--dfs-read-crc-mode", mode]),
             )
             .unwrap();
             assert_eq!(cfg.dfs_read_crc_mode.as_str(), mode);
-            assert!(cfg.dfs_crc32c_writes);
         }
+    }
+
+    #[test]
+    fn crc_read_mode_both_is_not_configurable() {
+        assert!(
+            Cli::try_parse_from(["afs-node", "--fs", "dfs", "--dfs-read-crc-mode", "both"])
+                .is_err()
+        );
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(
+            file.path(),
+            "fs = \"dfs\"\ndata_mode = \"grpc\"\ndfs_read_crc_mode = \"both\"\n",
+        )
+        .unwrap();
+        let cli = Cli::parse_from(["afs-node", "--config", file.path().to_str().unwrap()]);
+        assert!(Config::resolve(Role::Node, cli).is_err());
     }
 
     #[test]
@@ -1819,7 +1733,6 @@ mod crc_read_default_off_tests {
         for role in [Role::Node, Role::Meta] {
             let cfg = Config::resolve(role, Cli::parse_from(["afs", "--fs", "ownerfs"])).unwrap();
             assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Both);
-            assert!(!cfg.dfs_crc32c_writes);
         }
         let cfg = Config::resolve(
             Role::Node,
@@ -1827,7 +1740,6 @@ mod crc_read_default_off_tests {
         )
         .unwrap();
         assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Both);
-        assert!(cfg.dfs_crc32c_writes);
     }
 
     #[test]
@@ -1842,14 +1754,12 @@ mod crc_read_default_off_tests {
         let from_file =
             Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--config", path])).unwrap();
         assert_eq!(from_file.dfs_read_crc_mode, DfsReadCrcMode::Receiver);
-        assert!(from_file.dfs_crc32c_writes);
         let cli = Config::resolve(
             Role::Node,
             Cli::parse_from(["afs-node", "--config", path, "--dfs-read-crc-mode", "off"]),
         )
         .unwrap();
         assert_eq!(cli.dfs_read_crc_mode, DfsReadCrcMode::Off);
-        assert!(cli.dfs_crc32c_writes);
     }
 }
 

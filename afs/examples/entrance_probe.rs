@@ -265,10 +265,7 @@ async fn main() -> Result<(), Any> {
         let mount = mount_dfs_with_fd_bridge(
             b.clone(),
             &root.join("mnt"),
-            FuseMountOptions {
-                dfs_fuse_keep_cache: false,
-                ..Default::default()
-            },
+            FuseMountOptions::default(),
             server.fd_bridge().ok_or("missing fd bridge")?,
         )?;
         println!("{}", json!({"ready":true,"pid":std::process::id()}));

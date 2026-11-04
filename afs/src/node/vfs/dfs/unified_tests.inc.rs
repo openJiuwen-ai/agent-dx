@@ -78,11 +78,7 @@ async fn unified_reply(
 async fn unified_native_crc_cache_options_preserve_fixed_open_after_metadata_observation_and_expiry()
  {
     use crate::config::DfsReadCrcMode;
-    for mode in [
-        DfsReadCrcMode::Off,
-        DfsReadCrcMode::Receiver,
-        DfsReadCrcMode::Both,
-    ] {
+    for mode in [DfsReadCrcMode::Off, DfsReadCrcMode::Receiver] {
         for cache in [false, true] {
             let (_temp, meta, fs) = unified_local_fs(mode, cache);
             let id = meta.inode.lock().unwrap().inode_id.clone();

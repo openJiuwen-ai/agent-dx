@@ -53,60 +53,12 @@ pub(crate) fn sync_read_backend<T: Send>(work: impl FnOnce() -> Result<T> + Send
     }
 }
 
-/// A private final buffer and its byte lease move together across the RPC and
-/// the FUSE reply. Request metadata is released before publishing the reply.
-#[cfg(feature = "dfs")]
-pub struct OwnedNativeRead {
-    pub(crate) batch: crate::node::dfs_read::PeerReadBatch,
-    pub(crate) chunk: crate::dfs::ChunkObject,
-    // Retire observation before the buffer can reenter its pool or credits wake a new owner.
-    pub(crate) activity: Option<super::read_activity::ActivityGuard>,
-    pub(crate) buffer: super::read_buffer::ReadBuffer,
-    pub(crate) bytes: Vec<tokio::sync::OwnedSemaphorePermit>,
-    pub(crate) deadline: std::time::Instant,
-    pub(crate) group_handle: u64,
-    pub(crate) _lifetime: ReadLifetime,
-    pub(crate) allocation: Option<NativeReadAllocation>,
-}
-
 #[cfg(feature = "dfs")]
 pub(crate) struct NativeReadAllocation {
     pub(crate) length: usize,
     pub(crate) pool: std::sync::Arc<super::read_buffer::ReadBufferPool>,
     pub(crate) admission: std::sync::Arc<tokio::sync::Semaphore>,
     pub(crate) local: std::sync::Arc<super::chunk::LocalChunkStore>,
-}
-
-#[cfg(feature = "dfs")]
-impl OwnedNativeRead {
-    pub(crate) fn body_len(&self) -> usize {
-        self.allocation
-            .as_ref()
-            .map_or(self.buffer.len(), |a| a.length)
-    }
-    pub(crate) fn capacity_charge(&self) -> usize {
-        self.allocation
-            .as_ref()
-            .map_or(self.buffer.capacity(), |a| a.length.max(1024 * 1024))
-    }
-    pub(crate) async fn allocate(&mut self) -> Result<()> {
-        let Some(allocation) = self.allocation.take() else {
-            return Ok(());
-        };
-        let reply = allocation.allocate(self.deadline).await?;
-        self.activity = reply.activity;
-        self.buffer = reply.buffer;
-        self.bytes = reply.bytes;
-        Ok(())
-    }
-    pub(crate) fn into_reply(self) -> prost::bytes::Bytes {
-        NativeReadReply {
-            activity: self.activity,
-            buffer: self.buffer,
-            bytes: self.bytes,
-        }
-        .into_bytes()
-    }
 }
 
 #[cfg(feature = "dfs")]
@@ -161,18 +113,20 @@ impl NativeReadAllocation {
             )
         });
         Ok(NativeReadReply {
-            activity,
+            _activity: activity,
             buffer,
-            bytes,
+            _bytes: bytes,
         })
     }
 }
 
 #[cfg(feature = "dfs")]
 pub(crate) struct NativeReadReply {
-    pub(crate) activity: Option<super::read_activity::ActivityGuard>,
+    // Field order is drop order: retire the observation before the buffer can
+    // reenter its pool, and release byte credits last.
+    _activity: Option<super::read_activity::ActivityGuard>,
     pub(crate) buffer: super::read_buffer::ReadBuffer,
-    pub(crate) bytes: Vec<tokio::sync::OwnedSemaphorePermit>,
+    _bytes: Vec<tokio::sync::OwnedSemaphorePermit>,
 }
 #[cfg(feature = "dfs")]
 impl AsRef<[u8]> for NativeReadReply {
@@ -247,20 +201,6 @@ pub(crate) fn remaining_read_budget(
     Ok(remaining)
 }
 
-/// Only genuinely blocking work belongs here. The owned permit stays inside
-/// the closure even if its asynchronous caller is cancelled while it runs.
-pub(crate) async fn blocking_read<T: Send + 'static>(
-    permit: tokio::sync::OwnedSemaphorePermit,
-    read: impl FnOnce() -> Result<T> + Send + 'static,
-) -> Result<T> {
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        read()
-    })
-    .await
-    .map_err(|error| Error::coded(afs_error::CLIENT_WORKER_FAILED, error.to_string()))?
-}
-
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReadPipelineLimits {
@@ -308,44 +248,26 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "current_thread")]
-    async fn read_equivalence_lazy_reply_is_unallocated_until_selected() {
+    async fn read_equivalence_native_reply_releases_bytes_with_last_reference() {
         use std::sync::Arc;
         let temp = tempfile::tempdir().unwrap();
         let local = Arc::new(crate::node::chunk::LocalChunkStore::open(temp.path(), "b").unwrap());
         let pool = super::super::read_buffer::ReadBufferPool::new("reply");
         pool.configure_byte_limit(8 * 1024 * 1024).unwrap();
         let slots = Arc::new(tokio::sync::Semaphore::new(8 * 1024 * 1024));
-        let chunk = crate::node::chunk::StagedChunk::new_crc32c(
-            crate::dfs::OperationId::new("lazy"),
-            vec![3; 1024],
-        )
-        .unwrap()
-        .chunk;
-        let mut read = OwnedNativeRead {
-            batch: crate::node::dfs_read::PeerReadBatch {
-                file_version_id: crate::dfs::FileVersionId::new("v"),
-                layout_root_id: crate::dfs::LayoutRootId::new("l"),
-                operations: Vec::new(),
-            },
-            chunk,
-            activity: None,
-            buffer: Vec::new().into(),
-            bytes: Vec::new(),
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
-            group_handle: 1,
-            _lifetime: Arc::new(()),
-            allocation: Some(NativeReadAllocation {
-                length: 1024,
-                pool,
-                admission: slots.clone(),
-                local,
-            }),
+        let allocation = NativeReadAllocation {
+            length: 1024,
+            pool,
+            admission: slots.clone(),
+            local,
         };
-        assert_eq!(read.buffer.len(), 0);
         assert_eq!(slots.available_permits(), 8 * 1024 * 1024);
-        read.allocate().await.unwrap();
-        assert_eq!(read.buffer.len(), 1024);
-        let body = read.into_reply();
+        let reply = allocation
+            .allocate(std::time::Instant::now() + std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(reply.buffer.len(), 1024);
+        let body = reply.into_bytes();
         let tail = body.clone();
         drop(body);
         assert!(slots.available_permits() < 8 * 1024 * 1024);
@@ -381,34 +303,6 @@ mod tests {
             .validate()
             .is_err()
         );
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn read_concurrency_cancelled_wait_keeps_real_blocking_depth() {
-        use std::sync::Arc;
-        use std::time::Duration;
-        let slots = Arc::new(tokio::sync::Semaphore::new(1));
-        let permit = slots.clone().acquire_owned().await.unwrap();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let task = tokio::spawn(async move {
-            blocking_read(permit, move || {
-                started_tx.send(()).unwrap();
-                release_rx.recv().unwrap();
-                Ok(())
-            })
-            .await
-        });
-        started_rx.await.unwrap();
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        assert_eq!(slots.available_permits(), 0);
-        release_tx.send(()).unwrap();
-        let final_permit = tokio::time::timeout(Duration::from_secs(1), slots.acquire_owned())
-            .await
-            .unwrap()
-            .unwrap();
-        drop(final_permit);
     }
 }
 
