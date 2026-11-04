@@ -41,9 +41,10 @@ impl CoordinatorRpc {
     }
 
     async fn collect_one_failed(&self, id: &str, now: u64, retention: u64) -> Result<bool> {
-        let (stored, node, session_id) = {
+        let (stored, node, session_id, coordinator_epoch) = {
             let mut state = self.0.state.lock().await;
             state.healthy()?;
+            let coordinator_epoch = state.session.epoch();
             let stored = state.session.observe_failed(id, now).await?;
             state.remember_environment(stored.clone());
             if !stored.failed_collectable(now, retention) {
@@ -104,7 +105,7 @@ impl CoordinatorRpc {
                 .get(&stored.assignment.node_id)
                 .ok_or(Error::Conflict)?
                 .clone();
-            (stored, node, session_id)
+            (stored, node, session_id, coordinator_epoch)
         };
         let record = stored.result.ok_or(Error::Conflict)?;
         let channel = self
@@ -126,6 +127,7 @@ impl CoordinatorRpc {
                     caller: None,
                     failed_revision: Some(record.revision),
                     node_session_id: session_id.clone(),
+                    coordinator_epoch,
                 })
                 .await
                 .map_err(adx_protocol::dependency_status)?

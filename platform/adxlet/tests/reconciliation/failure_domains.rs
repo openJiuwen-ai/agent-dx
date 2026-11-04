@@ -17,6 +17,7 @@ pub(super) async fn control(
             administrator: false,
         }),
         node_session_id: "session".into(),
+        coordinator_epoch: 0,
     });
     request
         .metadata_mut()

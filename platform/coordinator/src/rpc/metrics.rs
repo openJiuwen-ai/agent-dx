@@ -54,7 +54,8 @@ impl CoordinatorRpc {
             .keys()
             .filter(|id| {
                 state.live.get(*id).is_none_or(|live| live.expired)
-                    || state.overdue(id, self.0.heartbeat_timeout)
+                    || state.heartbeat_expired(id, self.0.heartbeat_timeout)
+                    || state.unconfirmed(id, self.0.heartbeat_timeout)
             })
             .cloned()
             .collect();
@@ -90,7 +91,9 @@ impl CoordinatorRpc {
                 out.gauge(
                     "adx_coordinator_node_heartbeat_timeout",
                     &labels,
-                    u64::from(live.expired || state.overdue(id, self.0.heartbeat_timeout)),
+                    u64::from(
+                        live.expired || state.heartbeat_expired(id, self.0.heartbeat_timeout),
+                    ),
                 );
                 out.gauge(
                     "adx_coordinator_node_heartbeat_age_seconds",

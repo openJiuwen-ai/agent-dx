@@ -73,7 +73,7 @@ impl CoordinatorRpc {
     async fn control_owner(
         &self,
         stored: &StoredEnvironment,
-    ) -> std::result::Result<(StoredNode, String), Status> {
+    ) -> std::result::Result<(StoredNode, String, u64), Status> {
         let state = self.0.state.lock().await;
         state.healthy().map_err(status)?;
         if stored.invalidated {
@@ -91,7 +91,7 @@ impl CoordinatorRpc {
             .ok_or_else(|| Status::unavailable("environment owner unavailable"))?
             .id
             .clone();
-        Ok((node, session))
+        Ok((node, session, state.session.epoch()))
     }
 
     async fn control_client(
@@ -130,7 +130,7 @@ impl CoordinatorRpc {
         if let Some(control) = paused_control(&stored).map_err(status)? {
             return Ok(Response::new(control));
         }
-        let (node, session) = self.control_owner(&stored).await?;
+        let (node, session, coordinator_epoch) = self.control_owner(&stored).await?;
         let started_at = first_running_at(&stored).map_err(status)?;
         let mut control = self
             .control_client(&node.address)
@@ -139,6 +139,7 @@ impl CoordinatorRpc {
                 assignment: Some(stored.assignment.try_into().map_err(status)?),
                 caller: request.caller,
                 node_session_id: session,
+                coordinator_epoch,
             })
             .await?
             .into_inner();
@@ -204,6 +205,7 @@ impl CoordinatorRpc {
                         assignment: Some(stored.assignment.clone().try_into().map_err(status)?),
                         caller: request.caller.clone(),
                         node_session_id: session.id.clone(),
+                        coordinator_epoch: state.session.epoch(),
                     },
                 );
             }
@@ -242,7 +244,7 @@ impl CoordinatorRpc {
         let stored = self
             .control_environment(&request.id, request.caller.as_ref())
             .await?;
-        let (node, session) = self.control_owner(&stored).await?;
+        let (node, session, coordinator_epoch) = self.control_owner(&stored).await?;
         let started_at = first_running_at(&stored).map_err(status)?;
         let mut control = self
             .control_client(&node.address)
@@ -253,6 +255,7 @@ impl CoordinatorRpc {
                 node_session_id: session,
                 timeout_seconds: request.timeout_seconds,
                 extend_only: request.extend_only,
+                coordinator_epoch,
             })
             .await?
             .into_inner();
