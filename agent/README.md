@@ -48,6 +48,8 @@ Platform 检测空闲、保存 checkpoint 并释放执行资源。持续 HTTP/WS
 
 Paused/Pausing/Resuming 保留原 AgentBinding generation 和 Sandbox ID；Activator 冷缓存及 bypass 查询可返回该身份，不创建第二个 Sandbox，也不调用 resume。鉴权后的业务 HTTP/WS/SSH 或文件访问经共享 Gateway 请求 Platform EnsureRunning，等待已提交 Running 路由后转发。并发首请求的恢复去重由 Platform 负责；管理查询、未授权访问和被动健康探测不唤醒。`Target` 表示可路由身份，不保证业务进程已 Ready；Failed/Deleted 和未就绪的创建仍返回原有错误。恢复超时沿用原身份重试，不能据此重建实例。
 
+灰度别名升级是触发 checkpoint 的另一种场景：候选 E2 就绪后，若旧 current E1 已休眠，Activator 立即把 E2 pause 成 checkpoint 再切换，砍掉"E2 空转到模板 pause 超时才休眠"的窗口；若 E1 仍活跃则 E2 保持 Running 切换，省一次唤醒恢复。pause 预算取自 reconcile 步骤的剩余 deadline（clamp 到 API 契约 1..=3600），客户端等待预算与步骤预算对齐。详见 [休眠沙箱升级时立即 checkpoint](activator/README.md#休眠沙箱升级时立即-checkpoint)。
+
 ## 受管卷
 
 模板可声明 `volumes`，并以 `mounts[].volume_id` 挂载；内联 host_path 继续保留。例如：
@@ -202,7 +204,7 @@ AliasConfig 保存 `tenant/template/alias/seed/versions`，versions 为 `{versio
 
 Scope 使用 `template_ref: {"version":"1"}` 或 `template_ref: {"alias":"production"}`。AgentBinding 保留 generation、parameters、跨版本 Volume ID/UID，并保存 current 及可选 secondary；Env 引用只有真实 version、environment_id，secondary 另带 `preparing` / `retiring` 意图。固定版本 Binding 始终使用 current。没有 AliasBinding、target_version、发布任务或第三个 Env 槽位。
 
-升级为 `current=E1 → current=E1, secondary=E2/preparing → current=E2, secondary=E1/retiring → current=E2`。先保存候选 ID，再调用 Platform；Ready Running 或已初始化 Paused 才原子交换引用。切换前 CAS 核对最新 Alias revision 与 Binding 引用。配置连续变化时优先使用最新目标，但先清理不再需要的 secondary；已退役 Env 不再次提升，回退会准备新的 Env。每次平台调用使用保存的实际 ID，不从 BindingID 或 generation 反推。
+升级为 `current=E1 → current=E1, secondary=E2/preparing → current=E2, secondary=E1/retiring → current=E2`。先保存候选 ID，再调用 Platform；候选 Ready Running 或已初始化 Paused 才进入切换决策点。切换前在唯一决策点重查旧 current E1 相态：E1 已休眠（Paused/Deleted/absent）则先 `checkpoint_candidate` 把候选 pause 成 Paused 再交换引用（切换后候选仅占存储）；E1 仍活跃则保持候选 Running 直接交换（切换后流量走 E2，省一次唤醒恢复）。候选已 Paused 时直接交换，不再 pause。交换引用前 CAS 核对最新 Alias revision 与 Binding 引用。配置连续变化时优先使用最新目标，但先清理不再需要的 secondary；已退役 Env 不再次提升，回退会准备新的 Env。每次平台调用使用保存的实际 ID，不从 BindingID 或 generation 反推。
 
 切换后直接调用既有 Environment delete；Activator 不感知存量连接。删除未知时保留引用，确认删除及卷关联释放后清空。**Platform 优雅退出尚缺失，本次不实现；当前实际删除会清理运行时，不能保证旧连接不中断。** 新 Env 先建立卷 owner，旧 Env 删除确认后释放旧 owner；独享卷仍可能等待旧执行释放，无强制抢占或零空窗承诺。
 
@@ -258,7 +260,7 @@ SSH 首版只提供一个连接一个交互式终端，要求 PTY 和 shell 请�
 
 Template 的 service 声明 HTTP/WS/SSH 协议及端口，例如 `[{"protocol":"http","port":8080},{"protocol":"ws","port":8080},{"protocol":"ssh","port":22}]`。受管 SSH 无端口参数时必须恰好匹配一个 SSH service。用户直接调用 Harness 自定义接口，审计轨迹能力暂缓。
 
-预装镜像、Execd 与匹配的启动 profile 仍可用于验证。删除 Environment 明确返回 NotFound 时，Activator 条件清理对应 generation 的 Binding 及其 parameters；删除成功返回 Deleted 同样清理。超时、断连、权限错误或其他未知结果保留记录供重试。元数据清理不证明迟到的平台创建已被取消。pause/resume 完全由 Platform 负责，不属于 ADX 适配范围。模板可配置 `init_timeout_seconds` 和一次性 `readiness_probe`；Activator 通过 Environment 能力接口透传，Platform 在成功后才发布 Running 和绑定路由。Jiuwen 当前使用 TCP 18092 探针，只保证 AgentServer 前端监听，不保证内部 Runtime 已完成 warming；模板也可配置周期 `healthcheck`（同样的 action/timing 字段，加正整数 `failure_threshold`，默认 3），由 Platform 执行并处理失败。
+预装镜像、Execd 与匹配的启动 profile 仍可用于验证。删除 Environment 明确返回 NotFound 时，Activator 条件清理对应 generation 的 Binding 及其 parameters；删除成功返回 Deleted 同样清理。超时、断连、权限错误或其他未知结果保留记录供重试。元数据清理不证明迟到的平台创建已被取消。idle 触发的自动 pause/resume 由 Platform 全权负责，不属于 ADX 适配范围；但灰度升级时 Activator 会主动对候选调用 `Environment::pause` 做 checkpoint（见 [休眠沙箱升级时立即 checkpoint](activator/README.md#休眠沙箱升级时立即-checkpoint)），pause 能力是该升级路径的硬依赖——`Environment::pause` 默认返回 `Unsupported`，未实现的部署在候选就绪且 E1 已休眠时会停止主动重试、等待外部触发，而非降级为"不 checkpoint 直接切"。模板可配置 `init_timeout_seconds` 和一次性 `readiness_probe`；Activator 通过 Environment 能力接口透传，Platform 在成功后才发布 Running 和绑定路由。Jiuwen 当前使用 TCP 18092 探针，只保证 AgentServer 前端监听，不保证内部 Runtime 已完成 warming；模板也可配置周期 `healthcheck`（同样的 action/timing 字段，加正整数 `failure_threshold`，默认 3），由 Platform 执行并处理失败。
 
 流量激活时会先保存稳定身份，再提交平台创建。创建失败、响应丢失或进程中断可能留下尚未激活成功的 AgentBinding；该记录供原身份重试，并非独立的创建功能。如果删除明确返回不存在，则清理绑定；如果删除结果未知，则保留 Deleting 记录并沿用原身份重试。冷启动还可能遇到 Running 与共享路由发布之间的短暂窗口；HTTP/WS 或 SSH 已返回 AgentBinding 身份后，调用方应使用该身份重试，不能通过换用新身份重试来绕过该绑定的生命周期。
 
@@ -268,3 +270,5 @@ Template 的 service 声明 HTTP/WS/SSH 协议及端口，例如 `[{"protocol":"
 
 
 创建重试由Activator管理：Binding保存当前创建尝试序号及5→10→20→40→60秒封顶的退避时间，Env ID保持不变；每轮先查询Env。升级候选不存在时，在第一次创建及后续重试前统一检查旧Env已Paused/Deleted或不存在，不区分模板卷模式。旧Env尚未暂停只延后检查。确定分配前取消可推进Request ID；HTTP与嵌入式模式也可在原CREATE明确终态且原Env再次查询确认不存在后推进。序号单调递增且成功后不清零，不作为累计恢复次数上限；退避秒数同样跨删除事件累积，成功不归零，后续恢复沿用上次退避并在60秒封顶，引用退役清除元数据后才重置；每次推进后仍按持久化退避等待后续请求。普通404/409和未知结果均不授权推进。Activator为创建请求注入统一的3次故障重启策略，由Platform执行，模板无需新增配置。详见[创建排队取消与退避](activator/README.md#创建排队取消与退避)和[已删除Env的请求触发重试](activator/README.md#已删除-env-的请求触发重试)。
+
+候选创建通过后，reconcile 在切换前还会再查一次旧Env相态：已休眠则立即把候选checkpoint再切换，仍活跃则保持候选Running切换（详见[休眠沙箱升级时立即checkpoint](activator/README.md#休眠沙箱升级时立即-checkpoint)）。
