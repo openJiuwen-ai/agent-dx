@@ -281,17 +281,22 @@ pub async fn open_configured_store(cfg: &Config) -> Result<Option<Arc<store::Sto
     let log: Arc<dyn store::journal::MetaLog> = match cfg.meta_store {
         MetaStoreBackend::InMemory => {
             afs_logging::warn!("meta.store.memory_volatile"; "instance" => &cfg.id);
-            Arc::new(store::journal::MemoryLog::with_policy(limits, maintenance)?)
+            Arc::new(store::journal::MemoryLog::new(
+                store::journal::MemoryLogOptions {
+                    record_max_bytes: limits.record_max_bytes,
+                    batch_max_bytes: limits.batch_max_bytes,
+                    wal_max_bytes: limits.wal_max_bytes,
+                },
+            )?)
         }
         MetaStoreBackend::LocalFile => {
             let path = cfg.data_dir.join("meta-store");
             Arc::new(
                 tokio::task::spawn_blocking(move || {
-                    store::local_log::LocalLog::open_with_policies(
+                    store::local_log::LocalLog::open_with_checkpoint_limits(
                         path,
                         limits,
-                        store::journal::CheckpointLimits::default(),
-                        maintenance,
+                        store::local_log::LocalCheckpointLimits::default(),
                     )
                 })
                 .await??,
@@ -299,7 +304,15 @@ pub async fn open_configured_store(cfg: &Config) -> Result<Option<Arc<store::Sto
         }
     };
     Ok(Some(Arc::new(
-        store::Store::open_log_with_history(log, history).await?,
+        store::Store::open_log_with_options(
+            log,
+            store::StoreOptions {
+                history,
+                maintenance: Some(maintenance),
+                ..store::StoreOptions::default()
+            },
+        )
+        .await?,
     )))
 }
 
@@ -589,7 +602,7 @@ mod tests {
         let identity = std::fs::read(root.join("IDENTITY")).unwrap();
         let wal = root.join("wal-00000000000000000001.log");
         let bytes = std::fs::read(&wal).unwrap();
-        assert!(bytes.len() > store::journal::LOG_HEADER_BYTES as usize);
+        assert!(bytes.len() > store::local_log::LOG_HEADER_BYTES as usize);
         assert!(!root.join("wal").exists());
         assert!(!root.join("snapshot").exists());
         drop(meta);
@@ -692,7 +705,7 @@ mod tests {
         let identity = std::fs::read(root.join("IDENTITY")).unwrap();
         let wal = root.join("wal-00000000000000000001.log");
         let mut bytes = std::fs::read(&wal).unwrap();
-        bytes[store::journal::LOG_HEADER_BYTES as usize + 8] ^= 1;
+        bytes[store::local_log::LOG_HEADER_BYTES as usize + 8] ^= 1;
         std::fs::write(&wal, &bytes).unwrap();
         let error = match open_configured_store(&cfg).await {
             Err(error) => error,

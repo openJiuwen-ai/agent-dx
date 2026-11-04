@@ -9,7 +9,7 @@ use afs::{
         dfs::{CreateFileRequest, DfsService},
         store::{
             MetaRead, MetaStore, NodeSessionLease, RequestKey, Store, StoreRevision,
-            journal::LogLimits, local_log::LocalLog,
+            local_log::{LocalLog, LocalLogOptions},
         },
     },
 };
@@ -19,7 +19,7 @@ async fn open(path: &Path) -> Arc<dyn MetaStore> {
     // Only await the known channel-close/file-lock release after dropping Store.
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            match LocalLog::open(path, LogLimits::default()) {
+            match LocalLog::open(path, LocalLogOptions::default()) {
                 Ok(log) => {
                     break Arc::new(Store::open_log(Arc::new(log)).await.unwrap())
                         as Arc<dyn MetaStore>;

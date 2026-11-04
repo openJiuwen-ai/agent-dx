@@ -1261,11 +1261,11 @@ mod tests {
     #[tokio::test]
     async fn p3_history_state_log_management_advances_only_physical_sequence() {
         use super::super::{
-            journal::{LogLimits, LogTip, MemoryLog, MetaLog},
+            journal::{LogTip, MemoryLog, MetaLog},
             log::Record,
             state::State,
         };
-        let log = MemoryLog::new(LogLimits::default()).unwrap();
+        let log = MemoryLog::new(Default::default()).unwrap();
         let records = super::super::journal::test_records(3);
         let tip = log.append_and_sync(LogTip::EMPTY, records).await.unwrap();
         let state = authority();
@@ -1290,13 +1290,13 @@ mod tests {
     async fn p3_history_state_local_checkpoint_suffix_preserves_exact_cleanup() {
         use super::super::{
             NodeSessionLease,
-            journal::{LogLimits, LogTip, MetaLog},
+            journal::{LogTip, MetaLog},
             local_log::LocalLog,
             log::{Record, StateImage},
             state::State,
         };
         let dir = tempfile::tempdir().unwrap();
-        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let log = LocalLog::open(dir.path(), Default::default()).unwrap();
         let identity = log.identity();
         let records = super::super::journal::test_records(3);
         let tip = log.append_and_sync(LogTip::EMPTY, records).await.unwrap();
@@ -1308,7 +1308,7 @@ mod tests {
             .unwrap();
         drop(log);
         // First reopen must replay the management record from the real WAL.
-        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let log = LocalLog::open(dir.path(), Default::default()).unwrap();
         assert_eq!(log.identity(), identity);
         let recovered = log.recover().await.unwrap();
         assert!(recovered.checkpoint.is_none());
@@ -1345,7 +1345,7 @@ mod tests {
         drop(log);
         // Second reopen restores the cleared set from the image, then only the
         // suffix. It must not resurrect the old request or rebase event IDs.
-        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let log = LocalLog::open(dir.path(), Default::default()).unwrap();
         assert_eq!(log.identity(), identity);
         let recovered = log.recover().await.unwrap();
         assert_eq!(recovered.tip, final_tip);

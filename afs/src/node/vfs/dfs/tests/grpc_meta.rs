@@ -28,8 +28,37 @@ impl crate::meta::store::MetaLog for CountingMetaLog {
     fn persistence(&self) -> crate::meta::store::BackendPersistence {
         self.inner.persistence()
     }
-    fn limits(&self) -> crate::meta::store::journal::LogLimits {
+    fn limits(&self) -> crate::meta::store::journal::AppendLimits {
         self.inner.limits()
+    }
+    fn checkpoint_limits(&self) -> crate::meta::store::journal::CheckpointLimits {
+        self.inner.checkpoint_limits()
+    }
+    /// This wrapper does not forward checkpoints, so Store schedules none.
+    fn supports_checkpoint(&self) -> bool {
+        false
+    }
+    fn status(&self) -> crate::meta::store::MetaFuture<'_, crate::meta::store::journal::LogStatus> {
+        self.inner.status()
+    }
+    fn can_append(
+        &self,
+        expected: crate::meta::store::journal::LogTip,
+        bytes: usize,
+    ) -> crate::meta::store::MetaFuture<'_, bool> {
+        self.inner.can_append(expected, bytes)
+    }
+    fn install_checkpoint(
+        &self,
+        _: crate::meta::store::journal::LogTip,
+        _: Vec<u8>,
+    ) -> crate::meta::store::MetaFuture<'_, ()> {
+        Box::pin(async {
+            Err(afs_error::Error::coded(
+                afs_error::IO_UNAVAILABLE,
+                "test wrapper does not install checkpoints",
+            ))
+        })
     }
     fn recover(
         &self,

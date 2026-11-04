@@ -3,7 +3,7 @@ use afs::dfs::{
     ReplicationConfig, ValidateReplicaWriteRequest,
 };
 use afs::meta::store::{
-    journal::{LogLimits, LogTip, RecoveredLog},
+    journal::{AppendLimits, CheckpointLimits, LogStatus, LogTip, RecoveredLog},
     log::Record,
 };
 use afs::{
@@ -2379,7 +2379,7 @@ impl MetaLog for LostCommitResultBackend {
     fn persistence(&self) -> afs::meta::store::BackendPersistence {
         self.inner.persistence()
     }
-    fn limits(&self) -> LogLimits {
+    fn limits(&self) -> AppendLimits {
         self.inner.limits()
     }
     fn health(&self) -> afs::meta::store::MetaFuture<'_, ()> {
@@ -2387,6 +2387,27 @@ impl MetaLog for LostCommitResultBackend {
     }
     fn recover(&self) -> afs::meta::store::MetaFuture<'_, RecoveredLog> {
         self.inner.recover()
+    }
+    fn checkpoint_limits(&self) -> CheckpointLimits {
+        self.inner.checkpoint_limits()
+    }
+    /// This wrapper does not forward checkpoints, so Store schedules none.
+    fn supports_checkpoint(&self) -> bool {
+        false
+    }
+    fn status(&self) -> afs::meta::store::MetaFuture<'_, LogStatus> {
+        self.inner.status()
+    }
+    fn can_append(&self, expected: LogTip, bytes: usize) -> afs::meta::store::MetaFuture<'_, bool> {
+        self.inner.can_append(expected, bytes)
+    }
+    fn install_checkpoint(&self, _: LogTip, _: Vec<u8>) -> afs::meta::store::MetaFuture<'_, ()> {
+        Box::pin(async {
+            Err(afs_error::Error::coded(
+                afs_error::IO_UNAVAILABLE,
+                "test wrapper does not install checkpoints",
+            ))
+        })
     }
     fn append_and_sync(
         &self,
@@ -2557,7 +2578,7 @@ async fn p3_supported_commit_shapes_survive_local_log_reopen() {
         ("fragmented-layout", 1, 1, 65537),
     ] {
         let dir = tempfile::tempdir().unwrap();
-        let log = Arc::new(LocalLog::open(dir.path(), LogLimits::default()).unwrap());
+        let log = Arc::new(LocalLog::open(dir.path(), Default::default()).unwrap());
         let store = Arc::new(Store::open_log(log.clone()).await.unwrap());
         let replication = ReplicationConfig {
             desired_copies: copies,
@@ -2640,7 +2661,7 @@ async fn p3_supported_commit_shapes_survive_local_log_reopen() {
         );
         assert_eq!(facts.outcomes.len(), 1);
         let record_bytes = decision
-            .encode(LogLimits::default().record_max_bytes)
+            .encode(afs::meta::store::local_log::LocalLogOptions::default().record_max_bytes)
             .unwrap()
             .len();
         let expected_inode = store
@@ -2672,7 +2693,7 @@ async fn p3_supported_commit_shapes_survive_local_log_reopen() {
         .await
         .unwrap();
         drop(log);
-        let reopened_log = Arc::new(LocalLog::open(dir.path(), LogLimits::default()).unwrap());
+        let reopened_log = Arc::new(LocalLog::open(dir.path(), Default::default()).unwrap());
         let reopened = Arc::new(Store::open_log(reopened_log.clone()).await.unwrap());
         assert_eq!(
             reopened

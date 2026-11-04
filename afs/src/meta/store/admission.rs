@@ -12,6 +12,10 @@ pub(super) struct Visible {
     /// that the local disk is damaged. Refuse even reads until a fresh process
     /// reloads the backend; stale grants must never be served as current.
     pub(super) poisoned: AtomicBool,
+    /// Effective maintenance: `None` when not configured or when the backend
+    /// cannot checkpoint. Gates the checkpoint loop and the WAL capacity wait.
+    pub(super) maintenance: Option<journal::MaintenancePolicy>,
+    pub(super) capture_charge_max_bytes: usize,
 }
 
 pub(super) struct CheckpointGuard {

@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use std::{fs::File, io::Read, sync::Mutex};
 
 pub const FRAME_OVERHEAD: usize = 40;
-pub const LOG_HEADER_BYTES: u64 = 4096;
+/// Upper bound on records in one atomic `append_and_sync` group. Every backend
+/// accepts at most this many; Store gathers at most this many ready requests.
+pub const BATCH_RECORDS_MAX: usize = 64;
 const VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -41,75 +43,44 @@ impl LogTip {
         record_hash: [0; 32],
     };
 }
-#[derive(Clone, Copy, Debug)]
-pub struct LogLimits {
+/// Backend-neutral append bounds, in framed bytes (`frame_size`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AppendLimits {
+    /// Largest accepted single framed record.
     pub record_max_bytes: usize,
+    /// Largest accepted sum of framed records in one group.
     pub batch_max_bytes: usize,
-    pub wal_max_bytes: u64,
-    /// Soft rotation target; an atomic batch is never split between segments.
-    pub segment_bytes: u64,
-    pub segments_max: usize,
+    /// Largest accepted record count in one group, `1..=BATCH_RECORDS_MAX`.
+    pub batch_records_max: usize,
 }
-impl Default for LogLimits {
-    fn default() -> Self {
-        Self {
-            record_max_bytes: 64 * 1024 * 1024,
-            batch_max_bytes: 128 * 1024 * 1024,
-            wal_max_bytes: 1024 * 1024 * 1024,
-            segment_bytes: 64 * 1024 * 1024,
-            segments_max: 64,
-        }
-    }
-}
-impl LogLimits {
+impl AppendLimits {
     pub fn validate(self) -> Result<Self> {
-        let record = u64::try_from(self.record_max_bytes)
-            .map_err(|_| invalid_log("record limit overflow"))?;
-        if self.segment_bytes < LOG_HEADER_BYTES + 256
-            || !(2..=256).contains(&self.segments_max)
-            || self.record_max_bytes < 256
+        if self.record_max_bytes < 256
             || self.record_max_bytes > u32::MAX as usize
             || self.batch_max_bytes < self.record_max_bytes
-            || u64::try_from(self.batch_max_bytes)
-                .map_err(|_| invalid_log("batch limit overflow"))?
-                > self.wal_max_bytes.saturating_sub(LOG_HEADER_BYTES)
-            || record > self.wal_max_bytes.saturating_sub(LOG_HEADER_BYTES)
+            || !(1..=BATCH_RECORDS_MAX).contains(&self.batch_records_max)
         {
             return Err(invalid_log("invalid finite record/batch/WAL limits"));
         }
         Ok(self)
     }
 }
-/// Logical snapshot admission; allocator/RSS must be measured separately.
-#[derive(Clone, Copy, Debug)]
+/// Backend-neutral checkpoint bound. Meaningful only when the backend reports
+/// `supports_checkpoint`; it bounds both installed and recovered images.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CheckpointLimits {
     pub image_max_bytes: usize,
-    pub capture_charge_max_bytes: usize,
-    pub disk_max_bytes: u64,
-    pub files_max: usize,
 }
 impl Default for CheckpointLimits {
     fn default() -> Self {
         Self {
             image_max_bytes: 1024 * 1024 * 1024,
-            capture_charge_max_bytes: 2 * 1024 * 1024 * 1024,
-            disk_max_bytes: 4 * 1024 * 1024 * 1024,
-            files_max: 8,
         }
     }
 }
 impl CheckpointLimits {
     pub fn validate(self) -> Result<Self> {
-        let image = u64::try_from(self.image_max_bytes)
-            .map_err(|_| invalid_log("checkpoint limit overflow"))?;
-        if self.image_max_bytes < 256
-            || self.capture_charge_max_bytes < self.image_max_bytes
-            || image
-                .checked_mul(3)
-                .and_then(|n| n.checked_add(2 * 64 * 1024))
-                .is_none_or(|n| n > self.disk_max_bytes)
-            || self.files_max < 5
-        {
+        if self.image_max_bytes < 256 {
             return Err(invalid_log("invalid finite checkpoint limits"));
         }
         Ok(self)
@@ -125,7 +96,9 @@ pub struct RecoveredLog {
     pub tip: LogTip,
     pub records: Vec<Record>,
 }
-/// Background thresholds are soft; byte/file admission remains a hard bound.
+/// Store-side checkpoint schedule and WAL capacity wait. Passed to
+/// `Store::open_log_with_options`; never owned by a log backend. Background
+/// thresholds are soft; byte/file admission remains a hard bound.
 #[derive(Clone, Copy, Debug)]
 pub struct MaintenancePolicy {
     pub wal_bytes: u64,
@@ -176,36 +149,63 @@ impl MaintenancePolicy {
         Ok(self)
     }
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LogStatus {
     pub tip: LogTip,
+    /// Position covered by the selected checkpoint (`LogTip::EMPTY` if none).
     pub checkpoint: LogTip,
-    /// Conservative whole-segment charge. May include the covered prefix of
-    /// one segment; never subtract this from measured E2E time.
-    pub pending_bytes_upper_bound: u64,
+    /// Never less than the framed bytes of records after `checkpoint`. A
+    /// backend may over-charge (for example by whole storage units); callers
+    /// use it only as a trigger, never as a measured quantity.
+    pub uncheckpointed_bytes_upper_bound: u64,
 }
+/// The durable operation-log contract every Meta backend implements.
+///
+/// Every method is required, so wrappers cannot silently drop admission,
+/// status or checkpoint behavior. The contract, checked for every backend by
+/// the shared suite in `log_contract_tests`:
+///
+/// - **Compare-and-append.** `append_and_sync(expected, ..)` and
+///   `can_append(expected, ..)` fail when `expected` is not the current tip;
+///   a failed compare changes nothing.
+/// - **Groups.** A group holds `1..=limits().batch_records_max` records; each
+///   framed record is at most `record_max_bytes` and the group at most
+///   `batch_max_bytes`. Out-of-bound groups are rejected without writing.
+/// - **Sequence.** Each record advances the sequence by exactly one; the
+///   returned tip is `expected.sequence + records.len()`.
+/// - **Durability.** `Ok` from `append_and_sync` means the whole group is
+///   durable and will be recovered. An error never implies safe retry: the
+///   group may be absent, partially written or durable (ENOSPC can be
+///   partial). The caller must treat its view as stale.
+/// - **Write-failure latch.** After a failed durable write every later
+///   operation fails until the backend is reconstructed (reopened).
+/// - **Read-only admission.** `can_append` performs no writes. `Ok(false)`
+///   guarantees no append was attempted and nothing changed.
+/// - **Recovery.** `recover` returns the checkpoint (if any) and every record
+///   after it, in order; calling it twice without appends yields equal results
+///   (a backend may serve the first call from an open-time cache).
+/// - **Checkpoint.** When `supports_checkpoint` is true, `install_checkpoint`
+///   rejects anchors that are not on the chain, beyond the tip, or a known
+///   position with different bytes; success releases the covered prefix and
+///   keeps the suffix replayable. When false, Store never schedules it and the
+///   method returns an error.
+/// - **Status.** `status().uncheckpointed_bytes_upper_bound` is never below the
+///   true framed bytes after the checkpoint.
+// TODO(S1d-5): term/fencing — appends carry a term; stale terms are rejected.
 pub trait MetaLog: Send + Sync {
     fn persistence(&self) -> BackendPersistence;
-    fn limits(&self) -> LogLimits;
+    fn limits(&self) -> AppendLimits;
+    fn checkpoint_limits(&self) -> CheckpointLimits;
+    /// Capability: whether `install_checkpoint` can succeed. Store runs its
+    /// checkpoint loop and WAL capacity wait only when this is true.
+    fn supports_checkpoint(&self) -> bool;
     fn health(&self) -> MetaFuture<'_, ()>;
     fn recover(&self) -> MetaFuture<'_, RecoveredLog>;
-    fn maintenance_policy(&self) -> Option<MaintenancePolicy> {
-        None
-    }
-    fn status(&self) -> MetaFuture<'_, LogStatus> {
-        Box::pin(async { Err(unavailable("selected log has no maintenance status")) })
-    }
+    fn status(&self) -> MetaFuture<'_, LogStatus>;
     /// Read-only admission: false guarantees append was not attempted. An
     /// append error itself never implies safe retry (ENOSPC can be partial).
-    fn can_append(&self, _expected: LogTip, _framed_bytes: usize) -> MetaFuture<'_, bool> {
-        Box::pin(async { Ok(true) })
-    }
-    fn checkpoint_limits(&self) -> CheckpointLimits {
-        CheckpointLimits::default()
-    }
-    fn install_checkpoint(&self, _covered: LogTip, _bytes: Vec<u8>) -> MetaFuture<'_, ()> {
-        Box::pin(async { Err(unavailable("selected log does not install checkpoints")) })
-    }
+    fn can_append(&self, expected: LogTip, framed_bytes: usize) -> MetaFuture<'_, bool>;
+    fn install_checkpoint(&self, covered: LogTip, bytes: Vec<u8>) -> MetaFuture<'_, ()>;
     fn append_and_sync(&self, expected: LogTip, records: Vec<Record>) -> MetaFuture<'_, LogTip>;
 }
 #[derive(Deserialize, Serialize)]
@@ -379,10 +379,13 @@ pub(super) fn encode_batch(
     identity: StoreIdentity,
     tip: LogTip,
     records: Vec<Record>,
-    limits: LogLimits,
+    limits: AppendLimits,
 ) -> Result<(Vec<Vec<u8>>, LogTip, usize)> {
-    if records.is_empty() || records.len() > 64 {
-        return Err(invalid_log("batch record count outside 1..64"));
+    if records.is_empty() || records.len() > limits.batch_records_max {
+        return Err(invalid_log(format!(
+            "batch record count outside 1..{}",
+            limits.batch_records_max
+        )));
     }
     let mut frames = Vec::new();
     let mut tip = tip;
@@ -400,10 +403,53 @@ pub(super) fn encode_batch(
 }
 /// Explicitly volatile log for tests/disposable use, with the same wire checks.
 pub struct MemoryLog {
-    policy: MaintenancePolicy,
     identity: StoreIdentity,
-    limits: LogLimits,
+    options: MemoryLogOptions,
     state: std::sync::Arc<Mutex<MemoryState>>,
+    /// Test-only write-failure injection; absent from production builds.
+    #[cfg(test)]
+    fault: MemoryFault,
+}
+/// Bounds for the volatile log. Every byte bound counts framed records.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryLogOptions {
+    pub record_max_bytes: usize,
+    pub batch_max_bytes: usize,
+    /// Retained (uncheckpointed) framed bytes; appends beyond it fail `full`.
+    pub wal_max_bytes: u64,
+}
+impl Default for MemoryLogOptions {
+    fn default() -> Self {
+        Self {
+            record_max_bytes: 64 * 1024 * 1024,
+            batch_max_bytes: 128 * 1024 * 1024,
+            wal_max_bytes: 1024 * 1024 * 1024,
+        }
+    }
+}
+impl MemoryLogOptions {
+    fn append(self) -> AppendLimits {
+        AppendLimits {
+            record_max_bytes: self.record_max_bytes,
+            batch_max_bytes: self.batch_max_bytes,
+            batch_records_max: BATCH_RECORDS_MAX,
+        }
+    }
+    pub fn validate(self) -> Result<Self> {
+        self.append().validate()?;
+        let batch =
+            u64::try_from(self.batch_max_bytes).map_err(|_| invalid_log("batch limit overflow"))?;
+        if batch > self.wal_max_bytes {
+            return Err(invalid_log("invalid finite record/batch/WAL limits"));
+        }
+        Ok(self)
+    }
+}
+#[cfg(test)]
+#[derive(Default)]
+struct MemoryFault {
+    fail_next_append: std::sync::atomic::AtomicBool,
+    latched: std::sync::atomic::AtomicBool,
 }
 struct MemoryState {
     checkpoint: Option<RecoveredCheckpoint>,
@@ -414,15 +460,10 @@ struct MemoryState {
     bytes: u64,
 }
 impl MemoryLog {
-    pub fn new(limits: LogLimits) -> Result<Self> {
-        Self::with_policy(limits, MaintenancePolicy::default())
-    }
-    /// Volatile authority with a validated, caller-selected maintenance policy.
-    pub fn with_policy(limits: LogLimits, policy: MaintenancePolicy) -> Result<Self> {
+    pub fn new(options: MemoryLogOptions) -> Result<Self> {
         Ok(Self {
-            policy: policy.validate()?,
             identity: StoreIdentity::new()?,
-            limits: limits.validate()?,
+            options: options.validate()?,
             state: std::sync::Arc::new(Mutex::new(MemoryState {
                 checkpoint: None,
                 tip: LogTip::EMPTY,
@@ -431,69 +472,93 @@ impl MemoryLog {
                 frames: Vec::new(),
                 bytes: 0,
             })),
+            #[cfg(test)]
+            fault: MemoryFault::default(),
         })
+    }
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, MemoryState>> {
+        #[cfg(test)]
+        if self
+            .fault
+            .latched
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(unavailable("memory log write failed; reconstruct required"));
+        }
+        self.state
+            .lock()
+            .map_err(|_| unavailable("memory log poisoned"))
+    }
+    /// Test-only: the next append fails before changing anything, then every
+    /// operation on this handle fails, like a latched durable-write failure.
+    #[cfg(test)]
+    pub(super) fn inject_write_failure(&self) {
+        self.fault
+            .fail_next_append
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    /// Test-only: a fresh handle over the same volatile records, modelling the
+    /// reconstruction a latched failure requires.
+    #[cfg(test)]
+    pub(super) fn reopen(&self) -> Self {
+        Self {
+            identity: self.identity,
+            options: self.options,
+            state: std::sync::Arc::clone(&self.state),
+            fault: MemoryFault::default(),
+        }
     }
 }
 impl MetaLog for MemoryLog {
     fn persistence(&self) -> BackendPersistence {
         BackendPersistence::Volatile
     }
-    fn limits(&self) -> LogLimits {
-        self.limits
+    fn limits(&self) -> AppendLimits {
+        self.options.append()
+    }
+    fn checkpoint_limits(&self) -> CheckpointLimits {
+        CheckpointLimits::default()
+    }
+    fn supports_checkpoint(&self) -> bool {
+        true
     }
     fn health(&self) -> MetaFuture<'_, ()> {
         Box::pin(async {
-            drop(
-                self.state
-                    .lock()
-                    .map_err(|_| unavailable("memory log poisoned"))?,
-            );
+            drop(self.lock()?);
             Ok(())
         })
     }
-    fn maintenance_policy(&self) -> Option<MaintenancePolicy> {
-        Some(self.policy)
-    }
     fn status(&self) -> MetaFuture<'_, LogStatus> {
         Box::pin(async {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| unavailable("memory log poisoned"))?;
+            let state = self.lock()?;
             Ok(LogStatus {
                 tip: state.tip,
                 checkpoint: state.base,
-                pending_bytes_upper_bound: state.bytes,
+                uncheckpointed_bytes_upper_bound: state.bytes,
             })
         })
     }
     fn can_append(&self, expected: LogTip, framed_bytes: usize) -> MetaFuture<'_, bool> {
         Box::pin(async move {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| unavailable("memory log poisoned"))?;
+            let state = self.lock()?;
             if expected != state.tip {
                 return Err(unavailable("memory admission tip changed"));
             }
             Ok(state
                 .bytes
                 .checked_add(framed_bytes as u64)
-                .is_some_and(|bytes| bytes <= self.limits.wal_max_bytes))
+                .is_some_and(|bytes| bytes <= self.options.wal_max_bytes))
         })
     }
     fn recover(&self) -> MetaFuture<'_, RecoveredLog> {
         Box::pin(async {
-            let state = self
-                .state
-                .lock()
-                .map_err(|_| unavailable("memory log poisoned"))?;
+            let state = self.lock()?;
             let mut tip = state.base;
             let mut records = Vec::new();
             let mut revision = state.base_revision;
             for frame in &state.frames {
                 let (record, next) =
-                    decode_frame(self.identity, tip, frame, self.limits.record_max_bytes)?;
+                    decode_frame(self.identity, tip, frame, self.options.record_max_bytes)?;
                 if record.revision_before() != revision {
                     return Err(invalid_log("memory replay revision gap"));
                 }
@@ -512,59 +577,15 @@ impl MetaLog for MemoryLog {
         })
     }
     fn install_checkpoint(&self, covered: LogTip, bytes: Vec<u8>) -> MetaFuture<'_, ()> {
-        let state = std::sync::Arc::clone(&self.state);
-        let identity = self.identity;
-        let record_limit = self.limits.record_max_bytes;
-        let limits = self.checkpoint_limits();
         Box::pin(async move {
+            // The latch check is taken here; the blocking task owns the state.
+            drop(self.lock()?);
+            let state = std::sync::Arc::clone(&self.state);
+            let identity = self.identity;
+            let record_limit = self.options.record_max_bytes;
+            let limits = self.checkpoint_limits();
             tokio::task::spawn_blocking(move || {
-                let limits = limits.validate()?;
-                let revision =
-                    super::log::StateImage::validate_encoded(&bytes, limits.image_max_bytes)?;
-                let mut state = state
-                    .lock()
-                    .map_err(|_| unavailable("memory log poisoned"))?;
-                if covered.sequence > state.tip.sequence || covered.sequence < state.base.sequence {
-                    return Err(invalid_log("memory checkpoint position invalid"));
-                }
-                let count = usize::try_from(covered.sequence - state.base.sequence)
-                    .map_err(|_| invalid_log("memory checkpoint index"))?;
-                if count > state.frames.len() {
-                    return Err(invalid_log("memory checkpoint missing prefix"));
-                }
-                let mut anchor = state.base;
-                let mut business = state.base_revision;
-                let mut released = 0u64;
-                for frame in state.frames.iter().take(count) {
-                    let (record, next) = decode_frame(identity, anchor, frame, record_limit)?;
-                    if record.revision_before() != business {
-                        return Err(invalid_log("memory checkpoint revision gap"));
-                    }
-                    anchor = next;
-                    business = record.revision_after();
-                    released = released
-                        .checked_add(frame.len() as u64)
-                        .ok_or_else(|| invalid_log("memory checkpoint byte charge overflow"))?;
-                }
-                if anchor != covered || business != revision {
-                    return Err(invalid_log("memory checkpoint anchor/revision mismatch"));
-                }
-                if let Some(old) = &state.checkpoint
-                    && old.covered == covered
-                    && old.bytes != bytes
-                {
-                    return Err(invalid_log("same checkpoint position has different state"));
-                }
-                let remaining = state
-                    .bytes
-                    .checked_sub(released)
-                    .ok_or_else(|| invalid_log("memory checkpoint byte charge underflow"))?;
-                state.checkpoint = Some(RecoveredCheckpoint { covered, bytes });
-                state.frames.drain(..count);
-                state.base = covered;
-                state.base_revision = revision;
-                state.bytes = remaining;
-                Ok(())
+                install_memory_checkpoint(&state, identity, record_limit, limits, covered, bytes)
             })
             .await
             .map_err(|error| unavailable(format!("memory checkpoint task: {error}")))?
@@ -572,25 +593,89 @@ impl MetaLog for MemoryLog {
     }
     fn append_and_sync(&self, expected: LogTip, records: Vec<Record>) -> MetaFuture<'_, LogTip> {
         Box::pin(async move {
-            let mut state = self
-                .state
-                .lock()
-                .map_err(|_| unavailable("memory log poisoned"))?;
+            let mut state = self.lock()?;
             if state.tip != expected {
                 return Err(unavailable("log compare-and-append tip changed"));
             }
-            let (frames, tip, bytes) = encode_batch(self.identity, expected, records, self.limits)?;
+            let (frames, tip, bytes) =
+                encode_batch(self.identity, expected, records, self.options.append())?;
             let total = state
                 .bytes
                 .checked_add(bytes as u64)
-                .filter(|size| *size <= self.limits.wal_max_bytes)
+                .filter(|size| *size <= self.options.wal_max_bytes)
                 .ok_or_else(|| full("memory WAL byte budget exhausted"))?;
+            #[cfg(test)]
+            if self
+                .fault
+                .fail_next_append
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+            {
+                self.fault
+                    .latched
+                    .store(true, std::sync::atomic::Ordering::Release);
+                return Err(unavailable("injected memory log write failure"));
+            }
             state.frames.extend(frames);
             state.tip = tip;
             state.bytes = total;
             Ok(tip)
         })
     }
+}
+fn install_memory_checkpoint(
+    state: &Mutex<MemoryState>,
+    identity: StoreIdentity,
+    record_limit: usize,
+    limits: CheckpointLimits,
+    covered: LogTip,
+    bytes: Vec<u8>,
+) -> Result<()> {
+    let limits = limits.validate()?;
+    let revision = super::log::StateImage::validate_encoded(&bytes, limits.image_max_bytes)?;
+    let mut state = state
+        .lock()
+        .map_err(|_| unavailable("memory log poisoned"))?;
+    if covered.sequence > state.tip.sequence || covered.sequence < state.base.sequence {
+        return Err(invalid_log("memory checkpoint position invalid"));
+    }
+    let count = usize::try_from(covered.sequence - state.base.sequence)
+        .map_err(|_| invalid_log("memory checkpoint index"))?;
+    if count > state.frames.len() {
+        return Err(invalid_log("memory checkpoint missing prefix"));
+    }
+    let mut anchor = state.base;
+    let mut business = state.base_revision;
+    let mut released = 0u64;
+    for frame in state.frames.iter().take(count) {
+        let (record, next) = decode_frame(identity, anchor, frame, record_limit)?;
+        if record.revision_before() != business {
+            return Err(invalid_log("memory checkpoint revision gap"));
+        }
+        anchor = next;
+        business = record.revision_after();
+        released = released
+            .checked_add(frame.len() as u64)
+            .ok_or_else(|| invalid_log("memory checkpoint byte charge overflow"))?;
+    }
+    if anchor != covered || business != revision {
+        return Err(invalid_log("memory checkpoint anchor/revision mismatch"));
+    }
+    if let Some(old) = &state.checkpoint
+        && old.covered == covered
+        && old.bytes != bytes
+    {
+        return Err(invalid_log("same checkpoint position has different state"));
+    }
+    let remaining = state
+        .bytes
+        .checked_sub(released)
+        .ok_or_else(|| invalid_log("memory checkpoint byte charge underflow"))?;
+    state.checkpoint = Some(RecoveredCheckpoint { covered, bytes });
+    state.frames.drain(..count);
+    state.base = covered;
+    state.base_revision = revision;
+    state.bytes = remaining;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -629,7 +714,7 @@ mod tests {
 
     #[tokio::test]
     async fn p3_corrupt_authority_refuses_before_listener_and_preserves_files() {
-        use super::super::local_log::LocalLog;
+        use super::super::local_log::{LOG_HEADER_BYTES, LocalLog, LocalLogOptions};
         use crate::{
             config::{Cli, Config, MetaStoreBackend, Role},
             runtime::Observability,
@@ -721,7 +806,7 @@ mod tests {
                 .keep();
             println!("P3_CORRUPTION_CASE case={case} directory={}", dir.display());
             let root = dir.join("meta-store");
-            let log = LocalLog::open(&root, LogLimits::default()).unwrap();
+            let log = LocalLog::open(&root, LocalLogOptions::default()).unwrap();
             let record = test_records(1).pop().unwrap();
             let (original, _) =
                 encode_frame(log.identity(), LogTip::EMPTY, record.clone(), 1024 * 1024).unwrap();
@@ -802,7 +887,7 @@ mod tests {
                 .keep();
             println!("P3_CORRUPTION_CASE case={case} directory={}", dir.display());
             let root = dir.join("meta-store");
-            let limits = LogLimits {
+            let limits = LocalLogOptions {
                 record_max_bytes: 1024,
                 batch_max_bytes: 4096,
                 wal_max_bytes: 128 * 1024,
@@ -887,7 +972,7 @@ mod tests {
 
     #[tokio::test]
     async fn p3_maintenance_memory_checkpoint_releases_covered_frames() {
-        let log = MemoryLog::new(LogLimits::default()).unwrap();
+        let log = MemoryLog::new(MemoryLogOptions::default()).unwrap();
         let records = test_records(2);
         let first = super::super::state::State::default()
             .replay_record(&records[0])
@@ -922,7 +1007,7 @@ mod tests {
 
     #[tokio::test]
     async fn p3_memory_log_cas_batch_recovery_and_quota() {
-        let log = MemoryLog::new(LogLimits::default()).unwrap();
+        let log = MemoryLog::new(MemoryLogOptions::default()).unwrap();
         let tip = log
             .append_and_sync(LogTip::EMPTY, test_records(2))
             .await
@@ -938,11 +1023,10 @@ mod tests {
         );
         assert!(log.append_and_sync(tip, Vec::new()).await.is_err());
         assert_eq!(log.recover().await.unwrap().tip, tip);
-        let tiny = MemoryLog::new(LogLimits {
+        let tiny = MemoryLog::new(MemoryLogOptions {
             record_max_bytes: 256,
             batch_max_bytes: 256,
             wal_max_bytes: 8192,
-            ..Default::default()
         })
         .unwrap();
         let state = super::super::state::State::default();
@@ -971,11 +1055,10 @@ mod tests {
                 .is_err()
         );
         assert_eq!(tiny.recover().await.unwrap().tip, LogTip::EMPTY);
-        let quota = MemoryLog::new(LogLimits {
+        let quota = MemoryLog::new(MemoryLogOptions {
             record_max_bytes: 1024,
             batch_max_bytes: 1024,
             wal_max_bytes: 8192,
-            ..Default::default()
         })
         .unwrap();
         let mut tip = LogTip::EMPTY;
@@ -994,6 +1077,6 @@ mod tests {
         assert!(exhausted);
         assert!(tip.sequence > 0);
         assert_eq!(quota.recover().await.unwrap().tip, tip);
-        assert!(quota.state.lock().unwrap().bytes <= quota.limits().wal_max_bytes);
+        assert!(quota.state.lock().unwrap().bytes <= quota.options.wal_max_bytes);
     }
 }

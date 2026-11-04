@@ -15,7 +15,7 @@ use crate::{
     meta::{
         Meta,
         rpc::{DfsMetaRpc, MetaRpc},
-        store::{Store, journal::LogLimits, local_log::LocalLog},
+        store::{Store, local_log::LocalLog},
     },
     node::{
         api::local::{LocalApiOptions, serve_local_api_with_options},
@@ -75,7 +75,7 @@ async fn real_dfs(temp: &std::path::Path) -> (Arc<DistributedFs>, tokio::task::J
     let session_id = format!("usrbio-e2e-{}", std::process::id());
     let store = Arc::new(
         Store::open_log(Arc::new(
-            LocalLog::open(temp.join("meta"), LogLimits::default()).expect("open meta log"),
+            LocalLog::open(temp.join("meta"), Default::default()).expect("open meta log"),
         ))
         .await
         .expect("open log-backed meta store"),

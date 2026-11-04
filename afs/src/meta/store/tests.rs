@@ -982,7 +982,7 @@ impl MetaLog for GatedBackend {
     fn persistence(&self) -> BackendPersistence {
         self.inner.persistence()
     }
-    fn limits(&self) -> journal::LogLimits {
+    fn limits(&self) -> journal::AppendLimits {
         self.inner.limits()
     }
     fn health(&self) -> MetaFuture<'_, ()> {
@@ -990,6 +990,22 @@ impl MetaLog for GatedBackend {
     }
     fn recover(&self) -> MetaFuture<'_, journal::RecoveredLog> {
         self.inner.recover()
+    }
+    fn checkpoint_limits(&self) -> journal::CheckpointLimits {
+        self.inner.checkpoint_limits()
+    }
+    /// This wrapper does not forward checkpoints, so Store schedules none.
+    fn supports_checkpoint(&self) -> bool {
+        false
+    }
+    fn status(&self) -> MetaFuture<'_, journal::LogStatus> {
+        self.inner.status()
+    }
+    fn can_append(&self, expected: journal::LogTip, bytes: usize) -> MetaFuture<'_, bool> {
+        self.inner.can_append(expected, bytes)
+    }
+    fn install_checkpoint(&self, _: journal::LogTip, _: Vec<u8>) -> MetaFuture<'_, ()> {
+        Box::pin(async { Err(unavailable("test wrapper does not install checkpoints")) })
     }
     fn append_and_sync(
         &self,
@@ -1018,7 +1034,7 @@ impl MetaLog for CountingBackend {
     fn persistence(&self) -> BackendPersistence {
         self.inner.persistence()
     }
-    fn limits(&self) -> journal::LogLimits {
+    fn limits(&self) -> journal::AppendLimits {
         self.inner.limits()
     }
     fn health(&self) -> MetaFuture<'_, ()> {
@@ -1026,6 +1042,22 @@ impl MetaLog for CountingBackend {
     }
     fn recover(&self) -> MetaFuture<'_, journal::RecoveredLog> {
         self.inner.recover()
+    }
+    fn checkpoint_limits(&self) -> journal::CheckpointLimits {
+        self.inner.checkpoint_limits()
+    }
+    /// This wrapper does not forward checkpoints, so Store schedules none.
+    fn supports_checkpoint(&self) -> bool {
+        false
+    }
+    fn status(&self) -> MetaFuture<'_, journal::LogStatus> {
+        self.inner.status()
+    }
+    fn can_append(&self, expected: journal::LogTip, bytes: usize) -> MetaFuture<'_, bool> {
+        self.inner.can_append(expected, bytes)
+    }
+    fn install_checkpoint(&self, _: journal::LogTip, _: Vec<u8>) -> MetaFuture<'_, ()> {
+        Box::pin(async { Err(unavailable("test wrapper does not install checkpoints")) })
     }
     fn append_and_sync(
         &self,
@@ -1153,7 +1185,7 @@ fn p3_views_incremental_authority_charge_matches_full_rebuild_and_image() {
 }
 #[tokio::test]
 async fn p3_views_same_state_shares_bytes_but_counts_each_view() {
-    let log = Arc::new(journal::MemoryLog::new(journal::LogLimits::default()).unwrap());
+    let log = Arc::new(journal::MemoryLog::new(Default::default()).unwrap());
     let mut limits = view_limits();
     // This case tests quota/sharing, not deadline scheduling.
     limits.lifetime = Duration::from_secs(5);
@@ -1198,7 +1230,7 @@ async fn p3_views_same_state_shares_bytes_but_counts_each_view() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn p3_views_registry_stays_bounded_during_concurrent_fast_drop() {
-    let log = Arc::new(journal::MemoryLog::new(journal::LogLimits::default()).unwrap());
+    let log = Arc::new(journal::MemoryLog::new(Default::default()).unwrap());
     let mut limits = view_limits();
     limits.lifetime = Duration::from_secs(5);
     let store = Arc::new(Store::open_log_with_read_limits(log, limits).await.unwrap());
@@ -1237,7 +1269,7 @@ async fn p3_views_registry_stays_bounded_during_concurrent_fast_drop() {
 }
 #[tokio::test]
 async fn p3_views_byte_refusal_is_before_pin_and_does_not_block_writer() {
-    let log = Arc::new(journal::MemoryLog::new(journal::LogLimits::default()).unwrap());
+    let log = Arc::new(journal::MemoryLog::new(Default::default()).unwrap());
     let mut limits = view_limits();
     limits.held_bytes = 4096;
     let store = Store::open_log_with_read_limits(log, limits).await.unwrap();
@@ -1255,7 +1287,7 @@ async fn p3_views_byte_refusal_is_before_pin_and_does_not_block_writer() {
 }
 #[tokio::test]
 async fn p3_views_expiry_reclaims_state_without_caller_polling() {
-    let log = Arc::new(journal::MemoryLog::new(journal::LogLimits::default()).unwrap());
+    let log = Arc::new(journal::MemoryLog::new(Default::default()).unwrap());
     let store = Store::open_log_with_read_limits(log, view_limits())
         .await
         .unwrap();
@@ -1283,7 +1315,7 @@ async fn p3_views_expiry_reclaims_state_without_caller_polling() {
 #[tokio::test]
 async fn p3_views_known_failed_authority_refuses_existing_view() {
     let log = Arc::new(GatedLog {
-        inner: Arc::new(journal::MemoryLog::new(journal::LogLimits::default()).unwrap()),
+        inner: Arc::new(journal::MemoryLog::new(Default::default()).unwrap()),
         started: Notify::new(),
         release: Notify::new(),
         fail: true,
@@ -1311,7 +1343,7 @@ async fn p3_views_known_failed_authority_refuses_existing_view() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn p3_views_expired_active_read_retains_charge_until_release() {
-    let log = Arc::new(journal::MemoryLog::new(journal::LogLimits::default()).unwrap());
+    let log = Arc::new(journal::MemoryLog::new(Default::default()).unwrap());
     let store = Store::open_log_with_read_limits(log, view_limits())
         .await
         .unwrap();
@@ -1372,8 +1404,9 @@ async fn stop_local_retention_store(store: Store, log: Arc<local_log::LocalLog>)
 #[tokio::test]
 async fn p3_retention_local_runtime_expiry_checkpoint_reopen_keeps_removal() {
     let dir = tempfile::tempdir().unwrap();
-    let local =
-        Arc::new(local_log::LocalLog::open(dir.path(), journal::LogLimits::default()).unwrap());
+    let local = Arc::new(
+        local_log::LocalLog::open(dir.path(), local_log::LocalLogOptions::default()).unwrap(),
+    );
     let identity = local.identity();
     let mut limits = retention_limits();
     limits.request_retention = Duration::from_millis(100);
@@ -1401,8 +1434,9 @@ async fn p3_retention_local_runtime_expiry_checkpoint_reopen_keeps_removal() {
     assert!(tip.sequence >= 2);
     stop_local_retention_store(store, local).await;
 
-    let local =
-        Arc::new(local_log::LocalLog::open(dir.path(), journal::LogLimits::default()).unwrap());
+    let local = Arc::new(
+        local_log::LocalLog::open(dir.path(), local_log::LocalLogOptions::default()).unwrap(),
+    );
     assert_eq!(local.identity(), identity);
     // Raising the retention window must not resurrect an explicit removal.
     let store = Store::open_log_with_history(local.clone(), retention_limits())
@@ -1432,8 +1466,9 @@ async fn p3_retention_local_runtime_expiry_checkpoint_reopen_keeps_removal() {
 #[tokio::test]
 async fn p3_retention_local_runtime_lowered_limits_persist_before_admission() {
     let dir = tempfile::tempdir().unwrap();
-    let local =
-        Arc::new(local_log::LocalLog::open(dir.path(), journal::LogLimits::default()).unwrap());
+    let local = Arc::new(
+        local_log::LocalLog::open(dir.path(), local_log::LocalLogOptions::default()).unwrap(),
+    );
     let identity = local.identity();
     let wide = history::Limits {
         request_count: 8,
@@ -1457,8 +1492,9 @@ async fn p3_retention_local_runtime_lowered_limits_persist_before_admission() {
     let before_tip = before.log_tip;
     stop_local_retention_store(store, local).await;
 
-    let local =
-        Arc::new(local_log::LocalLog::open(dir.path(), journal::LogLimits::default()).unwrap());
+    let local = Arc::new(
+        local_log::LocalLog::open(dir.path(), local_log::LocalLogOptions::default()).unwrap(),
+    );
     assert_eq!(local.identity(), identity);
     let store = Store::open_log_with_history(local.clone(), retention_limits())
         .await
@@ -1480,8 +1516,9 @@ async fn p3_retention_local_runtime_lowered_limits_persist_before_admission() {
     }
     stop_local_retention_store(store, local).await;
 
-    let local =
-        Arc::new(local_log::LocalLog::open(dir.path(), journal::LogLimits::default()).unwrap());
+    let local = Arc::new(
+        local_log::LocalLog::open(dir.path(), local_log::LocalLogOptions::default()).unwrap(),
+    );
     assert_eq!(local.identity(), identity);
     let store = Store::open_log_with_history(local.clone(), wide)
         .await
@@ -1504,7 +1541,7 @@ async fn p3_retention_local_runtime_lowered_limits_persist_before_admission() {
 #[tokio::test]
 async fn p3_retention_runtime_capacity_and_rebuild_follow_actual_outcomes() {
     use journal::MetaLog;
-    let log = Arc::new(journal::MemoryLog::new(journal::LogLimits::default()).unwrap());
+    let log = Arc::new(journal::MemoryLog::new(Default::default()).unwrap());
     let store = Store::open_log_with_history(log.clone(), retention_limits())
         .await
         .unwrap();
@@ -1873,7 +1910,7 @@ async fn p3_lifecycle_completed_commands_reclaimed_pending_and_failed_preserved(
 #[tokio::test]
 async fn p3_retention_runtime_idle_expiry_is_a_durable_management_change() {
     use journal::MetaLog;
-    let log = Arc::new(journal::MemoryLog::new(journal::LogLimits::default()).unwrap());
+    let log = Arc::new(journal::MemoryLog::new(Default::default()).unwrap());
     let mut policy = retention_limits();
     policy.request_retention = Duration::from_millis(100);
     policy.event_retention = Duration::from_millis(100);
@@ -1932,7 +1969,7 @@ async fn p3_retention_runtime_idle_expiry_is_a_durable_management_change() {
 #[tokio::test]
 async fn p3_retention_runtime_busy_requests_do_not_reset_cleanup_deadline() {
     use journal::MetaLog;
-    let log = Arc::new(journal::MemoryLog::new(journal::LogLimits::default()).unwrap());
+    let log = Arc::new(journal::MemoryLog::new(Default::default()).unwrap());
     let mut policy = retention_limits();
     policy.request_retention = Duration::from_millis(200);
     policy.event_retention = Duration::from_millis(200);
@@ -1986,7 +2023,7 @@ async fn p3_retention_runtime_busy_requests_do_not_reset_cleanup_deadline() {
 #[tokio::test]
 async fn p3_retention_runtime_protected_new_outcome_cannot_bypass_byte_cap() {
     use journal::MetaLog;
-    let log = Arc::new(journal::MemoryLog::new(journal::LogLimits::default()).unwrap());
+    let log = Arc::new(journal::MemoryLog::new(Default::default()).unwrap());
     let mut policy = retention_limits();
     policy.request_bytes = 1;
     let store = Store::open_log_with_history(log.clone(), policy)
@@ -2009,7 +2046,7 @@ async fn p3_retention_runtime_protected_new_outcome_cannot_bypass_byte_cap() {
 #[tokio::test]
 async fn p3_retention_runtime_cleanup_stays_private_until_ack() {
     use journal::MetaLog;
-    let inner = Arc::new(journal::MemoryLog::new(journal::LogLimits::default()).unwrap());
+    let inner = Arc::new(journal::MemoryLog::new(Default::default()).unwrap());
     let mut state = State::default();
     let mut records = Vec::new();
     for n in 0..2 {
@@ -2080,7 +2117,7 @@ async fn p3_retention_runtime_cleanup_stays_private_until_ack() {
 #[tokio::test]
 async fn p3_retention_runtime_input_capacity_rejects_before_enqueue() {
     use journal::MetaLog;
-    let log = Arc::new(journal::MemoryLog::new(journal::LogLimits::default()).unwrap());
+    let log = Arc::new(journal::MemoryLog::new(Default::default()).unwrap());
     let mut store = Store::open_log(log.clone()).await.unwrap();
     store.pending_bytes = Arc::new(Semaphore::new(1));
     assert!(
@@ -2099,7 +2136,7 @@ async fn p3_retention_runtime_input_capacity_rejects_before_enqueue() {
 #[tokio::test]
 async fn p3_retention_runtime_cancelled_caller_keeps_input_charge_until_ack() {
     let log = Arc::new(GatedLog {
-        inner: Arc::new(journal::MemoryLog::new(journal::LogLimits::default()).unwrap()),
+        inner: Arc::new(journal::MemoryLog::new(Default::default()).unwrap()),
         started: Notify::new(),
         release: Notify::new(),
         fail: false,
@@ -2151,7 +2188,7 @@ async fn p3_retention_runtime_cancelled_caller_keeps_input_charge_until_ack() {
 #[tokio::test]
 async fn p3_retention_runtime_unknown_ack_stops_all_following_cleanup() {
     use journal::MetaLog;
-    let inner = Arc::new(journal::MemoryLog::new(journal::LogLimits::default()).unwrap());
+    let inner = Arc::new(journal::MemoryLog::new(Default::default()).unwrap());
     let mut state = State::default();
     let mut records = Vec::new();
     for n in 0..2 {
@@ -2238,7 +2275,7 @@ impl journal::MetaLog for CountingLog {
     fn persistence(&self) -> BackendPersistence {
         self.inner.persistence()
     }
-    fn limits(&self) -> journal::LogLimits {
+    fn limits(&self) -> journal::AppendLimits {
         self.inner.limits()
     }
     fn health(&self) -> MetaFuture<'_, ()> {
@@ -2246,6 +2283,22 @@ impl journal::MetaLog for CountingLog {
     }
     fn recover(&self) -> MetaFuture<'_, journal::RecoveredLog> {
         self.inner.recover()
+    }
+    fn checkpoint_limits(&self) -> journal::CheckpointLimits {
+        self.inner.checkpoint_limits()
+    }
+    /// This wrapper does not forward checkpoints, so Store schedules none.
+    fn supports_checkpoint(&self) -> bool {
+        false
+    }
+    fn status(&self) -> MetaFuture<'_, journal::LogStatus> {
+        self.inner.status()
+    }
+    fn can_append(&self, expected: journal::LogTip, bytes: usize) -> MetaFuture<'_, bool> {
+        self.inner.can_append(expected, bytes)
+    }
+    fn install_checkpoint(&self, _: journal::LogTip, _: Vec<u8>) -> MetaFuture<'_, ()> {
+        Box::pin(async { Err(unavailable("test wrapper does not install checkpoints")) })
     }
     fn append_and_sync(
         &self,
@@ -2271,7 +2324,8 @@ impl journal::MetaLog for CountingLog {
 async fn p3_incremental_write_does_not_reencode_untouched_authority() {
     let dir = tempfile::tempdir().unwrap();
     let log = Arc::new(CountingLog {
-        inner: local_log::LocalLog::open(dir.path(), journal::LogLimits::default()).unwrap(),
+        inner: local_log::LocalLog::open(dir.path(), local_log::LocalLogOptions::default())
+            .unwrap(),
         commits: 0.into(),
         bytes: 0.into(),
     });
@@ -2336,7 +2390,7 @@ async fn p3_incremental_write_does_not_reencode_untouched_authority() {
     .unwrap();
     drop(log);
     let reopened = Store::open_log(Arc::new(
-        local_log::LocalLog::open(dir.path(), journal::LogLimits::default()).unwrap(),
+        local_log::LocalLog::open(dir.path(), local_log::LocalLogOptions::default()).unwrap(),
     ))
     .await
     .unwrap();
@@ -2395,7 +2449,7 @@ impl journal::MetaLog for GatedLog {
     fn persistence(&self) -> BackendPersistence {
         BackendPersistence::Volatile
     }
-    fn limits(&self) -> journal::LogLimits {
+    fn limits(&self) -> journal::AppendLimits {
         self.inner.limits()
     }
     fn health(&self) -> MetaFuture<'_, ()> {
@@ -2403,6 +2457,22 @@ impl journal::MetaLog for GatedLog {
     }
     fn recover(&self) -> MetaFuture<'_, journal::RecoveredLog> {
         self.inner.recover()
+    }
+    fn checkpoint_limits(&self) -> journal::CheckpointLimits {
+        self.inner.checkpoint_limits()
+    }
+    /// This wrapper does not forward checkpoints, so Store schedules none.
+    fn supports_checkpoint(&self) -> bool {
+        false
+    }
+    fn status(&self) -> MetaFuture<'_, journal::LogStatus> {
+        self.inner.status()
+    }
+    fn can_append(&self, expected: journal::LogTip, bytes: usize) -> MetaFuture<'_, bool> {
+        self.inner.can_append(expected, bytes)
+    }
+    fn install_checkpoint(&self, _: journal::LogTip, _: Vec<u8>) -> MetaFuture<'_, ()> {
+        Box::pin(async { Err(unavailable("test wrapper does not install checkpoints")) })
     }
     fn append_and_sync(
         &self,
@@ -2426,7 +2496,7 @@ impl journal::MetaLog for GatedLog {
 #[tokio::test]
 async fn p3_log_holds_visibility_and_reply_until_durable_ack() {
     let log = Arc::new(GatedLog {
-        inner: Arc::new(journal::MemoryLog::new(journal::LogLimits::default()).unwrap()),
+        inner: Arc::new(journal::MemoryLog::new(Default::default()).unwrap()),
         started: Notify::new(),
         release: Notify::new(),
         fail: false,
@@ -2456,7 +2526,7 @@ async fn p3_log_holds_visibility_and_reply_until_durable_ack() {
 #[tokio::test]
 async fn p3_log_failed_ack_poisons_store_and_does_not_publish() {
     let log = Arc::new(GatedLog {
-        inner: Arc::new(journal::MemoryLog::new(journal::LogLimits::default()).unwrap()),
+        inner: Arc::new(journal::MemoryLog::new(Default::default()).unwrap()),
         started: Notify::new(),
         release: Notify::new(),
         fail: true,
@@ -2486,7 +2556,7 @@ async fn p3_log_failed_ack_poisons_store_and_does_not_publish() {
 }
 #[tokio::test]
 async fn p3_log_groups_ready_requests_preserving_all_outcomes_and_events() {
-    let log = Arc::new(journal::MemoryLog::new(journal::LogLimits::default()).unwrap());
+    let log = Arc::new(journal::MemoryLog::new(Default::default()).unwrap());
     let store = Store::open_log(log.clone()).await.unwrap();
     let a = RequestKey::new("a", "one");
     let b = RequestKey::new("a", "two");
@@ -2535,7 +2605,7 @@ async fn p3_log_groups_ready_requests_preserving_all_outcomes_and_events() {
 #[tokio::test]
 async fn p3_log_unknown_ack_stops_old_store_and_reopens_exact_outcome() {
     let log = Arc::new(GatedLog {
-        inner: Arc::new(journal::MemoryLog::new(journal::LogLimits::default()).unwrap()),
+        inner: Arc::new(journal::MemoryLog::new(Default::default()).unwrap()),
         started: Notify::new(),
         release: Notify::new(),
         fail: true,
@@ -2585,7 +2655,7 @@ async fn p3_log_unknown_ack_stops_old_store_and_reopens_exact_outcome() {
 }
 #[tokio::test]
 async fn p3_all_condition_variants_keep_truth_idempotence_and_wal_admission() {
-    let log = Arc::new(journal::MemoryLog::new(journal::LogLimits::default()).unwrap());
+    let log = Arc::new(journal::MemoryLog::new(Default::default()).unwrap());
     let store = Arc::new(Store::open_log(log.clone()).await.unwrap());
     for (node, session) in [("a", "s"), ("b", "t")] {
         store
@@ -3164,8 +3234,8 @@ async fn p3_a27_typed_byte_limits_reject_atomically_and_reopen_controls() {
 
     const REJECT_BYTES: usize = 4096;
     const CONTROL_BYTES: usize = 65536;
-    fn limits(record_max_bytes: usize) -> journal::LogLimits {
-        journal::LogLimits {
+    fn limits(record_max_bytes: usize) -> local_log::LocalLogOptions {
+        local_log::LocalLogOptions {
             record_max_bytes,
             batch_max_bytes: 131072,
             wal_max_bytes: 1048576,
@@ -3369,7 +3439,7 @@ async fn p3_a27_ready_group_keeps_failed_requests_out_of_durable_authority() {
     let backend = Arc::new(CountingLog {
         inner: local_log::LocalLog::open(
             directory.path(),
-            journal::LogLimits {
+            local_log::LocalLogOptions {
                 record_max_bytes: 4096,
                 batch_max_bytes: 131072,
                 wal_max_bytes: 1048576,
@@ -3505,7 +3575,7 @@ async fn p3_a27_ready_group_keeps_failed_requests_out_of_durable_authority() {
     let reopened = Store::open_log(Arc::new(
         local_log::LocalLog::open(
             directory.path(),
-            journal::LogLimits {
+            local_log::LocalLogOptions {
                 record_max_bytes: 4096,
                 batch_max_bytes: 131072,
                 wal_max_bytes: 1048576,
@@ -3532,11 +3602,10 @@ async fn p3_a27_ready_group_keeps_failed_requests_out_of_durable_authority() {
 
 #[tokio::test]
 async fn p3_log_failed_condition_and_oversize_do_not_append_or_publish() {
-    let limits = journal::LogLimits {
+    let limits = journal::MemoryLogOptions {
         record_max_bytes: 1024,
         batch_max_bytes: 1024,
         wal_max_bytes: 32 * 1024,
-        ..Default::default()
     };
     let log = Arc::new(journal::MemoryLog::new(limits).unwrap());
     let store = Store::open_log(log.clone()).await.unwrap();
@@ -3591,7 +3660,7 @@ async fn p3_log_failed_condition_and_oversize_do_not_append_or_publish() {
 #[tokio::test]
 async fn p3_log_byte_limit_splits_ready_group_without_losing_order() {
     let dir = tempfile::tempdir().unwrap();
-    let limits = journal::LogLimits {
+    let limits = local_log::LocalLogOptions {
         record_max_bytes: 1024,
         batch_max_bytes: 1024,
         wal_max_bytes: 32 * 1024,
@@ -3927,7 +3996,7 @@ struct MaintenanceLog {
 impl MaintenanceLog {
     fn new() -> Self {
         Self {
-            inner: journal::MemoryLog::new(journal::LogLimits::default()).unwrap(),
+            inner: journal::MemoryLog::new(Default::default()).unwrap(),
             policy: journal::MaintenancePolicy {
                 wal_records: 1,
                 poll: Duration::from_millis(5),
@@ -3949,7 +4018,7 @@ impl journal::MetaLog for MaintenanceLog {
     fn persistence(&self) -> BackendPersistence {
         BackendPersistence::Volatile
     }
-    fn limits(&self) -> journal::LogLimits {
+    fn limits(&self) -> journal::AppendLimits {
         self.inner.limits()
     }
     fn health(&self) -> MetaFuture<'_, ()> {
@@ -3958,8 +4027,11 @@ impl journal::MetaLog for MaintenanceLog {
     fn recover(&self) -> MetaFuture<'_, journal::RecoveredLog> {
         self.inner.recover()
     }
-    fn maintenance_policy(&self) -> Option<journal::MaintenancePolicy> {
-        Some(self.policy)
+    fn checkpoint_limits(&self) -> journal::CheckpointLimits {
+        self.inner.checkpoint_limits()
+    }
+    fn supports_checkpoint(&self) -> bool {
+        true
     }
     fn status(&self) -> MetaFuture<'_, journal::LogStatus> {
         self.inner.status()
@@ -3993,10 +4065,18 @@ impl journal::MetaLog for MaintenanceLog {
         })
     }
 }
+/// Store over a maintenance fixture with that fixture's policy.
+async fn open_maintenance_store(log: Arc<MaintenanceLog>) -> Store {
+    let options = StoreOptions {
+        maintenance: Some(log.policy),
+        ..StoreOptions::default()
+    };
+    Store::open_log_with_options(log, options).await.unwrap()
+}
 #[tokio::test]
 async fn p3_maintenance_background_installs_without_manual_call() {
     let log = Arc::new(MaintenanceLog::new());
-    let store = Store::open_log(log.clone()).await.unwrap();
+    let store = open_maintenance_store(log.clone()).await;
     store
         .register_node_session(RequestKey::new("bg", "one"), lease("one"))
         .await
@@ -4020,7 +4100,7 @@ async fn p3_maintenance_background_installs_without_manual_call() {
 async fn p3_maintenance_capacity_wait_never_appends_or_exposes_private_state() {
     let log = Arc::new(MaintenanceLog::new());
     log.admitted.store(false, Ordering::Release);
-    let store = Arc::new(Store::open_log(log.clone()).await.unwrap());
+    let store = Arc::new(open_maintenance_store(log.clone()).await);
     let write = {
         let store = store.clone();
         tokio::spawn(async move {
@@ -4055,7 +4135,7 @@ async fn p3_maintenance_capacity_timeout_is_not_an_uncertain_enospc_retry() {
     fixture.policy.capacity_wait = Duration::from_millis(25);
     let log = Arc::new(fixture);
     log.admitted.store(false, Ordering::Release);
-    let store = Store::open_log(log.clone()).await.unwrap();
+    let store = open_maintenance_store(log.clone()).await;
     let result = store
         .register_node_session(RequestKey::new("blocked", "no-append"), lease("no-append"))
         .await;
@@ -4089,7 +4169,7 @@ async fn p3_maintenance_capacity_timeout_is_not_an_uncertain_enospc_retry() {
         "unknown append may already be present"
     );
     log.uncertain_failure.store(false, Ordering::Release);
-    let reopened = Store::open_log(log.clone()).await.unwrap();
+    let reopened = open_maintenance_store(log.clone()).await;
     assert!(matches!(
         reopened
             .register_node_session(RequestKey::new("written", "unknown"), lease("unknown"))
@@ -4186,13 +4266,23 @@ struct GatedCheckpointLog {
     release: Notify,
     policy: Option<journal::MaintenancePolicy>,
     checkpoint_limits: journal::CheckpointLimits,
+    capture_charge_max_bytes: usize,
     installs: AtomicU64,
+}
+/// Store over a gated checkpoint log with that fixture's Store-side options.
+async fn open_gated_checkpoint_store(log: Arc<GatedCheckpointLog>) -> Store {
+    let options = StoreOptions {
+        maintenance: log.policy,
+        capture_charge_max_bytes: log.capture_charge_max_bytes,
+        ..StoreOptions::default()
+    };
+    Store::open_log_with_options(log, options).await.unwrap()
 }
 impl journal::MetaLog for GatedCheckpointLog {
     fn persistence(&self) -> BackendPersistence {
         BackendPersistence::Volatile
     }
-    fn limits(&self) -> journal::LogLimits {
+    fn limits(&self) -> journal::AppendLimits {
         self.inner.limits()
     }
     fn health(&self) -> MetaFuture<'_, ()> {
@@ -4201,14 +4291,17 @@ impl journal::MetaLog for GatedCheckpointLog {
     fn recover(&self) -> MetaFuture<'_, journal::RecoveredLog> {
         self.inner.recover()
     }
-    fn maintenance_policy(&self) -> Option<journal::MaintenancePolicy> {
-        self.policy
-    }
     fn checkpoint_limits(&self) -> journal::CheckpointLimits {
         self.checkpoint_limits
     }
+    fn supports_checkpoint(&self) -> bool {
+        true
+    }
     fn status(&self) -> MetaFuture<'_, journal::LogStatus> {
         self.inner.status()
+    }
+    fn can_append(&self, expected: journal::LogTip, bytes: usize) -> MetaFuture<'_, bool> {
+        self.inner.can_append(expected, bytes)
     }
     fn append_and_sync(
         &self,
@@ -4230,14 +4323,15 @@ impl journal::MetaLog for GatedCheckpointLog {
 #[tokio::test]
 async fn p3_checkpoint_cancelled_caller_retains_singleflight_and_state_anchor() {
     let log = Arc::new(GatedCheckpointLog {
-        inner: journal::MemoryLog::new(journal::LogLimits::default()).unwrap(),
+        inner: journal::MemoryLog::new(Default::default()).unwrap(),
         entered: Notify::new(),
         release: Notify::new(),
         policy: None,
         checkpoint_limits: journal::CheckpointLimits::default(),
+        capture_charge_max_bytes: StoreOptions::default().capture_charge_max_bytes,
         installs: AtomicU64::new(0),
     });
-    let store = Arc::new(Store::open_log(log.clone()).await.unwrap());
+    let store = Arc::new(open_gated_checkpoint_store(log.clone()).await);
     store
         .register_node_session(RequestKey::new("writer", "before"), lease("one"))
         .await
@@ -4280,7 +4374,7 @@ async fn p3_checkpoint_cancelled_caller_retains_singleflight_and_state_anchor() 
     assert_eq!(recovered.checkpoint.unwrap().covered.sequence, 1);
     assert_eq!(recovered.records.len(), 1);
     assert_eq!(store.committed().await.unwrap().log_tip.sequence, 2);
-    let restored = Store::open_log(log).await.unwrap();
+    let restored = open_gated_checkpoint_store(log).await;
     assert_eq!(restored.committed().await.unwrap().log_tip.sequence, 2);
     assert_eq!(
         restored.committed().await.unwrap().node_epochs,
@@ -4291,7 +4385,7 @@ async fn p3_checkpoint_cancelled_caller_retains_singleflight_and_state_anchor() 
 #[tokio::test]
 async fn p3_operational_observer_timeout_keeps_task_and_capture_owned() {
     let log = Arc::new(GatedCheckpointLog {
-        inner: journal::MemoryLog::new(journal::LogLimits::default()).unwrap(),
+        inner: journal::MemoryLog::new(Default::default()).unwrap(),
         entered: Notify::new(),
         release: Notify::new(),
         policy: Some(journal::MaintenancePolicy {
@@ -4301,9 +4395,10 @@ async fn p3_operational_observer_timeout_keeps_task_and_capture_owned() {
             ..Default::default()
         }),
         checkpoint_limits: journal::CheckpointLimits::default(),
+        capture_charge_max_bytes: StoreOptions::default().capture_charge_max_bytes,
         installs: 0.into(),
     });
-    let store = Store::open_log(log.clone()).await.unwrap();
+    let store = open_gated_checkpoint_store(log.clone()).await;
     for request in ["one", "two"] {
         store
             .register_node_session(RequestKey::new("timeout", request), lease(request))
@@ -4355,19 +4450,17 @@ async fn p3_operational_observer_timeout_keeps_task_and_capture_owned() {
 #[tokio::test]
 async fn p3_operational_capture_limit_rejects_before_install_without_poison() {
     let log = Arc::new(GatedCheckpointLog {
-        inner: journal::MemoryLog::new(journal::LogLimits::default()).unwrap(),
+        inner: journal::MemoryLog::new(Default::default()).unwrap(),
         entered: Notify::new(),
         release: Notify::new(),
         policy: None,
         checkpoint_limits: journal::CheckpointLimits {
             image_max_bytes: 256,
-            capture_charge_max_bytes: 256,
-            disk_max_bytes: 256 * 1024,
-            files_max: 5,
         },
+        capture_charge_max_bytes: 256,
         installs: 0.into(),
     });
-    let store = Store::open_log(log.clone()).await.unwrap();
+    let store = open_gated_checkpoint_store(log.clone()).await;
     store
         .register_node_session(RequestKey::new("capture", "one"), lease("one"))
         .await
@@ -4403,7 +4496,7 @@ impl journal::MetaLog for PressureLocalLog {
     fn persistence(&self) -> BackendPersistence {
         BackendPersistence::Persistent
     }
-    fn limits(&self) -> journal::LogLimits {
+    fn limits(&self) -> journal::AppendLimits {
         self.inner.limits()
     }
     fn checkpoint_limits(&self) -> journal::CheckpointLimits {
@@ -4421,12 +4514,8 @@ impl journal::MetaLog for PressureLocalLog {
     fn can_append(&self, tip: journal::LogTip, bytes: usize) -> MetaFuture<'_, bool> {
         self.inner.can_append(tip, bytes)
     }
-    fn maintenance_policy(&self) -> Option<journal::MaintenancePolicy> {
-        Some(journal::MaintenancePolicy {
-            poll: Duration::from_millis(5),
-            capacity_wait: Duration::from_secs(2),
-            ..Default::default()
-        })
+    fn supports_checkpoint(&self) -> bool {
+        true
     }
     fn append_and_sync(
         &self,
@@ -4448,7 +4537,7 @@ impl journal::MetaLog for PressureLocalLog {
 async fn p3_operational_real_wal_pressure_reclaims_and_continues() {
     let directory = tempfile::tempdir().unwrap().keep();
     eprintln!("P3 WAL pressure fixture={}", directory.display());
-    let limits = journal::LogLimits {
+    let limits = local_log::LocalLogOptions {
         record_max_bytes: 1024,
         batch_max_bytes: 4096,
         wal_max_bytes: 128 * 1024,
@@ -4459,7 +4548,19 @@ async fn p3_operational_real_wal_pressure_reclaims_and_continues() {
         inner: local_log::LocalLog::open(&directory, limits).unwrap(),
         installs: 0.into(),
     });
-    let store = Store::open_log(log.clone()).await.unwrap();
+    let store = Store::open_log_with_options(
+        log.clone(),
+        StoreOptions {
+            maintenance: Some(journal::MaintenancePolicy {
+                poll: Duration::from_millis(5),
+                capacity_wait: Duration::from_secs(2),
+                ..Default::default()
+            }),
+            ..StoreOptions::default()
+        },
+    )
+    .await
+    .unwrap();
     let mut max_files = 0;
     let mut max_bytes = 0;
     for number in 0..24 {
@@ -4534,8 +4635,9 @@ async fn p3_operational_real_wal_pressure_reclaims_and_continues() {
 #[tokio::test]
 async fn p3_checkpoint_local_reopen_restores_image_and_only_replays_suffix() {
     let dir = tempfile::tempdir().unwrap();
-    let local =
-        Arc::new(local_log::LocalLog::open(dir.path(), journal::LogLimits::default()).unwrap());
+    let local = Arc::new(
+        local_log::LocalLog::open(dir.path(), local_log::LocalLogOptions::default()).unwrap(),
+    );
     let identity = local.identity();
     let store = Store::open_log(local.clone()).await.unwrap();
     let request = RequestKey::new("writer", "checkpoint-first");
@@ -4569,8 +4671,9 @@ async fn p3_checkpoint_local_reopen_restores_image_and_only_replays_suffix() {
     .await
     .unwrap();
     drop(local);
-    let local =
-        Arc::new(local_log::LocalLog::open(dir.path(), journal::LogLimits::default()).unwrap());
+    let local = Arc::new(
+        local_log::LocalLog::open(dir.path(), local_log::LocalLogOptions::default()).unwrap(),
+    );
     assert_eq!(local.identity(), identity);
     assert_eq!(
         local.recover().await.unwrap().records.len(),
@@ -4661,8 +4764,9 @@ async fn p3_a77_owned_memory_and_real_wal_resource_report() {
             "scope":"one typed entity; owned capacities and existing reserve, not physical allocation or RSS"
         })
     }
-    let limits = journal::LogLimits::default();
-    let checkpoint = journal::CheckpointLimits::default();
+    let limits = local_log::LocalLogOptions::default();
+    let checkpoint = local_log::LocalCheckpointLimits::default();
+    let capture_charge_max_bytes = StoreOptions::default().capture_charge_max_bytes;
     let history = history::Limits::default();
     let mut observations = Vec::new();
     for files in [64, 128] {
@@ -4833,7 +4937,7 @@ async fn p3_a77_owned_memory_and_real_wal_resource_report() {
             "limits":{
                 "record_max_bytes":limits.record_max_bytes,"batch_max_bytes":limits.batch_max_bytes,"wal_max_bytes":limits.wal_max_bytes,
                 "segment_bytes":limits.segment_bytes,"segments_max":limits.segments_max,
-                "checkpoint_image_max_bytes":checkpoint.image_max_bytes,"checkpoint_capture_max_bytes":checkpoint.capture_charge_max_bytes,
+                "checkpoint_image_max_bytes":checkpoint.image_max_bytes,"checkpoint_capture_max_bytes":capture_charge_max_bytes,
                 "checkpoint_disk_max_bytes":checkpoint.disk_max_bytes,"checkpoint_files_max":checkpoint.files_max,
                 "requests_max":history.request_count,"request_bytes_max":history.request_bytes,"request_retention_ms":history.request_retention.as_millis(),
                 "events_max":history.event_count,"event_bytes_max":history.event_bytes,"event_retention_ms":history.event_retention.as_millis(),

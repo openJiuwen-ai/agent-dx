@@ -39,6 +39,8 @@ pub mod journal;
 pub use journal::MetaLog;
 pub mod local_log;
 pub mod log;
+#[cfg(test)]
+mod log_contract_tests;
 mod profile;
 mod state;
 use state::State;
@@ -56,6 +58,7 @@ use admission::*;
 pub(super) use conditions::entity_key;
 pub(crate) use conditions::now_unix_ms;
 use conditions::*;
+pub(crate) use engine::StoreOptions;
 use engine::*;
 pub use engine::{Store, unavailable_meta_store};
 use metrics::*;

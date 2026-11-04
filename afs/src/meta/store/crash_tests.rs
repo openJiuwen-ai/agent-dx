@@ -3,8 +3,8 @@
 use super::{
     MetaRead, MetaStore, NodeSessionLease, OperationResult, RequestKey, RequestOutcome, Store,
     StoreRevision, TxnOutcome, WatchBatch,
-    journal::{LogLimits, MetaLog},
-    local_log::LocalLog,
+    journal::MetaLog,
+    local_log::{LocalLog, LocalLogOptions},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -71,7 +71,7 @@ fn lease(session: &str) -> NodeSessionLease {
 async fn child(directory: &Path) {
     let root = directory.join("meta");
     let store = Store::open_log(Arc::new(
-        LocalLog::open(&root, LogLimits::default()).unwrap(),
+        LocalLog::open(&root, LocalLogOptions::default()).unwrap(),
     ))
     .await
     .unwrap();
@@ -166,7 +166,7 @@ async fn p3_process_crash_matrix() {
         let root = directory.join("meta");
         let wal = root.join("wal-00000000000000000001.log");
         let before = fs::read(&wal).unwrap();
-        let log = Arc::new(LocalLog::open(&root, LogLimits::default()).unwrap());
+        let log = Arc::new(LocalLog::open(&root, LocalLogOptions::default()).unwrap());
         let store = Store::open_log(log.clone()).await.unwrap();
         let count = if point == "partial_second" { 2 } else { 3 };
         assert_eq!(log.recover().await.unwrap().tip.sequence, count);
@@ -294,7 +294,7 @@ async fn p3_initialization_process_crash() {
     if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new("1")) {
         let directory = PathBuf::from(std::env::var_os(DIRECTORY).unwrap());
         fs::write(directory.join("armed"), b"no listener or business ACK").unwrap();
-        LocalLog::open(directory.join("meta"), LogLimits::default()).unwrap();
+        LocalLog::open(directory.join("meta"), LocalLogOptions::default()).unwrap();
         panic!("initialization faultpoint was not reached");
     }
     let directory = tempfile::tempdir().unwrap().keep();
@@ -331,7 +331,7 @@ async fn p3_initialization_process_crash() {
     let root = directory.join("meta");
     let identity = fs::read(root.join("IDENTITY")).unwrap();
     assert!(root.join("INITIALIZING").exists());
-    let log = Arc::new(LocalLog::open(&root, LogLimits::default()).unwrap());
+    let log = Arc::new(LocalLog::open(&root, LocalLogOptions::default()).unwrap());
     assert_eq!(fs::read(root.join("IDENTITY")).unwrap(), identity);
     assert!(!root.join("INITIALIZING").exists());
     let store = Store::open_log(log.clone()).await.unwrap();
@@ -359,7 +359,7 @@ async fn p3_initialization_process_crash() {
     .unwrap();
     drop(log);
     let store = Store::open_log(Arc::new(
-        LocalLog::open(&root, LogLimits::default()).unwrap(),
+        LocalLog::open(&root, LocalLogOptions::default()).unwrap(),
     ))
     .await
     .unwrap();
@@ -378,8 +378,8 @@ async fn p3_initialization_process_crash() {
     fs::remove_dir_all(directory).unwrap();
 }
 
-fn checkpoint_log_limits() -> LogLimits {
-    LogLimits {
+fn checkpoint_log_limits() -> LocalLogOptions {
+    LocalLogOptions {
         record_max_bytes: 1024,
         batch_max_bytes: 4096,
         wal_max_bytes: 128 * 1024,
@@ -388,10 +388,10 @@ fn checkpoint_log_limits() -> LogLimits {
     }
 }
 
-fn checkpoint_image_limits() -> super::journal::CheckpointLimits {
-    super::journal::CheckpointLimits {
+fn checkpoint_image_limits() -> super::local_log::LocalCheckpointLimits {
+    super::local_log::LocalCheckpointLimits {
         image_max_bytes: 64 * 1024,
-        capture_charge_max_bytes: 256 * 1024,
+        validation_charge_max_bytes: 256 * 1024,
         disk_max_bytes: 512 * 1024,
         files_max: 8,
     }

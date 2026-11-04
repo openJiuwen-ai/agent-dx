@@ -16,18 +16,111 @@ use afs_error::{Error, Result};
 use super::{
     BackendPersistence, MetaFuture, StoreRevision,
     journal::{
-        CheckpointLimits, LOG_HEADER_BYTES, LogLimits, LogTip, MetaLog, RecoveredCheckpoint,
-        RecoveredLog, StoreIdentity, decode_frame, encode_batch, frame_length, full, invalid_log,
-        unavailable,
+        AppendLimits, BATCH_RECORDS_MAX, CheckpointLimits, LogStatus, LogTip, MetaLog,
+        RecoveredCheckpoint, RecoveredLog, StoreIdentity, decode_frame, encode_batch, frame_length,
+        full, invalid_log, unavailable,
     },
     log::Record,
 };
 
+/// Fixed size of each local WAL segment header (static header plus tail slots).
+pub const LOG_HEADER_BYTES: u64 = 4096;
 const WAL: &str = "wal-00000000000000000001.log";
 const IDENTITY: &str = "IDENTITY";
 const STATIC_BYTES: usize = 256;
 const SLOT_BYTES: usize = 64;
 const EVIDENCE_LIMIT: usize = 2;
+
+/// Local WAL bounds. Append bounds are framed bytes; segment and directory
+/// bounds include each segment's `LOG_HEADER_BYTES` header.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalLogOptions {
+    pub record_max_bytes: usize,
+    pub batch_max_bytes: usize,
+    /// Directory WAL budget: every live or not-yet-removed segment file,
+    /// headers included.
+    pub wal_max_bytes: u64,
+    /// Soft rotation target; an atomic batch is never split between segments.
+    pub segment_bytes: u64,
+    pub segments_max: usize,
+}
+impl Default for LocalLogOptions {
+    fn default() -> Self {
+        Self {
+            record_max_bytes: 64 * 1024 * 1024,
+            batch_max_bytes: 128 * 1024 * 1024,
+            wal_max_bytes: 1024 * 1024 * 1024,
+            segment_bytes: 64 * 1024 * 1024,
+            segments_max: 64,
+        }
+    }
+}
+impl LocalLogOptions {
+    /// Backend-neutral append bounds this WAL accepts.
+    pub fn append(self) -> AppendLimits {
+        AppendLimits {
+            record_max_bytes: self.record_max_bytes,
+            batch_max_bytes: self.batch_max_bytes,
+            batch_records_max: BATCH_RECORDS_MAX,
+        }
+    }
+    pub fn validate(self) -> Result<Self> {
+        let record = u64::try_from(self.record_max_bytes)
+            .map_err(|_| invalid_log("record limit overflow"))?;
+        if self.segment_bytes < LOG_HEADER_BYTES + 256
+            || !(2..=256).contains(&self.segments_max)
+            || self.record_max_bytes < 256
+            || self.record_max_bytes > u32::MAX as usize
+            || self.batch_max_bytes < self.record_max_bytes
+            || u64::try_from(self.batch_max_bytes)
+                .map_err(|_| invalid_log("batch limit overflow"))?
+                > self.wal_max_bytes.saturating_sub(LOG_HEADER_BYTES)
+            || record > self.wal_max_bytes.saturating_sub(LOG_HEADER_BYTES)
+        {
+            return Err(invalid_log("invalid finite record/batch/WAL limits"));
+        }
+        self.append().validate()?;
+        Ok(self)
+    }
+}
+/// Local checkpoint bounds. `image_max_bytes` is the backend-neutral image
+/// bound; the rest bound local files. `validation_charge_max_bytes` bounds the
+/// memory charge held while proving an unreferenced image owned before
+/// deletion (the same 2 GiB default as Store's capture budget).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalCheckpointLimits {
+    pub image_max_bytes: usize,
+    pub validation_charge_max_bytes: usize,
+    pub disk_max_bytes: u64,
+    pub files_max: usize,
+}
+impl Default for LocalCheckpointLimits {
+    fn default() -> Self {
+        Self {
+            image_max_bytes: CheckpointLimits::default().image_max_bytes,
+            validation_charge_max_bytes: 2 * 1024 * 1024 * 1024,
+            disk_max_bytes: 4 * 1024 * 1024 * 1024,
+            files_max: 8,
+        }
+    }
+}
+impl LocalCheckpointLimits {
+    pub fn validate(self) -> Result<Self> {
+        let image = u64::try_from(self.image_max_bytes)
+            .map_err(|_| invalid_log("checkpoint limit overflow"))?;
+        if self.image_max_bytes < 256
+            || self.validation_charge_max_bytes < self.image_max_bytes
+            || image
+                .checked_mul(3)
+                .and_then(|n| n.checked_add(2 * 64 * 1024))
+                .is_none_or(|n| n > self.disk_max_bytes)
+            || self.files_max < 5
+        {
+            return Err(invalid_log("invalid finite checkpoint limits"));
+        }
+        Ok(self)
+    }
+}
 
 #[derive(Clone)]
 pub struct LocalLog {
@@ -37,9 +130,8 @@ struct Inner {
     owner_pid: u32,
     dir: PathBuf,
     identity: StoreIdentity,
-    limits: LogLimits,
-    checkpoint_limits: CheckpointLimits,
-    maintenance: super::journal::MaintenancePolicy,
+    limits: LocalLogOptions,
+    checkpoint_limits: LocalCheckpointLimits,
     checkpoint_install: Mutex<()>,
     _lock: File,
     state: Mutex<LocalState>,
@@ -452,7 +544,7 @@ fn wal_name(base: LogTip) -> Result<String> {
 }
 fn wal_budget(
     dir: &Path,
-    limits: LogLimits,
+    limits: LocalLogOptions,
     extra_bytes: u64,
     extra_files: usize,
     retired: &[SegmentRef],
@@ -470,7 +562,7 @@ fn wal_budget(
 // lets regressions delete an enumerated file before stat, without timing hooks.
 fn wal_budget_entries(
     entries: impl IntoIterator<Item = std::io::Result<fs::DirEntry>>,
-    limits: LogLimits,
+    limits: LocalLogOptions,
     extra_bytes: u64,
     extra_files: usize,
     retired: &[SegmentRef],
@@ -569,7 +661,7 @@ fn read_image(
     dir: &Path,
     identity: StoreIdentity,
     reference: CheckpointRef,
-    limits: CheckpointLimits,
+    limits: LocalCheckpointLimits,
 ) -> Result<RecoveredCheckpoint> {
     let name = image_name(reference);
     let read = || -> Result<RecoveredCheckpoint> {
@@ -688,7 +780,7 @@ fn checkpoint_budget(
     dir: &Path,
     extra_bytes: u64,
     extra_files: usize,
-    limits: CheckpointLimits,
+    limits: LocalCheckpointLimits,
 ) -> Result<()> {
     let mut bytes = extra_bytes;
     let mut files = extra_files;
@@ -724,7 +816,7 @@ fn reserve_file(file: &File, length: u64) -> Result<()> {
     }
     Ok(())
 }
-fn quarantine_checkpoint_tmp(dir: &Path, name: &str, limits: CheckpointLimits) -> Result<()> {
+fn quarantine_checkpoint_tmp(dir: &Path, name: &str, limits: LocalCheckpointLimits) -> Result<()> {
     let path = dir.join(name);
     match fs::symlink_metadata(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -772,7 +864,7 @@ fn quarantine_checkpoint_tmp(dir: &Path, name: &str, limits: CheckpointLimits) -
 fn verify_anchor(
     dir: &Path,
     identity: StoreIdentity,
-    limits: LogLimits,
+    limits: LocalLogOptions,
     segments: &[SegmentRef],
     covered: LogTip,
     revision: StoreRevision,
@@ -903,11 +995,209 @@ fn unselected_prepared_segment(dir: &Path, manifest: &Current) -> Result<Option<
     Ok(prepared)
 }
 
+/// First readable image of the CURRENT chain (current, then previous).
+fn select_checkpoint(
+    dir: &Path,
+    identity: StoreIdentity,
+    references: &[CheckpointRef],
+    checkpoint_limits: LocalCheckpointLimits,
+) -> Result<Option<RecoveredCheckpoint>> {
+    let mut errors = Vec::new();
+    for reference in references {
+        match read_image(dir, identity, *reference, checkpoint_limits) {
+            Ok(image) => return Ok(Some(image)),
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    if !references.is_empty() {
+        return Err(invalid_log(format!(
+            "CURRENT has no valid checkpoint: {}",
+            errors.join("; ")
+        )));
+    }
+    Ok(None)
+}
+/// Replay position carried across segments.
+struct ReplayCursor<'a> {
+    tip: LogTip,
+    revision: StoreRevision,
+    references: &'a [CheckpointRef],
+    /// Whether each reference's covered position was found on the chain.
+    anchors: Vec<bool>,
+    covered: u64,
+    records: Vec<Record>,
+}
+/// One segment after its complete frames were replayed.
+struct ScannedSegment {
+    name: String,
+    file: File,
+    declared: Tail,
+    offset: u64,
+    length: u64,
+}
+/// Replay every complete frame of one listed segment into `cursor`. Stops at
+/// an incomplete trailing frame; rejects any gap, corruption or a declared
+/// tail that the frames do not reach exactly.
+fn replay_segment(
+    dir: &Path,
+    identity: StoreIdentity,
+    limits: LocalLogOptions,
+    segment: &SegmentRef,
+    cursor: &mut ReplayCursor<'_>,
+) -> Result<ScannedSegment> {
+    if segment.base != cursor.tip || segment.base_revision != cursor.revision {
+        return Err(invalid_log("WAL segment base/revision gap"));
+    }
+    let name = wal_name(segment.base)?;
+    let mut file = open_file(&dir.join(&name), false).map_err(|error| {
+        invalid_log(format!(
+            "{name} offset 0 at base sequence {} required segment: {error}",
+            segment.base.sequence
+        ))
+    })?;
+    let declared = header(&mut file, identity, segment.base)?;
+    let length = file.metadata()?.len();
+    if declared.end > length
+        || segment
+            .sealed
+            .is_some_and(|(tail, _)| declared != tail || length != tail.end)
+    {
+        return Err(invalid_log(format!(
+            "{name} sealed/declared durable content missing or changed"
+        )));
+    }
+    let mut offset = LOG_HEADER_BYTES;
+    let mut matched = declared.end == offset && declared.tip == cursor.tip;
+    while offset < length {
+        if length - offset < 8 {
+            break;
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        let mut prefix = [0; 8];
+        file.read_exact(&mut prefix)?;
+        let size = frame_length(&prefix, limits.record_max_bytes)
+            .map_err(|error| invalid_log(format!("{name} offset {offset}: {error}")))?;
+        if size as u64 > length - offset {
+            break;
+        }
+        let mut frame = Vec::new();
+        frame
+            .try_reserve_exact(size)
+            .map_err(|_| Error::coded(afs_error::IO_OUT_OF_MEMORY, "replay frame allocation"))?;
+        frame.resize(size, 0);
+        frame[..8].copy_from_slice(&prefix);
+        file.read_exact(&mut frame[8..])?;
+        let tip = cursor.tip;
+        let revision = cursor.revision;
+        let (record, next) =
+            decode_frame(identity, tip, &frame, limits.record_max_bytes).map_err(|error| {
+                invalid_log(format!(
+                    "{name} offset {offset} after sequence {}: {error}",
+                    tip.sequence
+                ))
+            })?;
+        if record.revision_before() != revision {
+            return Err(invalid_log(format!(
+                "{name} offset {offset} after sequence {}: business revision gap; expected {revision}, found before {} after {}",
+                tip.sequence,
+                record.revision_before(),
+                record.revision_after()
+            )));
+        }
+        cursor.tip = next;
+        cursor.revision = record.revision_after();
+        offset += size as u64;
+        for (reference, matched) in cursor.references.iter().zip(&mut cursor.anchors) {
+            if reference.covered.sequence == cursor.tip.sequence {
+                *matched = reference.covered == cursor.tip && reference.revision == cursor.revision;
+            }
+        }
+        if cursor.tip.sequence > cursor.covered {
+            cursor.records.push(record);
+        }
+        if offset == declared.end {
+            if cursor.tip != declared.tip {
+                return Err(invalid_log(format!(
+                    "{name} declared tail hash/sequence mismatch"
+                )));
+            }
+            matched = true;
+        }
+        if offset > declared.end && !matched {
+            return Err(invalid_log(format!("{name} declared tail inside record")));
+        }
+    }
+    if !matched || offset < declared.end {
+        return Err(invalid_log(format!(
+            "{name} declared durable content incomplete"
+        )));
+    }
+    Ok(ScannedSegment {
+        name,
+        file,
+        declared,
+        offset,
+        length,
+    })
+}
+/// Validate the checkpoint chain against the replayed active segment, then
+/// preserve and cut any incomplete tail and confirm the recovered tail slot.
+/// Returns the active file, its end and its tail generation.
+fn finish_active_segment(
+    dir: &Path,
+    scanned: ScannedSegment,
+    cursor: &ReplayCursor<'_>,
+    prepared_segment: Option<LogTip>,
+) -> Result<(File, u64, u64)> {
+    let ScannedSegment {
+        mut file,
+        declared,
+        offset,
+        length,
+        ..
+    } = scanned;
+    let tip = cursor.tip;
+    if cursor.anchors.iter().any(|matched| !matched) {
+        return Err(invalid_log(
+            "CURRENT checkpoint chain anchor missing or mismatched; no fallback can discard acknowledged history",
+        ));
+    }
+    if prepared_segment.is_some_and(|base| base != tip) {
+        return Err(invalid_log(
+            "unlisted empty WAL is not the recovered next segment",
+        ));
+    }
+    let changed = offset != length || tip != declared.tip;
+    if offset != length {
+        preserve_tail(dir, &mut file, offset, length)?;
+        file.set_len(offset)?;
+    }
+    let generation = if changed {
+        let generation = declared
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| invalid_log("tail generation exhausted"))?;
+        write_tail(
+            &mut file,
+            Tail {
+                generation,
+                tip,
+                end: offset,
+            },
+        )?;
+        generation
+    } else {
+        declared.generation
+    };
+    // Confirm complete but previously unacknowledged same-kernel pages.
+    file.sync_all()?;
+    Ok((file, offset, generation))
+}
 fn replay(
     dir: &Path,
     identity: StoreIdentity,
-    limits: LogLimits,
-    checkpoint_limits: CheckpointLimits,
+    limits: LocalLogOptions,
+    checkpoint_limits: LocalCheckpointLimits,
 ) -> Result<Replay> {
     let manifest = read_current(dir, identity)?.ok_or_else(|| {
         invalid_log("CURRENT missing from initialized Meta log; originals retained")
@@ -920,160 +1210,42 @@ fn replay(
         .into_iter()
         .chain(manifest.previous)
         .collect();
-    let mut checkpoint = None;
-    let mut errors = Vec::new();
-    for reference in &references {
-        match read_image(dir, identity, *reference, checkpoint_limits) {
-            Ok(image) => {
-                checkpoint = Some(image);
-                break;
-            }
-            Err(error) => errors.push(error.to_string()),
-        }
-    }
-    if !references.is_empty() && checkpoint.is_none() {
-        return Err(invalid_log(format!(
-            "CURRENT has no valid checkpoint: {}",
-            errors.join("; ")
-        )));
-    }
-    let mut tip = manifest.segments[0].base;
-    let mut revision = manifest.segments[0].base_revision;
-    let mut anchors: Vec<_> = references
-        .iter()
-        .map(|reference| reference.covered == tip && reference.revision == revision)
-        .collect();
-    let covered = checkpoint
-        .as_ref()
-        .map_or(0, |image| image.covered.sequence);
-    let mut records = Vec::new();
+    let checkpoint = select_checkpoint(dir, identity, &references, checkpoint_limits)?;
+    let tip = manifest.segments[0].base;
+    let revision = manifest.segments[0].base_revision;
+    let mut cursor = ReplayCursor {
+        tip,
+        revision,
+        references: &references,
+        anchors: references
+            .iter()
+            .map(|reference| reference.covered == tip && reference.revision == revision)
+            .collect(),
+        covered: checkpoint
+            .as_ref()
+            .map_or(0, |image| image.covered.sequence),
+        records: Vec::new(),
+    };
     let mut active = None;
     for segment in &manifest.segments {
-        if segment.base != tip || segment.base_revision != revision {
-            return Err(invalid_log("WAL segment base/revision gap"));
-        }
-        let name = wal_name(segment.base)?;
-        let mut file = open_file(&dir.join(&name), false).map_err(|error| {
-            invalid_log(format!(
-                "{name} offset 0 at base sequence {} required segment: {error}",
-                segment.base.sequence
-            ))
-        })?;
-        let declared = header(&mut file, identity, segment.base)?;
-        let length = file.metadata()?.len();
-        if declared.end > length
-            || segment
-                .sealed
-                .is_some_and(|(tail, _)| declared != tail || length != tail.end)
-        {
-            return Err(invalid_log(format!(
-                "{name} sealed/declared durable content missing or changed"
-            )));
-        }
-        let mut offset = LOG_HEADER_BYTES;
-        let mut matched = declared.end == offset && declared.tip == tip;
-        while offset < length {
-            if length - offset < 8 {
-                break;
-            }
-            file.seek(SeekFrom::Start(offset))?;
-            let mut prefix = [0; 8];
-            file.read_exact(&mut prefix)?;
-            let size = frame_length(&prefix, limits.record_max_bytes)
-                .map_err(|error| invalid_log(format!("{name} offset {offset}: {error}")))?;
-            if size as u64 > length - offset {
-                break;
-            }
-            let mut frame = Vec::new();
-            frame.try_reserve_exact(size).map_err(|_| {
-                Error::coded(afs_error::IO_OUT_OF_MEMORY, "replay frame allocation")
-            })?;
-            frame.resize(size, 0);
-            frame[..8].copy_from_slice(&prefix);
-            file.read_exact(&mut frame[8..])?;
-            let (record, next) = decode_frame(identity, tip, &frame, limits.record_max_bytes)
-                .map_err(|error| {
-                    invalid_log(format!(
-                        "{name} offset {offset} after sequence {}: {error}",
-                        tip.sequence
-                    ))
-                })?;
-            if record.revision_before() != revision {
+        let scanned = replay_segment(dir, identity, limits, segment, &mut cursor)?;
+        if let Some((sealed, business)) = segment.sealed {
+            if cursor.tip != sealed.tip
+                || scanned.offset != sealed.end
+                || cursor.revision != business
+            {
                 return Err(invalid_log(format!(
-                    "{name} offset {offset} after sequence {}: business revision gap; expected {revision}, found before {} after {}",
-                    tip.sequence,
-                    record.revision_before(),
-                    record.revision_after()
+                    "{} seal/revision mismatch",
+                    scanned.name
                 )));
             }
-            tip = next;
-            revision = record.revision_after();
-            offset += size as u64;
-            for (reference, matched) in references.iter().zip(&mut anchors) {
-                if reference.covered.sequence == tip.sequence {
-                    *matched = reference.covered == tip && reference.revision == revision;
-                }
-            }
-            if tip.sequence > covered {
-                records.push(record);
-            }
-            if offset == declared.end {
-                if tip != declared.tip {
-                    return Err(invalid_log(format!(
-                        "{name} declared tail hash/sequence mismatch"
-                    )));
-                }
-                matched = true;
-            }
-            if offset > declared.end && !matched {
-                return Err(invalid_log(format!("{name} declared tail inside record")));
-            }
-        }
-        if !matched || offset < declared.end {
-            return Err(invalid_log(format!(
-                "{name} declared durable content incomplete"
-            )));
-        }
-        if let Some((sealed, business)) = segment.sealed {
-            if tip != sealed.tip || offset != sealed.end || revision != business {
-                return Err(invalid_log(format!("{name} seal/revision mismatch")));
-            }
         } else {
-            if anchors.iter().any(|matched| !matched) {
-                return Err(invalid_log(
-                    "CURRENT checkpoint chain anchor missing or mismatched; no fallback can discard acknowledged history",
-                ));
-            }
-            if prepared_segment.is_some_and(|base| base != tip) {
-                return Err(invalid_log(
-                    "unlisted empty WAL is not the recovered next segment",
-                ));
-            }
-            let changed = offset != length || tip != declared.tip;
-            if offset != length {
-                preserve_tail(dir, &mut file, offset, length)?;
-                file.set_len(offset)?;
-            }
-            let generation = if changed {
-                let generation = declared
-                    .generation
-                    .checked_add(1)
-                    .ok_or_else(|| invalid_log("tail generation exhausted"))?;
-                write_tail(
-                    &mut file,
-                    Tail {
-                        generation,
-                        tip,
-                        end: offset,
-                    },
-                )?;
-                generation
-            } else {
-                declared.generation
-            };
-            // Confirm complete but previously unacknowledged same-kernel pages.
-            file.sync_all()?;
-            active = Some((file, offset, generation));
+            active = Some(finish_active_segment(
+                dir,
+                scanned,
+                &cursor,
+                prepared_segment,
+            )?);
         }
     }
     let (file, end, generation) =
@@ -1083,6 +1255,12 @@ fn replay(
         open_file(&dir.join(CURRENT), false)?.sync_all()?;
     }
     sync_dir(dir)?;
+    let ReplayCursor {
+        tip,
+        revision,
+        records,
+        ..
+    } = cursor;
     Ok(Replay {
         recovered: RecoveredLog {
             checkpoint,
@@ -1096,7 +1274,7 @@ fn replay(
         manifest,
     })
 }
-fn write_current(dir: &Path, manifest: &Current, limits: CheckpointLimits) -> Result<()> {
+fn write_current(dir: &Path, manifest: &Current, limits: LocalCheckpointLimits) -> Result<()> {
     manifest.validate()?;
     let bytes = encode_current(manifest)?;
     quarantine_checkpoint_tmp(dir, "CURRENT.tmp", limits)?;
@@ -1117,7 +1295,7 @@ fn write_current(dir: &Path, manifest: &Current, limits: CheckpointLimits) -> Re
 fn cleanup_unreferenced_images(
     dir: &Path,
     manifest: &Current,
-    limits: CheckpointLimits,
+    limits: LocalCheckpointLimits,
     held_bytes: usize,
 ) -> Result<()> {
     let selected = manifest
@@ -1166,7 +1344,7 @@ fn cleanup_unreferenced_images(
             if image_name(reference) != name.as_ref()
                 || held_bytes
                     .checked_add(8192 + IMAGE_HEADER)
-                    .is_none_or(|n| n > limits.capture_charge_max_bytes)
+                    .is_none_or(|n| n > limits.validation_charge_max_bytes)
             {
                 return Err(invalid_log(
                     "unreferenced image cannot be validated within the existing capture budget",
@@ -1223,8 +1401,8 @@ fn cleanup_unreferenced_images(
 fn cleanup_retired(
     dir: &Path,
     manifest: &Current,
-    limits: LogLimits,
-    checkpoint_limits: CheckpointLimits,
+    limits: LocalLogOptions,
+    checkpoint_limits: LocalCheckpointLimits,
 ) -> Result<(Vec<SegmentRef>, Vec<CheckpointRef>)> {
     let mut segments = Vec::new();
     let mut images = Vec::new();
@@ -1276,7 +1454,7 @@ fn cleanup_retired(
 }
 /// The durable empty marker precedes every initialization file. No business
 /// append or listener is admitted until it is removed and the directory synced.
-fn initialize_marked(dir: &Path, limits: CheckpointLimits) -> Result<StoreIdentity> {
+fn initialize_marked(dir: &Path, limits: LocalCheckpointLimits) -> Result<StoreIdentity> {
     let marker = open_file(&dir.join("INITIALIZING"), false)?;
     if marker.metadata()?.len() != 0 {
         return Err(invalid_log("initialization marker is not empty"));
@@ -1421,31 +1599,16 @@ fn initialize_marked(dir: &Path, limits: CheckpointLimits) -> Result<StoreIdenti
 
 impl LocalLog {
     /// New directories only; old-format or foreign data is never adopted.
-    pub fn open(path: impl AsRef<Path>, limits: LogLimits) -> Result<Self> {
-        Self::open_with_checkpoint_limits(path, limits, CheckpointLimits::default())
+    pub fn open(path: impl AsRef<Path>, limits: LocalLogOptions) -> Result<Self> {
+        Self::open_with_checkpoint_limits(path, limits, LocalCheckpointLimits::default())
     }
     pub fn open_with_checkpoint_limits(
         path: impl AsRef<Path>,
-        limits: LogLimits,
-        checkpoint_limits: CheckpointLimits,
-    ) -> Result<Self> {
-        Self::open_with_policies(
-            path,
-            limits,
-            checkpoint_limits,
-            super::journal::MaintenancePolicy::default(),
-        )
-    }
-    /// Configure scheduling without changing the durable identity or format.
-    pub fn open_with_policies(
-        path: impl AsRef<Path>,
-        limits: LogLimits,
-        checkpoint_limits: CheckpointLimits,
-        maintenance: super::journal::MaintenancePolicy,
+        limits: LocalLogOptions,
+        checkpoint_limits: LocalCheckpointLimits,
     ) -> Result<Self> {
         let limits = limits.validate()?;
         let checkpoint_limits = checkpoint_limits.validate()?;
-        let maintenance = maintenance.validate()?;
         let dir = path.as_ref().to_path_buf();
         create_dir(&dir)?;
         let lock = OpenOptions::new()
@@ -1507,7 +1670,6 @@ impl LocalLog {
                 identity,
                 limits,
                 checkpoint_limits,
-                maintenance,
                 checkpoint_install: Mutex::new(()),
                 _lock: lock,
                 state: Mutex::new(LocalState {
@@ -1526,6 +1688,23 @@ impl LocalLog {
     }
     pub fn identity(&self) -> StoreIdentity {
         self.inner.identity
+    }
+    /// Test-only: replace the active WAL descriptor with a read-only one so the
+    /// next append hits a real write(2) failure (EBADF) and latches.
+    #[cfg(test)]
+    pub(super) fn inject_write_failure(&self) -> Result<()> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| unavailable("local WAL lock poisoned"))?;
+        let active = state
+            .manifest
+            .segments
+            .last()
+            .ok_or_else(|| invalid_log("missing active segment"))?;
+        state.file = File::open(self.inner.dir.join(wal_name(active.base)?))?;
+        Ok(())
     }
     fn check_files(inner: &Inner, state: &mut LocalState) -> Result<()> {
         if state.poisoned {
@@ -1651,6 +1830,196 @@ impl LocalLog {
         state.wal_bytes = bytes;
         Ok(())
     }
+    /// Install one checkpoint under the single-installer gate: verify the
+    /// anchor, keep a valid previous image, write the new image, then select it
+    /// in CURRENT and retire what it covers.
+    fn install_checkpoint_blocking(inner: &Inner, covered: LogTip, bytes: Vec<u8>) -> Result<()> {
+        Self::cleanup(inner)?;
+        let limits = inner.checkpoint_limits;
+        let revision = super::log::StateImage::validate_encoded(&bytes, limits.image_max_bytes)?;
+        let (mut prefix, old) = {
+            let mut state = inner
+                .state
+                .lock()
+                .map_err(|_| unavailable("WAL lock poisoned"))?;
+            Self::check_files(inner, &mut state)?;
+            if covered.sequence > state.tip.sequence {
+                return Err(invalid_log("checkpoint covers future log sequence"));
+            }
+            let mut prefix = state.manifest.segments.clone();
+            let last = prefix
+                .last_mut()
+                .ok_or_else(|| invalid_log("missing checkpoint active segment"))?;
+            last.sealed = Some((
+                Tail {
+                    generation: state.generation,
+                    tip: state.tip,
+                    end: state.end,
+                },
+                state.revision,
+            ));
+            (prefix, state.manifest.clone())
+        };
+        verify_anchor(
+            &inner.dir,
+            inner.identity,
+            inner.limits,
+            &prefix,
+            covered,
+            revision,
+        )?;
+        let (header, reference) = image_header(inner.identity, covered, revision, &bytes);
+        if let Some(current) = old.current {
+            if covered.sequence < current.covered.sequence {
+                return Err(invalid_log("checkpoint installation regresses CURRENT"));
+            }
+            if covered.sequence == current.covered.sequence {
+                if current != reference {
+                    return Err(invalid_log("same checkpoint position has different state"));
+                }
+                read_image(&inner.dir, inner.identity, reference, limits)?;
+                open_file(&inner.dir.join(image_name(reference)), false)?.sync_all()?;
+                open_file(&inner.dir.join(CURRENT), false)?.sync_all()?;
+                return sync_dir(&inner.dir);
+            }
+        }
+        let previous = Self::retained_previous_image(inner, &prefix, &old)?;
+        cleanup_unreferenced_images(&inner.dir, &old, limits, bytes.capacity())?;
+        // The captured prefix is no longer needed after anchors validate.
+        prefix.clear();
+        Self::write_checkpoint_image(inner, reference, &header, &bytes)?;
+        Self::select_checkpoint_manifest(inner, reference, previous)?;
+        Self::cleanup(inner)
+    }
+    /// The newest selected image that is still readable and anchored on the
+    /// chain; it stays as `previous` so one damaged image never loses history.
+    fn retained_previous_image(
+        inner: &Inner,
+        prefix: &[SegmentRef],
+        old: &Current,
+    ) -> Result<Option<CheckpointRef>> {
+        for candidate in old.current.into_iter().chain(old.previous) {
+            if read_image(
+                &inner.dir,
+                inner.identity,
+                candidate,
+                inner.checkpoint_limits,
+            )
+            .is_ok()
+                && verify_anchor(
+                    &inner.dir,
+                    inner.identity,
+                    inner.limits,
+                    prefix,
+                    candidate.covered,
+                    candidate.revision,
+                )
+                .is_ok()
+            {
+                return Ok(Some(candidate));
+            }
+        }
+        if old.current.is_some() {
+            return Err(invalid_log(
+                "prior CURRENT recovery point invalid; originals retained",
+            ));
+        }
+        Ok(None)
+    }
+    /// Make the image durable under its final name (or prove an existing one).
+    fn write_checkpoint_image(
+        inner: &Inner,
+        reference: CheckpointRef,
+        header: &[u8; IMAGE_HEADER],
+        bytes: &[u8],
+    ) -> Result<()> {
+        let limits = inner.checkpoint_limits;
+        quarantine_checkpoint_tmp(&inner.dir, "checkpoint.tmp", limits)?;
+        let target = inner.dir.join(image_name(reference));
+        let exists = target.try_exists()?;
+        let extra = if exists {
+            0
+        } else {
+            reference.bytes + IMAGE_HEADER as u64
+        };
+        checkpoint_budget(
+            &inner.dir,
+            extra + MANIFEST_MAX as u64,
+            if exists { 1 } else { 2 },
+            limits,
+        )?;
+        if exists {
+            read_image(&inner.dir, inner.identity, reference, limits)?;
+            open_file(&target, false)?.sync_all()?;
+        } else {
+            let tmp = inner.dir.join("checkpoint.tmp");
+            let mut file = open_file(&tmp, true)?;
+            reserve_file(&file, reference.bytes + IMAGE_HEADER as u64)?;
+            file.write_all(header)?;
+            #[cfg(test)]
+            if super::crash_tests::active("checkpoint_partial") {
+                file.write_all(&bytes[..bytes.len() / 2])?;
+                super::crash_tests::pause("checkpoint_partial", "half image body written");
+            }
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            fs::rename(tmp, &target)?;
+            sync_dir(&inner.dir)?;
+            #[cfg(test)]
+            super::crash_tests::pause("checkpoint_image_installed", "image durable; old CURRENT");
+        }
+        Ok(())
+    }
+    /// Select `reference` in a durable CURRENT, keeping `previous`, retiring
+    /// other images and every segment both chains cover. A failed CURRENT
+    /// write latches the log.
+    fn select_checkpoint_manifest(
+        inner: &Inner,
+        reference: CheckpointRef,
+        previous: Option<CheckpointRef>,
+    ) -> Result<()> {
+        let mut state = inner
+            .state
+            .lock()
+            .map_err(|_| unavailable("WAL lock poisoned"))?;
+        Self::check_files(inner, &mut state)?;
+        let mut manifest = state.manifest.clone();
+        for image in manifest.current.into_iter().chain(manifest.previous) {
+            if image != reference
+                && Some(image) != previous
+                && !manifest.retired_images.contains(&image)
+            {
+                manifest.retired_images.push(image);
+            }
+        }
+        manifest.current = Some(reference);
+        manifest.previous = previous;
+        let oldest = previous.unwrap_or(reference).covered.sequence;
+        let remove = manifest
+            .segments
+            .iter()
+            .take_while(|segment| {
+                segment
+                    .sealed
+                    .is_some_and(|(tail, _)| tail.tip.sequence <= oldest)
+            })
+            .count();
+        manifest
+            .retired_segments
+            .extend(manifest.segments.drain(..remove));
+        if let Err(error) = write_current(&inner.dir, &manifest, inner.checkpoint_limits) {
+            state.poisoned = true;
+            return Err(error);
+        }
+        #[cfg(test)]
+        super::crash_tests::pause(
+            "checkpoint_selected",
+            "new CURRENT durable; before retirement cleanup",
+        );
+        state.manifest = manifest;
+        state.recovered = None;
+        Ok(())
+    }
     fn cleanup(inner: &Inner) -> Result<()> {
         let manifest = {
             let mut state = inner
@@ -1694,8 +2063,16 @@ impl MetaLog for LocalLog {
     fn persistence(&self) -> BackendPersistence {
         BackendPersistence::Persistent
     }
-    fn limits(&self) -> LogLimits {
-        self.inner.limits
+    fn limits(&self) -> AppendLimits {
+        self.inner.limits.append()
+    }
+    fn checkpoint_limits(&self) -> CheckpointLimits {
+        CheckpointLimits {
+            image_max_bytes: self.inner.checkpoint_limits.image_max_bytes,
+        }
+    }
+    fn supports_checkpoint(&self) -> bool {
+        true
     }
     fn health(&self) -> MetaFuture<'_, ()> {
         let inner = Arc::clone(&self.inner);
@@ -1713,10 +2090,10 @@ impl MetaLog for LocalLog {
             .map_err(|e| unavailable(format!("WAL health task: {e}")))?
         })
     }
-    fn maintenance_policy(&self) -> Option<super::journal::MaintenancePolicy> {
-        Some(self.inner.maintenance)
-    }
-    fn status(&self) -> MetaFuture<'_, super::journal::LogStatus> {
+    /// Charges every segment holding any record after the checkpoint as a
+    /// whole (`end - LOG_HEADER_BYTES`), so the bound may include the covered
+    /// prefix of one segment.
+    fn status(&self) -> MetaFuture<'_, LogStatus> {
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
             inner.ensure_owner()?;
@@ -1742,10 +2119,10 @@ impl MetaLog for LocalLog {
                             .ok_or_else(|| invalid_log("checkpoint trigger byte overflow"))?;
                     }
                 }
-                Ok(super::journal::LogStatus {
+                Ok(LogStatus {
                     tip: state.tip,
                     checkpoint,
-                    pending_bytes_upper_bound: pending,
+                    uncheckpointed_bytes_upper_bound: pending,
                 })
             })
             .await
@@ -1801,9 +2178,6 @@ impl MetaLog for LocalLog {
             .map_err(|error| unavailable(format!("WAL admission task: {error}")))?
         })
     }
-    fn checkpoint_limits(&self) -> CheckpointLimits {
-        self.inner.checkpoint_limits
-    }
     fn install_checkpoint(&self, covered: LogTip, bytes: Vec<u8>) -> MetaFuture<'_, ()> {
         let inner = Arc::clone(&self.inner);
         Box::pin(async move {
@@ -1814,163 +2188,7 @@ impl MetaLog for LocalLog {
                     .checkpoint_install
                     .try_lock()
                     .map_err(|_| unavailable("checkpoint install already active or poisoned"))?;
-                Self::cleanup(&inner)?;
-                let limits = inner.checkpoint_limits;
-                let revision =
-                    super::log::StateImage::validate_encoded(&bytes, limits.image_max_bytes)?;
-                let (mut prefix, old) = {
-                    let mut state = inner
-                        .state
-                        .lock()
-                        .map_err(|_| unavailable("WAL lock poisoned"))?;
-                    Self::check_files(&inner, &mut state)?;
-                    if covered.sequence > state.tip.sequence {
-                        return Err(invalid_log("checkpoint covers future log sequence"));
-                    }
-                    let mut prefix = state.manifest.segments.clone();
-                    let last = prefix
-                        .last_mut()
-                        .ok_or_else(|| invalid_log("missing checkpoint active segment"))?;
-                    last.sealed = Some((
-                        Tail {
-                            generation: state.generation,
-                            tip: state.tip,
-                            end: state.end,
-                        },
-                        state.revision,
-                    ));
-                    (prefix, state.manifest.clone())
-                };
-                verify_anchor(
-                    &inner.dir,
-                    inner.identity,
-                    inner.limits,
-                    &prefix,
-                    covered,
-                    revision,
-                )?;
-                let (header, reference) = image_header(inner.identity, covered, revision, &bytes);
-                if let Some(current) = old.current {
-                    if covered.sequence < current.covered.sequence {
-                        return Err(invalid_log("checkpoint installation regresses CURRENT"));
-                    }
-                    if covered.sequence == current.covered.sequence {
-                        if current != reference {
-                            return Err(invalid_log(
-                                "same checkpoint position has different state",
-                            ));
-                        }
-                        read_image(&inner.dir, inner.identity, reference, limits)?;
-                        open_file(&inner.dir.join(image_name(reference)), false)?.sync_all()?;
-                        open_file(&inner.dir.join(CURRENT), false)?.sync_all()?;
-                        return sync_dir(&inner.dir);
-                    }
-                }
-                let mut previous = None;
-                for candidate in old.current.into_iter().chain(old.previous) {
-                    if read_image(&inner.dir, inner.identity, candidate, limits).is_ok()
-                        && verify_anchor(
-                            &inner.dir,
-                            inner.identity,
-                            inner.limits,
-                            &prefix,
-                            candidate.covered,
-                            candidate.revision,
-                        )
-                        .is_ok()
-                    {
-                        previous = Some(candidate);
-                        break;
-                    }
-                }
-                if old.current.is_some() && previous.is_none() {
-                    return Err(invalid_log(
-                        "prior CURRENT recovery point invalid; originals retained",
-                    ));
-                }
-                cleanup_unreferenced_images(&inner.dir, &old, limits, bytes.capacity())?;
-                // The captured prefix is no longer needed after anchors validate.
-                prefix.clear();
-                quarantine_checkpoint_tmp(&inner.dir, "checkpoint.tmp", limits)?;
-                let target = inner.dir.join(image_name(reference));
-                let exists = target.try_exists()?;
-                let extra = if exists {
-                    0
-                } else {
-                    reference.bytes + IMAGE_HEADER as u64
-                };
-                checkpoint_budget(
-                    &inner.dir,
-                    extra + MANIFEST_MAX as u64,
-                    if exists { 1 } else { 2 },
-                    limits,
-                )?;
-                if exists {
-                    read_image(&inner.dir, inner.identity, reference, limits)?;
-                    open_file(&target, false)?.sync_all()?;
-                } else {
-                    let tmp = inner.dir.join("checkpoint.tmp");
-                    let mut file = open_file(&tmp, true)?;
-                    reserve_file(&file, reference.bytes + IMAGE_HEADER as u64)?;
-                    file.write_all(&header)?;
-                    #[cfg(test)]
-                    if super::crash_tests::active("checkpoint_partial") {
-                        file.write_all(&bytes[..bytes.len() / 2])?;
-                        super::crash_tests::pause("checkpoint_partial", "half image body written");
-                    }
-                    file.write_all(&bytes)?;
-                    file.sync_all()?;
-                    fs::rename(tmp, &target)?;
-                    sync_dir(&inner.dir)?;
-                    #[cfg(test)]
-                    super::crash_tests::pause(
-                        "checkpoint_image_installed",
-                        "image durable; old CURRENT",
-                    );
-                }
-                {
-                    let mut state = inner
-                        .state
-                        .lock()
-                        .map_err(|_| unavailable("WAL lock poisoned"))?;
-                    Self::check_files(&inner, &mut state)?;
-                    let mut manifest = state.manifest.clone();
-                    for image in manifest.current.into_iter().chain(manifest.previous) {
-                        if image != reference
-                            && Some(image) != previous
-                            && !manifest.retired_images.contains(&image)
-                        {
-                            manifest.retired_images.push(image);
-                        }
-                    }
-                    manifest.current = Some(reference);
-                    manifest.previous = previous;
-                    let oldest = previous.unwrap_or(reference).covered.sequence;
-                    let remove = manifest
-                        .segments
-                        .iter()
-                        .take_while(|segment| {
-                            segment
-                                .sealed
-                                .is_some_and(|(tail, _)| tail.tip.sequence <= oldest)
-                        })
-                        .count();
-                    manifest
-                        .retired_segments
-                        .extend(manifest.segments.drain(..remove));
-                    if let Err(error) = write_current(&inner.dir, &manifest, limits) {
-                        state.poisoned = true;
-                        return Err(error);
-                    }
-                    #[cfg(test)]
-                    super::crash_tests::pause(
-                        "checkpoint_selected",
-                        "new CURRENT durable; before retirement cleanup",
-                    );
-                    state.manifest = manifest;
-                    state.recovered = None;
-                }
-                Self::cleanup(&inner)
+                Self::install_checkpoint_blocking(&inner, covered, bytes)
             })
             .await
             .map_err(|error| unavailable(format!("checkpoint installer task: {error}")))?
@@ -2021,7 +2239,7 @@ impl MetaLog for LocalLog {
                     .map(|record| record.revision_after())
                     .ok_or_else(|| invalid_log("empty append group"))?;
                 let (frames, tip, bytes) =
-                    encode_batch(inner.identity, expected, records, inner.limits)?;
+                    encode_batch(inner.identity, expected, records, inner.limits.append())?;
                 let rotate = state.end > LOG_HEADER_BYTES
                     && state
                         .end
@@ -2144,9 +2362,14 @@ mod tests {
             Ok(entry)
         });
         assert_eq!(
-            wal_budget_entries(entries, LogLimits::default(), 11, 0, &[retired], |path| {
-                fs::symlink_metadata(path)
-            })
+            wal_budget_entries(
+                entries,
+                LocalLogOptions::default(),
+                11,
+                0,
+                &[retired],
+                |path| { fs::symlink_metadata(path) }
+            )
             .unwrap(),
             75
         );
@@ -2163,7 +2386,7 @@ mod tests {
             });
             let error = wal_budget_entries(
                 entries,
-                LogLimits::default(),
+                LocalLogOptions::default(),
                 0,
                 0,
                 &[budget_retired_segment()],
@@ -2178,7 +2401,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let retired = budget_retired_segment();
         fs::write(dir.path().join(wal_name(retired.base).unwrap()), [1u8; 16]).unwrap();
-        let limits = LogLimits {
+        let limits = LocalLogOptions {
             segments_max: 1,
             ..Default::default()
         };
@@ -2221,18 +2444,18 @@ mod tests {
     #[test]
     fn p3_lock_owner_release_is_not_delayed_by_inherited_descriptor() {
         let dir = tempfile::tempdir().unwrap();
-        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
         // dup retains the same open-file-description lock, as a forked child
         // can do before CLOEXEC closes inherited descriptors. No unsafe fork.
         let inherited = log.inner._lock.try_clone().unwrap();
         let clone = log.clone();
         drop(log);
         assert!(
-            LocalLog::open(dir.path(), LogLimits::default()).is_err(),
+            LocalLog::open(dir.path(), LocalLogOptions::default()).is_err(),
             "another real LocalLog owner is still alive"
         );
         drop(clone);
-        let reopened = LocalLog::open(dir.path(), LogLimits::default());
+        let reopened = LocalLog::open(dir.path(), LocalLogOptions::default());
         assert!(
             reopened.is_ok(),
             "last real owner release must unlock despite a non-authoritative duplicated descriptor"
@@ -2240,30 +2463,30 @@ mod tests {
         let reopened = reopened.unwrap();
         drop(inherited);
         assert!(
-            LocalLog::open(dir.path(), LogLimits::default()).is_err(),
+            LocalLog::open(dir.path(), LocalLogOptions::default()).is_err(),
             "closing a stale duplicate must not unlock the new owner"
         );
         drop(reopened);
-        LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
     }
     #[test]
     fn p3_lock_owner_foreign_drop_does_not_unlock_parent_description() {
         let dir = tempfile::tempdir().unwrap();
-        let mut log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let mut log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
         let parent_description = log.inner._lock.try_clone().unwrap();
         Arc::get_mut(&mut log.inner).unwrap().owner_pid = std::process::id().wrapping_add(1);
         drop(log);
         assert!(
-            LocalLog::open(dir.path(), LogLimits::default()).is_err(),
+            LocalLog::open(dir.path(), LocalLogOptions::default()).is_err(),
             "dropping an inherited handle must not unlock the parent writer"
         );
         drop(parent_description);
-        LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
     }
     #[tokio::test]
     async fn p3_lock_owner_foreign_process_refuses_all_io_before_mutation() {
         let dir = tempfile::tempdir().unwrap();
-        let mut log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let mut log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
         let snapshot = || {
             fs::read_dir(dir.path())
                 .unwrap()
@@ -2368,11 +2591,11 @@ mod tests {
                 write_current(
                     dir.path(),
                     &Current::initial(identity),
-                    CheckpointLimits::default(),
+                    LocalCheckpointLimits::default(),
                 )
                 .unwrap();
             }
-            let log = LocalLog::open(dir.path(), LogLimits::default())
+            let log = LocalLog::open(dir.path(), LocalLogOptions::default())
                 .unwrap_or_else(|e| panic!("initialization phase {phase} must resume: {e}"));
             let found = log.identity();
             if phase >= 2 {
@@ -2386,7 +2609,7 @@ mod tests {
             assert_eq!(log.inner.state.lock().unwrap().tip, LogTip::EMPTY);
             drop(log);
             assert_eq!(
-                LocalLog::open(dir.path(), LogLimits::default())
+                LocalLog::open(dir.path(), LocalLogOptions::default())
                     .unwrap()
                     .identity(),
                 found
@@ -2397,7 +2620,7 @@ mod tests {
     #[tokio::test]
     async fn p3_initialization_marker_never_adopts_committed_or_foreign_data() {
         let dir = tempfile::tempdir().unwrap();
-        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
         let identity = log.identity();
         log.append_and_sync(LogTip::EMPTY, test_records(1))
             .await
@@ -2405,13 +2628,13 @@ mod tests {
         drop(log);
         fs::write(dir.path().join("INITIALIZING"), []).unwrap();
         let original = fs::read(dir.path().join(WAL)).unwrap();
-        assert!(LocalLog::open(dir.path(), LogLimits::default()).is_err());
+        assert!(LocalLog::open(dir.path(), LocalLogOptions::default()).is_err());
         assert_eq!(fs::read(dir.path().join(WAL)).unwrap(), original);
         assert_eq!(read_identity(dir.path()).unwrap(), identity);
         let foreign = tempfile::tempdir().unwrap();
         fs::write(foreign.path().join("INITIALIZING"), []).unwrap();
         fs::write(foreign.path().join("snapshot.json"), b"foreign input").unwrap();
-        assert!(LocalLog::open(foreign.path(), LogLimits::default()).is_err());
+        assert!(LocalLog::open(foreign.path(), LocalLogOptions::default()).is_err());
         assert_eq!(
             fs::read(foreign.path().join("snapshot.json")).unwrap(),
             b"foreign input"
@@ -2421,7 +2644,7 @@ mod tests {
     #[tokio::test]
     async fn p3_orphan_image_cleanup_preserves_foreign_corrupt_and_unknown_files() {
         let dir = tempfile::tempdir().unwrap();
-        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
         let identity = log.identity();
         let bytes =
             super::super::log::StateImage::encode(&super::super::state::State::default(), 65536)
@@ -2459,7 +2682,7 @@ mod tests {
         )
         .unwrap();
         drop(log);
-        let reopened = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let reopened = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
         assert!(!dir.path().join(image_name(own_ref)).exists());
         assert_eq!(
             fs::read(dir.path().join(image_name(foreign_ref))).unwrap(),
@@ -2476,7 +2699,7 @@ mod tests {
     #[tokio::test]
     async fn p3_recovery_missing_current_refuses_acknowledged_wal() {
         let dir = tempfile::tempdir().unwrap();
-        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
         log.append_and_sync(LogTip::EMPTY, test_records(1))
             .await
             .unwrap();
@@ -2484,7 +2707,7 @@ mod tests {
         fs::remove_file(dir.path().join(CURRENT)).unwrap();
         let original = fs::read(dir.path().join(WAL)).unwrap();
         assert!(
-            LocalLog::open(dir.path(), LogLimits::default()).is_err(),
+            LocalLog::open(dir.path(), LocalLogOptions::default()).is_err(),
             "missing CURRENT must not silently choose the initial manifest"
         );
         assert_eq!(fs::read(dir.path().join(WAL)).unwrap(), original);
@@ -2492,7 +2715,7 @@ mod tests {
     #[tokio::test]
     async fn p3_recovery_rolled_current_refuses_unlisted_nonempty_segment() {
         let dir = tempfile::tempdir().unwrap();
-        let limits = LogLimits {
+        let limits = LocalLogOptions {
             record_max_bytes: 1024,
             batch_max_bytes: 4096,
             wal_max_bytes: 128 * 1024,
@@ -2531,9 +2754,9 @@ mod tests {
     #[test]
     fn p3_maintenance_current_temporary_uses_manifest_bound_not_image_bound() {
         let dir = tempfile::tempdir().unwrap();
-        let limits = CheckpointLimits {
+        let limits = LocalCheckpointLimits {
             image_max_bytes: 256,
-            capture_charge_max_bytes: 1024,
+            validation_charge_max_bytes: 1024,
             disk_max_bytes: 256 * 1024,
             files_max: 5,
         };
@@ -2561,7 +2784,7 @@ mod tests {
     #[tokio::test]
     async fn p3_segments_capacity_rejects_before_mutation_and_missing_seal_refuses() {
         let dir = tempfile::tempdir().unwrap();
-        let limits = LogLimits {
+        let limits = LocalLogOptions {
             record_max_bytes: 1024,
             batch_max_bytes: 4096,
             wal_max_bytes: 128 * 1024,
@@ -2617,7 +2840,7 @@ mod tests {
         fs::write(&active, [0; 64]).unwrap();
         let bytes = wal_budget_entries(
             fs::read_dir(dir.path()).unwrap(),
-            LogLimits::default(),
+            LocalLogOptions::default(),
             8,
             0,
             &[budget_retired_segment()],
@@ -2639,7 +2862,7 @@ mod tests {
         fs::write(dir.path().join("wal-00000000000000000001.log"), [0; 32]).unwrap();
         let result = wal_budget_entries(
             fs::read_dir(dir.path()).unwrap(),
-            LogLimits::default(),
+            LocalLogOptions::default(),
             0,
             0,
             &[],
@@ -2656,7 +2879,7 @@ mod tests {
     #[tokio::test]
     async fn p3_segments_rotate_reclaim_and_keep_previous_recovery_suffix() {
         let dir = tempfile::tempdir().unwrap();
-        let limits = LogLimits {
+        let limits = LocalLogOptions {
             record_max_bytes: 1024,
             batch_max_bytes: 4096,
             wal_max_bytes: 128 * 1024,
@@ -2743,7 +2966,7 @@ mod tests {
     #[tokio::test]
     async fn p3_checkpoint_bad_current_image_falls_back_without_losing_suffix() {
         let dir = tempfile::tempdir().unwrap();
-        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
         let identity = log.identity();
         let mut state = super::super::state::State::default();
         let mut records = test_records(3);
@@ -2758,7 +2981,7 @@ mod tests {
         *corrupt.last_mut().unwrap() ^= 1;
         fs::write(&current, &corrupt).unwrap();
         drop(log);
-        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
         let recovered = log.recover().await.unwrap();
         assert_eq!(recovered.tip, tip3);
         assert_eq!(recovered.checkpoint.unwrap().covered, tip1);
@@ -2773,14 +2996,14 @@ mod tests {
         let mut wal = fs::read(dir.path().join(WAL)).unwrap();
         *wal.last_mut().unwrap() ^= 1;
         fs::write(dir.path().join(WAL), &wal).unwrap();
-        assert!(LocalLog::open(dir.path(), LogLimits::default()).is_err());
+        assert!(LocalLog::open(dir.path(), LocalLogOptions::default()).is_err());
         assert_eq!(fs::read(dir.path().join(WAL)).unwrap(), wal);
     }
 
     #[tokio::test]
     async fn p3_checkpoint_identity_and_manifest_corruption_refuse_recovery() {
         let dir = tempfile::tempdir().unwrap();
-        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
         let identity = log.identity();
         let mut state = super::super::state::State::default();
         install_test_image(&log, test_records(1), LogTip::EMPTY, &mut state).await;
@@ -2791,22 +3014,22 @@ mod tests {
         foreign[6] ^= 1;
         fs::write(&image, &foreign).unwrap();
         drop(log);
-        assert!(LocalLog::open(dir.path(), LogLimits::default()).is_err());
+        assert!(LocalLog::open(dir.path(), LocalLogOptions::default()).is_err());
         fs::write(&image, &original).unwrap();
         let current = dir.path().join(CURRENT);
         let mut broken = fs::read(&current).unwrap();
         broken[6] ^= 1;
         fs::write(&current, &broken).unwrap();
-        assert!(LocalLog::open(dir.path(), LogLimits::default()).is_err());
+        assert!(LocalLog::open(dir.path(), LocalLogOptions::default()).is_err());
         assert_eq!(fs::read(current).unwrap(), broken);
     }
 
     #[test]
     fn p3_checkpoint_quarantined_temporary_is_charged_and_symlink_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let limits = CheckpointLimits {
+        let limits = LocalCheckpointLimits {
             image_max_bytes: 256,
-            capture_charge_max_bytes: 1024,
+            validation_charge_max_bytes: 1024,
             disk_max_bytes: 256 * 1024,
             files_max: 5,
         };
@@ -2822,7 +3045,7 @@ mod tests {
     #[tokio::test]
     async fn p3_local_write_failure_latches_until_reopen() {
         let dir = tempfile::tempdir().unwrap();
-        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
         // Real write(2) EBADF, rather than a hook returning an invented error.
         log.inner.state.lock().unwrap().file = File::open(dir.path().join(WAL)).unwrap();
         assert!(
@@ -2839,7 +3062,7 @@ mod tests {
                 .is_err()
         );
         drop(log);
-        let reopened = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let reopened = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
         assert_eq!(reopened.recover().await.unwrap().tip, LogTip::EMPTY);
     }
 
@@ -2848,7 +3071,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let log = LocalLog::open(
             dir.path(),
-            LogLimits {
+            LocalLogOptions {
                 record_max_bytes: 1024,
                 batch_max_bytes: 4096,
                 wal_max_bytes: 8192,
@@ -2880,9 +3103,9 @@ mod tests {
     #[tokio::test]
     async fn p3_local_group_reopens_exact_records_and_stable_identity() {
         let dir = tempfile::tempdir().unwrap();
-        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
         let identity = log.identity();
-        assert!(LocalLog::open(dir.path(), LogLimits::default()).is_err());
+        assert!(LocalLog::open(dir.path(), LocalLogOptions::default()).is_err());
         let original = test_records(2);
         let expected = original
             .iter()
@@ -2891,7 +3114,7 @@ mod tests {
         let tip = log.append_and_sync(LogTip::EMPTY, original).await.unwrap();
         log.health().await.unwrap();
         drop(log);
-        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
         assert_eq!(log.identity(), identity);
         let recovered = log.recover().await.unwrap();
         assert_eq!(recovered.tip, tip);
@@ -2913,7 +3136,7 @@ mod tests {
     #[tokio::test]
     async fn p3_unacknowledged_complete_record_replays_and_incomplete_tail_preserved() {
         let dir = tempfile::tempdir().unwrap();
-        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
         let identity = log.identity();
         drop(log);
         let record = test_records(1).pop().unwrap();
@@ -2926,7 +3149,7 @@ mod tests {
         file.write_all(&[4, 5, 6]).unwrap();
         file.sync_all().unwrap();
         drop(file);
-        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
         assert_eq!(log.recover().await.unwrap().tip, tip);
         assert_eq!(
             fs::metadata(dir.path().join(WAL)).unwrap().len(),
@@ -2945,7 +3168,7 @@ mod tests {
         assert_eq!(fs::read(evidence).unwrap(), [4, 5, 6]);
         drop(log);
         assert_eq!(
-            LocalLog::open(dir.path(), LogLimits::default())
+            LocalLog::open(dir.path(), LocalLogOptions::default())
                 .unwrap()
                 .recover()
                 .await
@@ -2958,7 +3181,7 @@ mod tests {
     #[tokio::test]
     async fn p3_acknowledged_truncation_is_not_discarded() {
         let dir = tempfile::tempdir().unwrap();
-        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
         log.append_and_sync(LogTip::EMPTY, test_records(1))
             .await
             .unwrap();
@@ -2969,14 +3192,14 @@ mod tests {
         file.sync_all().unwrap();
         drop(file);
         let before = fs::read(&path).unwrap();
-        assert!(LocalLog::open(dir.path(), LogLimits::default()).is_err());
+        assert!(LocalLog::open(dir.path(), LocalLogOptions::default()).is_err());
         assert_eq!(fs::read(path).unwrap(), before);
     }
 
     #[tokio::test]
     async fn p3_complete_tail_corruption_is_not_discarded() {
         let dir = tempfile::tempdir().unwrap();
-        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
         log.append_and_sync(LogTip::EMPTY, test_records(1))
             .await
             .unwrap();
@@ -2988,7 +3211,7 @@ mod tests {
         file.sync_all().unwrap();
         drop(file);
         let before = fs::read(&path).unwrap();
-        assert!(LocalLog::open(dir.path(), LogLimits::default()).is_err());
+        assert!(LocalLog::open(dir.path(), LocalLogOptions::default()).is_err());
         assert_eq!(fs::read(path).unwrap(), before);
     }
 
@@ -2996,16 +3219,16 @@ mod tests {
     fn p3_identity_mix_missing_wal_and_legacy_are_rejected() {
         let a = tempfile::tempdir().unwrap();
         let b = tempfile::tempdir().unwrap();
-        drop(LocalLog::open(a.path(), LogLimits::default()).unwrap());
-        drop(LocalLog::open(b.path(), LogLimits::default()).unwrap());
+        drop(LocalLog::open(a.path(), LocalLogOptions::default()).unwrap());
+        drop(LocalLog::open(b.path(), LocalLogOptions::default()).unwrap());
         fs::copy(b.path().join(IDENTITY), a.path().join(IDENTITY)).unwrap();
-        assert!(LocalLog::open(a.path(), LogLimits::default()).is_err());
+        assert!(LocalLog::open(a.path(), LocalLogOptions::default()).is_err());
         fs::rename(b.path().join(WAL), b.path().join("preserved-wal")).unwrap();
-        assert!(LocalLog::open(b.path(), LogLimits::default()).is_err());
+        assert!(LocalLog::open(b.path(), LocalLogOptions::default()).is_err());
         for marker in ["snapshot", "wal"] {
             let old = tempfile::tempdir().unwrap();
             fs::write(old.path().join(marker), b"legacy").unwrap();
-            let error = match LocalLog::open(old.path(), LogLimits::default()) {
+            let error = match LocalLog::open(old.path(), LocalLogOptions::default()) {
                 Err(error) => error,
                 Ok(_) => panic!("old {marker} directory was accepted"),
             };
@@ -3021,7 +3244,7 @@ mod tests {
     #[tokio::test]
     async fn p3_live_health_detects_replaced_file_and_root() {
         let dir = tempfile::tempdir().unwrap();
-        let log = LocalLog::open(dir.path(), LogLimits::default()).unwrap();
+        let log = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
         fs::rename(dir.path().join(WAL), dir.path().join("original-wal")).unwrap();
         fs::copy(dir.path().join("original-wal"), dir.path().join(WAL)).unwrap();
         assert!(log.health().await.is_err());
@@ -3031,7 +3254,7 @@ mod tests {
                 .is_err()
         );
         let other = tempfile::tempdir().unwrap();
-        drop(LocalLog::open(other.path(), LogLimits::default()).unwrap());
+        drop(LocalLog::open(other.path(), LocalLogOptions::default()).unwrap());
         fs::copy(other.path().join(IDENTITY), dir.path().join(IDENTITY)).unwrap();
         assert!(log.health().await.is_err());
     }
@@ -3039,13 +3262,13 @@ mod tests {
     #[test]
     fn p3_damaged_tail_marker_fails_closed() {
         let dir = tempfile::tempdir().unwrap();
-        drop(LocalLog::open(dir.path(), LogLimits::default()).unwrap());
+        drop(LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap());
         let mut file = open_file(&dir.path().join(WAL), false).unwrap();
         file.seek(SeekFrom::Start(STATIC_BYTES as u64)).unwrap();
         file.write_all(&[1]).unwrap();
         file.sync_all().unwrap();
         drop(file);
-        assert!(LocalLog::open(dir.path(), LogLimits::default()).is_err());
+        assert!(LocalLog::open(dir.path(), LocalLogOptions::default()).is_err());
     }
 }
 

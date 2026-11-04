@@ -863,7 +863,7 @@ impl Config {
         if dfs_peer_serve_wait_ms > 50 {
             return Err(invalid("DFS Peer serve wait must be 0..=50 ms"));
         }
-        let log_defaults = crate::meta::store::journal::LogLimits::default();
+        let log_defaults = crate::meta::store::local_log::LocalLogOptions::default();
         let maintenance = crate::meta::store::journal::MaintenancePolicy::default();
         let history = crate::meta::store::HistoryLimits::default();
         let cfg = Self {
@@ -1251,13 +1251,16 @@ impl Config {
         Ok(cfg)
     }
 
-    pub(crate) fn meta_log_limits(&self) -> Result<crate::meta::store::journal::LogLimits> {
+    /// Validated for every backend so a configuration accepted for one
+    /// backend stays valid for the other; the memory log uses the append and
+    /// WAL byte bounds only.
+    pub(crate) fn meta_log_limits(&self) -> Result<crate::meta::store::local_log::LocalLogOptions> {
         if self.meta_wal_segment_bytes > self.meta_wal_max_bytes {
             return Err(invalid(
                 "meta_wal_segment_bytes must not exceed meta_wal_max_bytes",
             ));
         }
-        crate::meta::store::journal::LogLimits {
+        crate::meta::store::local_log::LocalLogOptions {
             record_max_bytes: self.meta_record_max_bytes,
             batch_max_bytes: self.meta_batch_max_bytes,
             wal_max_bytes: self.meta_wal_max_bytes,

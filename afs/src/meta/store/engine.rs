@@ -12,13 +12,34 @@ pub struct Store {
     next_request_id: AtomicU64,
 }
 
+/// Store-side options; the log backend owns none of these.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StoreOptions {
+    pub(crate) history: history::Limits,
+    /// Checkpoint schedule and WAL capacity wait. `None` runs neither; it is
+    /// also treated as `None` when the backend does not support checkpoints.
+    pub(crate) maintenance: Option<journal::MaintenancePolicy>,
+    /// Logical charge a checkpoint capture may hold before encoding; at least
+    /// the backend's `checkpoint_limits().image_max_bytes`.
+    pub(crate) capture_charge_max_bytes: usize,
+}
+impl Default for StoreOptions {
+    fn default() -> Self {
+        Self {
+            history: history::Limits::default(),
+            maintenance: Some(journal::MaintenancePolicy::default()),
+            capture_charge_max_bytes: 2 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
 impl Store {
     #[cfg(test)]
     pub(super) async fn open_log_with_read_limits(
         log: Arc<dyn journal::MetaLog>,
         limits: ReadLimits,
     ) -> Result<Self> {
-        Self::open_log_with_policies(log, history::Limits::default(), limits).await
+        Self::open_log_with_policies(log, StoreOptions::default(), limits).await
     }
     #[cfg(test)]
     pub(super) fn read_budget_stats(&self) -> ReadBudgetStats {
@@ -26,29 +47,48 @@ impl Store {
     }
     /// Replays already-decided records before serving. Does not re-execute
     /// client requests, conditions, clocks, Node IO, or external storage IO.
+    /// Uses the default maintenance policy when the backend supports checkpoints.
     pub async fn open_log(log: Arc<dyn journal::MetaLog>) -> Result<Self> {
-        Self::open_log_with_history(log, history::Limits::default()).await
+        Self::open_log_with_options(log, StoreOptions::default()).await
     }
+    #[cfg(test)]
     pub(crate) async fn open_log_with_history(
         log: Arc<dyn journal::MetaLog>,
         history: history::Limits,
     ) -> Result<Self> {
-        Self::open_log_with_policies(log, history, ReadLimits::default()).await
+        Self::open_log_with_options(
+            log,
+            StoreOptions {
+                history,
+                ..StoreOptions::default()
+            },
+        )
+        .await
+    }
+    pub(crate) async fn open_log_with_options(
+        log: Arc<dyn journal::MetaLog>,
+        options: StoreOptions,
+    ) -> Result<Self> {
+        Self::open_log_with_policies(log, options, ReadLimits::default()).await
     }
     async fn open_log_with_policies(
         log: Arc<dyn journal::MetaLog>,
-        history: history::Limits,
+        options: StoreOptions,
         reads: ReadLimits,
     ) -> Result<Self> {
-        let history = history.validate()?;
+        let history = options.history.validate()?;
         let reads = reads.validate()?;
         log.limits().validate()?;
-        let maintenance = log
-            .maintenance_policy()
+        let maintenance = options
+            .maintenance
             .map(journal::MaintenancePolicy::validate)
-            .transpose()?;
+            .transpose()?
+            .filter(|_| log.supports_checkpoint());
         let recovered = log.recover().await?;
-        log.checkpoint_limits().validate()?;
+        let image_max_bytes = log.checkpoint_limits().validate()?.image_max_bytes;
+        if options.capture_charge_max_bytes < image_max_bytes {
+            return Err(journal::invalid_log("invalid finite checkpoint limits"));
+        }
         let metrics = StoreMetrics::new()
             .map_err(|error| unavailable(format!("Meta metrics initialization: {error}")))?;
         if let Some(image) = &recovered.checkpoint {
@@ -60,7 +100,7 @@ impl Store {
                 if image.covered.sequence > recovered.tip.sequence {
                     return Err(journal::invalid_log("checkpoint exceeds recovered log tip"));
                 }
-                log::StateImage::decode(&image.bytes, log.checkpoint_limits().image_max_bytes)?
+                log::StateImage::decode(&image.bytes, image_max_bytes)?
             }
             None => State::default(),
         };
@@ -109,6 +149,8 @@ impl Store {
             checkpoint_wakeup: Arc::new(Notify::new()),
             checkpoint_finished: Arc::new(Notify::new()),
             poisoned: AtomicBool::new(false),
+            maintenance,
+            capture_charge_max_bytes: options.capture_charge_max_bytes,
         });
         if let Some(policy) = maintenance {
             tokio::spawn(run_checkpoint_loop(
@@ -233,7 +275,8 @@ async fn checkpoint_visible(
     visible: Arc<Visible>,
     log: Arc<dyn journal::MetaLog>,
 ) -> Result<journal::LogTip> {
-    let limits = log.checkpoint_limits().validate()?;
+    let image_max_bytes = log.checkpoint_limits().validate()?.image_max_bytes;
+    let capture_charge_max_bytes = visible.capture_charge_max_bytes;
     if visible
         .checkpoint_active
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -256,10 +299,10 @@ async fn checkpoint_visible(
         let state = visible.committed.load_full();
         let covered = state.log_tip;
         let bytes = tokio::task::spawn_blocking(move || {
-            if log::StateImage::capture_charge(&state)? > limits.capture_charge_max_bytes {
+            if log::StateImage::capture_charge(&state)? > capture_charge_max_bytes {
                 return Err(journal::full("checkpoint capture logical charge exceeded"));
             }
-            log::StateImage::encode(&state, limits.image_max_bytes)
+            log::StateImage::encode(&state, image_max_bytes)
         })
         .await
         .map_err(|error| unavailable(format!("checkpoint encoder task: {error}")))??;
@@ -312,7 +355,7 @@ async fn run_checkpoint_loop(
         if !forced
             && (records == 0
                 || (records < policy.wal_records
-                    && status.pending_bytes_upper_bound < policy.wal_bytes
+                    && status.uncheckpointed_bytes_upper_bound < policy.wal_bytes
                     && last_success.elapsed() < policy.interval))
         {
             continue;
@@ -343,7 +386,7 @@ async fn wait_log_capacity(
     if log.can_append(tip, bytes).await? {
         return Ok(true);
     }
-    let Some(policy) = log.maintenance_policy() else {
+    let Some(policy) = visible.maintenance else {
         return Ok(false);
     };
     let deadline = tokio::time::Instant::now()
@@ -557,6 +600,153 @@ async fn persist_authority_cleanup(
     }
 }
 
+/// Borrowed inputs shared by the commit loop's stages.
+struct CommitContext<'a> {
+    visible: &'a Arc<Visible>,
+    log: &'a Arc<dyn journal::MetaLog>,
+    history: history::Limits,
+    in_flight: &'a Arc<InFlight>,
+    limits: journal::AppendLimits,
+}
+
+/// Resume points of the bounded authority cleanup scans.
+#[derive(Default)]
+struct CleanupCursors {
+    grants: Option<MetaKey>,
+    commands: Option<MetaKey>,
+}
+
+/// One retention tick: grant and command cleanup, then request/event history.
+/// `Err` stops the commit loop (the Store is then poisoned).
+async fn cleanup_tick_step(
+    context: &CommitContext<'_>,
+    mut tip: journal::LogTip,
+    cursors: &mut CleanupCursors,
+) -> Result<journal::LogTip> {
+    let CommitContext {
+        visible,
+        log,
+        history,
+        in_flight,
+        limits,
+    } = *context;
+    tip = persist_authority_cleanup(
+        visible,
+        log,
+        tip,
+        AuthorityCleanup::Grants(&mut cursors.grants),
+        history,
+        in_flight,
+    )
+    .await?;
+    tip = persist_authority_cleanup(
+        visible,
+        log,
+        tip,
+        AuthorityCleanup::Commands(&mut cursors.commands),
+        history,
+        in_flight,
+    )
+    .await?;
+    let current = visible.committed.load_full();
+    let Some((next, delta, _retirement)) =
+        in_flight.prepare_history(&current, now_unix_ms(), history)?
+    else {
+        return Ok(tip);
+    };
+    let record = log::Record::History(delta);
+    let size = match journal::frame_size(tip, &record) {
+        Ok(size) if size <= limits.record_max_bytes => size,
+        _ => return Ok(tip),
+    };
+    let mut records = vec![record];
+    let mut replies = Vec::new();
+    match persist_log_group(visible, log, &next, tip, &mut records, &mut replies, size).await? {
+        LogGroup::Committed(next) => Ok(next),
+        LogGroup::NotAppended => Ok(tip),
+    }
+}
+
+/// A ready request prepared against the staged state of its group.
+struct PreparedItem {
+    next: State,
+    outcome: TxnOutcome,
+    record: Option<log::Record>,
+    size: usize,
+}
+
+/// Decide one ready request against `staged`, attach retention and frame it at
+/// its position in the group. `Err` is that request's reply; retention guards
+/// already taken stay in `retirements` until the group settles.
+fn prepare_ready_item(
+    context: &CommitContext<'_>,
+    staged: &State,
+    operation: Mutation,
+    group: (journal::LogTip, usize),
+    retirements: &mut Vec<InFlightGuard>,
+) -> Result<PreparedItem> {
+    let CommitContext {
+        history,
+        in_flight,
+        limits,
+        ..
+    } = *context;
+    let (tip, grouped) = group;
+    let (mut next, outcome, record) = match operation {
+        Mutation::Transaction(txn) => {
+            staged.prepare_txn_record(txn, now_unix_ms(), limits.record_max_bytes)
+        }
+        Mutation::RegisterNode(request, lease) => {
+            staged.prepare_node_record(request, lease, now_unix_ms(), limits.record_max_bytes)
+        }
+    }?;
+    let record = match record {
+        Some(decision) => {
+            let cleanup = in_flight.prepare_history(&next, now_unix_ms(), history)?;
+            let delta = cleanup.map(|(cleaned, delta, guard)| {
+                retirements.push(guard);
+                next = cleaned;
+                delta
+            });
+            if !next.history_fits(history) {
+                return Err(journal::full(
+                    "protected prepared history exceeds count/byte limits",
+                ));
+            }
+            Some(log::Record::Decision {
+                decision,
+                history: delta,
+            })
+        }
+        None => None,
+    };
+    let size = match &record {
+        Some(record) => {
+            let sequence = tip
+                .sequence
+                .checked_add(grouped as u64)
+                .ok_or_else(|| journal::invalid_log("group sequence exhausted"))?;
+            journal::frame_size(
+                journal::LogTip {
+                    sequence,
+                    record_hash: tip.record_hash,
+                },
+                record,
+            )?
+        }
+        None => 0,
+    };
+    if size > limits.record_max_bytes {
+        return Err(journal::full("record exceeds framed byte limit"));
+    }
+    Ok(PreparedItem {
+        next,
+        outcome,
+        record,
+        size,
+    })
+}
+
 async fn run_log_commit_loop(
     mut receiver: mpsc::Receiver<Pending>,
     visible: Arc<Visible>,
@@ -571,29 +761,21 @@ async fn run_log_commit_loop(
     let period = history.poll();
     let mut cleanup_tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
     cleanup_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut grant_cleanup_cursor = None;
-    let mut command_cleanup_cursor = None;
+    let mut cursors = CleanupCursors::default();
+    let context = CommitContext {
+        visible: &visible,
+        log: &log,
+        history,
+        in_flight: &in_flight,
+        limits,
+    };
     'receive: loop {
         let first = tokio::select! {
             biased;
             _=cleanup_tick.tick()=>{
-                match persist_authority_cleanup(&visible, &log, tip, AuthorityCleanup::Grants(&mut grant_cleanup_cursor), history, &in_flight).await {
-                    Ok(next) => tip = next, Err(_) => break,
-                }
-                match persist_authority_cleanup(&visible, &log, tip, AuthorityCleanup::Commands(&mut command_cleanup_cursor), history, &in_flight).await {
-                    Ok(next) => tip = next, Err(_) => break,
-                }
-                let current=visible.committed.load_full();
-                match in_flight.prepare_history(&current,now_unix_ms(),history) {
-                    Ok(Some((next,delta,_retirement)))=>{
-                        let record=log::Record::History(delta);
-                        let size=match journal::frame_size(tip,&record) {Ok(size) if size<=limits.record_max_bytes=>size,_=>continue};
-                        let mut records=vec![record];let mut replies=Vec::new();
-                        match persist_log_group(&visible,&log,&next,tip,&mut records,&mut replies,size).await {
-                            Ok(LogGroup::Committed(next))=>tip=next,Ok(LogGroup::NotAppended)=>{},Err(_)=>break,
-                        }
-                    },
-                    Ok(None)=>{},Err(_)=>break,
+                match cleanup_tick_step(&context, tip, &mut cursors).await {
+                    Ok(next) => tip = next,
+                    Err(_) => break,
                 }
                 continue;
             },
@@ -602,7 +784,7 @@ async fn run_log_commit_loop(
         // Gather only ready work: no fixed 1ms delay on an otherwise idle Meta.
         let mut batch = VecDeque::from([first]);
         tokio::task::yield_now().await;
-        while batch.len() < 64 {
+        while batch.len() < limits.batch_records_max {
             match receiver.try_recv() {
                 Ok(item) => batch.push_back(item),
                 Err(_) => break,
@@ -618,86 +800,21 @@ async fn run_log_commit_loop(
             // A cancelled caller cannot release queued input capacity or its
             // prepared identity before this writer has settled the group.
             input_holds.push((item.capacity, item.identity));
-            let prepared = match item.operation {
-                Mutation::Transaction(txn) => {
-                    staged.prepare_txn_record(txn, now_unix_ms(), limits.record_max_bytes)
-                }
-                Mutation::RegisterNode(request, lease) => staged.prepare_node_record(
-                    request,
-                    lease,
-                    now_unix_ms(),
-                    limits.record_max_bytes,
-                ),
-            };
-            let (mut next, outcome, record) = match prepared {
+            let prepared = match prepare_ready_item(
+                &context,
+                &staged,
+                item.operation,
+                (tip, records.len()),
+                &mut retirements,
+            ) {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     replies.push((item.reply, Err(error)));
                     continue;
                 }
             };
-            let record = match record {
-                Some(decision) => {
-                    let cleanup = match in_flight.prepare_history(&next, now_unix_ms(), history) {
-                        Ok(cleanup) => cleanup,
-                        Err(error) => {
-                            replies.push((item.reply, Err(error)));
-                            continue;
-                        }
-                    };
-                    let delta = cleanup.map(|(cleaned, delta, guard)| {
-                        retirements.push(guard);
-                        next = cleaned;
-                        delta
-                    });
-                    if !next.history_fits(history) {
-                        replies.push((
-                            item.reply,
-                            Err(journal::full(
-                                "protected prepared history exceeds count/byte limits",
-                            )),
-                        ));
-                        continue;
-                    }
-                    Some(log::Record::Decision {
-                        decision,
-                        history: delta,
-                    })
-                }
-                None => None,
-            };
-            let size = match record
-                .as_ref()
-                .map(|record| {
-                    let sequence = tip
-                        .sequence
-                        .checked_add(records.len() as u64)
-                        .ok_or_else(|| journal::invalid_log("group sequence exhausted"))?;
-                    journal::frame_size(
-                        journal::LogTip {
-                            sequence,
-                            record_hash: tip.record_hash,
-                        },
-                        record,
-                    )
-                })
-                .transpose()
-            {
-                Ok(size) => size.unwrap_or(0),
-                Err(error) => {
-                    replies.push((item.reply, Err(error)));
-                    continue;
-                }
-            };
-            if size > limits.record_max_bytes {
-                replies.push((
-                    item.reply,
-                    Err(journal::full("record exceeds framed byte limit")),
-                ));
-                continue;
-            }
             if bytes
-                .checked_add(size)
+                .checked_add(prepared.size)
                 .is_none_or(|total| total > limits.batch_max_bytes)
             {
                 match persist_log_group(
@@ -729,12 +846,12 @@ async fn run_log_commit_loop(
                     Err(_) => break 'receive,
                 }
             }
-            bytes += size;
-            staged = next;
-            if let Some(record) = record {
+            bytes += prepared.size;
+            staged = prepared.next;
+            if let Some(record) = prepared.record {
                 records.push(record);
             }
-            replies.push((item.reply, Ok(outcome)));
+            replies.push((item.reply, Ok(prepared.outcome)));
         }
         match persist_log_group(
             &visible,

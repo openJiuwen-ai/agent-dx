@@ -5,12 +5,11 @@ use tonic::Code;
 async fn p3_watch_rpc_idle_response_expires_without_delivering_old_commands() {
     use super::super::store::{
         MetaEntity, MetaStore, MetaTxn, OperationResult, RequestOutcome, Store, StoreOperation,
-        TxnCondition, TxnMutation,
-        journal::{LogLimits, MemoryLog},
+        TxnCondition, TxnMutation, journal::MemoryLog,
     };
     use tokio_stream::StreamExt;
     let store = Arc::new(
-        Store::open_log(Arc::new(MemoryLog::new(LogLimits::default()).unwrap()))
+        Store::open_log(Arc::new(MemoryLog::new(Default::default()).unwrap()))
             .await
             .unwrap(),
     );

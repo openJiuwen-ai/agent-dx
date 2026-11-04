@@ -5,7 +5,7 @@
 //! create path independently. Neither path measures FUSE, data I/O, or network RPC.
 
 use afs::meta::store::{
-    journal::{CheckpointLimits, LogLimits, LogStatus, LogTip, MaintenancePolicy, RecoveredLog},
+    journal::{AppendLimits, CheckpointLimits, LogStatus, LogTip, RecoveredLog},
     log::Record,
 };
 use std::{
@@ -236,7 +236,7 @@ impl MetaLog for ObservedBackend {
     fn persistence(&self) -> BackendPersistence {
         self.inner.persistence()
     }
-    fn limits(&self) -> LogLimits {
+    fn limits(&self) -> AppendLimits {
         self.inner.limits()
     }
     fn health(&self) -> MetaFuture<'_, ()> {
@@ -245,8 +245,8 @@ impl MetaLog for ObservedBackend {
     fn recover(&self) -> MetaFuture<'_, RecoveredLog> {
         self.inner.recover()
     }
-    fn maintenance_policy(&self) -> Option<MaintenancePolicy> {
-        self.inner.maintenance_policy()
+    fn supports_checkpoint(&self) -> bool {
+        self.inner.supports_checkpoint()
     }
     fn status(&self) -> MetaFuture<'_, LogStatus> {
         self.inner.status()
