@@ -109,7 +109,8 @@ ln -s "$current/bin/adxctl" "$cli_link"
 if [[ $with_sandboxd == 1 ]]; then
   ln -s "$sbox_target" "$sbox_link"
 fi
-cp -a "$source_dir"/. "$stage"/
+# Apply destination SELinux labels instead of copying labels from extraction.
+cp -aZ "$source_dir"/. "$stage"/
 verify_package "$stage"
 
 backup=
