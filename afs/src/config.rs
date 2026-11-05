@@ -21,14 +21,6 @@ pub enum Role {
     Node,
 }
 
-/// Kernel I/O policy for read-only DFS FUSE opens. Writable opens remain cached.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "lowercase")]
-pub enum DfsFuseReadMode {
-    #[default]
-    Cached,
-    Direct,
-}
 /// Optional immutable DFS read transport. Replication and OwnerFs retain data_mode.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -708,9 +700,6 @@ pub struct Cli {
     /// One native Peer admission wait deadline (0..=50 ms); zero never waits.
     #[arg(long)]
     pub dfs_peer_serve_wait_ms: Option<u64>,
-    /// Read-only DFS FUSE opens: cached (default) or direct. Direct mmap needs kernel support.
-    #[arg(long, value_enum)]
-    pub dfs_fuse_read_mode: Option<DfsFuseReadMode>,
     /// Filesystem-wide immutable DFS replica target count. Applied by Meta at initialization.
     #[arg(long)]
     pub dfs_desired_copies: Option<u16>,
@@ -887,7 +876,6 @@ struct FileConfig {
     dfs_external_backend: Option<DfsExternalBackendConfig>,
     dfs_peer_cache: Option<DfsPeerCacheConfig>,
     dfs_write_buffer_idle_bytes: Option<u64>,
-    dfs_fuse_read_mode: Option<DfsFuseReadMode>,
     dfs_desired_copies: Option<u16>,
     dfs_sync_required_copies: Option<u16>,
     dfs_min_distinct_nodes: Option<u16>,
@@ -1007,7 +995,6 @@ pub struct Config {
     pub dfs_peer_cache: Option<DfsPeerCacheConfig>,
     /// Reusable idle write-body capacity only, not a live-body quota.
     pub dfs_write_buffer_idle_bytes: u64,
-    pub dfs_fuse_read_mode: DfsFuseReadMode,
     pub dfs_desired_copies: u16,
     pub dfs_sync_required_copies: u16,
     pub dfs_min_distinct_nodes: u16,
@@ -1182,7 +1169,7 @@ impl Config {
         let dfs_read_group_max_inflight = cli
             .dfs_read_group_max_inflight
             .or(file.dfs_read_group_max_inflight)
-            .unwrap_or(1);
+            .unwrap_or(2);
         let dfs_read_group_max_descriptors = cli
             .dfs_read_group_max_descriptors
             .or(file.dfs_read_group_max_descriptors)
@@ -1532,10 +1519,6 @@ impl Config {
             dfs_write_buffer_idle_bytes: file
                 .dfs_write_buffer_idle_bytes
                 .unwrap_or(128 * 1024 * 1024),
-            dfs_fuse_read_mode: cli
-                .dfs_fuse_read_mode
-                .or(file.dfs_fuse_read_mode)
-                .unwrap_or_default(),
             dfs_desired_copies,
             dfs_sync_required_copies,
             dfs_min_distinct_nodes,

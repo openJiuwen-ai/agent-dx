@@ -2248,40 +2248,6 @@ fn tls_encryption_defaults_off_without_disabling_identity() {
 }
 
 #[test]
-fn dfs_fuse_read_mode_defaults_to_cached_and_cli_overrides_toml() {
-    let default = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
-    assert_eq!(
-        serde_json::to_value(default).unwrap()["dfs_fuse_read_mode"],
-        "cached"
-    );
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("node.toml");
-    std::fs::write(&path, "dfs_fuse_read_mode='direct'\n").unwrap();
-    let from_file = Config::resolve(
-        Role::Node,
-        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
-    )
-    .unwrap();
-    assert_eq!(
-        serde_json::to_value(from_file).unwrap()["dfs_fuse_read_mode"],
-        "direct"
-    );
-    let override_cli = Cli::try_parse_from([
-        "afs-node",
-        "--config",
-        path.to_str().unwrap(),
-        "--dfs-fuse-read-mode",
-        "cached",
-    ])
-    .unwrap();
-    let overridden = Config::resolve(Role::Node, override_cli).unwrap();
-    assert_eq!(
-        serde_json::to_value(overridden).unwrap()["dfs_fuse_read_mode"],
-        "cached"
-    );
-}
-
-#[test]
 fn tls_encryption_cli_file_precedence_and_identity_are_independent() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("tls.toml");
@@ -2328,17 +2294,19 @@ fn tls_encryption_cli_file_precedence_and_identity_are_independent() {
 }
 
 #[test]
-fn dfs_fuse_read_mode_rejects_unknown_values_at_the_boundary() {
+fn removed_dfs_fuse_read_mode_is_rejected_at_the_boundary() {
+    // DFS read-only opens always use the page cache; the former switch is
+    // not silently accepted from either source.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("node.toml");
-    std::fs::write(&path, "dfs_fuse_read_mode='automatic'\n").unwrap();
+    std::fs::write(&path, "dfs_fuse_read_mode='direct'\n").unwrap();
     let error = Config::resolve(
         Role::Node,
         Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
     )
     .unwrap_err();
-    assert!(error.to_string().contains("unknown variant"), "{error}");
-    assert!(Cli::try_parse_from(["afs-node", "--dfs-fuse-read-mode", "automatic"]).is_err());
+    assert!(error.to_string().contains("unknown field"), "{error}");
+    assert!(Cli::try_parse_from(["afs-node", "--dfs-fuse-read-mode", "direct"]).is_err());
 }
 
 #[test]
@@ -2347,7 +2315,7 @@ fn dfs_read_group_defaults_and_rejects_invalid_budgets() {
     let printed = serde_json::to_value(&cfg).unwrap();
     assert_eq!(printed["dfs_read_group_mode"], "off");
     assert_eq!(printed["dfs_read_group_bytes"], 8388608);
-    assert_eq!(printed["dfs_read_group_max_inflight"], 1);
+    assert_eq!(printed["dfs_read_group_max_inflight"], 2);
     assert_eq!(printed["dfs_read_group_max_descriptors"], 128);
     assert_eq!(printed["dfs_read_group_host_budget_bytes"], 1073741824);
     for args in [

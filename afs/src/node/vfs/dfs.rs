@@ -266,6 +266,10 @@ pub struct DistributedFs {
     #[cfg(test)]
     native_read_before_refresh: Mutex<Option<Arc<std::sync::Barrier>>>,
     #[cfg(test)]
+    group_fill_before_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    group_fills: AtomicUsize,
+    #[cfg(test)]
     native_read_after_committed: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     backend_inode_after_missing: Mutex<Option<Arc<std::sync::Barrier>>>,
@@ -292,7 +296,7 @@ pub struct DistributedFs {
     readonly_version_gates: Arc<crate::node::read_pipeline::ReadKeyGates>,
     readonly_empty_version: Arc<ReadOnlyVersion>,
     read_group: Option<ReadGroupPolicy>,
-    prefetch: Mutex<HashMap<u64, PrefetchWindow>>,
+    prefetch: Mutex<HashMap<u64, PrefetchSlot>>,
     prefetch_bytes: Arc<AtomicUsize>,
     /// One-group read-ahead shared with its background fill thread. The fill
     /// runs off the FUSE thread so the next group's prepare/transfer/validate
@@ -751,7 +755,7 @@ impl Drop for PrefetchReservation {
     }
 }
 
-/// One sequential read-ahead group owned by a single direct read handle.
+/// One sequential read-ahead group owned by a single read handle.
 struct PrefetchWindow {
     inode_id: InodeId,
     version_id: Option<FileVersionId>,
@@ -759,6 +763,134 @@ struct PrefetchWindow {
     start: u64,
     data: Vec<u8>,
     reservation: PrefetchReservation,
+}
+
+/// Group state of one read handle: the window at the cursor, the window
+/// before it, and at most one synchronous fill in flight.
+#[derive(Default)]
+struct PrefetchSlot {
+    window: Option<PrefetchWindow>,
+    previous: Option<PrefetchWindow>,
+    fill: Option<Arc<PrefetchFill>>,
+}
+
+/// Where the next synchronous group fill of a handle starts.
+struct GroupFillPlan {
+    start: u64,
+    /// Offset of the unread position inside the filled group.
+    skip: usize,
+    /// The fill continues the current window, so its preloaded group applies.
+    contiguous: bool,
+    /// The current window stays resident while the next one fills.
+    keep_current: bool,
+}
+
+impl PrefetchSlot {
+    /// Copies the bytes at `offset` that resident windows hold contiguously,
+    /// so a request may span the previous and the current window.
+    fn copy_resident(
+        &self,
+        identity: &PrefetchIdentity,
+        offset: u64,
+        out: &mut [u8],
+    ) -> Result<usize> {
+        let mut copied = 0;
+        while copied < out.len() {
+            let position = offset.saturating_add(copied as u64);
+            let window = [self.window.as_ref(), self.previous.as_ref()]
+                .into_iter()
+                .flatten()
+                .find(|window| {
+                    identity.matches(window)
+                        && position >= window.start
+                        && position - window.start < window.data.len() as u64
+                });
+            let Some(window) = window else {
+                break;
+            };
+            let relative = usize::try_from(position - window.start)
+                .map_err(|_| invalid("read prefetch offset is too large"))?;
+            let count = (window.data.len() - relative).min(out.len() - copied);
+            out[copied..copied + count].copy_from_slice(&window.data[relative..relative + count]);
+            copied += count;
+        }
+        Ok(copied)
+    }
+
+    fn plan_fill(
+        &self,
+        identity: &PrefetchIdentity,
+        offset: u64,
+        group: ReadGroupPolicy,
+    ) -> Result<GroupFillPlan> {
+        // Kernel readahead can hand a request just past a group boundary to
+        // the backend before one just below it. Requests of one readahead span
+        // therefore snap to the group grid and share one fill instead of each
+        // starting a group at its own offset.
+        let start = offset - offset % (group.bytes as u64).max(1);
+        let skip = usize::try_from(offset - start)
+            .map_err(|_| invalid("read prefetch offset is too large"))?;
+        let contiguous = self
+            .window
+            .as_ref()
+            .filter(|window| identity.matches(window))
+            .is_some_and(|window| window.start.saturating_add(window.data.len() as u64) == start);
+        Ok(GroupFillPlan {
+            start,
+            skip,
+            contiguous,
+            keep_current: contiguous,
+        })
+    }
+}
+
+/// Completion of one handle's synchronous group fill.
+#[derive(Default)]
+struct PrefetchFill {
+    done: Mutex<bool>,
+    ready: Condvar,
+}
+
+impl PrefetchFill {
+    fn wait(&self) -> Result<()> {
+        let mut done = self
+            .done
+            .lock()
+            .map_err(|_| unavailable("DFS prefetch fill is poisoned"))?;
+        while !*done {
+            done = self
+                .ready
+                .wait(done)
+                .map_err(|_| unavailable("DFS prefetch fill is poisoned"))?;
+        }
+        Ok(())
+    }
+}
+
+/// Clears a handle's fill marker and wakes its waiters on every exit path,
+/// after the filled window (if any) is installed.
+struct PrefetchFillGuard<'a> {
+    prefetch: &'a Mutex<HashMap<u64, PrefetchSlot>>,
+    handle: u64,
+    fill: Arc<PrefetchFill>,
+}
+
+impl Drop for PrefetchFillGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut cache) = self.prefetch.lock()
+            && let Some(slot) = cache.get_mut(&self.handle)
+            && slot
+                .fill
+                .as_ref()
+                .is_some_and(|fill| Arc::ptr_eq(fill, &self.fill))
+        {
+            slot.fill = None;
+        }
+        if let Ok(mut done) = self.fill.done.lock() {
+            *done = true;
+        }
+        self.fill.ready.notify_all();
+    }
 }
 
 /// File identity a read-ahead group must still match when it is promoted.
@@ -2917,6 +3049,10 @@ impl DistributedFs {
             #[cfg(test)]
             native_read_before_refresh: Mutex::new(None),
             #[cfg(test)]
+            group_fill_before_read: Mutex::new(None),
+            #[cfg(test)]
+            group_fills: AtomicUsize::new(0),
+            #[cfg(test)]
             native_read_after_committed: Mutex::new(None),
             #[cfg(test)]
             backend_inode_after_missing: Mutex::new(None),
@@ -4576,7 +4712,7 @@ impl DistributedFs {
         self
     }
 
-    /// Enables bounded sequential read-ahead for read-only direct handles.
+    /// Enables bounded sequential read-ahead for read-only native handles.
     pub fn with_read_group(mut self, group: Option<ReadGroupPolicy>) -> Self {
         self.read_group = group;
         self
@@ -5462,113 +5598,148 @@ impl DistributedFs {
         }
         let count = usize::try_from((length - offset).min(out.len() as u64))
             .map_err(|_| invalid("read length is too large"))?;
-        let mut cache = self
-            .prefetch
-            .lock()
-            .map_err(|_| unavailable("DFS prefetch table is poisoned"))?;
-        // The window is an immutable snapshot of its byte range for this
-        // version, so any request inside the range is served without a new
-        // group. Requiring the exact cursor position would rebuild the whole
-        // group whenever the kernel interleaves a small synchronous fault
-        // with its larger readahead request at the same offset.
-        if let Some(window) = cache.get_mut(&handle.0)
-            && window.inode_id == *inode_id
-            && window.version_id == version_id
-            && window.layout_root_id == layout.id
-            && offset >= window.start
-            && offset - window.start + count as u64 <= window.data.len() as u64
-        {
-            let relative = usize::try_from(offset - window.start)
-                .map_err(|_| invalid("read prefetch offset is too large"))?;
-            out[..count].copy_from_slice(&window.data[relative..relative + count]);
-            return Ok(count);
-        }
-        // A retired window keeps its allocation for the next fill: every fill
-        // rewrites the buffer, so a fresh zero-filled group would only add
-        // allocator churn and page faults to the hot path.
-        let mut previous = cache.remove(&handle.0);
-        drop(cache);
-
         let identity = PrefetchIdentity::of(inode_id, version_id.clone(), layout);
-        // Only a contiguous cursor can consume a preloaded group; a seek, a
-        // reopened version or a changed layout invalidates the fill in flight.
-        let contiguous = previous.as_ref().is_some_and(|window| {
-            identity.matches(window)
-                && window.start.saturating_add(window.data.len() as u64) == offset
-        });
-        let ahead = if contiguous {
-            self.take_ahead(handle.0, &identity, offset)
-        } else {
-            self.bump_prefetch_generation(handle.0);
-            self.drop_ahead(handle.0);
-            None
-        };
-        let ahead = ahead.filter(|entry| entry.generation == self.prefetch_generation(handle.0));
-
-        // A preloaded group is usable only when the background fill finished
-        // with the expected length; otherwise fall back to the synchronous fill.
-        let ahead_filled = ahead.and_then(|entry| {
-            let entry_length = entry.length;
-            match Self::wait_ahead(&entry) {
-                Some((filled, reservation)) if filled.len() == entry_length => {
-                    Some((filled, reservation))
-                }
-                _ => None,
-            }
-        });
-        let (data, reservation) = match ahead_filled {
-            Some(filled) => {
-                drop(previous.take());
-                filled
-            }
-            None => match self.fill_group_window(
-                &mut previous,
-                version_id.clone(),
-                layout,
-                offset,
-                length,
-                group,
-            )? {
-                Some(filled) => filled,
-                // The budget refused a group: read just this request from the
-                // same version and layout the group would have served, so the
-                // fallback never mixes in a head committed since the view.
-                None => {
-                    out[..count].fill(0);
-                    self.read_layout_range(version_id.as_ref(), layout, offset, &mut out[..count])?;
+        // A short reply is an end-of-file signal to the kernel, so every byte
+        // before the real end is delivered, across as many groups as needed.
+        let mut copied = 0;
+        loop {
+            // At most one synchronous fill runs per handle. Concurrent READs
+            // of a cached FUSE handle hit a resident window or wait for the
+            // fill in flight instead of fetching the same group again. A
+            // window is an immutable snapshot of its byte range for this
+            // version, so any request inside the range is served from memory.
+            let (fill, plan) = loop {
+                let mut cache = self
+                    .prefetch
+                    .lock()
+                    .map_err(|_| unavailable("DFS prefetch table is poisoned"))?;
+                let slot = cache.entry(handle.0).or_default();
+                copied += slot.copy_resident(
+                    &identity,
+                    offset.saturating_add(copied as u64),
+                    &mut out[copied..count],
+                )?;
+                if copied == count {
                     return Ok(count);
                 }
-            },
-        };
-        let window_end = offset.saturating_add(data.len() as u64);
-        let count = count.min(data.len());
-        out[..count].copy_from_slice(&data[..count]);
-        let window = PrefetchWindow {
-            inode_id: inode_id.clone(),
-            version_id: version_id.clone(),
-            layout_root_id: layout.id.clone(),
-            start: offset,
-            data,
-            reservation,
-        };
-        let mut cache = self
-            .prefetch
-            .lock()
-            .map_err(|_| unavailable("DFS prefetch table is poisoned"))?;
-        drop(cache.insert(handle.0, window));
-        drop(cache);
-        self.spawn_ahead(
-            handle.0, inode_id, version_id, layout, window_end, length, group,
-        );
-        Ok(count)
+                if let Some(fill) = slot.fill.clone() {
+                    drop(cache);
+                    fill.wait()?;
+                    continue;
+                }
+                let plan =
+                    slot.plan_fill(&identity, offset.saturating_add(copied as u64), group)?;
+                let fill = Arc::new(PrefetchFill::default());
+                slot.fill = Some(fill.clone());
+                break (fill, plan);
+            };
+            let _filling = PrefetchFillGuard {
+                prefetch: &self.prefetch,
+                handle: handle.0,
+                fill,
+            };
+
+            // Only a contiguous cursor can consume a preloaded group; a seek, a
+            // reopened version or a changed layout invalidates the fill in flight.
+            let ahead = if plan.contiguous {
+                self.take_ahead(handle.0, &identity, plan.start)
+            } else {
+                self.bump_prefetch_generation(handle.0);
+                self.drop_ahead(handle.0);
+                None
+            };
+            let ahead =
+                ahead.filter(|entry| entry.generation == self.prefetch_generation(handle.0));
+
+            // A preloaded group is usable only when the background fill finished
+            // with the expected length; otherwise fall back to the synchronous fill.
+            let ahead_filled = ahead.and_then(|entry| {
+                let entry_length = entry.length;
+                match Self::wait_ahead(&entry) {
+                    Some((filled, reservation)) if filled.len() == entry_length => {
+                        Some((filled, reservation))
+                    }
+                    _ => None,
+                }
+            });
+            let (data, reservation) = match ahead_filled {
+                Some(filled) => filled,
+                None => match self.fill_group_window(
+                    handle.0,
+                    plan.keep_current,
+                    version_id.clone(),
+                    layout,
+                    plan.start,
+                    length,
+                    group,
+                )? {
+                    Some(filled) => filled,
+                    // The budget refused a group: read the rest of this request
+                    // from the same version and layout the group would have
+                    // served, so the fallback never mixes in a head committed
+                    // since the view.
+                    None => {
+                        let rest = &mut out[copied..count];
+                        rest.fill(0);
+                        self.read_layout_range(
+                            version_id.as_ref(),
+                            layout,
+                            offset.saturating_add(copied as u64),
+                            rest,
+                        )?;
+                        return Ok(count);
+                    }
+                },
+            };
+            let available = data.len().saturating_sub(plan.skip);
+            let filled = (count - copied).min(available);
+            if filled == 0 {
+                return Err(invalid("read group does not cover the requested offset"));
+            }
+            out[copied..copied + filled].copy_from_slice(&data[plan.skip..plan.skip + filled]);
+            copied += filled;
+            let window_end = plan.start.saturating_add(data.len() as u64);
+            let window = PrefetchWindow {
+                inode_id: inode_id.clone(),
+                version_id: version_id.clone(),
+                layout_root_id: layout.id.clone(),
+                start: plan.start,
+                data,
+                reservation,
+            };
+            let retired = {
+                let mut cache = self
+                    .prefetch
+                    .lock()
+                    .map_err(|_| unavailable("DFS prefetch table is poisoned"))?;
+                let slot = cache.entry(handle.0).or_default();
+                let current = slot.window.replace(window);
+                std::mem::replace(&mut slot.previous, current)
+            };
+            drop(retired);
+            self.spawn_ahead(
+                handle.0,
+                inode_id,
+                version_id.clone(),
+                layout,
+                window_end,
+                length,
+                group,
+            );
+            if copied == count {
+                return Ok(count);
+            }
+        }
     }
 
     /// Reserves the group budget and fills a fresh (or recycled) window.
     /// Returns `None` when the host budget refuses the group so the caller can
     /// fall back to the non-grouped path.
+    #[allow(clippy::too_many_arguments)]
     fn fill_group_window(
         &self,
-        previous: &mut Option<PrefetchWindow>,
+        handle: u64,
+        keep_current: bool,
         version_id: Option<FileVersionId>,
         layout: &LayoutRoot,
         offset: u64,
@@ -5578,33 +5749,51 @@ impl DistributedFs {
         let grouped_end = offset.saturating_add(group.bytes as u64).min(file_length);
         let grouped_length = usize::try_from(grouped_end - offset)
             .map_err(|_| invalid("read group length is too large"))?;
-        let (mut data, reservation) = match previous.take() {
-            Some(window) => {
-                let PrefetchWindow {
-                    data, reservation, ..
-                } = window;
-                (data, Some(reservation))
-            }
-            None => (Vec::new(), None),
+        // A retired window keeps its allocation for the next fill: every fill
+        // rewrites the buffer, so a fresh zero-filled group would only add
+        // allocator churn and page faults to the hot path. A contiguous fill
+        // keeps the current window resident and recycles the one before it.
+        let take_windows = |current: bool| {
+            let mut cache = self
+                .prefetch
+                .lock()
+                .map_err(|_| unavailable("DFS prefetch table is poisoned"))?;
+            let slot = cache.entry(handle).or_default();
+            Ok::<_, Error>(if current {
+                (slot.window.take(), slot.previous.take())
+            } else {
+                (slot.previous.take(), None)
+            })
         };
-        let reservation = match reservation {
-            Some(mut reservation) => {
-                if !reservation.resize(grouped_length, group.host_budget_bytes) {
-                    drop(data);
-                    return Ok(None);
-                }
-                reservation
-            }
-            None => {
-                let Some(reservation) =
-                    self.reserve_prefetch_bytes(grouped_length, group.host_budget_bytes)
-                else {
-                    return Ok(None);
-                };
-                reservation
-            }
+        let (recycled, retired) = take_windows(!keep_current)?;
+        drop(retired);
+        let buffer = match recycled {
+            Some(window) => Some((window.data, window.reservation)),
+            None => match self.reserve_prefetch_bytes(grouped_length, group.host_budget_bytes) {
+                Some(reservation) => Some((Vec::new(), reservation)),
+                // Under budget pressure residency gives way to the group.
+                None if keep_current => take_windows(true)?
+                    .0
+                    .map(|window| (window.data, window.reservation)),
+                None => None,
+            },
         };
+        let Some((mut data, mut reservation)) = buffer else {
+            return Ok(None);
+        };
+        if !reservation.resize(grouped_length, group.host_budget_bytes) {
+            drop(data);
+            return Ok(None);
+        }
         data.resize(grouped_length, 0);
+        #[cfg(test)]
+        {
+            self.group_fills.fetch_add(1, Ordering::SeqCst);
+            let hook = self.group_fill_before_read.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         if let Err(error) = self.read_layout_range_with(
             version_id.as_ref(),
             layout,
@@ -29300,14 +29489,29 @@ mod tests {
         group_bytes: usize,
         max_inflight: usize,
     ) -> (tempfile::TempDir, Arc<RecordingMeta>, DistributedFs) {
+        grouped_fs_with_policy(group_bytes, max_inflight, 1024 * 1024)
+    }
+
+    fn grouped_fs_with_policy(
+        group_bytes: usize,
+        max_inflight: usize,
+        host_budget_bytes: usize,
+    ) -> (tempfile::TempDir, Arc<RecordingMeta>, DistributedFs) {
         let (temp, meta, fs) = test_fs();
         let fs = fs.with_read_group(Some(ReadGroupPolicy {
             bytes: group_bytes,
             max_inflight,
             max_descriptors: 8,
-            host_budget_bytes: 1024 * 1024,
+            host_budget_bytes,
         }));
         (temp, meta, fs)
+    }
+
+    fn group_read_at(fs: &DistributedFs, reader: FileHandle, offset: u64, size: usize) -> Vec<u8> {
+        let mut out = vec![0; size];
+        let read = fs.read(&context(), reader, offset, &mut out).unwrap();
+        out.truncate(read);
+        out
     }
 
     fn wait_for_prefetch_bytes(fs: &DistributedFs, expected: usize) {
@@ -29487,8 +29691,9 @@ mod tests {
         assert_eq!(&third, b"ef");
         assert_eq!(
             fs.prefetch_bytes.load(Ordering::SeqCst),
-            4,
-            "promotion trades the preloaded reservation for the live window"
+            8,
+            "promotion trades the preloaded reservation for the live window \
+             and keeps the window before it"
         );
 
         fs.release(&context(), reader).unwrap();
@@ -29553,7 +29758,7 @@ mod tests {
     fn sequential_group_read_drops_the_preloaded_group_on_seek() {
         let (_temp, meta, fs) = grouped_fs_with_inflight(4, 2);
         let inode_id = meta.inode.lock().unwrap().inode_id.clone();
-        publish_external_version_with_bytes(&meta, &fs, "group-ahead-seek", b"abcdefgh");
+        publish_external_version_with_bytes(&meta, &fs, "group-ahead-seek", b"abcdefghijkl");
         let inode = fs.backend_inode(&inode_id).unwrap();
         let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
 
@@ -29562,10 +29767,12 @@ mod tests {
         assert_eq!(&head, b"ab");
         assert_eq!(fs.prefetch_bytes.load(Ordering::SeqCst), 8);
 
+        // A seek past the preloaded group drops it; the new group recycles the
+        // window it replaces, so only that group stays reserved.
         let mut tail = [0; 2];
-        assert_eq!(fs.read(&context(), reader, 6, &mut tail).unwrap(), 2);
-        assert_eq!(&tail, b"gh");
-        wait_for_prefetch_bytes(&fs, 2);
+        assert_eq!(fs.read(&context(), reader, 10, &mut tail).unwrap(), 2);
+        assert_eq!(&tail, b"kl");
+        wait_for_prefetch_bytes(&fs, 4);
 
         fs.release(&context(), reader).unwrap();
         assert_eq!(fs.prefetch_bytes.load(Ordering::SeqCst), 0);
@@ -29592,9 +29799,228 @@ mod tests {
         // One fill at offset zero must serve every request; a window rebuilt
         // per request would start at the last offset instead.
         let cache = fs.prefetch.lock().unwrap();
-        let window = cache.get(&reader.0).expect("group window stays cached");
+        let window = cache
+            .get(&reader.0)
+            .and_then(|slot| slot.window.as_ref())
+            .expect("group window stays cached");
         assert_eq!(window.start, 0);
         assert_eq!(window.data.len(), 8);
+    }
+
+    /// Holds the next synchronous group fill until the returned sender fires.
+    fn pause_next_group_fill(
+        fs: &DistributedFs,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        *fs.group_fill_before_read.lock().unwrap() = Some(Box::new(move || {
+            started_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        }));
+        (started_rx, release_tx)
+    }
+
+    fn spawn_group_read(
+        fs: &Arc<DistributedFs>,
+        reader: FileHandle,
+        offset: u64,
+        size: usize,
+    ) -> std::sync::mpsc::Receiver<Vec<u8>> {
+        let fs = fs.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut out = vec![0; size];
+            let read = fs.read(&context(), reader, offset, &mut out).unwrap();
+            out.truncate(read);
+            let _ = done_tx.send(out);
+        });
+        done_rx
+    }
+
+    fn group_read_result(done: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+        done.recv_timeout(Duration::from_secs(5))
+            .expect("group read did not complete")
+    }
+
+    #[test]
+    fn concurrent_readahead_shares_one_group_fill_per_window() {
+        // Cached FUSE handles receive kernel readahead as concurrent READs
+        // that may run out of order. Each window is filled once: a request
+        // beyond the current window waits for the fill in flight, and a late
+        // request for an already-filled window is served from memory.
+        let (_temp, meta, fs) = grouped_fs(4);
+        let fs = Arc::new(fs);
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "group-concurrent", b"abcdefgh");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+
+        let (started, release) = pause_next_group_fill(&fs);
+        let first = spawn_group_read(&fs, reader, 0, 2);
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let waiting = spawn_group_read(&fs, reader, 2, 2);
+        std::thread::sleep(Duration::from_millis(100));
+        release.send(()).unwrap();
+        assert_eq!(group_read_result(&first), b"ab");
+        assert_eq!(group_read_result(&waiting), b"cd");
+        assert_eq!(fs.group_fills.load(Ordering::SeqCst), 1);
+
+        let (started, release) = pause_next_group_fill(&fs);
+        let next = spawn_group_read(&fs, reader, 4, 2);
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let late = spawn_group_read(&fs, reader, 2, 2);
+        assert_eq!(
+            group_read_result(&late),
+            b"cd",
+            "the current window keeps serving while the next one fills"
+        );
+        let ahead = spawn_group_read(&fs, reader, 6, 2);
+        std::thread::sleep(Duration::from_millis(100));
+        release.send(()).unwrap();
+        assert_eq!(group_read_result(&next), b"ef");
+        assert_eq!(group_read_result(&ahead), b"gh");
+
+        let mut previous = [0; 2];
+        assert_eq!(fs.read(&context(), reader, 1, &mut previous).unwrap(), 2);
+        assert_eq!(&previous, b"bc");
+        assert_eq!(
+            fs.group_fills.load(Ordering::SeqCst),
+            2,
+            "concurrent and late requests must not fill a window again"
+        );
+        assert_eq!(
+            fs.prefetch_bytes.load(Ordering::SeqCst),
+            8,
+            "a handle keeps the previous window resident"
+        );
+        fs.release(&context(), reader).unwrap();
+        assert_eq!(fs.prefetch_bytes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn group_read_straddling_the_window_end_continues_at_the_group_boundary() {
+        let (_temp, meta, fs) = grouped_fs(4);
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "group-straddle", b"abcdefghijkl");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+
+        let mut head = [0; 2];
+        assert_eq!(fs.read(&context(), reader, 0, &mut head).unwrap(), 2);
+        assert_eq!(&head, b"ab");
+        // Kernel readahead requests need not end on a group boundary.
+        let mut straddle = [0; 4];
+        assert_eq!(fs.read(&context(), reader, 2, &mut straddle).unwrap(), 4);
+        assert_eq!(&straddle, b"cdef");
+        let mut rest = [0; 2];
+        assert_eq!(fs.read(&context(), reader, 6, &mut rest).unwrap(), 2);
+        assert_eq!(&rest, b"gh");
+        assert_eq!(
+            fs.group_fills.load(Ordering::SeqCst),
+            2,
+            "a straddling request fills the next group from the window end"
+        );
+        let mut tail = [0; 2];
+        assert_eq!(fs.read(&context(), reader, 8, &mut tail).unwrap(), 2);
+        assert_eq!(&tail, b"ij");
+        assert_eq!(fs.group_fills.load(Ordering::SeqCst), 3);
+        fs.release(&context(), reader).unwrap();
+        assert_eq!(fs.prefetch_bytes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn reordered_reads_around_group_boundaries_fill_each_group_once() {
+        // FUSE worker threads can hand a request just past a group boundary to
+        // the backend before a request just below it, with no concurrency.
+        let (_temp, meta, fs) = grouped_fs(4);
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "group-reorder", b"abcdefghijklmnop");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+
+        for offset in [1, 0, 4, 3, 5, 8, 7, 9, 12, 11, 13] {
+            assert_eq!(
+                group_read_at(&fs, reader, offset, 1),
+                [b'a' + offset as u8],
+                "offset {offset}"
+            );
+        }
+        assert_eq!(
+            fs.group_fills.load(Ordering::SeqCst),
+            4,
+            "each group is transferred exactly once"
+        );
+        fs.release(&context(), reader).unwrap();
+        assert_eq!(fs.prefetch_bytes.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn late_request_across_two_windows_is_served_from_memory() {
+        let (_temp, meta, fs) = grouped_fs(4);
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "group-late", b"abcdefghijkl");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+
+        assert_eq!(group_read_at(&fs, reader, 0, 1), b"a");
+        assert_eq!(group_read_at(&fs, reader, 4, 1), b"e");
+        assert_eq!(group_read_at(&fs, reader, 3, 2), b"de");
+        assert_eq!(group_read_at(&fs, reader, 5, 1), b"f");
+        assert_eq!(
+            fs.group_fills.load(Ordering::SeqCst),
+            2,
+            "a request spanning both resident windows must not fill again"
+        );
+        fs.release(&context(), reader).unwrap();
+    }
+
+    #[test]
+    fn group_read_crossing_a_group_end_after_a_seek_returns_every_byte() {
+        // A short FUSE read is an end-of-file signal: the kernel shrinks the
+        // cached i_size to it, so only a real EOF may return fewer bytes.
+        {
+            let (_temp, meta, fs) = grouped_fs(4);
+            let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+            publish_external_version_with_bytes(&meta, &fs, "group-seek", b"abcdefghijklmnop");
+            let inode = fs.backend_inode(&inode_id).unwrap();
+            let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+
+            assert_eq!(group_read_at(&fs, reader, 3, 2), b"de");
+            assert_eq!(
+                group_read_at(&fs, reader, 14, 8),
+                b"op",
+                "a real EOF stays short"
+            );
+            fs.release(&context(), reader).unwrap();
+        }
+    }
+
+    #[test]
+    fn group_read_larger_than_a_group_returns_every_byte() {
+        {
+            let (_temp, meta, fs) = grouped_fs(4);
+            let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+            publish_external_version_with_bytes(&meta, &fs, "group-large", b"abcdefghijklmnop");
+            let inode = fs.backend_inode(&inode_id).unwrap();
+            let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+
+            assert_eq!(group_read_at(&fs, reader, 1, 10), b"bcdefghijk");
+            fs.release(&context(), reader).unwrap();
+        }
+    }
+
+    #[test]
+    fn budget_pressure_gives_up_the_previous_window_not_the_read() {
+        let (_temp, meta, fs) = grouped_fs_with_policy(4, 1, 4);
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "group-budget", b"abcdefgh");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+
+        assert_eq!(group_read_at(&fs, reader, 0, 1), b"a");
+        assert_eq!(group_read_at(&fs, reader, 3, 2), b"de");
+        assert_eq!(fs.prefetch_bytes.load(Ordering::SeqCst), 4);
+        fs.release(&context(), reader).unwrap();
     }
 
     #[test]
@@ -29641,7 +30067,11 @@ mod tests {
         let mut tail = [0; 2];
         assert_eq!(fs.read(&context(), reader, 4, &mut tail).unwrap(), 2);
         assert_eq!(&tail, b"ef");
-        assert_eq!(fs.prefetch_bytes.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            fs.prefetch_bytes.load(Ordering::SeqCst),
+            8,
+            "the window before the cursor stays resident"
+        );
 
         let mut middle = [0; 2];
         assert_eq!(fs.read(&context(), reader, 2, &mut middle).unwrap(), 2);
@@ -29695,31 +30125,12 @@ mod tests {
         assert_eq!(meta.file_version_load_count(), 2);
         assert_eq!(
             fs.prefetch_bytes.load(Ordering::SeqCst),
-            6,
+            8,
             "the stale window must be released before the new version is grouped"
         );
 
         fs.release(&context(), reader).unwrap();
         assert_eq!(fs.prefetch_bytes.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
-    fn group_read_shortens_request_to_available_group_window() {
-        let (_temp, meta, fs) = grouped_fs(4);
-        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
-        publish_external_version_with_bytes(&meta, &fs, "group-short-read", b"abcdefgh");
-        let inode = fs.backend_inode(&inode_id).unwrap();
-        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
-
-        let mut first = [0xa5; 8];
-        assert_eq!(fs.read(&context(), reader, 0, &mut first).unwrap(), 4);
-        assert_eq!(&first[..4], b"abcd");
-        assert_eq!(&first[4..], &[0xa5; 4]);
-        let mut second = [0xa5; 8];
-        assert_eq!(fs.read(&context(), reader, 4, &mut second).unwrap(), 4);
-        assert_eq!(&second[..4], b"efgh");
-        assert_eq!(&second[4..], &[0xa5; 4]);
-        fs.release(&context(), reader).unwrap();
     }
 
     #[test]
