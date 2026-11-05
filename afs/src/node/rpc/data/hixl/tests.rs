@@ -1430,18 +1430,6 @@ async fn capacity_close_ttl_and_release_idempotence_keep_unknown_exports_pinned(
 }
 
 #[tokio::test]
-async fn failed_native_outcome_does_not_release_a_source_window() {
-    let fixture = Fixture::new();
-    let window = fixture.admitted().await;
-    let mut release = release_request(&window);
-    release.windows[0].outcome = DfsHixlReleaseOutcome::Failed as i32;
-    release.windows[0].content_validated = false;
-    let reply = fixture.release(release).await.unwrap();
-    assert!(!reply.windows[0].consumed);
-    assert_eq!((fixture.releases(), fixture.quarantines()), (0, 1));
-}
-
-#[tokio::test]
 async fn failed_expiry_quarantine_keeps_admission_frozen_until_a_retry_succeeds() {
     let (fixture, metrics) = Fixture::with_metrics();
     fixture.admitted().await;

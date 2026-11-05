@@ -25,6 +25,7 @@ struct FakeBackend {
     submit_batch_error: Option<NativeCallError>,
     sync_batch_error: Option<NativeCallError>,
     shutdown_calls: usize,
+    shutdown_error: Option<NativeCallError>,
 }
 
 impl NativeBackend for FakeBackend {
@@ -110,7 +111,10 @@ impl NativeBackend for FakeBackend {
 
     fn shutdown(&mut self) -> Result<(), NativeCallError> {
         self.shutdown_calls += 1;
-        Ok(())
+        match self.shutdown_error.take() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -610,6 +614,74 @@ fn hccs_batch_uncertain_sync_quarantines_every_slot() {
         assert_eq!(core.backend.shutdown_calls, 0);
         assert!(core.shutdown().is_err());
     }
+}
+
+#[test]
+#[cfg(feature = "hixl")]
+fn failed_start_error_retains_the_native_runtime() {
+    let before = super::retained_start_count();
+    let error = super::failed_start_error(
+        std::ptr::without_provenance_mut::<std::ffi::c_void>(0x2000),
+        HIXL_UNSUPPORTED,
+        "HIXL Initialize failed".to_owned(),
+    );
+    assert!(error.accepted, "a retained handle is never a safe refusal");
+    assert_eq!(error.status, Some(HIXL_UNSUPPORTED));
+    assert!(
+        error
+            .message
+            .contains("retained with its device resources until process exit"),
+        "{}",
+        error.message
+    );
+    assert_eq!(super::retained_start_count(), before + 1);
+    let retained = super::retained_starts();
+    let last = retained.last().expect("the failed start is retained");
+    assert_eq!(last.address, 0x2000);
+    assert_eq!(last.status, Some(HIXL_UNSUPPORTED));
+
+    // A null handle is a clean failure: nothing is retained and preferred
+    // mode may still treat the status as a capability refusal.
+    let clean = super::failed_start_error(
+        std::ptr::null_mut(),
+        HIXL_UNSUPPORTED,
+        "HIXL Initialize failed".to_owned(),
+    );
+    assert!(!clean.accepted);
+    assert!(!clean.message.contains("retained"));
+    assert_eq!(super::retained_start_count(), before + 1);
+}
+
+#[test]
+#[cfg(feature = "hixl")]
+fn failed_native_cleanup_stays_retryable_until_shutdown_succeeds() {
+    let runtime = runtime_with_fake_backend(
+        FakeBackend {
+            shutdown_error: Some(NativeCallError::new(Some(9), "aclrtResetDevice failed")),
+            ..FakeBackend::default()
+        },
+        options(),
+    );
+
+    let error = runtime.shutdown().unwrap_err();
+    assert_eq!(error.kind, HixlErrorKind::ShutdownIncomplete);
+    assert_eq!(runtime.status().state, RuntimeState::ShutdownFailed);
+
+    // Cleanup stays retryable, but no data-plane operation may re-enter.
+    let blocked = runtime
+        .read_batch_timed_into(
+            "peer",
+            &[(0xfeed, 4)],
+            vec![0; 4],
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap_err();
+    assert_eq!(blocked.kind, HixlErrorKind::ShutdownIncomplete);
+
+    runtime.shutdown().unwrap();
+    assert_eq!(runtime.status().state, RuntimeState::Shutdown);
+    // A completed shutdown stays idempotent.
+    runtime.shutdown().unwrap();
 }
 
 #[test]

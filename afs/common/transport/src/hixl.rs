@@ -164,6 +164,10 @@ pub enum RuntimeState {
     Stopped,
     Running,
     Quarantined,
+    /// Native cleanup failed; every data-plane operation is refused, but
+    /// shutdown may be retried because the native cleanup steps are
+    /// idempotent.
+    ShutdownFailed,
     Shutdown,
 }
 
@@ -173,6 +177,7 @@ impl fmt::Display for RuntimeState {
             Self::Stopped => "stopped",
             Self::Running => "running",
             Self::Quarantined => "quarantined",
+            Self::ShutdownFailed => "shutdown-failed",
             Self::Shutdown => "shutdown",
         };
         formatter.write_str(name)
@@ -943,7 +948,9 @@ impl<B: NativeBackend> RuntimeCore<B> {
             ));
         }
         if let Err(error) = self.backend.shutdown() {
-            self.state = RuntimeState::Quarantined;
+            // A failed cleanup is retryable: the native steps are idempotent,
+            // and data-plane entry stays closed until one attempt completes.
+            self.state = RuntimeState::ShutdownFailed;
             return Err(HixlError::new(
                 HixlPhase::Shutdown,
                 HixlErrorKind::ShutdownIncomplete,
@@ -965,6 +972,11 @@ impl<B: NativeBackend> RuntimeCore<B> {
             ));
         }
         if self.state == RuntimeState::Quarantined {
+            return Ok(());
+        }
+        if self.state == RuntimeState::ShutdownFailed {
+            // Data-plane entry is already closed; keeping the state retryable
+            // lets a later shutdown attempt still reclaim native resources.
             return Ok(());
         }
         for slot_id in 0..self.exports.len() {
@@ -989,6 +1001,12 @@ impl<B: NativeBackend> RuntimeCore<B> {
                 HixlErrorKind::EnginePoisoned,
                 None,
                 "HIXL generation is quarantined after an uncertain native operation",
+            )),
+            RuntimeState::ShutdownFailed => Err(HixlError::new(
+                phase,
+                HixlErrorKind::ShutdownIncomplete,
+                None,
+                "HIXL generation failed to clean up; only shutdown may be retried",
             )),
             RuntimeState::Shutdown | RuntimeState::Stopped => Err(HixlError::new(
                 phase,
@@ -1769,6 +1787,86 @@ struct RealNative {
     hccs_domain_id: Option<u64>,
 }
 
+/// A native runtime the C ABI retained after an incomplete startup cleanup.
+///
+/// The bridge marks such a runtime poisoned and refuses to shut it down, so no
+/// code path may free, disconnect or reuse it. The record keeps the pointer
+/// reachable for the process lifetime instead of dropping it silently; only
+/// process exit releases the device resources it holds.
+#[cfg(feature = "hixl")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetainedStart {
+    /// Address of the retained native runtime. It is reported for diagnostics
+    /// and never dereferenced.
+    pub address: usize,
+    /// Native status that failed the start.
+    pub status: Option<u32>,
+}
+
+/// Failed-start runtimes of this process. They are never freed.
+#[cfg(feature = "hixl")]
+static RETAINED_STARTS: Mutex<Vec<RetainedStart>> = Mutex::new(Vec::new());
+
+/// Number of native runtimes retained after an incomplete startup cleanup. A
+/// nonzero value means the process must exit to release their device
+/// resources.
+#[cfg(feature = "hixl")]
+pub fn retained_start_count() -> usize {
+    match RETAINED_STARTS.lock() {
+        Ok(retained) => retained.len(),
+        Err(poisoned) => poisoned.into_inner().len(),
+    }
+}
+
+/// Retained failed-start generations for diagnostics.
+#[cfg(feature = "hixl")]
+pub fn retained_starts() -> Vec<RetainedStart> {
+    match RETAINED_STARTS.lock() {
+        Ok(retained) => retained.to_vec(),
+        Err(poisoned) => poisoned.into_inner().to_vec(),
+    }
+}
+
+#[cfg(feature = "hixl")]
+fn retain_failed_start(handle: *mut std::ffi::c_void, status: Option<u32>) -> usize {
+    let mut retained = match RETAINED_STARTS.lock() {
+        Ok(retained) => retained,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    retained.push(RetainedStart {
+        address: handle as usize,
+        status,
+    });
+    retained.len()
+}
+
+/// Error for a native start that failed. A non-null handle means the bridge
+/// kept its resources; the error reports that retention and names the record
+/// so the residual generation can be traced.
+#[cfg(feature = "hixl")]
+fn failed_start_error(
+    handle: *mut std::ffi::c_void,
+    status: u32,
+    message: String,
+) -> NativeCallError {
+    if handle.is_null() {
+        return NativeCallError {
+            status: Some(status),
+            message,
+            accepted: false,
+        };
+    }
+    let retained = retain_failed_start(handle, Some(status));
+    NativeCallError {
+        status: Some(status),
+        message: format!(
+            "{message}; startup cleanup incomplete, native runtime {retained} retained with its \
+             device resources until process exit"
+        ),
+        accepted: true,
+    }
+}
+
 #[cfg(feature = "hixl")]
 // SAFETY: RealNative is only moved into and accessed by the dedicated owner
 // thread. Native HIXL and ACL handles are never shared across Rust threads.
@@ -1812,20 +1910,10 @@ impl NativeBackend for RealNative {
         };
         if status != HIXL_SUCCESS || handle.is_null() {
             // The native bridge intentionally retains a non-null failed-start
-            // handle when cleanup is incomplete. Do not destroy it or allow a
-            // preferred-mode capability fallback in that case.
-            return Err(NativeCallError {
-                status: Some(status),
-                message: if handle.is_null() {
-                    error.message()
-                } else {
-                    format!(
-                        "{}; startup cleanup incomplete, resources retained",
-                        error.message()
-                    )
-                },
-                accepted: !handle.is_null(),
-            });
+            // handle when cleanup is incomplete. It is recorded below and
+            // never destroyed or reused, and preferred mode must not treat it
+            // as a safe capability refusal.
+            return Err(failed_start_error(handle, status, error.message()));
         }
         let handle = std::ptr::NonNull::new(handle).ok_or_else(|| NativeCallError {
             status: None,

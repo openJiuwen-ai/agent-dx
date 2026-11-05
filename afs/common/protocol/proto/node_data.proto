@@ -289,7 +289,7 @@ message DfsPrepareReadRangesHixlGroupReply {
 enum DfsHixlReleaseOutcome {
   DFS_HIXL_RELEASE_OUTCOME_UNSPECIFIED = 0;
   DFS_HIXL_RELEASE_OUTCOME_COMPLETED = 1;
-  DFS_HIXL_RELEASE_OUTCOME_FAILED = 2;
+  // The reader could not tell whether the native READ completed.
   DFS_HIXL_RELEASE_OUTCOME_UNKNOWN = 3;
   // The authenticated reader proves this window never entered native READ.
   DFS_HIXL_RELEASE_OUTCOME_NOT_SUBMITTED = 4;

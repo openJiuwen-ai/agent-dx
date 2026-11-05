@@ -962,10 +962,7 @@ impl HixlReadService {
                     )
                 })?;
                 validate_release_identity(record, &request, window)?;
-                if matches!(
-                    outcome,
-                    DfsHixlReleaseOutcome::Unknown | DfsHixlReleaseOutcome::Failed
-                ) {
+                if outcome == DfsHixlReleaseOutcome::Unknown {
                     pinned = true;
                     continue;
                 }

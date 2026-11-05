@@ -255,18 +255,19 @@ async fn fixture(policy: OwnerHixlPolicy, home_hixl: bool) -> Fixture {
 }
 
 async fn fixture_with(policy: OwnerHixlPolicy, home_hixl: bool, source: MemorySource) -> Fixture {
-    fixture_windows(policy, home_hixl, source, SLOT).await
+    fixture_windows(policy, home_hixl, source, SLOT, SLOT).await
 }
 
 /// A reader whose native window is `reader_slot` bytes against a Home
-/// window of `SLOT` bytes.
+/// window of `home_slot` bytes.
 async fn fixture_windows(
     policy: OwnerHixlPolicy,
     home_hixl: bool,
     source: MemorySource,
+    home_slot: usize,
     reader_slot: usize,
 ) -> Fixture {
-    let exports = Arc::new(MemoryExports::new(SLOT, 8));
+    let exports = Arc::new(MemoryExports::new(home_slot, 8));
     let source = Arc::new(source);
     let handler = Arc::new(FileHandler {
         source: source.clone(),
@@ -622,7 +623,34 @@ async fn a_reader_with_smaller_slots_than_home_reads_through_hixl() {
         policy(HixlOwnerFsReadMode::Required),
         true,
         MemorySource::new(content(), 3000),
+        SLOT,
         SLOT / 2,
+    )
+    .await;
+    let client = fixture.client.clone();
+    let all = blocking(move || {
+        let file = open(&client, libc::O_RDONLY);
+        scan(&client, &file)
+    })
+    .await;
+    assert_eq!(all, content());
+    assert_eq!(fixture.handler.grpc_reads.load(Ordering::SeqCst), 0);
+    fixture.wait_released().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_home_with_smaller_windows_than_the_reader_still_serves_full_content() {
+    // The configured window is an upper bound: the negotiated capacity is
+    // min(local slot, Home window) times the shared slot count, so a smaller
+    // Home window shortens every prepare instead of failing it.
+    let mut sized = policy(HixlOwnerFsReadMode::Required);
+    sized.max_window_bytes = 4 * SLOT;
+    let fixture = fixture_windows(
+        sized,
+        true,
+        MemorySource::new(content(), 3000),
+        SLOT / 2,
+        SLOT,
     )
     .await;
     let client = fixture.client.clone();

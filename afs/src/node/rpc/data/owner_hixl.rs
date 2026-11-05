@@ -662,10 +662,7 @@ impl OwnerHixlService {
                         "OwnerFs HIXL release engine identity does not match",
                     ));
                 }
-                if matches!(
-                    outcome,
-                    DfsHixlReleaseOutcome::Unknown | DfsHixlReleaseOutcome::Failed
-                ) {
+                if outcome == DfsHixlReleaseOutcome::Unknown {
                     pinned = true;
                     OwnerReleaseHixlReadReply::default()
                 } else {

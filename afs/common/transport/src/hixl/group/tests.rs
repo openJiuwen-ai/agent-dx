@@ -346,16 +346,13 @@ mod lifecycle {
         let owner_status = Arc::clone(&status);
         let owner = std::thread::spawn(move || {
             while let Ok(command) = receiver.recv() {
-                match command {
-                    Command::Shutdown { reply } => {
-                        order.lock().unwrap().push(device_id);
-                        if let Ok(mut status) = owner_status.write() {
-                            status.state = RuntimeState::Shutdown;
-                        }
-                        let _ = reply.send(Ok(()));
-                        break;
+                if let Command::Shutdown { reply } = command {
+                    order.lock().unwrap().push(device_id);
+                    if let Ok(mut status) = owner_status.write() {
+                        status.state = RuntimeState::Shutdown;
                     }
-                    _ => {}
+                    let _ = reply.send(Ok(()));
+                    break;
                 }
             }
         });

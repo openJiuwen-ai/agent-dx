@@ -101,7 +101,9 @@ pub struct HixlConfig {
     pub buffer_pool_count: usize,
     pub buffer_pool_size_mib: usize,
     pub ownerfs_read_mode: HixlOwnerFsReadMode,
-    /// Largest read-ahead window one OwnerFs prepare may export.
+    /// Target upper bound for one OwnerFs read-ahead window. The negotiated
+    /// capacity is `min(local window_bytes, Home window_bytes) × shared slots`,
+    /// so a smaller Home window shortens prepares below this value.
     pub ownerfs_window_bytes: usize,
     /// 1 fetches windows on demand; 2 also prefetches the next window.
     pub ownerfs_max_inflight: usize,

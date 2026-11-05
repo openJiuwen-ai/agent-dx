@@ -286,7 +286,8 @@ fn state_severity(state: RuntimeState) -> u8 {
         RuntimeState::Running => 0,
         RuntimeState::Shutdown => 1,
         RuntimeState::Stopped => 2,
-        RuntimeState::Quarantined => 3,
+        RuntimeState::ShutdownFailed => 3,
+        RuntimeState::Quarantined => 4,
     }
 }
 
