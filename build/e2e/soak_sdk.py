@@ -52,13 +52,17 @@ def run(connection, image, config, directory, stop):
               'requested_seconds': config['seconds'], 'elapsed_seconds': 0, 'cycles': 0,
               'operations': {key: 0 for key in ('command', 'file', 'create', 'delete')},
               'verified_bytes': 0, 'instances': {}, 'remaining': [], 'owner': config['owner'],
-              'mode': config['mode'], 'qualification_only': config.get('acceptance', 'qualification') != 'one-hour',
+              'mode': config['mode'],
+              'qualification_only': config.get('acceptance', 'qualification') == 'qualification',
               'contract_sha256': config.get('contract_sha256'),
               'payload_transport': PAYLOAD_TRANSPORT, 'maximum_publish_command_bytes': 0,
               'injected_failure_after_cycles': config['fail_after_cycles']}
 
     def publish():
         report['elapsed_seconds'] = round(time.monotonic() - started, 6) if started is not None else 0
+        if 'warmup_seconds' in config:
+            report.update(warmup_seconds=config['warmup_seconds'], measurement_seconds=config['measurement_seconds'],
+                          phase='warmup' if report['elapsed_seconds'] < config['warmup_seconds'] else 'measurement')
         save_json(progress, report)
 
     def one(environment, marker):

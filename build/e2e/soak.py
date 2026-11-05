@@ -62,7 +62,8 @@ def validate_workload(report, seconds):
         raise ValueError('continuous workload duration/work/counts/cleanup incomplete')
 
 
-def validate_samples(samples, limits, interval, *, baseline=None, require_progress=True, fd_metric='fds'):
+def validate_samples(samples, limits, interval, *, baseline=None, require_progress=True, fd_metric='fds',
+                     allow_retired_workers=False):
     if len(samples) < 2 or (require_progress and samples[-1]['cycles'] <= samples[0]['cycles']):
         raise ValueError('resource samples or sustained workload progress missing')
     last_progress = samples[0].get('observed_monotonic_seconds', samples[0]['elapsed_seconds'])
@@ -98,6 +99,9 @@ def validate_samples(samples, limits, interval, *, baseline=None, require_progre
             if not observed['processes']:
                 raise ValueError(node + ' has no monitored persistent processes')
             for name, process in initial['processes'].items():
+                if (allow_retired_workers and sample.get('active') is not True
+                        and name.startswith(('execd-service:', 'sdk-worker:'))):
+                    continue
                 current = observed['processes'].get(name, {})
                 if any(current.get(k) != process[k] for k in ('pid', 'start_ticks')):
                     raise ValueError(node + ' persistent process identity changed: ' + name)
@@ -114,7 +118,7 @@ def cgroup_resources(path):
             'file_bytes': int(stat['file']), 'events': events, 'path': str(path)}
 
 
-def observe_resources(run, progress, fd_roots=None):
+def observe_resources(run, progress, fd_roots=None, *, full_memory=False):
     nodes = {}
     for node in NODES:
         arguments = [progress['instances']['A' if node == 'node1' else 'B']] if (
@@ -123,6 +127,10 @@ def observe_resources(run, progress, fd_roots=None):
             arguments += ['--mode', fd_roots['mode']]
             if node in fd_roots:
                 arguments += ['--cache-root', fd_roots[node]]
+        if full_memory:
+            arguments += ['--full-memory']
+            if node == 'node1' and progress['status'] == 'running':
+                arguments += ['--sdk-worker', '/evidence/soak-sdk/worker.json']
         observed = json.loads(run.execute(node, 'python3', '/opt/adx/e2e/soak_probe.py', *arguments, timeout=30))
         item = json.loads(run.docker('inspect', run.owned[node], stream=False))[0]
         pid = item['State']['Pid']
@@ -177,8 +185,20 @@ def stop_worker(run, directory, receipt):
 
 def scenarios(run, checks, options, limits, policy=None):
     product = run.afs_product
+    observation = policy if policy and policy.get('observation') else (
+        acceptance.contract('warmup-hour') if options.get('qualify_v4_observer') else None)
+    if observation:
+        (run.output / 'soak-observer-contract.json').write_bytes(acceptance.contract_path(observation).read_bytes())
     if policy:
-        (run.output / 'soak-contract.json').write_bytes(acceptance.CONTRACT_PATH.read_bytes())
+        (run.output / 'soak-contract.json').write_bytes(acceptance.contract_path(policy).read_bytes())
+    if observation:
+        for node in ('node1', 'node2'):
+            deployment = json.loads((run.output / ('deployment-' + node + '.json')).read_text())
+            configs = [s['config'] for s in deployment['services']
+                       if isinstance(s.get('config'), dict) and 'execd_env' in s['config']]
+            if len(configs) != 1 or any(k in configs[0]['execd_env'] for k in (
+                    'EXECD_COMMAND_RESULT_TTL_SECS', 'EXECD_COMMAND_REGISTRY_MAX_RECORDS')):
+                raise ValueError('v4 requires unchanged Execd default TTL/capacity')
     product.sdk({'mode': 'warm'}, run.output / 'afs-sdk-warm.json')
     sys.path.append(str(Path(__file__).resolve().parents[2] / 'afs/tests'))
     try:
@@ -205,13 +225,14 @@ def scenarios(run, checks, options, limits, policy=None):
             report = {'status': 'failed', 'options': options, 'limits': limits, 'samples': 0,
                       'qualification_only': policy is None, 'cleanup_errors': [], 'mode': mode,
                       'contract_id': policy['id'] if policy else None,
-                      'contract_sha256': options.get('contract_sha256')}
+                      'contract_sha256': options.get('contract_sha256'),
+                      'observer_contract_sha256': acceptance.contract_sha(observation) if observation else None}
             try:
                 cluster.prepare()
                 fd_roots = ({'mode': mode, **({
                     node: str(Path(cluster.role_dir(role)) / 'state' / 'dfs' / 'chunks')
                     for node, role in (('node1', 'A'), ('node2', 'B'))} if mode == 'dfs' else {})}
-                    if policy else None)
+                    if policy or observation else None)
                 peer_before = peer_counter(cluster, 'B') if mode == 'dfs' else None
                 config = dict(options, owner=run.id, special='soak', paths={}, identities={})
                 for role in ('A', 'B'):
@@ -254,7 +275,8 @@ def scenarios(run, checks, options, limits, policy=None):
                                 retiring_at = retiring_at or time.monotonic()
                                 if time.monotonic() - retiring_at > 180:
                                     raise ValueError('SDK terminal cleanup exceeded 180 seconds')
-                            observed = observe_resources(run, progress, fd_roots)
+                            observed = observe_resources(run, progress, fd_roots,
+                                                         full_memory=bool(observation))
                             if policy and mode == 'dfs':
                                 observed['peer_reads'] = peer_counter(cluster, 'B')
                             samples.append(observed)
@@ -263,13 +285,15 @@ def scenarios(run, checks, options, limits, policy=None):
                             if len(samples) > 1:
                                 validate_samples(samples[-2:], limits, options['sample_seconds'],
                                                  baseline=samples[0], require_progress=False,
-                                                 fd_metric='fds_noncache' if policy else 'fds')
-                            if policy:
-                                acceptance.check_sample(observed, samples[0], policy, mode)
+                                                 fd_metric='fds_noncache' if policy or observation else 'fds',
+                                                 allow_retired_workers=bool(observation))
+                            if policy or observation:
+                                sample_policy = policy or observation
+                                acceptance.check_sample(observed, samples[0], sample_policy, mode)
                                 if (len(samples) > 1
                                         and observed['observed_monotonic_seconds']
                                         - samples[-2]['observed_monotonic_seconds']
-                                        > policy['maximum_sample_gap_seconds']):
+                                        > sample_policy['maximum_sample_gap_seconds']):
                                     raise ValueError('one-hour resource sampling gap exceeded 45 seconds')
                             run.event(f'SOAK {mode} elapsed={progress["elapsed_seconds"]:.1f}s '
                                       f'cycles={progress["cycles"]}')
@@ -277,7 +301,8 @@ def scenarios(run, checks, options, limits, policy=None):
                     time.sleep(0.25)
                 workload = json.loads((directory / 'workload.json').read_text())
                 report['workload'] = workload
-                final_sample = observe_resources(run, workload, fd_roots)
+                final_sample = observe_resources(run, workload, fd_roots,
+                                                 full_memory=bool(observation))
                 if policy and mode == 'dfs':
                     final_sample['peer_reads'] = peer_counter(cluster, 'B')
                 samples.append(final_sample)
@@ -287,7 +312,8 @@ def scenarios(run, checks, options, limits, policy=None):
                     raise ValueError('workload result identity mismatch')
                 validate_workload(workload, options['seconds'])
                 validate_samples(samples, limits, options['sample_seconds'],
-                                 fd_metric='fds_noncache' if policy else 'fds')
+                                 fd_metric='fds_noncache' if policy or observation else 'fds',
+                                 allow_retired_workers=bool(observation))
                 if policy:
                     report['acceptance'] = acceptance.evaluate(samples, workload, mode, policy)
                 if mode == 'dfs':
@@ -352,8 +378,10 @@ def main(argv=None):
     for flag in ('bundle', 'registry-images', 'image-export', 'artifact-commit', 'output'):
         parser.add_argument('--' + flag, required=True)
     parser.add_argument('--mode', choices=('ownerfs', 'dfs'), required=True)
-    parser.add_argument('--acceptance', choices=('qualification', 'one-hour'), default='qualification')
+    parser.add_argument('--acceptance', choices=('qualification', 'one-hour', 'warmup-hour'), default='qualification')
     parser.add_argument('--seconds', type=int, required=True)
+    parser.add_argument('--qualify-v4-observer', action='store_true',
+                        help='OwnerFs qualification only; exercise v4 probes without formal duration claims')
     parser.add_argument('--sample-seconds', type=int)
     parser.add_argument('--max-memory-growth-mib', type=int, default=512)
     parser.add_argument('--max-disk-growth-mib', type=int, default=256)
@@ -363,27 +391,35 @@ def main(argv=None):
     parser.add_argument('--qualify-fail-after-cycles', type=int, default=0,
                         help='deliberately fail the test worker; never eligible for PASS')
     args = parser.parse_args(argv)
-    policy = acceptance.contract() if args.acceptance == 'one-hour' else None
+    policy = acceptance.contract(args.acceptance) if args.acceptance != 'qualification' else None
     options = {'mode': args.mode, 'seconds': args.seconds,
                'sample_seconds': args.sample_seconds if args.sample_seconds is not None else (15 if policy else 10),
                'fail_after_cycles': args.qualify_fail_after_cycles, 'acceptance': args.acceptance,
-               'contract_sha256': acceptance.contract_sha() if policy else None}
+               'qualify_v4_observer': args.qualify_v4_observer,
+               'contract_sha256': acceptance.contract_sha(policy) if policy else None}
+    if policy and policy.get('observation'):
+        options.update(warmup_seconds=policy['warmup_seconds'], measurement_seconds=policy['measurement_seconds'])
     try:
         validate_options(options)
+        if args.qualify_v4_observer and (args.acceptance != 'qualification' or args.mode != 'ownerfs'):
+            raise ValueError('v4 observer qualification is restricted to OwnerFs qualification mode')
         limits = {'memory_bytes': args.max_memory_growth_mib * 1024**2,
                   'disk_bytes': args.max_disk_growth_mib * 1024**2, 'fds': args.max_fd_growth,
                   'mounts': args.max_mount_growth, 'min_free_bytes': args.min_free_mib * 1024**2}
         if any(value < 0 for value in limits.values()) or options['fail_after_cycles'] < 0:
             raise ValueError('resource limits and failure cycle count must be nonnegative')
         if policy:
+            label = 'warmup-hour' if args.acceptance == 'warmup-hour' else 'one-hour'
+            if policy.get('modes') and args.mode not in policy['modes']:
+                raise ValueError('mode has not qualified the selected warmup contract')
             expected = {key: policy['peak_growth'][key] for key in limits if key != 'min_free_bytes'}
             expected['min_free_bytes'] = policy['min_free_bytes']
             if (options['seconds'] != policy['seconds']
                     or options['sample_seconds'] != policy['sample_seconds']
                     or options['fail_after_cycles'] != 0):
-                raise ValueError('one-hour acceptance requires the exact frozen duration, sampling and resource bounds')
+                raise ValueError(label + ' acceptance requires the exact frozen duration, sampling and resource bounds')
             if (limits != expected):
-                raise ValueError('one-hour acceptance requires the exact frozen duration, sampling and resource bounds')
+                raise ValueError(label + ' acceptance requires the exact frozen duration, sampling and resource bounds')
     except ValueError as exc:
         parser.error(str(exc))
 
