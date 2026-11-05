@@ -1,0 +1,200 @@
+# Rendering defaults only: replace image/payload digests, network, storage and Secret references before installing.
+deployment_component: coordinator
+kubernetes_scheduling:
+  node_names: []
+managed_dependencies:
+  enabled: false
+  redis:
+    enabled: false
+    image: registry.example.com/dependencies/redis@sha256:0000000000000000000000000000000000000000000000000000000000000000
+    use_image_entrypoint: true
+    resources:
+      requests:
+        cpu: 25m
+        memory: 32Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+    pvc_size: 5Gi
+    storage_class: REPLACE_STORAGE_CLASS
+    secret: runtime-credentials
+    notify_keyspace_events: K$g
+runtime_payload_path: /opt/adx/runtime/0000000000000000000000000000000000000000000000000000000000000000.erofs
+namespace: adx-example
+tenant: example
+platform_namespace: adx-example-platform
+agent_namespace: adx-example-agent
+images:
+  coordinator: registry.example.com/adx/control@sha256:0000000000000000000000000000000000000000000000000000000000000000
+  apiserver: registry.example.com/adx/control@sha256:0000000000000000000000000000000000000000000000000000000000000000
+  activator: registry.example.com/adx/control@sha256:0000000000000000000000000000000000000000000000000000000000000000
+  ingress: registry.example.com/adx/control@sha256:0000000000000000000000000000000000000000000000000000000000000000
+  adx-node: registry.example.com/adx/node@sha256:0000000000000000000000000000000000000000000000000000000000000000
+components:
+  coordinator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 96Mi
+      limits:
+        cpu: 300m
+        memory: 384Mi
+  apiserver:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 96Mi
+      limits:
+        cpu: 300m
+        memory: 384Mi
+  activator:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 50m
+        memory: 96Mi
+      limits:
+        cpu: 300m
+        memory: 384Mi
+  ingress:
+    replicas: 1
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+  adx-node:
+    resources:
+      requests:
+        cpu: '8'
+        memory: 16Gi
+      limits:
+        cpu: '8'
+        memory: 16Gi
+secrets:
+  runtime: runtime-credentials
+  registry: adx-swr-credentials
+  obs: adx-obs-credentials
+dependencies:
+  redis_host: redis:6379
+node:
+  start_ordinal: 0
+  max_sandboxes: 12
+  sandbox_rootfs_size: 1G
+  filestore_size: 32G
+  pvc_size: 40Gi
+  data_storage: pvc
+  storage_class: REPLACE_STORAGE_CLASS
+  dns_address: 10.96.0.10
+  sandbox_gateway_cidr: 10.233.16.1/20
+  sandbox_target_cidr: 10.233.16.0/20
+  dns_options:
+  - ndots:5
+  - no-aaaa
+  checkpoint_storage:
+    kind: s3
+    alias: obs-checkpoint
+    bucket: replace-checkpoint-bucket
+    region: cn-north-4
+    endpoint: https://replace-checkpoint-bucket.obs.cn-north-4.myhuaweicloud.com
+    allow_http: false
+    prefix: adx-example/checkpoints
+    root: /work/checkpoints
+    cache_budget_bytes: 4294967296
+  sfs:
+    share_id: 00000000-0000-0000-0000-000000000001
+    server: sfs.example.internal
+    export_path: /
+    mount_path: /mnt/sfs
+    claim_size: 1Gi
+    mount_options:
+    - vers=3
+    - hard
+    - proto=tcp
+    - lookupcache=pos
+  runtime_control_port: 17002
+  storage_mounts:
+    sfs:
+      backend_id: sfs.example.internal:/
+      root: /mnt/sfs
+node_identities:
+  capacity: 2
+  private_secret: adx-node-identities-v1
+  public_secret: adx-node-peers-v1
+sandbox_network:
+  sandbox_cidrs:
+  - 10.233.24.0/21
+  - 10.233.20.0/22
+  - 10.233.18.0/23
+  - 10.233.17.0/24
+  - 10.233.16.128/25
+  - 10.233.16.64/26
+  - 10.233.16.32/27
+  - 10.233.16.16/28
+  - 10.233.16.8/29
+  - 10.233.16.4/30
+  - 10.233.16.2/31
+  - 10.233.16.0/32
+  internal_cidrs:
+  - 10.96.0.0/12
+  - 192.168.0.0/16
+  public_egress: true
+  egress_allow:
+  - cidr: 10.96.0.10/32
+    protocol: udp
+    ports:
+      first: 53
+      last: 53
+  - cidr: 10.96.0.10/32
+    protocol: tcp
+    ports:
+      first: 53
+      last: 53
+  - cidr: 10.233.16.1/32
+    protocol: udp
+    ports:
+      first: 53
+      last: 53
+  - cidr: 10.233.16.1/32
+    protocol: tcp
+    ports:
+      first: 53
+      last: 53
+  - cidr: 192.168.0.10/32
+    protocol: tcp
+    ports:
+      first: 2049
+      last: 2049
+  - cidr: 192.168.0.10/32
+    protocol: tcp
+    ports:
+      first: 111
+      last: 111
+  - cidr: 192.168.0.10/32
+    protocol: udp
+    ports:
+      first: 111
+      last: 111
+resource_quota:
+  limits.cpu: '20'
+  requests.cpu: '20'
+  limits.memory: 36Gi
+  requests.memory: 36Gi
+  requests.storage: 100Gi
+  persistentvolumeclaims: '10'
+  pods: '30'
+  services.loadbalancers: '0'
+  services.nodeports: '0'
+scheduling:
+  placement: spread
+storage_domains:
+  sfs:
+    backend_id: sfs.example.internal:/
+    dynamic_nodes: true
+    node_roots: {}
+    tenant_paths:
+      example: adx-example/workspaces
