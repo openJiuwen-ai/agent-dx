@@ -295,6 +295,11 @@ async fn corrupt_history_does_not_block_startup_or_discard_repairable_facts() {
     let session = store.begin(1).await.unwrap();
     register(&session, "node").await;
     create(&session, "live", 1).await;
+    super::observability::business_header(
+        &rig,
+        Some(|header| header["observability"]["started_at_unix_millis"] = 0.into()),
+    )
+    .await;
     let client = redis::Client::open(rig.url.as_str()).unwrap();
     let mut connection = client.get_multiplexed_async_connection().await.unwrap();
     let historical = BusinessCounters {
@@ -316,6 +321,11 @@ async fn corrupt_history_does_not_block_startup_or_discard_repairable_facts() {
         EnvironmentState::Running
     );
     assert!(recovered.business_counters().await.is_err());
+    assert_eq!(
+        super::observability::business_header(&rig, None).await["observability"]
+            ["started_at_unix_millis"],
+        0
+    );
     let fields = business_fields(&rig).await;
     assert!(fields.iter().any(|field| field == "environment:corrupt"));
     assert!(!fields.iter().any(|field| field == "environment:healthy"));
@@ -347,6 +357,7 @@ async fn corrupt_history_does_not_block_startup_or_discard_repairable_facts() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     let metrics = refreshed.expect("statistics did not refresh after history repair");
+    assert!(metrics.contains("adx_observability_history_known 1\n"));
     assert!(metrics.contains("adx_environment_owned_creation_results_total{outcome=\"success\"} 6"));
     let repaired = store.begin(1).await.unwrap();
     assert_eq!(

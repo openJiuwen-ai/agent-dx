@@ -407,12 +407,31 @@ impl Session {
     }
 
     pub async fn business_counters(&self) -> Result<BusinessCounters> {
-        let [header] = self.store.fields([HEADER.into()]).await?;
-        let mut total = self.header(&header)?.observability;
+        let [encoded] = self.store.fields([HEADER.into()]).await?;
+        let mut header = self.header(&encoded)?;
+        let mut total = header.observability.clone();
         let mut command = redis::cmd("HVALS");
         command.arg(format!("{}:business", self.store.key));
         for value in self.store.query::<Vec<String>>(command).await? {
             total.add(&decode::<BusinessCounters>(&value)?)?;
+        }
+        if total.started_at_unix_millis == 0 {
+            // Coverage begins now, after a complete valid read, without backfilling history.
+            // Preserve the header's base counts; the aggregated total must not be persisted.
+            header.observability.started_at_unix_millis = now_millis()?;
+            header.advance().map_err(|_| {
+                Error::Unavailable("business history coverage revision exhausted".into())
+            })?;
+            if !self
+                .store
+                .cas(encoded.as_deref().ok_or(Error::Conflict)?, &header, None)
+                .await?
+            {
+                return Err(Error::Unavailable(
+                    "concurrent business history coverage initialization; retry later".into(),
+                ));
+            }
+            total.started_at_unix_millis = header.observability.started_at_unix_millis;
         }
         Ok(total)
     }
