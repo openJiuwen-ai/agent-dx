@@ -16,10 +16,20 @@ impl CoordinatorRpc {
             let mut state = self.0.state.lock().await;
             state.healthy()?;
             let now = now()?;
+            let upgrade = state.session.upgrade_task().await?;
+            let upgrade_owned = |id: &str| {
+                upgrade.as_ref().is_some_and(|task| {
+                    task.active()
+                        && task
+                            .operations
+                            .values()
+                            .any(|op| op.environment_id == id && !op.settled())
+                })
+            };
             let candidates: Vec<_> = state
                 .environments
                 .values()
-                .filter(|i| i.recovery_point(now).is_some())
+                .filter(|i| !upgrade_owned(&i.spec.id) && i.recovery_point(now).is_some())
                 .cloned()
                 .collect();
             for stored in candidates {
@@ -62,7 +72,11 @@ impl CoordinatorRpc {
                 .values()
                 .filter(|i| i.spec.id > cursor)
                 .chain(state.environments.values().filter(|i| i.spec.id <= cursor))
-                .filter(|i| !i.invalidated && i.recovery.as_ref().is_some_and(|r| r.pending))
+                .filter(|i| {
+                    !upgrade_owned(&i.spec.id)
+                        && !i.invalidated
+                        && i.recovery.as_ref().is_some_and(|r| r.pending)
+                })
                 .filter_map(|i| {
                     let node = state.nodes.get(&i.assignment.node_id)?;
                     let live = state.live.get(&i.assignment.node_id)?;
@@ -86,39 +100,8 @@ impl CoordinatorRpc {
             state.recovery_cursor = work.last().map(|(_, record, _)| record.spec.id.clone());
             work
         };
-        let results = stream::iter(work.into_iter().map(|(node, record, run_timeout_seconds)| {
-            Box::pin(async move {
-                let endpoint = self
-                    .0
-                    .node_tls
-                    .endpoint(&node.address)
-                    .map_err(|_| Error::Conflict)?
-                    .connect_timeout(self.0.timeout)
-                    .timeout(self.0.timeout);
-                let channel = endpoint
-                    .connect()
-                    .await
-                    .map_err(|_| Error::Unavailable("recovery node unavailable".into()))?;
-                let session = node.session.ok_or(Error::Conflict)?.id;
-                let response =
-                    pb::node_service_client::NodeServiceClient::new(self.0.node_tls.wrap(channel))
-                        .recover_environment(pb::RecoverEnvironmentRequest {
-                            run_timeout_seconds,
-                            record: Some(record.try_into()?),
-                            node_session_id: session.clone(),
-                        })
-                        .await
-                        .map_err(adx_protocol::dependency_status)?
-                        .into_inner();
-                if response.durability != pb::Durability::Published as i32 {
-                    return Err(Error::Unavailable(
-                        "recovery result publication pending".into(),
-                    ));
-                }
-                let record = response.record.ok_or(Error::Conflict)?.try_into()?;
-                self.commit(record, session).await?;
-                Ok::<_, Error>(())
-            })
+        let results = stream::iter(work.into_iter().map(|(node, record, timeout)| {
+            self.recover_record(node, record, timeout, self.0.timeout, false)
         }))
         .buffer_unordered(4)
         .collect::<Vec<_>>()
@@ -128,5 +111,57 @@ impl CoordinatorRpc {
             return Err(error);
         }
         Ok(completed)
+    }
+    /// Both planned and failure recovery restore the same committed checkpoint;
+    /// a planned transfer additionally requires a published Running acknowledgement.
+    pub(super) fn recover_record(
+        &self,
+        node: StoredNode,
+        record: EnvironmentRecord,
+        run_timeout_seconds: Option<u64>,
+        timeout: Duration,
+        require_running: bool,
+    ) -> RpcFuture<'_, EnvironmentRecord> {
+        Box::pin(async move {
+            let assignment = record.assignment.clone();
+            let channel = self
+                .0
+                .node_tls
+                .endpoint(&node.address)
+                .map_err(|_| Error::Conflict)?
+                .connect_timeout(self.0.timeout)
+                .timeout(timeout)
+                .connect()
+                .await
+                .map_err(|_| Error::Unavailable("recovery node unavailable".into()))?;
+            let session = node.session.ok_or(Error::Conflict)?.id;
+            let result =
+                pb::node_service_client::NodeServiceClient::new(self.0.node_tls.wrap(channel))
+                    .recover_environment(pb::RecoverEnvironmentRequest {
+                        run_timeout_seconds,
+                        record: Some(record.try_into()?),
+                        node_session_id: session.clone(),
+                    })
+                    .await
+                    .map_err(adx_protocol::dependency_status)?
+                    .into_inner();
+            if result.durability != pb::Durability::Published as i32 {
+                return Err(Error::Unavailable(
+                    "recovery result publication pending".into(),
+                ));
+            }
+            let record: EnvironmentRecord = result.record.ok_or(Error::Conflict)?.try_into()?;
+            if record.assignment != assignment
+                || (require_running
+                    && (record.state != EnvironmentState::Running
+                        || !record.resources_held
+                        || record.runtime.ip.is_none()))
+            {
+                return Err(Error::Unavailable(
+                    "target restore is not published Running; retain source checkpoint".into(),
+                ));
+            }
+            self.commit(record, session).await
+        })
     }
 }

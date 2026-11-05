@@ -12,6 +12,8 @@ struct RetiredNode {
     session: Option<NodeSession>,
     scheduling_paused: bool,
     unregistered: bool,
+    #[serde(default)]
+    upgrade_pause: Option<UpgradePause>,
 }
 impl Session {
     pub async fn departed_node_sessions(
@@ -39,6 +41,13 @@ impl Session {
         for _ in 0..ATTEMPTS {
             let raw = self.store.raw().await?;
             let header = self.header(&raw.get(HEADER).cloned())?;
+            let upgrade = raw
+                .get(UPGRADE)
+                .map(|value| decode::<UpgradeTask>(value))
+                .transpose()?;
+            if upgrade.as_ref().is_some_and(UpgradeTask::active) {
+                return Ok(false);
+            }
             let Some(value) = raw.get(&field) else {
                 return Ok(false);
             };
@@ -65,6 +74,7 @@ impl Session {
                 session: node.session.clone(),
                 scheduling_paused: node.scheduling_paused,
                 unregistered: retirement.unregistered,
+                upgrade_pause: node.upgrade_pause.clone(),
             };
             let mut counters = CounterUpdate::load(&self.store, field.clone()).await?;
             counters.prepare_retirement(&self.store).await?;
@@ -74,6 +84,7 @@ impl Session {
                 if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] then return 0 end
                 if redis.call('HGET',KEYS[1],ARGV[2]) ~= ARGV[3] then return 0 end
                 if (redis.call('HGET',KEYS[1],ARGV[4]) or '') ~= ARGV[5] then return 0 end
+                if (redis.call('HGET',KEYS[1],'node-upgrade') or '') ~= ARGV[9] then return 0 end
                 local facts=cjson.decode(ARGV[8])
                 if (redis.call('HGET',KEYS[2],facts[1]) or '') ~= facts[2] then return 0 end
                 if (redis.call('HGET',KEYS[2],facts[4]) or '') ~= facts[5] then return 0 end
@@ -92,7 +103,8 @@ impl Session {
             .arg(raw.get(&membership).map_or("", String::as_str))
             .arg(id)
             .arg(encode(&tombstone)?)
-            .arg(counters.argument()?);
+            .arg(counters.argument()?)
+            .arg(raw.get(UPGRADE).map_or("", String::as_str));
             let write = self
                 .store
                 .publication_write(self.epoch, vec![field.clone()])
@@ -133,8 +145,27 @@ impl Session {
                 return Err(Error::Conflict);
             }
         }
+        let [header, upgrade_value] = self.store.fields([HEADER.into(), UPGRADE.into()]).await?;
+        let mut next_header = self.header(&header)?;
+        next_header.advance()?;
+        let upgrade = upgrade_value
+            .as_deref()
+            .map(decode::<UpgradeTask>)
+            .transpose()?;
+        let upgrade_pause = match upgrade.as_ref().filter(|task| task.active()) {
+            Some(task) => Some(UpgradePause {
+                task_id: task.task_id.clone(),
+                epoch: task.epoch,
+                original_paused: retired
+                    .upgrade_pause
+                    .as_ref()
+                    .map_or(retired.scheduling_paused, |owner| owner.original_paused),
+            }),
+            None => retired.upgrade_pause.clone(),
+        };
+        let scheduling_paused = retired.scheduling_paused || upgrade_pause.is_some();
         let mut node = node.clone();
-        node.available &= !retired.scheduling_paused;
+        node.available &= !scheduling_paused;
         let record = StoredNode {
             retirement: None,
             last_incident_id: None,
@@ -143,7 +174,8 @@ impl Session {
             address: address.into(),
             proxy_address: proxy.into(),
             session: session.cloned(),
-            scheduling_paused: retired.scheduling_paused,
+            scheduling_paused,
+            upgrade_pause,
             checkpoint_scopes: checkpoint_scopes.clone(),
             // Retirement follows ownership invalidation. A returning node remains
             // fenced until this authenticated process finishes reconciliation.
@@ -154,10 +186,13 @@ impl Session {
         cmd.arg(
             r#"
             if redis.call('HGET',KEYS[1],'epoch') ~= ARGV[1] then return 0 end
+            if (redis.call('HGET',KEYS[1],'node-upgrade') or '') ~= ARGV[6] then return 0 end
+            if redis.call('HGET',KEYS[1],'header') ~= ARGV[7] then return 0 end
             if redis.call('HEXISTS',KEYS[1],'node:' .. ARGV[2]) ~= 0 then return 0 end
             if redis.call('HGET',KEYS[1],'retired-node:' .. ARGV[2]) ~= ARGV[3] then return 0 end
             redis.call('HSET',KEYS[1],'node:' .. ARGV[2],ARGV[4])
             redis.call('HDEL',KEYS[1],'retired-node:' .. ARGV[2])
+            redis.call('HSET',KEYS[1],'header',ARGV[8])
             if ARGV[5] ~= '' then redis.call('HSET',KEYS[1],'node-session:' .. ARGV[2],ARGV[5]) end
             return 1
         "#,
@@ -168,7 +203,10 @@ impl Session {
         .arg(id)
         .arg(expected)
         .arg(encode(&record)?)
-        .arg(session.map_or("", |s| s.id.as_str()));
+        .arg(session.map_or("", |s| s.id.as_str()))
+        .arg(upgrade_value.as_deref().unwrap_or(""))
+        .arg(header.as_deref().ok_or(Error::Conflict)?)
+        .arg(encode(&next_header)?);
         let write = self
             .store
             .publication_write(self.epoch, vec![format!("node:{id}")])

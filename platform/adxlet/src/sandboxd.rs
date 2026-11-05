@@ -58,8 +58,38 @@ type Cell = Arc<tokio::sync::Mutex<StartState>>;
 pub struct Sandboxd {
     client: SandboxServiceClient<Channel>,
     config: Config,
+    rootfs_identity: Option<crate::RuntimeRootfsIdentity>,
     starts: Arc<Mutex<BTreeMap<String, Cell>>>,
     backend_ids: Arc<Mutex<BTreeMap<String, String>>>,
+}
+
+fn rootfs_identity(
+    profile: Option<&adx_core::runtime_profile::RuntimeProfile>,
+) -> Result<Option<crate::RuntimeRootfsIdentity>> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let Some(profile) = profile.filter(|profile| profile.rootfs.r#type == "local") else {
+        return Ok(None);
+    };
+    let mut file = std::fs::File::open(&profile.rootfs.path).map_err(unavailable)?;
+    if !file.metadata().map_err(unavailable)?.is_file() {
+        return Err(Error::Invalid(
+            "runtime rootfs must be a regular file".into(),
+        ));
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = file.read(&mut buffer).map_err(unavailable)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(Some(crate::RuntimeRootfsIdentity {
+        path: profile.rootfs.path.clone(),
+        sha256: format!("{:x}", digest.finalize()),
+    }))
 }
 
 fn unavailable(error: impl std::fmt::Display) -> Error {
@@ -157,6 +187,13 @@ impl Sandboxd {
                 .map_err(|error| Error::Invalid(error.to_string()))?;
             crate::runtime_logs::RuntimeLogs::new(policy.clone()).map_err(unavailable)?;
         }
+        // Deployment rootfs files must remain immutable for the process lifetime.
+        // Hash bytes once off the async executor; a changed image requires a new session.
+        let profile = config.runtime_profile.clone();
+        let rootfs_identity =
+            tokio::task::spawn_blocking(move || rootfs_identity(profile.as_ref()))
+                .await
+                .map_err(unavailable)??;
         let channel = Endpoint::from_static("http://localhost")
             .connect_timeout(config.rpc_timeout)
             .connect_with_connector(service_fn(move |_| {
@@ -168,6 +205,7 @@ impl Sandboxd {
         Ok(Self {
             client: SandboxServiceClient::new(channel),
             config,
+            rootfs_identity,
             starts: Arc::default(),
             backend_ids: Arc::default(),
         })
@@ -1151,6 +1189,10 @@ impl RuntimeDriver for Sandboxd {
     async fn sandbox_id(&self, runtime_id: &str) -> Option<String> {
         self.physical_id(runtime_id).await.ok().flatten()
     }
+    fn runtime_rootfs_identity(&self) -> Option<crate::RuntimeRootfsIdentity> {
+        self.rootfs_identity.clone()
+    }
+
     // Keep RuntimeDriver's conservative input retention: sandboxd can enable
     // runsc background page loading independently of adxlet configuration.
     // Firecracker also retains its caller-owned incremental memory base.
@@ -1565,6 +1607,14 @@ mod tests {
         assert!(!compatible.envs.contains_key("ADX_ENVD_GATEWAY_AUTH"));
         spec.runtime_profile = None;
         assert!(start_request(&spec, "missing-profile-1", 1, &[], &Config::default()).is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let mut profile = config.runtime_profile.unwrap();
+        profile.rootfs.path = directory.path().join("root.img").to_string_lossy().into();
+        profile.bootstrap.root = profile.rootfs.path.clone();
+        std::fs::write(&profile.rootfs.path, b"first").unwrap();
+        let first = rootfs_identity(Some(&profile)).unwrap().unwrap();
+        std::fs::write(&profile.rootfs.path, b"second").unwrap();
+        assert_ne!(first, rootfs_identity(Some(&profile)).unwrap().unwrap());
     }
 
     #[test]

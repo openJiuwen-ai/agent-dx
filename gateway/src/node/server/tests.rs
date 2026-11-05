@@ -81,6 +81,15 @@ async fn open_stream(
     link: &mut Link,
     address: SocketAddr,
 ) -> (h2::SendStream<Bytes>, h2::RecvStream) {
+    let (send, response) = connect_stream(link, address).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    (send, response.into_body())
+}
+
+async fn connect_stream(
+    link: &mut Link,
+    address: SocketAddr,
+) -> (h2::SendStream<Bytes>, http::Response<h2::RecvStream>) {
     let request = Request::builder()
         .method(http::Method::CONNECT)
         .uri(address.to_string())
@@ -93,8 +102,7 @@ async fn open_stream(
         .unwrap();
     let (response, send) = link.client.send_request(request, false).unwrap();
     let response = timeout(TEST_TIMEOUT, response).await.unwrap().unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    (send, response.into_body())
+    (send, response)
 }
 
 fn gateway() -> Relay {
@@ -180,11 +188,21 @@ async fn h2_liveness_bidirectional_blackhole_cleans_only_affected_connection() {
 
 #[tokio::test]
 async fn h2_liveness_healthy_idle_and_half_close_remain_usable() {
-    let node = gateway();
+    let node = gateway()
+        .with_activity_tracker(Arc::new(super::super::activity::ActivityTracker::new(
+            "proxy",
+        )))
+        .with_route_enforcement();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    node.activate_route("instance".into(), "environment".into(), address.ip())
+        .await;
     let mut link = link(node.clone()).await;
     let (mut send, mut recv) = open_stream(&mut link, listener.local_addr().unwrap()).await;
     let (mut backend, _) = listener.accept().await.unwrap();
+    node.drain_environment("instance", "environment").unwrap();
+    let (_, rejected) = connect_stream(&mut link, address).await;
+    assert_eq!(rejected.status(), StatusCode::CONFLICT);
     send.send_data(Bytes::new(), true).unwrap();
     let mut byte = [0];
     assert_eq!(

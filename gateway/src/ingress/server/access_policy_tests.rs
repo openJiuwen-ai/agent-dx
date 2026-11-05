@@ -650,11 +650,13 @@ async fn route_refresh_keeps_streams_but_pause_delete_and_identity_changes_cance
                 .resolve("sandbox-a", 8080, AccessKind::PortForwarding, "test")
                 .await
                 .unwrap();
+            let revision = ingress.resolver.current_route_revision(&route).unwrap();
             let session_id = Uuid::new_v4();
             let (cancel, cancelled) = watch::channel(false);
             ingress.sessions.lock().unwrap().insert(
                 session_id,
                 ActiveSession {
+                    revision,
                     instance_id: route.target.instance_id.clone(),
                     workload_id: route.target.workload_id.clone(),
                     relay_address: route.relay_address.clone(),
@@ -676,11 +678,18 @@ async fn route_refresh_keeps_streams_but_pause_delete_and_identity_changes_cance
                 }
                 _ => {}
             }
-            ingress.apply_route_change(super::super::route_store::RouteChange {
+            let update = super::super::route_store::RouteChange {
+                revision: revision + 1,
                 instance_id: "sandbox-a".into(),
                 previous: None,
                 current: (change != "delete").then_some(current),
-            });
+            };
+            let mut delayed = update.clone();
+            delayed.revision = revision;
+            delayed.current = None;
+            ingress.apply_route_change(delayed);
+            assert!(!*cancelled.borrow());
+            ingress.apply_route_change(update);
             assert_eq!(*cancelled.borrow(), change != "refresh", "{change}");
         }
     }

@@ -100,17 +100,35 @@ creating a physical connection; reused connections do not repeat the check.
 
 Ordinary Direct HTTP requests use a bounded keep-alive pool keyed by the full
 endpoint identity `(node, instance, workload, environment IP, port)`.
-Consequently, a connection can never move between environments or survive an
-route change. WebSocket/Upgrade and raw CONNECT traffic remain
-one logical H2 stream per client connection. Route changes and explicit Node
-Proxy retirement,
-and drain immediately invalidate matching idle HTTP connections.
+Consequently, a connection never moves between environments or execution bindings.
+WebSocket/Upgrade and raw CONNECT traffic remain one logical H2 stream per client
+connection. Route changes and Ingress drain invalidate matching idle HTTP
+connections. Active sessions record the route-store revision at admission;
+queued events from before admission cannot cancel a newly opened download.
+Later revocations still close old sessions, including when an identical endpoint
+is subsequently restored. HTTP pool keys include that instance's revision so a
+new request cannot reuse a connection admitted before revocation; changes to
+other instances do not change its pool key. Requests waiting for a connection
+recheck the admitted revision and authorization metadata before forwarding.
+An obsolete, unsent admission may retry the current route once within its original
+deadline and authorization scope. Authorization changes are rejected; transient
+route failures return a retryable response with `requestForwarded: false`.
+Requests already sent are never replayed. Delayed revocations invalidate only
+older pool revisions. Planned node-upgrade admission closure preserves accepted
+streams until they finish; only then may Adxlet retire the binding and checkpoint it.
 
 The pool defaults to 64 concurrent connections per endpoint, 64 idle
 connections per endpoint, 1024 idle connections globally, a 3 second acquire
 timeout, and a 5 second idle lifetime. An idle pooled HTTP connection is still
 an active Node CONNECT stream, so the short lifetime deliberately bounds how
-long pooling can defer environment idle reclamation. These settings are tunable:
+long pooling can defer environment idle reclamation. Continuously reused backend
+HTTP connections also have a 30 second maximum lifetime: expiry prevents reuse
+**after the current response completes**, and never truncates its body. This lets
+planned Relay draining finish under sustained short requests. A long-lived
+CONNECT, upgraded session or file transfer can exceed the pause budget; the
+upgrade fails safely and reopens the source admission instead of forcibly closing
+that stream. A pause budget shorter than the pool lifetime may likewise time out.
+The connection and idle limits are tunable:
 
 ```text
 ADX_DATA_PLANE_INGRESS_BACKEND_HTTP_MAX_CONNECTIONS_PER_ENDPOINT=64

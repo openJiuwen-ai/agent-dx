@@ -76,6 +76,12 @@ impl RuntimeRouter {
 
 #[async_trait]
 impl RuntimeDriver for RuntimeRouter {
+    fn runtime_rootfs_identity(&self) -> Option<crate::RuntimeRootfsIdentity> {
+        self.sandboxd
+            .as_ref()
+            .and_then(RuntimeDriver::runtime_rootfs_identity)
+    }
+
     fn retains_checkpoint_files(&self, class: &str) -> bool {
         self.class(class)
             .is_ok_and(|r| r.retains_checkpoint_files(class))

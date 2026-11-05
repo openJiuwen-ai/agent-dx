@@ -700,6 +700,7 @@ async fn lifecycle_rpc_scenario() {
         node_session_id: String::new(),
         assignment: Some(assignment.clone()),
         caller: caller(),
+        ..Default::default()
     };
     bad_delete.caller.as_mut().unwrap().tenant_id = "other".into();
     assert_eq!(
@@ -720,7 +721,8 @@ async fn lifecycle_rpc_scenario() {
 
                 node_session_id: String::new(),
                 assignment: Some(stale),
-                caller: caller()
+                caller: caller(),
+                ..Default::default()
             })
             .await
             .unwrap_err()
@@ -791,6 +793,7 @@ async fn lifecycle_rpc_scenario() {
         node_session_id: String::new(),
         assignment: Some(assignment),
         caller: caller(),
+        ..Default::default()
     };
     node_frontend
         .delete_environment(delete.clone())
@@ -840,6 +843,7 @@ async fn lifecycle_rpc_scenario() {
         node_session_id: String::new(),
         assignment: Some(second.assignment.try_into().unwrap()),
         caller: caller(),
+        ..Default::default()
     };
     assert!(node_frontend
         .delete_environment(delete.clone())
@@ -892,6 +896,7 @@ async fn lifecycle_rpc_scenario() {
             node_session_id: String::new(),
             assignment: record.assignment,
             caller: caller(),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -1148,6 +1153,7 @@ async fn lifecycle_rpc_scenario() {
                                         caller: caller(),
                                         failed_revision: None,
                                         node_session_id: "boot-1".into(),
+                                        ..Default::default()
                                     })
                                     .await
                                     .unwrap();
@@ -3120,6 +3126,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
             node_session_id: String::new(),
             assignment: source.assignment,
             caller: caller(),
+            ..Default::default()
         })
         .await
         .unwrap();
@@ -3228,6 +3235,7 @@ async fn snapshot_gc_waits_for_node_ack_and_recovers_from_lost_ack() {
             node_session_id: String::new(),
             assignment: created.assignment,
             caller: caller(),
+            ..Default::default()
         })
         .await
         .unwrap();

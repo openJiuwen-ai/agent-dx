@@ -1,5 +1,6 @@
 //! One durable on-demand restore path for public resume and Ingress demand.
 use super::*;
+use crate::storage::ResumeAdmission;
 use adx_core::scheduling::{LabelRequirement, LabelSelector, SelectorOp};
 
 impl CoordinatorRpc {
@@ -141,53 +142,65 @@ impl CoordinatorRpc {
             Duration::from_secs(seconds),
             Box::pin(async {
                 let _guard = lock.lock().await;
-                {
-                    let mut state = self.0.state.lock().await;
-                    state.recover_authoritative_state().await.map_err(status)?;
-                    let stored = state
-                        .session
-                        .get(&request.environment_id)
-                        .await
-                        .map_err(status)?;
-                    tenant(request.caller.as_ref(), &stored.spec.tenant_id)?;
-                    if !stored.invalidated
-                        && stored.resume.is_none()
-                        && stored.result.as_ref().is_some_and(|r| {
-                            r.state == EnvironmentState::Running
-                                && !request.expected_runtime_id.is_empty()
-                                && r.runtime.id != request.expected_runtime_id
-                        })
-                    {
-                        let node = state
-                            .nodes
-                            .get(&stored.assignment.node_id)
-                            .ok_or_else(|| Status::unavailable("owner node missing"))?;
-                        return Ok(pb::GetEnvironmentResponse {
-                            record: Some(
-                                stored
-                                    .result
-                                    .ok_or_else(|| Status::data_loss("result missing"))?
-                                    .try_into()
-                                    .map_err(status)?,
-                            ),
-                            node_address: node.address.clone(),
-                            relay_address: node.proxy_address.clone(),
-                        });
+                loop {
+                    let waiting_for_upgrade = {
+                        let mut state = self.0.state.lock().await;
+                        state.recover_authoritative_state().await.map_err(status)?;
+                        let stored = state
+                            .session
+                            .get(&request.environment_id)
+                            .await
+                            .map_err(status)?;
+                        tenant(request.caller.as_ref(), &stored.spec.tenant_id)?;
+                        // A cancelled/ambiguous CAS must reload. A known read-only
+                        // upgrade fence must not poison the scheduler health gate.
+                        state.needs_recovery = true;
+                        let admission = state
+                            .session
+                            .admit_resume(
+                                &request.environment_id,
+                                recovery::now().map_err(status)?,
+                                &request.expected_runtime_id,
+                                request.run_timeout_seconds,
+                            )
+                            .await
+                            .map_err(status)?;
+                        state.needs_recovery = false;
+                        match admission {
+                            ResumeAdmission::Upgrading => true,
+                            ResumeAdmission::Running(stored) => {
+                                let node = state
+                                    .nodes
+                                    .get(&stored.assignment.node_id)
+                                    .ok_or_else(|| Status::unavailable("owner node missing"))?;
+                                return Ok(pb::GetEnvironmentResponse {
+                                    record: Some(
+                                        stored
+                                            .result
+                                            .ok_or_else(|| Status::data_loss("result missing"))?
+                                            .try_into()
+                                            .map_err(status)?,
+                                    ),
+                                    node_address: node.address.clone(),
+                                    relay_address: node.proxy_address.clone(),
+                                });
+                            }
+                            ResumeAdmission::Demanded(stored) => {
+                                state.remember_environment(stored);
+                                false
+                            }
+                        }
+                    };
+                    if !waiting_for_upgrade {
+                        break;
                     }
-                    // A cancelled or ambiguous CAS must reload before cached sweeps
-                    // decide that no durable wake intent remains.
-                    state.needs_recovery = true;
-                    let demanded = state
-                        .session
-                        .request_resume_with_timeout(
-                            &request.environment_id,
-                            recovery::now().map_err(status)?,
-                            request.run_timeout_seconds,
-                        )
-                        .await
-                        .map_err(status)?;
-                    state.remember_environment(demanded);
-                    state.needs_recovery = false;
+                    // Never hold the state mutex while migration/rollback needs it.
+                    // Polling also covers durable task updates without a notification;
+                    // the single outer deadline bounds every wait and lock acquisition.
+                    tokio::select! {
+                        _ = self.0.changed.notified() => {},
+                        _ = tokio::time::sleep(Duration::from_millis(50)) => {},
+                    }
                 }
                 self.drive_resume(&request.environment_id).await
             }),
@@ -214,11 +227,22 @@ impl CoordinatorRpc {
                 if stored.resume.is_some() {
                     let was_rejected = stored.resume.as_ref().is_some_and(|r| r.local_rejected);
                     state.needs_recovery = true;
-                    stored = state
+                    let admission = state
                         .session
-                        .request_resume(id, recovery::now().map_err(status)?)
+                        .admit_resume(id, recovery::now().map_err(status)?, "", None)
                         .await
                         .map_err(status)?;
+                    state.needs_recovery = false;
+                    stored = match admission {
+                        ResumeAdmission::Demanded(stored) | ResumeAdmission::Running(stored) => {
+                            stored
+                        }
+                        ResumeAdmission::Upgrading => {
+                            drop(state);
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            continue;
+                        }
+                    };
                     if was_rejected && !stored.resume.as_ref().is_some_and(|r| r.local_rejected) {
                         state.scheduler.cancel_pending(id);
                     }

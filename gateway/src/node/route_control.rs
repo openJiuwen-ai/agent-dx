@@ -34,6 +34,7 @@ struct Bindings {
     ready: bool,
     versions: HashMap<String, UpdateBindingRequest>,
     snapshot: Option<proto::BindingSnapshot>,
+    admissions: HashMap<String, (proto::EnvironmentAdmissionRequest, bool)>,
 }
 impl BindingService {
     pub fn new(proxy: Arc<Relay>) -> Self {
@@ -72,6 +73,7 @@ impl BindingService {
         s.owner = expected.controller_session_id;
         s.ready = false;
         s.snapshot = None;
+        s.admissions.clear();
         self.proxy.clear_bindings();
         self.proxy.notify_activity_change();
         Ok(self.state_message(&s))
@@ -313,9 +315,11 @@ impl RelayService for BindingService {
         request: Request<proto::EnvironmentAdmissionRequest>,
     ) -> Result<Response<proto::EnvironmentAdmissionResponse>, Status> {
         let r = request.into_inner();
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
         if !state.ready
             || r.proxy_session_id != self.session
+            || r.sync_epoch != state.epoch
+            || r.admission_revision == 0
             || !matches!(
             state.versions.get(&r.environment_id).and_then(|v| v.binding.as_ref()),
             Some(Binding::Active(t)) if t.runtime_id == r.runtime_id)
@@ -324,15 +328,43 @@ impl RelayService for BindingService {
                 "current binding and session required",
             ));
         }
-        let closed = self
-            .proxy
-            .set_environment_admission(
-                &r.environment_id,
-                &r.runtime_id,
-                r.activity_revision,
-                r.close,
-            )
-            .map_err(|e| Status::unavailable(e.to_string()))?;
+        if let Some((previous, closed)) = state.admissions.get(&r.environment_id) {
+            if r.admission_revision < previous.admission_revision
+                || (r.admission_revision == previous.admission_revision && &r != previous)
+            {
+                return Err(Status::failed_precondition(
+                    "stale or conflicting admission revision",
+                ));
+            }
+            if &r == previous {
+                return Ok(Response::new(proto::EnvironmentAdmissionResponse {
+                    closed: *closed,
+                }));
+            }
+        }
+        let closed = if r.drain {
+            if !r.close || r.activity_revision != 0 {
+                return Err(Status::invalid_argument(
+                    "drain requires close without an idle revision",
+                ));
+            }
+            self.proxy
+                .drain_environment(&r.environment_id, &r.runtime_id)
+                .map_err(|e| Status::unavailable(e.to_string()))?;
+            true
+        } else {
+            self.proxy
+                .set_environment_admission(
+                    &r.environment_id,
+                    &r.runtime_id,
+                    r.activity_revision,
+                    r.close,
+                )
+                .map_err(|e| Status::unavailable(e.to_string()))?
+        };
+        state
+            .admissions
+            .insert(r.environment_id.clone(), (r, closed));
         Ok(Response::new(proto::EnvironmentAdmissionResponse {
             closed,
         }))
@@ -362,6 +394,7 @@ impl RelayService for BindingService {
             proxy_session_id: self.session.clone(),
             activity_revision,
             active_streams,
+            sync_epoch: state.epoch,
         }))
     }
 

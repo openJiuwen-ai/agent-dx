@@ -122,6 +122,8 @@ impl CoordinatorRpc {
                 .delete_environment(pb::DeleteEnvironmentRequest {
                     expected_revision: None,
 
+                    upgrade_task_id: String::new(),
+                    upgrade_epoch: 0,
                     assignment: Some(record.assignment.clone().try_into()?),
                     caller: None,
                     failed_revision: Some(record.revision),

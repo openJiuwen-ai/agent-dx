@@ -381,6 +381,15 @@ impl Adxlet {
         if controller::unstarted(record) {
             return Ok(None);
         }
+        if terminal_without_execution(record) {
+            self.services.upgrade.record_cleanup()?;
+        } else {
+            self.services.upgrade.record_action(
+                &record.spec.id,
+                record.assignment.generation,
+                "adopt",
+            )?;
+        }
         self.adopt_local(&record.spec, &record.assignment)?;
         if record.resources_held {
             let mut admission = self

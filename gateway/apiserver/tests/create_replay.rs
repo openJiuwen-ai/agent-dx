@@ -2449,6 +2449,8 @@ service_impl!(pb::node_service_server::NodeService, {
     get_environment_control(NodeGetEnvironmentControlRequest) -> EnvironmentControlRecord,
     batch_get_environment_control(NodeBatchGetEnvironmentControlRequest) -> BatchGetEnvironmentControlResponse,
     update_environment_control(NodeUpdateEnvironmentControlRequest) -> EnvironmentControlRecord,
+    apply_node_upgrade_control(NodeUpgradeControl) -> NodeUpgradeInspection,
+    inspect_node_upgrade(NodeUpgradeInspectRequest) -> NodeUpgradeInspection,
     recover_environment(RecoverEnvironmentRequest) -> EnvironmentResult,
     get_session(GetNodeSessionRequest) -> GetNodeSessionResponse,
     create_environment(StartAssignedEnvironmentRequest) -> EnvironmentResult,

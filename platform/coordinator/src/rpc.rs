@@ -1,5 +1,7 @@
 //! Async RPC coordination around the synchronous scheduler and Redis repository.
 use adx_transport::rpc::RpcClient;
+
+type RpcFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = Result<T>> + Send + 'a>>;
 mod artifacts;
 mod autoscaling;
 mod checkpoint_cleanup;
@@ -14,6 +16,7 @@ mod recovery;
 mod resume;
 mod snapshot_preparation;
 mod snapshots;
+mod upgrade;
 mod volumes;
 use crate::{
     storage::{ClaimOutcome, LocalClaim, NodeSession, Session, StoredEnvironment, StoredNode},
@@ -374,6 +377,7 @@ struct Inner {
     business: Arc<std::sync::RwLock<Option<observation::BusinessSnapshot>>>,
     business_fenced: Arc<std::sync::atomic::AtomicBool>,
     volume_domains: std::sync::RwLock<BTreeMap<String, adx_core::volumes::StorageDomain>>,
+    upgrade_lock: Mutex<()>,
     created: std::sync::atomic::AtomicU64,
     reclaimers: std::sync::RwLock<adx_checkpoint_storage::reclaim::Reclaimers>,
     resume_admission: Arc<tokio::sync::Semaphore>,
@@ -387,6 +391,27 @@ struct Inner {
     node_tls: RpcClient,
     timeout: Duration,
     heartbeat_timeout: Duration,
+}
+
+async fn current_registration_control(
+    session: &Session,
+    node: &StoredNode,
+    request: &pb::RegisterNodeRequest,
+) -> Result<Option<pb::NodeUpgradeControl>> {
+    // An ordinary same-session heartbeat stays live while Redis is unavailable.
+    // Only a persisted task-owned pause can require registration control.
+    let Some(owner) = &node.upgrade_pause else {
+        return Ok(None);
+    };
+    let task = session.upgrade_task().await?;
+    let Some(task) = task.filter(|task| task.active()) else {
+        return Ok(None);
+    };
+
+    if owner.task_id != task.task_id || owner.epoch != task.epoch {
+        return Err(Error::Conflict);
+    }
+    upgrade::registration_control(Some(&task), request)
 }
 
 struct PendingClaim {
@@ -595,6 +620,7 @@ impl CoordinatorRpc {
         let service = Self(Arc::new(Inner {
             business: Arc::new(std::sync::RwLock::new(business)),
             business_fenced: Default::default(),
+            upgrade_lock: Mutex::new(()),
             created: Default::default(),
             create_locks: Default::default(),
             reclaimers: Default::default(),
@@ -1204,6 +1230,11 @@ impl CoordinatorRpc {
                     })?;
                 continue;
             }
+            state
+                .session
+                .check_canary_creation(&spec.id)
+                .await
+                .map_err(status)?;
             if schedule_deadline.is_some_and(|deadline| {
                 tokio::time::Instant::now() >= deadline && !state.specs.contains_key(&spec.id)
             }) {
@@ -1546,12 +1577,12 @@ impl CoordinatorRpc {
         self.0.changed.notify_waiters();
         Ok(Some(failure))
     }
-    async fn commit(
+    fn commit(
         &self,
         record: EnvironmentRecord,
         session_id: String,
-    ) -> Result<EnvironmentRecord> {
-        Box::pin(self.commit_releasing(record, session_id, vec![], &[])).await
+    ) -> RpcFuture<'_, EnvironmentRecord> {
+        Box::pin(self.commit_releasing(record, session_id, vec![], &[]))
     }
 
     async fn commit_releasing(
@@ -2281,9 +2312,17 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                         ));
                     }
                     if r.heartbeat_sequence == live.sequence {
+                        let upgrade_control = current_registration_control(
+                            &state.session,
+                            &state.nodes[&r.node_id],
+                            &r,
+                        )
+                        .await
+                        .map_err(status)?;
                         return Ok(Response::new(pb::RegisterNodeResponse {
                             shard_id: state.nodes[&r.node_id].shard_id as u32,
                             coordinator_epoch: state.session.epoch(),
+                            upgrade_control,
                         }));
                     }
                     inspected =
@@ -2325,6 +2364,11 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     return Err(status(error));
                 }
             };
+            // The registration CAS may have retried after task finalization.
+            // Derive authority from its persisted pause owner and current task.
+            let upgrade_control = current_registration_control(&state.session, &saved, &r)
+                .await
+                .map_err(status)?;
             let shard = state
                 .scheduler
                 .register_at(saved.node.clone(), saved.shard_id)
@@ -2384,6 +2428,7 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
             Ok(Response::new(pb::RegisterNodeResponse {
                 shard_id: u32::try_from(shard).map_err(|_| Status::internal("shard overflow"))?,
                 coordinator_epoch: state.session.epoch(),
+                upgrade_control,
             }))
         })
         .await

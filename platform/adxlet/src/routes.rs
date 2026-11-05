@@ -18,6 +18,7 @@ struct Local {
     buffering: bool,
     initialized: bool,
     bindings: BTreeMap<String, UpdateBindingRequest>,
+    admission_revision: u64,
 }
 #[derive(Clone)]
 pub struct UdsRoutes {
@@ -71,6 +72,68 @@ impl UdsRoutes {
         r.set_timeout(self.timeout);
         adx_observability::trace::inject_metadata(r.metadata_mut());
         r
+    }
+    async fn set_admission(
+        &self,
+        record: &EnvironmentRecord,
+        close: bool,
+        drain: bool,
+        idle: Option<(&str, u64)>,
+    ) -> Result<(pb::BindingState, bool)> {
+        let mut client = self.connect().await?;
+        let state = self.remote(&mut client).await?;
+        if idle.is_some_and(|(session, _)| session != state.proxy_session_id) {
+            return Err(Error::Conflict);
+        }
+        let revision = {
+            let mut local = self.local.lock().await;
+            if !state.ready
+                || state.controller_session_id != self.owner
+                || !local.initialized
+                || local.buffering
+                || local.session.as_ref().is_none_or(|known| {
+                    known.proxy_session_id != state.proxy_session_id
+                        || known.sync_epoch != state.sync_epoch
+                })
+            {
+                return Err(Error::Conflict);
+            }
+            local.admission_revision = local
+                .admission_revision
+                .checked_add(1)
+                .ok_or(Error::Conflict)?;
+            local.admission_revision
+        };
+        let response = client
+            .set_environment_admission(self.request(pb::EnvironmentAdmissionRequest {
+                environment_id: record.spec.id.clone(),
+                runtime_id: record.runtime.id.clone(),
+                proxy_session_id: state.proxy_session_id.clone(),
+                sync_epoch: state.sync_epoch,
+                admission_revision: revision,
+                activity_revision: idle.map_or(0, |(_, revision)| revision),
+                close,
+                drain,
+            }))
+            .await
+            .map_err(rpc_error)?
+            .into_inner();
+        Ok((state, response.closed))
+    }
+    async fn environment_activity(
+        &self,
+        record: &EnvironmentRecord,
+    ) -> Result<pb::EnvironmentActivityState> {
+        Ok(self
+            .connect()
+            .await?
+            .get_environment_activity(self.request(pb::GetEnvironmentActivityRequest {
+                environment_id: record.spec.id.clone(),
+                runtime_id: record.runtime.id.clone(),
+            }))
+            .await
+            .map_err(rpc_error)?
+            .into_inner())
     }
     async fn remote(&self, client: &mut RelayServiceClient<Channel>) -> Result<pb::BindingState> {
         Ok(client
@@ -237,48 +300,40 @@ fn rpc_error(s: tonic::Status) -> Error {
 }
 #[async_trait]
 impl Routes for UdsRoutes {
+    async fn drain(&self, record: &EnvironmentRecord) -> Result<()> {
+        let (state, closed) = self.set_admission(record, true, true, None).await?;
+        if !closed {
+            return Err(unavailable("proxy did not close stream admission"));
+        }
+        loop {
+            // Read the authoritative counter after the close acknowledgement;
+            // a cached pre-close idle snapshot is not a drain barrier.
+            let activity = self.environment_activity(record).await?;
+            if activity.proxy_session_id != state.proxy_session_id
+                || activity.sync_epoch != state.sync_epoch
+            {
+                return Err(Error::Conflict);
+            }
+            if activity.active_streams == 0 {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
     async fn quiesce(
         &self,
         record: &EnvironmentRecord,
         session: &str,
         revision: u64,
     ) -> Result<bool> {
-        let response = self
-            .connect()
-            .await?
-            .set_environment_admission(self.request(pb::EnvironmentAdmissionRequest {
-                environment_id: record.spec.id.clone(),
-                runtime_id: record.runtime.id.clone(),
-                proxy_session_id: session.into(),
-                activity_revision: revision,
-                close: true,
-            }))
+        self.set_admission(record, true, false, Some((session, revision)))
             .await
-            .map_err(rpc_error)?
-            .into_inner();
-        Ok(response.closed)
+            .map(|(_, closed)| closed)
     }
     async fn reopen(&self, record: &EnvironmentRecord) -> Result<()> {
-        let session = self
-            .connect()
-            .await?
-            .get_binding_state(self.request(pb::GetBindingStateRequest {}))
+        self.set_admission(record, false, false, None)
             .await
-            .map_err(rpc_error)?
-            .into_inner()
-            .proxy_session_id;
-        self.connect()
-            .await?
-            .set_environment_admission(self.request(pb::EnvironmentAdmissionRequest {
-                environment_id: record.spec.id.clone(),
-                runtime_id: record.runtime.id.clone(),
-                proxy_session_id: session,
-                activity_revision: 0,
-                close: false,
-            }))
-            .await
-            .map_err(rpc_error)?;
-        Ok(())
+            .map(|_| ())
     }
     async fn activity_changed(
         &self,
@@ -300,15 +355,7 @@ impl Routes for UdsRoutes {
         }
     }
     async fn activity(&self, record: &EnvironmentRecord) -> Result<(String, u64, u64)> {
-        let mut client = self.connect().await?;
-        let result = client
-            .get_environment_activity(self.request(pb::GetEnvironmentActivityRequest {
-                environment_id: record.spec.id.clone(),
-                runtime_id: record.runtime.id.clone(),
-            }))
-            .await
-            .map_err(rpc_error)?
-            .into_inner();
+        let result = self.environment_activity(record).await?;
         Ok((
             result.proxy_session_id,
             result.activity_revision,
