@@ -1,7 +1,7 @@
 # sandboxd protocol
 
 - Repository: https://github.com/inclusionAI/sandboxd
-- Pinned head: `b5dab2958183faa8bcf04955eef7b0ae1c9b10ef`
+- Pinned head: `65eda5fc0dd014f600a6bbdade8cd936fe18c252`
 - ADX builds this revision without downstream source patches. Rootfs defaults,
   bootstrap mounts and managed-file paths are adapted by the control plane to
   the published sandboxd protocol.
@@ -22,6 +22,14 @@ revision as `source.json`.
 The archive contains sandboxd, sbox, runc, runc-shim, sandbox-logger, redis-cli
 and their backend manifest. It contains no ADX platform or Execd binaries.
 
+The bundled configuration sets `[plugin.image].oci_zero_ref_ttl = "30m"`,
+preserving sandboxd's existing retention interval for unreferenced OCI layers
+and lowerdir chains. Omitting or leaving the setting empty also uses `30m`.
+Users can select another positive Go duration, such as `"2h"`, or set `"0s"`
+to disable time-based eviction. The setting is node-wide and read at sandboxd
+startup. Disk-pressure GC and active-reference protection remain enabled, so
+disabling TTL eviction does not guarantee a permanent cache hit.
+
 The current AMD64 executables require glibc 2.34 or newer. Firecracker uses
 `mount_setattr` for recursive virtiofs export protection, requiring Linux 5.12
 or a kernel with that feature backported. An available `/dev/kvm` alone does
@@ -37,7 +45,8 @@ Both bundles are built from the clean pinned sandboxd revision using
 `build/e2e/build_backend.py`. Updating this dependency requires matching source
 and verified archive pins. To include the backend in the ADX release, build with
 `ADX_WITH_SANDBOXD=1 make platform-release`. This adds the backend to
-`runtime/sandboxd/`, includes architecture-pinned AKernel runsc builds,
+`runtime/sandboxd/`, includes architecture-pinned AKernel runsc builds and their
+adjacent `gvisor-bin/` helpers from the same verified upstream archive,
 and ships the systemd unit and example configuration described
 in the [standalone deployment guide](../../docs/deployment/standalone.md#使用随包的-sandboxd).
 

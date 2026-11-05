@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import platform
+import stat
 from pathlib import Path
 
 BINARIES = (
@@ -18,6 +19,13 @@ BINARIES = (
     "adx-relay",
 )
 SANDBOXD_BINARIES = ("sandboxd", "sbox", "runc", "runc-shim", "sandbox-logger", "redis-cli")
+RUNSC_HELPERS = (
+    "checkpointgofer",
+    "gvisor-sentry-prewarmer",
+    "gvisor_sentry",
+    "runsc-fd-parking",
+    "runsc-metric-server",
+)
 SANDBOXD_DEPLOYMENT_FILES = (
     "sandboxd.service",
     "sandboxd.toml",
@@ -76,6 +84,9 @@ def verify(directory: Path, *, enforce_host_architecture: bool = False) -> dict:
     backend_prefix = "runtime/sandboxd/"
     backend_files = {backend_prefix + name for name in (*SANDBOXD_BINARIES, "manifest.json")}
     backend_files.update(
+        backend_prefix + "gvisor-bin/" + name for name in RUNSC_HELPERS
+    )
+    backend_files.update(
         f"etc/examples/sandboxd/{name}" for name in SANDBOXD_DEPLOYMENT_FILES
     )
     backend_files.update({"lib/sandboxd_preflight.py", "runtime/sandboxd/runsc"})
@@ -122,10 +133,21 @@ def verify(directory: Path, *, enforce_host_architecture: bool = False) -> dict:
         if backend["files"] != {name: files[backend_prefix + name] for name in SANDBOXD_BINARIES}:
             raise ValueError("sandboxd file hashes differ from backend manifest")
         for name in (*SANDBOXD_BINARIES, "runsc"):
-            with (root / backend_prefix / name).open("rb") as binary:
+            executable = root / backend_prefix / name
+            with executable.open("rb") as binary:
                 header = binary.read(20)
             if header[:6] != b"\x7fELF\x02\x01" or int.from_bytes(header[18:20], "little") != machine:
                 raise ValueError(f"sandboxd executable architecture mismatch: {name}")
+            if not executable.stat().st_mode & stat.S_IXUSR:
+                raise ValueError(f"sandboxd executable is not executable: {name}")
+        for name in RUNSC_HELPERS:
+            helper = root / backend_prefix / "gvisor-bin" / name
+            if not helper.is_file() or not helper.stat().st_mode & stat.S_IXUSR:
+                raise ValueError(f"gVisor helper is missing or not executable: {name}")
+            with helper.open("rb") as binary:
+                header = binary.read(20)
+            if header[:6] != b"\x7fELF\x02\x01" or int.from_bytes(header[18:20], "little") != machine:
+                raise ValueError(f"gVisor helper architecture mismatch: {name}")
 
     commit = manifest.get("commit", "")
     if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):

@@ -742,15 +742,21 @@ Local Docker reproduction requires access to the same bind-mounted paths as the 
   Create with the public SDK without specifying a node, then check the
   persisted assignment, runtime class, command execution and resource release.
   The default two-node fixture configures only `runc`. To build a heterogeneous
-  bundle, pass `--runsc-bin /path/to/native/runsc` to `prepare.py`; its ELF
-  architecture is checked against the release and its SHA256 is recorded in
-  `bundle.json`. In Buildkite, set `ADX_E2E_RUNSC_BIN` and the independently
-  checked `ADX_E2E_RUNSC_SHA256`, set an HTTPS `ADX_E2E_RUNSC_URL` and its
-  pinned `ADX_E2E_RUNSC_SHA512`, or set an immutable
-  `ADX_E2E_RUNSC_IMAGE=registry/repository@sha256:<digest>` and the binary's
-  `ADX_E2E_RUNSC_SHA512`. The image path extracts `/runsc` from a regional OCI
-  image, verifies the binary, and avoids downloading it from GitHub on each CI
-  worker. Set exactly one of the three sources. Select
+  bundle, pass `--runsc-bin /path/to/native/runsc` to `prepare.py`, with the
+  matching `gvisor-bin/` directory beside it. Both architectures use the pinned
+  AKernel runtime kit; helper hashes, executable modes and ELF architectures
+  are verified before Docker runs, and helper identities are recorded in
+  `bundle.json`. Buildkite downloads the complete pinned kit from OBS by default.
+  To use a regional registry mirror, set `ADX_E2E_RUNSC_IMAGE` to an immutable
+  `repository@sha256:...` carrier containing `/runsc` and `/gvisor-bin/` with
+  the five matching helpers. `build/e2e/runsc_image.py` pulls the target platform,
+  copies the complete kit without running the carrier, and verifies all six
+  files against the same pinned hashes and ELF architecture as the OBS channel.
+  A launcher-only or mismatched image is rejected before building the node image.
+  `ADX_E2E_RUNSC_SHA512` optionally adds a launcher checksum check; the fixed
+  member SHA256 checks always apply. For a local kit, set `ADX_E2E_RUNSC_BIN`
+  and `ADX_E2E_RUNSC_SHA256`; local and image inputs are mutually exclusive.
+  The old single-binary `ADX_E2E_RUNSC_URL` input is rejected. Select
   `--profile full --case runtime-affinity`; the driver enables `runsc` only
   on node2 and requires live inventory, unpinned SDK creation, physical
   placement, command execution and cleanup. The OCI test image must support
@@ -944,7 +950,8 @@ contracts are assigned to the Firecracker profile. Resource observations read th
 limits and filesystem with infrastructure reservations; this fixture is not
 the production sandboxd collector.
 
-sandboxd is locked to PR #56 through `third_party/sandboxd/source.json`. A
+sandboxd is pinned by `third_party/sandboxd/source.json`; backend archives in
+`third_party/sandboxd/artifacts.json` must match that revision. A
 single-platform EXECD manifest is published within the test network (the pinned
 backend's image-index lookup defaults to AMD64). OCI storage is a child of a
 tmpfs mount to avoid nested OverlayFS depth and allow sandboxd to reset its

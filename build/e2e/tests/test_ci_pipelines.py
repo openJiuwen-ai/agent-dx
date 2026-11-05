@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import yaml
@@ -159,6 +160,87 @@ class IndependentPipelineTests(unittest.TestCase):
         self.assertIn("build/python/verify_index.py", publisher)
         self.assertNotIn("--skip-existing", publisher)
 
+    def test_invalid_runsc_sources_are_rejected_before_artifact_download(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = root / "tools"
+            tools.mkdir()
+            marker = root / "artifact-download-called"
+            artifact = tools / "buildkite-agent"
+            artifact.write_text('#!/bin/sh\ntouch "$ARTIFACT_DOWNLOAD_MARKER"\n')
+            artifact.chmod(0o755)
+            invalid_sources = (
+                {"ADX_E2E_RUNSC_URL": "https://runtime.example/runsc"},
+                {"ADX_E2E_RUNSC_IMAGE": "registry.example/runtime:latest"},
+                {"ADX_E2E_RUNSC_IMAGE": "registry.example/runtime@sha256:" + "a" * 64,
+                 "ADX_E2E_RUNSC_BIN": "/local/runsc"},
+            )
+            for sources in invalid_sources:
+                with self.subTest(sources=sources):
+                    environment = {key: value for key, value in os.environ.items() if not key.startswith("ADX_")}
+                    environment.update({
+                        "PATH": str(tools) + os.pathsep + os.environ["PATH"],
+                        "ARTIFACT_DOWNLOAD_MARKER": str(marker),
+                        **sources,
+                    })
+                    result = subprocess.run(
+                        [BASH, str(ROOT / ".buildkite/package-e2e.sh")],
+                        cwd=root, env=environment, text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("ADX_E2E_RUNSC", result.stderr)
+                    self.assertFalse(marker.exists())
+
+    def test_image_runtime_source_is_used_without_archive_download(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tools = root / "tools"
+            tools.mkdir()
+            marker = root / "image-arguments"
+            scripts = {
+                "git": '#!/bin/sh\n[ "$1" = rev-parse ] && echo fixture-commit\nexit 0\n',
+                "buildkite-agent": (
+                    "#!/bin/sh\nmkdir -p out/buildkite/package/sdk out/buildkite/sdk\n"
+                    "touch out/buildkite/package/sdk/adx_environment-fixture.whl "
+                    "out/buildkite/sdk/adx_environment-fixture.whl\n"
+                ),
+                "sha256sum": "#!/bin/sh\nexit 0\n",
+                "tar": "#!/bin/sh\nexit 0\n",
+                "docker": "#!/bin/sh\nexit 0\n",
+                "python3": (
+                    '#!/bin/sh\ncase "$1" in\n'
+                    'build/e2e/runsc_image.py) printf "%s\\n" "$@" > "$IMAGE_ARGS"; exit 37;;\n'
+                    'build/release/download_runsc.py) exit 49;;\nesac\nexit 0\n'
+                ),
+            }
+            for name, script in scripts.items():
+                path = tools / name
+                path.write_text(script)
+                path.chmod(0o755)
+            (root / ".buildkite").mkdir()
+            (root / ".buildkite/bootstrap-images.sh").write_text("# fixture bases are supplied by the caller\n")
+            image = "registry.example/runtime@sha256:" + "a" * 64
+            env = {key: value for key, value in os.environ.items() if not key.startswith(("ADX_", "BUILDKITE_"))}
+            env.update(
+                PATH=str(tools) + os.pathsep + env["PATH"], IMAGE_ARGS=str(marker),
+                ADX_WITH_AFS="1", ADX_E2E_IMAGE_REPOSITORY="fixture.invalid/adx",
+                ADX_BASE_PACKAGE_BUILD_ID="fixture-base", ADX_SDK_BUILD_ID="fixture-sdk",
+                ADX_E2E_RUNSC_IMAGE=image, BUILDKITE_COMMIT="fixture-commit",
+                ADX_COLLECTOR_IMAGE="fixture.invalid/collector@sha256:" + "b" * 64,
+                ADX_E2E_RUNTIME_BASE="fixture.invalid/base@sha256:" + "c" * 64,
+                ADX_E2E_EXECD_BASE="fixture.invalid/base@sha256:" + "c" * 64,
+            )
+            result = subprocess.run(
+                [BASH, str(ROOT / ".buildkite/package-e2e.sh")], cwd=root, env=env,
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(result.returncode, 37, result.stderr)
+            arguments = marker.read_text().splitlines()
+            self.assertEqual(arguments[arguments.index("--image") + 1], image)
+            self.assertEqual(arguments[arguments.index("--target") + 1], "x86_64-unknown-linux-gnu")
+            output = Path(arguments[arguments.index("--output") + 1])
+            self.assertTrue(output.resolve().is_relative_to((root / "out/buildkite/runtime").resolve()))
+
     def test_full_image_build_requires_explicit_base_and_sdk_builds(self):
         script = (ROOT / ".buildkite/package-e2e.sh").read_text()
         self.assertIn("ADX_BASE_PACKAGE_BUILD_ID", script)
@@ -168,10 +250,6 @@ class IndependentPipelineTests(unittest.TestCase):
         self.assertIn("--sdk-wheel", script)
         self.assertIn("--sdk-candidate", script)
         self.assertIn("ADX_E2E_ARTIFACT_COMMIT:-$BUILDKITE_COMMIT", script)
-        self.assertIn("ADX_E2E_RUNSC_URL", script)
-        self.assertIn("ADX_E2E_RUNSC_IMAGE", script)
-        self.assertIn("build/e2e/runsc_image.py", script)
-        self.assertIn("sha512sum --check", script)
 
     def test_e2e_handoff_forwards_afs_mode_and_preserves_verifier_failure(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -242,6 +320,41 @@ class IndependentPipelineTests(unittest.TestCase):
             wheel.write_bytes(b"changed")
             with self.assertRaisesRegex(ValueError, "SDK artifact"):
                 module.verify_sdk(wheel, candidate, "a" * 40)
+
+    def test_runsc_kit_stages_helpers_and_records_their_identity(self):
+        spec = importlib.util.spec_from_file_location("e2e_prepare", ROOT / "build/e2e/prepare.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "runtime"
+            source.mkdir()
+            runsc = source / "runsc"
+            elf = bytearray(64)
+            elf[:6] = b"\x7fELF\x02\x01"
+            elf[18:20] = (62).to_bytes(2, "little")
+            runsc.write_bytes(elf)
+            runsc.chmod(0o755)
+            helpers = source / "gvisor-bin"
+            helpers.mkdir()
+            names = ("checkpointgofer", "gvisor-sentry-prewarmer", "gvisor_sentry",
+                     "runsc-fd-parking", "runsc-metric-server")
+            files = {"runsc": module.sha(runsc)}
+            for name in names:
+                helper = helpers / name
+                helper.write_bytes(("verified " + name).encode())
+                helper.chmod(0o755)
+                files["gvisor-bin/" + name] = module.sha(helper)
+            destination = root / "backend"
+            destination.mkdir()
+            with mock.patch.object(module.runsc_release, "verify_runtime", return_value=files) as verify:
+                identity = module.stage_runsc(runsc, "x86_64-unknown-linux-gnu", destination)
+            verify.assert_called_once_with(runsc, "x86_64-unknown-linux-gnu")
+            self.assertEqual(identity["sha256"], files["runsc"])
+            self.assertEqual(identity["helpers"], {name: files["gvisor-bin/" + name] for name in names})
+            for name, digest in files.items():
+                self.assertEqual(module.sha(destination / name), digest)
+                self.assertTrue((destination / name).stat().st_mode & 0o100)
 
     def test_optional_runsc_binary_must_match_release_architecture(self):
         spec = importlib.util.spec_from_file_location("e2e_prepare", ROOT / "build/e2e/prepare.py")
