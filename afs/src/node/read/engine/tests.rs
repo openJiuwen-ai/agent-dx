@@ -5677,8 +5677,6 @@ impl ExternalReadAuthorizer for ExternalFixture {
             .map(|validation| {
                 let mut entry = crate::dfs::DfsExternalAuthorizedRead {
                     authorized: crate::dfs::DfsAuthorizedRead {
-                        open_sources: Vec::new(),
-
                         validation,
                         allowed_ranges: vec![(0, self.chunk.length)],
                         expires_at_unix_ms: expires_at,

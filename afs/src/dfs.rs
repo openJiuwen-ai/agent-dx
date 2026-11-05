@@ -780,6 +780,7 @@ pub enum CopyPhase {
 
 impl CopyPhase {
     /// The phase of a Meta copy record, for comparing the two authorities.
+    #[cfg(test)]
     pub fn of_meta(role: CopyRole, state: CopyState) -> Self {
         match (state, role) {
             (CopyState::Reserved0, _) => Self::Staged,
@@ -983,7 +984,6 @@ pub struct DfsMissingReadSource {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DfsAuthorizedRead {
-    pub open_sources: Vec<u8>,
     pub validation: DfsReadValidation,
     pub allowed_ranges: Vec<(u64, u64)>,
     pub expires_at_unix_ms: u64,

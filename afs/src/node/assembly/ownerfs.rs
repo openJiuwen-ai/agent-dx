@@ -131,11 +131,7 @@ pub(super) async fn assemble(
         let recovery_disk = disk.clone();
         let recovery_node_id = cfg.id.clone();
         let recovery_session_id = session_id.clone();
-        let owner_data_mode = match cfg.data_mode.as_str() {
-            "grpc" => rpc::peer::DataMode::Grpc,
-            "rdma" => rpc::peer::DataMode::Rdma,
-            _ => rpc::peer::DataMode::Auto,
-        };
+        let owner_data_mode = cfg.data_mode;
         if owner_data_mode == rpc::peer::DataMode::Rdma && cfg.rdma_device.is_none() {
             return Err(afs_error::Error::coded(
                 afs_error::CONFIG_INVALID,

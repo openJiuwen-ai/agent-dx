@@ -73,20 +73,10 @@ fn meta_capability_invalid_inode_keeps_local_failure_order() {
 #[derive(Default)]
 struct Pr88GcControl {
     captures: AtomicUsize,
-    unfenced_publications: AtomicUsize,
 }
 
 impl crate::node::gc::GcControl for Pr88GcControl {
-    fn retain(
-        &self,
-        _: &str,
-        _: &InodeId,
-        _: Option<&FileVersionId>,
-        publication: bool,
-    ) -> Result<()> {
-        if publication {
-            self.unfenced_publications.fetch_add(1, Ordering::SeqCst);
-        }
+    fn retain(&self, _: &str, _: &InodeId, _: Option<&FileVersionId>) -> Result<()> {
         Ok(())
     }
     fn retain_fenced(
@@ -99,9 +89,6 @@ impl crate::node::gc::GcControl for Pr88GcControl {
         Ok(crate::dfs::GcFence::WriteGeneration)
     }
     fn release(&self, _: &str) -> Result<()> {
-        Ok(())
-    }
-    fn reserve_publication(&self, _: &OperationId, _: Vec<ChunkObject>) -> Result<()> {
         Ok(())
     }
     fn collect(&self, _: u64, _: Vec<ChunkObject>) -> Result<crate::dfs::GcState> {
@@ -157,7 +144,6 @@ fn pr88_fix_crc32c_meta_resize_after_fullsync_keeps_fence() {
     assert_eq!(commits.last().unwrap().file_version.length, 70001);
     drop(commits);
     assert_eq!(control.captures.load(Ordering::SeqCst), 3);
-    assert_eq!(control.unfenced_publications.load(Ordering::SeqCst), 0);
     fs.release(&context(), file.handle).unwrap();
     references.flush().unwrap();
 }

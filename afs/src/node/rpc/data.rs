@@ -79,15 +79,15 @@ mod dfs_range_stream;
 mod dfs_read_authz;
 #[cfg(feature = "dfs")]
 mod dfs_replica_authz;
-#[cfg(all(feature = "dfs", test))]
-pub use dfs_chunks::make_dfs_chunks_server;
 #[cfg(feature = "dfs")]
 use dfs_chunks::*;
 #[cfg(feature = "dfs")]
 pub use dfs_chunks::{
     DfsChunkTransportResources, DfsChunksService, DfsPayloadMetrics,
-    make_dfs_chunks_server_with_replication, make_dfs_chunks_server_with_transport,
+    make_dfs_chunks_server_with_transport,
 };
+#[cfg(all(feature = "dfs", test))]
+pub use dfs_chunks::{make_dfs_chunks_server, make_dfs_chunks_server_with_replication};
 #[cfg(feature = "dfs")]
 pub use dfs_owner::{DfsOwnerFilesService, make_dfs_owner_files_server};
 #[cfg(feature = "dfs")]

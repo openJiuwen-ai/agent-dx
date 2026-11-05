@@ -102,8 +102,6 @@ fn external_authorization_wire_rejects_node_receiver_and_changed_object_key() {
     let key = crate::dfs::external_object_key("filesystem", "g1", &chunk_id).unwrap();
     let valid = afs_protocol::meta::DfsExternalAuthorizedRead {
         authorized: Some(afs_protocol::meta::DfsAuthorizedRead {
-            open_sources: Vec::new(),
-
             validation: Some(afs_protocol::meta::DfsReadValidation {
                 grant: Some(afs_protocol::meta::DfsReadGrant::default()),
                 chunk_id: chunk_id.0.clone(),
@@ -180,8 +178,6 @@ fn current_read_authorization() -> afs_protocol::meta::DfsExternalAuthorizedRead
     let key = crate::dfs::external_object_key("filesystem", "g1", &chunk_id).unwrap();
     afs_protocol::meta::DfsExternalAuthorizedRead {
         authorized: Some(afs_protocol::meta::DfsAuthorizedRead {
-            open_sources: Vec::new(),
-
             validation: Some(afs_protocol::meta::DfsReadValidation {
                 grant: Some(afs_protocol::meta::DfsReadGrant::default()),
                 chunk_id: chunk_id.0.clone(),

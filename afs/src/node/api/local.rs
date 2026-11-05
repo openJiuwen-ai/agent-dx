@@ -13,6 +13,9 @@
 //! 读取 E2E：node 从 Storage 读 bytes -> 通过 target grant 取 fd -> `write_fd_at`
 //! copy 到 SDK memfd -> SDK 再本地读取。
 //!
+//! `serve_local_api` 只供集成测试和 `tools/` 探针使用（集成测试链接产品库时没有
+//! `cfg(test)`，所以留在产品代码里）；Node 装配走 `serve_local_api_with_options`。
+//!
 //! 当前安全边界是 trusted local host：UDS socket 权限 + 一次性 token/TTL/会话标识
 //! 限制同机误用；它不是跨主机认证授权系统。
 
@@ -575,8 +578,8 @@ impl DfsLocalData for DfsLocalDataService {
 
 /// 在阻塞线程上执行一次会阻塞的工作。
 ///
-/// 注意它**不能**用来调用后端：`GrpcDfsMeta` 用 `Handle::block_on`，而 `spawn_blocking` 的线程
-/// 仍带 runtime 上下文，照样 panic。后端调用一律走 [`UsrbioHub::executor`]。
+/// `spawn_blocking` 线程上允许 `block_on`（见 `crate::node::bridge`）；后端调用按约定走
+/// [`UsrbioHub::executor`]。
 async fn blocking<T, F>(work: F) -> Result<T, Status>
 where
     F: FnOnce() -> Result<T, afs_error::Error> + Send + 'static,

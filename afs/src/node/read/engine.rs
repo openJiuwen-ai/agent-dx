@@ -434,7 +434,7 @@ pub trait ChunkTransfer: Send + Sync {
     }
 
     /// Speculative reads never wait for transport admission and never use the
-    /// legacy complete-body fallback. The default starts no RPC.
+    /// full-body fill fallback. The default starts no RPC.
     fn try_read_verified_object_to_sink<'output>(
         &self,
         _batch: &PeerReadBatch,
@@ -638,7 +638,7 @@ impl DfsReadEngine {
             config,
             external_backend: None,
             peer_cache: None,
-            read_authority: Arc::new(LocalReadAuthority::unbounded_for_tests_and_legacy()),
+            read_authority: Arc::new(LocalReadAuthority::unbounded_unknown_epoch()),
             readers: Mutex::new(BoundedLru::new(MAX_PINNED_READERS)),
             #[cfg(test)]
             test_hooks: ReadEngineTestHooks::default(),

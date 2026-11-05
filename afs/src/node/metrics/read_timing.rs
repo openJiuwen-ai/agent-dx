@@ -113,7 +113,7 @@ pub(crate) struct ReadDiagnosticConsumerWork {
     /// fallback; bytes/calls are attempts, not successful disk syscalls or fsync.
     pub(crate) sink_write: ReadDiagnosticWork,
     pub(crate) range_extract: ReadDiagnosticWork,
-    /// Whole-root work on legacy synchronous decode only; native pipeline uses
+    /// Whole-root work on the synchronous decode only; native pipeline uses
     /// producer_root_work instead and keeps this field zero.
     pub(crate) root_blake3: ReadDiagnosticWork,
     pub(crate) segment_blake3: ReadDiagnosticWork,

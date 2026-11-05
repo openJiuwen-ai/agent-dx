@@ -292,11 +292,19 @@ fn generation_chunk(operation: &str, suffix: char) -> MetaEntity {
     MetaEntity::DfsChunk(staged.chunk)
 }
 
+/// The persisted id of an admitted write generation (see `update_gc_reference`).
+fn write_reference(operation: &str) -> String {
+    format!(
+        "write:{}",
+        ChunkObject::generation_id(&OperationId::new(operation))
+    )
+}
+
 #[test]
 fn generation_reference_protects_unregistered_inventory_on_all_replicas() {
     let mut reference = pin("writer");
     reference.publication = true;
-    reference.reference_id = "publish:generation-A".into();
+    reference.reference_id = write_reference("generation-A");
     let entities = vec![
         generation_chunk("generation-A", 'a'),
         generation_chunk("generation-A", 'b'),
@@ -312,7 +320,7 @@ fn generation_reference_protects_unregistered_inventory_on_all_replicas() {
 fn generation_reference_does_not_protect_another_write() {
     let mut reference = pin("writer");
     reference.publication = true;
-    reference.reference_id = "publish:generation-A".into();
+    reference.reference_id = write_reference("generation-A");
     let a = generation_chunk("generation-A", 'a');
     let b = generation_chunk("generation-B", 'b');
     let MetaEntity::DfsChunk(expected) = &b else {
@@ -326,25 +334,6 @@ fn generation_reference_does_not_protect_another_write() {
     );
 }
 
-#[test]
-fn active_publication_retains_uploaded_but_uncommitted_chunks() {
-    let entities = vec![chunk("pending")];
-    let mut reference = pin("writer");
-    reference.publication = true;
-    let MetaEntity::DfsChunk(value) = chunk("pending") else {
-        unreachable!()
-    };
-    reference.chunks.push(value);
-    assert!(
-        plan_collection(&entities, &[reference], 100, 10)
-            .chunks
-            .is_empty()
-    );
-    assert_eq!(
-        plan_collection(&entities, &[], 100, 10).chunks,
-        vec![ChunkId::new("pending")]
-    );
-}
 async fn seeded_store(
     entities: Vec<MetaEntity>,
 ) -> (
@@ -399,7 +388,6 @@ fn update(id: &str) -> UpdateGcReference {
         inode_id: Some(InodeId::new("i")),
         version_id: None,
         publication: true,
-        chunks: vec![],
         release: false,
         admission_deadline_unix_ms: now_unix_ms().saturating_add(30_000),
     }
@@ -416,67 +404,6 @@ fn pending_reference(id: &str) -> MetaEntity {
         chunks: vec![],
         retired_at_unix_ms: None,
     })
-}
-#[tokio::test]
-async fn concurrent_publication_reservations_keep_every_chunk_without_retry_exhaustion() {
-    let (store, _) = seeded_store(vec![inode("i", 1, "v")]).await;
-    let service = DfsService::new(store.clone());
-    service
-        .update_gc_reference(update("publish:parallel"))
-        .await
-        .unwrap();
-    let start = Arc::new(tokio::sync::Barrier::new(256));
-    let mut tasks = tokio::task::JoinSet::new();
-    for index in 0..256 {
-        let service = service.clone();
-        let start = start.clone();
-        tasks.spawn(async move {
-            let bytes = format!("parallel-{index}");
-            let chunk = ChunkObject::from_content_addressed_id(&ChunkId::new(format!(
-                "blake3-{}-{}",
-                blake3::hash(bytes.as_bytes()).to_hex(),
-                bytes.len()
-            )))
-            .unwrap();
-            let mut reservation = update("publish:parallel");
-            reservation.inode_id = None;
-            reservation.chunks = vec![chunk];
-            start.wait().await;
-            service.update_gc_reference(reservation).await
-        });
-    }
-    let mut errors = Vec::new();
-    while let Some(result) = tasks.join_next().await {
-        if let Err(error) = result.unwrap() {
-            errors.push(error.to_string());
-        }
-    }
-    assert!(
-        errors.is_empty(),
-        "{} publication reservations failed; first: {:?}",
-        errors.len(),
-        errors.first()
-    );
-    let reference = store
-        .read_view()
-        .await
-        .unwrap()
-        .lookup(&ref_key("n", "s", "publish:parallel"))
-        .unwrap();
-    let Some(MetaEntity::DfsReference(reference)) = reference.entity else {
-        panic!("publication protection missing");
-    };
-    assert_eq!(reference.chunks.len(), 256);
-    assert_eq!(
-        reference
-            .chunks
-            .iter()
-            .map(|chunk| &chunk.id)
-            .collect::<BTreeSet<_>>()
-            .len(),
-        256,
-        "every distinct uploaded chunk must remain protected"
-    );
 }
 fn admission_conditions(view: &crate::meta::store::MetaReadView, id: &str) -> Vec<TxnCondition> {
     let mut conditions = vec![TxnCondition::NodeSessionCurrent {
@@ -585,38 +512,6 @@ async fn reference_conditions_reject_release_collection_and_session_fences() {
     }
 }
 #[tokio::test]
-async fn publication_conditions_reject_reserved_chunk_reclamation() {
-    let object = canonical_chunk();
-    let (store, _) = seeded_store(vec![
-        inode("i", 1, "v"),
-        MetaEntity::DfsChunk(object.clone()),
-    ])
-    .await;
-    let service = DfsService::new(store.clone()).with_gc_grace_ms(0);
-    let view = store.read_view().await.unwrap();
-    let mut conditions = admission_conditions(&view, "publication");
-    reference_entity(&view, MetaKey::DfsChunk(object.id.clone()), &mut conditions).unwrap();
-    let barrier = service
-        .collect_garbage("n".into(), "s".into(), 0, vec![])
-        .await
-        .unwrap();
-    assert!(barrier.chunks.contains(&object.id));
-    let mut reference = pending_reference("publication");
-    if let MetaEntity::DfsReference(value) = &mut reference {
-        value.chunks.push(object);
-    }
-    assert!(
-        !service
-            .gc_commit_checked(
-                conditions,
-                StoreOperation::DfsUpdateReference,
-                vec![TxnMutation::Put(reference)]
-            )
-            .await
-            .unwrap()
-    );
-}
-#[tokio::test]
 async fn reference_admission_requires_its_inode_version_and_current_session() {
     let mut entities = vec![inode("i", 1, "v")];
     entities.extend(version("v", "another-inode", "chunk"));
@@ -668,32 +563,17 @@ async fn reference_admission_requires_its_inode_version_and_current_session() {
     }
 }
 #[tokio::test]
-async fn publication_and_lost_gc_ack_are_fenced_across_meta_reopen() {
+async fn lost_gc_ack_is_fenced_across_meta_reopen() {
     use crate::meta::store::Store;
     let chunk = canonical_chunk();
-    let (store, backend) = seeded_store(vec![inode("i", 1, "v")]).await;
+    let (store, backend) = seeded_store(vec![
+        inode("i", 1, "v"),
+        MetaEntity::DfsChunk(chunk.clone()),
+    ])
+    .await;
     let service =
         DfsService::with_replication_config(store.clone(), ReplicationConfig::local_single_copy())
             .with_gc_grace_ms(0);
-    service
-        .update_gc_reference(update("publish:p"))
-        .await
-        .unwrap();
-    let mut reserve = update("publish:p");
-    reserve.inode_id = None;
-    reserve.chunks = vec![chunk.clone()];
-    service.update_gc_reference(reserve.clone()).await.unwrap();
-    assert!(
-        service
-            .collect_garbage("n".into(), "s".into(), 0, vec![chunk.clone()])
-            .await
-            .unwrap()
-            .chunks
-            .is_empty()
-    );
-    let mut release = update("publish:p");
-    release.release = true;
-    service.update_gc_reference(release).await.unwrap();
     let ticket = service
         .collect_garbage("n".into(), "s".into(), 0, vec![chunk.clone()])
         .await
@@ -706,19 +586,6 @@ async fn publication_and_lost_gc_ack_are_fenced_across_meta_reopen() {
     let service =
         DfsService::with_replication_config(reopened, ReplicationConfig::local_single_copy())
             .with_gc_grace_ms(0);
-    service
-        .update_gc_reference(update("publish:new"))
-        .await
-        .unwrap();
-    reserve.reference_id = "publish:new".into();
-    assert_eq!(
-        service
-            .update_gc_reference(reserve.clone())
-            .await
-            .unwrap_err()
-            .code(),
-        afs_error::META_DFS_GC_BUSY
-    );
     let repeated = service
         .collect_garbage("n".into(), "s".into(), 0, vec![])
         .await
@@ -733,7 +600,6 @@ async fn publication_and_lost_gc_ack_are_fenced_across_meta_reopen() {
         .collect_garbage("n".into(), "s".into(), ticket.generation, vec![])
         .await
         .unwrap();
-    service.update_gc_reference(reserve).await.unwrap();
 }
 #[tokio::test]
 async fn session_replacement_retires_only_fenced_refs_after_the_old_authority_deadline() {
@@ -741,7 +607,6 @@ async fn session_replacement_retires_only_fenced_refs_after_the_old_authority_de
     let mut reference = pin("i");
     reference.node_id = "n".into();
     reference.session_id = "old".into();
-    reference.chunks = vec![chunk.clone()];
     let deadline = now_unix_ms() + 30_000;
     let old = MetaEntity::NodeSession(NodeSession {
         node_id: "n".into(),
@@ -754,13 +619,15 @@ async fn session_replacement_retires_only_fenced_refs_after_the_old_authority_de
         lease_epoch: 0,
         expires_at_unix_ms: deadline,
     });
-    let (store, _) = seeded_store(vec![
+    let mut entities = vec![
         inode("i", 0, "v"),
         MetaEntity::DfsChunk(chunk.clone()),
         MetaEntity::DfsReference(reference),
         old,
-    ])
-    .await;
+    ];
+    // The reference protects the unlinked inode, its head and that chunk.
+    entities.extend(version("v", "i", &chunk.id.0));
+    let (store, _) = seeded_store(entities).await;
     let service = DfsService::new(store.clone());
     let ticket = service
         .collect_garbage("n".into(), "s".into(), 0, vec![])
@@ -802,12 +669,9 @@ async fn session_replacement_retires_only_fenced_refs_after_the_old_authority_de
 }
 #[test]
 fn heartbeat_expiry_without_session_replacement_never_retires_an_open_reader() {
-    let mut reference = pin("i");
-    let MetaEntity::DfsChunk(object) = chunk("live") else {
-        unreachable!()
-    };
-    reference.chunks = vec![object];
-    let entities = vec![inode("i", 0, "v"), chunk("live")];
+    let reference = pin("i");
+    let mut entities = vec![inode("i", 0, "v"), chunk("live")];
+    entities.extend(version("v", "i", "live"));
     assert!(
         plan_collection(&entities, &[reference], u64::MAX - 60_000, 60_000)
             .chunks
@@ -872,11 +736,10 @@ async fn active_publication_outlives_admission_but_cannot_change_identity() {
     invalid.admission_deadline_unix_ms = now_unix_ms() + 120_000;
     assert!(service.update_gc_reference(invalid).await.is_err());
     service.update_gc_reference(update("writer")).await.unwrap();
-    let mut chunks = update("writer");
-    chunks.inode_id = None;
-    chunks.admission_deadline_unix_ms = 0;
-    chunks.chunks = vec![canonical_chunk()];
-    service.update_gc_reference(chunks).await.unwrap();
+    let mut refresh = update("writer");
+    refresh.inode_id = None;
+    refresh.admission_deadline_unix_ms = 0;
+    service.update_gc_reference(refresh).await.unwrap();
     let mut reused = update("writer");
     reused.inode_id = Some(InodeId::new("different"));
     assert!(service.update_gc_reference(reused).await.is_err());

@@ -1,4 +1,7 @@
 //! Meta connection errors, ping and node registration.
+//!
+//! `registration_readiness_from_reply` is an integration-test entry for
+//! `tests/meta_health_capability.rs`; registration itself calls the `_at` form.
 
 use super::*;
 

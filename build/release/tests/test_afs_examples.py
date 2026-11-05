@@ -24,7 +24,7 @@ class AfsExampleTests(unittest.TestCase):
                 "tls_server_name": "afs-cluster",
             }
             if name == "node":
-                expected.update(meta_endpoint="https://127.0.0.1:7400", peer_endpoint="https://127.0.0.1:7500")
+                expected.update(meta_endpoint="https://127.0.0.1:7400")
             for field, value in expected.items():
                 self.assertIn(f'{field} = "{value}"', lines)
             self.assertIn('[trusted_node_certs]\nnode-a = "/opt/adx/config/afs/tls/node-a.pem"', text)

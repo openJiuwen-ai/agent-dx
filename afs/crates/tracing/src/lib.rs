@@ -16,8 +16,7 @@ mod server;
 
 pub use config::{ProcessIdentity, TracingConfig, TracingError};
 pub use context::{
-    TraceContext, TraceCorrelation, capture_current_context, current_correlation, current_exemplar,
-    record_ok, set_parent,
+    TraceContext, TraceCorrelation, capture_current_context, current_correlation, set_parent,
 };
 pub use grpc::{
     TraceContextInterceptor, TracedChannel, extract_remote_context, inject_current_context,

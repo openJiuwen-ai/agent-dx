@@ -563,8 +563,6 @@ impl DfsService {
             };
             return Ok(crate::dfs::DfsExternalAuthorizedRead {
                 authorized: crate::dfs::DfsAuthorizedRead {
-                    open_sources: Vec::new(),
-
                     validation: crate::dfs::DfsReadValidation {
                         grant,
                         chunk_id: missing.chunk_id.clone(),
@@ -682,8 +680,6 @@ impl DfsService {
             };
             result.push(crate::dfs::DfsExternalAuthorizedRead {
                 authorized: crate::dfs::DfsAuthorizedRead {
-                    open_sources: Vec::new(),
-
                     expires_at_unix_ms: now
                         .saturating_add(5_000)
                         .min(grant.expires_at_unix_ms)
@@ -838,8 +834,6 @@ impl DfsService {
                 .min(caller.expires_at_unix_ms)
                 .min(receiver.expires_at_unix_ms);
             result.push(crate::dfs::DfsAuthorizedRead {
-                open_sources: Vec::new(),
-
                 validation,
                 allowed_ranges,
                 expires_at_unix_ms,

@@ -1,10 +1,15 @@
 //! Node readiness behind `/v1/ready`: Meta registration state, mount
 //! identities and the data-device / RDMA resource observations, plus the
 //! sampler (`ReadinessSampler`, T1) that keeps those observations fresh.
+//!
+//! Integration-test entries, compiled in because integration tests link the
+//! product library without `cfg(test)`: `note_registration_success` and the
+//! `*_for_tests` methods, used only by `tests/node_health_contract.rs`.
 
 #[cfg(any(feature = "ownerfs", feature = "dfs"))]
 use super::fuse;
 use super::rpc;
+use crate::config::DataMode;
 use crate::runtime::{Services, cancelled};
 use rpc::meta::{MetaPersistenceCapability, NodeRegistrationReadiness};
 use std::{
@@ -276,7 +281,7 @@ impl NodeReadiness {
         registered_at: Option<Instant>,
         ownerfs_mount: Option<PathBuf>,
         dfs_mount: Option<PathBuf>,
-        data_mode: &str,
+        data_mode: DataMode,
         rdma_device: Option<&str>,
     ) -> Self {
         Self::new_with_mount_identities(
@@ -296,10 +301,10 @@ impl NodeReadiness {
         registered_at: Option<Instant>,
         ownerfs_mount: Option<AfsMountIdentity>,
         dfs_mount: Option<AfsMountIdentity>,
-        data_mode: &str,
+        data_mode: DataMode,
         rdma_device: Option<&str>,
     ) -> Self {
-        let rdma_required = data_mode == "rdma";
+        let rdma_required = data_mode == DataMode::Rdma;
         let rdma_configured = rdma_device.is_some();
         Self {
             meta_required,

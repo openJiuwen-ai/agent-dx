@@ -1,4 +1,3 @@
-use afs_metrics::MetricExemplar;
 use opentelemetry::{
     Context,
     trace::{SpanContext, TraceContextExt},
@@ -61,24 +60,12 @@ pub fn current_correlation() -> Option<TraceCorrelation> {
     })
 }
 
-#[must_use]
-pub fn current_exemplar() -> Option<MetricExemplar> {
-    let context = current_otel_context();
-    let span = context.span();
-    let span_context = span.span_context();
-    valid_sampled(span_context).then(|| MetricExemplar::new(span_context.trace_id().to_bytes()))
-}
-
 /// Makes an extracted remote or mailbox Context the parent of a new span.
 pub fn set_parent(span: &tracing::Span, parent: &TraceContext) {
     // No OpenTelemetry layer is a supported SDK-host configuration. In that
     // case `set_parent` reports that no OTel extension exists and tracing stays
     // a no-op; business execution must continue.
     let _ = span.set_parent(parent.0.clone());
-}
-
-pub fn record_ok(span: &tracing::Span) {
-    span.record("result", "ok");
 }
 
 fn current_otel_context() -> Context {
@@ -99,8 +86,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn no_subscriber_means_no_correlation_or_exemplar() {
+    fn no_subscriber_means_no_correlation() {
         assert_eq!(current_correlation(), None);
-        assert_eq!(current_exemplar(), None);
     }
 }

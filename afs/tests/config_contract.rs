@@ -1,5 +1,5 @@
-use afs::config::{Cli, Config, MetaStoreBackend, Role};
-use clap::Parser;
+use afs::config::{Cli, Config, DataMode, DfsLocalCopy, MetaStoreBackend, Role};
+use clap::{CommandFactory, Parser};
 
 #[test]
 fn p2_w2_native_write_limits_use_cli_file_defaults_and_bounded_resources() {
@@ -502,11 +502,10 @@ fn shipped_examples_resolve_with_mutual_tls_and_node_identity_binding() {
             .starts_with("https://")
     );
     assert!(
-        node.peer_endpoint
-            .as_deref()
-            .unwrap()
-            .starts_with("https://")
+        node.non_product_options().is_empty(),
+        "the shipped examples must not start with test-only or diagnostic options"
     );
+    assert!(meta.non_product_options().is_empty());
     for tls in [meta.tls_config(), node.tls_config()] {
         assert!(matches!(
             tls,
@@ -2003,5 +2002,136 @@ fn tls_encryption_cli_file_precedence_and_identity_are_independent() {
             Cli::parse_from(["afs", "--tls-encryption-enabled", "true"])
         )
         .is_err()
+    );
+}
+
+fn resolve_toml(role: Role, body: &str) -> afs_error::Result<Config> {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    std::fs::write(&path, body).unwrap();
+    Config::resolve(
+        role,
+        Cli::parse_from(["afs", "--config", path.to_str().unwrap()]),
+    )
+}
+
+#[test]
+fn data_mode_keeps_its_toml_cli_and_printed_names() {
+    let auto = resolve_toml(Role::Meta, "data_mode = 'auto'\n").unwrap();
+    assert_eq!(auto.data_mode, DataMode::Auto);
+    assert_eq!(serde_json::to_value(&auto).unwrap()["data_mode"], "auto");
+    let grpc = Config::resolve(Role::Meta, Cli::parse_from(["afs", "--data-mode", "grpc"]));
+    assert_eq!(grpc.unwrap().data_mode, DataMode::Grpc);
+    let default = Config::resolve(Role::Meta, Cli::default()).unwrap();
+    assert_eq!(serde_json::to_value(default).unwrap()["data_mode"], "grpc");
+
+    let rdma = Cli::parse_from(["afs", "--data-mode", "rdma"]);
+    assert_eq!(rdma.data_mode, Some(DataMode::Rdma));
+    let resolved = Config::resolve(Role::Meta, rdma);
+    if cfg!(feature = "rdma") {
+        assert_eq!(resolved.unwrap().data_mode, DataMode::Rdma);
+    } else {
+        assert_eq!(resolved.unwrap_err().code(), afs_error::CONFIG_INVALID);
+    }
+
+    let error = resolve_toml(Role::Meta, "data_mode = 'tcp'\n").unwrap_err();
+    assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+    assert!(
+        error
+            .to_string()
+            .contains("expected one of `grpc`, `rdma`, `auto`"),
+        "{error}"
+    );
+    let error = Cli::try_parse_from(["afs", "--data-mode", "tcp"]).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("[possible values: grpc, rdma, auto]"),
+        "{error}"
+    );
+}
+
+#[test]
+fn dfs_local_copy_keeps_its_toml_cli_and_printed_names() {
+    for (name, value) in [
+        ("required", DfsLocalCopy::Required),
+        ("preferred", DfsLocalCopy::Preferred),
+        ("none", DfsLocalCopy::None),
+    ] {
+        let file = resolve_toml(Role::Meta, &format!("dfs_local_copy = '{name}'\n")).unwrap();
+        assert_eq!(file.dfs_local_copy, value);
+        assert_eq!(serde_json::to_value(&file).unwrap()["dfs_local_copy"], name);
+        let cli = Cli::parse_from(["afs", "--dfs-local-copy", name]);
+        assert_eq!(
+            Config::resolve(Role::Meta, cli).unwrap().dfs_local_copy,
+            value
+        );
+    }
+    let default = Config::resolve(Role::Meta, Cli::default()).unwrap();
+    assert_eq!(default.dfs_local_copy, DfsLocalCopy::Required);
+
+    let error = resolve_toml(Role::Meta, "dfs_local_copy = 'always'\n").unwrap_err();
+    assert_eq!(error.code(), afs_error::CONFIG_INVALID);
+    assert!(
+        error
+            .to_string()
+            .contains("expected one of `required`, `preferred`, `none`"),
+        "{error}"
+    );
+    let error = Cli::try_parse_from(["afs", "--dfs-local-copy", "always"]).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("[possible values: required, preferred, none]"),
+        "{error}"
+    );
+}
+
+#[test]
+fn test_only_and_diagnostic_flags_are_accepted_but_hidden_from_help() {
+    let mut command = Cli::command();
+    let help = command.render_long_help().to_string();
+    for flag in [
+        "allow-volatile-meta",
+        "peer-endpoint",
+        "dfs-read-diagnostics-enabled",
+    ] {
+        assert!(!help.contains(flag), "--{flag} must not be in --help");
+    }
+    assert!(help.contains("--meta-store"));
+    let cli = Cli::parse_from([
+        "afs",
+        "--allow-volatile-meta",
+        "true",
+        "--peer-endpoint",
+        "https://127.0.0.1:7500",
+        "--dfs-read-diagnostics-enabled",
+        "true",
+    ]);
+    assert_eq!(cli.allow_volatile_meta, Some(true));
+    assert_eq!(cli.peer_endpoint.as_deref(), Some("https://127.0.0.1:7500"));
+    assert_eq!(cli.dfs_read_diagnostics_enabled, Some(true));
+}
+
+#[test]
+fn non_product_options_report_exactly_what_is_enabled() {
+    let default = Config::resolve(Role::Meta, Cli::default()).unwrap();
+    assert!(default.non_product_options().is_empty());
+    let enabled = resolve_toml(
+        Role::Meta,
+        "allow_volatile_meta = true\npeer_endpoint = 'https://127.0.0.1:7500'\n\
+         dfs_read_diagnostics_enabled = true\nfs = 'dfs'\n\
+         [dfs_external_backend]\nstore_id = 's'\ngeneration = '1'\n\
+         endpoint = 'http://127.0.0.1:8333'\nbucket = 'b'\nregion = 'r'\nallow_http = true\n",
+    )
+    .unwrap();
+    assert_eq!(
+        enabled.non_product_options(),
+        [
+            ("allow_volatile_meta", "test-only"),
+            ("dfs_external_backend.allow_http", "test-only"),
+            ("peer_endpoint", "diagnostic"),
+            ("dfs_read_diagnostics_enabled", "diagnostic"),
+        ]
     );
 }

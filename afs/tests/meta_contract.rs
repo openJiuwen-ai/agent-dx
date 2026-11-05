@@ -304,6 +304,19 @@ async fn dfs_gc_fence_capture_requires_a_write_reference_before_any_mutation() {
             .is_err(),
         "a rejected capture must not retain a reference"
     );
+    // Per-chunk publication references were removed; Meta refuses chunk lists.
+    let mut with_chunks = capture(&format!(
+        "write:{}",
+        afs::clock::timed_request_id("with-chunks")
+    ));
+    with_chunks.chunks = vec![Default::default()];
+    assert_eq!(
+        rpc.update_gc_reference(Request::new(with_chunks))
+            .await
+            .unwrap_err()
+            .code(),
+        Code::InvalidArgument
+    );
     let reply = rpc
         .update_gc_reference(Request::new(capture(&format!(
             "write:{}",
@@ -2657,25 +2670,22 @@ async fn p3_supported_commit_shapes_survive_local_log_reopen() {
             panic!("expected one domain decision");
         };
         let facts = decision.facts().unwrap();
-        // Publishing also releases the in-flight GC reference atomically.
-        let expected_changes = 4 + chunks * (2 + usize::from(copies));
+        // Inode, version and layout, plus each chunk's placement and copies.
+        // An unfenced commit no longer deletes a per-chunk `publish:` reference.
+        let expected_changes = 3 + chunks * (2 + usize::from(copies));
         assert_eq!(facts.events.len(), expected_changes);
-        assert_eq!(
-            facts
+        assert!(
+            !facts
                 .events
                 .iter()
-                .filter(|event| {
-                    matches!(event.key, afs::meta::store::MetaKey::DfsReference { .. })
-                        && matches!(event.change, afs::meta::store::WatchChange::Delete)
-                })
-                .count(),
-            1
+                .any(|event| matches!(event.key, afs::meta::store::MetaKey::DfsReference { .. }))
         );
         assert_eq!(facts.outcomes.len(), 1);
-        let record_bytes = decision
-            .encode(afs::meta::store::local_log::LocalLogOptions::default().record_max_bytes)
-            .unwrap()
-            .len();
+        let record_bytes = postcard::to_allocvec(decision).unwrap().len();
+        assert!(
+            record_bytes
+                <= afs::meta::store::local_log::LocalLogOptions::default().record_max_bytes
+        );
         let expected_inode = store
             .read(MetaRead::DfsInode(inode_id.clone()))
             .await

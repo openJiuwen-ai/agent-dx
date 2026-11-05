@@ -220,7 +220,7 @@ fn native_generation_retains_gc_reference_through_upload_and_publication() {
         active: Mutex<HashSet<String>>,
     }
     impl crate::node::gc::GcControl for Control {
-        fn retain(&self, id: &str, _: &InodeId, _: Option<&FileVersionId>, _: bool) -> Result<()> {
+        fn retain(&self, id: &str, _: &InodeId, _: Option<&FileVersionId>) -> Result<()> {
             self.active.lock().unwrap().insert(id.into());
             Ok(())
         }
@@ -235,9 +235,6 @@ fn native_generation_retains_gc_reference_through_upload_and_publication() {
         }
         fn release(&self, id: &str) -> Result<()> {
             self.active.lock().unwrap().remove(id);
-            Ok(())
-        }
-        fn reserve_publication(&self, _: &OperationId, _: Vec<ChunkObject>) -> Result<()> {
             Ok(())
         }
         fn collect(&self, _: u64, _: Vec<ChunkObject>) -> Result<crate::dfs::GcState> {

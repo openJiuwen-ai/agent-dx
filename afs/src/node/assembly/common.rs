@@ -509,7 +509,7 @@ pub(super) fn node_state(
         registered_node_at,
         ownerfs_mount_identity,
         dfs_mount_identity,
-        &cfg.data_mode,
+        cfg.data_mode,
         cfg.rdma_device.as_deref(),
     ));
     readiness.set_allow_volatile_meta(cfg.allow_volatile_meta);

@@ -250,7 +250,6 @@ impl GrpcDfsMeta {
                                 .map(|range| (range.offset, range.length))
                                 .collect(),
                             expires_at_unix_ms: entry.expires_at_unix_ms,
-                            open_sources: entry.open_sources,
                         })
                     })
                     .collect()

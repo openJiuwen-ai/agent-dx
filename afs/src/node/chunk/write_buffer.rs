@@ -256,23 +256,17 @@ impl WriteBufferPool {
         drop(idle);
     }
 
+    #[cfg(test)]
     fn checkout(self: &Arc<Self>, capacity: usize) -> Result<ChunkBuffer> {
-        #[cfg(any(feature = "dfs", test))]
-        {
-            self.checkout_with_native_lease(capacity, None)
-        }
-        #[cfg(not(any(feature = "dfs", test)))]
-        {
-            self.checkout_with_native_lease(capacity)
-        }
+        self.checkout_with_native_lease(capacity, None)
     }
 
+    #[cfg(any(feature = "dfs", test))]
     fn checkout_with_native_lease(
         self: &Arc<Self>,
         capacity: usize,
-        #[cfg(any(feature = "dfs", test))] mut native_live_lease: Option<DirtyLease>,
+        mut native_live_lease: Option<DirtyLease>,
     ) -> Result<ChunkBuffer> {
-        #[cfg(any(feature = "dfs", test))]
         if native_live_lease
             .as_ref()
             .is_some_and(|lease| lease.charged_bytes() < capacity)
@@ -296,18 +290,9 @@ impl WriteBufferPool {
                     .filter(|(_, bytes)| {
                         bytes.capacity() >= capacity
                             && bytes.capacity() < capacity.saturating_mul(2)
-                            && {
-                                #[cfg(any(feature = "dfs", test))]
-                                {
-                                    native_live_lease.as_ref().is_none_or(|lease| {
-                                        bytes.capacity() <= lease.charged_bytes()
-                                    })
-                                }
-                                #[cfg(not(any(feature = "dfs", test)))]
-                                {
-                                    true
-                                }
-                            }
+                            && native_live_lease
+                                .as_ref()
+                                .is_none_or(|lease| bytes.capacity() <= lease.charged_bytes())
                     })
                     .min_by_key(|(_, bytes)| bytes.capacity())
                     .map(|(index, _)| index)
@@ -323,7 +308,6 @@ impl WriteBufferPool {
                 state.stats.reuses += 1;
                 state.publish_metrics();
                 drop(state);
-                #[cfg(any(feature = "dfs", test))]
                 if let Some(lease) = &mut native_live_lease {
                     lease.shrink_to(bytes.capacity());
                 }
@@ -365,7 +349,6 @@ impl WriteBufferPool {
         bytes
             .try_reserve_exact(allocation_capacity)
             .map_err(|_| write_allocation_error())?;
-        #[cfg(any(feature = "dfs", test))]
         if let Some(lease) = &mut native_live_lease {
             // Vec may expose more actual capacity than requested. Complete the
             // old owner's charge without waiting, before publishing the buffer.
@@ -604,7 +587,7 @@ impl Deref for SharedChunkBytes {
 }
 
 /// One mutable final payload allocation. Pooled builders are fixed capacity;
-/// the legacy Default builder remains fallibly growable for other callers.
+/// the unpooled Default builder remains fallibly growable for other callers.
 #[derive(Debug)]
 pub struct ChunkBuilder {
     pub(super) buffer: ChunkBuffer,
@@ -622,6 +605,7 @@ impl Default for ChunkBuilder {
 
 impl ChunkBuilder {
     /// Acquire capacity without a live quota. Allocation refusal returns ENOMEM.
+    #[cfg(test)]
     pub fn with_pool(pool: Arc<WriteBufferPool>, capacity: usize) -> Result<Self> {
         Ok(Self {
             buffer: pool.checkout(capacity)?,
@@ -723,7 +707,7 @@ impl ChunkBuilder {
         self.buffer.bytes.truncate(length);
     }
 
-    /// Legacy full-body ownership transfer; pooled builders are not used here.
+    /// Unpooled full-body ownership transfer; pooled builders are not used here.
     pub fn replace(&mut self, bytes: Vec<u8>) {
         self.buffer = ChunkBuffer::unpooled(bytes);
         self.fixed_capacity = None;

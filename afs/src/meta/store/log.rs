@@ -954,11 +954,15 @@ impl RecordDecision {
         Ok(record)
     }
 
+    /// Standalone decision codec. The product encodes decisions inside their
+    /// `Record`; tests use this to pin the decision encoding on its own.
+    #[cfg(test)]
     pub fn encode(&self, byte_limit: usize) -> Result<Vec<u8>> {
         self.validate()?;
         codec::encode_bounded(self, byte_limit)
     }
 
+    #[cfg(test)]
     pub fn decode(bytes: &[u8], byte_limit: usize) -> Result<Self> {
         if bytes.len() > byte_limit {
             return Err(invalid_contract("canonical decision exceeds byte limit"));

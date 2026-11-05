@@ -10,10 +10,7 @@ use std::{
     any::{Any, TypeId},
     collections::HashMap,
     fmt,
-    hash::{Hash, Hasher},
-    sync::OnceLock,
     sync::{Arc, Mutex},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use prometheus::{Encoder, TextEncoder};
@@ -22,15 +19,12 @@ pub use prometheus::{
     IntGaugeVec, Opts,
 };
 
-/// Process-owned collector registry plus a small OpenMetrics exemplar sidecar.
+/// Process-owned collector registry plus shared metric handle bundles.
 ///
-/// `prometheus` 0.14 owns counters/histograms. The sidecar stores at most one
-/// sampled trace per bounded histogram bucket and augments exposition only;
-/// it is never consulted by a business operation.
+/// `prometheus` 0.14 owns counters/histograms.
 #[derive(Clone)]
 pub struct Registry {
     inner: prometheus::Registry,
-    exemplars: Arc<Mutex<ExemplarStore>>,
     bundles: Arc<Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>>,
 }
 
@@ -39,7 +33,6 @@ impl Registry {
     pub fn new() -> Self {
         Self {
             inner: prometheus::Registry::new(),
-            exemplars: Arc::new(Mutex::new(HashMap::new())),
             bundles: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -81,24 +74,6 @@ impl Registry {
     pub fn gather(&self) -> Vec<prometheus::proto::MetricFamily> {
         self.inner.gather()
     }
-
-    #[must_use]
-    pub fn exemplar_recorder(
-        &self,
-        metric: &'static str,
-        labels: &'static [&'static str],
-        buckets: &[f64],
-    ) -> ExemplarRecorder {
-        let mut label_order = (0..labels.len()).collect::<Vec<_>>();
-        label_order.sort_unstable_by_key(|index| labels[*index]);
-        ExemplarRecorder {
-            metric,
-            labels,
-            buckets: Arc::from(buckets),
-            label_order: Arc::from(label_order),
-            store: Arc::clone(&self.exemplars),
-        }
-    }
 }
 
 impl Default for Registry {
@@ -115,134 +90,6 @@ impl fmt::Debug for Registry {
 
 pub const OPENMETRICS_CONTENT_TYPE: &str =
     "application/openmetrics-text; version=1.0.0; charset=utf-8";
-
-/// Trace identity attached to one selected histogram observation.
-///
-/// It is deliberately a fixed 16-byte value. `trace_id` is never a metric
-/// label; hexadecimal encoding is deferred until OpenMetrics exposition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MetricExemplar {
-    trace_id: [u8; 16],
-}
-
-type ExemplarProvider = fn() -> Option<MetricExemplar>;
-static EXEMPLAR_PROVIDER: OnceLock<ExemplarProvider> = OnceLock::new();
-
-/// Installs the trace bridge without making Metrics depend on one tracing SDK.
-/// Repeated installation is intentionally harmless for SDK/server composition.
-pub fn install_exemplar_provider(provider: ExemplarProvider) {
-    let _ = EXEMPLAR_PROVIDER.set(provider);
-}
-
-fn capture_exemplar() -> Option<MetricExemplar> {
-    EXEMPLAR_PROVIDER.get().and_then(|provider| provider())
-}
-
-/// Typed handle used beside one existing `HistogramVec`.
-///
-/// Labels must be the same bounded labels used by that histogram. The trace ID
-/// is attached to a bucket sample, never promoted to a Prometheus label.
-#[derive(Clone)]
-pub struct ExemplarRecorder {
-    metric: &'static str,
-    labels: &'static [&'static str],
-    // 配置只读，Guard 克隆不再为未采样请求重复分配 bucket 数组。
-    buckets: Arc<[f64]>,
-    label_order: Arc<[usize]>,
-    store: Arc<Mutex<ExemplarStore>>,
-}
-
-// 以稳定身份散列定位候选，再比较完整标签消解碰撞。热身后更新已有
-// series 不复制标签、不排序、不编码 Trace ID；仅首次采样建立有界系列。
-type ExemplarStore = HashMap<u64, Vec<(ExemplarSeries, ExemplarValue)>>;
-
-impl ExemplarRecorder {
-    pub fn record(&self, labels: &[&str], value: f64, exemplar: Option<MetricExemplar>) {
-        let Some(exemplar) = exemplar.or_else(capture_exemplar) else {
-            return;
-        };
-        if labels.len() != self.labels.len() {
-            return;
-        }
-        let upper_bound = self
-            .buckets
-            .iter()
-            .copied()
-            .find(|bound| value <= *bound)
-            .unwrap_or(f64::INFINITY);
-        let ordered_labels = || {
-            self.label_order
-                .iter()
-                .map(|index| (self.labels[*index], labels[*index]))
-        };
-        let mut identity = std::collections::hash_map::DefaultHasher::new();
-        self.metric.hash(&mut identity);
-        upper_bound.to_bits().hash(&mut identity);
-        for label in ordered_labels() {
-            label.hash(&mut identity);
-        }
-        let observed_at_millis = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |duration| duration.as_millis() as u64);
-        let value = ExemplarValue {
-            trace_id: exemplar.trace_id(),
-            observed_value: value,
-            observed_at_millis,
-        };
-        if let Ok(mut store) = self.store.lock() {
-            let entries = store.entry(identity.finish()).or_default();
-            if let Some((_, previous)) = entries.iter_mut().find(|(series, _)| {
-                series.metric == self.metric
-                    && series.upper_bound_bits == upper_bound.to_bits()
-                    && series.labels.len() == self.labels.len()
-                    && series.labels.iter().zip(ordered_labels()).all(
-                        |((name, value), (expected_name, expected_value))| {
-                            name == expected_name && value == expected_value
-                        },
-                    )
-            }) {
-                *previous = value;
-            } else {
-                entries.push((
-                    ExemplarSeries {
-                        metric: self.metric,
-                        labels: ordered_labels()
-                            .map(|(name, value)| (name.to_owned(), value.to_owned()))
-                            .collect(),
-                        upper_bound_bits: upper_bound.to_bits(),
-                    },
-                    value,
-                ));
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct ExemplarSeries {
-    metric: &'static str,
-    labels: Vec<(String, String)>,
-    upper_bound_bits: u64,
-}
-
-#[derive(Clone, Debug)]
-struct ExemplarValue {
-    trace_id: [u8; 16],
-    observed_value: f64,
-    observed_at_millis: u64,
-}
-
-impl MetricExemplar {
-    #[must_use]
-    pub const fn new(trace_id: [u8; 16]) -> Self {
-        Self { trace_id }
-    }
-
-    #[must_use]
-    pub const fn trace_id(self) -> [u8; 16] {
-        self.trace_id
-    }
-}
 
 /// Registration or text-encoding failure at process composition time.
 #[derive(Debug, thiserror::Error)]
@@ -261,71 +108,18 @@ pub fn registry() -> Registry {
     Registry::new()
 }
 
-/// Encodes one OpenMetrics snapshot, including sampled histogram exemplars.
+/// Encodes one OpenMetrics snapshot.
 pub fn encode_text(registry: &Registry) -> Result<String, MetricsError> {
     let mut buffer = Vec::new();
     TextEncoder::new().encode(&registry.gather(), &mut buffer)?;
     let prometheus = String::from_utf8(buffer)?;
-    let exemplars = registry.exemplars.lock().map_or_else(
-        |_| HashMap::new(),
-        |store| store.values().flatten().cloned().collect(),
-    );
-    let mut output = String::with_capacity(prometheus.len() + 128);
+    let mut output = String::with_capacity(prometheus.len() + 6);
     for line in prometheus.lines() {
         output.push_str(line);
-        if let Some(exemplar) = exemplar_for_line(line, &exemplars) {
-            output.push_str(" # {trace_id=\"");
-            output.push_str(&hex_trace_id(exemplar.trace_id));
-            output.push_str("\"} ");
-            output.push_str(&exemplar.observed_value.to_string());
-            output.push(' ');
-            output.push_str(&exemplar.observed_at_millis.to_string());
-        }
         output.push('\n');
     }
     output.push_str("# EOF\n");
     Ok(output)
-}
-
-fn exemplar_for_line<'a>(
-    line: &str,
-    exemplars: &'a HashMap<ExemplarSeries, ExemplarValue>,
-) -> Option<&'a ExemplarValue> {
-    let (metric_and_labels, _) = line.split_once(' ')?;
-    let (metric, raw_labels) = metric_and_labels.split_once('{')?;
-    let metric = metric.strip_suffix("_bucket")?;
-    let raw_labels = raw_labels.strip_suffix('}')?;
-    let mut labels = Vec::new();
-    let mut upper_bound = None;
-    for pair in raw_labels.split(',') {
-        let (name, value) = pair.split_once('=')?;
-        let value = value.trim_matches('"');
-        if name == "le" {
-            upper_bound = Some(if value == "+Inf" {
-                f64::INFINITY
-            } else {
-                value.parse::<f64>().ok()?
-            });
-        } else {
-            labels.push((name.to_string(), value.to_string()));
-        }
-    }
-    labels.sort_unstable();
-    exemplars.get(&ExemplarSeries {
-        metric: exemplars.keys().find(|key| key.metric == metric)?.metric,
-        labels,
-        upper_bound_bits: upper_bound?.to_bits(),
-    })
-}
-
-fn hex_trace_id(bytes: [u8; 16]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut output = String::with_capacity(32);
-    for byte in bytes {
-        output.push(HEX[(byte >> 4) as usize] as char);
-        output.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    output
 }
 
 /// Self-observability for the process-owned trace exporter.
@@ -439,28 +233,6 @@ pub fn latency_buckets() -> Vec<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn sampled_updates_reuse_bound_series_and_binary_identity() {
-        let registry = registry();
-        let recorder = registry.exemplar_recorder("test", &["z", "a"], &[1.0]);
-        recorder.record(&["last", "first"], 0.1, Some(MetricExemplar::new([1; 16])));
-        let original_labels = {
-            let store = registry.exemplars.lock().unwrap();
-            let (series, _) = &store.values().next().unwrap()[0];
-            assert_eq!(series.labels[0].0, "a");
-            series.labels.as_ptr()
-        };
-        for _ in 0..1000 {
-            recorder.record(&["last", "first"], 0.2, Some(MetricExemplar::new([2; 16])));
-        }
-        let store = registry.exemplars.lock().unwrap();
-        let entries = store.values().next().unwrap();
-        assert_eq!(store.len(), 1);
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0.labels.as_ptr(), original_labels);
-        assert_eq!(entries[0].1.trace_id, [2; 16]);
-    }
 
     #[test]
     fn registry_bundles_are_shared_across_clones() {

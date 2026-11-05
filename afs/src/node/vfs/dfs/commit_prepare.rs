@@ -325,6 +325,14 @@ impl DistributedFs {
         span.record("staged_chunks", staged_chunks as u64);
         span.record("staged_bytes", staged_bytes);
         let unique = unique_staged_chunks(plan.staged_chunks)?;
+        // Every data write sets `native_operation_id`, so a staged generation is
+        // length-only and stores no chunks. Guard the invariant that let R33
+        // drop the per-chunk `publish:` GC reservation.
+        debug_assert!(
+            unique.is_empty(),
+            "a staged generation without a native operation carried {} chunk(s)",
+            unique.len()
+        );
         let unique_bytes = unique
             .iter()
             .fold(0_u64, |sum, chunk| sum.saturating_add(chunk.chunk.length));

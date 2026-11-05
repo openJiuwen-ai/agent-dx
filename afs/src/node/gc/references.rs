@@ -8,13 +8,8 @@ use std::sync::{
 };
 
 pub trait GcControl: Send + Sync {
-    fn retain(
-        &self,
-        id: &str,
-        inode: &InodeId,
-        version: Option<&FileVersionId>,
-        publication: bool,
-    ) -> Result<()>;
+    /// Unfenced read pin (`open:`); write generations use `retain_fenced`.
+    fn retain(&self, id: &str, inode: &InodeId, version: Option<&FileVersionId>) -> Result<()>;
     /// Fails closed if the authority cannot capture a pre-write GC fence.
     fn retain_fenced(
         &self,
@@ -28,11 +23,6 @@ pub trait GcControl: Send + Sync {
         ))
     }
     fn release(&self, id: &str) -> Result<()>;
-    fn reserve_publication(
-        &self,
-        operation: &crate::dfs::OperationId,
-        chunks: Vec<ChunkObject>,
-    ) -> Result<()>;
     fn collect(&self, completed: u64, inventory: Vec<ChunkObject>) -> Result<GcState>;
 }
 pub struct GcReferences {
@@ -76,9 +66,8 @@ impl GcReferences {
         self: &Arc<Self>,
         inode: &InodeId,
         version: Option<&FileVersionId>,
-        publication: Option<&crate::dfs::OperationId>,
     ) -> Result<Arc<GcPin>> {
-        self.pin_mode(inode, version, publication, false, false)
+        self.pin_mode(inode, version, None)
     }
     pub(crate) fn pin_generation(
         self: &Arc<Self>,
@@ -86,22 +75,17 @@ impl GcReferences {
         version: Option<&FileVersionId>,
         operation: &crate::dfs::OperationId,
     ) -> Result<Arc<GcPin>> {
-        self.pin_mode(inode, version, Some(operation), true, true)
+        self.pin_mode(inode, version, Some(operation))
     }
+    /// `generation` selects a fenced `write:` pin; `None` is an `open:` pin.
     fn pin_mode(
         self: &Arc<Self>,
         inode: &InodeId,
         version: Option<&FileVersionId>,
-        publication: Option<&crate::dfs::OperationId>,
-        fenced: bool,
-        generation: bool,
+        generation: Option<&crate::dfs::OperationId>,
     ) -> Result<Arc<GcPin>> {
-        let id = match publication {
-            Some(operation) => format!(
-                "{}:{}",
-                if generation { "write" } else { "publish" },
-                operation.0
-            ),
+        let id = match generation {
+            Some(operation) => format!("write:{}", operation.0),
             None => format!(
                 "open:{}",
                 crate::clock::timed_request_id(format!(
@@ -117,14 +101,13 @@ impl GcReferences {
             id,
             owner: self.clone(),
         };
-        pin.fence = if fenced {
+        pin.fence = if generation.is_some() {
             Some(self.control.retain_fenced(&pin.id, inode, version)?)
         } else {
-            self.control
-                .retain(&pin.id, inode, version, publication.is_some())?;
+            self.control.retain(&pin.id, inode, version)?;
             None
         };
-        if generation && pin.fence != Some(crate::dfs::GcFence::WriteGeneration) {
+        if generation.is_some() && pin.fence != Some(crate::dfs::GcFence::WriteGeneration) {
             return Err(Error::coded(
                 afs_error::NODE_VFS_UNIMPLEMENTED,
                 "Meta did not admit the write generation",
@@ -164,7 +147,7 @@ mod tests {
         fail_once: std::sync::atomic::AtomicBool,
     }
     impl GcControl for Control {
-        fn retain(&self, _: &str, _: &InodeId, _: Option<&FileVersionId>, _: bool) -> Result<()> {
+        fn retain(&self, _: &str, _: &InodeId, _: Option<&FileVersionId>) -> Result<()> {
             Ok(())
         }
         fn release(&self, id: &str) -> Result<()> {
@@ -172,13 +155,6 @@ mod tests {
                 return Err(Error::coded(afs_error::IO_UNAVAILABLE, "lost reply"));
             }
             self.releases.lock().unwrap().push(id.into());
-            Ok(())
-        }
-        fn reserve_publication(
-            &self,
-            _: &crate::dfs::OperationId,
-            _: Vec<ChunkObject>,
-        ) -> Result<()> {
             Ok(())
         }
         fn collect(&self, _: u64, _: Vec<ChunkObject>) -> Result<GcState> {
@@ -189,7 +165,7 @@ mod tests {
     fn in_flight_access_retains_pin_and_failed_release_is_retried() {
         let control = Arc::new(Control::default());
         let references = GcReferences::new(control.clone());
-        let handle = references.pin(&InodeId::new("i"), None, None).unwrap();
+        let handle = references.pin(&InodeId::new("i"), None).unwrap();
         let in_flight = handle.clone();
         drop(handle);
         references.flush().unwrap();
@@ -208,7 +184,7 @@ mod tests {
         let control = Arc::new(Control::default());
         let references = GcReferences::new(control.clone());
         for _ in 0..130 {
-            drop(references.pin(&InodeId::new("i"), None, None).unwrap());
+            drop(references.pin(&InodeId::new("i"), None).unwrap());
         }
         references.flush().unwrap();
         assert_eq!(control.releases.lock().unwrap().len(), 64);

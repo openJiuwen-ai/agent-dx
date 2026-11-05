@@ -53,7 +53,6 @@ fn generation_admission(f: &Fixture, release: bool) -> crate::dfs::UpdateGcRefer
         inode_id: Some(f.commit.inode_id.clone()),
         version_id: None,
         publication: true,
-        chunks: vec![],
         release,
         admission_deadline_unix_ms: now_unix_ms().saturating_add(30_000),
     }
@@ -624,7 +623,6 @@ async fn new_operation_on_same_node_admits_normally_after_tombstone_collection()
         inode_id: Some(f.commit.inode_id.clone()),
         version_id: None,
         publication: true,
-        chunks: vec![],
         release: false,
         admission_deadline_unix_ms: now_unix_ms().saturating_add(30_000),
     };

@@ -25,7 +25,7 @@ pub(super) struct LocalReadAuthorityState {
 ///
 /// Product wiring should refresh it from registration/heartbeat and stop it
 /// before FUSE output can be committed. Unit-only engines use an unbounded
-/// unknown-epoch authority so legacy tests do not accidentally depend on Node
+/// unknown-epoch authority so unit tests do not accidentally depend on Node
 /// lifecycle plumbing.
 pub(in crate::node) struct LocalReadAuthority {
     pub(super) state: Mutex<LocalReadAuthorityState>,
@@ -42,7 +42,7 @@ impl LocalReadAuthority {
         }
     }
 
-    pub(super) fn unbounded_for_tests_and_legacy() -> Self {
+    pub(super) fn unbounded_unknown_epoch() -> Self {
         Self {
             state: Mutex::new(LocalReadAuthorityState {
                 epoch: 0,

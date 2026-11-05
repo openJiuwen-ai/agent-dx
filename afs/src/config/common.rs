@@ -1,6 +1,6 @@
 //! Process identity, filesystem selection, data mode and process-level checks.
 
-use super::{Cli, Config, FileConfig, Role, invalid};
+use super::{Cli, Config, DataMode, FileConfig, Role, invalid};
 use afs_error::Result;
 use std::path::Path;
 
@@ -73,19 +73,52 @@ pub(super) fn resolve_filesystems(
     Ok((ownerfs, dfs))
 }
 
-pub(super) fn resolve_data_mode(cli: &mut Cli, file: &mut FileConfig) -> Result<String> {
+pub(super) fn resolve_data_mode(cli: &mut Cli, file: &mut FileConfig) -> Result<DataMode> {
     let data_mode = cli
         .data_mode
         .take()
         .or(file.data_mode.take())
-        .unwrap_or_else(|| "grpc".into());
-    if !["grpc", "rdma", "auto"].contains(&data_mode.as_str()) {
-        return Err(invalid("data_mode must be grpc, rdma or auto"));
-    }
-    if data_mode == "rdma" && !cfg!(feature = "rdma") {
+        .unwrap_or(DataMode::Grpc);
+    if data_mode == DataMode::Rdma && !cfg!(feature = "rdma") {
         return Err(invalid("rdma feature is not compiled in"));
     }
     Ok(data_mode)
+}
+
+impl Config {
+    /// Test-only and diagnostic options this configuration turns on, as
+    /// `(option, category)`; `docs/deployment/afs.md` classifies them. The
+    /// `memory` Meta store is absent: Meta warns `meta.store.memory_volatile`
+    /// when it opens that store.
+    #[must_use]
+    pub fn non_product_options(&self) -> Vec<(&'static str, &'static str)> {
+        let mut options = Vec::new();
+        if self.allow_volatile_meta {
+            options.push(("allow_volatile_meta", "test-only"));
+        }
+        if self
+            .dfs_external_backend
+            .as_ref()
+            .is_some_and(|backend| backend.allow_http)
+        {
+            options.push(("dfs_external_backend.allow_http", "test-only"));
+        }
+        if self.peer_endpoint.is_some() {
+            options.push(("peer_endpoint", "diagnostic"));
+        }
+        if self.dfs_read_diagnostics_enabled {
+            options.push(("dfs_read_diagnostics_enabled", "diagnostic"));
+        }
+        options
+    }
+
+    /// One WARN per enabled option; call once process logging is initialized.
+    pub(crate) fn warn_non_product_options(&self) {
+        for (option, category) in self.non_product_options() {
+            afs_logging::warn!("config.test_only_option_enabled";
+                "option" => option, "category" => category);
+        }
+    }
 }
 
 /// Timeout, tracing, log level, endpoint URIs and absolute paths.

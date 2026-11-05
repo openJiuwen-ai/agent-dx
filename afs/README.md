@@ -25,7 +25,7 @@ DFS Peer 客户端允许接收 128 KiB HTTP/2 DATA 帧；业务消息、流控�
 | `crates/client/` | `afs-client`：本机 SDK（UDS 控制 + 共享内存 usrbio）；`examples/` 只放 SDK 用法示例 |
 | `crates/error/` | `afs-error`：与协议无关的稳定错误合同（码表在 `error-codes.toml`） |
 | `crates/logging/` | `afs-logging`：进程日志 |
-| `crates/metrics/` | `afs-metrics`：Prometheus 注册表与 OpenMetrics exemplar |
+| `crates/metrics/` | `afs-metrics`：Prometheus 注册表与 OpenMetrics 编码 |
 | `crates/protocol/` | `afs-protocol`：proto 定义、生成的 gRPC 代码与集群线协议版本 |
 | `crates/tracing/` | `afs-tracing`：分布式追踪上下文与进程运行时 |
 | `crates/transport/` | `afs-transport`：gRPC/TLS、共享内存、ring 与可选 RDMA |

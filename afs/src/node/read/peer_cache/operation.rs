@@ -48,7 +48,7 @@ impl<'a> PeerCacheOperation<'a> {
                 return Ok(());
             }
             return Err(invalid(
-                "legacy fill requires releasing the stream allowance",
+                "full-body fill requires releasing the stream allowance",
             ));
         }
         let _waiting = FillWaiter::new(self.cache)?;
@@ -97,7 +97,7 @@ impl<'a> PeerCacheOperation<'a> {
                 return Ok(());
             }
             return Err(invalid(
-                "legacy fill requires releasing the stream allowance",
+                "full-body fill requires releasing the stream allowance",
             ));
         }
         let _waiting = FillWaiter::new(self.cache)?;

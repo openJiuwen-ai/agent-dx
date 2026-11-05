@@ -16,7 +16,7 @@ use crate::node::{
     Node,
     rpc::{
         meta,
-        peer::{DataClientOptions, DataMode, connect_data_client},
+        peer::{DataClientOptions, connect_data_client},
     },
 };
 
@@ -60,14 +60,9 @@ pub(in crate::node) async fn diagnose(node: Arc<Node>) -> afs_error::Result<Valu
         .await
         .map_err(afs_transport::grpc::error_status::status_to_error)?
         .into_inner();
-    let mode = match config.data_mode.as_str() {
-        "grpc" => DataMode::Grpc,
-        "rdma" => DataMode::Rdma,
-        _ => DataMode::Auto,
-    };
     let mut data = connect_data_client(DataClientOptions {
         endpoint: peer_endpoint.clone(),
-        mode,
+        mode: config.data_mode,
         rdma_device: config.rdma_device.clone(),
         timeout,
         tls,

@@ -576,7 +576,6 @@ impl LocalR1Path {
 /// The native [`ChunkSink`]: routes each batch to [`LocalR1Path`] or
 /// [`ReplicaChain`] and decides the resulting [`BodyRelease`].
 pub struct DfsChunkSink {
-    gc_control: Option<Arc<dyn crate::node::gc::GcControl>>,
     local_node_id: String,
     local_node_epoch: Option<u64>,
     local: Arc<LocalChunkStore>,
@@ -586,27 +585,6 @@ pub struct DfsChunkSink {
 }
 
 impl DfsChunkSink {
-    fn reserve_gc_publications(&self, staged: &[StagedChunk]) -> Result<()> {
-        if let Some(control) = &self.gc_control {
-            let mut operations = std::collections::BTreeMap::<_, Vec<_>>::new();
-            for item in staged {
-                operations
-                    .entry(item.operation_id.clone())
-                    .or_default()
-                    .push(item.chunk.clone());
-            }
-            for (operation, chunks) in operations {
-                control.reserve_publication(&operation, chunks)?;
-            }
-        }
-        Ok(())
-    }
-
-    pub fn with_gc_control(mut self, control: Arc<dyn crate::node::gc::GcControl>) -> Self {
-        self.gc_control = Some(control);
-        self
-    }
-
     pub fn new(
         local_node_id: String,
         local: Arc<LocalChunkStore>,
@@ -640,7 +618,6 @@ impl DfsChunkSink {
         data_plane: Arc<dyn ReplicaDataPlane>,
     ) -> Self {
         Self {
-            gc_control: None,
             local_r1: LocalR1Path {
                 node_id: local_node_id.clone(),
                 local: local.clone(),
@@ -752,11 +729,9 @@ impl DfsChunkSink {
 
 impl ChunkSink for DfsChunkSink {
     fn put_chunks(&self, staged: Vec<StagedChunk>, intent: PutIntent) -> Result<Vec<StoredChunk>> {
-        // Native writes fence their own write generation at commit; no
-        // per-chunk publication registration (S1a-7, F6).
-        if intent == PutIntent::Commit {
-            self.reserve_gc_publications(&staged)?;
-        }
+        // Native writes fence their own write generation at commit; chunks
+        // are never registered per publication (S1a-7, F6; R33 removed the
+        // `publish:` reservation that only ever saw empty batches).
         let snapshot = self.placement.snapshot()?;
         let mut stored = if snapshot.is_local_fast_path() {
             self.local_r1.put_batch(staged, &snapshot)?
@@ -1170,40 +1145,9 @@ mod tests {
         );
     }
 
-    #[derive(Default)]
-    struct RecordingGcControl {
-        reservations: Mutex<Vec<OperationId>>,
-    }
-
-    impl crate::node::gc::GcControl for RecordingGcControl {
-        fn retain(
-            &self,
-            _: &str,
-            _: &crate::dfs::InodeId,
-            _: Option<&crate::dfs::FileVersionId>,
-            _: bool,
-        ) -> Result<()> {
-            Ok(())
-        }
-        fn release(&self, _: &str) -> Result<()> {
-            Ok(())
-        }
-        fn reserve_publication(
-            &self,
-            operation: &OperationId,
-            _: Vec<crate::dfs::ChunkObject>,
-        ) -> Result<()> {
-            self.reservations.lock().unwrap().push(operation.clone());
-            Ok(())
-        }
-        fn collect(&self, _: u64, _: Vec<crate::dfs::ChunkObject>) -> Result<crate::dfs::GcState> {
-            Ok(crate::dfs::GcState::default())
-        }
-    }
-
-    /// The two differences `PutIntent` exists to express, on the same store.
+    /// The local-release difference `PutIntent` expresses, on the same store.
     #[test]
-    fn put_intent_selects_gc_reservation_and_local_release_decision() {
+    fn put_intent_selects_local_release_decision() {
         let temp = tempfile::tempdir().unwrap();
         let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
         let snapshot = Arc::new(PlacementSnapshot {
@@ -1220,30 +1164,23 @@ mod tests {
                 )],
             }],
         });
-        let control = Arc::new(RecordingGcControl::default());
         let store = DfsChunkSink::new_with_epoch(
             "node-a".into(),
             1,
             local,
             Arc::new(StaticPlacement { snapshot }),
             Arc::new(FakeDataPlane::default()),
-        )
-        .with_gc_control(control.clone());
+        );
 
         let committed = store
             .put_chunks(vec![staged("intent-commit")], PutIntent::Commit)
             .unwrap();
         assert_eq!(committed[0].body_release, BodyRelease::RetainUntilPublish);
-        assert_eq!(
-            *control.reservations.lock().unwrap(),
-            vec![OperationId::new("op-intent-commit")]
-        );
 
         let uploaded = store
             .put_chunks(vec![staged("intent-upload")], PutIntent::PipelineUpload)
             .unwrap();
         assert_eq!(uploaded[0].body_release, BodyRelease::ReleaseAfterUpload);
-        assert_eq!(control.reservations.lock().unwrap().len(), 1);
     }
 
     #[test]

@@ -804,8 +804,6 @@ pub(super) fn domain_external_authorized_read(
     }
     Ok(crate::dfs::DfsExternalAuthorizedRead {
         authorized: crate::dfs::DfsAuthorizedRead {
-            open_sources: Vec::new(),
-
             validation: crate::dfs::DfsReadValidation {
                 grant: domain_dfs_read_grant(required(
                     validation.grant,

@@ -1687,8 +1687,6 @@ impl DfsReadGrantValidator for SkewedReadGrantValidator {
                     validation.copy_id = crate::dfs::CopyId::new("another-copy");
                 }
                 crate::dfs::DfsAuthorizedRead {
-                    open_sources: Vec::new(),
-
                     validation,
                     allowed_ranges,
                     expires_at_unix_ms,

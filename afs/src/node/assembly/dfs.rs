@@ -171,7 +171,7 @@ impl DfsAssembly {
         } else {
             None
         };
-        let dfs_data_mode = parse_data_mode(&cfg.data_mode);
+        let dfs_data_mode = cfg.data_mode;
         let dfs_rdma_pool = if cfg.dfs {
             if let Some(device) =
                 dfs_rdma_startup_device(dfs_data_mode, cfg.rdma_device.as_deref())?
@@ -287,16 +287,13 @@ impl DfsAssembly {
         self.external_store = external_store.clone();
         let chunk_store: Arc<dyn chunk::ChunkSink> = match &external_store {
             Some(store) => store.clone(),
-            None => Arc::new(
-                replication::DfsChunkSink::new_with_epoch(
-                    cfg.id.clone(),
-                    registered_node_epoch,
-                    chunks.clone(),
-                    meta.clone(),
-                    dfs_replica_plane.clone(),
-                )
-                .with_gc_control(meta.clone()),
-            ),
+            None => Arc::new(replication::DfsChunkSink::new_with_epoch(
+                cfg.id.clone(),
+                registered_node_epoch,
+                chunks.clone(),
+                meta.clone(),
+                dfs_replica_plane.clone(),
+            )),
         };
         let read_config = read::engine::DfsReadConfig {
             max_ops_per_batch: cfg.dfs_read_max_ops_per_batch,
@@ -513,15 +510,6 @@ pub(super) fn start_repair(
             assembly.replica_plane.clone(),
         ))
         .start(services);
-    }
-}
-
-#[cfg(feature = "dfs")]
-fn parse_data_mode(value: &str) -> rpc::peer::DataMode {
-    match value {
-        "grpc" => rpc::peer::DataMode::Grpc,
-        "rdma" => rpc::peer::DataMode::Rdma,
-        _ => rpc::peer::DataMode::Auto,
     }
 }
 

@@ -1,6 +1,6 @@
 //! Disposable native Peer object cache, never replicas or read authority.
 //!
-//! Two streaming fills share Node transport work; a legacy body is exclusive.
+//! Two streaming fills share Node transport work; a full-body fill is exclusive.
 //! Metadata locks never cover runtime disk I/O, verification or Peer waits.
 //! Ready bodies live only on disk. Hits verify complete requested 32 KiB coverage
 //! groups against the trusted standard BLAKE3 root. Changed identity requires a root scan.

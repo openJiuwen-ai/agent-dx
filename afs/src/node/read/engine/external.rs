@@ -402,6 +402,8 @@ pub(super) struct ExternalReadSelection {
     pub(super) batch: ReadBatch,
     pub(super) selected: Vec<ExternalReadSelected>,
     pub(super) validations: Vec<DfsReadValidation>,
+    /// Only the test driver `read_batch_current_external` resolves these.
+    #[cfg(test)]
     pub(super) missing_sources: Vec<DfsMissingReadSource>,
 }
 
@@ -431,6 +433,9 @@ impl ExternalReadSelection {
 }
 
 impl DfsReadEngine {
+    /// Test driver; the product S3 read enters through
+    /// `read_external_authorized_selection`.
+    #[cfg(test)]
     pub fn read_batch_current_external(
         &self,
         inode_id: &crate::dfs::InodeId,
@@ -655,6 +660,7 @@ impl DfsReadEngine {
                 })
                 .collect(),
             validations: Vec::new(),
+            #[cfg(test)]
             missing_sources: Vec::new(),
         };
         let ExternalVersionPermits {
@@ -952,8 +958,6 @@ impl DfsReadEngine {
     ) -> DfsExternalAuthorizedRead {
         DfsExternalAuthorizedRead {
             authorized: crate::dfs::DfsAuthorizedRead {
-                open_sources: Vec::new(),
-
                 validation: DfsReadValidation {
                     grant: entry.grant.clone(),
                     chunk_id: entry.chunk.id.clone(),
@@ -1049,6 +1053,7 @@ impl DfsReadEngine {
         self.select_external_reads_from_sources(batch, &sources, false)
     }
 
+    #[cfg(test)]
     fn select_current_external_reads(
         &self,
         batch: &ReadBatch,
@@ -1132,6 +1137,7 @@ impl DfsReadEngine {
             batch,
             selected,
             validations,
+            #[cfg(test)]
             missing_sources: Vec::new(),
         }))
     }
@@ -1173,6 +1179,7 @@ impl DfsReadEngine {
         Ok((chunk.clone(), source.clone(), validation))
     }
 
+    #[cfg(test)]
     pub(super) fn cached_sources_for(
         &self,
         batch: &ReadBatch,
@@ -1448,6 +1455,7 @@ impl DfsReadEngine {
         Ok(())
     }
 
+    #[cfg(test)]
     fn validate_current_authorized_inode(
         &self,
         inode: &crate::dfs::InodeRecord,
@@ -1466,6 +1474,7 @@ impl DfsReadEngine {
         Ok(())
     }
 
+    #[cfg(test)]
     fn validate_current_head_changed_inode(
         &self,
         inode: &crate::dfs::InodeRecord,

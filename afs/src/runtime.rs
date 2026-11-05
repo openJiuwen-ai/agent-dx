@@ -198,6 +198,7 @@ pub fn initialize(
         },
         afs_logging::ProcessIdentity::new(service, &cfg.id),
     )?;
+    cfg.warn_non_product_options();
     let _tracing = afs_tracing::init_process_tracing(
         &afs_tracing::TracingConfig {
             enabled: cfg.trace_enabled,

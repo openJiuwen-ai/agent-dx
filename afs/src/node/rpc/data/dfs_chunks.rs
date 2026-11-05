@@ -82,7 +82,7 @@ pub fn make_dfs_chunks_server(
     )
 }
 
-#[cfg(feature = "dfs")]
+#[cfg(all(feature = "dfs", test))]
 pub fn make_dfs_chunks_server_with_replication(
     local_chunks: Option<Arc<LocalChunkStore>>,
     authenticator: Arc<dyn PeerAuthenticator>,

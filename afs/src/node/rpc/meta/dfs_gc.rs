@@ -9,9 +9,8 @@ impl crate::node::gc::GcControl for GrpcDfsMeta {
         id: &str,
         inode: &crate::dfs::InodeId,
         version: Option<&crate::dfs::FileVersionId>,
-        publication: bool,
     ) -> Result<()> {
-        self.update_gc(id, Some(inode), version, publication, Vec::new(), false)
+        self.update_gc(id, Some(inode), version, false, false)
     }
     fn retain_fenced(
         &self,
@@ -19,7 +18,7 @@ impl crate::node::gc::GcControl for GrpcDfsMeta {
         inode: &crate::dfs::InodeId,
         version: Option<&crate::dfs::FileVersionId>,
     ) -> Result<crate::dfs::GcFence> {
-        self.update_gc_with_fence(id, Some(inode), version, true, Vec::new(), false, true)?
+        self.update_gc_with_fence(id, Some(inode), version, true, false, true)?
             .ok_or_else(|| {
                 Error::coded(
                     afs_error::NODE_VFS_UNIMPLEMENTED,
@@ -28,31 +27,7 @@ impl crate::node::gc::GcControl for GrpcDfsMeta {
             })
     }
     fn release(&self, id: &str) -> Result<()> {
-        self.update_gc(id, None, None, false, Vec::new(), true)
-    }
-    fn reserve_publication(
-        &self,
-        operation: &crate::dfs::OperationId,
-        chunks: Vec<crate::dfs::ChunkObject>,
-    ) -> Result<()> {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
-            match self.update_gc(
-                &format!("publish:{}", operation.0),
-                None,
-                None,
-                true,
-                chunks.clone(),
-                false,
-            ) {
-                Err(error)
-                    if error.code() == afs_error::META_DFS_GC_BUSY && Instant::now() < deadline =>
-                {
-                    std::thread::sleep(Duration::from_millis(50))
-                }
-                result => return result,
-            }
-        }
+        self.update_gc(id, None, None, false, true)
     }
     fn collect(
         &self,
@@ -95,21 +70,18 @@ impl GrpcDfsMeta {
         inode: Option<&crate::dfs::InodeId>,
         version: Option<&crate::dfs::FileVersionId>,
         publication: bool,
-        chunks: Vec<crate::dfs::ChunkObject>,
         release: bool,
     ) -> Result<()> {
-        self.update_gc_with_fence(id, inode, version, publication, chunks, release, false)
+        self.update_gc_with_fence(id, inode, version, publication, release, false)
             .map(|_| ())
     }
 
-    #[allow(clippy::too_many_arguments)] // Mirrors the existing fixed GC request shape.
     fn update_gc_with_fence(
         &self,
         id: &str,
         inode: Option<&crate::dfs::InodeId>,
         version: Option<&crate::dfs::FileVersionId>,
         publication: bool,
-        chunks: Vec<crate::dfs::ChunkObject>,
         release: bool,
         capture_gc_fence: bool,
     ) -> Result<Option<crate::dfs::GcFence>> {
@@ -130,7 +102,8 @@ impl GrpcDfsMeta {
                     inode_id: inode.map(|id| id.0.clone()).unwrap_or_default(),
                     version_id: version.map(|id| id.0.clone()).unwrap_or_default(),
                     publication,
-                    chunks: chunks.into_iter().map(wire_chunk_object).collect(),
+                    // Per-chunk publication references were removed (R33).
+                    chunks: Vec::new(),
                     release,
                 }),
             )?

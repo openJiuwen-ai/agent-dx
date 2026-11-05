@@ -267,7 +267,7 @@ impl DistributedFs {
             // An inode-level reference protects every version of the inode,
             // including the one this handle pins until close.
             handle.gc_pin =
-                Some(references.pin(&inode_id, handle.opened_inode.head_version.as_ref(), None)?);
+                Some(references.pin(&inode_id, handle.opened_inode.head_version.as_ref())?);
         }
         let active = self.local_write_activity(&inode_id)?;
         self.handles.insert(id, handle, || {

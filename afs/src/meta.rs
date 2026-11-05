@@ -6,6 +6,8 @@
 //! Meta 通过统一 Store 先持久化确定变化，再发布可见权威。
 //! local-file 与显式易失 memory 使用同一操作日志合同；etcd/Redis 旧后端已退出当前交付。
 //! 没有 store 时 RPC 必须失败关闭，避免把进程内判断误写成授权事实。
+//! `Meta::with_store`、`with_store_and_peer_identity` 只供集成测试和单测装配；
+//! 集成测试链接产品库时没有 `cfg(test)`，所以留在产品代码里。
 
 pub mod dfs;
 pub mod owner_roots;
@@ -186,12 +188,6 @@ pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
         },
     );
     let dfs = if let Some(store) = store.as_ref() {
-        let local_copy = match cfg.dfs_local_copy.as_str() {
-            "required" => crate::dfs::LocalCopyPolicy::Required,
-            "preferred" => crate::dfs::LocalCopyPolicy::Preferred,
-            "none" => crate::dfs::LocalCopyPolicy::NotRequired,
-            _ => unreachable!("Config validates dfs_local_copy"),
-        };
         let service = dfs::DfsService::with_durability_policy(
             store.clone(),
             crate::dfs::ReplicationConfig {
@@ -199,7 +195,7 @@ pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
                 sync_required_copies: cfg.dfs_sync_required_copies,
                 min_distinct_nodes: cfg.dfs_min_distinct_nodes,
                 min_distinct_failure_domains: cfg.dfs_min_distinct_failure_domains,
-                local_copy,
+                local_copy: cfg.dfs_local_copy.into(),
             },
             cfg.dfs_external_backend.as_ref().map_or(
                 crate::dfs::DfsDurabilityPolicy::NodeReplicated,

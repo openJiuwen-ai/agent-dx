@@ -402,7 +402,7 @@ impl GrpcChunkTransfer {
             || node_id.len().saturating_add(endpoint.len()) > STREAM_KEY_BYTES
         {
             // Unsupported before cloning metadata or issuing an RPC; the caller
-            // drains this sink and acquires the original exclusive legacy fill.
+            // drains this sink and acquires the original exclusive full-body fill.
             return Ok(None);
         }
         let node_id = node_id.clone();

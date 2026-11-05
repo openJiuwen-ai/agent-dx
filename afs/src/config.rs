@@ -37,6 +37,33 @@ pub enum MetaStoreBackend {
     #[value(name = "memory")]
     InMemory,
 }
+/// Node-to-Node data transport. `rdma` requires the `rdma` feature; `auto`
+/// negotiates per peer and falls back to gRPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum DataMode {
+    Grpc,
+    Rdma,
+    Auto,
+}
+/// `dfs_local_copy`: whether the writing Node must hold a replica. Meta persists
+/// the choice as [`crate::dfs::LocalCopyPolicy`] when it initializes the filesystem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum DfsLocalCopy {
+    Required,
+    Preferred,
+    None,
+}
+impl From<DfsLocalCopy> for crate::dfs::LocalCopyPolicy {
+    fn from(value: DfsLocalCopy) -> Self {
+        match value {
+            DfsLocalCopy::Required => Self::Required,
+            DfsLocalCopy::Preferred => Self::Preferred,
+            DfsLocalCopy::None => Self::NotRequired,
+        }
+    }
+}
 /// Administrator-enabled OwnerFs workspace bind mount entry.
 /// The name is a single first-level OwnerFs workspace under the mount root.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -201,13 +228,14 @@ pub struct Cli {
     /// Watch event retention in milliseconds.
     #[arg(long)]
     pub meta_watch_retention_ms: Option<u64>,
-    /// Allow a node to become functionally ready with a healthy volatile Meta.
-    #[arg(long)]
+    /// Test only: allow a node to become functionally ready with a healthy volatile Meta.
+    #[arg(long, hide = true)]
     pub allow_volatile_meta: Option<bool>,
     /// Enable centralized HRW placement for new OwnerFs workspaces on Meta.
     #[arg(long)]
     pub ownerfs_mkdir_load_balance: Option<bool>,
-    #[arg(long)]
+    /// Diagnostics only: the peer that the Node REST `diagnose` route probes.
+    #[arg(long, hide = true)]
     pub peer_endpoint: Option<String>,
     /// 对外发布的本 Node gRPC URI；监听 0.0.0.0 时必须显式指定。
     #[arg(long)]
@@ -225,8 +253,8 @@ pub struct Cli {
     pub tls_server_name: Option<String>,
     #[arg(long)]
     pub fs: Option<String>,
-    #[arg(long)]
-    pub data_mode: Option<String>,
+    #[arg(long, value_enum)]
+    pub data_mode: Option<DataMode>,
     #[arg(long)]
     pub rdma_device: Option<String>,
     #[arg(long)]
@@ -320,9 +348,8 @@ pub struct Cli {
     pub dfs_min_distinct_nodes: Option<u16>,
     #[arg(long)]
     pub dfs_min_distinct_failure_domains: Option<u16>,
-    /// required, preferred, or none.
-    #[arg(long)]
-    pub dfs_local_copy: Option<String>,
+    #[arg(long, value_enum)]
+    pub dfs_local_copy: Option<DfsLocalCopy>,
     #[arg(long)]
     pub dfs_read_max_ops_per_batch: Option<usize>,
     #[arg(long)]
@@ -334,7 +361,7 @@ pub struct Cli {
     #[arg(long)]
     pub dfs_source_cache_bytes: Option<usize>,
     /// Bounded coarse read timing for explicit diagnosis only; disabled by default.
-    #[arg(long)]
+    #[arg(long, hide = true)]
     pub dfs_read_diagnostics_enabled: Option<bool>,
     /// Remote-read body verification for native DFS gRPC: `off` (default)
     /// delivers peer bytes unchecked; `receiver` verifies them against the
@@ -389,7 +416,7 @@ struct FileConfig {
     /// TLS 验证后再用证书 DER 的完整字节绑定 Node ID；仅由受信管理配置设置。
     trusted_node_certs: Option<HashMap<String, PathBuf>>,
     fs: Option<String>,
-    data_mode: Option<String>,
+    data_mode: Option<DataMode>,
     rdma_device: Option<String>,
     data_dir: Option<PathBuf>,
     uds_path: Option<PathBuf>,
@@ -427,7 +454,7 @@ struct FileConfig {
     dfs_sync_required_copies: Option<u16>,
     dfs_min_distinct_nodes: Option<u16>,
     dfs_min_distinct_failure_domains: Option<u16>,
-    dfs_local_copy: Option<String>,
+    dfs_local_copy: Option<DfsLocalCopy>,
     dfs_read_max_ops_per_batch: Option<usize>,
     dfs_read_max_inflight_bytes: Option<u64>,
     dfs_source_cache_max_ms: Option<u64>,
@@ -499,7 +526,7 @@ pub struct Config {
     pub trusted_node_certs: HashMap<String, PathBuf>,
     pub ownerfs: bool,
     pub dfs: bool,
-    pub data_mode: String,
+    pub data_mode: DataMode,
     pub rdma_device: Option<String>,
     pub data_dir: PathBuf,
     pub uds_path: PathBuf,
@@ -538,7 +565,7 @@ pub struct Config {
     pub dfs_sync_required_copies: u16,
     pub dfs_min_distinct_nodes: u16,
     pub dfs_min_distinct_failure_domains: u16,
-    pub dfs_local_copy: String,
+    pub dfs_local_copy: DfsLocalCopy,
     pub dfs_read_max_ops_per_batch: usize,
     pub dfs_read_max_inflight_bytes: u64,
     pub dfs_source_cache_max_ms: u64,
@@ -567,7 +594,7 @@ impl Config {
         let id = common::resolve_id(role, &mut cli, &mut file)?;
         let (ownerfs, dfs) = common::resolve_filesystems(role, &mut cli, &mut file)?;
         let data_mode = common::resolve_data_mode(&mut cli, &mut file)?;
-        let dfs_read_crc_mode = dfs::resolve_read_crc_mode(&cli, &file, dfs, &data_mode);
+        let dfs_read_crc_mode = dfs::resolve_read_crc_mode(&cli, &file, dfs, data_mode);
         let replication = dfs::resolve_replication(&mut cli, &mut file)?;
         let read = dfs::resolve_read_budget(&cli, &file)?;
         let fuse = fuse::resolve(&cli, &mut file)?;
@@ -744,7 +771,7 @@ struct Resolved {
     id: String,
     ownerfs: bool,
     dfs: bool,
-    data_mode: String,
+    data_mode: DataMode,
     dfs_read_crc_mode: DfsReadCrcMode,
     replication: dfs::DfsReplication,
     read: dfs::DfsReadBudget,

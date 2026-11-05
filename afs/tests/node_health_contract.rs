@@ -5,7 +5,7 @@ use std::{
 };
 
 use afs::{
-    config::{Cli, Config, Role},
+    config::{Cli, Config, DataMode, Role},
     node::{
         Node, NodeReadiness,
         api::rest,
@@ -26,7 +26,7 @@ fn test_config(data_dir: PathBuf) -> Config {
         Cli {
             data_dir: Some(data_dir),
             uds_path: Some(PathBuf::from("/tmp/afs-node-health-test.sock")),
-            data_mode: Some("grpc".into()),
+            data_mode: Some(DataMode::Grpc),
             ..Cli::default()
         },
     )
@@ -94,7 +94,13 @@ async fn node_health_can_report_foundation_ready_without_configured_mounts() {
     std::fs::create_dir_all(&data_dir).unwrap();
     let config = test_config(data_dir);
     let readiness = Arc::new(NodeReadiness::new(
-        false, None, None, None, None, "grpc", None,
+        false,
+        None,
+        None,
+        None,
+        None,
+        DataMode::Grpc,
+        None,
     ));
     mark_resources_ready(&readiness);
     let node = node_with_readiness(config, readiness);
@@ -123,7 +129,7 @@ async fn node_health_returns_unavailable_when_configured_mount_is_absent() {
         None,
         Some(missing_mount),
         None,
-        "grpc",
+        DataMode::Grpc,
         None,
     ));
     mark_resources_ready(&readiness);
@@ -150,7 +156,7 @@ async fn node_health_returns_unavailable_after_known_meta_registration_failure()
         Some(Instant::now()),
         None,
         None,
-        "grpc",
+        DataMode::Grpc,
         None,
     ));
     readiness.note_registration_failure("injected heartbeat failure");
@@ -181,7 +187,7 @@ async fn node_health_recovers_after_retryable_meta_registration_failure_clears()
         Some(Instant::now()),
         None,
         None,
-        "grpc",
+        DataMode::Grpc,
         None,
     ));
     readiness.note_registration_failure("retryable heartbeat failure");
@@ -216,7 +222,7 @@ async fn node_health_uses_latest_registration_persistence_readiness() {
         Some(Instant::now()),
         None,
         None,
-        "grpc",
+        DataMode::Grpc,
         None,
     ));
     mark_resources_ready(&readiness);
@@ -267,7 +273,7 @@ async fn node_health_rejects_volatile_meta_without_explicit_policy() {
         Some(Instant::now()),
         None,
         None,
-        "grpc",
+        DataMode::Grpc,
         None,
     ));
     readiness.note_registration_capability(&registration(
@@ -315,7 +321,7 @@ async fn node_health_allows_healthy_volatile_meta_only_when_policy_opts_in() {
         Some(Instant::now()),
         None,
         None,
-        "grpc",
+        DataMode::Grpc,
         None,
     ));
     readiness.set_allow_volatile_meta(true);
@@ -389,7 +395,7 @@ async fn initial_meta_persistence_update_preserves_registration_age() {
         Some(Instant::now() - Duration::from_secs(31)),
         None,
         None,
-        "grpc",
+        DataMode::Grpc,
         None,
     ));
     readiness.note_meta_persistence(true, None);
@@ -420,7 +426,7 @@ async fn initial_registration_capability_preserves_registration_age() {
         Some(Instant::now() - Duration::from_secs(31)),
         None,
         None,
-        "grpc",
+        DataMode::Grpc,
         None,
     ));
     readiness.set_allow_volatile_meta(true);
@@ -456,7 +462,7 @@ async fn node_health_fails_closed_on_stale_meta_heartbeat() {
         Some(Instant::now()),
         None,
         None,
-        "grpc",
+        DataMode::Grpc,
         None,
     ));
     readiness.note_meta_persistence(true, None);
@@ -488,7 +494,7 @@ async fn node_health_rejects_substituted_non_afs_mount() {
         None,
         Some(substituted_mount),
         None,
-        "grpc",
+        DataMode::Grpc,
         None,
     ));
     mark_resources_ready(&readiness);
@@ -513,7 +519,13 @@ async fn repeated_node_health_gets_do_not_touch_data_dir() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     let config = test_config(data_dir.clone());
     let readiness = Arc::new(NodeReadiness::new(
-        false, None, None, None, None, "grpc", None,
+        false,
+        None,
+        None,
+        None,
+        None,
+        DataMode::Grpc,
+        None,
     ));
     mark_resources_ready(&readiness);
     let node = node_with_readiness(config, readiness);
@@ -538,7 +550,13 @@ async fn node_health_fails_closed_before_resource_sampler_observes_device() {
     std::fs::create_dir_all(&data_dir).unwrap();
     let config = test_config(data_dir);
     let readiness = Arc::new(NodeReadiness::new(
-        false, None, None, None, None, "grpc", None,
+        false,
+        None,
+        None,
+        None,
+        None,
+        DataMode::Grpc,
+        None,
     ));
     let node = node_with_readiness(config, readiness);
 
@@ -560,7 +578,13 @@ async fn node_health_reports_data_device_failure_from_sampler_snapshot() {
     std::fs::create_dir_all(&data_dir).unwrap();
     let config = test_config(data_dir);
     let readiness = Arc::new(NodeReadiness::new(
-        false, None, None, None, None, "grpc", None,
+        false,
+        None,
+        None,
+        None,
+        None,
+        DataMode::Grpc,
+        None,
     ));
     readiness.note_resource_observation(false, Some("read-only filesystem".into()), false, None);
     let node = node_with_readiness(config, readiness);
@@ -583,7 +607,13 @@ async fn node_health_fails_closed_on_stale_resource_observation() {
     std::fs::create_dir_all(&data_dir).unwrap();
     let config = test_config(data_dir);
     let readiness = Arc::new(NodeReadiness::new(
-        false, None, None, None, None, "grpc", None,
+        false,
+        None,
+        None,
+        None,
+        None,
+        DataMode::Grpc,
+        None,
     ));
     mark_resources_ready(&readiness);
     readiness.force_stale_resource_observation_for_tests();
@@ -605,7 +635,7 @@ async fn node_health_requires_observed_rdma_availability_when_rdma_required() {
     let data_dir = temp.path().join("data");
     std::fs::create_dir_all(&data_dir).unwrap();
     let mut config = test_config(data_dir);
-    config.data_mode = "rdma".into();
+    config.data_mode = DataMode::Rdma;
     config.rdma_device = Some("missing-rdma-test-device".into());
     let readiness = Arc::new(NodeReadiness::new(
         false,
@@ -613,7 +643,7 @@ async fn node_health_requires_observed_rdma_availability_when_rdma_required() {
         None,
         None,
         None,
-        "rdma",
+        DataMode::Rdma,
         Some("missing-rdma-test-device"),
     ));
     readiness.note_resource_observation(
@@ -672,7 +702,13 @@ fn rdma_sampler_rejects_active_defer_and_accepts_exact_active() {
 #[tokio::test]
 async fn blocked_sampler_shutdown_returns_error_from_real_pending_worker() {
     let readiness = Arc::new(NodeReadiness::new(
-        false, None, None, None, None, "grpc", None,
+        false,
+        None,
+        None,
+        None,
+        None,
+        DataMode::Grpc,
+        None,
     ));
     let release = readiness.start_blocked_resource_sample_for_tests();
 
@@ -691,7 +727,13 @@ async fn resource_sampler_is_singleflight_and_reports_blocked_worker() {
     std::fs::create_dir_all(&data_dir).unwrap();
     let config = test_config(data_dir.clone());
     let readiness = Arc::new(NodeReadiness::new(
-        false, None, None, None, None, "grpc", None,
+        false,
+        None,
+        None,
+        None,
+        None,
+        DataMode::Grpc,
+        None,
     ));
     let release = readiness.start_blocked_resource_sample_for_tests();
 
@@ -713,7 +755,13 @@ async fn read_timing_endpoint_absent_when_diagnostics_disabled() {
     let temp = tempfile::tempdir().unwrap();
     let config = test_config(temp.path().to_owned());
     let readiness = Arc::new(NodeReadiness::new(
-        false, None, None, None, None, "grpc", None,
+        false,
+        None,
+        None,
+        None,
+        None,
+        DataMode::Grpc,
+        None,
     ));
     let node = node_with_readiness(config, readiness);
     let response = rest::router(node)

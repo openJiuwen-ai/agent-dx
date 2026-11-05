@@ -6,7 +6,13 @@ pub struct GcReference {
     pub session_id: String,
     pub reference_id: String,
     pub inode_id: Option<InodeId>,
+    /// Set on admitted `write:` generation references, which protect every
+    /// chunk of their generation from collection.
     pub publication: bool,
+    /// Decode only: always empty on new references. Per-chunk `publish:`
+    /// reservations were removed (R33), but this field is part of the postcard
+    /// record, so dropping it changes the WAL and checkpoint encoding and needs
+    /// a format version bump (see the format golden tests).
     pub chunks: Vec<ChunkObject>,
     pub retired_at_unix_ms: Option<u64>,
     /// Decode only: always `None` on new references. Open-read authorization
@@ -31,7 +37,6 @@ pub struct UpdateGcReference {
     pub inode_id: Option<InodeId>,
     pub version_id: Option<FileVersionId>,
     pub publication: bool,
-    pub chunks: Vec<ChunkObject>,
     pub release: bool,
     pub admission_deadline_unix_ms: u64,
 }

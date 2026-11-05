@@ -1034,7 +1034,7 @@ impl Backend for DistributedFs {
                         .gc
                         .references
                         .as_ref()
-                        .map(|references| references.pin(&inode_id, None, None))
+                        .map(|references| references.pin(&inode_id, None))
                         .transpose()?,
                 },
             );

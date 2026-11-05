@@ -366,7 +366,7 @@ impl DfsReadEngine {
 
     /// The fill leader: admit the body, recheck the cache, then give each
     /// distinct eligible copy one complete-object attempt (streaming first
-    /// when supported, else the legacy full body).
+    /// when supported, else the full-body fill).
     async fn fill_peer_cache_as_leader<'c>(
         &self,
         read: &PeerCacheRead<'_>,
@@ -425,7 +425,7 @@ impl DfsReadEngine {
         self.check_peer_cache_authority(batch, source, authority)?;
         let length = usize::try_from(chunk.length)
             .map_err(|_| invalid("Peer cache object length is too large"))?;
-        // Only an unsupported streaming adapter allocates the legacy body.
+        // Only an unsupported streaming adapter allocates the full body.
         // After that decision, retries keep the old mechanism rather than hold
         // a full Vec alongside a new streaming pipeline reservation.
         let mut fill = LeaderFill {
@@ -435,7 +435,7 @@ impl DfsReadEngine {
             length,
             last_error: None,
             body: Vec::new(),
-            legacy_fill_work: None,
+            full_body_fill_work: None,
             preparation,
         };
         let version = batch
@@ -489,7 +489,7 @@ impl DfsReadEngine {
                 return Ok(SourceOutcome::NotApplicable);
             }
             if let Some(outcome) = self
-                .fill_legacy_attempt(read, &mut fill, &attempt, source, out)
+                .fill_full_body_attempt(read, &mut fill, &attempt, source, out)
                 .await?
             {
                 return Ok(outcome);
@@ -536,7 +536,7 @@ impl DfsReadEngine {
             )
             .await;
         if !received.as_ref().is_ok_and(Option::is_none) {
-            // An unsupported probe starts no RPC. Retain the legacy
+            // An unsupported probe starts no RPC. Retain the full-body
             // prepare clock in that case instead of inventing an
             // extra receive observation or overlapping prepare work.
             if let Some(mut stage) = fill.preparation.take() {
@@ -607,9 +607,9 @@ impl DfsReadEngine {
         }
     }
 
-    /// One legacy complete-object attempt into a private full body. `None`
+    /// One full-body complete-object attempt into a private body. `None`
     /// records the failure and moves on to the next copy.
-    async fn fill_legacy_attempt<'s>(
+    async fn fill_full_body_attempt<'s>(
         &'s self,
         read: &PeerCacheRead<'_>,
         fill: &mut LeaderFill<'_, '_, '_, 's>,
@@ -623,7 +623,7 @@ impl DfsReadEngine {
         // before the original complete-object Vec is admitted.
         if fill.body.is_empty() {
             // The streaming adapter and sink have drained before changing
-            // admission modes. Legacy owns the original exclusive body
+            // admission modes. The full-body fill owns the original exclusive body
             // permit, so its full Vec never coexists with another stream.
             fill.operation.release_fill();
             fill.operation
@@ -631,7 +631,7 @@ impl DfsReadEngine {
                     self.check_peer_cache_authority(batch, source, authority)
                 })
                 .await?;
-            fill.legacy_fill_work = self.local.peer_disk_cache_fill_work(fill.length, out.len());
+            fill.full_body_fill_work = self.local.peer_disk_cache_fill_work(fill.length, out.len());
             fill.body.resize(fill.length, 0);
         }
         drop(fill.preparation.take());
@@ -746,7 +746,7 @@ enum StreamAttempt {
     Settled(SourceOutcome),
     /// This copy failed; try the next copy.
     Failed,
-    /// The adapter declined the stream; this copy takes the legacy body.
+    /// The adapter declined the stream; this copy takes the full-body fill.
     Unsupported,
 }
 
@@ -760,6 +760,6 @@ struct LeaderFill<'f, 'c, 'o, 'l> {
     length: usize,
     last_error: Option<Error>,
     body: Vec<u8>,
-    legacy_fill_work: Option<crate::node::metrics::work::PeerCacheFillWork>,
+    full_body_fill_work: Option<crate::node::metrics::work::PeerCacheFillWork>,
     preparation: Option<PeerFillStage<'l>>,
 }

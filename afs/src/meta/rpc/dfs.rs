@@ -11,11 +11,13 @@ impl DfsMetaService for DfsMetaRpc {
         let authenticated = authenticated_node_id(&self.0, &request)?;
         let request = request.into_inner();
         validate_caller(authenticated.as_deref(), &request.node_id)?;
+        if !request.chunks.is_empty() {
+            // Per-chunk publication references were removed (R33); a write
+            // generation reference protects its chunks instead.
+            return Err(invalid("GC references no longer carry chunks"));
+        }
         if request.capture_gc_fence
-            && (request.release
-                || !request.publication
-                || request.inode_id.is_empty()
-                || !request.chunks.is_empty())
+            && (request.release || !request.publication || request.inode_id.is_empty())
         {
             return Err(Status::invalid_argument(
                 "GC fence requires initial publication retain",
@@ -26,8 +28,6 @@ impl DfsMetaService for DfsMetaRpc {
         }
         let observation = if request.release {
             "dfs_gc_release"
-        } else if !request.chunks.is_empty() {
-            "dfs_gc_register"
         } else if request.capture_gc_fence {
             "dfs_gc_capture"
         } else {
@@ -42,11 +42,6 @@ impl DfsMetaService for DfsMetaRpc {
                 inode_id: optional_id(request.inode_id).map(crate::dfs::InodeId::new),
                 version_id: optional_id(request.version_id).map(crate::dfs::FileVersionId::new),
                 publication: request.publication,
-                chunks: request
-                    .chunks
-                    .into_iter()
-                    .map(domain_chunk_object)
-                    .collect::<Result<Vec<_>, _>>()?,
                 release: request.release,
                 admission_deadline_unix_ms: request.admission_deadline_unix_ms,
             })
@@ -901,7 +896,6 @@ impl DfsMetaService for DfsMetaRpc {
                                 })
                                 .collect(),
                             expires_at_unix_ms: entry.expires_at_unix_ms,
-                            open_sources: entry.open_sources,
                         }
                     })
                     .collect(),

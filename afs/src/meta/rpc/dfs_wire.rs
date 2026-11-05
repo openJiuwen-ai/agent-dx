@@ -705,8 +705,6 @@ pub(super) fn wire_authorized_read(
 ) -> afs_protocol::meta::DfsAuthorizedRead {
     let validation = entry.validation;
     afs_protocol::meta::DfsAuthorizedRead {
-        open_sources: Vec::new(),
-
         validation: Some(afs_protocol::meta::DfsReadValidation {
             grant: Some(wire_read_grant(validation.grant)),
             chunk_id: validation.chunk_id.0,

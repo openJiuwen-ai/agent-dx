@@ -62,7 +62,6 @@ pub fn init_process_tracing(
     metrics: Option<TraceRuntimeMetrics>,
 ) -> Result<TracingGuard, TracingError> {
     config.validate()?;
-    afs_metrics::install_exemplar_provider(crate::current_exemplar);
     if !config.enabled {
         // 仅进程入口拥有 Subscriber。显式禁用可切断 tracing/log 在无
         // dispatcher 时的 Span→日志回退，业务 log facade 的桥接保持不变。

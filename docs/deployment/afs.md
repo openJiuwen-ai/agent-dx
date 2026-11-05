@@ -22,7 +22,7 @@ Agent FS（AFS） 是 Agent DX 的可选文件系统组件。默认部署配置�
 
 Meta 后端优先级：
 
-1. `memory`：一次性演示，重启不保留状态；
+1. `memory`：测试专用，重启不保留状态；
 2. `local-file`：当前可靠性基线，中心节点可正常重启恢复；
 etcd／Redis适配已移除；未来支持需重新设计和验收，不是当前可选后端。
 
@@ -193,6 +193,117 @@ false；可在TOML或CLI（`--tls-encryption-enabled true|false`）覆盖。fals
 如果启用 FUSE 挂载，先确认 `/mnt/adx/ownerfs` 与 `/mnt/adx/dfs` 为空目录，再在
 `node.toml` 中启用对应 `ownerfs_mount` 或 `dfs_mount`。挂载所有者捕获的 canonical
 path、mount ID 和 source 同时作为 readiness 身份；挂载被替换时健康检查继续失败关闭。
+
+## 配置分类
+
+Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，CLI 把下划线写成连字符。TOML 拒绝未知键。下表登记全部 82 个顶层键：80 个 TOML 键，加上只在 CLI 上的 `config` 和 `print_config`。除标注"仅 TOML"的键和这两个 CLI 项外，其余键两边都能设置。
+
+- **产品差异**：不同部署按需选择的功能或拓扑。
+- **调优**：资源与性能预算，默认值可以直接用于部署。
+- **测试专用**：测试或实验环境使用，生产部署不启用。
+- **诊断**：限定诊断时按需打开，平时不启用。
+
+"角色"列是实际读取该键的进程。默认值以 `--print-config` 输出为准。
+
+<!-- afs-config-table:begin -->
+| 键 | 类别 | 角色 | 默认值 | 说明 |
+|---|---|---|---|---|
+| `config` | 产品差异 | 两者 | 无 | TOML 配置文件路径；不传则全部用默认值。仅 CLI |
+| `id` | 产品差异 | 两者 | Meta `meta`；Node `node` | 进程身份；1..128 个字母、数字、`_`、`-` |
+| `grpc_listen` | 产品差异 | 两者 | Meta `127.0.0.1:7400`；Node `127.0.0.1:7500` | gRPC 监听地址 |
+| `rest_listen` | 产品差异 | 两者 | Meta `127.0.0.1:7401`；Node `127.0.0.1:7501` | REST 监听地址（健康、指标、诊断） |
+| `meta_endpoint` | 产品差异 | Node | 无 | Meta 的 gRPC URI；Node 启用文件系统时需要 |
+| `meta_store` | 产品差异 | Meta | `local-file` | Meta 权威存储：`local-file` 或 `memory`；`memory` 属测试专用取值，见表后说明 |
+| `advertise_endpoint` | 产品差异 | Node | 无 | 对外发布的本 Node gRPC URI；未设时由 `grpc_listen` 推导，监听 `0.0.0.0` 时必须显式指定 |
+| `tls_encryption_enabled` | 产品差异 | 两者 | `false` | mTLS 认证之后是否加密内部流量 |
+| `tls_ca_certificate` | 产品差异 | 两者 | 无 | 内部 mTLS 的 CA 证书路径 |
+| `tls_identity_certificate` | 产品差异 | 两者 | 无 | 本进程身份证书路径 |
+| `tls_identity_private_key` | 产品差异 | 两者 | 无 | 本进程身份私钥路径 |
+| `tls_server_name` | 产品差异 | 两者 | 无 | 校验对端证书用的服务名 |
+| `trusted_node_certs` | 产品差异 | 两者 | `{}` | Node ID 到证书的绑定表。仅 TOML |
+| `fs` | 产品差异 | 两者 | 全部已编译后端 | `ownerfs`、`dfs` 或 `all`；`--print-config` 把它展开成 `ownerfs`、`dfs` 两个布尔值 |
+| `data_mode` | 产品差异 | Node | `grpc` | Node 间数据通道：`grpc`、`rdma` 或 `auto`；`rdma` 需要编译 `rdma` feature |
+| `rdma_device` | 产品差异 | Node | 无 | RDMA 设备名；OwnerFs 的 `rdma` 模式必填 |
+| `data_dir` | 产品差异 | 两者 | `/tmp/afs-<id>/data` | 数据目录，必须是绝对路径；默认值只适合临时运行 |
+| `uds_path` | 产品差异 | Node | `/tmp/afs-<id>/local.sock` | Local SDK 的 Unix socket 路径 |
+| `ownerfs_mount` | 产品差异 | Node | 无 | OwnerFs FUSE 挂载点；不设则不挂载 |
+| `ownerfs_mkdir_load_balance` | 产品差异 | Meta | `false` | 新 OwnerFs workspace 由 Meta 按 HRW 放置；写在 Node 配置里会启动失败 |
+| `dfs_mount` | 产品差异 | Node | 无 | DFS FUSE 挂载点；不设则不挂载 |
+| `dfs_external_backend` | 产品差异 | 两者 | 无 | 外部 S3 持久化；不设则用原生副本，子键见[DFS 外部 S3 连接](#dfs-外部-s3-连接)。仅 TOML |
+| `dfs_peer_cache` | 产品差异 | Node | 无 | 原生 Peer 可丢弃磁盘读缓存；不设则关闭，与 `dfs_external_backend` 互斥。仅 TOML |
+| `dfs_desired_copies` | 产品差异 | Meta | `1` | 文件系统级副本目标数，Meta 初始化时固定 |
+| `dfs_sync_required_copies` | 产品差异 | Meta | `1` | 提交前必须确认的副本数 |
+| `dfs_min_distinct_nodes` | 产品差异 | Meta | `1` | 副本至少分布的 Node 数 |
+| `dfs_min_distinct_failure_domains` | 产品差异 | Meta | `1` | 副本至少分布的故障域数 |
+| `dfs_local_copy` | 产品差异 | Meta | `required` | 写入 Node 是否必须持有副本：`required`、`preferred` 或 `none` |
+| `dfs_read_crc_mode` | 产品差异 | Node | `off` | 原生 DFS gRPC 远端读的正文校验：`off` 或 `receiver`；其他后端和通道固定走内部策略，`--print-config` 显示 `both`，且不接受显式设置 |
+| `log_level` | 产品差异 | 两者 | `info` | 日志级别 |
+| `trace_enabled` | 产品差异 | 两者 | `false` | 是否导出 Trace |
+| `trace_endpoint` | 产品差异 | 两者 | `http://127.0.0.1:4317` | OTLP 导出地址 |
+| `timeout_ms` | 调优 | Node | `5000` | 1..=300000；同时用作 Meta RPC、Peer、RDMA 和 S3 的请求超时 |
+| `trace_sample_ratio` | 调优 | 两者 | `0.01` | Trace 采样比例，0..=1 |
+| `meta_record_max_bytes` | 调优 | Meta | `67108864` | 单条操作日志记录上限 |
+| `meta_batch_max_bytes` | 调优 | Meta | `134217728` | 单个持久批次上限 |
+| `meta_wal_max_bytes` | 调优 | Meta | `1073741824` | WAL 总量上限；空间用尽时写入失败关闭 |
+| `meta_wal_segment_bytes` | 调优 | Meta | `67108864` | 软分段大小，不超过 WAL 上限 |
+| `meta_checkpoint_wal_bytes` | 调优 | Meta | `134217728` | 后台检查点的 WAL 字节阈值 |
+| `meta_checkpoint_wal_records` | 调优 | Meta | `1000000` | 后台检查点的记录数阈值 |
+| `meta_checkpoint_interval_ms` | 调优 | Meta | `60000` | 后台检查点间隔 |
+| `meta_request_retention_ms` | 调优 | Meta | `86400000` | 幂等结果保留时长 |
+| `meta_request_outcomes_max` | 调优 | Meta | `1000000` | 幂等结果保留条数上限 |
+| `meta_request_bytes_max` | 调优 | Meta | `268435456` | 幂等结果保留字节上限 |
+| `meta_watch_events_max` | 调优 | Meta | `1000000` | Watch 事件保留条数上限 |
+| `meta_watch_bytes_max` | 调优 | Meta | `67108864` | Watch 事件保留字节上限 |
+| `meta_watch_retention_ms` | 调优 | Meta | `3600000` | Watch 事件保留时长 |
+| `fuse_threads` | 调优 | Node | `4` | FUSE 接收线程数，1..=64 |
+| `fuse_clone_fd` | 调优 | Node | `true` | 多接收线程时克隆 FUSE 描述符 |
+| `fuse_workers` | 调优 | Node | `32` | 回调执行器线程数，1..=1024 |
+| `fuse_max_tasks` | 调优 | Node | `256` | 接纳的 FUSE 任务上限，1..=65536；默认是 `fuse_workers` 的 8 倍 |
+| `fuse_max_readahead_bytes` | 调优 | Node | `16777216` | 内核预读上限，不超过 16 MiB |
+| `dfs_read_pipeline` | 调优 | Node | `{"max_rpcs":4,"max_reply_bytes":268435456,"max_disk_reads":2,"max_batch_ops":4,"max_pending":256,"task_timeout_ms":30000}` | FUSE 读流水线的并发与回复内存上限。仅 TOML |
+| `dfs_version_cache_entries` | 调优 | Node | `4096` | 不可变版本缓存条目数，1..=65536 |
+| `dfs_version_cache_bytes` | 调优 | Node | `33554432` | 版本缓存的元数据字节估算上限，不超过 1 GiB |
+| `dfs_outboard_work_wait_ms` | 调优 | Node | `2` | 校验工作准入等待，0..=50 |
+| `dfs_catalog_commit_queue` | 调优 | Node | `256` | catalog 提交排队与执行中的请求数，1..=256 |
+| `dfs_write_queue_bytes` | 调优 | Node | `2147483648` | FUSE 前端写队列跨文件持有的载荷，8 MiB..=1 TiB |
+| `dfs_dirty_budget_bytes` | 调优 | Node | `67108864` | 写流水线活跃正文容量，4..=64 MiB |
+| `dfs_gc_grace_ms` | 调优 | Meta | `1000` | 引用退役后继续保护数据的时长，0..=600000 |
+| `dfs_unpublished_descriptors` | 调优 | Node | `1024` | 已上传未发布的对象数，1..=1024 |
+| `dfs_upload_inflight_chunks` | 调优 | Node | `8` | 上传并发，1..=8；S3 模式下实际被压到 4 |
+| `dfs_background_commit_ms` | 调优 | Node | `5000` | 后台提交调度周期，1..=60000；不是发布期限 |
+| `dfs_sidecar_install_queue` | 调优 | Node | `64` | 可选 sidecar 安装的排队与执行数，1..=64 |
+| `dfs_write_buffer_idle_bytes` | 调优 | Node | `134217728` | 写 buffer 池的空闲保留容量，不是活跃正文额度。仅 TOML |
+| `dfs_fetch_max_inflight_objects` | 调优 | Node | `8` | 缓存填充 flight 记录数，1..=8；只在配置了 `dfs_peer_cache` 时生效 |
+| `dfs_readahead_max_bytes` | 调优 | Node | `0` | 对象预读距离，0..=32 MiB；0 表示关闭 |
+| `dfs_peer_serve_resident_objects` | 调优 | Node | `2` | Peer 服务端常驻校验对象数，1..=16 |
+| `dfs_peer_serve_payload_bytes` | 调优 | Node | `16777216` | Peer 服务端常驻与在途载荷共享上限，4..=64 MiB |
+| `dfs_peer_serve_wait_ms` | 调优 | Node | `20` | Peer 服务准入等待，0..=50；0 表示不等待 |
+| `dfs_read_max_ops_per_batch` | 调优 | Node | `128` | 单批读操作数上限 |
+| `dfs_read_max_inflight_bytes` | 调优 | Node | `8388608` | 读在途字节上限；也决定 Peer 缓存走流式填充还是整块填充 |
+| `dfs_source_cache_max_ms` | 调优 | Node | `5000` | 副本来源缓存时长，不超过 60000；0 表示不保留 |
+| `dfs_source_lookahead_chunks` | 调优 | Node | `64` | 来源元数据前瞻 chunk 数，不超过 128 |
+| `dfs_source_cache_bytes` | 调优 | Node | `4194304` | 来源元数据缓存字节上限，不超过 4 MiB |
+| `allow_volatile_meta` | 测试专用 | Node | `false` | 允许 Node 在 Meta 为 `memory` 时报告就绪；不在 `--help` 中显示，启用时打 WARN |
+| `experimental_ownerfs_workspace_bind` | 测试专用 | Node | `false` | 实验性 OwnerFs workspace bind，见 [OwnerFs workspace bind ON](#ownerfs-workspace-bind-on) |
+| `ownerfs_workspace_egress_root` | 测试专用 | Node | 无 | workspace bind 目标的原生根目录；开启 bind 时必填 |
+| `ownerfs_workspace_bind` | 测试专用 | Node | 无 | workspace 名，只校验不读取。仅 TOML |
+| `peer_endpoint` | 诊断 | Node | 无 | REST `diagnose` 探测的对端，数据面不读；不在 `--help` 中显示，设置时打 WARN |
+| `dfs_read_diagnostics_enabled` | 诊断 | Node | `false` | [原生读粗粒度诊断](#原生读粗粒度诊断)开关；不在 `--help` 中显示，启用时打 WARN |
+| `print_config` | 诊断 | 两者 | `false` | 打印合并后的配置并退出，不创建监听或挂载。CLI 写作 `--print-config`，仅 CLI |
+<!-- afs-config-table:end -->
+
+**启动时的 WARN**。下列选项启用时，进程在日志初始化后为每个选项打一条 `config.test_only_option_enabled`，字段 `option` 是选项名，`category` 是 `test-only` 或 `diagnostic`；`--print-config` 不打：
+
+- `allow_volatile_meta = true`
+- `peer_endpoint` 已设置
+- `dfs_read_diagnostics_enabled = true`
+- `dfs_external_backend.allow_http = true`：这是嵌套子键，没有 CLI 选项，只用于隔离测试端点
+
+`meta_store = "memory"` 是测试专用取值，只用于可丢弃状态；Meta 打开这个存储时打 WARN `meta.store.memory_volatile`。
+
+OwnerFs workspace bind 的 3 个键目前没有启动 WARN。
+
+**Meta 专用键写在 Node 配置里**。`meta_*` 13 个调优键、`dfs_desired_copies`、`dfs_sync_required_copies`、`dfs_min_distinct_nodes`、`dfs_min_distinct_failure_domains`、`dfs_local_copy`、`dfs_gc_grace_ms` 写在 Node 配置里不会报错：Node 只解析和校验，不使用这些值，修改它们不会改变 Meta 的行为，副本策略以 Meta 配置为准。配置了 `dfs_external_backend` 时，Node 还会校验那 4 个副本计数都是 `1`、`dfs_local_copy` 是 `required`，否则启动失败。`meta_store` 写在 Node 配置里同样不生效，Node 通过注册结果判断 Meta 的持久能力。例外是 `ownerfs_mkdir_load_balance`，写在 Node 配置里会启动失败。Node 专用键写在 Meta 配置里也只解析和校验，例外是 `experimental_ownerfs_workspace_bind = true`，在 Meta 上会启动失败。
 
 ## OwnerFs workspace bind ON
 

@@ -99,7 +99,7 @@ impl DfsService {
         {
             return Err(conflict("commit references a chunk pending deletion"));
         }
-        push_commit_reference_mutations(&mut txn, &caller_id, &commit, generation_references);
+        push_commit_reference_mutations(&mut txn, generation_references);
         if let Some(session) = external_session {
             txn.conditions.extend([
                 TxnCondition::EntityEquals(MetaEntity::DfsDurabilityPolicy(durability_policy)),
@@ -693,24 +693,13 @@ fn push_commit_gc_fence(
 
 fn push_commit_reference_mutations(
     txn: &mut MetaTxn,
-    caller_id: &str,
-    commit: &CommitFileVersion,
     generation_references: Vec<crate::dfs::GcReference>,
 ) {
-    if !generation_references.is_empty() {
-        for mut reference in generation_references {
-            // The version becomes reachable in this same transaction. Retain a
-            // retirement marker through the maximum delayed-admission window.
-            reference.retired_at_unix_ms = Some(now_unix_ms());
-            txn.mutations
-                .push(TxnMutation::Put(MetaEntity::DfsReference(reference)));
-        }
-    } else {
+    for mut reference in generation_references {
+        // The version becomes reachable in this same transaction. Retain a
+        // retirement marker through the maximum delayed-admission window.
+        reference.retired_at_unix_ms = Some(now_unix_ms());
         txn.mutations
-            .push(TxnMutation::Delete(MetaKey::DfsReference {
-                node_id: caller_id.to_owned(),
-                session_id: commit.write_lease.owner_session_id.clone(),
-                reference_id: format!("publish:{}", commit.operation_id.0),
-            }));
+            .push(TxnMutation::Put(MetaEntity::DfsReference(reference)));
     }
 }

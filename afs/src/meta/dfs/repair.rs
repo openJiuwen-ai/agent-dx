@@ -609,9 +609,7 @@ impl DfsService {
         .await?;
         let repair_health = repair_health_for(remaining_live_sources);
         let mut updated_placement = placement.clone();
-        if !reported.changed.is_empty() || updated_placement.health != repair_health {
-            updated_placement.health = repair_health;
-        }
+        updated_placement.health = repair_health;
         let updated_task = corruption_repair_task(
             &request,
             &placement,

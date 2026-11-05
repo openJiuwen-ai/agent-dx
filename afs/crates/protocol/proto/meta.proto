@@ -1193,7 +1193,9 @@ message DfsMissingReadSource {
   uint64 length = 3;
 }
 message DfsAuthorizedRead {
-  bytes open_sources = 4; // bounded Meta-to-serving-Node file authorization page
+  // Was `bytes open_sources`: never populated by Meta nor read by Nodes.
+  reserved 4;
+  reserved "open_sources";
   DfsReadValidation validation = 1;
   message Range { uint64 offset = 1; uint64 length = 2; }
   repeated Range allowed_ranges = 2;

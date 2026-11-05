@@ -966,8 +966,6 @@ impl CurrentExternalFixture {
             .expect("fixture must return the committed external chunk key");
         DfsExternalAuthorizedRead {
             authorized: DfsAuthorizedRead {
-                open_sources: Vec::new(),
-
                 validation,
                 allowed_ranges: vec![(0, chunk.length)],
                 expires_at_unix_ms: u64::MAX,

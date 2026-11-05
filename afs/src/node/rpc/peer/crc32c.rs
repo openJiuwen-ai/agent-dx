@@ -301,7 +301,7 @@ impl<'a> CrcRangeDecoder<'a> {
                         || op.chunk_offset.checked_add(op.length) == Some(self.chunk.length));
                 let segment_only = done.range_checksum_algorithm
                     == afs_protocol::node_data::DfsDigestAlgorithm::Crc32cSegmentsV1 as i32;
-                let legacy_range = done.range_checksum_algorithm
+                let whole_range_crc = done.range_checksum_algorithm
                     == afs_protocol::node_data::DfsDigestAlgorithm::Crc32c as i32;
                 let receiver_only = done.range_checksum_algorithm
                     == afs_protocol::node_data::DfsDigestAlgorithm::Crc32cReceiverOnly as i32;
@@ -309,13 +309,13 @@ impl<'a> CrcRangeDecoder<'a> {
                     == afs_protocol::node_data::DfsDigestAlgorithm::ReadUnchecked as i32;
                 let policy_matches = match self.mode {
                     crate::config::DfsReadCrcMode::Both => {
-                        legacy_range || (segment_only && complete_segments)
+                        whole_range_crc || (segment_only && complete_segments)
                     }
                     crate::config::DfsReadCrcMode::Receiver => {
                         if complete_segments {
                             receiver_only
                         } else {
-                            legacy_range
+                            whole_range_crc
                         }
                     }
                     crate::config::DfsReadCrcMode::Off => unchecked,
@@ -341,7 +341,7 @@ impl<'a> CrcRangeDecoder<'a> {
                     .out
                     .get(start..start + self.cursor)
                     .ok_or_else(|| dfs_protocol_error("CRC output exceeds destination"))?;
-                if legacy_range {
+                if whole_range_crc {
                     let crc_scope = self.metrics.as_ref().and_then(|metrics| {
                         metrics.coarse_diagnostic("crc_range_receive", body.len() as u64)
                     });

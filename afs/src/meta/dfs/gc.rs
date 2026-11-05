@@ -92,13 +92,6 @@ fn plan_collection(
             chunks.insert(task.chunk_id.clone());
         }
     }
-    for reference in references.iter().filter(|reference| {
-        reference
-            .retired_at_unix_ms
-            .is_none_or(|time| time.saturating_add(grace) > now)
-    }) {
-        chunks.extend(reference.chunks.iter().map(|chunk| chunk.id.clone()));
-    }
     // Inventory can arrive from any replica before CommitFileVersion. One
     // admitted write generation protects all of its independently named objects.
     let generations: BTreeSet<_> = references
@@ -114,12 +107,6 @@ fn plan_collection(
                 .reference_id
                 .strip_prefix("write:")
                 .map(str::to_owned)
-                .or_else(|| {
-                    reference
-                        .reference_id
-                        .strip_prefix("publish:")
-                        .map(|operation| ChunkObject::generation_id(&OperationId::new(operation)))
-                })
         })
         .collect();
     for entity in entities {
@@ -252,10 +239,10 @@ impl DfsService {
         let key = ref_key(&update.node_id, &update.session_id, &update.reference_id);
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
-        // Concurrent uploads append to one publication reference. Queue them
-        // fairly instead of making each append lose up to 64 CAS attempts.
-        // Fixed shards bound memory; durable conditions still fence GC, other
-        // service instances, session replacement and cancelled requests.
+        // Serialize updates of one reference key fairly instead of letting each
+        // lose up to 64 CAS attempts. Fixed shards bound memory; durable
+        // conditions still fence GC, other service instances, session
+        // replacement and cancelled requests.
         let shard = hasher.finish() as usize % self.gc_reference_updates.len();
         let _reference_update = self.gc_reference_updates[shard].lock().await;
         for _ in 0..64 {
@@ -377,46 +364,10 @@ impl DfsService {
             {
                 return Err(invalid("reference identity was reused for another access"));
             }
-            let gc = match reference_entity(&view, MetaKey::DfsGc, &mut conditions)? {
-                Some(MetaEntity::DfsGc(gc)) => gc,
-                _ => GcState::default(),
-            };
-            if update
-                .chunks
-                .iter()
-                .any(|chunk| gc.chunks.contains(&chunk.id))
-            {
-                return Err(afs_error::Error::coded(
-                    afs_error::META_DFS_GC_BUSY,
-                    "chunk deletion must finish before publication",
-                ));
-            }
-            if !update.chunks.is_empty() && !reference.publication {
-                return Err(invalid("chunks require a publication reference"));
-            }
-            let mut mutations = Vec::new();
-            for chunk in &update.chunks {
-                if let Some(MetaEntity::DfsChunk(known)) =
-                    reference_entity(&view, MetaKey::DfsChunk(chunk.id.clone()), &mut conditions)?
-                {
-                    if &known != chunk {
-                        return Err(invalid("immutable chunk identity changed"));
-                    }
-                } else {
-                    mutations.push(TxnMutation::Put(MetaEntity::DfsChunk(chunk.clone())));
-                }
-                if let Some(known) = reference.chunks.iter().find(|known| known.id == chunk.id) {
-                    if known != chunk {
-                        return Err(invalid("publication chunk identity changed"));
-                    }
-                } else {
-                    reference.chunks.push(chunk.clone());
-                }
-            }
             if update.release {
                 reference.retired_at_unix_ms = Some(now_unix_ms());
             }
-            mutations.push(TxnMutation::Put(MetaEntity::DfsReference(reference)));
+            let mutations = vec![TxnMutation::Put(MetaEntity::DfsReference(reference))];
             if self
                 .gc_commit_checked(conditions, StoreOperation::DfsUpdateReference, mutations)
                 .await?

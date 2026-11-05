@@ -269,7 +269,7 @@ pub trait Backend: Send + Sync {
 
     /// Optional owned read response for backends that can build a private final
     /// payload without first filling a caller-owned buffer. The default keeps
-    /// legacy backends compatible by delegating to `read`.
+    /// other backends working by delegating to `read`.
     fn read_owned(
         &self,
         ctx: &types::RequestContext,
@@ -303,7 +303,7 @@ pub trait Backend: Send + Sync {
     }
 
     /// Keep private response ownership through the synchronous FUSE reply.
-    /// Legacy backends transfer their Vec allocation without copying.
+    /// By default, backends transfer their Vec allocation without copying.
     fn read_reply(
         &self,
         ctx: &types::RequestContext,

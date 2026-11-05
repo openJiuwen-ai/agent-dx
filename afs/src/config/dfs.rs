@@ -3,7 +3,8 @@
 //! backend, write buffers, Peer cache).
 
 use super::{
-    Cli, Config, DfsReadCrcMode, FileConfig, MAX_DFS_EXTERNAL_CACHE_CAPACITY_BYTES, Role, invalid,
+    Cli, Config, DataMode, DfsLocalCopy, DfsReadCrcMode, FileConfig,
+    MAX_DFS_EXTERNAL_CACHE_CAPACITY_BYTES, Role, invalid,
 };
 use afs_error::Result;
 
@@ -11,16 +12,16 @@ pub(super) fn resolve_read_crc_mode(
     cli: &Cli,
     file: &FileConfig,
     dfs: bool,
-    data_mode: &str,
+    data_mode: DataMode,
 ) -> DfsReadCrcMode {
     // This policy is implemented only for native CRC-format gRPC reads.
     // Keep unrelated backends and transports on their existing path.
-    let default_read_crc_mode = if dfs && file.dfs_external_backend.is_none() && data_mode == "grpc"
-    {
-        DfsReadCrcMode::default()
-    } else {
-        DfsReadCrcMode::Both
-    };
+    let default_read_crc_mode =
+        if dfs && file.dfs_external_backend.is_none() && data_mode == DataMode::Grpc {
+            DfsReadCrcMode::default()
+        } else {
+            DfsReadCrcMode::Both
+        };
     cli.dfs_read_crc_mode
         .or(file.dfs_read_crc_mode)
         .unwrap_or(default_read_crc_mode)
@@ -32,7 +33,7 @@ pub(super) struct DfsReplication {
     pub(super) dfs_sync_required_copies: u16,
     pub(super) dfs_min_distinct_nodes: u16,
     pub(super) dfs_min_distinct_failure_domains: u16,
-    pub(super) dfs_local_copy: String,
+    pub(super) dfs_local_copy: DfsLocalCopy,
 }
 
 pub(super) fn resolve_replication(cli: &mut Cli, file: &mut FileConfig) -> Result<DfsReplication> {
@@ -56,7 +57,7 @@ pub(super) fn resolve_replication(cli: &mut Cli, file: &mut FileConfig) -> Resul
         .dfs_local_copy
         .take()
         .or(file.dfs_local_copy.take())
-        .unwrap_or_else(|| "required".into());
+        .unwrap_or(DfsLocalCopy::Required);
     if dfs_sync_required_copies == 0
         || dfs_sync_required_copies > dfs_desired_copies
         || dfs_min_distinct_nodes == 0
@@ -66,11 +67,6 @@ pub(super) fn resolve_replication(cli: &mut Cli, file: &mut FileConfig) -> Resul
     {
         return Err(invalid(
             "DFS replication counts must be non-zero and no greater than dfs_desired_copies",
-        ));
-    }
-    if !["required", "preferred", "none"].contains(&dfs_local_copy.as_str()) {
-        return Err(invalid(
-            "dfs_local_copy must be required, preferred or none",
         ));
     }
     Ok(DfsReplication {
@@ -322,7 +318,7 @@ pub(super) fn validate_storage(role: Role, cfg: &Config) -> Result<()> {
             || cfg.dfs_sync_required_copies != 1
             || cfg.dfs_min_distinct_nodes != 1
             || cfg.dfs_min_distinct_failure_domains != 1
-            || cfg.dfs_local_copy != "required"
+            || cfg.dfs_local_copy != DfsLocalCopy::Required
         {
             return Err(invalid(
                 "external backend requires DFS with fixed single-copy defaults; Node replication combinations are unsupported",

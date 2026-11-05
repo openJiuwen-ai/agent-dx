@@ -47,7 +47,7 @@ fn process_probe() {
     for _ in 0..32 {
         let span = tracing::info_span!(target: "afs_tracing", "rpc_fallback_sentinel", transport.result = tracing::field::Empty);
         let _entered = span.enter();
-        assert_eq!(afs_tracing::current_exemplar().is_some(), mode == "1");
+        assert_eq!(afs_tracing::current_correlation().is_some(), mode == "1");
         span.record("transport.result", "ok");
     }
     afs_logging::info!("business_ready_sentinel");

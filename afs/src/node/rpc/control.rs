@@ -6,6 +6,9 @@
 //! `owner`（`OwnerControl`，`ownerfs`）、`dfs`（`DfsOwnerControl`，`dfs`）；未编译的
 //! 后端不注册 service，对端调用得到 gRPC UNIMPLEMENTED。
 //!
+//! `make_control_server` 只供 `tests/rdma_lifecycle.rs` 和单测装配（集成测试链接产品库
+//! 时没有 `cfg(test)`，所以留在产品代码里）；Node 装配走 `NodeControlService::into_server`。
+//!
 //! RDMA 建连顺序：
 //! 1. 客户端本地打开 RdmaEndpoint，拿到 client_info；
 //! 2. 客户端调用 NegotiateData，把 client_info 通过 gRPC 发给服务端；
@@ -155,7 +158,7 @@ pub fn owner_rdma_identity(
 }
 
 /// Authenticated business transports use this entry point after validating the
-/// channel and Node epoch. The legacy diagnostic RPC creates unbound sessions.
+/// channel and Node epoch. The diagnostic RPC creates unbound sessions.
 pub async fn negotiate_for_peer(
     registry: &RdmaSessionRegistry,
     identity: PeerSessionIdentity,

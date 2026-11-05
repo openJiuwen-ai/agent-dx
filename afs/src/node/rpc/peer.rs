@@ -167,12 +167,7 @@ const RELEASE_INITIAL_BACKOFF: Duration = Duration::from_millis(2);
 const RELEASE_MAX_BACKOFF: Duration = Duration::from_millis(20);
 #[cfg(feature = "ownerfs")]
 pub const OWNER_RDMA_MAX_CLIENT_WINDOWS: usize = 64;
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DataMode {
-    Grpc,
-    Rdma,
-    Auto,
-}
+pub use crate::config::DataMode;
 
 #[cfg(feature = "dfs")]
 use crate::node::bridge::SyncRuntime as PeerRuntime;

@@ -88,13 +88,10 @@ mod tests {
     }
 
     impl GcControl for Control {
-        fn retain(&self, _: &str, _: &InodeId, _: Option<&FileVersionId>, _: bool) -> Result<()> {
+        fn retain(&self, _: &str, _: &InodeId, _: Option<&FileVersionId>) -> Result<()> {
             Ok(())
         }
         fn release(&self, _: &str) -> Result<()> {
-            Ok(())
-        }
-        fn reserve_publication(&self, _: &OperationId, _: Vec<ChunkObject>) -> Result<()> {
             Ok(())
         }
         fn collect(&self, completed: u64, inventory: Vec<ChunkObject>) -> Result<GcState> {

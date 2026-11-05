@@ -93,11 +93,6 @@ pub struct LoggingGuard {
 }
 
 impl LoggingGuard {
-    #[must_use]
-    pub fn level_controller(&self) -> LevelController {
-        self.level.clone()
-    }
-
     pub fn set_level(&self, level: slog::Level) {
         self.level.set(level);
     }

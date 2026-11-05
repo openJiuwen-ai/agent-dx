@@ -1,4 +1,10 @@
 //! FUSE mount options, session ownership, kernel negotiation and mountinfo plumbing.
+//!
+//! Test and tool entries, compiled in because integration tests link the product
+//! library without `cfg(test)`: `mount_test_backend`, `mount_dfs` and
+//! `mount_dfs_with_metrics_and_options` for `tests/fuse_contract.rs`, and
+//! `mount_dfs_with_fd_bridge` for `tools/entrance-probe`. Node assembly uses the
+//! other mount functions.
 
 use super::AfsFuse;
 use super::metrics::FuseRequestMetrics;
