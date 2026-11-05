@@ -122,6 +122,7 @@ async fn network_create_preserves_tenant_session_and_api_key_checks() {
     register.reconciling = false;
     register.accepting_allocations = true;
     worker.register_node(register.clone()).await.unwrap();
+    let mut resource_report = register.clone();
     register.node_id = "other".into();
     assert_eq!(
         worker.register_node(register).await.unwrap_err().code(),
@@ -155,6 +156,41 @@ async fn network_create_preserves_tenant_session_and_api_key_checks() {
         .await
         .unwrap();
     assert_eq!(backend.started.load(Ordering::SeqCst), 1);
+    // WatchNodes carries ledger reservations, including after observed capacity
+    // drops to zero and the node stops accepting new allocations.
+    for accepting in [true, false] {
+        if !accepting {
+            resource_report.heartbeat_sequence += 1;
+            resource_report.accepting_allocations = false;
+            resource_report.capacity = Some(pb::Resources::default());
+            worker.register_node(resource_report.clone()).await.unwrap();
+        }
+        let mut stream = api
+            .watch_nodes(pb::WatchNodesRequest {})
+            .await
+            .unwrap()
+            .into_inner();
+        let frame = tokio::time::timeout(Duration::from_secs(3), stream.message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(frame.nodes.len(), 1);
+        let node = &frame.nodes[0];
+        assert_eq!(node.accepting_allocations, accepting);
+        assert_eq!(
+            node.allocated.as_ref().unwrap().cpu_millis,
+            spec("test").resources.cpu_millis
+        );
+        assert_eq!(
+            node.allocated.as_ref().unwrap().memory_bytes,
+            spec("test").resources.memory_bytes
+        );
+        if !accepting {
+            assert_eq!(node.capacity.as_ref().unwrap().cpu_millis, 0);
+            assert_eq!(node.allocatable.as_ref().unwrap().cpu_millis, 0);
+        }
+    }
     let mut get = pb::GetEnvironmentRequest {
         environment_id: "network-environment".into(),
         caller: caller(),

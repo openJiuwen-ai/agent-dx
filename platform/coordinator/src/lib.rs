@@ -489,6 +489,17 @@ impl Coordinator {
         let shard = *self.node_shards.get(id)?;
         self.shards.get(shard)?.node_resources(id)
     }
+    /// Return actual reservations independently of current capacity and admission.
+    pub fn node_allocated(
+        &self,
+        id: &str,
+    ) -> Option<(
+        adx_core::Resources,
+        Vec<adx_core::scheduling::DeviceAllocation>,
+    )> {
+        let shard = *self.node_shards.get(id)?;
+        self.shards.get(shard)?.node_allocated(id)
+    }
     pub fn node_devices(
         &self,
         id: &str,

@@ -77,6 +77,11 @@ sudo adxctl validate
 sudo adxctl run
 ```
 
+Use `adxctl resources` for a per-node and cluster summary of capacity, allocated
+reservations and remaining scheduling resources. `--output json` provides the
+same accounting in machine-readable form. See the [connection options and resource
+units](docs/deployment/adxctl.md#集群资源).
+
 Install the platform-independent administrator wheel on an operator workstation,
 then create the first tenant Key through the public HTTPS API:
 
