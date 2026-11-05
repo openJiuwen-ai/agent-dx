@@ -9,11 +9,17 @@
 use afs_error::{Error, Result};
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::HashMap,
-    net::SocketAddr,
-    path::{Component, PathBuf},
-};
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
+
+mod common;
+mod cross;
+mod dfs;
+mod fuse;
+mod meta;
+mod ownerfs;
+mod tls;
+
+pub use tls::read_certificate_der;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
@@ -550,302 +556,66 @@ pub struct Config {
 impl Config {
     /// 按默认值 < TOML < 显式 CLI 合并；所有可发现的配置错误在监听服务之前返回。
     /// Meta 可以没有文件后端；Node 至少启用一个。未指定 fs 时使用当前编译进去的集合。
-    pub fn resolve(role: Role, cli: Cli) -> Result<Self> {
-        let file: FileConfig = match cli.config {
-            Some(path) => toml::from_str(&std::fs::read_to_string(path)?)
-                .map_err(|error| invalid(error.to_string()))?,
-            None => FileConfig::default(),
+    ///
+    /// Each domain resolves its values in the original order, then checks that
+    /// need the merged configuration run in the original order too; error
+    /// messages and defaults are those of the single function this replaced.
+    pub fn resolve(role: Role, mut cli: Cli) -> Result<Self> {
+        let mut file = common::read_file(cli.config.as_deref())?;
+        common::reject_node_meta_options(role, &cli, &file)?;
+        let id = common::resolve_id(role, &mut cli, &mut file)?;
+        let (ownerfs, dfs) = common::resolve_filesystems(role, &mut cli, &mut file)?;
+        let data_mode = common::resolve_data_mode(&mut cli, &mut file)?;
+        let dfs_read_crc_mode = dfs::resolve_read_crc_mode(&cli, &file, dfs, &data_mode);
+        let replication = dfs::resolve_replication(&mut cli, &mut file)?;
+        let read = dfs::resolve_read_budget(&cli, &file)?;
+        let fuse = fuse::resolve(&cli, &mut file)?;
+        let version_cache = dfs::resolve_version_cache(role, &cli, &file)?;
+        let tuning = dfs::resolve_tuning(&cli, &file)?;
+        let meta = meta::resolve(&cli, &file);
+        let resolved = Resolved {
+            id,
+            ownerfs,
+            dfs,
+            data_mode,
+            dfs_read_crc_mode,
+            replication,
+            read,
+            fuse,
+            version_cache,
+            tuning,
+            meta,
         };
-        if role == Role::Node
-            && (cli.ownerfs_mkdir_load_balance.is_some()
-                || file.ownerfs_mkdir_load_balance.is_some())
-        {
-            return Err(invalid(
-                "ownerfs_mkdir_load_balance is only valid for afs-meta",
-            ));
-        }
-        let id = cli.id.or(file.id).unwrap_or_else(|| {
-            match role {
-                Role::Node => "node",
-                Role::Meta => "meta",
-            }
-            .into()
-        });
-        if id.is_empty()
-            || id.len() > 128
-            || !id
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b"_-".contains(&c))
-        {
-            return Err(invalid("id must contain 1..128 letters, digits, _ or -"));
-        }
-        // cfg! 查询本次二进制的编译能力；Backend 内的 #[cfg] 才实际裁掉后端模块。
-        let requested = cli.fs.or(file.fs);
-        let (ownerfs, dfs) = match requested.as_deref() {
-            None => (cfg!(feature = "ownerfs"), cfg!(feature = "dfs")),
-            Some("all") => (true, true),
-            Some("ownerfs") => (true, false),
-            Some("dfs") => (false, true),
-            _ => return Err(invalid("fs must be ownerfs, dfs or all")),
-        };
-        if role == Role::Node
-            && ((ownerfs && !cfg!(feature = "ownerfs")) || (dfs && !cfg!(feature = "dfs")))
-        {
-            return Err(invalid("requested filesystem backend is not compiled in"));
-        }
-        if role == Role::Node && !ownerfs && !dfs {
-            return Err(invalid(
-                "node requires at least one compiled filesystem backend",
-            ));
-        }
-        let data_mode = cli
-            .data_mode
-            .or(file.data_mode)
-            .unwrap_or_else(|| "grpc".into());
-        if !["grpc", "rdma", "auto"].contains(&data_mode.as_str()) {
-            return Err(invalid("data_mode must be grpc, rdma or auto"));
-        }
-        if data_mode == "rdma" && !cfg!(feature = "rdma") {
-            return Err(invalid("rdma feature is not compiled in"));
-        }
-        // This policy is implemented only for native CRC-format gRPC reads.
-        // Keep unrelated backends and transports on their existing path.
-        let default_read_crc_mode =
-            if dfs && file.dfs_external_backend.is_none() && data_mode == "grpc" {
-                DfsReadCrcMode::default()
-            } else {
-                DfsReadCrcMode::Both
-            };
-        let dfs_read_crc_mode = cli
-            .dfs_read_crc_mode
-            .or(file.dfs_read_crc_mode)
-            .unwrap_or(default_read_crc_mode);
-        let dfs_desired_copies = cli
-            .dfs_desired_copies
-            .or(file.dfs_desired_copies)
-            .unwrap_or(1);
-        let dfs_sync_required_copies = cli
-            .dfs_sync_required_copies
-            .or(file.dfs_sync_required_copies)
-            .unwrap_or(1);
-        let dfs_min_distinct_nodes = cli
-            .dfs_min_distinct_nodes
-            .or(file.dfs_min_distinct_nodes)
-            .unwrap_or(1);
-        let dfs_min_distinct_failure_domains = cli
-            .dfs_min_distinct_failure_domains
-            .or(file.dfs_min_distinct_failure_domains)
-            .unwrap_or(1);
-        let dfs_local_copy = cli
-            .dfs_local_copy
-            .or(file.dfs_local_copy)
-            .unwrap_or_else(|| "required".into());
-        if dfs_sync_required_copies == 0
-            || dfs_sync_required_copies > dfs_desired_copies
-            || dfs_min_distinct_nodes == 0
-            || dfs_min_distinct_nodes > dfs_desired_copies
-            || dfs_min_distinct_failure_domains == 0
-            || dfs_min_distinct_failure_domains > dfs_desired_copies
-        {
-            return Err(invalid(
-                "DFS replication counts must be non-zero and no greater than dfs_desired_copies",
-            ));
-        }
-        if !["required", "preferred", "none"].contains(&dfs_local_copy.as_str()) {
-            return Err(invalid(
-                "dfs_local_copy must be required, preferred or none",
-            ));
-        }
-        let dfs_read_max_ops_per_batch = cli
-            .dfs_read_max_ops_per_batch
-            .or(file.dfs_read_max_ops_per_batch)
-            .unwrap_or(128);
-        let dfs_read_max_inflight_bytes = cli
-            .dfs_read_max_inflight_bytes
-            .or(file.dfs_read_max_inflight_bytes)
-            .unwrap_or(8 * 1024 * 1024);
-        let dfs_source_cache_max_ms = cli
-            .dfs_source_cache_max_ms
-            .or(file.dfs_source_cache_max_ms)
-            .unwrap_or(5000);
-        let dfs_source_lookahead_chunks = cli
-            .dfs_source_lookahead_chunks
-            .or(file.dfs_source_lookahead_chunks)
-            .unwrap_or(64);
-        let dfs_source_cache_bytes = cli
-            .dfs_source_cache_bytes
-            .or(file.dfs_source_cache_bytes)
-            .unwrap_or(4 * 1024 * 1024);
-        if dfs_source_lookahead_chunks > 128 || dfs_source_cache_bytes > 4 * 1024 * 1024 {
-            return Err(invalid(
-                "DFS source metadata requires lookahead <= 128 chunks and cache <= 4194304 bytes",
-            ));
-        }
-        if dfs_read_max_ops_per_batch == 0
-            || dfs_read_max_inflight_bytes == 0
-            || dfs_source_cache_max_ms > 60_000
-        {
-            return Err(invalid(
-                "DFS read budgets must be non-zero and source cache TTL must be <= 60000 ms",
-            ));
-        }
-        let fuse_threads = cli.fuse_threads.or(file.fuse_threads).unwrap_or(4);
-        let fuse_workers = cli.fuse_workers.or(file.fuse_workers).unwrap_or(32);
-        let fuse_max_tasks = cli
-            .fuse_max_tasks
-            .or(file.fuse_max_tasks)
-            .unwrap_or(usize::from(fuse_workers) * 8);
-        let dfs_read_pipeline = file.dfs_read_pipeline.unwrap_or_default();
-        let dfs_read_pipeline = dfs_read_pipeline.validate()?;
-        let fuse_max_readahead_bytes = cli
-            .fuse_max_readahead_bytes
-            .or(file.fuse_max_readahead_bytes)
-            .unwrap_or(16 * 1024 * 1024);
-        if !(1..=64).contains(&fuse_threads)
-            || !(1..=1024).contains(&fuse_workers)
-            || !(1..=65_536).contains(&fuse_max_tasks)
-            || fuse_max_readahead_bytes > 16 * 1024 * 1024
-        {
-            return Err(invalid(
-                "FUSE threads must be 1..=64, workers 1..=1024, accepted tasks 1..=65536 and read-ahead <= 16 MiB",
-            ));
-        }
-        let dfs_version_cache_entries = cli
-            .dfs_version_cache_entries
-            .or(file.dfs_version_cache_entries)
-            .unwrap_or(4096);
-        if !(1..=65536).contains(&dfs_version_cache_entries) {
-            return Err(invalid("DFS version cache entries must be 1..=65536"));
-        }
-        let dfs_version_cache_bytes = cli
-            .dfs_version_cache_bytes
-            .or(file.dfs_version_cache_bytes)
-            .unwrap_or(32 * 1024 * 1024);
-        if !(1..=1024 * 1024 * 1024).contains(&dfs_version_cache_bytes) {
-            return Err(invalid("DFS version cache bytes must be 1..=1073741824"));
-        }
-        #[cfg(feature = "dfs")]
-        if role == Role::Node {
-            let minimum =
-                crate::node::vfs::dfs::version_cache_minimum_bytes(dfs_version_cache_entries)
-                    .ok_or_else(|| invalid("DFS version cache minimum byte estimate overflows"))?;
-            if usize::try_from(dfs_version_cache_bytes)
-                .ok()
-                .is_none_or(|bytes| bytes < minimum)
-            {
-                return Err(invalid(format!(
-                    "DFS version cache bytes {dfs_version_cache_bytes} is below minimum {minimum} for {dfs_version_cache_entries} entries",
-                )));
-            }
-        }
-        let dfs_outboard_work_wait_ms = cli
-            .dfs_outboard_work_wait_ms
-            .or(file.dfs_outboard_work_wait_ms)
-            .unwrap_or(2);
-        if dfs_outboard_work_wait_ms > 50 {
-            return Err(invalid("DFS outboard work wait must be 0..=50 ms"));
-        }
-        let dfs_catalog_commit_queue = cli
-            .dfs_catalog_commit_queue
-            .or(file.dfs_catalog_commit_queue)
-            .unwrap_or(256);
-        if !(1..=256).contains(&dfs_catalog_commit_queue) {
-            return Err(invalid("DFS catalog commit queue must be 1..=256"));
-        }
-        let dfs_write_queue_bytes = cli
-            .dfs_write_queue_bytes
-            .or(file.dfs_write_queue_bytes)
-            .unwrap_or(2 * 1024 * 1024 * 1024);
-        if !(8 * 1024 * 1024..=1024 * 1024 * 1024 * 1024).contains(&dfs_write_queue_bytes)
-            || usize::try_from(dfs_write_queue_bytes).is_err()
-        {
-            return Err(invalid(
-                "DFS write queue bytes must be 8MiB..=1TiB and fit usize",
-            ));
-        }
-        let dfs_dirty_budget_bytes = cli
-            .dfs_dirty_budget_bytes
-            .or(file.dfs_dirty_budget_bytes)
-            .unwrap_or(64 * 1024 * 1024);
-        if !(4 * 1024 * 1024..=64 * 1024 * 1024).contains(&dfs_dirty_budget_bytes) {
-            return Err(invalid("DFS native dirty budget bytes must be 4..=64MiB"));
-        }
-        let dfs_gc_grace_ms = cli
-            .dfs_gc_grace_ms
-            .or(file.dfs_gc_grace_ms)
-            .unwrap_or(1_000);
-        if dfs_gc_grace_ms > 600_000 {
-            return Err(invalid("DFS GC grace must be 0..=600000ms"));
-        }
-        let dfs_unpublished_descriptors = cli
-            .dfs_unpublished_descriptors
-            .or(file.dfs_unpublished_descriptors)
-            .unwrap_or(1024);
-        if !(1..=1024).contains(&dfs_unpublished_descriptors) {
-            return Err(invalid("DFS unpublished descriptors must be 1..=1024"));
-        }
-        let dfs_upload_inflight_chunks = cli
-            .dfs_upload_inflight_chunks
-            .or(file.dfs_upload_inflight_chunks)
-            .unwrap_or(8);
-        if !(1..=8).contains(&dfs_upload_inflight_chunks) {
-            return Err(invalid("DFS native upload inflight chunks must be 1..=8"));
-        }
-        let dfs_background_commit_ms = cli
-            .dfs_background_commit_ms
-            .or(file.dfs_background_commit_ms)
-            .unwrap_or(5000);
-        if !(1..=60000).contains(&dfs_background_commit_ms) {
-            return Err(invalid(
-                "DFS native background commit period must be 1..=60000ms",
-            ));
-        }
-        let dfs_sidecar_install_queue = cli
-            .dfs_sidecar_install_queue
-            .or(file.dfs_sidecar_install_queue)
-            .unwrap_or(64);
-        if !(1..=64).contains(&dfs_sidecar_install_queue) {
-            return Err(invalid("DFS sidecar install queue must be 1..=64"));
-        }
-        let dfs_fetch_max_inflight_objects = cli
-            .dfs_fetch_max_inflight_objects
-            .or(file.dfs_fetch_max_inflight_objects)
-            .unwrap_or(8);
-        if !(1..=8).contains(&dfs_fetch_max_inflight_objects) {
-            return Err(invalid("DFS fetch inflight objects must be 1..=8"));
-        }
-        let dfs_readahead_max_bytes = cli
-            .dfs_readahead_max_bytes
-            .or(file.dfs_readahead_max_bytes)
-            .unwrap_or(0);
-        if dfs_readahead_max_bytes > 32 * 1024 * 1024 {
-            return Err(invalid("DFS readahead distance must be 0..=32MiB"));
-        }
-        let dfs_peer_serve_resident_objects = cli
-            .dfs_peer_serve_resident_objects
-            .or(file.dfs_peer_serve_resident_objects)
-            .unwrap_or(2);
-        if !(1..=16).contains(&dfs_peer_serve_resident_objects) {
-            return Err(invalid("DFS Peer serve resident objects must be 1..=16"));
-        }
-        let dfs_peer_serve_payload_bytes = cli
-            .dfs_peer_serve_payload_bytes
-            .or(file.dfs_peer_serve_payload_bytes)
-            .unwrap_or(16 * 1024 * 1024);
-        if !(4 * 1024 * 1024..=64 * 1024 * 1024).contains(&dfs_peer_serve_payload_bytes) {
-            return Err(invalid("DFS Peer serve payload bytes must be 4..=64 MiB"));
-        }
-        let dfs_peer_serve_wait_ms = cli
-            .dfs_peer_serve_wait_ms
-            .or(file.dfs_peer_serve_wait_ms)
-            .unwrap_or(20);
-        if dfs_peer_serve_wait_ms > 50 {
-            return Err(invalid("DFS Peer serve wait must be 0..=50 ms"));
-        }
-        let log_defaults = crate::meta::store::local_log::LocalLogOptions::default();
-        let maintenance = crate::meta::store::journal::MaintenancePolicy::default();
-        let history = crate::meta::store::HistoryLimits::default();
-        let cfg = Self {
+        let cfg = Self::merge(role, cli, file, resolved);
+        dfs::validate_storage(role, &cfg)?;
+        common::validate_process(&cfg)?;
+        ownerfs::validate(role, &cfg)?;
+        cross::validate_mounts(&cfg)?;
+        tls::validate(&cfg)?;
+        cross::validate_read_crc(&cfg)?;
+        cfg.meta_log_limits()?;
+        cfg.meta_maintenance_policy()?;
+        cfg.meta_history_limits()?;
+        Ok(cfg)
+    }
+
+    /// The configuration literal: CLI over TOML over defaults for the plain
+    /// values, the domain results for the rest. Pure; no check runs here.
+    fn merge(role: Role, cli: Cli, file: FileConfig, resolved: Resolved) -> Self {
+        let Resolved {
+            id,
+            ownerfs,
+            dfs,
+            data_mode,
+            dfs_read_crc_mode,
+            replication,
+            read,
+            fuse,
+            version_cache: (dfs_version_cache_entries, dfs_version_cache_bytes),
+            tuning,
+            meta,
+        } = resolved;
+        Self {
             grpc_listen: cli.grpc_listen.or(file.grpc_listen).unwrap_or_else(|| {
                 ([127, 0, 0, 1], if role == Role::Meta { 7400 } else { 7500 }).into()
             }),
@@ -853,70 +623,22 @@ impl Config {
                 ([127, 0, 0, 1], if role == Role::Meta { 7401 } else { 7501 }).into()
             }),
             meta_endpoint: cli.meta_endpoint.or(file.meta_endpoint),
-            meta_store: cli
-                .meta_store
-                .or(file.meta_store)
-                .unwrap_or(MetaStoreBackend::LocalFile),
-            meta_record_max_bytes: cli
-                .meta_record_max_bytes
-                .or(file.meta_record_max_bytes)
-                .unwrap_or(log_defaults.record_max_bytes),
-            meta_batch_max_bytes: cli
-                .meta_batch_max_bytes
-                .or(file.meta_batch_max_bytes)
-                .unwrap_or(log_defaults.batch_max_bytes),
-            meta_wal_max_bytes: cli
-                .meta_wal_max_bytes
-                .or(file.meta_wal_max_bytes)
-                .unwrap_or(log_defaults.wal_max_bytes),
-            meta_checkpoint_wal_bytes: cli
-                .meta_checkpoint_wal_bytes
-                .or(file.meta_checkpoint_wal_bytes)
-                .unwrap_or(maintenance.wal_bytes),
-            meta_checkpoint_wal_records: cli
-                .meta_checkpoint_wal_records
-                .or(file.meta_checkpoint_wal_records)
-                .unwrap_or(maintenance.wal_records),
-            meta_checkpoint_interval_ms: cli
-                .meta_checkpoint_interval_ms
-                .or(file.meta_checkpoint_interval_ms)
-                .unwrap_or(60_000),
-            meta_wal_segment_bytes: cli
-                .meta_wal_segment_bytes
-                .or(file.meta_wal_segment_bytes)
-                .unwrap_or(log_defaults.segment_bytes),
-            meta_request_retention_ms: cli
-                .meta_request_retention_ms
-                .or(file.meta_request_retention_ms)
-                .unwrap_or(86_400_000),
-            meta_request_outcomes_max: cli
-                .meta_request_outcomes_max
-                .or(file.meta_request_outcomes_max)
-                .unwrap_or(history.request_count),
-            meta_request_bytes_max: cli
-                .meta_request_bytes_max
-                .or(file.meta_request_bytes_max)
-                .unwrap_or(history.request_bytes),
-            meta_watch_events_max: cli
-                .meta_watch_events_max
-                .or(file.meta_watch_events_max)
-                .unwrap_or(history.event_count),
-            meta_watch_bytes_max: cli
-                .meta_watch_bytes_max
-                .or(file.meta_watch_bytes_max)
-                .unwrap_or(history.event_bytes),
-            meta_watch_retention_ms: cli
-                .meta_watch_retention_ms
-                .or(file.meta_watch_retention_ms)
-                .unwrap_or(3_600_000),
-            allow_volatile_meta: cli
-                .allow_volatile_meta
-                .or(file.allow_volatile_meta)
-                .unwrap_or(false),
-            ownerfs_mkdir_load_balance: cli
-                .ownerfs_mkdir_load_balance
-                .or(file.ownerfs_mkdir_load_balance)
-                .unwrap_or(false),
+            meta_store: meta.meta_store,
+            meta_record_max_bytes: meta.meta_record_max_bytes,
+            meta_batch_max_bytes: meta.meta_batch_max_bytes,
+            meta_wal_max_bytes: meta.meta_wal_max_bytes,
+            meta_checkpoint_wal_bytes: meta.meta_checkpoint_wal_bytes,
+            meta_checkpoint_wal_records: meta.meta_checkpoint_wal_records,
+            meta_checkpoint_interval_ms: meta.meta_checkpoint_interval_ms,
+            meta_wal_segment_bytes: meta.meta_wal_segment_bytes,
+            meta_request_retention_ms: meta.meta_request_retention_ms,
+            meta_request_outcomes_max: meta.meta_request_outcomes_max,
+            meta_request_bytes_max: meta.meta_request_bytes_max,
+            meta_watch_events_max: meta.meta_watch_events_max,
+            meta_watch_bytes_max: meta.meta_watch_bytes_max,
+            meta_watch_retention_ms: meta.meta_watch_retention_ms,
+            allow_volatile_meta: meta.allow_volatile_meta,
+            ownerfs_mkdir_load_balance: meta.ownerfs_mkdir_load_balance,
             peer_endpoint: cli.peer_endpoint.or(file.peer_endpoint),
             advertise_endpoint: cli.advertise_endpoint.or(file.advertise_endpoint),
             tls_encryption_enabled: cli
@@ -955,43 +677,43 @@ impl Config {
                 .ownerfs_workspace_egress_root
                 .or(file.ownerfs_workspace_egress_root),
             dfs_mount: cli.dfs_mount.or(file.dfs_mount),
-            fuse_threads,
+            fuse_threads: fuse.fuse_threads,
             fuse_clone_fd: cli.fuse_clone_fd.or(file.fuse_clone_fd).unwrap_or(true),
-            fuse_workers,
-            fuse_max_tasks,
-            dfs_read_pipeline,
-            fuse_max_readahead_bytes,
+            fuse_workers: fuse.fuse_workers,
+            fuse_max_tasks: fuse.fuse_max_tasks,
+            dfs_read_pipeline: fuse.dfs_read_pipeline,
+            fuse_max_readahead_bytes: fuse.fuse_max_readahead_bytes,
             dfs_version_cache_entries,
             dfs_version_cache_bytes,
-            dfs_outboard_work_wait_ms,
-            dfs_catalog_commit_queue,
-            dfs_write_queue_bytes,
-            dfs_dirty_budget_bytes,
-            dfs_gc_grace_ms,
-            dfs_unpublished_descriptors,
-            dfs_upload_inflight_chunks,
-            dfs_background_commit_ms,
-            dfs_sidecar_install_queue,
-            dfs_fetch_max_inflight_objects,
-            dfs_readahead_max_bytes,
-            dfs_peer_serve_resident_objects,
-            dfs_peer_serve_payload_bytes,
-            dfs_peer_serve_wait_ms,
+            dfs_outboard_work_wait_ms: tuning.dfs_outboard_work_wait_ms,
+            dfs_catalog_commit_queue: tuning.dfs_catalog_commit_queue,
+            dfs_write_queue_bytes: tuning.dfs_write_queue_bytes,
+            dfs_dirty_budget_bytes: tuning.dfs_dirty_budget_bytes,
+            dfs_gc_grace_ms: tuning.dfs_gc_grace_ms,
+            dfs_unpublished_descriptors: tuning.dfs_unpublished_descriptors,
+            dfs_upload_inflight_chunks: tuning.dfs_upload_inflight_chunks,
+            dfs_background_commit_ms: tuning.dfs_background_commit_ms,
+            dfs_sidecar_install_queue: tuning.dfs_sidecar_install_queue,
+            dfs_fetch_max_inflight_objects: tuning.dfs_fetch_max_inflight_objects,
+            dfs_readahead_max_bytes: tuning.dfs_readahead_max_bytes,
+            dfs_peer_serve_resident_objects: tuning.dfs_peer_serve_resident_objects,
+            dfs_peer_serve_payload_bytes: tuning.dfs_peer_serve_payload_bytes,
+            dfs_peer_serve_wait_ms: tuning.dfs_peer_serve_wait_ms,
             dfs_external_backend: file.dfs_external_backend,
             dfs_peer_cache: file.dfs_peer_cache,
             dfs_write_buffer_idle_bytes: file
                 .dfs_write_buffer_idle_bytes
                 .unwrap_or(128 * 1024 * 1024),
-            dfs_desired_copies,
-            dfs_sync_required_copies,
-            dfs_min_distinct_nodes,
-            dfs_min_distinct_failure_domains,
-            dfs_local_copy,
-            dfs_read_max_ops_per_batch,
-            dfs_read_max_inflight_bytes,
-            dfs_source_cache_max_ms,
-            dfs_source_lookahead_chunks,
-            dfs_source_cache_bytes,
+            dfs_desired_copies: replication.dfs_desired_copies,
+            dfs_sync_required_copies: replication.dfs_sync_required_copies,
+            dfs_min_distinct_nodes: replication.dfs_min_distinct_nodes,
+            dfs_min_distinct_failure_domains: replication.dfs_min_distinct_failure_domains,
+            dfs_local_copy: replication.dfs_local_copy,
+            dfs_read_max_ops_per_batch: read.dfs_read_max_ops_per_batch,
+            dfs_read_max_inflight_bytes: read.dfs_read_max_inflight_bytes,
+            dfs_source_cache_max_ms: read.dfs_source_cache_max_ms,
+            dfs_source_lookahead_chunks: read.dfs_source_lookahead_chunks,
+            dfs_source_cache_bytes: read.dfs_source_cache_bytes,
             dfs_read_crc_mode,
             dfs_read_diagnostics_enabled: cli
                 .dfs_read_diagnostics_enabled
@@ -1012,336 +734,27 @@ impl Config {
                 .or(file.trace_sample_ratio)
                 .unwrap_or(0.01),
             print_config: cli.print_config,
-        };
-        if let Some(external) = &cfg.dfs_external_backend {
-            external.validate()?;
-            if !cfg.dfs
-                || cfg.dfs_desired_copies != 1
-                || cfg.dfs_sync_required_copies != 1
-                || cfg.dfs_min_distinct_nodes != 1
-                || cfg.dfs_min_distinct_failure_domains != 1
-                || cfg.dfs_local_copy != "required"
-            {
-                return Err(invalid(
-                    "external backend requires DFS with fixed single-copy defaults; Node replication combinations are unsupported",
-                ));
-            }
-        }
-        if cfg.dfs_write_buffer_idle_bytes > (1_u64 << 40)
-            || usize::try_from(cfg.dfs_write_buffer_idle_bytes).is_err()
-        {
-            return Err(invalid(
-                "dfs_write_buffer_idle_bytes must be in 0..=1 TiB and fit this platform; it limits idle capacity only",
-            ));
-        }
-        if let Some(cache) = &cfg.dfs_peer_cache {
-            let overlaps = |other: &std::path::Path| {
-                cache.directory.starts_with(other) || other.starts_with(&cache.directory)
-            };
-            if role != Role::Node
-                || !cfg.dfs
-                || cfg.dfs_external_backend.is_some()
-                || !cache.directory.is_absolute()
-                || cache.directory.parent().is_none()
-                || cache.directory.components().any(|part| {
-                    matches!(
-                        part,
-                        std::path::Component::ParentDir | std::path::Component::CurDir
-                    )
-                })
-                || cache.capacity_bytes == 0
-                || cache.capacity_bytes > MAX_DFS_EXTERNAL_CACHE_CAPACITY_BYTES
-                || overlaps(&cfg.data_dir)
-                || [&cfg.dfs_mount, &cfg.ownerfs_mount]
-                    .into_iter()
-                    .flatten()
-                    .any(|mount| overlaps(mount))
-            {
-                return Err(invalid(
-                    "dfs_peer_cache requires a native DFS Node, a separate absolute directory without traversal, and capacity in 1..=1 TiB; external-backend Peer caching is not enabled",
-                ));
-            }
-        }
-        if cfg.timeout_ms == 0 || cfg.timeout_ms > 300_000 {
-            return Err(invalid("timeout_ms must be in 1..300000"));
-        }
-        if !(0.0..=1.0).contains(&cfg.trace_sample_ratio) {
-            return Err(invalid("trace_sample_ratio must be 0..1"));
-        }
-        afs_logging::parse_level(&cfg.log_level).map_err(|e| invalid(e.to_string()))?;
-        for endpoint in [
-            &cfg.meta_endpoint,
-            &cfg.peer_endpoint,
-            &cfg.advertise_endpoint,
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
-                return Err(invalid("gRPC endpoint must be an http(s) URI"));
-            }
-            tonic::transport::Endpoint::from_shared(endpoint.clone())
-                .map_err(|e| invalid(e.to_string()))?;
-        }
-        if !cfg.uds_path.is_absolute() || !cfg.data_dir.is_absolute() {
-            return Err(invalid("uds_path and data_dir must be absolute"));
-        }
-        for mount in [&cfg.ownerfs_mount, &cfg.dfs_mount].into_iter().flatten() {
-            if !mount.is_absolute() {
-                return Err(invalid("filesystem mount paths must be absolute"));
-            }
-        }
-        if cfg.ownerfs_mount.is_some() && !cfg.ownerfs {
-            return Err(invalid("ownerfs_mount requires fs=ownerfs or fs=all"));
-        }
-        if cfg.experimental_ownerfs_workspace_bind {
-            if role != Role::Node || !cfg.ownerfs || cfg.ownerfs_mount.is_none() {
-                return Err(invalid(
-                    "experimental_ownerfs_workspace_bind requires Node OwnerFs with a mount",
-                ));
-            }
-            // The egress root must exist as a stable, admin-configured native
-            // path: absolute, no parent traversal, and outside both the FUSE
-            // mount and the private data directory so bind targets never cover
-            // the authoritative FUSE tree (D1/D6).
-            let egress_root = cfg.ownerfs_workspace_egress_root.as_ref().ok_or_else(|| {
-                invalid(
-                    "experimental_ownerfs_workspace_bind requires ownerfs_workspace_egress_root",
-                )
-            })?;
-            if !egress_root.is_absolute()
-                || egress_root
-                    .components()
-                    .any(|component| matches!(component, Component::ParentDir))
-            {
-                return Err(invalid(
-                    "ownerfs_workspace_egress_root must be absolute and contain no parent traversal",
-                ));
-            }
-            if egress_root.starts_with(cfg.ownerfs_mount.as_ref().expect("mount checked"))
-                || egress_root.starts_with(&cfg.data_dir)
-            {
-                return Err(invalid(
-                    "ownerfs_workspace_egress_root must be outside OwnerFs mount and data directories",
-                ));
-            }
-            // Multi-workspace bindmount is triggered dynamically by mkdir.
-            // The legacy [ownerfs_workspace_bind] section is optional and only
-            // used for pre-declared workspace names if present.
-            if let Some(bind) = cfg.ownerfs_workspace_bind.as_ref() {
-                validate_ownerfs_workspace_name(&bind.workspace)?;
-            }
-        }
-        if cfg.dfs_mount.is_some() && !cfg.dfs {
-            return Err(invalid("dfs_mount requires fs=dfs or fs=all"));
-        }
-        if cfg.ownerfs_mount.is_some() && cfg.ownerfs_mount == cfg.dfs_mount {
-            return Err(invalid(
-                "ownerfs_mount and dfs_mount must be different paths",
-            ));
-        }
-        let tls_count = [
-            cfg.tls_ca_certificate.is_some(),
-            cfg.tls_identity_certificate.is_some(),
-            cfg.tls_identity_private_key.is_some(),
-            cfg.tls_server_name.is_some(),
-        ]
-        .into_iter()
-        .filter(|value| *value)
-        .count();
-        if cfg.tls_encryption_enabled && tls_count == 0 {
-            return Err(invalid(
-                "tls_encryption_enabled requires all four tls_* identity fields",
-            ));
-        }
-        if tls_count != 0 && tls_count != 4 {
-            return Err(invalid("all four tls_* fields are required together"));
-        }
-        for path in cfg.trusted_node_certs.values() {
-            if !path.is_absolute() {
-                return Err(invalid("trusted_node_certs paths must be absolute"));
-            }
-        }
-        if cfg.dfs_read_crc_mode != DfsReadCrcMode::Both
-            && (!cfg.dfs || cfg.dfs_external_backend.is_some() || cfg.data_mode != "grpc")
-        {
-            return Err(invalid("dfs_read_crc_mode requires native DFS grpc"));
-        }
-        cfg.meta_log_limits()?;
-        cfg.meta_maintenance_policy()?;
-        cfg.meta_history_limits()?;
-        Ok(cfg)
-    }
-
-    /// Validated for every backend so a configuration accepted for one
-    /// backend stays valid for the other; the memory log uses the append and
-    /// WAL byte bounds only.
-    pub(crate) fn meta_log_limits(&self) -> Result<crate::meta::store::local_log::LocalLogOptions> {
-        if self.meta_wal_segment_bytes > self.meta_wal_max_bytes {
-            return Err(invalid(
-                "meta_wal_segment_bytes must not exceed meta_wal_max_bytes",
-            ));
-        }
-        crate::meta::store::local_log::LocalLogOptions {
-            record_max_bytes: self.meta_record_max_bytes,
-            batch_max_bytes: self.meta_batch_max_bytes,
-            wal_max_bytes: self.meta_wal_max_bytes,
-            segment_bytes: self.meta_wal_segment_bytes,
-            ..Default::default()
-        }
-        .validate()
-        .map_err(|error| invalid(error.to_string()))
-    }
-
-    pub(crate) fn meta_maintenance_policy(
-        &self,
-    ) -> Result<crate::meta::store::journal::MaintenancePolicy> {
-        use std::time::Duration;
-        let defaults = crate::meta::store::journal::MaintenancePolicy::default();
-        crate::meta::store::journal::MaintenancePolicy {
-            wal_bytes: self.meta_checkpoint_wal_bytes,
-            wal_records: self.meta_checkpoint_wal_records,
-            interval: Duration::from_millis(self.meta_checkpoint_interval_ms),
-            // Short test/operator intervals must also shorten the polling period.
-            poll: defaults
-                .poll
-                .min(Duration::from_millis(self.meta_checkpoint_interval_ms)),
-            ..defaults
-        }
-        .validate()
-        .map_err(|error| invalid(error.to_string()))
-    }
-
-    pub(crate) fn meta_history_limits(&self) -> Result<crate::meta::store::HistoryLimits> {
-        use std::time::Duration;
-        crate::meta::store::HistoryLimits {
-            request_count: self.meta_request_outcomes_max,
-            request_bytes: self.meta_request_bytes_max,
-            request_retention: Duration::from_millis(self.meta_request_retention_ms),
-            event_count: self.meta_watch_events_max,
-            event_bytes: self.meta_watch_bytes_max,
-            event_retention: Duration::from_millis(self.meta_watch_retention_ms),
-            ..Default::default()
-        }
-        .validate()
-        .map_err(|error| invalid(error.to_string()))
-    }
-
-    /// gRPC builders共用安全配置；只有配置了完整证书集合才启用 mTLS。
-    /// Meta authority and node-to-node filesystem RPCs also require
-    /// `trusted_node_certs` to bind a verified certificate to one Node ID.
-    pub fn tls_config(&self) -> afs_transport::grpc::TlsConfig {
-        match (
-            &self.tls_ca_certificate,
-            &self.tls_identity_certificate,
-            &self.tls_identity_private_key,
-            &self.tls_server_name,
-        ) {
-            (Some(ca), Some(cert), Some(key), Some(server_name)) => {
-                afs_transport::grpc::TlsConfig::MutualTls {
-                    encryption_enabled: self.tls_encryption_enabled,
-                    ca_certificate: ca.clone(),
-                    identity_certificate: cert.clone(),
-                    identity_private_key: key.clone(),
-                    server_name: server_name.clone(),
-                }
-            }
-            _ => afs_transport::grpc::TlsConfig::Disabled,
         }
     }
 }
+
+/// Values resolved and range-checked before the configuration literal.
+struct Resolved {
+    id: String,
+    ownerfs: bool,
+    dfs: bool,
+    data_mode: String,
+    dfs_read_crc_mode: DfsReadCrcMode,
+    replication: dfs::DfsReplication,
+    read: dfs::DfsReadBudget,
+    fuse: fuse::FuseSettings,
+    version_cache: (usize, u64),
+    tuning: dfs::DfsTuning,
+    meta: meta::MetaSettings,
+}
+
 fn invalid(message: impl Into<String>) -> Error {
     afs_error::Error::coded(afs_error::CONFIG_INVALID, message)
-}
-
-fn validate_ownerfs_workspace_name(workspace: &str) -> Result<()> {
-    if workspace.is_empty()
-        || workspace == "."
-        || workspace == ".."
-        || workspace.contains('/')
-        || workspace.contains('\0')
-    {
-        return Err(invalid(
-            "ownerfs_workspace_bind.workspace must be one first-level workspace name",
-        ));
-    }
-    Ok(())
-}
-
-/// Normalize a configured certificate file to the leaf DER identity exposed by tonic.
-/// Explicit service launchers reuse this parser instead of maintaining a second decoder.
-pub fn read_certificate_der(path: &std::path::Path) -> Result<Vec<u8>> {
-    let bytes = std::fs::read(path).map_err(|source| {
-        invalid(format!(
-            "failed to read trusted node cert {}: {source}",
-            path.display()
-        ))
-    })?;
-    if let Some(der) = first_pem_certificate_der(&bytes)? {
-        Ok(der)
-    } else if bytes.is_empty() {
-        Err(invalid(format!(
-            "trusted node cert {} is empty",
-            path.display()
-        )))
-    } else {
-        Ok(bytes)
-    }
-}
-
-fn first_pem_certificate_der(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
-    let text = match std::str::from_utf8(bytes) {
-        Ok(text) => text,
-        Err(_) => return Ok(None),
-    };
-    const BEGIN: &str = "-----BEGIN CERTIFICATE-----";
-    const END: &str = "-----END CERTIFICATE-----";
-    let Some(begin) = text.find(BEGIN) else {
-        return Ok(None);
-    };
-    let body_start = begin + BEGIN.len();
-    let Some(relative_end) = text[body_start..].find(END) else {
-        return Err(invalid("PEM certificate is missing END CERTIFICATE"));
-    };
-    let body = text[body_start..body_start + relative_end]
-        .chars()
-        .filter(|c| !c.is_ascii_whitespace())
-        .collect::<String>();
-    Ok(Some(decode_base64(&body)?))
-}
-
-fn decode_base64(input: &str) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(input.len() * 3 / 4);
-    let mut buffer = 0u32;
-    let mut bits = 0u8;
-    let mut padding = false;
-    for byte in input.bytes() {
-        let value = match byte {
-            b'A'..=b'Z' => u32::from(byte - b'A'),
-            b'a'..=b'z' => u32::from(byte - b'a' + 26),
-            b'0'..=b'9' => u32::from(byte - b'0' + 52),
-            b'+' => 62,
-            b'/' => 63,
-            b'=' => {
-                padding = true;
-                continue;
-            }
-            _ => return Err(invalid("PEM certificate contains invalid base64")),
-        };
-        if padding {
-            return Err(invalid("PEM certificate has data after base64 padding"));
-        }
-        buffer = (buffer << 6) | value;
-        bits += 6;
-        if bits >= 8 {
-            bits -= 8;
-            out.push(((buffer >> bits) & 0xff) as u8);
-        }
-    }
-    if out.is_empty() {
-        return Err(invalid("PEM certificate has empty base64 body"));
-    }
-    Ok(out)
 }
 
 #[cfg(test)]
