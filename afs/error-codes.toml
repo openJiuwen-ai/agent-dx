@@ -463,7 +463,7 @@ value = "0x03050001"
 kind = "FailedPrecondition"
 component = "Meta"
 subsystem = "NodeRegistration"
-description = "Node 注册携带的 Node↔Meta 协议版本与 Meta 不一致（缺省 0 视为旧实现），注册被拒绝；需部署同一版本的 Node 与 Meta"
+description = "Node 注册携带的集群线协议代际（Node↔Meta 注册、Node↔Node service 布局）与 Meta 不一致（缺省 0 视为旧实现），注册被拒绝；需部署同一版本的 Node 与 Meta"
 
 [[error]]
 name = "CONFIG_INVALID"

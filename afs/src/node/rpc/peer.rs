@@ -254,9 +254,9 @@ enum DataPeerClientInner {
 #[cfg(feature = "ownerfs")]
 pub struct OwnerPeerClient {
     client: StdMutex<OwnerFilesClient<Channel>>,
-    lock_control: afs_protocol::node_control::node_control_client::NodeControlClient<Channel>,
+    lock_control: afs_protocol::node_control::owner_control_client::OwnerControlClient<Channel>,
     long_lock_control:
-        Option<afs_protocol::node_control::node_control_client::NodeControlClient<Channel>>,
+        Option<afs_protocol::node_control::owner_control_client::OwnerControlClient<Channel>>,
     runtime: OwnerRuntime,
     // Per-open immutable read snapshot returned by OwnerFiles.Open. It is
     // removed at release and never reused for another open of the same path.
@@ -306,7 +306,7 @@ pub fn owner_files_client_from_channel(channel: Channel) -> OwnerPeerClient {
 #[cfg(feature = "ownerfs")]
 pub fn owner_files_client_from_channel_result(channel: Channel) -> PeerResult<OwnerPeerClient> {
     Ok(OwnerPeerClient {
-        lock_control: afs_protocol::node_control::node_control_client::NodeControlClient::new(
+        lock_control: afs_protocol::node_control::owner_control_client::OwnerControlClient::new(
             channel.clone(),
         ),
         long_lock_control: None,
@@ -340,7 +340,7 @@ pub fn owner_files_client_from_channel_with_runtime_and_metrics(
     metrics: Option<super::OwnerRpcMetrics>,
 ) -> OwnerPeerClient {
     OwnerPeerClient {
-        lock_control: afs_protocol::node_control::node_control_client::NodeControlClient::new(
+        lock_control: afs_protocol::node_control::owner_control_client::OwnerControlClient::new(
             channel.clone(),
         ),
         long_lock_control: None,
@@ -384,8 +384,9 @@ impl OwnerPeerClient {
     }
 
     pub fn with_long_wait_channel(mut self, channel: Channel) -> Self {
-        self.long_lock_control =
-            Some(afs_protocol::node_control::node_control_client::NodeControlClient::new(channel));
+        self.long_lock_control = Some(
+            afs_protocol::node_control::owner_control_client::OwnerControlClient::new(channel),
+        );
         self
     }
 
@@ -685,7 +686,7 @@ struct OwnerRdmaEndpointResource {
 
 #[cfg(all(feature = "ownerfs", feature = "rdma"))]
 struct OwnerRdmaCloseGuard {
-    control: afs_protocol::node_control::node_control_client::NodeControlClient<Channel>,
+    control: afs_protocol::node_control::owner_control_client::OwnerControlClient<Channel>,
     access: RootAccess,
     session_id: u64,
     timeout: Duration,

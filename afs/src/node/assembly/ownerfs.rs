@@ -266,13 +266,19 @@ pub(super) async fn mount_fuse(
     Ok((mounted_ownerfs, local))
 }
 
-/// OwnerFs locks and RDMA registry on the Node control service (段 18).
-pub(super) fn with_owner_control(
-    control: rpc::control::NodeControlService,
+/// The `OwnerControl` gRPC service: OwnerFs locks and RDMA registry (段 18).
+pub(super) fn owner_control_server(
     state: &Node,
     dfs_trusted: &[(String, Vec<u8>)],
     owner_rdma_sessions: &rpc::control::RdmaSessionRegistry,
-) -> Result<rpc::control::NodeControlService, BoxError> {
+    lock_waits: rpc::control::BlockingLockWaits,
+) -> Result<
+    afs_protocol::node_control::owner_control_server::OwnerControlServer<
+        rpc::control::OwnerControlService,
+    >,
+    BoxError,
+> {
+    let control = rpc::control::OwnerControlService::new(lock_waits);
     let control = if let Some(owner) = state.ownerfs.as_ref() {
         control
             .with_owner_locks(
@@ -283,7 +289,7 @@ pub(super) fn with_owner_control(
     } else {
         control
     };
-    Ok(control)
+    Ok(control.into_server())
 }
 
 /// The `owner_files` gRPC service (段 18).

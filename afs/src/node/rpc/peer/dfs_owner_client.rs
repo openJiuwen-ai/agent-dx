@@ -81,7 +81,7 @@ impl GrpcDfsOwnerClient {
     async fn control_client(
         &self,
     ) -> afs_error::Result<
-        afs_protocol::node_control::node_control_client::NodeControlClient<Channel>,
+        afs_protocol::node_control::dfs_owner_control_client::DfsOwnerControlClient<Channel>,
     > {
         self.control_client_with_long_wait(false).await
     }
@@ -90,7 +90,7 @@ impl GrpcDfsOwnerClient {
         &self,
         long_wait: bool,
     ) -> afs_error::Result<
-        afs_protocol::node_control::node_control_client::NodeControlClient<Channel>,
+        afs_protocol::node_control::dfs_owner_control_client::DfsOwnerControlClient<Channel>,
     > {
         let channel = if long_wait {
             self.peers
@@ -102,9 +102,11 @@ impl GrpcDfsOwnerClient {
                 .await?
         };
         Ok(
-            afs_protocol::node_control::node_control_client::NodeControlClient::new(channel)
-                .max_encoding_message_size(self.peers.config.max_encoding_message_bytes)
-                .max_decoding_message_size(self.peers.config.max_decoding_message_bytes),
+            afs_protocol::node_control::dfs_owner_control_client::DfsOwnerControlClient::new(
+                channel,
+            )
+            .max_encoding_message_size(self.peers.config.max_encoding_message_bytes)
+            .max_decoding_message_size(self.peers.config.max_decoding_message_bytes),
         )
     }
 
@@ -118,7 +120,7 @@ impl GrpcDfsOwnerClient {
         Reply: Send + 'static,
         Fut: std::future::Future<Output = Result<tonic::Response<Reply>, tonic::Status>> + Send,
         Call: FnOnce(
-                afs_protocol::node_control::node_control_client::NodeControlClient<Channel>,
+                afs_protocol::node_control::dfs_owner_control_client::DfsOwnerControlClient<Channel>,
                 tonic::Request<Req>,
             ) -> Fut
             + Send
@@ -144,7 +146,7 @@ impl GrpcDfsOwnerClient {
         Reply: Send + 'static,
         Fut: std::future::Future<Output = Result<tonic::Response<Reply>, tonic::Status>> + Send,
         Call: FnOnce(
-                afs_protocol::node_control::node_control_client::NodeControlClient<Channel>,
+                afs_protocol::node_control::dfs_owner_control_client::DfsOwnerControlClient<Channel>,
                 tonic::Request<Req>,
             ) -> Fut
             + Send

@@ -1,8 +1,10 @@
 //! Node → Node 控制 Handler。
 //!
-//! 这个文件实现 node_control.proto 生成的 gRPC service，负责“建立/关闭数据
-//! 传输会话”和基础 ping。它不传文件内容，不代替 Meta 提交新的访问授权，
-//! 也不决定文件读写是否成功。
+//! 这个文件实现 node_control.proto 的公共 service `NodeControl`，负责“建立/关闭
+//! 数据传输会话”和基础 ping，并持有各后端共用的 RDMA session 表。它不传文件内容，
+//! 不代替 Meta 提交新的访问授权，也不决定文件读写是否成功。后端 service 在子模块：
+//! `owner`（`OwnerControl`，`ownerfs`）、`dfs`（`DfsOwnerControl`，`dfs`）；未编译的
+//! 后端不注册 service，对端调用得到 gRPC UNIMPLEMENTED。
 //!
 //! RDMA 建连顺序：
 //! 1. 客户端本地打开 RdmaEndpoint，拿到 client_info；
@@ -16,6 +18,18 @@
 //!
 //! TTL/close 只管理 RDMA 资源生命周期：过期或 close 后旧 session 不能继续使用。
 
+#[cfg(feature = "dfs")]
+mod dfs;
+#[cfg(feature = "ownerfs")]
+mod owner;
+
+#[cfg(feature = "dfs")]
+pub use dfs::DfsOwnerControlService;
+#[cfg(feature = "ownerfs")]
+pub use owner::OwnerControlService;
+#[cfg(feature = "ownerfs")]
+pub(in crate::node::rpc) use owner::{owner_lock_from_wire, owner_lock_to_wire};
+
 use afs_transport::grpc::error_status::coded_status;
 use std::{
     collections::HashMap,
@@ -26,23 +40,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(any(feature = "ownerfs", feature = "dfs"))]
-use crate::node::rpc::data::{PeerAuthenticator, authenticate_peer};
-#[cfg(feature = "dfs")]
-use crate::node::vfs::dfs::owner_api::{
-    DfsOwnerLifecycleHandler, OwnerFuture, dfs_owner_lifecycle_unimplemented,
-};
-#[cfg(feature = "dfs")]
-use crate::node::vfs::types::OpenOptions;
 use afs_protocol::node_control::{
-    CloseDataReply, CloseDataRequest, DfsOwnerAcknowledgeLockWaitReply,
-    DfsOwnerAcknowledgeLockWaitRequest, DfsOwnerCancelLockWaitReply, DfsOwnerCancelLockWaitRequest,
-    DfsOwnerGetAttrReply, DfsOwnerGetAttrRequest, DfsOwnerGetLockReply, DfsOwnerGetLockRequest,
-    DfsOwnerMknodReply, DfsOwnerMknodRequest, DfsOwnerOpenReply, DfsOwnerOpenRequest,
-    DfsOwnerReleaseLockSessionReply, DfsOwnerReleaseLockSessionRequest, DfsOwnerReleaseLocksReply,
-    DfsOwnerReleaseLocksRequest, DfsOwnerReleaseReply, DfsOwnerReleaseRequest,
-    DfsOwnerSetLockReply, DfsOwnerSetLockRequest, NegotiateDataReply, NegotiateDataRequest,
-    PingReply, PingRequest,
+    CloseDataReply, CloseDataRequest, NegotiateDataReply, NegotiateDataRequest, PingReply,
+    PingRequest,
     node_control_server::{NodeControl, NodeControlServer},
 };
 use afs_tracing::Instrument;
@@ -424,53 +424,27 @@ impl RdmaSession {
 #[cfg(any(feature = "ownerfs", feature = "dfs"))]
 const MAX_BLOCKING_LOCK_CONTROL_RPCS: usize = 128;
 
+/// Bound on long advisory lock waits, shared by the OwnerFs and DFS control
+/// services of one Node.
+#[cfg(any(feature = "ownerfs", feature = "dfs"))]
 #[derive(Clone)]
-pub struct NodeControlService {
-    registry: RdmaSessionRegistry,
-    #[cfg(feature = "ownerfs")]
-    owner_rdma_registry: Option<RdmaSessionRegistry>,
-    #[cfg(feature = "dfs")]
-    dfs_owner: Option<Arc<dyn DfsOwnerLifecycleHandler>>,
-    #[cfg(feature = "dfs")]
-    dfs_authenticator: Option<Arc<dyn PeerAuthenticator>>,
-    #[cfg(any(feature = "ownerfs", feature = "dfs"))]
-    lock_waits: Arc<Semaphore>,
-    #[cfg(feature = "ownerfs")]
-    owner_locks: Option<crate::node::vfs::ownerfs::OwnerFsPeerExecutor>,
-    #[cfg(feature = "ownerfs")]
-    owner_authenticator: Option<Arc<dyn PeerAuthenticator>>,
+pub struct BlockingLockWaits(Arc<Semaphore>);
+
+#[cfg(any(feature = "ownerfs", feature = "dfs"))]
+impl Default for BlockingLockWaits {
+    fn default() -> Self {
+        Self(Arc::new(Semaphore::new(MAX_BLOCKING_LOCK_CONTROL_RPCS)))
+    }
 }
 
-impl NodeControlService {
-    #[cfg(feature = "ownerfs")]
-    pub fn with_owner_locks(
-        mut self,
-        handler: crate::node::vfs::ownerfs::OwnerFsPeerExecutor,
-        authenticator: Arc<dyn PeerAuthenticator>,
-    ) -> Self {
-        self.owner_locks = Some(handler);
-        self.owner_authenticator = Some(authenticator);
-        self
-    }
-
-    #[cfg(feature = "ownerfs")]
-    #[must_use]
-    pub fn with_owner_rdma_registry(mut self, registry: RdmaSessionRegistry) -> Self {
-        self.owner_rdma_registry = Some(registry);
-        self
-    }
-
-    pub fn into_server(self) -> NodeControlServer<Self> {
-        NodeControlServer::new(self)
-    }
-
-    #[cfg(any(feature = "ownerfs", feature = "dfs"))]
-    async fn dispatch_blocking_lock_call<Reply: Send + 'static>(
+#[cfg(any(feature = "ownerfs", feature = "dfs"))]
+impl BlockingLockWaits {
+    async fn dispatch<Reply: Send + 'static>(
         &self,
         call: impl FnOnce() -> afs_error::Result<Reply> + Send + 'static,
     ) -> Result<Response<Reply>, Status> {
         let permit = self
-            .lock_waits
+            .0
             .clone()
             .try_acquire_owned()
             .map_err(|_| Status::resource_exhausted("too many blocking lock requests"))?;
@@ -490,151 +464,22 @@ impl NodeControlService {
             .map(Response::new)
             .map_err(error_to_status)
     }
+}
 
-    #[cfg(feature = "ownerfs")]
-    async fn dispatch_owner_lock<Req: Send + 'static, Reply: Send + 'static>(
-        &self,
-        request: Request<Req>,
-        blocking: bool,
-        call: impl FnOnce(
-            crate::node::vfs::ownerfs::OwnerFsPeerExecutor,
-            String,
-            Req,
-        ) -> afs_error::Result<Reply>
-        + Send
-        + 'static,
-    ) -> Result<Response<Reply>, Status> {
-        let handler = self
-            .owner_locks
-            .clone()
-            .ok_or_else(|| Status::unimplemented("Owner lock authority not wired"))?;
-        let authenticator = self
-            .owner_authenticator
-            .as_ref()
-            .ok_or_else(|| Status::permission_denied("Owner locks require authenticated peer"))?;
-        let peer = authenticate_peer(authenticator.as_ref(), &request)?;
-        let body = request.into_inner();
-        if blocking {
-            return self
-                .dispatch_blocking_lock_call(move || call(handler, peer, body))
-                .await;
-        }
-        crate::node::bridge::spawn_blocking(move || call(handler, peer, body))
-            .await
-            .map_err(|error| Status::internal(error.to_string()))?
-            .map(Response::new)
-            .map_err(error_to_status)
-    }
+/// Backend-neutral Node control: Ping and the diagnostic `NodeData` RDMA session.
+#[derive(Clone)]
+pub struct NodeControlService {
+    registry: RdmaSessionRegistry,
+}
 
+impl NodeControlService {
     #[must_use]
     pub fn new(registry: RdmaSessionRegistry) -> Self {
-        Self {
-            registry,
-            #[cfg(feature = "ownerfs")]
-            owner_rdma_registry: None,
-            #[cfg(feature = "dfs")]
-            dfs_owner: None,
-            #[cfg(feature = "dfs")]
-            dfs_authenticator: None,
-            #[cfg(any(feature = "ownerfs", feature = "dfs"))]
-            lock_waits: Arc::new(Semaphore::new(MAX_BLOCKING_LOCK_CONTROL_RPCS)),
-            #[cfg(feature = "ownerfs")]
-            owner_locks: None,
-            #[cfg(feature = "ownerfs")]
-            owner_authenticator: None,
-        }
+        Self { registry }
     }
 
-    #[cfg(feature = "dfs")]
-    #[must_use]
-    pub fn with_dfs_owner(
-        registry: RdmaSessionRegistry,
-        handler: Arc<dyn DfsOwnerLifecycleHandler>,
-        authenticator: Arc<dyn PeerAuthenticator>,
-    ) -> Self {
-        Self {
-            registry,
-            #[cfg(feature = "ownerfs")]
-            owner_rdma_registry: None,
-            dfs_owner: Some(handler),
-            dfs_authenticator: Some(authenticator),
-            lock_waits: Arc::new(Semaphore::new(MAX_BLOCKING_LOCK_CONTROL_RPCS)),
-            #[cfg(feature = "ownerfs")]
-            owner_locks: None,
-            #[cfg(feature = "ownerfs")]
-            owner_authenticator: None,
-        }
-    }
-
-    #[cfg(feature = "dfs")]
-    async fn dispatch_dfs_owner<Req: Send + 'static, Reply: Send + 'static>(
-        &self,
-        request: Request<Req>,
-        call: impl FnOnce(Arc<dyn DfsOwnerLifecycleHandler>, String, Req) -> afs_error::Result<Reply>
-        + Send
-        + 'static,
-    ) -> Result<Response<Reply>, Status> {
-        let handler = self
-            .dfs_owner
-            .clone()
-            .ok_or_else(|| error_to_status(dfs_owner_lifecycle_unimplemented()))?;
-        let authenticator = self
-            .dfs_authenticator
-            .as_ref()
-            .ok_or_else(|| Status::permission_denied("DFS owner has no peer authenticator"))?;
-        let peer = authenticate_peer(authenticator.as_ref(), &request)?;
-        let request = request.into_inner();
-        crate::node::bridge::spawn_blocking(move || call(handler, peer, request))
-            .await
-            .map_err(|error| Status::internal(error.to_string()))?
-            .map(Response::new)
-            .map_err(error_to_status)
-    }
-
-    /// Lifecycle RPCs whose handler serves them on the async worker.
-    #[cfg(feature = "dfs")]
-    async fn dispatch_dfs_owner_async<Req: Send + 'static, Reply: Send + 'static>(
-        &self,
-        request: Request<Req>,
-        call: impl FnOnce(Arc<dyn DfsOwnerLifecycleHandler>, String, Req) -> OwnerFuture<Reply>,
-    ) -> Result<Response<Reply>, Status> {
-        let handler = self
-            .dfs_owner
-            .clone()
-            .ok_or_else(|| error_to_status(dfs_owner_lifecycle_unimplemented()))?;
-        let authenticator = self
-            .dfs_authenticator
-            .as_ref()
-            .ok_or_else(|| Status::permission_denied("DFS owner has no peer authenticator"))?;
-        let peer = authenticate_peer(authenticator.as_ref(), &request)?;
-        let request = request.into_inner();
-        crate::node::bridge::run_detached(call(handler, peer, request))
-            .await
-            .map_err(|error| Status::internal(error.to_string()))?
-            .map(Response::new)
-            .map_err(error_to_status)
-    }
-
-    #[cfg(feature = "dfs")]
-    async fn dispatch_blocking_dfs_owner_lock<Req: Send + 'static, Reply: Send + 'static>(
-        &self,
-        request: Request<Req>,
-        call: impl FnOnce(Arc<dyn DfsOwnerLifecycleHandler>, String, Req) -> afs_error::Result<Reply>
-        + Send
-        + 'static,
-    ) -> Result<Response<Reply>, Status> {
-        let handler = self
-            .dfs_owner
-            .clone()
-            .ok_or_else(|| error_to_status(dfs_owner_lifecycle_unimplemented()))?;
-        let authenticator = self
-            .dfs_authenticator
-            .as_ref()
-            .ok_or_else(|| Status::permission_denied("DFS owner has no peer authenticator"))?;
-        let peer = authenticate_peer(authenticator.as_ref(), &request)?;
-        let request = request.into_inner();
-        self.dispatch_blocking_lock_call(move || call(handler, peer, request))
-            .await
+    pub fn into_server(self) -> NodeControlServer<Self> {
+        NodeControlServer::new(self)
     }
 }
 
@@ -644,240 +489,6 @@ pub fn make_control_server(registry: RdmaSessionRegistry) -> NodeControlServer<N
 
 #[tonic::async_trait]
 impl NodeControl for NodeControlService {
-    async fn prepare_owner_root(
-        &self,
-        request: Request<afs_protocol::node_control::PrepareOwnerRootRequest>,
-    ) -> Result<Response<afs_protocol::node_control::PrepareOwnerRootReply>, Status> {
-        #[cfg(feature = "ownerfs")]
-        {
-            let owner = self.owner_locks.clone().ok_or_else(|| {
-                coded_status(afs_error::NODE_VFS_UNIMPLEMENTED, "OwnerFs is disabled")
-            })?;
-            let authenticator = self.owner_authenticator.as_ref().ok_or_else(|| {
-                coded_status(
-                    afs_error::IO_PERMISSION_DENIED,
-                    "workspace creation requires peer authentication",
-                )
-            })?;
-            let peer = authenticate_peer(authenticator.as_ref(), &request)?;
-            let request = request.into_inner();
-            let reservation = request.reservation.ok_or_else(|| {
-                coded_status(
-                    afs_error::CLIENT_ARGUMENT_INVALID,
-                    "workspace reservation is required",
-                )
-            })?;
-            let reservation =
-                super::ownerfs::reservation_from_wire(reservation).map_err(error_to_status)?;
-            let params = crate::node::vfs::ownerfs::root::RootCreateParams {
-                name: request.name,
-                uid: request.uid,
-                gid: request.gid,
-                mode: request.mode,
-            };
-            crate::node::bridge::spawn_blocking(move || {
-                owner.prepare_owner_root(&peer, &reservation, &params)
-            })
-            .await
-            .map_err(|error| coded_status(afs_error::IO_OTHER, error.to_string()))?
-            .map_err(error_to_status)?;
-            Ok(Response::new(
-                afs_protocol::node_control::PrepareOwnerRootReply {},
-            ))
-        }
-        #[cfg(not(feature = "ownerfs"))]
-        {
-            let _ = request;
-            Err(coded_status(
-                afs_error::NODE_VFS_UNIMPLEMENTED,
-                "OwnerFs is disabled",
-            ))
-        }
-    }
-
-    #[cfg(feature = "ownerfs")]
-    async fn owner_get_lock(
-        &self,
-        request: Request<afs_protocol::node_control::OwnerGetLockRequest>,
-    ) -> Result<Response<afs_protocol::node_control::OwnerGetLockReply>, Status> {
-        self.dispatch_owner_lock(request, false, |handler, peer, body| {
-            let (access, file) = owner_lock_handle_from_wire(body.handle)?;
-            let lock = owner_lock_from_wire(body.lock)?;
-            let conflict = handler.getlk(&peer, &access, &file, lock)?.map(|conflict| {
-                owner_lock_to_wire(&crate::node::vfs::locks::LockRequest {
-                    kind: conflict.kind,
-                    owner: conflict.owner,
-                    pid: conflict.pid,
-                    range: conflict.range,
-                    lock_type: conflict.lock_type,
-                })
-            });
-            Ok(afs_protocol::node_control::OwnerGetLockReply { conflict })
-        })
-        .await
-    }
-    #[cfg(feature = "ownerfs")]
-    async fn owner_set_lock(
-        &self,
-        request: Request<afs_protocol::node_control::OwnerSetLockRequest>,
-    ) -> Result<Response<afs_protocol::node_control::OwnerSetLockReply>, Status> {
-        let blocking = request.get_ref().waiter.is_some();
-        let mut cancel_guard = if let Some(waiter) = request.get_ref().waiter.clone() {
-            let handler = self
-                .owner_locks
-                .clone()
-                .ok_or_else(|| Status::unimplemented("Owner lock authority not wired"))?;
-            let authenticator = self.owner_authenticator.as_ref().ok_or_else(|| {
-                Status::permission_denied("Owner locks require authenticated peer")
-            })?;
-            let peer = authenticate_peer(authenticator.as_ref(), &request)?;
-            let (access, _) = owner_lock_handle_from_wire(request.get_ref().handle.clone())
-                .map_err(error_to_status)?;
-            let waiter = owner_lock_waiter_from_wire(waiter).map_err(error_to_status)?;
-            Some(OwnerLockCancelOnDrop {
-                handler,
-                peer,
-                access,
-                waiter: Some(waiter),
-            })
-        } else {
-            None
-        };
-        let result = self
-            .dispatch_owner_lock(request, blocking, |handler, peer, body| {
-                let (access, file) = owner_lock_handle_from_wire(body.handle)?;
-                let lock = owner_lock_from_wire(body.lock)?;
-                let waiter = body.waiter.map(owner_lock_waiter_from_wire).transpose()?;
-                handler.setlk(&peer, &access, &file, lock, waiter)?;
-                Ok(afs_protocol::node_control::OwnerSetLockReply {})
-            })
-            .await;
-        if let Some(guard) = &mut cancel_guard {
-            guard.waiter = None;
-        }
-        result
-    }
-    #[cfg(feature = "ownerfs")]
-    async fn owner_ack_lock_wait(
-        &self,
-        request: Request<afs_protocol::node_control::OwnerAckLockWaitRequest>,
-    ) -> Result<Response<afs_protocol::node_control::OwnerAckLockWaitReply>, Status> {
-        self.dispatch_owner_lock(request, false, |handler, peer, body| {
-            let access = super::data::presented_access(body.access)?;
-            let waiter =
-                owner_lock_waiter_from_wire(body.waiter.ok_or_else(owner_lock_wire_invalid)?)?;
-            handler.acknowledge_lock_wait(&peer, &access, waiter)?;
-            Ok(afs_protocol::node_control::OwnerAckLockWaitReply {})
-        })
-        .await
-    }
-    #[cfg(not(feature = "ownerfs"))]
-    async fn owner_ack_lock_wait(
-        &self,
-        _: Request<afs_protocol::node_control::OwnerAckLockWaitRequest>,
-    ) -> Result<Response<afs_protocol::node_control::OwnerAckLockWaitReply>, Status> {
-        Err(Status::unimplemented("OwnerFs is not enabled"))
-    }
-    #[cfg(feature = "ownerfs")]
-    async fn owner_cancel_lock_wait(
-        &self,
-        request: Request<afs_protocol::node_control::OwnerCancelLockWaitRequest>,
-    ) -> Result<Response<afs_protocol::node_control::OwnerCancelLockWaitReply>, Status> {
-        self.dispatch_owner_lock(request, false, |handler, peer, body| {
-            let access = super::data::presented_access(body.access)?;
-            let waiter =
-                owner_lock_waiter_from_wire(body.waiter.ok_or_else(owner_lock_wire_invalid)?)?;
-            let outcome = handler.cancel_lock_wait(&peer, &access, waiter)?;
-            Ok(afs_protocol::node_control::OwnerCancelLockWaitReply {
-                outcome: match outcome {
-                    crate::node::vfs::locks::LockWaiterOutcome::Cancelled => 1,
-                    crate::node::vfs::locks::LockWaiterOutcome::Granted => 2,
-                    crate::node::vfs::locks::LockWaiterOutcome::Unknown => 3,
-                },
-            })
-        })
-        .await
-    }
-    #[cfg(feature = "ownerfs")]
-    async fn owner_release_locks(
-        &self,
-        request: Request<afs_protocol::node_control::OwnerReleaseLocksRequest>,
-    ) -> Result<Response<afs_protocol::node_control::OwnerReleaseLocksReply>, Status> {
-        self.dispatch_owner_lock(request, false, |handler, peer, body| {
-            let (access, file) = owner_lock_handle_from_wire(body.handle)?;
-            if body.ingress_session_id.is_empty() || body.ingress_session_id.len() > 256 {
-                return Err(owner_lock_wire_invalid());
-            }
-            let kind = match body.release_kind {
-                1 => crate::node::vfs::types::ReleaseKind::PosixOwner,
-                2 => crate::node::vfs::types::ReleaseKind::FlockOwner,
-                _ => return Err(owner_lock_wire_invalid()),
-            };
-            handler.release_locks(
-                &peer,
-                &access,
-                &file,
-                crate::node::vfs::types::FileLockOwner {
-                    ingress_session_id: body.ingress_session_id,
-                    kernel_owner: body.kernel_owner,
-                },
-                kind,
-            )?;
-            Ok(afs_protocol::node_control::OwnerReleaseLocksReply {})
-        })
-        .await
-    }
-    #[cfg(feature = "ownerfs")]
-    async fn owner_release_lock_session(
-        &self,
-        request: Request<afs_protocol::node_control::OwnerReleaseLockSessionRequest>,
-    ) -> Result<Response<afs_protocol::node_control::OwnerReleaseLockSessionReply>, Status> {
-        self.dispatch_owner_lock(request, false, |handler, peer, body| {
-            let access = super::data::presented_access(body.access)?;
-            if body.ingress_session_id.is_empty() || body.ingress_session_id.len() > 256 {
-                return Err(owner_lock_wire_invalid());
-            }
-            handler.release_lock_session(&peer, &access, &body.ingress_session_id)?;
-            Ok(afs_protocol::node_control::OwnerReleaseLockSessionReply {})
-        })
-        .await
-    }
-
-    #[cfg(not(feature = "ownerfs"))]
-    async fn owner_get_lock(
-        &self,
-        _: Request<afs_protocol::node_control::OwnerGetLockRequest>,
-    ) -> Result<Response<afs_protocol::node_control::OwnerGetLockReply>, Status> {
-        Err(Status::unimplemented("OwnerFs is not enabled"))
-    }
-    #[cfg(not(feature = "ownerfs"))]
-    async fn owner_set_lock(
-        &self,
-        _: Request<afs_protocol::node_control::OwnerSetLockRequest>,
-    ) -> Result<Response<afs_protocol::node_control::OwnerSetLockReply>, Status> {
-        Err(Status::unimplemented("OwnerFs is not enabled"))
-    }
-    #[cfg(not(feature = "ownerfs"))]
-    async fn owner_cancel_lock_wait(
-        &self,
-        _: Request<afs_protocol::node_control::OwnerCancelLockWaitRequest>,
-    ) -> Result<Response<afs_protocol::node_control::OwnerCancelLockWaitReply>, Status> {
-        Err(Status::unimplemented("OwnerFs is not enabled"))
-    }
-    #[cfg(not(feature = "ownerfs"))]
-    async fn owner_release_locks(
-        &self,
-        _: Request<afs_protocol::node_control::OwnerReleaseLocksRequest>,
-    ) -> Result<Response<afs_protocol::node_control::OwnerReleaseLocksReply>, Status> {
-        Err(Status::unimplemented("OwnerFs is not enabled"))
-    }
-    #[cfg(not(feature = "ownerfs"))]
-    async fn owner_release_lock_session(
-        &self,
-        _: Request<afs_protocol::node_control::OwnerReleaseLockSessionRequest>,
-    ) -> Result<Response<afs_protocol::node_control::OwnerReleaseLockSessionReply>, Status> {
-        Err(Status::unimplemented("OwnerFs is not enabled"))
-    }
     async fn negotiate_data(
         &self,
         request: Request<NegotiateDataRequest>,
@@ -904,89 +515,6 @@ impl NodeControl for NodeControlService {
         Ok(Response::new(CloseDataReply {}))
     }
 
-    async fn owner_negotiate_data(
-        &self,
-        request: Request<afs_protocol::node_control::OwnerNegotiateDataRequest>,
-    ) -> Result<Response<NegotiateDataReply>, Status> {
-        #[cfg(not(feature = "ownerfs"))]
-        {
-            let _ = request;
-            Err(Status::permission_denied("OwnerFs is not enabled"))
-        }
-        #[cfg(feature = "ownerfs")]
-        {
-            let authenticator = self.owner_authenticator.as_ref().ok_or_else(|| {
-                Status::permission_denied("OwnerFiles RDMA requires authenticated peer")
-            })?;
-            let peer = authenticate_peer(authenticator.as_ref(), &request)?;
-            let body = request.into_inner();
-            let access = body
-                .access
-                .ok_or_else(|| Status::permission_denied("OwnerFiles RDMA access is required"))?;
-            let presented_access =
-                super::data::presented_access(Some(access.clone())).map_err(error_to_status)?;
-            let handler = self
-                .owner_locks
-                .clone()
-                .ok_or_else(|| Status::unimplemented("OwnerFs peer authority is not wired"))?;
-            let auth_peer = peer.clone();
-            let auth_access = presented_access.clone();
-            crate::node::bridge::spawn_blocking(move || {
-                handler.authorize_transport(&auth_peer, &auth_access)
-            })
-            .await
-            .map_err(|error| Status::internal(error.to_string()))?
-            .map_err(error_to_status)?;
-            let identity = PeerSessionIdentity::for_owner(peer, presented_access)?;
-            let negotiation = body.negotiation.ok_or_else(|| {
-                Status::invalid_argument("OwnerFiles RDMA negotiation is required")
-            })?;
-            if negotiation.handshake_version != RDMA_HANDSHAKE_VERSION {
-                return Err(coded_status(
-                    afs_error::NODE_RDMA_HANDSHAKE_VERSION,
-                    "unsupported RDMA handshake version",
-                ));
-            }
-            let registry = self
-                .owner_rdma_registry
-                .as_ref()
-                .ok_or_else(|| Status::unimplemented("OwnerFiles RDMA is not configured"))?;
-            let Some(device) = registry.device.clone() else {
-                return Ok(Response::new(rdma_unsupported_reply()));
-            };
-            negotiate_rdma(registry, device, negotiation, Some(identity)).await
-        }
-    }
-
-    async fn owner_close_data(
-        &self,
-        request: Request<afs_protocol::node_control::OwnerCloseDataRequest>,
-    ) -> Result<Response<CloseDataReply>, Status> {
-        #[cfg(not(feature = "ownerfs"))]
-        {
-            let _ = request;
-            Err(Status::permission_denied("OwnerFs is not enabled"))
-        }
-        #[cfg(feature = "ownerfs")]
-        {
-            let authenticator = self.owner_authenticator.as_ref().ok_or_else(|| {
-                Status::permission_denied("OwnerFiles RDMA requires authenticated peer")
-            })?;
-            let peer = authenticate_peer(authenticator.as_ref(), &request)?;
-            let body = request.into_inner();
-            let access = body
-                .access
-                .ok_or_else(|| Status::permission_denied("OwnerFiles RDMA access is required"))?;
-            let identity = owner_rdma_identity_from_wire(peer, access)?;
-            let registry = self
-                .owner_rdma_registry
-                .as_ref()
-                .ok_or_else(|| Status::unimplemented("OwnerFiles RDMA is not configured"))?;
-            registry.close_for(body.session_id, &identity).await?;
-            Ok(Response::new(CloseDataReply {}))
-        }
-    }
-
     async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PingReply>, Status> {
         async move {
             let payload = request.into_inner().payload;
@@ -999,256 +527,6 @@ impl NodeControl for NodeControlService {
         }
         .instrument(afs_tracing::tracing::info_span!("node.control.ping"))
         .await
-    }
-
-    #[cfg(feature = "dfs")]
-    async fn dfs_owner_open(
-        &self,
-        request: Request<DfsOwnerOpenRequest>,
-    ) -> Result<Response<DfsOwnerOpenReply>, Status> {
-        let body = request.get_ref();
-        if body.namespace_id.is_empty()
-            || body.inode_id.is_empty()
-            || body.owner_node_id.is_empty()
-            || body.owner_session_id.is_empty()
-            || body.lease_epoch == 0
-            || body.caller_session_id.is_empty()
-            || body.open_seq == 0
-        {
-            return Err(Status::permission_denied(
-                "DFS owner open identity is incomplete",
-            ));
-        }
-        let options = OpenOptions {
-            kill_suidgid: body.kill_suidgid,
-        };
-        self.dispatch_dfs_owner_async(request, move |handler, peer, request| {
-            handler.open_async(peer, request, options)
-        })
-        .await
-    }
-
-    #[cfg(feature = "dfs")]
-    async fn dfs_owner_get_attr(
-        &self,
-        request: Request<DfsOwnerGetAttrRequest>,
-    ) -> Result<Response<DfsOwnerGetAttrReply>, Status> {
-        validate_dfs_owner_control_handle(request.get_ref().handle.as_ref())?;
-        self.dispatch_dfs_owner_async(request, |handler, peer, request| {
-            handler.getattr_async(peer, request)
-        })
-        .await
-    }
-
-    #[cfg(feature = "dfs")]
-    async fn dfs_owner_mknod(
-        &self,
-        request: Request<DfsOwnerMknodRequest>,
-    ) -> Result<Response<DfsOwnerMknodReply>, Status> {
-        validate_dfs_owner_mknod_request(request.get_ref())?;
-        self.dispatch_dfs_owner(request, |handler, peer, request| {
-            handler.mknod(&peer, request)
-        })
-        .await
-    }
-
-    #[cfg(feature = "dfs")]
-    async fn dfs_owner_get_lock(
-        &self,
-        request: Request<DfsOwnerGetLockRequest>,
-    ) -> Result<Response<DfsOwnerGetLockReply>, Status> {
-        validate_dfs_owner_lock_authority(request.get_ref().authority.as_ref())?;
-        validate_dfs_owner_lock_request(request.get_ref().lock.as_ref())?;
-        self.dispatch_dfs_owner(request, |handler, peer, request| {
-            handler.get_lock(&peer, request)
-        })
-        .await
-    }
-
-    #[cfg(feature = "dfs")]
-    async fn dfs_owner_set_lock(
-        &self,
-        request: Request<DfsOwnerSetLockRequest>,
-    ) -> Result<Response<DfsOwnerSetLockReply>, Status> {
-        validate_dfs_owner_lock_authority(request.get_ref().authority.as_ref())?;
-        validate_dfs_owner_lock_request(request.get_ref().lock.as_ref())?;
-        if let Some(waiter) = request.get_ref().waiter.as_ref() {
-            validate_dfs_owner_lock_waiter(waiter)?;
-        }
-        if request.get_ref().waiter.is_some() {
-            self.dispatch_blocking_dfs_owner_lock(request, |handler, peer, request| {
-                handler.set_lock(&peer, request)
-            })
-            .await
-        } else {
-            self.dispatch_dfs_owner(request, |handler, peer, request| {
-                handler.set_lock(&peer, request)
-            })
-            .await
-        }
-    }
-
-    #[cfg(feature = "dfs")]
-    async fn dfs_owner_cancel_lock_wait(
-        &self,
-        request: Request<DfsOwnerCancelLockWaitRequest>,
-    ) -> Result<Response<DfsOwnerCancelLockWaitReply>, Status> {
-        validate_dfs_owner_lock_authority(request.get_ref().authority.as_ref())?;
-        let waiter = request
-            .get_ref()
-            .waiter
-            .as_ref()
-            .ok_or_else(|| Status::permission_denied("DFS lock waiter is required"))?;
-        validate_dfs_owner_lock_waiter(waiter)?;
-        self.dispatch_dfs_owner(request, |handler, peer, request| {
-            handler.cancel_lock_wait(&peer, request)
-        })
-        .await
-    }
-
-    #[cfg(feature = "dfs")]
-    async fn dfs_owner_acknowledge_lock_wait(
-        &self,
-        request: Request<DfsOwnerAcknowledgeLockWaitRequest>,
-    ) -> Result<Response<DfsOwnerAcknowledgeLockWaitReply>, Status> {
-        validate_dfs_owner_lock_authority(request.get_ref().authority.as_ref())?;
-        let waiter = request
-            .get_ref()
-            .waiter
-            .as_ref()
-            .ok_or_else(|| Status::permission_denied("DFS lock waiter is required"))?;
-        validate_dfs_owner_lock_waiter(waiter)?;
-        self.dispatch_dfs_owner(request, |handler, peer, request| {
-            handler.acknowledge_lock_wait(&peer, request)
-        })
-        .await
-    }
-
-    #[cfg(feature = "dfs")]
-    async fn dfs_owner_release_locks(
-        &self,
-        request: Request<DfsOwnerReleaseLocksRequest>,
-    ) -> Result<Response<DfsOwnerReleaseLocksReply>, Status> {
-        validate_dfs_owner_lock_authority(request.get_ref().authority.as_ref())?;
-        validate_dfs_owner_lock_owner(request.get_ref().owner.as_ref())?;
-        if request.get_ref().release_kind == 0 {
-            return Err(Status::invalid_argument(
-                "DFS lock release kind is required",
-            ));
-        }
-        self.dispatch_dfs_owner(request, |handler, peer, request| {
-            handler.release_locks(&peer, request)
-        })
-        .await
-    }
-
-    #[cfg(feature = "dfs")]
-    async fn dfs_owner_release_lock_session(
-        &self,
-        request: Request<DfsOwnerReleaseLockSessionRequest>,
-    ) -> Result<Response<DfsOwnerReleaseLockSessionReply>, Status> {
-        validate_dfs_owner_lock_authority(request.get_ref().authority.as_ref())?;
-        if request.get_ref().ingress_session_id.is_empty() {
-            return Err(Status::permission_denied(
-                "DFS lock release session is incomplete",
-            ));
-        }
-        self.dispatch_dfs_owner(request, |handler, peer, request| {
-            handler.release_lock_session(&peer, request)
-        })
-        .await
-    }
-
-    #[cfg(feature = "dfs")]
-    async fn dfs_owner_release(
-        &self,
-        request: Request<DfsOwnerReleaseRequest>,
-    ) -> Result<Response<DfsOwnerReleaseReply>, Status> {
-        validate_dfs_owner_release_handle(request.get_ref().handle.as_ref())?;
-        self.dispatch_dfs_owner_async(request, |handler, peer, request| {
-            handler.release_async(peer, request)
-        })
-        .await
-    }
-
-    #[cfg(not(feature = "dfs"))]
-    async fn dfs_owner_open(
-        &self,
-        _request: Request<DfsOwnerOpenRequest>,
-    ) -> Result<Response<DfsOwnerOpenReply>, Status> {
-        Err(Status::unimplemented("DFS owner lifecycle is not enabled"))
-    }
-
-    #[cfg(not(feature = "dfs"))]
-    async fn dfs_owner_get_attr(
-        &self,
-        _request: Request<DfsOwnerGetAttrRequest>,
-    ) -> Result<Response<DfsOwnerGetAttrReply>, Status> {
-        Err(Status::unimplemented("DFS owner lifecycle is not enabled"))
-    }
-
-    #[cfg(not(feature = "dfs"))]
-    async fn dfs_owner_mknod(
-        &self,
-        _request: Request<DfsOwnerMknodRequest>,
-    ) -> Result<Response<DfsOwnerMknodReply>, Status> {
-        Err(Status::unimplemented("DFS owner lifecycle is not enabled"))
-    }
-
-    #[cfg(not(feature = "dfs"))]
-    async fn dfs_owner_get_lock(
-        &self,
-        _request: Request<DfsOwnerGetLockRequest>,
-    ) -> Result<Response<DfsOwnerGetLockReply>, Status> {
-        Err(Status::unimplemented("DFS owner lifecycle is not enabled"))
-    }
-
-    #[cfg(not(feature = "dfs"))]
-    async fn dfs_owner_set_lock(
-        &self,
-        _request: Request<DfsOwnerSetLockRequest>,
-    ) -> Result<Response<DfsOwnerSetLockReply>, Status> {
-        Err(Status::unimplemented("DFS owner lifecycle is not enabled"))
-    }
-
-    #[cfg(not(feature = "dfs"))]
-    async fn dfs_owner_cancel_lock_wait(
-        &self,
-        _request: Request<DfsOwnerCancelLockWaitRequest>,
-    ) -> Result<Response<DfsOwnerCancelLockWaitReply>, Status> {
-        Err(Status::unimplemented("DFS owner lifecycle is not enabled"))
-    }
-
-    #[cfg(not(feature = "dfs"))]
-    async fn dfs_owner_acknowledge_lock_wait(
-        &self,
-        _request: Request<DfsOwnerAcknowledgeLockWaitRequest>,
-    ) -> Result<Response<DfsOwnerAcknowledgeLockWaitReply>, Status> {
-        Err(Status::unimplemented("DFS owner lifecycle is not enabled"))
-    }
-
-    #[cfg(not(feature = "dfs"))]
-    async fn dfs_owner_release_locks(
-        &self,
-        _request: Request<DfsOwnerReleaseLocksRequest>,
-    ) -> Result<Response<DfsOwnerReleaseLocksReply>, Status> {
-        Err(Status::unimplemented("DFS owner lifecycle is not enabled"))
-    }
-
-    #[cfg(not(feature = "dfs"))]
-    async fn dfs_owner_release_lock_session(
-        &self,
-        _request: Request<DfsOwnerReleaseLockSessionRequest>,
-    ) -> Result<Response<DfsOwnerReleaseLockSessionReply>, Status> {
-        Err(Status::unimplemented("DFS owner lifecycle is not enabled"))
-    }
-
-    #[cfg(not(feature = "dfs"))]
-    async fn dfs_owner_release(
-        &self,
-        _request: Request<DfsOwnerReleaseRequest>,
-    ) -> Result<Response<DfsOwnerReleaseReply>, Status> {
-        Err(Status::unimplemented("DFS owner lifecycle is not enabled"))
     }
 }
 
@@ -1322,275 +600,6 @@ fn native_status(error: afs_transport::rdma::RdmaError) -> Status {
     coded_status(afs_error::NODE_TRANSFER_UNAVAILABLE, error.to_string())
 }
 
-#[cfg(feature = "dfs")]
-fn validate_dfs_owner_lock_authority(
-    authority: Option<&afs_protocol::node_control::DfsOwnerLockAuthority>,
-) -> Result<(), Status> {
-    let authority =
-        authority.ok_or_else(|| Status::permission_denied("DFS lock authority is required"))?;
-    if authority.namespace_id.is_empty()
-        || authority.inode_id.is_empty()
-        || authority.owner_node_id.is_empty()
-        || authority.owner_session_id.is_empty()
-        || authority.lease_epoch == 0
-        || authority.lease_expires_at_unix_ms == 0
-        || authority.caller_node_id.is_empty()
-        || authority.caller_session_id.is_empty()
-    {
-        return Err(Status::permission_denied(
-            "DFS lock authority identity is incomplete",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(feature = "dfs")]
-fn validate_dfs_owner_lock_owner(
-    owner: Option<&afs_protocol::node_control::DfsOwnerLockOwner>,
-) -> Result<(), Status> {
-    let owner = owner.ok_or_else(|| Status::permission_denied("DFS lock owner is required"))?;
-    if owner.ingress_session_id.is_empty() {
-        return Err(Status::permission_denied(
-            "DFS lock owner session is incomplete",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(feature = "dfs")]
-fn validate_dfs_owner_lock_waiter(
-    waiter: &afs_protocol::node_control::DfsOwnerLockWaiter,
-) -> Result<(), Status> {
-    if waiter.ingress_session_id.is_empty() {
-        return Err(Status::permission_denied(
-            "DFS lock waiter session is incomplete",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(feature = "dfs")]
-fn validate_dfs_owner_lock_request(
-    request: Option<&afs_protocol::node_control::DfsOwnerLockRequest>,
-) -> Result<(), Status> {
-    let request =
-        request.ok_or_else(|| Status::permission_denied("DFS lock request is required"))?;
-    if request.kind == 0 || request.lock_type == 0 {
-        return Err(Status::invalid_argument("DFS lock kind/type is required"));
-    }
-    validate_dfs_owner_lock_owner(request.owner.as_ref())?;
-    let range = request
-        .range
-        .as_ref()
-        .ok_or_else(|| Status::invalid_argument("DFS lock range is required"))?;
-    if range.start > range.end {
-        return Err(Status::invalid_argument("DFS lock range is invalid"));
-    }
-    Ok(())
-}
-
-#[cfg(feature = "dfs")]
-fn validate_dfs_owner_mknod_request(request: &DfsOwnerMknodRequest) -> Result<(), Status> {
-    if request.namespace_id.is_empty()
-        || request.parent_inode_id.is_empty()
-        || request.owner_node_id.is_empty()
-        || request.owner_session_id.is_empty()
-        || request.lease_epoch == 0
-        || request.caller_session_id.is_empty()
-        || request.name.is_empty()
-    {
-        return Err(Status::permission_denied(
-            "DFS owner mknod identity is incomplete",
-        ));
-    }
-    let special = request
-        .special_node
-        .as_ref()
-        .ok_or_else(|| Status::invalid_argument("DFS owner mknod missing special_node"))?;
-    match afs_protocol::node_control::DfsOwnerSpecialNodeKind::try_from(special.kind) {
-        Ok(afs_protocol::node_control::DfsOwnerSpecialNodeKind::Fifo)
-        | Ok(afs_protocol::node_control::DfsOwnerSpecialNodeKind::Socket)
-            if special.rdev == 0 =>
-        {
-            Ok(())
-        }
-        Ok(afs_protocol::node_control::DfsOwnerSpecialNodeKind::BlockDevice)
-        | Ok(afs_protocol::node_control::DfsOwnerSpecialNodeKind::CharDevice) => Ok(()),
-        _ => Err(Status::invalid_argument(
-            "DFS owner mknod has invalid special kind/rdev",
-        )),
-    }
-}
-
-#[cfg(feature = "dfs")]
-fn validate_dfs_owner_control_handle(
-    handle: Option<&afs_protocol::node_control::DfsOwnerHandle>,
-) -> Result<(), Status> {
-    let handle = handle.ok_or_else(|| Status::permission_denied("DFS owner handle is required"))?;
-    if handle.namespace_id.is_empty()
-        || handle.inode_id.is_empty()
-        || handle.owner_node_id.is_empty()
-        || handle.owner_session_id.is_empty()
-        || handle.lease_epoch == 0
-        || handle.caller_node_id.is_empty()
-        || handle.caller_session_id.is_empty()
-        || handle.open_seq == 0
-        || handle.opaque_handle.is_empty()
-    {
-        return Err(Status::permission_denied(
-            "DFS owner handle identity is incomplete",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(feature = "dfs")]
-fn validate_dfs_owner_release_handle(
-    handle: Option<&afs_protocol::node_control::DfsOwnerHandle>,
-) -> Result<(), Status> {
-    let handle = handle.ok_or_else(|| Status::permission_denied("DFS owner handle is required"))?;
-    if handle.namespace_id.is_empty()
-        || handle.inode_id.is_empty()
-        || handle.owner_node_id.is_empty()
-        || handle.owner_session_id.is_empty()
-        || handle.lease_epoch == 0
-        || handle.caller_node_id.is_empty()
-        || handle.caller_session_id.is_empty()
-        || handle.open_seq == 0
-    {
-        return Err(Status::permission_denied(
-            "DFS owner release identity is incomplete",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(feature = "ownerfs")]
-pub(super) fn owner_lock_to_wire(
-    request: &crate::node::vfs::locks::LockRequest,
-) -> afs_protocol::node_control::OwnerFileLock {
-    use crate::node::vfs::types::{FileLockKind, FileLockType};
-    afs_protocol::node_control::OwnerFileLock {
-        kind: match request.kind {
-            FileLockKind::Posix => 1,
-            FileLockKind::Flock => 2,
-        },
-        ingress_session_id: request.owner.ingress_session_id.clone(),
-        kernel_owner: request.owner.kernel_owner,
-        pid: request.pid,
-        start: request.range.start,
-        end: request.range.end,
-        lock_type: match request.lock_type {
-            FileLockType::Read => 1,
-            FileLockType::Write => 2,
-            FileLockType::Unlock => 3,
-        },
-    }
-}
-
-#[cfg(feature = "ownerfs")]
-pub(super) fn owner_lock_from_wire(
-    wire: Option<afs_protocol::node_control::OwnerFileLock>,
-) -> afs_error::Result<crate::node::vfs::locks::LockRequest> {
-    use crate::node::vfs::{
-        locks::LockRequest,
-        types::{FileLockKind, FileLockOwner, FileLockRange, FileLockType},
-    };
-    let wire = wire.ok_or_else(owner_lock_wire_invalid)?;
-    if wire.ingress_session_id.is_empty()
-        || wire.ingress_session_id.len() > 1024
-        || wire.start > wire.end
-    {
-        return Err(owner_lock_wire_invalid());
-    }
-    Ok(LockRequest {
-        kind: match wire.kind {
-            1 => FileLockKind::Posix,
-            2 => FileLockKind::Flock,
-            _ => return Err(owner_lock_wire_invalid()),
-        },
-        owner: FileLockOwner {
-            ingress_session_id: wire.ingress_session_id,
-            kernel_owner: wire.kernel_owner,
-        },
-        pid: wire.pid,
-        range: FileLockRange {
-            start: wire.start,
-            end: wire.end,
-        },
-        lock_type: match wire.lock_type {
-            1 => FileLockType::Read,
-            2 => FileLockType::Write,
-            3 => FileLockType::Unlock,
-            _ => return Err(owner_lock_wire_invalid()),
-        },
-    })
-}
-
-#[cfg(feature = "ownerfs")]
-fn owner_lock_handle_from_wire(
-    handle: Option<afs_protocol::node_control::OwnerLockHandle>,
-) -> afs_error::Result<(
-    crate::node::vfs::ownerfs::root::PresentedRootAccess,
-    crate::node::vfs::ownerfs::files::RemoteFile,
-)> {
-    let handle = handle.ok_or_else(owner_lock_wire_invalid)?;
-    let access = super::data::presented_access(handle.access)?;
-    let bytes = handle.file.ok_or_else(owner_lock_wire_invalid)?.opaque;
-    let identity = handle.identity.ok_or_else(owner_lock_wire_invalid)?.opaque;
-    if bytes.len() != 8 || identity.is_empty() || identity.len() > 256 {
-        return Err(owner_lock_wire_invalid());
-    }
-    let mut file = super::data::remote_file_for_handle(&access, bytes);
-    file.identity = crate::node::vfs::ownerfs::files::FileIdentity(identity);
-    Ok((access, file))
-}
-
-#[cfg(feature = "ownerfs")]
-fn owner_lock_waiter_from_wire(
-    waiter: afs_protocol::node_control::OwnerLockWaiter,
-) -> afs_error::Result<crate::node::vfs::locks::LockWaiterId> {
-    if waiter.ingress_session_id.is_empty() || waiter.ingress_session_id.len() > 256 {
-        return Err(owner_lock_wire_invalid());
-    }
-    Ok(crate::node::vfs::locks::LockWaiterId {
-        ingress_session_id: waiter.ingress_session_id,
-        request_id: waiter.request_id,
-    })
-}
-#[cfg(feature = "ownerfs")]
-fn owner_lock_wire_invalid() -> afs_error::Error {
-    afs_error::Error::coded(
-        afs_error::CLIENT_ARGUMENT_INVALID,
-        "Owner advisory lock authority/request is incomplete",
-    )
-}
-
-#[cfg(feature = "ownerfs")]
-struct OwnerLockCancelOnDrop {
-    handler: crate::node::vfs::ownerfs::OwnerFsPeerExecutor,
-    peer: String,
-    access: crate::node::vfs::ownerfs::root::PresentedRootAccess,
-    waiter: Option<crate::node::vfs::locks::LockWaiterId>,
-}
-#[cfg(feature = "ownerfs")]
-impl Drop for OwnerLockCancelOnDrop {
-    fn drop(&mut self) {
-        if let Some(waiter) = self.waiter.take() {
-            let handler = self.handler.clone();
-            let peer = self.peer.clone();
-            let access = self.access.clone();
-            // Cancel the exact pending request when the HTTP/2 response future
-            // is dropped. A raced Granted outcome is retained; no broad unlock.
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                crate::node::bridge::spawn_blocking_on(&runtime, move || {
-                    let _ = handler.cancel_lock_wait(&peer, &access, waiter);
-                });
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1618,6 +627,44 @@ mod tests {
             .into_inner();
 
         assert_eq!(reply.payload, "pong");
+    }
+
+    /// The other backend's service is simply not registered in a single-backend
+    /// build: the peer sees gRPC UNIMPLEMENTED, classified as such on the client.
+    #[tokio::test]
+    async fn unregistered_backend_service_is_a_classified_unimplemented() {
+        use afs_protocol::node_control::{
+            DfsOwnerGetAttrRequest, OwnerGetLockRequest,
+            dfs_owner_control_client::DfsOwnerControlClient,
+            owner_control_client::OwnerControlClient,
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(make_control_server(RdmaSessionRegistry::new(None)))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener)),
+        );
+        let channel = tonic::transport::Endpoint::from_shared(endpoint)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let owner = OwnerControlClient::new(channel.clone())
+            .owner_get_lock(OwnerGetLockRequest::default())
+            .await
+            .unwrap_err();
+        let dfs = DfsOwnerControlClient::new(channel)
+            .dfs_owner_get_attr(DfsOwnerGetAttrRequest::default())
+            .await
+            .unwrap_err();
+        server.abort();
+        for status in [owner, dfs] {
+            assert_eq!(status.code(), tonic::Code::Unimplemented);
+            let error = afs_transport::grpc::error_status::status_to_error(status);
+            assert_eq!(error.code(), afs_error::CLIENT_REMOTE_STATUS);
+            assert_eq!(error.kind(), afs_error::ErrorKind::Unimplemented);
+        }
     }
 
     #[tokio::test]

@@ -672,10 +672,11 @@ Meta 注册回复提供实际已持久化租约的相对剩余期限 `lease_rema
 需配套升级 Meta 与 Node。旧 Meta 未返回相对期限时，新 Node 明确拒绝注册授权，
 不回退到跨机墙钟或任意30秒授权。Meta persistence readiness 的判定保持独立。
 
-注册请求携带 Node↔Meta 协议版本 `protocol_version`（当前为 1）。Meta 在登记会话前校验，
+注册请求携带集群线协议代际 `protocol_version`（当前为 2，涵盖 Node↔Meta 注册与 Node↔Node service
+布局）。Meta 在登记会话前校验，
 不符或缺省（0，旧 Node）返回 `META_NODE_PROTOCOL_VERSION`（`0x03050001`，FailedPrecondition），
 不写入任何状态；该错误不属于首次注册的可重试类别，Node 直接启动失败。DFS 与 OwnerFs Node
-同受此约束，Meta 与 Node 必须使用同一版本发布。
+同受此约束，Meta 与 Node 必须使用同一版本发布，不支持混合版本集群。
 
 ### Native Peer 准入等待
 

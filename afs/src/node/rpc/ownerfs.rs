@@ -3,7 +3,7 @@
 use afs_error::{Error, Result};
 use afs_protocol::{
     meta::RootReservation as WireReservation,
-    node_control::{PrepareOwnerRootRequest, node_control_client::NodeControlClient},
+    node_control::{PrepareOwnerRootRequest, owner_control_client::OwnerControlClient},
 };
 use tonic::transport::Channel;
 
@@ -55,7 +55,7 @@ pub async fn prepare_root(
     reservation: &RootReservation,
     params: &RootCreateParams,
 ) -> Result<()> {
-    NodeControlClient::new(channel)
+    OwnerControlClient::new(channel)
         .prepare_owner_root(PrepareOwnerRootRequest {
             reservation: Some(reservation_wire(reservation)),
             name: params.name.clone(),

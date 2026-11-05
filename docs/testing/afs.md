@@ -1248,7 +1248,8 @@ all-saturation admission.
 `tls_encryption_enabled` is a top-level Node and Meta boolean, default `false`,
 with the usual defaults < TOML < explicit CLI precedence. It applies uniformly
 to AFS internal TCP/gRPC: registration and heartbeat, filesystem Meta authority,
-node read/write, replica transfer and NodeControl. It does not introduce TLS to
+node read/write, replica transfer and the Node control services
+(`NodeControl`, `OwnerControl`, `DfsOwnerControl`). It does not introduce TLS to
 UDS, RDMA, REST or external object-store HTTPS.
 
 With all four existing `tls_*` identity fields configured, both values require

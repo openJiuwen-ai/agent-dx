@@ -39,7 +39,8 @@ message RegisterNodeRequest {
   string request_id = 1;
   NodeDescriptor node = 2;
   uint64 lease_seconds = 3;
-  // Node-Meta protocol version (afs::format FormatKind::NodeMetaProtocol).
+  // Cluster wire protocol generation: Node-Meta registration and Node-Node
+  // service layout (afs_protocol::CLUSTER_PROTOCOL_VERSION).
   // Meta refuses any other value with META_NODE_PROTOCOL_VERSION; a missing
   // field (0) is an older Node and is refused as well.
   uint32 protocol_version = 4;

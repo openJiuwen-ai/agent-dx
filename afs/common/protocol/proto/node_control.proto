@@ -13,7 +13,15 @@ import "meta.proto";
 // 控制统一 gRPC，不能把收到命令当作已经完成缓存/在途请求屏障。
 // 不承载文件内容。
 
+// Backend-neutral: liveness and the diagnostic NodeData RDMA session.
 service NodeControl {
+  rpc NegotiateData(NegotiateDataRequest) returns (NegotiateDataReply);
+  rpc CloseData(CloseDataRequest) returns (CloseDataReply);
+  rpc Ping(PingRequest) returns (PingReply);
+}
+
+// OwnerFs only; registered in `ownerfs` builds.
+service OwnerControl {
   // Prepare and activate a durable workspace reservation on its Home.
   rpc PrepareOwnerRoot(PrepareOwnerRootRequest) returns (PrepareOwnerRootReply);
   // Home owns advisory lock authority; no file payload travels here.
@@ -23,15 +31,14 @@ service NodeControl {
   rpc OwnerCancelLockWait(OwnerCancelLockWaitRequest) returns (OwnerCancelLockWaitReply);
   rpc OwnerReleaseLocks(OwnerReleaseLocksRequest) returns (OwnerReleaseLocksReply);
   rpc OwnerReleaseLockSession(OwnerReleaseLockSessionRequest) returns (OwnerReleaseLockSessionReply);
-
-  rpc NegotiateData(NegotiateDataRequest) returns (NegotiateDataReply);
-  rpc CloseData(CloseDataRequest) returns (CloseDataReply);
   rpc OwnerNegotiateData(OwnerNegotiateDataRequest) returns (NegotiateDataReply);
   rpc OwnerCloseData(OwnerCloseDataRequest) returns (CloseDataReply);
-  rpc Ping(PingRequest) returns (PingReply);
+}
 
-  // DFS owner lifecycle is control-plane: these calls create/inspect/drop a
-  // writer handle and carry no file bytes. Data ranges remain in node_data.
+// DFS only; registered in `dfs` builds. DFS owner lifecycle is control-plane:
+// these calls create/inspect/drop a writer handle and carry no file bytes. Data
+// ranges remain in node_data.
+service DfsOwnerControl {
   rpc DfsOwnerOpen(DfsOwnerOpenRequest) returns (DfsOwnerOpenReply);
   rpc DfsOwnerGetAttr(DfsOwnerGetAttrRequest) returns (DfsOwnerGetAttrReply);
   rpc DfsOwnerMknod(DfsOwnerMknodRequest) returns (DfsOwnerMknodReply);

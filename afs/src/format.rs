@@ -72,7 +72,9 @@ pub enum FormatKind {
     NodeExternalObjectKey,
     /// N11: OwnerFs local root record `.ownerfs-roots/` (`version`).
     OwnerFsRootRecord,
-    /// P2: Node↔Meta protocol carried by `RegisterNodeRequest`.
+    /// P2: cluster wire protocol generation (Node↔Meta registration, Node↔Node
+    /// service layout) carried by `RegisterNodeRequest`. The value is defined by
+    /// `afs_protocol::CLUSTER_PROTOCOL_VERSION`.
     NodeMetaProtocol,
     /// P3: Node↔Node RDMA probe handshake.
     RdmaHandshake,
@@ -111,8 +113,9 @@ pub const ALL: &[FormatKind] = &[
     FormatKind::RdmaHandshake,
 ];
 
-/// Current versions, typed as each format stores them. Values are the
-/// versions in use before the registry existed; none changed.
+/// Current versions, typed as each format stores them. Values are the versions
+/// in use before the registry existed, except `NODE_META_PROTOCOL`, which moved
+/// to 2 when `NodeControl` was split by backend.
 pub mod version {
     pub const META_WAL_ENVELOPE: u16 = 2;
     pub const META_WAL_SEGMENT: u16 = 1;
@@ -130,7 +133,7 @@ pub mod version {
     pub const NODE_PEER_CACHE_MARKER: u32 = 1;
     pub const NODE_EXTERNAL_OBJECT_KEY: u32 = 1;
     pub const OWNERFS_ROOT_RECORD: u32 = 1;
-    pub const NODE_META_PROTOCOL: u32 = 1;
+    pub const NODE_META_PROTOCOL: u32 = afs_protocol::CLUSTER_PROTOCOL_VERSION;
     pub const RDMA_HANDSHAKE: u32 = 1;
 }
 

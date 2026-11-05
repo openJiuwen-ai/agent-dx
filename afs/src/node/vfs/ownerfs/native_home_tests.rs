@@ -1113,7 +1113,7 @@ struct RemoteCreateFixture {
     _temp: tempfile::TempDir,
     owner: Arc<OwnerFs>,
     ctx: RequestContext,
-    service: crate::node::rpc::control::NodeControlService,
+    service: crate::node::rpc::control::OwnerControlService,
     request: afs_protocol::node_control::PrepareOwnerRootRequest,
 }
 
@@ -1152,10 +1152,8 @@ impl RemoteCreateFixture {
             requester_node_id: reservation.requester_node_id,
             requester_session_id: reservation.requester_session_id,
         };
-        let service = crate::node::rpc::control::NodeControlService::new(
-            crate::node::rpc::control::RdmaSessionRegistry::new(None),
-        )
-        .with_owner_locks(owner.peer_executor().unwrap(), Arc::new(RemoteCreatePeer));
+        let service = crate::node::rpc::control::OwnerControlService::new(Default::default())
+            .with_owner_locks(owner.peer_executor().unwrap(), Arc::new(RemoteCreatePeer));
         Self {
             _temp: temp,
             owner,
@@ -1172,14 +1170,14 @@ impl RemoteCreateFixture {
     }
 
     async fn prepare(&self) {
-        use afs_protocol::node_control::node_control_server::NodeControl;
+        use afs_protocol::node_control::owner_control_server::OwnerControl;
         self.service
             .prepare_owner_root(tonic::Request::new(self.request.clone()))
             .await
             .expect("creation must not depend on bind completion");
     }
     async fn reject_duplicate(&self) {
-        use afs_protocol::node_control::node_control_server::NodeControl;
+        use afs_protocol::node_control::owner_control_server::OwnerControl;
         let error = self
             .service
             .prepare_owner_root(tonic::Request::new(self.request.clone()))

@@ -1821,7 +1821,7 @@ fn owner_operation_global_cap_rejects_before_applying() {
 }
 
 /// A whole proxied session through the RPC entries, as `DfsOwnerFilesService` and
-/// `NodeControlService` run them.
+/// `DfsOwnerControlService` run them.
 async fn owner_rpc_entries_serve_a_session(meta: &RecordingMeta, fs: Arc<DistributedFs>) {
     use crate::node::vfs::{
         dfs::owner_api::{DfsOwnerFilesHandler, DfsOwnerLifecycleHandler},

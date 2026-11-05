@@ -5,7 +5,7 @@ edition = "2024"
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Shared wire-protocol source skeleton"
+description = "AFS wire contracts: protobuf definitions, generated gRPC clients and server traits, and the cluster protocol version"
 publish = false
 
 [lints]

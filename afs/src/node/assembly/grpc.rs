@@ -76,21 +76,24 @@ pub(super) fn start(
         .iter()
         .map(|(node_id, path)| Ok((node_id.clone(), crate::config::read_certificate_der(path)?)))
         .collect::<afs_error::Result<Vec<_>>>()?;
+    let control = rpc::control::NodeControlService::new(sessions.clone()).into_server();
+    // One bound on long advisory lock waits across both backends' control services.
+    #[cfg(any(feature = "ownerfs", feature = "dfs"))]
+    let lock_waits = rpc::control::BlockingLockWaits::default();
     #[cfg(feature = "dfs")]
-    let control = if let Some(dfs) = state.dfs.as_ref() {
-        rpc::control::NodeControlService::with_dfs_owner(
-            sessions.clone(),
+    let dfs_owner_control = if let Some(dfs) = state.dfs.as_ref() {
+        rpc::control::DfsOwnerControlService::with_dfs_owner(
+            lock_waits.clone(),
             dfs.clone(),
             Arc::new(rpc::data::MtlsPeerAuthenticator::new(dfs_trusted.clone())?),
         )
     } else {
-        rpc::control::NodeControlService::new(sessions.clone())
-    };
-    #[cfg(not(feature = "dfs"))]
-    let control = rpc::control::NodeControlService::new(sessions.clone());
+        rpc::control::DfsOwnerControlService::new(lock_waits.clone())
+    }
+    .into_server();
     #[cfg(feature = "ownerfs")]
-    let control = ownerfs::with_owner_control(control, state, &dfs_trusted, owner_rdma_sessions)?;
-    let control = control.into_server();
+    let owner_control =
+        ownerfs::owner_control_server(state, &dfs_trusted, owner_rdma_sessions, lock_waits)?;
     let data = rpc::data::make_data_server(diagnostic_storage, sessions.clone());
     #[cfg(feature = "dfs")]
     let dfs_read_authorizer: Arc<dyn rpc::data::DfsReadAuthorizer> = match dfs_meta.as_ref() {
@@ -136,7 +139,7 @@ pub(super) fn start(
             .add_service(control)
             .add_service(data);
         #[cfg(feature = "ownerfs")]
-        let router = router.add_service(owner_files);
+        let router = router.add_service(owner_control).add_service(owner_files);
         #[cfg(feature = "dfs")]
         let router = {
             let dfs_owner_files = if let Some(dfs) = grpc_state.dfs.as_ref() {
@@ -147,7 +150,10 @@ pub(super) fn start(
             } else {
                 rpc::data::make_dfs_owner_files_server(rpc::data::DfsOwnerFilesService::default())
             };
-            router.add_service(dfs_chunks).add_service(dfs_owner_files)
+            router
+                .add_service(dfs_owner_control)
+                .add_service(dfs_chunks)
+                .add_service(dfs_owner_files)
         };
         router
             .serve_with_incoming_shutdown(incoming, cancelled(stop))
