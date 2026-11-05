@@ -412,6 +412,53 @@ then start fresh OwnerFs and DFS one-hour runs. Never reinterpret or concatenate
 old failures. See the evidence scope and next steps in the
 [same five-step strategy](../../docs/testing/test-strategy.md#step-5).
 
+### Fixed warmup plus one-hour measurement v4 (OwnerFs)
+
+`--acceptance warmup-hour --mode ownerfs --seconds 7200` selects
+[warmup-hour-v4.json](soak-contracts/warmup-hour-v4.json). This is a new contract;
+`--acceptance one-hour` still selects the unchanged v3 file. No existing result
+is reclassified. The fixed product package, Execd defaults and SDK remain
+unchanged; only the independently staged test harness changes.
+
+```sh
+python3 -B build/e2e/soak.py \
+  --bundle /absolute/bundle/bundle.json \
+  --registry-images /absolute/bundle/registry-images.json \
+  --image-export /absolute/offline-images/image-export.json \
+  --artifact-commit <fixed-product-commit> \
+  --mode ownerfs --acceptance warmup-hour --seconds 7200 \
+  --output /absolute/new-ownerfs-warmup-hour-result
+```
+
+Before a formal run, `--acceptance qualification --qualify-v4-observer --seconds 60`
+can exercise the same memory/identity/peak probes. This remains qualification-only,
+never supplies formal measurement time, and cannot be combined with formal mode.
+
+The first 3600 seconds are active warmup; the next complete 3600 seconds are
+measurement. No process replacement, redeployment, cache clearing, adaptive
+extension or workload change occurs at the boundary. Deployment and final
+cleanup are separate. All 24 five-minute windows must sustain work; exactly the
+last 12 windows determine trends. Measurement alone must supply 600 cycles and
+300 complete churn pairs; warmup counts cannot supply them. Full-run minima are
+1200 cycles and 600 pairs. Every peak/OOM/error/identity/FD-credit/disk-reserve
+check applies from the first sample, including warmup; the baseline never resets.
+
+Numeric peak and existing trend limits are identical to v3. The v4 probe also
+records raw smaps and a census of every PID visible in each owned container PID
+namespace. Persistent roles include the actual Execd service child (bound to the
+runc init's executable and PID namespace), SDK worker, Collector, Redis and
+platform/AFS processes. Individual anonymous PSS uses the existing process RSS
+trend budget (8 MiB/hour and 16 MiB end delta); Swap must remain zero for this
+resident-memory qualification. Census races for short-lived commands remain in
+evidence; missing/replaced persistent roles fail. Expected SDK/anchor retirement
+is allowed only after the workload is terminal; normal cleanup remains mandatory.
+
+A pass means this fixed workload completed one effective measurement hour after
+one warmup hour within its budgets. It is not 24-hour, fault, performance or DFS
+acceptance. DFS is explicitly refused by this profile: its prior Meta peak
+failure cannot be hidden inside a warmup exemption. Complete results and dated
+run evidence remain in the [single five-step strategy](../../docs/testing/test-strategy.md#step-5).
+
 ### Fixed AFS component package on one Linux VM
 
 Provide a Linux VM whose native architecture matches the component, Python

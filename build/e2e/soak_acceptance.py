@@ -6,21 +6,27 @@ import json
 import math
 from pathlib import Path
 import statistics
+from copy import deepcopy
 
 NODES = ('node1', 'node2', 'afs-m')
 CONTRACT_PATH = Path(__file__).with_name('soak-contracts') / 'one-hour-v3.json'
+V4_CONTRACT_PATH = CONTRACT_PATH.with_name('warmup-hour-v4.json')
 
 _SPEC = importlib.util.spec_from_file_location('soak_fd_acceptance', Path(__file__).with_name('soak_fd.py'))
 fd = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(fd)
 
 
-def contract():
-    return json.loads(CONTRACT_PATH.read_text())
+def contract_path(policy=None):
+    return V4_CONTRACT_PATH if policy and policy.get('observation') else CONTRACT_PATH
 
 
-def contract_sha():
-    return hashlib.sha256(CONTRACT_PATH.read_bytes()).hexdigest()
+def contract(kind='one-hour'):
+    return json.loads((V4_CONTRACT_PATH if kind == 'warmup-hour' else CONTRACT_PATH).read_text())
+
+
+def contract_sha(policy=None):
+    return hashlib.sha256(contract_path(policy).read_bytes()).hexdigest()
 
 
 def number(value, label):
@@ -34,6 +40,7 @@ def number(value, label):
 
 
 def check_sample(sample, baseline, policy, mode):
+    full = bool(policy.get('observation'))
     if set(sample.get('nodes', {})) != set(NODES):
         raise ValueError('acceptance resource role missing')
     if sample.get('instances') != baseline['instances'] or set(sample['instances']) != {'A', 'B'}:
@@ -61,7 +68,15 @@ def check_sample(sample, baseline, policy, mode):
             raise ValueError(node + ' exactly one owned AFS process is required')
         if node == 'afs-m' and any(name.startswith('afs-node:') for name in observed['processes']):
             raise ValueError('Meta role cannot claim DFS reader credit')
-        fd.verify(observed, initial, mode, policy['peak_growth']['fds'])
+        fd_initial = initial
+        if full and sample.get('active') is not True:
+            fd_initial = deepcopy(initial)
+            fd_initial['processes'] = {name: p for name, p in fd_initial['processes'].items()
+                                       if not name.startswith(('execd-service:', 'sdk-worker:'))}
+            fd_initial['anchor_runtime'] = None
+            fd_initial['fds'] = sum(p['fds'] for p in fd_initial['processes'].values())
+            fd.attach(fd_initial, mode)
+        fd.verify(observed, fd_initial, mode, policy['peak_growth']['fds'])
         for field, maximum in policy['peak_growth'].items():
             metric = 'fds_noncache' if field == 'fds' else field
             current = number(observed.get(metric), node + '.' + metric)
@@ -74,12 +89,39 @@ def check_sample(sample, baseline, policy, mode):
                 if number(observed.get(field, {}).get(counter), field + '.' + counter) != 0:
                     raise ValueError(node + ' OOM event: ' + field)
         processes = observed.get('processes', {})
-        if set(processes) != set(initial['processes']):
+        terminal = full and sample.get('active') is not True
+        expected_processes = {name: p for name, p in initial['processes'].items()
+                              if not terminal or not name.startswith(('execd-service:', 'sdk-worker:'))}
+        if set(processes) != set(expected_processes):
             raise ValueError(node + ' persistent process set changed')
+        if full:
+            if observed.get('observation_scope') != policy['observation']['scope']:
+                raise ValueError(node + ' full memory observation missing')
+            census = observed.get('process_census', [])
+            by_pid = {p['pid']: p for p in census}
+            if not census or len(by_pid) != len(census):
+                raise ValueError(node + ' complete unique PID census missing')
+            required = (['afs-meta'] if node == 'afs-m' else policy['observation']['required_node_processes'])
+            if node == 'node1':
+                required = [*required, *policy['observation']['required_node1_processes']]
+            if terminal:
+                required = [n for n in required if n != 'execd-service']
+            if node == policy['observation']['required_sdk_node'] and not terminal:
+                required = [*required, 'sdk-worker']
+            if any(sum(name.startswith(role + ':') for name in processes) != 1 for role in required):
+                raise ValueError(node + ' required persistent role missing/ambiguous')
         for name, process in processes.items():
             if any(process.get(key) != initial['processes'][name][key] for key in ('pid', 'start_ticks')):
                 raise ValueError(node + ' process identity changed: ' + name)
             number(process.get('rss_bytes'), node + '.' + name + '.rss_bytes')
+            if full:
+                verify_memory(process, initial['processes'][name])
+                raw_process = by_pid.get(process['pid'], {})
+                if any(process.get(k) != raw_process.get(k)
+                       for k in ('start_ticks', 'identity', 'smaps_rollup_raw')):
+                    raise ValueError(node + ' persistent profile differs from raw PID census')
+                if process['rss_bytes'] - initial['processes'][name]['rss_bytes'] > policy['peak_growth']['rss_bytes']:
+                    raise ValueError(node + ' persistent process RSS peak growth: ' + name)
         if sample.get('active') is True and node != 'afs-m':
             anchor, initial_anchor = observed.get('anchor_runtime'), initial.get('anchor_runtime')
             if (not anchor or not initial_anchor or any(anchor.get(key) != initial_anchor.get(key)
@@ -91,6 +133,13 @@ def check_sample(sample, baseline, policy, mode):
                 if (number(anchor.get(metric), 'anchor.' + metric) - initial_anchor[metric]
                         > policy['peak_growth'][metric]):
                     raise ValueError(node + ' anchor peak resource growth: ' + metric)
+            if full:
+                verify_memory(anchor, initial_anchor)
+                service = next(p for name, p in processes.items() if name.startswith('execd-service:'))
+                if (service['identity']['ppid'] != anchor['pid'] or any(
+                        service['identity'][k] != anchor['identity'][k]
+                        for k in ('exe_device', 'exe_inode', 'pid_namespace'))):
+                    raise ValueError(node + ' Execd is not the pinned init service child')
 
 
 def trend(times, values, bounds, label):
@@ -105,8 +154,30 @@ def trend(times, values, bounds, label):
     return result
 
 
+def verify_memory(process, initial):
+    raw = {}
+    for line in process.get('smaps_rollup_raw', '').splitlines():
+        fields = line.split()
+        if len(fields) == 3 and fields[2] == 'kB':
+            raw[fields[0].rstrip(':')] = int(fields[1]) * 1024
+    for key, source in [('rss_bytes', 'Rss'), ('pss_anon_bytes', 'Pss_Anon'),
+                        ('swap_bytes', 'Swap'), ('swap_pss_bytes', 'SwapPss')]:
+        if source not in raw or number(process.get(key), key) != raw[source]:
+            raise ValueError('raw smaps differs: ' + key)
+    identity = process.get('identity')
+    if not identity or identity != initial.get('identity'):
+        raise ValueError('persistent executable/namespace/cgroup/parent identity differs')
+    if process['swap_bytes'] != 0 or process['swap_pss_bytes'] != 0:
+        raise ValueError('Swap invalidates resident memory measurement')
+
+
 def evaluate(samples, work, mode, policy):
     """Every required window and raw sample participates; never select best intervals."""
+    full = bool(policy.get('observation'))
+    if full and mode not in policy['modes']:
+        raise ValueError('mode has not qualified this warmup contract')
+    if full and any(work.get(k) != policy[k] for k in ('warmup_seconds', 'measurement_seconds')):
+        raise ValueError('SDK phase duration binding differs from frozen contract')
     counts = work.get('operations', {})
     cycles = number(work.get('cycles'), 'cycles')
     if (work.get('status') != 'passed'
@@ -119,7 +190,7 @@ def evaluate(samples, work, mode, policy):
         raise ValueError('one-hour workload duration/content/counts/error/cleanup contract incomplete')
     if (cycles < policy['minimum_total_cycles']
             or work.get('verified_bytes') != cycles * 16384
-            or work.get('contract_sha256') != contract_sha()):
+            or work.get('contract_sha256') != contract_sha(policy)):
         raise ValueError('one-hour workload duration/content/counts/error/cleanup contract incomplete')
     if (work.get('payload_transport') != policy['measurement']['payload_transport']
             or not 0 < number(work.get('maximum_publish_command_bytes'), 'control command bytes') <= 2048
@@ -162,7 +233,7 @@ def evaluate(samples, work, mode, policy):
     if baseline['instances'] != work.get('instances'):
         raise ValueError('final anchor identities differ')
     windows = []
-    for start in range(policy['warmup_seconds'], policy['seconds'], policy['window_seconds']):
+    for start in range(0 if full else policy['warmup_seconds'], policy['seconds'], policy['window_seconds']):
         end = start + policy['window_seconds']
         selected = [s for s in samples if s.get('active') is True and start <= s['elapsed_seconds'] < end]
         if (len(selected) < policy['minimum_window_samples']
@@ -199,6 +270,16 @@ def evaluate(samples, work, mode, policy):
                         'anchors': {node: {field: statistics.median(s['nodes'][node]['anchor_runtime'][field]
                                                                    for s in selected) for field in ('rss_bytes', 'fds')}
                                     for node in ('node1', 'node2')}})
+    warmup_windows = []
+    if full:
+        warmup_windows = [w for w in windows if w['start_seconds'] < policy['warmup_seconds']]
+        windows = [w for w in windows if w['start_seconds'] >= policy['warmup_seconds']]
+        measured = [s for s in samples if s.get('active') is True
+                    and policy['warmup_seconds'] <= s['elapsed_seconds'] < policy['seconds']]
+        if (measured[-1]['cycles'] - measured[0]['cycles'] < policy['minimum_measurement_cycles']
+                or any(measured[-1]['operations'][k] - measured[0]['operations'][k]
+                       < policy['minimum_measurement_churn'] for k in ('create', 'delete'))):
+            raise ValueError('measurement-only work insufficient; warmup cannot supply counts')
     times = [(window['start_seconds'] + window['end_seconds']) / 2 for window in windows]
     trends = {}
     for node in NODES:
@@ -208,6 +289,13 @@ def evaluate(samples, work, mode, policy):
             name: trend(times, [w['processes'][node][name] for w in windows],
                         policy['process_rss_trend'], node + '.' + name)
             for name in baseline['nodes'][node]['processes']}
+        if full:
+            trends[node]['process_pss_anon'] = {
+                name: trend(times, [statistics.median(s['nodes'][node]['processes'][name]['pss_anon_bytes']
+                    for s in samples if s.get('active') is True
+                    and w['start_seconds'] <= s['elapsed_seconds'] < w['end_seconds']) for w in windows],
+                    policy['process_pss_anon_trend'], node + '.' + name + '.pss_anon')
+                for name in baseline['nodes'][node]['processes']}
         trends[node]['process_noncache_fds'] = {
             name: trend(times, [w['process_fds'][node][name] for w in windows],
                         policy['trends']['fds'], node + '.' + name + '.noncache_fds')
@@ -224,6 +312,8 @@ def evaluate(samples, work, mode, policy):
                 policy['process_rss_trend'], node + '.anchor.rss')
             trends[node]['anchor_runtime_fds'] = trend(
                 times, [w['anchors'][node]['fds'] for w in windows], policy['trends']['fds'], node + '.anchor.fds')
-    return {'status': 'passed', 'contract_id': policy['id'], 'qualification_only': False,
+    phases = ({'warmup_seconds': policy['warmup_seconds'], 'measurement_seconds': policy['measurement_seconds'],
+               'warmup_windows': warmup_windows} if full else {})
+    return {'status': 'passed', 'contract_id': policy['id'], 'qualification_only': False, **phases,
             'actual_seconds': work['elapsed_seconds'], 'windows': windows, 'trends': trends,
             'fault_recovery_claimed': False, 'performance_acceptance': False}
