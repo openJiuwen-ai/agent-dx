@@ -12,17 +12,22 @@
 //!   a contended lock, [`offload`] for short local work that may avoid the pool,
 //!   [`local_io`] for finite local disk work inside an async read, and
 //!   [`run_sync_backend`] for genuinely synchronous provider implementations.
+#[cfg(any(feature = "ownerfs", feature = "dfs"))]
 use std::{future::Future, panic::Location, sync::Arc};
 
+#[cfg(any(feature = "ownerfs", feature = "dfs"))]
 use afs_error::{Error, Result};
+#[cfg(any(feature = "ownerfs", feature = "dfs"))]
 use tokio::runtime::{Handle, Runtime, RuntimeFlavor};
 
 /// Output of a bridged future: fallible, so a refused entry can be reported in
 /// the future's own error type.
+#[cfg(any(feature = "ownerfs", feature = "dfs"))]
 pub(crate) trait BridgeOutput {
     fn from_bridge_error(error: Error) -> Self;
 }
 
+#[cfg(any(feature = "ownerfs", feature = "dfs"))]
 impl<T, E: From<Error>> BridgeOutput for std::result::Result<T, E> {
     fn from_bridge_error(error: Error) -> Self {
         Err(error.into())
@@ -38,6 +43,7 @@ impl<T, E: From<Error>> BridgeOutput for std::result::Result<T, E> {
 /// is entered, so the check asks exactly that question with a ready future. On
 /// misuse the panic hook still prints Tokio's message. A thread without a handle
 /// (the FUSE workers) cannot be inside a runtime and skips the probe.
+#[cfg(any(feature = "ownerfs", feature = "dfs"))]
 #[track_caller]
 pub(crate) fn check_sync_entry() -> Result<()> {
     let Ok(current) = Handle::try_current() else {
@@ -240,7 +246,8 @@ fn on_multi_thread_runtime() -> bool {
     Handle::try_current().is_ok_and(|handle| handle.runtime_flavor() == RuntimeFlavor::MultiThread)
 }
 
-#[cfg(test)]
+// The tests drive `block_on`, which only exists with a filesystem backend.
+#[cfg(all(test, any(feature = "ownerfs", feature = "dfs")))]
 mod tests {
     use super::*;
 
@@ -349,7 +356,6 @@ mod tests {
         assert_eq!(result.unwrap(), 7);
     }
 
-    #[cfg(any(feature = "ownerfs", feature = "dfs"))]
     #[test]
     fn sync_runtime_outside_a_runtime_owns_one_and_refuses_inside_a_runtime() {
         let owned = SyncRuntime::current_or_new("test client").unwrap();

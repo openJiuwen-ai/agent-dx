@@ -55,10 +55,12 @@ pub(super) fn load_checkpoint(path: &Path) -> Result<Option<LocalCatalog>> {
     }
     Ok(Some(LocalCatalog {
         revision: value.revision,
+        #[cfg(any(feature = "dfs", test))]
         gc_generation: value.gc_generation,
         records,
     }))
 }
+#[cfg(any(feature = "dfs", test))]
 pub(super) fn save_checkpoint(root: &Path, catalog: &LocalCatalog) -> Result<()> {
     let mut records = catalog.records.values().cloned().collect::<Vec<_>>();
     records.sort_by(|a, b| a.chunk.id.cmp(&b.chunk.id));

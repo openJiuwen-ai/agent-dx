@@ -8,6 +8,7 @@ use super::*;
 pub(super) type PeerChannelKey = (String, u64, String, bool);
 
 pub struct PeerConnectionPool {
+    #[cfg(feature = "dfs")]
     pub(super) read_crc_mode: crate::config::DfsReadCrcMode,
     #[cfg(feature = "dfs")]
     pub(super) read_work_metrics: Option<crate::node::metrics::work::ReadWorkMetrics>,
@@ -51,6 +52,7 @@ impl PeerConnectionPool {
             security,
             capacity,
             state: tokio::sync::Mutex::new(PeerPoolState::default()),
+            #[cfg(feature = "dfs")]
             read_crc_mode: crate::config::DfsReadCrcMode::Both,
             #[cfg(feature = "dfs")]
             stream_work: Arc::new(PeerStreamWorkPool::default()),
@@ -68,6 +70,7 @@ impl PeerConnectionPool {
         self
     }
 
+    #[cfg(feature = "dfs")]
     pub(crate) fn with_read_crc_mode(mut self, mode: crate::config::DfsReadCrcMode) -> Self {
         self.read_crc_mode = mode;
         self

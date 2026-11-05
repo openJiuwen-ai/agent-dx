@@ -34,6 +34,7 @@ impl CatalogTxn {
 #[derive(Debug, Default)]
 pub struct LocalCatalog {
     pub(super) revision: u64,
+    #[cfg(any(feature = "dfs", test))]
     pub(super) gc_generation: u64,
     pub(super) records: HashMap<ChunkId, LocalChunkRecord>,
 }

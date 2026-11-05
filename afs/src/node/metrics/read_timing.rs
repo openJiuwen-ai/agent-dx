@@ -239,6 +239,13 @@ pub(crate) struct ReadCoarseDiagnosticSpan {
     bytes: u64,
 }
 
+// Without the journal the guard records nothing, but callers still end its
+// scope with `drop`, so it stays a drop guard in every build.
+#[cfg(not(any(feature = "dfs", test)))]
+impl Drop for ReadCoarseDiagnosticSpan {
+    fn drop(&mut self) {}
+}
+
 #[cfg(any(feature = "dfs", test))]
 impl Drop for ReadCoarseDiagnosticSpan {
     fn drop(&mut self) {

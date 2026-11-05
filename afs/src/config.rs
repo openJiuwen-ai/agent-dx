@@ -456,6 +456,7 @@ pub enum DfsReadCrcMode {
     Off,
 }
 impl DfsReadCrcMode {
+    #[cfg(feature = "dfs")]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Both => "both",
@@ -855,10 +856,9 @@ unsigned_payload = true
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "dfs"))]
 mod crc32c_config_tests {
     use super::*;
-    #[cfg(feature = "dfs")]
     #[test]
     fn crc32c_write_mode_follows_storage_and_has_no_switch() {
         // S1a-7 (R21, F6): native storage always writes CRC32C objects with
@@ -881,10 +881,9 @@ mod crc32c_config_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "dfs"))]
 mod crc_read_modes_contract_tests {
     use super::*;
-    #[cfg(feature = "dfs")]
     #[test]
     fn crc_read_modes_explicit_config_survives_resolution() {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -950,10 +949,9 @@ mod gc_grace_config_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "dfs"))]
 mod crc_read_modes_validation_tests {
     use super::*;
-    #[cfg(feature = "dfs")]
     #[test]
     fn crc_read_modes_cli_defaults_and_scope_preserve_write_crc() {
         for mode in ["receiver", "off"] {

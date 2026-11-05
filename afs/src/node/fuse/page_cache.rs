@@ -173,6 +173,7 @@ impl InodeCacheGate {
         })
     }
 
+    #[cfg(feature = "dfs")]
     pub(super) async fn read_owned_until(
         &self,
         deadline: std::time::Instant,

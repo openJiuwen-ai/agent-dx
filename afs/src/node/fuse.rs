@@ -21,6 +21,7 @@ mod write_admission;
 pub use self::metrics::FuseRequestMetrics;
 #[cfg(feature = "dfs")]
 pub use self::mount::mount_dfs_with_diagnostics_and_fd_bridge;
+#[cfg(feature = "ownerfs")]
 pub(crate) use self::mount::mount_with_policy;
 pub use self::mount::{
     DfsMountOptions, FuseExecOptions, FuseMountOptions, MountedFuse, mount_dfs,
@@ -73,7 +74,7 @@ use afs_error::Error;
 use afs_tracing::tracing;
 use afs_transport::usrbio_fd as fd_wire;
 use fuser::FileHandle as FuseFileHandle;
-#[cfg(any(feature = "dfs", test))]
+#[cfg(feature = "dfs")]
 use fuser::InitFlags;
 use fuser::RenameFlags as FuseRenameFlags;
 use fuser::{

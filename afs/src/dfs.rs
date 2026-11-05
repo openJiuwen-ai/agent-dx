@@ -601,7 +601,7 @@ impl EffectiveLocalCopy {
 
     /// A placement whose effective rule differs from the declared one. No
     /// production path produces this yet.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "dfs"))]
     pub(crate) fn lowered_for_test(declared: LocalCopyPolicy, effective: LocalCopyPolicy) -> Self {
         Self {
             declared,

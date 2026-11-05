@@ -103,7 +103,9 @@ impl LocalChunkStore {
             catalog: Mutex::new(catalog),
             catalog_committer: CatalogCommitter::default(),
             next_staging: AtomicU64::new(1),
+            #[cfg(any(feature = "dfs", test))]
             gc_inventory_cursor: AtomicU64::new(0),
+            #[cfg(any(feature = "dfs", test))]
             peer_read_crc_mode: crate::config::DfsReadCrcMode::Both,
             read_work: None,
             sidecar_installer: SidecarInstaller::default(),
@@ -134,6 +136,7 @@ impl LocalChunkStore {
         self
     }
 
+    #[cfg(feature = "dfs")]
     pub(crate) fn peer_read_crc_mode(&self) -> crate::config::DfsReadCrcMode {
         self.peer_read_crc_mode
     }

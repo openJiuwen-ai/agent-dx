@@ -376,7 +376,7 @@ pub(super) fn replica_write_token(
 }
 
 /// `placement_hash` of a placement that executes its declared local-copy rule.
-#[cfg(test)]
+#[cfg(all(test, feature = "dfs"))]
 pub(super) fn placement_hash(replication: &ReplicationConfig, targets: &[ReplicaTarget]) -> u64 {
     effective_placement_hash(
         replication,

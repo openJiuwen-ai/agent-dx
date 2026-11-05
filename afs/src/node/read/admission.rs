@@ -123,10 +123,12 @@ impl NativeReadReply {
 
 /// Bounded per-key coordination. Idle keys may be evicted, active gates never
 /// are; callers recheck their real cache after taking the owned async guard.
+#[cfg(feature = "dfs")]
 #[derive(Default)]
 pub(crate) struct ReadKeyGates(
     std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
 );
+#[cfg(feature = "dfs")]
 impl ReadKeyGates {
     pub(crate) fn entry(&self, key: String) -> Result<std::sync::Arc<tokio::sync::Mutex<()>>> {
         if key.len() > 4096 {

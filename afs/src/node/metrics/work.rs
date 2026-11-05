@@ -110,6 +110,7 @@ const NATIVE_WRITE_RESOURCES: &[&str] = &[
 ];
 
 /// Fixed, prebound counters: no label lookup in the per-frame hot loop.
+#[cfg(any(feature = "dfs", test))]
 #[derive(Clone, Copy)]
 pub(crate) enum ReadCheck {
     RequestValidate,
@@ -123,6 +124,7 @@ pub(crate) enum ReadCheck {
     BatchGroup,
     FullGrant,
 }
+#[cfg(any(feature = "dfs", test))]
 const READ_CHECK_NAMES: [&str; 10] = [
     "request_validate",
     "serve_state",
@@ -138,20 +140,28 @@ const READ_CHECK_NAMES: [&str; 10] = [
 
 #[derive(Clone, Debug)]
 pub struct ReadWorkMetrics {
+    #[cfg(feature = "dfs")]
     pub(crate) activities: super::super::read::activity::Activities,
+    #[cfg(any(feature = "dfs", test))]
     checks: [afs_metrics::IntCounter; 10],
     #[cfg(feature = "dfs")]
     native_write_resources: afs_metrics::IntGaugeVec,
     catalog_commit_resources: afs_metrics::IntGaugeVec,
     scan_bytes: afs_metrics::IntCounter,
     hashes: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
     read_buffer_events: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
     read_buffer_bytes: afs_metrics::IntCounterVec,
+    #[cfg(any(feature = "dfs", test))]
     read_buffer_idle: afs_metrics::IntGaugeVec,
+    #[cfg(any(feature = "dfs", test))]
     read_buffer_capacity: afs_metrics::IntGaugeVec,
     crc_read_bytes: afs_metrics::IntCounterVec,
     crc_read_calls: afs_metrics::IntCounterVec,
+    #[cfg(feature = "dfs")]
     authorization_ns: afs_metrics::IntCounterVec,
+    #[cfg(feature = "dfs")]
     authorization_calls: afs_metrics::IntCounterVec,
     outboard_total_bytes: afs_metrics::IntGauge,
     outboard_resident_bytes: afs_metrics::IntGauge,
@@ -258,18 +268,31 @@ impl ReadWorkMetrics {
                 "afs_dfs_read_scan_bytes_total",
                 "Logical file bytes read and hashed by complete immutable Chunk verification.",
             )?;
+            #[cfg(feature = "dfs")]
             let authorization_ns = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_authorization_nanoseconds_total", "Complete authorization scope wall time; scopes can nest and overlap."), &["stage"])?;
+            #[cfg(feature = "dfs")]
             let authorization_calls = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_authorization_calls_total", "Authorization scope calls, including cache hits and failures."), &["stage"])?;
+            #[cfg(feature = "dfs")]
             for stage in ["total", "cache_maintenance", "meta_rpc"] { authorization_ns.with_label_values(&[stage]); authorization_calls.with_label_values(&[stage]); }
+            #[cfg(feature = "dfs")]
             afs_metrics::register_collector(registry, &authorization_ns)?;
+            #[cfg(feature = "dfs")]
             afs_metrics::register_collector(registry, &authorization_calls)?;
+            #[cfg(any(feature = "dfs", test))]
             let checks = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_checks_total", "Executed read control operations; fixed-stage counters, not elapsed time."), &["stage"])?;
+            #[cfg(any(feature = "dfs", test))]
             let stages = [ReadCheck::RequestValidate, ReadCheck::ServeState, ReadCheck::CatalogOpen, ReadCheck::CatalogFence, ReadCheck::DescriptorEncode, ReadCheck::DescriptorDecode, ReadCheck::AuthorizeFull, ReadCheck::LocalProbe, ReadCheck::BatchGroup, ReadCheck::FullGrant];
+            #[cfg(any(feature = "dfs", test))]
             let checks_bound = std::array::from_fn(|i| checks.with_label_values(&[READ_CHECK_NAMES[stages[i] as usize]]));
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &checks)?;
+            #[cfg(any(feature = "dfs", test))]
             let read_buffer_events = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_buffer_events_total", "Read buffer allocation/reuse/return events; zero counts explicit initialization."), &["role", "event"])?;
+            #[cfg(any(feature = "dfs", test))]
             let read_buffer_bytes = afs_metrics::IntCounterVec::new(afs_metrics::Opts::new("afs_dfs_read_buffer_bytes_total", "Actual capacity allocated/reused/returned or explicit bytes zeroed."), &["role", "event"])?;
+            #[cfg(any(feature = "dfs", test))]
             let read_buffer_idle = afs_metrics::IntGaugeVec::new(afs_metrics::Opts::new("afs_dfs_read_buffer_idle_bytes", "Idle initialized buffer capacity; native async idle plus active storage shares a fixed byte budget."), &["role"])?;
+            #[cfg(any(feature = "dfs", test))]
             for role in ["serve", "reply"] {
                 read_buffer_idle.with_label_values(&[role]);
                 for event in ["allocate", "reuse", "return", "zero"] {
@@ -277,10 +300,15 @@ impl ReadWorkMetrics {
                     read_buffer_bytes.with_label_values(&[role,event]);
                 }
             }
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &read_buffer_events)?;
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &read_buffer_bytes)?;
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry, &read_buffer_idle)?;
+            #[cfg(any(feature = "dfs", test))]
             let read_buffer_capacity=afs_metrics::IntGaugeVec::new(afs_metrics::Opts::new("afs_dfs_read_buffer_capacity_bytes","Pool-owned storage by role/state; active plus idle equals total; legacy detached Vec storage excluded."), &["role","state"])?;
+            #[cfg(any(feature = "dfs", test))]
             afs_metrics::register_collector(registry,&read_buffer_capacity)?;
             let crc_read_bytes = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new("afs_dfs_crc32c_read_bytes_total", "Actual CRC32C read input bytes, including failed work; descriptor hashes are separate."), &["stage"],
@@ -625,20 +653,28 @@ impl ReadWorkMetrics {
                 copies.with_label_values(&[stage]);
             }
             Ok(Self {
+                #[cfg(feature = "dfs")]
                 activities: super::super::read::activity::Activities::register(registry)?,
+                #[cfg(any(feature = "dfs", test))]
                 checks: checks_bound,
                 #[cfg(feature = "dfs")]
                 native_write_resources,
                 catalog_commit_resources,
                 scan_bytes,
                 hashes,
+                #[cfg(any(feature = "dfs", test))]
                 read_buffer_events,
+                #[cfg(any(feature = "dfs", test))]
                 read_buffer_bytes,
+                #[cfg(any(feature = "dfs", test))]
                 read_buffer_idle,
+                #[cfg(any(feature = "dfs", test))]
                 read_buffer_capacity,
                 crc_read_bytes,
                 crc_read_calls,
+                #[cfg(feature = "dfs")]
                 authorization_ns,
+                #[cfg(feature = "dfs")]
                 authorization_calls,
                 outboard_total_bytes,
                 outboard_resident_bytes,
@@ -768,6 +804,7 @@ impl ReadWorkMetrics {
         self.diagnostics.as_ref().map(|journal| journal.snapshot())
     }
 
+    #[cfg(feature = "dfs")]
     pub(crate) fn authorization_scope(&self, stage: &'static str) -> ReadAuthorizationScope {
         ReadAuthorizationScope {
             metrics: self.clone(),
@@ -1113,6 +1150,7 @@ impl ReadWorkMetrics {
         }
     }
 
+    #[cfg(feature = "dfs")]
     pub(crate) fn read_buffer_counters(
         &self,
         role: &'static str,
@@ -1123,6 +1161,7 @@ impl ReadWorkMetrics {
             self.read_buffer_bytes.with_label_values(&[role, event]),
         )
     }
+    #[cfg(feature = "dfs")]
     pub(crate) fn read_buffer_gauge(
         &self,
         role: &'static str,
@@ -1130,6 +1169,7 @@ impl ReadWorkMetrics {
     ) -> afs_metrics::IntGauge {
         self.read_buffer_capacity.with_label_values(&[role, state])
     }
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn read_buffer(&self, role: &'static str, event: &'static str, bytes: u64) {
         self.read_buffer_events
             .with_label_values(&[role, event])
@@ -1138,6 +1178,7 @@ impl ReadWorkMetrics {
             .with_label_values(&[role, event])
             .inc_by(bytes);
     }
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn read_buffer_capacity(
         &self,
         role: &'static str,
@@ -1160,11 +1201,13 @@ impl ReadWorkMetrics {
             }
         }
     }
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn read_buffer_idle(&self, role: &'static str, bytes: u64) {
         if let Ok(bytes) = i64::try_from(bytes) {
             self.read_buffer_idle.with_label_values(&[role]).set(bytes);
         }
     }
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn check(&self, stage: ReadCheck) {
         self.checks[stage as usize].inc();
     }
@@ -1366,11 +1409,13 @@ impl Drop for ScanWork<'_> {
 }
 
 /// Cumulative counters independent of the bounded per-request journal.
+#[cfg(feature = "dfs")]
 pub(crate) struct ReadAuthorizationScope {
     metrics: ReadWorkMetrics,
     stage: &'static str,
     started: std::time::Instant,
 }
+#[cfg(feature = "dfs")]
 impl Drop for ReadAuthorizationScope {
     fn drop(&mut self) {
         self.metrics

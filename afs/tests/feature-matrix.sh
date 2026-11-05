@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # AFS feature matrix: every supported feature combination must check and build its tests.
 # Linux-only (see afs/AGENTS.md); the caller controls CARGO_TARGET_DIR. CARGO_JOBS defaults to 6.
-# It also runs the single-backend config_contract. --run-lib adds the single-backend lib
-# tests, which need TMPDIR on a native Linux filesystem with flock, xattr and over 1 GiB free:
-# not the Mac-shared directories (flock, xattr) or 64 MiB /dev/shm of the adx-vm build
-# container. There, build them with --lib --no-run and run the binaries on a runtime node.
+# It also runs the single-backend clippy (-D warnings) and config_contract, and builds the
+# tests without either backend. --run-lib adds the single-backend lib tests, which need
+# TMPDIR on a native Linux filesystem with flock, xattr and over 1 GiB free: not the
+# Mac-shared directories (flock, xattr) or 64 MiB /dev/shm of the adx-vm build container.
+# There, build them with --lib --no-run and run the binaries on a runtime node.
 set -euo pipefail
 run_lib=0
 case "${1:-}" in
@@ -40,6 +41,8 @@ done
 
 # Single-backend builds have no other gate.
 for fs in ownerfs dfs; do
+  echo "== afs [$fs]: clippy"
+  cargo clippy "${jobs[@]}" --locked -p afs --no-default-features --features "$fs" --all-targets -- -D warnings
   echo "== afs [$fs]: config_contract"
   cargo test "${jobs[@]}" --locked -p afs --no-default-features --features "$fs" --test config_contract
   if [[ $run_lib == 1 ]]; then
@@ -48,9 +51,11 @@ for fs in ownerfs dfs; do
   fi
 done
 
-# Meta builds without either filesystem backend.
+# Meta builds without either filesystem backend, and so do all test targets.
 echo '== afs-meta without backends'
 cargo check "${jobs[@]}" --locked -p afs --no-default-features --bin afs-meta
+echo '== afs without backends: tests build'
+cargo test "${jobs[@]}" --locked -p afs --no-default-features --tests --no-run
 echo '== afs-transport without features'
 cargo check "${jobs[@]}" --locked -p afs-transport --no-default-features
 

@@ -21,6 +21,7 @@ pub struct StagedChunk {
 
 impl StagedChunk {
     /// Rebuild a received/repaired body under its original immutable identity.
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn from_replica(
         operation_id: OperationId,
         expected: &ChunkObject,
@@ -116,6 +117,7 @@ impl StagedChunk {
     }
 
     /// Immutable native payload, bound to its persisted CRC descriptor.
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn from_shared_crc32c(
         operation_id: OperationId,
         bytes: SharedChunkBytes,
@@ -128,6 +130,7 @@ impl StagedChunk {
         Self::from_shared_crc32c_id(operation_id, bytes, id)
     }
 
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn from_shared_crc32c_id(
         operation_id: OperationId,
         bytes: SharedChunkBytes,

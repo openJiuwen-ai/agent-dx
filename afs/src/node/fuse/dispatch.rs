@@ -26,24 +26,29 @@ enum FuseActive {
 enum FuseJob {
     Owned(Box<dyn FnOnce() + Send + 'static>),
     // Nonblocking starter only: hand ownership to a future, never run IO or wait here.
+    #[cfg(any(feature = "dfs", test))]
     Deferred(Box<dyn FnOnce(std::result::Result<FuseCompletion, i32>) + Send + 'static>),
     Borrowed(Arc<(Mutex<bool>, Condvar)>),
 }
 
 /// Owns the admitted task and its ordering turn after the worker is returned.
 /// Moving this into a future or completion event does not retire the request.
+#[cfg(any(feature = "dfs", test))]
 pub(super) struct FuseCompletion {
     inner: Arc<FuseCompletionInner>,
 }
+#[cfg(any(feature = "dfs", test))]
 struct FuseCompletionInner {
     shared: Arc<FuseDispatchShared>,
     turn: Option<FuseTurn>,
 }
+#[cfg(any(feature = "dfs", test))]
 impl FuseCompletion {
     pub(super) fn hold(&self) -> crate::node::read::admission::ReadLifetime {
         self.inner.clone()
     }
 }
+#[cfg(any(feature = "dfs", test))]
 impl Drop for FuseCompletionInner {
     fn drop(&mut self) {
         FuseDispatch::finish(&self.shared, self.turn.take());
@@ -108,6 +113,7 @@ impl FuseRecoverySender {
             return;
         }
         queue.jobs += 1;
+        #[cfg(feature = "dfs")]
         if let Some(metrics) = self.shared.activity.get() {
             metrics.observe_count(
                 crate::node::read::activity::Activity::FuseTask,
@@ -136,6 +142,7 @@ impl FuseRecoverySender {
 }
 
 pub(super) struct FuseDispatchShared {
+    #[cfg(feature = "dfs")]
     pub(super) activity: std::sync::OnceLock<crate::node::read::activity::Activities>,
     pub(super) queue: Mutex<FuseQueue>,
     ready: Condvar,
@@ -182,6 +189,7 @@ impl FuseDispatch {
 
     pub(super) fn with_capacity(workers: usize, capacity: usize) -> Self {
         let shared = Arc::new(FuseDispatchShared {
+            #[cfg(feature = "dfs")]
             activity: std::sync::OnceLock::new(),
             queue: Mutex::new(FuseQueue {
                 ready: VecDeque::new(),
@@ -223,6 +231,7 @@ impl FuseDispatch {
                                 }
                                 Self::finish(&shared, key);
                             }
+                            #[cfg(any(feature = "dfs", test))]
                             FuseJob::Deferred(job) => {
                                 Self::start_deferred(&shared, key, job);
                             }
@@ -242,6 +251,7 @@ impl FuseDispatch {
         Self { shared, capacity }
     }
 
+    #[cfg(any(feature = "dfs", test))]
     fn start_deferred(
         shared: &Arc<FuseDispatchShared>,
         turn: Option<FuseTurn>,
@@ -273,6 +283,7 @@ impl FuseDispatch {
             return;
         }
         queue.jobs += 1;
+        #[cfg(feature = "dfs")]
         if let Some(metrics) = self.shared.activity.get() {
             metrics.observe_count(
                 crate::node::read::activity::Activity::FuseTask,
@@ -336,6 +347,7 @@ impl FuseDispatch {
         self.submit_job(key, access, FuseJob::Owned(Box::new(job)));
     }
 
+    #[cfg(feature = "dfs")]
     pub(super) fn submit_read_deferred_until(
         &self,
         key: u64,
@@ -395,6 +407,7 @@ impl FuseDispatch {
             return Err((libc::ETIMEDOUT, job));
         }
         queue.jobs += 1;
+        #[cfg(feature = "dfs")]
         if let Some(metrics) = self.shared.activity.get() {
             metrics.observe_count(
                 crate::node::read::activity::Activity::FuseTask,
@@ -422,7 +435,8 @@ impl FuseDispatch {
                 }
             }
             let turn = Some(FuseTurn { key, access });
-            match job {
+            #[cfg(any(feature = "dfs", test))]
+            let job = match job {
                 FuseJob::Deferred(starter) => {
                     // Already eligible at admission: starting the owned future
                     // needs no worker hop. Keep its counted task/order turn,
@@ -431,8 +445,9 @@ impl FuseDispatch {
                     Self::start_deferred(&self.shared, turn, starter);
                     return Ok(());
                 }
-                job => queue.ready.push_back((turn, job)),
-            }
+                job => job,
+            };
+            queue.ready.push_back((turn, job));
             self.shared.ready.notify_one();
         } else {
             queue
@@ -450,6 +465,7 @@ impl FuseDispatch {
             .lock()
             .expect("FUSE queue mutex poisoned at completion");
         queue.jobs -= 1;
+        #[cfg(feature = "dfs")]
         if let Some(metrics) = shared.activity.get() {
             metrics.observe_count(
                 crate::node::read::activity::Activity::FuseTask,
@@ -529,6 +545,7 @@ impl FuseDispatch {
             return;
         }
         queue.jobs += 1;
+        #[cfg(feature = "dfs")]
         if let Some(metrics) = self.shared.activity.get() {
             metrics.observe_count(
                 crate::node::read::activity::Activity::FuseTask,

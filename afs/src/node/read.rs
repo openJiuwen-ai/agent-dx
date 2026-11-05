@@ -5,8 +5,10 @@
 //! `object_fetch`/`direct_prefetch` 调度预取，`buffer` 是读缓冲池，`peer_cache` 是可丢弃的
 //! Peer 对象磁盘缓存，`activity` 记录读路径计时。
 
+#[cfg(feature = "dfs")]
 pub(super) mod activity;
 pub mod admission;
+#[cfg(any(feature = "dfs", test))]
 pub(super) mod buffer;
 #[cfg(feature = "dfs")]
 pub(super) mod direct_prefetch;

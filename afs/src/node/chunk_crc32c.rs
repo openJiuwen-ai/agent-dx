@@ -1,6 +1,8 @@
 //! Versioned native CRC32C descriptors. They are not cryptographic body proofs.
 use crate::dfs::{ContentDigest, DigestAlgorithm};
-use afs_error::{Error, Result};
+#[cfg(any(feature = "dfs", test))]
+use afs_error::Error;
+use afs_error::Result;
 use serde::{Deserialize, Serialize};
 pub(crate) const SEGMENT: usize = 32 * 1024;
 pub(crate) fn checksum(bytes: &[u8]) -> u32 {
@@ -39,6 +41,7 @@ pub(crate) struct CrcTable {
     pub(crate) checksums: Vec<u32>,
 }
 impl CrcTable {
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn build(bytes: &[u8]) -> Result<Self> {
         if bytes.is_empty() || bytes.len() > 4 * 1024 * 1024 {
             return Err(Error::coded(

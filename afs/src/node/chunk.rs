@@ -22,6 +22,7 @@ use std::{
 
 mod catalog_commit;
 mod checkpoint;
+#[cfg(any(feature = "dfs", test))]
 mod collect;
 pub mod outboard;
 #[cfg(any(feature = "dfs", test))]
@@ -247,9 +248,11 @@ pub struct LocalChunkStore {
     catalog: Mutex<LocalCatalog>,
     catalog_committer: CatalogCommitter,
     next_staging: AtomicU64,
+    #[cfg(any(feature = "dfs", test))]
     gc_inventory_cursor: AtomicU64,
     /// This Node's own remote-read policy as a reader. Served peer requests
     /// follow the caller's requested mode instead.
+    #[cfg(any(feature = "dfs", test))]
     peer_read_crc_mode: crate::config::DfsReadCrcMode,
     read_work: Option<super::metrics::work::ReadWorkMetrics>,
     sidecar_installer: SidecarInstaller,

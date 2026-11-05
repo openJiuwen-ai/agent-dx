@@ -431,6 +431,7 @@ pub(crate) fn mount_with_policy(
     }
     #[cfg(any(feature = "dfs", test))]
     {
+        #[cfg(feature = "dfs")]
         if let Some(metrics) = &read_work {
             let _ = fs.dispatch.shared.activity.set(metrics.activities.clone());
         }
