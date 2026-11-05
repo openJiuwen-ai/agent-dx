@@ -85,6 +85,8 @@ python build/e2e/firecracker/sdk_checkpoint.py \
 
 可复用快照与 workload checkpoint 共用后端超时换算：正的剩余预算向上取整到整秒，最少 1 秒；已过期预算不再发起捕获。发布等待仍使用原始截止时间，不因重试重新计时。退避抖动由 Environment ID 与 ownership generation 共同确定，避免同 generation 的环境全部使用同一偏移。
 
+capture 和源状态提交完成后，向 Coordinator 发布目录的 RPC 也使用本次快照操作的剩余预算，不再被普通控制 RPC 的短超时提前截断。调用方与 RPC 传输同时受原 deadline 约束；这不增加目录发布重试，也不将超时解释为写入一定未发生。超时仍保留同一 capture 的待发布进度和引用，供存活 owner 的同操作重试继续处理。真实回环 gRPC 回归覆盖普通 RPC 超时之后、快照预算以内的成功，以及原预算到期、源环境继续运行和不重复 capture 的恢复发布。
+
 准备阶段耗尽预算、且尚未调用后端 capture 时，通过 `abort_unstarted` 撤销准备并保留运行中的源环境；只有撤销无法确认时才沿用失败清理。capture 已成功后的发布失败会由存活的 owner 控制器保留阶段、原操作 ID、原 expected revision、暂存路径和快照元数据；同一请求重试继续发布同一个工件，不重复 capture、已完成阶段或 revision 推进。其他生命周期写操作不能越过这项待发布操作，删除仍可清理。新一次 RPC 可使用新的超时预算，但不能改变原操作的快照类型或名称。这个进度不是跨进程的持久恢复协议：节点进程重启仍按未封存 capture 的对账规则清理或退役执行；持久化的 execution-artifact 引用继续负责保护文件和资源归属。
 
 快照发布进度仍待完成时，运行时事件和定期监控触发的 workload checkpoint 也延后处理：不会为另一个 capture 分配暂存目录、执行 prepare、清理引用或向 Execd 返回完成 ACK。原请求及已记录的截止时间保持不变；快照发布完成后按原预算继续处理，已经过期的 workload 请求仍按原超时规则失败。健康观察和显式删除仍保持原有语义。回归覆盖 runsc 未封存的零大小暂存引用和运行时保留 capture 文件两种情形，并验证发布完成后可以执行后续 workload checkpoint。

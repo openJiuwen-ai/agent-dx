@@ -2779,6 +2779,8 @@ mod cancellation_tests {
 }
 
 #[cfg(test)]
+mod checkpoint_gc_tests;
+#[cfg(test)]
 mod publication_tests;
 #[cfg(test)]
 mod snapshot_publication_tests;

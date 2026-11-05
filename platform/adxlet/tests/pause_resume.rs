@@ -14,6 +14,9 @@ use std::{
     time::Duration,
 };
 
+#[path = "pause_resume/publication_budget.rs"]
+mod publication_budget;
+
 #[derive(Default)]
 struct Backend {
     journal_after_capture: Mutex<bool>,
@@ -1268,6 +1271,7 @@ impl adxlet::checkpoint::SnapshotCatalog for Backend {
     async fn publish(
         &self,
         snapshot: adx_core::snapshots::Snapshot,
+        _timeout: Duration,
     ) -> Result<adx_core::snapshots::Snapshot> {
         if *self.fail_snapshot_publish.lock().unwrap() {
             return Err(Error::Unavailable("catalog unavailable".into()));
