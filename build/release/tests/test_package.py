@@ -33,7 +33,10 @@ class PackageTests(unittest.TestCase):
             wheel = root / "adx_environment-1-py3-none-any.whl"
             wheel.write_bytes(b"fixture wheel")
             out = root / "package"
-            m = pkg.assemble(binaries, redis, redis_cli, wheel, out, "a" * 40, True, "test-fixture", "debug")
+            m = pkg.assemble(
+                binaries, redis, redis_cli, wheel, out,
+                pkg.BuildIdentity("a" * 40, True, "test-fixture", "debug"),
+            )
             self.assertTrue(m["dirty"])
             pkg.verify(out)
             self.assertIn("bin/redis-cli", m["files"])
@@ -71,7 +74,72 @@ class PackageTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 pkg.verify(out)
             with self.assertRaises(ValueError):
-                pkg.assemble(binaries, redis, redis_cli, wheel, out, "a" * 40, True, "test-fixture", "debug")
+                pkg.assemble(
+                    binaries, redis, redis_cli, wheel, out,
+                    pkg.BuildIdentity("a" * 40, True, "test-fixture", "debug"),
+                )
+
+    def test_bundled_sandboxd_matches_pinned_revision_and_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binaries = root / "bin"
+            binaries.mkdir()
+            for name in pkg.BINARIES + ("adx-execd", "adx-runtime-rootfs.img"):
+                (binaries / name).write_bytes(b"fixture")
+            redis = root / "redis"
+            redis.write_text("#!/bin/sh\necho 'Redis server v=7.2.5 sha=fixture'\n")
+            redis.chmod(0o700)
+            redis_cli = root / "redis-cli"
+            redis_cli.write_text("#!/bin/sh\necho 'redis-cli 7.2.5'\n")
+            redis_cli.chmod(0o700)
+            wheel = root / "adx_environment-1-py3-none-any.whl"
+            wheel.write_bytes(b"fixture")
+            backend = root / "backend"
+            backend.mkdir()
+            for name in pkg.SANDBOXD_BINARIES:
+                (backend / name).write_bytes(b"\x7fELF\x02\x01" + bytes(12) + (62).to_bytes(2, "little"))
+            runsc = root / "runsc"
+            runsc.write_bytes(b"\x7fELF\x02\x01" + bytes(12) + (62).to_bytes(2, "little"))
+            target = "x86_64-unknown-linux-gnu"
+            pin = json.loads((pkg.ROOT / "third_party/sandboxd/source.json").read_text())
+            metadata = {
+                "target": target,
+                "sandboxd_revision": pin["revision"],
+                "files": {name: pkg.sha(backend / name) for name in pkg.SANDBOXD_BINARIES},
+            }
+            (backend / "manifest.json").write_text(json.dumps(metadata))
+            output = root / "release"
+            pkg.assemble(
+                binaries, redis, redis_cli, wheel, output,
+                pkg.BuildIdentity("a" * 40, False, target, "release"),
+                backend_dir=backend, runsc=runsc,
+            )
+            manifest = pkg.verify(output)
+            self.assertTrue(manifest["with_sandboxd"])
+            self.assertIn("lib/sandboxd_preflight.py", manifest["files"])
+            for name in ("sandboxd.service", "sandboxd.toml", "oss.json", "registry.json",
+                         "oss_auths.json", "registry_auths.json"):
+                self.assertIn(f"etc/examples/sandboxd/{name}", manifest["files"])
+
+            packaged_runsc = output / "runtime/sandboxd/runsc"
+            original_runsc = packaged_runsc.read_bytes()
+            packaged_runsc.write_bytes(original_runsc[:18] + (183).to_bytes(2, "little"))
+            manifest_path = output / "manifest.json"
+            manifest["files"]["runtime/sandboxd/runsc"] = pkg.sha(packaged_runsc)
+            manifest_path.write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(ValueError, "architecture mismatch: runsc"):
+                pkg.verify(output)
+
+            metadata["target"] = "aarch64-unknown-linux-gnu"
+            (backend / "manifest.json").write_text(json.dumps(metadata))
+            wrong_target = root / "wrong-target"
+            with self.assertRaisesRegex(ValueError, "sandboxd revision or target mismatch"):
+                pkg.assemble(
+                    binaries, redis, redis_cli, wheel, wrong_target,
+                    pkg.BuildIdentity("a" * 40, False, target, "release"),
+                    backend_dir=backend, runsc=runsc,
+                )
+            self.assertFalse(wrong_target.exists())
 
     def test_legacy_manifest_cannot_silently_disable_afs(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -109,7 +177,10 @@ class PackageTests(unittest.TestCase):
             wheel = root / "adx_environment-1-py3-none-any.whl"
             wheel.write_bytes(b"fixture")
             output = root / "package"
-            manifest = pkg.assemble(binaries, redis, redis_cli, wheel, output, "a" * 40, True, "test-fixture", "debug")
+            manifest = pkg.assemble(
+                binaries, redis, redis_cli, wheel, output,
+                pkg.BuildIdentity("a" * 40, True, "test-fixture", "debug"),
+            )
             self.assertEqual({p.name for p in (output / "bin").iterdir()}, shipped | {"redis-server", "redis-cli"})
             self.assertNotIn("bin/adx-data-plane-forward", manifest["files"])
             self.assertNotIn("bin/afs-meta", manifest["files"])
@@ -144,7 +215,8 @@ class PackageTests(unittest.TestCase):
 
             default_output = root / "default-package"
             default_manifest = pkg.assemble(
-                binaries, redis, redis_cli, wheel, default_output, "a" * 40, True, "test-fixture", "debug"
+                binaries, redis, redis_cli, wheel, default_output,
+                pkg.BuildIdentity("a" * 40, True, "test-fixture", "debug")
             )
             self.assertNotIn("with_afs", default_manifest)
             self.assertNotIn("bin/afs-meta", default_manifest["files"])
@@ -153,7 +225,9 @@ class PackageTests(unittest.TestCase):
 
             afs_output = root / "afs-package"
             afs_manifest = pkg.assemble(
-                binaries, redis, redis_cli, wheel, afs_output, "a" * 40, True, "test-fixture", "debug", True
+                binaries, redis, redis_cli, wheel, afs_output,
+                pkg.BuildIdentity("a" * 40, True, "test-fixture", "debug"),
+                with_afs=True,
             )
             self.assertTrue(afs_manifest["with_afs"])
             self.assertIn("bin/afs-meta", afs_manifest["files"])
@@ -253,11 +327,8 @@ class PackageTests(unittest.TestCase):
                     redis_cli,
                     wheel,
                     root / "afs-package",
-                    "a" * 40,
-                    True,
-                    "test-fixture",
-                    "debug",
-                    True,
+                    pkg.BuildIdentity("a" * 40, True, "test-fixture", "debug"),
+                    with_afs=True,
                 )
 
     def test_package_ships_complete_optional_envd_provenance(self):
@@ -281,7 +352,7 @@ class PackageTests(unittest.TestCase):
             (envd / "manifest.json").write_text('{"sha256": "' + "a" * 64 + '"}')
             output = root / "package"
             manifest = pkg.assemble(
-                binaries, redis, redis_cli, wheel, output, "a" * 40, False, "fixture", "debug"
+                binaries, redis, redis_cli, wheel, output, pkg.BuildIdentity("a" * 40, False, "fixture", "debug")
             )
             self.assertIn("runtime/envd/manifest.json", manifest["files"])
             self.assertIn("runtime/envd/LICENSE", manifest["files"])
@@ -312,12 +383,72 @@ class PackageTests(unittest.TestCase):
                     root / "redis-cli",
                     root / "adx_environment-1.whl",
                     out,
-                    "a" * 40,
-                    True,
-                    "fixture",
-                    "debug",
+                    pkg.BuildIdentity("a" * 40, True, "fixture", "debug"),
                 )
             self.assertFalse(out.exists())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "installer targets Linux hosts")
+    def test_installer_exposes_bundled_sbox_without_replacing_unmanaged_command(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binaries = root / "bin"
+            binaries.mkdir()
+            for name in pkg.BINARIES + ("adx-execd",):
+                (binaries / name).write_bytes(b"fixture")
+            redis = root / "redis"
+            redis.write_text("#!/bin/sh\necho 'Redis server v=7.2.5 sha=fixture'\n")
+            redis.chmod(0o700)
+            redis_cli = root / "redis-cli"
+            redis_cli.write_text("#!/bin/sh\necho 'redis-cli 7.2.5'\n")
+            redis_cli.chmod(0o700)
+            wheel = root / "adx_environment-1-py3-none-any.whl"
+            wheel.write_bytes(b"fixture")
+            target = f"{platform.machine()}-unknown-linux-gnu"
+            machine = {"x86_64": 62, "aarch64": 183}[platform.machine()]
+            elf = b"\x7fELF\x02\x01" + bytes(12) + machine.to_bytes(2, "little")
+            backend = root / "backend"
+            backend.mkdir()
+            for name in pkg.SANDBOXD_BINARIES:
+                (backend / name).write_bytes(elf)
+            pin = json.loads((pkg.ROOT / "third_party/sandboxd/source.json").read_text())
+            (backend / "manifest.json").write_text(json.dumps({
+                "target": target,
+                "sandboxd_revision": pin["revision"],
+                "files": {name: pkg.sha(backend / name) for name in pkg.SANDBOXD_BINARIES},
+            }))
+            runsc = root / "runsc"
+            runsc.write_bytes(elf)
+            package = root / "package"
+            pkg.assemble(
+                binaries, redis, redis_cli, wheel, package,
+                pkg.BuildIdentity("a" * 40, False, target, "debug"),
+                backend_dir=backend, runsc=runsc,
+            )
+            prefix = root / "opt/adx"
+            bin_dir = root / "commands"
+            bin_dir.mkdir()
+            sbox = bin_dir / "sbox"
+            sbox.write_text("existing")
+            command = [str(package / "install.sh"), "--prefix", str(prefix), "--bin-dir", str(bin_dir)]
+            self.assertNotEqual(subprocess.run(command, capture_output=True).returncode, 0)
+            self.assertEqual(sbox.read_text(), "existing")
+            self.assertFalse(prefix.exists())
+            sbox.unlink()
+            result = subprocess.run(command, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(sbox.resolve(), prefix / "releases" / ("a" * 40) / "runtime/sandboxd/sbox")
+
+            without_backend = root / "without-backend"
+            pkg.assemble(
+                binaries, redis, redis_cli, wheel, without_backend,
+                pkg.BuildIdentity("b" * 40, False, target, "debug"),
+            )
+            result = subprocess.run(
+                [str(without_backend / "install.sh"), "--prefix", str(prefix), "--bin-dir", str(bin_dir)],
+                text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(sbox.is_symlink())
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "installer targets Linux hosts")
     def test_installer_verifies_and_installs_without_overwriting_host_state(self):
@@ -338,7 +469,10 @@ class PackageTests(unittest.TestCase):
             wheel.write_bytes(b"fixture wheel")
             package = root / "package"
             target = f"{platform.machine()}-unknown-linux-gnu"
-            pkg.assemble(binaries, redis, redis_cli, wheel, package, "a" * 40, False, target, "debug")
+            pkg.assemble(
+                binaries, redis, redis_cli, wheel, package,
+                pkg.BuildIdentity("a" * 40, False, target, "debug"),
+            )
             prefix = root / "opt/adx"
             bin_dir = root / "usr/local/bin"
             command = [str(package / "install.sh"), "--prefix", str(prefix), "--bin-dir", str(bin_dir)]
@@ -365,7 +499,10 @@ class PackageTests(unittest.TestCase):
             runtime = prefix / "run/supervisor.sock"
             runtime.write_text("runtime state\n")
             upgraded_package = root / "upgraded-package"
-            pkg.assemble(binaries, redis, redis_cli, wheel, upgraded_package, "b" * 40, False, target, "debug")
+            pkg.assemble(
+                binaries, redis, redis_cli, wheel, upgraded_package,
+                pkg.BuildIdentity("b" * 40, False, target, "debug"),
+            )
             upgraded_command = [
                 str(upgraded_package / "install.sh"),
                 "--prefix",

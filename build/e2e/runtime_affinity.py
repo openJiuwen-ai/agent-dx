@@ -4,7 +4,7 @@ import json
 import time
 
 from adx_environment import Environment
-from node import catalog
+from node import catalog, live_catalog
 from runtime_inventory import require_unique_runtime_node
 
 
@@ -15,7 +15,7 @@ def run(connection, image, output):
     deleted = False
     report = {"status": "failed", "cases": [], "cleanup_errors": []}
     try:
-        expected_node = require_unique_runtime_node(catalog(), runtime_class)
+        expected_node = require_unique_runtime_node(live_catalog(), runtime_class)
         environment = Environment(
             image=image,
             runtime=runtime_class,

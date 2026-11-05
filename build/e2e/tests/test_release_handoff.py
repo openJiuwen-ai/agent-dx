@@ -58,7 +58,8 @@ class ReleaseArchiveTests(unittest.TestCase):
             wheel.write_bytes(b'fixture wheel')
             built = root / 'built'
             package.assemble(
-                bins, redis, redis_cli, wheel, built, 'a' * 40, False, 'x86_64-unknown-linux-gnu', 'release'
+                bins, redis, redis_cli, wheel, built,
+                package.BuildIdentity('a' * 40, False, 'x86_64-unknown-linux-gnu', 'release')
             )
             archive = root / 'adx-release.tar.gz'
             subprocess.run([_executable('tar'), '-czf', archive, '-C', built, '.'], check=True)

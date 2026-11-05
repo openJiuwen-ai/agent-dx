@@ -224,9 +224,11 @@ impl Sandboxd {
         devices: &[adx_core::scheduling::DeviceAllocation],
     ) -> Result<Request<proto::StartRequest>> {
         if spec.execution.user.is_some() || spec.execution.group.is_some() {
-            return Err(Error::Invalid(
-                "this sandboxd backend does not support tool user/group overrides".into(),
-            ));
+            adx_observability::warn!(
+                environment_id = %spec.id,
+                runtime_class = %spec.runtime_class,
+                "sandboxd ignores tool user/group overrides and uses its configured identity"
+            );
         }
         let mut config = self.config.clone();
         // Runtime capability metadata owns the guest paths. Never inherit caller

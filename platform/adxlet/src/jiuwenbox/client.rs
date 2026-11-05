@@ -98,6 +98,7 @@ impl Client {
         body: Option<Value>,
         detached: bool,
     ) -> Result<Value> {
+        let create = method == Method::POST && path == "/api/v1/sandboxes";
         let request = async {
             let stream = tokio::time::timeout(self.timeout, UnixStream::connect(&self.socket))
                 .await
@@ -132,6 +133,10 @@ impl Client {
                 .await
                 .map_err(unavailable)?;
             let status = response.status();
+            let public_error = response
+                .headers()
+                .get("X-Jiuwenbox-Public-Error")
+                .is_some_and(|value| value == "true");
             let bytes = Limited::new(response.into_body(), 8 * 1024 * 1024)
                 .collect()
                 .await
@@ -160,7 +165,14 @@ impl Client {
             if bytes.is_empty() {
                 Ok(Value::Null)
             } else {
-                serde_json::from_slice(&bytes).map_err(unavailable)
+                let mut value: Value = serde_json::from_slice(&bytes).map_err(unavailable)?;
+                // Older Jiuwenbox releases may put raw daemon output in this field.
+                if create && !public_error {
+                    if let Some(object) = value.as_object_mut() {
+                        object.remove("error_message");
+                    }
+                }
+                Ok(value)
             }
         };
         // Create is owned by a spawned driver task. A caller deadline must not

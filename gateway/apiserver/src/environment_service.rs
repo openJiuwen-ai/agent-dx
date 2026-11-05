@@ -281,6 +281,7 @@ impl EnvironmentService {
                 outcome,
                 succeeded = result.is_ok(),
                 status_code,
+                status_message = result.as_ref().err().map_or("", |error| error.message()),
                 "Environment create completed"
             );
         });
