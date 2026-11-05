@@ -53,7 +53,7 @@ def census(proc=Path('/proc')):
         try:
             row.update(stat_fields((directory / 'stat').read_text()))
             row['comm'] = (directory / 'comm').read_text().strip()
-            if row['state'] == 'Z':
+            if row.get('state') == 'Z':
                 row['race'] = 'zombie'
             else:
                 row.update(profile(row['pid'], proc))
@@ -64,10 +64,17 @@ def census(proc=Path('/proc')):
 
 
 def service_child(anchor, rows):
-    matches = [p for p in rows if not p.get('race') and p.get('ppid') == anchor['pid']
-               and p.get('identity', {}).get('pid_namespace') == anchor['identity']['pid_namespace']
-               and all(p.get('identity', {}).get(k) == anchor['identity'][k]
-                       for k in ('exe_device', 'exe_inode'))]
+    matches = []
+    for process in rows:
+        if process.get('race') or process.get('ppid') != anchor['pid']:
+            continue
+        identity = process.get('identity', {})
+        if identity.get('pid_namespace') != anchor['identity']['pid_namespace']:
+            continue
+        if (identity.get('exe_device') != anchor['identity']['exe_device']
+                or identity.get('exe_inode') != anchor['identity']['exe_inode']):
+            continue
+        matches.append(process)
     if len(matches) != 1:
         raise ValueError('actual Execd service child missing or ambiguous')
     return matches[0]

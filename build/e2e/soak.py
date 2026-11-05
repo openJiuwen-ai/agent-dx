@@ -194,11 +194,16 @@ def scenarios(run, checks, options, limits, policy=None):
     if observation:
         for node in ('node1', 'node2'):
             deployment = json.loads((run.output / ('deployment-' + node + '.json')).read_text())
-            configs = [s['config'] for s in deployment['services']
-                       if isinstance(s.get('config'), dict) and 'execd_env' in s['config']]
-            if len(configs) != 1 or any(k in configs[0]['execd_env'] for k in (
-                    'EXECD_COMMAND_RESULT_TTL_SECS', 'EXECD_COMMAND_REGISTRY_MAX_RECORDS')):
+            configs = []
+            for service in deployment['services']:
+                service_config = service.get('config')
+                if isinstance(service_config, dict) and 'execd_env' in service_config:
+                    configs.append(service_config)
+            if len(configs) != 1:
                 raise ValueError('v4 requires unchanged Execd default TTL/capacity')
+            for key in ('EXECD_COMMAND_RESULT_TTL_SECS', 'EXECD_COMMAND_REGISTRY_MAX_RECORDS'):
+                if key in configs[0]['execd_env']:
+                    raise ValueError('v4 requires unchanged Execd default TTL/capacity')
     product.sdk({'mode': 'warm'}, run.output / 'afs-sdk-warm.json')
     sys.path.append(str(Path(__file__).resolve().parents[2] / 'afs/tests'))
     try:

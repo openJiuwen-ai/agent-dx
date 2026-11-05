@@ -274,12 +274,18 @@ def evaluate(samples, work, mode, policy):
     if full:
         warmup_windows = [w for w in windows if w['start_seconds'] < policy['warmup_seconds']]
         windows = [w for w in windows if w['start_seconds'] >= policy['warmup_seconds']]
-        measured = [s for s in samples if s.get('active') is True
-                    and policy['warmup_seconds'] <= s['elapsed_seconds'] < policy['seconds']]
-        if (measured[-1]['cycles'] - measured[0]['cycles'] < policy['minimum_measurement_cycles']
-                or any(measured[-1]['operations'][k] - measured[0]['operations'][k]
-                       < policy['minimum_measurement_churn'] for k in ('create', 'delete'))):
+        measured = []
+        for sample in samples:
+            if sample.get('active') is not True:
+                continue
+            if policy['warmup_seconds'] <= sample['elapsed_seconds'] < policy['seconds']:
+                measured.append(sample)
+        if measured[-1]['cycles'] - measured[0]['cycles'] < policy['minimum_measurement_cycles']:
             raise ValueError('measurement-only work insufficient; warmup cannot supply counts')
+        for operation in ('create', 'delete'):
+            count = measured[-1]['operations'][operation] - measured[0]['operations'][operation]
+            if count < policy['minimum_measurement_churn']:
+                raise ValueError('measurement-only work insufficient; warmup cannot supply counts')
     times = [(window['start_seconds'] + window['end_seconds']) / 2 for window in windows]
     trends = {}
     for node in NODES:
@@ -290,12 +296,19 @@ def evaluate(samples, work, mode, policy):
                         policy['process_rss_trend'], node + '.' + name)
             for name in baseline['nodes'][node]['processes']}
         if full:
-            trends[node]['process_pss_anon'] = {
-                name: trend(times, [statistics.median(s['nodes'][node]['processes'][name]['pss_anon_bytes']
-                    for s in samples if s.get('active') is True
-                    and w['start_seconds'] <= s['elapsed_seconds'] < w['end_seconds']) for w in windows],
-                    policy['process_pss_anon_trend'], node + '.' + name + '.pss_anon')
-                for name in baseline['nodes'][node]['processes']}
+            trends[node]['process_pss_anon'] = {}
+            for name in baseline['nodes'][node]['processes']:
+                medians = []
+                for window in windows:
+                    readings = []
+                    for sample in samples:
+                        if sample.get('active') is not True:
+                            continue
+                        if window['start_seconds'] <= sample['elapsed_seconds'] < window['end_seconds']:
+                            readings.append(sample['nodes'][node]['processes'][name]['pss_anon_bytes'])
+                    medians.append(statistics.median(readings))
+                trends[node]['process_pss_anon'][name] = trend(
+                    times, medians, policy['process_pss_anon_trend'], node + '.' + name + '.pss_anon')
         trends[node]['process_noncache_fds'] = {
             name: trend(times, [w['process_fds'][node][name] for w in windows],
                         policy['trends']['fds'], node + '.' + name + '.noncache_fds')

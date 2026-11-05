@@ -19,6 +19,8 @@ class MemoryAttribution(unittest.TestCase):
         self.assertEqual(M.service_child(anchor, [child])['pid'], 11)
         for rows in ([], [child, dict(child, pid=12)], [dict(child, ppid=9)],
                      [dict(child, identity=dict(child['identity'], pid_namespace='pid:[99]'))],
+                     [dict(child, identity=dict(child['identity'], exe_device=99))],
+                     [dict(child, identity=dict(child['identity'], exe_inode=99))],
                      [dict(child, race='exited_during_census')]):
             with self.assertRaisesRegex(ValueError, 'missing or ambiguous'):
                 M.service_child(anchor, rows)
