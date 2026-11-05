@@ -1876,43 +1876,100 @@ impl ReadContext {
                 .map_or(0, |lane| lane.export_slots),
         )
         .unwrap_or(0);
+        // Two waves are exported at once: the next wave is prepared while the
+        // previous one reads, so each wave takes at most half of the source
+        // lane's export slots. Native READs still run one wave at a time.
         let wave_width = group
             .map_or(usize::MAX, |group| group.max_descriptors)
             .min(self.receive_slots)
-            .min(export_slots)
+            .min((export_slots / 2).max(1))
             .clamp(1, crate::node::dfs_read::MAX_DFS_GROUP_OPS);
-        let mut chunks = Vec::new();
-        for (index, wave) in planned.chunks(wave_width).enumerate() {
-            if cancel.cancelled.load(Ordering::Acquire) {
-                let failure = WindowFailure::from(afs_error::Error::coded(
+        let waves = planned.chunks(wave_width).collect::<Vec<_>>();
+        let cancelled = || {
+            cancel.cancelled.load(Ordering::Acquire).then(|| {
+                WindowFailure::from(afs_error::Error::coded(
                     afs_error::CLIENT_DEADLINE_EXCEEDED,
                     "HIXL read cancelled before next wave",
-                ));
+                ))
+            })
+        };
+        let Some(first) = waves.first() else {
+            lease.guard.touched = Instant::now();
+            remaining(deadline)?;
+            return Ok(ReadResult::Complete(Vec::new()));
+        };
+        if let Some(failure) = cancelled() {
+            return Err(self.abort_batch(&mut lease, failure).await);
+        }
+        // Admission remains ordered: wave k+1 is prepared only after wave k's
+        // prepare returned, and its export overlaps wave k's native READ.
+        let mut prepared = match self
+            .prepare_group_windows_within_budget(&lease.session, first, &batch, deadline)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                report_wave_failure("prepare", planned.len(), first.len(), &failure);
+                // A reused session the source no longer serves refuses the
+                // first prepare before admitting any window.
+                *stale =
+                    !lease.fresh && failure.error.code() == afs_error::NODE_TRANSFER_UNAVAILABLE;
                 return Err(self.abort_batch(&mut lease, failure).await);
             }
-            // Admission remains ordered while native transfers run independently.
-            let prepared = match self
-                .prepare_group_windows_within_budget(&lease.session, wave, &batch, deadline)
-                .await
-            {
-                Ok(prepared) => prepared,
-                Err(failure) => {
-                    report_wave_failure("prepare", planned.len(), wave.len(), &failure);
-                    // A reused session the source no longer serves refuses the
-                    // first prepare before admitting any window.
-                    *stale = !lease.fresh
-                        && index == 0
-                        && failure.error.code() == afs_error::NODE_TRANSFER_UNAVAILABLE;
-                    return Err(self.abort_batch(&mut lease, failure).await);
+        };
+        let mut chunks = Vec::new();
+        for (index, wave) in waves.iter().enumerate() {
+            let read =
+                self.read_prepared_group(&lease.session, prepared, output_len, deadline, crc);
+            let (read, next) = match waves.get(index + 1) {
+                Some(next) if cancelled().is_none() => {
+                    let prepare = self.prepare_group_windows_within_budget(
+                        &lease.session,
+                        next,
+                        &batch,
+                        deadline,
+                    );
+                    let (read, next_prepared) = tokio::join!(read, prepare);
+                    (read, Some((next.len(), next_prepared)))
                 }
+                _ => (read.await, None),
             };
-            match self
-                .read_prepared_group(&lease.session, prepared, output_len, deadline, crc)
-                .await
-            {
-                Ok(mut ready) => chunks.append(&mut ready),
-                Err(failure) => {
+            match (read, next) {
+                (Ok(mut ready), next) => {
+                    chunks.append(&mut ready);
+                    prepared = match next {
+                        Some((_, Ok(next_prepared))) => next_prepared,
+                        Some((windows, Err(failure))) => {
+                            report_wave_failure("prepare", planned.len(), windows, &failure);
+                            return Err(self.abort_batch(&mut lease, failure).await);
+                        }
+                        None if index + 1 < waves.len() => {
+                            let failure = cancelled().unwrap_or_else(|| {
+                                WindowFailure::from(dfs_protocol_error(
+                                    "HIXL wave was neither prepared nor cancelled",
+                                ))
+                            });
+                            return Err(self.abort_batch(&mut lease, failure).await);
+                        }
+                        None => Vec::new(),
+                    };
+                }
+                (Err(failure), next) => {
                     report_wave_failure("read", planned.len(), wave.len(), &failure);
+                    let failure = match next {
+                        // The next wave never reached a native READ.
+                        Some((_, Ok(unread))) => {
+                            self.released_failure(
+                                &lease.session,
+                                &unread,
+                                DfsHixlReleaseOutcome::NotSubmitted,
+                                failure,
+                            )
+                            .await
+                        }
+                        Some((_, Err(other))) => failure.merged(other),
+                        None => failure,
+                    };
                     return Err(self.abort_batch(&mut lease, failure).await);
                 }
             }
@@ -2601,6 +2658,14 @@ struct WindowFailure {
 }
 
 impl WindowFailure {
+    /// Keeps this failure as the reported error while taking the stronger
+    /// fencing and quarantine demands of a concurrent one.
+    fn merged(mut self, other: Self) -> Self {
+        self.fence_peer |= other.fence_peer;
+        self.quarantine_local |= other.quarantine_local;
+        self
+    }
+
     /// A prepare that ran out of capacity did not corrupt the session: the
     /// source still serves narrower waves, so the caller retries with fewer
     /// windows instead of fencing the peer and losing the group.

@@ -759,6 +759,14 @@ mod loopback_integration {
     }
 
     #[derive(Default)]
+    struct ReadGate {
+        closed: bool,
+        entered: usize,
+        /// Window count of each batch READ, in arrival order.
+        windows: Vec<usize>,
+    }
+
+    #[derive(Default)]
     struct NativeBoundary {
         memory: StdMutex<MemoryExports>,
         prepare_calls: AtomicU64,
@@ -767,6 +775,11 @@ mod loopback_integration {
         source_quarantines: AtomicU64,
         connects: StdMutex<ConnectGate>,
         connects_changed: std::sync::Condvar,
+        /// Holds native batch READs so a test can observe what overlaps them.
+        reads: StdMutex<ReadGate>,
+        reads_changed: std::sync::Condvar,
+        /// The next native batch READ fails before submitting any window.
+        fail_read: std::sync::atomic::AtomicBool,
     }
 
     impl NativeBoundary {
@@ -776,6 +789,25 @@ mod loopback_integration {
         fn open_connect_gate(&self) {
             self.connects.lock().unwrap().closed = false;
             self.connects_changed.notify_all();
+        }
+        fn close_read_gate(&self) {
+            self.reads.lock().unwrap().closed = true;
+        }
+        fn open_read_gate(&self) {
+            self.reads.lock().unwrap().closed = false;
+            self.reads_changed.notify_all();
+        }
+        fn fail_next_read(&self) {
+            self.fail_read.store(true, Ordering::SeqCst);
+        }
+        async fn wait_read_entered(&self, count: usize) {
+            for _ in 0..300 {
+                if self.reads.lock().unwrap().entered >= count {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("no native batch READ entered");
         }
         async fn wait_connect_entered(&self, count: usize) {
             for _ in 0..300 {
@@ -1028,6 +1060,21 @@ mod loopback_integration {
             deadline: Instant,
         ) -> Result<HixlReadOutcome, HixlError> {
             self.boundary.batch_reads.fetch_add(1, Ordering::SeqCst);
+            {
+                let mut gate = self.boundary.reads.lock().unwrap();
+                gate.entered += 1;
+                gate.windows.push(windows.len());
+                while gate.closed {
+                    gate = self.boundary.reads_changed.wait(gate).unwrap();
+                }
+            }
+            if self.boundary.fail_read.swap(false, Ordering::SeqCst) {
+                return Err(native_error(
+                    HixlPhase::SubmitRead,
+                    HixlErrorKind::InvalidArgument,
+                    "injected batch READ refusal",
+                ));
+            }
             let mut offset = 0;
             for (address, length) in windows {
                 let bytes = self.read_window(peer, *address, *length, deadline)?;
@@ -1913,6 +1960,85 @@ mod loopback_integration {
         h.shutdown().await;
     }
 
+    /// Group policy whose 4-byte windows split the 8-byte chunk into two waves
+    /// when the source exposes two export slots.
+    fn two_wave_setup() -> Setup {
+        Setup {
+            group: Some(ReadGroupPolicy {
+                bytes: 8,
+                max_inflight: 1,
+                max_descriptors: 8,
+                host_budget_bytes: 1024 * 1024,
+            }),
+            ..Setup::new(1, 4, 2)
+        }
+    }
+
+    async fn wait_for_prepares(h: &Harness, count: u64) -> bool {
+        for _ in 0..200 {
+            if h.native.prepare_calls.load(Ordering::SeqCst) >= count {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn group_waves_prepare_the_next_wave_while_the_previous_one_reads() {
+        // Each wave may use half of the source export slots, so the export of
+        // wave k+1 overlaps the native read of wave k instead of following it.
+        let h = two_wave_setup().start().await;
+        h.native.close_read_gate();
+        let read = h.spawn_read(9);
+        h.native.wait_read_entered(1).await;
+        let overlapped = wait_for_prepares(&h, 2).await;
+        let first_read = h.native.reads.lock().unwrap().windows.first().copied();
+        h.native.open_read_gate();
+        let output = read.await.unwrap().unwrap();
+        assert_eq!(first_read, Some(1), "each wave carries one window");
+        assert!(
+            overlapped,
+            "the second wave must be exported while the first one reads"
+        );
+        assert_eq!(&output[1..9], b"abcdefgh");
+        assert_eq!(h.native.prepare_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(h.native.batch_reads.load(Ordering::SeqCst), 2);
+        let sessions = h.sessions();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].active_windows, 0);
+        assert_eq!(sessions[0].prepared_bytes, 0);
+        assert!(h.native.memory.lock().unwrap().active.is_empty());
+        h.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_wave_read_releases_the_prepared_next_wave() {
+        // A failed read of wave k must not strand the export of wave k+1, which
+        // was prepared alongside it and never reached a native READ.
+        let h = two_wave_setup().start().await;
+        h.native.close_read_gate();
+        h.native.fail_next_read();
+        let read = h.spawn_read(9);
+        h.native.wait_read_entered(1).await;
+        assert!(wait_for_prepares(&h, 2).await);
+        h.native.open_read_gate();
+        assert!(read.await.unwrap().is_err());
+        assert_eq!(h.native.batch_reads.load(Ordering::SeqCst), 1);
+        {
+            let memory = h.native.memory.lock().unwrap();
+            assert!(
+                memory.reads.is_empty(),
+                "the injected failure precedes every window READ"
+            );
+            assert!(
+                memory.active.is_empty(),
+                "neither the failed wave nor the unread next wave may stay exported"
+            );
+        }
+        h.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn group_prepare_admits_all_windows_from_one_snapshot() {
         let h = Setup::new(1, 4, 8).start().await;
@@ -2008,7 +2134,9 @@ mod loopback_integration {
                 .filter(|&&recorded| recorded == outcome as i32)
                 .count()
         };
-        assert_eq!(count(DfsHixlReleaseOutcome::Completed), 2);
+        // Two export slots give one-window waves (half the slots each), so
+        // three waves complete before the fourth export is refused.
+        assert_eq!(count(DfsHixlReleaseOutcome::Completed), 3);
         assert_eq!(
             count(DfsHixlReleaseOutcome::NotSubmitted),
             0,
@@ -2029,7 +2157,7 @@ mod loopback_integration {
             assert!(memory.active.is_empty());
             assert_eq!(
                 memory.reads.len(),
-                2,
+                3,
                 "the refused wave must never enter READ"
             );
         }
@@ -2055,7 +2183,8 @@ mod loopback_integration {
             fresh.session_id
         );
         assert!(h.native.memory.lock().unwrap().active.is_empty());
-        assert_eq!(h.native.memory.lock().unwrap().reads.len(), 6);
+        // Three windows read before the refusal plus four in the fresh session.
+        assert_eq!(h.native.memory.lock().unwrap().reads.len(), 7);
         assert_eq!(h.native.reader_quarantines.load(Ordering::SeqCst), 0);
         assert_eq!(h.native.source_quarantines.load(Ordering::SeqCst), 0);
         h.shutdown().await;

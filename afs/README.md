@@ -47,12 +47,9 @@ Meta 默认使用唯一持久后端 `local-file`。`memory` 仅适合一次性�
 Operator 负责创建 namespace/root grant、配置挂载和回收引用；Environment 创建尚不会
 自动 provision/mount/reclaim AFS。
 
-DFS FUSE 的 `dfs_fuse_read_mode` 默认 `"cached"`，批量顺序读取可选 `"direct"`（绕过内核
-页缓存与预读窗口），两者同时作用于 TCP 与 HIXL，不改变 chunk 校验和请求授权；模式差异、
-mmap 依赖与可写打开的行为见[部署文档](../docs/deployment/afs.md#hixl-dfs-远端读)。
-
 顺序预读组由根配置 `dfs_read_group_mode` 控制，默认 `"off"`；设为 `"sequential"` 时，
-只读 direct 句柄把连续范围合并为一个 DFS 批次，只对 gRPC 或 HIXL 路径生效，RDMA 数据面
+只读句柄把连续范围合并为一个 DFS 批次，只对 gRPC 或 HIXL
+路径生效，RDMA 数据面
 继续使用原逐批预算。字段与边界见[部署文档](../docs/deployment/afs.md#hixl-dfs-远端读)。
 
 HIXL 读取阶段墙钟由 `afs_dfs_read_phase_seconds{phase}` 按固定相位记录，只用于定位瓶颈，
@@ -93,18 +90,40 @@ HIXL 加速 DFS 已提交不可变 chunk 的远端读，并可选为 OwnerFs 远
 `[[hixl.additional_devices]]` 可配置最多 16 个逻辑设备。DFS dirty-owner 读和复制写入仍使用
 原 `data_mode`。
 
-A3 吞吐对照（1 GiB、4 MiB 块，HIXL 与 gRPC 都走 128 MiB 组读）在 216/217 共享机上测量，
-结论只取同轮交替配对：
-- `direct` 下 HIXL 对 gRPC 的收益随宿主负载显著变化：loadavg 17–21 的批次 5 轮全胜、
-  中位 +34.5%（HIXL 497.7 / gRPC 370.0 MiB/s）；loadavg 35–51 的批次收窄到持平附近
-  （BLAKE3 对象 −5%，CRC32C 对象 +23%）。
-- 对象类型不是因素：同一会话内先后读两种对象（loadavg 35–51，5 轮），HIXL 下 CRC32C 比
-  BLAKE3 快 +83 MiB/s（5/5 轮为正），gRPC 下两者相近（中位 +14，−18~+86 混合）；
-  CRC32C 的逐段校验走硬件指令、对 CPU 竞争不敏感，BLAKE3 整窗哈希在高负载下变慢。
-- `cached` 下 HIXL 对 gRPC 的 8 轮配对（BLAKE3）5 正 3 负、中位 +5%；CRC32C 5 轮
-  −1.6%~+46.7%、中位 +5.8%——未观察到稳定收益。
-- 本分支对上一版（direct、BLAKE3、8 轮配对）中位 +6 MiB/s（−25~+21，均值约 +3），
-  无系统性差异。绝对值随宿主负载大幅变化，跨会话的历史数字不可直接比较。
+A3 吞吐对照在 212（Meta 与源节点）→ 217（reader）双机 HCCS 上测量：1 GiB BLAKE3 对象，
+单线程读端以 4 MiB 块读取并逐块计算 SHA-256，每轮清理 reader 数据目录，3 轮交替，读回内容全部一致。
+
+| 配置（FUSE 页缓存读取） | 中位 MiB/s [范围] |
+| --- | --- |
+| HIXL，128 MiB 组，`dfs_read_group_max_inflight = 2` | 950.0 [864.4–981.7] |
+| gRPC，组读关闭 | 711.4 [563.4–799.3] |
+| HIXL，128 MiB 组，`dfs_read_group_max_inflight = 1` | 568.0 [549.4–608.7] |
+| gRPC，128 MiB 组，`dfs_read_group_max_inflight = 2` | 519.7 [514.3–526.4] |
+| gRPC，128 MiB 组，`dfs_read_group_max_inflight = 1` | 367.2 [366.8–371.2] |
+| HIXL，组读关闭 | 118.9 [114.9–122.6] |
+
+- HIXL 组读（`max_inflight = 2`）在 3 轮中都高于同轮的 gRPC 最好配置（组读关闭）：
+  981.7 / 799.3、950.0 / 711.4、864.4 / 563.4 MiB/s。
+- HIXL 需要组读：每个 peer 同一时刻只准入一个逻辑读，组读关闭时约 1 MiB 的内核预读请求
+  逐个完成 prepare、传输与 release，吞吐降到约 120 MiB/s。
+- gRPC 宜保持组读关闭：组读路径同步填充窗口，不使用逐请求的异步读管线，内核预读的并发
+  请求被收敛为每句柄一个组批次。
+- 组窗口在页缓存读取下按网格对齐并保留上一窗口后，HIXL 与 gRPC 都恰好传输 1.00 倍文件字节
+  （HIXL 每 GiB 8 个组批次）；此前同一组被重复填充，实际传输 1.4–2.1 倍。
+- 上表二进制在删除 FUSE 读模式开关之前构建，显式设置页缓存读取与表中 `max_inflight`。删除开关
+  后的构建以默认配置（`max_inflight` 不设置，即 2）在同一对主机上复测 5 轮：HIXL 组读中位
+  884.9 [868.6–902.4]，gRPC 组读关闭 809.1 [658.9–873.6] MiB/s；HIXL 5 轮全胜，但配对中位只有
+  +7.8%（+1.3~+36.9），gRPC 轮间波动明显大于 HIXL。测试机为共享环境，只比较同轮结果。
+- 逐块 SHA-256 的读端本身是瓶颈：同一脚本读页缓存中的本地文件约 1230 MiB/s。换成只读取不计算
+  的读端（其余条件相同，5 轮交替）：HIXL 组读中位 1023.0 [992.7–1109.1]，gRPC 组读关闭
+  681.5 [614.1–797.4] MiB/s，HIXL 5 轮全胜、配对中位 +47.4%（+39.1~+66.6）。
+- 组内 wave 流水（下一个 wave 的源端导出与当前 wave 的传输重叠，`afs-node` sha256
+  `a90fc275…`）在同一会话对上一构建交替 6 轮（纯读取读端）：新 1388.9 [1259.5–1461.5]、
+  旧 1291.9 [1198.0–1317.2]（n=5，1 轮 reader 设备初始化失败）MiB/s，配对中位 +11.0%
+  （−4.4~+18.9，4/5 胜）；gRPC 组读关闭 674.5 [642.1–746.5]，HIXL 6 轮全胜、配对中位 +102.7%
+  （+86.6~+117.5）。计算 SHA-256 的读端 4 轮中新旧持平（−2.2%，−13.2~+20.2），HIXL 对 gRPC
+  4 轮全胜、中位 +53.8%。每组 wave 由 2 个加到 4 个（`dfs_read_group_max_descriptors = 8`）
+  无明显差别（−2.6%，1/4）。同一会话中纯读取读端的绝对值比前一批高约 25%，宿主负载不同，只比较同轮结果。
 
 配置、信任边界、指标与验收范围见[部署文档](../docs/deployment/afs.md#hixl-dfs-远端读)，
 协议与失败语义见[架构说明](../docs/architecture/afs.md)。A2 RoCE、多设备吞吐、并发 reader

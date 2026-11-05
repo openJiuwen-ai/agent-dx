@@ -761,8 +761,19 @@ struct PrefetchWindow {
     version_id: Option<FileVersionId>,
     layout_root_id: LayoutRootId,
     start: u64,
-    data: Vec<u8>,
+    /// Shared so FUSE replies can slice a hit without copying; a reply still
+    /// in flight keeps its bytes alive after the window is replaced.
+    data: prost::bytes::Bytes,
     reservation: PrefetchReservation,
+}
+
+impl PrefetchWindow {
+    /// The window's buffer for the next fill. Replies still holding slices of
+    /// it keep those bytes; the fill then starts from a fresh allocation.
+    fn into_buffer(self) -> (Vec<u8>, PrefetchReservation) {
+        let data = self.data.try_into_mut().map(Vec::from).unwrap_or_default();
+        (data, self.reservation)
+    }
 }
 
 /// Group state of one read handle: the window at the cursor, the window
@@ -815,6 +826,24 @@ impl PrefetchSlot {
             copied += count;
         }
         Ok(copied)
+    }
+
+    /// A shared slice when one resident window holds the whole request.
+    fn slice_resident(
+        &self,
+        identity: &PrefetchIdentity,
+        offset: u64,
+        count: usize,
+    ) -> Option<prost::bytes::Bytes> {
+        [self.window.as_ref(), self.previous.as_ref()]
+            .into_iter()
+            .flatten()
+            .find_map(|window| {
+                let relative = usize::try_from(offset.checked_sub(window.start)?).ok()?;
+                let end = relative.checked_add(count)?;
+                (identity.matches(window) && end <= window.data.len())
+                    .then(|| window.data.slice(relative..end))
+            })
     }
 
     fn plan_fill(
@@ -935,10 +964,10 @@ struct GroupAheadCompletion {
 /// Read-ahead slots plus the generation map that invalidates them.
 ///
 /// This is group pipelining level 1: one background fill overlapping FUSE
-/// consumption of the current group. Level 2 is not implemented yet; it needs
-/// source-side prepared batches and slots for two in-flight groups so that
-/// prepare(N+1) overlaps transfer(N), which also requires raising the
-/// per-peer admission limit and the source snapshot budget.
+/// consumption of the current group. Level 2 lives in the HIXL transport,
+/// which overlaps the source export of a group's next wave with the native
+/// READ of the current wave. Overlapping two whole groups would need two
+/// source batches per peer, more slots and a larger snapshot budget.
 struct GroupAhead {
     slots: Mutex<HashMap<u64, GroupAheadEntry>>,
     generations: Mutex<HashMap<u64, u64>>,
@@ -5512,11 +5541,67 @@ impl DistributedFs {
         size: usize,
         group: ReadGroupPolicy,
     ) -> Result<Vec<u8>> {
+        self.deliver_native_group_read(handle, snapshot, |inode| {
+            let mut out = vec![0; size];
+            let count =
+                self.read_native_group_in_view(handle, snapshot, inode, offset, &mut out, group)?;
+            out.truncate(count);
+            Ok(out)
+        })
+    }
+
+    /// FUSE reply variant of [`Self::read_native_group_owned`]. A request
+    /// inside one resident window is answered with a shared slice of that
+    /// window, so a hit costs no allocation, zero fill or copy here.
+    fn read_native_group_reply(
+        &self,
+        handle: FileHandle,
+        snapshot: &DfsFileHandleSnapshot,
+        offset: u64,
+        size: usize,
+        group: ReadGroupPolicy,
+    ) -> Result<prost::bytes::Bytes> {
+        self.deliver_native_group_read(handle, snapshot, |inode| {
+            let cached = self.readonly_version_for_inode(inode)?;
+            let identity = PrefetchIdentity::of(
+                &snapshot.inode_id,
+                cached.version.as_ref().map(|version| version.id.clone()),
+                &cached.layout,
+            );
+            let available = cached.layout.file_length.saturating_sub(offset);
+            let count = usize::try_from(available.min(size as u64))
+                .map_err(|_| invalid("read length is too large"))?;
+            if count > 0 {
+                let cache = self
+                    .prefetch
+                    .lock()
+                    .map_err(|_| unavailable("DFS prefetch table is poisoned"))?;
+                if let Some(hit) = cache
+                    .get(&handle.0)
+                    .and_then(|slot| slot.slice_resident(&identity, offset, count))
+                {
+                    return Ok(hit);
+                }
+            }
+            let mut out = vec![0; size];
+            let count =
+                self.read_native_group_in_view(handle, snapshot, inode, offset, &mut out, group)?;
+            out.truncate(count);
+            Ok(out.into())
+        })
+    }
+
+    /// Reads under the handle's native view and rechecks every authority the
+    /// group path depends on before the bytes are delivered.
+    fn deliver_native_group_read<T>(
+        &self,
+        handle: FileHandle,
+        snapshot: &DfsFileHandleSnapshot,
+        read: impl Fn(&InodeRecord) -> Result<T>,
+    ) -> Result<T> {
         let operation = self.capture_native_read_view()?;
         let (inode, view) = self.native_inode_for_read(handle, snapshot)?;
-        let mut out = vec![0; size];
-        let mut count =
-            self.read_native_group_in_view(handle, snapshot, &inode, offset, &mut out, group)?;
+        let mut out = read(&inode)?;
         #[cfg(test)]
         {
             let hook = self.native_read_before_delivery.lock().unwrap().take();
@@ -5532,8 +5617,7 @@ impl DistributedFs {
             // read once more under a fresh Meta authorization. An unchanged
             // version is served again from its immutable group window.
             let (inode, view) = self.native_inode_for_read(handle, snapshot)?;
-            count =
-                self.read_native_group_in_view(handle, snapshot, &inode, offset, &mut out, group)?;
+            out = read(&inode)?;
             self.check_native_read_view(&view)?;
         }
         self.check_native_read_view(&operation)?;
@@ -5551,7 +5635,6 @@ impl DistributedFs {
             ));
         }
         drop(current);
-        out.truncate(count);
         Ok(out)
     }
 
@@ -5704,7 +5787,7 @@ impl DistributedFs {
                 version_id: version_id.clone(),
                 layout_root_id: layout.id.clone(),
                 start: plan.start,
-                data,
+                data: data.into(),
                 reservation,
             };
             let retired = {
@@ -5768,13 +5851,11 @@ impl DistributedFs {
         let (recycled, retired) = take_windows(!keep_current)?;
         drop(retired);
         let buffer = match recycled {
-            Some(window) => Some((window.data, window.reservation)),
+            Some(window) => Some(window.into_buffer()),
             None => match self.reserve_prefetch_bytes(grouped_length, group.host_budget_bytes) {
                 Some(reservation) => Some((Vec::new(), reservation)),
                 // Under budget pressure residency gives way to the group.
-                None if keep_current => take_windows(true)?
-                    .0
-                    .map(|window| (window.data, window.reservation)),
+                None if keep_current => take_windows(true)?.0.map(PrefetchWindow::into_buffer),
                 None => None,
             },
         };
@@ -5901,8 +5982,7 @@ impl DistributedFs {
     /// current one. Only sequential group mode with `max_inflight >= 2` opts
     /// in; every failure leaves the synchronous path unchanged.
     ///
-    /// Pipelining level 2 (overlapping prepare(N+1) with transfer(N)) is future
-    /// work; see [`GroupAhead`].
+    /// Wave-level overlap inside one group is the transport's; see [`GroupAhead`].
     #[allow(clippy::too_many_arguments)]
     fn spawn_ahead(
         &self,
@@ -12933,8 +13013,7 @@ impl Backend for DistributedFs {
         // from the same prefetched group window as `read`; without this branch
         // every request re-issues a whole group through the transport.
         if let Some(group) = self.native_read_group(&snapshot)? {
-            let data = self.read_native_group_owned(handle, &snapshot, offset, size, group)?;
-            return Ok(data.into());
+            return self.read_native_group_reply(handle, &snapshot, offset, size, group);
         }
         self.read_native_owned(handle, &snapshot, offset, size)
     }
@@ -30021,6 +30100,53 @@ mod tests {
         assert_eq!(group_read_at(&fs, reader, 3, 2), b"de");
         assert_eq!(fs.prefetch_bytes.load(Ordering::SeqCst), 4);
         fs.release(&context(), reader).unwrap();
+    }
+
+    #[test]
+    fn read_reply_serves_a_resident_group_window_without_copying() {
+        // A window hit replies with a shared slice of the window: no per-request
+        // allocation, zero fill or copy before the bytes reach the kernel.
+        let (_temp, meta, fs) = grouped_fs(8);
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "reply-zero-copy", b"abcdefgh");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+
+        assert_eq!(&fs.read_reply(&context(), reader, 0, 2).unwrap()[..], b"ab");
+        let hit = fs.read_reply(&context(), reader, 3, 4).unwrap();
+        assert_eq!(&hit[..], b"defg");
+        let window_start = fs
+            .prefetch
+            .lock()
+            .unwrap()
+            .get(&reader.0)
+            .and_then(|slot| slot.window.as_ref())
+            .map(|window| window.data.as_ptr() as usize)
+            .expect("group window stays resident");
+        assert_eq!(hit.as_ptr() as usize, window_start + 3);
+        assert_eq!(fs.group_fills.load(Ordering::SeqCst), 1);
+        fs.release(&context(), reader).unwrap();
+    }
+
+    #[test]
+    fn reply_slice_outlives_the_window_it_was_cut_from() {
+        // A reply still on its way to the kernel keeps its bytes even after the
+        // handle moves on and the window's buffer would otherwise be reused.
+        let (_temp, meta, fs) = grouped_fs(4);
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "reply-outlives", b"abcdefghijklmnop");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+
+        let held = fs.read_reply(&context(), reader, 0, 4).unwrap();
+        for offset in [4, 8, 12] {
+            let next = fs.read_reply(&context(), reader, offset, 4).unwrap();
+            assert_eq!(next[0], b'a' + offset as u8);
+        }
+        assert_eq!(&held[..], b"abcd");
+        fs.release(&context(), reader).unwrap();
+        assert_eq!(&held[..], b"abcd");
+        assert_eq!(fs.prefetch_bytes.load(Ordering::SeqCst), 0);
     }
 
     #[test]

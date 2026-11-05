@@ -98,13 +98,10 @@ DFS 的 `copy_file_range` 通过元数据 COW 为目标创建独立 FileVersion�
 
 文件提交和完整元数据同步遇到事务 CAS 未命中时，会重新验证 head 和写租约身份；同身份续期或并发 inode 属性变化不再永久污染 writer。换主和 head 变化仍拒绝。单次处理的持续竞争返回可重试错误，保留原 operation，避免把暂时竞争带到退出 drain。
 
-DFS FUSE 默认采用缓存的 write-through 模式，内核预读窗口可能把大的应用 read 拆成小请求。
-`dfs_fuse_read_mode = "direct"` 仅让 `O_RDONLY` 打开回复 `FOPEN_DIRECT_IO`，使批量读取
-绕过页缓存及预读窗口；`O_WRONLY`、`O_RDWR` 继续走原缓存路径，默认值为 `"cached"`。
-直接读取的实际大小受应用 read、协商的页数和内核限制约束，配置本身不保证 MiB 请求。
-只读 direct 句柄的 mmap 仍依赖协商的 `FUSE_DIRECT_IO_ALLOW_MMAP`，不具备该能力的
-内核使用 cached 模式执行只读 mmap。两种传输共享此策略，每个新 DFS 请求仍重新验证
-相关 chunk，不跨请求缓存“验证通过”标记。入口指标
+DFS FUSE 采用缓存的 write-through 模式，只读与可写打开都经过页缓存；`O_DIRECT` 打开和
+不兼容的固定打开视图仍回复 `FOPEN_DIRECT_IO`。内核预读把大的应用 read 拆成较小的请求
+（A3 实测约 1 MiB），顺序预读组把这些请求合并到组窗口。两种传输共享此策略，每个新 DFS
+请求仍重新验证相关 chunk，不跨请求缓存“验证通过”标记。入口指标
 `afs_fuse_callback_size_bytes{filesystem,operation}` 记录内核回调字节数的直方图，
 包含失败回调；其 sum 不是成功读取字节数，INIT 日志中的上限也不是实际请求分布。
 
@@ -112,18 +109,28 @@ HIXL 读取阶段墙钟由 `afs_dfs_read_phase_seconds{phase}` 按固定相位�
 scatter、validate、release、buffers）记录，只用于定位瓶颈，不改变读取结果与成功判定。
 
 顺序预读组由根配置 `dfs_read_group_mode = "sequential"` 开启，默认 `"off"` 保持原路径。
-只读 direct 句柄收到连续读时，把当前需求及其后最多 `dfs_read_group_bytes` 的连续范围
-规划成一个 DFS 批次，裁剪到 EOF；首个请求不等待后续 FUSE 请求到达。组绑定当前
+只读句柄收到连续读时，把当前需求所在组及其后最多 `dfs_read_group_bytes` 的连续范围
+规划成一个 DFS 批次（组起点对齐到组网格），裁剪到 EOF；首个请求不等待后续 FUSE 请求到达。组绑定当前
 file version、layout 和每个窗口的授权，单个组合最多 128 MiB / 512 个 range，
 超过时由 planner 切成多个合法组。HIXL 组批次在 peer 绑定的 lane 上把整组窗口一次
 提交给 native batch API，多 lane 配置同样生效；TCP 使用同一聚合范围，按流式方式提交。
 跨 FUSE 请求复用预取字节是有意行为变化：seek、倒退、重开、版本变化或写入可见性变化
-会丢弃窗口并重新走完整性验证；hole 仍为零填充。native 组窗口只把窗口本身计入
+会丢弃窗口并重新走完整性验证；hole 仍为零填充。每个句柄同时只有一次同步组填充：并发
+READ 命中已驻留窗口或等待在途填充，跨越窗口末端的请求从窗口末端续填下一组。除真实 EOF 外，
+组读始终返回请求的完整长度，因为 FUSE 短读会让内核缩小缓存的文件大小。内核预读的请求可能
+在组边界附近乱序到达，因此组起点对齐 `dfs_read_group_bytes` 网格，每个句柄保留上一窗口供
+迟到请求命中，横跨两个窗口的请求直接拼接。FUSE 回复完全落在一个驻留窗口内时，直接返回
+该窗口的共享切片，不再分配、清零和拷贝；仍在发往内核的回复会让切片在窗口被替换后短暂存活，
+此时下一次填充改用新缓冲区，这部分短暂内存不计入组预算。
+native 组窗口只把窗口本身计入
 `dfs_read_group_host_budget_bytes`，external 路径另计一份 staging 临时副本；不足时
 退回逐请求读取，且仍读取组窗口固定的 file version 与 layout，不重新解析 Meta head。
-`dfs_read_group_max_inflight` 只接受 1 或 2。2 表示当前组被消费时由后台线程预取
-下一组（流水第一级），源端在途批次数和槽位不变；第二级（源端同时保留两个 prepared
-batch，让 prepare 与 transfer 重叠）尚未实现；RDMA 数据面
+`dfs_read_group_max_inflight` 只接受 1 或 2，默认 2。2 表示当前组被消费时由后台线程预取
+下一组（流水第一级），源端在途批次数和槽位不变。第二级在一次逻辑读内部：每个 wave 至多占
+源端 lane `export_slots` 的一半，第 k 个 wave 做 native READ 时并发提交第 k+1 个 wave 的
+Prepare，源端导出与 reader 的传输、拆分和校验重叠；Prepare 仍按偏移顺序提交并复用同一快照，
+native READ 仍一次一个 wave。第 k 个 wave 读取失败时，已准备未读的第 k+1 个 wave 以
+`NotSubmitted` 释放后再关闭会话。RDMA 数据面
 不接受组批次，因此该模式只对 gRPC 或 HIXL prepared 路径生效。无论是否开启组模式，HIXL
 reader 都通过 `PrepareReadRangesHixlGroup` 一次提交整波有序 window，再用一次 native batch 读取，源端只授权父批次一次并从
 同一不可变快照切片导出全部 window；导出失败会回收本次已准入的 slot 并丢弃新建快照。
@@ -801,8 +808,8 @@ quarantine 或 drain）时以 `NODE_TRANSFER_UNAVAILABLE` 拒绝协商，`prefer
 串行等待自己的 READ，同一波的不同 lane 并行。每 peer 仍只准入一个逻辑读取任务。
 Prepare 失败回收同波未提交窗口；提交后等待全部 sibling 清理，调用方超时后后台继续受管清理。
 普通远端拒绝只影响对应 peer；本地 native 生命周期不确定才隔离本地整个组。
-当前实现只与 FUSE 消费重叠；组级流水第二级（源端双 prepared batch、prepare 与
-transfer 重叠）尚未实现。多设备按 peer 绑定 lane，实测只作为隔离与并发余量，
+组级流水第一级与 FUSE 消费重叠，第二级在同一逻辑读的相邻 wave 之间重叠源端导出与 reader
+传输。多设备按 peer 绑定 lane，实测只作为隔离与并发余量，
 端到端未形成可复现收益。
 
 HIXL 参数面不具备 AFS mTLS 的 Node 身份绑定，注册池的访问边界也不是每个 grant。
@@ -839,7 +846,7 @@ DFS HIXL 不改变 Meta source schema、dirty-owner 读、复制写入或持久 
   绑定 mTLS peer、`home_session_id` 与 reader engine；reader 对每个 Home 维护
   `ownerfs_sessions_per_home` 个会话（默认 1），每个会话同时只准入一次窗口获取，池内会话分摊
   该 lane 的导出槽。Prepare
-  以 reader 生成的 `read_id` 支持同一请求的重放；Release 结果为 Unknown/Failed、关闭时仍有未释放槽、
+  以 reader 生成的 `read_id` 支持同一请求的重放；Release 结果为 Unknown、关闭时仍有未释放槽、
   过期或 drain 超时都 quarantine 共享 runtime。
 - 回退：`preferred` 只在非顺序读、预算不足、dispatch 前 capability unsupported、Home 已停止准入或
   槽位不足时改用原 gRPC 单区间读，已从窗口复制的前缀保留；`required` 不回退。Home 停止准入（代际

@@ -189,12 +189,9 @@ path、mount ID 和 source 同时作为 readiness 身份；挂载被替换时健
 
 ## HIXL DFS 远端读
 
-DFS FUSE 的读取策略独立于传输选择。Node 根配置 `dfs_fuse_read_mode = "cached"`
-为默认值；批量顺序读可设置 `"direct"`，CLI 对应 `--dfs-fuse-read-mode direct`。
-它仅改变只读打开的 FUSE 回复，可写打开保留缓存的 write-through 和 mmap 路径。
-direct 可绕过小的内核预读窗口，但不保证每次请求达到配置的窗口容量。需要只读 mmap
-且内核不支持 `FUSE_DIRECT_IO_ALLOW_MMAP` 时保留 cached。此字段放在 TOML 根部，
-不能写入 `[hixl]`；TCP/HIXL 对照应使用相同值。完整性检查及源快照预算保持相同。
+DFS FUSE 读取统一经过页缓存，TCP 与 HIXL 共用同一策略；`O_DIRECT` 打开仍绕过页缓存。
+完整性检查及源快照预算与传输选择无关。HIXL 应与 `dfs_read_group_mode = "sequential"`
+一起使用；gRPC 在组读关闭时使用逐请求的异步读管线，吞吐更高（见下方验收边界）。
 
 HIXL 读取阶段墙钟由 `afs_dfs_read_phase_seconds{phase}` 记录，只用于定位瓶颈。
 
@@ -203,15 +200,20 @@ HIXL 读取阶段墙钟由 `afs_dfs_read_phase_seconds{phase}` 记录，只用�
 
 - `dfs_read_group_bytes`：单个组合的目标字节数，默认 8388608，范围
   1048576..=134217728 且为 4096 的倍数。
-- `dfs_read_group_max_inflight`：1 或 2，默认 1。1 为单组串行；2 表示在消费当前
-  组的同时，用一个后台线程预取下一组（只与 FUSE 消费重叠，不增加在途传输批次数）。
+- `dfs_read_group_max_inflight`：1 或 2，默认 2。2 表示在消费当前组的同时，用一个
+  后台线程预取下一组（只与 FUSE 消费重叠，不增加在途传输批次数）；1 为单组串行。
   预取失败、seek、版本或写入可见性变化、close 都会丢弃预取结果；预取线程只做已授权
   的组读，交付前仍校验 native read view。
 - `dfs_read_group_max_descriptors`：1..=128，默认 128，并受 `[hixl].receive_slots`
-  约束；一次 native batch 最多 64 个 descriptor。
+  约束；一次 native batch 最多 64 个 descriptor。HIXL 每个 wave 的窗口数取它、
+  `receive_slots` 与源端 `export_slots` 一半中的最小值，128 MiB 组、槽位 32 时每组 2 个
+  wave，下一个 wave 的源端导出与当前 wave 的传输重叠。
 - `dfs_read_group_host_budget_bytes`：预取窗口的共享预算，默认 1073741824，且不得
-  小于 `dfs_read_group_bytes`；native 组读每个句柄最多占两个窗口（当前窗口与预取中
-  的下一组）。
+  小于 `dfs_read_group_bytes`；native 组读每个句柄占一个当前窗口和保留的上一窗口（供乱序
+  到达的请求命中），`max_inflight = 2` 时另加预取中的下一组，因此最多三个窗口，128 MiB
+  组时每个句柄 384 MiB；预算不足时先放弃保留上一窗口。每个句柄同时只有一次组填充，并发
+  请求等待在途填充而不重复读取同一组。命中窗口的 FUSE 回复共享窗口内存，尚未交给内核的
+  回复会让被替换窗口的内存短暂多留一会儿，这部分不计入该预算。
 
 该模式只对 gRPC 或 HIXL prepared 路径生效；RDMA 数据面保持原逐批预算，配置值不会
 暗中缩小 native descriptor 数。128 MiB 组读需要 `[hixl].receive_slots` 与该 peer 绑定
@@ -264,7 +266,10 @@ session_idle_ms = 20000
 
 `off` 不初始化 CANN；`preferred` 只在本地明确能力缺失且清理已完成，或 peer 在任何
 数据提交前明确返回 AFS capability unsupported 时回退 gRPC；`required` 能力缺失时
-拒绝启动或读取。启动清理失败会保留资源并返回 drain incomplete，阻止继续启动。
+拒绝启动或读取。启动清理失败会保留资源并返回 drain incomplete，阻止继续启动；被保留的
+native runtime 处于 poisoned 状态，C ABI 拒绝其 shutdown，只能随进程退出回收。Node 在启动
+错误里给出保留记录编号，保留的运行时地址与 native 状态可通过
+`afs_transport::hixl::retained_starts()` 查询，不会被静默丢弃或复用。
 身份/授权错误、连接错误和提交后的错误不会通过降级重放。`preferred` 还会在 peer 尚无
 控制会话或建链进行中时，用同一授权经 gRPC 服务当前 batch，并在后台完成协商/建链；
 源端已停止准入（代际 quarantine 或 drain）而拒绝协商（`NODE_TRANSFER_UNAVAILABLE`）后，
@@ -279,7 +284,9 @@ mTLS、`trusted_node_certs`、非零端口的具体单播 IP、正数且有界�
 
 Node 在本地 HIXL 初始化完成后才首次向 Meta 注册；多设备初始化期间尚未持有 Meta 会话租约。
 注册失败时等待阻塞线程清理已初始化的 runtime，并保留原注册错误；启动取消或后续启动失败时
-由启动 guard 派发清理。正常停止仍先停消费者，再关闭全部 lanes，不重复尝试原生 shutdown。
+由启动 guard 派发清理。正常停止仍先停消费者，再关闭全部 lanes。原生 shutdown 失败时该
+lane 进入 `shutdown-failed`：数据面全部拒绝且不再准入，但允许再次调用 shutdown 重试原生
+清理（native 各清理步骤幂等），清理成功后才转为 `shutdown`；设备级 quarantine 仍拒绝重试。
 Node 的进程停机期限为 15 秒。期限耗尽走失败退出码 124，并绕过 C/native 退出处理器，
 避免它们在设备清理未完成时触发全局析构；正常完成路径仍执行资源清理并解除期限。
 退出码 124 不证明设备已排空，恢复测试前仍须核对遗留进程和设备状态。
@@ -323,19 +330,56 @@ engine endpoint、显式设备监听端口必须分别唯一。多设备要求�
 
 ### 验收边界
 
-以下结果来自 A3 HCCS 双机（216 运行 meta 与源节点，217 运行全远端 reader，单 lane、单设备，
-源码 `51b0dbc2`，`afs-node` sha256 `b5f01ef9…`）。FUSE 请求上限 1 MiB、`direct`，每轮清理
-reader 数据目录，读回数据 SHA-256 全部一致，结束时 quarantine 与导出槽均为 0。对照基线为
-本轮精简之前的源码 `90b5e361`，两者同轮交替。测试机为共享环境（负载约 30），只比较同轮结果。
+以下结果来自 A3 HCCS 双机（212 运行 meta 与源节点，217 运行全远端 reader，单 lane、单设备，
+`afs-node` sha256 `5aaa25a3…`）。1 GiB BLAKE3 对象，单线程读端以 4 MiB 块读取并逐块计算
+SHA-256，FUSE 页缓存读取（内核预读请求约 1 MiB），每轮清理 reader 数据目录，3 轮交替，读回
+数据 SHA-256 全部一致。测试机为共享环境，只比较同轮结果。
 
-| 1 GiB 顺序读，MiB/s，中位 [范围] | 当前 | 基线 |
-| --- | --- | --- |
-| DFS HIXL，组模式关闭（reader 对 EHOSTUNREACH 重试，见下） | 95.03 [92.98–100.95] | 94.85 [91.29–95.04] |
-| DFS HIXL，128 MiB 组，`dfs_read_group_max_inflight = 1` | 293.29 [284.38–315.63] | 293.28 [284.78–324.06] |
-| DFS HIXL，128 MiB 组，`dfs_read_group_max_inflight = 2` | 437.16 [425.86–438.87] | 444.75 [368.13–465.02] |
-| DFS gRPC，128 MiB 组，CRC32C 副本 | 402.28 [342.36–438.94] | 355.97 [268.6–417.15] |
+| 1 GiB 顺序读，MiB/s，中位 [范围] | 吞吐 |
+| --- | --- |
+| DFS HIXL，128 MiB 组，`dfs_read_group_max_inflight = 2` | 950.0 [864.4–981.7] |
+| DFS HIXL，128 MiB 组，`dfs_read_group_max_inflight = 1` | 568.0 [549.4–608.7] |
+| DFS HIXL，组模式关闭 | 118.9 [114.9–122.6] |
+| DFS gRPC，组模式关闭 | 711.4 [563.4–799.3] |
+| DFS gRPC，128 MiB 组，`dfs_read_group_max_inflight = 2` | 519.7 [514.3–526.4] |
+| DFS gRPC，128 MiB 组，`dfs_read_group_max_inflight = 1` | 367.2 [366.8–371.2] |
 
-差异都落在轮间波动内。端到端数字包含测试脚本的 Python SHA-256 校验。
+端到端数字包含测试脚本的 SHA-256 计算（约 0.64 s/GiB）。上表二进制在删除 FUSE 读模式开关之前
+构建，显式设置页缓存读取与表中的 `max_inflight`。删除开关后的构建（`afs-node` sha256
+`5b94b68a…`）以默认配置复测 5 轮交替（HIXL 不设置 `dfs_read_group_max_inflight`，即 2；gRPC
+组读关闭）：
+
+| 1 GiB 顺序读，MiB/s，中位 [范围] | 吞吐 |
+| --- | --- |
+| DFS HIXL，128 MiB 组，默认 `max_inflight` | 884.9 [868.6–902.4] |
+| DFS gRPC，组模式关闭 | 809.1 [658.9–873.6] |
+
+HIXL 5 轮全胜，配对中位 +7.8%（+1.3~+36.9），两者都恰好传输 1.00 倍文件字节。
+
+上述读端每块计算 SHA-256，本身限速约 1230 MiB/s（同一脚本读页缓存中的本地文件）。窗口命中改为
+共享切片回复后（`afs-node` sha256 `4d68edc9…`），换用只读取不计算的读端，其余条件相同，5 轮交替：
+
+| 1 GiB 顺序读，MiB/s，中位 [范围]，读端不计算 | 吞吐 |
+| --- | --- |
+| DFS HIXL，128 MiB 组，默认 `max_inflight` | 1023.0 [992.7–1109.1] |
+| DFS gRPC，组模式关闭 | 681.5 [614.1–797.4] |
+
+HIXL 5 轮全胜，配对中位 +47.4%（+39.1~+66.6）。同一会话中共享切片回复对上一构建 6 轮交替（计算
+SHA-256 的读端）配对中位 +2.2%（−9.2~+4.3），在轮间波动内；`fuse_threads` 由 4 增至 8 或 16 时
+HIXL 与 gRPC 都变慢，默认 4 保持不变。
+
+组内 wave 流水后（`afs-node` sha256 `a90fc275…`，每组 2 个 wave），同一会话交替，纯读取读端：
+
+| 1 GiB 顺序读，MiB/s，中位 [范围]，读端不计算 | 吞吐 |
+| --- | --- |
+| DFS HIXL，128 MiB 组，wave 流水（6 轮） | 1388.9 [1259.5–1461.5] |
+| DFS HIXL，128 MiB 组，上一构建（5 轮） | 1291.9 [1198.0–1317.2] |
+| DFS gRPC，组模式关闭（6 轮） | 674.5 [642.1–746.5] |
+
+新构建对上一构建配对中位 +11.0%（−4.4~+18.9，4/5 胜），对 gRPC 6 轮全胜、中位 +102.7%；两者都
+恰好传输 1.00 倍文件字节（HIXL 每 GiB 16 个 native batch）。计算 SHA-256 的读端 4 轮中新旧持平
+（中位 −2.2%），HIXL 对 gRPC 中位 +53.8%（4/4）。`dfs_read_group_max_descriptors = 8`（每组 4 个
+wave）对默认 4 轮无明显差别。该会话的绝对值比前一批高约 25%，宿主负载不同，只比较同轮结果。
 
 解读口径：
 
@@ -344,9 +388,9 @@ reader 数据目录，读回数据 SHA-256 全部一致，结束时 quarantine �
 - DFS 会为 reader 后台补齐本地副本，连续读若干轮后退化为本地读；测量必须在每轮前清理
   reader 的 Chunk，并核对 `afs_hixl_reader_native_batch_bytes_total` 随读取增长。
 
-上表之后的修复尚未在 A3 复测：读取跨过 native read view 的 5 秒期限时改为重新授权并重读（此前
-不重试的 reader 会收到 `EHOSTUNREACH`，当前版本 5 轮失败 4 轮，基线 5 轮失败 1 轮）；CRC32C 对象的
-`preferred` 冷回退；expire 失败不再停止 Node；OwnerFs 与 DFS reader 在源端拒绝准入后的回退与退避。
+组模式关闭的 HIXL 读取每轮耗时 9–10 s，跨过 native read view 的 5 秒期限，不重试的读端
+全部成功且内容一致。尚未在 A3 复测：CRC32C 对象的 `preferred` 冷回退；expire 失败不再停止
+Node；OwnerFs 与 DFS reader 在源端拒绝准入后的回退与退避。
 
 已知问题：
 
@@ -359,9 +403,9 @@ reader 数据目录，读回数据 SHA-256 全部一致，结束时 quarantine �
   `peer read completion identity/length mismatch`，已修复。
 
 尚未验收：更多源、并发读写、单 peer 跨多 lane 的分片传输、A2 RoCE、大于 1 MiB 的 FUSE
-请求与故障恢复；多 lane 目前只作为隔离与并发余量，不是吞吐承诺。组级流水第二级（源端同时
-保留两个 prepared batch，让 prepare(N+1) 与 transfer(N) 重叠）尚未实现：落地前需要放宽每
-peer 单批准入、把 `receive_slots`/`export_slots` 扩到两组，并为协议增加多批在途语义。
+请求与故障恢复；多 lane 目前只作为隔离与并发余量，不是吞吐承诺。不同组之间的 prepare 与
+transfer 重叠（源端同时保留两个父 batch）尚未实现：需要放宽每 peer 单批准入、扩大槽位与源
+快照预算，并为协议增加多批在途语义。
 
 `window_bytes` 是每次 native 导出的容量上限，默认 4 MiB；实际窗口仍受逻辑读取长度和
 FUSE 请求拆分影响。64 KiB 是此前最小资源诊断配置，不是产品默认值或 HIXL 限制。
@@ -455,10 +499,12 @@ ownerfs_min_file_bytes = 1048576
 ownerfs_sessions_per_home = 1
 ```
 
-- `ownerfs_window_bytes`：单次 Prepare 的最大窗口，`window_bytes` 的整数倍，不超过 64 MiB，
-  且不超过 `min(receive_slots, export_slots / ownerfs_sessions_per_home) × window_bytes`；运行时
-  再按协商后的远端 lane 导出槽数收紧。顺序访问时窗口从一个槽起翻倍到该值；从偏移 0 开始的
-  读立即开窗，跳转之后需连续两次顺序 READ 才开窗。
+- `ownerfs_window_bytes`：单次 Prepare 的目标上限，`window_bytes` 的整数倍，不超过 64 MiB，
+  且不超过 `min(receive_slots, export_slots / ownerfs_sessions_per_home) × window_bytes`。运行时
+  实际容量是 `min(本端 window_bytes, 协商后的 Home window_bytes) × 可用槽数`：远端窗口更小或
+  lane 导出槽更少时，Prepare 按实际容量缩短，配置值不可达，也不报错。预留 Host 预算和吞吐
+  预期时应按实际容量计算。顺序访问时窗口从一个槽起翻倍到该值；从偏移 0 开始的读立即开窗，
+  跳转之后需连续两次顺序 READ 才开窗。
 - `ownerfs_sessions_per_home`：1..=4，默认 1。reader 对每个 Home 的控制会话数，每个会话同时
   只准入一次窗口获取；大于 1 时同一 Home 的多个打开可并发 Prepare，单窗口最多使用远端导出槽
   的 `1 / ownerfs_sessions_per_home`，因此通常需要同时调大 `receive_slots`/`export_slots`
