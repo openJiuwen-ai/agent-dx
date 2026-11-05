@@ -2364,6 +2364,8 @@ async fn run_node(
         if let Some(fetcher) = &dfs_fetcher_for_shutdown {
             fetcher.close();
         }
+        #[cfg(test)]
+        record_shutdown_stage("admission_closed");
         on_shutdown();
     };
     #[cfg(feature = "ownerfs")]
@@ -2371,13 +2373,19 @@ async fn run_node(
         Some(drain_started_services(services, on_shutdown, error).await)
     } else {
         afs_logging::info!("node.ready";"grpc"=>cfg.grpc_listen.to_string(),"rest"=>cfg.rest_listen.to_string(),"uds"=>cfg.uds_path.display().to_string(),"ownerfs"=>cfg.ownerfs,"dfs"=>cfg.dfs);
+        #[cfg(test)]
+        record_shutdown_stage("serving");
         services.run_with_shutdown(on_shutdown).await.err()
     };
     #[cfg(not(feature = "ownerfs"))]
     let mut shutdown_error = {
         afs_logging::info!("node.ready";"grpc"=>cfg.grpc_listen.to_string(),"rest"=>cfg.rest_listen.to_string(),"uds"=>cfg.uds_path.display().to_string(),"ownerfs"=>cfg.ownerfs,"dfs"=>cfg.dfs);
+        #[cfg(test)]
+        record_shutdown_stage("serving");
         services.run_with_shutdown(on_shutdown).await.err()
     };
+    #[cfg(test)]
+    record_shutdown_stage("services_stopped");
     // A Services timeout may abort its observer, never the owned mount worker.
     // Keep FUSE alive until that same worker proves normal native closure. The
     // process-wide watchdog bounds a permanently busy or unresolved claim.
@@ -2400,6 +2408,8 @@ async fn run_node(
     #[cfg(feature = "ownerfs")]
     if let Some(owner) = state.ownerfs.as_ref() {
         owner.mount_manager_shutdown();
+        #[cfg(test)]
+        record_shutdown_stage("ownerfs_mounts_stopped");
     }
     // Stop FUSE admission and observe its thread cleanup before the final dirty drain.
     // Dropping BackgroundSession alone detaches the thread and cannot prove this boundary.
@@ -2418,6 +2428,8 @@ async fn run_node(
                 std::future::pending::<()>().await;
             }
         }
+        #[cfg(test)]
+        record_shutdown_stage("dfs_fuse_joined");
     }
     #[cfg(feature = "ownerfs")]
     if let Some(mounted) = mounted_ownerfs {
@@ -2434,6 +2446,8 @@ async fn run_node(
                 std::future::pending::<()>().await;
             }
         }
+        #[cfg(test)]
+        record_shutdown_stage("ownerfs_fuse_joined");
     }
     #[cfg(feature = "dfs")]
     if let Some(dfs) = dfs_for_drain {
@@ -2506,6 +2520,8 @@ async fn run_node(
                 remember_shutdown_error(&mut shutdown_error, error.into());
             }
         }
+        #[cfg(test)]
+        record_shutdown_stage("dfs_drained");
     }
     #[cfg(feature = "dfs")]
     if let Some(store) = dfs_sidecar_store_for_shutdown {
@@ -2528,6 +2544,12 @@ async fn run_node(
             }
             Err(error) => remember_shutdown_error(&mut shutdown_error, error.into()),
         }
+        #[cfg(test)]
+        record_shutdown_stage("chunk_store_exited");
+    }
+    #[cfg(all(test, feature = "dfs"))]
+    if dfs_fetcher_for_shutdown.is_some() {
+        record_shutdown_stage("fetcher_stopping");
     }
     #[cfg(feature = "dfs")]
     if let Some(fetcher) = dfs_fetcher_for_shutdown
@@ -2548,6 +2570,8 @@ async fn run_node(
                 remember_shutdown_error(&mut shutdown_error, error.into());
             }
         }
+        #[cfg(test)]
+        record_shutdown_stage("peer_cache_exited");
     }
     #[cfg(feature = "dfs")]
     if let Some(store) = dfs_external_store_for_shutdown {
@@ -2562,6 +2586,8 @@ async fn run_node(
                 remember_shutdown_error(&mut shutdown_error, error.into());
             }
         }
+        #[cfg(test)]
+        record_shutdown_stage("external_verifier_exited");
     }
     #[cfg(feature = "dfs")]
     {
@@ -2572,12 +2598,16 @@ async fn run_node(
         afs_logging::info!("dfs.write_buffers_stopped";
             "live_bytes" => buffers.live_bytes,
             "idle_bytes" => buffers.idle_bytes);
+        #[cfg(test)]
+        record_shutdown_stage("write_buffers_stopped");
     }
     match tokio::time::timeout(std::time::Duration::from_secs(10), local.shutdown()).await {
         Ok(Ok(())) => {}
         Ok(Err(error)) => remember_shutdown_error(&mut shutdown_error, error.into()),
         Err(error) => remember_shutdown_error(&mut shutdown_error, error.into()),
     }
+    #[cfg(test)]
+    record_shutdown_stage("local_api_stopped");
     if let Some(error) = shutdown_error {
         afs_logging::error!("node.shutdown_failed"; "error" => error.to_string());
         return Err(error);
@@ -2990,6 +3020,25 @@ fn dfs_rdma_startup_device(
         }
     }
 }
+
+/// Test-only witness of the shutdown sequence; `shutdown_order_tests` pins the
+/// order. Each call sits right after the stage it names has finished.
+#[cfg(test)]
+fn record_shutdown_stage(stage: &str) {
+    use std::io::Write;
+    let Some(path) = std::env::var_os("AFS_TEST_SHUTDOWN_TRACE") else {
+        return;
+    };
+    let mut trace = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("open shutdown trace");
+    writeln!(trace, "{stage}").expect("append shutdown trace");
+}
+
+#[cfg(all(test, feature = "dfs"))]
+mod shutdown_order_tests;
 
 #[cfg(test)]
 mod shutdown_tests {

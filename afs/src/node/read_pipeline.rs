@@ -227,6 +227,7 @@ impl ReadPipelineLimits {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "dfs")]
     #[tokio::test(flavor = "current_thread")]
     async fn read_equivalence_native_reply_releases_bytes_with_last_reference() {
         use std::sync::Arc;

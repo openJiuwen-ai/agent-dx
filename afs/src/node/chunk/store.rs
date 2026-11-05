@@ -151,7 +151,7 @@ impl LocalChunkStore {
         self.read_work.as_ref()
     }
 
-    #[cfg(feature = "dfs")]
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn with_read_work_metrics(
         mut self,
         metrics: super::super::read_work::ReadWorkMetrics,
@@ -262,7 +262,7 @@ impl LocalChunkStore {
         }
     }
 
-    #[cfg(feature = "dfs")]
+    #[cfg(any(feature = "dfs", test))]
     pub(crate) fn record_read_check(&self, stage: super::super::read_work::ReadCheck) {
         if let Some(metrics) = &self.read_work {
             metrics.check(stage);

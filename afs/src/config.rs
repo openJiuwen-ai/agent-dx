@@ -1462,6 +1462,7 @@ fn decode_base64(input: &str) -> Result<Vec<u8>> {
 mod certificate_tests {
     use super::*;
 
+    #[cfg(feature = "dfs")]
     #[test]
     fn read_config_delivery_defaults_and_overrides() {
         let temp = tempfile::tempdir().unwrap();
@@ -1558,6 +1559,7 @@ unsigned_payload = true
 #[cfg(test)]
 mod crc32c_config_tests {
     use super::*;
+    #[cfg(feature = "dfs")]
     #[test]
     fn crc32c_write_mode_follows_storage_and_has_no_switch() {
         // S1a-7 (R21, F6): native storage always writes CRC32C objects with
@@ -1583,6 +1585,7 @@ mod crc32c_config_tests {
 #[cfg(test)]
 mod crc_read_modes_contract_tests {
     use super::*;
+    #[cfg(feature = "dfs")]
     #[test]
     fn crc_read_modes_explicit_config_survives_resolution() {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -1651,6 +1654,7 @@ mod gc_grace_config_tests {
 #[cfg(test)]
 mod crc_read_modes_validation_tests {
     use super::*;
+    #[cfg(feature = "dfs")]
     #[test]
     fn crc_read_modes_cli_defaults_and_scope_preserve_write_crc() {
         for mode in ["receiver", "off"] {
@@ -1695,6 +1699,7 @@ mod crc_read_modes_validation_tests {
 mod crc_read_default_off_tests {
     use super::*;
 
+    #[cfg(feature = "dfs")]
     #[test]
     fn crc_read_default_off_keeps_native_write_checks_and_optional_receiver() {
         let cfg =
@@ -1715,6 +1720,7 @@ mod crc_read_default_off_tests {
         }
     }
 
+    #[cfg(feature = "dfs")]
     #[test]
     fn crc_read_mode_both_is_not_configurable() {
         assert!(
@@ -1733,18 +1739,27 @@ mod crc_read_default_off_tests {
 
     #[test]
     fn crc_read_default_off_does_not_activate_native_policy_on_other_backends() {
-        for role in [Role::Node, Role::Meta] {
+        // Node rejects a backend this build did not compile; Meta resolves any `fs`.
+        #[cfg(feature = "ownerfs")]
+        let roles = [Role::Node, Role::Meta];
+        #[cfg(not(feature = "ownerfs"))]
+        let roles = [Role::Meta];
+        for role in roles {
             let cfg = Config::resolve(role, Cli::parse_from(["afs", "--fs", "ownerfs"])).unwrap();
             assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Both);
         }
-        let cfg = Config::resolve(
-            Role::Node,
-            Cli::parse_from(["afs-node", "--fs", "dfs", "--data-mode", "auto"]),
-        )
-        .unwrap();
-        assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Both);
+        #[cfg(feature = "dfs")]
+        {
+            let cfg = Config::resolve(
+                Role::Node,
+                Cli::parse_from(["afs-node", "--fs", "dfs", "--data-mode", "auto"]),
+            )
+            .unwrap();
+            assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Both);
+        }
     }
 
+    #[cfg(feature = "dfs")]
     #[test]
     fn crc_read_default_off_respects_toml_and_cli_precedence() {
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -1770,12 +1785,19 @@ mod crc_read_default_off_tests {
 mod read_concurrency_config_tests {
     use super::*;
 
+    // FUSE task capacity is shared by both backends; use one this build compiled.
+    const BACKEND: &str = if cfg!(feature = "dfs") {
+        "dfs"
+    } else {
+        "ownerfs"
+    };
+
     #[test]
     fn read_concurrency_admission_is_independent_of_workers() {
         let cli = Cli::try_parse_from([
             "afs-node",
             "--fs",
-            "dfs",
+            BACKEND,
             "--fuse-workers",
             "32",
             "--fuse-max-tasks",
@@ -1795,7 +1817,7 @@ mod read_concurrency_config_tests {
     fn read_concurrency_default_capacity_preserves_worker_multiplier() {
         let cfg = Config::resolve(
             Role::Node,
-            Cli::parse_from(["afs-node", "--fs", "dfs", "--fuse-workers", "3"]),
+            Cli::parse_from(["afs-node", "--fs", BACKEND, "--fuse-workers", "3"]),
         )
         .unwrap();
         assert_eq!(serde_json::to_value(cfg).unwrap()["fuse_max_tasks"], 24);
@@ -1804,7 +1826,7 @@ mod read_concurrency_config_tests {
     #[test]
     fn read_concurrency_admission_rejects_zero() {
         let cli =
-            Cli::try_parse_from(["afs-node", "--fs", "dfs", "--fuse-max-tasks", "0"]).unwrap();
+            Cli::try_parse_from(["afs-node", "--fs", BACKEND, "--fuse-max-tasks", "0"]).unwrap();
         assert!(Config::resolve(Role::Node, cli).is_err());
     }
 }

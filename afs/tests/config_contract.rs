@@ -54,6 +54,7 @@ fn p2_w2_native_write_limits_use_cli_file_defaults_and_bounded_resources() {
     }
 }
 
+#[cfg(all(feature = "ownerfs", feature = "dfs"))]
 #[test]
 fn p2_w2_complete_node_examples_resolve_top_level_write_limits() {
     for (name, contents) in [
@@ -479,6 +480,7 @@ fn ownerfs_mkdir_load_balance_is_opt_in() {
     }
 }
 
+#[cfg(all(feature = "ownerfs", feature = "dfs"))]
 #[test]
 fn shipped_examples_resolve_with_mutual_tls_and_node_identity_binding() {
     let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
@@ -910,6 +912,7 @@ fn native_workspace_validates_admin_paths_and_explicit_off_override() {
     assert!(cfg.native_workspace.is_some());
 }
 
+#[cfg(feature = "ownerfs")]
 #[test]
 fn ownerfs_workspace_bind_is_default_off_and_refuses_incomplete_or_wrong_backend() {
     let cfg = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();

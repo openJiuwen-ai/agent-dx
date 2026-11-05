@@ -133,7 +133,7 @@ pub(in crate::node) use dfs_read_decode::complete_peer_disk_read_for_test;
 use dfs_read_decode::*;
 #[cfg(feature = "dfs")]
 pub(in crate::node) use dfs_read_decode::{CompletedPeerObjectProof, CompletedPeerStreamProof};
-#[cfg(test)]
+#[cfg(all(test, feature = "dfs"))]
 pub(crate) use dfs_replica_plane::replica_header;
 #[cfg(all(feature = "dfs", any(feature = "rdma", test)))]
 use dfs_replica_plane::*;
