@@ -10,7 +10,7 @@ pub(super) type PeerChannelKey = (String, u64, String, bool);
 pub struct PeerConnectionPool {
     pub(super) read_crc_mode: crate::config::DfsReadCrcMode,
     #[cfg(feature = "dfs")]
-    pub(super) read_work_metrics: Option<crate::node::read_work::ReadWorkMetrics>,
+    pub(super) read_work_metrics: Option<crate::node::metrics::work::ReadWorkMetrics>,
     pub(super) config: afs_transport::GrpcConfig,
     security: afs_transport::SecurityManager,
     capacity: usize,
@@ -62,7 +62,7 @@ impl PeerConnectionPool {
     #[cfg(feature = "dfs")]
     pub(crate) fn with_read_work_metrics(
         mut self,
-        metrics: crate::node::read_work::ReadWorkMetrics,
+        metrics: crate::node::metrics::work::ReadWorkMetrics,
     ) -> Self {
         self.read_work_metrics = Some(metrics);
         self

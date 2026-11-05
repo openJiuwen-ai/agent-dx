@@ -365,7 +365,7 @@ async fn sync_meta_call_on_an_async_worker_is_refused_and_the_async_method_runs(
 async fn native_rpc_metrics_count_real_adapter_invocations_even_on_failure() {
     let (endpoint, server) = hanging_endpoint().await;
     let registry = afs_metrics::Registry::new();
-    let metrics = crate::node::read_work::ReadWorkMetrics::register(&registry).unwrap();
+    let metrics = crate::node::metrics::work::ReadWorkMetrics::register(&registry).unwrap();
     let meta = test_meta(&endpoint, Duration::from_millis(30)).with_read_work_metrics(metrics);
     tokio::task::spawn_blocking(move || {
         use crate::node::{read::engine::ReadSourceProvider, vfs::dfs::DfsMeta};
@@ -424,7 +424,7 @@ async fn native_rpc_metrics_count_real_adapter_invocations_even_on_failure() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_read_diagnostics_cover_full_failed_meta_calls() {
-    use crate::node::read_work::{ReadDiagnosticStage, ReadWorkMetrics};
+    use crate::node::metrics::{read_timing::ReadDiagnosticStage, work::ReadWorkMetrics};
     let (endpoint, server) = hanging_endpoint().await;
     let registry = afs_metrics::Registry::new();
     let metrics = ReadWorkMetrics::register(&registry)
@@ -493,7 +493,7 @@ async fn native_read_diagnostics_cover_full_failed_meta_calls() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_write_diagnostics_cover_controls_and_keep_cached_placement_local() {
-    use crate::node::read_work::{ReadDiagnosticStage, ReadWorkMetrics};
+    use crate::node::metrics::{read_timing::ReadDiagnosticStage, work::ReadWorkMetrics};
     let (endpoint, server) = hanging_endpoint().await;
     for enabled in [false, true] {
         let registry = afs_metrics::Registry::new();

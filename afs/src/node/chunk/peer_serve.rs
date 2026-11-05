@@ -77,7 +77,7 @@ pub(super) fn peer_serve_fixed_control_bytes() -> usize {
 pub(super) struct PeerControlLease {
     budget: Arc<PeerReadBudget>,
     pub(super) bytes: u64,
-    pub(super) metrics: Option<super::super::read_work::ReadWorkMetrics>,
+    pub(super) metrics: Option<super::super::metrics::work::ReadWorkMetrics>,
 }
 
 #[cfg(any(feature = "dfs", test))]
@@ -246,7 +246,7 @@ impl Drop for PeerServeLeader<'_> {
 pub(crate) struct PeerReadReservation {
     budget: Arc<PeerReadBudget>,
     pub(super) bytes: u64,
-    pub(super) metrics: Option<super::super::read_work::ReadWorkMetrics>,
+    pub(super) metrics: Option<super::super::metrics::work::ReadWorkMetrics>,
 }
 
 #[cfg(any(feature = "dfs", test))]
@@ -306,7 +306,7 @@ fn peer_serve_unavailable(message: &str) -> Error {
 fn reserve_peer_bytes(
     budget: &PeerReadBudget,
     bytes: u64,
-    metrics: Option<&super::super::read_work::ReadWorkMetrics>,
+    metrics: Option<&super::super::metrics::work::ReadWorkMetrics>,
 ) -> Result<()> {
     let _admission = budget
         .admission
@@ -319,7 +319,7 @@ fn reserve_peer_bytes(
 fn reserve_peer_bytes_locked(
     budget: &PeerReadBudget,
     bytes: u64,
-    metrics: Option<&super::super::read_work::ReadWorkMetrics>,
+    metrics: Option<&super::super::metrics::work::ReadWorkMetrics>,
 ) -> Result<()> {
     if budget.stopped.load(Ordering::Acquire) {
         return Err(peer_serve_unavailable("Peer serve is stopped"));
@@ -331,7 +331,7 @@ fn reserve_peer_bytes_locked(
 fn charge_peer_bytes_locked(
     budget: &PeerReadBudget,
     bytes: u64,
-    metrics: Option<&super::super::read_work::ReadWorkMetrics>,
+    metrics: Option<&super::super::metrics::work::ReadWorkMetrics>,
 ) -> Result<()> {
     let mut used = budget.used.load(Ordering::Acquire);
     loop {
@@ -839,7 +839,8 @@ impl LocalChunkStore {
     ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         let (entered, observed) = std::sync::mpsc::channel();
         let (release, wait) = std::sync::mpsc::channel();
-        self.peer_fill_test_blocks
+        self.test_hooks
+            .peer_fill_test_blocks
             .lock()
             .unwrap()
             .insert(chunk_id, (entered, wait));
@@ -896,7 +897,7 @@ impl LocalChunkStore {
 
     #[cfg(any(feature = "dfs", test))]
     pub(crate) fn ensure_peer_serve_open(&self) -> Result<()> {
-        self.record_read_check(super::super::read_work::ReadCheck::ServeState);
+        self.record_read_check(super::super::metrics::work::ReadCheck::ServeState);
         let state = self
             .peer_read_cache
             .lock()
@@ -1082,7 +1083,12 @@ impl LocalChunkStore {
         let _reader = self.begin_peer_serve_read()?;
         #[cfg(test)]
         {
-            let block = self.peer_payload_test_block.lock().unwrap().take();
+            let block = self
+                .test_hooks
+                .peer_payload_test_block
+                .lock()
+                .unwrap()
+                .take();
             if let Some((entered, release)) = block {
                 entered.send(()).unwrap();
                 release.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1406,7 +1412,7 @@ impl LocalChunkStore {
         // catalog/file checks. Exact partial results remain request-private.
         #[cfg(test)]
         {
-            let block = self.peer_ready_test_block.lock().unwrap().take();
+            let block = self.test_hooks.peer_ready_test_block.lock().unwrap().take();
             if let Some((entered, release)) = block {
                 entered.send(()).unwrap();
                 release.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -1531,12 +1537,12 @@ impl LocalChunkStore {
         let read_verify = self.coarse_diagnostic("peer_read_verify", length as u64);
         let object_diagnostic = self.read_work.as_ref().and_then(|metrics| {
             metrics.object_diagnostic(
-                super::super::read_work::ReadObjectDiagnosticStage::PeerReadVerify,
+                super::super::metrics::read_timing::ReadObjectDiagnosticStage::PeerReadVerify,
                 &chunk_id.0,
             )
         });
         let mut repair_proof = None;
-        self.record_read_check(super::super::read_work::ReadCheck::CatalogFence);
+        self.record_read_check(super::super::metrics::work::ReadCheck::CatalogFence);
         let request = PeerRangeRequest {
             chunk_id,
             offset,
@@ -1643,7 +1649,12 @@ impl LocalChunkStore {
         {
             // Remove the hook under its own mutex, then wait without that
             // mutex: it must not introduce serialization of its own.
-            let block = self.peer_fill_test_blocks.lock().unwrap().remove(chunk_id);
+            let block = self
+                .test_hooks
+                .peer_fill_test_blocks
+                .lock()
+                .unwrap()
+                .remove(chunk_id);
             if let Some((entered, release)) = block {
                 entered.send(()).unwrap();
                 release.recv_timeout(Duration::from_secs(5)).unwrap();

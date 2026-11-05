@@ -196,7 +196,7 @@ path、mount ID 和 source 同时作为 readiness 身份；挂载被替换时健
 
 ## OwnerFs workspace bind ON
 
-普通发行默认关闭 workspace bind。当前实际试用场景需要显式开启，示例字段以 `build/config/examples/afs/node.toml` 为准；历史 `native_workspace` 命名只作为兼容入口，不能作为新的核心能力名称。
+普通发行默认关闭 workspace bind。当前实际试用场景需要显式开启，示例字段以 `build/config/examples/afs/node.toml` 为准。
 
 开启条件：
 
@@ -781,7 +781,7 @@ NodeReplicated DFS 默认启动每 5 秒一次的安全回收；关闭引用有�
 `META_DFS_NAMESPACE_RETRY`（POSIX `EAGAIN`），权限、非空目录等错误保持原语义。
 操作 ID 和请求摘要在内部重试中不变，已提交的删除可重放其原始结果。
 
-定位并发时可临时为 Meta 设置 `AFS_META_NAMESPACE_TRACE=1`。日志记录操作 ID、
+定位并发时可用开启 `diagnostics` feature 的 Meta（`cargo build -p afs --features diagnostics`，发行包默认不含）临时设置 `AFS_META_NAMESPACE_TRACE=1`；默认构建忽略该变量。日志记录操作 ID、
 调用节点、候选事务版本，以及修改或发生冲突的 inode 版本、head、链接数和属性；
 不记录文件内容、xattr 或凭据。`meta_namespace_applied` 只表示候选批次已应用，
 不能当成持久化成功回执。默认关闭该诊断，开启后应限制日志访问并在定位后关闭。

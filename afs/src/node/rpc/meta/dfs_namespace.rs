@@ -10,7 +10,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         name: &[u8],
     ) -> afs_error::Result<Option<crate::dfs::InodeRecord>> {
         self.read_diagnostic(
-            crate::node::read_work::ReadDiagnosticStage::MetaLookup,
+            crate::node::metrics::read_timing::ReadDiagnosticStage::MetaLookup,
             || {
                 let reply = self
                     .run(self.client().lookup(afs_protocol::meta::DfsLookupRequest {
@@ -37,7 +37,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         attributes: crate::dfs::InodeAttributes,
     ) -> afs_error::Result<(crate::dfs::InodeRecord, crate::dfs::WriteLease)> {
         self.read_diagnostic(
-            crate::node::read_work::ReadDiagnosticStage::MetaCreate,
+            crate::node::metrics::read_timing::ReadDiagnosticStage::MetaCreate,
             || {
                 let reply = self
                     .run(self.client().create(afs_protocol::meta::DfsCreateRequest {
@@ -253,7 +253,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         inode_id: &crate::dfs::InodeId,
     ) -> afs_error::Result<(crate::dfs::InodeRecord, crate::dfs::WriteLease)> {
         self.read_diagnostic(
-            crate::node::read_work::ReadDiagnosticStage::MetaOpenWrite,
+            crate::node::metrics::read_timing::ReadDiagnosticStage::MetaOpenWrite,
             || {
                 let reply = self
                     .run(
@@ -318,7 +318,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
     > {
         Box::pin(async move {
             let (diagnostic, _coarse) = self.begin_read_diagnostic(
-                crate::node::read_work::ReadDiagnosticStage::MetaResolveWriteAuthority,
+                crate::node::metrics::read_timing::ReadDiagnosticStage::MetaResolveWriteAuthority,
             );
             let result = async {
                 let reply = self
@@ -354,7 +354,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         lease: crate::dfs::WriteLease,
     ) -> afs_error::Result<crate::dfs::WriteLease> {
         self.read_diagnostic(
-            crate::node::read_work::ReadDiagnosticStage::MetaRenewWriteLease,
+            crate::node::metrics::read_timing::ReadDiagnosticStage::MetaRenewWriteLease,
             || {
                 let reply = self
                     .run(self.client().renew_write_lease(
@@ -380,7 +380,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         inode_id: &crate::dfs::InodeId,
     ) -> afs_error::Result<crate::dfs::InodeRecord> {
         self.read_diagnostic(
-            crate::node::read_work::ReadDiagnosticStage::MetaGetInode,
+            crate::node::metrics::read_timing::ReadDiagnosticStage::MetaGetInode,
             || {
                 self.record_read_rpc("get_inode");
                 let reply = self
@@ -437,7 +437,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         version_id: &crate::dfs::FileVersionId,
     ) -> afs_error::Result<(crate::dfs::FileVersion, crate::dfs::LayoutRoot)> {
         self.read_diagnostic(
-            crate::node::read_work::ReadDiagnosticStage::MetaGetFileVersion,
+            crate::node::metrics::read_timing::ReadDiagnosticStage::MetaGetFileVersion,
             || {
                 self.record_read_rpc("get_file_version");
                 let reply = self
@@ -462,7 +462,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         sync: crate::dfs::SyncInodeMetadata,
     ) -> afs_error::Result<crate::dfs::InodeRecord> {
         self.read_diagnostic(
-            crate::node::read_work::ReadDiagnosticStage::MetaSyncInodeMetadata,
+            crate::node::metrics::read_timing::ReadDiagnosticStage::MetaSyncInodeMetadata,
             || {
                 let reply = self
                     .run(
@@ -584,7 +584,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         node_id: &str,
     ) -> afs_error::Result<Option<crate::node::vfs::dfs::DfsNodeLocation>> {
         self.read_diagnostic(
-            crate::node::read_work::ReadDiagnosticStage::MetaLookupNodeLocation,
+            crate::node::metrics::read_timing::ReadDiagnosticStage::MetaLookupNodeLocation,
             || {
                 let reply =
                     self.run(self.root_client().lookup_node(

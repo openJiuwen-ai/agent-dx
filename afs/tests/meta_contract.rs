@@ -2582,7 +2582,7 @@ async fn p3_supported_commit_shapes_survive_local_log_reopen() {
     use prost::Message;
     use std::time::Duration;
 
-    // The batch count is the existing NativeWriteConfig maximum, not a new cap.
+    // The batch count is the existing WritePipelineConfig maximum, not a new cap.
     // A large layout remains a single value, independently of top-level slots.
     for (name, copies, chunks, extents) in [
         ("single-copy-batch", 1, 1024, 1024),

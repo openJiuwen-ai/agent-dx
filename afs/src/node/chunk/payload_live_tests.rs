@@ -1,16 +1,16 @@
 use super::*;
 
-fn lease(budget: &Arc<NativeWriteBudget>, bytes: usize) -> NativeWriteLease {
+fn lease(budget: &Arc<DirtyBudget>, bytes: usize) -> DirtyLease {
     match budget.try_reserve(bytes).unwrap() {
-        NativeWriteAdmission::Reserved(lease) => lease,
-        NativeWriteAdmission::Wait { .. } => panic!("test budget must have capacity"),
+        DirtyAdmission::Reserved(lease) => lease,
+        DirtyAdmission::Wait { .. } => panic!("test budget must have capacity"),
     }
 }
 
 #[test]
 fn p2_w2_native_last_slice_keeps_actual_charge_and_freeze_address() {
     let pool = WriteBufferPool::new(8192);
-    let budget = NativeWriteBudget::new(4096);
+    let budget = DirtyBudget::new(4096);
     let mut builder =
         ChunkBuilder::with_native_lease(pool.clone(), 4096, lease(&budget, 4096)).unwrap();
     builder.write_at(0, &[7; 4096]).unwrap();
@@ -29,7 +29,7 @@ fn p2_w2_native_last_slice_keeps_actual_charge_and_freeze_address() {
     assert_eq!(slow_transport.as_ref(), &[7]);
     assert!(matches!(
         budget.try_reserve(1).unwrap(),
-        NativeWriteAdmission::Wait { .. }
+        DirtyAdmission::Wait { .. }
     ));
     drop(slow_transport);
     assert_eq!(budget.snapshot().live_bytes, 0);
@@ -40,7 +40,7 @@ fn p2_w2_native_last_slice_keeps_actual_charge_and_freeze_address() {
 #[test]
 fn p2_w2_native_failed_allocation_refunds_admission_without_body_or_copy() {
     let pool = WriteBufferPool::new(0);
-    let budget = NativeWriteBudget::new(4096);
+    let budget = DirtyBudget::new(4096);
     pool.fail_next_allocation();
     let error =
         ChunkBuilder::with_native_lease(pool.clone(), 4096, lease(&budget, 4096)).unwrap_err();
@@ -59,7 +59,7 @@ fn p2_w2_native_idle_actual_capacity_is_never_borrowed_without_charge() {
     let large = ChunkBuilder::with_pool(pool.clone(), 4096).unwrap();
     let pointer = large.data_ptr();
     drop(large);
-    let small_budget = NativeWriteBudget::new(3000);
+    let small_budget = DirtyBudget::new(3000);
     let small =
         ChunkBuilder::with_native_lease(pool.clone(), 3000, lease(&small_budget, 3000)).unwrap();
     assert_eq!(small.capacity(), 3000);
@@ -69,7 +69,7 @@ fn p2_w2_native_idle_actual_capacity_is_never_borrowed_without_charge() {
     drop(small);
     let reuse_pool = WriteBufferPool::new(4096);
     drop(ChunkBuilder::with_pool(reuse_pool.clone(), 4096).unwrap());
-    let large_budget = NativeWriteBudget::new(4096);
+    let large_budget = DirtyBudget::new(4096);
     let reused =
         ChunkBuilder::with_native_lease(reuse_pool, 3000, lease(&large_budget, 4096)).unwrap();
     assert_eq!(reused.capacity(), 4096);
@@ -83,7 +83,7 @@ fn p2_w2_native_idle_actual_capacity_is_never_borrowed_without_charge() {
 #[test]
 fn p2_w2_native_stop_keeps_admitted_checkout_and_live_owner_until_last_drop() {
     let pool = WriteBufferPool::new(4096);
-    let budget = NativeWriteBudget::new(4096);
+    let budget = DirtyBudget::new(4096);
     let mut admitted = lease(&budget, 3000);
     budget.stop();
     assert_eq!(
@@ -111,7 +111,7 @@ fn p2_w2_native_stop_keeps_admitted_checkout_and_live_owner_until_last_drop() {
 
 #[test]
 fn p2_w2_native_failed_grow_keeps_original_charge_until_owner_retires() {
-    let budget = NativeWriteBudget::new(4096);
+    let budget = DirtyBudget::new(4096);
     let mut first = lease(&budget, 3000);
     let second = lease(&budget, 1096);
     assert!(!first.try_grow_to(4096).unwrap());
@@ -126,9 +126,9 @@ fn p2_w2_native_failed_grow_keeps_original_charge_until_owner_retires() {
 
 #[test]
 fn p2_w2_native_release_between_failed_admission_and_wait_is_not_lost() {
-    let budget = NativeWriteBudget::new(4096);
+    let budget = DirtyBudget::new(4096);
     let owner = lease(&budget, 4096);
-    let NativeWriteAdmission::Wait { epoch } = budget.try_reserve(1).unwrap() else {
+    let DirtyAdmission::Wait { epoch } = budget.try_reserve(1).unwrap() else {
         panic!("full ledger must return its observed epoch");
     };
     // Deterministically release before the waiter enters Condvar::wait.
@@ -149,9 +149,9 @@ fn p2_w2_native_release_between_failed_admission_and_wait_is_not_lost() {
 
 #[test]
 fn p2_w2_native_stop_wakes_waiter_without_refunding_existing_body() {
-    let budget = NativeWriteBudget::new(4096);
+    let budget = DirtyBudget::new(4096);
     let owner = lease(&budget, 4096);
-    let NativeWriteAdmission::Wait { epoch } = budget.try_reserve(1).unwrap() else {
+    let DirtyAdmission::Wait { epoch } = budget.try_reserve(1).unwrap() else {
         panic!("full ledger must wait");
     };
     let (tx, rx) = std::sync::mpsc::channel();
@@ -195,10 +195,14 @@ fn p2_w2_native_unbudgeted_ownerfs_and_existing_idle_pool_semantics_remain() {
 #[test]
 fn p2_w2_native_checkout_completes_actual_capacity_after_stop_or_releases_failure() {
     let pool = WriteBufferPool::new(0);
-    let budget = NativeWriteBudget::new(4096);
+    let budget = DirtyBudget::new(4096);
     let admitted = lease(&budget, 3000);
     budget.stop();
-    pool.state.lock().unwrap().next_allocation_capacity = Some(4096);
+    pool.state
+        .lock()
+        .unwrap()
+        .test_hooks
+        .next_allocation_capacity = Some(4096);
     let builder = ChunkBuilder::with_native_lease(pool.clone(), 3000, admitted).unwrap();
     assert_eq!(builder.capacity(), 4096);
     assert_eq!(budget.snapshot().live_bytes, 4096);
@@ -206,8 +210,12 @@ fn p2_w2_native_checkout_completes_actual_capacity_after_stop_or_releases_failur
     assert_eq!(budget.snapshot().live_bytes, 0);
     assert_eq!(pool.snapshot().live_bytes, 0);
 
-    let limited = NativeWriteBudget::new(3000);
-    pool.state.lock().unwrap().next_allocation_capacity = Some(4096);
+    let limited = DirtyBudget::new(3000);
+    pool.state
+        .lock()
+        .unwrap()
+        .test_hooks
+        .next_allocation_capacity = Some(4096);
     let error =
         ChunkBuilder::with_native_lease(pool.clone(), 3000, lease(&limited, 3000)).unwrap_err();
     assert_eq!(error.code(), afs_error::IO_CAPACITY);
@@ -219,7 +227,7 @@ fn p2_w2_native_checkout_completes_actual_capacity_after_stop_or_releases_failur
 #[test]
 fn p2_w2_native_pool_destruction_does_not_refund_a_shared_allocation() {
     let pool = WriteBufferPool::new(4096);
-    let budget = NativeWriteBudget::new(4096);
+    let budget = DirtyBudget::new(4096);
     assert_eq!(budget.snapshot().limit, 4096);
     let mut builder =
         ChunkBuilder::with_native_lease(pool.clone(), 4096, lease(&budget, 4096)).unwrap();
@@ -237,10 +245,14 @@ fn p2_w2_native_pool_destruction_does_not_refund_a_shared_allocation() {
 #[test]
 fn p2_w2_native_checkout_capacity_pressure_is_retryable_and_not_enomem() {
     let pool = WriteBufferPool::new(0);
-    let budget = NativeWriteBudget::new(4096);
+    let budget = DirtyBudget::new(4096);
     let admitted = lease(&budget, 3000);
     let other = lease(&budget, 1096);
-    pool.state.lock().unwrap().next_allocation_capacity = Some(4096);
+    pool.state
+        .lock()
+        .unwrap()
+        .test_hooks
+        .next_allocation_capacity = Some(4096);
     let error = ChunkBuilder::with_native_lease(pool.clone(), 3000, admitted).unwrap_err();
     assert_eq!(error.code(), afs_error::IO_WOULD_BLOCK);
     assert_eq!(budget.snapshot().live_bytes, 1096);
@@ -251,26 +263,30 @@ fn p2_w2_native_checkout_capacity_pressure_is_retryable_and_not_enomem() {
 }
 
 fn owner_lease(
-    budget: &Arc<NativeWriteBudget>,
-    owner: &Arc<NativeWriteOwner>,
+    budget: &Arc<DirtyBudget>,
+    owner: &Arc<DirtyOwner>,
     bytes: usize,
     owner_limit: usize,
-) -> NativeWriteLease {
+) -> DirtyLease {
     match budget
         .try_reserve_for(owner.clone(), bytes, owner_limit)
         .unwrap()
     {
-        NativeWriteAdmission::Reserved(lease) => lease,
-        NativeWriteAdmission::Wait { .. } => panic!("owner test requires available capacity"),
+        DirtyAdmission::Reserved(lease) => lease,
+        DirtyAdmission::Wait { .. } => panic!("owner test requires available capacity"),
     }
 }
 
 #[test]
 fn p2_w2_native_inode_charge_follows_last_shared_slice_and_actual_capacity() {
-    let budget = NativeWriteBudget::new(8192);
-    let owner = NativeWriteOwner::new();
+    let budget = DirtyBudget::new(8192);
+    let owner = DirtyOwner::new();
     let pool = WriteBufferPool::new(4096);
-    pool.state.lock().unwrap().next_allocation_capacity = Some(4096);
+    pool.state
+        .lock()
+        .unwrap()
+        .test_hooks
+        .next_allocation_capacity = Some(4096);
     let mut builder = ChunkBuilder::with_native_lease(
         pool.clone(),
         3000,
@@ -287,7 +303,7 @@ fn p2_w2_native_inode_charge_follows_last_shared_slice_and_actual_capacity() {
     assert_eq!(owner.snapshot().live_bytes, 4096);
     assert!(matches!(
         budget.try_reserve_for(owner.clone(), 1, 4096).unwrap(),
-        NativeWriteAdmission::Wait { .. }
+        DirtyAdmission::Wait { .. }
     ));
     drop(last);
     assert_eq!(owner.snapshot().live_bytes, 0);
@@ -297,23 +313,21 @@ fn p2_w2_native_inode_charge_follows_last_shared_slice_and_actual_capacity() {
 
 #[test]
 fn p2_w2_native_inode_cap_and_node_cap_are_checked_without_cross_owner_refund() {
-    let budget = NativeWriteBudget::new(8192);
-    let first = NativeWriteOwner::new();
-    let second = NativeWriteOwner::new();
+    let budget = DirtyBudget::new(8192);
+    let first = DirtyOwner::new();
+    let second = DirtyOwner::new();
     let mut a = owner_lease(&budget, &first, 3000, 4096);
     let b = owner_lease(&budget, &second, 4096, 4096);
     assert!(matches!(
         budget.try_reserve_for(first.clone(), 1097, 4096).unwrap(),
-        NativeWriteAdmission::Wait { .. }
+        DirtyAdmission::Wait { .. }
     ));
     assert!(a.try_grow_to(4096).unwrap());
     assert_eq!(first.snapshot().live_bytes, 4096);
     assert_eq!(second.snapshot().live_bytes, 4096);
     assert!(matches!(
-        budget
-            .try_reserve_for(NativeWriteOwner::new(), 1, 4096)
-            .unwrap(),
-        NativeWriteAdmission::Wait { .. }
+        budget.try_reserve_for(DirtyOwner::new(), 1, 4096).unwrap(),
+        DirtyAdmission::Wait { .. }
     ));
     assert_eq!(budget.snapshot().live_bytes, 8192);
     drop(a);
@@ -326,12 +340,16 @@ fn p2_w2_native_inode_cap_and_node_cap_are_checked_without_cross_owner_refund() 
 
 #[test]
 fn p2_w2_native_owner_cap_grow_failure_preserves_both_ledgers() {
-    let budget = NativeWriteBudget::new(8192);
-    let owner = NativeWriteOwner::new();
+    let budget = DirtyBudget::new(8192);
+    let owner = DirtyOwner::new();
     let first = owner_lease(&budget, &owner, 3000, 4096);
     let second = owner_lease(&budget, &owner, 1096, 4096);
     let pool = WriteBufferPool::new(0);
-    pool.state.lock().unwrap().next_allocation_capacity = Some(4096);
+    pool.state
+        .lock()
+        .unwrap()
+        .test_hooks
+        .next_allocation_capacity = Some(4096);
     let error = ChunkBuilder::with_native_lease(pool, 3000, first).unwrap_err();
     assert_eq!(error.code(), afs_error::IO_WOULD_BLOCK);
     assert_eq!(budget.snapshot().live_bytes, 1096);
@@ -345,8 +363,8 @@ fn p2_w2_native_owner_cap_grow_failure_preserves_both_ledgers() {
 fn p2_w2_native_inode_idle_reuse_refunds_only_spare_admission() {
     let pool = WriteBufferPool::new(4096);
     drop(ChunkBuilder::with_pool(pool.clone(), 3000).unwrap());
-    let budget = NativeWriteBudget::new(4096);
-    let owner = NativeWriteOwner::new();
+    let budget = DirtyBudget::new(4096);
+    let owner = DirtyOwner::new();
     let builder = ChunkBuilder::with_native_lease(
         pool.clone(),
         3000,
@@ -367,11 +385,15 @@ fn p2_w2_native_inode_idle_reuse_refunds_only_spare_admission() {
 #[test]
 fn p2_w2_native_inode_accepted_capacity_completion_survives_stop() {
     let pool = WriteBufferPool::new(0);
-    let budget = NativeWriteBudget::new(4096);
-    let owner = NativeWriteOwner::new();
+    let budget = DirtyBudget::new(4096);
+    let owner = DirtyOwner::new();
     let admitted = owner_lease(&budget, &owner, 3000, 4096);
     budget.stop();
-    pool.state.lock().unwrap().next_allocation_capacity = Some(4096);
+    pool.state
+        .lock()
+        .unwrap()
+        .test_hooks
+        .next_allocation_capacity = Some(4096);
     let builder = ChunkBuilder::with_native_lease(pool.clone(), 3000, admitted).unwrap();
     assert_eq!(owner.snapshot().live_bytes, 4096);
     assert_eq!(budget.snapshot().live_bytes, 4096);
@@ -399,7 +421,7 @@ fn p2_w2_native_default_receipts_never_claim_required_local_release() {
         16 * 1024
     );
     let receipts = store
-        .put_chunks(vec![staged.clone()], PutIntent::NativeUpload)
+        .put_chunks(vec![staged.clone()], PutIntent::PipelineUpload)
         .unwrap();
     assert_eq!(receipts.len(), 1);
     assert_eq!(receipts[0].receipt.chunk, staged.chunk);

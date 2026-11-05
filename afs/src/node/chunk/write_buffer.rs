@@ -30,8 +30,13 @@ pub(super) struct WriteBufferPoolState {
     stopped: bool,
     pub(super) metrics: Option<WriteBufferPoolMetrics>,
     #[cfg(test)]
-    fail_next_allocation: bool,
-    #[cfg(test)]
+    pub(super) test_hooks: WriteBufferPoolTestHooks,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(super) struct WriteBufferPoolTestHooks {
+    pub(super) fail_next_allocation: bool,
     pub(super) next_allocation_capacity: Option<usize>,
 }
 
@@ -265,7 +270,7 @@ impl WriteBufferPool {
     fn checkout_with_native_lease(
         self: &Arc<Self>,
         capacity: usize,
-        #[cfg(any(feature = "dfs", test))] mut native_live_lease: Option<NativeWriteLease>,
+        #[cfg(any(feature = "dfs", test))] mut native_live_lease: Option<DirtyLease>,
     ) -> Result<ChunkBuffer> {
         #[cfg(any(feature = "dfs", test))]
         if native_live_lease
@@ -339,7 +344,7 @@ impl WriteBufferPool {
                 });
             }
             #[cfg(test)]
-            if std::mem::take(&mut state.fail_next_allocation) {
+            if std::mem::take(&mut state.test_hooks.fail_next_allocation) {
                 return Err(write_allocation_error());
             }
         }
@@ -351,6 +356,7 @@ impl WriteBufferPool {
             .state
             .lock()
             .map_err(|_| invalid("write buffer pool is poisoned"))?
+            .test_hooks
             .next_allocation_capacity
             .take()
             .unwrap_or(capacity);
@@ -411,7 +417,7 @@ impl WriteBufferPool {
 
     #[cfg(test)]
     pub(in crate::node) fn fail_next_allocation(&self) {
-        self.state.lock().unwrap().fail_next_allocation = true;
+        self.state.lock().unwrap().test_hooks.fail_next_allocation = true;
     }
 }
 
@@ -423,7 +429,7 @@ pub(super) struct ChunkBuffer {
     // Drops after the body is returned to idle or really freed in Drop. Every
     // SharedChunkBytes slice keeps this same single allocation owner alive.
     #[cfg(any(feature = "dfs", test))]
-    native_live_lease: Option<NativeWriteLease>,
+    native_live_lease: Option<DirtyLease>,
 }
 
 impl ChunkBuffer {
@@ -630,7 +636,7 @@ impl ChunkBuilder {
     pub(crate) fn with_native_lease(
         pool: Arc<WriteBufferPool>,
         capacity: usize,
-        lease: NativeWriteLease,
+        lease: DirtyLease,
     ) -> Result<Self> {
         Ok(Self {
             buffer: pool.checkout_with_native_lease(capacity, Some(lease))?,

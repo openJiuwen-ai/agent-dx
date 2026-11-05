@@ -1,6 +1,6 @@
 //! Initialized storage is recycled only after its final owner. Native async
 //! pools charge both idle and borrowed capacity to the same fixed byte limit.
-use super::super::read_work::ReadWorkMetrics;
+use super::super::metrics::work::ReadWorkMetrics;
 use afs_error::{Error, Result};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};

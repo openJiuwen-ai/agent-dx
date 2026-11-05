@@ -69,7 +69,7 @@ pub struct DiskPeerCache {
     pub(super) changed: Condvar,
     pub(super) asynchronous_change: tokio::sync::Notify,
     pub(super) max_flights: usize,
-    pub(super) read_work: Option<crate::node::read_work::ReadWorkMetrics>,
+    pub(super) read_work: Option<crate::node::metrics::work::ReadWorkMetrics>,
     pub(super) proof_budget: Arc<OutboardBudget>,
 }
 
@@ -101,12 +101,15 @@ pub(super) struct CacheState {
     pub(super) flight_metadata_bytes: usize,
     pub(super) stats: PeerCacheStats,
     #[cfg(test)]
+    pub(super) test_hooks: CacheStateTestHooks,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(super) struct CacheStateTestHooks {
     pub(super) fail_remove: bool,
-    #[cfg(test)]
     pub(super) fail_stream_write: bool,
-    #[cfg(test)]
     pub(super) fail_stream_metadata: bool,
-    #[cfg(test)]
     pub(super) proof_limit: Option<u64>,
 }
 
@@ -260,13 +263,7 @@ impl CacheState {
             flight_metadata_bytes: 0,
             stats: PeerCacheStats::default(),
             #[cfg(test)]
-            fail_remove: false,
-            #[cfg(test)]
-            fail_stream_write: false,
-            #[cfg(test)]
-            fail_stream_metadata: false,
-            #[cfg(test)]
-            proof_limit: None,
+            test_hooks: CacheStateTestHooks::default(),
         }
     }
 
@@ -301,13 +298,7 @@ impl CacheState {
             flight_metadata_bytes: 0,
             stats: PeerCacheStats::default(),
             #[cfg(test)]
-            fail_remove: false,
-            #[cfg(test)]
-            fail_stream_write: false,
-            #[cfg(test)]
-            fail_stream_metadata: false,
-            #[cfg(test)]
-            proof_limit: None,
+            test_hooks: CacheStateTestHooks::default(),
         }
     }
 }

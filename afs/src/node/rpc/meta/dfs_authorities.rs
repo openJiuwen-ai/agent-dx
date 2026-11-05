@@ -26,7 +26,7 @@ impl crate::node::replication::PlacementProvider for GrpcDfsMeta {
         minimum_revision: u64,
     ) -> afs_error::Result<Arc<crate::dfs::PlacementSnapshot>> {
         self.read_diagnostic(
-            crate::node::read_work::ReadDiagnosticStage::MetaPlacementSnapshot,
+            crate::node::metrics::read_timing::ReadDiagnosticStage::MetaPlacementSnapshot,
             || {
                 let reply = self
                     .run(self.client().get_placement_snapshot(
@@ -121,7 +121,7 @@ impl crate::node::read::engine::ReadSourceProvider for GrpcDfsMeta {
         request: crate::dfs::DfsChunkSourcesRequest,
     ) -> afs_error::Result<crate::dfs::DfsChunkSourcesReply> {
         self.read_diagnostic(
-            crate::node::read_work::ReadDiagnosticStage::MetaGetChunkSources,
+            crate::node::metrics::read_timing::ReadDiagnosticStage::MetaGetChunkSources,
             || {
                 self.record_read_rpc("get_chunk_sources");
                 let reply = self

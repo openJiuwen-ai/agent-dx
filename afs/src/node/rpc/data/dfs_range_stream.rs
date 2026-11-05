@@ -78,8 +78,8 @@ pub(super) fn stream_dfs_ranges_until(
         if sender.is_closed() {
             return Ok(());
         }
-        let diagnostic =
-            local.read_diagnostic(crate::node::read_work::ReadDiagnosticStage::PeerServe);
+        let diagnostic = local
+            .read_diagnostic(crate::node::metrics::read_timing::ReadDiagnosticStage::PeerServe);
         let diagnostic_token = diagnostic.as_ref().map(|span| span.token());
         if let Some(table) = local
             .peer_crc32c_table(&crate::dfs::ChunkId::new(op.chunk_id.clone()))
@@ -189,10 +189,10 @@ fn stream_crc32c_op(
         drop(crc_scope);
         Some(checksum)
     };
-    local.record_read_check(crate::node::read_work::ReadCheck::DescriptorEncode);
+    local.record_read_check(crate::node::metrics::work::ReadCheck::DescriptorEncode);
     let descriptor =
         serde_json::to_vec(&table).map_err(|error| Status::internal(error.to_string()))?;
-    local.record_read_check(crate::node::read_work::ReadCheck::RequestValidate);
+    local.record_read_check(crate::node::metrics::work::ReadCheck::RequestValidate);
     validate_dfs_read_request(request)?;
     local.ensure_peer_serve_open().map_err(error_to_status)?;
     send(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {
@@ -208,7 +208,7 @@ fn stream_crc32c_op(
     }))?;
     let body = verified.into_shared_bytes();
     for start in (0..body.len()).step_by(DFS_REPLICA_FRAME_BYTES) {
-        local.record_read_check(crate::node::read_work::ReadCheck::RequestValidate);
+        local.record_read_check(crate::node::metrics::work::ReadCheck::RequestValidate);
         validate_dfs_read_request(request)?;
         local.ensure_peer_serve_open().map_err(error_to_status)?;
         let data = body.slice(start..(start + DFS_REPLICA_FRAME_BYTES).min(body.len()));
@@ -250,7 +250,7 @@ fn stream_grouped_op(
     stream: &RangeStream<'_>,
     op: &afs_protocol::node_data::DfsChunkReadOp,
     mut groups: crate::node::chunk::PeerGroupReader<'_>,
-    diagnostic_token: Option<&crate::node::read_work::ReadDiagnosticToken>,
+    diagnostic_token: Option<&crate::node::metrics::read_timing::ReadDiagnosticToken>,
 ) -> Result<(), Status> {
     let RangeStream {
         local,
@@ -323,7 +323,7 @@ fn stream_grouped_op(
 fn stream_verified_op(
     stream: &RangeStream<'_>,
     op: &afs_protocol::node_data::DfsChunkReadOp,
-    diagnostic_token: Option<&crate::node::read_work::ReadDiagnosticToken>,
+    diagnostic_token: Option<&crate::node::metrics::read_timing::ReadDiagnosticToken>,
 ) -> Result<RangeSent, Status> {
     let RangeStream {
         local,
@@ -370,7 +370,7 @@ fn stream_verified_op(
     let verified = verified.into_shared_bytes();
     // A fill follower can wait behind I/O. Content sharing never renews the
     // caller's grant or bypasses a known Node stop; no new Meta RPC here.
-    local.record_read_check(crate::node::read_work::ReadCheck::RequestValidate);
+    local.record_read_check(crate::node::metrics::work::ReadCheck::RequestValidate);
     validate_dfs_read_request(request)?;
     local.ensure_peer_serve_open().map_err(error_to_status)?;
     send(dfs_read_ranges_frame::Body::Header(DfsReadRangesHeader {

@@ -1,7 +1,7 @@
 //! Controlled USRBIO-only benchmark. RAM implementation shared with entrance_probe.
 use afs::node::{
     api::local::{LocalApiOptions, serve_local_api_with_options},
-    storage::Storage,
+    diagnostics::DiagnosticStorage,
     vfs::{Backend, types::*},
 };
 use afs_client::{DfsAccess, DfsLocalClient, DfsLocalClientConfig, DfsSyncMode};
@@ -319,7 +319,7 @@ async fn main() -> Result<(), Any> {
         fs::create_dir_all(root)?;
         let backend = Arc::new(Mem::new(n, false, false));
         let api = serve_local_api_with_options(
-            Storage::new(root.join("diag"))?,
+            DiagnosticStorage::new(root.join("diag"))?,
             root.join("node.sock"),
             LocalApiOptions {
                 metrics_registry: None,

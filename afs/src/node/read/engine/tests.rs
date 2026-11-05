@@ -205,7 +205,7 @@ fn read_equivalence_bounded_reply_pool_reuses_a_concurrent_working_set() {
     }
     let temp = tempfile::tempdir().unwrap();
     let registry = afs_metrics::Registry::new();
-    let metrics = crate::node::read_work::ReadWorkMetrics::register(&registry).unwrap();
+    let metrics = crate::node::metrics::work::ReadWorkMetrics::register(&registry).unwrap();
     let engine = DfsReadEngine::new(
         crate::dfs::NamespaceId::new("default"),
         "node-a".into(),
@@ -1292,7 +1292,7 @@ fn p2_r1_source_deadline_consumes_rpc_time_and_hits_do_not_renew_it() {
 fn p2_r1_source_cache_capacity_and_metrics_follow_real_retained_metadata() {
     let temp = tempfile::tempdir().unwrap();
     let registry = afs_metrics::Registry::new();
-    let metrics = crate::node::read_work::ReadWorkMetrics::register(&registry).unwrap();
+    let metrics = crate::node::metrics::work::ReadWorkMetrics::register(&registry).unwrap();
     let local = Arc::new(
         LocalChunkStore::open(temp.path(), "node-a")
             .unwrap()
@@ -1672,8 +1672,11 @@ fn reader_cache_concurrent_misses_return_one_canonical_pin() {
         Arc::new(UnimplementedChunkTransfer),
         DfsReadConfig::default(),
     );
-    *engine.local_reader_install_barrier.lock().unwrap() =
-        Some(Arc::new(std::sync::Barrier::new(READERS)));
+    *engine
+        .test_hooks
+        .local_reader_install_barrier
+        .lock()
+        .unwrap() = Some(Arc::new(std::sync::Barrier::new(READERS)));
     let pins = std::thread::scope(|scope| {
         let threads = (0..READERS)
             .map(|_| scope.spawn(|| engine.local_reader(&chunk).unwrap()))
@@ -3091,7 +3094,12 @@ fn native_peer_disk_cache_follower_ready_io_failure_falls_back_without_deleting_
     });
     let (recheck_entered_tx, recheck_entered_rx) = std::sync::mpsc::channel();
     let (recheck_release_tx, recheck_release_rx) = std::sync::mpsc::channel();
-    *fixture.engine.peer_cache_recheck_hook.lock().unwrap() = Some(PeerCacheRecheckHook {
+    *fixture
+        .engine
+        .test_hooks
+        .peer_cache_recheck_hook
+        .lock()
+        .unwrap() = Some(PeerCacheRecheckHook {
         stage: "follower_ready",
         entered: recheck_entered_tx,
         release: recheck_release_rx,
@@ -3141,7 +3149,12 @@ fn native_peer_disk_cache_leader_recheck_io_failure_falls_back_without_deleting_
     blocker.acquire_fill(|| Ok(())).unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    *fixture.engine.peer_cache_recheck_hook.lock().unwrap() = Some(PeerCacheRecheckHook {
+    *fixture
+        .engine
+        .test_hooks
+        .peer_cache_recheck_hook
+        .lock()
+        .unwrap() = Some(PeerCacheRecheckHook {
         stage: "leader_recheck",
         entered: entered_tx,
         release: release_rx,
@@ -3450,7 +3463,7 @@ fn r7_prefetch_busy_source_lock_skips_without_queue_or_rpc() {
     fixture.engine.config.readahead_max_bytes = 4 * 1024 * 1024;
     fixture.engine.sources_for(&fixture.batch).unwrap();
     let registry = afs_metrics::Registry::new();
-    let metrics = crate::node::read_work::ReadWorkMetrics::register(&registry).unwrap();
+    let metrics = crate::node::metrics::work::ReadWorkMetrics::register(&registry).unwrap();
     fixture.engine.fetcher = super::super::object_fetch::ObjectFetcher::new(
         runtime.handle().clone(),
         fixture.cache.proof_budget(),
@@ -4884,7 +4897,7 @@ fn native_verified_object_late_node_stop_rejects_proof_before_admission() {
 
 struct NativeObservedVerificationTransfer {
     inner: Arc<NativeCacheTransfer>,
-    metrics: crate::node::read_work::ReadWorkMetrics,
+    metrics: crate::node::metrics::work::ReadWorkMetrics,
 }
 
 impl ChunkTransfer for NativeObservedVerificationTransfer {
@@ -4892,7 +4905,7 @@ impl ChunkTransfer for NativeObservedVerificationTransfer {
         self.inner.read_ranges(batch, out)
     }
 
-    fn verification_metrics(&self) -> Option<&crate::node::read_work::ReadWorkMetrics> {
+    fn verification_metrics(&self) -> Option<&crate::node::metrics::work::ReadWorkMetrics> {
         Some(&self.metrics)
     }
 }
@@ -4909,7 +4922,7 @@ fn native_verified_object_fallback_counts_root_failure_without_unperformed_segme
         let registry = afs_metrics::Registry::new();
         let transfer = NativeObservedVerificationTransfer {
             inner: fixture.transfer.clone(),
-            metrics: crate::node::read_work::ReadWorkMetrics::register(&registry).unwrap(),
+            metrics: crate::node::metrics::work::ReadWorkMetrics::register(&registry).unwrap(),
         };
         let batch = PeerReadBatch {
             file_version_id: FileVersionId::new("version"),
@@ -4967,7 +4980,7 @@ fn native_peer_cache_fill_stage_metrics_exclude_hits_and_retain_failed_receive()
         let mut fixture =
             NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
         let registry = afs_metrics::Registry::new();
-        let metrics = crate::node::read_work::ReadWorkMetrics::register(&registry).unwrap();
+        let metrics = crate::node::metrics::work::ReadWorkMetrics::register(&registry).unwrap();
         fixture.engine.local = Arc::new(
             LocalChunkStore::open(fixture._temp.path().join("timing-local"), "node-a")
                 .unwrap()

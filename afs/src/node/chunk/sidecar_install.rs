@@ -39,7 +39,7 @@ pub(super) struct SidecarInstaller {
     pub(super) queue: Arc<SidecarInstallQueue>,
     pub(super) worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     joining: Mutex<()>,
-    pub(super) metrics: Option<super::super::read_work::ReadWorkMetrics>,
+    pub(super) metrics: Option<super::super::metrics::work::ReadWorkMetrics>,
 }
 
 #[derive(Clone, Debug)]
@@ -47,7 +47,7 @@ struct SidecarInstallContext {
     directory: PathBuf,
     repairs: Arc<OutboardRepairGates>,
     budget: Arc<OutboardBudget>,
-    pub(super) metrics: Option<super::super::read_work::ReadWorkMetrics>,
+    pub(super) metrics: Option<super::super::metrics::work::ReadWorkMetrics>,
     #[cfg(test)]
     test: Arc<SidecarInstallTestControl>,
 }
@@ -213,6 +213,7 @@ impl SidecarInstaller {
         if worker.is_none() && state.deadline.is_none() {
             #[cfg(test)]
             if store
+                .test_hooks
                 .sidecar_install_test
                 .fail_worker_start
                 .swap(false, Ordering::Relaxed)
@@ -256,7 +257,7 @@ impl SidecarInstaller {
                 budget: store.outboard_budget.clone(),
                 metrics: store.read_work.clone(),
                 #[cfg(test)]
-                test: store.sidecar_install_test.clone(),
+                test: store.test_hooks.sidecar_install_test.clone(),
             };
             let queue = self.queue.clone();
             let limit = self.limit;

@@ -8,7 +8,7 @@ use std::{
 use afs_error::{Error, Result};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct NativeWriteBudgetSnapshot {
+pub(crate) struct DirtyBudgetSnapshot {
     pub(crate) limit: usize,
     pub(crate) live_bytes: usize,
     pub(crate) live_peak_bytes: usize,
@@ -20,25 +20,25 @@ pub(crate) struct NativeWriteBudgetSnapshot {
 
 /// Failed admission carries the epoch observed under the same ledger lock.
 #[derive(Debug)]
-pub(crate) enum NativeWriteAdmission {
-    Reserved(NativeWriteLease),
+pub(crate) enum DirtyAdmission {
+    Reserved(DirtyLease),
     Wait { epoch: u64 },
 }
 
 #[derive(Debug)]
-pub(crate) struct NativeWriteBudget {
+pub(crate) struct DirtyBudget {
     limit: usize,
-    state: Mutex<NativeWriteBudgetSnapshot>,
+    state: Mutex<DirtyBudgetSnapshot>,
     changed: Condvar,
 }
 
-impl NativeWriteBudget {
+impl DirtyBudget {
     pub(crate) fn new(limit: usize) -> Arc<Self> {
         Arc::new(Self {
             limit,
-            state: Mutex::new(NativeWriteBudgetSnapshot {
+            state: Mutex::new(DirtyBudgetSnapshot {
                 limit,
-                ..NativeWriteBudgetSnapshot::default()
+                ..DirtyBudgetSnapshot::default()
             }),
             changed: Condvar::new(),
         })
@@ -47,16 +47,16 @@ impl NativeWriteBudget {
     /// Unowned admission is retained for isolated allocation-owner tests. Native
     /// VFS writes use try_reserve_for so the same final owner charges both caps.
     #[cfg(test)]
-    pub(crate) fn try_reserve(self: &Arc<Self>, bytes: usize) -> Result<NativeWriteAdmission> {
+    pub(crate) fn try_reserve(self: &Arc<Self>, bytes: usize) -> Result<DirtyAdmission> {
         self.reserve(None, bytes, usize::MAX)
     }
 
     pub(crate) fn try_reserve_for(
         self: &Arc<Self>,
-        owner: Arc<NativeWriteOwner>,
+        owner: Arc<DirtyOwner>,
         bytes: usize,
         owner_limit: usize,
-    ) -> Result<NativeWriteAdmission> {
+    ) -> Result<DirtyAdmission> {
         self.reserve(Some(owner), bytes, owner_limit)
     }
 
@@ -64,10 +64,10 @@ impl NativeWriteBudget {
     // never acquire the Node ledger; no map or caller-supplied inode key exists.
     fn reserve(
         self: &Arc<Self>,
-        owner: Option<Arc<NativeWriteOwner>>,
+        owner: Option<Arc<DirtyOwner>>,
         bytes: usize,
         owner_limit: usize,
-    ) -> Result<NativeWriteAdmission> {
+    ) -> Result<DirtyAdmission> {
         let mut state = self
             .state
             .lock()
@@ -95,7 +95,7 @@ impl NativeWriteBudget {
                 .as_ref()
                 .is_some_and(|owner| bytes > owner_limit.saturating_sub(owner.live_bytes))
         {
-            return Ok(NativeWriteAdmission::Wait { epoch: state.epoch });
+            return Ok(DirtyAdmission::Wait { epoch: state.epoch });
         }
         state.live_bytes += bytes;
         state.live_peak_bytes = state.live_peak_bytes.max(state.live_bytes);
@@ -105,7 +105,7 @@ impl NativeWriteBudget {
             owner.live_peak_bytes = owner.live_peak_bytes.max(owner.live_bytes);
         }
         drop(owner_state);
-        Ok(NativeWriteAdmission::Reserved(NativeWriteLease {
+        Ok(DirtyAdmission::Reserved(DirtyLease {
             budget: self.clone(),
             owner,
             owner_limit,
@@ -113,7 +113,7 @@ impl NativeWriteBudget {
         }))
     }
 
-    pub(crate) fn snapshot(&self) -> NativeWriteBudgetSnapshot {
+    pub(crate) fn snapshot(&self) -> DirtyBudgetSnapshot {
         *self
             .state
             .lock()
@@ -127,7 +127,7 @@ impl NativeWriteBudget {
         &self,
         epoch: u64,
         maximum_wait: Duration,
-    ) -> NativeWriteBudgetSnapshot {
+    ) -> DirtyBudgetSnapshot {
         let deadline = Instant::now().checked_add(maximum_wait);
         let mut state = self
             .state
@@ -166,23 +166,23 @@ impl NativeWriteBudget {
 /// Shared only by VFS state for one inode. Its lifetime and small metadata are
 /// part of the VFS descriptor ledger, not a new Node-global inode index.
 #[derive(Debug, Default)]
-pub(crate) struct NativeWriteOwner {
-    state: Mutex<NativeWriteOwnerSnapshot>,
+pub(crate) struct DirtyOwner {
+    state: Mutex<DirtyOwnerSnapshot>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct NativeWriteOwnerSnapshot {
+pub(crate) struct DirtyOwnerSnapshot {
     pub(crate) live_bytes: usize,
     pub(crate) live_peak_bytes: usize,
 }
 
-impl NativeWriteOwner {
+impl DirtyOwner {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
     #[cfg(test)]
-    pub(crate) fn snapshot(&self) -> NativeWriteOwnerSnapshot {
+    pub(crate) fn snapshot(&self) -> DirtyOwnerSnapshot {
         *self
             .state
             .lock()
@@ -193,14 +193,14 @@ impl NativeWriteOwner {
 /// Not Clone: this single charge moves into the final ChunkBuffer. Immutable
 /// shared slices retain that buffer's Arc rather than duplicating this lease.
 #[derive(Debug)]
-pub(crate) struct NativeWriteLease {
-    budget: Arc<NativeWriteBudget>,
-    owner: Option<Arc<NativeWriteOwner>>,
+pub(crate) struct DirtyLease {
+    budget: Arc<DirtyBudget>,
+    owner: Option<Arc<DirtyOwner>>,
     owner_limit: usize,
     bytes: usize,
 }
 
-impl NativeWriteLease {
+impl DirtyLease {
     pub(crate) fn charged_bytes(&self) -> usize {
         self.bytes
     }
@@ -270,7 +270,7 @@ impl NativeWriteLease {
     }
 }
 
-impl Drop for NativeWriteLease {
+impl Drop for DirtyLease {
     fn drop(&mut self) {
         let mut state = self
             .budget

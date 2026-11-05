@@ -1086,7 +1086,7 @@ async fn real_grpc_unknown_file_commit_ack_blocks_inode_and_replays_exact_reques
         Duration::from_secs(2),
     )
     .await;
-    let mut fs_a = Arc::new(fs_a_raw);
+    let fs_a = Arc::new(fs_a_raw);
 
     let created_a = {
         let fs = fs_a.clone();
@@ -1105,14 +1105,6 @@ async fn real_grpc_unknown_file_commit_ack_blocks_inode_and_replays_exact_reques
     let inode_backend_a = created_a.entry.inode;
     let handle_a = created_a.handle;
     let inode_a = fs_a.inode_id(inode_backend_a).unwrap();
-    let trace_output = _temp.path().join("real-meta-pending-trace.jsonl");
-    Arc::get_mut(&mut fs_a).unwrap().commit.pending_trace = Some(PendingTrace::test_gate(
-        &trace_output,
-        "default",
-        "node-a",
-        "session-a",
-        &inode_a.0,
-    ));
     {
         let fs = fs_a.clone();
         run_blocking(move || fs.write(&context(), handle_a, 0, b"alpha"))
@@ -1150,20 +1142,6 @@ async fn real_grpc_unknown_file_commit_ack_blocks_inode_and_replays_exact_reques
     gate.wait_first_committed(Duration::from_secs(1)).await;
 
     let (pending, blocked_before_replay) = pending_file_commit_snapshot(&fs_a, &inode_a);
-    let trace_rows: Vec<serde_json::Value> = std::fs::read_to_string(&trace_output)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str(line).unwrap())
-        .collect();
-    assert_eq!(trace_rows[1]["event"], "dfs_pending_commit_first_send");
-    assert_eq!(
-        trace_rows[2]["event"],
-        "dfs_pending_commit_unknown_retained"
-    );
-    assert_eq!(
-        trace_rows[1]["request_digest"],
-        trace_rows[2]["request_digest"]
-    );
     assert_eq!(chunks_a.put_batch_count(), 1);
     assert_eq!(pending.frozen.through_seq, 1);
     assert_eq!(pending.frozen.logical_length, 5);
@@ -1217,51 +1195,14 @@ async fn real_grpc_unknown_file_commit_ack_blocks_inode_and_replays_exact_reques
         .expect("commit outcome must be durable before reply release");
     assert_eq!(outcome.operation, StoreOperation::DfsCommitFileVersion);
     match outcome.result.clone() {
-        OperationResult::DfsNamespace {
-            request_digest,
-            result,
-        } if trace_rows[2]["request_digest"]
-            == request_digest
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>()
-            && matches!(
+        OperationResult::DfsNamespace { result, .. }
+            if matches!(
                 result.as_ref(),
                 OperationResult::DfsInode(inode)
                     if inode.head_version == Some(pending.batch.commit.file_version.id.clone())
             ) => {}
         other => panic!("unexpected commit outcome: {other:?}"),
     }
-    // Optional immutable test export. This fixture deliberately has no
-    // installed-process identity and cannot qualify installed acceptance.
-    let trace_fixture =
-        std::env::var_os("AFS_DFS_PENDING_TRACE_FIXTURE_DIR").map(std::path::PathBuf::from);
-    if let Some(directory) = &trace_fixture {
-        use crate::meta::store::MetaLog;
-        std::fs::create_dir(directory).unwrap();
-        std::fs::copy(&trace_output, directory.join("trace-unknown.jsonl")).unwrap();
-        std::fs::write(
-            directory.join("commit-request.json"),
-            serde_json::to_vec(pending.batch.commit.as_ref()).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(
-            directory.join("meta-outcome.json"),
-            serde_json::to_vec(&outcome).unwrap(),
-        )
-        .unwrap();
-        let recovered = _backend.recover().await.unwrap();
-        let revision = recovered.tip.sequence;
-        std::fs::write(
-            directory.join("meta-log-records.json"),
-            serde_json::to_vec(&recovered.records).unwrap(),
-        )
-        .unwrap();
-        std::fs::write(directory.join("scope.json"), serde_json::to_vec(&serde_json::json!({"status":"HARNESS_ONLY",
-                "test_fixture":true,"backend":"memory","backend_revision":revision,"installed_fault":"NOT_RUN",
-                "reason":"actual Rust emit and Meta outcome; header lacks installed process identity"})).unwrap()).unwrap();
-    }
-
     let replay = {
         let fs = fs_a.clone();
         tokio::task::spawn_blocking(move || fs.fsync(&context(), handle_a, SyncMode::Full))
@@ -1383,9 +1324,6 @@ async fn real_grpc_unknown_file_commit_ack_blocks_inode_and_replays_exact_reques
         .unwrap()
         .unwrap()
         .unwrap();
-    if let Some(directory) = &trace_fixture {
-        std::fs::copy(&trace_output, directory.join("trace-after-replay.jsonl")).unwrap();
-    }
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(2), blocked_write)
             .await

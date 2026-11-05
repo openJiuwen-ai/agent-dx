@@ -21,8 +21,8 @@ pub(super) struct DfsFileHandle {
 }
 
 pub(super) struct DfsHandle {
-    pub(super) native_prefetch:
-        std::sync::OnceLock<Arc<crate::node::read::native_prefetch::Controller>>,
+    pub(super) direct_prefetch:
+        std::sync::OnceLock<Arc<crate::node::read::direct_prefetch::Controller>>,
     _gc_pin: Option<Arc<crate::node::gc::GcPin>>,
     pub(super) inode_id: InodeId,
     pub(super) flags: i32,
@@ -51,7 +51,7 @@ pub(super) type PinnedReadView = Result<(Arc<InodeRecord>, NativeReadView)>;
 impl From<DfsFileHandle> for DfsHandle {
     fn from(opened: DfsFileHandle) -> Self {
         Self {
-            native_prefetch: std::sync::OnceLock::new(),
+            direct_prefetch: std::sync::OnceLock::new(),
             _gc_pin: opened.gc_pin,
             inode_id: opened.inode_id,
             flags: opened.flags,
@@ -161,7 +161,7 @@ impl DfsHandleTable {
             .remove(&id);
         if let Some(handle) = &removed {
             handle.closed.store(true, Ordering::Release);
-            if let Some(prefetch) = handle.native_prefetch.get() {
+            if let Some(prefetch) = handle.direct_prefetch.get() {
                 prefetch.retire();
             }
         }

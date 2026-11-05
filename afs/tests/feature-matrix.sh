@@ -27,6 +27,7 @@ matrix=(
   'dfs|--no-default-features --features dfs'
   'ownerfs|--no-default-features --features ownerfs'
   'rdma|--features rdma'
+  'diagnostics|--features diagnostics'
 )
 for entry in "${matrix[@]}"; do
   name=${entry%%|*}

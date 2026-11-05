@@ -72,12 +72,12 @@ impl SourceOutcome {
 
 /// The read route chosen once per batch by the engine's configuration.
 pub(super) enum ChunkSource<'a> {
-    Native(NativeSources<'a>),
+    Native(ReplicatedSources<'a>),
     External(ExternalSource<'a>),
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct NativeSources<'a> {
+pub(super) struct ReplicatedSources<'a> {
     engine: &'a DfsReadEngine,
 }
 
@@ -106,13 +106,13 @@ impl DfsReadEngine {
                 engine: self,
                 backend,
             }),
-            None => ChunkSource::Native(NativeSources { engine: self }),
+            None => ChunkSource::Native(ReplicatedSources { engine: self }),
         }
     }
 
     /// The Native route for callers that already rejected an external backend.
-    pub(super) fn native_sources(&self) -> NativeSources<'_> {
-        NativeSources { engine: self }
+    pub(super) fn replicated_sources(&self) -> ReplicatedSources<'_> {
+        ReplicatedSources { engine: self }
     }
 
     /// A remote copy that may serve a native read: readable, durable or
@@ -134,7 +134,7 @@ impl ExternalSource<'_> {
     }
 }
 
-impl NativeSources<'_> {
+impl ReplicatedSources<'_> {
     pub(super) fn read(
         self,
         batch: &ReadBatch,
@@ -246,7 +246,7 @@ impl PeerCacheSource<'_> {
         stream_only: bool,
     ) -> Result<SourceOutcome> {
         self.0
-            .read_native_peer_cache_mode_async(batch, sources, out, final_owned, stream_only)
+            .read_replicated_peer_cache_mode_async(batch, sources, out, final_owned, stream_only)
             .await
     }
 }

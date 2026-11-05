@@ -586,8 +586,8 @@ fn borrowed_write_and_release_follow_the_read_batch_with_production_workers() {
 #[test]
 fn read_diagnostic_disabled_keeps_reply_behavior() {
     let registry = afs_metrics::Registry::new();
-    let metrics = crate::node::read_work::ReadWorkMetrics::register(&registry).unwrap();
-    let span = metrics.diagnostic(crate::node::read_work::ReadDiagnosticStage::FuseRead);
+    let metrics = crate::node::metrics::work::ReadWorkMetrics::register(&registry).unwrap();
+    let span = metrics.diagnostic(crate::node::metrics::read_timing::ReadDiagnosticStage::FuseRead);
     assert!(span.is_none());
     let mut replied = false;
     super::complete_read_reply(span, false, || replied = true);
@@ -597,7 +597,7 @@ fn read_diagnostic_disabled_keeps_reply_behavior() {
 
 #[test]
 fn read_diagnostic_covers_async_queue_and_actual_reply_completion() {
-    use crate::node::read_work::{ReadDiagnosticStage, ReadWorkMetrics};
+    use crate::node::metrics::{read_timing::ReadDiagnosticStage, work::ReadWorkMetrics};
     let registry = afs_metrics::Registry::new();
     let metrics = ReadWorkMetrics::register(&registry)
         .unwrap()
@@ -634,7 +634,7 @@ fn read_diagnostic_covers_async_queue_and_actual_reply_completion() {
 
 #[test]
 fn read_diagnostic_keeps_error_and_unwind_reply_outcomes() {
-    use crate::node::read_work::{ReadDiagnosticStage, ReadWorkMetrics};
+    use crate::node::metrics::{read_timing::ReadDiagnosticStage, work::ReadWorkMetrics};
     let registry = afs_metrics::Registry::new();
     let metrics = ReadWorkMetrics::register(&registry)
         .unwrap()

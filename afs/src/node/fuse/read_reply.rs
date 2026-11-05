@@ -8,7 +8,7 @@ use afs_error::Result;
 struct ReadReply {
     reply: ReplyData,
     result: std::result::Result<prost::bytes::Bytes, i32>,
-    diagnostic: Option<crate::node::read_work::ReadDiagnosticSpan>,
+    diagnostic: Option<crate::node::metrics::read_timing::ReadDiagnosticSpan>,
     read: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     inode: Option<InodeCacheGate>,
     completion: FuseCompletion,
@@ -121,7 +121,7 @@ impl AfsFuse {
         }
         self.record_io_request("read", size as usize);
         let diagnostic = self.read_work.as_ref().and_then(|metrics| {
-            metrics.diagnostic(crate::node::read_work::ReadDiagnosticStage::FuseRead)
+            metrics.diagnostic(crate::node::metrics::read_timing::ReadDiagnosticStage::FuseRead)
         });
         let deadline = std::time::Instant::now() + task_timeout;
         let state = self.state.clone();

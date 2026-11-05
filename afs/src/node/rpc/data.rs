@@ -51,8 +51,9 @@ use crate::node::{
     read::engine::{MAX_DFS_READ_BYTES, MAX_DFS_READ_OPS},
 };
 use crate::node::{
+    diagnostics::{DiagnosticStorage, DiagnosticStorageError},
     rpc::control::RdmaSessionRegistry,
-    storage::{MAX_TRANSFER_BYTES, Storage, StorageError},
+    storage::MAX_TRANSFER_BYTES,
 };
 
 #[cfg(feature = "dfs")]
@@ -110,19 +111,19 @@ pub(crate) use dfs_replica_authz::{DFS_REPLICA_FRAME_BYTES, MAX_DFS_REPLICA_BYTE
 /// 服务端 endpoint。这里不区分 OwnerFs/DFS，只实现第一版诊断用的 8-byte/文件数据路径。
 #[derive(Clone)]
 pub struct NodeDataService {
-    storage: Arc<Storage>,
+    storage: Arc<DiagnosticStorage>,
     sessions: RdmaSessionRegistry,
 }
 
 impl NodeDataService {
     #[must_use]
-    pub fn new(storage: Arc<Storage>, sessions: RdmaSessionRegistry) -> Self {
+    pub fn new(storage: Arc<DiagnosticStorage>, sessions: RdmaSessionRegistry) -> Self {
         Self { storage, sessions }
     }
 }
 
 pub fn make_data_server(
-    storage: Arc<Storage>,
+    storage: Arc<DiagnosticStorage>,
     sessions: RdmaSessionRegistry,
 ) -> NodeDataServer<NodeDataService> {
     NodeDataServer::new(NodeDataService::new(storage, sessions))
@@ -282,7 +283,7 @@ async fn validate_read_session(
     Ok(())
 }
 
-fn storage_status(error: StorageError) -> Status {
+fn storage_status(error: DiagnosticStorageError) -> Status {
     error_to_status(error.into())
 }
 

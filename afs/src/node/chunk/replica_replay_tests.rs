@@ -30,7 +30,7 @@ fn buffer_reuse_peer_payload_lease_and_bytes_outlive_last_frame() {
 fn buffer_reuse_crc_off_reads_final_payload_without_scratch_copy() {
     let temp = tempfile::tempdir().unwrap();
     let registry = afs_metrics::Registry::new();
-    let metrics = super::super::read_work::ReadWorkMetrics::register(&registry).unwrap();
+    let metrics = super::super::metrics::work::ReadWorkMetrics::register(&registry).unwrap();
     let store = LocalChunkStore::open(temp.path(), "node-a")
         .unwrap()
         .with_peer_read_crc_mode(crate::config::DfsReadCrcMode::Off)
@@ -66,7 +66,7 @@ fn buffer_reuse_crc_off_reads_final_payload_without_scratch_copy() {
 fn p2_w3_uncontrolled_sixteen_requests_report_actual_groups_and_barriers() {
     let temp = tempfile::tempdir().unwrap();
     let registry = afs_metrics::Registry::new();
-    let metrics = super::super::read_work::ReadWorkMetrics::register(&registry)
+    let metrics = super::super::metrics::work::ReadWorkMetrics::register(&registry)
         .unwrap()
         .with_read_diagnostics(true);
     let store = Arc::new(
@@ -74,7 +74,15 @@ fn p2_w3_uncontrolled_sixteen_requests_report_actual_groups_and_barriers() {
             .unwrap()
             .with_read_work_metrics(metrics.clone()),
     );
-    assert!(store.catalog_commit_test.ready.lock().unwrap().is_none());
+    assert!(
+        store
+            .test_hooks
+            .catalog_commit_test
+            .ready
+            .lock()
+            .unwrap()
+            .is_none()
+    );
     let start = Arc::new(std::sync::Barrier::new(17));
     let staged: Vec<_> = (0..16)
         .map(|index| {
@@ -227,7 +235,7 @@ fn p2_w3_pre_ack_child() {
     };
     let mode = std::env::var("AFS_TEST_W3_PRE_ACK_MODE").unwrap();
     let registry = afs_metrics::Registry::new();
-    let metrics = super::super::read_work::ReadWorkMetrics::register(&registry)
+    let metrics = super::super::metrics::work::ReadWorkMetrics::register(&registry)
         .unwrap()
         .with_read_diagnostics(true);
     let store = Arc::new(
@@ -238,6 +246,7 @@ fn p2_w3_pre_ack_child() {
     if mode == "before-wal" {
         let (block, entered, _release) = p2_w3_block();
         store
+            .test_hooks
             .catalog_commit_test
             .before_wal
             .lock()
@@ -268,6 +277,7 @@ fn p2_w3_pre_ack_child() {
     }
     assert_eq!(mode, "half-wal");
     store
+        .test_hooks
         .catalog_commit_test
         .fail_wal_step
         .store(1, Ordering::Release);
@@ -402,7 +412,7 @@ fn p2_w3_pre_ack_process_exits_keep_prefix_orphans_and_exact_retry() {
 fn p2_w3_sixteen_ready_requests_share_one_durable_group() {
     let temp = tempfile::tempdir().unwrap();
     let registry = afs_metrics::Registry::new();
-    let metrics = super::super::read_work::ReadWorkMetrics::register(&registry)
+    let metrics = super::super::metrics::work::ReadWorkMetrics::register(&registry)
         .unwrap()
         .with_read_diagnostics(true);
     let store = Arc::new(
@@ -410,7 +420,8 @@ fn p2_w3_sixteen_ready_requests_share_one_durable_group() {
             .unwrap()
             .with_read_work_metrics(metrics.clone()),
     );
-    *store.catalog_commit_test.ready.lock().unwrap() = Some(Arc::new(std::sync::Barrier::new(16)));
+    *store.test_hooks.catalog_commit_test.ready.lock().unwrap() =
+        Some(Arc::new(std::sync::Barrier::new(16)));
     let staged: Vec<_> = (0..16)
         .map(|index| StagedChunk::new(OperationId::new(format!("group-{index}")), vec![index; 64]))
         .collect();
@@ -456,7 +467,7 @@ fn p2_w3_sixteen_ready_requests_share_one_durable_group() {
     for receipt in &receipts {
         assert_eq!(receipt.durable_acks[0].catalog_revision, 1);
     }
-    *store.catalog_commit_test.ready.lock().unwrap() = None;
+    *store.test_hooks.catalog_commit_test.ready.lock().unwrap() = None;
     let stats = store.catalog_commit_stats();
     assert_eq!(stats.requests, 0);
     assert_eq!(stats.ready, 0);
@@ -508,7 +519,12 @@ fn p2_w3_prepare_does_not_hold_catalog_or_block_a_different_id() {
     let temp = tempfile::tempdir().unwrap();
     let store = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
     let (block, observed, release) = p2_w3_block();
-    *store.catalog_commit_test.before_prepare.lock().unwrap() = Some(block);
+    *store
+        .test_hooks
+        .catalog_commit_test
+        .before_prepare
+        .lock()
+        .unwrap() = Some(block);
     let first_store = store.clone();
     let first = std::thread::spawn(move || {
         first_store.put(StagedChunk::new(
@@ -545,6 +561,7 @@ fn p2_w3_same_id_replay_and_quarantine_wait_for_the_install_flight() {
     let staged = StagedChunk::new(OperationId::new("same-flight"), b"same".to_vec());
     let (block, observed, release) = p2_w3_block();
     store
+        .test_hooks
         .catalog_commit_test
         .before_wal
         .lock()
@@ -580,6 +597,7 @@ fn p2_w3_first_group_ack_does_not_wait_for_a_blocked_following_group() {
     let (block1, observed1, release1) = p2_w3_block();
     let (block2, observed2, release2) = p2_w3_block();
     store
+        .test_hooks
         .catalog_commit_test
         .before_wal
         .lock()
@@ -630,6 +648,7 @@ fn p2_w3_oversized_batch_progresses_as_one_exclusive_original_transaction() {
         .collect();
     let (block, observed, release) = p2_w3_block();
     store
+        .test_hooks
         .catalog_commit_test
         .before_wal
         .lock()
@@ -667,6 +686,7 @@ fn p2_w3_partial_write_sync_and_parent_failures_prevent_every_later_append() {
         let healthy = StagedChunk::new(OperationId::new("healthy"), b"healthy".to_vec());
         store.put(healthy.clone()).unwrap();
         store
+            .test_hooks
             .catalog_commit_test
             .fail_wal_step
             .store(step, Ordering::Release);
@@ -719,6 +739,7 @@ fn p2_w3_stop_waits_for_owned_io_and_keeps_the_final_drain_commit() {
     );
     let (block, observed, release) = p2_w3_block();
     store
+        .test_hooks
         .catalog_commit_test
         .before_wal
         .lock()
@@ -780,11 +801,13 @@ fn p2_w3_unconfirmed_replacement_cannot_replay_until_a_reopen_directory_barrier(
         fs::write(store.chunk_path(&healthy.chunk.id), b"BROKEN!").unwrap();
         if later_prepare_failure {
             store
+                .test_hooks
                 .catalog_commit_test
                 .fail_prepare_after
                 .store(2, Ordering::Release);
         } else {
             store
+                .test_hooks
                 .catalog_commit_test
                 .fail_chunks_dir
                 .store(true, Ordering::Release);
@@ -860,9 +883,10 @@ fn p2_w3_shared_group_failure_wakes_every_waiter_without_ack() {
             b"confirmed".to_vec(),
         );
         store.put(healthy.clone()).unwrap();
-        *store.catalog_commit_test.ready.lock().unwrap() =
+        *store.test_hooks.catalog_commit_test.ready.lock().unwrap() =
             Some(Arc::new(std::sync::Barrier::new(16)));
         store
+            .test_hooks
             .catalog_commit_test
             .fail_wal_step
             .store(step, Ordering::Release);
@@ -886,7 +910,7 @@ fn p2_w3_shared_group_failure_wakes_every_waiter_without_ack() {
             errors.iter().all(|error| error == &errors[0]),
             "every failed group member must observe the same structured error"
         );
-        *store.catalog_commit_test.ready.lock().unwrap() = None;
+        *store.test_hooks.catalog_commit_test.ready.lock().unwrap() = None;
         let stats = store.catalog_commit_stats();
         assert!(stats.failed);
         assert_eq!(stats.requests, 0);
@@ -1057,7 +1081,7 @@ fn p2_w0_blocked_installer_does_not_delay_durable_ack() {
     );
     let (entered, entered_rx) = mpsc::channel();
     let (release, release_rx) = mpsc::channel();
-    *store.sidecar_install_test.block.lock().unwrap() = Some((entered, release_rx));
+    *store.test_hooks.sidecar_install_test.block.lock().unwrap() = Some((entered, release_rx));
     let worker_store = store.clone();
     let worker_staged = staged.clone();
     let (completed, completed_rx) = mpsc::channel();
@@ -1094,7 +1118,7 @@ fn block_next_sidecar_install(
 ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
     let (entered, entered_rx) = std::sync::mpsc::channel();
     let (release, release_rx) = std::sync::mpsc::channel();
-    *store.sidecar_install_test.block.lock().unwrap() = Some((entered, release_rx));
+    *store.test_hooks.sidecar_install_test.block.lock().unwrap() = Some((entered, release_rx));
     (entered_rx, release)
 }
 
@@ -1102,7 +1126,7 @@ fn block_next_sidecar_install(
 fn p2_w0_required_barriers_precede_ack_while_optional_installer_is_blocked() {
     let temp = tempfile::tempdir().unwrap();
     let registry = afs_metrics::Registry::new();
-    let metrics = super::super::read_work::ReadWorkMetrics::register(&registry)
+    let metrics = super::super::metrics::work::ReadWorkMetrics::register(&registry)
         .unwrap()
         .with_read_diagnostics(true);
     let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
@@ -1151,7 +1175,12 @@ fn p2_w0_required_barriers_precede_ack_while_optional_installer_is_blocked() {
     }
     assert_eq!(receipt.durable_acks.len(), 1);
     assert_eq!(
-        *store.sidecar_install_test.optional_io.lock().unwrap(),
+        *store
+            .test_hooks
+            .sidecar_install_test
+            .optional_io
+            .lock()
+            .unwrap(),
         OutboardPersistIo::default()
     );
     release.send(()).unwrap();
@@ -1162,7 +1191,7 @@ fn p2_w0_required_barriers_precede_ack_while_optional_installer_is_blocked() {
 fn p2_w0_queue_limit_includes_active_and_releases_only_its_own_proof_refs() {
     let temp = tempfile::tempdir().unwrap();
     let registry = afs_metrics::Registry::new();
-    let metrics = super::super::read_work::ReadWorkMetrics::register(&registry).unwrap();
+    let metrics = super::super::metrics::work::ReadWorkMetrics::register(&registry).unwrap();
     let budget = OutboardBudget::new_with_metrics(DEFAULT_OUTBOARD_BUDGET_BYTES, metrics.clone());
     let staged = pooled_outboard_chunks(&budget, 65, 4096);
     let store = LocalChunkStore::open(temp.path(), "node-a")
@@ -1204,7 +1233,12 @@ fn p2_w0_queue_limit_includes_active_and_releases_only_its_own_proof_refs() {
         charged,
         "staged owners still retain every proof allocation"
     );
-    let io = *store.sidecar_install_test.optional_io.lock().unwrap();
+    let io = *store
+        .test_hooks
+        .sidecar_install_test
+        .optional_io
+        .lock()
+        .unwrap();
     assert_eq!(
         (io.writes, io.file_syncs, io.renames, io.directory_syncs),
         (64, 64, 64, 3)
@@ -1236,7 +1270,7 @@ fn p2_w0_queue_limit_includes_active_and_releases_only_its_own_proof_refs() {
 fn p2_w0_installer_failure_keeps_ack_and_safe_read_repairs_once() {
     let temp = tempfile::tempdir().unwrap();
     let registry = afs_metrics::Registry::new();
-    let metrics = super::super::read_work::ReadWorkMetrics::register(&registry).unwrap();
+    let metrics = super::super::metrics::work::ReadWorkMetrics::register(&registry).unwrap();
     let budget = OutboardBudget::new_with_metrics(DEFAULT_OUTBOARD_BUDGET_BYTES, metrics.clone());
     let staged = pooled_outboard_chunks(&budget, 1, 128 * 1024)
         .pop()
@@ -1318,6 +1352,7 @@ fn p2_w0_ack_before_sidecar_keeps_verified_full_scan_fallback_and_repair() {
     store.sidecar_installer.wait_idle();
     assert_eq!(
         store
+            .test_hooks
             .sidecar_install_test
             .optional_io
             .lock()
@@ -1332,7 +1367,7 @@ fn p2_w0_ack_before_sidecar_keeps_verified_full_scan_fallback_and_repair() {
 fn p2_w0_control_metadata_admission_failure_drops_optional_work_not_ack() {
     let temp = tempfile::tempdir().unwrap();
     let registry = afs_metrics::Registry::new();
-    let metrics = super::super::read_work::ReadWorkMetrics::register(&registry).unwrap();
+    let metrics = super::super::metrics::work::ReadWorkMetrics::register(&registry).unwrap();
     let budget = OutboardBudget::new_with_metrics(DEFAULT_OUTBOARD_BUDGET_BYTES, metrics.clone());
     let staged = pooled_outboard_chunks(&budget, 1, 128 * 1024)
         .pop()
@@ -1374,7 +1409,7 @@ fn p2_w0_control_metadata_admission_failure_drops_optional_work_not_ack() {
 fn p2_w0_control_charge_is_observed_before_optional_worker_start_failure() {
     let temp = tempfile::tempdir().unwrap();
     let registry = afs_metrics::Registry::new();
-    let metrics = super::super::read_work::ReadWorkMetrics::register(&registry).unwrap();
+    let metrics = super::super::metrics::work::ReadWorkMetrics::register(&registry).unwrap();
     let budget = OutboardBudget::new_with_metrics(DEFAULT_OUTBOARD_BUDGET_BYTES, metrics.clone());
     let staged = pooled_outboard_chunks(&budget, 1, 128 * 1024)
         .pop()
@@ -1391,6 +1426,7 @@ fn p2_w0_control_charge_is_observed_before_optional_worker_start_failure() {
             .contains("afs_dfs_sidecar_install_items{state=\"limit\"} 2\n")
     );
     store
+        .test_hooks
         .sidecar_install_test
         .fail_worker_start
         .store(true, Ordering::Relaxed);
@@ -1428,7 +1464,7 @@ fn p2_w0_control_charge_is_observed_before_optional_worker_start_failure() {
 fn p2_w0_deadline_between_install_and_directory_barrier_skips_new_sync() {
     let temp = tempfile::tempdir().unwrap();
     let registry = afs_metrics::Registry::new();
-    let metrics = super::super::read_work::ReadWorkMetrics::register(&registry).unwrap();
+    let metrics = super::super::metrics::work::ReadWorkMetrics::register(&registry).unwrap();
     let budget = OutboardBudget::new_with_metrics(DEFAULT_OUTBOARD_BUDGET_BYTES, metrics.clone());
     let staged = pooled_outboard_chunks(&budget, 1, 128 * 1024)
         .pop()
@@ -1440,6 +1476,7 @@ fn p2_w0_deadline_between_install_and_directory_barrier_skips_new_sync() {
     let (entered, entered_rx) = std::sync::mpsc::channel();
     let (release, release_rx) = std::sync::mpsc::channel();
     *store
+        .test_hooks
         .sidecar_install_test
         .before_directory_sync
         .lock()
@@ -1458,7 +1495,12 @@ fn p2_w0_deadline_between_install_and_directory_barrier_skips_new_sync() {
     store.sidecar_installer.close(Instant::now());
     release.send(()).unwrap();
     store.sidecar_installer.wait_idle();
-    let io = *store.sidecar_install_test.optional_io.lock().unwrap();
+    let io = *store
+        .test_hooks
+        .sidecar_install_test
+        .optional_io
+        .lock()
+        .unwrap();
     assert_eq!(
         (io.writes, io.file_syncs, io.renames, io.directory_syncs),
         (1, 1, 1, 0)
@@ -1688,7 +1730,14 @@ fn take_outboard_persist_io() -> OutboardPersistIo {
 fn take_store_outboard_persist_io(store: &LocalChunkStore) -> OutboardPersistIo {
     store.sidecar_installer.wait_idle();
     let mut io = take_outboard_persist_io();
-    let background = std::mem::take(&mut *store.sidecar_install_test.optional_io.lock().unwrap());
+    let background = std::mem::take(
+        &mut *store
+            .test_hooks
+            .sidecar_install_test
+            .optional_io
+            .lock()
+            .unwrap(),
+    );
     io.writes += background.writes;
     io.file_syncs += background.file_syncs;
     io.renames += background.renames;
@@ -1701,7 +1750,7 @@ fn coarse_persist_diagnostics_preserve_body_proof_barriers_and_receipts() {
     for enabled in [false, true] {
         let temp = tempfile::tempdir().unwrap();
         let registry = afs_metrics::Registry::new();
-        let metrics = super::super::read_work::ReadWorkMetrics::register(&registry)
+        let metrics = super::super::metrics::work::ReadWorkMetrics::register(&registry)
             .unwrap()
             .with_read_diagnostics(enabled);
         let budget = OutboardBudget::new(DEFAULT_OUTBOARD_BUDGET_BYTES);
@@ -1741,7 +1790,7 @@ fn coarse_persist_diagnostics_preserve_body_proof_barriers_and_receipts() {
                 assert_eq!(snapshot.records.len(), 1);
                 assert_eq!(
                     snapshot.records[0].stage,
-                    super::super::read_work::ReadDiagnosticStage::PersistBatch
+                    super::super::metrics::read_timing::ReadDiagnosticStage::PersistBatch
                 );
                 assert!(snapshot.records[0].success);
                 assert_eq!(snapshot.overflow, 0);
@@ -2366,6 +2415,7 @@ fn wi6_outboard_batch_optional_failures_keep_acks_and_retry_barriers() {
     }));
     fs::remove_dir(blocked).unwrap();
     store
+        .test_hooks
         .sidecar_install_test
         .fail_directory_sync
         .store(true, Ordering::Relaxed);
@@ -3400,7 +3450,7 @@ fn p2_r6_default_lru_and_control_owners_release_only_after_last_frame() {
     let store = LocalChunkStore::open(temp.path(), "node-a")
         .unwrap()
         .with_read_work_metrics(
-            super::super::read_work::ReadWorkMetrics::register(&registry).unwrap(),
+            super::super::metrics::work::ReadWorkMetrics::register(&registry).unwrap(),
         );
     println!(
         "R6_CONTROL fixed={} object={} flight={} cap={}",
@@ -3705,7 +3755,7 @@ fn p2_r6_packed_admission_cannot_reopen_budget_after_shutdown() {
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
     let (drained_tx, drained_rx) = std::sync::mpsc::channel();
-    *store.peer_payload_test_block.lock().unwrap() = Some((entered_tx, release_rx));
+    *store.test_hooks.peer_payload_test_block.lock().unwrap() = Some((entered_tx, release_rx));
     let drained = std::sync::atomic::AtomicBool::new(false);
     let (premature, admitted_after_drain) = std::thread::scope(|scope| {
         let allocating = scope.spawn(|| {
@@ -3746,7 +3796,7 @@ fn p2_r6_old_ready_follower_cannot_retire_a_new_healthy_resident() {
     let (fill_entered, fill_release) = store.pause_next_peer_fill_for_test(chunk.chunk.id.clone());
     let (ready_entered, ready_observed) = std::sync::mpsc::channel();
     let (ready_release, ready_wait) = std::sync::mpsc::channel();
-    *store.peer_ready_test_block.lock().unwrap() = Some((ready_entered, ready_wait));
+    *store.test_hooks.peer_ready_test_block.lock().unwrap() = Some((ready_entered, ready_wait));
     std::thread::scope(|scope| {
         let first = scope.spawn(|| store.read_peer_range(&chunk.chunk.id, 0, 64 * 1024));
         fill_entered.recv_timeout(Duration::from_secs(3)).unwrap();
@@ -3814,7 +3864,7 @@ fn p2_r6_different_objects_fill_outside_shared_table_lock() {
     let (second_entered_tx, second_entered_rx) = mpsc::channel();
     let (second_release_tx, second_release_rx) = mpsc::channel();
     {
-        let mut blocks = store.peer_fill_test_blocks.lock().unwrap();
+        let mut blocks = store.test_hooks.peer_fill_test_blocks.lock().unwrap();
         blocks.insert(first.chunk.id.clone(), (first_entered_tx, first_release_rx));
         blocks.insert(
             second.chunk.id.clone(),
@@ -4127,7 +4177,7 @@ fn private_range_work_metrics_count_actual_scan_and_copy_bytes() {
     let store = LocalChunkStore::open(temp.path(), "node-a")
         .unwrap()
         .with_read_work_metrics(
-            super::super::read_work::ReadWorkMetrics::register(&registry).unwrap(),
+            super::super::metrics::work::ReadWorkMetrics::register(&registry).unwrap(),
         );
     let staged = StagedChunk::new(OperationId::new("work-counts"), vec![7; 65_537]);
     store.put(staged.clone()).unwrap();

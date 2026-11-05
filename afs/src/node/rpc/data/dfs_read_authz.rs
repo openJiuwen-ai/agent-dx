@@ -16,7 +16,7 @@ pub trait DfsReadAuthorizer: Send + Sync + 'static {
 
 #[cfg(feature = "dfs")]
 pub trait DfsReadGrantValidator: Send + Sync + 'static {
-    fn authorization_metrics(&self) -> Option<super::super::super::read_work::ReadWorkMetrics> {
+    fn authorization_metrics(&self) -> Option<super::super::super::metrics::work::ReadWorkMetrics> {
         None
     }
     fn validate(
@@ -27,7 +27,7 @@ pub trait DfsReadGrantValidator: Send + Sync + 'static {
 
 #[cfg(feature = "dfs")]
 impl DfsReadGrantValidator for super::super::meta::GrpcDfsMeta {
-    fn authorization_metrics(&self) -> Option<super::super::super::read_work::ReadWorkMetrics> {
+    fn authorization_metrics(&self) -> Option<super::super::super::metrics::work::ReadWorkMetrics> {
         self.authorization_metrics()
     }
     fn validate(
@@ -108,8 +108,8 @@ impl DfsReadAuthorizer for CachedDfsReadAuthorizer {
     fn authorize(&self, peer: &str, request: &DfsReadRangesRequest) -> afs_error::Result<()> {
         let metrics = self.validator.authorization_metrics();
         if let Some(metrics) = &metrics {
-            metrics.check(crate::node::read_work::ReadCheck::AuthorizeFull);
-            metrics.check(crate::node::read_work::ReadCheck::RequestValidate);
+            metrics.check(crate::node::metrics::work::ReadCheck::AuthorizeFull);
+            metrics.check(crate::node::metrics::work::ReadCheck::RequestValidate);
         }
         let _authorization_scope = metrics.as_ref().map(|m| m.authorization_scope("total"));
         validate_dfs_read_request(request)

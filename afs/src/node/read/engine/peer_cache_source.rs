@@ -119,7 +119,7 @@ impl DfsReadEngine {
     #[cfg(test)]
     fn wait_peer_cache_recheck_for_test(&self, stage: &'static str) {
         let hook = {
-            let mut slot = self.peer_cache_recheck_hook.lock().unwrap();
+            let mut slot = self.test_hooks.peer_cache_recheck_hook.lock().unwrap();
             if slot.as_ref().is_some_and(|hook| hook.stage == stage) {
                 slot.take()
             } else {
@@ -136,7 +136,7 @@ impl DfsReadEngine {
     /// peer disk cache. A hit reads the cached object; a miss may lead (or
     /// follow) one complete-object fill. `NotApplicable` sends the read on
     /// to the bounded peer range source.
-    pub(super) async fn read_native_peer_cache_mode_async(
+    pub(super) async fn read_replicated_peer_cache_mode_async(
         &self,
         batch: &ReadBatch,
         sources: &[ChunkSources],
@@ -760,6 +760,6 @@ struct LeaderFill<'f, 'c, 'o, 'l> {
     length: usize,
     last_error: Option<Error>,
     body: Vec<u8>,
-    legacy_fill_work: Option<crate::node::read_work::PeerCacheFillWork>,
+    legacy_fill_work: Option<crate::node::metrics::work::PeerCacheFillWork>,
     preparation: Option<PeerFillStage<'l>>,
 }

@@ -23,23 +23,21 @@ use std::{
 mod catalog_commit;
 mod checkpoint;
 mod collect;
-#[cfg(any(feature = "dfs", test))]
-mod native_live;
-#[cfg(test)]
-mod native_live_tests;
 pub mod outboard;
-use catalog_commit::CatalogCommitter;
-#[cfg(feature = "dfs")]
-pub(crate) use native_live::NativeWriteBudgetSnapshot;
 #[cfg(any(feature = "dfs", test))]
-pub(crate) use native_live::{
-    NativeWriteAdmission, NativeWriteBudget, NativeWriteLease, NativeWriteOwner,
-};
+mod payload_live;
+#[cfg(test)]
+mod payload_live_tests;
+use catalog_commit::CatalogCommitter;
 pub use outboard::OutboardBudget;
 use outboard::{
     ChunkOutboard, DEFAULT_OUTBOARD_BUDGET_BYTES, MAX_ENCODED_OUTBOARD_BYTES, OutboardBuilder,
     OutboardLease, OutboardReadContext, OutboardReadWork, SharedOutboard, SidecarOutboard,
 };
+#[cfg(feature = "dfs")]
+pub(crate) use payload_live::DirtyBudgetSnapshot;
+#[cfg(any(feature = "dfs", test))]
+pub(crate) use payload_live::{DirtyAdmission, DirtyBudget, DirtyLease, DirtyOwner};
 
 use afs_error::{Error, Result};
 use afs_tracing::tracing;
@@ -99,7 +97,7 @@ pub enum PutIntent {
     Commit,
     /// Background upload of a native generation, which fences itself at commit.
     /// `DfsChunkSink` decides the [`BodyRelease`] of each [`StoredChunk`].
-    NativeUpload,
+    PipelineUpload,
 }
 
 /// What the writer may do with the in-memory body once a native upload is durable.
@@ -253,18 +251,10 @@ pub struct LocalChunkStore {
     /// This Node's own remote-read policy as a reader. Served peer requests
     /// follow the caller's requested mode instead.
     peer_read_crc_mode: crate::config::DfsReadCrcMode,
-    read_work: Option<super::read_work::ReadWorkMetrics>,
+    read_work: Option<super::metrics::work::ReadWorkMetrics>,
     sidecar_installer: SidecarInstaller,
     #[cfg(test)]
-    catalog_commit_test: CatalogCommitTestControl,
-    #[cfg(test)]
-    sidecar_install_test: Arc<SidecarInstallTestControl>,
-    #[cfg(test)]
-    peer_fill_test_blocks: Mutex<HashMap<ChunkId, PeerFillTestBlock>>,
-    #[cfg(test)]
-    peer_ready_test_block: Mutex<Option<PeerFillTestBlock>>,
-    #[cfg(test)]
-    peer_payload_test_block: Mutex<Option<PeerFillTestBlock>>,
+    test_hooks: ChunkStoreTestHooks,
     #[cfg(any(feature = "dfs", test))]
     peer_read_budget: Arc<PeerReadBudget>,
     #[cfg(any(feature = "dfs", test))]
@@ -273,6 +263,16 @@ pub struct LocalChunkStore {
     peer_read_cache: Mutex<PeerServeState>,
     #[cfg(any(feature = "dfs", test))]
     peer_serve_changed: Condvar,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ChunkStoreTestHooks {
+    pub(super) catalog_commit_test: CatalogCommitTestControl,
+    pub(super) sidecar_install_test: Arc<SidecarInstallTestControl>,
+    pub(super) peer_fill_test_blocks: Mutex<HashMap<ChunkId, PeerFillTestBlock>>,
+    pub(super) peer_ready_test_block: Mutex<Option<PeerFillTestBlock>>,
+    pub(super) peer_payload_test_block: Mutex<Option<PeerFillTestBlock>>,
 }
 
 fn open_device_epoch(root: &Path) -> Result<u64> {
@@ -320,7 +320,7 @@ fn verified_range(
     chunk: &ChunkObject,
     offset: u64,
     length: usize,
-    metrics: Option<&super::read_work::ReadWorkMetrics>,
+    metrics: Option<&super::metrics::work::ReadWorkMetrics>,
 ) -> Result<Vec<u8>> {
     offset
         .checked_add(length as u64)
@@ -348,7 +348,7 @@ fn verified_ranges_into(
     ranges: &[VerifiedRangeCopy],
     out: &mut [u8],
     force_scan: bool,
-    metrics: Option<&super::read_work::ReadWorkMetrics>,
+    metrics: Option<&super::metrics::work::ReadWorkMetrics>,
 ) -> Result<Vec<usize>> {
     verified_ranges_into_building(file, chunk, ranges, out, force_scan, metrics, None)
         .map(|(counts, _)| counts)
@@ -360,7 +360,7 @@ fn verified_ranges_into_building(
     ranges: &[VerifiedRangeCopy],
     out: &mut [u8],
     force_scan: bool,
-    metrics: Option<&super::read_work::ReadWorkMetrics>,
+    metrics: Option<&super::metrics::work::ReadWorkMetrics>,
     mut builder: Option<OutboardBuilder>,
 ) -> Result<(Vec<usize>, Option<SharedOutboard>)> {
     let mut counts = Vec::with_capacity(ranges.len());
@@ -390,7 +390,7 @@ fn verified_ranges_into_building(
     if file.metadata().map_err(Error::from)?.len() != chunk.length {
         return Err(corrupt(&chunk.id, "length mismatch"));
     }
-    let mut work = metrics.map(super::read_work::ReadWorkMetrics::scan);
+    let mut work = metrics.map(super::metrics::work::ReadWorkMetrics::scan);
     let mut scratch = [0; 64 * 1024];
     let mut hasher = blake3::Hasher::new();
     let mut position = 0;

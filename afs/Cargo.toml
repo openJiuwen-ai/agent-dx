@@ -13,6 +13,9 @@ default = ["ownerfs", "dfs", "node-jemalloc"]
 ownerfs = []
 dfs = []
 rdma = ["afs-transport/rdma"]
+# Developer diagnostics compiled out of default builds: Meta store profiling
+# (`AFS_META_PROFILE`) and namespace tracing (`AFS_META_NAMESPACE_TRACE`).
+diagnostics = []
 # Disable only for allocator comparisons; only afs-node installs it globally.
 node-jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 

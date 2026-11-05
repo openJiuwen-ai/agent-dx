@@ -53,7 +53,7 @@ pub(super) fn backend_read_data(
 // Filesystem::read return would lose queued worker time and the reply itself.
 pub(super) fn complete_read_reply(
     #[cfg(any(feature = "dfs", test))] diagnostic: Option<
-        crate::node::read_work::ReadDiagnosticSpan,
+        crate::node::metrics::read_timing::ReadDiagnosticSpan,
     >,
     #[cfg(any(feature = "dfs", test))] success: bool,
     reply: impl FnOnce(),

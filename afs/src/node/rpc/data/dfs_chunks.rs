@@ -540,7 +540,7 @@ impl DfsChunks for DfsChunksService {
         let crc_mode = requested_crc_read_mode(request.metadata())?;
         let request = request.into_inner();
         if let Some(local) = &self.local_chunks {
-            local.record_read_check(crate::node::read_work::ReadCheck::RequestValidate);
+            local.record_read_check(crate::node::metrics::work::ReadCheck::RequestValidate);
         }
         validate_dfs_read_request(&request)?;
         for operation in &request.operations {
@@ -585,7 +585,7 @@ impl DfsChunks for DfsChunksService {
             }
         };
         if let Some(local) = &self.local_chunks {
-            local.record_read_check(crate::node::read_work::ReadCheck::RequestValidate);
+            local.record_read_check(crate::node::metrics::work::ReadCheck::RequestValidate);
         }
         validate_dfs_read_request(&request)?;
         let authorizer = self.authorizer.clone();

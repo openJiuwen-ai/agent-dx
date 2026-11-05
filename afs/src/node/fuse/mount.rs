@@ -364,7 +364,7 @@ pub fn mount_dfs_with_diagnostics_and_fd_bridge(
     backend: Arc<dyn Backend>,
     path: &Path,
     metrics: FuseRequestMetrics,
-    read_work: crate::node::read_work::ReadWorkMetrics,
+    read_work: crate::node::metrics::work::ReadWorkMetrics,
     options: FuseMountOptions,
     bridge: Arc<FdBridge>,
 ) -> Result<MountedFuse> {
@@ -382,7 +382,9 @@ fn mount_dfs_inner(
     backend: Arc<dyn Backend>,
     path: &Path,
     metrics: Option<FuseRequestMetrics>,
-    #[cfg(any(feature = "dfs", test))] read_work: Option<crate::node::read_work::ReadWorkMetrics>,
+    #[cfg(any(feature = "dfs", test))] read_work: Option<
+        crate::node::metrics::work::ReadWorkMetrics,
+    >,
     options: FuseMountOptions,
     bridge: Option<Arc<FdBridge>>,
 ) -> Result<MountedFuse> {
@@ -410,7 +412,9 @@ pub(crate) fn mount_with_policy(
     features: FuseMountFeatures,
     exec: FuseExecOptions,
     metrics: Option<FuseRequestMetrics>,
-    #[cfg(any(feature = "dfs", test))] read_work: Option<crate::node::read_work::ReadWorkMetrics>,
+    #[cfg(any(feature = "dfs", test))] read_work: Option<
+        crate::node::metrics::work::ReadWorkMetrics,
+    >,
 ) -> Result<MountedFuse> {
     let exec = exec.validate()?;
     let path = canonical_mount_path(path)?;

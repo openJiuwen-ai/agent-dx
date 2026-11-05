@@ -34,10 +34,10 @@ use crate::{
     },
     node::{
         chunk::{LocalChunkStore, PinnedChunkReader, VerifiedRangeCopy, outboard::OutboardBudget},
+        metrics::work::PeerFillClock,
         read::peer_cache::{
             CompletedPeerDiskRead, DiskPeerCache, PeerStreamSink, VerifiedPeerChunk,
         },
-        read_work::PeerFillClock,
     },
 };
 
@@ -448,7 +448,7 @@ pub trait ChunkTransfer: Send + Sync {
     }
 
     /// Optional observation only; never grants permission or memory admission.
-    fn verification_metrics(&self) -> Option<&crate::node::read_work::ReadWorkMetrics> {
+    fn verification_metrics(&self) -> Option<&crate::node::metrics::work::ReadWorkMetrics> {
         None
     }
 
@@ -537,7 +537,7 @@ pub struct DfsReadEngine {
     reply_buffer_pool: Arc<super::buffer::ReadBufferPool>,
     read_pipeline_limits: super::admission::ReadPipelineLimits,
     reply_admission: Arc<tokio::sync::Semaphore>,
-    native_prefetch_budget: Arc<std::sync::OnceLock<Arc<super::native_prefetch::Budget>>>,
+    native_prefetch_budget: Arc<std::sync::OnceLock<Arc<super::direct_prefetch::Budget>>>,
     source_query_gates: Arc<super::admission::ReadKeyGates>,
     local_node_id: String,
     local: Arc<LocalChunkStore>,
@@ -549,14 +549,18 @@ pub struct DfsReadEngine {
     read_authority: Arc<LocalReadAuthority>,
     readers: Mutex<BoundedLru<ChunkId, Arc<PinnedChunkReader>>>,
     #[cfg(test)]
-    local_reader_install_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
-    #[cfg(test)]
-    peer_cache_recheck_hook: Mutex<Option<PeerCacheRecheckHook>>,
-    #[cfg(test)]
-    prefetch_attempt_hook: Mutex<Option<PrefetchAttemptHook>>,
+    test_hooks: ReadEngineTestHooks,
     source_cache: Arc<Mutex<SourceCache>>,
     fetcher: Option<Arc<super::object_fetch::ObjectFetcher>>,
     external_authority_cache: Mutex<ExternalAuthorityCache>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct ReadEngineTestHooks {
+    pub(super) local_reader_install_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
+    pub(super) peer_cache_recheck_hook: Mutex<Option<PeerCacheRecheckHook>>,
+    pub(super) prefetch_attempt_hook: Mutex<Option<PrefetchAttemptHook>>,
 }
 
 #[cfg(test)]
@@ -581,14 +585,15 @@ impl Drop for DfsReadEngine {
 impl DfsReadEngine {
     pub(in crate::node) fn publication_diagnostic(
         &self,
-    ) -> Option<super::super::read_work::ReadDiagnosticSpan> {
-        self.local
-            .read_diagnostic(super::super::read_work::ReadDiagnosticStage::MetaCommitFileVersion)
+    ) -> Option<super::super::metrics::read_timing::ReadDiagnosticSpan> {
+        self.local.read_diagnostic(
+            super::super::metrics::read_timing::ReadDiagnosticStage::MetaCommitFileVersion,
+        )
     }
 
     pub(in crate::node) fn publication_coarse_diagnostic(
         &self,
-    ) -> Option<super::super::read_work::ReadCoarseDiagnosticSpan> {
+    ) -> Option<super::super::metrics::read_timing::ReadCoarseDiagnosticSpan> {
         self.local.coarse_diagnostic("meta_publish_rpc", 0)
     }
 
@@ -636,11 +641,7 @@ impl DfsReadEngine {
             read_authority: Arc::new(LocalReadAuthority::unbounded_for_tests_and_legacy()),
             readers: Mutex::new(BoundedLru::new(MAX_PINNED_READERS)),
             #[cfg(test)]
-            local_reader_install_barrier: Mutex::new(None),
-            #[cfg(test)]
-            peer_cache_recheck_hook: Mutex::new(None),
-            #[cfg(test)]
-            prefetch_attempt_hook: Mutex::new(None),
+            test_hooks: ReadEngineTestHooks::default(),
             source_cache: Arc::new(Mutex::new(source_cache)),
             fetcher: None,
             external_authority_cache: Mutex::new(ExternalAuthorityCache::default()),
@@ -687,7 +688,7 @@ impl DfsReadEngine {
 
     #[cfg(test)]
     pub(in crate::node) fn set_prefetch_attempt_hook_for_test(&self, hook: PrefetchAttemptHook) {
-        *self.prefetch_attempt_hook.lock().unwrap() = Some(hook);
+        *self.test_hooks.prefetch_attempt_hook.lock().unwrap() = Some(hook);
     }
 
     fn task_reader(&self) -> Self {
@@ -708,11 +709,7 @@ impl DfsReadEngine {
             read_authority: self.read_authority.clone(),
             readers: Mutex::new(BoundedLru::new(0)),
             #[cfg(test)]
-            local_reader_install_barrier: Mutex::new(None),
-            #[cfg(test)]
-            peer_cache_recheck_hook: Mutex::new(None),
-            #[cfg(test)]
-            prefetch_attempt_hook: Mutex::new(None),
+            test_hooks: ReadEngineTestHooks::default(),
             source_cache: self.source_cache.clone(),
             fetcher: None,
             external_authority_cache: Mutex::new(ExternalAuthorityCache::default()),

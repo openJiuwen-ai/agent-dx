@@ -12,7 +12,7 @@ pub struct PinnedChunkReader {
     pub(super) outboard_repairs: Arc<OutboardRepairGates>,
     pub(super) outboard: Mutex<Option<SharedOutboard>>,
     pub(super) proof_identity: Mutex<PeerFileIdentity>,
-    pub(super) read_work: Option<super::super::read_work::ReadWorkMetrics>,
+    pub(super) read_work: Option<super::super::metrics::work::ReadWorkMetrics>,
     // Only a private peer-serving reader may opt out; local/recovery readers stay checked.
     pub(super) verify_crc_body: bool,
 }

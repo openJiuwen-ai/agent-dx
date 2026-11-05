@@ -784,7 +784,7 @@ impl ChunkSink for LocalRequiredChunkStore {
     fn put_chunks(&self, staged: Vec<StagedChunk>, intent: PutIntent) -> Result<Vec<StoredChunk>> {
         let mut stored = self.0.put_chunks(staged, intent)?;
         for stored in &mut stored {
-            stored.body_release = if intent == PutIntent::NativeUpload {
+            stored.body_release = if intent == PutIntent::PipelineUpload {
                 BodyRelease::ReleaseAfterUpload
             } else {
                 BodyRelease::RetainUntilPublish
@@ -862,9 +862,9 @@ fn test_dfs_new(
         chunk_store,
         read_engine,
     )
-    .with_native_write_pipeline(
-        NativeWriteBudget::new(PRODUCTION_NATIVE_BUDGET_BYTES as usize),
-        NativeWriteConfig {
+    .with_write_pipeline(
+        DirtyBudget::new(PRODUCTION_NATIVE_BUDGET_BYTES as usize),
+        WritePipelineConfig {
             unpublished_descriptors: PRODUCTION_UNPUBLISHED_DESCRIPTORS,
             upload_inflight_chunks: PRODUCTION_UPLOAD_INFLIGHT_CHUNKS,
         },
@@ -1240,7 +1240,7 @@ fn test_fs_on_fake_s3() -> (
         read_engine,
     );
     assert!(
-        fs.native.pipeline.is_some(),
+        fs.write_resources.pipeline.is_some(),
         "S3 writes through the native pipeline"
     );
     (temp, meta, fs, store)
@@ -1778,12 +1778,12 @@ mod dirty_index;
 mod grpc_meta;
 mod locks;
 mod misc;
-mod native_write;
 mod owner_gateway;
 mod read_views;
 mod remote_provider;
 mod s3;
 mod unified;
 mod version_cache;
+mod write_pipeline_ops;
 mod write_semantics;
 mod write_state;

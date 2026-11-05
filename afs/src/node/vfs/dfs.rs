@@ -24,9 +24,6 @@ use std::{
 use afs_error::{Error, Result};
 use afs_tracing::tracing;
 
-mod pending_trace;
-use pending_trace::PendingTrace;
-
 mod backend;
 mod commit;
 mod commit_prepare;
@@ -42,8 +39,6 @@ mod lock_proxy_owner;
 mod lock_sessions;
 mod lock_wire;
 mod meta_port;
-mod native_pipeline;
-mod native_write;
 pub mod owner_api;
 mod owner_gateway;
 mod owner_op_table;
@@ -54,6 +49,8 @@ mod sharded;
 mod test_hooks;
 mod util;
 mod version_cache;
+mod write_pipeline;
+mod write_pipeline_ops;
 mod write_state;
 mod writeback;
 
@@ -68,8 +65,6 @@ use inode_map::*;
 use lock_authority::*;
 use lock_proxy_client::*;
 pub use meta_port::{DfsMeta, DfsNodeLocation, DfsRemoteOwnerFactory};
-pub(crate) use native_pipeline::NativeWriteConfig;
-use native_pipeline::*;
 use owner_api::RemoteDfsOwner;
 use owner_gateway::*;
 use owner_op_table::*;
@@ -80,6 +75,8 @@ use test_hooks::*;
 use util::*;
 pub(crate) use version_cache::version_cache_minimum_bytes;
 use version_cache::*;
+pub(crate) use write_pipeline::WritePipelineConfig;
+use write_pipeline::*;
 pub use write_state::DfsWriteSession;
 use write_state::*;
 
@@ -104,8 +101,8 @@ use crate::{
         XattrSetMode,
     },
     node::chunk::{
-        BodyRelease, ChunkBuilder, ChunkSink, NativeWriteAdmission, NativeWriteBudget,
-        NativeWriteOwner, PutIntent, SharedChunkBytes, StagedChunk, StoredChunk, WriteBufferPool,
+        BodyRelease, ChunkBuilder, ChunkSink, DirtyAdmission, DirtyBudget, DirtyOwner, PutIntent,
+        SharedChunkBytes, StagedChunk, StoredChunk, WriteBufferPool,
     },
     node::read::engine::{
         BoundedLru, ChunkReadOp, CurrentExternalReadOutcome, DfsReadEngine,
@@ -139,8 +136,7 @@ pub struct DistributedFs {
     versions: VersionCache,
     gc: GcCoordinator,
     writes: InodeWriteTable,
-    native: NativeWrites,
-    commit: CommitEngine,
+    write_resources: WriteResources,
     locks: LockService,
     #[cfg(test)]
     hooks: TestHooks,
@@ -181,10 +177,6 @@ impl DistributedFs {
     ) -> Self {
         let node_id = node_id.into();
         let session_id = session_id.into();
-        #[cfg(not(test))]
-        let pending_trace = PendingTrace::from_env(&namespace_id.0, &node_id, &session_id);
-        #[cfg(test)]
-        let pending_trace = None;
         let identity = Arc::new(NodeIdentity::new(namespace_id, node_id, session_id));
         Self {
             owner_gateway: OwnerGateway::new(identity.clone(), meta.clone()),
@@ -194,8 +186,7 @@ impl DistributedFs {
             versions: VersionCache::default(),
             gc: GcCoordinator::default(),
             writes: InodeWriteTable::default(),
-            native: NativeWrites::default(),
-            commit: CommitEngine { pending_trace },
+            write_resources: WriteResources::default(),
             locks: LockService::default(),
             #[cfg(test)]
             hooks: TestHooks::default(),
@@ -223,12 +214,12 @@ impl DistributedFs {
         Ok(self)
     }
 
-    pub(crate) fn with_native_write_pipeline(
+    pub(crate) fn with_write_pipeline(
         mut self,
-        budget: Arc<NativeWriteBudget>,
-        config: NativeWriteConfig,
+        budget: Arc<DirtyBudget>,
+        config: WritePipelineConfig,
         runtime: tokio::runtime::Handle,
-        metrics: Option<crate::node::read_work::ReadWorkMetrics>,
+        metrics: Option<crate::node::metrics::work::ReadWorkMetrics>,
     ) -> Result<Self> {
         if config.unpublished_descriptors == 0
             || config.unpublished_descriptors > 1024
@@ -237,10 +228,10 @@ impl DistributedFs {
         {
             return Err(invalid("invalid native write pipeline configuration"));
         }
-        self.native.pipeline = Some(Arc::new(NativeWritePipeline::new(
+        self.write_resources.pipeline = Some(Arc::new(WritePipeline::new(
             budget, config, runtime, metrics,
         )));
-        self.observe_native_resources();
+        self.observe_pipeline_resources();
         Ok(self)
     }
 
@@ -255,7 +246,7 @@ impl DistributedFs {
     }
 
     pub fn with_write_buffer_pool(mut self, pool: Arc<WriteBufferPool>) -> Self {
-        self.native.buffer_pool = pool;
+        self.write_resources.buffer_pool = pool;
         self
     }
 

@@ -34,7 +34,7 @@ impl DfsReadEngine {
 
     pub(crate) fn native_prefetch_policy(
         &self,
-    ) -> Option<(Arc<super::super::native_prefetch::Budget>, u64)> {
+    ) -> Option<(Arc<super::super::direct_prefetch::Budget>, u64)> {
         if self.config.readahead_max_bytes == 0
             || !self.async_read_enabled()
             || self.peer_cache.is_some()
@@ -48,7 +48,7 @@ impl DfsReadEngine {
         let budget = self
             .native_prefetch_budget
             .get_or_init(|| {
-                super::super::native_prefetch::Budget::new(
+                super::super::direct_prefetch::Budget::new(
                     cap,
                     self.local.read_work_metrics().cloned(),
                 )
@@ -76,7 +76,7 @@ impl DfsReadEngine {
     }
     pub(crate) fn compose_native_prefetch_reply(
         &self,
-        parts: crate::node::read::native_prefetch::Reply,
+        parts: crate::node::read::direct_prefetch::Reply,
         length: usize,
         prepared: Option<crate::node::read::admission::NativeReadReply>,
     ) -> Result<prost::bytes::Bytes> {
@@ -143,7 +143,7 @@ impl DfsReadEngine {
             if covered != output_len {
                 reply.buffer.fill(0);
             }
-            self.native_sources()
+            self.replicated_sources()
                 .read_async(&batch, &mut reply.buffer, true, Some(deadline), lifetime)
                 .await
                 .inspect_err(|error| self.invalidate_native_batch_on_error(&batch, error))?;
@@ -181,7 +181,7 @@ impl DfsReadEngine {
             };
             let mut reply = allocation.allocate(deadline).await?;
             reply.buffer.fill(0);
-            self.native_sources()
+            self.replicated_sources()
                 .read_async(&batch, &mut reply.buffer, true, Some(deadline), lifetime)
                 .await?;
             crate::node::bridge::local_io(|| overlay(&mut reply.buffer))?;

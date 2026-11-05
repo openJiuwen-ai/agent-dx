@@ -185,7 +185,7 @@ fn pr88_fix_crc32c_tail_partial_success_retry_keeps_ids_and_receipts() {
                 return Err(unavailable("injected lost second durable receipt"));
             }
             for stored in &mut stored {
-                stored.body_release = if intent == PutIntent::NativeUpload {
+                stored.body_release = if intent == PutIntent::PipelineUpload {
                     BodyRelease::ReleaseAfterUpload
                 } else {
                     BodyRelease::RetainUntilPublish

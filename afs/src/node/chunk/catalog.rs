@@ -120,7 +120,7 @@ impl LocalCatalog {
 pub(super) fn append_catalog_txn(
     path: &Path,
     txn: &CatalogTxn,
-    metrics: Option<&super::super::read_work::ReadWorkMetrics>,
+    metrics: Option<&super::super::metrics::work::ReadWorkMetrics>,
 ) -> Result<()> {
     append_catalog_txn_observed(path, txn, metrics, |_| Ok(()))
 }
@@ -128,7 +128,7 @@ pub(super) fn append_catalog_txn(
 pub(super) fn append_catalog_txn_observed(
     path: &Path,
     txn: &CatalogTxn,
-    metrics: Option<&super::super::read_work::ReadWorkMetrics>,
+    metrics: Option<&super::super::metrics::work::ReadWorkMetrics>,
     observe_capacity: impl FnOnce(usize) -> Result<()>,
 ) -> Result<()> {
     let mut encoded = serde_json::to_vec(txn)

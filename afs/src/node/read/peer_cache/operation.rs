@@ -247,7 +247,7 @@ impl<'a> PeerCacheOperation<'a> {
         });
         let object_diagnostic = self.cache.read_work.as_ref().and_then(|metrics| {
             metrics.object_diagnostic(
-                crate::node::read_work::ReadObjectDiagnosticStage::CacheHitReadVerify,
+                crate::node::metrics::read_timing::ReadObjectDiagnosticStage::CacheHitReadVerify,
                 &chunk.id.0,
             )
         });
@@ -457,7 +457,7 @@ impl<'a> PeerCacheOperation<'a> {
         result: Result<()>,
         selected: SelectedEntry<'a>,
         finalize_started: Instant,
-        object_diagnostic: Option<crate::node::read_work::ReadObjectDiagnosticSpan>,
+        object_diagnostic: Option<crate::node::metrics::read_timing::ReadObjectDiagnosticSpan>,
     ) -> Result<bool> {
         let outcome = (|| match result {
             Ok(()) => {
@@ -544,7 +544,7 @@ impl<'a> PeerCacheOperation<'a> {
         };
         let object_diagnostic = self.cache.read_work.as_ref().and_then(|metrics| {
             metrics.object_diagnostic(
-                crate::node::read_work::ReadObjectDiagnosticStage::CacheHitRootFallback,
+                crate::node::metrics::read_timing::ReadObjectDiagnosticStage::CacheHitRootFallback,
                 &chunk.id.0,
             )
         });
@@ -859,7 +859,7 @@ pub(super) fn refresh_metadata(state: &mut CacheState) {
 
 pub(super) fn proof_can_fit(state: &CacheState) -> bool {
     #[cfg(test)]
-    if state.proof_limit.is_some_and(|limit| {
+    if state.test_hooks.proof_limit.is_some_and(|limit| {
         state
             .stats
             .proof_metadata_bytes
@@ -998,7 +998,7 @@ pub(super) fn write_header(file: &mut File, header: &Header) -> Result<()> {
 }
 
 pub(super) fn report_work(
-    metrics: &crate::node::read_work::ReadWorkMetrics,
+    metrics: &crate::node::metrics::work::ReadWorkMetrics,
     current: PeerCacheHashWork,
     before: PeerCacheHashWork,
 ) {
@@ -1033,7 +1033,7 @@ fn elapsed_ns(started: Instant) -> u64 {
 }
 
 pub(super) fn report_stages(
-    metrics: &crate::node::read_work::ReadWorkMetrics,
+    metrics: &crate::node::metrics::work::ReadWorkMetrics,
     current: PeerCacheReadStages,
     before: PeerCacheReadStages,
 ) {

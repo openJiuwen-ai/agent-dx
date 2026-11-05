@@ -1,8 +1,8 @@
 //! Bounded look-ahead for confirmed, explicitly direct, single-stream reads.
 //! Ordinary replies never enter the retained-result map.
 use super::super::{
+    metrics::work::ReadWorkMetrics,
     read::admission::{ReadLifetime, ReadReplyFuture},
-    read_work::ReadWorkMetrics,
 };
 use afs_error::{Error, Result};
 use prost::bytes::Bytes;

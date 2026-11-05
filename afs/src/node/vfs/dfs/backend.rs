@@ -206,8 +206,8 @@ impl Backend for DistributedFs {
         let mut change = change.clone();
         let mut killpriv_setattr = false;
         let _native_ticket = if let Some(cell) = self.write_state(&inode_id)? {
-            let ticket = self.native_ticket(&cell)?;
-            if self.native.pipeline.is_some() {
+            let ticket = self.mutation_ticket(&cell)?;
+            if self.write_resources.pipeline.is_some() {
                 drop(self.begin_inode_operation(&inode_id, cell)?);
             }
             ticket
@@ -711,7 +711,7 @@ impl Backend for DistributedFs {
     }
 
     fn accepts_queued_writes(&self, handle: FileHandle) -> bool {
-        self.native.pipeline.is_some()
+        self.write_resources.pipeline.is_some()
             && self.handle_snapshot(handle).ok().is_some_and(|snapshot| {
                 snapshot.flags & libc::O_ACCMODE != libc::O_RDONLY
                     && snapshot.flags & libc::O_APPEND == 0
@@ -728,7 +728,7 @@ impl Backend for DistributedFs {
         // Native admission may wait for mutation/publication or shared body
         // capacity. Keep those waits on a worker so the FUSE receiver can
         // admit unrelated reads and writeback needed to make progress.
-        if self.native.pipeline.is_some() {
+        if self.write_resources.pipeline.is_some() {
             return WriteAdmissionMode::Queued;
         }
         if self
@@ -783,12 +783,12 @@ impl Backend for DistributedFs {
         if data.is_empty() {
             return Ok(0);
         }
-        if self.native.pipeline.is_none() {
+        if self.write_resources.pipeline.is_none() {
             return Err(unavailable(
                 "DFS store has no native write pipeline configured",
             ));
         }
-        self.native_ordinary_write(handle, &snapshot, state, offset, data, options)
+        self.pipeline_ordinary_write(handle, &snapshot, state, offset, data, options)
     }
 
     fn copy_file_range(
@@ -929,14 +929,9 @@ impl Backend for DistributedFs {
                     _gc_pin: None,
                     through_seq: state.visible_write_seq,
                     commit: Arc::new(commit),
-                    _native_accounting: None,
-                    _native_uploads: Vec::new(),
+                    _pipeline_accounting: None,
+                    _pipeline_uploads: Vec::new(),
                 },
-                trace_send_attempt: self
-                    .commit
-                    .pending_trace
-                    .as_ref()
-                    .map(|_| Arc::new(AtomicU64::new(0))),
             };
             state.in_flight = Some(InFlightCommit::File(Box::new(pending.clone())));
             state.commit_busy = true;

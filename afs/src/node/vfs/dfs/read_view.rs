@@ -135,7 +135,7 @@ impl DistributedFs {
         let deadline = Instant::now() + self.read_engine.read_pipeline_timeout();
         self.read_engine.run_sync_boundary(Box::pin(async {
             result = Some(
-                self.read_native_bytes_async(
+                self.read_replicated_bytes_async(
                     handle,
                     snapshot,
                     offset,

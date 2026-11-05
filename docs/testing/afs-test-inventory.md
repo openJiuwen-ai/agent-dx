@@ -186,7 +186,7 @@ Rust 属性词法统计未展开宏/target；Python AST 统计不证明 unittest
 | [afs/src/meta/store.rs](../../afs/src/meta/store.rs) | 24 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/meta.rs](../../afs/src/meta.rs) | 5 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/api/local.rs](../../afs/src/node/api/local.rs) | 8 | 0 | 模块测试/私有组件集成混合 |
-| [afs/src/node/chunk/native_live_tests.rs](../../afs/src/node/chunk/native_live_tests.rs) | 20 | 0 | 模块测试/私有组件集成混合 |
+| [afs/src/node/chunk/payload_live_tests.rs](../../afs/src/node/chunk/payload_live_tests.rs) | 20 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/chunk/outboard.rs](../../afs/src/node/chunk/outboard.rs) | 33 | 1 | 模块测试/私有组件集成混合 |
 | [afs/src/node/chunk.rs](../../afs/src/node/chunk.rs) | 114 | 3 | 模块测试/私有组件集成混合 |
 | [afs/src/node/read/object_fetch.rs](../../afs/src/node/read/object_fetch.rs) | 2 | 0 | 模块测试/私有组件集成混合 |
@@ -194,9 +194,9 @@ Rust 属性词法统计未展开宏/target；Python AST 统计不证明 unittest
 | [afs/src/node/external_chunk.rs](../../afs/src/node/external_chunk.rs) | 93 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/fuse/state.rs](../../afs/src/node/fuse/state.rs) | 3 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/fuse.rs](../../afs/src/node/fuse.rs) | 46 | 0 | 模块测试/私有组件集成混合 |
-| [afs/src/node/native_workspace.rs](../../afs/src/node/native_workspace.rs) | 17 | 8 | 模块测试/私有组件集成混合 |
+| [afs/src/node/native_workspace.rs](https://gitcode.com/openJiuwen/agent-dx/blob/1e9ae5f235d412b06fa4195bdbe26860bd7cd840/afs/src/node/native_workspace.rs) | 17 | 8 | 模块测试/私有组件集成混合 |
 | [afs/src/node/read/peer_cache.rs](../../afs/src/node/read/peer_cache.rs) | 54 | 0 | 模块测试/私有组件集成混合 |
-| [afs/src/node/read_work.rs](../../afs/src/node/read_work.rs) | 20 | 0 | 模块测试/私有组件集成混合 |
+| [afs/src/node/metrics/work.rs](../../afs/src/node/metrics/work.rs) | 20 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/replication.rs](../../afs/src/node/replication.rs) | 30 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/rpc/control.rs](../../afs/src/node/rpc/control.rs) | 14 | 1 | 模块测试/私有组件集成混合 |
 | [afs/src/node/rpc/data.rs](../../afs/src/node/rpc/data.rs) | 48 | 5 | 模块测试/私有组件集成混合 |
@@ -204,7 +204,7 @@ Rust 属性词法统计未展开宏/target；Python AST 统计不证明 unittest
 | [afs/src/node/rpc/peer.rs](../../afs/src/node/rpc/peer.rs) | 49 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/storage/localfs.rs](../../afs/src/node/storage/localfs.rs) | 1 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/storage.rs](../../afs/src/node/storage.rs) | 3 | 0 | 模块测试/私有组件集成混合 |
-| [afs/src/node/vfs/dfs/pending_trace.rs](../../afs/src/node/vfs/dfs/pending_trace.rs) | 3 | 0 | 模块测试/私有组件集成混合 |
+| [afs/src/node/vfs/dfs/pending_trace.rs](https://gitcode.com/openJiuwen/agent-dx/blob/1e9ae5f235d412b06fa4195bdbe26860bd7cd840/afs/src/node/vfs/dfs/pending_trace.rs) | 3 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/vfs/dfs.rs](../../afs/src/node/vfs/dfs.rs) | 263 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/vfs/locks.rs](../../afs/src/node/vfs/locks.rs) | 31 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/vfs/ownerfs/bind_mount.rs](../../afs/src/node/vfs/ownerfs/bind_mount.rs) | 11 | 5 | 模块测试/私有组件集成混合 |
@@ -285,7 +285,7 @@ Rust 属性词法统计未展开宏/target；Python AST 统计不证明 unittest
 | [build/e2e/afs/perf/test_dfs_compare.py](../../build/e2e/afs/perf/test_dfs_compare.py) | 40 |
 | [build/e2e/afs/scripts/dfs/test_three_node_core.py](../../build/e2e/afs/scripts/dfs/test_three_node_core.py) | 1 |
 | [build/e2e/afs/scripts/ownerfs/test_bind_two_node_localfile.py](../../build/e2e/afs/scripts/ownerfs/test_bind_two_node_localfile.py) | 4 |
-| [build/e2e/afs/scripts/ownerfs/test_native_workspace_control.py](../../build/e2e/afs/scripts/ownerfs/test_native_workspace_control.py) | 3 |
+| [build/e2e/afs/scripts/ownerfs/test_native_workspace_control.py](https://gitcode.com/openJiuwen/agent-dx/blob/1e9ae5f235d412b06fa4195bdbe26860bd7cd840/build/e2e/afs/scripts/ownerfs/test_native_workspace_control.py) | 3 |
 
 ## 5. 后续使用与本轮边界
 

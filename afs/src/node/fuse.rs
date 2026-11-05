@@ -115,7 +115,7 @@ pub use crate::node::vfs::ownerfs::fuse_policy::{
 pub struct AfsFuse {
     fd_bridge: Option<Arc<FdBridge>>,
     #[cfg(any(feature = "dfs", test))]
-    read_work: Option<crate::node::read_work::ReadWorkMetrics>,
+    read_work: Option<crate::node::metrics::work::ReadWorkMetrics>,
     requests: Option<(FuseRequestMetrics, &'static str)>,
     backend: Arc<dyn Backend>,
     /// [`FuseMountFeatures::kernel_cache`].
@@ -1173,7 +1173,7 @@ impl Filesystem for AfsFuse {
         };
         #[cfg(any(feature = "dfs", test))]
         let diagnostic = self.read_work.as_ref().and_then(|metrics| {
-            metrics.diagnostic(crate::node::read_work::ReadDiagnosticStage::FuseRead)
+            metrics.diagnostic(crate::node::metrics::read_timing::ReadDiagnosticStage::FuseRead)
         });
         self.record_io_request("read", size as usize);
         let ino = ino.0;

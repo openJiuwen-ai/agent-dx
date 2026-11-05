@@ -1,8 +1,8 @@
 //! Diagnostic only. Same Backend behind unmodified AFS FUSE and USRBIO frontends.
 use afs::node::{
     api::local::{LocalApiOptions, serve_local_api_with_options},
+    diagnostics::DiagnosticStorage,
     fuse::{FuseMountOptions, mount_dfs_with_fd_bridge},
-    storage::Storage,
     vfs::{Backend, types::*},
 };
 use afs_client::{DfsAccess, DfsLocalClient, DfsLocalClientConfig, DfsSyncMode};
@@ -253,7 +253,7 @@ async fn main() -> Result<(), Any> {
         let null = a[4] == "null";
         let b = Arc::new(Mem::new(n, null, a[5] == "write"));
         let server = serve_local_api_with_options(
-            Storage::new(root.join("diag"))?,
+            DiagnosticStorage::new(root.join("diag"))?,
             root.join("node.sock"),
             LocalApiOptions {
                 metrics_registry: None,

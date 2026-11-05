@@ -39,7 +39,7 @@ struct State {
 pub(super) struct CatalogCommitter {
     state: Mutex<State>,
     changed: Condvar,
-    metrics: Mutex<Option<super::super::read_work::ReadWorkMetrics>>,
+    metrics: Mutex<Option<super::super::metrics::work::ReadWorkMetrics>>,
 }
 
 #[cfg(test)]
@@ -94,7 +94,7 @@ pub(super) struct Admission<'a> {
 
 impl CatalogCommitter {
     #[cfg(any(feature = "dfs", test))]
-    pub(super) fn set_metrics(&self, metrics: super::super::read_work::ReadWorkMetrics) {
+    pub(super) fn set_metrics(&self, metrics: super::super::metrics::work::ReadWorkMetrics) {
         *self
             .metrics
             .lock()
@@ -568,7 +568,7 @@ impl LocalChunkStore {
             CatalogCommitter::observe_actual(&mut state, 0)?;
         }
         #[cfg(test)]
-        self.catalog_commit_test.before_group();
+        self.test_hooks.catalog_commit_test.before_group();
         let mut state = self
             .catalog_committer
             .state
@@ -694,6 +694,7 @@ impl LocalChunkStore {
         }
         #[cfg(test)]
         if self
+            .test_hooks
             .catalog_commit_test
             .fail_chunks_dir
             .swap(false, Ordering::AcqRel)
@@ -732,6 +733,7 @@ impl LocalChunkStore {
         #[cfg(test)]
         {
             let step = self
+                .test_hooks
                 .catalog_commit_test
                 .fail_wal_step
                 .swap(0, Ordering::AcqRel);
@@ -779,7 +781,7 @@ impl LocalChunkStore {
                     )?;
                 }
                 #[cfg(test)]
-                self.catalog_commit_test.pause_wal();
+                self.test_hooks.catalog_commit_test.pause_wal();
                 Ok(())
             },
         );

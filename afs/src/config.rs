@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    path::{Component, Path, PathBuf},
+    path::{Component, PathBuf},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,20 +31,6 @@ pub enum MetaStoreBackend {
     #[value(name = "memory")]
     InMemory,
 }
-/// Administrator-only experimental single-container workspace configuration.
-/// Eligibility is fixed when OwnerFs is constructed, never switched online.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct NativeWorkspaceConfig {
-    pub control_dir: PathBuf,
-    pub runtime: PathBuf,
-    pub rootfs: PathBuf,
-    pub idle_command: Vec<String>,
-    pub identity_command: Vec<String>,
-    pub workload_uid: u32,
-    pub workload_gid: u32,
-}
-
 /// Administrator-enabled OwnerFs workspace bind mount entry.
 /// The name is a single first-level OwnerFs workspace under the mount root.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -243,9 +229,6 @@ pub struct Cli {
     pub uds_path: Option<PathBuf>,
     #[arg(long)]
     pub ownerfs_mount: Option<PathBuf>,
-    /// Experimental managed-container native path; default false, not production READY.
-    #[arg(long)]
-    pub experimental_native_workspace: Option<bool>,
     /// Experimental OwnerFs workspace bind mount path; default false, not production READY.
     #[arg(long)]
     pub experimental_ownerfs_workspace_bind: Option<bool>,
@@ -405,8 +388,6 @@ struct FileConfig {
     data_dir: Option<PathBuf>,
     uds_path: Option<PathBuf>,
     ownerfs_mount: Option<PathBuf>,
-    experimental_native_workspace: Option<bool>,
-    native_workspace: Option<NativeWorkspaceConfig>,
     experimental_ownerfs_workspace_bind: Option<bool>,
     ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
     ownerfs_workspace_egress_root: Option<PathBuf>,
@@ -516,8 +497,6 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub uds_path: PathBuf,
     pub ownerfs_mount: Option<PathBuf>,
-    pub experimental_native_workspace: bool,
-    pub native_workspace: Option<NativeWorkspaceConfig>,
     pub experimental_ownerfs_workspace_bind: bool,
     pub ownerfs_workspace_bind: Option<WorkspaceBindConfig>,
     pub ownerfs_workspace_egress_root: Option<PathBuf>,
@@ -967,11 +946,6 @@ impl Config {
             data_mode,
             rdma_device: cli.rdma_device.or(file.rdma_device),
             ownerfs_mount: cli.ownerfs_mount.or(file.ownerfs_mount),
-            experimental_native_workspace: cli
-                .experimental_native_workspace
-                .or(file.experimental_native_workspace)
-                .unwrap_or(false),
-            native_workspace: file.native_workspace,
             experimental_ownerfs_workspace_bind: cli
                 .experimental_ownerfs_workspace_bind
                 .or(file.experimental_ownerfs_workspace_bind)
@@ -1126,11 +1100,6 @@ impl Config {
                     "experimental_ownerfs_workspace_bind requires Node OwnerFs with a mount",
                 ));
             }
-            if cfg.experimental_native_workspace {
-                return Err(invalid(
-                    "experimental_ownerfs_workspace_bind cannot be enabled with experimental_native_workspace",
-                ));
-            }
             // The egress root must exist as a stable, admin-configured native
             // path: absolute, no parent traversal, and outside both the FUSE
             // mount and the private data directory so bind targets never cover
@@ -1162,53 +1131,6 @@ impl Config {
             if let Some(bind) = cfg.ownerfs_workspace_bind.as_ref() {
                 validate_ownerfs_workspace_name(&bind.workspace)?;
             }
-        }
-        if cfg.experimental_native_workspace {
-            if role != Role::Node || !cfg.ownerfs || cfg.ownerfs_mount.is_none() {
-                return Err(invalid(
-                    "experimental_native_workspace requires Node OwnerFs with a mount",
-                ));
-            }
-            let native = cfg.native_workspace.as_ref().ok_or_else(|| {
-                invalid(
-                "experimental_native_workspace requires administrator native_workspace settings"
-            )
-            })?;
-            for path in [&native.control_dir, &native.runtime, &native.rootfs] {
-                if !path.is_absolute()
-                    || path
-                        .components()
-                        .any(|c| matches!(c, std::path::Component::ParentDir))
-                {
-                    return Err(invalid(
-                        "native workspace paths must be absolute and contain no parent traversal",
-                    ));
-                }
-            }
-            for path in [&native.control_dir, &native.rootfs, &native.runtime] {
-                if path.starts_with(cfg.ownerfs_mount.as_ref().expect("native mount checked"))
-                    || path.starts_with(&cfg.data_dir)
-                {
-                    return Err(invalid(
-                        "native controller/runtime/rootfs must be outside OwnerFs mount and data directories",
-                    ));
-                }
-            }
-            if native.workload_uid == 0 || native.workload_gid == 0 {
-                return Err(invalid(
-                    "native workspace workload uid/gid must be non-root",
-                ));
-            }
-            if native.control_dir == native.rootfs
-                || native.control_dir.starts_with(&native.rootfs)
-                || native.rootfs.starts_with(&native.control_dir)
-            {
-                return Err(invalid(
-                    "native workspace control directory and rootfs must be disjoint",
-                ));
-            }
-            validate_native_workspace_command(&native.idle_command, "idle_command")?;
-            validate_native_workspace_command(&native.identity_command, "identity_command")?;
         }
         if cfg.dfs_mount.is_some() && !cfg.dfs {
             return Err(invalid("dfs_mount requires fs=dfs or fs=all"));
@@ -1342,42 +1264,6 @@ fn validate_ownerfs_workspace_name(workspace: &str) -> Result<()> {
         return Err(invalid(
             "ownerfs_workspace_bind.workspace must be one first-level workspace name",
         ));
-    }
-    Ok(())
-}
-
-fn validate_native_workspace_command(argv: &[String], field: &str) -> Result<()> {
-    const MAX_ARGS: usize = 32;
-    const MAX_ARG_BYTES: usize = 4096;
-    if argv.is_empty() || argv.len() > MAX_ARGS {
-        return Err(invalid(format!(
-            "native_workspace.{field} must contain 1..{MAX_ARGS} arguments"
-        )));
-    }
-    for arg in argv {
-        if arg.is_empty() || arg.len() > MAX_ARG_BYTES || arg.contains('\0') {
-            return Err(invalid(format!(
-                "native_workspace.{field} arguments must be nonempty, <= {MAX_ARG_BYTES} bytes, and contain no NUL"
-            )));
-        }
-    }
-    let program = Path::new(&argv[0]);
-    if !program.is_absolute()
-        || program.components().any(|component| {
-            matches!(
-                component,
-                Component::CurDir | Component::ParentDir | Component::Prefix(_)
-            )
-        })
-    {
-        return Err(invalid(format!(
-            "native_workspace.{field} executable must be absolute and contain no traversal"
-        )));
-    }
-    if program.file_name().is_none() {
-        return Err(invalid(format!(
-            "native_workspace.{field} executable must name a file"
-        )));
     }
     Ok(())
 }

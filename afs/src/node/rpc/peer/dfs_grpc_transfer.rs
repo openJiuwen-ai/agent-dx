@@ -514,7 +514,7 @@ struct PeerStreamProducer {
     peers: Arc<PeerConnectionPool>,
     active: Arc<PeerStreamActive>,
     control: Option<crate::node::read::engine::PrefetchControl>,
-    diagnostic: Option<crate::node::read_work::ReadDiagnosticToken>,
+    diagnostic: Option<crate::node::metrics::read_timing::ReadDiagnosticToken>,
     deadline: std::time::Instant,
     expected_body_bytes: u64,
 }
@@ -534,7 +534,7 @@ struct PeerStreamConsumer<'c> {
     request: &'c DfsReadRangesRequest,
     chunk: &'c ChunkObject,
     metrics: Option<&'c ReadWorkMetrics>,
-    diagnostic: Option<&'c crate::node::read_work::ReadDiagnosticToken>,
+    diagnostic: Option<&'c crate::node::metrics::read_timing::ReadDiagnosticToken>,
     requested_offset: u64,
     deadline: std::time::Instant,
     prefetch: Option<&'c crate::node::read::engine::PrefetchControl>,

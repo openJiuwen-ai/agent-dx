@@ -12,7 +12,7 @@ impl DfsReadEngine {
         out: &mut [u8],
     ) -> Result<SourceOutcome> {
         self.local
-            .record_read_check(crate::node::read_work::ReadCheck::BatchGroup);
+            .record_read_check(crate::node::metrics::work::ReadCheck::BatchGroup);
         let remote = crate::node::bridge::local_io(|| -> Result<RemoteMask> {
             let mut groups: Vec<(ChunkId, Vec<usize>)> = Vec::new();
             let mut positions: HashMap<ChunkId, usize> = HashMap::new();
@@ -133,7 +133,7 @@ impl DfsReadEngine {
 
     pub(super) fn local_reader(&self, chunk_id: &ChunkId) -> Result<Arc<PinnedChunkReader>> {
         self.local
-            .record_read_check(crate::node::read_work::ReadCheck::LocalProbe);
+            .record_read_check(crate::node::metrics::work::ReadCheck::LocalProbe);
         if let Some(reader) = self
             .readers
             .lock()
@@ -148,7 +148,12 @@ impl DfsReadEngine {
         {
             // Deterministically hold concurrent cold opens before installation.
             // No cache or hook mutex is held while the test barrier waits.
-            let barrier = self.local_reader_install_barrier.lock().unwrap().clone();
+            let barrier = self
+                .test_hooks
+                .local_reader_install_barrier
+                .lock()
+                .unwrap()
+                .clone();
             if let Some(barrier) = barrier {
                 barrier.wait();
             }

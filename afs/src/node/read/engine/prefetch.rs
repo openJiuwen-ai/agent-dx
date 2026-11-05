@@ -229,7 +229,12 @@ impl DfsReadEngine {
             }
             #[cfg(test)]
             {
-                let hook = self.prefetch_attempt_hook.lock().unwrap().clone();
+                let hook = self
+                    .test_hooks
+                    .prefetch_attempt_hook
+                    .lock()
+                    .unwrap()
+                    .clone();
                 if let Some(hook) = hook {
                     hook(window, chunk_id);
                 }

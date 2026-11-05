@@ -26,13 +26,16 @@ use crate::{
     dfs::ChunkObject,
     node::{
         chunk::outboard::{ChunkOutboard, OutboardBudget, OutboardBuilder, SharedOutboard},
+        metrics::{
+            read_timing::{
+                ReadDiagnosticConsumer, ReadDiagnosticConsumerStage, ReadDiagnosticIntervals,
+                ReadDiagnosticProducer, ReadDiagnosticStage,
+            },
+            work::ReadWorkMetrics,
+        },
         read::peer_cache::{
             CompletedPeerDiskRead, PeerObjectProof, PeerStreamProof, PeerStreamSink,
             VerifiedPeerChunk,
-        },
-        read_work::{
-            ReadDiagnosticConsumer, ReadDiagnosticConsumerStage, ReadDiagnosticIntervals,
-            ReadDiagnosticProducer, ReadDiagnosticStage, ReadWorkMetrics,
         },
     },
 };

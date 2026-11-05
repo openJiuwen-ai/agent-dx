@@ -5,7 +5,7 @@ impl DistributedFs {
     /// close contract. Failures remain attached to the inode and are reported
     /// once per open writer by a later write/flush/sync operation.
     pub fn writeback_pending(&self) -> Result<usize> {
-        if self.native.pipeline.is_none() {
+        if self.write_resources.pipeline.is_none() {
             return Ok(0);
         }
         for (_, cell) in self.writes.states.snapshot()? {
@@ -17,7 +17,7 @@ impl DistributedFs {
                 state.native_due_through = state.native_due_through.max(state.visible_write_seq);
             }
         }
-        self.progress_native_writeback()
+        self.progress_writeback()
     }
 
     pub fn renew_active_write_leases(&self) -> Result<usize> {
@@ -113,13 +113,13 @@ impl DistributedFs {
         }
     }
 
-    fn join_native_uploads_for_drain(&self) -> Result<Option<Error>> {
-        let Some(pipeline) = &self.native.pipeline else {
+    fn join_uploads_for_drain(&self) -> Result<Option<Error>> {
+        let Some(pipeline) = &self.write_resources.pipeline else {
             return Ok(None);
         };
         let mut first_error = None;
         loop {
-            if let Some(error) = self.poll_native_uploads()? {
+            if let Some(error) = self.poll_uploads()? {
                 first_error.get_or_insert(error);
             }
             if pipeline
@@ -141,7 +141,7 @@ impl DistributedFs {
     pub fn drain(&self) -> Result<usize> {
         // Harvest existing Node-wide tasks before per-inode preparation can
         // consume a different owner's error. Node shutdown has closed admission.
-        let mut join_error = self.join_native_uploads_for_drain()?;
+        let mut join_error = self.join_uploads_for_drain()?;
         let result = (|| -> Result<usize> {
             let inode_ids = self.writes.states.keys_snapshot()?;
             let mut committed = 0;
@@ -178,7 +178,7 @@ impl DistributedFs {
             }
             Ok(committed)
         })();
-        if let Some(error) = self.join_native_uploads_for_drain()? {
+        if let Some(error) = self.join_uploads_for_drain()? {
             join_error.get_or_insert(error);
         }
         match result {

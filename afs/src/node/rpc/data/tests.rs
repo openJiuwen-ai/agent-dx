@@ -106,7 +106,7 @@ fn wi6_outboard_header_shares_owner_and_preserves_legacy_wire_fields() {
 #[tokio::test]
 async fn grpc_inline_write_then_read_uses_storage() {
     let temp = tempfile::tempdir().unwrap();
-    let storage = Storage::new(temp.path()).unwrap();
+    let storage = DiagnosticStorage::new(temp.path()).unwrap();
     let service = NodeDataService::new(Arc::new(storage), RdmaSessionRegistry::new(None));
 
     let written = service
@@ -141,7 +141,7 @@ async fn grpc_inline_write_then_read_uses_storage() {
 #[tokio::test]
 async fn rdma_read_validates_session_before_touching_storage() {
     let temp = tempfile::tempdir().unwrap();
-    let storage = Storage::new(temp.path()).unwrap();
+    let storage = DiagnosticStorage::new(temp.path()).unwrap();
     let service = NodeDataService::new(Arc::new(storage), RdmaSessionRegistry::new(None));
 
     let error = service
@@ -672,7 +672,7 @@ async fn spawn_grpc_server() -> (tempfile::TempDir, String, tokio::task::JoinHan
         .join("afs-test-tmp");
     std::fs::create_dir_all(&base).unwrap();
     let temp = tempfile::Builder::new().tempdir_in(base).unwrap();
-    let storage = Arc::new(Storage::new(temp.path()).unwrap());
+    let storage = Arc::new(DiagnosticStorage::new(temp.path()).unwrap());
     let registry = RdmaSessionRegistry::new(None);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
@@ -2984,7 +2984,7 @@ fn dfs_corrupt_range_publishes_no_grpc_frames_or_rdma_completions() {
     use crate::node::chunk::StagedChunk;
     let temp = tempfile::tempdir().unwrap();
     let registry = afs_metrics::Registry::new();
-    let metrics = crate::node::read_work::ReadWorkMetrics::register(&registry)
+    let metrics = crate::node::metrics::work::ReadWorkMetrics::register(&registry)
         .unwrap()
         .with_read_diagnostics(true);
     let local = LocalChunkStore::open(temp.path(), "node")
@@ -3012,7 +3012,9 @@ fn dfs_corrupt_range_publishes_no_grpc_frames_or_rdma_completions() {
     let served = snapshot
         .records
         .iter()
-        .find(|record| record.stage == crate::node::read_work::ReadDiagnosticStage::PeerServe)
+        .find(|record| {
+            record.stage == crate::node::metrics::read_timing::ReadDiagnosticStage::PeerServe
+        })
         .unwrap();
     assert!(served.completed && !served.success);
     assert_eq!(
@@ -3123,7 +3125,7 @@ fn dfs_stream_whole_digest_reuse_preserves_wire_and_partial_hash_work() {
     use crate::node::chunk::StagedChunk;
     let temp = tempfile::tempdir().unwrap();
     let registry = afs_metrics::Registry::new();
-    let metrics = crate::node::read_work::ReadWorkMetrics::register(&registry)
+    let metrics = crate::node::metrics::work::ReadWorkMetrics::register(&registry)
         .unwrap()
         .with_read_diagnostics(true);
     let local = LocalChunkStore::open(temp.path(), "node")
@@ -3217,7 +3219,9 @@ fn dfs_stream_whole_digest_reuse_preserves_wire_and_partial_hash_work() {
     let served = diagnostic
         .records
         .iter()
-        .filter(|record| record.stage == crate::node::read_work::ReadDiagnosticStage::PeerServe)
+        .filter(|record| {
+            record.stage == crate::node::metrics::read_timing::ReadDiagnosticStage::PeerServe
+        })
         .collect::<Vec<_>>();
     assert_eq!(served.len(), 4);
     for record in served {
@@ -3421,7 +3425,7 @@ async fn dfs_peer_object_reuse_scans_once_and_still_checks_authority() {
         LocalChunkStore::open(temp.path(), "node")
             .unwrap()
             .with_read_work_metrics(
-                crate::node::read_work::ReadWorkMetrics::register(&registry).unwrap(),
+                crate::node::metrics::work::ReadWorkMetrics::register(&registry).unwrap(),
             ),
     );
     let bytes: Vec<u8> = (0..4 * 1024 * 1024).map(|n| (n % 251) as u8).collect();
@@ -3686,7 +3690,7 @@ async fn dfs_peer_cancel_during_authorization_keeps_permit_until_exit_and_skips_
         LocalChunkStore::open(temp.path(), "node")
             .unwrap()
             .with_read_work_metrics(
-                crate::node::read_work::ReadWorkMetrics::register(&registry).unwrap(),
+                crate::node::metrics::work::ReadWorkMetrics::register(&registry).unwrap(),
             ),
     );
     let staged = StagedChunk::new(

@@ -17,18 +17,19 @@ pub(crate) mod bridge;
 pub(crate) mod call_deadline;
 pub mod chunk;
 pub(crate) mod chunk_crc32c;
+pub mod diagnostics;
 #[cfg(feature = "dfs")]
 pub mod external_chunk;
 pub(crate) mod fault;
 pub mod fuse;
 #[cfg(feature = "dfs")]
 pub mod gc;
-#[cfg(feature = "ownerfs")]
-mod native_workspace;
 pub mod read;
 /// S1e 临时兼容，S1e-6 删：`afs::node::read_pipeline` 旧路径（`afs/tests/config_contract.rs` 引用）。
 pub use read::admission as read_pipeline;
-pub mod read_work;
+pub mod metrics;
+/// S1e 临时兼容，S1e-6 删：`afs::node::read_work` 旧路径（`afs/tests/node_health_contract.rs` 引用）。
+pub use metrics::work as read_work;
 #[cfg(feature = "dfs")]
 pub mod replication;
 pub mod rpc;
@@ -253,7 +254,7 @@ pub struct Node {
     pub session_id: String,
     pub readiness: Arc<NodeReadiness>,
     #[cfg(feature = "dfs")]
-    pub read_work_metrics: read_work::ReadWorkMetrics,
+    pub read_work_metrics: metrics::work::ReadWorkMetrics,
     #[cfg(feature = "ownerfs")]
     pub ownerfs: Option<Arc<vfs::ownerfs::OwnerFs>>,
     #[cfg(feature = "dfs")]
@@ -549,8 +550,8 @@ mod readiness_mount_tests {
 mod node_tcp_server_settings_tests {
     use super::{
         OWNER_ONLY_TCP_MAX_FRAME_SIZE, configure_node_tcp_server,
+        diagnostics::DiagnosticStorage,
         rpc::{control::RdmaSessionRegistry, data::make_data_server},
-        storage::Storage,
     };
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -574,7 +575,7 @@ mod node_tcp_server_settings_tests {
 
     async fn advertised_http2_max_frame_size(ownerfs: bool, dfs: bool) -> u32 {
         let temp = tempfile::tempdir().expect("tempdir");
-        let storage = Storage::new(temp.path().join("data")).expect("storage");
+        let storage = DiagnosticStorage::new(temp.path().join("data")).expect("storage");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -1236,7 +1237,7 @@ async fn run_node(
         None
     };
     #[cfg(feature = "dfs")]
-    let dfs_read_work_metrics = read_work::ReadWorkMetrics::register(&obs.registry)?
+    let dfs_read_work_metrics = metrics::work::ReadWorkMetrics::register(&obs.registry)?
         .with_read_diagnostics(cfg.dfs_read_diagnostics_enabled);
     // A single metadata ledger follows outboards across builders, local
     // readers, Peer frames and the disposable disk cache. Payload and existing
@@ -1445,10 +1446,7 @@ async fn run_node(
             })
             .await??,
         );
-        if workspace_bind_root_commands_enabled(
-            cfg.experimental_ownerfs_workspace_bind,
-            cfg.experimental_native_workspace,
-        ) {
+        if cfg.experimental_ownerfs_workspace_bind {
             workspace_bind_root_control = Some((root_meta, roots.clone()));
         }
         let roots_for_startup = roots.clone();
@@ -1462,12 +1460,6 @@ async fn run_node(
                 disk,
                 remote_factory,
                 egress_root,
-            )
-        } else if cfg.experimental_native_workspace {
-            vfs::ownerfs::OwnerFs::new_local_native_eligible_with_remote(
-                roots,
-                disk,
-                remote_factory,
             )
         } else {
             vfs::ownerfs::OwnerFs::new_local_with_remote(roots, disk, remote_factory)
@@ -1732,16 +1724,14 @@ async fn run_node(
         } else {
             cfg.dfs_upload_inflight_chunks
         };
-        let fs = fs.with_native_write_pipeline(
-            chunk::NativeWriteBudget::new(usize::try_from(cfg.dfs_dirty_budget_bytes).map_err(
-                |_| {
-                    afs_error::Error::coded(
-                        afs_error::CONFIG_INVALID,
-                        "native dirty budget does not fit this platform",
-                    )
-                },
-            )?),
-            vfs::dfs::NativeWriteConfig {
+        let fs = fs.with_write_pipeline(
+            chunk::DirtyBudget::new(usize::try_from(cfg.dfs_dirty_budget_bytes).map_err(|_| {
+                afs_error::Error::coded(
+                    afs_error::CONFIG_INVALID,
+                    "native dirty budget does not fit this platform",
+                )
+            })?),
+            vfs::dfs::WritePipelineConfig {
                 unpublished_descriptors: cfg.dfs_unpublished_descriptors,
                 upload_inflight_chunks,
             },
@@ -1754,7 +1744,9 @@ async fn run_node(
     };
 
     // diagnostics is a separate test object directory, not an OwnerFs or DFS data path.
-    let diagnostic_storage = Arc::new(storage::Storage::new(cfg.data_dir.join("diagnostics"))?);
+    let diagnostic_storage = Arc::new(diagnostics::DiagnosticStorage::new(
+        cfg.data_dir.join("diagnostics"),
+    )?);
     let sessions = rpc::control::RdmaSessionRegistry::new(cfg.rdma_device.clone());
     #[cfg(feature = "ownerfs")]
     let owner_rdma_sessions = rpc::control::RdmaSessionRegistry::new(cfg.rdma_device.clone());
@@ -2020,34 +2012,35 @@ async fn run_node(
         fault::lease_keeper::LeaseKeeper::new(move || renewing.renew_active_write_leases())
             .start(&mut services);
         let stop = services.stop.subscribe();
-        let native_notify = dfs.native_writeback_notify();
-        let native_commit_period = std::time::Duration::from_millis(cfg.dfs_background_commit_ms);
+        let writeback_wakeup = dfs.writeback_notify();
+        let background_commit_period =
+            std::time::Duration::from_millis(cfg.dfs_background_commit_ms);
         services.spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
             tick.tick().await;
-            let mut native_tick = tokio::time::interval(native_commit_period);
-            native_tick.tick().await;
-            let has_native_pipeline = native_notify.is_some();
+            let mut commit_tick = tokio::time::interval(background_commit_period);
+            commit_tick.tick().await;
+            let has_write_pipeline = writeback_wakeup.is_some();
             let shutdown = cancelled(stop);
             tokio::pin!(shutdown);
             loop {
                 tokio::select! {
                     _ = &mut shutdown => return Ok(()),
                     due = async {
-                        match native_notify.as_ref() {
+                        match writeback_wakeup.as_ref() {
                             Some(notify) => tokio::select! {
                                 _ = notify.notified() => false,
-                                _ = native_tick.tick() => true,
+                                _ = commit_tick.tick() => true,
                             },
                             None => std::future::pending::<bool>().await,
                         }
-                    }, if has_native_pipeline => {
+                    }, if has_write_pipeline => {
                         let fs = dfs.clone();
                         match crate::node::bridge::spawn_blocking(move || {
                             if due {
                                 fs.writeback_pending()
                             } else {
-                                fs.progress_native_writeback()
+                                fs.progress_writeback()
                             }
                         }).await {
                             Ok(Ok(count)) if count > 0 => {
@@ -2066,13 +2059,6 @@ async fn run_node(
                         let fs = dfs.clone();
                         match crate::node::bridge::spawn_blocking(move || {
                             let mut first_error = None;
-                            let committed = if has_native_pipeline { 0 } else { match fs.writeback_pending() {
-                                Ok(count) => count,
-                                Err(error) => {
-                                    first_error.get_or_insert(error);
-                                    0
-                                }
-                            }};
                             let remote_releases = match fs.retry_pending_remote_releases() {
                                 Ok(count) => count,
                                 Err(error) => {
@@ -2097,14 +2083,11 @@ async fn run_node(
                             if let Some(error) = first_error {
                                 return Err(error);
                             }
-                            Ok::<_, afs_error::Error>((committed, remote_releases, owner_handles, lock_sessions))
+                            Ok::<_, afs_error::Error>((remote_releases, owner_handles, lock_sessions))
                         }).await {
-                            Ok(Ok((committed, remote_releases, owner_handles, lock_sessions)))
-                                if committed > 0 || remote_releases > 0 || owner_handles > 0 || lock_sessions > 0 =>
+                            Ok(Ok((remote_releases, owner_handles, lock_sessions)))
+                                if remote_releases > 0 || owner_handles > 0 || lock_sessions > 0 =>
                             {
-                                if committed > 0 {
-                                    afs_logging::info!("dfs.background_versions_committed"; "count" => committed);
-                                }
                                 if remote_releases > 0 {
                                     afs_logging::info!("dfs.remote_releases_retried"; "count" => remote_releases);
                                 }
@@ -2307,37 +2290,10 @@ async fn run_node(
         }
         Ok(())
     });
-    #[cfg(feature = "ownerfs")]
-    let mut native_workspace_startup_error = None;
-    #[cfg(feature = "ownerfs")]
-    let mut native_workspace_worker = None;
-    #[cfg(feature = "ownerfs")]
-    if cfg.experimental_native_workspace {
-        let owner = state
-            .ownerfs
-            .clone()
-            .expect("native config requires OwnerFs");
-        let mount = cfg
-            .ownerfs_mount
-            .clone()
-            .expect("native config requires mount");
-        let native = cfg
-            .native_workspace
-            .clone()
-            .expect("native config requires settings");
-        let startup = crate::node::bridge::spawn_blocking(move || {
-            native_workspace::NativeWorkspace::start(owner, mount, native)
-        })
-        .await;
-        (native_workspace_worker, native_workspace_startup_error) =
-            register_native_workspace_startup(&mut services, startup);
-    }
     // Multi-workspace bind mount is handled by MountManager via mkdir triggers.
     // No single-workspace startup worker is needed.
     #[cfg(feature = "ownerfs")]
-    if native_workspace_startup_error.is_none()
-        && let Some((meta, roots)) = workspace_bind_root_control
-    {
+    if let Some((meta, roots)) = workspace_bind_root_control {
         let stop = services.stop.subscribe();
         services.spawn(run_workspace_bind_root_commands(meta, roots, stop));
     }
@@ -2348,7 +2304,7 @@ async fn run_node(
         dfs_shutting_down.store(true, Ordering::Release);
         #[cfg(feature = "dfs")]
         if let Some(dfs) = &state.dfs {
-            dfs.close_native_write_admission();
+            dfs.close_write_admission();
         }
         #[cfg(feature = "dfs")]
         if let Some(store) = &dfs_sidecar_store_for_shutdown {
@@ -2375,16 +2331,6 @@ async fn run_node(
         record_shutdown_stage("admission_closed");
         on_shutdown();
     };
-    #[cfg(feature = "ownerfs")]
-    let mut shutdown_error = if let Some(error) = native_workspace_startup_error {
-        Some(drain_started_services(services, on_shutdown, error).await)
-    } else {
-        afs_logging::info!("node.ready";"grpc"=>cfg.grpc_listen.to_string(),"rest"=>cfg.rest_listen.to_string(),"uds"=>cfg.uds_path.display().to_string(),"ownerfs"=>cfg.ownerfs,"dfs"=>cfg.dfs);
-        #[cfg(test)]
-        record_shutdown_stage("serving");
-        services.run_with_shutdown(on_shutdown).await.err()
-    };
-    #[cfg(not(feature = "ownerfs"))]
     let mut shutdown_error = {
         afs_logging::info!("node.ready";"grpc"=>cfg.grpc_listen.to_string(),"rest"=>cfg.rest_listen.to_string(),"uds"=>cfg.uds_path.display().to_string(),"ownerfs"=>cfg.ownerfs,"dfs"=>cfg.dfs);
         #[cfg(test)]
@@ -2393,25 +2339,6 @@ async fn run_node(
     };
     #[cfg(test)]
     record_shutdown_stage("services_stopped");
-    // A Services timeout may abort its observer, never the owned mount worker.
-    // Keep FUSE alive until that same worker proves normal native closure. The
-    // process-wide watchdog bounds a permanently busy or unresolved claim.
-    #[cfg(feature = "ownerfs")]
-    if let Some(worker) = native_workspace_worker {
-        let closure = crate::node::bridge::spawn_blocking(move || worker.shutdown()).await;
-        let error: Option<BoxError> = match closure {
-            Ok(Ok(())) => None,
-            Ok(Err(error)) => Some(error.into()),
-            Err(error) => Some(error.into()),
-        };
-        if let Some(error) = error {
-            afs_logging::error!("ownerfs.workspace_closure_failed"; "error" => error.to_string());
-            remember_shutdown_error(&mut shutdown_error, error);
-            // No successful closure proof (including a worker panic): keep
-            // FUSE owned until the process watchdog reports failure124.
-            std::future::pending::<()>().await;
-        }
-    }
     #[cfg(feature = "ownerfs")]
     if let Some(owner) = state.ownerfs.as_ref() {
         owner.mount_manager_shutdown();
@@ -2622,11 +2549,6 @@ async fn run_node(
     Ok(())
 }
 
-#[cfg(feature = "ownerfs")]
-fn workspace_bind_root_commands_enabled(host: bool, managed: bool) -> bool {
-    host || managed
-}
-
 /// In-session progress only: no persisted cursor or revoke ACK is produced.
 /// A matching command rejects admission before Services starts normal closure.
 #[cfg(feature = "ownerfs")]
@@ -2737,21 +2659,6 @@ async fn run_workspace_bind_root_commands(
 mod workspace_bind_root_command_tests {
     use super::*;
     use rpc::meta::{RootCommand, RootCommandBatch, RootCommandRecoveryReason, RootCommandType};
-
-    #[test]
-    fn workspace_bind_root_command_default_off_does_not_start_control() {
-        assert!(!workspace_bind_root_commands_enabled(false, false));
-    }
-
-    #[test]
-    fn workspace_bind_root_command_host_only_receives_control() {
-        assert!(workspace_bind_root_commands_enabled(true, false));
-    }
-
-    #[test]
-    fn workspace_bind_root_command_managed_only_receives_control() {
-        assert!(workspace_bind_root_commands_enabled(false, true));
-    }
 
     fn command(id: &str, revision: u64) -> RootCommand {
         RootCommand {
@@ -2881,56 +2788,6 @@ mod workspace_bind_root_command_tests {
         .unwrap_err();
         assert_eq!(error.code(), afs_error::NODE_OWNER_INVALID_GRANT);
     }
-}
-
-#[cfg(feature = "ownerfs")]
-fn register_native_workspace_startup(
-    services: &mut Services,
-    startup: Result<std::io::Result<native_workspace::NativeWorkspace>, tokio::task::JoinError>,
-) -> (Option<native_workspace::NativeWorkspace>, Option<BoxError>) {
-    match startup {
-        Ok(Ok(worker)) => {
-            let monitor = worker.monitor(services.stop.subscribe());
-            services.spawn(async move { monitor.await.map_err(Into::into) });
-            (Some(worker), None)
-        }
-        Ok(Err(error)) => {
-            services.spawn(async {
-                Err::<(), BoxError>(
-                    std::io::Error::other(
-                        "native workspace startup failed after node services started",
-                    )
-                    .into(),
-                )
-            });
-            (None, Some(error.into()))
-        }
-        Err(error) => {
-            services.spawn(async {
-                Err::<(), BoxError>(
-                    std::io::Error::other(
-                        "native workspace startup task failed after node services started",
-                    )
-                    .into(),
-                )
-            });
-            (None, Some(error.into()))
-        }
-    }
-}
-
-#[cfg(feature = "ownerfs")]
-async fn drain_started_services(
-    services: Services,
-    on_shutdown: impl FnOnce(),
-    startup_error: BoxError,
-) -> BoxError {
-    let mut shutdown_error = Some(startup_error);
-    if let Err(error) = services.run_with_shutdown(on_shutdown).await {
-        afs_logging::error!("node.startup_services_failed"; "error" => error.to_string());
-        remember_shutdown_error(&mut shutdown_error, error);
-    }
-    shutdown_error.expect("startup error is preserved")
 }
 
 fn heartbeat_error_is_retryable(error: &afs_error::Error) -> bool {
@@ -3230,111 +3087,6 @@ mod shutdown_tests {
             std::io::Error::other("local shutdown failed").into(),
         );
         assert_eq!(first.unwrap().to_string(), "drain failed");
-    }
-
-    #[cfg(feature = "ownerfs")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn native_workspace_startup_io_failure_drains_services_and_keeps_original_errno() {
-        let mut services = crate::runtime::Services::new();
-        let stop = services.stop.subscribe();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (stop_seen_tx, stop_seen_rx) = tokio::sync::oneshot::channel();
-        let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
-        services.spawn(async move {
-            let _ = started_tx.send(());
-            super::cancelled(stop).await;
-            let _ = stop_seen_tx.send(());
-            let _ = cleanup_tx.send(());
-            Err::<(), crate::runtime::BoxError>(
-                std::io::Error::other("sibling cleanup failed").into(),
-            )
-        });
-        expect_signal(started_rx).await;
-
-        let startup_error = super::register_native_workspace_startup(
-            &mut services,
-            Ok(Err(std::io::Error::from_raw_os_error(13))),
-        )
-        .1
-        .expect("startup error");
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let final_error = tokio::time::timeout(
-            Duration::from_secs(2),
-            super::drain_started_services(
-                services,
-                move || {
-                    let _ = shutdown_tx.send(());
-                },
-                startup_error,
-            ),
-        )
-        .await
-        .expect("bounded drain");
-
-        expect_signal(shutdown_rx).await;
-        expect_signal(stop_seen_rx).await;
-        expect_signal(cleanup_rx).await;
-        let io_error = final_error
-            .downcast_ref::<std::io::Error>()
-            .expect("original io error");
-        assert_eq!(io_error.raw_os_error(), Some(13));
-    }
-
-    #[cfg(feature = "ownerfs")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn native_workspace_startup_join_error_drains_services_and_keeps_original_panic() {
-        let mut services = crate::runtime::Services::new();
-        let stop = services.stop.subscribe();
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (stop_seen_tx, stop_seen_rx) = tokio::sync::oneshot::channel();
-        let (cleanup_tx, cleanup_rx) = tokio::sync::oneshot::channel();
-        services.spawn(async move {
-            let _ = started_tx.send(());
-            super::cancelled(stop).await;
-            let _ = stop_seen_tx.send(());
-            let _ = cleanup_tx.send(());
-            Ok(())
-        });
-        expect_signal(started_rx).await;
-
-        let startup = tokio::task::spawn_blocking(
-            || -> std::io::Result<super::native_workspace::NativeWorkspace> {
-                panic!("native workspace startup panic")
-            },
-        )
-        .await;
-        let startup_error = super::register_native_workspace_startup(&mut services, startup)
-            .1
-            .expect("startup join error");
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-        let final_error = tokio::time::timeout(
-            Duration::from_secs(2),
-            super::drain_started_services(
-                services,
-                move || {
-                    let _ = shutdown_tx.send(());
-                },
-                startup_error,
-            ),
-        )
-        .await
-        .expect("bounded drain");
-
-        expect_signal(shutdown_rx).await;
-        expect_signal(stop_seen_rx).await;
-        expect_signal(cleanup_rx).await;
-        let join_error = final_error
-            .downcast_ref::<tokio::task::JoinError>()
-            .expect("original join error");
-        assert!(join_error.is_panic());
-    }
-
-    #[cfg(feature = "ownerfs")]
-    async fn expect_signal<T>(rx: tokio::sync::oneshot::Receiver<T>) -> T {
-        tokio::time::timeout(Duration::from_secs(2), rx)
-            .await
-            .expect("bounded signal")
-            .expect("sender kept")
     }
 
     #[cfg(feature = "dfs")]

@@ -13,7 +13,7 @@ use afs_error::{Error, Result};
 
 use super::super::{
     chunk::outboard::{OutboardBudget, OutboardLease},
-    read_work::ReadWorkMetrics,
+    metrics::work::ReadWorkMetrics,
 };
 
 const MAX_FETCH_TASKS: usize = 8;

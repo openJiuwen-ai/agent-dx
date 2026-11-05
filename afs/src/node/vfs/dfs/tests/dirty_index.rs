@@ -6,7 +6,7 @@ use super::*;
 #[derive(Default)]
 struct W1LegacyDirtyMap {
     extents: Vec<DirtyExtent>,
-    builders: Vec<NativeDirtyBuilder>,
+    builders: Vec<DirtyBuilder>,
     native_admitted_bytes: Option<u64>,
 }
 
@@ -72,7 +72,7 @@ impl W1LegacyDirtyMap {
                     Err(error) => return Err(error),
                 };
                 let index = self.builders.len();
-                self.builders.push(NativeDirtyBuilder {
+                self.builders.push(DirtyBuilder {
                     file_offset: position,
                     builder,
                     descriptor: None,

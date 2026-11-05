@@ -13,7 +13,7 @@ pub struct GrpcDfsMeta {
     pub(super) timeout: Duration,
     sequence: AtomicU64,
     pub(super) placement: Mutex<Option<Arc<crate::dfs::PlacementSnapshot>>>,
-    pub(super) read_work: Option<crate::node::read_work::ReadWorkMetrics>,
+    pub(super) read_work: Option<crate::node::metrics::work::ReadWorkMetrics>,
 }
 
 #[cfg(feature = "dfs")]
@@ -55,7 +55,7 @@ impl GrpcDfsMeta {
 
     pub(crate) fn with_read_work_metrics(
         mut self,
-        metrics: crate::node::read_work::ReadWorkMetrics,
+        metrics: crate::node::metrics::work::ReadWorkMetrics,
     ) -> Self {
         self.read_work = Some(metrics);
         self
@@ -71,7 +71,7 @@ impl GrpcDfsMeta {
     // and domain conversion. It is a client adapter interval, not server CPU.
     pub(super) fn read_diagnostic<T>(
         &self,
-        stage: crate::node::read_work::ReadDiagnosticStage,
+        stage: crate::node::metrics::read_timing::ReadDiagnosticStage,
         call: impl FnOnce() -> afs_error::Result<T>,
     ) -> afs_error::Result<T> {
         let (diagnostic, _coarse) = self.begin_read_diagnostic(stage);
@@ -84,12 +84,12 @@ impl GrpcDfsMeta {
 
     pub(super) fn begin_read_diagnostic(
         &self,
-        stage: crate::node::read_work::ReadDiagnosticStage,
+        stage: crate::node::metrics::read_timing::ReadDiagnosticStage,
     ) -> (
-        Option<crate::node::read_work::ReadDiagnosticSpan>,
-        Option<crate::node::read_work::ReadCoarseDiagnosticSpan>,
+        Option<crate::node::metrics::read_timing::ReadDiagnosticSpan>,
+        Option<crate::node::metrics::read_timing::ReadCoarseDiagnosticSpan>,
     ) {
-        use crate::node::read_work::ReadDiagnosticStage;
+        use crate::node::metrics::read_timing::ReadDiagnosticStage;
         let diagnostic = self
             .read_work
             .as_ref()
@@ -180,7 +180,9 @@ impl GrpcDfsMeta {
         afs_protocol::meta::meta_client::MetaClient::new(self.channel.clone())
     }
 
-    pub(crate) fn authorization_metrics(&self) -> Option<crate::node::read_work::ReadWorkMetrics> {
+    pub(crate) fn authorization_metrics(
+        &self,
+    ) -> Option<crate::node::metrics::work::ReadWorkMetrics> {
         self.read_work.clone()
     }
 
@@ -189,7 +191,7 @@ impl GrpcDfsMeta {
         request: crate::dfs::ValidateDfsReadGrants,
     ) -> afs_error::Result<Vec<crate::dfs::DfsAuthorizedRead>> {
         self.read_diagnostic(
-            crate::node::read_work::ReadDiagnosticStage::MetaValidateReadGrants,
+            crate::node::metrics::read_timing::ReadDiagnosticStage::MetaValidateReadGrants,
             || {
                 self.record_read_rpc("validate_read_grants");
                 let validations = request

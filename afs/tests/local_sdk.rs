@@ -2,7 +2,8 @@ use std::{os::unix::fs::PermissionsExt, path::Path, sync::Arc, time::Duration};
 
 use afs::node::{
     api::local::{LocalApiServer, serve_local_api},
-    storage::{MAX_TRANSFER_BYTES, Storage},
+    diagnostics::DiagnosticStorage,
+    storage::MAX_TRANSFER_BYTES,
 };
 use afs_client::{
     DiagnosticLocalClient, DiagnosticLocalClientConfig, LocalClientError,
@@ -15,7 +16,7 @@ use tower::service_fn;
 
 async fn start_local_api(temp: &tempfile::TempDir) -> (LocalApiServer, DiagnosticLocalClient) {
     let socket_path = temp.path().join("afs-node.sock");
-    let storage = Storage::new(temp.path().join("data")).expect("storage");
+    let storage = DiagnosticStorage::new(temp.path().join("data")).expect("storage");
     let server = serve_local_api(storage, &socket_path)
         .await
         .expect("serve local api");
@@ -67,7 +68,7 @@ async fn diagnostic_local_sdk_writes_and_reads_eight_bytes_through_shm() {
 async fn local_api_rejects_missing_shm_grant_without_data_fallback() {
     let temp = tempfile::tempdir().expect("tempdir");
     let socket_path = temp.path().join("afs-node.sock");
-    let storage = Storage::new(temp.path().join("data")).expect("storage");
+    let storage = DiagnosticStorage::new(temp.path().join("data")).expect("storage");
     let server = serve_local_api(storage, &socket_path)
         .await
         .expect("serve local api");
@@ -92,7 +93,7 @@ async fn local_api_rejects_missing_shm_grant_without_data_fallback() {
 async fn local_api_socket_is_owner_only() {
     let temp = tempfile::tempdir().expect("tempdir");
     let socket_path = temp.path().join("afs-node.sock");
-    let storage = Storage::new(temp.path().join("data")).expect("storage");
+    let storage = DiagnosticStorage::new(temp.path().join("data")).expect("storage");
     let server = serve_local_api(storage, &socket_path)
         .await
         .expect("serve local api");
@@ -119,7 +120,7 @@ async fn local_api_socket_is_owner_only() {
 async fn server_shutdown_removes_owned_socket() {
     let temp = tempfile::tempdir().expect("tempdir");
     let socket_path = temp.path().join("afs-node.sock");
-    let storage = Storage::new(temp.path().join("data")).expect("storage");
+    let storage = DiagnosticStorage::new(temp.path().join("data")).expect("storage");
     let server = serve_local_api(storage, &socket_path)
         .await
         .expect("serve local api");

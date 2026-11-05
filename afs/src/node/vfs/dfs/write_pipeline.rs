@@ -1,16 +1,17 @@
 use super::*;
 
-const NATIVE_METADATA_BYTES: usize = 4 * 1024 * 1024;
-const NATIVE_CONTROL_BYTES: usize = 64 * 1024;
-pub(super) const NATIVE_DESCRIPTOR_BYTES: usize = NATIVE_METADATA_BYTES - NATIVE_CONTROL_BYTES;
+const PIPELINE_METADATA_BYTES: usize = 4 * 1024 * 1024;
+const PIPELINE_CONTROL_BYTES: usize = 64 * 1024;
+pub(super) const PIPELINE_DESCRIPTOR_BYTES: usize =
+    PIPELINE_METADATA_BYTES - PIPELINE_CONTROL_BYTES;
 
 #[derive(Clone, Copy)]
-pub(crate) struct NativeWriteConfig {
+pub(crate) struct WritePipelineConfig {
     pub unpublished_descriptors: usize,
     pub upload_inflight_chunks: usize,
 }
 
-impl Default for NativeWriteConfig {
+impl Default for WritePipelineConfig {
     fn default() -> Self {
         Self {
             unpublished_descriptors: 1024,
@@ -20,7 +21,7 @@ impl Default for NativeWriteConfig {
 }
 
 #[derive(Default)]
-pub(super) struct NativeMetadataState {
+pub(super) struct PipelineMetadataState {
     control_bytes: usize,
     control_peak: usize,
     pub(super) descriptor_bytes: usize,
@@ -37,34 +38,34 @@ pub(super) struct NativeMetadataState {
     pub(super) pressure_live: u64,
 }
 
-pub(super) struct NativeMetadataBudget {
-    pub(super) state: Mutex<NativeMetadataState>,
+pub(super) struct PipelineMetadataBudget {
+    pub(super) state: Mutex<PipelineMetadataState>,
     descriptor_limit: usize,
     pub(super) upload_limit: usize,
     notify: Arc<tokio::sync::Notify>,
 }
 
-pub(super) struct NativeMetadataLease {
-    pub(super) budget: Arc<NativeMetadataBudget>,
+pub(super) struct PipelineMetadataLease {
+    pub(super) budget: Arc<PipelineMetadataBudget>,
     pub(super) bytes: usize,
     descriptor: bool,
     counted_descriptor: bool,
     pub(super) actual_bytes: usize,
 }
 
-impl NativeMetadataBudget {
+impl PipelineMetadataBudget {
     pub(super) fn reserve(
         self: &Arc<Self>,
         bytes: usize,
         descriptor: bool,
-    ) -> Result<Option<NativeMetadataLease>> {
+    ) -> Result<Option<PipelineMetadataLease>> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| unavailable("native metadata budget is poisoned"))?;
         if descriptor {
             if state.descriptors >= self.descriptor_limit
-                || bytes > NATIVE_DESCRIPTOR_BYTES.saturating_sub(state.descriptor_reserved_bytes)
+                || bytes > PIPELINE_DESCRIPTOR_BYTES.saturating_sub(state.descriptor_reserved_bytes)
             {
                 return Ok(None);
             }
@@ -72,13 +73,13 @@ impl NativeMetadataBudget {
             state.descriptor_reserved_bytes += bytes;
             state.descriptor_peak_count = state.descriptor_peak_count.max(state.descriptors);
         } else {
-            if bytes > NATIVE_CONTROL_BYTES.saturating_sub(state.control_bytes) {
+            if bytes > PIPELINE_CONTROL_BYTES.saturating_sub(state.control_bytes) {
                 return Ok(None);
             }
             state.control_bytes += bytes;
             state.control_peak = state.control_peak.max(state.control_bytes);
         }
-        Ok(Some(NativeMetadataLease {
+        Ok(Some(PipelineMetadataLease {
             budget: self.clone(),
             bytes,
             descriptor,
@@ -88,7 +89,7 @@ impl NativeMetadataBudget {
     }
 }
 
-impl NativeMetadataLease {
+impl PipelineMetadataLease {
     pub(super) fn set_actual(&mut self, actual: usize) -> Result<()> {
         let budget = self.budget.clone();
         let mut state = budget
@@ -103,12 +104,12 @@ impl NativeMetadataLease {
     pub(super) fn set_actual_locked(
         &mut self,
         actual: usize,
-        state: &mut NativeMetadataState,
+        state: &mut PipelineMetadataState,
     ) -> Result<()> {
         if self.descriptor {
             let reserved = self.bytes.max(actual.saturating_mul(4));
             if reserved - self.bytes
-                > NATIVE_DESCRIPTOR_BYTES.saturating_sub(state.descriptor_reserved_bytes)
+                > PIPELINE_DESCRIPTOR_BYTES.saturating_sub(state.descriptor_reserved_bytes)
             {
                 return Err(unavailable(
                     "native metadata actual capacity exceeds its reservation",
@@ -131,7 +132,7 @@ impl NativeMetadataLease {
     }
 }
 
-pub(super) fn native_receipt_heap(receipt: &ChunkReceipt) -> usize {
+pub(super) fn receipt_heap(receipt: &ChunkReceipt) -> usize {
     receipt.operation_id.0.capacity()
         + receipt.chunk.id.0.capacity()
         + receipt.replica_group_id.0.capacity()
@@ -153,7 +154,7 @@ pub(super) fn native_receipt_heap(receipt: &ChunkReceipt) -> usize {
         })
 }
 
-impl Drop for NativeMetadataLease {
+impl Drop for PipelineMetadataLease {
     fn drop(&mut self) {
         if let Ok(mut state) = self.budget.state.lock() {
             if self.descriptor {
@@ -172,13 +173,13 @@ impl Drop for NativeMetadataLease {
 }
 
 #[derive(Default)]
-pub(super) struct NativeTicketQueue {
+pub(super) struct MutationTicketQueue {
     pub(super) values: VecDeque<u64>,
-    allocation: Option<NativeMetadataLease>,
+    allocation: Option<PipelineMetadataLease>,
 }
 
-impl NativeTicketQueue {
-    pub(super) fn push(&mut self, id: u64, budget: &Arc<NativeMetadataBudget>) -> Result<()> {
+impl MutationTicketQueue {
+    pub(super) fn push(&mut self, id: u64, budget: &Arc<PipelineMetadataBudget>) -> Result<()> {
         if self.values.len() == self.values.capacity() {
             let target = self.values.capacity().saturating_mul(2).max(4);
             let bytes = target
@@ -228,15 +229,15 @@ impl NativeTicketQueue {
 
 /// Native write resources: the upload pipeline (installed by the Node
 /// assembly, absent in plain unit fixtures) and the staging buffer pool.
-pub(super) struct NativeWrites {
-    pub(super) pipeline: Option<Arc<NativeWritePipeline>>,
+pub(super) struct WriteResources {
+    pub(super) pipeline: Option<Arc<WritePipeline>>,
     pub(super) buffer_pool: Arc<WriteBufferPool>,
 }
 
-impl Default for NativeWrites {
+impl Default for WriteResources {
     fn default() -> Self {
         Self {
-            // 原生存储的写流水线由装配方用 `with_native_write_pipeline` 装上（需要 Node runtime）；
+            // 原生存储的写流水线由装配方用 `with_write_pipeline` 装上（需要 Node runtime）；
             // 构造时不装，避免出现只在测试里存在的"无 runtime 流水线"。
             pipeline: None,
             buffer_pool: WriteBufferPool::new(128 * 1024 * 1024),
@@ -244,29 +245,29 @@ impl Default for NativeWrites {
     }
 }
 
-pub(super) struct NativeWritePipeline {
-    pub(super) budget: Arc<NativeWriteBudget>,
-    pub(super) metadata: Arc<NativeMetadataBudget>,
+pub(super) struct WritePipeline {
+    pub(super) budget: Arc<DirtyBudget>,
+    pub(super) metadata: Arc<PipelineMetadataBudget>,
     pub(super) runtime: tokio::runtime::Handle,
     pub(super) notify: Arc<tokio::sync::Notify>,
-    pub(super) metrics: Option<crate::node::read_work::ReadWorkMetrics>,
+    pub(super) metrics: Option<crate::node::metrics::work::ReadWorkMetrics>,
     pub(super) closed: AtomicBool,
     pub(super) next_ticket: AtomicU64,
-    pub(super) allocation_queue: Mutex<NativeTicketQueue>,
-    pub(super) tasks: Mutex<Vec<Arc<NativeUpload>>>,
-    _task_capacity: Option<NativeMetadataLease>,
+    pub(super) allocation_queue: Mutex<MutationTicketQueue>,
+    pub(super) tasks: Mutex<Vec<Arc<PipelineUpload>>>,
+    _task_capacity: Option<PipelineMetadataLease>,
 }
 
-impl NativeWritePipeline {
+impl WritePipeline {
     pub(super) fn new(
-        budget: Arc<NativeWriteBudget>,
-        config: NativeWriteConfig,
+        budget: Arc<DirtyBudget>,
+        config: WritePipelineConfig,
         runtime: tokio::runtime::Handle,
-        metrics: Option<crate::node::read_work::ReadWorkMetrics>,
+        metrics: Option<crate::node::metrics::work::ReadWorkMetrics>,
     ) -> Self {
         let notify = Arc::new(tokio::sync::Notify::new());
-        let metadata = Arc::new(NativeMetadataBudget {
-            state: Mutex::new(NativeMetadataState::default()),
+        let metadata = Arc::new(PipelineMetadataBudget {
+            state: Mutex::new(PipelineMetadataState::default()),
             descriptor_limit: config.unpublished_descriptors,
             upload_limit: config.upload_inflight_chunks,
             notify: notify.clone(),
@@ -274,7 +275,7 @@ impl NativeWritePipeline {
         let tasks = Vec::with_capacity(config.upload_inflight_chunks);
         let task_capacity = metadata
             .reserve(
-                tasks.capacity() * std::mem::size_of::<Arc<NativeUpload>>(),
+                tasks.capacity() * std::mem::size_of::<Arc<PipelineUpload>>(),
                 false,
             )
             .ok()
@@ -287,7 +288,7 @@ impl NativeWritePipeline {
             metrics,
             closed: AtomicBool::new(false),
             next_ticket: AtomicU64::new(1),
-            allocation_queue: Mutex::new(NativeTicketQueue::default()),
+            allocation_queue: Mutex::new(MutationTicketQueue::default()),
             tasks: Mutex::new(tasks),
             _task_capacity: task_capacity,
         }
@@ -315,9 +316,9 @@ impl NativeWritePipeline {
                 ("descriptor_peak_count", state.descriptor_peak_count as u64),
                 ("control_bytes", state.control_bytes as u64),
                 ("control_peak_bytes", state.control_peak as u64),
-                ("control_reserve_bytes", NATIVE_CONTROL_BYTES as u64),
-                ("metadata_limit_bytes", NATIVE_METADATA_BYTES as u64),
-                ("descriptor_limit_bytes", NATIVE_DESCRIPTOR_BYTES as u64),
+                ("control_reserve_bytes", PIPELINE_CONTROL_BYTES as u64),
+                ("metadata_limit_bytes", PIPELINE_METADATA_BYTES as u64),
+                ("descriptor_limit_bytes", PIPELINE_DESCRIPTOR_BYTES as u64),
                 ("upload_inflight", state.inflight as u64),
                 ("upload_peak", state.inflight_peak as u64),
                 ("upload_limit", self.metadata.upload_limit as u64),
@@ -330,13 +331,13 @@ impl NativeWritePipeline {
     }
 }
 
-pub(super) struct NativeMutationTicket {
+pub(super) struct MutationTicket {
     pub(super) id: u64,
     pub(super) cell: SharedInodeWriteState,
-    pub(super) pipeline: Arc<NativeWritePipeline>,
+    pub(super) pipeline: Arc<WritePipeline>,
 }
 
-impl Drop for NativeMutationTicket {
+impl Drop for MutationTicket {
     fn drop(&mut self) {
         if let Ok(mut state) = self.cell.lock() {
             if state.native_queue.values.front() == Some(&self.id) {
@@ -349,12 +350,12 @@ impl Drop for NativeMutationTicket {
     }
 }
 
-pub(super) struct NativeAllocationTurn {
+pub(super) struct AllocationTurn {
     pub(super) id: u64,
-    pub(super) pipeline: Arc<NativeWritePipeline>,
+    pub(super) pipeline: Arc<WritePipeline>,
 }
 
-impl Drop for NativeAllocationTurn {
+impl Drop for AllocationTurn {
     fn drop(&mut self) {
         if let Ok(mut queue) = self.pipeline.allocation_queue.lock() {
             queue.remove(self.id);
@@ -363,14 +364,14 @@ impl Drop for NativeAllocationTurn {
     }
 }
 
-pub(super) struct NativeCommitAccounting {
-    pub(super) budget: Arc<NativeMetadataBudget>,
+pub(super) struct CommitAccounting {
+    pub(super) budget: Arc<PipelineMetadataBudget>,
     pub(super) reserved: usize,
     pub(super) actual: AtomicUsize,
-    pub(super) _owners: Vec<Arc<Mutex<NativeMetadataLease>>>,
+    pub(super) _owners: Vec<Arc<Mutex<PipelineMetadataLease>>>,
 }
 
-impl NativeCommitAccounting {
+impl CommitAccounting {
     pub(super) fn set_actual(&self, bytes: usize) -> Result<()> {
         if bytes > self.reserved {
             return Err(unavailable(
@@ -392,7 +393,7 @@ impl NativeCommitAccounting {
     }
 }
 
-impl Drop for NativeCommitAccounting {
+impl Drop for CommitAccounting {
     fn drop(&mut self) {
         if let Ok(mut state) = self.budget.state.lock() {
             state.scratch_reserved_bytes =
@@ -405,11 +406,11 @@ impl Drop for NativeCommitAccounting {
     }
 }
 
-pub(super) struct NativeRpcAccounting {
-    pub(super) accounting: Arc<NativeCommitAccounting>,
+pub(super) struct CommitRpcAccounting {
+    pub(super) accounting: Arc<CommitAccounting>,
     pub(super) base: usize,
 }
-impl Drop for NativeRpcAccounting {
+impl Drop for CommitRpcAccounting {
     fn drop(&mut self) {
         let _ = self.accounting.set_actual(self.base);
     }
@@ -419,7 +420,7 @@ impl Drop for NativeRpcAccounting {
 // Do not impose a new file-size limit on those existing layers. This ledger
 // covers W2's additional retained receipts and incremental publication owners;
 // full-layout/domain/wire capacity remains a separately reported RSS cost.
-pub(super) fn native_commit_heap(commit: &CommitFileVersion) -> usize {
+pub(super) fn commit_heap(commit: &CommitFileVersion) -> usize {
     std::mem::size_of::<CommitFileVersion>()
         + commit.operation_id.0.capacity()
         + commit.inode_id.0.capacity()
@@ -434,12 +435,12 @@ pub(super) fn native_commit_heap(commit: &CommitFileVersion) -> usize {
         + commit
             .chunk_receipts
             .iter()
-            .map(native_receipt_heap)
+            .map(receipt_heap)
             .sum::<usize>()
 }
 
-pub(super) struct NativeUploadPermit(pub(super) Arc<NativeMetadataBudget>);
-impl Drop for NativeUploadPermit {
+pub(super) struct UploadPermit(pub(super) Arc<PipelineMetadataBudget>);
+impl Drop for UploadPermit {
     fn drop(&mut self) {
         if let Ok(mut state) = self.0.state.lock() {
             state.inflight = state.inflight.saturating_sub(1);
@@ -448,17 +449,17 @@ impl Drop for NativeUploadPermit {
     }
 }
 
-pub(super) struct NativeUpload {
+pub(super) struct PipelineUpload {
     pub(super) _gc_pin: Option<Arc<crate::node::gc::GcPin>>,
     pub(super) operation_id: OperationId,
     pub(super) chunk: ChunkObject,
     pub(super) owner: Weak<InodeWriteStateCell>,
-    pub(super) state: Mutex<NativeUploadState>,
+    pub(super) state: Mutex<PipelineUploadState>,
     pub(super) cv: Condvar,
-    pub(super) _descriptor: Arc<Mutex<NativeMetadataLease>>,
+    pub(super) _descriptor: Arc<Mutex<PipelineMetadataLease>>,
 }
 
-pub(super) struct NativeUploadState {
+pub(super) struct PipelineUploadState {
     pub(super) body: Option<SharedChunkBytes>,
     pub(super) staged: Option<StagedChunk>,
     pub(super) task: Option<tokio::task::JoinHandle<Result<StoredChunk>>>,
@@ -468,7 +469,7 @@ pub(super) struct NativeUploadState {
     pub(super) joining: bool,
 }
 
-impl NativeUpload {
+impl PipelineUpload {
     pub(super) fn read_at(
         &self,
         store: &dyn ChunkSink,
@@ -503,17 +504,17 @@ impl NativeUpload {
     }
 }
 
-pub(super) struct NativeInodeMutationGuard<'a> {
+pub(super) struct InodeMutationGuard<'a> {
     pub(super) state: std::sync::MutexGuard<'a, InodeWriteState>,
-    pub(super) _ticket: Option<NativeMutationTicket>,
+    pub(super) _ticket: Option<MutationTicket>,
 }
-impl std::ops::Deref for NativeInodeMutationGuard<'_> {
+impl std::ops::Deref for InodeMutationGuard<'_> {
     type Target = InodeWriteState;
     fn deref(&self) -> &Self::Target {
         &self.state
     }
 }
-impl std::ops::DerefMut for NativeInodeMutationGuard<'_> {
+impl std::ops::DerefMut for InodeMutationGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.state
     }

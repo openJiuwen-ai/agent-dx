@@ -517,6 +517,7 @@ mod linux {
         namespace_identity_from_metadata(&metadata)
     }
 
+    #[cfg(test)]
     fn namespace_identity(file: &File) -> io::Result<NamespaceIdentity> {
         namespace_identity_from_metadata(&file.metadata()?)
     }
@@ -541,6 +542,7 @@ mod linux {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::node) fn inspect_secondary_clone(
         namespace: &File,
         root: &File,
@@ -559,6 +561,7 @@ mod linux {
         })
     }
 
+    #[cfg(test)]
     pub(in crate::node) fn detach_secondary_clone(
         namespace: &File,
         root: &File,
@@ -608,6 +611,7 @@ mod linux {
         }
     }
 
+    #[cfg(test)]
     fn in_mount_namespace<T>(
         namespace: &File,
         body: impl FnOnce() -> io::Result<T>,
@@ -626,6 +630,7 @@ mod linux {
         }
     }
 
+    #[cfg(test)]
     #[allow(unsafe_code)]
     fn change_directory(directory: &File) -> io::Result<()> {
         // SAFETY: the directory descriptor is owned and live. This controller
@@ -637,6 +642,7 @@ mod linux {
         }
     }
 
+    #[cfg(test)]
     #[allow(unsafe_code)]
     fn setns_mount(namespace: &File) -> io::Result<()> {
         // SAFETY: namespace is an owned live descriptor; setns consumes no pointer and
@@ -947,6 +953,7 @@ mod linux {
         }
     }
 
+    #[cfg(test)]
     #[allow(unsafe_code)]
     fn normal_unmount(path: &std::ffi::CStr) -> io::Result<()> {
         // SAFETY: path is NUL-terminated and live. Flags 0 request normal unmount.
@@ -1548,8 +1555,7 @@ mod linux {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(in crate::node) use linux::WorkspaceBindMount;
 #[cfg(target_os = "linux")]
-pub(in crate::node) use linux::{
-    AuthorizedWorkspaceBind, WorkspaceBindMount, detach_egress_bind, detach_secondary_clone,
-    inspect_secondary_clone, scan_egress_binds,
-};
+pub(in crate::node) use linux::{AuthorizedWorkspaceBind, detach_egress_bind, scan_egress_binds};

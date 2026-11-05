@@ -4,7 +4,7 @@ fn wait_for_s3_puts(store: &FakeS3Store, fs: &DistributedFs, puts: usize) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while store.puts.load(Ordering::SeqCst) < puts {
         assert!(Instant::now() < deadline, "S3 uploads did not start");
-        fs.progress_native_writeback().unwrap();
+        fs.progress_writeback().unwrap();
         std::thread::sleep(Duration::from_millis(1));
     }
 }

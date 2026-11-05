@@ -66,8 +66,13 @@ pub(super) struct CacheInner {
     pub(super) sampler_seed: u64,
     pub(super) activity: CacheActivity,
     #[cfg(test)]
+    pub(super) test_hooks: CacheTestHooks,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct CacheTestHooks {
     pub(super) eviction_samples: VecDeque<(usize, usize)>,
-    #[cfg(test)]
     pub(super) forced_access_bucket: Option<u64>,
 }
 
@@ -1091,7 +1096,7 @@ fn restore_lru_position(inner: &mut CacheInner, position: usize, key: CacheKey) 
 
 fn current_cache_access_bucket(_inner: &CacheInner) -> u64 {
     #[cfg(test)]
-    if let Some(bucket) = _inner.forced_access_bucket {
+    if let Some(bucket) = _inner.test_hooks.forced_access_bucket {
         return bucket;
     }
     static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
@@ -1170,7 +1175,7 @@ pub(super) fn access_bucket_for(inner: &CacheInner, key: &CacheKey) -> Option<u6
 
 fn sample_eviction_candidates(inner: &mut CacheInner, len: usize) -> (usize, usize) {
     #[cfg(test)]
-    if let Some(pair) = inner.eviction_samples.pop_front() {
+    if let Some(pair) = inner.test_hooks.eviction_samples.pop_front() {
         return pair;
     }
     let first = sample_index(&mut inner.sampler_seed, len);

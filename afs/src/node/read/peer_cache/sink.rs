@@ -253,7 +253,7 @@ impl PeerStreamSink<'_> {
         self.file = Some(file);
         self.owns_pending = true;
         #[cfg(test)]
-        if self.cache.lock_state()?.fail_stream_metadata {
+        if self.cache.lock_state()?.test_hooks.fail_stream_metadata {
             return Err(unavailable("injected pending descriptor metadata failure"));
         }
         let file = self
@@ -329,7 +329,7 @@ impl PeerStreamSink<'_> {
         #[cfg(test)]
         std::thread::sleep(self.write_delay);
         #[cfg(test)]
-        if self.cache.lock_state()?.fail_stream_write {
+        if self.cache.lock_state()?.test_hooks.fail_stream_write {
             self.disable(&unavailable("injected stream cache write failure"));
         }
         if let Some(file) = &mut self.file

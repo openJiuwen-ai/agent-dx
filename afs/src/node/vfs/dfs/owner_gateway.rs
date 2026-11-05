@@ -74,9 +74,14 @@ pub(super) struct OwnerGateway {
     /// Replay table for proxied write/resize/sync (R54).
     remote_operation_results: Mutex<OwnerOperationTable>,
     #[cfg(test)]
-    owner_open_finish_pause: Mutex<Option<Arc<OwnerOpenFinishPause>>>,
-    #[cfg(test)]
-    remote_operation_before_apply: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    test_hooks: OwnerGatewayTestHooks,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct OwnerGatewayTestHooks {
+    pub(super) owner_open_finish_pause: Mutex<Option<Arc<OwnerOpenFinishPause>>>,
+    pub(super) remote_operation_before_apply: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -164,9 +169,7 @@ impl OwnerGateway {
             owner_handle_reap_cursor: AtomicU64::new(0),
             remote_operation_results: Mutex::new(OwnerOperationTable::default()),
             #[cfg(test)]
-            owner_open_finish_pause: Mutex::new(None),
-            #[cfg(test)]
-            remote_operation_before_apply: Mutex::new(None),
+            test_hooks: OwnerGatewayTestHooks::default(),
         }
     }
 
@@ -726,17 +729,26 @@ impl OwnerGateway {
 impl OwnerGateway {
     #[cfg(test)]
     pub(super) fn set_owner_open_finish_pause(&self, pause: Option<Arc<OwnerOpenFinishPause>>) {
-        *self.owner_open_finish_pause.lock().unwrap() = pause;
+        *self.test_hooks.owner_open_finish_pause.lock().unwrap() = pause;
     }
 
     #[cfg(test)]
     pub(super) fn set_remote_operation_before_apply(&self, hook: Box<dyn FnOnce() + Send>) {
-        *self.remote_operation_before_apply.lock().unwrap() = Some(hook);
+        *self
+            .test_hooks
+            .remote_operation_before_apply
+            .lock()
+            .unwrap() = Some(hook);
     }
 
     #[cfg(test)]
     fn run_remote_operation_before_apply_hook(&self) {
-        let hook = self.remote_operation_before_apply.lock().unwrap().take();
+        let hook = self
+            .test_hooks
+            .remote_operation_before_apply
+            .lock()
+            .unwrap()
+            .take();
         if let Some(hook) = hook {
             hook();
         }
@@ -749,7 +761,12 @@ impl OwnerGateway {
 
     #[cfg(test)]
     fn pause_before_owner_open_finish(&self) {
-        let pause = self.owner_open_finish_pause.lock().unwrap().clone();
+        let pause = self
+            .test_hooks
+            .owner_open_finish_pause
+            .lock()
+            .unwrap()
+            .clone();
         if let Some(pause) = pause {
             pause.pause();
         }
@@ -1800,7 +1817,7 @@ impl DistributedFs {
         }
         let deadline = Instant::now() + self.read_engine.read_pipeline_timeout();
         let data = self
-            .read_native_bytes_async(file, &snapshot, offset, length, deadline, Arc::new(()))
+            .read_replicated_bytes_async(file, &snapshot, offset, length, deadline, Arc::new(()))
             .await?
             .to_vec();
         let visible_write_seq =

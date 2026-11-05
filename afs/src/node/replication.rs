@@ -763,7 +763,7 @@ impl ChunkSink for DfsChunkSink {
         } else {
             self.put_replicated_batch(staged, snapshot.revision)?
         };
-        if intent == PutIntent::NativeUpload && snapshot.local_copy.requires_local() {
+        if intent == PutIntent::PipelineUpload && snapshot.local_copy.requires_local() {
             self.confirm_local_required_copies(&mut stored)?;
         }
         Ok(stored)
@@ -1146,7 +1146,7 @@ mod tests {
         );
         let input = staged("native-durable-body");
         let mut receipts = store
-            .put_chunks(vec![input.clone()], PutIntent::NativeUpload)
+            .put_chunks(vec![input.clone()], PutIntent::PipelineUpload)
             .unwrap();
         let receipt = receipts.remove(0);
         assert_eq!(receipt.body_release, BodyRelease::ReleaseAfterUpload);
@@ -1240,7 +1240,7 @@ mod tests {
         );
 
         let uploaded = store
-            .put_chunks(vec![staged("intent-upload")], PutIntent::NativeUpload)
+            .put_chunks(vec![staged("intent-upload")], PutIntent::PipelineUpload)
             .unwrap();
         assert_eq!(uploaded[0].body_release, BodyRelease::ReleaseAfterUpload);
         assert_eq!(control.reservations.lock().unwrap().len(), 1);
@@ -1270,7 +1270,7 @@ mod tests {
             Arc::new(FakeDataPlane::default()),
         );
         let receipt = store
-            .put_chunks(vec![staged("remote-native")], PutIntent::NativeUpload)
+            .put_chunks(vec![staged("remote-native")], PutIntent::PipelineUpload)
             .unwrap()
             .remove(0);
         assert_eq!(receipt.body_release, BodyRelease::RetainUntilPublish);
@@ -2294,7 +2294,7 @@ mod tests {
 
             let item = staged("effective-local-head");
             let stored = sink
-                .put_chunks(vec![item.clone()], PutIntent::NativeUpload)
+                .put_chunks(vec![item.clone()], PutIntent::PipelineUpload)
                 .unwrap();
 
             assert!(holds(&local, &item), "{declared:?}/{effective:?}");
@@ -2338,7 +2338,7 @@ mod tests {
             let sink = sink_on(local.clone(), snapshot, plane.clone());
 
             let item = staged("effective-remote-head");
-            let result = sink.put_chunks(vec![item.clone()], PutIntent::NativeUpload);
+            let result = sink.put_chunks(vec![item.clone()], PutIntent::PipelineUpload);
 
             assert!(!holds(&local, &item), "{declared:?}/{effective:?}");
             assert_eq!(result.is_ok(), accepted, "{declared:?}/{effective:?}");
@@ -2518,13 +2518,13 @@ mod tests {
 
         // On its own the upload half keeps the body until publication.
         let alone = inner
-            .put_chunks(vec![staged("composite-alone")], PutIntent::NativeUpload)
+            .put_chunks(vec![staged("composite-alone")], PutIntent::PipelineUpload)
             .unwrap();
         assert_eq!(alone[0].body_release, BodyRelease::RetainUntilPublish);
 
         let sink: Arc<dyn ChunkSink> = Arc::new(StagingSink { staging, inner });
         let stored = sink
-            .put_chunks(vec![item.clone()], PutIntent::NativeUpload)
+            .put_chunks(vec![item.clone()], PutIntent::PipelineUpload)
             .unwrap();
 
         // The published receipt is the upload's; the body is durable in staging.
@@ -2563,7 +2563,7 @@ mod tests {
             inner: Arc::new(FailingSink),
         });
         let error = sink
-            .put_chunks(vec![item.clone()], PutIntent::NativeUpload)
+            .put_chunks(vec![item.clone()], PutIntent::PipelineUpload)
             .unwrap_err();
         assert_eq!(error.code(), afs_error::NODE_TRANSFER_UNAVAILABLE);
         assert!(holds(&staged_on, &item));
@@ -2575,7 +2575,7 @@ mod tests {
             inner,
         });
         assert!(
-            sink.put_chunks(vec![item], PutIntent::NativeUpload)
+            sink.put_chunks(vec![item], PutIntent::PipelineUpload)
                 .is_err()
         );
         assert!(plane.prepared.lock().unwrap().is_empty());
@@ -3027,7 +3027,7 @@ mod tests {
         sorted[(sorted.len() * per_mille / 1000).min(sorted.len() - 1)]
     }
 
-    /// Per-call cost of the production single-chunk put (`native_write.rs`).
+    /// Per-call cost of the production single-chunk put (`write_pipeline_ops.rs`).
     /// Each call persists a distinct CRC32C object, as native uploads do, and
     /// each cell gets a fresh store so the catalog does not grow across cells.
     ///
@@ -3073,7 +3073,7 @@ mod tests {
                             (result.unwrap().len(), elapsed, call_allocs, call_bytes)
                         } else {
                             let (result, elapsed, call_allocs, call_bytes) =
-                                timed(|| store.put_chunks(vec![staged], PutIntent::NativeUpload));
+                                timed(|| store.put_chunks(vec![staged], PutIntent::PipelineUpload));
                             (result.unwrap().len(), elapsed, call_allocs, call_bytes)
                         };
                         assert_eq!(count, 1);

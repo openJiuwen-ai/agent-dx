@@ -36,9 +36,14 @@ const DEFAULT_RANGE_WORK_WAIT: Duration = Duration::from_millis(2);
 struct RangeWorkState {
     stopped: bool,
     #[cfg(test)]
-    waiters: usize,
-    #[cfg(test)]
-    before_wait: Option<(
+    test_hooks: RangeWorkTestHooks,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct RangeWorkTestHooks {
+    pub(super) waiters: usize,
+    pub(super) before_wait: Option<(
         std::sync::mpsc::SyncSender<()>,
         std::sync::mpsc::Receiver<()>,
     )>,
@@ -50,7 +55,7 @@ pub struct OutboardBudget {
     used: AtomicUsize,
     resident_limit: usize,
     resident_used: AtomicUsize,
-    metrics: Option<super::super::read_work::ReadWorkMetrics>,
+    metrics: Option<super::super::metrics::work::ReadWorkMetrics>,
     work_wait: Duration,
     work_state: Mutex<RangeWorkState>,
     work_changed: Condvar,
@@ -62,21 +67,21 @@ impl OutboardBudget {
     #[cfg(test)]
     pub(crate) fn new_with_metrics(
         limit: usize,
-        metrics: super::super::read_work::ReadWorkMetrics,
+        metrics: super::super::metrics::work::ReadWorkMetrics,
     ) -> Arc<Self> {
         Self::create(limit, Some(metrics), DEFAULT_RANGE_WORK_WAIT)
     }
     #[cfg(feature = "dfs")]
     pub(crate) fn new_with_metrics_and_work_wait(
         limit: usize,
-        metrics: super::super::read_work::ReadWorkMetrics,
+        metrics: super::super::metrics::work::ReadWorkMetrics,
         work_wait: Duration,
     ) -> Arc<Self> {
         Self::create(limit, Some(metrics), work_wait)
     }
     fn create(
         limit: usize,
-        metrics: Option<super::super::read_work::ReadWorkMetrics>,
+        metrics: Option<super::super::metrics::work::ReadWorkMetrics>,
         work_wait: Duration,
     ) -> Arc<Self> {
         if let Some(metrics) = &metrics {
@@ -203,14 +208,14 @@ impl OutboardBudget {
         }
         loop {
             #[cfg(test)]
-            if let Some((checked, resume)) = state.before_wait.take() {
+            if let Some((checked, resume)) = state.test_hooks.before_wait.take() {
                 checked.send(()).ok()?;
                 resume.recv().ok()?;
             }
             let remaining = deadline.checked_duration_since(Instant::now())?;
             #[cfg(test)]
             {
-                state.waiters += 1;
+                state.test_hooks.waiters += 1;
             }
             // release/stop take this same mutex. They cannot notify between
             // our capacity check and the atomic unlock-and-wait operation.
@@ -218,7 +223,7 @@ impl OutboardBudget {
             state = next;
             #[cfg(test)]
             {
-                state.waiters -= 1;
+                state.test_hooks.waiters -= 1;
             }
             if state.stopped || Instant::now() >= deadline {
                 return None;
@@ -1553,7 +1558,7 @@ mod tests {
         assert_eq!(budget.used(), RANGE_WORKING_BYTES);
         let (checked, checked_rx) = mpsc::sync_channel(0);
         let (resume, resume_rx) = mpsc::sync_channel(0);
-        budget.work_state.lock().unwrap().before_wait = Some((checked, resume_rx));
+        budget.work_state.lock().unwrap().test_hooks.before_wait = Some((checked, resume_rx));
         let waiting_budget = budget.clone();
         let waiter = thread::spawn(move || waiting_budget.try_reserve_range_work());
         checked_rx.recv().unwrap();
@@ -1582,7 +1587,7 @@ mod tests {
     fn c1a_wait_for_waiters(budget: &OutboardBudget, count: usize) {
         let guard = Instant::now() + Duration::from_secs(2);
         loop {
-            if budget.work_state.lock().unwrap().waiters == count {
+            if budget.work_state.lock().unwrap().test_hooks.waiters == count {
                 return;
             }
             assert!(
@@ -1598,7 +1603,7 @@ mod tests {
         let budget = OutboardBudget::create(RANGE_WORKING_BYTES, None, Duration::ZERO);
         let held = budget.try_reserve(RANGE_WORKING_BYTES).unwrap();
         assert!(budget.try_reserve_range_work().is_none());
-        assert_eq!(budget.work_state.lock().unwrap().waiters, 0);
+        assert_eq!(budget.work_state.lock().unwrap().test_hooks.waiters, 0);
         assert!(budget.try_reserve(1).is_none());
         assert!(budget.try_reserve_resident(1).is_none());
         drop(held);
@@ -1664,14 +1669,14 @@ mod tests {
         let held = budget.try_reserve(RANGE_WORKING_BYTES).unwrap();
         let (checked, checked_rx) = mpsc::sync_channel(0);
         let (resume, resume_rx) = mpsc::sync_channel(0);
-        budget.work_state.lock().unwrap().before_wait = Some((checked, resume_rx));
+        budget.work_state.lock().unwrap().test_hooks.before_wait = Some((checked, resume_rx));
         let waiting = budget.clone();
         let waiter = std::thread::spawn(move || waiting.try_reserve_range_work().is_none());
         checked_rx.recv().unwrap();
         std::thread::sleep(Duration::from_millis(5));
         resume.send(()).unwrap();
         assert!(waiter.join().unwrap());
-        assert_eq!(budget.work_state.lock().unwrap().waiters, 0);
+        assert_eq!(budget.work_state.lock().unwrap().test_hooks.waiters, 0);
         assert_eq!(budget.used(), RANGE_WORKING_BYTES);
         drop(held);
     }
@@ -2759,7 +2764,8 @@ mod tests {
     #[test]
     fn pr60_ledger_metrics_do_not_call_read_builder_fallback_a_native_write() {
         let registry = afs_metrics::Registry::new();
-        let metrics = super::super::super::read_work::ReadWorkMetrics::register(&registry).unwrap();
+        let metrics =
+            super::super::super::metrics::work::ReadWorkMetrics::register(&registry).unwrap();
         let budget = OutboardBudget::new_with_metrics(1024, metrics);
         let resident = budget.try_reserve_resident(512).unwrap();
         let working = budget.try_reserve(256).unwrap();

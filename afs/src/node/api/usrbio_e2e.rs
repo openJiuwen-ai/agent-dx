@@ -20,9 +20,9 @@ use crate::{
     node::{
         api::local::{LocalApiOptions, serve_local_api_with_options},
         chunk::LocalChunkStore,
+        diagnostics::DiagnosticStorage,
         read::engine::{ChunkTransfer, DfsReadConfig, DfsReadEngine, PeerReadBatch},
         rpc::meta::{GrpcDfsMeta, register_node_with_readiness},
-        storage::Storage,
         vfs::{Backend, dfs::DistributedFs, types},
     },
     runtime::Observability,
@@ -205,9 +205,9 @@ async fn real_dfs(temp: &std::path::Path) -> (Arc<DistributedFs>, tokio::task::J
             chunk_store,
             read_engine,
         )
-        .with_native_write_pipeline(
-            crate::node::chunk::NativeWriteBudget::new(64 * 1024 * 1024),
-            crate::node::vfs::dfs::NativeWriteConfig {
+        .with_write_pipeline(
+            crate::node::chunk::DirtyBudget::new(64 * 1024 * 1024),
+            crate::node::vfs::dfs::WritePipelineConfig {
                 unpublished_descriptors: 1024,
                 upload_inflight_chunks: 8,
             },
@@ -256,7 +256,7 @@ async fn usrbio_round_trips_on_a_real_dfs_backend() {
     assert!(handle.0 > 0, "创建必须返回有效句柄");
 
     let socket_path = temp.path().join("afs-node.sock");
-    let storage = Storage::new(temp.path().join("diagnostics")).expect("storage");
+    let storage = DiagnosticStorage::new(temp.path().join("diagnostics")).expect("storage");
     let server_task = serve_local_api_with_options(
         storage,
         &socket_path,
@@ -375,7 +375,7 @@ async fn usrbio_perf_single_vs_batch() {
     .expect("create perf.bin");
 
     let socket_path = temp.path().join("afs-node.sock");
-    let storage = Storage::new(temp.path().join("diagnostics")).expect("storage");
+    let storage = DiagnosticStorage::new(temp.path().join("diagnostics")).expect("storage");
     let server_task = serve_local_api_with_options(
         storage,
         &socket_path,
@@ -487,7 +487,7 @@ async fn usrbio_perf_bulk_throughput() {
     let temp = tempfile::tempdir().expect("tempdir");
     let backend = Arc::new(MemoryBackend::new(1024));
     let socket_path = temp.path().join("afs-node.sock");
-    let storage = Storage::new(temp.path().join("diagnostics")).expect("storage");
+    let storage = DiagnosticStorage::new(temp.path().join("diagnostics")).expect("storage");
     let server = serve_local_api_with_options(
         storage,
         &socket_path,
@@ -638,7 +638,7 @@ async fn usrbio_multi_client_rings_keep_regions_isolated() {
     .expect("create shared.bin");
 
     let socket_path = temp.path().join("afs-node.sock");
-    let storage = Storage::new(temp.path().join("diagnostics")).expect("storage");
+    let storage = DiagnosticStorage::new(temp.path().join("diagnostics")).expect("storage");
     let api = serve_local_api_with_options(
         storage,
         &socket_path,
@@ -736,7 +736,7 @@ async fn usrbio_writes_are_visible_through_the_backend_read_path() {
     .expect("create visible.bin");
 
     let socket_path = temp.path().join("afs-node.sock");
-    let storage = Storage::new(temp.path().join("diagnostics")).expect("storage");
+    let storage = DiagnosticStorage::new(temp.path().join("diagnostics")).expect("storage");
     let api = serve_local_api_with_options(
         storage,
         &socket_path,
@@ -833,7 +833,7 @@ async fn usrbio_perf_real_disk_one_gib() {
     .expect("create bulk.bin");
 
     let socket_path = temp.path().join("afs-node.sock");
-    let storage = Storage::new(temp.path().join("diagnostics")).expect("storage");
+    let storage = DiagnosticStorage::new(temp.path().join("diagnostics")).expect("storage");
     let api = serve_local_api_with_options(
         storage,
         &socket_path,
@@ -958,7 +958,7 @@ async fn usrbio_perf_real_disk_scaling() {
     .expect("create scale.bin");
 
     let socket_path = temp.path().join("afs-node.sock");
-    let storage = Storage::new(temp.path().join("diagnostics")).expect("storage");
+    let storage = DiagnosticStorage::new(temp.path().join("diagnostics")).expect("storage");
     let api = serve_local_api_with_options(
         storage,
         &socket_path,
@@ -1245,7 +1245,7 @@ async fn usrbio_perf_read_path() {
     .expect("create readpath.bin");
 
     let socket_path = temp.path().join("afs-node.sock");
-    let storage = Storage::new(temp.path().join("diagnostics")).expect("storage");
+    let storage = DiagnosticStorage::new(temp.path().join("diagnostics")).expect("storage");
     let api = serve_local_api_with_options(
         storage,
         &socket_path,
@@ -1394,7 +1394,7 @@ async fn usrbio_posix_fd_write_child() {
     let mount_path = temp.as_path().join("mount");
     std::fs::create_dir_all(&mount_path).unwrap();
     let api = serve_local_api_with_options(
-        Storage::new(temp.as_path().join("diag")).unwrap(),
+        DiagnosticStorage::new(temp.as_path().join("diag")).unwrap(),
         temp.as_path().join("node.sock"),
         LocalApiOptions {
             metrics_registry: None,

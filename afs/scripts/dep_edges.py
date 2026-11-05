@@ -21,7 +21,7 @@ RPC = re.compile(r"node::rpc::")
 
 # Data-layer modules directly under src/node: a name prefix matches both `x.rs` and `x/`.
 DATA_PREFIXES = ("dfs_read", "peer_cache", "chunk", "read", "external_chunk")
-DATA_NAMES = ("dfs_fetch", "native_prefetch", "replication", "gc", "fault")
+DATA_NAMES = ("dfs_fetch", "direct_prefetch", "replication", "gc", "fault")
 
 
 def under(*prefixes):

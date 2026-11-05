@@ -12,7 +12,7 @@ impl DistributedFs {
                 .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
             while state.operation_busy
                 || state.commit_busy
-                    && (self.native.pipeline.is_none()
+                    && (self.write_resources.pipeline.is_none()
                         || Self::in_flight_blocks_mutation(&state.in_flight))
             {
                 state = cell
@@ -27,7 +27,7 @@ impl DistributedFs {
                 drop(state);
                 return Ok(InodeOperationGuard {
                     cell,
-                    native_notify: self.native_writeback_notify(),
+                    native_notify: self.writeback_notify(),
                 });
             }
             drop(state);
@@ -45,15 +45,15 @@ impl DistributedFs {
         &self,
         inode_id: &InodeId,
         cell: &'a SharedInodeWriteState,
-    ) -> Result<NativeInodeMutationGuard<'a>> {
-        let ticket = self.native_ticket(cell)?;
+    ) -> Result<InodeMutationGuard<'a>> {
+        let ticket = self.mutation_ticket(cell)?;
         loop {
             let mut state = cell
                 .lock()
                 .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
             while state.operation_busy
                 || state.commit_busy
-                    && (self.native.pipeline.is_none()
+                    && (self.write_resources.pipeline.is_none()
                         || Self::in_flight_blocks_mutation(&state.in_flight))
             {
                 state = cell
@@ -64,7 +64,7 @@ impl DistributedFs {
                 return Err(error);
             }
             if !Self::in_flight_blocks_mutation(&state.in_flight) {
-                return Ok(NativeInodeMutationGuard {
+                return Ok(InodeMutationGuard {
                     state,
                     _ticket: ticket,
                 });
@@ -90,7 +90,7 @@ impl DistributedFs {
         frozen: &mut FrozenCommit,
         operation_id: &OperationId,
         layout_id: LayoutRootId,
-        retained_uploads: &mut Vec<Arc<NativeUpload>>,
+        retained_uploads: &mut Vec<Arc<PipelineUpload>>,
     ) -> Result<(LayoutRoot, Vec<ChunkReceipt>)> {
         let mut plan = CommitPlanner.plan_with_integrity(
             frozen,
@@ -101,7 +101,7 @@ impl DistributedFs {
         let mut receipts: Vec<ChunkReceipt> = Vec::new();
         for extent in frozen.dirty_extents.extents.values() {
             if let Some(upload) = &extent.native_upload {
-                let receipt = self.wait_native_upload(upload)?;
+                let receipt = self.wait_upload(upload)?;
                 if extent.file_offset < frozen.logical_length {
                     plan.layout_root.inline_extents.push(Extent {
                         file_offset: extent.file_offset,
@@ -136,7 +136,7 @@ impl DistributedFs {
                 .ok_or_else(|| {
                     unavailable("native publication body has no descriptor reservation")
                 })?;
-            let upload = Arc::new(NativeUpload {
+            let upload = Arc::new(PipelineUpload {
                 _gc_pin: frozen.dirty_extents.native_gc_pin.clone(),
                 operation_id: operation_id.clone(),
                 chunk: staged.chunk.clone(),
@@ -144,7 +144,7 @@ impl DistributedFs {
                     .write_state(&frozen.inode.inode_id)?
                     .as_ref()
                     .map_or_else(Weak::new, Arc::downgrade),
-                state: Mutex::new(NativeUploadState {
+                state: Mutex::new(PipelineUploadState {
                     body: Some(body),
                     staged: Some(staged),
                     task: None,
@@ -181,7 +181,7 @@ impl DistributedFs {
                 }
             }
             retained_uploads.push(upload.clone());
-            let receipt = self.wait_native_upload(&upload)?;
+            let receipt = self.wait_upload(&upload)?;
             if !receipts
                 .iter()
                 .any(|previous| previous.chunk.id == receipt.chunk.id)
@@ -256,13 +256,12 @@ impl DistributedFs {
             layout_root,
             receipts,
         );
-        let native_accounting =
-            self.reserve_native_commit_accounting(frozen, &commit, &native_uploads)?;
+        let native_accounting = self.reserve_commit_accounting(frozen, &commit, &native_uploads)?;
         Ok(CommitBatch {
             _gc_pin: gc_pin,
             through_seq: frozen.through_seq,
-            _native_accounting: native_accounting,
-            _native_uploads: native_uploads,
+            _pipeline_accounting: native_accounting,
+            _pipeline_uploads: native_uploads,
             commit: Arc::new(commit),
         })
     }
@@ -390,12 +389,12 @@ impl DistributedFs {
 
     /// Charge the commit's metadata against scratch its descriptors already
     /// reserved. Admission happened at write time, so this fails, never waits.
-    fn reserve_native_commit_accounting(
+    fn reserve_commit_accounting(
         &self,
         frozen: &FrozenCommit,
         commit: &CommitFileVersion,
-        native_uploads: &Vec<Arc<NativeUpload>>,
-    ) -> std::result::Result<Option<Arc<NativeCommitAccounting>>, PrepareCommitError> {
+        native_uploads: &Vec<Arc<PipelineUpload>>,
+    ) -> std::result::Result<Option<Arc<CommitAccounting>>, PrepareCommitError> {
         if frozen.dirty_extents.native_operation_id.is_none()
             || commit.chunk_receipts.is_empty()
                 && !frozen
@@ -405,14 +404,14 @@ impl DistributedFs {
         {
             return Ok(None);
         }
-        let pipeline = self
-            .native
-            .pipeline
-            .as_ref()
-            .ok_or_else(|| PrepareCommitError {
-                error: unavailable("native write pipeline is missing"),
-            })?;
-        let mut owners: Vec<Arc<Mutex<NativeMetadataLease>>> = Vec::new();
+        let pipeline =
+            self.write_resources
+                .pipeline
+                .as_ref()
+                .ok_or_else(|| PrepareCommitError {
+                    error: unavailable("native write pipeline is missing"),
+                })?;
+        let mut owners: Vec<Arc<Mutex<PipelineMetadataLease>>> = Vec::new();
         for extent in frozen.dirty_extents.iter_extents() {
             if let Some(owner) = &extent.native_descriptor
                 && !owners.iter().any(|other| Arc::ptr_eq(other, owner))
@@ -428,9 +427,9 @@ impl DistributedFs {
             owned_headroom =
                 owned_headroom.saturating_add(owner.bytes.saturating_sub(owner.actual_bytes));
         }
-        let base = native_commit_heap(commit)
-            + owners.capacity() * std::mem::size_of::<Arc<Mutex<NativeMetadataLease>>>()
-            + native_uploads.capacity() * std::mem::size_of::<Arc<NativeUpload>>();
+        let base = commit_heap(commit)
+            + owners.capacity() * std::mem::size_of::<Arc<Mutex<PipelineMetadataLease>>>()
+            + native_uploads.capacity() * std::mem::size_of::<Arc<PipelineUpload>>();
         let reserved = base.saturating_mul(3);
         let mut state = pipeline
             .metadata
@@ -454,7 +453,7 @@ impl DistributedFs {
         state.descriptor_bytes += base;
         state.descriptor_peak = state.descriptor_peak.max(state.descriptor_bytes);
         drop(state);
-        Ok(Some(Arc::new(NativeCommitAccounting {
+        Ok(Some(Arc::new(CommitAccounting {
             budget: pipeline.metadata.clone(),
             reserved,
             actual: AtomicUsize::new(base),
@@ -528,7 +527,7 @@ impl DistributedFs {
         let Some(state) = self.write_state(&session.inode_id)? else {
             return Ok(());
         };
-        let _native_ticket = self.native_ticket_with_cleanup(&state, true)?;
+        let _native_ticket = self.mutation_ticket_with_cleanup(&state, true)?;
         let mut state = state
             .lock()
             .map_err(|_| unavailable("DFS inode write state is poisoned"))?;

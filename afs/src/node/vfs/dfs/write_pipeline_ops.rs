@@ -1,39 +1,39 @@
 use super::*;
 
 /// Where a native write's next bytes go, as read before unlocked admission.
-struct NativeWriteTarget {
+struct WriteTarget {
     position: u64,
     selection: Option<(usize, usize, usize)>,
     capacity: usize,
     generation: Option<OperationId>,
     seq: u64,
-    owner: Arc<NativeWriteOwner>,
+    owner: Arc<DirtyOwner>,
 }
 
-struct NativeReservationRequest<'a> {
+struct ReservationRequest<'a> {
     turn_id: u64,
     operation_id: &'a OperationId,
-    owner: &'a Arc<NativeWriteOwner>,
+    owner: &'a Arc<DirtyOwner>,
     capacity: usize,
     has_accepted_prefix: bool,
 }
 
-enum NativeReservation {
+enum Reservation {
     Reserved {
         builder: ChunkBuilder,
-        descriptor: Option<Arc<Mutex<NativeMetadataLease>>>,
+        descriptor: Option<Arc<Mutex<PipelineMetadataLease>>>,
     },
     /// Out of memory with a prefix already visible: end the write short.
     StopAccepting,
 }
 
-struct NativeWriteApply<'a> {
+struct WriteApply<'a> {
     append: bool,
     offset: u64,
     data: &'a [u8],
     accepted: usize,
     kill_suidgid: bool,
-    target: NativeWriteTarget,
+    target: WriteTarget,
     operation_id: OperationId,
 }
 
@@ -43,7 +43,11 @@ impl DistributedFs {
     pub(super) fn crc32c_writes(&self) -> bool {
         !self.read_engine.has_external_backend()
     }
-    fn stage_native_chunk(&self, op: OperationId, bytes: SharedChunkBytes) -> Result<StagedChunk> {
+    fn stage_pipeline_chunk(
+        &self,
+        op: OperationId,
+        bytes: SharedChunkBytes,
+    ) -> Result<StagedChunk> {
         if self.crc32c_writes() {
             StagedChunk::from_shared_crc32c(op, bytes)
         } else {
@@ -51,15 +55,15 @@ impl DistributedFs {
         }
     }
 
-    pub(crate) fn native_writeback_notify(&self) -> Option<Arc<tokio::sync::Notify>> {
-        self.native
+    pub(crate) fn writeback_notify(&self) -> Option<Arc<tokio::sync::Notify>> {
+        self.write_resources
             .pipeline
             .as_ref()
             .map(|pipeline| pipeline.notify.clone())
     }
 
-    pub(crate) fn close_native_write_admission(&self) {
-        if let Some(pipeline) = &self.native.pipeline {
+    pub(crate) fn close_write_admission(&self) {
+        if let Some(pipeline) = &self.write_resources.pipeline {
             pipeline.closed.store(true, Ordering::Release);
             pipeline.budget.stop();
             pipeline.notify.notify_waiters();
@@ -71,19 +75,19 @@ impl DistributedFs {
         }
     }
 
-    pub(super) fn native_ticket(
+    pub(super) fn mutation_ticket(
         &self,
         cell: &SharedInodeWriteState,
-    ) -> Result<Option<NativeMutationTicket>> {
-        self.native_ticket_with_cleanup(cell, false)
+    ) -> Result<Option<MutationTicket>> {
+        self.mutation_ticket_with_cleanup(cell, false)
     }
 
-    pub(super) fn native_ticket_with_cleanup(
+    pub(super) fn mutation_ticket_with_cleanup(
         &self,
         cell: &SharedInodeWriteState,
         cleanup: bool,
-    ) -> Result<Option<NativeMutationTicket>> {
-        let Some(pipeline) = &self.native.pipeline else {
+    ) -> Result<Option<MutationTicket>> {
+        let Some(pipeline) = &self.write_resources.pipeline else {
             return Ok(None);
         };
         if !cleanup && pipeline.closed.load(Ordering::Acquire) {
@@ -97,7 +101,7 @@ impl DistributedFs {
             return Ok(None);
         }
         state.native_queue.push(id, &pipeline.metadata)?;
-        let ticket = NativeMutationTicket {
+        let ticket = MutationTicket {
             id,
             cell: cell.clone(),
             pipeline: pipeline.clone(),
@@ -122,8 +126,8 @@ impl DistributedFs {
         Ok(Some(ticket))
     }
 
-    pub(super) fn observe_native_resources(&self) {
-        let Some(pipeline) = &self.native.pipeline else {
+    pub(super) fn observe_pipeline_resources(&self) {
+        let Some(pipeline) = &self.write_resources.pipeline else {
             return;
         };
         pipeline.observe();
@@ -141,11 +145,7 @@ impl DistributedFs {
         }
     }
 
-    fn native_wait_mutation_ready(
-        &self,
-        inode: &InodeId,
-        cell: &SharedInodeWriteState,
-    ) -> Result<()> {
+    fn wait_mutation_ready(&self, inode: &InodeId, cell: &SharedInodeWriteState) -> Result<()> {
         loop {
             let state = cell
                 .lock()
@@ -173,7 +173,7 @@ impl DistributedFs {
         }
     }
 
-    fn native_owner_limit(&self, pipeline: &NativeWritePipeline) -> Result<usize> {
+    fn dirty_owner_limit(&self, pipeline: &WritePipeline) -> Result<usize> {
         let mut writers = 0;
         for (_, cell) in self.writes.states.snapshot()? {
             let state = cell
@@ -186,7 +186,7 @@ impl DistributedFs {
         Ok((16 * 1024 * 1024).max(pipeline.budget.snapshot().limit / writers.max(1)))
     }
 
-    pub(super) fn native_ordinary_write(
+    pub(super) fn pipeline_ordinary_write(
         &self,
         handle: FileHandle,
         snapshot: &DfsFileHandleSnapshot,
@@ -196,7 +196,7 @@ impl DistributedFs {
         options: WriteOptions,
     ) -> Result<usize> {
         let mut accepted = 0;
-        let result = self.native_ordinary_write_inner(
+        let result = self.pipeline_ordinary_write_inner(
             handle,
             snapshot,
             cell,
@@ -218,7 +218,7 @@ impl DistributedFs {
         }
     }
 
-    fn native_ordinary_write_inner(
+    fn pipeline_ordinary_write_inner(
         &self,
         handle: FileHandle,
         snapshot: &DfsFileHandleSnapshot,
@@ -228,33 +228,33 @@ impl DistributedFs {
     ) -> Result<usize> {
         let (offset, data, options) = input;
         let pipeline = self
-            .native
+            .write_resources
             .pipeline
             .as_ref()
             .ok_or_else(|| unavailable("native write pipeline is missing"))?
             .clone();
         let ticket = self
-            .native_ticket(&cell)?
+            .mutation_ticket(&cell)?
             .ok_or_else(|| unavailable("native mutation ticket is missing"))?;
         let append = snapshot.flags & libc::O_APPEND != 0;
         while *accepted < data.len() {
-            self.native_wait_mutation_ready(&snapshot.inode_id, &cell)?;
+            self.wait_mutation_ready(&snapshot.inode_id, &cell)?;
             if pipeline.closed.load(Ordering::Acquire) {
                 return Err(unavailable("native write admission is closed"));
             }
-            let _ = self.poll_native_uploads()?;
+            let _ = self.poll_uploads()?;
             self.observe_handle_error(handle)?;
-            let target = Self::native_write_target(&cell, append, offset, data, *accepted)?;
+            let target = Self::write_target(&cell, append, offset, data, *accepted)?;
             let operation_id = target
                 .generation
                 .clone()
                 .unwrap_or_else(|| self.identity.operation_id("native-generation"));
             let (prepared, descriptor) = if target.selection.is_none() {
-                match self.reserve_native_builder(
+                match self.reserve_dirty_builder(
                     handle,
                     &cell,
                     &pipeline,
-                    NativeReservationRequest {
+                    ReservationRequest {
                         turn_id: ticket.id,
                         operation_id: &operation_id,
                         owner: &target.owner,
@@ -262,11 +262,11 @@ impl DistributedFs {
                         has_accepted_prefix: *accepted > 0,
                     },
                 )? {
-                    NativeReservation::Reserved {
+                    Reservation::Reserved {
                         builder,
                         descriptor,
                     } => (Some(builder), descriptor),
-                    NativeReservation::StopAccepting => break,
+                    Reservation::StopAccepting => break,
                 }
             } else {
                 (None, None)
@@ -283,9 +283,9 @@ impl DistributedFs {
                 None
             };
             let operation = self.begin_inode_operation(&snapshot.inode_id, cell.clone())?;
-            let Some((written, accepted_seq)) = Self::apply_native_write(
+            let Some((written, accepted_seq)) = Self::apply_pipeline_write(
                 &cell,
-                NativeWriteApply {
+                WriteApply {
                     append,
                     offset,
                     data,
@@ -304,9 +304,9 @@ impl DistributedFs {
             };
             *accepted += written;
             self.update_handle_write_progress(handle, accepted_seq)?;
-            self.seal_native_full_builders(&cell)?;
-            self.start_native_uploads()?;
-            self.observe_native_resources();
+            self.seal_full_builders(&cell)?;
+            self.start_uploads()?;
+            self.observe_pipeline_resources();
         }
         // Keep the FIFO ticket, but release every short operation guard before
         // waiting for the persistent barrier. Preparing may finish meanwhile.
@@ -320,14 +320,14 @@ impl DistributedFs {
     }
 
     /// Read where the next unaccepted bytes land. Admission runs unlocked after
-    /// this, so `apply_native_write` revalidates the result under the same lock.
-    fn native_write_target(
+    /// this, so `apply_pipeline_write` revalidates the result under the same lock.
+    fn write_target(
         cell: &SharedInodeWriteState,
         append: bool,
         offset: u64,
         data: &[u8],
         accepted: usize,
-    ) -> Result<NativeWriteTarget> {
+    ) -> Result<WriteTarget> {
         let state = cell
             .lock()
             .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
@@ -349,7 +349,7 @@ impl DistributedFs {
             .native_selection(position, state.logical_length);
         let capacity =
             DirtyExtentMap::native_capacity(position, data.len() - accepted, state.logical_length);
-        Ok(NativeWriteTarget {
+        Ok(WriteTarget {
             position,
             selection,
             capacity,
@@ -361,13 +361,13 @@ impl DistributedFs {
 
     /// Take this writer's allocation turn and wait for its metadata reservation
     /// and body capacity. The turn is released on every return.
-    fn reserve_native_builder(
+    fn reserve_dirty_builder(
         &self,
         handle: FileHandle,
         cell: &SharedInodeWriteState,
-        pipeline: &Arc<NativeWritePipeline>,
-        request: NativeReservationRequest<'_>,
-    ) -> Result<NativeReservation> {
+        pipeline: &Arc<WritePipeline>,
+        request: ReservationRequest<'_>,
+    ) -> Result<Reservation> {
         let turn_id = request.turn_id;
         let mut descriptor = None;
         {
@@ -377,7 +377,7 @@ impl DistributedFs {
                 .map_err(|_| unavailable("native allocation queue is poisoned"))?;
             queue.push(turn_id, &pipeline.metadata)?;
         }
-        let _turn = NativeAllocationTurn {
+        let _turn = AllocationTurn {
             id: turn_id,
             pipeline: pipeline.clone(),
         };
@@ -394,10 +394,10 @@ impl DistributedFs {
                 == Some(&turn_id);
             if is_front {
                 if descriptor.is_none() {
-                    descriptor = self.reserve_native_descriptor(pipeline, request.operation_id)?;
+                    descriptor = self.reserve_descriptor(pipeline, request.operation_id)?;
                     if descriptor.is_none() {
-                        self.request_native_pressure(cell, true)?;
-                        self.progress_native_writeback()?;
+                        self.request_pipeline_pressure(cell, true)?;
+                        self.progress_writeback()?;
                         let epoch = pipeline.budget.snapshot().epoch;
                         pipeline
                             .budget
@@ -405,20 +405,20 @@ impl DistributedFs {
                         continue;
                     }
                 }
-                let limit = self.native_owner_limit(pipeline)?;
+                let limit = self.dirty_owner_limit(pipeline)?;
                 match pipeline.budget.try_reserve_for(
                     request.owner.clone(),
                     request.capacity,
                     limit,
                 )? {
-                    NativeWriteAdmission::Reserved(lease) => {
+                    DirtyAdmission::Reserved(lease) => {
                         match ChunkBuilder::with_native_lease(
-                            self.native.buffer_pool.clone(),
+                            self.write_resources.buffer_pool.clone(),
                             request.capacity,
                             lease,
                         ) {
                             Ok(builder) => {
-                                return Ok(NativeReservation::Reserved {
+                                return Ok(Reservation::Reserved {
                                     builder,
                                     descriptor,
                                 });
@@ -429,15 +429,15 @@ impl DistributedFs {
                             {
                                 // The rejected tail was never accepted. Complete
                                 // any sync barrier for the visible prefix below.
-                                return Ok(NativeReservation::StopAccepting);
+                                return Ok(Reservation::StopAccepting);
                             }
                             Err(error) if error.code() == afs_error::IO_WOULD_BLOCK => {}
                             Err(error) => return Err(error),
                         }
                     }
-                    NativeWriteAdmission::Wait { epoch } => {
-                        self.request_native_pressure(cell, false)?;
-                        self.progress_native_writeback()?;
+                    DirtyAdmission::Wait { epoch } => {
+                        self.request_pipeline_pressure(cell, false)?;
+                        self.progress_writeback()?;
                         pipeline
                             .budget
                             .wait_for_change(epoch, Duration::from_millis(10));
@@ -449,22 +449,22 @@ impl DistributedFs {
                     .budget
                     .wait_for_change(epoch, Duration::from_millis(10));
             }
-            let _ = self.poll_native_uploads()?;
+            let _ = self.poll_uploads()?;
             self.observe_handle_error(handle)?;
         }
     }
 
     /// `None` means the metadata budget is full and the caller must apply
     /// pressure and retry.
-    fn reserve_native_descriptor(
+    fn reserve_descriptor(
         &self,
-        pipeline: &NativeWritePipeline,
+        pipeline: &WritePipeline,
         operation_id: &OperationId,
-    ) -> Result<Option<Arc<Mutex<NativeMetadataLease>>>> {
+    ) -> Result<Option<Arc<Mutex<PipelineMetadataLease>>>> {
         let reservation = self
             .chunk_store
             .descriptor_reservation_bytes(operation_id)?;
-        if reservation > NATIVE_DESCRIPTOR_BYTES {
+        if reservation > PIPELINE_DESCRIPTOR_BYTES {
             return Err(Error::coded(
                 afs_error::IO_CAPACITY,
                 "native descriptor and publication scratch exceed their fixed metadata budget",
@@ -479,7 +479,7 @@ impl DistributedFs {
                 .lock()
                 .map_err(|_| unavailable("native descriptor reservation is poisoned"))?
                 .set_actual(
-                    std::mem::size_of::<Mutex<NativeMetadataLease>>()
+                    std::mem::size_of::<Mutex<PipelineMetadataLease>>()
                         + 2 * std::mem::size_of::<usize>(),
                 )?;
         }
@@ -490,15 +490,15 @@ impl DistributedFs {
     /// write sequence. `None` means the target moved during unlocked admission
     /// and the caller must retry. Consumes the operation guard so that it is
     /// released after the state lock, whichever way this returns.
-    fn apply_native_write(
+    fn apply_pipeline_write(
         cell: &SharedInodeWriteState,
-        write: NativeWriteApply<'_>,
+        write: WriteApply<'_>,
         prepared: Option<ChunkBuilder>,
-        descriptor: Option<Arc<Mutex<NativeMetadataLease>>>,
+        descriptor: Option<Arc<Mutex<PipelineMetadataLease>>>,
         gc_pin: Option<Arc<crate::node::gc::GcPin>>,
         operation: InodeOperationGuard,
     ) -> Result<Option<(usize, u64)>> {
-        let NativeWriteApply {
+        let WriteApply {
             append,
             offset,
             data,
@@ -558,12 +558,12 @@ impl DistributedFs {
         Ok(Some((written, next_seq)))
     }
 
-    fn request_native_pressure(
+    fn request_pipeline_pressure(
         &self,
         cell: &SharedInodeWriteState,
         descriptor: bool,
     ) -> Result<()> {
-        let Some(pipeline) = &self.native.pipeline else {
+        let Some(pipeline) = &self.write_resources.pipeline else {
             return Ok(());
         };
         let mut state = cell
@@ -597,8 +597,8 @@ impl DistributedFs {
         Ok(())
     }
 
-    fn seal_native_full_builders(&self, cell: &SharedInodeWriteState) -> Result<()> {
-        let Some(pipeline) = &self.native.pipeline else {
+    fn seal_full_builders(&self, cell: &SharedInodeWriteState) -> Result<()> {
+        let Some(pipeline) = &self.write_resources.pipeline else {
             return Ok(());
         };
         let mut state = cell
@@ -629,13 +629,13 @@ impl DistributedFs {
             }
             // The immutable allocation stays the same. Staging performs the
             // standard BLAKE3 scan; no body concatenation or clone is involved.
-            let staged = self.stage_native_chunk(operation_id.clone(), body.clone())?;
-            let upload = Arc::new(NativeUpload {
+            let staged = self.stage_pipeline_chunk(operation_id.clone(), body.clone())?;
+            let upload = Arc::new(PipelineUpload {
                 _gc_pin: state.dirty_extents.native_gc_pin.clone(),
                 operation_id: operation_id.clone(),
                 chunk: staged.chunk.clone(),
                 owner: Arc::downgrade(cell),
-                state: Mutex::new(NativeUploadState {
+                state: Mutex::new(PipelineUploadState {
                     body: Some(body),
                     staged: Some(staged),
                     task: None,
@@ -647,8 +647,8 @@ impl DistributedFs {
                 cv: Condvar::new(),
                 _descriptor: descriptor,
             });
-            let actual = std::mem::size_of::<NativeUpload>()
-                + std::mem::size_of::<Mutex<NativeMetadataLease>>()
+            let actual = std::mem::size_of::<PipelineUpload>()
+                + std::mem::size_of::<Mutex<PipelineMetadataLease>>()
                 + 4 * std::mem::size_of::<usize>()
                 + upload.operation_id.0.capacity()
                 + upload.chunk.id.0.capacity()
@@ -687,21 +687,19 @@ impl DistributedFs {
         Ok(())
     }
 
-    fn next_native_upload(&self) -> Result<Option<Arc<NativeUpload>>> {
+    fn next_upload(&self) -> Result<Option<Arc<PipelineUpload>>> {
         // Existing inode registry snapshots are shared lifecycle metadata, not
         // a second W2 payload or per-object queue. Hold no registry lock while
         // examining an inode or waiting for an upload.
         for (_, cell) in self.writes.states.snapshot()? {
-            if let Some(upload) = Self::next_native_upload_for_cell(&cell)? {
+            if let Some(upload) = Self::next_upload_for_cell(&cell)? {
                 return Ok(Some(upload));
             }
         }
         Ok(None)
     }
 
-    fn next_native_upload_for_cell(
-        cell: &SharedInodeWriteState,
-    ) -> Result<Option<Arc<NativeUpload>>> {
+    fn next_upload_for_cell(cell: &SharedInodeWriteState) -> Result<Option<Arc<PipelineUpload>>> {
         let state = cell
             .lock()
             .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
@@ -727,9 +725,9 @@ impl DistributedFs {
         Ok(None)
     }
 
-    pub(super) fn start_native_upload(&self, upload: &Arc<NativeUpload>) -> Result<bool> {
+    pub(super) fn start_upload(&self, upload: &Arc<PipelineUpload>) -> Result<bool> {
         let pipeline = self
-            .native
+            .write_resources
             .pipeline
             .as_ref()
             .ok_or_else(|| unavailable("native write pipeline is missing"))?;
@@ -766,7 +764,7 @@ impl DistributedFs {
             metadata.inflight += 1;
             metadata.inflight_peak = metadata.inflight_peak.max(metadata.inflight);
         }
-        let permit = NativeUploadPermit(pipeline.metadata.clone());
+        let permit = UploadPermit(pipeline.metadata.clone());
         let store = self.chunk_store.clone();
         let staged = match state.staged.take() {
             Some(staged) => staged,
@@ -786,7 +784,7 @@ impl DistributedFs {
             move || {
                 let _permit = permit;
                 let result = store
-                    .put_chunks(vec![staged], PutIntent::NativeUpload)
+                    .put_chunks(vec![staged], PutIntent::PipelineUpload)
                     .and_then(|mut receipts| {
                         if receipts.len() != 1 {
                             return Err(invalid("native upload returned the wrong receipt count"));
@@ -801,13 +799,13 @@ impl DistributedFs {
         Ok(true)
     }
 
-    fn install_native_receipt(
+    fn install_upload_receipt(
         &self,
-        upload: &Arc<NativeUpload>,
+        upload: &Arc<PipelineUpload>,
         result: Result<StoredChunk>,
     ) -> Result<Option<Error>> {
         let pipeline = self
-            .native
+            .write_resources
             .pipeline
             .as_ref()
             .ok_or_else(|| unavailable("native write pipeline is missing"))?;
@@ -827,12 +825,12 @@ impl DistributedFs {
                     Some(invalid("native receipt differs from its immutable upload"))
                 }
                 Ok(receipt) => {
-                    let actual = std::mem::size_of::<NativeUpload>()
-                        + std::mem::size_of::<Mutex<NativeMetadataLease>>()
+                    let actual = std::mem::size_of::<PipelineUpload>()
+                        + std::mem::size_of::<Mutex<PipelineMetadataLease>>()
                         + 4 * std::mem::size_of::<usize>()
                         + upload.operation_id.0.capacity()
                         + upload.chunk.id.0.capacity()
-                        + native_receipt_heap(&receipt.receipt);
+                        + receipt_heap(&receipt.receipt);
                     let mut descriptor = upload
                         ._descriptor
                         .lock()
@@ -905,11 +903,11 @@ impl DistributedFs {
         installed
     }
 
-    pub(super) fn poll_native_uploads(&self) -> Result<Option<Error>> {
-        let Some(pipeline) = &self.native.pipeline else {
+    pub(super) fn poll_uploads(&self) -> Result<Option<Error>> {
+        let Some(pipeline) = &self.write_resources.pipeline else {
             return Ok(None);
         };
-        let tasks: [Option<Arc<NativeUpload>>; 8] = {
+        let tasks: [Option<Arc<PipelineUpload>>; 8] = {
             let tasks = pipeline
                 .tasks
                 .lock()
@@ -938,7 +936,7 @@ impl DistributedFs {
                         })
                         .and_then(|result| result)
                 });
-                let installed = self.install_native_receipt(&upload, result);
+                let installed = self.install_upload_receipt(&upload, result);
                 // A consumed JoinHandle must leave the table even when receipt
                 // installation encounters a structural error. This guard only
                 // removes the joined slot; a poisoned table remains poisoned.
@@ -970,24 +968,24 @@ impl DistributedFs {
                 }
             }
         }
-        self.observe_native_resources();
+        self.observe_pipeline_resources();
         // Business failures belong to their inode. A caller may have harvested
         // another inode's task; only drain consumes this Node-wide summary.
         Ok(first_error)
     }
 
-    fn start_native_uploads(&self) -> Result<()> {
-        while let Some(upload) = self.next_native_upload()? {
-            if !self.start_native_upload(&upload)? {
+    fn start_uploads(&self) -> Result<()> {
+        while let Some(upload) = self.next_upload()? {
+            if !self.start_upload(&upload)? {
                 break;
             }
         }
         Ok(())
     }
 
-    pub(super) fn wait_native_upload(&self, upload: &Arc<NativeUpload>) -> Result<ChunkReceipt> {
+    pub(super) fn wait_upload(&self, upload: &Arc<PipelineUpload>) -> Result<ChunkReceipt> {
         loop {
-            let _ = self.poll_native_uploads()?;
+            let _ = self.poll_uploads()?;
             {
                 let mut state = upload
                     .state
@@ -1003,7 +1001,7 @@ impl DistributedFs {
                     return Err(error);
                 }
             }
-            self.start_native_upload(upload)?;
+            self.start_upload(upload)?;
             let state = upload
                 .state
                 .lock()
@@ -1019,12 +1017,12 @@ impl DistributedFs {
         }
     }
 
-    pub(crate) fn progress_native_writeback(&self) -> Result<usize> {
-        if self.native.pipeline.is_none() {
+    pub(crate) fn progress_writeback(&self) -> Result<usize> {
+        if self.write_resources.pipeline.is_none() {
             return Ok(0);
         }
-        let _ = self.poll_native_uploads()?;
-        self.start_native_uploads()?;
+        let _ = self.poll_uploads()?;
+        self.start_uploads()?;
         let mut committed = 0;
         for (inode, cell) in self.writes.states.snapshot()? {
             let due = {
@@ -1048,7 +1046,7 @@ impl DistributedFs {
                 }
             }
         }
-        self.observe_native_resources();
+        self.observe_pipeline_resources();
         Ok(committed)
     }
 }

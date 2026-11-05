@@ -148,7 +148,7 @@ impl DiskPeerCache {
 
     pub fn with_read_work_metrics(
         mut self,
-        metrics: crate::node::read_work::ReadWorkMetrics,
+        metrics: crate::node::metrics::work::ReadWorkMetrics,
     ) -> Self {
         if let Ok(state) = self.state.lock() {
             report_work(
@@ -227,7 +227,7 @@ impl DiskPeerCache {
         local.local_index_available = state.index_lease.is_some();
         #[cfg(test)]
         {
-            local.proof_limit = state.proof_limit;
+            local.test_hooks.proof_limit = state.test_hooks.proof_limit;
         }
         drop(state);
         if !background {
@@ -502,7 +502,7 @@ impl DiskPeerCache {
             return Ok(());
         };
         #[cfg(test)]
-        if state.fail_remove {
+        if state.test_hooks.fail_remove {
             return Err(unavailable("injected Peer cache cleanup failure"));
         }
         match fs::symlink_metadata(self.path(key)) {

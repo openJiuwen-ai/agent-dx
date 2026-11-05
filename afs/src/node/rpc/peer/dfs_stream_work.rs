@@ -24,7 +24,7 @@ pub(super) struct PeerStreamBlock {
     pub(super) offset: usize,
     // Two small accounting owners are allocated once per shared session,
     // then move with the same blocks; handing off a block allocates nothing.
-    pub(super) _work: Option<Box<crate::node::read_work::PeerStreamFrameWork>>,
+    pub(super) _work: Option<Box<crate::node::metrics::work::PeerStreamFrameWork>>,
 }
 
 #[cfg(feature = "dfs")]
@@ -105,7 +105,7 @@ pub(super) struct PeerStreamSession {
     pub(super) available: tokio::sync::Notify,
     pub(super) controls: Arc<tokio::sync::Semaphore>,
     // Fields drop in order: all payload owners precede this shared observation.
-    pub(super) _work: std::sync::Mutex<Option<crate::node::read_work::PeerCacheStreamWork>>,
+    pub(super) _work: std::sync::Mutex<Option<crate::node::metrics::work::PeerCacheStreamWork>>,
 }
 
 #[cfg(feature = "dfs")]

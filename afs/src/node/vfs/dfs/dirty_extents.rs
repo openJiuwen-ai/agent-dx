@@ -12,8 +12,8 @@ pub(super) struct DirtyExtent {
     // interval splits. Reusing this owner must not turn one input copy into
     // multiple copies merely because later writes split the visible map.
     pub(super) native_reuse_end: u64,
-    pub(super) native_upload: Option<Arc<NativeUpload>>,
-    pub(super) native_descriptor: Option<Arc<Mutex<NativeMetadataLease>>>,
+    pub(super) native_upload: Option<Arc<PipelineUpload>>,
+    pub(super) native_descriptor: Option<Arc<Mutex<PipelineMetadataLease>>>,
 }
 
 #[derive(Default)]
@@ -21,7 +21,7 @@ pub(super) struct DirtyExtentMap {
     // Native writes and resize holes retain only the final nonoverlapping
     // visible intervals.
     pub(super) extents: BTreeMap<u64, DirtyExtent>,
-    pub(super) builders: Vec<NativeDirtyBuilder>,
+    pub(super) builders: Vec<DirtyBuilder>,
     pub(super) append_builders: BTreeMap<u64, BTreeSet<(u64, usize)>>,
     pub(super) next_builder_order: u64,
     pub(super) native_admitted_bytes: Option<u64>,
@@ -29,10 +29,10 @@ pub(super) struct DirtyExtentMap {
     pub(super) native_gc_pin: Option<Arc<crate::node::gc::GcPin>>,
 }
 
-pub(super) struct NativeDirtyBuilder {
+pub(super) struct DirtyBuilder {
     pub(super) file_offset: u64,
     pub(super) builder: ChunkBuilder,
-    pub(super) descriptor: Option<Arc<Mutex<NativeMetadataLease>>>,
+    pub(super) descriptor: Option<Arc<Mutex<PipelineMetadataLease>>>,
     pub(super) creation_order: u64,
 }
 
@@ -124,7 +124,7 @@ impl DirtyExtentMap {
         write_seq: u64,
         selection: Option<(usize, usize, usize)>,
         prepared: Option<ChunkBuilder>,
-        descriptor: Option<Arc<Mutex<NativeMetadataLease>>>,
+        descriptor: Option<Arc<Mutex<PipelineMetadataLease>>>,
     ) -> Result<usize> {
         self.promote_native();
         let (index, source_offset, available) = if let Some(selection) = selection {
@@ -145,7 +145,7 @@ impl DirtyExtentMap {
                 .next_builder_order
                 .checked_add(1)
                 .ok_or_else(file_too_large)?;
-            let entry = NativeDirtyBuilder {
+            let entry = DirtyBuilder {
                 file_offset: position,
                 builder,
                 descriptor,
@@ -329,7 +329,7 @@ impl DirtyExtentMap {
                     Err(error) => return Err(error),
                 };
                 let index = self.builders.len();
-                self.builders.push(NativeDirtyBuilder {
+                self.builders.push(DirtyBuilder {
                     file_offset: position,
                     builder,
                     descriptor: None,

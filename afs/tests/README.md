@@ -4,7 +4,7 @@
 `*_contract.rs` 和 `support/` 保持原位。本工具不部署完整 ADX、不创建流水线或 VM，
 不自动安装依赖、修改主机用户或全局挂载/网络配置。
 
-feature 组合门禁：在 Linux 上于仓库任意目录运行 `bash afs/tests/feature-matrix.sh`，它对默认、dfs-only、ownerfs-only、rdma 四种 feature 组合执行 `cargo check` 与 `--tests --no-run` 构建，并检查无后端 `afs-meta` 能构建、SDK 不启用 RDMA；并运行 ownerfs-only、dfs-only 的 `config_contract`。加 `--run-lib` 再运行这两组 lib 单测，要求 `TMPDIR` 在支持 flock 与 xattr、剩余超过 1 GiB 的原生 Linux 文件系统上；adx-vm 编译容器不满足，需用 `--lib --no-run` 编译后到运行节点执行。
+feature 组合门禁：在 Linux 上于仓库任意目录运行 `bash afs/tests/feature-matrix.sh`，它对默认、dfs-only、ownerfs-only、rdma、diagnostics 五种 feature 组合执行 `cargo check` 与 `--tests --no-run` 构建，并检查无后端 `afs-meta` 能构建、SDK 不启用 RDMA；并运行 ownerfs-only、dfs-only 的 `config_contract`。加 `--run-lib` 再运行这两组 lib 单测，要求 `TMPDIR` 在支持 flock 与 xattr、剩余超过 1 GiB 的原生 Linux 文件系统上；adx-vm 编译容器不满足，需用 `--lib --no-run` 编译后到运行节点执行。
 
 公共E2E已补测试资产交接：AFS ON时，`build/e2e/prepare.py`及K8s
 `stage_harness()`携带本目录的`run.py`、`suites/`、`fixtures/`、`tools/`及`runner_tests/`的Python文件和示例配置，

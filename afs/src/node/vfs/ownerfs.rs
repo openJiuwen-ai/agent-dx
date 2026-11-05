@@ -51,8 +51,10 @@ mod native_home;
 pub mod remote;
 pub mod root;
 
+pub(crate) use native_home::HomeExportAuthority;
+#[cfg(test)]
 pub(crate) use native_home::{
-    DirectoryIdentity as NativeHomeDirectoryIdentity, HomeExportAuthority,
+    DirectoryIdentity as NativeHomeDirectoryIdentity,
     NamespaceIdentity as NativeHomeNamespaceIdentity,
 };
 
@@ -156,6 +158,7 @@ impl OwnerFs {
     ///
     /// This is a bounded experimental admission path for the managed container
     /// workspace caller. Ordinary constructors remain native-ineligible.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn new_local_native_eligible_with_remote(
         roots: Arc<RootManager>,

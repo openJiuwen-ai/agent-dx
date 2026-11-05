@@ -107,7 +107,7 @@ impl GrpcChunkTransfer {
             return Err(dfs_protocol_error("CRC source is not a Node replica"));
         };
         if let Some(metrics) = &self.peers.read_work_metrics {
-            metrics.check(crate::node::read_work::ReadCheck::FullGrant);
+            metrics.check(crate::node::metrics::work::ReadCheck::FullGrant);
         }
         let sequence = self
             .next_read
@@ -255,7 +255,7 @@ impl<'a> CrcRangeDecoder<'a> {
                 }
                 self.header_seen = true;
                 if let Some(metrics) = &self.metrics {
-                    metrics.check(crate::node::read_work::ReadCheck::DescriptorDecode);
+                    metrics.check(crate::node::metrics::work::ReadCheck::DescriptorDecode);
                 }
                 let table: CrcTable = serde_json::from_slice(&header.crc32c_table)
                     .map_err(|_| dfs_corrupt_error("invalid CRC descriptor"))?;

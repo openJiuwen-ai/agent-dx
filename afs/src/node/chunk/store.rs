@@ -108,15 +108,7 @@ impl LocalChunkStore {
             read_work: None,
             sidecar_installer: SidecarInstaller::default(),
             #[cfg(test)]
-            catalog_commit_test: CatalogCommitTestControl::default(),
-            #[cfg(test)]
-            sidecar_install_test: Arc::new(SidecarInstallTestControl::default()),
-            #[cfg(test)]
-            peer_fill_test_blocks: Mutex::new(HashMap::new()),
-            #[cfg(test)]
-            peer_ready_test_block: Mutex::new(None),
-            #[cfg(test)]
-            peer_payload_test_block: Mutex::new(None),
+            test_hooks: ChunkStoreTestHooks::default(),
             #[cfg(any(feature = "dfs", test))]
             peer_read_budget: Arc::new(PeerReadBudget::default()),
             #[cfg(any(feature = "dfs", test))]
@@ -147,14 +139,16 @@ impl LocalChunkStore {
     }
 
     #[cfg(feature = "dfs")]
-    pub(crate) fn read_work_metrics(&self) -> Option<&super::super::read_work::ReadWorkMetrics> {
+    pub(crate) fn read_work_metrics(
+        &self,
+    ) -> Option<&super::super::metrics::work::ReadWorkMetrics> {
         self.read_work.as_ref()
     }
 
     #[cfg(any(feature = "dfs", test))]
     pub(crate) fn with_read_work_metrics(
         mut self,
-        metrics: super::super::read_work::ReadWorkMetrics,
+        metrics: super::super::metrics::work::ReadWorkMetrics,
     ) -> Self {
         self.catalog_committer.set_metrics(metrics.clone());
         self.read_work = Some(metrics);
@@ -200,15 +194,15 @@ impl LocalChunkStore {
         &self,
         phase: &'static str,
         bytes: u64,
-    ) -> Option<super::super::read_work::ReadCoarseDiagnosticSpan> {
+    ) -> Option<super::super::metrics::read_timing::ReadCoarseDiagnosticSpan> {
         self.read_work.as_ref()?.coarse_diagnostic(phase, bytes)
     }
 
     #[cfg(any(feature = "dfs", test))]
     pub(in crate::node) fn read_diagnostic(
         &self,
-        stage: super::super::read_work::ReadDiagnosticStage,
-    ) -> Option<super::super::read_work::ReadDiagnosticSpan> {
+        stage: super::super::metrics::read_timing::ReadDiagnosticStage,
+    ) -> Option<super::super::metrics::read_timing::ReadDiagnosticSpan> {
         self.read_work.as_ref()?.diagnostic(stage)
     }
 
@@ -236,7 +230,7 @@ impl LocalChunkStore {
         &self,
         bytes: usize,
         output: usize,
-    ) -> Option<super::super::read_work::PeerCacheFillWork> {
+    ) -> Option<super::super::metrics::work::PeerCacheFillWork> {
         self.read_work
             .as_ref()
             .map(|metrics| metrics.peer_disk_cache_fill_work(bytes, output))
@@ -263,7 +257,7 @@ impl LocalChunkStore {
     }
 
     #[cfg(any(feature = "dfs", test))]
-    pub(crate) fn record_read_check(&self, stage: super::super::read_work::ReadCheck) {
+    pub(crate) fn record_read_check(&self, stage: super::super::metrics::work::ReadCheck) {
         if let Some(metrics) = &self.read_work {
             metrics.check(stage);
         }
@@ -421,8 +415,8 @@ impl LocalChunkStore {
     ) -> Result<Vec<ReplicaAck>> {
         let _diagnostic = self.coarse_diagnostic("persist_batch", 0);
         #[cfg(any(feature = "dfs", test))]
-        let batch_diagnostic =
-            self.read_diagnostic(super::super::read_work::ReadDiagnosticStage::PersistBatch);
+        let batch_diagnostic = self
+            .read_diagnostic(super::super::metrics::read_timing::ReadDiagnosticStage::PersistBatch);
         if target.node_id != self.node_id
             || target.device.device_id != self.device_id
             || target.device.device_epoch != self.device_epoch
@@ -472,7 +466,7 @@ impl LocalChunkStore {
                             .map_or(0, catalog_commit::record_allocation),
                 )?;
                 #[cfg(test)]
-                self.catalog_commit_test.pause_prepare()?;
+                self.test_hooks.catalog_commit_test.pause_prepare()?;
                 if let Some(existing) = existing.as_ref() {
                     if existing.chunk != item.chunk {
                         return Err(invalid(
@@ -726,7 +720,7 @@ impl LocalChunkStore {
 
     pub(super) fn open_cataloged(&self, chunk_id: &ChunkId) -> Result<PinnedChunkReader> {
         #[cfg(feature = "dfs")]
-        self.record_read_check(super::super::read_work::ReadCheck::CatalogOpen);
+        self.record_read_check(super::super::metrics::work::ReadCheck::CatalogOpen);
         let record = self
             .catalog
             .lock()

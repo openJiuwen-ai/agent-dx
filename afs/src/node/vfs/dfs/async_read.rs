@@ -111,12 +111,12 @@ impl DistributedFs {
         }
         let snapshot = self.handle_snapshot(handle)?;
         Ok(Some(Box::pin(async move {
-            self.read_native_bytes_async(handle, &snapshot, offset, size, deadline, lifetime)
+            self.read_replicated_bytes_async(handle, &snapshot, offset, size, deadline, lifetime)
                 .await
         })))
     }
 
-    pub(super) async fn read_native_bytes_async(
+    pub(super) async fn read_replicated_bytes_async(
         &self,
         handle: FileHandle,
         snapshot: &DfsFileHandleSnapshot,
@@ -141,7 +141,7 @@ impl DistributedFs {
         };
         crate::node::read::admission::in_read_scope(scope, async {
             let result = self
-                .native_read_plan_async(handle, snapshot, offset, size, deadline, lifetime)
+                .replicated_read_plan_async(handle, snapshot, offset, size, deadline, lifetime)
                 .await
                 .inspect_err(|e| self.invalidate_native_handle_view_on_error(handle, e))?;
             #[cfg(test)]
@@ -174,7 +174,7 @@ impl DistributedFs {
         .await
     }
 
-    async fn native_read_plan_async(
+    async fn replicated_read_plan_async(
         &self,
         handle: FileHandle,
         snapshot: &DfsFileHandleSnapshot,
@@ -289,11 +289,11 @@ impl DistributedFs {
         // Speculative parts are cached per handle and keyed by offset only, so
         // only a handle whose version never moved may use them.
         if !snapshot.handle.dynamic_read_route.load(Ordering::Acquire)
-            && crate::node::read::native_prefetch::eligible(snapshot.flags)
+            && crate::node::read::direct_prefetch::eligible(snapshot.flags)
             && let Some((budget, window)) = self.read_engine.native_prefetch_policy()
         {
-            let controller = snapshot.handle.native_prefetch.get_or_init(|| {
-                crate::node::read::native_prefetch::Controller::new(budget.clone(), window)
+            let controller = snapshot.handle.direct_prefetch.get_or_init(|| {
+                crate::node::read::direct_prefetch::Controller::new(budget.clone(), window)
             });
             let fetch = controller.fetch(|| {
                 let engine = self.read_engine.clone();
@@ -312,9 +312,9 @@ impl DistributedFs {
             });
             // Large internal reads discard speculative parts and use a single
             // owned reply; only small cross-boundary reads need assembly.
-            let crossing = count <= crate::node::read::native_prefetch::UNIT
-                && offset % crate::node::read::native_prefetch::UNIT as u64 + count as u64
-                    > crate::node::read::native_prefetch::UNIT as u64;
+            let crossing = count <= crate::node::read::direct_prefetch::UNIT
+                && offset % crate::node::read::direct_prefetch::UNIT as u64 + count as u64
+                    > crate::node::read::direct_prefetch::UNIT as u64;
             // Serialize rare shape-change assembly before acquiring any parts.
             // Pausing prevents another completion from growing the window here.
             let assembly = if crossing {

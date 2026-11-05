@@ -1,13 +1,5 @@
 use super::*;
 
-/// Commit engine state. Commits run on the caller's thread under the inode
-/// write-state cell, so the engine owns no lock of its own; it only carries
-/// the optional pending-commit diagnostics trace.
-#[derive(Default)]
-pub(super) struct CommitEngine {
-    pub(super) pending_trace: Option<PendingTrace>,
-}
-
 #[derive(Clone)]
 pub(super) struct FrozenCommit {
     pub(super) through_seq: u64,
@@ -30,9 +22,6 @@ pub(super) enum InFlightCommit {
 pub(super) struct PendingFileCommit {
     pub(super) frozen: FrozenCommit,
     pub(super) batch: CommitBatch,
-    // Diagnostic only, shared by clones of this exact prepared request. Never
-    // serialized into the domain request or consulted by filesystem policy.
-    pub(super) trace_send_attempt: Option<Arc<AtomicU64>>,
 }
 
 pub(super) struct CommitPlan {
@@ -52,8 +41,8 @@ pub(super) struct CommitBatch {
     pub(super) _gc_pin: Option<Arc<crate::node::gc::GcPin>>,
     pub(super) through_seq: u64,
     pub(super) commit: Arc<CommitFileVersion>,
-    pub(super) _native_accounting: Option<Arc<NativeCommitAccounting>>,
-    pub(super) _native_uploads: Vec<Arc<NativeUpload>>,
+    pub(super) _pipeline_accounting: Option<Arc<CommitAccounting>>,
+    pub(super) _pipeline_uploads: Vec<Arc<PipelineUpload>>,
 }
 
 enum CommitAction {
@@ -150,11 +139,11 @@ impl DistributedFs {
             };
         };
         let _native_ticket = if wait_for_operation {
-            self.native_ticket_with_cleanup(&state, true)?
+            self.mutation_ticket_with_cleanup(&state, true)?
         } else {
             None
         };
-        let _operation = if wait_for_operation && self.native.pipeline.is_none() {
+        let _operation = if wait_for_operation && self.write_resources.pipeline.is_none() {
             Some(self.begin_inode_operation(&snapshot.inode_id, state.clone())?)
         } else {
             None
@@ -374,17 +363,15 @@ impl DistributedFs {
                 let pending_file = PendingFileCommit {
                     frozen: *frozen,
                     batch,
-                    trace_send_attempt: self
-                        .commit
-                        .pending_trace
-                        .as_ref()
-                        .map(|_| Arc::new(AtomicU64::new(0))),
                 };
                 let pending = InFlightCommit::File(Box::new(pending_file.clone()));
                 let mut state = cell
                     .lock()
                     .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-                while self.native.pipeline.is_some() && wait_for_operation && state.operation_busy {
+                while self.write_resources.pipeline.is_some()
+                    && wait_for_operation
+                    && state.operation_busy
+                {
                     state = cell
                         .wait(state)
                         .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
@@ -423,7 +410,7 @@ impl DistributedFs {
             || matches!(&pending, InFlightCommit::Metadata(sync, _) if sync.metadata_delta.kill_suidgid);
         let result = match &pending {
             InFlightCommit::Preparing(_) => Err(unavailable("DFS inode commit is still preparing")),
-            InFlightCommit::File(pending) => self.send_file_commit(&cell, pending, branch),
+            InFlightCommit::File(pending) => self.send_file_commit(pending, branch),
             InFlightCommit::Metadata(sync, through_seq) => {
                 self.send_metadata_sync(sync, *through_seq, branch)
             }
@@ -450,17 +437,6 @@ impl DistributedFs {
                     layout,
                     updated,
                 );
-                if let Some(trace) = &self.commit.pending_trace
-                    && let InFlightCommit::File(sent) = &pending
-                {
-                    trace.observe(
-                        "dfs_pending_commit_success_cleared",
-                        branch,
-                        &state,
-                        sent,
-                        None,
-                    );
-                }
                 Ok(Some(through_seq))
             }
             Ok(AppliedCommit::Metadata {
@@ -478,7 +454,7 @@ impl DistributedFs {
             }
             Err(error) => {
                 let definite = is_definite_commit_rejection(&error);
-                self.record_commit_error_locked(&mut state, &pending, &error, definite, branch);
+                Self::record_commit_error_locked(&mut state, &error, definite);
                 if definite && let InFlightCommit::File(pending) = pending {
                     state
                         .dirty_extents
@@ -492,31 +468,22 @@ impl DistributedFs {
         outcome
     }
 
-    fn send_file_commit(
-        &self,
-        cell: &SharedInodeWriteState,
-        pending: &PendingFileCommit,
-        branch: &str,
-    ) -> Result<AppliedCommit> {
+    fn send_file_commit(&self, pending: &PendingFileCommit, branch: &str) -> Result<AppliedCommit> {
         let committed_full_metadata =
             pending.batch.commit.metadata_delta.mode == CommitMetadataMode::Full;
         let version = pending.batch.commit.file_version.clone();
         let layout = pending.batch.commit.layout_root.clone();
-        let _native_rpc_accounting = if let Some(accounting) = &pending.batch._native_accounting {
+        let _pipeline_rpc_accounting = if let Some(accounting) = &pending.batch._pipeline_accounting
+        {
             let base = accounting.actual.load(Ordering::Relaxed);
-            accounting.set_actual(base + native_commit_heap(pending.batch.commit.as_ref()))?;
-            Some(NativeRpcAccounting {
+            accounting.set_actual(base + commit_heap(pending.batch.commit.as_ref()))?;
+            Some(CommitRpcAccounting {
                 accounting: accounting.clone(),
                 base,
             })
         } else {
             None
         };
-        if let Some(trace) = &self.commit.pending_trace
-            && let Ok(state) = cell.lock()
-        {
-            trace.observe("dfs_pending_commit_send", branch, &state, pending, None);
-        }
         let publish_span = tracing::info_span!(
             "node.dfs.commit.publish",
             branch,
@@ -631,27 +598,10 @@ impl DistributedFs {
 
     /// A definite rejection is terminal for the inode; anything else leaves the
     /// outcome unknown, so the commit stays in flight for an exact retry.
-    fn record_commit_error_locked(
-        &self,
-        state: &mut InodeWriteState,
-        pending: &InFlightCommit,
-        error: &Error,
-        definite: bool,
-        branch: &str,
-    ) {
+    fn record_commit_error_locked(state: &mut InodeWriteState, error: &Error, definite: bool) {
         if definite {
             state.in_flight = None;
             state.terminal_error = Some(error.clone());
-        }
-        if let Some(trace) = &self.commit.pending_trace
-            && let InFlightCommit::File(sent) = pending
-        {
-            let event = if definite {
-                "dfs_pending_commit_definite_rejection_cleared"
-            } else {
-                "dfs_pending_commit_unknown_retained"
-            };
-            trace.observe(event, branch, state, sent, Some(error));
         }
     }
 

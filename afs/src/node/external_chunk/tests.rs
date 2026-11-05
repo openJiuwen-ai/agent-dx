@@ -196,7 +196,7 @@ fn write_ready_cache_file(shared: &CacheShared, staged: &StagedChunk) -> CacheKe
 }
 
 fn force_cache_access_bucket(shared: &CacheShared, bucket: u64) {
-    shared.inner.lock().unwrap().forced_access_bucket = Some(bucket);
+    shared.inner.lock().unwrap().test_hooks.forced_access_bucket = Some(bucket);
 }
 
 fn write_ready_payload(shared: &CacheShared, staged: &StagedChunk, payload: &[u8]) -> PathBuf {
@@ -1897,7 +1897,7 @@ fn eviction_sampler_selects_older_of_two_ready_candidates() {
     let newest_key = write_ready_cache_file(&shared, &newest);
     {
         let mut inner = shared.inner.lock().unwrap();
-        inner.eviction_samples.push_back((2, 0));
+        inner.test_hooks.eviction_samples.push_back((2, 0));
         assert!(shared.evict_for_locked(&mut inner, 1));
         assert!(!inner.entries.contains_key(&oldest_key));
         assert!(matches!(
@@ -1941,7 +1941,7 @@ fn eviction_sampler_keeps_first_random_candidate_inside_same_access_bucket() {
 
     {
         let mut inner = shared.inner.lock().unwrap();
-        inner.eviction_samples.push_back((2, 0));
+        inner.test_hooks.eviction_samples.push_back((2, 0));
         assert!(shared.evict_for_locked(&mut inner, 1));
         assert!(
             inner.entries.contains_key(&first_key),
@@ -1980,7 +1980,7 @@ fn ready_lookup_refreshes_access_bucket_without_expanding_budget() {
     shared.clear_resident_for_test();
     {
         let mut inner = shared.inner.lock().unwrap();
-        inner.eviction_samples.push_back((0, 1));
+        inner.test_hooks.eviction_samples.push_back((0, 1));
         assert!(shared.evict_for_locked(&mut inner, incoming.chunk.length));
         inner.entries.insert(
             CacheKey::new("filesystem-a", "generation-1", &incoming.chunk),
@@ -2103,7 +2103,10 @@ fn coarse_eviction_128_objects_64_capacity_keeps_scan_hits_and_hot_entries() {
     for seed in [1_u64, 2, 3, 4, 17, 91, 255, 1024] {
         let mut inner = CacheInner {
             sampler_seed: seed,
-            forced_access_bucket: Some(0),
+            test_hooks: CacheTestHooks {
+                forced_access_bucket: Some(0),
+                ..CacheTestHooks::default()
+            },
             ..CacheInner::default()
         };
         let keys = (0_u64..128)
@@ -2163,7 +2166,7 @@ fn coarse_eviction_128_objects_64_capacity_keeps_scan_hits_and_hot_entries() {
             "seed {seed}: sequential scan unexpectedly collapsed to {hits} hits"
         );
         let hot = inner.lru.iter().take(8).cloned().collect::<Vec<_>>();
-        inner.forced_access_bucket = Some(2);
+        inner.test_hooks.forced_access_bucket = Some(2);
         for key in &hot {
             touch_cache_access(&mut inner, key);
         }
@@ -2176,7 +2179,10 @@ fn coarse_eviction_128_objects_64_capacity_keeps_scan_hits_and_hot_entries() {
         let hot_key = hot[0].clone();
         let hot_index = inner.lru.iter().position(|key| *key == hot_key).unwrap();
         let cold_index = inner.lru.iter().position(|key| *key == cold_key).unwrap();
-        inner.eviction_samples.push_back((hot_index, cold_index));
+        inner
+            .test_hooks
+            .eviction_samples
+            .push_back((hot_index, cold_index));
         let victim = select_eviction_victim(&mut inner).unwrap();
         assert_eq!(
             victim.key, cold_key,

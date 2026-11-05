@@ -1943,12 +1943,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn local_sdk_round_trips_through_iov_and_ring() {
         use crate::node::api::local::{LocalApiOptions, serve_local_api_with_options};
-        use crate::node::storage::Storage;
+        use crate::node::diagnostics::DiagnosticStorage;
         use afs_client::{DfsAccess, DfsLocalClient, DfsLocalClientConfig};
 
         let temp = tempfile::tempdir().expect("tempdir");
         let socket_path = temp.path().join("afs-node.sock");
-        let storage = Storage::new(temp.path().join("diagnostics")).expect("storage");
+        let storage = DiagnosticStorage::new(temp.path().join("diagnostics")).expect("storage");
         let backend = Arc::new(MemoryBackend::new(4096));
         let server = serve_local_api_with_options(
             storage,
@@ -2021,12 +2021,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn local_sdk_without_dfs_backend_is_unimplemented() {
         use crate::node::api::local::serve_local_api;
-        use crate::node::storage::Storage;
+        use crate::node::diagnostics::DiagnosticStorage;
         use afs_client::{DfsAccess, DfsLocalClient, DfsLocalClientConfig};
 
         let temp = tempfile::tempdir().expect("tempdir");
         let socket_path = temp.path().join("afs-node.sock");
-        let storage = Storage::new(temp.path().join("diagnostics")).expect("storage");
+        let storage = DiagnosticStorage::new(temp.path().join("diagnostics")).expect("storage");
         let server = serve_local_api(storage, &socket_path)
             .await
             .expect("serve local api");
@@ -2045,12 +2045,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn sync_modes_reach_the_backend_as_requested() {
         use crate::node::api::local::{LocalApiOptions, serve_local_api_with_options};
-        use crate::node::storage::Storage;
+        use crate::node::diagnostics::DiagnosticStorage;
         use afs_client::{DfsAccess, DfsLocalClient, DfsLocalClientConfig, DfsSyncMode};
 
         let temp = tempfile::tempdir().expect("tempdir");
         let socket_path = temp.path().join("afs-node.sock");
-        let storage = Storage::new(temp.path().join("diagnostics")).expect("storage");
+        let storage = DiagnosticStorage::new(temp.path().join("diagnostics")).expect("storage");
         let backend = Arc::new(MemoryBackend::new(4096));
         let server = serve_local_api_with_options(
             storage,
@@ -3121,12 +3121,12 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn local_sdk_batches_writes_and_reads() {
         use crate::node::api::local::{LocalApiOptions, serve_local_api_with_options};
-        use crate::node::storage::Storage;
+        use crate::node::diagnostics::DiagnosticStorage;
         use afs_client::{DfsAccess, DfsLocalClient, DfsLocalClientConfig};
 
         let temp = tempfile::tempdir().expect("tempdir");
         let socket_path = temp.path().join("afs-node.sock");
-        let storage = Storage::new(temp.path().join("diagnostics")).expect("storage");
+        let storage = DiagnosticStorage::new(temp.path().join("diagnostics")).expect("storage");
         let backend = Arc::new(MemoryBackend::new(4096));
         let server = serve_local_api_with_options(
             storage,

@@ -270,10 +270,10 @@ fn disk_peer_cache_pending_generations_keep_failed_charge_and_other_fill_private
     assert!(first_path.exists() && second_path.exists());
     assert_eq!(cache.state.lock().unwrap().pending.len(), 2);
     assert!(cache.stats().unwrap().disk_bytes <= cache.options.capacity_bytes);
-    cache.state.lock().unwrap().fail_remove = true;
+    cache.state.lock().unwrap().test_hooks.fail_remove = true;
     drop(first_sink);
     drop(first_op);
-    cache.state.lock().unwrap().fail_remove = false;
+    cache.state.lock().unwrap().test_hooks.fail_remove = false;
     assert!(first_path.exists());
     let mut out = [0; 8];
     let proof = crate::node::rpc::peer::complete_peer_disk_read_for_test(
@@ -550,7 +550,7 @@ fn disk_peer_cache_failed_retired_delete_preserves_slots_and_index_until_retry()
     assert!(fill(&cache, &staged).unwrap());
     let key = cache.key(&staged.chunk).unwrap();
     let before = cache.stats().unwrap().disk_bytes;
-    cache.state.lock().unwrap().fail_remove = true;
+    cache.state.lock().unwrap().test_hooks.fail_remove = true;
     assert!(cache.retire(&key, None, true).is_err());
     assert!(cache.shutdown().is_err());
     {
@@ -560,7 +560,7 @@ fn disk_peer_cache_failed_retired_delete_preserves_slots_and_index_until_retry()
         assert_eq!(state.retired_disk_bytes, before);
         assert_eq!(state.used_bytes, before);
     }
-    cache.state.lock().unwrap().fail_remove = false;
+    cache.state.lock().unwrap().test_hooks.fail_remove = false;
     cache.shutdown().unwrap();
     let state = cache.state.lock().unwrap();
     assert!(state.retired.is_empty());
@@ -1127,7 +1127,7 @@ fn peer_stream_sink_quota_or_write_failure_keeps_verified_output_without_ready()
         let mut out = [0; 31];
         {
             let mut operation = cache.operation().unwrap();
-            cache.state.lock().unwrap().fail_stream_write = write_failure;
+            cache.state.lock().unwrap().test_hooks.fail_stream_write = write_failure;
             let mut sink = operation.begin_stream(&staged.chunk).unwrap();
             let proof = crate::node::rpc::peer::complete_peer_disk_read_for_test(
                 &staged.chunk,
@@ -1153,7 +1153,7 @@ fn peer_stream_sink_unknown_created_file_and_failed_cleanup_remain_charged() {
     let staged = StagedChunk::new(OperationId::new("stream-unidentified"), vec![19; 64 * 1024]);
     {
         let mut operation = cache.operation().unwrap();
-        cache.state.lock().unwrap().fail_stream_metadata = true;
+        cache.state.lock().unwrap().test_hooks.fail_stream_metadata = true;
         let sink = operation.begin_stream(&staged.chunk).unwrap();
         assert!(sink.file.is_none());
         assert!(cache.state.lock().unwrap().pending_charge > 0);
@@ -1193,7 +1193,7 @@ fn peer_stream_sink_observed_extra_blocks_stay_charged_after_cleanup_failure() {
                 .unwrap()
                 .charge = actual - 512;
         }
-        cache.state.lock().unwrap().fail_remove = true;
+        cache.state.lock().unwrap().test_hooks.fail_remove = true;
         assert!(sink.commit(proof).is_err());
         assert_eq!(cache.state.lock().unwrap().used_bytes, actual);
         assert_eq!(cache.state.lock().unwrap().pending_charge, actual);
@@ -1206,7 +1206,7 @@ fn peer_stream_sink_observed_extra_blocks_stay_charged_after_cleanup_failure() {
 fn coarse_cache_diagnostics_separate_misses_from_verified_hit_attempts() {
     let temp = tempfile::tempdir().unwrap();
     let registry = afs_metrics::Registry::new();
-    let metrics = crate::node::read_work::ReadWorkMetrics::register(&registry)
+    let metrics = crate::node::metrics::work::ReadWorkMetrics::register(&registry)
         .unwrap()
         .with_read_diagnostics(true);
     let cache = DiskPeerCache::open(options(temp.path().join("cache")))
@@ -1254,7 +1254,7 @@ fn coarse_cache_diagnostics_separate_misses_from_verified_hit_attempts() {
     assert!(snapshot.object_records[0].success);
     assert_eq!(
         snapshot.object_records[0].stage,
-        crate::node::read_work::ReadObjectDiagnosticStage::CacheHitReadVerify
+        crate::node::metrics::read_timing::ReadObjectDiagnosticStage::CacheHitReadVerify
     );
 }
 
@@ -1526,10 +1526,10 @@ fn disk_peer_cache_evicts_with_actual_blocks_and_failed_delete_stays_charged() {
     let second = StagedChunk::new(OperationId::new("second"), vec![2; 64 * 1024]);
     assert!(fill(&cache, &first).unwrap());
     let before = cache.stats().unwrap().disk_bytes;
-    cache.state.lock().unwrap().fail_remove = true;
+    cache.state.lock().unwrap().test_hooks.fail_remove = true;
     assert!(fill(&cache, &second).is_err());
     assert_eq!(cache.stats().unwrap().disk_bytes, before);
-    cache.state.lock().unwrap().fail_remove = false;
+    cache.state.lock().unwrap().test_hooks.fail_remove = false;
     assert!(fill(&cache, &second).unwrap());
     assert!(cache.stats().unwrap().disk_bytes <= config.capacity_bytes);
     assert_eq!(cache.stats().unwrap().evictions, 1);
@@ -1646,7 +1646,7 @@ fn disk_peer_cache_failed_pending_cleanup_keeps_reserved_blocks_charged() {
         .unwrap()
         .write_all(b"preserve foreign publication target")
         .unwrap();
-    cache.state.lock().unwrap().fail_remove = true;
+    cache.state.lock().unwrap().test_hooks.fail_remove = true;
     assert!(fill(&cache, &staged).is_err());
     let stats = cache.stats().unwrap();
     assert!(stats.disk_bytes >= staged.chunk.length);
@@ -1656,7 +1656,7 @@ fn disk_peer_cache_failed_pending_cleanup_keeps_reserved_blocks_charged() {
         fs::read(&foreign).unwrap(),
         b"preserve foreign publication target"
     );
-    cache.state.lock().unwrap().fail_remove = false;
+    cache.state.lock().unwrap().test_hooks.fail_remove = false;
     fs::remove_file(foreign).unwrap();
     assert!(fill(&cache, &staged).unwrap());
     assert!(pending_files(&cache).is_empty());
@@ -1863,7 +1863,7 @@ fn disk_peer_cache_metadata_quota_falls_back_to_complete_verification() {
     config.capacity_bytes = 8 * 1024 * 1024;
     let cache = DiskPeerCache::open(config).unwrap();
     let limit = std::mem::size_of::<Option<Box<VerifiedDiskOutboard>>>() as u64;
-    cache.state.lock().unwrap().proof_limit = Some(limit);
+    cache.state.lock().unwrap().test_hooks.proof_limit = Some(limit);
     let staged = StagedChunk::new(
         OperationId::new("metadata-quota"),
         vec![53; 4 * PEER_CACHE_SEGMENT_BYTES],
@@ -1992,7 +1992,7 @@ fn disk_peer_cache_reports_actual_segment_work_and_metadata_until_shutdown() {
     let mut config = options(temp.path().join("cache"));
     config.capacity_bytes = 8 * 1024 * 1024;
     let cache = DiskPeerCache::open(config).unwrap().with_read_work_metrics(
-        crate::node::read_work::ReadWorkMetrics::register(&registry).unwrap(),
+        crate::node::metrics::work::ReadWorkMetrics::register(&registry).unwrap(),
     );
     let staged = StagedChunk::new(
         OperationId::new("metadata-metrics"),

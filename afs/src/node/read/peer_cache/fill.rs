@@ -101,7 +101,7 @@ impl DiskPeerCache {
             let result = (|| {
                 self.check_root()?;
                 #[cfg(test)]
-                if self.lock_state()?.fail_remove {
+                if self.lock_state()?.test_hooks.fail_remove {
                     return Err(unavailable("injected Peer cache cleanup failure"));
                 }
                 match fs::symlink_metadata(self.path(&key)) {
@@ -330,7 +330,7 @@ impl DiskPeerCache {
     ) -> Result<()> {
         self.check_root()?;
         #[cfg(test)]
-        if self.lock_state()?.fail_remove {
+        if self.lock_state()?.test_hooks.fail_remove {
             return Err(unavailable("injected Peer cache cleanup failure"));
         }
         match fs::symlink_metadata(self.pending_path(generation)) {
@@ -395,7 +395,7 @@ impl DiskPeerCache {
             local.local_index_available = state.index_lease.is_some();
             #[cfg(test)]
             {
-                local.proof_limit = state.proof_limit;
+                local.test_hooks.proof_limit = state.test_hooks.proof_limit;
             }
         }
         local.entries.insert(
