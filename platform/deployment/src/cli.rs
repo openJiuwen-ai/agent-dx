@@ -46,6 +46,8 @@ pub enum Command {
     Run,
     /// Query the running deployment supervisor.
     Status,
+    /// Show per-node and cluster scheduling resources through the Environment API.
+    Resources(crate::resources::Options),
     /// Stop supervised services using the running supervisor's shutdown mode.
     Stop {
         /// Override the shutdown mode for this stop request only.
@@ -101,6 +103,7 @@ impl Cli {
             Command::Status => {
                 print_supervisor_response(&config_path, Request::Status).await?;
             }
+            Command::Resources(options) => options.execute(&config_path).await?,
             Command::Stop { mode } => {
                 print_supervisor_response(&config_path, Request::Stop { mode }).await?;
             }

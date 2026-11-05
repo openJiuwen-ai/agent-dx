@@ -196,6 +196,20 @@ impl ShardScheduler {
             .get(id)
             .map(|state| (state.scalar.capacity(), state.scalar.available()))
     }
+    pub fn node_allocated(
+        &self,
+        id: &str,
+    ) -> Option<(
+        adx_core::Resources,
+        Vec<adx_core::scheduling::DeviceAllocation>,
+    )> {
+        self.nodes.get(id).map(|state| {
+            (
+                state.scalar.used(),
+                state.devices.allocated().cloned().collect(),
+            )
+        })
+    }
     pub fn node_devices(&self, id: &str) -> Option<(Vec<Device>, Vec<Device>)> {
         self.nodes.get(id).map(|state| {
             (
