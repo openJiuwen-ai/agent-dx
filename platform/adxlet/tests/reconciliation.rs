@@ -540,6 +540,60 @@ async fn periodic_stale_network_policy_does_not_fence_delete() {
 }
 
 #[tokio::test]
+async fn rejected_stale_failed_collection_does_not_fence_reconciliation_or_delete() {
+    use adx_core::observation::OperationIntent;
+    use std::sync::atomic::Ordering;
+
+    let backend = Arc::new(Backend::default());
+    let node = manager(&backend);
+    let mut authority = authority::Fixture::new().await;
+    let mut failed = record("stale-collection", EnvironmentState::Failed);
+    failed.resources_held = false;
+    failed.runtime.ip = None;
+    authority
+        .authority
+        .records
+        .lock()
+        .unwrap()
+        .push(failed.clone().try_into().unwrap());
+    authority.cycle(&node).await.unwrap();
+    let handle = node.environment(failed.spec, failed.assignment).unwrap();
+    let before_delete = handle.sync().await.unwrap().record;
+
+    // A user deletion publishes a newer Failed result while GC is in flight.
+    backend.fail_remove.store(true, Ordering::SeqCst);
+    assert!(handle.delete().await.is_err());
+    let published = handle.sync().await.unwrap().record;
+    assert_eq!(published.state, EnvironmentState::Failed);
+    assert!(published.revision > before_delete.revision);
+    assert_eq!(
+        published.observation.as_ref().and_then(|o| o.intent),
+        Some(OperationIntent::User)
+    );
+    *authority.authority.records.lock().unwrap() = vec![published.clone().try_into().unwrap()];
+    backend.events.lock().unwrap().clear();
+
+    assert_eq!(
+        handle
+            .collect_failed(before_delete.revision)
+            .await
+            .unwrap_err(),
+        adx_core::Error::Conflict
+    );
+    assert!(backend.events.lock().unwrap().is_empty());
+    backend.fail_remove.store(false, Ordering::SeqCst);
+
+    // Compare before another sync could publish any accidental local mutation.
+    authority.cycle(&node).await.unwrap();
+    assert!(backend.events.lock().unwrap().is_empty());
+    assert_eq!(handle.sync().await.unwrap().record, published);
+    let deleted = handle.delete().await.unwrap();
+    assert_eq!(deleted.record.state, EnvironmentState::Deleted);
+    assert_eq!(deleted.durability, Durability::Published);
+    assert!(!deleted.record.resources_held);
+}
+
+#[tokio::test]
 async fn periodic_current_spec_conflict_remains_fenced_until_authority_matches() {
     let backend = Arc::new(Backend::default());
     *backend.actual.lock().unwrap() = vec![observed("kept")];

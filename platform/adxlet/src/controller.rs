@@ -823,8 +823,6 @@ impl Controller {
         };
         if matches!(&command, Command::Delete) {
             self.operation_intent(adx_core::observation::OperationIntent::User);
-        } else if matches!(&command, Command::CollectFailed(_)) {
-            self.operation_intent(adx_core::observation::OperationIntent::Policy);
         }
         let result = match command {
             Command::RunControl(_)
@@ -903,6 +901,8 @@ impl Controller {
                 {
                     Err(Error::Conflict)
                 } else {
+                    // Rejected GC must not mutate a published record at the same revision.
+                    self.operation_intent(adx_core::observation::OperationIntent::Policy);
                     self.delete().await
                 }
             }
