@@ -486,6 +486,7 @@ fn spawn_controller(
         timer_sequence: 0,
         next_run_timeout: None,
         capture_preparation: None,
+        snapshot_publication: None,
         intent_retry: None,
         recovery_files: None,
         execution_files: vec![],
@@ -941,6 +942,7 @@ struct Controller {
     intent_retry: Option<adx_core::CompletedOperation>,
     stopped_runtime_ids: Vec<String>,
     capture_preparation: Option<(adx_core::CompletedOperation, std::path::PathBuf)>,
+    snapshot_publication: Option<snapshots::SnapshotPublication>,
     create_deadline: Option<tokio::time::Instant>,
     auto_pause_guard: Option<((String, u64, u64), u64)>,
     demand: Arc<std::sync::atomic::AtomicU64>,
@@ -1683,6 +1685,7 @@ impl Controller {
         self.cleanup_pending
             .store(false, std::sync::atomic::Ordering::Release);
         self.capture_preparation = None;
+        self.snapshot_publication = None;
         self.recovery_files = None;
         self.execution_files.clear();
         self.record.execution_artifacts.clear();

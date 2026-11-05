@@ -182,6 +182,17 @@ impl Controller {
         kind: LifecycleKind,
     ) -> Result<bool> {
         validate_operation(id, revision)?;
+        if let Some(pending) = &self.snapshot_publication {
+            let request = &pending.request;
+            return if request.operation_id == id
+                && request.expected_revision == revision
+                && kind == LifecycleKind::Snapshot
+            {
+                Ok(false)
+            } else {
+                Err(Error::Conflict)
+            };
+        }
         if let Some((op, _)) = &self.capture_preparation {
             return if op.id == id && op.expected_revision == revision && op.kind == kind {
                 Ok(false)

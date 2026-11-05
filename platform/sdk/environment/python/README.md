@@ -213,6 +213,13 @@ The source must have a valid lifecycle identity. In particular, an Environment w
 an active reverse tunnel cannot create a reusable Snapshot. A successful
 Snapshot leaves the source running and publishes an immutable artifact; the
 server records READY metadata only after that artifact is available.
+During a node snapshot attempt, a locally Journaled source state is republished
+until Coordinator accepts it or the attempt's checkpoint budget expires. This
+wait keeps the same record and revision and does not repeat backend capture.
+The backend receives the remaining budget, rather than a fresh full timeout.
+Publication conflicts and other errors still fail immediately. If publication
+times out after capture, local pending metadata and artifact references remain
+available for reconciliation; the SDK does not report a successful Snapshot.
 The SDK does not expose the reusable-Snapshot request ID and generates a fresh
 identity for each call. Raw HTTP clients that retry an uncertain request must
 reuse it only for the same source and name; they must not reuse one request ID

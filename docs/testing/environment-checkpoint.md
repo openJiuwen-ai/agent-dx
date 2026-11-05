@@ -48,6 +48,7 @@ sandboxd 必须支持 checkpoint／restore，并通过 runtime capabilities 提�
 - API/RPC 断线不会取消已进入实例队列的操作。暂停等节点操作重试保持原始身份/版本；恢复重试复用 Redis 中的固定意图。已暂停对象节点失效后继续休眠，等待需求、TTL 或删除。
 - 正常结果记录只保留最近成功操作。Node RPC 拒绝旧预期版本；客户端不能在一个后续操作已改变状态后，把旧请求换成新版本重新执行。
 - checkpoint 已完成而 Coordinator 提交失败时，节点按 [SQLite 降级契约](node-lifecycle.md) 保存待补交结果。同一操作重试只补交；Journaled 不返回集群成功，重启后先等待 Coordinator 权威对账。
+- 可复用 Snapshot 在同一次节点请求内等待 Journaled 状态达到 Published：只补交相同记录和版本，不重新运行后端 capture。等待占用该次 checkpoint 的剩余预算，后端收到扣除等待时间后的超时。真实归属／版本冲突立即返回；预算耗尽后保留待补交记录和制品引用，不把本地 journal 当作 Snapshot 成功。此规则不放宽 Coordinator 的 CAS、归属和制品引用校验。
 - checkpoint 调用前，准备失败可调用 Execd abort；调用后不再假设 checkpoint 未启动。无法确认停止／清理时保留资源占用并报告失败。
 - 发布制品失败时，从完整本地暂存尝试恢复运行，并返回暂停失败。回滚或清理失败不会伪装成暂停成功。
 - 恢复失败但清理成功时保留恢复点并释放此次资源；清理不确定时保留资源，等待处理。
@@ -58,6 +59,7 @@ sandboxd 必须支持 checkpoint／restore，并通过 runtime capabilities 提�
 ## 验证
 
 组件测试覆盖状态与资源转换、丢失提交回复、过期清理、恢复失败、回滚、真实 sandboxd 协议的 UDS 调用、Execd HTTP 身份切换和 Ingress 版本检查。Redis 集成测试使用独立真实 Redis。
+可复用 Snapshot 的真实 SQLite JournalSink 回归还覆盖暂时发布失败后成功、只 capture 一次、原预算耗尽及不重试永久冲突；组件结果不替代并发集群验收。
 
 ```bash
 cargo test -p adxlet -p adx-coordinator -p adx-core -p adx-protocol
@@ -78,3 +80,13 @@ python build/e2e/firecracker/sdk_checkpoint.py \
 用例检查创建、命令与文件、暂停、恢复后的内存计数器和 PID、二进制文件、删除。可通过 `--restart-command` 指定选定 adxlet 的重启及就绪检查脚本，验证暂停期间重启。进程重启脚本属于部署测试夹具，不通过 SDK 实现。
 
 真实 FC 本地验收与 Kubernetes Buildkite 验收分开记录；组件测试通过不表示后者已通过。
+
+## 可复用快照的发布等待边界
+
+可复用快照与 workload checkpoint 共用后端超时换算：正的剩余预算向上取整到整秒，最少 1 秒；已过期预算不再发起捕获。发布等待仍使用原始截止时间，不因重试重新计时。退避抖动由 Environment ID 与 ownership generation 共同确定，避免同 generation 的环境全部使用同一偏移。
+
+准备阶段耗尽预算、且尚未调用后端 capture 时，通过 `abort_unstarted` 撤销准备并保留运行中的源环境；只有撤销无法确认时才沿用失败清理。capture 已成功后的发布失败会由存活的 owner 控制器保留阶段、原操作 ID、原 expected revision、暂存路径和快照元数据；同一请求重试继续发布同一个工件，不重复 capture、已完成阶段或 revision 推进。其他生命周期写操作不能越过这项待发布操作，删除仍可清理。新一次 RPC 可使用新的超时预算，但不能改变原操作的快照类型或名称。这个进度不是跨进程的持久恢复协议：节点进程重启仍按未封存 capture 的对账规则清理或退役执行；持久化的 execution-artifact 引用继续负责保护文件和资源归属。
+
+快照发布进度仍待完成时，运行时事件和定期监控触发的 workload checkpoint 也延后处理：不会为另一个 capture 分配暂存目录、执行 prepare、清理引用或向 Execd 返回完成 ACK。原请求及已记录的截止时间保持不变；快照发布完成后按原预算继续处理，已经过期的 workload 请求仍按原超时规则失败。健康观察和显式删除仍保持原有语义。回归覆盖 runsc 未封存的零大小暂存引用和运行时保留 capture 文件两种情形，并验证发布完成后可以执行后续 workload checkpoint。
+
+只有 `Durability::Journaled` 明确确认本地持久化后才等待重新发布；`sync()` 的错误（包括提交超时或本地 journal 故障）立即向调用方返回，不把不确定的持久化结果当成 Journaled。同一 Environment 的控制器仍串行处理命令，发布等待会占用该命令处理窗口直到成功、错误或请求截止时间；本改动不提供 DELETE、RunDeadline 或健康检查事件抢占快照操作的能力。需要缩短这段等待时应设置较短的快照超时，而不是绕过所有权校验或重复 capture。
