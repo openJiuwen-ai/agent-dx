@@ -7,14 +7,32 @@ impl CoordinatorRpc {
     /// Independent maintenance loop: never hold the scheduler lock while waiting
     /// for storage deletion on a node. Deleting records cannot acquire new refs.
     pub async fn collect_snapshots(&self) -> Result<usize> {
-        let (session, candidates) = {
+        let (session, environments, nodes) = {
             let state = self.0.state.lock().await;
             state.healthy()?;
-            let snapshots = state.session.retained_snapshots().await?;
+            let nodes: BTreeMap<_, _> = state
+                .nodes
+                .iter()
+                .filter_map(|(id, node)| {
+                    let live = state.live.get(id)?;
+                    let ready = node
+                        .session
+                        .as_ref()
+                        .is_some_and(|s| s.routable && s.id == live.session)
+                        && live.inspected
+                        && !live.report.reconciling
+                        && live.last_seen.elapsed() < self.0.heartbeat_timeout;
+                    ready.then(|| (id.clone(), (node.address.clone(), live.session.clone())))
+                })
+                .collect();
+            (state.session.clone(), state.environments.clone(), nodes)
+        };
+        let candidates = {
+            let snapshots = session.retained_snapshots().await?;
             for snapshot in &snapshots {
                 for reference in &snapshot.references {
                     if let adx_core::snapshots::Reference::Restore { environment_id } = reference {
-                        if let Some(environment) = state.environments.get(environment_id) {
+                        if let Some(environment) = environments.get(environment_id) {
                             if environment.spec.snapshot_id.as_deref() == Some(snapshot.id.as_str())
                                 && environment.result.as_ref().is_some_and(|record| {
                                     !record.execution_artifacts.contains(&snapshot.artifact)
@@ -29,17 +47,16 @@ impl CoordinatorRpc {
                                             || record.state == EnvironmentState::Deleted)
                                 })
                             {
-                                state
-                                    .session
-                                    .release_snapshot(&snapshot.id, reference.clone())
+                                session
+                                    .release_consumed_snapshot(&snapshot.id, environment)
                                     .await?;
                             }
                         }
                     }
                 }
             }
-            let snapshots = state.session.retained_snapshots().await?;
-            let holds = state.session.execution_holds().await?;
+            let snapshots = session.retained_snapshots().await?;
+            let holds = session.execution_holds().await?;
             let mut candidates = Vec::new();
             for snapshot in &snapshots {
                 if !snapshot.collectable() {
@@ -57,7 +74,7 @@ impl CoordinatorRpc {
                 if snapshots
                     .iter()
                     .any(|s| s.id != snapshot.id && same(&s.artifact))
-                    || state.environments.values().any(|i| {
+                    || environments.values().any(|i| {
                         i.result.as_ref().is_some_and(|r| {
                             r.checkpoint
                                 .iter()
@@ -74,25 +91,8 @@ impl CoordinatorRpc {
                     candidates.push((snapshot.clone(), String::new(), String::new(), false));
                     continue;
                 }
-                let source = state.nodes.get(&snapshot.source_node_id);
-                let source_live = state.live.get(&snapshot.source_node_id);
-                let source_ready = source.zip(source_live).is_some_and(|(node, live)| {
-                    node.session
-                        .as_ref()
-                        .is_some_and(|session| session.routable && session.id == live.session)
-                        && live.inspected
-                        && !live.report.reconciling
-                        && live.last_seen.elapsed() < self.0.heartbeat_timeout
-                });
-                if source_ready {
-                    let node = source.ok_or(Error::Conflict)?;
-                    let live = source_live.ok_or(Error::Conflict)?;
-                    candidates.push((
-                        snapshot.clone(),
-                        node.address.clone(),
-                        live.session.clone(),
-                        false,
-                    ));
+                if let Some((address, session_id)) = nodes.get(&snapshot.source_node_id) {
+                    candidates.push((snapshot.clone(), address.clone(), session_id.clone(), false));
                     continue;
                 }
                 // Local artifacts are owned by their source node.  A shared
@@ -100,7 +100,7 @@ impl CoordinatorRpc {
                 // node cache release as physical deletion by delegating it to
                 // another node after the source has stopped.
             }
-            (state.session.clone(), candidates)
+            candidates
         };
         let mut completed = 0;
         let mut error = None;
@@ -197,6 +197,16 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                 if snapshot.source_node_id != node_id {
                     return Err(Status::permission_denied("snapshot source node mismatch"));
                 }
+                // Serialize duplicate ownership of one artifact without blocking
+                // heartbeats or unrelated environments behind metadata IO.
+                let _publication = self
+                    .create_guard(format!(
+                        "snapshot-artifact:{}:{}{}",
+                        snapshot.artifact.storage.len(),
+                        snapshot.artifact.storage,
+                        snapshot.artifact.location
+                    ))
+                    .await;
                 let state = self.0.state.lock().await;
                 state.healthy().map_err(status)?;
                 let live = state
@@ -224,14 +234,25 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                         "snapshot source ownership changed",
                     ));
                 }
+                let source = source.clone();
+                let session = state.session.clone();
+                drop(state);
                 // Retry an already accepted immutable publication without requiring that
                 // its source Environment still retain the original recovery point.
-                match state.session.get_snapshot(&snapshot.id).await {
+                match session.get_snapshot(&snapshot.id).await {
                     Ok(existing)
                         if existing.same_content(&snapshot)
                             && existing.state == SnapshotState::Ready =>
                     {
-                        return Ok(Response::new(existing.try_into().map_err(status)?));
+                        let saved = session
+                            .publish_snapshot_from_source(
+                                snapshot,
+                                &source.assignment,
+                                &r.node_session_id,
+                            )
+                            .await
+                            .map_err(status)?;
+                        return Ok(Response::new(saved.try_into().map_err(status)?));
                     }
                     Ok(_) => return Err(Status::already_exists("snapshot ID already used")),
                     Err(Error::NotFound) => (),
@@ -245,24 +266,17 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                         "snapshot source input must be committed first",
                     ));
                 }
-                if state
-                    .session
-                    .retained_snapshots()
+                if session
+                    .snapshot_artifact_owned(&snapshot.artifact)
                     .await
                     .map_err(status)?
-                    .iter()
-                    .any(|s| {
-                        s.artifact.storage == snapshot.artifact.storage
-                            && s.artifact.location == snapshot.artifact.location
-                    })
                 {
                     return Err(Status::failed_precondition(
                         "snapshot artifact already owned",
                     ));
                 }
-                let saved = state
-                    .session
-                    .publish_snapshot_from_source(snapshot, &source.assignment)
+                let saved = session
+                    .publish_snapshot_from_source(snapshot, &source.assignment, &r.node_session_id)
                     .await
                     .map_err(status)?;
                 Ok(Response::new(saved.try_into().map_err(status)?))
@@ -305,17 +319,26 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                         ))
                     }
                 }
-                let snapshot = state.session.get_snapshot(&r.id).await.map_err(status)?;
+                let session = state.session.clone();
+                drop(state);
+                let snapshot = session.get_snapshot(&r.id).await.map_err(status)?;
+                let state = self.0.state.lock().await;
+                state.healthy().map_err(status)?;
                 match principal {
                     Principal::ApiServer => {
                         tenant(r.caller.as_ref(), &snapshot.template.tenant_id)?
                     }
                     Principal::Node(id)
-                        if id == snapshot.source_node_id
+                        if state.live.get(&id).is_some_and(|live| {
+                            live.session == r.node_session_id
+                                && live.inspected
+                                && !live.report.reconciling
+                                && live.last_seen.elapsed() < self.0.heartbeat_timeout
+                        }) && (id == snapshot.source_node_id
                             || state.environments.values().any(|e| {
                                 e.assignment.node_id == id
                                     && e.spec.snapshot_id.as_deref() == Some(snapshot.id.as_str())
-                            }) => {}
+                            })) => {}
                     _ => return Err(Status::permission_denied("snapshot source node mismatch")),
                 }
                 if snapshot.state == SnapshotState::Deleted {
@@ -358,8 +381,9 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                 let size = if r.page_size == 0 { 100 } else { r.page_size } as usize;
                 let state = self.0.state.lock().await;
                 state.healthy().map_err(status)?;
-                let snapshots = state
-                    .session
+                let session = state.session.clone();
+                drop(state);
+                let snapshots = session
                     .list_snapshots(&caller.tenant_id)
                     .await
                     .map_err(status)?;
@@ -406,7 +430,9 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                 let r = request.into_inner();
                 let state = self.0.state.lock().await;
                 state.healthy().map_err(status)?;
-                let snapshot = state.session.get_snapshot(&r.id).await.map_err(status)?;
+                let session = state.session.clone();
+                drop(state);
+                let snapshot = session.get_snapshot(&r.id).await.map_err(status)?;
                 tenant(r.caller.as_ref(), &snapshot.template.tenant_id)?;
                 let mut users = std::collections::BTreeSet::new();
                 let mut templates = std::collections::BTreeSet::new();
@@ -423,6 +449,8 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                         }
                     }
                 }
+                let state = self.0.state.lock().await;
+                state.healthy().map_err(status)?;
                 for environment in state.environments.values() {
                     if environment.result.as_ref().is_some_and(|record| {
                         record.execution_artifacts.contains(&snapshot.artifact)
@@ -434,7 +462,8 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                         users.insert(environment.spec.id.clone());
                     }
                 }
-                for hold in state.session.execution_holds().await.map_err(status)? {
+                drop(state);
+                for hold in session.execution_holds().await.map_err(status)? {
                     if hold.artifacts.contains(&snapshot.artifact) {
                         users.insert(hold.assignment.environment_id);
                     }
@@ -445,8 +474,7 @@ impl pb::snapshot_service_server::SnapshotService for CoordinatorRpc {
                         template_ids: templates.into_iter().collect(),
                     }));
                 }
-                let deleted = state
-                    .session
+                let deleted = session
                     .delete_snapshot(&r.id, &snapshot.template.tenant_id)
                     .await
                     .map_err(status)?;

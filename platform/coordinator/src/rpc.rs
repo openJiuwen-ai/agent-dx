@@ -2111,8 +2111,26 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     "live node session required for inspection",
                 ));
             }
-            let (cached_snapshots, holds) =
-                state.session.inspection_inventory().await.map_err(status)?;
+            let session = state.session.clone();
+            drop(state);
+            let (cached_snapshots, holds) = session
+                .node_inspection_inventory(&r.node_id)
+                .await
+                .map_err(status)?;
+            let mut state = self.0.state.lock().await;
+            state.healthy().map_err(status)?;
+            let live = state.live.get(&r.node_id).ok_or_else(|| {
+                Status::failed_precondition("node session changed during inspection")
+            })?;
+            if state.session.epoch() != session.epoch()
+                || live.session != r.session_id
+                || live.expired
+                || live.last_seen.elapsed() >= self.0.heartbeat_timeout
+            {
+                return Err(Status::failed_precondition(
+                    "node session changed during inspection",
+                ));
+            }
             let mut retained = BTreeMap::new();
             let mut retain = |artifact: &adx_core::CheckpointArtifact| {
                 if artifact.storage == "local" {
@@ -2153,10 +2171,6 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 .map_err(status)?;
             let snapshots = cached_snapshots
                 .into_iter()
-                .filter(|snapshot| {
-                    snapshot.source_node_id == r.node_id
-                        && snapshot.state != adx_core::snapshots::SnapshotState::Deleted
-                })
                 .map(TryInto::try_into)
                 .collect::<Result<Vec<_>>>()
                 .map_err(status)?;
@@ -2766,3 +2780,5 @@ mod cancellation_tests {
 
 #[cfg(test)]
 mod publication_tests;
+#[cfg(test)]
+mod snapshot_publication_tests;

@@ -164,6 +164,33 @@ SDK 的 `EnvironmentHTTPError.sandbox_ids` / `template_ids` 提供这些列表�
 无使用者时，Redis CAS 将 Snapshot 置为 Deleting，关闭新引用。后台执行物理删除并提交 Deleted；
 存储失败或应答丢失会幂等重试。共享删除不要求源 adxlet 在线。
 
+同一 Coordinator Session 的 Snapshot 提交沿用 inspection 互斥，并在取得互斥后读取
+CAS 比较的全局 header。并发更新不同 Snapshot 的引用时，等待者以队列前序提交完成后
+的 header 构建比较值。epoch、完整 Snapshot 记录、来源记录与 Volume catalog 的比较、
+全局 revision 推进及既有32次重试预算保持不变。
+
+带卷 Snapshot 的发布与最终删除也在取得 inspection 互斥后读取整份 Volume catalog，并从这份 catalog 计算卷保护增删及对应 header；不能只刷新 header 而保留排队前计算的卷写入，否则可能覆盖其他 Snapshot 的保护关系。普通 acquire/release 在 Snapshot 未进入 Deleted 时不修改 Volume catalog。相同 Session 的这些提交仍按既有互斥串行执行，锁内 Redis 往返属于当前正确性方案的成本；本改动不声称消除全局提交瓶颈或跨 Session 的全部竞争。
+
+节点 Inspect 从已提交缓存中先筛选来源节点并排除 Deleted，再复制要返回的 Snapshot；
+Deleting 仍返回，执行输入保护仍使用完整的 holds 视图。持久化 tombstone 与完整 catalog
+查询保持不变。这样单节点巡检不会为全部节点的历史 Deleted 记录复制模板环境等正文。
+Linux 回归 `storage::inspection::tests::node_inspection_clone_budget` 在独立子进程中构造
+64 个已删除、一个其他节点和两个本节点有效记录，每份携带 2 MiB 模板数据，限制巡检
+新增峰值小于 16 MiB；这验证复制范围，不代表 Coordinator 的总内存预算或集群容量。
+
+已初始化目录的 Session 在读取 Snapshot 列表、节点所有权和回收候选时，先校验当前
+epoch，再从同一个已提交目录筛选并复制结果；不会为每次操作通过 Redis HVALS 重读
+全部历史 tombstone。未初始化目录的独立存储 Session 保留原有持久化查询与数据校验。
+可复用快照发布只借用目录判断同 storage/location 是否已有非 Deleted 所有者，不复制
+全部保留记录；Deleting 仍占有制品。目录因取消或不确定写入而不可用时，此判断返回
+Unavailable，必须先恢复，不能把目录缺失解释为“无人使用”。来源记录、节点会话与
+最终提交的 epoch/CAS 校验保持不变。
+Redis 连接 lease 被替换时，旧目录即失效；成功重连或读取 header 不足以重新确认目录。
+在途写入不能重新发布旧 lease 下的视图，跨 lease 的目录恢复也会被拒绝并要求重试。
+真实 Redis 回归覆盖发布、列表和一次 GC 不重读历史目录，以及 Deleting/Deleted
+所有权、未恢复目录、旧 epoch 拒绝、Redis 重启后的重新确认和在途目录写入隔离；
+这不替代部署后的并发或故障验收。
+
 ## 共享回收与故障
 
 Coordinator 在 Redis 持久化共享制品清单。每轮检查 Environment 恢复点、执行输入、

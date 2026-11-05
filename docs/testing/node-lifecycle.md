@@ -2,6 +2,12 @@
 
 adxlet 拥有实例串行状态机。Coordinator 提供归属校验、Redis 持久化和路由发布；暂停等节点操作由 API Server 缓存命中后直达节点；手动恢复与 Ingress 流量唤醒统一调用 Coordinator `EnsureRunning`。
 
+快照目录的发布、查询、删除、巡检和回收等待存储时，不持有 Coordinator 全局调度状态锁，避免慢元数据操作阻塞正常心跳。发布在读取归属后，仍由同一 Redis CAS 比较 epoch、原始 Environment 记录和 `node-session` 标记；节点替换或源实例变化会拒绝迟到的发布。同一 artifact 的发布单独串行，避免两个快照 ID 重复认领。回收已消费的输入引用时，也比较原始持久归属，防止扫描后实例更新或重建导致误释放。
+
+调度恢复检查通过独立的原子标记判断 inspection inventory 是否已初始化，避免仅检查就绪状态也排在元数据写锁后。目录内容仍等待原锁，不能读取未提交视图；写入失败或取消时，guard 释放会关闭标记并要求权威恢复。
+
+`rpc::snapshot_publication_tests` 使用私有真实 Redis 暂停写入，同时提交目录读取、删除、节点巡检和 GC，验证普通心跳仍能完成；并覆盖持久节点会话替换及相同 artifact 的并发发布。RPC 快照回归继续校验租户隔离、失效源实例、引用保留和物理回收确认。
+
 ## 运行策略
 
 `EnvironmentSpec.lifecycle` 包含 `idle_timeout_seconds`、`idle_action`（默认 delete）、可选 `pause` 和可选 `restart`。HTTP 对应 `idleTimeoutSeconds`、`idleAction`、`pauseOptions`、`restartPolicy`；Python SDK 对应 `idle_timeout`、`IdleAction`、`PausePolicy`、`RestartPolicy`。自动和手动暂停后的鉴权业务流量均可唤醒，无需额外开关。
@@ -23,6 +29,8 @@ ADXlet 启动或节点会话重新接管时，在准入屏障内排空已接纳�
 同一实例最多一个待完成核对任务。读取目录前记录本机 Controller 身份，期间新接纳的 Controller 不会因缺席旧目录被删除；旧代际不能覆盖新执行。节点会话失效和启动恢复仍限制准入；普通周期目录获取失败保持原有目录与准入，后续重试收敛，不能把失败当作空目录。状态提交失败保留待发布结果，由该实例自己的重试截止时间恢复。
 
 已认领但创建 RPC 尚未到达的初始 `Pending`（revision 为 0、无执行结果）在日常核对中保留，等待原创建流程；已注册但尚未开始的 Controller 同样不会被转成 Failed。目录中暂时没有某条记录，不能证明在途 Claim 已被拒绝，本机预留由明确的声明结果或原身份重试收敛。启动恢复不采用这一豁免：旧进程可能启动过尚未提交的执行，仍须核对并清理。
+
+初次发布带 checkpoint/输入制品或 Volume 的 `Running` 结果时，Coordinator 按制品保护、对象发布锁、inspection 锁的顺序进入元数据队列，再读取被比较的 header；不同恢复不能携带排队前的旧 header 耗尽 CAS 重试。队列只覆盖权威元数据发布，不覆盖后端恢复、就绪探测或业务命令。epoch、header、原记录、业务计数、节点会话、归属与 Request ID 回执校验保持不变；不附带制品或 Volume 的初始发布仍可跨对象并行。
 
 已发布本地结果领先于目录时，仅重新核对该 Environment，不采用旧目录、不关闭整个
 节点准入，也不阻止该对象的删除等生命周期操作。网络策略等可变 Spec 字段发生变化时，
@@ -143,3 +151,9 @@ Rust 用例位于 adxlet 的 `journal.rs`、`resources.rs`、`pause_resume.rs` �
 
 同一轮最终目录中实例全部 Deleted，资源已释放，sandboxd 清单与 checkpoint 目录为空，服务正常停止。
 证据位于 `out/ci/pause-resume/fc-r7/evidence/`，包括 `sdk/result.json`、`lifecycle/result.json`、`catalog-final.json`、`inventory-final.txt` 和 `result.json`；构建/部署完整日志位于 `out/ci/stage-2/{linux-2,package-2,fc-r7}.log`。回归日志为 `rust-5.log`（141 项测试，Clippy 通过）及 `clients-4.log`（Go 检查及 138 项 SDK 测试）。这些是本地证据，Kubernetes 验收尚未包含新增生命周期场景。
+
+首次 Running 结果发布在读取 header、Volume catalog 和计数器前取得同一对象的发布锁；
+准备期间只有读取，读取失败或等待取消不会污染已提交的目录。仅在提交 Redis EVAL 前
+启用不确定写入跟踪，此后超时或取消仍要求对账，不能当作未写入处理。
+本地回归覆盖 512 个制品结果和 64 个共享 Volume 结果并发发布，校验每个结果、
+请求回执和 Volume 引用；这不代表集群启动／恢复吞吐已经完成验收。

@@ -20,6 +20,26 @@ async fn publication_restores_a_rebuilt_catalog() {
 async fn catalog_rebuild_preserves_memory_local_reservation_until_publication() {
     publication_race("local-rebuild").await;
 }
+#[tokio::test]
+#[ignore = "requires isolated Redis; run control-rpc suite"]
+async fn catalog_rebuild_preserves_dispatched_central_reservation_until_publication() {
+    publication_race("central-rebuild").await;
+}
+#[tokio::test]
+#[ignore = "requires isolated Redis; run control-rpc suite"]
+async fn catalog_rebuild_does_not_retain_a_replaced_nodes_volatile_assignment() {
+    publication_race("replaced-session-rebuild").await;
+}
+#[tokio::test]
+#[ignore = "requires isolated Redis; run control-rpc suite"]
+async fn catalog_rebuild_does_not_retain_a_retired_nodes_volatile_assignment() {
+    publication_race("retired-session-rebuild").await;
+}
+#[tokio::test]
+#[ignore = "requires isolated Redis; run control-rpc suite"]
+async fn new_coordinator_process_does_not_invent_a_volatile_assignment() {
+    publication_race("new-process").await;
+}
 async fn publication_race(action: &str) {
     let redis = cancellation_test_redis::Redis::new().await;
     let store = crate::storage::RedisStore::connect(&redis.url, "test", Duration::from_secs(5))
@@ -62,7 +82,7 @@ async fn publication_race(action: &str) {
         .unwrap();
     let assignment = {
         let mut state = rpc.0.state.lock().await;
-        state.scheduler.register(node).unwrap();
+        state.scheduler.register(node.clone()).unwrap();
         state.nodes.insert("node".into(), saved);
         state.live.insert(
             "node".into(),
@@ -102,18 +122,82 @@ async fn publication_race(action: &str) {
         snapshot_source: None,
         execution_artifacts: vec![],
     };
-    if action == "local-rebuild" {
+    if action == "new-process" {
+        let restarted = CoordinatorRpc::new(
+            session.clone(),
+            Placement::Pack,
+            Peers::network(),
+            RpcClient::network(Principal::Coordinator),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(!restarted
+            .0
+            .state
+            .lock()
+            .await
+            .environments
+            .contains_key(&spec.id));
+        assert_eq!(session.get(&spec.id).await.unwrap_err(), Error::NotFound);
+        return;
+    }
+    if matches!(
+        action,
+        "replaced-session-rebuild" | "retired-session-rebuild"
+    ) {
+        if action == "replaced-session-rebuild" {
+            session
+                .register_session(
+                    node,
+                    "127.0.0.1:1".into(),
+                    "127.0.0.1:2".into(),
+                    Some(NodeSession {
+                        id: "replacement".into(),
+                        sequence: 1,
+                        routable: true,
+                    }),
+                )
+                .await
+                .unwrap();
+        } else {
+            session.invalidate_node("node", "boot").await.unwrap();
+        }
+        {
+            let mut state = rpc.0.state.lock().await;
+            state.needs_recovery = true;
+            state.recover_authoritative_state().await.unwrap();
+            assert!(!state.environments.contains_key(&spec.id));
+            assert!(!state
+                .scheduler
+                .snapshot()
+                .environments()
+                .contains_key(&spec.id));
+        }
+        assert!(rpc.commit(record, "boot".into()).await.is_err());
+        assert_eq!(session.get(&spec.id).await.unwrap_err(), Error::NotFound);
+        return;
+    }
+    if matches!(action, "local-rebuild" | "central-rebuild") {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         {
             let mut state = rpc.0.state.lock().await;
-            state
-                .local_reservation_deadlines
-                .insert(spec.id.clone(), (assignment.clone(), deadline));
+            if action == "local-rebuild" {
+                state
+                    .local_reservation_deadlines
+                    .insert(spec.id.clone(), (assignment.clone(), deadline));
+            }
             state.needs_recovery = true;
             state.recover_authoritative_state().await.unwrap();
-            assert_eq!(state.environments[&spec.id].assignment, assignment);
+            assert_eq!(
+                state.environments.get(&spec.id).map(|e| &e.assignment),
+                Some(&assignment),
+                "catalog repair must retain an assignment already handed to a node"
+            );
             assert_eq!(state.scheduler.pending(0).unwrap(), 0);
-            assert_eq!(state.local_reservation_deadlines[&spec.id].1, deadline);
+            if action == "local-rebuild" {
+                assert_eq!(state.local_reservation_deadlines[&spec.id].1, deadline);
+            }
             assert!(state
                 .scheduler
                 .snapshot()

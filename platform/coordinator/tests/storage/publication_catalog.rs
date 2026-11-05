@@ -270,3 +270,38 @@ async fn publication_resolves_a_timed_out_write_before_publishing_its_repair() {
     publisher.refresh().await.unwrap();
     assert_eq!(directory(&publisher).await.upserts.len(), 1);
 }
+
+#[tokio::test]
+#[ignore = "requires isolated Redis; run storage suite"]
+async fn failed_initial_publication_read_keeps_committed_catalog_available() {
+    let mut rig = common::Redis::new().await;
+    let session = rig.store().await.begin(1).await.unwrap();
+    register(&session, "node").await;
+    session
+        .publish_initial(record("existing", 1), "", "")
+        .await
+        .unwrap();
+    let publisher = RoutePublisher::new(session.clone(), Peers::network());
+    publisher.refresh().await.unwrap();
+    rig.crash();
+    assert!(session
+        .publish_initial(record("unwritten", 2), "", "")
+        .await
+        .is_err());
+    // Preparation only read Redis. With no EVAL attempted, a new directory
+    // snapshot remains available from the already committed in-memory catalog.
+    publisher.refresh().await.unwrap();
+    let frame = directory(&publisher).await;
+    assert_eq!(frame.upserts.len(), 1);
+    assert_eq!(
+        frame.upserts[0]
+            .record
+            .as_ref()
+            .unwrap()
+            .spec
+            .as_ref()
+            .unwrap()
+            .id,
+        "existing"
+    );
+}

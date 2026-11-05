@@ -137,6 +137,10 @@ object CAS updates the catalog and enqueues its typed value or deletion under on
 short lock; unchanged replays do not republish old results. Each atomic batch has
 one publication cursor. Recovery captures the in-memory snapshot, subscription
 and watermark together; it does not scan Redis or wait for other writers to stop.
+In-process scheduler repair retains unpublished local and central assignments
+already handed to the same live node session, without renewing their deadlines.
+Durable ownership wins over this volatile view; replaced or retired node sessions
+are excluded. A new Coordinator process recovers only durable assignments.
 Both receive and batch-drain overflow reset this cursor. Ambiguous writes are
 repaired by bounded, object-locked reads of the affected keys. Publication recovery
 does not change node admission. The Coordinator runtime uses four worker threads;

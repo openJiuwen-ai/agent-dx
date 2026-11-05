@@ -186,6 +186,18 @@ impl Session {
             || !record.execution_artifacts.is_empty();
         let _access = self.store.lock_artifacts(&artifacts)?;
         for _ in 0..ATTEMPTS {
+            // Match artifact -> object publication -> inspection ordering used
+            // by failure recovery. Header comparisons must be read after joining
+            // the metadata queue, rather than racing every restored execution.
+            let mut write = self
+                .store
+                .publication_prepare(self.epoch, vec![field.clone()])
+                .await;
+            let inspection = if attaches_artifacts || volumes::has_volumes(&record.spec) {
+                Some(self.inspection.lock().await)
+            } else {
+                None
+            };
             let catalog = if volumes::has_volumes(&record.spec) {
                 Some(self.volume_catalog().await?)
             } else {
@@ -196,6 +208,7 @@ impl Session {
                 .as_ref()
                 .is_some_and(|catalog| catalog.control.get(&field) != old.as_ref())
             {
+                write.finish(false, vec![]);
                 continue;
             }
             let mut counters = CounterUpdate::load(&self.store, field.clone()).await?;
@@ -216,6 +229,7 @@ impl Session {
             });
 
             if require_existing && !published {
+                write.finish(false, vec![]);
                 return Err(Error::NotFound);
             }
             let mut next = next.clone();
@@ -301,10 +315,7 @@ impl Session {
                 record.spec.id.clone(),
                 Some(Arc::new(next.clone())),
             )];
-            let write = self
-                .store
-                .publication_write(self.epoch, vec![field.clone()])
-                .await;
+            write.begin_write();
             let (code, raw): (i8, String) = self.store.query(command).await?;
             write.finish_with_fields(
                 code == 1,
@@ -314,6 +325,7 @@ impl Session {
                     .flat_map(volumes::Catalog::change_fields)
                     .collect(),
             );
+            drop(inspection);
             match code {
                 1 | 2 => {
                     let winner: StoredEnvironment = decode(&raw)?;
