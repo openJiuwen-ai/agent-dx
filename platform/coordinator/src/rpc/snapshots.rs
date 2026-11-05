@@ -110,6 +110,11 @@ impl CoordinatorRpc {
                 if session.get_snapshot(&snapshot.id).await? != snapshot {
                     return Err(Error::Conflict);
                 }
+                // Local node RPCs are destructive too. Keep exclusion through
+                // their ACK and final catalog update, just like shared GC.
+                let _deletion = session
+                    .claim_artifact_deletion(&snapshot.artifact, Some(&snapshot.id))
+                    .await?;
                 if snapshot.artifact.storage != "local" {
                     let reclaimers = self
                         .0
@@ -117,9 +122,6 @@ impl CoordinatorRpc {
                         .read()
                         .expect("reclaimer registry lock poisoned")
                         .clone();
-                    let _deletion = session
-                        .claim_artifact_deletion(&snapshot.artifact, Some(&snapshot.id))
-                        .await?;
                     reclaimers.remove(&snapshot.artifact).await?;
                     session.forget_artifact(&snapshot.artifact).await?;
                     session
