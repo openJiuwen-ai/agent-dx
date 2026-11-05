@@ -57,29 +57,22 @@ fn p2_w2_native_write_limits_use_cli_file_defaults_and_bounded_resources() {
 #[cfg(all(feature = "ownerfs", feature = "dfs"))]
 #[test]
 fn p2_w2_complete_node_examples_resolve_top_level_write_limits() {
-    for (name, contents) in [
-        ("component", include_str!("../examples/node.toml")),
-        (
-            "deployment",
-            include_str!("../../build/config/examples/afs/node.toml"),
-        ),
-    ] {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("node.toml");
-        std::fs::write(&path, contents).unwrap();
-        let config = Config::resolve(
-            Role::Node,
-            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
-        )
-        .unwrap_or_else(|error| panic!("{name} complete example does not resolve: {error}"));
-        assert_eq!(config.dfs_dirty_budget_bytes, 64 * 1024 * 1024, "{name}");
-        assert_eq!(config.dfs_unpublished_descriptors, 1024, "{name}");
-        assert_eq!(config.dfs_upload_inflight_chunks, 8, "{name}");
-        assert_eq!(config.dfs_background_commit_ms, 5000, "{name}");
-        assert_eq!(config.dfs_catalog_commit_queue, 256, "{name}");
-        assert_eq!(config.trusted_node_certs.len(), 1, "{name}");
-        assert!(config.trusted_node_certs.contains_key("node-a"), "{name}");
-    }
+    let contents = include_str!("../../build/config/examples/afs/node.toml");
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("node.toml");
+    std::fs::write(&path, contents).unwrap();
+    let config = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+    .unwrap_or_else(|error| panic!("deployment complete example does not resolve: {error}"));
+    assert_eq!(config.dfs_dirty_budget_bytes, 64 * 1024 * 1024);
+    assert_eq!(config.dfs_unpublished_descriptors, 1024);
+    assert_eq!(config.dfs_upload_inflight_chunks, 8);
+    assert_eq!(config.dfs_background_commit_ms, 5000);
+    assert_eq!(config.dfs_catalog_commit_queue, 256);
+    assert_eq!(config.trusted_node_certs.len(), 1);
+    assert!(config.trusted_node_certs.contains_key("node-a"));
 }
 
 #[test]
@@ -483,7 +476,8 @@ fn ownerfs_mkdir_load_balance_is_opt_in() {
 #[cfg(all(feature = "ownerfs", feature = "dfs"))]
 #[test]
 fn shipped_examples_resolve_with_mutual_tls_and_node_identity_binding() {
-    let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples");
+    let examples =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../build/config/examples/afs");
     let meta_path = examples.join("meta.toml");
     let node_path = examples.join("node.toml");
     let meta = Config::resolve(
@@ -1945,7 +1939,7 @@ fn unified_native_read_has_no_user_sync_async_switch() {
     let json = serde_json::to_value(&config).unwrap();
     assert!(json["dfs_read_pipeline"].get("enabled").is_none());
     assert!(
-        serde_json::from_value::<afs::node::read_pipeline::ReadPipelineLimits>(
+        serde_json::from_value::<afs::node::read::admission::ReadPipelineLimits>(
             serde_json::json!({"enabled":false})
         )
         .is_err()

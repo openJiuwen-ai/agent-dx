@@ -18,7 +18,7 @@ Agent FS（AFS） 是 Agent DX 的可选文件系统组件。默认部署配置�
 
 ## 配置示例
 
-发布包配置示例来自 [build/config/examples/afs/](../../build/config/examples/afs/)，源码级示例保留在 [afs/examples/](../../afs/examples/)。部署层只负责把 AFS TOML 交给 `afs-meta` 和 `afs-node`，以及进程启动、健康查询、正常停止和卸载；它不改写 AFS 自有配置 schema。
+发布包配置示例来自 [build/config/examples/afs/](../../build/config/examples/afs/)，这也是唯一的权威示例（`afs/tests/config_contract.rs` 直接解析它）。部署层只负责把 AFS TOML 交给 `afs-meta` 和 `afs-node`，以及进程启动、健康查询、正常停止和卸载；它不改写 AFS 自有配置 schema。
 
 Meta 后端优先级：
 
@@ -619,7 +619,7 @@ Node 顶层 `dfs_read_diagnostics_enabled` 默认为 `false`。仅在限定诊�
 dfs_read_diagnostics_enabled = true
 ```
 
-使用节点现有 `rest_listen` 地址读取 `GET /v1/diagnostics/dfs-read-timing`；例如 `afs/examples/node.toml` 示例的
+使用节点现有 `rest_listen` 地址读取 `GET /v1/diagnostics/dfs-read-timing`；例如 `build/config/examples/afs/node.toml` 示例的
 `http://127.0.0.1:7501/v1/diagnostics/dfs-read-timing`。未开启时路由返回404。
 该入口复用现有管理HTTP监听，不新增鉴权层；监听地址应限于原受控管理网络。
 

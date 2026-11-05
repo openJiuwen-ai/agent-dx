@@ -7,22 +7,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[3]
 PACKAGED = ROOT / "build/config/examples/afs"
-SOURCE = ROOT / "afs/examples"
 
 
 class AfsExampleTests(unittest.TestCase):
-    def test_packaged_examples_are_secure_and_match_crate_examples(self):
-        # Config::resolve is exercised by afs/tests/config_contract.rs.
+    def test_packaged_examples_are_secure(self):
+        # Config::resolve of these same files is exercised by afs/tests/config_contract.rs.
         # Keep this package-copy contract runnable in ADX's Python 3.9 image.
         for name, identity in (("meta", "meta"), ("node", "node-a")):
             text = (PACKAGED / f"{name}.toml").read_text()
             lines = [line.strip() for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
-            source_lines = [
-                line.strip()
-                for line in (SOURCE / f"{name}.toml").read_text().splitlines()
-                if line.strip() and not line.lstrip().startswith("#")
-            ]
-            self.assertEqual(lines, source_lines)
             expected = {
                 "fs": "all",
                 "tls_ca_certificate": "/opt/adx/config/afs/tls/ca.pem",

@@ -22,10 +22,11 @@ AFS 把用户可见的文件语义和文件字节搬运分开：
 | --- | --- |
 | `afs-meta` | 命名空间、inode、写租约、文件版本、布局、放置、副本目录和幂等提交结果 |
 | `afs-node` | FUSE 会话、OwnerFs Home 访问、DFS dirty 状态、本地 chunk 存储、复制执行、远端读、验证缓存和卸载排空 |
-| `afs/common/*` | AFS 域内共享的错误、日志、指标、协议、追踪和传输 crate |
-| `afs/client` | DFS 客户端 crate；不作为 Agent DX 平台内部 RPC 适配层 |
+| `afs/crates/*` | AFS 域内共享的错误、日志、指标、协议、追踪和传输 crate |
+| `afs/crates/client` | DFS 客户端 crate；不作为 Agent DX 平台内部 RPC 适配层 |
+| `afs/tools` | 度量工具与诊断探针（`afs-tools`），不进发布包 |
 
-`afs/common/*` 是 AFS 域内共享层，不纳入 Agent DX 根级产品基础设施。
+`afs/crates/*` 是 AFS 域内共享层，不纳入 Agent DX 根级产品基础设施。
 Agent DX 平台内部 gRPC 仍按 Environment、Runtime、Snapshot、Route 和 Node
 责任拆分；AFS 不把 POSIX/Frontend 适配器接入 Platform 内部 RPC。
 

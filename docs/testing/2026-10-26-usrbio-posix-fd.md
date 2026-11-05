@@ -7,9 +7,9 @@ This is single Linux ARM64/FUSE/DFS component evidence, not full ADX deployment,
 physical-power-loss, multi-node, mTLS deployment, remote CI or a product storage
 throughput claim. Publication and remote CI status are tracked separately by the merge request.
 
-The [main example](../../afs/client/examples/usrbio_round_trip.rs) now uses POSIX
+The [main example](../../afs/crates/client/examples/usrbio_round_trip.rs) now uses POSIX
 create/open, `register_fd`, the existing rings, retained-original `sync_all`,
-`unregister_fd`, then POSIX readback. [The path example](../../afs/client/examples/usrbio_path_round_trip.rs)
+`unregister_fd`, then POSIX readback. [The path example](../../afs/crates/client/examples/usrbio_path_round_trip.rs)
 retains the separate SDK open/register interface. Identity is the original FUSE
 open, never a path re-open. Access bits and ring session are checked by Node;
 current O_APPEND/O_PATH is rejected before RPC, including F_SETFL after open.
@@ -66,7 +66,7 @@ cohorts are retained separately. Final binaries have SHA256:
 - FUSE test: `c61de7ea2da7e54ce943e7461bf159e222c79022171028a5fcc7a7384411e71d`
 - performance probe: `503080c1419fbf36ce10662cae8b94f15dfb085d40a79fe3d5aebcf439395de9`
 
-The maintained [probe](../../afs/examples/entrance_probe.rs) accepts `sdk` and
+The maintained [probe](../../afs/tools/src/bin/entrance-probe.rs) accepts `sdk` and
 `sdk_fd`, with optional final pass count `3`; its JSON separates first/steady IO,
 setup, sync, cleanup and full wall time. Raw per-round output, exact commands,
 source hashes, gate exits and failed-attempt history accompany the delivery.

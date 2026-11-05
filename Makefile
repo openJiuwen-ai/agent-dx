@@ -37,10 +37,10 @@ endif
 ADX_WITH_AFS ?= 0
 ADX_AFS_ALL_FEATURES ?= 0
 AFS_PACKAGES := -p afs -p afs-client -p afs-error -p afs-logging \
-	-p afs-metrics -p afs-protocol -p afs-tracing -p afs-transport
+	-p afs-metrics -p afs-protocol -p afs-tracing -p afs-transport -p afs-tools
 AFS_EXCLUDES := --exclude afs --exclude afs-client --exclude afs-error \
 	--exclude afs-logging --exclude afs-metrics --exclude afs-protocol \
-	--exclude afs-tracing --exclude afs-transport
+	--exclude afs-tracing --exclude afs-transport --exclude afs-tools
 ifeq ($(ADX_WITH_AFS),1)
 else ifeq ($(ADX_WITH_AFS),0)
 else

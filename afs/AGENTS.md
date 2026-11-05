@@ -7,5 +7,5 @@
 - 不导入源仓过程资产，例如 `.github/`、`.codex/`、`.omx/`、历史证据、checkpoint、大日志或旧 release 包。
 - 不 vendor 或私有 patch 第三方 FUSE 源码；当前依赖是 `Cargo.toml` 声明的官方固定 `fuser` 版本。
 - Rust 构建、Cargo metadata、格式、Clippy、单元测试、FUSE runtime 验证和性能结论都只在 Linux 上确认。macOS 只用于文档检查和 Python 静态工具核对，不能作为 Rust/文件系统验收通过证据。
-- `tests/support` 程序是测试辅助。验收流程可以显式构建它们，但它们不是产品二进制，不得进入默认发布包。
-- `afs/common/*` 是 AFS 域内共享 crate，不是 Agent DX 根级产品基础设施；不要把旧 POSIX 或 Frontend 适配器接回 Platform 内部 RPC。
+- `tools/`（crate `afs-tools`）是度量工具与诊断探针。验收流程可以显式构建它们，但它们不是产品二进制，不得进入默认发布包；新增工具放这里，不放 `tests/` 或 `src/`。
+- `afs/crates/*` 是 AFS 域内共享库 crate，不是 Agent DX 根级产品基础设施；不要把旧 POSIX 或 Frontend 适配器接回 Platform 内部 RPC。

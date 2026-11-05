@@ -25,9 +25,16 @@ uds_path = "/opt/adx/run/afs/node-a.sock"
 # dfs_version_cache_entries = 4096
 # Cache-retained metadata estimate; active reader Arcs and Node RSS are separate.
 # Includes layout/index capacities, ID buffers and conservative cache-table overhead.
+# A DFS-capable Node rejects combinations below the table plus fixed value floor.
+# Larger layouts remain uncached when their actual retained size exceeds this limit.
 # dfs_version_cache_bytes = 33554432
-# Catalog request count, independent of body/proof budgets.
+# Shared proof work admission wait, 0..=50ms; 0 disables waiting, not validation.
+# dfs_outboard_work_wait_ms = 2
+# Optional proof installs, queued plus active; valid range 1..=64.
+# Body/catalog durability never waits for this background queue.
+# Catalog request count; a separate 1MiB control bound also applies.
 dfs_catalog_commit_queue = 256
+# dfs_sidecar_install_queue = 64
 # Bounded native cache flight records, valid range 1..=8.
 # This does not enable multiple body fills or object prefetch.
 # dfs_fetch_max_inflight_objects = 8
@@ -60,7 +67,12 @@ trace_endpoint = "http://127.0.0.1:4317"
 # Create and authorize the Home workspace through OwnerFs before enabling this.
 # Only one already-existing local Home workspace is supported. Stop managed
 # users before shutdown/root changes; native FDs are not instantly revocable.
+# When enabled, ownerfs_workspace_egress_root is required: an absolute native
+# path outside ownerfs_mount and data_dir whose children receive the bind
+# targets (<egress_root>/<workspace>); schedulers read the same file to mount
+# containers from that path.
 experimental_ownerfs_workspace_bind = false
+# ownerfs_workspace_egress_root = "/opt/adx/egress"
 # [ownerfs_workspace_bind]
 # workspace = "agent1"
 
@@ -71,7 +83,8 @@ tls_identity_certificate = "/opt/adx/config/afs/tls/node-a.pem"
 tls_identity_private_key = "/opt/adx/config/afs/tls/node-a-key.pem"
 tls_server_name = "afs-cluster"
 
-# Native DFS live uploads and unpublished metadata. S3 keeps its separate budgets.
+# DFS live uploads and unpublished metadata (native and S3 storage alike).
+# With S3, uploads are capped at 4 in flight.
 # Front-owned ordinary-write payload across all files; not whole-process memory.
 # Automatic waiting reserve: min(dfs_write_queue_bytes / 8, 32MiB).
 dfs_write_queue_bytes = 2147483648
@@ -113,3 +126,10 @@ node-a = "/opt/adx/config/afs/tls/node-a.pem"
 # Distinct from kernel/B look-ahead windows; B look-ahead remains opt-in.
 # [dfs_read_pipeline]
 # max_reply_bytes = 268435456
+
+# Optional native DFS Peer disk cache; OFF when omitted, no RAM resident cache.
+# Use only without dfs_external_backend, separate from data_dir/FUSE mounts.
+# Capacity is configurable; 256MiB is only an example.
+# [dfs_peer_cache]
+# directory = "/opt/adx/cache/afs/peer"
+# capacity_bytes = 268435456

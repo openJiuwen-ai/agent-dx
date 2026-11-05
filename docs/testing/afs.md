@@ -99,13 +99,13 @@ cargo test --locked -p afs --all-features --lib node::dfs_read::tests
 
 ### 并发基准工具 afs-bench
 
-`afs/client/src/bin/afs-bench.rs` 是双臂同尺的 DFS 并发基准：FUSE 臂走挂载点（POSIX 语义），
+`afs/tools/src/bin/afs-bench.rs`（`afs-tools` crate）是双臂同尺的 DFS 并发基准：FUSE 臂走挂载点（POSIX 语义），
 SDK 臂走节点 uds（usrbio 数据面），同一确定性 payload、同口径计时，结果直接可比。首个
 workload 为多文件并发读写。工具只产生吞吐数字与校验结果；功能通过、测量完成、稳定性与
 性能达标必须分开登记，工具输出本身不构成任何验收结论。
 
 ```sh
-cargo build --locked --release -p afs-client --bin afs-bench
+cargo build --locked --release -p afs-tools --bin afs-bench
 ./target/release/afs-bench <mountpoint> --sock <node.sock> --arm fuse --mode rw \
   --files 16 --file-bytes 256M --threads 16 --rounds 3 --settle-secs 65 --json bench.json
 ```

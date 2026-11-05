@@ -1,7 +1,7 @@
 /*
  * AFS RDMA native shim public C ABI.
  *
- * This header is consumed only by Rust FFI in common/transport/src/rdma.rs.
+ * This header is consumed only by Rust FFI in crates/transport/src/rdma.rs.
  * It is not a filesystem API and not a daemon API: callers still send file
  * commands through gRPC/proto; this C layer only manages libibverbs endpoint
  * resources and one-sided data movement.

@@ -27,12 +27,8 @@ pub(crate) mod fault;
 pub mod fuse;
 #[cfg(feature = "dfs")]
 pub mod gc;
-pub mod read;
-/// S1e 临时兼容，S1e-6 删：`afs::node::read_pipeline` 旧路径（`afs/tests/config_contract.rs` 引用）。
-pub use read::admission as read_pipeline;
 pub mod metrics;
-/// S1e 临时兼容，S1e-6 删：`afs::node::read_work` 旧路径（`afs/tests/node_health_contract.rs` 引用）。
-pub use metrics::work as read_work;
+pub mod read;
 mod readiness;
 mod registration;
 #[cfg(feature = "dfs")]

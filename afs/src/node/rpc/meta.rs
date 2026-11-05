@@ -1,6 +1,6 @@
 //! Node owns its generated Meta caller; common transport only configures it.
 //!
-//! 调用端直接使用 Proto 生成的 MetaClient，再应用 common/transport/grpc 的配置。
+//! 调用端直接使用 Proto 生成的 MetaClient，再应用 crates/transport/grpc 的配置。
 //! 这是 Node 的内部控制 caller，不是对外的本机高性能 client/ SDK。
 //! 示例每次显式 ping 建连；未来节点注册/watch 的连接复用由相应业务模块管理。
 #[cfg(feature = "ownerfs")]

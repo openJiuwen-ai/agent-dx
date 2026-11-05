@@ -18,13 +18,23 @@ DFS Peer 客户端允许接收 128 KiB HTTP/2 DATA 帧；业务消息、流控�
 
 ## 组件范围
 
-| 目录 | 内容 |
+| 目录 | 角色 |
 | --- | --- |
-| `src/` | `afs-meta`、`afs-node`、OwnerFs、DFS、Meta 后端、FUSE 适配和运行时入口 |
-| `client/` | DFS 客户端 crate |
-| `common/` | 错误、日志、指标、协议、追踪和传输等共享 crate |
-| `examples/` | crate 级示例配置；发布包示例另见 `build/config/examples/afs/` |
-| `tests/` | Cargo 绑定的单元、契约和小型集成测试 |
+| `Cargo.toml`、`src/` | 主 crate `afs`：产品二进制 `afs-meta`、`afs-node`，包含 Meta、Node、OwnerFs、DFS、FUSE 适配和运行时装配 |
+| `crates/` | AFS 域内的库 crate，被主 crate 与工具依赖；一句话职责同时写在各自 `Cargo.toml` 的 `description` |
+| `crates/client/` | `afs-client`：本机 SDK（UDS 控制 + 共享内存 usrbio）；`examples/` 只放 SDK 用法示例 |
+| `crates/error/` | `afs-error`：与协议无关的稳定错误合同（码表在 `error-codes.toml`） |
+| `crates/logging/` | `afs-logging`：进程日志 |
+| `crates/metrics/` | `afs-metrics`：Prometheus 注册表与 OpenMetrics exemplar |
+| `crates/protocol/` | `afs-protocol`：proto 定义、生成的 gRPC 代码与集群线协议版本 |
+| `crates/tracing/` | `afs-tracing`：分布式追踪上下文与进程运行时 |
+| `crates/transport/` | `afs-transport`：gRPC/TLS、共享内存、ring 与可选 RDMA |
+| `tools/` | `afs-tools`：度量工具与诊断探针，**不进发布包**，见 [tools/README.md](tools/README.md) |
+| `tests/` | 只放测试：Cargo 集成与契约测试、e2e 运行器 `run.py`、fixtures、suites |
+| `scripts/` | 开发期检查脚本（如依赖边计数） |
+| `error-codes.toml` | 错误码表，由 `afs-error` 编译期引用 |
+
+配置示例只有一份权威来源：[build/config/examples/afs/](../build/config/examples/afs/)（随 `ADX_WITH_AFS=1` 发布包分发，`tests/config_contract.rs` 直接解析它）。
 
 来源、路径映射和许可证记录保存在 `docs/migration/`；它们不定义当前运行合同。
 FUSE 依赖使用根工作区声明的官方固定 `fuser =0.18.0`。
@@ -213,7 +223,7 @@ ADX 进程不强制替换。S3 原窗口和预算独立保持，不新增正文 
 
 ## POSIX fd 接入本机 USRBIO
 
-主示例是 [usrbio_round_trip](client/examples/usrbio_round_trip.rs)：普通 POSIX create/open
+主示例是 [usrbio_round_trip](crates/client/examples/usrbio_round_trip.rs)：普通 POSIX create/open
 取得 fd，SDK `register_fd(file.as_fd())` 导入原打开对象，数据走持久 IOV/SQ/CQ；
 读写完成后对原对象 fsync、`unregister_fd`，再用 POSIX 读回/关闭。路径参数是完整挂载路径。
 
@@ -224,7 +234,7 @@ cargo run -p afs-client --example usrbio_round_trip -- /run/afs/node.sock /mnt/a
 同机 owner-only、DFS 普通文件、顺序交接是首版边界；SDK 数据阶段不能同时使用 POSIX
 数据 IO/mmap 或修改 fd 状态标志，注销失败不能当作已经交回缓存。原 fd 关闭后可用注册对象的 `sync_all`
 同步保留副本。O_APPEND/O_PATH、其他文件系统或错误 Node fd 明确失败。
-[usrbio_path_round_trip](client/examples/usrbio_path_round_trip.rs) 保留 SDK `open(path)`
+[usrbio_path_round_trip](crates/client/examples/usrbio_path_round_trip.rs) 保留 SDK `open(path)`
 便利方式，它会单独打开路径；不等同于导入原 fd。更多生命周期与缓存边界见
 [架构](../docs/architecture/afs.md#本机-sdk-usrbio-数据面)。
 

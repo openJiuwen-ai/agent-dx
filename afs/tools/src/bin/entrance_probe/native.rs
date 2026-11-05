@@ -1847,6 +1847,275 @@ fn protocol_violation(message: &'static str) -> LocalClientError {
     ))
 }
 
+// Experiment-only synchronous lifetime: buffers held until ALL validated CQEs.
+// No task cancellation or production API claim. Copies remain inside timed loop.
+impl DfsRing {
+    pub async fn probe_transfer(
+        &mut self,
+        iov: &mut DfsIov,
+        reg: &DfsRegistration,
+        input: &[u8],
+        output: &mut [u8],
+        shape: (usize, usize, bool),
+    ) -> Result<(), LocalClientError> {
+        self.require_same_iov(iov)?;
+        let (block, wave, write) = shape;
+        let slices: Vec<_> = (0..wave)
+            .map(|_| iov.allocator.reserve(block))
+            .collect::<Result<_, _>>()?;
+        let result = async {
+            for base in (0..input.len()).step_by(block * wave) {
+                let count = wave.min((input.len() - base) / block);
+                let mut sq = Vec::with_capacity(count);
+                for (j, slice) in slices.iter().take(count).enumerate() {
+                    let off = base + j * block;
+                    if write {
+                        iov.view.write_block(slice, &input[off..off + block])?;
+                    }
+                    sq.push(Submission {
+                        op: if write { OP_WRITE } else { OP_READ },
+                        flags: 0,
+                        reg_id: reg.reg_id,
+                        len: block as u32,
+                        offset: off as u64,
+                        iov_offset: slice.iov_offset,
+                        userdata: (j + 1) as u64,
+                    });
+                }
+                self.submit_all(&sq).await?;
+                let cq = self.wait_for(count).await?;
+                let mut seen = vec![false; count];
+                for c in cq {
+                    let j = c.userdata as usize - 1;
+                    if j >= count || seen[j] || completion_bytes(&c)? != block {
+                        return Err(protocol_violation("probe completion mismatch"));
+                    }
+                    seen[j] = true;
+                    if !write {
+                        let off = base + j * block;
+                        output[off..off + block]
+                            .copy_from_slice(iov.view.slice(slices[j].iov_offset, block as u64)?);
+                    }
+                }
+                if !seen.iter().all(|v| *v) {
+                    return Err(protocol_violation("probe missing CQE"));
+                }
+            }
+            Ok(())
+        }
+        .await;
+        // Unknown results retain slots until process exit; never recycle on failure.
+        if result.is_ok() {
+            for s in &slices {
+                iov.allocator.release(s)?;
+            }
+        }
+        result
+    }
+}
+
+impl DfsRing {
+    /// Diagnostic minimum: same copies and ring protocol; blocking notification, bounded wait.
+    pub fn probe_wire(
+        &mut self,
+        iov: &mut DfsIov,
+        reg: &DfsRegistration,
+        input: &[u8],
+        output: &mut [u8],
+        shape: (usize, usize, bool, bool),
+    ) -> Result<serde_json::Value, LocalClientError> {
+        let (block, wave, write, pipelined) = shape;
+        self.require_same_iov(iov)?;
+        let slices: Vec<_> = (0..wave)
+            .map(|_| iov.allocator.reserve(block))
+            .collect::<Result<_, _>>()?;
+        let mut copy_ns = 0u128;
+        let mut wait_ns = 0u128;
+        let mut submit_ns = 0u128;
+        let profile = std::env::var_os("CADX_PROBE_PROFILE").is_some();
+        let result = (|| -> Result<(), LocalClientError> {
+            for base in (0..input.len()).step_by(block * wave) {
+                let count = wave.min((input.len() - base) / block);
+                let grain = if pipelined && write {
+                    (4 * 1024 * 1024 / block).max(1)
+                } else {
+                    count
+                };
+                for group in (0..count).step_by(grain) {
+                    let end = (group + grain).min(count);
+                    let t = Instant::now();
+                    if write {
+                        for (j, slice) in slices.iter().enumerate().take(end).skip(group) {
+                            let off = base + j * block;
+                            iov.view.write_block(slice, &input[off..off + block])?;
+                        }
+                    }
+                    if profile {
+                        copy_ns += t.elapsed().as_nanos();
+                    }
+                    let t = Instant::now();
+                    for (j, s) in slices.iter().enumerate().take(end).skip(group) {
+                        self.ring.submission_producer().push(&Submission {
+                            op: if write { OP_WRITE } else { OP_READ },
+                            flags: 0,
+                            reg_id: reg.reg_id,
+                            len: block as u32,
+                            offset: (base + j * block) as u64,
+                            iov_offset: s.iov_offset,
+                            userdata: (j + 1) as u64,
+                        })?;
+                    }
+                    self.doorbell.ring();
+                    if profile {
+                        submit_ns += t.elapsed().as_nanos();
+                    }
+                }
+                let t = Instant::now();
+                let deadline = Instant::now() + self.wait_timeout;
+                let consumer = self.ring.completion_consumer();
+                while (consumer.ready() as usize) < count {
+                    if Instant::now() >= deadline {
+                        return Err(LocalClientError::RingTimeout);
+                    }
+                    self.completion
+                        .wait(Some(deadline.saturating_duration_since(Instant::now())));
+                }
+                let mut seen = vec![false; count];
+                for _ in 0..count {
+                    let c = consumer
+                        .pop()
+                        .ok_or_else(|| protocol_violation("missing probe CQE"))?;
+                    let j = c.userdata as usize - 1;
+                    if j >= count || seen[j] || completion_bytes(&c)? != block {
+                        return Err(protocol_violation("probe CQE mismatch"));
+                    }
+                    seen[j] = true;
+                }
+                if profile {
+                    wait_ns += t.elapsed().as_nanos();
+                }
+                let t = Instant::now();
+                if !write {
+                    for (j, s) in slices.iter().take(count).enumerate() {
+                        let off = base + j * block;
+                        output[off..off + block]
+                            .copy_from_slice(iov.view.slice(s.iov_offset, block as u64)?);
+                    }
+                }
+                if profile {
+                    copy_ns += t.elapsed().as_nanos();
+                }
+            }
+            Ok(())
+        })();
+        if result.is_ok() {
+            for s in &slices {
+                iov.allocator.release(s)?;
+            }
+        }
+        result?;
+        Ok(
+            serde_json::json!({"copy_ns":copy_ns as u64,"submit_ns":submit_ns as u64,"wait_ns":wait_ns as u64,"profile_enabled":profile}),
+        )
+    }
+}
+
+impl DfsRing {
+    /// Diagnostic minimum: same copies and ring protocol; blocking notification, bounded wait.
+    pub async fn probe_wire_async(
+        &mut self,
+        iov: &mut DfsIov,
+        reg: &DfsRegistration,
+        input: &[u8],
+        output: &mut [u8],
+        shape: (usize, usize, bool, bool),
+    ) -> Result<serde_json::Value, LocalClientError> {
+        let (block, wave, write, pipelined) = shape;
+        self.require_same_iov(iov)?;
+        let slices: Vec<_> = (0..wave)
+            .map(|_| iov.allocator.reserve(block))
+            .collect::<Result<_, _>>()?;
+        let mut copy_ns = 0u128;
+        let mut wait_ns = 0u128;
+        let mut submit_ns = 0u128;
+        let profile = std::env::var_os("CADX_PROBE_PROFILE").is_some();
+        let result = async {
+            for base in (0..input.len()).step_by(block * wave) {
+                let count = wave.min((input.len() - base) / block);
+                let grain = if pipelined && write {
+                    (4 * 1024 * 1024 / block).max(1)
+                } else {
+                    count
+                };
+                for group in (0..count).step_by(grain) {
+                    let end = (group + grain).min(count);
+                    let t = Instant::now();
+                    if write {
+                        for (j, slice) in slices.iter().enumerate().take(end).skip(group) {
+                            let off = base + j * block;
+                            iov.view.write_block(slice, &input[off..off + block])?;
+                        }
+                    }
+                    if profile {
+                        copy_ns += t.elapsed().as_nanos();
+                    }
+                    let t = Instant::now();
+                    for (j, s) in slices.iter().enumerate().take(end).skip(group) {
+                        self.ring.submission_producer().push(&Submission {
+                            op: if write { OP_WRITE } else { OP_READ },
+                            flags: 0,
+                            reg_id: reg.reg_id,
+                            len: block as u32,
+                            offset: (base + j * block) as u64,
+                            iov_offset: s.iov_offset,
+                            userdata: (j + 1) as u64,
+                        })?;
+                    }
+                    self.doorbell.ring();
+                    if profile {
+                        submit_ns += t.elapsed().as_nanos();
+                    }
+                }
+                let t = Instant::now();
+                let completions = self.wait_for(count).await?;
+                let mut seen = vec![false; count];
+                for c in completions {
+                    let j = c.userdata as usize - 1;
+                    if j >= count || seen[j] || completion_bytes(&c)? != block {
+                        return Err(protocol_violation("probe CQE mismatch"));
+                    }
+                    seen[j] = true;
+                }
+                if profile {
+                    wait_ns += t.elapsed().as_nanos();
+                }
+                let t = Instant::now();
+                if !write {
+                    for (j, s) in slices.iter().take(count).enumerate() {
+                        let off = base + j * block;
+                        output[off..off + block]
+                            .copy_from_slice(iov.view.slice(s.iov_offset, block as u64)?);
+                    }
+                }
+                if profile {
+                    copy_ns += t.elapsed().as_nanos();
+                }
+            }
+            Ok::<(), LocalClientError>(())
+        }
+        .await;
+        if result.is_ok() {
+            for s in &slices {
+                iov.allocator.release(s)?;
+            }
+        }
+        result?;
+        Ok(
+            serde_json::json!({"copy_ns":copy_ns as u64,"submit_ns":submit_ns as u64,"wait_ns":wait_ns as u64,"profile_enabled":profile}),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2628,274 +2897,5 @@ mod tests {
             .await
             .expect_err("io_depth beyond the execution batch limit must be rejected locally");
         assert_eq!(error.code(), afs_error::CLIENT_ARGUMENT_INVALID);
-    }
-}
-
-// Experiment-only synchronous lifetime: buffers held until ALL validated CQEs.
-// No task cancellation or production API claim. Copies remain inside timed loop.
-impl DfsRing {
-    pub async fn probe_transfer(
-        &mut self,
-        iov: &mut DfsIov,
-        reg: &DfsRegistration,
-        input: &[u8],
-        output: &mut [u8],
-        shape: (usize, usize, bool),
-    ) -> Result<(), LocalClientError> {
-        self.require_same_iov(iov)?;
-        let (block, wave, write) = shape;
-        let slices: Vec<_> = (0..wave)
-            .map(|_| iov.allocator.reserve(block))
-            .collect::<Result<_, _>>()?;
-        let result = async {
-            for base in (0..input.len()).step_by(block * wave) {
-                let count = wave.min((input.len() - base) / block);
-                let mut sq = Vec::with_capacity(count);
-                for (j, slice) in slices.iter().take(count).enumerate() {
-                    let off = base + j * block;
-                    if write {
-                        iov.view.write_block(slice, &input[off..off + block])?;
-                    }
-                    sq.push(Submission {
-                        op: if write { OP_WRITE } else { OP_READ },
-                        flags: 0,
-                        reg_id: reg.reg_id,
-                        len: block as u32,
-                        offset: off as u64,
-                        iov_offset: slice.iov_offset,
-                        userdata: (j + 1) as u64,
-                    });
-                }
-                self.submit_all(&sq).await?;
-                let cq = self.wait_for(count).await?;
-                let mut seen = vec![false; count];
-                for c in cq {
-                    let j = c.userdata as usize - 1;
-                    if j >= count || seen[j] || completion_bytes(&c)? != block {
-                        return Err(protocol_violation("probe completion mismatch"));
-                    }
-                    seen[j] = true;
-                    if !write {
-                        let off = base + j * block;
-                        output[off..off + block]
-                            .copy_from_slice(iov.view.slice(slices[j].iov_offset, block as u64)?);
-                    }
-                }
-                if !seen.iter().all(|v| *v) {
-                    return Err(protocol_violation("probe missing CQE"));
-                }
-            }
-            Ok(())
-        }
-        .await;
-        // Unknown results retain slots until process exit; never recycle on failure.
-        if result.is_ok() {
-            for s in &slices {
-                iov.allocator.release(s)?;
-            }
-        }
-        result
-    }
-}
-
-impl DfsRing {
-    /// Diagnostic minimum: same copies and ring protocol; blocking notification, bounded wait.
-    pub fn probe_wire(
-        &mut self,
-        iov: &mut DfsIov,
-        reg: &DfsRegistration,
-        input: &[u8],
-        output: &mut [u8],
-        shape: (usize, usize, bool, bool),
-    ) -> Result<serde_json::Value, LocalClientError> {
-        let (block, wave, write, pipelined) = shape;
-        self.require_same_iov(iov)?;
-        let slices: Vec<_> = (0..wave)
-            .map(|_| iov.allocator.reserve(block))
-            .collect::<Result<_, _>>()?;
-        let mut copy_ns = 0u128;
-        let mut wait_ns = 0u128;
-        let mut submit_ns = 0u128;
-        let profile = std::env::var_os("CADX_PROBE_PROFILE").is_some();
-        let result = (|| -> Result<(), LocalClientError> {
-            for base in (0..input.len()).step_by(block * wave) {
-                let count = wave.min((input.len() - base) / block);
-                let grain = if pipelined && write {
-                    (4 * 1024 * 1024 / block).max(1)
-                } else {
-                    count
-                };
-                for group in (0..count).step_by(grain) {
-                    let end = (group + grain).min(count);
-                    let t = Instant::now();
-                    if write {
-                        for (j, slice) in slices.iter().enumerate().take(end).skip(group) {
-                            let off = base + j * block;
-                            iov.view.write_block(slice, &input[off..off + block])?;
-                        }
-                    }
-                    if profile {
-                        copy_ns += t.elapsed().as_nanos();
-                    }
-                    let t = Instant::now();
-                    for (j, s) in slices.iter().enumerate().take(end).skip(group) {
-                        self.ring.submission_producer().push(&Submission {
-                            op: if write { OP_WRITE } else { OP_READ },
-                            flags: 0,
-                            reg_id: reg.reg_id,
-                            len: block as u32,
-                            offset: (base + j * block) as u64,
-                            iov_offset: s.iov_offset,
-                            userdata: (j + 1) as u64,
-                        })?;
-                    }
-                    self.doorbell.ring();
-                    if profile {
-                        submit_ns += t.elapsed().as_nanos();
-                    }
-                }
-                let t = Instant::now();
-                let deadline = Instant::now() + self.wait_timeout;
-                let consumer = self.ring.completion_consumer();
-                while (consumer.ready() as usize) < count {
-                    if Instant::now() >= deadline {
-                        return Err(LocalClientError::RingTimeout);
-                    }
-                    self.completion
-                        .wait(Some(deadline.saturating_duration_since(Instant::now())));
-                }
-                let mut seen = vec![false; count];
-                for _ in 0..count {
-                    let c = consumer
-                        .pop()
-                        .ok_or_else(|| protocol_violation("missing probe CQE"))?;
-                    let j = c.userdata as usize - 1;
-                    if j >= count || seen[j] || completion_bytes(&c)? != block {
-                        return Err(protocol_violation("probe CQE mismatch"));
-                    }
-                    seen[j] = true;
-                }
-                if profile {
-                    wait_ns += t.elapsed().as_nanos();
-                }
-                let t = Instant::now();
-                if !write {
-                    for (j, s) in slices.iter().take(count).enumerate() {
-                        let off = base + j * block;
-                        output[off..off + block]
-                            .copy_from_slice(iov.view.slice(s.iov_offset, block as u64)?);
-                    }
-                }
-                if profile {
-                    copy_ns += t.elapsed().as_nanos();
-                }
-            }
-            Ok(())
-        })();
-        if result.is_ok() {
-            for s in &slices {
-                iov.allocator.release(s)?;
-            }
-        }
-        result?;
-        Ok(
-            serde_json::json!({"copy_ns":copy_ns as u64,"submit_ns":submit_ns as u64,"wait_ns":wait_ns as u64,"profile_enabled":profile}),
-        )
-    }
-}
-
-impl DfsRing {
-    /// Diagnostic minimum: same copies and ring protocol; blocking notification, bounded wait.
-    pub async fn probe_wire_async(
-        &mut self,
-        iov: &mut DfsIov,
-        reg: &DfsRegistration,
-        input: &[u8],
-        output: &mut [u8],
-        shape: (usize, usize, bool, bool),
-    ) -> Result<serde_json::Value, LocalClientError> {
-        let (block, wave, write, pipelined) = shape;
-        self.require_same_iov(iov)?;
-        let slices: Vec<_> = (0..wave)
-            .map(|_| iov.allocator.reserve(block))
-            .collect::<Result<_, _>>()?;
-        let mut copy_ns = 0u128;
-        let mut wait_ns = 0u128;
-        let mut submit_ns = 0u128;
-        let profile = std::env::var_os("CADX_PROBE_PROFILE").is_some();
-        let result = async {
-            for base in (0..input.len()).step_by(block * wave) {
-                let count = wave.min((input.len() - base) / block);
-                let grain = if pipelined && write {
-                    (4 * 1024 * 1024 / block).max(1)
-                } else {
-                    count
-                };
-                for group in (0..count).step_by(grain) {
-                    let end = (group + grain).min(count);
-                    let t = Instant::now();
-                    if write {
-                        for (j, slice) in slices.iter().enumerate().take(end).skip(group) {
-                            let off = base + j * block;
-                            iov.view.write_block(slice, &input[off..off + block])?;
-                        }
-                    }
-                    if profile {
-                        copy_ns += t.elapsed().as_nanos();
-                    }
-                    let t = Instant::now();
-                    for (j, s) in slices.iter().enumerate().take(end).skip(group) {
-                        self.ring.submission_producer().push(&Submission {
-                            op: if write { OP_WRITE } else { OP_READ },
-                            flags: 0,
-                            reg_id: reg.reg_id,
-                            len: block as u32,
-                            offset: (base + j * block) as u64,
-                            iov_offset: s.iov_offset,
-                            userdata: (j + 1) as u64,
-                        })?;
-                    }
-                    self.doorbell.ring();
-                    if profile {
-                        submit_ns += t.elapsed().as_nanos();
-                    }
-                }
-                let t = Instant::now();
-                let completions = self.wait_for(count).await?;
-                let mut seen = vec![false; count];
-                for c in completions {
-                    let j = c.userdata as usize - 1;
-                    if j >= count || seen[j] || completion_bytes(&c)? != block {
-                        return Err(protocol_violation("probe CQE mismatch"));
-                    }
-                    seen[j] = true;
-                }
-                if profile {
-                    wait_ns += t.elapsed().as_nanos();
-                }
-                let t = Instant::now();
-                if !write {
-                    for (j, s) in slices.iter().take(count).enumerate() {
-                        let off = base + j * block;
-                        output[off..off + block]
-                            .copy_from_slice(iov.view.slice(s.iov_offset, block as u64)?);
-                    }
-                }
-                if profile {
-                    copy_ns += t.elapsed().as_nanos();
-                }
-            }
-            Ok::<(), LocalClientError>(())
-        }
-        .await;
-        if result.is_ok() {
-            for s in &slices {
-                iov.allocator.release(s)?;
-            }
-        }
-        result?;
-        Ok(
-            serde_json::json!({"copy_ns":copy_ns as u64,"submit_ns":submit_ns as u64,"wait_ns":wait_ns as u64,"profile_enabled":profile}),
-        )
     }
 }

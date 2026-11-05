@@ -25,7 +25,7 @@ early replies over upstream. Both final versions remove the same experiment-only
 per-request probes. CRC, replicas, object size, TLS, native buffer budget and
 backend concurrency stay fixed.
 
-The reproducible workload is [write_delivery_bench.c](../../afs/tests/support/write_delivery_bench.c):
+The reproducible workload is [write_delivery_bench.c](../../afs/tools/probes/write_delivery_bench.c):
 compile explicitly on Linux with `gcc -std=c11 -O3 -pthread -Wall -Wextra -Werror`.
 It is a test helper and is not a product/release binary. The driver uses one
 process and two worker pthreads with an internal barrier and common

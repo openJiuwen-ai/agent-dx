@@ -136,7 +136,7 @@ mod tests {
 
     #[test]
     fn method_table_matches_meta_proto() {
-        let proto = include_str!("../../common/protocol/proto/meta.proto");
+        let proto = include_str!("../../crates/protocol/proto/meta.proto");
         let mut service = "";
         let mut declared = Vec::new();
         for line in proto.lines() {

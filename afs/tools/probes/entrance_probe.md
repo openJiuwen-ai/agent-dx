@@ -1,7 +1,7 @@
 # Controlled USRBIO probes
 
-`../usrbio_pipeline_probe.rs` runs the final same-RAM comparison. It uses the
-product SDK in `sdk` mode and the frozen `native.rs` client for controlled
+`../src/bin/usrbio-pipeline-probe.rs` (bin `usrbio_pipeline_probe`) runs the final same-RAM comparison. It uses the
+product SDK in `sdk` mode and the frozen `../src/bin/entrance_probe/native.rs` client for controlled
 minimum-ring modes (`wire_async`, `wire_pipeline_async` and blocking diagnostics).
 The reference is derived from d24c158; it is test code for a bounded, fully
 verified workload, not a second supported SDK or cancellation-safe public API.
@@ -11,8 +11,8 @@ are linked from `docs/testing/2026-10-25-usrbio-self-optimization.md` at the rep
 root. Use the async reference for an equivalent notification contract. Blocking
 modes and same-process copy diagnostics have different boundaries.
 
-`../entrance_probe.rs` is the preceding same-Backend FUSE/USRBIO diagnostic.
-`direct_hook.rs` belongs to the prior backend/sync ablation; its numbers are not
+`../src/bin/entrance-probe.rs` (bin `entrance_probe`) is the preceding same-Backend FUSE/USRBIO diagnostic.
+`../src/bin/entrance_probe/direct_hook.rs` belongs to the prior backend/sync ablation; its numbers are not
 durability admission results. These helpers are never invoked by a normal product
 build or benchmark mode.
 

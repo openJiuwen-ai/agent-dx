@@ -450,7 +450,6 @@ dependencies = [
  "im",
  "libc",
  "object_store",
- "opentelemetry-proto 0.32.0",
  "postcard",
  "prost 0.14.4",
  "rayon-core",
@@ -528,6 +527,30 @@ dependencies = [
  "tonic 0.14.6",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "afs-tools"
+version = "0.1.0"
+dependencies = [
+ "afs",
+ "afs-client",
+ "afs-error",
+ "afs-protocol",
+ "afs-tracing",
+ "afs-transport",
+ "blake3",
+ "clap",
+ "hyper-util",
+ "libc",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tonic 0.14.6",
+ "tower 0.5.3",
 ]
 
 [[package]]

@@ -1,14 +1,14 @@
 # Meta 基线驱动（显式运行）
 
-`afs-meta-bench` 是测试辅助 example，不是 Meta 产品进程，不进入普通交付包。
+`afs-meta-bench` 是 `afs-tools` 的度量 bin（`afs/tools/src/bin/meta-bench.rs`），不是 Meta 产品进程，不进入普通交付包。
 它调用现有公开 Store API，另提供 DfsService 创建／重试／查询的功能检查；
 不实现 P3 新状态引擎，也不测 FUSE、网络 RPC 或正文传输。
 
 仅在 Linux 构建和运行，沿用 ADX 公共工具链与既有缓存：
 
 ```sh
-cargo build --locked -p afs --example afs-meta-bench --release
-cargo test --locked -p afs --example afs-meta-bench
+cargo build --locked -p afs-tools --bin afs-meta-bench --release
+cargo test --locked -p afs-tools --bin afs-meta-bench
 ```
 
 每次运行须提供真实的完整源码 commit、包括未提交工具改动的源码清单 SHA-256；

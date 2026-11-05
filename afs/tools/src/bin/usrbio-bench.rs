@@ -4,7 +4,7 @@
 //! 参数化总字节数与块大小，输出可直接与 `dd` 的结果并列。
 //!
 //! ```text
-//! cargo run --release --example usrbio_bench -- <node.sock> <已存在文件> <总MiB> [块KiB]
+//! cargo run --release -p afs-tools --bin usrbio_bench -- <node.sock> <已存在文件> <总MiB> [块KiB]
 //! ```
 //!
 //! 三个数字分别对应：写入（不含落盘）、`sync(Full)` 落盘、读回。

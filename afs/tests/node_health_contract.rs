@@ -36,7 +36,7 @@ fn test_config(data_dir: PathBuf) -> Config {
 fn node_with_readiness(config: Config, readiness: Arc<NodeReadiness>) -> Arc<Node> {
     Arc::new(Node {
         #[cfg(feature = "dfs")]
-        read_work_metrics: afs::node::read_work::ReadWorkMetrics::register(
+        read_work_metrics: afs::node::metrics::work::ReadWorkMetrics::register(
             &afs_metrics::Registry::default(),
         )
         .unwrap(),
