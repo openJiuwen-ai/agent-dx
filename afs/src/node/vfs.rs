@@ -297,8 +297,8 @@ pub trait Backend: Send + Sync {
         _offset: u64,
         _size: usize,
         _deadline: std::time::Instant,
-        _lifetime: crate::node::read_pipeline::ReadLifetime,
-    ) -> Result<Option<crate::node::read_pipeline::ReadReplyFuture>> {
+        _lifetime: crate::node::read::admission::ReadLifetime,
+    ) -> Result<Option<crate::node::read::admission::ReadReplyFuture>> {
         Ok(None)
     }
 

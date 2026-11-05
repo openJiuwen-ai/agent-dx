@@ -4,12 +4,12 @@ fn test_fs_with_native_authority() -> (
     tempfile::TempDir,
     Arc<RecordingMeta>,
     DistributedFs,
-    Arc<crate::node::dfs_read::LocalReadAuthority>,
+    Arc<crate::node::read::engine::LocalReadAuthority>,
 ) {
     let meta = Arc::new(RecordingMeta::new());
     let temp = tempfile::tempdir().unwrap();
     let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
-    let authority = Arc::new(crate::node::dfs_read::LocalReadAuthority::new(
+    let authority = Arc::new(crate::node::read::engine::LocalReadAuthority::new(
         1,
         Instant::now() + Duration::from_secs(30),
     ));
@@ -18,9 +18,9 @@ fn test_fs_with_native_authority() -> (
             NamespaceId::new("default"),
             "node-a".into(),
             local.clone(),
-            Arc::new(crate::node::dfs_read::UnimplementedReadSourceProvider),
-            Arc::new(crate::node::dfs_read::UnimplementedChunkTransfer),
-            crate::node::dfs_read::DfsReadConfig::default(),
+            Arc::new(crate::node::read::engine::UnimplementedReadSourceProvider),
+            Arc::new(crate::node::read::engine::UnimplementedChunkTransfer),
+            crate::node::read::engine::DfsReadConfig::default(),
         )
         .with_read_authority(authority.clone()),
     );
@@ -876,7 +876,7 @@ fn p1_handle_registration_racing_local_or_proxy_install_preserves_dirty_visibili
                 NamespaceId::new("default"),
                 "node-b".into(),
                 chunks.clone(),
-                Arc::new(crate::node::dfs_read::UnimplementedReadSourceProvider),
+                Arc::new(crate::node::read::engine::UnimplementedReadSourceProvider),
                 Arc::new(UnimplementedChunkTransfer),
                 DfsReadConfig::default(),
             ));
@@ -963,11 +963,13 @@ fn r7_product_sequential_reads_schedule_one_two_four_objects_and_zero_stays_idle
     use crate::{
         dfs::*,
         node::{
-            dfs_read::{
+            read::engine::{
                 ChunkTransfer, DfsReadConfig, LocalReadAuthority, PeerReadBatch, PrefetchControl,
                 ReadSourceProvider,
             },
-            peer_cache::{CompletedPeerDiskRead, DiskPeerCache, PeerCacheOptions, PeerStreamSink},
+            read::peer_cache::{
+                CompletedPeerDiskRead, DiskPeerCache, PeerCacheOptions, PeerStreamSink,
+            },
         },
     };
     struct Fixture {

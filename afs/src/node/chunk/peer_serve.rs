@@ -390,7 +390,7 @@ impl PeerFileIdentity {
 #[derive(Debug)]
 #[cfg(any(feature = "dfs", test))]
 pub(super) struct PeerVerifiedObject {
-    pub(super) bytes: super::super::read_buffer::ReadBuffer,
+    pub(super) bytes: super::super::read::buffer::ReadBuffer,
     pub(super) outboard: Option<SharedOutboard>,
     _reservation: PeerReadReservation,
     // A range fallback is never resident and needs no reusable identity.

@@ -16,17 +16,17 @@
 #[cfg(feature = "dfs")]
 mod crc32c;
 #[cfg(feature = "dfs")]
-mod read_pipeline;
+mod read_admission;
 
 #[cfg(all(feature = "dfs", feature = "rdma"))]
-use crate::node::dfs_read::ChunkTransfer;
+use crate::node::read::engine::ChunkTransfer;
 
 #[cfg(feature = "dfs")]
 use crate::{
     dfs::ChunkObject,
     node::{
         chunk::outboard::{ChunkOutboard, OutboardBudget, OutboardBuilder, SharedOutboard},
-        peer_cache::{CompletedPeerDiskRead, PeerStreamSink, VerifiedPeerChunk},
+        read::peer_cache::{CompletedPeerDiskRead, PeerStreamSink, VerifiedPeerChunk},
         read_work::{
             ReadDiagnosticConsumer, ReadDiagnosticConsumerStage, ReadDiagnosticIntervals,
             ReadDiagnosticProducer, ReadDiagnosticStage, ReadWorkMetrics,

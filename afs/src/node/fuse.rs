@@ -12,7 +12,7 @@ mod mount;
 mod page_cache;
 pub(crate) mod policy;
 #[cfg(feature = "dfs")]
-mod read_pipeline;
+mod read_reply;
 mod reply;
 mod request;
 mod state;
@@ -132,7 +132,7 @@ pub struct AfsFuse {
     #[cfg(feature = "dfs")]
     read_runtime: Option<tokio::runtime::Handle>,
     #[cfg(feature = "dfs")]
-    read_completions: Option<read_pipeline::ReadCompletions>,
+    read_completions: Option<read_reply::ReadCompletions>,
     ingress_session_id: String,
     lock_session_cleaned: bool,
     callbacks_drained: bool,

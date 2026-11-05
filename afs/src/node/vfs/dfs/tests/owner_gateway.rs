@@ -472,13 +472,13 @@ fn caller_serializes_same_route_open_admission_until_ack() {
     fs_a.release(&context(), created.handle).unwrap();
     let temp_b = tempfile::tempdir().unwrap();
     let chunks_b = Arc::new(LocalChunkStore::open(temp_b.path(), "node-b").unwrap());
-    let read_engine_b = Arc::new(crate::node::dfs_read::DfsReadEngine::new(
+    let read_engine_b = Arc::new(crate::node::read::engine::DfsReadEngine::new(
         NamespaceId::new("default"),
         "node-b".into(),
         chunks_b.clone(),
-        Arc::new(crate::node::dfs_read::UnimplementedReadSourceProvider),
-        Arc::new(crate::node::dfs_read::UnimplementedChunkTransfer),
-        crate::node::dfs_read::DfsReadConfig::default(),
+        Arc::new(crate::node::read::engine::UnimplementedReadSourceProvider),
+        Arc::new(crate::node::read::engine::UnimplementedChunkTransfer),
+        crate::node::read::engine::DfsReadConfig::default(),
     ));
     let loopback = Arc::new(LoopbackRemoteDfsOwner {
         owner: fs_a.clone(),
@@ -587,13 +587,13 @@ fn remote_open_ack_loss_queues_cleanup_identity_and_late_replay_does_not_reopen(
     fs_a.release(&context(), created.handle).unwrap();
     let temp_b = tempfile::tempdir().unwrap();
     let chunks_b = Arc::new(LocalChunkStore::open(temp_b.path(), "node-b").unwrap());
-    let read_engine_b = Arc::new(crate::node::dfs_read::DfsReadEngine::new(
+    let read_engine_b = Arc::new(crate::node::read::engine::DfsReadEngine::new(
         NamespaceId::new("default"),
         "node-b".into(),
         chunks_b.clone(),
-        Arc::new(crate::node::dfs_read::UnimplementedReadSourceProvider),
-        Arc::new(crate::node::dfs_read::UnimplementedChunkTransfer),
-        crate::node::dfs_read::DfsReadConfig::default(),
+        Arc::new(crate::node::read::engine::UnimplementedReadSourceProvider),
+        Arc::new(crate::node::read::engine::UnimplementedChunkTransfer),
+        crate::node::read::engine::DfsReadConfig::default(),
     ));
     let loopback = Arc::new(LoopbackRemoteDfsOwner {
         owner: fs_a.clone(),
@@ -648,13 +648,13 @@ fn writeonly_read_companion_ack_loss_has_independent_cleanup_identity() {
     fs_a.release(&context(), created.handle).unwrap();
     let temp_b = tempfile::tempdir().unwrap();
     let chunks_b = Arc::new(LocalChunkStore::open(temp_b.path(), "node-b").unwrap());
-    let read_engine_b = Arc::new(crate::node::dfs_read::DfsReadEngine::new(
+    let read_engine_b = Arc::new(crate::node::read::engine::DfsReadEngine::new(
         NamespaceId::new("default"),
         "node-b".into(),
         chunks_b.clone(),
-        Arc::new(crate::node::dfs_read::UnimplementedReadSourceProvider),
-        Arc::new(crate::node::dfs_read::UnimplementedChunkTransfer),
-        crate::node::dfs_read::DfsReadConfig::default(),
+        Arc::new(crate::node::read::engine::UnimplementedReadSourceProvider),
+        Arc::new(crate::node::read::engine::UnimplementedChunkTransfer),
+        crate::node::read::engine::DfsReadConfig::default(),
     ));
     let loopback = Arc::new(LoopbackRemoteDfsOwner {
         owner: fs_a.clone(),
@@ -832,13 +832,13 @@ fn writeonly_remote_provider_supports_fresh_readonly_reader() {
 
     let temp_b = tempfile::tempdir().unwrap();
     let chunks_b = Arc::new(LocalChunkStore::open(temp_b.path(), "node-b").unwrap());
-    let read_engine_b = Arc::new(crate::node::dfs_read::DfsReadEngine::new(
+    let read_engine_b = Arc::new(crate::node::read::engine::DfsReadEngine::new(
         NamespaceId::new("default"),
         "node-b".into(),
         chunks_b.clone(),
-        Arc::new(crate::node::dfs_read::UnimplementedReadSourceProvider),
-        Arc::new(crate::node::dfs_read::UnimplementedChunkTransfer),
-        crate::node::dfs_read::DfsReadConfig::default(),
+        Arc::new(crate::node::read::engine::UnimplementedReadSourceProvider),
+        Arc::new(crate::node::read::engine::UnimplementedChunkTransfer),
+        crate::node::read::engine::DfsReadConfig::default(),
     ));
     let remote_owner = Arc::new(LoopbackRemoteDfsOwner {
         owner: fs_a.clone(),
@@ -950,13 +950,13 @@ fn remote_provider_retire_timeout_keeps_release_debt_until_io_guard_drops() {
 
     let temp_b = tempfile::tempdir().unwrap();
     let chunks_b = Arc::new(LocalChunkStore::open(temp_b.path(), "node-b").unwrap());
-    let read_engine_b = Arc::new(crate::node::dfs_read::DfsReadEngine::new(
+    let read_engine_b = Arc::new(crate::node::read::engine::DfsReadEngine::new(
         NamespaceId::new("default"),
         "node-b".into(),
         chunks_b.clone(),
-        Arc::new(crate::node::dfs_read::UnimplementedReadSourceProvider),
-        Arc::new(crate::node::dfs_read::UnimplementedChunkTransfer),
-        crate::node::dfs_read::DfsReadConfig::default(),
+        Arc::new(crate::node::read::engine::UnimplementedReadSourceProvider),
+        Arc::new(crate::node::read::engine::UnimplementedChunkTransfer),
+        crate::node::read::engine::DfsReadConfig::default(),
     ));
     let loopback = Arc::new(LoopbackRemoteDfsOwner {
         owner: fs_a.clone(),
@@ -1067,13 +1067,13 @@ fn former_local_clean_state_does_not_shadow_remote_provider() {
 
     // The routing fixture gives the new owner a recovered committed base.
     let chunks_b = Arc::new(LocalChunkStore::open(_temp_a.path(), "node-b").unwrap());
-    let read_engine_b = Arc::new(crate::node::dfs_read::DfsReadEngine::new(
+    let read_engine_b = Arc::new(crate::node::read::engine::DfsReadEngine::new(
         NamespaceId::new("default"),
         "node-b".into(),
         chunks_b.clone(),
-        Arc::new(crate::node::dfs_read::UnimplementedReadSourceProvider),
-        Arc::new(crate::node::dfs_read::UnimplementedChunkTransfer),
-        crate::node::dfs_read::DfsReadConfig::default(),
+        Arc::new(crate::node::read::engine::UnimplementedReadSourceProvider),
+        Arc::new(crate::node::read::engine::UnimplementedChunkTransfer),
+        crate::node::read::engine::DfsReadConfig::default(),
     ));
     let fs_b = Arc::new(test_dfs_new(
         NamespaceId::new("default"),
@@ -1137,13 +1137,13 @@ fn temporary_remote_close_does_not_restore_released_previous_provider() {
 
     let temp_b = tempfile::tempdir().unwrap();
     let chunks_b = Arc::new(LocalChunkStore::open(temp_b.path(), "node-b").unwrap());
-    let read_engine_b = Arc::new(crate::node::dfs_read::DfsReadEngine::new(
+    let read_engine_b = Arc::new(crate::node::read::engine::DfsReadEngine::new(
         NamespaceId::new("default"),
         "node-b".into(),
         chunks_b.clone(),
-        Arc::new(crate::node::dfs_read::UnimplementedReadSourceProvider),
-        Arc::new(crate::node::dfs_read::UnimplementedChunkTransfer),
-        crate::node::dfs_read::DfsReadConfig::default(),
+        Arc::new(crate::node::read::engine::UnimplementedReadSourceProvider),
+        Arc::new(crate::node::read::engine::UnimplementedChunkTransfer),
+        crate::node::read::engine::DfsReadConfig::default(),
     ));
     let remote_owner = Arc::new(LoopbackRemoteDfsOwner {
         owner: fs_a.clone(),

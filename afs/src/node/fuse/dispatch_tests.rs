@@ -854,7 +854,7 @@ fn test_context() -> super::RequestContext {
 #[test]
 fn buffer_reuse_backend_reply_holds_pool_owner_until_send_returns() {
     struct PooledBackend {
-        pool: std::sync::Arc<crate::node::read_buffer::ReadBufferPool>,
+        pool: std::sync::Arc<crate::node::read::buffer::ReadBufferPool>,
     }
     impl super::Backend for PooledBackend {
         fn root_inode(&self) -> super::BackendInode {
@@ -873,7 +873,7 @@ fn buffer_reuse_backend_reply_holds_pool_owner_until_send_returns() {
         }
     }
     let backend = PooledBackend {
-        pool: crate::node::read_buffer::ReadBufferPool::new("reply"),
+        pool: crate::node::read::buffer::ReadBufferPool::new("reply"),
     };
     let reply =
         super::backend_read_data(&backend, &test_context(), super::FileHandle(9), 0, 1024).unwrap();

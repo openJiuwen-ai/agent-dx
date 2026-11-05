@@ -312,8 +312,10 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
     fn resolve_write_authority_async(
         &self,
         inode_id: crate::dfs::InodeId,
-    ) -> crate::node::read_pipeline::ReadFuture<'_, (crate::dfs::InodeRecord, crate::dfs::WriteLease)>
-    {
+    ) -> crate::node::read::admission::ReadFuture<
+        '_,
+        (crate::dfs::InodeRecord, crate::dfs::WriteLease),
+    > {
         Box::pin(async move {
             let (diagnostic, _coarse) = self.begin_read_diagnostic(
                 crate::node::read_work::ReadDiagnosticStage::MetaResolveWriteAuthority,
@@ -399,8 +401,10 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
     fn get_file_version_async(
         &self,
         version_id: crate::dfs::FileVersionId,
-    ) -> crate::node::read_pipeline::ReadFuture<'_, (crate::dfs::FileVersion, crate::dfs::LayoutRoot)>
-    {
+    ) -> crate::node::read::admission::ReadFuture<
+        '_,
+        (crate::dfs::FileVersion, crate::dfs::LayoutRoot),
+    > {
         Box::pin(async move {
             self.record_read_rpc("get_file_version");
             let mut client = self.client();
@@ -614,7 +618,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
     fn current_node_session_async(
         &self,
         node_id: String,
-    ) -> crate::node::read_pipeline::ReadFuture<'_, Option<String>> {
+    ) -> crate::node::read::admission::ReadFuture<'_, Option<String>> {
         Box::pin(async move {
             let reply =
                 self.run_async(self.root_client().lookup_node(

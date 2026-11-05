@@ -148,7 +148,7 @@ impl DiskPeerCache {
 
     pub fn with_read_work_metrics(
         mut self,
-        metrics: super::super::read_work::ReadWorkMetrics,
+        metrics: crate::node::read_work::ReadWorkMetrics,
     ) -> Self {
         if let Ok(state) = self.state.lock() {
             report_work(

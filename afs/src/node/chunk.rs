@@ -267,7 +267,7 @@ pub struct LocalChunkStore {
     #[cfg(any(feature = "dfs", test))]
     peer_read_budget: Arc<PeerReadBudget>,
     #[cfg(any(feature = "dfs", test))]
-    peer_buffer_pool: Arc<super::read_buffer::ReadBufferPool>,
+    peer_buffer_pool: Arc<super::read::buffer::ReadBufferPool>,
     #[cfg(any(feature = "dfs", test))]
     peer_read_cache: Mutex<PeerServeState>,
     #[cfg(any(feature = "dfs", test))]

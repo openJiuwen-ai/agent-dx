@@ -8,7 +8,7 @@ struct NativeReadRequest<'a> {
     offset: u64,
     size: usize,
     deadline: Instant,
-    lifetime: crate::node::read_pipeline::ReadLifetime,
+    lifetime: crate::node::read::admission::ReadLifetime,
 }
 
 impl DistributedFs {
@@ -16,7 +16,7 @@ impl DistributedFs {
         &self,
         inode: &InodeRecord,
         deadline: Instant,
-        lifetime: crate::node::read_pipeline::ReadLifetime,
+        lifetime: crate::node::read::admission::ReadLifetime,
     ) -> Result<Arc<ReadOnlyVersion>> {
         let engine = self.read_engine.clone();
         let meta = self.meta.clone();
@@ -104,8 +104,8 @@ impl DistributedFs {
         offset: u64,
         size: usize,
         deadline: Instant,
-        lifetime: crate::node::read_pipeline::ReadLifetime,
-    ) -> Result<Option<crate::node::read_pipeline::ReadReplyFuture>> {
+        lifetime: crate::node::read::admission::ReadLifetime,
+    ) -> Result<Option<crate::node::read::admission::ReadReplyFuture>> {
         if !self.read_engine.async_read_enabled() {
             return Ok(None);
         }
@@ -123,7 +123,7 @@ impl DistributedFs {
         offset: u64,
         size: usize,
         deadline: Instant,
-        lifetime: crate::node::read_pipeline::ReadLifetime,
+        lifetime: crate::node::read::admission::ReadLifetime,
     ) -> Result<prost::bytes::Bytes> {
         self.read_engine.validate_native_read_size(size)?;
 
@@ -133,13 +133,13 @@ impl DistributedFs {
         let opened = snapshot.handle.clone();
         let operation = self.capture_native_read_view()?;
         let deadline = deadline.min(operation.deadline);
-        let lifetime: crate::node::read_pipeline::ReadLifetime =
+        let lifetime: crate::node::read::admission::ReadLifetime =
             Arc::new((opened.clone(), lifetime));
-        let scope = crate::node::read_pipeline::ReadScope {
+        let scope = crate::node::read::admission::ReadScope {
             deadline,
             lifetime: lifetime.clone(),
         };
-        crate::node::read_pipeline::in_read_scope(scope, async {
+        crate::node::read::admission::in_read_scope(scope, async {
             let result = self
                 .native_read_plan_async(handle, snapshot, offset, size, deadline, lifetime)
                 .await
@@ -181,7 +181,7 @@ impl DistributedFs {
         offset: u64,
         size: usize,
         deadline: Instant,
-        lifetime: crate::node::read_pipeline::ReadLifetime,
+        lifetime: crate::node::read::admission::ReadLifetime,
     ) -> Result<prost::bytes::Bytes> {
         let request = NativeReadRequest {
             snapshot,
@@ -289,11 +289,11 @@ impl DistributedFs {
         // Speculative parts are cached per handle and keyed by offset only, so
         // only a handle whose version never moved may use them.
         if !snapshot.handle.dynamic_read_route.load(Ordering::Acquire)
-            && crate::node::native_prefetch::eligible(snapshot.flags)
+            && crate::node::read::native_prefetch::eligible(snapshot.flags)
             && let Some((budget, window)) = self.read_engine.native_prefetch_policy()
         {
             let controller = snapshot.handle.native_prefetch.get_or_init(|| {
-                crate::node::native_prefetch::Controller::new(budget.clone(), window)
+                crate::node::read::native_prefetch::Controller::new(budget.clone(), window)
             });
             let fetch = controller.fetch(|| {
                 let engine = self.read_engine.clone();
@@ -312,9 +312,9 @@ impl DistributedFs {
             });
             // Large internal reads discard speculative parts and use a single
             // owned reply; only small cross-boundary reads need assembly.
-            let crossing = count <= crate::node::native_prefetch::UNIT
-                && offset % crate::node::native_prefetch::UNIT as u64 + count as u64
-                    > crate::node::native_prefetch::UNIT as u64;
+            let crossing = count <= crate::node::read::native_prefetch::UNIT
+                && offset % crate::node::read::native_prefetch::UNIT as u64 + count as u64
+                    > crate::node::read::native_prefetch::UNIT as u64;
             // Serialize rare shape-change assembly before acquiring any parts.
             // Pausing prevents another completion from growing the window here.
             let assembly = if crossing {

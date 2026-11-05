@@ -1,7 +1,7 @@
 //! Peer read admission. Every peer read holds one pending slot and one RPC slot
 //! for its scope, bounded by the configured read pipeline limits.
 use super::*;
-use crate::node::read_pipeline::ReadPipelineLimits;
+use crate::node::read::admission::ReadPipelineLimits;
 
 pub(super) struct PeerReadPipeline {
     rpc: Arc<tokio::sync::Semaphore>,
@@ -17,8 +17,8 @@ impl GrpcChunkTransfer {
     /// owner can be cloned by a streaming producer.
     pub(super) async fn admit_borrowed_read(
         &self,
-    ) -> afs_error::Result<crate::node::read_pipeline::ReadLifetime> {
-        let inherited = crate::node::read_pipeline::current_read_scope();
+    ) -> afs_error::Result<crate::node::read::admission::ReadLifetime> {
+        let inherited = crate::node::read::admission::current_read_scope();
         let deadline = inherited
             .as_ref()
             .map_or_else(|| std::time::Instant::now() + self.timeout, |s| s.deadline);

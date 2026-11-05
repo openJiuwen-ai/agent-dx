@@ -13,7 +13,7 @@ use crate::{
     },
     node::{
         chunk::LocalChunkStore,
-        dfs_read::{
+        read::engine::{
             DfsReadConfig, ExternalChunkReader, ExternalReadAuthorizer, ReadSourceProvider,
             UnimplementedChunkTransfer, VerifiedExternalChunk,
         },
@@ -740,7 +740,7 @@ impl DfsMeta for RecordingMeta {
     fn current_node_session_async(
         &self,
         node_id: String,
-    ) -> crate::node::read_pipeline::ReadFuture<'_, Option<String>> {
+    ) -> crate::node::read::admission::ReadFuture<'_, Option<String>> {
         self.current_session_async_calls
             .fetch_add(1, Ordering::SeqCst);
         Box::pin(async move { self.current_node_session(&node_id) })
@@ -749,7 +749,7 @@ impl DfsMeta for RecordingMeta {
     fn resolve_write_authority_async(
         &self,
         inode_id: InodeId,
-    ) -> crate::node::read_pipeline::ReadFuture<'_, (InodeRecord, WriteLease)> {
+    ) -> crate::node::read::admission::ReadFuture<'_, (InodeRecord, WriteLease)> {
         self.resolve_write_async_calls
             .fetch_add(1, Ordering::SeqCst);
         Box::pin(async move { self.resolve_write_authority(&inode_id) })
@@ -812,13 +812,13 @@ fn distributed_fs_with_chunk_store(
     local: Arc<LocalChunkStore>,
     chunk_store: Arc<dyn ChunkSink>,
 ) -> DistributedFs {
-    let read_engine = Arc::new(crate::node::dfs_read::DfsReadEngine::new(
+    let read_engine = Arc::new(crate::node::read::engine::DfsReadEngine::new(
         NamespaceId::new("default"),
         "node-a".into(),
         local,
-        Arc::new(crate::node::dfs_read::UnimplementedReadSourceProvider),
-        Arc::new(crate::node::dfs_read::UnimplementedChunkTransfer),
-        crate::node::dfs_read::DfsReadConfig::default(),
+        Arc::new(crate::node::read::engine::UnimplementedReadSourceProvider),
+        Arc::new(crate::node::read::engine::UnimplementedChunkTransfer),
+        crate::node::read::engine::DfsReadConfig::default(),
     ));
     test_dfs_new(
         NamespaceId::new("default"),

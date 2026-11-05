@@ -130,7 +130,7 @@ const READ_CHECK_NAMES: [&str; 10] = [
 
 #[derive(Clone, Debug)]
 pub struct ReadWorkMetrics {
-    pub(crate) activities: super::read_activity::Activities,
+    pub(crate) activities: super::read::activity::Activities,
     checks: [afs_metrics::IntCounter; 10],
     #[cfg(feature = "dfs")]
     native_write_resources: afs_metrics::IntGaugeVec,
@@ -617,7 +617,7 @@ impl ReadWorkMetrics {
                 copies.with_label_values(&[stage]);
             }
             Ok(Self {
-                activities: super::read_activity::Activities::register(registry)?,
+                activities: super::read::activity::Activities::register(registry)?,
                 checks: checks_bound,
                 #[cfg(feature = "dfs")]
                 native_write_resources,

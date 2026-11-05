@@ -61,7 +61,7 @@ async fn read_equivalence_cold_source_lookup_is_shared() {
         fn sources_for_async(
             &self,
             request: DfsChunkSourcesRequest,
-        ) -> super::super::read_pipeline::ReadFuture<'_, DfsChunkSourcesReply> {
+        ) -> super::super::admission::ReadFuture<'_, DfsChunkSourcesReply> {
             Box::pin(async move {
                 tokio::time::sleep(Duration::from_millis(80)).await;
                 self.sources_for(request)
@@ -117,7 +117,7 @@ async fn read_equivalence_source_query_survives_one_waiter_timeout() {
         fn sources_for_async(
             &self,
             r: DfsChunkSourcesRequest,
-        ) -> super::super::read_pipeline::ReadFuture<'_, DfsChunkSourcesReply> {
+        ) -> super::super::admission::ReadFuture<'_, DfsChunkSourcesReply> {
             Box::pin(async move {
                 self.started
                     .store(true, std::sync::atomic::Ordering::SeqCst);
@@ -214,7 +214,7 @@ fn read_equivalence_bounded_reply_pool_reuses_a_concurrent_working_set() {
         Arc::new(AsyncTransfer),
         DfsReadConfig::default(),
     )
-    .with_read_pipeline(crate::node::read_pipeline::ReadPipelineLimits {
+    .with_read_pipeline(crate::node::read::admission::ReadPipelineLimits {
         ..Default::default()
     })
     .unwrap();
@@ -2955,7 +2955,7 @@ impl ChunkTransfer for NativeCacheTransfer {
 struct NativeCacheFixture {
     _temp: tempfile::TempDir,
     engine: DfsReadEngine,
-    cache: Arc<crate::node::peer_cache::DiskPeerCache>,
+    cache: Arc<crate::node::read::peer_cache::DiskPeerCache>,
     sources: Arc<StaticSources>,
     transfer: Arc<NativeCacheTransfer>,
     batch: ReadBatch,
@@ -2980,8 +2980,8 @@ impl NativeCacheFixture {
             }],
         }));
         let cache = Arc::new(
-            crate::node::peer_cache::DiskPeerCache::open(
-                crate::node::peer_cache::PeerCacheOptions {
+            crate::node::read::peer_cache::DiskPeerCache::open(
+                crate::node::read::peer_cache::PeerCacheOptions {
                     directory: temp.path().join("cache"),
                     capacity_bytes: 2 * 1024 * 1024,
                     namespace_id: crate::dfs::NamespaceId::new("default"),
@@ -3158,7 +3158,7 @@ fn native_peer_disk_cache_leader_recheck_io_failure_falls_back_without_deleting_
         }
         {
             let bytes = fixture.transfer.bytes.lock().unwrap();
-            let verified = crate::node::peer_cache::VerifiedPeerChunk::verify(
+            let verified = crate::node::read::peer_cache::VerifiedPeerChunk::verify(
                 &fixture.chunk,
                 &bytes,
                 fixture.cache.proof_budget(),
@@ -3197,7 +3197,7 @@ fn native_peer_disk_cache_failed_leader_does_not_fail_valid_follower() {
     ] {
         let fixture =
             NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
-        let crate::node::peer_cache::FillRole::Leader(mut leader) = fixture
+        let crate::node::read::peer_cache::FillRole::Leader(mut leader) = fixture
             .cache
             .fill_flight(&fixture.chunk, || Ok(()))
             .unwrap()
@@ -3215,7 +3215,7 @@ fn native_peer_disk_cache_failed_leader_does_not_fail_valid_follower() {
             if let Some(error) = failure {
                 // Keep the completed leader alive: the follower must not
                 // rejoin this terminal flight or inherit its source error.
-                leader.finish(crate::node::peer_cache::FillOutcome::Failed(error));
+                leader.finish(crate::node::read::peer_cache::FillOutcome::Failed(error));
             } else {
                 drop(leader);
             }
@@ -3236,7 +3236,7 @@ fn native_peer_disk_cache_failed_leader_does_not_fail_valid_follower() {
 #[test]
 fn native_peer_disk_cache_failed_leader_cannot_bypass_follower_stop() {
     let fixture = NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
-    let crate::node::peer_cache::FillRole::Leader(mut leader) = fixture
+    let crate::node::read::peer_cache::FillRole::Leader(mut leader) = fixture
         .cache
         .fill_flight(&fixture.chunk, || Ok(()))
         .unwrap()
@@ -3251,9 +3251,9 @@ fn native_peer_disk_cache_failed_leader_cannot_bypass_follower_stop() {
             std::thread::yield_now();
         }
         fixture.engine.read_authority.stop();
-        leader.finish(crate::node::peer_cache::FillOutcome::Failed(unavailable(
-            "leader timed out",
-        )));
+        leader.finish(crate::node::read::peer_cache::FillOutcome::Failed(
+            unavailable("leader timed out"),
+        ));
         assert!(following.join().unwrap().is_err());
     });
     assert!(fixture.transfer.batches.lock().unwrap().is_empty());
@@ -3451,7 +3451,7 @@ fn r7_prefetch_busy_source_lock_skips_without_queue_or_rpc() {
     fixture.engine.sources_for(&fixture.batch).unwrap();
     let registry = afs_metrics::Registry::new();
     let metrics = crate::node::read_work::ReadWorkMetrics::register(&registry).unwrap();
-    fixture.engine.fetcher = super::super::dfs_fetch::ObjectFetcher::new(
+    fixture.engine.fetcher = super::super::object_fetch::ObjectFetcher::new(
         runtime.handle().clone(),
         fixture.cache.proof_budget(),
         8,
@@ -3818,7 +3818,7 @@ fn r7_fanout_degradation_uses_only_foreground_serial_range_fallback() {
             &'a self,
             batch: &'a PeerReadBatch,
             out: &'a mut [u8],
-        ) -> super::super::read_pipeline::ReadFuture<'a, ()> {
+        ) -> super::super::admission::ReadFuture<'a, ()> {
             Box::pin(async move {
                 if tokio::task::try_id().is_some() {
                     self.child_range.store(true, Ordering::SeqCst);
@@ -3832,7 +3832,7 @@ fn r7_fanout_degradation_uses_only_foreground_serial_range_fallback() {
             chunk: &'a ChunkObject,
             out: &'a mut [u8],
             proof_budget: Arc<OutboardBudget>,
-        ) -> super::super::read_pipeline::ReadFuture<'a, VerifiedPeerChunk<'a>> {
+        ) -> super::super::admission::ReadFuture<'a, VerifiedPeerChunk<'a>> {
             Box::pin(async move {
                 if tokio::task::try_id().is_some() {
                     self.child_range.store(true, Ordering::SeqCst);
@@ -3919,8 +3919,8 @@ fn r7_fanout_degradation_uses_only_foreground_serial_range_fallback() {
             StagedChunk::new(OperationId::new("r7-fallback-second"), vec![29; 64 * 1024]),
         ];
         let cache = Arc::new(
-            crate::node::peer_cache::DiskPeerCache::open(
-                crate::node::peer_cache::PeerCacheOptions {
+            crate::node::read::peer_cache::DiskPeerCache::open(
+                crate::node::read::peer_cache::PeerCacheOptions {
                     directory: temp.path().join("cache"),
                     capacity_bytes: if mode == "capacity" {
                         8192
@@ -4148,11 +4148,13 @@ fn r7_cross_object_private_read_overlaps_two_sink_fills_and_joins_before_deliver
     let (entered_tx, entered_rx) = mpsc::channel();
     let released = Arc::new((Mutex::new(false), Condvar::new()));
     let cache = Arc::new(
-        crate::node::peer_cache::DiskPeerCache::open(crate::node::peer_cache::PeerCacheOptions {
-            directory: temp.path().join("cache"),
-            capacity_bytes: 1024 * 1024,
-            namespace_id: crate::dfs::NamespaceId::new("default"),
-        })
+        crate::node::read::peer_cache::DiskPeerCache::open(
+            crate::node::read::peer_cache::PeerCacheOptions {
+                directory: temp.path().join("cache"),
+                capacity_bytes: 1024 * 1024,
+                namespace_id: crate::dfs::NamespaceId::new("default"),
+            },
+        )
         .unwrap(),
     );
     let provider = Arc::new(StaticSources::new(DfsChunkSourcesReply {
@@ -4306,7 +4308,7 @@ fn native_stream_fill_cache_quota_failure_keeps_same_rpc_verified_range_success(
     let mut fixture =
         NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
     let cache = Arc::new(
-        DiskPeerCache::open(crate::node::peer_cache::PeerCacheOptions {
+        DiskPeerCache::open(crate::node::read::peer_cache::PeerCacheOptions {
             directory: fixture._temp.path().join("stream-tiny-cache"),
             capacity_bytes: 16,
             namespace_id: crate::dfs::NamespaceId::new("default"),
@@ -4639,7 +4641,7 @@ fn native_peer_disk_cache_admission_failure_does_not_fail_verified_read() {
     let mut fixture =
         NativeCacheFixture::new(MAX_DFS_READ_BYTES, vec![(0, 64 * 1024)], Duration::ZERO);
     let cache = Arc::new(
-        DiskPeerCache::open(crate::node::peer_cache::PeerCacheOptions {
+        DiskPeerCache::open(crate::node::read::peer_cache::PeerCacheOptions {
             directory: fixture._temp.path().join("small-cache"),
             capacity_bytes: 4096,
             namespace_id: crate::dfs::NamespaceId::new("default"),

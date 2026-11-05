@@ -375,7 +375,7 @@ pub(super) struct PeerRootProducer {
     pub(super) length: u64,
     pub(super) expected_length: u64,
     pub(super) deadline: std::time::Instant,
-    pub(super) binding: crate::node::peer_cache::PeerStreamBinding,
+    pub(super) binding: crate::node::read::peer_cache::PeerStreamBinding,
     pub(super) diagnostic: Option<ReadDiagnosticProducer>,
 }
 
@@ -384,14 +384,14 @@ pub(super) struct PeerRootReceipt {
     pub(super) root_intervals: Option<ReadDiagnosticIntervals>,
     pub(super) length: u64,
     pub(super) digest: PeerRootDigest,
-    pub(super) binding: crate::node::peer_cache::PeerStreamBinding,
+    pub(super) binding: crate::node::read::peer_cache::PeerStreamBinding,
 }
 
 #[cfg(feature = "dfs")]
 impl PeerRootProducer {
     pub(super) fn new(
         expected_length: u64,
-        binding: crate::node::peer_cache::PeerStreamBinding,
+        binding: crate::node::read::peer_cache::PeerStreamBinding,
         diagnostic: Option<ReadDiagnosticProducer>,
         deadline: std::time::Instant,
     ) -> Self {

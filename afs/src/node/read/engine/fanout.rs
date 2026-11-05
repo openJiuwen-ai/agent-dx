@@ -159,7 +159,7 @@ impl DfsReadEngine {
     /// Admission stops at the first budget refusal or failed recheck.
     async fn spawn_fanout_children(
         &self,
-        fetcher: &Arc<super::super::dfs_fetch::ObjectFetcher>,
+        fetcher: &Arc<super::super::object_fetch::ObjectFetcher>,
         batch: &ReadBatch,
         sources: &[ChunkSources],
         authority: &NativeReadAuthoritySnapshot,

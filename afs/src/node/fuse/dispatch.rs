@@ -40,7 +40,7 @@ struct FuseCompletionInner {
     turn: Option<FuseTurn>,
 }
 impl FuseCompletion {
-    pub(super) fn hold(&self) -> crate::node::read_pipeline::ReadLifetime {
+    pub(super) fn hold(&self) -> crate::node::read::admission::ReadLifetime {
         self.inner.clone()
     }
 }
@@ -110,7 +110,7 @@ impl FuseRecoverySender {
         queue.jobs += 1;
         if let Some(metrics) = self.shared.activity.get() {
             metrics.observe_count(
-                crate::node::read_activity::Activity::FuseTask,
+                crate::node::read::activity::Activity::FuseTask,
                 queue.jobs as u64,
             );
         }
@@ -136,7 +136,7 @@ impl FuseRecoverySender {
 }
 
 pub(super) struct FuseDispatchShared {
-    pub(super) activity: std::sync::OnceLock<crate::node::read_activity::Activities>,
+    pub(super) activity: std::sync::OnceLock<crate::node::read::activity::Activities>,
     pub(super) queue: Mutex<FuseQueue>,
     ready: Condvar,
     capacity: Condvar,
@@ -275,7 +275,7 @@ impl FuseDispatch {
         queue.jobs += 1;
         if let Some(metrics) = self.shared.activity.get() {
             metrics.observe_count(
-                crate::node::read_activity::Activity::FuseTask,
+                crate::node::read::activity::Activity::FuseTask,
                 queue.jobs as u64,
             );
         }
@@ -397,7 +397,7 @@ impl FuseDispatch {
         queue.jobs += 1;
         if let Some(metrics) = self.shared.activity.get() {
             metrics.observe_count(
-                crate::node::read_activity::Activity::FuseTask,
+                crate::node::read::activity::Activity::FuseTask,
                 queue.jobs as u64,
             );
         }
@@ -452,7 +452,7 @@ impl FuseDispatch {
         queue.jobs -= 1;
         if let Some(metrics) = shared.activity.get() {
             metrics.observe_count(
-                crate::node::read_activity::Activity::FuseTask,
+                crate::node::read::activity::Activity::FuseTask,
                 queue.jobs as u64,
             );
         }
@@ -531,7 +531,7 @@ impl FuseDispatch {
         queue.jobs += 1;
         if let Some(metrics) = self.shared.activity.get() {
             metrics.observe_count(
-                crate::node::read_activity::Activity::FuseTask,
+                crate::node::read::activity::Activity::FuseTask,
                 queue.jobs as u64,
             );
         }

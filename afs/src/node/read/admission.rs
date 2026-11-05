@@ -36,9 +36,9 @@ pub(crate) async fn in_read_scope<T>(
 #[cfg(feature = "dfs")]
 pub(crate) struct NativeReadAllocation {
     pub(crate) length: usize,
-    pub(crate) pool: std::sync::Arc<super::read_buffer::ReadBufferPool>,
+    pub(crate) pool: std::sync::Arc<super::buffer::ReadBufferPool>,
     pub(crate) admission: std::sync::Arc<tokio::sync::Semaphore>,
-    pub(crate) local: std::sync::Arc<super::chunk::LocalChunkStore>,
+    pub(crate) local: std::sync::Arc<super::super::chunk::LocalChunkStore>,
 }
 
 #[cfg(feature = "dfs")]
@@ -51,7 +51,7 @@ impl NativeReadAllocation {
         })?;
         let wait = a.local.read_work_metrics().map(|m| {
             m.activities
-                .enter(super::read_activity::Activity::ReplyWait, 0)
+                .enter(crate::node::read::activity::Activity::ReplyWait, 0)
         });
         let lease = tokio::time::timeout_at(
             tokio::time::Instant::from_std(deadline),
@@ -88,7 +88,7 @@ impl NativeReadAllocation {
         drop(wait);
         let activity = a.local.read_work_metrics().map(|m| {
             m.activities.enter(
-                super::read_activity::Activity::ReplyBytes,
+                super::activity::Activity::ReplyBytes,
                 buffer.capacity() as u64,
             )
         });
@@ -104,8 +104,8 @@ impl NativeReadAllocation {
 pub(crate) struct NativeReadReply {
     // Field order is drop order: retire the observation before the buffer can
     // reenter its pool, and release byte credits last.
-    _activity: Option<super::read_activity::ActivityGuard>,
-    pub(crate) buffer: super::read_buffer::ReadBuffer,
+    _activity: Option<super::activity::ActivityGuard>,
+    pub(crate) buffer: super::buffer::ReadBuffer,
     _bytes: Vec<tokio::sync::OwnedSemaphorePermit>,
 }
 #[cfg(feature = "dfs")]
@@ -233,7 +233,7 @@ mod tests {
         use std::sync::Arc;
         let temp = tempfile::tempdir().unwrap();
         let local = Arc::new(crate::node::chunk::LocalChunkStore::open(temp.path(), "b").unwrap());
-        let pool = super::super::read_buffer::ReadBufferPool::new("reply");
+        let pool = super::super::buffer::ReadBufferPool::new("reply");
         pool.configure_byte_limit(8 * 1024 * 1024).unwrap();
         let slots = Arc::new(tokio::sync::Semaphore::new(8 * 1024 * 1024));
         let allocation = NativeReadAllocation {
@@ -293,7 +293,7 @@ mod unified_contract_tests {
     #[cfg(feature = "dfs")]
     #[test]
     fn unified_sync_transport_adapter_preserves_an_existing_runtime() {
-        use crate::node::dfs_read::{ChunkTransfer, PeerReadBatch};
+        use crate::node::read::engine::{ChunkTransfer, PeerReadBatch};
         struct Legacy {
             runtime: tokio::runtime::Runtime,
         }

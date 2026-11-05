@@ -46,7 +46,7 @@ pub trait RemoteDfsOwner: Send + Sync {
     fn read_async(
         &self,
         request: afs_protocol::node_data::DfsOwnerReadRequest,
-    ) -> crate::node::read_pipeline::ReadFuture<'_, afs_protocol::node_data::DfsOwnerReadReply>
+    ) -> crate::node::read::admission::ReadFuture<'_, afs_protocol::node_data::DfsOwnerReadReply>
     {
         Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.read(request)) })
     }
@@ -72,42 +72,46 @@ pub trait RemoteDfsOwner: Send + Sync {
     fn open_async(
         &self,
         request: afs_protocol::node_control::DfsOwnerOpenRequest,
-    ) -> crate::node::read_pipeline::ReadFuture<'_, afs_protocol::node_control::DfsOwnerOpenReply>
+    ) -> crate::node::read::admission::ReadFuture<'_, afs_protocol::node_control::DfsOwnerOpenReply>
     {
         Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.open(request)) })
     }
     fn getattr_async(
         &self,
         request: afs_protocol::node_control::DfsOwnerGetAttrRequest,
-    ) -> crate::node::read_pipeline::ReadFuture<'_, afs_protocol::node_control::DfsOwnerGetAttrReply>
-    {
+    ) -> crate::node::read::admission::ReadFuture<
+        '_,
+        afs_protocol::node_control::DfsOwnerGetAttrReply,
+    > {
         Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.getattr(request)) })
     }
     fn release_async(
         &self,
         request: afs_protocol::node_control::DfsOwnerReleaseRequest,
-    ) -> crate::node::read_pipeline::ReadFuture<'_, afs_protocol::node_control::DfsOwnerReleaseReply>
-    {
+    ) -> crate::node::read::admission::ReadFuture<
+        '_,
+        afs_protocol::node_control::DfsOwnerReleaseReply,
+    > {
         Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.release(request)) })
     }
     fn write_async(
         &self,
         request: afs_protocol::node_data::DfsOwnerWriteRequest,
-    ) -> crate::node::read_pipeline::ReadFuture<'_, afs_protocol::node_data::DfsOwnerWriteReply>
+    ) -> crate::node::read::admission::ReadFuture<'_, afs_protocol::node_data::DfsOwnerWriteReply>
     {
         Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.write(request)) })
     }
     fn resize_async(
         &self,
         request: afs_protocol::node_data::DfsOwnerResizeRequest,
-    ) -> crate::node::read_pipeline::ReadFuture<'_, afs_protocol::node_data::DfsOwnerResizeReply>
+    ) -> crate::node::read::admission::ReadFuture<'_, afs_protocol::node_data::DfsOwnerResizeReply>
     {
         Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.resize(request)) })
     }
     fn sync_async(
         &self,
         request: afs_protocol::node_data::DfsOwnerSyncRequest,
-    ) -> crate::node::read_pipeline::ReadFuture<'_, afs_protocol::node_data::DfsOwnerSyncReply>
+    ) -> crate::node::read::admission::ReadFuture<'_, afs_protocol::node_data::DfsOwnerSyncReply>
     {
         Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.sync(request)) })
     }
@@ -299,7 +303,7 @@ macro_rules! dfs_owner_rpc {
         fn $method_async(
             &self,
             request: $request,
-        ) -> crate::node::read_pipeline::ReadFuture<'_, $reply> {
+        ) -> crate::node::read::admission::ReadFuture<'_, $reply> {
             let timeout = self.call_timeout();
             Box::pin(async move {
                 if request
@@ -343,7 +347,7 @@ impl RemoteDfsOwner for GrpcDfsOwnerClient {
     fn open_async(
         &self,
         request: afs_protocol::node_control::DfsOwnerOpenRequest,
-    ) -> crate::node::read_pipeline::ReadFuture<'_, afs_protocol::node_control::DfsOwnerOpenReply>
+    ) -> crate::node::read::admission::ReadFuture<'_, afs_protocol::node_control::DfsOwnerOpenReply>
     {
         let timeout = self.call_timeout();
         Box::pin(async move {
@@ -507,7 +511,7 @@ impl RemoteDfsOwner for GrpcDfsOwnerClient {
     fn read_async(
         &self,
         request: afs_protocol::node_data::DfsOwnerReadRequest,
-    ) -> crate::node::read_pipeline::ReadFuture<'_, afs_protocol::node_data::DfsOwnerReadReply>
+    ) -> crate::node::read::admission::ReadFuture<'_, afs_protocol::node_data::DfsOwnerReadReply>
     {
         Box::pin(async move {
             if request
@@ -517,9 +521,9 @@ impl RemoteDfsOwner for GrpcDfsOwnerClient {
             {
                 return Err(dfs_protocol_error("DFS owner request targets another Node"));
             }
-            let timeout = crate::node::read_pipeline::current_read_scope()
+            let timeout = crate::node::read::admission::current_read_scope()
                 .map(|s| {
-                    crate::node::read_pipeline::remaining_read_budget(s.deadline, self.timeout)
+                    crate::node::read::admission::remaining_read_budget(s.deadline, self.timeout)
                 })
                 .transpose()?
                 .unwrap_or(self.timeout);

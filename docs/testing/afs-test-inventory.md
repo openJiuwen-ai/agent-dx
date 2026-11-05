@@ -132,7 +132,7 @@ Buildkite现有调用链、AFS已接/缺失，以及已有规划和待补项，
 
 资产索引（按测试名/入口核查，非运行结果）：
 
-- **U1**：[DFS VFS](../../afs/src/node/vfs/dfs.rs)、[OwnerFs VFS](../../afs/src/node/vfs/ownerfs.rs)、[DFS read](../../afs/src/node/dfs_read.rs)、[Chunk](../../afs/src/node/chunk.rs)、[ExternalChunk](../../afs/src/node/external_chunk.rs)、[Peer cache](../../afs/src/node/peer_cache.rs)、[replication](../../afs/src/node/replication.rs) 等模块测试。
+- **U1**：[DFS VFS](../../afs/src/node/vfs/dfs.rs)、[OwnerFs VFS](../../afs/src/node/vfs/ownerfs.rs)、[DFS read](../../afs/src/node/read/engine.rs)、[Chunk](../../afs/src/node/chunk.rs)、[ExternalChunk](../../afs/src/node/external_chunk.rs)、[Peer cache](../../afs/src/node/read/peer_cache.rs)、[replication](../../afs/src/node/replication.rs) 等模块测试。
 - **U2**：[配置](../../afs/tests/config_contract.rs)、[REST](../../afs/tests/rest_contract.rs)、[Node health](../../afs/tests/node_health_contract.rs)、[Meta capability](../../afs/tests/meta_health_capability.rs)、[错误](../../afs/tests/error_contract.rs)。
 - **M1**：[Meta 合同](../../afs/tests/meta_contract.rs)、[local-file](https://gitcode.com/openJiuwen/agent-dx/blob/1e9ae5f235d412b06fa4195bdbe26860bd7cd840/afs/src/meta/store/local_file.rs)、[Redis](https://gitcode.com/openJiuwen/agent-dx/blob/1e9ae5f235d412b06fa4195bdbe26860bd7cd840/afs/tests/redis_contract.rs)、[local storage](../../afs/tests/storage_localfs.rs)。
 - **P1**：[OwnerFs Peer](../../afs/tests/ownerfs_peer_contract.rs)、[RDMA lifecycle](../../afs/tests/rdma_lifecycle.rs)、[RDMA probe](../../afs/common/transport/tests/rdma_probe.rs)。
@@ -189,13 +189,13 @@ Rust 属性词法统计未展开宏/target；Python AST 统计不证明 unittest
 | [afs/src/node/chunk/native_live_tests.rs](../../afs/src/node/chunk/native_live_tests.rs) | 20 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/chunk/outboard.rs](../../afs/src/node/chunk/outboard.rs) | 33 | 1 | 模块测试/私有组件集成混合 |
 | [afs/src/node/chunk.rs](../../afs/src/node/chunk.rs) | 114 | 3 | 模块测试/私有组件集成混合 |
-| [afs/src/node/dfs_fetch.rs](../../afs/src/node/dfs_fetch.rs) | 2 | 0 | 模块测试/私有组件集成混合 |
-| [afs/src/node/dfs_read.rs](../../afs/src/node/dfs_read.rs) | 125 | 0 | 模块测试/私有组件集成混合 |
+| [afs/src/node/read/object_fetch.rs](../../afs/src/node/read/object_fetch.rs) | 2 | 0 | 模块测试/私有组件集成混合 |
+| [afs/src/node/read/engine.rs](../../afs/src/node/read/engine.rs) | 125 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/external_chunk.rs](../../afs/src/node/external_chunk.rs) | 93 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/fuse/state.rs](../../afs/src/node/fuse/state.rs) | 3 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/fuse.rs](../../afs/src/node/fuse.rs) | 46 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/native_workspace.rs](../../afs/src/node/native_workspace.rs) | 17 | 8 | 模块测试/私有组件集成混合 |
-| [afs/src/node/peer_cache.rs](../../afs/src/node/peer_cache.rs) | 54 | 0 | 模块测试/私有组件集成混合 |
+| [afs/src/node/read/peer_cache.rs](../../afs/src/node/read/peer_cache.rs) | 54 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/read_work.rs](../../afs/src/node/read_work.rs) | 20 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/replication.rs](../../afs/src/node/replication.rs) | 30 | 0 | 模块测试/私有组件集成混合 |
 | [afs/src/node/rpc/control.rs](../../afs/src/node/rpc/control.rs) | 14 | 1 | 模块测试/私有组件集成混合 |

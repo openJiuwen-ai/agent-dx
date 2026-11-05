@@ -226,9 +226,9 @@ impl DfsReadEngine {
             // independently authorized follower. No Ready is installed when
             // the precommit check fails; followers take their own safe path.
             let outcome = if crate::node::fault::classify::read_authority_rejected(error) {
-                crate::node::peer_cache::FillOutcome::Uncached
+                crate::node::read::peer_cache::FillOutcome::Uncached
             } else {
-                crate::node::peer_cache::FillOutcome::Failed(error.clone())
+                crate::node::read::peer_cache::FillOutcome::Failed(error.clone())
             };
             leader.finish(outcome);
         }
@@ -335,24 +335,24 @@ impl DfsReadEngine {
             })
             .await?
         {
-            crate::node::peer_cache::FillRole::Leader(leader) => {
+            crate::node::read::peer_cache::FillRole::Leader(leader) => {
                 return Ok(FillJoin::Leader(leader));
             }
-            crate::node::peer_cache::FillRole::Finished(outcome) => outcome,
+            crate::node::read::peer_cache::FillRole::Finished(outcome) => outcome,
         };
         self.check_peer_cache_authority(batch, source, authority)?;
         match outcome {
-            crate::node::peer_cache::FillOutcome::Ready => {
+            crate::node::read::peer_cache::FillOutcome::Ready => {
                 #[cfg(test)]
                 self.wait_peer_cache_recheck_for_test("follower_ready");
                 let hit = self.read_cached_range(read, operation, out);
                 self.check_peer_cache_authority(batch, source, authority)?;
                 Ok(FillJoin::Settled(SourceOutcome::served(hit)))
             }
-            crate::node::peer_cache::FillOutcome::Uncached => {
+            crate::node::read::peer_cache::FillOutcome::Uncached => {
                 Ok(FillJoin::Settled(SourceOutcome::NotApplicable))
             }
-            crate::node::peer_cache::FillOutcome::Failed(_) => {
+            crate::node::read::peer_cache::FillOutcome::Failed(_) => {
                 // A flight is shared by object, not by source, grant or
                 // deadline. Its leader's failure cannot decide another
                 // caller's read, including source-specific corruption.
@@ -370,7 +370,7 @@ impl DfsReadEngine {
     async fn fill_peer_cache_as_leader<'c>(
         &self,
         read: &PeerCacheRead<'_>,
-        leader: &mut crate::node::peer_cache::FillLeader<'c>,
+        leader: &mut crate::node::read::peer_cache::FillLeader<'c>,
         operation: &mut super::super::peer_cache::PeerCacheOperation<'_>,
         total: &mut PeerFillStage<'_>,
         clocks: LeaderClocks,
@@ -383,7 +383,7 @@ impl DfsReadEngine {
                 .checked_add(out.len() as u64)
                 .is_some_and(|bytes| bytes <= self.config.max_inflight_bytes);
         if read.stream_only && !use_stream {
-            leader.finish(crate::node::peer_cache::FillOutcome::Uncached);
+            leader.finish(crate::node::read::peer_cache::FillOutcome::Uncached);
             return Ok(SourceOutcome::NotApplicable);
         }
         if use_stream {
@@ -405,7 +405,7 @@ impl DfsReadEngine {
         self.wait_peer_cache_recheck_for_test("leader_recheck");
         if self.read_cached_range(read, operation, out) {
             self.check_peer_cache_authority(batch, source, authority)?;
-            leader.finish(crate::node::peer_cache::FillOutcome::Ready);
+            leader.finish(crate::node::read::peer_cache::FillOutcome::Ready);
             return Ok(SourceOutcome::Done);
         }
         // Emit fill timings only after an actual complete-object fill has been
@@ -485,7 +485,7 @@ impl DfsReadEngine {
             // all fragment scratch before the original serial fallback.
             if read.stream_only {
                 fill.leader
-                    .finish(crate::node::peer_cache::FillOutcome::Uncached);
+                    .finish(crate::node::read::peer_cache::FillOutcome::Uncached);
                 return Ok(SourceOutcome::NotApplicable);
             }
             if let Some(outcome) = self
@@ -517,7 +517,7 @@ impl DfsReadEngine {
         let mut sink = crate::node::bridge::local_io(|| fill.operation.begin_stream(chunk))?;
         if read.stream_only && !sink.is_caching() {
             fill.leader
-                .finish(crate::node::peer_cache::FillOutcome::Uncached);
+                .finish(crate::node::read::peer_cache::FillOutcome::Uncached);
             return Ok(StreamAttempt::Settled(SourceOutcome::NotApplicable));
         }
         let output_pointer = out[start..end].as_ptr() as usize;
@@ -572,9 +572,9 @@ impl DfsReadEngine {
                 let _delivery = PeerFillStage::start(&self.local, "deliver");
                 fill.leader
                     .finish(if stored.as_ref().is_ok_and(|stored| *stored) {
-                        crate::node::peer_cache::FillOutcome::Ready
+                        crate::node::read::peer_cache::FillOutcome::Ready
                     } else {
-                        crate::node::peer_cache::FillOutcome::Uncached
+                        crate::node::read::peer_cache::FillOutcome::Uncached
                     });
                 match stored {
                     Ok(true) => self.local.record_peer_disk_cache_event("fill"),
@@ -670,9 +670,9 @@ impl DfsReadEngine {
                 let _delivery = PeerFillStage::start(&self.local, "deliver");
                 fill.leader
                     .finish(if stored.as_ref().is_ok_and(|stored| *stored) {
-                        crate::node::peer_cache::FillOutcome::Ready
+                        crate::node::read::peer_cache::FillOutcome::Ready
                     } else {
-                        crate::node::peer_cache::FillOutcome::Uncached
+                        crate::node::read::peer_cache::FillOutcome::Uncached
                     });
                 match stored {
                     Ok(true) => self.local.record_peer_disk_cache_event("fill"),
@@ -737,7 +737,7 @@ struct LeaderClocks {
 
 /// A miss either leads the object's fill or settles from another's.
 enum FillJoin<'c> {
-    Leader(crate::node::peer_cache::FillLeader<'c>),
+    Leader(crate::node::read::peer_cache::FillLeader<'c>),
     Settled(SourceOutcome),
 }
 
@@ -754,12 +754,12 @@ enum StreamAttempt {
 /// order, matching the former locals' reverse declaration order: the error,
 /// the body, its work accounting, then the open preparation stage.
 struct LeaderFill<'f, 'c, 'o, 'l> {
-    leader: &'f mut crate::node::peer_cache::FillLeader<'c>,
+    leader: &'f mut crate::node::read::peer_cache::FillLeader<'c>,
     operation: &'f mut super::super::peer_cache::PeerCacheOperation<'o>,
     use_stream: bool,
     length: usize,
     last_error: Option<Error>,
     body: Vec<u8>,
-    legacy_fill_work: Option<super::super::read_work::PeerCacheFillWork>,
+    legacy_fill_work: Option<crate::node::read_work::PeerCacheFillWork>,
     preparation: Option<PeerFillStage<'l>>,
 }

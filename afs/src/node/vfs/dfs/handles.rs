@@ -21,7 +21,8 @@ pub(super) struct DfsFileHandle {
 }
 
 pub(super) struct DfsHandle {
-    pub(super) native_prefetch: std::sync::OnceLock<Arc<crate::node::native_prefetch::Controller>>,
+    pub(super) native_prefetch:
+        std::sync::OnceLock<Arc<crate::node::read::native_prefetch::Controller>>,
     _gc_pin: Option<Arc<crate::node::gc::GcPin>>,
     pub(super) inode_id: InodeId,
     pub(super) flags: i32,
@@ -42,7 +43,7 @@ pub(super) struct HandleMut {
     pub(super) native_denial_serial: u64,
     // Accepted/synced sequences and the observed error cursor change after open.
     pub(super) write_session: Option<DfsRemoteWriteSession>,
-    pub(super) read_sequence: crate::node::dfs_fetch::ReadSequence,
+    pub(super) read_sequence: crate::node::read::object_fetch::ReadSequence,
 }
 
 pub(super) type PinnedReadView = Result<(Arc<InodeRecord>, NativeReadView)>;
@@ -62,7 +63,7 @@ impl From<DfsFileHandle> for DfsHandle {
                 native_read_generation: opened.native_read_generation,
                 native_denial_serial: opened.native_denial_serial,
                 write_session: opened.write_session,
-                read_sequence: crate::node::dfs_fetch::ReadSequence::default(),
+                read_sequence: crate::node::read::object_fetch::ReadSequence::default(),
             }),
             closed: AtomicBool::new(false),
             dynamic_read_route: AtomicBool::new(false),

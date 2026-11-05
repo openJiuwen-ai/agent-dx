@@ -33,7 +33,7 @@ pub struct FuseExecOptions {
 /// Settings only DFS mounts use.
 #[derive(Clone, Copy, Debug)]
 pub struct DfsMountOptions {
-    pub read_pipeline: crate::node::read_pipeline::ReadPipelineLimits,
+    pub read_pipeline: crate::node::read::admission::ReadPipelineLimits,
     /// Front-owned normal ordinary-write payload; downstream buffers are separate.
     pub write_queue_bytes: u64,
 }

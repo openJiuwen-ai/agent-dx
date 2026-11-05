@@ -7,7 +7,7 @@
 //! and asks Meta to publish a new FileVersion. Writable `flush` commits prior
 //! writes before reporting close success; `release` only drops the handle.
 
-mod read_pipeline;
+mod async_read;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque},
@@ -106,7 +106,7 @@ use crate::{
         BodyRelease, ChunkBuilder, ChunkSink, NativeWriteAdmission, NativeWriteBudget,
         NativeWriteOwner, PutIntent, SharedChunkBytes, StagedChunk, StoredChunk, WriteBufferPool,
     },
-    node::dfs_read::{
+    node::read::engine::{
         BoundedLru, ChunkReadOp, CurrentExternalReadOutcome, DfsReadEngine,
         NativeReadAuthoritySnapshot, ReadBatch,
     },

@@ -1206,7 +1206,7 @@ fn peer_stream_sink_observed_extra_blocks_stay_charged_after_cleanup_failure() {
 fn coarse_cache_diagnostics_separate_misses_from_verified_hit_attempts() {
     let temp = tempfile::tempdir().unwrap();
     let registry = afs_metrics::Registry::new();
-    let metrics = super::super::read_work::ReadWorkMetrics::register(&registry)
+    let metrics = crate::node::read_work::ReadWorkMetrics::register(&registry)
         .unwrap()
         .with_read_diagnostics(true);
     let cache = DiskPeerCache::open(options(temp.path().join("cache")))
@@ -1254,7 +1254,7 @@ fn coarse_cache_diagnostics_separate_misses_from_verified_hit_attempts() {
     assert!(snapshot.object_records[0].success);
     assert_eq!(
         snapshot.object_records[0].stage,
-        super::super::read_work::ReadObjectDiagnosticStage::CacheHitReadVerify
+        crate::node::read_work::ReadObjectDiagnosticStage::CacheHitReadVerify
     );
 }
 
@@ -1992,7 +1992,7 @@ fn disk_peer_cache_reports_actual_segment_work_and_metadata_until_shutdown() {
     let mut config = options(temp.path().join("cache"));
     config.capacity_bytes = 8 * 1024 * 1024;
     let cache = DiskPeerCache::open(config).unwrap().with_read_work_metrics(
-        super::super::read_work::ReadWorkMetrics::register(&registry).unwrap(),
+        crate::node::read_work::ReadWorkMetrics::register(&registry).unwrap(),
     );
     let staged = StagedChunk::new(
         OperationId::new("metadata-metrics"),

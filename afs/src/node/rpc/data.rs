@@ -48,7 +48,7 @@ use tonic::{Request, Response, Status};
 #[cfg(feature = "dfs")]
 use crate::node::{
     chunk::LocalChunkStore,
-    dfs_read::{MAX_DFS_READ_BYTES, MAX_DFS_READ_OPS},
+    read::engine::{MAX_DFS_READ_BYTES, MAX_DFS_READ_OPS},
 };
 use crate::node::{
     rpc::control::RdmaSessionRegistry,

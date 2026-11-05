@@ -77,11 +77,11 @@ impl crate::node::replication::ReplicationTaskAuthority for GrpcDfsMeta {
 }
 
 #[cfg(feature = "dfs")]
-impl crate::node::dfs_read::ReadSourceProvider for GrpcDfsMeta {
+impl crate::node::read::engine::ReadSourceProvider for GrpcDfsMeta {
     fn sources_for_async(
         &self,
         request: crate::dfs::DfsChunkSourcesRequest,
-    ) -> crate::node::read_pipeline::ReadFuture<'_, crate::dfs::DfsChunkSourcesReply> {
+    ) -> crate::node::read::admission::ReadFuture<'_, crate::dfs::DfsChunkSourcesReply> {
         Box::pin(async move {
             self.record_read_rpc("get_chunk_sources");
             let mut client = self.client();
@@ -156,7 +156,7 @@ impl crate::node::dfs_read::ReadSourceProvider for GrpcDfsMeta {
 }
 
 #[cfg(feature = "dfs")]
-impl crate::node::dfs_read::ExternalReadAuthorizer for GrpcDfsMeta {
+impl crate::node::read::engine::ExternalReadAuthorizer for GrpcDfsMeta {
     fn authorize_current_external_read(
         &self,
         request: crate::dfs::AuthorizeCurrentExternalRead,

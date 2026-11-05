@@ -20,7 +20,7 @@ use crate::{
     node::{
         api::local::{LocalApiOptions, serve_local_api_with_options},
         chunk::LocalChunkStore,
-        dfs_read::{ChunkTransfer, DfsReadConfig, DfsReadEngine, PeerReadBatch},
+        read::engine::{ChunkTransfer, DfsReadConfig, DfsReadEngine, PeerReadBatch},
         rpc::meta::{GrpcDfsMeta, register_node_with_readiness},
         storage::Storage,
         vfs::{Backend, dfs::DistributedFs, types},

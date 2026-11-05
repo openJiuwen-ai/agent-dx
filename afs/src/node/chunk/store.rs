@@ -120,7 +120,7 @@ impl LocalChunkStore {
             #[cfg(any(feature = "dfs", test))]
             peer_read_budget: Arc::new(PeerReadBudget::default()),
             #[cfg(any(feature = "dfs", test))]
-            peer_buffer_pool: super::super::read_buffer::ReadBufferPool::new("serve"),
+            peer_buffer_pool: super::super::read::buffer::ReadBufferPool::new("serve"),
             #[cfg(any(feature = "dfs", test))]
             peer_read_cache: Mutex::new(PeerServeState::default()),
             #[cfg(any(feature = "dfs", test))]

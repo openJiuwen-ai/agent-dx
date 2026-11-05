@@ -18,24 +18,16 @@ pub(crate) mod call_deadline;
 pub mod chunk;
 pub(crate) mod chunk_crc32c;
 #[cfg(feature = "dfs")]
-mod dfs_fetch;
-#[cfg(feature = "dfs")]
-pub mod dfs_read;
-#[cfg(feature = "dfs")]
 pub mod external_chunk;
 pub(crate) mod fault;
 pub mod fuse;
 #[cfg(feature = "dfs")]
 pub mod gc;
-#[cfg(feature = "dfs")]
-mod native_prefetch;
 #[cfg(feature = "ownerfs")]
 mod native_workspace;
-#[cfg(feature = "dfs")]
-pub mod peer_cache;
-mod read_activity;
-mod read_buffer;
-pub mod read_pipeline;
+pub mod read;
+/// S1e 临时兼容，S1e-6 删：`afs::node::read_pipeline` 旧路径（`afs/tests/config_contract.rs` 引用）。
+pub use read::admission as read_pipeline;
 pub mod read_work;
 #[cfg(feature = "dfs")]
 pub mod replication;
@@ -1251,7 +1243,7 @@ async fn run_node(
     // transport windows remain separately bounded by their original limits.
     #[cfg(feature = "dfs")]
     let dfs_outboard_budget = chunk::outboard::OutboardBudget::new_with_metrics_and_work_wait(
-        usize::try_from(peer_cache::MAX_PEER_CACHE_PROOF_BYTES)?,
+        usize::try_from(read::peer_cache::MAX_PEER_CACHE_PROOF_BYTES)?,
         dfs_read_work_metrics.clone(),
         std::time::Duration::from_millis(cfg.dfs_outboard_work_wait_ms),
     );
@@ -1358,7 +1350,7 @@ async fn run_node(
                 "DFS reads require a registered Node session",
             )
         })?;
-        Some(Arc::new(dfs_read::LocalReadAuthority::new(
+        Some(Arc::new(read::engine::LocalReadAuthority::new(
             registration.lease_epoch,
             registration.session_deadline,
         )))
@@ -1556,9 +1548,9 @@ async fn run_node(
     #[cfg(feature = "dfs")]
     let mut dfs_external_store_for_shutdown: Option<Arc<external_chunk::S3ChunkStore>> = None;
     #[cfg(feature = "dfs")]
-    let mut dfs_peer_cache_for_shutdown: Option<Arc<peer_cache::DiskPeerCache>> = None;
+    let mut dfs_peer_cache_for_shutdown: Option<Arc<read::peer_cache::DiskPeerCache>> = None;
     #[cfg(feature = "dfs")]
-    let mut dfs_fetcher_for_shutdown: Option<Arc<dfs_fetch::ObjectFetcher>> = None;
+    let mut dfs_fetcher_for_shutdown: Option<Arc<read::object_fetch::ObjectFetcher>> = None;
     #[cfg(feature = "dfs")]
     let dfs_write_buffer_idle_bytes =
         usize::try_from(cfg.dfs_write_buffer_idle_bytes).map_err(|_| {
@@ -1643,7 +1635,7 @@ async fn run_node(
                 .with_gc_control(meta.clone()),
             ),
         };
-        let read_config = dfs_read::DfsReadConfig {
+        let read_config = read::engine::DfsReadConfig {
             max_ops_per_batch: cfg.dfs_read_max_ops_per_batch,
             max_inflight_bytes: cfg.dfs_read_max_inflight_bytes,
             source_cache_ttl: std::time::Duration::from_millis(cfg.dfs_source_cache_max_ms),
@@ -1652,7 +1644,7 @@ async fn run_node(
             readahead_max_bytes: cfg.dfs_readahead_max_bytes,
         };
         read_config.validate()?;
-        let read_engine = dfs_read::DfsReadEngine::new(
+        let read_engine = read::engine::DfsReadEngine::new(
             namespace.clone(),
             cfg.id.clone(),
             chunks,
@@ -1670,7 +1662,7 @@ async fn run_node(
             None => read_engine,
         };
         let read_engine = if let Some(cache) = &cfg.dfs_peer_cache {
-            let options = peer_cache::PeerCacheOptions {
+            let options = read::peer_cache::PeerCacheOptions {
                 directory: cache.directory.clone(),
                 capacity_bytes: cache.capacity_bytes,
                 namespace_id: namespace.clone(),
@@ -1680,9 +1672,12 @@ async fn run_node(
             let max_inflight_objects = cfg.dfs_fetch_max_inflight_objects;
             let cache = Arc::new(
                 crate::node::bridge::spawn_blocking(move || {
-                    peer_cache::DiskPeerCache::open_with_outboard_budget(options, outboard_budget)
-                        .and_then(|cache| cache.with_max_inflight_objects(max_inflight_objects))
-                        .map(|cache| cache.with_read_work_metrics(cache_metrics))
+                    read::peer_cache::DiskPeerCache::open_with_outboard_budget(
+                        options,
+                        outboard_budget,
+                    )
+                    .and_then(|cache| cache.with_max_inflight_objects(max_inflight_objects))
+                    .map(|cache| cache.with_read_work_metrics(cache_metrics))
                 })
                 .await??,
             );
@@ -2947,7 +2942,7 @@ fn initial_registration_error_is_retryable(error: &afs_error::Error) -> bool {
 
 #[cfg(feature = "dfs")]
 fn refresh_running_read_authority(
-    authority: &dfs_read::LocalReadAuthority,
+    authority: &read::engine::LocalReadAuthority,
     epoch: u64,
     deadline: Instant,
     shutting_down: &AtomicBool,
@@ -3045,7 +3040,7 @@ mod shutdown_tests {
     #[cfg(feature = "dfs")]
     #[test]
     fn registration_refresh_preserves_expired_and_changed_epoch_fail_closed() {
-        use super::dfs_read::LocalReadAuthority;
+        use super::read::engine::LocalReadAuthority;
         use std::time::Instant;
 
         let now = Instant::now();
@@ -3182,8 +3177,10 @@ mod shutdown_tests {
             sync::atomic::{AtomicBool, Ordering},
             time::Instant,
         };
-        let authority =
-            super::dfs_read::LocalReadAuthority::new(1, Instant::now() + Duration::from_secs(30));
+        let authority = super::read::engine::LocalReadAuthority::new(
+            1,
+            Instant::now() + Duration::from_secs(30),
+        );
         let stopping = AtomicBool::new(true);
         authority.stop();
         super::refresh_running_read_authority(

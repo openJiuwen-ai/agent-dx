@@ -1,7 +1,7 @@
 //! Async native range preparation; shares cache validation, authority and
 //! retry rules with synchronous reads, publishing only a complete private reply.
 use super::*;
-use crate::node::read_pipeline::ReadPipelineLimits;
+use crate::node::read::admission::ReadPipelineLimits;
 
 impl DfsReadEngine {
     pub(crate) fn with_read_pipeline(mut self, limits: ReadPipelineLimits) -> Result<Self> {
@@ -27,7 +27,7 @@ impl DfsReadEngine {
 
     pub(crate) fn run_sync_boundary(
         &self,
-        future: crate::node::read_pipeline::ReadFuture<'_, ()>,
+        future: crate::node::read::admission::ReadFuture<'_, ()>,
     ) -> Result<()> {
         self.transfer.block_on_read(future)
     }
@@ -64,8 +64,8 @@ impl DfsReadEngine {
         &self,
         length: usize,
         deadline: Instant,
-    ) -> Result<crate::node::read_pipeline::NativeReadReply> {
-        crate::node::read_pipeline::NativeReadAllocation {
+    ) -> Result<crate::node::read::admission::NativeReadReply> {
+        crate::node::read::admission::NativeReadAllocation {
             length,
             pool: self.reply_buffer_pool.clone(),
             admission: self.reply_admission.clone(),
@@ -76,9 +76,9 @@ impl DfsReadEngine {
     }
     pub(crate) fn compose_native_prefetch_reply(
         &self,
-        parts: crate::node::native_prefetch::Reply,
+        parts: crate::node::read::native_prefetch::Reply,
         length: usize,
-        prepared: Option<crate::node::read_pipeline::NativeReadReply>,
+        prepared: Option<crate::node::read::admission::NativeReadReply>,
     ) -> Result<prost::bytes::Bytes> {
         if parts.len() == 1 {
             return parts
@@ -114,18 +114,18 @@ impl DfsReadEngine {
         batch: ReadBatch,
         output_len: usize,
         deadline: Instant,
-        lifetime: crate::node::read_pipeline::ReadLifetime,
+        lifetime: crate::node::read::admission::ReadLifetime,
     ) -> Result<prost::bytes::Bytes> {
-        let scope = crate::node::read_pipeline::ReadScope {
+        let scope = crate::node::read::admission::ReadScope {
             deadline,
             lifetime: lifetime.clone(),
         };
-        crate::node::read_pipeline::in_read_scope(scope, async {
+        crate::node::read::admission::in_read_scope(scope, async {
             self.validate_native_read_size(output_len)?;
             batch.validate_for_output(output_len, &self.config)?;
             self.validate_private_native_ranges(&batch)?;
             let authority = self.capture_native_read_authority()?;
-            let allocation = crate::node::read_pipeline::NativeReadAllocation {
+            let allocation = crate::node::read::admission::NativeReadAllocation {
                 length: output_len,
                 pool: self.reply_buffer_pool.clone(),
                 admission: self.reply_admission.clone(),
@@ -158,7 +158,7 @@ impl DfsReadEngine {
         batch: ReadBatch,
         length: usize,
         deadline: Instant,
-        lifetime: crate::node::read_pipeline::ReadLifetime,
+        lifetime: crate::node::read::admission::ReadLifetime,
         overlay: F,
     ) -> Result<prost::bytes::Bytes>
     where
@@ -168,12 +168,12 @@ impl DfsReadEngine {
         batch.validate_for_output(length, &self.config)?;
         self.validate_private_native_ranges(&batch)?;
         let authority = self.capture_native_read_authority()?;
-        let scope = crate::node::read_pipeline::ReadScope {
+        let scope = crate::node::read::admission::ReadScope {
             deadline,
             lifetime: lifetime.clone(),
         };
-        crate::node::read_pipeline::in_read_scope(scope, async {
-            let allocation = crate::node::read_pipeline::NativeReadAllocation {
+        crate::node::read::admission::in_read_scope(scope, async {
+            let allocation = crate::node::read::admission::NativeReadAllocation {
                 length,
                 pool: self.reply_buffer_pool.clone(),
                 admission: self.reply_admission.clone(),

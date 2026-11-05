@@ -44,10 +44,10 @@ enum RdmaReadResult {
 }
 
 #[cfg(feature = "dfs")]
-impl crate::node::dfs_read::ChunkTransfer for RdmaChunkTransfer {
+impl crate::node::read::engine::ChunkTransfer for RdmaChunkTransfer {
     fn block_on_read(
         &self,
-        future: crate::node::read_pipeline::ReadFuture<'_, ()>,
+        future: crate::node::read::admission::ReadFuture<'_, ()>,
     ) -> afs_error::Result<()> {
         self.runtime.block_on(future)
     }
@@ -57,14 +57,14 @@ impl crate::node::dfs_read::ChunkTransfer for RdmaChunkTransfer {
     }
     fn read_ranges(
         &self,
-        batch: &crate::node::dfs_read::PeerReadBatch,
+        batch: &crate::node::read::engine::PeerReadBatch,
         out: &mut [u8],
     ) -> afs_error::Result<()> {
         self.read_ranges_integrity(batch, out, None)
     }
     fn read_crc32c_range(
         &self,
-        batch: &crate::node::dfs_read::PeerReadBatch,
+        batch: &crate::node::read::engine::PeerReadBatch,
         chunk: &ChunkObject,
         out: &mut [u8],
     ) -> afs_error::Result<()> {
@@ -76,7 +76,7 @@ impl crate::node::dfs_read::ChunkTransfer for RdmaChunkTransfer {
 impl RdmaChunkTransfer {
     fn read_ranges_integrity(
         &self,
-        batch: &crate::node::dfs_read::PeerReadBatch,
+        batch: &crate::node::read::engine::PeerReadBatch,
         out: &mut [u8],
         expected: Option<&ChunkObject>,
     ) -> afs_error::Result<()> {
@@ -225,7 +225,7 @@ pub(super) type DfsRdmaReadWindow = (
 
 #[cfg(all(feature = "dfs", feature = "rdma"))]
 pub(super) fn pack_dfs_rdma_read_windows(
-    batch: &crate::node::dfs_read::PeerReadBatch,
+    batch: &crate::node::read::engine::PeerReadBatch,
     sequence: u64,
 ) -> afs_error::Result<Vec<DfsRdmaReadWindow>> {
     let first = &batch.operations[0].source.read_grant;
@@ -337,7 +337,7 @@ pub fn make_chunk_transfer(
     peers: Arc<PeerConnectionPool>,
     timeout: Duration,
     rdma: Option<Arc<DfsRdmaPool>>,
-) -> afs_error::Result<Arc<dyn crate::node::dfs_read::ChunkTransfer>> {
+) -> afs_error::Result<Arc<dyn crate::node::read::engine::ChunkTransfer>> {
     match mode {
         DataMode::Rdma => Ok(Arc::new(RdmaChunkTransfer::new(
             rdma.ok_or_else(|| dfs_protocol_error("DFS RDMA resources are absent"))?,

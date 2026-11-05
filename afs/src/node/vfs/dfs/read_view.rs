@@ -237,7 +237,7 @@ impl DistributedFs {
         size: usize,
     ) -> Result<Vec<u8>> {
         self.read_committed_inode_owned_hint(inode, offset, size, &mut None, None)
-            .map(crate::node::read_buffer::ReadBuffer::into_vec)
+            .map(crate::node::read::buffer::ReadBuffer::into_vec)
     }
 
     #[cfg(test)]
@@ -248,7 +248,7 @@ impl DistributedFs {
         size: usize,
         hint: &mut Option<ReadBatch>,
         deadline: Option<Instant>,
-    ) -> Result<crate::node::read_buffer::ReadBuffer> {
+    ) -> Result<crate::node::read::buffer::ReadBuffer> {
         let cached = self.readonly_version_for_inode(inode)?;
         let length = cached.layout.file_length;
         if offset >= length || size == 0 {

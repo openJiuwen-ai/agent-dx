@@ -9,7 +9,7 @@
 //! The scope belongs to the calling thread and **does not cross threads**:
 //! `spawn_blocking`, `std::thread::spawn` and spawned tasks start without it.
 //! The gRPC clients read it on the calling thread, before `block_on`, so wrap
-//! the blocking call itself. Async work uses `read_pipeline::ReadScope` instead.
+//! the blocking call itself. Async work uses `read::admission::ReadScope` instead.
 use std::{
     cell::Cell,
     time::{Duration, Instant},

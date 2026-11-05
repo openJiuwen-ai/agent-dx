@@ -637,8 +637,8 @@ impl Backend for DistributedFs {
         offset: u64,
         size: usize,
         deadline: Instant,
-        lifetime: crate::node::read_pipeline::ReadLifetime,
-    ) -> Result<Option<crate::node::read_pipeline::ReadReplyFuture>> {
+        lifetime: crate::node::read::admission::ReadLifetime,
+    ) -> Result<Option<crate::node::read::admission::ReadReplyFuture>> {
         self.prepare_native_async_read(handle, offset, size, deadline, lifetime)
     }
 

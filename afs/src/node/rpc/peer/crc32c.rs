@@ -2,7 +2,7 @@
 use super::*;
 use crate::node::{
     chunk_crc32c::{CrcTable, SEGMENT, checksum},
-    dfs_read::PeerReadBatch,
+    read::engine::PeerReadBatch,
 };
 
 #[cfg(feature = "rdma")]
@@ -129,7 +129,7 @@ impl GrpcChunkTransfer {
             }],
         };
         let timeout = deadline
-            .map(|d| crate::node::read_pipeline::remaining_read_budget(d, self.timeout))
+            .map(|d| crate::node::read::admission::remaining_read_budget(d, self.timeout))
             .transpose()?
             .unwrap_or(self.timeout);
         tokio::time::timeout(timeout, async {
@@ -153,7 +153,7 @@ impl GrpcChunkTransfer {
                 tonic::metadata::MetadataValue::from_static(self.peers.read_crc_mode.as_str()),
             );
             if let Some(deadline) = deadline {
-                wire_request.set_timeout(crate::node::read_pipeline::remaining_read_budget(
+                wire_request.set_timeout(crate::node::read::admission::remaining_read_budget(
                     deadline,
                     self.timeout,
                 )?);
@@ -163,7 +163,7 @@ impl GrpcChunkTransfer {
             }
             let _activity = self.peers.read_work_metrics.as_ref().map(|m| {
                 m.activities
-                    .enter(crate::node::read_activity::Activity::RangeRpc, 0)
+                    .enter(crate::node::read::activity::Activity::RangeRpc, 0)
             });
             let response = client
                 .read_ranges(wire_request)

@@ -2576,7 +2576,7 @@ async fn dfs_product_rdma_replica_and_read_real_verbs_with_mode(
     server_rdma: bool,
 ) {
     use crate::node::chunk::StagedChunk;
-    use crate::node::dfs_read::{ChunkReadOp, PeerReadBatch, ResolvedReadOp};
+    use crate::node::read::engine::{ChunkReadOp, PeerReadBatch, ResolvedReadOp};
     use crate::node::rpc::peer::{
         DfsRdmaPool, PeerConnectionPool, make_chunk_transfer, make_replica_data_plane,
     };

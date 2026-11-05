@@ -10,7 +10,7 @@ use std::{sync::Arc, time::Duration};
 use fuser::{Notifier, ReplyOpen};
 
 use crate::node::{
-    api::usrbio::FdBridge, read_pipeline::ReadPipelineLimits, vfs::types::BackendInode,
+    api::usrbio::FdBridge, read::admission::ReadPipelineLimits, vfs::types::BackendInode,
 };
 
 /// Kernel entry/attribute TTL used when a policy has no cache of its own.

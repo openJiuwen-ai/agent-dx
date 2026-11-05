@@ -7,7 +7,7 @@ use super::*;
 pub(in crate::node) struct CompletedPeerStreamProof {
     chunk: ChunkObject,
     root_digest: [u8; 32],
-    pub(super) binding: crate::node::peer_cache::PeerStreamBinding,
+    pub(super) binding: crate::node::read::peer_cache::PeerStreamBinding,
     pub(super) outboard: Option<SharedOutboard>,
 }
 
@@ -17,7 +17,7 @@ impl CompletedPeerStreamProof {
         self.outboard
     }
 
-    pub(in crate::node) fn binding(&self) -> &crate::node::peer_cache::PeerStreamBinding {
+    pub(in crate::node) fn binding(&self) -> &crate::node::read::peer_cache::PeerStreamBinding {
         &self.binding
     }
     pub(in crate::node) fn chunk(&self) -> &ChunkObject {
@@ -193,7 +193,7 @@ pub(super) struct ReadFrameDecoder<'a> {
     completed: Vec<bool>,
     pub(super) active: Option<ActivePeerRead>,
     pub(super) verified_object: Option<VerifiedObjectDecode>,
-    pub(super) stream_binding: Option<crate::node::peer_cache::PeerStreamBinding>,
+    pub(super) stream_binding: Option<crate::node::read::peer_cache::PeerStreamBinding>,
     producer_root_pending: bool,
     producer_outboard_installed: bool,
     root_mode: PeerRootMode,

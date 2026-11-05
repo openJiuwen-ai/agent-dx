@@ -374,13 +374,13 @@ impl afs_protocol::node_data::dfs_chunks_server::DfsChunks for DiskStreamFixture
 pub(super) fn disk_stream_batch(
     chunk: &ChunkObject,
     endpoint: String,
-) -> crate::node::dfs_read::PeerReadBatch {
+) -> crate::node::read::engine::PeerReadBatch {
     use crate::dfs::*;
-    crate::node::dfs_read::PeerReadBatch {
+    crate::node::read::engine::PeerReadBatch {
         file_version_id: FileVersionId::new("version"),
         layout_root_id: LayoutRootId::new("layout"),
-        operations: vec![crate::node::dfs_read::ResolvedReadOp {
-            op: crate::node::dfs_read::ChunkReadOp {
+        operations: vec![crate::node::read::engine::ResolvedReadOp {
+            op: crate::node::read::engine::ChunkReadOp {
                 chunk_id: chunk.id.clone(),
                 chunk_offset: 0,
                 length: chunk.length,
@@ -418,8 +418,8 @@ pub(super) fn disk_stream_batch(
 #[cfg(feature = "dfs")]
 struct FetchRpcCase {
     _temp: tempfile::TempDir,
-    engine: Arc<crate::node::dfs_read::DfsReadEngine>,
-    cache: Arc<crate::node::peer_cache::DiskPeerCache>,
+    engine: Arc<crate::node::read::engine::DfsReadEngine>,
+    cache: Arc<crate::node::read::peer_cache::DiskPeerCache>,
     chunks: Vec<ChunkObject>,
     gate: Arc<FetchRpcGate>,
     calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -430,7 +430,7 @@ struct FetchRpcCase {
 
 #[cfg(feature = "dfs")]
 async fn fetch_rpc_case(readahead: u64, gate_all: bool) -> FetchRpcCase {
-    use crate::node::dfs_read::{DfsReadConfig, DfsReadEngine, ReadSourceProvider};
+    use crate::node::read::engine::{DfsReadConfig, DfsReadEngine, ReadSourceProvider};
     struct Sources {
         reply: crate::dfs::DfsChunkSourcesReply,
         calls: Arc<std::sync::atomic::AtomicUsize>,
@@ -536,11 +536,13 @@ async fn fetch_rpc_case(readahead: u64, gate_all: bool) -> FetchRpcCase {
         },
     };
     let cache = Arc::new(
-        crate::node::peer_cache::DiskPeerCache::open(crate::node::peer_cache::PeerCacheOptions {
-            directory: temp.path().join("cache"),
-            capacity_bytes: 1024 * 1024,
-            namespace_id: crate::dfs::NamespaceId::new("test"),
-        })
+        crate::node::read::peer_cache::DiskPeerCache::open(
+            crate::node::read::peer_cache::PeerCacheOptions {
+                directory: temp.path().join("cache"),
+                capacity_bytes: 1024 * 1024,
+                namespace_id: crate::dfs::NamespaceId::new("test"),
+            },
+        )
         .unwrap(),
     );
     let engine = Arc::new(
@@ -558,10 +560,12 @@ async fn fetch_rpc_case(readahead: u64, gate_all: bool) -> FetchRpcCase {
                 ..DfsReadConfig::default()
             },
         )
-        .with_read_authority(Arc::new(crate::node::dfs_read::LocalReadAuthority::new(
-            1,
-            std::time::Instant::now() + Duration::from_secs(30),
-        )))
+        .with_read_authority(Arc::new(
+            crate::node::read::engine::LocalReadAuthority::new(
+                1,
+                std::time::Instant::now() + Duration::from_secs(30),
+            ),
+        ))
         .with_peer_cache(cache.clone()),
     );
     FetchRpcCase {
@@ -578,8 +582,8 @@ async fn fetch_rpc_case(readahead: u64, gate_all: bool) -> FetchRpcCase {
 }
 
 #[cfg(feature = "dfs")]
-fn fetch_case_batch(case: &FetchRpcCase, cross: bool) -> crate::node::dfs_read::ReadBatch {
-    use crate::node::dfs_read::{ChunkReadOp, ReadBatch};
+fn fetch_case_batch(case: &FetchRpcCase, cross: bool) -> crate::node::read::engine::ReadBatch {
+    use crate::node::read::engine::{ChunkReadOp, ReadBatch};
     ReadBatch {
         file_version_id: Some(crate::dfs::FileVersionId::new("version")),
         layout_root_id: crate::dfs::LayoutRootId::new("layout"),
@@ -618,7 +622,7 @@ async fn unified_actual_rpc_cross_object_cache_fill_hit_has_no_sync_fallback() {
         Arc::try_unwrap(case.engine)
             .ok()
             .unwrap()
-            .with_read_pipeline(crate::node::read_pipeline::ReadPipelineLimits::default())
+            .with_read_pipeline(crate::node::read::admission::ReadPipelineLimits::default())
             .unwrap(),
     );
     let batch = fetch_case_batch(&case, true);
@@ -687,7 +691,7 @@ async fn unified_actual_rpc_cancelled_parent_keeps_descendant_lifetime_until_ret
         Arc::try_unwrap(case.engine)
             .ok()
             .unwrap()
-            .with_read_pipeline(crate::node::read_pipeline::ReadPipelineLimits::default())
+            .with_read_pipeline(crate::node::read::admission::ReadPipelineLimits::default())
             .unwrap(),
     );
     let batch = fetch_case_batch(&case, true);
@@ -921,8 +925,8 @@ async fn r7_actual_rpc_prefetch_is_sink_only_and_cancel_really_joins() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_stream_actual_rpc_seals_only_after_eof_and_drains_on_failure() {
     use crate::node::{
-        dfs_read::ChunkTransfer,
-        peer_cache::{DiskPeerCache, PeerCacheOptions},
+        read::engine::ChunkTransfer,
+        read::peer_cache::{DiskPeerCache, PeerCacheOptions},
     };
     // 9/10: peer proof, including disabled disk cache; 11: wrong body;
     // 12: late transport error; 13: missing Completion; 14: false wire root;
@@ -1205,7 +1209,7 @@ async fn peer_stream_actual_rpc_seals_only_after_eof_and_drains_on_failure() {
 #[cfg(feature = "dfs")]
 #[test]
 fn peer_stream_joined_root_receipt_requires_completion_meta_and_sink_identity() {
-    use crate::node::peer_cache::{DiskPeerCache, PeerCacheOptions};
+    use crate::node::read::peer_cache::{DiskPeerCache, PeerCacheOptions};
     for consumer_tree in [false, true] {
         for mode in 0..6 {
             let staged = crate::node::chunk::StagedChunk::new(
@@ -1337,7 +1341,7 @@ fn peer_stream_joined_root_receipt_requires_completion_meta_and_sink_identity() 
 #[cfg(feature = "dfs")]
 #[test]
 fn peer_root_producer_rejects_reordered_and_truncated_blocks() {
-    use crate::node::peer_cache::{DiskPeerCache, PeerCacheOptions};
+    use crate::node::read::peer_cache::{DiskPeerCache, PeerCacheOptions};
     let staged = crate::node::chunk::StagedChunk::new(
         crate::dfs::OperationId::new("producer-order"),
         vec![37; 512],
@@ -1434,8 +1438,8 @@ async fn r7_background_admission_first_poll_never_waits_for_metadata_locks() {
 #[tokio::test]
 async fn peer_stream_current_thread_is_unsupported_before_rpc() {
     use crate::node::{
-        dfs_read::ChunkTransfer,
-        peer_cache::{DiskPeerCache, PeerCacheOptions},
+        read::engine::ChunkTransfer,
+        read::peer_cache::{DiskPeerCache, PeerCacheOptions},
     };
     let pool = PeerConnectionPool::new(
         afs_transport::GrpcConfig::default(),
@@ -1472,7 +1476,7 @@ async fn peer_stream_current_thread_is_unsupported_before_rpc() {
 #[cfg(feature = "dfs")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn peer_stream_large_windows_are_unsupported_before_rpc() {
-    use crate::node::dfs_read::ChunkTransfer;
+    use crate::node::read::engine::ChunkTransfer;
     for connection in [false, true] {
         let mut config = afs_transport::GrpcConfig::default();
         if connection {
@@ -1509,7 +1513,7 @@ fn peer_stream_blocks_retain_capacity_and_controls_reject_payload() {
 #[cfg(feature = "dfs")]
 #[test]
 fn peer_stream_complete_proof_cannot_seal_another_same_object_sink() {
-    use crate::node::peer_cache::{DiskPeerCache, PeerCacheOptions};
+    use crate::node::read::peer_cache::{DiskPeerCache, PeerCacheOptions};
     let directory = tempfile::tempdir().unwrap();
     let make_cache = |name| {
         DiskPeerCache::open(PeerCacheOptions {
@@ -2808,7 +2812,7 @@ fn wi6_peer_outboard_rejects_shape_cv_replay_and_partial_capabilities() {
 #[cfg(feature = "dfs")]
 #[test]
 fn wi6_peer_producer_retires_wire_backing_and_keeps_standard_root() {
-    use crate::node::peer_cache::{DiskPeerCache, PeerCacheOptions};
+    use crate::node::read::peer_cache::{DiskPeerCache, PeerCacheOptions};
     let body = vec![47; 2 * STREAM_FRAME_BACKING_BYTES + 31];
     let encoded = wi6_encoded_outboard(&body);
     let (chunk, request, mut frames) = wi6_frames_with_outboard(&body, &encoded);
@@ -2926,7 +2930,7 @@ fn wi6_peer_producer_retires_wire_backing_and_keeps_standard_root() {
 #[cfg(feature = "dfs")]
 #[test]
 fn wi6_r_producer_hash_is_reserved_for_header_fallbacks() {
-    use crate::node::peer_cache::{DiskPeerCache, PeerCacheOptions};
+    use crate::node::read::peer_cache::{DiskPeerCache, PeerCacheOptions};
     let body = vec![83; 96 * 1024 + 17];
     let encoded = wi6_encoded_outboard(&body);
     for mode in 0..4 {
@@ -3805,7 +3809,7 @@ mod dfs_rdma_tests {
     #[test]
     fn read_windows_split_at_registered_capacity_and_preserve_destinations() {
         use crate::dfs::*;
-        use crate::node::dfs_read::{ChunkReadOp, PeerReadBatch, ResolvedReadOp};
+        use crate::node::read::engine::{ChunkReadOp, PeerReadBatch, ResolvedReadOp};
         let size = 3 * 1024 * 1024;
         let batch = PeerReadBatch {
             file_version_id: FileVersionId::new("version"),

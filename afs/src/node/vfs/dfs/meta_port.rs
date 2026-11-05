@@ -28,7 +28,7 @@ pub trait DfsMeta: Send + Sync {
     fn get_file_version_async(
         &self,
         version_id: FileVersionId,
-    ) -> crate::node::read_pipeline::ReadFuture<'_, (FileVersion, LayoutRoot)> {
+    ) -> crate::node::read::admission::ReadFuture<'_, (FileVersion, LayoutRoot)> {
         Box::pin(async move { self.get_file_version(&version_id) })
     }
 
@@ -44,7 +44,7 @@ pub trait DfsMeta: Send + Sync {
     fn resolve_write_authority_async(
         &self,
         inode_id: InodeId,
-    ) -> crate::node::read_pipeline::ReadFuture<'_, (InodeRecord, WriteLease)> {
+    ) -> crate::node::read::admission::ReadFuture<'_, (InodeRecord, WriteLease)> {
         Box::pin(async move {
             crate::node::bridge::run_sync_backend(|| self.resolve_write_authority(&inode_id))
         })
@@ -58,7 +58,7 @@ pub trait DfsMeta: Send + Sync {
     fn current_node_session_async(
         &self,
         node_id: String,
-    ) -> crate::node::read_pipeline::ReadFuture<'_, Option<String>> {
+    ) -> crate::node::read::admission::ReadFuture<'_, Option<String>> {
         Box::pin(async move {
             crate::node::bridge::run_sync_backend(|| self.current_node_session(&node_id))
         })

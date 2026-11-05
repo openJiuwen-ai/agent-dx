@@ -3,8 +3,11 @@
 use super::*;
 
 #[cfg(feature = "dfs")]
+use crate::node::read::engine::MAX_DFS_READ_BYTES;
+
+#[cfg(feature = "dfs")]
 pub struct GrpcChunkTransfer {
-    pub(super) read_pipeline: std::sync::OnceLock<Arc<read_pipeline::PeerReadPipeline>>,
+    pub(super) read_pipeline: std::sync::OnceLock<Arc<read_admission::PeerReadPipeline>>,
     pub(super) peers: Arc<PeerConnectionPool>,
     pub(super) runtime: PeerRuntime,
     pub(super) timeout: Duration,
@@ -31,7 +34,7 @@ impl GrpcChunkTransfer {
 impl GrpcChunkTransfer {
     fn read_ranges_impl<'a>(
         &self,
-        batch: &crate::node::dfs_read::PeerReadBatch,
+        batch: &crate::node::read::engine::PeerReadBatch,
         chunk: Option<&'a ChunkObject>,
         out: &'a mut [u8],
         proof_budget: Option<Arc<OutboardBudget>>,
@@ -42,7 +45,7 @@ impl GrpcChunkTransfer {
 
     async fn read_ranges_impl_async<'a>(
         &self,
-        batch: &crate::node::dfs_read::PeerReadBatch,
+        batch: &crate::node::read::engine::PeerReadBatch,
         chunk: Option<&'a ChunkObject>,
         out: &'a mut [u8],
         proof_budget: Option<Arc<OutboardBudget>>,
@@ -50,7 +53,7 @@ impl GrpcChunkTransfer {
         let _read_owner = self.admit_borrowed_read().await?;
 
         match chunk {
-            Some(chunk) => crate::node::dfs_read::validate_verified_peer_object_request(
+            Some(chunk) => crate::node::read::engine::validate_verified_peer_object_request(
                 batch,
                 chunk,
                 out.len(),
@@ -93,8 +96,8 @@ impl GrpcChunkTransfer {
                 })
                 .collect(),
         };
-        let timeout = crate::node::read_pipeline::current_read_scope()
-            .map(|s| crate::node::read_pipeline::remaining_read_budget(s.deadline, self.timeout))
+        let timeout = crate::node::read::admission::current_read_scope()
+            .map(|s| crate::node::read::admission::remaining_read_budget(s.deadline, self.timeout))
             .transpose()?
             .unwrap_or(self.timeout);
         async {
@@ -160,17 +163,17 @@ impl GrpcChunkTransfer {
         self.stream_sink_supported()
             && length
                 .checked_add(4 * 1024 * 1024)
-                .is_some_and(|bytes| bytes <= crate::node::dfs_read::MAX_DFS_READ_BYTES as usize)
+                .is_some_and(|bytes| bytes <= MAX_DFS_READ_BYTES as usize)
     }
 
     fn read_object_to_sink<'output>(
         &self,
-        batch: &crate::node::dfs_read::PeerReadBatch,
+        batch: &crate::node::read::engine::PeerReadBatch,
         chunk: &ChunkObject,
         requested_offset: u64,
         out: &'output mut [u8],
         sink: &mut PeerStreamSink<'_>,
-        prefetch: Option<&crate::node::dfs_read::PrefetchControl>,
+        prefetch: Option<&crate::node::read::engine::PrefetchControl>,
     ) -> afs_error::Result<Option<CompletedPeerDiskRead<'output>>> {
         // Capability rejection predates the sync API boundary: do not enter a
         // runtime or reserve transport work for a genuinely unsupported sink.
@@ -190,12 +193,12 @@ impl GrpcChunkTransfer {
 
     async fn read_object_to_sink_async<'output>(
         &self,
-        batch: &crate::node::dfs_read::PeerReadBatch,
+        batch: &crate::node::read::engine::PeerReadBatch,
         chunk: &ChunkObject,
         requested_offset: u64,
         out: &'output mut [u8],
         sink: &mut PeerStreamSink<'_>,
-        prefetch: Option<&crate::node::dfs_read::PrefetchControl>,
+        prefetch: Option<&crate::node::read::engine::PrefetchControl>,
     ) -> afs_error::Result<Option<CompletedPeerDiskRead<'output>>> {
         if !self.stream_sink_fits(out.len()) {
             return Ok(None);
@@ -216,8 +219,8 @@ impl GrpcChunkTransfer {
             PeerRuntime::Owned(runtime) => runtime.handle().clone(),
         };
         let peers = self.peers.clone();
-        let timeout = crate::node::read_pipeline::current_read_scope()
-            .map(|s| crate::node::read_pipeline::remaining_read_budget(s.deadline, self.timeout))
+        let timeout = crate::node::read::admission::current_read_scope()
+            .map(|s| crate::node::read::admission::remaining_read_budget(s.deadline, self.timeout))
             .transpose()?
             .unwrap_or(self.timeout);
         let deadline = std::time::Instant::now() + timeout;
@@ -347,12 +350,12 @@ impl GrpcChunkTransfer {
     /// `None` is "unsupported": metadata too large for the stream bounds.
     fn peer_stream_target(
         &self,
-        batch: &crate::node::dfs_read::PeerReadBatch,
+        batch: &crate::node::read::engine::PeerReadBatch,
         chunk: &ChunkObject,
         requested_offset: u64,
         out_len: usize,
     ) -> afs_error::Result<Option<PeerStreamTarget>> {
-        crate::node::dfs_read::validate_verified_peer_object_request(
+        crate::node::read::engine::validate_verified_peer_object_request(
             batch,
             chunk,
             chunk.length as usize,
@@ -460,7 +463,7 @@ impl GrpcChunkTransfer {
         node_epoch: u64,
         endpoint: &str,
         deadline: std::time::Instant,
-        prefetch: Option<&crate::node::dfs_read::PrefetchControl>,
+        prefetch: Option<&crate::node::read::engine::PrefetchControl>,
     ) -> afs_error::Result<Option<Arc<PeerStreamActive>>> {
         let admit = async {
             tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
@@ -510,7 +513,7 @@ struct PeerStreamProducer {
     controls: Arc<tokio::sync::Semaphore>,
     peers: Arc<PeerConnectionPool>,
     active: Arc<PeerStreamActive>,
-    control: Option<crate::node::dfs_read::PrefetchControl>,
+    control: Option<crate::node::read::engine::PrefetchControl>,
     diagnostic: Option<crate::node::read_work::ReadDiagnosticToken>,
     deadline: std::time::Instant,
     expected_body_bytes: u64,
@@ -522,7 +525,7 @@ struct PeerStreamPayload {
     request: tonic::Request<DfsReadRangesRequest>,
     chunk: ChunkObject,
     proof_budget: Arc<crate::node::chunk::OutboardBudget>,
-    binding: crate::node::peer_cache::PeerStreamBinding,
+    binding: crate::node::read::peer_cache::PeerStreamBinding,
 }
 
 /// Borrowed inputs of the consumer half on the caller's task.
@@ -534,14 +537,14 @@ struct PeerStreamConsumer<'c> {
     diagnostic: Option<&'c crate::node::read_work::ReadDiagnosticToken>,
     requested_offset: u64,
     deadline: std::time::Instant,
-    prefetch: Option<&'c crate::node::dfs_read::PrefetchControl>,
+    prefetch: Option<&'c crate::node::read::engine::PrefetchControl>,
 }
 
 /// The spawned producer: read frames within the deadline (and prefetch
 /// cancellation), hand blocks and controls to the consumer, return the root.
 #[cfg(feature = "dfs")]
 async fn produce_peer_stream(
-    read_owner: crate::node::read_pipeline::ReadLifetime,
+    read_owner: crate::node::read::admission::ReadLifetime,
     producer: PeerStreamProducer,
     payload: PeerStreamPayload,
 ) -> afs_error::Result<PeerRootReceipt> {
@@ -751,7 +754,7 @@ impl PeerStreamProducer {
 async fn consume_peer_stream<'c>(
     receiver: &mut tokio::sync::mpsc::Receiver<afs_error::Result<OwnedPeerStreamMessage>>,
     consumer: PeerStreamConsumer<'c>,
-    output_binding: crate::node::peer_cache::PeerStreamBinding,
+    output_binding: crate::node::read::peer_cache::PeerStreamBinding,
     out: &mut [u8],
     sink: &mut PeerStreamSink<'_>,
 ) -> afs_error::Result<(ReadFrameDecoder<'c>, Option<ReadDiagnosticConsumer>)> {
@@ -837,18 +840,18 @@ async fn consume_peer_stream<'c>(
 }
 
 #[cfg(feature = "dfs")]
-impl crate::node::dfs_read::ChunkTransfer for GrpcChunkTransfer {
+impl crate::node::read::engine::ChunkTransfer for GrpcChunkTransfer {
     fn block_on_read(
         &self,
-        future: crate::node::read_pipeline::ReadFuture<'_, ()>,
+        future: crate::node::read::admission::ReadFuture<'_, ()>,
     ) -> afs_error::Result<()> {
         self.runtime.block_on(future)
     }
     fn read_ranges_async<'a>(
         &'a self,
-        batch: &'a crate::node::dfs_read::PeerReadBatch,
+        batch: &'a crate::node::read::engine::PeerReadBatch,
         out: &'a mut [u8],
-    ) -> crate::node::read_pipeline::ReadFuture<'a, ()> {
+    ) -> crate::node::read::admission::ReadFuture<'a, ()> {
         Box::pin(async move {
             self.read_ranges_impl_async(batch, None, out, None)
                 .await
@@ -857,13 +860,13 @@ impl crate::node::dfs_read::ChunkTransfer for GrpcChunkTransfer {
     }
     fn read_crc32c_range_async<'a>(
         &'a self,
-        batch: &'a crate::node::dfs_read::PeerReadBatch,
+        batch: &'a crate::node::read::engine::PeerReadBatch,
         chunk: &'a ChunkObject,
         out: &'a mut [u8],
-    ) -> crate::node::read_pipeline::ReadFuture<'a, ()> {
+    ) -> crate::node::read::admission::ReadFuture<'a, ()> {
         Box::pin(async move {
             let _read_owner = self.admit_borrowed_read().await?;
-            let deadline = crate::node::read_pipeline::current_read_scope().map(|s| s.deadline);
+            let deadline = crate::node::read::admission::current_read_scope().map(|s| s.deadline);
             self.read_crc32c_attempt_async(batch, chunk, out, deadline)
                 .await
         })
@@ -871,11 +874,11 @@ impl crate::node::dfs_read::ChunkTransfer for GrpcChunkTransfer {
 
     fn read_verified_object_async<'a>(
         &'a self,
-        batch: &'a crate::node::dfs_read::PeerReadBatch,
+        batch: &'a crate::node::read::engine::PeerReadBatch,
         chunk: &'a ChunkObject,
         out: &'a mut [u8],
         proof_budget: Arc<OutboardBudget>,
-    ) -> crate::node::read_pipeline::ReadFuture<'a, VerifiedPeerChunk<'a>> {
+    ) -> crate::node::read::admission::ReadFuture<'a, VerifiedPeerChunk<'a>> {
         Box::pin(async move {
             self.read_ranges_impl_async(batch, Some(chunk), out, Some(proof_budget))
                 .await?
@@ -884,13 +887,13 @@ impl crate::node::dfs_read::ChunkTransfer for GrpcChunkTransfer {
     }
     fn read_verified_object_to_sink_async<'a, 'output: 'a>(
         &'a self,
-        batch: &'a crate::node::dfs_read::PeerReadBatch,
+        batch: &'a crate::node::read::engine::PeerReadBatch,
         chunk: &'a ChunkObject,
         requested_offset: u64,
         out: &'output mut [u8],
         sink: &'a mut PeerStreamSink<'_>,
-        prefetch: Option<&'a crate::node::dfs_read::PrefetchControl>,
-    ) -> crate::node::read_pipeline::ReadFuture<'a, Option<CompletedPeerDiskRead<'output>>> {
+        prefetch: Option<&'a crate::node::read::engine::PrefetchControl>,
+    ) -> crate::node::read::admission::ReadFuture<'a, Option<CompletedPeerDiskRead<'output>>> {
         Box::pin(self.read_object_to_sink_async(
             batch,
             chunk,
@@ -907,19 +910,20 @@ impl crate::node::dfs_read::ChunkTransfer for GrpcChunkTransfer {
 
     fn admit_native_read_async(
         &self,
-    ) -> crate::node::read_pipeline::ReadFuture<'_, crate::node::read_pipeline::ReadLifetime> {
+    ) -> crate::node::read::admission::ReadFuture<'_, crate::node::read::admission::ReadLifetime>
+    {
         Box::pin(self.admit_borrowed_read())
     }
     fn configure_read_pipeline(
         &self,
-        limits: crate::node::read_pipeline::ReadPipelineLimits,
+        limits: crate::node::read::admission::ReadPipelineLimits,
     ) -> afs_error::Result<()> {
         self.configure_native_read_pipeline(limits)
     }
 
     fn read_crc32c_range(
         &self,
-        batch: &crate::node::dfs_read::PeerReadBatch,
+        batch: &crate::node::read::engine::PeerReadBatch,
         chunk: &ChunkObject,
         out: &mut [u8],
     ) -> afs_error::Result<()> {
@@ -932,7 +936,7 @@ impl crate::node::dfs_read::ChunkTransfer for GrpcChunkTransfer {
 
     fn read_verified_object_to_sink<'output>(
         &self,
-        batch: &crate::node::dfs_read::PeerReadBatch,
+        batch: &crate::node::read::engine::PeerReadBatch,
         chunk: &ChunkObject,
         requested_offset: u64,
         private_out: &'output mut [u8],
@@ -943,12 +947,12 @@ impl crate::node::dfs_read::ChunkTransfer for GrpcChunkTransfer {
 
     fn try_read_verified_object_to_sink<'output>(
         &self,
-        batch: &crate::node::dfs_read::PeerReadBatch,
+        batch: &crate::node::read::engine::PeerReadBatch,
         chunk: &ChunkObject,
         requested_offset: u64,
         private_out: &'output mut [u8],
         sink: &mut PeerStreamSink<'_>,
-        control: &crate::node::dfs_read::PrefetchControl,
+        control: &crate::node::read::engine::PrefetchControl,
     ) -> afs_error::Result<Option<CompletedPeerDiskRead<'output>>> {
         self.read_object_to_sink(
             batch,
@@ -966,7 +970,7 @@ impl crate::node::dfs_read::ChunkTransfer for GrpcChunkTransfer {
 
     fn read_ranges(
         &self,
-        batch: &crate::node::dfs_read::PeerReadBatch,
+        batch: &crate::node::read::engine::PeerReadBatch,
         out: &mut [u8],
     ) -> afs_error::Result<()> {
         self.read_ranges_impl(batch, None, out, None).map(|_| ())
@@ -974,7 +978,7 @@ impl crate::node::dfs_read::ChunkTransfer for GrpcChunkTransfer {
 
     fn read_verified_object<'a>(
         &self,
-        batch: &crate::node::dfs_read::PeerReadBatch,
+        batch: &crate::node::read::engine::PeerReadBatch,
         chunk: &'a ChunkObject,
         out: &'a mut [u8],
         proof_budget: Arc<OutboardBudget>,

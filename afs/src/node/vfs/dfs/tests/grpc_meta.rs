@@ -453,13 +453,13 @@ async fn grpc_dfs_test_fs(
             data_plane,
         ),
     )));
-    let read_engine = Arc::new(crate::node::dfs_read::DfsReadEngine::new(
+    let read_engine = Arc::new(crate::node::read::engine::DfsReadEngine::new(
         NamespaceId::new("default"),
         node_id.to_owned(),
         local,
-        Arc::new(crate::node::dfs_read::UnimplementedReadSourceProvider),
-        Arc::new(crate::node::dfs_read::UnimplementedChunkTransfer),
-        crate::node::dfs_read::DfsReadConfig::default(),
+        Arc::new(crate::node::read::engine::UnimplementedReadSourceProvider),
+        Arc::new(crate::node::read::engine::UnimplementedChunkTransfer),
+        crate::node::read::engine::DfsReadConfig::default(),
     ));
     (
         meta.clone(),

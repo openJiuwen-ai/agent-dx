@@ -40,7 +40,7 @@ use crate::{
     },
     node::{
         chunk::{ChunkSink, MAX_STAGED_CHUNK_BYTES, PutIntent, StagedChunk, StoredChunk},
-        dfs_read::{ExternalChunkReader, VerifiedExternalChunk},
+        read::engine::{ExternalChunkReader, VerifiedExternalChunk},
     },
 };
 

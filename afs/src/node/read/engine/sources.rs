@@ -525,7 +525,7 @@ impl DfsReadEngine {
         batch: &ReadBatch,
         allow_generation_retry: bool,
         deadline: Instant,
-        lifetime: super::super::read_pipeline::ReadLifetime,
+        lifetime: super::super::admission::ReadLifetime,
     ) -> Result<Vec<ChunkSources>> {
         if let SourceLookup::Ready(value) =
             self.prepare_source_lookup(batch, allow_generation_retry)?

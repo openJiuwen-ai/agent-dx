@@ -77,7 +77,7 @@ impl Drop for ReadCompletions {
 impl AfsFuse {
     pub(super) fn enable_read_pipeline(
         &mut self,
-        limits: crate::node::read_pipeline::ReadPipelineLimits,
+        limits: crate::node::read::admission::ReadPipelineLimits,
     ) -> Result<()> {
         if !self.backend.supports_async_reads() {
             return Ok(());
@@ -185,7 +185,7 @@ impl AfsFuse {
                     };
                     let _wait = self_metrics.as_ref().map(|m| {
                         m.activities
-                            .enter(crate::node::read_activity::Activity::CompletionWait, 0)
+                            .enter(crate::node::read::activity::Activity::CompletionWait, 0)
                     });
                     if let Err(error) = sender.send(event).await {
                         // Shutdown must normally drain before closing this lane.

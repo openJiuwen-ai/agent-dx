@@ -69,7 +69,7 @@ pub struct DiskPeerCache {
     pub(super) changed: Condvar,
     pub(super) asynchronous_change: tokio::sync::Notify,
     pub(super) max_flights: usize,
-    pub(super) read_work: Option<super::super::read_work::ReadWorkMetrics>,
+    pub(super) read_work: Option<crate::node::read_work::ReadWorkMetrics>,
     pub(super) proof_budget: Arc<OutboardBudget>,
 }
 

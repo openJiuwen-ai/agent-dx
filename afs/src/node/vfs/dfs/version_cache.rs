@@ -230,7 +230,7 @@ impl ReadOnlyVersion {
             // and force an extra lookup. This never changes body operations.
             let width = lookahead
                 .saturating_add(1)
-                .min(crate::node::dfs_read::MAX_DFS_READ_OPS);
+                .min(crate::node::read::engine::MAX_DFS_READ_OPS);
             let first = self
                 .index
                 .entries
@@ -265,14 +265,14 @@ pub(super) fn source_lookahead_ids<'a>(
     limit: usize,
 ) -> Vec<crate::dfs::ChunkId> {
     let mut ids = Vec::new();
-    let limit = limit.min(crate::node::dfs_read::MAX_DFS_READ_OPS);
+    let limit = limit.min(crate::node::read::engine::MAX_DFS_READ_OPS);
     if limit == 0 || ops.is_empty() {
         return ids;
     }
     for extent in extents {
         if extent.length == 0
             || extent.chunk_id.0.is_empty()
-            || extent.chunk_id.0.len() > crate::node::dfs_read::MAX_SOURCE_LOOKAHEAD_ID_BYTES
+            || extent.chunk_id.0.len() > crate::node::read::engine::MAX_SOURCE_LOOKAHEAD_ID_BYTES
             || ops.iter().any(|op| op.chunk_id == extent.chunk_id)
             || ids.contains(&extent.chunk_id)
         {
@@ -411,7 +411,7 @@ pub(super) fn extent_read_op(
 /// per-version single-flight gates used by the asynchronous read entry.
 pub(super) struct VersionCache {
     pub(super) cache: Arc<Mutex<ReadOnlyVersionCache>>,
-    pub(super) gates: Arc<crate::node::read_pipeline::ReadKeyGates>,
+    pub(super) gates: Arc<crate::node::read::admission::ReadKeyGates>,
     pub(super) empty: Arc<ReadOnlyVersion>,
 }
 

@@ -247,7 +247,7 @@ impl<'a> PeerCacheOperation<'a> {
         });
         let object_diagnostic = self.cache.read_work.as_ref().and_then(|metrics| {
             metrics.object_diagnostic(
-                super::super::read_work::ReadObjectDiagnosticStage::CacheHitReadVerify,
+                crate::node::read_work::ReadObjectDiagnosticStage::CacheHitReadVerify,
                 &chunk.id.0,
             )
         });
@@ -457,7 +457,7 @@ impl<'a> PeerCacheOperation<'a> {
         result: Result<()>,
         selected: SelectedEntry<'a>,
         finalize_started: Instant,
-        object_diagnostic: Option<super::super::read_work::ReadObjectDiagnosticSpan>,
+        object_diagnostic: Option<crate::node::read_work::ReadObjectDiagnosticSpan>,
     ) -> Result<bool> {
         let outcome = (|| match result {
             Ok(()) => {
@@ -544,7 +544,7 @@ impl<'a> PeerCacheOperation<'a> {
         };
         let object_diagnostic = self.cache.read_work.as_ref().and_then(|metrics| {
             metrics.object_diagnostic(
-                super::super::read_work::ReadObjectDiagnosticStage::CacheHitRootFallback,
+                crate::node::read_work::ReadObjectDiagnosticStage::CacheHitRootFallback,
                 &chunk.id.0,
             )
         });
@@ -998,7 +998,7 @@ pub(super) fn write_header(file: &mut File, header: &Header) -> Result<()> {
 }
 
 pub(super) fn report_work(
-    metrics: &super::super::read_work::ReadWorkMetrics,
+    metrics: &crate::node::read_work::ReadWorkMetrics,
     current: PeerCacheHashWork,
     before: PeerCacheHashWork,
 ) {
@@ -1033,7 +1033,7 @@ fn elapsed_ns(started: Instant) -> u64 {
 }
 
 pub(super) fn report_stages(
-    metrics: &super::super::read_work::ReadWorkMetrics,
+    metrics: &crate::node::read_work::ReadWorkMetrics,
     current: PeerCacheReadStages,
     before: PeerCacheReadStages,
 ) {

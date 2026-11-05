@@ -149,7 +149,7 @@ class Scenario:
             "afs/src/node/fuse/mount.rs",
             "afs/src/node/fuse/page_cache.rs",
             "afs/src/node/fuse/policy.rs",
-            "afs/src/node/fuse/read_pipeline.rs",
+            "afs/src/node/fuse/read_reply.rs",
             "afs/src/node/fuse/reply.rs",
             "afs/src/node/fuse/request.rs",
             "afs/src/node/fuse/state.rs",

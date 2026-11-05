@@ -368,7 +368,7 @@ async fn native_rpc_metrics_count_real_adapter_invocations_even_on_failure() {
     let metrics = crate::node::read_work::ReadWorkMetrics::register(&registry).unwrap();
     let meta = test_meta(&endpoint, Duration::from_millis(30)).with_read_work_metrics(metrics);
     tokio::task::spawn_blocking(move || {
-        use crate::node::{dfs_read::ReadSourceProvider, vfs::dfs::DfsMeta};
+        use crate::node::{read::engine::ReadSourceProvider, vfs::dfs::DfsMeta};
         assert!(
             meta.get_inode(&crate::dfs::InodeId::new("missing"))
                 .is_err()
@@ -433,7 +433,7 @@ async fn native_read_diagnostics_cover_full_failed_meta_calls() {
     let meta =
         test_meta(&endpoint, Duration::from_millis(30)).with_read_work_metrics(metrics.clone());
     tokio::task::spawn_blocking(move || {
-        use crate::node::{dfs_read::ReadSourceProvider, vfs::dfs::DfsMeta};
+        use crate::node::{read::engine::ReadSourceProvider, vfs::dfs::DfsMeta};
         assert_eq!(
             meta.get_inode(&crate::dfs::InodeId::new("missing"))
                 .unwrap_err()

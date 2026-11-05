@@ -131,7 +131,7 @@ fn p2_r1_lookahead_deduplicates_fragmented_layout_without_widening_body() {
             file_offset: 1,
             length: 1,
             chunk_id: crate::dfs::ChunkId::new(
-                "x".repeat(crate::node::dfs_read::MAX_SOURCE_LOOKAHEAD_ID_BYTES + 1),
+                "x".repeat(crate::node::read::engine::MAX_SOURCE_LOOKAHEAD_ID_BYTES + 1),
             ),
             chunk_offset: 0,
         },

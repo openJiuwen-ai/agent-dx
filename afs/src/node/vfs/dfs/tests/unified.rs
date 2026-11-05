@@ -1,11 +1,15 @@
 use super::*;
 
 struct UnifiedLocalTransfer;
-impl crate::node::dfs_read::ChunkTransfer for UnifiedLocalTransfer {
+impl crate::node::read::engine::ChunkTransfer for UnifiedLocalTransfer {
     fn supports_async_native_read(&self) -> bool {
         true
     }
-    fn read_ranges(&self, _: &crate::node::dfs_read::PeerReadBatch, _: &mut [u8]) -> Result<()> {
+    fn read_ranges(
+        &self,
+        _: &crate::node::read::engine::PeerReadBatch,
+        _: &mut [u8],
+    ) -> Result<()> {
         Err(unavailable(
             "local unified fixture unexpectedly requested a peer",
         ))
@@ -26,19 +30,19 @@ fn unified_local_fs(
         NamespaceId::new("default"),
         "node-a".into(),
         local.clone(),
-        Arc::new(crate::node::dfs_read::UnimplementedReadSourceProvider),
+        Arc::new(crate::node::read::engine::UnimplementedReadSourceProvider),
         Arc::new(UnifiedLocalTransfer),
-        crate::node::dfs_read::DfsReadConfig {
+        crate::node::read::engine::DfsReadConfig {
             readahead_max_bytes: if cache { 16 * 1024 * 1024 } else { 0 },
             ..Default::default()
         },
     )
-    .with_read_pipeline(crate::node::read_pipeline::ReadPipelineLimits::default())
+    .with_read_pipeline(crate::node::read::admission::ReadPipelineLimits::default())
     .unwrap();
     if cache {
         engine = engine.with_peer_cache(Arc::new(
-            crate::node::peer_cache::DiskPeerCache::open(
-                crate::node::peer_cache::PeerCacheOptions {
+            crate::node::read::peer_cache::DiskPeerCache::open(
+                crate::node::read::peer_cache::PeerCacheOptions {
                     directory: temp.path().join("cache"),
                     capacity_bytes: 16 * 1024 * 1024,
                     namespace_id: NamespaceId::new("default"),

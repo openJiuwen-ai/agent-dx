@@ -1,7 +1,7 @@
 //! Bounded look-ahead for confirmed, explicitly direct, single-stream reads.
 //! Ordinary replies never enter the retained-result map.
-use super::{
-    read_pipeline::{ReadLifetime, ReadReplyFuture},
+use super::super::{
+    read::admission::{ReadLifetime, ReadReplyFuture},
     read_work::ReadWorkMetrics,
 };
 use afs_error::{Error, Result};

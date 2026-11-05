@@ -40,7 +40,7 @@ mod state;
 mod store;
 use fill::*;
 use operation::*;
-pub(super) use sink::PeerStreamBinding;
+pub(in crate::node) use sink::PeerStreamBinding;
 pub use sink::{CompletedPeerDiskRead, PeerStreamSink, VerifiedPeerChunk};
 use state::*;
 pub use state::{

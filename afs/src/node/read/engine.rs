@@ -16,9 +16,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-mod read_pipeline;
+mod async_prepare;
 
-pub use super::dfs_fetch::PrefetchControl;
+pub use super::object_fetch::PrefetchControl;
 
 use afs_error::{Error, Result};
 use afs_tracing::tracing;
@@ -33,27 +33,29 @@ use crate::{
     },
     node::{
         chunk::{LocalChunkStore, PinnedChunkReader, VerifiedRangeCopy, outboard::OutboardBudget},
-        peer_cache::{CompletedPeerDiskRead, DiskPeerCache, PeerStreamSink, VerifiedPeerChunk},
+        read::peer_cache::{
+            CompletedPeerDiskRead, DiskPeerCache, PeerStreamSink, VerifiedPeerChunk,
+        },
         read_work::PeerFillClock,
     },
 };
 
 mod authority;
-mod chunk_source;
 mod external;
 mod fanout;
 mod local;
-mod peer_cache_mode;
+mod peer_cache_source;
 mod prefetch;
 mod remote;
+mod route;
 mod sources;
-pub(super) use authority::{LocalReadAuthority, NativeReadAuthoritySnapshot};
-use chunk_source::*;
+pub(in crate::node) use authority::{LocalReadAuthority, NativeReadAuthoritySnapshot};
 use external::*;
 pub use external::{CurrentExternalReadOutcome, VerifiedExternalChunk};
 #[cfg(test)]
-use peer_cache_mode::*;
-pub(super) use sources::BoundedLru;
+use peer_cache_source::*;
+use route::*;
+pub(in crate::node) use sources::BoundedLru;
 use sources::*;
 
 /// Hard protocol budgets shared by the scheduler, peer adapter and service.
@@ -66,7 +68,7 @@ const MAX_EXTERNAL_AUTH_CACHE_ENTRIES: usize = 128;
 const MAX_EXTERNAL_AUTH_CACHE_BYTES: usize = 1024 * 1024;
 const MAX_SOURCE_CACHE_BYTES: usize = 4 * 1024 * 1024;
 const SOURCE_GRANT_SAFETY_MS: u64 = 1_000;
-pub(super) const MAX_SOURCE_LOOKAHEAD_ID_BYTES: usize = 512;
+pub(in crate::node) const MAX_SOURCE_LOOKAHEAD_ID_BYTES: usize = 512;
 
 #[derive(Clone, Debug)]
 pub struct DfsReadConfig {
@@ -209,7 +211,7 @@ pub trait ReadSourceProvider: Send + Sync {
     fn sources_for_async(
         &self,
         request: DfsChunkSourcesRequest,
-    ) -> super::read_pipeline::ReadFuture<'_, DfsChunkSourcesReply> {
+    ) -> super::admission::ReadFuture<'_, DfsChunkSourcesReply> {
         Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.sources_for(request)) })
     }
 }
@@ -313,7 +315,7 @@ fn validate_local_object_identity(expected: &ChunkObject, local: &ChunkObject) -
 pub trait ChunkTransfer: Send + Sync {
     /// Synchronous callers are compatibility boundaries; all scheduling logic
     /// lives in the same async core used by FUSE. Real gRPC overrides this.
-    fn block_on_read(&self, future: super::read_pipeline::ReadFuture<'_, ()>) -> Result<()> {
+    fn block_on_read(&self, future: super::admission::ReadFuture<'_, ()>) -> Result<()> {
         crate::node::bridge::block_on_scoped_runtime(future)
     }
 
@@ -321,7 +323,7 @@ pub trait ChunkTransfer: Send + Sync {
         &'a self,
         batch: &'a PeerReadBatch,
         out: &'a mut [u8],
-    ) -> super::read_pipeline::ReadFuture<'a, ()> {
+    ) -> super::admission::ReadFuture<'a, ()> {
         Box::pin(
             async move { crate::node::bridge::run_sync_backend(|| self.read_ranges(batch, out)) },
         )
@@ -331,7 +333,7 @@ pub trait ChunkTransfer: Send + Sync {
         batch: &'a PeerReadBatch,
         chunk: &'a ChunkObject,
         out: &'a mut [u8],
-    ) -> super::read_pipeline::ReadFuture<'a, ()> {
+    ) -> super::admission::ReadFuture<'a, ()> {
         Box::pin(async move {
             crate::node::bridge::run_sync_backend(|| self.read_crc32c_range(batch, chunk, out))
         })
@@ -343,13 +345,10 @@ pub trait ChunkTransfer: Send + Sync {
 
     fn admit_native_read_async(
         &self,
-    ) -> super::read_pipeline::ReadFuture<'_, super::read_pipeline::ReadLifetime> {
-        Box::pin(async { Ok(Arc::new(()) as super::read_pipeline::ReadLifetime) })
+    ) -> super::admission::ReadFuture<'_, super::admission::ReadLifetime> {
+        Box::pin(async { Ok(Arc::new(()) as super::admission::ReadLifetime) })
     }
-    fn configure_read_pipeline(
-        &self,
-        _limits: super::read_pipeline::ReadPipelineLimits,
-    ) -> Result<()> {
+    fn configure_read_pipeline(&self, _limits: super::admission::ReadPipelineLimits) -> Result<()> {
         Ok(())
     }
 
@@ -359,7 +358,7 @@ pub trait ChunkTransfer: Send + Sync {
         chunk: &'a ChunkObject,
         out: &'a mut [u8],
         proof_budget: Arc<OutboardBudget>,
-    ) -> super::read_pipeline::ReadFuture<'a, VerifiedPeerChunk<'a>> {
+    ) -> super::admission::ReadFuture<'a, VerifiedPeerChunk<'a>> {
         Box::pin(async move {
             crate::node::bridge::run_sync_backend(|| {
                 self.read_verified_object(batch, chunk, out, proof_budget)
@@ -374,7 +373,7 @@ pub trait ChunkTransfer: Send + Sync {
         out: &'output mut [u8],
         sink: &'a mut PeerStreamSink<'_>,
         prefetch: Option<&'a PrefetchControl>,
-    ) -> super::read_pipeline::ReadFuture<'a, Option<CompletedPeerDiskRead<'output>>> {
+    ) -> super::admission::ReadFuture<'a, Option<CompletedPeerDiskRead<'output>>> {
         Box::pin(async move {
             crate::node::bridge::run_sync_backend(|| {
                 if let Some(control) = prefetch {
@@ -471,7 +470,7 @@ pub trait ChunkTransfer: Send + Sync {
     }
 }
 
-pub(super) fn validate_verified_peer_object_request(
+pub(in crate::node) fn validate_verified_peer_object_request(
     batch: &PeerReadBatch,
     chunk: &ChunkObject,
     output_len: usize,
@@ -534,11 +533,11 @@ fn range_covered(ranges: &[(u64, u64)], requested_start: u64, requested_len: u64
 
 pub struct DfsReadEngine {
     namespace_id: crate::dfs::NamespaceId,
-    reply_buffer_pool: Arc<super::read_buffer::ReadBufferPool>,
-    read_pipeline_limits: super::read_pipeline::ReadPipelineLimits,
+    reply_buffer_pool: Arc<super::buffer::ReadBufferPool>,
+    read_pipeline_limits: super::admission::ReadPipelineLimits,
     reply_admission: Arc<tokio::sync::Semaphore>,
     native_prefetch_budget: Arc<std::sync::OnceLock<Arc<super::native_prefetch::Budget>>>,
-    source_query_gates: Arc<super::read_pipeline::ReadKeyGates>,
+    source_query_gates: Arc<super::admission::ReadKeyGates>,
     local_node_id: String,
     local: Arc<LocalChunkStore>,
     source_provider: Arc<dyn ReadSourceProvider>,
@@ -555,7 +554,7 @@ pub struct DfsReadEngine {
     #[cfg(test)]
     prefetch_attempt_hook: Mutex<Option<PrefetchAttemptHook>>,
     source_cache: Arc<Mutex<SourceCache>>,
-    fetcher: Option<Arc<super::dfs_fetch::ObjectFetcher>>,
+    fetcher: Option<Arc<super::object_fetch::ObjectFetcher>>,
     external_authority_cache: Mutex<ExternalAuthorityCache>,
 }
 
@@ -579,14 +578,16 @@ impl Drop for DfsReadEngine {
 }
 
 impl DfsReadEngine {
-    pub(super) fn publication_diagnostic(&self) -> Option<super::read_work::ReadDiagnosticSpan> {
+    pub(in crate::node) fn publication_diagnostic(
+        &self,
+    ) -> Option<super::super::read_work::ReadDiagnosticSpan> {
         self.local
-            .read_diagnostic(super::read_work::ReadDiagnosticStage::MetaCommitFileVersion)
+            .read_diagnostic(super::super::read_work::ReadDiagnosticStage::MetaCommitFileVersion)
     }
 
-    pub(super) fn publication_coarse_diagnostic(
+    pub(in crate::node) fn publication_coarse_diagnostic(
         &self,
-    ) -> Option<super::read_work::ReadCoarseDiagnosticSpan> {
+    ) -> Option<super::super::read_work::ReadCoarseDiagnosticSpan> {
         self.local.coarse_diagnostic("meta_publish_rpc", 0)
     }
 
@@ -622,7 +623,7 @@ impl DfsReadEngine {
         );
         source_cache.record(&local);
         Self {
-            reply_buffer_pool: super::read_buffer::ReadBufferPool::new("reply"),
+            reply_buffer_pool: super::buffer::ReadBufferPool::new("reply"),
             read_pipeline_limits: Default::default(),
             reply_admission: Arc::new(tokio::sync::Semaphore::new(8 * 1024 * 1024)),
             native_prefetch_budget: Arc::new(std::sync::OnceLock::new()),
@@ -662,9 +663,9 @@ impl DfsReadEngine {
 
     /// Disposable local storage for already verified native Peer objects.
     /// Cache contents never supply grant, Node/session or file-view authority.
-    pub(super) fn with_peer_cache(mut self, cache: Arc<DiskPeerCache>) -> Self {
+    pub(in crate::node) fn with_peer_cache(mut self, cache: Arc<DiskPeerCache>) -> Self {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            self.fetcher = match super::dfs_fetch::ObjectFetcher::new(
+            self.fetcher = match super::object_fetch::ObjectFetcher::new(
                 runtime,
                 cache.proof_budget(),
                 cache.max_inflight_objects(),
@@ -681,12 +682,14 @@ impl DfsReadEngine {
         self
     }
 
-    pub(super) fn object_fetcher(&self) -> Option<Arc<super::dfs_fetch::ObjectFetcher>> {
+    pub(in crate::node) fn object_fetcher(
+        &self,
+    ) -> Option<Arc<super::object_fetch::ObjectFetcher>> {
         self.fetcher.clone()
     }
 
     #[cfg(test)]
-    pub(super) fn set_prefetch_attempt_hook_for_test(&self, hook: PrefetchAttemptHook) {
+    pub(in crate::node) fn set_prefetch_attempt_hook_for_test(&self, hook: PrefetchAttemptHook) {
         *self.prefetch_attempt_hook.lock().unwrap() = Some(hook);
     }
 
@@ -719,12 +722,15 @@ impl DfsReadEngine {
         }
     }
 
-    pub(super) fn with_read_authority(mut self, authority: Arc<LocalReadAuthority>) -> Self {
+    pub(in crate::node) fn with_read_authority(
+        mut self,
+        authority: Arc<LocalReadAuthority>,
+    ) -> Self {
         self.read_authority = authority;
         self
     }
 
-    pub(super) fn validate_native_read_size(&self, size: usize) -> Result<()> {
+    pub(in crate::node) fn validate_native_read_size(&self, size: usize) -> Result<()> {
         self.config.validate()?;
         if size as u64 > self.config.max_inflight_bytes {
             return Err(invalid("DFS private read exceeds inflight byte budget"));
@@ -735,7 +741,7 @@ impl DfsReadEngine {
     /// Fill a caller-owned, unpublished native result without an additional
     /// aggregate staging allocation. On error this private buffer may change
     /// and must be discarded. Borrowed public output must use `read_batch`.
-    pub(super) fn read_batch_native_into_private(
+    pub(in crate::node) fn read_batch_native_into_private(
         &self,
         batch: &ReadBatch,
         out: &mut [u8],
@@ -743,7 +749,7 @@ impl DfsReadEngine {
         self.read_batch_native_into_private_before(batch, out, None)
     }
 
-    pub(super) fn read_batch_native_into_private_before(
+    pub(in crate::node) fn read_batch_native_into_private_before(
         &self,
         batch: &ReadBatch,
         out: &mut [u8],
@@ -782,7 +788,7 @@ impl DfsReadEngine {
     }
 
     #[cfg(test)]
-    pub(super) fn read_batch_native_open_into_private_before(
+    pub(in crate::node) fn read_batch_native_open_into_private_before(
         &self,
         batch: &ReadBatch,
         out: &mut [u8],
@@ -910,21 +916,21 @@ impl DfsReadEngine {
         self.read_batch_native_owned_before(batch, output_len, None)
     }
 
-    pub(super) fn read_batch_native_owned_before(
+    pub(in crate::node) fn read_batch_native_owned_before(
         &self,
         batch: &ReadBatch,
         output_len: usize,
         deadline: Option<Instant>,
     ) -> Result<Option<Vec<u8>>> {
         self.read_batch_native_open_owned_before(batch, output_len, deadline)
-            .map(|result| result.map(super::read_buffer::ReadBuffer::into_vec))
+            .map(|result| result.map(super::buffer::ReadBuffer::into_vec))
     }
-    pub(super) fn read_batch_native_open_owned_before(
+    pub(in crate::node) fn read_batch_native_open_owned_before(
         &self,
         batch: &ReadBatch,
         output_len: usize,
         deadline: Option<Instant>,
-    ) -> Result<Option<super::read_buffer::ReadBuffer>> {
+    ) -> Result<Option<super::buffer::ReadBuffer>> {
         if output_len as u64 > self.config.max_inflight_bytes {
             return Err(invalid("DFS owned read exceeds inflight byte budget"));
         }

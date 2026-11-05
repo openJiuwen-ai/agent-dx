@@ -11,7 +11,7 @@ use std::{
 
 use afs_error::{Error, Result};
 
-use super::{
+use super::super::{
     chunk::outboard::{OutboardBudget, OutboardLease},
     read_work::ReadWorkMetrics,
 };
@@ -26,7 +26,7 @@ pub struct PrefetchControl {
 }
 
 impl PrefetchControl {
-    pub(super) fn new(
+    pub(in crate::node) fn new(
         cancellation: FetchCancellation,
         check: impl Fn() -> Result<()> + Send + Sync + 'static,
     ) -> Self {
@@ -35,13 +35,13 @@ impl PrefetchControl {
             check: Arc::new(check),
         }
     }
-    pub(super) fn check(&self) -> Result<()> {
+    pub(in crate::node) fn check(&self) -> Result<()> {
         if self.cancellation.is_cancelled() {
             return Err(stopped());
         }
         (self.check)()
     }
-    pub(super) async fn cancelled(&self) {
+    pub(in crate::node) async fn cancelled(&self) {
         // Quiet peers may produce no frames on which to recheck their handle,
         // cached grant or original deadline. This fixed metadata-only poll
         // bounds known invalidation latency without another task or payload.
@@ -60,7 +60,7 @@ impl PrefetchControl {
 /// One Node signal wakes producers even while the remote peer is silent.
 /// Per-handle validity is checked by the job's bounded immutable context.
 #[derive(Clone, Default)]
-pub(super) struct FetchCancellation(Arc<FetchCancellationState>);
+pub(in crate::node) struct FetchCancellation(Arc<FetchCancellationState>);
 
 #[derive(Default)]
 struct FetchCancellationState {
@@ -69,16 +69,16 @@ struct FetchCancellationState {
 }
 
 impl FetchCancellation {
-    pub(super) fn cancel(&self) {
+    pub(in crate::node) fn cancel(&self) {
         self.0.cancelled.store(true, Ordering::Release);
         self.0.changed.notify_waiters();
     }
 
-    pub(super) fn is_cancelled(&self) -> bool {
+    pub(in crate::node) fn is_cancelled(&self) -> bool {
         self.0.cancelled.load(Ordering::Acquire)
     }
 
-    pub(super) async fn cancelled(&self) {
+    pub(in crate::node) async fn cancelled(&self) {
         loop {
             let changed = self.0.changed.notified();
             tokio::pin!(changed);
@@ -93,7 +93,7 @@ impl FetchCancellation {
 
 /// Fixed-size handle hint. Its scope hash is advisory, never authority.
 #[derive(Default)]
-pub(super) struct ReadSequence {
+pub(in crate::node) struct ReadSequence {
     scope: Option<[u8; 32]>,
     last_read_end: Option<u64>,
     window: usize,
@@ -101,18 +101,18 @@ pub(super) struct ReadSequence {
 }
 
 impl ReadSequence {
-    pub(super) fn generation(&self) -> u64 {
+    pub(in crate::node) fn generation(&self) -> u64 {
         self.generation
     }
 
-    pub(super) fn invalidate(&mut self) {
+    pub(in crate::node) fn invalidate(&mut self) {
         self.scope = None;
         self.last_read_end = None;
         self.window = 0;
         self.generation = self.generation.saturating_add(1);
     }
 
-    pub(super) fn record(
+    pub(in crate::node) fn record(
         &mut self,
         scope: [u8; 32],
         offset: u64,
@@ -157,7 +157,7 @@ struct FetchState {
     background: Vec<tokio::task::JoinHandle<()>>,
 }
 
-pub(super) struct ObjectFetcher {
+pub(in crate::node) struct ObjectFetcher {
     runtime: tokio::runtime::Handle,
     budget: Arc<OutboardBudget>,
     limit: usize,
@@ -171,14 +171,14 @@ pub(super) struct ObjectFetcher {
     _fixed_metadata: OutboardLease,
 }
 
-pub(super) struct FetchTaskPermit {
+pub(in crate::node) struct FetchTaskPermit {
     owner: Arc<ObjectFetcher>,
     charge: usize,
     metadata: Option<OutboardLease>,
 }
 
 impl ObjectFetcher {
-    pub(super) fn new(
+    pub(in crate::node) fn new(
         runtime: tokio::runtime::Handle,
         budget: Arc<OutboardBudget>,
         limit: usize,
@@ -218,11 +218,11 @@ impl ObjectFetcher {
         })))
     }
 
-    pub(super) fn cancellation(&self) -> FetchCancellation {
+    pub(in crate::node) fn cancellation(&self) -> FetchCancellation {
         self.cancellation.clone()
     }
 
-    pub(super) fn event(&self, event: &'static str) {
+    pub(in crate::node) fn event(&self, event: &'static str) {
         if let Some(metrics) = &self.metrics {
             metrics.fetch_event(event);
         }
@@ -241,7 +241,7 @@ impl ObjectFetcher {
 
     /// Call before cloning the bounded job context. Foreground caller keeps
     /// its original deadline/authority check; no new deadline starts here.
-    pub(super) async fn reserve_foreground_async(
+    pub(in crate::node) async fn reserve_foreground_async(
         self: &Arc<Self>,
         charge: usize,
         deadline: Option<Instant>,
@@ -294,7 +294,7 @@ impl ObjectFetcher {
         }
     }
 
-    pub(super) fn try_reserve_background(
+    pub(in crate::node) fn try_reserve_background(
         self: &Arc<Self>,
         charge: usize,
     ) -> Result<Option<FetchTaskPermit>> {
@@ -331,21 +331,21 @@ impl ObjectFetcher {
 
     /// The result is only existing per-request scratch, never captured source
     /// metadata. Callers must join every returned handle before returning.
-    pub(super) fn spawn_foreground_async<T: Send + 'static>(
+    pub(in crate::node) fn spawn_foreground_async<T: Send + 'static>(
         &self,
         permit: FetchTaskPermit,
         work: impl Future<Output = Result<T>> + Send + 'static,
     ) -> tokio::task::JoinHandle<Result<T>> {
         let permit = Arc::new(permit);
-        let parent = crate::node::read_pipeline::current_read_scope();
-        let scope = crate::node::read_pipeline::ReadScope {
+        let parent = crate::node::read::admission::current_read_scope();
+        let scope = crate::node::read::admission::ReadScope {
             deadline: parent
                 .as_ref()
                 .map_or_else(|| Instant::now() + Duration::from_secs(30), |s| s.deadline),
             lifetime: Arc::new((parent.map(|s| s.lifetime), permit.clone())),
         };
         self.runtime.spawn(async move {
-            let work = crate::node::read_pipeline::in_read_scope(scope, work);
+            let work = crate::node::read::admission::in_read_scope(scope, work);
             let result = match catch_async(work).await {
                 Ok(result) => result.map_err(|error| {
                     let mut end = error.message().len().min(512);
@@ -364,7 +364,7 @@ impl ObjectFetcher {
         })
     }
 
-    pub(super) fn spawn_background_async(
+    pub(in crate::node) fn spawn_background_async(
         &self,
         permit: FetchTaskPermit,
         deadline: Instant,
@@ -375,12 +375,12 @@ impl ObjectFetcher {
             return Err(stopped());
         }
         let permit = Arc::new(permit);
-        let scope = crate::node::read_pipeline::ReadScope {
+        let scope = crate::node::read::admission::ReadScope {
             deadline,
             lifetime: permit.clone(),
         };
         state.background.push(self.runtime.spawn(async move {
-            match catch_async(crate::node::read_pipeline::in_read_scope(scope, work)).await {
+            match catch_async(crate::node::read::admission::in_read_scope(scope, work)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
                     permit.owner.event("failed");
@@ -431,7 +431,7 @@ impl ObjectFetcher {
         Ok(true)
     }
 
-    pub(super) fn close(&self) {
+    pub(in crate::node) fn close(&self) {
         if let Ok(mut state) = self.state.lock() {
             state.closed = true;
         }
@@ -441,7 +441,7 @@ impl ObjectFetcher {
     }
 
     #[cfg(test)]
-    pub(super) fn join_background_for_test(&self) -> Result<()> {
+    pub(in crate::node) fn join_background_for_test(&self) -> Result<()> {
         let tasks = {
             let mut state = self
                 .state
@@ -463,7 +463,7 @@ impl ObjectFetcher {
         Ok(())
     }
 
-    pub(super) async fn shutdown(&self) -> Result<()> {
+    pub(in crate::node) async fn shutdown(&self) -> Result<()> {
         self.close();
         let background = {
             let mut state = self

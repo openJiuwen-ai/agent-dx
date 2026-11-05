@@ -157,7 +157,7 @@ impl NativeSources<'_> {
         out: &mut [u8],
         final_owned: bool,
         deadline: Option<Instant>,
-        lifetime: super::super::read_pipeline::ReadLifetime,
+        lifetime: super::super::admission::ReadLifetime,
     ) -> Result<()> {
         let remote = match LocalSource(self.engine).read(batch, out)? {
             SourceOutcome::Partial(remote) => remote,
