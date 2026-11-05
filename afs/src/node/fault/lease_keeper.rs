@@ -7,16 +7,13 @@
 //! renewal is part of their contract, the one documented exception (S1c J4)
 //! to "renewal never runs on a main path".
 
-use std::{
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::{sync::Arc, time::Duration};
 
 use afs_error::Result;
 
+use crate::clock::now_unix_ms;
 use crate::{
-    dfs::WriteLease,
-    node::vfs::dfs::{DFS_WRITE_LEASE_SECONDS, DistributedFs},
+    dfs::{DFS_WRITE_LEASE_SECONDS, WriteLease},
     runtime::{ServiceResult, Services, cancelled},
 };
 
@@ -50,35 +47,30 @@ pub(crate) fn ensure_fresh(
     Ok(())
 }
 
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
-}
-
 /// Runs `DistributedFs::renew_active_write_leases` every
 /// [`LEASE_KEEPER_PERIOD`] until shutdown.
 ///
 /// Conventions: a pass error (`dfs.writer_renewal_retry`) or a failed
 /// blocking worker (`dfs.writer_renewal_worker_failed`) is logged and retried
 /// next period; the service itself only ends at shutdown.
-pub(crate) struct LeaseKeeper {
-    fs: Arc<DistributedFs>,
+pub(crate) struct LeaseKeeper<F> {
+    renew: F,
 }
 
-impl LeaseKeeper {
-    pub(crate) fn new(fs: Arc<DistributedFs>) -> Self {
-        Self { fs }
+impl<F> LeaseKeeper<F>
+where
+    F: Fn() -> Result<usize> + Send + Sync + 'static,
+{
+    /// `renew` is one renewal pass over the filesystem's active writers
+    /// (`DistributedFs::renew_active_write_leases`).
+    pub(crate) fn new(renew: F) -> Self {
+        Self { renew }
     }
 
     /// Start the loop as one service; it stops with `services.stop`.
     pub(crate) fn start(self, services: &mut Services) {
         let stop = services.stop.subscribe();
-        let fs = self.fs;
-        services.spawn(run_lease_loop(stop, move || fs.renew_active_write_leases()));
+        services.spawn(run_lease_loop(stop, self.renew));
     }
 }
 

@@ -103,7 +103,7 @@ impl MetaService for MetaRpc {
         Ok(Response::new(register_node_reply(
             session,
             readiness,
-            super::super::store::now_unix_ms(),
+            crate::clock::now_unix_ms(),
         )))
     }
 

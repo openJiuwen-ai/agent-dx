@@ -755,7 +755,7 @@ async fn commit_without_fence_with_gc_state() -> String {
 // Commit E/J: a native write generation is admitted, fenced and retired.
 async fn commit_with_write_generation() -> String {
     let mut f = CommitFixture::new(single_copy()).await;
-    f.commit.operation_id = OperationId::new(crate::meta::store::timed_request_id("generation"));
+    f.commit.operation_id = OperationId::new(crate::clock::timed_request_id("generation"));
     f.commit.gc_fence = Some(GcFence::WriteGeneration);
     let chunk = StagedChunk::new_crc32c(f.commit.operation_id.clone(), f.body.clone())
         .unwrap()

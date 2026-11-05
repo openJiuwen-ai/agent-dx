@@ -1552,6 +1552,8 @@ async fn run_node(
     #[cfg(feature = "dfs")]
     let mut dfs_fetcher_for_shutdown: Option<Arc<read::object_fetch::ObjectFetcher>> = None;
     #[cfg(feature = "dfs")]
+    let mut dfs_gc_collector: Option<Arc<gc::Collector>> = None;
+    #[cfg(feature = "dfs")]
     let dfs_write_buffer_idle_bytes =
         usize::try_from(cfg.dfs_write_buffer_idle_bytes).map_err(|_| {
             afs_error::Error::coded(
@@ -1647,7 +1649,7 @@ async fn run_node(
         let read_engine = read::engine::DfsReadEngine::new(
             namespace.clone(),
             cfg.id.clone(),
-            chunks,
+            chunks.clone(),
             meta.clone(),
             rpc::peer::make_chunk_transfer(
                 dfs_data_mode,
@@ -1695,6 +1697,14 @@ async fn run_node(
             None => read_engine,
         });
         dfs_fetcher_for_shutdown = read_engine.object_fetcher();
+        dfs_gc_collector = gc_references.as_ref().map(|references| {
+            Arc::new(gc::Collector::new(
+                references.clone(),
+                chunks,
+                read_engine.clone(),
+                cfg.id.clone(),
+            ))
+        });
         let remote_factory = Arc::new(rpc::peer::GrpcDfsOwnerFactory::new(
             peer_connections.clone(),
             timeout,
@@ -2005,8 +2015,10 @@ async fn run_node(
     }
     #[cfg(feature = "dfs")]
     if let Some(dfs) = state.dfs.clone() {
-        fault::reaper::Reaper::new(dfs.clone()).start(&mut services);
-        fault::lease_keeper::LeaseKeeper::new(dfs.clone()).start(&mut services);
+        fault::reaper::Reaper::new(dfs_gc_collector.clone()).start(&mut services);
+        let renewing = dfs.clone();
+        fault::lease_keeper::LeaseKeeper::new(move || renewing.renew_active_write_leases())
+            .start(&mut services);
         let stop = services.stop.subscribe();
         let native_notify = dfs.native_writeback_notify();
         let native_commit_period = std::time::Duration::from_millis(cfg.dfs_background_commit_ms);

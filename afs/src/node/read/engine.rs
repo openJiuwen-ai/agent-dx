@@ -13,7 +13,7 @@ use std::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 mod async_prepare;
@@ -23,6 +23,7 @@ pub use super::object_fetch::PrefetchControl;
 use afs_error::{Error, Result};
 use afs_tracing::tracing;
 
+use crate::clock::now_unix_ms;
 use crate::{
     dfs::{
         AuthorizeCurrentExternalRead, AuthorizeCurrentExternalReadReply,
@@ -591,13 +592,9 @@ impl DfsReadEngine {
         self.local.coarse_diagnostic("meta_publish_rpc", 0)
     }
 
-    pub(crate) fn gc_generation(&self) -> Result<u64> {
-        self.local.gc_generation()
-    }
-    pub(crate) fn gc_inventory(&self) -> Result<Vec<crate::dfs::ChunkObject>> {
-        self.local.gc_inventory()
-    }
-    pub(crate) fn collect_generation(&self, generation: u64, chunks: &[ChunkId]) -> Result<usize> {
+    /// Forget cached readers of `chunks` and every cached source list before
+    /// GC retires those local copies (`node::gc::Collector`).
+    pub(crate) fn evict_collected(&self, chunks: &[ChunkId]) -> Result<()> {
         self.readers
             .lock()
             .map_err(|_| unavailable("reader cache poisoned"))?
@@ -606,7 +603,7 @@ impl DfsReadEngine {
             .lock()
             .map_err(|_| unavailable("source cache poisoned"))?
             .retain(|_, _| false);
-        self.local.lifecycle().retire_generation(generation, chunks)
+        Ok(())
     }
 
     pub fn new(
@@ -965,15 +962,6 @@ impl DfsReadEngine {
         self.check_native_read_authority(&authority)?;
         Ok(Some(result))
     }
-}
-
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 pub struct UnimplementedReadSourceProvider;

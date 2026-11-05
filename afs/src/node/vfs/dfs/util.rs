@@ -119,14 +119,7 @@ pub(super) fn file_attributes_from_owner_attr(
     })
 }
 
-pub(super) fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
-}
+pub(super) use crate::clock::now_unix_ms;
 
 fn unix_ms(value: u64) -> SystemTime {
     UNIX_EPOCH + std::time::Duration::from_millis(value)

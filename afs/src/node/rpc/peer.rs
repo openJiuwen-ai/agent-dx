@@ -26,7 +26,10 @@ use crate::{
     dfs::ChunkObject,
     node::{
         chunk::outboard::{ChunkOutboard, OutboardBudget, OutboardBuilder, SharedOutboard},
-        read::peer_cache::{CompletedPeerDiskRead, PeerStreamSink, VerifiedPeerChunk},
+        read::peer_cache::{
+            CompletedPeerDiskRead, PeerObjectProof, PeerStreamProof, PeerStreamSink,
+            VerifiedPeerChunk,
+        },
         read_work::{
             ReadDiagnosticConsumer, ReadDiagnosticConsumerStage, ReadDiagnosticIntervals,
             ReadDiagnosticProducer, ReadDiagnosticStage, ReadWorkMetrics,
@@ -120,9 +123,11 @@ mod dfs_replica_plane;
 mod dfs_stream_work;
 mod pool;
 #[cfg(feature = "dfs")]
+use crate::node::vfs::dfs::owner_api::RemoteDfsOwner;
+#[cfg(feature = "dfs")]
 pub use dfs_grpc_transfer::GrpcChunkTransfer;
 #[cfg(feature = "dfs")]
-pub use dfs_owner_client::{GrpcDfsOwnerClient, GrpcDfsOwnerFactory, RemoteDfsOwner};
+pub use dfs_owner_client::{GrpcDfsOwnerClient, GrpcDfsOwnerFactory};
 #[cfg(all(feature = "dfs", feature = "rdma"))]
 use dfs_rdma_transfer::*;
 #[cfg(feature = "dfs")]
@@ -131,8 +136,6 @@ pub use dfs_rdma_transfer::{RdmaChunkTransfer, make_chunk_transfer};
 pub(in crate::node) use dfs_read_decode::complete_peer_disk_read_for_test;
 #[cfg(feature = "dfs")]
 use dfs_read_decode::*;
-#[cfg(feature = "dfs")]
-pub(in crate::node) use dfs_read_decode::{CompletedPeerObjectProof, CompletedPeerStreamProof};
 #[cfg(all(test, feature = "dfs"))]
 pub(crate) use dfs_replica_plane::replica_header;
 #[cfg(all(feature = "dfs", any(feature = "rdma", test)))]

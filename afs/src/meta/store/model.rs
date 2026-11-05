@@ -537,13 +537,6 @@ pub struct OwnerRootScan {
     pub reservations: Vec<RootReservationRecord>,
 }
 
-/// Authority operations required by Meta business services.
-///
-/// Constructs the stable identity reused by filesystem mutation retries.
-pub fn timed_request_id(id: impl std::fmt::Display) -> String {
-    format!("afs1-{}-{id}", now_unix_ms())
-}
-
 impl fmt::Display for StoreRevision {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)

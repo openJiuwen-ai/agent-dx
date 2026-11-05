@@ -199,7 +199,7 @@ pub async fn register_node_with_readiness(
     let mut client = MetaClient::new(afs_tracing::traced_channel(channel));
     let reply = client
         .register_node(RegisterNodeRequest {
-            request_id: crate::meta::store::timed_request_id(format!(
+            request_id: crate::clock::timed_request_id(format!(
                 "register-{}-{}",
                 node.session_id,
                 REGISTER_SEQUENCE.fetch_add(1, Ordering::Relaxed),

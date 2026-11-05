@@ -1,9 +1,10 @@
 //! Owner-side service contracts of the DFS write proxy.
 //!
 //! The RPC layer (`node::rpc::control` / `node::rpc::data`) decodes requests
-//! and dispatches to these traits; the file layer implements them. Defining
-//! them here keeps the dependency pointing from transport to file layer
-//! (ledger R47 / S1b H4).
+//! and dispatches to the handler traits; the file layer implements them. The
+//! caller-side `RemoteDfsOwner` is defined here too and implemented by
+//! `node::rpc::peer`. Defining them here keeps the dependency pointing from
+//! transport to file layer (ledger R47 / S1b H4).
 use afs_protocol::{
     node_control::{
         DfsOwnerAcknowledgeLockWaitReply, DfsOwnerAcknowledgeLockWaitRequest,
@@ -21,6 +22,122 @@ use afs_protocol::{
 };
 
 use crate::node::vfs::types::OpenOptions;
+
+/// Caller side of the same proxy: forwards operations on an already-open DFS
+/// writer handle to its inode owner. The transport (`node::rpc::peer`)
+/// implements it. There is deliberately no automatic retry/fallback of
+/// mutating operations after an uncertain reply. Blocking calls honor the
+/// calling thread's `crate::node::call_deadline` scope.
+pub trait RemoteDfsOwner: Send + Sync {
+    fn open(
+        &self,
+        request: afs_protocol::node_control::DfsOwnerOpenRequest,
+    ) -> afs_error::Result<afs_protocol::node_control::DfsOwnerOpenReply>;
+    fn getattr(
+        &self,
+        request: afs_protocol::node_control::DfsOwnerGetAttrRequest,
+    ) -> afs_error::Result<afs_protocol::node_control::DfsOwnerGetAttrReply>;
+    fn release(
+        &self,
+        request: afs_protocol::node_control::DfsOwnerReleaseRequest,
+    ) -> afs_error::Result<afs_protocol::node_control::DfsOwnerReleaseReply>;
+    fn get_lock(
+        &self,
+        request: afs_protocol::node_control::DfsOwnerGetLockRequest,
+    ) -> afs_error::Result<afs_protocol::node_control::DfsOwnerGetLockReply>;
+    fn set_lock(
+        &self,
+        request: afs_protocol::node_control::DfsOwnerSetLockRequest,
+    ) -> afs_error::Result<afs_protocol::node_control::DfsOwnerSetLockReply>;
+    fn cancel_lock_wait(
+        &self,
+        request: afs_protocol::node_control::DfsOwnerCancelLockWaitRequest,
+    ) -> afs_error::Result<afs_protocol::node_control::DfsOwnerCancelLockWaitReply>;
+    fn acknowledge_lock_wait(
+        &self,
+        request: afs_protocol::node_control::DfsOwnerAcknowledgeLockWaitRequest,
+    ) -> afs_error::Result<afs_protocol::node_control::DfsOwnerAcknowledgeLockWaitReply>;
+    fn release_locks(
+        &self,
+        request: afs_protocol::node_control::DfsOwnerReleaseLocksRequest,
+    ) -> afs_error::Result<afs_protocol::node_control::DfsOwnerReleaseLocksReply>;
+    fn release_lock_session(
+        &self,
+        request: afs_protocol::node_control::DfsOwnerReleaseLockSessionRequest,
+    ) -> afs_error::Result<afs_protocol::node_control::DfsOwnerReleaseLockSessionReply>;
+    fn read_async(
+        &self,
+        request: afs_protocol::node_data::DfsOwnerReadRequest,
+    ) -> crate::node::read::admission::ReadFuture<'_, afs_protocol::node_data::DfsOwnerReadReply>
+    {
+        Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.read(request)) })
+    }
+    fn read(
+        &self,
+        request: afs_protocol::node_data::DfsOwnerReadRequest,
+    ) -> afs_error::Result<afs_protocol::node_data::DfsOwnerReadReply>;
+    fn write(
+        &self,
+        request: afs_protocol::node_data::DfsOwnerWriteRequest,
+    ) -> afs_error::Result<afs_protocol::node_data::DfsOwnerWriteReply>;
+    fn resize(
+        &self,
+        request: afs_protocol::node_data::DfsOwnerResizeRequest,
+    ) -> afs_error::Result<afs_protocol::node_data::DfsOwnerResizeReply>;
+    fn sync(
+        &self,
+        request: afs_protocol::node_data::DfsOwnerSyncRequest,
+    ) -> afs_error::Result<afs_protocol::node_data::DfsOwnerSyncReply>;
+
+    // Callable on an async worker. A default leaves the worker for the sync
+    // method; a network client overrides these with its native future.
+    fn open_async(
+        &self,
+        request: afs_protocol::node_control::DfsOwnerOpenRequest,
+    ) -> crate::node::read::admission::ReadFuture<'_, afs_protocol::node_control::DfsOwnerOpenReply>
+    {
+        Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.open(request)) })
+    }
+    fn getattr_async(
+        &self,
+        request: afs_protocol::node_control::DfsOwnerGetAttrRequest,
+    ) -> crate::node::read::admission::ReadFuture<
+        '_,
+        afs_protocol::node_control::DfsOwnerGetAttrReply,
+    > {
+        Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.getattr(request)) })
+    }
+    fn release_async(
+        &self,
+        request: afs_protocol::node_control::DfsOwnerReleaseRequest,
+    ) -> crate::node::read::admission::ReadFuture<
+        '_,
+        afs_protocol::node_control::DfsOwnerReleaseReply,
+    > {
+        Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.release(request)) })
+    }
+    fn write_async(
+        &self,
+        request: afs_protocol::node_data::DfsOwnerWriteRequest,
+    ) -> crate::node::read::admission::ReadFuture<'_, afs_protocol::node_data::DfsOwnerWriteReply>
+    {
+        Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.write(request)) })
+    }
+    fn resize_async(
+        &self,
+        request: afs_protocol::node_data::DfsOwnerResizeRequest,
+    ) -> crate::node::read::admission::ReadFuture<'_, afs_protocol::node_data::DfsOwnerResizeReply>
+    {
+        Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.resize(request)) })
+    }
+    fn sync_async(
+        &self,
+        request: afs_protocol::node_data::DfsOwnerSyncRequest,
+    ) -> crate::node::read::admission::ReadFuture<'_, afs_protocol::node_data::DfsOwnerSyncReply>
+    {
+        Box::pin(async move { crate::node::bridge::run_sync_backend(|| self.sync(request)) })
+    }
+}
 
 /// A request being served on an async worker. It owns what it needs, so the RPC
 /// layer can run it detached from the caller's cancellation.

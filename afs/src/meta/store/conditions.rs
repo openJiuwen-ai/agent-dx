@@ -6,14 +6,6 @@ pub(super) fn invalid_contract(message: impl Into<String>) -> Error {
     Error::coded(afs_error::META_CATALOG_INVALID_REQUEST, message)
 }
 
-pub(crate) fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| {
-            u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-        })
-}
-
 pub(in crate::meta) fn entity_key(entity: &MetaEntity) -> MetaKey {
     match entity {
         MetaEntity::RootEpochWatermark(_) => MetaKey::RootEpochWatermark,

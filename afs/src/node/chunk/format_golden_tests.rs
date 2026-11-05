@@ -57,7 +57,7 @@ fn snapshot_bytes() -> Vec<u8> {
     for record in [record("b", 3, None), record("a", 2, Some(crc_table()))] {
         catalog.records.insert(record.chunk.id.clone(), record);
     }
-    gc::save_checkpoint(temp.path(), &catalog).unwrap();
+    checkpoint::save_checkpoint(temp.path(), &catalog).unwrap();
     std::fs::read(temp.path().join("catalog.snapshot")).unwrap()
 }
 

@@ -1,43 +1,47 @@
 //! Reaper: the Node's background garbage-collection loop.
 //!
-//! One pass asks Meta which GC generation this node must collect and, when it
-//! is waiting on this node, retires those local copies through the copy
-//! lifecycle. Pins (`node::gc`) stay with the paths that take them. S3 mode
-//! has no references, so its passes return 0 (orphan reclaim is R05).
+//! One pass (`node::gc::Collector::collect_once`) asks Meta which GC
+//! generation this node must collect and, when it is waiting on this node,
+//! retires those local copies through the copy lifecycle. Pins (`node::gc`)
+//! stay with the paths that take them. S3 mode has no references and no
+//! collector, so its passes return 0 (orphan reclaim is R05).
 
 use std::{sync::Arc, time::Duration};
 
 use afs_error::Result;
 
 use crate::{
-    node::{gc::GcReferences, read::engine::DfsReadEngine, vfs::dfs::DistributedFs},
+    node::gc::Collector,
     runtime::{ServiceResult, Services, cancelled},
 };
 
 /// Period of the reaping loop.
 const REAPER_PERIOD: Duration = Duration::from_secs(5);
 
-/// Runs `DistributedFs::collect_garbage` every [`REAPER_PERIOD`] until
-/// shutdown.
+/// Runs `Collector::collect_once` every [`REAPER_PERIOD`] until shutdown.
 ///
 /// Conventions: a collected count above zero is logged (`dfs.gc_collected`);
 /// a pass error (`dfs.gc_retry`) or a failed blocking worker
 /// (`dfs.gc_worker_failed`) is logged and retried next period; the service
 /// itself only ends at shutdown.
 pub(crate) struct Reaper {
-    fs: Arc<DistributedFs>,
+    collector: Option<Arc<Collector>>,
 }
 
 impl Reaper {
-    pub(crate) fn new(fs: Arc<DistributedFs>) -> Self {
-        Self { fs }
+    pub(crate) fn new(collector: Option<Arc<Collector>>) -> Self {
+        Self { collector }
     }
 
     /// Start the loop as one service; it stops with `services.stop`.
     pub(crate) fn start(self, services: &mut Services) {
         let stop = services.stop.subscribe();
-        let fs = self.fs;
-        services.spawn(run_reaper_loop(stop, move || fs.collect_garbage()));
+        let collector = self.collector;
+        services.spawn(run_reaper_loop(stop, move || {
+            collector
+                .as_ref()
+                .map_or(Ok(0), |collector| collector.collect_once())
+        }));
     }
 }
 
@@ -63,28 +67,6 @@ async fn run_reaper_loop(
             }
         }
     }
-}
-
-/// One collection pass. The caller holds the collection gate, so passes never
-/// overlap. Releases are flushed first; local copies are retired only when
-/// Meta's batch waits on this node for a newer generation, and completion is
-/// acknowledged with an empty inventory.
-pub(crate) fn collect_once(
-    references: &GcReferences,
-    read_engine: &DfsReadEngine,
-    node_id: &str,
-) -> Result<usize> {
-    references.flush()?;
-    let completed = read_engine.gc_generation()?;
-    let batch = references
-        .control
-        .collect(completed, read_engine.gc_inventory()?)?;
-    if batch.waiting_nodes.iter().any(|node| node == node_id) && batch.generation > completed {
-        read_engine.collect_generation(batch.generation, &batch.chunks)?;
-        references.control.collect(batch.generation, Vec::new())?;
-        return Ok(batch.chunks.len());
-    }
-    Ok(0)
 }
 
 #[cfg(test)]

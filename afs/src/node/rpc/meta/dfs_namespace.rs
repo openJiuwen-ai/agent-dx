@@ -48,7 +48,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
                         name: name.to_vec(),
                         attributes: Some(wire_dfs_attributes(attributes)),
                         owner_session_id: self.session_id.clone(),
-                        lease_seconds: crate::node::vfs::dfs::DFS_WRITE_LEASE_SECONDS,
+                        lease_seconds: crate::dfs::DFS_WRITE_LEASE_SECONDS,
                     }))?
                     .into_inner();
                 Ok((
@@ -263,7 +263,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
                                 owner_session_id: self.session_id.clone(),
                                 operation_id: self.request_id(),
                                 inode_id: inode_id.0.clone(),
-                                lease_seconds: crate::node::vfs::dfs::DFS_WRITE_LEASE_SECONDS,
+                                lease_seconds: crate::dfs::DFS_WRITE_LEASE_SECONDS,
                             }),
                     )?
                     .into_inner();
@@ -286,7 +286,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
                     owner_session_id: self.session_id.clone(),
                     operation_id: self.request_id(),
                     inode_id: inode_id.0.clone(),
-                    lease_seconds: crate::node::vfs::dfs::DFS_WRITE_LEASE_SECONDS,
+                    lease_seconds: crate::dfs::DFS_WRITE_LEASE_SECONDS,
                 },
             ))?
             .into_inner();
@@ -328,7 +328,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
                             owner_session_id: self.session_id.clone(),
                             operation_id: self.request_id(),
                             inode_id: inode_id.0,
-                            lease_seconds: crate::node::vfs::dfs::DFS_WRITE_LEASE_SECONDS,
+                            lease_seconds: crate::dfs::DFS_WRITE_LEASE_SECONDS,
                         },
                     ))
                     .await?
@@ -363,7 +363,7 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
                             owner_session_id: self.session_id.clone(),
                             operation_id: self.request_id(),
                             current_lease: Some(wire_dfs_write_lease(lease)),
-                            lease_seconds: crate::node::vfs::dfs::DFS_WRITE_LEASE_SECONDS,
+                            lease_seconds: crate::dfs::DFS_WRITE_LEASE_SECONDS,
                         },
                     ))?
                     .into_inner();

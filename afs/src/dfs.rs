@@ -937,6 +937,10 @@ pub struct ReportChunkCorruption {
     pub catalog_revision: u64,
 }
 
+/// Term a Node requests for a DFS writer lease; the lease keeper renews at
+/// two thirds of it.
+pub const DFS_WRITE_LEASE_SECONDS: u64 = 30;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WriteLease {
     pub inode_id: InodeId,

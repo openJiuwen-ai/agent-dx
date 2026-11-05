@@ -22,7 +22,7 @@ impl NodeIdentity {
     }
 
     pub(super) fn operation_id(&self, prefix: &str) -> OperationId {
-        OperationId::new(crate::meta::store::timed_request_id(format!(
+        OperationId::new(crate::clock::timed_request_id(format!(
             "{}-{prefix}-{}",
             self.session_id,
             self.next_operation.fetch_add(1, Ordering::Relaxed)

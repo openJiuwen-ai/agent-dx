@@ -1493,7 +1493,7 @@ mod retention_tests {
             .await
             .unwrap(),
         );
-        let key = || RequestKey::new("node", crate::meta::store::timed_request_id(uuid_id()));
+        let key = || RequestKey::new("node", crate::clock::timed_request_id(uuid_id()));
         store
             .register_node_session(
                 key(),

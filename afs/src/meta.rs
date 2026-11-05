@@ -154,7 +154,7 @@ impl Meta {
             .await?;
         Ok(match snapshot.entity {
             Some(store::MetaEntity::NodeSession(session))
-                if session.is_live_at_unix_ms(store::now_unix_ms()) =>
+                if session.is_live_at_unix_ms(crate::clock::now_unix_ms()) =>
             {
                 Some(session)
             }

@@ -44,8 +44,8 @@ impl LocalCatalog {
     }
 
     pub(super) fn recover(path: &Path) -> Result<Self> {
-        let mut catalog =
-            gc::load_checkpoint(&path.with_file_name("catalog.snapshot"))?.unwrap_or_default();
+        let mut catalog = checkpoint::load_checkpoint(&path.with_file_name("catalog.snapshot"))?
+            .unwrap_or_default();
         let base_revision = catalog.revision;
         if !path.exists() {
             return Ok(catalog);

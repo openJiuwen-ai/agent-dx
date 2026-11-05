@@ -14,10 +14,12 @@ use std::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use afs_error::{Error, Result};
+
+use crate::clock::now_unix_ms;
 use afs_tracing::{Instrument, tracing};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
@@ -56,7 +58,6 @@ mod read_view;
 mod txn;
 use admission::*;
 pub(super) use conditions::entity_key;
-pub(crate) use conditions::now_unix_ms;
 use conditions::*;
 pub(crate) use engine::StoreOptions;
 use engine::*;
@@ -67,7 +68,6 @@ pub use model::{
     NodeSessionLease, OwnerRootScan, RecoveryCursor, RecoveryReason, RecoveryScan, RequestKey,
     RootAccessGrant, RootCommandAck, RootCommandRecord, RootCommandType, RootRecord,
     RootReservationRecord, RootRight, StoreRevision, WatchBatch, WatchChange, WatchEvent,
-    timed_request_id,
 };
 pub(crate) use model::{
     WATCH_RESPONSE_BASE_BYTES, WATCH_RESPONSE_MAX_BYTES, WATCH_RESPONSE_MAX_EVENTS,

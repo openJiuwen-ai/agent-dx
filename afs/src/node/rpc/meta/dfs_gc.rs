@@ -123,7 +123,7 @@ impl GrpcDfsMeta {
                     session_id: self.session_id.clone(),
                     reference_id: id.into(),
                     admission_deadline_unix_ms: if inode.is_some() && !release {
-                        crate::meta::store::now_unix_ms().saturating_add(30_000)
+                        crate::clock::now_unix_ms().saturating_add(30_000)
                     } else {
                         0
                     },

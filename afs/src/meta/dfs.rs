@@ -5,11 +5,11 @@ mod gc;
 use std::{
     collections::{BTreeSet, HashSet},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use afs_error::{Error, Result};
 
+use crate::clock::now_unix_ms;
 use crate::dfs::{
     CallerContext, ChunkObject, ChunkSources, ClaimReplicationTask, CommitFileVersion,
     CommitMetadataMode, CopyId, CopyLocation, CopyRecord, CopyRole, CopyState, Dentry, DentryKey,
@@ -429,15 +429,6 @@ fn root_inode(namespace_id: NamespaceId) -> InodeRecord {
         xattrs: Default::default(),
         revision: 1,
     }
-}
-
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 fn lease_expiry(lease_seconds: u64) -> Result<u64> {

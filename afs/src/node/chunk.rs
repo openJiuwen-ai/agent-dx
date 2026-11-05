@@ -21,7 +21,8 @@ use std::{
 };
 
 mod catalog_commit;
-mod gc;
+mod checkpoint;
+mod collect;
 #[cfg(any(feature = "dfs", test))]
 mod native_live;
 #[cfg(test)]

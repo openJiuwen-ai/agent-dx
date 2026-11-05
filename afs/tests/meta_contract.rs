@@ -307,7 +307,7 @@ async fn dfs_gc_fence_capture_requires_a_write_reference_before_any_mutation() {
     let reply = rpc
         .update_gc_reference(Request::new(capture(&format!(
             "write:{}",
-            afs::meta::store::timed_request_id("capture")
+            afs::clock::timed_request_id("capture")
         ))))
         .await
         .unwrap()

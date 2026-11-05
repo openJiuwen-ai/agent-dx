@@ -12,18 +12,18 @@ pub(in crate::node) struct CompletedPeerStreamProof {
 }
 
 #[cfg(feature = "dfs")]
-impl CompletedPeerStreamProof {
-    pub(in crate::node) fn into_outboard(self) -> Option<SharedOutboard> {
+impl PeerStreamProof for CompletedPeerStreamProof {
+    fn into_outboard(self) -> Option<SharedOutboard> {
         self.outboard
     }
 
-    pub(in crate::node) fn binding(&self) -> &crate::node::read::peer_cache::PeerStreamBinding {
+    fn binding(&self) -> &crate::node::read::peer_cache::PeerStreamBinding {
         &self.binding
     }
-    pub(in crate::node) fn chunk(&self) -> &ChunkObject {
+    fn chunk(&self) -> &ChunkObject {
         &self.chunk
     }
-    pub(in crate::node) fn root_digest(&self) -> &[u8; 32] {
+    fn root_digest(&self) -> &[u8; 32] {
         &self.root_digest
     }
 }
@@ -130,16 +130,16 @@ pub(in crate::node) struct CompletedPeerObjectProof<'a> {
 }
 
 #[cfg(feature = "dfs")]
-impl<'a> CompletedPeerObjectProof<'a> {
-    pub(in crate::node) fn into_outboard(self) -> Option<SharedOutboard> {
+impl<'a> PeerObjectProof<'a> for CompletedPeerObjectProof<'a> {
+    fn into_outboard(self) -> Option<SharedOutboard> {
         self.outboard
     }
 
-    pub(in crate::node) fn bytes(&self) -> &'a [u8] {
+    fn bytes(&self) -> &'a [u8] {
         self.bytes
     }
 
-    pub(in crate::node) fn root_digest(&self) -> &[u8; 32] {
+    fn root_digest(&self) -> &[u8; 32] {
         &self.root_digest
     }
 }

@@ -119,7 +119,7 @@ impl GrpcRootMeta {
     }
 
     fn request_id(&self) -> String {
-        crate::meta::store::timed_request_id(format!(
+        crate::clock::timed_request_id(format!(
             "{}-{}",
             self.session_id,
             self.sequence.fetch_add(1, Ordering::Relaxed)

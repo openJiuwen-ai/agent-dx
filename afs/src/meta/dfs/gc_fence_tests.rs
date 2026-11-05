@@ -14,7 +14,7 @@ struct Fixture {
 
 async fn generation_fixture() -> Fixture {
     let mut f = fixture().await;
-    f.commit.operation_id = OperationId::new(crate::meta::store::timed_request_id("generation"));
+    f.commit.operation_id = OperationId::new(crate::clock::timed_request_id("generation"));
     f.commit.chunk_receipts[0].operation_id = f.commit.operation_id.clone();
     let staged =
         StagedChunk::new_crc32c(f.commit.operation_id.clone(), f.staged.bytes().to_vec()).unwrap();
@@ -138,9 +138,8 @@ async fn generation_retry_can_publish_retained_receipts_only_while_all_birth_gen
                 .await
                 .unwrap();
         }
-        f.commit.operation_id = OperationId::new(crate::meta::store::timed_request_id(
-            "retry-with-new-writes",
-        ));
+        f.commit.operation_id =
+            OperationId::new(crate::clock::timed_request_id("retry-with-new-writes"));
         f.service
             .update_gc_reference(generation_admission(&f, false))
             .await
@@ -617,7 +616,7 @@ async fn new_operation_on_same_node_admits_normally_after_tombstone_collection()
         .collect_garbage("writer".into(), "writer-session".into(), 0, vec![])
         .await
         .unwrap();
-    f.commit.operation_id = OperationId::new(crate::meta::store::timed_request_id("next-op"));
+    f.commit.operation_id = OperationId::new(crate::clock::timed_request_id("next-op"));
     let fresh = crate::dfs::UpdateGcReference {
         node_id: "writer".into(),
         session_id: "writer-session".into(),

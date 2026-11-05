@@ -35,11 +35,13 @@ use crate::{
 
 mod fill;
 mod operation;
+mod proof;
 mod sink;
 mod state;
 mod store;
 use fill::*;
 use operation::*;
+pub(in crate::node) use proof::{PeerObjectProof, PeerStreamProof};
 pub(in crate::node) use sink::PeerStreamBinding;
 pub use sink::{CompletedPeerDiskRead, PeerStreamSink, VerifiedPeerChunk};
 use state::*;

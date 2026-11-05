@@ -54,7 +54,7 @@ impl<'a> VerifiedPeerChunk<'a> {
     pub(in crate::node) fn from_completed_stream(
         chunk: &'a ChunkObject,
         bytes: &'a [u8],
-        proof: crate::node::rpc::peer::CompletedPeerObjectProof<'a>,
+        proof: impl PeerObjectProof<'a>,
     ) -> Result<Self> {
         validate_chunk(chunk)?;
         if bytes.len() as u64 != chunk.length
@@ -342,7 +342,7 @@ impl PeerStreamSink<'_> {
 
     pub(in crate::node) fn seal_completed<'output>(
         &mut self,
-        proof: crate::node::rpc::peer::CompletedPeerStreamProof,
+        proof: impl PeerStreamProof,
         requested_offset: u64,
         output: &'output [u8],
     ) -> Result<CompletedPeerDiskRead<'output>> {

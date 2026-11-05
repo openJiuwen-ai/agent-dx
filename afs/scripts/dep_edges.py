@@ -53,6 +53,18 @@ EDGES = {
     "D-meta-node": (under("src/meta"), re.compile(r"crate::node::"), 0),
     "D-data-rpc": (data_layer, RPC, 0),
     "D-file-access": (under("src/node/vfs"), re.compile(r"node::fuse::"), 1),
+    # The fault loops reach the file layer only through what `run_node` hands
+    # them (a `gc::Collector`, a renewal closure); `vfs/dfs -> fault` stays.
+    "D-fault-vfs": (under("src/node/fault"), re.compile(r"\bvfs::"), 0),
+    # GC execution lives in `node/gc`; the read engine only evicts its caches.
+    "D-read-gc": (under("src/node/read"), re.compile(r"\bfn (gc_\w+|collect_generation)\b"), 0),
+    # Peer proofs: only the two decoder receipts in `rpc/peer` may implement the
+    # data-layer proof traits (pinned, not a ceiling to grow into).
+    "N-peer-proof-impls": (
+        under("src"),
+        re.compile(r"^\s*impl\b.*\bPeer(Object|Stream)Proof\b.*\bfor\b"),
+        2,
+    ),
 }
 
 

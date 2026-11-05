@@ -1,4 +1,5 @@
-//! References outlive in-flight handle users. Drops enqueue durable release retries.
+//! GC reference pins. References outlive in-flight handle users; drops
+//! enqueue durable release retries.
 use crate::dfs::{ChunkObject, FileVersionId, GcState, InodeId};
 use afs_error::{Error, Result};
 use std::sync::{
@@ -103,7 +104,7 @@ impl GcReferences {
             ),
             None => format!(
                 "open:{}",
-                crate::meta::store::timed_request_id(format!(
+                crate::clock::timed_request_id(format!(
                     "{}-{}",
                     std::process::id(),
                     self.sequence.fetch_add(1, Ordering::Relaxed)

@@ -447,7 +447,7 @@ impl DfsService {
     ) -> Result<bool> {
         let key = RequestKey::new(
             "afs-meta",
-            super::super::store::timed_request_id(format!(
+            crate::clock::timed_request_id(format!(
                 "gc-{}-{}",
                 std::process::id(),
                 GC_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)

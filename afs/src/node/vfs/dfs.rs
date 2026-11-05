@@ -70,6 +70,7 @@ use lock_proxy_client::*;
 pub use meta_port::{DfsMeta, DfsNodeLocation, DfsRemoteOwnerFactory};
 pub(crate) use native_pipeline::NativeWriteConfig;
 use native_pipeline::*;
+use owner_api::RemoteDfsOwner;
 use owner_gateway::*;
 use owner_op_table::*;
 use remote_client::*;
@@ -110,10 +111,8 @@ use crate::{
         BoundedLru, ChunkReadOp, CurrentExternalReadOutcome, DfsReadEngine,
         NativeReadAuthoritySnapshot, ReadBatch,
     },
-    node::rpc::peer::RemoteDfsOwner,
 };
 
-pub const DFS_WRITE_LEASE_SECONDS: u64 = 30;
 pub const DEFAULT_DIRTY_DATA_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
 const ROOT_INODE: u64 = 1;
 const DEFAULT_VERSION_CACHE_ENTRIES: usize = 4096;
