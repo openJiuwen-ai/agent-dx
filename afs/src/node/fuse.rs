@@ -253,6 +253,51 @@ impl AfsFuse {
         (Some(guard), result)
     }
 
+    /// Inline local read on the FUSE thread into the reusable scratch buffer,
+    /// which stays locked through the reply.
+    #[allow(clippy::too_many_arguments)]
+    fn read_inline_local(
+        &self,
+        context: &RequestContext,
+        ino: u64,
+        fh: u64,
+        offset: u64,
+        size: usize,
+        fuse_span: &tracing::Span,
+        request_span: &tracing::Span,
+        #[cfg(any(feature = "dfs", test))] diagnostic: Option<
+            crate::node::metrics::read_timing::ReadDiagnosticSpan,
+        >,
+        reply: ReplyData,
+    ) {
+        let mut scratch = self.inline_local_read_scratch.lock().unwrap();
+        let result = fuse_span.in_scope(|| {
+            tracing::info_span!("node.fuse.read.execute").in_scope(|| {
+                fuse_span.record("queue_wait_us", 0_u64);
+                let file = self.state.lock().unwrap().file_handle(fh);
+                let file = file.ok_or(libc::ESTALE).and_then(|file| {
+                    AfsFuse::validate_handle_inode_in(&self.state, ino).map(|()| file)
+                });
+                match file {
+                    Ok(file) => inline_local_read_data(&mut scratch, size, |out| {
+                        self.backend
+                            .read(context, file.handle, offset, out)
+                            .map_err(errno_in(FuseOp::Read))
+                    }),
+                    Err(error) => Err(error),
+                }
+            })
+        });
+        finish_read_reply(
+            #[cfg(any(feature = "dfs", test))]
+            diagnostic,
+            result,
+            fuse_span,
+            request_span,
+            reply,
+        );
+    }
+
     fn file_dispatch_key(&self, inode: u64, handle: u64) -> u64 {
         if self.front_write.is_some() {
             inode
@@ -431,6 +476,36 @@ impl Drop for AfsFuse {
     fn drop(&mut self) {
         self.finish_callbacks();
     }
+}
+
+/// Replies with one synchronous read result. Success records the returned
+/// length on the request spans; the diagnostic still ends after the reply.
+fn finish_read_reply<D: AsRef<[u8]>>(
+    #[cfg(any(feature = "dfs", test))] diagnostic: Option<
+        crate::node::metrics::read_timing::ReadDiagnosticSpan,
+    >,
+    result: std::result::Result<D, i32>,
+    fuse_span: &tracing::Span,
+    request_span: &tracing::Span,
+    reply: ReplyData,
+) {
+    #[cfg(any(feature = "dfs", test))]
+    let success = result.is_ok();
+    complete_read_reply(
+        #[cfg(any(feature = "dfs", test))]
+        diagnostic,
+        #[cfg(any(feature = "dfs", test))]
+        success,
+        || match result {
+            Ok(data) => {
+                let data = data.as_ref();
+                fuse_span.record("returned_bytes", data.len() as u64);
+                tracing::info_span!(parent: request_span, "node.fuse.read.reply", returned_bytes = data.len() as u64)
+                    .in_scope(|| reply.data(data))
+            }
+            Err(error) => reply.error(fuse_errno(error)),
+        },
+    );
 }
 
 impl Filesystem for AfsFuse {
@@ -1213,77 +1288,48 @@ impl Filesystem for AfsFuse {
             returned_bytes = tracing::field::Empty,
         );
         if inline_local_read {
-            let mut scratch = self.inline_local_read_scratch.lock().unwrap();
-            let result = fuse_span.in_scope(|| {
-                tracing::info_span!("node.fuse.read.execute").in_scope(|| {
-                    fuse_span.record("queue_wait_us", 0_u64);
-                    let file = state.lock().unwrap().file_handle(fh);
-                    let file = file.ok_or(libc::ESTALE).and_then(|file| {
-                        AfsFuse::validate_handle_inode_in(&state, ino).map(|()| file)
-                    });
-                    match file {
-                        Ok(file) => inline_local_read_data(&mut scratch, size as usize, |out| {
-                            backend
-                                .read(&context, file.handle, offset, out)
-                                .map_err(errno_in(FuseOp::Read))
-                        }),
-                        Err(error) => Err(error),
-                    }
-                })
-            });
-            #[cfg(any(feature = "dfs", test))]
-            let success = result.is_ok();
-            complete_read_reply(
+            self.read_inline_local(
+                &context,
+                ino,
+                fh,
+                offset,
+                size as usize,
+                &fuse_span,
+                &request_span,
                 #[cfg(any(feature = "dfs", test))]
                 diagnostic,
-                #[cfg(any(feature = "dfs", test))]
-                success,
-                || match result {
-                    Ok(data) => {
-                        fuse_span.record("returned_bytes", data.len() as u64);
-                        tracing::info_span!(parent: &request_span, "node.fuse.read.reply", returned_bytes = data.len() as u64)
-                        .in_scope(|| reply.data(&data))
-                    }
-                    Err(error) => reply.error(fuse_errno(error)),
-                },
+                reply,
             );
             return;
         }
         let run = move || {
             let _front_guard = _front_guard;
-            let cache_gate = if cached_io {
-                match cache_gates.acquire(ino) {
-                    Ok(gate) => Some(gate),
-                    Err(error) => {
-                        complete_read_reply(
-                            #[cfg(any(feature = "dfs", test))]
-                            diagnostic,
-                            #[cfg(any(feature = "dfs", test))]
-                            false,
-                            || reply.error(fuse_errno(error)),
-                        );
-                        return;
-                    }
+            // Page-cache mode holds the inode gate read lease through the reply.
+            let cache_gate = match cached_io.then(|| cache_gates.acquire(ino)).transpose() {
+                Ok(gate) => gate,
+                Err(error) => {
+                    return finish_read_reply::<&[u8]>(
+                        #[cfg(any(feature = "dfs", test))]
+                        diagnostic,
+                        Err(error),
+                        &fuse_span,
+                        &request_span,
+                        reply,
+                    );
                 }
-            } else {
-                None
             };
-            let _cache_read = if let Some(gate) = &cache_gate {
-                match gate.read() {
-                    Ok(guard) => Some(guard),
-                    Err(_) => {
-                        complete_read_reply(
-                            #[cfg(any(feature = "dfs", test))]
-                            diagnostic,
-                            #[cfg(any(feature = "dfs", test))]
-                            false,
-                            || reply.error(fuse_errno(libc::EIO)),
-                        );
-                        return;
-                    }
+            let _cache_read = match cache_gate.as_ref().map(|gate| gate.read()).transpose() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    return finish_read_reply::<&[u8]>(
+                        #[cfg(any(feature = "dfs", test))]
+                        diagnostic,
+                        Err(libc::EIO),
+                        &fuse_span,
+                        &request_span,
+                        reply,
+                    );
                 }
-            } else {
-                None
             };
             let result = fuse_span.in_scope(|| {
                 tracing::info_span!("node.fuse.read.execute").in_scope(|| {
@@ -1300,21 +1346,13 @@ impl Filesystem for AfsFuse {
                     .map_err(errno_in(FuseOp::Read))
                 })
             });
-            #[cfg(any(feature = "dfs", test))]
-            let success = result.is_ok();
-            complete_read_reply(
+            finish_read_reply(
                 #[cfg(any(feature = "dfs", test))]
                 diagnostic,
-                #[cfg(any(feature = "dfs", test))]
-                success,
-                || match result {
-                    Ok(data) => {
-                        fuse_span.record("returned_bytes", data.len() as u64);
-                        tracing::info_span!(parent: &request_span, "node.fuse.read.reply", returned_bytes = data.len() as u64)
-                        .in_scope(|| reply.data(&data))
-                    }
-                    Err(error) => reply.error(fuse_errno(error)),
-                },
+                result,
+                &fuse_span,
+                &request_span,
+                reply,
             );
         };
         if parallel_read {

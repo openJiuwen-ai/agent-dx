@@ -177,6 +177,125 @@ NodeSession 保留拒绝过期 session ID 重用所需的记录；待确认、�
 的命令保留。因此有界历史不等于全部权威实体有界，完整生命周期仍有欠账。
 逻辑清理不是立即回收旧 WAL 字节，物理回收仍由 checkpoint/退休协议负责。
 
+## DFS 读写时序
+
+下面两张图是 DFS 原生节点的一次写（含提交）和一次读。参与者标注的都是 `afs/src/` 下的模块路径；
+跨进程箭头上写的是 proto 方法名（Meta 走 `DfsMeta` 服务，节点之间走 `DfsChunks` 服务）。
+图从调用点逐跳核对而来，描述的是调用关系和先后次序，不代表每个分支都有运行验收。
+
+### 写与提交
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant K as 内核 FUSE
+    participant FU as node/fuse.rs<br/>node/fuse/front_write.rs<br/>node/fuse/write_admission.rs
+    participant BE as node/vfs/dfs/backend.rs
+    participant WP as node/vfs/dfs/write_pipeline_ops.rs<br/>node/vfs/dfs/dirty_extents.rs
+    participant GC as node/gc/references.rs<br/>node/rpc/meta/dfs_gc.rs
+    participant SK as node/replication.rs（DfsChunkSink）<br/>node/external_chunk/store.rs（S3）
+    participant CS as node/chunk/store.rs<br/>node/chunk/catalog_commit.rs<br/>node/chunk/sidecar_install.rs
+    participant PR as node/rpc/peer/dfs_replica_plane.rs<br/>对端 node/rpc/data/dfs_chunks.rs
+    participant CM as node/vfs/dfs/commit.rs<br/>node/vfs/dfs/commit_prepare.rs
+    participant MP as node/vfs/dfs/meta_port.rs<br/>node/rpc/meta/dfs_namespace.rs
+    participant M as Meta：meta/rpc/dfs.rs<br/>meta/dfs/write_lease.rs、gc.rs、commit.rs<br/>meta/store/
+
+    K->>FU: open（可写）
+    FU->>BE: 派发闭包内 open_with_options
+    BE->>MP: get_inode 预检，再 resolve_write_authority（默认实现即 open_write）
+    MP->>M: OpenWrite → write_lease.rs::open_write
+    M-->>BE: InodeRecord + WriteLease
+    BE->>BE: 租约属于本节点时 install_write_state + open_write_session，否则建远端写会话
+    K->>FU: write(buf)
+    alt 配了前台写队列
+        FU->>FU: FrontWriteQueue 接住正文，后台单消费线程按序执行
+    else 未配
+        FU->>FU: fuse_write_admission 决定 Queued（owned 输入进派发队列）或在接收线程执行
+    end
+    FU->>BE: write_with_options
+    Note over BE: 远端写会话走 write_coordinator.remote_write，不进本地管线
+    BE->>WP: pipeline_ordinary_write → pipeline_ordinary_write_inner
+    opt 本代际第一次写（target.generation 为空）
+        WP->>GC: pin_generation
+        GC->>M: UpdateGcReference → gc.rs::update_gc_reference
+    end
+    WP->>WP: apply_pipeline_write → dirty_extents.write_native_prepared，再 seal_full_builders
+    WP-)SK: start_uploads → start_upload 在阻塞线程上 put_chunks(PipelineUpload)，write 不等它
+    alt 本机快路径（placement snapshot.is_local_fast_path）
+        SK->>CS: LocalR1Path::put_batch → persist_batch
+    else 多副本
+        SK->>CS: ReplicaChain::persist_head → persist_batch（本机是目标时）
+        SK->>PR: forward → put_peer_replica（PutReplicaStream 或 PutReplicaRdma），收对端 durable ACK
+    else S3
+        SK->>SK: S3ChunkStore::put_chunks 交给 S3 worker PUT
+    end
+    Note over CS: persist_batch：暂存文件写入并 fsync → link/rename 到最终名 → 一次 catalog 提交 → confirm → 可选 sidecar enqueue_batch → ReplicaAck
+    SK-->>WP: StoredChunk（PipelineUpload 且要求本机副本时先 confirm_local_required_copies）
+    K->>FU: fsync / flush
+    FU->>BE: fsync / flush
+    BE->>CM: sync_handle → commit_inode
+    Note over CM: 后台提交：node/background/tick.rs → writeback.rs::writeback_pending → progress_writeback → commit_inode
+    CM->>CM: acquire_commit_action → prepare_commit：commit_operation_and_gc_pin，有 native_operation_id 时 prepare_native_generation（wait_upload 取回执），否则 prepare_staged_generation
+    CM->>MP: finish_commit → send_file_commit → commit_file_version
+    MP->>M: CommitFileVersion → commit.rs::commit_file_version_attempt → store compare_and_commit
+    M-->>CM: 新 InodeRecord、FileVersion、LayoutRoot
+    CM->>CM: apply_file_commit_locked（base_version、base_layout、durable/committed seq）后 notify_all
+```
+
+### 读
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant K as 内核 FUSE
+    participant FU as node/fuse.rs<br/>node/fuse/read_reply.rs<br/>node/fuse/page_cache.rs
+    participant BE as node/vfs/dfs/backend.rs<br/>node/vfs/dfs/async_read.rs<br/>node/vfs/dfs/read_view.rs
+    participant EN as node/read/engine/async_prepare.rs<br/>node/read/engine/route.rs<br/>node/read/engine/local.rs
+    participant SR as node/read/engine/sources.rs<br/>node/rpc/meta/dfs_authorities.rs
+    participant M as Meta：meta/rpc/dfs.rs<br/>meta/dfs/read_auth.rs
+    participant RM as node/read/engine/fanout.rs、remote.rs<br/>node/rpc/peer/dfs_grpc_transfer.rs
+    participant PS as 对端 node/rpc/data/dfs_chunks.rs<br/>dfs_read_authz.rs、dfs_range_stream.rs<br/>node/chunk/peer_serve.rs
+    participant PC as node/read/engine/peer_cache_source.rs<br/>node/read/peer_cache/
+
+    K->>FU: read(ino, fh, offset, size)
+    FU->>FU: try_start_async_read（backend 不支持异步读时回落到派发线程同步读）
+    FU-)FU: submit_read_deferred_until → 运行时任务里 InodeCacheGate::read_owned_until 取页缓存读租约
+    FU->>BE: read_reply_async → prepare_native_async_read → read_replicated_bytes_async
+    BE->>BE: replicated_read_plan_async
+    alt 动态路由且写 owner 在别的节点
+        BE->>BE: remote_read_async：经 node/rpc/peer/dfs_owner_client.rs 调 DfsOwnerFiles.Read，由 owner 的 node/rpc/data/dfs_owner.rs 读可见数据
+    else 本节点有写活动
+        BE->>EN: read_native_overlay_async（已提交布局，再叠加冻结与活动脏区）
+    else 只读已提交版本
+        BE->>BE: native_inode_for_read_async 固定视图 → read_committed_async → readonly_version_async
+        BE->>EN: read_native_unified_async（direct_prefetch 开启时先取预读部分）
+    end
+    EN->>EN: replicated_sources().read_async：LocalSource 先读本机副本（read_local_copies → chunk/reader.rs）
+    opt 还有本机没有覆盖的范围
+        EN->>SR: sources_for_attempt_async（先查 source 缓存）
+        opt 缓存未命中或过期
+            SR->>M: GetChunkSources → read_auth.rs::chunk_sources
+            M-->>SR: 副本位置 + 带 token 的读授权（30 s 到期）
+        end
+        EN->>RM: ① final_owned 时 FanoutSource → fanout_private_objects_async
+        EN->>PC: ② 未完成：PeerCacheSource → read_replicated_peer_cache_mode_async（未配 peer cache 时不适用）
+        EN->>RM: ③ 仍未完成：PeerRangeSource → read_remote_ranges_async → read_ranges_async
+        RM->>PS: ReadRanges（gRPC 流，按请求方 CRC 模式；RDMA 时 ReadRangesRdma）
+        PS-->>RM: 数据帧
+    end
+    opt readahead_object_limit 大于 0
+        BE->>EN: record_async_prefetch → prefetch.rs::prefetch_cached（要有 peer cache 与 fetcher）
+    end
+    EN-->>BE: Bytes
+    BE-->>FU: ReadReply 送入 ReadCompletions（afs-read-reply 线程）
+    FU-->>K: ReadReply::finish → reply.data，之后释放读租约和派发轮次
+```
+
+S3 后端不走异步读（`async_read_enabled` 要求没有外部后端）：派发线程里
+`backend_read_data` → `node/vfs/dfs/backend.rs::read_reply` → `read_owned` →
+`node/read/engine.rs::read_batch` → `node/read/engine/external.rs::read_external_batch`
+（`sources_for` 取授权）→ `read_external_authorized_selection` → `node/external_chunk/`。
+
 ## DFS 原生写正文所有权
 
 原生本地 owner 的普通 FUSE 写入由前台有界正文队列接住，后台单消费线程依序执行；

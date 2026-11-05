@@ -429,184 +429,226 @@ impl LocalChunkStore {
             ));
         }
         let admission = self.admit_catalog(staged)?;
-        let result = (|| -> Result<Vec<ReplicaAck>> {
-            if self
-                .catalog
-                .lock()
-                .map_err(|_| invalid("local chunk catalog lock is poisoned"))?
-                .revision
-                < target.device.catalog_revision
-            {
-                return Err(invalid(
-                    "local catalog is older than the placement revision floor",
-                ));
-            }
-
-            let mut records = Vec::new();
-            let mut installed_chunk_ids = HashSet::new();
-            for item in staged {
-                let mut replace_existing = false;
-                let existing = self
-                    .catalog
-                    .lock()
-                    .map_err(|_| invalid("local chunk catalog lock is poisoned"))?
-                    .records
-                    .get(&item.chunk.id)
-                    .cloned();
-                let set_capacity = installed_chunk_ids.capacity()
-                    * (std::mem::size_of::<ChunkId>() + std::mem::size_of::<usize>() + 1)
-                    * 2
-                    + installed_chunk_ids
-                        .iter()
-                        .map(|id: &ChunkId| id.0.capacity())
-                        .sum::<usize>();
-                self.observe_catalog_preparing(
-                    &admission,
-                    catalog_commit::record_capacity(&records)
-                        + set_capacity
-                        + existing
-                            .as_ref()
-                            .map_or(0, catalog_commit::record_allocation),
-                )?;
-                #[cfg(test)]
-                self.test_hooks.catalog_commit_test.pause_prepare()?;
-                if let Some(existing) = existing.as_ref() {
-                    if existing.chunk != item.chunk {
-                        return Err(invalid(
-                            "immutable Chunk ID collides with another local record",
-                        ));
-                    }
-                    if existing.state == LocalChunkState::Quarantined {
-                        replace_existing = true;
-                    } else {
-                        match if existing.segment_crc.is_some() {
-                            self.verify_crc_file(
-                                &self.path_for_record(existing)?,
-                                &item.chunk,
-                                existing.segment_crc.as_ref().ok_or_else(|| {
-                                    corrupt(&item.chunk.id, "CRC descriptor missing")
-                                })?,
-                            )
-                        } else {
-                            verify_file(&self.path_for_record(existing)?, &item.chunk)
-                        } {
-                            Ok(()) => continue,
-                            Err(error) if verified_copy_is_invalid(&error) => {
-                                replace_existing = true
-                            }
-                            Err(error) => return Err(error),
-                        }
-                    }
-                }
-                let temp_path = self.staging.join(format!(
-                    "{}.{}.tmp",
-                    safe_id(&item.operation_id.0),
-                    self.next_staging.fetch_add(1, Ordering::Relaxed)
-                ));
-                let mut file = OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .open(&temp_path)
-                    .map_err(Error::from)?;
-                {
-                    let _diagnostic =
-                        self.coarse_diagnostic("persist_body_write", item.chunk.length);
-                    file.write_all(item.bytes()).map_err(Error::from)?;
-                }
-                {
-                    let _diagnostic =
-                        self.coarse_diagnostic("persist_body_sync", item.chunk.length);
-                    file.sync_all().map_err(Error::from)?;
-                }
-                let final_path = self.chunk_path(&item.chunk.id);
-                if replace_existing {
-                    // Publish a new inode; never truncate a file held by readers.
-                    // Its immutable content identity is unchanged. Directory and
-                    // catalog barriers below still precede the durable ACK.
-                    fs::rename(&temp_path, &final_path).map_err(Error::from)?;
-                    admission.namespace_changed();
-                } else {
-                    match fs::hard_link(&temp_path, &final_path) {
-                        Ok(()) => admission.namespace_changed(),
-                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                            if let Some(table) = &item.segment_crc {
-                                self.verify_crc_file(&final_path, &item.chunk, table)?;
-                                // Adopting a synced but unpublished orphan still
-                                // requires the namespace barrier before its ACK.
-                                admission.namespace_changed();
-                            } else {
-                                verify_file(&final_path, &item.chunk)?;
-                            }
-                        }
-                        Err(error) => return Err(Error::from(error)),
-                    }
-                    fs::remove_file(&temp_path).map_err(Error::from)?;
-                }
-                if installed_chunk_ids.insert(item.chunk.id.clone()) {
-                    records.push(LocalChunkRecord {
-                        location: PhysicalLocation::PerChunkFile {
-                            relative_path: format!("chunks/{}", item.chunk.id.0),
-                        },
-                        segment_crc: item.segment_crc.as_deref().cloned(),
-                        stored_length: item.chunk.length,
-                        stored_checksum: item.chunk.content_digest.clone(),
-                        device_id: self.device_id.clone(),
-                        device_epoch: self.device_epoch,
-                        chunk: item.chunk.clone(),
-                        encoding: PhysicalEncoding::Raw,
-                        state: LocalChunkState::Durable,
-                        catalog_revision: 0,
-                    });
-                }
-                let set_capacity = installed_chunk_ids.capacity()
-                    * (std::mem::size_of::<ChunkId>() + std::mem::size_of::<usize>() + 1)
-                    * 2
-                    + installed_chunk_ids
-                        .iter()
-                        .map(|id| id.0.capacity())
-                        .sum::<usize>();
-                self.observe_catalog_preparing(
-                    &admission,
-                    catalog_commit::record_capacity(&records)
-                        + set_capacity
-                        + temp_path.capacity()
-                        + final_path.capacity()
-                        + existing
-                            .as_ref()
-                            .map_or(0, catalog_commit::record_allocation),
-                )?;
-            }
-            drop(installed_chunk_ids);
-            let catalog_revision = self.commit_catalog(&admission, records)?;
-            admission.confirm();
-            // Optional proof installation remains after every required durability barrier.
-            self.sidecar_installer.enqueue_batch(self, staged);
-            let acks = staged
-                .iter()
-                .map(|item| ReplicaAck {
-                    operation_id: item.operation_id.clone(),
-                    chunk_id: item.chunk.id.clone(),
-                    placement_revision,
-                    placement_epoch,
-                    node_id: target.node_id.clone(),
-                    node_epoch: target.node_epoch,
-                    device_id: target.device.device_id.clone(),
-                    device_epoch: target.device.device_epoch,
-                    catalog_revision,
-                    persisted_bytes: item.chunk.length,
-                    verified_digest: item.chunk.content_digest.clone(),
-                })
-                .collect();
+        let result = self.persist_admitted(
+            staged,
+            target,
+            placement_revision,
+            placement_epoch,
+            &admission,
             #[cfg(any(feature = "dfs", test))]
-            if let Some(diagnostic) = batch_diagnostic {
-                diagnostic.finish(true);
-            }
-            Ok(acks)
-        })();
+            batch_diagnostic,
+        );
         if let Err(error) = &result {
             admission.fail_if_unconfirmed(error.clone());
         }
         result
+    }
+
+    /// Admitted batch: durable bodies, one catalog commit, then the durable ACKs.
+    /// Optional proof installation stays after every required durability barrier.
+    fn persist_admitted(
+        &self,
+        staged: &[StagedChunk],
+        target: &ReplicaTarget,
+        placement_revision: u64,
+        placement_epoch: u64,
+        admission: &catalog_commit::Admission<'_>,
+        #[cfg(any(feature = "dfs", test))] batch_diagnostic: Option<
+            super::super::metrics::read_timing::ReadDiagnosticSpan,
+        >,
+    ) -> Result<Vec<ReplicaAck>> {
+        if self
+            .catalog
+            .lock()
+            .map_err(|_| invalid("local chunk catalog lock is poisoned"))?
+            .revision
+            < target.device.catalog_revision
+        {
+            return Err(invalid(
+                "local catalog is older than the placement revision floor",
+            ));
+        }
+
+        let mut records = Vec::new();
+        let mut installed_chunk_ids = HashSet::new();
+        for item in staged {
+            self.persist_staged_item(item, admission, &mut records, &mut installed_chunk_ids)?;
+        }
+        drop(installed_chunk_ids);
+        let catalog_revision = self.commit_catalog(admission, records)?;
+        admission.confirm();
+        // Optional proof installation remains after every required durability barrier.
+        self.sidecar_installer.enqueue_batch(self, staged);
+        let acks = staged
+            .iter()
+            .map(|item| ReplicaAck {
+                operation_id: item.operation_id.clone(),
+                chunk_id: item.chunk.id.clone(),
+                placement_revision,
+                placement_epoch,
+                node_id: target.node_id.clone(),
+                node_epoch: target.node_epoch,
+                device_id: target.device.device_id.clone(),
+                device_epoch: target.device.device_epoch,
+                catalog_revision,
+                persisted_bytes: item.chunk.length,
+                verified_digest: item.chunk.content_digest.clone(),
+            })
+            .collect();
+        #[cfg(any(feature = "dfs", test))]
+        if let Some(diagnostic) = batch_diagnostic {
+            diagnostic.finish(true);
+        }
+        Ok(acks)
+    }
+
+    /// Makes one staged body durable under its final name and queues its record.
+    /// A verified existing copy is kept without a new record.
+    fn persist_staged_item(
+        &self,
+        item: &StagedChunk,
+        admission: &catalog_commit::Admission<'_>,
+        records: &mut Vec<LocalChunkRecord>,
+        installed_chunk_ids: &mut HashSet<ChunkId>,
+    ) -> Result<()> {
+        let existing = self
+            .catalog
+            .lock()
+            .map_err(|_| invalid("local chunk catalog lock is poisoned"))?
+            .records
+            .get(&item.chunk.id)
+            .cloned();
+        let existing_allocation = existing
+            .as_ref()
+            .map_or(0, catalog_commit::record_allocation);
+        self.observe_catalog_preparing(
+            admission,
+            catalog_commit::record_capacity(records)
+                + installed_set_capacity(installed_chunk_ids)
+                + existing_allocation,
+        )?;
+        #[cfg(test)]
+        self.test_hooks.catalog_commit_test.pause_prepare()?;
+        let replace_existing = match existing.as_ref() {
+            Some(existing) => match self.existing_copy_needs_replacement(existing, item)? {
+                Some(replace) => replace,
+                None => return Ok(()),
+            },
+            None => false,
+        };
+        let (temp_path, final_path) =
+            self.install_staged_body(item, replace_existing, admission)?;
+        if installed_chunk_ids.insert(item.chunk.id.clone()) {
+            records.push(LocalChunkRecord {
+                location: PhysicalLocation::PerChunkFile {
+                    relative_path: format!("chunks/{}", item.chunk.id.0),
+                },
+                segment_crc: item.segment_crc.as_deref().cloned(),
+                stored_length: item.chunk.length,
+                stored_checksum: item.chunk.content_digest.clone(),
+                device_id: self.device_id.clone(),
+                device_epoch: self.device_epoch,
+                chunk: item.chunk.clone(),
+                encoding: PhysicalEncoding::Raw,
+                state: LocalChunkState::Durable,
+                catalog_revision: 0,
+            });
+        }
+        self.observe_catalog_preparing(
+            admission,
+            catalog_commit::record_capacity(records)
+                + installed_set_capacity(installed_chunk_ids)
+                + temp_path.capacity()
+                + final_path.capacity()
+                + existing_allocation,
+        )
+    }
+
+    /// `None` keeps a verified existing copy; `Some(true)` replaces a quarantined
+    /// or invalid copy. A different immutable Chunk under the same ID is an error.
+    fn existing_copy_needs_replacement(
+        &self,
+        existing: &LocalChunkRecord,
+        item: &StagedChunk,
+    ) -> Result<Option<bool>> {
+        if existing.chunk != item.chunk {
+            return Err(invalid(
+                "immutable Chunk ID collides with another local record",
+            ));
+        }
+        if existing.state == LocalChunkState::Quarantined {
+            return Ok(Some(true));
+        }
+        let verified = if existing.segment_crc.is_some() {
+            self.verify_crc_file(
+                &self.path_for_record(existing)?,
+                &item.chunk,
+                existing
+                    .segment_crc
+                    .as_ref()
+                    .ok_or_else(|| corrupt(&item.chunk.id, "CRC descriptor missing"))?,
+            )
+        } else {
+            verify_file(&self.path_for_record(existing)?, &item.chunk)
+        };
+        match verified {
+            Ok(()) => Ok(None),
+            Err(error) if verified_copy_is_invalid(&error) => Ok(Some(true)),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Writes and syncs a private staging file, then publishes it under the
+    /// final name. Returns both paths for control-capacity accounting.
+    fn install_staged_body(
+        &self,
+        item: &StagedChunk,
+        replace_existing: bool,
+        admission: &catalog_commit::Admission<'_>,
+    ) -> Result<(PathBuf, PathBuf)> {
+        let temp_path = self.staging.join(format!(
+            "{}.{}.tmp",
+            safe_id(&item.operation_id.0),
+            self.next_staging.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)
+            .map_err(Error::from)?;
+        {
+            let _diagnostic = self.coarse_diagnostic("persist_body_write", item.chunk.length);
+            file.write_all(item.bytes()).map_err(Error::from)?;
+        }
+        {
+            let _diagnostic = self.coarse_diagnostic("persist_body_sync", item.chunk.length);
+            file.sync_all().map_err(Error::from)?;
+        }
+        let final_path = self.chunk_path(&item.chunk.id);
+        if replace_existing {
+            // Publish a new inode; never truncate a file held by readers.
+            // Its immutable content identity is unchanged. Directory and
+            // catalog barriers below still precede the durable ACK.
+            fs::rename(&temp_path, &final_path).map_err(Error::from)?;
+            admission.namespace_changed();
+        } else {
+            match fs::hard_link(&temp_path, &final_path) {
+                Ok(()) => admission.namespace_changed(),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if let Some(table) = &item.segment_crc {
+                        self.verify_crc_file(&final_path, &item.chunk, table)?;
+                        // Adopting a synced but unpublished orphan still
+                        // requires the namespace barrier before its ACK.
+                        admission.namespace_changed();
+                    } else {
+                        verify_file(&final_path, &item.chunk)?;
+                    }
+                }
+                Err(error) => return Err(Error::from(error)),
+            }
+            fs::remove_file(&temp_path).map_err(Error::from)?;
+        }
+        Ok((temp_path, final_path))
     }
 
     pub fn persist(
@@ -817,4 +859,10 @@ impl ChunkSink for LocalChunkStore {
     fn capacity(&self) -> Result<FilesystemCapacity> {
         LocalChunkStore::capacity(self)
     }
+}
+
+/// Conservative control charge of the batch's de-duplication set.
+fn installed_set_capacity(ids: &HashSet<ChunkId>) -> usize {
+    ids.capacity() * (std::mem::size_of::<ChunkId>() + std::mem::size_of::<usize>() + 1) * 2
+        + ids.iter().map(|id| id.0.capacity()).sum::<usize>()
 }
