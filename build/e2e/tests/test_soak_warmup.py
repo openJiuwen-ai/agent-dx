@@ -1,8 +1,6 @@
 """Independent warmup/measurement boundaries must not hide growth or missing work."""
 from copy import deepcopy
 import importlib.util
-import contextlib
-import io
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -156,13 +154,20 @@ class WarmupContract(unittest.TestCase):
         with patch.object(runner.docker_run.common, 'main', return_value=0) as run:
             self.assertEqual(runner.main(args), 0)
             run.assert_called_once()
-        for extra in (['--seconds', '3600'], ['--mode', 'dfs'], ['--sample-seconds', '30']):
-            with (self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()),
+        frozen_error = 'warmup-hour acceptance requires the exact frozen duration, sampling and resource bounds'
+        invalid = [(['--seconds', '3600'], frozen_error),
+                   (['--mode', 'dfs'], 'mode has not qualified the selected warmup contract'),
+                   (['--sample-seconds', '30'], frozen_error),
+                   (['--qualify-v4-observer'],
+                    'v4 observer qualification is restricted to OwnerFs qualification mode')]
+        for extra, message in invalid:
+            with (patch.object(runner.argparse.ArgumentParser, 'error',
+                               side_effect=ValueError('admission rejected')) as reject,
                   patch.object(runner.docker_run.common, 'main') as run):
-                runner.main(args + extra)
+                with self.assertRaisesRegex(ValueError, 'admission rejected'):
+                    runner.main(args + extra)
+            reject.assert_called_once_with(message)
             run.assert_not_called()
-        with (self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO())):
-            runner.main(args + ['--qualify-v4-observer'])
         with patch.object(runner.docker_run.common, 'main', return_value=0) as run:
             self.assertEqual(runner.main(args + ['--acceptance', 'qualification',
                                                 '--qualify-v4-observer', '--seconds', '60']), 0)
