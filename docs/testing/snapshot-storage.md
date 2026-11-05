@@ -6,6 +6,35 @@
 共享回收接口 `ArtifactReclaimer`。adxlet 处理捕获、恢复和本机缓存；Coordinator
 管理 Environment/Snapshot 的保留关系并回收共享文件。默认 ADX 构建不依赖 AFS/FUSE。
 
+## 并发快照的元数据提交边界
+
+无 Volume 的已运行 Environment 在状态提交中新增 checkpoint / execution artifact 引用时，Redis 事务只比较
+Coordinator epoch、该 Environment 的旧记录与业务计数，不再比较并更新共享 control header 版本。
+无 Volume 的 Snapshot 发布也只比较快照、源 Environment 与节点 session；不同环境的
+快照引用不再因同一 header 版本变化而互相重试。Volume catalog 写入仍保留原有全局 CAS。
+
+这不是移除 GC 保护：所有引用（包括 local artifact）在提交期间持有对应 artifact 的读锁；
+共享 artifact 的物理 GC 和 Deleted cleanup 准入使用相同身份的写锁。cleanup 准入从未引用检查到环境
+退役事务完成一直保留写锁，取消或失败时释放，不持久化额外墓碑。共享 artifact 继续登记到
+共享回收目录；local artifact 只参与互斥，不加入共享目录。该互斥沿用单活 Coordinator
+合同，不能据此宣称支持多活 Coordinator。
+
+Snapshot inspection 目录仍以既有锁保护已提交视图，Redis 写入失败／取消后要求恢复目录；
+此次没有取消该锁，也没有改变 runsc 保存、fsync 或存储持久化语义。ADXlet catalog 发布
+使用快照操作的剩余 deadline，重试不能延长调用方预算。
+
+可用真实 Redis 回归验证上述边界（测试自行创建并清理隔离 Redis）：
+
+```bash
+export ADX_TEST_REDIS_SERVER=/absolute/path/to/redis-server
+cargo test --locked -p adx-coordinator --lib storage::checkpoint_contention_tests -- --ignored
+cargo test --locked -p adx-coordinator --test storage checkpoint_publication_rounds_1024 -- --ignored --nocapture
+```
+
+第二项运行两轮各 1024 个环境的引用登记、封装结果持有、目录发布和临时引用释放，并检查删除
+源 Environment 后仍可取得快照恢复引用；阶段计时只包含 Coordinator 元数据操作，不执行
+运行时捕获／恢复，不能作为集群端到端 checkpoint 延迟或持久化性能结果。
+
 ## 三种模式
 
 | 模式 | 捕获 | 恢复 | 物理回收 |

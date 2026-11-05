@@ -20,6 +20,8 @@ mod recovery;
 pub use observability::{
     BusinessCounters, CreationResult, CreationSummary, InterruptionSummary, RecoveryState,
 };
+#[cfg(test)]
+mod checkpoint_contention_tests;
 mod resume;
 mod snapshot_preparation;
 mod snapshots;
@@ -772,49 +774,19 @@ impl RedisStore {
     ) -> Result<bool> {
         let (name, old, next) = field.ok_or(Error::Conflict)?;
         let values = Self::publication_values([(name, Some(next.as_str()))])?;
-        let artifacts = if name.starts_with("environment:") {
+        let references = if name.starts_with("environment:") {
             decode::<StoredEnvironment>(&next)?
                 .result
                 .as_ref()
-                .map(artifacts::record_artifacts)
+                .map(artifacts::record_references)
                 .unwrap_or_default()
         } else {
             vec![]
         };
-        let attached_artifacts = if name.starts_with("environment:") {
-            let next: StoredEnvironment = decode(&next)?;
-            let previous = old.map(decode::<StoredEnvironment>).transpose()?;
-            let owned = |stored: &StoredEnvironment| {
-                stored
-                    .result
-                    .as_ref()
-                    .map(|record| {
-                        record
-                            .checkpoint
-                            .iter()
-                            .chain(record.snapshot_source.iter())
-                            .map(|point| point.artifact.clone())
-                            .chain(record.execution_artifacts.iter().cloned())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
-            };
-            let previous = previous.as_ref().map(owned).unwrap_or_default();
-            owned(&next)
-                .into_iter()
-                .filter(|artifact| !previous.contains(artifact))
-                .collect::<Vec<_>>()
-        } else {
-            vec![]
-        };
-        let guarded_header = if attached_artifacts.is_empty() {
-            None
-        } else {
-            let mut next = header.clone();
-            next.advance()?;
-            Some((encode(header)?, encode(&next)?))
-        };
-        let _access = self.lock_artifacts(&artifacts)?;
+        // Artifact-scoped exclusion protects GC and cleanup admission. The
+        // object bytes, business facts and Coordinator epoch are compared in
+        // Redis; unrelated checkpoint references do not mutate the header.
+        let _access = self.lock_artifacts(&references)?;
         let membership = if name.starts_with("environment:") {
             let environment: StoredEnvironment = decode(&next)?;
             format!("node-ownership:{}", environment.assignment.node_id)
@@ -850,20 +822,16 @@ impl RedisStore {
             if not old and string.sub(ARGV[2],1,5) == 'node:' and redis.call('HEXISTS',KEYS[1],'retired-node:' .. string.sub(ARGV[2],6)) ~= 0 then return 0 end
             local facts = cjson.decode(ARGV[7])
             if facts[1] ~= '' and (redis.call('HGET',KEYS[3],facts[1]) or '') ~= facts[2] then return 0 end
-            if ARGV[8] ~= '' and redis.call('HGET',KEYS[1],'header') ~= ARGV[8] then return 0 end
             redis.call('HSET',KEYS[1],ARGV[2],ARGV[4])
-            if ARGV[8] ~= '' then redis.call('HSET',KEYS[1],'header',ARGV[9]) end
             if facts[1] ~= '' then redis.call('HSET',KEYS[3],facts[1],facts[3]) end
             if ARGV[5] ~= '' then redis.call('HSET',KEYS[1],'node-session:' .. string.sub(ARGV[2],6),ARGV[5]) end
             if ARGV[6] ~= '' then redis.call('HINCRBY',KEYS[1],ARGV[6],1) end
-            for i=10,#ARGV,2 do redis.call('HSET',KEYS[2],ARGV[i],ARGV[i+1]) end
+            for i=8,#ARGV,2 do redis.call('HSET',KEYS[2],ARGV[i],ARGV[i+1]) end
             return 1
         "#).arg(3).arg(&self.key).arg(format!("{}:artifacts", self.key)).arg(format!("{}:business", self.key))
             .arg(header.epoch.to_string()).arg(name).arg(old.unwrap_or("")).arg(next).arg(node_session).arg(membership)
-            .arg(counters.map(CounterUpdate::argument).transpose()?.unwrap_or_else(|| r#"["","",""]"#.into()))
-            .arg(guarded_header.as_ref().map(|pair| pair.0.as_str()).unwrap_or(""))
-            .arg(guarded_header.as_ref().map(|pair| pair.1.as_str()).unwrap_or(""));
-        for artifact in artifacts {
+            .arg(counters.map(CounterUpdate::argument).transpose()?.unwrap_or_else(|| r#"["","",""]"#.into()));
+        for artifact in references.into_iter().filter(|a| a.storage != "local") {
             cmd.arg(artifacts::artifact_key(&artifact))
                 .arg(encode(&artifact)?);
         }
@@ -2153,12 +2121,15 @@ impl Session {
             } else {
                 None
             };
-            let cleanup = if result.state == EnvironmentState::Deleted {
+            // Keep artifact exclusion through retirement, including Redis
+            // cancellation: a stale cleanup scan must not race a new reference.
+            let prepared_cleanup = if result.state == EnvironmentState::Deleted {
                 self.prepare_checkpoint_cleanup(&stored_environment, &result, cleanup_artifacts)
                     .await?
             } else {
                 None
             };
+            let cleanup = prepared_cleanup.as_ref().map(|(task, _guards)| task);
             if cleanup.is_some() && catalog.is_none() {
                 header.advance()?;
             }
@@ -2191,7 +2162,7 @@ impl Session {
                         &DeletedReceipt::from_result(&result, cleanup_artifacts)?,
                         &counters,
                         catalog.as_ref(),
-                        cleanup.as_ref(),
+                        cleanup,
                     )
                     .await?
             } else {

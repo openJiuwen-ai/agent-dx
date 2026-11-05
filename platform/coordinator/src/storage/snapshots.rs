@@ -40,9 +40,8 @@ impl Session {
         } else {
             None
         };
-        // The inspection latch already serializes these commits. Read the
-        // compared header after joining that queue, rather than letting each
-        // waiter carry a header made stale by the writers ahead of it.
+        // Serialize committed inventory updates, including recovery after a
+        // cancelled or ambiguous write. Do not expose a speculative cache value.
         let mut inventory = self.inspection.lock().await;
         // Volume writes must be derived from the same fresh catalog as their
         // compared header. Replacing only the header of a queued catalog could
@@ -60,19 +59,14 @@ impl Session {
         } else {
             None
         };
-        let header_value = match catalog.as_ref() {
-            Some(catalog) => Some(catalog.header_value.clone()),
-            None => self.store.fields([HEADER.into()]).await?[0].clone(),
-        };
-        let mut current_header = self.header(&header_value)?;
-        let header = if let Some(catalog) = catalog.as_ref() {
-            Some(catalog.advanced_header()?)
-        } else if next.state == SnapshotState::Ready {
-            current_header.advance()?;
-            Some(current_header)
-        } else {
-            None
-        };
+        // No-volume snapshots have only object/source/session predicates.
+        // Artifact locks fence deletion; only Volume catalog writes require the
+        // global header CAS. Keep the inspection latch for ordered cache updates
+        // and invalidation after ambiguous/cancelled writes.
+        let header = catalog
+            .as_ref()
+            .map(|catalog| catalog.advanced_header())
+            .transpose()?;
         let mut command = redis::cmd("EVAL");
         command
             .arg(
@@ -107,7 +101,11 @@ impl Session {
             .arg(old.unwrap_or(""))
             .arg(encode(next)?)
             .arg(header.as_ref().map(encode).transpose()?.unwrap_or_default())
-            .arg(header_value.as_deref().unwrap_or(""));
+            .arg(
+                catalog
+                    .as_ref()
+                    .map_or("", |catalog| catalog.header_value.as_str()),
+            );
         command
             .arg(source.as_ref().map_or("", |f| f.environment_field))
             .arg(source.as_ref().map_or("", |f| f.environment_value))

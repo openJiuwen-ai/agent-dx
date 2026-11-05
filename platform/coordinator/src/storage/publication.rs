@@ -184,7 +184,9 @@ impl Session {
         let attaches_artifacts = record.checkpoint.is_some()
             || record.snapshot_source.is_some()
             || !record.execution_artifacts.is_empty();
-        let _access = self.store.lock_artifacts(&artifacts)?;
+        let _access = self
+            .store
+            .lock_artifacts(&artifacts::record_references(&record))?;
         for _ in 0..ATTEMPTS {
             // Match artifact -> object publication -> inspection ordering used
             // by failure recovery. Header comparisons must be read after joining
