@@ -1,0 +1,123 @@
+{
+  "schema_version": 1,
+  "id": "afs-continuous-warmup-1h-measurement-1h-v4",
+  "scope": "OwnerFs fixed-package continuous SDK I/O/lifecycle; 1h warmup plus full1h measurement; no faults/performance SLA",
+  "seconds": 7200,
+  "sample_seconds": 15,
+  "maximum_sample_gap_seconds": 45,
+  "maximum_progress_stall_seconds": 45,
+  "maximum_boundary_gap_seconds": 30,
+  "warmup_seconds": 3600,
+  "window_seconds": 300,
+  "minimum_window_samples": 12,
+  "minimum_window_cycles": 25,
+  "minimum_window_churn": 10,
+  "minimum_total_cycles": 1200,
+  "minimum_total_churn": 600,
+  "min_free_bytes": 2147483648,
+  "peak_growth": {
+    "memory_bytes": 536870912,
+    "memory_anon_bytes": 134217728,
+    "runtime_memory_bytes": 134217728,
+    "runtime_anon_bytes": 67108864,
+    "rss_bytes": 134217728,
+    "disk_bytes": 268435456,
+    "disk_data_bytes": 67108864,
+    "log_bytes": 134217728,
+    "fds": 128,
+    "mounts": 8,
+    "runtime_backing_bytes": 134217728
+  },
+  "trends": {
+    "memory_anon_bytes": {
+      "maximum_end_delta": 33554432,
+      "maximum_slope_per_hour": 16777216
+    },
+    "runtime_anon_bytes": {
+      "maximum_end_delta": 16777216,
+      "maximum_slope_per_hour": 8388608
+    },
+    "rss_bytes": {
+      "maximum_end_delta": 33554432,
+      "maximum_slope_per_hour": 16777216
+    },
+    "disk_data_bytes": {
+      "maximum_end_delta": 33554432,
+      "maximum_slope_per_hour": 16777216
+    },
+    "fds": {
+      "maximum_end_delta": 4,
+      "maximum_slope_per_hour": 4
+    },
+    "mounts": {
+      "maximum_end_delta": 1,
+      "maximum_slope_per_hour": 1
+    },
+    "runtime_backing_bytes": {
+      "maximum_end_delta": 33554432,
+      "maximum_slope_per_hour": 16777216
+    }
+  },
+  "process_rss_trend": {
+    "maximum_end_delta": 16777216,
+    "maximum_slope_per_hour": 8388608
+  },
+  "error_policy": "fail on first error; no retries, replacements, omitted samples, intentional restart or weakened thresholds",
+  "cleanup_policy": "SDK worker terminal, explicit Environment deletion, empty backend, normal AFS unmount/process exit, then Docker cleanup; all required",
+  "measurement": {
+    "storage_scope": "allocated-backing-fs-v2",
+    "runtime_backing_bytes": "st_blocks*512 on the owning filesystem; exclude submounts including erofs/overlay/tmpfs/bind views; hardlink inode counted once; include writable backing upperdirs and retained runtime streams",
+    "runtime_disk_bytes": "Legacy cross-mount apparent size, retained as diagnostic only and not used as a disk-allocation bound",
+    "payload_delivery": "Fixed 16KiB SDK file staging, readable by UID10000; short UID10000 command copies and fsyncs target. Payload never stored in command argv. Original confirmed-content check unchanged.",
+    "command_retention": "Default3600s/4096 records; request dedup1800s/65536 unchanged. No Execd TTL/capacity override.",
+    "payload_transport": "sdk-stage-short-copy-fsync-v2",
+    "maximum_publish_command_bytes": 2048,
+    "fd_scope": "dfs-reader-accounting-v3",
+    "fds": "Raw sum of all persistent process descriptors plus live anchor; peak_growth.fds and trends.fds apply to recomputed noncache FDs. Separate mode-specific raw caps also apply; warmup only excludes trend windows.",
+    "warmup": "Fixed3600s of same active workload; no restart/cache flush/redeployment; no adaptive extension. All24 five-minute windows require work; trends use exactly12 measurement windows."
+  },
+  "fd_accounting": {
+    "scope": "dfs-reader-accounting-v3",
+    "dfs_reader_capacity_per_afs_node": 256,
+    "cache_credit": "One FD per unique live regular dev/inode directly in the explicitly owned DFS chunk root; deleted, duplicate and foreign handles receive no credit. Never credit OwnerFs, Meta, platform or anchor processes.",
+    "noncache_peak_growth": 128,
+    "raw_peak_growth": "Node and each persistent process: 128 plus at most 256 only for each owned DFS afs-node; every raw descriptor is retained in evidence.",
+    "steady_excess_median": 0,
+    "noncache_trend": {
+      "maximum_end_delta": 4,
+      "maximum_slope_per_hour": 4
+    },
+    "steady_policy": "Excess beyond capacity remains charged as noncache, including inflight readers. Every steady five-minute window must have median excess zero. Node AND individual process noncache trends are gated; raw trends remain diagnostic.",
+    "binding": "Raw census bound to PID/start_ticks and stable canonical chunk root path/device/inode; aggregate values independently recomputed. Missing, replaced or inconsistent evidence fails."
+  },
+  "measurement_seconds": 3600,
+  "minimum_measurement_cycles": 600,
+  "minimum_measurement_churn": 300,
+  "modes": [
+    "ownerfs"
+  ],
+  "observation": {
+    "scope": "persistent-smaps-v4",
+    "required_node_processes": [
+      "afs-node",
+      "otelcol-contrib",
+      "execd-service",
+      "sandboxd",
+      "adxctl",
+      "adxlet"
+    ],
+    "required_sdk_node": "node1",
+    "swap_bytes": 0,
+    "peak_reference": "first sample, including all warmup; never reset at measurement start",
+    "raw_census": "all PIDs visible in each owned container PID namespace; transient races retained, persistent roles must remain stable",
+    "required_node1_processes": [
+      "redis-server",
+      "adx-coordinator",
+      "adx-apiserver"
+    ]
+  },
+  "process_pss_anon_trend": {
+    "maximum_end_delta": 16777216,
+    "maximum_slope_per_hour": 8388608
+  }
+}

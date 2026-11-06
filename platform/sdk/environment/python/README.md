@@ -217,6 +217,9 @@ During a node snapshot attempt, a locally Journaled source state is republished
 until Coordinator accepts it or the attempt's checkpoint budget expires. This
 wait keeps the same record and revision and does not repeat backend capture.
 The backend receives the remaining budget, rather than a fresh full timeout.
+The Coordinator catalog-publication RPC receives that remaining budget too;
+the ordinary short control-RPC timeout does not truncate the snapshot attempt.
+This does not replay an uncertain publication or extend the original deadline.
 Publication conflicts and other errors still fail immediately. If publication
 times out after capture, local pending metadata and artifact references remain
 available for reconciliation; the SDK does not report a successful Snapshot.
@@ -730,6 +733,21 @@ that implements this action together with the matching SDK; unsupported runtimes
 fail explicitly.
 
 ## Recover a background command
+
+Command handles read the authoritative result by stable command ID. If an older
+runtime returns normal terminal status with a missing exit code, the SDK reads
+that same ID once more; it does not infer success or submit the command again.
+A second inconsistent response raises `COMMAND_RESULT_INCONSISTENT` with unknown
+outcome, preserving the environment and command operation identities. Legitimate
+signal, timeout and spawn-failure results retain their nullable exit-code contract.
+This check applies both to direct result reads and to the HTTP `process.wait`
+response. A runtime observation failure (`COMMAND_STATE_UNAVAILABLE`) raises
+`EnvironmentError` with `retry=same_operation` and `outcome=unknown`, preserving
+the command, environment and request identities; polling, listing and waiting do
+not turn an unavailable observation into a successful command result. Retry only
+the same read/wait operation, not command submission.
+For non-2xx responses this remains the original `EnvironmentHTTPError`, including
+its HTTP status, payload and request ID, with the same structured observation fields.
 
 Background commands run without an execution deadline by default. Pass
 `timeout` to set one explicitly; foreground commands default to 60 seconds.

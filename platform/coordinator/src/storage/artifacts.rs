@@ -35,6 +35,26 @@ impl RedisStore {
             }))
     }
 
+    pub(super) fn lock_artifact_deletions(
+        &self,
+        artifacts: &[CheckpointArtifact],
+    ) -> Result<Vec<ArtifactDeletionGuard>> {
+        artifacts
+            .iter()
+            .map(artifact_key)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|key| {
+                Ok(ArtifactDeletionGuard {
+                    _lock: self
+                        .artifact_lock(key)?
+                        .try_write_owned()
+                        .map_err(|_| Error::Conflict)?,
+                })
+            })
+            .collect()
+    }
+
     pub(super) fn lock_artifacts(
         &self,
         artifacts: &[CheckpointArtifact],
@@ -152,7 +172,7 @@ impl Session {
         let saved = snapshot(&raw)?;
         if saved.environments.values().any(|e| {
             e.result.as_ref().is_some_and(|r| {
-                record_artifacts(r)
+                record_references(r)
                     .iter()
                     .any(|a| same_artifact(a, artifact))
             })
@@ -219,12 +239,20 @@ pub(super) fn artifact_key(a: &CheckpointArtifact) -> String {
     format!("{}:{}", a.storage, a.location)
 }
 pub(super) fn record_artifacts(r: &EnvironmentRecord) -> Vec<CheckpointArtifact> {
+    record_references(r)
+        .into_iter()
+        .filter(|a| a.storage != "local")
+        .collect()
+}
+
+/// Local references also participate in cleanup exclusion, but never enter the
+/// shared artifact registry (their physical deletion belongs to the source node).
+pub(super) fn record_references(r: &EnvironmentRecord) -> Vec<CheckpointArtifact> {
     r.checkpoint
         .iter()
         .chain(r.snapshot_source.iter())
         .map(|p| p.artifact.clone())
         .chain(r.execution_artifacts.iter().cloned())
-        .filter(|a| a.storage != "local")
         .collect()
 }
 pub(super) fn hold_key(a: &Assignment) -> String {

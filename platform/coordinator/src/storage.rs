@@ -20,6 +20,8 @@ mod recovery;
 pub use observability::{
     BusinessCounters, CreationResult, CreationSummary, InterruptionSummary, RecoveryState,
 };
+#[cfg(test)]
+mod checkpoint_contention_tests;
 mod resume;
 pub(crate) use resume::ResumeAdmission;
 mod snapshot_preparation;
@@ -819,50 +821,26 @@ impl RedisStore {
     ) -> Result<bool> {
         let (name, old, next) = field.ok_or(Error::Conflict)?;
         let values = Self::publication_values([(name, Some(next.as_str()))])?;
-        let artifacts = if name.starts_with("environment:") {
+        let references = if name.starts_with("environment:") {
             decode::<StoredEnvironment>(&next)?
                 .result
                 .as_ref()
-                .map(artifacts::record_artifacts)
+                .map(artifacts::record_references)
                 .unwrap_or_default()
         } else {
             vec![]
         };
-        let attached_artifacts = if name.starts_with("environment:") {
-            let next: StoredEnvironment = decode(&next)?;
-            let previous = old.map(decode::<StoredEnvironment>).transpose()?;
-            let owned = |stored: &StoredEnvironment| {
-                stored
-                    .result
-                    .as_ref()
-                    .map(|record| {
-                        record
-                            .checkpoint
-                            .iter()
-                            .chain(record.snapshot_source.iter())
-                            .map(|point| point.artifact.clone())
-                            .chain(record.execution_artifacts.iter().cloned())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default()
-            };
-            let previous = previous.as_ref().map(owned).unwrap_or_default();
-            owned(&next)
-                .into_iter()
-                .filter(|artifact| !previous.contains(artifact))
-                .collect::<Vec<_>>()
+        // Upgrade barriers and node control still share the header CAS. Artifact
+        // references use scoped exclusion so unrelated attachments can publish
+        // independently under the same Coordinator epoch.
+        let guarded_header = if checks.iter().any(|(key, _)| key == HEADER) {
+            let mut next = header.clone();
+            next.advance()?;
+            Some((encode(header)?, encode(&next)?))
         } else {
-            vec![]
+            None
         };
-        let guarded_header =
-            if attached_artifacts.is_empty() && !checks.iter().any(|(key, _)| key == HEADER) {
-                None
-            } else {
-                let mut next = header.clone();
-                next.advance()?;
-                Some((encode(header)?, encode(&next)?))
-            };
-        let _access = self.lock_artifacts(&artifacts)?;
+        let _access = self.lock_artifacts(&references)?;
         let membership = if name.starts_with("environment:") {
             let environment: StoredEnvironment = decode(&next)?;
             format!("node-ownership:{}", environment.assignment.node_id)
@@ -916,7 +894,7 @@ impl RedisStore {
             .arg(guarded_header.as_ref().map(|pair| pair.0.as_str()).unwrap_or(""))
             .arg(guarded_header.as_ref().map(|pair| pair.1.as_str()).unwrap_or(""))
             .arg(encode(&checks.iter().map(|(key, value)| (key, value.as_deref().unwrap_or(""))).collect::<BTreeMap<_, _>>())?);
-        for artifact in artifacts {
+        for artifact in references.into_iter().filter(|a| a.storage != "local") {
             cmd.arg(artifacts::artifact_key(&artifact))
                 .arg(encode(&artifact)?);
         }
@@ -2352,12 +2330,15 @@ impl Session {
             } else {
                 None
             };
-            let cleanup = if result.state == EnvironmentState::Deleted {
+            // Keep artifact exclusion through retirement, including Redis
+            // cancellation: a stale cleanup scan must not race a new reference.
+            let prepared_cleanup = if result.state == EnvironmentState::Deleted {
                 self.prepare_checkpoint_cleanup(&stored_environment, &result, cleanup_artifacts)
                     .await?
             } else {
                 None
             };
+            let cleanup = prepared_cleanup.as_ref().map(|(task, _guards)| task);
             if cleanup.is_some() && catalog.is_none() {
                 header.advance()?;
             }
@@ -2390,7 +2371,7 @@ impl Session {
                         &DeletedReceipt::from_result(&result, cleanup_artifacts)?,
                         &counters,
                         catalog.as_ref(),
-                        cleanup.as_ref(),
+                        cleanup,
                     )
                     .await?
             } else {

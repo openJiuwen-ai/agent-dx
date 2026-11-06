@@ -772,6 +772,7 @@ impl Session {
         let (expected, header) = expected_header;
         let mut checks = BTreeMap::new();
         let mut artifacts = Vec::new();
+        let mut references = Vec::new();
         let mut memberships = Vec::new();
         let mut sessions = Vec::new();
         for (field, value) in fields {
@@ -793,6 +794,7 @@ impl Session {
                 memberships.push(format!("node-ownership:{}", record.assignment.node_id));
                 if let Some(result) = &record.result {
                     artifacts.extend(artifacts::record_artifacts(result));
+                    references.extend(artifacts::record_references(result));
                 }
             } else if field.starts_with("node:") {
                 let node: StoredNode = decode(value)?;
@@ -813,7 +815,7 @@ impl Session {
             }
             checks.insert(key.clone(), expected);
         }
-        let _access = self.store.lock_artifacts(&artifacts)?;
+        let _access = self.store.lock_artifacts(&references)?;
         let mut command = redis::cmd("EVAL");
         command.arg(r#"
             if redis.call('HGET',KEYS[1],'header') ~= ARGV[1] then return 0 end

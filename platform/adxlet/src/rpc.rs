@@ -1135,7 +1135,11 @@ impl crate::checkpoint::SnapshotCatalog for CoordinatorStateSink {
     async fn publish(
         &self,
         snapshot: adx_core::snapshots::Snapshot,
+        timeout: Duration,
     ) -> Result<adx_core::snapshots::Snapshot> {
+        if timeout.is_zero() {
+            return Err(Error::Unavailable("snapshot publication timed out".into()));
+        }
         let snapshot_id = snapshot.id.clone();
         let source_environment_id = snapshot.template.id.clone();
         let mut client = self
@@ -1148,8 +1152,8 @@ impl crate::checkpoint::SnapshotCatalog for CoordinatorStateSink {
             node_session_id: self.session_id.clone(),
         });
         adx_observability::trace::inject_metadata(request.metadata_mut());
-        request.set_timeout(self.timeout);
-        tokio::time::timeout(self.timeout, client.publish_snapshot(request))
+        request.set_timeout(timeout);
+        tokio::time::timeout(timeout, client.publish_snapshot(request))
             .await
             .map_err(|_| Error::Unavailable("snapshot publication timed out".into()))?
             .map_err(|status| {

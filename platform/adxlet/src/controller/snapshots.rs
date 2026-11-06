@@ -307,7 +307,16 @@ impl Controller {
                     self.publish_snapshot_state(deadline)
                         .await
                         .map_err(|error| step_error("artifact-hold-commit", error))?;
-                    pending.snapshot = catalog.publish(pending.snapshot.clone()).await?;
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(Error::Unavailable("snapshot publication timed out".into()));
+                    }
+                    pending.snapshot = tokio::time::timeout_at(
+                        deadline,
+                        catalog.publish(pending.snapshot.clone(), remaining),
+                    )
+                    .await
+                    .map_err(|_| Error::Unavailable("snapshot publication timed out".into()))??;
                     pending.stage = PublicationStage::CatalogPublished;
                 }
                 PublicationStage::CatalogPublished => {

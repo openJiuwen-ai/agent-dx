@@ -101,8 +101,12 @@ pub(crate) struct Attempt<'a> {
     started: Instant,
     outcome: usize,
     classification: (&'static str, &'static str),
+    successful_create: Option<std::time::Duration>,
 }
 impl Attempt<'_> {
+    pub fn successful_create(&mut self, elapsed: std::time::Duration) {
+        self.successful_create = Some(elapsed);
+    }
     pub fn elapsed(&self) -> std::time::Duration {
         self.started.elapsed()
     }
@@ -161,6 +165,15 @@ impl Drop for Attempt<'_> {
         for (bound, count) in BOUNDS.iter().zip(&mut completed.buckets) {
             *count += u64::from(elapsed <= *bound);
         }
+        if let Some(duration) = self.successful_create.filter(|_| self.outcome == 0) {
+            let histogram = &mut completed.successful_creates;
+            let seconds = duration.as_secs_f64();
+            histogram.count += 1;
+            histogram.seconds += seconds;
+            for (bound, count) in BOUNDS.iter().zip(&mut histogram.buckets) {
+                *count += u64::from(seconds <= *bound);
+            }
+        }
     }
 }
 impl CreationMetrics {
@@ -181,19 +194,6 @@ impl CreationMetrics {
             .entry(reason)
             .or_default() += 1;
     }
-    pub fn successful_create(&self, elapsed: std::time::Duration) {
-        let mut completed = self
-            .completed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let histogram = &mut completed.successful_creates;
-        let seconds = elapsed.as_secs_f64();
-        histogram.count += 1;
-        histogram.seconds += seconds;
-        for (bound, count) in BOUNDS.iter().zip(&mut histogram.buckets) {
-            *count += u64::from(seconds <= *bound);
-        }
-    }
     pub fn http_request(&self) {
         self.http.fetch_add(1, Ordering::Relaxed);
     }
@@ -207,6 +207,7 @@ impl CreationMetrics {
             started: Instant::now(),
             outcome: 3,
             classification: ("unknown", "unknown"),
+            successful_create: None,
         }
     }
     pub fn render(&self) -> String {
@@ -440,9 +441,17 @@ mod tests {
             Err(Status::invalid_argument("invalid")),
         ] {
             let mut attempt = metrics.attempt();
+            attempt.successful_create(std::time::Duration::from_secs(1));
+            if result.is_ok() {
+                assert!(metrics
+                    .render()
+                    .contains("adx_environment_create_success_call_duration_seconds_count 0\n"));
+            }
             attempt.finish(&result);
         }
-        drop(metrics.attempt());
+        let mut cancelled = metrics.attempt();
+        cancelled.successful_create(std::time::Duration::from_secs(1));
+        drop(cancelled);
         let text = metrics.render();
         for outcome in ["success", "failure", "unknown", "cancelled"] {
             assert!(
@@ -452,6 +461,8 @@ mod tests {
         }
         assert!(text.contains("adx_environment_create_in_flight 0\n"));
         assert!(text.contains("adx_environment_create_duration_seconds_count 4\n"));
+        assert!(text.contains("adx_environment_create_success_call_duration_seconds_count 1\n"));
+        assert!(text.contains("adx_environment_create_success_call_duration_seconds_sum 1\n"));
         assert!(!text.contains("environment_id"));
     }
 }
