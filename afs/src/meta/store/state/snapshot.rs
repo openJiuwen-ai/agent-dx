@@ -166,7 +166,7 @@ impl State {
         {
             return Err(invalid_contract("store event exceeds snapshot revision"));
         }
-        state.rebuild_dentry_parents();
+        state.rebuild_derived_indexes();
         Ok(state)
     }
 }

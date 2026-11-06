@@ -204,6 +204,9 @@ pub(super) struct State {
         crate::dfs::InodeId,
         Vec<u8>,
     )>,
+    /// Derived, never serialized: how many entities and retained request outcomes
+    /// carry each root epoch, so the epoch floor needs no scan.
+    pub(super) root_epochs: im::OrdMap<u64, u64>,
     pub(super) events: SharedEvents,
     pub(super) node_epochs: im::OrdMap<String, u64>,
     #[cfg(test)]

@@ -11,23 +11,7 @@ impl State {
         {
             return *value;
         }
-        let entities = self.entities.values().map(|v| match &v.entity {
-            MetaEntity::Root(v) => v.root_epoch,
-            MetaEntity::RootReservation(v) => v.root_epoch,
-            MetaEntity::RootGrant(v) => v.root_epoch,
-            MetaEntity::RootCommand(v) => v.root_epoch,
-            MetaEntity::RootCommandAck(v) => v.root_epoch,
-            _ => 0,
-        });
-        let outcomes = self.requests.values().map(|v| match &v.result {
-            OperationResult::RootRecord(v) => v.root_epoch,
-            OperationResult::RootReservation(v) => v.root_epoch,
-            OperationResult::RootGrant(v) => v.root_epoch,
-            OperationResult::RootCommand(v) => v.root_epoch,
-            OperationResult::RootCommandAck(v) => v.root_epoch,
-            _ => 0,
-        });
-        entities.chain(outcomes).max().unwrap_or(0)
+        self.root_epochs.get_max().map_or(0, |(epoch, _)| *epoch)
     }
 
     pub(in crate::meta::store) fn read(&self, read: MetaRead) -> Result<MetaSnapshot> {

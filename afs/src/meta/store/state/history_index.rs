@@ -232,7 +232,7 @@ impl State {
                 &outcome.result,
                 false,
             )?;
-            next.requests.remove(&request.key);
+            next.forget_request_outcome(&request.key);
             next.request_completion.remove(&request.key);
         }
         for _ in 0..removed {

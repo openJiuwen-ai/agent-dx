@@ -229,7 +229,7 @@ impl State {
                     revision: facts.revision_after,
                 },
             );
-            prepared.requests.insert(outcome.request.clone(), outcome);
+            prepared.record_request_outcome(outcome);
         }
         for (node, epoch) in facts.node_epochs {
             prepared.set_epoch(node, epoch)?;

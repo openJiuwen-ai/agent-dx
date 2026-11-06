@@ -84,7 +84,7 @@ impl State {
                     event_index += 1;
                 }
                 TxnMutation::RecordRequestOutcome(outcome) => {
-                    state.requests.insert(outcome.request.clone(), outcome);
+                    state.record_request_outcome(outcome);
                 }
             }
         }
@@ -272,27 +272,58 @@ impl State {
         }
         if let Some(old) = self.entities.get(&key) {
             let old = old.entity.clone();
-            self.unindex_dentry(&old);
+            self.unindex_entity(&old);
         }
-        self.index_dentry(&value.entity);
+        self.index_entity(&value.entity);
         self.entities.insert(key, value);
         Ok(())
     }
 
-    fn index_dentry(&mut self, entity: &MetaEntity) {
+    fn index_entity(&mut self, entity: &MetaEntity) {
         if let MetaEntity::DfsDentry(dentry) = entity {
             self.dentry_parents.insert(dentry_parent_entry(dentry));
         }
+        self.count_root_epoch(entity_root_epoch(entity), true);
     }
 
-    fn unindex_dentry(&mut self, entity: &MetaEntity) {
+    fn unindex_entity(&mut self, entity: &MetaEntity) {
         if let MetaEntity::DfsDentry(dentry) = entity {
             self.dentry_parents.remove(&dentry_parent_entry(dentry));
         }
+        self.count_root_epoch(entity_root_epoch(entity), false);
     }
 
-    /// Rebuilds the derived dentry index after loading entities from an image.
-    pub(in crate::meta::store) fn rebuild_dentry_parents(&mut self) {
+    fn count_root_epoch(&mut self, epoch: u64, present: bool) {
+        if epoch == 0 {
+            return;
+        }
+        if present {
+            *self.root_epochs.entry(epoch).or_insert(0) += 1;
+        } else if let Some(count) = self.root_epochs.get_mut(&epoch) {
+            *count -= 1;
+            if *count == 0 {
+                self.root_epochs.remove(&epoch);
+            }
+        }
+    }
+
+    /// Every retained outcome enters and leaves through these two.
+    pub(in crate::meta::store) fn record_request_outcome(&mut self, outcome: RequestOutcome) {
+        let epoch = outcome_root_epoch(&outcome);
+        if let Some(old) = self.requests.insert(outcome.request.clone(), outcome) {
+            self.count_root_epoch(outcome_root_epoch(&old), false);
+        }
+        self.count_root_epoch(epoch, true);
+    }
+
+    pub(in crate::meta::store) fn forget_request_outcome(&mut self, request: &RequestKey) {
+        if let Some(old) = self.requests.remove(request) {
+            self.count_root_epoch(outcome_root_epoch(&old), false);
+        }
+    }
+
+    /// Rebuilds the derived indexes after loading entities and outcomes from an image.
+    pub(in crate::meta::store) fn rebuild_derived_indexes(&mut self) {
         self.dentry_parents = self
             .entities
             .values()
@@ -301,6 +332,18 @@ impl State {
                 _ => None,
             })
             .collect();
+        let entity_epochs = self
+            .entities
+            .values()
+            .map(|versioned| entity_root_epoch(&versioned.entity));
+        let outcome_epochs = self.requests.values().map(outcome_root_epoch);
+        let mut root_epochs = im::OrdMap::new();
+        for epoch in entity_epochs.chain(outcome_epochs) {
+            if epoch != 0 {
+                *root_epochs.entry(epoch).or_insert(0) += 1;
+            }
+        }
+        self.root_epochs = root_epochs;
     }
 
     /// The dentry naming `child`: its only one for a directory.
@@ -337,7 +380,7 @@ impl State {
         }
         if let Some(old) = self.entities.get(key) {
             let old = old.entity.clone();
-            self.unindex_dentry(&old);
+            self.unindex_entity(&old);
         }
         self.entities.remove(key);
         Ok(())
@@ -352,6 +395,30 @@ impl State {
         }
         self.node_epochs.insert(node, epoch);
         Ok(())
+    }
+}
+
+/// The root epoch an entity holds as evidence of a used epoch; 0 for none.
+fn entity_root_epoch(entity: &MetaEntity) -> u64 {
+    match entity {
+        MetaEntity::Root(value) => value.root_epoch,
+        MetaEntity::RootReservation(value) => value.root_epoch,
+        MetaEntity::RootGrant(value) => value.root_epoch,
+        MetaEntity::RootCommand(value) => value.root_epoch,
+        MetaEntity::RootCommandAck(value) => value.root_epoch,
+        _ => 0,
+    }
+}
+
+/// The root epoch a retained request outcome holds as evidence; 0 for none.
+fn outcome_root_epoch(outcome: &RequestOutcome) -> u64 {
+    match &outcome.result {
+        OperationResult::RootRecord(value) => value.root_epoch,
+        OperationResult::RootReservation(value) => value.root_epoch,
+        OperationResult::RootGrant(value) => value.root_epoch,
+        OperationResult::RootCommand(value) => value.root_epoch,
+        OperationResult::RootCommandAck(value) => value.root_epoch,
+        _ => 0,
     }
 }
 
@@ -439,10 +506,85 @@ mod dentry_parent_tests {
         assert_eq!(recovered.dentry_parents, state.dentry_parents);
         let mut rebuilt = state.clone();
         rebuilt.dentry_parents = im::OrdSet::new();
-        rebuilt.rebuild_dentry_parents();
+        rebuilt.rebuild_derived_indexes();
         assert_eq!(rebuilt.dentry_parents, state.dentry_parents);
         let image = crate::meta::store::log::StateImage::encode(&state, 1024 * 1024).unwrap();
         let restored = crate::meta::store::log::StateImage::decode(&image, 1024 * 1024).unwrap();
         assert_eq!(restored.dentry_parents, state.dentry_parents);
+    }
+
+    /// What the derived epoch index replaces: scan every entity and outcome.
+    fn scanned_epoch_floor(state: &State) -> u64 {
+        state
+            .entities
+            .values()
+            .map(|versioned| entity_root_epoch(&versioned.entity))
+            .chain(state.requests.values().map(outcome_root_epoch))
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn grant(root: &str, epoch: u64) -> MetaEntity {
+        MetaEntity::RootGrant(crate::meta::store::RootAccessGrant {
+            root_id: root.into(),
+            root_epoch: epoch,
+            home_node_id: "home".into(),
+            home_session_id: "home-session".into(),
+            holder_node_id: "holder".into(),
+            holder_session_id: "holder-session".into(),
+            access_generation: 1,
+            rights: Vec::new(),
+            fencing_token: "fence".into(),
+            issued_at_revision: StoreRevision(1),
+        })
+    }
+
+    fn outcome(id: &str, epoch: u64) -> RequestOutcome {
+        let MetaEntity::RootGrant(value) = grant("r", epoch) else {
+            unreachable!()
+        };
+        RequestOutcome {
+            request: RequestKey::new("c", id),
+            operation: StoreOperation::CleanupRootGrants,
+            result: OperationResult::RootGrant(value),
+        }
+    }
+
+    #[test]
+    fn the_epoch_floor_tracks_every_change_without_a_scan() {
+        let mut state = State {
+            revision: StoreRevision(1),
+            ..State::default()
+        };
+        assert_eq!(state.root_epoch_watermark(), 0);
+        let check = |state: &State, expected: u64| {
+            assert_eq!(state.root_epoch_watermark(), expected);
+            assert_eq!(scanned_epoch_floor(state), expected);
+        };
+        put(&mut state, grant("a", 5));
+        put(&mut state, grant("b", 5));
+        put(&mut state, grant("c", 3));
+        check(&state, 5);
+        // Replacing an entity retires its old epoch.
+        put(&mut state, grant("a", 2));
+        check(&state, 5);
+        state.delete_authority(&entity_key(&grant("b", 5))).unwrap();
+        check(&state, 3);
+        // A retained outcome is evidence too, until retention removes it.
+        state.record_request_outcome(outcome("o", 9));
+        state.record_request_outcome(outcome("o", 9));
+        check(&state, 9);
+        let bytes = state.snapshot_bytes_with_batch(0).unwrap();
+        let recovered = State::from_snapshot(&bytes).unwrap();
+        assert_eq!(recovered.root_epochs, state.root_epochs);
+        let mut rebuilt = state.clone();
+        rebuilt.root_epochs = im::OrdMap::new();
+        rebuilt.rebuild_derived_indexes();
+        assert_eq!(rebuilt.root_epochs, state.root_epochs);
+        state.forget_request_outcome(&outcome("o", 9).request);
+        check(&state, 3);
+        state.delete_authority(&entity_key(&grant("c", 3))).unwrap();
+        state.delete_authority(&entity_key(&grant("a", 2))).unwrap();
+        check(&state, 0);
     }
 }
