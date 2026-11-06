@@ -10,6 +10,8 @@ pub mod autoscaling;
 mod journal;
 pub mod metrics;
 mod queue;
+#[cfg(test)]
+mod recovery_tests;
 pub mod routes;
 pub mod rpc;
 mod shard;
@@ -266,6 +268,38 @@ impl Coordinator {
         self.recovery_requests.insert(id);
         Ok(shard)
     }
+
+    /// Publish the durable spec after recovery placement. Required-node filters
+    /// added for checkpoint access and source exclusion are only placement inputs;
+    /// claims and execution grants must see the unchanged Environment identity.
+    /// Reject any other spec change or a different assignment without mutation.
+    pub(crate) fn finish_recovery_placement(
+        &mut self,
+        spec: &EnvironmentSpec,
+        assignment: &Assignment,
+    ) -> Result<()> {
+        spec.validate()?;
+        let (shard, queued) = self.requests.get_mut(&spec.id).ok_or(Error::Conflict)?;
+        if *shard != assignment.shard_id
+            || self.shards[*shard].assignment(&spec.id) != Some(assignment)
+        {
+            return Err(Error::Conflict);
+        }
+        let mut canonical = queued.clone();
+        canonical.scheduling.required_node = spec.scheduling.required_node.clone();
+        if canonical != *spec {
+            return Err(Error::Conflict);
+        }
+        *queued = canonical;
+        Arc::make_mut(&mut self.snapshot).place(PlacedEnvironment {
+            spec: spec.clone(),
+            node_id: assignment.node_id.clone(),
+        });
+        self.journal.record(&assignment.node_id);
+        self.wake_pending(None);
+        Ok(())
+    }
+
     pub fn submit(&mut self, spec: EnvironmentSpec) -> Result<usize> {
         spec.validate()?;
         if self.retired.contains(&spec.id) {

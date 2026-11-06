@@ -10,6 +10,8 @@
 4. checkpoint 缺失或 local-only 时明确恢复失败，不从原始镜像重新创建。节点不可调度期间不把它的容量重新投入分配。
 5. Coordinator 重启后，已有节点先关闭路由和准入，并从恢复完成时开始等待一个心跳超时周期。期限内重新报到可正常对账；期限届满仍未报到则失效旧执行。迟到注册和结果提交同样先检查这段期限，不能绕过定时器。
 
+跨节点选点追加的 checkpoint 存储别名、源节点及已拒绝节点排除条件只用于本次调度。`reserve_recovery` 持久化新 Assignment 后，调度请求与放置快照恢复为权威 Environment spec；新代次、设备和资源预留保持不变。后续独占卷执行授权、claim 和状态提交均比较原 spec，不能因这些临时条件产生身份冲突。该规则同时适用于自动故障恢复与休眠对象的按需恢复。
+
 ## 超时前的正常进程重启
 
 同一节点在心跳期限内重启 adxlet 时，Coordinator 通过 mTLS 调用原注册地址的 `NodeService.GetSession`，核对节点身份与新进程会话；原地址/代理地址必须保持一致。复核时不持有调度锁，提交注册时重新检查前任会话和期限。新会话先关闭准入并完成权威对账，保留仍有效的 backend，之后再恢复路由。旧会话的心跳和提交被拒绝。
@@ -23,6 +25,10 @@
 3. 已失效、已转移或代次落后的执行：退役本机绑定/会话，调用 RuntimeDriver 删除旧执行，清理本机占用。不能复用旧执行重新发布 Running，也不能把自动重启策略用于重新拉起它。
 4. SQLite 日志不能覆盖 Coordinator 的失效或转移决定；丢弃退役归属的补写记录。有效归属的日志继续遵守已有降级契约。
 5. 清理失败时保持对账未完成和准入关闭，重试清理。受有效快照引用保护的制品不随旧执行无条件删除。
+
+自动恢复仅对本地容量不足，以及后端 restore 调用前 `prepare_execution` 的临时准入错误（`Unavailable`、`VolumeBusy`、`NoCapacity` 或准入超时）返回可重试错误。已确认清理的尝试保留 Paused、checkpoint 与 `recovery.pending`；Coordinator 仍保留该恢复计划的调度预留。临时准入错误沿用已有 Assignment 重试；明确 NoCapacity 可由按需恢复流程记录拒绝后重新选点。执行准入控制 RPC 明确返回 `Unauthenticated` 或 `PermissionDenied` 时，保留已有错误码及原因，确认清理后转为 Failed，不自动重试。`Internal` 保留诊断原因，继续沿用该阶段的临时失败策略；没有明确认证拒绝的 TLS/连接故障仍按不可用处理。checkpoint 读取失败、后端拒绝、开始 restore 后的初始化超时、readiness 或路由激活失败，在确认清理后转为 Failed，即使错误类型为 `Unavailable`。清理不确定时保留实际状态和占用，不从镜像另起执行；Running 结果发布失败只补交结果，不重复调用后端 restore。
+
+执行授权可能先写入 Redis 的 `volume_execution` 和独占卷 Occupancy，再返回暂不可用。adxlet 此时保留本次 runtime id；确认清理后通过 Paused 提交携带 `stopped_runtime_ids`，Coordinator 原子释放对应占用并标记执行已释放，不依赖下一次恢复才释放。下一次准入用这个已清理 runtime 作为 previous，再申请新的 runtime。清理或提交未确认时保留清理凭据和必要占用，由后续同步/对账处理。
 
 失效判定与物理清理是两个步骤：前者由 Coordinator 在心跳超时后完成，后者由恢复后的 adxlet 执行。跨节点恢复不以收到旧节点的停止确认作为前置条件；控制面不应将超时事件记录为已经观察到远端进程退出。
 

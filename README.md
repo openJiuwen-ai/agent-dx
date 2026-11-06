@@ -162,6 +162,8 @@ Execd can initiate a dedicated bidirectional control stream to adxlet, publishin
 
 Checkpoint storage supports local only, S3 with a node cache, and direct AFS filesystem access. Shared publication completes the backend persistence barrier before authoritative metadata is acknowledged; local only retains readable-file semantics without forced writeback. Anonymous recovery points belong to their Environment; active execution inputs remain protected until confirmed cleanup. Coordinator reclaims shared S3/AFS artifacts, while nodes manage local files and cache eviction. Deleting an in-use reusable Snapshot returns `SNAPSHOT_IN_USE` with the Sandbox list. See the [storage contract and validation boundaries](docs/testing/snapshot-storage.md).
 
+Cross-node recovery preserves the Environment specification when selecting a checkpoint-compatible target and authorizing managed volumes. Automatic recovery retries local capacity refusal and temporary execution-admission failures before backend restore begins. Explicit control RPC authentication or permission rejections settle recovery Failed after confirmed cleanup. Checkpoint reads and backend restore, initialization, readiness or route failures settle Failed after confirmed cleanup; uncertain cleanup retains execution holds. See the [recovery contract](docs/testing/node-failure-takeover.md) and [pause/resume validation](docs/testing/environment-checkpoint.md).
+
 [Component names and abstractions](docs/architecture/naming.md).
 
 ## ✨ Capabilities
