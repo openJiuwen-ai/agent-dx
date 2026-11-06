@@ -36,6 +36,10 @@ use crate::{
         },
     },
 };
+pub mod hixl;
+#[cfg(all(feature = "ownerfs", feature = "dfs"))]
+pub mod owner_hixl;
+
 #[cfg(any(feature = "ownerfs", feature = "dfs", feature = "rdma", test))]
 use std::sync::Arc;
 #[cfg(feature = "rdma")]
@@ -157,6 +161,22 @@ impl PeerRuntime {
         match self {
             Self::Existing(handle) => handle.block_on(future),
             Self::Owned(runtime) => runtime.block_on(future),
+        }
+    }
+
+    /// Runs a detached task only when an external runtime keeps polling it. An
+    /// owned current-thread runtime makes no progress outside `block_on`, so
+    /// callers keep their synchronous path in that case.
+    fn spawn_background<F>(&self, future: F) -> bool
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        match self {
+            Self::Existing(handle) => {
+                handle.spawn(future);
+                true
+            }
+            Self::Owned(_) => false,
         }
     }
 }
@@ -1207,6 +1227,7 @@ pub struct GrpcChunkTransfer {
     runtime: PeerRuntime,
     timeout: Duration,
     next_read: std::sync::atomic::AtomicU64,
+    group_bytes: Option<u64>,
 }
 
 #[cfg(feature = "dfs")]
@@ -1234,7 +1255,14 @@ impl GrpcChunkTransfer {
             next_read: std::sync::atomic::AtomicU64::new(1),
             open_read_peers,
             fast_open_ready: std::sync::Mutex::new(std::collections::HashSet::new()),
+            group_bytes: None,
         })
+    }
+
+    /// Keeps the TCP control path on the same aggregated group budget as HIXL.
+    pub fn with_read_group(mut self, group_bytes: Option<u64>) -> Self {
+        self.group_bytes = group_bytes;
+        self
     }
 }
 
@@ -1266,7 +1294,10 @@ impl GrpcChunkTransfer {
                 chunk,
                 out.len(),
             )?,
-            None => batch.validate(out.len())?,
+            None => match self.group_bytes {
+                Some(group_bytes) => batch.validate_group(out.len(), group_bytes)?,
+                None => batch.validate(out.len())?,
+            },
         }
         let first = &batch.operations[0].source;
         self.remember_open_read(first)?;
@@ -4518,6 +4549,10 @@ pub struct OwnerPeerClient {
     data_mode: DataMode,
     rdma_device: Option<String>,
     timeout: Duration,
+    // Optional HIXL read-ahead windows of read-only opens. None keeps every
+    // read on the original gRPC path.
+    #[cfg(feature = "dfs")]
+    hixl: Option<owner_hixl::OwnerHixlFiles>,
 }
 
 /// Runtime used by synchronous OwnerFs/FUSE callbacks to drive async tonic RPCs.
@@ -4556,6 +4591,16 @@ impl OwnerRuntime {
         match self {
             Self::Existing(handle) => handle.block_on(future),
             Self::Owned(runtime) => runtime.block_on(future),
+        }
+    }
+
+    /// A handle whose spawned tasks progress without a caller blocking on it.
+    /// The private current-thread runtime only runs tasks inside `block_on`.
+    #[cfg(feature = "dfs")]
+    fn handle(&self) -> Option<tokio::runtime::Handle> {
+        match self {
+            Self::Existing(handle) => Some(handle.clone()),
+            Self::Owned(_) => None,
         }
     }
 }
@@ -4602,6 +4647,8 @@ pub fn owner_files_client_from_channel_result(channel: Channel) -> PeerResult<Ow
         data_mode: DataMode::Grpc,
         rdma_device: None,
         timeout: Duration::from_secs(5),
+        #[cfg(feature = "dfs")]
+        hixl: None,
     })
 }
 
@@ -4636,6 +4683,8 @@ pub fn owner_files_client_from_channel_with_runtime_and_metrics(
         data_mode: DataMode::Grpc,
         rdma_device: None,
         timeout: Duration::from_secs(5),
+        #[cfg(feature = "dfs")]
+        hixl: None,
     }
 }
 
@@ -4692,6 +4741,32 @@ impl OwnerPeerClient {
     pub fn with_rdma_admission(mut self, admission: Arc<tokio::sync::Semaphore>) -> Self {
         self.rdma_admission = admission;
         self
+    }
+
+    /// Serves eligible read-only opens of `home_node_id` from HIXL read-ahead
+    /// windows. Only gRPC data mode uses them; RDMA/auto keep their path.
+    #[cfg(feature = "dfs")]
+    pub fn with_hixl(
+        mut self,
+        reader: Arc<owner_hixl::OwnerHixlReader>,
+        home_node_id: String,
+    ) -> Self {
+        self.hixl = Some(owner_hixl::OwnerHixlFiles::new(reader, home_node_id));
+        self
+    }
+
+    #[cfg(feature = "dfs")]
+    fn hixl_files(&self) -> Option<&owner_hixl::OwnerHixlFiles> {
+        self.hixl
+            .as_ref()
+            .filter(|_| self.data_mode == DataMode::Grpc)
+    }
+
+    #[cfg(feature = "dfs")]
+    fn invalidate_hixl(&self, identity: Option<&FileIdentity>) {
+        if let (Some(hixl), Some(identity)) = (self.hixl_files(), identity) {
+            hixl.invalidate(&identity.0);
+        }
     }
 
     fn cloned_client(&self) -> PeerResult<OwnerFilesClient<Channel>> {
@@ -5060,6 +5135,86 @@ macro_rules! owner_rpc {
 }
 
 #[cfg(feature = "ownerfs")]
+impl OwnerPeerClient {
+    /// The gRPC/RDMA single-range read after the per-open prefetch check.
+    fn read_uncached(
+        &self,
+        grant: &RootGrant,
+        file: &RemoteFile,
+        offset: u64,
+        out: &mut [u8],
+    ) -> afs_error::Result<usize> {
+        let started = std::time::Instant::now();
+        let result = (|| -> PeerResult<usize> {
+            if !out.is_empty() && matches!(self.data_mode, DataMode::Rdma | DataMode::Auto) {
+                let negotiated = self.runtime.block_on(self.negotiate_owner_rdma(grant));
+                match (self.data_mode, negotiated) {
+                    (_, Ok(window)) => {
+                        let read = self.runtime.block_on(
+                            self.owner_read_with_rdma_window(window, grant, file, offset, out),
+                        )?;
+                        if let Some(metrics) = &self.metrics {
+                            metrics.record_payload("client", "read", "rdma", read as u64);
+                        }
+                        return Ok(read);
+                    }
+                    (DataMode::Rdma, Err(error)) => return Err(error),
+                    (DataMode::Auto, Err(error))
+                        if error.code() == afs_error::NODE_TRANSFER_UNSUPPORTED =>
+                    {
+                        afs_logging::warn!(
+                            "ownerfs.rdma_read_fallback";
+                            "code" => error.code().to_string(),
+                            "error" => error.to_string()
+                        );
+                    }
+                    (DataMode::Auto, Err(error)) => return Err(error),
+                    (DataMode::Grpc, _) => unreachable!("checked above"),
+                }
+            }
+            let length = out.len();
+            let mut client = self.cloned_client()?;
+            let reply = self.runtime.block_on(async move {
+                client
+                    .read(request_with_current_context(OwnerReadRequest {
+                        access: Some(root_access(grant)),
+                        handle: Some(file_handle(file)),
+                        offset,
+                        length: length as u32,
+                        plane: Some(grpc_plane()),
+                    }))
+                    .await
+                    .map_err(PeerError::from)
+                    .map(|reply| reply.into_inner())
+            })?;
+            if reply.read as usize != reply.data.len() || reply.data.len() > length {
+                return Err(PeerError::coded(
+                    afs_error::CLIENT_PROTOCOL_VIOLATION,
+                    "OwnerReadReply shape mismatch",
+                ));
+            }
+            if !reply.data_checksum.is_empty()
+                && blake3::hash(&reply.data).as_bytes().as_slice() != reply.data_checksum.as_slice()
+            {
+                return Err(PeerError::coded(
+                    afs_error::NODE_TRANSFER_CORRUPT_DATA,
+                    "OwnerReadReply checksum mismatch",
+                ));
+            }
+            out[..reply.data.len()].copy_from_slice(&reply.data);
+            if let Some(metrics) = &self.metrics {
+                metrics.record_payload("client", "read", "grpc", reply.data.len() as u64);
+            }
+            Ok(reply.data.len())
+        })();
+        if let Some(metrics) = &self.metrics {
+            metrics.observe("client", "read", started.elapsed());
+        }
+        result.map_err(|error| error.0)
+    }
+}
+
+#[cfg(feature = "ownerfs")]
 impl RemoteFiles for OwnerPeerClient {
     fn getlk(
         &self,
@@ -5344,6 +5499,8 @@ impl RemoteFiles for OwnerPeerClient {
                 caller: Some(owner_caller(ctx)),
             }
         );
+        #[cfg(feature = "dfs")]
+        self.invalidate_hixl(expected_identity.or(file.map(|file| &file.identity)));
         owner_entry(grant, reply.attr)
     }
 
@@ -5464,6 +5621,11 @@ impl RemoteFiles for OwnerPeerClient {
         let handle = reply
             .handle
             .ok_or_else(|| protocol_error("OwnerCreateReply missing handle"))?;
+        // Creating an existing file with O_TRUNC truncates it.
+        #[cfg(feature = "dfs")]
+        if flags & libc::O_TRUNC != 0 {
+            self.invalidate_hixl(Some(&entry.identity));
+        }
         Ok(RemoteCreatedFile {
             file: remote_file(
                 grant,
@@ -5635,6 +5797,15 @@ impl RemoteFiles for OwnerPeerClient {
                 .map_err(|_| protocol_error("OwnerFiles prefetch cache lock poisoned"))?
                 .insert(handle.opaque.clone(), bytes);
         }
+        #[cfg(feature = "dfs")]
+        if let Some(hixl) = self.hixl_files() {
+            // A truncating open changed the file; earlier opens drop their
+            // windows like after a write.
+            if flags & libc::O_TRUNC != 0 {
+                hixl.invalidate(&identity.opaque);
+            }
+            hixl.opened(&handle.opaque, &identity.opaque, flags, attributes.size);
+        }
         Ok((
             remote_file(
                 grant,
@@ -5732,73 +5903,24 @@ impl RemoteFiles for OwnerPeerClient {
             out[..end - start].copy_from_slice(&bytes[start..end]);
             return Ok(end - start);
         }
-        let started = std::time::Instant::now();
-        let result = (|| -> PeerResult<usize> {
-            if !out.is_empty() && matches!(self.data_mode, DataMode::Rdma | DataMode::Auto) {
-                let negotiated = self.runtime.block_on(self.negotiate_owner_rdma(grant));
-                match (self.data_mode, negotiated) {
-                    (_, Ok(window)) => {
-                        let read = self.runtime.block_on(
-                            self.owner_read_with_rdma_window(window, grant, file, offset, out),
-                        )?;
-                        if let Some(metrics) = &self.metrics {
-                            metrics.record_payload("client", "read", "rdma", read as u64);
-                        }
-                        return Ok(read);
-                    }
-                    (DataMode::Rdma, Err(error)) => return Err(error),
-                    (DataMode::Auto, Err(error))
-                        if error.code() == afs_error::NODE_TRANSFER_UNSUPPORTED =>
-                    {
-                        afs_logging::warn!(
-                            "ownerfs.rdma_read_fallback";
-                            "code" => error.code().to_string(),
-                            "error" => error.to_string()
-                        );
-                    }
-                    (DataMode::Auto, Err(error)) => return Err(error),
-                    (DataMode::Grpc, _) => unreachable!("checked above"),
+        #[cfg(feature = "dfs")]
+        if let Some(hixl) = self.hixl_files() {
+            let client = self.cloned_client().map_err(|error| error.0)?;
+            match hixl.read(&self.runtime, &client, grant, file, offset, out)? {
+                owner_hixl::WindowRead::Done(read) => return Ok(read),
+                owner_hixl::WindowRead::Fallback { served: 0 } => {}
+                owner_hixl::WindowRead::Fallback { served } => {
+                    let rest = self.read_uncached(
+                        grant,
+                        file,
+                        offset.saturating_add(served as u64),
+                        &mut out[served..],
+                    )?;
+                    return Ok(served + rest);
                 }
             }
-            let length = out.len();
-            let mut client = self.cloned_client()?;
-            let reply = self.runtime.block_on(async move {
-                client
-                    .read(request_with_current_context(OwnerReadRequest {
-                        access: Some(root_access(grant)),
-                        handle: Some(file_handle(file)),
-                        offset,
-                        length: length as u32,
-                        plane: Some(grpc_plane()),
-                    }))
-                    .await
-                    .map_err(PeerError::from)
-                    .map(|reply| reply.into_inner())
-            })?;
-            if reply.read as usize != reply.data.len() || reply.data.len() > length {
-                return Err(PeerError::coded(
-                    afs_error::CLIENT_PROTOCOL_VIOLATION,
-                    "OwnerReadReply shape mismatch",
-                ));
-            }
-            if !reply.data_checksum.is_empty()
-                && blake3::hash(&reply.data).as_bytes().as_slice() != reply.data_checksum.as_slice()
-            {
-                return Err(PeerError::coded(
-                    afs_error::NODE_TRANSFER_CORRUPT_DATA,
-                    "OwnerReadReply checksum mismatch",
-                ));
-            }
-            out[..reply.data.len()].copy_from_slice(&reply.data);
-            if let Some(metrics) = &self.metrics {
-                metrics.record_payload("client", "read", "grpc", reply.data.len() as u64);
-            }
-            Ok(reply.data.len())
-        })();
-        if let Some(metrics) = &self.metrics {
-            metrics.observe("client", "read", started.elapsed());
         }
-        result.map_err(|error| error.0)
+        self.read_uncached(grant, file, offset, out)
     }
 
     fn write_with_options(
@@ -5874,7 +5996,12 @@ impl RemoteFiles for OwnerPeerClient {
         if let Some(metrics) = &self.metrics {
             metrics.observe("client", "write", started.elapsed());
         }
-        result.map_err(|error| error.0)
+        let written = result.map_err(|error| error.0)?;
+        #[cfg(feature = "dfs")]
+        if written > 0 {
+            self.invalidate_hixl(Some(&file.identity));
+        }
+        Ok(written)
     }
 
     fn flush(&self, grant: &RootGrant, file: &RemoteFile) -> afs_error::Result<()> {
@@ -5912,6 +6039,10 @@ impl RemoteFiles for OwnerPeerClient {
             .lock()
             .map_err(|_| protocol_error("OwnerFiles prefetch cache lock poisoned"))?
             .remove(&file.handle);
+        #[cfg(feature = "dfs")]
+        if let Some(hixl) = &self.hixl {
+            hixl.released(&file.handle);
+        }
         // All writes and explicit sync/flush calls have already received their
         // own result before this cleanup request. A FUSE RELEASE is not a
         // durability barrier; waiting for its RPC only adds close latency.
@@ -7143,6 +7274,31 @@ mod tests {
                     > + Send,
             >,
         >;
+        async fn negotiate_hixl(
+            &self,
+            _request: Request<afs_protocol::node_data::DfsNegotiateHixlRequest>,
+        ) -> Result<Response<afs_protocol::node_data::DfsNegotiateHixlReply>, Status> {
+            Err(Status::unimplemented("unused fixture RPC"))
+        }
+        async fn prepare_read_ranges_hixl_group(
+            &self,
+            _request: Request<afs_protocol::node_data::DfsPrepareReadRangesHixlGroupRequest>,
+        ) -> Result<Response<afs_protocol::node_data::DfsPrepareReadRangesHixlGroupReply>, Status>
+        {
+            Err(Status::unimplemented("unused fixture RPC"))
+        }
+        async fn release_hixl_read(
+            &self,
+            _request: Request<afs_protocol::node_data::DfsReleaseHixlReadRequest>,
+        ) -> Result<Response<afs_protocol::node_data::DfsReleaseHixlReadReply>, Status> {
+            Err(Status::unimplemented("unused fixture RPC"))
+        }
+        async fn close_hixl(
+            &self,
+            _request: Request<afs_protocol::node_data::DfsCloseHixlRequest>,
+        ) -> Result<Response<afs_protocol::node_data::DfsCloseHixlReply>, Status> {
+            Err(Status::unimplemented("unused fixture RPC"))
+        }
         async fn put_replica_stream(
             &self,
             _request: Request<tonic::Streaming<afs_protocol::node_data::DfsPutReplicaFrame>>,
@@ -7350,6 +7506,7 @@ mod tests {
                         token: "test-token".into(),
                     },
                 },
+                chunk: None,
             }],
         }
     }
@@ -10800,6 +10957,7 @@ mod tests {
                 layout_root_id: LayoutRootId::new("layout"),
                 operations: (0..2)
                     .map(|i| ResolvedReadOp {
+                        chunk: None,
                         op: ChunkReadOp {
                             chunk_id: ChunkId::new(format!("chunk-{i}")),
                             chunk_offset: 0,

@@ -39,11 +39,21 @@ use afs_protocol::node_data::{
     node_data_server::{NodeData, NodeDataServer},
 };
 #[cfg(feature = "dfs")]
+pub mod hixl;
+#[cfg(all(feature = "ownerfs", feature = "dfs"))]
+pub mod owner_hixl;
+#[cfg(feature = "dfs")]
+pub mod snapshot;
+
+#[cfg(feature = "dfs")]
 use afs_protocol::node_data::{
-    DfsCloseRdmaReply, DfsCloseRdmaRequest, DfsConfirmReplicaRequest, DfsNegotiateRdmaReply,
-    DfsNegotiateRdmaRequest, DfsPutReplicaFrame, DfsPutReplicaRdmaRequest, DfsPutReplicaReply,
-    DfsReadRangesCompletion, DfsReadRangesFrame, DfsReadRangesHeader, DfsReadRangesRdmaReply,
-    DfsReadRangesRdmaRequest, DfsReadRangesRequest, DfsReplicaAck,
+    DfsCloseHixlReply, DfsCloseHixlRequest, DfsCloseRdmaReply, DfsCloseRdmaRequest,
+    DfsConfirmReplicaRequest, DfsNegotiateHixlReply, DfsNegotiateHixlRequest,
+    DfsNegotiateRdmaReply, DfsNegotiateRdmaRequest, DfsPrepareReadRangesHixlGroupReply,
+    DfsPrepareReadRangesHixlGroupRequest, DfsPutReplicaFrame, DfsPutReplicaRdmaRequest,
+    DfsPutReplicaReply, DfsReadRangesCompletion, DfsReadRangesFrame, DfsReadRangesHeader,
+    DfsReadRangesRdmaReply, DfsReadRangesRdmaRequest, DfsReadRangesRequest,
+    DfsReleaseHixlReadReply, DfsReleaseHixlReadRequest, DfsReplicaAck,
     dfs_chunks_server::{DfsChunks, DfsChunksServer},
     dfs_read_ranges_frame,
 };
@@ -53,9 +63,10 @@ use tokio_stream::Stream;
 use tonic::{Request, Response, Status};
 
 #[cfg(feature = "dfs")]
-use crate::node::{
-    chunk::LocalChunkStore,
-    dfs_read::{MAX_DFS_READ_BYTES, MAX_DFS_READ_OPS},
+use crate::node::chunk::LocalChunkStore;
+#[cfg(feature = "dfs")]
+use crate::node::dfs_read::{
+    MAX_DFS_GROUP_BYTES, MAX_DFS_GROUP_OPS, MAX_DFS_READ_BYTES, MAX_DFS_READ_OPS,
 };
 use crate::node::{
     rpc::control::RdmaSessionRegistry,
@@ -515,6 +526,7 @@ pub struct DfsChunkTransportResources {
     pub read_pipeline: crate::node::read_pipeline::ReadPipelineLimits,
     pub rdma_sessions: super::control::RdmaSessionRegistry,
     pub payload_metrics: Option<DfsPayloadMetrics>,
+    pub hixl: Option<Arc<hixl::HixlReadService>>,
 }
 
 // Existing constructors remain wrappers passing a disabled registry and no
@@ -536,6 +548,7 @@ pub struct DfsChunksService {
     replica_timeout: std::time::Duration,
     rdma_sessions: super::control::RdmaSessionRegistry,
     payload_metrics: Option<DfsPayloadMetrics>,
+    hixl: Option<Arc<hixl::HixlReadService>>,
 }
 
 /// Verifies grant authenticity, caller epoch, namespace/version/layout membership
@@ -886,6 +899,7 @@ pub fn make_dfs_chunks_server_with_replication(
             read_pipeline: Default::default(),
             rdma_sessions: super::control::RdmaSessionRegistry::new(None),
             payload_metrics: None,
+            hixl: None,
         },
     )
 }
@@ -916,6 +930,7 @@ pub fn make_dfs_chunks_server_with_transport(
         replica_timeout,
         rdma_sessions: resources.rdma_sessions,
         payload_metrics: resources.payload_metrics,
+        hixl: resources.hixl,
     })
 }
 
@@ -1481,6 +1496,59 @@ impl DfsChunks for DfsChunksService {
             tokio_stream::wrappers::ReceiverStream::new(receiver),
         )))
     }
+
+    async fn negotiate_hixl(
+        &self,
+        request: Request<DfsNegotiateHixlRequest>,
+    ) -> Result<Response<DfsNegotiateHixlReply>, Status> {
+        let peer = authenticate_peer(self.authenticator.as_ref(), &request)?;
+        let service = self.hixl.clone().ok_or_else(|| {
+            hixl::unsupported_status("HIXL DFS read source-window capability is unavailable")
+        })?;
+        service
+            .negotiate(peer, request.into_inner(), self.authorizer.clone())
+            .await
+    }
+
+    async fn prepare_read_ranges_hixl_group(
+        &self,
+        request: Request<DfsPrepareReadRangesHixlGroupRequest>,
+    ) -> Result<Response<DfsPrepareReadRangesHixlGroupReply>, Status> {
+        let peer = authenticate_peer(self.authenticator.as_ref(), &request)?;
+        let service = self.hixl.clone().ok_or_else(|| {
+            hixl::unsupported_status("HIXL DFS read source-window capability is unavailable")
+        })?;
+        service
+            .prepare_group(
+                peer,
+                request.into_inner(),
+                self.authorizer.clone(),
+                self.local_chunks.clone(),
+            )
+            .await
+    }
+
+    async fn release_hixl_read(
+        &self,
+        request: Request<DfsReleaseHixlReadRequest>,
+    ) -> Result<Response<DfsReleaseHixlReadReply>, Status> {
+        let peer = authenticate_peer(self.authenticator.as_ref(), &request)?;
+        let service = self.hixl.clone().ok_or_else(|| {
+            hixl::unsupported_status("HIXL DFS read source-window capability is unavailable")
+        })?;
+        service.release(peer, request.into_inner()).await
+    }
+
+    async fn close_hixl(
+        &self,
+        request: Request<DfsCloseHixlRequest>,
+    ) -> Result<Response<DfsCloseHixlReply>, Status> {
+        let peer = authenticate_peer(self.authenticator.as_ref(), &request)?;
+        let service = self.hixl.clone().ok_or_else(|| {
+            hixl::unsupported_status("HIXL DFS read source-window capability is unavailable")
+        })?;
+        service.close(peer, request.into_inner()).await
+    }
 }
 
 #[tonic::async_trait]
@@ -1601,6 +1669,9 @@ fn validate_length(length: u32) -> Result<(), Status> {
     Ok(())
 }
 
+/// Validates both legacy DFS batches and explicit ReadGroup aggregates. The
+/// small-batch 8 MiB construction budget stays with the sender; every transport
+/// boundary must admit a group that carries the group protocol budget.
 #[cfg(feature = "dfs")]
 fn validate_dfs_read_request(request: &DfsReadRangesRequest) -> Result<(), Status> {
     if request.read_id.is_empty()
@@ -1608,7 +1679,7 @@ fn validate_dfs_read_request(request: &DfsReadRangesRequest) -> Result<(), Statu
         || request.file_version_id.is_empty()
         || request.layout_root_id.is_empty()
         || request.operations.is_empty()
-        || request.operations.len() > MAX_DFS_READ_OPS
+        || request.operations.len() > MAX_DFS_GROUP_OPS
     {
         return Err(coded_status(
             afs_error::NODE_TRANSFER_INVALID,
@@ -1650,7 +1721,7 @@ fn validate_dfs_read_request(request: &DfsReadRangesRequest) -> Result<(), Statu
         }
         total = total
             .checked_add(op.length)
-            .filter(|total| *total <= MAX_DFS_READ_BYTES)
+            .filter(|total| *total <= MAX_DFS_GROUP_BYTES)
             .ok_or_else(|| {
                 coded_status(
                     afs_error::NODE_TRANSFER_INVALID,
@@ -3468,6 +3539,8 @@ pub struct OwnerFilesService {
     authenticator: Option<Arc<dyn PeerAuthenticator>>,
     metrics: Option<super::OwnerRpcMetrics>,
     rdma_sessions: Option<RdmaSessionRegistry>,
+    #[cfg(feature = "dfs")]
+    hixl: Option<Arc<owner_hixl::OwnerHixlService>>,
 }
 
 #[cfg(feature = "ownerfs")]
@@ -3482,7 +3555,18 @@ impl OwnerFilesService {
             authenticator: Some(authenticator),
             metrics: None,
             rdma_sessions: None,
+            #[cfg(feature = "dfs")]
+            hixl: None,
         }
+    }
+
+    /// Enables OwnerFs HIXL read-ahead windows. Without it the HIXL RPCs
+    /// report the capability as unsupported after authenticating the peer.
+    #[must_use]
+    #[cfg(feature = "dfs")]
+    pub fn with_hixl(mut self, hixl: Arc<owner_hixl::OwnerHixlService>) -> Self {
+        self.hixl = Some(hixl);
+        self
     }
 
     #[must_use]
@@ -3920,9 +4004,106 @@ pub fn make_owner_files_server_with_handler_metrics_and_rdma(
     )
 }
 
+#[must_use]
+#[cfg(feature = "ownerfs")]
+pub fn make_owner_files_server_from(
+    service: OwnerFilesService,
+) -> OwnerFilesServer<OwnerFilesService> {
+    OwnerFilesServer::new(service)
+}
+
+#[cfg(feature = "ownerfs")]
+impl OwnerFilesService {
+    /// Authenticates before reporting capability, so an unauthenticated
+    /// caller cannot probe whether this Home enables HIXL.
+    #[cfg(feature = "dfs")]
+    fn owner_hixl<T>(
+        &self,
+        operation: &'static str,
+        request: &Request<T>,
+    ) -> Result<(String, Arc<owner_hixl::OwnerHixlService>), Status> {
+        let peer = self.owner_peer(operation, request)?;
+        let hixl = self.hixl.clone().ok_or_else(|| {
+            owner_hixl::unsupported_status("OwnerFs HIXL read-ahead capability is unavailable")
+        })?;
+        Ok((peer, hixl))
+    }
+
+    #[cfg(not(feature = "dfs"))]
+    fn owner_hixl_unsupported<T>(&self, operation: &'static str, request: &Request<T>) -> Status {
+        match self.owner_peer(operation, request) {
+            Err(status) => status,
+            Ok(_) => coded_status(
+                afs_error::NODE_TRANSFER_UNSUPPORTED,
+                "OwnerFs HIXL read-ahead capability is unavailable",
+            ),
+        }
+    }
+}
+
 #[tonic::async_trait]
 #[cfg(feature = "ownerfs")]
 impl OwnerFiles for OwnerFilesService {
+    async fn negotiate_hixl(
+        &self,
+        request: Request<afs_protocol::node_data::OwnerNegotiateHixlRequest>,
+    ) -> Result<Response<afs_protocol::node_data::OwnerNegotiateHixlReply>, Status> {
+        #[cfg(feature = "dfs")]
+        {
+            let (peer, hixl) = self.owner_hixl("OwnerFiles.NegotiateHixl", &request)?;
+            hixl.negotiate(peer, request.into_inner()).await
+        }
+        #[cfg(not(feature = "dfs"))]
+        {
+            Err(self.owner_hixl_unsupported("OwnerFiles.NegotiateHixl", &request))
+        }
+    }
+
+    async fn prepare_read_hixl(
+        &self,
+        request: Request<afs_protocol::node_data::OwnerPrepareReadHixlRequest>,
+    ) -> Result<Response<afs_protocol::node_data::OwnerPrepareReadHixlReply>, Status> {
+        #[cfg(feature = "dfs")]
+        {
+            let (peer, hixl) = self.owner_hixl("OwnerFiles.PrepareReadHixl", &request)?;
+            hixl.prepare(peer, request.into_inner()).await
+        }
+        #[cfg(not(feature = "dfs"))]
+        {
+            Err(self.owner_hixl_unsupported("OwnerFiles.PrepareReadHixl", &request))
+        }
+    }
+
+    async fn release_hixl_read(
+        &self,
+        request: Request<afs_protocol::node_data::OwnerReleaseHixlReadRequest>,
+    ) -> Result<Response<afs_protocol::node_data::OwnerReleaseHixlReadReply>, Status> {
+        #[cfg(feature = "dfs")]
+        {
+            let (peer, hixl) = self.owner_hixl("OwnerFiles.ReleaseHixlRead", &request)?;
+            hixl.release(peer, request.into_inner()).await
+        }
+        #[cfg(not(feature = "dfs"))]
+        {
+            Err(self.owner_hixl_unsupported("OwnerFiles.ReleaseHixlRead", &request))
+        }
+    }
+
+    async fn close_hixl(
+        &self,
+        request: Request<afs_protocol::node_data::OwnerCloseHixlRequest>,
+    ) -> Result<Response<afs_protocol::node_data::OwnerCloseHixlReply>, Status> {
+        #[cfg(feature = "dfs")]
+        {
+            let (peer, hixl) = self.owner_hixl("OwnerFiles.CloseHixl", &request)?;
+            hixl.close(peer, request.into_inner()).await
+        }
+        #[cfg(not(feature = "dfs"))]
+        {
+            Err(self.owner_hixl_unsupported("OwnerFiles.CloseHixl", &request))
+        }
+    }
+
     async fn lookup(
         &self,
         request: Request<OwnerLookupRequest>,
@@ -5918,6 +6099,7 @@ mod tests {
                 read_pipeline: Default::default(),
                 rdma_sessions: super::super::control::RdmaSessionRegistry::new(None),
                 payload_metrics: Some(metrics),
+                hixl: None,
             },
         );
         let target_server = tokio::spawn(async move {
@@ -6900,6 +7082,7 @@ mod tests {
                 read_pipeline: Default::default(),
                 rdma_sessions: rdma_registry.clone(),
                 payload_metrics: Some(metrics.clone()),
+                hixl: None,
             },
         );
         let server = tokio::spawn(async move {
@@ -7231,6 +7414,7 @@ mod tests {
                     server_rdma.then(|| device.clone()),
                 ),
                 payload_metrics: Some(metrics.clone()),
+                hixl: None,
             },
         );
         let server = tokio::spawn(async move {
@@ -7286,6 +7470,7 @@ mod tests {
             file_version_id: crate::dfs::FileVersionId::new(read.file_version_id.clone()),
             layout_root_id: crate::dfs::LayoutRootId::new(read.layout_root_id.clone()),
             operations: vec![ResolvedReadOp {
+                chunk: None,
                 op: ChunkReadOp {
                     chunk_id: crate::dfs::ChunkId::new(item.chunk_id.clone()),
                     chunk_offset: item.chunk_offset,
@@ -7775,6 +7960,7 @@ mod tests {
             replica_timeout: std::time::Duration::from_secs(30),
             rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
             payload_metrics: None,
+            hixl: None,
         }
     }
 
@@ -8419,6 +8605,7 @@ mod tests {
             replica_timeout: std::time::Duration::from_secs(30),
             rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
             payload_metrics: None,
+            hixl: None,
         };
         assert!(
             denied
@@ -8440,6 +8627,7 @@ mod tests {
             replica_timeout: std::time::Duration::from_secs(30),
             rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
             payload_metrics: None,
+            hixl: None,
         };
         let mut stream = allowed
             .read_ranges(Request::new(request))
@@ -8483,8 +8671,63 @@ mod tests {
             .as_mut()
             .unwrap()
             .expires_at_unix_ms = u64::MAX;
+        // A ReadGroup aggregate exceeds the small-batch budget and stays valid
+        // up to the group budget.
         request.operations[0].length = MAX_DFS_READ_BYTES + 1;
+        assert!(validate_dfs_read_request(&request).is_ok());
+        request.operations[0].length = MAX_DFS_GROUP_BYTES;
+        assert!(validate_dfs_read_request(&request).is_ok());
+        request.operations[0].length = MAX_DFS_GROUP_BYTES + 1;
         assert!(validate_dfs_read_request(&request).is_err());
+        request.operations[0].length = 1;
+        let template = request.operations[0].clone();
+        request.operations = (0..=MAX_DFS_GROUP_OPS)
+            .map(|index| {
+                let mut op = template.clone();
+                op.operation_index = u32::try_from(index).unwrap();
+                op
+            })
+            .collect();
+        assert!(validate_dfs_read_request(&request).is_err());
+    }
+
+    #[cfg(feature = "dfs")]
+    #[tokio::test]
+    async fn dfs_hixl_disabled_authenticates_before_capability_status() {
+        struct RejectPeer;
+
+        impl PeerAuthenticator for RejectPeer {
+            fn authenticate(
+                &self,
+                _: &MetadataMap,
+                _: Option<SocketAddr>,
+                _: Option<&[u8]>,
+            ) -> afs_error::Result<String> {
+                Err(afs_error::Error::coded(
+                    afs_error::NODE_TRANSFER_INVALID,
+                    "fixture peer rejected",
+                ))
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut service = dfs_reuse_test_service(
+            Arc::new(LocalChunkStore::open(temp.path(), "node").unwrap()),
+            Arc::new(DenyDfsReadAuthorizer),
+        );
+        service.authenticator = Arc::new(RejectPeer);
+        let status = service
+            .negotiate_hixl(Request::new(DfsNegotiateHixlRequest::default()))
+            .await
+            .expect_err("unauthenticated HIXL calls must fail before capability lookup");
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+
+        service.authenticator = Arc::new(AllowDfsTestPeer);
+        let status = service
+            .negotiate_hixl(Request::new(DfsNegotiateHixlRequest::default()))
+            .await
+            .expect_err("authenticated disabled HIXL calls must return capability status");
+        assert_eq!(status.code(), tonic::Code::Unimplemented);
     }
     #[cfg(feature = "dfs")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -2059,12 +2059,12 @@ impl Drop for AfsFuse {
 impl Filesystem for AfsFuse {
     fn init(&mut self, _: &Request, config: &mut KernelConfig) -> io::Result<()> {
         self.record_request("init");
-        let _ = config.set_max_write(1024 * 1024);
         if self.cached_io {
             configure_readahead(self.mount_options.fuse_max_readahead_bytes, |limit| {
                 config.set_max_readahead(limit)
             })?;
         }
+        let _ = config.set_max_write(1024 * 1024);
         for capability in negotiated_init_flags(config.capabilities()) {
             let _ = config.add_capabilities(capability);
         }
@@ -3795,7 +3795,11 @@ impl Filesystem for AfsFuse {
                         &file_attr(ino, &created.entry.attributes),
                         Generation(0),
                         FuseFileHandle(fh),
-                        open_reply_flags(!private && !self.cached_io),
+                        if private || self.cached_io {
+                            FopenFlags::empty()
+                        } else {
+                            DIRECT_IO
+                        },
                     )
                 });
             }
@@ -5436,6 +5440,47 @@ mod dispatch_tests {
         assert_eq!(
             first.requests.with_label_values(&["ownerfs", "read"]).get(),
             2
+        );
+    }
+
+    #[test]
+    fn fuse_read_request_sizes_export_zeros_and_share_registry_without_cross_filesystem_leak() {
+        let registry = afs_metrics::Registry::new();
+        let first = super::FuseRequestMetrics::register(&registry).unwrap();
+        let text = afs_metrics::encode_text(&registry).unwrap();
+        for filesystem in ["ownerfs", "dfs"] {
+            for operation in ["read", "write"] {
+                assert!(
+                    text.lines().any(|line| {
+                        line.starts_with("afs_fuse_callback_size_bytes_count{")
+                            && line.contains(&format!("filesystem=\"{filesystem}\""))
+                            && line.contains(&format!("operation=\"{operation}\""))
+                            && line.ends_with(" 0")
+                    }),
+                    "missing zero histogram count for {filesystem}/{operation}: {text}"
+                );
+            }
+        }
+
+        let same = super::FuseRequestMetrics::register(&registry.clone()).unwrap();
+        first.record_io("dfs", "read", 131_072);
+        same.record_io("dfs", "read", 1_048_576);
+        let read = first.io_size_bytes.with_label_values(&["dfs", "read"]);
+        assert_eq!(read.get_sample_count(), 2);
+        assert_eq!(read.get_sample_sum(), 1_179_648.0);
+        assert_eq!(first.requests.with_label_values(&["dfs", "read"]).get(), 2);
+        assert_eq!(
+            first.requests.with_label_values(&["ownerfs", "read"]).get(),
+            0
+        );
+        let other_registry = afs_metrics::Registry::new();
+        let other = super::FuseRequestMetrics::register(&other_registry).unwrap();
+        assert_eq!(
+            other
+                .io_size_bytes
+                .with_label_values(&["dfs", "read"])
+                .get_sample_count(),
+            0
         );
     }
 

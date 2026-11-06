@@ -157,6 +157,490 @@ where
     }
 }
 
+#[cfg(any(feature = "dfs", test))]
+struct HixlStartupGuard<T, Cleanup>
+where
+    T: Send + 'static,
+    Cleanup: FnOnce(T) + Send + 'static,
+{
+    resource: Option<T>,
+    cleanup: Option<Cleanup>,
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl<T, Cleanup> HixlStartupGuard<T, Cleanup>
+where
+    T: Send + 'static,
+    Cleanup: FnOnce(T) + Send + 'static,
+{
+    fn new(resource: T, cleanup: Cleanup) -> Self {
+        Self {
+            resource: Some(resource),
+            cleanup: Some(cleanup),
+        }
+    }
+
+    fn resource(&self) -> Option<&T> {
+        self.resource.as_ref()
+    }
+
+    fn take(&mut self) -> Option<T> {
+        let resource = self.resource.take();
+        self.cleanup.take();
+        resource
+    }
+
+    async fn cleanup_now(&mut self) {
+        let (Some(resource), Some(cleanup)) = (self.resource.take(), self.cleanup.take()) else {
+            return;
+        };
+        if let Err(error) = tokio::task::spawn_blocking(move || cleanup(resource)).await {
+            afs_logging::error!("node.hixl_startup_cleanup_worker_failed"; "error" => error.to_string());
+        }
+    }
+}
+
+#[cfg(any(feature = "dfs", test))]
+impl<T, Cleanup> Drop for HixlStartupGuard<T, Cleanup>
+where
+    T: Send + 'static,
+    Cleanup: FnOnce(T) + Send + 'static,
+{
+    fn drop(&mut self) {
+        let (Some(resource), Some(cleanup)) = (self.resource.take(), self.cleanup.take()) else {
+            return;
+        };
+        let cleanup = move || cleanup(resource);
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            drop(handle.spawn_blocking(cleanup));
+        } else if let Err(error) = std::thread::Builder::new()
+            .name("afs-hixl-startup-cleanup".to_owned())
+            .spawn(cleanup)
+        {
+            afs_logging::error!("node.hixl_startup_cleanup_dispatch_failed"; "error" => error.to_string());
+        }
+    }
+}
+
+#[cfg(any(feature = "dfs", test))]
+async fn initialize_hixl_and_register_node<
+    T,
+    R,
+    Initialize,
+    InitializeFuture,
+    Register,
+    RegisterFuture,
+    Cleanup,
+>(
+    initialize: Initialize,
+    register: Register,
+    cleanup: Cleanup,
+) -> Result<(HixlStartupGuard<T, Cleanup>, R), BoxError>
+where
+    Initialize: FnOnce() -> InitializeFuture,
+    InitializeFuture: Future<Output = Result<T, BoxError>>,
+    Register: FnOnce() -> RegisterFuture,
+    RegisterFuture: Future<Output = Result<R, BoxError>>,
+    T: Send + 'static,
+    Cleanup: FnOnce(T) + Send + 'static,
+{
+    let runtime = initialize().await?;
+    let mut guard = HixlStartupGuard::new(runtime, cleanup);
+    let registration = match register().await {
+        Ok(registration) => registration,
+        Err(error) => {
+            guard.cleanup_now().await;
+            return Err(error);
+        }
+    };
+    Ok((guard, registration))
+}
+
+/// Either read mode needs the shared HIXL runtime group.
+#[cfg(feature = "dfs")]
+fn hixl_runtime_configured(config: &crate::config::HixlConfig) -> bool {
+    config.dfs_read_mode != crate::config::HixlDfsReadMode::Off
+        || config.ownerfs_read_mode != crate::config::HixlOwnerFsReadMode::Off
+}
+
+/// A required mode keeps startup fail-closed when the local capability is absent.
+#[cfg(feature = "dfs")]
+fn hixl_runtime_required(config: &crate::config::HixlConfig) -> bool {
+    config.dfs_read_mode == crate::config::HixlDfsReadMode::Required
+        || config.ownerfs_read_mode == crate::config::HixlOwnerFsReadMode::Required
+}
+
+#[cfg(feature = "dfs")]
+const HIXL_EXPIRY_PERIOD: Duration = Duration::from_secs(5);
+
+/// Periodically retires expired sessions of one HIXL source until shutdown.
+/// A failed tick is logged and retried on the next tick. The source freezes
+/// admission before it asks the runtime to quarantine, so a failure never
+/// reopens admission, and it must not end the service: `Services` would stop
+/// every non-HIXL path of the Node with it.
+#[cfg(feature = "dfs")]
+fn spawn_hixl_expiry<F, Fut>(services: &mut Services, expire: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = std::result::Result<(), tonic::Status>> + Send + 'static,
+{
+    let stop = services.stop.subscribe();
+    services.spawn(run_hixl_expiry(HIXL_EXPIRY_PERIOD, stop, expire));
+}
+
+#[cfg(feature = "dfs")]
+async fn run_hixl_expiry<F, Fut>(
+    period: Duration,
+    stop: tokio::sync::watch::Receiver<bool>,
+    expire: F,
+) -> crate::runtime::ServiceResult
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = std::result::Result<(), tonic::Status>> + Send + 'static,
+{
+    let mut tick = tokio::time::interval(period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let shutdown = cancelled(stop);
+    tokio::pin!(shutdown);
+    loop {
+        tokio::select! {
+            _ = &mut shutdown => return Ok(()),
+            _ = tick.tick() => {
+                if let Err(status) = expire().await {
+                    afs_logging::warn!("dfs.hixl_expiry_failed";
+                        "error" => status.message(),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn cleanup_hixl_startup_runtime(runtime: Option<Arc<afs_transport::hixl::HixlRuntimeGroup>>) {
+    if let Some(runtime) = runtime
+        && let Err(error) = runtime.shutdown()
+    {
+        afs_logging::error!("dfs.hixl_startup_cleanup_failed"; "error" => error.to_string());
+    }
+}
+
+/// Pre-establishes HIXL control sessions for the configured peers at startup.
+/// The loop is bounded and never blocks node startup: a peer that is not up
+/// yet is retried with a fresh registry lookup, and a pre-warm that cannot
+/// succeed leaves the lazy first-read connect path unchanged. `session_idle`
+/// still governs how long an unused pre-warmed session survives.
+#[cfg(feature = "dfs")]
+fn spawn_hixl_prewarm(
+    transfer: Arc<rpc::peer::hixl::HixlChunkTransfer>,
+    nodes: Vec<String>,
+    caller_epoch: u64,
+    meta: Arc<rpc::meta::GrpcDfsMeta>,
+) {
+    const ATTEMPTS: usize = 10;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+    let spawned = std::thread::Builder::new()
+        .name("afs-hixl-prewarm".to_owned())
+        .spawn(move || {
+            for node_id in &nodes {
+                for attempt in 0..ATTEMPTS {
+                    match meta.lookup_node_data_location(node_id) {
+                        Ok((address, node_epoch)) => {
+                            if transfer.prewarm(node_id, node_epoch, &address, caller_epoch) {
+                                afs_logging::info!("dfs.hixl_prewarm_connected";
+                                    "peer" => node_id.as_str(),
+                                );
+                                break;
+                            }
+                            if attempt + 1 == ATTEMPTS {
+                                afs_logging::warn!("dfs.hixl_prewarm_exhausted";
+                                    "peer" => node_id.as_str(),
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            if attempt + 1 == ATTEMPTS {
+                                afs_logging::warn!("dfs.hixl_prewarm_failed";
+                                    "peer" => node_id.as_str(),
+                                    "error" => error.to_string(),
+                                );
+                            }
+                        }
+                    }
+                    std::thread::sleep(RETRY_DELAY);
+                }
+            }
+        });
+    if spawned.is_err() {
+        afs_logging::error!("dfs.hixl_prewarm_spawn_failed");
+    }
+}
+
+#[cfg(all(test, feature = "dfs"))]
+mod hixl_expiry_tests {
+    use super::run_hixl_expiry;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+
+    /// A failed tick must not end the expiry service: `Services` treats any
+    /// ended service as fatal and would stop every non-HIXL path with it.
+    #[tokio::test]
+    async fn failed_expiry_tick_keeps_the_service_running() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (stop, receiver) = tokio::sync::watch::channel(false);
+        let counter = calls.clone();
+        let service = tokio::spawn(run_hixl_expiry(
+            Duration::from_millis(5),
+            receiver,
+            move || {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    Err(tonic::Status::unavailable("injected expiry failure"))
+                }
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while calls.load(Ordering::SeqCst) < 3 && !service.is_finished() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("expiry ticks are bounded");
+        assert!(!service.is_finished(), "a failed tick ended the service");
+        stop.send(true).unwrap();
+        service.await.unwrap().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod hixl_startup_order_tests {
+    use super::{BoxError, HixlStartupGuard, initialize_hixl_and_register_node};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    struct FakeRuntime;
+
+    fn test_error(message: &'static str) -> BoxError {
+        std::io::Error::other(message).into()
+    }
+
+    #[tokio::test]
+    async fn slow_hixl_initialization_completes_before_meta_registration() {
+        let initialized = Arc::new(AtomicBool::new(false));
+        let elapsed_seconds = Arc::new(AtomicU64::new(0));
+        let registration_elapsed = Arc::new(AtomicU64::new(0));
+        let registered_before_init = Arc::new(AtomicBool::new(false));
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let (init_started, init_started_rx) = oneshot::channel();
+        let (finish_init, finish_init_rx) = oneshot::channel();
+
+        let task = tokio::spawn(initialize_hixl_and_register_node(
+            {
+                let initialized = Arc::clone(&initialized);
+                move || async move {
+                    let _ = init_started.send(());
+                    finish_init_rx
+                        .await
+                        .map_err(|_| test_error("init gate closed"))?;
+                    initialized.store(true, Ordering::SeqCst);
+                    Ok(FakeRuntime)
+                }
+            },
+            {
+                let initialized = Arc::clone(&initialized);
+                let elapsed_seconds = Arc::clone(&elapsed_seconds);
+                let registration_elapsed = Arc::clone(&registration_elapsed);
+                let registered_before_init = Arc::clone(&registered_before_init);
+                move || async move {
+                    registration_elapsed
+                        .store(elapsed_seconds.load(Ordering::SeqCst), Ordering::SeqCst);
+                    registered_before_init
+                        .store(!initialized.load(Ordering::SeqCst), Ordering::SeqCst);
+                    Ok("registered")
+                }
+            },
+            {
+                let cleanup_calls = Arc::clone(&cleanup_calls);
+                move |_| {
+                    cleanup_calls.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        ));
+
+        tokio::time::timeout(Duration::from_secs(1), init_started_rx)
+            .await
+            .expect("HIXL initializer did not start")
+            .expect("HIXL initializer dropped its start signal");
+        // Advance the fake startup clock beyond Meta's 30-second lease while
+        // initialization is still blocked, without making the test wait 30 s.
+        elapsed_seconds.store(31, Ordering::SeqCst);
+        finish_init
+            .send(())
+            .expect("HIXL initializer gate was dropped");
+
+        let (mut guard, registration) = task
+            .await
+            .expect("startup helper task panicked")
+            .expect("startup helper failed");
+        assert_eq!(registration, "registered");
+        assert!(!registered_before_init.load(Ordering::SeqCst));
+        assert!(registration_elapsed.load(Ordering::SeqCst) >= 30);
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            guard.take().is_some(),
+            "successful startup must hand off HIXL"
+        );
+        drop(guard);
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn hixl_initialization_failure_skips_meta_registration() {
+        let registration_calls = Arc::new(AtomicUsize::new(0));
+        let result = initialize_hixl_and_register_node(
+            || async { Err::<FakeRuntime, _>(test_error("HIXL initialization failed")) },
+            {
+                let registration_calls = Arc::clone(&registration_calls);
+                move || async move {
+                    registration_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+            |_| {},
+        )
+        .await;
+
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("failed HIXL initialization must fail startup"),
+        };
+        assert_eq!(error.to_string(), "HIXL initialization failed");
+        assert_eq!(registration_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn meta_registration_failure_cleans_hixl_and_preserves_primary_error() {
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let result = initialize_hixl_and_register_node(
+            || async { Ok(FakeRuntime) },
+            || async { Err::<(), _>(test_error("primary Meta registration failure")) },
+            {
+                let cleanup_calls = Arc::clone(&cleanup_calls);
+                move |_| {
+                    cleanup_calls.fetch_add(1, Ordering::SeqCst);
+                }
+            },
+        )
+        .await;
+
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("Meta registration failure must fail startup"),
+        };
+        assert_eq!(error.to_string(), "primary Meta registration failure");
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancelling_meta_registration_future_cleans_hixl_once() {
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let (cleanup_done, cleanup_done_rx) = oneshot::channel();
+        let (register_started, register_started_rx) = oneshot::channel();
+        let task = tokio::spawn(initialize_hixl_and_register_node(
+            || async { Ok(FakeRuntime) },
+            move || async move {
+                let _ = register_started.send(());
+                std::future::pending::<Result<(), BoxError>>().await
+            },
+            {
+                let cleanup_calls = Arc::clone(&cleanup_calls);
+                move |_| {
+                    cleanup_calls.fetch_add(1, Ordering::SeqCst);
+                    let _ = cleanup_done.send(());
+                }
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(1), register_started_rx)
+            .await
+            .expect("registration did not start")
+            .expect("registration dropped its start signal");
+
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(Duration::from_secs(1), cleanup_done_rx)
+            .await
+            .expect("cancelled startup did not dispatch HIXL cleanup")
+            .expect("HIXL cleanup worker dropped its completion signal");
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_startup_guard_does_not_block_runtime_worker() {
+        let (release_cleanup, cleanup_gate) = std::sync::mpsc::channel();
+        let (cleanup_done, cleanup_done_rx) = oneshot::channel();
+        let cleanup_released = Arc::new(AtomicBool::new(false));
+        let watchdog_fired = Arc::new(AtomicBool::new(false));
+
+        let cleanup = move |_| {
+            let _ = cleanup_gate.recv();
+            let _ = cleanup_done.send(());
+        };
+        let guard = HixlStartupGuard::new(FakeRuntime, cleanup);
+
+        let cleanup_released_by_timer = Arc::clone(&cleanup_released);
+        let timer_cleanup_release = release_cleanup.clone();
+        let (timer_completed, timer_completed_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            cleanup_released_by_timer.store(true, Ordering::SeqCst);
+            let _ = timer_cleanup_release.send(());
+            let _ = timer_completed.send(());
+        });
+
+        let cleanup_released_by_watchdog = Arc::clone(&cleanup_released);
+        let watchdog_fired_by_thread = Arc::clone(&watchdog_fired);
+        let watchdog_release = release_cleanup.clone();
+        let watchdog = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            if !cleanup_released_by_watchdog.load(Ordering::SeqCst) {
+                watchdog_fired_by_thread.store(true, Ordering::SeqCst);
+                let _ = watchdog_release.send(());
+            }
+        });
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_millis(100), timer_completed_rx)
+            .await
+            .expect("HIXL cleanup blocked the Tokio worker")
+            .expect("timer task dropped its completion signal");
+        tokio::time::timeout(Duration::from_secs(1), cleanup_done_rx)
+            .await
+            .expect("HIXL cleanup worker did not finish")
+            .expect("HIXL cleanup worker dropped its completion signal");
+        assert!(!watchdog_fired.load(Ordering::SeqCst));
+        watchdog.join().expect("cleanup watchdog panicked");
+    }
+
+    #[test]
+    fn dropping_startup_guard_without_runtime_uses_thread_fallback() {
+        let (cleanup_done, cleanup_done_rx) = std::sync::mpsc::channel();
+        drop(HixlStartupGuard::new(FakeRuntime, move |_| {
+            let _ = cleanup_done.send(());
+        }));
+
+        cleanup_done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("HIXL cleanup was not dispatched without a Tokio runtime");
+    }
+}
+
 fn configure_node_tcp_server(
     grpc_config: &afs_transport::grpc::GrpcConfig,
     ownerfs: bool,
@@ -184,6 +668,8 @@ struct OwnerFilesFactory {
     rdma_device: Option<String>,
     timeout: std::time::Duration,
     rdma_admission: Arc<tokio::sync::Semaphore>,
+    #[cfg(feature = "dfs")]
+    hixl: Option<Arc<rpc::peer::owner_hixl::OwnerHixlReader>>,
 }
 
 #[cfg(feature = "ownerfs")]
@@ -234,16 +720,20 @@ impl vfs::ownerfs::RemoteFilesFactory for OwnerFilesFactory {
         let long_wait_channel =
             self.runtime
                 .block_on(self.peers.long_wait_channel(home_node_id, node_epoch, &uri))?;
-        Ok(Arc::new(
-            rpc::peer::owner_files_client_from_channel_with_runtime_and_metrics(
-                channel,
-                self.runtime.clone(),
-                Some(self.metrics.clone()),
-            )
-            .with_data_transport(self.data_mode, self.rdma_device.clone(), self.timeout)
-            .with_rdma_admission(self.rdma_admission.clone())
-            .with_long_wait_channel(long_wait_channel),
-        ))
+        let client = rpc::peer::owner_files_client_from_channel_with_runtime_and_metrics(
+            channel,
+            self.runtime.clone(),
+            Some(self.metrics.clone()),
+        )
+        .with_data_transport(self.data_mode, self.rdma_device.clone(), self.timeout)
+        .with_rdma_admission(self.rdma_admission.clone())
+        .with_long_wait_channel(long_wait_channel);
+        #[cfg(feature = "dfs")]
+        let client = match &self.hixl {
+            Some(reader) => client.with_hixl(reader.clone(), home_node_id.to_owned()),
+            None => client,
+        };
+        Ok(Arc::new(client))
     }
 }
 
@@ -261,6 +751,10 @@ pub struct Node {
     pub ownerfs: Option<Arc<vfs::ownerfs::OwnerFs>>,
     #[cfg(feature = "dfs")]
     pub dfs: Option<Arc<vfs::dfs::DistributedFs>>,
+    #[cfg(feature = "dfs")]
+    pub hixl_runtime: Option<Arc<afs_transport::hixl::HixlRuntimeGroup>>,
+    #[cfg(feature = "dfs")]
+    pub hixl_metrics: Option<rpc::hixl::HixlMetrics>,
 }
 
 const READINESS_SAMPLER_INTERVAL: Duration = Duration::from_secs(15);
@@ -1324,7 +1818,7 @@ async fn run_node(
             },
         )
     });
-    let (registered_node_epoch, registered_node_at, registered_readiness) =
+    let register_initial_node = || async {
         if let Some((endpoint, descriptor)) = &node_descriptor {
             // No FUSE mount or local API has been exposed yet. A bounded retry
             // absorbs the valid cold-start window in which Meta has been
@@ -1343,14 +1837,93 @@ async fn run_node(
                 initial_registration_budget(timeout),
             )
             .await?;
-            (
+            Ok::<_, BoxError>((
                 registration.lease_epoch,
                 Some(Instant::now()),
                 Some(registration),
-            )
+            ))
         } else {
-            (0, None, None)
-        };
+            Ok((0, None, None))
+        }
+    };
+    #[cfg(feature = "dfs")]
+    let (mut hixl_startup_guard, initial_registration) =
+        initialize_hixl_and_register_node(
+            || async {
+                // DFS and OwnerFs share one runtime group (and its failure
+                // domain); either mode starts it.
+                let hixl_runtime =
+                    if hixl_runtime_configured(&cfg.hixl) {
+                        let options = cfg.hixl.runtime_options_per_device();
+                        match tokio::task::spawn_blocking(move || {
+                            afs_transport::hixl::HixlRuntimeGroup::start(options)
+                        })
+                        .await?
+                        {
+                            Ok(runtime) => Some(runtime),
+                            Err(error)
+                                if !hixl_runtime_required(&cfg.hixl)
+                                    && error.kind
+                                        == afs_transport::hixl::HixlErrorKind::Unsupported =>
+                            {
+                                afs_logging::warn!("dfs.hixl_startup_fallback"; "reason" => "local capability unsupported");
+                                None
+                            }
+                            Err(error) => {
+                                return Err(rpc::hixl::runtime_error(error).into());
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                Ok(hixl_runtime)
+            },
+            register_initial_node,
+            cleanup_hixl_startup_runtime,
+        )
+        .await?;
+    #[cfg(not(feature = "dfs"))]
+    let initial_registration = register_initial_node().await?;
+    let (registered_node_epoch, registered_node_at, registered_readiness) = initial_registration;
+    #[cfg(feature = "dfs")]
+    let hixl_runtime = hixl_startup_guard.resource().cloned().flatten();
+    #[cfg(feature = "dfs")]
+    let hixl_metrics = if hixl_runtime_configured(&cfg.hixl) {
+        let metrics = rpc::hixl::HixlMetrics::register(&obs.registry)?;
+        if let Some(runtime) = &hixl_runtime {
+            metrics.snapshot(&runtime.status());
+        } else {
+            metrics.observe(rpc::hixl::Operation::Fallback, Duration::ZERO, true);
+        }
+        Some(metrics)
+    } else {
+        None
+    };
+    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    let owner_hixl_reader = match (&hixl_runtime, cfg.hixl.ownerfs_read_mode) {
+        (Some(runtime), mode) if mode != crate::config::HixlOwnerFsReadMode::Off => {
+            let mut reader = rpc::peer::owner_hixl::OwnerHixlReader::new(
+                runtime.clone(),
+                cfg.id.clone(),
+                rpc::peer::owner_hixl::OwnerHixlPolicy {
+                    mode,
+                    max_window_bytes: cfg.hixl.ownerfs_window_bytes,
+                    max_inflight: cfg.hixl.ownerfs_max_inflight,
+                    host_budget_bytes: cfg.hixl.ownerfs_host_budget_bytes,
+                    min_file_bytes: cfg.hixl.ownerfs_min_file_bytes,
+                    receive_slots: cfg.hixl.receive_slots,
+                    sessions_per_home: cfg.hixl.ownerfs_sessions_per_home,
+                },
+                timeout,
+            )?
+            .with_owner_metrics(owner_rpc_metrics.clone());
+            if let Some(metrics) = &hixl_metrics {
+                reader = reader.with_metrics(metrics.clone());
+            }
+            Some(Arc::new(reader))
+        }
+        _ => None,
+    };
     #[cfg(feature = "dfs")]
     let dfs_read_authority = if cfg.dfs {
         let registration = registered_readiness.as_ref().ok_or_else(|| {
@@ -1439,6 +2012,8 @@ async fn run_node(
             rdma_admission: Arc::new(tokio::sync::Semaphore::new(
                 rpc::peer::OWNER_RDMA_MAX_CLIENT_WINDOWS,
             )),
+            #[cfg(feature = "dfs")]
+            hixl: owner_hixl_reader.clone(),
         });
         let recovery_root_meta = root_meta.clone();
         let roots = Arc::new(
@@ -1525,6 +2100,23 @@ async fn run_node(
     };
     #[cfg(feature = "dfs")]
     let dfs_data_mode = parse_data_mode(&cfg.data_mode);
+    // The DFS source serves only DFS mode; an OwnerFs-only runtime must not
+    // expose DFS windows.
+    #[cfg(feature = "dfs")]
+    let hixl_source = hixl_runtime
+        .as_ref()
+        .filter(|_| cfg.hixl.dfs_read_mode != crate::config::HixlDfsReadMode::Off)
+        .map(|runtime| {
+            let mut source = rpc::data::hixl::HixlReadService::new(
+                runtime.clone(),
+                cfg.id.clone(),
+                registered_node_epoch,
+            );
+            if let Some(metrics) = &hixl_metrics {
+                source = source.with_metrics(metrics.clone());
+            }
+            Arc::new(source)
+        });
     #[cfg(feature = "dfs")]
     let dfs_rdma_pool = if cfg.dfs {
         if let Some(device) = dfs_rdma_startup_device(dfs_data_mode, cfg.rdma_device.as_deref())? {
@@ -1649,17 +2241,74 @@ async fn run_node(
             readahead_max_bytes: cfg.dfs_readahead_max_bytes,
         };
         read_config.validate()?;
-        let read_engine = dfs_read::DfsReadEngine::new(
-            namespace.clone(),
-            cfg.id.clone(),
-            chunks,
-            meta.clone(),
+        let read_group = (cfg.dfs_read_group_mode == crate::config::DfsReadGroupMode::Sequential)
+            .then(|| dfs_read::ReadGroupPolicy {
+                bytes: usize::try_from(cfg.dfs_read_group_bytes).unwrap_or(usize::MAX),
+                max_inflight: cfg.dfs_read_group_max_inflight,
+                max_descriptors: cfg.dfs_read_group_max_descriptors,
+                host_budget_bytes: usize::try_from(cfg.dfs_read_group_host_budget_bytes)
+                    .unwrap_or(usize::MAX),
+            });
+        let grpc_group = read_group.map(|group| group.bytes as u64);
+        // Only aggregate at the DFS layer when the selected transport accepts
+        // group-sized logical batches; RDMA keeps its legacy per-batch budget.
+        let transport_group = read_group.filter(|_| {
+            cfg.hixl.dfs_read_mode != crate::config::HixlDfsReadMode::Off
+                || dfs_data_mode == rpc::peer::DataMode::Grpc
+        });
+        let transfer: Arc<dyn dfs_read::ChunkTransfer> = if cfg.hixl.dfs_read_mode
+            != crate::config::HixlDfsReadMode::Off
+            && let Some(runtime) = &hixl_runtime
+        {
+            let mut transfer = rpc::peer::hixl::HixlChunkTransfer::new(
+                peer_connections.clone(),
+                runtime.clone(),
+                cfg.hixl.dfs_read_mode,
+                timeout,
+            )?
+            .with_phase_metrics(dfs_read::DfsReadPhaseMetrics::register(&obs.registry)?);
+            if let Some(metrics) = &hixl_metrics {
+                transfer = transfer.with_metrics(metrics.clone());
+            }
+            transfer = transfer
+                .with_session_idle(cfg.hixl.session_idle_ms)
+                .with_receive_slots(cfg.hixl.receive_slots);
+            if let Some(group) = read_group {
+                transfer = transfer.with_read_group(group);
+            }
+            let transfer = Arc::new(transfer);
+            if !cfg.hixl.prewarm_nodes.is_empty()
+                && let Some(meta) = dfs_meta.clone()
+            {
+                spawn_hixl_prewarm(
+                    transfer.clone(),
+                    cfg.hixl.prewarm_nodes.clone(),
+                    registered_node_epoch,
+                    meta,
+                );
+            }
+            transfer
+        } else if cfg.hixl.dfs_read_mode != crate::config::HixlDfsReadMode::Off
+            || (grpc_group.is_some() && dfs_data_mode == rpc::peer::DataMode::Grpc)
+        {
+            Arc::new(
+                rpc::peer::GrpcChunkTransfer::new(peer_connections.clone(), timeout)?
+                    .with_read_group(grpc_group),
+            )
+        } else {
             rpc::peer::make_chunk_transfer(
                 dfs_data_mode,
                 peer_connections.clone(),
                 timeout,
                 dfs_rdma_pool.clone(),
-            )?,
+            )?
+        };
+        let read_engine = dfs_read::DfsReadEngine::new(
+            namespace.clone(),
+            cfg.id.clone(),
+            chunks,
+            meta.clone(),
+            transfer,
             read_config,
         );
         let read_engine = match &dfs_read_authority {
@@ -1734,7 +2383,8 @@ async fn run_node(
         .with_remote_owner_factory(remote_factory)
         .with_version_cache_capacity(cfg.dfs_version_cache_entries)
         .with_version_cache_bytes(cfg.dfs_version_cache_bytes)
-        .with_write_buffer_pool(dfs_write_buffers.clone());
+        .with_write_buffer_pool(dfs_write_buffers.clone())
+        .with_read_group(transport_group);
         let fs = if cfg.dfs_external_backend.is_none() {
             fs.with_native_write_pipeline(
                 chunk::NativeWriteBudget::new(
@@ -1889,8 +2539,45 @@ async fn run_node(
         ownerfs: ownerfs_instance,
         #[cfg(feature = "dfs")]
         dfs: dfs_instance,
+        #[cfg(feature = "dfs")]
+        hixl_runtime: hixl_runtime.clone(),
+        #[cfg(feature = "dfs")]
+        hixl_metrics: hixl_metrics.clone(),
     });
     let mut services = Services::new();
+    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    let owner_hixl_source = match (&hixl_runtime, state.ownerfs.as_ref()) {
+        (Some(runtime), Some(ownerfs))
+            if cfg.hixl.ownerfs_read_mode != crate::config::HixlOwnerFsReadMode::Off =>
+        {
+            let mut source = rpc::data::owner_hixl::OwnerHixlService::new(
+                runtime.clone(),
+                ownerfs.peer_executor()?,
+            )
+            .with_owner_metrics(owner_rpc_metrics.clone());
+            if let Some(metrics) = &hixl_metrics {
+                source = source.with_metrics(metrics.clone());
+            }
+            Some(Arc::new(source))
+        }
+        _ => None,
+    };
+    #[cfg(all(feature = "ownerfs", feature = "dfs"))]
+    if let Some(source) = &owner_hixl_source {
+        let source = source.clone();
+        spawn_hixl_expiry(&mut services, move || {
+            let source = source.clone();
+            async move { source.expire().await }
+        });
+    }
+    #[cfg(feature = "dfs")]
+    if let Some(source) = &hixl_source {
+        let source = source.clone();
+        spawn_hixl_expiry(&mut services, move || {
+            let source = source.clone();
+            async move { source.expire().await }
+        });
+    }
     {
         let stop = services.stop.subscribe();
         let readiness = readiness.clone();
@@ -2249,6 +2936,7 @@ async fn run_node(
         rpc::data::DfsChunkTransportResources {
             read_pipeline: cfg.dfs_read_pipeline,
             rdma_sessions: sessions.clone(),
+            hixl: hixl_source.clone(),
             payload_metrics: Some(rpc::data::DfsPayloadMetrics::register(
                 &state.observability.registry,
             )?),
@@ -2265,12 +2953,15 @@ async fn run_node(
             .collect::<afs_error::Result<Vec<_>>>()?;
         let authenticator = Arc::new(rpc::data::MtlsPeerAuthenticator::new(trusted)?);
         let handler = rpc::data::make_owner_files_handler(ownerfs.peer_executor()?);
-        rpc::data::make_owner_files_server_with_handler_metrics_and_rdma(
-            handler,
-            authenticator,
-            owner_rpc_metrics.clone(),
-            owner_rdma_sessions.clone(),
-        )
+        let service = rpc::data::OwnerFilesService::new(handler, authenticator)
+            .with_metrics(owner_rpc_metrics.clone())
+            .with_rdma_sessions(owner_rdma_sessions.clone());
+        #[cfg(feature = "dfs")]
+        let service = match &owner_hixl_source {
+            Some(source) => service.with_hixl(source.clone()),
+            None => service,
+        };
+        rpc::data::make_owner_files_server_from(service)
     } else {
         rpc::data::make_owner_files_server()
     };
@@ -2295,10 +2986,47 @@ async fn run_node(
             };
             router.add_service(dfs_chunks).add_service(dfs_owner_files)
         };
+        #[cfg(feature = "dfs")]
+        let (drain_sender, drain_receiver) = tokio::sync::oneshot::channel();
+        #[cfg(feature = "dfs")]
+        let shutdown = async move {
+            cancelled(stop).await;
+            // Keep release RPCs available while source admission is closed.
+            // This grace period stays inside the Services ten-second deadline.
+            let dfs = async {
+                match hixl_source {
+                    Some(source) => source.drain(Duration::from_secs(5)).await,
+                    None => Ok(()),
+                }
+            };
+            #[cfg(feature = "ownerfs")]
+            let owner = async {
+                match owner_hixl_source {
+                    Some(source) => source.drain(Duration::from_secs(5)).await,
+                    None => Ok(()),
+                }
+            };
+            #[cfg(not(feature = "ownerfs"))]
+            let owner = async { Ok::<(), tonic::Status>(()) };
+            let (dfs, owner) = tokio::join!(dfs, owner);
+            let _ = drain_sender.send(dfs.and(owner));
+        };
+        #[cfg(not(feature = "dfs"))]
+        let shutdown = cancelled(stop);
         router
-            .serve_with_incoming_shutdown(incoming, cancelled(stop))
+            .serve_with_incoming_shutdown(incoming, shutdown)
+            .await?;
+        #[cfg(feature = "dfs")]
+        drain_receiver
             .await
-            .map_err(Into::into)
+            .map_err(|error| {
+                afs_error::Error::coded(
+                    afs_error::NODE_TRANSFER_INTERNAL,
+                    format!("HIXL source shutdown lost its drain result: {error}"),
+                )
+            })?
+            .map_err(afs_transport::grpc::error_status::status_to_error)?;
+        Ok(())
     });
     #[cfg(feature = "dfs")]
     if let (Some(meta), Some(local), None) = (
@@ -2671,6 +3399,18 @@ async fn run_node(
         Ok(Ok(())) => {}
         Ok(Err(error)) => remember_shutdown_error(&mut shutdown_error, error.into()),
         Err(error) => remember_shutdown_error(&mut shutdown_error, error.into()),
+    }
+    #[cfg(feature = "dfs")]
+    if let Some(Some(runtime)) = hixl_startup_guard.take() {
+        // The services and FUSE consumers have stopped above. The group attempts
+        // shutdown on every lane and reports incomplete drain proof.
+        match tokio::task::spawn_blocking(move || runtime.shutdown()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                remember_shutdown_error(&mut shutdown_error, rpc::hixl::runtime_error(error).into())
+            }
+            Err(error) => remember_shutdown_error(&mut shutdown_error, error.into()),
+        }
     }
     if let Some(error) = shutdown_error {
         afs_logging::error!("node.shutdown_failed"; "error" => error.to_string());

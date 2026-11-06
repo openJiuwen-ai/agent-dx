@@ -69,6 +69,15 @@ impl CrcTable {
             bytes: *h.finalize().as_bytes(),
         }
     }
+    /// Whether `[offset, offset + length)` starts on a segment boundary and
+    /// ends on one or at the object end, so this table alone binds its bytes.
+    pub(crate) fn covers_whole_segments(&self, offset: u64, length: u64) -> bool {
+        let segment = u64::from(self.segment_bytes);
+        segment != 0
+            && offset.is_multiple_of(segment)
+            && (length.is_multiple_of(segment) || offset.checked_add(length) == Some(self.length))
+    }
+
     pub(crate) fn valid_shape(&self, length: u64) -> bool {
         length > 0
             && length <= 4 * 1024 * 1024
