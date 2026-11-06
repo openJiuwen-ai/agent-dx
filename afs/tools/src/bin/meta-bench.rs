@@ -49,7 +49,8 @@ const CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_LATENCY_BINS: usize = 262_144;
 const SEED_BATCH_FILES: u64 = 256;
 const NAMESPACE: &str = "meta-bench";
-const ROOT: &str = "meta-bench-root";
+/// The real root inode id: directory rename walks up to it.
+const ROOT: &str = "1";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 enum Dataset {
