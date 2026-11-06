@@ -350,6 +350,11 @@ pub enum MetaRead {
         namespace_id: NamespaceId,
         parent_inode_id: InodeId,
     },
+    /// The dentry naming a directory inode, whose key holds its parent.
+    DfsDirectoryParent {
+        namespace_id: NamespaceId,
+        child_inode_id: InodeId,
+    },
     DfsInode(InodeId),
     DfsFileVersion(FileVersionId),
     DfsLayoutRoot(LayoutRootId),

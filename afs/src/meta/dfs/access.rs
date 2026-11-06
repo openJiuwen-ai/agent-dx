@@ -83,64 +83,15 @@ async fn parent_inode_from_view(
     if inode_id.0 == "1" {
         return Ok(None);
     }
-    let cursor = InodeId::new("1");
-    let mut seen = HashSet::new();
-    while seen.insert(cursor.clone()) {
-        for dentry in directory_entries_from_view(view, namespace_id, &cursor).await? {
-            if dentry.inode_id == *inode_id {
-                return Ok(Some(cursor));
-            }
-            let Ok(inode) = inode_from_view(view, namespace_id, dentry.inode_id.clone()).await
-            else {
-                continue;
-            };
-            if inode.kind == InodeKind::Directory {
-                // Depth-first scan is acceptable for the current fullsnapshot Meta slice.
-                if let Some(parent) = parent_inode_from_subtree(
-                    view,
-                    namespace_id,
-                    &inode.inode_id,
-                    inode_id,
-                    &mut HashSet::new(),
-                )
-                .await?
-                {
-                    return Ok(Some(parent));
-                }
-            }
-        }
-    }
-    Ok(None)
-}
-
-fn parent_inode_from_subtree<'a>(
-    view: &'a MetaReadView,
-    namespace_id: &'a NamespaceId,
-    directory_inode_id: &'a InodeId,
-    inode_id: &'a InodeId,
-    seen: &'a mut HashSet<InodeId>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<InodeId>>> + Send + 'a>> {
-    Box::pin(async move {
-        if !seen.insert(directory_inode_id.clone()) {
-            return Ok(None);
-        }
-        for dentry in directory_entries_from_view(view, namespace_id, directory_inode_id).await? {
-            if dentry.inode_id == *inode_id {
-                return Ok(Some(directory_inode_id.clone()));
-            }
-            let Ok(inode) = inode_from_view(view, namespace_id, dentry.inode_id.clone()).await
-            else {
-                continue;
-            };
-            if inode.kind == InodeKind::Directory
-                && let Some(parent) =
-                    parent_inode_from_subtree(view, namespace_id, &inode.inode_id, inode_id, seen)
-                        .await?
-            {
-                return Ok(Some(parent));
-            }
-        }
-        Ok(None)
+    let snapshot = view
+        .read(MetaRead::DfsDirectoryParent {
+            namespace_id: namespace_id.clone(),
+            child_inode_id: inode_id.clone(),
+        })
+        .await?;
+    Ok(match snapshot.entity {
+        Some(MetaEntity::DfsDentry(dentry)) => Some(dentry.key.parent_inode_id),
+        _ => None,
     })
 }
 

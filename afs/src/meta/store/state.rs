@@ -195,6 +195,15 @@ pub(super) struct State {
     /// Derived full authority capacity, incremented only for changed keys.
     pub(super) authority_bytes: u64,
     pub(super) authority_indexed: bool,
+    /// Derived from `DfsDentry` keys, never serialized: (namespace, child, parent,
+    /// name), so the parent of a directory is one ordered lookup. A directory has
+    /// exactly one dentry; a hard-linked file has one entry per link.
+    pub(super) dentry_parents: im::OrdSet<(
+        crate::dfs::NamespaceId,
+        crate::dfs::InodeId,
+        crate::dfs::InodeId,
+        Vec<u8>,
+    )>,
     pub(super) events: SharedEvents,
     pub(super) node_epochs: im::OrdMap<String, u64>,
     #[cfg(test)]

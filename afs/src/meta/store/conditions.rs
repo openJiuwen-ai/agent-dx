@@ -194,14 +194,16 @@ fn dfs_directory_is_empty(
     namespace_id: &NamespaceId,
     parent_inode_id: &InodeId,
 ) -> bool {
-    !state.entities.values().any(|versioned| {
-        matches!(
-            &versioned.entity,
-            MetaEntity::DfsDentry(dentry)
-                if dentry.key.namespace_id == *namespace_id
-                    && dentry.key.parent_inode_id == *parent_inode_id
-        )
-    })
+    let first = DentryKey {
+        namespace_id: namespace_id.clone(),
+        parent_inode_id: parent_inode_id.clone(),
+        name: Vec::new(),
+    };
+    !matches!(
+        state.entities.starting_at(MetaKey::DfsDentry(first)).next(),
+        Some((MetaKey::DfsDentry(key), _))
+            if key.namespace_id == *namespace_id && key.parent_inode_id == *parent_inode_id
+    )
 }
 
 fn dfs_is_descendant_or_same(
@@ -231,17 +233,13 @@ fn dfs_is_descendant_or_same(
 }
 
 fn dfs_parent_of(state: &State, namespace_id: &NamespaceId, inode_id: &InodeId) -> Option<InodeId> {
-    state
-        .entities
-        .values()
-        .find_map(|versioned| match &versioned.entity {
-            MetaEntity::DfsDentry(dentry)
-                if dentry.key.namespace_id == *namespace_id && dentry.inode_id == *inode_id =>
-            {
-                Some(dentry.key.parent_inode_id.clone())
-            }
-            _ => None,
-        })
+    match state
+        .dentry_of_child(namespace_id, inode_id)
+        .map(|versioned| &versioned.entity)
+    {
+        Some(MetaEntity::DfsDentry(dentry)) => Some(dentry.key.parent_inode_id.clone()),
+        _ => None,
+    }
 }
 
 pub(super) fn current_session_matches(state: &State, node_id: &str, session_id: &str) -> bool {

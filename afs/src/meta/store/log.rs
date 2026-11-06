@@ -1713,6 +1713,7 @@ impl StateImage {
             .extend(self.event_completion.iter().copied());
         state.node_epochs.extend(self.node_epochs.iter().cloned());
         state.rebuild_history_index()?;
+        state.rebuild_dentry_parents();
         Ok(state)
     }
 }

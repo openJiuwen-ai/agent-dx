@@ -1,6 +1,7 @@
 //! Validated transaction and node registration application, and authority index maintenance.
 
 use super::*;
+use crate::dfs::{Dentry, DentryKey, InodeId, NamespaceId};
 
 impl State {
     pub(in crate::meta::store) fn apply_txn(&mut self, txn: MetaTxn) -> Result<TxnOutcome> {
@@ -269,8 +270,60 @@ impl State {
                 .and_then(|bytes| bytes.checked_add(new))
                 .ok_or_else(|| invalid_contract("Meta authority replacement charge overflow"))?;
         }
+        if let Some(old) = self.entities.get(&key) {
+            let old = old.entity.clone();
+            self.unindex_dentry(&old);
+        }
+        self.index_dentry(&value.entity);
         self.entities.insert(key, value);
         Ok(())
+    }
+
+    fn index_dentry(&mut self, entity: &MetaEntity) {
+        if let MetaEntity::DfsDentry(dentry) = entity {
+            self.dentry_parents.insert(dentry_parent_entry(dentry));
+        }
+    }
+
+    fn unindex_dentry(&mut self, entity: &MetaEntity) {
+        if let MetaEntity::DfsDentry(dentry) = entity {
+            self.dentry_parents.remove(&dentry_parent_entry(dentry));
+        }
+    }
+
+    /// Rebuilds the derived dentry index after loading entities from an image.
+    pub(in crate::meta::store) fn rebuild_dentry_parents(&mut self) {
+        self.dentry_parents = self
+            .entities
+            .values()
+            .filter_map(|versioned| match &versioned.entity {
+                MetaEntity::DfsDentry(dentry) => Some(dentry_parent_entry(dentry)),
+                _ => None,
+            })
+            .collect();
+    }
+
+    /// The dentry naming `child`: its only one for a directory.
+    pub(in crate::meta::store) fn dentry_of_child(
+        &self,
+        namespace_id: &NamespaceId,
+        child: &InodeId,
+    ) -> Option<&VersionedEntity> {
+        let first = (
+            namespace_id.clone(),
+            child.clone(),
+            InodeId(String::new()),
+            Vec::new(),
+        );
+        let (namespace, found_child, parent, name) = self.dentry_parents.range(first..).next()?;
+        if namespace != namespace_id || found_child != child {
+            return None;
+        }
+        self.entities.get(&MetaKey::DfsDentry(DentryKey {
+            namespace_id: namespace.clone(),
+            parent_inode_id: parent.clone(),
+            name: name.clone(),
+        }))
     }
 
     pub(super) fn delete_authority(&mut self, key: &MetaKey) -> Result<()> {
@@ -281,6 +334,10 @@ impl State {
                 .authority_bytes
                 .checked_sub(super::super::history::authority_charge(key, &old.entity)?)
                 .ok_or_else(|| invalid_contract("Meta authority deletion charge underflow"))?;
+        }
+        if let Some(old) = self.entities.get(key) {
+            let old = old.entity.clone();
+            self.unindex_dentry(&old);
         }
         self.entities.remove(key);
         Ok(())
@@ -295,5 +352,97 @@ impl State {
         }
         self.node_epochs.insert(node, epoch);
         Ok(())
+    }
+}
+
+fn dentry_parent_entry(dentry: &Dentry) -> (NamespaceId, InodeId, InodeId, Vec<u8>) {
+    (
+        dentry.key.namespace_id.clone(),
+        dentry.inode_id.clone(),
+        dentry.key.parent_inode_id.clone(),
+        dentry.key.name.clone(),
+    )
+}
+
+#[cfg(test)]
+mod dentry_parent_tests {
+    use super::*;
+
+    fn dentry(parent: &str, name: &str, child: &str) -> MetaEntity {
+        MetaEntity::DfsDentry(Dentry {
+            key: DentryKey {
+                namespace_id: NamespaceId::new("n"),
+                parent_inode_id: InodeId::new(parent),
+                name: name.as_bytes().to_vec(),
+            },
+            inode_id: InodeId::new(child),
+        })
+    }
+
+    fn parent_of(state: &State, child: &str) -> Option<String> {
+        match state.read(MetaRead::DfsDirectoryParent {
+            namespace_id: NamespaceId::new("n"),
+            child_inode_id: InodeId::new(child),
+        }) {
+            Ok(MetaSnapshot {
+                entity: Some(MetaEntity::DfsDentry(dentry)),
+                ..
+            }) => Some(dentry.key.parent_inode_id.0),
+            _ => None,
+        }
+    }
+
+    fn put(state: &mut State, entity: MetaEntity) {
+        state
+            .put_authority(
+                entity_key(&entity),
+                VersionedEntity {
+                    revision: StoreRevision(1),
+                    entity,
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn the_dentry_index_follows_changes_and_is_rebuilt_on_recovery() {
+        let mut state = State {
+            revision: StoreRevision(1),
+            ..State::default()
+        };
+        assert_eq!(parent_of(&state, "dir"), None);
+        put(&mut state, dentry("root", "dir", "dir"));
+        assert_eq!(parent_of(&state, "dir").as_deref(), Some("root"));
+
+        // Same key, new child: the old child leaves the index.
+        put(&mut state, dentry("root", "dir", "dir2"));
+        assert_eq!(parent_of(&state, "dir"), None);
+        assert_eq!(parent_of(&state, "dir2").as_deref(), Some("root"));
+
+        // Rename moves a directory: put at the new key, delete the old one.
+        put(&mut state, dentry("other", "moved", "dir2"));
+        state
+            .delete_authority(&entity_key(&dentry("root", "dir", "dir2")))
+            .unwrap();
+        assert_eq!(parent_of(&state, "dir2").as_deref(), Some("other"));
+
+        // Hard links: removing one link keeps the other.
+        put(&mut state, dentry("a", "l1", "file"));
+        put(&mut state, dentry("b", "l2", "file"));
+        state
+            .delete_authority(&entity_key(&dentry("a", "l1", "file")))
+            .unwrap();
+        assert_eq!(parent_of(&state, "file").as_deref(), Some("b"));
+
+        let bytes = state.snapshot_bytes_with_batch(0).unwrap();
+        let recovered = State::from_snapshot(&bytes).unwrap();
+        assert_eq!(recovered.dentry_parents, state.dentry_parents);
+        let mut rebuilt = state.clone();
+        rebuilt.dentry_parents = im::OrdSet::new();
+        rebuilt.rebuild_dentry_parents();
+        assert_eq!(rebuilt.dentry_parents, state.dentry_parents);
+        let image = crate::meta::store::log::StateImage::encode(&state, 1024 * 1024).unwrap();
+        let restored = crate::meta::store::log::StateImage::decode(&image, 1024 * 1024).unwrap();
+        assert_eq!(restored.dentry_parents, state.dentry_parents);
     }
 }

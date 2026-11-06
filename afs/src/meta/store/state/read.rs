@@ -80,6 +80,10 @@ impl State {
         let state = self;
         match read {
             MetaRead::RootEpochWatermark => None,
+            MetaRead::DfsDirectoryParent {
+                namespace_id,
+                child_inode_id,
+            } => state.dentry_of_child(namespace_id, child_inode_id),
             MetaRead::NodeSession {
                 node_id,
                 session_id,
