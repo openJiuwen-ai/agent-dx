@@ -2244,12 +2244,12 @@ impl RotationTransfer {
 }
 
 impl ChunkTransfer for RotationTransfer {
-    fn review_suspect_chunk(
-        &self,
-        suspect: &crate::node::fault::suspect::SuspectCopy,
-    ) -> Result<bool> {
+    fn review_suspect_chunk_async<'a>(
+        &'a self,
+        suspect: &'a crate::node::fault::suspect::SuspectCopy,
+    ) -> crate::node::read::admission::ReadFuture<'a, bool> {
         self.reviews.lock().unwrap().push(suspect.clone());
-        Ok(true)
+        Box::pin(async { Ok(true) })
     }
     fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> Result<()> {
         let copies: Vec<String> = batch
@@ -2352,7 +2352,7 @@ fn rotation_read_reviewing(
         out,
     );
     if review {
-        engine.review_suspect_copies(8).unwrap();
+        crate::node::bridge::block_on_scoped_runtime(engine.review_suspect_copies(8)).unwrap();
     }
     result
 }

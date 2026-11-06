@@ -21,8 +21,8 @@ impl DistributedFs {
     }
 
     /// R59: ask holders to re-verify copies this Node's reads found suspect.
-    pub fn review_suspect_copies(&self, limit: usize) -> Result<usize> {
-        self.read_engine.review_suspect_copies(limit)
+    pub async fn review_suspect_copies(&self, limit: usize) -> Result<usize> {
+        self.read_engine.review_suspect_copies(limit).await
     }
 
     pub fn renew_active_write_leases(&self) -> Result<usize> {

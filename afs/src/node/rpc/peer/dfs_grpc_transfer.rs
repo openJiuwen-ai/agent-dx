@@ -841,11 +841,11 @@ async fn consume_peer_stream<'c>(
 
 #[cfg(feature = "dfs")]
 impl crate::node::read::engine::ChunkTransfer for GrpcChunkTransfer {
-    fn review_suspect_chunk(
-        &self,
-        suspect: &crate::node::fault::suspect::SuspectCopy,
-    ) -> afs_error::Result<bool> {
-        self.runtime.block_on(async {
+    fn review_suspect_chunk_async<'a>(
+        &'a self,
+        suspect: &'a crate::node::fault::suspect::SuspectCopy,
+    ) -> crate::node::read::admission::ReadFuture<'a, bool> {
+        Box::pin(async move {
             let channel = tokio::time::timeout(
                 self.timeout,
                 self.peers

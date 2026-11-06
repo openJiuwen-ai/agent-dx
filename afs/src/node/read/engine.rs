@@ -341,11 +341,11 @@ pub trait ChunkTransfer: Send + Sync {
     }
 
     /// Ask a copy's holder to re-verify it; whether the holder found it invalid.
-    fn review_suspect_chunk(
-        &self,
-        _suspect: &crate::node::fault::suspect::SuspectCopy,
-    ) -> Result<bool> {
-        Ok(false)
+    fn review_suspect_chunk_async<'a>(
+        &'a self,
+        _suspect: &'a crate::node::fault::suspect::SuspectCopy,
+    ) -> super::admission::ReadFuture<'a, bool> {
+        Box::pin(async { Ok(false) })
     }
 
     fn supports_async_native_read(&self) -> bool {
@@ -610,11 +610,11 @@ impl DfsReadEngine {
     /// GC retires those local copies (`node::gc::Collector`).
     /// Asks holders to re-verify up to `limit` suspect copies; one failure does
     /// not stop the others. Returns the copies the holders found invalid.
-    pub(crate) fn review_suspect_copies(&self, limit: usize) -> Result<usize> {
+    pub(crate) async fn review_suspect_copies(&self, limit: usize) -> Result<usize> {
         let mut invalid = 0;
         let mut first_error = None;
         for suspect in self.suspect_copies.take(limit) {
-            match self.transfer.review_suspect_chunk(&suspect) {
+            match self.transfer.review_suspect_chunk_async(&suspect).await {
                 Ok(true) => {
                     invalid += 1;
                     self.local.record_peer_read_event("suspect_copy_invalid");

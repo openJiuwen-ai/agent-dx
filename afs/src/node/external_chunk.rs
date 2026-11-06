@@ -418,6 +418,7 @@ fn validate_private_file(file: &File, expected_len: u64) -> Result<()> {
 }
 
 #[cfg(test)]
+#[path = "external_chunk/gc_e2e_tests.rs"]
 mod gc_e2e;
 #[cfg(test)]
 mod tests;

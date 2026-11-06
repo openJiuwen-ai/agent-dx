@@ -485,8 +485,11 @@ pub(super) fn start_background(
 ) {
     fault::reaper::Reaper::new(assembly.gc_collector.clone()).start(services);
     let reviewing = dfs.clone();
-    fault::suspect::SuspectReviewer::new(move |limit| reviewing.review_suspect_copies(limit))
-        .start(services);
+    fault::suspect::SuspectReviewer::new(move |limit| {
+        let reviewing = reviewing.clone();
+        async move { reviewing.review_suspect_copies(limit).await }
+    })
+    .start(services);
     let renewing = dfs.clone();
     fault::lease_keeper::LeaseKeeper::new(move || renewing.renew_active_write_leases())
         .start(services);

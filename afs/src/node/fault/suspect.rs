@@ -7,6 +7,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    future::Future,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -130,9 +131,10 @@ pub(crate) struct SuspectReviewer<F> {
     pass: F,
 }
 
-impl<F> SuspectReviewer<F>
+impl<F, Fut> SuspectReviewer<F>
 where
-    F: Fn(usize) -> Result<usize> + Send + Sync + 'static,
+    F: Fn(usize) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<usize>> + Send + 'static,
 {
     /// `pass` reviews up to the given number of queued suspects.
     pub(crate) fn new(pass: F) -> Self {
@@ -145,11 +147,11 @@ where
     }
 }
 
-async fn run_review_loop(
-    stop: tokio::sync::watch::Receiver<bool>,
-    pass: impl Fn(usize) -> Result<usize> + Send + Sync + 'static,
-) -> ServiceResult {
-    let pass = Arc::new(pass);
+async fn run_review_loop<F, Fut>(stop: tokio::sync::watch::Receiver<bool>, pass: F) -> ServiceResult
+where
+    F: Fn(usize) -> Fut,
+    Fut: Future<Output = Result<usize>>,
+{
     let mut tick = tokio::time::interval(REVIEW_PERIOD);
     let shutdown = cancelled(stop);
     tokio::pin!(shutdown);
@@ -157,11 +159,8 @@ async fn run_review_loop(
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
             _ = tick.tick() => {
-                let pass = pass.clone();
-                match crate::node::bridge::spawn_blocking(move || pass(MAX_REVIEWS_PER_PASS)).await {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(error)) => afs_logging::warn!("dfs.suspect_review_retry"; "error" => error.to_string()),
-                    Err(error) => afs_logging::warn!("dfs.suspect_review_worker_failed"; "error" => error.to_string()),
+                if let Err(error) = pass(MAX_REVIEWS_PER_PASS).await {
+                    afs_logging::warn!("dfs.suspect_review_retry"; "error" => error.to_string());
                 }
             }
         }
