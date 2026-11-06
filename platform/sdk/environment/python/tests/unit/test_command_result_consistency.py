@@ -1,12 +1,14 @@
 """A legacy torn result is reread by stable ID, never resubmitted or guessed."""
 import asyncio
+import json
 from unittest.mock import Mock
 
+import httpx
 import pytest
 from adx_environment import EnvironmentError as SDKEnvironmentError
-from adx_environment._transport import EnvironmentHTTPError
+from adx_environment._transport import EnvironmentClient, EnvironmentHTTPError
 from adx_environment.commands import CommandHandle, CommandNotFound, Commands
-from adx_environment.types import CommandStatus
+from adx_environment.types import CommandStatus, ConnectionConfig
 
 
 class CommandClient:
@@ -170,3 +172,74 @@ def test_unavailable_observation_never_becomes_a_command_result(status, operatio
     assert error.request_id == "req-42"
     assert str(error) == "command exit state is poisoned"
     assert all(call.args[1] != "process.start" for call in client.invoke.call_args_list)
+
+
+def test_real_http_command_read_retains_flat_observation_error(monkeypatch):
+    requests = []
+    payload = {
+        "command_id": "cmd-42", "status": "FAILED", "exit_code": None,
+        "error_code": "COMMAND_STATE_UNAVAILABLE", "error": "command exit state is poisoned",
+        "retry": "same_operation", "outcome": "unknown",
+    }
+
+    def handler(request):
+        assert request.method == "POST"
+        assert request.url.path == "/direct/environment/invoke"
+        requests.append(json.loads(request.content))
+        return httpx.Response(400, json=payload, headers={"X-Request-Id": "req-http"})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as transport:
+        monkeypatch.setattr("adx_environment._transport.acquire_shared_http_client", lambda *args: transport)
+        client = EnvironmentClient(connection=ConnectionConfig(server_address="api.test:443", token="test"))
+        try:
+            with pytest.raises(EnvironmentHTTPError) as raised:
+                CommandHandle("cmd-42", client, "environment").poll()
+            error = raised.value
+            assert error.code == "COMMAND_STATE_UNAVAILABLE"
+            assert error.retry == "same_operation"
+            assert error.outcome == "unknown"
+            assert error.environment_id == "environment"
+            assert error.operation_id == "cmd-42"
+            assert error.request_id == "req-http"
+            assert error.status_code == 400
+            assert error.payload == payload
+            assert len(requests) == 1
+            assert requests[0]["action"] == "process.get"
+            assert requests[0]["args"] == {"command_id": "cmd-42"}
+        finally:
+            client.close()
+
+
+@pytest.mark.parametrize("operation", ["poll", "wait", "http_wait", "reread", "list", "exec"])
+def test_http_observation_error_preserves_status_payload_and_request_identity(operation):
+    client = CommandClient()
+    payload = {
+        "command_id": "cmd-42", "operation_id": "cmd-42", "status": "FAILED",
+        "error_code": "COMMAND_STATE_UNAVAILABLE", "error": "command exit state is poisoned",
+        "retry": "same_operation", "outcome": "unknown", "exit_code": None,
+    }
+    error = EnvironmentHTTPError(400, payload, "HTTP 400 command state is unavailable", request_id="req-42")
+    client.invoke.side_effect = error
+    if operation == "http_wait":
+        client.invoke.side_effect = [{"status": "RUNNING"}, error]
+    if operation == "reread":
+        client.invoke.side_effect = [{"status": "SUCCEEDED", "exit_code": None}, error]
+    handle = CommandHandle("cmd-42", client, "environment")
+    with pytest.raises(EnvironmentHTTPError) as raised:
+        if operation in ("http_wait", "reread"):
+            handle.wait(2)
+        elif operation == "list":
+            Commands(client, "environment").list()
+        elif operation == "exec":
+            Commands(client, "environment").run("true", timeout=2)
+        else:
+            getattr(handle, operation)()
+    assert raised.value is error
+    assert error.status_code == 400
+    assert error.payload is payload
+    assert error.code == "COMMAND_STATE_UNAVAILABLE"
+    assert error.retry == "same_operation"
+    assert error.outcome == "unknown"
+    assert error.operation_id == "cmd-42"
+    assert error.environment_id == "environment"
+    assert error.request_id == "req-42"

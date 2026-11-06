@@ -86,6 +86,8 @@ PID 可以在运行时被复用，不能作为长期恢复身份。
 保留 command_id／operation_id、PID 和明确的错误状态（稳定 ID 为 `FAILED`，PID 客户端为
 `error`），退出码与信号为 null。此错误状态不表示子进程已退出；SDK 抛出结构化异常，
 不会从字段缺省推断成功。`process.list` 中的单条观测错误也保留本次请求身份。
+HTTP 非 2xx 的观测错误在 SDK 中保留原 `EnvironmentHTTPError`、状态码、响应体和请求身份，
+并补齐同样的错误码、重试和未知结果字段。
 
 兼容旧服务端时，SDK 对 GET 或 HTTP wait 返回的普通终态缺失退出码，最多按同一
 command_id 再读一次；不得重启命令或推断 exit_code=0。再次不一致抛出

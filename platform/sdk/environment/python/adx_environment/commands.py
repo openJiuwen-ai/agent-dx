@@ -165,6 +165,25 @@ def _raise_observation_error(
         )
 
 
+def _invoke_command(
+    client: EnvironmentClient, environment_id: str, action: str, args: dict, **kwargs
+) -> dict:
+    try:
+        return client.invoke(environment_id, action, args, **kwargs)
+    except EnvironmentHTTPError as error:
+        if error.payload.get("error_code") == "COMMAND_STATE_UNAVAILABLE":
+            # Execd returns flat action errors on non-2xx responses. Preserve
+            # the original HTTP exception, payload and request identity while
+            # exposing the same semantics as a successful HTTP error body.
+            error.code = "COMMAND_STATE_UNAVAILABLE"
+            error.retry = "same_operation"
+            error.outcome = "unknown"
+            operation_id = args.get("command_id") or error.payload.get("operation_id")
+            error.operation_id = str(operation_id or error.payload.get("command_id") or "")
+            error.environment_id = environment_id
+        raise
+
+
 def _result(snapshot: dict) -> CommandResult:
     raw_status = snapshot.get("status")
     if raw_status is None:
@@ -273,7 +292,7 @@ class CommandHandle:
 
     def _fetch_snapshot(self) -> dict:
         try:
-            snapshot = self._client.invoke(self._sid, "process.get", {"command_id": self.command_id})
+            snapshot = _invoke_command(self._client, self._sid, "process.get", {"command_id": self.command_id})
         except EnvironmentHTTPError as error:
             if error.status_code == 404:
                 raise CommandNotFound(
@@ -334,7 +353,8 @@ class CommandHandle:
                 connection = getattr(self._client, "_connection", None)
                 if connection is None:
                     try:
-                        snapshot = self._client.invoke(
+                        snapshot = _invoke_command(
+                            self._client,
                             self._sid,
                             "process.wait",
                             {"command_id": self.command_id, "timeout": timeout},
@@ -535,7 +555,8 @@ class Commands:
         timeout = 60 if timeout is None else timeout
         if timeout > _POLL_THRESHOLD:
             return self._run_with_poll(cmd, envs, effective_cwd, timeout)
-        response = self._client.invoke(
+        response = _invoke_command(
+            self._client,
             self._sid,
             "process.exec",
             {"cmd": cmd, "envs": envs, "cwd": effective_cwd, "timeout": timeout},
@@ -616,7 +637,7 @@ class Commands:
         return handle
 
     def list(self) -> List[CommandInfo]:
-        response = self._client.invoke(self._sid, "process.list", {})
+        response = _invoke_command(self._client, self._sid, "process.list", {})
         _raise_observation_error(response, self._sid)
         processes = response.get("processes")
         if not isinstance(processes, list):

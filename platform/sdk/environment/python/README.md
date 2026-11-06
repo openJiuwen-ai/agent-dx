@@ -746,6 +746,8 @@ response. A runtime observation failure (`COMMAND_STATE_UNAVAILABLE`) raises
 the command, environment and request identities; polling, listing and waiting do
 not turn an unavailable observation into a successful command result. Retry only
 the same read/wait operation, not command submission.
+For non-2xx responses this remains the original `EnvironmentHTTPError`, including
+its HTTP status, payload and request ID, with the same structured observation fields.
 
 Background commands run without an execution deadline by default. Pass
 `timeout` to set one explicitly; foreground commands default to 60 seconds.
