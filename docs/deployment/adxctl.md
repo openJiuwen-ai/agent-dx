@@ -59,6 +59,9 @@ sudo adxctl run
 sudo adxctl status
 sudo adxctl stop
 
+# 本次停止保留 Environment；显式清理则使用 --mode drain
+sudo adxctl stop --mode preserve
+
 # 非默认位置可在所有子命令前后传入，也可设置 ADX_DEPLOYMENT_CONFIG
 adxctl -c /srv/adx/node.yaml validate
 ```
@@ -81,7 +84,11 @@ adxctl -c /srv/adx/node.yaml validate
 
 `status` 返回子进程 PID、角色、重启次数、当前退出／启动失败标记和日志状态。进程退出或启动失败后，按 `restart_delay_ms` 持续重试，成功启动后清除失败标记。PID 存在只代表进程存活，不代表集群已经可以创建 Environment。AFS 服务配置了 `health_url` 时，supervisor 会查询 HTTP `/health`，只有返回 JSON 且 `status` 为 `ready` 才报告 ready；HTTP 200 但状态仍是 `starting` 或 `degraded` 不算 ready。
 
-`stop` 先要求本机 adxlet 停止新准入并删除其管理的 Environment，清理成功后才按反向顺序退出组件。清理失败时命令失败，并保留 Coordinator、Redis、代理等依赖以便重试。
+`shutdown_mode` 控制退出策略，可选 `preserve`（默认）或 `drain`。`stop` 未传 `--mode` 时，以及 supervisor 收到 SIGTERM/SIGINT 时，都使用 supervisor 启动时加载的策略；`stop --mode preserve|drain` 只覆盖本次停止。运行中修改 YAML 不会改变已加载策略。`status` 输出 `shutdown_mode`，成功停止响应输出本次实际使用的模式。
+
+`drain` 先要求本机 adxlet 停止新准入并删除其管理的全部 Environment，包括 Paused 对象，清理成功后才按反向顺序退出组件。显式 Drain RPC 完成清理后，adxctl 向 adxlet 发送 SIGTERM，触发 planned unregister。清理失败时命令失败，并保留 Coordinator、Redis、代理等依赖以便重试。
+
+`preserve` 跳过 NodeAdmin Drain，不因退出而删除 Environment 或清理其 checkpoint，按相同的反向顺序停止组件，并仅向 adxlet PID 发送 SIGUSR1 明确保留退出意图（不广播到其进程组）；无需 adxlet 管理 socket 可用。adxlet 收到停止信号后立即关闭新分配与本地创建准入，保留已有 Environment；内嵌 Relay 排水期间继续运行心跳和运行时控制服务，排水完成后退出，不主动注销节点。其余受管进程仍使用 SIGTERM，并执行停止超时及日志收尾，preserve 下 adxlet 终止超时的 SIGKILL 也只作用于其 PID，避免误杀同组后端子进程；进程终止失败仍返回错误，不自动切换为 drain。停止失败的结构化响应包含 `mode`、`phase`（`drain` 或 `terminate`）、`service_id` 和 `message`，CLI 将这些上下文输出到标准错误。直接向 adxlet 发送 SIGTERM/SIGINT 仍表示 planned departure，会主动注销；preserve 应通过 adxctl 选择或向 adxlet 发送 SIGUSR1。保留模式只约束 adxctl 的退出动作，不承诺运行时独立于 Pod 存活或重启后的恢复结果。
 
 ## 部署文件的公共字段
 
@@ -93,6 +100,7 @@ redis_url: redis://127.0.0.1:6379/
 namespace: adx
 restart_delay_ms: 1000
 stop_timeout_seconds: 90
+shutdown_mode: preserve
 services: []
 ```
 
@@ -105,9 +113,12 @@ services: []
 | `services` | 当前主机需要启动的角色，不是整个集群的角色清单 |
 | `with_afs` | 默认 `false`；必须显式为 `true` 才允许 `afs-meta` 或 `afs-node` 角色 |
 | `restart_delay_ms` | 进程退出或启动失败后，再次启动前的等待时间；默认 1000 毫秒，持续重试 |
-| `stop_timeout_seconds` | 单个 Drain 或进程停止阶段的超时 |
+| `stop_timeout_seconds` | 单个 Drain 或进程停止阶段的超时；须覆盖完整 Relay 排水及退出收尾时间 |
+| `shutdown_mode` | `preserve`（默认）跳过删除；`drain` 先删除本机 Environment。无参数 `stop` 和 SIGTERM/SIGINT 使用启动时加载的模式 |
 | `environment` | adxlet 和 API Server 共用的本地 EROFS 或 OCI 运行环境定义 |
 | `logging` | supervisor 接管组件输出时的滚动、压缩和保留策略 |
+
+`stop_timeout_seconds` 应大于 Relay 的完整退出时间，并为调度和收尾留出余量。内嵌 Relay 的 `ADX_DATA_PLANE_RELAY_DRAIN_TIMEOUT_SEC` 默认 30 秒；等待活跃流结束后，后台服务收尾还可再等待同样的超时，因此不能只按单个 30 秒窗口设置 supervisor 超时，可按 90 秒起配置。e2e 部署生成器当前使用 30 秒，慢排水时可能先触发 supervisor 超时：preserve 不转换为删除，但 adxlet 会被 SIGKILL，`stop` 返回 `phase=terminate` 失败，未完成的排水和心跳随之中断。外层 systemd／Pod 终止宽限期还需覆盖全部受管组件的顺序退出。
 
 每个 `services[]` 元素由 `id`、`role`、`config` 和可选 `env` 组成。`config` 是组件配置，`env` 用于 Ingress 和 Relay 等环境变量入口。不要手工重复公共 `redis_url` 和 `namespace`；`adxctl render` 会按角色注入。
 
@@ -271,7 +282,7 @@ sudo adxctl run
 
 需要独立故障域或单独限制资源时，可以使用完整部署 YAML：为 adxlet 显式设置 `proxy_mode: standalone`，把 Proxy 环境项移到独立的 `role: relay` 服务。省略 `proxy_mode` 与设置 `embedded` 等价，不能在默认内嵌模式下再启动独立 Relay。
 
-sandboxd 仍由节点部署环境单独管理。`adxctl stop` 只停止 ADX 进程，完成 Environment 清理后不会停止 sandboxd。
+sandboxd 仍由节点部署环境单独管理。`adxctl stop` 只停止 ADX 进程，不停止 sandboxd；Environment 是否先清理由所选模式决定。
 
 ### 3. API Server 与 Ingress 接入节点
 
@@ -320,7 +331,7 @@ API Frontend 对应 `role: "apiserver"` 和 `adx-apiserver`。示例将 API 监�
 - `stop` 失败：至少一个 adxlet Drain 或组件停止未完成；依赖会保留，检查 `state_dir/logs/` 后使用相同命令重试。
 - `render` 失败且目录已存在：换一个新的输出目录；工具不会覆盖已有审查证据。
 
-配置和证书在组件启动时读取。`adxctl` 当前没有 `restart` 或热重载子命令。完整 `stop` 会删除本机 Environment，因此不应用它进行需要保留实例的普通证书轮换；此类维护由部署环境按组件重启，并等待 adxlet 对账和路由重新同步。
+配置和证书在组件启动时读取。`adxctl` 当前没有 `restart` 或热重载子命令。仅重启 adxlet、后端执行仍存活且保持节点 ID、RPC/Relay 地址时，需要保留 Environment 的维护可在部署文件中配置 `shutdown_mode: preserve`，或单次执行 `stop --mode preserve`，再由部署环境在心跳期限内启动新进程，经 Coordinator 的 GetSession 身份校验接续会话，完成 adxlet 对账和路由同步。超时、身份复核失败或后端执行已停止时不能接续；preserve 不延长心跳期限。需要清理本机 Environment 时显式使用 `stop --mode drain`；只停止某个组件仍由部署环境管理。
 
 完整的单机依赖、证书和 SDK 业务就绪步骤见[单机进程部署](standalone.md)，运行环境见[本地 EROFS 与 OCI](runtime-environment.md)。
 

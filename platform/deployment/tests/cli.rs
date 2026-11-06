@@ -4,6 +4,15 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[test]
+fn stop_accepts_explicit_shutdown_modes_and_rejects_unknown_values() {
+    for mode in ["preserve", "drain"] {
+        assert!(Cli::try_parse_from(["adxctl", "stop", "--mode", mode]).is_ok());
+    }
+    assert!(Cli::try_parse_from(["adxctl", "stop"]).is_ok());
+    assert!(Cli::try_parse_from(["adxctl", "stop", "--mode", "presreve"]).is_err());
+}
+
+#[test]
 fn parses_typed_subcommands_without_positional_argument_assumptions() {
     let cli = Cli::try_parse_from([
         "adxctl",

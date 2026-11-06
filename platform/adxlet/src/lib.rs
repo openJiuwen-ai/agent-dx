@@ -391,6 +391,7 @@ pub trait StateSink: Send + Sync {
 }
 
 pub(crate) struct Admission {
+    stopping: Arc<std::sync::atomic::AtomicBool>,
     ledger: ResourceLedger,
     devices: DeviceLedger,
     devices_valid_until: Option<Instant>,
@@ -402,6 +403,9 @@ pub(crate) struct Admission {
 
 impl Admission {
     fn reserve(&mut self, id: &str, spec: &EnvironmentSpec, assignment: &Assignment) -> Result<()> {
+        if self.stopping.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(Error::Unavailable("node is stopping".into()));
+        }
         if self.maintenance
             || self.pressure
             || self
@@ -457,6 +461,7 @@ pub struct Adxlet {
     node_id: String,
     local_holds: Arc<Mutex<BTreeMap<String, local::LocalHold>>>,
     draining: Arc<std::sync::atomic::AtomicBool>,
+    stopping: Arc<std::sync::atomic::AtomicBool>,
     lifecycle_ready: Arc<tokio::sync::RwLock<bool>>,
     authority_reconciling: Arc<std::sync::atomic::AtomicBool>,
     authority_initialized: Arc<std::sync::atomic::AtomicBool>,
@@ -481,10 +486,12 @@ impl Adxlet {
         routes: Arc<dyn Routes>,
         sink: Arc<dyn StateSink>,
     ) -> Self {
+        let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
         Self {
             node_id,
             local_holds: Arc::default(),
             draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            stopping: stopping.clone(),
             lifecycle_ready: Arc::new(tokio::sync::RwLock::new(true)),
             authority_reconciling: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             authority_initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -496,6 +503,7 @@ impl Adxlet {
                 routes,
                 sink,
                 admission: Arc::new(Mutex::new(Admission {
+                    stopping,
                     ledger: ResourceLedger::new(Resources::default()),
                     devices: DeviceLedger::default(),
                     devices_valid_until: None,
@@ -633,6 +641,24 @@ impl Adxlet {
         Ok(self)
     }
 
+    /// Close admission for process shutdown without deleting Environments.
+    /// Existing work and node reporting may continue. Returns Unavailable if
+    /// the admission state cannot be locked; the shutdown gate remains closed.
+    pub fn begin_shutdown(&self) -> Result<()> {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.services
+            .admission
+            .lock()
+            .map_err(|_| Error::Unavailable("node admission state unavailable".into()))?
+            .maintenance = true;
+        Ok(())
+    }
+
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     pub fn set_maintenance(&self, maintenance: bool) {
         self.services
             .admission
@@ -657,7 +683,7 @@ impl Adxlet {
     }
 
     fn locally_accepting_allocations(&self) -> bool {
-        if !self.lifecycle_ready.try_read().is_ok_and(|ready| *ready) {
+        if self.is_stopping() || !self.lifecycle_ready.try_read().is_ok_and(|ready| *ready) {
             return false;
         }
         let admission = self
@@ -778,6 +804,9 @@ impl Adxlet {
         spec: EnvironmentSpec,
         assignment: Assignment,
     ) -> Result<EnvironmentHandle> {
+        if self.is_stopping() {
+            return Err(Error::Unavailable("node is stopping".into()));
+        }
         if self.is_draining() {
             return Err(Error::Unavailable("node is draining".into()));
         }

@@ -15,6 +15,9 @@ pub(crate) struct LocalHold {
 }
 impl Adxlet {
     pub fn reserve_local(&self, spec: &EnvironmentSpec) -> Result<LocalReservation> {
+        if self.is_stopping() {
+            return Err(Error::Unavailable("node is stopping".into()));
+        }
         if self
             .authority_reconciling
             .load(std::sync::atomic::Ordering::Acquire)

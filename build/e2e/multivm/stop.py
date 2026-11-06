@@ -48,7 +48,7 @@ def stop_services(machine, remote=ssh, wait=wait_until):
     if not pids:
         raise AssertionError(f"{machine['role']} has no supervised child processes")
     config = machine.get('deployment_config', '/opt/adx/config/deployment.yaml')
-    remote(machine, 'sudo', '-n', '/opt/adx/current/bin/adxctl', 'stop', '--config', config)
+    remote(machine, 'sudo', '-n', '/opt/adx/current/bin/adxctl', 'stop', '--mode', 'drain', '--config', config)
     wait(lambda: processes_gone(machine, pids, remote), f"{machine['role']} retained a supervised child", 90)
     return pids
 

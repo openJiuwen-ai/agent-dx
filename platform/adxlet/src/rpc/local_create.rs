@@ -90,7 +90,7 @@ impl NodeRpc {
         };
         let _serial = lock.lock().await;
         let gate = self.manager.lifecycle_ready.read().await;
-        if !*gate || self.manager.is_draining() {
+        if !*gate || self.manager.is_draining() || self.manager.is_stopping() {
             return Err(Status::unavailable("node is reconciling or draining"));
         }
         if raw.snapshot_id.is_some() {

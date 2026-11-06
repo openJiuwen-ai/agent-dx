@@ -110,11 +110,15 @@ Coordinator 的 `node_retention_seconds` 默认 1800 秒，必须大于零。从
 恢复/回收流程处理。主动注销不增加 Worker Incidents；尚在运行的执行中断按 unknown
 原因记录，并保留“节点主动注销”的证据，避免混同心跳超时。
 
-adxlet 收到正常退出信号后关闭本地准入，通过当前 Coordinator 连接发送注销请求，
-通知最多等待 `min(rpc_timeout_seconds, 5)` 秒。通知失败记录一次 WARN，继续退出，
-由心跳失效与超时退役兜底。直接退出不等于用户删除，运行时由现有失效归属对账处理。
-`adxctl stop` 仍先通过 Drain 删除并确认本地 Environment 已发布退役，再停止进程
-并发送注销。
+adxlet 收到退出信号后关闭本地准入，内嵌 Relay 排水期间继续心跳与运行时控制。
+adxctl 默认 preserve 向 adxlet 发送 SIGUSR1，不删除 Environment，也不发送注销；后端执行仍存活、节点 ID 和原
+RPC/Relay 地址保持一致的新进程，可在心跳期限内通过 GetSession 身份复核接续会话。
+preserve 不延长心跳期限；超时或复核失败仍沿既有失效对账路径处理。
+
+显式 `adxctl stop --mode drain` 先通过 Drain 删除并确认本地 Environment 已发布退役。
+清理成功后向 adxlet 发送 SIGTERM；完成 Relay 排水，再通过当前 Coordinator 连接
+发送注销。直接给 adxlet 的 SIGTERM/SIGINT 同样保留 planned departure 语义。通知最多等待 `min(rpc_timeout_seconds, 5)` 秒，失败记录一次 WARN
+并继续退出，由心跳失效与超时退役兜底。
 
 主动注销的 boot session 另存为 `node-departed:<digest>` 最小身份记录。新会话加入及
 Coordinator 再次重启都不清除此记录，避免已注销进程的迟到注册重新激活节点。

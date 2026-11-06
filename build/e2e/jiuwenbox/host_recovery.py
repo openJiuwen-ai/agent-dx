@@ -64,7 +64,7 @@ class HostRecovery(FullSDK):
             "Restart=on-failure",
             "RestartSec=3",
         ]
-        # An explicit deployment stop drains/deletes Environments. A host service
+        # An explicit drain stop deletes Environments. A host service
         # interruption must retain desired state for boot recovery instead.
         if name == "deployment":
             lines += ["KillSignal=SIGKILL", "KillMode=control-group"]
@@ -174,7 +174,10 @@ class HostRecovery(FullSDK):
                 ):
                     raise AssertionError("acceptance condition failed")
                 await self.sdk_rpc("delete", backend)
-                await self.until(lambda: self.record(environment_id) is None, "delete commit after reboot")
+                await self.until(
+                    lambda environment_id=environment_id: self.record(environment_id) is None,
+                    "delete commit after reboot",
+                )
             await self.until(
                 self.managed_backends_absent,
                 "reboot native cleanup",
@@ -202,7 +205,7 @@ class HostRecovery(FullSDK):
             await self.sdk_rpc("close")
             self.sdk.stdin.close()
             await self.sdk.wait()
-            command(str(self.package / "bin/adxctl"), "--config", str(self.config_path), "stop")
+            command(str(self.package / "bin/adxctl"), "--config", str(self.config_path), "stop", "--mode", "drain")
         for name in reversed(list(state["units"])):
             command("systemctl", "disable", "--now", state["units"][name])
         for name, unit in state["units"].items():
