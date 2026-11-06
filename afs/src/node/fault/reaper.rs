@@ -2,9 +2,9 @@
 //!
 //! One pass (`node::gc::Collector::collect_once`) asks Meta which GC
 //! generation this node must collect and, when it is waiting on this node,
-//! retires those local copies through the copy lifecycle. Pins (`node::gc`)
-//! stay with the paths that take them. S3 mode has no references and no
-//! collector, so its passes return 0 (orphan reclaim is R05).
+//! retires those local copies through the copy lifecycle; in S3 mode it deletes
+//! the objects and lists the store when Meta assigns it. Pins (`node::gc`) stay
+//! with the paths that take them.
 
 use std::{sync::Arc, time::Duration};
 

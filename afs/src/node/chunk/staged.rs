@@ -108,6 +108,26 @@ impl StagedChunk {
         })
     }
 
+    /// S3 payload under its generational BLAKE3 identity (R05).
+    pub fn from_shared_generational(operation_id: OperationId, bytes: SharedChunkBytes) -> Self {
+        let mut staged = Self::from_shared(operation_id, bytes);
+        let root = blake3::Hash::from(staged.chunk.content_digest.bytes);
+        staged.chunk.id =
+            ChunkObject::generational_blake3_id(&staged.operation_id, &root, staged.chunk.length);
+        #[cfg(feature = "dfs")]
+        {
+            staged.sealed_chunk = staged.chunk.clone();
+        }
+        staged
+    }
+
+    pub fn new_generational(operation_id: OperationId, bytes: Vec<u8>) -> Self {
+        Self::from_shared_generational(
+            operation_id,
+            SharedChunkBytes::from_buffer(ChunkBuffer::unpooled(bytes)),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn new_crc32c(operation_id: OperationId, bytes: Vec<u8>) -> Result<Self> {
         Self::from_shared_crc32c(

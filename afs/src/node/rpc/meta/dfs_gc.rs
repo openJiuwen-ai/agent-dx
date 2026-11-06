@@ -34,6 +34,14 @@ impl crate::node::gc::GcControl for GrpcDfsMeta {
         completed: u64,
         inventory: Vec<crate::dfs::ChunkObject>,
     ) -> Result<crate::dfs::GcState> {
+        self.collect_batch(completed, inventory)
+            .map(|batch| batch.state)
+    }
+    fn collect_batch(
+        &self,
+        completed: u64,
+        inventory: Vec<crate::dfs::ChunkObject>,
+    ) -> Result<crate::node::gc::GcBatch> {
         let mut client =
             afs_protocol::meta::dfs_meta_client::DfsMetaClient::new(self.channel.clone());
         let reply = self
@@ -46,17 +54,20 @@ impl crate::node::gc::GcControl for GrpcDfsMeta {
                 }),
             )?
             .into_inner();
-        Ok(crate::dfs::GcState {
-            generation: reply.generation,
-            chunks: reply
-                .chunk_ids
-                .into_iter()
-                .map(crate::dfs::ChunkId::new)
-                .collect(),
-            waiting_nodes: if reply.pending_for_node {
-                vec![self.node_id.clone()]
-            } else {
-                Vec::new()
+        Ok(crate::node::gc::GcBatch {
+            list_external_inventory: reply.list_external_inventory,
+            state: crate::dfs::GcState {
+                generation: reply.generation,
+                chunks: reply
+                    .chunk_ids
+                    .into_iter()
+                    .map(crate::dfs::ChunkId::new)
+                    .collect(),
+                waiting_nodes: if reply.pending_for_node {
+                    vec![self.node_id.clone()]
+                } else {
+                    Vec::new()
+                },
             },
         })
     }

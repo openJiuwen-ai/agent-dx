@@ -160,6 +160,8 @@ async fn execute(
                     .collect::<Result<Vec<_>>>()?;
                 Ok(Reply::Put(receipts))
             }
+            Request::Delete(chunks) => delete_objects(backend, options, chunks).await,
+            Request::List { after, limit } => list_objects(backend, options, after, limit).await,
             Request::Read(chunk) => {
                 let key = external_object_key(&options.store_id, &options.generation, &chunk.id)?;
                 // No HEAD, versionId or conditional GET in the normal data path.
@@ -299,6 +301,55 @@ pub(super) async fn collect_s3_body(
     tracing::Span::current().record("copy_us", timing.copy_us);
     tracing::Span::current().record("final_eof_wait_us", timing.final_eof_wait_us);
     Ok((bytes, timing))
+}
+
+/// Batched delete. An object that is already gone counts as deleted, so a
+/// retried batch is idempotent; any other failure fails the batch.
+async fn delete_objects(
+    backend: &dyn ObjectStore,
+    options: &S3ChunkStoreOptions,
+    chunks: Vec<ChunkId>,
+) -> Result<Reply> {
+    let paths = chunks
+        .iter()
+        .map(|chunk| {
+            external_object_key(&options.store_id, &options.generation, chunk)
+                .map(|key| Ok(ObjectPath::from(key.as_str())))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut results = backend.delete_stream(Box::pin(tokio_stream::iter(paths)));
+    while let Some(result) = tokio_stream::StreamExt::next(&mut results).await {
+        match result {
+            Ok(_) | Err(object_store::Error::NotFound { .. }) => {}
+            Err(error) => return Err(storage_error(error)),
+        }
+    }
+    Ok(Reply::Deleted)
+}
+
+/// One page of this store's chunk keys in key order, after `after`.
+async fn list_objects(
+    backend: &dyn ObjectStore,
+    options: &S3ChunkStoreOptions,
+    after: Option<String>,
+    limit: usize,
+) -> Result<Reply> {
+    let prefix = ObjectPath::from(external_chunk_prefix(
+        &options.store_id,
+        &options.generation,
+    )?);
+    let mut listed = match &after {
+        Some(after) => backend.list_with_offset(Some(&prefix), &ObjectPath::from(after.as_str())),
+        None => backend.list(Some(&prefix)),
+    };
+    let mut keys = Vec::new();
+    while keys.len() < limit {
+        match tokio_stream::StreamExt::next(&mut listed).await {
+            Some(meta) => keys.push(meta.map_err(storage_error)?.location.to_string()),
+            None => break,
+        }
+    }
+    Ok(Reply::Listed(keys))
 }
 
 async fn put_one(

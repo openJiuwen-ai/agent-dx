@@ -97,7 +97,8 @@ fn put_against_http_fixture(unsigned_payload: bool, status: &'static [u8]) -> Ca
         (header, body)
     });
     let store = S3ChunkStore::new(config).unwrap();
-    let staged = StagedChunk::new(OperationId::new("fixture-put"), b"payload".to_vec());
+    let staged =
+        StagedChunk::new_generational(OperationId::new("fixture-put"), b"payload".to_vec());
     let chunk = staged.chunk.clone();
     let result = store.put(staged);
     let (header, body) = server.join().unwrap();
@@ -580,7 +581,12 @@ impl ObjectStore for ObservedStore {
 
 fn upload_batch(count: u8, length: usize) -> Vec<StagedChunk> {
     (0..count)
-        .map(|tag| StagedChunk::new(OperationId::new(format!("upload-{tag}")), vec![tag; length]))
+        .map(|tag| {
+            StagedChunk::new_generational(
+                OperationId::new(format!("upload-{tag}")),
+                vec![tag; length],
+            )
+        })
         .collect()
 }
 
@@ -590,7 +596,8 @@ fn s3_verifier_is_store_owned_fixed_gate_and_shutdown_joins_workers() {
         S3ChunkStore::with_backend(options(), Arc::new(object_store::memory::InMemory::new()))
             .unwrap();
     let verifier = store.verifier.clone();
-    let staged = StagedChunk::new(OperationId::new("closed-verifier"), b"closed".to_vec());
+    let staged =
+        StagedChunk::new_generational(OperationId::new("closed-verifier"), b"closed".to_vec());
 
     assert_eq!(
         verifier.worker_count_for_test(),
@@ -627,8 +634,10 @@ fn verifier_gate_limits_concurrent_hashes_to_one_object() {
         S3ChunkStore::with_backend(options(), Arc::new(object_store::memory::InMemory::new()))
             .unwrap();
     let verifier = store.verifier.clone();
-    let first = StagedChunk::new(OperationId::new("gate-a"), vec![1; MAX_STAGED_CHUNK_BYTES]);
-    let second = StagedChunk::new(OperationId::new("gate-b"), vec![2; MAX_STAGED_CHUNK_BYTES]);
+    let first =
+        StagedChunk::new_generational(OperationId::new("gate-a"), vec![1; MAX_STAGED_CHUNK_BYTES]);
+    let second =
+        StagedChunk::new_generational(OperationId::new("gate-b"), vec![2; MAX_STAGED_CHUNK_BYTES]);
     let barrier = Arc::new(std::sync::Barrier::new(3));
 
     let first_thread = {
@@ -665,7 +674,7 @@ fn verifier_panic_is_reported_and_closes_future_hashes() {
         S3ChunkStore::with_backend(options(), Arc::new(object_store::memory::InMemory::new()))
             .unwrap();
     let verifier = store.verifier.clone();
-    let staged = StagedChunk::new(OperationId::new("panic"), b"panic".to_vec());
+    let staged = StagedChunk::new_generational(OperationId::new("panic"), b"panic".to_vec());
     verifier.panic_next_hash_for_test();
 
     assert_eq!(
@@ -699,7 +708,8 @@ fn verifier_panic_is_reported_and_closes_future_hashes() {
 fn full_object_digest_covers_bytes_outside_requested_read_range() {
     let backend = Arc::new(object_store::memory::InMemory::new());
     let store = S3ChunkStore::with_backend(options(), backend.clone()).unwrap();
-    let staged = StagedChunk::new(OperationId::new("tail-corruption"), b"01234567".to_vec());
+    let staged =
+        StagedChunk::new_generational(OperationId::new("tail-corruption"), b"01234567".to_vec());
     store.put(staged.clone()).unwrap();
     let key = external_object_key("filesystem-a", "generation-1", &staged.chunk.id).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -734,7 +744,7 @@ fn get_and_ready_load_share_the_store_verifier() {
     let backend = Arc::new(object_store::memory::InMemory::new());
     let store = S3ChunkStore::with_backend(config, backend).unwrap();
     let verifier = store.verifier.clone();
-    let staged = StagedChunk::new(
+    let staged = StagedChunk::new_generational(
         OperationId::new("shared-verifier"),
         vec![7; MAX_STAGED_CHUNK_BYTES],
     );
@@ -791,8 +801,10 @@ fn valid_but_replaced_public_identity_does_not_replace_content_proof() {
         verifier: S3ChunkVerifier::new().unwrap(),
         observer: S3GetObserver::new(None),
     };
-    let mut original = StagedChunk::new(OperationId::new("producer"), b"original".to_vec());
-    let different = StagedChunk::new(OperationId::new("producer"), b"different".to_vec());
+    let mut original =
+        StagedChunk::new_generational(OperationId::new("producer"), b"original".to_vec());
+    let different =
+        StagedChunk::new_generational(OperationId::new("producer"), b"different".to_vec());
     original.chunk = different.chunk;
     validate_chunk(&original.chunk).unwrap();
     assert_eq!(
@@ -955,7 +967,7 @@ fn whole_batch_timeout_cancels_all_parallel_uploads_before_join() {
 
 #[test]
 fn immutable_id_binds_both_digest_and_length() {
-    let staged = StagedChunk::new(OperationId::new("write"), b"original".to_vec());
+    let staged = StagedChunk::new_generational(OperationId::new("write"), b"original".to_vec());
     assert_eq!(chunk_from_id(&staged.chunk.id).unwrap(), staged.chunk);
     for id in [
         "",
@@ -969,7 +981,7 @@ fn immutable_id_binds_both_digest_and_length() {
 
 #[test]
 fn changed_content_never_passes_integrity_validation() {
-    let staged = StagedChunk::new(OperationId::new("write"), b"original".to_vec());
+    let staged = StagedChunk::new_generational(OperationId::new("write"), b"original".to_vec());
     assert!(verify_bytes(&staged.chunk, b"mutated!").is_err());
     assert!(verify_bytes(&staged.chunk, b"short").is_err());
     verify_bytes(&staged.chunk, staged.bytes()).unwrap();
@@ -989,7 +1001,7 @@ fn empty_batch_needs_no_worker_and_nonempty_batches_keep_validation() {
     };
     assert!(store.put_batch(Vec::new()).unwrap().is_empty());
 
-    let valid = StagedChunk::new(OperationId::new("write"), b"original".to_vec());
+    let valid = StagedChunk::new_generational(OperationId::new("write"), b"original".to_vec());
     assert_eq!(
         store
             .put_batch(vec![valid.clone(); MAX_BATCH + 1])
@@ -1009,7 +1021,7 @@ fn empty_batch_needs_no_worker_and_nonempty_batches_keep_validation() {
 fn external_receipt_and_partial_rmw_are_bound_to_the_same_object() {
     let backend = Arc::new(object_store::memory::InMemory::new());
     let store = S3ChunkStore::with_backend(options(), backend).unwrap();
-    let staged = StagedChunk::new(OperationId::new("write"), b"original".to_vec());
+    let staged = StagedChunk::new_generational(OperationId::new("write"), b"original".to_vec());
     let receipt = store.put(staged.clone()).unwrap();
     assert!(receipt.durable_acks.is_empty());
     assert_eq!(receipt.placement_revision, 0);
@@ -1038,7 +1050,7 @@ fn untrusted_store_generation_or_key_is_rejected_before_get() {
     let store =
         S3ChunkStore::with_backend(options(), Arc::new(object_store::memory::InMemory::new()))
             .unwrap();
-    let staged = StagedChunk::new(OperationId::new("write"), b"original".to_vec());
+    let staged = StagedChunk::new_generational(OperationId::new("write"), b"original".to_vec());
     let key = external_object_key("filesystem-a", "generation-1", &staged.chunk.id).unwrap();
     let authorized = source(&staged.chunk, key);
     for variant in 0..3 {
@@ -1070,7 +1082,7 @@ fn untrusted_store_generation_or_key_is_rejected_before_get() {
 fn damaged_s3_bytes_do_not_publish_partial_rmw_output() {
     let backend = Arc::new(object_store::memory::InMemory::new());
     let store = S3ChunkStore::with_backend(options(), backend.clone()).unwrap();
-    let staged = StagedChunk::new(OperationId::new("write"), b"original".to_vec());
+    let staged = StagedChunk::new_generational(OperationId::new("write"), b"original".to_vec());
     store.put(staged.clone()).unwrap();
     let key = external_object_key("filesystem-a", "generation-1", &staged.chunk.id).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1096,7 +1108,7 @@ fn cache_off_remains_the_default() {
     let backend = Arc::new(object_store::memory::InMemory::new());
     let store = S3ChunkStore::with_backend(options(), backend.clone()).unwrap();
     assert!(store.cache.is_none());
-    let staged = StagedChunk::new(OperationId::new("write"), b"original".to_vec());
+    let staged = StagedChunk::new_generational(OperationId::new("write"), b"original".to_vec());
     store.put(staged.clone()).unwrap();
     let key = external_object_key("filesystem-a", "generation-1", &staged.chunk.id).unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1123,7 +1135,7 @@ fn read_through_cache_serves_verified_pending_or_ready_bytes() {
     let mut config = options();
     config.cache = Some(cache_options(dir.path(), 1024 * 1024));
     let store = S3ChunkStore::with_backend(config, backend.clone()).unwrap();
-    let staged = StagedChunk::new(OperationId::new("write"), b"original".to_vec());
+    let staged = StagedChunk::new_generational(OperationId::new("write"), b"original".to_vec());
     store.put(staged.clone()).unwrap();
     let mut out = [0; 8];
     assert_eq!(store.read_at(&staged.chunk.id, 0, &mut out).unwrap(), 8);
@@ -1146,7 +1158,7 @@ fn read_through_cache_serves_verified_pending_or_ready_bytes() {
 fn ready_cache_file_recovers_after_store_restart() {
     let backend = Arc::new(object_store::memory::InMemory::new());
     let dir = tempfile::tempdir().unwrap();
-    let staged = StagedChunk::new(OperationId::new("write"), b"original".to_vec());
+    let staged = StagedChunk::new_generational(OperationId::new("write"), b"original".to_vec());
     {
         let mut config = options();
         config.cache = Some(cache_options(dir.path(), 1024 * 1024));
@@ -1180,7 +1192,7 @@ fn corrupt_ready_cache_is_removed_and_refetched() {
     let mut config = options();
     config.cache = Some(cache_options(dir.path(), 1024 * 1024));
     let store = S3ChunkStore::with_backend(config, backend).unwrap();
-    let staged = StagedChunk::new(OperationId::new("write"), b"original".to_vec());
+    let staged = StagedChunk::new_generational(OperationId::new("write"), b"original".to_vec());
     store.put(staged.clone()).unwrap();
     let mut out = [0; 8];
     assert_eq!(store.read_at(&staged.chunk.id, 0, &mut out).unwrap(), 8);
@@ -1212,7 +1224,7 @@ fn ready_load_reserves_unverified_payload_until_verified_handoff() {
         inner: Mutex::new(CacheInner::default()),
         wake: Condvar::new(),
     });
-    let staged = StagedChunk::new(
+    let staged = StagedChunk::new_generational(
         OperationId::new("ready-budget"),
         vec![7; MAX_STAGED_CHUNK_BYTES],
     );
@@ -1272,15 +1284,15 @@ fn ready_load_budget_evicts_unpinned_resident_before_rejecting_new_load() {
         inner: Mutex::new(CacheInner::default()),
         wake: Condvar::new(),
     });
-    let first = StagedChunk::new(
+    let first = StagedChunk::new_generational(
         OperationId::new("ready-first"),
         vec![1; MAX_STAGED_CHUNK_BYTES],
     );
-    let second = StagedChunk::new(
+    let second = StagedChunk::new_generational(
         OperationId::new("ready-second"),
         vec![2; MAX_STAGED_CHUNK_BYTES],
     );
-    let third = StagedChunk::new(
+    let third = StagedChunk::new_generational(
         OperationId::new("ready-third"),
         vec![3; MAX_STAGED_CHUNK_BYTES],
     );
@@ -1327,8 +1339,10 @@ fn ready_load_budget_evicts_unpinned_resident_before_rejecting_new_load() {
 
 #[test]
 fn ready_load_reuses_unique_resident_allocation_inside_existing_budget() {
-    let first = StagedChunk::new(OperationId::new("resident-first"), b"old-data".to_vec());
-    let second = StagedChunk::new(OperationId::new("resident-second"), b"new-data".to_vec());
+    let first =
+        StagedChunk::new_generational(OperationId::new("resident-first"), b"old-data".to_vec());
+    let second =
+        StagedChunk::new_generational(OperationId::new("resident-second"), b"new-data".to_vec());
     let retained_capacity = 64;
     let dir = tempfile::tempdir().unwrap();
     let mut options = cache_options(dir.path(), retained_capacity as u64);
@@ -1379,7 +1393,7 @@ fn ready_load_reuses_unique_resident_allocation_inside_existing_budget() {
 
 #[test]
 fn ready_load_recycled_capacity_stays_charged_for_short_tail() {
-    let first = StagedChunk::new(OperationId::new("full-resident"), vec![1; 64]);
+    let first = StagedChunk::new_generational(OperationId::new("full-resident"), vec![1; 64]);
     let dir = tempfile::tempdir().unwrap();
     let mut options = cache_options(dir.path(), 64);
     options.pending_bytes = 64;
@@ -1419,7 +1433,7 @@ fn ready_load_recycled_capacity_stays_charged_for_short_tail() {
 
 #[test]
 fn ready_load_larger_object_falls_back_without_exceeding_budget() {
-    let first = StagedChunk::new(OperationId::new("small-resident"), vec![1; 8]);
+    let first = StagedChunk::new_generational(OperationId::new("small-resident"), vec![1; 8]);
     let dir = tempfile::tempdir().unwrap();
     let mut options = cache_options(dir.path(), 64);
     options.pending_bytes = 64;
@@ -1450,8 +1464,10 @@ fn ready_load_larger_object_falls_back_without_exceeding_budget() {
 
 #[test]
 fn ready_load_does_not_recycle_pinned_resident_allocation() {
-    let first = StagedChunk::new(OperationId::new("resident-pinned"), b"old-data".to_vec());
-    let second = StagedChunk::new(OperationId::new("resident-next"), b"new-data".to_vec());
+    let first =
+        StagedChunk::new_generational(OperationId::new("resident-pinned"), b"old-data".to_vec());
+    let second =
+        StagedChunk::new_generational(OperationId::new("resident-next"), b"new-data".to_vec());
     let retained_capacity = 64;
     let dir = tempfile::tempdir().unwrap();
     let mut options = cache_options(dir.path(), retained_capacity as u64);
@@ -1496,8 +1512,10 @@ fn ready_load_does_not_recycle_pinned_resident_allocation() {
 
 #[test]
 fn ready_load_recycled_buffer_failure_does_not_expose_old_identity() {
-    let first = StagedChunk::new(OperationId::new("resident-stale"), b"old-data".to_vec());
-    let second = StagedChunk::new(OperationId::new("resident-corrupt"), b"new-data".to_vec());
+    let first =
+        StagedChunk::new_generational(OperationId::new("resident-stale"), b"old-data".to_vec());
+    let second =
+        StagedChunk::new_generational(OperationId::new("resident-corrupt"), b"new-data".to_vec());
     let retained_capacity = 64;
     let dir = tempfile::tempdir().unwrap();
     let mut options = cache_options(dir.path(), retained_capacity as u64);
@@ -1560,7 +1578,7 @@ fn ready_load_worker_panic_releases_raw_budget() {
         inner: Mutex::new(CacheInner::default()),
         wake: Condvar::new(),
     };
-    let staged = StagedChunk::new(
+    let staged = StagedChunk::new_generational(
         OperationId::new("ready-panic"),
         vec![9; MAX_STAGED_CHUNK_BYTES],
     );
@@ -1587,7 +1605,7 @@ fn ready_load_shutdown_waits_for_accepted_pipeline_and_keeps_raw_budget_charged(
         inner: Mutex::new(CacheInner::default()),
         wake: Condvar::new(),
     });
-    let staged = StagedChunk::new(
+    let staged = StagedChunk::new_generational(
         OperationId::new("ready-shutdown"),
         vec![5; MAX_STAGED_CHUNK_BYTES],
     );
@@ -1678,7 +1696,8 @@ fn ready_load_pipeline_keeps_full_digest_and_segment_events() {
         let payload = (0..size)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
-        let staged = StagedChunk::new(OperationId::new(format!("ready-{size}")), payload);
+        let staged =
+            StagedChunk::new_generational(OperationId::new(format!("ready-{size}")), payload);
         write_ready_cache_file(&shared, &staged);
 
         let verified = shared.lookup(&staged.chunk).unwrap();
@@ -1704,7 +1723,7 @@ fn ready_load_rejects_truncated_oversized_and_tail_corrupt_files() {
     ];
     for (name, payload) in cases {
         let dir = tempfile::tempdir().unwrap();
-        let staged = StagedChunk::new(
+        let staged = StagedChunk::new_generational(
             OperationId::new(format!("ready-{name}")),
             b"01234567".to_vec(),
         );
@@ -1729,7 +1748,8 @@ fn ready_load_rejects_truncated_oversized_and_tail_corrupt_files() {
 #[test]
 fn recovery_preserves_ready_files_when_raw_load_budget_is_exhausted() {
     let dir = tempfile::tempdir().unwrap();
-    let staged = StagedChunk::new(OperationId::new("recovery-budget"), b"payload".to_vec());
+    let staged =
+        StagedChunk::new_generational(OperationId::new("recovery-budget"), b"payload".to_vec());
     let mut options = cache_options(dir.path(), 1024 * 1024);
     options.pending_bytes = staged.chunk.length - 1;
     let shared = CacheShared {
@@ -1759,9 +1779,9 @@ fn recovery_preserves_ready_files_when_raw_load_budget_is_exhausted() {
 #[test]
 fn failed_ready_removal_keeps_conservative_cache_budget() {
     let dir = tempfile::tempdir().unwrap();
-    let blocked = StagedChunk::new(OperationId::new("blocked"), b"blocked".to_vec());
-    let extra = StagedChunk::new(OperationId::new("extra"), b"extra".to_vec());
-    let later = StagedChunk::new(OperationId::new("later"), b"later".to_vec());
+    let blocked = StagedChunk::new_generational(OperationId::new("blocked"), b"blocked".to_vec());
+    let extra = StagedChunk::new_generational(OperationId::new("extra"), b"extra".to_vec());
+    let later = StagedChunk::new_generational(OperationId::new("later"), b"later".to_vec());
     let shared = CacheShared {
         options: cache_options(dir.path(), blocked.chunk.length),
         store_id: "filesystem-a".into(),
@@ -1837,7 +1857,7 @@ fn recovery_rejects_uncleanable_cache_files_that_would_break_budget() {
     assert!(shared.recover_ready_entries().is_err());
 
     let dir = tempfile::tempdir().unwrap();
-    let staged = StagedChunk::new(OperationId::new("damaged"), b"damaged".to_vec());
+    let staged = StagedChunk::new_generational(OperationId::new("damaged"), b"damaged".to_vec());
     let shared = CacheShared {
         options: cache_options(dir.path(), 1024),
         store_id: "filesystem-a".into(),
@@ -1860,8 +1880,8 @@ fn recovery_rejects_uncleanable_cache_files_that_would_break_budget() {
 fn cache_capacity_evicts_ready_entries_without_failing_reads() {
     let backend = Arc::new(object_store::memory::InMemory::new());
     let dir = tempfile::tempdir().unwrap();
-    let first = StagedChunk::new(OperationId::new("write-1"), b"first".to_vec());
-    let second = StagedChunk::new(OperationId::new("write-2"), b"second".to_vec());
+    let first = StagedChunk::new_generational(OperationId::new("write-1"), b"first".to_vec());
+    let second = StagedChunk::new_generational(OperationId::new("write-2"), b"second".to_vec());
     let mut config = options();
     config.cache = Some(cache_options(dir.path(), 8));
     let store = S3ChunkStore::with_backend(config, backend).unwrap();
@@ -1886,9 +1906,9 @@ fn eviction_sampler_selects_older_of_two_ready_candidates() {
         inner: Mutex::new(CacheInner::default()),
         wake: Condvar::new(),
     };
-    let oldest = StagedChunk::new(OperationId::new("oldest"), b"a".to_vec());
-    let middle = StagedChunk::new(OperationId::new("middle"), b"b".to_vec());
-    let newest = StagedChunk::new(OperationId::new("newest"), b"c".to_vec());
+    let oldest = StagedChunk::new_generational(OperationId::new("oldest"), b"a".to_vec());
+    let middle = StagedChunk::new_generational(OperationId::new("middle"), b"b".to_vec());
+    let newest = StagedChunk::new_generational(OperationId::new("newest"), b"c".to_vec());
     force_cache_access_bucket(&shared, 1);
     let oldest_key = write_ready_cache_file(&shared, &oldest);
     force_cache_access_bucket(&shared, 2);
@@ -1932,9 +1952,9 @@ fn eviction_sampler_keeps_first_random_candidate_inside_same_access_bucket() {
         wake: Condvar::new(),
     };
     force_cache_access_bucket(&shared, 7);
-    let first = StagedChunk::new(OperationId::new("same-first"), b"a".to_vec());
-    let second = StagedChunk::new(OperationId::new("same-second"), b"b".to_vec());
-    let third = StagedChunk::new(OperationId::new("same-third"), b"c".to_vec());
+    let first = StagedChunk::new_generational(OperationId::new("same-first"), b"a".to_vec());
+    let second = StagedChunk::new_generational(OperationId::new("same-second"), b"b".to_vec());
+    let third = StagedChunk::new_generational(OperationId::new("same-third"), b"c".to_vec());
     let first_key = write_ready_cache_file(&shared, &first);
     let second_key = write_ready_cache_file(&shared, &second);
     let third_key = write_ready_cache_file(&shared, &third);
@@ -1967,9 +1987,9 @@ fn ready_lookup_refreshes_access_bucket_without_expanding_budget() {
         inner: Mutex::new(CacheInner::default()),
         wake: Condvar::new(),
     };
-    let refreshed = StagedChunk::new(OperationId::new("refreshed"), b"a".to_vec());
-    let stale = StagedChunk::new(OperationId::new("stale"), b"b".to_vec());
-    let incoming = StagedChunk::new(OperationId::new("incoming"), b"c".to_vec());
+    let refreshed = StagedChunk::new_generational(OperationId::new("refreshed"), b"a".to_vec());
+    let stale = StagedChunk::new_generational(OperationId::new("stale"), b"b".to_vec());
+    let incoming = StagedChunk::new_generational(OperationId::new("incoming"), b"c".to_vec());
     force_cache_access_bucket(&shared, 1);
     let refreshed_key = write_ready_cache_file(&shared, &refreshed);
     force_cache_access_bucket(&shared, 2);
@@ -2010,7 +2030,8 @@ fn first_ready_and_recovered_index_use_current_access_bucket() {
         S3ChunkVerifier::new().unwrap(),
     )
     .unwrap();
-    let staged = StagedChunk::new(OperationId::new("first-ready-bucket"), b"original".to_vec());
+    let staged =
+        StagedChunk::new_generational(OperationId::new("first-ready-bucket"), b"original".to_vec());
     let key = CacheKey::new("filesystem-a", "generation-1", &staged.chunk);
     force_cache_access_bucket(&cache.shared, 41);
     cache.schedule_from_read(&staged.chunk, verified(&staged));
@@ -2050,7 +2071,7 @@ fn ready_bucket_fits_existing_entry_metadata() {
         Pending { bytes: VerifiedExternalChunk },
         Ready { length: u64 },
     }
-    let staged = StagedChunk::new(OperationId::new("entry-layout"), b"a".to_vec());
+    let staged = StagedChunk::new_generational(OperationId::new("entry-layout"), b"a".to_vec());
     let previous = [
         PreviousEntry::Pending {
             bytes: verified(&staged),
@@ -2084,7 +2105,7 @@ fn failed_eviction_preserves_ready_access_bucket_and_accounting() {
         wake: Condvar::new(),
     };
     force_cache_access_bucket(&shared, 9);
-    let staged = StagedChunk::new(OperationId::new("rollback-bucket"), b"a".to_vec());
+    let staged = StagedChunk::new_generational(OperationId::new("rollback-bucket"), b"a".to_vec());
     let key = write_ready_cache_file(&shared, &staged);
     let path = shared.path_for(&key);
     std::fs::remove_file(&path).unwrap();
@@ -2111,7 +2132,7 @@ fn coarse_eviction_128_objects_64_capacity_keeps_scan_hits_and_hot_entries() {
         };
         let keys = (0_u64..128)
             .map(|i| {
-                let staged = StagedChunk::new(
+                let staged = StagedChunk::new_generational(
                     OperationId::new(format!("scan-{i}")),
                     i.to_le_bytes().to_vec(),
                 );
@@ -2202,7 +2223,7 @@ fn eviction_sampler_handles_one_none_and_pending_exclusion() {
         inner: Mutex::new(CacheInner::default()),
         wake: Condvar::new(),
     };
-    let only = StagedChunk::new(OperationId::new("only"), b"a".to_vec());
+    let only = StagedChunk::new_generational(OperationId::new("only"), b"a".to_vec());
     let only_key = write_ready_cache_file(&shared, &only);
     {
         let mut inner = shared.inner.lock().unwrap();
@@ -2212,7 +2233,7 @@ fn eviction_sampler_handles_one_none_and_pending_exclusion() {
         assert_eq!(inner.activity.evictions, 1);
     }
 
-    let pending = StagedChunk::new(OperationId::new("pending"), b"b".to_vec());
+    let pending = StagedChunk::new_generational(OperationId::new("pending"), b"b".to_vec());
     let pending_key = CacheKey::new("filesystem-a", "generation-1", &pending.chunk);
     {
         let mut inner = shared.inner.lock().unwrap();
@@ -2246,10 +2267,22 @@ fn eviction_sampler_multi_seed_cyclic_scan_avoids_strict_lru_all_miss() {
             wake: Condvar::new(),
         };
         let chunks = [
-            StagedChunk::new(OperationId::new(format!("scan-a-{seed}")), b"a".to_vec()),
-            StagedChunk::new(OperationId::new(format!("scan-b-{seed}")), b"b".to_vec()),
-            StagedChunk::new(OperationId::new(format!("scan-c-{seed}")), b"c".to_vec()),
-            StagedChunk::new(OperationId::new(format!("scan-d-{seed}")), b"d".to_vec()),
+            StagedChunk::new_generational(
+                OperationId::new(format!("scan-a-{seed}")),
+                b"a".to_vec(),
+            ),
+            StagedChunk::new_generational(
+                OperationId::new(format!("scan-b-{seed}")),
+                b"b".to_vec(),
+            ),
+            StagedChunk::new_generational(
+                OperationId::new(format!("scan-c-{seed}")),
+                b"c".to_vec(),
+            ),
+            StagedChunk::new_generational(
+                OperationId::new(format!("scan-d-{seed}")),
+                b"d".to_vec(),
+            ),
         ];
         for staged in &chunks[..3] {
             write_ready_cache_file(&shared, staged);
@@ -2292,7 +2325,7 @@ fn eviction_sampler_multi_seed_cyclic_scan_avoids_strict_lru_all_miss() {
 fn store_generation_namespaces_never_share_cached_content() {
     let backend = Arc::new(object_store::memory::InMemory::new());
     let dir = tempfile::tempdir().unwrap();
-    let staged = StagedChunk::new(OperationId::new("write"), b"original".to_vec());
+    let staged = StagedChunk::new_generational(OperationId::new("write"), b"original".to_vec());
     {
         let mut config = options();
         config.cache = Some(cache_options(dir.path(), 1024 * 1024));
@@ -2351,10 +2384,12 @@ fn write_fill_is_partial_by_default_and_large_write_opt_in() {
     let mut config = options();
     config.cache = Some(cache_options(dir.path(), 1024 * 1024));
     let store = S3ChunkStore::with_backend(config, backend.clone()).unwrap();
-    let partial = StagedChunk::new(OperationId::new("partial-write"), b"small".to_vec());
+    let partial =
+        StagedChunk::new_generational(OperationId::new("partial-write"), b"small".to_vec());
     store.put(partial.clone()).unwrap();
     wait_for_file(&cache_path(dir.path(), "generation-1", &partial.chunk));
-    let staged = StagedChunk::new(OperationId::new("write"), vec![7; MAX_STAGED_CHUNK_BYTES]);
+    let staged =
+        StagedChunk::new_generational(OperationId::new("write"), vec![7; MAX_STAGED_CHUNK_BYTES]);
     store.put(staged.clone()).unwrap();
     thread::sleep(Duration::from_millis(50));
     assert!(!cache_path(dir.path(), "generation-1", &staged.chunk).exists());
@@ -2371,7 +2406,8 @@ fn write_fill_is_partial_by_default_and_large_write_opt_in() {
 
 #[test]
 fn pending_cache_entry_is_served_before_disk_fill_runs() {
-    let staged = StagedChunk::new(OperationId::new("pending"), b"pending-bytes".to_vec());
+    let staged =
+        StagedChunk::new_generational(OperationId::new("pending"), b"pending-bytes".to_vec());
     let dir = tempfile::tempdir().unwrap();
     let shared = CacheShared {
         options: cache_options(dir.path(), 1024 * 1024),
@@ -2400,9 +2436,10 @@ fn pending_cache_entry_is_served_before_disk_fill_runs() {
 #[test]
 fn read_fill_pending_reject_preserves_ready_disk_entry() {
     let dir = tempfile::tempdir().unwrap();
-    let ready = StagedChunk::new(OperationId::new("ready"), b"ready-01".to_vec());
-    let held = StagedChunk::new(OperationId::new("held"), b"held-001".to_vec());
-    let incoming = StagedChunk::new(OperationId::new("incoming"), b"incoming".to_vec());
+    let ready = StagedChunk::new_generational(OperationId::new("ready"), b"ready-01".to_vec());
+    let held = StagedChunk::new_generational(OperationId::new("held"), b"held-001".to_vec());
+    let incoming =
+        StagedChunk::new_generational(OperationId::new("incoming"), b"incoming".to_vec());
     let shared = CacheShared {
         options: S3ChunkCacheOptions {
             directory: dir.path().join("cache"),
@@ -2454,9 +2491,10 @@ fn read_fill_pending_reject_preserves_ready_disk_entry() {
 #[test]
 fn raw_fill_pending_reject_preserves_ready_disk_entry() {
     let dir = tempfile::tempdir().unwrap();
-    let ready = StagedChunk::new(OperationId::new("ready"), b"ready-01".to_vec());
-    let held = StagedChunk::new(OperationId::new("held"), b"held-001".to_vec());
-    let incoming = StagedChunk::new(OperationId::new("incoming"), b"incoming".to_vec());
+    let ready = StagedChunk::new_generational(OperationId::new("ready"), b"ready-01".to_vec());
+    let held = StagedChunk::new_generational(OperationId::new("held"), b"held-001".to_vec());
+    let incoming =
+        StagedChunk::new_generational(OperationId::new("incoming"), b"incoming".to_vec());
     let shared = CacheShared {
         options: S3ChunkCacheOptions {
             directory: dir.path().join("cache"),
@@ -2502,8 +2540,10 @@ fn raw_fill_pending_reject_preserves_ready_disk_entry() {
 #[test]
 fn read_fill_drops_unpinned_resident_before_pending_reject() {
     let dir = tempfile::tempdir().unwrap();
-    let resident = StagedChunk::new(OperationId::new("resident"), b"resident".to_vec());
-    let incoming = StagedChunk::new(OperationId::new("incoming"), b"incoming".to_vec());
+    let resident =
+        StagedChunk::new_generational(OperationId::new("resident"), b"resident".to_vec());
+    let incoming =
+        StagedChunk::new_generational(OperationId::new("incoming"), b"incoming".to_vec());
     let shared = CacheShared {
         options: cache_options(dir.path(), incoming.chunk.length),
         store_id: "filesystem-a".into(),
@@ -2546,8 +2586,9 @@ fn read_fill_drops_unpinned_resident_before_pending_reject() {
 #[test]
 fn cache_activity_counts_task_rejections() {
     let dir = tempfile::tempdir().unwrap();
-    let ready = StagedChunk::new(OperationId::new("ready"), b"ready".to_vec());
-    let incoming = StagedChunk::new(OperationId::new("incoming"), b"incoming".to_vec());
+    let ready = StagedChunk::new_generational(OperationId::new("ready"), b"ready".to_vec());
+    let incoming =
+        StagedChunk::new_generational(OperationId::new("incoming"), b"incoming".to_vec());
     let shared = CacheShared {
         options: cache_options(dir.path(), 1024 * 1024),
         store_id: "filesystem-a".into(),
@@ -2585,8 +2626,8 @@ fn cache_activity_counts_task_rejections() {
 #[test]
 fn cache_activity_splits_capacity_from_pending_budget_rejections() {
     let dir = tempfile::tempdir().unwrap();
-    let zero = StagedChunk::new(OperationId::new("zero"), Vec::new());
-    let too_large = StagedChunk::new(OperationId::new("too-large"), vec![1; 8]);
+    let zero = StagedChunk::new_generational(OperationId::new("zero"), Vec::new());
+    let too_large = StagedChunk::new_generational(OperationId::new("too-large"), vec![1; 8]);
     let shared = CacheShared {
         options: cache_options(dir.path(), 4),
         store_id: "filesystem-a".into(),
@@ -2607,7 +2648,8 @@ fn cache_activity_splits_capacity_from_pending_budget_rejections() {
 
 #[test]
 fn read_fill_keeps_the_verified_buffer_identity() {
-    let staged = StagedChunk::new(OperationId::new("read-fill"), b"read-fill-bytes".to_vec());
+    let staged =
+        StagedChunk::new_generational(OperationId::new("read-fill"), b"read-fill-bytes".to_vec());
     let verified = VerifiedExternalChunk::verify(&staged.chunk, staged.bytes().to_vec()).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let shared = CacheShared {
@@ -2638,7 +2680,8 @@ fn read_fill_keeps_the_verified_buffer_identity() {
 
 #[test]
 fn read_fill_rejects_a_verified_buffer_for_another_chunk_identity() {
-    let accepted = StagedChunk::new(OperationId::new("accepted"), b"same-length-a".to_vec());
+    let accepted =
+        StagedChunk::new_generational(OperationId::new("accepted"), b"same-length-a".to_vec());
     let mut mutated_identity = accepted.chunk.clone();
     mutated_identity.length += 1;
     let other = VerifiedExternalChunk::verify(&accepted.chunk, accepted.bytes().to_vec()).unwrap();
@@ -2663,7 +2706,8 @@ fn read_fill_rejects_a_verified_buffer_for_another_chunk_identity() {
 
 #[test]
 fn stopped_read_fill_does_not_retain_the_verified_buffer() {
-    let staged = StagedChunk::new(OperationId::new("stopped-read"), b"stopped".to_vec());
+    let staged =
+        StagedChunk::new_generational(OperationId::new("stopped-read"), b"stopped".to_vec());
     let dir = tempfile::tempdir().unwrap();
     let shared = CacheShared {
         options: cache_options(dir.path(), 1024 * 1024),
@@ -2688,7 +2732,8 @@ fn stopped_read_fill_does_not_retain_the_verified_buffer() {
 
 #[test]
 fn stopped_ready_lookup_does_not_repopulate_resident_slot() {
-    let staged = StagedChunk::new(OperationId::new("stopped-ready"), b"stopped".to_vec());
+    let staged =
+        StagedChunk::new_generational(OperationId::new("stopped-ready"), b"stopped".to_vec());
     let dir = tempfile::tempdir().unwrap();
     let shared = CacheShared {
         options: cache_options(dir.path(), 1024 * 1024),
@@ -2727,7 +2772,7 @@ fn resident_slot_reuses_verified_object_until_explicit_eviction() {
     let mut config = options();
     config.cache = Some(cache_options(dir.path(), 1024 * 1024));
     let store = S3ChunkStore::with_backend(config, backend.clone()).unwrap();
-    let staged = StagedChunk::new(OperationId::new("resident"), b"original".to_vec());
+    let staged = StagedChunk::new_generational(OperationId::new("resident"), b"original".to_vec());
     store.put(staged.clone()).unwrap();
     let mut out = [0; 8];
     assert_eq!(store.read_at(&staged.chunk.id, 0, &mut out).unwrap(), 8);
@@ -2766,7 +2811,7 @@ fn resident_slot_reuses_verified_object_until_explicit_eviction() {
 
 #[test]
 fn resident_slot_requires_full_chunk_identity_not_only_cache_key() {
-    let staged = StagedChunk::new(OperationId::new("identity"), b"identity".to_vec());
+    let staged = StagedChunk::new_generational(OperationId::new("identity"), b"identity".to_vec());
     let mut wrong_chunk = staged.chunk.clone();
     wrong_chunk.length += 1;
     let dir = tempfile::tempdir().unwrap();
@@ -2798,8 +2843,8 @@ fn resident_slot_requires_full_chunk_identity_not_only_cache_key() {
 
 #[test]
 fn resident_slot_counts_external_pins_before_replacement() {
-    let first = StagedChunk::new(OperationId::new("first-pin"), b"first".to_vec());
-    let second = StagedChunk::new(OperationId::new("second-pin"), b"other".to_vec());
+    let first = StagedChunk::new_generational(OperationId::new("first-pin"), b"first".to_vec());
+    let second = StagedChunk::new_generational(OperationId::new("second-pin"), b"other".to_vec());
     let dir = tempfile::tempdir().unwrap();
     let mut options = cache_options(dir.path(), first.chunk.length * 2);
     options.pending_bytes = first.chunk.length;
@@ -2855,7 +2900,7 @@ fn resident_slot_counts_external_pins_before_replacement() {
 
 #[test]
 fn verified_allocation_budget_counts_vec_capacity_not_object_length() {
-    let staged = StagedChunk::new(OperationId::new("capacity"), b"bytes".to_vec());
+    let staged = StagedChunk::new_generational(OperationId::new("capacity"), b"bytes".to_vec());
     let dir = tempfile::tempdir().unwrap();
     let mut options = cache_options(dir.path(), 1024 * 1024);
     options.pending_bytes = staged.chunk.length;
@@ -2882,7 +2927,8 @@ fn verified_allocation_budget_counts_vec_capacity_not_object_length() {
 
 #[test]
 fn worker_completion_keeps_caller_pin_charged_until_release() {
-    let staged = StagedChunk::new(OperationId::new("worker-pin"), b"worker-pin".to_vec());
+    let staged =
+        StagedChunk::new_generational(OperationId::new("worker-pin"), b"worker-pin".to_vec());
     let dir = tempfile::tempdir().unwrap();
     let cache = S3ChunkCache::new(
         cache_options(dir.path(), 1024 * 1024),
@@ -2923,8 +2969,10 @@ fn worker_completion_keeps_caller_pin_charged_until_release() {
 
 #[test]
 fn resident_slot_counts_a_concurrent_reader_pin_before_replacement() {
-    let first = StagedChunk::new(OperationId::new("first-concurrent"), b"first".to_vec());
-    let second = StagedChunk::new(OperationId::new("second-concurrent"), b"other".to_vec());
+    let first =
+        StagedChunk::new_generational(OperationId::new("first-concurrent"), b"first".to_vec());
+    let second =
+        StagedChunk::new_generational(OperationId::new("second-concurrent"), b"other".to_vec());
     let dir = tempfile::tempdir().unwrap();
     let mut options = cache_options(dir.path(), first.chunk.length * 2);
     options.pending_bytes = first.chunk.length;
@@ -2991,8 +3039,8 @@ fn resident_slot_counts_a_concurrent_reader_pin_before_replacement() {
 
 #[test]
 fn pending_budget_and_queue_bounds_drop_extra_fills() {
-    let first = StagedChunk::new(OperationId::new("first"), b"12345".to_vec());
-    let second = StagedChunk::new(OperationId::new("second"), b"abcde".to_vec());
+    let first = StagedChunk::new_generational(OperationId::new("first"), b"12345".to_vec());
+    let second = StagedChunk::new_generational(OperationId::new("second"), b"abcde".to_vec());
     let dir = tempfile::tempdir().unwrap();
     let mut options = cache_options(dir.path(), first.chunk.length * 2);
     options.pending_bytes = first.chunk.length;
@@ -3009,8 +3057,8 @@ fn pending_budget_and_queue_bounds_drop_extra_fills() {
     assert!(shared.lookup(&first.chunk).is_some());
     assert!(shared.lookup(&second.chunk).is_none());
 
-    let queued = StagedChunk::new(OperationId::new("queued"), b"q".to_vec());
-    let dropped = StagedChunk::new(OperationId::new("dropped"), b"d".to_vec());
+    let queued = StagedChunk::new_generational(OperationId::new("queued"), b"q".to_vec());
+    let dropped = StagedChunk::new_generational(OperationId::new("dropped"), b"d".to_vec());
     let dir = tempfile::tempdir().unwrap();
     let shared = CacheShared {
         options: cache_options(dir.path(), 1024 * 1024),
@@ -3026,7 +3074,7 @@ fn pending_budget_and_queue_bounds_drop_extra_fills() {
     {
         let mut inner = shared.inner.lock().unwrap();
         for index in 1..MAX_CACHE_JOBS {
-            let staged = StagedChunk::new(
+            let staged = StagedChunk::new_generational(
                 OperationId::new(format!("queued-{index}")),
                 vec![index as u8],
             );
@@ -3044,8 +3092,9 @@ fn pending_budget_and_queue_bounds_drop_extra_fills() {
     shared.schedule_from_read(&dropped.chunk, verified(&dropped));
     assert!(shared.lookup(&dropped.chunk).is_none());
 
-    let entry = StagedChunk::new(OperationId::new("entry"), b"entry".to_vec());
-    let overflow = StagedChunk::new(OperationId::new("overflow"), b"overflow".to_vec());
+    let entry = StagedChunk::new_generational(OperationId::new("entry"), b"entry".to_vec());
+    let overflow =
+        StagedChunk::new_generational(OperationId::new("overflow"), b"overflow".to_vec());
     let dir = tempfile::tempdir().unwrap();
     let shared = CacheShared {
         options: cache_options(dir.path(), 1024 * 1024),
@@ -3058,7 +3107,7 @@ fn pending_budget_and_queue_bounds_drop_extra_fills() {
     {
         let mut inner = shared.inner.lock().unwrap();
         for index in 0..MAX_CACHE_ENTRIES {
-            let staged = StagedChunk::new(
+            let staged = StagedChunk::new_generational(
                 OperationId::new(format!("entry-{index}")),
                 index.to_le_bytes().to_vec(),
             );
@@ -3086,7 +3135,7 @@ fn cache_io_failure_does_not_change_s3_put_or_get_results() {
     cache.cache_large_write = true;
     config.cache = Some(cache);
     let store = S3ChunkStore::with_backend(config, backend.clone()).unwrap();
-    let staged = StagedChunk::new(OperationId::new("write"), b"original".to_vec());
+    let staged = StagedChunk::new_generational(OperationId::new("write"), b"original".to_vec());
     let key = external_object_key("filesystem-a", "generation-1", &staged.chunk.id).unwrap();
     let cache_entry = cache_path(dir.path(), "generation-1", &staged.chunk);
     std::fs::create_dir(&cache_entry).unwrap();
@@ -3141,7 +3190,7 @@ fn s3_put_signs_payload_by_default() {
     assert!(
         captured
             .header
-            .starts_with("PUT /chunks/afs/v1/filesystem-a/generation-1/chunks/")
+            .starts_with("PUT /chunks/afs/v2/filesystem-a/generation-1/chunks/")
     );
     assert_eq!(captured.body, b"payload");
     assert!(captured.result.unwrap().external_commit.is_some());
@@ -3165,7 +3214,7 @@ fn s3_put_can_use_unsigned_payload_without_dropping_sigv4_or_receipt_checks() {
     assert!(
         captured
             .header
-            .starts_with("PUT /chunks/afs/v1/filesystem-a/generation-1/chunks/")
+            .starts_with("PUT /chunks/afs/v2/filesystem-a/generation-1/chunks/")
     );
     assert_eq!(captured.body, b"payload");
     assert_eq!(
@@ -3250,7 +3299,7 @@ fn cache_on_failed_put_still_returns_no_external_receipt() {
             .unwrap();
     });
     let store = S3ChunkStore::new(config).unwrap();
-    let staged = StagedChunk::new(OperationId::new("failure"), b"original".to_vec());
+    let staged = StagedChunk::new_generational(OperationId::new("failure"), b"original".to_vec());
     let result = store.put(staged.clone());
     assert!(result.is_err());
     assert!(
@@ -3301,7 +3350,7 @@ fn s3_client_reuses_connection_between_batches_and_closes_it_on_drop() {
         for _ in 0..2 {
             let mut header = String::new();
             connection.read_line(&mut header).unwrap();
-            assert!(header.starts_with("PUT /chunks/afs/v1/"));
+            assert!(header.starts_with("PUT /chunks/afs/v2/"));
             let mut length = None;
             loop {
                 header.clear();
@@ -3329,7 +3378,7 @@ fn s3_client_reuses_connection_between_batches_and_closes_it_on_drop() {
     let store = S3ChunkStore::new(config).unwrap();
     for index in 0..2 {
         store
-            .put(StagedChunk::new(
+            .put(StagedChunk::new_generational(
                 OperationId::new(format!("reuse-{index}")),
                 b"original".to_vec(),
             ))
@@ -3399,12 +3448,12 @@ fn real_s3_put_failure_returns_no_external_receipt() {
             assert!(header.len() < 16 * 1024);
         }
         let header = String::from_utf8(header).unwrap();
-        assert!(header.starts_with("PUT /chunks/afs/v1/filesystem-a/generation-1/chunks/"));
+        assert!(header.starts_with("PUT /chunks/afs/v2/filesystem-a/generation-1/chunks/"));
         assert!(!header.contains("If-Match") && !header.contains("If-None-Match"));
         connection.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
     });
     let store = S3ChunkStore::new(config).unwrap();
-    let result = store.put(StagedChunk::new(
+    let result = store.put(StagedChunk::new_generational(
         OperationId::new("failure"),
         b"original".to_vec(),
     ));
@@ -3434,7 +3483,7 @@ fn bounded_batch_accepts_a_64mib_file_without_node_acknowledgements() {
         .unwrap();
     let staged = (0..16)
         .map(|index| {
-            StagedChunk::new(
+            StagedChunk::new_generational(
                 OperationId::new(format!("write-{index}")),
                 vec![index; MAX_STAGED_CHUNK_BYTES],
             )
@@ -3468,7 +3517,7 @@ fn verified_full_object_read_fills_disposable_cache_without_new_authority() {
     });
     let backend = Arc::new(object_store::memory::InMemory::new());
     let store = S3ChunkStore::with_backend(config, backend.clone()).unwrap();
-    let staged = StagedChunk::new(
+    let staged = StagedChunk::new_generational(
         OperationId::new("cache-fill"),
         vec![7; MAX_STAGED_CHUNK_BYTES],
     );
@@ -3544,11 +3593,75 @@ fn timeout_cancels_the_owned_operation_before_worker_join() {
     );
     let store = S3ChunkStore::with_backend(config, Arc::new(backend)).unwrap();
     let start = std::time::Instant::now();
-    let result = store.put(StagedChunk::new(
+    let result = store.put(StagedChunk::new_generational(
         OperationId::new("timeout"),
         b"bytes".to_vec(),
     ));
     assert_eq!(result.unwrap_err().code(), afs_error::IO_TIMEOUT);
     drop(store);
     assert!(start.elapsed() < Duration::from_secs(2));
+}
+
+/// R05：删除幂等（对象已不存在也算成功）；存储失败不算删除成功。
+#[test]
+fn delete_is_idempotent_and_reports_only_real_failures() {
+    let backend = Arc::new(object_store::memory::InMemory::new());
+    let store = S3ChunkStore::with_backend(options(), backend).unwrap();
+    let staged = StagedChunk::new_generational(OperationId::new("write"), b"body".to_vec());
+    store.put(staged.clone()).unwrap();
+    store
+        .delete_objects(std::slice::from_ref(&staged.chunk.id))
+        .unwrap();
+    let mut out = [0; 4];
+    assert!(store.read_at(&staged.chunk.id, 0, &mut out).is_err());
+    store
+        .delete_objects(std::slice::from_ref(&staged.chunk.id))
+        .unwrap();
+    assert!(store.delete_objects(&[ChunkId::new("../escape")]).is_err());
+}
+
+/// R05：分页列举覆盖整个前缀、不重不漏；不是我们 chunk 的 key 不进 inventory。
+#[test]
+fn listing_pages_through_chunks_and_skips_foreign_keys() {
+    let backend = Arc::new(object_store::memory::InMemory::new());
+    let store = S3ChunkStore::with_backend(options(), backend.clone()).unwrap();
+    let mut expected = std::collections::BTreeSet::new();
+    for index in 0..5_u8 {
+        let staged = StagedChunk::new_generational(OperationId::new("write"), vec![index; 8]);
+        expected.insert(staged.chunk.id.clone());
+        store.put(staged).unwrap();
+    }
+    let prefix = external_chunk_prefix("filesystem-a", "generation-1").unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        for key in [
+            format!("{prefix}aa/not-a-chunk"),
+            "afs/v2/other/place".to_owned(),
+        ] {
+            backend
+                .put(&ObjectPath::from(key.as_str()), vec![0].into())
+                .await
+                .unwrap();
+        }
+    });
+    let mut found = std::collections::BTreeSet::new();
+    let mut after = None;
+    let mut pages = 0;
+    loop {
+        let (chunks, next) = store.list_objects(after, 2).unwrap();
+        if next.is_none() {
+            break;
+        }
+        for chunk in chunks {
+            assert!(found.insert(chunk.id), "a chunk was listed twice");
+        }
+        after = next;
+        pages += 1;
+        assert!(pages < 10, "the listing never ended");
+    }
+    assert_eq!(found, expected);
+    assert!(pages >= 3);
 }

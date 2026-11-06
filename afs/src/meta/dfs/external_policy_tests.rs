@@ -51,7 +51,7 @@ async fn pending_commit(service: &DfsService) -> CommitFileVersion {
         .await
         .unwrap();
     let operation_id = OperationId::new("publish-file");
-    let staged = StagedChunk::new(operation_id.clone(), b"data".to_vec());
+    let staged = StagedChunk::new_generational(operation_id.clone(), b"data".to_vec());
     let receipt = ChunkReceipt {
         operation_id: operation_id.clone(),
         chunk: staged.chunk.clone(),
@@ -580,7 +580,7 @@ async fn external_receipt_rejects_wrong_store_key_length_digest_without_publicat
     );
     service.initialize_replication_config().await.unwrap();
     let commit = pending_commit(&service).await;
-    for case in 0..10 {
+    for case in 0..12 {
         let mut invalid_commit = commit.clone();
         let receipt = invalid_commit.chunk_receipts[0]
             .external_commit
@@ -609,6 +609,29 @@ async fn external_receipt_rejects_wrong_store_key_length_digest_without_publicat
             8 => {
                 invalid_commit.chunk_receipts[0].chunk.id =
                     crate::dfs::ChunkId::new("unbound-chunk")
+            }
+            // R05: an object must belong to this write generation. Plain content
+            // addressing could name an object some other write owns.
+            10 | 11 => {
+                let chunk = &invalid_commit.chunk_receipts[0].chunk;
+                let root = blake3::Hash::from(chunk.content_digest.bytes);
+                let id = if case == 10 {
+                    crate::dfs::ChunkId::new(format!("blake3-{}-{}", root.to_hex(), chunk.length))
+                } else {
+                    ChunkObject::generational_blake3_id(
+                        &OperationId::new("another-write"),
+                        &root,
+                        chunk.length,
+                    )
+                };
+                let key =
+                    crate::dfs::external_object_key("seaweed-test", "generation-1", &id).unwrap();
+                invalid_commit.chunk_receipts[0].chunk.id = id;
+                invalid_commit.chunk_receipts[0]
+                    .external_commit
+                    .as_mut()
+                    .unwrap()
+                    .object_key = key;
             }
             _ => invalid_commit.chunk_receipts[0]
                 .durable_acks

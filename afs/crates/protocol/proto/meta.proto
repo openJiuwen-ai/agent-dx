@@ -1282,4 +1282,7 @@ message CollectDfsGarbageReply {
   uint64 generation = 1;
   repeated string chunk_ids = 2;
   bool pending_for_node = 3;
+  // External storage: this Node should report a page of the object store as
+  // inventory on its next call. Only one Node at a time.
+  bool list_external_inventory = 4;
 }

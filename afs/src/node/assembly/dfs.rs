@@ -328,9 +328,7 @@ impl DfsAssembly {
         } else {
             read_engine
         };
-        let gc_references = external_store
-            .is_none()
-            .then(|| gc::GcReferences::new(meta.clone()));
+        let gc_references = Some(gc::GcReferences::new(meta.clone()));
         let read_engine = read_engine.with_read_pipeline(cfg.dfs_read_pipeline)?;
         let read_engine = Arc::new(match external_store {
             Some(store) => read_engine.with_external_backend(store, meta.clone()),
@@ -338,12 +336,21 @@ impl DfsAssembly {
         });
         self.fetcher = read_engine.object_fetcher();
         self.gc_collector = gc_references.as_ref().map(|references| {
-            Arc::new(gc::Collector::new(
-                references.clone(),
-                chunks,
-                read_engine.clone(),
-                cfg.id.clone(),
-            ))
+            Arc::new(match &self.external_store {
+                Some(store) => gc::Collector::new_external(
+                    references.clone(),
+                    store.clone(),
+                    read_engine.clone(),
+                    cfg.id.clone(),
+                    cfg.dfs_external_gc_list_pages_per_pass,
+                ),
+                None => gc::Collector::new(
+                    references.clone(),
+                    chunks,
+                    read_engine.clone(),
+                    cfg.id.clone(),
+                ),
+            })
         });
         let remote_factory = Arc::new(rpc::peer::GrpcDfsOwnerFactory::new(
             peer_connections.clone(),

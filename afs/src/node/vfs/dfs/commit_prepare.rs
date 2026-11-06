@@ -656,7 +656,7 @@ impl CommitPlanner {
                     staged_chunks.push(if crc32c_writes {
                         StagedChunk::from_shared_crc32c(operation_id.clone(), body)?
                     } else {
-                        StagedChunk::from_shared(operation_id.clone(), body)
+                        StagedChunk::from_shared_generational(operation_id.clone(), body)
                     });
                     staged_by_source.insert(key, index);
                     index

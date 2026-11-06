@@ -272,6 +272,7 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `dfs_upload_inflight_chunks` | 调优 | Node | `8` | 上传并发，1..=8；S3 模式下实际被压到 4 |
 | `dfs_background_commit_ms` | 调优 | Node | `5000` | 后台提交调度周期，1..=60000；不是发布期限 |
 | `dfs_sidecar_install_queue` | 调优 | Node | `64` | 可选 sidecar 安装的排队与执行数，1..=64 |
+| `dfs_external_gc_list_pages_per_pass` | 调优 | Node | `1` | S3 回收每轮（5 秒）列举的桶页数（每页 1000 个对象），1..=100；只有 Meta 指定的一个 Node 列举 |
 | `dfs_write_buffer_idle_bytes` | 调优 | Node | `134217728` | 写 buffer 池的空闲保留容量，不是活跃正文额度。仅 TOML |
 | `dfs_fetch_max_inflight_objects` | 调优 | Node | `8` | 缓存填充 flight 记录数，1..=8；只在配置了 `dfs_peer_cache` 时生效 |
 | `dfs_readahead_max_bytes` | 调优 | Node | `0` | 对象预读距离，0..=32 MiB；0 表示关闭 |
@@ -379,7 +380,7 @@ Node 写流水线采用分配前预算：普通数据128MiB，发布保留32MiB�
 PUT 直接持有已封口的不可变载荷及其预算租约，不再复制整块 HTTP body；
 发布构块使用独立串行保护，仍存活的 transport／retry owner 释放前不得退还额度。
 这项预算与缓存容量、缓存 pending、读取缓冲及进程其它开销分开核算，不能作为
-总 RSS 上限。失败或超时可能留下未引用的不可变对象，不能直接删除可能被引用的对象。
+总 RSS 上限。失败或超时可能留下未引用的不可变对象，由 S3 回收的列举发现并回收；不要手工删除桶内对象。S3 对象 key 前缀为 `afs/v2/`，旧桶需重建。
 
 外部模式的当前恢复范围是读取已经发布的版本；写节点重启后重新取得写权
 另行验收。旧写租约有效时，新会话立即复写原文件可能返回 EBUSY，不能将
@@ -783,7 +784,7 @@ Meta 注册回复提供实际已持久化租约的相对剩余期限 `lease_rema
 需配套升级 Meta 与 Node。旧 Meta 未返回相对期限时，新 Node 明确拒绝注册授权，
 不回退到跨机墙钟或任意30秒授权。Meta persistence readiness 的判定保持独立。
 
-注册请求携带集群线协议代际 `protocol_version`（当前为 2，涵盖 Node↔Meta 注册与 Node↔Node service
+注册请求携带集群线协议代际 `protocol_version`（当前为 3，涵盖 Node↔Meta 注册与 Node↔Node service
 布局）。Meta 在登记会话前校验，
 不符或缺省（0，旧 Node）返回 `META_NODE_PROTOCOL_VERSION`（`0x03050001`，FailedPrecondition），
 不写入任何状态；该错误不属于首次注册的可重试类别，Node 直接启动失败。DFS 与 OwnerFs Node

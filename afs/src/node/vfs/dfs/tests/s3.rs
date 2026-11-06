@@ -77,10 +77,11 @@ fn s1a5_s3_write_reads_own_data_without_commit_and_fsync_publishes_external_rece
     fs.release(&context(), reader).unwrap();
 }
 
-/// S1a-5 decision D1 (accepted, R05 reclaims): a full chunk uploaded before
-/// an overwrite is no longer referenced by the committed version.
+/// A full chunk uploaded before an overwrite is not referenced by the committed
+/// version. GC reclaims it (R05): `external_chunk::gc_e2e` proves the store ends
+/// with only the head's objects; this fixture has no GC, so it shows the input.
 #[test]
-fn s1a5_s3_overwrite_after_upload_leaves_an_unreferenced_object_today() {
+fn s3_overwrite_after_upload_leaves_an_unreferenced_object_for_gc() {
     let (_temp, meta, fs, store) = test_fs_on_fake_s3();
     let created = fs
         .create(
@@ -110,7 +111,7 @@ fn s1a5_s3_overwrite_after_upload_leaves_an_unreferenced_object_today() {
         .keys()
         .filter(|id| !referenced.contains(*id))
         .count();
-    assert_eq!(orphans, 1, "the fully overwritten upload is orphaned");
+    assert_eq!(orphans, 1, "the fully overwritten upload is GC input");
     assert_eq!(objects.len(), referenced.len() + orphans);
     drop(objects);
     drop(commits);

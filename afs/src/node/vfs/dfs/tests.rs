@@ -889,7 +889,7 @@ fn publish_external_version_with_bytes(
 ) -> FileVersionId {
     let receipt = fs
         .chunk_store
-        .put(StagedChunk::new(
+        .put(StagedChunk::new_generational(
             OperationId::new(operation_id),
             bytes.to_vec(),
         ))

@@ -1005,3 +1005,97 @@ async fn gc_stall_metrics_track_the_waiting_generation() {
     assert_eq!(service.gc_metrics().waiting_nodes.get(), 0);
     assert_eq!(service.gc_metrics().generation_age_seconds.get(), 0);
 }
+
+fn external_gc_service(store: Arc<crate::meta::store::Store>) -> DfsService {
+    DfsService::with_durability_policy(
+        store,
+        ReplicationConfig::local_single_copy(),
+        crate::dfs::DfsDurabilityPolicy::ExternalBackend {
+            store_id: "s".into(),
+            generation: "g".into(),
+        },
+    )
+    .with_gc_grace_ms(0)
+}
+
+fn generational_chunk(operation: &str, body: &[u8]) -> ChunkObject {
+    crate::node::chunk::StagedChunk::new_generational(OperationId::new(operation), body.to_vec())
+        .chunk
+}
+
+/// R05：S3 一份对象只删一次：一代只等一个执行者（存活存储节点中 node_id 最小的），它同时负责列举。
+#[tokio::test]
+async fn external_collection_waits_for_one_deleter_that_also_lists() {
+    let orphan = generational_chunk("crashed", b"orphan");
+    let (store, _) = seeded_store(vec![]).await;
+    register(
+        &store,
+        "a",
+        "a1",
+        std::time::Duration::from_secs(30),
+        vec![storage_device("a")],
+    )
+    .await;
+    let service = external_gc_service(store.clone());
+    assert!(service.lists_external_inventory("a").await.unwrap());
+    assert!(!service.lists_external_inventory("n").await.unwrap());
+    let ticket = service
+        .collect_garbage("a".into(), "a1".into(), 0, vec![orphan.clone()])
+        .await
+        .unwrap();
+    assert_eq!(ticket.chunks, vec![orphan.id]);
+    assert_eq!(ticket.waiting_nodes, vec!["a".to_owned()]);
+}
+
+/// R05：等待期间上报的列举页也登记，下一代回收；不因为碰上一代未结束而丢页。
+#[tokio::test]
+async fn external_inventory_reported_while_waiting_is_collected_next() {
+    let first = generational_chunk("crashed-1", b"one");
+    let second = generational_chunk("crashed-2", b"two");
+    let (store, _) = seeded_store(vec![]).await;
+    let service = external_gc_service(store.clone());
+    let ticket = service
+        .collect_garbage("n".into(), "s".into(), 0, vec![first])
+        .await
+        .unwrap();
+    service
+        .collect_garbage("n".into(), "s".into(), 0, vec![second.clone()])
+        .await
+        .unwrap();
+    service
+        .collect_garbage("n".into(), "s".into(), ticket.generation, vec![])
+        .await
+        .unwrap();
+    let next = service
+        .collect_garbage("n".into(), "s".into(), ticket.generation, vec![])
+        .await
+        .unwrap();
+    assert_eq!(next.chunks, vec![second.id]);
+}
+
+/// R05：活着的写代引用保护它上传而未提交的对象，即使 Meta 从未登记过它（列举得来）。
+#[tokio::test]
+async fn a_live_write_generation_protects_its_listed_objects() {
+    let operation = "upload-in-flight";
+    let uploaded = generational_chunk(operation, b"pending");
+    let (store, _) = seeded_store(vec![MetaEntity::DfsReference(GcReference {
+        open_read: None,
+        node_id: "n".into(),
+        session_id: "s".into(),
+        reference_id: format!(
+            "write:{}",
+            ChunkObject::generation_id(&OperationId::new(operation))
+        ),
+        inode_id: Some(InodeId::new("i")),
+        publication: true,
+        chunks: vec![],
+        retired_at_unix_ms: None,
+    })])
+    .await;
+    let service = external_gc_service(store.clone());
+    let ticket = service
+        .collect_garbage("n".into(), "s".into(), 0, vec![uploaded])
+        .await
+        .unwrap();
+    assert!(ticket.chunks.is_empty(), "{ticket:?}");
+}

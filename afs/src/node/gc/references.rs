@@ -24,6 +24,19 @@ pub trait GcControl: Send + Sync {
     }
     fn release(&self, id: &str) -> Result<()>;
     fn collect(&self, completed: u64, inventory: Vec<ChunkObject>) -> Result<GcState>;
+    /// `collect` plus the assignment to list the external object store.
+    fn collect_batch(&self, completed: u64, inventory: Vec<ChunkObject>) -> Result<GcBatch> {
+        Ok(GcBatch {
+            state: self.collect(completed, inventory)?,
+            list_external_inventory: false,
+        })
+    }
+}
+
+/// One collection reply.
+pub struct GcBatch {
+    pub state: GcState,
+    pub list_external_inventory: bool,
 }
 pub struct GcReferences {
     pub control: Arc<dyn GcControl>,

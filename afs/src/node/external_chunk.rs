@@ -34,9 +34,9 @@ use serde::Deserialize;
 use crate::{
     config::MAX_DFS_EXTERNAL_CACHE_CAPACITY_BYTES,
     dfs::{
-        ChunkEncoding, ChunkId, ChunkObject, ChunkReceipt, ContentDigest, CopyLocation, CopyRole,
-        CopyState, DigestAlgorithm, ExternalCommitReceipt, OperationId, ReplicaGroupId,
-        SourceCandidate, external_object_key,
+        ChunkId, ChunkObject, ChunkReceipt, CopyLocation, CopyRole, CopyState,
+        ExternalCommitReceipt, OperationId, ReplicaGroupId, SourceCandidate, external_chunk_prefix,
+        external_object_key,
     },
     node::{
         chunk::{ChunkSink, MAX_STAGED_CHUNK_BYTES, PutIntent, StagedChunk, StoredChunk},
@@ -114,11 +114,15 @@ struct Credentials {
 enum Request {
     Put(Vec<StagedChunk>),
     Read(ChunkObject),
+    Delete(Vec<ChunkId>),
+    List { after: Option<String>, limit: usize },
 }
 
 enum Reply {
     Put(Vec<ChunkReceipt>),
     Read(VerifiedExternalChunk),
+    Deleted,
+    Listed(Vec<String>),
 }
 
 struct Command {
@@ -138,11 +142,13 @@ fn request_summary(request: &Request) -> (&'static str, usize, u64) {
                 .fold(0_u64, |sum, value| sum.saturating_add(value.chunk.length)),
         ),
         Request::Read(chunk) => ("read", 1, chunk.length),
+        Request::Delete(chunks) => ("delete", chunks.len(), 0),
+        Request::List { limit, .. } => ("list", *limit, 0),
     }
 }
 
 fn validate_options(options: &S3ChunkStoreOptions) -> Result<()> {
-    let probe = StagedChunk::new(OperationId::new("identity-probe"), Vec::new());
+    let probe = StagedChunk::new_generational(OperationId::new("identity-probe"), Vec::new());
     external_object_key(&options.store_id, &options.generation, &probe.chunk.id)?;
     if options.bucket.is_empty()
         || options.region.is_empty()
@@ -220,41 +226,14 @@ fn load_credentials(source: &S3CredentialsSource) -> Result<Credentials> {
     Ok(credentials)
 }
 
+/// S3 objects are generational BLAKE3 chunks (`blake3-v2-…`, R05) of at
+/// most one staged chunk.
 fn chunk_from_id(id: &ChunkId) -> Result<ChunkObject> {
-    let remainder =
-        id.0.strip_prefix("blake3-")
-            .ok_or_else(|| invalid("noncanonical immutable Chunk ID"))?;
-    let (hex, length) = remainder
-        .split_once('-')
-        .ok_or_else(|| invalid("noncanonical immutable Chunk ID"))?;
-    let length = length
-        .parse::<u64>()
-        .map_err(|_| invalid("invalid immutable Chunk length"))?;
-    if hex.len() != 64
-        || length > MAX_STAGED_CHUNK_BYTES as u64
-        || !hex
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        || id.0 != format!("blake3-{hex}-{length}")
-    {
-        return Err(invalid(
-            "noncanonical immutable Chunk ID or oversized Chunk",
-        ));
-    }
-    let mut bytes = [0; 32];
-    for (index, byte) in bytes.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)
-            .map_err(|_| invalid("invalid immutable Chunk digest"))?;
-    }
-    Ok(ChunkObject {
-        id: id.clone(),
-        length,
-        encoding: ChunkEncoding::Raw,
-        content_digest: ContentDigest {
-            algorithm: DigestAlgorithm::Blake3,
-            bytes,
-        },
-    })
+    ChunkObject::from_content_addressed_id(id)
+        .filter(|chunk| {
+            chunk.is_generational_blake3() && chunk.length <= MAX_STAGED_CHUNK_BYTES as u64
+        })
+        .ok_or_else(|| invalid("noncanonical immutable Chunk ID or oversized Chunk"))
 }
 
 fn validate_chunk(chunk: &ChunkObject) -> Result<()> {
@@ -438,5 +417,7 @@ fn validate_private_file(file: &File, expected_len: u64) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod gc_e2e;
 #[cfg(test)]
 mod tests;

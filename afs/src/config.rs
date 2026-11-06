@@ -323,6 +323,9 @@ pub struct Cli {
     /// Queued plus active optional sidecar installs (1..=64).
     #[arg(long)]
     pub dfs_sidecar_install_queue: Option<usize>,
+    /// S3 bucket pages listed per GC pass to find unregistered objects (1..=100).
+    #[arg(long)]
+    pub dfs_external_gc_list_pages_per_pass: Option<usize>,
     /// Concurrent native cache fill-flight records (1..=8), not active body transfers.
     #[arg(long)]
     pub dfs_fetch_max_inflight_objects: Option<usize>,
@@ -442,6 +445,7 @@ struct FileConfig {
     dfs_upload_inflight_chunks: Option<usize>,
     dfs_background_commit_ms: Option<u64>,
     dfs_sidecar_install_queue: Option<usize>,
+    dfs_external_gc_list_pages_per_pass: Option<usize>,
     dfs_fetch_max_inflight_objects: Option<usize>,
     dfs_readahead_max_bytes: Option<u64>,
     dfs_peer_serve_resident_objects: Option<usize>,
@@ -552,6 +556,7 @@ pub struct Config {
     pub dfs_upload_inflight_chunks: usize,
     pub dfs_background_commit_ms: u64,
     pub dfs_sidecar_install_queue: usize,
+    pub dfs_external_gc_list_pages_per_pass: usize,
     pub dfs_fetch_max_inflight_objects: usize,
     pub dfs_readahead_max_bytes: u64,
     pub dfs_peer_serve_resident_objects: usize,
@@ -722,6 +727,7 @@ impl Config {
             dfs_upload_inflight_chunks: tuning.dfs_upload_inflight_chunks,
             dfs_background_commit_ms: tuning.dfs_background_commit_ms,
             dfs_sidecar_install_queue: tuning.dfs_sidecar_install_queue,
+            dfs_external_gc_list_pages_per_pass: tuning.dfs_external_gc_list_pages_per_pass,
             dfs_fetch_max_inflight_objects: tuning.dfs_fetch_max_inflight_objects,
             dfs_readahead_max_bytes: tuning.dfs_readahead_max_bytes,
             dfs_peer_serve_resident_objects: tuning.dfs_peer_serve_resident_objects,

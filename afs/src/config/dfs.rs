@@ -179,6 +179,7 @@ pub(super) struct DfsTuning {
     pub(super) dfs_upload_inflight_chunks: usize,
     pub(super) dfs_background_commit_ms: u64,
     pub(super) dfs_sidecar_install_queue: usize,
+    pub(super) dfs_external_gc_list_pages_per_pass: usize,
     pub(super) dfs_fetch_max_inflight_objects: usize,
     pub(super) dfs_readahead_max_bytes: u64,
     pub(super) dfs_peer_serve_resident_objects: usize,
@@ -256,6 +257,15 @@ pub(super) fn resolve_tuning(cli: &Cli, file: &FileConfig) -> Result<DfsTuning> 
     if !(1..=64).contains(&dfs_sidecar_install_queue) {
         return Err(invalid("DFS sidecar install queue must be 1..=64"));
     }
+    let dfs_external_gc_list_pages_per_pass = cli
+        .dfs_external_gc_list_pages_per_pass
+        .or(file.dfs_external_gc_list_pages_per_pass)
+        .unwrap_or(1);
+    if !(1..=100).contains(&dfs_external_gc_list_pages_per_pass) {
+        return Err(invalid(
+            "DFS external GC list pages per pass must be 1..=100",
+        ));
+    }
     let dfs_fetch_max_inflight_objects = cli
         .dfs_fetch_max_inflight_objects
         .or(file.dfs_fetch_max_inflight_objects)
@@ -301,6 +311,7 @@ pub(super) fn resolve_tuning(cli: &Cli, file: &FileConfig) -> Result<DfsTuning> 
         dfs_upload_inflight_chunks,
         dfs_background_commit_ms,
         dfs_sidecar_install_queue,
+        dfs_external_gc_list_pages_per_pass,
         dfs_fetch_max_inflight_objects,
         dfs_readahead_max_bytes,
         dfs_peer_serve_resident_objects,

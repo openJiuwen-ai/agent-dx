@@ -143,7 +143,7 @@ RDMA 握手）。读写两端都用这些常量，不再散落 magic／版本字
   `catalog.wal` 与请求摘要只由 golden 钉住。
 - **未上线不做兼容**：旧格式直接拒绝，不提供迁移或旧版本识别分支。
 - **协议**：`RegisterNodeRequest.protocol_version` 是集群线协议代际（Node↔Meta 注册、Node↔Node service
-  布局），当前为 2，定义在 `afs_protocol::CLUSTER_PROTOCOL_VERSION`；由 Node 填当前版本，Meta 在读写任何状态前校验，
+  布局），当前为 3，定义在 `afs_protocol::CLUSTER_PROTOCOL_VERSION`；由 Node 填当前版本，Meta 在读写任何状态前校验，
   不符（含缺省 0）返回 `META_NODE_PROTOCOL_VERSION`（`0x03050001`，FailedPrecondition）且不登记会话，
   Node 初始注册不重试该错误。DFS 与 OwnerFs Node 走同一注册路径。Node↔Node 通道本身不握手，
   依赖经 Meta 准入的同版本部署，service 布局变化必须升代际；RDMA 握手版本沿用 `NODE_RDMA_HANDSHAKE_VERSION`。
@@ -686,6 +686,9 @@ bind 与远端访问共享底层文件，新打开的可见性及权限仍需按
 绑定 store/generation/key、完整长度和摘要的有类型凭据。Meta 在原版本提交
 事务中发布外部对象引用和 inode head；旧 Node 复制凭据与外部凭据不能混用。
 
+外部回执的 chunk id 必须绑定本次写代（Meta 校验 `blake3-v2-<写代>-<根>-<长度>` 与回执
+`operation_id`），提交走写代 fence，GC 进行中不与提交冲突。对象回收见「DFS 历史与数据块回收」。
+
 S3 默认保留载荷签名；显式 `dfs_external_backend.unsigned_payload=true` 只将 SDK
 载荷签名策略改为 unsigned，SigV4 请求认证仍在。AFS 业务完整 BLAKE3、对象长度、
 回执身份、错误传播和发布持久屏障不变；该选项不是关闭内容校验，也不自动适配
@@ -874,6 +877,15 @@ Coordinator 挂载同一 namespace，统一管理共享文件的回收；节点�
 运行时文件依赖与挂载的实际验证边界见[存储流程](../testing/snapshot-storage.md)。
 
 ## DFS 历史与数据块回收
+
+S3（外部后端）与原生共用同一套规划（`plan_collection`、写代保护、每代 1024 个上限），只是执行者不同：
+对象只有一份，所以一代只等一个存活存储节点（node_id 最小者）删除，全部成功才确认，失败下一轮重试，已不
+存在的对象算成功；Meta 不接触对象存储。S3 对象按写代命名（`blake3-v2-<写代>-<根>-<长度>`，key 前缀
+`afs/v2/`）：相同内容的两次写入是两个对象，删除一个不会抹掉另一个，代价是不再跨写入去重（COW 克隆仍共享）。
+Meta 从未登记的对象（覆盖掉的满块、上传中途失败、崩溃）由同一节点列举发现：每轮
+`dfs_external_gc_list_pages_per_pass` 页（默认 1 页、每 5 秒），作为 inventory 上报后走同一规划，
+写代引用还在就受保护、退休后回收，不比较时钟。执行者失联时这一代随 R55 规则结束，留下的对象由列举回收。
+S3 下打开与写入同样建立引用。
 
 NodeReplicated DFS 的回收由 Meta 判定可达性、AFS Node 删除本机块。Platform Coordinator
 仍负责匿名 checkpoint／Snapshot 的共享目录生命周期；AFS 的回收只处理目录删除后失去引用的

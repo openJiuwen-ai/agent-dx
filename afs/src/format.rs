@@ -68,7 +68,8 @@ pub enum FormatKind {
     NodePeerCacheEntry,
     /// N8: Peer cache directory marker `.afs-peer-cache-v1`.
     NodePeerCacheMarker,
-    /// N9: external object key prefix `afs/v1/`. Generated, never parsed.
+    /// N9: external object key prefix `afs/v2/` (v2: keys name generational
+    /// `blake3-v2-…` chunk ids, R05). Generated; GC parses listed keys back.
     NodeExternalObjectKey,
     /// N11: OwnerFs local root record `.ownerfs-roots/` (`version`).
     OwnerFsRootRecord,
@@ -131,7 +132,7 @@ pub mod version {
     pub const NODE_CHUNK_SIDECAR: u16 = 1;
     pub const NODE_PEER_CACHE_ENTRY: u32 = 2;
     pub const NODE_PEER_CACHE_MARKER: u32 = 1;
-    pub const NODE_EXTERNAL_OBJECT_KEY: u32 = 1;
+    pub const NODE_EXTERNAL_OBJECT_KEY: u32 = 2;
     pub const OWNERFS_ROOT_RECORD: u32 = 1;
     pub const NODE_META_PROTOCOL: u32 = afs_protocol::CLUSTER_PROTOCOL_VERSION;
     pub const RDMA_HANDSHAKE: u32 = 1;

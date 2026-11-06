@@ -402,16 +402,36 @@ pub struct ChunkObject {
 }
 
 impl ChunkObject {
-    /// Birth generation of an independently named CRC object. Repairs retain it.
+    /// Birth generation of an independently named object: a CRC object
+    /// (`crc32c-v2-<generation>-<object>`) or a generational BLAKE3 object
+    /// (`blake3-v2-<generation>-<root>-<length>`, S3). Repairs retain it.
     pub fn write_generation(&self) -> Option<&str> {
-        let value = self.id.0.strip_prefix("crc32c-v2-")?;
-        let (generation, object) = value.split_once('-')?;
-        let hex = |s: &str| {
-            s.len() == 32
-                && s.bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        };
-        (hex(generation) && hex(object)).then_some(generation)
+        if let Some(value) = self.id.0.strip_prefix("crc32c-v2-") {
+            let (generation, object) = value.split_once('-')?;
+            return (is_lower_hex(generation, 32) && is_lower_hex(object, 32))
+                .then_some(generation);
+        }
+        content_addressed_parts(&self.id).and_then(|parts| parts.generation)
+    }
+
+    /// The generational BLAKE3 identity of `body`'s standard root, born in the
+    /// write generation of `operation` (R05: one write's object is never
+    /// another write's, so deleting it cannot take out a re-upload).
+    pub fn generational_blake3_id(
+        operation: &OperationId,
+        root: &blake3::Hash,
+        length: u64,
+    ) -> ChunkId {
+        ChunkId::new(format!(
+            "blake3-v2-{}-{}-{length}",
+            Self::generation_id(operation),
+            root.to_hex()
+        ))
+    }
+
+    /// A generational BLAKE3 object (`blake3-v2-…`).
+    pub fn is_generational_blake3(&self) -> bool {
+        self.id.0.starts_with("blake3-v2-") && self.write_generation().is_some()
     }
 
     pub fn generation_id(operation: &OperationId) -> String {
@@ -435,7 +455,11 @@ impl ChunkObject {
     /// Other historical IDs have no content-addressed authority; callers must
     /// retain their complete verification fallback rather than infer a root.
     pub fn from_content_addressed_id(chunk_id: &ChunkId) -> Option<Self> {
-        let (hex, length) = content_addressed_parts(chunk_id)?;
+        let ContentAddressedParts {
+            digest: hex,
+            length,
+            ..
+        } = content_addressed_parts(chunk_id)?;
         let mut bytes = [0; 32];
         for (index, byte) in bytes.iter_mut().enumerate() {
             *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).ok()?;
@@ -452,19 +476,42 @@ impl ChunkObject {
     }
 }
 
-fn content_addressed_parts(chunk_id: &ChunkId) -> Option<(&str, u64)> {
-    let content = chunk_id.0.strip_prefix("blake3-")?;
-    let (digest, length) = content.split_once('-')?;
-    let parsed_length = length.parse::<u64>().ok()?;
-    if digest.len() != 64
-        || !digest
+fn is_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        || parsed_length.to_string() != length
-    {
+}
+
+struct ContentAddressedParts<'a> {
+    generation: Option<&'a str>,
+    digest: &'a str,
+    length: u64,
+}
+
+/// `blake3-<root>-<length>` or `blake3-v2-<generation>-<root>-<length>`.
+fn content_addressed_parts(chunk_id: &ChunkId) -> Option<ContentAddressedParts<'_>> {
+    let content = chunk_id.0.strip_prefix("blake3-")?;
+    let (generation, content) = match content.strip_prefix("v2-") {
+        Some(rest) => {
+            let (generation, content) = rest.split_once('-')?;
+            if !is_lower_hex(generation, 32) {
+                return None;
+            }
+            (Some(generation), content)
+        }
+        None => (None, content),
+    };
+    let (digest, length) = content.split_once('-')?;
+    let parsed_length = length.parse::<u64>().ok()?;
+    if !is_lower_hex(digest, 64) || parsed_length.to_string() != length {
         return None;
     }
-    Some((digest, parsed_length))
+    Some(ContentAddressedParts {
+        generation,
+        digest,
+        length: parsed_length,
+    })
 }
 
 /// Immutable durability contract; external storage never counts as a Node replica.
@@ -522,12 +569,23 @@ pub fn external_object_key(
             "invalid external chunk identity",
         )
     };
-    let (digest, _) = content_addressed_parts(chunk_id).ok_or_else(invalid)?;
+    let digest = content_addressed_parts(chunk_id)
+        .ok_or_else(invalid)?
+        .digest;
     Ok(format!(
         "afs/v{}/{store_id}/{generation}/chunks/{}/{}",
         crate::format::version::NODE_EXTERNAL_OBJECT_KEY,
         &digest[..2],
         chunk_id.0
+    ))
+}
+
+/// Key prefix of every chunk object of one store generation.
+pub fn external_chunk_prefix(store_id: &str, generation: &str) -> afs_error::Result<String> {
+    validate_external_store_identity(store_id, generation)?;
+    Ok(format!(
+        "afs/v{}/{store_id}/{generation}/chunks/",
+        crate::format::version::NODE_EXTERNAL_OBJECT_KEY
     ))
 }
 
@@ -1233,7 +1291,7 @@ mod external_identity_tests {
         let chunk = ChunkId::new(format!("blake3-{}-42", "a".repeat(64)));
         assert_eq!(
             external_object_key("filesystem", "generation-1", &chunk).unwrap(),
-            format!("afs/v1/filesystem/generation-1/chunks/aa/{}", chunk.0)
+            format!("afs/v2/filesystem/generation-1/chunks/aa/{}", chunk.0)
         );
         for segment in ["", "..", "a/b", "a b", "a%2fb"] {
             assert!(external_object_key(segment, "generation", &chunk).is_err());

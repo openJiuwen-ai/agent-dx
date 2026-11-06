@@ -309,11 +309,6 @@ impl DfsService {
         require_id(&update.node_id, "node_id")?;
         require_id(&update.session_id, "session_id")?;
         require_id(&update.reference_id, "reference_id")?;
-        if self.is_external_backend() {
-            return Err(invalid(
-                "native GC references require NodeReplicated storage",
-            ));
-        }
         // On the wire the original timestamped operation fixes admission age.
         // Persist the hash key that immutable chunk identities can address.
         let write_operation = update
@@ -523,6 +518,17 @@ impl DfsService {
         Ok(gc)
     }
 
+    /// Whether `node` should list the external object store and report a page
+    /// as inventory: one node at a time, the same one that deletes (R05).
+    pub async fn lists_external_inventory(&self, node: &str) -> Result<bool> {
+        if !self.is_external_backend() {
+            return Ok(false);
+        }
+        let sessions = self.store.read(MetaRead::CurrentNodeSessions).await?;
+        let participants = gc_participants(&sessions.entities, now_unix_ms());
+        Ok(participants.first().map(String::as_str) == Some(node))
+    }
+
     async fn collect_garbage_attempts(
         &self,
         node: String,
@@ -530,9 +536,6 @@ impl DfsService {
         completed: u64,
         inventory: Vec<ChunkObject>,
     ) -> Result<GcState> {
-        if self.is_external_backend() {
-            return Err(invalid("native collection requires NodeReplicated storage"));
-        }
         if inventory.len() > MAX_CHUNKS {
             return Err(invalid("GC inventory batch too large"));
         }
@@ -551,6 +554,11 @@ impl DfsService {
                 ));
             }
             if !gc.waiting_nodes.is_empty() {
+                // A listed page is a cursor position that will not repeat soon;
+                // native inventory simply comes back next pass.
+                if self.is_external_backend() {
+                    register_inventory(&inventory, &mut entities, &mut mutations)?;
+                }
                 let waiting = gc.waiting_nodes.len();
                 gc.waiting_nodes
                     .retain(|value| participants.contains(value));
@@ -575,20 +583,7 @@ impl DfsService {
                 self.gc_metrics.retired_references.inc_by(retired);
                 return Ok(gc);
             }
-            for chunk in &inventory {
-                if !chunk.valid_immutable_identity() {
-                    return Err(invalid(
-                        "GC inventory requires canonical content identities",
-                    ));
-                }
-                if !entities.iter().any(
-                    |entity| matches!(entity,MetaEntity::DfsChunk(value) if value.id==chunk.id),
-                ) {
-                    let value = MetaEntity::DfsChunk(chunk.clone());
-                    mutations.push(TxnMutation::Put(value.clone()));
-                    entities.push(value);
-                }
-            }
+            register_inventory(&inventory, &mut entities, &mut mutations)?;
             let references = entities
                 .iter()
                 .filter_map(|entity| match entity {
@@ -608,6 +603,10 @@ impl DfsService {
             gc.chunks = plan.chunks;
             gc.waiting_nodes = if gc.chunks.is_empty() {
                 Vec::new()
+            } else if self.is_external_backend() {
+                // One copy of each object: one Node deletes. If it is lost the
+                // objects stay in the store and reconciliation finds them.
+                participants.into_iter().take(1).collect()
             } else {
                 participants.into_iter().collect()
             };
@@ -626,6 +625,38 @@ impl DfsService {
         }
         Err(conflict("garbage collection contention"))
     }
+}
+
+/// Registers objects a Node found that Meta does not know, so the one plan
+/// decides them (a live write generation protects them; otherwise collected).
+fn register_inventory(
+    inventory: &[ChunkObject],
+    entities: &mut Vec<MetaEntity>,
+    mutations: &mut Vec<TxnMutation>,
+) -> Result<()> {
+    if inventory.is_empty() {
+        return Ok(());
+    }
+    let known = entities
+        .iter()
+        .filter_map(|entity| match entity {
+            MetaEntity::DfsChunk(value) => Some(value.id.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    for chunk in inventory {
+        if !chunk.valid_immutable_identity() {
+            return Err(invalid(
+                "GC inventory requires canonical content identities",
+            ));
+        }
+        if !known.contains(&chunk.id) {
+            let value = MetaEntity::DfsChunk(chunk.clone());
+            mutations.push(TxnMutation::Put(value.clone()));
+            entities.push(value);
+        }
+    }
+    Ok(())
 }
 
 /// Each node's current session: the highest lease epoch among its sessions.

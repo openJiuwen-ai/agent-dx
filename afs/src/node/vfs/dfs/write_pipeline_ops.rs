@@ -39,11 +39,13 @@ struct WriteApply<'a> {
 
 impl DistributedFs {
     /// Native storage writes segmented-CRC32C objects; S3 stores only
-    /// canonical BLAKE3 objects (decision recorded in S1a-7, F6).
+    /// generational BLAKE3 objects (S1a-7 F6, R05).
     pub(super) fn crc32c_writes(&self) -> bool {
         !self.read_engine.has_external_backend()
     }
-    fn stage_pipeline_chunk(
+
+    /// The one place a write's payload gets its immutable identity.
+    pub(super) fn stage_write_chunk(
         &self,
         op: OperationId,
         bytes: SharedChunkBytes,
@@ -51,7 +53,7 @@ impl DistributedFs {
         if self.crc32c_writes() {
             StagedChunk::from_shared_crc32c(op, bytes)
         } else {
-            Ok(StagedChunk::from_shared(op, bytes))
+            Ok(StagedChunk::from_shared_generational(op, bytes))
         }
     }
 
@@ -626,7 +628,7 @@ impl DistributedFs {
             }
             // The immutable allocation stays the same. Staging performs the
             // standard BLAKE3 scan; no body concatenation or clone is involved.
-            let staged = self.stage_pipeline_chunk(operation_id.clone(), body.clone())?;
+            let staged = self.stage_write_chunk(operation_id.clone(), body.clone())?;
             let upload = Arc::new(PipelineUpload {
                 _gc_pin: state.dirty_extents.native_gc_pin.clone(),
                 operation_id: operation_id.clone(),
@@ -770,7 +772,7 @@ impl DistributedFs {
                 body,
                 upload.chunk.id.clone(),
             )?,
-            None => StagedChunk::from_shared(upload.operation_id.clone(), body),
+            None => self.stage_write_chunk(upload.operation_id.clone(), body)?,
         };
         if staged.chunk != upload.chunk {
             return Err(invalid("native upload changed its immutable object"));

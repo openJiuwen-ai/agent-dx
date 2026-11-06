@@ -195,7 +195,7 @@ impl DfsService {
             let generation = receipt
                 .chunk
                 .write_generation()
-                .ok_or_else(|| invalid("generation receipts require CRC identities"))?;
+                .ok_or_else(|| invalid("generation receipts require generational identities"))?;
             if generation != ChunkObject::generation_id(&receipt.operation_id) {
                 return Err(invalid(
                     "receipt operation differs from its birth generation",
@@ -379,10 +379,12 @@ impl DfsService {
             .as_ref()
             .ok_or_else(|| invalid("external durability requires an external commit receipt"))?;
         let key = crate::dfs::external_object_key(store_id, generation, &receipt.chunk.id)?;
-        let canonical_chunk = format!(
-            "blake3-{}-{}",
-            blake3::Hash::from(receipt.chunk.content_digest.bytes).to_hex(),
-            receipt.chunk.length
+        // One write's object is never another write's (R05): the identity binds
+        // the receipt's write generation, its content root and its length.
+        let canonical_chunk = ChunkObject::generational_blake3_id(
+            &receipt.operation_id,
+            &blake3::Hash::from(receipt.chunk.content_digest.bytes),
+            receipt.chunk.length,
         );
         if !receipt.durable_acks.is_empty()
             || receipt.placement_revision != 0
@@ -393,7 +395,7 @@ impl DfsService {
             || external.object_key != key
             || external.persisted_bytes != receipt.chunk.length
             || external.verified_digest != receipt.chunk.content_digest
-            || receipt.chunk.id.0 != canonical_chunk
+            || receipt.chunk.id != canonical_chunk
             || receipt.chunk.length == 0
         {
             return Err(invalid(

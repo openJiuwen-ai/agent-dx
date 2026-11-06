@@ -62,6 +62,10 @@ impl DfsMetaService for DfsMetaRpc {
         let request = request.into_inner();
         validate_caller(authenticated.as_deref(), &request.node_id)?;
         let node = request.node_id.clone();
+        let list_external_inventory = dfs_service(&self.0)?
+            .lists_external_inventory(&node)
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
         let state = dfs_service(&self.0)?
             .collect_garbage(
                 request.node_id,
@@ -80,6 +84,7 @@ impl DfsMetaService for DfsMetaRpc {
             generation: state.generation,
             pending_for_node: state.waiting_nodes.contains(&node),
             chunk_ids: state.chunks.into_iter().map(|id| id.0).collect(),
+            list_external_inventory,
         }))
     }
 

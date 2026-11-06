@@ -199,8 +199,42 @@ impl S3ChunkStore {
                 }
                 Ok(bytes)
             }
-            Reply::Put(_) => Err(invalid("S3 worker returned the wrong response")),
+            _ => Err(invalid("S3 worker returned the wrong response")),
         }
+    }
+
+    /// Deletes these chunks' objects; missing objects count as deleted.
+    pub fn delete_objects(&self, chunks: &[ChunkId]) -> Result<()> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+        match self.request(Request::Delete(chunks.to_vec()))? {
+            Reply::Deleted => Ok(()),
+            _ => Err(invalid("S3 worker returned the wrong response")),
+        }
+    }
+
+    /// One page of this store's objects after `after`, as (chunk, key). A key
+    /// that does not name a generational chunk is not ours to judge and is
+    /// skipped. An empty page means the listing reached the end.
+    pub fn list_objects(
+        &self,
+        after: Option<String>,
+        limit: usize,
+    ) -> Result<(Vec<ChunkObject>, Option<String>)> {
+        let keys = match self.request(Request::List { after, limit })? {
+            Reply::Listed(keys) => keys,
+            _ => return Err(invalid("S3 worker returned the wrong response")),
+        };
+        let chunks = keys
+            .iter()
+            .filter_map(|key| {
+                let id = ChunkId::new(key.rsplit('/').next()?);
+                ChunkObject::from_content_addressed_id(&id)
+                    .filter(ChunkObject::is_generational_blake3)
+            })
+            .collect();
+        Ok((chunks, keys.into_iter().next_back()))
     }
 
     /// Close the private verifier pool. Any stored verifier failure is reported
@@ -221,6 +255,19 @@ impl Drop for S3ChunkStore {
         if let Err(error) = self.verifier.shutdown() {
             tracing::warn!(message = %error.message(), "S3 verifier shutdown failed");
         }
+    }
+}
+
+impl crate::node::gc::ExternalObjects for S3ChunkStore {
+    fn delete_objects(&self, chunks: &[ChunkId]) -> Result<()> {
+        S3ChunkStore::delete_objects(self, chunks)
+    }
+    fn list_objects(
+        &self,
+        after: Option<String>,
+        limit: usize,
+    ) -> Result<(Vec<ChunkObject>, Option<String>)> {
+        S3ChunkStore::list_objects(self, after, limit)
     }
 }
 
@@ -265,7 +312,7 @@ impl ChunkSink for S3ChunkStore {
         }
         match self.request(Request::Put(staged))? {
             Reply::Put(receipts) => Ok(receipts.into_iter().map(StoredChunk::unreleased).collect()),
-            Reply::Read(_) => Err(invalid("S3 worker returned the wrong response")),
+            _ => Err(invalid("S3 worker returned the wrong response")),
         }
     }
 }
