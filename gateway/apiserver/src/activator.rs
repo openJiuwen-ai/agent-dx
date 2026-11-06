@@ -71,6 +71,17 @@ impl EnvironmentApplication for EnvironmentService {
             .map_err(map_delete_status)?;
         Ok(())
     }
+    async fn pause_request(
+        &self,
+        tenant: &str,
+        id: &str,
+        input: Value,
+        operation_id: &str,
+    ) -> Result<Value, EnvironmentError> {
+        self.execute(Kind::Pause, id, operation_id, input, &caller(tenant))
+            .await
+            .map_err(map_pause_status)
+    }
 }
 fn caller(tenant: &str) -> pb::CallerContext {
     pb::CallerContext {
@@ -101,6 +112,12 @@ fn map_delete_status(status: Status) -> EnvironmentError {
     } else {
         map_status(status, true)
     }
+}
+/// A pause is a write: a missing target is `OutcomeUnknown` (re-query the original ID)
+/// rather than confirmed absence, so the orchestrator converges on the next pass.
+/// Conflict surfaces idle/replay races; `Unsupported` blocks rather than degrading.
+fn map_pause_status(status: Status) -> EnvironmentError {
+    map_status(status, true)
 }
 fn map_status(status: Status, write: bool) -> EnvironmentError {
     match status.code() {
@@ -185,6 +202,29 @@ mod tests {
         ));
         assert!(matches!(
             map_delete_status(Status::unavailable("lost response")),
+            EnvironmentError::OutcomeUnknown(_)
+        ));
+    }
+    #[test]
+    fn pause_failures_keep_write_semantics_without_confirmed_absence() {
+        // A missing pause target is unknown, not confirmed absence, so the orchestrator
+        // re-queries the original ID and converges on the next pass.
+        assert!(matches!(
+            map_pause_status(Status::not_found("missing")),
+            EnvironmentError::OutcomeUnknown(_)
+        ));
+        // Idle/replay races surface as Conflict for convergence, and an incapable
+        // deployment blocks as Unsupported rather than degrading to Running.
+        assert!(matches!(
+            map_pause_status(Status::failed_precondition("idle race")),
+            EnvironmentError::Conflict(_)
+        ));
+        assert!(matches!(
+            map_pause_status(Status::unimplemented("no pause")),
+            EnvironmentError::Unsupported(_)
+        ));
+        assert!(matches!(
+            map_pause_status(Status::unavailable("lost response")),
             EnvironmentError::OutcomeUnknown(_)
         ));
     }

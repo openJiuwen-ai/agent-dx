@@ -1,5 +1,5 @@
 //! Standalone Activator adapter for the existing API Server management API.
-use crate::environment_request::{self, observation, validate_identity};
+use crate::environment_request::{self, observation, paused, validate_identity};
 use adx_agent_core::network::SandboxNetworkPolicy;
 use adx_agent_core::{
     environment::*,
@@ -300,6 +300,97 @@ impl HttpEnvironment {
             Err(uncertain())
         }
     }
+
+    async fn pause(
+        &self,
+        tenant: &str,
+        id: &str,
+        timeout_seconds: u64,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        validate_identity(tenant)?;
+        validate_identity(id)?;
+        let key = self.api_keys.get(tenant).ok_or_else(|| {
+            EnvironmentError::Unavailable("Platform tenant credential is not configured".into())
+        })?;
+        let mut url = self
+            .base
+            .join(ENVIRONMENT_PATH)
+            .map_err(|_| EnvironmentError::Invalid("invalid API Server URL".into()))?;
+        url.path_segments_mut()
+            .map_err(|_| EnvironmentError::Invalid("invalid API Server URL".into()))?
+            .push(id)
+            .push("pause");
+        let request = self
+            .client
+            .post(url)
+            .bearer_auth(key)
+            .timeout(self.timeout + Duration::from_secs(timeout_seconds))
+            .header(
+                "x-adx-request-id",
+                environment_request::pause_operation_id(tenant, id)?,
+            )
+            .json(&environment_request::pause_input(timeout_seconds));
+        let uncertain = || {
+            EnvironmentError::OutcomeUnknown(
+                "Environment pause response unavailable; query the original ID".into(),
+            )
+        };
+        let mut response = request.send().await.map_err(|error| {
+            if error.is_connect() {
+                EnvironmentError::Unavailable("API Server connection failed".into())
+            } else {
+                uncertain()
+            }
+        })?;
+        let status = response.status();
+        if response
+            .content_length()
+            .is_some_and(|n| n > limits::HTTP_JSON_BYTES as u64)
+        {
+            return Err(uncertain());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|_| uncertain())? {
+            if chunk.len() > limits::HTTP_JSON_BYTES.saturating_sub(body.len()) {
+                return Err(uncertain());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        if !status.is_success() {
+            // A pause is a write: a missing target is unknown (re-query the original ID),
+            // not confirmed absence, matching the gateway bridge's write semantics. This
+            // mirrors the create path, where only delete maps NOT_FOUND to confirmed absence.
+            return Err(match status {
+                StatusCode::BAD_REQUEST => {
+                    EnvironmentError::Invalid("API Server rejected request".into())
+                }
+                StatusCode::CONFLICT => {
+                    EnvironmentError::Conflict("Environment pause conflict".into())
+                }
+                StatusCode::UNAUTHORIZED => {
+                    EnvironmentError::Unavailable("API Server credential rejected".into())
+                }
+                StatusCode::FORBIDDEN => {
+                    EnvironmentError::Unavailable("API Server permission denied".into())
+                }
+                StatusCode::NOT_IMPLEMENTED => {
+                    EnvironmentError::Unsupported("Environment capability unavailable".into())
+                }
+                _ => uncertain(),
+            });
+        }
+        let value: Value = serde_json::from_slice(&body).map_err(|_| uncertain())?;
+        if value.get("code").and_then(Value::as_u64) != Some(200) {
+            return Err(uncertain());
+        }
+        let encoded = value
+            .get("data")
+            .and_then(Value::as_str)
+            .ok_or_else(uncertain)?;
+        let decoded = STANDARD.decode(encoded).map_err(|_| uncertain())?;
+        let result: Value = serde_json::from_slice(&decoded).map_err(|_| uncertain())?;
+        paused(tenant, id, &result)
+    }
 }
 #[async_trait]
 impl Environment for HttpEnvironment {
@@ -372,5 +463,13 @@ impl Environment for HttpEnvironment {
         )
         .await?;
         Ok(observation(tenant, id, EnvironmentPhase::Deleted))
+    }
+    async fn pause(
+        &self,
+        tenant: &str,
+        id: &str,
+        timeout_seconds: u64,
+    ) -> Result<EnvironmentObservation, EnvironmentError> {
+        HttpEnvironment::pause(self, tenant, id, timeout_seconds).await
     }
 }
