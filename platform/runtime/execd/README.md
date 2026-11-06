@@ -38,6 +38,12 @@ finishing while a response is formatted cannot produce `SUCCEEDED` without its
 zero exit code. Publication guards are released before output collection, and
 watch responses copy command references before acquiring a per-command guard so
 they do not retain the process-wide registry lock while waiting on publication.
+The inner exit-state locks are copied and released in separate statements; an
+observer never holds the spawn-error lock while waiting for the exit-code lock.
+If exit state cannot be observed, the response retains command identity and
+explicit error status (`FAILED`, or `error` for PID clients), nullable exit fields,
+`error_code=COMMAND_STATE_UNAVAILABLE`, `retry=same_operation` and `outcome=unknown`.
+This is an observation failure, not evidence that the child exited or succeeded.
 
 Finished command results are retained for `EXECD_COMMAND_RESULT_TTL_SECS`
 (default 3600). After that, an explicit command ID returns `status=EXPIRED`

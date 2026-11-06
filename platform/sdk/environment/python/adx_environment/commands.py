@@ -141,12 +141,28 @@ def _validate_command_id(command_id: str) -> str:
 
 
 def _incomplete_terminal_result(snapshot: dict) -> bool:
+    if str(snapshot.get("status", "")).upper() not in ("SUCCEEDED", "FAILED"):
+        return False
     return (
-        str(snapshot.get("status", "")).upper() in ("SUCCEEDED", "FAILED")
-        and snapshot.get("exit_code") is None
+        snapshot.get("exit_code") is None
         and not snapshot.get("error_code")
         and snapshot.get("exit_signal") is None
     )
+
+
+def _raise_observation_error(
+    snapshot: dict, environment_id: str, command_id: str = "", request_id: Optional[str] = None
+) -> None:
+    if snapshot.get("error_code") == "COMMAND_STATE_UNAVAILABLE":
+        raise EnvironmentError(
+            str(snapshot.get("error") or snapshot.get("error_message") or "command state is unavailable"),
+            code="COMMAND_STATE_UNAVAILABLE",
+            retry="same_operation",
+            outcome="unknown",
+            operation_id=command_id or str(snapshot.get("operation_id") or snapshot.get("command_id") or ""),
+            environment_id=environment_id,
+            request_id=getattr(snapshot, "request_id", None) or request_id,
+        )
 
 
 def _result(snapshot: dict) -> CommandResult:
@@ -278,13 +294,14 @@ class CommandHandle:
             )
         return snapshot
 
-    def _raw_snapshot(self) -> dict:
-        snapshot = self._fetch_snapshot()
+    def _checked_snapshot(self, snapshot: dict) -> dict:
+        _raise_observation_error(snapshot, self._sid, self.command_id)
         if _incomplete_terminal_result(snapshot):
             # Older Execd can observe completion between copying the exit code
             # and serializing status. Read the same stable command once more;
             # never infer exit zero or submit the command again.
             snapshot = self._fetch_snapshot()
+            _raise_observation_error(snapshot, self._sid, self.command_id)
             if _incomplete_terminal_result(snapshot):
                 raise EnvironmentError(
                     f"command {self.command_id} has a terminal status without an exit code after reread",
@@ -295,6 +312,10 @@ class CommandHandle:
                     environment_id=self._sid,
                     request_id=getattr(snapshot, "request_id", None),
                 )
+        return snapshot
+
+    def _raw_snapshot(self) -> dict:
+        snapshot = self._checked_snapshot(self._fetch_snapshot())
         info = _info(snapshot)
         if info.pid:
             self.pid = info.pid
@@ -333,6 +354,7 @@ class CommandHandle:
                     snapshot = self._raw_snapshot()
                 if snapshot.get("error_code") == "WAIT_TIMEOUT":
                     return _wait_timeout_result(snapshot)
+                snapshot = self._checked_snapshot(snapshot)
             return _result(snapshot)
         finally:
             observe_wait(time.monotonic() - started)
@@ -519,6 +541,7 @@ class Commands:
             {"cmd": cmd, "envs": envs, "cwd": effective_cwd, "timeout": timeout},
             timeout=timeout,
         )
+        _raise_observation_error(response, self._sid)
         return _result(response)
 
     def _run_with_poll(
@@ -593,9 +616,14 @@ class Commands:
         return handle
 
     def list(self) -> List[CommandInfo]:
-        processes = self._client.invoke(self._sid, "process.list", {}).get("processes")
+        response = self._client.invoke(self._sid, "process.list", {})
+        _raise_observation_error(response, self._sid)
+        processes = response.get("processes")
         if not isinstance(processes, list):
             return []
+        for item in processes:
+            if isinstance(item, dict):
+                _raise_observation_error(item, self._sid, request_id=getattr(response, "request_id", None))
         return [_info(item) for item in processes if isinstance(item, dict)]
 
     def kill(self, command: Union[str, int]) -> bool:

@@ -79,36 +79,64 @@ fn observe_exit(exit: &ExitState) -> Result<ExitObservation, &'static str> {
         .signal_guard
         .lock()
         .map_err(|_| "command publication state is poisoned")?;
+    // Each inner guard must be dropped at its own statement boundary. A
+    // struct literal would retain temporaries and invert wait_exit's lock order.
+    let code = *exit
+        .code
+        .lock()
+        .map_err(|_| "command exit state is poisoned")?;
+    let spawn_error = exit
+        .spawn_error
+        .lock()
+        .map_err(|_| "command spawn state is poisoned")?
+        .clone();
+    let finished_at_ms = *exit
+        .finished_at_ms
+        .lock()
+        .map_err(|_| "command completion time is poisoned")?;
+    let signal = *exit
+        .signal
+        .lock()
+        .map_err(|_| "command exit signal is poisoned")?;
     Ok(ExitObservation {
-        spawn_error: exit
-            .spawn_error
-            .lock()
-            .map_err(|_| "command spawn state is poisoned")?
-            .clone(),
-        code: *exit
-            .code
-            .lock()
-            .map_err(|_| "command exit state is poisoned")?,
+        spawn_error,
+        code,
         killed: exit.killed.load(Ordering::Acquire),
         timed_out: exit.timed_out.load(Ordering::Acquire),
-        finished_at_ms: *exit
-            .finished_at_ms
-            .lock()
-            .map_err(|_| "command completion time is poisoned")?,
-        signal: *exit
-            .signal
-            .lock()
-            .map_err(|_| "command exit signal is poisoned")?,
+        finished_at_ms,
+        signal,
         state_version: exit.state_version.load(Ordering::Acquire),
     })
 }
 
-fn observation_error(command_id: &str, message: &'static str) -> Value {
+fn observation_error(record: &CommandSnapshot, message: &'static str, legacy: bool) -> Value {
     map_value(vec![
-        ("command_id", Value::from(command_id)),
-        ("operation_id", Value::from(command_id)),
+        ("command_id", Value::from(record.command_id.clone())),
+        ("operation_id", Value::from(record.command_id.clone())),
+        ("pid", Value::from(record.pid)),
+        ("cmd", Value::from(record.cmd.clone())),
+        (
+            "status",
+            Value::from(if legacy { "error" } else { "FAILED" }),
+        ),
+        ("running", Value::from(false)),
+        (
+            "state_version",
+            Value::from(record.exit.state_version.load(Ordering::Acquire)),
+        ),
+        ("exit_code", Value::Nil),
+        ("exit_signal", Value::Nil),
+        ("stdout", Value::from("")),
+        ("stderr", Value::from("")),
+        ("created_at_ms", Value::from(record.created_at_ms)),
+        (
+            "started_at_ms",
+            record.started_at_ms.map(Value::from).unwrap_or(Value::Nil),
+        ),
+        ("finished_at_ms", Value::Nil),
         ("error_code", Value::from("COMMAND_STATE_UNAVAILABLE")),
         ("error", Value::from(message)),
+        ("error_message", Value::from(message)),
         ("retry", Value::from("same_operation")),
         ("outcome", Value::from("unknown")),
     ])
@@ -559,7 +587,7 @@ fn status(record: &CommandRecord) -> &'static str {
 fn record_value(record: &CommandSnapshot, include_output: bool) -> Value {
     match observe_exit(&record.exit) {
         Ok(exit) => record_value_observed(record, include_output, &exit),
-        Err(message) => observation_error(&record.command_id, message),
+        Err(message) => observation_error(record, message, false),
     }
 }
 
@@ -645,7 +673,7 @@ fn record_value_observed(
 fn legacy_record_value(record: &CommandSnapshot, include_output: bool) -> Value {
     let exit = match observe_exit(&record.exit) {
         Ok(exit) => exit,
-        Err(message) => return observation_error(&record.command_id, message),
+        Err(message) => return observation_error(record, message, true),
     };
     let mut value = record_value_observed(record, include_output, &exit);
     let Value::Map(items) = &mut value else {
@@ -1213,6 +1241,41 @@ mod tests {
     }
 
     #[test]
+    fn observation_does_not_hold_spawn_lock_while_waiting_for_exit_code() {
+        let state = make_exit_state();
+        let code = state.code.lock().unwrap();
+        let observer_state = Arc::clone(&state);
+        let observer = std::thread::spawn(move || observe_exit(&observer_state));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut entered = false;
+        while Instant::now() < deadline {
+            if state.signal_guard.try_lock().is_err() {
+                entered = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let mut inverted = false;
+        while entered && Instant::now() < deadline {
+            if state.spawn_error.try_lock().is_err() {
+                inverted = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        // Release and join before asserting so the regression fails promptly,
+        // instead of leaving a permanently deadlocked waiter in the test suite.
+        drop(code);
+        assert!(observer.join().unwrap().is_ok());
+        assert!(entered, "observer did not enter the publication guard");
+        assert!(
+            !inverted,
+            "observer inverted wait_exit's code -> spawn lock order"
+        );
+    }
+
+    #[test]
     fn completion_after_observation_does_not_tear_command_response() {
         for code in [0, 17] {
             let record = CommandSnapshot {
@@ -1275,20 +1338,41 @@ mod tests {
 
     #[test]
     fn poisoned_command_observation_returns_structured_unknown_error() {
-        let state = make_exit_state();
+        let record = CommandSnapshot {
+            command_id: "cmd-poisoned".into(),
+            pid: 42,
+            cmd: "true".into(),
+            created_at_ms: 1,
+            started_at_ms: Some(2),
+            stdout: empty_reader("EXECD_COMMAND_STDOUT_LIMIT_BYTES"),
+            stderr: empty_reader("EXECD_COMMAND_STDERR_LIMIT_BYTES"),
+            exit: make_exit_state(),
+        };
         let result = std::panic::catch_unwind(|| {
-            let _guard = state.code.lock().unwrap();
+            let _guard = record.exit.code.lock().unwrap();
             panic!("fixture poisons only this command's exit lock");
         });
         assert!(result.is_err());
-        let error = observation_error("cmd-poisoned", observe_exit(&state).err().unwrap());
-        assert_eq!(
-            field(&error, "error_code").as_str(),
-            Some("COMMAND_STATE_UNAVAILABLE")
-        );
-        assert_eq!(field(&error, "outcome").as_str(), Some("unknown"));
-        assert_eq!(field(&error, "operation_id").as_str(), Some("cmd-poisoned"));
-        assert!(field(&error, "error").as_str().is_some());
+        for (error, expected_status) in [
+            (record_value(&record, true), "FAILED"),
+            (legacy_record_value(&record, true), "error"),
+        ] {
+            assert_eq!(field(&error, "status").as_str(), Some(expected_status));
+            assert_eq!(field(&error, "pid").as_i64(), Some(42));
+            assert_eq!(field(&error, "cmd").as_str(), Some("true"));
+            assert_eq!(field(&error, "running").as_bool(), Some(false));
+            assert_eq!(field(&error, "state_version").as_u64(), Some(1));
+            assert!(field(&error, "exit_code").is_nil());
+            assert!(field(&error, "exit_signal").is_nil());
+            assert_eq!(
+                field(&error, "error_code").as_str(),
+                Some("COMMAND_STATE_UNAVAILABLE")
+            );
+            assert_eq!(field(&error, "outcome").as_str(), Some("unknown"));
+            assert_eq!(field(&error, "retry").as_str(), Some("same_operation"));
+            assert_eq!(field(&error, "operation_id").as_str(), Some("cmd-poisoned"));
+            assert!(field(&error, "error").as_str().is_some());
+        }
     }
 
     #[test]

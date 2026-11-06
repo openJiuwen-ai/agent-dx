@@ -740,6 +740,12 @@ that same ID once more; it does not infer success or submit the command again.
 A second inconsistent response raises `COMMAND_RESULT_INCONSISTENT` with unknown
 outcome, preserving the environment and command operation identities. Legitimate
 signal, timeout and spawn-failure results retain their nullable exit-code contract.
+This check applies both to direct result reads and to the HTTP `process.wait`
+response. A runtime observation failure (`COMMAND_STATE_UNAVAILABLE`) raises
+`EnvironmentError` with `retry=same_operation` and `outcome=unknown`, preserving
+the command, environment and request identities; polling, listing and waiting do
+not turn an unavailable observation into a successful command result. Retry only
+the same read/wait operation, not command submission.
 
 Background commands run without an execution deadline by default. Pass
 `timeout` to set one explicitly; foreground commands default to 60 seconds.
