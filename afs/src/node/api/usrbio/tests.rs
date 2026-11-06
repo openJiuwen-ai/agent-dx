@@ -19,8 +19,9 @@ pub(crate) struct MemoryBackend {
     next_handle: StdMutex<u64>,
     /// 记录后端实际收到的同步屏障，用来断言 SDK 没有把 DataOnly 悄悄降级成 Full 或反之。
     last_sync: StdMutex<Option<types::SyncMode>>,
-    /// 记录句柄生命周期调用（flush / release），用来固定 SDK close 的现状语义。
+    /// 记录句柄生命周期调用（flush / release），用来固定 SDK close 的语义。
     handle_calls: StdMutex<Vec<&'static str>>,
+    fail_next_flush: StdMutex<bool>,
 }
 
 impl MemoryBackend {
@@ -33,6 +34,7 @@ impl MemoryBackend {
             next_handle: StdMutex::new(1),
             last_sync: StdMutex::new(None),
             handle_calls: StdMutex::new(Vec::new()),
+            fail_next_flush: StdMutex::new(false),
         }
     }
 
@@ -174,6 +176,12 @@ impl Backend for MemoryBackend {
             .lock()
             .expect("handle calls")
             .push("flush");
+        if std::mem::take(&mut *self.fail_next_flush.lock().expect("fail flush")) {
+            return Err(Error::coded(
+                afs_error::NODE_VFS_UNAVAILABLE,
+                "injected flush failure",
+            ));
+        }
         Ok(())
     }
 
@@ -185,6 +193,27 @@ impl Backend for MemoryBackend {
         self.handles.lock().expect("handles").remove(&handle.0);
         Ok(())
     }
+}
+
+/// flush 失败：close 把错误还给调用者，句柄照样释放（POSIX close 失败后 fd 也已关闭）。
+#[test]
+fn sdk_path_close_returns_flush_error_and_still_releases() {
+    let backend = Arc::new(MemoryBackend::new(16));
+    *backend.fail_next_flush.lock().expect("fail flush") = true;
+    let hub = UsrbioHub::new(backend.clone(), None);
+    let (handle, _) = hub
+        .open("test", "/data.bin", OpenAccess::ReadWrite)
+        .expect("open");
+    let error = hub
+        .close(&handle)
+        .expect_err("close reports the flush error");
+    assert!(error.to_string().contains("injected flush failure"));
+    assert_eq!(
+        *backend.handle_calls.lock().expect("handle calls"),
+        vec!["flush", "release"]
+    );
+    assert!(backend.handles.lock().expect("handles").is_empty());
+    hub.close(&handle).expect_err("the handle is gone");
 }
 
 /// SDK 侧与 Node 侧各自映射同一块 memfd，模拟真实的两进程关系。
@@ -329,11 +358,9 @@ fn ring_round_trip_writes_and_reads_through_shared_memory() {
     hub.destroy_iov(iov_id).expect("destroy iov");
 }
 
-/// S0 特征测试（决策 12 将改变）：SDK 路径式 close 现在只 `release`，不 `flush`。
-/// DFS 的 flush 才做 DataOnly 提交，所以路径式 close 后的可见性要等后台提交。
-/// 阶段 E 按 3FS 语义补 flush 时，同一改动里把断言改成先 flush 后 release。
+/// 决策 12（R02）：SDK 路径式 close 按 3FS 语义先 flush（同一次同步提交），再 release。
 #[test]
-fn s0_sdk_path_close_releases_without_flush_today() {
+fn sdk_path_close_flushes_then_releases() {
     let backend = Arc::new(MemoryBackend::new(16));
     let hub = UsrbioHub::new(backend.clone(), None);
     let (handle, _) = hub
@@ -342,7 +369,7 @@ fn s0_sdk_path_close_releases_without_flush_today() {
     hub.close(&handle).expect("close");
     assert_eq!(
         *backend.handle_calls.lock().expect("handle calls"),
-        vec!["release"]
+        vec!["flush", "release"]
     );
     assert!(backend.last_sync.lock().expect("last sync").is_none());
 }
@@ -961,6 +988,13 @@ async fn sync_modes_reach_the_backend_as_requested() {
         ),
         "Full must reach the backend as-is"
     );
+    // A backend without version identity (the default `fsync_receipt`) reports none.
+    let reply = client
+        .sync(&file.handle, DfsSyncMode::Full)
+        .await
+        .expect("sync full");
+    assert!(reply.file_version_id.is_empty());
+    assert_eq!(reply.durable_write_seq, 0);
 
     client.close(file.handle.clone()).await.expect("close");
     // 已关闭的句柄不能再同步；必须显式报错，不能当作成功。
@@ -1764,6 +1798,9 @@ impl Backend for ParallelProbe {
         o: OpenOptions,
     ) -> Result<FileHandle, Error> {
         self.inner.open_with_options(c, i, f, o)
+    }
+    fn flush(&self, _c: &types::RequestContext, _h: FileHandle) -> Result<(), Error> {
+        Ok(())
     }
     fn release(&self, c: &types::RequestContext, h: FileHandle) -> Result<(), Error> {
         self.inner.release(c, h)

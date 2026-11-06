@@ -71,6 +71,17 @@ fn context() -> types::RequestContext {
 
 /// 进程内装配真实 DFS：本地日志 meta store → tonic meta 服务 → GrpcDfsMeta → DistributedFs。
 async fn real_dfs(temp: &std::path::Path) -> (Arc<DistributedFs>, tokio::task::JoinHandle<()>) {
+    let (dfs, _, server) = real_dfs_with_meta(temp).await;
+    (dfs, server)
+}
+
+async fn real_dfs_with_meta(
+    temp: &std::path::Path,
+) -> (
+    Arc<DistributedFs>,
+    Arc<GrpcDfsMeta>,
+    tokio::task::JoinHandle<()>,
+) {
     // A restarted Node must not renew the previous process's expired session.
     let session_id = format!("usrbio-e2e-{}", std::process::id());
     let store = Arc::new(
@@ -201,7 +212,7 @@ async fn real_dfs(temp: &std::path::Path) -> (Arc<DistributedFs>, tokio::task::J
             namespace,
             "node-a",
             session_id,
-            meta_client,
+            meta_client.clone(),
             chunk_store,
             read_engine,
         )
@@ -216,7 +227,109 @@ async fn real_dfs(temp: &std::path::Path) -> (Arc<DistributedFs>, tokio::task::J
         )
         .expect("native write pipeline"),
     );
-    (dfs, server)
+    (dfs, meta_client, server)
+}
+
+/// 决策 12（R02）与 R19：只 write + close 的 SDK 句柄，close 返回时数据已提交到 Meta；
+/// sync 回复带 Meta 里该 inode 的 head version 与持久序号。
+#[tokio::test]
+async fn sdk_close_commits_and_sync_reports_the_meta_head_version() {
+    use crate::node::vfs::dfs::DfsMeta;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let (dfs, meta, _server) = real_dfs_with_meta(temp.path()).await;
+    let creator = dfs.clone();
+    let inode_id = on_plain_thread(move || {
+        let created = creator.create(
+            &context(),
+            creator.root_inode(),
+            OsStr::new("close.bin"),
+            0o644,
+            libc::O_RDWR,
+        )?;
+        creator.release(&context(), created.handle)?;
+        creator.test_inode_id(created.entry.inode)
+    })
+    .await
+    .expect("create close.bin");
+    let head_version = {
+        let meta = meta.clone();
+        let inode_id = inode_id.clone();
+        move || {
+            let meta = meta.clone();
+            let inode_id = inode_id.clone();
+            on_plain_thread(move || {
+                let inode = meta.get_inode(&inode_id)?;
+                let Some(head) = inode.head_version else {
+                    return Ok::<_, afs_error::Error>((String::new(), 0));
+                };
+                let (version, _) = meta.get_file_version(&head)?;
+                Ok((head.0, version.length))
+            })
+        }
+    };
+    let socket_path = temp.path().join("afs-node.sock");
+    let storage = DiagnosticStorage::new(temp.path().join("diagnostics")).expect("storage");
+    let server_task = serve_local_api_with_options(
+        storage,
+        &socket_path,
+        LocalApiOptions {
+            metrics_registry: None,
+            dfs_backend: Some(dfs.clone() as Arc<dyn Backend>),
+            dfs_namespace: Some("default".to_owned()),
+        },
+    )
+    .await
+    .expect("serve local api");
+    let client = DfsLocalClient::connect(DfsLocalClientConfig::new(&socket_path))
+        .await
+        .expect("connect");
+    let file = client
+        .open("/close.bin", DfsAccess::ReadWrite)
+        .await
+        .expect("open through sdk");
+    let mut iov = client.create_iov(4096, 2).await.expect("create iov");
+    let mut ring = client
+        .create_ring(&iov, 8, 0, 500)
+        .await
+        .expect("create ring");
+    let registration = client.register_file(&file).await.expect("register");
+    ring.write_from(&mut iov, &registration, 0, b"synced")
+        .await
+        .expect("write");
+    let reply = client
+        .sync(&file.handle, DfsSyncMode::Full)
+        .await
+        .expect("sync");
+    let (head, length) = head_version().await.expect("head after sync");
+    assert_eq!(length, 6);
+    assert_eq!(reply.file_version_id, head, "sync reports the Meta head");
+    assert!(
+        reply.durable_write_seq > 0,
+        "sync reports a durable sequence"
+    );
+
+    ring.write_from(&mut iov, &registration, 6, b"+close")
+        .await
+        .expect("write");
+    assert_eq!(
+        head_version().await.expect("head").1,
+        6,
+        "not committed yet"
+    );
+    client
+        .unregister_file(registration)
+        .await
+        .expect("unregister");
+    client.close(file.handle).await.expect("close");
+    assert_eq!(
+        head_version().await.expect("head after close").1,
+        12,
+        "close returned, so the data is committed for a new opener"
+    );
+    ring.destroy().await.expect("destroy ring");
+    iov.destroy().await.expect("destroy iov");
+    server_task.shutdown().await.expect("shutdown");
 }
 
 /// 真实 `DistributedFs` 上跑一遍 open / 写 / sync / 读 / 大小核对。

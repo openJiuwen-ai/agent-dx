@@ -217,21 +217,28 @@ impl Backend for DistributedFs {
         if options.kill_suidgid {
             let current = self.validate_inode(self.meta.get_inode(&inode_id)?)?;
             if current.kind == InodeKind::Regular {
-                killpriv_setattr = true;
-                let state = self.ensure_inode_write_state(&current)?;
-                let mut state = self.lock_for_mutation(&inode_id, &state)?;
-                if change.mode.is_some()
-                    && !super::super::types::is_legacy_privilege_clear(
-                        &attributes(&state.inode, state.logical_length, 0),
-                        &change,
-                    )
-                {
-                    return Err(Error::from(std::io::Error::from(
-                        std::io::ErrorKind::PermissionDenied,
-                    )));
+                if let Some(state) = self.local_write_state_for_killpriv(&current)? {
+                    killpriv_setattr = true;
+                    let mut state = self.lock_for_mutation(&inode_id, &state)?;
+                    if change.mode.is_some()
+                        && !super::super::types::is_legacy_privilege_clear(
+                            &attributes(&state.inode, state.logical_length, 0),
+                            &change,
+                        )
+                    {
+                        return Err(Error::from(std::io::Error::from(
+                            std::io::ErrorKind::PermissionDenied,
+                        )));
+                    }
+                    Self::apply_kernel_killpriv_to_state(&mut state);
+                    change.mode = None;
+                } else if change.size.is_some() {
+                    // The owner is another node: its temporary write session
+                    // opens with `kill_suidgid` and commits the clear with the
+                    // resize. Without a resize the legacy clear stays the plain
+                    // mode change below.
+                    change.mode = None;
                 }
-                Self::apply_kernel_killpriv_to_state(&mut state);
-                change.mode = None;
             }
         } else if change.mode.is_some() && self.has_pending_killpriv(&inode_id)? {
             self.commit_inode(
@@ -984,6 +991,26 @@ impl Backend for DistributedFs {
                 CommitWait::AfterOperations,
             )
         }
+    }
+
+    fn fsync_receipt(
+        &self,
+        ctx: &RequestContext,
+        handle: FileHandle,
+        mode: SyncMode,
+    ) -> Result<SyncReceipt> {
+        let snapshot = self.handle_snapshot(handle)?;
+        if let Some(session) = snapshot.write_session.as_ref()
+            && session.remote.is_some()
+        {
+            let reply = self.write_coordinator.remote_sync(session, mode)?;
+            return Ok(SyncReceipt {
+                file_version_id: reply.file_version_id,
+                durable_write_seq: reply.durable_write_seq,
+            });
+        }
+        Backend::fsync(self, ctx, handle, mode)?;
+        self.local_sync_receipt(handle)
     }
 
     fn release(&self, _: &RequestContext, handle: FileHandle) -> Result<()> {

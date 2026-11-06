@@ -514,7 +514,10 @@ fn native_upload_failure_is_reported_once_to_the_same_handle() {
                     .is_err()
             })
             .count();
-    assert_eq!(reports, 1, "one upload failure, reported once to one handle");
+    assert_eq!(
+        reports, 1,
+        "one upload failure, reported once to one handle"
+    );
     assert_eq!(meta.commit_count(), 1);
     let other = fs
         .open(&context(), created.entry.inode, libc::O_RDWR)

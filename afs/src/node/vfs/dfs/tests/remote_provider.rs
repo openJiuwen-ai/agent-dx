@@ -1,5 +1,180 @@
 use super::*;
 
+/// Owner on node A (`fs_a` holds the write lease); node B reaches it over loopback RPC.
+struct RemoteOwnerPair {
+    _temp_a: tempfile::TempDir,
+    _temp_b: tempfile::TempDir,
+    meta: Arc<RecordingMeta>,
+    fs_a: Arc<DistributedFs>,
+    fs_b: DistributedFs,
+    inode_id: InodeId,
+    inode_b: BackendInode,
+}
+
+fn remote_owner_pair(name: &str, mode: u32, body: &[u8]) -> RemoteOwnerPair {
+    let (temp_a, meta, fs_a_raw) = test_fs();
+    let fs_a = Arc::new(fs_a_raw);
+    let created = fs_a
+        .create(
+            &context(),
+            fs_a.root_inode(),
+            OsStr::new(name),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fs_a.write(&context(), created.handle, 0, body).unwrap();
+    fs_a.flush(&context(), created.handle).unwrap();
+    fs_a.setattr(
+        &context(),
+        created.entry.inode,
+        Some(created.handle),
+        &AttributeChange {
+            mode: Some(mode),
+            ..AttributeChange::default()
+        },
+    )
+    .unwrap();
+    fs_a.release(&context(), created.handle).unwrap();
+
+    let temp_b = tempfile::tempdir().unwrap();
+    let chunks_b = Arc::new(LocalChunkStore::open(temp_b.path(), "node-b").unwrap());
+    let read_engine_b = Arc::new(crate::node::read::engine::DfsReadEngine::new(
+        NamespaceId::new("default"),
+        "node-b".into(),
+        chunks_b.clone(),
+        Arc::new(crate::node::read::engine::UnimplementedReadSourceProvider),
+        Arc::new(crate::node::read::engine::UnimplementedChunkTransfer),
+        crate::node::read::engine::DfsReadConfig::default(),
+    ));
+    let remote_owner = Arc::new(LoopbackRemoteDfsOwner {
+        owner: fs_a.clone(),
+        peer: "node-b".into(),
+    }) as Arc<dyn RemoteDfsOwner>;
+    let fs_b = test_dfs_new(
+        NamespaceId::new("default"),
+        "node-b",
+        "session-b",
+        meta.clone(),
+        chunks_b,
+        read_engine_b,
+    )
+    .with_remote_owner_factory(Arc::new(StaticRemoteOwnerFactory {
+        owner: remote_owner,
+    }));
+    let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+    let inode_b = fs_b.backend_inode(&inode_id).unwrap();
+    RemoteOwnerPair {
+        _temp_a: temp_a,
+        _temp_b: temp_b,
+        meta,
+        fs_a,
+        fs_b,
+        inode_id,
+        inode_b,
+    }
+}
+
+/// R19: a remote writer's sync receipt carries the owner's committed head and sequence.
+#[test]
+fn remote_writer_sync_receipt_reports_the_owner_head() {
+    let pair = remote_owner_pair("remote-receipt.bin", 0o640, b"base");
+    let handle = pair
+        .fs_b
+        .open(&context(), pair.inode_b, libc::O_RDWR)
+        .unwrap();
+    pair.fs_b.write(&context(), handle, 0, b"changed").unwrap();
+    let receipt = pair
+        .fs_b
+        .fsync_receipt(&context(), handle, SyncMode::Full)
+        .unwrap();
+    let head = pair
+        .meta
+        .inode
+        .lock()
+        .unwrap()
+        .head_version
+        .clone()
+        .unwrap();
+    assert_eq!(receipt.file_version_id, head.0);
+    assert!(receipt.durable_write_seq > 0);
+    pair.fs_b.release(&context(), handle).unwrap();
+}
+
+/// R57: a privilege-clearing path truncate with the owner on another node clears
+/// suid/sgid exactly as a local one does.
+#[test]
+fn remote_owner_killpriv_truncate_clears_suid_and_sgid() {
+    let pair = remote_owner_pair("remote-killpriv.bin", 0o6750, b"abcdef");
+    assert_eq!(
+        pair.meta.inode.lock().unwrap().attributes.mode & 0o7777,
+        0o6750
+    );
+    let attrs = pair
+        .fs_b
+        .setattr_with_options(
+            &context(),
+            pair.inode_b,
+            None,
+            &AttributeChange {
+                size: Some(3),
+                mode: Some(0o0750),
+                ..AttributeChange::default()
+            },
+            SetAttrOptions {
+                kill_suidgid: true,
+                timestamps_now: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(attrs.size, 3);
+    assert_eq!(attrs.mode & 0o6000, 0);
+    assert_eq!(pair.meta.inode.lock().unwrap().attributes.mode & 0o6000, 0);
+    let state = pair.fs_a.write_state(&pair.inode_id).unwrap().unwrap();
+    assert_eq!(state.lock().unwrap().logical_length, 3);
+}
+
+/// R57: the owner RPC entry accepts `kill_suidgid`, and a replayed open with the same
+/// `open_seq` stays idempotent.
+#[test]
+fn owner_open_async_with_kill_suidgid_clears_privileges_idempotently() {
+    let pair = remote_owner_pair("owner-killpriv.bin", 0o6750, b"abcdef");
+    let lease = pair.meta.lease.lock().unwrap().clone();
+    let open = || afs_protocol::node_control::DfsOwnerOpenRequest {
+        namespace_id: "default".into(),
+        inode_id: pair.inode_id.0.clone(),
+        owner_node_id: "node-a".into(),
+        owner_session_id: "session-a".into(),
+        lease_epoch: lease.lease_epoch,
+        caller_session_id: "session-b".into(),
+        open_flags: libc::O_RDWR,
+        kill_suidgid: true,
+        open_seq: 1,
+    };
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let fs = pair.fs_a.clone();
+    let first = runtime
+        .block_on(
+            crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler::open_async(
+                fs.clone(),
+                "node-b".into(),
+                open(),
+            ),
+        )
+        .unwrap();
+    let replay = runtime
+        .block_on(
+            crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler::open_async(
+                fs,
+                "node-b".into(),
+                open(),
+            ),
+        )
+        .unwrap();
+    assert_eq!(first.handle, replay.handle);
+    assert!(pair.fs_a.has_pending_killpriv(&pair.inode_id).unwrap());
+}
+
 #[test]
 fn remote_owner_write_after_local_close_rebinds_metadata_dirty_state() {
     let (_temp, meta, fs) = test_fs();

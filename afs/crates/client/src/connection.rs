@@ -1578,6 +1578,7 @@ impl DfsLocalClient {
         })
     }
 
+    /// 显式屏障；返回提交到的文件版本与持久写序号（后端未暴露时为空串与 0）。
     pub async fn sync(
         &self,
         handle: &DfsFileHandle,
@@ -1598,6 +1599,8 @@ impl DfsLocalClient {
         })
     }
 
+    /// 关闭句柄：与 POSIX close 相同，先同步提交此前的写入再释放；提交失败时返回错误，
+    /// 句柄同样已关闭。
     pub async fn close(&self, handle: DfsFileHandle) -> Result<(), LocalClientError> {
         let request = request_with_current_context(DfsCloseRequest {
             handle: Some(handle.to_wire()),

@@ -347,14 +347,13 @@ impl DfsLocalData for DfsLocalDataService {
             let handle = handle_value(request.handle)?;
             let mode = sync_mode(request.barrier)?;
             let executor = hub.executor().clone();
-            executor
+            let receipt = executor
                 .run(move || hub.sync(&handle, mode))
                 .await
                 .map_err(error_to_status)?;
             Ok(DfsSyncReply {
-                // 同 open：后端未暴露版本身份与 durable 序号，这里返回零值而不是编造。
-                file_version_id: String::new(),
-                durable_write_seq: 0,
+                file_version_id: receipt.file_version_id,
+                durable_write_seq: receipt.durable_write_seq,
             })
         }
         .await;

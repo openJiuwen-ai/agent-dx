@@ -21,8 +21,6 @@ use afs_protocol::{
     },
 };
 
-use crate::node::vfs::types::OpenOptions;
-
 /// Caller side of the same proxy: forwards operations on an already-open DFS
 /// writer handle to its inode owner. The transport (`node::rpc::peer`)
 /// implements it. There is deliberately no automatic retry/fallback of
@@ -168,29 +166,14 @@ pub trait DfsOwnerLifecycleHandler: Send + Sync + 'static {
         Err(dfs_owner_lifecycle_unimplemented())
     }
 
-    fn open_with_options(
-        &self,
-        peer: &str,
-        request: DfsOwnerOpenRequest,
-        options: OpenOptions,
-    ) -> afs_error::Result<DfsOwnerOpenReply> {
-        if options.kill_suidgid {
-            return Err(dfs_owner_lifecycle_unimplemented());
-        }
-        self.open(peer, request)
-    }
-
-    /// The RPC entry of `open_with_options`; runs on an async worker. The default
-    /// runs the sync method on the blocking pool.
+    /// The RPC entry of `open`; runs on an async worker. The default runs the
+    /// sync method on the blocking pool.
     fn open_async(
         self: std::sync::Arc<Self>,
         peer: String,
         request: DfsOwnerOpenRequest,
-        options: OpenOptions,
     ) -> OwnerFuture<DfsOwnerOpenReply> {
-        Box::pin(offload_handler(move || {
-            self.open_with_options(&peer, request, options)
-        }))
+        Box::pin(offload_handler(move || self.open(&peer, request)))
     }
     fn getattr(
         &self,

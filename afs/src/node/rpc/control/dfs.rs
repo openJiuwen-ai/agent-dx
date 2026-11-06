@@ -4,11 +4,8 @@
 use super::BlockingLockWaits;
 use crate::node::{
     rpc::data::{PeerAuthenticator, authenticate_peer},
-    vfs::{
-        dfs::owner_api::{
-            DfsOwnerLifecycleHandler, OwnerFuture, dfs_owner_lifecycle_unimplemented,
-        },
-        types::OpenOptions,
+    vfs::dfs::owner_api::{
+        DfsOwnerLifecycleHandler, OwnerFuture, dfs_owner_lifecycle_unimplemented,
     },
 };
 use afs_protocol::node_control::{
@@ -148,11 +145,8 @@ impl DfsOwnerControl for DfsOwnerControlService {
                 "DFS owner open identity is incomplete",
             ));
         }
-        let options = OpenOptions {
-            kill_suidgid: body.kill_suidgid,
-        };
         self.dispatch_dfs_owner_async(request, move |handler, peer, request| {
-            handler.open_async(peer, request, options)
+            handler.open_async(peer, request)
         })
         .await
     }

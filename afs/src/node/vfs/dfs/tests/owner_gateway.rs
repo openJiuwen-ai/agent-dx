@@ -1823,21 +1823,14 @@ fn owner_operation_global_cap_rejects_before_applying() {
 /// A whole proxied session through the RPC entries, as `DfsOwnerFilesService` and
 /// `DfsOwnerControlService` run them.
 async fn owner_rpc_entries_serve_a_session(meta: &RecordingMeta, fs: Arc<DistributedFs>) {
-    use crate::node::vfs::{
-        dfs::owner_api::{DfsOwnerFilesHandler, DfsOwnerLifecycleHandler},
-        types::OpenOptions,
-    };
+    use crate::node::vfs::dfs::owner_api::{DfsOwnerFilesHandler, DfsOwnerLifecycleHandler};
     let peer = || "node-b".to_owned();
     let sessions_before = meta.current_session_calls.load(Ordering::SeqCst);
     let resolves_before = meta.resolve_write_calls.load(Ordering::SeqCst);
 
     let handle = fs
         .clone()
-        .open_async(
-            peer(),
-            dfs_owner_open_request(1, libc::O_RDWR),
-            OpenOptions::default(),
-        )
+        .open_async(peer(), dfs_owner_open_request(1, libc::O_RDWR))
         .await
         .unwrap()
         .handle
@@ -1953,17 +1946,13 @@ async fn owner_rpc_entries_await_meta_on_a_current_thread_runtime() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn owner_open_async_meta_failure_clears_inflight_admission() {
-    use crate::node::vfs::{dfs::owner_api::DfsOwnerLifecycleHandler, types::OpenOptions};
+    use crate::node::vfs::dfs::owner_api::DfsOwnerLifecycleHandler;
     let (_temp, meta, fs) = test_fs();
     let fs = Arc::new(fs);
     meta.fail_next_open_write_with(unavailable("injected open_write failure"));
     let error = fs
         .clone()
-        .open_async(
-            "node-b".to_owned(),
-            dfs_owner_open_request(1, libc::O_RDWR),
-            OpenOptions::default(),
-        )
+        .open_async("node-b".to_owned(), dfs_owner_open_request(1, libc::O_RDWR))
         .await
         .unwrap_err();
     assert_eq!(error.code(), afs_error::NODE_VFS_UNAVAILABLE);
@@ -1976,19 +1965,12 @@ async fn owner_open_async_meta_failure_clears_inflight_admission() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn owner_write_async_rejects_a_stale_caller_session_before_applying() {
-    use crate::node::vfs::{
-        dfs::owner_api::{DfsOwnerFilesHandler, DfsOwnerLifecycleHandler},
-        types::OpenOptions,
-    };
+    use crate::node::vfs::dfs::owner_api::{DfsOwnerFilesHandler, DfsOwnerLifecycleHandler};
     let (_temp, meta, fs) = test_fs();
     let fs = Arc::new(fs);
     let handle = fs
         .clone()
-        .open_async(
-            "node-b".to_owned(),
-            dfs_owner_open_request(1, libc::O_RDWR),
-            OpenOptions::default(),
-        )
+        .open_async("node-b".to_owned(), dfs_owner_open_request(1, libc::O_RDWR))
         .await
         .unwrap()
         .handle

@@ -11,3 +11,9 @@ pub(super) struct TestHooks {
     pub(super) readonly_version_before_install: Mutex<Option<Arc<std::sync::Barrier>>>,
     pub(super) writeback_after_prepare_pause: Mutex<Option<Duration>>,
 }
+
+impl DistributedFs {
+    pub(crate) fn test_inode_id(&self, inode: BackendInode) -> Result<InodeId> {
+        self.inode_id(inode)
+    }
+}

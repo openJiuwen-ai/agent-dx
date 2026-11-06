@@ -87,7 +87,7 @@ use super::{
         AttributeChange, BackendInode, CreatedFile, DirectoryEntry, DirectoryHandle, Entry,
         FileAttributes, FileHandle, FileKind, FileLockConflict, FileLockKind, FileLockOwner,
         FileLockRange, FileLockType, FilesystemCapacity, OpenOptions, ReleaseKind, RenameFlags,
-        RequestContext, SetAttrOptions, SpecialFileKind, SyncMode, WriteOptions,
+        RequestContext, SetAttrOptions, SpecialFileKind, SyncMode, SyncReceipt, WriteOptions,
     },
 };
 use crate::{

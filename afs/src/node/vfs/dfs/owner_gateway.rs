@@ -1342,12 +1342,8 @@ impl owner_api::DfsOwnerLifecycleHandler for DistributedFs {
         self: Arc<Self>,
         peer: String,
         request: afs_protocol::node_control::DfsOwnerOpenRequest,
-        options: crate::node::vfs::types::OpenOptions,
     ) -> OwnerFuture<afs_protocol::node_control::DfsOwnerOpenReply> {
         Box::pin(async move {
-            if options.kill_suidgid {
-                return Err(owner_api::dfs_owner_lifecycle_unimplemented());
-            }
             let gateway = &self.owner_gateway;
             gateway.check_owner_open_target(&request)?;
             let current = gateway
@@ -1736,23 +1732,8 @@ impl OwnerLocalFiles for DistributedFs {
 
     fn owner_sync(&self, file: FileHandle, mode: SyncMode) -> Result<(u64, String)> {
         <Self as Backend>::fsync(self, &owner_request_context(), file, mode)?;
-        let snapshot = self.handle_snapshot(file)?;
-        let durable_write_seq = snapshot
-            .write_session
-            .as_ref()
-            .map_or(0, |session| session.local.last_synced_seq);
-        let file_version_id = self
-            .write_state(&snapshot.inode_id)?
-            .and_then(|state| {
-                state.lock().ok().and_then(|state| {
-                    state
-                        .base_version
-                        .as_ref()
-                        .map(|version| version.id.0.clone())
-                })
-            })
-            .unwrap_or_default();
-        Ok((durable_write_seq, file_version_id))
+        let receipt = self.local_sync_receipt(file)?;
+        Ok((receipt.durable_write_seq, receipt.file_version_id))
     }
 
     fn release_owner_handle(&self, file: FileHandle) -> Result<Option<Error>> {

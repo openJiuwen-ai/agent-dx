@@ -36,7 +36,8 @@ fn s2_background_commit_failure_reaches_the_same_handle_fsync_once() {
         .fsync(&context(), created.handle, SyncMode::Full)
         .unwrap_err();
     assert!(error.to_string().contains("injected test commit failure"));
-    fs.fsync(&context(), created.handle, SyncMode::Full).unwrap();
+    fs.fsync(&context(), created.handle, SyncMode::Full)
+        .unwrap();
     assert_eq!(meta.commit_count(), 1);
     fs.release(&context(), created.handle).unwrap();
 }
@@ -84,7 +85,8 @@ fn s2_delivered_background_error_does_not_block_a_fresh_lease() {
         fs.fsync(&context(), created.handle, SyncMode::Full)
             .is_err()
     );
-    fs.fsync(&context(), created.handle, SyncMode::Full).unwrap();
+    fs.fsync(&context(), created.handle, SyncMode::Full)
+        .unwrap();
     fs.release(&context(), created.handle).unwrap();
     fs.writeback_pending().unwrap();
 
@@ -154,7 +156,8 @@ fn s2_each_open_writer_sees_a_background_error_once() {
             .is_err()
     );
     assert!(fs.release(&context(), second).is_err());
-    fs.fsync(&context(), created.handle, SyncMode::Full).unwrap();
+    fs.fsync(&context(), created.handle, SyncMode::Full)
+        .unwrap();
     fs.release(&context(), created.handle).unwrap();
 }
 

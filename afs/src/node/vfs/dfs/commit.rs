@@ -79,7 +79,7 @@ pub(super) enum ForegroundCommit {
     DataSync,
     /// fsync: data plus a full metadata barrier.
     FullSync,
-    /// FUSE flush on close(2); data only (decision 5).
+    /// FUSE flush on close(2) and SDK close; data only (decision 5).
     Close,
     /// Node shutdown.
     NodeDrain,

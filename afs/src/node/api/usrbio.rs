@@ -463,7 +463,9 @@ impl UsrbioHub {
         Ok((value, attributes.size))
     }
 
-    /// 释放句柄。仍被注册的句柄必须先用 `unregister_file` 注销。
+    /// 关闭句柄（决策 12，3FS 语义）：先做一次与 FUSE close 相同的 flush，再释放。
+    /// flush 失败也释放（POSIX close 失败后 fd 同样已关闭），返回 flush 的错误。
+    /// 仍被注册的句柄必须先用 `unregister_file` 注销。
     pub(crate) fn close(&self, handle: &[u8]) -> Result<(), Error> {
         let mut state = self.lock();
         if state
@@ -479,11 +481,17 @@ impl UsrbioHub {
             return Err(invalid("unknown DFS file handle"));
         };
         drop(state);
-        self.backend.release(&opened.ctx, opened.handle)
+        let flushed = self.backend.flush(&opened.ctx, opened.handle);
+        let released = self.backend.release(&opened.ctx, opened.handle);
+        flushed.and(released)
     }
 
     /// 应用显式屏障。
-    pub(crate) fn sync(&self, handle: &[u8], mode: types::SyncMode) -> Result<(), Error> {
+    pub(crate) fn sync(
+        &self,
+        handle: &[u8],
+        mode: types::SyncMode,
+    ) -> Result<types::SyncReceipt, Error> {
         let opened = {
             let state = self.lock();
             state
@@ -492,7 +500,7 @@ impl UsrbioHub {
                 .cloned()
                 .ok_or_else(|| invalid("unknown DFS file handle"))?
         };
-        self.backend.fsync(&opened.ctx, opened.handle, mode)
+        self.backend.fsync_receipt(&opened.ctx, opened.handle, mode)
     }
 
     /// 建立持久 iov 的 Node 侧视图。

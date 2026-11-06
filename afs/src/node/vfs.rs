@@ -368,6 +368,17 @@ pub trait Backend: Send + Sync {
         Err(unsupported("fsync"))
     }
 
+    /// 同 [`Self::fsync`]，并返回屏障提交到的版本身份与持久序号（SDK sync 的回复）。
+    fn fsync_receipt(
+        &self,
+        ctx: &types::RequestContext,
+        handle: types::FileHandle,
+        mode: types::SyncMode,
+    ) -> Result<types::SyncReceipt> {
+        self.fsync(ctx, handle, mode)?;
+        Ok(types::SyncReceipt::default())
+    }
+
     /// 释放本进程的句柄；不能以 path 重新寻找被 rename/unlink 的文件。
     fn release(&self, _ctx: &types::RequestContext, _handle: types::FileHandle) -> Result<()> {
         Err(unsupported("release"))

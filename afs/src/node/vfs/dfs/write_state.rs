@@ -758,6 +758,23 @@ impl DistributedFs {
         Ok(session)
     }
 
+    /// This node's write state for a privilege clear, or `None` when the write
+    /// lease belongs to another node.
+    pub(super) fn local_write_state_for_killpriv(
+        &self,
+        inode: &InodeRecord,
+    ) -> Result<Option<SharedInodeWriteState>> {
+        if self.write_state(&inode.inode_id)?.is_some() {
+            return self.ensure_inode_write_state(inode).map(Some);
+        }
+        let (fresh_inode, write_lease) = self.meta.open_write(&inode.inode_id)?;
+        if self.ensure_local_write_owner(&write_lease).is_err() {
+            return Ok(None);
+        }
+        self.install_write_state(self.validate_inode(fresh_inode)?, write_lease)?;
+        self.write_state(&inode.inode_id)
+    }
+
     pub(super) fn visible_attributes(&self, inode: &InodeRecord) -> Result<FileAttributes> {
         self.visible_attributes_with_observed_inode(inode, inode)
     }

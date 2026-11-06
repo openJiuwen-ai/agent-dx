@@ -373,6 +373,31 @@ impl DistributedFs {
         self.release_writer(&session.local)
     }
 
+    /// What a sync barrier on this local handle has reached: this handle's
+    /// acknowledged sequence and the inode's committed version.
+    pub(super) fn local_sync_receipt(&self, handle: FileHandle) -> Result<SyncReceipt> {
+        let snapshot = self.handle_snapshot(handle)?;
+        let durable_write_seq = snapshot
+            .write_session
+            .as_ref()
+            .map_or(0, |session| session.local.last_synced_seq);
+        let file_version_id = self
+            .write_state(&snapshot.inode_id)?
+            .and_then(|state| {
+                state.lock().ok().and_then(|state| {
+                    state
+                        .base_version
+                        .as_ref()
+                        .map(|version| version.id.0.clone())
+                })
+            })
+            .unwrap_or_default();
+        Ok(SyncReceipt {
+            file_version_id,
+            durable_write_seq,
+        })
+    }
+
     pub(super) fn update_handle_error_cursor(&self, handle: FileHandle, cursor: u64) -> Result<()> {
         let opened = self
             .handles
