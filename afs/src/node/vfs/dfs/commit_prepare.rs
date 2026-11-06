@@ -477,14 +477,13 @@ impl DistributedFs {
         let Some(state) = self.write_state(&snapshot.inode_id)? else {
             return Ok(());
         };
-        let state = state
+        let mut state = state
             .lock()
             .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
         if let Some(error) = state.terminal_error.clone() {
             return Err(error);
         }
-        let observed = state.background_error.clone();
-        let Some(observed) = observed.filter(|error| error.cursor > session.local.error_cursor)
+        let Some(observed) = Self::take_undelivered_error(&mut state, session.local.error_cursor)
         else {
             return Ok(());
         };
@@ -531,9 +530,27 @@ impl DistributedFs {
         Ok(state.visible_write_seq)
     }
 
-    pub(super) fn release_writer(&self, session: &DfsWriteSession) -> Result<()> {
+    /// A closing writer: an error it has not seen yet is its last chance to
+    /// reach a caller, so it comes back with the release. The writer is gone
+    /// either way.
+    pub(super) fn release_writer(&self, session: &DfsWriteSession) -> Result<Option<Error>> {
+        Ok(self
+            .leave_writer(session, true)?
+            .map(|observed| observed.error))
+    }
+
+    /// An open that failed before returning a handle: nothing is delivered.
+    pub(super) fn abandon_writer(&self, session: &DfsWriteSession) -> Result<()> {
+        self.leave_writer(session, false).map(|_| ())
+    }
+
+    fn leave_writer(
+        &self,
+        session: &DfsWriteSession,
+        deliver: bool,
+    ) -> Result<Option<ObservedWriteError>> {
         let Some(state) = self.write_state(&session.inode_id)? else {
-            return Ok(());
+            return Ok(None);
         };
         let _native_ticket = self.mutation_ticket_with_cleanup(&state, true)?;
         let mut state = state
@@ -543,7 +560,9 @@ impl DistributedFs {
         if state.open_writers == 0 && (state.dirty || state.metadata_dirty) {
             state.last_writer_background_requested = true;
         }
-        Ok(())
+        Ok(deliver
+            .then(|| Self::take_undelivered_error(&mut state, session.error_cursor))
+            .flatten())
     }
 }
 

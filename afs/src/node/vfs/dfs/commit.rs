@@ -162,8 +162,11 @@ impl DistributedFs {
             if synced >= target_seq && !metadata_pending {
                 break;
             }
-            let committed_seq =
-                self.commit_inode(&snapshot.inode_id, reason, CommitWait::InsideOperation)?;
+            // A failed step may be one the inode already retained (an upload
+            // failure): report it from there, so this handle sees it only once.
+            let committed_seq = self
+                .commit_inode(&snapshot.inode_id, reason, CommitWait::InsideOperation)
+                .map_err(|error| self.observe_handle_error(handle).err().unwrap_or(error))?;
             if let Some(committed_seq) = committed_seq {
                 self.update_handles_after_commit(&snapshot.inode_id, committed_seq)?;
                 continue;

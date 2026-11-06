@@ -350,6 +350,29 @@ impl DistributedFs {
         Ok(())
     }
 
+    /// Removes the handle and its writer. `Ok(Some(_))`: the handle is gone and
+    /// this write error had not reached any caller yet.
+    pub(super) fn release_file_handle(&self, handle: FileHandle) -> Result<Option<Error>> {
+        let removed = self
+            .handles
+            .remove(handle.0)?
+            .ok_or_else(|| stale("DFS file handle is no longer open"))?;
+        let session = removed
+            .state
+            .lock()
+            .map_err(|_| unavailable("DFS handle state is poisoned"))?
+            .write_session
+            .clone();
+        let Some(session) = session else {
+            return Ok(None);
+        };
+        if session.remote.is_some() {
+            self.close_remote_write_session(&removed.inode_id, &session)?;
+            return Ok(None);
+        }
+        self.release_writer(&session.local)
+    }
+
     pub(super) fn update_handle_error_cursor(&self, handle: FileHandle, cursor: u64) -> Result<()> {
         let opened = self
             .handles

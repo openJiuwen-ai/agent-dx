@@ -190,6 +190,9 @@ impl DistributedFs {
         }
     }
 
+    /// The single place a write failure without a waiting caller is retained.
+    /// Delivery is `take_undelivered_error`: to each open writer once, at its
+    /// next write, flush, fsync or release.
     pub(super) fn record_background_error(&self, inode_id: &InodeId, error: Error) -> Result<()> {
         let Some(state) = self.write_state(inode_id)? else {
             return Ok(());
@@ -197,16 +200,47 @@ impl DistributedFs {
         let mut state = state
             .lock()
             .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        Self::record_background_error_locked(&mut state, error);
+        Ok(())
+    }
+
+    pub(super) fn record_background_error_locked(state: &mut InodeWriteState, error: Error) {
         let cursor = state
             .background_error
             .as_ref()
             .map_or(1, |previous| previous.cursor.saturating_add(1));
         afs_logging::warn!("dfs.background_error_recorded";
-            "inode_id" => inode_id.0.as_str(),
+            "inode_id" => state.inode.inode_id.0.as_str(),
             "cursor" => cursor,
             "error" => error.to_string()
         );
-        state.background_error = Some(ObservedWriteError { cursor, error });
-        Ok(())
+        state.background_error = Some(ObservedWriteError {
+            cursor,
+            error,
+            delivered: false,
+        });
+    }
+
+    pub(super) fn retained_error_cursor(cell: &SharedInodeWriteState) -> Result<u64> {
+        let state = cell
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        Ok(state
+            .background_error
+            .as_ref()
+            .map_or(0, |error| error.cursor))
+    }
+
+    /// The retained error this session has not seen yet, marked delivered.
+    pub(super) fn take_undelivered_error(
+        state: &mut InodeWriteState,
+        session_cursor: u64,
+    ) -> Option<ObservedWriteError> {
+        let observed = state
+            .background_error
+            .as_mut()
+            .filter(|error| error.cursor > session_cursor)?;
+        observed.delivered = true;
+        Some(observed.clone())
     }
 }

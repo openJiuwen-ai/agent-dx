@@ -528,7 +528,7 @@ impl Backend for DistributedFs {
                     && let Err(error) =
                         self.resize_dirty_inode(&inode.inode_id, 0, options.kill_suidgid)
                 {
-                    self.release_writer(&session.local)?;
+                    self.abandon_writer(&session.local)?;
                     return Err(error);
                 }
                 session
@@ -987,24 +987,7 @@ impl Backend for DistributedFs {
     }
 
     fn release(&self, _: &RequestContext, handle: FileHandle) -> Result<()> {
-        let removed = self
-            .handles
-            .remove(handle.0)?
-            .ok_or_else(|| stale("DFS file handle is no longer open"))?;
-        let session = removed
-            .state
-            .lock()
-            .map_err(|_| unavailable("DFS handle state is poisoned"))?
-            .write_session
-            .clone();
-        if let Some(session) = session.as_ref() {
-            if session.remote.is_some() {
-                self.close_remote_write_session(&removed.inode_id, session)?;
-            } else {
-                self.release_writer(&session.local)?;
-            }
-        }
-        Ok(())
+        self.release_file_handle(handle)?.map_or(Ok(()), Err)
     }
 
     fn opendir(&self, _: &RequestContext, inode: BackendInode) -> Result<DirectoryHandle> {

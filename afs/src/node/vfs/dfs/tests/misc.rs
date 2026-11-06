@@ -221,9 +221,6 @@ fn pr88_fix_crc32c_tail_partial_success_retry_keeps_ids_and_receipts() {
         2,
         "both tails reached real durable storage"
     );
-    // R56：生产模式下同一次上传失败对同一句柄报告两次；先取走重复的那次（经后台错误游标，
-    // 由下一次句柄操作报告）。R56 修复时删掉这一步。
-    assert!(fs.fsync(&context(), file.handle, SyncMode::Full).is_err());
     let inode_id = meta.inode.lock().unwrap().inode_id.clone();
     let cell = fs.write_state(&inode_id).unwrap().unwrap();
     {
@@ -476,11 +473,10 @@ fn s1a_inode_lock_contention_is_counted_only_when_a_lock_waits() {
     assert!(wait.wait_nanoseconds.get() >= 10_000_000);
 }
 
-/// S1a-1 特征测试（R56，S2 修）：生产模式（带 runtime 的 native 流水线）下，一次后台上传
-/// 失败对同一句柄报告两次：一次由等待该上传的 fsync 取走，一次经 inode 的后台错误游标由下一次
-/// 句柄操作报告。之后重试成功；之后打开的句柄不受影响。修复时改为只报告一次。
+/// R56：生产模式（带 runtime 的 native 流水线）下，一次后台上传失败对同一句柄只报告一次，
+/// 经 inode 的后台错误游标交付。之后重试成功；之后打开的句柄不受影响。
 #[test]
-fn s1a_native_upload_failure_is_reported_twice_to_the_same_handle_today() {
+fn native_upload_failure_is_reported_once_to_the_same_handle() {
     struct FailOnceStore {
         inner: Arc<LocalChunkStore>,
         fail: AtomicBool,
@@ -518,13 +514,7 @@ fn s1a_native_upload_failure_is_reported_twice_to_the_same_handle_today() {
                     .is_err()
             })
             .count();
-    assert_eq!(
-        reports, 2,
-        "one upload failure, reported twice to one handle"
-    );
-    assert_eq!(meta.commit_count(), 0);
-    fs.fsync(&context(), created.handle, SyncMode::Full)
-        .unwrap();
+    assert_eq!(reports, 1, "one upload failure, reported once to one handle");
     assert_eq!(meta.commit_count(), 1);
     let other = fs
         .open(&context(), created.entry.inode, libc::O_RDWR)
@@ -582,12 +572,6 @@ fn crc32c_native_preupload_retry_preserves_immutable_id() {
                 .is_err()
         );
     }
-    // R56：生产模式下同一次上传失败对同一句柄报告两次（上传等待一次、后台错误游标一次）。
-    // 这里先把重复的那次报告取走；R56 修复时删掉这一步。
-    assert!(
-        fs.fsync(&context(), created.handle, SyncMode::Full)
-            .is_err()
-    );
     assert_eq!(meta.commit_count(), 0);
     let inode_id = meta.inode.lock().unwrap().inode_id.clone();
     let cell = fs.write_state(&inode_id).unwrap().unwrap();
@@ -611,12 +595,20 @@ fn crc32c_native_preupload_retry_preserves_immutable_id() {
     let attempts = store.attempts.lock().unwrap();
     assert_eq!(attempts.len(), 3);
     assert_eq!(attempts[0][0].length, COMMIT_CHUNK_BYTES);
+    // The failed object is retried by the next barrier; the new tail may start first.
+    let retry = attempts[1..]
+        .iter()
+        .find(|attempt| attempt[0].length == COMMIT_CHUNK_BYTES)
+        .unwrap();
+    let tail = attempts[1..]
+        .iter()
+        .find(|attempt| attempt[0].length == 4096)
+        .unwrap();
     assert_eq!(
-        attempts[1], attempts[0],
+        retry, &attempts[0],
         "retry keeps the sealed immutable object; it does not rewrite its hidden tail"
     );
-    assert_eq!(attempts[2].len(), 1);
-    assert_eq!(attempts[2][0].length, 4096);
+    assert_eq!(tail.len(), 1);
     assert!(
         attempts
             .iter()
@@ -624,8 +616,8 @@ fn crc32c_native_preupload_retry_preserves_immutable_id() {
             .all(ChunkObject::is_segment_crc32c)
     );
     for (chunk, body) in [
-        (&attempts[1][0], original.as_slice()),
-        (&attempts[2][0], [7; 4096].as_slice()),
+        (&retry[0], original.as_slice()),
+        (&tail[0], [7; 4096].as_slice()),
     ] {
         assert_eq!(
             chunk.content_digest,

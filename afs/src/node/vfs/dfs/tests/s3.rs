@@ -118,7 +118,7 @@ fn s1a5_s3_overwrite_after_upload_leaves_an_unreferenced_object_today() {
 }
 
 /// S1a-5: an S3 PUT failure is reported to the writer, nothing is committed,
-/// and the next barrier retries the same object (R56 may report it twice).
+/// once, and the next barrier retries the same object.
 #[test]
 fn s1a5_s3_put_failure_is_reported_then_retried() {
     let (_temp, meta, fs, store) = test_fs_on_fake_s3();
@@ -141,9 +141,8 @@ fn s1a5_s3_put_failure_is_reported_then_retried() {
         );
         assert_eq!(meta.commit_count(), 0);
         failures += 1;
-        assert!(failures <= 2, "one PUT failure reported more than twice");
     }
-    assert!(failures >= 1);
+    assert_eq!(failures, 1);
     assert_eq!(meta.commit_count(), 1);
     assert_eq!(store.objects(), 1);
     fs.release(&context(), created.handle).unwrap();

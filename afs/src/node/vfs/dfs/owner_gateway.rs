@@ -56,7 +56,9 @@ pub(super) trait OwnerLocalFiles {
     fn owner_resize(&self, file: FileHandle, length: u64, kill_suidgid: bool) -> Result<u64>;
     /// The handle's durable write sequence and the inode's base version id.
     fn owner_sync(&self, file: FileHandle, mode: SyncMode) -> Result<(u64, String)>;
-    fn release_owner_handle(&self, file: FileHandle) -> Result<()>;
+    /// Releases the handle. `Ok(Some(_))`: it is gone, and this write error had
+    /// not reached any caller yet; the releasing caller is its last receiver.
+    fn release_owner_handle(&self, file: FileHandle) -> Result<Option<Error>>;
 }
 
 /// The part of an open handle the gateway validates a wire handle against.
@@ -457,7 +459,7 @@ impl OwnerGateway {
                 Ok(cancelled) => cancelled,
                 Err(error) => {
                     match local.release_owner_handle(handle) {
-                        Ok(()) => {}
+                        Ok(_) => {}
                         Err(release_error)
                             if release_error.code() == afs_error::NODE_DFS_STALE_HANDLE => {}
                         Err(release_error) => return Err(release_error),
@@ -519,9 +521,9 @@ impl OwnerGateway {
             return Ok(afs_protocol::node_control::DfsOwnerReleaseReply {});
         }
         self.validate_owner_release_session_current(peer, &handle)?;
-        self.release_owner_open_if_present(local, peer, &handle)?;
+        let undelivered = self.release_owner_open_if_present(local, peer, &handle)?;
         self.finish_owner_open_identity_retirement(peer, &handle)?;
-        Ok(afs_protocol::node_control::DfsOwnerReleaseReply {})
+        undelivered.map_or(Ok(afs_protocol::node_control::DfsOwnerReleaseReply {}), Err)
     }
 
     /// Cleanup release of an admission that has an active handle.
@@ -542,12 +544,13 @@ impl OwnerGateway {
         local: &dyn OwnerLocalFiles,
         peer: &str,
         handle: &afs_protocol::node_control::DfsOwnerHandle,
-    ) -> Result<()> {
-        if let Some(file) = self.owner_release_file_handle(local, peer, handle)? {
-            local.release_owner_handle(file)?;
-            self.forget_owner_handle_operations(file)?;
-        }
-        Ok(())
+    ) -> Result<Option<Error>> {
+        let Some(file) = self.owner_release_file_handle(local, peer, handle)? else {
+            return Ok(None);
+        };
+        let undelivered = local.release_owner_handle(file)?;
+        self.forget_owner_handle_operations(file)?;
+        Ok(undelivered)
     }
 }
 
@@ -1297,7 +1300,7 @@ impl OwnerGateway {
         let mut first_error = None;
         for file in handles {
             let released = match local.release_owner_handle(file) {
-                Ok(()) => {
+                Ok(_) => {
                     reaped = reaped.saturating_add(1);
                     Ok(())
                 }
@@ -1475,14 +1478,14 @@ impl owner_api::DfsOwnerLifecycleHandler for DistributedFs {
                 .await?;
             OwnerGateway::check_owner_release_caller_session(current, &handle)?;
             let (fs, caller, released) = (self.clone(), peer.clone(), handle.clone());
-            offload_handler(move || {
+            let undelivered = offload_handler(move || {
                 fs.owner_gateway
                     .release_owner_open_if_present(&*fs, &caller, &released)
             })
             .await?;
             self.finish_owner_open_retirement_async(&peer, &handle)
                 .await?;
-            Ok(reply)
+            undelivered.map_or(Ok(reply), Err)
         })
     }
 }
@@ -1615,7 +1618,7 @@ impl OwnerLocalFiles for DistributedFs {
         self.install_write_state(inode.clone(), lease.clone())?;
         let session = self.open_write_session(inode, open_flags)?;
         if session.lease_epoch != lease.lease_epoch {
-            self.release_writer(&session)?;
+            self.abandon_writer(&session)?;
             return Err(stale("DFS owner lease changed during open admission"));
         }
         if kill_suidgid {
@@ -1752,8 +1755,8 @@ impl OwnerLocalFiles for DistributedFs {
         Ok((durable_write_seq, file_version_id))
     }
 
-    fn release_owner_handle(&self, file: FileHandle) -> Result<()> {
-        <Self as Backend>::release(self, &owner_request_context(), file)
+    fn release_owner_handle(&self, file: FileHandle) -> Result<Option<Error>> {
+        self.release_file_handle(file)
     }
 }
 

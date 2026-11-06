@@ -971,9 +971,7 @@ fn p2_w2_upload_error_is_owned_by_its_inode_while_drain_still_aggregates() {
             "owner body changed after failed upload"
         );
     }
-    // The owner cursor and that upload's retained attempt error are
-    // separately observed; retry still uses the same immutable object.
-    assert!(a_fs.fsync(&context(), a.handle, SyncMode::Full).is_err());
+    // The failure was reported once; retry still uses the same immutable object.
     a_fs.fsync(&context(), a.handle, SyncMode::Full).unwrap();
     {
         let commits = a_meta.commits.lock().unwrap();
@@ -1068,8 +1066,7 @@ fn p2_review_node_wide_poll_never_reports_another_inode_upload_error() {
     b_fs.fsync(&context(), b.handle, SyncMode::Full).unwrap();
     assert_eq!(b_meta.commits.lock().unwrap().len(), 1);
     assert!(a_meta.commits.lock().unwrap().is_empty());
-    // R56: the same failure can be reported twice to A's handle; it must be
-    // reported at least once and must never reach B.
+    // R56: the failure is reported to A's handle exactly once and never reaches B.
     let mut a_failures = 0;
     while let Err(error) = a_fs.fsync(&context(), a.handle, SyncMode::Full) {
         assert!(
@@ -1077,12 +1074,8 @@ fn p2_review_node_wide_poll_never_reports_another_inode_upload_error() {
             "{error}"
         );
         a_failures += 1;
-        assert!(
-            a_failures <= 2,
-            "one upload failure reported more than twice"
-        );
     }
-    assert!(a_failures >= 1);
+    assert_eq!(a_failures, 1);
     assert_eq!(a_meta.commits.lock().unwrap().len(), 1);
 }
 

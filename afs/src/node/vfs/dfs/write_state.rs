@@ -186,6 +186,9 @@ pub(super) struct PrepareCommitError {
 pub(super) struct ObservedWriteError {
     pub(super) cursor: u64,
     pub(super) error: Error,
+    /// Some caller has received this error. A new writer's session starts past
+    /// a delivered error and before an undelivered one (Linux errseq).
+    pub(super) delivered: bool,
 }
 
 pub(super) struct InodeOperationGuard {
@@ -424,6 +427,9 @@ impl DistributedFs {
         self.writes.get(inode_id)
     }
 
+    // The three predicates below deliberately ignore `background_error`: they
+    // all require no open writer and no pending work, so an undelivered error
+    // has no receiver yet and must not stop the next writer that will get it.
     pub(super) fn write_state_can_adopt_fresh_lease(state: &InodeWriteState) -> bool {
         state.open_writers == 0
             && !state.dirty
@@ -434,7 +440,6 @@ impl DistributedFs {
             && !state.commit_busy
             && !state.operation_busy
             && !state.last_writer_background_requested
-            && state.background_error.is_none()
             && state.terminal_error.is_none()
     }
 
@@ -449,7 +454,6 @@ impl DistributedFs {
             && state.in_flight.is_none()
             && !state.commit_busy
             && !state.operation_busy
-            && state.background_error.is_none()
             && state.terminal_error.is_none()
     }
 
@@ -462,7 +466,6 @@ impl DistributedFs {
             && !state.commit_busy
             && !state.operation_busy
             && !state.last_writer_background_requested
-            && state.background_error.is_none()
             && state.terminal_error.is_none()
     }
 
@@ -881,6 +884,7 @@ fn write_session(
         error_cursor: state
             .background_error
             .as_ref()
+            .filter(|error| error.delivered)
             .map_or(0, |error| error.cursor),
     }
 }

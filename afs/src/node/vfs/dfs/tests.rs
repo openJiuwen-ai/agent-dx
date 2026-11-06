@@ -1773,6 +1773,7 @@ impl RemoteDfsOwner for ScriptedReleaseRemoteDfsOwner {
 
 mod commit;
 mod dirty_index;
+mod error_delivery;
 mod grpc_meta;
 mod locks;
 mod misc;

@@ -842,6 +842,15 @@ impl DistributedFs {
                 }
                 Err(error) => Some(error.clone()),
             };
+            // Retain the failure on its inode before a waiter can see it on the
+            // upload: the waiter's barrier reports it from there, exactly once.
+            if let (Some(error), Some(cell)) = (&failure, upload.owner.upgrade()) {
+                let mut state = cell
+                    .lock()
+                    .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                Self::record_background_error_locked(&mut state, error.clone());
+                cell.notify_all();
+            }
             let mut state = upload
                 .state
                 .lock()
@@ -947,20 +956,6 @@ impl DistributedFs {
                     }
                 }
                 if let Some(error) = installed? {
-                    if let Some(cell) = upload.owner.upgrade() {
-                        let mut state = cell
-                            .lock()
-                            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-                        let cursor = state
-                            .background_error
-                            .as_ref()
-                            .map_or(1, |previous| previous.cursor.saturating_add(1));
-                        state.background_error = Some(ObservedWriteError {
-                            cursor,
-                            error: error.clone(),
-                        });
-                        cell.notify_all();
-                    }
                     first_error.get_or_insert(error);
                 }
             }
@@ -980,11 +975,19 @@ impl DistributedFs {
         Ok(())
     }
 
+    /// A barrier's wait for one upload. An earlier failed attempt was reported
+    /// through the inode's error cursor, so this barrier retries it; a failure
+    /// during this wait aborts the barrier, which reports it from that cursor.
     pub(super) fn wait_upload(&self, upload: &Arc<PipelineUpload>) -> Result<ChunkReceipt> {
+        upload
+            .state
+            .lock()
+            .map_err(|_| unavailable("native upload state is poisoned"))?
+            .error = None;
         loop {
             let _ = self.poll_uploads()?;
             {
-                let mut state = upload
+                let state = upload
                     .state
                     .lock()
                     .map_err(|_| unavailable("native upload state is poisoned"))?;
@@ -994,8 +997,8 @@ impl DistributedFs {
                 if let Some(receipt) = &state.receipt {
                     return Ok(receipt.receipt.clone());
                 }
-                if let Some(error) = state.error.take() {
-                    return Err(error);
+                if let Some(error) = &state.error {
+                    return Err(error.clone());
                 }
             }
             self.start_upload(upload)?;
@@ -1026,9 +1029,11 @@ impl DistributedFs {
                 let state = cell
                     .lock()
                     .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
-                state.native_due || state.last_writer_background_requested
+                state.terminal_error.is_none()
+                    && (state.native_due || state.last_writer_background_requested)
             };
             if due {
+                let retained = Self::retained_error_cursor(&cell)?;
                 match self.commit_inode(
                     &inode,
                     CommitReason::BACKGROUND,
@@ -1039,6 +1044,8 @@ impl DistributedFs {
                         committed += 1;
                     }
                     Ok(None) => {}
+                    // An upload failure was retained when it was harvested.
+                    Err(_) if Self::retained_error_cursor(&cell)? != retained => {}
                     Err(error) => self.record_background_error(&inode, error)?,
                 }
             }
