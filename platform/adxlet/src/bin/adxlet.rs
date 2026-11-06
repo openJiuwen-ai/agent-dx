@@ -73,6 +73,10 @@ struct Config {
     execd_command: Vec<String>,
     #[serde(default)]
     execd_env: HashMap<String, String>,
+    #[serde(default)]
+    network_baseline: Option<adxlet::network_baseline::NetworkBaseline>,
+    #[serde(default)]
+    platform_ingress_sources: Option<Vec<ipnet::Ipv4Net>>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -131,6 +135,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config: Config = read_config()?;
     let mut preserve =
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
+    if let Some(baseline) = &config.network_baseline {
+        baseline.validate()?;
+    }
+    if config
+        .platform_ingress_sources
+        .as_ref()
+        .is_some_and(|sources| sources.is_empty())
+    {
+        return Err("platform_ingress_sources must not be empty".into());
+    }
     if config.sandboxd_socket.is_none() && config.jiuwenbox.is_none() {
         return Err("configure sandboxd_socket and/or jiuwenbox".into());
     }
@@ -256,6 +270,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cwd: "/".into(),
         rpc_timeout: timeout,
         runtime_logs: Some(config.runtime_logs.clone()),
+        network_baseline: config.network_baseline,
+        platform_ingress_sources: config.platform_ingress_sources,
     };
     let jiuwenbox = match config.jiuwenbox {
         Some(backend) => Some(Jiuwenbox::connect(backend, runtime_config.clone()).await?),

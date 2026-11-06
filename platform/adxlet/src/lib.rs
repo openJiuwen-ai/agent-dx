@@ -11,6 +11,7 @@ pub mod jiuwenbox;
 pub mod journal;
 pub mod managed_mounts;
 pub mod metrics;
+pub mod network_baseline;
 pub mod node_reconciliation;
 pub mod proxy;
 pub mod readiness;
