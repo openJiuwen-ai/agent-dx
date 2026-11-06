@@ -50,6 +50,13 @@ def rows():
     return (shared / "logs/origin.jsonl").read_text().splitlines()
 
 
+def resource_snapshot():
+    return {
+        target: json.loads(execute(target, "python3", "/artifacts/scripts/process_resources.py"))
+        for target in ["mgmt", "worker-1", "worker-2", "worker-3", "worker-4"]
+    }
+
+
 for iteration in range(a.rounds):
     backends = a.backends
     backends = backends[iteration % len(backends) :] + backends[: iteration % len(backends)]
@@ -79,6 +86,7 @@ for iteration in range(a.rounds):
             ("peer", "worker-3", "10.203.0.22"),
             ("local", "worker-2", "10.203.0.21"),
         ]:
+            resources_before = resource_snapshot()
             begin = len(rows())
             case = f"{run_id}-{iteration}-{backend}-{state}"
             result = json.loads(
@@ -105,6 +113,8 @@ for iteration in range(a.rounds):
                 origin_blob_bytes=sum(r.get("bytes", 0) for r in blob_gets),
                 origin_blob_gets=len(blob_gets),
             )
+            result["resources_before"] = resources_before
+            result["resources_after"] = resource_snapshot()
             results.append(result)
             (root / "evidence" / a.output).write_text(
                 json.dumps(

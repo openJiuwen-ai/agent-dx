@@ -16,7 +16,7 @@ macOS 只运行编排；FUSE 和文件正文都在节点原生 `/workspace`。
    运行 `python3 ../nydus/prepare_tls.py "$TASK/artifacts/afs-tls" --four-workers`。
    **配置只有一个持久副本，专门区分缓存供数和持久副本；不是生产可靠性配置。**
 3. 按 [Nydus 实验](../nydus/README.md) 准备工具、Registry、观察代理和转换后的 fixture；
-   将其脚本与本目录 `bench_*.py` 复制到 `$TASK/artifacts/scripts/`。
+   将其脚本与本目录 `bench_*.py`、`process_resources.py` 复制到 `$TASK/artifacts/scripts/`。
 4. 用 `../nydus/run.py --workspace "$TASK" --adx-vm "$CLI" start ROLE`
    依次启动 meta、node-a、node-b、node-c、node-d。
 
