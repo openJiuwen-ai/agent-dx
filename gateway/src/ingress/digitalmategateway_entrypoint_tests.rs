@@ -110,7 +110,11 @@ async fn enabling_jiuwen_keeps_generic_agent_dispatch_on_both_listeners() {
                 .unwrap(),
             )),
     );
-    for security in [IngressSecurity::Plaintext, IngressSecurity::Tls] {
+    for security in [
+        IngressSecurity::Plaintext,
+        IngressSecurity::AuthenticatedHttp,
+        IngressSecurity::Tls,
+    ] {
         let (mut sender, server, client) = connection(gateway.clone(), security).await;
         for host in ["localhost", "generic.example"] {
             let response = sender
@@ -186,7 +190,11 @@ async fn jiuwen_auth_is_transport_independent_while_management_requires_tls() {
             )),
     );
     // The duplex fixture tests dispatcher policy, not a real TLS handshake.
-    for security in [IngressSecurity::Plaintext, IngressSecurity::Tls] {
+    for security in [
+        IngressSecurity::Plaintext,
+        IngressSecurity::AuthenticatedHttp,
+        IngressSecurity::Tls,
+    ] {
         let (mut sender, server, client) = connection(gateway.clone(), security).await;
         let mut spoofed = upgrade_request();
         spoofed.headers_mut().remove("authorization");
@@ -255,7 +263,8 @@ async fn jiuwen_auth_is_transport_independent_while_management_requires_tls() {
             response.status(),
             match security {
                 IngressSecurity::Plaintext => StatusCode::UPGRADE_REQUIRED,
-                IngressSecurity::Tls => StatusCode::UNAUTHORIZED,
+                IngressSecurity::Tls | IngressSecurity::AuthenticatedHttp =>
+                    StatusCode::UNAUTHORIZED,
             }
         );
         response.collect().await.unwrap();

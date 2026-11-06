@@ -28,6 +28,9 @@ pub struct Config {
     pub cwd: String,
     pub rpc_timeout: Duration,
     pub runtime_logs: Option<crate::runtime_logs::RuntimeLogPolicy>,
+    pub network_baseline: Option<crate::network_baseline::NetworkBaseline>,
+    /// None keeps legacy exceptions; configured CIDRs constrain host-originated control traffic.
+    pub platform_ingress_sources: Option<Vec<ipnet::Ipv4Net>>,
 }
 
 impl Default for Config {
@@ -39,6 +42,8 @@ impl Default for Config {
             cwd: "/".into(),
             rpc_timeout: Duration::from_secs(30),
             runtime_logs: None,
+            network_baseline: None,
+            platform_ingress_sources: None,
         }
     }
 }
@@ -852,13 +857,12 @@ pub fn start_request(
         ]),
         writable_layer_limit_bytes: disk_limit,
         extra_config: options.extra_config.clone(),
-        network_policy: options
-            .network
-            .as_ref()
-            .map(|policy| {
-                environment_network_policy(policy, &options.ports, options.tunnel_http_port, config)
-            })
-            .transpose()?,
+        network_policy: optional_network_policy(
+            options.network.as_ref(),
+            &options.ports,
+            options.tunnel_http_port,
+            config,
+        )?,
         inject_entrypoint: if options.inherit_entrypoint {
             image_process_config.into()
         } else {
@@ -965,6 +969,24 @@ fn environment_mount(value: &adx_core::execution::Mount) -> Result<proto::Mount>
     })
 }
 
+fn optional_network_policy(
+    value: Option<&adx_core::execution::NetworkPolicy>,
+    ports: &[u16],
+    tunnel_http_port: Option<u16>,
+    config: &Config,
+) -> Result<Option<proto::NetworkPolicy>> {
+    match (value, config.network_baseline.as_ref()) {
+        (Some(value), _) => {
+            environment_network_policy(value, ports, tunnel_http_port, config).map(Some)
+        }
+        (None, Some(baseline)) => {
+            environment_network_policy(&baseline.enforce(None)?, ports, tunnel_http_port, config)
+                .map(Some)
+        }
+        (None, None) => Ok(None),
+    }
+}
+
 pub(crate) fn environment_network_policy(
     value: &adx_core::execution::NetworkPolicy,
     ports: &[u16],
@@ -972,6 +994,31 @@ pub(crate) fn environment_network_policy(
     config: &Config,
 ) -> Result<proto::NetworkPolicy> {
     use adx_core::execution as model;
+    let enforced = config
+        .network_baseline
+        .as_ref()
+        .map(|baseline| baseline.enforce(Some(value)))
+        .transpose()?;
+    let value = enforced.as_ref().unwrap_or(value);
+    if config
+        .platform_ingress_sources
+        .as_ref()
+        .is_some_and(|sources| sources.is_empty())
+    {
+        return Err(Error::Invalid(
+            "platform_ingress_sources must not be empty".into(),
+        ));
+    }
+    if config.platform_ingress_sources.is_some()
+        && value
+            .traffic
+            .as_ref()
+            .is_none_or(|traffic| traffic.mode != model::TrafficMode::Stateful)
+    {
+        return Err(Error::Invalid(
+            "source-bounded platform exceptions require stateful traffic policy".into(),
+        ));
+    }
     model::ExecutionOptions {
         tunnel_http_port,
         ports: ports.to_vec(),
@@ -1035,46 +1082,64 @@ pub(crate) fn environment_network_policy(
         // Control traffic and declared public ports remain reachable under a
         // deny-by-default user policy. UINT32_MAX is reserved by the public
         // contract for these platform-owned rules.
+        let sources = config.platform_ingress_sources.as_ref().map_or_else(
+            || vec![proto::NetworkEndpoint::default()],
+            |sources| {
+                sources
+                    .iter()
+                    .map(|source| proto::NetworkEndpoint {
+                        cidr: source.to_string(),
+                        ..Default::default()
+                    })
+                    .collect()
+            },
+        );
         for port in std::iter::once(execd_port).chain(ports.iter().copied()) {
-            rules.push(proto::TrafficRule {
-                action: proto::NetworkPolicyAction::Allow as i32,
-                // Execd control replies must not depend on a conntrack entry
-                // from the previous policy generation. Stateless published
-                // ports also need an explicit return-path rule.
-                direction: if port == execd_port || traffic.mode == model::TrafficMode::Stateless {
-                    proto::NetworkDirection::Both as i32
-                } else {
-                    proto::NetworkDirection::Ingress as i32
-                },
-                protocol: proto::NetworkProtocol::Tcp as i32,
-                peer: Some(proto::NetworkEndpoint::default()),
-                // sandboxd schema v2 forbids the legacy scalar
-                // `sandbox_port`. An exact port is represented as a one-value
-                // range, including platform-owned EXECD and published-port
-                // exceptions.
-                sandbox_port_range: Some(proto::PortRange {
-                    first: u32::from(port),
-                    last: u32::from(port),
-                }),
-                priority: u32::MAX,
-                ..Default::default()
-            });
+            for source in &sources {
+                rules.push(proto::TrafficRule {
+                    action: proto::NetworkPolicyAction::Allow as i32,
+                    // Execd control replies must not depend on a conntrack entry
+                    // from the previous policy generation. Stateless published
+                    // ports also need an explicit return-path rule.
+                    direction: if config.platform_ingress_sources.is_none()
+                        && (port == execd_port || traffic.mode == model::TrafficMode::Stateless)
+                    {
+                        proto::NetworkDirection::Both as i32
+                    } else {
+                        proto::NetworkDirection::Ingress as i32
+                    },
+                    protocol: proto::NetworkProtocol::Tcp as i32,
+                    peer: Some(source.clone()),
+                    // sandboxd schema v2 forbids the legacy scalar
+                    // `sandbox_port`. An exact port is represented as a one-value
+                    // range, including platform-owned EXECD and published-port
+                    // exceptions.
+                    sandbox_port_range: Some(proto::PortRange {
+                        first: u32::from(port),
+                        last: u32::from(port),
+                    }),
+                    priority: u32::MAX,
+                    ..Default::default()
+                });
+            }
         }
         // Only a new inbound handshake may establish the tunnel return path.
         // A Both rule would allow arbitrary outbound TCP with this source port.
         if let Some(port) = tunnel_http_port {
-            rules.push(proto::TrafficRule {
-                action: proto::NetworkPolicyAction::Allow as i32,
-                direction: proto::NetworkDirection::Ingress as i32,
-                protocol: proto::NetworkProtocol::Tcp as i32,
-                peer: Some(proto::NetworkEndpoint::default()),
-                sandbox_port_range: Some(proto::PortRange {
-                    first: u32::from(port - 1),
-                    last: u32::from(port - 1),
-                }),
-                priority: u32::MAX,
-                ..Default::default()
-            });
+            for source in &sources {
+                rules.push(proto::TrafficRule {
+                    action: proto::NetworkPolicyAction::Allow as i32,
+                    direction: proto::NetworkDirection::Ingress as i32,
+                    protocol: proto::NetworkProtocol::Tcp as i32,
+                    peer: Some(source.clone()),
+                    sandbox_port_range: Some(proto::PortRange {
+                        first: u32::from(port - 1),
+                        last: u32::from(port - 1),
+                    }),
+                    priority: u32::MAX,
+                    ..Default::default()
+                });
+            }
         }
         // Execd initiates this connection. Preserve only the node-owned TCP
         // endpoint, including its replies under stateless policies. User env
@@ -1305,16 +1370,15 @@ impl RuntimeDriver for Sandboxd {
         let id = self.physical_id(runtime_id).await?.ok_or(Error::NotFound)?;
         self.client
             .clone()
-            .set_network_policy(
-                self.request(proto::SetNetworkPolicyRequest {
-                    sandbox_id: id,
-                    network_policy: policy
-                        .map(|value| {
-                            environment_network_policy(value, ports, tunnel_http_port, &self.config)
-                        })
-                        .transpose()?,
-                }),
-            )
+            .set_network_policy(self.request(proto::SetNetworkPolicyRequest {
+                sandbox_id: id,
+                network_policy: optional_network_policy(
+                    policy,
+                    ports,
+                    tunnel_http_port,
+                    &self.config,
+                )?,
+            }))
             .await
             .map_err(unavailable)?;
         Ok(())
@@ -1649,6 +1713,10 @@ mod tests {
         };
         let default_request = start_request(&spec, "i-7", 7, &[], &Config::default()).unwrap();
         assert!(!default_request.envs.contains_key("EXECD_HTTP_ONLY"));
+        assert!(
+            default_request.ports.is_empty(),
+            "ADX forwarding must not publish host DNAT ports"
+        );
         assert_eq!(default_request.envs["EXECD_HTTP_PORT"], "50090");
         let config = Config {
             env: HashMap::from([
@@ -1679,6 +1747,35 @@ mod tests {
             request.rootfs.unwrap().source,
             Some(proto::rootfs_config::Source::ImageUrl("image:tag".into()))
         );
+    }
+
+    #[test]
+    fn source_bounded_platform_rules_do_not_allow_outbound_source_port_bypass() {
+        use adx_core::execution::{NetworkAction, NetworkPolicy, TrafficMode, TrafficPolicy};
+        let mut policy = NetworkPolicy {
+            traffic: Some(TrafficPolicy {
+                ingress_default_action: NetworkAction::Deny,
+                egress_default_action: NetworkAction::Deny,
+                rules: Vec::new(),
+                mode: TrafficMode::Stateful,
+            }),
+            dns: None,
+        };
+        let config = Config {
+            platform_ingress_sources: Some(vec!["10.88.4.1/32".parse().unwrap()]),
+            ..Default::default()
+        };
+        let translated =
+            environment_network_policy(&policy, &[18092], Some(8766), &config).unwrap();
+        let rules = translated.traffic.unwrap().rules;
+        assert_eq!(rules.len(), 3);
+        for rule in rules {
+            assert_eq!(rule.direction, proto::NetworkDirection::Ingress as i32);
+            assert_eq!(rule.peer.unwrap().cidr, "10.88.4.1/32");
+        }
+        policy.traffic.as_mut().unwrap().mode = TrafficMode::Stateless;
+        assert!(environment_network_policy(&policy, &[], None, &config).is_err());
+        assert!(environment_network_policy(&policy, &[], None, &Config::default()).is_ok());
     }
     #[test]
     fn runtime_control_credentials_are_scoped_and_host_secret_is_not_injected() {

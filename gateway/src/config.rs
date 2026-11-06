@@ -18,6 +18,7 @@ pub const DEFAULT_CONTROL_PLANE_ROUTES: &str = "exact:/,exact:/healthz,prefix:/t
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IngressConfig {
     pub etcd_endpoints: Vec<String>,
+    pub listeners: Option<Vec<crate::ingress::ListenerConfig>>,
     pub tls_bind: SocketAddr,
     pub plain_bind: SocketAddr,
     pub health_bind: SocketAddr,
@@ -195,7 +196,29 @@ impl IngressConfig {
         let health_bind = parse_env("ADX_DATA_PLANE_INGRESS_HEALTH_BIND", "127.0.0.1:18080")?;
         let tls_cert = env::var("ADX_DATA_PLANE_INGRESS_TLS_CERT").unwrap_or_default();
         let tls_key = env::var("ADX_DATA_PLANE_INGRESS_TLS_KEY").unwrap_or_default();
-        if tls_cert.is_empty() || tls_key.is_empty() {
+        let listeners = match env::var("ADX_DATA_PLANE_INGRESS_LISTENERS") {
+            Ok(value) => {
+                let values: Vec<crate::ingress::ListenerConfig> = serde_json::from_str(&value)
+                    .map_err(|error| {
+                        ConfigError::Invalid(format!("invalid Ingress listeners: {error}"))
+                    })?;
+                if values.is_empty() {
+                    return Err(ConfigError::Invalid(
+                        "at least one Ingress listener required".into(),
+                    ));
+                }
+                for listener in &values {
+                    listener.validate().map_err(ConfigError::Invalid)?;
+                }
+                Some(values)
+            }
+            Err(env::VarError::NotPresent) => None,
+            Err(error) => return Err(ConfigError::Invalid(format!("Ingress listeners: {error}"))),
+        };
+        let needs_tls = listeners
+            .as_ref()
+            .is_none_or(|values| values.iter().any(|listener| listener.tls));
+        if needs_tls && (tls_cert.is_empty() || tls_key.is_empty()) {
             return Err(ConfigError::Invalid(
                 "Ingress TLS listener requires a certificate and key".into(),
             ));
@@ -393,6 +416,7 @@ impl IngressConfig {
         }
         Ok(Self {
             etcd_endpoints,
+            listeners,
             tls_bind,
             plain_bind,
             health_bind,
@@ -435,6 +459,25 @@ impl IngressConfig {
             etcd_tls_domain,
             etcd_username,
             etcd_password,
+        })
+    }
+
+    pub fn listener_options(&self) -> Vec<crate::ingress::ListenerConfig> {
+        self.listeners.clone().unwrap_or_else(|| {
+            vec![
+                crate::ingress::ListenerConfig {
+                    listen: self.tls_bind,
+                    tls: true,
+                    allow_http_credentials: false,
+                    allowed_routes: None,
+                },
+                crate::ingress::ListenerConfig {
+                    listen: self.plain_bind,
+                    tls: false,
+                    allow_http_credentials: false,
+                    allowed_routes: None,
+                },
+            ]
         })
     }
 
@@ -655,6 +698,42 @@ fn fd_based_stream_budget() -> Result<usize, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_http_listener_limits_methods_and_route_boundaries() {
+        let listener: crate::ingress::ListenerConfig = serde_json::from_value(serde_json::json!({
+            "listen": "10.88.0.1:8080",
+            "allow_http_credentials": true,
+            "allowed_routes": [{"method": "POST", "path": "prefix:/api/environment/v1/environments"}]
+        })).unwrap();
+        listener.validate().unwrap();
+        assert!(listener.allows(&http::Method::POST, "/api/environment/v1/environments"));
+        assert!(listener.allows(
+            &http::Method::POST,
+            "/api/environment/v1/environments/tool-a"
+        ));
+        assert!(!listener.allows(
+            &http::Method::DELETE,
+            "/api/environment/v1/environments/tool-a"
+        ));
+        assert!(!listener.allows(
+            &http::Method::POST,
+            "/api/environment/v1/environments-admin"
+        ));
+        assert!(!listener.allows(&http::Method::POST, "/api/admin/v1/keys"));
+    }
+
+    #[test]
+    fn explicit_listener_configuration_rejects_invalid_security_and_routes() {
+        for value in [
+            serde_json::json!({"listen":"127.0.0.1:8080", "tls":true, "allow_http_credentials":true}),
+            serde_json::json!({"listen":"127.0.0.1:8080", "allowed_routes":[{"path":"prefix:/"}]}),
+            serde_json::json!({"listen":"127.0.0.1:8080", "allowed_routes":[{"method":"bad method", "path":"exact:/"}]}),
+        ] {
+            let listener: crate::ingress::ListenerConfig = serde_json::from_value(value).unwrap();
+            assert!(listener.validate().is_err());
+        }
+    }
 
     #[test]
     fn parses_and_normalizes_etcd_endpoints() {
