@@ -140,6 +140,15 @@ def _validate_command_id(command_id: str) -> str:
     return command_id
 
 
+def _incomplete_terminal_result(snapshot: dict) -> bool:
+    return (
+        str(snapshot.get("status", "")).upper() in ("SUCCEEDED", "FAILED")
+        and snapshot.get("exit_code") is None
+        and not snapshot.get("error_code")
+        and snapshot.get("exit_signal") is None
+    )
+
+
 def _result(snapshot: dict) -> CommandResult:
     raw_status = snapshot.get("status")
     if raw_status is None:
@@ -246,7 +255,7 @@ class CommandHandle:
     def _snapshot(self) -> CommandInfo:
         return _info(self._raw_snapshot())
 
-    def _raw_snapshot(self) -> dict:
+    def _fetch_snapshot(self) -> dict:
         try:
             snapshot = self._client.invoke(self._sid, "process.get", {"command_id": self.command_id})
         except EnvironmentHTTPError as error:
@@ -267,6 +276,25 @@ class CommandHandle:
                 command_id=self.command_id,
                 request_id=getattr(snapshot, "request_id", None),
             )
+        return snapshot
+
+    def _raw_snapshot(self) -> dict:
+        snapshot = self._fetch_snapshot()
+        if _incomplete_terminal_result(snapshot):
+            # Older Execd can observe completion between copying the exit code
+            # and serializing status. Read the same stable command once more;
+            # never infer exit zero or submit the command again.
+            snapshot = self._fetch_snapshot()
+            if _incomplete_terminal_result(snapshot):
+                raise EnvironmentError(
+                    f"command {self.command_id} has a terminal status without an exit code after reread",
+                    code="COMMAND_RESULT_INCONSISTENT",
+                    retry="never",
+                    outcome="unknown",
+                    operation_id=self.command_id,
+                    environment_id=self._sid,
+                    request_id=getattr(snapshot, "request_id", None),
+                )
         info = _info(snapshot)
         if info.pid:
             self.pid = info.pid

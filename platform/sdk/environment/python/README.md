@@ -734,6 +734,13 @@ fail explicitly.
 
 ## Recover a background command
 
+Command handles read the authoritative result by stable command ID. If an older
+runtime returns normal terminal status with a missing exit code, the SDK reads
+that same ID once more; it does not infer success or submit the command again.
+A second inconsistent response raises `COMMAND_RESULT_INCONSISTENT` with unknown
+outcome, preserving the environment and command operation identities. Legitimate
+signal, timeout and spawn-failure results retain their nullable exit-code contract.
+
 Background commands run without an execution deadline by default. Pass
 `timeout` to set one explicitly; foreground commands default to 60 seconds.
 
