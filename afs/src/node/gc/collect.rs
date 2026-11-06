@@ -112,8 +112,13 @@ impl Collector {
         }
     }
 
-    /// A pass with collection switched off: releases only (`fault::experiment`).
-    #[cfg(feature = "diagnostics")]
+    /// Resolves when dropped pins should be released before the next pass.
+    pub(crate) async fn release_wanted(&self) {
+        self.references.release_wanted().await;
+    }
+
+    /// Releases only: a wake from the dropped-pin backlog, or a pass with
+    /// collection switched off (`fault::experiment`).
     pub(crate) fn flush_references(&self) -> Result<usize> {
         let _gate = self
             .gate
@@ -220,7 +225,7 @@ mod tests {
         fn retain(&self, _: &str, _: &InodeId, _: Option<&FileVersionId>) -> Result<()> {
             Ok(())
         }
-        fn release(&self, _: &str) -> Result<()> {
+        fn release(&self, _: &[String]) -> Result<()> {
             Ok(())
         }
         fn collect(&self, completed: u64, inventory: Vec<ChunkObject>) -> Result<GcState> {
@@ -331,7 +336,7 @@ mod tests {
         fn retain(&self, _: &str, _: &InodeId, _: Option<&FileVersionId>) -> Result<()> {
             Ok(())
         }
-        fn release(&self, _: &str) -> Result<()> {
+        fn release(&self, _: &[String]) -> Result<()> {
             Ok(())
         }
         fn collect(&self, completed: u64, inventory: Vec<ChunkObject>) -> Result<GcState> {

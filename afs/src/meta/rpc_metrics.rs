@@ -25,6 +25,7 @@ const META_RPCS: &[&str] = &[
     "afs.meta.v1.OwnerRoots/AckRevocation",
     "afs.meta.v1.OwnerRoots/RecoverRoot",
     "afs.meta.v1.DfsMeta/UpdateGcReference",
+    "afs.meta.v1.DfsMeta/ReleaseGcReferences",
     "afs.meta.v1.DfsMeta/CollectGarbage",
     "afs.meta.v1.DfsMeta/Lookup",
     "afs.meta.v1.DfsMeta/Create",

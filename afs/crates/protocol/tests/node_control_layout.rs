@@ -76,5 +76,5 @@ fn service_paths_keep_the_package() {
 /// Nodes are refused at registration instead of failing per call at runtime.
 #[test]
 fn cluster_protocol_generation_includes_the_split_layout() {
-    assert_eq!(CLUSTER_PROTOCOL_VERSION, 2);
+    assert_eq!(CLUSTER_PROTOCOL_VERSION, 4);
 }

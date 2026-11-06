@@ -388,6 +388,7 @@ message RecoverRootReply {
 // after local or replicated ChunkStore writes have produced durable receipts.
 service DfsMeta {
   rpc UpdateGcReference(UpdateDfsGcReferenceRequest) returns (UpdateDfsGcReferenceReply);
+  rpc ReleaseGcReferences(ReleaseDfsGcReferencesRequest) returns (ReleaseDfsGcReferencesReply);
   rpc CollectGarbage(CollectDfsGarbageRequest) returns (CollectDfsGarbageReply);
   rpc Lookup(DfsLookupRequest) returns (DfsLookupReply);
   rpc Create(DfsCreateRequest) returns (DfsCreateReply);
@@ -1264,7 +1265,7 @@ message UpdateDfsGcReferenceRequest {
   string version_id = 5;
   bool publication = 6;
   repeated DfsChunkObject chunks = 7;
-  bool release = 8;
+  reserved 8;
   // Fixed by the sender; a replay never refreshes this admission deadline.
   uint64 admission_deadline_unix_ms = 9;
   // Capture once before the caller starts producing native receipts.
@@ -1272,6 +1273,14 @@ message UpdateDfsGcReferenceRequest {
   reserved 11, 12;
 }
 message UpdateDfsGcReferenceReply { DfsGcFence gc_fence = 1; }
+// One transaction retires every listed reference of this session; a reference
+// Meta has not seen yet gets a tombstone that fences its late admission.
+message ReleaseDfsGcReferencesRequest {
+  string node_id = 1;
+  string session_id = 2;
+  repeated string reference_ids = 3;
+}
+message ReleaseDfsGcReferencesReply {}
 message CollectDfsGarbageRequest {
   string node_id = 1;
   string session_id = 2;

@@ -28,6 +28,13 @@ pub(crate) struct Reaper {
     collector: Option<Arc<Collector>>,
 }
 
+/// What one loop iteration runs. A release wake never plans or collects.
+#[derive(Clone, Copy)]
+enum PassKind {
+    Collect,
+    Release,
+}
+
 impl Reaper {
     pub(crate) fn new(collector: Option<Arc<Collector>>) -> Self {
         Self { collector }
@@ -37,22 +44,43 @@ impl Reaper {
     pub(crate) fn start(self, services: &mut Services) {
         let stop = services.stop.subscribe();
         let collector = self.collector;
-        services.spawn(run_reaper_loop(stop, move || {
-            collector.as_ref().map_or(Ok(0), |collector| {
-                #[cfg(feature = "diagnostics")]
-                if super::experiment::gc_collection_off() {
-                    return collector.flush_references();
+        let waking = collector.clone();
+        services.spawn(run_reaper_loop(
+            stop,
+            move || {
+                let waking = waking.clone();
+                async move {
+                    match waking {
+                        Some(collector) => collector.release_wanted().await,
+                        None => std::future::pending().await,
+                    }
                 }
-                collector.collect_once()
-            })
-        }));
+            },
+            move |kind| {
+                collector.as_ref().map_or(Ok(0), |collector| match kind {
+                    PassKind::Release => collector.flush_references(),
+                    PassKind::Collect => {
+                        #[cfg(feature = "diagnostics")]
+                        if super::experiment::gc_collection_off() {
+                            return collector.flush_references();
+                        }
+                        collector.collect_once()
+                    }
+                })
+            },
+        ));
     }
 }
 
-async fn run_reaper_loop(
+async fn run_reaper_loop<W, F>(
     stop: tokio::sync::watch::Receiver<bool>,
-    pass: impl Fn() -> Result<usize> + Send + Sync + 'static,
-) -> ServiceResult {
+    release_wanted: W,
+    pass: impl Fn(PassKind) -> Result<usize> + Send + Sync + 'static,
+) -> ServiceResult
+where
+    W: Fn() -> F,
+    F: std::future::Future<Output = ()>,
+{
     let pass = Arc::new(pass);
     let mut tick = tokio::time::interval(REAPER_PERIOD);
     let shutdown = cancelled(stop);
@@ -60,9 +88,14 @@ async fn run_reaper_loop(
     loop {
         tokio::select! {
             _ = &mut shutdown => return Ok(()),
-            _ = tick.tick() => {
+            kind = async {
+                tokio::select! {
+                    _ = tick.tick() => PassKind::Collect,
+                    () = release_wanted() => PassKind::Release,
+                }
+            } => {
                 let pass = pass.clone();
-                match crate::node::bridge::spawn_blocking(move || pass()).await {
+                match crate::node::bridge::spawn_blocking(move || pass(kind)).await {
                     Ok(Ok(count)) if count > 0 => afs_logging::info!("dfs.gc_collected"; "chunks" => count),
                     Ok(Ok(_)) => {}
                     Ok(Err(error)) => afs_logging::warn!("dfs.gc_retry"; "error" => error.to_string()),
@@ -83,7 +116,7 @@ mod tests {
         let (stop, rx) = tokio::sync::watch::channel(false);
         let passes = Arc::new(AtomicUsize::new(0));
         let counted = passes.clone();
-        let service = tokio::spawn(run_reaper_loop(rx, move || {
+        let service = tokio::spawn(run_reaper_loop(rx, std::future::pending, move |_| {
             counted.fetch_add(1, Ordering::SeqCst);
             Err(afs_error::Error::coded(
                 afs_error::NODE_STORAGE_INVALID,
@@ -95,6 +128,40 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert!(!service.is_finished());
+        stop.send(true).unwrap();
+        assert!(service.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_release_wake_flushes_without_a_collection_pass() {
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = seen.clone();
+        let waiter = wake.clone();
+        let service = tokio::spawn(run_reaper_loop(
+            rx,
+            move || {
+                let waiter = waiter.clone();
+                async move { waiter.notified().await }
+            },
+            move |kind| {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(matches!(kind, PassKind::Collect));
+                Ok(0)
+            },
+        ));
+        // The first interval tick is the collection pass.
+        while seen.lock().unwrap().is_empty() {
+            tokio::task::yield_now().await;
+        }
+        wake.notify_one();
+        while seen.lock().unwrap().len() < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(*seen.lock().unwrap(), vec![true, false]);
         stop.send(true).unwrap();
         assert!(service.await.unwrap().is_ok());
     }

@@ -10,7 +10,7 @@ impl crate::node::gc::GcControl for GrpcDfsMeta {
         inode: &crate::dfs::InodeId,
         version: Option<&crate::dfs::FileVersionId>,
     ) -> Result<()> {
-        self.update_gc(id, Some(inode), version, false, false)
+        self.update_gc(id, inode, version, false, false).map(|_| ())
     }
     fn retain_fenced(
         &self,
@@ -18,7 +18,7 @@ impl crate::node::gc::GcControl for GrpcDfsMeta {
         inode: &crate::dfs::InodeId,
         version: Option<&crate::dfs::FileVersionId>,
     ) -> Result<crate::dfs::GcFence> {
-        self.update_gc_with_fence(id, Some(inode), version, true, false, true)?
+        self.update_gc(id, inode, version, true, true)?
             .ok_or_else(|| {
                 Error::coded(
                     afs_error::NODE_VFS_UNIMPLEMENTED,
@@ -26,8 +26,17 @@ impl crate::node::gc::GcControl for GrpcDfsMeta {
                 )
             })
     }
-    fn release(&self, id: &str) -> Result<()> {
-        self.update_gc(id, None, None, false, true)
+    fn release(&self, ids: &[String]) -> Result<()> {
+        let mut client =
+            afs_protocol::meta::dfs_meta_client::DfsMetaClient::new(self.channel.clone());
+        self.run(client.release_gc_references(
+            afs_protocol::meta::ReleaseDfsGcReferencesRequest {
+                node_id: self.node_id.clone(),
+                session_id: self.session_id.clone(),
+                reference_ids: ids.to_vec(),
+            },
+        ))?;
+        Ok(())
     }
     fn collect(
         &self,
@@ -78,22 +87,9 @@ impl GrpcDfsMeta {
     fn update_gc(
         &self,
         id: &str,
-        inode: Option<&crate::dfs::InodeId>,
+        inode: &crate::dfs::InodeId,
         version: Option<&crate::dfs::FileVersionId>,
         publication: bool,
-        release: bool,
-    ) -> Result<()> {
-        self.update_gc_with_fence(id, inode, version, publication, release, false)
-            .map(|_| ())
-    }
-
-    fn update_gc_with_fence(
-        &self,
-        id: &str,
-        inode: Option<&crate::dfs::InodeId>,
-        version: Option<&crate::dfs::FileVersionId>,
-        publication: bool,
-        release: bool,
         capture_gc_fence: bool,
     ) -> Result<Option<crate::dfs::GcFence>> {
         let mut client =
@@ -105,17 +101,12 @@ impl GrpcDfsMeta {
                     node_id: self.node_id.clone(),
                     session_id: self.session_id.clone(),
                     reference_id: id.into(),
-                    admission_deadline_unix_ms: if inode.is_some() && !release {
-                        crate::clock::now_unix_ms().saturating_add(30_000)
-                    } else {
-                        0
-                    },
-                    inode_id: inode.map(|id| id.0.clone()).unwrap_or_default(),
+                    admission_deadline_unix_ms: crate::clock::now_unix_ms().saturating_add(30_000),
+                    inode_id: inode.0.clone(),
                     version_id: version.map(|id| id.0.clone()).unwrap_or_default(),
                     publication,
                     // Per-chunk publication references were removed (R33).
                     chunks: Vec::new(),
-                    release,
                 }),
             )?
             .into_inner();

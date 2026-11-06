@@ -397,10 +397,80 @@ fn update(id: &str) -> UpdateGcReference {
         inode_id: Some(InodeId::new("i")),
         version_id: None,
         publication: true,
-        release: false,
         admission_deadline_unix_ms: now_unix_ms().saturating_add(30_000),
     }
 }
+#[tokio::test]
+async fn one_release_call_retires_a_batch_in_one_transaction() {
+    let (store, _) = seeded_store(vec![inode("i", 1, "v")]).await;
+    let service = DfsService::new(store.clone());
+    for id in ["a", "b"] {
+        service.update_gc_reference(update(id)).await.unwrap();
+    }
+    let before = store.read_view().await.unwrap().snapshot().unwrap().0;
+    service
+        .release_gc_references(
+            "n".into(),
+            "s".into(),
+            vec!["a".into(), "b".into(), "never-admitted".into()],
+        )
+        .await
+        .unwrap();
+    let (after, entities) = store.read_view().await.unwrap().snapshot().unwrap();
+    assert_eq!(after.0, before.0 + 1, "one transaction for the whole batch");
+    let retired = entities
+        .iter()
+        .filter_map(|entity| match entity {
+            MetaEntity::DfsReference(reference) => Some(reference),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(retired.len(), 3);
+    assert!(retired.iter().all(|r| r.retired_at_unix_ms.is_some()));
+    // A retried batch changes nothing; the tombstone fences a late admission.
+    service
+        .release_gc_references(
+            "n".into(),
+            "s".into(),
+            vec!["a".into(), "b".into(), "never-admitted".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store.read_view().await.unwrap().snapshot().unwrap().0,
+        after,
+        "a retry writes nothing"
+    );
+    assert!(
+        service
+            .update_gc_reference(update("never-admitted"))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn a_release_batch_stays_bounded_and_needs_the_current_session() {
+    let (store, _) = seeded_store(vec![inode("i", 1, "v")]).await;
+    let service = DfsService::new(store.clone());
+    let too_many = (0..=MAX_RELEASE_BATCH)
+        .map(|i| format!("open:{i}"))
+        .collect();
+    assert!(
+        service
+            .release_gc_references("n".into(), "s".into(), too_many)
+            .await
+            .is_err()
+    );
+    assert!(
+        service
+            .release_gc_references("n".into(), "stale".into(), vec!["a".into()])
+            .await
+            .is_err(),
+        "a replaced session releases nothing; its references retire with the session"
+    );
+}
+
 fn pending_reference(id: &str) -> MetaEntity {
     MetaEntity::DfsReference(GcReference {
         open_read: None,
@@ -478,9 +548,10 @@ async fn reference_conditions_reject_release_collection_and_session_fences() {
         let conditions = admission_conditions(&view, "late-reader");
         match fence {
             "release" => {
-                let mut release = update("late-reader");
-                release.release = true;
-                service.update_gc_reference(release).await.unwrap();
+                service
+                    .release_gc_references("n".into(), "s".into(), vec!["late-reader".into()])
+                    .await
+                    .unwrap();
             }
             "collection" => {
                 service
@@ -692,10 +763,10 @@ async fn release_before_delayed_admission_is_a_durable_rejection() {
     use crate::meta::store::Store;
     let (store, backend) = seeded_store(vec![inode("i", 1, "v")]).await;
     let service = DfsService::new(store.clone());
-    let mut release = update("late-open");
-    release.release = true;
-    release.inode_id = None;
-    service.update_gc_reference(release).await.unwrap();
+    service
+        .release_gc_references("n".into(), "s".into(), vec!["late-open".into()])
+        .await
+        .unwrap();
     drop(service);
     drop(store);
     let service = DfsService::new(Arc::new(Store::open_log(backend).await.unwrap()));
@@ -712,10 +783,10 @@ async fn release_before_delayed_admission_is_a_durable_rejection() {
 async fn expired_delayed_admission_cannot_reappear_after_tombstone_collection() {
     let (store, _) = seeded_store(vec![inode("i", 1, "v")]).await;
     let service = DfsService::new(store.clone()).with_gc_grace_ms(0);
-    let mut release = update("late-open");
-    release.release = true;
-    release.inode_id = None;
-    service.update_gc_reference(release).await.unwrap();
+    service
+        .release_gc_references("n".into(), "s".into(), vec!["late-open".into()])
+        .await
+        .unwrap();
     service
         .collect_garbage("n".into(), "s".into(), 0, vec![])
         .await

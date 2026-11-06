@@ -16,9 +16,7 @@ impl DfsMetaService for DfsMetaRpc {
             // generation reference protects its chunks instead.
             return Err(invalid("GC references no longer carry chunks"));
         }
-        if request.capture_gc_fence
-            && (request.release || !request.publication || request.inode_id.is_empty())
-        {
+        if request.capture_gc_fence && (!request.publication || request.inode_id.is_empty()) {
             return Err(Status::invalid_argument(
                 "GC fence requires initial publication retain",
             ));
@@ -26,9 +24,7 @@ impl DfsMetaService for DfsMetaRpc {
         if request.capture_gc_fence && !request.reference_id.starts_with("write:") {
             return Err(invalid("GC fence capture requires a write: reference"));
         }
-        let observation = if request.release {
-            "dfs_gc_release"
-        } else if request.capture_gc_fence {
+        let observation = if request.capture_gc_fence {
             "dfs_gc_capture"
         } else {
             "dfs_gc_retain"
@@ -42,7 +38,6 @@ impl DfsMetaService for DfsMetaRpc {
                 inode_id: optional_id(request.inode_id).map(crate::dfs::InodeId::new),
                 version_id: optional_id(request.version_id).map(crate::dfs::FileVersionId::new),
                 publication: request.publication,
-                release: request.release,
                 admission_deadline_unix_ms: request.admission_deadline_unix_ms,
             })
             .await
@@ -52,6 +47,22 @@ impl DfsMetaService for DfsMetaRpc {
         self.0.observability.record("meta", observation, true);
         Ok(Response::new(
             afs_protocol::meta::UpdateDfsGcReferenceReply { gc_fence },
+        ))
+    }
+    async fn release_gc_references(
+        &self,
+        request: Request<afs_protocol::meta::ReleaseDfsGcReferencesRequest>,
+    ) -> Result<Response<afs_protocol::meta::ReleaseDfsGcReferencesReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.node_id)?;
+        dfs_service(&self.0)?
+            .release_gc_references(request.node_id, request.session_id, request.reference_ids)
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        self.0.observability.record("meta", "dfs_gc_release", true);
+        Ok(Response::new(
+            afs_protocol::meta::ReleaseDfsGcReferencesReply {},
         ))
     }
     async fn collect_garbage(

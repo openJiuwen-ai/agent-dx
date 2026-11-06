@@ -11,6 +11,9 @@ const MAX_CHUNKS: usize = 1024;
 const GC_DURATION_BUCKETS: [f64; 12] = [
     0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 15.0, 60.0, 300.0, 1800.0,
 ];
+/// Most references one release call retires. One call is one transaction, so
+/// this also bounds the size of its log record.
+pub const MAX_RELEASE_BATCH: usize = 1024;
 /// Maximum admission horizon update_gc_reference accepts beyond the current
 /// time (the "60s cleanup fence"). A replay of an abandoned admission can
 /// only be accepted while its original deadline is still in this window.
@@ -357,6 +360,17 @@ fn reference_entity(
     });
     Ok(snapshot.entity)
 }
+/// On the wire a `write:` reference names its timestamped operation, which fixes
+/// admission age. The stored id is the hash immutable chunk identities address.
+fn stored_reference_id(id: &str) -> String {
+    match id.strip_prefix("write:") {
+        Some(operation) => format!(
+            "write:{}",
+            ChunkObject::generation_id(&OperationId::new(operation))
+        ),
+        None => id.to_owned(),
+    }
+}
 fn ref_key(node: &str, session: &str, id: &str) -> MetaKey {
     MetaKey::DfsReference {
         node_id: node.into(),
@@ -410,12 +424,7 @@ impl DfsService {
             .reference_id
             .strip_prefix("write:")
             .map(str::to_owned);
-        if let Some(operation) = &write_operation {
-            update.reference_id = format!(
-                "write:{}",
-                ChunkObject::generation_id(&OperationId::new(operation))
-            );
-        }
+        update.reference_id = stored_reference_id(&update.reference_id);
         let key = ref_key(&update.node_id, &update.session_id, &update.reference_id);
         let mut hasher = DefaultHasher::new();
         key.hash(&mut hasher);
@@ -444,33 +453,8 @@ impl DfsService {
                 Some(MetaEntity::DfsReference(reference)) => Some(reference),
                 _ => None,
             };
-            let mut reference = if let Some(reference) = existing {
+            let reference = if let Some(reference) = existing {
                 reference
-            } else if update.release {
-                // Persist a tombstone even when admission has not become visible.
-                // This CAS fences a queued/lost-reply retain on the same key.
-                let tombstone = GcReference {
-                    open_read: None,
-
-                    node_id: update.node_id.clone(),
-                    session_id: update.session_id.clone(),
-                    reference_id: update.reference_id.clone(),
-                    inode_id: None,
-                    publication: false,
-                    chunks: Vec::new(),
-                    retired_at_unix_ms: Some(now_unix_ms()),
-                };
-                if self
-                    .gc_commit_checked(
-                        conditions,
-                        StoreOperation::DfsUpdateReference,
-                        vec![TxnMutation::Put(MetaEntity::DfsReference(tombstone))],
-                    )
-                    .await?
-                {
-                    return Ok(());
-                }
-                continue;
             } else {
                 let now = now_unix_ms();
                 if update.admission_deadline_unix_ms <= now {
@@ -529,23 +513,15 @@ impl DfsService {
                 }
             };
             if reference.retired_at_unix_ms.is_some() {
-                return if update.release {
-                    Ok(())
-                } else {
-                    Err(conflict("retired reference cannot be reused"))
-                };
+                return Err(conflict("retired reference cannot be reused"));
             }
-            if !update.release
-                && (update
-                    .inode_id
-                    .as_ref()
-                    .is_some_and(|inode| reference.inode_id.as_ref() != Some(inode))
-                    || update.publication != reference.publication)
+            if update
+                .inode_id
+                .as_ref()
+                .is_some_and(|inode| reference.inode_id.as_ref() != Some(inode))
+                || update.publication != reference.publication
             {
                 return Err(invalid("reference identity was reused for another access"));
-            }
-            if update.release {
-                reference.retired_at_unix_ms = Some(now_unix_ms());
             }
             let mutations = vec![TxnMutation::Put(MetaEntity::DfsReference(reference))];
             if self
@@ -556,6 +532,82 @@ impl DfsService {
             }
         }
         Err(conflict("GC reference admission contention"))
+    }
+    /// Retires `reference_ids` of this session in one transaction: one log
+    /// record however many there are. A reference Meta has not seen gets a
+    /// tombstone that fences a queued or lost-reply admission of the same key;
+    /// one already retired stays as it is, so a retried batch is idempotent.
+    /// Keys are not shard-locked: a racing admission of the same key loses on
+    /// the per-key conditions, whichever transaction commits first.
+    pub async fn release_gc_references(
+        &self,
+        node_id: String,
+        session_id: String,
+        reference_ids: Vec<String>,
+    ) -> Result<()> {
+        require_id(&node_id, "node_id")?;
+        require_id(&session_id, "session_id")?;
+        if reference_ids.len() > MAX_RELEASE_BATCH {
+            return Err(invalid("GC release batch too large"));
+        }
+        let mut keys = BTreeSet::new();
+        for id in &reference_ids {
+            require_id(id, "reference_id")?;
+            keys.insert(ref_key(&node_id, &session_id, &stored_reference_id(id)));
+        }
+        if keys.is_empty() {
+            return Ok(());
+        }
+        for _ in 0..64 {
+            let view = self.store.read_view().await?;
+            let caller = view
+                .lookup(&MetaKey::CurrentNodeSession {
+                    node_id: node_id.clone(),
+                })?
+                .entity;
+            live_caller(caller.as_slice(), &node_id, &session_id)?;
+            let mut conditions = vec![TxnCondition::NodeSessionCurrent {
+                node_id: node_id.clone(),
+                session_id: session_id.clone(),
+            }];
+            let now = now_unix_ms();
+            let mut mutations = Vec::new();
+            for key in &keys {
+                let reference = match reference_entity(&view, key.clone(), &mut conditions)? {
+                    Some(MetaEntity::DfsReference(reference)) => reference,
+                    Some(_) => return Err(invalid("GC reference key holds another entity")),
+                    None => {
+                        let MetaKey::DfsReference { reference_id, .. } = key else {
+                            return Err(invalid("GC release key is not a reference"));
+                        };
+                        GcReference {
+                            open_read: None,
+                            node_id: node_id.clone(),
+                            session_id: session_id.clone(),
+                            reference_id: reference_id.clone(),
+                            inode_id: None,
+                            publication: false,
+                            chunks: Vec::new(),
+                            retired_at_unix_ms: None,
+                        }
+                    }
+                };
+                if reference.retired_at_unix_ms.is_none() {
+                    mutations.push(TxnMutation::Put(MetaEntity::DfsReference(GcReference {
+                        retired_at_unix_ms: Some(now),
+                        ..reference
+                    })));
+                }
+            }
+            if mutations.is_empty()
+                || self
+                    .gc_commit_checked(conditions, StoreOperation::DfsUpdateReference, mutations)
+                    .await?
+            {
+                return Ok(());
+            }
+        }
+        Err(conflict("GC reference release contention"))
     }
     async fn gc_commit(
         &self,

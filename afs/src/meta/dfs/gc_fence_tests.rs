@@ -39,21 +39,24 @@ async fn generation_fixture() -> Fixture {
     f.commit.layout_root.inline_extents[0].chunk_id = staged.chunk.id.clone();
     f.staged = staged;
     f.service
-        .update_gc_reference(generation_admission(&f, false))
+        .update_gc_reference(generation_admission(&f))
         .await
         .unwrap();
     f
 }
 
-fn generation_admission(f: &Fixture, release: bool) -> crate::dfs::UpdateGcReference {
+fn generation_reference_id(f: &Fixture) -> String {
+    format!("write:{}", f.commit.operation_id.0)
+}
+
+fn generation_admission(f: &Fixture) -> crate::dfs::UpdateGcReference {
     crate::dfs::UpdateGcReference {
         node_id: "writer".into(),
         session_id: "writer-session".into(),
-        reference_id: format!("write:{}", f.commit.operation_id.0),
+        reference_id: generation_reference_id(f),
         inode_id: Some(f.commit.inode_id.clone()),
         version_id: None,
         publication: true,
-        release,
         admission_deadline_unix_ms: now_unix_ms().saturating_add(30_000),
     }
 }
@@ -88,7 +91,7 @@ async fn generation_commit_survives_unrelated_gc_and_reply_loss() {
     assert_eq!(committed, replay);
     assert!(
         f.service
-            .update_gc_reference(generation_admission(&f, false))
+            .update_gc_reference(generation_admission(&f))
             .await
             .is_err(),
         "finished generations cannot be readmitted"
@@ -99,7 +102,11 @@ async fn generation_commit_survives_unrelated_gc_and_reply_loss() {
 async fn generation_retirement_prevents_late_commit_and_readmission() {
     let f = generation_fixture().await;
     f.service
-        .update_gc_reference(generation_admission(&f, true))
+        .release_gc_references(
+            "writer".into(),
+            "writer-session".into(),
+            vec![generation_reference_id(&f)],
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -112,7 +119,7 @@ async fn generation_retirement_prevents_late_commit_and_readmission() {
     );
     assert!(
         f.service
-            .update_gc_reference(generation_admission(&f, false))
+            .update_gc_reference(generation_admission(&f))
             .await
             .is_err()
     );
@@ -133,14 +140,18 @@ async fn generation_retry_can_publish_retained_receipts_only_while_all_birth_gen
         let old_operation = f.commit.operation_id.clone();
         if retire_old {
             f.service
-                .update_gc_reference(generation_admission(&f, true))
+                .release_gc_references(
+                    "writer".into(),
+                    "writer-session".into(),
+                    vec![generation_reference_id(&f)],
+                )
                 .await
                 .unwrap();
         }
         f.commit.operation_id =
             OperationId::new(crate::clock::timed_request_id("retry-with-new-writes"));
         f.service
-            .update_gc_reference(generation_admission(&f, false))
+            .update_gc_reference(generation_admission(&f))
             .await
             .unwrap();
         let result = f
@@ -177,7 +188,7 @@ async fn generation_retry_can_publish_retained_receipts_only_while_all_birth_gen
 #[tokio::test]
 async fn generation_expired_identity_cannot_refresh_admission_after_tombstone_cleanup() {
     let f = fixture().await;
-    let mut request = generation_admission(&f, false);
+    let mut request = generation_admission(&f);
     request.reference_id = format!(
         "write:afs1-{}-old-generation",
         now_unix_ms().saturating_sub(60_001)
@@ -230,7 +241,11 @@ async fn generation_atomic_publication_condition_rejects_retirement_race() {
             result: OperationResult::Empty,
         }));
     f.service
-        .update_gc_reference(generation_admission(&f, true))
+        .release_gc_references(
+            "writer".into(),
+            "writer-session".into(),
+            vec![generation_reference_id(&f)],
+        )
         .await
         .unwrap();
     assert!(matches!(
@@ -556,7 +571,11 @@ async fn late_admission_replay_after_tombstone_collection_is_rejected() {
     let mut f = generation_fixture().await;
     f.service = f.service.with_gc_grace_ms(0);
     f.service
-        .update_gc_reference(generation_admission(&f, true))
+        .release_gc_references(
+            "writer".into(),
+            "writer-session".into(),
+            vec![generation_reference_id(&f)],
+        )
         .await
         .unwrap();
     f.service
@@ -565,7 +584,7 @@ async fn late_admission_replay_after_tombstone_collection_is_rejected() {
         .unwrap();
     assert!(
         f.service
-            .update_gc_reference(generation_admission(&f, false))
+            .update_gc_reference(generation_admission(&f))
             .await
             .is_err(),
         "a collected tombstone must not let an abandoned admission resurrect an active reference while its original deadline is still valid"
@@ -577,7 +596,11 @@ async fn tombstone_retention_still_reclaims_unprotected_data_at_short_grace() {
     let mut f = generation_fixture().await;
     f.service = f.service.with_gc_grace_ms(0);
     f.service
-        .update_gc_reference(generation_admission(&f, true))
+        .release_gc_references(
+            "writer".into(),
+            "writer-session".into(),
+            vec![generation_reference_id(&f)],
+        )
         .await
         .unwrap();
     let gc = f
@@ -596,7 +619,7 @@ async fn tombstone_retention_still_reclaims_unprotected_data_at_short_grace() {
     );
     assert!(
         f.service
-            .update_gc_reference(generation_admission(&f, false))
+            .update_gc_reference(generation_admission(&f))
             .await
             .is_err(),
         "the lingering record must keep fencing the abandoned admission"
@@ -608,7 +631,11 @@ async fn new_operation_on_same_node_admits_normally_after_tombstone_collection()
     let mut f = generation_fixture().await;
     f.service = f.service.with_gc_grace_ms(0);
     f.service
-        .update_gc_reference(generation_admission(&f, true))
+        .release_gc_references(
+            "writer".into(),
+            "writer-session".into(),
+            vec![generation_reference_id(&f)],
+        )
         .await
         .unwrap();
     f.service
@@ -623,7 +650,6 @@ async fn new_operation_on_same_node_admits_normally_after_tombstone_collection()
         inode_id: Some(f.commit.inode_id.clone()),
         version_id: None,
         publication: true,
-        release: false,
         admission_deadline_unix_ms: now_unix_ms().saturating_add(30_000),
     };
     assert!(

@@ -37,7 +37,6 @@ pub struct UpdateGcReference {
     pub inode_id: Option<InodeId>,
     pub version_id: Option<FileVersionId>,
     pub publication: bool,
-    pub release: bool,
     pub admission_deadline_unix_ms: u64,
 }
 

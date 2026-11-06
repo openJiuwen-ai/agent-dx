@@ -233,8 +233,11 @@ fn native_generation_retains_gc_reference_through_upload_and_publication() {
             self.active.lock().unwrap().insert(id.into());
             Ok(crate::dfs::GcFence::WriteGeneration)
         }
-        fn release(&self, id: &str) -> Result<()> {
-            self.active.lock().unwrap().remove(id);
+        fn release(&self, ids: &[String]) -> Result<()> {
+            let mut active = self.active.lock().unwrap();
+            for id in ids {
+                active.remove(id);
+            }
             Ok(())
         }
         fn collect(&self, _: u64, _: Vec<ChunkObject>) -> Result<crate::dfs::GcState> {

@@ -22,7 +22,9 @@ pub trait GcControl: Send + Sync {
             "fenced GC retain is unsupported",
         ))
     }
-    fn release(&self, id: &str) -> Result<()>;
+    /// Retires every id in one call. Failure means none is known retired: the
+    /// caller keeps them all and retries, which is idempotent.
+    fn release(&self, ids: &[String]) -> Result<()>;
     fn collect(&self, completed: u64, inventory: Vec<ChunkObject>) -> Result<GcState>;
     /// `collect` plus the assignment to list the external object store.
     fn collect_batch(&self, completed: u64, inventory: Vec<ChunkObject>) -> Result<GcBatch> {
@@ -71,11 +73,22 @@ impl GcReleaseMetrics {
     }
 }
 
+/// Ids per release call. Meta accepts at most `meta::dfs::MAX_RELEASE_BATCH`.
+const RELEASE_BATCH: usize = 1024;
+/// A dropped pin wakes the release loop once this many wait, so release keeps up
+/// with any open rate instead of waiting for the next collection pass.
+const RELEASE_WAKE_PENDING: usize = 256;
+/// Backpressure: a new pin first drains the queue when this many wait. Dropping a
+/// pin never blocks and never loses its id, so the bound is enforced where pins
+/// are made; while Meta cannot take releases it cannot admit new pins either.
+const RELEASE_MAX_PENDING: usize = 65_536;
+
 pub struct GcReferences {
     pub control: Arc<dyn GcControl>,
     pending: Mutex<Vec<String>>,
     sequence: AtomicU64,
     metrics: Option<GcReleaseMetrics>,
+    wake: tokio::sync::Notify,
 }
 pub struct GcPin {
     fence: Option<crate::dfs::GcFence>,
@@ -98,6 +111,9 @@ impl Drop for GcPin {
         if let Ok(mut pending) = self.owner.pending.lock() {
             pending.push(self.id.clone());
             self.owner.observe_pending(pending.len());
+            if pending.len() == RELEASE_WAKE_PENDING {
+                self.owner.wake.notify_one();
+            }
         }
         // Poisoning keeps the durable reference; it never authorizes deletion.
     }
@@ -118,7 +134,13 @@ impl GcReferences {
             pending: Mutex::new(Vec::new()),
             sequence: AtomicU64::new(1),
             metrics,
+            wake: tokio::sync::Notify::new(),
         })
+    }
+    /// Resolves when enough dropped pins wait that the release loop should not
+    /// sleep until its next pass.
+    pub(crate) async fn release_wanted(&self) {
+        self.wake.notified().await;
     }
     fn observe_pending(&self, pending: usize) {
         if let Some(metrics) = &self.metrics {
@@ -160,6 +182,9 @@ impl GcReferences {
                 ))
             ),
         };
+        if self.pending_len()? >= RELEASE_MAX_PENDING {
+            self.flush()?;
+        }
         // Queue cleanup even when an admission reply is lost.
         let mut pin = GcPin {
             fence: None,
@@ -180,22 +205,34 @@ impl GcReferences {
         }
         Ok(Arc::new(pin))
     }
+    fn pending_len(&self) -> Result<usize> {
+        Ok(self
+            .pending
+            .lock()
+            .map_err(|_| Error::coded(afs_error::IO_UNAVAILABLE, "GC release queue poisoned"))?
+            .len())
+    }
+    /// Releases everything dropped so far, a batch at a time. On failure the
+    /// unconfirmed ids return to the queue: a lost release only protects longer.
     pub fn flush(&self) -> Result<()> {
-        let pending = {
-            let mut queue = self.pending.lock().map_err(|_| {
-                Error::coded(afs_error::IO_UNAVAILABLE, "GC release queue poisoned")
-            })?;
-            let count = queue.len().min(64);
-            let drained = queue.drain(..count).collect::<Vec<_>>();
-            self.observe_pending(queue.len());
-            drained
-        };
-        for (index, id) in pending.iter().enumerate() {
-            if let Err(error) = self.control.release(id) {
+        loop {
+            let batch = {
                 let mut queue = self.pending.lock().map_err(|_| {
                     Error::coded(afs_error::IO_UNAVAILABLE, "GC release queue poisoned")
                 })?;
-                queue.extend(pending[index..].iter().cloned());
+                let count = queue.len().min(RELEASE_BATCH);
+                let batch = queue.drain(..count).collect::<Vec<_>>();
+                self.observe_pending(queue.len());
+                batch
+            };
+            if batch.is_empty() {
+                return Ok(());
+            }
+            if let Err(error) = self.control.release(&batch) {
+                let mut queue = self.pending.lock().map_err(|_| {
+                    Error::coded(afs_error::IO_UNAVAILABLE, "GC release queue poisoned")
+                })?;
+                queue.extend(batch);
                 self.observe_pending(queue.len());
                 if let Some(metrics) = &self.metrics {
                     metrics.failures.inc();
@@ -203,10 +240,9 @@ impl GcReferences {
                 return Err(error);
             }
             if let Some(metrics) = &self.metrics {
-                metrics.released.inc();
+                metrics.released.inc_by(batch.len() as u64);
             }
         }
-        Ok(())
     }
 }
 
@@ -216,17 +252,19 @@ mod tests {
     #[derive(Default)]
     struct Control {
         releases: Mutex<Vec<String>>,
+        batches: AtomicU64,
         fail_once: std::sync::atomic::AtomicBool,
     }
     impl GcControl for Control {
         fn retain(&self, _: &str, _: &InodeId, _: Option<&FileVersionId>) -> Result<()> {
             Ok(())
         }
-        fn release(&self, id: &str) -> Result<()> {
+        fn release(&self, ids: &[String]) -> Result<()> {
             if self.fail_once.swap(false, Ordering::Relaxed) {
                 return Err(Error::coded(afs_error::IO_UNAVAILABLE, "lost reply"));
             }
-            self.releases.lock().unwrap().push(id.into());
+            self.batches.fetch_add(1, Ordering::Relaxed);
+            self.releases.lock().unwrap().extend_from_slice(ids);
             Ok(())
         }
         fn collect(&self, _: u64, _: Vec<ChunkObject>) -> Result<GcState> {
@@ -266,16 +304,75 @@ mod tests {
         assert_eq!(metrics.released.get(), 3);
     }
     #[test]
-    fn release_work_is_bounded_without_losing_queued_handles() {
+    fn one_flush_drains_any_backlog_in_batches_without_losing_ids() {
         let control = Arc::new(Control::default());
         let references = GcReferences::new(control.clone());
-        for _ in 0..130 {
+        let total = RELEASE_BATCH * 2 + 3;
+        for _ in 0..total {
             drop(references.pin(&InodeId::new("i"), None).unwrap());
         }
         references.flush().unwrap();
-        assert_eq!(control.releases.lock().unwrap().len(), 64);
+        let released = control.releases.lock().unwrap().clone();
+        assert_eq!(released.len(), total);
+        assert_eq!(
+            released
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            total
+        );
+        assert_eq!(control.batches.load(Ordering::Relaxed), 3);
         references.flush().unwrap();
+        assert_eq!(control.batches.load(Ordering::Relaxed), 3, "nothing left");
+    }
+    #[test]
+    fn a_failed_batch_keeps_every_id_for_the_retry() {
+        let control = Arc::new(Control::default());
+        let references = GcReferences::new(control.clone());
+        for _ in 0..5 {
+            drop(references.pin(&InodeId::new("i"), None).unwrap());
+        }
+        control.fail_once.store(true, Ordering::Relaxed);
+        assert!(references.flush().is_err());
+        assert!(control.releases.lock().unwrap().is_empty());
+        assert_eq!(references.pending_len().unwrap(), 5);
         references.flush().unwrap();
-        assert_eq!(control.releases.lock().unwrap().len(), 130);
+        assert_eq!(control.releases.lock().unwrap().len(), 5);
+    }
+    #[tokio::test]
+    async fn enough_dropped_pins_wake_the_release_loop() {
+        let references = GcReferences::new(Arc::new(Control::default()));
+        let waiter = references.release_wanted();
+        tokio::pin!(waiter);
+        for _ in 0..RELEASE_WAKE_PENDING - 1 {
+            drop(references.pin(&InodeId::new("i"), None).unwrap());
+        }
+        let short = std::time::Duration::from_millis(20);
+        assert!(tokio::time::timeout(short, waiter.as_mut()).await.is_err());
+        drop(references.pin(&InodeId::new("i"), None).unwrap());
+        assert!(tokio::time::timeout(short, waiter.as_mut()).await.is_ok());
+    }
+    #[test]
+    fn a_full_queue_makes_the_next_pin_drain_it_first() {
+        let control = Arc::new(Control::default());
+        let references = GcReferences::new(control.clone());
+        references
+            .pending
+            .lock()
+            .unwrap()
+            .extend((0..RELEASE_MAX_PENDING).map(|index| format!("open:{index}")));
+        let pin = references.pin(&InodeId::new("i"), None).unwrap();
+        assert_eq!(references.pending_len().unwrap(), 0);
+        assert_eq!(control.releases.lock().unwrap().len(), RELEASE_MAX_PENDING);
+        drop(pin);
+        // A Meta that cannot take releases refuses the new pin, not the old ids.
+        references
+            .pending
+            .lock()
+            .unwrap()
+            .extend((0..RELEASE_MAX_PENDING).map(|index| format!("open:{index}")));
+        control.fail_once.store(true, Ordering::Relaxed);
+        assert!(references.pin(&InodeId::new("i"), None).is_err());
+        assert_eq!(references.pending_len().unwrap(), RELEASE_MAX_PENDING + 1);
     }
 }

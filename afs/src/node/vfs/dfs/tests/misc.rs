@@ -88,7 +88,7 @@ impl crate::node::gc::GcControl for Pr88GcControl {
         self.captures.fetch_add(1, Ordering::SeqCst);
         Ok(crate::dfs::GcFence::WriteGeneration)
     }
-    fn release(&self, _: &str) -> Result<()> {
+    fn release(&self, _: &[String]) -> Result<()> {
         Ok(())
     }
     fn collect(&self, _: u64, _: Vec<ChunkObject>) -> Result<crate::dfs::GcState> {

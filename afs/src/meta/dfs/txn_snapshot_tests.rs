@@ -793,7 +793,6 @@ async fn commit_with_write_generation() -> String {
             inode_id: Some(f.commit.inode_id.clone()),
             version_id: None,
             publication: true,
-            release: false,
             admission_deadline_unix_ms: now_unix_ms().saturating_add(30_000),
         })
         .await
