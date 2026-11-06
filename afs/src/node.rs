@@ -1645,6 +1645,11 @@ async fn run_node(
             ),
         };
         let read_config = dfs_read::DfsReadConfig {
+            read_cache_bytes: cfg.dfs_read_cache_bytes,
+            distribution: dfs_read::ReadDistributionConfig {
+                parallelism: cfg.dfs_read_parallelism,
+                stripe_bytes: cfg.dfs_read_stripe_bytes,
+            },
             max_ops_per_batch: cfg.dfs_read_max_ops_per_batch,
             max_inflight_bytes: cfg.dfs_read_max_inflight_bytes,
             source_cache_ttl: std::time::Duration::from_millis(cfg.dfs_source_cache_max_ms),
@@ -1665,7 +1670,8 @@ async fn run_node(
                 dfs_rdma_pool.clone(),
             )?,
             read_config,
-        );
+        )
+        .with_cache_session(session_id.clone());
         let read_engine = match &dfs_read_authority {
             Some(authority) => read_engine.with_read_authority(authority.clone()),
             None => read_engine,

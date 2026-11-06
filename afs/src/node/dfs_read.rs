@@ -16,7 +16,13 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+mod dissemination;
+mod distribution;
 mod read_pipeline;
+pub use distribution::ReadDistributionConfig;
+
+#[cfg(test)]
+mod distribution_tests;
 
 pub use super::dfs_fetch::PrefetchControl;
 
@@ -52,6 +58,8 @@ pub(super) const MAX_SOURCE_LOOKAHEAD_ID_BYTES: usize = 512;
 
 #[derive(Clone, Debug)]
 pub struct DfsReadConfig {
+    pub read_cache_bytes: u64,
+    pub distribution: ReadDistributionConfig,
     pub max_ops_per_batch: usize,
     pub max_inflight_bytes: u64,
     pub source_cache_ttl: Duration,
@@ -64,6 +72,8 @@ pub struct DfsReadConfig {
 impl Default for DfsReadConfig {
     fn default() -> Self {
         Self {
+            distribution: ReadDistributionConfig::default(),
+            read_cache_bytes: 0,
             max_ops_per_batch: MAX_DFS_READ_OPS,
             max_inflight_bytes: MAX_DFS_READ_BYTES,
             source_cache_ttl: Duration::from_millis(5_000),
@@ -77,6 +87,7 @@ impl Default for DfsReadConfig {
 impl DfsReadConfig {
     /// Reject unsupported configuration before it becomes a peer-only failure.
     pub fn validate(&self) -> Result<()> {
+        self.distribution.validate()?;
         if self.max_ops_per_batch == 0
             || self.max_ops_per_batch > MAX_DFS_READ_OPS
             || self.max_inflight_bytes == 0
@@ -185,6 +196,32 @@ impl ReadBatch {
 
 pub trait ReadSourceProvider: Send + Sync {
     fn sources_for(&self, request: DfsChunkSourcesRequest) -> Result<DfsChunkSourcesReply>;
+
+    fn publish_read_cache(
+        &self,
+        _request: crate::dfs::PublishReadCache,
+        _deadline: Instant,
+    ) -> super::read_pipeline::ReadFuture<'_, crate::dfs::CopyRecord> {
+        Box::pin(async {
+            Err(Error::coded(
+                afs_error::NODE_VFS_UNIMPLEMENTED,
+                "read cache publication is unsupported",
+            ))
+        })
+    }
+
+    fn retire_read_cache(
+        &self,
+        _request: crate::dfs::RetireReadCache,
+        _deadline: Instant,
+    ) -> super::read_pipeline::ReadFuture<'_, ()> {
+        Box::pin(async {
+            Err(Error::coded(
+                afs_error::NODE_VFS_UNIMPLEMENTED,
+                "read cache retirement is unsupported",
+            ))
+        })
+    }
 
     /// Local/test providers may return immediately. Network adapters override
     /// this entry so async read preparation never hides a network block_on.
@@ -1230,6 +1267,10 @@ enum SourceLookupFinish {
 }
 
 pub struct DfsReadEngine {
+    cache_session: Option<String>,
+    cache_admission: Arc<tokio::sync::Semaphore>,
+    cache_fetch_admission: Arc<tokio::sync::Semaphore>,
+    source_turn: Arc<std::sync::atomic::AtomicUsize>,
     namespace_id: crate::dfs::NamespaceId,
     reply_buffer_pool: Arc<super::read_buffer::ReadBufferPool>,
     read_pipeline_limits: super::read_pipeline::ReadPipelineLimits,
@@ -1657,6 +1698,10 @@ impl DfsReadEngine {
         );
         source_cache.record(&local);
         Self {
+            source_turn: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            cache_session: None,
+            cache_admission: Arc::new(tokio::sync::Semaphore::new(2)),
+            cache_fetch_admission: Arc::new(tokio::sync::Semaphore::new(2)),
             reply_buffer_pool: super::read_buffer::ReadBufferPool::new("reply"),
             read_pipeline_limits: Default::default(),
             reply_admission: Arc::new(tokio::sync::Semaphore::new(8 * 1024 * 1024)),
@@ -1728,6 +1773,10 @@ impl DfsReadEngine {
 
     fn task_reader(&self) -> Self {
         Self {
+            source_turn: self.source_turn.clone(),
+            cache_session: self.cache_session.clone(),
+            cache_admission: self.cache_admission.clone(),
+            cache_fetch_admission: self.cache_fetch_admission.clone(),
             reply_buffer_pool: self.reply_buffer_pool.clone(),
             read_pipeline_limits: self.read_pipeline_limits,
             reply_admission: self.reply_admission.clone(),
@@ -1754,6 +1803,11 @@ impl DfsReadEngine {
             fetcher: None,
             external_authority_cache: Mutex::new(ExternalAuthorityCache::default()),
         }
+    }
+
+    pub(super) fn with_cache_session(mut self, session_id: String) -> Self {
+        self.cache_session = Some(session_id);
+        self
     }
 
     pub(super) fn with_read_authority(mut self, authority: Arc<LocalReadAuthority>) -> Self {
@@ -4822,6 +4876,40 @@ impl DfsReadEngine {
         final_owned: bool,
         deadline: Option<Instant>,
     ) -> Result<()> {
+        if self
+            .read_cache_full_chunks(batch, sources, out, deadline)
+            .await?
+        {
+            return Ok(());
+        }
+        self.read_remote_batch_uncached(batch, sources, out, final_owned, deadline)
+            .await?;
+        if self.config.read_cache_bytes != 0
+            && let Err(error) = self
+                .cache_completed_ranges(batch, sources, out, deadline)
+                .await
+        {
+            // Optional read copies never fail an already verified ordinary read.
+            afs_logging::warn!("dfs.read_cache_skipped"; "error" => error.to_string());
+        }
+        Ok(())
+    }
+
+    async fn read_remote_batch_uncached(
+        &self,
+        batch: &ReadBatch,
+        sources: &[ChunkSources],
+        out: &mut [u8],
+        final_owned: bool,
+        deadline: Option<Instant>,
+    ) -> Result<()> {
+        if final_owned
+            && self
+                .read_distributed_ranges(batch, sources, out, deadline)
+                .await?
+        {
+            return Ok(());
+        }
         if final_owned
             && self
                 .fanout_private_objects_async(batch, sources, out, deadline)
@@ -4835,7 +4923,8 @@ impl DfsReadEngine {
         {
             return Ok(());
         }
-        self.read_remote_ranges_async(batch, sources, out, final_owned)
+        let ordered = self.distributed_sources(batch, sources);
+        self.read_remote_ranges_async(batch, &ordered, out, final_owned)
             .await
     }
 
@@ -5083,7 +5172,7 @@ mod tests {
     };
 
     #[derive(Default)]
-    struct StaticSources {
+    pub(super) struct StaticSources {
         reply: Mutex<DfsChunkSourcesReply>,
         calls: Mutex<u64>,
     }
@@ -5751,7 +5840,7 @@ mod tests {
         assert_eq!(error.code(), afs_error::NODE_TRANSFER_CORRUPT_DATA);
     }
 
-    fn source(copy: &str, chunk_id: &ChunkId, node_id: &str) -> SourceCandidate {
+    pub(super) fn source(copy: &str, chunk_id: &ChunkId, node_id: &str) -> SourceCandidate {
         SourceCandidate {
             copy_id: CopyId::new(copy),
             chunk_id: chunk_id.clone(),
@@ -5932,7 +6021,7 @@ mod tests {
         assert_eq!(cache.get(&"d"), Some(&5));
     }
 
-    fn source_cache_lru_batch(chunk_id: ChunkId) -> ReadBatch {
+    pub(super) fn source_cache_lru_batch(chunk_id: ChunkId) -> ReadBatch {
         ReadBatch {
             lookahead: Vec::new(),
             file_version_id: Some(FileVersionId::new("version")),

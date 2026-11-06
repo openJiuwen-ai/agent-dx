@@ -48,7 +48,9 @@ class Handler(BaseHTTPRequestHandler):
                     time.sleep(0.05)
             if mode == "delay":
                 time.sleep(control.get("delay", 3))
-            if mode == "503":
+            if mode == "503" or (
+                mode == "body_503" and self.command == "GET" and self.headers.get("Range") != "bytes=0-0"
+            ):
                 status, headers, body = 503, {}, b"origin temporarily unavailable"
             else:
                 conn = http.client.HTTPConnection("10.203.0.10", 5000, timeout=60)
@@ -66,7 +68,10 @@ class Handler(BaseHTTPRequestHandler):
             for key, value in headers.items():
                 if key.lower() not in ("content-length", "transfer-encoding", "connection", "server", "date"):
                     self.send_header(key, value)
-            self.send_header("Content-Length", str(len(body)))
+            self.send_header(
+                "Content-Length",
+                headers.get("Content-Length", str(len(body))) if self.command == "HEAD" else str(len(body)),
+            )
             self.send_header("Connection", "close")
             self.end_headers()
             if self.command != "HEAD":

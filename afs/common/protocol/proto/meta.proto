@@ -411,6 +411,8 @@ service DfsMeta {
   rpc ClaimReplicationTask(ClaimDfsReplicationTaskRequest) returns (ClaimDfsReplicationTaskReply);
   rpc ReportReplicationTask(ReportDfsReplicationTaskRequest) returns (ReportDfsReplicationTaskReply);
   rpc ReportChunkCorruption(ReportDfsChunkCorruptionRequest) returns (ReportDfsChunkCorruptionReply);
+  rpc PublishReadCache(PublishDfsReadCacheRequest) returns (PublishDfsReadCacheReply);
+  rpc RetireReadCache(RetireDfsReadCacheRequest) returns (RetireDfsReadCacheReply);
   rpc GetChunkSources(GetDfsChunkSourcesRequest) returns (GetDfsChunkSourcesReply);
   rpc ValidateReadGrants(ValidateDfsReadGrantsRequest) returns (ValidateDfsReadGrantsReply);
   rpc ValidateExternalReadGrants(ValidateExternalReadGrantsRequest) returns (ValidateExternalReadGrantsReply);
@@ -496,6 +498,28 @@ message DfsReplicaAck {
   bytes verified_digest = 11;
   DfsDigestAlgorithm verified_digest_algorithm = 12;
 }
+
+// Physical persistence receipts do not make these copies durable replicas.
+message PublishDfsReadCacheRequest {
+  string caller_id = 1;
+  string caller_session_id = 2;
+  uint64 caller_node_epoch = 3;
+  string operation_id = 4;
+  string namespace_id = 5;
+  string file_version_id = 6;
+  string layout_root_id = 7;
+  DfsReplicaAck receipt = 8;
+}
+message PublishDfsReadCacheReply { string copy_id = 1; }
+message RetireDfsReadCacheRequest {
+  string caller_id = 1;
+  string caller_session_id = 2;
+  uint64 caller_node_epoch = 3;
+  string operation_id = 4;
+  string copy_id = 5;
+  DfsReplicaAck receipt = 6;
+}
+message RetireDfsReadCacheReply {}
 
 message DfsChunkObject {
   string chunk_id = 1;

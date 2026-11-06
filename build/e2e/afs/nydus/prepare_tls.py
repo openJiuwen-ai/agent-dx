@@ -8,7 +8,9 @@ import shutil
 
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument("output", type=Path)
-r = p.parse_args().output
+p.add_argument("--four-workers", action="store_true")
+options = p.parse_args()
+r = options.output
 if r.exists() and any(r.iterdir()):
     raise SystemExit("TLS directory exists; preserve identities until the owning run is closed and cleaned")
 r.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -39,9 +41,10 @@ cmd(
     r / "ca.pem",
 )
 (r / "extensions").write_text(
-    "subjectAltName=DNS:afs-meta,IP:10.203.0.10,IP:10.203.0.20,IP:10.203.0.21,IP:10.203.0.22\nextendedKeyUsage=serverAuth,clientAuth\n"
+    "subjectAltName=DNS:afs-meta,IP:10.203.0.10,IP:10.203.0.20,IP:10.203.0.21,IP:10.203.0.22,IP:10.203.0.23\n"
+    "extendedKeyUsage=serverAuth,clientAuth\n"
 )
-for n in ["meta", "node-a", "node-b", "node-c"]:
+for n in ["meta", "node-a", "node-b", "node-c"] + (["node-d"] if options.four_workers else []):
     cmd("req", "-newkey", "rsa:2048", "-nodes", "-subj", "/CN=" + n, "-keyout", r / f"{n}.key", "-out", r / f"{n}.csr")
     cmd(
         "x509",

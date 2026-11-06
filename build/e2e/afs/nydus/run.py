@@ -27,7 +27,9 @@ def execute(node, *args):
 
 
 def start(node):
-    guest = {"meta": "mgmt", "node-a": "worker-1", "node-b": "worker-2", "node-c": "worker-3"}[node]
+    guest = {"meta": "mgmt", "node-a": "worker-1", "node-b": "worker-2", "node-c": "worker-3", "node-d": "worker-4"}[
+        node
+    ]
     binary = "afs/afs-meta" if node == "meta" else "afs/afs-node"
     execute(
         guest,
@@ -48,7 +50,9 @@ nohup /artifacts/{binary} --config /artifacts/afs-configs/{node}.toml >>/output/
 
 
 def stop(node):
-    guest = {"meta": "mgmt", "node-a": "worker-1", "node-b": "worker-2", "node-c": "worker-3"}[node]
+    guest = {"meta": "mgmt", "node-a": "worker-1", "node-b": "worker-2", "node-c": "worker-3", "node-d": "worker-4"}[
+        node
+    ]
     execute(
         guest,
         "bash",

@@ -34,11 +34,15 @@ pub(super) fn load_checkpoint(path: &Path) -> Result<Option<LocalCatalog>> {
             return Err(invalid("invalid chunk checkpoint record"));
         }
     }
-    Ok(Some(LocalCatalog {
+    let mut catalog = LocalCatalog {
         revision: value.revision,
         gc_generation: value.gc_generation,
-        records,
-    }))
+        ..Default::default()
+    };
+    for record in records.into_values() {
+        catalog.insert_record(record);
+    }
+    Ok(Some(catalog))
 }
 fn save_checkpoint(root: &Path, catalog: &LocalCatalog) -> Result<()> {
     let mut records = catalog.records.values().cloned().collect::<Vec<_>>();
@@ -161,6 +165,8 @@ impl LocalChunkStore {
                 .ok_or_else(|| invalid("chunk catalog revision overflow"))?,
             gc_generation: generation,
             records: catalog.records.clone(),
+            cache_order: catalog.cache_order.clone(),
+            cache_bytes: catalog.cache_bytes,
         };
         let mut removed = 0;
         for id in chunks {
@@ -174,7 +180,7 @@ impl LocalChunkStore {
                     Err(error) => return Err(error.into()),
                 }
             }
-            next.records.remove(id);
+            next.remove_record(id);
         }
         File::open(&self.chunks)?.sync_all()?;
         File::open(&self.outboards)?.sync_all()?;

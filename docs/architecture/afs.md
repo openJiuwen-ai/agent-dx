@@ -214,6 +214,41 @@ AFS live/idle、allocator allocated/active/resident/retained 与进程 RSS 是�
 接收线程、worker、任务数与输入字节预算均可形成背压，不能声称新请求总能立即接收。
 具体功能、回收及平台验证边界见[测试说明](../testing/afs.md#原生写-buffer-验证)。
 
+## DFS 通用读副本扩散（可选）
+
+普通文件和 `lazy_fill` 文件共用此路径，connector 不参与副本发现或选源。
+已提交的不可变 Chunk 经完整校验后，可复用本机 ChunkStore/catalog WAL 保存为
+`VerifiedCache`，通过现有 Copy/Placement 和节点 session 发布。其他读者可选择这份副本。
+缓存不增加文件内容版本，不计入持久副本承诺；普通写入提升为持久副本后不再受缓存淘汰。
+
+`DfsReadEngine` 可将同一版本的授权范围拆为互不重叠的 stripe，从多个 Node 并发读取。
+每段沿用既有 Peer 授权、校验、失败换源和总截止时间；所有子任务排空后才返回调用方。
+候选按已有负载提示排序并轮换，尚无吞吐自适应、慢源对冲或拓扑感知调度。
+
+```text
+FUSE / vfs::Backend / connector
+              ↓
+DistributedFs：固定文件版本与授权
+              ↓
+DfsReadEngine：并行选源 → 校验完整 Chunk → LocalChunkStore
+              ↕                               ↓
+          现有 Peer                     Copy / Placement 发布
+              ↕                               ↓
+          其他 Node ←─────────────── Meta 可读副本发现
+```
+
+开启读副本后，短读可以扩为完整 Chunk（仅授权覆盖整块时，单块不超过 4 MiB）；
+扩展批次不超过 `max_inflight_bytes`，同时至多两个扩展读取和两个缓存写入任务。
+同 Chunk 的本机请求共用已有有界 key gate。缓存按 catalog revision FIFO 淘汰，
+容量计算包括正文和每块 4 KiB 记账；固定 reader 仍可读完已打开的旧文件。
+这不是整个文件系统磁盘用量的硬上限，WAL、元数据和未关闭的已删除文件需另留空间。
+
+缓存损坏／缺失沿用隔离与维护上报；旧节点 epoch 的缓存不参与发现。
+缓存发布／撤销失败目前是尽力处理，尚无持久重试与库存对账，淘汰和发布竞态可能留下
+不可用来源提示；客户端应换源，不得把失败当数据。重启后没有主动重新发布全部缓存。
+全部副本丢失时，已提交 Chunk 不会自动重新调用 lazy hook 重建。
+这些是生产替代前的缺口；默认关闭扩散，默认远端读取并行度仍为 1。
+
 ## DFS 原生节点读取上下文
 
 未配置外部后端时，新open从Meta取得fresh inode，之后同句柄复用已提交版本视图

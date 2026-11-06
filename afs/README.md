@@ -16,6 +16,10 @@ DFS Peer 客户端允许接收 128 KiB HTTP/2 DATA 帧；业务消息、流控�
 
 详细路径见[AFS 架构与时序图](../docs/architecture/afs.md)。
 
+DFS 提供可选的通用读副本扩散及多源并行范围读取，普通文件无需 Provider 即可使用。
+默认关闭扩散、保持单路读取；配置、可靠性区别和当前限制见
+[部署说明](../docs/deployment/afs.md#可选-dfs-通用分发)。
+
 ## 组件范围
 
 | 目录 | 内容 |

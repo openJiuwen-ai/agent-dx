@@ -1,0 +1,25 @@
+console: true
+log:
+  level: info
+host:
+  ip: 10.203.0.21
+  hostname: distribution-worker-2
+server:
+  pluginDir: /workspace/dragonfly/plugins
+  cacheDir: /workspace/dragonfly/config-cache
+download:
+  server:
+    socketPath: /workspace/dragonfly/dfdaemon.sock
+  concurrentPieceCount: 4
+storage:
+  dir: /workspace/dragonfly/peer
+  keep: true
+proxy:
+  server:
+    port: 4001
+  rules:
+    - regex: 'blobs/sha256.*'
+      schedulingPolicy: auto
+  registryMirror:
+    addr: http://10.203.0.10:5001
+  prefetch: false

@@ -1738,6 +1738,68 @@ impl DfsMetaService for DfsMetaRpc {
         ))
     }
 
+    async fn publish_read_cache(
+        &self,
+        request: Request<afs_protocol::meta::PublishDfsReadCacheRequest>,
+    ) -> Result<Response<afs_protocol::meta::PublishDfsReadCacheReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.caller_id)?;
+        let receipt = domain_replica_ack(
+            request
+                .receipt
+                .ok_or_else(|| invalid("read cache receipt is required"))?,
+        )?;
+        let copy = dfs_service(&self.0)?
+            .publish_read_cache(crate::dfs::PublishReadCache {
+                caller_id: request.caller_id,
+                caller_session_id: request.caller_session_id,
+                caller_node_epoch: request.caller_node_epoch,
+                operation_id: crate::dfs::OperationId::new(request.operation_id),
+                namespace_id: crate::dfs::NamespaceId::new(request.namespace_id),
+                file_version_id: crate::dfs::FileVersionId::new(request.file_version_id),
+                layout_root_id: crate::dfs::LayoutRootId::new(request.layout_root_id),
+                receipt,
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(
+            afs_protocol::meta::PublishDfsReadCacheReply { copy_id: copy.id.0 },
+        ))
+    }
+
+    async fn retire_read_cache(
+        &self,
+        request: Request<afs_protocol::meta::RetireDfsReadCacheRequest>,
+    ) -> Result<Response<afs_protocol::meta::RetireDfsReadCacheReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.caller_id)?;
+        let receipt = domain_replica_ack(
+            request
+                .receipt
+                .ok_or_else(|| invalid("read cache retirement receipt is required"))?,
+        )?;
+        let copy = crate::dfs::read_cache_copy(&receipt)
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        if copy.id.0 != request.copy_id {
+            return Err(invalid("read cache retirement identity differs"));
+        }
+        dfs_service(&self.0)?
+            .retire_read_cache(crate::dfs::RetireReadCache {
+                caller_id: request.caller_id,
+                caller_session_id: request.caller_session_id,
+                caller_node_epoch: request.caller_node_epoch,
+                operation_id: crate::dfs::OperationId::new(request.operation_id),
+                copy,
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(
+            afs_protocol::meta::RetireDfsReadCacheReply {},
+        ))
+    }
+
     async fn report_chunk_corruption(
         &self,
         request: Request<afs_protocol::meta::ReportDfsChunkCorruptionRequest>,

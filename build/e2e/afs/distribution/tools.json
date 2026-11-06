@@ -1,0 +1,12 @@
+[
+  {
+    "asset": "dragonfly-2.5.3-linux-arm64.tar.gz",
+    "sha256": "sha256:2b11a31325f7fc60b4bece3b4b462a835831097bacfa691950f48236015cefd3",
+    "url": "https://github.com/dragonflyoss/dragonfly/releases/download/v2.5.3/dragonfly-2.5.3-linux-arm64.tar.gz"
+  },
+  {
+    "asset": "dragonfly-client-v1.5.11-aarch64-unknown-linux-musl.tar.gz",
+    "sha256": "sha256:19ffd41c803380225815554d3ff37173fc4c288ea2d2c9f058535895c287a06a",
+    "url": "https://github.com/dragonflyoss/client/releases/download/v1.5.11/dragonfly-client-v1.5.11-aarch64-unknown-linux-musl.tar.gz"
+  }
+]

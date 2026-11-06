@@ -346,6 +346,12 @@ pub struct Cli {
     #[arg(long)]
     pub dfs_read_max_ops_per_batch: Option<usize>,
     #[arg(long)]
+    pub dfs_read_cache_bytes: Option<u64>,
+    #[arg(long)]
+    pub dfs_read_parallelism: Option<usize>,
+    #[arg(long)]
+    pub dfs_read_stripe_bytes: Option<usize>,
+    #[arg(long)]
     pub dfs_read_max_inflight_bytes: Option<u64>,
     #[arg(long)]
     pub dfs_source_cache_max_ms: Option<u64>,
@@ -500,6 +506,9 @@ struct FileConfig {
     dfs_min_distinct_failure_domains: Option<u16>,
     dfs_local_copy: Option<String>,
     dfs_read_max_ops_per_batch: Option<usize>,
+    dfs_read_cache_bytes: Option<u64>,
+    dfs_read_parallelism: Option<usize>,
+    dfs_read_stripe_bytes: Option<usize>,
     dfs_read_max_inflight_bytes: Option<u64>,
     dfs_source_cache_max_ms: Option<u64>,
     dfs_source_lookahead_chunks: Option<usize>,
@@ -614,6 +623,9 @@ pub struct Config {
     pub dfs_min_distinct_failure_domains: u16,
     pub dfs_local_copy: String,
     pub dfs_read_max_ops_per_batch: usize,
+    pub dfs_read_cache_bytes: u64,
+    pub dfs_read_parallelism: usize,
+    pub dfs_read_stripe_bytes: usize,
     pub dfs_read_max_inflight_bytes: u64,
     pub dfs_source_cache_max_ms: u64,
     pub dfs_source_lookahead_chunks: usize,
@@ -748,6 +760,26 @@ impl Config {
         if !["required", "preferred", "none"].contains(&dfs_local_copy.as_str()) {
             return Err(invalid(
                 "dfs_local_copy must be required, preferred or none",
+            ));
+        }
+        let dfs_read_cache_bytes = cli
+            .dfs_read_cache_bytes
+            .or(file.dfs_read_cache_bytes)
+            .unwrap_or(0);
+        let dfs_read_parallelism = cli
+            .dfs_read_parallelism
+            .or(file.dfs_read_parallelism)
+            .unwrap_or(1);
+        let dfs_read_stripe_bytes = cli
+            .dfs_read_stripe_bytes
+            .or(file.dfs_read_stripe_bytes)
+            .unwrap_or(256 * 1024);
+        if !(1..=8).contains(&dfs_read_parallelism)
+            || !(64 * 1024..=8 * 1024 * 1024).contains(&dfs_read_stripe_bytes)
+            || !dfs_read_stripe_bytes.is_multiple_of(64 * 1024)
+        {
+            return Err(invalid(
+                "DFS distribution requires parallelism 1..=8 and stripe size 64KiB..=8MiB in 64KiB units",
             ));
         }
         let dfs_read_max_ops_per_batch = cli
@@ -1112,6 +1144,9 @@ impl Config {
             dfs_min_distinct_failure_domains,
             dfs_local_copy,
             dfs_read_max_ops_per_batch,
+            dfs_read_cache_bytes,
+            dfs_read_parallelism,
+            dfs_read_stripe_bytes,
             dfs_read_max_inflight_bytes,
             dfs_source_cache_max_ms,
             dfs_source_lookahead_chunks,

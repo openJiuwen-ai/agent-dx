@@ -27,6 +27,7 @@ mod native_live;
 #[cfg(test)]
 mod native_live_tests;
 pub mod outboard;
+mod read_cache;
 #[cfg(any(feature = "dfs", test))]
 mod read_pipeline;
 use catalog_commit::CatalogCommitter;
@@ -1215,6 +1216,9 @@ pub enum PhysicalEncoding {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LocalChunkRecord {
+    /// Nonzero only for disposable read copies; ordinary persistence promotes to zero.
+    #[serde(default, skip_serializing_if = "is_zero_epoch")]
+    pub(crate) read_cache_epoch: u64,
     pub chunk: ChunkObject,
     pub stored_length: u64,
     pub stored_checksum: ContentDigest,
@@ -1226,6 +1230,10 @@ pub struct LocalChunkRecord {
     pub catalog_revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) segment_crc: Option<super::chunk_crc32c::CrcTable>,
+}
+
+fn is_zero_epoch(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1648,6 +1656,8 @@ fn read_positioned(file: &File, offset: u64, out: &mut [u8]) -> Result<usize> {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct CatalogTxn {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    removed: Vec<ChunkId>,
     revision: u64,
     records: Vec<LocalChunkRecord>,
     checksum: String,
@@ -1658,6 +1668,7 @@ impl CatalogTxn {
     fn new(revision: u64, records: Vec<LocalChunkRecord>) -> Result<Self> {
         let checksum = catalog_checksum(revision, &records)?;
         Ok(Self {
+            removed: Vec::new(),
             revision,
             records,
             checksum,
@@ -1665,7 +1676,14 @@ impl CatalogTxn {
     }
 
     fn verify(&self) -> Result<()> {
-        if self.checksum != catalog_checksum(self.revision, &self.records)? {
+        let expected = if self.removed.is_empty() {
+            catalog_checksum(self.revision, &self.records)?
+        } else {
+            let bytes = serde_json::to_vec(&(self.revision, &self.records, &self.removed))
+                .map_err(|e| invalid(e.to_string()))?;
+            blake3::hash(&bytes).to_hex().to_string()
+        };
+        if self.checksum != expected {
             return Err(invalid("local chunk catalog transaction checksum mismatch"));
         }
         Ok(())
@@ -1677,9 +1695,35 @@ pub struct LocalCatalog {
     revision: u64,
     gc_generation: u64,
     records: HashMap<ChunkId, LocalChunkRecord>,
+    cache_order: std::collections::BTreeSet<(u64, ChunkId)>,
+    cache_bytes: u64,
 }
 
 impl LocalCatalog {
+    fn insert_record(&mut self, record: LocalChunkRecord) {
+        self.remove_record(&record.chunk.id);
+        if record.read_cache_epoch != 0 {
+            self.cache_bytes = self
+                .cache_bytes
+                .saturating_add(record.stored_length.saturating_add(4096));
+            self.cache_order
+                .insert((record.catalog_revision, record.chunk.id.clone()));
+        }
+        self.records.insert(record.chunk.id.clone(), record);
+    }
+
+    fn remove_record(&mut self, id: &ChunkId) {
+        if let Some(old) = self.records.remove(id)
+            && old.read_cache_epoch != 0
+        {
+            self.cache_bytes = self
+                .cache_bytes
+                .saturating_sub(old.stored_length.saturating_add(4096));
+            self.cache_order
+                .remove(&(old.catalog_revision, old.chunk.id));
+        }
+    }
+
     pub fn revision(&self) -> u64 {
         self.revision
     }
@@ -1744,11 +1788,14 @@ impl LocalCatalog {
             if txn.revision != catalog.revision.saturating_add(1) {
                 return Err(invalid("local chunk catalog revision is not contiguous"));
             }
+            for id in txn.removed {
+                catalog.remove_record(&id);
+            }
             for record in txn.records {
                 if record.catalog_revision != txn.revision {
                     return Err(invalid("local chunk record has the wrong catalog revision"));
                 }
-                catalog.records.insert(record.chunk.id.clone(), record);
+                catalog.insert_record(record);
             }
             catalog.revision = txn.revision;
             valid_bytes = next_offset;
@@ -1764,6 +1811,7 @@ mod catalog_tail_recovery_tests {
     fn record(revision: u64, label: &str) -> LocalChunkRecord {
         let staged = StagedChunk::new(OperationId::new(label), label.as_bytes().to_vec());
         LocalChunkRecord {
+            read_cache_epoch: 0,
             segment_crc: None,
             stored_length: staged.chunk.length,
             stored_checksum: staged.chunk.content_digest.clone(),
@@ -3252,6 +3300,7 @@ pub struct LocalChunkStore {
     catalog_path: PathBuf,
     catalog: Mutex<LocalCatalog>,
     catalog_committer: CatalogCommitter,
+    read_cache_admission: Mutex<()>,
     next_staging: AtomicU64,
     gc_inventory_cursor: AtomicU64,
     peer_read_crc_mode: crate::config::DfsReadCrcMode,
@@ -3334,6 +3383,7 @@ impl LocalChunkStore {
             catalog_path,
             catalog: Mutex::new(catalog),
             catalog_committer: CatalogCommitter::default(),
+            read_cache_admission: Mutex::new(()),
             next_staging: AtomicU64::new(1),
             gc_inventory_cursor: AtomicU64::new(0),
             peer_read_crc_mode: crate::config::DfsReadCrcMode::Both,
@@ -3993,6 +4043,17 @@ impl LocalChunkStore {
         placement_revision: u64,
         placement_epoch: u64,
     ) -> Result<Vec<ReplicaAck>> {
+        self.persist_batch_kind(staged, target, placement_revision, placement_epoch, 0)
+    }
+
+    fn persist_batch_kind(
+        &self,
+        staged: &[StagedChunk],
+        target: &ReplicaTarget,
+        placement_revision: u64,
+        placement_epoch: u64,
+        read_cache_epoch: u64,
+    ) -> Result<Vec<ReplicaAck>> {
         let _diagnostic = self.coarse_diagnostic("persist_batch", 0);
         #[cfg(any(feature = "dfs", test))]
         let batch_diagnostic =
@@ -4067,7 +4128,19 @@ impl LocalChunkStore {
                         } else {
                             verify_file(&self.path_for_record(existing)?, &item.chunk)
                         } {
-                            Ok(()) => continue,
+                            Ok(()) => {
+                                // A durable write must promote a disposable local copy before ACK.
+                                if existing.read_cache_epoch != 0
+                                    && existing.read_cache_epoch != read_cache_epoch
+                                {
+                                    let mut promoted = existing.clone();
+                                    promoted.read_cache_epoch = read_cache_epoch;
+                                    if installed_chunk_ids.insert(item.chunk.id.clone()) {
+                                        records.push(promoted);
+                                    }
+                                }
+                                continue;
+                            }
                             Err(error) if verified_copy_is_invalid(&error) => {
                                 replace_existing = true
                             }
@@ -4121,6 +4194,7 @@ impl LocalChunkStore {
                 }
                 if installed_chunk_ids.insert(item.chunk.id.clone()) {
                     records.push(LocalChunkRecord {
+                        read_cache_epoch,
                         location: PhysicalLocation::PerChunkFile {
                             relative_path: format!("chunks/{}", item.chunk.id.0),
                         },
@@ -6962,6 +7036,7 @@ mod replica_replay_tests {
             body.write_all(unconfirmed.bytes()).unwrap();
             body.sync_all().unwrap();
             let record = LocalChunkRecord {
+                read_cache_epoch: 0,
                 chunk: unconfirmed.chunk.clone(),
                 segment_crc: None,
                 stored_length: unconfirmed.chunk.length,
