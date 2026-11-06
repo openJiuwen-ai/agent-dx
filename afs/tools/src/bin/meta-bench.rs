@@ -1179,7 +1179,8 @@ async fn service_smoke(store: Arc<Store>) -> BenchResult<Value> {
 /// `--seconds` is the iteration count here. Each iteration times one rmdir of an
 /// empty directory in the seeded (large) root, and one rename of a directory at
 /// depth 8 between its parent and a directory beside it. The setup mkdirs are
-/// not timed.
+/// not timed. Names sort after the seeded files, so a search that walks the
+/// root directory in name order meets every seeded entry first.
 async fn dir_ops(store: Arc<Store>, iterations: u64) -> BenchResult<Value> {
     use afs::dfs::{CallerContext, MkdirRequest, RenameMode, RenameRequest, RmdirRequest};
     store
@@ -1227,18 +1228,18 @@ async fn dir_ops(store: Arc<Store>, iterations: u64) -> BenchResult<Value> {
     for depth in 0..8 {
         let parent = chain[depth].clone();
         let made = service
-            .mkdir(mkdir(parent, format!("deep-{depth}"), operation()))
+            .mkdir(mkdir(parent, format!("zz-deep-{depth}"), operation()))
             .await?;
         chain.push(made.inode_id);
     }
     let beside = service
-        .mkdir(mkdir(chain[7].clone(), "beside".into(), operation()))
+        .mkdir(mkdir(chain[7].clone(), "zz-beside".into(), operation()))
         .await?
         .inode_id;
     let (mut rmdir_ns, mut rename_ns) = (BTreeMap::new(), BTreeMap::new());
     let mut at_beside = false;
     for index in 0..iterations {
-        let name = format!("empty-{index}");
+        let name = format!("zz-empty-{index}");
         service
             .mkdir(mkdir(InodeId::new(ROOT), name.clone(), operation()))
             .await?;
@@ -1266,9 +1267,9 @@ async fn dir_ops(store: Arc<Store>, iterations: u64) -> BenchResult<Value> {
                 operation_id: operation(),
                 namespace_id: namespace.clone(),
                 old_parent_inode_id: from,
-                old_name: b"deep-7".to_vec(),
+                old_name: b"zz-deep-7".to_vec(),
                 new_parent_inode_id: to,
-                new_name: b"deep-7".to_vec(),
+                new_name: b"zz-deep-7".to_vec(),
                 mode: RenameMode::NoReplace,
                 caller: caller.clone(),
             })
