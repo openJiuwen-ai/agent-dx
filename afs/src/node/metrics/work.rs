@@ -316,6 +316,8 @@ const PEER_READ_EVENTS: &[&str] = &[
     "stream_verified_group",
     "stream_group_corrupt",
     "stream_proof_retired",
+    "suspect_copy_invalid",
+    "suspect_copy_not_confirmed",
 ];
 #[cfg(feature = "dfs")]
 const DISK_CACHE_RESOURCES: &[&str] = &[
@@ -1497,6 +1499,8 @@ impl ReadWorkMetrics {
                 | "stream_verified_group"
                 | "stream_group_corrupt"
                 | "stream_proof_retired"
+                | "suspect_copy_invalid"
+                | "suspect_copy_not_confirmed"
         ) {
             self.peer_serve
                 .peer_read_events
@@ -1936,6 +1940,8 @@ mod tests {
             "stream_verified_group",
             "stream_group_corrupt",
             "stream_proof_retired",
+            "suspect_copy_invalid",
+            "suspect_copy_not_confirmed",
         ] {
             metrics.peer_read_event(event);
             assert_eq!(
@@ -1952,7 +1958,7 @@ mod tests {
             .iter()
             .find(|family| family.name() == "afs_dfs_peer_read_events_total")
             .unwrap();
-        assert_eq!(events.get_metric().len(), 15);
+        assert_eq!(events.get_metric().len(), 17);
     }
 
     #[test]

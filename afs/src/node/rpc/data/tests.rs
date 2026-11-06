@@ -3251,6 +3251,7 @@ fn dfs_reuse_test_service(
         replica_timeout: std::time::Duration::from_secs(30),
         rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
         payload_metrics: None,
+        suspect_reviews: Default::default(),
     }
 }
 
@@ -3880,6 +3881,7 @@ async fn dfs_range_service_requires_authority_and_streams_bounded_frames() {
         replica_timeout: std::time::Duration::from_secs(30),
         rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
         payload_metrics: None,
+        suspect_reviews: Default::default(),
     };
     assert!(
         denied
@@ -3898,6 +3900,7 @@ async fn dfs_range_service_requires_authority_and_streams_bounded_frames() {
         replica_timeout: std::time::Duration::from_secs(30),
         rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
         payload_metrics: None,
+        suspect_reviews: Default::default(),
     };
     let mut stream = allowed
         .read_ranges(Request::new(request))
@@ -3976,4 +3979,60 @@ async fn retired_open_read_token_gets_no_special_authority() {
     check.validations[0].grant.token = "dfs-open-v1:read-open:old-process".into();
     let error = service.validate_read_grants(check).await.unwrap_err();
     assert_eq!(error.code(), afs_error::IO_PERMISSION_DENIED);
+}
+
+/// R59：持有方只信自己读盘：坏副本被隔离（之后由修复 worker 自报 Meta），好副本不变；
+/// 同一 chunk 冷却期内不重复全量校验。
+#[cfg(feature = "dfs")]
+#[tokio::test]
+async fn a_suspect_review_quarantines_only_a_copy_that_is_bad_on_this_disk() {
+    use crate::{dfs::OperationId, node::chunk::StagedChunk};
+    fn find_body(dir: &std::path::Path, body: &[u8]) -> Option<std::path::PathBuf> {
+        std::fs::read_dir(dir).unwrap().find_map(|entry| {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                find_body(&path, body)
+            } else {
+                (std::fs::read(&path).unwrap() == body).then_some(path)
+            }
+        })
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let local = Arc::new(LocalChunkStore::open(temp.path(), "node-b").unwrap());
+    let good = StagedChunk::new(OperationId::new("good"), vec![1; 8192]);
+    let bad = StagedChunk::new(OperationId::new("bad"), vec![2; 8192]);
+    for staged in [good.clone(), bad.clone()] {
+        local.put(staged).unwrap();
+    }
+    let path = find_body(temp.path(), &vec![2; 8192]).unwrap();
+    let mut body = std::fs::read(&path).unwrap();
+    body[100] ^= 0xff;
+    std::fs::write(&path, body).unwrap();
+    let service = dfs_reuse_test_service(local.clone(), Arc::new(DenyDfsReadAuthorizer));
+    let review = |chunk: &StagedChunk| {
+        Request::new(afs_protocol::node_data::DfsReviewSuspectChunkRequest {
+            chunk_id: chunk.chunk.id.0.clone(),
+        })
+    };
+    let reply = service
+        .review_suspect_chunk(review(&good))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(reply.reviewed && !reply.copy_invalid);
+    let reply = service
+        .review_suspect_chunk(review(&bad))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(reply.reviewed && reply.copy_invalid);
+    let quarantined = local.quarantined_chunks().unwrap();
+    assert_eq!(quarantined.len(), 1);
+    assert_eq!(quarantined[0].chunk.id, bad.chunk.id);
+    let again = service
+        .review_suspect_chunk(review(&good))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!again.reviewed, "cooling down");
 }

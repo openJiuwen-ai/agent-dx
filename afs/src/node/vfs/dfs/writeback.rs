@@ -20,6 +20,11 @@ impl DistributedFs {
         self.progress_writeback()
     }
 
+    /// R59: ask holders to re-verify copies this Node's reads found suspect.
+    pub fn review_suspect_copies(&self, limit: usize) -> Result<usize> {
+        self.read_engine.review_suspect_copies(limit)
+    }
+
     pub fn renew_active_write_leases(&self) -> Result<usize> {
         // Open idle writers and unknown commits still depend on their lease.
         // Renew independently of writeback, without changing a frozen request.

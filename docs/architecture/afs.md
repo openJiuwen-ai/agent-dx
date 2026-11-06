@@ -511,6 +511,17 @@ singleflight与额度不变。容量不足不当作损坏，不丢弃健康证�
 扫描仍保留。修复失败只放弃可选优化，不削弱正文／catalog／receipt持久屏障。
 固定修复锁及reader结构属于有界运行时开销，不宣称被proof额度覆盖全部Node内存。
 
+### 接收方校验失败的副本复核
+
+对端字节没通过接收方内容校验（`NODE_TRANSFER_CORRUPT_DATA`）时，读照常换下一个副本。默认
+`receiver` 模式下整段对齐的 CRC 读，服务方发送前不校验盘上数据，这类盘上损坏只有接收方能发现；但接收方
+分不清是盘坏还是传输翻位，Meta 也只接受报告自己设备上的副本。所以接收方把该副本放进故障层有界去重队列
+（`node/fault/suspect.rs`，读路径不等待，同一副本 60 秒内只报一次；批量失败只在逐个单试定位后才报），
+每 5 秒最多发 8 个 `DfsChunks.ReviewSuspectChunk`。持有方只信自己读盘的结果：全量校验（同时只做一个、同一
+chunk 60 秒内只做一次），坏副本经 `CopyLifecycle` 隔离，再由修复 worker 走原有 `ReportChunkCorruption` 自报，
+Meta 标坏并安排修复；校验通过则什么都不改。`afs_dfs_peer_read_events_total` 的 `suspect_copy_invalid` 与
+`suspect_copy_not_confirmed` 分别计数，后者持续增长说明链路有问题。
+
 ### B端可丢弃磁盘缓存与Peer交接
 
 B的`dfs_peer_cache`默认OFF，只存可丢弃磁盘副本，不写入LocalChunkStore副本目录，

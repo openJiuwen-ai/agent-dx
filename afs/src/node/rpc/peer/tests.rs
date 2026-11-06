@@ -258,6 +258,12 @@ impl afs_protocol::node_data::dfs_chunks_server::DfsChunks for DiskStreamFixture
     ) -> Result<Response<afs_protocol::node_data::DfsReplicaAck>, Status> {
         Err(Status::unimplemented("unused fixture RPC"))
     }
+    async fn review_suspect_chunk(
+        &self,
+        _request: Request<afs_protocol::node_data::DfsReviewSuspectChunkRequest>,
+    ) -> Result<Response<afs_protocol::node_data::DfsReviewSuspectChunkReply>, Status> {
+        Err(Status::unimplemented("unused fixture RPC"))
+    }
     async fn negotiate_rdma(
         &self,
         _request: Request<afs_protocol::node_data::DfsNegotiateRdmaRequest>,

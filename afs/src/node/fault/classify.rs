@@ -84,6 +84,15 @@ pub(crate) fn read_authority_rejected(error: &Error) -> bool {
     )
 }
 
+/// A peer's bytes failed this reader's content verification, so that copy may
+/// be bad on disk (or the bytes flipped in transit: only the holder can tell).
+/// Set: code `NODE_TRANSFER_CORRUPT_DATA`. Frame protocol violations, transport
+/// errors, timeouts and authorization are not content.
+#[cfg(feature = "dfs")]
+pub(crate) fn remote_copy_content_suspect(error: &Error) -> bool {
+    error.code() == afs_error::NODE_TRANSFER_CORRUPT_DATA
+}
+
 /// A peer-cache entry is corrupt or gone, so it is retired and counted as a
 /// miss. Set: code `NODE_TRANSFER_CORRUPT_DATA` ∪ kind {`NotFound`}.
 #[cfg(feature = "dfs")]
@@ -234,5 +243,21 @@ mod tests {
             cached_copy_is_invalid,
             afs_error::NODE_TRANSFER_CORRUPT_DATA
         ));
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn remote_suspect_set() {
+        assert!(remote_copy_content_suspect(&Error::coded(
+            afs_error::NODE_TRANSFER_CORRUPT_DATA,
+            "x"
+        )));
+        for code in [
+            afs_error::CLIENT_PROTOCOL_VIOLATION,
+            afs_error::NODE_VFS_UNAVAILABLE,
+            afs_error::IO_TIMEOUT,
+        ] {
+            assert!(!remote_copy_content_suspect(&Error::coded(code, "x")));
+        }
     }
 }

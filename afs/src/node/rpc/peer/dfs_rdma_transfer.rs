@@ -55,6 +55,16 @@ impl crate::node::read::engine::ChunkTransfer for RdmaChunkTransfer {
     fn verification_metrics(&self) -> Option<&ReadWorkMetrics> {
         self.pool.peers.read_work_metrics.as_ref()
     }
+    /// The review is one small control RPC; it never needs the RDMA data path.
+    fn review_suspect_chunk(
+        &self,
+        suspect: &crate::node::fault::suspect::SuspectCopy,
+    ) -> afs_error::Result<bool> {
+        match &self.fallback {
+            Some(grpc) => grpc.review_suspect_chunk(suspect),
+            None => Ok(false),
+        }
+    }
     fn read_ranges(
         &self,
         batch: &crate::node::read::engine::PeerReadBatch,

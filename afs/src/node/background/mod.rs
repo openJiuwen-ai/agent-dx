@@ -27,6 +27,7 @@
 //! | T2 | `MetaHeartbeat` | `node::registration` | fatal |
 //! | T3 | `OwnerPeerReaper` | `node::assembly::ownerfs` | retry |
 //! | T4 | `Reaper` | `node::fault::reaper` | retry |
+//! | T4b | `SuspectReviewer` | `node::fault::suspect` | retry |
 //! | T5 | `LeaseKeeper` | `node::fault::lease_keeper` | retry |
 //! | T6 | `DfsBackgroundTick` | `tick` | retry |
 //! | T7 | `LocalApiWatch` | `local_api_watch` | fatal |

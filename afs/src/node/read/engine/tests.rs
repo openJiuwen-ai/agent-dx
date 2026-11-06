@@ -2214,15 +2214,27 @@ fn characterize_quarantine_has_taken_effect_when_detecting_read_returns() {
 struct RotationTransfer {
     failing: Vec<&'static str>,
     denied: Vec<&'static str>,
+    corrupt: Vec<&'static str>,
     attempts: Mutex<Vec<Vec<String>>>,
+    reviews: Mutex<Vec<crate::node::fault::suspect::SuspectCopy>>,
 }
 
 impl RotationTransfer {
     fn new(failing: &[&'static str], denied: &[&'static str]) -> Arc<Self> {
+        Self::with_corrupt(failing, denied, &[])
+    }
+
+    fn with_corrupt(
+        failing: &[&'static str],
+        denied: &[&'static str],
+        corrupt: &[&'static str],
+    ) -> Arc<Self> {
         Arc::new(Self {
             failing: failing.to_vec(),
             denied: denied.to_vec(),
+            corrupt: corrupt.to_vec(),
             attempts: Mutex::new(Vec::new()),
+            reviews: Mutex::new(Vec::new()),
         })
     }
 
@@ -2232,6 +2244,13 @@ impl RotationTransfer {
 }
 
 impl ChunkTransfer for RotationTransfer {
+    fn review_suspect_chunk(
+        &self,
+        suspect: &crate::node::fault::suspect::SuspectCopy,
+    ) -> Result<bool> {
+        self.reviews.lock().unwrap().push(suspect.clone());
+        Ok(true)
+    }
     fn read_ranges(&self, batch: &PeerReadBatch, out: &mut [u8]) -> Result<()> {
         let copies: Vec<String> = batch
             .operations
@@ -2250,6 +2269,15 @@ impl ChunkTransfer for RotationTransfer {
             .any(|copy| self.failing.contains(&copy.as_str()))
         {
             return Err(unavailable("injected rotation failure"));
+        }
+        if copies
+            .iter()
+            .any(|copy| self.corrupt.contains(&copy.as_str()))
+        {
+            return Err(Error::coded(
+                afs_error::NODE_TRANSFER_CORRUPT_DATA,
+                "injected content mismatch",
+            ));
         }
         for item in &batch.operations {
             let start = item.op.output_offset;
@@ -2270,6 +2298,16 @@ fn rotation_read(
     chunks: Vec<(ChunkId, Vec<SourceCandidate>)>,
     transfer: Arc<RotationTransfer>,
     out: &mut [u8],
+) -> Result<()> {
+    rotation_read_reviewing(chunks, transfer, out, false)
+}
+
+/// `review`: after the read, run one suspect review pass.
+fn rotation_read_reviewing(
+    chunks: Vec<(ChunkId, Vec<SourceCandidate>)>,
+    transfer: Arc<RotationTransfer>,
+    out: &mut [u8],
+    review: bool,
 ) -> Result<()> {
     let temp = tempfile::tempdir().unwrap();
     let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
@@ -2304,7 +2342,7 @@ fn rotation_read(
         transfer,
         DfsReadConfig::default(),
     );
-    engine.read_batch(
+    let result = engine.read_batch(
         &ReadBatch {
             lookahead: Vec::new(),
             file_version_id: Some(FileVersionId::new("version")),
@@ -2312,7 +2350,67 @@ fn rotation_read(
             ops,
         },
         out,
+    );
+    if review {
+        engine.review_suspect_copies(8).unwrap();
+    }
+    result
+}
+
+/// R59：对端字节没通过本端内容校验时，请持有方复核一次（读照常换下一个副本成功）；
+/// 传输错误不请复核。
+#[test]
+fn a_content_mismatch_asks_the_holder_to_review_once_and_a_transport_error_does_not() {
+    let chunk = ChunkId::new("suspect");
+    let transfer = RotationTransfer::with_corrupt(&["flaky-b"], &[], &["bad-c"]);
+    let mut out = [0; 4];
+    rotation_read_reviewing(
+        vec![(
+            chunk.clone(),
+            vec![
+                source("flaky-b", &chunk, "node-b"),
+                source("bad-c", &chunk, "node-c"),
+                source("good-d", &chunk, "node-d"),
+            ],
+        )],
+        transfer.clone(),
+        &mut out,
+        true,
     )
+    .unwrap();
+    assert_eq!(out, [b'r'; 4]);
+    let reviews = transfer.reviews.lock().unwrap().clone();
+    assert_eq!(reviews.len(), 1, "{reviews:?}");
+    assert_eq!(reviews[0].node_id, "node-c");
+    assert_eq!(reviews[0].chunk_id, chunk);
+    assert_eq!(reviews[0].endpoint, "http://node-c");
+}
+
+/// R59：批量失败不知道是哪个副本，只在逐个单试确认后才请复核。
+#[test]
+fn a_batch_failure_is_attributed_only_by_the_single_retry() {
+    let (first, second) = (ChunkId::new("first"), ChunkId::new("second"));
+    let transfer = RotationTransfer::with_corrupt(&[], &[], &["bad-b2"]);
+    let mut out = [0; 8];
+    rotation_read_reviewing(
+        vec![
+            (first.clone(), vec![source("good-b1", &first, "node-b")]),
+            (
+                second.clone(),
+                vec![
+                    source("bad-b2", &second, "node-b"),
+                    source("good-c2", &second, "node-c"),
+                ],
+            ),
+        ],
+        transfer.clone(),
+        &mut out,
+        true,
+    )
+    .unwrap();
+    let reviews = transfer.reviews.lock().unwrap().clone();
+    assert_eq!(reviews.len(), 1, "{reviews:?}");
+    assert_eq!(reviews[0].chunk_id, second);
 }
 
 #[test]

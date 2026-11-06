@@ -64,6 +64,7 @@ pub struct DfsChunksService {
     pub(super) replica_timeout: std::time::Duration,
     pub(super) rdma_sessions: super::super::control::RdmaSessionRegistry,
     pub(super) payload_metrics: Option<DfsPayloadMetrics>,
+    pub(super) suspect_reviews: Arc<crate::node::fault::suspect::SuspectReviewGate>,
 }
 
 #[cfg(all(feature = "dfs", test))]
@@ -126,6 +127,7 @@ pub fn make_dfs_chunks_server_with_transport(
         replica_timeout,
         rdma_sessions: resources.rdma_sessions,
         payload_metrics: resources.payload_metrics,
+        suspect_reviews: Default::default(),
     })
 }
 
@@ -370,6 +372,47 @@ impl DfsChunks for DfsChunksService {
     ) -> Result<Response<DfsReplicaAck>, Status> {
         Err(Status::unimplemented(
             "DFS replica confirmation is not implemented; no durable acknowledgement exists",
+        ))
+    }
+
+    /// R59: trust only this disk. A bad copy is quarantined by `open_verified`
+    /// and the repair worker self-reports it; a healthy one changes nothing.
+    async fn review_suspect_chunk(
+        &self,
+        request: Request<afs_protocol::node_data::DfsReviewSuspectChunkRequest>,
+    ) -> Result<Response<afs_protocol::node_data::DfsReviewSuspectChunkReply>, Status> {
+        authenticate_peer(self.authenticator.as_ref(), &request)?;
+        let chunk_id = crate::dfs::ChunkId::new(request.into_inner().chunk_id);
+        let local = self
+            .local_chunks
+            .clone()
+            .ok_or_else(|| Status::unavailable("DFS chunk store is not available"))?;
+        let Some(permit) = self.suspect_reviews.admit(&chunk_id) else {
+            return Ok(Response::new(
+                afs_protocol::node_data::DfsReviewSuspectChunkReply {
+                    reviewed: false,
+                    copy_invalid: false,
+                },
+            ));
+        };
+        let copy_invalid = crate::node::bridge::spawn_blocking(move || {
+            let _permit = permit;
+            match local.open_verified(&chunk_id) {
+                Ok(_) => Ok(false),
+                Err(error) if crate::node::fault::classify::verified_copy_is_invalid(&error) => {
+                    Ok(true)
+                }
+                Err(error) => Err(error),
+            }
+        })
+        .await
+        .map_err(|error| Status::internal(error.to_string()))?
+        .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(
+            afs_protocol::node_data::DfsReviewSuspectChunkReply {
+                reviewed: true,
+                copy_invalid,
+            },
         ))
     }
 

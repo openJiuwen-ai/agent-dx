@@ -190,10 +190,39 @@ impl DfsReadEngine {
                     return Err(error);
                 }
                 self.capture_native_read_authority()?;
+                // A batch error does not say which copy failed; a lone one does.
+                if let [item] = attempt.operations.as_slice() {
+                    self.note_suspect_copy(&error, item);
+                }
                 progress.last_error = Some(error);
                 self.retry_group_singly(round, group, &attempt, out, progress)
                     .await
             }
+        }
+    }
+
+    /// Queues the copy for its holder's review when its bytes failed this
+    /// reader's content verification (R59). Never waits.
+    fn note_suspect_copy(&self, error: &Error, item: &ResolvedReadOp) {
+        if !crate::node::fault::classify::remote_copy_content_suspect(error) {
+            return;
+        }
+        if let (
+            CopyLocation::Node {
+                node_id,
+                node_epoch,
+                ..
+            },
+            Some(endpoint),
+        ) = (&item.source.location, item.source.node_data_endpoint())
+        {
+            self.suspect_copies
+                .report(crate::node::fault::suspect::SuspectCopy {
+                    node_id: node_id.clone(),
+                    node_epoch: *node_epoch,
+                    endpoint: endpoint.to_owned(),
+                    chunk_id: item.source.chunk_id.clone(),
+                });
         }
     }
 
@@ -244,6 +273,7 @@ impl DfsReadEngine {
                             return Err(error);
                         }
                         self.capture_native_read_authority()?;
+                        self.note_suspect_copy(&error, item);
                         progress.last_error = Some(error);
                     }
                 }

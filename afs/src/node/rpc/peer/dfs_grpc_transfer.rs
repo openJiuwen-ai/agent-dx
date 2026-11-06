@@ -841,6 +841,38 @@ async fn consume_peer_stream<'c>(
 
 #[cfg(feature = "dfs")]
 impl crate::node::read::engine::ChunkTransfer for GrpcChunkTransfer {
+    fn review_suspect_chunk(
+        &self,
+        suspect: &crate::node::fault::suspect::SuspectCopy,
+    ) -> afs_error::Result<bool> {
+        self.runtime.block_on(async {
+            let channel = tokio::time::timeout(
+                self.timeout,
+                self.peers
+                    .channel(&suspect.node_id, suspect.node_epoch, &suspect.endpoint),
+            )
+            .await
+            .map_err(|_| {
+                afs_error::Error::coded(
+                    afs_error::CLIENT_DEADLINE_EXCEEDED,
+                    "DFS suspect copy review connection deadline exceeded",
+                )
+            })??;
+            let mut request = request_with_current_context(
+                afs_protocol::node_data::DfsReviewSuspectChunkRequest {
+                    chunk_id: suspect.chunk_id.0.clone(),
+                },
+            );
+            request.set_timeout(self.timeout);
+            let reply = DfsChunksClient::new(channel)
+                .review_suspect_chunk(request)
+                .await
+                .map_err(afs_transport::grpc::error_status::status_to_error)?
+                .into_inner();
+            Ok(reply.copy_invalid)
+        })
+    }
+
     fn block_on_read(
         &self,
         future: crate::node::read::admission::ReadFuture<'_, ()>,

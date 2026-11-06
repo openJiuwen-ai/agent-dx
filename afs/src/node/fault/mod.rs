@@ -8,6 +8,8 @@
 //! - `reaper`: the GC collection loop.
 //! - `lease_keeper`: background writer-lease renewal, plus `ensure_fresh` for
 //!   the three main paths whose contract needs a fresh lease (J4).
+//! - `suspect`: a reader's failed verification of a peer copy, reviewed by the
+//!   holder.
 //!
 //! Loop conventions shared by `repair`, `reaper` and `lease_keeper`: each is
 //! a named component built by the Node assembly (`node::assembly`) and
@@ -26,3 +28,5 @@ pub(crate) mod lease_keeper;
 pub(crate) mod reaper;
 #[cfg(feature = "dfs")]
 pub(crate) mod repair;
+#[cfg(feature = "dfs")]
+pub(crate) mod suspect;

@@ -56,6 +56,19 @@ service DfsChunks {
   rpc NegotiateRdma(DfsNegotiateRdmaRequest) returns (DfsNegotiateRdmaReply);
   rpc CloseRdma(DfsCloseRdmaRequest) returns (DfsCloseRdmaReply);
   rpc ReadRangesRdma(DfsReadRangesRdmaRequest) returns (DfsReadRangesRdmaReply);
+  // A reader's verification of this Node's copy failed. The holder re-verifies
+  // its own disk; a bad copy goes through the normal quarantine and self-report.
+  rpc ReviewSuspectChunk(DfsReviewSuspectChunkRequest) returns (DfsReviewSuspectChunkReply);
+}
+
+message DfsReviewSuspectChunkRequest {
+  string chunk_id = 1;
+}
+
+message DfsReviewSuspectChunkReply {
+  // False when this chunk was reviewed recently or another review is running.
+  bool reviewed = 1;
+  bool copy_invalid = 2;
 }
 
 message DfsPutReplicaHeader {

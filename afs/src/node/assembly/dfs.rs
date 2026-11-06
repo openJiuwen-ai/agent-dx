@@ -476,7 +476,7 @@ async fn open_peer_cache(
     Ok(cache)
 }
 
-/// T4 `Reaper`, T5 `LeaseKeeper` and T6 `DfsBackgroundTick`, in this order.
+/// T4 `Reaper`, `SuspectReviewer`, T5 `LeaseKeeper` and T6 `DfsBackgroundTick`, in this order.
 pub(super) fn start_background(
     cfg: &Config,
     dfs: Arc<vfs::dfs::DistributedFs>,
@@ -484,6 +484,9 @@ pub(super) fn start_background(
     services: &mut Services,
 ) {
     fault::reaper::Reaper::new(assembly.gc_collector.clone()).start(services);
+    let reviewing = dfs.clone();
+    fault::suspect::SuspectReviewer::new(move |limit| reviewing.review_suspect_copies(limit))
+        .start(services);
     let renewing = dfs.clone();
     fault::lease_keeper::LeaseKeeper::new(move || renewing.renew_active_write_leases())
         .start(services);

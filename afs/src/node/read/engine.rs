@@ -340,6 +340,14 @@ pub trait ChunkTransfer: Send + Sync {
         })
     }
 
+    /// Ask a copy's holder to re-verify it; whether the holder found it invalid.
+    fn review_suspect_chunk(
+        &self,
+        _suspect: &crate::node::fault::suspect::SuspectCopy,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     fn supports_async_native_read(&self) -> bool {
         false
     }
@@ -543,6 +551,7 @@ pub struct DfsReadEngine {
     local: Arc<LocalChunkStore>,
     source_provider: Arc<dyn ReadSourceProvider>,
     transfer: Arc<dyn ChunkTransfer>,
+    suspect_copies: Arc<crate::node::fault::suspect::SuspectQueue>,
     config: DfsReadConfig,
     external_backend: Option<ExternalReadBackend>,
     peer_cache: Option<Arc<DiskPeerCache>>,
@@ -599,6 +608,31 @@ impl DfsReadEngine {
 
     /// Forget cached readers of `chunks` and every cached source list before
     /// GC retires those local copies (`node::gc::Collector`).
+    /// Asks holders to re-verify up to `limit` suspect copies; one failure does
+    /// not stop the others. Returns the copies the holders found invalid.
+    pub(crate) fn review_suspect_copies(&self, limit: usize) -> Result<usize> {
+        let mut invalid = 0;
+        let mut first_error = None;
+        for suspect in self.suspect_copies.take(limit) {
+            match self.transfer.review_suspect_chunk(&suspect) {
+                Ok(true) => {
+                    invalid += 1;
+                    self.local.record_peer_read_event("suspect_copy_invalid");
+                    afs_logging::warn!("dfs.suspect_copy_invalid";
+                        "chunk" => suspect.chunk_id.0.clone(),
+                        "node" => suspect.node_id.clone());
+                }
+                Ok(false) => self
+                    .local
+                    .record_peer_read_event("suspect_copy_not_confirmed"),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(invalid), Err)
+    }
+
     pub(crate) fn evict_collected(&self, chunks: &[ChunkId]) -> Result<()> {
         self.readers
             .lock()
@@ -635,6 +669,7 @@ impl DfsReadEngine {
             local,
             source_provider,
             transfer,
+            suspect_copies: Default::default(),
             config,
             external_backend: None,
             peer_cache: None,
@@ -703,6 +738,7 @@ impl DfsReadEngine {
             local: self.local.clone(),
             source_provider: self.source_provider.clone(),
             transfer: self.transfer.clone(),
+            suspect_copies: self.suspect_copies.clone(),
             config: self.config.clone(),
             external_backend: None,
             peer_cache: self.peer_cache.clone(),
