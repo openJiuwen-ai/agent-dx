@@ -24,6 +24,10 @@ use crate::node::chunk::StagedChunk;
 struct RecordingStore {
     inner: Arc<Store>,
     txns: Mutex<Vec<MetaTxn>>,
+    /// A heartbeat landing between a decision and its commit.
+    heartbeat_before_next_commit: Mutex<Option<(RequestKey, NodeSessionLease)>>,
+    /// This node's CurrentNodeSession read fails like a storage error.
+    fail_session_read_of: Mutex<Option<String>>,
 }
 
 impl RecordingStore {
@@ -43,11 +47,27 @@ impl MetaStore for RecordingStore {
         self.inner.read_view()
     }
     fn read(&self, read: MetaRead) -> crate::meta::store::MetaFuture<'_, MetaSnapshot> {
+        if let MetaRead::CurrentNodeSession { node_id } = &read
+            && self.fail_session_read_of.lock().unwrap().as_ref() == Some(node_id)
+        {
+            return Box::pin(async {
+                Err(Error::coded(
+                    afs_error::META_CATALOG_INVALID_REQUEST,
+                    "injected session read failure",
+                ))
+            });
+        }
         self.inner.read(read)
     }
     fn compare_and_commit(&self, txn: MetaTxn) -> crate::meta::store::MetaFuture<'_, TxnOutcome> {
         self.txns.lock().unwrap().push(txn.clone());
-        self.inner.compare_and_commit(txn)
+        let heartbeat = self.heartbeat_before_next_commit.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some((request, lease)) = heartbeat {
+                self.inner.register_node_session(request, lease).await?;
+            }
+            self.inner.compare_and_commit(txn).await
+        })
     }
     fn watch(
         &self,
@@ -222,6 +242,8 @@ impl RepairFixture {
         let recording = Arc::new(RecordingStore {
             inner: store.clone(),
             txns: Mutex::new(Vec::new()),
+            heartbeat_before_next_commit: Mutex::new(None),
+            fail_session_read_of: Mutex::new(None),
         });
         register(&store, "source", "source-s1", 0).await;
         register(&store, "target", "target-s1", 0).await;
@@ -595,6 +617,8 @@ impl CommitFixture {
         let recording = Arc::new(RecordingStore {
             inner: store.clone(),
             txns: Mutex::new(Vec::new()),
+            heartbeat_before_next_commit: Mutex::new(None),
+            fail_session_read_of: Mutex::new(None),
         });
         register(&store, "writer", "writer-s1", 0).await;
         register(&store, "peer", "peer-s1", 0).await;
@@ -816,6 +840,252 @@ macro_rules! snapshot_cases {
             )+
         }
     };
+}
+
+impl RepairFixture {
+    /// `node` restarted and its first heartbeat reports a catalog below the
+    /// copy's revision, so its copy cannot serve yet; `arm` makes the heartbeat
+    /// that repairs that land just before the next transaction commits.
+    async fn restart_with_stale_catalog(&self, node: &str, arm: bool) {
+        let session = format!("{node}-s2");
+        register(&self.store, node, &session, 0).await;
+        if arm {
+            *self.recording.heartbeat_before_next_commit.lock().unwrap() = Some((
+                RequestKey::new(node, "heartbeat-with-catalog"),
+                NodeSessionLease {
+                    node_id: node.into(),
+                    session_id: session,
+                    grpc_addr: format!("http://{node}:1"),
+                    data_addr: format!("http://{node}:2"),
+                    rest_addr: format!("http://{node}:3"),
+                    ownerfs_enabled: false,
+                    storage_devices: vec![device(node, 1)],
+                    lease_ttl: std::time::Duration::from_secs(60),
+                },
+            ));
+        }
+    }
+
+    /// Adds a second durable copy on `other`, registered and able to serve.
+    async fn add_other_copy(&self) -> CopyRecord {
+        register(&self.store, "other", "other-s1", 0).await;
+        let other = CopyRecord {
+            id: CopyId::new("copy-other"),
+            location: CopyLocation::Node {
+                node_id: "other".into(),
+                node_epoch: 1,
+                device_id: "other-dev".into(),
+                device_epoch: 1,
+                catalog_revision: 1,
+            },
+            ..self.copy.clone()
+        };
+        let mut placement = self.placement.clone();
+        placement.copies.push(other.id.clone());
+        seed(
+            &self.store,
+            "seed-other-copy",
+            vec![
+                MetaEntity::DfsCopy(other.clone()),
+                MetaEntity::DfsPlacement(placement),
+            ],
+        )
+        .await;
+        other
+    }
+
+    async fn stored_health(&self) -> PlacementHealth {
+        let Some(MetaEntity::DfsPlacement(placement)) = self
+            .store
+            .read(MetaRead::DfsPlacement(self.chunk.id.clone()))
+            .await
+            .unwrap()
+            .entity
+        else {
+            panic!("placement is missing");
+        };
+        placement.health
+    }
+}
+
+// R62: a claim that saw no live source must not park the task when the source
+// came back before the commit.
+#[tokio::test]
+async fn claim_does_not_block_a_source_that_returned_before_commit() {
+    let f = RepairFixture::new().await;
+    f.restart_with_stale_catalog("source", true).await;
+    let result = f
+        .service
+        .claim_replication_task(ClaimReplicationTask {
+            caller_id: "target".into(),
+            caller_session_id: "target-s1".into(),
+            caller_node_epoch: 1,
+            operation_id: OperationId::new("claim-raced"),
+            lease_seconds: 30,
+        })
+        .await;
+    assert_ne!(
+        f.stored_health().await,
+        PlacementHealth::BlockedNoSource,
+        "claim result {result:?}"
+    );
+    let retried = f
+        .service
+        .claim_replication_task(ClaimReplicationTask {
+            caller_id: "source".into(),
+            caller_session_id: "source-s2".into(),
+            caller_node_epoch: 2,
+            operation_id: OperationId::new("claim-retried"),
+            lease_seconds: 30,
+        })
+        .await
+        .unwrap();
+    assert!(retried.is_some(), "the returned source can repair");
+}
+
+// R62: same decision in the report path. The other node's copy came back while
+// the worker reported its source invalid.
+#[tokio::test]
+async fn source_invalid_does_not_block_a_source_that_returned_before_commit() {
+    let f = RepairFixture::new().await;
+    f.add_other_copy().await;
+    let claim = f.claimed().await;
+    f.restart_with_stale_catalog("other", true).await;
+    let result = f
+        .service
+        .report_replication_task(ReportReplicationTask {
+            caller_id: "source".into(),
+            caller_session_id: "source-s1".into(),
+            caller_node_epoch: 1,
+            operation_id: OperationId::new("report-raced"),
+            claim,
+            durable_acks: Vec::new(),
+            error: None,
+            source_invalid: true,
+        })
+        .await;
+    assert_ne!(
+        f.stored_health().await,
+        PlacementHealth::BlockedNoSource,
+        "report result {result:?}"
+    );
+}
+
+// R62: same decision in the corruption report path.
+#[tokio::test]
+async fn corruption_report_does_not_block_a_source_that_returned_before_commit() {
+    let f = RepairFixture::new().await;
+    f.add_other_copy().await;
+    f.restart_with_stale_catalog("other", true).await;
+    let result = f
+        .service
+        .report_chunk_corruption(ReportChunkCorruption {
+            caller_id: "source".into(),
+            caller_session_id: "source-s1".into(),
+            caller_node_epoch: 1,
+            operation_id: OperationId::new("corrupt-raced"),
+            chunk_id: f.chunk.id.clone(),
+            device_id: "source-dev".into(),
+            device_epoch: 1,
+            catalog_revision: 2,
+        })
+        .await;
+    assert_ne!(
+        f.stored_health().await,
+        PlacementHealth::BlockedNoSource,
+        "report result {result:?}"
+    );
+}
+
+// R62: a storage error reading a session is not "no live source".
+#[tokio::test]
+async fn a_session_read_error_is_not_reported_as_no_live_source() {
+    let f = RepairFixture::new().await;
+    *f.recording.fail_session_read_of.lock().unwrap() = Some("source".into());
+    let result = f
+        .service
+        .claim_replication_task(ClaimReplicationTask {
+            caller_id: "target".into(),
+            caller_session_id: "target-s1".into(),
+            caller_node_epoch: 1,
+            operation_id: OperationId::new("claim-unreadable"),
+            lease_seconds: 30,
+        })
+        .await;
+    assert!(result.is_err(), "{result:?}");
+    assert_ne!(f.stored_health().await, PlacementHealth::BlockedNoSource);
+}
+
+// R14: only reliable roles count. A cache copy must not satisfy the placement
+// or hide the repair debt.
+#[tokio::test]
+async fn commit_counts_only_reliable_copy_roles() {
+    let replication = ReplicationConfig {
+        desired_copies: 2,
+        sync_required_copies: 1,
+        min_distinct_nodes: 1,
+        min_distinct_failure_domains: 1,
+        local_copy: LocalCopyPolicy::Required,
+    };
+    let f = CommitFixture::new(replication.clone()).await;
+    let receipt = &f.commit.chunk_receipts[0];
+    let durable = CopyRecord {
+        id: CopyId::new("copy-durable"),
+        chunk_id: receipt.chunk.id.clone(),
+        role: CopyRole::DurableReplica,
+        state: CopyState::Ready,
+        location: CopyLocation::Node {
+            node_id: "node".into(),
+            node_epoch: 1,
+            device_id: "node-dev".into(),
+            device_epoch: 1,
+            catalog_revision: 1,
+        },
+        persisted_bytes: receipt.chunk.length,
+        verified_digest: receipt.chunk.content_digest.clone(),
+    };
+    let cache = CopyRecord {
+        id: CopyId::new("copy-cache"),
+        role: CopyRole::VerifiedCache,
+        ..durable.clone()
+    };
+    let mut txn = MetaTxn::new(
+        RequestKey::new("node", "op"),
+        StoreOperation::DfsCommitFileVersion,
+    );
+    f.service.push_receipt_mutations(
+        &mut txn,
+        &f.commit,
+        vec![vec![durable.clone(), cache.clone()]],
+        &replication,
+    );
+    let placement = txn
+        .mutations
+        .iter()
+        .find_map(|mutation| match mutation {
+            TxnMutation::Put(MetaEntity::DfsPlacement(placement)) => Some(placement),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(placement.health, PlacementHealth::UnderReplicated);
+    assert!(
+        txn.mutations.iter().any(|mutation| matches!(
+            mutation,
+            TxnMutation::Put(MetaEntity::DfsReplicationTask(_))
+        )),
+        "the repair debt is registered"
+    );
+    assert_eq!(reliable_copy_count(&[durable.clone(), cache.clone()]), 1);
+    assert_eq!(
+        reliable_copy_count(&[
+            durable.clone(),
+            CopyRecord {
+                role: CopyRole::ExternalCommitted,
+                ..durable
+            }
+        ]),
+        2
+    );
 }
 
 snapshot_cases!(

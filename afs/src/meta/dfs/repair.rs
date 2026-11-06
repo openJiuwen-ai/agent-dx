@@ -2,6 +2,21 @@
 
 use super::*;
 
+/// Copies that count toward a chunk's desired copies. Every replica-count
+/// decision goes through this: `VerifiedCache` copies never count, and the
+/// degraded-write judgment (R12) belongs here too.
+pub(super) fn reliable_copy_count(copies: &[CopyRecord]) -> usize {
+    copies
+        .iter()
+        .filter(|copy| {
+            matches!(
+                copy.role,
+                CopyRole::DurableReplica | CopyRole::ExternalCommitted
+            )
+        })
+        .count()
+}
+
 /// Inputs shared by every candidate decision of one claim request.
 struct ClaimContext<'a> {
     request: &'a ClaimReplicationTask,
@@ -130,8 +145,7 @@ impl DfsService {
             .collect::<Vec<_>>();
         candidates.sort_by(|left, right| left.id.cmp(&right.id));
         for placement in placements {
-            if placement.desired_copies <= placement.copies.len() as u16
-                && placement.health == PlacementHealth::Satisfied
+            if placement.health == PlacementHealth::Satisfied
                 && self.live_ready_copy_count(&placement, now).await?
                     >= usize::from(placement.desired_copies)
             {
@@ -189,12 +203,19 @@ impl DfsService {
             Ok(placement) => placement,
             Err(_) => return Ok(None),
         };
-        if self.live_ready_copy_count(&placement, now).await? == 0 {
+        let sources = self.live_sources(&placement, now, None).await?;
+        if sources.count == 0 {
             if task.state != ReplicationTaskState::BlockedNoSource
                 || placement.health != PlacementHealth::BlockedNoSource
             {
                 return self
-                    .block_no_source_txn(context, task, placement, retired_worker_conditions)
+                    .block_no_source_txn(
+                        context,
+                        task,
+                        placement,
+                        retired_worker_conditions,
+                        sources.evidence,
+                    )
                     .await;
             }
             return Ok(None);
@@ -288,6 +309,7 @@ impl DfsService {
         task: ReplicationTask,
         placement: PlacementRecord,
         retired_worker_conditions: Vec<TxnCondition>,
+        no_source_evidence: Vec<TxnCondition>,
     ) -> Result<Option<MetaTxn>> {
         let mut blocked_task = task.clone();
         blocked_task.state = ReplicationTaskState::BlockedNoSource;
@@ -298,6 +320,7 @@ impl DfsService {
         blocked_placement.health = PlacementHealth::BlockedNoSource;
         let (request_key, mut txn) = claim_txn_shell(context.request);
         txn.conditions.extend(retired_worker_conditions);
+        txn.conditions.extend(no_source_evidence);
         txn.conditions.extend([
             TxnCondition::RequestAbsent(request_key.clone()),
             TxnCondition::EntityEquals(MetaEntity::DfsPlacement(placement)),
@@ -446,6 +469,7 @@ impl DfsService {
                 &placement,
                 now,
                 &mut updated_task,
+                &mut conditions,
             )
             .await?
         } else if let Some(error) = request.error.clone() {
@@ -490,6 +514,7 @@ impl DfsService {
         placement: &PlacementRecord,
         now: u64,
         updated_task: &mut ReplicationTask,
+        conditions: &mut Vec<TxnCondition>,
     ) -> Result<Vec<TxnMutation>> {
         if !copy_is_on_node(source_copy, &request.caller_id)
             || !copy_matches_chunk(source_copy, &request.claim.chunk)
@@ -502,16 +527,17 @@ impl DfsService {
         let mut mutations = vec![TxnMutation::Put(MetaEntity::DfsCopy(mark_copy_corrupt(
             source_copy,
         )))];
-        let remaining_live_sources = self
-            .live_ready_copy_count_excluding(placement, now, Some(&source_copy.id))
+        let remaining = self
+            .live_sources(placement, now, Some(&source_copy.id))
             .await?;
         let mut updated_placement = placement.clone();
-        updated_task.state = if remaining_live_sources == 0 {
+        updated_task.state = if remaining.count == 0 {
+            conditions.extend(remaining.evidence);
             ReplicationTaskState::BlockedNoSource
         } else {
             ReplicationTaskState::RetryWaiting
         };
-        updated_placement.health = repair_health_for(remaining_live_sources);
+        updated_placement.health = repair_health_for(remaining.count);
         mutations.push(TxnMutation::Put(MetaEntity::DfsPlacement(
             updated_placement,
         )));
@@ -535,6 +561,11 @@ impl DfsService {
         let accepted = self
             .validate_repair_acks(&request.claim, &request.durable_acks, now, conditions)
             .await?;
+        if reliable_copy_count(&accepted) < usize::from(request.claim.replication.desired_copies) {
+            return Err(invalid(
+                "replication report does not include the full repaired target set",
+            ));
+        }
         let mut mutations = Vec::new();
         let mut copy_ids = placement.copies.clone();
         for copy in accepted {
@@ -542,11 +573,6 @@ impl DfsService {
                 copy_ids.push(copy.id.clone());
             }
             mutations.push(TxnMutation::Put(MetaEntity::DfsCopy(copy)));
-        }
-        if copy_ids.len() < usize::from(request.claim.replication.desired_copies) {
-            return Err(invalid(
-                "replication report does not include the full repaired target set",
-            ));
         }
         mutations.push(TxnMutation::Put(MetaEntity::DfsPlacement(
             PlacementRecord {
@@ -600,13 +626,9 @@ impl DfsService {
             ));
         }
 
-        let remaining_live_sources = live_ready_copy_count_from_observed_excluding(
-            &reported.observed,
-            &reported.changed_ids,
-            self,
-            now,
-        )
-        .await?;
+        let remaining =
+            live_sources_among(&reported.observed, &reported.changed_ids, self, now).await?;
+        let remaining_live_sources = remaining.count;
         let repair_health = repair_health_for(remaining_live_sources);
         let mut updated_placement = placement.clone();
         updated_placement.health = repair_health;
@@ -651,6 +673,9 @@ impl DfsService {
                     conditions,
                 )
                 .await;
+        }
+        if remaining_live_sources == 0 {
+            conditions.extend(remaining.evidence);
         }
 
         let txn = corruption_txn(
@@ -837,35 +862,36 @@ impl DfsService {
     }
 
     async fn live_ready_copy_count(&self, placement: &PlacementRecord, now: u64) -> Result<usize> {
-        self.live_ready_copy_count_excluding(placement, now, None)
-            .await
+        Ok(self.live_sources(placement, now, None).await?.count)
     }
 
-    async fn live_ready_copy_count_excluding(
+    /// Live sources of a placement, with the evidence a "no source" decision
+    /// has to pin. Copies come from their own records; see
+    /// [`live_sources_among`] for the sessions.
+    async fn live_sources(
         &self,
         placement: &PlacementRecord,
         now: u64,
         excluded_copy_id: Option<&CopyId>,
-    ) -> Result<usize> {
+    ) -> Result<LiveSources> {
         let chunk = self.chunk(&placement.chunk_id).await?;
-        let mut nodes = HashSet::new();
+        let mut copies = Vec::new();
         for copy_id in &placement.copies {
             if excluded_copy_id.is_some_and(|excluded| excluded == copy_id) {
                 continue;
             }
             let copy = self.copy(copy_id).await?;
-            if !copy_matches_chunk(&copy, &chunk) {
-                continue;
-            }
-            if let CopyLocation::Node { node_id, .. } = &copy.location
-                && let Ok(session) = self.current_live_session(node_id, now).await
-                && let Some(serving_copy) = serving_read_copy(&copy, &session, now)
-                && let CopyLocation::Node { node_id, .. } = serving_copy.location
-            {
-                nodes.insert(node_id);
+            if copy_matches_chunk(&copy, &chunk) {
+                copies.push(copy);
             }
         }
-        Ok(nodes.len())
+        let mut sources = live_sources_among(&copies, &HashSet::new(), self, now).await?;
+        sources.evidence.extend(
+            copies
+                .into_iter()
+                .map(|copy| TxnCondition::EntityEquals(MetaEntity::DfsCopy(copy))),
+        );
+        Ok(sources)
     }
 
     async fn build_replication_claim(
@@ -1381,29 +1407,59 @@ fn replica_ack_copy_record(ack: &ReplicaAck, chunk: &ChunkObject) -> CopyRecord 
     }
 }
 
-pub(super) async fn live_ready_copy_count_from_observed_excluding(
+/// Live sources among `copies` and what that count rests on. A heartbeat or
+/// re-registration can bring a source back after the count, so a "no source"
+/// decision pins every session it looked at: CAS rejects it instead of parking
+/// a task that has a live source (R62). A read error is an error, never "no
+/// live source".
+pub(super) struct LiveSources {
+    pub(super) count: usize,
+    pub(super) evidence: Vec<TxnCondition>,
+}
+
+pub(super) async fn live_sources_among(
     copies: &[CopyRecord],
     excluded: &HashSet<CopyId>,
     service: &DfsService,
     now: u64,
-) -> Result<usize> {
+) -> Result<LiveSources> {
     let mut nodes = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut evidence = Vec::new();
     for copy in copies {
         if excluded.contains(&copy.id) {
             continue;
         }
-        if let CopyLocation::Node { node_id, .. } = &copy.location {
-            let session = match service.current_live_session(node_id, now).await {
-                Ok(session) => session,
-                Err(error) if error.code() == afs_error::META_DFS_CONFLICT => continue,
-                Err(error) => return Err(error),
-            };
-            if let Some(serving_copy) = serving_read_copy(copy, &session, now)
-                && let CopyLocation::Node { node_id, .. } = serving_copy.location
-            {
-                nodes.insert(node_id);
-            }
+        let CopyLocation::Node { node_id, .. } = &copy.location else {
+            continue;
+        };
+        let key = MetaKey::CurrentNodeSession {
+            node_id: node_id.clone(),
+        };
+        let snapshot = service
+            .store
+            .read(MetaRead::CurrentNodeSession {
+                node_id: node_id.clone(),
+            })
+            .await?;
+        if seen.insert(node_id.clone()) {
+            evidence.push(if snapshot.entity.is_some() {
+                TxnCondition::RevisionEquals {
+                    key,
+                    revision: snapshot.revision,
+                }
+            } else {
+                TxnCondition::Missing(key)
+            });
+        }
+        if let Some(MetaEntity::NodeSession(session)) = snapshot.entity
+            && serving_read_copy(copy, &session, now).is_some()
+        {
+            nodes.insert(node_id.clone());
         }
     }
-    Ok(nodes.len())
+    Ok(LiveSources {
+        count: nodes.len(),
+        evidence,
+    })
 }

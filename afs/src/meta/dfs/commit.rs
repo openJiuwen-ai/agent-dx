@@ -299,7 +299,7 @@ impl DfsService {
 
     /// Records each receipt's chunk, copies and placement; registers the
     /// replica debt of an under-replicated Node placement as a Pending task.
-    fn push_receipt_mutations(
+    pub(super) fn push_receipt_mutations(
         &self,
         txn: &mut MetaTxn,
         commit: &CommitFileVersion,
@@ -318,7 +318,8 @@ impl DfsService {
                 .iter()
                 .map(|copy| copy.id.clone())
                 .collect::<Vec<_>>();
-            let health = if copies.len() >= usize::from(replication.desired_copies) {
+            let reliable_copies = reliable_copy_count(&copies);
+            let health = if reliable_copies >= usize::from(replication.desired_copies) {
                 PlacementHealth::Satisfied
             } else {
                 PlacementHealth::UnderReplicated
@@ -342,7 +343,8 @@ impl DfsService {
                         health,
                     },
                 )));
-            if !self.is_external_backend() && copies.len() < usize::from(replication.desired_copies)
+            if !self.is_external_backend()
+                && reliable_copies < usize::from(replication.desired_copies)
             {
                 txn.mutations
                     .push(TxnMutation::Put(MetaEntity::DfsReplicationTask(

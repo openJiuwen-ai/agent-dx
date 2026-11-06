@@ -1137,14 +1137,10 @@ async fn corruption_report_excludes_bad_own_copy_and_persists_repair_debt() {
     let mut excluded = std::collections::HashSet::new();
     excluded.insert(fixture.copy.id.clone());
     assert_eq!(
-        live_ready_copy_count_from_observed_excluding(
-            &observed_copies,
-            &excluded,
-            &fixture.service,
-            now_unix_ms(),
-        )
-        .await
-        .unwrap(),
+        live_sources_among(&observed_copies, &excluded, &fixture.service, now_unix_ms(),)
+            .await
+            .unwrap()
+            .count,
         1
     );
     let task = stored_repair_task(&fixture).await;
