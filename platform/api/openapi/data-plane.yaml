@@ -853,6 +853,15 @@ components:
       properties:
         command_id:
           type: string
+        operation_id:
+          type: string
+          description: Stable command identity on an observation error.
+        retry:
+          type: string
+          const: same_operation
+        outcome:
+          type: string
+          const: unknown
         pid:
           type: integer
           format: int64
@@ -947,7 +956,9 @@ components:
       additionalProperties: false
       description: Stable command records use uppercase status; PID-only lookup uses running/done/error. Spawn failure
         is FAILED/SPAWN_FAILED with null exit_code and an error_message. Terminal output may be truncated; byte
-        counters describe the retained suffix.
+        counters describe the retained suffix. COMMAND_STATE_UNAVAILABLE is an observation error with status
+        FAILED (error for PID clients), nullable exit_code and exit_signal, retry=same_operation and outcome=unknown;
+        it does not establish that the child exited.
     CommandWaitTimeout:
       type: object
       properties:
