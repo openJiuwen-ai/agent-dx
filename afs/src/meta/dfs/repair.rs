@@ -462,16 +462,18 @@ impl DfsService {
             caller_session_current(&request.caller_id, &request.caller_session_id),
         ];
         let mutations = if request.source_invalid {
-            self.apply_source_invalid(
-                &request,
-                &caller_session,
-                &source_copy,
-                &placement,
-                now,
-                &mut updated_task,
-                &mut conditions,
-            )
-            .await?
+            let (mutations, no_source_evidence) = self
+                .apply_source_invalid(
+                    &request,
+                    &caller_session,
+                    &source_copy,
+                    &placement,
+                    now,
+                    &mut updated_task,
+                )
+                .await?;
+            conditions.extend(no_source_evidence);
+            mutations
         } else if let Some(error) = request.error.clone() {
             updated_task.state = ReplicationTaskState::RetryWaiting;
             updated_task.claim = None;
@@ -505,7 +507,8 @@ impl DfsService {
     }
 
     /// The worker found its bound source copy invalid: mark it Corrupt and
-    /// park the task by the remaining live sources. Returns the mutations.
+    /// park the task by the remaining live sources. Returns the mutations and
+    /// the evidence a no-source decision has to pin.
     async fn apply_source_invalid(
         &self,
         request: &ReportReplicationTask,
@@ -514,8 +517,7 @@ impl DfsService {
         placement: &PlacementRecord,
         now: u64,
         updated_task: &mut ReplicationTask,
-        conditions: &mut Vec<TxnCondition>,
-    ) -> Result<Vec<TxnMutation>> {
+    ) -> Result<(Vec<TxnMutation>, Vec<TxnCondition>)> {
         if !copy_is_on_node(source_copy, &request.caller_id)
             || !copy_matches_chunk(source_copy, &request.claim.chunk)
             || serving_read_copy(source_copy, caller_session, now).is_none()
@@ -532,7 +534,6 @@ impl DfsService {
             .await?;
         let mut updated_placement = placement.clone();
         updated_task.state = if remaining.count == 0 {
-            conditions.extend(remaining.evidence);
             ReplicationTaskState::BlockedNoSource
         } else {
             ReplicationTaskState::RetryWaiting
@@ -545,7 +546,12 @@ impl DfsService {
         updated_task.last_error = Some("source copy failed local verification".into());
         updated_task.next_retry_unix_ms =
             now.saturating_add(retry_backoff_ms(updated_task.attempt));
-        Ok(mutations)
+        let evidence = if remaining.count == 0 {
+            remaining.evidence
+        } else {
+            Vec::new()
+        };
+        Ok((mutations, evidence))
     }
 
     /// The repair succeeded: verify the ACKs (adding their session conditions),
