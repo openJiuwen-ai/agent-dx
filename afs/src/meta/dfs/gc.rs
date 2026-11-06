@@ -57,6 +57,8 @@ pub(crate) struct GcMetrics {
     pub(crate) retired_reference_records: afs_metrics::IntGauge,
     /// Authority entities one planning attempt had to look at.
     pub(crate) planned_entities: afs_metrics::IntGauge,
+    /// Placements repair claims looked at; idle cost must not follow placements.
+    pub(crate) repair_placements_checked: afs_metrics::IntCounter,
     open_generation: Arc<std::sync::Mutex<Option<(u64, std::time::Instant)>>>,
 }
 
@@ -129,6 +131,10 @@ impl GcMetrics {
                 "afs_meta_dfs_gc_planned_entities",
                 "Authority entities read by the last DFS GC planning attempt",
             )?,
+            repair_placements_checked: afs_metrics::IntCounter::new(
+                "afs_meta_dfs_repair_placements_checked_total",
+                "Placements looked at by DFS replication task claims",
+            )?,
             open_generation: Arc::new(std::sync::Mutex::new(None)),
         })
     }
@@ -151,7 +157,8 @@ impl GcMetrics {
         afs_metrics::register_collector(registry, &self.generation_duration)?;
         afs_metrics::register_collector(registry, &self.live_references)?;
         afs_metrics::register_collector(registry, &self.retired_reference_records)?;
-        afs_metrics::register_collector(registry, &self.planned_entities)
+        afs_metrics::register_collector(registry, &self.planned_entities)?;
+        afs_metrics::register_collector(registry, &self.repair_placements_checked)
     }
 
     fn observe_references(&self, entities: &[MetaEntity]) {

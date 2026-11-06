@@ -17,6 +17,27 @@ pub(super) fn reliable_copy_count(copies: &[CopyRecord]) -> usize {
         .count()
 }
 
+/// Placements a patrol looks at per claim (smaller in unit tests, same logic).
+pub(super) const PATROL_PAGE: usize = if cfg!(test) { 64 } else { 1024 };
+/// A patrol also starts this long after the last one finished. It catches what no
+/// session change announces; a lost node starts one at once.
+const PATROL_PERIOD: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// What decides that recorded placement health may have gone stale.
+#[derive(Eq, PartialEq)]
+struct RepairPatrolSignature {
+    desired_copies: u16,
+    live_sessions: BTreeSet<(String, String)>,
+}
+
+/// Progress of the placement patrol. Memory only.
+#[derive(Default)]
+pub(super) struct RepairPatrol {
+    signature: Option<RepairPatrolSignature>,
+    cursor: Option<crate::dfs::ChunkId>,
+    finished_at: Option<std::time::Instant>,
+}
+
 /// Inputs shared by every candidate decision of one claim request.
 struct ClaimContext<'a> {
     request: &'a ClaimReplicationTask,
@@ -69,7 +90,7 @@ impl DfsService {
         let now = now_unix_ms();
         let caller_session = self.repair_worker_session(&request, now).await?;
         let replication = self.current_replication_config().await?;
-        let candidates = self.repair_candidates(now).await?;
+        let candidates = self.repair_candidates(&replication, now).await?;
         let context = ClaimContext {
             request: &request,
             request_digest,
@@ -112,23 +133,17 @@ impl DfsService {
         Ok(caller_session)
     }
 
-    /// Every non-completed task, plus a Pending task for each placement whose
-    /// replica debt is not registered yet (reactivating a Completed record).
-    async fn repair_candidates(&self, now: u64) -> Result<Vec<ReplicationTask>> {
-        let placements = self
+    /// Every open task, plus a Pending task for each placement whose replica
+    /// debt is not registered yet (reactivating a Completed record). Placements
+    /// looked at: those already recorded unhealthy, and at most one patrol page.
+    async fn repair_candidates(
+        &self,
+        replication: &ReplicationConfig,
+        now: u64,
+    ) -> Result<Vec<ReplicationTask>> {
+        let mut candidates = self
             .store
-            .read(MetaRead::DfsPlacements)
-            .await?
-            .entities
-            .into_iter()
-            .filter_map(|entity| match entity {
-                MetaEntity::DfsPlacement(placement) => Some(placement),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let tasks = self
-            .store
-            .read(MetaRead::DfsReplicationTasks)
+            .read(MetaRead::DfsOpenReplicationTasks)
             .await?
             .entities
             .into_iter()
@@ -137,29 +152,37 @@ impl DfsService {
                 _ => None,
             })
             .collect::<Vec<_>>();
-
-        let mut candidates = tasks
+        let mut registered = candidates
             .iter()
-            .filter(|task| task.state != ReplicationTaskState::Completed)
-            .cloned()
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| left.id.cmp(&right.id));
-        for placement in placements {
-            if placement.health == PlacementHealth::Satisfied
-                && self.live_ready_copy_count(&placement, now).await?
-                    >= usize::from(placement.desired_copies)
+            .map(|task| task.chunk_id.clone())
+            .collect::<HashSet<_>>();
+        let mut placements = self
+            .store
+            .read(MetaRead::DfsUnhealthyPlacements)
+            .await?
+            .entities;
+        placements.extend(self.patrol_page(replication, now).await?);
+        for entity in placements {
+            let MetaEntity::DfsPlacement(placement) = entity else {
+                continue;
+            };
+            self.gc_metrics().repair_placements_checked.inc();
+            if registered.contains(&placement.chunk_id)
+                || (placement.health == PlacementHealth::Satisfied
+                    && self.live_ready_copy_count(&placement, now).await?
+                        >= usize::from(placement.desired_copies))
             {
                 continue;
             }
+            registered.insert(placement.chunk_id.clone());
             let task_id = repair_task_id(&placement.chunk_id);
-            if candidates
-                .iter()
-                .any(|task| task.chunk_id == placement.chunk_id)
-            {
-                continue;
-            }
-            if let Some(completed) = tasks.iter().find(|task| task.id == task_id) {
-                let mut reactivated = completed.clone();
+            let completed = self
+                .store
+                .read(MetaRead::DfsReplicationTask(task_id))
+                .await?
+                .entity;
+            if let Some(MetaEntity::DfsReplicationTask(completed)) = completed {
+                let mut reactivated = completed;
                 reactivated.chunk_id = placement.chunk_id.clone();
                 reactivated.placement_epoch = placement.placement_epoch;
                 reactivated.desired_copies = placement.desired_copies;
@@ -181,6 +204,73 @@ impl DfsService {
         }
         candidates.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(candidates)
+    }
+
+    /// A placement recorded Satisfied can still lack live copies once a node is
+    /// gone, and only a look at its copies shows that. Such a look at every
+    /// placement runs when the live sessions or the replication contract change,
+    /// and every `PATROL_PERIOD` as a safety net. It advances one page per claim,
+    /// so a claim costs O(open debt) when nothing changed and O(page) otherwise,
+    /// whatever the number of placements. Progress is in memory: a Meta restart
+    /// starts one patrol.
+    async fn patrol_page(
+        &self,
+        replication: &ReplicationConfig,
+        now: u64,
+    ) -> Result<Vec<MetaEntity>> {
+        let sessions = self.store.read(MetaRead::CurrentNodeSessions).await?;
+        let signature = RepairPatrolSignature {
+            desired_copies: replication.desired_copies,
+            live_sessions: sessions
+                .entities
+                .iter()
+                .filter_map(|entity| match entity {
+                    MetaEntity::NodeSession(session) if session.is_live_at_unix_ms(now) => {
+                        Some((session.node_id.clone(), session.session_id.clone()))
+                    }
+                    _ => None,
+                })
+                .collect(),
+        };
+        let after = {
+            let mut patrol = self
+                .repair_patrol
+                .lock()
+                .map_err(|_| invalid("repair patrol lock poisoned"))?;
+            if patrol.signature.as_ref() != Some(&signature)
+                || patrol
+                    .finished_at
+                    .is_some_and(|finished| finished.elapsed() >= PATROL_PERIOD)
+            {
+                patrol.signature = Some(signature);
+                patrol.cursor = None;
+                patrol.finished_at = None;
+            }
+            if patrol.finished_at.is_some() {
+                return Ok(Vec::new());
+            }
+            patrol.cursor.clone()
+        };
+        let page = self
+            .store
+            .read(MetaRead::DfsPlacementPage {
+                after,
+                limit: PATROL_PAGE,
+            })
+            .await?
+            .entities;
+        let mut patrol = self
+            .repair_patrol
+            .lock()
+            .map_err(|_| invalid("repair patrol lock poisoned"))?;
+        patrol.cursor = page.last().and_then(|entity| match entity {
+            MetaEntity::DfsPlacement(placement) => Some(placement.chunk_id.clone()),
+            _ => None,
+        });
+        if page.len() < PATROL_PAGE {
+            patrol.finished_at = Some(std::time::Instant::now());
+        }
+        Ok(page)
     }
 
     /// Decides one candidate. `None` skips it; otherwise the one transaction

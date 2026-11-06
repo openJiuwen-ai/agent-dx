@@ -361,6 +361,15 @@ pub enum MetaRead {
     DfsChunk(crate::dfs::ChunkId),
     DfsPlacement(crate::dfs::ChunkId),
     DfsPlacements,
+    /// At most `limit` placements in chunk order, after `after`.
+    DfsPlacementPage {
+        after: Option<crate::dfs::ChunkId>,
+        limit: usize,
+    },
+    /// Placements whose recorded health is not Satisfied.
+    DfsUnhealthyPlacements,
+    /// Replication tasks that are not Completed.
+    DfsOpenReplicationTasks,
     DfsCopy(crate::dfs::CopyId),
     DfsReplicationConfig,
     DfsDurabilityPolicy,

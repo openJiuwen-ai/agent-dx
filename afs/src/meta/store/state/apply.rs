@@ -280,15 +280,37 @@ impl State {
     }
 
     fn index_entity(&mut self, entity: &MetaEntity) {
-        if let MetaEntity::DfsDentry(dentry) = entity {
-            self.dentry_parents.insert(dentry_parent_entry(dentry));
+        match entity {
+            MetaEntity::DfsDentry(dentry) => {
+                self.dentry_parents.insert(dentry_parent_entry(dentry));
+            }
+            MetaEntity::DfsReplicationTask(task)
+                if task.state != crate::dfs::ReplicationTaskState::Completed =>
+            {
+                self.open_repair_tasks.insert(task.id.clone());
+            }
+            MetaEntity::DfsPlacement(placement)
+                if placement.health != crate::dfs::PlacementHealth::Satisfied =>
+            {
+                self.unhealthy_placements.insert(placement.chunk_id.clone());
+            }
+            _ => {}
         }
         self.count_root_epoch(entity_root_epoch(entity), true);
     }
 
     fn unindex_entity(&mut self, entity: &MetaEntity) {
-        if let MetaEntity::DfsDentry(dentry) = entity {
-            self.dentry_parents.remove(&dentry_parent_entry(dentry));
+        match entity {
+            MetaEntity::DfsDentry(dentry) => {
+                self.dentry_parents.remove(&dentry_parent_entry(dentry));
+            }
+            MetaEntity::DfsReplicationTask(task) => {
+                self.open_repair_tasks.remove(&task.id);
+            }
+            MetaEntity::DfsPlacement(placement) => {
+                self.unhealthy_placements.remove(&placement.chunk_id);
+            }
+            _ => {}
         }
         self.count_root_epoch(entity_root_epoch(entity), false);
     }
@@ -344,6 +366,30 @@ impl State {
             }
         }
         self.root_epochs = root_epochs;
+        self.open_repair_tasks = self
+            .entities
+            .values()
+            .filter_map(|versioned| match &versioned.entity {
+                MetaEntity::DfsReplicationTask(task)
+                    if task.state != crate::dfs::ReplicationTaskState::Completed =>
+                {
+                    Some(task.id.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        self.unhealthy_placements = self
+            .entities
+            .values()
+            .filter_map(|versioned| match &versioned.entity {
+                MetaEntity::DfsPlacement(placement)
+                    if placement.health != crate::dfs::PlacementHealth::Satisfied =>
+                {
+                    Some(placement.chunk_id.clone())
+                }
+                _ => None,
+            })
+            .collect();
     }
 
     /// The dentry naming `child`: its only one for a directory.
@@ -548,6 +594,60 @@ mod dentry_parent_tests {
             operation: StoreOperation::CleanupRootGrants,
             result: OperationResult::RootGrant(value),
         }
+    }
+
+    #[test]
+    fn repair_indexes_follow_task_and_placement_states_and_recovery() {
+        use crate::dfs::{
+            ChunkId, PlacementHealth, PlacementRecord, ReplicaGroupId, ReplicationTask,
+            ReplicationTaskId, ReplicationTaskState,
+        };
+        fn task(state: ReplicationTaskState) -> MetaEntity {
+            MetaEntity::DfsReplicationTask(ReplicationTask {
+                id: ReplicationTaskId::new("t"),
+                chunk_id: ChunkId::new("c"),
+                placement_epoch: 1,
+                desired_copies: 2,
+                existing_copies: Vec::new(),
+                state,
+                attempt: 0,
+                next_retry_unix_ms: 0,
+                last_error: None,
+                claim: None,
+            })
+        }
+        fn placement(health: PlacementHealth) -> MetaEntity {
+            MetaEntity::DfsPlacement(PlacementRecord {
+                chunk_id: ChunkId::new("c"),
+                replica_group_id: ReplicaGroupId::new("g"),
+                placement_epoch: 1,
+                desired_copies: 2,
+                copies: Vec::new(),
+                health,
+            })
+        }
+        let mut state = State {
+            revision: StoreRevision(1),
+            ..State::default()
+        };
+        put(&mut state, task(ReplicationTaskState::Pending));
+        put(&mut state, placement(PlacementHealth::UnderReplicated));
+        assert_eq!(state.open_repair_tasks.len(), 1);
+        assert_eq!(state.unhealthy_placements.len(), 1);
+        let bytes = state.snapshot_bytes_with_batch(0).unwrap();
+        let recovered = State::from_snapshot(&bytes).unwrap();
+        assert_eq!(recovered.open_repair_tasks, state.open_repair_tasks);
+        assert_eq!(recovered.unhealthy_placements, state.unhealthy_placements);
+        // Completion and recovered health take them out without deleting records.
+        put(&mut state, task(ReplicationTaskState::Completed));
+        put(&mut state, placement(PlacementHealth::Satisfied));
+        assert!(state.open_repair_tasks.is_empty());
+        assert!(state.unhealthy_placements.is_empty());
+        put(&mut state, task(ReplicationTaskState::Pending));
+        state
+            .delete_authority(&MetaKey::DfsReplicationTask(ReplicationTaskId::new("t")))
+            .unwrap();
+        assert!(state.open_repair_tasks.is_empty());
     }
 
     #[test]

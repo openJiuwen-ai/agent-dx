@@ -207,6 +207,11 @@ pub(super) struct State {
     /// Derived, never serialized: how many entities and retained request outcomes
     /// carry each root epoch, so the epoch floor needs no scan.
     pub(super) root_epochs: im::OrdMap<u64, u64>,
+    /// Derived, never serialized: replication tasks that are not Completed. This
+    /// is the repair debt a claim reads, however many completed tasks exist.
+    pub(super) open_repair_tasks: im::OrdSet<crate::dfs::ReplicationTaskId>,
+    /// Derived, never serialized: placements whose recorded health is not Satisfied.
+    pub(super) unhealthy_placements: im::OrdSet<crate::dfs::ChunkId>,
     pub(super) events: SharedEvents,
     pub(super) node_epochs: im::OrdMap<String, u64>,
     #[cfg(test)]

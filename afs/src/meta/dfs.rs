@@ -54,6 +54,7 @@ pub struct DfsService {
     gc_grace_ms: u64,
     gc_metrics: gc::GcMetrics,
     gc_reference_updates: Arc<[tokio::sync::Mutex<()>; GC_REFERENCE_LOCK_SHARDS]>,
+    repair_patrol: Arc<std::sync::Mutex<repair::RepairPatrol>>,
 }
 
 // Store batches at most 64 submitted transactions in one durable commit pass.
@@ -118,6 +119,7 @@ impl DfsService {
             gc_grace_ms: 1_000,
             gc_metrics: gc::GcMetrics::new().expect("fixed GC metric descriptors are valid"),
             gc_reference_updates: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(()))),
+            repair_patrol: Arc::default(),
         }
     }
 

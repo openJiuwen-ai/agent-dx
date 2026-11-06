@@ -40,6 +40,11 @@ impl State {
             } => self.read_dfs_directory(namespace_id, parent_inode_id),
             MetaRead::CurrentNodeSessions => self.read_current_node_sessions(),
             MetaRead::DfsPlacements => self.read_dfs_placements(),
+            MetaRead::DfsPlacementPage { after, limit } => {
+                self.read_dfs_placement_page(after.as_ref(), *limit)
+            }
+            MetaRead::DfsUnhealthyPlacements => self.read_dfs_unhealthy_placements(),
+            MetaRead::DfsOpenReplicationTasks => self.read_dfs_open_replication_tasks(),
             MetaRead::DfsReplicationTasks => self.read_dfs_replication_tasks(),
             MetaRead::RootGrants { root_id } => self.read_root_grants(root_id),
             _ => (
@@ -138,7 +143,10 @@ impl State {
             }
             MetaRead::DfsLayoutRoot(id) => state.entities.get(&MetaKey::DfsLayoutRoot(id.clone())),
             MetaRead::DfsPlacement(id) => state.entities.get(&MetaKey::DfsPlacement(id.clone())),
-            MetaRead::DfsPlacements => None,
+            MetaRead::DfsPlacements
+            | MetaRead::DfsPlacementPage { .. }
+            | MetaRead::DfsUnhealthyPlacements
+            | MetaRead::DfsOpenReplicationTasks => None,
             MetaRead::DfsChunk(id) => state.entities.get(&MetaKey::DfsChunk(id.clone())),
             MetaRead::DfsCopy(id) => state.entities.get(&MetaKey::DfsCopy(id.clone())),
             MetaRead::DfsDurabilityPolicy => state.entities.get(&MetaKey::DfsDurabilityPolicy),
@@ -255,6 +263,47 @@ impl State {
                 .map(|(_, versioned)| versioned.entity)
                 .collect(),
         )
+    }
+
+    fn read_dfs_placement_page(
+        &self,
+        after: Option<&crate::dfs::ChunkId>,
+        limit: usize,
+    ) -> (StoreRevision, Vec<MetaEntity>) {
+        let start =
+            MetaKey::DfsPlacement(after.cloned().unwrap_or(crate::dfs::ChunkId(String::new())));
+        let entities = self
+            .entities
+            .starting_at(start.clone())
+            .take_while(|(key, _)| matches!(key, MetaKey::DfsPlacement(_)))
+            .filter(|(key, _)| after.is_none() || **key != start)
+            .take(limit)
+            .map(|(_, versioned)| versioned.entity.clone())
+            .collect();
+        (self.revision, entities)
+    }
+
+    fn read_dfs_unhealthy_placements(&self) -> (StoreRevision, Vec<MetaEntity>) {
+        let entities = self
+            .unhealthy_placements
+            .iter()
+            .filter_map(|chunk| self.entities.get(&MetaKey::DfsPlacement(chunk.clone())))
+            .map(|versioned| versioned.entity.clone())
+            .collect();
+        (self.revision, entities)
+    }
+
+    fn read_dfs_open_replication_tasks(&self) -> (StoreRevision, Vec<MetaEntity>) {
+        let entities = self
+            .open_repair_tasks
+            .iter()
+            .filter_map(|task| {
+                self.entities
+                    .get(&MetaKey::DfsReplicationTask(task.clone()))
+            })
+            .map(|versioned| versioned.entity.clone())
+            .collect();
+        (self.revision, entities)
     }
 
     fn read_dfs_replication_tasks(&self) -> (StoreRevision, Vec<MetaEntity>) {
