@@ -167,10 +167,10 @@ async fn register_node_refuses_other_protocol_versions_before_writing() {
     ));
     let supported = afs::format::version::NODE_META_PROTOCOL;
     assert_eq!(
-        supported, 2,
-        "generation 1 predates the split control services"
+        supported, 3,
+        "generation 2 predates suspect-copy review and the external GC listing (S2)"
     );
-    for found in [0, 1, supported + 1] {
+    for found in [0, 1, supported - 1, supported + 1] {
         let mut request = request("session-old");
         request.protocol_version = found;
         let status = MetaRpc(meta.clone())
