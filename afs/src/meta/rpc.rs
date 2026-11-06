@@ -1738,6 +1738,37 @@ impl DfsMetaService for DfsMetaRpc {
         ))
     }
 
+    async fn restore_file_chunk(
+        &self,
+        request: Request<afs_protocol::meta::RestoreDfsFileChunkRequest>,
+    ) -> Result<Response<afs_protocol::meta::RestoreDfsFileChunkReply>, Status> {
+        let authenticated = authenticated_node_id(&self.0, &request)?;
+        let request = request.into_inner();
+        validate_caller(authenticated.as_deref(), &request.caller_id)?;
+        dfs_service(&self.0)?
+            .restore_file_chunk(crate::dfs::RestoreFileChunk {
+                caller_id: request.caller_id,
+                operation_id: crate::dfs::OperationId::new(request.operation_id),
+                file_version_id: crate::dfs::FileVersionId::new(request.file_version_id),
+                layout_root_id: crate::dfs::LayoutRootId::new(request.layout_root_id),
+                write_lease: domain_dfs_write_lease(
+                    request
+                        .write_lease
+                        .ok_or_else(|| invalid("restore requires write lease"))?,
+                ),
+                receipt: domain_chunk_receipt(
+                    request
+                        .receipt
+                        .ok_or_else(|| invalid("restore requires receipt"))?,
+                )?,
+            })
+            .await
+            .map_err(afs_transport::grpc::error_status::error_to_status)?;
+        Ok(Response::new(
+            afs_protocol::meta::RestoreDfsFileChunkReply {},
+        ))
+    }
+
     async fn publish_read_cache(
         &self,
         request: Request<afs_protocol::meta::PublishDfsReadCacheRequest>,

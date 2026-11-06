@@ -2,15 +2,26 @@
 use super::*;
 #[derive(Deserialize, Serialize)]
 struct Checkpoint {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cache_intents: Vec<ReadCacheIntent>,
     schema: u32,
     revision: u64,
     gc_generation: u64,
     records: Vec<LocalChunkRecord>,
     checksum: String,
 }
-fn checksum(revision: u64, generation: u64, records: &[LocalChunkRecord]) -> Result<String> {
-    let bytes = serde_json::to_vec(&(1_u32, revision, generation, records))
-        .map_err(|error| invalid(error.to_string()))?;
+fn checksum(
+    revision: u64,
+    generation: u64,
+    records: &[LocalChunkRecord],
+    intents: &[ReadCacheIntent],
+) -> Result<String> {
+    let encoded = if intents.is_empty() {
+        serde_json::to_vec(&(1_u32, revision, generation, records))
+    } else {
+        serde_json::to_vec(&(1_u32, revision, generation, records, intents))
+    };
+    let bytes = encoded.map_err(|error| invalid(error.to_string()))?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 pub(super) fn load_checkpoint(path: &Path) -> Result<Option<LocalCatalog>> {
@@ -22,7 +33,13 @@ pub(super) fn load_checkpoint(path: &Path) -> Result<Option<LocalCatalog>> {
     let value: Checkpoint = serde_json::from_slice(&data)
         .map_err(|error| invalid(format!("chunk checkpoint decode: {error}")))?;
     if value.schema != 1
-        || value.checksum != checksum(value.revision, value.gc_generation, &value.records)?
+        || value.checksum
+            != checksum(
+                value.revision,
+                value.gc_generation,
+                &value.records,
+                &value.cache_intents,
+            )?
     {
         return Err(invalid("chunk checkpoint checksum mismatch"));
     }
@@ -39,6 +56,7 @@ pub(super) fn load_checkpoint(path: &Path) -> Result<Option<LocalCatalog>> {
         gc_generation: value.gc_generation,
         ..Default::default()
     };
+    catalog.apply_cache_sync(value.cache_intents, Vec::new());
     for record in records.into_values() {
         catalog.insert_record(record);
     }
@@ -47,8 +65,15 @@ pub(super) fn load_checkpoint(path: &Path) -> Result<Option<LocalCatalog>> {
 fn save_checkpoint(root: &Path, catalog: &LocalCatalog) -> Result<()> {
     let mut records = catalog.records.values().cloned().collect::<Vec<_>>();
     records.sort_by(|a, b| a.chunk.id.cmp(&b.chunk.id));
-    let checksum = checksum(catalog.revision, catalog.gc_generation, &records)?;
+    let cache_intents = catalog.cache_intents.values().cloned().collect::<Vec<_>>();
+    let checksum = checksum(
+        catalog.revision,
+        catalog.gc_generation,
+        &records,
+        &cache_intents,
+    )?;
     let value = Checkpoint {
+        cache_intents,
         schema: 1,
         revision: catalog.revision,
         gc_generation: catalog.gc_generation,
@@ -159,6 +184,7 @@ impl LocalChunkStore {
             }
         }
         let mut next = LocalCatalog {
+            cache_intents: catalog.cache_intents.clone(),
             revision: catalog
                 .revision
                 .checked_add(1)

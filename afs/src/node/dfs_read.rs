@@ -16,9 +16,11 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+mod cache_reconcile;
 mod dissemination;
 mod distribution;
 mod read_pipeline;
+mod recovery;
 pub use distribution::ReadDistributionConfig;
 
 #[cfg(test)]
@@ -1267,6 +1269,7 @@ enum SourceLookupFinish {
 }
 
 pub struct DfsReadEngine {
+    cache_sync: Arc<tokio::sync::Mutex<cache_reconcile::CacheSyncState>>,
     cache_session: Option<String>,
     cache_admission: Arc<tokio::sync::Semaphore>,
     cache_fetch_admission: Arc<tokio::sync::Semaphore>,
@@ -1699,6 +1702,9 @@ impl DfsReadEngine {
         source_cache.record(&local);
         Self {
             source_turn: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            cache_sync: Arc::new(tokio::sync::Mutex::new(
+                cache_reconcile::CacheSyncState::default(),
+            )),
             cache_session: None,
             cache_admission: Arc::new(tokio::sync::Semaphore::new(2)),
             cache_fetch_admission: Arc::new(tokio::sync::Semaphore::new(2)),
@@ -1774,6 +1780,7 @@ impl DfsReadEngine {
     fn task_reader(&self) -> Self {
         Self {
             source_turn: self.source_turn.clone(),
+            cache_sync: self.cache_sync.clone(),
             cache_session: self.cache_session.clone(),
             cache_admission: self.cache_admission.clone(),
             cache_fetch_admission: self.cache_fetch_admission.clone(),
@@ -1903,7 +1910,6 @@ impl DfsReadEngine {
         self.check_native_read_authority(&authority)
     }
 
-    #[cfg(test)]
     pub(super) fn read_batch_native_open_into_private_before(
         &self,
         batch: &ReadBatch,

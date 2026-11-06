@@ -127,7 +127,9 @@ impl DfsService {
                 } = &old.location
                     && (*node_epoch > ack.node_epoch
                         || (*node_epoch == ack.node_epoch
-                            && *catalog_revision > ack.catalog_revision))
+                            && (*catalog_revision > ack.catalog_revision
+                                || (old.state == CopyState::Deleting
+                                    && *catalog_revision == ack.catalog_revision))))
                 {
                     return Err(conflict("read cache receipt was superseded"));
                 }
@@ -225,7 +227,16 @@ impl DfsService {
                     None => TxnCondition::Missing(MetaKey::DfsCopy(request.copy.id.clone())),
                 },
             ];
-            if old == Some(MetaEntity::DfsCopy(request.copy.clone())) {
+            let matching = match &old {
+                Some(MetaEntity::DfsCopy(copy)) => {
+                    let mut ready = copy.clone();
+                    ready.state = CopyState::Ready;
+                    ready == request.copy
+                }
+                None => true,
+                _ => false,
+            };
+            if matching {
                 let placement = view
                     .read(MetaRead::DfsPlacement(request.copy.chunk_id.clone()))
                     .await?
@@ -247,9 +258,27 @@ impl DfsService {
                         ))),
                     Some(_) => return Err(invalid("read cache placement has wrong type")),
                 }
-                txn.mutations.push(TxnMutation::Delete(MetaKey::DfsCopy(
-                    request.copy.id.clone(),
-                )));
+                // Keep the incarnation fence in the existing CopyRecord. An
+                // earlier publication can still arrive after its timeout. GC
+                // reclaims this tombstone together with the immutable chunk.
+                let chunk = view
+                    .read(MetaRead::DfsChunk(request.copy.chunk_id.clone()))
+                    .await?
+                    .entity;
+                if let Some(entity) = chunk {
+                    txn.conditions.push(TxnCondition::EntityEquals(entity));
+                    let mut tombstone = request.copy.clone();
+                    tombstone.state = CopyState::Deleting;
+                    txn.mutations
+                        .push(TxnMutation::Put(MetaEntity::DfsCopy(tombstone)));
+                } else {
+                    txn.conditions.push(TxnCondition::Missing(MetaKey::DfsChunk(
+                        request.copy.chunk_id.clone(),
+                    )));
+                    txn.mutations.push(TxnMutation::Delete(MetaKey::DfsCopy(
+                        request.copy.id.clone(),
+                    )));
+                }
             }
             // A no-op also has a durable outcome. Replays cannot delete a later registration.
             txn.mutations

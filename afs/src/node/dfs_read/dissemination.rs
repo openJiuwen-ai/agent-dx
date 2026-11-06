@@ -228,56 +228,31 @@ impl DfsReadEngine {
                 "read-cache:{session}:{}",
                 self.source_turn.fetch_add(1, Ordering::Relaxed)
             ));
-            let write = tokio::task::spawn_blocking(move || {
+            let binding = (
+                self.namespace_id.clone(),
+                version.clone(),
+                batch.layout_root_id.clone(),
+            );
+            tokio::task::spawn_blocking(move || {
                 // The permit lives with the job even if its caller is cancelled.
                 let _permit = permit;
                 let staged =
                     super::super::chunk::StagedChunk::from_replica(operation_id, &chunk, body)?;
-                store.persist_read_cache(&staged, authority.epoch, capacity)
+                let write = store.persist_read_cache(&staged, authority.epoch, capacity)?;
+                if let Some(receipt) = &write.receipt {
+                    store.track_read_cache(super::super::chunk::ReadCacheIntent {
+                        namespace_id: binding.0,
+                        file_version_id: binding.1,
+                        layout_root_id: binding.2,
+                        copy: crate::dfs::read_cache_copy(receipt)?,
+                    })?;
+                }
+                Ok::<_, Error>(())
             })
             .await
             .map_err(|e| unavailable(format!("read cache worker failed: {e}")))??;
             self.check_native_read_authority(&authority)?;
-            for copy in write.retired {
-                if Instant::now() >= deadline {
-                    break;
-                }
-                self.source_provider
-                    .retire_read_cache(
-                        crate::dfs::RetireReadCache {
-                            caller_id: self.local_node_id.clone(),
-                            caller_session_id: session.clone(),
-                            caller_node_epoch: authority.epoch,
-                            operation_id: crate::dfs::OperationId::new(format!(
-                                "read-cache-retire:{session}:{}",
-                                self.source_turn.fetch_add(1, Ordering::Relaxed)
-                            )),
-                            copy,
-                        },
-                        deadline,
-                    )
-                    .await?;
-            }
-            if let Some(receipt) = write.receipt {
-                if Instant::now() >= deadline {
-                    break;
-                }
-                self.source_provider
-                    .publish_read_cache(
-                        crate::dfs::PublishReadCache {
-                            caller_id: self.local_node_id.clone(),
-                            caller_session_id: session.clone(),
-                            caller_node_epoch: authority.epoch,
-                            operation_id: receipt.operation_id.clone(),
-                            namespace_id: self.namespace_id.clone(),
-                            file_version_id: version.clone(),
-                            layout_root_id: batch.layout_root_id.clone(),
-                            receipt,
-                        },
-                        deadline,
-                    )
-                    .await?;
-            }
+            self.reconcile_read_caches(deadline).await?;
         }
         Ok(())
     }

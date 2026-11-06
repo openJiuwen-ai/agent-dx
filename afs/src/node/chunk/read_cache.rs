@@ -1,6 +1,16 @@
 //! Disposable read copies share the ordinary immutable files and catalog WAL.
 use super::*;
 
+/// Provenance for discovery, not a new file/object identity. The catalog retains
+/// this desired copy until its absence has been acknowledged by Meta.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct ReadCacheIntent {
+    pub(crate) namespace_id: crate::dfs::NamespaceId,
+    pub(crate) file_version_id: crate::dfs::FileVersionId,
+    pub(crate) layout_root_id: crate::dfs::LayoutRootId,
+    pub(crate) copy: crate::dfs::CopyRecord,
+}
+
 pub(crate) struct ReadCacheWrite {
     pub(crate) receipt: Option<ReplicaAck>,
     pub(crate) retired: Vec<crate::dfs::CopyRecord>,
@@ -84,6 +94,8 @@ impl LocalChunkStore {
                 let bytes = serde_json::to_vec(&(revision, &records, &removed))
                     .map_err(|e| invalid(e.to_string()))?;
                 let txn = CatalogTxn {
+                    cache_updates: Vec::new(),
+                    cache_acks: Vec::new(),
                     revision,
                     records,
                     removed,
@@ -175,9 +187,248 @@ impl LocalChunkStore {
     }
 }
 
+impl LocalChunkStore {
+    /// Persist before sending any publication. Removing the physical record
+    /// leaves this intent in the same WAL until exact retirement is acknowledged.
+    pub(crate) fn track_read_cache(&self, intent: ReadCacheIntent) -> Result<bool> {
+        let _admission = self
+            .catalog_committer
+            .admit(std::iter::empty(), usize::MAX)?;
+        let mut catalog = self
+            .catalog
+            .lock()
+            .map_err(|_| invalid("chunk catalog poisoned"))?;
+        let Some(record) = catalog.records.get(&intent.copy.chunk_id) else {
+            return Ok(false);
+        };
+        if record.read_cache_epoch == 0
+            || record.state != LocalChunkState::Durable
+            || crate::dfs::read_cache_copy(
+                &self.cache_receipt(record, OperationId::new("observe")),
+            )? != intent.copy
+        {
+            return Ok(false);
+        }
+        if catalog.cache_intents.get(&intent.copy.chunk_id) == Some(&intent) {
+            return Ok(true);
+        }
+        if catalog.cache_intents.len() >= 1024
+            && !catalog.cache_intents.contains_key(&intent.copy.chunk_id)
+        {
+            return Err(Error::coded(
+                afs_error::IO_CAPACITY,
+                "read cache reconciliation backlog is full",
+            ));
+        }
+        self.commit_cache_sync(&mut catalog, Vec::new(), vec![intent], Vec::new())?;
+        Ok(true)
+    }
+
+    pub(crate) fn read_cache_intents(&self) -> Result<Vec<ReadCacheIntent>> {
+        Ok(self
+            .catalog
+            .lock()
+            .map_err(|_| invalid("chunk catalog poisoned"))?
+            .cache_intents
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    /// Return the current desired copy. Full physical verification is required
+    /// before first publication in this process; subsequent ticks only check
+    /// catalog/namespace presence unless the incarnation changed.
+    pub(crate) fn refresh_read_cache_intent(
+        &self,
+        expected: &ReadCacheIntent,
+        epoch: u64,
+        verified: bool,
+    ) -> Result<Option<ReadCacheIntent>> {
+        if epoch == 0 {
+            return Err(invalid("cache reconciliation requires current node epoch"));
+        }
+        let record = {
+            let catalog = self
+                .catalog
+                .lock()
+                .map_err(|_| invalid("chunk catalog poisoned"))?;
+            if catalog.cache_intents.get(&expected.copy.chunk_id) != Some(expected) {
+                return Err(Error::coded(
+                    afs_error::NODE_DFS_STALE_HANDLE,
+                    "cache intent changed",
+                ));
+            }
+            catalog.records.get(&expected.copy.chunk_id).cloned()
+        };
+        let Some(record) =
+            record.filter(|r| r.read_cache_epoch != 0 && r.state == LocalChunkState::Durable)
+        else {
+            return Ok(None);
+        };
+        let path = self.path_for_record(&record)?;
+        let physical = if verified
+            && crate::dfs::read_cache_copy(
+                &self.cache_receipt(&record, OperationId::new("observe")),
+            )? == expected.copy
+        {
+            match fs::metadata(&path) {
+                Ok(meta) if meta.is_file() && meta.len() == record.stored_length => Ok(()),
+                Ok(_) => Err(corrupt(&record.chunk.id, "cache physical length changed")),
+                Err(error) => Err(error.into()),
+            }
+        } else if let Some(table) = &record.segment_crc {
+            self.verify_crc_file(&path, &record.chunk, table)
+        } else {
+            verify_file(&path, &record.chunk)
+        };
+        if let Err(error) = physical {
+            if verified_copy_is_invalid(&error) {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        let _admission = self
+            .catalog_committer
+            .admit(std::iter::empty(), usize::MAX)?;
+        let mut catalog = self
+            .catalog
+            .lock()
+            .map_err(|_| invalid("chunk catalog poisoned"))?;
+        if catalog.cache_intents.get(&expected.copy.chunk_id) != Some(expected) {
+            return Err(Error::coded(
+                afs_error::NODE_DFS_STALE_HANDLE,
+                "cache intent changed",
+            ));
+        }
+        if catalog.records.get(&record.chunk.id).is_none_or(|current| {
+            current.catalog_revision != record.catalog_revision
+                || current.state != record.state
+                || current.read_cache_epoch != record.read_cache_epoch
+        }) {
+            return Ok(None);
+        }
+        let mut current = record;
+        let mut records = Vec::new();
+        if current.read_cache_epoch != epoch {
+            current.read_cache_epoch = epoch;
+            current.catalog_revision = catalog
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| invalid("catalog revision exhausted"))?;
+            records.push(current.clone());
+        }
+        let mut updated = expected.clone();
+        updated.copy = crate::dfs::read_cache_copy(
+            &self.cache_receipt(&current, OperationId::new("observe")),
+        )?;
+        if updated != *expected || !records.is_empty() {
+            self.commit_cache_sync(&mut catalog, records, vec![updated.clone()], Vec::new())?;
+        }
+        Ok(Some(updated))
+    }
+
+    pub(crate) fn acknowledge_cache_retirement(&self, expected: &ReadCacheIntent) -> Result<()> {
+        let _admission = self
+            .catalog_committer
+            .admit(std::iter::empty(), usize::MAX)?;
+        let mut catalog = self
+            .catalog
+            .lock()
+            .map_err(|_| invalid("chunk catalog poisoned"))?;
+        if catalog.cache_intents.get(&expected.copy.chunk_id) == Some(expected) {
+            self.commit_cache_sync(&mut catalog, Vec::new(), Vec::new(), vec![expected.clone()])?;
+        }
+        Ok(())
+    }
+
+    fn commit_cache_sync(
+        &self,
+        catalog: &mut LocalCatalog,
+        mut records: Vec<LocalChunkRecord>,
+        updates: Vec<ReadCacheIntent>,
+        acknowledgements: Vec<ReadCacheIntent>,
+    ) -> Result<()> {
+        let revision = catalog
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| invalid("catalog revision exhausted"))?;
+        for record in &mut records {
+            record.catalog_revision = revision;
+        }
+        let mut txn = CatalogTxn {
+            revision,
+            records,
+            removed: Vec::new(),
+            cache_updates: updates,
+            cache_acks: acknowledgements,
+            checksum: String::new(),
+        };
+        txn.checksum = txn.expected_checksum()?;
+        if let Err(error) =
+            append_catalog_txn_observed(&self.catalog_path, &txn, self.read_work.as_ref(), |_| {
+                Ok(())
+            })
+        {
+            return Err(self.catalog_committer.fail(error).as_ref().clone());
+        }
+        for record in txn.records {
+            catalog.insert_record(record);
+        }
+        catalog.apply_cache_sync(txn.cache_updates, txn.cache_acks);
+        catalog.revision = revision;
+        Ok(())
+    }
+}
+
+impl LocalChunkStore {
+    pub(crate) fn has_durable_record(&self, id: &ChunkId) -> Result<bool> {
+        Ok(self
+            .catalog
+            .lock()
+            .map_err(|_| invalid("chunk catalog poisoned"))?
+            .records
+            .get(id)
+            .is_some_and(|r| r.state == LocalChunkState::Durable && r.read_cache_epoch == 0))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recovery_cache_intent_survives_catalog_replay() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        let staged = StagedChunk::new(OperationId::new("intent"), b"data".to_vec());
+        let ack = store
+            .persist_read_cache(&staged, 1, 4100)
+            .unwrap()
+            .receipt
+            .unwrap();
+        let intent = ReadCacheIntent {
+            namespace_id: crate::dfs::NamespaceId::new("default"),
+            file_version_id: crate::dfs::FileVersionId::new("version"),
+            layout_root_id: crate::dfs::LayoutRootId::new("layout"),
+            copy: crate::dfs::read_cache_copy(&ack).unwrap(),
+        };
+        let revision = store.catalog.lock().unwrap().revision + 1;
+        let mut txn = CatalogTxn::new(revision, Vec::new()).unwrap();
+        txn.cache_updates.push(intent.clone());
+        txn.checksum = txn.expected_checksum().unwrap();
+        append_catalog_txn_observed(&store.catalog_path, &txn, None, |_| Ok(())).unwrap();
+        drop(store);
+        let store = LocalChunkStore::open(temp.path(), "node-a").unwrap();
+        assert_eq!(
+            store
+                .catalog
+                .lock()
+                .unwrap()
+                .cache_intents
+                .get(&staged.chunk.id),
+            Some(&intent)
+        );
+    }
 
     #[test]
     fn distribution_cache_store_reuses_catalog_and_evicts_only_disposable_bytes() {

@@ -11,14 +11,14 @@ Node → ConnectorRuntime → 各 ConnectorModule
                            └─ stop：关闭接入、排空仍在执行的文件工作
 
 Nydus → HTTP adapter → NydusService → vfs::Backend（DistributedFs）
-                            │                    │ 缺少已提交范围
+                            │                    │ 缺失范围或已提交副本不可用
                             │                    └─ 当前 owner → LazyFillHandler
                             └─ 查询镜像描述                         │
                                  RegistryProvider ← NydusLazyFillHandler
                                       │ 返回完整范围或错误
                                  OCI Registry
 
-DFS 收到范围正文后，沿既有写入、fsync、版本提交和 Peer 读取路径处理。
+未填充范围沿既有写入、fsync、版本提交处理；已有 Chunk 的来源恢复只重建副本，不改文件版本。
 ```
 
 代码在 `src/node/connectors/{mod.rs,nydus/}`；通用合同在 `src/node/vfs/lazy_fill.rs`，DFS 实现在 `src/node/vfs/dfs/lazy_fill.rs`。DFS 不引用 Registry、Nydus 类型或凭据。
@@ -71,14 +71,18 @@ Nydus backend 示例（替换实际地址与具体 manifest digest）：
 
 ## 核心流程和失败边界
 
-1. 首次 HEAD 或直接 GET：Service 查询并校验固定 manifest，预建 `.afs-nydus/images/{source}/{manifest-hex}/blobs/{blob-hex}` 以及 `descriptor.json`；不展开容器内部文件树，不下载 blob 正文。每个 blob 是一个文件。不同镜像目录下的共享 blob 尚不合并为同一个 inode。
+1. 首次 HEAD 或直接 GET：Service 查询并校验固定 manifest，预建 `.afs-nydus/images/{source}/{manifest-hex}/blobs/{blob-hex}` 以及 `descriptor.json`；不展开容器内部文件树，不下载 blob 正文。每个 blob 是一个文件。新准备的描述文件也绑定 `nydus.registry-plan.v1`：hook 按固定 manifest 校验并重建同一序列化描述，避免描述文件丢失先阻断 blob 恢复；这个 kind 的字节编码必须保持稳定，修改编码需新 kind。不同镜像目录下的共享 blob 尚不合并为同一个 inode。
 2. 并发准备：各请求使用私有 staging，既有 no-replace rename 决定最终目录。明确竞争失败的一方校验已发布描述并清理自己的 staging；目录 CAS 冲突的有界重试在 DFS 文件层完成，Service 不识别 Meta 错误码。进程崩溃或结果无法确认可能留下 staging，由运维确认无活动任务后清理，不影响最终目录的可读性。
 3. 冷读：本节点已提交范围可读则直接读取；范围未填充则复用现有 owner 路由。owner 调本机 hook，Provider 校验 Range 响应的状态、Content-Range、长度和 deadline；DFS 提交后返回。Provider 不管理副本、选主或文件版本。转发 owner 读取时，沿既有 ReadScope 和 gRPC timeout 传递剩余预算；owner 在排队、回源及交付时使用同一截止时间。
-4. 故障：失败的范围不读成零；已有范围仍可复用。回源中断后请求可重试。接管遵循现有租约与 fencing，不能承诺故障后立即切换；已提交数据的可用性取决于既有持久副本，不因绑定了 Registry 就自动重建丢失的已提交 chunk。
+4. 故障：失败的范围不读成零；已有范围仍可复用。回源中断后请求可重试。接管遵循现有租约与 fencing，不能承诺故障后立即切换。懒文件的已提交副本不可用时，当前 owner 可再次调用同一 hook，按原布局重建完整 Chunk（至多 4 MiB），核对原描述，沿既有 GC publication pin 和持久副本写入取得 receipt；`RestoreFileChunk` 校验当前 owner、head、Chunk、复制策略和 GC 状态后恢复 Copy/Placement，不改文件版本。未绑定来源的普通文件不获得凭空回源能力。
 5. 停止：关闭 HTTP 接入，排空保留生命周期的文件工作和 lazy-fill，再执行已有 DFS 排空。删除复用 unlink/rmdir 和既有 GC；开放句柄与后台回收仍遵循 AFS 本身的合同。
 
 默认只有按需读取，没有全量后台下载或新增回源预取。没有必选分段校验清单：Provider 校验 manifest digest 与传输范围，Nydus 校验内容；完整但错误的源站正文可能先进入缓存，自动修复此类内容错误不在本版范围。首次验证不代表性能或跨物理机 HA 资格。
 
 ## 验证入口
 
-通用单测过滤器 `lazy_fill_`；协议测试过滤器 `node::connectors`。真实 OCI Registry、Nydus 与三节点复现材料见 [E2E 脚本](../build/e2e/afs/nydus/README.md)。本次完整运行结果以该入口记录的证据为准。
+通用单测过滤器 `lazy_fill_`、`recovery_`；协议测试过滤器 `node::connectors`。真实 OCI Registry、Nydus 与三节点复现材料见 [E2E 脚本](../build/e2e/afs/nydus/README.md)。本次完整运行结果以该入口记录的证据为准。
+
+已提交副本的来源恢复及普通缓存持久对账见[恢复 E2E](../build/e2e/afs/recovery/README.md)。传输／提交失败保留已校验的本地字节，后续读取按现有布局及本地 catalog 对照 Meta 来源，补齐未确认的副本发布；旧 owner 的迟到回调不能发布。
+
+旧版本已经准备的普通 `descriptor.json` 不会被静默改写为懒文件；需重新准备镜像目录才能获得描述文件来源恢复。本变更不提供旧目录在线迁移。

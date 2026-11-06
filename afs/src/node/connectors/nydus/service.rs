@@ -14,7 +14,7 @@ use crate::node::{
     vfs::{
         Backend, PreparedPublication,
         lazy_fill::LazyFileSpec,
-        types::{BackendInode, Entry, FileHandle, RequestContext, SyncMode},
+        types::{BackendInode, Entry, FileHandle, RequestContext},
     },
 };
 use afs_error::{Error, ErrorKind, Result};
@@ -262,31 +262,16 @@ impl NydusService {
             if body.len() > PLAN_LIMIT {
                 return Err(invalid("image descriptor is oversized"));
             }
-            let file = self.backend.create(
+            self.backend.prepare_lazy_file(
                 &self.ctx,
                 dir.inode,
                 OsStr::new("descriptor.json"),
-                0o440,
-                libc::O_RDWR | libc::O_EXCL,
+                &LazyFileSpec {
+                    length: body.len() as u64,
+                    binding: lazy_fill::plan_binding(&plan, body.len() as u64)?,
+                },
             )?;
             descriptor_created = true;
-            let write = (|| {
-                for (index, part) in body.chunks(IO_BATCH).enumerate() {
-                    if self.backend.write(
-                        &self.ctx,
-                        file.handle,
-                        (index * IO_BATCH) as u64,
-                        part,
-                    )? != part.len()
-                    {
-                        return Err(unavailable("short image descriptor write"));
-                    }
-                }
-                self.backend.fsync(&self.ctx, file.handle, SyncMode::Full)
-            })();
-            let closed = self.backend.release(&self.ctx, file.handle);
-            write?;
-            closed?;
             check_deadline(deadline)?;
             publication_attempted = true;
             self.backend.publish_prepared(

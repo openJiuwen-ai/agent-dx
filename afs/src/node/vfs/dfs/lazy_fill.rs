@@ -187,7 +187,35 @@ impl DistributedFs {
                 "lazy-file length differs from its immutable source",
             ));
         }
-        if !covered(&version.layout, offset, count as u64) {
+        if covered(&version.layout, offset, count as u64) {
+            let mut out = vec![0; count];
+            // Reserve time for owner recovery instead of spending the whole read
+            // deadline on locations which may already have lost their bodies.
+            let probe_deadline =
+                Instant::now() + deadline.saturating_duration_since(Instant::now()) / 2;
+            match self.read_engine.read_batch_native_open_into_private_before(
+                &version.read_batch(offset, count, 0)?,
+                &mut out,
+                Some(probe_deadline),
+                None,
+            ) {
+                Ok(()) => {
+                    if !self.read_engine.has_unpublished_local_copy(
+                        &version.read_batch(offset, count, 0)?,
+                        deadline,
+                    )? {
+                        self.check_lazy_delivery(snapshot, &authority)?;
+                        if Instant::now() >= deadline {
+                            return Err(unavailable("lazy read expired before delivery"));
+                        }
+                        return Ok(Some(out.into()));
+                    }
+                }
+                Err(error) if recoverable_source_failure(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        {
             let (owner_inode, lease) = self.meta.resolve_write_authority(&inode.inode_id)?;
             inode = self.validate_inode(owner_inode)?;
             if lease.owner_node_id != self.node_id || lease.owner_session_id != self.session_id {
@@ -374,6 +402,9 @@ impl DistributedFs {
                     return Err(stale("lazy source changed"));
                 }
                 let version = self.readonly_version_for_inode(&fresh)?;
+                self.recover_lazy_committed(
+                    &fresh, &session, source, &version, offset, count, deadline,
+                )?;
                 let Some((start, length)) = missing_range(&version.layout, offset, end) else {
                     break;
                 };
@@ -427,5 +458,204 @@ impl DistributedFs {
         })();
         let released = self.release(&owner_request_context(), handle);
         result.and(released)
+    }
+}
+
+fn recoverable_source_failure(error: &Error) -> bool {
+    matches!(
+        error.kind(),
+        afs_error::ErrorKind::NotFound
+            | afs_error::ErrorKind::Unavailable
+            | afs_error::ErrorKind::DataLoss
+            | afs_error::ErrorKind::DeadlineExceeded
+    )
+}
+
+impl DistributedFs {
+    /// Called under the existing owner file gate and origin budget. Rebuild
+    /// replicas, not file bytes/versions. A fill commit also depends on retaining
+    /// the already committed chunks it references, so inspect those dependencies.
+    #[allow(clippy::too_many_arguments)] // Frozen owner, file identity and caller range are separate contracts.
+    fn recover_lazy_committed(
+        &self,
+        inode: &InodeRecord,
+        session: &DfsWriteSession,
+        source: &LazyFileSpec,
+        version: &ReadOnlyVersion,
+        offset: u64,
+        count: usize,
+        deadline: Instant,
+    ) -> Result<()> {
+        let end = offset
+            .checked_add(count as u64)
+            .ok_or_else(|| invalid("recovery range overflow"))?;
+        let version_id = &version
+            .version
+            .as_ref()
+            .ok_or_else(|| invalid("recovery requires committed version"))?
+            .id;
+        let filling_hole = !covered(&version.layout, offset, count as u64);
+        let ids = version
+            .layout
+            .inline_extents
+            .iter()
+            .filter(|e| {
+                filling_hole
+                    || (e.file_offset < end && e.file_offset.saturating_add(e.length) > offset)
+            })
+            .map(|e| e.chunk_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        for id in ids {
+            if Instant::now() >= deadline {
+                return Err(unavailable("origin recovery expired"));
+            }
+            let sources = self.read_engine.recovery_sources(
+                version_id.clone(),
+                version.layout.id.clone(),
+                id.clone(),
+                deadline,
+            )?;
+            let chunk = sources
+                .chunk
+                .ok_or_else(|| invalid("recovery descriptor absent"))?;
+            let requested = version.layout.inline_extents.iter().any(|e| {
+                e.chunk_id == id
+                    && e.file_offset < end
+                    && e.file_offset.saturating_add(e.length) > offset
+            });
+            if !requested && !sources.sources.is_empty() {
+                continue;
+            }
+            let mut body = vec![
+                0;
+                usize::try_from(chunk.length)
+                    .map_err(|_| invalid("recovery chunk too large"))?
+            ];
+            let batch = ReadBatch {
+                file_version_id: Some(version_id.clone()),
+                layout_root_id: version.layout.id.clone(),
+                lookahead: Vec::new(),
+                ops: vec![ChunkReadOp {
+                    chunk_id: id.clone(),
+                    chunk_offset: 0,
+                    length: chunk.length,
+                    output_offset: 0,
+                }],
+            };
+            let probe_deadline = Instant::now()
+                + (deadline.saturating_duration_since(Instant::now()) / 3)
+                    .min(Duration::from_millis(500));
+            let available = match self.read_engine.read_batch_native_open_into_private_before(
+                &batch,
+                &mut body,
+                Some(probe_deadline),
+                None,
+            ) {
+                Ok(()) => {
+                    if sources.sources.iter().any(|s| matches!(&s.location, crate::dfs::CopyLocation::Node { node_id, .. } if node_id == &self.node_id)) { continue; }
+                    true
+                }
+                Err(error) if recoverable_source_failure(&error) => false,
+                Err(error) => return Err(error),
+            };
+            if !available {
+                let handler = self.lazy_fill_registry.resolve(&source.binding.kind)?;
+                // One immutable chunk may be represented by several source extents.
+                // Cover every chunk byte before validating its original descriptor.
+                let mut extents = version
+                    .layout
+                    .inline_extents
+                    .iter()
+                    .filter(|e| e.chunk_id == id)
+                    .collect::<Vec<_>>();
+                extents.sort_by_key(|e| e.chunk_offset);
+                let mut cursor = 0u64;
+                for extent in extents {
+                    if extent.chunk_offset > cursor {
+                        return Err(invalid("origin mapping does not cover complete chunk"));
+                    }
+                    let extent_end = extent
+                        .chunk_offset
+                        .checked_add(extent.length)
+                        .ok_or_else(|| invalid("recovery mapping overflow"))?;
+                    while cursor < extent_end.min(chunk.length) {
+                        let start = extent
+                            .file_offset
+                            .checked_add(cursor - extent.chunk_offset)
+                            .ok_or_else(|| invalid("origin offset overflow"))?;
+                        let length = (extent_end.min(chunk.length) - cursor)
+                            .min(MAX_FILL_BYTES as u64)
+                            as usize;
+                        let mut fetched = None;
+                        self.read_engine.run_sync_boundary(Box::pin(async {
+                            fetched = Some(
+                                tokio::time::timeout_at(
+                                    deadline.into(),
+                                    handler.fill(LazyFillRequest {
+                                        binding: source.binding.clone(),
+                                        offset: start,
+                                        length,
+                                        deadline,
+                                    }),
+                                )
+                                .await
+                                .map_err(|_| unavailable("origin recovery deadline exceeded"))??,
+                            );
+                            Ok(())
+                        }))?;
+                        let data =
+                            fetched.ok_or_else(|| unavailable("origin recovery body absent"))?;
+                        if data.len() != length {
+                            return Err(invalid("origin recovery returned short body"));
+                        }
+                        let start = usize::try_from(cursor)
+                            .map_err(|_| invalid("recovery offset too large"))?;
+                        body[start..start + length].copy_from_slice(&data);
+                        cursor += length as u64;
+                    }
+                }
+                if cursor != chunk.length {
+                    return Err(invalid("origin mapping is incomplete"));
+                }
+            }
+            let (fresh, lease) = self.meta.resolve_write_authority(&inode.inode_id)?;
+            if lease.owner_node_id != self.node_id
+                || lease.owner_session_id != self.session_id
+                || lease.lease_epoch != session.lease_epoch
+                || fresh.head_version.as_ref() != Some(version_id)
+                || descriptor(&fresh)?.as_ref() != Some(source)
+            {
+                return Err(stale("origin recovery owner or file identity changed"));
+            }
+            let operation_id = self.operation_id("restore-chunk");
+            let staged = StagedChunk::from_replica(operation_id.clone(), &chunk, body)?;
+            if Instant::now() >= deadline {
+                return Err(unavailable("origin recovery expired before persistence"));
+            }
+            // Replica persistence appends to an already admitted publication.
+            // Reuse the normal GC pin so transfer and Meta restoration cannot
+            // race collection, including an indeterminate restore response.
+            let _publication = self
+                .gc_references
+                .as_ref()
+                .map(|references| {
+                    references.pin(&inode.inode_id, Some(version_id), Some(&operation_id))
+                })
+                .transpose()?;
+            let receipt = self.chunk_store.put(staged)?;
+            self.meta.restore_file_chunk(
+                crate::dfs::RestoreFileChunk {
+                    caller_id: self.node_id.clone(),
+                    operation_id,
+                    file_version_id: version_id.clone(),
+                    layout_root_id: version.layout.id.clone(),
+                    write_lease: lease,
+                    receipt,
+                },
+                deadline.saturating_duration_since(Instant::now()),
+            )?;
+            self.read_engine.invalidate_recovered_chunk(&id)?;
+        }
+        Ok(())
     }
 }

@@ -411,6 +411,7 @@ service DfsMeta {
   rpc ClaimReplicationTask(ClaimDfsReplicationTaskRequest) returns (ClaimDfsReplicationTaskReply);
   rpc ReportReplicationTask(ReportDfsReplicationTaskRequest) returns (ReportDfsReplicationTaskReply);
   rpc ReportChunkCorruption(ReportDfsChunkCorruptionRequest) returns (ReportDfsChunkCorruptionReply);
+  rpc RestoreFileChunk(RestoreDfsFileChunkRequest) returns (RestoreDfsFileChunkReply);
   rpc PublishReadCache(PublishDfsReadCacheRequest) returns (PublishDfsReadCacheReply);
   rpc RetireReadCache(RetireDfsReadCacheRequest) returns (RetireDfsReadCacheReply);
   rpc GetChunkSources(GetDfsChunkSourcesRequest) returns (GetDfsChunkSourcesReply);
@@ -498,6 +499,17 @@ message DfsReplicaAck {
   bytes verified_digest = 11;
   DfsDigestAlgorithm verified_digest_algorithm = 12;
 }
+
+// Availability restoration under the current owner and unchanged committed version.
+message RestoreDfsFileChunkRequest {
+  string caller_id = 1;
+  string operation_id = 2;
+  string file_version_id = 3;
+  string layout_root_id = 4;
+  DfsWriteLease write_lease = 5;
+  DfsChunkReceipt receipt = 6;
+}
+message RestoreDfsFileChunkReply {}
 
 // Physical persistence receipts do not make these copies durable replicas.
 message PublishDfsReadCacheRequest {

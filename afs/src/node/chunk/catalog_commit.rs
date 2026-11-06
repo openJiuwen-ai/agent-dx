@@ -725,6 +725,8 @@ impl LocalChunkStore {
         let checksum = blake3::hash(&checksum_input).to_hex().to_string();
         drop(checksum_input);
         let txn = CatalogTxn {
+            cache_updates: Vec::new(),
+            cache_acks: Vec::new(),
             removed: Vec::new(),
             revision,
             records,

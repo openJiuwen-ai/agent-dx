@@ -152,6 +152,16 @@ pub trait DfsMeta: Send + Sync {
     ) -> Result<InodeRecord> {
         self.sync_inode_metadata(sync)
     }
+    fn restore_file_chunk(
+        &self,
+        _request: crate::dfs::RestoreFileChunk,
+        _timeout: Duration,
+    ) -> Result<()> {
+        Err(Error::coded(
+            afs_error::NODE_VFS_UNIMPLEMENTED,
+            "committed chunk restoration is unsupported",
+        ))
+    }
     fn commit_file_version(&self, commit: CommitFileVersion) -> Result<InodeRecord>;
     fn commit_file_version_with_timeout(
         &self,
@@ -4458,6 +4468,15 @@ impl DistributedFs {
             }
         };
         Ok(state)
+    }
+
+    pub(crate) fn reconcile_read_caches(&self) -> Result<()> {
+        self.read_engine.run_sync_boundary(Box::pin(async {
+            self.read_engine
+                .reconcile_read_caches(Instant::now() + Duration::from_secs(1))
+                .await?;
+            Ok(())
+        }))
     }
 
     pub fn with_remote_owner_factory(mut self, factory: Arc<dyn DfsRemoteOwnerFactory>) -> Self {
@@ -15083,6 +15102,8 @@ mod tests {
 
     struct RecordingMeta {
         lose_commit_reply: AtomicBool,
+        lose_restore_reply: AtomicBool,
+        restore_calls: AtomicUsize,
         mkdir_conflicts: AtomicUsize,
         next_lookup_absent: AtomicBool,
         inode: Mutex<InodeRecord>,
@@ -15127,6 +15148,8 @@ mod tests {
         fn new() -> Self {
             Self {
                 lose_commit_reply: AtomicBool::new(false),
+                lose_restore_reply: AtomicBool::new(false),
+                restore_calls: AtomicUsize::new(0),
                 mkdir_conflicts: AtomicUsize::new(0),
                 next_lookup_absent: AtomicBool::new(false),
                 inode: Mutex::new(InodeRecord {
@@ -15372,7 +15395,78 @@ mod tests {
         }
     }
 
+    impl crate::node::dfs_read::ReadSourceProvider for RecordingMeta {
+        fn sources_for(
+            &self,
+            request: crate::dfs::DfsChunkSourcesRequest,
+        ) -> Result<crate::dfs::DfsChunkSourcesReply> {
+            let commits = self.commits.lock().unwrap();
+            let version = commits
+                .iter()
+                .find(|c| {
+                    c.file_version.id == request.file_version_id
+                        && c.layout_root.id == request.layout_root_id
+                })
+                .ok_or_else(|| Error::coded(afs_error::IO_NOT_FOUND, "test version missing"))?;
+            let mut chunks = Vec::new();
+            for id in request.chunk_ids {
+                let chunk = commits
+                    .iter()
+                    .flat_map(|c| &c.chunk_receipts)
+                    .find(|r| r.chunk.id == id)
+                    .ok_or_else(|| Error::coded(afs_error::IO_NOT_FOUND, "test chunk missing"))?
+                    .chunk
+                    .clone();
+                let allowed_ranges = version
+                    .layout_root
+                    .inline_extents
+                    .iter()
+                    .filter(|e| e.chunk_id == id)
+                    .map(|e| (e.chunk_offset, e.length))
+                    .collect();
+                chunks.push(crate::dfs::ChunkSources {
+                    chunk_id: id,
+                    chunk: Some(chunk),
+                    sources: Vec::new(),
+                    allowed_ranges,
+                });
+            }
+            Ok(crate::dfs::DfsChunkSourcesReply {
+                revision: 1,
+                chunks,
+            })
+        }
+    }
+
     impl DfsMeta for RecordingMeta {
+        fn restore_file_chunk(
+            &self,
+            request: crate::dfs::RestoreFileChunk,
+            _timeout: Duration,
+        ) -> Result<()> {
+            let inode = self.inode.lock().unwrap();
+            assert_eq!(inode.head_version.as_ref(), Some(&request.file_version_id));
+            assert_eq!(
+                self.lease.lock().unwrap().lease_epoch,
+                request.write_lease.lease_epoch
+            );
+            let commits = self.commits.lock().unwrap();
+            assert!(
+                commits
+                    .iter()
+                    .flat_map(|c| &c.chunk_receipts)
+                    .any(|r| r.chunk == request.receipt.chunk)
+            );
+            self.restore_calls.fetch_add(1, Ordering::SeqCst);
+            if self.lose_restore_reply.swap(false, Ordering::SeqCst) {
+                return Err(Error::coded(
+                    afs_error::NODE_VFS_UNAVAILABLE,
+                    "restore applied but response lost",
+                ));
+            }
+            Ok(())
+        }
+
         fn lookup(&self, _: &InodeId, name: &[u8]) -> Result<Option<InodeRecord>> {
             if name == b"new-child" || self.next_lookup_absent.swap(false, Ordering::SeqCst) {
                 return Ok(None);
@@ -16135,6 +16229,7 @@ mod tests {
                 match self.fault.load(Ordering::SeqCst) {
                     1 => Err(unavailable("origin failure")),
                     2 => Ok(prost::bytes::Bytes::from_static(b"a")),
+                    3 => Ok(prost::bytes::Bytes::from(vec![b'x'; request.length])),
                     _ => Ok(prost::bytes::Bytes::copy_from_slice(
                         &b"abcdefgh"
                             [request.offset as usize..request.offset as usize + request.length],
@@ -16217,6 +16312,144 @@ mod tests {
         );
         fs.release(&context(), handle).unwrap();
     }
+    #[test]
+    fn recovery_lazy_committed_chunk_keeps_version_and_identity() {
+        let meta = Arc::new(RecordingMeta::new());
+        meta.next_lookup_absent.store(true, Ordering::SeqCst);
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local.clone(),
+            local.clone(),
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let control = Arc::new(Pr88GcControl::default());
+        let references = crate::node::gc::GcReferences::new(control.clone());
+        let (fs, handler, entry) = lazy_fixture(fs.with_gc_references(Some(references)));
+        let h = fs.open(&context(), entry.inode, libc::O_RDONLY).unwrap();
+        assert_eq!(fs.read_owned(&context(), h, 0, 4).unwrap(), b"abcd");
+        let before = meta.commits.lock().unwrap().last().unwrap().clone();
+        let chunk = before.layout_root.inline_extents[0].chunk_id.clone();
+        let publications = control.unfenced_publications.load(Ordering::SeqCst);
+        fs.read_engine
+            .collect_generation(1, std::slice::from_ref(&chunk))
+            .unwrap();
+        assert_eq!(fs.read_owned(&context(), h, 0, 4).unwrap(), b"abcd");
+        let after = meta.commits.lock().unwrap().last().unwrap().clone();
+        assert_eq!(
+            control.unfenced_publications.load(Ordering::SeqCst),
+            publications + 1,
+            "restore must admit the existing GC publication before replica persistence"
+        );
+        assert_eq!(before.file_version, after.file_version);
+        assert_eq!(before.layout_root, after.layout_root);
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 2);
+        assert!(local.open_verified(&chunk).is_ok());
+        fs.release(&context(), h).unwrap();
+    }
+
+    #[test]
+    fn recovery_lazy_rejects_changed_origin_then_concurrent_readers_share_restore() {
+        let (_temp, meta, fs) = test_fs();
+        meta.next_lookup_absent.store(true, Ordering::SeqCst);
+        let (fs, handler, entry) = lazy_fixture(fs);
+        let h = fs.open(&context(), entry.inode, libc::O_RDONLY).unwrap();
+        assert_eq!(fs.read_owned(&context(), h, 0, 4).unwrap(), b"abcd");
+        let before = meta.commits.lock().unwrap().last().unwrap().clone();
+        let chunk = before.layout_root.inline_extents[0].chunk_id.clone();
+        fs.read_engine
+            .collect_generation(1, std::slice::from_ref(&chunk))
+            .unwrap();
+        handler.fault.store(3, Ordering::SeqCst);
+        assert!(fs.read_owned(&context(), h, 0, 4).is_err());
+        assert_eq!(
+            meta.commits.lock().unwrap().last().unwrap().file_version,
+            before.file_version
+        );
+        handler.fault.store(0, Ordering::SeqCst);
+        std::thread::scope(|scope| {
+            for _ in 0..6 {
+                scope.spawn(|| assert_eq!(fs.read_owned(&context(), h, 0, 4).unwrap(), b"abcd"));
+            }
+        });
+        assert_eq!(
+            handler.calls.load(Ordering::SeqCst),
+            3,
+            "initial fill, rejected body, one coalesced restore"
+        );
+        assert_eq!(
+            meta.commits.lock().unwrap().last().unwrap().file_version,
+            before.file_version
+        );
+        fs.release(&context(), h).unwrap();
+    }
+
+    #[test]
+    fn recovery_lazy_lost_restore_reply_republishes_local_bytes() {
+        let (_temp, meta, fs) = test_fs();
+        meta.next_lookup_absent.store(true, Ordering::SeqCst);
+        let (fs, handler, entry) = lazy_fixture(fs);
+        let h = fs.open(&context(), entry.inode, libc::O_RDONLY).unwrap();
+        assert_eq!(fs.read_owned(&context(), h, 0, 4).unwrap(), b"abcd");
+        let before = meta.commits.lock().unwrap().last().unwrap().clone();
+        let restores_before = meta.restore_calls.load(Ordering::SeqCst);
+        let chunk = before.layout_root.inline_extents[0].chunk_id.clone();
+        fs.read_engine
+            .collect_generation(1, std::slice::from_ref(&chunk))
+            .unwrap();
+        meta.lose_restore_reply.store(true, Ordering::SeqCst);
+        assert!(fs.read_owned(&context(), h, 0, 4).is_err());
+        assert_eq!(fs.read_owned(&context(), h, 0, 4).unwrap(), b"abcd");
+        assert_eq!(
+            handler.calls.load(Ordering::SeqCst),
+            2,
+            "retry uses persisted restored bytes"
+        );
+        assert_eq!(
+            meta.restore_calls.load(Ordering::SeqCst),
+            restores_before + 2,
+            "unknown acknowledgement must be reconciled"
+        );
+        assert_eq!(
+            meta.commits.lock().unwrap().last().unwrap().file_version,
+            before.file_version
+        );
+        fs.release(&context(), h).unwrap();
+    }
+
+    #[test]
+    fn recovery_lazy_late_restore_rejects_changed_owner() {
+        let (_temp, meta, fs) = test_fs();
+        meta.next_lookup_absent.store(true, Ordering::SeqCst);
+        let (fs, handler, entry) = lazy_fixture(fs);
+        let h = fs.open(&context(), entry.inode, libc::O_RDONLY).unwrap();
+        assert_eq!(fs.read_owned(&context(), h, 0, 4).unwrap(), b"abcd");
+        let before = meta.commits.lock().unwrap().last().unwrap().clone();
+        let restores_before = meta.restore_calls.load(Ordering::SeqCst);
+        fs.read_engine
+            .collect_generation(1, &[before.layout_root.inline_extents[0].chunk_id.clone()])
+            .unwrap();
+        handler.hold.store(true, Ordering::SeqCst);
+        let reader = fs.clone();
+        let work = std::thread::spawn(move || reader.read_owned(&context(), h, 0, 4));
+        let until = Instant::now() + Duration::from_secs(2);
+        while handler.calls.load(Ordering::SeqCst) < 2 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let entered = handler.calls.load(Ordering::SeqCst) == 2;
+        meta.lease.lock().unwrap().lease_epoch += 1;
+        handler.hold.store(false, Ordering::SeqCst);
+        assert!(work.join().unwrap().is_err());
+        assert!(entered);
+        assert_eq!(meta.restore_calls.load(Ordering::SeqCst), restores_before);
+        assert_eq!(
+            meta.commits.lock().unwrap().last().unwrap().file_version,
+            before.file_version
+        );
+        fs.release(&context(), h).unwrap();
+    }
+
     #[test]
     fn lazy_fill_errors_and_short_bodies_do_not_publish() {
         let (_temp, meta, fs) = test_fs();
@@ -16499,7 +16732,7 @@ mod tests {
             NamespaceId::new("default"),
             "node-a".into(),
             local,
-            Arc::new(crate::node::dfs_read::UnimplementedReadSourceProvider),
+            meta.clone(),
             Arc::new(crate::node::dfs_read::UnimplementedChunkTransfer),
             crate::node::dfs_read::DfsReadConfig::default(),
         ));

@@ -26,6 +26,12 @@ Linux focused `distribution_` 测试还验证并发重叠、版本约束、截�
 启动时间对照必须同时注明 Dragonfly 调度策略、缓存状态、二进制优化档位和拓扑；
 不同实现的进程／网络／落盘成本不可用单个 HTTP 数字代替生产资格。
 
+来源恢复与缓存对账专项见[recovery E2E](../../build/e2e/afs/recovery/README.md)：
+R1 原节点停机后恢复原 Chunk，Meta 断联／Node 重启后自动补发布和撤销，
+普通文件多节点供数以及 Nydus 真实挂载。`recovery_` 还检查错误源正文、
+丢失确认、迟到 owner 回调、catalog WAL／检查点和旧撤销确认不覆盖新安装。
+一次本地多 namespace 运行不能替代多机或生产长稳资格。
+
 ## 平台与入口矩阵
 
 Rust 构建、Cargo metadata、格式、Clippy、单元测试、FUSE 运行、mount、权限、runc、workspace bind 和性能结论都只在 Linux 上确认。macOS 可用于文档检查和 Python 静态工具核对，不能作为 Rust/文件系统验收通过证据。

@@ -1736,6 +1736,28 @@ impl crate::node::dfs_read::ExternalReadAuthorizer for GrpcDfsMeta {
 
 #[cfg(feature = "dfs")]
 impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
+    fn restore_file_chunk(
+        &self,
+        request: crate::dfs::RestoreFileChunk,
+        timeout: Duration,
+    ) -> afs_error::Result<()> {
+        self.run_with_timeout(
+            self.client()
+                .restore_file_chunk(afs_tracing::request_with_current_context(
+                    afs_protocol::meta::RestoreDfsFileChunkRequest {
+                        caller_id: request.caller_id,
+                        operation_id: request.operation_id.0,
+                        file_version_id: request.file_version_id.0,
+                        layout_root_id: request.layout_root_id.0,
+                        write_lease: Some(wire_dfs_write_lease(request.write_lease)),
+                        receipt: Some(wire_chunk_receipt(request.receipt)),
+                    },
+                )),
+            timeout,
+        )?;
+        Ok(())
+    }
+
     fn lookup(
         &self,
         parent: &crate::dfs::InodeId,

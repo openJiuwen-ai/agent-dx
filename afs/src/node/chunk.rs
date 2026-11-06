@@ -28,6 +28,7 @@ mod native_live;
 mod native_live_tests;
 pub mod outboard;
 mod read_cache;
+pub(crate) use read_cache::ReadCacheIntent;
 #[cfg(any(feature = "dfs", test))]
 mod read_pipeline;
 use catalog_commit::CatalogCommitter;
@@ -1657,6 +1658,10 @@ fn read_positioned(file: &File, offset: u64, out: &mut [u8]) -> Result<usize> {
 #[derive(Debug, Deserialize, Serialize)]
 struct CatalogTxn {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cache_updates: Vec<ReadCacheIntent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    cache_acks: Vec<ReadCacheIntent>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     removed: Vec<ChunkId>,
     revision: u64,
     records: Vec<LocalChunkRecord>,
@@ -1668,6 +1673,8 @@ impl CatalogTxn {
     fn new(revision: u64, records: Vec<LocalChunkRecord>) -> Result<Self> {
         let checksum = catalog_checksum(revision, &records)?;
         Ok(Self {
+            cache_updates: Vec::new(),
+            cache_acks: Vec::new(),
             removed: Vec::new(),
             revision,
             records,
@@ -1675,15 +1682,29 @@ impl CatalogTxn {
         })
     }
 
-    fn verify(&self) -> Result<()> {
-        let expected = if self.removed.is_empty() {
-            catalog_checksum(self.revision, &self.records)?
+    fn expected_checksum(&self) -> Result<String> {
+        if !self.cache_updates.is_empty() || !self.cache_acks.is_empty() {
+            let bytes = serde_json::to_vec(&(
+                self.revision,
+                &self.records,
+                &self.removed,
+                &self.cache_updates,
+                &self.cache_acks,
+            ))
+            .map_err(|e| invalid(e.to_string()))?;
+            return Ok(blake3::hash(&bytes).to_hex().to_string());
+        }
+        if self.removed.is_empty() {
+            catalog_checksum(self.revision, &self.records)
         } else {
             let bytes = serde_json::to_vec(&(self.revision, &self.records, &self.removed))
                 .map_err(|e| invalid(e.to_string()))?;
-            blake3::hash(&bytes).to_hex().to_string()
-        };
-        if self.checksum != expected {
+            Ok(blake3::hash(&bytes).to_hex().to_string())
+        }
+    }
+
+    fn verify(&self) -> Result<()> {
+        if self.checksum != self.expected_checksum()? {
             return Err(invalid("local chunk catalog transaction checksum mismatch"));
         }
         Ok(())
@@ -1692,6 +1713,7 @@ impl CatalogTxn {
 
 #[derive(Debug, Default)]
 pub struct LocalCatalog {
+    cache_intents: std::collections::BTreeMap<ChunkId, ReadCacheIntent>,
     revision: u64,
     gc_generation: u64,
     records: HashMap<ChunkId, LocalChunkRecord>,
@@ -1700,6 +1722,21 @@ pub struct LocalCatalog {
 }
 
 impl LocalCatalog {
+    fn apply_cache_sync(
+        &mut self,
+        updates: Vec<ReadCacheIntent>,
+        acknowledgements: Vec<ReadCacheIntent>,
+    ) {
+        for intent in acknowledgements {
+            if self.cache_intents.get(&intent.copy.chunk_id) == Some(&intent) {
+                self.cache_intents.remove(&intent.copy.chunk_id);
+            }
+        }
+        for intent in updates {
+            self.cache_intents
+                .insert(intent.copy.chunk_id.clone(), intent);
+        }
+    }
     fn insert_record(&mut self, record: LocalChunkRecord) {
         self.remove_record(&record.chunk.id);
         if record.read_cache_epoch != 0 {
@@ -1788,6 +1825,7 @@ impl LocalCatalog {
             if txn.revision != catalog.revision.saturating_add(1) {
                 return Err(invalid("local chunk catalog revision is not contiguous"));
             }
+            catalog.apply_cache_sync(txn.cache_updates, txn.cache_acks);
             for id in txn.removed {
                 catalog.remove_record(&id);
             }

@@ -2324,6 +2324,7 @@ async fn run_node(
         local_chunk_store,
         cfg.dfs_external_backend.as_ref(),
     ) {
+        let dfs_cache_maintenance = state.dfs.clone();
         let worker = Arc::new(replication::ReplicationWorker::new(
             cfg.id.clone(),
             registered_node_epoch,
@@ -2346,7 +2347,14 @@ async fn run_node(
                 // The worker owns an exact pending request until its Meta
                 // outcome is confirmed. A started blocking transfer is not
                 // detached on a tick or replaced by another task.
-                match tokio::task::spawn_blocking(move || worker.run_once()).await {
+                let dfs = dfs_cache_maintenance.clone();
+                match tokio::task::spawn_blocking(move || {
+                    if let Some(dfs) = dfs
+                        && let Err(error) = dfs.reconcile_read_caches() {
+                        afs_logging::warn!("dfs.read_cache_reconcile_retry"; "error" => error.to_string());
+                    }
+                    worker.run_once()
+                }).await {
                     Ok(Ok(Some(task))) => {
                         afs_logging::info!("dfs.replication_task_reported";
                             "task" => task.id.0,

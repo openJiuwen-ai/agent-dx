@@ -82,10 +82,9 @@ impl ConnectorModule for NydusConnector {
         "nydus"
     }
     fn register_lazy_handlers(&self, registry: &mut LazyFillRegistry) -> Result<()> {
-        registry.register(
-            lazy_fill::KIND,
-            Arc::new(lazy_fill::NydusLazyFillHandler::new(self.provider.clone())),
-        )
+        let handler = Arc::new(lazy_fill::NydusLazyFillHandler::new(self.provider.clone()));
+        registry.register(lazy_fill::KIND, handler.clone())?;
+        registry.register(lazy_fill::PLAN_KIND, handler)
     }
     fn http_routes(&self, context: ConnectorContext) -> Result<Router> {
         let service = Arc::new(service::NydusService::new(

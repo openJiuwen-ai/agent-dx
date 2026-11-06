@@ -1,6 +1,6 @@
 //! Fault boundary: rename moves the real namespace, then loses its reply.
 use super::*;
-use crate::node::vfs::types::{CreatedFile, FileAttributes, FileKind, RenameFlags};
+use crate::node::vfs::types::{CreatedFile, FileAttributes, FileKind, RenameFlags, SyncMode};
 use std::{
     collections::HashMap,
     ffi::OsString,
@@ -23,6 +23,7 @@ struct LostReplyBackend {
     lose_reply: AtomicBool,
     fail_confirmation: AtomicBool,
     published: AtomicBool,
+    plan_bytes: Mutex<Vec<u8>>,
 }
 impl LostReplyBackend {
     fn insert(
@@ -91,7 +92,20 @@ impl Backend for LostReplyBackend {
         name: &OsStr,
         spec: &LazyFileSpec,
     ) -> Result<Entry> {
-        self.insert(parent, name, FileKind::Regular, spec.length)
+        let entry = self.insert(parent, name, FileKind::Regular, spec.length)?;
+        if name == OsStr::new("descriptor.json") {
+            assert_eq!(
+                spec.binding.kind,
+                lazy_fill::PLAN_KIND,
+                "descriptors must survive the same copy loss as blobs"
+            );
+            self.state
+                .lock()
+                .unwrap()
+                .contents
+                .insert(entry.inode.value, self.plan_bytes.lock().unwrap().clone());
+        }
+        Ok(entry)
     }
     fn create(
         &self,
@@ -212,6 +226,7 @@ fn fixture() -> (Arc<LostReplyBackend>, NydusService, ImagePlan) {
             size: 8,
         }],
     };
+    *backend.plan_bytes.lock().unwrap() = serde_json::to_vec(&plan).unwrap();
     (backend, service, plan)
 }
 #[test]

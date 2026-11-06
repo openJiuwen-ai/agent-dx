@@ -4,6 +4,7 @@ mod gc;
 
 mod open_read;
 mod read_cache;
+mod restore;
 
 use std::{
     collections::{BTreeSet, HashSet},
@@ -6550,6 +6551,98 @@ mod read_recovery_tests {
         }
     }
 
+    async fn restore_request(f: &Fixture) -> crate::dfs::RestoreFileChunk {
+        f.service.initialize_replication_config().await.unwrap();
+        let (_, lease) = f
+            .service
+            .open_write(
+                "receiver".into(),
+                "receiver-original".into(),
+                OperationId::new("restore-open"),
+                InodeId::new("file"),
+                30,
+            )
+            .await
+            .unwrap();
+        let placement = f
+            .service
+            .placement_snapshot("receiver".into())
+            .await
+            .unwrap();
+        let group = &placement.replica_groups[0];
+        let staged = StagedChunk::new(OperationId::new("restore-existing"), b"data".to_vec());
+        let acks = f
+            .local
+            .persist_batch(
+                std::slice::from_ref(&staged),
+                &group.targets[0],
+                placement.revision,
+                group.placement_epoch,
+            )
+            .unwrap();
+        crate::dfs::RestoreFileChunk {
+            caller_id: "receiver".into(),
+            operation_id: staged.operation_id.clone(),
+            file_version_id: f.request.file_version_id.clone(),
+            layout_root_id: f.request.layout_root_id.clone(),
+            write_lease: lease,
+            receipt: crate::dfs::ChunkReceipt {
+                operation_id: staged.operation_id,
+                chunk: staged.chunk,
+                replica_group_id: group.id.clone(),
+                placement_revision: placement.revision,
+                placement_epoch: group.placement_epoch,
+                durable_acks: acks,
+                external_commit: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_restore_preserves_head_and_replay_rejects_changed_receipt() {
+        let f = fixture().await;
+        let request = restore_request(&f).await;
+        let before = f.service.get_inode(InodeId::new("file")).await.unwrap();
+        f.service.restore_file_chunk(request.clone()).await.unwrap();
+        f.service.restore_file_chunk(request.clone()).await.unwrap();
+        assert_eq!(
+            f.service.get_inode(InodeId::new("file")).await.unwrap(),
+            before
+        );
+        let mut changed = request;
+        changed.receipt.durable_acks[0].catalog_revision += 1;
+        assert!(f.service.restore_file_chunk(changed).await.is_err());
+        assert!(
+            f.sources()
+                .await
+                .iter()
+                .any(|source| source.chunk_id == f.copy.chunk_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_restore_rejects_wrong_authority_body_and_head() {
+        let f = fixture().await;
+        let request = restore_request(&f).await;
+        let mut wrong = request.clone();
+        wrong.write_lease.lease_epoch += 1;
+        assert!(f.service.restore_file_chunk(wrong).await.is_err());
+        let mut wrong = request.clone();
+        wrong.file_version_id = FileVersionId::new("another-head");
+        assert!(f.service.restore_file_chunk(wrong).await.is_err());
+        let mut wrong = request.clone();
+        wrong.receipt.chunk.length += 1;
+        assert!(f.service.restore_file_chunk(wrong).await.is_err());
+        let mut wrong = request.clone();
+        wrong.receipt.durable_acks[0].node_epoch += 1;
+        assert!(f.service.restore_file_chunk(wrong).await.is_err());
+        let mut wrong = request.clone();
+        wrong.receipt.durable_acks.clear();
+        assert!(f.service.restore_file_chunk(wrong).await.is_err());
+        f.restart(f.local.device_descriptor().unwrap()).await;
+        assert!(f.service.restore_file_chunk(request).await.is_err());
+    }
+
     async fn replace_source_layout(f: &Fixture, extents: Vec<Extent>) {
         let key = RequestKey::new("fixture", "source-range-layout");
         let mut txn = MetaTxn::new(key.clone(), StoreOperation::DfsCommitFileVersion);
@@ -7147,7 +7240,7 @@ mod read_recovery_tests {
     #[tokio::test]
     async fn distribution_retire_absence_replay_cannot_change_later_publication() {
         let f = fixture().await;
-        let request = cache_request(&f, "late-cache");
+        let mut request = cache_request(&f, "late-cache");
         let copy = crate::dfs::read_cache_copy(&request.receipt).unwrap();
         let retire = crate::dfs::RetireReadCache {
             caller_id: request.caller_id.clone(),
@@ -7157,6 +7250,8 @@ mod read_recovery_tests {
             copy: copy.clone(),
         };
         f.service.retire_read_cache(retire.clone()).await.unwrap();
+        request.receipt.catalog_revision += 1;
+        let copy = crate::dfs::read_cache_copy(&request.receipt).unwrap();
         f.service.publish_read_cache(request).await.unwrap();
         f.service.retire_read_cache(retire).await.unwrap();
         assert_eq!(
@@ -7164,6 +7259,32 @@ mod read_recovery_tests {
             copy,
             "a replay must preserve the recorded no-op outcome"
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_retired_cache_rejects_late_publication() {
+        let f = fixture().await;
+        let request = cache_request(&f, "late-after-retire");
+        let copy = crate::dfs::read_cache_copy(&request.receipt).unwrap();
+        f.service
+            .retire_read_cache(crate::dfs::RetireReadCache {
+                caller_id: request.caller_id.clone(),
+                caller_session_id: request.caller_session_id.clone(),
+                caller_node_epoch: request.caller_node_epoch,
+                operation_id: OperationId::new("retire-before-delivery"),
+                copy,
+            })
+            .await
+            .unwrap();
+        assert!(
+            f.service.publish_read_cache(request.clone()).await.is_err(),
+            "late delivery cannot revive an evicted incarnation"
+        );
+        let mut newer = request;
+        newer.operation_id = OperationId::new("new-install");
+        newer.receipt.operation_id = newer.operation_id.clone();
+        newer.receipt.catalog_revision += 1;
+        assert!(f.service.publish_read_cache(newer).await.is_ok());
     }
 
     #[tokio::test]

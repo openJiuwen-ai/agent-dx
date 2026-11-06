@@ -677,6 +677,18 @@ pub struct PublishReadCache {
     pub receipt: ReplicaAck,
 }
 
+/// Restore already committed immutable bytes using the ordinary replication receipt.
+/// This changes availability only, never the inode, FileVersion or layout.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RestoreFileChunk {
+    pub caller_id: String,
+    pub operation_id: OperationId,
+    pub file_version_id: FileVersionId,
+    pub layout_root_id: LayoutRootId,
+    pub write_lease: WriteLease,
+    pub receipt: ChunkReceipt,
+}
+
 /// Retire exactly the observed cache incarnation; stale retirement cannot
 /// remove a replacement copy or a promoted durable replica.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
