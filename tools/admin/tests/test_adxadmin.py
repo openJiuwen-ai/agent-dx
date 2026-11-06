@@ -165,6 +165,21 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(arguments.endpoint, "https://adx.example.com")
         self.assertEqual(arguments.output, "json")
 
+    def test_malformed_timeout_environment_is_a_usage_error(self):
+        parser = build_parser(
+            {
+                "ADX_ENDPOINT": "https://adx.example.com",
+                "ADX_ADMIN_TOKEN_FILE": "/tmp/admin.key",
+                "ADX_ADMIN_TIMEOUT_SECONDS": "not-a-number",
+            }
+        )
+        stderr = io.StringIO()
+        with mock.patch("sys.stderr", new=stderr), self.assertRaises(SystemExit) as raised:
+            parser.parse_args(["key", "list"])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("--timeout-seconds", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
     def test_no_expiry_is_an_explicit_alias_for_the_default(self):
         parser = build_parser({})
         arguments = parser.parse_args(
