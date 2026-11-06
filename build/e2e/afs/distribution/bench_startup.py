@@ -11,7 +11,7 @@ import subprocess
 import time
 
 p = argparse.ArgumentParser(description=__doc__)
-p.add_argument("--backend", choices=["registry", "afs", "dragonfly"], required=True)
+p.add_argument("--backend", choices=["registry", "registry-direct", "afs", "dragonfly"], required=True)
 p.add_argument("--ip", required=True)
 p.add_argument("--case", required=True)
 p.add_argument("--manifest", required=True)
@@ -37,7 +37,7 @@ if a.backend == "afs":
         },
     }
 else:
-    host = "10.203.0.10:5001" if a.backend == "registry" else f"{a.ip}:4001"
+    host = {"registry": "10.203.0.10:5001", "registry-direct": "10.203.0.10:5000"}.get(a.backend, f"{a.ip}:4001")
     backend = {"type": "registry", "registry": {"scheme": "http", "host": host, "repo": "lab/nydus", "retry_limit": 0}}
 config = {
     "version": 2,

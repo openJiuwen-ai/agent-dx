@@ -13,7 +13,10 @@ p.add_argument("--workspace", type=pathlib.Path, required=True)
 p.add_argument("--adx-vm", required=True)
 p.add_argument("--rounds", type=int, default=3)
 p.add_argument(
-    "--backends", nargs="+", choices=["registry", "afs", "dragonfly"], default=["registry", "afs", "dragonfly"]
+    "--backends",
+    nargs="+",
+    choices=["registry", "registry-direct", "afs", "dragonfly"],
+    default=["registry", "afs", "dragonfly"],
 )
 p.add_argument("--dragonfly-policy", choices=["always", "auto"], default="always")
 p.add_argument("--output", default="startup-benchmark.json")
@@ -92,7 +95,7 @@ for iteration in range(a.rounds):
             result = json.loads(
                 execute(
                     node,
-                    sys.executable,
+                    "python3",
                     "/artifacts/scripts/bench_startup.py",
                     "--backend",
                     backend,
@@ -115,6 +118,9 @@ for iteration in range(a.rounds):
             )
             result["resources_before"] = resources_before
             result["resources_after"] = resource_snapshot()
+            if backend == "registry-direct":
+                result["origin_blob_bytes"] = None
+                result["origin_blob_gets"] = None
             results.append(result)
             (root / "evidence" / a.output).write_text(
                 json.dumps(

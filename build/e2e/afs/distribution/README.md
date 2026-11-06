@@ -59,12 +59,16 @@ python3 dragonfly.py --workspace "$TASK" --adx-vm "$CLI" start
 python3 run_startup_bench.py --workspace "$TASK" --adx-vm "$CLI" --rounds 3
 python3 run_startup_bench.py --workspace "$TASK" --adx-vm "$CLI" \
   --backends dragonfly --dragonfly-policy auto --output startup-benchmark-auto.json
+python3 run_startup_bench.py --workspace "$TASK" --adx-vm "$CLI" \
+  --backends registry-direct --output startup-benchmark-registry-direct.json
 ```
 
 每次启动 Nydus 用新本地缓存，预装 bootstrap、关闭预取，计时到 startup.txt+hot.bin 校验完成。
 AFS 每轮新 manifest；Dragonfly 每轮清自己的已停止 peer 缓存；Registry 本身热缓存。
 `always` 强制 P2P；`auto` 的小请求可能直接回源，必须同时报告。bootstrap 获取不在计时内。
 Registry 的 1-byte stat GET 与正文传输分开计数；`body_503` 允许 stat，不代表完全离线。
+`registry` 经观察代理；`registry-direct` 绕过代理，用于隔离测试代理的额外成本，
+启动测试不采集其源站字节（JSON 为 null，不能解释为零回源）。Dragonfly 重置会在计时外等待端口可重新绑定。
 在 mgmt 运行 `/artifacts/scripts/bench_ranges.py` 可测热缓存 64 KiB HTTP 范围读取：
 并发 1/8/32，各 128 请求，报告吞吐、P50/P95/P99、回源量；这不是 Nydus 完整工作负载。
 Python HTTP 客户端、代理 backlog、单 VM 和 debug/release 差异均可能限制结果。

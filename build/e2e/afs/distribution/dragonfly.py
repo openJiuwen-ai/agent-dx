@@ -20,7 +20,7 @@ def execute(node, command):
         [a.adx_vm, "exec", "--session", session, "--node", node, "--", "bash", "-euc", command],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=90,
     )
     if r.returncode:
         raise RuntimeError(f"{node}: {r.stdout}\n{r.stderr}")
@@ -43,6 +43,23 @@ fi""",
 
 
 def peer(i):
+    # Peer shutdown can leave TCP listeners in TIME_WAIT. Wait outside the
+    # measured workload instead of racing an immediate bind on restart.
+    execute(
+        f"worker-{i}",
+        """python3 - <<'PY'
+import socket,time
+deadline=time.monotonic()+70
+while True:
+ try:
+  for port in range(4000,4007):
+   with socket.socket() as probe: probe.bind(('0.0.0.0',port))
+  break
+ except OSError:
+  if time.monotonic()>=deadline: raise
+  time.sleep(0.2)
+PY""",
+    )
     execute(
         f"worker-{i}",
         f"""mkdir -p /workspace/dragonfly

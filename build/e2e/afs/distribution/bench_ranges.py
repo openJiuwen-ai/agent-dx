@@ -30,6 +30,7 @@ def main():
     offsets = [index * 65536 for index in range(16)]
     expected = {offset: hashlib.sha256(fetch(origin, offset)[0]).hexdigest() for offset in offsets}
     urls = {
+        "registry-direct": origin,
         "registry": origin.replace(":5000/", ":5001/"),
         "afs": lab.url("b", manifest),
         "dragonfly-auto": f"http://10.203.0.21:4001/v2/lab/nydus/blobs/{lab.BLOB['digest']}",
@@ -65,6 +66,9 @@ def main():
                 "origin_bytes": sum(item.get("bytes", 0) for item in requests),
                 "passed": True,
             }
+            if backend == "registry-direct":
+                row["origin_bytes"] = 128 * 65536
+                row["origin_accounting"] = "validated response bodies read directly from Registry"
             results.append(row)
             print(json.dumps(row), flush=True)
             pathlib.Path("/output/range-benchmark.json").write_text(json.dumps(results, indent=2))
