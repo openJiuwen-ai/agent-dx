@@ -132,6 +132,100 @@ async fn independent_artifact_attachments_accept_the_same_header() {
 
 #[tokio::test]
 #[ignore = "requires isolated real Redis"]
+async fn checked_artifact_publication_preserves_upgrade_and_header_fences() {
+    let rig = transport_test_redis::Redis::new().await;
+    let store = rig.store().await;
+    let session = store.begin(1).await.unwrap();
+    register(&session).await;
+    running(&session, "source").await;
+    let field = "environment:source";
+    let [raw_header, old] = store.fields([HEADER.into(), field.into()]).await.unwrap();
+    let header = session.header(&raw_header).unwrap();
+    let mut next: StoredEnvironment = decode(old.as_deref().unwrap()).unwrap();
+    next.result
+        .as_mut()
+        .unwrap()
+        .execution_artifacts
+        .push(artifact("capture"));
+    next.result.as_mut().unwrap().revision += 1;
+    let bytes = encode(&next).unwrap();
+    assert!(store
+        .object_cas_checked(
+            &header,
+            Some((field, old.as_deref(), bytes.clone())),
+            None,
+            &[(UPGRADE.into(), None)],
+        )
+        .await
+        .unwrap());
+    assert_eq!(store.fields([HEADER.into()]).await.unwrap()[0], raw_header);
+
+    // Task-owned control explicitly advances the header even though ordinary
+    // checkpoint publication above does not participate in that contention.
+    let task = UpgradeTask {
+        protocol_version: 2,
+        task_id: "upgrade".into(),
+        epoch: 1,
+        namespace: "test".into(),
+        daemonset_uid: "daemonset".into(),
+        target_image: format!("node@sha256:{}", "a".repeat(64)),
+        phase: "Active".into(),
+        nodes: [(
+            "node".into(),
+            UpgradeNode {
+                node_id: "node".into(),
+                pod_uid: "pod".into(),
+                node_session_id: "session".into(),
+                ..Default::default()
+            },
+        )]
+        .into(),
+        ..Default::default()
+    };
+    session.save_upgrade(task, None).await.unwrap();
+    let [current_header, upgrade] = store.fields([HEADER.into(), UPGRADE.into()]).await.unwrap();
+    assert_ne!(current_header, raw_header);
+    next.result
+        .as_mut()
+        .unwrap()
+        .execution_artifacts
+        .push(artifact("later"));
+    next.result.as_mut().unwrap().revision += 1;
+    let later = encode(&next).unwrap();
+    for checks in [
+        vec![(UPGRADE.into(), None)],
+        vec![(HEADER.into(), raw_header)],
+    ] {
+        assert!(
+            !store
+                .object_cas_checked(
+                    &header,
+                    Some((field, Some(&bytes), later.clone())),
+                    None,
+                    &checks,
+                )
+                .await
+                .unwrap(),
+            "stale upgrade or explicit header checks must reject publication"
+        );
+    }
+    assert!(store
+        .object_cas_checked(
+            &header,
+            Some((field, Some(&bytes), later)),
+            None,
+            &[(UPGRADE.into(), upgrade)],
+        )
+        .await
+        .unwrap());
+    assert_eq!(
+        store.fields([HEADER.into()]).await.unwrap(),
+        [current_header]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated real Redis"]
 async fn snapshot_publication_does_not_advance_unrelated_control_header() {
     let rig = transport_test_redis::Redis::new().await;
     let store = rig.store().await;

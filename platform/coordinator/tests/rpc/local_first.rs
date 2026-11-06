@@ -349,6 +349,7 @@ impl Rig {
                 node_session_id: String::new(),
                 assignment: Some(owner.clone()),
                 caller: caller(),
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -808,6 +809,7 @@ async fn failed_gc_cleans_node_controller_redis_and_allows_same_name() {
         node_session_id: "boot-a".into(),
         assignment: Some(assignment.clone()),
         caller: None,
+        ..Default::default()
     };
     let replayed = rig.coordinator_nodes[0]
         .delete_environment(replay.clone())
@@ -2032,6 +2034,7 @@ async fn existing_terminal_claim_reconciles_a_late_commit_into_scheduler_account
             node_session_id: String::new(),
             assignment: running.assignment,
             caller: caller(),
+            ..Default::default()
         })
         .await
         .is_err());

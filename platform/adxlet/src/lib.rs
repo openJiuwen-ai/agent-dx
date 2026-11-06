@@ -22,6 +22,7 @@ pub mod runtime_control;
 pub mod runtime_logs;
 pub mod runtime_router;
 pub mod sandboxd;
+pub mod upgrade;
 
 use adx_core::scheduling::{validate_device_assignment, Device, DeviceAllocation, DeviceLedger};
 use adx_core::{
@@ -80,8 +81,20 @@ pub struct RuntimeStatus {
     pub failure: Option<adx_core::RuntimeFailure>,
 }
 
+/// Identity of the immutable deployment root used by default-profile executions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeRootfsIdentity {
+    pub path: String,
+    pub sha256: String,
+}
+
 #[async_trait]
 pub trait RuntimeDriver: Send + Sync {
+    /// Unknown or non-local defaults cannot establish cross-node rootfs compatibility.
+    fn runtime_rootfs_identity(&self) -> Option<RuntimeRootfsIdentity> {
+        None
+    }
+
     /// Whether a successful restore keeps caller-owned checkpoint input files.
     /// Unknown drivers conservatively retain their input until execution stops.
     fn retains_checkpoint_files(&self, _runtime_class: &str) -> bool {
@@ -284,6 +297,12 @@ pub trait Readiness: Send + Sync {
 
 #[async_trait]
 pub trait Routes: Send + Sync {
+    /// Close new business streams and wait for already accepted streams to end.
+    /// A caller-supplied deadline bounds the wait; failure may leave admission
+    /// closed, so callers retaining a Running execution must reopen it.
+    async fn drain(&self, _record: &EnvironmentRecord) -> Result<()> {
+        Err(Error::Unavailable("proxy draining is unavailable".into()))
+    }
     /// Close new business stream admission only if the observed idle version still matches.
     async fn quiesce(
         &self,
@@ -444,6 +463,29 @@ pub(crate) struct Services {
     snapshots: Option<Arc<dyn checkpoint::SnapshotCatalog>>,
     metrics: metrics::Metrics,
     health_failure_threshold: Option<u32>,
+    upgrade: Arc<upgrade::UpgradeGate>,
+}
+
+impl Services {
+    async fn execution(
+        &self,
+        record: &EnvironmentRecord,
+        action: &str,
+    ) -> Result<upgrade::ExecutionLease> {
+        self.upgrade
+            .enter(&record.spec.id, record.assignment.generation, action)
+            .await
+    }
+
+    async fn activate_route(&self, record: &EnvironmentRecord) -> Result<()> {
+        let _execution = self.execution(record, "route").await?;
+        self.routes.activate(record).await
+    }
+
+    async fn reopen_route(&self, record: &EnvironmentRecord) -> Result<()> {
+        let _execution = self.execution(record, "route").await?;
+        self.routes.reopen(record).await
+    }
 }
 
 type EnvironmentDirectory = BTreeMap<String, (EnvironmentSpec, Assignment, EnvironmentHandle)>;
@@ -509,6 +551,7 @@ impl Adxlet {
                 snapshots: None,
                 metrics: metrics::Metrics::default(),
                 health_failure_threshold: None,
+                upgrade: Arc::new(upgrade::UpgradeGate::unmanaged()),
             }),
             environments: Arc::default(),
             authority_tasks: Arc::default(),
@@ -657,7 +700,9 @@ impl Adxlet {
     }
 
     fn locally_accepting_allocations(&self) -> bool {
-        if !self.lifecycle_ready.try_read().is_ok_and(|ready| *ready) {
+        if !self.services.upgrade.accepting_allocations()
+            || !self.lifecycle_ready.try_read().is_ok_and(|ready| *ready)
+        {
             return false;
         }
         let admission = self
@@ -840,6 +885,9 @@ impl Adxlet {
             ));
         }
         retired.remove(&spec.id);
+        self.services
+            .upgrade
+            .record_action(&spec.id, assignment.generation, "create")?;
         // The registry lock makes controller creation atomic across concurrent callers.
         let held = self.adopt_local(&spec, &assignment)?;
         let handle = controller::spawn(

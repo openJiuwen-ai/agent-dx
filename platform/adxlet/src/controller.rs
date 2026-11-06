@@ -1073,6 +1073,20 @@ impl Controller {
     }
 
     async fn reconcile(&mut self) -> Result<OperationResult> {
+        // Quarantine preserves authoritative records without reopening old executions.
+        if self.record.state != EnvironmentState::Paused
+            && self
+                .services
+                .upgrade
+                .check(
+                    &self.record.spec.id,
+                    self.record.assignment.generation,
+                    "route",
+                )
+                .is_err()
+        {
+            return self.replay_or_sync().await;
+        }
         if self
             .record
             .execution_artifacts
@@ -1148,7 +1162,7 @@ impl Controller {
                         control.reopen_idle(&self.record).await?;
                     }
                 }
-                self.services.routes.activate(&self.record).await
+                self.services.activate_route(&self.record).await
             })
             .await
             .map_err(|_| Error::Unavailable("recovery readiness timed out".into()))??;
@@ -1345,6 +1359,14 @@ impl Controller {
         completion: Option<(String, u64, LifecycleKind)>,
     ) -> Result<OperationResult> {
         let previous_runtime_id = self.record.runtime.id.clone();
+        let action = if restore_checkpoint {
+            "resume"
+        } else if restart {
+            "restart"
+        } else {
+            "create"
+        };
+        let _execution = self.services.execution(&self.record, action).await?;
         let runtime_id = if restart {
             format!(
                 "{}-{}-r{}",
@@ -1519,7 +1541,7 @@ impl Controller {
                         "environment.id",
                         self.record.spec.id.clone(),
                     );
-                    self.services.routes.activate(&self.record).await
+                    self.services.activate_route(&self.record).await
                 })
                 .await?;
             Ok((

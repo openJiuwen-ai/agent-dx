@@ -22,6 +22,9 @@ pub struct BackendHttpPoolConfig {
     pub max_idle_connections: usize,
     pub max_idle_connections_per_endpoint: usize,
     pub idle_timeout: Duration,
+    /// Retire a connection after its current response completes, even when it
+    /// is continuously reused. This bounds planned Relay drain latency.
+    pub max_connection_lifetime: Duration,
     pub acquire_timeout: Duration,
 }
 
@@ -35,6 +38,7 @@ impl Default for BackendHttpPoolConfig {
             // Relay. Keep this deliberately short so pooling cannot pin a
             // environment busy for an unbounded period.
             idle_timeout: Duration::from_secs(5),
+            max_connection_lifetime: Duration::from_secs(30),
             acquire_timeout: Duration::from_secs(3),
         }
     }
@@ -42,6 +46,7 @@ impl Default for BackendHttpPoolConfig {
 
 #[derive(Debug, Clone, Eq)]
 pub struct BackendHttpPoolKey {
+    pub route_revision: u64,
     pub relay_address: String,
     pub instance_id: String,
     pub workload_id: String,
@@ -51,7 +56,8 @@ pub struct BackendHttpPoolKey {
 
 impl PartialEq for BackendHttpPoolKey {
     fn eq(&self, other: &Self) -> bool {
-        self.relay_address == other.relay_address
+        self.route_revision == other.route_revision
+            && self.relay_address == other.relay_address
             && self.instance_id == other.instance_id
             && self.workload_id == other.workload_id
             && self.target_ip == other.target_ip
@@ -61,6 +67,7 @@ impl PartialEq for BackendHttpPoolKey {
 
 impl Hash for BackendHttpPoolKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        self.route_revision.hash(state);
         self.relay_address.hash(state);
         self.instance_id.hash(state);
         self.workload_id.hash(state);
@@ -102,6 +109,7 @@ struct EndpointPool {
 struct IdleConnection {
     sender: SendRequest<Incoming>,
     idle_since: Instant,
+    opened_at: Instant,
 }
 
 impl BackendHttpPool {
@@ -143,9 +151,10 @@ impl BackendHttpPool {
         }
     }
 
-    pub fn invalidate_instance(&self, instance_id: &str) {
-        self.inner
-            .remove_matching(|key| key.instance_id == instance_id);
+    pub fn invalidate_instance(&self, instance_id: &str, before_revision: u64) {
+        self.inner.remove_matching(|key| {
+            key.instance_id == instance_id && key.route_revision < before_revision
+        });
     }
 
     pub fn clear(&self) {
@@ -163,21 +172,24 @@ impl BackendHttpPool {
         Fut: Future<Output = io::Result<T>>,
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        self.send_recoverable(key, request, open)
+        self.send_recoverable(key, request, open, || Ok(()))
             .await
             .map_err(|(error, _)| error)
     }
 
     /// Return ownership only if no business request has been sent. Callers may safely re-resolve
     /// a target in that case, but may never replay an ambiguous send_request failure.
-    pub async fn send_recoverable<F, Fut, T>(
+    /// Validate admission after all pool/connection waits, immediately before sending.
+    pub async fn send_recoverable<F, Fut, T, V>(
         &self,
         key: BackendHttpPoolKey,
         mut request: Request<Incoming>,
         open: F,
+        validate: V,
     ) -> Result<Response<PooledResponseBody>, (BackendHttpPoolError, Option<Request<Incoming>>)>
     where
         F: FnOnce() -> Fut,
+        V: FnOnce() -> io::Result<()>,
         Fut: Future<Output = io::Result<T>>,
         T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
@@ -199,8 +211,11 @@ impl BackendHttpPool {
                 BackendHttpPoolError::Saturated
             })?
             .map_err(|_| BackendHttpPoolError::Closed)?;
+            if !endpoint.valid.load(Ordering::Acquire) {
+                return Err(BackendHttpPoolError::Closed);
+            }
 
-            let sender = loop {
+            let (sender, opened_at, reused) = loop {
                 let Some(mut idle) = self.inner.take_idle(&endpoint) else {
                     let stream = open().await.map_err(BackendHttpPoolError::Connect)?;
                     let (sender, connection) =
@@ -213,22 +228,30 @@ impl BackendHttpPool {
                             tracing::debug!(%error, "pooled environment HTTP connection closed");
                         }
                     }));
-                    break sender;
+                    break (sender, Instant::now(), false);
                 };
                 if idle.sender.ready().await.is_ok() {
-                    self.inner.reused_total.fetch_add(1, Ordering::Relaxed);
-                    break idle.sender;
+                    break (idle.sender, idle.opened_at, true);
                 }
                 self.inner.discarded_total.fetch_add(1, Ordering::Relaxed);
             };
 
-            Ok::<_, BackendHttpPoolError>((sender, endpoint, permit))
+            Ok::<_, BackendHttpPoolError>((sender, opened_at, endpoint, permit, reused))
         }
         .await;
-        let (mut sender, endpoint, permit) = match prepared {
+        let (mut sender, opened_at, endpoint, permit, reused) = match prepared {
             Ok(value) => value,
             Err(error) => return Err((error, Some(request))),
         };
+        if !endpoint.valid.load(Ordering::Acquire) {
+            return Err((BackendHttpPoolError::Closed, Some(request)));
+        }
+        if let Err(error) = validate() {
+            return Err((BackendHttpPoolError::Connect(error), Some(request)));
+        }
+        if reused {
+            self.inner.reused_total.fetch_add(1, Ordering::Relaxed);
+        }
         let request_allows_reuse = !has_connection_close(request.headers());
         if let Some(processing) = request
             .extensions()
@@ -244,6 +267,7 @@ impl BackendHttpPool {
         let reusable = request_allows_reuse && response_allows_reuse;
         let lease = ConnectionLease {
             sender: Some(sender),
+            opened_at,
             endpoint,
             pool: Arc::downgrade(&self.inner),
             permit: Some(permit),
@@ -282,9 +306,13 @@ impl PoolInner {
     fn take_idle(&self, endpoint: &EndpointPool) -> Option<IdleConnection> {
         let now = Instant::now();
         let mut idle = endpoint.idle.lock().unwrap();
+        if !endpoint.valid.load(Ordering::Acquire) {
+            return None;
+        }
         while let Some(connection) = idle.pop_back() {
             self.idle_connections.fetch_sub(1, Ordering::Relaxed);
             if now.duration_since(connection.idle_since) <= self.config.idle_timeout
+                && now.duration_since(connection.opened_at) < self.config.max_connection_lifetime
                 && !connection.sender.is_closed()
             {
                 return Some(connection);
@@ -294,12 +322,21 @@ impl PoolInner {
         None
     }
 
-    fn return_idle(&self, endpoint: &EndpointPool, sender: SendRequest<Incoming>) {
-        if !endpoint.valid.load(Ordering::Acquire) || sender.is_closed() {
+    fn return_idle(
+        &self,
+        endpoint: &EndpointPool,
+        sender: SendRequest<Incoming>,
+        opened_at: Instant,
+    ) {
+        // Serialize the validity check and insertion with invalidation's queue drain.
+        let mut idle = endpoint.idle.lock().unwrap();
+        if !endpoint.valid.load(Ordering::Acquire)
+            || sender.is_closed()
+            || opened_at.elapsed() >= self.config.max_connection_lifetime
+        {
             self.discarded_total.fetch_add(1, Ordering::Relaxed);
             return;
         }
-        let mut idle = endpoint.idle.lock().unwrap();
         if idle.len() >= self.config.max_idle_connections_per_endpoint
             || self
                 .idle_connections
@@ -314,6 +351,7 @@ impl PoolInner {
         idle.push_back(IdleConnection {
             sender,
             idle_since: Instant::now(),
+            opened_at,
         });
     }
 
@@ -325,6 +363,8 @@ impl PoolInner {
             let before = idle.len();
             idle.retain(|connection| {
                 now.duration_since(connection.idle_since) <= self.config.idle_timeout
+                    && now.duration_since(connection.opened_at)
+                        < self.config.max_connection_lifetime
                     && !connection.sender.is_closed()
             });
             let removed = before - idle.len();
@@ -338,6 +378,7 @@ impl PoolInner {
                     == self.config.max_connections_per_endpoint);
             if !keep {
                 endpoint.valid.store(false, Ordering::Release);
+                endpoint.permits.close();
             }
             keep
         });
@@ -349,8 +390,11 @@ impl PoolInner {
             if !predicate(key) {
                 return true;
             }
+            let mut idle = endpoint.idle.lock().unwrap();
             endpoint.valid.store(false, Ordering::Release);
-            let removed = endpoint.idle.lock().unwrap().len();
+            endpoint.permits.close();
+            let removed = idle.len();
+            idle.clear();
             if removed > 0 {
                 self.idle_connections.fetch_sub(removed, Ordering::Relaxed);
                 self.discarded_total
@@ -363,6 +407,7 @@ impl PoolInner {
 
 struct ConnectionLease {
     sender: Option<SendRequest<Incoming>>,
+    opened_at: Instant,
     endpoint: Arc<EndpointPool>,
     pool: std::sync::Weak<PoolInner>,
     permit: Option<OwnedSemaphorePermit>,
@@ -373,7 +418,7 @@ impl ConnectionLease {
     fn finish(mut self, body_complete: bool) {
         if body_complete && self.reusable {
             if let (Some(pool), Some(sender)) = (self.pool.upgrade(), self.sender.take()) {
-                pool.return_idle(&self.endpoint, sender);
+                pool.return_idle(&self.endpoint, sender, self.opened_at);
             }
         } else if let Some(pool) = self.pool.upgrade() {
             pool.discarded_total.fetch_add(1, Ordering::Relaxed);
@@ -503,7 +548,7 @@ mod retry_tests {
     use std::convert::Infallible;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    async fn exercise(fail_before_send: bool) {
+    async fn exercise(fail_before_send: bool, reject_admission: bool) {
         let pool = BackendHttpPool::new(BackendHttpPoolConfig::default());
         let (front, incoming) = tokio::io::duplex(8192);
         let task = tokio::spawn(async move {
@@ -514,6 +559,7 @@ mod retry_tests {
                         let pool = pool.clone();
                         async move {
                             let key = BackendHttpPoolKey {
+                                route_revision: 1,
                                 relay_address: "unused".into(),
                                 instance_id: "instance".into(),
                                 workload_id: "workload".into(),
@@ -522,7 +568,7 @@ mod retry_tests {
                             };
                             let (stream, mut peer) = tokio::io::duplex(8192);
                             let received = tokio::spawn(async move {
-                                if fail_before_send {
+                                if fail_before_send || reject_admission {
                                     return Vec::new();
                                 }
                                 let mut all = Vec::new();
@@ -539,17 +585,28 @@ mod retry_tests {
                                 all
                             });
                             let result = pool
-                                .send_recoverable(key, request, || async move {
-                                    if fail_before_send {
-                                        Err(io::Error::other("connect failed"))
-                                    } else {
-                                        Ok(stream)
-                                    }
-                                })
+                                .send_recoverable(
+                                    key,
+                                    request,
+                                    || async move {
+                                        if fail_before_send {
+                                            Err(io::Error::other("connect failed"))
+                                        } else {
+                                            Ok(stream)
+                                        }
+                                    },
+                                    || {
+                                        if reject_admission {
+                                            Err(io::Error::other("admission revoked"))
+                                        } else {
+                                            Ok(())
+                                        }
+                                    },
+                                )
                                 .await;
                             match result {
                                 Err((BackendHttpPoolError::Connect(_), Some(request)))
-                                    if fail_before_send =>
+                                    if fail_before_send || reject_admission =>
                                 {
                                     assert_eq!(
                                         request.into_body().collect().await.unwrap().to_bytes(),
@@ -557,11 +614,11 @@ mod retry_tests {
                                     );
                                 }
                                 Err((BackendHttpPoolError::Request(_), None))
-                                    if !fail_before_send => {}
+                                    if !fail_before_send && !reject_admission => {}
                                 _ => panic!("incorrect replay eligibility"),
                             }
                             let bytes = received.await.unwrap();
-                            if !fail_before_send {
+                            if !fail_before_send && !reject_admission {
                                 assert!(bytes.ends_with(b"one-business-body"));
                             }
                             Ok::<_, Infallible>(Response::new(Full::new(Bytes::new())))
@@ -591,11 +648,16 @@ mod retry_tests {
     }
     #[tokio::test]
     async fn connection_failure_returns_the_unconsumed_business_body() {
-        exercise(true).await;
+        exercise(true, false).await;
     }
     #[tokio::test]
     async fn lost_response_never_returns_a_replayable_business_body() {
-        exercise(false).await;
+        exercise(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn revoked_admission_keeps_the_business_body_unsent() {
+        exercise(false, true).await;
     }
 
     #[test]

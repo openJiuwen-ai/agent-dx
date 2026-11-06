@@ -7,8 +7,9 @@ async fn paused_fixture() -> (
 ) {
     let rig = common::Redis::new().await;
     let session = rig.store().await.begin(1).await.unwrap();
-    register(&session, "source").await;
-    register(&session, "target").await;
+    for id in ["source", "target"] {
+        maintenance_register(&session, id, &format!("{id}-session"), 1).await;
+    }
     let assignment = Assignment {
         environment_id: "sleep".into(),
         node_id: "source".into(),
@@ -350,4 +351,255 @@ async fn failure_recovery_intermediate_pause_does_not_become_user_dormancy() {
         EnvironmentState::Failed
     );
     assert!(interrupted.recovery_point(1).is_some());
+}
+
+async fn maintenance_register(
+    session: &adx_coordinator::storage::Session,
+    id: &str,
+    sid: &str,
+    sequence: u64,
+) -> StoredNode {
+    session
+        .register_session(
+            node(id),
+            format!("{id}:1"),
+            format!("{id}:2"),
+            Some(adx_coordinator::storage::NodeSession {
+                id: sid.into(),
+                sequence,
+                routable: true,
+            }),
+        )
+        .await
+        .unwrap()
+}
+
+fn maintenance_task(admin_paused: bool) -> adx_coordinator::storage::UpgradeTask {
+    use adx_coordinator::storage::{UpgradeNode, UpgradeTask};
+    UpgradeTask {
+        protocol_version: 2,
+        task_id: "upgrade".into(),
+        epoch: 1,
+        namespace: "test".into(),
+        daemonset_uid: "daemonset".into(),
+        target_image: format!("node@sha256:{}", "a".repeat(64)),
+        phase: "Active".into(),
+        nodes: [(
+            "source".into(),
+            UpgradeNode {
+                node_id: "source".into(),
+                pod_uid: "source-pod".into(),
+                node_session_id: "source-session".into(),
+                original_pod_uid: "source-pod".into(),
+                original_session_id: "source-session".into(),
+                original_paused: admin_paused,
+                phase: "evacuating".into(),
+                ..Default::default()
+            },
+        )]
+        .into(),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated real Redis"]
+async fn maintenance_admission_and_terminal_registration_matrix() {
+    for admin in [false, true] {
+        for retired in [false, true] {
+            let (rig, session, _) = paused_fixture().await;
+            session
+                .set_node_scheduling("source", admin, !admin)
+                .await
+                .unwrap();
+            if retired {
+                maintenance_register(&session, "late", "old", 1).await;
+                session
+                    .invalidate_node_with_departure("late", "old", true)
+                    .await
+                    .unwrap();
+                assert!(session
+                    .retire_expired_node("late", "old", 1, 0)
+                    .await
+                    .unwrap());
+            }
+            let task = session
+                .save_upgrade(maintenance_task(admin), None)
+                .await
+                .unwrap();
+            assert!(session
+                .set_upgrade_node_scheduling("upgrade", 2, "source", true)
+                .await
+                .is_err());
+            session
+                .set_upgrade_node_scheduling("upgrade", 1, "source", true)
+                .await
+                .unwrap();
+            assert!(session.request_resume("sleep", 1).await.is_err());
+            assert!(session.get("sleep").await.unwrap().resume.is_none());
+            let heartbeat = maintenance_register(&session, "source", "source-session", 2).await;
+            assert!(heartbeat.scheduling_paused && heartbeat.upgrade_pause.is_some());
+            let released = session
+                .set_upgrade_node_scheduling("upgrade", 1, "source", false)
+                .await
+                .unwrap();
+            assert_eq!(released.scheduling_paused, admin);
+            let late = maintenance_register(&session, "late", "replacement", 1).await;
+            assert!(late.scheduling_paused && late.upgrade_pause.is_some());
+            let mut terminal = task.clone();
+            terminal.phase = "Completed".into();
+            terminal.nodes.get_mut("source").unwrap().phase = "verified".into();
+            assert!(session
+                .save_upgrade(terminal.clone(), Some(task.revision))
+                .await
+                .is_err());
+            session
+                .set_upgrade_node_scheduling("upgrade", 1, "late", false)
+                .await
+                .unwrap();
+            session
+                .save_upgrade(terminal, Some(task.revision))
+                .await
+                .unwrap();
+            let current = rig.store().await.begin(1).await.unwrap();
+            assert!(session
+                .set_node_scheduling("source", false, true)
+                .await
+                .is_err());
+            assert_eq!(
+                current.upgrade_task().await.unwrap().unwrap().phase,
+                "Completed"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated real Redis"]
+async fn maintenance_transfer_requires_stopped_owner_and_exact_sessions() {
+    for resume in [false, true] {
+        let (_rig, session, record) = paused_fixture().await;
+        let replacement = Assignment {
+            environment_id: "sleep".into(),
+            node_id: "target".into(),
+            generation: 2,
+            shard_id: 0,
+            devices: vec![],
+        };
+        for (source, target) in [("stale", "target-session"), ("source-session", "stale")] {
+            assert!(session
+                .reserve_migration(
+                    &record.assignment,
+                    replacement.clone(),
+                    1,
+                    resume,
+                    source,
+                    target
+                )
+                .await
+                .is_err());
+            assert_eq!(
+                session.get("sleep").await.unwrap().assignment,
+                record.assignment
+            );
+        }
+        let mut active = record.clone();
+        active.state = EnvironmentState::Running;
+        active.resources_held = true;
+        active.runtime.ip = Some("10.0.0.2".parse().unwrap());
+        active.runtime.id = format!("{}-r{}", record.runtime.id, record.revision + 1);
+        active.last_operation = Some(adx_core::CompletedOperation {
+            id: "resume".into(),
+            kind: adx_core::LifecycleKind::Resume,
+            expected_revision: record.revision,
+        });
+        active.revision += 1;
+        session.commit(active.clone()).await.unwrap();
+        session
+            .save_upgrade(maintenance_task(false), None)
+            .await
+            .unwrap();
+        assert!(session
+            .reserve_migration(
+                &record.assignment,
+                replacement.clone(),
+                1,
+                resume,
+                "source-session",
+                "target-session"
+            )
+            .await
+            .is_err());
+        let mut stopped = active.clone();
+        stopped.state = EnvironmentState::Paused;
+        stopped.resources_held = false;
+        stopped.runtime.ip = None;
+        stopped.revision += 1;
+        session.commit(stopped).await.unwrap();
+        let moved = session
+            .reserve_migration(
+                &record.assignment,
+                replacement.clone(),
+                1,
+                resume,
+                "source-session",
+                "target-session",
+            )
+            .await
+            .unwrap();
+        assert_eq!(moved.assignment, replacement);
+        assert_eq!(moved.recovery.unwrap().pending, resume);
+        let paused = moved.result.unwrap();
+        assert_eq!(paused.state, EnvironmentState::Paused);
+        assert!(!paused.resources_held);
+        assert!(session.commit(active).await.is_err());
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires isolated real Redis"]
+async fn maintenance_revocation_survives_restart_and_legacy_tasks_remain_read_only() {
+    use adx_coordinator::storage::LocalClaim;
+    let (rig, session, _) = paused_fixture().await;
+    let id = "default-upgrade-canary-lost";
+    let mut task = maintenance_task(false);
+    task.canaries.insert(id.into(), "target".into());
+    let mut task = session.save_upgrade(task, None).await.unwrap();
+    let probe = spec(id);
+    let assignment = Assignment {
+        environment_id: id.into(),
+        node_id: "target".into(),
+        generation: 9,
+        shard_id: 0,
+        devices: vec![],
+    };
+    session
+        .reserve(probe.clone(), assignment.clone())
+        .await
+        .unwrap();
+    task.revoked_canaries.insert(id.into());
+    let task = session
+        .save_upgrade(task.clone(), Some(task.revision))
+        .await
+        .unwrap();
+    let current = rig.store().await.begin(1).await.unwrap();
+    assert!(current.reserve(probe.clone(), assignment).await.is_err());
+    assert!(current
+        .claim(
+            probe,
+            &LocalClaim {
+                request_id: "late".into(),
+                node_id: "target".into(),
+                node_session_id: "target-session".into(),
+                devices: vec![]
+            }
+        )
+        .await
+        .is_err());
+    let mut encoded = serde_json::to_value(task).unwrap();
+    encoded.as_object_mut().unwrap().remove("protocol_version");
+    let legacy: adx_coordinator::storage::UpgradeTask = serde_json::from_value(encoded).unwrap();
+    assert!(legacy.validate().is_ok());
+    assert!(legacy.fence("upgrade", 1).is_err());
+    assert!(current.save_upgrade(legacy, None).await.is_err());
 }

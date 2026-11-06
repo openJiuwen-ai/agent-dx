@@ -49,7 +49,14 @@ pub async fn pause_lifecycle_reporting(
     drain_reporting(manager.pause_lifecycle(), async {
         loop {
             heartbeat.tick().await;
-            if let Err(error) = report(coordinator, registration, timeout, handshake_required).await
+            if let Err(error) = report(
+                manager,
+                coordinator,
+                registration,
+                timeout,
+                handshake_required,
+            )
+            .await
             {
                 // A report failure cannot abandon the drain or reopen lifecycle.
                 adx_observability::warn!(%error, "node report unavailable while lifecycle drains");
@@ -77,6 +84,7 @@ pub async fn unregister_node(
 }
 
 async fn report(
+    manager: &Adxlet,
     coordinator: &mut Coordinator,
     registration: &mut pb::RegisterNodeRequest,
     timeout: Duration,
@@ -88,9 +96,19 @@ async fn report(
         .ok_or_else(|| Status::internal("heartbeat sequence exhausted"))?;
     let mut request = Request::new(registration.clone());
     request.set_timeout(timeout);
-    let result = bounded_rpc(timeout, coordinator.register_node(request))
-        .await
-        .map(|_| ());
+    let result = match bounded_rpc(timeout, coordinator.register_node(request)).await {
+        Ok(response) => {
+            if let Some(control) = response.into_inner().upgrade_control {
+                manager
+                    .apply_registration_upgrade_control(control)
+                    .await
+                    .map_err(status)
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) => Err(error),
+    };
     if result
         .as_ref()
         .is_err_and(|error| error.code() == tonic::Code::FailedPrecondition)
@@ -162,7 +180,7 @@ pub async fn reconcile_node(
         .await?;
     }
     let result = async {
-        report(coordinator, registration, timeout, &mut handshake_required).await?;
+        report(manager, coordinator, registration, timeout, &mut handshake_required).await?;
         let basis = if periodic {
             Some(manager.comparison_basis(report_interval).await)
         } else {
@@ -239,7 +257,7 @@ pub async fn reconcile_node(
                         registration.accepting_allocations = manager.accepting_allocations()
                             && !manager.is_draining();
                     }
-                    report(coordinator, registration, timeout, &mut handshake_required).await?;
+                    report(manager, coordinator, registration, timeout, &mut handshake_required).await?;
                 },
             }
         }
@@ -251,7 +269,7 @@ pub async fn reconcile_node(
         manager
             .authority_reconciling
             .store(false, Ordering::Release);
-        report(coordinator, registration, timeout, &mut handshake_required).await
+        report(manager, coordinator, registration, timeout, &mut handshake_required).await
     }
     .await;
     if result.is_err() && periodic && !handshake_required {
@@ -261,7 +279,14 @@ pub async fn reconcile_node(
         registration.accepting_allocations =
             manager.accepting_allocations() && !manager.is_draining();
         if catalog_retry {
-            let _ = report(coordinator, registration, timeout, &mut handshake_required).await;
+            let _ = report(
+                manager,
+                coordinator,
+                registration,
+                timeout,
+                &mut handshake_required,
+            )
+            .await;
             if handshake_required {
                 manager.authority_reconciling.store(true, Ordering::Release);
                 registration.reconciling = true;
@@ -277,8 +302,14 @@ pub async fn reconcile_node(
             registration.reconciling = false;
             registration.accepting_allocations =
                 manager.accepting_allocations() && !manager.is_draining();
-            if let Err(error) =
-                report(coordinator, registration, timeout, &mut handshake_required).await
+            if let Err(error) = report(
+                manager,
+                coordinator,
+                registration,
+                timeout,
+                &mut handshake_required,
+            )
+            .await
             {
                 manager.authority_reconciling.store(true, Ordering::Release);
                 pause_lifecycle_reporting(

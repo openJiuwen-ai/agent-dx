@@ -75,6 +75,7 @@ impl Controller {
         let Some(id) = status.requested_checkpoint else {
             return Ok(false);
         };
+        let _execution = self.services.execution(&self.record, "pause").await?;
         if let Err(error) = services.store.validate_policy(storage) {
             services
                 .cooperation

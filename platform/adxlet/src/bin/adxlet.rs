@@ -299,6 +299,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state_sink,
     )
     .with_runtime_control(control.clone())?
+    .with_upgrade_control(
+        config.proxy_socket.with_file_name("upgrade-control.json"),
+        session_id.clone(),
+    )?
     .with_operation_timeout(timeout)?
     .with_health_check(config.execd_health_failure_threshold)?;
     let checkpoint_storage = match (config.checkpoint_dir, config.checkpoint_storage) {
@@ -322,6 +326,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .with_snapshot_catalog(sink.clone())?;
     }
     let manager = Arc::new(manager);
+    if std::env::var("ADX_NODE_UPGRADE_ISOLATED").as_deref() == Ok("true") {
+        manager.isolate_upgrade_bootstrap()?;
+    }
     manager.pause_lifecycle().await;
     let (o, valid) = loop {
         match sample(&source, &runtime, timeout).await {

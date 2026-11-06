@@ -39,26 +39,91 @@ impl Session {
         replacement: Assignment,
         now: u64,
     ) -> Result<StoredEnvironment> {
+        Box::pin(self.transfer_checkpoint(previous, replacement, now, None, None)).await
+    }
+
+    /// Planned transfer requires a published, stopped source; it never simulates node failure.
+    pub async fn reserve_migration(
+        &self,
+        previous: &Assignment,
+        replacement: Assignment,
+        now: u64,
+        resume: bool,
+        expected_source_session: &str,
+        expected_target_session: &str,
+    ) -> Result<StoredEnvironment> {
+        Box::pin(self.transfer_checkpoint(
+            previous,
+            replacement,
+            now,
+            Some(resume),
+            Some((expected_source_session, expected_target_session)),
+        ))
+        .await
+    }
+
+    async fn transfer_checkpoint(
+        &self,
+        previous: &Assignment,
+        replacement: Assignment,
+        now: u64,
+        planned_resume: Option<bool>,
+        expected_sessions: Option<(&str, &str)>,
+    ) -> Result<StoredEnvironment> {
+        let (planned, resume) = (planned_resume.is_some(), planned_resume.unwrap_or(true));
         if previous.environment_id != replacement.environment_id
             || previous.node_id == replacement.node_id
             || previous.generation >= replacement.generation
         {
             return Err(Error::Conflict);
         }
+        if replacement.generation >> 32 == self.epoch {
+            self.generations
+                .fetch_max(replacement.generation, Ordering::AcqRel);
+        }
         let field = format!("environment:{}", previous.environment_id);
         for _ in 0..ATTEMPTS {
-            let [header_value, environment_value, node_value] = self
-                .store
-                .fields([
-                    HEADER.into(),
-                    field.clone(),
-                    format!("node:{}", replacement.node_id),
-                ])
-                .await?;
+            let [header_value, environment_value, node_value, source_node_value, upgrade_value] =
+                self.store
+                    .fields([
+                        HEADER.into(),
+                        field.clone(),
+                        format!("node:{}", replacement.node_id),
+                        format!("node:{}", previous.node_id),
+                        UPGRADE.into(),
+                    ])
+                    .await?;
             let header = self.header(&header_value)?;
+            let upgrade = upgrade_value
+                .as_deref()
+                .map(decode::<UpgradeTask>)
+                .transpose()?;
             let mut stored_environment: StoredEnvironment =
                 decode(environment_value.as_deref().ok_or(Error::NotFound)?)?;
             stored_environment.validate()?;
+            if planned && volumes::has_volumes(&stored_environment.spec) {
+                return Err(Error::Invalid(
+                    "planned migration of managed Volumes is not supported".into(),
+                ));
+            }
+            if let Some((source_session, target_session)) = expected_sessions {
+                let source: StoredNode =
+                    decode(source_node_value.as_deref().ok_or(Error::NotFound)?)?;
+                let target: StoredNode = decode(node_value.as_deref().ok_or(Error::NotFound)?)?;
+                if source_session.is_empty()
+                    || target_session.is_empty()
+                    || source
+                        .session
+                        .as_ref()
+                        .is_none_or(|s| s.id != source_session)
+                    || target
+                        .session
+                        .as_ref()
+                        .is_none_or(|s| s.id != target_session)
+                {
+                    return Err(Error::Conflict);
+                }
+            }
             if stored_environment.assignment == replacement
                 && stored_environment
                     .recovery
@@ -70,14 +135,52 @@ impl Session {
             if &stored_environment.assignment != previous {
                 return Err(Error::Conflict);
             }
-            let mut checkpoint = stored_environment
-                .recovery_point(now)
-                .or_else(|| stored_environment.resume_point(now))
-                .ok_or(Error::Conflict)?
-                .clone();
+            let planned_point = stored_environment
+                .result
+                .as_ref()
+                .filter(|r| {
+                    planned
+                        && !stored_environment.invalidated
+                        && stored_environment.resume.is_none()
+                        && r.state == EnvironmentState::Paused
+                        && !r.resources_held
+                        && !r.restart_pending
+                })
+                .and_then(|r| r.checkpoint.as_ref().or(r.snapshot_source.as_ref()))
+                .filter(|cp| cp.artifact.storage != "local" && !cp.expired(now));
+            let mut checkpoint = if planned {
+                planned_point
+            } else {
+                stored_environment
+                    .recovery_point(now)
+                    .or_else(|| stored_environment.resume_point(now))
+            }
+            .ok_or(Error::Conflict)?
+            .clone();
             node_value.as_deref().ok_or(Error::NotFound)?;
             let target = self.get_node(&replacement.node_id).await?;
-            if !target.node.available
+            if planned && !checkpoint.artifact.scope.is_empty() {
+                let source: StoredNode =
+                    decode(source_node_value.as_deref().ok_or(Error::NotFound)?)?;
+                if !source
+                    .checkpoint_scopes
+                    .contains(&checkpoint.artifact.scope)
+                    || !target
+                        .checkpoint_scopes
+                        .contains(&checkpoint.artifact.scope)
+                {
+                    return Err(Error::Invalid(
+                        "checkpoint backend identity is unavailable on migration nodes".into(),
+                    ));
+                }
+            }
+            let canary_target = planned
+                && upgrade.as_ref().is_some_and(|task| {
+                    task.active()
+                        && !task.revoked_canaries.contains(&previous.environment_id)
+                        && task.canaries.get(&previous.environment_id) == Some(&replacement.node_id)
+                });
+            if (!target.node.available && !canary_target)
                 || target.shard_id != replacement.shard_id
                 || target.session.as_ref().is_some_and(|s| !s.routable)
             {
@@ -127,7 +230,7 @@ impl Session {
             stored_environment.failed_since_unix_seconds = None;
             stored_environment.recovery = Some(Recovery {
                 source: previous.clone(),
-                pending: true,
+                pending: resume,
             });
             if let Some(last) = stored_environment
                 .last_interruption
@@ -148,15 +251,22 @@ impl Session {
                 None
             };
 
-            if self
-                .assignment_cas(
-                    &header,
-                    environment_value.as_deref(),
-                    &stored_environment,
-                    catalog.as_ref(),
-                    None,
-                )
-                .await?
+            if Box::pin(self.assignment_cas_checked(
+                &header,
+                environment_value.as_deref(),
+                &stored_environment,
+                catalog.as_ref(),
+                None,
+                &[
+                    (UPGRADE.into(), upgrade_value.clone()),
+                    (
+                        format!("node:{}", previous.node_id),
+                        source_node_value.clone(),
+                    ),
+                    (format!("node:{}", replacement.node_id), node_value.clone()),
+                ],
+            ))
+            .await?
             {
                 return Ok(stored_environment);
             }

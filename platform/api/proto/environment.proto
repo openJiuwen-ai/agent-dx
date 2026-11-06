@@ -48,6 +48,9 @@ service NodeService {
   rpc GetEnvironmentControl(NodeGetEnvironmentControlRequest) returns (EnvironmentControlRecord);
   rpc BatchGetEnvironmentControl(NodeBatchGetEnvironmentControlRequest) returns (BatchGetEnvironmentControlResponse);
   rpc UpdateEnvironmentControl(NodeUpdateEnvironmentControlRequest) returns (EnvironmentControlRecord);
+  // Coordinator-only maintenance fencing. Grants are scoped to one process session.
+  rpc ApplyNodeUpgradeControl(NodeUpgradeControl) returns (NodeUpgradeInspection);
+  rpc InspectNodeUpgrade(NodeUpgradeInspectRequest) returns (NodeUpgradeInspection);
   rpc CreateLocalEnvironment(LocalEnvironmentCreateRequest) returns (EnvironmentResult);
   rpc RecoverEnvironment(RecoverEnvironmentRequest) returns (EnvironmentResult);
   // Coordinator verifies the process currently serving an already registered address
@@ -127,7 +130,7 @@ message StorageMount {
 message UnregisterNodeRequest { string node_id = 1; string session_id = 2; }
 message UnregisterNodeResponse {}
 
-message RegisterNodeResponse { uint32 shard_id = 1; uint64 coordinator_epoch = 2; }
+message RegisterNodeResponse { uint32 shard_id = 1; uint64 coordinator_epoch = 2; NodeUpgradeControl upgrade_control = 3; }
 
 message CreateEnvironmentRequest {
   EnvironmentSpec spec = 1;
@@ -172,6 +175,9 @@ message DeleteEnvironmentRequest {
   reserved 5;
   // Coordinator-owned preparation cleanup: exact lifecycle revision, with session fencing.
   optional uint64 expected_revision = 6;
+  // Trusted Coordinator probe cleanup only; ordinary API/GC callers leave these empty.
+  string upgrade_task_id = 7;
+  uint64 upgrade_epoch = 8;
 }
 
 message CommitEnvironmentRequest {
@@ -275,4 +281,46 @@ message ClaimEnvironmentResponse {
     GetEnvironmentResponse existing = 2;
     bool fallback = 3; // Definitive no-write result; safe to release this attempt's hold.
   }
+}
+
+// Internal upgrade controls are deliberately separate from ordinary scheduling pause.
+message NodeUpgradeGrant {
+  string environment_id = 1;
+  uint64 assignment_generation = 2;
+  repeated string actions = 3;
+}
+message NodeUpgradeControl {
+  string task_id = 1;
+  uint64 epoch = 2;
+  string node_session_id = 3;
+  uint64 revision = 4;
+  string phase = 5;
+  repeated NodeUpgradeGrant grants = 6;
+}
+message NodeUpgradeInspectRequest {
+  string task_id = 1;
+  uint64 epoch = 2;
+  string node_session_id = 3;
+  string environment_id = 4;
+}
+message NodeUpgradeInspection {
+  string task_id = 1;
+  uint64 epoch = 2;
+  string node_session_id = 3;
+  uint64 revision = 4;
+  string phase = 5;
+  uint64 controllers = 6;
+  uint64 holds = 7;
+  uint64 backends = 8;
+  uint64 authority_tasks = 9;
+  bool unknown = 10;
+  bool strict_empty = 11;
+  bool may_have_executed = 12;
+  repeated NodeUpgradeGrant grants = 13;
+  EnvironmentResult environment = 14;
+  // Byte identity of the immutable default local EROFS root; empty means unknown.
+  string runtime_rootfs_sha256 = 15;
+  string runtime_rootfs_path = 16;
+  // Explicit maintenance protocol, including DeleteEnvironmentRequest field allocation.
+  uint32 protocol_version = 17;
 }

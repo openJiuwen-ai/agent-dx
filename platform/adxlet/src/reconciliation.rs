@@ -187,6 +187,15 @@ impl Adxlet {
                 if let Some((_, _, handle)) = environments.get(&r.spec.id) {
                     handle.clone()
                 } else {
+                    if terminal_without_execution(&r) {
+                        self.services.upgrade.record_cleanup()?;
+                    } else {
+                        self.services.upgrade.record_action(
+                            &r.spec.id,
+                            r.assignment.generation,
+                            "adopt",
+                        )?;
+                    }
                     retained.extend(r.execution_artifacts.iter().cloned());
                     if let Some(source) = &r.snapshot_source {
                         retained.push(source.artifact.clone());
@@ -327,6 +336,11 @@ impl Adxlet {
                 }
                 handle.clone()
             } else {
+                self.services.upgrade.record_action(
+                    &record.spec.id,
+                    record.assignment.generation,
+                    "recover",
+                )?;
                 let environment_id = record.spec.id.clone();
                 let handle = controller::spawn_restored(record.clone(), self.services.clone());
                 environments.insert(

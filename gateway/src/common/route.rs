@@ -197,8 +197,14 @@ impl RouteCache {
         let owner = route.instance_id.clone();
         let aliases = HashSet::from([owner.clone(), sanitize_instance_id(&owner)]);
         let mut inner = self.inner.write().unwrap();
-        remove_instance(&mut inner, &owner);
+        // An exact instance ID takes precedence over another instance's alias.
+        if inner.by_instance.contains_key(&owner) {
+            remove_instance(&mut inner, &owner);
+        }
         for alias in &aliases {
+            if alias != &owner && inner.by_instance.contains_key(alias) {
+                continue;
+            }
             inner.routes.insert(
                 alias.clone(),
                 RouteCacheEntry {

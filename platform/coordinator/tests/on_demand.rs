@@ -1685,6 +1685,7 @@ async fn delete_serializes_with_restore_and_fences_its_late_result() {
         failed_revision: None,
 
         node_session_id: String::new(),
+        ..Default::default()
     }));
     assert!(futures_util::poll!(deleting.as_mut()).is_pending());
     gate.notify_one();
@@ -2022,6 +2023,7 @@ async fn local_checkpoint_waits_for_volume_without_rejecting_its_owner_node() {
         caller: caller(),
         failed_revision: None,
         node_session_id: String::new(),
+        ..Default::default()
     })
     .await
     .unwrap();
