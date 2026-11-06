@@ -174,8 +174,14 @@ fn acquire_lock(root: &Path) -> Result<SupervisorGuard> {
     Ok(SupervisorGuard { file, socket })
 }
 pub async fn request(root: &Path, request: Request, timeout: Duration) -> Result<Value> {
+    let socket = root.join("supervisor.sock");
     tokio::time::timeout(timeout, async {
-        let mut stream = UnixStream::connect(root.join("supervisor.sock")).await?;
+        let mut stream = UnixStream::connect(&socket).await.map_err(|error| {
+            format!(
+                "cannot connect to the supervisor socket {}: {error}; the supervisor is not running, or the deployment state_dir differs from the running instance",
+                socket.display()
+            )
+        })?;
         stream
             .write_all(format!("{}\n", request.as_str()).as_bytes())
             .await?;
@@ -189,7 +195,14 @@ pub async fn request(root: &Path, request: Request, timeout: Duration) -> Result
         }
         Ok(response)
     })
-    .await?
+    .await
+    .map_err(|_| {
+        format!(
+            "supervisor did not answer within {}s at {}; it may be stopped, or the deployment state_dir differs from the running instance",
+            timeout.as_secs(),
+            socket.display()
+        )
+    })?
 }
 async fn drain(path: PathBuf, timeout: Duration) -> Result<()> {
     tokio::time::timeout(timeout, async move {
