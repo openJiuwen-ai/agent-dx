@@ -45,8 +45,9 @@ message UpdateBindingRequest {
     Retired retired = 5;
   }
 }
-// Success acknowledges application, including retirement of the previous
-// binding. Identical retries succeed; older versions or conflicting payloads
+// Success acknowledges the new version and retirement of any replaced execution.
+// Renewing the same generation and target preserves streams and admission state.
+// Identical retries succeed; older versions or conflicting payloads
 // at the same version fail with FAILED_PRECONDITION. Receiver restart requires
 // authoritative reconciliation before it serves traffic.
 message UpdateBindingResponse {

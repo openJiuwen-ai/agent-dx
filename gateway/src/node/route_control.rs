@@ -157,9 +157,13 @@ impl BindingService {
         check_version(s.versions.get(&request.environment_id), &request)?;
         if let Some(previous) = s.versions.get(&request.environment_id) {
             if previous.ownership_generation == request.ownership_generation
-                && previous.binding_revision == request.binding_revision
+                && previous.binding == request.binding
             {
-                return Ok(ack(&request));
+                // A record revision can advance without replacing its execution.
+                // Preserve accepted streams and admission state while fencing older updates.
+                let response = ack(&request);
+                s.versions.insert(request.environment_id.clone(), request);
+                return Ok(response);
             }
             if let Some(Binding::Active(old)) = &previous.binding {
                 self.proxy
@@ -464,4 +468,239 @@ pub async fn serve_route_control_until(
         .serve_with_incoming_shutdown(UnixListenerStream::new(listener), shutdown)
         .await
         .map_err(std::io::Error::other)
+}
+
+#[cfg(all(test, feature = "mock-e2e"))]
+mod tests {
+    use super::*;
+    use crate::common::protocol::{ConnectTarget, GatewayPolicy};
+    use crate::ingress::connector::H2ConnectStream;
+    use crate::ingress::{DataPlaneL4Connector, H2PoolConfig};
+    use std::io;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::sync::{oneshot, watch};
+    use tokio::task::JoinHandle;
+    use tokio::time::timeout;
+
+    const PREFIX_BYTES: usize = 5 * 1024 * 1024;
+    const DOWNLOAD_BYTES: usize = 10 * 1024 * 1024;
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+    struct Download {
+        stream: H2ConnectStream,
+        resume: Option<oneshot::Sender<()>>,
+        _cancel: watch::Sender<bool>,
+        backend: JoinHandle<()>,
+        relay: JoinHandle<()>,
+    }
+
+    impl Download {
+        async fn finish(&mut self) -> io::Result<Vec<u8>> {
+            self.resume.take().unwrap().send(()).unwrap();
+            let mut tail = Vec::new();
+            timeout(TEST_TIMEOUT, self.stream.read_to_end(&mut tail))
+                .await
+                .expect("download did not finish after the binding update")?;
+            Ok(tail)
+        }
+    }
+
+    impl Drop for Download {
+        fn drop(&mut self) {
+            self.backend.abort();
+            self.relay.abort();
+        }
+    }
+
+    async fn downloading() -> (BindingService, UpdateBindingRequest, Download) {
+        let proxy = Arc::new(
+            Relay::new(GatewayPolicy::for_local_mock(vec!["127.0.0.0/8"
+                .parse()
+                .unwrap()]))
+            .with_route_enforcement(),
+        );
+        let service = BindingService::new(proxy.clone());
+        let state = service.begin(service.inspect().await).await.unwrap();
+        let binding = UpdateBindingRequest {
+            proxy_session_id: state.proxy_session_id.clone(),
+            sync_epoch: state.sync_epoch,
+            environment_id: "download-environment".into(),
+            ownership_generation: 1,
+            binding_revision: 1,
+            binding: Some(Binding::Active(proto::RuntimeTarget {
+                runtime_id: "download-runtime".into(),
+                ip: "127.0.0.1".into(),
+            })),
+        };
+        service
+            .replace(proto::BindingSnapshot {
+                proxy_session_id: state.proxy_session_id,
+                sync_epoch: state.sync_epoch,
+                bindings: vec![binding.clone()],
+            })
+            .await
+            .unwrap();
+
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_address = backend_listener.local_addr().unwrap();
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {DOWNLOAD_BYTES}\r\nConnection: close\r\n\r\n"
+        );
+        let response_header = header.clone();
+        let (resume, resumed) = oneshot::channel();
+        let backend = tokio::spawn(async move {
+            let (mut socket, _) = backend_listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            socket.read_to_end(&mut request).await.unwrap();
+            assert!(request.starts_with(b"GET /download HTTP/1.1\r\n"));
+            socket.write_all(response_header.as_bytes()).await.unwrap();
+            socket.write_all(&vec![b'a'; PREFIX_BYTES]).await.unwrap();
+            if resumed.await.is_ok() {
+                let _ = socket
+                    .write_all(&vec![b'b'; DOWNLOAD_BYTES - PREFIX_BYTES])
+                    .await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let relay_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_address = relay_listener.local_addr().unwrap().to_string();
+        let relay = tokio::spawn(async move {
+            let (socket, _) = relay_listener.accept().await.unwrap();
+            let _ = proxy.serve_h2(socket).await;
+        });
+        let connector = DataPlaneL4Connector::new(H2PoolConfig {
+            connections_per_node: 1,
+            max_connections_per_node: 1,
+            ..Default::default()
+        });
+        let (cancel, cancelled) = watch::channel(false);
+        let mut stream = connector
+            .connect_stream(
+                &relay_address,
+                &ConnectTarget {
+                    instance_id: binding.environment_id.clone(),
+                    workload_id: "download-runtime".into(),
+                    target_ip: backend_address.ip(),
+                    target_port: backend_address.port(),
+                    request_id: "binding-update-download".into(),
+                },
+                cancelled,
+            )
+            .await
+            .unwrap();
+        stream
+            .write_all(b"GET /download HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        stream.shutdown().await.unwrap();
+        let mut received_header = vec![0; header.len()];
+        timeout(TEST_TIMEOUT, stream.read_exact(&mut received_header))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received_header, header.as_bytes());
+        // Cross the production H2 stream window before changing the binding.
+        let mut prefix = vec![0; PREFIX_BYTES];
+        timeout(TEST_TIMEOUT, stream.read_exact(&mut prefix))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(prefix.iter().all(|byte| *byte == b'a'));
+        (
+            service,
+            binding,
+            Download {
+                stream,
+                resume: Some(resume),
+                _cancel: cancel,
+                backend,
+                relay,
+            },
+        )
+    }
+
+    async fn update(service: &BindingService, binding: UpdateBindingRequest) {
+        let response = service
+            .update_binding(Request::new(binding.clone()))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response, ack(&binding));
+    }
+
+    #[tokio::test]
+    async fn binding_revision_keeps_same_execution_download_connected() {
+        let (service, old, mut download) = downloading().await;
+        let mut renewed = old.clone();
+        renewed.binding_revision += 1;
+        update(&service, renewed).await;
+        assert_eq!(
+            service
+                .update_binding(Request::new(old))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        let tail = download.finish().await.unwrap();
+        assert_eq!(tail, vec![b'b'; DOWNLOAD_BYTES - PREFIX_BYTES]);
+    }
+
+    async fn assert_binding_change_cancels(change: impl FnOnce(&mut UpdateBindingRequest)) {
+        let (service, old, mut download) = downloading().await;
+        let mut changed = old.clone();
+        changed.binding_revision += 1;
+        change(&mut changed);
+        update(&service, changed).await;
+        assert_eq!(
+            service
+                .update_binding(Request::new(old))
+                .await
+                .unwrap_err()
+                .code(),
+            tonic::Code::FailedPrecondition
+        );
+        assert!(
+            !matches!(download.finish().await, Ok(tail) if tail.len() == DOWNLOAD_BYTES - PREFIX_BYTES),
+            "replaced binding completed the previous execution's download"
+        );
+    }
+
+    #[tokio::test]
+    async fn binding_retirement_cancels_download_and_fences_old_version() {
+        assert_binding_change_cancels(|binding| {
+            binding.binding = Some(Binding::Retired(proto::Retired {}));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn binding_generation_change_cancels_same_target_download() {
+        assert_binding_change_cancels(|binding| binding.ownership_generation += 1).await;
+    }
+
+    #[tokio::test]
+    async fn binding_runtime_change_cancels_download() {
+        assert_binding_change_cancels(|binding| {
+            let Some(Binding::Active(target)) = &mut binding.binding else {
+                panic!("test starts with an active binding");
+            };
+            target.runtime_id = "replacement-runtime".into();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn binding_ip_change_cancels_download() {
+        assert_binding_change_cancels(|binding| {
+            let Some(Binding::Active(target)) = &mut binding.binding else {
+                panic!("test starts with an active binding");
+            };
+            target.ip = "127.0.0.2".into();
+        })
+        .await;
+    }
 }
