@@ -210,3 +210,70 @@ fn s2_owner_release_returns_undelivered_error_after_finishing_cleanup() {
     assert!(error.to_string().contains("injected test commit failure"));
     DfsOwnerLifecycleHandler::release(&fs, "node-b", release).unwrap();
 }
+
+/// 确定性拒绝（Meta 明确不接受这次提交）：错误交付、所有写者关闭后，这批写丢弃（与 Linux 写回
+/// 失败后脏页丢弃一致），下一个写者从 Meta 的已提交版本开始，可以正常写入提交。修复前
+/// `terminal_error` 没有清除路径，该 inode 在本 Node 不可写，直到 Node 重启。
+#[test]
+fn s2_definite_rejection_is_delivered_then_a_new_writer_starts_from_the_committed_version() {
+    let (_temp, meta, fs) = test_fs();
+    let created = create_rw(&fs, "terminal.bin");
+    fs.write(&context(), created.handle, 0, b"kept").unwrap();
+    fs.fsync(&context(), created.handle, SyncMode::Full)
+        .unwrap();
+    fs.write(&context(), created.handle, 0, b"lost-data")
+        .unwrap();
+    meta.fail_next_commit_with(Error::coded(
+        afs_error::META_DFS_CONFLICT,
+        "injected definite rejection",
+    ));
+    fs.writeback_pending().unwrap();
+    // 还有写者打开时错误是粘性的。
+    for _ in 0..2 {
+        let error = fs
+            .fsync(&context(), created.handle, SyncMode::Full)
+            .unwrap_err();
+        assert_eq!(error.code(), afs_error::META_DFS_CONFLICT, "{error}");
+    }
+    let _ = fs.release(&context(), created.handle);
+
+    let handle = fs
+        .open(&context(), created.entry.inode, libc::O_RDWR)
+        .unwrap();
+    let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+    {
+        let cell = fs.write_state(&inode_id).unwrap().unwrap();
+        let state = cell.lock().unwrap();
+        assert!(state.terminal_error.is_none());
+        assert_eq!(state.logical_length, 4, "the rejected writes are gone");
+        assert!(state.dirty_extents.is_empty());
+    }
+    fs.write(&context(), handle, 4, b"+new").unwrap();
+    fs.fsync(&context(), handle, SyncMode::Full).unwrap();
+    assert_eq!(meta.commit_count(), 2);
+    fs.release(&context(), handle).unwrap();
+}
+
+/// 还有别的写者打开时不丢弃：它们仍持有那批写的语义，错误保持粘性。
+#[test]
+fn s2_definite_rejection_stays_terminal_while_any_writer_is_open() {
+    let (_temp, meta, fs) = test_fs();
+    let created = create_rw(&fs, "terminal-open.bin");
+    let other = fs
+        .open(&context(), created.entry.inode, libc::O_RDWR)
+        .unwrap();
+    fs.write(&context(), created.handle, 0, b"data").unwrap();
+    meta.fail_next_commit_with(Error::coded(
+        afs_error::META_DFS_CONFLICT,
+        "injected definite rejection",
+    ));
+    fs.writeback_pending().unwrap();
+    assert!(fs.fsync(&context(), other, SyncMode::Full).is_err());
+    let _ = fs.release(&context(), created.handle);
+    let third = fs
+        .open(&context(), created.entry.inode, libc::O_RDWR)
+        .unwrap();
+    assert!(fs.write(&context(), third, 0, b"x").is_err());
+    let _ = fs.release(&context(), third);
+    let _ = fs.release(&context(), other);
+}
