@@ -3,6 +3,35 @@ use crate::checkpoint::{now, validate_operation};
 use adx_core::{CompletedOperation, LifecycleKind, RestorePoint};
 use std::{path::Path, time::Duration};
 
+// Keep the failing stage local to a resume attempt. Error::Unavailable also
+// describes unreadable checkpoints and rejected/failed runtime restores, which
+// must not opt an automatic recovery into repeated backend execution.
+struct ResumeFailure {
+    error: Error,
+    retry_admission: bool,
+}
+
+impl ResumeFailure {
+    fn admission(error: Error) -> Self {
+        Self {
+            retry_admission: matches!(
+                error,
+                Error::Unavailable(_) | Error::VolumeBusy(_) | Error::NoCapacity
+            ),
+            error,
+        }
+    }
+}
+
+impl From<Error> for ResumeFailure {
+    fn from(error: Error) -> Self {
+        Self {
+            error,
+            retry_admission: false,
+        }
+    }
+}
+
 impl Controller {
     pub(super) async fn auto_pause(
         &mut self,
@@ -511,7 +540,10 @@ impl Controller {
                     .artifact
                     .clone();
                 let path = services.store.prepare_restore(&artifact).await?;
-                let rollback = self.restore_execution(&path).await;
+                let rollback = self
+                    .restore_execution(&path)
+                    .await
+                    .map_err(|failure| failure.error);
                 if self.held
                     && (rollback.is_err()
                         || self
@@ -549,7 +581,7 @@ impl Controller {
         );
         self.sync().await
     }
-    async fn restore_execution(&mut self, path: &Path) -> Result<()> {
+    async fn restore_execution(&mut self, path: &Path) -> std::result::Result<(), ResumeFailure> {
         let previous_runtime_id = self.record.runtime.id.clone();
         let next_revision = self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
         let runtime_id = format!(
@@ -560,7 +592,8 @@ impl Controller {
             .admission
             .lock()
             .expect("shared state lock poisoned")
-            .reserve(&runtime_id, &self.record.spec, &self.record.assignment)?;
+            .reserve(&runtime_id, &self.record.spec, &self.record.assignment)
+            .map_err(ResumeFailure::admission)?;
         self.record.runtime.id = runtime_id;
         self.held = true;
         self.record.resources_held = true;
@@ -579,7 +612,8 @@ impl Controller {
                 .services
                 .sink
                 .prepare_execution(&self.record, &previous_runtime_id)
-                .await?;
+                .await
+                .map_err(ResumeFailure::admission)?;
             execution_admitted = true;
             let runtime_started = Instant::now();
             self.record.runtime.ip = Some(
@@ -617,12 +651,16 @@ impl Controller {
         })
         .await
         .unwrap_or_else(|_| {
-            Err(Error::Unavailable(
-                "restore initialization timed out".into(),
-            ))
+            let error = Error::Unavailable("restore initialization timed out".into());
+            Err(if execution_admitted {
+                error.into()
+            } else {
+                ResumeFailure::admission(error)
+            })
         });
-        if let Err(error) = attempt {
-            if let Error::ProbeFailed(failure) = &error {
+        if let Err(failure) = attempt {
+            let error = &failure.error;
+            if let Error::ProbeFailed(failure) = error {
                 self.record.failure = Some(failure.clone().into());
             }
             match self.cleanup().await {
@@ -641,10 +679,11 @@ impl Controller {
                     self.transition(Event::Fail)?;
                     return Err(Error::Unavailable(format!(
                         "restore failed: {error}; cleanup failed: {cleanup}"
-                    )));
+                    ))
+                    .into());
                 }
             }
-            return Err(error);
+            return Err(failure);
         }
         self.transition(Event::Ready)?;
         Ok(())
@@ -686,8 +725,15 @@ impl Controller {
             }
             request.expected_revision = operation.expected_revision;
         }
-        let result = self.resume(request).await;
-        if self.capture_preparation.is_some() || matches!(result, Err(Error::NoCapacity)) {
+        let attempt = self.resume_attempt(request).await;
+        let retry_admission = attempt
+            .as_ref()
+            .is_err_and(|failure| failure.retry_admission);
+        let result = attempt.map_err(|failure| failure.error);
+        if self.capture_preparation.is_some() || retry_admission {
+            // Retry only local capacity refusal or a temporary execution-admission
+            // error before restore_from was called. Input/Running publication and
+            // uncertain cleanup retain their existing state/hold protections.
             return result;
         }
         if let Err(error) = &result {
@@ -713,15 +759,24 @@ impl Controller {
         result
     }
     pub(super) async fn resume(&mut self, request: ResumeRequest) -> Result<OperationResult> {
+        self.resume_attempt(request)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    async fn resume_attempt(
+        &mut self,
+        request: ResumeRequest,
+    ) -> std::result::Result<OperationResult, ResumeFailure> {
         if self.replay_operation(
             &request.operation_id,
             request.expected_revision,
             LifecycleKind::Resume,
         )? {
-            return self.replay_or_sync().await;
+            return self.replay_or_sync().await.map_err(Into::into);
         }
         if self.record.state != EnvironmentState::Paused {
-            return Err(Error::Conflict);
+            return Err(Error::Conflict.into());
         }
         if let Some(seconds) = request.run_timeout_seconds {
             let mut policy =
@@ -738,7 +793,7 @@ impl Controller {
             .or_else(|| self.record.snapshot_source.clone())
             .ok_or(Error::Conflict)?;
         if cp.expired(now()?) {
-            return Err(Error::Invalid("checkpoint expired".into()));
+            return Err(Error::Invalid("checkpoint expired".into()).into());
         }
         let services = self.services.checkpoint.clone().ok_or(Error::Conflict)?;
         let resume_started = Instant::now();
@@ -762,16 +817,15 @@ impl Controller {
         if self.capture_preparation.is_some()
             && self.sync().await?.durability != Durability::Published
         {
-            return Err(Error::Unavailable(
-                "restore input publication pending".into(),
-            ));
+            return Err(Error::Unavailable("restore input publication pending".into()).into());
         }
         self.capture_preparation = None;
         let input_commit_ms = input_started.elapsed().as_secs_f64() * 1_000.0;
         let execution_started = Instant::now();
         let restored = self.restore_execution(&path).await;
         let restore_execution_ms = execution_started.elapsed().as_secs_f64() * 1_000.0;
-        if restored == Err(Error::NoCapacity) && !already_held {
+        if matches!(&restored, Err(failure) if failure.error == Error::NoCapacity) && !already_held
+        {
             self.record
                 .execution_artifacts
                 .retain(|a| a != &cp.artifact);
@@ -786,13 +840,14 @@ impl Controller {
         {
             self.hold_artifact(cp.artifact.clone(), path);
         }
-        if let Err(error) = restored {
+        if let Err(mut failure) = restored {
             if let Err(commit) = self.sync().await {
-                return Err(Error::Unavailable(format!(
-                    "{error}; result commit failed: {commit}"
-                )));
+                failure.error = Error::Unavailable(format!(
+                    "{}; result commit failed: {commit}",
+                    failure.error
+                ));
             }
-            return Err(error);
+            return Err(failure);
         }
         // Install after successful restore, before Running can establish its timer.
         // Replays and failed admissions must not stage a duration for a later run.
@@ -827,6 +882,6 @@ impl Controller {
             published = result.as_ref().is_ok_and(|result| result.durability == Durability::Published),
             "environment resume stages completed"
         );
-        result
+        result.map_err(Into::into)
     }
 }

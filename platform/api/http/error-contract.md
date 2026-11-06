@@ -200,6 +200,7 @@ export bounded labels rather than raw error messages. See the
 
 Volume 管理沿用上述错误结构。ensure 与删除应答未知时用相同 tenant/Volume ID 或 owner ID 重试；不能从超时推断定义或关联未提交。删除有引用、关联或占用的卷返回 CONFLICT，数据目录始终保留。接口见 [Volume API](volumes.md)。
 
+自动跨节点恢复只在本地容量不足或后端 restore 之前的执行准入阶段对临时 `Unavailable`、`VolumeBusy`、`NoCapacity` 保留重试。相同错误若来自 checkpoint 读取或后端 restore/初始化/readiness/路由阶段，确认清理后进入 Failed。执行准入控制 RPC 的明确 `Unauthenticated`、`PermissionDenied` 保留认证/权限错误码及原因，清理确认后进入 Failed，不自动重试；`Internal` 保留诊断原因并沿用阶段重试策略。准入失败清理确认后保留 Paused、checkpoint 与待恢复计划；清理或结果发布未知时保留实际进度和必要占用。公开恢复请求等待超时仍使用原 `same_operation / unknown` 契约，不能从内部授权暂不可用推断 `never / not_started`，也不能换 Environment ID 重建。
 
 ### E2B HTTP admission
 

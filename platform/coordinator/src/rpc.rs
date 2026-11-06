@@ -304,6 +304,21 @@ impl State {
             };
             match saved {
                 Ok(record) => {
+                    if record
+                        .recovery
+                        .as_ref()
+                        .is_some_and(|recovery| recovery.pending)
+                    {
+                        if let Err(error) = self
+                            .scheduler
+                            .finish_recovery_placement(&record.spec, &record.assignment)
+                        {
+                            // Redis already owns the new assignment. Rebuild
+                            // before accepting claims or scheduling more work.
+                            self.needs_recovery = true;
+                            return Err(error);
+                        }
+                    }
                     if let Some(source) = record
                         .recovery
                         .as_ref()
