@@ -5,6 +5,7 @@
 
 #[cfg(feature = "dfs")]
 pub mod dfs;
+pub mod lazy_fill;
 pub mod locks;
 #[cfg(feature = "ownerfs")]
 pub mod ownerfs;
@@ -32,12 +33,62 @@ pub struct PageCacheIdentity {
     pub length: u64,
 }
 
+/// Confirmed outcome of publishing a private prepared inode without replacing
+/// another file. Errors are indeterminate: callers must retain the private tree.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PreparedPublication {
+    Published,
+    Occupied,
+}
+
 /// 两种后端接收同一组文件操作；每项默认拒绝，未实现时不得报告成功。
 ///
 /// 这里仅规定入口必须提供的参数与返回值。根授权、文件身份、缓存和持久化
 /// 由具体后端决定。回调是同步的，以匹配当前 fuser 入口；后端可以用自己的
 /// I/O 执行器，但不能在锁内无限等待远端或把未完成的操作假装完成。
 pub trait Backend: Send + Sync {
+    /// Publish a fixed-length, immutable-origin file without fetching its body.
+    /// The binding and length must be durable before the final name is visible.
+    fn prepare_lazy_file(
+        &self,
+        _ctx: &types::RequestContext,
+        _parent: types::BackendInode,
+        _name: &OsStr,
+        _spec: &lazy_fill::LazyFileSpec,
+    ) -> Result<types::Entry> {
+        Err(unsupported("prepare_lazy_file"))
+    }
+
+    /// Publish within one parent; the temporary name must be private to the
+    /// caller and must identify `prepared`. A lost reply is reconciled by inode
+    /// identity. Only `Occupied` permits cleaning the losing private tree;
+    /// an error must never trigger deletion through remembered child inodes.
+    fn publish_prepared(
+        &self,
+        ctx: &types::RequestContext,
+        parent: types::BackendInode,
+        temporary: &OsStr,
+        name: &OsStr,
+        prepared: types::BackendInode,
+    ) -> Result<PreparedPublication> {
+        match self.rename(ctx, parent, temporary, parent, name, types::RenameFlags(1)) {
+            Ok(()) => Ok(PreparedPublication::Published),
+            Err(error) => {
+                if self
+                    .lookup(ctx, parent, name)
+                    .is_ok_and(|entry| entry.inode == prepared)
+                {
+                    return Ok(PreparedPublication::Published);
+                }
+                if error.kind() == afs_error::ErrorKind::AlreadyExists {
+                    Ok(PreparedPublication::Occupied)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
     /// 当前 Backend 在本 mount 内的根 inode。它不是 FUSE inode，也不是跨进程身份。
     fn root_inode(&self) -> types::BackendInode;
 

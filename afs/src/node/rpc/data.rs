@@ -81,6 +81,18 @@ pub trait DfsOwnerFilesHandler: Send + Sync + 'static {
     ) -> afs_error::Result<DfsOwnerReadReply> {
         Err(dfs_owner_unimplemented())
     }
+    fn read_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(30)
+    }
+    /// Remaining caller budget, captured before entering the blocking worker.
+    fn read_with_deadline(
+        &self,
+        peer: &str,
+        request: DfsOwnerReadRequest,
+        _deadline: std::time::Instant,
+    ) -> afs_error::Result<DfsOwnerReadReply> {
+        self.read(peer, request)
+    }
     fn write(
         &self,
         _peer: &str,
@@ -193,8 +205,14 @@ impl DfsOwnerFiles for DfsOwnerFilesService {
         }
         let handle =
             handle.ok_or_else(|| Status::permission_denied("DFS owner handle is required"))?;
-        self.dispatch(request, &handle, None, |handler, peer, request| {
-            handler.read(&peer, request)
+        let deadline = read_pipeline::processing_deadline(
+            request.metadata(),
+            self.handler
+                .as_ref()
+                .map_or(std::time::Duration::from_secs(30), |h| h.read_timeout()),
+        )?;
+        self.dispatch(request, &handle, None, move |handler, peer, request| {
+            handler.read_with_deadline(&peer, request, deadline)
         })
         .await
     }

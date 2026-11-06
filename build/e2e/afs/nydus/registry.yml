@@ -1,0 +1,8 @@
+version: 0.1
+log:
+  level: info
+storage:
+  filesystem:
+    rootdirectory: /workspace/registry
+http:
+  addr: 10.203.0.10:5000

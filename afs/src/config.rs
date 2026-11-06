@@ -424,6 +424,7 @@ impl Cli {
 #[serde(deny_unknown_fields)]
 /// TOML 输入层。拒绝未知字段，让拼错开关在启动时失败，而不是静默使用默认行为。
 struct FileConfig {
+    connectors: Option<crate::node::connectors::ConnectorsConfig>,
     id: Option<String>,
     grpc_listen: Option<SocketAddr>,
     rest_listen: Option<SocketAddr>,
@@ -536,6 +537,7 @@ impl DfsReadCrcMode {
 #[derive(Debug, Clone, Serialize)]
 /// 解析和校验后的进程配置。模块接收这个值，不各自重复读取配置文件或环境变量。
 pub struct Config {
+    pub connectors: crate::node::connectors::ConnectorsConfig,
     pub id: String,
     pub grpc_listen: SocketAddr,
     pub rest_listen: SocketAddr,
@@ -647,6 +649,10 @@ impl Config {
                 "ownerfs_mkdir_load_balance is only valid for afs-meta",
             ));
         }
+        let connectors = file.connectors.clone().unwrap_or_default();
+        if connectors.nydus.enabled && role != Role::Node {
+            return Err(invalid("connectors are only supported by afs-node"));
+        }
         let id = cli.id.or(file.id).unwrap_or_else(|| {
             match role {
                 Role::Node => "node",
@@ -671,6 +677,11 @@ impl Config {
             Some("dfs") => (false, true),
             _ => return Err(invalid("fs must be ownerfs, dfs or all")),
         };
+        if connectors.nydus.enabled
+            && (!dfs || !cfg!(feature = "dfs") || file.dfs_external_backend.is_some())
+        {
+            return Err(invalid("Nydus connector requires native DFS"));
+        }
         if role == Role::Node
             && ((ownerfs && !cfg!(feature = "ownerfs")) || (dfs && !cfg!(feature = "dfs")))
         {
@@ -1032,6 +1043,7 @@ impl Config {
                 .tls_identity_private_key
                 .or(file.tls_identity_private_key),
             tls_server_name: cli.tls_server_name.or(file.tls_server_name),
+            connectors,
             trusted_node_certs: file.trusted_node_certs.unwrap_or_default(),
             data_dir: cli
                 .data_dir
