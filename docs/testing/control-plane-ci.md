@@ -77,7 +77,7 @@ agent-dx-python-sdk ───┘                         ↓
 ### 2. 部署完整平台
 
 - 平台组件：Redis、单 Coordinator（Global 与内嵌 Shard）、Environment API、Ingress、两个 adxlet 和 Relay。
-- 执行后端：测试环境独立托管 sandboxd，锁定 PR #56 提交 `efc201531d7e2e9d69505da151eb66084b61eebf`（见 `third_party/sandboxd/source.json`）；使用本次构建的 Execd 准备真实实例环境。
+- 执行后端：测试环境独立托管 sandboxd，版本以 `third_party/sandboxd/source.json` 为准，后端归档由 `third_party/sandboxd/artifacts.json` 固定并校验同一 revision；使用本次构建的 Execd 准备真实实例环境。
 - 客户端：干净 Python 环境安装本次构建的 SDK wheel，通过对外入口操作；禁止用源码 PYTHONPATH 代替安装包验收。
 - 用例资源：本轮独立的租户/API Key、实例、端口与目录。快照阶段接入实际的对象存储测试后端；GPU/NPU 在对应环境与能力实现后扩展。
 

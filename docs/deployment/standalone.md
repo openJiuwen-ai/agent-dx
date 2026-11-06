@@ -39,6 +39,20 @@ overlayfs，以及与后端二进制匹配的 libseccomp 和 AppArmor 运行库�
 glibc 2.34 或更高版本。即使只用 OCI 镜像，sandboxd 启动时也会加载随包的模板和空认证文件。
 使用 Nydus 或 OSS 镜像时还需准备 distill_fs 并配置镜像源。
 
+随包配置在 `[plugin.image]` 中设置 `oci_zero_ref_ttl = "30m"`，保持 sandboxd 原有的
+30 分钟无引用 OCI 镜像层和 lowerdir chain 保留时长。用户可按需修改为其他正的
+Go duration，例如 `"2h"`；设为 `"0s"` 可关闭超时清理，以减少暂停后恢复时重新下载、
+解包镜像的情况。省略或留空同样使用 sandboxd 默认的 `"30m"`。
+磁盘压力 GC 仍然有效，正在使用的镜像引用仍受保护；即使设为 `"0s"`，也不保证镜像
+永久命中本地缓存。负数、非法或溢出的值会使 sandboxd 初始化失败。
+该配置对整个 sandboxd 实例生效，修改现有节点配置后需要排空节点并重启 sandboxd。
+
+升级现有 sandboxd 配置时，还需检查 `[plugin.resource.memory_limit]`：新版本只接受
+`enabled` 和 `total_reserve`，旧的 `system_reserve`、`control_reserve`、`other_reserve`、
+`safety_buffer`、`runtime_headroom` 即使设为零也会阻止启动。启用过旧内存策略的节点应按
+[上游迁移说明](https://github.com/inclusionAI/sandboxd/blob/65eda5fc0dd014f600a6bbdade8cd936fe18c252/doc/node-memory-limit.md#configuration-migration)
+核算总预留和原 distill-fs 预算，迁移配置后再启动；随包配置未启用此策略。
+
 Buildkite 在启动 sandboxd 前检查 `net.bridge.bridge-nf-call-iptables=1`。需要准备的新节点上，
 先加载模块并持久化该设置：
 
@@ -80,7 +94,11 @@ ADX Relay 的目标 CIDR 需要覆盖实际使用的地址池。私有 OCI 镜�
 如果旧 OCI 层目录以 `0700` 创建，排空节点后可将 `sandboxd.toml` 的 `[plugin.image].root`
 指向新的缓存目录，让 sandboxd 在新 umask 下重新解包同一镜像。
 自定义 ADX 安装路径时需相应调整 unit 和配置中的二进制路径。sandboxd 就绪后按下文启动
-ADX，使用 `runtime="runc"` 或 `runtime="runsc"` 创建实例。随包 runsc 采用 AKernel 适配版本，ARM64 为 20260817.0-akernel.2，x86_64 为 20260817.0-akernel.4-3-g87e8441b6db1。
+ADX，使用 `runtime="runc"` 或 `runtime="runsc"` 创建实例。随包 runsc 在两个架构上均采用
+与锁定 sandboxd 版本配套的 AKernel `release-20261012.0-akernel.3`，包含 `runsc` 及相邻
+`gvisor-bin/` 辅助程序目录；部署时应保留完整目录结构，不能只复制单个 `runsc`。
+运行时升级前应排空旧节点，或保留使用旧运行时的节点恢复存量暂停沙箱；不承诺跨 runsc
+版本的 checkpoint 兼容，不能仅升级二进制后假设旧快照仍能恢复。
 
 ## 证书与初始密钥
 

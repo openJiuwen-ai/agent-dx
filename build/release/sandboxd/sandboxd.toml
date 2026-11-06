@@ -34,6 +34,7 @@ runsc = "/opt/adx/current/runtime/sandboxd/runsc"
 
 [plugin.image]
 root = "/var/lib/adx-sandboxd/image-manager"
+oci_zero_ref_ttl = "30m"
 oss_template = "/etc/adx/sandboxd/oss.json"
 nydus_template = "/etc/adx/sandboxd/registry.json"
 oss_auths_path = "/etc/adx/sandboxd/oss_auths.json"

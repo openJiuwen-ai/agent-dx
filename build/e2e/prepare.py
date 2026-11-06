@@ -32,6 +32,9 @@ ROOT = Path(__file__).resolve().parents[2]
 spec = importlib.util.spec_from_file_location('release_package', ROOT / 'build/release/package.py')
 package = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(package)
+runsc_spec = importlib.util.spec_from_file_location('runsc_release', ROOT / 'build/release/download_runsc.py')
+runsc_release = importlib.util.module_from_spec(runsc_spec)
+runsc_spec.loader.exec_module(runsc_release)
 afs_spec = importlib.util.spec_from_file_location('afs_handoff', ROOT / 'build/e2e/afs_handoff.py')
 afs_handoff = importlib.util.module_from_spec(afs_spec)
 afs_spec.loader.exec_module(afs_handoff)
@@ -111,6 +114,26 @@ def verify_runsc(binary, target):
     return sha(binary)
 
 
+def stage_runsc(binary, target, destination):
+    """Stage the verified launcher and the complete matching runtime helper kit."""
+    verify_runsc(binary, target)
+    files = runsc_release.verify_runtime(binary, target)
+    for name, digest in files.items():
+        output = destination / name
+        output.parent.mkdir(parents=True, exist_ok=True)
+        source = binary if name == 'runsc' else binary.parent / name
+        shutil.copy2(source, output)
+        output.chmod(0o755)
+        if sha(output) != digest:
+            raise ValueError('runsc runtime changed while staging: ' + name)
+    return {
+        'sha256': files['runsc'],
+        'target': target,
+        'helpers': {name.removeprefix('gvisor-bin/'): digest
+                    for name, digest in files.items() if name.startswith('gvisor-bin/')},
+    }
+
+
 def main():
     p = argparse.ArgumentParser()
     for name in ('package', 'backend', 'sdk-wheel', 'sdk-candidate', 'output'):
@@ -121,7 +144,9 @@ def main():
     p.add_argument('--workload-probes', action='store_true', help='include the managed probe workload fixture')
     p.add_argument('--afs-contracts', type=Path, help='frozen same-product FUSE test assets, outside the release')
     p.add_argument('--firecracker-kit', type=Path)
-    p.add_argument('--runsc-bin', type=Path, help='optional verified native runsc for the heterogeneous runtime E2E')
+    p.add_argument(
+        '--runsc-bin', type=Path, help='verified native runsc with its matching adjacent gvisor-bin runtime kit'
+    )
     a = p.parse_args()
     a.output.mkdir(parents=True, exist_ok=False)
     manifest = package.verify(a.package)
@@ -130,7 +155,7 @@ def main():
         harness_commit = os.getenv('BUILDKITE_COMMIT') or subprocess.check_output(
             [_executable('git'), '-C', str(ROOT), 'rev-parse', 'HEAD'], text=True,
         ).strip()
-    runsc_sha256 = verify_runsc(a.runsc_bin, manifest['target']) if a.runsc_bin else None
+    runsc_identity = None
     expected_commit = os.getenv('ADX_E2E_ARTIFACT_COMMIT', os.getenv('BUILDKITE_COMMIT', manifest['commit']))
     sdk = verify_sdk(a.sdk_wheel, a.sdk_candidate, expected_commit)
     if os.getenv('BUILDKITE'):
@@ -181,8 +206,7 @@ def main():
             shutil.copy2(a.backend / name, context / 'backend' / name)
             (context / 'backend' / name).chmod(0o755)
         if a.runsc_bin:
-            shutil.copy2(a.runsc_bin, context / 'runsc')
-            (context / 'runsc').chmod(0o755)
+            runsc_identity = stage_runsc(a.runsc_bin, manifest['target'], context / 'backend')
         shutil.copytree(ROOT / 'build/observability', context / 'observability')
         shutil.copytree(ROOT / 'build/e2e', context / 'e2e', ignore=shutil.ignore_patterns('__pycache__', 'tests'))
         shutil.copy2(ROOT / 'build/ci/rpc_certificates.py', context / 'e2e/rpc_certificates.py')
@@ -230,9 +254,6 @@ def main():
                     '--no-install-recommends fuse3 util-linux && rm -rf /var/lib/apt/lists/*\n'
                 )
                 dockerfile.write('RUN ' + json.dumps(command) + '\n')
-        if a.runsc_bin:
-            with (context / 'Dockerfile.node').open('a') as dockerfile:
-                dockerfile.write('COPY runsc /usr/local/bin/runsc\n')
         if fc_kit:
             with (context / 'Dockerfile.node').open('a') as dockerfile:
                 dockerfile.write('COPY fc-kit /opt/adx-fc\nCOPY fc-kit/tools /opt/adx/tools\n')
@@ -340,8 +361,8 @@ def main():
         result['activator_archive_sha256'] = sha(a.output / 'activator.tar')
     if a.workload_probes:
         result['workload_probes_archive_sha256'] = sha(a.output / 'workload-probes.tar')
-    if runsc_sha256:
-        result['runsc'] = {'sha256': runsc_sha256, 'target': manifest['target']}
+    if runsc_identity:
+        result['runsc'] = runsc_identity
     if fc_kit:
         result['firecracker_kit'] = fc_kit
     (a.output / 'bundle.json').write_text(json.dumps(result, indent=2) + '\n')
