@@ -134,6 +134,9 @@ enum Phase {
     AuditSeed,
     ServiceSmoke,
     Diagnose,
+    /// rmdir and directory rename in the seeded namespace (R15): DfsService,
+    /// in-process, no RPC.
+    DirOps,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
@@ -1172,6 +1175,112 @@ async fn service_smoke(store: Arc<Store>) -> BenchResult<Value> {
     )
 }
 
+/// `--seconds` is the iteration count here. Each iteration times one rmdir of an
+/// empty directory in the seeded (large) root, and one rename of a directory at
+/// depth 8 between its parent and a directory beside it. The setup mkdirs are
+/// not timed.
+async fn dir_ops(store: Arc<Store>, iterations: u64) -> BenchResult<Value> {
+    use afs::dfs::{CallerContext, MkdirRequest, RenameMode, RenameRequest, RmdirRequest};
+    store
+        .register_node_session(
+            RequestKey::new("meta-bench", "dir-ops-session"),
+            NodeSessionLease {
+                node_id: "bench-client".into(),
+                session_id: "bench-session".into(),
+                grpc_addr: "127.0.0.1:1".into(),
+                data_addr: "127.0.0.1:2".into(),
+                rest_addr: "127.0.0.1:3".into(),
+                ownerfs_enabled: true,
+                storage_devices: vec![],
+                lease_ttl: Duration::from_secs(600),
+            },
+        )
+        .await?;
+    let service = DfsService::new(store.clone());
+    let namespace = NamespaceId::new(NAMESPACE);
+    let caller = CallerContext {
+        uid: 0,
+        gid: 0,
+        supplementary_gids: Vec::new(),
+    };
+    let mut sequence = 0_u64;
+    let mut operation = || {
+        sequence += 1;
+        OperationId::new(format!("dir-ops-{sequence}"))
+    };
+    let mut directory = InodeAttributes {
+        mode: 0o40777,
+        ..attributes()
+    };
+    directory.nlink = 2;
+    let mkdir = |parent: InodeId, name: String, operation_id: OperationId| MkdirRequest {
+        caller_id: "bench-client".into(),
+        operation_id,
+        namespace_id: namespace.clone(),
+        parent_inode_id: parent,
+        name: name.into_bytes(),
+        attributes: directory.clone(),
+        caller: caller.clone(),
+    };
+    let mut chain = vec![InodeId::new(ROOT)];
+    for depth in 0..8 {
+        let parent = chain[depth].clone();
+        let made = service
+            .mkdir(mkdir(parent, format!("deep-{depth}"), operation()))
+            .await?;
+        chain.push(made.inode_id);
+    }
+    let beside = service
+        .mkdir(mkdir(chain[7].clone(), "beside".into(), operation()))
+        .await?
+        .inode_id;
+    let (mut rmdir_ns, mut rename_ns) = (BTreeMap::new(), BTreeMap::new());
+    let mut at_beside = false;
+    for index in 0..iterations {
+        let name = format!("empty-{index}");
+        service
+            .mkdir(mkdir(InodeId::new(ROOT), name.clone(), operation()))
+            .await?;
+        let start = Instant::now();
+        service
+            .rmdir(RmdirRequest {
+                caller_id: "bench-client".into(),
+                operation_id: operation(),
+                namespace_id: namespace.clone(),
+                parent_inode_id: InodeId::new(ROOT),
+                name: name.into_bytes(),
+                caller: caller.clone(),
+            })
+            .await?;
+        record_latency(&mut rmdir_ns, elapsed_ns(start.elapsed()))?;
+        let (from, to) = if at_beside {
+            (beside.clone(), chain[7].clone())
+        } else {
+            (chain[7].clone(), beside.clone())
+        };
+        let start = Instant::now();
+        service
+            .rename(RenameRequest {
+                caller_id: "bench-client".into(),
+                operation_id: operation(),
+                namespace_id: namespace.clone(),
+                old_parent_inode_id: from,
+                old_name: b"deep-7".to_vec(),
+                new_parent_inode_id: to,
+                new_name: b"deep-7".to_vec(),
+                mode: RenameMode::NoReplace,
+                caller: caller.clone(),
+            })
+            .await?;
+        record_latency(&mut rename_ns, elapsed_ns(start.elapsed()))?;
+        at_beside = !at_beside;
+    }
+    Ok(
+        json!({"scope":"DfsService rmdir and depth-8 directory rename, in-process, not RPC",
+        "iterations":iterations,"rmdir":quantiles(rmdir_ns)?,"dir_rename":quantiles(rename_ns)?}),
+    )
+}
+
 fn rss_bytes() -> Option<u64> {
     fs::read_to_string("/proc/self/status")
         .ok()?
@@ -1365,6 +1474,7 @@ async fn main() -> BenchResult<()> {
                 "scope":"all expected seed entities, per-entity revisions and original seed outcomes after normal Store reopen; not crash recovery, post-load ACK coverage or formal performance acceptance"})
         }
         Phase::ServiceSmoke => service_smoke(store).await?,
+        Phase::DirOps => dir_ops(store, args.seconds).await?,
         Phase::Diagnose => {
             diagnose(
                 store,
