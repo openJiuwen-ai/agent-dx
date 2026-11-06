@@ -2,6 +2,7 @@ use crate::{
     config::Config,
     environment_directory::{EnvironmentDirectory, EnvironmentPage},
     ownership::Cache,
+    workspace_affinity::WorkspaceAffinityResolver,
 };
 use adx_observability::trace;
 use adx_protocol::control as pb;
@@ -20,6 +21,7 @@ use tonic::{Code, Response, Status};
 
 pub struct Clients {
     pub config: Config,
+    pub workspace: Option<WorkspaceAffinityResolver>,
     directory: Mutex<crate::directory::Directory>,
     tls: RpcClient,
     discovery: Option<adx_discovery::RedisDiscovery>,
@@ -50,8 +52,24 @@ impl Clients {
             })
             .transpose()?;
         let limit = config.cache_entries;
+        // Affinity is optional: a node without the Workspace service must still
+        // start. A missing token disables the feature instead of blocking boot.
+        let workspace = match config.workspace_affinity.clone() {
+            None => None,
+            Some(affinity) => match WorkspaceAffinityResolver::new(affinity) {
+                Ok(resolver) => Some(resolver),
+                Err(error) => {
+                    adx_observability::warn!(
+                        error = %error,
+                        "Workspace affinity disabled; ownership lookup is unavailable"
+                    );
+                    None
+                }
+            },
+        };
         let clients = Arc::new(Self {
             config,
+            workspace,
             directory: Mutex::default(),
             tls,
             discovery,
