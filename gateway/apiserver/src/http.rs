@@ -294,7 +294,24 @@ impl Api {
             return plain(200, json!({"capabilities": ["workload-probes-v1"]}));
         }
         if method == "GET" && path == "/api/environment/v1/resources" {
+            let accounting = match query.get("view").map(String::as_str) {
+                None => false,
+                Some("accounting") => true,
+                _ => {
+                    return error_response(
+                        Status::invalid_argument("view must be accounting"),
+                        &request_id,
+                        None,
+                        None,
+                        false,
+                    )
+                }
+            };
             return match self.clients.nodes().await {
+                Ok(nodes) if accounting => match accounting_resource_view(nodes) {
+                    Ok(value) => plain(StatusCode::OK.as_u16(), value),
+                    Err(error) => error_response(error, &request_id, None, None, false),
+                },
                 Ok(nodes) => plain(StatusCode::OK.as_u16(), resource_view(nodes)),
                 Err(error) => error_response(error, &request_id, None, None, false),
             };
@@ -1202,27 +1219,66 @@ fn scheduling_resource_node(mut node: pb::NodeEndpoint) -> pb::NodeEndpoint {
 }
 
 fn resource_view(nodes: Vec<pb::NodeEndpoint>) -> Value {
-    fn resources(resources: Option<pb::Resources>, devices: &[pb::Device]) -> Value {
-        let resources = resources.unwrap_or_default();
-        let mut values = serde_json::Map::from_iter([
-            ("CPU".into(), json!(resources.cpu_millis)),
-            ("Memory".into(), json!(resources.memory_bytes / 1_048_576)),
-            ("Disk".into(), json!(resources.disk_bytes / 1_048_576)),
-        ]);
-        for (name, count) in device_counts(devices) {
-            values.insert(name, json!(count));
-        }
-        Value::Object(values)
-    }
     json!({
         "items": nodes.into_iter().map(scheduling_resource_node).map(|node| json!({
             "id": node.node_id,
             "status": if node.accepting_allocations { 0 } else { 1 },
-            "capacity": resources(node.capacity, &node.capacity_devices),
-            "allocatable": resources(node.allocatable, &node.allocatable_devices),
+            "capacity": resource_values(node.capacity, &node.capacity_devices),
+            "allocatable": resource_values(node.allocatable, &node.allocatable_devices),
             "labels": node.labels,
         })).collect::<Vec<_>>()
     })
+}
+
+fn resource_values(resources: Option<pb::Resources>, devices: &[pb::Device]) -> Value {
+    let resources = resources.unwrap_or_default();
+    let mut values = serde_json::Map::from_iter([
+        ("CPU".into(), json!(resources.cpu_millis)),
+        ("Memory".into(), json!(resources.memory_bytes / 1_048_576)),
+        ("Disk".into(), json!(resources.disk_bytes / 1_048_576)),
+    ]);
+    for (name, count) in device_counts(devices) {
+        values.insert(name, json!(count));
+    }
+    Value::Object(values)
+}
+
+fn accounting_resource_view(nodes: Vec<pb::NodeEndpoint>) -> Result<Value, Status> {
+    let mut items = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let allocated = node.allocated.ok_or_else(|| {
+            Status::unavailable("node allocation accounting unavailable; update Coordinator")
+        })?;
+        let devices = node
+            .allocated_devices
+            .into_iter()
+            .map(|device| pb::Device {
+                id: device.id,
+                kind: device.kind,
+                model: device.model,
+                healthy: true,
+            })
+            .collect::<Vec<_>>();
+        let remaining = if node.accepting_allocations {
+            resource_values(node.allocatable, &node.allocatable_devices)
+        } else {
+            resource_values(Some(pb::Resources::default()), &[])
+        };
+        let capacity_devices = node
+            .capacity_devices
+            .into_iter()
+            .filter(|device| device.healthy)
+            .collect::<Vec<_>>();
+        items.push(json!({
+            "id": node.node_id,
+            "status": if node.accepting_allocations { 0 } else { 1 },
+            "capacity": resource_values(node.capacity, &capacity_devices),
+            "allocated": resource_values(Some(allocated), &devices),
+            "allocatable": remaining,
+            "labels": node.labels,
+        }));
+    }
+    Ok(json!({"items": items}))
 }
 
 fn legacy_resource_view(nodes: Vec<pb::NodeEndpoint>, request_id: &str) -> Value {
@@ -1525,6 +1581,48 @@ mod error_contract_tests {
     }
 
     #[test]
+    fn accounting_keeps_reservations_and_capacity_when_admission_is_blocked() {
+        let node = pb::NodeEndpoint {
+            node_id: "paused".into(),
+            capacity: Some(pb::Resources {
+                cpu_millis: 1000,
+                memory_bytes: 1_048_576,
+                disk_bytes: 0,
+            }),
+            allocated: Some(pb::Resources {
+                cpu_millis: 3000,
+                memory_bytes: 3 * 1_048_576,
+                disk_bytes: 0,
+            }),
+            allocatable: Some(pb::Resources {
+                cpu_millis: 0,
+                memory_bytes: 0,
+                disk_bytes: 0,
+            }),
+            allocated_devices: vec![pb::DeviceAllocation {
+                id: 1,
+                kind: pb::DeviceKind::Gpu.into(),
+                model: "A100".into(),
+            }],
+            ..Default::default()
+        };
+        let value = accounting_resource_view(vec![node]).unwrap();
+        assert_eq!(value["items"][0]["status"], 1);
+        assert_eq!(value["items"][0]["capacity"]["CPU"], 1000);
+        assert_eq!(value["items"][0]["allocated"]["CPU"], 3000);
+        assert_eq!(value["items"][0]["allocated"]["GPU/A100"], 1);
+        assert_eq!(value["items"][0]["allocatable"]["CPU"], 0);
+        assert_eq!(value["items"][0]["allocated"]["Memory"], 3);
+    }
+
+    #[test]
+    fn accounting_rejects_an_old_directory_without_reservation_data() {
+        let error = accounting_resource_view(vec![pb::NodeEndpoint::default()]).unwrap_err();
+        assert_eq!(error.code(), Code::Unavailable);
+        assert!(error.message().contains("update Coordinator"));
+    }
+
+    #[test]
     fn resource_view_uses_public_units_and_plain_labels() {
         let value = resource_view(vec![pb::NodeEndpoint {
             node_id: "node-a".into(),
@@ -1555,6 +1653,7 @@ mod error_contract_tests {
                 model: "A100".into(),
                 healthy: true,
             }],
+            ..Default::default()
         }]);
         assert_eq!(value["items"][0]["id"], "node-a");
         assert_eq!(value["items"][0]["capacity"]["CPU"], 4000);

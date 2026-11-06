@@ -231,6 +231,7 @@ fn zero_capacity_reports_preserve_reservations_until_capacity_recovers() {
             (zero.capacity, zero.capacity.saturating_sub(resources(1)))
         );
         assert_eq!(coordinator.snapshot().nodes()["n"].capacity, zero.capacity);
+        assert_eq!(coordinator.node_allocated("n").unwrap().0, resources(1));
         coordinator.submit(spec("waiting", "t", 0)).unwrap();
         assert!(coordinator.schedule(0).unwrap().is_none());
         // Recovery to the occupied capacity must not erase the running reservation.
@@ -260,6 +261,7 @@ fn capacity_below_used_blocks_placement_until_normal_release() {
     let (capacity, available) = coordinator.node_resources("n").unwrap();
     assert_eq!(capacity.cpu_millis, 1);
     assert_eq!(available.cpu_millis, 0);
+    assert_eq!(coordinator.node_allocated("n").unwrap().0.cpu_millis, 2);
     coordinator.submit(spec("c", "t", 0)).unwrap();
     assert!(coordinator.schedule(0).unwrap().is_none());
     coordinator.release(&a).unwrap();

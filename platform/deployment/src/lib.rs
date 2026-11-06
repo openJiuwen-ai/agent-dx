@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod config;
+pub mod resources;
 pub mod supervisor;
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 

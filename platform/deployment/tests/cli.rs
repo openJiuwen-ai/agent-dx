@@ -4,6 +4,14 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[test]
+fn resources_accepts_table_and_json_output() {
+    for format in ["table", "json"] {
+        assert!(Cli::try_parse_from(["adxctl", "resources", "--output", format]).is_ok());
+    }
+    assert!(Cli::try_parse_from(["adxctl", "resources", "--output", "yaml"]).is_err());
+}
+
+#[test]
 fn parses_typed_subcommands_without_positional_argument_assumptions() {
     let cli = Cli::try_parse_from([
         "adxctl",
