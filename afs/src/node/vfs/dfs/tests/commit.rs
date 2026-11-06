@@ -325,8 +325,7 @@ fn active_writer_lease_renewal_skips_closed_clean_states_and_rejects_fencing() {
         false,
     );
     fs.writes
-        .states
-        .insert(lease.inode_id.clone(), cell.clone())
+        .insert_cell(lease.inode_id.clone(), cell.clone())
         .unwrap();
     assert_eq!(fs.renew_active_write_leases().unwrap(), 0);
     assert_eq!(meta.renew_call_count(), 0);
@@ -356,8 +355,7 @@ fn active_writer_lease_renewal_late_reply_cannot_replace_newer_authority() {
         false,
     );
     fs.writes
-        .states
-        .insert(lease.inode_id.clone(), cell.clone())
+        .insert_cell(lease.inode_id.clone(), cell.clone())
         .unwrap();
     let pause = meta.pause_next_renew();
     meta.queue_renew_result(Ok(meta.lease_with_expiry(now_unix_ms() + 30_000)));

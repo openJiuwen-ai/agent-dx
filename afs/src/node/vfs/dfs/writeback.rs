@@ -8,7 +8,7 @@ impl DistributedFs {
         if self.write_resources.pipeline.is_none() {
             return Ok(0);
         }
-        for (_, cell) in self.writes.states.snapshot()? {
+        for (_, cell) in self.pending_write_states()? {
             let mut state = cell
                 .lock()
                 .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
@@ -23,7 +23,7 @@ impl DistributedFs {
     pub fn renew_active_write_leases(&self) -> Result<usize> {
         // Open idle writers and unknown commits still depend on their lease.
         // Renew independently of writeback, without changing a frozen request.
-        let mut entries = self.writes.states.snapshot()?;
+        let mut entries = self.pending_write_states()?;
         entries.sort_by(|left, right| left.0.0.cmp(&right.0.0));
         if !entries.is_empty() {
             let start = self.writes.lease_cursor.load(Ordering::Relaxed) as usize % entries.len();
@@ -39,7 +39,7 @@ impl DistributedFs {
             }
             examined += 1;
             let lease = {
-                let Ok(state) = cell.state.try_lock() else {
+                let Ok(state) = cell.try_lock() else {
                     continue;
                 };
                 if state.terminal_error.is_some()

@@ -2,10 +2,99 @@ use super::*;
 
 pub(super) type SharedInodeWriteState = Arc<InodeWriteStateCell>;
 
+#[cfg(test)]
+std::thread_local! {
+    /// Inode write-state lock acquisitions on this thread (test probe).
+    pub(super) static DFS_WRITE_STATE_LOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(super) struct InodeWriteStateCell {
-    pub(super) state: Mutex<InodeWriteState>,
+    state: Mutex<InodeWriteState>,
     pub(super) cv: Condvar,
     lock_wait: Option<Arc<InodeLockWait>>,
+    /// Set once, when the cell joins an `InodeWriteTable`.
+    pending: std::sync::OnceLock<PendingWriteEntry>,
+    /// Whether `pending` currently lists this inode. Changed only while
+    /// `state` is held, so listing and unlisting follow the inode's order.
+    listed: AtomicBool,
+}
+
+/// Inodes that may have pending write work, the only ones a Node-wide
+/// writeback pass has to examine. Closed and published write states stay in
+/// `InodeWriteTable::states` for reopen; they are not listed here.
+pub(super) type PendingWriteIndex = ShardedMap<InodeId, ()>;
+
+struct PendingWriteEntry {
+    inode_id: InodeId,
+    index: Arc<PendingWriteIndex>,
+}
+
+/// A held inode write-state lock. Releasing it (drop or a condvar wait) lists
+/// the inode in the pending-write index when the state has pending write work,
+/// so every transition out of idle is visible to the next writeback pass.
+pub(super) struct InodeWriteStateGuard<'a> {
+    cell: &'a InodeWriteStateCell,
+    guard: Option<std::sync::MutexGuard<'a, InodeWriteState>>,
+}
+
+impl<'a> InodeWriteStateGuard<'a> {
+    fn new(
+        cell: &'a InodeWriteStateCell,
+        guard: std::sync::MutexGuard<'a, InodeWriteState>,
+    ) -> Self {
+        Self {
+            cell,
+            guard: Some(guard),
+        }
+    }
+
+    fn wrap(
+        cell: &'a InodeWriteStateCell,
+        result: std::sync::LockResult<std::sync::MutexGuard<'a, InodeWriteState>>,
+    ) -> std::sync::LockResult<Self> {
+        match result {
+            Ok(guard) => Ok(Self::new(cell, guard)),
+            Err(poisoned) => Err(std::sync::PoisonError::new(Self::new(
+                cell,
+                poisoned.into_inner(),
+            ))),
+        }
+    }
+
+    /// Publish pending work, then hand the raw guard to a condvar wait.
+    fn release_for_wait(mut self) -> std::sync::MutexGuard<'a, InodeWriteState> {
+        let guard = self
+            .guard
+            .take()
+            .expect("inode write-state guard is held until released");
+        self.cell.publish_pending(&guard);
+        guard
+    }
+}
+
+impl std::ops::Deref for InodeWriteStateGuard<'_> {
+    type Target = InodeWriteState;
+    fn deref(&self) -> &Self::Target {
+        self.guard
+            .as_ref()
+            .expect("inode write-state guard is held until released")
+    }
+}
+
+impl std::ops::DerefMut for InodeWriteStateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.guard
+            .as_mut()
+            .expect("inode write-state guard is held until released")
+    }
+}
+
+impl Drop for InodeWriteStateGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(guard) = self.guard.take() {
+            self.cell.publish_pending(&guard);
+        }
+    }
 }
 
 /// Structural-cost counters for inode write-state lock contention. Only an
@@ -117,6 +206,27 @@ impl Drop for InodeOperationGuard {
 }
 
 impl InodeWriteState {
+    /// Anything a Node-wide writeback pass (progress, timer, upload start,
+    /// lease renewal, resource accounting) may act on or count. A state
+    /// without any of these is closed and published: no pass touches it.
+    pub(super) fn has_pending_write_work(&self) -> bool {
+        self.open_writers > 0
+            || self.dirty
+            || self.metadata_dirty
+            || self.kill_suidgid_dirty
+            || !self.dirty_extents.is_empty()
+            || !self.dirty_extents.builders.is_empty()
+            || self.dirty_extents.native_operation_id.is_some()
+            || self.in_flight.is_some()
+            || self.commit_busy
+            || self.operation_busy
+            || self.native_due
+            || self.last_writer_background_requested
+            || !self.native_queue.values.is_empty()
+            || self.native_thread.is_some()
+            || self.visible_write_seq > self.committed_write_seq
+    }
+
     /// This Node has write activity on the inode: an open local writer,
     /// accepted writes not yet committed, or a commit in flight. While it
     /// lasts every handle on this Node reads the Node's own view (4a).
@@ -134,6 +244,8 @@ impl InodeWriteStateCell {
             state: Mutex::new(state),
             cv: Condvar::new(),
             lock_wait: None,
+            pending: std::sync::OnceLock::new(),
+            listed: AtomicBool::new(false),
         }
     }
 
@@ -142,27 +254,99 @@ impl InodeWriteStateCell {
         self
     }
 
-    pub(super) fn lock(&self) -> std::sync::LockResult<std::sync::MutexGuard<'_, InodeWriteState>> {
+    pub(super) fn lock(&self) -> std::sync::LockResult<InodeWriteStateGuard<'_>> {
+        #[cfg(test)]
+        DFS_WRITE_STATE_LOCKS.with(|count| count.set(count.get() + 1));
         let Some(lock_wait) = &self.lock_wait else {
-            return self.state.lock();
+            return InodeWriteStateGuard::wrap(self, self.state.lock());
         };
         match self.state.try_lock() {
-            Ok(guard) => Ok(guard),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => Err(poisoned),
+            Ok(guard) => Ok(InodeWriteStateGuard::new(self, guard)),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                InodeWriteStateGuard::wrap(self, Err(poisoned))
+            }
             Err(std::sync::TryLockError::WouldBlock) => {
                 let started = Instant::now();
                 let result = self.state.lock();
                 lock_wait.record(started.elapsed());
-                result
+                InodeWriteStateGuard::wrap(self, result)
             }
+        }
+    }
+
+    pub(super) fn try_lock(&self) -> std::sync::TryLockResult<InodeWriteStateGuard<'_>> {
+        #[cfg(test)]
+        DFS_WRITE_STATE_LOCKS.with(|count| count.set(count.get() + 1));
+        match self.state.try_lock() {
+            Ok(guard) => Ok(InodeWriteStateGuard::new(self, guard)),
+            Err(std::sync::TryLockError::WouldBlock) => Err(std::sync::TryLockError::WouldBlock),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Err(
+                std::sync::TryLockError::Poisoned(std::sync::PoisonError::new(
+                    InodeWriteStateGuard::new(self, poisoned.into_inner()),
+                )),
+            ),
         }
     }
 
     pub(super) fn wait<'a>(
         &self,
-        guard: std::sync::MutexGuard<'a, InodeWriteState>,
-    ) -> std::sync::LockResult<std::sync::MutexGuard<'a, InodeWriteState>> {
-        self.cv.wait(guard)
+        guard: InodeWriteStateGuard<'a>,
+    ) -> std::sync::LockResult<InodeWriteStateGuard<'a>> {
+        let cell = guard.cell;
+        InodeWriteStateGuard::wrap(cell, self.cv.wait(guard.release_for_wait()))
+    }
+
+    pub(super) fn wait_timeout<'a>(
+        &self,
+        guard: InodeWriteStateGuard<'a>,
+        timeout: Duration,
+    ) -> std::sync::LockResult<InodeWriteStateGuard<'a>> {
+        let cell = guard.cell;
+        let result = match self.cv.wait_timeout(guard.release_for_wait(), timeout) {
+            Ok((guard, _)) => Ok(guard),
+            Err(poisoned) => Err(std::sync::PoisonError::new(poisoned.into_inner().0)),
+        };
+        InodeWriteStateGuard::wrap(cell, result)
+    }
+
+    /// List this inode for writeback passes once its state has pending write
+    /// work. Called with the state lock held.
+    fn publish_pending(&self, state: &InodeWriteState) {
+        let Some(entry) = self.pending.get() else {
+            return;
+        };
+        if self.listed.load(Ordering::Relaxed) || !state.has_pending_write_work() {
+            return;
+        }
+        // A poisoned shard leaves the inode unlisted; that shard's other
+        // operations already fail, and a later release retries the listing.
+        if let Ok(mut shard) = entry.index.write(&entry.inode_id) {
+            shard.insert(entry.inode_id.clone(), ());
+            self.listed.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Drop this inode from the pending-write index if its state has no
+    /// pending write work. A busy state is kept listed and checked next pass.
+    fn unlist_if_idle(&self) -> Result<bool> {
+        let Some(entry) = self.pending.get() else {
+            return Ok(false);
+        };
+        let state = match self.state.try_lock() {
+            Ok(state) => state,
+            // Busy or poisoned: keep it listed; the pass reports poison itself.
+            Err(_) => return Ok(false),
+        };
+        if state.has_pending_write_work() {
+            return Ok(false);
+        }
+        entry
+            .index
+            .write(&entry.inode_id)
+            .map_err(|_| unavailable("DFS pending write index is poisoned"))?
+            .remove(&entry.inode_id);
+        self.listed.store(false, Ordering::Relaxed);
+        Ok(true)
     }
 
     pub(super) fn notify_all(&self) {
@@ -176,6 +360,8 @@ impl InodeWriteStateCell {
 #[derive(Default)]
 pub(super) struct InodeWriteTable {
     pub(super) states: ShardedMap<InodeId, SharedInodeWriteState>,
+    /// The subset of `states` that may have pending write work.
+    pub(super) pending: Arc<PendingWriteIndex>,
     /// Contention counters attached to every newly installed cell.
     pub(super) lock_wait: Option<Arc<InodeLockWait>>,
     /// Rotation cursor so lease renewal is fair across passes.
@@ -183,6 +369,30 @@ pub(super) struct InodeWriteTable {
 }
 
 impl InodeWriteTable {
+    /// Install `cell` for `inode_id` unless a cell is already there; the
+    /// installed cell is listed for writeback passes whenever it has pending
+    /// write work.
+    pub(super) fn insert_cell(&self, inode_id: InodeId, cell: SharedInodeWriteState) -> Result<()> {
+        let _ = cell.pending.set(PendingWriteEntry {
+            inode_id: inode_id.clone(),
+            index: self.pending.clone(),
+        });
+        let installed = self
+            .states
+            .write(&inode_id)
+            .map_err(|_| unavailable("DFS inode write table is poisoned"))?
+            .entry(inode_id)
+            .or_insert(cell)
+            .clone();
+        // A cell built with pending work is listed now, not at its next release.
+        let state = installed
+            .state
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        installed.publish_pending(&state);
+        Ok(())
+    }
+
     pub(super) fn get(&self, inode_id: &InodeId) -> Result<Option<SharedInodeWriteState>> {
         Ok(self
             .states
@@ -194,6 +404,22 @@ impl InodeWriteTable {
 }
 
 impl DistributedFs {
+    /// Write states a Node-wide writeback pass has to examine: those listed
+    /// with pending write work. Listed states found idle are unlisted here, so
+    /// a pass costs the inodes with work, not every inode this Node retains.
+    pub(super) fn pending_write_states(&self) -> Result<Vec<(InodeId, SharedInodeWriteState)>> {
+        let mut pending = Vec::new();
+        for inode_id in self.writes.pending.keys_snapshot()? {
+            let Some(cell) = self.write_state(&inode_id)? else {
+                continue;
+            };
+            if !cell.unlist_if_idle()? {
+                pending.push((inode_id, cell));
+            }
+        }
+        Ok(pending)
+    }
+
     pub(super) fn write_state(&self, inode_id: &InodeId) -> Result<Option<SharedInodeWriteState>> {
         self.writes.get(inode_id)
     }
@@ -470,12 +696,7 @@ impl DistributedFs {
             })
             .with_lock_wait(self.writes.lock_wait.clone()),
         );
-        self.writes
-            .states
-            .write(&inode.inode_id)
-            .map_err(|_| unavailable("DFS inode write table is poisoned"))?
-            .entry(inode.inode_id.clone())
-            .or_insert(state);
+        self.writes.insert_cell(inode.inode_id.clone(), state)?;
         self.handles.mark_dynamic(&inode.inode_id)?;
         Ok(())
     }

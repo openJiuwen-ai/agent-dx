@@ -1051,7 +1051,7 @@ fn p2_review_node_wide_poll_never_reports_another_inode_upload_error() {
     let a_cell = a_fs.write_state(&a_id).unwrap().unwrap();
     // The single-inode Meta fixture uses separate facades; share A's real cell
     // as well as the store/pipeline so B's poll scans a Node-wide task table.
-    b_fs.writes.states.insert(a_id, a_cell).unwrap();
+    b_fs.writes.insert_cell(a_id, a_cell).unwrap();
     store.fail_next.store(true, Ordering::SeqCst);
     a_fs.write(&context(), a.handle, 0, &vec![0x48; 4 * 1024 * 1024])
         .unwrap();
@@ -1515,4 +1515,65 @@ fn native_builder_vfs_short_write_does_not_extend_unaccepted_tail() {
         );
         assert_eq!(pool.snapshot().copied_bytes, COMMIT_CHUNK_BYTES);
     }
+}
+
+/// Inode write-state locks taken by Node-wide writeback passes (the notify
+/// pass and the timer pass) beside `idle` retained write states: inodes this
+/// Node opened for write earlier, closed and published (or never wrote).
+/// Returns the locks taken while one writer has pending data, and the locks
+/// taken once that writer, too, is closed and published.
+fn writeback_pass_write_state_locks(idle: usize) -> (usize, usize) {
+    let (_temp, meta, fs, _runtime, _store) = native_pipeline_fixture(true, 8 * 1024 * 1024, 8);
+    for index in 0..idle {
+        // The single-inode Meta fixture cannot create more files; install the
+        // write state an earlier open/close of another inode leaves behind.
+        let mut inode = meta.inode.lock().unwrap().clone();
+        inode.inode_id = InodeId::new(format!("inode:idle-{index}"));
+        let mut lease = meta.lease.lock().unwrap().clone();
+        lease.inode_id = inode.inode_id.clone();
+        fs.install_write_state(inode, lease).unwrap();
+    }
+    let active = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("active"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fs.write(&context(), active.handle, 0, b"pending").unwrap();
+    // One settling pass, then the measured passes.
+    fs.progress_writeback().unwrap();
+    DFS_WRITE_STATE_LOCKS.with(|count| count.set(0));
+    fs.progress_writeback().unwrap();
+    fs.writeback_pending().unwrap();
+    let with_writer = DFS_WRITE_STATE_LOCKS.with(std::cell::Cell::get);
+    assert_eq!(meta.commits.lock().unwrap().len(), 1);
+    fs.release(&context(), active.handle).unwrap();
+    fs.writeback_pending().unwrap();
+    fs.progress_writeback().unwrap();
+    DFS_WRITE_STATE_LOCKS.with(|count| count.set(0));
+    fs.progress_writeback().unwrap();
+    fs.writeback_pending().unwrap();
+    let all_idle = DFS_WRITE_STATE_LOCKS.with(std::cell::Cell::get);
+    // Retention of closed write states is unchanged: they stay for reopen.
+    assert_eq!(fs.writes.states.len().unwrap(), idle + 1);
+    (with_writer, all_idle)
+}
+
+#[test]
+fn writeback_pass_cost_does_not_grow_with_idle_retained_write_states() {
+    let (few_with_writer, few_idle) = writeback_pass_write_state_locks(4);
+    let (many_with_writer, many_idle) = writeback_pass_write_state_locks(256);
+    assert_eq!(
+        few_with_writer, many_with_writer,
+        "a writeback pass must examine only inodes with pending write work, \
+         not every closed and published inode this Node has written"
+    );
+    assert_eq!(
+        (few_idle, many_idle),
+        (0, 0),
+        "with no pending write work a writeback pass examines no inode"
+    );
 }

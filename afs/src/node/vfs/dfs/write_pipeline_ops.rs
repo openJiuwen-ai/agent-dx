@@ -117,10 +117,8 @@ impl DistributedFs {
                 break;
             }
             state = cell
-                .cv
                 .wait_timeout(state, Duration::from_millis(10))
-                .map_err(|_| unavailable("native mutation queue is poisoned"))?
-                .0;
+                .map_err(|_| unavailable("native mutation queue is poisoned"))?;
         }
         drop(state);
         Ok(Some(ticket))
@@ -132,7 +130,7 @@ impl DistributedFs {
         };
         pipeline.observe();
         if let Some(metrics) = &pipeline.metrics
-            && let Ok(states) = self.writes.states.snapshot()
+            && let Ok(states) = self.pending_write_states()
         {
             let mut pending = 0_u64;
             for (_, cell) in states {
@@ -158,8 +156,7 @@ impl DistributedFs {
             }
             if state.commit_busy {
                 drop(
-                    cell.cv
-                        .wait_timeout(state, Duration::from_millis(10))
+                    cell.wait_timeout(state, Duration::from_millis(10))
                         .map_err(|_| unavailable("DFS inode write state is poisoned"))?,
                 );
             } else {
@@ -175,7 +172,7 @@ impl DistributedFs {
 
     fn dirty_owner_limit(&self, pipeline: &WritePipeline) -> Result<usize> {
         let mut writers = 0;
-        for (_, cell) in self.writes.states.snapshot()? {
+        for (_, cell) in self.pending_write_states()? {
             let state = cell
                 .lock()
                 .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
@@ -691,7 +688,7 @@ impl DistributedFs {
         // Existing inode registry snapshots are shared lifecycle metadata, not
         // a second W2 payload or per-object queue. Hold no registry lock while
         // examining an inode or waiting for an upload.
-        for (_, cell) in self.writes.states.snapshot()? {
+        for (_, cell) in self.pending_write_states()? {
             if let Some(upload) = Self::next_upload_for_cell(&cell)? {
                 return Ok(Some(upload));
             }
@@ -1024,7 +1021,7 @@ impl DistributedFs {
         let _ = self.poll_uploads()?;
         self.start_uploads()?;
         let mut committed = 0;
-        for (inode, cell) in self.writes.states.snapshot()? {
+        for (inode, cell) in self.pending_write_states()? {
             let due = {
                 let state = cell
                     .lock()

@@ -239,7 +239,7 @@ impl DistributedFs {
     ) -> Result<Option<CommitAction>> {
         let maintenance = reason.is_background();
         let mut state = if maintenance {
-            match cell.state.try_lock() {
+            match cell.try_lock() {
                 Ok(state) => state,
                 Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
                 Err(std::sync::TryLockError::Poisoned(_)) => {

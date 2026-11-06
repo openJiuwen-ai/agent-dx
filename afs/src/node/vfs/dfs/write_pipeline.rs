@@ -505,7 +505,7 @@ impl PipelineUpload {
 }
 
 pub(super) struct InodeMutationGuard<'a> {
-    pub(super) state: std::sync::MutexGuard<'a, InodeWriteState>,
+    pub(super) state: InodeWriteStateGuard<'a>,
     pub(super) _ticket: Option<MutationTicket>,
 }
 impl std::ops::Deref for InodeMutationGuard<'_> {
