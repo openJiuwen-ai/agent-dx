@@ -179,7 +179,13 @@ impl DfsReadEngine {
                 }
                 tokio::time::timeout_at(
                     tokio::time::Instant::from_std(deadline),
-                    self.read_remote_ranges_async(&child, &[candidates], target, true),
+                    self.read_remote_ranges_async(
+                        &child,
+                        &[candidates],
+                        target,
+                        true,
+                        Some(deadline),
+                    ),
                 )
                 .await
                 .map_err(|_| unavailable("distributed read deadline exceeded"))?

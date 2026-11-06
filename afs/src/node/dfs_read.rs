@@ -4924,7 +4924,7 @@ impl DfsReadEngine {
             return Ok(());
         }
         let ordered = self.distributed_sources(batch, sources);
-        self.read_remote_ranges_async(batch, &ordered, out, final_owned)
+        self.read_remote_ranges_async(batch, &ordered, out, final_owned, deadline)
             .await
     }
 
@@ -4934,7 +4934,9 @@ impl DfsReadEngine {
         sources: &[ChunkSources],
         out: &mut [u8],
         final_owned: bool,
+        deadline: Option<Instant>,
     ) -> Result<()> {
+        let deadline = deadline.unwrap_or_else(|| Instant::now() + self.read_pipeline_timeout());
         let version = batch
             .file_version_id
             .clone()
@@ -5008,13 +5010,37 @@ impl DfsReadEngine {
                     .and_then(|set| set.chunk.as_ref())
                     .filter(|chunk| chunk.is_segment_crc32c());
                 let target = if direct { &mut *out } else { &mut scratch };
-                let result = if let Some(chunk) = integrity {
-                    self.transfer
-                        .read_crc32c_range_async(&attempt, chunk, target)
-                        .await
+                // A silent first source must not consume the whole caller deadline.
+                // Keep a share for the remaining copies; this is sequential retry,
+                // not speculative duplicate traffic. Ordinary default policy is unchanged.
+                let choices = if self.config.distribution.parallelism > 1 {
+                    group
+                        .iter()
+                        .map(|&i| candidates[i].len() - next[i])
+                        .min()
+                        .unwrap_or(1)
                 } else {
-                    self.transfer.read_ranges_async(&attempt, target).await
+                    1
                 };
+                let budget = deadline.saturating_duration_since(Instant::now())
+                    / u32::try_from(choices.max(1)).unwrap_or(u32::MAX);
+                let result = tokio::time::timeout(budget, async {
+                    if let Some(chunk) = integrity {
+                        self.transfer
+                            .read_crc32c_range_async(&attempt, chunk, target)
+                            .await
+                    } else {
+                        self.transfer.read_ranges_async(&attempt, target).await
+                    }
+                })
+                .await
+                .map_err(|_| {
+                    Error::coded(
+                        afs_error::CLIENT_DEADLINE_EXCEEDED,
+                        "peer attempt exhausted its share of the read deadline",
+                    )
+                })
+                .and_then(|result| result);
                 match result {
                     Ok(()) => {
                         if attempt
@@ -5050,6 +5076,7 @@ impl DfsReadEngine {
                             return Err(error);
                         }
                         self.capture_native_read_authority()?;
+                        let timed_out = error.kind() == afs_error::ErrorKind::DeadlineExceeded;
                         last_error = Some(error);
                         // A batch error does not identify which copy failed. Before
                         // discarding a valid source for its neighbours, retry each
@@ -5057,7 +5084,7 @@ impl DfsReadEngine {
                         // Each candidate gets at most one batch and one single-op
                         // attempt; failed singles advance exactly once.
                         for (index, item) in group.iter().copied().zip(&attempt.operations) {
-                            if group.len() > 1 {
+                            if group.len() > 1 && !timed_out {
                                 let mut single = item.clone();
                                 single.op.output_offset = 0;
                                 let single_batch = PeerReadBatch {

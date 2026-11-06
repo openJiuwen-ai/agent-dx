@@ -223,6 +223,7 @@ AFS live/idle、allocator allocated/active/resident/retained 与进程 RSS 是�
 
 `DfsReadEngine` 可将同一版本的授权范围拆为互不重叠的 stripe，从多个 Node 并发读取。
 每段沿用既有 Peer 授权、校验、失败换源和总截止时间；所有子任务排空后才返回调用方。
+启用多源策略时，单个来源只使用剩余截止时间的一份，为其他副本保留重试时间；不额外并发发送重复范围。
 候选按已有负载提示排序并轮换，尚无吞吐自适应、慢源对冲或拓扑感知调度。
 
 ```text

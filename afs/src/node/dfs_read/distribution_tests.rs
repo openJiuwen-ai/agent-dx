@@ -10,6 +10,7 @@ struct ConcurrentTransfer {
     barrier: tokio::sync::Notify,
     wait_for: usize,
     fail_peer: Option<String>,
+    hang_peer: Option<String>,
 }
 
 impl ConcurrentTransfer {
@@ -22,6 +23,7 @@ impl ConcurrentTransfer {
             barrier: tokio::sync::Notify::new(),
             wait_for: 2,
             fail_peer: None,
+            hang_peer: None,
         }
     }
 }
@@ -76,6 +78,10 @@ impl ChunkTransfer for ConcurrentTransfer {
                 if self.fail_peer.as_ref() == Some(node_id) {
                     out.fill(255);
                     return Err(unavailable("selected peer exited mid-transfer"));
+                }
+                if self.hang_peer.as_ref() == Some(node_id) {
+                    out.fill(255);
+                    std::future::pending::<()>().await;
                 }
                 for index in 0..item.op.length as usize {
                     out[item.op.output_offset + index] =
@@ -169,6 +175,29 @@ async fn distribution_failed_source_is_retried_without_publishing_partial_bytes(
             .iter()
             .any(|c| c.0 == "peer-1")
     );
+    assert_eq!(transfer.active.load(Ordering::SeqCst), 0);
+    for (index, value) in out.iter().enumerate() {
+        assert_eq!(*value, ((index + 17) % 251) as u8);
+    }
+}
+
+#[tokio::test]
+async fn distribution_unresponsive_source_leaves_budget_for_healthy_copy() {
+    let mut transfer = ConcurrentTransfer::new();
+    transfer.hang_peer = Some("peer-1".into());
+    let transfer = Arc::new(transfer);
+    let (_temp, engine, batch, sources) = striped_fixture(transfer.clone());
+    let mut out = vec![0; 1024 * 1024];
+    engine
+        .read_remote_batch_async(
+            &batch,
+            &sources,
+            &mut out,
+            true,
+            Some(Instant::now() + Duration::from_millis(400)),
+        )
+        .await
+        .unwrap();
     assert_eq!(transfer.active.load(Ordering::SeqCst), 0);
     for (index, value) in out.iter().enumerate() {
         assert_eq!(*value, ((index + 17) % 251) as u8);
