@@ -16,6 +16,10 @@ schema marker 为 `binding-numbered-versions-v3`，初始化 `SET NX` 后读取�
 
 ## Redis 配置
 
+`service-grant` 使用同一 Repository 和 namespace，按凭据摘要点查。记录引用 AgentBinding 的 scope/generation，仅增加 audience、purpose、expiry；不存原始 bearer、工作区主表、飞书凭证或加密密钥。签发通过现有 CAS 同时检查 Binding revision；校验再读取当前 Binding，拒绝 Deleting、缺失、generation 变化或工作区不匹配。默认 30 天、最多 365 天；记录 envelope 的 `expires_at_unix_seconds` 对应 Redis `SET ... EXAT`，授权逻辑还会独立检查到期时间。模板和 Binding 记录不设置此 TTL。
+
+授权命令与查询由 Activator 执行，加解密服务没有直接访问这份 Redis 元数据的凭据。过期、淘汰或丢失记录都视为无有效授权，不能降级允许；部署要按权威元数据配置持久化、容量和恢复，不把旧授权备份当作可随意回灌的缓存。
+
 - 独立 `adx:v2:<namespace>:` 命名空间，不访问 Platform 私有键。
 - 单一权威写入端点，不承诺 Redis Cluster 跨 slot 事务。
 - 持久化和故障切换配置决定确认写入的可靠性，Lua 原子性不等于异步复制零丢失。

@@ -9,6 +9,7 @@ mod redis_store;
 pub use redis_store::RedisRepository;
 mod notifications;
 pub use notifications::{MetadataChange, RedisChanges};
+mod service_grants;
 mod state;
 pub use state::AgentState;
 mod aliases;
@@ -62,7 +63,12 @@ impl Key {
     pub fn new(kind: &str, parts: &[&str]) -> Result<Self> {
         if !matches!(
             kind,
-            "template" | "template-sequence" | "binding" | "binding-launch" | "alias"
+            "template"
+                | "template-sequence"
+                | "binding"
+                | "binding-launch"
+                | "alias"
+                | "service-grant"
         ) || parts.is_empty()
             || parts.iter().any(|s| s.is_empty() || s.len() > 2048)
         {
@@ -116,12 +122,15 @@ impl Revision {
 pub struct Record {
     pub revision: Revision,
     pub value: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_seconds: Option<u64>,
 }
 impl Record {
     pub fn new<T: Serialize>(value: &T) -> Result<Self> {
         Ok(Self {
             revision: Revision::new(),
             value: serde_json::to_value(value).map_err(|e| Error::Invalid(e.to_string()))?,
+            expires_at_unix_seconds: None,
         })
     }
     pub fn decode<T: DeserializeOwned>(&self) -> Result<T> {
@@ -169,6 +178,13 @@ impl Transaction {
         }
         seen.clear();
         for put in &puts {
+            if put
+                .record
+                .expires_at_unix_seconds
+                .is_some_and(|v| v == 0 || v > 253_402_300_799)
+            {
+                return Err(Error::Invalid("invalid record expiry".into()));
+            }
             if !seen.insert(&put.key) {
                 return Err(Error::Invalid("duplicate write".into()));
             }

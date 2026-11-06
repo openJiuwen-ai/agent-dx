@@ -216,3 +216,59 @@ async fn embedded_resolve_bypass_invalidates_warm_binding_before_backend_failure
         original
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn local_service_verification_is_fresh_bounded_and_does_not_activate() {
+    use adx_agent_api::managed::ManagedService;
+    use adx_agent_core::service_grants::*;
+    let state = AgentState::new(Arc::new(MemoryRepository::default()));
+    state
+        .publish("tenant", &adx_agent_core::TemplateDraft::from(&template()))
+        .await
+        .unwrap();
+    let binding = state
+        .create_binding_with_parameters(
+            scope(),
+            &std::collections::BTreeMap::from([("workspace".into(), "alice".into())]),
+        )
+        .await
+        .unwrap();
+    // Any lifecycle call would stall; grant admission must only read existing authority.
+    let activator = Arc::new(Activator::new(state, Arc::new(StalledEnvironment)));
+    let issued = activator
+        .issue_service_grant(&IssueServiceGrant {
+            scope: scope(),
+            expected_generation: binding.generation,
+            purpose: ORBIT_CONFIG_PURPOSE.into(),
+            ttl_seconds: 60,
+        })
+        .await
+        .unwrap();
+    let request = VerifyServiceGrant {
+        credential: issued.credential,
+        expected: issued.context,
+    };
+    let managed = ManagedService::new(Arc::new(LocalControl::new(activator.clone())));
+    assert!(managed
+        .verify_service_grant(&context(), &request)
+        .await
+        .unwrap());
+    activator
+        .revoke_service_grant(&RevokeServiceGrant {
+            credential_digest: issued.credential_digest,
+        })
+        .await
+        .unwrap();
+    assert!(!managed
+        .verify_service_grant(&context(), &request)
+        .await
+        .unwrap());
+    let stalled = ManagedService::new(Arc::new(LocalControl::new(Arc::new(Activator::new(
+        AgentState::new(Arc::new(StalledStore)),
+        Arc::new(StalledEnvironment),
+    )))));
+    assert!(matches!(
+        stalled.verify_service_grant(&context(), &request).await,
+        Err(Error::Unavailable(_))
+    ));
+}

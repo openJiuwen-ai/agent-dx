@@ -24,6 +24,8 @@ struct Settings {
     #[serde(default)]
     binding_cache: CacheSettings,
     registration: Option<RegistrationConfig>,
+    credential_grants_token_env: Option<String>,
+    credential_delivery: Option<adx_activator::credential_delivery::CredentialDelivery>,
 }
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -60,17 +62,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await?,
     );
-    let activator = Arc::new(Activator::with_cache(
-        AgentState::new(store.clone()),
-        environment,
-        settings.binding_cache,
-    )?);
-    let app = server::router(
-        activator.clone(),
-        &std::env::var("ADX_ACTIVATOR_SERVICE_TOKEN")?,
-        timeout,
-    )?;
+    let activator = Arc::new(
+        Activator::with_cache(
+            AgentState::new(store.clone()),
+            environment,
+            settings.binding_cache,
+        )?
+        .with_credential_delivery(settings.credential_delivery.clone())?,
+    );
+    let service_token = std::env::var("ADX_ACTIVATOR_SERVICE_TOKEN")?;
+    let mut app = server::router(activator.clone(), &service_token, timeout)?;
+    if let Some(variable) = settings.credential_grants_token_env {
+        app = app.merge(adx_activator::service_grants::router(
+            activator.clone(),
+            &service_token,
+            &std::env::var(variable)?,
+            timeout,
+        )?);
+    }
     let listener = tokio::net::TcpListener::bind(settings.listen).await?;
+    let renewal = settings.credential_delivery.map(|config| {
+        let authority = activator.clone();
+        let interval = config.renewal_interval();
+        tokio::spawn(async move {
+            loop {
+                if let Err(error) = authority.renew_delivered_credentials(&config).await {
+                    tracing::warn!(%error,"credential identity renewal failed");
+                }
+                tokio::time::sleep(interval).await;
+            }
+        })
+    });
     let reconciliation = match settings.registration {
         Some(config) => Some(
             Reconciliation::start(
@@ -101,6 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             {
                 let _ = tokio::signal::ctrl_c().await;
             }
+            if let Some(renewal)=renewal {renewal.abort();}
             if let Some(reconciliation) = reconciliation {
                 if let Err(error) = reconciliation.shutdown().await { tracing::warn!(%error, "Activator reconciliation shutdown failed; lease will expire"); }
             }

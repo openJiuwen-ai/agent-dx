@@ -1,6 +1,4 @@
 use std::env;
-use std::fs::File;
-use std::io::BufReader;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -454,49 +452,19 @@ impl IngressConfig {
 
     pub fn h2_pool_config(&self) -> Result<crate::ingress::H2PoolConfig, ConfigError> {
         let tls_config = if self.node_security_mode == IngressNodeSecurityMode::Mtls {
-            let mut roots = rustls::RootCertStore::empty();
-            let mut reader = BufReader::new(
-                File::open(&self.node_tls_ca)
-                    .map_err(|error| ConfigError::Invalid(format!("open node TLS CA: {error}")))?,
-            );
-            let certificates = rustls_pemfile::certs(&mut reader)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| ConfigError::Invalid(format!("read node TLS CA: {error}")))?;
-            if certificates.is_empty() {
-                return Err(ConfigError::Invalid(
-                    "node TLS CA contains no certificates".into(),
-                ));
-            }
-            for certificate in certificates {
-                roots
-                    .add(certificate)
-                    .map_err(|error| ConfigError::Invalid(format!("add node TLS CA: {error}")))?;
-            }
-            let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
-            let mut cert_reader =
-                BufReader::new(File::open(&self.node_tls_client_cert).map_err(|error| {
-                    ConfigError::Invalid(format!("open Relay TLS client certificate: {error}"))
-                })?);
-            let certificates = rustls_pemfile::certs(&mut cert_reader)
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|error| {
-                    ConfigError::Invalid(format!("read Relay TLS client certificate: {error}"))
-                })?;
-            let mut key_reader =
-                BufReader::new(File::open(&self.node_tls_client_key).map_err(|error| {
-                    ConfigError::Invalid(format!("open Relay TLS client key: {error}"))
-                })?);
-            let key = rustls_pemfile::private_key(&mut key_reader)
-                .map_err(|error| {
-                    ConfigError::Invalid(format!("read Relay TLS client key: {error}"))
-                })?
-                .ok_or_else(|| ConfigError::Invalid("Relay TLS client key is empty".into()))?;
-            let mut config = builder
-                .with_client_auth_cert(certificates, key)
-                .map_err(|error| {
-                    ConfigError::Invalid(format!("configure Relay TLS client identity: {error}"))
-                })?;
-            config.alpn_protocols = vec![b"h2".to_vec()];
+            let read = |path: &str| {
+                std::fs::read(path)
+                    .map_err(|error| ConfigError::Invalid(format!("read Relay TLS file: {error}")))
+            };
+            let config = adx_transport::tls::http_client_config(
+                &read(&self.node_tls_ca)?,
+                Some((
+                    &read(&self.node_tls_client_cert)?,
+                    &read(&self.node_tls_client_key)?,
+                )),
+                vec![b"h2".to_vec()],
+            )
+            .map_err(|error| ConfigError::Invalid(format!("configure Relay TLS: {error}")))?;
             Some(Arc::new(config))
         } else {
             None

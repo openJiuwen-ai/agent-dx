@@ -12,6 +12,7 @@ pub mod mounts;
 pub mod network;
 pub mod parameters;
 pub mod probes;
+pub mod service_grants;
 pub mod target;
 pub mod transport;
 pub mod volumes;

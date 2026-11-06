@@ -70,9 +70,10 @@ impl IngressService {
             || std::env::var_os("ADX_AGENT_CONFIG").is_some()
             || std::env::var_os("ADX_SSH_CONFIG").is_some()
             || std::env::var_os("ADX_JIUWEN_CONFIG").is_some()
+            || std::env::var_os("ADX_CREDENTIAL_CRYPTO_CONFIG").is_some()
         {
             return Err(
-                "Environment, Agent, Jiuwen and SSH configuration require a Gateway built with --features agent-api".into(),
+                "Environment, Agent, Jiuwen, credential crypto and SSH configuration require a Gateway built with --features agent-api".into(),
             );
         }
         let tls_listener = TcpListener::bind(config.tls_bind).await?;
@@ -152,6 +153,22 @@ impl IngressService {
         } else {
             None
         };
+        #[cfg(feature = "agent-api")]
+        let credential_crypto_api = if let Ok(path) = std::env::var("ADX_CREDENTIAL_CRYPTO_CONFIG")
+        {
+            use super::credential_crypto::{CredentialCryptoApi, CredentialCryptoConfig};
+            let settings: CredentialCryptoConfig = serde_json::from_slice(&std::fs::read(path)?)
+                .map_err(|_| "invalid credential crypto Gateway configuration")?;
+            let agent = agent_api
+                .as_ref()
+                .ok_or("credential crypto Gateway requires ADX_AGENT_CONFIG")?;
+            Some(Arc::new(CredentialCryptoApi::new(
+                settings,
+                agent.managed.clone(),
+            )?))
+        } else {
+            None
+        };
         let gateway = Ingress::new(
             resolver,
             connector,
@@ -193,6 +210,11 @@ impl IngressService {
             gateway.with_digitalmategateway_api(api)
         } else {
             gateway
+        };
+        #[cfg(feature = "agent-api")]
+        let gateway = match credential_crypto_api {
+            Some(api) => gateway.with_credential_crypto_api(api),
+            None => gateway,
         };
         let gateway = Arc::new(gateway);
         #[cfg(feature = "agent-api")]

@@ -1,4 +1,7 @@
 //! Transport and fixed-ID mapping checks; no live Platform claim.
+#[cfg(feature = "mock-e2e")]
+#[path = "credential_crypto_tests.rs"]
+mod credential_crypto_tests;
 use super::*;
 use crate::ingress::{
     agent_api::AgentApi,

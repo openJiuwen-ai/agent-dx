@@ -10,7 +10,7 @@ case "$component" in
     export RUST_TEST_THREADS=1
     ;;
   gateway)
-    packages=(adx-apiserver data-plane-gateway adx-agent-core adx-agent-store adx-agent-api adx-activator adx-cli)
+    packages=(adx-apiserver data-plane-gateway adx-agent-core adx-agent-store adx-agent-api adx-activator adx-cli adx-credential-crypto)
     ;;
   execd)
     packages=(adx-execd)

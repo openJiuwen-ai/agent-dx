@@ -25,6 +25,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",
@@ -200,6 +201,32 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 1.0.69",
+]
+
+[[package]]
+name = "adx-credential-crypto"
+version = "0.1.0"
+dependencies = [
+ "adx-activator",
+ "adx-agent-core",
+ "adx-agent-store",
+ "adx-transport",
+ "async-trait",
+ "axum 0.7.9",
+ "base64 0.22.1",
+ "clap",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "reqwest 0.12.28",
+ "ring",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tower 0.5.3",
+ "zeroize",
 ]
 
 [[package]]
@@ -1392,6 +1419,7 @@ dependencies = [
  "adx-agent-core",
  "adx-agent-store",
  "adx-core",
+ "adx-credential-crypto",
  "adx-discovery",
  "adx-observability",
  "adx-process",

@@ -67,6 +67,13 @@ impl LocalControl {
 
 #[async_trait]
 impl Control for LocalControl {
+    async fn verify_service_grant(
+        &self,
+        _ctx: &RequestContext,
+        request: &adx_agent_core::service_grants::VerifyServiceGrant,
+    ) -> Result<adx_agent_core::service_grants::ServiceGrantDecision> {
+        self.activator.verify_service_grant(request).await
+    }
     async fn resolve(
         &self,
         ctx: &RequestContext,

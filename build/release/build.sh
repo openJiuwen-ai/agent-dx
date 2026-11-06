@@ -42,10 +42,10 @@ esac
 stage=$(mktemp -d "${TMPDIR:-/tmp}/adx-build.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
 echo "--- :rust: Compile control plane, gateway and EXECD"
-cargo build --locked --release -j "$JOBS" -p adx-activator -p adx-apiserver -p adx-deployment -p adx-coordinator -p adxlet -p adx-execd --bins
+cargo build --locked --release -j "$JOBS" -p adx-credential-crypto -p adx-activator -p adx-apiserver -p adx-deployment -p adx-coordinator -p adxlet -p adx-execd --bins
 cargo build --locked --release -j "$JOBS" \
   -p data-plane-gateway --features agent-api --bin adx-ingress --bin adx-relay
-for name in adx-activator adx-apiserver adx-ingress adx-relay adxctl adx-inspect adx-coordinator adxlet adx-execd; do
+for name in adx-credential-crypto adx-activator adx-apiserver adx-ingress adx-relay adxctl adx-inspect adx-coordinator adxlet adx-execd; do
  cp "$CARGO_TARGET_DIR/release/$name" "$stage/$name"
 done
 if [[ "$ADX_WITH_AFS" == "1" ]]; then
