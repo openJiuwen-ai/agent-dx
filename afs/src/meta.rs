@@ -206,6 +206,7 @@ pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
             ),
         )
         .with_gc_grace_ms(cfg.dfs_gc_grace_ms);
+        service.gc_metrics().register(&obs.registry)?;
         if cfg.dfs {
             service.initialize_replication_config().await?;
         }

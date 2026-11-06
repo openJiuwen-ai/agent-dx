@@ -52,6 +52,7 @@ pub struct DfsService {
     durability_policy: DfsDurabilityPolicy,
     read_grant_key: Arc<Option<[u8; 32]>>,
     gc_grace_ms: u64,
+    gc_metrics: gc::GcMetrics,
     gc_reference_updates: Arc<[tokio::sync::Mutex<()>; GC_REFERENCE_LOCK_SHARDS]>,
 }
 
@@ -115,6 +116,7 @@ impl DfsService {
             durability_policy,
             read_grant_key: Arc::new(read_grant_key),
             gc_grace_ms: 1_000,
+            gc_metrics: gc::GcMetrics::new().expect("fixed GC metric descriptors are valid"),
             gc_reference_updates: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(()))),
         }
     }

@@ -22,6 +22,92 @@ const ADMISSION_CLOCK_SKEW_MS: u64 = 60_000;
 /// as the configured data grace protects their content (plan_collection
 /// deletes them at max(grace, this value)), so a long grace is honored.
 const REFERENCE_RECORD_RETENTION_MS: u64 = ADMISSION_HORIZON_MS + ADMISSION_CLOCK_SKEW_MS;
+/// Process-local GC progress for operators. A generation that stays open with
+/// waiting nodes is the stall to alert on (`generation_age_seconds`); it is
+/// refreshed by every collection call, and any live storage node calls every
+/// few seconds. Restarting Meta restarts the age.
+#[derive(Clone)]
+pub(crate) struct GcMetrics {
+    pub(crate) generation: afs_metrics::IntGauge,
+    pub(crate) waiting_nodes: afs_metrics::IntGauge,
+    pub(crate) pending_chunks: afs_metrics::IntGauge,
+    pub(crate) generation_age_seconds: afs_metrics::IntGauge,
+    pub(crate) dropped_nodes: afs_metrics::IntCounter,
+    pub(crate) retired_references: afs_metrics::IntCounter,
+    open_generation: Arc<std::sync::Mutex<Option<(u64, std::time::Instant)>>>,
+}
+
+impl GcMetrics {
+    pub(crate) fn new() -> std::result::Result<Self, afs_metrics::MetricsError> {
+        Ok(Self {
+            generation: afs_metrics::IntGauge::new(
+                "afs_meta_dfs_gc_generation",
+                "Current DFS GC generation",
+            )?,
+            waiting_nodes: afs_metrics::IntGauge::new(
+                "afs_meta_dfs_gc_waiting_nodes",
+                "Live storage nodes that have not finished the current DFS GC generation",
+            )?,
+            pending_chunks: afs_metrics::IntGauge::new(
+                "afs_meta_dfs_gc_pending_chunks",
+                "Chunks behind the current DFS GC deletion barrier",
+            )?,
+            generation_age_seconds: afs_metrics::IntGauge::new(
+                "afs_meta_dfs_gc_generation_age_seconds",
+                "How long this Meta process has seen the current DFS GC generation waiting; 0 when none waits",
+            )?,
+            dropped_nodes: afs_metrics::IntCounter::new(
+                "afs_meta_dfs_gc_dropped_nodes_total",
+                "Nodes removed from a DFS GC generation's waiting set because their session expired",
+            )?,
+            retired_references: afs_metrics::IntCounter::new(
+                "afs_meta_dfs_gc_retired_references_total",
+                "GC references retired because their node session is no longer current and live",
+            )?,
+            open_generation: Arc::new(std::sync::Mutex::new(None)),
+        })
+    }
+
+    pub(crate) fn register(
+        &self,
+        registry: &afs_metrics::Registry,
+    ) -> std::result::Result<(), afs_metrics::MetricsError> {
+        afs_metrics::register_collector(registry, &self.generation)?;
+        afs_metrics::register_collector(registry, &self.waiting_nodes)?;
+        afs_metrics::register_collector(registry, &self.pending_chunks)?;
+        afs_metrics::register_collector(registry, &self.generation_age_seconds)?;
+        afs_metrics::register_collector(registry, &self.dropped_nodes)?;
+        afs_metrics::register_collector(registry, &self.retired_references)
+    }
+
+    fn observe(&self, gc: &GcState) {
+        self.generation
+            .set(i64::try_from(gc.generation).unwrap_or(i64::MAX));
+        self.waiting_nodes
+            .set(i64::try_from(gc.waiting_nodes.len()).unwrap_or(i64::MAX));
+        self.pending_chunks
+            .set(i64::try_from(gc.chunks.len()).unwrap_or(i64::MAX));
+        let Ok(mut open) = self.open_generation.lock() else {
+            return;
+        };
+        if gc.waiting_nodes.is_empty() {
+            *open = None;
+            self.generation_age_seconds.set(0);
+            return;
+        }
+        let since = match *open {
+            Some((generation, since)) if generation == gc.generation => since,
+            _ => {
+                let since = std::time::Instant::now();
+                *open = Some((gc.generation, since));
+                since
+            }
+        };
+        self.generation_age_seconds
+            .set(i64::try_from(since.elapsed().as_secs()).unwrap_or(i64::MAX));
+    }
+}
+
 #[derive(Default)]
 struct GcPlan {
     keys: Vec<MetaKey>,
@@ -214,6 +300,10 @@ impl DfsService {
     pub fn with_gc_grace_ms(mut self, grace: u64) -> Self {
         self.gc_grace_ms = grace;
         self
+    }
+
+    pub(crate) fn gc_metrics(&self) -> &GcMetrics {
+        &self.gc_metrics
     }
     pub async fn update_gc_reference(&self, mut update: UpdateGcReference) -> Result<()> {
         require_id(&update.node_id, "node_id")?;
@@ -426,6 +516,20 @@ impl DfsService {
         completed: u64,
         inventory: Vec<ChunkObject>,
     ) -> Result<GcState> {
+        let gc = self
+            .collect_garbage_attempts(node, session, completed, inventory)
+            .await?;
+        self.gc_metrics.observe(&gc);
+        Ok(gc)
+    }
+
+    async fn collect_garbage_attempts(
+        &self,
+        node: String,
+        session: String,
+        completed: u64,
+        inventory: Vec<ChunkObject>,
+    ) -> Result<GcState> {
         if self.is_external_backend() {
             return Err(invalid("native collection requires NodeReplicated storage"));
         }
@@ -437,46 +541,24 @@ impl DfsService {
             let (revision, mut entities) = view.snapshot()?;
             live_caller(&entities, &node, &session)?;
             let mut gc = gc_state(&entities);
-            // A new session fences the old process. Keep its pins through the old
-            // authority deadline plus the normal read-grant grace; heartbeat loss
-            // alone never retires a reader.
-            let mut mutations = Vec::new();
             let now = now_unix_ms();
-            let old_deadlines = entities
-                .iter()
-                .filter_map(|entity| match entity {
-                    MetaEntity::NodeSession(value)
-                        if value.node_id == node && value.session_id != session =>
-                    {
-                        Some((value.session_id.clone(), value.expires_at_unix_ms))
-                    }
-                    _ => None,
-                })
-                .collect::<std::collections::BTreeMap<_, _>>();
-            for entity in &mut entities {
-                if let MetaEntity::DfsReference(reference) = entity
-                    && reference.node_id == node
-                    && reference.session_id != session
-                    && reference.retired_at_unix_ms.is_none()
-                {
-                    reference.retired_at_unix_ms = Some(
-                        old_deadlines
-                            .get(&reference.session_id)
-                            .copied()
-                            .unwrap_or(now)
-                            .max(now),
-                    );
-                    mutations.push(TxnMutation::Put(entity.clone()));
-                }
-            }
+            let participants = gc_participants(&entities, now);
+            let mut mutations = Vec::new();
+            let retired = retire_departed_references(&mut entities, now, &mut mutations);
             if completed > gc.generation {
                 return Err(conflict(
                     "Meta GC generation is older than durable Node progress",
                 ));
             }
             if !gc.waiting_nodes.is_empty() {
-                if completed == gc.generation && gc.waiting_nodes.contains(&node) {
+                let waiting = gc.waiting_nodes.len();
+                gc.waiting_nodes
+                    .retain(|value| participants.contains(value));
+                let dropped = waiting - gc.waiting_nodes.len();
+                if completed == gc.generation {
                     gc.waiting_nodes.retain(|value| value != &node);
+                }
+                if gc.waiting_nodes.len() != waiting {
                     if gc.waiting_nodes.is_empty() {
                         gc.chunks.clear();
                     }
@@ -489,6 +571,8 @@ impl DfsService {
                 {
                     continue;
                 }
+                self.gc_metrics.dropped_nodes.inc_by(dropped as u64);
+                self.gc_metrics.retired_references.inc_by(retired);
                 return Ok(gc);
             }
             for chunk in &inventory {
@@ -522,28 +606,104 @@ impl DfsService {
                 .checked_add(1)
                 .ok_or_else(|| conflict("GC generation exhausted"))?;
             gc.chunks = plan.chunks;
-            if !gc.chunks.is_empty() {
-                gc.waiting_nodes = entities
-                    .iter()
-                    .filter_map(|entity| match entity {
-                        MetaEntity::NodeSession(value) => Some(value.node_id.clone()),
-                        _ => None,
-                    })
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect();
+            gc.waiting_nodes = if gc.chunks.is_empty() {
+                Vec::new()
+            } else {
+                participants.into_iter().collect()
+            };
+            if gc.waiting_nodes.is_empty() {
+                // No live storage node holds local copies to retire.
+                gc.chunks.clear();
             }
             mutations.push(TxnMutation::Put(MetaEntity::DfsGc(gc.clone())));
             if self
                 .gc_commit(revision, StoreOperation::DfsCollectGarbage, mutations)
                 .await?
             {
+                self.gc_metrics.retired_references.inc_by(retired);
                 return Ok(gc);
             }
         }
         Err(conflict("garbage collection contention"))
     }
 }
+
+/// Each node's current session: the highest lease epoch among its sessions.
+fn current_sessions(entities: &[MetaEntity]) -> std::collections::BTreeMap<&str, &NodeSession> {
+    let mut current = std::collections::BTreeMap::<&str, &NodeSession>::new();
+    for entity in entities {
+        if let MetaEntity::NodeSession(value) = entity {
+            let slot = current.entry(value.node_id.as_str()).or_insert(value);
+            if value.lease_epoch > slot.lease_epoch {
+                *slot = value;
+            }
+        }
+    }
+    current
+}
+
+/// The nodes a GC generation waits for (R55): a node whose current session is
+/// live at `now` and registered a storage device, the same rule as repair
+/// placement. A node that is not live has fail-closed (heartbeat loss stops it
+/// before its lease ends) and serves no copy; when it returns, its leftover
+/// files are unknown to Meta, come back through its inventory and are
+/// collected in a later generation. A node without storage (OwnerFs only) runs
+/// no Collector and is never waited for.
+fn gc_participants(entities: &[MetaEntity], now: u64) -> BTreeSet<String> {
+    current_sessions(entities)
+        .into_iter()
+        .filter(|(_, session)| {
+            session.is_live_at_unix_ms(now) && !session.storage_devices.is_empty()
+        })
+        .map(|(node, _)| node.to_owned())
+        .collect()
+}
+
+/// Retires every unretired reference whose session is no longer its node's
+/// current live session: the node restarted (the old process is fenced) or
+/// its session expired (the process fail-closed). Retirement keeps protecting
+/// the inode through the old session's deadline plus the normal read grace.
+fn retire_departed_references(
+    entities: &mut [MetaEntity],
+    now: u64,
+    mutations: &mut Vec<TxnMutation>,
+) -> u64 {
+    let live_sessions = current_sessions(entities)
+        .into_iter()
+        .filter(|(_, session)| session.is_live_at_unix_ms(now))
+        .map(|(node, session)| (node.to_owned(), session.session_id.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let deadlines = entities
+        .iter()
+        .filter_map(|entity| match entity {
+            MetaEntity::NodeSession(value) => Some((
+                (value.node_id.clone(), value.session_id.clone()),
+                value.expires_at_unix_ms,
+            )),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut retired = 0;
+    for entity in entities {
+        if let MetaEntity::DfsReference(reference) = entity
+            && reference.retired_at_unix_ms.is_none()
+            && match live_sessions.get(&reference.node_id) {
+                Some(session) => session != &reference.session_id,
+                None => deadlines.keys().any(|(node, _)| node == &reference.node_id),
+            }
+        {
+            let deadline = deadlines
+                .get(&(reference.node_id.clone(), reference.session_id.clone()))
+                .copied()
+                .unwrap_or(now);
+            reference.retired_at_unix_ms = Some(deadline.max(now));
+            mutations.push(TxnMutation::Put(entity.clone()));
+            retired += 1;
+        }
+    }
+    retired
+}
+
 #[cfg(test)]
 #[path = "gc_tests.rs"]
 mod tests;

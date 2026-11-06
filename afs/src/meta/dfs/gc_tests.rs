@@ -334,6 +334,15 @@ fn generation_reference_does_not_protect_another_write() {
     );
 }
 
+fn storage_device(node: &str) -> crate::dfs::StorageDeviceDescriptor {
+    crate::dfs::StorageDeviceDescriptor {
+        device_id: format!("{node}-device"),
+        device_epoch: 1,
+        catalog_revision: 1,
+        failure_domain: format!("{node}-domain"),
+    }
+}
+
 async fn seeded_store(
     entities: Vec<MetaEntity>,
 ) -> (
@@ -353,7 +362,7 @@ async fn seeded_store(
                 data_addr: "http://n:2".into(),
                 rest_addr: "http://n:3".into(),
                 ownerfs_enabled: false,
-                storage_devices: vec![],
+                storage_devices: vec![storage_device("n")],
                 lease_ttl: std::time::Duration::from_secs(30),
             },
         )
@@ -668,7 +677,7 @@ async fn session_replacement_retires_only_fenced_refs_after_the_old_authority_de
     assert!(service.update_gc_reference(wrong).await.is_err());
 }
 #[test]
-fn heartbeat_expiry_without_session_replacement_never_retires_an_open_reader() {
+fn an_unretired_reference_protects_its_inode_at_any_time() {
     let reference = pin("i");
     let mut entities = vec![inode("i", 0, "v"), chunk("live")];
     entities.extend(version("v", "i", "live"));
@@ -743,4 +752,256 @@ async fn active_publication_outlives_admission_but_cannot_change_identity() {
     let mut reused = update("writer");
     reused.inode_id = Some(InodeId::new("different"));
     assert!(service.update_gc_reference(reused).await.is_err());
+}
+
+async fn register(
+    store: &crate::meta::store::Store,
+    node: &str,
+    session: &str,
+    ttl: std::time::Duration,
+    devices: Vec<crate::dfs::StorageDeviceDescriptor>,
+) {
+    store
+        .register_node_session(
+            RequestKey::new(node, session),
+            crate::meta::store::NodeSessionLease {
+                node_id: node.into(),
+                session_id: session.into(),
+                grpc_addr: "http://x:1".into(),
+                data_addr: "http://x:2".into(),
+                rest_addr: "http://x:3".into(),
+                ownerfs_enabled: false,
+                storage_devices: devices,
+                lease_ttl: ttl,
+            },
+        )
+        .await
+        .unwrap();
+}
+
+fn distinct_chunk(body: &[u8]) -> ChunkObject {
+    ChunkObject::from_content_addressed_id(&ChunkId::new(format!(
+        "blake3-{}-{}",
+        blake3::hash(body).to_hex(),
+        body.len()
+    )))
+    .unwrap()
+}
+
+fn gc_service(store: Arc<crate::meta::store::Store>) -> DfsService {
+    DfsService::with_replication_config(store, ReplicationConfig::local_single_copy())
+        .with_gc_grace_ms(0)
+}
+
+const SHORT_LEASE: std::time::Duration = std::time::Duration::from_millis(150);
+const PAST_SHORT_LEASE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// R55（S0 Q02）：开代后一个等待节点失联，存活节点的下一次调用把它剔除，这一代结束；
+/// 之后的代只等存活节点。修复前这一代永远结束不了，之后的删除永不回收。
+#[tokio::test]
+async fn an_expired_waiter_no_longer_stalls_gc() {
+    let first = distinct_chunk(b"first");
+    let second = distinct_chunk(b"second");
+    let (store, _) = seeded_store(vec![]).await;
+    register(&store, "m", "m1", SHORT_LEASE, vec![storage_device("m")]).await;
+    let service = gc_service(store.clone());
+    let ticket = service
+        .collect_garbage("n".into(), "s".into(), 0, vec![first.clone()])
+        .await
+        .unwrap();
+    assert_eq!(ticket.waiting_nodes, vec!["m".to_owned(), "n".to_owned()]);
+    assert_eq!(ticket.chunks, vec![first.id.clone()]);
+
+    tokio::time::sleep(PAST_SHORT_LEASE).await;
+    let acked = service
+        .collect_garbage("n".into(), "s".into(), ticket.generation, vec![])
+        .await
+        .unwrap();
+    assert!(acked.waiting_nodes.is_empty(), "{acked:?}");
+    assert!(acked.chunks.is_empty(), "the deletion barrier is lifted");
+
+    let next = service
+        .collect_garbage(
+            "n".into(),
+            "s".into(),
+            ticket.generation,
+            vec![second.clone()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.generation, ticket.generation + 1);
+    assert_eq!(next.waiting_nodes, vec!["n".to_owned()]);
+    assert_eq!(next.chunks, vec![second.id]);
+}
+
+/// 只有持有存储设备的存活节点才进等待集合：OwnerFs-only 节点不运行 Collector，等它就是永久停摆。
+#[tokio::test]
+async fn nodes_without_storage_devices_are_not_waited_for() {
+    let chunk = canonical_chunk();
+    let (store, _) = seeded_store(vec![]).await;
+    register(
+        &store,
+        "ownerfs",
+        "o1",
+        std::time::Duration::from_secs(30),
+        vec![],
+    )
+    .await;
+    let service = gc_service(store.clone());
+    let ticket = service
+        .collect_garbage("n".into(), "s".into(), 0, vec![chunk])
+        .await
+        .unwrap();
+    assert_eq!(ticket.waiting_nodes, vec!["n".to_owned()]);
+}
+
+/// R55：失联节点持有的引用按会话过期退休（任何存活节点的调用都能做），它保护的已 unlink
+/// inode 在宽限后回收。修复前只有该节点自己的新会话能退休，永不回来就永不回收。
+#[tokio::test]
+async fn references_of_an_expired_session_retire_and_release_their_inode() {
+    let chunk = canonical_chunk();
+    let mut reference = pin("i");
+    reference.node_id = "m".into();
+    reference.session_id = "m1".into();
+    let mut entities = vec![
+        inode("i", 0, "v"),
+        MetaEntity::DfsChunk(chunk.clone()),
+        MetaEntity::DfsReference(reference),
+    ];
+    entities.extend(version("v", "i", &chunk.id.0));
+    let (store, _) = seeded_store(entities).await;
+    register(&store, "m", "m1", SHORT_LEASE, vec![storage_device("m")]).await;
+    let service = gc_service(store.clone());
+    let live = service
+        .collect_garbage("n".into(), "s".into(), 0, vec![])
+        .await
+        .unwrap();
+    assert!(
+        live.chunks.is_empty(),
+        "a live session's reference protects"
+    );
+
+    tokio::time::sleep(PAST_SHORT_LEASE).await;
+    service
+        .collect_garbage("n".into(), "s".into(), 0, vec![])
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+    let reclaimed = service
+        .collect_garbage("n".into(), "s".into(), 0, vec![])
+        .await
+        .unwrap();
+    assert_eq!(reclaimed.chunks, vec![chunk.id]);
+    assert_eq!(reclaimed.waiting_nodes, vec!["n".to_owned()]);
+}
+
+/// 节点缺席若干代后以新会话回来：它盘上的块 Meta 已不认识，经 inventory 重新登记并回收，
+/// 它落后的 generation 不妨碍参与新一代。
+#[tokio::test]
+async fn a_node_absent_for_generations_catches_up_through_inventory() {
+    let orphan = distinct_chunk(b"left on the absent node");
+    let (store, _) = seeded_store(vec![]).await;
+    register(&store, "m", "m1", SHORT_LEASE, vec![storage_device("m")]).await;
+    let service = gc_service(store.clone());
+    tokio::time::sleep(PAST_SHORT_LEASE).await;
+    let mut completed = 0;
+    for body in [b"one".as_slice(), b"two".as_slice()] {
+        let ticket = service
+            .collect_garbage(
+                "n".into(),
+                "s".into(),
+                completed,
+                vec![distinct_chunk(body)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(ticket.waiting_nodes, vec!["n".to_owned()]);
+        completed = ticket.generation;
+        service
+            .collect_garbage("n".into(), "s".into(), completed, vec![])
+            .await
+            .unwrap();
+    }
+
+    register(
+        &store,
+        "m",
+        "m2",
+        std::time::Duration::from_secs(30),
+        vec![storage_device("m")],
+    )
+    .await;
+    let ticket = service
+        .collect_garbage("m".into(), "m2".into(), 0, vec![orphan.clone()])
+        .await
+        .unwrap();
+    assert_eq!(ticket.generation, completed + 1);
+    assert_eq!(ticket.chunks, vec![orphan.id]);
+    assert_eq!(ticket.waiting_nodes, vec!["m".to_owned(), "n".to_owned()]);
+    let acked = service
+        .collect_garbage("m".into(), "m2".into(), ticket.generation, vec![])
+        .await
+        .unwrap();
+    assert_eq!(acked.waiting_nodes, vec!["n".to_owned()]);
+}
+
+/// 指标能看见停滞：一代等一个活着但不确认的节点时，等待数非零、代龄增长；失联节点被剔除时
+/// 计数增加。
+#[tokio::test]
+async fn gc_stall_metrics_track_the_waiting_generation() {
+    let chunk = canonical_chunk();
+    let (store, _) = seeded_store(vec![]).await;
+    register(
+        &store,
+        "stuck",
+        "st1",
+        std::time::Duration::from_secs(30),
+        vec![storage_device("stuck")],
+    )
+    .await;
+    register(
+        &store,
+        "gone",
+        "g1",
+        SHORT_LEASE,
+        vec![storage_device("gone")],
+    )
+    .await;
+    let service = gc_service(store.clone());
+    let ticket = service
+        .collect_garbage("n".into(), "s".into(), 0, vec![chunk])
+        .await
+        .unwrap();
+    assert_eq!(
+        service.gc_metrics().generation.get(),
+        ticket.generation as i64
+    );
+    assert_eq!(service.gc_metrics().waiting_nodes.get(), 3);
+    assert_eq!(service.gc_metrics().pending_chunks.get(), 1);
+    assert_eq!(service.gc_metrics().dropped_nodes.get(), 0);
+
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    service
+        .collect_garbage("n".into(), "s".into(), ticket.generation, vec![])
+        .await
+        .unwrap();
+    assert_eq!(
+        service.gc_metrics().waiting_nodes.get(),
+        1,
+        "only the stuck node"
+    );
+    assert_eq!(
+        service.gc_metrics().dropped_nodes.get(),
+        1,
+        "gone was dropped"
+    );
+    assert!(service.gc_metrics().generation_age_seconds.get() >= 1);
+
+    // The generation ends: nothing stalls any more.
+    service
+        .collect_garbage("stuck".into(), "st1".into(), ticket.generation, vec![])
+        .await
+        .unwrap();
+    assert_eq!(service.gc_metrics().waiting_nodes.get(), 0);
+    assert_eq!(service.gc_metrics().generation_age_seconds.get(), 0);
 }

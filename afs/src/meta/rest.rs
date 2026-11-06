@@ -45,7 +45,11 @@ async fn store_statistics(
     let mut statistics = view.statistics()?;
     let snapshot = view.read(MetaRead::DfsGc).await?;
     if let Some(MetaEntity::DfsGc(gc)) = snapshot.entity {
-        statistics["gc"] = json!({"generation":gc.generation,"pending_chunks":gc.chunks.len(),"waiting_nodes":gc.waiting_nodes});
+        let age = meta
+            .dfs
+            .as_ref()
+            .map_or(0, |dfs| dfs.gc_metrics().generation_age_seconds.get());
+        statistics["gc"] = json!({"generation":gc.generation,"pending_chunks":gc.chunks.len(),"waiting_nodes":gc.waiting_nodes,"generation_age_seconds":age});
     }
     Ok(Json(statistics))
 }

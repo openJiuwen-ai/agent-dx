@@ -881,6 +881,18 @@ inode、FileVersion、LayoutRoot 与数据块，两层职责不混用。
 
 - 有链接的 inode 当前版本是保留根。打开的文件／目录使用持久引用；文件的在途访问共享同一引用，
   最后一个使用者退出才排队释放。有效写租约、尚未提交的上传与复制任务也构成保留根。
+- 一代回收只等**存活的存储节点**：节点的当前会话（最高租约代）未过期且登记了存储设备。
+  Node 的心跳失败 25 秒内自行停止，先于 30 秒会话租约结束，过期会话也不能续期，所以会话过期
+  即视为进程已退出：它从当前一代的等待集合中剔除（任何存活节点的下一次回收调用都会做），不再
+  阻塞之后的回收。同一 node_id 以新会话回来时，盘上残留的块已不在 Meta 中，经 inventory 重新
+  登记，在之后的一代回收。OwnerFs-only 节点不运行 Collector，从不进入等待集合。`NodeSession`
+  记录本身不删除（OwnerFs 恢复依赖）。
+- 会话已不是其节点当前存活会话（节点换了会话或会话过期）时，该会话持有的打开引用与写引用由
+  任何存活节点的回收调用退休，并继续保护到旧会话期限加宽限。
+- 回收停滞看 `afs_meta_dfs_gc_generation_age_seconds`（当前一代已等待的时长，Meta 重启后
+  重新计时）、`afs_meta_dfs_gc_waiting_nodes`、`afs_meta_dfs_gc_pending_chunks`；
+  `afs_meta_dfs_gc_dropped_nodes_total` 与 `afs_meta_dfs_gc_retired_references_total` 记录因
+  失联被剔除的节点与被退休的引用。
 - 最后一个写句柄关闭后，即使数据已提交且序号相同，也后台提交剩余元数据；提交结果未确认时保留
   原请求和写租约，确认干净后停止续租，避免已 unlink 文件因时间戳脏状态永久保留历史。
 - COW 目标布局直接引用共享 chunk；源文件删除不改变目标的所有权。`parent_version` 仅记录血缘，
