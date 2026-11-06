@@ -50,6 +50,25 @@ impl Role {
         }
     }
 }
+
+/// Whether stopping the deployment first deletes its locally owned Environments.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShutdownMode {
+    #[default]
+    Preserve,
+    Drain,
+}
+
+impl std::fmt::Display for ShutdownMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Preserve => "preserve",
+            Self::Drain => "drain",
+        })
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Service {
@@ -156,6 +175,8 @@ pub struct Deployment {
     pub namespace: String,
     pub restart_delay_ms: u64,
     pub stop_timeout_seconds: u64,
+    #[serde(default)]
+    pub shutdown_mode: ShutdownMode,
     pub services: Vec<Service>,
 }
 
@@ -245,6 +266,8 @@ struct ProfileDeployment {
     restart_delay_ms: Option<u64>,
     #[serde(default)]
     stop_timeout_seconds: Option<u64>,
+    #[serde(default)]
+    shutdown_mode: Option<ShutdownMode>,
     #[serde(default)]
     logging: Option<Value>,
     #[serde(default)]
@@ -859,6 +882,9 @@ fn resolve_profile(input: ProfileDeployment) -> Result<Deployment> {
     }
     if let Some(value) = input.stop_timeout_seconds {
         deployment.stop_timeout_seconds = value;
+    }
+    if let Some(value) = input.shutdown_mode {
+        deployment.shutdown_mode = value;
     }
     if let Some(patch) = input.logging {
         let mut logging = serde_json::to_value(&deployment.logging)?;

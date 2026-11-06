@@ -12,6 +12,33 @@ fn creating_spec() -> EnvironmentSpec {
 }
 
 #[tokio::test]
+async fn shutdown_reports_keep_advancing_without_reopening_admission_or_unregistering() {
+    let node = authority::manager(Arc::new(Runtime::default()));
+    let mut authority = authority::Fixture::new().await;
+    authority.cycle(&node).await.unwrap();
+    assert!(node.accepting_allocations());
+    let before = authority.authority.reports.lock().unwrap().len();
+    node.begin_shutdown().unwrap();
+    // A periodic capacity/maintenance update must not reopen process shutdown.
+    node.set_maintenance(false);
+    for _ in 0..3 {
+        authority.cycle(&node).await.unwrap();
+        assert!(!node.accepting_allocations());
+        assert!(node.reserve_local(&creating_spec()).is_err());
+    }
+    let reports = authority.authority.reports.lock().unwrap();
+    assert!(reports.len() >= before + 3);
+    assert!(reports[before..]
+        .iter()
+        .all(|report| !report.accepting_allocations));
+    assert!(reports.windows(2).all(|pair| {
+        pair[1].heartbeat_sequence > pair[0].heartbeat_sequence
+            && pair[1].session_id == pair[0].session_id
+    }));
+    assert!(authority.authority.departures.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn live_catalog_fetch_does_not_reject_or_wait_for_new_creation() {
     let node = authority::manager(Arc::new(Runtime::default()));
     let mut authority = authority::Fixture::new().await;
@@ -314,9 +341,43 @@ async fn expired_capacity_observation_keeps_last_capacity_for_creation() {
 }
 
 #[tokio::test]
+async fn preserve_shutdown_retains_session_without_contacting_departure_rpc() {
+    for previously_draining in [false, true] {
+        let node = authority::manager(Arc::new(Runtime::default()));
+        let mut fixture = authority::Fixture::new().await;
+        fixture.cycle(&node).await.unwrap();
+        if previously_draining {
+            node.drain().await.unwrap();
+        }
+        node.begin_shutdown().unwrap();
+        fixture
+            .authority
+            .stall_unregister
+            .store(true, Ordering::SeqCst);
+        adxlet::node_reconciliation::finish_shutdown(
+            adxlet::proxy::ShutdownMode::Preserve,
+            &mut fixture.client,
+            &fixture.registration,
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap();
+        assert!(
+            fixture.authority.departures.lock().unwrap().is_empty(),
+            "prior drain cannot override the current preserve intent"
+        );
+        assert!(!node.accepting_allocations());
+    }
+}
+
+#[tokio::test]
 async fn planned_departure_uses_exact_identity_and_bounds_unavailable_coordinator() {
+    let node = authority::manager(Arc::new(Runtime::default()));
     let mut fixture = authority::Fixture::new().await;
-    adxlet::node_reconciliation::unregister_node(
+    fixture.cycle(&node).await.unwrap();
+    node.drain().await.unwrap();
+    adxlet::node_reconciliation::finish_shutdown(
+        adxlet::proxy::ShutdownMode::Drain,
         &mut fixture.client,
         &fixture.registration,
         Duration::from_millis(100),
@@ -332,7 +393,8 @@ async fn planned_departure_uses_exact_identity_and_bounds_unavailable_coordinato
         .stall_unregister
         .store(true, Ordering::SeqCst);
     let started = std::time::Instant::now();
-    let error = adxlet::node_reconciliation::unregister_node(
+    let error = adxlet::node_reconciliation::finish_shutdown(
+        adxlet::proxy::ShutdownMode::Drain,
         &mut fixture.client,
         &fixture.registration,
         Duration::from_millis(20),
