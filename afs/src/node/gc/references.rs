@@ -38,10 +38,44 @@ pub struct GcBatch {
     pub state: GcState,
     pub list_external_inventory: bool,
 }
+/// Release backlog as operators see it. Registered once per Node.
+#[derive(Clone)]
+pub(crate) struct GcReleaseMetrics {
+    pending: afs_metrics::IntGauge,
+    released: afs_metrics::IntCounter,
+    failures: afs_metrics::IntCounter,
+}
+
+impl GcReleaseMetrics {
+    pub(crate) fn register(
+        registry: &afs_metrics::Registry,
+    ) -> std::result::Result<Self, afs_metrics::MetricsError> {
+        let metrics = Self {
+            pending: afs_metrics::IntGauge::new(
+                "afs_dfs_gc_release_pending",
+                "GC references dropped by this Node and not yet released at Meta",
+            )?,
+            released: afs_metrics::IntCounter::new(
+                "afs_dfs_gc_released_total",
+                "GC references this Node released at Meta",
+            )?,
+            failures: afs_metrics::IntCounter::new(
+                "afs_dfs_gc_release_failures_total",
+                "GC release calls that failed and stay queued",
+            )?,
+        };
+        afs_metrics::register_collector(registry, &metrics.pending)?;
+        afs_metrics::register_collector(registry, &metrics.released)?;
+        afs_metrics::register_collector(registry, &metrics.failures)?;
+        Ok(metrics)
+    }
+}
+
 pub struct GcReferences {
     pub control: Arc<dyn GcControl>,
     pending: Mutex<Vec<String>>,
     sequence: AtomicU64,
+    metrics: Option<GcReleaseMetrics>,
 }
 pub struct GcPin {
     fence: Option<crate::dfs::GcFence>,
@@ -63,17 +97,35 @@ impl Drop for GcPin {
     fn drop(&mut self) {
         if let Ok(mut pending) = self.owner.pending.lock() {
             pending.push(self.id.clone());
+            self.owner.observe_pending(pending.len());
         }
         // Poisoning keeps the durable reference; it never authorizes deletion.
     }
 }
 impl GcReferences {
     pub fn new(control: Arc<dyn GcControl>) -> Arc<Self> {
+        Self::build(control, None)
+    }
+    pub(crate) fn with_metrics(
+        control: Arc<dyn GcControl>,
+        metrics: GcReleaseMetrics,
+    ) -> Arc<Self> {
+        Self::build(control, Some(metrics))
+    }
+    fn build(control: Arc<dyn GcControl>, metrics: Option<GcReleaseMetrics>) -> Arc<Self> {
         Arc::new(Self {
             control,
             pending: Mutex::new(Vec::new()),
             sequence: AtomicU64::new(1),
+            metrics,
         })
+    }
+    fn observe_pending(&self, pending: usize) {
+        if let Some(metrics) = &self.metrics {
+            metrics
+                .pending
+                .set(i64::try_from(pending).unwrap_or(i64::MAX));
+        }
     }
     pub fn pin(
         self: &Arc<Self>,
@@ -134,17 +186,24 @@ impl GcReferences {
                 Error::coded(afs_error::IO_UNAVAILABLE, "GC release queue poisoned")
             })?;
             let count = queue.len().min(64);
-            queue.drain(..count).collect::<Vec<_>>()
+            let drained = queue.drain(..count).collect::<Vec<_>>();
+            self.observe_pending(queue.len());
+            drained
         };
         for (index, id) in pending.iter().enumerate() {
             if let Err(error) = self.control.release(id) {
-                self.pending
-                    .lock()
-                    .map_err(|_| {
-                        Error::coded(afs_error::IO_UNAVAILABLE, "GC release queue poisoned")
-                    })?
-                    .extend(pending[index..].iter().cloned());
+                let mut queue = self.pending.lock().map_err(|_| {
+                    Error::coded(afs_error::IO_UNAVAILABLE, "GC release queue poisoned")
+                })?;
+                queue.extend(pending[index..].iter().cloned());
+                self.observe_pending(queue.len());
+                if let Some(metrics) = &self.metrics {
+                    metrics.failures.inc();
+                }
                 return Err(error);
+            }
+            if let Some(metrics) = &self.metrics {
+                metrics.released.inc();
             }
         }
         Ok(())
@@ -191,6 +250,20 @@ mod tests {
         assert_eq!(control.releases.lock().unwrap().len(), 1);
         references.flush().unwrap();
         assert_eq!(control.releases.lock().unwrap().len(), 1);
+    }
+    #[test]
+    fn release_backlog_is_visible_as_metrics() {
+        let registry = afs_metrics::registry();
+        let metrics = GcReleaseMetrics::register(&registry).unwrap();
+        let control = Arc::new(Control::default());
+        let references = GcReferences::with_metrics(control.clone(), metrics.clone());
+        for _ in 0..3 {
+            drop(references.pin(&InodeId::new("i"), None).unwrap());
+        }
+        assert_eq!(metrics.pending.get(), 3);
+        references.flush().unwrap();
+        assert_eq!(metrics.pending.get(), 0);
+        assert_eq!(metrics.released.get(), 3);
     }
     #[test]
     fn release_work_is_bounded_without_losing_queued_handles() {

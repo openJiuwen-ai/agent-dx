@@ -328,7 +328,10 @@ impl DfsAssembly {
         } else {
             read_engine
         };
-        let gc_references = Some(gc::GcReferences::new(meta.clone()));
+        let gc_references = Some(gc::GcReferences::with_metrics(
+            meta.clone(),
+            gc::GcReleaseMetrics::register(&obs.registry)?,
+        ));
         let read_engine = read_engine.with_read_pipeline(cfg.dfs_read_pipeline)?;
         let read_engine = Arc::new(match external_store {
             Some(store) => read_engine.with_external_backend(store, meta.clone()),

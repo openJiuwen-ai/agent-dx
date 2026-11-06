@@ -7,6 +7,10 @@ use std::{
 };
 static GC_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 const MAX_CHUNKS: usize = 1024;
+/// A pass or generation ranges from milliseconds to minutes under load.
+const GC_DURATION_BUCKETS: [f64; 12] = [
+    0.001, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 15.0, 60.0, 300.0, 1800.0,
+];
 /// Maximum admission horizon update_gc_reference accepts beyond the current
 /// time (the "60s cleanup fence"). A replay of an abandoned admission can
 /// only be accepted while its original deadline is still in this window.
@@ -34,6 +38,22 @@ pub(crate) struct GcMetrics {
     pub(crate) generation_age_seconds: afs_metrics::IntGauge,
     pub(crate) dropped_nodes: afs_metrics::IntCounter,
     pub(crate) retired_references: afs_metrics::IntCounter,
+    /// One per `collect_garbage` call.
+    pub(crate) passes: afs_metrics::IntCounter,
+    /// One per snapshot-and-plan attempt inside a pass.
+    pub(crate) attempts: afs_metrics::IntCounter,
+    /// Attempts whose commit lost a conflict and had to start over.
+    pub(crate) conflicts: afs_metrics::IntCounter,
+    /// Passes that gave up after the last attempt ("contention").
+    pub(crate) exhausted_passes: afs_metrics::IntCounter,
+    pub(crate) pass_duration: afs_metrics::Histogram,
+    pub(crate) generation_duration: afs_metrics::Histogram,
+    /// References that still protect their inode without a retirement time.
+    pub(crate) live_references: afs_metrics::IntGauge,
+    /// Retired reference records kept for grace and replay fencing.
+    pub(crate) retired_reference_records: afs_metrics::IntGauge,
+    /// Authority entities one planning attempt had to look at.
+    pub(crate) planned_entities: afs_metrics::IntGauge,
     open_generation: Arc<std::sync::Mutex<Option<(u64, std::time::Instant)>>>,
 }
 
@@ -64,6 +84,48 @@ impl GcMetrics {
                 "afs_meta_dfs_gc_retired_references_total",
                 "GC references retired because their node session is no longer current and live",
             )?,
+            passes: afs_metrics::IntCounter::new(
+                "afs_meta_dfs_gc_passes_total",
+                "DFS GC collection calls",
+            )?,
+            attempts: afs_metrics::IntCounter::new(
+                "afs_meta_dfs_gc_attempts_total",
+                "DFS GC planning attempts, including those repeated after a conflict",
+            )?,
+            conflicts: afs_metrics::IntCounter::new(
+                "afs_meta_dfs_gc_conflicts_total",
+                "DFS GC commits that lost a conflict and started over",
+            )?,
+            exhausted_passes: afs_metrics::IntCounter::new(
+                "afs_meta_dfs_gc_exhausted_passes_total",
+                "DFS GC collection calls that gave up after repeated conflicts",
+            )?,
+            pass_duration: afs_metrics::Histogram::with_opts(
+                afs_metrics::HistogramOpts::new(
+                    "afs_meta_dfs_gc_pass_duration_seconds",
+                    "Duration of one DFS GC collection call",
+                )
+                .buckets(GC_DURATION_BUCKETS.to_vec()),
+            )?,
+            generation_duration: afs_metrics::Histogram::with_opts(
+                afs_metrics::HistogramOpts::new(
+                    "afs_meta_dfs_gc_generation_duration_seconds",
+                    "How long this Meta process saw a DFS GC generation waiting for nodes",
+                )
+                .buckets(GC_DURATION_BUCKETS.to_vec()),
+            )?,
+            live_references: afs_metrics::IntGauge::new(
+                "afs_meta_dfs_gc_live_references",
+                "GC references without a retirement time, as of the last planning attempt",
+            )?,
+            retired_reference_records: afs_metrics::IntGauge::new(
+                "afs_meta_dfs_gc_retired_reference_records",
+                "Retired GC reference records still kept, as of the last planning attempt",
+            )?,
+            planned_entities: afs_metrics::IntGauge::new(
+                "afs_meta_dfs_gc_planned_entities",
+                "Authority entities read by the last DFS GC planning attempt",
+            )?,
             open_generation: Arc::new(std::sync::Mutex::new(None)),
         })
     }
@@ -77,7 +139,33 @@ impl GcMetrics {
         afs_metrics::register_collector(registry, &self.pending_chunks)?;
         afs_metrics::register_collector(registry, &self.generation_age_seconds)?;
         afs_metrics::register_collector(registry, &self.dropped_nodes)?;
-        afs_metrics::register_collector(registry, &self.retired_references)
+        afs_metrics::register_collector(registry, &self.retired_references)?;
+        afs_metrics::register_collector(registry, &self.passes)?;
+        afs_metrics::register_collector(registry, &self.attempts)?;
+        afs_metrics::register_collector(registry, &self.conflicts)?;
+        afs_metrics::register_collector(registry, &self.exhausted_passes)?;
+        afs_metrics::register_collector(registry, &self.pass_duration)?;
+        afs_metrics::register_collector(registry, &self.generation_duration)?;
+        afs_metrics::register_collector(registry, &self.live_references)?;
+        afs_metrics::register_collector(registry, &self.retired_reference_records)?;
+        afs_metrics::register_collector(registry, &self.planned_entities)
+    }
+
+    fn observe_references(&self, entities: &[MetaEntity]) {
+        let (mut live, mut retired) = (0_i64, 0_i64);
+        for entity in entities {
+            if let MetaEntity::DfsReference(reference) = entity {
+                if reference.retired_at_unix_ms.is_some() {
+                    retired += 1;
+                } else {
+                    live += 1;
+                }
+            }
+        }
+        self.live_references.set(live);
+        self.retired_reference_records.set(retired);
+        self.planned_entities
+            .set(i64::try_from(entities.len()).unwrap_or(i64::MAX));
     }
 
     fn observe(&self, gc: &GcState) {
@@ -91,13 +179,20 @@ impl GcMetrics {
             return;
         };
         if gc.waiting_nodes.is_empty() {
-            *open = None;
+            if let Some((_, since)) = open.take() {
+                self.generation_duration
+                    .observe(since.elapsed().as_secs_f64());
+            }
             self.generation_age_seconds.set(0);
             return;
         }
         let since = match *open {
             Some((generation, since)) if generation == gc.generation => since,
-            _ => {
+            previous => {
+                if let Some((_, since)) = previous {
+                    self.generation_duration
+                        .observe(since.elapsed().as_secs_f64());
+                }
                 let since = std::time::Instant::now();
                 *open = Some((gc.generation, since));
                 since
@@ -511,9 +606,15 @@ impl DfsService {
         completed: u64,
         inventory: Vec<ChunkObject>,
     ) -> Result<GcState> {
-        let gc = self
+        self.gc_metrics.passes.inc();
+        let started = std::time::Instant::now();
+        let result = self
             .collect_garbage_attempts(node, session, completed, inventory)
-            .await?;
+            .await;
+        self.gc_metrics
+            .pass_duration
+            .observe(started.elapsed().as_secs_f64());
+        let gc = result?;
         self.gc_metrics.observe(&gc);
         Ok(gc)
     }
@@ -542,6 +643,8 @@ impl DfsService {
         for _ in 0..64 {
             let view = self.store.read_view().await?;
             let (revision, mut entities) = view.snapshot()?;
+            self.gc_metrics.attempts.inc();
+            self.gc_metrics.observe_references(&entities);
             live_caller(&entities, &node, &session)?;
             let mut gc = gc_state(&entities);
             let now = now_unix_ms();
@@ -577,6 +680,7 @@ impl DfsService {
                         .gc_commit(revision, StoreOperation::DfsCollectGarbage, mutations)
                         .await?
                 {
+                    self.gc_metrics.conflicts.inc();
                     continue;
                 }
                 self.gc_metrics.dropped_nodes.inc_by(dropped as u64);
@@ -622,7 +726,9 @@ impl DfsService {
                 self.gc_metrics.retired_references.inc_by(retired);
                 return Ok(gc);
             }
+            self.gc_metrics.conflicts.inc();
         }
+        self.gc_metrics.exhausted_passes.inc();
         Err(conflict("garbage collection contention"))
     }
 }

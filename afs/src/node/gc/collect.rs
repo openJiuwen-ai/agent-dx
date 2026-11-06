@@ -112,6 +112,17 @@ impl Collector {
         }
     }
 
+    /// A pass with collection switched off: releases only (`fault::experiment`).
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn flush_references(&self) -> Result<usize> {
+        let _gate = self
+            .gate
+            .lock()
+            .map_err(|_| Error::coded(afs_error::NODE_VFS_UNAVAILABLE, "GC worker poisoned"))?;
+        self.references.flush()?;
+        Ok(0)
+    }
+
     fn collect_local(&self, store: &LocalChunkStore) -> Result<usize> {
         let completed = store.gc_generation()?;
         let batch = self

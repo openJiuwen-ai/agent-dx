@@ -38,9 +38,13 @@ impl Reaper {
         let stop = services.stop.subscribe();
         let collector = self.collector;
         services.spawn(run_reaper_loop(stop, move || {
-            collector
-                .as_ref()
-                .map_or(Ok(0), |collector| collector.collect_once())
+            collector.as_ref().map_or(Ok(0), |collector| {
+                #[cfg(feature = "diagnostics")]
+                if super::experiment::gc_collection_off() {
+                    return collector.flush_references();
+                }
+                collector.collect_once()
+            })
         }));
     }
 }

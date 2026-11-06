@@ -979,6 +979,11 @@ async fn gc_stall_metrics_track_the_waiting_generation() {
     assert_eq!(service.gc_metrics().waiting_nodes.get(), 3);
     assert_eq!(service.gc_metrics().pending_chunks.get(), 1);
     assert_eq!(service.gc_metrics().dropped_nodes.get(), 0);
+    assert_eq!(service.gc_metrics().passes.get(), 1);
+    assert_eq!(service.gc_metrics().attempts.get(), 1);
+    assert_eq!(service.gc_metrics().conflicts.get(), 0);
+    assert_eq!(service.gc_metrics().exhausted_passes.get(), 0);
+    assert_eq!(service.gc_metrics().pass_duration.get_sample_count(), 1);
 
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     service
@@ -1004,6 +1009,11 @@ async fn gc_stall_metrics_track_the_waiting_generation() {
         .unwrap();
     assert_eq!(service.gc_metrics().waiting_nodes.get(), 0);
     assert_eq!(service.gc_metrics().generation_age_seconds.get(), 0);
+    assert_eq!(
+        service.gc_metrics().generation_duration.get_sample_count(),
+        1,
+        "one closed generation"
+    );
 }
 
 fn external_gc_service(store: Arc<crate::meta::store::Store>) -> DfsService {

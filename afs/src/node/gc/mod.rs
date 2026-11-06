@@ -16,4 +16,5 @@ mod collect;
 mod references;
 
 pub(crate) use collect::{Collector, ExternalObjects};
+pub(crate) use references::GcReleaseMetrics;
 pub use references::{GcBatch, GcControl, GcPin, GcReferences};

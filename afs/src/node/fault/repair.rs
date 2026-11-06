@@ -357,6 +357,10 @@ impl RepairService {
 
     /// Start the loop as one service; it stops with `services.stop`.
     pub(crate) fn start(self, services: &mut Services) {
+        #[cfg(feature = "diagnostics")]
+        if super::experiment::repair_loop_off() {
+            return;
+        }
         let stop = services.stop.subscribe();
         let worker = self.worker;
         services.spawn(run_repair_loop(stop, move || worker.run_once()));

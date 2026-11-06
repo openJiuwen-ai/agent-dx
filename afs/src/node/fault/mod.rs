@@ -22,6 +22,8 @@
 //! for every Node background service and lists them all.
 
 pub(crate) mod classify;
+#[cfg(all(feature = "dfs", feature = "diagnostics"))]
+mod experiment;
 #[cfg(feature = "dfs")]
 pub(crate) mod lease_keeper;
 #[cfg(feature = "dfs")]
