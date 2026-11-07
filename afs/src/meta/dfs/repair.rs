@@ -25,6 +25,13 @@ pub(super) const PATROL_PAGE: usize = if cfg!(test) { 64 } else { 16 * 1024 };
 /// session change announces; a lost node starts one at once.
 const PATROL_PERIOD: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// Placements found lacking copies wait here until a claim records their debt: a
+/// claim takes one candidate, and the patrol does not come back. The patrol pauses
+/// at this many, so memory and the work behind it stay bounded.
+const PATROL_SUSPECTS_MAX: usize = 4096;
+/// Waiting placements one claim looks at. It takes one, so a few are plenty.
+const PATROL_SUSPECTS_PER_CLAIM: usize = 256;
+
 /// What decides that recorded placement health may have gone stale.
 #[derive(Eq, PartialEq)]
 struct RepairPatrolSignature {
@@ -38,6 +45,7 @@ pub(super) struct RepairPatrol {
     signature: Option<RepairPatrolSignature>,
     cursor: Option<crate::dfs::ChunkId>,
     finished_at: Option<std::time::Instant>,
+    suspects: BTreeSet<crate::dfs::ChunkId>,
 }
 
 /// Inputs shared by every candidate decision of one claim request.
@@ -163,6 +171,7 @@ impl DfsService {
             .read(MetaRead::DfsUnhealthyPlacements)
             .await?
             .entities;
+        placements.extend(self.patrol_suspects().await?);
         placements.extend(self.patrol_page(replication, now).await?);
         for entity in placements {
             let MetaEntity::DfsPlacement(placement) = entity else {
@@ -174,8 +183,10 @@ impl DfsService {
                     && self.live_ready_copy_count(&placement, now).await?
                         >= usize::from(placement.desired_copies))
             {
+                self.patrol_settled(&placement.chunk_id)?;
                 continue;
             }
+            self.patrol_suspect(&placement.chunk_id)?;
             registered.insert(placement.chunk_id.clone());
             let task_id = repair_task_id(&placement.chunk_id);
             let completed = self
@@ -206,6 +217,51 @@ impl DfsService {
         }
         candidates.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(candidates)
+    }
+
+    /// Placements the patrol already found lacking and no claim has recorded yet.
+    /// One that is gone (collected) leaves the list.
+    async fn patrol_suspects(&self) -> Result<Vec<MetaEntity>> {
+        let suspects = self
+            .repair_patrol
+            .lock()
+            .map_err(|_| invalid("repair patrol lock poisoned"))?
+            .suspects
+            .iter()
+            .take(PATROL_SUSPECTS_PER_CLAIM)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut placements = Vec::with_capacity(suspects.len());
+        for chunk_id in suspects {
+            match self
+                .store
+                .read(MetaRead::DfsPlacement(chunk_id.clone()))
+                .await?
+                .entity
+            {
+                Some(entity) => placements.push(entity),
+                None => self.patrol_settled(&chunk_id)?,
+            }
+        }
+        Ok(placements)
+    }
+
+    fn patrol_suspect(&self, chunk_id: &crate::dfs::ChunkId) -> Result<()> {
+        self.repair_patrol
+            .lock()
+            .map_err(|_| invalid("repair patrol lock poisoned"))?
+            .suspects
+            .insert(chunk_id.clone());
+        Ok(())
+    }
+
+    fn patrol_settled(&self, chunk_id: &crate::dfs::ChunkId) -> Result<()> {
+        self.repair_patrol
+            .lock()
+            .map_err(|_| invalid("repair patrol lock poisoned"))?
+            .suspects
+            .remove(chunk_id);
+        Ok(())
     }
 
     /// A placement recorded Satisfied can still lack live copies once a node is
@@ -248,7 +304,7 @@ impl DfsService {
                 patrol.cursor = None;
                 patrol.finished_at = None;
             }
-            if patrol.finished_at.is_some() {
+            if patrol.finished_at.is_some() || patrol.suspects.len() >= PATROL_SUSPECTS_MAX {
                 return Ok(Vec::new());
             }
             patrol.cursor.clone()

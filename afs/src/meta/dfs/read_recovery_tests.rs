@@ -1706,3 +1706,114 @@ async fn a_session_change_restarts_the_patrol_and_finds_lost_replicas_in_bounded
     }
     panic!("the patrol must reach the lost placement within pages of all placements");
 }
+
+#[tokio::test]
+async fn every_lost_replica_a_patrol_finds_gets_its_debt_recorded() {
+    let fixture = fixture().await;
+    register(
+        &fixture.store,
+        "target",
+        "target-original",
+        vec![StorageDeviceDescriptor {
+            device_id: "target-device".into(),
+            device_epoch: 1,
+            catalog_revision: 0,
+            failure_domain: "target-fd".into(),
+        }],
+    )
+    .await;
+    let target_epoch = match fixture
+        .store
+        .read(MetaRead::CurrentNodeSession {
+            node_id: "target".into(),
+        })
+        .await
+        .unwrap()
+        .entity
+    {
+        Some(MetaEntity::NodeSession(session)) => session.lease_epoch,
+        _ => panic!("target session is missing"),
+    };
+    let chunk = seed_chunk(&fixture).await;
+    let lost = (0..5)
+        .map(|index| crate::dfs::ChunkId::new(format!("lost-chunk-{index}")))
+        .collect::<Vec<_>>();
+    for chunk_id in &lost {
+        let key = RequestKey::new("fixture", format!("seed-{}", chunk_id.0));
+        let mut txn = MetaTxn::new(key.clone(), StoreOperation::DfsCommitFileVersion);
+        txn.conditions
+            .push(TxnCondition::RequestAbsent(key.clone()));
+        let mut copy = fixture.copy.clone();
+        copy.id = CopyId::new(format!("copy-of-{}", chunk_id.0));
+        copy.chunk_id = chunk_id.clone();
+        copy.location = CopyLocation::Node {
+            node_id: "target".into(),
+            node_epoch: target_epoch,
+            device_id: "target-device".into(),
+            device_epoch: 1,
+            catalog_revision: 0,
+        };
+        txn.mutations.extend([
+            TxnMutation::Put(MetaEntity::DfsChunk(ChunkObject {
+                id: chunk_id.clone(),
+                ..chunk.clone()
+            })),
+            TxnMutation::Put(MetaEntity::DfsCopy(copy.clone())),
+            TxnMutation::Put(MetaEntity::DfsPlacement(PlacementRecord {
+                chunk_id: chunk_id.clone(),
+                replica_group_id: ReplicaGroupId::new("seed"),
+                placement_epoch: 1,
+                desired_copies: 1,
+                copies: vec![copy.id],
+                health: PlacementHealth::Satisfied,
+            })),
+            TxnMutation::RecordRequestOutcome(RequestOutcome {
+                request: key,
+                operation: StoreOperation::DfsCommitFileVersion,
+                result: OperationResult::Empty,
+            }),
+        ]);
+        fixture.store.compare_and_commit(txn).await.unwrap();
+    }
+    let claim = |id: String| {
+        let service = fixture.service.clone();
+        async move {
+            service
+                .claim_replication_task(claim_request(&id))
+                .await
+                .unwrap()
+        }
+    };
+    // The patrol finishes with every placement healthy.
+    claim("before".into()).await;
+    claim("before-2".into()).await;
+    // The node is replaced: one page finds all five, one claim can take only one.
+    register(
+        &fixture.store,
+        "target",
+        "target-replaced",
+        vec![StorageDeviceDescriptor {
+            device_id: "target-device-2".into(),
+            device_epoch: 2,
+            catalog_revision: 0,
+            failure_domain: "target-fd".into(),
+        }],
+    )
+    .await;
+    for call in 0..lost.len() + 1 {
+        claim(format!("after-{call}")).await;
+    }
+    let tasks = fixture
+        .store
+        .read(MetaRead::DfsReplicationTasks)
+        .await
+        .unwrap()
+        .entities;
+    for chunk_id in &lost {
+        assert!(
+            tasks.iter().any(|entity| matches!(entity,
+                MetaEntity::DfsReplicationTask(task) if task.chunk_id == *chunk_id)),
+            "{chunk_id:?} lost its debt once the patrol moved past it"
+        );
+    }
+}
