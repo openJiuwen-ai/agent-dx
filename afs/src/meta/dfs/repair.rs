@@ -56,7 +56,7 @@ pub(super) struct RepairPatrol {
     suspects: BTreeSet<crate::dfs::ChunkId>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "dfs"))]
 impl RepairPatrol {
     pub(super) fn has_suspect(&self, chunk_id: &crate::dfs::ChunkId) -> bool {
         self.suspects.contains(chunk_id)

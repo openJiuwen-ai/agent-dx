@@ -1963,7 +1963,7 @@ async fn a_session_changing_during_every_claim_cannot_keep_the_patrol_from_far_p
     // claim: each flap is a change of the live sessions.
     register_target(&fixture, "target-replaced", "target-device-2").await;
     let mut found = false;
-    for call in 0..(5_usize) {
+    for call in 0..5_usize {
         register(
             &fixture.store,
             "flapping",
