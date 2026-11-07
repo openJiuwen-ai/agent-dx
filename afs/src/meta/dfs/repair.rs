@@ -17,8 +17,10 @@ pub(super) fn reliable_copy_count(copies: &[CopyRecord]) -> usize {
         .count()
 }
 
-/// Placements a patrol looks at per claim (smaller in unit tests, same logic).
-pub(super) const PATROL_PAGE: usize = if cfg!(test) { 64 } else { 1024 };
+/// Placements a patrol looks at per claim (smaller in unit tests, same logic). A
+/// Node that finds no work polls every 8 s, so this sets how fast a lost node is
+/// noticed: 100k placements in about 7 claims, a million in about 62.
+pub(super) const PATROL_PAGE: usize = if cfg!(test) { 64 } else { 16 * 1024 };
 /// A patrol also starts this long after the last one finished. It catches what no
 /// session change announces; a lost node starts one at once.
 const PATROL_PERIOD: std::time::Duration = std::time::Duration::from_secs(600);
