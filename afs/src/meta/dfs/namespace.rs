@@ -75,6 +75,20 @@ impl DfsService {
             lease_epoch: 1,
             expires_at_unix_ms: lease_expiry(lease_seconds)?,
         };
+        // The handle this create opens is admitted in the same transaction, so
+        // the new inode is protected from the moment it exists, without a second
+        // Meta round trip. The caller adopts this reference when it builds the
+        // handle and releases it like any other.
+        let handle_reference = crate::dfs::GcReference {
+            node_id: caller_id.clone(),
+            session_id: lease.owner_session_id.clone(),
+            reference_id: crate::dfs::created_handle_reference_id(&operation_id),
+            inode_id: Some(inode.inode_id.clone()),
+            publication: false,
+            chunks: Vec::new(),
+            retired_at_unix_ms: None,
+            open_read: None,
+        };
         let request = RequestKey::new(caller_id, operation_id.0.clone());
         let mut parent = self
             .directory_for_mutation(&namespace_id, &parent_inode_id)
@@ -102,12 +116,16 @@ impl DfsService {
                 TxnCondition::Missing(MetaKey::DfsDentry(dentry.key.clone())),
                 TxnCondition::Missing(MetaKey::DfsInode(inode.inode_id.clone())),
                 TxnCondition::Missing(MetaKey::DfsWriteLease(inode.inode_id.clone())),
+                TxnCondition::Missing(crate::meta::store::entity_key(&MetaEntity::DfsReference(
+                    handle_reference.clone(),
+                ))),
             ]);
             push_parent_namespace_change(&mut txn, parent.clone(), 0);
             txn.mutations.extend([
                 TxnMutation::Put(MetaEntity::DfsDentry(dentry)),
                 TxnMutation::Put(MetaEntity::DfsInode(inode.clone())),
                 TxnMutation::Put(MetaEntity::DfsWriteLease(lease.clone())),
+                TxnMutation::Put(MetaEntity::DfsReference(handle_reference.clone())),
                 TxnMutation::RecordRequestOutcome(outcome),
             ]);
             let outcome = validate_namespace_outcome(

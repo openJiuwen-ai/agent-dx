@@ -401,6 +401,84 @@ fn update(id: &str) -> UpdateGcReference {
     }
 }
 #[tokio::test]
+async fn create_admits_its_handle_reference_atomically_and_a_replay_keeps_one() {
+    use crate::dfs::created_handle_reference_id;
+    use crate::meta::dfs::CreateFileRequest as Create;
+    let (store, _) = seeded_store(vec![MetaEntity::DfsInode(InodeRecord {
+        kind: InodeKind::Directory,
+        ..match inode("parent", 2, "v") {
+            MetaEntity::DfsInode(value) => value,
+            _ => unreachable!(),
+        }
+    })])
+    .await;
+    let service = DfsService::new(store.clone());
+    let operation = OperationId::new("create-1");
+    let request = Create {
+        caller_id: "n".into(),
+        owner_session_id: "s".into(),
+        operation_id: operation.clone(),
+        namespace_id: NamespaceId::new("ns"),
+        parent_inode_id: InodeId::new("parent"),
+        name: b"file".to_vec(),
+        attributes: InodeAttributes {
+            mode: 0o600,
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+            atime_unix_ms: 0,
+            mtime_unix_ms: 0,
+            ctime_unix_ms: 0,
+        },
+        lease_seconds: 30,
+    };
+    let (created, _) = service.create(request.clone()).await.unwrap();
+    let key = ref_key("n", "s", &created_handle_reference_id(&operation));
+    let stored = |entities: &[MetaEntity]| {
+        entities
+            .iter()
+            .filter(|entity| crate::meta::store::entity_key(entity) == key)
+            .count()
+    };
+    let (revision, entities) = store.read_view().await.unwrap().snapshot().unwrap();
+    assert_eq!(stored(&entities), 1, "the reference is in the create txn");
+    let reference = entities
+        .iter()
+        .find_map(|entity| match entity {
+            MetaEntity::DfsReference(value) if crate::meta::store::entity_key(entity) == key => {
+                Some(value.clone())
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(reference.inode_id, Some(created.inode_id.clone()));
+    assert!(reference.retired_at_unix_ms.is_none());
+    // A lost-reply retry replays the outcome and writes nothing.
+    service.create(request).await.unwrap();
+    assert_eq!(
+        store.read_view().await.unwrap().snapshot().unwrap().0,
+        revision
+    );
+    // Until it is released GC treats the new inode like any opened one.
+    let plan = plan_collection(
+        &entities,
+        std::slice::from_ref(&reference),
+        now_unix_ms(),
+        0,
+    );
+    assert!(!plan.keys.iter().any(|key| matches!(key,
+        MetaKey::DfsInode(id) if *id == created.inode_id)));
+    service
+        .release_gc_references(
+            "n".into(),
+            "s".into(),
+            vec![created_handle_reference_id(&operation)],
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn one_release_call_retires_a_batch_in_one_transaction() {
     let (store, _) = seeded_store(vec![inode("i", 1, "v")]).await;
     let service = DfsService::new(store.clone());

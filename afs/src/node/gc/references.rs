@@ -89,11 +89,20 @@ pub struct GcReferences {
     sequence: AtomicU64,
     metrics: Option<GcReleaseMetrics>,
     wake: tokio::sync::Notify,
+    /// Live `open:` pins by inode. A reference protects every version of its
+    /// inode until its release, and its release waits for the last user of the
+    /// pin, so another open of the same inode shares it instead of a new
+    /// admission. A finished pin leaves on drop, keeping this bounded by open
+    /// inodes; in a racing open the map may briefly miss a live pin, which only
+    /// costs one more reference.
+    open_pins: Mutex<std::collections::HashMap<InodeId, std::sync::Weak<GcPin>>>,
 }
 pub struct GcPin {
     fence: Option<crate::dfs::GcFence>,
     id: String,
     owner: Arc<GcReferences>,
+    /// The inode it is shared under; only `open:` pins are shared.
+    open_inode: Option<InodeId>,
 }
 impl GcPin {
     pub(crate) fn fence(&self) -> Option<crate::dfs::GcFence> {
@@ -115,6 +124,13 @@ impl Drop for GcPin {
                 self.owner.wake.notify_one();
             }
         }
+        if let (Some(inode), Ok(mut open_pins)) = (&self.open_inode, self.owner.open_pins.lock())
+            && open_pins
+                .get(inode)
+                .is_some_and(|pin| pin.strong_count() == 0)
+        {
+            open_pins.remove(inode);
+        }
         // Poisoning keeps the durable reference; it never authorizes deletion.
     }
 }
@@ -135,6 +151,7 @@ impl GcReferences {
             sequence: AtomicU64::new(1),
             metrics,
             wake: tokio::sync::Notify::new(),
+            open_pins: Mutex::default(),
         })
     }
     /// Resolves when enough dropped pins wait that the release loop should not
@@ -149,12 +166,46 @@ impl GcReferences {
                 .set(i64::try_from(pending).unwrap_or(i64::MAX));
         }
     }
+    /// An `open:` pin of `inode`, shared with any live pin of the same inode.
     pub fn pin(
         self: &Arc<Self>,
         inode: &InodeId,
         version: Option<&FileVersionId>,
     ) -> Result<Arc<GcPin>> {
-        self.pin_mode(inode, version, None)
+        if let Some(shared) = self.shared_open_pin(inode)? {
+            return Ok(shared);
+        }
+        let pin = self.pin_mode(inode, version, None)?;
+        self.share_open_pin(inode, &pin)?;
+        Ok(pin)
+    }
+    /// The pin of a handle whose reference Meta admits inside the Create
+    /// transaction (`dfs::created_handle_reference_id`): no admission call here.
+    pub(crate) fn created_handle_pin(
+        self: &Arc<Self>,
+        operation: &crate::dfs::OperationId,
+    ) -> Arc<GcPin> {
+        Arc::new(GcPin {
+            fence: None,
+            id: crate::dfs::created_handle_reference_id(operation),
+            owner: self.clone(),
+            open_inode: None,
+        })
+    }
+    fn shared_open_pin(&self, inode: &InodeId) -> Result<Option<Arc<GcPin>>> {
+        Ok(self
+            .open_pins
+            .lock()
+            .map_err(|_| Error::coded(afs_error::IO_UNAVAILABLE, "GC pin table poisoned"))?
+            .get(inode)
+            .and_then(std::sync::Weak::upgrade))
+    }
+    fn share_open_pin(&self, inode: &InodeId, pin: &Arc<GcPin>) -> Result<()> {
+        self.open_pins
+            .lock()
+            .map_err(|_| Error::coded(afs_error::IO_UNAVAILABLE, "GC pin table poisoned"))?
+            .insert(inode.clone(), Arc::downgrade(pin));
+        Ok(())
     }
     pub(crate) fn pin_generation(
         self: &Arc<Self>,
@@ -190,6 +241,7 @@ impl GcReferences {
             fence: None,
             id,
             owner: self.clone(),
+            open_inode: generation.is_none().then(|| inode.clone()),
         };
         pin.fence = if generation.is_some() {
             Some(self.control.retain_fenced(&pin.id, inode, version)?)
@@ -288,6 +340,46 @@ mod tests {
         assert_eq!(control.releases.lock().unwrap().len(), 1);
         references.flush().unwrap();
         assert_eq!(control.releases.lock().unwrap().len(), 1);
+    }
+    #[test]
+    fn opens_of_one_inode_share_a_reference_until_the_last_is_gone() {
+        let control = Arc::new(Control::default());
+        let references = GcReferences::new(control.clone());
+        let first = references.pin(&InodeId::new("i"), None).unwrap();
+        let second = references.pin(&InodeId::new("i"), None).unwrap();
+        assert!(Arc::ptr_eq(&first, &second), "no second admission");
+        let other = references.pin(&InodeId::new("other"), None).unwrap();
+        assert!(!Arc::ptr_eq(&first, &other));
+        drop(first);
+        references.flush().unwrap();
+        assert!(
+            control.releases.lock().unwrap().is_empty(),
+            "a remaining handle keeps the reference unreleased"
+        );
+        drop(second);
+        references.flush().unwrap();
+        assert_eq!(control.releases.lock().unwrap().len(), 1);
+        // Released means a later open needs a new admission, not the old id.
+        let third = references.pin(&InodeId::new("i"), None).unwrap();
+        drop(third);
+        references.flush().unwrap();
+        let released = control.releases.lock().unwrap().clone();
+        assert_eq!(released.len(), 2);
+        assert_ne!(released[0], released[1]);
+        drop(other);
+        assert!(references.open_pins.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn a_created_handle_adopts_its_reference_and_releases_it() {
+        let control = Arc::new(Control::default());
+        let references = GcReferences::new(control.clone());
+        let operation = crate::dfs::OperationId::new("op");
+        drop(references.created_handle_pin(&operation));
+        references.flush().unwrap();
+        assert_eq!(
+            *control.releases.lock().unwrap(),
+            vec![crate::dfs::created_handle_reference_id(&operation)]
+        );
     }
     #[test]
     fn release_backlog_is_visible_as_metrics() {

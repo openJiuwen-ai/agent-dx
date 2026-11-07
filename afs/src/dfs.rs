@@ -11,7 +11,9 @@ use serde::{Deserialize, Serialize};
 mod cow;
 mod gc;
 pub use cow::clone_file_layout;
-pub use gc::{GcFence, GcReference, GcState, OpenReadIdentity, UpdateGcReference};
+pub use gc::{
+    GcFence, GcReference, GcState, OpenReadIdentity, UpdateGcReference, created_handle_reference_id,
+};
 
 macro_rules! string_id {
     ($name:ident) => {

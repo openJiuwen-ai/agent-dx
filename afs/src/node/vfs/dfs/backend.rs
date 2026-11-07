@@ -414,8 +414,16 @@ impl Backend for DistributedFs {
         } else {
             mode
         };
+        let operation_id = self.identity.operation_id("create");
+        // Dropped on any failure below, which queues its release: the reply may
+        // be lost after Meta already admitted the reference.
+        let gc_pin = self
+            .gc
+            .references
+            .as_ref()
+            .map(|references| references.created_handle_pin(&operation_id));
         let (inode, write_lease) = self.meta.create(
-            &self.identity.operation_id("create"),
+            &operation_id,
             &self.inode_id(parent)?,
             name.as_encoded_bytes(),
             InodeAttributes {
@@ -432,7 +440,7 @@ impl Backend for DistributedFs {
         self.install_write_state(inode.clone(), write_lease)?;
         let session = self.open_write_session(&inode, flags)?;
         let handle = self.allocate_handle(DfsFileHandle {
-            gc_pin: None,
+            gc_pin,
             inode_id: inode.inode_id.clone(),
             opened_inode: inode.clone(),
             opened_page_identity: None,

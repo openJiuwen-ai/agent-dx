@@ -40,6 +40,13 @@ pub struct UpdateGcReference {
     pub admission_deadline_unix_ms: u64,
 }
 
+/// The `open:` reference Meta admits inside the Create transaction, for the
+/// handle the same call opens. Create retries reuse the operation id, so a replay
+/// names the same reference.
+pub fn created_handle_reference_id(operation: &crate::dfs::OperationId) -> String {
+    format!("open:create-{}", operation.0)
+}
+
 /// How a native write generation is protected from GC while it produces receipts.
 /// Never written to the Meta log. The variant name still reaches disk through the
 /// JSON namespace request digest, so renaming it breaks replay of recorded commits.

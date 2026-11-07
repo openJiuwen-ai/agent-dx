@@ -263,7 +263,9 @@ impl DistributedFs {
     pub(super) fn allocate_handle(&self, mut handle: DfsFileHandle) -> Result<FileHandle> {
         let id = self.handles.next_id();
         let inode_id = handle.inode_id.clone();
-        if let Some(references) = &self.gc.references {
+        if handle.gc_pin.is_none()
+            && let Some(references) = &self.gc.references
+        {
             // An inode-level reference protects every version of the inode,
             // including the one this handle pins until close.
             handle.gc_pin =
