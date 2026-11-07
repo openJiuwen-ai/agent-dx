@@ -215,19 +215,40 @@ impl DistributedFs {
                 Err(error) => return Err(error),
             }
         }
-        {
-            let (owner_inode, lease) = self.meta.resolve_write_authority(&inode.inode_id)?;
+        let mut retries = 2;
+        loop {
+            let (owner_inode, lease) = match self.meta.resolve_write_authority(&inode.inode_id) {
+                Err(error)
+                    if error.code() == afs_error::META_DFS_CONFLICT
+                        && retries > 0
+                        && Instant::now() < deadline =>
+                {
+                    retries -= 1;
+                    continue;
+                }
+                result => result?,
+            };
             inode = self.validate_inode(owner_inode)?;
             if lease.owner_node_id != self.node_id || lease.owner_session_id != self.session_id {
                 // Reuse the existing owner open/read/release lifecycle. The remote
                 // handle is read-only; it cannot be used to modify sealed bytes.
                 let previous = self.current_remote_provider(&inode.inode_id)?;
-                let session = self.open_remote_write_session(
+                let session = match self.open_remote_write_session(
                     &inode,
                     &lease,
                     libc::O_RDONLY,
                     OpenOptions::default(),
-                )?;
+                ) {
+                    Err(error)
+                        if error.code() == afs_error::NODE_DFS_STALE_HANDLE
+                            && retries > 0
+                            && Instant::now() < deadline =>
+                    {
+                        retries -= 1;
+                        continue;
+                    }
+                    result => result?,
+                };
                 let result = (|| {
                     let remote = session
                         .remote
@@ -276,6 +297,7 @@ impl DistributedFs {
             }
             self.fill_lazy_owned(&inode, lease, &source, offset, count, deadline)?;
             inode = self.validate_inode(self.meta.get_inode(&inode.inode_id)?)?;
+            break;
         }
         let committed = self.readonly_version_for_inode(&inode)?;
         if !covered(&committed.layout, offset, count as u64) {

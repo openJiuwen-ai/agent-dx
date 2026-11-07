@@ -148,6 +148,102 @@ async fn dfs_lock_resolver_live_local_authority_does_not_commit_or_extend_expiry
 }
 
 #[tokio::test]
+async fn dfs_lazy_authority_replaces_superseded_local_session_before_lease_expiry() {
+    use afs::dfs::{CallerContext, SetXattrRequest, XattrSetMode};
+
+    let (store, dfs, original, _) = lock_resolver_fixture(30).await;
+    let meta = rpc::MetaRpc(Arc::new(Meta::with_store(
+        "meta-test".into(),
+        Observability::new().unwrap(),
+        store,
+    )));
+    register_dfs_storage_node(&meta, "node-a", "session-a", "original-session", "zone-a").await;
+    register_dfs_storage_node(&meta, "node-a", "session-a-2", "new-session", "zone-a").await;
+    register_dfs_storage_node(&meta, "node-b", "session-b", "reader-session", "zone-a").await;
+
+    let inode = dfs.get_inode(original.inode_id.clone()).await.unwrap();
+    let (_, normal) = dfs
+        .resolve_write_authority(
+            "node-a".into(),
+            "session-a-2".into(),
+            OperationId::new("resolve-normal"),
+            inode.inode_id.clone(),
+            30,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        normal, original,
+        "ordinary files retain their existing lease semantics"
+    );
+    let (_, normal_peer) = dfs
+        .resolve_write_authority(
+            "node-b".into(),
+            "session-b".into(),
+            OperationId::new("resolve-normal-peer"),
+            inode.inode_id.clone(),
+            30,
+        )
+        .await
+        .unwrap();
+    assert_eq!(normal_peer, original);
+
+    dfs.set_xattr(SetXattrRequest {
+        caller_id: "node-a".into(),
+        operation_id: OperationId::new("bind-lazy-source"),
+        caller: CallerContext {
+            uid: 0,
+            gid: 0,
+            supplementary_gids: Vec::new(),
+        },
+        inode_id: inode.inode_id.clone(),
+        expected_inode_revision: inode.revision,
+        name: b"user.afs.lazy.v1".to_vec(),
+        value: br#"{"length":4096,"binding":{"kind":"fixture","payload":[1]}}"#.to_vec(),
+        mode: XattrSetMode::Create,
+    })
+    .await
+    .unwrap();
+
+    let (_, unregistered) = dfs
+        .resolve_write_authority(
+            "node-a".into(),
+            "unregistered".into(),
+            OperationId::new("resolve-unregistered"),
+            inode.inode_id.clone(),
+            30,
+        )
+        .await
+        .unwrap();
+    assert_eq!(unregistered, original);
+
+    let (_, recovered) = dfs
+        .resolve_write_authority(
+            "node-b".into(),
+            "session-b".into(),
+            OperationId::new("resolve-peer-before-owner-reads"),
+            inode.inode_id,
+            30,
+        )
+        .await
+        .unwrap();
+    assert_eq!(recovered.owner_node_id, "node-a");
+    assert_eq!(recovered.owner_session_id, "session-a-2");
+    assert_eq!(recovered.lease_epoch, original.lease_epoch + 1);
+    assert!(
+        dfs.renew_write_lease(
+            "node-a".into(),
+            "session-a".into(),
+            OperationId::new("renew-retired"),
+            original,
+            30,
+        )
+        .await
+        .is_err()
+    );
+}
+
+#[tokio::test]
 async fn dfs_write_authority_live_local_does_not_commit_or_extend_expiry() {
     let (store, dfs, original, backend) = lock_resolver_fixture(30).await;
     let before = store
