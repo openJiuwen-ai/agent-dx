@@ -143,7 +143,7 @@ RDMA 握手）。读写两端都用这些常量，不再散落 magic／版本字
   `catalog.wal` 与请求摘要只由 golden 钉住。
 - **未上线不做兼容**：旧格式直接拒绝，不提供迁移或旧版本识别分支。
 - **协议**：`RegisterNodeRequest.protocol_version` 是集群线协议代际（Node↔Meta 注册、Node↔Node service
-  布局），当前为 3，定义在 `afs_protocol::CLUSTER_PROTOCOL_VERSION`；由 Node 填当前版本，Meta 在读写任何状态前校验，
+  布局），当前为 4，定义在 `afs_protocol::CLUSTER_PROTOCOL_VERSION`；由 Node 填当前版本，Meta 在读写任何状态前校验，
   不符（含缺省 0）返回 `META_NODE_PROTOCOL_VERSION`（`0x03050001`，FailedPrecondition）且不登记会话，
   Node 初始注册不重试该错误。DFS 与 OwnerFs Node 走同一注册路径。Node↔Node 通道本身不握手，
   依赖经 Meta 准入的同版本部署，service 布局变化必须升代际；RDMA 握手版本沿用 `NODE_RDMA_HANDSHAKE_VERSION`。
@@ -903,8 +903,9 @@ NodeReplicated DFS 的回收由 Meta 判定可达性、AFS Node 删除本机块�
 仍负责匿名 checkpoint／Snapshot 的共享目录生命周期；AFS 的回收只处理目录删除后失去引用的
 inode、FileVersion、LayoutRoot 与数据块，两层职责不混用。
 
-- 有链接的 inode 当前版本是保留根。打开的文件／目录使用持久引用；文件的在途访问共享同一引用，
-  最后一个使用者退出才排队释放。有效写租约、尚未提交的上传与复制任务也构成保留根。
+- 有链接的 inode 当前版本是保留根。打开的文件／目录使用持久引用；同一 Node 上同一 inode 的打开
+  共享一个引用，最后一个使用者退出才排队释放。新建文件的引用在 Create 事务内一并登记，不多一次
+  Meta 往返。有效写租约、尚未提交的上传与复制任务也构成保留根。
 - 一代回收只等**存活的存储节点**：节点的当前会话（最高租约代）未过期且登记了存储设备。
   Node 的心跳失败 25 秒内自行停止，先于 30 秒会话租约结束，过期会话也不能续期，所以会话过期
   即视为进程已退出：它从当前一代的等待集合中剔除（任何存活节点的下一次回收调用都会做），不再
@@ -916,7 +917,12 @@ inode、FileVersion、LayoutRoot 与数据块，两层职责不混用。
 - 回收停滞看 `afs_meta_dfs_gc_generation_age_seconds`（当前一代已等待的时长，Meta 重启后
   重新计时）、`afs_meta_dfs_gc_waiting_nodes`、`afs_meta_dfs_gc_pending_chunks`；
   `afs_meta_dfs_gc_dropped_nodes_total` 与 `afs_meta_dfs_gc_retired_references_total` 记录因
-  失联被剔除的节点与被退休的引用。
+  失联被剔除的节点与被退休的引用。推进情况看 `afs_meta_dfs_gc_passes_total`、
+  `afs_meta_dfs_gc_attempts_total`、`afs_meta_dfs_gc_conflicts_total`、
+  `afs_meta_dfs_gc_exhausted_passes_total`、`afs_meta_dfs_gc_pass_duration_seconds`、
+  `afs_meta_dfs_gc_generation_duration_seconds`；引用积压看 Meta 的
+  `afs_meta_dfs_gc_live_references`、`afs_meta_dfs_gc_retired_reference_records` 与 Node 的
+  `afs_dfs_gc_release_pending`、`afs_dfs_gc_released_total`、`afs_dfs_gc_release_failures_total`。
 - 最后一个写句柄关闭后，即使数据已提交且序号相同，也后台提交剩余元数据；提交结果未确认时保留
   原请求和写租约，确认干净后停止续租，避免已 unlink 文件因时间戳脏状态永久保留历史。
 - COW 目标布局直接引用共享 chunk；源文件删除不改变目标的所有权。`parent_version` 仅记录血缘，
@@ -932,9 +938,21 @@ inode、FileVersion、LayoutRoot 与数据块，两层职责不混用。
 - Node 删除块和校验旁文件，持久化 catalog 检查点及已完成代次后应答；重启或应答丢失重试不重复
   删除新上传的同内容块。catalog WAL 随检查点截断。Node 清单还会发现无主上传残留。
 
-每批最多 1024 个 chunk，Node 每 5 秒推进，引用释放每次最多 64 个。不可达 Node 会保守阻塞
-当前物理删除批次，不以心跳失联推定磁盘已清空。DFS 外部对象持久化模式目前不启用本机块回收；
+每批最多 1024 个 chunk，Node 每 5 秒推进。引用释放不限速：一次 `ReleaseGcReferences` 调用在
+一个事务内退休至多 1024 个引用，每次回收调用先排空释放队列，队列积压到 256 个时唤醒回收循环只
+做释放；积压到 65536 个时，新建引用先排空队列，Meta 不接受释放就连新引用一起失败，队列因此有
+界。不可达 Node 会保守阻塞当前物理删除批次，不以心跳失联推定磁盘已清空。DFS 外部对象持久化模式目前不启用本机块回收；
 其对象删除需要独立的外部存储回收合同，不能直接套用 NodeReplicated 协议。
+
+## Meta 每操作成本
+
+副本修复认领（`ClaimReplicationTask`）读未完成任务和记录为不健康的放置，两者是 `State` 上由实体
+派生的索引，不落盘；另外最多读一页放置（1024 个）作为巡检。放置记录为健康但副本已失效的情况只有
+看副本才知道，这一巡检在存活会话集合或副本策略变化时启动，并每 10 分钟兜底一次；没有变化时认领
+不读放置。Node 的空闲轮询从 1 秒退避到 8 秒。
+
+目录是否为空按目录的 dentry 范围查第一项；目录的父目录查 `State` 上由 dentry 派生的索引，加载时
+重建，不落盘。root epoch 水位同样来自派生的计数索引。这三者都让对应判定不随 Meta 总实体数增长。
 
 ## Meta 保留窗口与 Watch 重新同步
 
