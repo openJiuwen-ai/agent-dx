@@ -263,7 +263,13 @@ impl DistributedFs {
     pub(super) fn allocate_handle(&self, mut handle: DfsFileHandle) -> Result<FileHandle> {
         let id = self.handles.next_id();
         let inode_id = handle.inode_id.clone();
+        #[cfg(feature = "diagnostics")]
+        let unpinned_reader = handle.flags & libc::O_ACCMODE == libc::O_RDONLY
+            && crate::node::fault::experiment::reader_pin_off();
+        #[cfg(not(feature = "diagnostics"))]
+        let unpinned_reader = false;
         if handle.gc_pin.is_none()
+            && !unpinned_reader
             && let Some(references) = &self.gc.references
         {
             // An inode-level reference protects every version of the inode,

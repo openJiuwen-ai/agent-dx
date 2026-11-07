@@ -23,7 +23,7 @@
 
 pub(crate) mod classify;
 #[cfg(all(feature = "dfs", feature = "diagnostics"))]
-mod experiment;
+pub(crate) mod experiment;
 #[cfg(feature = "dfs")]
 pub(crate) mod lease_keeper;
 #[cfg(feature = "dfs")]
