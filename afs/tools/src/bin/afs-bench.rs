@@ -142,17 +142,20 @@ enum WorkloadSel {
     SmallFile,
     Meta,
     Txn,
+    OpenRead,
     All,
 }
 
 impl WorkloadSel {
     fn includes(self, name: &str) -> bool {
         match self {
-            WorkloadSel::All => true,
+            // `all` keeps its pre-existing meaning; the mixed load is opt-in.
+            WorkloadSel::All => name != "openread",
             WorkloadSel::MultiFile => name == "multifile",
             WorkloadSel::SmallFile => name == "smallfile",
             WorkloadSel::Meta => name == "meta",
             WorkloadSel::Txn => name == "txn",
+            WorkloadSel::OpenRead => name == "openread",
         }
     }
 }
@@ -279,6 +282,7 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
                 "smallfile" => workload = WorkloadSel::SmallFile,
                 "meta" => workload = WorkloadSel::Meta,
                 "txn" => workload = WorkloadSel::Txn,
+                "openread" => workload = WorkloadSel::OpenRead,
                 "all" => workload = WorkloadSel::All,
                 other => return Err(format!("unknown workload: {other}")),
             },
@@ -372,7 +376,7 @@ fn usage() -> &'static str {
      [--files N] [--file-bytes B] [--block B] [--threads N] [--q Q] [--rounds R]\n\
      [--settle-secs S] [--json <path>] [--gc-log <node.log>] [--node-cgroup <dir>]\n\
      [--max-node-mem MiB] [--keep]\n\
-     [--workload multifile|smallfile|meta|txn|all] [--ops N] [--small-bytes B] [--dir-entries N]\n\
+     [--workload multifile|smallfile|meta|txn|openread|all] [--ops N] [--small-bytes B] [--dir-entries N]\n\
      [--node-metrics host:port] [--meta-metrics host:port]"
 }
 
@@ -596,6 +600,7 @@ fn registry() -> Vec<Box<dyn Workload>> {
         Box::new(SmallFileRw),
         Box::new(MetaOps),
         Box::new(SyncTxn),
+        Box::new(OpenRead),
     ]
 }
 
@@ -1554,6 +1559,145 @@ impl Workload for SyncTxn {
             std::fs::remove_dir(&dir)?;
         }
         Ok(vec![report])
+    }
+}
+
+/// 混合负载（R67）：`--threads` 个线程持续直读（O_DIRECT）`--files` 个大文件，
+/// 同时一个线程依次 open + 读 `--small-bytes` + close `--ops` 个小文件。
+/// 读者在开文件者结束时停止。报两个相位：open（开文件者每次操作的时延与 ops/s）
+/// 与 read（同一墙钟内读者的吞吐）。大文件与小文件在计时外写好。
+struct OpenRead;
+
+/// 直读缓冲按页对齐。
+fn aligned_slice(storage: &mut [u8], len: usize) -> &mut [u8] {
+    let offset = storage.as_ptr().align_offset(4096);
+    &mut storage[offset..offset + len]
+}
+
+impl Workload for OpenRead {
+    fn name(&self) -> &'static str {
+        "openread"
+    }
+
+    fn run(&self, ctx: &BenchCtx) -> Result<Vec<CaseReport>, BoxError> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        if !ctx.args().arm.labels().contains(&"fuse") {
+            eprintln!("[afs-bench] openread runs on the fuse arm only; skipped");
+            return Ok(Vec::new());
+        }
+        let block = usize::try_from(ctx.args().block)?;
+        let mut open_report = CaseReport {
+            name: "openread",
+            arm: "fuse",
+            phase: "open",
+            mode: "op",
+            rounds: Vec::new(),
+        };
+        let mut read_report = CaseReport {
+            name: "openread",
+            arm: "fuse",
+            phase: "read",
+            mode: "op",
+            rounds: Vec::new(),
+        };
+        let dir = op_dir(ctx.args(), "openread");
+        reset_dir(&dir)?;
+        let mut payload = vec![0u8; block];
+        for file_index in 0..ctx.args().files {
+            let mut file = File::create(dir.join(format!("big{file_index:03}")))?;
+            for block_index in 0..ctx.args().file_bytes / ctx.args().block {
+                payload_block(file_index, block_index, &mut payload);
+                file.write_all(&payload)?;
+            }
+            file.sync_all()?;
+        }
+        let small = usize::try_from(ctx.args().small_bytes)?;
+        for index in 0..ctx.args().ops {
+            let mut file = File::create(dir.join(format!("s{index:07}")))?;
+            file.write_all(&small_payload(index, small))?;
+            file.sync_all()?;
+        }
+        for round in 0..ctx.args().rounds {
+            settle(ctx, &format!("openread round {}", round + 1))?;
+            let args = ctx.args().clone();
+            let work_dir = dir.clone();
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let readers = args.threads;
+            let run = dispatch_ops(ctx, readers + 1, move |thread_index| {
+                if thread_index == readers {
+                    // The opener: every open is a path lookup (DFS entry TTL is zero).
+                    let _stop_readers = StopOnDrop(stop.clone());
+                    let mut samples = Vec::with_capacity(args.ops);
+                    let mut verified = true;
+                    let mut buf = vec![0u8; small];
+                    for index in 0..args.ops {
+                        let started = Instant::now();
+                        let file = File::open(work_dir.join(format!("s{index:07}")))
+                            .map_err(|error| error.to_string())?;
+                        file.read_exact_at(&mut buf, 0)
+                            .map_err(|error| error.to_string())?;
+                        drop(file);
+                        samples.push(micros_since(started));
+                        verified &= buf == small_payload(index, small);
+                    }
+                    return Ok((samples, Some(verified), 0));
+                }
+                let file_index = thread_index % args.files;
+                let file = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(work_dir.join(format!("big{file_index:03}")))
+                    .map_err(|error| error.to_string())?;
+                let mut storage = vec![0u8; block + 4096];
+                let buf = aligned_slice(&mut storage, block);
+                let mut bytes = 0u64;
+                let mut offset = 0u64;
+                while !stop.load(Ordering::Acquire) {
+                    let count = file
+                        .read_at(buf, offset)
+                        .map_err(|error| error.to_string())?;
+                    bytes += count as u64;
+                    offset += count as u64;
+                    if count == 0 || offset >= args.file_bytes {
+                        offset = 0;
+                    }
+                }
+                Ok((Vec::new(), None, bytes))
+            })?;
+            let mut read = op_phase_stat(OpRun {
+                wall_s: run.wall_s,
+                node_cpu_s: run.node_cpu_s,
+                meta_cpu_s: run.meta_cpu_s,
+                memory: run.memory,
+                memory_source: run.memory_source.clone(),
+                samples: Vec::new(),
+                verified: None,
+                bytes: run.bytes,
+                cost: None,
+            });
+            read.ops = None;
+            read.latency = None;
+            read_report.rounds.push(read);
+            let mut open = op_phase_stat(run);
+            open.bytes = 0;
+            open.throughput_bytes_per_s = 0.0;
+            open_report.rounds.push(open);
+        }
+        if !ctx.args().keep {
+            reset_dir(&dir)?;
+            std::fs::remove_dir(&dir)?;
+        }
+        Ok(vec![open_report, read_report])
+    }
+}
+
+/// Stops the readers even when the opener returns early with an error.
+struct StopOnDrop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
@@ -2540,6 +2684,10 @@ mod tests {
         for name in ["multifile", "smallfile", "meta", "txn"] {
             assert!(all.workload.includes(name));
         }
+        assert!(!all.workload.includes("openread"));
+        let mixed = parse_args(&["/mnt".into(), "--workload".into(), "openread".into()]).unwrap();
+        assert!(mixed.workload.includes("openread"));
+        assert!(!mixed.workload.includes("multifile"));
         assert!(parse_args(&["/mnt".into(), "--ops".into(), "0".into()]).is_err());
     }
 
