@@ -1338,6 +1338,13 @@ struct MockBackend {
     statfs_capacity: Mutex<Option<FilesystemCapacity>>,
     write_blocker: Mutex<Option<WriteBlocker>>,
     read_blocker: Mutex<Option<WriteBlocker>>,
+    setattr_blocker: Mutex<Option<WriteBlocker>>,
+    rename_blocker: Mutex<Option<WriteBlocker>>,
+    /// Ordinary writes are owned by the DFS front queue and acknowledged at
+    /// admission, as the native DFS backend does.
+    queued_writes: std::sync::atomic::AtomicBool,
+    /// Backend arrival order of the callbacks the front-gate ordering tests watch.
+    trace: Mutex<Vec<String>>,
     events: Mutex<Vec<&'static str>>,
     getattr_calls: AtomicU64,
     read_calls: AtomicU64,
@@ -1396,6 +1403,7 @@ impl Backend for MockBackend {
         parent: BackendInode,
         name: &OsStr,
     ) -> afs_error::Result<Entry> {
+        self.note(format!("lookup:{}", name.to_string_lossy()));
         let state = self.state.lock().unwrap();
         let inode = state
             .entries
@@ -1403,6 +1411,10 @@ impl Backend for MockBackend {
             .copied()
             .ok_or_else(not_found)?;
         Ok(entry(inode, state.nodes.get(&inode).unwrap(), 0))
+    }
+
+    fn accepts_queued_writes(&self, _: FileHandle) -> bool {
+        self.queued_writes.load(Ordering::SeqCst)
     }
 
     fn getattr(
@@ -1478,11 +1490,13 @@ impl Backend for MockBackend {
         out: &mut [u8],
     ) -> afs_error::Result<usize> {
         self.read_calls.fetch_add(1, Ordering::SeqCst);
+        self.note("read:start".to_owned());
         let blocker = self.read_blocker.lock().unwrap().take();
         if let Some(blocker) = blocker {
             blocker.entered.send(()).unwrap();
             blocker.release.recv().unwrap();
         }
+        self.note("read:finish".to_owned());
         let state = self.state.lock().unwrap();
         let inode = *state.file_handles.get(&handle.0).ok_or_else(not_found)?;
         let data = &state.nodes.get(&inode).ok_or_else(not_found)?.data;
@@ -1504,6 +1518,7 @@ impl Backend for MockBackend {
         data: &[u8],
     ) -> afs_error::Result<usize> {
         self.events.lock().unwrap().push("write:start");
+        self.note("write:start".to_owned());
         let blocker = self.write_blocker.lock().unwrap().take();
         if let Some(blocker) = blocker {
             blocker.entered.send(()).unwrap();
@@ -1521,6 +1536,7 @@ impl Backend for MockBackend {
         }
         node.data[offset..offset + data.len()].copy_from_slice(data);
         self.events.lock().unwrap().push("write:finish");
+        self.note("write:finish".to_owned());
         Ok(data.len())
     }
 
@@ -1532,6 +1548,13 @@ impl Backend for MockBackend {
         change: &afs::node::vfs::types::AttributeChange,
     ) -> afs_error::Result<FileAttributes> {
         self.events.lock().unwrap().push("setattr");
+        self.note("setattr:start".to_owned());
+        let blocker = self.setattr_blocker.lock().unwrap().take();
+        if let Some(blocker) = blocker {
+            blocker.entered.send(()).unwrap();
+            blocker.release.recv().unwrap();
+        }
+        self.note("setattr:finish".to_owned());
         let mut state = self.state.lock().unwrap();
         let inode = handle
             .and_then(|handle| state.file_handles.get(&handle.0).copied())
@@ -1556,6 +1579,7 @@ impl Backend for MockBackend {
     }
 
     fn fsync(&self, _: &RequestContext, handle: FileHandle, _: SyncMode) -> afs_error::Result<()> {
+        self.note("fsync".to_owned());
         self.flush(&request_context(), handle)
     }
 
@@ -1678,6 +1702,13 @@ impl Backend for MockBackend {
         to_name: &OsStr,
         _: RenameFlags,
     ) -> afs_error::Result<()> {
+        self.note("rename:start".to_owned());
+        let blocker = self.rename_blocker.lock().unwrap().take();
+        if let Some(blocker) = blocker {
+            blocker.entered.send(()).unwrap();
+            blocker.release.recv().unwrap();
+        }
+        self.note("rename:finish".to_owned());
         let mut state = self.state.lock().unwrap();
         let inode = state
             .entries
@@ -1704,6 +1735,14 @@ impl MockBackend {
 
     fn events(&self) -> Vec<&'static str> {
         self.events.lock().unwrap().clone()
+    }
+
+    fn note(&self, event: String) {
+        self.trace.lock().unwrap().push(event);
+    }
+
+    fn trace(&self) -> Vec<String> {
+        self.trace.lock().unwrap().clone()
     }
 }
 
@@ -2093,5 +2132,369 @@ mod real_dfs_keep_cache_contract {
             assert_full_read(&mut &b"abcd"[..], b"abcd").unwrap(),
             blake3::hash(b"abcd")
         );
+    }
+}
+
+/// R67: the orderings the DFS front gate guarantees, pinned before the gate
+/// learns to let readers overlap. Each test blocks one callback inside the
+/// backend and checks that the later, ordered callback does not reach the
+/// backend until the first one finishes.
+mod front_gate_ordering {
+    use super::*;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    /// Long enough for an unordered callback to reach the backend.
+    const QUIET: Duration = Duration::from_millis(300);
+    const DEADLINE: Duration = Duration::from_secs(5);
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        mount: std::path::PathBuf,
+        backend: Arc<MockBackend>,
+        session: Option<fuse::MountedFuse>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let temp = tempfile::tempdir().unwrap();
+            let mount = temp.path().join("mnt");
+            std::fs::create_dir(&mount).unwrap();
+            let backend = Arc::new(MockBackend::default());
+            backend.queued_writes.store(true, Ordering::SeqCst);
+            let session = fuse::mount_dfs_with_options(
+                backend.clone(),
+                &mount,
+                fuse::FuseMountOptions::default(),
+            )
+            .unwrap();
+            wait_until_mounted(&mount).unwrap();
+            Self {
+                _temp: temp,
+                mount,
+                backend,
+                session: Some(session),
+            }
+        }
+
+        /// A direct-I/O descriptor: every read and write is a FUSE request.
+        fn open(&self, name: &str, create: bool) -> Arc<std::fs::File> {
+            Arc::new(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create(create)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(self.mount.join(name))
+                    .unwrap(),
+            )
+        }
+
+        fn reader(&self, name: &str) -> Arc<std::fs::File> {
+            Arc::new(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECT)
+                    .open(self.mount.join(name))
+                    .unwrap(),
+            )
+        }
+
+        fn arrived(&self, event: &str) -> bool {
+            self.backend.trace().iter().any(|seen| seen == event)
+        }
+
+        fn count(&self, event: &str) -> usize {
+            self.backend.trace().iter().filter(|seen| *seen == event).count()
+        }
+
+        fn position(&self, event: &str) -> usize {
+            let trace = self.backend.trace();
+            trace
+                .iter()
+                .position(|seen| seen == event)
+                .unwrap_or_else(|| panic!("{event} never reached the backend: {trace:?}"))
+        }
+
+        fn assert_before(&self, first: &str, then: &str) {
+            assert!(
+                self.position(first) < self.position(then),
+                "{then} reached the backend before {first}: {:?}",
+                self.backend.trace()
+            );
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            if let Some(session) = self.session.take() {
+                let _ = session.join();
+            }
+            let _ = std::process::Command::new("fusermount3")
+                .arg("-u")
+                .arg(&self.mount)
+                .status();
+        }
+    }
+
+    fn blocker(slot: &Mutex<Option<WriteBlocker>>) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        *slot.lock().unwrap() = Some(WriteBlocker {
+            entered: entered_tx,
+            release: release_rx,
+        });
+        (entered_rx, release_tx)
+    }
+
+    /// Runs `op` on its own thread; the receiver yields its result.
+    fn spawn<T: Send + 'static>(
+        op: impl FnOnce() -> io::Result<T> + Send + 'static,
+    ) -> mpsc::Receiver<io::Result<T>> {
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(op());
+        });
+        done_rx
+    }
+
+    /// Writes `abcd` at offset 0 and returns once the front queue has
+    /// acknowledged it while its body is still blocked inside the backend.
+    fn acked_blocked_write(fx: &Fixture, file: &Arc<std::fs::File>) -> mpsc::Sender<()> {
+        let (entered, release) = blocker(&fx.backend.write_blocker);
+        let writer = file.clone();
+        let acked = spawn(move || writer.write_at(b"abcd", 0));
+        entered.recv_timeout(DEADLINE).unwrap();
+        assert_eq!(
+            acked.recv_timeout(DEADLINE).unwrap().unwrap(),
+            4,
+            "an ordinary DFS write must be acknowledged at queue admission"
+        );
+        assert!(!fx.arrived("write:finish"));
+        release
+    }
+
+    #[test]
+    #[ignore = "requires Linux /dev/fuse and fusermount3"]
+    fn read_after_an_acknowledged_write_waits_for_its_body() {
+        let fx = Fixture::new();
+        let file = fx.open("a", true);
+        let reader = fx.reader("a");
+        let release = acked_blocked_write(&fx, &file);
+
+        let read = spawn(move || {
+            let mut bytes = [0u8; 4];
+            let count = reader.read_at(&mut bytes, 0)?;
+            Ok(bytes[..count].to_vec())
+        });
+        std::thread::sleep(QUIET);
+        assert!(!fx.arrived("read:start"), "READ overtook an acknowledged write");
+
+        release.send(()).unwrap();
+        assert_eq!(read.recv_timeout(DEADLINE).unwrap().unwrap(), b"abcd");
+        fx.assert_before("write:finish", "read:start");
+    }
+
+    #[test]
+    #[ignore = "requires Linux /dev/fuse and fusermount3"]
+    fn fsync_waits_for_an_acknowledged_write() {
+        let fx = Fixture::new();
+        let file = fx.open("a", true);
+        let release = acked_blocked_write(&fx, &file);
+
+        let syncer = file.clone();
+        let synced = spawn(move || syncer.sync_all());
+        std::thread::sleep(QUIET);
+        assert!(synced.try_recv().is_err(), "fsync returned before the write body");
+        assert!(!fx.arrived("fsync"));
+
+        release.send(()).unwrap();
+        synced.recv_timeout(DEADLINE).unwrap().unwrap();
+        fx.assert_before("write:finish", "fsync");
+    }
+
+    #[test]
+    #[ignore = "requires Linux /dev/fuse and fusermount3"]
+    fn truncate_waits_for_an_acknowledged_write() {
+        let fx = Fixture::new();
+        let file = fx.open("a", true);
+        let release = acked_blocked_write(&fx, &file);
+
+        let truncater = file.clone();
+        let truncated = spawn(move || truncater.set_len(1));
+        std::thread::sleep(QUIET);
+        assert!(!fx.arrived("setattr:start"), "SETATTR overtook an acknowledged write");
+
+        release.send(()).unwrap();
+        truncated.recv_timeout(DEADLINE).unwrap().unwrap();
+        fx.assert_before("write:finish", "setattr:start");
+    }
+
+    #[test]
+    #[ignore = "requires Linux /dev/fuse and fusermount3"]
+    fn path_lookup_waits_for_acknowledged_writes() {
+        let fx = Fixture::new();
+        let file = fx.open("a", true);
+        let release = acked_blocked_write(&fx, &file);
+
+        // CREATE already looked the name up once; count only later lookups.
+        let lookups = fx.count("lookup:a");
+        let path = fx.mount.join("a");
+        let looked_up = spawn(move || std::fs::metadata(path));
+        std::thread::sleep(QUIET);
+        assert_eq!(fx.count("lookup:a"), lookups, "LOOKUP overtook an acknowledged write");
+
+        release.send(()).unwrap();
+        looked_up.recv_timeout(DEADLINE).unwrap().unwrap();
+        let trace = fx.backend.trace();
+        let finished = fx.position("write:finish");
+        assert!(
+            trace[finished..].iter().any(|seen| seen == "lookup:a"),
+            "the path lookup never reached the backend after the write: {trace:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires Linux /dev/fuse and fusermount3"]
+    fn namespace_change_waits_for_acknowledged_writes_to_other_files() {
+        let fx = Fixture::new();
+        let file = fx.open("a", true);
+        drop(fx.open("b", true));
+        let release = acked_blocked_write(&fx, &file);
+
+        let (from, to) = (fx.mount.join("b"), fx.mount.join("c"));
+        let renamed = spawn(move || std::fs::rename(from, to));
+        std::thread::sleep(QUIET);
+        assert!(!fx.arrived("rename:start"), "RENAME overtook an acknowledged write");
+
+        release.send(()).unwrap();
+        renamed.recv_timeout(DEADLINE).unwrap().unwrap();
+        fx.assert_before("write:finish", "rename:start");
+    }
+
+    #[test]
+    #[ignore = "requires Linux /dev/fuse and fusermount3"]
+    fn read_waits_for_an_in_flight_truncate_of_the_same_file() {
+        let fx = Fixture::new();
+        let file = fx.open("a", true);
+        assert_eq!(file.write_at(b"abcd", 0).unwrap(), 4);
+        file.sync_all().unwrap();
+        let reader = fx.reader("a");
+
+        let (entered, release) = blocker(&fx.backend.setattr_blocker);
+        let truncater = file.clone();
+        let truncated = spawn(move || truncater.set_len(2));
+        entered.recv_timeout(DEADLINE).unwrap();
+
+        let read = spawn(move || {
+            let mut bytes = [0u8; 4];
+            let count = reader.read_at(&mut bytes, 0)?;
+            Ok(bytes[..count].to_vec())
+        });
+        std::thread::sleep(QUIET);
+        assert!(!fx.arrived("read:start"), "READ overlapped a same-file SETATTR");
+
+        release.send(()).unwrap();
+        truncated.recv_timeout(DEADLINE).unwrap().unwrap();
+        assert_eq!(read.recv_timeout(DEADLINE).unwrap().unwrap(), b"ab");
+        fx.assert_before("setattr:finish", "read:start");
+    }
+
+    #[test]
+    #[ignore = "requires Linux /dev/fuse and fusermount3"]
+    fn write_waits_for_an_in_flight_read_of_the_same_file() {
+        let fx = Fixture::new();
+        let file = fx.open("a", true);
+        assert_eq!(file.write_at(b"abcd", 0).unwrap(), 4);
+        file.sync_all().unwrap();
+        let reader = fx.reader("a");
+
+        let (entered, release) = blocker(&fx.backend.read_blocker);
+        let read = spawn(move || {
+            let mut bytes = [0u8; 4];
+            let count = reader.read_at(&mut bytes, 0)?;
+            Ok(bytes[..count].to_vec())
+        });
+        entered.recv_timeout(DEADLINE).unwrap();
+        let writes_before = fx
+            .backend
+            .trace()
+            .iter()
+            .filter(|seen| *seen == "write:start")
+            .count();
+
+        let writer = file.clone();
+        let written = spawn(move || writer.write_at(b"WXYZ", 0));
+        std::thread::sleep(QUIET);
+        let writes_now = fx
+            .backend
+            .trace()
+            .iter()
+            .filter(|seen| *seen == "write:start")
+            .count();
+        assert_eq!(writes_now, writes_before, "WRITE overlapped a same-file READ");
+
+        release.send(()).unwrap();
+        assert_eq!(read.recv_timeout(DEADLINE).unwrap().unwrap(), b"abcd");
+        assert_eq!(written.recv_timeout(DEADLINE).unwrap().unwrap(), 4);
+        file.sync_all().unwrap();
+        let mut bytes = [0u8; 4];
+        assert_eq!(fx.reader("a").read_at(&mut bytes, 0).unwrap(), 4);
+        assert_eq!(&bytes, b"WXYZ");
+    }
+
+    #[test]
+    #[ignore = "requires Linux /dev/fuse and fusermount3"]
+    fn namespace_change_waits_for_an_in_flight_file_callback() {
+        let fx = Fixture::new();
+        let file = fx.open("a", true);
+        assert_eq!(file.write_at(b"abcd", 0).unwrap(), 4);
+        file.sync_all().unwrap();
+        drop(fx.open("b", true));
+        let reader = fx.reader("a");
+
+        let (entered, release) = blocker(&fx.backend.read_blocker);
+        let read = spawn(move || {
+            let mut bytes = [0u8; 4];
+            reader.read_at(&mut bytes, 0)
+        });
+        entered.recv_timeout(DEADLINE).unwrap();
+
+        let (from, to) = (fx.mount.join("b"), fx.mount.join("c"));
+        let renamed = spawn(move || std::fs::rename(from, to));
+        std::thread::sleep(QUIET);
+        assert!(!fx.arrived("rename:start"), "RENAME overlapped an in-flight READ");
+
+        release.send(()).unwrap();
+        assert_eq!(read.recv_timeout(DEADLINE).unwrap().unwrap(), 4);
+        renamed.recv_timeout(DEADLINE).unwrap().unwrap();
+        fx.assert_before("read:finish", "rename:start");
+    }
+
+    #[test]
+    #[ignore = "requires Linux /dev/fuse and fusermount3"]
+    fn file_callback_waits_for_an_in_flight_namespace_change() {
+        let fx = Fixture::new();
+        let file = fx.open("a", true);
+        assert_eq!(file.write_at(b"abcd", 0).unwrap(), 4);
+        file.sync_all().unwrap();
+        drop(fx.open("b", true));
+        let reader = fx.reader("a");
+
+        let (entered, release) = blocker(&fx.backend.rename_blocker);
+        let (from, to) = (fx.mount.join("b"), fx.mount.join("c"));
+        let renamed = spawn(move || std::fs::rename(from, to));
+        entered.recv_timeout(DEADLINE).unwrap();
+
+        let read = spawn(move || {
+            let mut bytes = [0u8; 4];
+            reader.read_at(&mut bytes, 0)
+        });
+        std::thread::sleep(QUIET);
+        assert!(!fx.arrived("read:start"), "READ overlapped an in-flight RENAME");
+
+        release.send(()).unwrap();
+        renamed.recv_timeout(DEADLINE).unwrap().unwrap();
+        assert_eq!(read.recv_timeout(DEADLINE).unwrap().unwrap(), 4);
+        fx.assert_before("rename:finish", "read:start");
     }
 }
