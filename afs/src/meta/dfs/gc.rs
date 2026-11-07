@@ -308,6 +308,7 @@ struct GcPlan {
     /// Owner of each version in `keys`, for the commit condition.
     version_owners: BTreeMap<FileVersionId, InodeId>,
 }
+#[cfg(test)]
 fn plan_collection(
     entities: &[MetaEntity],
     references: &[GcReference],
