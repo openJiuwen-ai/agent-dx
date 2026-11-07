@@ -1345,6 +1345,12 @@ struct MockBackend {
     queued_writes: std::sync::atomic::AtomicBool,
     /// Backend arrival order of the callbacks the front-gate ordering tests watch.
     trace: Mutex<Vec<String>>,
+    /// R58: `security.capability` is a fixed local reply (as on DFS).
+    fixed_capability: std::sync::atomic::AtomicBool,
+    /// R58: answer the capability probe with ENODATA instead of EOPNOTSUPP.
+    capability_no_data: std::sync::atomic::AtomicBool,
+    /// R58: the thread that answered each capability probe.
+    capability_probes: Mutex<Vec<String>>,
     events: Mutex<Vec<&'static str>>,
     getattr_calls: AtomicU64,
     read_calls: AtomicU64,
@@ -1415,6 +1421,35 @@ impl Backend for MockBackend {
 
     fn accepts_queued_writes(&self, _: FileHandle) -> bool {
         self.queued_writes.load(Ordering::SeqCst)
+    }
+
+    fn getxattr_is_fixed_local(&self, name: &OsStr) -> bool {
+        self.fixed_capability.load(Ordering::SeqCst)
+            && name.as_encoded_bytes() == b"security.capability"
+    }
+
+    fn getxattr(
+        &self,
+        _: &RequestContext,
+        _: BackendInode,
+        name: &OsStr,
+    ) -> afs_error::Result<Vec<u8>> {
+        if name.as_encoded_bytes() == b"security.capability" {
+            self.capability_probes
+                .lock()
+                .unwrap()
+                .push(std::thread::current().name().unwrap_or("").to_owned());
+            let code = if self.capability_no_data.load(Ordering::SeqCst) {
+                afs_error::IO_NO_DATA
+            } else {
+                afs_error::IO_NOT_SUPPORTED
+            };
+            return Err(afs_error::Error::coded(code, "mock has no capabilities"));
+        }
+        Err(afs_error::Error::coded(
+            afs_error::IO_NOT_SUPPORTED,
+            "mock has no xattrs",
+        ))
     }
 
     fn getattr(
@@ -2528,5 +2563,91 @@ mod front_gate_ordering {
         renamed.recv_timeout(DEADLINE).unwrap().unwrap();
         assert_eq!(read.recv_timeout(DEADLINE).unwrap().unwrap(), 4);
         fx.assert_before("rename:finish", "read:start");
+    }
+}
+
+/// R58: the kernel asks for `security.capability` before writes; DFS answers
+/// it from a fixed local reply.
+mod capability_probe {
+    use super::*;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    const WRITES: usize = 16;
+
+    /// Mounts a DFS MockBackend, writes `WRITES` times through one cached and
+    /// one direct descriptor, and returns the probe threads per descriptor.
+    fn probes(fixed: bool, no_data: bool) -> (Vec<String>, Vec<String>) {
+        let temp = tempfile::tempdir().unwrap();
+        let mount = temp.path().join("mnt");
+        std::fs::create_dir(&mount).unwrap();
+        let backend = Arc::new(MockBackend::default());
+        backend.fixed_capability.store(fixed, Ordering::SeqCst);
+        backend.capability_no_data.store(no_data, Ordering::SeqCst);
+        let session = fuse::mount_dfs_with_options(
+            backend.clone(),
+            &mount,
+            fuse::FuseMountOptions::default(),
+        )
+        .unwrap();
+        wait_until_mounted(&mount).unwrap();
+        let mut seen = Vec::new();
+        for direct in [false, true] {
+            let mut options = std::fs::OpenOptions::new();
+            options.read(true).write(true).create(true);
+            if direct {
+                options.custom_flags(libc::O_DIRECT);
+            }
+            let file = options
+                .open(mount.join(if direct { "direct" } else { "cached" }))
+                .unwrap();
+            backend.capability_probes.lock().unwrap().clear();
+            for index in 0..WRITES {
+                assert_eq!(file.write_at(b"abcd", (index * 4) as u64).unwrap(), 4);
+            }
+            seen.push(std::mem::take(
+                &mut *backend.capability_probes.lock().unwrap(),
+            ));
+        }
+        drop(session.join());
+        let _ = std::process::Command::new("fusermount3")
+            .arg("-u")
+            .arg(&mount)
+            .status();
+        let direct = seen.pop().unwrap();
+        (seen.pop().unwrap(), direct)
+    }
+
+    /// Kernel behavior record for D-S3-3: probes per write with EOPNOTSUPP
+    /// and with ENODATA. Neither answer is cached by the kernel.
+    #[test]
+    #[ignore = "requires Linux /dev/fuse and fusermount3"]
+    fn kernel_probes_capability_on_every_write_whatever_the_answer() {
+        let (cached_eopnotsupp, direct_eopnotsupp) = probes(true, false);
+        let (cached_enodata, direct_enodata) = probes(true, true);
+        eprintln!(
+            "capability probes per {WRITES} writes: EOPNOTSUPP cached={} direct={}; ENODATA cached={} direct={}",
+            cached_eopnotsupp.len(),
+            direct_eopnotsupp.len(),
+            cached_enodata.len(),
+            direct_enodata.len()
+        );
+        assert!(cached_eopnotsupp.len() >= WRITES);
+        assert_eq!(cached_enodata.len(), cached_eopnotsupp.len());
+        assert_eq!(direct_enodata.len(), direct_eopnotsupp.len());
+    }
+
+    #[test]
+    #[ignore = "requires Linux /dev/fuse and fusermount3"]
+    fn fixed_capability_reply_needs_no_worker_handoff() {
+        let (cached, direct) = probes(true, false);
+        let all: Vec<_> = cached.iter().chain(&direct).collect();
+        assert!(
+            !all.is_empty(),
+            "the kernel never probed security.capability"
+        );
+        assert!(
+            all.iter().all(|thread| !thread.starts_with("afs-fuse-")),
+            "a fixed local capability reply was handed to a FUSE worker: {all:?}"
+        );
     }
 }

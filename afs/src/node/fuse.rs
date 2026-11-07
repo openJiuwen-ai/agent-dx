@@ -2271,7 +2271,7 @@ impl Filesystem for AfsFuse {
         let context = Self::metadata_context(req, 0);
         let name = name.to_os_string();
         let scoped = _front_guard.is_some();
-        self.submit_file_metadata(ino.0, scoped, move || {
+        let run = move || {
             let _front_guard = _front_guard;
             match backend.getxattr(&context, inode, &name) {
                 Ok(data) => reply_xattr(reply, FuseOp::Getxattr, size, Ok(data)),
@@ -2283,7 +2283,15 @@ impl Filesystem for AfsFuse {
                     &context,
                 ))),
             }
-        });
+        };
+        // A fixed local reply has no network or queue wait (the kernel's
+        // per-write `security.capability` probe): answer on the receive
+        // thread instead of handing it to a worker.
+        if ordering == FrontOrdering::FixedLocalReply {
+            run();
+        } else {
+            self.submit_file_metadata(ino.0, scoped, run);
+        }
     }
 
     fn listxattr(&self, req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {

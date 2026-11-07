@@ -494,7 +494,8 @@ pub trait Backend: Send + Sync {
     }
 
     /// A fixed local response which does not depend on queued write contents.
-    /// The actual operation must still validate inode identity and permissions.
+    /// The actual operation must still validate inode identity and permissions,
+    /// and must not block: the FUSE layer answers it on the receive thread.
     fn getxattr_is_fixed_local(&self, _name: &OsStr) -> bool {
         false
     }
