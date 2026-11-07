@@ -33,15 +33,60 @@ use crate::{
 };
 use std::{sync::Arc, time::Duration};
 
+/// Writeback passes by trigger (`notify`: a write-pipeline wakeup, `timer`:
+/// the commit timer) and whether the pass committed anything. Registered once
+/// per Node; R66 measures wakeups per operation with it.
+#[derive(Clone)]
+pub(crate) struct WritebackPassMetrics {
+    passes: afs_metrics::IntCounterVec,
+}
+
+impl WritebackPassMetrics {
+    pub(crate) fn register(
+        registry: &afs_metrics::Registry,
+    ) -> std::result::Result<Self, afs_metrics::MetricsError> {
+        registry.get_or_register(|registry| {
+            let passes = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new(
+                    "afs_dfs_writeback_passes_total",
+                    "DFS background writeback passes by trigger and outcome.",
+                ),
+                &["trigger", "outcome"],
+            )?;
+            afs_metrics::register_collector(registry, &passes)?;
+            for trigger in ["notify", "timer"] {
+                for outcome in ["committed", "idle", "error"] {
+                    passes.with_label_values(&[trigger, outcome]);
+                }
+            }
+            Ok(Self { passes })
+        })
+    }
+
+    fn observe(&self, timer_due: bool, outcome: &'static str) {
+        let trigger = if timer_due { "timer" } else { "notify" };
+        self.passes.with_label_values(&[trigger, outcome]).inc();
+    }
+}
+
 /// T6; see the module documentation.
 pub(crate) struct DfsBackgroundTick {
     fs: Arc<DistributedFs>,
     commit_period: Duration,
+    passes: WritebackPassMetrics,
 }
 
 impl DfsBackgroundTick {
-    pub(crate) fn new(fs: Arc<DistributedFs>, commit_period: Duration) -> Self {
-        Self { fs, commit_period }
+    pub(crate) fn new(
+        fs: Arc<DistributedFs>,
+        commit_period: Duration,
+        passes: WritebackPassMetrics,
+    ) -> Self {
+        Self {
+            fs,
+            commit_period,
+            passes,
+        }
     }
 
     /// Start the tick as one service; it stops with `services.stop`.
@@ -51,6 +96,7 @@ impl DfsBackgroundTick {
         let writeback_wakeup = dfs.writeback_notify();
         let background_commit_period = self.commit_period;
         let pump = WritebackPump { fs: dfs.clone() };
+        let passes = self.passes;
         let releases = RemoteReleaseRetrier { fs: dfs.clone() };
         let peers = PeerSessionReaper { fs: dfs };
         services.spawn(async move {
@@ -76,10 +122,12 @@ impl DfsBackgroundTick {
                         let pump = pump.clone();
                         match crate::node::bridge::spawn_blocking(move || pump.pass(due)).await {
                             Ok(Ok(count)) if count > 0 => {
+                                passes.observe(due, "committed");
                                 afs_logging::debug!("dfs.native_write_progress"; "count" => count, "timer_due" => due);
                             }
-                            Ok(Ok(_)) => {}
+                            Ok(Ok(_)) => passes.observe(due, "idle"),
                             Ok(Err(error)) => {
+                                passes.observe(due, "error");
                                 afs_logging::warn!("dfs.native_write_retry"; "error" => error.to_string());
                             }
                             Err(error) => {

@@ -135,6 +135,7 @@ pub(super) struct DfsAssembly {
     pub(super) peer_cache: Option<Arc<read::peer_cache::DiskPeerCache>>,
     pub(super) fetcher: Option<Arc<read::object_fetch::ObjectFetcher>>,
     pub(super) gc_collector: Option<Arc<gc::Collector>>,
+    pub(super) writeback_passes: background::tick::WritebackPassMetrics,
     /// Moved into `Node` once the mounts exist.
     pub(super) instance: Option<Arc<vfs::dfs::DistributedFs>>,
 }
@@ -227,6 +228,7 @@ impl DfsAssembly {
             peer_cache: None,
             fetcher: None,
             gc_collector: None,
+            writeback_passes: background::tick::WritebackPassMetrics::register(&obs.registry)?,
             instance: None,
         };
         if cfg.dfs {
@@ -499,6 +501,7 @@ pub(super) fn start_background(
     background::tick::DfsBackgroundTick::new(
         dfs,
         std::time::Duration::from_millis(cfg.dfs_background_commit_ms),
+        assembly.writeback_passes.clone(),
     )
     .start(services);
 }
