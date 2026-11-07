@@ -333,11 +333,10 @@ pub(crate) fn unix_ms() -> Result<u64> {
         .map_err(|_| invalid("system clock is before epoch"))
 }
 
-/// Post-error delay of the repair loop and its first idle poll.
+/// Idle poll and post-error delay of the repair loop. An idle claim reads no
+/// placement, and repair detection advances with these polls, so it does not back
+/// off.
 const REPAIR_IDLE_DELAY: Duration = Duration::from_secs(1);
-/// Idle polls back off to this. It bounds how long new repair debt waits for a
-/// poll on a Node that found none before.
-const REPAIR_IDLE_DELAY_MAX: Duration = Duration::from_secs(8);
 /// Delay after a reported task, so a backlog drains without a busy loop.
 const REPAIR_BUSY_DELAY: Duration = Duration::from_millis(1);
 
@@ -395,7 +394,7 @@ async fn run_repair_loop(
                     "attempt" => task.attempt);
                 delay = REPAIR_BUSY_DELAY;
             }
-            Ok(Ok(None)) => delay = next_idle_delay(delay),
+            Ok(Ok(None)) => delay = REPAIR_IDLE_DELAY,
             Ok(Err(error)) => {
                 afs_logging::warn!("dfs.replication_task_retry"; "error" => error.to_string());
                 delay = REPAIR_IDLE_DELAY;
@@ -407,11 +406,6 @@ async fn run_repair_loop(
             }
         }
     }
-}
-
-/// Doubles from the first idle poll to the cap; coming off work starts over.
-fn next_idle_delay(previous: Duration) -> Duration {
-    (previous * 2).clamp(REPAIR_IDLE_DELAY, REPAIR_IDLE_DELAY_MAX)
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -428,17 +422,6 @@ mod tests {
         let (_stop, rx) = tokio::sync::watch::channel(false);
         let result = run_repair_loop(rx, || panic!("worker state invalidated")).await;
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn idle_polls_back_off_to_the_cap_and_work_starts_over() {
-        let mut delay = REPAIR_BUSY_DELAY;
-        let mut seen = Vec::new();
-        for _ in 0..6 {
-            delay = next_idle_delay(delay);
-            seen.push(delay.as_secs());
-        }
-        assert_eq!(seen, vec![1, 2, 4, 8, 8, 8]);
     }
 
     #[tokio::test]

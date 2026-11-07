@@ -18,8 +18,8 @@ pub(super) fn reliable_copy_count(copies: &[CopyRecord]) -> usize {
 }
 
 /// Placements a patrol looks at per claim (smaller in unit tests, same logic). A
-/// Node that finds no work polls every 8 s, so this sets how fast a lost node is
-/// noticed: 100k placements in about 7 claims, a million in about 62.
+/// Node polls every second, so this sets how fast a lost node is noticed: 100k
+/// placements in about 7 seconds, a million in about a minute.
 pub(super) const PATROL_PAGE: usize = if cfg!(test) { 64 } else { 16 * 1024 };
 /// A patrol also starts this long after the last one finished. It catches what no
 /// session change announces; a lost node starts one at once.
@@ -28,9 +28,9 @@ const PATROL_PERIOD: std::time::Duration = std::time::Duration::from_secs(600);
 /// Placements found lacking copies wait here until a claim records their debt: a
 /// claim takes one candidate, and the patrol does not come back. The patrol pauses
 /// at this many, so memory and the work behind it stay bounded.
-const PATROL_SUSPECTS_MAX: usize = 4096;
+pub(super) const PATROL_SUSPECTS_MAX: usize = if cfg!(test) { 16 } else { 4096 };
 /// Waiting placements one claim looks at. It takes one, so a few are plenty.
-const PATROL_SUSPECTS_PER_CLAIM: usize = 256;
+const PATROL_SUSPECTS_PER_CLAIM: usize = if cfg!(test) { 4 } else { 256 };
 
 /// What decides that recorded placement health may have gone stale.
 #[derive(Eq, PartialEq)]
@@ -44,8 +44,23 @@ struct RepairPatrolSignature {
 pub(super) struct RepairPatrol {
     signature: Option<RepairPatrolSignature>,
     cursor: Option<crate::dfs::ChunkId>,
+    /// Where the patrol was at the latest change. Everything must be looked at once
+    /// after a change, so the patrol runs on through the end of the placements and
+    /// finishes when it comes back here. It never starts over: a change during a
+    /// patrol, even every few seconds, cannot keep the far placements from being
+    /// reached.
+    lap_end: Option<crate::dfs::ChunkId>,
+    /// The cursor passed the end of the placements since the latest change.
+    wrapped: bool,
     finished_at: Option<std::time::Instant>,
     suspects: BTreeSet<crate::dfs::ChunkId>,
+}
+
+#[cfg(test)]
+impl RepairPatrol {
+    pub(super) fn has_suspect(&self, chunk_id: &crate::dfs::ChunkId) -> bool {
+        self.suspects.contains(chunk_id)
+    }
 }
 
 /// Inputs shared by every candidate decision of one claim request.
@@ -295,13 +310,13 @@ impl DfsService {
                 .repair_patrol
                 .lock()
                 .map_err(|_| invalid("repair patrol lock poisoned"))?;
-            if patrol.signature.as_ref() != Some(&signature)
-                || patrol
-                    .finished_at
-                    .is_some_and(|finished| finished.elapsed() >= PATROL_PERIOD)
-            {
+            let periodic = patrol
+                .finished_at
+                .is_some_and(|finished| finished.elapsed() >= PATROL_PERIOD);
+            if patrol.signature.as_ref() != Some(&signature) || periodic {
                 patrol.signature = Some(signature);
-                patrol.cursor = None;
+                patrol.lap_end = patrol.cursor.clone();
+                patrol.wrapped = false;
                 patrol.finished_at = None;
             }
             if patrol.finished_at.is_some() || patrol.suspects.len() >= PATROL_SUSPECTS_MAX {
@@ -326,7 +341,26 @@ impl DfsService {
             _ => None,
         });
         if page.len() < PATROL_PAGE {
+            // The end of the placements. A patrol that began at the start is done;
+            // one that began mid-way goes round to where it began.
+            if patrol.lap_end.is_none() || patrol.wrapped {
+                patrol.finished_at = Some(std::time::Instant::now());
+            } else {
+                patrol.wrapped = true;
+                patrol.cursor = None;
+            }
+        } else if patrol.wrapped
+            && patrol
+                .lap_end
+                .as_ref()
+                .is_some_and(|end| patrol.cursor.as_ref().is_some_and(|cursor| cursor >= end))
+        {
             patrol.finished_at = Some(std::time::Instant::now());
+        }
+        if patrol.finished_at.is_some() {
+            patrol.cursor = None;
+            patrol.lap_end = None;
+            patrol.wrapped = false;
         }
         Ok(page)
     }

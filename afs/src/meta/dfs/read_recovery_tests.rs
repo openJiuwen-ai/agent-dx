@@ -1817,3 +1817,181 @@ async fn every_lost_replica_a_patrol_finds_gets_its_debt_recorded() {
         );
     }
 }
+
+/// Seeds `count` Satisfied placements whose one copy lives on `target`, with chunk
+/// ids that sort after everything else, and returns those ids.
+async fn seed_placements_on_target(
+    fixture: &Fixture,
+    prefix: &str,
+    count: usize,
+) -> Vec<crate::dfs::ChunkId> {
+    let target_epoch = match fixture
+        .store
+        .read(MetaRead::CurrentNodeSession {
+            node_id: "target".into(),
+        })
+        .await
+        .unwrap()
+        .entity
+    {
+        Some(MetaEntity::NodeSession(session)) => session.lease_epoch,
+        _ => panic!("target session is missing"),
+    };
+    let chunk = seed_chunk(fixture).await;
+    let mut ids = Vec::new();
+    for index in 0..count {
+        let chunk_id = crate::dfs::ChunkId::new(format!("{prefix}-{index:06}"));
+        let key = RequestKey::new("fixture", format!("seed-{}", chunk_id.0));
+        let mut txn = MetaTxn::new(key.clone(), StoreOperation::DfsCommitFileVersion);
+        txn.conditions
+            .push(TxnCondition::RequestAbsent(key.clone()));
+        let mut copy = fixture.copy.clone();
+        copy.id = CopyId::new(format!("copy-of-{}", chunk_id.0));
+        copy.chunk_id = chunk_id.clone();
+        copy.location = CopyLocation::Node {
+            node_id: "target".into(),
+            node_epoch: target_epoch,
+            device_id: "target-device".into(),
+            device_epoch: 1,
+            catalog_revision: 0,
+        };
+        txn.mutations.extend([
+            TxnMutation::Put(MetaEntity::DfsChunk(ChunkObject {
+                id: chunk_id.clone(),
+                ..chunk.clone()
+            })),
+            TxnMutation::Put(MetaEntity::DfsCopy(copy.clone())),
+            TxnMutation::Put(MetaEntity::DfsPlacement(PlacementRecord {
+                chunk_id: chunk_id.clone(),
+                replica_group_id: ReplicaGroupId::new("seed"),
+                placement_epoch: 1,
+                desired_copies: 1,
+                copies: vec![copy.id],
+                health: PlacementHealth::Satisfied,
+            })),
+            TxnMutation::RecordRequestOutcome(RequestOutcome {
+                request: key,
+                operation: StoreOperation::DfsCommitFileVersion,
+                result: OperationResult::Empty,
+            }),
+        ]);
+        fixture.store.compare_and_commit(txn).await.unwrap();
+        ids.push(chunk_id);
+    }
+    ids
+}
+
+async fn register_target(fixture: &Fixture, session: &str, device: &str) {
+    register(
+        &fixture.store,
+        "target",
+        session,
+        vec![StorageDeviceDescriptor {
+            device_id: device.into(),
+            device_epoch: 1,
+            catalog_revision: 0,
+            failure_domain: "target-fd".into(),
+        }],
+    )
+    .await;
+}
+
+async fn chunks_with_debt(fixture: &Fixture) -> std::collections::BTreeSet<crate::dfs::ChunkId> {
+    fixture
+        .store
+        .read(MetaRead::DfsReplicationTasks)
+        .await
+        .unwrap()
+        .entities
+        .into_iter()
+        .filter_map(|entity| match entity {
+            MetaEntity::DfsReplicationTask(task) => Some(task.chunk_id),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn more_lost_placements_than_the_waiting_list_holds_all_get_their_debt() {
+    let fixture = fixture().await;
+    register_target(&fixture, "target-original", "target-device").await;
+    // More than the list holds, and over several patrol pages.
+    let lost_count = PATROL_SUSPECTS_MAX * 5 + 3;
+    let lost = seed_placements_on_target(&fixture, "lost", lost_count).await;
+    // Let the first patrol find them all healthy.
+    for call in 0..4 {
+        fixture
+            .service
+            .claim_replication_task(claim_request(&format!("healthy-{call}")))
+            .await
+            .unwrap();
+    }
+    assert!(chunks_with_debt(&fixture).await.is_empty());
+    register_target(&fixture, "target-replaced", "target-device-2").await;
+    for call in 0.. {
+        assert!(
+            call <= lost_count * 2,
+            "the patrol must resume after the waiting list drains"
+        );
+        fixture
+            .service
+            .claim_replication_task(claim_request(&format!("drain-{call}")))
+            .await
+            .unwrap();
+        let with_debt = chunks_with_debt(&fixture).await;
+        if lost.iter().all(|chunk| with_debt.contains(chunk)) {
+            return;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_session_changing_during_every_claim_cannot_keep_the_patrol_from_far_placements() {
+    let fixture = fixture().await;
+    register_target(&fixture, "target-original", "target-device").await;
+    // Healthy placements on a node that stays: several pages before the far one.
+    seed_satisfied_placements(&fixture, PATROL_PAGE * 3).await;
+    let far = seed_placements_on_target(&fixture, "z-far", 1).await;
+    for call in 0..5 {
+        fixture
+            .service
+            .claim_replication_task(claim_request(&format!("healthy-{call}")))
+            .await
+            .unwrap();
+    }
+    // The far placement's only copy goes first, then another node flaps every
+    // claim: each flap is a change of the live sessions.
+    register_target(&fixture, "target-replaced", "target-device-2").await;
+    let mut found = false;
+    for call in 0..(5_usize) {
+        register(
+            &fixture.store,
+            "flapping",
+            &format!("flap-{call}"),
+            vec![StorageDeviceDescriptor {
+                device_id: format!("flap-device-{call}"),
+                device_epoch: 1,
+                catalog_revision: 0,
+                failure_domain: "flap-fd".into(),
+            }],
+        )
+        .await;
+        fixture
+            .service
+            .claim_replication_task(claim_request(&format!("flap-claim-{call}")))
+            .await
+            .unwrap();
+        if chunks_with_debt(&fixture).await.contains(&far[0])
+            || fixture
+                .service
+                .repair_patrol
+                .lock()
+                .unwrap()
+                .has_suspect(&far[0])
+        {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "a change must not send the patrol back to the start");
+}
