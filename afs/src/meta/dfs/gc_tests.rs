@@ -578,7 +578,7 @@ async fn a_plan_survives_unrelated_commits_and_fails_on_each_relevant_change() {
 #[tokio::test]
 async fn a_valid_plan_is_still_correct_when_replanned_at_commit_time() {
     // Seeded xorshift: a failure reproduces.
-    let mut seed = 0x5DEE_CE66_D_u64;
+    let mut seed = 0x0005_DEEC_E66D_u64;
     let mut random = move |limit: usize| {
         seed ^= seed << 13;
         seed ^= seed >> 7;
