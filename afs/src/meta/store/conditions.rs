@@ -186,7 +186,89 @@ pub(super) fn condition_matches(state: &State, condition: &TxnCondition) -> bool
             ancestor_inode_id,
             child_inode_id,
         } => !dfs_is_descendant_or_same(state, namespace_id, ancestor_inode_id, child_inode_id),
+        TxnCondition::DfsGcPlanStillValid(guard) => dfs_gc_plan_still_valid(state, guard),
     }
+}
+
+/// Whether a GC plan made at `guard.since` still holds. It holds unless a change
+/// since then touched what the plan writes or could make something in it alive
+/// again. These are the inputs of `plan_collection` that can move that way:
+///
+/// - a reference admitted for an inode the plan removes or whose old versions it
+///   removes, or a `write:` reference for the generation of a chunk it removes;
+/// - a write lease on those inodes;
+/// - a version on a removed inode or layout, or a layout using a removed chunk;
+/// - a task, placement or copy of a removed chunk;
+/// - a change in the set of live sessions, which decide the waiting nodes and the
+///   references retired with this plan;
+/// - any write to a key the plan writes. This covers inode changes of removed
+///   inodes, and tasks, placements and copies of removed chunks.
+///
+/// Everything else only makes more things dead: releases, expiring leases,
+/// claims and grace. A live inode's new head is a new version (commit requires
+/// its id to be absent), so its old versions stay dead. History the check cannot
+/// see counts as a change.
+fn dfs_gc_plan_still_valid(state: &State, guard: &super::GcPlanGuard) -> bool {
+    if state.compacted_to > guard.since {
+        return false;
+    }
+    let sessions_changed = {
+        let now_ms = now_unix_ms();
+        let live = state
+            .entities
+            .starting_at(MetaKey::CurrentNodeSession {
+                node_id: String::new(),
+            })
+            .take_while(|(key, _)| matches!(key, MetaKey::CurrentNodeSession { .. }))
+            .filter_map(|(_, versioned)| match &versioned.entity {
+                MetaEntity::NodeSession(session) if session.is_live_at_unix_ms(now_ms) => {
+                    Some((session.node_id.clone(), session.session_id.clone()))
+                }
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        live != guard.live_sessions
+    };
+    if sessions_changed {
+        return false;
+    }
+    !state.events.since(guard.since).any(|event| {
+        if guard.written_keys.contains(&event.key) {
+            return true;
+        }
+        let WatchChange::Put(entity) = &event.change else {
+            return false;
+        };
+        match entity {
+            MetaEntity::DfsReference(reference) => {
+                reference.retired_at_unix_ms.is_none()
+                    && (reference
+                        .inode_id
+                        .as_ref()
+                        .is_some_and(|inode| guard.protected_by_reference.contains(inode))
+                        || (reference.publication
+                            && reference
+                                .reference_id
+                                .strip_prefix("write:")
+                                .is_some_and(|generation| guard.generations.contains(generation))))
+            }
+            MetaEntity::DfsWriteLease(lease) => {
+                guard.protected_by_reference.contains(&lease.inode_id)
+            }
+            MetaEntity::DfsFileVersion(version) => {
+                guard.dead_inodes.contains(&version.inode_id)
+                    || guard.dead_layouts.contains(&version.layout_root)
+            }
+            MetaEntity::DfsLayoutRoot(layout) => layout
+                .inline_extents
+                .iter()
+                .any(|extent| guard.chunks.contains(&extent.chunk_id)),
+            MetaEntity::DfsReplicationTask(task) => guard.chunks.contains(&task.chunk_id),
+            MetaEntity::DfsCopy(copy) => guard.chunks.contains(&copy.chunk_id),
+            MetaEntity::DfsPlacement(placement) => guard.chunks.contains(&placement.chunk_id),
+            _ => false,
+        }
+    })
 }
 
 fn dfs_directory_is_empty(

@@ -98,6 +98,10 @@ impl SharedEvents {
     pub(super) fn iter(&self) -> impl Iterator<Item = &WatchEvent> {
         self.0.iter().map(Arc::as_ref)
     }
+    /// Events after `revision`, oldest first.
+    pub(super) fn since(&self, revision: StoreRevision) -> impl Iterator<Item = &WatchEvent> {
+        self.0.iter().skip(self.after(revision)).map(Arc::as_ref)
+    }
 }
 impl Extend<WatchEvent> for SharedEvents {
     fn extend<T: IntoIterator<Item = WatchEvent>>(&mut self, events: T) {

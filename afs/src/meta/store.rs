@@ -75,7 +75,8 @@ pub(crate) use model::{
 pub use read_view::MetaReadView;
 use read_view::*;
 pub use txn::{
-    MetaTxn, OperationResult, RequestOutcome, StoreOperation, TxnCondition, TxnMutation, TxnOutcome,
+    GcPlanGuard, MetaTxn, OperationResult, RequestOutcome, StoreOperation, TxnCondition,
+    TxnMutation, TxnOutcome,
 };
 
 /// Boxed only on the coarse Meta control path. Durable logs preserve results

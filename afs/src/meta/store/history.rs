@@ -195,6 +195,12 @@ impl Heap for super::TxnMutation {
 impl Heap for super::TxnCondition {
     fn heap(&self, c: &mut Charge) -> Result<()> {
         match self {
+            Self::DfsGcPlanStillValid(guard) => {
+                for key in &guard.written_keys {
+                    c.value(key)?;
+                }
+                c.value(&guard.heap_bytes())
+            }
             Self::RootEpochWatermarkEquals(value) => c.value(value),
             Self::StoreRevisionEquals(value) => c.value(value),
             Self::Missing(value) => c.value(value),
@@ -1777,6 +1783,37 @@ mod tests {
         assert!(
             !index.fits(all_protected),
             "protected history must backpressure its owner, not silently fit"
+        );
+    }
+}
+
+#[cfg(test)]
+mod gc_batch_charge_tests {
+    use super::*;
+    /// `MAX_BATCH_KEYS` in `meta::dfs::gc` relies on this: deleting a key charges
+    /// no more than the smallest event an old revision can hold.
+    #[test]
+    fn a_delete_event_charges_about_a_small_put() {
+        let key = |id: &str| super::super::MetaKey::DfsInode(crate::dfs::InodeId::new(id));
+        let charge = |id: &str| {
+            event_charge(&super::super::WatchEvent {
+                revision: super::super::StoreRevision(1),
+                event_index: 0,
+                key: key(id),
+                change: super::super::WatchChange::Delete,
+            })
+            .unwrap()
+        };
+        let long = "x".repeat(64);
+        println!(
+            "delete event charge: short {} long {}",
+            charge("i"),
+            charge(&long)
+        );
+        assert!(
+            charge(&long) < 2048,
+            "a delete stays small: {}",
+            charge(&long)
         );
     }
 }

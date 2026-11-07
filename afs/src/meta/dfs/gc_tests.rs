@@ -401,6 +401,574 @@ fn update(id: &str) -> UpdateGcReference {
     }
 }
 #[tokio::test]
+async fn a_plan_survives_unrelated_commits_and_fails_on_each_relevant_change() {
+    use crate::dfs::{FileVersionId, GcReference, ReplicationTask, ReplicationTaskId};
+    use crate::meta::store::{GcPlanGuard, entity_key};
+    let dead_chunk =
+        ChunkId::new("crc32c-v2-00000000000000000000000000000001-00000000000000000000000000000002");
+    let plan = |since| {
+        Arc::new(GcPlanGuard {
+            since,
+            written_keys: [
+                MetaKey::DfsInode(InodeId::new("dead")),
+                MetaKey::DfsChunk(dead_chunk.clone()),
+            ]
+            .into(),
+            protected_by_reference: [InodeId::new("dead"), InodeId::new("owner")].into(),
+            dead_inodes: [InodeId::new("dead")].into(),
+            dead_layouts: [LayoutRootId::new("dead-layout")].into(),
+            chunks: [dead_chunk.clone()].into(),
+            generations: ["00000000000000000000000000000001".to_owned()].into(),
+            live_sessions: [("n".to_owned(), "s".to_owned())].into(),
+        })
+    };
+    let reference = |id: &str, inode: &str, publication: bool, retired: Option<u64>| {
+        MetaEntity::DfsReference(GcReference {
+            open_read: None,
+            node_id: "n".into(),
+            session_id: "s".into(),
+            reference_id: id.into(),
+            inode_id: Some(InodeId::new(inode)),
+            publication,
+            chunks: vec![],
+            retired_at_unix_ms: retired,
+        })
+    };
+    let version_on = |inode: &str, layout: &str| {
+        MetaEntity::DfsFileVersion(FileVersion {
+            id: FileVersionId::new("new-version"),
+            inode_id: InodeId::new(inode),
+            parent_version: None,
+            length: 4,
+            layout_root: LayoutRootId::new(layout),
+            created_at_unix_ms: 0,
+        })
+    };
+    let mut layout_using_chunk = version("new-layout", "live", dead_chunk.0.as_str());
+    let layout_using_chunk = layout_using_chunk.remove(1);
+    let lease_on = |inode: &str| {
+        MetaEntity::DfsWriteLease(WriteLease {
+            inode_id: InodeId::new(inode),
+            owner_node_id: "n".into(),
+            owner_session_id: "s".into(),
+            lease_epoch: 1,
+            expires_at_unix_ms: u64::MAX,
+        })
+    };
+    let task = MetaEntity::DfsReplicationTask(ReplicationTask {
+        id: ReplicationTaskId::new("task"),
+        chunk_id: dead_chunk.clone(),
+        placement_epoch: 1,
+        desired_copies: 1,
+        existing_copies: vec![],
+        state: ReplicationTaskState::Pending,
+        attempt: 0,
+        next_retry_unix_ms: 0,
+        last_error: None,
+        claim: None,
+    });
+    let relevant = vec![
+        (
+            "new reference on the dead inode",
+            reference("open:a", "dead", false, None),
+        ),
+        (
+            "new reference on a version owner",
+            reference("open:b", "owner", false, None),
+        ),
+        (
+            "new write generation of a removed chunk",
+            reference(
+                "write:00000000000000000000000000000001",
+                "other",
+                true,
+                None,
+            ),
+        ),
+        ("lease on the dead inode", lease_on("dead")),
+        ("lease on a version owner", lease_on("owner")),
+        ("version on the dead inode", version_on("dead", "fresh")),
+        (
+            "version on a removed layout",
+            version_on("live", "dead-layout"),
+        ),
+        ("layout using a removed chunk", layout_using_chunk),
+        ("task of a removed chunk", task),
+        ("key the plan writes", inode("dead", 1, "v")),
+    ];
+    let unrelated = vec![
+        (
+            "reference on another inode",
+            reference("open:c", "live", false, None),
+        ),
+        (
+            "retiring a reference on the dead inode",
+            reference("open:d", "dead", false, Some(1)),
+        ),
+        (
+            "write generation of another chunk",
+            reference("write:ff", "live", true, None),
+        ),
+        ("lease on another inode", lease_on("live")),
+        ("version on another inode", version_on("live", "fresh")),
+        (
+            "new head of the version owner",
+            inode("owner", 1, "new-head"),
+        ),
+    ];
+    for (expected, cases) in [(false, relevant), (true, unrelated)] {
+        for (name, entity) in cases {
+            let (store, _) =
+                seeded_store(vec![inode("dead", 0, "v"), inode("owner", 1, "h")]).await;
+            let service = DfsService::new(store.clone());
+            let since = store.read_view().await.unwrap().snapshot().unwrap().0;
+            let condition = TxnCondition::DfsGcPlanStillValid(plan(since));
+            assert!(
+                service
+                    .gc_commit_checked(
+                        vec![],
+                        StoreOperation::DfsUpdateReference,
+                        vec![TxnMutation::Put(entity)]
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert_eq!(
+                service
+                    .gc_commit_checked(
+                        vec![condition],
+                        StoreOperation::DfsCollectGarbage,
+                        vec![TxnMutation::Delete(entity_key(&inode("dead", 0, "v")))]
+                    )
+                    .await
+                    .unwrap(),
+                expected,
+                "{name}"
+            );
+        }
+    }
+    // A change in the live sessions invalidates; a lease renewal does not.
+    let (store, _) = seeded_store(vec![inode("dead", 0, "v")]).await;
+    let service = DfsService::new(store.clone());
+    let since = store.read_view().await.unwrap().snapshot().unwrap().0;
+    let condition = TxnCondition::DfsGcPlanStillValid(plan(since));
+    register(
+        &store,
+        "other",
+        "o1",
+        SHORT_LEASE,
+        vec![storage_device("other")],
+    )
+    .await;
+    assert!(
+        !service
+            .gc_commit_checked(
+                vec![condition],
+                StoreOperation::DfsCollectGarbage,
+                vec![TxnMutation::Delete(entity_key(&inode("dead", 0, "v")))]
+            )
+            .await
+            .unwrap(),
+        "a new live session changes the waiting set"
+    );
+}
+
+/// Whatever a commit keeps valid must still be dead when re-planned at commit
+/// time: the check may refuse too much, never too little.
+#[tokio::test]
+async fn a_valid_plan_is_still_correct_when_replanned_at_commit_time() {
+    // Seeded xorshift: a failure reproduces.
+    let mut seed = 0x5DEE_CE66_D_u64;
+    let mut random = move |limit: usize| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed % limit as u64) as usize
+    };
+    let (mut kept, mut refused) = (0, 0);
+    for _round in 0..300 {
+        let now = 1_000_000_u64;
+        let grace = 10;
+        let mut entities = Vec::new();
+        for index in 0..6 {
+            let id = format!("i{index}");
+            let nlink = u32::from(random(2) == 0);
+            entities.push(inode(&id, nlink, &format!("v{index}-{}", random(2))));
+            for generation in 0..2 {
+                let version_id = format!("v{index}-{generation}");
+                let chunk_id = format!("c{index}-{generation}");
+                entities.extend(version(&version_id, &id, &chunk_id));
+                entities.push(chunk(&chunk_id));
+            }
+        }
+        let mut references = Vec::new();
+        for index in 0..random(4) {
+            let mut value = pin(&format!("open:r{index}"));
+            value.inode_id = Some(InodeId::new(format!("i{}", random(6))));
+            references.push(value.clone());
+            entities.push(MetaEntity::DfsReference(value));
+        }
+        let (store, _) = seeded_store(entities.clone()).await;
+        let service = DfsService::new(store.clone());
+        let (since, snapshot) = store.read_view().await.unwrap().snapshot().unwrap();
+        let plan = plan_collection(&snapshot, &references, now, grace);
+        let mutations = plan
+            .keys
+            .iter()
+            .cloned()
+            .map(TxnMutation::Delete)
+            .collect::<Vec<_>>();
+        let guard = plan_guard(since, &snapshot, now, &plan, &plan.keys, &mutations);
+        // Foreground commits racing the plan: any of the changes a real writer
+        // makes, aimed at random inodes, versions and chunks.
+        for change in 0..random(4) {
+            let target = random(6);
+            let mutation = match random(5) {
+                0 => {
+                    let mut value = pin(&format!("open:late{change}"));
+                    value.inode_id = Some(InodeId::new(format!("i{target}")));
+                    MetaEntity::DfsReference(value)
+                }
+                1 => MetaEntity::DfsWriteLease(WriteLease {
+                    inode_id: InodeId::new(format!("i{target}")),
+                    owner_node_id: "n".into(),
+                    owner_session_id: "s".into(),
+                    lease_epoch: 1,
+                    expires_at_unix_ms: u64::MAX,
+                }),
+                2 => {
+                    // A commit: a fresh head version with a fresh layout.
+                    let fresh = format!("fresh{change}");
+                    for entity in version(&fresh, &format!("i{target}"), &format!("c{fresh}")) {
+                        service
+                            .gc_commit_checked(
+                                vec![],
+                                StoreOperation::DfsUpdateReference,
+                                vec![TxnMutation::Put(entity)],
+                            )
+                            .await
+                            .unwrap();
+                    }
+                    inode(&format!("i{target}"), 1, &fresh)
+                }
+                3 => {
+                    // COW: a layout that references an existing chunk.
+                    version(
+                        &format!("clone{change}"),
+                        &format!("i{target}"),
+                        &format!("c{target}-{}", random(2)),
+                    )
+                    .remove(1)
+                }
+                _ => chunk(&format!("c{target}-{}", random(2))),
+            };
+            service
+                .gc_commit_checked(
+                    vec![],
+                    StoreOperation::DfsUpdateReference,
+                    vec![TxnMutation::Put(mutation)],
+                )
+                .await
+                .unwrap();
+        }
+        let (_, at_commit) = store.read_view().await.unwrap().snapshot().unwrap();
+        let references_now = at_commit
+            .iter()
+            .filter_map(|entity| match entity {
+                MetaEntity::DfsReference(value) => Some(value.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let replanned = plan_collection(&at_commit, &references_now, now, grace);
+        let still_dead = plan.keys.iter().all(|key| replanned.keys.contains(key))
+            && plan
+                .chunks
+                .iter()
+                .all(|chunk| replanned.chunks.contains(chunk));
+        let valid = service
+            .gc_commit_checked(
+                vec![TxnCondition::DfsGcPlanStillValid(Arc::new(guard))],
+                StoreOperation::DfsCollectGarbage,
+                mutations,
+            )
+            .await
+            .unwrap();
+        if valid {
+            kept += 1;
+            assert!(
+                still_dead,
+                "a kept plan deletes something a fresh plan would keep: {:?} vs {:?}",
+                plan.keys, replanned.keys
+            );
+        } else {
+            refused += 1;
+        }
+    }
+    assert!(
+        kept > 30 && refused > 30,
+        "the check must be exercised both ways: kept {kept}, refused {refused}"
+    );
+}
+
+/// Everything reachable from a live root, at every step of a batched collection.
+fn assert_live_files_intact(entities: &[MetaEntity], expected_live_files: usize) {
+    let mut live = 0;
+    for entity in entities {
+        let MetaEntity::DfsInode(inode) = entity else {
+            continue;
+        };
+        if inode.attributes.nlink == 0 {
+            continue;
+        }
+        live += 1;
+        let head = inode.head_version.as_ref().unwrap();
+        let version = entities
+            .iter()
+            .find_map(|value| match value {
+                MetaEntity::DfsFileVersion(version) if &version.id == head => Some(version),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("live inode lost its head version {head:?}"));
+        let layout = entities
+            .iter()
+            .find_map(|value| match value {
+                MetaEntity::DfsLayoutRoot(layout) if layout.id == version.layout_root => {
+                    Some(layout)
+                }
+                _ => None,
+            })
+            .expect("a live version keeps its layout");
+        for extent in &layout.inline_extents {
+            assert!(
+                entities.iter().any(|value| matches!(value,
+                    MetaEntity::DfsChunk(chunk) if chunk.id == extent.chunk_id)),
+                "a live layout keeps its chunks"
+            );
+        }
+    }
+    assert_eq!(live, expected_live_files);
+}
+
+fn bulk_delete_fixture(dead_files: usize, live_files: usize) -> Vec<MetaEntity> {
+    let mut entities = Vec::new();
+    for index in 0..dead_files + live_files {
+        let nlink = u32::from(index >= dead_files);
+        let (id, head, chunk_id) = (
+            format!("i{index:06}"),
+            format!("v{index:06}"),
+            format!("c{index:06}"),
+        );
+        entities.push(inode(&id, nlink, &head));
+        entities.extend(version(&head, &id, &chunk_id));
+        entities.push(chunk(&chunk_id));
+        entities.push(MetaEntity::DfsPlacement(crate::dfs::PlacementRecord {
+            chunk_id: ChunkId::new(&chunk_id),
+            replica_group_id: crate::dfs::ReplicaGroupId::new("g"),
+            placement_epoch: 1,
+            desired_copies: 1,
+            copies: Vec::new(),
+            health: PlacementHealth::Satisfied,
+        }));
+    }
+    entities
+}
+
+/// Drives passes as a Node would until nothing is dead, reopening the store from
+/// its log after each one when `restart` is set: a crash between any two batches.
+async fn collect_until_clean(
+    entities: Vec<MetaEntity>,
+    live_files: usize,
+    restart: bool,
+) -> (usize, Arc<crate::meta::store::Store>, DfsService) {
+    use crate::meta::store::Store;
+    let (mut store, backend) = seeded_store(entities).await;
+    let mut service = DfsService::new(store.clone()).with_gc_grace_ms(0);
+    let mut passes = 0;
+    let mut completed = 0;
+    loop {
+        passes += 1;
+        assert!(passes < 1000, "collection must converge");
+        let gc = service
+            .collect_garbage("n".into(), "s".into(), completed, vec![])
+            .await
+            .unwrap();
+        // The Node retires the chunks and acknowledges.
+        if gc.waiting_nodes.iter().any(|node| node == "n") {
+            service
+                .collect_garbage("n".into(), "s".into(), gc.generation, vec![])
+                .await
+                .unwrap();
+        }
+        completed = gc.generation;
+        let (_, now) = store.read_view().await.unwrap().snapshot().unwrap();
+        assert_live_files_intact(&now, live_files);
+        let references = Vec::new();
+        let plan = plan_collection(&now, &references, now_unix_ms(), 0);
+        if plan.keys.is_empty() {
+            return (passes, store, service);
+        }
+        if restart {
+            drop(service);
+            drop(store);
+            store = Arc::new(Store::open_log(backend.clone()).await.unwrap());
+            service = DfsService::new(store.clone()).with_gc_grace_ms(0);
+            // The session lease survives the reopen; the fixture is unchanged.
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_bulk_delete_converges_in_batches_and_leaves_live_files_intact() {
+    let (passes, store, _) = collect_until_clean(bulk_delete_fixture(600, 25), 25, false).await;
+    assert!(
+        passes > 1,
+        "chunk batches split a bulk delete across passes"
+    );
+    let (_, entities) = store.read_view().await.unwrap().snapshot().unwrap();
+    assert_eq!(
+        entities
+            .iter()
+            .filter(|entity| matches!(entity, MetaEntity::DfsInode(_)))
+            .count(),
+        25,
+        "only live inodes remain"
+    );
+    assert_eq!(
+        entities
+            .iter()
+            .filter(|entity| matches!(entity, MetaEntity::DfsChunk(_)))
+            .count(),
+        25,
+        "only live chunks remain"
+    );
+    assert!(
+        !entities.iter().any(|entity| matches!(entity,
+            MetaEntity::DfsPlacement(placement)
+                if !entities.iter().any(|chunk| matches!(chunk,
+                    MetaEntity::DfsChunk(value) if value.id == placement.chunk_id)))),
+        "a chunk's records leave together"
+    );
+}
+
+#[tokio::test]
+async fn a_restart_between_batches_resumes_and_finishes_the_same_collection() {
+    let (_, store, _) = collect_until_clean(bulk_delete_fixture(300, 10), 10, true).await;
+    let (_, entities) = store.read_view().await.unwrap().snapshot().unwrap();
+    assert_eq!(
+        entities
+            .iter()
+            .filter(|entity| matches!(entity, MetaEntity::DfsInode(_)))
+            .count(),
+        10
+    );
+}
+
+#[test]
+fn any_subset_of_a_plan_leaves_the_rest_dead_and_chunk_records_stay_together() {
+    let entities = bulk_delete_fixture(20, 5);
+    let plan = plan_bounded(&entities, &[], now_unix_ms(), 0, 8);
+    assert_eq!(plan.chunks.len(), 8);
+    // First the chunk records: 8 chunks and their placements.
+    assert_eq!(plan.chunk_keys, 16);
+    assert!(
+        plan.keys[..plan.chunk_keys]
+            .iter()
+            .all(|key| matches!(key, MetaKey::DfsChunk(_) | MetaKey::DfsPlacement(_)))
+    );
+    let rest = plan.keys[plan.chunk_keys..].to_vec();
+    // Delete a shrinking subset each time: what stays planned does not change.
+    for keep in [rest.len() / 2, rest.len() / 3, 1] {
+        let deleted = rest[keep..]
+            .iter()
+            .chain(plan.keys[..plan.chunk_keys].iter())
+            .collect::<BTreeSet<_>>();
+        let remaining = entities
+            .iter()
+            .filter(|entity| !deleted.contains(&crate::meta::store::entity_key(entity)))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_live_files_intact(&remaining, 5);
+        let again = plan_bounded(&remaining, &[], now_unix_ms(), 0, 1024);
+        for key in &rest[..keep] {
+            assert!(again.keys.contains(key), "{key:?} became reachable");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_commit_refused_for_size_halves_the_batch_and_is_counted() {
+    use crate::meta::store::{Store, journal::MemoryLog};
+    // History at its limit in single-event revisions: a commit can only free the
+    // oldest `cleanup_items` of them, so only a small batch can fit.
+    let backend = Arc::new(MemoryLog::new(Default::default()).unwrap());
+    let history = crate::meta::store::HistoryLimits {
+        event_count: 1000,
+        cleanup_items: 128,
+        ..Default::default()
+    };
+    let store = Arc::new(
+        Store::open_log_with_history(backend, history)
+            .await
+            .unwrap(),
+    );
+    store
+        .register_node_session(
+            RequestKey::new("n", "session"),
+            crate::meta::store::NodeSessionLease {
+                node_id: "n".into(),
+                session_id: "s".into(),
+                grpc_addr: "http://n:1".into(),
+                data_addr: "http://n:2".into(),
+                rest_addr: "http://n:3".into(),
+                ownerfs_enabled: false,
+                storage_devices: vec![storage_device("n")],
+                lease_ttl: std::time::Duration::from_secs(30),
+            },
+        )
+        .await
+        .unwrap();
+    for (index, entity) in bulk_delete_fixture(200, 0).into_iter().enumerate() {
+        let key = RequestKey::new("seed", format!("entity-{index}"));
+        let mut txn = MetaTxn::new(key.clone(), StoreOperation::DfsCollectGarbage);
+        txn.conditions
+            .push(TxnCondition::RequestAbsent(key.clone()));
+        txn.mutations.push(TxnMutation::Put(entity));
+        txn.mutations
+            .push(TxnMutation::RecordRequestOutcome(RequestOutcome {
+                request: key,
+                operation: StoreOperation::DfsCollectGarbage,
+                result: OperationResult::Empty,
+            }));
+        store.compare_and_commit(txn).await.unwrap();
+    }
+    let service = DfsService::new(store.clone()).with_gc_grace_ms(0);
+    let gc = service
+        .collect_garbage("n".into(), "s".into(), 0, vec![])
+        .await
+        .unwrap();
+    assert!(gc.generation > 0, "a smaller batch got through");
+    assert!(service.gc_metrics().rejected_batches.get() > 0);
+}
+
+#[tokio::test]
+async fn stalled_collection_is_visible_while_dead_keys_wait() {
+    let (store, _) = seeded_store(bulk_delete_fixture(3, 0)).await;
+    let service = DfsService::new(store.clone()).with_gc_grace_ms(0);
+    service.gc_metrics().observe_stall();
+    service.gc_metrics().dead_keys.set(10);
+    *service.gc_metrics().last_collected.lock().unwrap() =
+        Some(std::time::Instant::now() - std::time::Duration::from_secs(90));
+    service.gc_metrics().observe_stall();
+    assert!(service.gc_metrics().stalled_seconds.get() >= 90);
+    // A pass that collects clears it.
+    service
+        .collect_garbage("n".into(), "s".into(), 0, vec![])
+        .await
+        .unwrap();
+    assert_eq!(service.gc_metrics().stalled_seconds.get(), 0);
+}
+
+#[tokio::test]
 async fn create_admits_its_handle_reference_atomically_and_a_replay_keeps_one() {
     use crate::dfs::created_handle_reference_id;
     use crate::meta::dfs::CreateFileRequest as Create;
@@ -576,6 +1144,17 @@ fn admission_conditions(view: &crate::meta::store::MetaReadView, id: &str) -> Ve
     }
     conditions
 }
+/// The commit condition of a plan that deletes inode `i`, made at `since`.
+fn plan_of_dead_inode(since: crate::meta::store::StoreRevision) -> TxnCondition {
+    TxnCondition::DfsGcPlanStillValid(Arc::new(crate::meta::store::GcPlanGuard {
+        since,
+        written_keys: [MetaKey::DfsInode(InodeId::new("i"))].into(),
+        protected_by_reference: [InodeId::new("i")].into(),
+        dead_inodes: [InodeId::new("i")].into(),
+        live_sessions: [("n".to_owned(), "s".to_owned())].into(),
+        ..Default::default()
+    }))
+}
 #[tokio::test]
 async fn reference_conditions_ignore_unrelated_commits_but_invalidate_stale_collection() {
     let (store, _) = seeded_store(vec![inode("i", 1, "v")]).await;
@@ -599,8 +1178,8 @@ async fn reference_conditions_ignore_unrelated_commits_but_invalidate_stale_coll
     );
     assert!(
         !service
-            .gc_commit(
-                collection_revision,
+            .gc_commit_checked(
+                vec![plan_of_dead_inode(collection_revision)],
                 StoreOperation::DfsCollectGarbage,
                 vec![TxnMutation::Delete(MetaKey::DfsInode(InodeId::new("i")))]
             )

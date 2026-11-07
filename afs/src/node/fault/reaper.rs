@@ -17,6 +17,9 @@ use crate::{
 
 /// Period of the reaping loop.
 const REAPER_PERIOD: Duration = Duration::from_secs(5);
+/// Next pass after one that collected chunks: a backlog drains at about one
+/// generation per second, not one per period.
+const REAPER_BACKLOG_PERIOD: Duration = Duration::from_secs(1);
 
 /// Runs `Collector::collect_once` every [`REAPER_PERIOD`] until shutdown.
 ///
@@ -96,7 +99,12 @@ where
             } => {
                 let pass = pass.clone();
                 match crate::node::bridge::spawn_blocking(move || pass(kind)).await {
-                    Ok(Ok(count)) if count > 0 => afs_logging::info!("dfs.gc_collected"; "chunks" => count),
+                    Ok(Ok(count)) if count > 0 => {
+                        afs_logging::info!("dfs.gc_collected"; "chunks" => count);
+                        if matches!(kind, PassKind::Collect) {
+                            tick.reset_after(REAPER_BACKLOG_PERIOD);
+                        }
+                    }
                     Ok(Ok(_)) => {}
                     Ok(Err(error)) => afs_logging::warn!("dfs.gc_retry"; "error" => error.to_string()),
                     Err(error) => afs_logging::warn!("dfs.gc_worker_failed"; "error" => error.to_string()),

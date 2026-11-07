@@ -2,7 +2,7 @@
 use super::*;
 use crate::dfs::{ChunkId, GcReference, GcState, UpdateGcReference};
 use std::{
-    collections::{BTreeSet, hash_map::DefaultHasher},
+    collections::{BTreeMap, BTreeSet, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
 };
 static GC_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -59,6 +59,13 @@ pub(crate) struct GcMetrics {
     pub(crate) planned_entities: afs_metrics::IntGauge,
     /// Placements repair claims looked at; idle cost must not follow placements.
     pub(crate) repair_placements_checked: afs_metrics::IntCounter,
+    /// Keys the last plan found dead that the pass did not delete.
+    pub(crate) dead_keys: afs_metrics::IntGauge,
+    /// How long dead keys have waited with nothing collected; alert on it.
+    pub(crate) stalled_seconds: afs_metrics::IntGauge,
+    /// Commits refused for size; each halves the batch for the next attempt.
+    pub(crate) rejected_batches: afs_metrics::IntCounter,
+    last_collected: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     open_generation: Arc<std::sync::Mutex<Option<(u64, std::time::Instant)>>>,
 }
 
@@ -135,6 +142,19 @@ impl GcMetrics {
                 "afs_meta_dfs_repair_placements_checked_total",
                 "Placements looked at by DFS replication task claims",
             )?,
+            dead_keys: afs_metrics::IntGauge::new(
+                "afs_meta_dfs_gc_dead_keys",
+                "Keys the last DFS GC plan found dead and has not deleted yet",
+            )?,
+            stalled_seconds: afs_metrics::IntGauge::new(
+                "afs_meta_dfs_gc_stalled_seconds",
+                "How long dead keys have waited with nothing collected; 0 when none wait",
+            )?,
+            rejected_batches: afs_metrics::IntCounter::new(
+                "afs_meta_dfs_gc_rejected_batches_total",
+                "DFS GC commits refused for size, each halving the batch",
+            )?,
+            last_collected: Arc::new(std::sync::Mutex::new(None)),
             open_generation: Arc::new(std::sync::Mutex::new(None)),
         })
     }
@@ -158,7 +178,53 @@ impl GcMetrics {
         afs_metrics::register_collector(registry, &self.live_references)?;
         afs_metrics::register_collector(registry, &self.retired_reference_records)?;
         afs_metrics::register_collector(registry, &self.planned_entities)?;
-        afs_metrics::register_collector(registry, &self.repair_placements_checked)
+        afs_metrics::register_collector(registry, &self.repair_placements_checked)?;
+        afs_metrics::register_collector(registry, &self.dead_keys)?;
+        afs_metrics::register_collector(registry, &self.stalled_seconds)?;
+        afs_metrics::register_collector(registry, &self.rejected_batches)
+    }
+
+    /// Something was collected, or nothing was dead.
+    fn observe_collected(&self) {
+        if let Ok(mut last) = self.last_collected.lock() {
+            *last = Some(std::time::Instant::now());
+        }
+        self.stalled_seconds.set(0);
+    }
+
+    /// Refreshed by every pass, failed or not: stalled time is what an operator
+    /// has to see when collection stops working.
+    fn observe_stall(&self) {
+        let Ok(mut last) = self.last_collected.lock() else {
+            return;
+        };
+        let since = *last.get_or_insert_with(std::time::Instant::now);
+        if self.dead_keys.get() == 0 {
+            return;
+        }
+        let stalled = since.elapsed().as_secs();
+        let previous = self.stalled_seconds.get();
+        self.stalled_seconds
+            .set(i64::try_from(stalled).unwrap_or(i64::MAX));
+        if stalled >= GC_STALL_WARN_SECONDS
+            && i64::try_from(GC_STALL_WARN_SECONDS).is_ok_and(|warn| previous < warn)
+        {
+            afs_logging::warn!("dfs.gc_stalled";
+                "seconds" => stalled, "dead_keys" => self.dead_keys.get());
+        }
+    }
+
+    /// A commit refused for capacity gets a smaller batch; anything else, or the
+    /// smallest batch being refused, is the caller's error.
+    fn rejected_batch(&self, error: afs_error::Error, batch_keys: usize) -> Result<usize> {
+        if error.code() != afs_error::IO_CAPACITY {
+            return Err(error);
+        }
+        self.rejected_batches.inc();
+        if batch_keys <= MIN_BATCH_KEYS {
+            return Err(error);
+        }
+        Ok((batch_keys / 2).max(MIN_BATCH_KEYS))
     }
 
     fn observe_references(&self, entities: &[MetaEntity]) {
@@ -213,16 +279,49 @@ impl GcMetrics {
     }
 }
 
+/// Most keys one GC transaction deletes when nothing has pushed back. Equal to the
+/// default `history::Limits::cleanup_items`: a commit clears at most that many
+/// retained revisions while it is prepared, each holding at least one event of
+/// about a delete's charge, so a batch this size fits even with history at its
+/// byte limit. Smaller history limits are met by halving on rejection.
+const MAX_BATCH_KEYS: usize = 4096;
+/// References one pass retires for departed sessions.
+const MAX_RETIRED_PER_PASS: u64 = 1024;
+/// A pass stops halving here and reports the rejection.
+const MIN_BATCH_KEYS: usize = 64;
+/// Key batches one pass may commit after the first. Keys that are not chunk
+/// records need no Node acknowledgement, so one plan can clear many of them.
+const MAX_EXTRA_BATCHES_PER_PASS: usize = 15;
+/// Warn when dead keys exist and nothing was collected for this long.
+const GC_STALL_WARN_SECONDS: u64 = 60;
+/// One plan. `keys` holds the chunk records first, which must be deleted together
+/// with the barrier that names their chunks (a copy whose chunk record is gone
+/// would never be planned again). Everything after `chunk_keys` is independent:
+/// each entity is dead by reachability from live roots alone, so deleting any
+/// subset leaves the rest dead and whatever is live untouched, in any order and
+/// across restarts.
 #[derive(Default)]
 struct GcPlan {
     keys: Vec<MetaKey>,
+    chunk_keys: usize,
     chunks: Vec<ChunkId>,
+    /// Owner of each version in `keys`, for the commit condition.
+    version_owners: BTreeMap<FileVersionId, InodeId>,
 }
 fn plan_collection(
     entities: &[MetaEntity],
     references: &[GcReference],
     now: u64,
     grace: u64,
+) -> GcPlan {
+    plan_bounded(entities, references, now, grace, MAX_CHUNKS)
+}
+fn plan_bounded(
+    entities: &[MetaEntity],
+    references: &[GcReference],
+    now: u64,
+    grace: u64,
+    max_chunks: usize,
 ) -> GcPlan {
     let protected: BTreeSet<_> = references
         .iter()
@@ -317,13 +416,22 @@ fn plan_collection(
         })
         .collect::<BTreeSet<_>>()
         .into_iter()
-        .take(MAX_CHUNKS)
+        .take(max_chunks)
         .collect();
     let mut plan = GcPlan {
         keys: Vec::new(),
         chunks: reclaim.iter().cloned().collect(),
+        ..GcPlan::default()
     };
+    let mut other_keys = Vec::new();
     for entity in entities {
+        let chunk_record = matches!(
+            entity,
+            MetaEntity::DfsChunk(_)
+                | MetaEntity::DfsPlacement(_)
+                | MetaEntity::DfsCopy(_)
+                | MetaEntity::DfsReplicationTask(_)
+        );
         let dead = match entity {
             MetaEntity::DfsInode(inode) => {
                 inode.attributes.nlink == 0 && !protected_inodes.contains(&inode.inode_id)
@@ -346,9 +454,19 @@ fn plan_collection(
             _ => false,
         };
         if dead {
-            plan.keys.push(crate::meta::store::entity_key(entity));
+            if chunk_record {
+                plan.keys.push(crate::meta::store::entity_key(entity));
+            } else {
+                other_keys.push(crate::meta::store::entity_key(entity));
+                if let MetaEntity::DfsFileVersion(version) = entity {
+                    plan.version_owners
+                        .insert(version.id.clone(), version.inode_id.clone());
+                }
+            }
         }
     }
+    plan.chunk_keys = plan.keys.len();
+    plan.keys.extend(other_keys);
     plan
 }
 fn reference_entity(
@@ -616,19 +734,6 @@ impl DfsService {
         }
         Err(conflict("GC reference release contention"))
     }
-    async fn gc_commit(
-        &self,
-        revision: super::super::store::StoreRevision,
-        operation: StoreOperation,
-        mutations: Vec<TxnMutation>,
-    ) -> Result<bool> {
-        self.gc_commit_checked(
-            vec![TxnCondition::StoreRevisionEquals(revision)],
-            operation,
-            mutations,
-        )
-        .await
-    }
     async fn gc_commit_checked(
         &self,
         conditions: Vec<TxnCondition>,
@@ -673,9 +778,61 @@ impl DfsService {
         self.gc_metrics
             .pass_duration
             .observe(started.elapsed().as_secs_f64());
+        self.gc_metrics.observe_stall();
         let gc = result?;
         self.gc_metrics.observe(&gc);
         Ok(gc)
+    }
+
+    /// Commits what the first batch of a plan left, while the plan stays valid.
+    /// Best effort: anything left over is planned again next pass.
+    async fn commit_remaining_keys(
+        &self,
+        since: crate::meta::store::StoreRevision,
+        entities: &[MetaEntity],
+        now: u64,
+        plan: &GcPlan,
+        mut rest: &[MetaKey],
+        batch_keys: usize,
+    ) {
+        for _ in 0..MAX_EXTRA_BATCHES_PER_PASS {
+            if rest.is_empty() {
+                break;
+            }
+            let (batch, later) = rest.split_at(rest.len().min(batch_keys));
+            rest = later;
+            let mutations = batch
+                .iter()
+                .cloned()
+                .map(TxnMutation::Delete)
+                .collect::<Vec<_>>();
+            let chunkless = GcPlan {
+                version_owners: plan.version_owners.clone(),
+                ..GcPlan::default()
+            };
+            let guard = plan_guard(since, entities, now, &chunkless, batch, &mutations);
+            match self
+                .gc_commit_checked(
+                    vec![TxnCondition::DfsGcPlanStillValid(Arc::new(guard))],
+                    StoreOperation::DfsCollectGarbage,
+                    mutations,
+                )
+                .await
+            {
+                Ok(true) => self.gc_metrics.observe_collected(),
+                Ok(false) => {
+                    self.gc_metrics.conflicts.inc();
+                    return;
+                }
+                Err(error) => {
+                    let _ = self.gc_metrics.rejected_batch(error, MIN_BATCH_KEYS);
+                    return;
+                }
+            }
+        }
+        self.gc_metrics
+            .dead_keys
+            .set(i64::try_from(rest.len()).unwrap_or(i64::MAX));
     }
 
     /// Whether `node` should list the external object store and report a page
@@ -699,9 +856,12 @@ impl DfsService {
         if inventory.len() > MAX_CHUNKS {
             return Err(invalid("GC inventory batch too large"));
         }
+        let mut batch_keys = MAX_BATCH_KEYS;
         for _ in 0..64 {
             let view = self.store.read_view().await?;
             let (revision, mut entities) = view.snapshot()?;
+            let mut gc_conditions = Vec::new();
+            reference_entity(&view, MetaKey::DfsGc, &mut gc_conditions)?;
             self.gc_metrics.attempts.inc();
             self.gc_metrics.observe_references(&entities);
             live_caller(&entities, &node, &session)?;
@@ -734,13 +894,27 @@ impl DfsService {
                     }
                     mutations.push(TxnMutation::Put(MetaEntity::DfsGc(gc.clone())));
                 }
-                if !mutations.is_empty()
-                    && !self
-                        .gc_commit(revision, StoreOperation::DfsCollectGarbage, mutations)
+                if !mutations.is_empty() {
+                    let guard = plan_guard(
+                        revision,
+                        &entities,
+                        now,
+                        &GcPlan::default(),
+                        &[],
+                        &mutations,
+                    );
+                    gc_conditions.push(TxnCondition::DfsGcPlanStillValid(Arc::new(guard)));
+                    if !self
+                        .gc_commit_checked(
+                            gc_conditions,
+                            StoreOperation::DfsCollectGarbage,
+                            mutations,
+                        )
                         .await?
-                {
-                    self.gc_metrics.conflicts.inc();
-                    continue;
+                    {
+                        self.gc_metrics.conflicts.inc();
+                        continue;
+                    }
                 }
                 self.gc_metrics.dropped_nodes.inc_by(dropped as u64);
                 self.gc_metrics.retired_references.inc_by(retired);
@@ -754,16 +928,28 @@ impl DfsService {
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            let plan = plan_collection(&entities, &references, now_unix_ms(), self.gc_grace_ms);
-            mutations.extend(plan.keys.into_iter().map(TxnMutation::Delete));
+            let plan = plan_bounded(
+                &entities,
+                &references,
+                now,
+                self.gc_grace_ms,
+                MAX_CHUNKS.min(batch_keys / 8).max(1),
+            );
+            self.gc_metrics
+                .dead_keys
+                .set(i64::try_from(plan.keys.len()).unwrap_or(i64::MAX));
+            let first = plan.keys.len().min(plan.chunk_keys.max(batch_keys));
+            let (batch, rest) = plan.keys.split_at(first);
+            mutations.extend(batch.iter().cloned().map(TxnMutation::Delete));
             if mutations.is_empty() {
+                self.gc_metrics.observe_collected();
                 return Ok(gc);
             }
             gc.generation = gc
                 .generation
                 .checked_add(1)
                 .ok_or_else(|| conflict("GC generation exhausted"))?;
-            gc.chunks = plan.chunks;
+            gc.chunks = plan.chunks.clone();
             gc.waiting_nodes = if gc.chunks.is_empty() {
                 Vec::new()
             } else if self.is_external_backend() {
@@ -777,18 +963,94 @@ impl DfsService {
                 // No live storage node holds local copies to retire.
                 gc.chunks.clear();
             }
+            let guard = plan_guard(revision, &entities, now, &plan, batch, &mutations);
+            gc_conditions.push(TxnCondition::DfsGcPlanStillValid(Arc::new(guard)));
             mutations.push(TxnMutation::Put(MetaEntity::DfsGc(gc.clone())));
-            if self
-                .gc_commit(revision, StoreOperation::DfsCollectGarbage, mutations)
-                .await?
+            match self
+                .gc_commit_checked(gc_conditions, StoreOperation::DfsCollectGarbage, mutations)
+                .await
             {
-                self.gc_metrics.retired_references.inc_by(retired);
-                return Ok(gc);
+                Ok(true) => {}
+                Ok(false) => {
+                    self.gc_metrics.conflicts.inc();
+                    continue;
+                }
+                Err(error) => {
+                    batch_keys = self.gc_metrics.rejected_batch(error, batch_keys)?;
+                    continue;
+                }
             }
-            self.gc_metrics.conflicts.inc();
+            self.gc_metrics.retired_references.inc_by(retired);
+            self.gc_metrics.observe_collected();
+            self.commit_remaining_keys(revision, &entities, now, &plan, rest, batch_keys)
+                .await;
+            return Ok(gc);
         }
         self.gc_metrics.exhausted_passes.inc();
         Err(conflict("garbage collection contention"))
+    }
+}
+
+/// What the commit of `batch`, part of `plan`, must find unchanged; see
+/// `DfsGcPlanStillValid`. Only the batch's own keys matter: the rest of the plan
+/// is not being deleted by this commit.
+fn plan_guard(
+    since: crate::meta::store::StoreRevision,
+    entities: &[MetaEntity],
+    now: u64,
+    plan: &GcPlan,
+    batch: &[MetaKey],
+    mutations: &[TxnMutation],
+) -> crate::meta::store::GcPlanGuard {
+    let written_keys = mutations
+        .iter()
+        .filter_map(|mutation| match mutation {
+            TxnMutation::Put(entity) => Some(crate::meta::store::entity_key(entity)),
+            TxnMutation::Delete(key) => Some(key.clone()),
+            TxnMutation::RecordRequestOutcome(_) => None,
+        })
+        .collect();
+    let chunks = plan.chunks.iter().cloned().collect::<BTreeSet<_>>();
+    let generations = entities
+        .iter()
+        .filter_map(|entity| match entity {
+            MetaEntity::DfsChunk(chunk) if chunks.contains(&chunk.id) => chunk.write_generation(),
+            _ => None,
+        })
+        .map(str::to_owned)
+        .collect();
+    let (mut dead_inodes, mut protected_by_reference, mut dead_layouts) =
+        (BTreeSet::new(), BTreeSet::new(), BTreeSet::new());
+    for key in batch {
+        match key {
+            MetaKey::DfsInode(inode) => {
+                dead_inodes.insert(inode.clone());
+                protected_by_reference.insert(inode.clone());
+            }
+            MetaKey::DfsFileVersion(version) => {
+                if let Some(owner) = plan.version_owners.get(version) {
+                    protected_by_reference.insert(owner.clone());
+                }
+            }
+            MetaKey::DfsLayoutRoot(layout) => {
+                dead_layouts.insert(layout.clone());
+            }
+            _ => {}
+        }
+    }
+    crate::meta::store::GcPlanGuard {
+        since,
+        written_keys,
+        protected_by_reference,
+        dead_inodes,
+        dead_layouts,
+        chunks,
+        generations,
+        live_sessions: current_sessions(entities)
+            .into_iter()
+            .filter(|(_, session)| session.is_live_at_unix_ms(now))
+            .map(|(node, session)| (node.to_owned(), session.session_id.clone()))
+            .collect(),
     }
 }
 
@@ -895,6 +1157,10 @@ fn retire_departed_references(
             reference.retired_at_unix_ms = Some(deadline.max(now));
             mutations.push(TxnMutation::Put(entity.clone()));
             retired += 1;
+            // The rest stay protected and retire with a later pass.
+            if retired == MAX_RETIRED_PER_PASS {
+                break;
+            }
         }
     }
     retired

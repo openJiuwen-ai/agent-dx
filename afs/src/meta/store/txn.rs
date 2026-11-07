@@ -1,6 +1,8 @@
 //! Transaction conditions, mutations, operations and outcomes.
 
 use super::*;
+use crate::dfs::ChunkId;
+use std::collections::BTreeSet;
 
 /// Condition checked inside a single durable transaction.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -68,6 +70,53 @@ pub enum TxnCondition {
         ancestor_inode_id: InodeId,
         child_inode_id: InodeId,
     },
+    /// No change since the plan's snapshot can make anything in it alive again.
+    DfsGcPlanStillValid(Arc<GcPlanGuard>),
+}
+
+/// What a GC plan computed at `since` depends on; see
+/// `conditions::dfs_gc_plan_still_valid`.
+#[derive(Debug, Default, Eq, PartialEq)]
+pub struct GcPlanGuard {
+    pub since: StoreRevision,
+    /// Every key the transaction writes: its deletions and its Puts.
+    pub written_keys: BTreeSet<MetaKey>,
+    /// Inodes being deleted and the owners of versions being deleted.
+    pub protected_by_reference: BTreeSet<InodeId>,
+    /// Inodes being deleted.
+    pub dead_inodes: BTreeSet<InodeId>,
+    pub dead_layouts: BTreeSet<LayoutRootId>,
+    pub chunks: BTreeSet<ChunkId>,
+    /// Write generations of `chunks`: a live `write:` reference protects them.
+    pub generations: BTreeSet<String>,
+    /// `(node, session)` of the live sessions the plan saw.
+    pub live_sessions: BTreeSet<(String, String)>,
+}
+impl GcPlanGuard {
+    pub(super) fn heap_bytes(&self) -> usize {
+        fn text(value: &str) -> usize {
+            value.len() + 32
+        }
+        self.written_keys.len() * 128
+            + self
+                .protected_by_reference
+                .iter()
+                .map(|id| text(&id.0))
+                .sum::<usize>()
+            + self.dead_inodes.iter().map(|id| text(&id.0)).sum::<usize>()
+            + self
+                .dead_layouts
+                .iter()
+                .map(|id| text(&id.0))
+                .sum::<usize>()
+            + self.chunks.iter().map(|id| text(&id.0)).sum::<usize>()
+            + self.generations.iter().map(|id| text(id)).sum::<usize>()
+            + self
+                .live_sessions
+                .iter()
+                .map(|(node, session)| text(node) + text(session))
+                .sum::<usize>()
+    }
 }
 
 /// Mutation written inside a single durable transaction.
