@@ -6,7 +6,27 @@ use adx_agent_core::environment::EnvironmentError;
 use adx_protocol::control as pb;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::sync::{atomic::Ordering, Arc};
 use tonic::{Code, Status};
+
+/// Counts one in-process embedded Activator operation for the shutdown
+/// completion criterion: these run inside Ingress connection tasks, invisible
+/// to the management HTTP connection count, so the host must wait for the
+/// gauge separately ("management HTTP at zero ≠ activations finished").
+struct EmbeddedOperationGuard(Arc<std::sync::atomic::AtomicUsize>);
+
+impl EmbeddedOperationGuard {
+    fn new(counter: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::Relaxed);
+        Self(counter)
+    }
+}
+
+impl Drop for EmbeddedOperationGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 #[async_trait]
 impl EnvironmentApplication for EnvironmentService {
@@ -15,6 +35,7 @@ impl EnvironmentApplication for EnvironmentService {
         tenant: &str,
         input: Value,
     ) -> Result<Value, EnvironmentError> {
+        let _operation = EmbeddedOperationGuard::new(self.embedded_operations.clone());
         Box::pin(self.volume_request(
             "POST",
             None,
@@ -26,6 +47,7 @@ impl EnvironmentApplication for EnvironmentService {
         .map_err(map_volume_status)
     }
     async fn release_volume_owner(&self, tenant: &str, id: &str) -> Result<(), EnvironmentError> {
+        let _operation = EmbeddedOperationGuard::new(self.embedded_operations.clone());
         EnvironmentService::release_volume_owner(self, id, &caller(tenant))
             .await
             .map_err(map_volume_status)
@@ -36,6 +58,7 @@ impl EnvironmentApplication for EnvironmentService {
         input: Value,
         operation_id: &str,
     ) -> Result<Value, EnvironmentError> {
+        let _operation = EmbeddedOperationGuard::new(self.embedded_operations.clone());
         Box::pin(EnvironmentService::create_request(
             self,
             input,
@@ -46,6 +69,7 @@ impl EnvironmentApplication for EnvironmentService {
         .map_err(map_create_status)
     }
     async fn instance(&self, tenant: &str, id: &str) -> Result<Option<Value>, EnvironmentError> {
+        let _operation = EmbeddedOperationGuard::new(self.embedded_operations.clone());
         let Some(owner) = self
             .inspect(tenant, id)
             .await
@@ -66,6 +90,7 @@ impl EnvironmentApplication for EnvironmentService {
         input: Value,
         operation_id: &str,
     ) -> Result<(), EnvironmentError> {
+        let _operation = EmbeddedOperationGuard::new(self.embedded_operations.clone());
         self.execute(Kind::Delete, id, operation_id, input, &caller(tenant))
             .await
             .map_err(map_delete_status)?;

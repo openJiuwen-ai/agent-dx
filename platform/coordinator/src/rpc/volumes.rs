@@ -379,6 +379,7 @@ impl pb::volume_execution_service_server::VolumeExecutionService for Coordinator
             adx_observability::trace::Trace::rpc("coordinator.volume.initialize.begin", &request);
         trace
             .run_result(async {
+                self.admission()?;
                 let principal = self.0.peers.authenticate(&request)?;
                 let request = request.into_inner();
                 let record: EnvironmentRecord = request
@@ -432,6 +433,7 @@ impl pb::volume_execution_service_server::VolumeExecutionService for Coordinator
         );
         trace
             .run_result(async {
+                self.admission()?;
                 let principal = self.0.peers.authenticate(&request)?;
                 let request = request.into_inner();
                 let execution = request
@@ -477,6 +479,7 @@ impl pb::volume_service_server::VolumeService for CoordinatorRpc {
             adx_observability::trace::Trace::rpc("coordinator.volume.release_owner", &request);
         trace
             .run_result(async {
+                self.admission()?;
                 if self.0.peers.authenticate(&request)? != Principal::ApiServer {
                     return Err(Status::permission_denied("API Server identity required"));
                 }
@@ -537,6 +540,7 @@ impl pb::volume_service_server::VolumeService for CoordinatorRpc {
         let trace = adx_observability::trace::Trace::rpc("coordinator.volume.ensure", &request);
         trace
             .run_result(async {
+                self.admission()?;
                 if self.0.peers.authenticate(&request)? != Principal::ApiServer {
                     return Err(Status::permission_denied("API Server identity required"));
                 }
@@ -649,6 +653,7 @@ impl pb::volume_service_server::VolumeService for CoordinatorRpc {
         let trace = adx_observability::trace::Trace::rpc("coordinator.volume.delete", &request);
         trace
             .run_result(async {
+                self.admission()?;
                 if self.0.peers.authenticate(&request)? != Principal::ApiServer {
                     return Err(Status::permission_denied("API Server identity required"));
                 }

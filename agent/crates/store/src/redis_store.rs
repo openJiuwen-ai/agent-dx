@@ -178,6 +178,25 @@ impl RedisRepository {
     }
 }
 
+impl RedisRepository {
+    /// Liveness probe shared by readiness checks. Never replays a command
+    /// whose result is unknown; PING is side-effect-free so any failure
+    /// (including a timeout) simply reports "not ready".
+    pub async fn ping(&self) -> Result<()> {
+        let _: String = self.execute(redis::cmd("PING"), false).await?;
+        Ok(())
+    }
+    /// Dedicated pub/sub connection for membership-change notifications.
+    /// Separate from the multiplexed command connection so subscriptions do
+    /// not block command traffic.
+    pub async fn pubsub(&self) -> Result<redis::aio::PubSub> {
+        self.client
+            .get_async_pubsub()
+            .await
+            .map_err(|_| Error::Unavailable("Redis pubsub connect failed".into()))
+    }
+}
+
 #[async_trait]
 impl Repository for RedisRepository {
     async fn get(&self, key: &Key) -> Result<Option<Record>> {

@@ -394,6 +394,33 @@ impl TryFrom<adx_core::EnvironmentRecord> for control::EnvironmentRecord {
         })
     }
 }
+/// Trailer metadata marking a rejection as "not accepted": the request was
+/// refused before any effect, so the same request may be retried, against
+/// another replica or the next primary, with the same identity. Callers must
+/// distinguish this from an ordinary `Unavailable`, which may follow an
+/// applied write (outcome unknown).
+pub const NOT_ACCEPTED_METADATA: &str = "adx-not-accepted";
+
+/// A structured "handover or drain in progress; not accepted" rejection.
+/// Used by a coordinator draining for handover and by replicas rejecting
+/// work while shutting down.
+pub fn not_accepted(message: impl Into<String>) -> tonic::Status {
+    let mut status = tonic::Status::unavailable(message);
+    status.metadata_mut().insert(
+        NOT_ACCEPTED_METADATA,
+        tonic::metadata::MetadataValue::from_static("true"),
+    );
+    status
+}
+
+/// Whether a status is a structured "not accepted" rejection.
+pub fn not_accepted_status(status: &tonic::Status) -> bool {
+    status
+        .metadata()
+        .get(NOT_ACCEPTED_METADATA)
+        .is_some_and(|value| value.as_bytes() == b"true")
+}
+
 pub fn status(error: adx_core::Error) -> tonic::Status {
     match error {
         Error::UnsupportedCapability(capability) => {

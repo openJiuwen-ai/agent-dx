@@ -12,9 +12,10 @@ pub(super) fn now() -> Result<u64> {
 }
 impl CoordinatorRpc {
     pub async fn recover_environments(&self) -> Result<usize> {
-        let work = {
+        let (work, coordinator_epoch) = {
             let mut state = self.0.state.lock().await;
             state.healthy()?;
+            let coordinator_epoch = state.session.epoch();
             let now = now()?;
             let candidates: Vec<_> = state
                 .environments
@@ -84,7 +85,7 @@ impl CoordinatorRpc {
                 .take(16)
                 .collect();
             state.recovery_cursor = work.last().map(|(_, record, _)| record.spec.id.clone());
-            work
+            (work, coordinator_epoch)
         };
         let results = stream::iter(work.into_iter().map(|(node, record, run_timeout_seconds)| {
             Box::pin(async move {
@@ -106,6 +107,7 @@ impl CoordinatorRpc {
                             run_timeout_seconds,
                             record: Some(record.try_into()?),
                             node_session_id: session.clone(),
+                            coordinator_epoch,
                         })
                         .await
                         .map_err(adx_protocol::dependency_status)?

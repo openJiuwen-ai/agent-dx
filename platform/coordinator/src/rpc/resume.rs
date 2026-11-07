@@ -210,6 +210,7 @@ impl CoordinatorRpc {
             let work = {
                 let mut state = self.0.state.lock().await;
                 state.healthy().map_err(status)?;
+                let coordinator_epoch = state.session.epoch();
                 let mut stored = state.session.get(id).await.map_err(status)?;
                 if stored.resume.is_some() {
                     let was_rejected = stored.resume.as_ref().is_some_and(|r| r.local_rejected);
@@ -351,12 +352,12 @@ impl CoordinatorRpc {
                     && !stored.resume.as_ref().is_some_and(|r| r.local_rejected)
                     && !waiting_for_volume
                 {
-                    Some((stored, node, record))
+                    Some((stored, node, record, coordinator_epoch))
                 } else {
                     None
                 }
             };
-            let Some((stored, node, record)) = work else {
+            let Some((stored, node, record, coordinator_epoch)) = work else {
                 if waiting_for_volume {
                     changed.await;
                 } else {
@@ -396,6 +397,7 @@ impl CoordinatorRpc {
                         run_timeout_seconds: intent.run_timeout_seconds,
                         record: Some(record.try_into().map_err(status)?),
                         node_session_id: session.clone(),
+                        coordinator_epoch,
                     })
                     .await
             } else {
@@ -405,6 +407,7 @@ impl CoordinatorRpc {
                         assignment: Some(stored.assignment.clone().try_into().map_err(status)?),
                         operation_id: intent.operation_id.clone(),
                         node_session_id: session.clone(),
+                        coordinator_epoch,
                     })
                     .await
             };

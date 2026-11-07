@@ -70,6 +70,12 @@ pub struct EnvironmentService {
     names: Mutex<HashMap<String, CreateKey>>,
     #[cfg(test)]
     cleanup_started: [tokio::sync::Notify; 2],
+    /// In-process embedded Activator operations (activations, bindings and
+    /// their environment management calls) currently executing. They run
+    /// inside Ingress connection tasks, so the management HTTP connection
+    /// count cannot see them; shutdown waits for this gauge instead —
+    /// "management HTTP at zero ≠ activations finished".
+    pub(crate) embedded_operations: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl EnvironmentService {
@@ -87,6 +93,7 @@ impl EnvironmentService {
             names: Mutex::default(),
             #[cfg(test)]
             cleanup_started: Default::default(),
+            embedded_operations: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         });
         let weak = Arc::downgrade(&service);
         tokio::spawn(async move {
@@ -149,6 +156,13 @@ impl EnvironmentService {
 
     pub fn metrics(&self) -> String {
         self.creation_metrics.render()
+    }
+
+    /// Embedded Activator operations currently executing (see the field
+    /// comment). The shutdown completion criterion reads this.
+    pub fn embedded_operations(&self) -> usize {
+        self.embedded_operations
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Inspect the caller-visible Environment through the same versioned

@@ -6,7 +6,7 @@ use adx_activator::{
 };
 use adx_agent_core::{
     alias::{AliasConfig, VersionWeight},
-    discovery::{ranked_endpoints, ActivatorEndpoint},
+    discovery::{ranked_endpoints, ActivatorEndpoint, MemberCondition},
     environment::*,
     *,
 };
@@ -57,6 +57,11 @@ impl Environment for Platform {
         Ok(record.clone())
     }
 }
+
+fn ready_condition() -> adx_activator::registration::ConditionSource {
+    Arc::new(MemberCondition::default)
+}
+
 fn settings() -> ReconcileSettings {
     ReconcileSettings {
         concurrency: 2,
@@ -174,7 +179,12 @@ async fn member_removal_transfers_unfinished_bindings_without_an_alias_update() 
         .unwrap()
         .binding;
     registry
-        .renew(&members[0], "ghost", Duration::from_secs(60))
+        .renew(
+            &members[0],
+            "ghost",
+            Duration::from_secs(60),
+            MemberCondition::default(),
+        )
         .await
         .unwrap();
     let survivor = Reconciliation::start(
@@ -183,6 +193,8 @@ async fn member_removal_transfers_unfinished_bindings_without_an_alias_update() 
         registry.clone(),
         registration("survivor"),
         settings(),
+        true,
+        ready_condition(),
     )
     .await
     .unwrap();
@@ -203,7 +215,7 @@ async fn member_removal_transfers_unfinished_bindings_without_an_alias_update() 
         platform.0.lock().unwrap()[&original.current.environment_id].phase,
         EnvironmentPhase::Deleted
     );
-    survivor.shutdown().await.unwrap();
+    survivor.shutdown(Duration::from_secs(5)).await.unwrap();
 }
 
 #[tokio::test]
@@ -224,6 +236,8 @@ async fn startup_scan_and_later_notifications_converge_and_invalidate_hot_cache(
         registry,
         registration("only"),
         settings(),
+        true,
+        ready_condition(),
     )
     .await
     .unwrap();
@@ -252,7 +266,7 @@ async fn startup_scan_and_later_notifications_converge_and_invalidate_hot_cache(
         "retired Env must never be promoted again"
     );
     assert_eq!(platform.0.lock().unwrap().len(), 3);
-    worker.shutdown().await.unwrap();
+    worker.shutdown(Duration::from_secs(5)).await.unwrap();
 }
 
 #[tokio::test]
@@ -270,6 +284,8 @@ async fn subscription_reconnect_rescans_changes_missed_while_disconnected() {
         registry,
         registration("only"),
         settings(),
+        true,
+        ready_condition(),
     )
     .await
     .unwrap();
@@ -306,7 +322,7 @@ async fn subscription_reconnect_rescans_changes_missed_while_disconnected() {
     select(&state, &mut config, "2").await;
     converged(&state, &scope, "2").await;
     assert!(activator.ready());
-    worker.shutdown().await.unwrap();
+    worker.shutdown(Duration::from_secs(5)).await.unwrap();
 }
 
 #[tokio::test]
@@ -328,6 +344,8 @@ async fn two_live_activators_invalidate_their_caches_on_the_same_binding_switch(
         registry.clone(),
         registration("one"),
         settings(),
+        true,
+        ready_condition(),
     )
     .await
     .unwrap();
@@ -337,6 +355,8 @@ async fn two_live_activators_invalidate_their_caches_on_the_same_binding_switch(
         registry,
         registration("two"),
         settings(),
+        true,
+        ready_condition(),
     )
     .await
     .unwrap();
@@ -363,8 +383,8 @@ async fn two_live_activators_invalidate_their_caches_on_the_same_binding_switch(
         .unwrap();
     }
     assert_eq!(platform.0.lock().unwrap().len(), 2);
-    one.shutdown().await.unwrap();
-    two.shutdown().await.unwrap();
+    one.shutdown(Duration::from_secs(5)).await.unwrap();
+    two.shutdown(Duration::from_secs(5)).await.unwrap();
 }
 
 #[derive(Default)]
@@ -445,6 +465,8 @@ async fn cancelled_creation_retries_after_backoff_without_holding_a_worker() {
             concurrency: 1,
             ..settings()
         },
+        true,
+        ready_condition(),
     )
     .await
     .unwrap();
@@ -468,7 +490,7 @@ async fn cancelled_creation_retries_after_backoff_without_holding_a_worker() {
         .phase = EnvironmentPhase::Paused;
     converged(&state, &waiting, "2").await;
     assert_eq!(*platform.attempts.lock().unwrap(), vec![0, 1]);
-    worker.shutdown().await.unwrap();
+    worker.shutdown(Duration::from_secs(5)).await.unwrap();
 }
 
 #[tokio::test]
@@ -494,6 +516,8 @@ async fn unpaused_current_defers_candidate_without_holding_a_worker() {
             concurrency: 1,
             ..settings()
         },
+        true,
+        ready_condition(),
     )
     .await
     .unwrap();
@@ -507,5 +531,5 @@ async fn unpaused_current_defers_candidate_without_holding_a_worker() {
     assert!(!platform.0.lock().unwrap().contains_key(candidate));
     pause_current(&platform, &state, &waiting).await;
     converged(&state, &waiting, "2").await;
-    worker.shutdown().await.unwrap();
+    worker.shutdown(Duration::from_secs(5)).await.unwrap();
 }

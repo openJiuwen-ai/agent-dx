@@ -28,6 +28,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::mpsc;
+use tokio::{sync::Mutex, task::JoinSet};
 use tonic::{Code, Status};
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -38,6 +39,22 @@ pub struct Api {
     pub clients: Arc<Clients>,
     pub environment_service: Arc<EnvironmentService>,
     proxy: reqwest::Client,
+    /// Background tasks for SSE create streams (and other detached work) so
+    /// shutdown can drain them within the shutdown budget instead of leaving
+    /// them to be killed at runtime exit. Aborting a create task surfaces as
+    /// an unknown outcome, handled by `CreateReplays` retention.
+    pub background: Arc<Mutex<JoinSet<()>>>,
+    /// Set when the process begins shutting down: new management operations
+    /// are rejected before acceptance with the structured not-started
+    /// contract ("交接中，未接收"); already-accepted requests continue
+    /// within the shutdown budget. `/readyz` follows this flag.
+    draining: Arc<std::sync::atomic::AtomicBool>,
+    /// Admission readiness contributed by optional embedded components (the
+    /// embedded Ingress, which itself covers the embedded Activator's entry
+    /// path). Set once by the host after construction; initialization-only —
+    /// runtime failures after initialization are per-request errors and must
+    /// not un-ready the replica.
+    embedded_readiness: std::sync::OnceLock<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 impl Api {
     pub fn new(clients: Arc<Clients>) -> Result<Arc<Self>, Error> {
@@ -49,7 +66,37 @@ impl Api {
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(10))
                 .build()?,
+            background: Arc::new(Mutex::new(JoinSet::new())),
+            draining: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            embedded_readiness: std::sync::OnceLock::new(),
         }))
+    }
+
+    /// Fold an embedded component's admission readiness into `/readyz`.
+    /// Call once, after the embedded component has started. Initialization
+    /// criteria only; see [`Api::ready`].
+    pub fn set_embedded_readiness(&self, probe: Box<dyn Fn() -> bool + Send + Sync>) {
+        let _ = self.embedded_readiness.set(probe);
+    }
+
+    /// Admission readiness for `/readyz`: the directory watches have
+    /// delivered their first frame, every embedded component reports ready,
+    /// and the process is not draining. Each criterion is a one-way startup
+    /// latch — a transient watch reconnect or a runtime dependency failure
+    /// never flips readiness back, so a shared-dependency outage cannot pull
+    /// every replica out of load balancing at once.
+    pub fn ready(&self) -> bool {
+        self.clients.ready()
+            && self.embedded_readiness.get().is_none_or(|probe| probe())
+            && !self.draining.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Begin rejecting new management operations ("交接中，未接收") and
+    /// reporting not-ready on `/readyz`. Already-accepted requests continue
+    /// within the shutdown budget.
+    pub fn begin_draining(&self) {
+        self.draining
+            .store(true, std::sync::atomic::Ordering::Release);
     }
     pub async fn serve(
         self: Arc<Self>,
@@ -65,6 +112,22 @@ impl Api {
         self: Arc<Self>,
         request: Request<Incoming>,
     ) -> Result<Response<Body>, Infallible> {
+        // Unauthenticated readiness/liveness probes, served before tracing or
+        // authentication so a slow dependency or auth path never masks the
+        // probe. Mirrors the Ingress health-listener convention.
+        if request.method().as_str() == "GET" {
+            match request.uri().path() {
+                "/healthz" => return Ok(plain(200, json!({"status": "ok"}))),
+                "/readyz" => {
+                    return Ok(if self.ready() {
+                        plain(200, json!({"status": "ready"}))
+                    } else {
+                        plain(503, json!({"status": "not ready"}))
+                    });
+                }
+                _ => {}
+            }
+        }
         if request.method() == hyper::Method::POST
             && percent_encoding::percent_decode_str(request.uri().path())
                 .decode_utf8()
@@ -159,6 +222,16 @@ impl Api {
             .creation_metrics
             .rejection_guard(create_route);
         let request_id = RequestContext::from_headers(request.headers()).request_id;
+        // Draining: reject the operation BEFORE acceptance with the
+        // structured not-started contract (UNAVAILABLE / after_backoff /
+        // not_started) so callers retry the same identity against the new
+        // replica instead of being cut off mid-flight. Requests already past
+        // this point continue within the shutdown budget.
+        if self.draining.load(std::sync::atomic::Ordering::Acquire) {
+            let status = Status::unavailable("API Server is draining; operation not accepted");
+            rejection.status(&status);
+            return error_response(status, &request_id, None, None, false);
+        }
         let e2b_route = crate::e2b::http::route(request.uri().path());
         let api_key = if crate::e2b::keys::route(request.uri().path()) {
             match crate::e2b::keys::token(request.headers()) {
@@ -458,7 +531,10 @@ impl Api {
             };
             rejection.accepted();
             if stream && path.ends_with("environments") {
-                return self.clone().create_stream(spec, input, request_id, caller);
+                return self
+                    .clone()
+                    .create_stream(spec, input, request_id, caller)
+                    .await;
             }
             let environment_id = spec.id.clone();
             let result =
@@ -576,7 +652,7 @@ impl Api {
         )
     }
 
-    fn create_stream(
+    async fn create_stream(
         self: Arc<Self>,
         spec: pb::EnvironmentSpec,
         input: Value,
@@ -593,7 +669,15 @@ impl Api {
                     .boxed_unsync(),
             )
             .expect("static event-stream response is valid");
-        tokio::spawn(trace::with_current_context(async move {
+        // The create total span is the create-duration metric boundary and
+        // must be a direct child of the route span, so the stream wrapper
+        // inherits the ambient route context instead of interposing its own.
+        let started = Instant::now();
+        let background = self.background.clone();
+        background
+            .lock()
+            .await
+            .spawn(trace::with_current_context(async move {
             let accepted = json!({"status":"creating", "requestId":request_id});
             if sender.send(Ok(sse("accepted", accepted))).await.is_err() {
                 return;
@@ -613,6 +697,15 @@ impl Api {
                     }
                 }
             };
+            adx_observability::info!(
+                event = "environment_create_stream_completed",
+                request_id,
+                environment_id = %instance_id,
+                duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
+                succeeded = result.is_ok(),
+                status_code = result.as_ref().err().map_or("OK", |error| error.code().description()),
+                "Environment create stream completed"
+            );
             let final_event = match result {
                 Ok(value) => value,
                 Err(error) => create_error_event(&error, &request_id, &instance_id),
