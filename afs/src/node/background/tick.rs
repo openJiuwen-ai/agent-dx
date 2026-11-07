@@ -34,7 +34,8 @@ use crate::{
 use std::{sync::Arc, time::Duration};
 
 /// Writeback passes by trigger (`notify`: a write-pipeline wakeup, `timer`:
-/// the commit timer) and whether the pass committed anything. Registered once
+/// the commit timer) and whether the pass committed anything; `skipped` counts
+/// notify wakeups that found no work and ran no pass. Registered once
 /// per Node; R66 measures wakeups per operation with it.
 #[derive(Clone)]
 pub(crate) struct WritebackPassMetrics {
@@ -49,13 +50,13 @@ impl WritebackPassMetrics {
             let passes = afs_metrics::IntCounterVec::new(
                 afs_metrics::Opts::new(
                     "afs_dfs_writeback_passes_total",
-                    "DFS background writeback passes by trigger and outcome.",
+                    "DFS background writeback passes by trigger and outcome; skipped wakeups ran no pass.",
                 ),
                 &["trigger", "outcome"],
             )?;
             afs_metrics::register_collector(registry, &passes)?;
             for trigger in ["notify", "timer"] {
-                for outcome in ["committed", "idle", "error"] {
+                for outcome in ["committed", "idle", "error", "skipped"] {
                     passes.with_label_values(&[trigger, outcome]);
                 }
             }
@@ -119,6 +120,12 @@ impl DfsBackgroundTick {
                             None => std::future::pending::<bool>().await,
                         }
                     }, if has_write_pipeline => {
+                        // Most write-pipeline wakeups find nothing to do; skip
+                        // the blocking hop for those (R66). The timer pass always runs.
+                        if !due && !pump.ready() {
+                            passes.observe(false, "skipped");
+                            continue;
+                        }
                         let pump = pump.clone();
                         match crate::node::bridge::spawn_blocking(move || pump.pass(due)).await {
                             Ok(Ok(count)) if count > 0 => {
@@ -182,6 +189,12 @@ struct WritebackPump {
 impl WritebackPump {
     /// A notify wakeup progresses ready work; the commit timer writes back
     /// everything due.
+    /// Cheap readiness check; an error means "run the pass" so the pass
+    /// reports it.
+    fn ready(&self) -> bool {
+        self.fs.writeback_ready().unwrap_or(true)
+    }
+
     fn pass(&self, timer_due: bool) -> afs_error::Result<usize> {
         if timer_due {
             self.fs.writeback_pending()

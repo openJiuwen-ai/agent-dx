@@ -148,6 +148,7 @@ impl DistributedFs {
                     body: Some(body),
                     staged: Some(staged),
                     task: None,
+                    finished: None,
                     receipt: None,
                     error: None,
                     terminal_error: None,

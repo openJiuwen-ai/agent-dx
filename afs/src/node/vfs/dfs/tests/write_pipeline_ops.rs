@@ -1573,3 +1573,103 @@ fn writeback_pass_cost_does_not_grow_with_idle_retained_write_states() {
         "with no pending write work a writeback pass examines no inode"
     );
 }
+
+#[test]
+fn upload_completion_wakes_its_waiting_barrier_without_a_background_pass() {
+    let (_temp, _meta, fs, _runtime, store) = native_pipeline_fixture(false, 8 * 1024 * 1024, 8);
+    let pause = Arc::new(CommitPause::new(0));
+    *store.pause.lock().unwrap() = Some(pause.clone());
+    let file = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("upload-wakes-waiter"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fs.write(&context(), file.handle, 0, &vec![0x31; 4 * 1024 * 1024])
+        .unwrap();
+    pause.wait_until_reached();
+    let pipeline = fs.write_resources.pipeline.as_ref().unwrap().clone();
+    let upload = pipeline.tasks.lock().unwrap()[0].clone();
+    let waiting = upload.clone();
+    let waiter = std::thread::spawn(move || {
+        let state = waiting.state.lock().unwrap();
+        let (state, timeout) = waiting
+            .cv
+            .wait_timeout_while(state, Duration::from_secs(5), |state| {
+                state.finished.is_none()
+            })
+            .unwrap();
+        !timeout.timed_out() && state.finished.is_some()
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    pause.release();
+    assert!(
+        waiter.join().unwrap(),
+        "the upload worker must hand its result to a waiting barrier directly"
+    );
+    // The barrier harvests the result itself; no writeback pass ran.
+    let receipt = fs.wait_upload(&upload).unwrap();
+    assert_eq!(receipt.chunk, upload.chunk);
+    assert!(upload.state.lock().unwrap().task.is_none());
+    assert!(pipeline.tasks.lock().unwrap().is_empty());
+}
+
+#[test]
+fn writeback_readiness_is_true_only_when_a_pass_can_act() {
+    let (_temp, _meta, fs, _runtime, store) = native_pipeline_fixture(false, 8 * 1024 * 1024, 8);
+    assert!(
+        !fs.writeback_ready().unwrap(),
+        "an idle pipeline has no work"
+    );
+    let file = fs
+        .create(
+            &context(),
+            fs.root_inode(),
+            OsStr::new("readiness"),
+            0o640,
+            libc::O_RDWR,
+        )
+        .unwrap();
+    fs.write(&context(), file.handle, 0, &[0x11; 64 * 1024])
+        .unwrap();
+    assert!(
+        !fs.writeback_ready().unwrap(),
+        "an open builder below a chunk is not background work"
+    );
+
+    let pause = Arc::new(CommitPause::new(0));
+    *store.pause.lock().unwrap() = Some(pause.clone());
+    fs.write(&context(), file.handle, 0, &vec![0x22; 4 * 1024 * 1024])
+        .unwrap();
+    pause.wait_until_reached();
+    assert!(
+        !fs.writeback_ready().unwrap(),
+        "a running upload has nothing to harvest yet"
+    );
+    pause.release();
+    let pipeline = fs.write_resources.pipeline.as_ref().unwrap().clone();
+    let upload = pipeline.tasks.lock().unwrap()[0].clone();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while upload.state.lock().unwrap().finished.is_none() {
+        assert!(Instant::now() < deadline, "fixture upload did not finish");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        fs.writeback_ready().unwrap(),
+        "a finished upload must be harvested"
+    );
+    fs.progress_writeback().unwrap();
+    assert!(!fs.writeback_ready().unwrap());
+
+    // The last writer leaving dirty data asks for a background commit.
+    fs.release(&context(), file.handle).unwrap();
+    assert!(
+        fs.writeback_ready().unwrap(),
+        "a requested background commit is work"
+    );
+    assert_eq!(fs.progress_writeback().unwrap(), 1);
+    assert!(!fs.writeback_ready().unwrap());
+}

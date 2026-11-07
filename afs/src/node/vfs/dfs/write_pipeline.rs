@@ -462,7 +462,10 @@ pub(super) struct PipelineUpload {
 pub(super) struct PipelineUploadState {
     pub(super) body: Option<SharedChunkBytes>,
     pub(super) staged: Option<StagedChunk>,
-    pub(super) task: Option<tokio::task::JoinHandle<Result<StoredChunk>>>,
+    /// The upload worker. It leaves its result in `finished` and wakes `cv`,
+    /// so a waiting barrier harvests it without a background pass.
+    pub(super) task: Option<tokio::task::JoinHandle<()>>,
+    pub(super) finished: Option<Result<StoredChunk>>,
     pub(super) receipt: Option<StoredChunk>,
     pub(super) error: Option<Error>,
     pub(super) terminal_error: Option<Error>,

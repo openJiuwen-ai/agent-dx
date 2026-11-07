@@ -638,6 +638,7 @@ impl DistributedFs {
                     body: Some(body),
                     staged: Some(staged),
                     task: None,
+                    finished: None,
                     receipt: None,
                     error: None,
                     terminal_error: None,
@@ -778,6 +779,7 @@ impl DistributedFs {
             return Err(invalid("native upload changed its immutable object"));
         }
         let notify = pipeline.notify.clone();
+        let finished = Arc::downgrade(upload);
         state.task = Some(crate::node::bridge::spawn_blocking_on(
             &pipeline.runtime,
             move || {
@@ -790,8 +792,15 @@ impl DistributedFs {
                         }
                         Ok(receipts.remove(0))
                     });
+                // Hand the result to whoever harvests first: a barrier waiting
+                // on `cv`, or the next background pass (notified below).
+                if let Some(upload) = finished.upgrade() {
+                    if let Ok(mut state) = upload.state.lock() {
+                        state.finished = Some(result);
+                    }
+                    upload.cv.notify_all();
+                }
                 notify.notify_one();
-                result
             },
         ));
         task_table.push(upload.clone());
@@ -924,26 +933,36 @@ impl DistributedFs {
         };
         let mut first_error = None;
         for upload in tasks.into_iter().flatten() {
-            let task = {
+            let harvest = {
                 let mut state = upload
                     .state
                     .lock()
                     .map_err(|_| unavailable("native upload state is poisoned"))?;
-                if state.task.as_ref().is_some_and(|task| task.is_finished()) {
+                if let Some(result) = state.finished.take() {
+                    // The worker is past its last use of the upload; detach it.
                     state.joining = true;
-                    state.task.take()
+                    state.task = None;
+                    Some(Ok(result))
+                } else if state.task.as_ref().is_some_and(|task| task.is_finished()) {
+                    // Finished without leaving a result: it panicked.
+                    state.joining = true;
+                    state.task.take().map(Err)
                 } else {
                     None
                 }
             };
-            if let Some(task) = task {
-                let result = crate::node::bridge::block_on(&pipeline.runtime, async {
-                    task.await
-                        .map_err(|error| {
-                            unavailable(format!("native upload worker failed: {error}"))
-                        })
-                        .and_then(|result| result)
-                });
+            if let Some(harvest) = harvest {
+                let result = match harvest {
+                    Ok(result) => result,
+                    Err(task) => crate::node::bridge::block_on(&pipeline.runtime, async {
+                        match task.await {
+                            Ok(()) => Err(unavailable("native upload worker left no result")),
+                            Err(error) => {
+                                Err(unavailable(format!("native upload worker failed: {error}")))
+                            }
+                        }
+                    }),
+                };
                 let installed = self.install_upload_receipt(&upload, result);
                 // A consumed JoinHandle must leave the table even when receipt
                 // installation encounters a structural error. This guard only
@@ -1017,6 +1036,57 @@ impl DistributedFs {
                 );
             }
         }
+    }
+
+    /// Whether `progress_writeback` could act now: a finished upload to
+    /// harvest, an upload it may start, or a due inode. Conservative, cheap and
+    /// non-blocking, so the background tick skips its blocking hop for the
+    /// many wakeups that find nothing to do (R66).
+    pub(crate) fn writeback_ready(&self) -> Result<bool> {
+        let Some(pipeline) = &self.write_resources.pipeline else {
+            return Ok(false);
+        };
+        let can_start = {
+            let tasks = pipeline
+                .tasks
+                .lock()
+                .map_err(|_| unavailable("native upload task table is poisoned"))?;
+            for upload in tasks.iter() {
+                let state = upload
+                    .state
+                    .lock()
+                    .map_err(|_| unavailable("native upload state is poisoned"))?;
+                if state.finished.is_some()
+                    || state.task.as_ref().is_some_and(|task| task.is_finished())
+                {
+                    return Ok(true);
+                }
+            }
+            tasks.len() < pipeline.metadata.upload_limit
+                && pipeline
+                    .metadata
+                    .state
+                    .lock()
+                    .map_err(|_| unavailable("native metadata budget is poisoned"))?
+                    .inflight
+                    < pipeline.metadata.upload_limit
+        };
+        for (_, cell) in self.pending_write_states()? {
+            {
+                let state = cell
+                    .lock()
+                    .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+                if state.terminal_error.is_none()
+                    && (state.native_due || state.last_writer_background_requested)
+                {
+                    return Ok(true);
+                }
+            }
+            if can_start && Self::next_upload_for_cell(&cell)?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub(crate) fn progress_writeback(&self) -> Result<usize> {
