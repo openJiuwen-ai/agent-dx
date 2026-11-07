@@ -336,7 +336,10 @@ DFS FUSE 的本地 owner 普通显式偏移写进一步在前台整笔入有界�
 有额度时接住正文后在当前回调直接回复；无额度时接收回调先返回，待额度晋升后回复。
 回复均在正文状态锁外执行，不增加独立回复线程或回复队列。读、截断、元数据、
 复制、USRBIO交接和同步先等待相关文件已接纳的正文，正文为空时保持原读并发。
-同inode屏障跨句柄持有至真实完成；namespace保留全挂载屏障。fsync/flush/release
+同inode门跨句柄持有至真实完成：读、getattr、getxattr/listxattr、readlink、目录读和只读open共享，
+只等该inode已接纳的正文；写、截断、同步、xattr修改等独占，等待中的独占回调挡住新的共享回调。
+namespace变更保留全挂载屏障（并等全部在途回调）；路径LOOKUP只与namespace变更互斥并等已接纳正文。
+固定本地答复的getxattr（内核每次写前的`security.capability`探测）在接收线程直接回复。fsync/flush/release
 通过独立的有界恢复接纳登记续办任务，不占正文额度；正文仍是一条FIFO、一个消费者。
 写成功不表示持久化；fsync/flush/close继续执行原同步，追加、O_SYNC/O_DSYNC、
 远端owner、内核writeback和OwnerFS保留旧返回点。失败和尾部按inode隔离，关闭仅退役

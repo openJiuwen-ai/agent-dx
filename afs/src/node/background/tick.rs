@@ -5,8 +5,11 @@
 //!
 //! - writeback wakeup (write-pipeline notify, or the
 //!   `dfs_background_commit_ms` timer, default 5 s) → `WritebackPump`:
-//!   1. notify: `progress_writeback`, the ready write-pipeline work;
-//!   2. timer: `writeback_pending`, everything due;
+//!   1. notify: `progress_writeback`, the ready write-pipeline work. A notify
+//!      first runs `writeback_ready` on this task; when nothing can progress it
+//!      skips the blocking pass (R66: most notifies come from operation guards
+//!      and leases on writes whose fsync commits in the foreground);
+//!   2. timer: `writeback_pending`, everything due; it always runs;
 //! - the 5 s tick → one blocking pass over
 //!   3. `RemoteReleaseRetrier` (`retry_pending_remote_releases`),
 //!   4. `PeerSessionReaper::reap_owner_handles`,
@@ -17,6 +20,9 @@
 //! Both arms share one `select!`, so a slow 5 s pass delays the next writeback
 //! progress exactly as before; running them as separate tasks would change
 //! that (S3 performance work, not S1).
+//!
+//! Passes are counted in `afs_dfs_writeback_passes_total{trigger,outcome}`;
+//! `outcome="skipped"` is a notify that found no work.
 //!
 //! Retry class: a pass error (`dfs.native_write_retry`,
 //! `dfs.background_retry`) or a failed blocking worker

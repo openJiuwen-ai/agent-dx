@@ -25,10 +25,18 @@ The FIFO body consumer preserves write order, including overlapping writes and
 writes through multiple handles. It calls the existing complete DFS backend,
 including write CRC, replication, catalog and Meta work. File callbacks fence only
 the addressed inode; cross-file copy acquires both inode gates as one sorted set.
-Same-inode dispatcher turns include deferred read completion across handles.
-Namespace callbacks retain a conservative mount-wide barrier. Gates survive the
-real dispatched operation, rather than just its enqueue. Fixed local replies
-retain validation without acquiring these body/dispatcher barriers.
+The inode gate is a reader/writer gate: reads, getattr, statfs, readlink,
+directory reads, getxattr/listxattr and read-only opens share it and wait only
+for that inode's admitted bodies; writes, resizes, syncs, xattr changes and the
+remaining file callbacks hold it exclusively, and a waiting exclusive callback
+fences new readers. Same-inode dispatcher turns include deferred read completion
+across handles. Namespace changes retain a conservative mount-wide barrier that
+also drains dispatched callbacks; a path LOOKUP excludes only namespace changes and
+waits for admitted bodies, not for in-flight callbacks. Gates survive the real
+dispatched operation, rather than just its enqueue. Fixed local replies retain
+validation without acquiring these body/dispatcher barriers; a fixed local
+getxattr (the kernel's per-write `security.capability` probe) is answered on the
+receive thread.
 
 Fsync/flush/release register parked recovery continuations outside normal body
 and dispatcher admission. A file prefix settles with success or a recorded error;
