@@ -14,6 +14,7 @@
 pub mod api;
 pub mod chunk;
 pub(crate) mod chunk_crc32c;
+pub mod connectors;
 #[cfg(feature = "dfs")]
 mod dfs_fetch;
 #[cfg(feature = "dfs")]
@@ -1578,6 +1579,9 @@ async fn run_node(
     };
     #[cfg(feature = "dfs")]
     dfs_write_buffers.register_metrics(&obs.registry)?;
+    let connector_runtime = connectors::ConnectorRuntime::build(&cfg.connectors, &cfg.id)?;
+    #[cfg(feature = "dfs")]
+    let lazy_fill_registry = connector_runtime.register_lazy_handlers()?;
     #[cfg(feature = "dfs")]
     let dfs_instance = if cfg.dfs {
         let namespace = crate::dfs::NamespaceId::new(DEFAULT_DFS_NAMESPACE);
@@ -1641,6 +1645,11 @@ async fn run_node(
             ),
         };
         let read_config = dfs_read::DfsReadConfig {
+            read_cache_bytes: cfg.dfs_read_cache_bytes,
+            distribution: dfs_read::ReadDistributionConfig {
+                parallelism: cfg.dfs_read_parallelism,
+                stripe_bytes: cfg.dfs_read_stripe_bytes,
+            },
             max_ops_per_batch: cfg.dfs_read_max_ops_per_batch,
             max_inflight_bytes: cfg.dfs_read_max_inflight_bytes,
             source_cache_ttl: std::time::Duration::from_millis(cfg.dfs_source_cache_max_ms),
@@ -1661,7 +1670,8 @@ async fn run_node(
                 dfs_rdma_pool.clone(),
             )?,
             read_config,
-        );
+        )
+        .with_cache_session(session_id.clone());
         let read_engine = match &dfs_read_authority {
             Some(authority) => read_engine.with_read_authority(authority.clone()),
             None => read_engine,
@@ -1725,6 +1735,7 @@ async fn run_node(
             chunk_store,
             read_engine,
         )
+        .with_lazy_fill_registry(lazy_fill_registry)
         .with_gc_references(gc_references)
         .with_optimistic_gc_commit(cfg.dfs_optimistic_gc_commit)
         .with_crc32c_writes(cfg.dfs_crc32c_writes)
@@ -1773,12 +1784,19 @@ async fn run_node(
         .map(|backend| Arc::clone(backend) as Arc<dyn vfs::Backend>);
     #[cfg(not(feature = "dfs"))]
     let dfs_backend: Option<Arc<dyn vfs::Backend>> = None;
+    let connector_routes = match &dfs_backend {
+        Some(backend) => connector_runtime.http_routes(connectors::ConnectorContext {
+            backend: backend.clone(),
+            root: backend.root_inode(),
+        })?,
+        None => axum::Router::new(),
+    };
     let local = api::local::serve_local_api_with_options(
         diagnostic_storage.clone(),
         &cfg.uds_path,
         api::local::LocalApiOptions {
             metrics_registry: Some(obs.registry.clone()),
-            dfs_backend,
+            dfs_backend: dfs_backend.clone(),
             // 与上面 DFS 后端构造时使用的命名空间保持一致。
             dfs_namespace: Some(DEFAULT_DFS_NAMESPACE.to_owned()),
         },
@@ -2306,6 +2324,7 @@ async fn run_node(
         local_chunk_store,
         cfg.dfs_external_backend.as_ref(),
     ) {
+        let dfs_cache_maintenance = state.dfs.clone();
         let worker = Arc::new(replication::ReplicationWorker::new(
             cfg.id.clone(),
             registered_node_epoch,
@@ -2328,7 +2347,14 @@ async fn run_node(
                 // The worker owns an exact pending request until its Meta
                 // outcome is confirmed. A started blocking transfer is not
                 // detached on a tick or replaced by another task.
-                match tokio::task::spawn_blocking(move || worker.run_once()).await {
+                let dfs = dfs_cache_maintenance.clone();
+                match tokio::task::spawn_blocking(move || {
+                    if let Some(dfs) = dfs
+                        && let Err(error) = dfs.reconcile_read_caches() {
+                        afs_logging::warn!("dfs.read_cache_reconcile_retry"; "error" => error.to_string());
+                    }
+                    worker.run_once()
+                }).await {
                     Ok(Ok(Some(task))) => {
                         afs_logging::info!("dfs.replication_task_reported";
                             "task" => task.id.0,
@@ -2355,7 +2381,7 @@ async fn run_node(
     let stop = services.stop.subscribe();
     let rest_state = state.clone();
     services.spawn(async move {
-        axum::serve(rest, api::rest::router(rest_state))
+        axum::serve(rest, api::rest::router(rest_state).merge(connector_routes))
             .with_graceful_shutdown(cancelled(stop))
             .await
             .map_err(Into::into)
@@ -2420,6 +2446,7 @@ async fn run_node(
         #[cfg(feature = "dfs")]
         if let Some(dfs) = &state.dfs {
             dfs.close_native_write_admission();
+            dfs.close_lazy_fill_admission();
         }
         #[cfg(feature = "dfs")]
         if let Some(store) = &dfs_sidecar_store_for_shutdown {
@@ -2472,6 +2499,9 @@ async fn run_node(
         afs_logging::info!("node.ready";"grpc"=>cfg.grpc_listen.to_string(),"rest"=>cfg.rest_listen.to_string(),"uds"=>cfg.uds_path.display().to_string(),"ownerfs"=>cfg.ownerfs,"dfs"=>cfg.dfs);
         services.run_with_shutdown(on_shutdown).await.err()
     };
+    if let Err(error) = connector_runtime.stop().await {
+        remember_shutdown_error(&mut shutdown_error, error.into());
+    }
     // A Services timeout may abort its observer, never the owned mount worker.
     // Keep FUSE alive until that same worker proves normal native closure. The
     // process-wide watchdog bounds a permanently busy or unresolved claim.
@@ -2531,6 +2561,7 @@ async fn run_node(
     }
     #[cfg(feature = "dfs")]
     if let Some(dfs) = dfs_for_drain {
+        dfs.drain_lazy_fills().await;
         match tokio::task::spawn_blocking(move || {
             let mut first_error = None;
             let committed = match dfs.drain() {

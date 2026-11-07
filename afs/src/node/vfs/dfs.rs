@@ -7,6 +7,7 @@
 //! and asks Meta to publish a new FileVersion. Writable `flush` commits prior
 //! writes before reporting close success; `release` only drops the handle.
 
+mod lazy_fill;
 mod read_pipeline;
 
 use std::{
@@ -151,6 +152,16 @@ pub trait DfsMeta: Send + Sync {
     ) -> Result<InodeRecord> {
         self.sync_inode_metadata(sync)
     }
+    fn restore_file_chunk(
+        &self,
+        _request: crate::dfs::RestoreFileChunk,
+        _timeout: Duration,
+    ) -> Result<()> {
+        Err(Error::coded(
+            afs_error::NODE_VFS_UNIMPLEMENTED,
+            "committed chunk restoration is unsupported",
+        ))
+    }
     fn commit_file_version(&self, commit: CommitFileVersion) -> Result<InodeRecord>;
     fn commit_file_version_with_timeout(
         &self,
@@ -226,6 +237,7 @@ pub trait DfsMeta: Send + Sync {
 type SharedInodeWriteState = Arc<InodeWriteStateCell>;
 
 struct InodeWriteStateCell {
+    lazy_fill_gate: Arc<tokio::sync::Semaphore>,
     state: Mutex<InodeWriteState>,
     cv: Condvar,
 }
@@ -238,6 +250,9 @@ pub struct DistributedFs {
     meta: Arc<dyn DfsMeta>,
     chunk_store: Arc<dyn ChunkStore>,
     read_engine: Arc<DfsReadEngine>,
+    lazy_fill_registry: Arc<super::lazy_fill::LazyFillRegistry>,
+    lazy_fill_budget: Arc<tokio::sync::Semaphore>,
+    lazy_fill_lifetime: Arc<tokio::sync::Semaphore>,
     remote_owner_factory: Option<Arc<dyn DfsRemoteOwnerFactory>>,
     handles: DfsHandleTable,
     gc_references: Option<Arc<crate::node::gc::GcReferences>>,
@@ -696,6 +711,7 @@ struct NativeReadView {
 }
 
 struct DfsFileHandle {
+    origin_fill: bool,
     gc_pin: Option<Arc<crate::node::gc::GcPin>>,
     inode_id: InodeId,
     opened_inode: InodeRecord,
@@ -709,6 +725,7 @@ struct DfsFileHandle {
 }
 
 struct DfsHandle {
+    origin_fill: bool,
     native_prefetch: std::sync::OnceLock<Arc<crate::node::native_prefetch::Controller>>,
     open_read_inode: Option<Arc<InodeRecord>>,
     open_read_authority: Option<NativeReadAuthoritySnapshot>,
@@ -841,6 +858,7 @@ impl NativeReadRefresh {
 impl From<DfsFileHandle> for DfsHandle {
     fn from(opened: DfsFileHandle) -> Self {
         Self {
+            origin_fill: opened.origin_fill,
             native_prefetch: std::sync::OnceLock::new(),
             open_read_authority: opened
                 .native_read_view
@@ -2718,6 +2736,7 @@ impl InFlightCommit {
 impl InodeWriteStateCell {
     fn new(state: InodeWriteState) -> Self {
         Self {
+            lazy_fill_gate: Arc::new(tokio::sync::Semaphore::new(1)),
             state: Mutex::new(state),
             cv: Condvar::new(),
         }
@@ -2772,6 +2791,11 @@ impl DistributedFs {
             meta,
             chunk_store,
             read_engine,
+            lazy_fill_registry: Arc::new(super::lazy_fill::LazyFillRegistry::default()),
+            lazy_fill_budget: Arc::new(tokio::sync::Semaphore::new(16)),
+            lazy_fill_lifetime: Arc::new(tokio::sync::Semaphore::new(
+                tokio::sync::Semaphore::MAX_PERMITS,
+            )),
             remote_owner_factory: None,
             handles: DfsHandleTable::default(),
             gc_references: None,
@@ -4444,6 +4468,15 @@ impl DistributedFs {
             }
         };
         Ok(state)
+    }
+
+    pub(crate) fn reconcile_read_caches(&self) -> Result<()> {
+        self.read_engine.run_sync_boundary(Box::pin(async {
+            self.read_engine
+                .reconcile_read_caches(Instant::now() + Duration::from_secs(1))
+                .await?;
+            Ok(())
+        }))
     }
 
     pub fn with_remote_owner_factory(mut self, factory: Arc<dyn DfsRemoteOwnerFactory>) -> Self {
@@ -11171,6 +11204,16 @@ impl CommitReason {
 }
 
 impl Backend for DistributedFs {
+    fn prepare_lazy_file(
+        &self,
+        ctx: &RequestContext,
+        parent: BackendInode,
+        name: &OsStr,
+        source: &super::lazy_fill::LazyFileSpec,
+    ) -> Result<Entry> {
+        self.prepare_lazy(ctx, parent, name, source)
+    }
+
     fn fixed_read_view(&self, handle: FileHandle) -> bool {
         self.handles
             .get(handle.0)
@@ -11687,6 +11730,10 @@ impl Backend for DistributedFs {
         options: SetAttrOptions,
     ) -> Result<FileAttributes> {
         let inode_id = self.inode_id(inode)?;
+        if change.size.is_some() && lazy_fill::sealed(&self.meta.get_inode(&inode_id)?) {
+            return Err(invalid("immutable-origin file length cannot change"));
+        }
+
         let mut change = change.clone();
         let mut killpriv_setattr = false;
         let _native_ticket = if let Some(cell) = self.write_state(&inode_id)? {
@@ -11891,6 +11938,7 @@ impl Backend for DistributedFs {
         self.install_write_state(inode.clone(), write_lease)?;
         let session = self.open_write_session(&inode, flags)?;
         let handle = self.allocate_handle(DfsFileHandle {
+            origin_fill: false,
             gc_pin: None,
             inode_id: inode.inode_id.clone(),
             opened_inode: inode.clone(),
@@ -11975,6 +12023,12 @@ impl Backend for DistributedFs {
                 "DFS special inode data path is handled by kernel/local device semantics",
             ));
         }
+        if lazy_fill::sealed(&preflight) {
+            if flags & libc::O_ACCMODE != libc::O_RDONLY || flags & libc::O_TRUNC != 0 {
+                return Err(invalid("immutable-origin files only allow read opens"));
+            }
+            native_read_view = None;
+        }
         let writable = flags & libc::O_ACCMODE != libc::O_RDONLY;
         let (opened_inode, write_session) = if writable {
             let (inode, write_lease) = self.meta.resolve_write_authority(&inode_id)?;
@@ -12051,6 +12105,7 @@ impl Backend for DistributedFs {
             self.check_native_read_view(view)?;
         }
         self.allocate_handle(DfsFileHandle {
+            origin_fill: false,
             gc_pin: None,
             inode_id: opened_inode.inode_id.clone(),
             opened_inode,
@@ -12074,6 +12129,15 @@ impl Backend for DistributedFs {
         let snapshot = self.handle_snapshot(handle)?;
         if snapshot.flags & libc::O_ACCMODE == libc::O_WRONLY {
             return Err(bad_file_descriptor("DFS handle was not opened for reading"));
+        }
+        if let Some(data) = self.lazy_read(
+            &snapshot,
+            offset,
+            out.len(),
+            Instant::now() + self.read_engine.read_pipeline_timeout(),
+        )? {
+            out[..data.len()].copy_from_slice(&data);
+            return Ok(data.len());
         }
         if !self.read_engine.has_external_backend() {
             let result = self.read_native_owned(handle, &snapshot, offset, out.len())?;
@@ -12122,6 +12186,14 @@ impl Backend for DistributedFs {
         if snapshot.flags & libc::O_ACCMODE == libc::O_WRONLY {
             return Err(bad_file_descriptor("DFS handle was not opened for reading"));
         }
+        if let Some(data) = self.lazy_read(
+            &snapshot,
+            offset,
+            size,
+            Instant::now() + self.read_engine.read_pipeline_timeout(),
+        )? {
+            return Ok(data);
+        }
         self.read_native_owned(handle, &snapshot, offset, size)
     }
 
@@ -12135,6 +12207,14 @@ impl Backend for DistributedFs {
         let snapshot = self.handle_snapshot(handle)?;
         if snapshot.flags & libc::O_ACCMODE == libc::O_WRONLY {
             return Err(bad_file_descriptor("DFS handle was not opened for reading"));
+        }
+        if let Some(data) = self.lazy_read(
+            &snapshot,
+            offset,
+            size,
+            Instant::now() + self.read_engine.read_pipeline_timeout(),
+        )? {
+            return Ok(data.to_vec());
         }
         if !self.read_engine.has_external_backend() {
             return self
@@ -12223,6 +12303,12 @@ impl Backend for DistributedFs {
     ) -> Result<usize> {
         self.observe_handle_error(handle)?;
         let snapshot = self.handle_snapshot(handle)?;
+        if lazy_fill::sealed(&snapshot.opened_inode) && !snapshot.handle.origin_fill {
+            return Err(invalid(
+                "immutable-origin files cannot be written by callers",
+            ));
+        }
+
         if snapshot.flags & libc::O_ACCMODE == libc::O_RDONLY {
             return Err(bad_file_descriptor("DFS handle was not opened for writing"));
         }
@@ -12704,6 +12790,13 @@ impl Backend for DistributedFs {
     ) -> Result<u64> {
         let source = self.handle_snapshot(range.source)?;
         let destination = self.handle_snapshot(range.destination)?;
+        if lazy_fill::sealed(&source.opened_inode) || lazy_fill::sealed(&destination.opened_inode) {
+            return Err(Error::coded(
+                afs_error::IO_NOT_SUPPORTED,
+                "lazy files do not support COW range copy",
+            ));
+        }
+
         if source.flags & libc::O_ACCMODE == libc::O_WRONLY
             || destination.flags & libc::O_ACCMODE == libc::O_RDONLY
         {
@@ -12990,21 +13083,41 @@ impl Backend for DistributedFs {
         mode: u32,
     ) -> Result<Entry> {
         let now = now_unix_ms();
-        let inode = self.validate_inode(self.meta.mkdir(
-            &self.operation_id("mkdir"),
-            &self.inode_id(parent)?,
-            name.as_encoded_bytes(),
-            InodeAttributes {
-                mode: mode & !ctx.umask,
-                uid: ctx.uid,
-                gid: ctx.gid,
-                nlink: 2,
-                atime_unix_ms: now,
-                mtime_unix_ms: now,
-                ctime_unix_ms: now,
-            },
-            caller_context(ctx),
-        )?)?;
+        let operation = self.operation_id("mkdir");
+        let parent_id = self.inode_id(parent)?;
+        let inode = self.validate_inode(retry_namespace_conflict(|| {
+            match self.meta.mkdir(
+                &operation,
+                &parent_id,
+                name.as_encoded_bytes(),
+                InodeAttributes {
+                    mode: mode & !ctx.umask,
+                    uid: ctx.uid,
+                    gid: ctx.gid,
+                    nlink: 2,
+                    atime_unix_ms: now,
+                    mtime_unix_ms: now,
+                    ctime_unix_ms: now,
+                },
+                caller_context(ctx),
+            ) {
+                Err(error) if error.code() == afs_error::META_DFS_CONFLICT => {
+                    if self
+                        .meta
+                        .lookup(&parent_id, name.as_encoded_bytes())?
+                        .is_some()
+                    {
+                        Err(Error::coded(
+                            afs_error::IO_ALREADY_EXISTS,
+                            "directory entry exists",
+                        ))
+                    } else {
+                        Err(error)
+                    }
+                }
+                result => result,
+            }
+        })?)?;
         Ok(Entry {
             inode: self.backend_inode(&inode.inode_id)?,
             attributes: attributes(&inode, 0, 0),
@@ -13049,15 +13162,20 @@ impl Backend for DistributedFs {
         flags: RenameFlags,
     ) -> Result<()> {
         let mode = rename_mode(flags)?;
-        let outcome = self.meta.rename(
-            &self.operation_id("rename"),
-            &self.inode_id(from_parent)?,
-            from_name.as_encoded_bytes(),
-            &self.inode_id(to_parent)?,
-            to_name.as_encoded_bytes(),
-            mode,
-            caller_context(ctx),
-        )?;
+        let operation = self.operation_id("rename");
+        let from_parent = self.inode_id(from_parent)?;
+        let to_parent = self.inode_id(to_parent)?;
+        let outcome = retry_namespace_conflict(|| {
+            self.meta.rename(
+                &operation,
+                &from_parent,
+                from_name.as_encoded_bytes(),
+                &to_parent,
+                to_name.as_encoded_bytes(),
+                mode,
+                caller_context(ctx),
+            )
+        })?;
         self.refresh_inode_record(outcome.inode, true, true)?;
         if let Some(replaced) = outcome.replaced_inode {
             self.refresh_inode_record(replaced, true, true)?;
@@ -13173,6 +13291,9 @@ impl Backend for DistributedFs {
         value: &[u8],
         flags: i32,
     ) -> Result<()> {
+        if name.as_encoded_bytes() == super::lazy_fill::DESCRIPTOR_XATTR {
+            return Err(invalid("lazy source descriptor is reserved and immutable"));
+        }
         let inode_id = self.inode_id(inode)?;
         let current = self.validate_inode(self.meta.get_inode(&inode_id)?)?;
         self.refresh_inode_record(
@@ -13193,6 +13314,9 @@ impl Backend for DistributedFs {
     }
 
     fn removexattr(&self, ctx: &RequestContext, inode: BackendInode, name: &OsStr) -> Result<()> {
+        if name.as_encoded_bytes() == super::lazy_fill::DESCRIPTOR_XATTR {
+            return Err(invalid("lazy source descriptor is reserved and immutable"));
+        }
         let inode_id = self.inode_id(inode)?;
         let current = self.validate_inode(self.meta.get_inode(&inode_id)?)?;
         self.refresh_inode_record(
@@ -13357,6 +13481,13 @@ impl crate::node::rpc::control::DfsOwnerLifecycleHandler for DistributedFs {
             return Err(stale("DFS owner lease is no longer current"));
         }
         let apply = (|| {
+            if lazy_fill::sealed(&inode)
+                && (request.open_flags & libc::O_ACCMODE != libc::O_RDONLY
+                    || request.open_flags & libc::O_TRUNC != 0
+                    || request.kill_suidgid)
+            {
+                return Err(invalid("lazy peer handles are read-only"));
+            }
             self.install_write_state(inode.clone(), lease.clone())?;
             let session = self.open_write_session(&inode, request.open_flags)?;
             if session.lease_epoch != request.lease_epoch {
@@ -13371,6 +13502,7 @@ impl crate::node::rpc::control::DfsOwnerLifecycleHandler for DistributedFs {
                 Self::apply_kernel_killpriv_to_state(&mut state);
             }
             self.allocate_handle(DfsFileHandle {
+                origin_fill: false,
                 gc_pin: None,
                 inode_id: inode.inode_id.clone(),
                 opened_inode: inode.clone(),
@@ -13710,6 +13842,27 @@ impl crate::node::rpc::data::DfsOwnerFilesHandler for DistributedFs {
         peer: &str,
         request: afs_protocol::node_data::DfsOwnerReadRequest,
     ) -> Result<afs_protocol::node_data::DfsOwnerReadReply> {
+        self.read_with_deadline(
+            peer,
+            request,
+            Instant::now() + self.read_engine.read_pipeline_timeout(),
+        )
+    }
+
+    fn read_timeout(&self) -> Duration {
+        self.read_engine.read_pipeline_timeout()
+    }
+
+    fn read_with_deadline(
+        &self,
+        peer: &str,
+        request: afs_protocol::node_data::DfsOwnerReadRequest,
+        deadline: Instant,
+    ) -> Result<afs_protocol::node_data::DfsOwnerReadReply> {
+        let deadline = deadline.min(Instant::now() + self.read_engine.read_pipeline_timeout());
+        if Instant::now() >= deadline {
+            return Err(unavailable("owner read expired before dispatch"));
+        }
         let handle = request
             .handle
             .ok_or_else(|| stale("DFS owner read missing handle"))?;
@@ -13717,13 +13870,20 @@ impl crate::node::rpc::data::DfsOwnerFilesHandler for DistributedFs {
         let file = self.validate_owner_handle(peer, &handle)?;
         let length = usize::try_from(request.length)
             .map_err(|_| invalid("DFS owner read length exceeds platform limits"))?;
-        let data = <Self as Backend>::read_owned(
-            self,
-            &owner_request_context(),
-            file,
-            request.offset,
-            length,
-        )?;
+        let snapshot = self.handle_snapshot(file)?;
+        let data = match self.lazy_read(&snapshot, request.offset, length, deadline)? {
+            Some(data) => data.to_vec(),
+            None => <Self as Backend>::read_owned(
+                self,
+                &owner_request_context(),
+                file,
+                request.offset,
+                length,
+            )?,
+        };
+        if Instant::now() >= deadline {
+            return Err(unavailable("owner read expired before delivery"));
+        }
         let visible_write_seq = self
             .write_state(&InodeId::new(handle.inode_id))?
             .and_then(|state| state.lock().ok().map(|state| state.visible_write_seq))
@@ -14632,6 +14792,22 @@ fn slice_directory_entries(
         .collect())
 }
 
+/// CAS rejection proves this attempt did not publish. Keep one operation ID
+/// at callers; never replay an ambiguous transport failure as a new operation.
+fn retry_namespace_conflict<T>(mut operation: impl FnMut() -> Result<T>) -> Result<T> {
+    for _ in 0..64 {
+        match operation() {
+            Err(error) if error.code() == afs_error::META_DFS_CONFLICT => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            result => return result,
+        }
+    }
+    Err(unavailable(
+        "namespace metadata contention; retry operation",
+    ))
+}
+
 fn rename_mode(flags: RenameFlags) -> Result<RenameMode> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
@@ -14925,6 +15101,11 @@ mod tests {
     }
 
     struct RecordingMeta {
+        lose_commit_reply: AtomicBool,
+        lose_restore_reply: AtomicBool,
+        restore_calls: AtomicUsize,
+        mkdir_conflicts: AtomicUsize,
+        next_lookup_absent: AtomicBool,
         inode: Mutex<InodeRecord>,
         lease: Mutex<WriteLease>,
         commits: Mutex<Vec<CommitFileVersion>>,
@@ -14966,6 +15147,11 @@ mod tests {
     impl RecordingMeta {
         fn new() -> Self {
             Self {
+                lose_commit_reply: AtomicBool::new(false),
+                lose_restore_reply: AtomicBool::new(false),
+                restore_calls: AtomicUsize::new(0),
+                mkdir_conflicts: AtomicUsize::new(0),
+                next_lookup_absent: AtomicBool::new(false),
                 inode: Mutex::new(InodeRecord {
                     namespace_id: NamespaceId::new("default"),
                     inode_id: InodeId::new("inode:test"),
@@ -15209,8 +15395,82 @@ mod tests {
         }
     }
 
+    impl crate::node::dfs_read::ReadSourceProvider for RecordingMeta {
+        fn sources_for(
+            &self,
+            request: crate::dfs::DfsChunkSourcesRequest,
+        ) -> Result<crate::dfs::DfsChunkSourcesReply> {
+            let commits = self.commits.lock().unwrap();
+            let version = commits
+                .iter()
+                .find(|c| {
+                    c.file_version.id == request.file_version_id
+                        && c.layout_root.id == request.layout_root_id
+                })
+                .ok_or_else(|| Error::coded(afs_error::IO_NOT_FOUND, "test version missing"))?;
+            let mut chunks = Vec::new();
+            for id in request.chunk_ids {
+                let chunk = commits
+                    .iter()
+                    .flat_map(|c| &c.chunk_receipts)
+                    .find(|r| r.chunk.id == id)
+                    .ok_or_else(|| Error::coded(afs_error::IO_NOT_FOUND, "test chunk missing"))?
+                    .chunk
+                    .clone();
+                let allowed_ranges = version
+                    .layout_root
+                    .inline_extents
+                    .iter()
+                    .filter(|e| e.chunk_id == id)
+                    .map(|e| (e.chunk_offset, e.length))
+                    .collect();
+                chunks.push(crate::dfs::ChunkSources {
+                    chunk_id: id,
+                    chunk: Some(chunk),
+                    sources: Vec::new(),
+                    allowed_ranges,
+                });
+            }
+            Ok(crate::dfs::DfsChunkSourcesReply {
+                revision: 1,
+                chunks,
+            })
+        }
+    }
+
     impl DfsMeta for RecordingMeta {
-        fn lookup(&self, _: &InodeId, _: &[u8]) -> Result<Option<InodeRecord>> {
+        fn restore_file_chunk(
+            &self,
+            request: crate::dfs::RestoreFileChunk,
+            _timeout: Duration,
+        ) -> Result<()> {
+            let inode = self.inode.lock().unwrap();
+            assert_eq!(inode.head_version.as_ref(), Some(&request.file_version_id));
+            assert_eq!(
+                self.lease.lock().unwrap().lease_epoch,
+                request.write_lease.lease_epoch
+            );
+            let commits = self.commits.lock().unwrap();
+            assert!(
+                commits
+                    .iter()
+                    .flat_map(|c| &c.chunk_receipts)
+                    .any(|r| r.chunk == request.receipt.chunk)
+            );
+            self.restore_calls.fetch_add(1, Ordering::SeqCst);
+            if self.lose_restore_reply.swap(false, Ordering::SeqCst) {
+                return Err(Error::coded(
+                    afs_error::NODE_VFS_UNAVAILABLE,
+                    "restore applied but response lost",
+                ));
+            }
+            Ok(())
+        }
+
+        fn lookup(&self, _: &InodeId, name: &[u8]) -> Result<Option<InodeRecord>> {
+            if name == b"new-child" || self.next_lookup_absent.swap(false, Ordering::SeqCst) {
+                return Ok(None);
+            }
             Ok(Some(self.inode.lock().unwrap().clone()))
         }
 
@@ -15382,6 +15642,9 @@ mod tests {
                     DistributedFs::clear_kernel_write_privileges(inode.attributes.mode);
             }
             self.commits.lock().unwrap().push(commit);
+            if self.lose_commit_reply.swap(false, Ordering::SeqCst) {
+                return Err(unavailable("commit applied, reply lost"));
+            }
             Ok(inode.clone())
         }
 
@@ -15402,6 +15665,13 @@ mod tests {
             attributes: InodeAttributes,
             _: CallerContext,
         ) -> Result<InodeRecord> {
+            if self
+                .mkdir_conflicts
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(Error::coded(afs_error::META_DFS_CONFLICT, "parent changed"));
+            }
             let mut inode = self.inode.lock().unwrap().clone();
             inode.kind = InodeKind::Directory;
             inode.attributes = attributes;
@@ -15908,6 +16178,536 @@ mod tests {
         fs.release(&context(), file.handle).unwrap();
     }
 
+    #[test]
+    fn lazy_fill_prepare_publishes_length_but_no_body() {
+        let (_temp, meta, fs) = test_fs();
+        meta.next_lookup_absent.store(true, Ordering::SeqCst);
+        let spec = super::super::lazy_fill::LazyFileSpec {
+            length: 8,
+            binding: super::super::lazy_fill::LazyFillBinding {
+                kind: "test.v1".into(),
+                payload: b"fixture".to_vec(),
+            },
+        };
+        let entry = fs
+            .prepare_lazy_file(&context(), fs.root_inode(), OsStr::new("lazy"), &spec)
+            .unwrap();
+        assert_eq!(entry.attributes.size, 8);
+        assert!(
+            meta.commits
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .layout_root
+                .inline_extents
+                .is_empty()
+        );
+        let handle = fs.open(&context(), entry.inode, libc::O_RDONLY).unwrap();
+        let mut body = [0xa5; 4];
+        assert!(fs.read(&context(), handle, 0, &mut body).is_err());
+        assert_eq!(body, [0xa5; 4]);
+        fs.release(&context(), handle).unwrap();
+    }
+
+    struct LazyHandlerFixture {
+        hold: AtomicBool,
+        calls: AtomicUsize,
+        fault: AtomicUsize,
+    }
+    impl super::super::lazy_fill::LazyFillHandler for LazyHandlerFixture {
+        fn fill(
+            &self,
+            request: super::super::lazy_fill::LazyFillRequest,
+        ) -> super::super::lazy_fill::LazyFillFuture<'_> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                while self.hold.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                match self.fault.load(Ordering::SeqCst) {
+                    1 => Err(unavailable("origin failure")),
+                    2 => Ok(prost::bytes::Bytes::from_static(b"a")),
+                    3 => Ok(prost::bytes::Bytes::from(vec![b'x'; request.length])),
+                    _ => Ok(prost::bytes::Bytes::copy_from_slice(
+                        &b"abcdefgh"
+                            [request.offset as usize..request.offset as usize + request.length],
+                    )),
+                }
+            })
+        }
+    }
+    fn lazy_fixture(fs: DistributedFs) -> (Arc<DistributedFs>, Arc<LazyHandlerFixture>, Entry) {
+        use super::super::lazy_fill::{LazyFileSpec, LazyFillBinding, LazyFillRegistry};
+        let handler = Arc::new(LazyHandlerFixture {
+            hold: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+            fault: AtomicUsize::new(0),
+        });
+        let mut registry = LazyFillRegistry::default();
+        registry.register("test.v1", handler.clone()).unwrap();
+        assert!(registry.register("test.v1", handler.clone()).is_err());
+        let fs = Arc::new(fs.with_lazy_fill_registry(Arc::new(registry)));
+        let spec = LazyFileSpec {
+            length: 8,
+            binding: LazyFillBinding {
+                kind: "test.v1".into(),
+                payload: b"fixture".to_vec(),
+            },
+        };
+        let entry = fs
+            .prepare_lazy_file(&context(), fs.root_inode(), OsStr::new("lazy"), &spec)
+            .unwrap();
+        let same = fs
+            .prepare_lazy_file(&context(), fs.root_inode(), OsStr::new("lazy"), &spec)
+            .unwrap();
+        assert_eq!(entry.inode, same.inode);
+        let different = LazyFileSpec { length: 9, ..spec };
+        assert!(
+            fs.prepare_lazy_file(&context(), fs.root_inode(), OsStr::new("lazy"), &different)
+                .is_err()
+        );
+        (fs, handler, entry)
+    }
+    #[test]
+    fn lazy_fill_exact_ranges_do_not_prefetch_or_overwrite_covered_bytes() {
+        let (_temp, meta, fs) = test_fs();
+        meta.next_lookup_absent.store(true, Ordering::SeqCst);
+        let (fs, handler, entry) = lazy_fixture(fs);
+        let handle = fs.open(&context(), entry.inode, libc::O_RDONLY).unwrap();
+        assert_eq!(fs.read_owned(&context(), handle, 1, 2).unwrap(), b"bc");
+        let layout = meta
+            .commits
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .layout_root
+            .clone();
+        assert_eq!(
+            layout.inline_extents.iter().map(|e| e.length).sum::<u64>(),
+            2
+        );
+        assert_eq!(fs.read_owned(&context(), handle, 0, 4).unwrap(), b"abcd");
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(fs.read_owned(&context(), handle, 0, 4).unwrap(), b"abcd");
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 3);
+        assert!(fs.open(&context(), entry.inode, libc::O_RDWR).is_err());
+        assert!(
+            fs.setattr(
+                &context(),
+                entry.inode,
+                None,
+                &AttributeChange {
+                    size: Some(0),
+                    ..Default::default()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            fs.removexattr(&context(), entry.inode, OsStr::new("user.afs.lazy.v1"))
+                .is_err()
+        );
+        fs.release(&context(), handle).unwrap();
+    }
+    #[test]
+    fn recovery_lazy_committed_chunk_keeps_version_and_identity() {
+        let meta = Arc::new(RecordingMeta::new());
+        meta.next_lookup_absent.store(true, Ordering::SeqCst);
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
+        let fs = distributed_fs_with_chunk_store(
+            meta.clone(),
+            local.clone(),
+            local.clone(),
+            DEFAULT_DIRTY_DATA_BUDGET_BYTES,
+        );
+        let control = Arc::new(Pr88GcControl::default());
+        let references = crate::node::gc::GcReferences::new(control.clone());
+        let (fs, handler, entry) = lazy_fixture(fs.with_gc_references(Some(references)));
+        let h = fs.open(&context(), entry.inode, libc::O_RDONLY).unwrap();
+        assert_eq!(fs.read_owned(&context(), h, 0, 4).unwrap(), b"abcd");
+        let before = meta.commits.lock().unwrap().last().unwrap().clone();
+        let chunk = before.layout_root.inline_extents[0].chunk_id.clone();
+        let publications = control.unfenced_publications.load(Ordering::SeqCst);
+        fs.read_engine
+            .collect_generation(1, std::slice::from_ref(&chunk))
+            .unwrap();
+        assert_eq!(fs.read_owned(&context(), h, 0, 4).unwrap(), b"abcd");
+        let after = meta.commits.lock().unwrap().last().unwrap().clone();
+        assert_eq!(
+            control.unfenced_publications.load(Ordering::SeqCst),
+            publications + 1,
+            "restore must admit the existing GC publication before replica persistence"
+        );
+        assert_eq!(before.file_version, after.file_version);
+        assert_eq!(before.layout_root, after.layout_root);
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 2);
+        assert!(local.open_verified(&chunk).is_ok());
+        fs.release(&context(), h).unwrap();
+    }
+
+    #[test]
+    fn recovery_lazy_rejects_changed_origin_then_concurrent_readers_share_restore() {
+        let (_temp, meta, fs) = test_fs();
+        meta.next_lookup_absent.store(true, Ordering::SeqCst);
+        let (fs, handler, entry) = lazy_fixture(fs);
+        let h = fs.open(&context(), entry.inode, libc::O_RDONLY).unwrap();
+        assert_eq!(fs.read_owned(&context(), h, 0, 4).unwrap(), b"abcd");
+        let before = meta.commits.lock().unwrap().last().unwrap().clone();
+        let chunk = before.layout_root.inline_extents[0].chunk_id.clone();
+        fs.read_engine
+            .collect_generation(1, std::slice::from_ref(&chunk))
+            .unwrap();
+        handler.fault.store(3, Ordering::SeqCst);
+        assert!(fs.read_owned(&context(), h, 0, 4).is_err());
+        assert_eq!(
+            meta.commits.lock().unwrap().last().unwrap().file_version,
+            before.file_version
+        );
+        handler.fault.store(0, Ordering::SeqCst);
+        std::thread::scope(|scope| {
+            for _ in 0..6 {
+                scope.spawn(|| assert_eq!(fs.read_owned(&context(), h, 0, 4).unwrap(), b"abcd"));
+            }
+        });
+        assert_eq!(
+            handler.calls.load(Ordering::SeqCst),
+            3,
+            "initial fill, rejected body, one coalesced restore"
+        );
+        assert_eq!(
+            meta.commits.lock().unwrap().last().unwrap().file_version,
+            before.file_version
+        );
+        fs.release(&context(), h).unwrap();
+    }
+
+    #[test]
+    fn recovery_lazy_lost_restore_reply_republishes_local_bytes() {
+        let (_temp, meta, fs) = test_fs();
+        meta.next_lookup_absent.store(true, Ordering::SeqCst);
+        let (fs, handler, entry) = lazy_fixture(fs);
+        let h = fs.open(&context(), entry.inode, libc::O_RDONLY).unwrap();
+        assert_eq!(fs.read_owned(&context(), h, 0, 4).unwrap(), b"abcd");
+        let before = meta.commits.lock().unwrap().last().unwrap().clone();
+        let restores_before = meta.restore_calls.load(Ordering::SeqCst);
+        let chunk = before.layout_root.inline_extents[0].chunk_id.clone();
+        fs.read_engine
+            .collect_generation(1, std::slice::from_ref(&chunk))
+            .unwrap();
+        meta.lose_restore_reply.store(true, Ordering::SeqCst);
+        assert!(fs.read_owned(&context(), h, 0, 4).is_err());
+        assert_eq!(fs.read_owned(&context(), h, 0, 4).unwrap(), b"abcd");
+        assert_eq!(
+            handler.calls.load(Ordering::SeqCst),
+            2,
+            "retry uses persisted restored bytes"
+        );
+        assert_eq!(
+            meta.restore_calls.load(Ordering::SeqCst),
+            restores_before + 2,
+            "unknown acknowledgement must be reconciled"
+        );
+        assert_eq!(
+            meta.commits.lock().unwrap().last().unwrap().file_version,
+            before.file_version
+        );
+        fs.release(&context(), h).unwrap();
+    }
+
+    #[test]
+    fn recovery_lazy_late_restore_rejects_changed_owner() {
+        let (_temp, meta, fs) = test_fs();
+        meta.next_lookup_absent.store(true, Ordering::SeqCst);
+        let (fs, handler, entry) = lazy_fixture(fs);
+        let h = fs.open(&context(), entry.inode, libc::O_RDONLY).unwrap();
+        assert_eq!(fs.read_owned(&context(), h, 0, 4).unwrap(), b"abcd");
+        let before = meta.commits.lock().unwrap().last().unwrap().clone();
+        let restores_before = meta.restore_calls.load(Ordering::SeqCst);
+        fs.read_engine
+            .collect_generation(1, &[before.layout_root.inline_extents[0].chunk_id.clone()])
+            .unwrap();
+        handler.hold.store(true, Ordering::SeqCst);
+        let reader = fs.clone();
+        let work = std::thread::spawn(move || reader.read_owned(&context(), h, 0, 4));
+        let until = Instant::now() + Duration::from_secs(2);
+        while handler.calls.load(Ordering::SeqCst) < 2 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let entered = handler.calls.load(Ordering::SeqCst) == 2;
+        meta.lease.lock().unwrap().lease_epoch += 1;
+        handler.hold.store(false, Ordering::SeqCst);
+        assert!(work.join().unwrap().is_err());
+        assert!(entered);
+        assert_eq!(meta.restore_calls.load(Ordering::SeqCst), restores_before);
+        assert_eq!(
+            meta.commits.lock().unwrap().last().unwrap().file_version,
+            before.file_version
+        );
+        fs.release(&context(), h).unwrap();
+    }
+
+    #[test]
+    fn lazy_fill_errors_and_short_bodies_do_not_publish() {
+        let (_temp, meta, fs) = test_fs();
+        meta.next_lookup_absent.store(true, Ordering::SeqCst);
+        let (fs, handler, entry) = lazy_fixture(fs);
+        let h = fs.open(&context(), entry.inode, libc::O_RDONLY).unwrap();
+        for fault in [1, 2] {
+            handler.fault.store(fault, Ordering::SeqCst);
+            assert!(fs.read_owned(&context(), h, 0, 4).is_err());
+            assert!(
+                meta.commits
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .unwrap()
+                    .layout_root
+                    .inline_extents
+                    .is_empty()
+            );
+        }
+        handler.fault.store(0, Ordering::SeqCst);
+        assert_eq!(fs.read_owned(&context(), h, 0, 4).unwrap(), b"abcd");
+        fs.release(&context(), h).unwrap();
+    }
+    #[test]
+    fn lazy_fill_concurrent_readers_share_committed_range() {
+        let (_temp, meta, fs) = test_fs();
+        meta.next_lookup_absent.store(true, Ordering::SeqCst);
+        let (fs, handler, entry) = lazy_fixture(fs);
+        std::thread::scope(|scope| {
+            for _ in 0..6 {
+                let fs = fs.clone();
+                scope.spawn(move || {
+                    let h = fs.open(&context(), entry.inode, libc::O_RDONLY).unwrap();
+                    assert_eq!(fs.read_owned(&context(), h, 0, 4).unwrap(), b"abcd");
+                    fs.release(&context(), h).unwrap();
+                });
+            }
+        });
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn lazy_fill_same_file_waiters_leave_other_origin_slots_available() {
+        let (_temp, meta, fs) = test_fs();
+        meta.next_lookup_absent.store(true, Ordering::SeqCst);
+        let (fs, handler, entry) = lazy_fixture(fs);
+        handler.hold.store(true, Ordering::SeqCst);
+        let handles: Vec<_> = (0..16)
+            .map(|_| fs.open(&context(), entry.inode, libc::O_RDONLY).unwrap())
+            .collect();
+        let workers: Vec<_> = handles
+            .iter()
+            .map(|&h| {
+                let fs = fs.clone();
+                std::thread::spawn(move || fs.read_owned(&context(), h, 0, 4))
+            })
+            .collect();
+        let until = Instant::now() + Duration::from_secs(2);
+        while handler.calls.load(Ordering::SeqCst) == 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        let available = fs.lazy_fill_budget.available_permits();
+        handler.hold.store(false, Ordering::SeqCst);
+        for worker in workers {
+            assert_eq!(worker.join().unwrap().unwrap(), b"abcd");
+        }
+        for handle in handles {
+            fs.release(&context(), handle).unwrap();
+        }
+        assert_eq!(
+            available, 15,
+            "only the actual fetch may occupy a node slot"
+        );
+    }
+
+    #[test]
+    fn lazy_fill_owner_obeys_forwarded_deadline_without_commit() {
+        use crate::node::rpc::{control::DfsOwnerLifecycleHandler, data::DfsOwnerFilesHandler};
+        let (_temp, meta, fs) = test_fs();
+        meta.next_lookup_absent.store(true, Ordering::SeqCst);
+        let (fs, handler, _) = lazy_fixture(fs);
+        handler.hold.store(true, Ordering::SeqCst);
+        let open = DfsOwnerLifecycleHandler::open(
+            fs.as_ref(),
+            "node-b",
+            dfs_owner_open_request(1, libc::O_RDONLY),
+        )
+        .unwrap();
+        let owner = open.handle.unwrap();
+        let release = handler.clone();
+        let unlock = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            release.hold.store(false, Ordering::SeqCst);
+        });
+        let result = DfsOwnerFilesHandler::read_with_deadline(
+            fs.as_ref(),
+            "node-b",
+            afs_protocol::node_data::DfsOwnerReadRequest {
+                handle: Some(DistributedFs::data_owner_handle(&owner)),
+                offset: 0,
+                length: 4,
+            },
+            Instant::now() + Duration::from_millis(30),
+        );
+        unlock.join().unwrap();
+        DfsOwnerLifecycleHandler::release(
+            fs.as_ref(),
+            "node-b",
+            afs_protocol::node_control::DfsOwnerReleaseRequest {
+                handle: Some(owner),
+            },
+        )
+        .unwrap();
+        assert!(
+            result.is_err(),
+            "owner must not reset the caller's deadline"
+        );
+        assert!(
+            meta.commits
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .layout_root
+                .inline_extents
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn namespace_mkdir_retries_parent_conflict_without_exposing_meta_code() {
+        let (_temp, meta, fs) = test_fs();
+        meta.mkdir_conflicts.store(3, Ordering::SeqCst);
+        meta.next_lookup_absent.store(true, Ordering::SeqCst);
+        let result = fs.mkdir(&context(), fs.root_inode(), OsStr::new("new-child"), 0o750);
+        assert!(
+            result.is_ok(),
+            "unrelated parent changes must not become NotFound: {result:?}"
+        );
+        assert_eq!(meta.mkdir_conflicts.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn lazy_fill_lost_commit_reply_reuses_committed_bytes_on_retry() {
+        let (_temp, meta, fs) = test_fs();
+        meta.next_lookup_absent.store(true, Ordering::SeqCst);
+        let (fs, handler, entry) = lazy_fixture(fs);
+        let h = fs.open(&context(), entry.inode, libc::O_RDONLY).unwrap();
+        let commits = meta.commits.lock().unwrap().len();
+        meta.lose_commit_reply.store(true, Ordering::SeqCst);
+        // The first caller may see success after reconciliation or an unknown
+        // outcome. A retry must not fetch or commit the already-published range.
+        let _ = fs.read_owned(&context(), h, 0, 4);
+        assert_eq!(fs.read_owned(&context(), h, 0, 4).unwrap(), b"abcd");
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(meta.commits.lock().unwrap().len(), commits + 1);
+        fs.release(&context(), h).unwrap();
+    }
+
+    #[test]
+    fn lazy_fill_shutdown_drains_waiters_and_open_handles() {
+        let (_temp, meta, fs) = test_fs();
+        meta.next_lookup_absent.store(true, Ordering::SeqCst);
+        let (fs, handler, entry) = lazy_fixture(fs);
+        handler.hold.store(true, Ordering::SeqCst);
+        let h = fs.open(&context(), entry.inode, libc::O_RDONLY).unwrap();
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let fs = fs.clone();
+                std::thread::spawn(move || fs.read_owned(&context(), h, 0, 4))
+            })
+            .collect();
+        let until = Instant::now() + Duration::from_secs(2);
+        while handler.calls.load(Ordering::SeqCst) == 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        fs.close_lazy_fill_admission();
+        assert!(fs.lazy_fill_lifetime.available_permits() < tokio::sync::Semaphore::MAX_PERMITS);
+        handler.hold.store(false, Ordering::SeqCst);
+        for worker in workers {
+            let _ = worker.join().unwrap();
+        }
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(fs.drain_lazy_fills());
+        assert_eq!(
+            fs.lazy_fill_lifetime.available_permits(),
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
+        assert_eq!(
+            fs.handles.len(),
+            1,
+            "only the caller handle remains after drain"
+        );
+        fs.release(&context(), h).unwrap();
+    }
+
+    #[test]
+    fn lazy_fill_late_callback_rejects_new_owner_epoch() {
+        let (_temp, meta, fs) = test_fs();
+        meta.next_lookup_absent.store(true, Ordering::SeqCst);
+        let (fs, handler, entry) = lazy_fixture(fs);
+        handler.hold.store(true, Ordering::SeqCst);
+        let handle = fs.open(&context(), entry.inode, libc::O_RDONLY).unwrap();
+        let reader = fs.clone();
+        let work = std::thread::spawn(move || reader.read_owned(&context(), handle, 0, 4));
+        let until = Instant::now() + Duration::from_secs(2);
+        while handler.calls.load(Ordering::SeqCst) == 0 && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+        meta.lease.lock().unwrap().lease_epoch += 1;
+        handler.hold.store(false, Ordering::SeqCst);
+        assert!(work.join().unwrap().is_err());
+        assert!(
+            meta.commits
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .layout_root
+                .inline_extents
+                .is_empty()
+        );
+        fs.release(&context(), handle).unwrap();
+    }
+
+    #[test]
+    fn lazy_fill_expired_read_never_commits_and_closed_admission_rejects() {
+        let (_temp, meta, fs) = test_fs();
+        meta.next_lookup_absent.store(true, Ordering::SeqCst);
+        let (fs, handler, entry) = lazy_fixture(fs);
+        handler.hold.store(true, Ordering::SeqCst);
+        let handle = fs.open(&context(), entry.inode, libc::O_RDONLY).unwrap();
+        let snapshot = fs.handle_snapshot(handle).unwrap();
+        assert!(
+            fs.lazy_read(&snapshot, 0, 4, Instant::now() + Duration::from_millis(20))
+                .is_err()
+        );
+        assert!(
+            meta.commits
+                .lock()
+                .unwrap()
+                .last()
+                .unwrap()
+                .layout_root
+                .inline_extents
+                .is_empty()
+        );
+        handler.hold.store(false, Ordering::SeqCst);
+        fs.close_lazy_fill_admission();
+        assert!(fs.read_owned(&context(), handle, 0, 4).is_err());
+        assert_eq!(handler.calls.load(Ordering::SeqCst), 1);
+        fs.release(&context(), handle).unwrap();
+    }
+
     fn test_fs() -> (tempfile::TempDir, Arc<RecordingMeta>, DistributedFs) {
         test_fs_with_dirty_budget(DEFAULT_DIRTY_DATA_BUDGET_BYTES)
     }
@@ -15932,7 +16732,7 @@ mod tests {
             NamespaceId::new("default"),
             "node-a".into(),
             local,
-            Arc::new(crate::node::dfs_read::UnimplementedReadSourceProvider),
+            meta.clone(),
             Arc::new(crate::node::dfs_read::UnimplementedChunkTransfer),
             crate::node::dfs_read::DfsReadConfig::default(),
         ));
@@ -26491,6 +27291,7 @@ mod tests {
                             .insert(
                                 id,
                                 DfsFileHandle {
+                                    origin_fill: false,
                                     gc_pin: None,
                                     inode_id: inode.inode_id.clone(),
                                     opened_inode: inode.clone(),

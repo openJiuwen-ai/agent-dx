@@ -663,6 +663,74 @@ pub struct ReplicaAck {
     pub verified_digest: ContentDigest,
 }
 
+/// Publish a complete verified read copy into the existing placement catalog.
+/// The local persistence receipt is evidence of bytes, not a durability promise.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PublishReadCache {
+    pub caller_id: String,
+    pub caller_session_id: String,
+    pub caller_node_epoch: u64,
+    pub operation_id: OperationId,
+    pub namespace_id: NamespaceId,
+    pub file_version_id: FileVersionId,
+    pub layout_root_id: LayoutRootId,
+    pub receipt: ReplicaAck,
+}
+
+/// Restore already committed immutable bytes using the ordinary replication receipt.
+/// This changes availability only, never the inode, FileVersion or layout.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RestoreFileChunk {
+    pub caller_id: String,
+    pub operation_id: OperationId,
+    pub file_version_id: FileVersionId,
+    pub layout_root_id: LayoutRootId,
+    pub write_lease: WriteLease,
+    pub receipt: ChunkReceipt,
+}
+
+/// Retire exactly the observed cache incarnation; stale retirement cannot
+/// remove a replacement copy or a promoted durable replica.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RetireReadCache {
+    pub caller_id: String,
+    pub caller_session_id: String,
+    pub caller_node_epoch: u64,
+    pub operation_id: OperationId,
+    pub copy: CopyRecord,
+}
+
+/// Stable per-device cache identity shared by publication and retirement.
+pub fn read_cache_copy(ack: &ReplicaAck) -> afs_error::Result<CopyRecord> {
+    let identity = serde_json::to_vec(&(
+        &ack.chunk_id,
+        &ack.node_id,
+        &ack.device_id,
+        ack.device_epoch,
+    ))
+    .map_err(|_| {
+        afs_error::Error::coded(
+            afs_error::IO_INVALID,
+            "read cache identity cannot be encoded",
+        )
+    })?;
+    Ok(CopyRecord {
+        id: CopyId::new(format!("cache:{}", blake3::hash(&identity).to_hex())),
+        chunk_id: ack.chunk_id.clone(),
+        role: CopyRole::VerifiedCache,
+        state: CopyState::Ready,
+        location: CopyLocation::Node {
+            node_id: ack.node_id.clone(),
+            node_epoch: ack.node_epoch,
+            device_id: ack.device_id.clone(),
+            device_epoch: ack.device_epoch,
+            catalog_revision: ack.catalog_revision,
+        },
+        persisted_bytes: ack.persisted_bytes,
+        verified_digest: ack.verified_digest.clone(),
+    })
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub enum CopyRole {
     #[serde(alias = "Durable", alias = "DurableReplica")]
@@ -739,6 +807,14 @@ impl CopyRecord {
             }),
             CopyLocation::External { .. } => None,
         }
+    }
+
+    /// Read eligibility is separate from the durability policy's copy count.
+    pub fn is_ready_readable(&self) -> bool {
+        matches!(
+            self.role,
+            CopyRole::DurableReplica | CopyRole::VerifiedCache
+        ) && self.state.is_readable()
     }
 
     pub fn is_ready_durable(&self) -> bool {

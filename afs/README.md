@@ -16,6 +16,10 @@ DFS Peer 客户端允许接收 128 KiB HTTP/2 DATA 帧；业务消息、流控�
 
 详细路径见[AFS 架构与时序图](../docs/architecture/afs.md)。
 
+DFS 提供可选的通用读副本扩散及多源并行范围读取，普通文件无需 Provider 即可使用。
+默认关闭扩散、保持单路读取；配置、可靠性区别和当前限制见
+[部署说明](../docs/deployment/afs.md#可选-dfs-通用分发)。
+
 ## 组件范围
 
 | 目录 | 内容 |
@@ -272,3 +276,7 @@ cryptographic confidentiality or integrity. See
 按文件收窄等待；正文保留共享FIFO和单消费者。fsync/flush/release登记恢复任务，不占正文额度。
 后台失败按文件保留并报告，不关闭整个挂载；USRBIO交接前等待此前正文处理。
 完整内存、顺序、错误及历史性能口径见[写入接纳合同](../docs/performance/afs-write-owned-admission.md)。
+
+## 可选第三方接入
+
+Nydus HTTP 接入、Registry Provider、通用 DFS 懒填充及使用边界见 [Connectors](CONNECTORS.md)。该能力默认关闭，按需注册到 Node 现有 REST 服务。

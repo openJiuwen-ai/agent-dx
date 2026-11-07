@@ -1,0 +1,24 @@
+{
+  "nydus": "v2.4.5",
+  "registry": "v3.1.2",
+  "assets": [
+    {
+      "url": "https://github.com/dragonflyoss/nydus/releases/download/v2.4.5/nydus-static-v2.4.5-linux-arm64.tgz",
+      "file": "nydus-static-v2.4.5-linux-arm64.tgz",
+      "bytes": 33237145,
+      "sha256": "85925af702d79fc3a8b9d501a5267ddc9f81449ff9fe94841845eb98eda84593"
+    },
+    {
+      "url": "https://github.com/dragonflyoss/nydus/releases/download/v2.4.5/nydus-static-v2.4.5-linux-arm64.tgz.sha256sum",
+      "file": "nydus-static-v2.4.5-linux-arm64.tgz.sha256sum",
+      "bytes": 102,
+      "sha256": "df4943adff38bb367e69677fe85072232040edf55b6dc1e242dc52fa5f6e2ea6"
+    },
+    {
+      "url": "https://github.com/distribution/distribution/releases/download/v3.1.2/registry_3.1.2_linux_arm64.tar.gz",
+      "file": "registry_3.1.2_linux_arm64.tar.gz",
+      "bytes": 14303844,
+      "sha256": "09d26f88d2c0f161bd1b8bfc6c123571cc3d291dcca8af5477b3cacc4ec95e73"
+    }
+  ]
+}

@@ -16,6 +16,22 @@ AFS 拥有自己的 UT 和组件集成测试；部署及公共用户 E2E 统一�
 
 Agent FS（AFS） 在目标仓中的验收按“目标仓源码、目标仓二进制、目标仓环境证据”登记。DMS/AFS 历史证据保留来源版本、环境和判据，可用于追溯和风险判断，但不自动升级为 Agent DX 当前候选结论。
 
+## 通用分发专项
+
+入口为 [distribution E2E](../../build/e2e/afs/distribution/README.md)。
+普通文件覆盖读后扩散、多来源供数、修改／截断／删除、缓存损坏／缺失、淘汰预算；
+Nydus 沿用原有 connector E2E 验证 HEAD/GET 自动准备、owner 回源和跨节点复用。
+Linux focused `distribution_` 测试还验证并发重叠、版本约束、截止时间、部分失败排空、
+缓存不冒充持久副本、最后缓存可作为修复来源、撤销重试不删除后续发布。
+启动时间对照必须同时注明 Dragonfly 调度策略、缓存状态、二进制优化档位和拓扑；
+不同实现的进程／网络／落盘成本不可用单个 HTTP 数字代替生产资格。
+
+来源恢复与缓存对账专项见[recovery E2E](../../build/e2e/afs/recovery/README.md)：
+R1 原节点停机后恢复原 Chunk，Meta 断联／Node 重启后自动补发布和撤销，
+普通文件多节点供数以及 Nydus 真实挂载。`recovery_` 还检查错误源正文、
+丢失确认、迟到 owner 回调、catalog WAL／检查点和旧撤销确认不覆盖新安装。
+一次本地多 namespace 运行不能替代多机或生产长稳资格。
+
 ## 平台与入口矩阵
 
 Rust 构建、Cargo metadata、格式、Clippy、单元测试、FUSE 运行、mount、权限、runc、workspace bind 和性能结论都只在 Linux 上确认。macOS 可用于文档检查和 Python 静态工具核对，不能作为 Rust/文件系统验收通过证据。

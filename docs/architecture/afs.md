@@ -214,6 +214,52 @@ AFS live/idle、allocator allocated/active/resident/retained 与进程 RSS 是�
 接收线程、worker、任务数与输入字节预算均可形成背压，不能声称新请求总能立即接收。
 具体功能、回收及平台验证边界见[测试说明](../testing/afs.md#原生写-buffer-验证)。
 
+## DFS 通用读副本扩散（可选）
+
+普通文件和 `lazy_fill` 文件共用此路径，connector 不参与副本发现或选源。
+已提交的不可变 Chunk 经完整校验后，可复用本机 ChunkStore/catalog WAL 保存为
+`VerifiedCache`，通过现有 Copy/Placement 和节点 session 发布。其他读者可选择这份副本。
+缓存不增加文件内容版本，不计入持久副本承诺；普通写入提升为持久副本后不再受缓存淘汰。
+
+`DfsReadEngine` 可将同一版本的授权范围拆为互不重叠的 stripe，从多个 Node 并发读取。
+每段沿用既有 Peer 授权、校验、失败换源和总截止时间；所有子任务排空后才返回调用方。
+启用多源策略时，单个来源只使用剩余截止时间的一份，为其他副本保留重试时间；不额外并发发送重复范围。
+候选按已有负载提示排序并轮换，尚无吞吐自适应、慢源对冲或拓扑感知调度。
+
+```text
+FUSE / vfs::Backend / connector
+              ↓
+DistributedFs：固定文件版本与授权
+              ↓
+DfsReadEngine：并行选源 → 校验完整 Chunk → LocalChunkStore
+              ↕                               ↓
+          现有 Peer                     Copy / Placement 发布
+              ↕                               ↓
+          其他 Node ←─────────────── Meta 可读副本发现
+```
+
+开启读副本后，短读可以扩为完整 Chunk（仅授权覆盖整块时，单块不超过 4 MiB）；
+扩展批次不超过 `max_inflight_bytes`，同时至多两个扩展读取和两个缓存写入任务。
+同 Chunk 的本机请求共用已有有界 key gate。缓存按 catalog revision FIFO 淘汰，
+容量计算包括正文和每块 4 KiB 记账；固定 reader 仍可读完已打开的旧文件。
+这不是整个文件系统磁盘用量的硬上限，WAL、元数据和未关闭的已删除文件需另留空间。
+
+缓存损坏／缺失沿用隔离与维护上报；旧节点 epoch 的缓存不参与发现。
+发布前将待对账的 Copy 与版本来源写入同一个 catalog WAL／检查点。已有维护循环
+按物理缓存和当前 session 重试发布／撤销；重启后重新验证缓存并发布新 epoch，
+不需要一次新的业务读取。撤销确认只清除相同 incarnation 的记录，Meta 用既有
+Copy 的 Deleting 状态阻止迟到发布复活旧副本；Chunk GC 同时清除该标记。
+每节点至多 1024 条对账记录（含已发布缓存），每轮至多 16 条、1 秒预算；网络失败保留记录，
+不会把未发布缓存计入持久副本，也不阻止已经校验成功的读取。维护循环仍可能被
+其他复制任务延迟，收敛时间没有固定 SLA。
+
+有通用 lazy_fill 来源绑定的文件，在已提交副本不可用时由当前 owner 重建原 Chunk，
+沿既有 GC 保护和复制写入取得 receipt，再通过 `RestoreFileChunk` 恢复 Copy/Placement；
+Meta 检查 head、owner／session、原 Chunk、复制策略及 GC，不生成新内容版本。
+恢复最多取完整 4 MiB Chunk，hook 单次至多 1 MiB；Provider 不参与存储提交。
+普通文件的副本扩散、对账和多来源读取不依赖 connector；没有来源绑定的文件不能回源。
+默认关闭扩散，默认远端读取并行度仍为 1。规模、吞吐及跨物理机故障资格须单独验收。
+
 ## DFS 原生节点读取上下文
 
 未配置外部后端时，新open从Meta取得fresh inode，之后同句柄复用已提交版本视图

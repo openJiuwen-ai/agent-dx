@@ -346,6 +346,12 @@ pub struct Cli {
     #[arg(long)]
     pub dfs_read_max_ops_per_batch: Option<usize>,
     #[arg(long)]
+    pub dfs_read_cache_bytes: Option<u64>,
+    #[arg(long)]
+    pub dfs_read_parallelism: Option<usize>,
+    #[arg(long)]
+    pub dfs_read_stripe_bytes: Option<usize>,
+    #[arg(long)]
     pub dfs_read_max_inflight_bytes: Option<u64>,
     #[arg(long)]
     pub dfs_source_cache_max_ms: Option<u64>,
@@ -424,6 +430,7 @@ impl Cli {
 #[serde(deny_unknown_fields)]
 /// TOML 输入层。拒绝未知字段，让拼错开关在启动时失败，而不是静默使用默认行为。
 struct FileConfig {
+    connectors: Option<crate::node::connectors::ConnectorsConfig>,
     id: Option<String>,
     grpc_listen: Option<SocketAddr>,
     rest_listen: Option<SocketAddr>,
@@ -499,6 +506,9 @@ struct FileConfig {
     dfs_min_distinct_failure_domains: Option<u16>,
     dfs_local_copy: Option<String>,
     dfs_read_max_ops_per_batch: Option<usize>,
+    dfs_read_cache_bytes: Option<u64>,
+    dfs_read_parallelism: Option<usize>,
+    dfs_read_stripe_bytes: Option<usize>,
     dfs_read_max_inflight_bytes: Option<u64>,
     dfs_source_cache_max_ms: Option<u64>,
     dfs_source_lookahead_chunks: Option<usize>,
@@ -536,6 +546,7 @@ impl DfsReadCrcMode {
 #[derive(Debug, Clone, Serialize)]
 /// 解析和校验后的进程配置。模块接收这个值，不各自重复读取配置文件或环境变量。
 pub struct Config {
+    pub connectors: crate::node::connectors::ConnectorsConfig,
     pub id: String,
     pub grpc_listen: SocketAddr,
     pub rest_listen: SocketAddr,
@@ -612,6 +623,9 @@ pub struct Config {
     pub dfs_min_distinct_failure_domains: u16,
     pub dfs_local_copy: String,
     pub dfs_read_max_ops_per_batch: usize,
+    pub dfs_read_cache_bytes: u64,
+    pub dfs_read_parallelism: usize,
+    pub dfs_read_stripe_bytes: usize,
     pub dfs_read_max_inflight_bytes: u64,
     pub dfs_source_cache_max_ms: u64,
     pub dfs_source_lookahead_chunks: usize,
@@ -647,6 +661,10 @@ impl Config {
                 "ownerfs_mkdir_load_balance is only valid for afs-meta",
             ));
         }
+        let connectors = file.connectors.clone().unwrap_or_default();
+        if connectors.nydus.enabled && role != Role::Node {
+            return Err(invalid("connectors are only supported by afs-node"));
+        }
         let id = cli.id.or(file.id).unwrap_or_else(|| {
             match role {
                 Role::Node => "node",
@@ -671,6 +689,11 @@ impl Config {
             Some("dfs") => (false, true),
             _ => return Err(invalid("fs must be ownerfs, dfs or all")),
         };
+        if connectors.nydus.enabled
+            && (!dfs || !cfg!(feature = "dfs") || file.dfs_external_backend.is_some())
+        {
+            return Err(invalid("Nydus connector requires native DFS"));
+        }
         if role == Role::Node
             && ((ownerfs && !cfg!(feature = "ownerfs")) || (dfs && !cfg!(feature = "dfs")))
         {
@@ -737,6 +760,26 @@ impl Config {
         if !["required", "preferred", "none"].contains(&dfs_local_copy.as_str()) {
             return Err(invalid(
                 "dfs_local_copy must be required, preferred or none",
+            ));
+        }
+        let dfs_read_cache_bytes = cli
+            .dfs_read_cache_bytes
+            .or(file.dfs_read_cache_bytes)
+            .unwrap_or(0);
+        let dfs_read_parallelism = cli
+            .dfs_read_parallelism
+            .or(file.dfs_read_parallelism)
+            .unwrap_or(1);
+        let dfs_read_stripe_bytes = cli
+            .dfs_read_stripe_bytes
+            .or(file.dfs_read_stripe_bytes)
+            .unwrap_or(256 * 1024);
+        if !(1..=8).contains(&dfs_read_parallelism)
+            || !(64 * 1024..=8 * 1024 * 1024).contains(&dfs_read_stripe_bytes)
+            || !dfs_read_stripe_bytes.is_multiple_of(64 * 1024)
+        {
+            return Err(invalid(
+                "DFS distribution requires parallelism 1..=8 and stripe size 64KiB..=8MiB in 64KiB units",
             ));
         }
         let dfs_read_max_ops_per_batch = cli
@@ -1032,6 +1075,7 @@ impl Config {
                 .tls_identity_private_key
                 .or(file.tls_identity_private_key),
             tls_server_name: cli.tls_server_name.or(file.tls_server_name),
+            connectors,
             trusted_node_certs: file.trusted_node_certs.unwrap_or_default(),
             data_dir: cli
                 .data_dir
@@ -1100,6 +1144,9 @@ impl Config {
             dfs_min_distinct_failure_domains,
             dfs_local_copy,
             dfs_read_max_ops_per_batch,
+            dfs_read_cache_bytes,
+            dfs_read_parallelism,
+            dfs_read_stripe_bytes,
             dfs_read_max_inflight_bytes,
             dfs_source_cache_max_ms,
             dfs_source_lookahead_chunks,

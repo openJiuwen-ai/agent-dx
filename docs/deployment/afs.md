@@ -20,6 +20,27 @@ Agent FS（AFS） 是 Agent DX 的可选文件系统组件。默认部署配置�
 
 发布包配置示例来自 [build/config/examples/afs/](../../build/config/examples/afs/)，源码级示例保留在 [afs/examples/](../../afs/examples/)。部署层只负责把 AFS TOML 交给 `afs-meta` 和 `afs-node`，以及进程启动、健康查询、正常停止和卸载；它不改写 AFS 自有配置 schema。
 
+### 可选 DFS 通用分发
+
+Node TOML 顶层配置（普通文件也生效，不依赖 Nydus）：
+
+```toml
+# 默认分别为 0、1、262144；此示例显式启用实验候选。
+dfs_read_cache_bytes = 67108864
+dfs_read_parallelism = 4
+dfs_read_stripe_bytes = 262144
+```
+
+并行度允许 1–8；stripe 允许 64 KiB–8 MiB，且为 64 KiB 整倍数。
+读副本要求支持完整 Chunk 授权的原生异步 Peer 路径；不适用时沿用原有读取。
+缓存持久化及发布在首次读取路径上，短读可能下载完整块，需测量放大和首读延迟。
+缓存预算不替代持久数据容量和读管线预算；VerifiedCache 不计入 `dfs_desired_copies`
+或同步持久 ACK。不要通过减少持久副本数来假装保持了原有可靠性。
+
+所有 Node/Meta 应部署同一协议版本；默认关闭不代表旧 Meta 支持新增 RPC。
+当前候选的生命周期限制见[架构说明](../architecture/afs.md#dfs-通用读副本扩散可选)，
+不是大规模 Dragonfly 替代资格。
+
 ### Trace 配置
 
 AFS 使用自有 TOML 的 `trace_enabled`、`trace_endpoint`、`trace_sample_ratio`，默认关闭；开启后经 OTLP/gRPC 导出（代码默认 4317）。AFS 不读取 ADX 的 `ADX_TRACE_*` / `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`，也不受部署级 `tracing` 策略控制。ADX Collector 默认只接收 OTLP/HTTP 4318，启用 AFS trace 时需为 Collector 增加 gRPC 接收端或调整 AFS endpoint。

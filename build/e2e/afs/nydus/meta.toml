@@ -1,0 +1,17 @@
+dfs_desired_copies = 2
+dfs_sync_required_copies = 2
+dfs_min_distinct_nodes = 2
+id = "meta"
+fs = "dfs"
+grpc_listen = "10.203.0.10:7400"
+rest_listen = "10.203.0.10:7401"
+data_dir = "/workspace/afs/state-replicated"
+log_level = "info"
+trace_enabled = false
+tls_encryption_enabled = false
+tls_ca_certificate = "/artifacts/afs-tls/ca.pem"
+tls_identity_certificate = "/artifacts/afs-tls/meta.pem"
+tls_identity_private_key = "/artifacts/afs-tls/meta.key"
+tls_server_name = "afs-meta"
+trusted_node_certs = { node-a = "/artifacts/afs-tls/node-a.pem", node-b = "/artifacts/afs-tls/node-b.pem", node-c = "/artifacts/afs-tls/node-c.pem" }
+meta_store = "local-file"

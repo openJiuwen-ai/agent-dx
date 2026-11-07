@@ -1,0 +1,33 @@
+dfs_read_cache_bytes = 67108864
+dfs_read_parallelism = 4
+dfs_read_stripe_bytes = 262144
+dfs_desired_copies = 1
+dfs_sync_required_copies = 1
+dfs_min_distinct_nodes = 1
+id = "node-a"
+fs = "dfs"
+grpc_listen = "10.203.0.20:7400"
+rest_listen = "10.203.0.20:7401"
+data_dir = "/workspace/afs/state-replicated"
+log_level = "info"
+trace_enabled = false
+tls_encryption_enabled = false
+tls_ca_certificate = "/artifacts/afs-tls/ca.pem"
+tls_identity_certificate = "/artifacts/afs-tls/node-a.pem"
+tls_identity_private_key = "/artifacts/afs-tls/node-a.key"
+tls_server_name = "afs-meta"
+trusted_node_certs = { node-a = "/artifacts/afs-tls/node-a.pem", node-b = "/artifacts/afs-tls/node-b.pem", node-c = "/artifacts/afs-tls/node-c.pem", node-d = "/artifacts/afs-tls/node-d.pem" }
+meta_endpoint = "https://10.203.0.10:7400"
+advertise_endpoint = "https://10.203.0.20:7400"
+data_mode = "grpc"
+uds_path = "/workspace/afs/run/node.sock"
+dfs_mount = "/workspace/afs/mount"
+dfs_crc32c_writes = true
+dfs_read_crc_mode = "both"
+dfs_optimistic_gc_commit = true
+[connectors.nydus]
+enabled = true
+timeout_ms = 3000
+[connectors.nydus.sources.lab]
+registry = "http://10.203.0.10:5001"
+repository = "lab/nydus"

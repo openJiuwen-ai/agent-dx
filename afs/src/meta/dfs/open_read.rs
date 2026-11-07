@@ -126,7 +126,7 @@ impl DfsService {
                 if let Some(MetaEntity::DfsCopy(copy)) =
                     view.lookup(&MetaKey::DfsCopy(copy_id.clone()))?.entity
                     && copy.chunk_id == *id
-                    && copy.is_ready_durable()
+                    && copy.is_ready_readable()
                     && serving_read_copy(&copy, &receiver, now).is_some()
                 {
                     copies.push(copy.id);

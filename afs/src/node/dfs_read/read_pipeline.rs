@@ -145,7 +145,9 @@ impl DfsReadEngine {
         group_handle: u64,
         lifetime: crate::node::read_pipeline::ReadLifetime,
     ) -> Result<Option<prost::bytes::Bytes>> {
-        if self.external_backend.is_some()
+        if self.config.read_cache_bytes != 0
+            || self.config.distribution.parallelism > 1
+            || self.external_backend.is_some()
             || batch.ops.len() != 1
             || batch.ops[0].output_offset != 0
             || batch.ops[0].length != output_len as u64

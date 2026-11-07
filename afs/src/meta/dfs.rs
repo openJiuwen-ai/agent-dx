@@ -3,6 +3,8 @@
 mod gc;
 
 mod open_read;
+mod read_cache;
+mod restore;
 
 use std::{
     collections::{BTreeSet, HashSet},
@@ -593,7 +595,11 @@ impl DfsService {
                 Ok(placement) => placement,
                 Err(_) => continue,
             };
-            if self.live_ready_copy_count(&placement, now).await? == 0 {
+            if self
+                .live_source_count_excluding(&placement, now, None, false)
+                .await?
+                == 0
+            {
                 if task.state != ReplicationTaskState::BlockedNoSource
                     || placement.health != PlacementHealth::BlockedNoSource
                 {
@@ -850,7 +856,7 @@ impl DfsService {
             corrupt.state = CopyState::Corrupt;
             mutations.push(TxnMutation::Put(MetaEntity::DfsCopy(corrupt)));
             let remaining_live_sources = self
-                .live_ready_copy_count_excluding(&placement, now, Some(&source_copy.id))
+                .live_source_count_excluding(&placement, now, Some(&source_copy.id), false)
                 .await?;
             let mut updated_placement = placement.clone();
             if remaining_live_sources == 0 {
@@ -998,13 +1004,17 @@ impl DfsService {
 
         let mut observed_copies = Vec::with_capacity(placement.copies.len());
         let mut same_device_seen = false;
+        let mut durable_same_device_seen = false;
         let mut has_superseding_same_device = false;
         let mut changed_copies = Vec::new();
         let mut changed_copy_ids = HashSet::new();
         for copy_id in &placement.copies {
             let copy = self.copy(copy_id).await?;
             if copy_matches_chunk(&copy, &chunk)
-                && copy.role == CopyRole::DurableReplica
+                && matches!(
+                    copy.role,
+                    CopyRole::DurableReplica | CopyRole::VerifiedCache
+                )
                 && let CopyLocation::Node {
                     node_id,
                     device_id,
@@ -1017,6 +1027,7 @@ impl DfsService {
                 && *device_epoch == request.device_epoch
             {
                 same_device_seen = true;
+                durable_same_device_seen |= copy.role == CopyRole::DurableReplica;
                 if *catalog_revision >= request.catalog_revision || copy.state == CopyState::Corrupt
                 {
                     has_superseding_same_device = true;
@@ -1032,8 +1043,51 @@ impl DfsService {
         }
         if !same_device_seen {
             return Err(permission_denied(
-                "corruption report found no caller-owned durable copy on the reported device",
+                "corruption report found no caller-owned copy on the reported device",
             ));
+        }
+
+        if !durable_same_device_seen {
+            // Disposable cache health uses the same corruption report and copy fencing,
+            // but its loss does not create a durability repair obligation.
+            if changed_copies.is_empty() && !has_superseding_same_device {
+                return Err(invalid(
+                    "cache corruption report has no matching incarnation",
+                ));
+            }
+            let key = RequestKey::new(&request.caller_id, &request.operation_id.0);
+            let mut txn = MetaTxn::new(key.clone(), StoreOperation::DfsReportChunkCorruption);
+            txn.conditions = vec![
+                TxnCondition::RequestAbsent(key.clone()),
+                TxnCondition::NodeSessionCurrent {
+                    node_id: request.caller_id.clone(),
+                    session_id: request.caller_session_id.clone(),
+                },
+                TxnCondition::EntityEquals(MetaEntity::NodeSession(caller_session)),
+                TxnCondition::EntityEquals(MetaEntity::DfsChunk(chunk)),
+                TxnCondition::EntityEquals(MetaEntity::DfsPlacement(placement)),
+            ];
+            txn.conditions.extend(
+                observed_copies
+                    .into_iter()
+                    .map(|copy| TxnCondition::EntityEquals(MetaEntity::DfsCopy(copy))),
+            );
+            txn.mutations.extend(
+                changed_copies
+                    .into_iter()
+                    .map(|copy| TxnMutation::Put(MetaEntity::DfsCopy(copy))),
+            );
+            txn.mutations
+                .push(TxnMutation::RecordRequestOutcome(RequestOutcome {
+                    request: key,
+                    operation: StoreOperation::DfsReportChunkCorruption,
+                    result: namespace_result(request_digest, OperationResult::Empty),
+                }));
+            return empty_namespace_outcome(
+                self.store.compare_and_commit(txn).await?,
+                StoreOperation::DfsReportChunkCorruption,
+                request_digest,
+            );
         }
 
         let remaining_live_sources = live_ready_copy_count_from_observed_excluding(
@@ -2850,7 +2904,7 @@ impl DfsService {
                     }
                     (copy.clone(), None)
                 } else {
-                    if copy.chunk_id != chunk_id || !copy.is_ready_durable() {
+                    if copy.chunk_id != chunk_id || !copy.is_ready_readable() {
                         continue;
                     }
                     let CopyLocation::Node { node_id, .. } = &copy.location else {
@@ -3529,7 +3583,7 @@ impl DfsService {
                 .entity
             {
                 Some(MetaEntity::DfsCopy(value))
-                    if value.chunk_id == validation.chunk_id && value.is_ready_durable() =>
+                    if value.chunk_id == validation.chunk_id && value.is_ready_readable() =>
                 {
                     value
                 }
@@ -4453,6 +4507,17 @@ impl DfsService {
         now: u64,
         excluded_copy_id: Option<&CopyId>,
     ) -> Result<usize> {
+        self.live_source_count_excluding(placement, now, excluded_copy_id, true)
+            .await
+    }
+
+    async fn live_source_count_excluding(
+        &self,
+        placement: &PlacementRecord,
+        now: u64,
+        excluded_copy_id: Option<&CopyId>,
+        durable_only: bool,
+    ) -> Result<usize> {
         let chunk = self.chunk(&placement.chunk_id).await?;
         let mut nodes = HashSet::new();
         for copy_id in &placement.copies {
@@ -4460,7 +4525,10 @@ impl DfsService {
                 continue;
             }
             let copy = self.copy(copy_id).await?;
-            if !copy_matches_chunk(&copy, &chunk) {
+            if !copy.is_ready_readable()
+                || (durable_only && !copy.is_ready_durable())
+                || !copy_matches_chunk(&copy, &chunk)
+            {
                 continue;
             }
             if let CopyLocation::Node { node_id, .. } = &copy.location
@@ -6094,7 +6162,8 @@ pub(super) fn serving_read_copy(
     else {
         return None;
     };
-    if !copy.is_ready_durable()
+    if !copy.is_ready_readable()
+        || (copy.role == CopyRole::VerifiedCache && session.lease_epoch != *node_epoch)
         || node_id != &session.node_id
         || *node_epoch == 0
         || session.lease_epoch < *node_epoch
@@ -6145,7 +6214,7 @@ async fn live_ready_copy_count_from_observed_excluding(
 ) -> Result<usize> {
     let mut nodes = HashSet::new();
     for copy in copies {
-        if excluded.contains(&copy.id) {
+        if !copy.is_ready_durable() || excluded.contains(&copy.id) {
             continue;
         }
         if let CopyLocation::Node { node_id, .. } = &copy.location {
@@ -6480,6 +6549,98 @@ mod read_recovery_tests {
             },
             copy,
         }
+    }
+
+    async fn restore_request(f: &Fixture) -> crate::dfs::RestoreFileChunk {
+        f.service.initialize_replication_config().await.unwrap();
+        let (_, lease) = f
+            .service
+            .open_write(
+                "receiver".into(),
+                "receiver-original".into(),
+                OperationId::new("restore-open"),
+                InodeId::new("file"),
+                30,
+            )
+            .await
+            .unwrap();
+        let placement = f
+            .service
+            .placement_snapshot("receiver".into())
+            .await
+            .unwrap();
+        let group = &placement.replica_groups[0];
+        let staged = StagedChunk::new(OperationId::new("restore-existing"), b"data".to_vec());
+        let acks = f
+            .local
+            .persist_batch(
+                std::slice::from_ref(&staged),
+                &group.targets[0],
+                placement.revision,
+                group.placement_epoch,
+            )
+            .unwrap();
+        crate::dfs::RestoreFileChunk {
+            caller_id: "receiver".into(),
+            operation_id: staged.operation_id.clone(),
+            file_version_id: f.request.file_version_id.clone(),
+            layout_root_id: f.request.layout_root_id.clone(),
+            write_lease: lease,
+            receipt: crate::dfs::ChunkReceipt {
+                operation_id: staged.operation_id,
+                chunk: staged.chunk,
+                replica_group_id: group.id.clone(),
+                placement_revision: placement.revision,
+                placement_epoch: group.placement_epoch,
+                durable_acks: acks,
+                external_commit: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_restore_preserves_head_and_replay_rejects_changed_receipt() {
+        let f = fixture().await;
+        let request = restore_request(&f).await;
+        let before = f.service.get_inode(InodeId::new("file")).await.unwrap();
+        f.service.restore_file_chunk(request.clone()).await.unwrap();
+        f.service.restore_file_chunk(request.clone()).await.unwrap();
+        assert_eq!(
+            f.service.get_inode(InodeId::new("file")).await.unwrap(),
+            before
+        );
+        let mut changed = request;
+        changed.receipt.durable_acks[0].catalog_revision += 1;
+        assert!(f.service.restore_file_chunk(changed).await.is_err());
+        assert!(
+            f.sources()
+                .await
+                .iter()
+                .any(|source| source.chunk_id == f.copy.chunk_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_restore_rejects_wrong_authority_body_and_head() {
+        let f = fixture().await;
+        let request = restore_request(&f).await;
+        let mut wrong = request.clone();
+        wrong.write_lease.lease_epoch += 1;
+        assert!(f.service.restore_file_chunk(wrong).await.is_err());
+        let mut wrong = request.clone();
+        wrong.file_version_id = FileVersionId::new("another-head");
+        assert!(f.service.restore_file_chunk(wrong).await.is_err());
+        let mut wrong = request.clone();
+        wrong.receipt.chunk.length += 1;
+        assert!(f.service.restore_file_chunk(wrong).await.is_err());
+        let mut wrong = request.clone();
+        wrong.receipt.durable_acks[0].node_epoch += 1;
+        assert!(f.service.restore_file_chunk(wrong).await.is_err());
+        let mut wrong = request.clone();
+        wrong.receipt.durable_acks.clear();
+        assert!(f.service.restore_file_chunk(wrong).await.is_err());
+        f.restart(f.local.device_descriptor().unwrap()).await;
+        assert!(f.service.restore_file_chunk(request).await.is_err());
     }
 
     async fn replace_source_layout(f: &Fixture, extents: Vec<Extent>) {
@@ -6865,6 +7026,303 @@ mod read_recovery_tests {
             }),
         ]);
         store.compare_and_commit(txn).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn distribution_verified_cache_is_readable_but_never_counts_as_durable() {
+        let f = fixture().await;
+        let mut cache = f.copy.clone();
+        cache.role = CopyRole::VerifiedCache;
+        overwrite_copy(&f.store, cache, "cache-only").await;
+        let sources = f.service.chunk_sources(f.request.clone()).await.unwrap();
+        assert_eq!(
+            sources.chunks[0].sources.len(),
+            1,
+            "verified cache must be discoverable"
+        );
+        assert_eq!(sources.chunks[0].sources[0].role, CopyRole::VerifiedCache);
+        let placement = stored_placement(&f).await;
+        assert_eq!(
+            f.service
+                .live_ready_copy_count(&placement, now_unix_ms())
+                .await
+                .unwrap(),
+            0
+        );
+        let cached = stored_copy(&f, &f.copy.id).await;
+        assert_eq!(
+            live_ready_copy_count_from_observed_excluding(
+                &[cached],
+                &HashSet::new(),
+                &f.service,
+                now_unix_ms()
+            )
+            .await
+            .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn distribution_last_read_cache_can_supply_normal_durable_repair() {
+        let f = underreplicated_fixture().await;
+        let mut cache = f.copy.clone();
+        cache.role = CopyRole::VerifiedCache;
+        overwrite_copy(&f.store, cache, "only-cache-source").await;
+        let claim = f
+            .service
+            .claim_replication_task(claim_request("repair-from-cache"))
+            .await
+            .unwrap();
+        assert!(
+            claim.is_some(),
+            "a readable cache may supply repair without counting as a durable ACK"
+        );
+    }
+
+    #[tokio::test]
+    async fn distribution_cache_corruption_is_withdrawn_without_creating_durability_debt() {
+        let f = fixture().await;
+        let mut cache = f.copy.clone();
+        cache.role = CopyRole::VerifiedCache;
+        overwrite_copy(&f.store, cache.clone(), "only-cache-corrupt").await;
+        let report = corruption_report("bad-cache", &cache, node_catalog_revision(&cache) + 1);
+        f.service.report_chunk_corruption(report).await.unwrap();
+        assert_eq!(stored_copy(&f, &cache.id).await.state, CopyState::Corrupt);
+        assert!(
+            f.service
+                .chunk_sources(f.request.clone())
+                .await
+                .unwrap()
+                .chunks[0]
+                .sources
+                .is_empty()
+        );
+        assert!(
+            f.store
+                .read(MetaRead::DfsReplicationTask(repair_task_id(
+                    &cache.chunk_id
+                )))
+                .await
+                .unwrap()
+                .entity
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn distribution_cache_requires_same_session_and_readable_state() {
+        let f = fixture().await;
+        let CopyLocation::Node { node_id, .. } = &f.copy.location else {
+            panic!("node copy")
+        };
+        let session = f
+            .service
+            .current_live_session(node_id, now_unix_ms())
+            .await
+            .unwrap();
+        let mut cache = f.copy.clone();
+        cache.role = CopyRole::VerifiedCache;
+        assert!(serving_read_copy(&cache, &session, now_unix_ms()).is_some());
+        let mut restarted = session.clone();
+        restarted.lease_epoch += 1;
+        for device in &mut restarted.storage_devices {
+            device.catalog_revision = u64::MAX;
+        }
+        assert!(
+            serving_read_copy(&cache, &restarted, now_unix_ms()).is_none(),
+            "recovered caches require fresh publication"
+        );
+        assert!(
+            serving_read_copy(&f.copy, &restarted, now_unix_ms()).is_some(),
+            "durable recovery still uses existing catalog floor"
+        );
+        for state in [
+            CopyState::Corrupt,
+            CopyState::Deleting,
+            CopyState::LegacyStaging,
+        ] {
+            cache.state = state;
+            assert!(!cache.is_ready_readable());
+            assert!(serving_read_copy(&cache, &session, now_unix_ms()).is_none());
+        }
+    }
+
+    fn cache_request(f: &Fixture, operation: &str) -> crate::dfs::PublishReadCache {
+        let CopyLocation::Node {
+            node_id,
+            node_epoch,
+            device_id,
+            device_epoch,
+            catalog_revision,
+        } = &f.copy.location
+        else {
+            panic!("node copy")
+        };
+        crate::dfs::PublishReadCache {
+            caller_id: node_id.clone(),
+            caller_session_id: "receiver-original".into(),
+            caller_node_epoch: *node_epoch,
+            operation_id: OperationId::new(operation),
+            namespace_id: f.request.namespace_id.clone(),
+            file_version_id: f.request.file_version_id.clone(),
+            layout_root_id: f.request.layout_root_id.clone(),
+            receipt: ReplicaAck {
+                operation_id: OperationId::new(operation),
+                chunk_id: f.copy.chunk_id.clone(),
+                placement_revision: 1,
+                placement_epoch: 1,
+                node_id: node_id.clone(),
+                node_epoch: *node_epoch,
+                device_id: device_id.clone(),
+                device_epoch: *device_epoch,
+                catalog_revision: *catalog_revision,
+                persisted_bytes: f.copy.persisted_bytes,
+                verified_digest: f.copy.verified_digest.clone(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn distribution_cache_publication_replay_retirement_and_durability() {
+        let f = fixture().await;
+        let request = cache_request(&f, "cache-publish");
+        let copy = f.service.publish_read_cache(request.clone()).await.unwrap();
+        assert_eq!(
+            f.service.publish_read_cache(request.clone()).await.unwrap(),
+            copy
+        );
+        assert_eq!(copy.role, CopyRole::VerifiedCache);
+        let sources = f.service.chunk_sources(f.request.clone()).await.unwrap();
+        assert_eq!(sources.chunks[0].sources.len(), 2);
+        assert_eq!(
+            f.service
+                .live_ready_copy_count(&stored_placement(&f).await, now_unix_ms())
+                .await
+                .unwrap(),
+            1
+        );
+        let mut changed = request.clone();
+        changed.receipt.persisted_bytes += 1;
+        assert!(
+            f.service.publish_read_cache(changed).await.is_err(),
+            "same operation cannot change receipt"
+        );
+        let retire = crate::dfs::RetireReadCache {
+            caller_id: request.caller_id.clone(),
+            caller_session_id: request.caller_session_id.clone(),
+            caller_node_epoch: request.caller_node_epoch,
+            operation_id: OperationId::new("retire-cache"),
+            copy: copy.clone(),
+        };
+        f.service.retire_read_cache(retire.clone()).await.unwrap();
+        f.service.retire_read_cache(retire.clone()).await.unwrap();
+        assert_eq!(
+            f.service
+                .chunk_sources(f.request.clone())
+                .await
+                .unwrap()
+                .chunks[0]
+                .sources
+                .len(),
+            1
+        );
+        let mut durable = retire;
+        durable.operation_id = OperationId::new("bad-retire");
+        durable.copy = f.copy.clone();
+        assert!(f.service.retire_read_cache(durable).await.is_err());
+        assert_eq!(
+            stored_copy(&f, &f.copy.id).await.role,
+            CopyRole::DurableReplica
+        );
+    }
+
+    #[tokio::test]
+    async fn distribution_retire_absence_replay_cannot_change_later_publication() {
+        let f = fixture().await;
+        let mut request = cache_request(&f, "late-cache");
+        let copy = crate::dfs::read_cache_copy(&request.receipt).unwrap();
+        let retire = crate::dfs::RetireReadCache {
+            caller_id: request.caller_id.clone(),
+            caller_session_id: request.caller_session_id.clone(),
+            caller_node_epoch: request.caller_node_epoch,
+            operation_id: OperationId::new("early-retire"),
+            copy: copy.clone(),
+        };
+        f.service.retire_read_cache(retire.clone()).await.unwrap();
+        request.receipt.catalog_revision += 1;
+        let copy = crate::dfs::read_cache_copy(&request.receipt).unwrap();
+        f.service.publish_read_cache(request).await.unwrap();
+        f.service.retire_read_cache(retire).await.unwrap();
+        assert_eq!(
+            stored_copy(&f, &copy.id).await,
+            copy,
+            "a replay must preserve the recorded no-op outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_retired_cache_rejects_late_publication() {
+        let f = fixture().await;
+        let request = cache_request(&f, "late-after-retire");
+        let copy = crate::dfs::read_cache_copy(&request.receipt).unwrap();
+        f.service
+            .retire_read_cache(crate::dfs::RetireReadCache {
+                caller_id: request.caller_id.clone(),
+                caller_session_id: request.caller_session_id.clone(),
+                caller_node_epoch: request.caller_node_epoch,
+                operation_id: OperationId::new("retire-before-delivery"),
+                copy,
+            })
+            .await
+            .unwrap();
+        assert!(
+            f.service.publish_read_cache(request.clone()).await.is_err(),
+            "late delivery cannot revive an evicted incarnation"
+        );
+        let mut newer = request;
+        newer.operation_id = OperationId::new("new-install");
+        newer.receipt.operation_id = newer.operation_id.clone();
+        newer.receipt.catalog_revision += 1;
+        assert!(f.service.publish_read_cache(newer).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn distribution_cache_publication_rejects_partial_or_foreign_receipts() {
+        let f = fixture_with_bytes(b"cache bytes").await;
+        for mode in 0..5 {
+            let mut request = cache_request(&f, &format!("invalid-cache-{mode}"));
+            match mode {
+                0 => request.receipt.persisted_bytes -= 1,
+                1 => request.receipt.verified_digest.bytes[0] ^= 1,
+                2 => request.receipt.node_id = "foreign".into(),
+                3 => request.receipt.device_epoch += 1,
+                _ => request.file_version_id = FileVersionId::new("missing"),
+            }
+            assert!(f.service.publish_read_cache(request).await.is_err());
+        }
+        assert_eq!(stored_placement(&f).await.copies, vec![f.copy.id.clone()]);
+    }
+
+    #[tokio::test]
+    async fn distribution_stale_cache_retirement_cannot_remove_replacement() {
+        let f = fixture().await;
+        let request = cache_request(&f, "first-cache");
+        let copy = f.service.publish_read_cache(request.clone()).await.unwrap();
+        let mut next = cache_request(&f, "new-cache");
+        next.receipt.catalog_revision += 1;
+        let replacement = f.service.publish_read_cache(next).await.unwrap();
+        f.service
+            .retire_read_cache(crate::dfs::RetireReadCache {
+                caller_id: request.caller_id,
+                caller_session_id: request.caller_session_id,
+                caller_node_epoch: request.caller_node_epoch,
+                operation_id: OperationId::new("late-retire"),
+                copy,
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored_copy(&f, &replacement.id).await, replacement);
     }
 
     async fn stored_copy(fixture: &Fixture, copy_id: &CopyId) -> CopyRecord {

@@ -594,6 +594,9 @@ pub enum StoreOperation {
     DfsClaimReplicationTask,
     DfsReportReplicationTask,
     DfsReportChunkCorruption,
+    DfsRestoreFileChunk,
+    DfsPublishReadCache,
+    DfsRetireReadCache,
     CleanupRootGrants,
     CleanupRootCommands,
     DfsUpdateReference,
@@ -638,6 +641,9 @@ impl StoreOperation {
             Self::DfsClaimReplicationTask => "dfs_claim_replication_task",
             Self::DfsReportReplicationTask => "dfs_report_replication_task",
             Self::DfsReportChunkCorruption => "dfs_report_chunk_corruption",
+            Self::DfsRestoreFileChunk => "dfs_restore_file_chunk",
+            Self::DfsPublishReadCache => "dfs_publish_read_cache",
+            Self::DfsRetireReadCache => "dfs_retire_read_cache",
         }
     }
 }
