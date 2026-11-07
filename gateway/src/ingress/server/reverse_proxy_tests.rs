@@ -108,6 +108,14 @@ impl Fixture {
     }
 
     async fn with_mount(config: ReverseProxyConfig, mount: Option<&str>) -> Self {
+        Self::with_mount_and_security(config, mount, IngressSecurity::Tls).await
+    }
+
+    async fn with_mount_and_security(
+        config: ReverseProxyConfig,
+        mount: Option<&str>,
+        security: IngressSecurity,
+    ) -> Self {
         let backend = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let backend_address = backend.local_addr().unwrap();
         let accepted = Arc::new(AtomicUsize::new(0));
@@ -178,7 +186,7 @@ impl Fixture {
                         tasks.spawn(async move {
                             let service = service_fn(move |request| {
                                 let ingress = ingress.clone();
-                                async move { ingress.handle_http(request, IngressSecurity::Tls, peer).await }
+                                async move { ingress.handle_http(request, security, peer).await }
                             });
                             let _ = hyper::server::conn::http1::Builder::new()
                                 .serve_connection(TokioIo::new(stream), service).with_upgrades().await;
@@ -450,4 +458,19 @@ async fn reverse_proxy_removes_connection_nominated_headers() {
     let text = String::from_utf8(body.to_vec()).unwrap().to_lowercase();
     assert!(!text.contains("x-hop-secret"));
     assert!(!text.contains("for=attacker"));
+}
+
+#[tokio::test]
+async fn explicit_authenticated_http_reports_actual_proxy_transport() {
+    let mut fixture = Fixture::with_mount_and_security(
+        ReverseProxyConfig::default(),
+        None,
+        IngressSecurity::AuthenticatedHttp,
+    )
+    .await;
+    let mut sender = fixture.sender().await;
+    let response = complete(&mut sender, "/api/echo").await;
+    let response = String::from_utf8(response.to_vec()).unwrap().to_lowercase();
+    assert!(response.contains("x-forwarded-proto: http"), "{response}");
+    assert!(!response.contains("x-forwarded-proto: https"));
 }

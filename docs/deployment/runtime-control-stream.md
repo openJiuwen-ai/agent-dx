@@ -62,3 +62,11 @@ stateful 策略保留 WS 端口最高优先级的 TCP 入站规则，不增加�
 其他客户端或原始 HTTP 发起的更新仍由现有应用心跳兜底发现，默认心跳间隔为
 20 秒、pong 超时为 10 秒。standalone 回归要求持有隧道的客户端在 10 秒内恢复，
 短于默认心跳间隔。
+
+## Optional sandboxd network ceiling
+
+The adxlet JSON configuration accepts optional `network_baseline: {"policy": ...}` using the native `adx_core::execution::NetworkPolicy` representation (PascalCase action/direction/protocol values and nested `peer` fields). Traffic must be stateful with both defaults `Deny`. Creation and network updates retain baseline deny rules, require explicit allow rules to fit the node ceiling in destination, direction, protocol, ports and priority, and deny user traffic when the requested policy is absent. DNS requests are deny by default and constrained by the node DNS ceiling. The ceiling describes maximum permissions; it does not grant its allow rules automatically.
+
+`network_baseline.peer_aliases` optionally maps exact traffic-domain selectors to node-local IPv4 CIDRs, for example `{"ingress.node.invalid":"10.88.4.1/32"}`. An explicit request can use that logical domain as its traffic peer while its application connects to a separately supplied node address. The node resolves the alias before checking the same permission ceiling; direction, protocol, ports and priority remain constrained. Stored requests retain the logical peer, so restore uses the target node's mapping. Alias resolution grants no DNS permission and an omitted request still grants no user traffic.
+
+`platform_ingress_sources` optionally restricts Execd, probe and workload-port ingress exceptions to IPv4 CIDRs. It requires stateful traffic; replies use connection state rather than unrestricted reverse rules. Runtime-control keeps its exact destination exception and separate execution credentials. Both options apply to sandboxd only and leave generic defaults unchanged when absent. Sandboxd receives no host port publications. Deployments must separately enforce host INPUT/FORWARD/bridge boundaries and block IPv6 bypass; an IPv4 policy does not establish that boundary.
