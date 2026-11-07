@@ -1568,6 +1568,8 @@ impl Workload for SyncTxn {
 /// 与 read（同一墙钟内读者的吞吐）。大文件与小文件在计时外写好。
 struct OpenRead;
 
+const READER_REOPEN: Duration = Duration::from_secs(1);
+
 /// 直读缓冲按页对齐。
 fn aligned_slice(storage: &mut [u8], len: usize) -> &mut [u8] {
     let offset = storage.as_ptr().align_offset(4096);
@@ -1644,16 +1646,26 @@ impl Workload for OpenRead {
                     return Ok((samples, Some(verified), 0));
                 }
                 let file_index = thread_index % args.files;
-                let file = OpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_DIRECT)
-                    .open(work_dir.join(format!("big{file_index:03}")))
-                    .map_err(|error| error.to_string())?;
+                let open_big = || {
+                    OpenOptions::new()
+                        .read(true)
+                        .custom_flags(libc::O_DIRECT)
+                        .open(work_dir.join(format!("big{file_index:03}")))
+                        .map_err(|error| error.to_string())
+                };
+                let mut file = open_big()?;
+                let mut opened_at = Instant::now();
                 let mut storage = vec![0u8; block + 4096];
                 let buf = aligned_slice(&mut storage, block);
                 let mut bytes = 0u64;
                 let mut offset = 0u64;
                 while !stop.load(Ordering::Acquire) {
+                    // A DFS handle read across its 5 s read-view expiry fails
+                    // with EHOSTUNREACH (S3b new issue); reopen to stay clear.
+                    if opened_at.elapsed() >= READER_REOPEN {
+                        file = open_big()?;
+                        opened_at = Instant::now();
+                    }
                     let count = file
                         .read_at(buf, offset)
                         .map_err(|error| error.to_string())?;
