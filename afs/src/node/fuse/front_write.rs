@@ -47,12 +47,54 @@ struct Shared {
     limit: usize,
     admitted_limit: usize,
 }
+/// How a callback holds the gate. Shared holders of the same file (or of the
+/// namespace) overlap; an exclusive holder excludes every other holder of
+/// that file (or every holder of the mount). Waiting exclusive holders stop
+/// new shared entrants, so a stream of readers cannot starve a writer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum GateAccess {
+    Shared,
+    Exclusive,
+}
+
 #[derive(Default)]
 struct GateState {
+    /// Files held exclusively (writes, resizes, syncs, recoveries).
     files: HashSet<u64>,
+    /// Shared holders per file (reads and attribute queries).
+    readers: HashMap<u64, usize>,
+    /// Exclusive entrants waiting per file; they block new shared entrants.
+    exclusive_waiters: HashMap<u64, usize>,
+    /// A namespace change holds the whole mount.
     namespace: bool,
+    /// Path lookups in flight; they exclude only namespace changes.
+    namespace_readers: usize,
     namespace_waiters: usize,
     recoveries: VecDeque<(u64, RecoveryStart)>,
+}
+
+impl GateState {
+    fn file_busy(&self, file: u64) -> bool {
+        self.files.contains(&file) || self.readers.get(&file).is_some_and(|count| *count != 0)
+    }
+
+    fn any_file_holder(&self) -> bool {
+        !self.files.is_empty() || !self.readers.is_empty()
+    }
+}
+
+fn decrement(map: &mut HashMap<u64, usize>, key: u64) {
+    if let Some(count) = map.get_mut(&key) {
+        *count -= 1;
+        if *count == 0 {
+            map.remove(&key);
+        }
+    }
+}
+
+enum Held {
+    Files { files: Vec<u64>, access: GateAccess },
+    Namespace(GateAccess),
 }
 #[derive(Default)]
 struct Gates {
@@ -67,7 +109,7 @@ impl Drop for ControlLease {
 }
 pub(super) struct CallbackGuard {
     gates: Arc<Gates>,
-    files: Option<Vec<u64>>,
+    held: Held,
     _control: Option<ControlLease>,
 }
 impl Gates {
@@ -76,7 +118,7 @@ impl Gates {
         let mut index = 0;
         while index < state.recoveries.len() {
             let file = state.recoveries[index].0;
-            if !state.files.contains(&file) {
+            if !state.file_busy(file) {
                 if let Some(item) = state.recoveries.remove(index) {
                     state.files.insert(file);
                     ready.push(item);
@@ -91,7 +133,10 @@ impl Gates {
         for (inode, start) in ready {
             start(CallbackGuard {
                 gates: self.clone(),
-                files: Some(vec![inode]),
+                held: Held::Files {
+                    files: vec![inode],
+                    access: GateAccess::Exclusive,
+                },
                 _control: None,
             });
         }
@@ -112,12 +157,25 @@ impl Drop for CallbackGuard {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(files) = &self.files {
-            for file in files {
-                state.files.remove(file);
+        match &self.held {
+            Held::Files {
+                files,
+                access: GateAccess::Exclusive,
+            } => {
+                for file in files {
+                    state.files.remove(file);
+                }
             }
-        } else {
-            state.namespace = false;
+            Held::Files {
+                files,
+                access: GateAccess::Shared,
+            } => {
+                for file in files {
+                    decrement(&mut state.readers, *file);
+                }
+            }
+            Held::Namespace(GateAccess::Exclusive) => state.namespace = false,
+            Held::Namespace(GateAccess::Shared) => state.namespace_readers -= 1,
         }
         let ready = Gates::ready(&mut state);
         self.gates.changed.notify_all();
@@ -162,11 +220,15 @@ impl FrontWriteQueue {
             worker: Mutex::new(Some(worker)),
         })
     }
-    /// File callbacks exclude only the same inode. Namespace operations retain
-    /// their conservative exclusive barrier; recovery bypasses that admission gate.
+    /// File callbacks exclude only the same inode: shared callbacks overlap,
+    /// an exclusive one excludes every other callback on that inode. A
+    /// namespace change excludes every callback on the mount; a shared
+    /// namespace callback (path lookup) excludes only namespace changes.
+    /// Recovery bypasses the namespace gate.
     pub(super) fn enter(
         &self,
         files: Option<&[u64]>,
+        access: GateAccess,
         recovery: bool,
     ) -> Result<CallbackGuard, i32> {
         let mut files = files.map(<[u64]>::to_vec);
@@ -175,36 +237,74 @@ impl FrontWriteQueue {
             files.dedup();
         }
         let mut state = self.gates.state.lock().map_err(|_| EIO)?;
-        if files.is_none() {
-            state.namespace_waiters += 1;
+        let mut waiting = true;
+        match (&files, access) {
+            (None, GateAccess::Exclusive) => state.namespace_waiters += 1,
+            (Some(files), GateAccess::Exclusive) => {
+                for file in files {
+                    *state.exclusive_waiters.entry(*file).or_default() += 1;
+                }
+            }
+            _ => waiting = false,
         }
         loop {
-            let blocked = match &files {
-                Some(files) => {
+            let namespace_closed = state.namespace || state.namespace_waiters != 0;
+            let blocked = match (&files, access) {
+                (Some(files), access) => {
                     files.iter().any(|file| {
-                        state.files.contains(file)
-                            || state.recoveries.iter().any(|(waiting, _)| waiting == file)
-                    }) || (!recovery && (state.namespace || state.namespace_waiters != 0))
+                        let recovering =
+                            state.recoveries.iter().any(|(waiting, _)| waiting == file);
+                        match access {
+                            GateAccess::Exclusive => state.file_busy(*file) || recovering,
+                            GateAccess::Shared => {
+                                state.files.contains(file)
+                                    || recovering
+                                    || state.exclusive_waiters.contains_key(file)
+                            }
+                        }
+                    }) || (!recovery && namespace_closed)
                 }
-                None => state.namespace || !state.files.is_empty(),
+                (None, GateAccess::Exclusive) => {
+                    state.namespace || state.namespace_readers != 0 || state.any_file_holder()
+                }
+                (None, GateAccess::Shared) => namespace_closed,
             };
             if !blocked {
                 break;
             }
             state = self.gates.changed.wait(state).map_err(|_| EIO)?;
         }
-        match &files {
-            Some(files) => {
-                state.files.extend(files);
+        let held = match (files, access) {
+            (Some(files), GateAccess::Exclusive) => {
+                for file in &files {
+                    if waiting {
+                        decrement(&mut state.exclusive_waiters, *file);
+                    }
+                    state.files.insert(*file);
+                }
+                Held::Files { files, access }
             }
-            None => {
+            (Some(files), GateAccess::Shared) => {
+                for file in &files {
+                    *state.readers.entry(*file).or_default() += 1;
+                }
+                Held::Files { files, access }
+            }
+            (None, GateAccess::Exclusive) => {
                 state.namespace_waiters -= 1;
                 state.namespace = true;
+                Held::Namespace(access)
             }
-        }
+            (None, GateAccess::Shared) => {
+                state.namespace_readers += 1;
+                Held::Namespace(access)
+            }
+        };
+        // Leaving the waiter set can admit blocked shared entrants.
+        self.gates.changed.notify_all();
         Ok(CallbackGuard {
             gates: self.gates.clone(),
-            files,
+            held,
             _control: None,
         })
     }
@@ -1013,7 +1113,7 @@ mod tests {
             Err(EAGAIN)
         );
         // Neither registration nor recovery needs body capacity or another thread.
-        drop(q.enter(Some(&[1]), true).unwrap());
+        drop(q.enter(Some(&[1]), GateAccess::Exclusive, true).unwrap());
         q.wait(Some(2), true).unwrap();
         release_tx.send(()).unwrap();
         assert_eq!(
@@ -1063,7 +1163,7 @@ mod tests {
             tail_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Err(EIO)
         );
-        let _gate = q.enter(Some(&[1]), true).unwrap();
+        let _gate = q.enter(Some(&[1]), GateAccess::Exclusive, true).unwrap();
         q.wait(Some(1), true).unwrap();
         q.release_handle(1, 11, true);
         assert!(!q.has_pending());
@@ -1092,7 +1192,7 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             Err(EAGAIN)
         );
-        let close = q.enter(Some(&[1]), true).unwrap();
+        let close = q.enter(Some(&[1]), GateAccess::Exclusive, true).unwrap();
         assert_eq!(q.wait(Some(1), true), Err(libc::ENOSPC));
         q.release_handle(1, 11, true);
         drop(close);
@@ -1110,19 +1210,157 @@ mod tests {
     #[test]
     fn file_gates_are_independent_and_recovery_bypasses_namespace_gate() {
         let q = FrontWriteQueue::with_limits(56, 8).unwrap();
-        let a = q.enter(Some(&[1]), false).unwrap();
-        drop(q.enter(Some(&[2]), false).unwrap());
+        let a = q.enter(Some(&[1]), GateAccess::Exclusive, false).unwrap();
+        drop(q.enter(Some(&[2]), GateAccess::Exclusive, false).unwrap());
         drop(a);
-        let namespace = q.enter(None, false).unwrap();
-        drop(q.enter(Some(&[1]), true).unwrap());
+        let namespace = q.enter(None, GateAccess::Exclusive, false).unwrap();
+        drop(q.enter(Some(&[1]), GateAccess::Exclusive, true).unwrap());
         drop(namespace);
-        drop(q.enter(Some(&[2, 1, 2]), false).unwrap());
+        drop(
+            q.enter(Some(&[2, 1, 2]), GateAccess::Exclusive, false)
+                .unwrap(),
+        );
+    }
+
+    /// Runs `enter` on another thread; `Ok(())` arrives once it is admitted.
+    fn enter_later(
+        q: &Arc<FrontWriteQueue>,
+        files: Option<Vec<u64>>,
+        access: GateAccess,
+    ) -> (mpsc::Receiver<()>, mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (leave_tx, leave_rx) = mpsc::channel::<()>();
+        let q = q.clone();
+        std::thread::spawn(move || {
+            let guard = q.enter(files.as_deref(), access, false).unwrap();
+            entered_tx.send(()).unwrap();
+            let _ = leave_rx.recv();
+            drop(guard);
+        });
+        (entered_rx, leave_tx)
+    }
+
+    const ADMIT: Duration = Duration::from_secs(2);
+    const HELD: Duration = Duration::from_millis(100);
+
+    #[test]
+    fn shared_file_callbacks_overlap_on_one_inode() {
+        let q = FrontWriteQueue::with_limits(56, 8).unwrap();
+        let first = q.enter(Some(&[1]), GateAccess::Shared, false).unwrap();
+        let second = q.enter(Some(&[1]), GateAccess::Shared, false).unwrap();
+        drop((first, second));
+        drop(q.enter(Some(&[1]), GateAccess::Exclusive, false).unwrap());
+    }
+
+    #[test]
+    fn exclusive_file_callback_waits_for_readers_and_fences_new_ones() {
+        let q = Arc::new(FrontWriteQueue::with_limits(56, 8).unwrap());
+        let reader = q.enter(Some(&[1]), GateAccess::Shared, false).unwrap();
+        let (writer_in, writer_out) = enter_later(&q, Some(vec![1]), GateAccess::Exclusive);
+        assert!(
+            writer_in.recv_timeout(HELD).is_err(),
+            "writer overlapped a reader"
+        );
+        // The waiting writer fences later readers of the same inode only.
+        let (late_in, late_out) = enter_later(&q, Some(vec![1]), GateAccess::Shared);
+        assert!(
+            late_in.recv_timeout(HELD).is_err(),
+            "reader overtook a waiting writer"
+        );
+        drop(q.enter(Some(&[2]), GateAccess::Shared, false).unwrap());
+        drop(reader);
+        writer_in.recv_timeout(ADMIT).unwrap();
+        assert!(
+            late_in.recv_timeout(HELD).is_err(),
+            "reader overlapped a writer"
+        );
+        writer_out.send(()).unwrap();
+        late_in.recv_timeout(ADMIT).unwrap();
+        late_out.send(()).unwrap();
+    }
+
+    #[test]
+    fn path_lookups_overlap_file_callbacks_but_not_namespace_changes() {
+        let q = Arc::new(FrontWriteQueue::with_limits(56, 8).unwrap());
+        let file = q.enter(Some(&[1]), GateAccess::Exclusive, false).unwrap();
+        let lookup = q.enter(None, GateAccess::Shared, false).unwrap();
+        drop(q.enter(None, GateAccess::Shared, false).unwrap());
+        drop(file);
+        let (change_in, change_out) = enter_later(&q, None, GateAccess::Exclusive);
+        assert!(
+            change_in.recv_timeout(HELD).is_err(),
+            "namespace change overlapped a lookup"
+        );
+        drop(lookup);
+        change_in.recv_timeout(ADMIT).unwrap();
+        let (lookup_in, lookup_out) = enter_later(&q, None, GateAccess::Shared);
+        assert!(
+            lookup_in.recv_timeout(HELD).is_err(),
+            "lookup overlapped a namespace change"
+        );
+        change_out.send(()).unwrap();
+        lookup_in.recv_timeout(ADMIT).unwrap();
+        lookup_out.send(()).unwrap();
+    }
+
+    #[test]
+    fn waiting_namespace_change_fences_new_lookups_and_file_callbacks() {
+        let q = Arc::new(FrontWriteQueue::with_limits(56, 8).unwrap());
+        let reader = q.enter(Some(&[1]), GateAccess::Shared, false).unwrap();
+        let (change_in, change_out) = enter_later(&q, None, GateAccess::Exclusive);
+        assert!(
+            change_in.recv_timeout(HELD).is_err(),
+            "namespace change overlapped a reader"
+        );
+        let (lookup_in, lookup_out) = enter_later(&q, None, GateAccess::Shared);
+        let (other_in, other_out) = enter_later(&q, Some(vec![2]), GateAccess::Shared);
+        assert!(
+            lookup_in.recv_timeout(HELD).is_err(),
+            "lookup overtook a waiting change"
+        );
+        assert!(
+            other_in.recv_timeout(HELD).is_err(),
+            "reader overtook a waiting change"
+        );
+        drop(reader);
+        change_in.recv_timeout(ADMIT).unwrap();
+        change_out.send(()).unwrap();
+        lookup_in.recv_timeout(ADMIT).unwrap();
+        other_in.recv_timeout(ADMIT).unwrap();
+        lookup_out.send(()).unwrap();
+        other_out.send(()).unwrap();
+    }
+
+    #[test]
+    fn recovery_waits_for_readers_and_fences_new_readers() {
+        let q = FrontWriteQueue::with_limits(56, 8).unwrap();
+        let reader = q.enter(Some(&[1]), GateAccess::Shared, false).unwrap();
+        let (tx, rx) = mpsc::channel();
+        q.recover(1, false, move |guard, result| {
+            tx.send((guard, result)).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(HELD).is_err(),
+            "recovery overlapped a reader"
+        );
+        drop(reader);
+        let (guard, result) = rx.recv_timeout(ADMIT).unwrap();
+        assert_eq!(result, Ok(()));
+        let q = Arc::new(q);
+        let (late_in, late_out) = enter_later(&q, Some(vec![1]), GateAccess::Shared);
+        assert!(
+            late_in.recv_timeout(HELD).is_err(),
+            "reader overlapped a recovery"
+        );
+        drop(guard);
+        late_in.recv_timeout(ADMIT).unwrap();
+        late_out.send(()).unwrap();
     }
 
     #[test]
     fn recovery_registration_returns_while_file_gate_is_held() {
         let q = FrontWriteQueue::with_limits(56, 8).unwrap();
-        let first = q.enter(Some(&[1]), false).unwrap();
+        let first = q.enter(Some(&[1]), GateAccess::Exclusive, false).unwrap();
         let (tx, rx) = mpsc::channel();
         q.recover(1, false, move |guard, result| {
             assert!(guard.is_some());

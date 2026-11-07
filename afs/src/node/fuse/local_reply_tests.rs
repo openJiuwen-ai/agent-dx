@@ -45,7 +45,12 @@ fn local_reply_does_not_wait_for_accepted_inflight_body() {
     let local = fs.clone();
     let (done_tx, done_rx) = mpsc::channel();
     let probe = thread::spawn(move || {
-        let (_guard, result) = local.front_callback(FrontOrdering::FixedLocalReply, Some(1), false);
+        let (_guard, result) = local.front_callback(
+            FrontOrdering::FixedLocalReply,
+            GateAccess::Exclusive,
+            Some(1),
+            false,
+        );
         done_tx.send(result).unwrap();
     });
     let before = done_rx.recv_timeout(Duration::from_millis(100));
@@ -85,7 +90,12 @@ fn local_reply_does_not_consume_retry_or_replace_sticky_write_error() {
         })
         .unwrap();
     assert_eq!(queue.wait(Some(1), false), Err(libc::ENOSPC));
-    let (_, result) = fs.front_callback(FrontOrdering::FixedLocalReply, Some(1), false);
+    let (_, result) = fs.front_callback(
+        FrontOrdering::FixedLocalReply,
+        GateAccess::Exclusive,
+        Some(1),
+        false,
+    );
     assert_eq!(queue.wait(Some(1), false), Err(libc::ENOSPC));
     assert_eq!(
         queue.submit_with(1, 1, 1, || Ok(Box::new(|| Ok(())))),
@@ -101,7 +111,12 @@ fn ordered_read_resize_and_sync_fence_still_waits_inflight_body() {
     let ordered = fs.clone();
     let (done_tx, done_rx) = mpsc::channel();
     let waiter = thread::spawn(move || {
-        let (_guard, result) = ordered.front_callback(FrontOrdering::WriteBarrier, Some(1), false);
+        let (_guard, result) = ordered.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Exclusive,
+            Some(1),
+            false,
+        );
         done_tx.send(result).unwrap();
     });
     let blocked = done_rx.recv_timeout(Duration::from_millis(100)).is_err();
@@ -126,7 +141,12 @@ fn local_reply_does_not_wait_for_unrelated_dispatched_metadata() {
     let local = fs.clone();
     let (done_tx, done_rx) = mpsc::channel();
     let probe = thread::spawn(move || {
-        let (_guard, result) = local.front_callback(FrontOrdering::FixedLocalReply, Some(1), false);
+        let (_guard, result) = local.front_callback(
+            FrontOrdering::FixedLocalReply,
+            GateAccess::Exclusive,
+            Some(1),
+            false,
+        );
         done_tx.send(result).unwrap();
     });
     let before = done_rx.recv_timeout(Duration::from_millis(100));

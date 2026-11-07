@@ -31,6 +31,7 @@ pub use self::mount::{
 pub(crate) use self::reply::open_reply_flags;
 
 use self::dispatch::{FuseDispatch, FuseRecoverySender};
+use self::front_write::GateAccess;
 use self::mount::{configure_readahead, mount_bounds_error, negotiated_init_flags};
 use self::page_cache::{ActiveCachedViews, InodeCacheGates, PageCacheIdentities};
 use self::reply::{
@@ -199,6 +200,7 @@ impl AfsFuse {
     fn front_callback(
         &self,
         ordering: FrontOrdering,
+        access: GateAccess,
         inode: Option<u64>,
         retry: bool,
     ) -> (
@@ -206,12 +208,13 @@ impl AfsFuse {
         std::result::Result<(), i32>,
     ) {
         let files = inode.map(|inode| vec![inode]);
-        self.front_callbacks(ordering, files.as_deref(), retry)
+        self.front_callbacks(ordering, access, files.as_deref(), retry)
     }
 
     fn front_callbacks(
         &self,
         ordering: FrontOrdering,
+        access: GateAccess,
         files: Option<&[u64]>,
         retry: bool,
     ) -> (
@@ -224,7 +227,7 @@ impl AfsFuse {
         if ordering == FrontOrdering::FixedLocalReply {
             return (None, Ok(()));
         }
-        let guard = match queue.enter(files, retry) {
+        let guard = match queue.enter(files, access, retry) {
             Ok(guard) => guard,
             Err(error) => return (None, Err(error)),
         };
@@ -247,7 +250,9 @@ impl AfsFuse {
                     self.dispatch.drain_key(*file);
                 }
             }
-        } else {
+        } else if access == GateAccess::Exclusive {
+            // A namespace change waits for every in-flight callback. A path
+            // lookup only needs the acknowledged writes waited for above.
             self.dispatch.drain();
         }
         (Some(guard), result)
@@ -577,8 +582,12 @@ impl Filesystem for AfsFuse {
             reply.error(fuse_errno(libc::EOPNOTSUPP));
             return;
         };
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, Some(ino.0), false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Exclusive,
+            Some(ino.0),
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -604,7 +613,7 @@ impl Filesystem for AfsFuse {
 
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, None, false);
+            self.front_callback(FrontOrdering::WriteBarrier, GateAccess::Shared, None, false);
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -657,8 +666,12 @@ impl Filesystem for AfsFuse {
     }
 
     fn getattr(&self, req: &Request, ino: INodeNo, fh: Option<FuseFileHandle>, reply: ReplyAttr) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, Some(ino.0), false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Shared,
+            Some(ino.0),
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -716,8 +729,12 @@ impl Filesystem for AfsFuse {
     }
 
     fn statfs(&self, req: &Request, ino: INodeNo, reply: ReplyStatfs) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, Some(ino.0), false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Shared,
+            Some(ino.0),
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -763,8 +780,12 @@ impl Filesystem for AfsFuse {
         _flags: Option<fuser::BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, Some(ino.0), false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Exclusive,
+            Some(ino.0),
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -839,8 +860,12 @@ impl Filesystem for AfsFuse {
     }
 
     fn readlink(&self, req: &Request, ino: INodeNo, reply: ReplyData) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, Some(ino.0), false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Shared,
+            Some(ino.0),
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -869,8 +894,12 @@ impl Filesystem for AfsFuse {
         umask: u32,
         reply: ReplyEntry,
     ) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, None, false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Exclusive,
+            None,
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -899,8 +928,12 @@ impl Filesystem for AfsFuse {
     }
 
     fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, None, false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Exclusive,
+            None,
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -917,8 +950,12 @@ impl Filesystem for AfsFuse {
     }
 
     fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, None, false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Exclusive,
+            None,
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -942,8 +979,12 @@ impl Filesystem for AfsFuse {
         target: &Path,
         reply: ReplyEntry,
     ) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, None, false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Exclusive,
+            None,
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -986,8 +1027,12 @@ impl Filesystem for AfsFuse {
         flags: FuseRenameFlags,
         reply: ReplyEmpty,
     ) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, None, false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Exclusive,
+            None,
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -1027,8 +1072,12 @@ impl Filesystem for AfsFuse {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, Some(ino.0), false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Exclusive,
+            Some(ino.0),
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -1058,8 +1107,17 @@ impl Filesystem for AfsFuse {
     }
 
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        // A read-only open changes nothing other callbacks on the inode
+        // observe; the page-cache fence against older READs is the per-inode
+        // cache gate taken on the worker.
+        let open_access =
+            if flags.0 & libc::O_ACCMODE == libc::O_RDONLY && flags.0 & libc::O_TRUNC == 0 {
+                GateAccess::Shared
+            } else {
+                GateAccess::Exclusive
+            };
         let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, Some(ino.0), false);
+            self.front_callback(FrontOrdering::WriteBarrier, open_access, Some(ino.0), false);
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -1231,8 +1289,12 @@ impl Filesystem for AfsFuse {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, Some(ino.0), false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Shared,
+            Some(ino.0),
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -1377,7 +1439,8 @@ impl Filesystem for AfsFuse {
         reply: ReplyWrite,
     ) {
         let ordering = self.write_front_ordering(fh.0, flags, write_flags);
-        let (_front_guard, front_result) = self.front_callback(ordering, Some(ino.0), false);
+        let (_front_guard, front_result) =
+            self.front_callback(ordering, GateAccess::Exclusive, Some(ino.0), false);
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -1528,7 +1591,8 @@ impl Filesystem for AfsFuse {
             FrontOrdering::FixedLocalReply
         };
         let files = [ino_in.0, ino_out.0];
-        let (_front_guard, front_result) = self.front_callbacks(ordering, Some(&files), false);
+        let (_front_guard, front_result) =
+            self.front_callbacks(ordering, GateAccess::Exclusive, Some(&files), false);
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -1797,8 +1861,12 @@ impl Filesystem for AfsFuse {
     }
 
     fn opendir(&self, req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, Some(ino.0), false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Shared,
+            Some(ino.0),
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -1833,8 +1901,12 @@ impl Filesystem for AfsFuse {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, Some(ino.0), false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Shared,
+            Some(ino.0),
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -1881,8 +1953,12 @@ impl Filesystem for AfsFuse {
         _flags: OpenFlags,
         reply: ReplyEmpty,
     ) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, Some(ino.0), false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Shared,
+            Some(ino.0),
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -1910,8 +1986,12 @@ impl Filesystem for AfsFuse {
         datasync: bool,
         reply: ReplyEmpty,
     ) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, Some(ino.0), false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Exclusive,
+            Some(ino.0),
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -1945,8 +2025,12 @@ impl Filesystem for AfsFuse {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, None, false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Exclusive,
+            None,
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -2016,8 +2100,12 @@ impl Filesystem for AfsFuse {
         _pid: u32,
         reply: ReplyLock,
     ) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::FixedLocalReply, None, false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::FixedLocalReply,
+            GateAccess::Exclusive,
+            None,
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -2040,8 +2128,12 @@ impl Filesystem for AfsFuse {
         _sleep: bool,
         reply: ReplyEmpty,
     ) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::FixedLocalReply, None, false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::FixedLocalReply,
+            GateAccess::Exclusive,
+            None,
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -2060,8 +2152,12 @@ impl Filesystem for AfsFuse {
         rdev: u32,
         reply: ReplyEntry,
     ) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, None, false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Exclusive,
+            None,
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -2144,8 +2240,12 @@ impl Filesystem for AfsFuse {
     }
 
     fn access(&self, _: &Request, _: INodeNo, _: AccessFlags, reply: ReplyEmpty) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::FixedLocalReply, None, false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::FixedLocalReply,
+            GateAccess::Exclusive,
+            None,
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -2156,7 +2256,8 @@ impl Filesystem for AfsFuse {
 
     fn getxattr(&self, req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
         let ordering = xattr_front_ordering(self.backend.as_ref(), name);
-        let (_front_guard, front_result) = self.front_callback(ordering, Some(ino.0), false);
+        let (_front_guard, front_result) =
+            self.front_callback(ordering, GateAccess::Shared, Some(ino.0), false);
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -2186,8 +2287,12 @@ impl Filesystem for AfsFuse {
     }
 
     fn listxattr(&self, req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, Some(ino.0), false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Shared,
+            Some(ino.0),
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -2227,7 +2332,8 @@ impl Filesystem for AfsFuse {
         } else {
             FrontOrdering::WriteBarrier
         };
-        let (_front_guard, front_result) = self.front_callback(ordering, Some(ino.0), false);
+        let (_front_guard, front_result) =
+            self.front_callback(ordering, GateAccess::Exclusive, Some(ino.0), false);
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;
@@ -2260,8 +2366,12 @@ impl Filesystem for AfsFuse {
     }
 
     fn removexattr(&self, req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let (_front_guard, front_result) =
-            self.front_callback(FrontOrdering::WriteBarrier, Some(ino.0), false);
+        let (_front_guard, front_result) = self.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Exclusive,
+            Some(ino.0),
+            false,
+        );
         if let Err(error) = front_result {
             reply.error(fuse_errno(error));
             return;

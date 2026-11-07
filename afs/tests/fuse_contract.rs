@@ -2204,7 +2204,11 @@ mod front_gate_ordering {
         }
 
         fn count(&self, event: &str) -> usize {
-            self.backend.trace().iter().filter(|seen| *seen == event).count()
+            self.backend
+                .trace()
+                .iter()
+                .filter(|seen| *seen == event)
+                .count()
         }
 
         fn position(&self, event: &str) -> usize {
@@ -2287,7 +2291,10 @@ mod front_gate_ordering {
             Ok(bytes[..count].to_vec())
         });
         std::thread::sleep(QUIET);
-        assert!(!fx.arrived("read:start"), "READ overtook an acknowledged write");
+        assert!(
+            !fx.arrived("read:start"),
+            "READ overtook an acknowledged write"
+        );
 
         release.send(()).unwrap();
         assert_eq!(read.recv_timeout(DEADLINE).unwrap().unwrap(), b"abcd");
@@ -2304,7 +2311,10 @@ mod front_gate_ordering {
         let syncer = file.clone();
         let synced = spawn(move || syncer.sync_all());
         std::thread::sleep(QUIET);
-        assert!(synced.try_recv().is_err(), "fsync returned before the write body");
+        assert!(
+            synced.try_recv().is_err(),
+            "fsync returned before the write body"
+        );
         assert!(!fx.arrived("fsync"));
 
         release.send(()).unwrap();
@@ -2322,7 +2332,10 @@ mod front_gate_ordering {
         let truncater = file.clone();
         let truncated = spawn(move || truncater.set_len(1));
         std::thread::sleep(QUIET);
-        assert!(!fx.arrived("setattr:start"), "SETATTR overtook an acknowledged write");
+        assert!(
+            !fx.arrived("setattr:start"),
+            "SETATTR overtook an acknowledged write"
+        );
 
         release.send(()).unwrap();
         truncated.recv_timeout(DEADLINE).unwrap().unwrap();
@@ -2341,7 +2354,11 @@ mod front_gate_ordering {
         let path = fx.mount.join("a");
         let looked_up = spawn(move || std::fs::metadata(path));
         std::thread::sleep(QUIET);
-        assert_eq!(fx.count("lookup:a"), lookups, "LOOKUP overtook an acknowledged write");
+        assert_eq!(
+            fx.count("lookup:a"),
+            lookups,
+            "LOOKUP overtook an acknowledged write"
+        );
 
         release.send(()).unwrap();
         looked_up.recv_timeout(DEADLINE).unwrap().unwrap();
@@ -2364,7 +2381,10 @@ mod front_gate_ordering {
         let (from, to) = (fx.mount.join("b"), fx.mount.join("c"));
         let renamed = spawn(move || std::fs::rename(from, to));
         std::thread::sleep(QUIET);
-        assert!(!fx.arrived("rename:start"), "RENAME overtook an acknowledged write");
+        assert!(
+            !fx.arrived("rename:start"),
+            "RENAME overtook an acknowledged write"
+        );
 
         release.send(()).unwrap();
         renamed.recv_timeout(DEADLINE).unwrap().unwrap();
@@ -2391,7 +2411,10 @@ mod front_gate_ordering {
             Ok(bytes[..count].to_vec())
         });
         std::thread::sleep(QUIET);
-        assert!(!fx.arrived("read:start"), "READ overlapped a same-file SETATTR");
+        assert!(
+            !fx.arrived("read:start"),
+            "READ overlapped a same-file SETATTR"
+        );
 
         release.send(()).unwrap();
         truncated.recv_timeout(DEADLINE).unwrap().unwrap();
@@ -2431,7 +2454,10 @@ mod front_gate_ordering {
             .iter()
             .filter(|seen| *seen == "write:start")
             .count();
-        assert_eq!(writes_now, writes_before, "WRITE overlapped a same-file READ");
+        assert_eq!(
+            writes_now, writes_before,
+            "WRITE overlapped a same-file READ"
+        );
 
         release.send(()).unwrap();
         assert_eq!(read.recv_timeout(DEADLINE).unwrap().unwrap(), b"abcd");
@@ -2462,7 +2488,10 @@ mod front_gate_ordering {
         let (from, to) = (fx.mount.join("b"), fx.mount.join("c"));
         let renamed = spawn(move || std::fs::rename(from, to));
         std::thread::sleep(QUIET);
-        assert!(!fx.arrived("rename:start"), "RENAME overlapped an in-flight READ");
+        assert!(
+            !fx.arrived("rename:start"),
+            "RENAME overlapped an in-flight READ"
+        );
 
         release.send(()).unwrap();
         assert_eq!(read.recv_timeout(DEADLINE).unwrap().unwrap(), 4);
@@ -2490,7 +2519,10 @@ mod front_gate_ordering {
             reader.read_at(&mut bytes, 0)
         });
         std::thread::sleep(QUIET);
-        assert!(!fx.arrived("read:start"), "READ overlapped an in-flight RENAME");
+        assert!(
+            !fx.arrived("read:start"),
+            "READ overlapped an in-flight RENAME"
+        );
 
         release.send(()).unwrap();
         renamed.recv_timeout(DEADLINE).unwrap().unwrap();

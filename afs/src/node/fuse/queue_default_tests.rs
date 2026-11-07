@@ -117,7 +117,12 @@ fn last_close_observes_earlier_release_before_retiring_failed_inode() {
     let handles = fs.file_handle_inodes.clone();
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let (first_guard, _) = fs.front_callback(FrontOrdering::WriteAdmission, Some(1), false);
+    let (first_guard, _) = fs.front_callback(
+        FrontOrdering::WriteAdmission,
+        GateAccess::Exclusive,
+        Some(1),
+        false,
+    );
     fs.dispatch.submit_keyed(1, move || {
         let _first_guard = first_guard;
         entered_tx.send(()).unwrap();
@@ -128,7 +133,12 @@ fn last_close_observes_earlier_release_before_retiring_failed_inode() {
     let closing = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let close = thread::spawn(move || {
-        let (_guard, _) = closing.front_callback(FrontOrdering::WriteBarrier, Some(1), true);
+        let (_guard, _) = closing.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Exclusive,
+            Some(1),
+            true,
+        );
         closing.retire_front_handle(1, 12);
         done_tx.send(()).unwrap();
     });
@@ -154,7 +164,12 @@ fn no_write_backlog_does_not_serialize_existing_read_dispatch() {
     let next = fs.clone();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let check = thread::spawn(move || {
-        let (_guard, result) = next.front_callback(FrontOrdering::WriteBarrier, Some(2), false);
+        let (_guard, result) = next.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Exclusive,
+            Some(2),
+            false,
+        );
         done_tx.send(result).unwrap();
     });
     let result = done_rx.recv_timeout(Duration::from_millis(100));
@@ -175,7 +190,12 @@ fn file_barrier_unrelated_dispatch_does_not_delay_write_admission() {
     let other = fs.clone();
     let (done_tx, done_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
-        let (_guard, result) = other.front_callback(FrontOrdering::WriteAdmission, Some(1), false);
+        let (_guard, result) = other.front_callback(
+            FrontOrdering::WriteAdmission,
+            GateAccess::Exclusive,
+            Some(1),
+            false,
+        );
         done_tx.send(result).unwrap();
     });
     let before = done_rx.recv_timeout(Duration::from_millis(100));
@@ -190,7 +210,12 @@ fn file_barrier_unrelated_body_does_not_delay_other_file() {
     let other = fs.clone();
     let (done_tx, done_rx) = mpsc::channel();
     let worker = thread::spawn(move || {
-        let (_guard, result) = other.front_callback(FrontOrdering::WriteBarrier, Some(2), false);
+        let (_guard, result) = other.front_callback(
+            FrontOrdering::WriteBarrier,
+            GateAccess::Exclusive,
+            Some(2),
+            false,
+        );
         done_tx.send(result).unwrap();
     });
     let before = done_rx.recv_timeout(Duration::from_millis(100));
