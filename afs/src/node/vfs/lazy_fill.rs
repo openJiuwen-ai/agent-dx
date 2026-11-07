@@ -7,7 +7,7 @@ use prost::bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "dfs")]
-pub(crate) const DESCRIPTOR_XATTR: &[u8] = b"user.afs.lazy.v1";
+pub(crate) use crate::dfs::LAZY_FILE_DESCRIPTOR_XATTR as DESCRIPTOR_XATTR;
 pub const MAX_FILL_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

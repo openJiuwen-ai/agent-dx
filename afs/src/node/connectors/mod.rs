@@ -1,5 +1,7 @@
 //! Optional third-party connectors. Node only assembles hooks and HTTP routes.
 pub mod nydus;
+#[cfg(all(target_os = "linux", feature = "overlaybd-connector"))]
+mod overlaybd;
 
 use super::vfs::{Backend, lazy_fill::LazyFillRegistry, types::BackendInode};
 use afs_error::Result;
@@ -11,6 +13,8 @@ use std::{future::Future, pin::Pin, sync::Arc};
 #[serde(default, deny_unknown_fields)]
 pub struct ConnectorsConfig {
     pub nydus: nydus::NydusConfig,
+    #[cfg(all(target_os = "linux", feature = "overlaybd-connector"))]
+    pub overlaybd: overlaybd::OverlaybdConfig,
 }
 
 #[derive(Clone)]
@@ -38,6 +42,18 @@ impl ConnectorRuntime {
             connectors.push(Box::new(nydus::NydusConnector::new(
                 config.nydus.clone(),
                 node_id,
+            )?));
+        }
+        #[cfg(all(target_os = "linux", feature = "overlaybd-connector"))]
+        if config.overlaybd.enabled {
+            if !config.nydus.enabled {
+                return Err(afs_error::Error::coded(
+                    afs_error::CONFIG_INVALID,
+                    "OverlayBD requires the AFS Registry blob routes",
+                ));
+            }
+            connectors.push(Box::new(overlaybd::OverlaybdConnector::new(
+                config.overlaybd.clone(),
             )?));
         }
         Ok(Self { connectors })

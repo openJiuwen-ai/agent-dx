@@ -146,6 +146,9 @@ pub struct InodeAttributes {
     pub ctime_unix_ms: u64,
 }
 
+/// Metadata binding for immutable, source-backed files.
+pub(crate) const LAZY_FILE_DESCRIPTOR_XATTR: &[u8] = b"user.afs.lazy.v1";
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct InodeRecord {
     pub namespace_id: NamespaceId,

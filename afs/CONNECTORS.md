@@ -86,3 +86,42 @@ Nydus backend 示例（替换实际地址与具体 manifest digest）：
 已提交副本的来源恢复及普通缓存持久对账见[恢复 E2E](../build/e2e/afs/recovery/README.md)。传输／提交失败保留已校验的本地字节，后续读取按现有布局及本地 catalog 对照 Meta 来源，补齐未确认的副本发布；旧 owner 的迟到回调不能发布。
 
 旧版本已经准备的普通 `descriptor.json` 不会被静默改写为懒文件；需重新准备镜像目录才能获得描述文件来源恢复。本变更不提供旧目录在线迁移。
+
+## OverlayBD 本机块设备
+
+Linux 构建可选用 `cargo build -p afs --bin afs-node --features overlaybd-connector`。
+运行时仍需显式启用：
+
+```toml
+[connectors.overlaybd]
+enabled = true
+recover_on_restart = false
+directory = "/var/lib/afs/overlaybd"
+image = "registry.example.com/team/image@sha256:MANIFEST_DIGEST"
+```
+
+私有目录（模式 0700）内放部署固定的 OverlayBD `image.json` 和 `global.json`。
+镜像须为只读，`repoBlobUrl` 可使用同节点
+`http://AFS_NODE:7401/nydus/SOURCE/sha256:MANIFEST_DIGEST/blobs`。
+启用现有 Registry blob 服务并配置对应来源。块后端和 Linux ublk 队列在
+AFS Node 进程内运行。按需填充、提交和 Peer 读由现有 AFS 负责。
+
+adxlet 配置 `ADX_OVERLAYBD_ROOTFS_SOCKET=/var/lib/afs/overlaybd/connector.sock`。
+本地 socket 的 `POST /acquire` 接收 `{"runtime_id":"...","image":"..."}`，
+返回 JSON 挂载路径，其他镜像返回 `null`，沿用现有启动路径。
+`POST /release` 接收 `{"runtime_id":"..."}`，在 sandboxd 确认实例删除后调用。
+adxlet 在 socket 同目录的 `.adxlet-overlaybd-refs` 记录持有和待释放的引用。
+connector 暂时离线时，已落盘的待释放引用在 adxlet 重启后继续重试。
+服务身份要能管理 ublk 设备和 ext4 挂载。AFS Node 与 sandboxd 必须看到同一挂载。
+同镜像共享只读挂载，实例写层由 sandboxd/gVisor 管理。
+
+引用保存在本机。启用 `recover_on_restart` 后，新建只读设备要求内核支持
+`USER_RECOVERY` 和 `USER_RECOVERY_REISSUE`，镜像层须由远端 digest 固定。
+新 Node 在同一次宿主机启动内核对原设备、原挂载及镜像配置，再重新打开镜像层和
+ublk 队列。接管共享 60 秒预算，重试镜像打开和内核队列暂不可用，成功后继续原盘读。
+确认原盘身份且无法接管时，先停止供数设备以结束等待的 I/O，最后一个实例释放引用时清理。
+接管中断后的再次接管依赖 Linux 6.15 或发行版的等效修复。
+
+懒文件补冷范围时，Meta 可把有效旧租约交给原节点的新注册 session。
+其他节点先读也可触发这次交接，租约持有节点仍是原节点，epoch 递增，旧提交被拒绝。
+没有来源绑定的普通文件沿用原租约规则。
