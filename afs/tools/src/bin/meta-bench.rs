@@ -138,6 +138,9 @@ enum Phase {
     /// rmdir and directory rename in the seeded namespace (R15): DfsService,
     /// in-process, no RPC.
     DirOps,
+    /// How many repair claims it takes to notice one lost replica, the worst
+    /// placed one among the seeded placements, and what each claim costs (R61).
+    PatrolLatency,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
@@ -1283,6 +1286,130 @@ async fn dir_ops(store: Arc<Store>, iterations: u64) -> BenchResult<Value> {
     )
 }
 
+async fn patrol_latency(store: Arc<Store>, dimensions: Dimensions) -> BenchResult<Value> {
+    use afs::dfs::{ClaimReplicationTask, StorageDeviceDescriptor};
+    if dimensions.chunks_per_file != 1 || dimensions.copies_per_chunk != 1 {
+        return Err("patrol-latency needs one chunk and one copy per file (dataset s)".into());
+    }
+    let device = |id: &str| StorageDeviceDescriptor {
+        device_id: id.into(),
+        device_epoch: 1,
+        catalog_revision: 1,
+        failure_domain: "bench-fd".into(),
+    };
+    let lease = |node: &str, session: &str, device_id: &str| NodeSessionLease {
+        node_id: node.into(),
+        session_id: session.into(),
+        grpc_addr: "127.0.0.1:1".into(),
+        data_addr: "127.0.0.1:2".into(),
+        rest_addr: "127.0.0.1:3".into(),
+        ownerfs_enabled: false,
+        storage_devices: vec![device(device_id)],
+        lease_ttl: Duration::from_secs(600),
+    };
+    for (node, session) in [("bench-node-0", "worker"), ("bench-node-lost", "first")] {
+        store
+            .register_node_session(
+                RequestKey::new(node, format!("register-{session}")),
+                lease(node, session, "bench-device"),
+            )
+            .await?;
+    }
+    // The last placement in chunk order lives on the node that will be lost.
+    let last_chunk = ChunkId::new(format!("bench-chunk-{:016x}-0", dimensions.files - 1));
+    let copy_id = CopyId::new(format!("bench-copy-{:016x}-0-0", dimensions.files - 1));
+    let mut moved = transaction(
+        "patrol-move-copy".into(),
+        StoreOperation::DfsCommitFileVersion,
+    );
+    let MetaEntity::DfsCopy(mut copy) = store
+        .read(MetaRead::DfsCopy(copy_id))
+        .await?
+        .entity
+        .ok_or("seeded copy is missing")?
+    else {
+        return Err("seeded copy has the wrong type".into());
+    };
+    copy.location = CopyLocation::Node {
+        node_id: "bench-node-lost".into(),
+        node_epoch: 1,
+        device_id: "bench-device".into(),
+        device_epoch: 1,
+        catalog_revision: 1,
+    };
+    moved
+        .mutations
+        .insert(0, TxnMutation::Put(MetaEntity::DfsCopy(copy)));
+    committed(store.as_ref(), moved).await?;
+    let service = DfsService::new(store.clone());
+    let mut sequence = 0_u64;
+    let mut claim = async || -> BenchResult<u64> {
+        sequence += 1;
+        let start = Instant::now();
+        service
+            .claim_replication_task(ClaimReplicationTask {
+                caller_id: "bench-node-0".into(),
+                caller_session_id: "worker".into(),
+                caller_node_epoch: 1,
+                operation_id: OperationId::new(format!("patrol-claim-{sequence}")),
+                lease_seconds: 30,
+            })
+            .await?;
+        Ok(elapsed_ns(start.elapsed()))
+    };
+    let debt = async || -> BenchResult<bool> {
+        for read in [MetaRead::DfsReplicationTasks] {
+            let found = store.read(read).await?.entities.iter().any(|entity| {
+                matches!(entity, MetaEntity::DfsReplicationTask(task) if task.chunk_id == last_chunk)
+            });
+            if found {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    // The first patrol walks everything; all healthy.
+    let pages = dimensions.files / 1024 + 2;
+    let mut first_patrol = BTreeMap::new();
+    for _ in 0..pages.min(2000) {
+        record_latency(&mut first_patrol, claim().await?)?;
+        if debt().await? {
+            return Err("a healthy placement got repair debt".into());
+        }
+    }
+    let mut idle = BTreeMap::new();
+    for _ in 0..20 {
+        record_latency(&mut idle, claim().await?)?;
+    }
+    // The node is replaced: its copy is stale, and only looking at it shows that.
+    store
+        .register_node_session(
+            RequestKey::new("bench-node-lost", "register-second"),
+            lease("bench-node-lost", "second", "bench-device-2"),
+        )
+        .await?;
+    let lost_at = Instant::now();
+    let mut during = BTreeMap::new();
+    let mut claims_to_notice = 0_u64;
+    loop {
+        claims_to_notice += 1;
+        if claims_to_notice > pages + 8 {
+            return Err("the patrol never noticed the lost replica".into());
+        }
+        record_latency(&mut during, claim().await?)?;
+        if debt().await? {
+            break;
+        }
+    }
+    Ok(
+        json!({"scope":"DfsService claims in-process; a real cluster polls once per second per storage node",
+        "placements":dimensions.files,"claims_to_notice":claims_to_notice,
+        "claim_wall_to_notice_ns":elapsed_ns(lost_at.elapsed()),
+        "first_patrol_claim":quantiles(first_patrol)?,"idle_claim":quantiles(idle)?,
+        "patrol_claim":quantiles(during)?}),
+    )
+}
+
 fn rss_bytes() -> Option<u64> {
     fs::read_to_string("/proc/self/status")
         .ok()?
@@ -1477,6 +1604,7 @@ async fn main() -> BenchResult<()> {
         }
         Phase::ServiceSmoke => service_smoke(store).await?,
         Phase::DirOps => dir_ops(store, args.seconds).await?,
+        Phase::PatrolLatency => patrol_latency(store, dimensions).await?,
         Phase::Diagnose => {
             diagnose(
                 store,
