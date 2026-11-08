@@ -1911,6 +1911,51 @@ async fn chunks_with_debt(fixture: &Fixture) -> std::collections::BTreeSet<crate
         .collect()
 }
 
+/// Q08: a session change while the patrol's finds still wait in the list
+/// restarts the patrol over the same placements. One claim then sees each
+/// waiting chunk twice (from the list, then from the page); the second sighting
+/// must not drop it from the list, because only one of them gets recorded.
+#[tokio::test]
+async fn a_restarted_patrol_keeps_every_unrecorded_find_in_the_waiting_list() {
+    let fixture = fixture().await;
+    register_target(&fixture, "target-original", "target-device").await;
+    let lost = seed_placements_on_target(&fixture, "lost", 5).await;
+    for call in 0..2 {
+        fixture
+            .service
+            .claim_replication_task(claim_request(&format!("healthy-{call}")))
+            .await
+            .unwrap();
+    }
+    assert!(chunks_with_debt(&fixture).await.is_empty());
+    // The node restarts with an empty disk: one claim finds all five lost and
+    // records one.
+    register_target(&fixture, "target-wiped", "target-device-2").await;
+    fixture
+        .service
+        .claim_replication_task(claim_request("found"))
+        .await
+        .unwrap();
+    assert_eq!(chunks_with_debt(&fixture).await.len(), 1);
+    // It restarts again before the others are recorded: a new lap.
+    register_target(&fixture, "target-restarted", "target-device-3").await;
+    for call in 0..lost.len() + 1 {
+        fixture
+            .service
+            .claim_replication_task(claim_request(&format!("record-{call}")))
+            .await
+            .unwrap();
+    }
+    let with_debt = chunks_with_debt(&fixture).await;
+    let patrol = fixture.service.repair_patrol.lock().unwrap();
+    for chunk_id in &lost {
+        assert!(
+            with_debt.contains(chunk_id) || patrol.has_suspect(chunk_id),
+            "{chunk_id:?} left the waiting list without its debt being recorded"
+        );
+    }
+}
+
 #[tokio::test]
 async fn more_lost_placements_than_the_waiting_list_holds_all_get_their_debt() {
     let fixture = fixture().await;

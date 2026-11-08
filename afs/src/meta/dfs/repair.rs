@@ -177,10 +177,14 @@ impl DfsService {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let mut registered = candidates
+        // Debt already recorded in the store, versus chunks this pass merely
+        // offers. A chunk can arrive twice in one pass (waiting list, then the
+        // patrol page); only recorded debt may leave the waiting list (Q08).
+        let recorded = candidates
             .iter()
             .map(|task| task.chunk_id.clone())
             .collect::<HashSet<_>>();
+        let mut offered = HashSet::new();
         let mut placements = self
             .store
             .read(MetaRead::DfsUnhealthyPlacements)
@@ -193,7 +197,10 @@ impl DfsService {
                 continue;
             };
             self.gc_metrics().repair_placements_checked.inc();
-            if registered.contains(&placement.chunk_id)
+            if offered.contains(&placement.chunk_id) {
+                continue;
+            }
+            if recorded.contains(&placement.chunk_id)
                 || (placement.health == PlacementHealth::Satisfied
                     && self.live_ready_copy_count(&placement, now).await?
                         >= usize::from(placement.desired_copies))
@@ -202,7 +209,7 @@ impl DfsService {
                 continue;
             }
             self.patrol_suspect(&placement.chunk_id)?;
-            registered.insert(placement.chunk_id.clone());
+            offered.insert(placement.chunk_id.clone());
             let task_id = repair_task_id(&placement.chunk_id);
             let completed = self
                 .store
