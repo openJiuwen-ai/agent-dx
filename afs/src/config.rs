@@ -473,17 +473,20 @@ struct FileConfig {
     trace_sample_ratio: Option<f64>,
 }
 /// Remote native CRC-format reads only; write integrity is independent.
-/// Users choose `off` or `receiver`, and only for native DFS gRPC. `Both`
-/// (sender and receiver verify) is the fixed internal policy elsewhere and the
-/// meaning of a peer request without a mode header; it is not configurable.
+/// Users choose `off` or `receiver`, and only for native DFS gRPC. The
+/// default is `receiver`: a corrupt remote copy is rejected and the read moves
+/// to another copy instead of returning the bad bytes (D-S4-1). `off` is an
+/// explicit opt-out that may deliver silent corruption. `Both` (sender and
+/// receiver verify) is the fixed internal policy elsewhere and the meaning of
+/// a peer request without a mode header; it is not configurable.
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum DfsReadCrcMode {
     #[value(skip)]
     #[serde(skip_deserializing)]
     Both,
-    Receiver,
     #[default]
+    Receiver,
     Off,
 }
 impl DfsReadCrcMode {
@@ -806,7 +809,7 @@ mod certificate_tests {
         assert_eq!(cfg.dfs_read_pipeline.max_reply_bytes, 256 * 1024 * 1024);
         assert_eq!(cfg.fuse_max_readahead_bytes, 16 * 1024 * 1024);
         assert_eq!(cfg.dfs_readahead_max_bytes, 0);
-        assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Off);
+        assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Receiver);
         let cli = Cli::try_parse_from([
             "afs-node",
             "--config",
@@ -1005,7 +1008,7 @@ mod crc_read_modes_validation_tests {
         }
         let cfg =
             Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--fs", "dfs"])).unwrap();
-        assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Off);
+        assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Receiver);
         assert!(Cli::try_parse_from(["afs-node", "--dfs-read-crc-mode", "maybe"]).is_err());
         assert!(
             Config::resolve(
@@ -1026,19 +1029,21 @@ mod crc_read_modes_validation_tests {
 }
 
 #[cfg(test)]
-mod crc_read_default_off_tests {
+mod crc_read_default_receiver_tests {
     use super::*;
 
+    /// Remote reads verify bodies by default so a bad replica is never handed
+    /// to the application (D-S4-1); `off` stays an explicit opt-out.
     #[cfg(feature = "dfs")]
     #[test]
-    fn crc_read_default_off_keeps_native_write_checks_and_optional_receiver() {
+    fn crc_read_default_receiver_keeps_native_write_checks_and_optional_off() {
         let cfg =
             Config::resolve(Role::Node, Cli::parse_from(["afs-node", "--fs", "dfs"])).unwrap();
-        assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Off);
-        assert_eq!(DfsReadCrcMode::default(), DfsReadCrcMode::Off);
+        assert_eq!(cfg.dfs_read_crc_mode, DfsReadCrcMode::Receiver);
+        assert_eq!(DfsReadCrcMode::default(), DfsReadCrcMode::Receiver);
         assert_eq!(
             serde_json::to_value(&cfg).unwrap()["dfs_read_crc_mode"],
-            "off"
+            "receiver"
         );
         for mode in ["receiver", "off"] {
             let cfg = Config::resolve(

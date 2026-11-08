@@ -236,7 +236,7 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `dfs_min_distinct_nodes` | 产品差异 | Meta | `1` | 副本至少分布的 Node 数 |
 | `dfs_min_distinct_failure_domains` | 产品差异 | Meta | `1` | 副本至少分布的故障域数 |
 | `dfs_local_copy` | 产品差异 | Meta | `required` | 写入 Node 是否必须持有副本：`required`、`preferred` 或 `none` |
-| `dfs_read_crc_mode` | 产品差异 | Node | `off` | 原生 DFS gRPC 远端读的正文校验：`off` 或 `receiver`；其他后端和通道固定走内部策略，`--print-config` 显示 `both`，且不接受显式设置 |
+| `dfs_read_crc_mode` | 产品差异 | Node | `receiver` | 原生 DFS gRPC 远端读的正文校验：`receiver`（默认，坏副本不交给应用）或 `off`（显式关闭，可能交付静默损坏）；其他后端和通道固定走内部策略，`--print-config` 显示 `both`，且不接受显式设置 |
 | `log_level` | 产品差异 | 两者 | `info` | 日志级别 |
 | `trace_enabled` | 产品差异 | 两者 | `false` | 是否导出 Trace |
 | `trace_endpoint` | 产品差异 | 两者 | `http://127.0.0.1:4317` | OTLP 导出地址 |
@@ -443,7 +443,7 @@ cache ON 必须按[验收说明](../testing/afs.md#dfs-外部-s3-闭环)登记�
 | `dfs_source_lookahead_chunks` | `64` | `0..=128`，仅后续源元数据；与mandatory合并请求至多128项；0仅关闭前瞻 |
 | `dfs_source_cache_bytes` | `4194304`（4MiB） | `0..=4194304`，最多1024条源元数据的保留估算上限；0不保留且不前瞻 |
 | `dfs_readahead_max_bytes` | `0` | `0..=33554432`；0不创建后台fetch任务；product可显式设8388608。这是对象调度距离，未新增正文、proof、连接或磁盘额度 |
-| `dfs_read_crc_mode` | `"off"` | 仅原生DFS且`data_mode = "grpc"`可设置，取值`"off"`或`"receiver"`。`off`：远端读正文不做CRC校验（损坏字节原样交付）；`receiver`：读取方按Meta可信CRC表校验完整32KiB分段，非对齐片段由服务方校验，同时关闭原生预取。只影响本Node发起的远端读；服务方按请求方声明的模式执行，各Node可以不同。原`both`在S1a-7删除 |
+| `dfs_read_crc_mode` | `"receiver"` | 仅原生DFS且`data_mode = "grpc"`可设置，取值`"receiver"`或`"off"`。`receiver`（默认）：读取方按Meta可信CRC表校验完整32KiB分段，非对齐片段由服务方校验，校验失败换下一个副本并复核上报，同时关闭原生预取；`off`：远端读正文不做CRC校验（损坏字节原样交付），仅在明确接受该风险时显式设置。只影响本Node发起的远端读；服务方按请求方声明的模式执行，各Node可以不同。原`both`在S1a-7删除 |
 
 Linux DFS挂载完成后仅设置自身FUSE设备的BDI `read_ahead_kb`，默认16384KiB；显式0禁用。
 INIT协商值与BDI有效值分别记录在`dfs.fuse_cache_init`和`dfs.fuse_readahead`。
