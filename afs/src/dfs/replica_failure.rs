@@ -74,7 +74,9 @@ impl ReplicaFailureConfig {
     }
 
     /// Rejects a missing or unspecified policy and an out-of-range count; the
-    /// caller still checks it against its replication config.
+    /// caller still checks it against its replication config. Only a DFS Node
+    /// decodes it.
+    #[cfg(feature = "dfs")]
     pub(crate) fn from_wire(
         value: Option<afs_protocol::meta::DfsReplicaFailureConfig>,
     ) -> afs_error::Result<Self> {
