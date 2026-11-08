@@ -131,8 +131,9 @@ impl DistributedFs {
             return Err(bad_file_descriptor("DFS handle was not opened for reading"));
         }
         let opened = snapshot.handle.clone();
+        // The read keeps its own pipeline deadline: delivery revalidates the
+        // authority, so the view's reuse period must not cut the read short.
         let operation = self.capture_native_read_view()?;
-        let deadline = deadline.min(operation.deadline);
         let lifetime: crate::node::read::admission::ReadLifetime =
             Arc::new((opened.clone(), lifetime));
         let scope = crate::node::read::admission::ReadScope {
@@ -154,7 +155,7 @@ impl DistributedFs {
             {
                 hook();
             }
-            self.check_native_read_view(&operation)?;
+            self.check_native_read_view_for_delivery(&operation)?;
             if opened.closed.load(Ordering::Acquire) {
                 return Err(stale("DFS file handle is no longer open"));
             }
@@ -255,13 +256,13 @@ impl DistributedFs {
             .read_committed_async(
                 &inode,
                 NativeReadRequest {
-                    deadline: deadline.min(view.deadline),
+                    deadline,
                     ..request
                 },
                 true,
             )
             .await?;
-        self.check_native_read_view(&view)?;
+        self.check_native_read_view_for_delivery(&view)?;
         Ok(result)
     }
 

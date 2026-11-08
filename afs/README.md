@@ -91,8 +91,8 @@ SHM 的 memfd、sealing 与原子 CLOEXEC FD 传递实现及对应运行测试�
 
 必要正确性边界仍需保留：读写新鲜度、close-to-open、权限和 suid/sgid 清除、错误传播、持久化屏障、direct-I/O mmap 能力协商、正常卸载和受管引用排空。
 
-原生DFS新open取得fresh状态，已打开读视图最多复用5秒、命中不续期；Node/session
-授权与版本视图分别检查，已知失效停止交付。A当前已验证对象单槽最多4MiB，与在途
+原生DFS新open取得fresh状态并固定该版本直到close；读取授权快照最多复用5秒、命中不续期，
+跨过复用期的读只要Node/session授权未中断即正常交付，已知失效（停止、epoch变化）停止交付。A当前已验证对象单槽最多4MiB，与在途
 正文共用8MiB容量；B可显式启用可丢弃的磁盘读缓存，不新增常驻正文RAM缓存。具体期限、断链、失效与资源范围见
 [读取上下文边界](../docs/architecture/afs.md#dfs-原生节点读取上下文)及
 [验收与指标](../docs/testing/afs.md)。这不改变成功fsync的持久要求。

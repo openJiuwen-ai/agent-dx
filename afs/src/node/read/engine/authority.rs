@@ -98,6 +98,21 @@ impl LocalReadAuthority {
         Ok(())
     }
 
+    /// Whether the authority captured in `snapshot` held without a break until
+    /// now, even if that snapshot's own lease expiry has passed (a heartbeat
+    /// extended it). A lapsed lease stops the authority for good (`refresh`)
+    /// and a re-registration changes the epoch, so a current, unstopped,
+    /// same-epoch state proves the lease never lapsed since the capture.
+    pub(super) fn check_continuous(&self, snapshot: &NativeReadAuthoritySnapshot) -> Result<()> {
+        let current = self.snapshot()?;
+        if current.epoch != snapshot.epoch {
+            return Err(external_denied(
+                "DFS read authority changed before publication",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn snapshot(&self) -> Result<NativeReadAuthoritySnapshot> {
         let state = self
             .state
@@ -131,6 +146,15 @@ impl DfsReadEngine {
         snapshot: &NativeReadAuthoritySnapshot,
     ) -> Result<()> {
         self.read_authority.check_snapshot(snapshot)
+    }
+
+    /// Delivery check for bytes read under `snapshot`: the Node's read
+    /// authority held continuously since the capture (R75).
+    pub(in crate::node) fn check_native_read_authority_continuous(
+        &self,
+        snapshot: &NativeReadAuthoritySnapshot,
+    ) -> Result<()> {
+        self.read_authority.check_continuous(snapshot)
     }
 
     pub(super) fn invalidate_native_batch_authority(&self, batch: &ReadBatch) {

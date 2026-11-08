@@ -10,6 +10,8 @@ pub(super) struct TestHooks {
     pub(super) handle_registration_after_route_check: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     pub(super) readonly_version_before_install: Mutex<Option<Arc<std::sync::Barrier>>>,
     pub(super) writeback_after_prepare_pause: Mutex<Option<Duration>>,
+    /// Shorter read-view reuse period, so a test read can cross it.
+    pub(super) native_read_view_ttl: Mutex<Option<Duration>>,
 }
 
 impl DistributedFs {

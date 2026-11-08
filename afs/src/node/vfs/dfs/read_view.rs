@@ -3,12 +3,19 @@ use super::*;
 impl DistributedFs {
     pub(super) fn capture_native_read_view(&self) -> Result<NativeReadView> {
         let started = Instant::now();
+        #[cfg(test)]
+        let ttl = self
+            .hooks
+            .native_read_view_ttl
+            .lock()
+            .map_err(|_| unavailable("test hook poisoned"))?
+            .unwrap_or(NATIVE_READ_VIEW_TTL);
+        #[cfg(not(test))]
+        let ttl = NATIVE_READ_VIEW_TTL;
         let authority = self.read_engine.capture_native_read_authority()?;
         let deadline = authority
             .expires_at()
-            .map_or(started + NATIVE_READ_VIEW_TTL, |expiry| {
-                expiry.min(started + NATIVE_READ_VIEW_TTL)
-            });
+            .map_or(started + ttl, |expiry| expiry.min(started + ttl));
         Ok(NativeReadView {
             generation: 0,
             authority,
@@ -23,6 +30,20 @@ impl DistributedFs {
             return Err(unavailable("DFS native read view expired before delivery"));
         }
         Ok(())
+    }
+
+    /// Delivery check for bytes read under `view` (R75). The view's 5 s reuse
+    /// period only bounds how long a captured snapshot serves new reads; it is
+    /// not a safety bound for a read already running. Versions are pinned by
+    /// the handle and chunks by its GC pin, so delivery needs only that the
+    /// Node's read authority held without a break since the view was
+    /// captured. A stop or epoch change still rejects (PermissionDenied).
+    pub(super) fn check_native_read_view_for_delivery(&self, view: &NativeReadView) -> Result<()> {
+        if self.check_native_read_view(view).is_ok() {
+            return Ok(());
+        }
+        self.read_engine
+            .check_native_read_authority_continuous(&view.authority)
     }
 
     pub(super) fn invalidate_native_inode_views_on_error(&self, inode_id: &InodeId, error: &Error) {

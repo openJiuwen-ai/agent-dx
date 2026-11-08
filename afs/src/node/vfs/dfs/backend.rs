@@ -598,7 +598,9 @@ impl Backend for DistributedFs {
             None
         };
         if let Some(view) = native_read_view.as_ref() {
-            self.check_native_read_view(view)?;
+            // A slow open (Meta round trips) may outlive the view's reuse
+            // period; it only needs the authority to have held (R75).
+            self.check_native_read_view_for_delivery(view)?;
         }
         self.allocate_handle(DfsFileHandle {
             gc_pin: None,

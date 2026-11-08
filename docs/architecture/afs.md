@@ -384,15 +384,18 @@ AFS live/idle、allocator allocated/active/resident/retained 与进程 RSS 是�
 
 ## DFS 原生节点读取上下文
 
-未配置外部后端时，新open从Meta取得fresh inode，之后同句柄复用已提交版本视图
-最多5秒。截止从fresh请求前的单调时刻起算，并受Node/session原期限限制；命中和
-心跳不延长该视图。到期刷新head，已有getattr、本机成功发布或truncate刷新点
-使旧视图失效。close-to-open保证新打开读取最新已提交状态，不承诺已打开句柄
-每次read即时感知外部修改，也不固定为永久快照；rename/unlink沿用inode及版本
-保留规则，不因视图复用扩展GC或文件描述符生命周期。
+未配置外部后端时，新open从Meta取得fresh inode，句柄固定这个已提交版本直到close
+（决策4a）；其他节点的提交只在新open时可见，本机成功发布或truncate刷新本句柄。
+句柄上捕获的读取授权快照（读视图）最多复用5秒供新read开始使用，截止从捕获前的单调
+时刻起算，并受Node/session原期限限制；命中和心跳不延长该视图，到期后下一次read在本机
+重新捕获，不回Meta取head。rename/unlink沿用inode及版本保留规则，不因视图复用扩展GC
+或文件描述符生命周期。
 
 版本新鲜度和授权独立。Node注册、心跳、epoch变化和停止接入同一有界读取授权，
-read开始与私有结果交付前检查；源元数据缓存默认最多5秒，并受原grant到期减1秒
+read开始与私有结果交付前检查。交付检查要求的是授权自捕获起从未中断：快照仍有效即交付；
+快照的5秒复用期或所带租约期限在读取途中到期时，当前授权仍为同一epoch且未停止即交付
+（租约一旦过期即永久停止，重新注册会换epoch，所以同epoch未停止说明从未中断）；
+停止或epoch变化仍拒绝交付（EACCES）。读取本身只受读取流水线期限约束，不被视图复用期截短；源元数据缓存默认最多5秒，并受原grant到期减1秒
 安全余量约束；A端grant缓存仍最多5秒。源缓存不延长任何grant或已捕获Node／读视图期限。
 普通Meta断链只允许继续已获且未到期的上下文；新open、
 head/source/授权刷新需要Meta时失败即报错。读取拒绝失效对应上下文，Node级

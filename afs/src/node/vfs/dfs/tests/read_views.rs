@@ -1171,8 +1171,10 @@ fn r7_product_sequential_reads_schedule_one_two_four_objects_and_zero_stays_idle
         );
         if maximum == 0 {
             // Exercise the public borrowed-output boundary with all fetch
-            // slots held. Preserve this existing handle deadline; the
-            // engine must not start a fresh five-second view while queued.
+            // slots held. The engine must not start a fresh five-second view
+            // while queued; since R75 the queued read keeps its own pipeline
+            // deadline instead of failing when this handle view expires, and
+            // completes once the slots are released.
             let fetcher = engine.object_fetcher().unwrap();
             let permits: Vec<_> = (0..8)
                 .map(|_| fetcher.try_reserve_background(1).unwrap().unwrap())
@@ -1199,10 +1201,11 @@ fn r7_product_sequential_reads_schedule_one_two_four_objects_and_zero_stays_idle
             drop(permits);
             reading.join().unwrap();
             assert_eq!(
-                before_slot_release,
-                Some((true, [91; 16])),
-                "the original VFS view must expire in queue without changing public output"
+                before_slot_release, None,
+                "an expired handle view must not fail a read queued within its deadline"
             );
+            let (failed, _) = done_rx.recv().unwrap();
+            assert!(!failed, "the queued read is delivered once slots free");
         }
         fs.release(&context(), reader).unwrap();
         runtime
@@ -1212,9 +1215,11 @@ fn r7_product_sequential_reads_schedule_one_two_four_objects_and_zero_stays_idle
             fixture.background.load(Ordering::SeqCst),
             if maximum == 0 { 0 } else { 4 }
         );
+        // With no read-ahead the queued read above now completes (R75) and
+        // caches the next object itself: one more foreground entry.
         assert_eq!(
             cache.stats().unwrap().entries,
-            if maximum == 0 { 1 } else { 5 }
+            if maximum == 0 { 2 } else { 5 }
         );
         assert_eq!(
             fixture.lookups.load(Ordering::SeqCst),
@@ -1701,4 +1706,62 @@ fn c1b_version_cache_floor_does_not_exempt_actual_identifier_capacity() {
     cache.insert(key.clone(), value);
     assert!(cache.get(&key).is_some());
     assert_eq!(cache.table_bytes + cache.value_bytes, table + retained);
+}
+
+/// R75: a read that starts on a valid view and outlives the view's reuse
+/// period (or its captured lease) is still delivered, because the Node's read
+/// authority never lapsed in between.
+#[test]
+fn r75_read_crossing_view_expiry_is_delivered() {
+    let (_temp, meta, fs, authority) = test_fs_with_native_authority();
+    let fs = Arc::new(fs);
+    *fs.hooks.native_read_view_ttl.lock().unwrap() = Some(Duration::from_millis(50));
+    let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+    publish_external_version_with_bytes(&meta, &fs, "r75-cross", b"data");
+    let inode = fs.backend_inode(&inode_id).unwrap();
+    let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+    assert_eq!(fs.read_owned(&context(), reader, 0, 16).unwrap(), b"data");
+    let heartbeat = authority.clone();
+    *fs.hooks.native_read_after_committed.lock().unwrap() = Some(Box::new(move || {
+        std::thread::sleep(Duration::from_millis(150));
+        heartbeat
+            .refresh(1, Instant::now() + Duration::from_secs(30))
+            .unwrap();
+    }));
+    assert_eq!(fs.read_owned(&context(), reader, 0, 16).unwrap(), b"data");
+    fs.release(&context(), reader).unwrap();
+}
+
+/// R75 reverse: a real authority change while the read is in flight still
+/// rejects delivery, whether the Node stopped or re-registered.
+#[test]
+fn r75_authority_change_during_a_slow_read_still_rejects_delivery() {
+    for change in ["stop", "epoch"] {
+        let (_temp, meta, fs, authority) = test_fs_with_native_authority();
+        let fs = Arc::new(fs);
+        *fs.hooks.native_read_view_ttl.lock().unwrap() = Some(Duration::from_millis(50));
+        let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+        publish_external_version_with_bytes(&meta, &fs, "r75-change", b"data");
+        let inode = fs.backend_inode(&inode_id).unwrap();
+        let reader = fs.open(&context(), inode, libc::O_RDONLY).unwrap();
+        assert_eq!(fs.read_owned(&context(), reader, 0, 16).unwrap(), b"data");
+        let changed = authority.clone();
+        *fs.hooks.native_read_after_committed.lock().unwrap() = Some(Box::new(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            if change == "stop" {
+                changed.stop();
+            } else {
+                let _ = changed.refresh(2, Instant::now() + Duration::from_secs(30));
+            }
+        }));
+        let mut output = [7; 16];
+        let error = fs.read(&context(), reader, 0, &mut output).unwrap_err();
+        assert_eq!(
+            error.kind(),
+            afs_error::ErrorKind::PermissionDenied,
+            "{change}"
+        );
+        assert_eq!(output, [7; 16], "{change}");
+        fs.release(&context(), reader).unwrap();
+    }
 }
