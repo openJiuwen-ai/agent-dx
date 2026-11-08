@@ -81,8 +81,17 @@ checkpoint 文件头与状态 image，以及 Node 的 `catalog.snapshot`、CRC32
 新库从 term 1 开始，每帧记录写入它的 term。恢复时帧 term 必须不递减且不超过 CURRENT 的
 term，否则拒绝启动（`CONFIG_INVALID`）。持有旧 term 的句柄（已被更新的写者接管）任何追加、
 准入及其它日志操作都返回 `META_LOG_FENCED`（`0x03020002`，消息含 found／current term），
-不写入任何字节，Store 随即按现有规则失效；在途请求同样返回 `META_LOG_FENCED`，之后的请求返回不可用。目录锁 `LOCK` 仍是本机互斥手段，
-term 只在锁失效时兜底。`memory` 后端同样按 term 检查，但重启不保留。管理记录可推进日志位置而不改变业务revision。
+不写入任何字节，Store 随即按现有规则失效；在途请求同样返回 `META_LOG_FENCED`，之后的请求返回不可用。
+
+**local-file 的写者互斥合同**：目录锁 `LOCK`（`flock`，句柄存活期间一直持有）是互斥手段，term 只是兜底。
+每次日志操作都会重读 CURRENT 比较 term，但这次比较与随后的写入在进程之间不是一个原子操作。
+因此 `data_dir/meta-store/` 必须放在本机独占的存储上，`flock` 在其上有效：不放在 NFS 等网络文件系统，
+不让两台主机挂载同一块盘或同一目录，Meta 运行期间不删除 `LOCK`。锁失效时，如果新写者的打开与一次追加
+恰好落在旧写者“已比较 term、尚未写入”的窗口内，旧写者会覆盖新写者已确认的一组记录；新写者在下一次操作
+时发现并失效（`CONFIG_INVALID`），但那组已确认记录不可恢复（单测 `lost_lock_window_between_term_check_and_write`）。
+CURRENT 与一个 `CURRENT.tmp` 在 checkpoint 磁盘／文件额度里有固定预留（2 个文件、2×64KiB），
+每次打开写 CURRENT 不受快照镜像额度影响：保留的损坏镜像或隔离的临时文件占满镜像额度时，
+新的快照安装会被拒绝，但 Meta 仍能打开。`memory` 后端同样按 term 检查，但重启不保留。管理记录可推进日志位置而不改变业务revision。
 canonical路径已接入历史计账和运行时清理。请求结果及事件历史可通过
 [操作日志策略参数](#meta-操作日志有限策略)配置；下表列默认值，待处理输入与准备身份仍为内部边界：
 

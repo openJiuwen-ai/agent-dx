@@ -228,6 +228,14 @@ pub struct LogStatus {
 ///   whose term was superseded, fails `META_LOG_FENCED` without writing a byte.
 ///   Recovery rejects a chain whose frame terms decrease or exceed the current
 ///   term. Frames with term 0 (written before terms existed) remain valid.
+/// - **Writer exclusion.** How a backend makes the term check and the write
+///   one unit is backend specific and part of its contract. A shared-service
+///   backend compares the term and the tip in the same server-side atomic
+///   unit as the write (a transaction or script), so a superseded writer can
+///   never write. `LocalLog` relies on its directory `flock` for mutual
+///   exclusion and uses the term only as a backstop: it requires exclusive
+///   local storage, and without a working lock an older writer that passed
+///   its term check can still overwrite a newer writer's acknowledged group.
 pub trait MetaLog: Send + Sync {
     fn persistence(&self) -> BackendPersistence;
     fn limits(&self) -> AppendLimits;

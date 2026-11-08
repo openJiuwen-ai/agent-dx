@@ -1167,3 +1167,111 @@ async fn stale_handle_is_fenced_by_newer_current_term() {
         .unwrap();
     assert_eq!(wal_terms(dir.path()), [1, 2]);
 }
+
+/// R63: what happens when the directory lock no longer excludes an older
+/// writer and a newer writer completes open + append inside the older
+/// writer's check-then-write window. Outside the local backend's contract
+/// (exclusive local storage, working flock); this pins the residual.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lost_lock_window_between_term_check_and_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let records = test_records(3);
+    let old = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
+    let tip = old
+        .append_and_sync(LogTip::EMPTY.at(1), records[..1].to_vec())
+        .await
+        .unwrap();
+    old.release_lock_for_takeover().unwrap();
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    old.pause_next_append_before_write(move || {
+        reached_tx.send(()).unwrap();
+        go_rx.recv().unwrap();
+    });
+    let stale = old.clone();
+    let late = records[1..2].to_vec();
+    let pending = tokio::spawn(async move { stale.append_and_sync(tip.at(1), late).await });
+    tokio::task::spawn_blocking(move || reached_rx.recv().unwrap())
+        .await
+        .unwrap();
+    // The older writer has passed its term check. A newer writer opens and
+    // its append is acknowledged.
+    let new = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
+    let recovered = new.recover().await.unwrap();
+    assert_eq!((recovered.term, recovered.tip), (2, tip));
+    let acknowledged = new
+        .append_and_sync(tip.at(2), records[1..2].to_vec())
+        .await
+        .unwrap();
+    go_tx.send(()).unwrap();
+    let late = pending.await.unwrap();
+    // Both appends were acknowledged: the older writer wrote at the offset
+    // it checked, overwriting the newer writer's acknowledged group.
+    assert_eq!(late.unwrap().sequence, 2);
+    // The newer writer notices only at its next operation and latches.
+    let next = new
+        .append_and_sync(acknowledged.at(2), records[2..].to_vec())
+        .await
+        .unwrap_err();
+    assert_eq!(next.code(), afs_error::CONFIG_INVALID);
+    assert!(next.to_string().contains("declared tail changed"), "{next}");
+    drop((old, new));
+    // Recovery keeps the older writer's frame: the newer writer's
+    // acknowledged term-2 group is gone. This is why the local backend's
+    // contract requires a working flock on exclusive local storage.
+    let reopened = LocalLog::open(dir.path(), LocalLogOptions::default()).unwrap();
+    let replay = reopened.recover().await.unwrap();
+    assert_eq!(replay.tip.sequence, 2);
+    assert_ne!(replay.tip, acknowledged);
+    drop(reopened);
+    assert_eq!(wal_terms(dir.path()), [1, 1]);
+}
+
+/// R63 D: each open writes CURRENT. That write must never be refused by the
+/// checkpoint image budget, which retained corrupt images or quarantined
+/// temporaries may fill; otherwise a directory that opened before cannot
+/// open again and Meta cannot start.
+#[tokio::test]
+async fn open_is_not_refused_when_checkpoint_image_budget_is_full() {
+    let limits = LocalCheckpointLimits {
+        image_max_bytes: 256,
+        validation_charge_max_bytes: 1024,
+        disk_max_bytes: 256 * 1024,
+        files_max: 5,
+    };
+    for (files, bytes) in [(4usize, 16usize), (1, 255 * 1024)] {
+        let dir = tempfile::tempdir().unwrap();
+        let log =
+            LocalLog::open_with_checkpoint_limits(dir.path(), LocalLogOptions::default(), limits)
+                .unwrap();
+        let tip = log
+            .append_and_sync(LogTip::EMPTY.at(1), test_records(1))
+            .await
+            .unwrap();
+        drop(log);
+        // Retained, unvalidatable images still consume the image budget.
+        for number in 0..files {
+            fs::write(
+                dir.path()
+                    .join(format!("checkpoint-{number:020}-corrupt.bin")),
+                vec![9u8; bytes / files],
+            )
+            .unwrap();
+        }
+        assert!(
+            checkpoint_budget(dir.path(), 1, 1, limits).is_err(),
+            "image budget is full"
+        );
+        let log =
+            LocalLog::open_with_checkpoint_limits(dir.path(), LocalLogOptions::default(), limits)
+                .expect("open must still select its writer term");
+        let recovered = log.recover().await.unwrap();
+        assert_eq!((recovered.term, recovered.tip), (2, tip));
+        log.append_and_sync(tip.at(2), test_records(2)[1..].to_vec())
+            .await
+            .unwrap();
+        drop(log);
+        LocalLog::open_with_checkpoint_limits(dir.path(), LocalLogOptions::default(), limits)
+            .expect("repeated opens keep working");
+    }
+}

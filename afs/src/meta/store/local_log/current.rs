@@ -230,8 +230,9 @@ pub(super) fn write_current(
 ) -> Result<()> {
     manifest.validate()?;
     let bytes = encode_current(manifest)?;
+    // The selector writes within its fixed reservation (see
+    // `checkpoint_budget`), so it is never refused by the image budget.
     quarantine_checkpoint_tmp(dir, "CURRENT.tmp", limits)?;
-    checkpoint_budget(dir, bytes.len() as u64, 1, limits)?;
     let tmp = dir.join("CURRENT.tmp");
     let mut file = open_file(&tmp, true)?;
     reserve_file(&file, bytes.len() as u64)?;

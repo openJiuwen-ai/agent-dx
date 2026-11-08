@@ -1,5 +1,18 @@
 //! Local canonical operation log. The legacy JSON backend is not read here.
 //! Two checked tail slots share the WAL's single group durability barrier.
+//!
+//! Writer exclusion contract: the directory `LOCK` (`flock`, held for the
+//! handle's lifetime) is the mutual exclusion; the writer term in `CURRENT`
+//! is a backstop. Every operation re-reads `CURRENT` and fails
+//! `META_LOG_FENCED` once a newer term is visible, but that check and the
+//! following write are not one atomic unit across processes. The directory
+//! must therefore be on exclusive local storage where `flock` works (not NFS,
+//! not a block device or directory shared by two hosts, and `LOCK` is never
+//! deleted while Meta runs). If the lock does not exclude an older writer and
+//! a newer writer opens and appends inside the older writer's check-then-write
+//! window, the older writer overwrites the newer writer's acknowledged group;
+//! the newer writer latches at its next operation
+//! (`lost_lock_window_between_term_check_and_write`).
 use std::{
     fs::{self, File, OpenOptions, TryLockError},
     io::{Read, Seek, SeekFrom, Write},
@@ -147,6 +160,10 @@ struct Inner {
     checkpoint_install: Mutex<()>,
     _lock: File,
     state: Mutex<LocalState>,
+    /// Test-only: runs once inside the next append, after the CURRENT term
+    /// and tip checks and before any byte is written.
+    #[cfg(test)]
+    before_write: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 impl Inner {
     fn ensure_owner(&self) -> Result<()> {
@@ -277,6 +294,8 @@ impl LocalLog {
                 checkpoint_limits,
                 checkpoint_install: Mutex::new(()),
                 _lock: lock,
+                #[cfg(test)]
+                before_write: Mutex::new(None),
                 state: Mutex::new(LocalState {
                     file: replay.file,
                     tip: replay.recovered.tip,
@@ -308,6 +327,14 @@ impl LocalLog {
     #[cfg(test)]
     pub(super) fn release_lock_for_takeover(&self) -> Result<()> {
         Ok(self.inner._lock.unlock()?)
+    }
+    /// Test-only: run `hook` once inside the next append, between the
+    /// CURRENT term check and the first written byte.
+    #[cfg(test)]
+    pub(super) fn pause_next_append_before_write(&self, hook: impl FnOnce() + Send + 'static) {
+        if let Ok(mut slot) = self.inner.before_write.lock() {
+            *slot = Some(Box::new(hook));
+        }
     }
     /// Test-only: replace the active WAL descriptor with a read-only one so the
     /// next append hits a real write(2) failure (EBADF) and latches.
@@ -565,12 +592,9 @@ impl LocalLog {
         } else {
             reference.bytes + IMAGE_HEADER as u64
         };
-        checkpoint_budget(
-            &inner.dir,
-            extra + MANIFEST_MAX as u64,
-            if exists { 1 } else { 2 },
-            limits,
-        )?;
+        // The CURRENT that selects this image is covered by the selector
+        // reservation inside `checkpoint_budget`.
+        checkpoint_budget(&inner.dir, extra, usize::from(!exists), limits)?;
         if exists {
             read_image(&inner.dir, inner.identity, reference, limits)?;
             open_file(&target, false)?.sync_all()?;
@@ -902,6 +926,15 @@ impl MetaLog for LocalLog {
                     .checked_add(1)
                     .ok_or_else(|| invalid_log("tail generation exhausted"))?;
                 let start = state.end;
+                #[cfg(test)]
+                if let Some(hook) = inner
+                    .before_write
+                    .lock()
+                    .ok()
+                    .and_then(|mut slot| slot.take())
+                {
+                    hook();
+                }
                 let result = (|| {
                     state.file.seek(SeekFrom::Start(start))?;
                     for frame in frames {

@@ -123,26 +123,41 @@ pub(super) fn read_image(
     })
 }
 
-fn checkpoint_owned(name: &str) -> bool {
+/// Files charged to the checkpoint image budget. `CURRENT` and
+/// `CURRENT.tmp` are not: they hold a fixed reservation (below) so selecting a
+/// writer term or a checkpoint is never refused because retained images or
+/// quarantined temporaries filled the image budget.
+fn image_budget_owned(name: &str) -> bool {
     name.starts_with("checkpoint-")
         || name == "checkpoint.tmp"
         || name.starts_with("orphan-checkpoint")
         || name.starts_with("orphan-CURRENT")
-        || name == CURRENT
-        || name == "CURRENT.tmp"
 }
 
+/// Permanent reservation for the selector: `CURRENT` plus one `CURRENT.tmp`
+/// (a stale one is quarantined before each write), each at most
+/// `MANIFEST_MAX`. `LocalCheckpointLimits::validate` already requires room for
+/// it beside three images.
+const SELECTOR_RESERVED_FILES: usize = 2;
+const SELECTOR_RESERVED_BYTES: u64 = 2 * MANIFEST_MAX as u64;
+
+/// Charge for writing image data: every image-budget file plus the selector
+/// reservation plus `extra_*` must stay within the configured limits.
 pub(super) fn checkpoint_budget(
     dir: &Path,
     extra_bytes: u64,
     extra_files: usize,
     limits: LocalCheckpointLimits,
 ) -> Result<()> {
-    let mut bytes = extra_bytes;
-    let mut files = extra_files;
+    let mut bytes = extra_bytes
+        .checked_add(SELECTOR_RESERVED_BYTES)
+        .ok_or_else(|| full("checkpoint disk charge overflow"))?;
+    let mut files = extra_files
+        .checked_add(SELECTOR_RESERVED_FILES)
+        .ok_or_else(|| full("checkpoint file count overflow"))?;
     for entry in fs::read_dir(dir)? {
         let entry = entry?;
-        if checkpoint_owned(&entry.file_name().to_string_lossy()) {
+        if image_budget_owned(&entry.file_name().to_string_lossy()) {
             let metadata = fs::symlink_metadata(entry.path())?;
             if !metadata.is_file() {
                 return Err(invalid_log("checkpoint entry is not regular file"));
