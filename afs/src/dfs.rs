@@ -181,6 +181,22 @@ pub struct DentryRecord {
     pub inode: InodeRecord,
 }
 
+/// One directory listing entry: what readdir needs, not the full inode.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirEntryRecord {
+    pub name: Vec<u8>,
+    pub inode_id: InodeId,
+    pub kind: InodeKind,
+}
+
+/// One page of a directory in name order (R72).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DirPage {
+    pub entries: Vec<DirEntryRecord>,
+    /// No entry follows the last one returned.
+    pub eof: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct MkdirRequest {
     pub caller_id: String,

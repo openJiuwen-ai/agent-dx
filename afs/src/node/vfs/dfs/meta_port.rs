@@ -71,7 +71,9 @@ pub trait DfsMeta: Send + Sync {
         attributes: InodeAttributes,
         caller: CallerContext,
     ) -> Result<InodeRecord>;
-    fn read_dir(&self, parent: &InodeId) -> Result<Vec<DentryRecord>>;
+    /// One page of `parent` in name order, strictly after `after` (empty starts
+    /// at the beginning); Meta caps `limit`.
+    fn read_dir_page(&self, parent: &InodeId, after: &[u8], limit: u32) -> Result<DirPage>;
     fn link(
         &self,
         operation_id: &OperationId,

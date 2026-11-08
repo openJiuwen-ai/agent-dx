@@ -81,20 +81,31 @@ impl crate::node::vfs::dfs::DfsMeta for GrpcDfsMeta {
         required(reply.inode, "DfsMkdir.inode").and_then(domain_dfs_inode)
     }
 
-    fn read_dir(
+    fn read_dir_page(
         &self,
         parent: &crate::dfs::InodeId,
-    ) -> afs_error::Result<Vec<crate::dfs::DentryRecord>> {
+        after: &[u8],
+        limit: u32,
+    ) -> afs_error::Result<crate::dfs::DirPage> {
         let reply = self
             .run(
                 self.client()
                     .read_dir(afs_protocol::meta::DfsReadDirRequest {
                         namespace_id: self.namespace_id.0.clone(),
                         parent_inode_id: parent.0.clone(),
+                        after_name: after.to_vec(),
+                        limit,
                     }),
             )?
             .into_inner();
-        reply.entries.into_iter().map(domain_dfs_dentry).collect()
+        Ok(crate::dfs::DirPage {
+            entries: reply
+                .entries
+                .into_iter()
+                .map(domain_dfs_dir_entry)
+                .collect::<afs_error::Result<_>>()?,
+            eof: reply.eof,
+        })
     }
 
     fn unlink(

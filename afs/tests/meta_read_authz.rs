@@ -164,6 +164,7 @@ fn read_dir() -> DfsReadDirRequest {
     DfsReadDirRequest {
         namespace_id: "default".into(),
         parent_inode_id: "1".into(),
+        ..Default::default()
     }
 }
 

@@ -1035,29 +1035,24 @@ impl Backend for DistributedFs {
                 std::io::ErrorKind::NotADirectory,
             )));
         }
-        let entries = self
-            .meta
-            .read_dir(&inode_id)?
-            .into_iter()
-            .map(|entry| self.directory_entry(entry))
-            .collect::<Result<Vec<_>>>()?;
         let id = self.handles.next_id();
+        let directory = DfsDirectoryHandle {
+            _gc_pin: self
+                .gc
+                .references
+                .as_ref()
+                .map(|references| references.pin(&inode_id, None))
+                .transpose()?,
+            inode_id,
+            entries: Vec::new(),
+            last_name: Vec::new(),
+            eof: false,
+        };
         self.handles
             .directories
             .lock()
             .map_err(|_| unavailable("DFS directory handle table is poisoned"))?
-            .insert(
-                id,
-                DfsDirectoryHandle {
-                    entries,
-                    _gc_pin: self
-                        .gc
-                        .references
-                        .as_ref()
-                        .map(|references| references.pin(&inode_id, None))
-                        .transpose()?,
-                },
-            );
+            .insert(id, Arc::new(Mutex::new(directory)));
         Ok(DirectoryHandle(id))
     }
 
@@ -1068,15 +1063,41 @@ impl Backend for DistributedFs {
         cookie: u64,
         max_entries: usize,
     ) -> Result<Vec<DirectoryEntry>> {
-        let handles = self
+        let directory = self
             .handles
             .directories
             .lock()
-            .map_err(|_| unavailable("DFS directory handle table is poisoned"))?;
-        let directory = handles
+            .map_err(|_| unavailable("DFS directory handle table is poisoned"))?
             .get(&handle.0)
+            .cloned()
             .ok_or_else(|| stale("DFS directory handle is no longer open"))?;
-        slice_directory_entries(directory.entries.clone(), cookie, max_entries)
+        // Only this handle waits for its page fetch; other handles proceed.
+        let mut directory = directory
+            .lock()
+            .map_err(|_| unavailable("DFS directory handle is poisoned"))?;
+        let start =
+            usize::try_from(cookie).map_err(|_| invalid("directory cookie is too large"))?;
+        let wanted = start.saturating_add(max_entries);
+        while directory.entries.len() < wanted && !directory.eof {
+            let page = self.meta.read_dir_page(
+                &directory.inode_id,
+                &directory.last_name,
+                READ_DIR_PAGE_ENTRIES,
+            )?;
+            if page.entries.is_empty() && !page.eof {
+                return Err(unavailable("DFS ReadDir returned an empty non-final page"));
+            }
+            directory.eof = page.eof;
+            for entry in page.entries {
+                if entry.name.as_slice() <= directory.last_name.as_slice() {
+                    return Err(unavailable("DFS ReadDir page is out of name order"));
+                }
+                directory.last_name.clone_from(&entry.name);
+                let row = self.directory_entry(entry)?;
+                directory.entries.push(row);
+            }
+        }
+        Ok(directory_slice(&directory.entries, start, max_entries))
     }
 
     fn fsyncdir(&self, _: &RequestContext, handle: DirectoryHandle, _: SyncMode) -> Result<()> {

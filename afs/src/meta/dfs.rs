@@ -13,16 +13,17 @@ use crate::clock::now_unix_ms;
 use crate::dfs::{
     CallerContext, ChunkObject, ChunkSources, ClaimReplicationTask, CommitFileVersion,
     CommitMetadataMode, CopyId, CopyLocation, CopyRecord, CopyRole, CopyState, Dentry, DentryKey,
-    DentryRecord, DfsChunkSourcesReply, DfsChunkSourcesRequest, DfsDurabilityPolicy, DfsReadGrant,
-    EffectiveLocalCopy, FileVersion, FileVersionId, GetXattrRequest, InodeAttributes, InodeId,
-    InodeKind, InodeRecord, LayoutRoot, LayoutRootId, LinkRequest, ListXattrRequest,
-    LocalCopyPolicy, MkdirRequest, MknodRequest, NamespaceId, OperationId, PlacementHealth,
-    PlacementRecord, PlacementSnapshot, ReadLinkRequest, RemoveXattrRequest, RenameMode,
-    RenameOutcome, RenameRequest, ReplicaAck, ReplicaGroup, ReplicaGroupId, ReplicaTarget,
-    ReplicaWriteGrant, ReplicationClaim, ReplicationConfig, ReplicationTask, ReplicationTaskId,
-    ReplicationTaskState, ReportChunkCorruption, ReportReplicationTask, RmdirRequest,
-    SetInodeAttrRequest, SetXattrRequest, SourceCandidate, SpecialNodeKind, SymlinkRequest,
-    SyncInodeMetadata, UnlinkRequest, ValidateReplicaWriteRequest, WriteLease, XattrSetMode,
+    DfsChunkSourcesReply, DfsChunkSourcesRequest, DfsDurabilityPolicy, DfsReadGrant,
+    DirEntryRecord, DirPage, EffectiveLocalCopy, FileVersion, FileVersionId, GetXattrRequest,
+    InodeAttributes, InodeId, InodeKind, InodeRecord, LayoutRoot, LayoutRootId, LinkRequest,
+    ListXattrRequest, LocalCopyPolicy, MkdirRequest, MknodRequest, NamespaceId, OperationId,
+    PlacementHealth, PlacementRecord, PlacementSnapshot, ReadLinkRequest, RemoveXattrRequest,
+    RenameMode, RenameOutcome, RenameRequest, ReplicaAck, ReplicaGroup, ReplicaGroupId,
+    ReplicaTarget, ReplicaWriteGrant, ReplicationClaim, ReplicationConfig, ReplicationTask,
+    ReplicationTaskId, ReplicationTaskState, ReportChunkCorruption, ReportReplicationTask,
+    RmdirRequest, SetInodeAttrRequest, SetXattrRequest, SourceCandidate, SpecialNodeKind,
+    SymlinkRequest, SyncInodeMetadata, UnlinkRequest, ValidateReplicaWriteRequest, WriteLease,
+    XattrSetMode,
 };
 
 use super::store::{
@@ -44,6 +45,11 @@ pub(super) use read_auth::serving_read_copy;
 pub(super) use repair::external_copy_matches;
 use repair::*;
 use replay::*;
+
+/// Most directory entries one `ReadDir` page returns. A slim entry is at
+/// most a 255-byte name, an inode id and a kind, so a page stays far below the
+/// gRPC message limit; the Node asks for pages as FUSE consumes them.
+pub const READ_DIR_PAGE_MAX: usize = 1024;
 
 #[derive(Clone)]
 pub struct DfsService {

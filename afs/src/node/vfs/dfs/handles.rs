@@ -86,7 +86,7 @@ pub(super) struct DfsHandleTable {
     shards: [HandleShard; DFS_HANDLE_SHARDS],
     by_inode: [InodeHandleIndex; DFS_HANDLE_SHARDS],
     next_handle: AtomicU64,
-    pub(super) directories: Mutex<HashMap<u64, DfsDirectoryHandle>>,
+    pub(super) directories: Mutex<HashMap<u64, Arc<Mutex<DfsDirectoryHandle>>>>,
 }
 
 impl Default for DfsHandleTable {
@@ -254,9 +254,18 @@ impl DfsHandleTable {
     }
 }
 
+/// An open directory lists Meta pages on demand (R72). Entries fetched so far
+/// stay in name order; a FUSE cookie is the index after an entry, so seekdir
+/// within the fetched range is exact. The next page starts strictly after the
+/// last fetched name, so an entry not changed while open appears exactly once.
 pub(super) struct DfsDirectoryHandle {
     pub(super) _gc_pin: Option<Arc<crate::node::gc::GcPin>>,
+    pub(super) inode_id: InodeId,
     pub(super) entries: Vec<DirectoryEntry>,
+    /// Raw name of the last fetched entry: the next page's cursor.
+    pub(super) last_name: Vec<u8>,
+    /// Meta reported no entry after `last_name`.
+    pub(super) eof: bool,
 }
 
 impl DistributedFs {

@@ -3322,6 +3322,7 @@ async fn dfs_namespace_mkdir_readdir_and_rmdir_update_directory_links() {
         .read_dir(Request::new(DfsReadDirRequest {
             namespace_id: "default".into(),
             parent_inode_id: dir.inode_id.clone(),
+            ..Default::default()
         }))
         .await
         .unwrap()

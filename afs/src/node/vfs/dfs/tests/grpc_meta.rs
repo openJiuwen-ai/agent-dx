@@ -310,8 +310,8 @@ impl DfsMeta for CapturingDfsMeta {
         )
     }
 
-    fn read_dir(&self, parent: &InodeId) -> Result<Vec<DentryRecord>> {
-        DfsMeta::read_dir(self.inner.as_ref(), parent)
+    fn read_dir_page(&self, parent: &InodeId, after: &[u8], limit: u32) -> Result<DirPage> {
+        DfsMeta::read_dir_page(self.inner.as_ref(), parent, after, limit)
     }
 
     fn link(

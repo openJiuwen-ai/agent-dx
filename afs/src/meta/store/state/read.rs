@@ -38,6 +38,12 @@ impl State {
                 namespace_id,
                 parent_inode_id,
             } => self.read_dfs_directory(namespace_id, parent_inode_id),
+            MetaRead::DfsDirectoryPage {
+                namespace_id,
+                parent_inode_id,
+                after,
+                limit,
+            } => self.read_dfs_directory_page(namespace_id, parent_inode_id, after, *limit),
             MetaRead::CurrentNodeSessions => self.read_current_node_sessions(),
             MetaRead::DfsPlacements => self.read_dfs_placements(),
             MetaRead::DfsPlacementPage { after, limit } => {
@@ -136,7 +142,7 @@ impl State {
             }
             MetaRead::RequestOutcome(_) => None,
             MetaRead::DfsDentry(key) => state.entities.get(&MetaKey::DfsDentry(key.clone())),
-            MetaRead::DfsDirectory { .. } => None,
+            MetaRead::DfsDirectory { .. } | MetaRead::DfsDirectoryPage { .. } => None,
             MetaRead::DfsInode(id) => state.entities.get(&MetaKey::DfsInode(id.clone())),
             MetaRead::DfsFileVersion(id) => {
                 state.entities.get(&MetaKey::DfsFileVersion(id.clone()))
@@ -207,6 +213,34 @@ impl State {
                 .map(|(_, versioned)| versioned.entity)
                 .collect(),
         )
+    }
+
+    /// Dentry keys are ordered by name within a directory, so a page is one
+    /// range scan from `after` (exclusive), like the placement page.
+    fn read_dfs_directory_page(
+        &self,
+        namespace_id: &crate::dfs::NamespaceId,
+        parent_inode_id: &crate::dfs::InodeId,
+        after: &[u8],
+        limit: usize,
+    ) -> (StoreRevision, Vec<MetaEntity>) {
+        let start = MetaKey::DfsDentry(crate::dfs::DentryKey {
+            namespace_id: namespace_id.clone(),
+            parent_inode_id: parent_inode_id.clone(),
+            name: after.to_vec(),
+        });
+        let entities = self
+            .entities
+            .starting_at(start.clone())
+            .take_while(|(key, _)| {
+                matches!(key, MetaKey::DfsDentry(key)
+                    if key.namespace_id == *namespace_id && key.parent_inode_id == *parent_inode_id)
+            })
+            .filter(|(key, _)| after.is_empty() || **key != start)
+            .take(limit)
+            .map(|(_, versioned)| versioned.entity.clone())
+            .collect();
+        (self.revision, entities)
     }
 
     fn read_current_node_sessions(&self) -> (StoreRevision, Vec<MetaEntity>) {

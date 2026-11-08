@@ -10,7 +10,7 @@ use afs_protocol::meta::{
     AcquireRootRequest, ActivateRootReply, ActivateRootRequest, CommitFileVersionReply,
     CommitFileVersionRequest, DeactivateRootReply, DeactivateRootRequest,
     DfsCallerContext as PbDfsCallerContext, DfsCommitMetadataMode, DfsCreateReply,
-    DfsCreateRequest, DfsDentryRecord as PbDfsDentryRecord, DfsGetXattrReply, DfsGetXattrRequest,
+    DfsCreateRequest, DfsDirEntry as PbDfsDirEntry, DfsGetXattrReply, DfsGetXattrRequest,
     DfsInodeAttributeUpdate as PbDfsInodeAttributeUpdate,
     DfsInodeAttributes as PbDfsInodeAttributes, DfsInodeKind as PbDfsInodeKind,
     DfsInodeRecord as PbDfsInodeRecord, DfsLayoutRoot as PbDfsLayoutRoot, DfsLinkReply,

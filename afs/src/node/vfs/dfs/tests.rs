@@ -142,6 +142,11 @@ struct RecordingMeta {
     get_inode_calls: AtomicUsize,
     xattr_calls: AtomicUsize,
     next_xattr_error: Mutex<Option<Error>>,
+    /// Directory listing served by `read_dir_page`, keyed (and so ordered) by name.
+    dir_entries: Mutex<std::collections::BTreeMap<Vec<u8>, DirEntryRecord>>,
+    /// Largest page `read_dir_page` returns, standing in for Meta's cap.
+    dir_page_cap: AtomicUsize,
+    dir_page_calls: AtomicUsize,
 }
 
 impl RecordingMeta {
@@ -200,6 +205,9 @@ impl RecordingMeta {
             current_session_calls: AtomicUsize::new(0),
             current_session_async_calls: AtomicUsize::new(0),
             resolve_write_async_calls: AtomicUsize::new(0),
+            dir_entries: Mutex::new(std::collections::BTreeMap::new()),
+            dir_page_cap: AtomicUsize::new(1024),
+            dir_page_calls: AtomicUsize::new(0),
             file_version_loads: AtomicUsize::new(0),
             renew_calls: AtomicUsize::new(0),
             open_write_calls: AtomicUsize::new(0),
@@ -570,8 +578,16 @@ impl DfsMeta for RecordingMeta {
         Ok(inode)
     }
 
-    fn read_dir(&self, _: &InodeId) -> Result<Vec<DentryRecord>> {
-        Ok(Vec::new())
+    fn read_dir_page(&self, _: &InodeId, after: &[u8], limit: u32) -> Result<DirPage> {
+        self.dir_page_calls.fetch_add(1, Ordering::SeqCst);
+        let take = (limit as usize).min(self.dir_page_cap.load(Ordering::SeqCst));
+        let entries = self.dir_entries.lock().unwrap();
+        let mut after_cursor = entries
+            .range::<[u8], _>((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+            .map(|(_, entry)| entry.clone());
+        let page: Vec<_> = after_cursor.by_ref().take(take).collect();
+        let eof = after_cursor.next().is_none();
+        Ok(DirPage { entries: page, eof })
     }
 
     fn unlink(
@@ -1772,6 +1788,7 @@ impl RemoteDfsOwner for ScriptedReleaseRemoteDfsOwner {
 }
 
 mod commit;
+mod directories;
 mod dirty_index;
 mod error_delivery;
 mod grpc_meta;

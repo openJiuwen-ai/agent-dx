@@ -737,11 +737,6 @@ message DfsCreateReply {
 }
 
 
-message DfsDentryRecord {
-  bytes name = 1;
-  DfsInodeRecord inode = 2;
-}
-
 message DfsMkdirRequest {
   string caller_id = 1;
   string operation_id = 2;
@@ -756,13 +751,29 @@ message DfsMkdirReply {
   DfsInodeRecord inode = 1;
 }
 
+// One page of a directory in name order. `after_name` is exclusive; empty
+// starts at the beginning (no entry has an empty name). Meta caps `limit`;
+// 0 asks for the cap.
 message DfsReadDirRequest {
   string namespace_id = 1;
   string parent_inode_id = 2;
+  bytes after_name = 3;
+  uint32 limit = 4;
+}
+
+// Only what a directory listing needs; attributes come from LOOKUP/GETATTR.
+message DfsDirEntry {
+  bytes name = 1;
+  string inode_id = 2;
+  DfsInodeKind kind = 3;
+  DfsSpecialNode special_node = 4;
 }
 
 message DfsReadDirReply {
-  repeated DfsDentryRecord entries = 1;
+  reserved 1;
+  // True when no entry follows the last one returned.
+  bool eof = 2;
+  repeated DfsDirEntry entries = 3;
 }
 
 message DfsUnlinkRequest {

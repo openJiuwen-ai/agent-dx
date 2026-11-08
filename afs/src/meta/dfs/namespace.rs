@@ -406,36 +406,52 @@ impl DfsService {
         )
     }
 
-    pub async fn read_dir(
+    /// One page of a directory in name order, strictly after `after` (empty
+    /// starts at the beginning), at most `limit` entries capped at
+    /// [`READ_DIR_PAGE_MAX`] (0 asks for the cap). Each page reads one consistent view; across pages
+    /// a name cursor keeps every entry not changed meanwhile exactly once (R72).
+    pub async fn read_dir_page(
         &self,
         namespace_id: NamespaceId,
         parent_inode_id: InodeId,
-    ) -> Result<Vec<DentryRecord>> {
+        after: Vec<u8>,
+        limit: usize,
+    ) -> Result<DirPage> {
         require_id(&namespace_id.0, "namespace_id")?;
         require_id(&parent_inode_id.0, "parent_inode_id")?;
+        let limit = if limit == 0 {
+            READ_DIR_PAGE_MAX
+        } else {
+            limit.min(READ_DIR_PAGE_MAX)
+        };
         let view = self.store.read_view().await?;
         let parent = inode_from_view(&view, &namespace_id, parent_inode_id.clone()).await?;
         if parent.kind != InodeKind::Directory {
             return Err(not_directory("DFS readdir target is not a directory"));
         }
+        // One extra entry tells whether the page ends the directory.
         let snapshot = view
-            .read(MetaRead::DfsDirectory {
+            .read(MetaRead::DfsDirectoryPage {
                 namespace_id: namespace_id.clone(),
                 parent_inode_id,
+                after,
+                limit: limit + 1,
             })
             .await?;
-        let mut records = Vec::with_capacity(snapshot.entities.len());
-        for entity in snapshot.entities {
+        let eof = snapshot.entities.len() <= limit;
+        let mut entries = Vec::with_capacity(snapshot.entities.len().min(limit));
+        for entity in snapshot.entities.into_iter().take(limit) {
             let MetaEntity::DfsDentry(dentry) = entity else {
                 continue;
             };
             let inode = inode_from_view(&view, &namespace_id, dentry.inode_id).await?;
-            records.push(DentryRecord {
+            entries.push(DirEntryRecord {
                 name: dentry.key.name,
-                inode,
+                inode_id: inode.inode_id,
+                kind: inode.kind,
             });
         }
-        Ok(records)
+        Ok(DirPage { entries, eof })
     }
 
     pub async fn unlink(&self, request: UnlinkRequest) -> Result<InodeRecord> {

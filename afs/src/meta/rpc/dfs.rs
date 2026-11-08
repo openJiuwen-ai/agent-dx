@@ -196,15 +196,18 @@ impl DfsMetaService for DfsMetaRpc {
         let request = request.into_inner();
         require_text(&request.namespace_id, "namespace_id")?;
         require_text(&request.parent_inode_id, "parent_inode_id")?;
-        let entries = dfs_service(&self.0)?
-            .read_dir(
+        let page = dfs_service(&self.0)?
+            .read_dir_page(
                 crate::dfs::NamespaceId::new(request.namespace_id),
                 crate::dfs::InodeId::new(request.parent_inode_id),
+                request.after_name,
+                usize::try_from(request.limit).unwrap_or(usize::MAX),
             )
             .await
             .map_err(afs_transport::grpc::error_status::error_to_status)?;
         Ok(Response::new(DfsReadDirReply {
-            entries: entries.into_iter().map(wire_dfs_dentry).collect(),
+            eof: page.eof,
+            entries: page.entries.into_iter().map(wire_dfs_dir_entry).collect(),
         }))
     }
 

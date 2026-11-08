@@ -220,23 +220,22 @@ pub(super) fn caller_context(ctx: &RequestContext) -> CallerContext {
     }
 }
 
-pub(super) fn slice_directory_entries(
-    mut rows: Vec<DirectoryEntry>,
-    cookie: u64,
+/// `max_entries` entries from index `start` of an already name-ordered list;
+/// each entry's cookie is the index after it.
+pub(super) fn directory_slice(
+    rows: &[DirectoryEntry],
+    start: usize,
     max_entries: usize,
-) -> Result<Vec<DirectoryEntry>> {
-    let start = usize::try_from(cookie).map_err(|_| invalid("directory cookie is too large"))?;
-    rows.sort_by(|left, right| left.name.cmp(&right.name));
-    Ok(rows
-        .into_iter()
+) -> Vec<DirectoryEntry> {
+    rows.iter()
         .enumerate()
         .skip(start)
         .take(max_entries)
-        .map(|(index, mut entry)| {
-            entry.next_cookie = u64::try_from(index + 1).unwrap_or(u64::MAX);
-            entry
+        .map(|(index, entry)| DirectoryEntry {
+            next_cookie: u64::try_from(index + 1).unwrap_or(u64::MAX),
+            ..entry.clone()
         })
-        .collect())
+        .collect()
 }
 
 pub(super) fn rename_mode(flags: RenameFlags) -> Result<RenameMode> {

@@ -115,13 +115,13 @@ impl DistributedFs {
         self.inode_map.get_or_create(inode)
     }
 
-    pub(super) fn directory_entry(&self, entry: DentryRecord) -> Result<DirectoryEntry> {
-        let inode = self.validate_inode(entry.inode)?;
-        let kind = file_kind(inode.kind);
+    /// A listing entry from a ReadDir page: names the inode in this
+    /// namespace; its attributes come from LOOKUP/GETATTR.
+    pub(super) fn directory_entry(&self, entry: DirEntryRecord) -> Result<DirectoryEntry> {
         Ok(DirectoryEntry {
             name: OsString::from_vec(entry.name),
-            inode: self.backend_inode(&inode.inode_id)?,
-            kind,
+            inode: self.backend_inode(&entry.inode_id)?,
+            kind: file_kind(entry.kind),
             next_cookie: 0,
         })
     }

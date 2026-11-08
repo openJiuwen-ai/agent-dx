@@ -72,9 +72,13 @@ pub(super) fn add_backend_entries(
     offset: u64,
     entries: &[DirectoryEntry],
 ) {
-    if offset == 0 {
-        let _ = reply.add(INodeNo(parent), 1, FileType::Directory, ".");
-        let _ = reply.add(INodeNo(ROOT_INO), 2, FileType::Directory, "..");
+    // Cookies 1 and 2 are "." and ".."; a backend entry's cookie is its
+    // backend cookie plus 2, so every entry has a distinct resume point.
+    if offset == 0 && reply.add(INodeNo(parent), 1, FileType::Directory, ".") {
+        return;
+    }
+    if offset <= 1 && reply.add(INodeNo(ROOT_INO), 2, FileType::Directory, "..") {
+        return;
     }
     for entry in entries {
         let fuse_entry = Entry {
@@ -93,15 +97,20 @@ pub(super) fn add_backend_entries(
             },
         };
         let ino = state.remember_readdir_entry(&fuse_entry);
-        let cookie = entry.next_cookie.max(3);
+        let cookie = entry.next_cookie.saturating_add(DOT_ENTRIES);
         if reply.add(INodeNo(ino), cookie, file_type(entry.kind), &entry.name) {
             break;
         }
     }
 }
 
+/// "." and ".." precede the backend's entries in every listing.
+const DOT_ENTRIES: u64 = 2;
+
+/// The backend cookie to resume from after FUSE `offset` (see
+/// `add_backend_entries`): 0 until both dot entries have been returned.
 pub(super) fn backend_cookie(offset: u64) -> u64 {
-    if offset <= 2 { 0 } else { offset }
+    offset.saturating_sub(DOT_ENTRIES)
 }
 
 pub(super) fn file_attr(ino: u64, attributes: &FileAttributes) -> FileAttr {
@@ -441,4 +450,27 @@ pub(super) fn errno_xattr(
         FailureGrade::Error => record!(error),
     }
     errno
+}
+
+#[cfg(test)]
+mod cookie_tests {
+    use super::*;
+
+    /// R72: backend entry `i` reports next_cookie `i + 1`; its FUSE cookie
+    /// is distinct from "." (1), ".." (2) and every other entry, and resuming
+    /// from it continues with entry `i + 1`. The first three entries used to
+    /// share cookie 3.
+    #[test]
+    fn readdir_cookies_are_distinct_and_resume_after_each_entry() {
+        let mut seen = std::collections::HashSet::from([1, 2]);
+        for index in 0..10u64 {
+            let cookie = (index + 1).saturating_add(DOT_ENTRIES);
+            assert!(seen.insert(cookie), "entry {index} reuses cookie {cookie}");
+            assert_eq!(backend_cookie(cookie), index + 1);
+        }
+        assert_eq!(backend_cookie(0), 0);
+        assert_eq!(backend_cookie(1), 0);
+        assert_eq!(backend_cookie(2), 0);
+        assert_eq!(backend_cookie(u64::MAX), u64::MAX - 2);
+    }
 }

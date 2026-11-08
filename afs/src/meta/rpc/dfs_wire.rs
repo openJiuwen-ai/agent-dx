@@ -2,10 +2,24 @@
 
 use super::*;
 
-pub(super) fn wire_dfs_dentry(entry: crate::dfs::DentryRecord) -> PbDfsDentryRecord {
-    PbDfsDentryRecord {
+pub(super) fn wire_dfs_dir_entry(entry: crate::dfs::DirEntryRecord) -> PbDfsDirEntry {
+    PbDfsDirEntry {
         name: entry.name,
-        inode: Some(wire_dfs_inode(entry.inode)),
+        inode_id: entry.inode_id.0,
+        kind: wire_dfs_inode_kind(entry.kind),
+        special_node: match entry.kind {
+            crate::dfs::InodeKind::Special(kind) => Some(wire_dfs_special_node(kind)),
+            _ => None,
+        },
+    }
+}
+
+fn wire_dfs_inode_kind(kind: crate::dfs::InodeKind) -> i32 {
+    match kind {
+        crate::dfs::InodeKind::Regular => PbDfsInodeKind::Regular as i32,
+        crate::dfs::InodeKind::Directory => PbDfsInodeKind::Directory as i32,
+        crate::dfs::InodeKind::Symlink => PbDfsInodeKind::Symlink as i32,
+        crate::dfs::InodeKind::Special(_) => PbDfsInodeKind::Special as i32,
     }
 }
 
@@ -13,12 +27,7 @@ pub(super) fn wire_dfs_inode(inode: crate::dfs::InodeRecord) -> PbDfsInodeRecord
     PbDfsInodeRecord {
         namespace_id: inode.namespace_id.0,
         inode_id: inode.inode_id.0,
-        kind: match inode.kind {
-            crate::dfs::InodeKind::Regular => PbDfsInodeKind::Regular as i32,
-            crate::dfs::InodeKind::Directory => PbDfsInodeKind::Directory as i32,
-            crate::dfs::InodeKind::Symlink => PbDfsInodeKind::Symlink as i32,
-            crate::dfs::InodeKind::Special(_) => PbDfsInodeKind::Special as i32,
-        },
+        kind: wire_dfs_inode_kind(inode.kind),
         attributes: Some(PbDfsInodeAttributes {
             mode: inode.attributes.mode,
             uid: inode.attributes.uid,

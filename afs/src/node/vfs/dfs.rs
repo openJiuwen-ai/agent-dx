@@ -93,12 +93,12 @@ use super::{
 use crate::{
     dfs::{
         CallerContext, ChunkObject, ChunkReceipt, CommitFileVersion, CommitMetadataDelta,
-        CommitMetadataMode, DentryRecord, DfsWriteSessionId, Extent, FileVersion, FileVersionId,
-        GetXattrRequest, InodeAttrUpdate, InodeAttributes, InodeId, InodeKind, InodeRecord,
-        LayoutRoot, LayoutRootId, ListXattrRequest, MknodRequest, NamespaceId, OperationId,
-        ReadLinkRequest, RemoveXattrRequest, RenameMode, RenameOutcome, SetInodeAttrRequest,
-        SetXattrRequest, SpecialNodeKind, SymlinkRequest, SyncInodeMetadata, WriteLease,
-        XattrSetMode,
+        CommitMetadataMode, DfsWriteSessionId, DirEntryRecord, DirPage, Extent, FileVersion,
+        FileVersionId, GetXattrRequest, InodeAttrUpdate, InodeAttributes, InodeId, InodeKind,
+        InodeRecord, LayoutRoot, LayoutRootId, ListXattrRequest, MknodRequest, NamespaceId,
+        OperationId, ReadLinkRequest, RemoveXattrRequest, RenameMode, RenameOutcome,
+        SetInodeAttrRequest, SetXattrRequest, SpecialNodeKind, SymlinkRequest, SyncInodeMetadata,
+        WriteLease, XattrSetMode,
     },
     node::chunk::{
         BodyRelease, ChunkBuilder, ChunkSink, DirtyAdmission, DirtyBudget, DirtyOwner, PutIntent,
@@ -117,6 +117,8 @@ const DEFAULT_VERSION_CACHE_BYTES: usize = 32 * 1024 * 1024;
 // How long a captured Node read-authority snapshot is reused before it is
 // captured again. Renewal is local and never moves a handle's version.
 const NATIVE_READ_VIEW_TTL: Duration = Duration::from_secs(5);
+/// Entries the Node asks Meta for per ReadDir page; Meta caps it too.
+const READ_DIR_PAGE_ENTRIES: u32 = 1024;
 const COMMIT_CHUNK_BYTES: u64 = crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u64;
 const MAX_PENDING_REMOTE_RELEASES: usize = 1024;
 const REMOTE_RELEASE_MAINTENANCE_BUDGET: std::time::Duration =

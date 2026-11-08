@@ -29,12 +29,40 @@ pub(super) fn wire_dfs_attr_update(
 }
 
 #[cfg(feature = "dfs")]
-pub(super) fn domain_dfs_dentry(
-    entry: afs_protocol::meta::DfsDentryRecord,
-) -> afs_error::Result<crate::dfs::DentryRecord> {
-    Ok(crate::dfs::DentryRecord {
+pub(super) fn domain_dfs_dir_entry(
+    entry: afs_protocol::meta::DfsDirEntry,
+) -> afs_error::Result<crate::dfs::DirEntryRecord> {
+    if entry.name.is_empty() || entry.inode_id.is_empty() {
+        return Err(Error::coded(
+            afs_error::CLIENT_PROTOCOL_VIOLATION,
+            "DfsDirEntry has an empty name or inode id",
+        ));
+    }
+    Ok(crate::dfs::DirEntryRecord {
         name: entry.name,
-        inode: domain_dfs_inode(required(entry.inode, "DfsDentryRecord.inode")?)?,
+        inode_id: crate::dfs::InodeId::new(entry.inode_id),
+        kind: domain_dfs_inode_kind(entry.kind, entry.special_node)?,
+    })
+}
+
+#[cfg(feature = "dfs")]
+fn domain_dfs_inode_kind(
+    kind: i32,
+    special_node: Option<afs_protocol::meta::DfsSpecialNode>,
+) -> afs_error::Result<crate::dfs::InodeKind> {
+    Ok(match afs_protocol::meta::DfsInodeKind::try_from(kind) {
+        Ok(afs_protocol::meta::DfsInodeKind::Regular) => crate::dfs::InodeKind::Regular,
+        Ok(afs_protocol::meta::DfsInodeKind::Directory) => crate::dfs::InodeKind::Directory,
+        Ok(afs_protocol::meta::DfsInodeKind::Symlink) => crate::dfs::InodeKind::Symlink,
+        Ok(afs_protocol::meta::DfsInodeKind::Special) => crate::dfs::InodeKind::Special(
+            domain_dfs_special_node(required(special_node, "special_node")?)?,
+        ),
+        _ => {
+            return Err(Error::coded(
+                afs_error::CLIENT_PROTOCOL_VIOLATION,
+                "DFS entry has an invalid inode kind",
+            ));
+        }
     })
 }
 
@@ -58,20 +86,7 @@ pub(super) fn domain_dfs_inode(
     inode: afs_protocol::meta::DfsInodeRecord,
 ) -> afs_error::Result<crate::dfs::InodeRecord> {
     let attributes = required(inode.attributes, "DfsInodeRecord.attributes")?;
-    let kind = match afs_protocol::meta::DfsInodeKind::try_from(inode.kind) {
-        Ok(afs_protocol::meta::DfsInodeKind::Regular) => crate::dfs::InodeKind::Regular,
-        Ok(afs_protocol::meta::DfsInodeKind::Directory) => crate::dfs::InodeKind::Directory,
-        Ok(afs_protocol::meta::DfsInodeKind::Symlink) => crate::dfs::InodeKind::Symlink,
-        Ok(afs_protocol::meta::DfsInodeKind::Special) => crate::dfs::InodeKind::Special(
-            domain_dfs_special_node(required(inode.special_node, "DfsInodeRecord.special_node")?)?,
-        ),
-        _ => {
-            return Err(Error::coded(
-                afs_error::CLIENT_PROTOCOL_VIOLATION,
-                "DfsInodeRecord has an invalid inode kind",
-            ));
-        }
-    };
+    let kind = domain_dfs_inode_kind(inode.kind, inode.special_node)?;
     Ok(crate::dfs::InodeRecord {
         namespace_id: crate::dfs::NamespaceId::new(inode.namespace_id),
         inode_id: crate::dfs::InodeId::new(inode.inode_id),

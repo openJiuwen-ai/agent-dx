@@ -350,6 +350,14 @@ pub enum MetaRead {
         namespace_id: NamespaceId,
         parent_inode_id: InodeId,
     },
+    /// At most `limit` dentries of a directory in name order, strictly after
+    /// `after` (empty starts at the beginning).
+    DfsDirectoryPage {
+        namespace_id: NamespaceId,
+        parent_inode_id: InodeId,
+        after: Vec<u8>,
+        limit: usize,
+    },
     /// The dentry naming a directory inode, whose key holds its parent.
     DfsDirectoryParent {
         namespace_id: NamespaceId,

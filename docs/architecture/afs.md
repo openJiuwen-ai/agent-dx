@@ -143,7 +143,7 @@ RDMA 握手）。读写两端都用这些常量，不再散落 magic／版本字
   `catalog.wal` 与请求摘要只由 golden 钉住。
 - **未上线不做兼容**：旧格式直接拒绝，不提供迁移或旧版本识别分支。
 - **协议**：`RegisterNodeRequest.protocol_version` 是集群线协议代际（Node↔Meta 注册、Node↔Node service
-  布局），当前为 4，定义在 `afs_protocol::CLUSTER_PROTOCOL_VERSION`；由 Node 填当前版本，Meta 在读写任何状态前校验，
+  布局），当前为 5（S4a 的 `ReadDir` 分页），定义在 `afs_protocol::CLUSTER_PROTOCOL_VERSION`；由 Node 填当前版本，Meta 在读写任何状态前校验，
   不符（含缺省 0）返回 `META_NODE_PROTOCOL_VERSION`（`0x03050001`，FailedPrecondition）且不登记会话，
   Node 初始注册不重试该错误。DFS 与 OwnerFs Node 走同一注册路径。Node↔Node 通道本身不握手，
   依赖经 Meta 准入的同版本部署，service 布局变化必须升代际；RDMA 握手版本沿用 `NODE_RDMA_HANDSHAKE_VERSION`。
@@ -675,6 +675,13 @@ DFS普通I/O沿用cached write-through，不启用writeback。默认entry/attr T
 它不是跨节点读许可或撤销协议。内核已收到的页面
 没有再次进入用户态授权检查的机会，不能宣传为可立即撤回的载荷；新open和用户态交付
 仍遵循权限与授权合同。正TTL是明确的宽松路径模式，不满足严格close-to-open。
+
+DFS目录列举按页进行：`DfsMeta.ReadDir`带名字游标`after_name`（不含）与`limit`，Meta每页至多1024项
+（`READ_DIR_PAGE_MAX`），按名字顺序返回只含名字、inode id与类型的精简条目及`eof`；属性由LOOKUP/GETATTR取。
+opendir只校验目录并持GC pin，不取条目；readdir按FUSE需要逐页取，句柄内累积已取条目，cookie为条目
+序号，seekdir回到已取范围内精确定位。每页是一个一致视图，跨页由名字游标续接，所以打开期间未被修改的
+项恰好出现一次，期间增删的项可出现可不出现。FUSE层cookie 1、2固定给"."和".."，后端条目cookie为后端
+cookie加2（DFS与OwnerFs同一规则），每项有独立的续接点。
 
 OwnerFs使用同一接收／worker配置，其Home缓存、TTL、direct-I/O及mmap协商保持独立。
 DFS的版本复用与read-ahead设置不覆盖OwnerFs策略。read-ahead是向内核请求的上限，
