@@ -910,6 +910,17 @@ SDK 活跃导入及待清理任务合计最多 64 个；取消/丢失回复由�
 Drop 仅安排有界后台清理，失败持有 fd/配额重试，显式 unregister 才是确认交回的接口。
 这不承诺跨 Node 已打开缓存 fd 的即时一致性或任意 POSIX/SDK 并发混写。
 
+**客户端进程退出时的回收**（R18，`node/api/usrbio/owner.rs`）。路径式句柄、iov、注册和环都归
+创建它的客户端进程所有，进程由 UDS 对端凭据（`SO_PEERCRED` 的 pid）确定；SDK 的连接会重建或
+并行多条，所以归属按进程而不按连接，与 3FS 按 pid 回收相同。Node 为每个归属进程开一个 pidfd，
+由一条后台线程统一 poll；进程无论怎样退出（含 `kill -9`），pidfd 都变为可读，且不会被复用同一
+pid 的新进程混淆。回收顺序与显式调用的要求一致：先停环并 join worker（worker 把未执行的提交以
+`NODE_VFS_UNAVAILABLE` 失败完成），再删注册，再像内核关闭 FUSE fd 那样 flush 并释放句柄，最后
+解除 iov 映射。仍被别的进程的注册引用的句柄保留；POSIX fd 导入的注册仍由 FUSE release 撤销。
+显式 close/destroy 过的资源不再回收。回收数计入 `afs_usrbio_ring_io_total` 的
+`reclaimed_ring`、`reclaimed_registration`、`reclaimed_handle`、`reclaimed_iov`，日志
+`usrbio.client_reclaimed`。`fork` 后的子进程不继承父进程资源的归属：父进程退出即回收。
+
 ## OwnerFs workspace bind mount
 
 OwnerFs workspace bind mount 是当前实际试用场景的优先能力，默认 OFF。开启后，它把 Home 上 workspace 的底层真实目录 bind 到独立原生 `ownerfs_workspace_egress_root` 下的同名一级目录。egress root 必须在 OwnerFs FUSE 挂载和 Node 数据目录之外；FUSE 子树仍保留，不以 bind 覆盖。把 FUSE 目录自身 bind 到别处不满足此设计。

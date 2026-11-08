@@ -50,7 +50,7 @@ use tokio::{net::UnixListener, sync::oneshot, task::JoinHandle};
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::{Request, Response, Status, transport::Server};
 
-use crate::node::api::usrbio::{FdBridge, OpenAccess, UsrbioHub};
+use crate::node::api::usrbio::{FdBridge, OpenAccess, Owned, UsrbioHub};
 use crate::node::diagnostics::{DiagnosticLocalDataService, DiagnosticStorage};
 use crate::node::vfs::{Backend, types};
 use afs_protocol::local_api::{DfsFdSessionReply, DfsFdSessionRequest};
@@ -314,16 +314,19 @@ impl DfsLocalData for DfsLocalDataService {
         &self,
         request: Request<DfsOpenRequest>,
     ) -> Result<Response<DfsOpenReply>, Status> {
+        let pid = local_peer_pid(&request);
         let request = request.into_inner();
         let outcome = async {
             let hub = self.hub()?.clone();
             let access = open_access(request.access)?;
             let (namespace, path) = (request.namespace_id.clone(), request.path.clone());
             let executor = hub.executor().clone();
+            let opener = hub.clone();
             let (value, length) = executor
-                .run(move || hub.open(&namespace, &path, access))
+                .run(move || opener.open(&namespace, &path, access))
                 .await
                 .map_err(error_to_status)?;
+            hub.adopt(pid, Owned::Handle(value.clone()));
             Ok(DfsOpenReply {
                 handle: Some(DfsFileHandle { value }),
                 // 版本身份目前无法从 `Backend` 取得（trait 没有版本访问器），因此留空表示
@@ -385,6 +388,7 @@ impl DfsLocalData for DfsLocalDataService {
         &self,
         request: Request<DfsIovCreateRequest>,
     ) -> Result<Response<DfsIovCreateReply>, Status> {
+        let pid = local_peer_pid(&request);
         let request = request.into_inner();
         let outcome = async {
             let hub = self.hub()?;
@@ -409,6 +413,7 @@ impl DfsLocalData for DfsLocalDataService {
                 return Err(shm_invalid_status("iov grant offset must be zero"));
             }
             let iov_id = hub.create_iov(fd, layout).map_err(error_to_status)?;
+            hub.adopt(pid, Owned::Iov(iov_id));
             Ok(DfsIovCreateReply {
                 iov_id,
                 block_size: block_size as u64,
@@ -440,11 +445,13 @@ impl DfsLocalData for DfsLocalDataService {
         &self,
         request: Request<DfsRegisterFileRequest>,
     ) -> Result<Response<DfsRegisterFileReply>, Status> {
+        let pid = local_peer_pid(&request);
         let request = request.into_inner();
         let outcome = async {
             let hub = self.hub()?;
             let handle = handle_value(request.handle)?;
             let reg_id = hub.register_file(&handle).map_err(error_to_status)?;
+            hub.adopt(pid, Owned::Registration(reg_id));
             Ok(DfsRegisterFileReply {
                 reg_id,
                 file_version_id: String::new(),
@@ -475,6 +482,7 @@ impl DfsLocalData for DfsLocalDataService {
         &self,
         request: Request<DfsRingCreateRequest>,
     ) -> Result<Response<DfsRingCreateReply>, Status> {
+        let pid = local_peer_pid(&request);
         let owner = if request.get_ref().fd_session_key.is_empty() {
             None
         } else {
@@ -536,6 +544,7 @@ impl DfsLocalData for DfsLocalDataService {
                     session,
                 )
                 .map_err(error_to_status)?;
+            hub.adopt(pid, Owned::Ring(ring_id));
             Ok(DfsRingCreateReply {
                 ring_id,
                 entries: layout.entries(),
@@ -631,6 +640,16 @@ fn local_peer_uid<T>(request: &Request<T>) -> Result<u32, Status> {
                 "fd operations require authenticated UDS credentials",
             )
         })
+}
+
+/// The calling process, from the UDS peer credentials; it owns what it creates
+/// (R18). `None` when the transport carries no credentials.
+fn local_peer_pid<T>(request: &Request<T>) -> Option<i32> {
+    request
+        .extensions()
+        .get::<tonic::transport::server::UdsConnectInfo>()
+        .and_then(|info| info.peer_cred.as_ref())
+        .and_then(tokio::net::unix::UCred::pid)
 }
 
 fn invalid_status(message: impl Into<String>) -> Status {

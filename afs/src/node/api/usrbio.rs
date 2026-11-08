@@ -12,8 +12,10 @@
 //! - 后端句柄在仍被注册时不能被关闭，否则环里的请求会指向已释放的句柄。
 
 mod fd;
+mod owner;
 pub use fd::FdBridge;
 pub(crate) use fd::FdSession;
+pub(crate) use owner::{Owned, Reclaimed};
 
 use std::{
     collections::HashMap,
@@ -125,6 +127,15 @@ impl RingMetrics {
             self.io.with_label_values(&[event]).inc_by(value);
         }
     }
+
+    /// Resources released because their client process exited (R18).
+    fn record_reclaim(&self, done: Reclaimed) {
+        let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+        self.record("reclaimed_ring", count(done.rings));
+        self.record("reclaimed_registration", count(done.registrations));
+        self.record("reclaimed_handle", count(done.handles));
+        self.record("reclaimed_iov", count(done.iovs));
+    }
 }
 
 /// 一条环的活动计数。
@@ -211,6 +222,8 @@ struct HubState {
     registrations: HashMap<u32, RegisteredFile>,
     iovs: HashMap<u64, Arc<IovEntry>>,
     rings: HashMap<u64, RingEntry>,
+    /// Which client process created each resource (R18).
+    owners: owner::Owners,
     next_handle: u64,
     next_registration: u32,
     next_iov: u64,
@@ -237,6 +250,7 @@ impl HubState {
             registrations: HashMap::new(),
             iovs: HashMap::new(),
             rings: HashMap::new(),
+            owners: owner::Owners::default(),
             next_handle: 1,
             next_registration: 1,
             next_iov: 1,
@@ -338,6 +352,19 @@ impl BackendThread {
     }
 }
 
+/// Stops a ring removed from the table and joins its worker.
+fn stop_ring(ring_id: u64, entry: RingEntry) {
+    entry.stop.store(true, Ordering::Release);
+    // worker 可能正阻塞在门铃上，必须先把它叫醒才会看到 stop 标志。
+    entry.doorbell.ring();
+    // 客户端可能正阻塞在完成通知上；环要销毁了，必须让它返回而不是永久等待。
+    entry.completion.ring();
+    if let Some(Err(error)) = entry.worker.map(|worker| worker.join()) {
+        afs_logging::warn!("usrbio.ring_worker_join_failed";
+            "ring_id" => ring_id, "error" => format!("{error:?}"));
+    }
+}
+
 /// usrbio 注册表。控制面 RPC 与环 worker 共享同一份状态。
 pub(crate) struct UsrbioHub {
     backend: Arc<dyn Backend>,
@@ -350,6 +377,8 @@ pub(crate) struct UsrbioHub {
     identity: types::RequestContext,
     /// 与环 worker 共享；worker 只在查表时短暂持有。
     state: Arc<Mutex<HubState>>,
+    /// Started with the first owned resource; `None` if it could not start.
+    owner_watch: OnceLock<Option<owner::ProcessWatch>>,
 }
 
 /// 建环需要的三个跨进程 fd。
@@ -385,6 +414,55 @@ impl UsrbioHub {
             namespace,
             identity: process_identity(),
             state,
+            owner_watch: OnceLock::new(),
+        }
+    }
+
+    /// Records that client process `pid` created `resource`, so the resource
+    /// is reclaimed when that process exits (R18). Without a pid (no peer
+    /// credentials) nothing is recorded and only explicit calls release it.
+    pub(crate) fn adopt(&self, pid: Option<i32>, resource: Owned) {
+        let Some(pid) = pid else {
+            return;
+        };
+        if !self.lock().owners.adopt(pid, resource) {
+            return;
+        }
+        let watch = self.owner_watch.get_or_init(|| {
+            let metrics = self.metrics.clone();
+            owner::ProcessWatch::start(
+                Arc::downgrade(&self.state),
+                self.backend.clone(),
+                Some(Box::new(move |done: Reclaimed| {
+                    if let Some(metrics) = &metrics {
+                        metrics.record_reclaim(done);
+                    }
+                })),
+            )
+            .inspect_err(|error| {
+                afs_logging::warn!("usrbio.owner_watch_unavailable";
+                    "error" => error.to_string());
+            })
+            .ok()
+        });
+        match watch.as_ref().map(|watch| watch.watch(pid)) {
+            Some(Ok(())) | None => {}
+            Some(Err(error)) if error.raw_os_error() == Some(libc::ESRCH) => {
+                // The client exited before it could be watched. Reclaim off
+                // this (possibly async) thread: closing handles may block.
+                let (state, backend) = (self.state.clone(), self.backend.clone());
+                let spawned = thread::Builder::new()
+                    .name("afs-usrbio-reclaim".into())
+                    .spawn(move || owner::reclaim(&state, backend.as_ref(), pid));
+                if let Err(error) = spawned {
+                    afs_logging::warn!("usrbio.owner_reclaim_unavailable"; "pid" => pid,
+                        "error" => error.to_string());
+                }
+            }
+            Some(Err(error)) => {
+                afs_logging::warn!("usrbio.owner_watch_failed"; "pid" => pid,
+                    "error" => error.to_string());
+            }
         }
     }
 
@@ -480,6 +558,7 @@ impl UsrbioHub {
         let Some(opened) = state.opened.remove(handle) else {
             return Err(invalid("unknown DFS file handle"));
         };
+        state.owners.forget(&Owned::Handle(handle.to_vec()));
         drop(state);
         let flushed = self.backend.flush(&opened.ctx, opened.handle);
         let released = self.backend.release(&opened.ctx, opened.handle);
@@ -539,6 +618,7 @@ impl UsrbioHub {
         if state.rings.values().any(|ring| ring.iov_id == iov_id) {
             return Err(invalid("iov is still bound to a ring"));
         }
+        state.owners.forget(&Owned::Iov(iov_id));
         state
             .iovs
             .remove(&iov_id)
@@ -581,6 +661,7 @@ impl UsrbioHub {
                 "POSIX registrations require the fd handoff control",
             ));
         }
+        state.owners.forget(&Owned::Registration(registration));
         state
             .registrations
             .remove(&registration)
@@ -704,20 +785,13 @@ impl UsrbioHub {
     pub(crate) fn destroy_ring(&self, ring_id: u64) -> Result<(), Error> {
         let entry = {
             let mut state = self.lock();
+            state.owners.forget(&Owned::Ring(ring_id));
             state
                 .rings
                 .remove(&ring_id)
                 .ok_or_else(|| invalid("unknown ring id"))?
         };
-        entry.stop.store(true, Ordering::Release);
-        // worker 可能正阻塞在门铃上，必须先把它叫醒才会看到 stop 标志。
-        entry.doorbell.ring();
-        // 客户端可能正阻塞在完成通知上；环要销毁了，必须让它返回而不是永久等待。
-        entry.completion.ring();
-        if let Some(Err(error)) = entry.worker.map(|worker| worker.join()) {
-            afs_logging::warn!("usrbio.ring_worker_join_failed";
-                "ring_id" => ring_id, "error" => format!("{error:?}"));
-        }
+        stop_ring(ring_id, entry);
         Ok(())
     }
 
@@ -728,13 +802,7 @@ impl UsrbioHub {
             std::mem::take(&mut state.rings)
         };
         for (ring_id, entry) in entries {
-            entry.stop.store(true, Ordering::Release);
-            entry.doorbell.ring();
-            entry.completion.ring();
-            if let Some(Err(error)) = entry.worker.map(|worker| worker.join()) {
-                afs_logging::warn!("usrbio.ring_worker_join_failed";
-                    "ring_id" => ring_id, "error" => format!("{error:?}"));
-            }
+            stop_ring(ring_id, entry);
         }
     }
 

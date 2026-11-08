@@ -2103,3 +2103,125 @@ async fn local_sdk_batches_writes_and_reads() {
     iov.destroy().await.expect("destroy iov");
     server.shutdown().await.expect("shutdown");
 }
+
+/// A client process that can be killed: `sleep` holds a pid until SIGKILL.
+fn client_process() -> std::process::Child {
+    std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn client process")
+}
+
+fn owned_count(hub: &UsrbioHub) -> (usize, usize, usize, usize) {
+    let state = hub.lock();
+    (
+        state.rings.len(),
+        state.registrations.len(),
+        state.opened.len(),
+        state.iovs.len(),
+    )
+}
+
+fn wait_owned(hub: &UsrbioHub, expected: (usize, usize, usize, usize)) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if owned_count(hub) == expected {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    false
+}
+
+/// R18: everything a client created is released once it is `kill -9`ed, in
+/// the safe order: the ring worker stops (and fails what was queued) before
+/// its registration and iov go, and the handle is flushed then released.
+#[test]
+fn a_killed_client_has_its_ring_registration_handle_and_iov_reclaimed() {
+    let f = RingFixture::new("usrbio-reclaim", 0, 100, 4);
+    let (handle, _) = f
+        .hub
+        .open("default", "/data.bin", OpenAccess::ReadWrite)
+        .expect("open");
+    let reg_id = f.hub.register_file(&handle).expect("register");
+    let mut client = client_process();
+    let pid = Some(i32::try_from(client.id()).expect("pid"));
+    f.hub.adopt(pid, Owned::Handle(handle.clone()));
+    f.hub.adopt(pid, Owned::Registration(reg_id));
+    f.hub.adopt(pid, Owned::Iov(f.iov_id));
+    f.hub.adopt(pid, Owned::Ring(f.ring_id));
+    // A write queued but never run: the reclaimed ring must complete it as failed.
+    let mut allocator = IovAllocator::new(f.layout);
+    f.queue_write(&mut allocator, reg_id, 0, b"lost", 7);
+    assert_eq!(owned_count(&f.hub), (1, 1, 1, 1));
+
+    client.kill().expect("kill -9 the client");
+    client.wait().expect("reap the client");
+
+    assert!(
+        wait_owned(&f.hub, (0, 0, 0, 0)),
+        "a dead client's resources must be reclaimed: {:?}",
+        owned_count(&f.hub)
+    );
+    assert!(f.hub.ring_stats(f.ring_id).is_none());
+    let calls = f.backend.handle_calls.lock().expect("calls").clone();
+    assert_eq!(calls, ["flush", "release"]);
+    // Explicit calls on reclaimed ids report unknown ids, never panic.
+    assert!(f.hub.destroy_ring(f.ring_id).is_err());
+    assert!(f.hub.unregister_file(reg_id).is_err());
+    assert!(f.hub.close(&handle).is_err());
+    assert!(f.hub.destroy_iov(f.iov_id).is_err());
+}
+
+/// A live client keeps its resources, and one that released them explicitly
+/// leaves nothing for the reclaim to touch.
+#[test]
+fn live_clients_keep_their_resources_and_explicit_release_is_not_repeated() {
+    let f = RingFixture::new("usrbio-live", 0, 100, 4);
+    let (handle, _) = f
+        .hub
+        .open("default", "/data.bin", OpenAccess::ReadOnly)
+        .expect("open");
+    let me = Some(i32::try_from(std::process::id()).expect("pid"));
+    f.hub.adopt(me, Owned::Handle(handle.clone()));
+    f.hub.adopt(me, Owned::Iov(f.iov_id));
+    f.hub.adopt(me, Owned::Ring(f.ring_id));
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        owned_count(&f.hub),
+        (1, 0, 1, 1),
+        "a live client must not be reclaimed"
+    );
+
+    let mut client = client_process();
+    let pid = Some(i32::try_from(client.id()).expect("pid"));
+    let (other, _) = f
+        .hub
+        .open("default", "/data.bin", OpenAccess::ReadOnly)
+        .expect("open");
+    f.hub.adopt(pid, Owned::Handle(other.clone()));
+    f.hub.close(&other).expect("explicit close");
+    client.kill().expect("kill -9 the client");
+    client.wait().expect("reap the client");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(owned_count(&f.hub), (1, 0, 1, 1));
+    let calls = f.backend.handle_calls.lock().expect("calls").clone();
+    assert_eq!(calls, ["flush", "release"], "the explicit close ran once");
+}
+
+/// A client that is already gone when its first resource is recorded is
+/// reclaimed right away.
+#[test]
+fn a_client_gone_before_it_is_watched_is_reclaimed_at_once() {
+    let backend = Arc::new(MemoryBackend::new(64));
+    let hub = UsrbioHub::new(backend.clone(), None);
+    let mut client = client_process();
+    let pid = Some(i32::try_from(client.id()).expect("pid"));
+    client.kill().expect("kill -9 the client");
+    client.wait().expect("reap the client");
+    let (handle, _) = hub
+        .open("default", "/data.bin", OpenAccess::ReadOnly)
+        .expect("open");
+    hub.adopt(pid, Owned::Handle(handle));
+    assert!(wait_owned(&hub, (0, 0, 0, 0)));
+}
