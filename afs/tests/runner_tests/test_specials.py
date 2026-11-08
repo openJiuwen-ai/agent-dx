@@ -69,10 +69,10 @@ class ProfileTests(unittest.TestCase):
         basic = common.select(cases, suite="all-basic")
         self.assertEqual(len(basic), 22)
         self.assertTrue(all(c.profile is None and c.purpose == "functional" for c in basic))
-        self.assertEqual(len(common.select(cases, suite="local-write-special")), 5)
+        self.assertEqual(len(common.select(cases, suite="local-write-special")), 6)
         self.assertEqual(len(common.select(cases, suite="cluster-read-special")), 4)
         specials = common.select(cases, suite="all-special")
-        self.assertEqual(len(specials), 18)
+        self.assertEqual(len(specials), 20)
         self.assertTrue(all(c.purpose == "functional" for c in specials))
 
 

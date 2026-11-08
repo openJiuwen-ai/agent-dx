@@ -39,6 +39,7 @@ class DfsProfile:
     read_crc_mode: str | None = None
     readahead_max_bytes: int | None = None
     kernel_readahead_bytes: int | None = None
+    replica_failure: str | None = None
 
     def __post_init__(self):
         if not is_integer(self.node_count) or self.node_count not in (2, 3):
@@ -54,12 +55,16 @@ class DfsProfile:
                 raise ValueError("invalid DFS profile " + name)
         if self.read_crc_mode not in (None, "off", "receiver"):
             raise ValueError("invalid DFS read CRC mode")
+        if self.replica_failure not in (None, "degrade", "strict"):
+            raise ValueError("invalid DFS replica failure policy")
 
     def meta_config(self):
         return (
             f"dfs_desired_copies = {self.copies}\ndfs_sync_required_copies = {self.copies}\n"
             f"dfs_min_distinct_nodes = {self.copies}\ndfs_min_distinct_failure_domains = 1\n"
             'dfs_local_copy = "required"\n'
+        ) + (
+            f'dfs_replica_failure_policy = "{self.replica_failure}"\n' if self.replica_failure else ""
         )
 
     def node_config(self):

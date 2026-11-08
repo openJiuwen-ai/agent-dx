@@ -476,7 +476,7 @@ AFS技术边界见 [测试合同](../../docs/testing/afs.md)。K8s组件定向�
 
 | 集合 | 当前行为范围 | 配置与边界 |
 | --- | --- | --- |
-| `local-write-special` / `cluster-write-special` | 跨fd覆盖/截断顺序；O_SYNC/O_DSYNC/close-only/并发append；有界接纳下同文件及独立文件fsync推进；必需副本失败恢复；失败close退役 | 各5项。显式64MiB前台额度；R2例只启动A/B两个Node并要求两个不同Node的持久副本。256MiB压力不冒充实测队列峰值、严格公平性或时延SLA |
+| `local-write-special` / `cluster-write-special` | 跨fd覆盖/截断顺序；O_SYNC/O_DSYNC/close-only/并发append；有界接纳下同文件及独立文件fsync推进；`strict`下必需副本失败恢复与失败close退役；默认`degrade`下副本Node停止时写入成功、恢复后两份副本一致 | 各6项。显式64MiB前台额度；R2例只启动A/B两个Node并要求两个不同Node的持久副本。256MiB压力不冒充实测队列峰值、严格公平性或时延SLA |
 | `local-read-special` / `cluster-read-special` | off/receiver/both三种CRC模式下的远端非对齐/跨块/EOF正确性；显式direct顺序读触发预取、seek/close后缓冲释放；cached首读/同fd/重开正确性及direct专用预取门控 | 各5项。固定open授权显式开启以覆盖原生句柄路径；不加强旧fd一致性。不把正向CRC测试记成损坏注入/坏副本恢复，也不把cached内容正确当作缓存驻留或零RPC证明 |
 | `all-special` | 上述单机和隔离节点专项的并集 | 20项，使用matrix环境；不含性能，不替代`all-basic`或完整AFS验收 |
 | `local-performance` | 顺序写交付/同步完成测量资产及远端读测量资产 | 两个测量入口，默认拒绝执行。不是受控基线比较或性能准入，不能用PASS代表性能无退化 |

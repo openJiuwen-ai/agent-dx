@@ -1,6 +1,7 @@
 """Migrated ordinary-write semantics; no throughput or elapsed-time acceptance."""
 
 import json
+import time
 from pathlib import Path
 
 from fixtures.common import Case, DfsProfile
@@ -88,6 +89,24 @@ def recovery(c):
     failed_replica(c, "recover")
 
 
+def degraded(c):
+    """R12 default: with B stopped the write still commits on A, then repair copies it to B."""
+    data = b"degraded-write" * 75000
+    c.stop("B")
+    c.write("A", "degraded", data)
+    c.read("A", "degraded", data)
+    c.start("B")
+    for attempt in range(60):
+        try:
+            physical_replicas(c)
+            break
+        except AssertionError:
+            if attempt == 59:
+                raise
+            time.sleep(1)
+    c.read("B", "degraded", data)
+
+
 def failed_close(c):
     failed_replica(c, "close")
 
@@ -95,14 +114,18 @@ def failed_close(c):
 def cases():
     result = []
     for prefix, tag in [("local", "local-write-special"), ("cluster", "cluster-write-special")]:
-        for name, function, copies in [
-            ("cross_handle_order", order, 1), ("sync_append_close", barriers, 1),
-            ("bounded_sync_progress", bounded, 2), ("required_replica_recovery", recovery, 2),
-            ("failed_close_retirement", failed_close, 2),
+        # The failed-replica cases keep the strict contract: a write fails until B returns.
+        for name, function, copies, failure in [
+            ("cross_handle_order", order, 1, None), ("sync_append_close", barriers, 1, None),
+            ("bounded_sync_progress", bounded, 2, None),
+            ("required_replica_recovery", recovery, 2, "strict"),
+            ("failed_close_retirement", failed_close, 2, "strict"),
+            ("degraded_replica_write", degraded, 2, None),
         ]:
             result.append(Case(
                 "dfs.write." + prefix + "." + name, (tag,), "dfs", (), function,
-                profile=DfsProfile(copies=copies, node_count=2, write_queue_bytes=64 * 1024**2),
+                profile=DfsProfile(copies=copies, node_count=2, write_queue_bytes=64 * 1024**2,
+                                   replica_failure=failure),
             ))
     return tuple(result)
 
