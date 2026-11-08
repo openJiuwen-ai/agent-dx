@@ -7,6 +7,8 @@ impl MetaService for MetaRpc {
     async fn ping(&self, request: Request<PingRequest>) -> Result<Response<PingReply>, Status> {
         let span = afs_tracing::tracing::info_span!("meta.ping");
         let _entered = span.enter();
+        // R41 (model M0): every Meta RPC requires a trusted-node certificate.
+        let _authenticated = authenticated_node_id(&self.0, &request)?;
         let message = self
             .0
             .ping(&request.into_inner().node_id)
@@ -111,6 +113,9 @@ impl MetaService for MetaRpc {
         &self,
         request: Request<LookupNodeRequest>,
     ) -> Result<Response<LookupNodeReply>, Status> {
+        // R41 (model M0): node addresses and lease epochs are served only to
+        // trusted nodes, as every other Meta read is.
+        let _authenticated = authenticated_node_id(&self.0, &request)?;
         let request = request.into_inner();
         require_text(&request.node_id, "node_id")?;
         let session = self

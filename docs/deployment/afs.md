@@ -173,11 +173,19 @@ sudo adxctl validate
 证书绑定表不能替代 TLS 配置；启用 OwnerFs 或 DFS 权威的 Meta 缺少 mTLS 时，
 必须在监听端口和打开持久后端前拒绝启动。
 
-Meta 的 DFS 读 RPC（`Lookup`、`ReadDir`、`ReadLink`、`GetInode`、`GetFileVersion`、
-`GetXattr`、`ListXattr`）只接受能映射到 `trusted_node_certs` 中某个 Node 的证书；同一
-CA 签发但不在该表中的证书会收到 permission denied。这些 RPC 只校验证书属于受信
-Node，不绑定请求里的调用者，也不做逐调用者授权：部署按单一信任域对待，引入多租户
-前必须补齐。
+**Meta 读授权模型（M0，单一信任域）**：一个 AFS 集群就是一个信任域，任何受信 Node
+（证书能映射到 `trusted_node_certs` 中某个 Node）都可以读全部 DFS 元数据。
+Meta 的每个 gRPC 都要求这样的证书：写类与授权类 RPC 还校验请求中声明的
+caller／holder／owner 等于证书对应的 Node；DFS 读 RPC（`Lookup`、`ReadDir`、`ReadLink`、
+`GetInode`、`GetFileVersion`、`GetXattr`、`ListXattr`）以及 `Ping`、`LookupNode` 只校验证书
+属于受信 Node，不绑定请求里的调用者或会话，也不按 namespace 授权。同一 CA 签发但不在
+该表中的证书会收到 permission denied（单测 `meta_read_authz`）。`GetXattr`／`ListXattr`
+按请求中的 uid／gid 做 POSIX 权限判断，这些值由调用 Node 自报，Meta 不能验证，节点内用户身份
+由 Node 负责。多租户（按 Node／会话或 namespace 授权）不在当前范围，引入前必须另行设计。
+
+Meta 与 Node 的 REST 端口（`rest_listen`，默认 `127.0.0.1:7401`／`127.0.0.1:7501`）是本机运维面：
+明文 HTTP、无鉴权，暴露健康、指标、Store 统计、root 位置与 chunk 副本状态等只读信息。
+**只应监听回环地址**；确需从其他主机访问时，须在前面放置有鉴权的代理，不能直接监听公网或集群网段。
 
 组件间持续传输加密统一由顶层 `tls_encryption_enabled` 控制，Node／Meta默认均为
 false；可在TOML或CLI（`--tls-encryption-enabled true|false`）覆盖。false仍需要

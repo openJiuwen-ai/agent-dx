@@ -1,6 +1,7 @@
 #![cfg(feature = "dfs")]
 
-//! Meta read RPCs accept only certificates that map to a trusted node.
+//! Meta read RPCs accept only certificates that map to a trusted node
+//! (R41, model M0: one trust domain; a trusted node may read all DFS metadata).
 
 use std::{collections::HashMap, path::Path, process::Command, sync::Arc, time::Duration};
 
@@ -9,16 +10,18 @@ use afs::{
     meta::{
         Meta,
         dfs::{CreateFileRequest, DfsService},
-        rpc::DfsMetaRpc,
+        rpc::{DfsMetaRpc, MetaRpc},
         store::{MetaStore, Store, journal::MemoryLog},
     },
     runtime::Observability,
 };
 use afs_protocol::meta::{
-    DfsLookupRequest, DfsReadDirRequest, DfsReadLinkRequest, GetDfsInodeRequest,
-    GetFileVersionRequest,
+    DfsCallerContext, DfsGetXattrRequest, DfsListXattrRequest, DfsLookupRequest, DfsReadDirRequest,
+    DfsReadLinkRequest, GetDfsInodeRequest, GetFileVersionRequest, LookupNodeRequest, PingRequest,
     dfs_meta_client::DfsMetaClient,
     dfs_meta_server::{DfsMeta, DfsMetaServer},
+    meta_client::MetaClient,
+    meta_server::MetaServer,
 };
 use afs_transport::{SecurityManager, TlsConfig};
 use tokio::net::TcpListener;
@@ -181,6 +184,29 @@ fn get_inode(inode: &str) -> GetDfsInodeRequest {
     }
 }
 
+fn caller() -> Option<DfsCallerContext> {
+    Some(DfsCallerContext {
+        uid: 0,
+        gid: 0,
+        supplementary_gids: Vec::new(),
+    })
+}
+
+fn get_xattr(inode: &str) -> DfsGetXattrRequest {
+    DfsGetXattrRequest {
+        inode_id: inode.into(),
+        name: b"user.none".to_vec(),
+        caller: caller(),
+    }
+}
+
+fn list_xattr(inode: &str) -> DfsListXattrRequest {
+    DfsListXattrRequest {
+        inode_id: inode.into(),
+        caller: caller(),
+    }
+}
+
 fn get_file_version() -> GetFileVersionRequest {
     GetFileVersionRequest {
         version_id: "no-such-version".into(),
@@ -217,6 +243,7 @@ impl MtlsMeta {
         let security = SecurityManager::new(tls(dir.path(), "meta")).unwrap();
         let server = tokio::spawn(async move {
             Server::builder()
+                .add_service(MetaServer::new(MetaRpc(Arc::clone(&meta))))
                 .add_service(DfsMetaServer::new(DfsMetaRpc(meta)))
                 .serve_with_incoming(security.incoming(TcpListenerStream::new(listener)).unwrap())
                 .await
@@ -230,12 +257,20 @@ impl MtlsMeta {
         }
     }
 
-    async fn client(&self, name: &str) -> DfsMetaClient<Channel> {
+    async fn channel(&self, name: &str) -> Channel {
         let security = SecurityManager::new(tls(self.dir.path(), name)).unwrap();
         let endpoint = Endpoint::from_shared(security.endpoint_uri(&self.endpoint))
             .unwrap()
             .timeout(Duration::from_secs(5));
-        DfsMetaClient::new(security.connect(endpoint).await.unwrap())
+        security.connect(endpoint).await.unwrap()
+    }
+
+    async fn client(&self, name: &str) -> DfsMetaClient<Channel> {
+        DfsMetaClient::new(self.channel(name).await)
+    }
+
+    async fn meta_client(&self, name: &str) -> MetaClient<Channel> {
+        MetaClient::new(self.channel(name).await)
     }
 }
 
@@ -268,7 +303,37 @@ async fn read_rpcs_reject_a_same_ca_certificate_outside_the_trusted_node_list() 
                 .await
                 .unwrap_err(),
         ),
+        (
+            "get_xattr",
+            client.get_xattr(get_xattr(inode)).await.unwrap_err(),
+        ),
+        (
+            "list_xattr",
+            client.list_xattr(list_xattr(inode)).await.unwrap_err(),
+        ),
     ];
+    let mut meta_client = meta.meta_client("outsider").await;
+    let errors = errors.into_iter().chain([
+        (
+            "ping",
+            meta_client
+                .ping(PingRequest {
+                    node_id: "node-a".into(),
+                })
+                .await
+                .unwrap_err(),
+        ),
+        (
+            "lookup_node",
+            meta_client
+                .lookup_node(LookupNodeRequest {
+                    request_id: "lookup".into(),
+                    node_id: "node-a".into(),
+                })
+                .await
+                .unwrap_err(),
+        ),
+    ]);
     for (rpc, error) in errors {
         assert_eq!(error.code(), Code::PermissionDenied, "{rpc}: {error:?}");
         assert!(
@@ -309,6 +374,22 @@ async fn read_rpcs_serve_a_trusted_node_certificate() {
     ] {
         assert_ne!(error.code(), Code::PermissionDenied, "{error:?}");
     }
+    let mut meta_client = meta.meta_client("node-a").await;
+    meta_client
+        .ping(PingRequest {
+            node_id: "node-a".into(),
+        })
+        .await
+        .unwrap();
+    let node = meta_client
+        .lookup_node(LookupNodeRequest {
+            request_id: "lookup".into(),
+            node_id: "node-a".into(),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!node.found, "the fixture registers no node session");
 }
 
 #[tokio::test]

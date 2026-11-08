@@ -103,6 +103,8 @@ DFS 的 `copy_file_range` 通过元数据 COW 为目标创建独立 FileVersion�
 `trusted_node_certs`。CA 只证明证书链可信；Meta 还把握手得到的叶证书 DER 精确
 映射到一个 Node ID，并校验 RPC 中声明的 caller／holder／owner 身份。DFS-only
 部署与 OwnerFs 部署执行同一身份绑定，不能用另一张同 CA 证书冒充目标 Node。
+读授权按单一信任域（M0）：DFS 元数据读、`Ping` 与 `LookupNode` 只要求受信 Node 证书，
+不绑定调用者、会话或 namespace；REST 是只读本机运维面，只监听回环。
 Node 的 Meta、peer control 和 data 诊断请求复用同一生产认证及加密配置，诊断不绕过证书认证。
 这里的 Node ID 绑定发生在服务端对调用方的校验中；客户端仍按 CA 和
 `tls_server_name` 验证服务端，不承诺按目标 Node ID 对服务端证书逐一 pinning。
