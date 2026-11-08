@@ -15,6 +15,11 @@ pub struct PeerConnectionPool {
     pub(super) config: afs_transport::GrpcConfig,
     security: afs_transport::SecurityManager,
     capacity: usize,
+    /// Runtime that drives every pooled channel's connection task (R82). A
+    /// channel is shared by sync owner clients, which block on private
+    /// current-thread runtimes, and by the async read path on the Node runtime;
+    /// dialing under a private runtime would park the connection there.
+    channel_runtime: Option<tokio::runtime::Handle>,
     pub(super) state: tokio::sync::Mutex<PeerPoolState>,
     #[cfg(feature = "dfs")]
     pub(super) stream_work: Arc<PeerStreamWorkPool>,
@@ -51,6 +56,7 @@ impl PeerConnectionPool {
             config,
             security,
             capacity,
+            channel_runtime: None,
             state: tokio::sync::Mutex::new(PeerPoolState::default()),
             #[cfg(feature = "dfs")]
             read_crc_mode: crate::config::DfsReadCrcMode::Both,
@@ -59,6 +65,14 @@ impl PeerConnectionPool {
             #[cfg(feature = "dfs")]
             read_work_metrics: None,
         })
+    }
+
+    /// Dial every pooled channel on `runtime`, normally the Node runtime that
+    /// outlives every client of this pool.
+    #[must_use]
+    pub(crate) fn with_channel_runtime(mut self, runtime: tokio::runtime::Handle) -> Self {
+        self.channel_runtime = Some(runtime);
+        self
     }
 
     #[cfg(feature = "dfs")]
@@ -178,6 +192,8 @@ impl PeerConnectionPool {
         } else {
             DFS_PEER_RECEIVE_FRAME_BYTES
         });
+        // tonic spawns the connection task where the channel is built.
+        let _channel_runtime = self.channel_runtime.as_ref().map(|runtime| runtime.enter());
         let channel = self.security.connect_lazy(endpoint).map_err(|error| {
             afs_error::Error::coded(afs_error::CLIENT_ARGUMENT_INVALID, error.to_string())
         })?;

@@ -318,7 +318,13 @@ fn peer_connections(
         },
         cfg.tls_config(),
         64,
-    )?;
+    )?
+    .with_channel_runtime(tokio::runtime::Handle::try_current().map_err(|error| {
+        afs_error::Error::coded(
+            afs_error::CLIENT_WORKER_FAILED,
+            format!("Peer connection pool needs the Node runtime: {error}"),
+        )
+    })?);
     #[cfg(feature = "dfs")]
     let peer_connections = peer_connections
         .with_read_work_metrics(storage.dfs.read_work_metrics.clone())

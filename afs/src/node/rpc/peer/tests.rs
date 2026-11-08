@@ -1643,6 +1643,57 @@ async fn grpc_client_rejects_read_reply_shape_mismatch() {
     server.abort();
 }
 
+/// R82: an owner client built on a FUSE thread blocks on its own private
+/// current-thread runtime. The first pooled channel it dials must still serve
+/// the async read path on the Node runtime while that private runtime is idle.
+#[test]
+fn pooled_channel_first_dialed_on_a_private_runtime_serves_the_node_runtime() {
+    let node = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (endpoint, server) = node.block_on(spawn_bad_data_server(BadReplyKind::ReadShape));
+    let pool = node.block_on(async {
+        PeerConnectionPool::new(
+            afs_transport::GrpcConfig::default(),
+            afs_transport::TlsConfig::Disabled,
+            4,
+        )
+        .unwrap()
+        .with_channel_runtime(tokio::runtime::Handle::current())
+    });
+    let private = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let channel = std::thread::scope(|scope| {
+        scope
+            .spawn(|| private.block_on(pool.channel("node-a", 1, &endpoint)))
+            .join()
+            .unwrap()
+    })
+    .unwrap();
+
+    let reply = node.block_on(async {
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            NodeDataClient::new(channel).read(DataReadRequest {
+                session_id: 0,
+                transfer: DataTransfer::GrpcInline.into(),
+                name: "first.bin".to_owned(),
+                offset: 0,
+                length: 8,
+            }),
+        )
+        .await
+    });
+
+    let reply = reply.expect("pooled channel stalled until the private runtime ran again");
+    assert_eq!(reply.unwrap().into_inner().data, b"short".to_vec());
+    node.block_on(async { server.abort() });
+}
+
 #[tokio::test]
 async fn grpc_client_rejects_write_count_mismatch() {
     let (endpoint, server) = spawn_bad_data_server(BadReplyKind::WriteCount).await;
