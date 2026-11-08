@@ -738,3 +738,33 @@ fn statfs_returns_unsupported_when_chunk_backend_has_no_capacity_capability() {
         open_writes_before
     );
 }
+
+/// D-S4-2: a time before 1970 cannot be stored; setattr refuses it with
+/// EINVAL instead of silently storing 1970-01-01, and changes nothing.
+#[test]
+fn setattr_refuses_times_before_1970_instead_of_storing_the_epoch() {
+    let (_temp, meta, fs) = test_fs();
+    let inode_id = meta.inode.lock().unwrap().inode_id.clone();
+    let inode = fs.backend_inode(&inode_id).unwrap();
+    let before = meta.inode.lock().unwrap().attributes.clone();
+    let old = std::time::UNIX_EPOCH - Duration::from_secs(10 * 365 * 24 * 3600);
+    for change in [
+        AttributeChange {
+            mtime: Some(old),
+            ..AttributeChange::default()
+        },
+        AttributeChange {
+            atime: Some(old),
+            ..AttributeChange::default()
+        },
+    ] {
+        let error = fs.setattr(&context(), inode, None, &change).unwrap_err();
+        assert_eq!(crate::error::errno(&error), libc::EINVAL);
+    }
+    assert_eq!(meta.inode.lock().unwrap().attributes, before);
+    let epoch = AttributeChange {
+        mtime: Some(std::time::UNIX_EPOCH + Duration::from_millis(1)),
+        ..AttributeChange::default()
+    };
+    fs.setattr(&context(), inode, None, &epoch).unwrap();
+}

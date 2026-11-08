@@ -88,6 +88,7 @@ SHM 的 memfd、sealing 与原子 CLOEXEC FD 传递实现及对应运行测试�
 - 中心 Meta `local-file` 是当前可重启恢复基线；`memory` 只适合一次性演示。
 - etcd、Redis、多 Meta、高可用、完整 POSIX、复杂可靠性和大规模长时间测试后置。
 - 跨节点 `fcntl/flock`、阻塞锁取消、bind/native 与远端 FUSE 锁域协同后置，不能把本机 ext4 锁或单挂载内核回退宣传为分布式锁。
+- DFS 不能保存 1970-01-01 之前的时间戳（Meta 时间是无符号毫秒）：`utime`/`utimensat` 设这类时间返回 EINVAL，不静默存成 1970。不支持的 rename flags（`RENAME_EXCHANGE`、`RENAME_WHITEOUT`）返回 EINVAL。
 
 必要正确性边界仍需保留：读写新鲜度、close-to-open、权限和 suid/sgid 清除、错误传播、持久化屏障、direct-I/O mmap 能力协商、正常卸载和受管引用排空。
 

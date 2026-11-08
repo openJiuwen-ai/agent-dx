@@ -125,6 +125,16 @@ fn unix_ms(value: u64) -> SystemTime {
     UNIX_EPOCH + std::time::Duration::from_millis(value)
 }
 
+/// Milliseconds since the epoch for a time set by the application. A time
+/// before 1970 cannot be stored (Meta times are unsigned) and is EINVAL;
+/// supporting it needs signed times in the protocol and Meta format.
+pub(super) fn unix_ms_of(value: SystemTime) -> Result<u64> {
+    let since = value
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| invalid("DFS cannot store a time before 1970-01-01"))?;
+    Ok(since.as_millis().try_into().unwrap_or(u64::MAX))
+}
+
 pub(super) fn system_time_ms(value: SystemTime) -> u64 {
     value
         .duration_since(UNIX_EPOCH)

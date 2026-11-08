@@ -202,6 +202,11 @@ impl Backend for DistributedFs {
         change: &AttributeChange,
         options: SetAttrOptions,
     ) -> Result<FileAttributes> {
+        // Meta keeps unsigned milliseconds since the epoch: refuse a time it
+        // cannot represent instead of storing 1970 (D-S4-2), before any effect.
+        for time in [change.atime, change.mtime].into_iter().flatten() {
+            unix_ms_of(time)?;
+        }
         let inode_id = self.inode_id(inode)?;
         let mut change = change.clone();
         let mut killpriv_setattr = false;
@@ -266,8 +271,8 @@ impl Backend for DistributedFs {
                         mode: change.mode,
                         uid: change.uid,
                         gid: change.gid,
-                        atime_unix_ms: change.atime.map(system_time_ms),
-                        mtime_unix_ms: change.mtime.map(system_time_ms),
+                        atime_unix_ms: change.atime.map(unix_ms_of).transpose()?,
+                        mtime_unix_ms: change.mtime.map(unix_ms_of).transpose()?,
                         ctime_unix_ms: Some(now_unix_ms()),
                         timestamps_now: options.timestamps_now,
                     },
