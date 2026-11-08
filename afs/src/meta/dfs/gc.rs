@@ -25,7 +25,9 @@ const ADMISSION_CLOCK_SKEW_MS: u64 = 60_000;
 /// as the configured data grace protects their content (plan_collection
 /// deletes them at max(grace, this value)), so a long grace is honored.
 const REFERENCE_RECORD_RETENTION_MS: u64 = ADMISSION_HORIZON_MS + ADMISSION_CLOCK_SKEW_MS;
+mod deleter;
 mod metrics;
+pub(crate) use deleter::DeleterWatch;
 pub(crate) use metrics::GcMetrics;
 /// Most keys one GC transaction deletes when nothing has pushed back. Equal to the
 /// default `history::Limits::cleanup_items`: a commit clears at most that many
@@ -243,69 +245,6 @@ fn stored_reference_id(id: &str) -> String {
         None => id.to_owned(),
     }
 }
-/// How long the single external deleter has held its generation (S4-9).
-///
-/// An external object has one copy that any Node can delete, so a deleter
-/// that stays registered but never finishes (its object store hangs) must not
-/// hold collection forever: past the deadline the next live participant that
-/// calls takes the generation over. Deleting an object twice is harmless; its
-/// metadata left with the plan. Process-local: a Meta restart restarts it.
-#[derive(Clone)]
-pub(super) struct DeleterWatch {
-    handoff: std::time::Duration,
-    held: Arc<std::sync::Mutex<Option<(u64, String, std::time::Instant)>>>,
-}
-
-/// A batch of up to 512 deletions; well past a healthy store's latency.
-const GC_DELETER_HANDOFF: std::time::Duration = std::time::Duration::from_secs(120);
-
-impl Default for DeleterWatch {
-    fn default() -> Self {
-        Self::new(GC_DELETER_HANDOFF)
-    }
-}
-
-impl DeleterWatch {
-    fn new(handoff: std::time::Duration) -> Self {
-        Self {
-            handoff,
-            held: Arc::default(),
-        }
-    }
-
-    /// Moves an overdue generation to `caller`; true if it did.
-    fn hand_over(&self, gc: &mut GcState, caller: &str, participants: &BTreeSet<String>) -> bool {
-        let [deleter] = gc.waiting_nodes.as_slice() else {
-            return false;
-        };
-        let Ok(mut held) = self.held.lock() else {
-            return false;
-        };
-        let now = std::time::Instant::now();
-        let since = match held.as_ref() {
-            Some((generation, node, since)) if *generation == gc.generation && node == deleter => {
-                *since
-            }
-            _ => {
-                *held = Some((gc.generation, deleter.clone(), now));
-                now
-            }
-        };
-        if deleter == caller
-            || !participants.contains(caller)
-            || now.duration_since(since) < self.handoff
-        {
-            return false;
-        }
-        afs_logging::warn!("dfs.gc_deleter_handoff"; "generation" => gc.generation,
-            "from" => deleter.as_str(), "to" => caller,
-            "held_seconds" => now.duration_since(since).as_secs());
-        gc.waiting_nodes = vec![caller.to_owned()];
-        *held = Some((gc.generation, caller.to_owned(), now));
-        true
-    }
-}
-
 fn ref_key(node: &str, session: &str, id: &str) -> MetaKey {
     MetaKey::DfsReference {
         node_id: node.into(),
@@ -661,7 +600,7 @@ impl DfsService {
         }
         let sessions = self.store.read(MetaRead::CurrentNodeSessions).await?;
         let participants = gc_participants(&sessions.entities, now_unix_ms());
-        Ok(participants.first().map(String::as_str) == Some(node))
+        Ok(self.gc_deleter.choose(&participants).as_deref() == Some(node))
     }
 
     async fn collect_garbage_attempts(
@@ -706,6 +645,7 @@ impl DfsService {
                 if completed == gc.generation {
                     gc.waiting_nodes.retain(|value| value != &node);
                 }
+                self.gc_deleter.finished(&node, completed);
                 let handed_over = self.is_external_backend()
                     && self.gc_deleter.hand_over(&mut gc, &node, &participants);
                 if gc.waiting_nodes.len() != waiting || handed_over {
@@ -777,7 +717,7 @@ impl DfsService {
             } else if self.is_external_backend() {
                 // One copy of each object: one Node deletes. If it is lost the
                 // objects stay in the store and reconciliation finds them.
-                participants.into_iter().take(1).collect()
+                self.gc_deleter.choose(&participants).into_iter().collect()
             } else {
                 participants.into_iter().collect()
             };

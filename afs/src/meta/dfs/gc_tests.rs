@@ -1826,11 +1826,20 @@ async fn an_overdue_external_deleter_hands_its_generation_to_another_live_node()
         .await
         .unwrap();
     assert!(done.waiting_nodes.is_empty(), "{done:?}");
-    let stale = service
+    // While a is overdue, the next generation and the listing pass it over.
+    assert!(service.lists_external_inventory("n").await.unwrap());
+    let second = generational_chunk("crashed-again", b"second");
+    let next = service
+        .collect_garbage("n".into(), "s".into(), late.generation, vec![second])
+        .await
+        .unwrap();
+    assert_eq!(next.waiting_nodes, vec!["n".to_owned()]);
+    // a reports the generation it lost: it is deleting again.
+    service
         .collect_garbage("a".into(), "a1".into(), late.generation, vec![])
         .await
         .unwrap();
-    assert!(stale.waiting_nodes.is_empty(), "{stale:?}");
+    assert!(service.lists_external_inventory("a").await.unwrap());
 }
 
 /// Native copies live on each Node's own disk: nobody can delete another
