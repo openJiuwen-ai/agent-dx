@@ -11,14 +11,15 @@ payload per DFS mount. Its default is 2147483648 (2GiB), with range
 8388608..1099511627776 (8MiB..1TiB), additionally checked to fit `usize`.
 CLI overrides TOML, which overrides the default. All files share this allowance.
 An additional reserve of min(normal/8, 32MiB) owns requests awaiting admission;
-at the default, total payload capacity is 2080MiB. At most 4096 body entries are
-retained, including executing, pending and failed retained work.
+at the default, total payload capacity is 2080MiB. At most 4096 acknowledged body
+entries are queued (failed retained work included, the executing entry excluded);
+beyond that a write waits like a quota wait, with its reply withheld. At most
+65536 withheld entries exist; each blocks one application write or one kernel
+background request, so the bound is far above the kernel's in-flight requests.
 A single FUSE write must fit the normal allowance; an oversized request returns
 E2BIG before payload allocation. Consider the negotiated FUSE request size when
 choosing a smaller allowance. The reserve never reduces the normal admission window. Executing
-requests and failed retained bodies remain charged. Normal capacity backpressures the application by retaining its owned input and withholding the reply, while returning the receive callback. Exhausting the total body/entry bound returns EAGAIN before input ownership or success; allocation failure returns ENOMEM. When failed retained bodies prevent
-capacity recovery, an unrelated admission returns EAGAIN rather than blocking the
-callback that must sync or close those bodies. Allocator metadata and downstream
+requests and failed retained bodies remain charged. Normal capacity and the entry bound backpressure the application by retaining its owned input and withholding the reply, while returning the receive callback. Only exhausting the reserve (total payload) or the withheld-entry bound returns EAGAIN before input ownership or success; allocation failure returns ENOMEM. A file's failure is reported to that file. Another file's write that must wait keeps waiting while draining healthy entries can still admit it; it returns EAGAIN only when retained failed bodies alone leave no room (their bytes or entries fill the normal allowance or the entry bound), rather than blocking until the failed file is synced or closed. `afs_fuse_front_write_admissions_total{outcome}` counts writes acknowledged at once (`admitted`), after a wait (`waited`) and each rejection reason. Allocator metadata and downstream
 DFS buffers are additional memory. This limit does not alter downstream dirty-body or idle-pool settings. Promotion retains the same Vec, with no additional payload copy. No per-file thread or 2GiB up-front allocation is introduced.
 
 The FIFO body consumer preserves write order, including overlapping writes and

@@ -11,7 +11,14 @@ use std::thread::{self, JoinHandle};
 type Job = Box<dyn FnMut() -> Result<(), i32> + Send>;
 type Admission = Box<dyn FnOnce(Result<(), i32>) + Send>;
 type RecoveryStart = Box<dyn FnOnce(CallbackGuard) + Send>;
-const MAX_WAITING_ENTRIES: usize = 4096;
+/// Acknowledged (admitted) entries the worker may hold, including retained
+/// failures. Beyond it a write waits with its reply withheld, like a body-quota
+/// wait; it is not rejected.
+const MAX_ADMITTED_ENTRIES: usize = 4096;
+/// Hard bound on withheld entries. Each blocks one application write (or one
+/// kernel background request), so it is reached only far beyond the kernel's
+/// in-flight requests.
+const MAX_PENDING_ENTRIES: usize = 65_536;
 
 /// Admission outcomes counted per mount. `admitted` replies at once;
 /// `waited` replied after a withheld wait; the rest are rejections by reason.
@@ -72,6 +79,9 @@ struct State {
     peak_bytes: usize,
     peak_pending_bytes: usize,
     peak_entries: usize,
+    peak_pending_entries: usize,
+    /// Entries whose reply is withheld (`admission.is_some()`).
+    pending_entries: usize,
     next_sequence: u64,
     waiters: Vec<Waiter>,
     active: Option<(u64, u64)>,
@@ -84,6 +94,7 @@ struct Shared {
     changed: Condvar,
     limit: usize,
     admitted_limit: usize,
+    max_entries: usize,
     metrics: OnceLock<AdmissionMetrics>,
 }
 
@@ -248,7 +259,15 @@ impl FrontWriteQueue {
     }
 
     fn with_limits(admitted_limit: usize, reserve: usize) -> Result<Self, i32> {
-        if admitted_limit == 0 {
+        Self::with_entry_limit(admitted_limit, reserve, MAX_ADMITTED_ENTRIES)
+    }
+
+    fn with_entry_limit(
+        admitted_limit: usize,
+        reserve: usize,
+        max_entries: usize,
+    ) -> Result<Self, i32> {
+        if admitted_limit == 0 || max_entries == 0 {
             return Err(E2BIG);
         }
         let limit = admitted_limit.checked_add(reserve).ok_or(E2BIG)?;
@@ -257,6 +276,7 @@ impl FrontWriteQueue {
             changed: Condvar::new(),
             limit,
             admitted_limit,
+            max_entries,
             metrics: OnceLock::new(),
         });
         let work = shared.clone();
@@ -462,6 +482,26 @@ impl FrontWriteQueue {
             .iter()
             .position(|entry| entry.admission.is_none() && !state.errors.contains_key(&entry.inode))
     }
+    /// Acknowledged entries held in the queue (executing entry excluded).
+    fn admitted_entries(state: &State) -> usize {
+        state.entries.len() - state.pending_entries
+    }
+    /// Whether retained failures of other files alone leave no room for
+    /// `bytes`: then draining healthy entries can never admit the write.
+    fn failures_block(shared: &Shared, state: &State, inode: u64, bytes: usize) -> bool {
+        if state.errors.keys().all(|failed| *failed == inode) {
+            return false;
+        }
+        let (mut failed_bytes, mut failed_entries) = (0usize, 0usize);
+        for entry in &state.entries {
+            if entry.admission.is_none() && state.errors.contains_key(&entry.inode) {
+                failed_bytes += entry.bytes;
+                failed_entries += 1;
+            }
+        }
+        failed_entries >= shared.max_entries
+            || bytes > shared.admitted_limit.saturating_sub(failed_bytes)
+    }
     fn admissions(shared: &Shared, state: &mut State) -> Vec<(Admission, Result<(), i32>)> {
         let mut callbacks = Vec::new();
         let mut index = 0;
@@ -476,7 +516,7 @@ impl FrontWriteQueue {
                 Some((Outcome::Closing, EIO))
             } else if let Some(error) = state.errors.get(&entry.inode) {
                 Some((Outcome::FileError, *error))
-            } else if !state.errors.is_empty() {
+            } else if Self::failures_block(shared, state, entry.inode, entry.bytes) {
                 Some((Outcome::RetainedFailure, EAGAIN))
             } else {
                 None
@@ -486,6 +526,7 @@ impl FrontWriteQueue {
                 if let Some(mut entry) = state.entries.remove(index) {
                     let bytes = entry.bytes;
                     if let Some(callback) = entry.admission.take() {
+                        state.pending_entries -= 1;
                         callbacks.push((callback, Err(error)));
                     }
                     drop(entry);
@@ -497,9 +538,11 @@ impl FrontWriteQueue {
             let inode = entry.inode;
             if !blocked.contains(&inode)
                 && bytes <= shared.admitted_limit.saturating_sub(state.admitted_bytes)
+                && Self::admitted_entries(state) < shared.max_entries
             {
                 if let Some(callback) = state.entries[index].admission.take() {
                     state.admitted_bytes += bytes;
+                    state.pending_entries -= 1;
                     callbacks.push((callback, Ok(())));
                 }
             } else {
@@ -579,6 +622,9 @@ impl FrontWriteQueue {
         state.bytes += bytes;
         if admission.is_none() {
             state.admitted_bytes += bytes;
+        } else {
+            state.pending_entries += 1;
+            state.peak_pending_entries = state.peak_pending_entries.max(state.pending_entries);
         }
         state.peak_bytes = state.peak_bytes.max(state.bytes);
         state.peak_pending_bytes = state
@@ -608,7 +654,11 @@ impl FrontWriteQueue {
         // retain their callback until promotion. Both run outside the state lock.
         let mut callback: Option<Admission> = Some(Box::new(admitted));
         let result = (|| {
-            let mut state = self.shared.state.lock().map_err(|_| (Outcome::Closing, EIO))?;
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .map_err(|_| (Outcome::Closing, EIO))?;
             if state.closing || state.closed {
                 return Err((Outcome::Closing, EIO));
             }
@@ -621,19 +671,20 @@ impl FrontWriteQueue {
             if bytes > self.shared.limit.saturating_sub(state.bytes) {
                 return Err((Outcome::TotalBytes, EAGAIN));
             }
-            if state.entries.len() >= MAX_WAITING_ENTRIES {
-                return Err((Outcome::Entries, EAGAIN));
-            }
             let pending = bytes
                 > self
                     .shared
                     .admitted_limit
                     .saturating_sub(state.admitted_bytes)
+                || Self::admitted_entries(&state) >= self.shared.max_entries
                 || state
                     .entries
                     .iter()
                     .any(|entry| entry.inode == inode && entry.admission.is_some());
-            if pending && !state.errors.is_empty() {
+            if pending && state.pending_entries >= MAX_PENDING_ENTRIES {
+                return Err((Outcome::Entries, EAGAIN));
+            }
+            if pending && Self::failures_block(&self.shared, &state, inode, bytes) {
                 return Err((Outcome::RetainedFailure, EAGAIN));
             }
             let job = make().map_err(|error| (Outcome::FileError, error))?;
@@ -686,7 +737,8 @@ impl FrontWriteQueue {
             if let Some(error) = state.errors.get(&inode) {
                 return Err(*error);
             }
-            if bytes <= self.shared.limit - state.bytes && state.entries.len() < MAX_WAITING_ENTRIES
+            if bytes <= self.shared.limit - state.bytes
+                && state.entries.len() < self.shared.max_entries
             {
                 break;
             }
@@ -751,6 +803,7 @@ impl FrontWriteQueue {
                 if let Some(mut entry) = state.entries.remove(index) {
                     let bytes = entry.bytes;
                     if let Some(callback) = entry.admission.take() {
+                        state.pending_entries -= 1;
                         callbacks.push((callback, Err(EIO)));
                     } else {
                         state.admitted_bytes -= bytes;
@@ -786,10 +839,12 @@ impl FrontWriteQueue {
         state.entries.clear();
         state.bytes = 0;
         state.admitted_bytes = 0;
+        state.pending_entries = 0;
         afs_logging::info!("fuse.front_write_summary";
             "peak_bytes" => state.peak_bytes as u64,
             "peak_pending_bytes" => state.peak_pending_bytes as u64,
             "peak_entries" => state.peak_entries as u64,
+            "peak_pending_entries" => state.peak_pending_entries as u64,
             "limit_bytes" => self.shared.limit as u64,
             "admitted_limit_bytes" => self.shared.admitted_limit as u64,
         );
@@ -1615,5 +1670,201 @@ mod tests {
         assert_eq!(rejected.unwrap(), Err(EAGAIN));
         assert_eq!(control_before.unwrap(), Ok(()));
         assert!(!q.has_pending());
+    }
+
+    /// Blocks the worker on a first entry of `inode` until `release` is sent.
+    fn hold_worker(q: &FrontWriteQueue, inode: u64, handle: u64) -> mpsc::Sender<()> {
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        q.submit_deferred_with(
+            inode,
+            handle,
+            1,
+            || {
+                Ok(Box::new(move || {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.recv();
+                    Ok(())
+                }))
+            },
+            |result| assert_eq!(result, Ok(())),
+        );
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        release_tx
+    }
+
+    fn deferred(q: &FrontWriteQueue, inode: u64, handle: u64) -> mpsc::Receiver<Result<(), i32>> {
+        let (tx, rx) = mpsc::channel();
+        q.submit_deferred_with(
+            inode,
+            handle,
+            1,
+            || Ok(Box::new(|| Ok(()))),
+            move |result| tx.send(result).unwrap(),
+        );
+        rx
+    }
+
+    /// R76: a full entry bound withholds the reply (the application waits in
+    /// write()) and promotes once the worker drains, instead of EAGAIN.
+    #[test]
+    fn entry_bound_withholds_reply_and_promotes_instead_of_eagain() {
+        let q = FrontWriteQueue::with_entry_limit(64, 8, 2).unwrap();
+        let release = hold_worker(&q, 1, 11);
+        let first = deferred(&q, 1, 11);
+        let second = deferred(&q, 2, 22);
+        assert_eq!(first.recv_timeout(Duration::from_secs(2)).unwrap(), Ok(()));
+        assert_eq!(second.recv_timeout(Duration::from_secs(2)).unwrap(), Ok(()));
+        // Two admitted entries fill the bound: the next ones wait, unacknowledged.
+        let third = deferred(&q, 2, 22);
+        let fourth = deferred(&q, 3, 33);
+        assert!(third.try_recv().is_err(), "entry bound ACKed a write");
+        assert!(fourth.try_recv().is_err(), "entry bound ACKed a write");
+        release.send(()).unwrap();
+        assert_eq!(third.recv_timeout(Duration::from_secs(2)).unwrap(), Ok(()));
+        assert_eq!(fourth.recv_timeout(Duration::from_secs(2)).unwrap(), Ok(()));
+        q.wait(None, false).unwrap();
+        assert!(!q.has_pending());
+    }
+
+    /// Same-inode order is kept across an entry-bound wait: a later write of a
+    /// waiting inode cannot be acknowledged ahead of the waiting one.
+    #[test]
+    fn entry_bound_wait_keeps_same_inode_fifo() {
+        let q = FrontWriteQueue::with_entry_limit(64, 8, 1).unwrap();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let release = hold_worker(&q, 9, 99);
+        let mut acks = Vec::new();
+        for n in 0..4u64 {
+            let (tx, rx) = mpsc::channel();
+            let order = order.clone();
+            q.submit_deferred_with(
+                1,
+                11,
+                1,
+                move || {
+                    Ok(Box::new(move || {
+                        order.lock().unwrap().push(n);
+                        Ok(())
+                    }))
+                },
+                move |result| tx.send((n, result)).unwrap(),
+            );
+            acks.push(rx);
+        }
+        release.send(()).unwrap();
+        for (n, rx) in acks.iter().enumerate() {
+            assert_eq!(
+                rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                (n as u64, Ok(()))
+            );
+        }
+        q.wait(None, false).unwrap();
+        assert_eq!(*order.lock().unwrap(), vec![0, 1, 2, 3]);
+    }
+
+    /// Another file's retained failure does not reject a wait that can still
+    /// be satisfied by draining healthy entries: the error stays with the
+    /// failed file.
+    #[test]
+    fn unrelated_retained_failure_does_not_reject_a_recoverable_wait() {
+        let q = FrontWriteQueue::with_entry_limit(64, 8, 2).unwrap();
+        submit(&q, 1, 11, 1, || Err(EIO)).unwrap();
+        assert_eq!(q.wait(Some(1), false), Err(EIO));
+        let release = hold_worker(&q, 2, 22);
+        let healthy = deferred(&q, 2, 22);
+        assert_eq!(
+            healthy.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Ok(())
+        );
+        // Failed head + one queued healthy entry fill the bound of two (the
+        // executing entry is outside it); this write waits, then promotes.
+        let waiting = deferred(&q, 3, 33);
+        let more = deferred(&q, 3, 33);
+        assert!(waiting.try_recv().is_err());
+        release.send(()).unwrap();
+        assert_eq!(
+            waiting.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Ok(())
+        );
+        assert_eq!(more.recv_timeout(Duration::from_secs(2)).unwrap(), Ok(()));
+        q.wait(Some(3), false).unwrap();
+        assert_eq!(q.wait(Some(1), false), Err(EIO));
+        q.release_handle(1, 11, true);
+        q.wait(None, false).unwrap();
+        assert!(!q.has_pending());
+    }
+
+    /// The remaining EAGAIN: retained failures alone fill the entry bound, so
+    /// no amount of draining can admit another file's write until the failed
+    /// file is synced, retried or closed.
+    #[test]
+    fn retained_failures_filling_the_entry_bound_still_reject_other_files() {
+        let q = FrontWriteQueue::with_entry_limit(64, 8, 2).unwrap();
+        let release = hold_worker(&q, 1, 11);
+        let failing = Arc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            let failing = failing.clone();
+            q.submit_deferred_with(
+                1,
+                11,
+                1,
+                move || {
+                    Ok(Box::new(move || {
+                        failing.fetch_add(1, Ordering::SeqCst);
+                        Err(EIO)
+                    }))
+                },
+                |result| assert_eq!(result, Ok(())),
+            );
+        }
+        release.send(()).unwrap();
+        assert_eq!(q.wait(Some(1), false), Err(EIO));
+        assert_eq!(
+            deferred(&q, 2, 22)
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            Err(EAGAIN)
+        );
+        q.release_handle(1, 11, true);
+        assert_eq!(
+            deferred(&q, 2, 22)
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            Ok(())
+        );
+        q.wait(None, false).unwrap();
+        assert!(!q.has_pending());
+    }
+
+    #[test]
+    fn admission_outcomes_are_counted_by_reason() {
+        let registry = afs_metrics::Registry::new();
+        let counter = afs_metrics::IntCounterVec::new(
+            afs_metrics::Opts::new("t", "t"),
+            &["filesystem", "outcome"],
+        )
+        .unwrap();
+        afs_metrics::register_collector(&registry, &counter).unwrap();
+        let q = FrontWriteQueue::with_entry_limit(64, 8, 1).unwrap();
+        q.set_metrics(counter.clone(), "dfs");
+        let release = hold_worker(&q, 1, 11);
+        assert_eq!(
+            deferred(&q, 2, 22)
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap(),
+            Ok(())
+        );
+        let waiting = deferred(&q, 3, 33);
+        release.send(()).unwrap();
+        assert_eq!(
+            waiting.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Ok(())
+        );
+        q.wait(None, false).unwrap();
+        let get = |outcome: &str| counter.with_label_values(&["dfs", outcome]).get();
+        assert_eq!(get("admitted"), 2);
+        assert_eq!(get("waited"), 1);
+        assert_eq!(get("rejected_entries"), 0);
     }
 }
