@@ -68,7 +68,8 @@ impl PeerConnectionPool {
     }
 
     /// Dial every pooled channel on `runtime`, normally the Node runtime that
-    /// outlives every client of this pool.
+    /// outlives every client of this pool. Only a Node with a backend builds a pool.
+    #[cfg(any(feature = "ownerfs", feature = "dfs", test))]
     #[must_use]
     pub(crate) fn with_channel_runtime(mut self, runtime: tokio::runtime::Handle) -> Self {
         self.channel_runtime = Some(runtime);
