@@ -350,17 +350,21 @@ impl DistributedFs {
         position
             .checked_add((data.len() - accepted) as u64)
             .ok_or_else(file_too_large)?;
-        let selection = state
-            .dirty_extents
-            .native_selection(position, state.logical_length);
-        let capacity =
-            DirtyExtentMap::native_capacity(position, data.len() - accepted, state.logical_length);
+        let selection = state.dirty_extents.native_selection(position);
+        let capacity = state.dirty_extents.native_capacity(
+            position,
+            data.len() - accepted,
+            state.logical_length,
+        );
         Ok(WriteTarget {
             position,
             selection,
             capacity,
             generation: state.dirty_extents.native_operation_id.clone(),
-            base: state.base_version.as_ref().map(|version| version.id.clone()),
+            base: state
+                .base_version
+                .as_ref()
+                .map(|version| version.id.clone()),
             seq: state.next_write_seq,
             owner: state.native_owner.clone(),
         })
@@ -526,10 +530,7 @@ impl DistributedFs {
         if state.next_write_seq != target.seq
             || state.dirty_extents.native_operation_id != target.generation
             || actual_position != position
-            || state
-                .dirty_extents
-                .native_selection(position, state.logical_length)
-                != target.selection
+            || state.dirty_extents.native_selection(position) != target.selection
         {
             drop(state);
             drop(operation);

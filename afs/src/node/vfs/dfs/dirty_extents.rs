@@ -27,6 +27,10 @@ pub(super) struct DirtyExtentMap {
     pub(super) native_admitted_bytes: Option<u64>,
     pub(super) native_operation_id: Option<OperationId>,
     pub(super) native_gc_pin: Option<Arc<crate::node::gc::GcPin>>,
+    /// End and builder capacity of the last native write (R81 F1). A write
+    /// that starts there continues a sequential run inside the file, so its
+    /// builder doubles instead of every small write becoming its own chunk.
+    pub(super) sequential_end: Option<(u64, usize)>,
 }
 
 pub(super) struct DirtyBuilder {
@@ -64,16 +68,13 @@ impl Clone for DirtyExtentMap {
             native_admitted_bytes: self.native_admitted_bytes,
             native_operation_id: self.native_operation_id.clone(),
             native_gc_pin: self.native_gc_pin.clone(),
+            sequential_end: self.sequential_end,
         }
     }
 }
 
 impl DirtyExtentMap {
-    pub(super) fn native_selection(
-        &self,
-        position: u64,
-        logical_length: u64,
-    ) -> Option<(usize, usize, usize)> {
+    pub(super) fn native_selection(&self, position: u64) -> Option<(usize, usize, usize)> {
         let latest = self
             .extents
             .range(..=position)
@@ -89,31 +90,41 @@ impl DirtyExtentMap {
                 (extent.native_reuse_end - position) as usize,
             ));
         }
-        if position >= logical_length {
-            return self
-                .append_builders
-                .get(&position)
-                .and_then(|indices| indices.last())
-                .map(|(_, index)| {
-                    let entry = &self.builders[*index];
-                    (
-                        *index,
-                        entry.builder.len(),
-                        entry.builder.writable_capacity() - entry.builder.len(),
-                    )
-                });
-        }
-        None
+        // A builder that ends exactly here with room left continues it, at the
+        // end of the file or inside it (a sequential rewrite or a fill after
+        // `ftruncate`, R81 F1).
+        self.append_builders
+            .get(&position)
+            .and_then(|indices| indices.last())
+            .map(|(_, index)| {
+                let entry = &self.builders[*index];
+                (
+                    *index,
+                    entry.builder.len(),
+                    entry.builder.writable_capacity() - entry.builder.len(),
+                )
+            })
     }
 
-    pub(super) fn native_capacity(position: u64, remaining: usize, logical_length: u64) -> usize {
+    /// Builder capacity for a write at `position` that found no builder to
+    /// continue. At the end of the file a full chunk; inside it the write's
+    /// own size, doubled per step while the writes stay sequential (R81 F1).
+    pub(super) fn native_capacity(
+        &self,
+        position: u64,
+        remaining: usize,
+        logical_length: u64,
+    ) -> usize {
+        let full = COMMIT_CHUNK_BYTES as usize;
         if position >= logical_length {
-            COMMIT_CHUNK_BYTES as usize
-        } else {
-            remaining
-                .min(COMMIT_CHUNK_BYTES as usize)
-                .max(4096)
-                .next_power_of_two()
+            return full;
+        }
+        let own = remaining.min(full).max(4096).next_power_of_two();
+        match self.sequential_end {
+            Some((end, capacity)) if end == position => {
+                own.max(capacity.saturating_mul(2).min(full))
+            }
+            _ => own,
         }
     }
 
@@ -159,6 +170,10 @@ impl DirtyExtentMap {
             (index, 0, capacity)
         };
         let take = available.min(data.len());
+        self.sequential_end = Some((
+            position + take as u64,
+            self.builders[index].builder.writable_capacity(),
+        ));
         let previous_end =
             self.builders[index].file_offset + self.builders[index].builder.len() as u64;
         self.builders[index]

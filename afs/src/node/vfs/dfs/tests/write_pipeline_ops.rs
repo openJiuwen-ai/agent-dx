@@ -61,6 +61,45 @@ fn native_builder_six_megabytes_freezes_two_allocations_without_body_move() {
     assert_eq!(dirty.dirty_data_bytes(), 6 * 1024 * 1024);
 }
 
+/// R81 F1: sequential 4 KiB writes inside a file (for example after
+/// `ftruncate` to the final size) grow their builders instead of making one
+/// chunk per write. Before, each write got a 4 KiB builder: 4096 chunks for a
+/// 16 MiB file. A write that does not continue the last one stays small.
+#[test]
+fn sequential_writes_inside_a_file_double_their_builders_up_to_a_chunk() {
+    let pool = WriteBufferPool::new(64 * 1024 * 1024);
+    let mut dirty = DirtyExtentMap::default();
+    let logical = 16 * 1024 * 1024;
+    let write = |dirty: &mut DirtyExtentMap, position: u64, seq: u64| {
+        let data = vec![(seq % 251) as u8; 4096];
+        let selection = dirty.native_selection(position);
+        let prepared = selection.is_none().then(|| {
+            ChunkBuilder::with_pool(pool.clone(), dirty.native_capacity(position, 4096, logical))
+                .unwrap()
+        });
+        dirty
+            .write_native_prepared(position, &data, seq, selection, prepared, None)
+            .unwrap()
+    };
+    for index in 0..4096u64 {
+        assert_eq!(write(&mut dirty, index * 4096, index + 1), 4096);
+    }
+    assert!(
+        dirty.builders.len() <= 16,
+        "{} builders for 4096 sequential writes",
+        dirty.builders.len()
+    );
+    assert!(
+        dirty
+            .builders
+            .iter()
+            .any(|entry| entry.builder.len() == COMMIT_CHUNK_BYTES as usize)
+    );
+    assert_eq!(dirty.dirty_data_bytes(), logical);
+    // A random write elsewhere is not a continuation: its own size only.
+    assert_eq!(dirty.native_capacity(3 * 4096 + 123, 4096, logical), 4096);
+}
+
 struct NativeFixtureStore {
     local: Arc<LocalChunkStore>,
     required: bool,
