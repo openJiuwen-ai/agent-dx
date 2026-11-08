@@ -361,6 +361,16 @@ pub struct Cli {
     /// One native Peer admission wait deadline (0..=50 ms); zero never waits.
     #[arg(long)]
     pub dfs_peer_serve_wait_ms: Option<u64>,
+    /// Background scrub rate of local DFS copies in bytes per second
+    /// (0 disables, otherwise 1MiB..=1GiB; default 32MiB).
+    #[arg(long)]
+    pub dfs_scrub_bytes_per_second: Option<u64>,
+    /// Delay before the first scrub round after Node start (0..=86400 s).
+    #[arg(long)]
+    pub dfs_scrub_start_delay_seconds: Option<u64>,
+    /// Minimum time between the starts of two scrub rounds (1..=2592000 s).
+    #[arg(long)]
+    pub dfs_scrub_round_interval_seconds: Option<u64>,
     /// Filesystem-wide immutable DFS replica target count. Applied by Meta at initialization.
     #[arg(long)]
     pub dfs_desired_copies: Option<u16>,
@@ -477,6 +487,9 @@ struct FileConfig {
     dfs_peer_serve_resident_objects: Option<usize>,
     dfs_peer_serve_payload_bytes: Option<u64>,
     dfs_peer_serve_wait_ms: Option<u64>,
+    dfs_scrub_bytes_per_second: Option<u64>,
+    dfs_scrub_start_delay_seconds: Option<u64>,
+    dfs_scrub_round_interval_seconds: Option<u64>,
     dfs_external_backend: Option<DfsExternalBackendConfig>,
     dfs_peer_cache: Option<DfsPeerCacheConfig>,
     dfs_write_buffer_idle_bytes: Option<u64>,
@@ -593,6 +606,9 @@ pub struct Config {
     pub dfs_peer_serve_resident_objects: usize,
     pub dfs_peer_serve_payload_bytes: u64,
     pub dfs_peer_serve_wait_ms: u64,
+    pub dfs_scrub_bytes_per_second: u64,
+    pub dfs_scrub_start_delay_seconds: u64,
+    pub dfs_scrub_round_interval_seconds: u64,
     pub dfs_external_backend: Option<DfsExternalBackendConfig>,
     pub dfs_peer_cache: Option<DfsPeerCacheConfig>,
     /// Reusable idle write-body capacity only, not a live-body quota.
@@ -766,6 +782,9 @@ impl Config {
             dfs_peer_serve_resident_objects: tuning.dfs_peer_serve_resident_objects,
             dfs_peer_serve_payload_bytes: tuning.dfs_peer_serve_payload_bytes,
             dfs_peer_serve_wait_ms: tuning.dfs_peer_serve_wait_ms,
+            dfs_scrub_bytes_per_second: tuning.dfs_scrub_bytes_per_second,
+            dfs_scrub_start_delay_seconds: tuning.dfs_scrub_start_delay_seconds,
+            dfs_scrub_round_interval_seconds: tuning.dfs_scrub_round_interval_seconds,
             dfs_external_backend: file.dfs_external_backend,
             dfs_peer_cache: file.dfs_peer_cache,
             dfs_write_buffer_idle_bytes: file

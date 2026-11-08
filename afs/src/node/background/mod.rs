@@ -36,6 +36,7 @@
 //! | T10 | `RestServer` | `rest_server` | fatal |
 //! | T11 | `RdmaSessionSweeper` | `rdma_session_sweeper` | retry (no error path) |
 //! | T13 | workspace bind-root commands | `node::assembly::ownerfs` | fatal |
+//! | T14 | `ScrubService` | `node::fault::scrub` | retry |
 //!
 //! T12 (the experimental native workspace monitor) was removed in S1e-3.
 //!

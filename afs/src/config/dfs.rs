@@ -202,6 +202,9 @@ pub(super) struct DfsTuning {
     pub(super) dfs_peer_serve_resident_objects: usize,
     pub(super) dfs_peer_serve_payload_bytes: u64,
     pub(super) dfs_peer_serve_wait_ms: u64,
+    pub(super) dfs_scrub_bytes_per_second: u64,
+    pub(super) dfs_scrub_start_delay_seconds: u64,
+    pub(super) dfs_scrub_round_interval_seconds: u64,
 }
 
 pub(super) fn resolve_tuning(cli: &Cli, file: &FileConfig) -> Result<DfsTuning> {
@@ -318,6 +321,33 @@ pub(super) fn resolve_tuning(cli: &Cli, file: &FileConfig) -> Result<DfsTuning> 
     if dfs_peer_serve_wait_ms > 50 {
         return Err(invalid("DFS Peer serve wait must be 0..=50 ms"));
     }
+    // 32 MiB/s: about 12% of a 270 MiB/s cloud disk and 0.06 CPU core (S4b
+    // cost probe: 1.86-2.01 CPU s per verified GiB); 1 TiB per 9.1 hours.
+    let dfs_scrub_bytes_per_second = cli
+        .dfs_scrub_bytes_per_second
+        .or(file.dfs_scrub_bytes_per_second)
+        .unwrap_or(32 * 1024 * 1024);
+    if dfs_scrub_bytes_per_second != 0
+        && !(1024 * 1024..=1024 * 1024 * 1024).contains(&dfs_scrub_bytes_per_second)
+    {
+        return Err(invalid(
+            "DFS scrub bytes per second must be 0 (off) or 1MiB..=1GiB",
+        ));
+    }
+    let dfs_scrub_start_delay_seconds = cli
+        .dfs_scrub_start_delay_seconds
+        .or(file.dfs_scrub_start_delay_seconds)
+        .unwrap_or(300);
+    if dfs_scrub_start_delay_seconds > 86_400 {
+        return Err(invalid("DFS scrub start delay must be 0..=86400 s"));
+    }
+    let dfs_scrub_round_interval_seconds = cli
+        .dfs_scrub_round_interval_seconds
+        .or(file.dfs_scrub_round_interval_seconds)
+        .unwrap_or(86_400);
+    if !(1..=2_592_000).contains(&dfs_scrub_round_interval_seconds) {
+        return Err(invalid("DFS scrub round interval must be 1..=2592000 s"));
+    }
     Ok(DfsTuning {
         dfs_outboard_work_wait_ms,
         dfs_catalog_commit_queue,
@@ -334,6 +364,9 @@ pub(super) fn resolve_tuning(cli: &Cli, file: &FileConfig) -> Result<DfsTuning> 
         dfs_peer_serve_resident_objects,
         dfs_peer_serve_payload_bytes,
         dfs_peer_serve_wait_ms,
+        dfs_scrub_bytes_per_second,
+        dfs_scrub_start_delay_seconds,
+        dfs_scrub_round_interval_seconds,
     })
 }
 

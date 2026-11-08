@@ -47,6 +47,8 @@ pub enum QuarantineTrigger {
     UploadedReadBack,
     /// Background repair reading its local source.
     RepairSource,
+    /// Background scrub verifying a durable copy (S4-16).
+    Scrub,
 }
 
 impl QuarantineTrigger {
@@ -61,6 +63,7 @@ impl QuarantineTrigger {
             Self::DfsLocalRead => "dfs_local_read",
             Self::UploadedReadBack => "uploaded_read_back",
             Self::RepairSource => "repair_source",
+            Self::Scrub => "scrub",
         }
     }
 }

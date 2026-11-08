@@ -298,6 +298,9 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `dfs_peer_serve_resident_objects` | 调优 | Node | `2` | Peer 服务端常驻校验对象数，1..=16 |
 | `dfs_peer_serve_payload_bytes` | 调优 | Node | `16777216` | Peer 服务端常驻与在途载荷共享上限，4..=64 MiB |
 | `dfs_peer_serve_wait_ms` | 调优 | Node | `20` | Peer 服务准入等待，0..=50；0 表示不等待 |
+| `dfs_scrub_bytes_per_second` | 调优 | Node | `33554432` | 后台巡检限速（字节/秒），0 关闭，否则 1MiB..=1GiB；见[后台巡检](#dfs-后台巡检) |
+| `dfs_scrub_start_delay_seconds` | 调优 | Node | `300` | Node 启动后首轮巡检的延迟，0..=86400 |
+| `dfs_scrub_round_interval_seconds` | 调优 | Node | `86400` | 两轮巡检开始时间的最短间隔，1..=2592000；一轮更长时下一轮紧接开始 |
 | `dfs_read_max_ops_per_batch` | 调优 | Node | `128` | 单批读操作数上限 |
 | `dfs_read_max_inflight_bytes` | 调优 | Node | `8388608` | 读在途字节上限；也决定 Peer 缓存走流式填充还是整块填充 |
 | `dfs_source_cache_max_ms` | 调优 | Node | `5000` | 副本来源缓存时长，不超过 60000；0 表示不保留 |
@@ -891,6 +894,24 @@ Registry不持有Store、State或磁盘句柄；采集不扫描全库、不读�
 counter以进程生命周期计，重启归零；恢复的当前状态会初始化gauge。指标是观测副本，
 不是canonical权威或线性化读取接口。重复注册返回错误，产品在打开监听前报告该错误。
 物理WAL／checkpoint容量仍由日志自身的有限准入和安全回收合同约束，不由counter充当配额。
+
+## DFS 后台巡检
+
+本机副本模式（非外部 S3）的 Node 默认开启后台巡检：按 chunk id 顺序遍历本机目录里的持久副本，
+逐个完整校验正文（与本机读、修复源读同一校验）。校验失败（损坏或文件缺失）的副本被隔离，
+由现有的上报 → 修复链路从其他副本补齐，日志 `dfs.scrub_corrupt_found`。它补上了“只有远端读才会校验”
+的缺口：例如两副本下写入节点总在本机读，另一份副本从不被读，坏了也没人发现，直到它成为唯一的修复源。
+
+- 一次只校验一个副本；下一个副本要等已校验字节按 `dfs_scrub_bytes_per_second` 折算的时间过去才开始，
+  空闲时间不累积成突发。默认 32MiB/s：约占 270MiB/s 云盘读带宽的 12%，按 S4b 实测（每 GiB 1.86–2.01 CPU 秒）
+  约 0.06 个 CPU 核；1TiB 本机数据约 9.1 小时一轮。
+- Node 启动 `dfs_scrub_start_delay_seconds`（默认 300）秒后开始首轮；两轮开始时间至少相隔
+  `dfs_scrub_round_interval_seconds`（默认 86400）秒，一轮比这更长时下一轮紧接开始。
+- 巡检只读，不改协议与持久格式；与 GC、修复不互斥：选中后被回收或替换的副本直接跳过，
+  隔离前会在目录屏障下重新校验当前文件，不会把刚装好的新副本误隔离。
+- 校验经过页缓存：刚被读过、仍在页缓存里的 chunk 按缓存内容校验。
+- 指标 `afs_dfs_scrub_total{event}`：`chunks_verified`、`bytes_verified`、`corrupt_found`、`skipped`、
+  `errors`、`rounds_completed`；每轮结束记一条 `dfs.scrub_round_completed`（含副本数、字节、损坏数与耗时）。
 
 ## 原生 DFS 回收
 

@@ -93,6 +93,13 @@ pub(super) async fn run_node(
         &mut services,
     )?;
     #[cfg(feature = "dfs")]
+    dfs::start_scrub(
+        &cfg,
+        &backends.dfs,
+        &state.observability.registry,
+        &mut services,
+    )?;
+    #[cfg(feature = "dfs")]
     dfs::start_repair(
         &cfg,
         &state.session_id,

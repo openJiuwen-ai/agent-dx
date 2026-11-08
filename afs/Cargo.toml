@@ -64,6 +64,7 @@ tikv-jemalloc-ctl = { version = "=0.7.0", optional = true, features = ["use_std"
 tempfile = "3"
 afs-client = { path = "crates/client" }
 hyper-util = { version = "0.1", features = ["tokio"] }
+tokio = { version = "1.47.1", features = ["test-util"] }
 
 [lints]
 workspace = true

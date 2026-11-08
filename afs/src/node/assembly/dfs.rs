@@ -506,6 +506,38 @@ pub(super) fn start_background(
     .start(services);
 }
 
+/// T14 `ScrubService`, only for a local (non-external) backend and a nonzero
+/// rate. Must run before `start_repair`, which takes the local ChunkStore.
+pub(super) fn start_scrub(
+    cfg: &Config,
+    assembly: &DfsAssembly,
+    registry: &afs_metrics::Registry,
+    services: &mut Services,
+) -> afs_error::Result<()> {
+    let (Some(local), None) = (
+        assembly.storage.local_chunk_store.clone(),
+        cfg.dfs_external_backend.as_ref(),
+    ) else {
+        return Ok(());
+    };
+    if cfg.dfs_scrub_bytes_per_second == 0 {
+        return Ok(());
+    }
+    let metrics = fault::scrub::ScrubMetrics::register(registry)
+        .map_err(|error| afs_error::Error::coded(afs_error::CONFIG_INVALID, error.to_string()))?;
+    fault::scrub::ScrubService::new(
+        local,
+        fault::scrub::ScrubSettings {
+            bytes_per_second: cfg.dfs_scrub_bytes_per_second,
+            start_delay: std::time::Duration::from_secs(cfg.dfs_scrub_start_delay_seconds),
+            round_interval: std::time::Duration::from_secs(cfg.dfs_scrub_round_interval_seconds),
+        },
+        Some(metrics),
+    )
+    .start(services);
+    Ok(())
+}
+
 /// T9 `RepairService`, only for a local (non-external) backend. Takes the
 /// Meta adapter and the local ChunkStore, which nothing after it uses.
 pub(super) fn start_repair(

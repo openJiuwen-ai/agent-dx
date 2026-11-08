@@ -53,6 +53,11 @@ dfs_catalog_commit_queue = 256
 # dfs_peer_serve_payload_bytes = 16777216
 # One native admission deadline; 0 disables waiting, maximum 50ms.
 # dfs_peer_serve_wait_ms = 20
+# Background scrub of local copies: bytes per second (0 off, else 1MiB..=1GiB),
+# delay after start, and minimum time between round starts.
+# dfs_scrub_bytes_per_second = 33554432
+# dfs_scrub_start_delay_seconds = 300
+# dfs_scrub_round_interval_seconds = 86400
 # Metadata-only source lookahead; no object/body prefetch. Zero max/bytes disables retention.
 # dfs_source_cache_max_ms = 5000
 # dfs_source_lookahead_chunks = 64

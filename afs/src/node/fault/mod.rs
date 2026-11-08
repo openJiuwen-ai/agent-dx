@@ -8,6 +8,7 @@
 //! - `reaper`: the GC collection loop.
 //! - `lease_keeper`: background writer-lease renewal, plus `ensure_fresh` for
 //!   the three main paths whose contract needs a fresh lease (J4).
+//! - `scrub`: background verification of local durable copies (S4-16).
 //! - `suspect`: a reader's failed verification of a peer copy, reviewed by the
 //!   holder.
 //!
@@ -30,5 +31,7 @@ pub(crate) mod lease_keeper;
 pub(crate) mod reaper;
 #[cfg(feature = "dfs")]
 pub(crate) mod repair;
+#[cfg(feature = "dfs")]
+pub(crate) mod scrub;
 #[cfg(feature = "dfs")]
 pub(crate) mod suspect;

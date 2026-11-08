@@ -61,6 +61,8 @@ mod lifecycle;
 mod outboard_file;
 mod peer_serve;
 mod reader;
+#[cfg(any(feature = "dfs", test))]
+mod scrub;
 mod sidecar_install;
 mod staged;
 mod store;
@@ -78,6 +80,8 @@ use peer_serve::*;
 pub use reader::PinnedChunkReader;
 pub(crate) use reader::VerifiedRangeCopy;
 use reader::*;
+#[cfg(any(feature = "dfs", test))]
+pub(crate) use scrub::{ScrubItem, ScrubOutcome};
 use sidecar_install::*;
 #[cfg(feature = "dfs")]
 pub(crate) use staged::MAX_STAGED_CHUNK_BYTES;

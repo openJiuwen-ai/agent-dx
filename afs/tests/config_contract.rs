@@ -2182,3 +2182,77 @@ fn non_product_options_report_exactly_what_is_enabled() {
         ]
     );
 }
+
+/// S4-16: background scrub defaults (on at 32 MiB/s, 300 s start delay,
+/// 24 h round interval), 0 turns it off, out-of-range values are rejected
+/// from TOML and CLI.
+#[test]
+fn s4c_scrub_settings_default_on_and_reject_out_of_range() {
+    let defaults = Config::resolve(Role::Node, Cli::parse_from(["afs-node"])).unwrap();
+    assert_eq!(
+        (
+            defaults.dfs_scrub_bytes_per_second,
+            defaults.dfs_scrub_start_delay_seconds,
+            defaults.dfs_scrub_round_interval_seconds,
+        ),
+        (32 * 1024 * 1024, 300, 86_400)
+    );
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("scrub.toml");
+    std::fs::write(
+        &path,
+        "dfs_scrub_bytes_per_second=0\ndfs_scrub_start_delay_seconds=0\ndfs_scrub_round_interval_seconds=1\n",
+    )
+    .unwrap();
+    let off = Config::resolve(
+        Role::Node,
+        Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+    )
+    .unwrap();
+    assert_eq!(
+        (
+            off.dfs_scrub_bytes_per_second,
+            off.dfs_scrub_start_delay_seconds,
+            off.dfs_scrub_round_interval_seconds,
+        ),
+        (0, 0, 1)
+    );
+    for (key, flag, value) in [
+        (
+            "dfs_scrub_bytes_per_second",
+            "--dfs-scrub-bytes-per-second",
+            "1048575",
+        ),
+        (
+            "dfs_scrub_bytes_per_second",
+            "--dfs-scrub-bytes-per-second",
+            "1073741825",
+        ),
+        (
+            "dfs_scrub_start_delay_seconds",
+            "--dfs-scrub-start-delay-seconds",
+            "86401",
+        ),
+        (
+            "dfs_scrub_round_interval_seconds",
+            "--dfs-scrub-round-interval-seconds",
+            "0",
+        ),
+        (
+            "dfs_scrub_round_interval_seconds",
+            "--dfs-scrub-round-interval-seconds",
+            "2592001",
+        ),
+    ] {
+        std::fs::write(&path, format!("{key}={value}\n")).unwrap();
+        let error = Config::resolve(
+            Role::Node,
+            Cli::parse_from(["afs-node", "--config", path.to_str().unwrap()]),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID, "{key}={value}");
+        let error =
+            Config::resolve(Role::Node, Cli::parse_from(["afs-node", flag, value])).unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID, "{flag} {value}");
+    }
+}
