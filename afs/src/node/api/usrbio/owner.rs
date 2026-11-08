@@ -189,8 +189,10 @@ pub(super) fn reclaim(state: &Mutex<HubState>, backend: &dyn Backend, pid: i32) 
             }
         }
     }
-    afs_logging::info!("usrbio.client_reclaimed"; "pid" => pid, "rings" => done.rings,
-        "registrations" => done.registrations, "handles" => done.handles, "iovs" => done.iovs);
+    if done != Reclaimed::default() {
+        afs_logging::info!("usrbio.client_reclaimed"; "pid" => pid, "rings" => done.rings,
+            "registrations" => done.registrations, "handles" => done.handles, "iovs" => done.iovs);
+    }
     done
 }
 
