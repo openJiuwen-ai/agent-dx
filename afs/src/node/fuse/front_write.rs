@@ -3,7 +3,7 @@
 use libc::{E2BIG, EAGAIN, EIO};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
-    Arc, Condvar, Mutex,
+    Arc, Condvar, Mutex, OnceLock,
     atomic::{AtomicUsize, Ordering},
 };
 use std::thread::{self, JoinHandle};
@@ -12,6 +12,44 @@ type Job = Box<dyn FnMut() -> Result<(), i32> + Send>;
 type Admission = Box<dyn FnOnce(Result<(), i32>) + Send>;
 type RecoveryStart = Box<dyn FnOnce(CallbackGuard) + Send>;
 const MAX_WAITING_ENTRIES: usize = 4096;
+
+/// Admission outcomes counted per mount. `admitted` replies at once;
+/// `waited` replied after a withheld wait; the rest are rejections by reason.
+pub(super) const ADMISSION_OUTCOMES: &[&str] = &[
+    "admitted",
+    "waited",
+    "rejected_total_bytes",
+    "rejected_entries",
+    "rejected_retained_failure",
+    "rejected_file_error",
+    "rejected_too_large",
+    "rejected_closing",
+    "rejected_control",
+];
+
+#[derive(Clone, Copy)]
+enum Outcome {
+    Admitted,
+    Waited,
+    TotalBytes,
+    Entries,
+    RetainedFailure,
+    FileError,
+    TooLarge,
+    Closing,
+    Control,
+}
+
+impl Outcome {
+    fn label(self) -> &'static str {
+        ADMISSION_OUTCOMES[self as usize]
+    }
+}
+
+struct AdmissionMetrics {
+    counter: afs_metrics::IntCounterVec,
+    filesystem: &'static str,
+}
 
 struct Waiter {
     inode: u64,
@@ -46,6 +84,18 @@ struct Shared {
     changed: Condvar,
     limit: usize,
     admitted_limit: usize,
+    metrics: OnceLock<AdmissionMetrics>,
+}
+
+impl Shared {
+    fn count(&self, outcome: Outcome) {
+        if let Some(metrics) = self.metrics.get() {
+            metrics
+                .counter
+                .with_label_values(&[metrics.filesystem, outcome.label()])
+                .inc();
+        }
+    }
 }
 /// How a callback holds the gate. Shared holders of the same file (or of the
 /// namespace) overlap; an exclusive holder excludes every other holder of
@@ -207,6 +257,7 @@ impl FrontWriteQueue {
             changed: Condvar::new(),
             limit,
             admitted_limit,
+            metrics: OnceLock::new(),
         });
         let work = shared.clone();
         let worker = thread::Builder::new()
@@ -219,6 +270,17 @@ impl FrontWriteQueue {
             controls: Arc::new(AtomicUsize::new(0)),
             worker: Mutex::new(Some(worker)),
         })
+    }
+    /// Count admission outcomes into the mount's FUSE metrics.
+    pub(super) fn set_metrics(
+        &self,
+        counter: afs_metrics::IntCounterVec,
+        filesystem: &'static str,
+    ) {
+        let _ = self.shared.metrics.set(AdmissionMetrics {
+            counter,
+            filesystem,
+        });
     }
     /// File callbacks exclude only the same inode: shared callbacks overlap,
     /// an exclusive one excludes every other callback on that inode. A
@@ -322,6 +384,7 @@ impl FrontWriteQueue {
         let lease = ControlLease(self.controls.clone());
         if previous >= 4096 && !closing {
             drop(lease);
+            self.shared.count(Outcome::Control);
             ready(None, Err(EAGAIN));
             return;
         }
@@ -410,15 +473,16 @@ impl FrontWriteQueue {
                 continue;
             }
             let error = if state.closing {
-                Some(EIO)
+                Some((Outcome::Closing, EIO))
             } else if let Some(error) = state.errors.get(&entry.inode) {
-                Some(*error)
+                Some((Outcome::FileError, *error))
             } else if !state.errors.is_empty() {
-                Some(EAGAIN)
+                Some((Outcome::RetainedFailure, EAGAIN))
             } else {
                 None
             };
-            if let Some(error) = error {
+            if let Some((outcome, error)) = error {
+                shared.count(outcome);
                 if let Some(mut entry) = state.entries.remove(index) {
                     let bytes = entry.bytes;
                     if let Some(callback) = entry.admission.take() {
@@ -544,20 +608,21 @@ impl FrontWriteQueue {
         // retain their callback until promotion. Both run outside the state lock.
         let mut callback: Option<Admission> = Some(Box::new(admitted));
         let result = (|| {
-            let mut state = self.shared.state.lock().map_err(|_| EIO)?;
+            let mut state = self.shared.state.lock().map_err(|_| (Outcome::Closing, EIO))?;
             if state.closing || state.closed {
-                return Err(EIO);
+                return Err((Outcome::Closing, EIO));
             }
             if let Some(error) = state.errors.get(&inode) {
-                return Err(*error);
+                return Err((Outcome::FileError, *error));
             }
             if bytes > self.shared.admitted_limit {
-                return Err(E2BIG);
+                return Err((Outcome::TooLarge, E2BIG));
             }
-            if bytes > self.shared.limit.saturating_sub(state.bytes)
-                || state.entries.len() >= MAX_WAITING_ENTRIES
-            {
-                return Err(EAGAIN);
+            if bytes > self.shared.limit.saturating_sub(state.bytes) {
+                return Err((Outcome::TotalBytes, EAGAIN));
+            }
+            if state.entries.len() >= MAX_WAITING_ENTRIES {
+                return Err((Outcome::Entries, EAGAIN));
             }
             let pending = bytes
                 > self
@@ -569,16 +634,37 @@ impl FrontWriteQueue {
                     .iter()
                     .any(|entry| entry.inode == inode && entry.admission.is_some());
             if pending && !state.errors.is_empty() {
-                return Err(EAGAIN);
+                return Err((Outcome::RetainedFailure, EAGAIN));
             }
-            let job = make()?;
-            let admission = if pending { callback.take() } else { None };
+            let job = make().map_err(|error| (Outcome::FileError, error))?;
+            let admission = if pending {
+                callback.take().map(|ready| {
+                    let shared = self.shared.clone();
+                    Box::new(move |result: Result<(), i32>| {
+                        if result.is_ok() {
+                            shared.count(Outcome::Waited);
+                        }
+                        ready(result);
+                    }) as Admission
+                })
+            } else {
+                None
+            };
             Self::record_entry(&mut state, inode, handle, bytes, job, admission);
             self.shared.changed.notify_all();
             Ok(())
         })();
         if let Some(callback) = callback {
-            callback(result);
+            match result {
+                Ok(()) => {
+                    self.shared.count(Outcome::Admitted);
+                    callback(Ok(()));
+                }
+                Err((outcome, error)) => {
+                    self.shared.count(outcome);
+                    callback(Err(error));
+                }
+            }
         }
     }
     #[cfg(test)]

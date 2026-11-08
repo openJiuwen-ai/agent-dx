@@ -189,9 +189,12 @@ impl AfsFuse {
     }
 
     fn enable_write_queue(&mut self, bytes: usize) -> io::Result<()> {
-        self.front_write = Some(Arc::new(
-            front_write::FrontWriteQueue::new(bytes).map_err(io::Error::from_raw_os_error)?,
-        ));
+        let queue =
+            front_write::FrontWriteQueue::new(bytes).map_err(io::Error::from_raw_os_error)?;
+        if let Some((metrics, filesystem)) = &self.requests {
+            queue.set_metrics(metrics.front_write_admissions.clone(), filesystem);
+        }
+        self.front_write = Some(Arc::new(queue));
         Ok(())
     }
 

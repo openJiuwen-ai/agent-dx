@@ -9,6 +9,7 @@ pub struct FuseRequestMetrics {
     pub(super) io_size_bytes: afs_metrics::HistogramVec,
     pub(super) copy_range_duration: afs_metrics::HistogramVec,
     pub(super) write_duration: afs_metrics::HistogramVec,
+    pub(super) front_write_admissions: afs_metrics::IntCounterVec,
 }
 
 impl FuseRequestMetrics {
@@ -46,6 +47,14 @@ impl FuseRequestMetrics {
                 &["filesystem", "source", "stage"],
             )?;
             afs_metrics::register_collector(registry, &write_duration)?;
+            let front_write_admissions = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new(
+                    "afs_fuse_front_write_admissions_total",
+                    "Ordinary queued writes by admission outcome: acknowledged at once, acknowledged after waiting, or rejected with the reason.",
+                ),
+                &["filesystem", "outcome"],
+            )?;
+            afs_metrics::register_collector(registry, &front_write_admissions)?;
             for filesystem in ["ownerfs", "dfs"] {
                 for source in ["page_cache", "write_call"] {
                     for stage in ["queue", "execute"] {
@@ -61,8 +70,11 @@ impl FuseRequestMetrics {
                 for operation in ["read", "write"] {
                     io_size_bytes.with_label_values(&[filesystem, operation]);
                 }
+                for outcome in super::front_write::ADMISSION_OUTCOMES {
+                    front_write_admissions.with_label_values(&[filesystem, outcome]);
+                }
             }
-            Ok(Self { requests, io_size_bytes, copy_range_duration, write_duration })
+            Ok(Self { requests, io_size_bytes, copy_range_duration, write_duration, front_write_admissions })
         })
     }
 
