@@ -9,7 +9,7 @@ pub struct Store {
     pub(super) visible: Arc<Visible>,
     pub(super) writes: mpsc::Sender<Pending>,
     backend: Arc<dyn journal::MetaLog>,
-    next_request_id: AtomicU64,
+    pub(super) next_request_id: AtomicU64,
 }
 
 /// Store-side options; the log backend owns none of these.
@@ -202,7 +202,7 @@ impl Store {
         checkpoint_visible(Arc::clone(&self.visible), Arc::clone(&self.backend)).await
     }
 
-    fn ensure_available(&self) -> Result<()> {
+    pub(super) fn ensure_available(&self) -> Result<()> {
         if self.visible.poisoned.load(Ordering::Acquire) {
             Err(unavailable(
                 "store backend commit failed; restart Meta to reload authority",
@@ -217,58 +217,6 @@ impl Store {
         let state = self.visible.committed.load_full();
         self.ensure_available()?;
         Ok(state)
-    }
-
-    pub(super) async fn mutate(
-        &self,
-        operation: Mutation,
-        priority: InputPriority,
-    ) -> Result<TxnOutcome> {
-        let store_request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let operation_name = operation.operation_name();
-        let span = tracing::info_span!(
-            "meta.store.mutate",
-            store.request_id = store_request_id,
-            store.operation = operation_name,
-            store.batch_id = tracing::field::Empty,
-            result = tracing::field::Empty,
-        );
-        async move {
-            self.ensure_available()?;
-            let bytes = usize::try_from(operation.capacity_charge()?)
-                .map_err(|_| journal::full("queued Meta input charge overflow"))?;
-            let capacity = Some(self.input.admit(bytes, priority).await?);
-            let identity = self.in_flight.admit(&operation)?;
-            let (reply, result) = oneshot::channel();
-            self.writes
-                .send(Pending {
-                    identity,
-                    capacity,
-                    operation,
-                    reply,
-                })
-                .instrument(tracing::info_span!(
-                    "meta.store.enqueue",
-                    store.request_id = store_request_id,
-                    store.operation = operation_name,
-                    result = tracing::field::Empty,
-                ))
-                .await
-                .map_err(|_| unavailable("store commit loop stopped"))?;
-            let outcome = result
-                .instrument(tracing::info_span!(
-                    "meta.store.commit_wait",
-                    store.request_id = store_request_id,
-                    store.operation = operation_name,
-                    result = tracing::field::Empty,
-                ))
-                .await
-                .map_err(|_| unavailable("store commit loop dropped reply"))?;
-            tracing::Span::current().record("result", tracing_result(outcome.as_ref()));
-            outcome
-        }
-        .instrument(span)
-        .await
     }
 }
 
@@ -874,7 +822,7 @@ async fn run_log_commit_loop(
     visible.poisoned.store(true, Ordering::Release);
 }
 
-fn tracing_result(result: std::result::Result<&TxnOutcome, &Error>) -> &'static str {
+pub(super) fn tracing_result(result: std::result::Result<&TxnOutcome, &Error>) -> &'static str {
     match result {
         Ok(TxnOutcome::Committed { .. }) => "committed",
         Ok(TxnOutcome::ConditionFailed { .. }) => "condition_failed",

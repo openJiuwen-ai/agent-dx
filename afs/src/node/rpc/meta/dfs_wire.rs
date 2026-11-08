@@ -33,10 +33,7 @@ pub(super) fn domain_dfs_dir_entry(
     entry: afs_protocol::meta::DfsDirEntry,
 ) -> afs_error::Result<crate::dfs::DirEntryRecord> {
     if entry.name.is_empty() || entry.inode_id.is_empty() {
-        return Err(Error::coded(
-            afs_error::CLIENT_PROTOCOL_VIOLATION,
-            "DfsDirEntry has an empty name or inode id",
-        ));
+        return Err(wire_violation("DfsDirEntry has an empty name or inode id"));
     }
     Ok(crate::dfs::DirEntryRecord {
         name: entry.name,
@@ -57,13 +54,13 @@ fn domain_dfs_inode_kind(
         Ok(afs_protocol::meta::DfsInodeKind::Special) => crate::dfs::InodeKind::Special(
             domain_dfs_special_node(required(special_node, "special_node")?)?,
         ),
-        _ => {
-            return Err(Error::coded(
-                afs_error::CLIENT_PROTOCOL_VIOLATION,
-                "DFS entry has an invalid inode kind",
-            ));
-        }
+        _ => return Err(wire_violation("DFS entry has an invalid inode kind")),
     })
+}
+
+#[cfg(feature = "dfs")]
+fn wire_violation(message: &'static str) -> Error {
+    Error::coded(afs_error::CLIENT_PROTOCOL_VIOLATION, message)
 }
 
 #[cfg(feature = "dfs")]

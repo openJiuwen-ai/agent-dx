@@ -378,3 +378,59 @@ pub(super) struct Pending {
     pub(super) operation: Mutation,
     pub(super) reply: oneshot::Sender<Result<TxnOutcome>>,
 }
+
+impl Store {
+    /// Admit one write into the queued input (waiting as backpressure, R71a)
+    /// and its in-flight identity, enqueue it and wait for the group outcome.
+    pub(super) async fn mutate(
+        &self,
+        operation: Mutation,
+        priority: InputPriority,
+    ) -> Result<TxnOutcome> {
+        let store_request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let operation_name = operation.operation_name();
+        let span = tracing::info_span!(
+            "meta.store.mutate",
+            store.request_id = store_request_id,
+            store.operation = operation_name,
+            store.batch_id = tracing::field::Empty,
+            result = tracing::field::Empty,
+        );
+        async move {
+            self.ensure_available()?;
+            let bytes = usize::try_from(operation.capacity_charge()?)
+                .map_err(|_| journal::full("queued Meta input charge overflow"))?;
+            let capacity = Some(self.input.admit(bytes, priority).await?);
+            let identity = self.in_flight.admit(&operation)?;
+            let (reply, result) = oneshot::channel();
+            self.writes
+                .send(Pending {
+                    identity,
+                    capacity,
+                    operation,
+                    reply,
+                })
+                .instrument(tracing::info_span!(
+                    "meta.store.enqueue",
+                    store.request_id = store_request_id,
+                    store.operation = operation_name,
+                    result = tracing::field::Empty,
+                ))
+                .await
+                .map_err(|_| unavailable("store commit loop stopped"))?;
+            let outcome = result
+                .instrument(tracing::info_span!(
+                    "meta.store.commit_wait",
+                    store.request_id = store_request_id,
+                    store.operation = operation_name,
+                    result = tracing::field::Empty,
+                ))
+                .await
+                .map_err(|_| unavailable("store commit loop dropped reply"))?;
+            tracing::Span::current().record("result", tracing_result(outcome.as_ref()));
+            outcome
+        }
+        .instrument(span)
+        .await
+    }
+}
