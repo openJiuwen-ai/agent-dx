@@ -1,7 +1,7 @@
 //! R52: FUSE failure grading. Pins both the log grade per `op × errno` and the
 //! errno handed to the kernel, which must stay exactly as before grading.
 
-use super::reply::{FuseOp, errno_in, fuse_failure_grade};
+use super::reply::{FuseOp, errno_in, fuse_failure_grade, reply_errno};
 use crate::error::FailureGrade::{self, Debug, Error as Fault, Warn};
 use afs_error::{
     Error, ErrorCode, ErrorKind, IO_ALREADY_EXISTS, IO_CAPACITY, IO_CROSS_DEVICE,
@@ -206,9 +206,42 @@ fn errno_in_matches_edge_mapping_for_every_op() {
         for error in &errors {
             assert_eq!(
                 errno_in(op)(error.clone()),
-                crate::error::errno(error),
+                reply_errno(op, error),
                 "{op:?} {error:?}"
             );
+            let edge = crate::error::errno(error);
+            if edge != libc::ENOSYS || !op.enosys_latches_supported_operation() {
+                assert_eq!(reply_errno(op, error), edge, "{op:?} {error:?}");
+            }
         }
+    }
+}
+
+/// R20: a callback whose operation is supported never answers ENOSYS for an
+/// unsupported argument; the kernel would latch it for the whole mount.
+#[test]
+fn supported_operations_never_answer_enosys_for_unsupported_arguments() {
+    let unsupported_flags = Error::coded(
+        afs_error::NODE_VFS_UNIMPLEMENTED,
+        "rename supports only default replace and RENAME_NOREPLACE",
+    );
+    assert_eq!(crate::error::errno(&unsupported_flags), libc::ENOSYS);
+    assert_eq!(
+        errno_in(FuseOp::Rename)(unsupported_flags.clone()),
+        libc::EINVAL
+    );
+    let latching: Vec<_> = ALL_OPS
+        .into_iter()
+        .filter(|op| op.enosys_latches_supported_operation())
+        .collect();
+    assert_eq!(latching, [FuseOp::Rename]);
+    // Every other callback keeps the edge mapping, including the recorded
+    // OwnerFs remote xattr ENOSYS (whole operation unsupported there).
+    for op in ALL_OPS.into_iter().filter(|op| *op != FuseOp::Rename) {
+        assert_eq!(
+            errno_in(op)(unsupported_flags.clone()),
+            libc::ENOSYS,
+            "{op:?}"
+        );
     }
 }

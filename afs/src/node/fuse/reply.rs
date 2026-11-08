@@ -391,9 +391,33 @@ pub(super) fn fuse_failure_grade(op: FuseOp, errno: i32, error: &Error) -> Failu
 /// Maps a backend error to the kernel errno for `op` and records it at the
 /// grade chosen by [`fuse_failure_grade`]. The errno is exactly
 /// `crate::error::errno(&error)`.
+impl FuseOp {
+    /// The kernel latches ENOSYS from these callbacks for the whole mount
+    /// (`no_rename2` for RENAME2), although the operation itself is supported
+    /// and only this request's arguments (flags) are not. Such a reply must be
+    /// EINVAL, or one RENAME_EXCHANGE attempt disables RENAME_NOREPLACE until
+    /// remount (R20). Other callbacks may answer ENOSYS only when the whole
+    /// operation is never supported (OwnerFs remote xattr is recorded as such).
+    pub(super) fn enosys_latches_supported_operation(self) -> bool {
+        matches!(self, Self::Rename)
+    }
+}
+
+/// The errno a callback replies with: the edge mapping, except that ENOSYS
+/// for a supported operation becomes EINVAL (see
+/// [`FuseOp::enosys_latches_supported_operation`]).
+pub(super) fn reply_errno(op: FuseOp, error: &Error) -> i32 {
+    let errno = crate::error::errno(error);
+    if errno == libc::ENOSYS && op.enosys_latches_supported_operation() {
+        libc::EINVAL
+    } else {
+        errno
+    }
+}
+
 pub(super) fn errno_in(op: FuseOp) -> impl Fn(Error) -> i32 {
     move |error| {
-        let errno = crate::error::errno(&error);
+        let errno = reply_errno(op, &error);
         macro_rules! record {
             ($level:ident) => {
                 afs_logging::$level!(
