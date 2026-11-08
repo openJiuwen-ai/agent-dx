@@ -5,7 +5,7 @@ use super::*;
 pub struct Store {
     pub(super) in_flight: Arc<InFlight>,
     pub(super) read_budget: Arc<ReadBudget>,
-    pub(super) pending_bytes: Arc<Semaphore>,
+    pub(super) input: InputQueue,
     pub(super) visible: Arc<Visible>,
     pub(super) writes: mpsc::Sender<Pending>,
     backend: Arc<dyn journal::MetaLog>,
@@ -177,7 +177,7 @@ impl Store {
         Ok(Self {
             in_flight,
             read_budget: ReadBudget::new(reads)?,
-            pending_bytes: Arc::new(Semaphore::new(PENDING_INPUT_BYTES)),
+            input: InputQueue::new(PENDING_INPUT_BYTES, PENDING_INPUT_WAIT),
             visible,
             writes,
             backend: log,
@@ -219,7 +219,11 @@ impl Store {
         Ok(state)
     }
 
-    async fn mutate(&self, operation: Mutation) -> Result<TxnOutcome> {
+    pub(super) async fn mutate(
+        &self,
+        operation: Mutation,
+        priority: InputPriority,
+    ) -> Result<TxnOutcome> {
         let store_request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let operation_name = operation.operation_name();
         let span = tracing::info_span!(
@@ -231,13 +235,9 @@ impl Store {
         );
         async move {
             self.ensure_available()?;
-            let bytes = u32::try_from(operation.capacity_charge()?)
+            let bytes = usize::try_from(operation.capacity_charge()?)
                 .map_err(|_| journal::full("queued Meta input charge overflow"))?;
-            let capacity = Some(
-                Arc::clone(&self.pending_bytes)
-                    .try_acquire_many_owned(bytes)
-                    .map_err(|_| journal::full("queued Meta input byte capacity exhausted"))?,
-            );
+            let capacity = Some(self.input.admit(bytes, priority).await?);
             let identity = self.in_flight.admit(&operation)?;
             let (reply, result) = oneshot::channel();
             self.writes
@@ -951,7 +951,17 @@ impl MetaStore for Store {
     }
 
     fn compare_and_commit(&self, txn: MetaTxn) -> MetaFuture<'_, TxnOutcome> {
-        Box::pin(async move { self.mutate(Mutation::Transaction(txn)).await })
+        Box::pin(async move {
+            self.mutate(Mutation::Transaction(txn), InputPriority::Foreground)
+                .await
+        })
+    }
+
+    fn compare_and_commit_background(&self, txn: MetaTxn) -> MetaFuture<'_, TxnOutcome> {
+        Box::pin(async move {
+            self.mutate(Mutation::Transaction(txn), InputPriority::Background)
+                .await
+        })
     }
 
     fn watch(&self, after_revision: StoreRevision, limit: usize) -> MetaFuture<'_, WatchBatch> {
@@ -963,7 +973,13 @@ impl MetaStore for Store {
         request: RequestKey,
         lease: NodeSessionLease,
     ) -> MetaFuture<'_, TxnOutcome> {
-        Box::pin(async move { self.mutate(Mutation::RegisterNode(request, lease)).await })
+        Box::pin(async move {
+            self.mutate(
+                Mutation::RegisterNode(request, lease),
+                InputPriority::Foreground,
+            )
+            .await
+        })
     }
 
     fn scan_roots_for_recovery<'a>(

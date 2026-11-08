@@ -2119,7 +2119,7 @@ async fn p3_retention_runtime_input_capacity_rejects_before_enqueue() {
     use journal::MetaLog;
     let log = Arc::new(journal::MemoryLog::new(Default::default()).unwrap());
     let mut store = Store::open_log(log.clone()).await.unwrap();
-    store.pending_bytes = Arc::new(Semaphore::new(1));
+    store.input = InputQueue::new(1, Duration::from_secs(5));
     assert!(
         store
             .register_node_session(RequestKey::new("retained", "input-cap"), lease("new"))
@@ -2143,7 +2143,7 @@ async fn p3_retention_runtime_cancelled_caller_keeps_input_charge_until_ack() {
         persist_before_error: false,
     });
     let store = Arc::new(Store::open_log(log.clone()).await.unwrap());
-    let budget = store.pending_bytes.clone();
+    let budget = store.input.total.clone();
     let full = budget.available_permits();
     let writer = store.clone();
     let key = RequestKey::new("retained", "cancel");
@@ -5007,4 +5007,86 @@ async fn p3_a77_owned_memory_and_real_wal_resource_report() {
             "observations":observations
         })
     );
+}
+
+/// R71a: a full Meta input queue is backpressure. The write waits for queued
+/// input to drain instead of failing at once with ENOSPC.
+#[tokio::test]
+async fn meta_input_queue_full_waits_for_capacity_then_commits() {
+    let log = Arc::new(journal::MemoryLog::new(Default::default()).unwrap());
+    let store = Arc::new(Store::open_log(log).await.unwrap());
+    let held = store
+        .input
+        .total
+        .clone()
+        .acquire_many_owned(PENDING_INPUT_BYTES as u32)
+        .await
+        .unwrap();
+    let writer = store.clone();
+    let task = tokio::spawn(async move {
+        writer
+            .register_node_session(RequestKey::new("r71a", "wait"), lease("new"))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !task.is_finished(),
+        "a full input queue must wait, not reject"
+    );
+    drop(held);
+    task.await.unwrap().unwrap();
+}
+
+/// R71a: when the queue stays full past the admission wait, the error is a
+/// retryable busy code (EAGAIN), never IO_CAPACITY (ENOSPC). A request that
+/// can never fit keeps IO_CAPACITY.
+#[tokio::test]
+async fn meta_input_queue_full_past_the_wait_is_busy_not_disk_full() {
+    let log = Arc::new(journal::MemoryLog::new(Default::default()).unwrap());
+    let mut store = Store::open_log(log).await.unwrap();
+    store.input = InputQueue::new(PENDING_INPUT_BYTES, Duration::from_millis(200));
+    let _held = store
+        .input
+        .total
+        .clone()
+        .acquire_many_owned(PENDING_INPUT_BYTES as u32)
+        .await
+        .unwrap();
+    let error = store
+        .register_node_session(RequestKey::new("r71a", "busy"), lease("new"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), afs_error::META_STORE_BUSY);
+    assert_eq!(crate::error::errno(&error), libc::EAGAIN);
+    let mut tiny = Store::open_log(Arc::new(
+        journal::MemoryLog::new(Default::default()).unwrap(),
+    ))
+    .await
+    .unwrap();
+    tiny.input = InputQueue::new(1, Duration::from_millis(200));
+    let error = tiny
+        .register_node_session(RequestKey::new("r71a", "huge"), lease("new"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), afs_error::IO_CAPACITY);
+}
+
+/// R71a: background commits (GC batches) hold a sub-quota of half the queue,
+/// so they wait for each other while foreground writes still get in.
+#[tokio::test]
+async fn meta_background_input_cannot_take_the_whole_queue() {
+    let queue = InputQueue::new(1000, Duration::from_millis(300));
+    let background = queue.admit(500, InputPriority::Background).await.unwrap();
+    let started = std::time::Instant::now();
+    let error = queue
+        .admit(1, InputPriority::Background)
+        .await
+        .err()
+        .expect("the background sub-quota is full");
+    assert_eq!(error.code(), afs_error::META_STORE_BUSY);
+    assert!(started.elapsed() >= Duration::from_millis(250));
+    let foreground = queue.admit(500, InputPriority::Foreground).await.unwrap();
+    drop(background);
+    drop(foreground);
+    queue.admit(1000, InputPriority::Foreground).await.unwrap();
 }

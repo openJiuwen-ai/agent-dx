@@ -47,6 +47,91 @@ pub(super) enum Mutation {
 }
 
 pub(super) const PENDING_INPUT_BYTES: usize = 128 * 1024 * 1024;
+/// How long a write waits for queued input to drain before the retryable busy
+/// error. Shorter than the Node's default 5 s Meta RPC deadline, so the caller
+/// sees the cause rather than its own timeout.
+pub(super) const PENDING_INPUT_WAIT: Duration = Duration::from_secs(3);
+
+/// Who is queueing input. Background commits (GC batches) also hold a
+/// sub-quota of half the queue, so they never take foreground room.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum InputPriority {
+    Foreground,
+    Background,
+}
+
+/// Queued Meta input bytes (R71a). A full queue is backpressure: a write waits
+/// up to `wait` for earlier input to commit. Only a charge that can never fit
+/// is `IO_CAPACITY`; a queue that stays full is `META_STORE_BUSY` (EAGAIN).
+pub(super) struct InputQueue {
+    pub(super) total: Arc<Semaphore>,
+    total_limit: usize,
+    background: Arc<Semaphore>,
+    background_limit: usize,
+    wait: Duration,
+}
+
+/// Input charge held until the writer has settled the group.
+pub(super) struct InputCharge {
+    _total: OwnedSemaphorePermit,
+    _background: Option<OwnedSemaphorePermit>,
+}
+
+impl InputQueue {
+    pub(super) fn new(total_limit: usize, wait: Duration) -> Self {
+        let background_limit = total_limit / 2;
+        Self {
+            total: Arc::new(Semaphore::new(total_limit)),
+            total_limit,
+            background: Arc::new(Semaphore::new(background_limit)),
+            background_limit,
+            wait,
+        }
+    }
+
+    pub(super) async fn admit(&self, bytes: usize, priority: InputPriority) -> Result<InputCharge> {
+        let limit = match priority {
+            InputPriority::Foreground => self.total_limit,
+            InputPriority::Background => self.background_limit,
+        };
+        if bytes > limit {
+            return Err(journal::full("Meta input exceeds the queue capacity"));
+        }
+        let permits =
+            u32::try_from(bytes).map_err(|_| journal::full("queued Meta input charge overflow"))?;
+        let deadline = tokio::time::Instant::now() + self.wait;
+        let background = match priority {
+            InputPriority::Background => {
+                Some(Self::acquire(&self.background, permits, deadline).await?)
+            }
+            InputPriority::Foreground => None,
+        };
+        Ok(InputCharge {
+            _total: Self::acquire(&self.total, permits, deadline).await?,
+            _background: background,
+        })
+    }
+
+    async fn acquire(
+        semaphore: &Arc<Semaphore>,
+        permits: u32,
+        deadline: tokio::time::Instant,
+    ) -> Result<OwnedSemaphorePermit> {
+        if let Ok(permit) = Arc::clone(semaphore).try_acquire_many_owned(permits) {
+            return Ok(permit);
+        }
+        match tokio::time::timeout_at(deadline, Arc::clone(semaphore).acquire_many_owned(permits))
+            .await
+        {
+            Ok(Ok(permit)) => Ok(permit),
+            Ok(Err(_)) => Err(unavailable("Meta input queue is closed")),
+            Err(_) => Err(Error::coded(
+                afs_error::META_STORE_BUSY,
+                "queued Meta input stayed full until the admission wait expired",
+            )),
+        }
+    }
+}
 
 pub(super) const PROTECTED_KEY_BYTES: u64 = 4 * 1024 * 1024;
 
@@ -289,7 +374,7 @@ impl Drop for InFlightGuard {
 
 pub(super) struct Pending {
     pub(super) identity: InFlightGuard,
-    pub(super) capacity: Option<OwnedSemaphorePermit>,
+    pub(super) capacity: Option<InputCharge>,
     pub(super) operation: Mutation,
     pub(super) reply: oneshot::Sender<Result<TxnOutcome>>,
 }

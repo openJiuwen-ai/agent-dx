@@ -506,7 +506,7 @@ impl DfsService {
         }));
         txn.mutations = mutations;
         Ok(matches!(
-            self.store.compare_and_commit(txn).await?,
+            self.store.compare_and_commit_background(txn).await?,
             TxnOutcome::Committed { .. }
         ))
     }

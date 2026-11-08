@@ -88,6 +88,7 @@ catalog! {
     META_OWNER_HOME_UNAVAILABLE = 0x03040003 => Unavailable;
     META_STORE_UNIMPLEMENTED = 0x03020001 => Unimplemented;
     META_LOG_FENCED = 0x03020002 => FailedPrecondition;
+    META_STORE_BUSY = 0x03020003 => ResourceExhausted;
     META_NODE_PROTOCOL_VERSION = 0x03050001 => FailedPrecondition;
     CONFIG_INVALID = 0x04010001 => InvalidArgument;
     RUNTIME_INTERNAL = 0x04020001 => Internal;

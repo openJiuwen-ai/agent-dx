@@ -193,14 +193,15 @@ impl GcMetrics {
         }
     }
 
-    /// A commit refused for capacity gets a smaller batch; anything else, or the
+    /// A commit refused for capacity (too large for the input queue, or the
+    /// queue staying busy) gets a smaller batch; anything else, or the
     /// smallest batch being refused, is the caller's error.
     pub(super) fn rejected_batch(
         &self,
         error: afs_error::Error,
         batch_keys: usize,
     ) -> Result<usize> {
-        if error.code() != afs_error::IO_CAPACITY {
+        if error.code() != afs_error::IO_CAPACITY && error.code() != afs_error::META_STORE_BUSY {
             return Err(error);
         }
         self.rejected_batches.inc();

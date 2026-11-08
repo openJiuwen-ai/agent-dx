@@ -105,6 +105,12 @@ pub trait MetaStore: Send + Sync {
     /// current Home session for that exact command, root epoch and generation.
     fn compare_and_commit(&self, txn: MetaTxn) -> MetaFuture<'_, TxnOutcome>;
 
+    /// `compare_and_commit` for background work (GC batches): it queues
+    /// within a sub-quota so it never takes the room foreground writes need.
+    fn compare_and_commit_background(&self, txn: MetaTxn) -> MetaFuture<'_, TxnOutcome> {
+        self.compare_and_commit(txn)
+    }
+
     /// Returns ordered changes after `after_revision`, or a compaction cursor
     /// that forces callers to rescan before resuming.
     fn watch(&self, after_revision: StoreRevision, limit: usize) -> MetaFuture<'_, WatchBatch>;
