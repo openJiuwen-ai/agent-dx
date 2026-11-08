@@ -242,6 +242,11 @@ sequenceDiagram
     CM->>CM: apply_file_commit_locked（base_version、base_layout、durable/committed seq）后 notify_all
 ```
 
+副本接收端每 Node 8 个副本槽（`node/rpc/data/dfs_chunks.rs`），前台写与修复共用。槽满是背压：接收端在本次副本传输的
+总期限内排队等槽，写端的流停在 HTTP/2 流控上；期限到才回 `ResourceExhausted`，写端
+（`GrpcReplicaDataPlane::put_peer_replica`）在自己的总期限内退避重试，不把它交给应用。真实磁盘满（`IO_CAPACITY`）
+不重试。`afs_dfs_peer_admissions_total{operation="replica",outcome}` 区分立即取到、排队后取到与期限到被拒。
+
 ### 读
 
 ```mermaid

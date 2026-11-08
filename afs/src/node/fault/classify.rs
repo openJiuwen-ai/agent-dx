@@ -93,6 +93,14 @@ pub(crate) fn remote_copy_content_suspect(error: &Error) -> bool {
     error.code() == afs_error::NODE_TRANSFER_CORRUPT_DATA
 }
 
+/// A peer refused only because its slots or queue were full: the same request
+/// may succeed after a short wait. Set: kind `ResourceExhausted` without code
+/// `IO_CAPACITY` (a full disk is not retried). Used by the replica sender (R71b).
+#[cfg(feature = "dfs")]
+pub(crate) fn retryable_backpressure(error: &Error) -> bool {
+    error.kind() == ErrorKind::ResourceExhausted && error.code() != afs_error::IO_CAPACITY
+}
+
 /// A peer-cache entry is corrupt or gone, so it is retired and counted as a
 /// miss. Set: code `NODE_TRANSFER_CORRUPT_DATA` ∪ kind {`NotFound`}.
 #[cfg(feature = "dfs")]
@@ -144,6 +152,20 @@ mod tests {
             accepted_kinds(verified_copy_is_invalid),
             [ErrorKind::NotFound, ErrorKind::DataLoss]
         );
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn retryable_backpressure_set() {
+        assert_eq!(
+            accepted_kinds(retryable_backpressure),
+            [ErrorKind::ResourceExhausted]
+        );
+        assert!(!retryable_backpressure(&Error::new(
+            afs_error::IO_CAPACITY,
+            ErrorKind::ResourceExhausted,
+            "disk full"
+        )));
     }
 
     #[cfg(feature = "dfs")]

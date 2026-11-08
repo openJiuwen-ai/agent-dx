@@ -4036,3 +4036,214 @@ async fn a_suspect_review_quarantines_only_a_copy_that_is_bad_on_this_disk() {
         .into_inner();
     assert!(!again.reviewed, "cooling down");
 }
+
+/// R71b: a full replica receive admission queues the stream until its
+/// deadline instead of answering `resource_exhausted` at once; a released slot
+/// admits the waiting replica, and only an expired deadline rejects.
+#[cfg(feature = "dfs")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dfs_replica_receive_admission_waits_for_a_slot_until_the_deadline() {
+    use crate::node::chunk::StagedChunk;
+    use afs_protocol::node_data::{
+        dfs_chunks_client::DfsChunksClient, dfs_put_replica_frame::Body,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let local = Arc::new(LocalChunkStore::open(temp.path(), "receiver").unwrap());
+    let staged = StagedChunk::new(
+        crate::dfs::OperationId::new("replica-admission"),
+        vec![41; 64 * 1024],
+    );
+    let target = crate::dfs::ReplicaTarget {
+        node_id: "receiver".into(),
+        node_epoch: 1,
+        data_endpoint: "http://127.0.0.1:1".into(),
+        device: local.device_descriptor().unwrap(),
+    };
+    let op = crate::node::replication::ReplicaPeerOp {
+        chunk_id: staged.chunk.id.clone(),
+        placement_revision: 1,
+        placement_epoch: 1,
+        replica_group_id: crate::dfs::ReplicaGroupId::new("fixture"),
+        initiator_node_id: "reader".into(),
+        initiator_node_epoch: 1,
+        ordered_targets: vec![target.clone()],
+        sync_target_count: 1,
+        target_index: 0,
+        target,
+        chain_tail: vec![],
+        repair_claim: None,
+    };
+    let permits = Arc::new(tokio::sync::Semaphore::new(1));
+    let registry = afs_metrics::Registry::new();
+    let service = DfsChunksService {
+        local_chunks: Some(local.clone()),
+        authenticator: Arc::new(AllowDfsTestPeer),
+        authorizer: Arc::new(DenyDfsReadAuthorizer),
+        replica_authorizer: Arc::new(FixtureReplicaGrant(op.clone())),
+        replica_data_plane: None,
+        replica_permits: permits.clone(),
+        read_permits: Arc::new(tokio::sync::Semaphore::new(8)),
+        replica_timeout: std::time::Duration::from_millis(1500),
+        rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
+        payload_metrics: Some(DfsPayloadMetrics::register(&registry).unwrap()),
+        suspect_reviews: Default::default(),
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(DfsChunksServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let client = DfsChunksClient::connect(format!("http://{address}"))
+        .await
+        .unwrap();
+    let header = super::super::peer::replica_header(&op, &staged).unwrap();
+    let frames = move || {
+        let mut result = vec![DfsPutReplicaFrame {
+            body: Some(Body::Header(header.clone())),
+        }];
+        result.extend(staged.bytes().chunks(DFS_REPLICA_FRAME_BYTES).map(|data| {
+            DfsPutReplicaFrame {
+                body: Some(Body::Data(data.to_vec().into())),
+            }
+        }));
+        result
+    };
+    // Every slot is busy: the replica waits instead of failing at once.
+    let held = permits.clone().acquire_owned().await.unwrap();
+    let mut waiting_client = client.clone();
+    let waiting_frames = frames();
+    let waiting = tokio::spawn(async move {
+        waiting_client
+            .put_replica_stream(tokio_stream::iter(waiting_frames))
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !waiting.is_finished(),
+        "full replica slots must queue, not reject"
+    );
+    drop(held);
+    let reply = waiting.await.unwrap().unwrap().into_inner();
+    assert_eq!(reply.durable_acks.len(), 1);
+    // A slot that never frees rejects only after the admission deadline.
+    let _held = permits.clone().acquire_owned().await.unwrap();
+    let started = std::time::Instant::now();
+    let error = client
+        .clone()
+        .put_replica_stream(tokio_stream::iter(frames()))
+        .await
+        .unwrap_err();
+    assert!(started.elapsed() >= std::time::Duration::from_millis(1000));
+    assert_eq!(error.code(), tonic::Code::ResourceExhausted);
+    let text = afs_metrics::encode_text(&registry).unwrap();
+    for outcome in ["waited", "rejected"] {
+        assert!(
+            text.lines().any(|line| line.starts_with(&format!(
+                "afs_dfs_peer_admissions_total{{operation=\"replica\",outcome=\"{outcome}\"}} 1"
+            ))),
+            "{outcome} not counted:\n{text}"
+        );
+    }
+    server.abort();
+}
+
+/// R71b sender side: a receiver whose slots stay full past its own admission
+/// deadline answers ResourceExhausted; the replica sender backs off and retries
+/// within its total deadline instead of failing the upload.
+#[cfg(feature = "dfs")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dfs_replica_sender_retries_receiver_backpressure_within_its_deadline() {
+    use crate::node::chunk::StagedChunk;
+    use crate::node::replication::ReplicaDataPlane;
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(LocalChunkStore::open(temp.path(), "a").unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = crate::dfs::ReplicaTarget {
+        node_id: "a".into(),
+        node_epoch: 1,
+        data_endpoint: format!("http://{}", listener.local_addr().unwrap()),
+        device: store.device_descriptor().unwrap(),
+    };
+    let staged = StagedChunk::new(
+        crate::dfs::OperationId::new("sender-retry"),
+        vec![73; 96 * 1024],
+    );
+    let op = crate::node::replication::ReplicaPeerOp {
+        chunk_id: staged.chunk.id.clone(),
+        placement_revision: 1,
+        placement_epoch: 1,
+        replica_group_id: crate::dfs::ReplicaGroupId::new("sender-retry"),
+        initiator_node_id: "writer".into(),
+        initiator_node_epoch: 1,
+        ordered_targets: vec![target.clone()],
+        sync_target_count: 1,
+        target_index: 0,
+        target,
+        chain_tail: vec![],
+        repair_claim: None,
+    };
+    let permits = Arc::new(tokio::sync::Semaphore::new(1));
+    let registry = afs_metrics::Registry::new();
+    let service = DfsChunksService {
+        local_chunks: Some(store.clone()),
+        authenticator: Arc::new(FixtureReplicaPeer("writer".into())),
+        authorizer: Arc::new(DenyDfsReadAuthorizer),
+        replica_authorizer: Arc::new(FixtureReplicaGrant(op.clone())),
+        replica_data_plane: None,
+        replica_permits: permits.clone(),
+        read_permits: Arc::new(tokio::sync::Semaphore::new(8)),
+        replica_timeout: std::time::Duration::from_millis(200),
+        rdma_sessions: crate::node::rpc::control::RdmaSessionRegistry::new(None),
+        payload_metrics: Some(DfsPayloadMetrics::register(&registry).unwrap()),
+        suspect_reviews: Default::default(),
+    };
+    let server = tokio::spawn(async move {
+        Server::builder()
+            .add_service(DfsChunksServer::new(service))
+            .serve_with_incoming(TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let plane = Arc::new(
+        super::super::peer::GrpcReplicaDataPlane::new(
+            Arc::new(
+                super::super::peer::PeerConnectionPool::new(
+                    afs_transport::GrpcConfig::default(),
+                    afs_transport::TlsConfig::Disabled,
+                    8,
+                )
+                .unwrap(),
+            ),
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap(),
+    );
+    let held = permits.clone().acquire_owned().await.unwrap();
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        drop(held);
+    });
+    let acks = tokio::task::spawn_blocking(move || plane.put_peer_replica(&op, &staged))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(acks.len(), 1);
+    release.await.unwrap();
+    let text = afs_metrics::encode_text(&registry).unwrap();
+    let rejected = text
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix(
+                "afs_dfs_peer_admissions_total{operation=\"replica\",outcome=\"rejected\"} ",
+            )
+        })
+        .unwrap()
+        .parse::<u64>()
+        .unwrap();
+    assert!(rejected >= 1, "the receiver never pushed back:\n{text}");
+    server.abort();
+}

@@ -7,6 +7,7 @@ use super::*;
 #[derive(Clone)]
 pub struct DfsPayloadMetrics {
     pub(super) bytes: afs_metrics::IntCounterVec,
+    pub(super) admissions: afs_metrics::IntCounterVec,
 }
 
 #[cfg(feature = "dfs")]
@@ -21,13 +22,29 @@ impl DfsPayloadMetrics {
                 &["transport", "direction", "operation"],
             )?;
             afs_metrics::register_collector(registry, &bytes)?;
+            let admissions = afs_metrics::IntCounterVec::new(
+                afs_metrics::Opts::new(
+                    "afs_dfs_peer_admissions_total",
+                    "Peer replica receive slots: taken at once, taken after queueing, or rejected when the admission deadline expired.",
+                ),
+                &["operation", "outcome"],
+            )?;
+            afs_metrics::register_collector(registry, &admissions)?;
             for transport in ["grpc", "rdma"] {
                 for (direction, operation) in [("recv", "replica"), ("send", "read")] {
                     bytes.with_label_values(&[transport, direction, operation]);
                 }
             }
-            Ok(Self { bytes })
+            for outcome in ["immediate", "waited", "rejected"] {
+                admissions.with_label_values(&["replica", outcome]);
+            }
+            Ok(Self { bytes, admissions })
         })
+    }
+    fn admission(&self, operation: &'static str, outcome: &'static str) {
+        self.admissions
+            .with_label_values(&[operation, outcome])
+            .inc();
     }
     pub(super) fn record(
         &self,
@@ -132,6 +149,43 @@ pub fn make_dfs_chunks_server_with_transport(
 }
 
 #[cfg(feature = "dfs")]
+impl DfsChunksService {
+    /// Replica receive admission: take a slot at once, else queue until
+    /// `deadline` (R71b). Two writers sharing a target can exceed its slots;
+    /// that is backpressure, not an error. While queued, the sender's stream
+    /// waits on HTTP/2 flow control. Repair transfers share the same FIFO
+    /// semaphore, so neither side starves.
+    async fn admit_replica(
+        &self,
+        deadline: tokio::time::Instant,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, Status> {
+        let count = |outcome| {
+            if let Some(metrics) = &self.payload_metrics {
+                metrics.admission("replica", outcome);
+            }
+        };
+        if let Ok(permit) = self.replica_permits.clone().try_acquire_owned() {
+            count("immediate");
+            return Ok(permit);
+        }
+        match tokio::time::timeout_at(deadline, self.replica_permits.clone().acquire_owned()).await
+        {
+            Ok(Ok(permit)) => {
+                count("waited");
+                Ok(permit)
+            }
+            Ok(Err(_)) => Err(Status::unavailable("DFS replica admission is closed")),
+            Err(_) => {
+                count("rejected");
+                Err(Status::resource_exhausted(
+                    "DFS replica admission deadline exceeded",
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "dfs")]
 #[tonic::async_trait]
 impl DfsChunks for DfsChunksService {
     type ReadRangesStream =
@@ -143,11 +197,9 @@ impl DfsChunks for DfsChunksService {
     ) -> Result<Response<DfsPutReplicaReply>, Status> {
         use afs_protocol::node_data::dfs_put_replica_frame::Body;
         let peer = authenticate_peer(self.authenticator.as_ref(), &request)?;
-        let permit = self
-            .replica_permits
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Status::resource_exhausted("DFS replica staging slots are full"))?;
+        // One absolute deadline covers queueing and the transfer.
+        let deadline = tokio::time::Instant::now() + self.replica_timeout;
+        let permit = self.admit_replica(deadline).await?;
         let local = self
             .local_chunks
             .clone()
@@ -156,7 +208,7 @@ impl DfsChunks for DfsChunksService {
         let plane = self.replica_data_plane.clone();
         let metrics = self.payload_metrics.clone();
         let mut stream = request.into_inner();
-        tokio::time::timeout(self.replica_timeout, async move {
+        tokio::time::timeout_at(deadline, async move {
             let first = stream
                 .message()
                 .await?
@@ -265,11 +317,8 @@ impl DfsChunks for DfsChunksService {
                     "RDMA replica requires one exact whole-chunk MR window",
                 ));
             }
-            let permit = self
-                .replica_permits
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| Status::resource_exhausted("DFS replica slots are full"))?;
+            let deadline = tokio::time::Instant::now() + self.replica_timeout;
+            let permit = self.admit_replica(deadline).await?;
             let local = self
                 .local_chunks
                 .clone()
@@ -301,8 +350,8 @@ impl DfsChunks for DfsChunksService {
             let poisoned_guard = DfsServerRdmaGuard::new(session.clone());
             let plane = self.replica_data_plane.clone();
             let metrics = self.payload_metrics.clone();
-            let acks = tokio::time::timeout(
-                self.replica_timeout,
+            let acks = tokio::time::timeout_at(
+                deadline,
                 crate::node::bridge::spawn_blocking(move || {
                     let _permit = permit;
                     ensure_replica_grant_live(grant.expires_at_unix_ms)?;

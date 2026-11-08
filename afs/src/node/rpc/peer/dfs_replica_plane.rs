@@ -53,57 +53,85 @@ impl crate::node::replication::ReplicaDataPlane for GrpcReplicaDataPlane {
             ));
         }
         let header = replica_header(op, staged)?;
-        let staged = staged.clone();
         self.runtime.block_on(async {
-            tokio::time::timeout(self.timeout, async {
-                let channel = self
-                    .peers
-                    .channel(
-                        &op.target.node_id,
-                        op.target.node_epoch,
-                        &op.target.data_endpoint,
-                    )
-                    .await?;
-                let mut client = DfsChunksClient::new(channel)
-                    .max_encoding_message_size(self.peers.config.max_encoding_message_bytes)
-                    .max_decoding_message_size(self.peers.config.max_decoding_message_bytes);
-                let validation_staged = staged.clone();
-                let frames = tokio_stream::iter(std::iter::once(
-                    afs_protocol::node_data::DfsPutReplicaFrame {
-                        body: Some(
-                            afs_protocol::node_data::dfs_put_replica_frame::Body::Header(header),
-                        ),
-                    },
-                ))
-                .chain(tokio_stream::iter(replica_data_frames(staged)));
-                let mut request = request_with_current_context(frames);
-                request.set_timeout(self.timeout);
-                let reply = client
-                    .put_replica_stream(request)
-                    .await
-                    .map_err(afs_transport::grpc::error_status::status_to_error)?
-                    .into_inner();
-                if reply.durable_acks.len() != op.sync_target_count - op.target_index {
-                    return Err(dfs_protocol_error(
-                        "replica reply does not include the complete synchronous tail",
-                    ));
-                }
-                let acks = reply
-                    .durable_acks
-                    .into_iter()
-                    .map(domain_replica_ack)
-                    .collect::<afs_error::Result<Vec<_>>>()?;
-                crate::node::replication::validate_peer_acks(op, &validation_staged, &acks)?;
-                Ok(acks)
-            })
-            .await
-            .map_err(|_| {
-                afs_error::Error::coded(
-                    afs_error::CLIENT_DEADLINE_EXCEEDED,
-                    "DFS replica transfer total deadline exceeded",
+            // One total deadline. A receiver whose slots stay full past its own
+            // admission deadline answers ResourceExhausted; retry that with a
+            // short backoff instead of failing the upload (R71b).
+            let deadline = tokio::time::Instant::now() + self.timeout;
+            let mut backoff = Duration::from_millis(5);
+            loop {
+                let attempt = tokio::time::timeout_at(
+                    deadline,
+                    self.put_peer_replica_once(op, header.clone(), staged.clone(), deadline),
                 )
-            })?
+                .await
+                .map_err(|_| {
+                    afs_error::Error::coded(
+                        afs_error::CLIENT_DEADLINE_EXCEEDED,
+                        "DFS replica transfer total deadline exceeded",
+                    )
+                })?;
+                match attempt {
+                    Err(error)
+                        if crate::node::fault::classify::retryable_backpressure(&error)
+                            && tokio::time::Instant::now() + backoff < deadline =>
+                    {
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(Duration::from_millis(200));
+                    }
+                    result => return result,
+                }
+            }
         })
+    }
+}
+
+#[cfg(feature = "dfs")]
+impl GrpcReplicaDataPlane {
+    async fn put_peer_replica_once(
+        &self,
+        op: &crate::node::replication::ReplicaPeerOp,
+        header: afs_protocol::node_data::DfsPutReplicaHeader,
+        staged: crate::node::chunk::StagedChunk,
+        deadline: tokio::time::Instant,
+    ) -> afs_error::Result<Vec<crate::dfs::ReplicaAck>> {
+        let channel = self
+            .peers
+            .channel(
+                &op.target.node_id,
+                op.target.node_epoch,
+                &op.target.data_endpoint,
+            )
+            .await?;
+        let mut client = DfsChunksClient::new(channel)
+            .max_encoding_message_size(self.peers.config.max_encoding_message_bytes)
+            .max_decoding_message_size(self.peers.config.max_decoding_message_bytes);
+        let validation_staged = staged.clone();
+        let frames = tokio_stream::iter(std::iter::once(
+            afs_protocol::node_data::DfsPutReplicaFrame {
+                body: Some(afs_protocol::node_data::dfs_put_replica_frame::Body::Header(header)),
+            },
+        ))
+        .chain(tokio_stream::iter(replica_data_frames(staged)));
+        let mut request = request_with_current_context(frames);
+        request.set_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()));
+        let reply = client
+            .put_replica_stream(request)
+            .await
+            .map_err(afs_transport::grpc::error_status::status_to_error)?
+            .into_inner();
+        if reply.durable_acks.len() != op.sync_target_count - op.target_index {
+            return Err(dfs_protocol_error(
+                "replica reply does not include the complete synchronous tail",
+            ));
+        }
+        let acks = reply
+            .durable_acks
+            .into_iter()
+            .map(domain_replica_ack)
+            .collect::<afs_error::Result<Vec<_>>>()?;
+        crate::node::replication::validate_peer_acks(op, &validation_staged, &acks)?;
+        Ok(acks)
     }
 }
 
