@@ -243,6 +243,69 @@ fn stored_reference_id(id: &str) -> String {
         None => id.to_owned(),
     }
 }
+/// How long the single external deleter has held its generation (S4-9).
+///
+/// An external object has one copy that any Node can delete, so a deleter
+/// that stays registered but never finishes (its object store hangs) must not
+/// hold collection forever: past the deadline the next live participant that
+/// calls takes the generation over. Deleting an object twice is harmless; its
+/// metadata left with the plan. Process-local: a Meta restart restarts it.
+#[derive(Clone)]
+pub(super) struct DeleterWatch {
+    handoff: std::time::Duration,
+    held: Arc<std::sync::Mutex<Option<(u64, String, std::time::Instant)>>>,
+}
+
+/// A batch of up to 512 deletions; well past a healthy store's latency.
+const GC_DELETER_HANDOFF: std::time::Duration = std::time::Duration::from_secs(120);
+
+impl Default for DeleterWatch {
+    fn default() -> Self {
+        Self::new(GC_DELETER_HANDOFF)
+    }
+}
+
+impl DeleterWatch {
+    fn new(handoff: std::time::Duration) -> Self {
+        Self {
+            handoff,
+            held: Arc::default(),
+        }
+    }
+
+    /// Moves an overdue generation to `caller`; true if it did.
+    fn hand_over(&self, gc: &mut GcState, caller: &str, participants: &BTreeSet<String>) -> bool {
+        let [deleter] = gc.waiting_nodes.as_slice() else {
+            return false;
+        };
+        let Ok(mut held) = self.held.lock() else {
+            return false;
+        };
+        let now = std::time::Instant::now();
+        let since = match held.as_ref() {
+            Some((generation, node, since)) if *generation == gc.generation && node == deleter => {
+                *since
+            }
+            _ => {
+                *held = Some((gc.generation, deleter.clone(), now));
+                now
+            }
+        };
+        if deleter == caller
+            || !participants.contains(caller)
+            || now.duration_since(since) < self.handoff
+        {
+            return false;
+        }
+        afs_logging::warn!("dfs.gc_deleter_handoff"; "generation" => gc.generation,
+            "from" => deleter.as_str(), "to" => caller,
+            "held_seconds" => now.duration_since(since).as_secs());
+        gc.waiting_nodes = vec![caller.to_owned()];
+        *held = Some((gc.generation, caller.to_owned(), now));
+        true
+    }
+}
+
 fn ref_key(node: &str, session: &str, id: &str) -> MetaKey {
     MetaKey::DfsReference {
         node_id: node.into(),
@@ -280,6 +343,14 @@ fn live_caller(entities: &[MetaEntity], node: &str, session: &str) -> Result<()>
 impl DfsService {
     pub fn with_gc_grace_ms(mut self, grace: u64) -> Self {
         self.gc_grace_ms = grace;
+        self
+    }
+
+    /// How long an external deleter may hold a generation before another live
+    /// participant takes it over (S4-9).
+    #[must_use]
+    pub fn with_gc_deleter_handoff(mut self, handoff: std::time::Duration) -> Self {
+        self.gc_deleter = DeleterWatch::new(handoff);
         self
     }
 
@@ -635,7 +706,9 @@ impl DfsService {
                 if completed == gc.generation {
                     gc.waiting_nodes.retain(|value| value != &node);
                 }
-                if gc.waiting_nodes.len() != waiting {
+                let handed_over = self.is_external_backend()
+                    && self.gc_deleter.hand_over(&mut gc, &node, &participants);
+                if gc.waiting_nodes.len() != waiting || handed_over {
                     if gc.waiting_nodes.is_empty() {
                         gc.chunks.clear();
                     }
@@ -663,7 +736,9 @@ impl DfsService {
                         continue;
                     }
                 }
-                self.gc_metrics.dropped_nodes.inc_by(dropped as u64);
+                self.gc_metrics
+                    .dropped_nodes
+                    .inc_by(dropped as u64 + u64::from(handed_over));
                 self.gc_metrics.retired_references.inc_by(retired);
                 return Ok(gc);
             }

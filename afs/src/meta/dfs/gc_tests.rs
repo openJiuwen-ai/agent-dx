@@ -1785,6 +1785,89 @@ async fn external_collection_waits_for_one_deleter_that_also_lists() {
     assert_eq!(ticket.waiting_nodes, vec!["a".to_owned()]);
 }
 
+/// S4-9: an external deleter that stays registered but never finishes (its
+/// object store hangs) would hold every later generation. Past the handoff
+/// deadline another live participant takes the deletion over; before it, the
+/// deleter keeps it, and its late acknowledgement changes nothing.
+#[tokio::test]
+async fn an_overdue_external_deleter_hands_its_generation_to_another_live_node() {
+    let orphan = generational_chunk("crashed", b"orphan");
+    let (store, _) = seeded_store(vec![]).await;
+    register(
+        &store,
+        "a",
+        "a1",
+        std::time::Duration::from_secs(30),
+        vec![storage_device("a")],
+    )
+    .await;
+    let service = external_gc_service(store.clone())
+        .with_gc_deleter_handoff(std::time::Duration::from_millis(200));
+    let ticket = service
+        .collect_garbage("a".into(), "a1".into(), 0, vec![orphan.clone()])
+        .await
+        .unwrap();
+    assert_eq!(ticket.waiting_nodes, vec!["a".to_owned()]);
+    let early = service
+        .collect_garbage("n".into(), "s".into(), 0, vec![])
+        .await
+        .unwrap();
+    assert_eq!(early.waiting_nodes, vec!["a".to_owned()], "not overdue yet");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let late = service
+        .collect_garbage("n".into(), "s".into(), 0, vec![])
+        .await
+        .unwrap();
+    assert_eq!(late.generation, ticket.generation);
+    assert_eq!(late.waiting_nodes, vec!["n".to_owned()]);
+    assert_eq!(late.chunks, vec![orphan.id.clone()]);
+    let done = service
+        .collect_garbage("n".into(), "s".into(), late.generation, vec![])
+        .await
+        .unwrap();
+    assert!(done.waiting_nodes.is_empty(), "{done:?}");
+    let stale = service
+        .collect_garbage("a".into(), "a1".into(), late.generation, vec![])
+        .await
+        .unwrap();
+    assert!(stale.waiting_nodes.is_empty(), "{stale:?}");
+}
+
+/// Native copies live on each Node's own disk: nobody can delete another
+/// Node's copy, so a native generation never changes hands.
+#[tokio::test]
+async fn a_native_generation_never_hands_its_deletion_to_another_node() {
+    let (store, _) = seeded_store(vec![]).await;
+    register(
+        &store,
+        "a",
+        "a1",
+        std::time::Duration::from_secs(30),
+        vec![storage_device("a")],
+    )
+    .await;
+    let orphan = generational_chunk("native-orphan", b"orphan");
+    let service = DfsService::new(store.clone())
+        .with_gc_grace_ms(0)
+        .with_gc_deleter_handoff(std::time::Duration::ZERO);
+    let ticket = service
+        .collect_garbage("a".into(), "a1".into(), 0, vec![orphan])
+        .await
+        .unwrap();
+    assert_eq!(ticket.waiting_nodes, vec!["a".to_owned(), "n".to_owned()]);
+    let n_done = service
+        .collect_garbage("n".into(), "s".into(), ticket.generation, vec![])
+        .await
+        .unwrap();
+    assert_eq!(n_done.waiting_nodes, vec!["a".to_owned()]);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let later = service
+        .collect_garbage("n".into(), "s".into(), ticket.generation, vec![])
+        .await
+        .unwrap();
+    assert_eq!(later.waiting_nodes, vec!["a".to_owned()]);
+}
+
 /// R05：等待期间上报的列举页也登记，下一代回收；不因为碰上一代未结束而丢页。
 #[tokio::test]
 async fn external_inventory_reported_while_waiting_is_collected_next() {

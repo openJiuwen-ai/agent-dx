@@ -988,7 +988,10 @@ inode、FileVersion、LayoutRoot 与数据块，两层职责不混用。
 一个计划分批提交：每批至多 4096 个 key，一次回收调用至多 16 批；每代至多 512 个 chunk，有积压时约每秒一代。chunk 与它的 placement、copy、task 同批删除；其余实体都从活根不可达，删去任何子集都不改变活数据，崩溃后重新规划即可继续。提交被容量拒绝时批大小减半，到 64 仍被拒才报错。回收停滞看 `afs_meta_dfs_gc_stalled_seconds`、`afs_meta_dfs_gc_dead_keys`、`afs_meta_dfs_gc_rejected_batches_total` 与日志 `dfs.gc_stalled`。Node 每 5 秒推进。引用释放不限速：一次 `ReleaseGcReferences` 调用在
 一个事务内退休至多 1024 个引用，每次回收调用先排空释放队列，队列积压到 256 个时唤醒回收循环只
 做释放；积压到 65536 个时，新建引用先排空队列，Meta 不接受释放就连新引用一起失败，队列因此有
-界。不可达 Node 会保守阻塞当前物理删除批次，不以心跳失联推定磁盘已清空。DFS 外部对象持久化模式目前不启用本机块回收；
+界。不可达 Node 会保守阻塞当前物理删除批次，不以心跳失联推定磁盘已清空。外部对象（S3）模式一代只等一个删除者（存活
+存储 Node 中 id 最小的）：它失联后被移出等待集合，剩余对象由列举对账找回；它仍注册却 120 秒没有完成（例如对象存储挂起），
+下一个调用回收的存活 Node 接过这一代并删除同一批对象（重复删除无害，日志 `dfs.gc_deleter_handoff`，计入
+`afs_meta_dfs_gc_dropped_nodes_total`）。本机副本只有持有者能删，原生模式不转交。DFS 外部对象持久化模式目前不启用本机块回收；
 其对象删除需要独立的外部存储回收合同，不能直接套用 NodeReplicated 协议。
 
 ## Meta 每操作成本
