@@ -18,12 +18,12 @@ use crate::dfs::{
     InodeAttributes, InodeId, InodeKind, InodeRecord, LayoutRoot, LayoutRootId, LinkRequest,
     ListXattrRequest, LocalCopyPolicy, MkdirRequest, MknodRequest, NamespaceId, OperationId,
     PlacementHealth, PlacementRecord, PlacementSnapshot, ReadLinkRequest, RemoveXattrRequest,
-    RenameMode, RenameOutcome, RenameRequest, ReplicaAck, ReplicaGroup, ReplicaGroupId,
-    ReplicaTarget, ReplicaWriteGrant, ReplicationClaim, ReplicationConfig, ReplicationTask,
-    ReplicationTaskId, ReplicationTaskState, ReportChunkCorruption, ReportReplicationTask,
-    RmdirRequest, SetInodeAttrRequest, SetXattrRequest, SourceCandidate, SpecialNodeKind,
-    SymlinkRequest, SyncInodeMetadata, UnlinkRequest, ValidateReplicaWriteRequest, WriteLease,
-    XattrSetMode,
+    RenameMode, RenameOutcome, RenameRequest, ReplicaAck, ReplicaFailureConfig, ReplicaGroup,
+    ReplicaGroupId, ReplicaTarget, ReplicaWriteGrant, ReplicationClaim, ReplicationConfig,
+    ReplicationTask, ReplicationTaskId, ReplicationTaskState, ReportChunkCorruption,
+    ReportReplicationTask, RmdirRequest, SetInodeAttrRequest, SetXattrRequest, SourceCandidate,
+    SpecialNodeKind, SymlinkRequest, SyncInodeMetadata, UnlinkRequest, ValidateReplicaWriteRequest,
+    WriteLease, XattrSetMode,
 };
 
 use super::store::{
@@ -55,6 +55,7 @@ pub const READ_DIR_PAGE_MAX: usize = 1024;
 pub struct DfsService {
     store: Arc<dyn MetaStore>,
     replication: ReplicationConfig,
+    failure: ReplicaFailureConfig,
     durability_policy: DfsDurabilityPolicy,
     read_grant_key: Arc<Option<[u8; 32]>>,
     gc_grace_ms: u64,
@@ -120,6 +121,7 @@ impl DfsService {
         Self {
             store,
             replication,
+            failure: ReplicaFailureConfig::default(),
             durability_policy,
             read_grant_key: Arc::new(read_grant_key),
             gc_grace_ms: 1_000,
@@ -127,6 +129,13 @@ impl DfsService {
             gc_reference_updates: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(()))),
             repair_patrol: Arc::default(),
         }
+    }
+
+    /// The replica failure contract this Meta initializes or verifies (R12).
+    #[must_use]
+    pub fn with_replica_failure_config(mut self, failure: ReplicaFailureConfig) -> Self {
+        self.failure = failure;
+        self
     }
 
     /// Creates the single filesystem replication contract or verifies the
@@ -141,7 +150,13 @@ impl DfsService {
         if !self.replication.is_valid() {
             return Err(invalid("DFS replication config is invalid"));
         }
+        if !self.failure.is_valid_for(&self.replication) {
+            return Err(invalid(
+                "DFS min_degraded_copies must be in 1..=sync_required_copies",
+            ));
+        }
         self.initialize_durability_policy().await?;
+        self.initialize_replica_failure_config().await?;
         let existing = self.store.read(MetaRead::DfsReplicationConfig).await?;
         if let Some(MetaEntity::DfsReplicationConfig(config)) = existing.entity {
             return if config == self.replication {
@@ -252,6 +267,52 @@ impl DfsService {
                 "DFS durability policy changed during initialization",
             )),
             _ => Err(invalid("DFS durability policy was not persisted")),
+        }
+    }
+
+    /// Same contract as the replication config: written once, then every start
+    /// must name the same value. A filesystem without the record (initialized
+    /// before R12) takes the configured value on its next start.
+    async fn initialize_replica_failure_config(&self) -> Result<()> {
+        let existing = self.store.read(MetaRead::DfsReplicaFailureConfig).await?;
+        if let Some(MetaEntity::DfsReplicaFailureConfig(failure)) = existing.entity {
+            return if failure == self.failure {
+                Ok(())
+            } else {
+                Err(conflict(
+                    "DFS replica failure policy is immutable; reinitialize the filesystem to change it",
+                ))
+            };
+        }
+        let request = RequestKey::new("afs-meta", "dfs-replica-failure-config-v1");
+        let mut txn = MetaTxn::new(
+            request.clone(),
+            StoreOperation::DfsInitializeReplicaFailureConfig,
+        );
+        txn.conditions.extend([
+            TxnCondition::RequestAbsent(request.clone()),
+            TxnCondition::Missing(MetaKey::DfsReplicaFailureConfig),
+        ]);
+        txn.mutations.extend([
+            TxnMutation::Put(MetaEntity::DfsReplicaFailureConfig(self.failure)),
+            TxnMutation::RecordRequestOutcome(RequestOutcome {
+                request,
+                operation: StoreOperation::DfsInitializeReplicaFailureConfig,
+                result: OperationResult::Empty,
+            }),
+        ]);
+        let _ = self.store.compare_and_commit(txn).await?;
+        match self
+            .store
+            .read(MetaRead::DfsReplicaFailureConfig)
+            .await?
+            .entity
+        {
+            Some(MetaEntity::DfsReplicaFailureConfig(failure)) if failure == self.failure => Ok(()),
+            Some(MetaEntity::DfsReplicaFailureConfig(_)) => Err(conflict(
+                "DFS replica failure policy changed during initialization",
+            )),
+            _ => Err(invalid("DFS replica failure policy was not persisted")),
         }
     }
 
@@ -528,3 +589,6 @@ mod txn_snapshot_tests;
 
 #[cfg(all(test, feature = "dfs"))]
 mod request_digest_golden_tests;
+
+#[cfg(all(test, feature = "dfs"))]
+mod degraded_write_tests;

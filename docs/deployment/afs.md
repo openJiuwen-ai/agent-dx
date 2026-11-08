@@ -236,6 +236,8 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `dfs_min_distinct_nodes` | 产品差异 | Meta | `1` | 副本至少分布的 Node 数 |
 | `dfs_min_distinct_failure_domains` | 产品差异 | Meta | `1` | 副本至少分布的故障域数 |
 | `dfs_local_copy` | 产品差异 | Meta | `required` | 写入 Node 是否必须持有副本：`required`、`preferred` 或 `none` |
+| `dfs_replica_failure_policy` | 产品差异 | Meta | `degrade` | 同步副本写不成时：`degrade` 用已持有的副本提交并登记欠副本待补齐，`strict` 让写入失败；Meta 初始化时固定 |
+| `dfs_min_degraded_copies` | 产品差异 | Meta | `1` | 降级写至少保留的可靠副本数，`1..=dfs_sync_required_copies`；Meta 初始化时固定 |
 | `dfs_read_crc_mode` | 产品差异 | Node | `receiver` | 原生 DFS gRPC 远端读的正文校验：`receiver`（默认，坏副本不交给应用）或 `off`（显式关闭，可能交付静默损坏）；其他后端和通道固定走内部策略，`--print-config` 显示 `both`，且不接受显式设置 |
 | `log_level` | 产品差异 | 两者 | `info` | 日志级别 |
 | `trace_enabled` | 产品差异 | 两者 | `false` | 是否导出 Trace |
@@ -304,7 +306,7 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 
 OwnerFs workspace bind 的 3 个键目前没有启动 WARN。
 
-**Meta 专用键写在 Node 配置里**。`meta_*` 13 个调优键、`dfs_desired_copies`、`dfs_sync_required_copies`、`dfs_min_distinct_nodes`、`dfs_min_distinct_failure_domains`、`dfs_local_copy`、`dfs_gc_grace_ms` 写在 Node 配置里不会报错：Node 只解析和校验，不使用这些值，修改它们不会改变 Meta 的行为，副本策略以 Meta 配置为准。配置了 `dfs_external_backend` 时，Node 还会校验那 4 个副本计数都是 `1`、`dfs_local_copy` 是 `required`，否则启动失败。`meta_store` 写在 Node 配置里同样不生效，Node 通过注册结果判断 Meta 的持久能力。例外是 `ownerfs_mkdir_load_balance`，写在 Node 配置里会启动失败。Node 专用键写在 Meta 配置里也只解析和校验，例外是 `experimental_ownerfs_workspace_bind = true`，在 Meta 上会启动失败。
+**Meta 专用键写在 Node 配置里**。`meta_*` 13 个调优键、`dfs_desired_copies`、`dfs_sync_required_copies`、`dfs_min_distinct_nodes`、`dfs_min_distinct_failure_domains`、`dfs_local_copy`、`dfs_replica_failure_policy`、`dfs_min_degraded_copies`、`dfs_gc_grace_ms` 写在 Node 配置里不会报错：Node 只解析和校验，不使用这些值，修改它们不会改变 Meta 的行为，副本策略以 Meta 配置为准。配置了 `dfs_external_backend` 时，Node 还会校验那 4 个副本计数都是 `1`、`dfs_local_copy` 是 `required`，否则启动失败。`meta_store` 写在 Node 配置里同样不生效，Node 通过注册结果判断 Meta 的持久能力。例外是 `ownerfs_mkdir_load_balance`，写在 Node 配置里会启动失败。Node 专用键写在 Meta 配置里也只解析和校验，例外是 `experimental_ownerfs_workspace_bind = true`，在 Meta 上会启动失败。
 
 ## OwnerFs workspace bind ON
 

@@ -167,8 +167,8 @@ async fn register_node_refuses_other_protocol_versions_before_writing() {
     ));
     let supported = afs::format::version::NODE_META_PROTOCOL;
     assert_eq!(
-        supported, 5,
-        "generation 4 predates the paged ReadDir (S4a R72)"
+        supported, 6,
+        "generation 5 predates the replica failure contract (S4b R12)"
     );
     for found in [0, 1, supported - 1, supported + 1] {
         let mut request = request("session-old");

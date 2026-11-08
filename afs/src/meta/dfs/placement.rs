@@ -46,11 +46,17 @@ impl DfsService {
             .collect::<Vec<_>>();
 
         let local_copy = EffectiveLocalCopy::declared(&replication);
-        let replica_groups =
-            build_replica_groups(&caller_id, &replication, local_copy, &storage_sessions)?;
+        let replica_groups = build_replica_groups(
+            &caller_id,
+            &replication,
+            self.failure,
+            local_copy,
+            &storage_sessions,
+        )?;
         Ok(PlacementSnapshot {
             revision: config_snapshot.revision.0.max(sessions_snapshot.revision.0),
             replication,
+            failure: self.failure,
             replica_groups,
             local_copy,
         })
@@ -159,6 +165,7 @@ impl DfsService {
             replica_group_id: request.replica_group_id,
             target_index: request.target_index,
             replication: placement.replication.clone(),
+            failure: placement.failure,
             // Authority has checked the frozen order and device identities
             // against current placement. Keep the caller's validated catalog
             // floors so granting a retry cannot rewrite its transfer identity.
@@ -174,9 +181,43 @@ impl DfsService {
     }
 }
 
+/// The smallest group a placement may hand out.
+#[derive(Clone, Copy)]
+struct GroupMinimum {
+    copies: usize,
+    nodes: usize,
+    domains: usize,
+}
+
+impl GroupMinimum {
+    fn complete(replication: &ReplicationConfig) -> Self {
+        Self {
+            copies: usize::from(replication.sync_required_copies),
+            nodes: usize::from(replication.min_distinct_nodes),
+            domains: usize::from(replication.min_distinct_failure_domains),
+        }
+    }
+
+    /// Too few live storage Nodes for a complete group under `degrade`: a
+    /// group of at least the degraded floor (R12 M4/M5). Its node and domain
+    /// counts are whatever its distinct targets give.
+    fn degraded(floor: usize) -> Self {
+        Self {
+            copies: floor,
+            nodes: floor,
+            domains: 1,
+        }
+    }
+
+    fn targets(self) -> usize {
+        self.copies.max(self.nodes).max(self.domains)
+    }
+}
+
 pub(super) fn build_replica_groups(
     caller_id: &str,
     replication: &ReplicationConfig,
+    failure: ReplicaFailureConfig,
     local_copy: EffectiveLocalCopy,
     sessions: &[NodeSession],
 ) -> Result<Vec<ReplicaGroup>> {
@@ -203,16 +244,18 @@ pub(super) fn build_replica_groups(
         ));
     }
 
-    let required_targets = usize::from(replication.sync_required_copies)
-        .max(usize::from(replication.min_distinct_nodes))
-        .max(usize::from(replication.min_distinct_failure_domains));
-    if targets.len() < required_targets {
+    let complete = GroupMinimum::complete(replication);
+    let minimum = match failure.degraded_floor(replication) {
+        Some(floor) if targets.len() < complete.targets() => GroupMinimum::degraded(floor),
+        _ => complete,
+    };
+    if targets.len() < minimum.targets() {
         return Err(conflict(
             "DFS placement has too few live storage nodes for the configured policy",
         ));
     }
     let target_count = usize::from(replication.desired_copies).min(targets.len());
-    if target_count < required_targets {
+    if target_count < minimum.targets() {
         return Err(conflict(
             "DFS placement cannot satisfy sync, node or failure-domain minima",
         ));
@@ -231,6 +274,7 @@ pub(super) fn build_replica_groups(
                 if let Some(group) = build_replica_group(
                     replication,
                     local_copy,
+                    minimum,
                     Some(head.clone()),
                     &tail,
                     target_count,
@@ -242,9 +286,15 @@ pub(super) fn build_replica_groups(
         }
         None => {
             for seed in 0..targets.len() {
-                if let Some(group) =
-                    build_replica_group(replication, local_copy, None, &targets, target_count, seed)
-                {
+                if let Some(group) = build_replica_group(
+                    replication,
+                    local_copy,
+                    minimum,
+                    None,
+                    &targets,
+                    target_count,
+                    seed,
+                ) {
                     groups.push(group);
                 }
             }
@@ -280,6 +330,7 @@ fn preferred_replica_target(session: &NodeSession) -> Option<ReplicaTarget> {
 fn build_replica_group(
     replication: &ReplicationConfig,
     local_copy: EffectiveLocalCopy,
+    minimum: GroupMinimum,
     head: Option<ReplicaTarget>,
     candidates: &[ReplicaTarget],
     target_count: usize,
@@ -315,9 +366,9 @@ fn build_replica_group(
         }
     }
 
-    if selected.len() < usize::from(replication.sync_required_copies)
-        || nodes.len() < usize::from(replication.min_distinct_nodes)
-        || domains.len() < usize::from(replication.min_distinct_failure_domains)
+    if selected.len() < minimum.copies
+        || nodes.len() < minimum.nodes
+        || domains.len() < minimum.domains
     {
         return None;
     }

@@ -146,6 +146,7 @@ copy_heap!(
     dfs::DigestAlgorithm,
     dfs::ChunkEncoding,
     dfs::LocalCopyPolicy,
+    dfs::ReplicaFailureConfig,
     dfs::CopyRole,
     dfs::CopyState,
     dfs::PlacementHealth,
@@ -604,7 +605,9 @@ impl Heap for super::MetaKey {
             Self::DfsChunk(value) | Self::DfsPlacement(value) => c.value(value),
             Self::DfsCopy(value) => c.value(value),
             Self::DfsReplicationTask(value) => c.value(value),
-            Self::DfsReplicationConfig | Self::DfsDurabilityPolicy => Ok(()),
+            Self::DfsReplicationConfig
+            | Self::DfsDurabilityPolicy
+            | Self::DfsReplicaFailureConfig => Ok(()),
         }
     }
 }
@@ -649,7 +652,8 @@ entity_heap!(
     DfsWriteLease,
     RootEpochWatermark,
     DfsReference,
-    DfsGc
+    DfsGc,
+    DfsReplicaFailureConfig
 );
 impl Heap for super::WatchChange {
     fn heap(&self, c: &mut Charge) -> Result<()> {

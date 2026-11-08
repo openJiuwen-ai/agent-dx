@@ -268,6 +268,8 @@ pub enum MetaEntity {
     RootEpochWatermark(u64),
     DfsReference(crate::dfs::GcReference),
     DfsGc(crate::dfs::GcState),
+    /// Appended last: earlier variant indexes are on disk.
+    DfsReplicaFailureConfig(crate::dfs::ReplicaFailureConfig),
 }
 
 impl MetaEntity {
@@ -293,6 +295,7 @@ impl MetaEntity {
             Self::RootEpochWatermark(_) => "root_epoch_watermark",
             Self::DfsReference(_) => "dfs_reference",
             Self::DfsGc(_) => "dfs_gc",
+            Self::DfsReplicaFailureConfig(_) => "dfs_replica_failure_config",
         }
     }
 }
@@ -385,6 +388,7 @@ pub enum MetaRead {
     DfsReplicationTasks,
     DfsWriteLease(InodeId),
     DfsGc,
+    DfsReplicaFailureConfig,
 }
 
 /// A linearizable read response. Empty results are represented explicitly so
@@ -446,6 +450,8 @@ pub enum MetaKey {
         reference_id: String,
     },
     DfsGc,
+    /// Appended last: earlier variant indexes are on disk.
+    DfsReplicaFailureConfig,
 }
 
 /// Ordered change stream item.

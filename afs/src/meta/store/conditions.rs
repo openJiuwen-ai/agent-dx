@@ -45,6 +45,7 @@ pub(in crate::meta) fn entity_key(entity: &MetaEntity) -> MetaKey {
         MetaEntity::DfsChunk(chunk) => MetaKey::DfsChunk(chunk.id.clone()),
         MetaEntity::DfsReplicationConfig(_) => MetaKey::DfsReplicationConfig,
         MetaEntity::DfsDurabilityPolicy(_) => MetaKey::DfsDurabilityPolicy,
+        MetaEntity::DfsReplicaFailureConfig(_) => MetaKey::DfsReplicaFailureConfig,
         MetaEntity::DfsPlacement(placement) => MetaKey::DfsPlacement(placement.chunk_id.clone()),
         MetaEntity::DfsCopy(copy) => MetaKey::DfsCopy(copy.id.clone()),
         MetaEntity::DfsReplicationTask(task) => MetaKey::DfsReplicationTask(task.id.clone()),

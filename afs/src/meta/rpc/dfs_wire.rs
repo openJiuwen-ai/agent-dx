@@ -176,6 +176,7 @@ pub(super) fn wire_placement_snapshot(
     afs_protocol::meta::DfsPlacementSnapshot {
         revision: snapshot.revision,
         replication: Some(wire_replication_config(snapshot.replication)),
+        failure: Some(snapshot.failure.wire()),
         replica_groups: snapshot
             .replica_groups
             .into_iter()
@@ -249,6 +250,7 @@ pub(super) fn wire_replica_write_grant(
         replica_group_id: grant.replica_group_id.0,
         target_index: grant.target_index,
         replication: Some(wire_replication_config(grant.replication)),
+        failure: Some(grant.failure.wire()),
         replica_group: Some(wire_replica_group(grant.replica_group)),
         expires_at_unix_ms: grant.expires_at_unix_ms,
         fence: grant.fence,

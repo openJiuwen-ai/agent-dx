@@ -441,6 +441,18 @@ message DfsReplicationConfig {
   DfsLocalCopyPolicy local_copy = 5;
 }
 
+enum DfsReplicaFailurePolicy {
+  DFS_REPLICA_FAILURE_POLICY_UNSPECIFIED = 0;
+  DFS_REPLICA_FAILURE_POLICY_DEGRADE = 1;
+  DFS_REPLICA_FAILURE_POLICY_STRICT = 2;
+}
+
+// Immutable filesystem contract for a failed synchronous replica (R12).
+message DfsReplicaFailureConfig {
+  DfsReplicaFailurePolicy policy = 1;
+  uint32 min_degraded_copies = 2;
+}
+
 message DfsStorageDevice {
   string device_id = 1;
   uint64 device_epoch = 2;
@@ -465,6 +477,7 @@ message DfsPlacementSnapshot {
   uint64 revision = 1;
   DfsReplicationConfig replication = 2;
   repeated DfsReplicaGroup replica_groups = 3;
+  DfsReplicaFailureConfig failure = 4;
 }
 
 message DfsReplicaWriteGrant {
@@ -486,6 +499,7 @@ message DfsReplicaWriteGrant {
   uint64 expires_at_unix_ms = 16;
   uint64 fence = 17;
   string token = 18;
+  DfsReplicaFailureConfig failure = 19;
 }
 
 message DfsReplicaAck {

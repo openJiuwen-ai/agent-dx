@@ -247,6 +247,23 @@ sequenceDiagram
 （`GrpcReplicaDataPlane::put_peer_replica`）在自己的总期限内退避重试，不把它交给应用。真实磁盘满（`IO_CAPACITY`）
 不重试。`afs_dfs_peer_admissions_total{operation="replica",outcome}` 区分立即取到、排队后取到与期限到被拒。
 
+**副本失败时的降级写**（`dfs_replica_failure_policy`，默认 `degrade`；`dfs_min_degraded_copies`，默认 1）。
+这两项与副本配置一样是文件系统级不可变合同，Meta 初始化时另存为 `DfsReplicaFailureConfig` 实体（不放进
+`ReplicationConfig`），随放置快照和副本写授权下发。`degrade` 下：
+
+- 写端是链头（本机持有副本）时，后面一跳失败（对端拒绝连接、超时、背压期限到、对端授权失败等），只要本机已持有的
+  副本数不少于 `dfs_min_degraded_copies` 且满足本地副本规则，就用这些副本继续提交；同一批里后续 chunk 不再等这条链。
+  链协议违规（`NODE_STORAGE_INVALID`）和本机请求错误不降级。链中间一跳的失败仍让整条尾巴失败：链回包不带部分前缀。
+- 存活存储 Node 不够组成完整副本组时，Meta 发不少于 `dfs_min_degraded_copies` 个目标的降级组；够时始终发完整组。
+- Meta 提交时接受不少于 `dfs_min_degraded_copies` 份、含本地副本（`required`）的回执；回执引用的副本组已因对端会话
+  过期而消失时，仍逐个按当前存活会话与设备校验 ACK。少于 `dfs_desired_copies` 的放置在**同一事务**里记为
+  `UnderReplicated` 并登记 Pending 修复任务，对端恢复或有新 Node 时由修复补齐。降级写不放宽 Node 数和故障域数之外的任何校验。
+- 本地盘故障时写入照常失败（决策 3，改写远端只留扩展点）。修复始终按 `strict` 补齐全部副本。
+
+`strict` 下任何一份同步副本失败都让写入失败，与引入降级前一致。`dfs_min_degraded_copies` 必须在
+`1..=dfs_sync_required_copies` 内；等于同步副本数时 `degrade` 与 `strict` 相同。日志 `dfs.replica_write_degraded`
+记录每次降级的 chunk 和原因；`GET /v1/dfs/chunks/<id>/replication` 的 `health` 显示欠副本与补齐。
+
 ### 读
 
 ```mermaid

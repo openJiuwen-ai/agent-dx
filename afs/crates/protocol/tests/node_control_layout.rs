@@ -74,8 +74,9 @@ fn service_paths_keep_the_package() {
 
 /// Node↔Node channels do not negotiate: a layout change must bump this so old
 /// Nodes are refused at registration instead of failing per call at runtime.
-/// Generation 5 pages `DfsMeta.ReadDir` (S4a R72).
+/// Generation 5 pages `DfsMeta.ReadDir` (S4a R72); generation 6 carries the
+/// replica failure contract in placement snapshots and write grants (S4b R12).
 #[test]
 fn cluster_protocol_generation_includes_the_split_layout() {
-    assert_eq!(CLUSTER_PROTOCOL_VERSION, 5);
+    assert_eq!(CLUSTER_PROTOCOL_VERSION, 6);
 }

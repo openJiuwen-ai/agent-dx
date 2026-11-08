@@ -10,10 +10,12 @@ use serde::{Deserialize, Serialize};
 
 mod cow;
 mod gc;
+mod replica_failure;
 pub use cow::clone_file_layout;
 pub use gc::{
     GcFence, GcReference, GcState, OpenReadIdentity, UpdateGcReference, created_handle_reference_id,
 };
+pub use replica_failure::{ReplicaFailureConfig, ReplicaFailurePolicy};
 
 macro_rules! string_id {
     ($name:ident) => {
@@ -730,6 +732,7 @@ pub struct ReplicaGroup {
 pub struct PlacementSnapshot {
     pub revision: u64,
     pub replication: ReplicationConfig,
+    pub failure: ReplicaFailureConfig,
     pub replica_groups: Vec<ReplicaGroup>,
     /// Derived, never persisted: Meta assembles it for this placement and a
     /// Node derives it again when decoding the snapshot.
@@ -779,6 +782,7 @@ pub struct ReplicaWriteGrant {
     pub replica_group_id: ReplicaGroupId,
     pub target_index: u32,
     pub replication: ReplicationConfig,
+    pub failure: ReplicaFailureConfig,
     pub replica_group: ReplicaGroup,
     pub expires_at_unix_ms: u64,
     pub fence: u64,

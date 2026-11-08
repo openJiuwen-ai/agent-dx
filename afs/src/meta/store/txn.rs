@@ -177,6 +177,8 @@ pub enum StoreOperation {
     CleanupRootCommands,
     DfsUpdateReference,
     DfsCollectGarbage,
+    /// Appended last: earlier variant indexes are on disk.
+    DfsInitializeReplicaFailureConfig,
 }
 
 impl StoreOperation {
@@ -214,6 +216,7 @@ impl StoreOperation {
             Self::DfsCollectGarbage => "dfs_collect_garbage",
             Self::DfsInitializeReplicationConfig => "dfs_initialize_replication_config",
             Self::DfsInitializeDurabilityPolicy => "dfs_initialize_durability_policy",
+            Self::DfsInitializeReplicaFailureConfig => "dfs_initialize_replica_failure_config",
             Self::DfsClaimReplicationTask => "dfs_claim_replication_task",
             Self::DfsReportReplicationTask => "dfs_report_replication_task",
             Self::DfsReportChunkCorruption => "dfs_report_chunk_corruption",

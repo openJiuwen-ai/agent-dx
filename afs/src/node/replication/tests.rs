@@ -146,6 +146,7 @@ fn p2_w2_required_receipt_releases_only_for_exact_local_durable_identity() {
     let temp = tempfile::tempdir().unwrap();
     let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
     let snapshot = Arc::new(PlacementSnapshot {
+        failure: crate::dfs::ReplicaFailureConfig::strict(),
         revision: 11,
         local_copy: EffectiveLocalCopy::declared(&config(1)),
         replication: config(1),
@@ -198,6 +199,7 @@ fn put_intent_selects_local_release_decision() {
     let temp = tempfile::tempdir().unwrap();
     let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
     let snapshot = Arc::new(PlacementSnapshot {
+        failure: crate::dfs::ReplicaFailureConfig::strict(),
         revision: 11,
         local_copy: EffectiveLocalCopy::declared(&config(1)),
         replication: config(1),
@@ -237,6 +239,7 @@ fn p2_w2_nonrequired_remote_receipt_never_claims_local_body_replacement() {
     let mut policy = config(1);
     policy.local_copy = LocalCopyPolicy::Preferred;
     let snapshot = Arc::new(PlacementSnapshot {
+        failure: crate::dfs::ReplicaFailureConfig::strict(),
         revision: 7,
         local_copy: EffectiveLocalCopy::declared(&policy),
         replication: policy,
@@ -276,6 +279,7 @@ fn p2_w2_descriptor_reservation_accounts_for_all_possible_authority_targets() {
     let mut remote = target(&long_node, remote_device("remote-b"));
     remote.node_id = long_node;
     let snapshot = Arc::new(PlacementSnapshot {
+        failure: crate::dfs::ReplicaFailureConfig::strict(),
         revision: 7,
         local_copy: EffectiveLocalCopy::declared(&config(1)),
         replication: config(1),
@@ -311,6 +315,7 @@ fn local_r1_capacity_forwards_after_catalog_advance_without_revision_equality() 
         local.device_descriptor().unwrap().catalog_revision > device_before_write.catalog_revision
     );
     let snapshot = Arc::new(PlacementSnapshot {
+        failure: crate::dfs::ReplicaFailureConfig::strict(),
         revision: 11,
         local_copy: EffectiveLocalCopy::declared(&config(1)),
         replication: config(1),
@@ -371,6 +376,7 @@ fn capacity_denies_replicated_or_remote_or_wrong_device_authority() {
     ];
     for (name, replication, targets, code) in cases {
         let snapshot = Arc::new(PlacementSnapshot {
+            failure: crate::dfs::ReplicaFailureConfig::strict(),
             revision: 11,
             local_copy: EffectiveLocalCopy::declared(&replication),
             replication,
@@ -398,6 +404,7 @@ fn put_batch_groups_by_stable_chunk_plan_and_preserves_receipt_order() {
     let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
     let local_device = local.device_descriptor().unwrap();
     let snapshot = Arc::new(PlacementSnapshot {
+        failure: crate::dfs::ReplicaFailureConfig::strict(),
         revision: 7,
         local_copy: EffectiveLocalCopy::declared(&config(3)),
         replication: config(3),
@@ -455,6 +462,7 @@ fn non_head_local_rn_fails_before_prepare_or_local_persist() {
     let local = Arc::new(LocalChunkStore::open(temp.path(), "node-a").unwrap());
     let local_device = local.device_descriptor().unwrap();
     let snapshot = Arc::new(PlacementSnapshot {
+        failure: crate::dfs::ReplicaFailureConfig::strict(),
         revision: 9,
         local_copy: EffectiveLocalCopy::declared(&config(2)),
         replication: config(2),
@@ -503,6 +511,7 @@ fn assert_fresh_placement_write(sync_required_copies: u16, chunk_count: usize) {
         local_copy: LocalCopyPolicy::Required,
     };
     let cached = Arc::new(PlacementSnapshot {
+        failure: crate::dfs::ReplicaFailureConfig::strict(),
         revision: 7,
         local_copy: EffectiveLocalCopy::declared(&policy),
         replication: policy.clone(),
@@ -516,6 +525,7 @@ fn assert_fresh_placement_write(sync_required_copies: u16, chunk_count: usize) {
         }],
     });
     let fresh = Arc::new(PlacementSnapshot {
+        failure: crate::dfs::ReplicaFailureConfig::strict(),
         revision: 8,
         local_copy: EffectiveLocalCopy::declared(&policy),
         replication: policy,
@@ -586,6 +596,7 @@ fn configurable_two_and_four_copy_chains_return_distinct_durable_acks() {
             )
         }));
         let snapshot = Arc::new(PlacementSnapshot {
+            failure: crate::dfs::ReplicaFailureConfig::strict(),
             revision: 7,
             local_copy: EffectiveLocalCopy::declared(&config(copies)),
             replication: config(copies),
@@ -617,6 +628,7 @@ fn preferred_remote_head_does_not_create_unassigned_local_copy() {
     let mut policy = config(2);
     policy.local_copy = LocalCopyPolicy::Preferred;
     let snapshot = Arc::new(PlacementSnapshot {
+        failure: crate::dfs::ReplicaFailureConfig::strict(),
         revision: 7,
         local_copy: EffectiveLocalCopy::declared(&policy),
         replication: policy,
@@ -652,6 +664,7 @@ fn async_desired_three_sync_one_does_not_wait_for_tail() {
     policy.sync_required_copies = 1;
     policy.min_distinct_nodes = 1;
     let snapshot = Arc::new(PlacementSnapshot {
+        failure: crate::dfs::ReplicaFailureConfig::strict(),
         revision: 7,
         local_copy: EffectiveLocalCopy::declared(&policy),
         replication: policy,
@@ -692,6 +705,7 @@ fn failure_domain_constraint_extends_synchronous_prefix() {
     targets[1].device.failure_domain = "zone-1".into();
     targets[2].device.failure_domain = "zone-2".into();
     let snapshot = PlacementSnapshot {
+        failure: crate::dfs::ReplicaFailureConfig::strict(),
         revision: 7,
         local_copy: EffectiveLocalCopy::declared(&policy),
         replication: policy,
@@ -709,6 +723,7 @@ fn failure_domain_constraint_extends_synchronous_prefix() {
 fn duplicate_node_placement_is_rejected_before_any_chunk_side_effect() {
     let item = staged("duplicate-node");
     let snapshot = PlacementSnapshot {
+        failure: crate::dfs::ReplicaFailureConfig::strict(),
         revision: 7,
         local_copy: EffectiveLocalCopy::declared(&config(2)),
         replication: config(2),
@@ -729,6 +744,7 @@ fn duplicate_node_placement_is_rejected_before_any_chunk_side_effect() {
 fn missing_or_duplicate_tail_ack_is_not_a_successful_receipt() {
     let item = staged("acks");
     let snapshot = PlacementSnapshot {
+        failure: crate::dfs::ReplicaFailureConfig::strict(),
         revision: 7,
         local_copy: EffectiveLocalCopy::declared(&config(2)),
         replication: config(2),
@@ -754,6 +770,7 @@ fn next_hop_preserves_initiator_and_stops_at_sync_prefix() {
     policy.min_distinct_nodes = 2;
     policy.local_copy = LocalCopyPolicy::NotRequired;
     let snapshot = PlacementSnapshot {
+        failure: crate::dfs::ReplicaFailureConfig::strict(),
         revision: 7,
         local_copy: EffectiveLocalCopy::declared(&policy),
         replication: policy,
@@ -783,6 +800,7 @@ fn next_hop_preserves_initiator_and_stops_at_sync_prefix() {
 fn receiver_execution_requires_meta_target_and_authenticated_predecessor() {
     let item = staged("grant");
     let grant = ReplicaWriteGrant {
+        failure: crate::dfs::ReplicaFailureConfig::strict(),
         requester_node_id: "b".into(),
         requester_node_epoch: 1,
         initiator_node_id: "writer".into(),
@@ -872,6 +890,7 @@ fn durable_middle_with_missing_tail_retries_content_and_returns_complete_receipt
     }
     let local = stores["a"].clone();
     let snapshot = Arc::new(PlacementSnapshot {
+        failure: crate::dfs::ReplicaFailureConfig::strict(),
         revision: 7,
         local_copy: EffectiveLocalCopy::declared(&config(3)),
         replication: config(3),
@@ -924,6 +943,7 @@ struct SelectiveFailPlane {
     peer: Arc<LocalChunkStore>,
     fail_prepare: Option<ChunkId>,
     fail_hop: Option<ChunkId>,
+    hop_error: afs_error::ErrorCode,
     sent: Mutex<Vec<ChunkId>>,
 }
 
@@ -949,10 +969,7 @@ impl ReplicaDataPlane for SelectiveFailPlane {
     ) -> Result<Vec<ReplicaAck>> {
         self.sent.lock().unwrap().push(staged.chunk.id.clone());
         if self.fail_hop.as_ref() == Some(&staged.chunk.id) {
-            return Err(Error::coded(
-                afs_error::NODE_TRANSFER_UNAVAILABLE,
-                "injected hop failure",
-            ));
+            return Err(Error::coded(self.hop_error, "injected hop failure"));
         }
         Ok(vec![self.peer.persist(
             staged,
@@ -974,10 +991,25 @@ fn selective_fail_fixture(
     fail_prepare: Option<ChunkId>,
     fail_hop: Option<ChunkId>,
 ) -> SelectiveFailFixture {
+    selective_fail_fixture_with(
+        crate::dfs::ReplicaFailureConfig::strict(),
+        fail_prepare,
+        fail_hop,
+        afs_error::NODE_TRANSFER_UNAVAILABLE,
+    )
+}
+
+fn selective_fail_fixture_with(
+    failure: crate::dfs::ReplicaFailureConfig,
+    fail_prepare: Option<ChunkId>,
+    fail_hop: Option<ChunkId>,
+    hop_error: afs_error::ErrorCode,
+) -> SelectiveFailFixture {
     let temp = tempfile::tempdir().unwrap();
     let local = Arc::new(LocalChunkStore::open(temp.path().join("a"), "a").unwrap());
     let peer = Arc::new(LocalChunkStore::open(temp.path().join("b"), "b").unwrap());
     let snapshot = Arc::new(PlacementSnapshot {
+        failure,
         revision: 7,
         local_copy: EffectiveLocalCopy::declared(&config(2)),
         replication: config(2),
@@ -994,6 +1026,7 @@ fn selective_fail_fixture(
         peer,
         fail_prepare,
         fail_hop,
+        hop_error,
         sent: Mutex::new(Vec::new()),
     });
     let store = DfsChunkSink::new_with_epoch(
@@ -1038,6 +1071,96 @@ fn characterize_write_batch_one_failed_hop_fails_whole_batch_without_rollback() 
     assert!(holds(&f.plane.peer, &items[0]));
     assert!(!holds(&f.plane.peer, &items[1]));
     assert!(!holds(&f.plane.peer, &items[2]));
+}
+
+/// R12: under `degrade` a failed hop keeps the head's own copy; the rest of
+/// the same group skips the failed chain instead of waiting on it per chunk.
+#[test]
+fn degrade_keeps_the_local_copy_when_a_hop_fails_and_skips_the_rest_of_the_group() {
+    let items = [
+        staged("degrade-1"),
+        staged("degrade-2"),
+        staged("degrade-3"),
+    ];
+    let f = selective_fail_fixture_with(
+        crate::dfs::ReplicaFailureConfig::default(),
+        None,
+        Some(items[1].chunk.id.clone()),
+        afs_error::NODE_TRANSFER_UNAVAILABLE,
+    );
+
+    let receipts = f.store.put_batch(items.to_vec()).unwrap();
+
+    let nodes = |index: usize| {
+        receipts[index]
+            .durable_acks
+            .iter()
+            .map(|ack| ack.node_id.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(nodes(0), ["a", "b"]);
+    assert_eq!(nodes(1), ["a"]);
+    assert_eq!(nodes(2), ["a"]);
+    assert_eq!(
+        *f.plane.sent.lock().unwrap(),
+        vec![items[0].chunk.id.clone(), items[1].chunk.id.clone()]
+    );
+    for item in &items {
+        assert!(holds(&f.local, item));
+    }
+}
+
+/// A chain protocol violation is not a peer failure: degrading would hide it.
+#[test]
+fn degrade_still_fails_on_a_chain_protocol_violation() {
+    let items = [staged("violation-1")];
+    let f = selective_fail_fixture_with(
+        crate::dfs::ReplicaFailureConfig::default(),
+        None,
+        Some(items[0].chunk.id.clone()),
+        afs_error::NODE_STORAGE_INVALID,
+    );
+
+    let error = f.store.put_batch(items.to_vec()).unwrap_err();
+
+    assert_eq!(error.code(), afs_error::NODE_STORAGE_INVALID);
+}
+
+/// A degraded group (Meta found too few live Nodes for a complete one) is
+/// written in full under `degrade` and refused under `strict`.
+#[test]
+fn a_degraded_group_writes_under_degrade_and_fails_under_strict() {
+    for (failure, ok) in [
+        (crate::dfs::ReplicaFailureConfig::default(), true),
+        (crate::dfs::ReplicaFailureConfig::strict(), false),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let local = Arc::new(LocalChunkStore::open(temp.path(), "a").unwrap());
+        let snapshot = Arc::new(PlacementSnapshot {
+            failure,
+            revision: 7,
+            local_copy: EffectiveLocalCopy::declared(&config(2)),
+            replication: config(2),
+            replica_groups: vec![ReplicaGroup {
+                id: ReplicaGroupId::new("degraded"),
+                placement_epoch: 9,
+                targets: vec![target("a", local.device_descriptor().unwrap())],
+            }],
+        });
+        let plane = Arc::new(FakeDataPlane::default());
+        let store = DfsChunkSink::new_with_epoch(
+            "a".into(),
+            1,
+            local.clone(),
+            Arc::new(StaticPlacement { snapshot }),
+            plane,
+        );
+        let result = store.put_batch(vec![staged("degraded-group")]);
+        assert_eq!(result.is_ok(), ok, "{failure:?}: {result:?}");
+        if let Ok(receipts) = result {
+            assert_eq!(receipts[0].durable_acks.len(), 1);
+        }
+    }
 }
 
 #[test]
@@ -1227,6 +1350,7 @@ fn effective_snapshot(
     let mut replication = config(copies);
     replication.local_copy = declared;
     Arc::new(PlacementSnapshot {
+        failure: crate::dfs::ReplicaFailureConfig::strict(),
         revision: 11,
         local_copy: EffectiveLocalCopy::lowered_for_test(declared, effective),
         replication,
@@ -1399,6 +1523,7 @@ fn declared_effective_local_copy_keeps_strict_requirement_at_config_values() {
                 min_nodes: 3,
                 min_domains: 2,
                 require_initiator: policy == LocalCopyPolicy::Required,
+                degraded_floor: None,
             }
         );
     }
@@ -1974,6 +2099,7 @@ impl BenchPlacement {
         let mut replication = config(copies);
         replication.local_copy = policy;
         let snapshot = Arc::new(PlacementSnapshot {
+            failure: crate::dfs::ReplicaFailureConfig::strict(),
             revision: 11,
             local_copy: EffectiveLocalCopy::declared(&replication),
             replication,

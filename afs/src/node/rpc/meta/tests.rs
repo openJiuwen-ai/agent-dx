@@ -17,6 +17,7 @@ fn decoded_placement_snapshot_derives_effective_local_copy_from_declared() {
             revision: 7,
             replication: Some(wire_replication_config(replication.clone())),
             replica_groups: Vec::new(),
+            failure: Some(crate::dfs::ReplicaFailureConfig::default().wire()),
         })
         .unwrap();
         assert_eq!(snapshot.replication, replication);
@@ -501,6 +502,7 @@ async fn native_write_diagnostics_cover_controls_and_keep_cached_placement_local
         tokio::task::spawn_blocking(move || {
             use crate::node::{replication::PlacementProvider, vfs::dfs::DfsMeta};
             let cached = Arc::new(crate::dfs::PlacementSnapshot {
+                failure: crate::dfs::ReplicaFailureConfig::default(),
                 revision: 9,
                 local_copy: crate::dfs::EffectiveLocalCopy::declared(
                     &crate::dfs::ReplicationConfig::local_single_copy(),

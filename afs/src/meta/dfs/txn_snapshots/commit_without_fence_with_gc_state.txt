@@ -6,7 +6,7 @@ conditions:
   Missing(DfsFileVersion(FileVersionId("version")))
   Missing(DfsLayoutRoot(LayoutRootId("layout")))
   RequestAbsent(RequestKey { caller_id: "writer", request_id: "commit" })
-  RevisionEquals { key: DfsGc, revision: StoreRevision(7) }
+  RevisionEquals { key: DfsGc, revision: StoreRevision(8) }
 mutations:
   Put(DfsChunk(ChunkObject { id: ChunkId("<chunk>"), length: 20, content_digest: ContentDigest { algorithm: Blake3, bytes: [32, 127, 208, 4, 13, 227, 106, 176, 243, 160, 60, 214, 134, 115, 250, 151, 84, 82, 176, 80, 226, 11, 197, 150, 165, 104, 254, 219, 149, 201, 138, 72] }, encoding: Raw }))
   Put(DfsCopy(CopyRecord { id: CopyId("writer:1:writer-dev:<chunk>"), chunk_id: ChunkId("<chunk>"), role: DurableReplica, location: Node { node_id: "writer", node_epoch: 1, device_id: "writer-dev", device_epoch: 1, catalog_revision: 1 }, state: Ready, persisted_bytes: 20, verified_digest: ContentDigest { algorithm: Blake3, bytes: [32, 127, 208, 4, 13, 227, 106, 176, 243, 160, 60, 214, 134, 115, 250, 151, 84, 82, 176, 80, 226, 11, 197, 150, 165, 104, 254, 219, 149, 201, 138, 72] } }))

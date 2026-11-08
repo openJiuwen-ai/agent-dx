@@ -1049,6 +1049,7 @@ impl DfsService {
             replica_group_id: request.replica_group_id,
             target_index: request.target_index,
             replication: claim.replication,
+            failure: ReplicaFailureConfig::strict(),
             replica_group: claim.replica_group,
             expires_at_unix_ms: claim.expires_at_unix_ms,
             fence,
@@ -1145,9 +1146,11 @@ impl DfsService {
         // Insufficient live capacity is a normal repair wait state. Backend
         // failures above still propagate; this pure placement computation
         // only checks whether the initialized policy can be satisfied now.
+        // Repair restores every desired copy; it never degrades.
         let Ok(groups) = build_replica_groups(
             &request.caller_id,
             &repair_replication,
+            ReplicaFailureConfig::strict(),
             EffectiveLocalCopy::declared(&repair_replication),
             &storage_sessions,
         ) else {

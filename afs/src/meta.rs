@@ -205,6 +205,10 @@ pub async fn run(cfg: Config, obs: Observability) -> Result<(), BoxError> {
                 },
             ),
         )
+        .with_replica_failure_config(crate::dfs::ReplicaFailureConfig {
+            policy: cfg.dfs_replica_failure_policy.into(),
+            min_degraded_copies: cfg.dfs_min_degraded_copies,
+        })
         .with_gc_grace_ms(cfg.dfs_gc_grace_ms);
         service.gc_metrics().register(&obs.registry)?;
         if cfg.dfs {

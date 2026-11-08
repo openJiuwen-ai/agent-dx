@@ -3,7 +3,7 @@
 //! backend, write buffers, Peer cache).
 
 use super::{
-    Cli, Config, DataMode, DfsLocalCopy, DfsReadCrcMode, FileConfig,
+    Cli, Config, DataMode, DfsLocalCopy, DfsReadCrcMode, DfsReplicaFailurePolicy, FileConfig,
     MAX_DFS_EXTERNAL_CACHE_CAPACITY_BYTES, Role, invalid,
 };
 use afs_error::Result;
@@ -34,6 +34,8 @@ pub(super) struct DfsReplication {
     pub(super) dfs_min_distinct_nodes: u16,
     pub(super) dfs_min_distinct_failure_domains: u16,
     pub(super) dfs_local_copy: DfsLocalCopy,
+    pub(super) dfs_replica_failure_policy: DfsReplicaFailurePolicy,
+    pub(super) dfs_min_degraded_copies: u16,
 }
 
 pub(super) fn resolve_replication(cli: &mut Cli, file: &mut FileConfig) -> Result<DfsReplication> {
@@ -69,7 +71,22 @@ pub(super) fn resolve_replication(cli: &mut Cli, file: &mut FileConfig) -> Resul
             "DFS replication counts must be non-zero and no greater than dfs_desired_copies",
         ));
     }
+    let dfs_replica_failure_policy = cli
+        .dfs_replica_failure_policy
+        .or(file.dfs_replica_failure_policy)
+        .unwrap_or_default();
+    let dfs_min_degraded_copies = cli
+        .dfs_min_degraded_copies
+        .or(file.dfs_min_degraded_copies)
+        .unwrap_or(1);
+    if dfs_min_degraded_copies == 0 || dfs_min_degraded_copies > dfs_sync_required_copies {
+        return Err(invalid(
+            "dfs_min_degraded_copies must be non-zero and no greater than dfs_sync_required_copies",
+        ));
+    }
     Ok(DfsReplication {
+        dfs_replica_failure_policy,
+        dfs_min_degraded_copies,
         dfs_desired_copies,
         dfs_sync_required_copies,
         dfs_min_distinct_nodes,

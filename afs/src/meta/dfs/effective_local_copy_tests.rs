@@ -54,6 +54,7 @@ fn groups(
     build_replica_groups(
         "caller",
         &config(declared),
+        crate::dfs::ReplicaFailureConfig::strict(),
         EffectiveLocalCopy::lowered_for_test(declared, effective),
         &sessions(nodes),
     )
@@ -117,6 +118,7 @@ fn declared_effective_keeps_group_epochs_at_the_pinned_hash() {
         let groups = build_replica_groups(
             "caller",
             &config,
+            crate::dfs::ReplicaFailureConfig::strict(),
             EffectiveLocalCopy::declared(&config),
             &sessions(&["b", "c", "caller"]),
         )

@@ -140,6 +140,9 @@ fn meta_store_enum_variant_indices_are_pinned() {
         17: MetaEntity::RootEpochWatermark(_) => MetaEntity::RootEpochWatermark(3),
         18: MetaEntity::DfsReference(_) => MetaEntity::DfsReference(reference()),
         19: MetaEntity::DfsGc(_) => MetaEntity::DfsGc(gc_state()),
+        20: MetaEntity::DfsReplicaFailureConfig(_) => MetaEntity::DfsReplicaFailureConfig(
+            crate::dfs::ReplicaFailureConfig::default(),
+        ),
     });
     pin_variants!(MetaKey {
         0: MetaKey::NodeSession { .. } => MetaKey::NodeSession {
@@ -188,6 +191,7 @@ fn meta_store_enum_variant_indices_are_pinned() {
             reference_id: "write:g".into(),
         },
         22: MetaKey::DfsGc => MetaKey::DfsGc,
+        23: MetaKey::DfsReplicaFailureConfig => MetaKey::DfsReplicaFailureConfig,
     });
     pin_variants!(StoreOperation {
         0: StoreOperation::RegisterNode => StoreOperation::RegisterNode,
@@ -225,6 +229,7 @@ fn meta_store_enum_variant_indices_are_pinned() {
         32: StoreOperation::CleanupRootCommands => StoreOperation::CleanupRootCommands,
         33: StoreOperation::DfsUpdateReference => StoreOperation::DfsUpdateReference,
         34: StoreOperation::DfsCollectGarbage => StoreOperation::DfsCollectGarbage,
+        35: StoreOperation::DfsInitializeReplicaFailureConfig => StoreOperation::DfsInitializeReplicaFailureConfig,
     });
 }
 
@@ -309,6 +314,10 @@ fn dfs_persisted_enum_variant_indices_are_pinned() {
             store_id: "store".into(),
             generation: "g".into(),
         },
+    });
+    pin_variants!(crate::dfs::ReplicaFailurePolicy {
+        0: crate::dfs::ReplicaFailurePolicy::Degrade => crate::dfs::ReplicaFailurePolicy::Degrade,
+        1: crate::dfs::ReplicaFailurePolicy::Strict => crate::dfs::ReplicaFailurePolicy::Strict,
     });
     pin_variants!(LocalCopyPolicy {
         0: LocalCopyPolicy::Required => LocalCopyPolicy::Required,

@@ -157,6 +157,9 @@ impl State {
             MetaRead::DfsCopy(id) => state.entities.get(&MetaKey::DfsCopy(id.clone())),
             MetaRead::DfsDurabilityPolicy => state.entities.get(&MetaKey::DfsDurabilityPolicy),
             MetaRead::DfsReplicationConfig => state.entities.get(&MetaKey::DfsReplicationConfig),
+            MetaRead::DfsReplicaFailureConfig => {
+                state.entities.get(&MetaKey::DfsReplicaFailureConfig)
+            }
             MetaRead::DfsReplicationTask(id) => {
                 state.entities.get(&MetaKey::DfsReplicationTask(id.clone()))
             }

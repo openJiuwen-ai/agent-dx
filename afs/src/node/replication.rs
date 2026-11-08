@@ -54,30 +54,6 @@ pub trait ReplicaDataPlane: Send + Sync {
     -> Result<Vec<ReplicaAck>>;
 }
 
-/// What a replica chain must prove before a write counts as durable.
-///
-/// Extension point: degraded writes will add a weaker constructor, and need the
-/// chain protocol to return a partial prefix ([`validate_peer_acks`] still
-/// demands the exact tail). Today every plan, repair included, is strict.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct AckRequirement {
-    min_acks: usize,
-    min_nodes: usize,
-    min_domains: usize,
-    require_initiator: bool,
-}
-
-impl AckRequirement {
-    pub fn strict(config: &ReplicationConfig, local_copy: EffectiveLocalCopy) -> Self {
-        Self {
-            min_acks: usize::from(config.sync_required_copies),
-            min_nodes: usize::from(config.min_distinct_nodes),
-            min_domains: usize::from(config.min_distinct_failure_domains),
-            require_initiator: local_copy.requires_local(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ReplicationPlan {
     pub chunk_id: ChunkId,
@@ -124,7 +100,11 @@ impl ReplicaPeerOp {
             replica_group_id: grant.replica_group_id.clone(),
             config: grant.replication.clone(),
             local_copy,
-            ack_requirement: AckRequirement::strict(&grant.replication, local_copy),
+            ack_requirement: AckRequirement::for_writes(
+                &grant.replication,
+                grant.failure,
+                local_copy,
+            ),
             ordered_targets: grant.replica_group.targets.clone(),
         };
         plan.validate_initiator(&grant.initiator_node_id)?;
@@ -246,8 +226,12 @@ impl ReplicationPlan {
         }
         let group = select_replica_group(&staged.chunk.id, snapshot)
             .ok_or_else(|| invalid("placement snapshot contains no replica group"))?;
-        let ack_requirement = AckRequirement::strict(&snapshot.replication, snapshot.local_copy);
-        if group.targets.len() < ack_requirement.min_acks {
+        let ack_requirement = AckRequirement::for_writes(
+            &snapshot.replication,
+            snapshot.failure,
+            snapshot.local_copy,
+        );
+        if group.targets.len() < ack_requirement.fewest_acks() {
             return Err(Error::coded(
                 afs_error::NODE_VFS_UNIMPLEMENTED,
                 "placement has fewer targets than the configured synchronous copy count",
@@ -282,6 +266,15 @@ impl ReplicationPlan {
             if index + 1 >= minimum && domains.len() >= self.ack_requirement.min_domains {
                 return Ok(index + 1);
             }
+        }
+        // A degraded group (too few live Nodes for a complete one) is written
+        // in full: every target it has is synchronous.
+        if self
+            .ack_requirement
+            .degraded_floor
+            .is_some_and(|floor| self.ordered_targets.len() >= floor)
+        {
+            return Ok(self.ordered_targets.len());
         }
         Err(invalid(
             "placement cannot satisfy synchronous node/failure-domain constraints",
@@ -426,19 +419,45 @@ impl ReplicaChain {
         }
     }
 
+    /// Sends the chunk down the chain. Under `degrade`, a failed hop keeps the
+    /// copies already held when they meet the floor; `skip_remote` means an
+    /// earlier chunk of the same group already did, so its chain is not tried
+    /// again. Returns the ACKs and whether the write was degraded.
     fn forward(
         &self,
         plan: &ReplicationPlan,
         op: Option<&ReplicaPeerOp>,
         staged: &StagedChunk,
         local_ack: Option<ReplicaAck>,
-    ) -> Result<Vec<ReplicaAck>> {
+        skip_remote: bool,
+    ) -> Result<(Vec<ReplicaAck>, bool)> {
         let mut durable_acks = local_ack.into_iter().collect::<Vec<_>>();
+        let mut degraded = false;
         if let Some(op) = op {
-            durable_acks.extend(self.data_plane.put_peer_replica(op, staged)?);
+            let keep = plan.ack_requirement.may_keep(&durable_acks, &self.node_id);
+            if skip_remote && keep {
+                degraded = true;
+            } else {
+                match self.data_plane.put_peer_replica(op, staged) {
+                    Ok(acks) => durable_acks.extend(acks),
+                    Err(error)
+                        if keep
+                            && crate::node::fault::classify::replica_peer_failure_degrades(
+                                &error,
+                            ) =>
+                    {
+                        afs_logging::warn!("dfs.replica_write_degraded";
+                            "chunk_id" => staged.chunk.id.0.as_str(),
+                            "kept_copies" => durable_acks.len(),
+                            "error" => error.to_string());
+                        degraded = true;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         }
         validate_acks(plan, staged, &durable_acks, &self.node_id)?;
-        Ok(durable_acks)
+        Ok((durable_acks, degraded))
     }
 
     fn put_batch(
@@ -467,6 +486,9 @@ impl ReplicaChain {
                 .map(|index| staged[*index].clone())
                 .collect::<Vec<_>>();
             let local_acks = self.persist_head(&group.plan, &group_staged)?;
+            // One failed hop degrades the rest of this group without waiting
+            // for the same peer once per chunk.
+            let mut degraded = false;
             for ((index, item), local_ack) in group.indexes.iter().copied().zip(group_staged).zip(
                 local_acks
                     .into_iter()
@@ -474,7 +496,9 @@ impl ReplicaChain {
                     .chain(std::iter::repeat(None)),
             ) {
                 let plan = &plans[index];
-                let durable_acks = self.forward(plan, ops[index].as_ref(), &item, local_ack)?;
+                let (durable_acks, this_degraded) =
+                    self.forward(plan, ops[index].as_ref(), &item, local_ack, degraded)?;
+                degraded |= this_degraded;
                 receipts[index] = Some(StoredChunk::unreleased(ChunkReceipt {
                     external_commit: None,
                     operation_id: item.operation_id,
@@ -504,7 +528,9 @@ impl ReplicaChain {
             .persist_head(plan, std::slice::from_ref(staged))?
             .into_iter()
             .next();
-        self.forward(plan, op.as_ref(), staged, local_ack)
+        // A repair plan is strict, so it never degrades.
+        self.forward(plan, op.as_ref(), staged, local_ack, false)
+            .map(|(acks, _)| acks)
     }
 }
 
@@ -751,7 +777,10 @@ impl ChunkSink for DfsChunkSink {
                 "native descriptor admission needs valid placement authority",
             ));
         }
-        let synchronous = usize::from(snapshot.replication.sync_required_copies);
+        let synchronous = snapshot
+            .failure
+            .degraded_floor(&snapshot.replication)
+            .unwrap_or(usize::from(snapshot.replication.sync_required_copies));
         let mut receipt = 0usize;
         for group in &snapshot.replica_groups {
             if group.targets.len() < synchronous {
@@ -848,99 +877,6 @@ fn stable_group_index(chunk_id: &ChunkId, group_count: usize) -> usize {
     (hash as usize) % group_count
 }
 
-/// Validate an ordered synchronous tail before acknowledging its predecessor.
-pub(crate) fn validate_peer_acks(
-    op: &ReplicaPeerOp,
-    staged: &StagedChunk,
-    acks: &[ReplicaAck],
-) -> Result<()> {
-    op.validate_shape()?;
-    let targets = &op.ordered_targets[op.target_index..op.sync_target_count];
-    if acks.len() != targets.len() {
-        return Err(invalid("replica acknowledgement tail is incomplete"));
-    }
-    for (ack, target) in acks.iter().zip(targets) {
-        if ack.operation_id != staged.operation_id
-            || ack.chunk_id != staged.chunk.id
-            || ack.placement_revision != op.placement_revision
-            || ack.placement_epoch != op.placement_epoch
-            || ack.node_id != target.node_id
-            || ack.node_epoch != target.node_epoch
-            || ack.device_id != target.device.device_id
-            || ack.device_epoch != target.device.device_epoch
-            || ack.catalog_revision < target.device.catalog_revision
-            || ack.persisted_bytes != staged.chunk.length
-            || ack.verified_digest != staged.chunk.content_digest
-        {
-            return Err(invalid(
-                "replica acknowledgement differs from authorized immutable tail",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_acks(
-    plan: &ReplicationPlan,
-    staged: &StagedChunk,
-    durable_acks: &[ReplicaAck],
-    initiator: &str,
-) -> Result<()> {
-    let mut acknowledged_targets = HashSet::new();
-    let mut domains = HashSet::new();
-    for ack in durable_acks {
-        if ack.operation_id != staged.operation_id
-            || ack.chunk_id != staged.chunk.id
-            || ack.placement_revision != plan.placement_revision
-            || ack.placement_epoch != plan.placement_epoch
-            || ack.persisted_bytes != staged.chunk.length
-            || ack.verified_digest != staged.chunk.content_digest
-        {
-            return Err(invalid(
-                "replica acknowledgement does not prove the staged Chunk",
-            ));
-        }
-        let assigned = plan.ordered_targets.iter().any(|target| {
-            target.node_id == ack.node_id
-                && target.node_epoch == ack.node_epoch
-                && target.device.device_id == ack.device_id
-                && target.device.device_epoch == ack.device_epoch
-                && ack.catalog_revision >= target.device.catalog_revision
-        });
-        if !assigned {
-            return Err(invalid(
-                "replica acknowledgement is not part of the ReplicationPlan",
-            ));
-        }
-        if !acknowledged_targets.insert(ack.node_id.clone()) {
-            return Err(invalid(
-                "replica acknowledgements contain a duplicate target",
-            ));
-        }
-        let target = plan
-            .ordered_targets
-            .iter()
-            .find(|target| target.node_id == ack.node_id)
-            .expect("assigned acknowledgement checked above");
-        domains.insert(target.device.failure_domain.as_str());
-    }
-    let requirement = plan.ack_requirement;
-    if acknowledged_targets.len() < requirement.min_nodes
-        || domains.len() < requirement.min_domains
-        || (requirement.require_initiator && !acknowledged_targets.contains(initiator))
-    {
-        return Err(invalid(
-            "replica acknowledgements violate node, failure-domain or local-copy constraints",
-        ));
-    }
-    if acknowledged_targets.len() < requirement.min_acks {
-        return Err(invalid(
-            "replica acknowledgements do not satisfy the synchronous copy count",
-        ));
-    }
-    Ok(())
-}
-
 fn invalid(message: impl Into<String>) -> Error {
     Error::coded(afs_error::NODE_STORAGE_INVALID, message)
 }
@@ -949,5 +885,10 @@ fn unsupported_capacity(message: impl Into<String>) -> Error {
     Error::coded(afs_error::NODE_VFS_UNIMPLEMENTED, message)
 }
 
+mod acks;
 #[cfg(test)]
 mod tests;
+
+pub use acks::AckRequirement;
+use acks::validate_acks;
+pub(crate) use acks::validate_peer_acks;

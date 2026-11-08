@@ -101,6 +101,20 @@ pub(crate) fn retryable_backpressure(error: &Error) -> bool {
     error.kind() == ErrorKind::ResourceExhausted && error.code() != afs_error::IO_CAPACITY
 }
 
+/// A synchronous replica hop failed for a reason on its side of the chain, so
+/// under `degrade` the writer may keep the copies it already holds (R12). Set:
+/// every kind except {`InvalidArgument`, `Unimplemented`, `Internal`}, and not
+/// code `NODE_STORAGE_INVALID`: those are this Node's own request or a chain
+/// protocol violation, which a smaller commit would hide rather than survive.
+#[cfg(feature = "dfs")]
+pub(crate) fn replica_peer_failure_degrades(error: &Error) -> bool {
+    error.code() != afs_error::NODE_STORAGE_INVALID
+        && !matches!(
+            error.kind(),
+            ErrorKind::InvalidArgument | ErrorKind::Unimplemented | ErrorKind::Internal
+        )
+}
+
 /// A peer-cache entry is corrupt or gone, so it is retired and counted as a
 /// miss. Set: code `NODE_TRANSFER_CORRUPT_DATA` ∪ kind {`NotFound`}.
 #[cfg(feature = "dfs")]
@@ -166,6 +180,37 @@ mod tests {
             ErrorKind::ResourceExhausted,
             "disk full"
         )));
+    }
+
+    #[cfg(feature = "dfs")]
+    #[test]
+    fn replica_peer_failure_set() {
+        assert_eq!(
+            accepted_kinds(replica_peer_failure_degrades),
+            [
+                ErrorKind::Unknown,
+                ErrorKind::Cancelled,
+                ErrorKind::OutOfRange,
+                ErrorKind::NotFound,
+                ErrorKind::AlreadyExists,
+                ErrorKind::PermissionDenied,
+                ErrorKind::ResourceExhausted,
+                ErrorKind::FailedPrecondition,
+                ErrorKind::Aborted,
+                ErrorKind::Unavailable,
+                ErrorKind::DataLoss,
+                ErrorKind::Unauthenticated,
+                ErrorKind::DeadlineExceeded,
+            ]
+        );
+        assert!(!accepts_code(
+            replica_peer_failure_degrades,
+            afs_error::NODE_STORAGE_INVALID
+        ));
+        assert!(accepts_code(
+            replica_peer_failure_degrades,
+            afs_error::CLIENT_DEADLINE_EXCEEDED
+        ));
     }
 
     #[cfg(feature = "dfs")]

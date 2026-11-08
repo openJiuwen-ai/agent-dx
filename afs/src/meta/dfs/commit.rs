@@ -439,9 +439,13 @@ impl DfsService {
                 "Node replication does not accept external commit receipts",
             ));
         }
+        // R12: under `degrade` a write commits with at least the degraded
+        // floor; its missing copies become replica debt in this transaction.
+        let degraded_floor = self.failure.degraded_floor(replication);
+        let synchronous = usize::from(replication.sync_required_copies);
         if receipt.placement_revision == 0
             || receipt.placement_epoch == 0
-            || receipt.durable_acks.len() < usize::from(replication.sync_required_copies)
+            || receipt.durable_acks.len() < degraded_floor.unwrap_or(synchronous)
         {
             return Err(invalid(
                 "ChunkReceipt does not satisfy the initialized replication config",
@@ -462,8 +466,13 @@ impl DfsService {
             .replica_groups
             .iter()
             .find(|group| group.id == receipt.replica_group_id)
-            .filter(|group| group.placement_epoch == receipt.placement_epoch)
-            .ok_or_else(|| conflict("ChunkReceipt references a stale ReplicaGroup"))?;
+            .filter(|group| group.placement_epoch == receipt.placement_epoch);
+        // A degraded receipt can outlive its group: the failed target's session
+        // expiring removes every group naming it (R12 M7). Each ACK below must
+        // still name a live session and device; strict keeps the group check.
+        if group.is_none() && degraded_floor.is_none() {
+            return Err(conflict("ChunkReceipt references a stale ReplicaGroup"));
+        }
         for ack in &receipt.durable_acks {
             if ack.operation_id != receipt.operation_id
                 || ack.chunk_id != receipt.chunk.id
@@ -479,18 +488,18 @@ impl DfsService {
                     "ChunkReceipt contains duplicate Node acknowledgements",
                 ));
             }
-            group
-                .targets
-                .iter()
-                .find(|target| {
+            if let Some(group) = group
+                && !group.targets.iter().any(|target| {
                     target.node_id == ack.node_id
                         && target.node_epoch == ack.node_epoch
                         && target.device.device_id == ack.device_id
                         && target.device.device_epoch == ack.device_epoch
                 })
-                .ok_or_else(|| {
-                    conflict("ReplicaAck target is not assigned by the current ReplicaGroup")
-                })?;
+            {
+                return Err(conflict(
+                    "ReplicaAck target is not assigned by the current ReplicaGroup",
+                ));
+            }
             // This snapshot may include unrelated catalog advances after the
             // write grant. The receiver enforces the frozen grant's floor;
             // comparing that ACK against today's floor would reject valid data.
@@ -537,8 +546,11 @@ impl DfsService {
             });
         }
 
-        if nodes.len() < usize::from(replication.min_distinct_nodes)
-            || failure_domains.len() < usize::from(replication.min_distinct_failure_domains)
+        let complete = nodes.len() >= synchronous
+            && nodes.len() >= usize::from(replication.min_distinct_nodes)
+            && failure_domains.len() >= usize::from(replication.min_distinct_failure_domains);
+        let degraded = degraded_floor.is_some_and(|floor| nodes.len() >= floor);
+        if !(complete || degraded)
             || (EffectiveLocalCopy::declared(replication).requires_local()
                 && !nodes.contains(caller_id))
         {

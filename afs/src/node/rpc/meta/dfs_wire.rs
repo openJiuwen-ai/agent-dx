@@ -482,6 +482,7 @@ pub(super) fn domain_replica_write_grant(
             grant.replication,
             "DfsReplicaWriteGrant.replication",
         )?)?,
+        failure: crate::dfs::ReplicaFailureConfig::from_wire(grant.failure)?,
         replica_group: domain_replica_group(required(
             grant.replica_group,
             "DfsReplicaWriteGrant.replica_group",
@@ -690,6 +691,7 @@ pub(super) fn domain_placement_snapshot(
         revision: snapshot.revision,
         // Not on the wire: effective equals declared until Meta can lower it.
         local_copy: crate::dfs::EffectiveLocalCopy::declared(&replication),
+        failure: crate::dfs::ReplicaFailureConfig::from_wire(snapshot.failure)?,
         replication,
         replica_groups: snapshot
             .replica_groups

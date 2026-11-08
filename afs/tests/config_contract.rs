@@ -1,4 +1,6 @@
-use afs::config::{Cli, Config, DataMode, DfsLocalCopy, MetaStoreBackend, Role};
+use afs::config::{
+    Cli, Config, DataMode, DfsLocalCopy, DfsReplicaFailurePolicy, MetaStoreBackend, Role,
+};
 use clap::{CommandFactory, Parser};
 
 #[test]
@@ -2049,6 +2051,51 @@ fn data_mode_keeps_its_toml_cli_and_printed_names() {
             .contains("[possible values: grpc, rdma, auto]"),
         "{error}"
     );
+}
+
+#[test]
+fn dfs_replica_failure_policy_defaults_to_degrade_with_one_copy_and_bounds_the_floor() {
+    let default = Config::resolve(Role::Meta, Cli::default()).unwrap();
+    assert_eq!(
+        default.dfs_replica_failure_policy,
+        DfsReplicaFailurePolicy::Degrade
+    );
+    assert_eq!(default.dfs_min_degraded_copies, 1);
+    for (name, value) in [
+        ("degrade", DfsReplicaFailurePolicy::Degrade),
+        ("strict", DfsReplicaFailurePolicy::Strict),
+    ] {
+        let file = resolve_toml(
+            Role::Meta,
+            &format!("dfs_replica_failure_policy = '{name}'\n"),
+        )
+        .unwrap();
+        assert_eq!(file.dfs_replica_failure_policy, value);
+        assert_eq!(
+            serde_json::to_value(&file).unwrap()["dfs_replica_failure_policy"],
+            name
+        );
+        let cli = Cli::parse_from(["afs", "--dfs-replica-failure-policy", name]);
+        assert_eq!(
+            Config::resolve(Role::Meta, cli)
+                .unwrap()
+                .dfs_replica_failure_policy,
+            value
+        );
+    }
+    let two = resolve_toml(
+        Role::Meta,
+        "dfs_desired_copies = 2\ndfs_sync_required_copies = 2\ndfs_min_degraded_copies = 2\n",
+    )
+    .unwrap();
+    assert_eq!(two.dfs_min_degraded_copies, 2);
+    for floor in [
+        "dfs_min_degraded_copies = 0\n",
+        "dfs_desired_copies = 2\ndfs_sync_required_copies = 1\ndfs_min_degraded_copies = 2\n",
+    ] {
+        let error = resolve_toml(Role::Meta, floor).unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID, "{floor}");
+    }
 }
 
 #[test]

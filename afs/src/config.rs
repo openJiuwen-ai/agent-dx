@@ -64,6 +64,26 @@ impl From<DfsLocalCopy> for crate::dfs::LocalCopyPolicy {
         }
     }
 }
+/// `dfs_replica_failure_policy`: what a write does when a synchronous replica
+/// cannot be written (R12, decision 3). Meta persists it once, beside the
+/// replication config, as [`crate::dfs::ReplicaFailurePolicy`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum DfsReplicaFailurePolicy {
+    /// Commit with at least `dfs_min_degraded_copies` copies and repair the rest.
+    #[default]
+    Degrade,
+    /// Fail the write unless every synchronous copy persists.
+    Strict,
+}
+impl From<DfsReplicaFailurePolicy> for crate::dfs::ReplicaFailurePolicy {
+    fn from(value: DfsReplicaFailurePolicy) -> Self {
+        match value {
+            DfsReplicaFailurePolicy::Degrade => Self::Degrade,
+            DfsReplicaFailurePolicy::Strict => Self::Strict,
+        }
+    }
+}
 /// Administrator-enabled OwnerFs workspace bind mount entry.
 /// The name is a single first-level OwnerFs workspace under the mount root.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -353,6 +373,12 @@ pub struct Cli {
     pub dfs_min_distinct_failure_domains: Option<u16>,
     #[arg(long, value_enum)]
     pub dfs_local_copy: Option<DfsLocalCopy>,
+    /// Filesystem-wide immutable: `degrade` (default) or `strict`. Applied by Meta at initialization.
+    #[arg(long, value_enum)]
+    pub dfs_replica_failure_policy: Option<DfsReplicaFailurePolicy>,
+    /// Fewest copies a degraded write keeps, in 1..=dfs_sync_required_copies (default 1).
+    #[arg(long)]
+    pub dfs_min_degraded_copies: Option<u16>,
     #[arg(long)]
     pub dfs_read_max_ops_per_batch: Option<usize>,
     #[arg(long)]
@@ -459,6 +485,8 @@ struct FileConfig {
     dfs_min_distinct_nodes: Option<u16>,
     dfs_min_distinct_failure_domains: Option<u16>,
     dfs_local_copy: Option<DfsLocalCopy>,
+    dfs_replica_failure_policy: Option<DfsReplicaFailurePolicy>,
+    dfs_min_degraded_copies: Option<u16>,
     dfs_read_max_ops_per_batch: Option<usize>,
     dfs_read_max_inflight_bytes: Option<u64>,
     dfs_source_cache_max_ms: Option<u64>,
@@ -574,6 +602,8 @@ pub struct Config {
     pub dfs_min_distinct_nodes: u16,
     pub dfs_min_distinct_failure_domains: u16,
     pub dfs_local_copy: DfsLocalCopy,
+    pub dfs_replica_failure_policy: DfsReplicaFailurePolicy,
+    pub dfs_min_degraded_copies: u16,
     pub dfs_read_max_ops_per_batch: usize,
     pub dfs_read_max_inflight_bytes: u64,
     pub dfs_source_cache_max_ms: u64,
@@ -746,6 +776,8 @@ impl Config {
             dfs_min_distinct_nodes: replication.dfs_min_distinct_nodes,
             dfs_min_distinct_failure_domains: replication.dfs_min_distinct_failure_domains,
             dfs_local_copy: replication.dfs_local_copy,
+            dfs_replica_failure_policy: replication.dfs_replica_failure_policy,
+            dfs_min_degraded_copies: replication.dfs_min_degraded_copies,
             dfs_read_max_ops_per_batch: read.dfs_read_max_ops_per_batch,
             dfs_read_max_inflight_bytes: read.dfs_read_max_inflight_bytes,
             dfs_source_cache_max_ms: read.dfs_source_cache_max_ms,
