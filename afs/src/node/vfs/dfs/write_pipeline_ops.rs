@@ -6,6 +6,9 @@ struct WriteTarget {
     selection: Option<(usize, usize, usize)>,
     capacity: usize,
     generation: Option<OperationId>,
+    /// The committed version this write builds on; a new generation keeps it
+    /// from collection until the generation's commit is applied (R81 F2).
+    base: Option<FileVersionId>,
     seq: u64,
     owner: Arc<DirtyOwner>,
 }
@@ -275,7 +278,11 @@ impl DistributedFs {
                     .references
                     .as_ref()
                     .map(|references| {
-                        references.pin_generation(&snapshot.inode_id, None, &operation_id)
+                        references.pin_generation(
+                            &snapshot.inode_id,
+                            target.base.as_ref(),
+                            &operation_id,
+                        )
                     })
                     .transpose()?
             } else {
@@ -353,6 +360,7 @@ impl DistributedFs {
             selection,
             capacity,
             generation: state.dirty_extents.native_operation_id.clone(),
+            base: state.base_version.as_ref().map(|version| version.id.clone()),
             seq: state.next_write_seq,
             owner: state.native_owner.clone(),
         })

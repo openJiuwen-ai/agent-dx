@@ -123,8 +123,8 @@ pub mod version {
     pub const META_IDENTITY: u16 = 1;
     pub const META_CURRENT: u16 = 3;
     pub const META_CHECKPOINT_FILE: u16 = 1;
-    pub const META_STATE_IMAGE: u16 = 2;
-    pub const META_RECORD_DECISION: u16 = 1;
+    pub const META_STATE_IMAGE: u16 = 3;
+    pub const META_RECORD_DECISION: u16 = 2;
     pub const META_REQUEST_DIGEST: u32 = 1;
     pub const NODE_CHUNK_CATALOG_WAL: u32 = 1;
     pub const NODE_CHUNK_CATALOG_SNAPSHOT: u32 = 1;
@@ -327,7 +327,9 @@ mod tests {
                 version::NODE_CHUNK_SIDECAR,
                 version::OWNERFS_ROOT_RECORD,
             ),
-            (2, 2, 1, 1, 1, 1, 1)
+            // State image 3 and decision 2: GC references name their pinned
+            // version, and R12's replica failure entity and keys (S4b).
+            (2, 3, 2, 1, 1, 1, 1)
         );
     }
 

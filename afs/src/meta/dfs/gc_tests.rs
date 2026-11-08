@@ -65,6 +65,7 @@ fn pin(id: &str) -> GcReference {
         publication: false,
         chunks: vec![],
         retired_at_unix_ms: None,
+        pinned_version: None,
     }
 }
 #[test]
@@ -89,12 +90,16 @@ fn cow_clone_retains_shared_chunks_after_source_is_unlinked() {
     );
     assert_eq!(plan.chunks, vec![ChunkId::new("garbage")]);
 }
+/// A reader that opened v1 keeps v1 (and the head) until it closes and the
+/// grace passes. Before R81 F2 any reference kept every version; now the
+/// reference names the version it keeps.
 #[test]
 fn open_inode_retains_old_versions_until_last_reference_and_grace_are_gone() {
     let mut entities = vec![inode("mapped", 0, "v2"), chunk("old"), chunk("new")];
     entities.extend(version("v1", "mapped", "old"));
     entities.extend(version("v2", "mapped", "new"));
     let mut reference = pin("mapped");
+    reference.pinned_version = Some(FileVersionId::new("v1"));
     assert!(
         plan_collection(&entities, &[reference.clone()], 100, 10)
             .chunks
@@ -112,6 +117,40 @@ fn open_inode_retains_old_versions_until_last_reference_and_grace_are_gone() {
         2,
         "both versions become unreachable only after close and grace"
     );
+}
+
+/// R81 F2: an open file no longer keeps every version it ever had. Versions
+/// nobody pinned are collected while the file stays open; the head, the
+/// versions references name and the chunks they share stay.
+#[test]
+fn an_open_file_keeps_its_head_and_pinned_versions_only() {
+    let mut entities = vec![inode("busy", 1, "v5"), chunk("shared")];
+    for (id, chunk_id) in [("v1", "c1"), ("v2", "c2"), ("v3", "shared"), ("v4", "c4")] {
+        entities.extend(version(id, "busy", chunk_id));
+        entities.push(chunk(chunk_id));
+    }
+    entities.extend(version("v5", "busy", "shared"));
+    entities.push(MetaEntity::DfsWriteLease(WriteLease {
+        inode_id: InodeId::new("busy"),
+        owner_node_id: "writer".into(),
+        owner_session_id: "session".into(),
+        lease_epoch: 1,
+        expires_at_unix_ms: u64::MAX,
+    }));
+    let created = pin("busy");
+    let mut reader = pin("busy");
+    reader.reference_id = "open:reader".into();
+    reader.pinned_version = Some(FileVersionId::new("v2"));
+    let plan = plan_collection(&entities, &[created, reader], 100, 10);
+    let dead = |id: &str| {
+        plan.keys
+            .contains(&MetaKey::DfsFileVersion(FileVersionId::new(id)))
+    };
+    assert!(dead("v1") && dead("v3") && dead("v4"), "{:?}", plan.keys);
+    assert!(!dead("v2") && !dead("v5"));
+    let mut chunks = plan.chunks.clone();
+    chunks.sort();
+    assert_eq!(chunks, vec![ChunkId::new("c1"), ChunkId::new("c4")]);
 }
 
 fn retired_reference(id: &str, retired_at: u64) -> (MetaEntity, GcReference) {
@@ -192,6 +231,7 @@ async fn record_past_retention_but_still_protecting_data_survives_consecutive_co
     entities.extend(version("v1", "i", "old"));
     entities.extend(version("v2", "i", "new"));
     let mut reference = pin("i");
+    reference.pinned_version = Some(FileVersionId::new("v1"));
     reference.retired_at_unix_ms = Some(now_unix_ms().saturating_sub(150_000));
     entities.push(MetaEntity::DfsReference(reference));
     let (store, _) = seeded_store(entities).await;
@@ -432,6 +472,7 @@ async fn a_plan_survives_unrelated_commits_and_fails_on_each_relevant_change() {
             publication,
             chunks: vec![],
             retired_at_unix_ms: retired,
+            pinned_version: None,
         })
     };
     let version_on = |inode: &str, layout: &str| {
@@ -1128,6 +1169,7 @@ fn pending_reference(id: &str) -> MetaEntity {
         publication: true,
         chunks: vec![],
         retired_at_unix_ms: None,
+        pinned_version: None,
     })
 }
 fn admission_conditions(view: &crate::meta::store::MetaReadView, id: &str) -> Vec<TxnCondition> {
@@ -1920,6 +1962,7 @@ async fn a_live_write_generation_protects_its_listed_objects() {
         publication: true,
         chunks: vec![],
         retired_at_unix_ms: None,
+        pinned_version: None,
     })])
     .await;
     let service = external_gc_service(store.clone());
@@ -1928,4 +1971,89 @@ async fn a_live_write_generation_protects_its_listed_objects() {
         .await
         .unwrap();
     assert!(ticket.chunks.is_empty(), "{ticket:?}");
+}
+
+/// R81 F2 guard: what a reader pinned at open survives every later commit and
+/// collection until it closes. Under the old rule any reference protected
+/// every version of its inode; under the version rule the reference names the
+/// opened version. Both keep it.
+#[tokio::test]
+async fn a_readers_pinned_version_survives_later_commits_and_collection() {
+    let mut entities = vec![inode("f", 1, "v4")];
+    for (version_id, chunk_id) in [("v1", "c1"), ("v2", "c2"), ("v3", "c3"), ("v4", "c4")] {
+        entities.extend(version(version_id, "f", chunk_id));
+        entities.push(chunk(chunk_id));
+    }
+    let (store, _) = seeded_store(entities).await;
+    let service = DfsService::new(store.clone()).with_gc_grace_ms(0);
+    let mut reader = update("open:reader-of-v1");
+    reader.inode_id = Some(InodeId::new("f"));
+    reader.version_id = Some(FileVersionId::new("v1"));
+    reader.publication = false;
+    service.update_gc_reference(reader).await.unwrap();
+    collect_with_acks(&service).await;
+    let view = store.read_view().await.unwrap();
+    for key in [
+        MetaKey::DfsFileVersion(FileVersionId::new("v1")),
+        MetaKey::DfsLayoutRoot(LayoutRootId::new("v1")),
+        MetaKey::DfsChunk(ChunkId::new("c1")),
+        MetaKey::DfsFileVersion(FileVersionId::new("v4")),
+        MetaKey::DfsChunk(ChunkId::new("c4")),
+    ] {
+        assert!(
+            view.lookup(&key).unwrap().entity.is_some(),
+            "{key:?} was collected"
+        );
+    }
+}
+
+/// R81 F2 guard: an in-flight write generation keeps the version it started
+/// from, even once a later commit moved the head past it.
+#[tokio::test]
+async fn an_inflight_writes_base_version_survives_collection() {
+    let mut entities = vec![inode("f", 1, "v2")];
+    for (version_id, chunk_id) in [("v1", "c1"), ("v2", "c2")] {
+        entities.extend(version(version_id, "f", chunk_id));
+        entities.push(chunk(chunk_id));
+    }
+    let (store, _) = seeded_store(entities).await;
+    let service = DfsService::new(store.clone()).with_gc_grace_ms(0);
+    let operation = crate::dfs::OperationId::new(crate::clock::timed_request_id("base-writer"));
+    let mut writer = update(&format!("write:{}", operation.0));
+    writer.inode_id = Some(InodeId::new("f"));
+    writer.version_id = Some(FileVersionId::new("v1"));
+    service.update_gc_reference(writer).await.unwrap();
+    collect_with_acks(&service).await;
+    let view = store.read_view().await.unwrap();
+    for key in [
+        MetaKey::DfsFileVersion(FileVersionId::new("v1")),
+        MetaKey::DfsLayoutRoot(LayoutRootId::new("v1")),
+        MetaKey::DfsChunk(ChunkId::new("c1")),
+    ] {
+        assert!(
+            view.lookup(&key).unwrap().entity.is_some(),
+            "{key:?} was collected"
+        );
+    }
+}
+
+/// Runs collection as the one storage Node `n` until nothing more is planned.
+async fn collect_with_acks(service: &DfsService) {
+    let mut completed = 0;
+    for _ in 0..50 {
+        let gc = service
+            .collect_garbage("n".into(), "s".into(), completed, vec![])
+            .await
+            .unwrap();
+        if gc.waiting_nodes.iter().any(|node| node == "n") {
+            service
+                .collect_garbage("n".into(), "s".into(), gc.generation, vec![])
+                .await
+                .unwrap();
+        }
+        if gc.generation == completed {
+            return;
+        }
+        completed = gc.generation;
+    }
 }

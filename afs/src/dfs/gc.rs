@@ -21,6 +21,13 @@ pub struct GcReference {
     /// bump (see the format golden tests).
     #[serde(default)]
     pub open_read: Option<OpenReadIdentity>,
+    /// The one version this reference keeps readable besides the head: a
+    /// reader's opened version, or the version a write generation started
+    /// from (R81 F2). `None` keeps the inode and its head only. Added with
+    /// `META_RECORD_DECISION` 2 / `META_STATE_IMAGE` 3; older stored references
+    /// carried no version and are refused with their format, never read as
+    /// "protects nothing".
+    pub pinned_version: Option<FileVersionId>,
 }
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GcState {
@@ -112,6 +119,7 @@ mod open_authority_tests {
                 chunks: vec![],
                 retired_at_unix_ms: None,
                 open_read: identity,
+                pinned_version: None,
             };
             let expected = (reference, true);
             let bytes = postcard::to_allocvec(&expected).unwrap();

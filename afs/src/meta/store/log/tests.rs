@@ -1424,13 +1424,15 @@ fn image_and_decision_versions_are_identified_before_the_full_decode() {
     // postcard: four magic bytes, then the schema varint.
     assert_eq!(image[..4], super::IMAGE_MAGIC);
     assert_eq!(u16::from(image[4]), super::IMAGE_SCHEMA);
-    image[4] = 3;
+    // Image 2 is the pre-R81 checkpoint (GC references without a pinned
+    // version): refused, never read as "protects nothing".
+    image[4] = 2;
     image.truncate(5);
     assert_incompatible(
         super::StateImage::validate_encoded(&image, LIMIT).unwrap_err(),
         "Meta checkpoint state image",
-        "version 3",
-        "supports version 2",
+        "version 2",
+        "supports version 3",
     );
 
     let entity = root_entity();
@@ -1438,22 +1440,22 @@ fn image_and_decision_versions_are_identified_before_the_full_decode() {
     let record = decision(&[event(entity, 0)], &outcomes);
     let mut bytes = record.encode(LIMIT).unwrap();
     assert_eq!(u16::from(bytes[0]), super::SCHEMA);
-    bytes[0] = 2;
+    bytes[0] = 1;
     bytes.truncate(1);
     assert_incompatible(
         RecordDecision::decode(&bytes, LIMIT).unwrap_err(),
         "Meta WAL record decision",
-        "version 2",
-        "supports version 1",
+        "version 1",
+        "supports version 2",
     );
     let mut framed = postcard::to_allocvec(&super::Record::from(record)).unwrap();
     assert_eq!((framed[0], u16::from(framed[1])), (0, super::SCHEMA));
-    framed[1] = 2;
+    framed[1] = 1;
     assert_incompatible(
         super::Record::check_schema(&framed).unwrap_err(),
         "Meta WAL record decision",
-        "version 2",
-        "supports version 1",
+        "version 1",
+        "supports version 2",
     );
     super::Record::check_schema(&postcard::to_allocvec(&1u32).unwrap()).unwrap();
 }

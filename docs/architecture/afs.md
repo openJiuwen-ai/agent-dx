@@ -937,6 +937,13 @@ Coordinator 挂载同一 namespace，统一管理共享文件的回收；节点�
 
 ## DFS 历史与数据块回收
 
+**哪些版本可达**（R81 F2）：inode 的 nlink 大于 0、或有未退休（或仍在宽限期内）的 GC 引用、或写租约未过期时，
+保留 inode 和它的 head；每个引用另外保留它记录的那一个版本（`GcReference.pinned_version`）：读句柄是打开时固定的
+版本，写代是这一代开始时的基线版本；Create 事务里建的句柄引用、目录引用不记版本，只保 head。没有被任何一条命名的旧版本，
+即使文件仍打开也会回收，它与保留版本共享的 chunk 由可达性保留。Node 按（inode，版本）共享 `open:` 引用。
+这一字段随 `META_RECORD_DECISION` 2、`META_STATE_IMAGE` 3 引入，旧数据目录按格式规则拒绝（`STORAGE_FORMAT_INCOMPATIBLE`），
+不会把旧引用当成“什么都不保护”。
+
 S3（外部后端）与原生共用同一套规划（`plan_collection`、写代保护、每代 1024 个上限），只是执行者不同：
 对象只有一份，所以一代只等一个存活存储节点（node_id 最小者）删除，全部成功才确认，失败下一轮重试，已不
 存在的对象算成功；Meta 不接触对象存储。S3 对象按写代命名（`blake3-v2-<写代>-<根>-<长度>`，key 前缀

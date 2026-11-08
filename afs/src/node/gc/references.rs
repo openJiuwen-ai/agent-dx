@@ -89,20 +89,22 @@ pub struct GcReferences {
     sequence: AtomicU64,
     metrics: Option<GcReleaseMetrics>,
     wake: tokio::sync::Notify,
-    /// Live `open:` pins by inode. A reference protects every version of its
-    /// inode until its release, and its release waits for the last user of the
-    /// pin, so another open of the same inode shares it instead of a new
-    /// admission. A finished pin leaves on drop, keeping this bounded by open
-    /// inodes; in a racing open the map may briefly miss a live pin, which only
-    /// costs one more reference.
-    open_pins: Mutex<std::collections::HashMap<InodeId, std::sync::Weak<GcPin>>>,
+    /// Live `open:` pins by inode and opened version. A reference keeps its
+    /// inode, its head and the one version it names until its release (R81
+    /// F2), and its release waits for the last user of the pin, so another open
+    /// of the same version shares it instead of a new admission; an open of
+    /// another version needs its own. A finished pin leaves on drop, keeping
+    /// this bounded by open versions; in a racing open the map may briefly miss
+    /// a live pin, which only costs one more reference.
+    open_pins: Mutex<std::collections::HashMap<OpenPinKey, std::sync::Weak<GcPin>>>,
 }
+type OpenPinKey = (InodeId, Option<FileVersionId>);
 pub struct GcPin {
     fence: Option<crate::dfs::GcFence>,
     id: String,
     owner: Arc<GcReferences>,
-    /// The inode it is shared under; only `open:` pins are shared.
-    open_inode: Option<InodeId>,
+    /// The inode and version it is shared under; only `open:` pins are shared.
+    open_inode: Option<OpenPinKey>,
 }
 impl GcPin {
     pub(crate) fn fence(&self) -> Option<crate::dfs::GcFence> {
@@ -172,11 +174,12 @@ impl GcReferences {
         inode: &InodeId,
         version: Option<&FileVersionId>,
     ) -> Result<Arc<GcPin>> {
-        if let Some(shared) = self.shared_open_pin(inode)? {
+        let key = (inode.clone(), version.cloned());
+        if let Some(shared) = self.shared_open_pin(&key)? {
             return Ok(shared);
         }
         let pin = self.pin_mode(inode, version, None)?;
-        self.share_open_pin(inode, &pin)?;
+        self.share_open_pin(key, &pin)?;
         Ok(pin)
     }
     /// The pin of a handle whose reference Meta admits inside the Create
@@ -192,19 +195,19 @@ impl GcReferences {
             open_inode: None,
         })
     }
-    fn shared_open_pin(&self, inode: &InodeId) -> Result<Option<Arc<GcPin>>> {
+    fn shared_open_pin(&self, key: &OpenPinKey) -> Result<Option<Arc<GcPin>>> {
         Ok(self
             .open_pins
             .lock()
             .map_err(|_| Error::coded(afs_error::IO_UNAVAILABLE, "GC pin table poisoned"))?
-            .get(inode)
+            .get(key)
             .and_then(std::sync::Weak::upgrade))
     }
-    fn share_open_pin(&self, inode: &InodeId, pin: &Arc<GcPin>) -> Result<()> {
+    fn share_open_pin(&self, key: OpenPinKey, pin: &Arc<GcPin>) -> Result<()> {
         self.open_pins
             .lock()
             .map_err(|_| Error::coded(afs_error::IO_UNAVAILABLE, "GC pin table poisoned"))?
-            .insert(inode.clone(), Arc::downgrade(pin));
+            .insert(key, Arc::downgrade(pin));
         Ok(())
     }
     pub(crate) fn pin_generation(
@@ -241,7 +244,9 @@ impl GcReferences {
             fence: None,
             id,
             owner: self.clone(),
-            open_inode: generation.is_none().then(|| inode.clone()),
+            open_inode: generation
+                .is_none()
+                .then(|| (inode.clone(), version.cloned())),
         };
         pin.fence = if generation.is_some() {
             Some(self.control.retain_fenced(&pin.id, inode, version)?)

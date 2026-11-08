@@ -88,6 +88,8 @@ impl DfsService {
             chunks: Vec::new(),
             retired_at_unix_ms: None,
             open_read: None,
+            // A new file has no version yet; its creator reads its own writes.
+            pinned_version: None,
         };
         let request = RequestKey::new(caller_id, operation_id.0.clone());
         let mut parent = self

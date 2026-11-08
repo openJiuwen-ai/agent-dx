@@ -72,16 +72,26 @@ fn plan_bounded(
     grace: u64,
     max_chunks: usize,
 ) -> GcPlan {
-    let protected: BTreeSet<_> = references
-        .iter()
-        .filter(|reference| {
-            reference
-                .retired_at_unix_ms
-                .is_none_or(|time| time.saturating_add(grace) > now)
-        })
-        .filter_map(|reference| reference.inode_id.clone())
-        .collect();
-    let mut protected_inodes = protected;
+    // A live reference (or one still in grace) keeps its inode and that
+    // inode's head, plus the one version it names: a reader's opened version
+    // or a write generation's base (R81 F2). Earlier versions nobody names are
+    // collectable even while the file stays open; their bytes may still be
+    // shared with a kept version, which reachability below keeps.
+    let live_references = references.iter().filter(|reference| {
+        reference
+            .retired_at_unix_ms
+            .is_none_or(|time| time.saturating_add(grace) > now)
+    });
+    let mut protected_inodes = BTreeSet::new();
+    let mut pinned_versions = BTreeSet::new();
+    for reference in live_references {
+        if let Some(inode) = &reference.inode_id {
+            protected_inodes.insert(inode.clone());
+            if let Some(version) = &reference.pinned_version {
+                pinned_versions.insert((inode.clone(), version.clone()));
+            }
+        }
+    }
     for entity in entities {
         if let MetaEntity::DfsWriteLease(lease) = entity
             && lease.expires_at_unix_ms > now
@@ -104,7 +114,8 @@ fn plan_bounded(
     let mut layouts = BTreeSet::new();
     for entity in entities {
         if let MetaEntity::DfsFileVersion(version) = entity
-            && (heads.contains(&version.id) || protected_inodes.contains(&version.inode_id))
+            && (heads.contains(&version.id)
+                || pinned_versions.contains(&(version.inode_id.clone(), version.id.clone())))
         {
             versions.insert(version.id.clone());
             layouts.insert(version.layout_root.clone());
@@ -392,6 +403,7 @@ impl DfsService {
                     chunks: Vec::new(),
                     retired_at_unix_ms: None,
                     open_read: None,
+                    pinned_version: update.version_id.clone(),
                 }
             };
             if reference.retired_at_unix_ms.is_some() {
@@ -402,6 +414,7 @@ impl DfsService {
                 .as_ref()
                 .is_some_and(|inode| reference.inode_id.as_ref() != Some(inode))
                 || update.publication != reference.publication
+                || update.version_id != reference.pinned_version
             {
                 return Err(invalid("reference identity was reused for another access"));
             }
@@ -471,6 +484,7 @@ impl DfsService {
                             publication: false,
                             chunks: Vec::new(),
                             retired_at_unix_ms: None,
+                            pinned_version: None,
                         }
                     }
                 };

@@ -91,7 +91,9 @@ async fn wal_record_decision_schema_is_identified_before_the_full_decode() {
         let schema = 8 + head.len() + 1;
         assert_eq!(frame[schema - 1], 0, "Decision variant index");
         assert_eq!(u16::from(frame[schema]), version::META_RECORD_DECISION);
-        frame[schema] = 2;
+        // Schema 1 is the pre-R81 decision: its GC references carry no pinned
+        // version, so it is refused rather than read as "protects nothing".
+        frame[schema] = 1;
         // Keep the frame itself intact so only the inner version differs.
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"afs.meta.record.v2");
@@ -106,8 +108,8 @@ async fn wal_record_decision_schema_is_identified_before_the_full_decode() {
         &[
             "Meta WAL record decision",
             WAL,
-            "version 2",
-            "supports version 1",
+            "version 1",
+            "supports version 2",
         ],
     );
 }

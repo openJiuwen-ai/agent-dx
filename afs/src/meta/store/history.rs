@@ -618,6 +618,7 @@ fields_heap!(crate::dfs::OpenReadIdentity {
 });
 fields_heap!(crate::dfs::GcReference {
     open_read,
+    pinned_version,
     node_id,
     session_id,
     reference_id,
