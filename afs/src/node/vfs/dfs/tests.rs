@@ -147,6 +147,10 @@ struct RecordingMeta {
     /// Largest page `read_dir_page` returns, standing in for Meta's cap.
     dir_page_cap: AtomicUsize,
     dir_page_calls: AtomicUsize,
+    /// Errors `rename` returns, in order, before it succeeds.
+    rename_errors: Mutex<VecDeque<Error>>,
+    /// Operation ids `rename` was called with.
+    rename_operations: Mutex<Vec<OperationId>>,
 }
 
 impl RecordingMeta {
@@ -208,6 +212,8 @@ impl RecordingMeta {
             dir_entries: Mutex::new(std::collections::BTreeMap::new()),
             dir_page_cap: AtomicUsize::new(1024),
             dir_page_calls: AtomicUsize::new(0),
+            rename_errors: Mutex::new(VecDeque::new()),
+            rename_operations: Mutex::new(Vec::new()),
             file_version_loads: AtomicUsize::new(0),
             renew_calls: AtomicUsize::new(0),
             open_write_calls: AtomicUsize::new(0),
@@ -612,7 +618,7 @@ impl DfsMeta for RecordingMeta {
 
     fn rename(
         &self,
-        _: &OperationId,
+        operation_id: &OperationId,
         _: &InodeId,
         _: &[u8],
         _: &InodeId,
@@ -620,6 +626,13 @@ impl DfsMeta for RecordingMeta {
         _: RenameMode,
         _: CallerContext,
     ) -> Result<RenameOutcome> {
+        self.rename_operations
+            .lock()
+            .unwrap()
+            .push(operation_id.clone());
+        if let Some(error) = self.rename_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
         Ok(RenameOutcome {
             inode: self.inode.lock().unwrap().clone(),
             replaced_inode: None,

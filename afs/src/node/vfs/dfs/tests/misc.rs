@@ -768,3 +768,84 @@ fn setattr_refuses_times_before_1970_instead_of_storing_the_epoch() {
     };
     fs.setattr(&context(), inode, None, &epoch).unwrap();
 }
+
+fn rename_conflict() -> Error {
+    Error::coded(
+        afs_error::META_DFS_CONFLICT,
+        "DFS metadata condition changed during rename",
+    )
+}
+
+/// R83: a rename whose Meta transaction lost a condition race (the source
+/// was updated between Meta's read and its commit, for example by the
+/// just-closed file's own commit) is retried under the same operation id,
+/// so the application sees the rename succeed instead of EBUSY.
+#[test]
+fn rename_retries_a_meta_condition_conflict_under_the_same_operation() {
+    let (_temp, meta, fs) = test_fs();
+    let root = fs
+        .backend_inode(&meta.inode.lock().unwrap().inode_id)
+        .unwrap();
+    meta.rename_errors
+        .lock()
+        .unwrap()
+        .extend([rename_conflict(), rename_conflict()]);
+    fs.rename(
+        &context(),
+        root,
+        OsStr::new("c1"),
+        root,
+        OsStr::new("c2"),
+        RenameFlags(libc::RENAME_NOREPLACE),
+    )
+    .unwrap();
+    let operations = meta.rename_operations.lock().unwrap().clone();
+    assert_eq!(operations.len(), 3);
+    assert!(operations.iter().all(|id| id == &operations[0]));
+}
+
+/// R83: the retry is bounded; a conflict that persists reaches the caller,
+/// and errors other than a condition conflict are never retried.
+#[test]
+fn rename_conflict_retry_is_bounded_and_specific() {
+    let (_temp, meta, fs) = test_fs();
+    let root = fs
+        .backend_inode(&meta.inode.lock().unwrap().inode_id)
+        .unwrap();
+    meta.rename_errors
+        .lock()
+        .unwrap()
+        .extend((0..64).map(|_| rename_conflict()));
+    let error = fs
+        .rename(
+            &context(),
+            root,
+            OsStr::new("a"),
+            root,
+            OsStr::new("b"),
+            RenameFlags(0),
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), afs_error::META_DFS_CONFLICT);
+    let attempts = meta.rename_operations.lock().unwrap().len();
+    assert!((2..=8).contains(&attempts), "{attempts} attempts");
+
+    meta.rename_errors.lock().unwrap().clear();
+    meta.rename_operations.lock().unwrap().clear();
+    meta.rename_errors.lock().unwrap().push_back(Error::coded(
+        afs_error::IO_ALREADY_EXISTS,
+        "DFS rename target already exists",
+    ));
+    let error = fs
+        .rename(
+            &context(),
+            root,
+            OsStr::new("a"),
+            root,
+            OsStr::new("b"),
+            RenameFlags(libc::RENAME_NOREPLACE),
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), afs_error::IO_ALREADY_EXISTS);
+    assert_eq!(meta.rename_operations.lock().unwrap().len(), 1);
+}

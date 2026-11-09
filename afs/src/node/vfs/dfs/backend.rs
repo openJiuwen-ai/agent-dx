@@ -1194,15 +1194,34 @@ impl Backend for DistributedFs {
         flags: RenameFlags,
     ) -> Result<()> {
         let mode = rename_mode(flags)?;
-        let outcome = self.meta.rename(
-            &self.identity.operation_id("rename"),
-            &self.inode_id(from_parent)?,
-            from_name.as_encoded_bytes(),
-            &self.inode_id(to_parent)?,
-            to_name.as_encoded_bytes(),
-            mode,
-            caller_context(ctx),
-        )?;
+        let operation_id = self.identity.operation_id("rename");
+        let (old_parent, new_parent) = (self.inode_id(from_parent)?, self.inode_id(to_parent)?);
+        let mut attempt = 1;
+        // R83: Meta answers META_DFS_CONFLICT when the source or a parent changed
+        // between its read and its commit (a just-closed file's own commit can
+        // land there). Nothing was committed, so the same operation id is sent
+        // again: Meta re-reads and commits, replays an earlier commit, or gives
+        // the real answer (EEXIST, ENOENT). Bounded so a hot directory cannot spin.
+        let outcome = loop {
+            match self.meta.rename(
+                &operation_id,
+                &old_parent,
+                from_name.as_encoded_bytes(),
+                &new_parent,
+                to_name.as_encoded_bytes(),
+                mode,
+                caller_context(ctx),
+            ) {
+                Err(error)
+                    if error.code() == afs_error::META_DFS_CONFLICT
+                        && attempt < RENAME_CONFLICT_ATTEMPTS =>
+                {
+                    std::thread::sleep(Duration::from_millis(2 * attempt as u64));
+                    attempt += 1;
+                }
+                result => break result?,
+            }
+        };
         self.refresh_inode_record(outcome.inode, true, true)?;
         if let Some(replaced) = outcome.replaced_inode {
             self.refresh_inode_record(replaced, true, true)?;

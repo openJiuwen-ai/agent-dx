@@ -117,6 +117,8 @@ const DEFAULT_VERSION_CACHE_BYTES: usize = 32 * 1024 * 1024;
 // How long a captured Node read-authority snapshot is reused before it is
 // captured again. Renewal is local and never moves a handle's version.
 const NATIVE_READ_VIEW_TTL: Duration = Duration::from_secs(5);
+/// Attempts for a rename that hit a Meta condition conflict (R83).
+const RENAME_CONFLICT_ATTEMPTS: usize = 4;
 /// Entries the Node asks Meta for per ReadDir page; Meta caps it too.
 const READ_DIR_PAGE_ENTRIES: u32 = 1024;
 const COMMIT_CHUNK_BYTES: u64 = crate::node::chunk::MAX_STAGED_CHUNK_BYTES as u64;
