@@ -246,6 +246,11 @@ Redis 7.2.5 在本机 ext4 上）：持续 `fsync` 写小文件时 `kill -9` Red
   并开启 `--auto-compaction-*`。后端不自行 compact，因为 compact 作用于整个 etcd，会影响共用它的其他应用；
 - 建议独占的 etcd；共用时用不同的 `meta_store_prefix`。
 
+**性能边界**（adx-runtime 单 Node、native、4 线程，Redis／etcd 与 Meta 同机、同一块 ext4 盘、回环连接，3 轮中位数）：
+Redis 与 `local-file` 持平（create、rename、unlink、小文件写、txn fsync 为其 1.02–1.04 倍）；etcd 为其 0.84–0.88 倍
+（stat、readdir 持平）。每次追加是一次服务端请求（Redis 脚本或 etcd 事务）加服务端 fsync；跨机部署还要加一次网络往返，
+写延迟随之增加。这些数字只表示支持边界，不是性能承诺。
+
 两个后端当前都使用明文连接、不带认证配置（Redis URL 可带口令，打印配置时隐去），只应部署在受信网络中。
 
 ## 配置分类
