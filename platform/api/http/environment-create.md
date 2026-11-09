@@ -1,5 +1,13 @@
 # Environment create ownership
 
+Omit the image and rootfs source to use the deployment-owned default rootfs.
+An explicit `process.commands` starts a managed workload independently of OCI
+entrypoint inheritance, including on a local EROFS rootfs. Its optional user and
+working directory default to the Execd identity and `/`; readiness and healthcheck
+probes apply to this workload as usual. No image process metadata file is required.
+`inheritEntrypoint=true` remains the option for reading an OCI image's process
+metadata, with optional `process` overrides.
+
 `POST /api/environment/v1/environments` returns a confirmed-running result as
 JSON inside the normal response envelope, or as the final SSE event:
 

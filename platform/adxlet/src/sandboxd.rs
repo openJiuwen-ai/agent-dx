@@ -1592,6 +1592,77 @@ mod tests {
     }
 
     #[test]
+    fn default_local_rootfs_keeps_explicit_workload_without_image_injection() {
+        let profile: adx_core::runtime_profile::RuntimeProfile =
+            serde_json::from_value(serde_json::json!({
+                "rootfs":{"runtime_class":"runsc","type":"local","path":"/opt/adx/runtime.img"},
+                "bootstrap":{"type":"erofs","root":"/opt/adx/runtime.img",
+                    "target":"/__adx","entrypoint":["/__adx/usr/local/bin/adx-execd"]}
+            }))
+            .unwrap();
+        let process = adx_core::execution::WorkloadProcess {
+            commands: Some(vec![vec![
+                "/opt/python/bin/python".into(),
+                "-m".into(),
+                "agentserver".into(),
+            ]]),
+            cwd: Some("/home/agentos".into()),
+            ..Default::default()
+        };
+        let spec = EnvironmentSpec {
+            id: "local-workload".into(),
+            tenant_id: "tenant".into(),
+            image: String::new(),
+            runtime_class: "runsc".into(),
+            runtime_profile: Some(profile.clone()),
+            run_policy: None,
+            envd: None,
+            compatibility: None,
+            snapshot_id: None,
+            lifecycle: Default::default(),
+            env: Default::default(),
+            scheduling: Default::default(),
+            resources: adx_core::Resources {
+                cpu_millis: 1000,
+                memory_bytes: 512 * 1024 * 1024,
+                disk_bytes: 0,
+            },
+            priority: 0,
+            execution: adx_core::execution::ExecutionOptions {
+                process: Some(process.clone()),
+                ..Default::default()
+            },
+        };
+        let request = start_request(
+            &spec,
+            "local-workload-1",
+            1,
+            &[],
+            &Config {
+                runtime_profile: Some(profile),
+                ..Config::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(request.runtime, "runsc");
+        assert_eq!(
+            request.rootfs.unwrap().source,
+            Some(proto::rootfs_config::Source::Path(
+                "/opt/adx/runtime.img".into()
+            ))
+        );
+        assert!(request.inject_entrypoint.is_empty());
+        assert!(!request.envs.contains_key("ADX_IMAGE_PROCESS_CONFIG"));
+        assert_eq!(
+            serde_json::from_str::<adx_core::execution::WorkloadProcess>(
+                &request.envs[adx_core::execution::WORKLOAD_PROCESS_ENV]
+            )
+            .unwrap(),
+            process
+        );
+    }
+
+    #[test]
     fn deployment_envd_payload_is_enabled_without_compatibility_identity() {
         let profile: adx_core::runtime_profile::RuntimeProfile = serde_json::from_value(serde_json::json!({
             "rootfs":{"runtime_class":"runc","type":"local","path":"/opt/adx/runtime.img","readonly":false},

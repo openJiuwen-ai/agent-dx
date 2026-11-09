@@ -66,6 +66,10 @@ impl Drop for Process {
     }
 }
 fn start(config: ProbeConfig) -> Process {
+    start_with_local_workload(config, false)
+}
+
+fn start_with_local_workload(config: ProbeConfig, local: bool) -> Process {
     let temp = tempfile::tempdir().unwrap();
     let workload = temp.path().join("process.json");
     std::fs::write(
@@ -90,11 +94,20 @@ fn start(config: ProbeConfig) -> Process {
         .env("ADX_ENVIRONMENT_ID", "probe")
         .env("ADX_RUNTIME_ID", "probe-1")
         .env("ADX_OWNERSHIP_GENERATION", "1")
-        .env("ADX_IMAGE_PROCESS_CONFIG", workload)
         .env(CONFIG_ENV, serde_json::to_string(&config).unwrap())
         .stdout(Stdio::from(log.try_clone().unwrap()))
         .stderr(Stdio::from(log))
         .process_group(0);
+    if local {
+        command.env_remove("ADX_IMAGE_PROCESS_CONFIG").env(
+            "ADX_WORKLOAD_PROCESS",
+            serde_json::json!({"commands":[["/bin/sh","-c","sleep 60"]]}).to_string(),
+        );
+    } else {
+        command
+            .env_remove("ADX_WORKLOAD_PROCESS")
+            .env("ADX_IMAGE_PROCESS_CONFIG", workload);
+    }
     let child = command.spawn().unwrap();
     let record = EnvironmentRecord {
         observation: None,
@@ -216,6 +229,41 @@ async fn readiness_failure_reaches_real_adxlet_http_waiter() {
     );
     assert_eq!(failed.failure.as_ref().unwrap().exit_code, Some(7));
     assert!(failed.failure.unwrap().message.contains("not-ready"));
+}
+
+#[tokio::test]
+async fn local_workload_readiness_failure_reaches_real_adxlet_http_waiter() {
+    let process = start_with_local_workload(
+        ProbeConfig {
+            readiness: Some(probe(ProbeAction::Exec {
+                command: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "echo local-not-ready >&2; exit 7".into(),
+                ],
+            })),
+            healthcheck: None,
+            init_timeout_seconds: 1,
+        },
+        true,
+    );
+    let checker = ExecdReadiness::with_client(
+        Arc::new(Backend),
+        process.client.clone(),
+        Duration::from_millis(10),
+        Duration::from_secs(1),
+        Duration::from_secs(4),
+    )
+    .unwrap();
+    let error = checker.wait_ready(&process.record).await.unwrap_err();
+    assert!(
+        matches!(error, adx_core::Error::ProbeFailed(_)),
+        "{error:?}"
+    );
+    let failure = status(&process).await.failure.unwrap();
+    assert_eq!(failure.kind, ProbeFailureKind::ReadinessTimeout);
+    assert_eq!(failure.exit_code, Some(7));
+    assert!(failure.message.contains("local-not-ready"));
 }
 #[tokio::test]
 async fn healthcheck_is_armed_after_readiness_resets_failures_and_preserves_idle_activity() {
