@@ -14,7 +14,13 @@ use adxlet::{
     Adxlet,
 };
 use serde::Deserialize;
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    net::SocketAddr,
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
@@ -75,6 +81,8 @@ struct Config {
     execd_env: HashMap<String, String>,
     #[serde(default)]
     network_baseline: Option<adxlet::network_baseline::NetworkBaseline>,
+    #[serde(default)]
+    network_peer_aliases: BTreeMap<String, ipnet::Ipv4Net>,
     #[serde(default)]
     platform_ingress_sources: Option<Vec<ipnet::Ipv4Net>>,
 }
@@ -137,6 +145,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
     if let Some(baseline) = &config.network_baseline {
         baseline.validate()?;
+    }
+    if config
+        .network_peer_aliases
+        .keys()
+        .any(|peer| peer.trim().is_empty())
+    {
+        return Err("network_peer_aliases must use nonempty logical peers".into());
     }
     if config
         .platform_ingress_sources
@@ -271,6 +286,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rpc_timeout: timeout,
         runtime_logs: Some(config.runtime_logs.clone()),
         network_baseline: config.network_baseline,
+        network_peer_aliases: config.network_peer_aliases,
         platform_ingress_sources: config.platform_ingress_sources,
     };
     let jiuwenbox = match config.jiuwenbox {

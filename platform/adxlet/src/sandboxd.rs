@@ -29,6 +29,8 @@ pub struct Config {
     pub rpc_timeout: Duration,
     pub runtime_logs: Option<crate::runtime_logs::RuntimeLogPolicy>,
     pub network_baseline: Option<crate::network_baseline::NetworkBaseline>,
+    /// Resolve traffic peers on the destination node, independently of policy ceilings.
+    pub network_peer_aliases: BTreeMap<String, ipnet::Ipv4Net>,
     /// None keeps legacy exceptions; configured CIDRs constrain host-originated control traffic.
     pub platform_ingress_sources: Option<Vec<ipnet::Ipv4Net>>,
 }
@@ -43,6 +45,7 @@ impl Default for Config {
             rpc_timeout: Duration::from_secs(30),
             runtime_logs: None,
             network_baseline: None,
+            network_peer_aliases: BTreeMap::new(),
             platform_ingress_sources: None,
         }
     }
@@ -994,12 +997,29 @@ pub(crate) fn environment_network_policy(
     config: &Config,
 ) -> Result<proto::NetworkPolicy> {
     use adx_core::execution as model;
+    let mut resolved = value.clone();
+    if let Some(traffic) = &mut resolved.traffic {
+        for rule in &mut traffic.rules {
+            if rule.peer.domain.is_empty() {
+                continue;
+            }
+            if let Some(cidr) = config.network_peer_aliases.get(&rule.peer.domain) {
+                if !rule.peer.address.is_empty() || !rule.peer.cidr.is_empty() {
+                    return Err(Error::Invalid(
+                        "network peer alias cannot be combined with an address or CIDR".into(),
+                    ));
+                }
+                rule.peer.domain.clear();
+                rule.peer.cidr = cidr.to_string();
+            }
+        }
+    }
     let enforced = config
         .network_baseline
         .as_ref()
-        .map(|baseline| baseline.enforce(Some(value)))
+        .map(|baseline| baseline.enforce(Some(&resolved)))
         .transpose()?;
-    let value = enforced.as_ref().unwrap_or(value);
+    let value = enforced.as_ref().unwrap_or(&resolved);
     if config
         .platform_ingress_sources
         .as_ref()
@@ -1746,6 +1766,101 @@ mod tests {
         assert_eq!(
             request.rootfs.unwrap().source,
             Some(proto::rootfs_config::Source::ImageUrl("image:tag".into()))
+        );
+    }
+
+    #[test]
+    fn node_peer_aliases_preserve_requested_access_without_a_ceiling() {
+        use adx_core::execution::{
+            DnsPolicy, NetworkAction, NetworkDirection, NetworkPeer, NetworkPolicy,
+            NetworkProtocol, NetworkRule, TrafficMode, TrafficPolicy,
+        };
+        let policy = NetworkPolicy {
+            traffic: Some(TrafficPolicy {
+                ingress_default_action: NetworkAction::Deny,
+                egress_default_action: NetworkAction::Deny,
+                mode: TrafficMode::Stateful,
+                rules: vec![
+                    NetworkRule {
+                        action: NetworkAction::Allow,
+                        direction: NetworkDirection::Egress,
+                        protocol: NetworkProtocol::Tcp,
+                        peer: NetworkPeer {
+                            domain: "ingress.node.invalid".into(),
+                            port: 8080,
+                            ..Default::default()
+                        },
+                        environment_port: 0,
+                        environment_port_range: None,
+                        priority: 300,
+                    },
+                    NetworkRule {
+                        action: NetworkAction::Allow,
+                        direction: NetworkDirection::Egress,
+                        protocol: NetworkProtocol::Tcp,
+                        peer: NetworkPeer {
+                            domain: "model.example".into(),
+                            port: 18046,
+                            ..Default::default()
+                        },
+                        environment_port: 0,
+                        environment_port_range: None,
+                        priority: 300,
+                    },
+                ],
+            }),
+            dns: Some(DnsPolicy {
+                default_action: NetworkAction::Deny,
+                rules: Vec::new(),
+            }),
+        };
+        for bridge in ["10.88.4.1/32", "10.99.0.1/32"] {
+            let config = Config {
+                network_peer_aliases: BTreeMap::from([(
+                    "ingress.node.invalid".into(),
+                    bridge.parse().unwrap(),
+                )]),
+                platform_ingress_sources: Some(vec![bridge.parse().unwrap()]),
+                ..Default::default()
+            };
+            // Creation and policy updates share this translation; replay on a new
+            // node must use that node's address without changing the stored spec.
+            let translated = environment_network_policy(&policy, &[18092], None, &config).unwrap();
+            let traffic = translated.traffic.unwrap();
+            assert_eq!(
+                traffic.egress_default_action,
+                proto::NetworkPolicyAction::Deny as i32
+            );
+            assert_eq!(
+                traffic.ingress_default_action,
+                proto::NetworkPolicyAction::Deny as i32
+            );
+            let ingress = traffic.rules[0].peer.as_ref().unwrap();
+            assert_eq!(ingress.cidr, bridge);
+            assert!(ingress.domain.is_empty());
+            assert_eq!(ingress.port, 8080);
+            let model = traffic.rules[1].peer.as_ref().unwrap();
+            assert_eq!(model.domain, "model.example");
+            assert_eq!(model.port, 18046);
+            assert_eq!(traffic.rules[1].priority, 300);
+            assert_eq!(
+                translated.dns.unwrap().default_action,
+                proto::NetworkPolicyAction::Deny as i32
+            );
+            for rule in &traffic.rules[2..] {
+                assert_eq!(rule.direction, proto::NetworkDirection::Ingress as i32);
+                assert_eq!(rule.peer.as_ref().unwrap().cidr, bridge);
+            }
+            assert!(optional_network_policy(None, &[], None, &config)
+                .unwrap()
+                .is_none());
+            let mut malformed = policy.clone();
+            malformed.traffic.as_mut().unwrap().rules[0].peer.cidr = "192.0.2.0/24".into();
+            assert!(environment_network_policy(&malformed, &[], None, &config).is_err());
+        }
+        assert_eq!(
+            policy.traffic.unwrap().rules[0].peer.domain,
+            "ingress.node.invalid"
         );
     }
 
