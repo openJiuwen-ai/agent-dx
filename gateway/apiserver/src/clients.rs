@@ -53,20 +53,19 @@ impl Clients {
             .transpose()?;
         let limit = config.cache_entries;
         // Affinity is optional: a node without the Workspace service must still
-        // start. A missing token disables the feature instead of blocking boot.
-        let workspace = match config.workspace_affinity.clone() {
-            None => None,
-            Some(affinity) => match WorkspaceAffinityResolver::new(affinity) {
-                Ok(resolver) => Some(resolver),
-                Err(error) => {
-                    adx_observability::warn!(
-                        error = %error,
-                        "Workspace affinity disabled; ownership lookup is unavailable"
-                    );
-                    None
-                }
-            },
-        };
+        // start. An unreadable token keeps the resolver so every affected create
+        // still follows the configured error policy instead of silently
+        // scheduling without affinity.
+        let workspace = config.workspace_affinity.clone().map(|affinity| {
+            let resolver = WorkspaceAffinityResolver::new(affinity);
+            if let Some(error) = resolver.init_error() {
+                adx_observability::warn!(
+                    error = %error,
+                    "Workspace affinity is unavailable; creates follow the configured error policy"
+                );
+            }
+            resolver
+        });
         let clients = Arc::new(Self {
             config,
             workspace,
