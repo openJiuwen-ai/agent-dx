@@ -32,6 +32,8 @@ pub enum Error {
     Unavailable,
     #[error("invalid account service configuration")]
     Configuration,
+    #[error("account claim belongs to another request or credential")]
+    ClaimConflict,
 }
 impl Error {
     pub fn status(&self) -> StatusCode {
@@ -41,6 +43,7 @@ impl Error {
             Self::Forbidden | Self::AccountDisabled | Self::AgreementRequired => {
                 StatusCode::FORBIDDEN
             }
+            Self::ClaimConflict => StatusCode::CONFLICT,
             _ => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
@@ -52,6 +55,7 @@ impl Error {
             Self::Forbidden => "FORBIDDEN",
             Self::AccountDisabled => "ACCOUNT_DISABLED",
             Self::AgreementRequired => "AGREEMENT_REQUIRED",
+            Self::ClaimConflict => "ACCOUNT_CONFLICT",
             _ => "AUTH_UNAVAILABLE",
         }
     }
@@ -114,6 +118,29 @@ pub struct Principal {
     pub expires_at: i64,
     pub(crate) token_digest: String,
 }
+
+/// One workspace bound to a pooled slot. The claim identity is part of the row so a
+/// retry can distinguish its own progress from a conflicting acquisition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimAssignment {
+    pub tenant: String,
+    pub template: String,
+    pub workspace: String,
+    pub slot_id: String,
+    pub claim_id: String,
+    pub committed: bool,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClaimState {
+    pub credential_version: Option<String>,
+    pub credential_ready: bool,
+    pub assignment: Option<ClaimAssignment>,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaimProgress {
+    pub credential_ready: bool,
+    pub assignment_committed: bool,
+}
 /// Called by DigitalMateGateway only. Production has no fixed-user or anonymous implementation.
 #[async_trait]
 pub trait BusinessAuth: Send + Sync {
@@ -126,6 +153,60 @@ pub trait BusinessAuth: Send + Sync {
     async fn logout(&self, token: &str) -> Result<()>;
     async fn quota(&self, principal: &Principal) -> Result<QuotaResponse>;
     async fn model_parameters(&self, principal: &Principal) -> Result<Parameters>;
+    /// Initialization parameters for one application scope. The default keeps the
+    /// pre-pool behavior for callers that do not persist workspace assignments.
+    async fn model_parameters_for(
+        &self,
+        principal: &Principal,
+        _scope: &adx_agent_core::Scope,
+    ) -> Result<Parameters> {
+        self.model_parameters(principal).await
+    }
+    async fn claim_state(
+        &self,
+        _principal: &Principal,
+        _scope: &adx_agent_core::Scope,
+    ) -> Result<ClaimState> {
+        Ok(ClaimState::default())
+    }
+    /// Persist the pool credential and workspace assignment as one idempotent transaction.
+    async fn record_claim(
+        &self,
+        _principal: &Principal,
+        _scope: &adx_agent_core::Scope,
+        _claim_id: &str,
+        _slot_id: &str,
+        _workspace: &str,
+        _model_api_key: &str,
+    ) -> Result<ClaimProgress> {
+        Err(Error::Unavailable)
+    }
+    async fn commit_claim(
+        &self,
+        _principal: &Principal,
+        _scope: &adx_agent_core::Scope,
+        _claim_id: &str,
+    ) -> Result<()> {
+        Err(Error::Unavailable)
+    }
+    /// Transfer a recorded pool credential to the user and mark it ready. Safe to replay:
+    /// the transfer never writes spend or budget fields.
+    async fn activate_claim(
+        &self,
+        _principal: &Principal,
+        _scope: &adx_agent_core::Scope,
+        _claim_id: &str,
+        _slot_id: &str,
+        _model_api_key: &str,
+    ) -> Result<()> {
+        Err(Error::Unavailable)
+    }
+    fn model_api_base(&self) -> Option<String> {
+        None
+    }
+    fn pool_models(&self) -> Option<Arc<dyn ModelProvider>> {
+        None
+    }
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -360,6 +441,102 @@ impl BusinessAuth for AccountService {
         Ok(quota)
     }
     async fn model_parameters(&self, principal: &Principal) -> Result<Parameters> {
+        self.launch_parameters(principal, None).await
+    }
+    async fn model_parameters_for(
+        &self,
+        principal: &Principal,
+        scope: &adx_agent_core::Scope,
+    ) -> Result<Parameters> {
+        self.launch_parameters(principal, Some(scope)).await
+    }
+    async fn claim_state(
+        &self,
+        principal: &Principal,
+        scope: &adx_agent_core::Scope,
+    ) -> Result<ClaimState> {
+        self.store
+            .claim_state(&principal.user_id, &scope.tenant, &scope.template)
+            .await
+    }
+    async fn record_claim(
+        &self,
+        principal: &Principal,
+        scope: &adx_agent_core::Scope,
+        claim_id: &str,
+        slot_id: &str,
+        workspace: &str,
+        model_api_key: &str,
+    ) -> Result<ClaimProgress> {
+        self.check(principal).await?;
+        let aad = self
+            .cipher
+            .associated_data(&principal.user_id)
+            .map_err(|_| Error::Unavailable)?;
+        let encrypted = self
+            .cipher
+            .seal(&aad, model_api_key.as_bytes())
+            .map_err(|_| Error::Unavailable)?;
+        let progress = self
+            .store
+            .record_claim(
+                &principal.user_id,
+                store::ClaimBinding {
+                    tenant: &scope.tenant,
+                    template: &scope.template,
+                    claim_id,
+                    slot_id,
+                    workspace,
+                },
+                encrypted,
+            )
+            .await?;
+        self.check(principal).await?;
+        Ok(progress)
+    }
+    async fn commit_claim(
+        &self,
+        principal: &Principal,
+        scope: &adx_agent_core::Scope,
+        claim_id: &str,
+    ) -> Result<()> {
+        self.check(principal).await?;
+        self.store
+            .commit_claim(&principal.user_id, &scope.tenant, &scope.template, claim_id)
+            .await?;
+        self.check(principal).await
+    }
+    async fn activate_claim(
+        &self,
+        principal: &Principal,
+        _scope: &adx_agent_core::Scope,
+        claim_id: &str,
+        slot_id: &str,
+        model_api_key: &str,
+    ) -> Result<()> {
+        self.check(principal).await?;
+        let owner = self.cipher.model_owner(&principal.user_id);
+        let alias = self.store.model_key_alias(principal).await?;
+        self.models
+            .transfer_pool(&format!("pool:{slot_id}"), model_api_key, &owner, &alias)
+            .await?;
+        self.store.mark_ready(principal, claim_id).await?;
+        self.check(principal).await
+    }
+    fn model_api_base(&self) -> Option<String> {
+        Some(self.config.litellm.api_base.clone())
+    }
+    fn pool_models(&self) -> Option<Arc<dyn ModelProvider>> {
+        Some(self.models.clone())
+    }
+}
+
+impl AccountService {
+    async fn launch_parameters(
+        &self,
+        principal: &Principal,
+        scope: Option<&adx_agent_core::Scope>,
+    ) -> Result<Parameters> {
         self.check(principal).await?;
         let aad = self
             .cipher
@@ -382,18 +559,44 @@ impl BusinessAuth for AccountService {
         // Persist the key BEFORE remote creation so retries cannot mint another key.
         let owner = self.cipher.model_owner(&principal.user_id);
         let alias = self.store.model_key_alias(principal).await?;
+        let assignment = match scope {
+            Some(scope) => {
+                self.store
+                    .assignment(&scope.tenant, &scope.template, &principal.user_id)
+                    .await?
+            }
+            None => None,
+        };
+        if !record.ready {
+            if let Some(assignment) = &assignment {
+                if assignment.claim_id == record.version {
+                    self.models
+                        .transfer_pool(
+                            &format!("pool:{}", assignment.slot_id),
+                            &key,
+                            &owner,
+                            &alias,
+                        )
+                        .await?;
+                }
+            }
+        }
         self.models.ensure(&owner, &key, &alias).await?;
         if !record.ready {
             self.store.mark_ready(principal, &record.version).await?;
         }
         self.check(principal).await?;
-        Ok(BTreeMap::from([
+        let mut parameters = BTreeMap::from([
             ("model_api_key".into(), key),
             (
                 "model_api_base".into(),
                 self.config.litellm.api_base.clone(),
             ),
-        ]))
+        ]);
+        if let Some(assignment) = assignment {
+            parameters.insert("workspace".into(), assignment.workspace);
+        }
+        Ok(parameters)
     }
 }
 fn valid_agc_access_token(value: &str) -> bool {

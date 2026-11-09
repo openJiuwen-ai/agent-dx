@@ -564,7 +564,12 @@ shared top-level `tenant` and peer application blocks. The required `jiuwen` blo
     "template_ref": "production",
     "backend_path": "/digitalmate/ws",
     "service_port": 18092,
-    "request_timeout_seconds": 180
+    "request_timeout_seconds": 180,
+    "pool": {
+      "pools_by_version": {"17": "digitalmate-v17"},
+      "claim_budget_seconds": 10,
+      "supplier_interval_seconds": 5
+    }
   }
 }
 ```
@@ -596,7 +601,41 @@ non-numeric string selects an Alias; for example `"12"` or `"production"`.
 An Alias must exist before admission and its reconciliation requires configured
 Activator registration and Redis notifications; registration automatically starts reconciliation. Reconnects reuse the same scope; different users
 are isolated. There is no client-selected binding ID or binding ID response
-header, ownership field, or mapping table.
+header or client-selected ownership field. Pooled DigitalMate workspaces use the
+server-side assignment table described below.
+
+`digitalmate.pool` is optional and only affects new users whose desired
+template version has a pool mapping. The Gateway first asks Activator for a
+claim; an empty pool or a different version keeps the existing cold-start path.
+After a claim is granted it records the encrypted pool key and
+`workspace_assignments(tenant,template,user_id)` transaction, transfers the
+LiteLLM key with `blocked=false` (never writing `spend`), marks the credential
+ready, and commits the slot as the user's AgentBinding. If the commit outcome is
+unknown or the claim was aborted after the account write, the request fails
+retryably instead of starting a second execution. The workspace is released
+only after Platform confirms deletion of the pool Environment; cold start then
+reuses the same `pool-<slot>` workspace.
+
+The Gateway also runs a pool supplier on the configured interval. It reserves
+slots and confirms that each pending key is not yet present in LiteLLM (or is
+still a blocked key owned by `pool:<slot_id>`). It does not create the key:
+LiteLLM caches key objects per worker and `/key/update` invalidates only the
+serving worker, so a pre-created blocked key can keep returning 401 after the
+transfer. The claim transfer creates the same persisted key for the user. Retired
+keys are deleted only for slots that never received a Grant and whose owner is still
+`pool:<slot_id>`; an absent key needs no deletion. Once a Grant exists, cleanup acknowledges the retired slot
+without deleting its key, even when the transfer did not finish. This avoids
+deleting an account's recoverable credential or racing a late ownership transfer.
+An unused key retained after an aborted claim requires explicit operational
+reconciliation against the account database; it is not automatically deleted.
+Missing claimed keys are recreated with the exact persisted key for the verified
+user; existing keys retain their spend and budgets. Pool keys and
+slot records live in the shared Activator Redis namespace; users must not be
+able to read that namespace.
+
+The [pool recovery contract](../docs/api/digitalmate-prewarm-pools.md) defines
+global claim lookup, bounded admission, key retention and the workspace release
+barrier. Pool claims are recovered before reading current Alias weights.
 
 The target is selected solely from the gateway configuration and verified session.
 Query parameters do not participate in gateway target or binding selection, even
@@ -752,7 +791,9 @@ remain separate. Use a Jiuwen hostname outside the direct-port host domain.
 Accounts, hashed sessions and encrypted per-user LiteLLM credentials use a shared
 PostgreSQL schema without tenant columns. Apply [schema.sql](src/ingress/accounts/schema.sql)
 for a fresh database.
-The schema version remains 1. Runtime SQL has no old-column detection or fallback.
+Schema version 2 adds `workspace_assignments`, keyed by
+`(tenant,template,user_id)`, to keep a pooled workspace stable across Binding
+deletion and re-creation. Runtime SQL has no old-column detection or fallback.
 The gateway's unchanged configured tenant is only a fixed identity namespace for
 Agent scopes, workspace hashes, LiteLLM owners and encrypted-key associated data.
 Keep that value and the credential encryption key unchanged to reuse existing data.

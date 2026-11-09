@@ -1,5 +1,6 @@
 //! Private service API. Authenticated Gateway supplies the verified tenant scope.
 use crate::*;
+use adx_agent_core::pool::*;
 use adx_agent_core::{
     activator::*,
     limits,
@@ -87,6 +88,28 @@ pub fn router(activator: Arc<Activator>, token: &str, timeout: Duration) -> Resu
         .route("/internal/adx/v1/bindings/activate", post(activate))
         .route("/internal/adx/v1/bindings/resolve", post(resolve))
         .route("/internal/adx/v1/bindings/view", post(binding_view))
+        .route("/internal/adx/v1/pools/put", post(put_pool))
+        .route("/internal/adx/v1/pools/get", post(get_pool))
+        .route("/internal/adx/v1/pools/status", post(pool_status))
+        .route("/internal/adx/v1/pools/drain", post(drain_pool))
+        .route("/internal/adx/v1/pools/reserve", post(reserve_pool))
+        .route(
+            "/internal/adx/v1/pools/pending_keys",
+            post(pending_pool_keys),
+        )
+        .route(
+            "/internal/adx/v1/pools/key_confirmed",
+            post(confirm_pool_key),
+        )
+        .route("/internal/adx/v1/pools/claim", post(claim_pool))
+        .route("/internal/adx/v1/pools/claims/get", post(lookup_pool_claim))
+        .route("/internal/adx/v1/pools/commit", post(commit_pool))
+        .route("/internal/adx/v1/pools/abort", post(abort_pool))
+        .route("/internal/adx/v1/pools/retired", post(retired_pool_keys))
+        .route(
+            "/internal/adx/v1/pools/retired/ack",
+            post(ack_retired_pool_key),
+        )
         .layer(DefaultBodyLimit::max(limits::HTTP_JSON_BYTES))
         .route_layer(middleware::from_fn_with_state(s.clone(), authorize))
         .route("/health/live", get(|| async { StatusCode::NO_CONTENT }))
@@ -197,6 +220,150 @@ async fn resolve(
 async fn binding_view(State(s): State<Service>, Json(request): Json<ScopeRequest>) -> Response {
     match s.activator.binding_view(&request.scope).await {
         Ok(value) => Json(value).into_response(),
+        Err(error) => failure(error),
+    }
+}
+
+async fn put_pool(
+    State(s): State<Service>,
+    axum::Extension(p): axum::Extension<Arc<RequestProgress>>,
+    Json(request): Json<PoolPutRequest>,
+) -> Response {
+    p.start_write();
+    match s.activator.put_pool(&request).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => failure(error),
+    }
+}
+async fn get_pool(State(s): State<Service>, Json(request): Json<PoolRequest>) -> Response {
+    match s.activator.pool(&request.tenant, &request.pool_id).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => failure(error),
+    }
+}
+async fn pool_status(State(s): State<Service>, Json(request): Json<PoolRequest>) -> Response {
+    match s
+        .activator
+        .pool_status(&request.tenant, &request.pool_id)
+        .await
+    {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => failure(error),
+    }
+}
+async fn drain_pool(
+    State(s): State<Service>,
+    axum::Extension(p): axum::Extension<Arc<RequestProgress>>,
+    Json(request): Json<PoolRequest>,
+) -> Response {
+    p.start_write();
+    match s
+        .activator
+        .drain_pool(&request.tenant, &request.pool_id)
+        .await
+    {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => failure(error),
+    }
+}
+async fn reserve_pool(
+    State(s): State<Service>,
+    axum::Extension(p): axum::Extension<Arc<RequestProgress>>,
+    Json(request): Json<ReserveRequest>,
+) -> Response {
+    p.start_write();
+    match s.activator.reserve_pool_slot(&request).await {
+        Ok(Some(value)) => Json(value).into_response(),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => failure(error),
+    }
+}
+async fn pending_pool_keys(
+    State(s): State<Service>,
+    Json(request): Json<PendingKeysRequest>,
+) -> Response {
+    match s.activator.pending_pool_keys(&request).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => failure(error),
+    }
+}
+async fn confirm_pool_key(
+    State(s): State<Service>,
+    axum::Extension(p): axum::Extension<Arc<RequestProgress>>,
+    Json(request): Json<KeyConfirmedRequest>,
+) -> Response {
+    p.start_write();
+    match s.activator.confirm_pool_key(&request).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => failure(error),
+    }
+}
+async fn claim_pool(
+    State(s): State<Service>,
+    axum::Extension(p): axum::Extension<Arc<RequestProgress>>,
+    Json(request): Json<ClaimRequest>,
+) -> Response {
+    p.start_write();
+    match s.activator.claim_pool(&request).await {
+        Ok(outcome @ ClaimOutcome::Aborted { .. }) => {
+            (StatusCode::CONFLICT, Json(outcome)).into_response()
+        }
+        Ok(value) => Json(value).into_response(),
+        Err(error) => failure(error),
+    }
+}
+
+async fn lookup_pool_claim(
+    State(s): State<Service>,
+    Json(request): Json<ClaimLookupRequest>,
+) -> Response {
+    match s.activator.lookup_pool_claim(&request).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => failure(error),
+    }
+}
+async fn commit_pool(
+    State(s): State<Service>,
+    axum::Extension(p): axum::Extension<Arc<RequestProgress>>,
+    Json(request): Json<CommitRequest>,
+) -> Response {
+    p.start_write();
+    match s.activator.commit_pool(&request).await {
+        Ok(outcome @ ClaimOutcome::Aborted { .. }) => {
+            (StatusCode::CONFLICT, Json(outcome)).into_response()
+        }
+        Ok(value) => Json(value).into_response(),
+        Err(error) => failure(error),
+    }
+}
+async fn abort_pool(
+    State(s): State<Service>,
+    axum::Extension(p): axum::Extension<Arc<RequestProgress>>,
+    Json(request): Json<AbortRequest>,
+) -> Response {
+    p.start_write();
+    match s.activator.abort_pool(&request).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => failure(error),
+    }
+}
+async fn retired_pool_keys(
+    State(s): State<Service>,
+    Json(request): Json<RetiredRequest>,
+) -> Response {
+    match s.activator.retired_pool_keys(&request).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => failure(error),
+    }
+}
+async fn ack_retired_pool_key(
+    State(s): State<Service>,
+    axum::Extension(p): axum::Extension<Arc<RequestProgress>>,
+    Json(request): Json<AckRetiredRequest>,
+) -> Response {
+    p.start_write();
+    match s.activator.ack_retired_pool_key(&request).await {
+        Ok(()) => Json(()).into_response(),
         Err(error) => failure(error),
     }
 }

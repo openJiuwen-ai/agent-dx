@@ -25,6 +25,9 @@ impl ManagedService {
             templates: Mutex::new(BoundedCache::new(1024)),
         }
     }
+    pub fn control(&self) -> Arc<dyn Control> {
+        self.control.clone()
+    }
     /// Select an AgentBinding identity without creating product or Environment state.
     /// Returns Invalid for a direct instance target or invalid scope components.
     pub fn binding_scope(

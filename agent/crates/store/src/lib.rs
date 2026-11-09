@@ -14,6 +14,7 @@ pub use state::AgentState;
 mod aliases;
 #[cfg(feature = "test-memory")]
 mod memory;
+mod pools;
 #[cfg(feature = "test-memory")]
 pub use memory::MemoryRepository;
 
@@ -57,12 +58,43 @@ impl Index {
     pub fn all_bindings() -> Self {
         Self("all-bindings".into())
     }
+    pub fn pools() -> Self {
+        Self("pools".into())
+    }
+    pub fn pool_slots(tenant: &str, pool_id: &str) -> Result<Self> {
+        Ok(Self(format!(
+            "pool-slots:{}",
+            adx_agent_core::encode_key(&[tenant, pool_id])
+        )))
+    }
+    pub fn pool_claims(tenant: &str, pool_id: &str) -> Result<Self> {
+        Ok(Self(format!(
+            "pool-claims:{}",
+            adx_agent_core::encode_key(&[tenant, pool_id])
+        )))
+    }
+    pub fn pool_retired(tenant: &str, pool_id: &str) -> Result<Self> {
+        Ok(Self(format!(
+            "pool-retired:{}",
+            adx_agent_core::encode_key(&[tenant, pool_id])
+        )))
+    }
 }
 impl Key {
     pub fn new(kind: &str, parts: &[&str]) -> Result<Self> {
         if !matches!(
             kind,
-            "template" | "template-sequence" | "binding" | "binding-launch" | "alias"
+            "template"
+                | "template-sequence"
+                | "binding"
+                | "binding-launch"
+                | "alias"
+                | "pool"
+                | "pool-slot"
+                | "pool-claim"
+                | "pool-retired"
+                | "pool-leader"
+                | "pool-workspace"
         ) || parts.is_empty()
             || parts.iter().any(|s| s.is_empty() || s.len() > 2048)
         {
@@ -79,6 +111,18 @@ impl Key {
                 };
                 indexes.push(Index::bindings(parts[0], parts[1], &reference)?);
             }
+        }
+        if kind == "pool" {
+            indexes.push(Index::pools());
+        }
+        if kind == "pool-slot" && parts.len() == 3 {
+            indexes.push(Index::pool_slots(parts[0], parts[1])?);
+        }
+        if kind == "pool-claim" && parts.len() == 3 {
+            indexes.push(Index::pool_claims(parts[0], parts[1])?);
+        }
+        if kind == "pool-retired" && parts.len() == 3 {
+            indexes.push(Index::pool_retired(parts[0], parts[1])?);
         }
         Ok(Self(
             format!("{kind}:{}", adx_agent_core::encode_key(parts)),

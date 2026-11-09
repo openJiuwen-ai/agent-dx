@@ -1,0 +1,15 @@
+{
+  "pool_id": "digitalmate-v17",
+  "tenant": "your-tenant",
+  "template": "digitalmate",
+  "version": "17",
+  "enabled": true,
+  "min_running": 2,
+  "min_ready": 4,
+  "max_slots": 10,
+  "max_provisioning": 3,
+  "key_confirm_timeout_seconds": 60,
+  "provision_timeout_seconds": 300,
+  "claim_timeout_seconds": 30,
+  "max_ready_age_seconds": 86400
+}

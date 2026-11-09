@@ -2,6 +2,7 @@
 mod creation;
 pub mod environment_request;
 pub mod local_environment;
+pub mod pool;
 pub mod reconciliation;
 pub mod server;
 pub mod transport;
@@ -553,6 +554,29 @@ impl Activator {
                 .await?;
         }
         self.state.finish_delete(&binding).await?;
+        self.cleanup_pool_claim(scope).await?;
+        Ok(())
+    }
+    async fn cleanup_pool_claim(&self, scope: &Scope) -> Result<()> {
+        for (_, config) in self.state.pools().await? {
+            if config.tenant != scope.tenant || config.template != scope.template {
+                continue;
+            }
+            if let Some((_, claim)) = self
+                .state
+                .pool_claim(&scope.tenant, &config.pool_id, &scope.binding_id)
+                .await?
+            {
+                if claim.state == adx_agent_core::pool::ClaimState::Committed
+                    && claim.scope == *scope
+                    && claim.pool_id == config.pool_id
+                {
+                    self.state
+                        .delete_pool_claim(&scope.tenant, &config.pool_id, &scope.binding_id)
+                        .await?;
+                }
+            }
+        }
         Ok(())
     }
     async fn cleanup_environment(

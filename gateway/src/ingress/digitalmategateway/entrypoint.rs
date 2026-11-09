@@ -216,6 +216,7 @@ pub struct DigitalMateGatewayApi {
     config: DigitalMateGatewayConfig,
     auth: Arc<dyn BusinessAuth>,
     managed: Arc<ManagedService>,
+    pool: Option<Arc<super::pool::PoolRuntime>>,
 }
 impl DigitalMateGatewayApi {
     pub fn new(
@@ -224,10 +225,23 @@ impl DigitalMateGatewayApi {
         auth: Arc<dyn BusinessAuth>,
     ) -> Result<Self, Error> {
         config.validate()?;
+        let pool = config
+            .digitalmate
+            .as_ref()
+            .and_then(|digitalmate| digitalmate.pool.clone())
+            .and_then(|pool| {
+                super::pool::PoolRuntime::new(
+                    managed.control(),
+                    auth.clone(),
+                    config.tenant.clone(),
+                    pool,
+                )
+            });
         Ok(Self {
             auth,
             config,
             managed,
+            pool,
         })
     }
     pub fn matches(path: &str) -> bool {
@@ -286,7 +300,10 @@ impl DigitalMateGatewayApi {
                     self.managed.clone(),
                     self.auth.clone(),
                     principal,
-                    &self.config.tenant,
+                    super::application_ws::ApplicationContext {
+                        tenant: &self.config.tenant,
+                        pool: self.pool.clone(),
+                    },
                 )
                 .await;
         }

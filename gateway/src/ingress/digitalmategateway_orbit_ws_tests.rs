@@ -506,6 +506,12 @@ impl ModelAuth {
 }
 #[async_trait::async_trait]
 impl crate::ingress::accounts::BusinessAuth for ModelAuth {
+    fn model_api_base(&self) -> Option<String> {
+        Some("https://model.test/v1".into())
+    }
+    fn pool_models(&self) -> Option<Arc<dyn crate::ingress::accounts::ModelProvider>> {
+        Some(Arc::new(UnusedPoolModels))
+    }
     async fn login(
         &self,
         request: crate::ingress::accounts::LoginRequest,
@@ -548,6 +554,101 @@ impl crate::ingress::accounts::BusinessAuth for ModelAuth {
             ("model_api_key".into(), "synthetic-model-key".into()),
             ("model_api_base".into(), "http://model.test/v1".into()),
         ]))
+    }
+}
+
+struct UnusedPoolModels;
+#[async_trait::async_trait]
+impl crate::ingress::accounts::ModelProvider for UnusedPoolModels {
+    async fn ensure(&self, _: &str, _: &str, _: &str) -> crate::ingress::accounts::Result<()> {
+        unreachable!()
+    }
+    async fn quota(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> crate::ingress::accounts::Result<crate::ingress::accounts::QuotaResponse> {
+        unreachable!()
+    }
+}
+
+#[tokio::test]
+async fn digitalmate_pool_misses_reach_the_real_cold_initializer() {
+    for scenario in ["empty", "disabled", "version_changed"] {
+        let (gateway, backend) = fixture().await;
+        let state = AgentState::new(Arc::new(MemoryRepository::default()));
+        let draft: adx_agent_core::TemplateDraft = serde_json::from_value(json!({
+            "name":"digitalmate","image":"app:1","isolation_runtime":"runc",
+            "resources":{"cpu_millis":500,"memory_mib":512},"service":[{"protocol":"ws","port":18092}]
+        })).unwrap();
+        state.publish("tenant", &draft).await.unwrap();
+        state.publish("tenant", &draft).await.unwrap();
+        state
+            .put_alias(
+                &serde_json::from_value(json!({
+                    "tenant":"tenant","template":"digitalmate","alias":"production","seed":"stable",
+                    "versions":[{"version":"1","weight":1}]
+                }))
+                .unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        state.put_pool(&serde_json::from_value(json!({
+            "tenant":"tenant","pool_id":"pool","template":"digitalmate",
+            "version":if scenario == "version_changed" { "2" } else { "1" }, "enabled":scenario != "disabled",
+            "min_running":0,"min_ready":0,"max_slots":1,"max_provisioning":1,
+            "key_confirm_timeout_seconds":60,"provision_timeout_seconds":300,"claim_timeout_seconds":30,"max_ready_age_seconds":86400
+        })).unwrap(), None).await.unwrap();
+        let mut config = application_alias_settings("digitalmate", 18092);
+        let application = config.digitalmate.as_mut().unwrap();
+        application.request_timeout_seconds = 1;
+        application.pool =
+            Some(serde_json::from_value(json!({"pools_by_version":{"1":"pool"}})).unwrap());
+        let managed = Arc::new(ManagedService::new(Arc::new(LocalControl::new(Arc::new(
+            adx_activator::Activator::new(state.clone(), backend),
+        )))));
+        let auth = Arc::new(ModelAuth::new());
+        let gateway = Arc::new(
+            gateway
+                .as_ref()
+                .clone()
+                .with_digitalmategateway_api(Arc::new(
+                    DigitalMateGatewayApi::new(config, managed, auth.clone()).unwrap(),
+                )),
+        );
+        let (mut sender, server, client) = connection(gateway, IngressSecurity::Plaintext).await;
+        let response = sender
+            .send_request(application_request("digitalmate", ""))
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "{scenario}: cold target has no configured route"
+        );
+        response.collect().await.unwrap();
+        assert_eq!(
+            auth.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "{scenario}: initializer ran"
+        );
+        let scope = adx_agent_core::Scope {
+            tenant: "tenant".into(),
+            template: "digitalmate".into(),
+            template_ref: adx_agent_core::TemplateRef::Alias("production".into()),
+            binding_id: format!(
+                "digitalmate-{}",
+                hex::encode(Sha256::digest(
+                    serde_json::to_vec(&["tenant", "alice"]).unwrap()
+                ))
+            ),
+        };
+        assert!(
+            state.binding(&scope).await.unwrap().unwrap().parameters["workspace"].starts_with("w-")
+        );
+        server.abort();
+        client.abort();
     }
 }
 

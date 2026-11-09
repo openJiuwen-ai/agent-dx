@@ -1,5 +1,6 @@
 use super::*;
 use deadpool_postgres::{Manager, Pool, Runtime};
+use tokio_postgres::error::SqlState;
 use tokio_postgres::{config::SslMode, Row};
 
 #[derive(Clone)]
@@ -10,6 +11,13 @@ pub(crate) struct CredentialRecord {
     pub encrypted_key: Vec<u8>,
     pub version: String,
     pub ready: bool,
+}
+pub(crate) struct ClaimBinding<'a> {
+    pub tenant: &'a str,
+    pub template: &'a str,
+    pub claim_id: &'a str,
+    pub slot_id: &'a str,
+    pub workspace: &'a str,
 }
 impl AccountStore {
     pub async fn connect(config: &AccountConfig) -> Result<Self> {
@@ -63,7 +71,7 @@ impl AccountStore {
             .query("SELECT version FROM adx_accounts.schema_version", &[])
             .await
             .map_err(|_| Error::Configuration)?;
-        if rows.len() != 1 || rows[0].get::<_, i32>(0) != 1 {
+        if rows.len() != 1 || rows[0].get::<_, i32>(0) != 2 {
             return Err(Error::Configuration);
         }
         drop(client);
@@ -164,5 +172,170 @@ impl AccountStore {
             return Err(Error::Unavailable);
         }
         Ok(())
+    }
+
+    pub(crate) async fn claim_state(
+        &self,
+        user_id: &str,
+        tenant: &str,
+        template: &str,
+    ) -> Result<super::ClaimState> {
+        let client = self.pool.get().await.map_err(|_| Error::Unavailable)?;
+        let row = client.query_one(
+            "SELECT c.credential_version,c.ready,a.workspace,a.slot_id,a.claim_id,a.committed \
+             FROM (VALUES ($1::text)) AS subject(user_id) \
+             LEFT JOIN adx_accounts.model_credentials c ON c.user_id=subject.user_id \
+             LEFT JOIN adx_accounts.workspace_assignments a ON a.user_id=subject.user_id AND a.tenant=$2 AND a.template=$3",
+            &[&user_id, &tenant, &template],
+        ).await.map_err(|_| Error::Unavailable)?;
+        let assignment = row
+            .get::<_, Option<String>>(4)
+            .map(|claim_id| super::ClaimAssignment {
+                tenant: tenant.into(),
+                template: template.into(),
+                workspace: row.get(2),
+                slot_id: row.get(3),
+                claim_id,
+                committed: row.get(5),
+            });
+        Ok(super::ClaimState {
+            credential_version: row.get(0),
+            credential_ready: row.get::<_, Option<bool>>(1).unwrap_or(false),
+            assignment,
+        })
+    }
+
+    pub(crate) async fn assignment(
+        &self,
+        tenant: &str,
+        template: &str,
+        user_id: &str,
+    ) -> Result<Option<super::ClaimAssignment>> {
+        let client = self.pool.get().await.map_err(|_| Error::Unavailable)?;
+        let row = client
+            .query_opt(
+                "SELECT tenant,template,workspace,slot_id,claim_id,committed FROM adx_accounts.workspace_assignments WHERE tenant=$1 AND template=$2 AND user_id=$3",
+                &[&tenant, &template, &user_id],
+            )
+            .await
+            .map_err(|_| Error::Unavailable)?;
+        Ok(row.map(Self::assignment_row))
+    }
+
+    fn assignment_row(row: Row) -> super::ClaimAssignment {
+        super::ClaimAssignment {
+            tenant: row.get(0),
+            template: row.get(1),
+            workspace: row.get(2),
+            slot_id: row.get(3),
+            claim_id: row.get(4),
+            committed: row.get(5),
+        }
+    }
+
+    /// Credential and assignment are written in one transaction. A repeated call for the
+    /// same claim returns its progress; a different claim for the same user conflicts.
+    pub(crate) async fn record_claim(
+        &self,
+        user_id: &str,
+        binding: ClaimBinding<'_>,
+        encrypted_key: Vec<u8>,
+    ) -> Result<super::ClaimProgress> {
+        let ClaimBinding {
+            tenant,
+            template,
+            claim_id,
+            slot_id,
+            workspace,
+        } = binding;
+        let mut client = self.pool.get().await.map_err(|_| Error::Unavailable)?;
+        let tx = client.transaction().await.map_err(|_| Error::Unavailable)?;
+        tx.execute(
+            "INSERT INTO adx_accounts.model_credentials(user_id,credential_version,encrypted_key) \
+             SELECT user_id,$2,$3 FROM adx_accounts.users WHERE user_id=$1 AND status='active' \
+             ON CONFLICT (user_id) DO NOTHING",
+            &[&user_id, &claim_id, &encrypted_key],
+        )
+        .await
+        .map_err(|_| Error::Unavailable)?;
+        let credential = tx
+            .query_opt(
+                "SELECT credential_version,ready FROM adx_accounts.model_credentials WHERE user_id=$1 FOR UPDATE",
+                &[&user_id],
+            )
+            .await
+            .map_err(|_| Error::Unavailable)?
+            .ok_or(Error::Forbidden)?;
+        if credential.get::<_, String>(0) != claim_id {
+            return Err(Error::ClaimConflict);
+        }
+        tx.execute(
+            "INSERT INTO adx_accounts.workspace_assignments(tenant,template,user_id,workspace,slot_id,claim_id) \
+             SELECT $1,$2,user_id,$4,$5,$6 FROM adx_accounts.users WHERE user_id=$3 AND status='active' \
+             ON CONFLICT (tenant,template,user_id) DO NOTHING",
+            &[&tenant, &template, &user_id, &workspace, &slot_id, &claim_id],
+        )
+        .await
+        .map_err(|error| {
+            if error.code() == Some(&SqlState::UNIQUE_VIOLATION) {
+                Error::ClaimConflict
+            } else {
+                Error::Unavailable
+            }
+        })?;
+        let assignment = tx
+            .query_opt(
+                "SELECT workspace,slot_id,claim_id,committed FROM adx_accounts.workspace_assignments \
+                 WHERE tenant=$1 AND template=$2 AND user_id=$3 FOR UPDATE",
+                &[&tenant, &template, &user_id],
+            )
+            .await
+            .map_err(|_| Error::Unavailable)?
+            .ok_or(Error::Forbidden)?;
+        if assignment.get::<_, String>(0) != workspace
+            || assignment.get::<_, String>(1) != slot_id
+            || assignment.get::<_, String>(2) != claim_id
+        {
+            return Err(Error::ClaimConflict);
+        }
+        let progress = super::ClaimProgress {
+            credential_ready: credential.get(1),
+            assignment_committed: assignment.get(3),
+        };
+        tx.commit().await.map_err(|_| Error::Unavailable)?;
+        Ok(progress)
+    }
+
+    pub(crate) async fn commit_claim(
+        &self,
+        user_id: &str,
+        tenant: &str,
+        template: &str,
+        claim_id: &str,
+    ) -> Result<()> {
+        let client = self.pool.get().await.map_err(|_| Error::Unavailable)?;
+        let updated = client
+            .execute(
+                "UPDATE adx_accounts.workspace_assignments SET committed=true \
+                 WHERE tenant=$1 AND template=$2 AND user_id=$3 AND claim_id=$4",
+                &[&tenant, &template, &user_id, &claim_id],
+            )
+            .await
+            .map_err(|_| Error::Unavailable)?;
+        if updated == 1 {
+            return Ok(());
+        }
+        let row = client
+            .query_opt(
+                "SELECT claim_id FROM adx_accounts.workspace_assignments \
+                 WHERE tenant=$1 AND template=$2 AND user_id=$3",
+                &[&tenant, &template, &user_id],
+            )
+            .await
+            .map_err(|_| Error::Unavailable)?;
+        match row {
+            Some(row) if row.get::<_, String>(0) == claim_id => Ok(()),
+            _ => Err(Error::ClaimConflict),
+        }
     }
 }

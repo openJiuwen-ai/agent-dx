@@ -470,3 +470,159 @@ async fn postgres_sessions_and_litellm_credentials_survive_retries_and_replicas(
     server.abort();
     db_task.abort();
 }
+
+#[tokio::test]
+#[ignore = "requires dedicated PostgreSQL with accounts/schema.sql v2 applied"]
+async fn postgres_claim_records_are_idempotent_and_tenant_scoped() {
+    let db =
+        std::env::var("ADX_ACCOUNT_TEST_DATABASE_URL").expect("dedicated test database required");
+    let model = Arc::new(ModelState::default());
+    let (url, server) = serve_model(model).await;
+    let provider_scope = format!("claim-{}", uuid::Uuid::new_v4());
+    let make = || async {
+        let mut cfg = config(&url);
+        cfg.developer_scope = provider_scope.clone();
+        let model = Arc::new(LiteLlm::with_key(cfg.litellm.clone(), "mock-admin".into()).unwrap());
+        Arc::new(
+            AccountService::new_with_agc(
+                cfg,
+                "test-app".into(),
+                AccountStore::from_url(&db, true, None).await.unwrap(),
+                Arc::new(Identity),
+                None,
+                model,
+                CredentialCipher::new([7; 32], "tenant").unwrap(),
+            )
+            .unwrap(),
+        )
+    };
+    let a = make().await;
+    let b = make().await;
+    for index in 0..24 {
+        let login = a.login(login(&format!("snapshot-{index}"))).await.unwrap();
+        let principal = a.authenticate(&login.token).await.unwrap();
+        let scope = adx_agent_core::Scope {
+            tenant: "snapshot-tenant".into(),
+            template: "digitalmate".into(),
+            template_ref: adx_agent_core::TemplateRef::Version("17".into()),
+            binding_id: format!("claim-{index}"),
+        };
+        let workspace = format!("pool-snapshot-{index}");
+        let writing = a.record_claim(
+            &principal,
+            &scope,
+            &scope.binding_id,
+            &workspace,
+            &workspace,
+            "sk-snapshot",
+        );
+        let reading = async {
+            for _ in 0..8 {
+                let state = b.claim_state(&principal, &scope).await.unwrap();
+                assert_eq!(
+                    state.credential_version.is_some(),
+                    state.assignment.is_some()
+                );
+            }
+        };
+        let (result, ()) = tokio::join!(writing, reading);
+        result.unwrap();
+    }
+    let alice = a
+        .authenticate(&a.login(login("alice")).await.unwrap().token)
+        .await
+        .unwrap();
+    let bob = b
+        .authenticate(&b.login(login("bob")).await.unwrap().token)
+        .await
+        .unwrap();
+    let scope = adx_agent_core::Scope {
+        tenant: "tenant-a".into(),
+        template: "digitalmate".into(),
+        template_ref: adx_agent_core::TemplateRef::Version("17".into()),
+        binding_id: "digitalmate-alice".into(),
+    };
+    let first = a
+        .record_claim(
+            &alice,
+            &scope,
+            &scope.binding_id,
+            "s-1",
+            "pool-s-1",
+            "sk-pool",
+        )
+        .await
+        .unwrap();
+    assert!(!first.credential_ready);
+    assert!(!first.assignment_committed);
+    let replay = b
+        .record_claim(
+            &alice,
+            &scope,
+            &scope.binding_id,
+            "s-1",
+            "pool-s-1",
+            "sk-pool",
+        )
+        .await
+        .unwrap();
+    assert_eq!(first, replay);
+    assert!(matches!(
+        b.record_claim(&alice, &scope, "other-claim", "s-1", "pool-s-1", "sk-pool")
+            .await,
+        Err(Error::ClaimConflict)
+    ));
+    a.commit_claim(&alice, &scope, &scope.binding_id)
+        .await
+        .unwrap();
+    b.commit_claim(&alice, &scope, &scope.binding_id)
+        .await
+        .unwrap();
+    let state = b.claim_state(&alice, &scope).await.unwrap();
+    assert_eq!(
+        state.credential_version.as_deref(),
+        Some(scope.binding_id.as_str())
+    );
+    assert!(state.assignment.as_ref().unwrap().committed);
+    // The account store is shared, but the assignment identity includes tenant.
+    let other_tenant = adx_agent_core::Scope {
+        tenant: "tenant-b".into(),
+        ..scope.clone()
+    };
+    b.record_claim(
+        &alice,
+        &other_tenant,
+        &scope.binding_id,
+        "s-1",
+        "pool-s-1-b",
+        "sk-pool",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        b.claim_state(&alice, &other_tenant)
+            .await
+            .unwrap()
+            .assignment
+            .unwrap()
+            .tenant,
+        "tenant-b"
+    );
+    // Another user cannot take the same tenant/workspace pair.
+    assert!(matches!(
+        b.record_claim(
+            &bob,
+            &adx_agent_core::Scope {
+                binding_id: "digitalmate-bob".into(),
+                ..scope.clone()
+            },
+            "digitalmate-bob",
+            "s-2",
+            "pool-s-1",
+            "sk-other",
+        )
+        .await,
+        Err(Error::ClaimConflict)
+    ));
+    server.abort();
+}
