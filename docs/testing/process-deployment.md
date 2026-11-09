@@ -10,7 +10,7 @@
 |---|---|
 | `platform/deployment/src/cli.rs` | 类型化子命令和参数；`start` 是 `run` 的兼容别名 |
 | `platform/deployment/src/config.rs` | 部署 schema、控制面/数据面角色与公共参数校验，生成组件配置、Redis AOF 配置和 Node 管理 socket 地址 |
-| `platform/deployment/src/supervisor.rs` | 单部署文件锁、受保护的控制 UDS、子进程组、日志、有限次数重启、状态查询和停止顺序 |
+| `platform/deployment/src/supervisor.rs` | 单部署文件锁、受保护的控制 UDS、子进程组、日志、持续重启、状态查询和停止策略与顺序 |
 | `platform/adxlet/src/admin.rs` | 本机已管理 Environment 的停止清理；保持 adxlet 的生命周期所有权 |
 | `node.proto / NodeAdminService` | 仅在本机受保护 UDS 服务的 Drain RPC，不挂到 Node TCP 服务 |
 | `build/release/build.sh` | 原生 release 构建、SDK wheel 构建、统一包组装 |
@@ -26,7 +26,7 @@ adxctl render --output /tmp/adx-generated
 adxctl run
 # 另一个终端
 adxctl status
-adxctl stop
+adxctl stop --mode drain
 ```
 
 `start` 与 `run` 相同，前台运行 supervisor，适合直接作为服务或 Pod 的入口进程。状态查询反映子进程 PID、重启次数和失败标记，**不等同于平台业务就绪**。同一 `state_dir` 只允许一个 supervisor，命令经当前进程的 UDS 执行，不读取 PID 文件后盲目 kill。
@@ -39,13 +39,17 @@ adxctl stop
 
 默认启动顺序为 Redis → Coordinator → adxlet（含内嵌 Proxy）→ API Server（含内嵌 Ingress）。显式分进程时，独立 Relay 在 adxlet 前启动，独立 Ingress 在 API Server 后启动。该顺序只安排进程拉起；组件通过已有发现和对账握手达到就绪。进程退出或 spawn 失败后按 `restart_delay_ms` 持续重试，其他角色保持运行。状态中的 `restarts` 只记录重试次数，`failed` 表示当前退出或启动失败状态，成功启动后清除；进程存活仍不代表业务就绪。
 
-显式 `stop` 和 supervisor 收到 SIGTERM／SIGINT 都执行：
+退出模式由部署文件的 `shutdown_mode` 控制，默认 `preserve`。无参数 `stop` 和 supervisor 的 SIGTERM／SIGINT 使用启动时加载的模式；`stop --mode preserve|drain` 只覆盖一次停止，后续磁盘配置变化不会隐式改变运行中的策略。`status` 输出配置模式，停止响应和日志记录实际模式。
+
+选择 `drain` 时执行：
 
 1. 调用本机各 adxlet 的 Drain。Node 关闭新准入，等待已接收的串行操作，逐一退役绑定、删除运行时、提交 Deleted。
 2. 每个删除结果必须为 `Published` 且不占资源。Coordinator 不可用、清理失败或只进入本地降级日志时，停止不成功，保留依赖供重试。
 3. 所有本机节点清理成功后，按相反顺序停止子进程。单个进程终止超时会被强制终止，并使这次停止返回失败。
 
-adxlet 未完成权威对账时，不能用空内存目录宣称清理完成。清理开始后保持 draining；失败可再次执行。作用域是本机已接收并管理的 Environment，不执行远端节点排空或迁移。完整 E2E 还需覆盖停止与 Coordinator 在途分配之间的竞争。
+drain 要求 adxlet 完成权威对账，不能用空内存目录宣称清理完成。清理开始后保持 draining；失败可再次执行。作用域是本机已接收并管理的 Environment，不执行远端节点排空或迁移。完整 E2E 还需覆盖停止与 Coordinator 在途分配之间的竞争。
+
+选择 `preserve` 时跳过上述 Drain 和删除提交阶段，直接按反向顺序停止进程并收尾日志；对 adxlet 的 SIGUSR1 及超时后的 SIGKILL 仅发送到其 PID，不向同组子进程广播；adxlet 已退出或管理 socket 不可用不阻止其余组件停止。adxlet 收到停止信号后立即关闭新准入，内嵌 Relay 排水期间持续运行原有心跳与运行时控制循环，排水完成后退出，不主动注销节点。周期性对账不能重新开放退出中的准入。它不因退出而删除 Environment 或 checkpoint，仍报告进程终止超时等错误，且不自动转换为 drain。失败响应包含模式、阶段、服务 ID 与错误消息。保留的会话仅可在心跳期限内、后端执行仍存活且节点 ID/RPC/Relay 地址保持一致时，经 GetSession 复核接续；preserve 不延长超时窗口，也不保证 Pod 替换后的运行时存活。
 
 sandboxd 始终由部署环境独立托管，角色枚举不允许 supervisor 拉起它。Execd 随包交付到 `runtime/`，须进入实际实例环境；不会被当成宿主公共服务启动。Relay 和 Ingress 均支持默认共进程及显式分进程，见 [Relay 进程模式](relay-process-modes.md)与 [Ingress 进程模式](api-ingress-process-modes.md)。
 
@@ -89,12 +93,17 @@ package/
 
 - TDD 首先确认 `drain`／`is_draining` 接口缺失；随后测试删除提交失败、重试只补提交、未对账拒绝停止、新分配拒绝。
 - supervisor 测试运行真实子进程和 UDS，检查重复启动排他、连续退出后仍可恢复、清理失败时依赖存活、再次停止成功。
+- preserve 回归启动真实 adxctl 二进制，以可观测的 NodeAdmin 夹具核对 SIGTERM/SIGINT、CLI 覆盖、配置变化、管理 socket 缺失和 adxlet 已退出时的行为；单独核对终止超时的结构化错误。supervisor 的 `stop_timeout_seconds` 需覆盖完整 Relay 排水和收尾时间，详见 [退出配置](../deployment/adxctl.md)。`adxlet` 的退出组件测试用虚拟时间覆盖 35 秒 Relay 排水，核对准入关闭、心跳与控制服务持续运行、已有 Environment 和资源预留保留；生产 gRPC 客户端对账测试核对心跳序号递增、会话不变且持续报告不接收分配；退出完成测试核对 preserve 不调用注销、显式 drain 仍按精确会话注销。这些是退出策略组件验证，没有运行真实 sandboxd／Execd。
 - 真实包 smoke 托管真实 Redis＋Coordinator，检查 Redis 地址发布、Coordinator 强制退出后的新 PID／新 epoch，以及 `adxctl stop` 后 supervisor 退出。
 - API Server 通过根 Cargo workspace 编译与测试；原有 HTTPS／RPC／Redis 协作套件继续回归。
 
 这不是两节点完整平台验收：没有启动真实 sandboxd／Execd，也没有通过安装后的公开 SDK 完成创建—命令—文件—删除。后续环境驱动器、实例镜像、资源源与 SDK 用例已接通，正式结果见本文开头。不会用本阶段的包构建或 Coordinator smoke 代替该门禁。
 
-## 本轮结果
+## preserve 本地验证（2026-11-06）
+
+`adx-deployment` 的 78 项测试通过，包含 10 项独立进程退出测试；全工作区 rustfmt、全 target／feature Clippy（含 AFS）及仓库 `unwrap_used` 检查通过。完整日志保留于 `out/preserve-shutdown-20261106/`。没有构建或发布新 Node 镜像，没有执行 Kubernetes／生产重启验收。
+
+## 早期验收结果
 
 基准为 `refactor/monorepo-layout` 的 `1e49d86f2123173a8f5358182ca294fab9a9b1e4` 加未提交工作树。Rust／进程验证在 macOS ARM64；Go 在 Linux ARM64 工具链容器测试并生成本机服务。统一包是明确标记的 `aarch64-apple-darwin / debug` 开发包。
 

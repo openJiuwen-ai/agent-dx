@@ -10,6 +10,13 @@ pub enum ProxyMode {
     #[default]
     Embedded,
 }
+
+/// Process exit intent: SIGUSR1 preserves ownership; SIGTERM/SIGINT depart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownMode {
+    Preserve,
+    Drain,
+}
 pub struct EmbeddedProxy {
     stop: Option<oneshot::Sender<()>>,
     task: JoinHandle<Result<()>>,
@@ -65,6 +72,50 @@ impl Drop for EmbeddedProxy {
         self.task.abort();
     }
 }
+
+/// Close admission on shutdown, keeping node services alive through Relay drain.
+/// Returns admission, service or Relay failures to the process owner.
+pub async fn serve_until_shutdown<E>(
+    manager: &crate::Adxlet,
+    mut proxy: Option<EmbeddedProxy>,
+    services: impl std::future::Future<Output = std::result::Result<(), E>>,
+    signal: impl std::future::Future<Output = ShutdownMode>,
+) -> std::result::Result<ShutdownMode, E>
+where
+    E: From<Error>,
+{
+    tokio::pin!(services);
+    // A background service exit alone does not authorize planned departure.
+    let mode = tokio::select! {
+        result = async {
+            match &mut proxy {
+                Some(proxy) => proxy.failed().await,
+                None => std::future::pending::<Result<()>>().await,
+            }
+        } => return result.map(|()| ShutdownMode::Preserve).map_err(E::from),
+        result = &mut services => return result.map(|()| ShutdownMode::Preserve),
+        mode = signal => mode,
+    };
+    manager.begin_shutdown().map_err(E::from)?;
+    let drain = async {
+        if let Some(proxy) = proxy {
+            proxy.shutdown().await.map_err(E::from)?;
+        }
+        Ok(())
+    };
+    // Prefer a completed drain when both branches are ready. A service exit
+    // during drain returns immediately: dropping EmbeddedProxy aborts Relay
+    // rather than waiting without heartbeat/runtime control services.
+    tokio::select! {
+        biased;
+        result = drain => result.map(|()| mode),
+        result = &mut services => result.map(|()| mode),
+    }
+}
+
+#[cfg(test)]
+#[path = "proxy_shutdown_tests.rs"]
+mod shutdown_tests;
 
 #[cfg(test)]
 mod tests {
