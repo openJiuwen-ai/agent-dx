@@ -445,6 +445,7 @@ dependencies = [
  "blake3",
  "clap",
  "crc32c",
+ "etcd-client 0.21.1",
  "fuser",
  "hyper-util",
  "im",
@@ -453,6 +454,7 @@ dependencies = [
  "postcard",
  "prost 0.14.4",
  "rayon-core",
+ "redis",
  "reqwest 0.13.5",
  "rustls",
  "serde",
@@ -1425,7 +1427,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "deadpool-postgres",
- "etcd-client",
+ "etcd-client 0.14.1",
  "futures-util",
  "h2",
  "hex",
@@ -1756,6 +1758,24 @@ dependencies = [
  "tonic 0.12.3",
  "tonic-build 0.12.3",
  "tower 0.4.13",
+ "tower-service",
+]
+
+[[package]]
+name = "etcd-client"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c46b85f82f5189ce66d901425833ee2d94440a571e8071252db5776cc66dea63"
+dependencies = [
+ "http",
+ "prost 0.14.4",
+ "tokio",
+ "tokio-stream",
+ "tonic 0.14.6",
+ "tonic-build 0.14.6",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tower 0.5.3",
  "tower-service",
 ]
 

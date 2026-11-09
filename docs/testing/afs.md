@@ -954,7 +954,7 @@ Root命令接口契约及受影响真实gRPC丢ACK修复用例补充核对接线
 P3-6有限配置回归包括默认local-file、退役选项拒绝、TOML／CLI覆盖和非法范围。
 共享启动工厂的有限运行测试另核对实际历史条数／空闲过期、恢复后不复活、
 短周期checkpoint与WAL分段；序列化配置正确不替代运行接线证据。
-旧快照StoreBackend、etcd／Redis适配和专属测试已按clean-break移除；保留现有领域、健康故障和丢ACK重放断言并改用canonical日志。旧源码与历史结论仍按原版本保留。配置／组件通过不代表真实产品或P3-6全部完成。
+旧快照StoreBackend（整份快照单 key 的 etcd／Redis 适配）和专属测试已按clean-break移除，R16 的 redis／etcd 操作日志后端另有合同测试（`log_contract_tests`、`kv_log_tests`，`--ignored` 并指定专用实例）；保留现有领域、健康故障和丢ACK重放断言并改用canonical日志。旧源码与历史结论仍按原版本保留。配置／组件通过不代表真实产品或P3-6全部完成。
 
 ### Meta指标与旧工具接线回归
 

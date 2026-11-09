@@ -79,6 +79,9 @@ pub enum FormatKind {
     NodeMetaProtocol,
     /// P3: Node↔Node RDMA probe handshake.
     RdmaHandshake,
+    /// M17: `AFSK` layout key of a shared-service Meta log (etcd/Redis,
+    /// `meta::store::kv_log`): key layout and frame/pointer encodings.
+    MetaKvLayout,
 }
 
 /// What a reader does with a version it does not support.
@@ -112,6 +115,7 @@ pub const ALL: &[FormatKind] = &[
     FormatKind::OwnerFsRootRecord,
     FormatKind::NodeMetaProtocol,
     FormatKind::RdmaHandshake,
+    FormatKind::MetaKvLayout,
 ];
 
 /// Current versions, typed as each format stores them. Values are the versions
@@ -136,6 +140,7 @@ pub mod version {
     pub const OWNERFS_ROOT_RECORD: u32 = 1;
     pub const NODE_META_PROTOCOL: u32 = afs_protocol::CLUSTER_PROTOCOL_VERSION;
     pub const RDMA_HANDSHAKE: u32 = 1;
+    pub const META_KV_LAYOUT: u16 = 1;
 }
 
 /// `magic || version (u16 big-endian)`: the six-byte tag of the fixed Meta
@@ -148,6 +153,7 @@ pub const META_WAL_SEGMENT_MAGIC: [u8; 4] = *b"AFSW";
 pub const META_IDENTITY_MAGIC: [u8; 4] = *b"AFSI";
 pub const META_CURRENT_MAGIC: [u8; 4] = *b"AFSM";
 pub const META_CHECKPOINT_MAGIC: [u8; 4] = *b"AFSC";
+pub const META_KV_LAYOUT_MAGIC: [u8; 4] = *b"AFSK";
 /// `AFSI\0\x01`.
 pub const META_IDENTITY_HEADER: [u8; 6] =
     tagged_header(META_IDENTITY_MAGIC, version::META_IDENTITY);
@@ -188,6 +194,7 @@ impl FormatKind {
             Self::OwnerFsRootRecord => "OwnerFs local root record",
             Self::NodeMetaProtocol => "Node-Meta protocol",
             Self::RdmaHandshake => "RDMA handshake",
+            Self::MetaKvLayout => "Meta key-value log layout",
         }
     }
 
@@ -211,6 +218,7 @@ impl FormatKind {
             Self::OwnerFsRootRecord => version::OWNERFS_ROOT_RECORD,
             Self::NodeMetaProtocol => version::NODE_META_PROTOCOL,
             Self::RdmaHandshake => version::RDMA_HANDSHAKE,
+            Self::MetaKvLayout => version::META_KV_LAYOUT as u32,
         }
     }
 
@@ -302,7 +310,7 @@ mod tests {
             assert!(names.insert(kind.name()), "duplicate name {}", kind.name());
             check(*kind, "x", u64::from(kind.current())).unwrap();
         }
-        assert_eq!(ALL.len(), 18);
+        assert_eq!(ALL.len(), 19);
     }
 
     /// The registry only names today's encodings; it must not change a byte.

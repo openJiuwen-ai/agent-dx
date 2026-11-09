@@ -7,6 +7,10 @@ use afs_error::Result;
 /// Meta settings; the defaults come from the Meta store itself.
 pub(super) struct MetaSettings {
     pub(super) meta_store: MetaStoreBackend,
+    pub(super) meta_redis_url: Option<String>,
+    pub(super) meta_etcd_endpoints: Vec<String>,
+    pub(super) meta_etcd_max_request_bytes: usize,
+    pub(super) meta_store_prefix: String,
     pub(super) meta_record_max_bytes: usize,
     pub(super) meta_batch_max_bytes: usize,
     pub(super) meta_wal_max_bytes: u64,
@@ -33,6 +37,21 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> MetaSettings {
             .meta_store
             .or(file.meta_store)
             .unwrap_or(MetaStoreBackend::LocalFile),
+        meta_redis_url: cli.meta_redis_url.clone().or(file.meta_redis_url.clone()),
+        meta_etcd_endpoints: cli
+            .meta_etcd_endpoints
+            .clone()
+            .or(file.meta_etcd_endpoints.clone())
+            .unwrap_or_default(),
+        meta_etcd_max_request_bytes: cli
+            .meta_etcd_max_request_bytes
+            .or(file.meta_etcd_max_request_bytes)
+            .unwrap_or(ETCD_DEFAULT_MAX_REQUEST_BYTES),
+        meta_store_prefix: cli
+            .meta_store_prefix
+            .clone()
+            .or(file.meta_store_prefix.clone())
+            .unwrap_or_else(|| "afs/meta".into()),
         meta_record_max_bytes: cli
             .meta_record_max_bytes
             .or(file.meta_record_max_bytes)
@@ -96,7 +115,111 @@ pub(super) fn resolve(cli: &Cli, file: &FileConfig) -> MetaSettings {
     }
 }
 
+/// etcd's own default `--max-request-bytes`.
+pub(super) const ETCD_DEFAULT_MAX_REQUEST_BYTES: usize = 1536 * 1024;
+
+/// Where a `redis`/`etcd` Meta log lives, validated against `meta_store`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum MetaStoreTarget {
+    Local,
+    Redis {
+        url: String,
+        prefix: String,
+    },
+    Etcd {
+        endpoints: Vec<String>,
+        prefix: String,
+        max_request_bytes: usize,
+    },
+}
+
+/// `redis://user:secret@host` → `redis://***@host`; anything else unchanged.
+pub(super) fn redact_url(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => match rest.split_once('@') {
+            Some((_, host)) => format!("{scheme}://***@{host}"),
+            None => url.to_owned(),
+        },
+        None => url.to_owned(),
+    }
+}
+
+pub(super) fn serialize_redacted_url<S: serde::Serializer>(
+    url: &Option<String>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    match url {
+        Some(url) => serializer.serialize_some(&redact_url(url)),
+        None => serializer.serialize_none(),
+    }
+}
+
 impl Config {
+    /// The configured shared-service log, or `Local` for local-file/memory.
+    /// Endpoints are required by their own backend and rejected otherwise;
+    /// the prefix is 1..=128 printable ASCII bytes without spaces, `*?[]\`
+    /// or a trailing `/`.
+    pub(crate) fn meta_store_target(&self) -> Result<MetaStoreTarget> {
+        let prefix = &self.meta_store_prefix;
+        if prefix.is_empty()
+            || prefix.len() > 128
+            || prefix.ends_with('/')
+            || !prefix
+                .bytes()
+                .all(|c| c.is_ascii_graphic() && !b"*?[]\\".contains(&c))
+        {
+            return Err(invalid(
+                "meta_store_prefix must be 1..=128 printable ASCII bytes without spaces, *?[]\\ or a trailing /",
+            ));
+        }
+        let redis = self.meta_redis_url.as_ref();
+        let etcd = !self.meta_etcd_endpoints.is_empty();
+        match self.meta_store {
+            MetaStoreBackend::Redis => {
+                if etcd {
+                    return Err(invalid(
+                        "meta_etcd_endpoints is only valid with meta_store = \"etcd\"",
+                    ));
+                }
+                let url = redis
+                    .filter(|url| !url.is_empty())
+                    .ok_or_else(|| invalid("meta_store = \"redis\" requires meta_redis_url"))?;
+                Ok(MetaStoreTarget::Redis {
+                    url: url.clone(),
+                    prefix: prefix.clone(),
+                })
+            }
+            MetaStoreBackend::Etcd => {
+                if redis.is_some() {
+                    return Err(invalid(
+                        "meta_redis_url is only valid with meta_store = \"redis\"",
+                    ));
+                }
+                if !etcd || self.meta_etcd_endpoints.iter().any(String::is_empty) {
+                    return Err(invalid(
+                        "meta_store = \"etcd\" requires meta_etcd_endpoints",
+                    ));
+                }
+                if !(256 * 1024..=1024 * 1024 * 1024).contains(&self.meta_etcd_max_request_bytes) {
+                    return Err(invalid("meta_etcd_max_request_bytes must be 256KiB..=1GiB"));
+                }
+                Ok(MetaStoreTarget::Etcd {
+                    endpoints: self.meta_etcd_endpoints.clone(),
+                    prefix: prefix.clone(),
+                    max_request_bytes: self.meta_etcd_max_request_bytes,
+                })
+            }
+            MetaStoreBackend::LocalFile | MetaStoreBackend::InMemory => {
+                if redis.is_some() || etcd {
+                    return Err(invalid(
+                        "meta_redis_url / meta_etcd_endpoints require meta_store = \"redis\" / \"etcd\"",
+                    ));
+                }
+                Ok(MetaStoreTarget::Local)
+            }
+        }
+    }
+
     /// Validated for every backend so a configuration accepted for one
     /// backend stays valid for the other; the memory log uses the append and
     /// WAL byte bounds only.

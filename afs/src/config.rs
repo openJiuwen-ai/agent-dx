@@ -16,6 +16,7 @@ mod cross;
 mod dfs;
 mod fuse;
 mod meta;
+pub(crate) use meta::MetaStoreTarget;
 mod ownerfs;
 mod tls;
 
@@ -27,7 +28,9 @@ pub enum Role {
     Node,
 }
 /// Meta authority backend. `memory` is useful for disposable local runs but
-/// loses root/session authority whenever afs-meta exits.
+/// loses root/session authority whenever afs-meta exits. `redis` and `etcd`
+/// keep only the operation log and checkpoints in that service; Meta stays a
+/// single process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 pub enum MetaStoreBackend {
     #[serde(rename = "local-file")]
@@ -36,6 +39,12 @@ pub enum MetaStoreBackend {
     #[serde(rename = "memory")]
     #[value(name = "memory")]
     InMemory,
+    #[serde(rename = "redis")]
+    #[value(name = "redis")]
+    Redis,
+    #[serde(rename = "etcd")]
+    #[value(name = "etcd")]
+    Etcd,
 }
 /// Node-to-Node data transport. `rdma` requires the `rdma` feature; `auto`
 /// negotiates per peer and falls back to gRPC.
@@ -206,9 +215,24 @@ pub struct Cli {
     pub rest_listen: Option<SocketAddr>,
     #[arg(long)]
     pub meta_endpoint: Option<String>,
-    /// Meta authority: local-file (default, new-format directory) or volatile memory.
+    /// Meta authority: local-file (default, new-format directory), redis, etcd
+    /// or volatile memory.
     #[arg(long, value_enum)]
     pub meta_store: Option<MetaStoreBackend>,
+    /// Redis URL of the `redis` Meta log (required with it, rejected otherwise).
+    #[arg(long)]
+    pub meta_redis_url: Option<String>,
+    /// etcd endpoints of the `etcd` Meta log, comma separated (required with
+    /// it, rejected otherwise).
+    #[arg(long, value_delimiter = ',')]
+    pub meta_etcd_endpoints: Option<Vec<String>>,
+    /// The etcd server's `--max-request-bytes` (default 1572864, etcd's own
+    /// default); bounds one append and one checkpoint chunk.
+    #[arg(long)]
+    pub meta_etcd_max_request_bytes: Option<usize>,
+    /// Key prefix of the `redis`/`etcd` Meta log (default `afs/meta`).
+    #[arg(long)]
+    pub meta_store_prefix: Option<String>,
     /// Maximum bytes of one framed Meta operation-log record.
     #[arg(long)]
     pub meta_record_max_bytes: Option<usize>,
@@ -430,6 +454,10 @@ struct FileConfig {
     rest_listen: Option<SocketAddr>,
     meta_endpoint: Option<String>,
     meta_store: Option<MetaStoreBackend>,
+    meta_redis_url: Option<String>,
+    meta_etcd_endpoints: Option<Vec<String>>,
+    meta_etcd_max_request_bytes: Option<usize>,
+    meta_store_prefix: Option<String>,
     meta_record_max_bytes: Option<usize>,
     meta_batch_max_bytes: Option<usize>,
     meta_wal_max_bytes: Option<u64>,
@@ -549,6 +577,12 @@ pub struct Config {
     pub rest_listen: SocketAddr,
     pub meta_endpoint: Option<String>,
     pub meta_store: MetaStoreBackend,
+    /// Credentials in the URL are not printed.
+    #[serde(serialize_with = "meta::serialize_redacted_url")]
+    pub meta_redis_url: Option<String>,
+    pub meta_etcd_endpoints: Vec<String>,
+    pub meta_etcd_max_request_bytes: usize,
+    pub meta_store_prefix: String,
     pub meta_record_max_bytes: usize,
     pub meta_batch_max_bytes: usize,
     pub meta_wal_max_bytes: u64,
@@ -676,6 +710,7 @@ impl Config {
         tls::validate(&cfg)?;
         cross::validate_read_crc(&cfg)?;
         cfg.meta_log_limits()?;
+        cfg.meta_store_target()?;
         cfg.meta_maintenance_policy()?;
         cfg.meta_history_limits()?;
         Ok(cfg)
@@ -706,6 +741,10 @@ impl Config {
             }),
             meta_endpoint: cli.meta_endpoint.or(file.meta_endpoint),
             meta_store: meta.meta_store,
+            meta_redis_url: meta.meta_redis_url,
+            meta_etcd_endpoints: meta.meta_etcd_endpoints,
+            meta_etcd_max_request_bytes: meta.meta_etcd_max_request_bytes,
+            meta_store_prefix: meta.meta_store_prefix,
             meta_record_max_bytes: meta.meta_record_max_bytes,
             meta_batch_max_bytes: meta.meta_batch_max_bytes,
             meta_wal_max_bytes: meta.meta_wal_max_bytes,

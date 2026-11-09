@@ -22,7 +22,7 @@ AFS 的目标：Agent 场景下的共享文件存储。DFS 吞吐优先；OwnerF
 | DFS 一写多读 | 原生 Node 路径；1GiB 多副本/CRC 有限验证；外部 S3 实验 |
 | 中心 Meta `local-file` | 当前可重启恢复基线 |
 | `memory` Meta | 仅用于演示，重启不保留 |
-| etcd / Redis Meta | 已移除，不恢复 |
+| etcd / Redis Meta | 作为 `MetaLog` 后端可用（只存操作日志与 checkpoint，Meta 仍单进程，不做 HA）；持久性与性能边界见[部署说明](../deployment/afs.md#meta-操作日志的-redisetcd-后端) |
 | 跨节点 `fcntl/flock` | 明确不做 |
 | 完整 POSIX / 多 Meta / HA / 大规模长稳 | 未完成，见 [dfs-plan.md](dfs-plan.md) |
 

@@ -53,6 +53,10 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 fuser = { version = "=0.18.0", default-features = false }
 
+# Meta 操作日志的 Redis／etcd 后端（`meta/store/{redis,etcd}_log.rs`，R16）。
+redis = { version = "=1.7.0", default-features = false, features = ["tokio-comp"] }
+etcd-client = { version = "=0.21.1" }
+
 # Meta 服务端 RPC 计数层（`meta/rpc_metrics.rs`）。
 tower = { version = "0.5", features = ["util"] }
 

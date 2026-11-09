@@ -23,6 +23,20 @@ pub(super) fn reject_node_meta_options(role: Role, cli: &Cli, file: &FileConfig)
             "ownerfs_mkdir_load_balance is only valid for afs-meta",
         ));
     }
+    if role == Role::Node
+        && (cli.meta_redis_url.is_some()
+            || file.meta_redis_url.is_some()
+            || cli.meta_etcd_endpoints.is_some()
+            || file.meta_etcd_endpoints.is_some()
+            || cli.meta_etcd_max_request_bytes.is_some()
+            || file.meta_etcd_max_request_bytes.is_some()
+            || cli.meta_store_prefix.is_some()
+            || file.meta_store_prefix.is_some())
+    {
+        return Err(invalid(
+            "meta_redis_url, meta_etcd_* and meta_store_prefix are only valid for afs-meta",
+        ));
+    }
     Ok(())
 }
 

@@ -4,7 +4,8 @@
 //! 当前 Ping 不修改业务状态，所以没有为它引入 Mutex 或 actor。
 //! 将来根归属/授权状态应在这里所属的领域模块实现，不能各在 REST 和 gRPC 存一份。
 //! Meta 通过统一 Store 先持久化确定变化，再发布可见权威。
-//! local-file 与显式易失 memory 使用同一操作日志合同；etcd/Redis 旧后端已退出当前交付。
+//! local-file、redis、etcd 与显式易失 memory 使用同一操作日志合同（`store::journal::MetaLog`）；
+//! redis／etcd 只存日志与 checkpoint，Meta 仍是单进程。
 //! 没有 store 时 RPC 必须失败关闭，避免把进程内判断误写成授权事实。
 //! `Meta::with_store`、`with_store_and_peer_identity` 只供集成测试和单测装配；
 //! 集成测试链接产品库时没有 `cfg(test)`，所以留在产品代码里。
@@ -289,6 +290,39 @@ pub async fn open_configured_store(cfg: &Config) -> Result<Option<Arc<store::Sto
                     wal_max_bytes: limits.wal_max_bytes,
                 },
             )?)
+        }
+        MetaStoreBackend::Redis | MetaStoreBackend::Etcd => {
+            let options = store::kv_log::KvLogOptions {
+                record_max_bytes: limits.record_max_bytes,
+                batch_max_bytes: limits.batch_max_bytes,
+                wal_max_bytes: limits.wal_max_bytes,
+                image_max_bytes: store::journal::CheckpointLimits::default().image_max_bytes,
+            };
+            match cfg.meta_store_target()? {
+                crate::config::MetaStoreTarget::Redis { url, prefix } => {
+                    afs_logging::info!("meta.store.redis"; "instance" => &cfg.id, "prefix" => &prefix);
+                    Arc::new(store::kv_log::RedisLog::open_redis(&url, &prefix, options).await?)
+                }
+                crate::config::MetaStoreTarget::Etcd {
+                    endpoints,
+                    prefix,
+                    max_request_bytes,
+                } => {
+                    afs_logging::info!("meta.store.etcd"; "instance" => &cfg.id, "prefix" => &prefix);
+                    Arc::new(
+                        store::kv_log::EtcdLog::open_etcd(
+                            &endpoints,
+                            &prefix,
+                            max_request_bytes,
+                            options,
+                        )
+                        .await?,
+                    )
+                }
+                crate::config::MetaStoreTarget::Local => {
+                    return Err("redis/etcd Meta store without its endpoint".into());
+                }
+            }
         }
         MetaStoreBackend::LocalFile => {
             let path = cfg.data_dir.join("meta-store");

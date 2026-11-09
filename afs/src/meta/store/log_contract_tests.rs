@@ -5,7 +5,11 @@
 //! sequence, (4) checkpoint anchors, (5) read-only admission, (6) write-failure
 //! latch, (7) term fencing, (8) status upper bound. Recovery of a chain whose
 //! term decreases or exceeds the current term needs backend-specific damage;
-//! it is tested with each backend (`journal`, `local_log`).
+//! it is tested with each backend (`journal`, `local_log`, `kv_log_tests`).
+//!
+//! The Redis and etcd suites need a dedicated service and are `#[ignore]`d:
+//! run them with `--ignored` and `AFS_TEST_REDIS_URL` / `AFS_TEST_ETCD_ENDPOINTS`
+//! set. A selected suite without its endpoint fails; it never passes silently.
 
 use super::{
     NodeSessionLease, RequestKey,
@@ -13,6 +17,7 @@ use super::{
         BATCH_RECORDS_MAX, LogCursor, LogStatus, LogTip, MemoryLog, MemoryLogOptions, MetaLog,
         RecoveredLog, frame_size, test_records,
     },
+    kv_log::{EtcdLog, KvLogOptions, RedisLog},
     local_log::{LOG_HEADER_BYTES, LocalLog, LocalLogOptions},
     log::{Record, StateImage},
     state::State,
@@ -21,10 +26,10 @@ use std::{path::Path, time::Duration};
 
 /// Byte bounds a case needs; `None` asks for the backend defaults.
 #[derive(Clone, Copy)]
-struct CaseLimits {
-    record_max_bytes: usize,
-    batch_max_bytes: usize,
-    wal_max_bytes: u64,
+pub(super) struct CaseLimits {
+    pub(super) record_max_bytes: usize,
+    pub(super) batch_max_bytes: usize,
+    pub(super) wal_max_bytes: u64,
 }
 
 struct Fixture<L> {
@@ -84,6 +89,134 @@ fn local_fixture(limits: Option<CaseLimits>) -> Fixture<LocalLog> {
         inject_write_failure: Box::new(|log: &LocalLog| log.inject_write_failure().unwrap()),
         storage: Box::new(move || inventory(&storage_path)),
         _dir: Some(dir),
+    }
+}
+
+/// Runs `future` to completion from a synchronous fixture closure. Needs the
+/// multi-thread test runtime.
+pub(super) fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(future))
+}
+
+/// Redis tests share one instance; the probe test changes its settings, so
+/// it takes this gate exclusively while every other Redis test shares it.
+pub(super) static REDIS_GATE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+pub(super) fn redis_url() -> String {
+    std::env::var("AFS_TEST_REDIS_URL").expect(
+        "the Redis contract needs AFS_TEST_REDIS_URL: a dedicated Redis with appendonly yes, appendfsync always and noeviction",
+    )
+}
+
+pub(super) fn etcd_endpoints() -> Vec<String> {
+    std::env::var("AFS_TEST_ETCD_ENDPOINTS")
+        .expect("the etcd contract needs AFS_TEST_ETCD_ENDPOINTS: a dedicated etcd")
+        .split(',')
+        .map(str::to_owned)
+        .collect()
+}
+
+/// etcd's default `--max-request-bytes`, the bound the etcd suite runs under.
+pub(super) const ETCD_TEST_MAX_REQUEST_BYTES: usize = 1536 * 1024;
+
+/// A fresh key prefix per fixture: every fixture starts at term 1.
+pub(super) fn unique_prefix() -> String {
+    format!("afs-contract/{}", uuid::Uuid::new_v4())
+}
+
+pub(super) fn kv_options(limits: Option<CaseLimits>, bound: usize) -> KvLogOptions {
+    limits.map_or(
+        KvLogOptions {
+            record_max_bytes: bound.min(64 * 1024 * 1024),
+            batch_max_bytes: bound.min(128 * 1024 * 1024),
+            wal_max_bytes: 1024 * 1024 * 1024,
+            image_max_bytes: 1024 * 1024 * 1024,
+        },
+        |limits| KvLogOptions {
+            record_max_bytes: limits.record_max_bytes,
+            batch_max_bytes: limits.batch_max_bytes,
+            wal_max_bytes: limits.wal_max_bytes,
+            image_max_bytes: 1024 * 1024 * 1024,
+        },
+    )
+}
+
+fn redis_fixture(limits: Option<CaseLimits>) -> Fixture<RedisLog> {
+    let url = redis_url();
+    let prefix = unique_prefix();
+    let options = kv_options(limits, 256 * 1024 * 1024);
+    let open = {
+        let (url, prefix) = (url.clone(), prefix.clone());
+        move || block_on(RedisLog::open_redis(&url, &prefix, options)).unwrap()
+    };
+    let reopen = open.clone();
+    let takeover = open.clone();
+    Fixture {
+        log: open(),
+        reopen: Box::new(move |log| {
+            drop(log);
+            reopen()
+        }),
+        // No lock to lose: a second writer simply opens and takes a term.
+        takeover: Box::new(move |_| takeover()),
+        inject_write_failure: Box::new(RedisLog::inject_write_failure),
+        storage: Box::new(move || {
+            block_on(async {
+                use super::kv_log::KvService;
+                super::redis_log::RedisService::connect(&url, &prefix)
+                    .await
+                    .unwrap()
+                    .dump()
+                    .await
+                    .unwrap()
+            })
+        }),
+        _dir: None,
+    }
+}
+
+fn etcd_fixture(limits: Option<CaseLimits>) -> Fixture<EtcdLog> {
+    let endpoints = etcd_endpoints();
+    let prefix = unique_prefix();
+    let options = kv_options(limits, ETCD_TEST_MAX_REQUEST_BYTES - 64 * 1024);
+    let open = {
+        let (endpoints, prefix) = (endpoints.clone(), prefix.clone());
+        move || {
+            block_on(EtcdLog::open_etcd(
+                &endpoints,
+                &prefix,
+                ETCD_TEST_MAX_REQUEST_BYTES,
+                options,
+            ))
+            .unwrap()
+        }
+    };
+    let reopen = open.clone();
+    let takeover = open.clone();
+    Fixture {
+        log: open(),
+        reopen: Box::new(move |log| {
+            drop(log);
+            reopen()
+        }),
+        takeover: Box::new(move |_| takeover()),
+        inject_write_failure: Box::new(EtcdLog::inject_write_failure),
+        storage: Box::new(move || {
+            block_on(async {
+                use super::kv_log::KvService;
+                super::etcd_log::EtcdService::connect(
+                    &endpoints,
+                    &prefix,
+                    ETCD_TEST_MAX_REQUEST_BYTES,
+                )
+                .await
+                .unwrap()
+                .dump()
+                .await
+                .unwrap()
+            })
+        }),
+        _dir: None,
     }
 }
 
@@ -638,4 +771,17 @@ async fn memory_log_satisfies_contract() {
 #[tokio::test]
 async fn local_log_satisfies_contract() {
     contract_suite(local_fixture).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a dedicated Redis: set AFS_TEST_REDIS_URL and run with --ignored"]
+async fn redis_log_satisfies_contract() {
+    let _shared = REDIS_GATE.read().await;
+    contract_suite(redis_fixture).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a dedicated etcd: set AFS_TEST_ETCD_ENDPOINTS and run with --ignored"]
+async fn etcd_log_satisfies_contract() {
+    contract_suite(etcd_fixture).await;
 }

@@ -20,11 +20,12 @@ Agent FS（AFS） 是 Agent DX 的可选文件系统组件。默认部署配置�
 
 发布包配置示例来自 [build/config/examples/afs/](../../build/config/examples/afs/)，这也是唯一的权威示例（`afs/tests/config_contract.rs` 直接解析它）。部署层只负责把 AFS TOML 交给 `afs-meta` 和 `afs-node`，以及进程启动、健康查询、正常停止和卸载；它不改写 AFS 自有配置 schema。
 
-Meta 后端优先级：
+Meta 后端（`meta_store`）：
 
 1. `memory`：测试专用，重启不保留状态；
-2. `local-file`：当前可靠性基线，中心节点可正常重启恢复；
-etcd／Redis适配已移除；未来支持需重新设计和验收，不是当前可选后端。
+2. `local-file`：默认与可靠性基线，中心节点可正常重启恢复；
+3. `redis`／`etcd`：只把操作日志与 checkpoint 存在外部服务里，Meta 仍是单进程，不提供高可用或多 Meta；
+   持久性与性能边界见[Meta 操作日志的 Redis／etcd 后端](#meta-操作日志的-redisetcd-后端)。
 
 当前默认使用 `local-file`。发布包内 `etc/examples/afs/meta.toml` 已显式设置 `meta_store = "local-file"`，并把 Meta 状态放在 `/opt/adx/data/afs/meta`，固定可恢复路径身份。使用 `memory` 时，验收报告必须明确“Meta 重启后不保留状态”。
 
@@ -150,7 +151,7 @@ LocalLog锁绑定创建进程，不能把fork继承的对象当成新写者；�
 安全回收删除两个保留恢复点均不再需要的封口段／退休镜像，并可在恢复链验证后回收
 未引用、身份及完整校验均有效的本库 checkpoint 镜像。损坏、未知和外来对象保留计账；
 不能通过无上限调大参数或手动删除日志解除压力。
-旧快照后端、etcd／Redis适配及其依赖已移除；不保留双写、旧格式导入或兼容feature。
+旧快照后端（整份快照单 key 的 etcd／Redis 适配）已移除；当前 redis／etcd 后端是操作日志后端，格式不同，不导入旧数据；不保留双写、旧格式导入或兼容feature。
 这些改动不表示已有 FUSE、物理掉电或性能验收自动适用于新格式。
 
 单机试用前先准备配置、数据、运行时、挂载目录和本机临时证书：
@@ -211,6 +212,42 @@ false；可在TOML或CLI（`--tls-encryption-enabled true|false`）覆盖。fals
 `node.toml` 中启用对应 `ownerfs_mount` 或 `dfs_mount`。挂载所有者捕获的 canonical
 path、mount ID 和 source 同时作为 readiness 身份；挂载被替换时健康检查继续失败关闭。
 
+### Meta 操作日志的 Redis／etcd 后端
+
+`meta_store = "redis"` 或 `"etcd"` 时，Meta 把操作日志与 checkpoint 存在外部服务的 `meta_store_prefix`
+（默认 `afs/meta`）下，状态机与提交路径与 `local-file` 相同；Meta 仍是**单进程**，不提供高可用、多 Meta 或无状态 Meta。
+两个后端与 `local-file`、`memory` 通过同一组日志合同测试（比较追加、成组上限、恢复与序号、checkpoint 锚点、
+只读准入、写失败闩锁、term fencing、status 上界）。
+
+- **key 布局**：`<prefix>/layout`（`AFSK` + 版本 + store 身份，版本不符以 `STORAGE_FORMAT_INCOMPATIBLE` 拒绝）、
+  `<prefix>/term`、`<prefix>/tip`、每条记录一个 `<prefix>/wal/<序号>`（与本地 WAL 帧字节相同）、
+  `<prefix>/checkpoint` 指针与 `<prefix>/chunk/<term>-<序号>/<分块>`。前缀下已有其他 key 而没有 layout 时拒绝启动，不接管数据。
+- **写者互斥**：每次打开原子地取下一个 term；每次追加在同一服务端原子单元（Redis Lua 脚本、etcd 事务）里比较 term
+  与 tip 后再写。第二个 Meta 打开同一前缀后，旧 Meta 的下一次写返回 `META_LOG_FENCED`，应用在该 Meta 上看到 `EBUSY`；
+  旧 Meta 随即失效，它服务的 Node 心跳失败后退出，需要按正常流程重启。
+- **checkpoint**：镜像分块写入（Redis 8MiB、etcd 不超过 1MiB 与请求上限），最后一步比较 term 与旧指针后切换指针；
+  之后删除被覆盖的记录与旧镜像分块。崩溃留下的残留在下次打开时删除；只删除更早 term 写的未选中分块，
+  不会删掉更新写者正在写的分块。
+- **写失败**：一次追加或指针切换结果未知（连接断开、超时 30 秒）时，该 Meta 失败关闭，与本地盘写失败相同，需要重启 Meta。
+
+**Redis 的持久性**：只有单实例 `appendonly yes` 且 `appendfsync always` 时，确认过的写才在 Redis 崩溃后仍在。
+Meta 启动时用 `CONFIG GET` 检查 `appendonly=yes`、`appendfsync=always`、`no-appendfsync-on-rewrite=no`、
+`maxmemory-policy=noeviction`，并要求 layout／term／tip 没有 TTL，任一不满足或 `CONFIG` 被禁用都拒绝启动（`CONFIG_INVALID`）。
+Redis 主从复制是异步的，不提供额外保证，也不承诺故障切换后不丢已确认写。实测（adx-runtime，单 Node，
+Redis 7.2.5 在本机 ext4 上）：持续 `fsync` 写小文件时 `kill -9` Redis，重启 Redis 与 Meta 后 580 个已确认文件全部完好。
+
+**etcd 的持久性**：事务被 Raft 多数派提交并写入各成员 WAL 后才确认；单成员 etcd 等同一次本地 fsync。同样的实测下
+516 个已确认文件全部完好（etcd 3.7.3 单成员）。部署要求：
+
+- `meta_etcd_max_request_bytes` 与服务端 `--max-request-bytes` 一致（etcd 默认 1.5MiB）。一次追加（整组记录加比较）
+  与一个 checkpoint 分块都要放进一个请求，因此 `meta_record_max_bytes` 与 `meta_batch_max_bytes` 不能超过该值减 64KiB，
+  否则 Meta 拒绝启动；
+- `--quota-backend-bytes` 留足 checkpoint 镜像（新旧各一份）、未 checkpoint 的日志与 MVCC 历史，建议 8GiB；
+  并开启 `--auto-compaction-*`。后端不自行 compact，因为 compact 作用于整个 etcd，会影响共用它的其他应用；
+- 建议独占的 etcd；共用时用不同的 `meta_store_prefix`。
+
+两个后端当前都使用明文连接、不带认证配置（Redis URL 可带口令，打印配置时隐去），只应部署在受信网络中。
+
 ## 配置分类
 
 Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，CLI 把下划线写成连字符。TOML 拒绝未知键。下表登记全部 82 个顶层键：80 个 TOML 键，加上只在 CLI 上的 `config` 和 `print_config`。除标注"仅 TOML"的键和这两个 CLI 项外，其余键两边都能设置。
@@ -230,7 +267,11 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `grpc_listen` | 产品差异 | 两者 | Meta `127.0.0.1:7400`；Node `127.0.0.1:7500` | gRPC 监听地址 |
 | `rest_listen` | 产品差异 | 两者 | Meta `127.0.0.1:7401`；Node `127.0.0.1:7501` | REST 监听地址（健康、指标、诊断） |
 | `meta_endpoint` | 产品差异 | Node | 无 | Meta 的 gRPC URI；Node 启用文件系统时需要 |
-| `meta_store` | 产品差异 | Meta | `local-file` | Meta 权威存储：`local-file` 或 `memory`；`memory` 属测试专用取值，见表后说明 |
+| `meta_store` | 产品差异 | Meta | `local-file` | Meta 权威存储：`local-file`、`redis`、`etcd` 或 `memory`；`memory` 属测试专用取值，见表后说明 |
+| `meta_redis_url` | 产品差异 | Meta | 无 | `redis` 后端的 Redis URL，仅且必须与 `meta_store = "redis"` 同用；打印配置时隐去 URL 中的口令 |
+| `meta_etcd_endpoints` | 产品差异 | Meta | 无 | `etcd` 后端的 endpoint 列表（CLI 逗号分隔），仅且必须与 `meta_store = "etcd"` 同用 |
+| `meta_etcd_max_request_bytes` | 产品差异 | Meta | `1572864` | 与 etcd 服务端 `--max-request-bytes` 一致；限制单次追加与单个 checkpoint 分块，256KiB..=1GiB |
+| `meta_store_prefix` | 产品差异 | Meta | `afs/meta` | `redis`／`etcd` 后端的 key 前缀，1..=128 个可打印 ASCII，不含空格、`*?[]\\`，不以 `/` 结尾 |
 | `advertise_endpoint` | 产品差异 | Node | 无 | 对外发布的本 Node gRPC URI；未设时由 `grpc_listen` 推导，监听 `0.0.0.0` 时必须显式指定 |
 | `tls_encryption_enabled` | 产品差异 | 两者 | `false` | mTLS 认证之后是否加密内部流量 |
 | `tls_ca_certificate` | 产品差异 | 两者 | 无 | 内部 mTLS 的 CA 证书路径 |
@@ -380,8 +421,8 @@ credentials_file = "/opt/adx/config/afs/s3-credentials.json"
 权限、数据同步落盘及数据库持久配置由管理员在服务端保证；HTTP 成功本身
 不能证明物理持久性。产品包不部署或打包 SeaweedFS、PostgreSQL 或 JuiceFS。
 
-Meta 的 `meta_store` 是独立配置：默认 `local-file`，也可显式选择易失的 `memory`。
-本接入不增加 PostgreSQL Meta。etcd／Redis 选项和连接字段已退役；旧数据需保留原二进制与原目录。
+Meta 的 `meta_store` 是独立配置：默认 `local-file`，也可选择 `redis`、`etcd` 或易失的 `memory`。
+本接入不增加 PostgreSQL Meta。旧的 `etcd_endpoint`／`redis_endpoint` 字段已退役，不再接受；旧数据需保留原二进制与原目录。
 对象 key 身份不允许变更后重新使用同一 Meta 数据目录；配置错误及 GET/PUT
 错误向调用方传播。正常停机仍需先排空工作负载和 FUSE 引用。
 
@@ -824,8 +865,8 @@ resource_exhausted，停止后不允许等待结果生成新的响应。RPC许�
 
 ## Meta 操作日志有限策略
 
-`meta_store` 默认 `local-file`；`memory` 仅用于可丢弃状态。配置中的 `etcd`、`redis`、
-`etcd_endpoint`、`redis_endpoint` 不再接受，不静默回退。新二进制只打开新格式的
+`meta_store` 默认 `local-file`；`memory` 仅用于可丢弃状态；`redis`／`etcd` 见上文专节。
+旧字段 `etcd_endpoint`、`redis_endpoint` 不再接受，不静默回退。新二进制只打开新格式的
 `data_dir/meta-store`；旧快照目录不自动导入。回滚使用原二进制和匹配的原目录，
 不得让旧二进制打开新操作日志目录，也不得覆盖旧数据。
 

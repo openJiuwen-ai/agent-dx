@@ -571,36 +571,136 @@ fn p3_settings_default_is_local_file_without_retired_endpoints() {
     let output = serde_json::to_value(&cfg).unwrap();
     assert!(output.get("etcd_endpoint").is_none());
     assert!(output.get("redis_endpoint").is_none());
+    assert_eq!(output["meta_redis_url"], serde_json::Value::Null);
+    assert_eq!(output["meta_etcd_endpoints"], serde_json::json!([]));
+    assert_eq!(output["meta_store_prefix"], "afs/meta");
+    assert_eq!(output["meta_etcd_max_request_bytes"], 1536 * 1024);
 }
+
+/// R16: `redis` and `etcd` are Meta log backends, each requiring its own
+/// endpoint and rejecting the other's; the retired `etcd_endpoint` /
+/// `redis_endpoint` keys stay rejected; Nodes reject every Meta store key;
+/// printed configuration hides URL credentials.
 #[test]
-fn p3_settings_retired_backend_selection_and_endpoints_are_rejected() {
+fn r16_redis_and_etcd_backends_need_their_own_endpoint() {
+    let redis = Config::resolve(
+        Role::Meta,
+        Cli::parse_from([
+            "afs-meta",
+            "--meta-store",
+            "redis",
+            "--meta-redis-url",
+            "redis://:secret@10.0.0.1:6379/0",
+            "--meta-store-prefix",
+            "afs/cluster-a",
+        ]),
+    )
+    .unwrap();
+    assert_eq!(redis.meta_store, MetaStoreBackend::Redis);
+    let printed = serde_json::to_value(&redis).unwrap();
+    assert_eq!(printed["meta_redis_url"], "redis://***@10.0.0.1:6379/0");
+    assert!(!printed.to_string().contains("secret"));
+    let etcd = Config::resolve(
+        Role::Meta,
+        Cli::parse_from([
+            "afs-meta",
+            "--meta-store",
+            "etcd",
+            "--meta-etcd-endpoints",
+            "http://10.0.0.1:2379,http://10.0.0.2:2379",
+            "--meta-etcd-max-request-bytes",
+            "10485760",
+        ]),
+    )
+    .unwrap();
+    assert_eq!(etcd.meta_store, MetaStoreBackend::Etcd);
+    assert_eq!(etcd.meta_etcd_endpoints.len(), 2);
+    assert_eq!(etcd.meta_etcd_max_request_bytes, 10 * 1024 * 1024);
+    for args in [
+        &["--meta-store", "redis"][..],
+        &["--meta-store", "etcd"],
+        &[
+            "--meta-store",
+            "redis",
+            "--meta-etcd-endpoints",
+            "http://e:2379",
+        ],
+        &[
+            "--meta-store",
+            "etcd",
+            "--meta-redis-url",
+            "redis://r:6379/0",
+        ],
+        &["--meta-redis-url", "redis://r:6379/0"],
+        &["--meta-etcd-endpoints", "http://e:2379"],
+        &[
+            "--meta-store",
+            "etcd",
+            "--meta-etcd-endpoints",
+            "http://e:2379",
+            "--meta-etcd-max-request-bytes",
+            "1024",
+        ],
+        &[
+            "--meta-store",
+            "redis",
+            "--meta-redis-url",
+            "redis://r:6379/0",
+            "--meta-store-prefix",
+            "bad/",
+        ],
+        &[
+            "--meta-store",
+            "redis",
+            "--meta-redis-url",
+            "redis://r:6379/0",
+            "--meta-store-prefix",
+            "a*b",
+        ],
+    ] {
+        let cli = Cli::parse_from(std::iter::once("afs-meta").chain(args.iter().copied()));
+        let error = Config::resolve(Role::Meta, cli).unwrap_err();
+        assert_eq!(error.code(), afs_error::CONFIG_INVALID, "{args:?}");
+    }
     for (flag, value) in [
-        ("--meta-store", "etcd"),
-        ("--meta-store", "redis"),
         ("--etcd-endpoint", "http://127.0.0.1:2379"),
         ("--redis-endpoint", "redis://127.0.0.1:6379/0"),
     ] {
-        if let Ok(cli) = Cli::try_parse_from(["afs-meta", flag, value]) {
-            assert!(
-                Config::resolve(Role::Meta, cli).is_err(),
-                "retired CLI option accepted: {flag}={value}"
-            );
-        }
+        assert!(
+            Cli::try_parse_from(["afs-meta", flag, value]).is_err(),
+            "retired CLI option accepted: {flag}={value}"
+        );
     }
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("retired.toml");
-    for text in [
-        "meta_store='etcd'",
-        "meta_store='redis'",
-        "etcd_endpoint='http://127.0.0.1:2379'",
-        "redis_endpoint='redis://127.0.0.1:6379/0'",
+    let path = dir.path().join("store.toml");
+    for (text, accepted) in [
+        (
+            "meta_store='redis'\nmeta_redis_url='redis://127.0.0.1:6379/0'",
+            true,
+        ),
+        (
+            "meta_store='etcd'\nmeta_etcd_endpoints=['http://127.0.0.1:2379']",
+            true,
+        ),
+        ("meta_store='etcd'", false),
+        ("meta_store='redis'", false),
+        ("etcd_endpoint='http://127.0.0.1:2379'", false),
+        ("redis_endpoint='redis://127.0.0.1:6379/0'", false),
     ] {
         std::fs::write(&path, text).unwrap();
         let result = Config::resolve(
             Role::Meta,
             Cli::parse_from(["afs-meta", "--config", path.to_str().unwrap()]),
         );
-        assert!(result.is_err(), "retired TOML accepted: {text}");
+        assert_eq!(result.is_ok(), accepted, "{text}: {result:?}");
+    }
+    for args in [
+        &["--meta-redis-url", "redis://r:6379/0"][..],
+        &["--meta-etcd-endpoints", "http://e:2379"],
+        &["--meta-store-prefix", "p"],
+    ] {
+        let cli = Cli::parse_from(std::iter::once("afs-node").chain(args.iter().copied()));
+        assert!(Config::resolve(Role::Node, cli).is_err(), "{args:?}");
     }
 }
 #[test]

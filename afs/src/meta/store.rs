@@ -39,11 +39,16 @@ mod history;
 pub(crate) use history::Limits as HistoryLimits;
 pub mod journal;
 pub use journal::MetaLog;
+pub mod etcd_log;
+pub mod kv_log;
+#[cfg(test)]
+mod kv_log_tests;
 pub mod local_log;
 pub mod log;
 #[cfg(test)]
 mod log_contract_tests;
 mod profile;
+pub mod redis_log;
 mod state;
 use state::State;
 #[cfg(test)]
