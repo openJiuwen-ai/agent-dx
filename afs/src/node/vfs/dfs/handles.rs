@@ -281,8 +281,9 @@ impl DistributedFs {
             && !unpinned_reader
             && let Some(references) = &self.gc.references
         {
-            // An inode-level reference protects every version of the inode,
-            // including the one this handle pins until close.
+            // The reference protects the inode, its head and the version
+            // this handle opened (decision 4a: readers are pinned to it until
+            // close); other historical versions are collected (R81 F2).
             handle.gc_pin =
                 Some(references.pin(&inode_id, handle.opened_inode.head_version.as_ref())?);
         }
