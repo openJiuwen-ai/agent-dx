@@ -9,6 +9,8 @@
 
 ## 已知限制（先读）
 
+本节只列 POSIX 相关的限制；完整的已知限制（含 local-file Meta 目录必须在本机独占盘、打开着反复 fsync 的文件使 Meta 内存增长等更严重的项）与支持矩阵见[支持边界与已知限制](afs-support-boundary.md)。
+
 1. **文件锁只在本机有效**（决策 11）。`flock`、`fcntl` 字节范围锁与 OFD 锁由每个 Node 的内核本地锁表处理：
    同一 Node 上的两个进程互斥，不同 Node 上的进程之间**没有互斥**。依赖文件锁协调多台机器的程序
    （数据库、`lockfile` 类工具）不能在 DFS 上跨 Node 使用。用例：`file_locks_exclude_on_one_node_only`。

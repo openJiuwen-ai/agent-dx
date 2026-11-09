@@ -43,10 +43,11 @@ dfs_catalog_commit_queue = 256
 # Native body readahead is opt-in; product profiles may explicitly use 8388608.
 # This is scheduling distance, sharing the existing proof/stream/disk budgets.
 # dfs_readahead_max_bytes = 0
-# Native gRPC remote-read body verification on this reading Node: "off"
-# (default, unchecked) or "receiver" (CRC segments checked; disables prefetch).
-# Serving Nodes follow each caller's mode, so Nodes may differ.
-# dfs_read_crc_mode = "off"
+# Native gRPC remote-read body verification on this reading Node: "receiver"
+# (default, CRC segments checked; disables prefetch) or "off" (unchecked; a bad
+# replica is delivered as is). Serving Nodes follow each caller's mode, so
+# Nodes may differ.
+# dfs_read_crc_mode = "receiver"
 # A-side verified Peer payloads: 2 resident objects, sharing 16MiB with live frames.
 # Payload range 4..=64MiB; eviction does not refund still-referenced data.
 # dfs_peer_serve_resident_objects = 2

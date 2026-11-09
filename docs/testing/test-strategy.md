@@ -25,8 +25,8 @@
 
 | 步骤 | 原则／要拦截的问题 | 当前现状（事实） | 环境、目录与入口 | 待补项（未实施） | 优先级 |
 | --- | --- | --- | --- | --- | --- |
-| ① 基础UT／LLT | 尽早发现模块规则、错误传播、状态机及接口合同回归 | 已有8个AFS crate测试入口；普通非ignored测试已接ON组件构建 | Linux；UT在源文件，LLT在域内tests；`make afs-test`／选包 `cargo test` | 固定推荐范围、说明feature/ignored边界；新功能按代码补UT，不另造runner | 维护基线；P0明确范围 |
-| ② 单VM集成 | 验证真实Meta/Node、FUSE/bind、数据/权限/缓存和正常恢复/清理 | 统一入口已实现；历史冻结候选基础11/11通过；当前登记13基础＋2扩展，按实际制品/环境分别验收 | 一台Linux VM；`afs/tests/run.py`＋`suites/`＋local/exec适配 | 此前冻结输入的新构建阻塞保留为历史；后续新版本持续跑对应本地集合 | P0基础已完成 |
+| ① 基础UT／LLT | 尽早发现模块规则、错误传播、状态机及接口合同回归 | 已有9个AFS crate测试入口；普通非ignored测试已接ON组件构建 | Linux；UT在源文件，LLT在域内tests；`make afs-test`／选包 `cargo test` | 固定推荐范围、说明feature/ignored边界；新功能按代码补UT，不另造runner | 维护基线；P0明确范围 |
+| ② 单VM集成 | 验证真实Meta/Node、FUSE/bind、数据/权限/缓存和正常恢复/清理 | 统一入口已实现；历史冻结候选基础11/11通过；当前登记14基础＋2扩展，按实际制品/环境分别验收 | 一台Linux VM；`afs/tests/run.py`＋`suites/`＋local/exec适配 | 此前冻结输入的新构建阻塞保留为历史；后续新版本持续跑对应本地集合 | P0基础已完成 |
 | ③ 多namespace集成 | 验证隔离节点的真实TCP/mTLS、远端数据路径、恢复和多读者 | 一VM多namespace已实现；历史冻结候选三角色基础＋C读者9/9通过，不继承为当前其它环境的成绩 | 一VM的M/A/B/C隔离角色；标准Linux环境说明；`cluster-basic`／`cluster-manyread`；同run.py | 可选SSH真实多VM适配未实跑；不宣称VM断电/宿主故障隔离 | P1基础已完成 |
 | ④ Buildkite流水线验证 | 防止共享候选包破坏AFS/ADX；流水线内必测、事件触发、合入保护分别验收 | 上游MR126–130已合入；envd工具修复候选Base235新包/默认公共2＋AFS5＋SDK12首次通过；正常Full91公共11＋AFS24＋SDK16及正常清理首次通过，MR131已合入；Base236保留envd首败、一次原条件retry后新包和默认冒烟通过，69项关键回执独立核验 | 既有目标K8s；`run-e2e.sh` → `afs_gate.py`；组件复用AFS `run.py`，SDK融入ADX公共E2E | 维护默认门禁；envd间歇获取、公共Redis Issue71、外部relay/合入强制分别核验 | 维护默认门禁；P1专项 |
 | ⑤ 固定包验收 | 人或AI可自主部署、验收和复现，扩大版本质量验证 | PK0非K8s组件4例通过；PK1固定Base236在单Linux VM／Docker的公共11组＋AFS24项＋SDK16项组合Full通过，正常清理通过；PK2首批恢复／压力代表通过；PK3旧一小时两模式FD越界FAILED；包含OwnerFs修复的新固定包组件回归和v3 SDK短观测通过，OwnerFs原v3一小时内存趋势FAILED；新v4固定1小时预热＋1小时测量正式PASS；DFS14分钟Meta内存峰值FAILED；旧失败保留 | 固定包/SDK/backend/bundle＋合格环境；公共 `build/e2e/run.py` 定向运行，`build/e2e/afs_gate.py` 运行Docker组合Full；K8s仍走原入口 | PK2标准兼容仍待；DFS Meta内存越界仍待诊断；OwnerFs小时级已独立通过，全天长稳、PK4受控性能另验；K8s直接运行新增参数仍只有工具验证，不继承Docker结果 | P1专项；P2长稳/性能 |
@@ -45,9 +45,9 @@
 
 **原则**：复用自然的编译/测试工具，在开发期快速定位基础问题，不新增测试平台。
 
-**现状／事实**：`make afs-test`已选择8个AFS crate及all-targets；单独 `cargo test -p afs`只选择主crate，不能当作整个AFS域都跑过。Cargo测试可自行编译；单独编译不会自动测试。普通LLT与UT均可能参与Cargo，不能仅按命令名称统称纯UT。
+**现状／事实**：`make afs-test`已选择9个AFS crate及all-targets；单独 `cargo test -p afs`只选择主crate，不能当作整个AFS域都跑过。Cargo测试可自行编译；单独编译不会自动测试。普通LLT与UT均可能参与Cargo，不能仅按命令名称统称纯UT。
 
-**待补与优先级**：P0固定推荐命令和范围说明；后续行为变更补相应UT/LLT。真实挂载、外部依赖、ignored及特殊feature明确转入第2/3步或定向扩展，不能从普通Cargo通过推导它们也通过。
+**待补与优先级**：P0固定推荐命令和范围说明；后续行为变更补相应UT/LLT。AFS 阶段门禁不能只跑主crate：应跑全部9个AFS crate的测试，并加跑 `afs/tests/run.py --suite local-resources`（2026-11 AFS DFS重构的教训：`afs-error` 码表测试与 `local-resources` 的 `reader_fd_budget` 分别从两个阶段起失败，因阶段门禁未覆盖而直到全量闭环才发现）。真实挂载、外部依赖、ignored及特殊feature明确转入第2/3步或定向扩展，不能从普通Cargo通过推导它们也通过。
 
 ### 现有入口、目录和边界
 
@@ -265,7 +265,7 @@ CI4首批明确登记24项功能（13本地＋9跨角色＋2扩展），包含�
 | 内容 | 入口／位置 | 当前实现和验收边界 |
 | --- | --- | --- |
 | 明确的组件Full选集 | `afs/tests/suites/ci_full.py`统一登记ID；`python3 afs/tests/run.py run --suite ci-full`复用原断言 | 24项核心/扩展，含namespace、正常恢复、权限/缓存、多读者、顺序/busy；必需case或清理缺失判红 |
-| 单Pod内核环境 | `afs/tests/fixtures/kubernetes.py`＋`afs/tests/fixtures/multivm.py` | 记录kubernetes/local，M Pod内多进程和双挂载；仅Full M挂载可写BDI目录，探针只改自有FUSE BDI并恢复；适用13基础＋2扩展 |
+| 单Pod内核环境 | `afs/tests/fixtures/kubernetes.py`＋`afs/tests/fixtures/multivm.py` | 记录kubernetes/local，M Pod内多进程和双挂载；仅Full M挂载可写BDI目录，探针只改自有FUSE BDI并恢复；适用14基础＋2扩展 |
 | 跨Pod环境 | `build/e2e/kubernetes/afs_component.py` | M/A/B/C独立Pod，A/B跨worker；C独立读者且如实报告worker，不要求虚构第三worker |
 | 测试ELF交接 | `build/e2e/afs_contracts.py`；Base `build-afs`独立artifact | Linux builder冻结同源`fuse_contract`、四精确selector；包外测试资产，绑定源码/架构/产品binary/ELF/archive SHA；缺资产正常Full在部署前失败 |
 | Full SDK存储行为 | `build/e2e/kubernetes/afs_product.py`／`build/e2e/afs_sdk.py` | 保留六项冒烟，另加旧FD经rename/unlink身份、增长/截短/EOF，共每模式8项；不修改SDK/ADX生产接口 |
@@ -977,8 +977,8 @@ python3 build/e2e/kubernetes/targeted_suite.py \
 | 时机／测试集合 | 要拦截的问题与边界 | 用例放哪里：当前／已对齐归属 | 谁来跑／何时跑 | 环境如何准备：前提与自动化 | 现有脚本与Buildkite调用（事实） | AFS已接／现状缺口 | ADX已有规划（区别于实现） | AFS待补（未实施） |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | **①开发自检：UT／普通LLT** | 在提交前定位模块规则、状态机、错误传播、接口/RPC组合、数据校验及资源释放问题；不证明完整产品已部署 | UT在 `afs/src/**`、`afs/crates/*/src/**`；LLT在 `afs/tests/*_contract.rs`、`local_sdk.rs`、`storage_localfs.rs` 及域内crate `tests/` | 开发者修改后在Linux运行受影响集合；同一集合也由②CI代跑 | 开发者提供已有Linux VM及Rust工具链；测试按例启动进程/socket、临时目录；需外部后端的例另备fixture；不必每例一个VM | 本地 `cargo test --locked -p <crate> ...`；CI复用 `.buildkite/component-tests.sh afs` 的9个crate选择；不是先执行cargo build才允许测试 | 普通非ignored集合已接；已有预算/校验/取消、Meta/VFS/mTLS/UDS/SHM等断言；部分是替身，feature/ignored例不会自然全跑 | 既有文档将UT/组件测试列为代码门禁；不把此集合当作L0或Full | 按附件补基础断言；明确feature/ignored/后端适用性，避免“有定义即有运行”的遗漏 |
-| **①开发自检：真实后端、FUSE/bind及单机子系统集成** | 在提交前拦截真实持久确认、重开/重放、挂载权限/版本缓存、Meta与多个Node读写发布/删除/清理错误；与真实跨宿主故障分开 | 已有 `afs/tests/{meta,redis,fuse}_contract.rs`、源内hook；外置 `build/e2e/afs/scripts/ownerfs/bind-two-node-localfile.py`、`scripts/dfs/three_node_core.py`；已对齐统一归 `afs/tests/`，尚未迁移 | 开发者在受影响的真实语义变更后定向运行；并非每次修改都先部署完整ADX | 已有一台Linux/ext4 VM，按例具备FUSE、root/mount权限及Redis/etcd；现有单机驱动用 `--binary-dir` 和新的 `--work-root`，生成配置/证书并起Meta＋2/3 Node进程，不要求每Node一个容器 | Rust显式选择相应test/ignored；两个现有Python脚本可直接调用；普通Cargo只运行适用非ignored部分；当前没有完整显式特权集成Buildkite链 | 真实挂载/跨句柄/权限及单机访问驱动已有；许多例ignored；后端与挂载矩阵、包身份及CI调度未统一 | 没有已实现的“普通编译自动运行全部真实后端/挂载”机制；旧AFS文档保留复杂可靠性后置范围 | 统一AFS集成归属、输入/环境要求和选集；明确开发自检及CI分别选择哪些现有场景；不在本文预设新runner/step名称 |
-| **①开发自检：跨节点AFS集成（默认namespace）** | 在提交前定向发现真实网络/远端源、独立Node视图和节点恢复问题；不能用单机多进程代替 | 当前统一 `afs/tests/run.py`、suites与fixture；旧 `build/e2e/afs/` driver/cohort保留历史及专项用途 | 开发者涉及跨节点合同变更时；也可由版本专项复用 | 执行者先提供多台已有Linux VM/主机、SSH、二进制/配置/后端和挂载；各机直接运行AFS进程；旧工具存在历史环境默认值，尚无统一新部署适配 | 直接调用既有driver/cohort；本地已提供cluster集合，Buildkite仍无跨节点AFS组件接线 | 驱动已有，候选/环境绑定分散；不表示当前包或完整故障矩阵已验收 | 旧acceptance有smoke/full清单，但其环境限制和旧身份不能当作公共ADX设计 | 去除隐含历史身份依赖、明确部署/清理与适用集合；保留跨节点证据；归入同一AFS集成体系 |
+| **①开发自检：真实后端、FUSE/bind及单机子系统集成** | 在提交前拦截真实持久确认、重开/重放、挂载权限/版本缓存、Meta与多个Node读写发布/删除/清理错误；与真实跨宿主故障分开 | 已有 `afs/tests/{meta,meta_log,fuse}_contract.rs`、源内hook（Redis／etcd 日志后端由 `afs/src/meta/store/log_contract_tests.rs` 的 ignored 合同及 `local-fault` 的 `dfs.fault.meta_backend_redis`／`_etcd` 覆盖）；外置 `build/e2e/afs/scripts/ownerfs/bind-two-node-localfile.py`、`scripts/dfs/three_node_core.py`；已对齐统一归 `afs/tests/`，尚未迁移 | 开发者在受影响的真实语义变更后定向运行；并非每次修改都先部署完整ADX | 已有一台Linux/ext4 VM，按例具备FUSE、root/mount权限及Redis/etcd；现有单机驱动用 `--binary-dir` 和新的 `--work-root`，生成配置/证书并起Meta＋2/3 Node进程，不要求每Node一个容器 | Rust显式选择相应test/ignored；两个现有Python脚本可直接调用；普通Cargo只运行适用非ignored部分；当前没有完整显式特权集成Buildkite链 | 真实挂载/跨句柄/权限及单机访问驱动已有；许多例ignored；后端与挂载矩阵、包身份及CI调度未统一 | 没有已实现的“普通编译自动运行全部真实后端/挂载”机制；旧AFS文档保留复杂可靠性后置范围 | 统一AFS集成归属、输入/环境要求和选集；明确开发自检及CI分别选择哪些现有场景；不在本文预设新runner/step名称 |
+| **①开发自检：跨节点AFS集成（默认namespace）** | 在提交前定向发现真实网络/远端源、独立Node视图和节点恢复问题；不能用单机多进程代替 | 当前统一 `afs/tests/run.py`、suites与fixture；旧 `build/e2e/afs/` driver/cohort保留历史及专项用途 | 开发者涉及跨节点合同变更时；也可由版本专项复用 | 执行者先提供多台已有Linux VM/主机、SSH、二进制/配置/后端和挂载；各机直接运行AFS进程；旧工具存在历史环境默认值，尚无统一新部署适配 | 直接调用既有driver/cohort；本地已提供cluster集合；Full的ci-full已含9个跨角色case（K8s多Pod，非多VM），仍无跨宿主AFS组件接线 | 驱动已有，候选/环境绑定分散；不表示当前包或完整故障矩阵已验收 | 旧acceptance有smoke/full清单，但其环境限制和旧身份不能当作公共ADX设计 | 去除隐含历史身份依赖、明确部署/清理与适用集合；保留跨节点证据；归入同一AFS集成体系 |
 | **①开发自检／③版本复现：本地ADX产品E2E** | 发现公共SDK→Environment→真实runtime/Execd的命令、文件、生命周期和清理回归；支持CI失败复现 | 已有 `build/e2e/run.py`、`scenarios.py`、`sdk_smoke.py`、`functional_data_plane.py`，fixture `node.py`；继续作为公共产品用例 | 开发者需要完整产品自检或复现；测试人员也可直接运行 | 先提供匹配架构的Linux Docker主机、固定包/SDK/backend及镜像；`prepare.py` 生成bundle；`run.py` 自动建两privileged节点容器/网络、启动平台与sandboxd、执行并清理；不创建宿主机 | `build/e2e/prepare.py` → `build/e2e/run.py --bundle <目录> --profile l0/standalone`；Buildkite基础线使用K8s driver，业务场景共享 | 原有ADX入口可用；尚缺公共场景明确配置/使用真实AFS并验证其路径；AFS组件PASS不能代替这里的PASS | 已有Standalone完整11组合同与本地复现说明；不代表Multi-VM/跨物理宿主验收 | 让真实AFS存储变体进入共享产品场景及fixture，本地与K8s复用业务断言；不复制一套AFS产品E2E |
 | **②主线／候选回归：代码及组件门禁** | 在共享版本构建中发现基础组件行为、工具、API合同及工程检查回归；保护其他组件与AFS相互影响 | 组件自有UT/LLT；工具自测 `build/e2e/tests/`、`build/release/tests/`；门禁脚本 `.buildkite/` | 选中基础流水线后由Buildkite agent运行；开发者负责失败定位；外部合入触发配置尚未核实 | CI使用既有构建agent/Pod和bootstrap工具链/cache；实际测试是Linux进程；AFS编译能力不等于具备特权挂载条件 | `pipeline-package.yml` 并行source-gate与组件作业；`build-afs` → `build-component.sh afs` → `component-tests.sh afs` → Cargo测试后release编译；`source-gate.sh` → 公共工具测试/API/Rust检查 | `ADX_WITH_AFS=1`时已接AFS 9个crate普通测试；`ADX_COMPONENT_TESTS`默认1、可关；公共Python discovery不覆盖所有外置AFS测试；ignored未自动执行 | 既有门禁文档要求UT/组件失败阻断；触发频率建议不等于外部已配置。ARM用Linux ARM64 Docker builder，`ADX_ARM_TESTS`默认0 | 将组件工具自测纳入正确发现入口；登记ON/OFF、架构、feature和未执行项；明确AFS真实集成如何被选中，尚未修改CI |
 | **②主线／候选回归：制品组装与交接检查** | 发现组件遗漏、错架构、manifest/hash、安装和测试制品错配；不证明业务功能可用 | `.buildkite/package-components.sh`、`build/release/`及其自测；产品安装/CLI合同在所属组件 | Buildkite在组件/源码/SDK等前置成功后运行 | 使用同build组件制品，临时prefix安装和CLI help；镜像作业准备Docker/runtime bundle；不在此执行完整用户场景 | `platform-build` → `package-components.sh`；`publish-amd64` → `publish-amd-package.sh`；`platform-images` → `package-smoke.sh` → `package-e2e.sh`；随后才L0 | AFS ON/OFF包内容和交接模式有检查；**包含AFS二进制不等于启动或使用AFS**；旧AFS DEP driver依赖旧包/afs-processctl，不能直接复用验新包 | 已有公共制品/安装门禁；没有已确认的新增AFS发布前step或test-kit方案 | 补齐当前统一包下实际AFS服务/存储行为验证；测试资产与产品身份对应；不复活旧交付体系 |
@@ -1098,7 +1098,7 @@ HTML由本Markdown生成：在仓库根目录执行 `python3 build/docs/render_t
 ## 组件读写专项的增补原则
 
 读写专项继续遵循第二/三步统一入口，详见[组件测试README](../../afs/tests/README.md#读写专项与性能资产)。
-`all-special`只聚合已注册的功能扩展，不自动扩大基础集合；基础集合因独立缓存复用/热缓存权限两项明确增为22项，也不等于完整AFS Full。
+`all-special`只聚合已注册的功能扩展，不自动扩大基础集合；基础集合因独立缓存复用/热缓存权限两项增为22项，其后又并入远端目录句柄回收（`ownerfs.basic.remote_dir_close_fd`），当前为23项，也不等于完整AFS Full。
 普通新增用例复用角色操作、typed profile和正常回收；需要持有FUSE FD的探针必须由fixture接管，
 先退休辅助进程再停Node，保留真实退出和清理结果。
 

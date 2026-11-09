@@ -1,7 +1,7 @@
 # AFS 组件集成：单 VM 与多 namespace
 
 `run.py` 是第二、三步的共用入口，Python 用例直接位于 `suites/`；已有 Rust
-`*_contract.rs` 和 `support/` 保持原位。本工具不部署完整 ADX、不创建流水线或 VM，
+`*_contract.rs` 保持原位（原 `support/` 下的度量程序已移到 `afs/tools`）。本工具不部署完整 ADX、不创建流水线或 VM，
 不自动安装依赖、修改主机用户或全局挂载/网络配置。
 
 feature 组合门禁：在 Linux 上于仓库任意目录运行 `bash afs/tests/feature-matrix.sh`，它对默认、dfs-only、ownerfs-only、rdma、diagnostics 五种 feature 组合执行 `cargo check` 与 `--tests --no-run` 构建，并检查无后端 `afs-meta` 能构建、SDK 不启用 RDMA；并运行 ownerfs-only、dfs-only 的 `config_contract`。加 `--run-lib` 再运行这两组 lib 单测，要求 `TMPDIR` 在支持 flock 与 xattr、剩余超过 1 GiB 的原生 Linux 文件系统上；adx-vm 编译容器不满足，需用 `--lib --no-run` 编译后到运行节点执行。
@@ -254,7 +254,7 @@ SH
 只有本次独占VM且不再需要时才关闭/删除VM。不要在共享环境执行`ip -all netns delete`、全局kill、lazy卸载或磁盘prune。
 
 初版通用setup/PYENV、预检与20项基础用例曾在Ubuntu 24.04 ARM64 Linux环境实测通过；
-该历史记录不包含后来新增的缓存复用和热缓存权限两项，当前注册基础集合为22项。
+该历史记录不包含后来新增的缓存复用、热缓存权限与远端目录句柄回收（`ownerfs.basic.remote_dir_close_fd`）三项，当前注册基础集合为23项（`local-basic` 14 项＋`cluster-manyread` 9 项）。
 代理继承导致的初次失败已保留，清除代理后完整重跑通过。该验证是在已有VM内按本文准备新namespace，
 不表示从空白镜像安装软件包、所有架构/虚拟化平台均已逐项验收。
 
@@ -331,7 +331,7 @@ python3 afs/tests/run.py run --case 'ownerfs.basic.*' --case 'dfs.basic.*' \
   MV是沿用的验收组编号，实际拓扑以每case的kind/namespace证据为准，不表示多VM通过。
 - `local-extended`：单VM执行额外OwnerFs对象身份/根创建竞争断言，供多机逻辑的本机定向诊断；不属于默认基础集合。
 - `s0-semantics`：DFS文件语义特征测试（A写，B/C经各自Node与FUSE读），断言**当前**行为：
-  提交后新OPEN可见、已打开读者在提交后能看到新版本（重构决策4a将改为open到close固定版本）、
+  提交后新OPEN可见、已打开读者固定在open时的版本（决策4a，S1a-6起），新OPEN才看到新版本、
   unlink已打开文件后数据仍可读、close后他人stat立即看到新长度和mtime、fsync/fdatasync成功、
   文件锁不跨节点互斥（决策11本轮不支持）。按决策改变的断言在对应重构步骤中同步更新；不属于默认基础集合。
 - `posix-boundary`：DFS 的 POSIX 支持边界（R20），每项断言应用经真实内核挂载看到的结果，清单与归类见
@@ -382,9 +382,10 @@ Home/Meta重启允许有界30秒会话/缓存收敛，记录全部暂态错误�
 ## 用例组织与后续添加规则
 
 本README是AFS组件测试的使用和扩展总入口；测试分层、Buildkite和完整ADX产品行为仍遵循
-[五步总规范](../../docs/testing/test-strategy.md)。当前22项是第二/三步的**基础集合**，不是AFS全量覆盖。
+[五步总规范](../../docs/testing/test-strategy.md)。当前23项是第二/三步的**基础集合**，不是AFS全量覆盖。
 `--all`仅表示全部已登记case，不能据此宣称功能、兼容性、故障、长稳和性能均已覆盖。
 当前列表以`python3 afs/tests/run.py list`为准，覆盖缺口和优先级记入总规范，不另建一份平行清单。
+改动 AFS 的阶段门禁除 `local-basic`、`s0-semantics` 外至少加跑 `local-resources`，并跑全部 9 个 AFS crate 的 Cargo 测试（不只主 crate）；只跑基础集合曾让两处失败漏过两个开发阶段。
 
 ### 目录各负责什么
 
@@ -395,7 +396,7 @@ Home/Meta重启允许有界30秒会话/缓存收敛，记录全部暂态错误�
 | `faults/` | `local-fault` 的短时集群驱动 `harness.sh` 与各场景阶段脚本、探针 | 每个阶段脚本自带判据（失败即非零退出），由 `suites/dfs/test_faults.py` 登记；新场景复用 `harness.sh` |
 | `fixtures/` | 环境接入、角色、配置/TLS、生命周期、传输、取证与清理 | 普通新case复用现有`Cluster`；新增环境能力才改fixture，不在case内复制部署或强制清理逻辑 |
 | `runner_tests/` | 选择、协议、环境拒绝和清理规则的工具合同 | 工具逻辑改变才补对应测试；它们不替代真实产品用例 |
-| 原有`*_contract.rs`、`support/` | Rust组件/内核合同及辅助程序 | 原位维护，通过显式测试ELF调用；不拷贝Rust断言到另一套假实现 |
+| 原有`*_contract.rs` | Rust组件/内核合同 | 原位维护，通过显式测试ELF调用；不拷贝Rust断言到另一套假实现 |
 | `build/e2e/` | ADX安装、部署、SDK及产品全链路场景 | 按第四/五步融合公共体系，不放进AFS组件目录冒充完整产品验证 |
 
 ### 最小示例：新增一个OwnerFs截断用例
@@ -487,13 +488,13 @@ AFS技术边界见 [测试合同](../../docs/testing/afs.md)。K8s组件定向�
 
 ## 读写专项与性能资产
 
-基础集合为22项（原20项及独立的缓存复用、热缓存权限两项）；以下是可选扩展，不自动进入Buildkite、基础冒烟或产品Full。
+基础集合为23项（原20项及独立的缓存复用、热缓存权限、远端目录句柄回收三项）；以下是可选扩展，不自动进入Buildkite、基础冒烟或产品Full。
 用例ID和实际profile以`run.py list`为准；本节只说明归属，不维护第二份独立注册表。
 
 | 集合 | 当前行为范围 | 配置与边界 |
 | --- | --- | --- |
 | `local-write-special` / `cluster-write-special` | 跨fd覆盖/截断顺序；O_SYNC/O_DSYNC/close-only/并发append；有界接纳下同文件及独立文件fsync推进；`strict`下必需副本失败恢复与失败close退役；默认`degrade`下副本Node停止时写入成功、恢复后两份副本一致 | 各6项。显式64MiB前台额度；R2例只启动A/B两个Node并要求两个不同Node的持久副本。256MiB压力不冒充实测队列峰值、严格公平性或时延SLA |
-| `local-read-special` / `cluster-read-special` | off/receiver/both三种CRC模式下的远端非对齐/跨块/EOF正确性；显式direct顺序读触发预取、seek/close后缓冲释放；cached首读/同fd/重开正确性及direct专用预取门控 | 各5项。固定open授权显式开启以覆盖原生句柄路径；不加强旧fd一致性。不把正向CRC测试记成损坏注入/坏副本恢复，也不把cached内容正确当作缓存驻留或零RPC证明 |
+| `local-read-special` / `cluster-read-special` | off/receiver两种CRC模式下的远端非对齐/跨块/EOF正确性；显式direct顺序读触发预取、seek/close后缓冲释放；cached首读/同fd/重开正确性及direct专用预取门控 | 各4项。不加强旧fd一致性。不把正向CRC测试记成损坏注入/坏副本恢复，也不把cached内容正确当作缓存驻留或零RPC证明 |
 | `all-special` | 上述单机和隔离节点专项的并集 | 20项，使用matrix环境；不含性能，不替代`all-basic`或完整AFS验收 |
 | `local-performance` | 顺序写交付/同步完成测量资产及远端读测量资产 | 两个测量入口，默认拒绝执行。不是受控基线比较或性能准入，不能用PASS代表性能无退化 |
 

@@ -5,13 +5,13 @@
 [ADX 测试体系现状](test-strategy.md)，静态现状、缺失与优先级见 [AFS 用例盘点](afs-test-inventory.md)。
 AFS 拥有自己的 UT 和组件集成测试；部署及公共用户 E2E 统一纳入 ADX。
 三类组件集成（真实 FUSE/bind、单机多进程、跨节点）的目标统一为 `afs/tests/`；
-基础组件集成已落地 [afs/tests/run.py](../../afs/tests/README.md)，同guest与多namespace共用入口；旧外置driver保留辅助/专项用途。Buildkite真实AFS接线仍未实施。
+基础组件集成已落地 [afs/tests/run.py](../../afs/tests/README.md)，同guest与多namespace共用入口；旧外置driver保留辅助/专项用途。Buildkite已接Base默认冒烟的AFS组件5项与Full的`ci-full` 24项（见[测试体系第四步](test-strategy.html#step-4)）；特权真实后端集成链未接。
 下文旧 acceptance runner 的 ARM64/full 限制是现有工具事实，不是 ADX 共用测试的架构要求。
 
 五步原则、现状、待补与优先级统一维护在 [同页测试规范](test-strategy.html)；
 可直接定位 [单VM](test-strategy.html#step-2)、[多namespace](test-strategy.html#step-3)、
 [Buildkite](test-strategy.html#step-4) 和 [固定包验收](test-strategy.html#step-5)。
-第二/三步共用入口已实现；当前基础注册为22case。旧冻结产物20case通过只属于历史批次；
+第二/三步共用入口已实现；当前基础注册为23case（`local-basic` 14＋`cluster-manyread` 9）。旧冻结产物20case通过只属于历史批次；
 新增缓存/权限检查的实际资格以当前候选结果为准。可选SSH多VM与CI产品接线仍须独立验收。
 
 Agent FS（AFS） 在目标仓中的验收按“目标仓源码、目标仓二进制、目标仓环境证据”登记。DMS/AFS 历史证据保留来源版本、环境和判据，可用于追溯和风险判断，但不自动升级为 Agent DX 当前候选结论。
@@ -48,7 +48,7 @@ AFS 产品二进制只支持 ARM64，也不代表 x86_64 包或定向 Linux driv
 3. DFS 一写多读核心场景；
 4. 普通 OwnerFs 本地 FUSE 访问及性能优化。
 
-大规模、长时间、复杂可靠性、多 Meta、etcd、Redis 和完整故障矩阵继续后置。pjdfstest、固定 LTP filesystem 子集和短 FSx 用于兜底功能完备性；项目自定义 case 只补充 OwnerFs bind、远端访问、DFS 复制、Meta 恢复和权限语义。
+大规模、长时间、多 Meta／高可用和完整故障矩阵继续后置；etcd、Redis 已可作 Meta 操作日志后端，24 个本机故障场景见 `afs/tests/run.py --suite local-fault`。pjdfstest、固定 LTP filesystem 子集和短 FSx 用于兜底功能完备性；项目自定义 case 只补充 OwnerFs bind、远端访问、DFS 复制、Meta 恢复和权限语义。
 
 ## 性能目标
 

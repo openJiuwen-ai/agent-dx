@@ -71,7 +71,7 @@ WAL硬上限同时计入保留、待删除和已准备的孤立日志文件，�
 只有两个保留恢复点都不再需要的封口段，才可在CURRENT持久切换后删除；活跃段不删。
 删除中断可按退休清单接续；损坏或外来退休文件保留并继续占额度，不盲删。
 
-当前CURRENT内部格式为v3，最大64KiB；WAL记录信封为v2，状态image为schema2。
+当前CURRENT内部格式为v3，最大64KiB；WAL记录信封为v2，记录决策（`RecordDecision`）为schema2，状态image为schema3（`afs/src/format.rs` 的 `version` 模块）。
 v3 在 v2 基础上增加写者 term（`AFSM\0\x03`），帧布局、WAL段、checkpoint与实体编码不变。
 **格式变化：v2 CURRENT 直接拒绝启动**（`STORAGE_FORMAT_INCOMPATIBLE`，`0x04040001`，消息含
 格式名、文件、发现版本 2、支持版本 3 与“rebuild the data directory”），原文件保留。此前创建的 local-file Meta 数据目录（OwnerFs 与 DFS
@@ -227,8 +227,9 @@ path、mount ID 和 source 同时作为 readiness 身份；挂载被替换时健
   `<prefix>/term`、`<prefix>/tip`、每条记录一个 `<prefix>/wal/<序号>`（与本地 WAL 帧字节相同）、
   `<prefix>/checkpoint` 指针与 `<prefix>/chunk/<term>-<序号>/<分块>`。前缀下已有其他 key 而没有 layout 时拒绝启动，不接管数据。
 - **写者互斥**：每次打开原子地取下一个 term；每次追加在同一服务端原子单元（Redis Lua 脚本、etcd 事务）里比较 term
-  与 tip 后再写。第二个 Meta 打开同一前缀后，旧 Meta 的下一次写返回 `META_LOG_FENCED`，应用在该 Meta 上看到 `EBUSY`；
-  旧 Meta 随即失效，它服务的 Node 心跳失败后退出，需要按正常流程重启。
+  与 tip 后再写。第二个 Meta 打开同一前缀后，旧 Meta 的下一次写返回 `META_LOG_FENCED`，当时在途的请求在应用侧是 `EBUSY`；
+  旧 Meta 随即失效（进程不退出，之后的请求是 `IO_UNAVAILABLE`，应用侧 `EHOSTUNREACH`，`/health` 返回 503），
+  它服务的 Node 心跳失败后约 15 秒退出，需要按正常流程重启，见[运维要点](#运维要点)。
 - **checkpoint**：镜像分块写入（Redis 8MiB、etcd 不超过 1MiB 与请求上限；超过一个分块的记录同样分段写入，见下），最后一步比较 term 与旧指针后切换指针；
   之后删除被覆盖的记录与旧镜像分块。崩溃留下的残留在下次打开时删除；只删除更早 term 写的未选中分块，
   不会删掉更新写者正在写的分块。
@@ -267,7 +268,7 @@ Redis 与 `local-file` 持平（create、rename、unlink、小文件写、txn fs
 
 ## 配置分类
 
-Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，CLI 把下划线写成连字符。TOML 拒绝未知键。下表登记全部 82 个顶层键：80 个 TOML 键，加上只在 CLI 上的 `config` 和 `print_config`。除标注"仅 TOML"的键和这两个 CLI 项外，其余键两边都能设置。
+Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，CLI 把下划线写成连字符。TOML 拒绝未知键。下表登记全部 92 个顶层键：90 个 TOML 键，加上只在 CLI 上的 `config` 和 `print_config`。除标注"仅 TOML"的键和这两个 CLI 项外，其余键两边都能设置。
 
 - **产品差异**：不同部署按需选择的功能或拓扑。
 - **调优**：资源与性能预算，默认值可以直接用于部署。
@@ -321,7 +322,7 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 | `trace_sample_ratio` | 调优 | 两者 | `0.01` | Trace 采样比例，0..=1 |
 | `meta_record_max_bytes` | 调优 | Meta | `67108864` | 单条操作日志记录上限 |
 | `meta_batch_max_bytes` | 调优 | Meta | `134217728` | 单个持久批次上限 |
-| `meta_wal_max_bytes` | 调优 | Meta | `1073741824` | WAL 总量上限；空间用尽时写入失败关闭 |
+| `meta_wal_max_bytes` | 调优 | Meta | `1073741824`（`etcd` 后端 `536870912`） | WAL 总量上限；空间用尽时写入失败关闭 |
 | `meta_wal_segment_bytes` | 调优 | Meta | `67108864` | 软分段大小，不超过 WAL 上限 |
 | `meta_checkpoint_wal_bytes` | 调优 | Meta | `134217728` | 后台检查点的 WAL 字节阈值 |
 | `meta_checkpoint_wal_records` | 调优 | Meta | `1000000` | 后台检查点的记录数阈值 |
@@ -384,7 +385,7 @@ Meta 和 Node 共用一套键：合并顺序是默认值 < TOML < 显式 CLI，C
 
 OwnerFs workspace bind 的 3 个键目前没有启动 WARN。
 
-**Meta 专用键写在 Node 配置里**。`meta_*` 13 个调优键、`dfs_desired_copies`、`dfs_sync_required_copies`、`dfs_min_distinct_nodes`、`dfs_min_distinct_failure_domains`、`dfs_local_copy`、`dfs_replica_failure_policy`、`dfs_min_degraded_copies`、`dfs_gc_grace_ms` 写在 Node 配置里不会报错：Node 只解析和校验，不使用这些值，修改它们不会改变 Meta 的行为，副本策略以 Meta 配置为准。配置了 `dfs_external_backend` 时，Node 还会校验那 4 个副本计数都是 `1`、`dfs_local_copy` 是 `required`，否则启动失败。`meta_store` 写在 Node 配置里同样不生效，Node 通过注册结果判断 Meta 的持久能力。例外是 `ownerfs_mkdir_load_balance`，写在 Node 配置里会启动失败。Node 专用键写在 Meta 配置里也只解析和校验，例外是 `experimental_ownerfs_workspace_bind = true`，在 Meta 上会启动失败。
+**Meta 专用键写在 Node 配置里**。`meta_*` 13 个调优键、`dfs_desired_copies`、`dfs_sync_required_copies`、`dfs_min_distinct_nodes`、`dfs_min_distinct_failure_domains`、`dfs_local_copy`、`dfs_replica_failure_policy`、`dfs_min_degraded_copies`、`dfs_gc_grace_ms` 写在 Node 配置里不会报错：Node 只解析和校验，不使用这些值，修改它们不会改变 Meta 的行为，副本策略以 Meta 配置为准。配置了 `dfs_external_backend` 时，Node 还会校验那 4 个副本计数都是 `1`、`dfs_local_copy` 是 `required`，否则启动失败。`meta_store` 写成 `local-file` 或 `memory` 时在 Node 配置里同样不生效，Node 通过注册结果判断 Meta 的持久能力；写成 `redis` 或 `etcd` 时 Node 一定启动失败（这两个取值要求的 `meta_redis_url`／`meta_etcd_endpoints` 在 Node 上被拒绝）。例外共 5 个键，写在 Node 配置里（TOML 或 CLI）会启动失败（`CONFIG_INVALID`）：`ownerfs_mkdir_load_balance`、`meta_redis_url`、`meta_etcd_endpoints`、`meta_etcd_max_request_bytes`、`meta_store_prefix`（`afs/src/config/common.rs`）。Node 专用键写在 Meta 配置里也只解析和校验，例外是 `experimental_ownerfs_workspace_bind = true` 与 `dfs_peer_cache`，在 Meta 上会启动失败（`afs/src/config/dfs.rs`）。
 
 ## OwnerFs workspace bind ON
 
@@ -399,7 +400,36 @@ OwnerFs workspace bind 的 3 个键目前没有启动 WARN。
 - 同一 Node 只启用管理员控制的 host bind entry；
 - 停机、root/epoch 变化或授权失效前，先停止受管用户并排空引用。
 
-## 运维边界
+## 运维要点
+
+| 场景 | 现象 | 处置 | 依据 |
+| --- | --- | --- | --- |
+| Node 的 Meta 会话过期（Node 暂停或断网超过 30 秒会话期限） | 续约被拒（`expired node session cannot be renewed; start a new session_id`，不可重试），Node 停止读授权并退出，日志 `node.shutdown_failed` 的 `error` 字段带这句话；没有单独的事件名 | **重启 Node**：session_id 在进程启动时生成，运行中不会换新会话。由进程守护自动拉起即可 | `afs/src/node/registration.rs`；`afs/src/meta/store/state/apply.rs` |
+| Meta 心跳持续失败（Meta 不可达、被 fence 或日志失效） | Node 每 10 秒心跳，失败后每秒重试；距最后一次成功心跳 25 秒（即第一次失败后约 15 秒）停止读授权并退出，之后还有至多 15 秒的进程关停预算 | Meta 恢复后重启 Node | `HEARTBEAT_INTERVAL`、`HEARTBEAT_FAIL_CLOSED_AFTER`（`afs/src/node/registration.rs`） |
+| Meta 被 fence（另一个 Meta 打开了同一份日志）或日志写结果未知 | Meta 失败关闭但进程不退出：在途请求得到 `META_LOG_FENCED`（应用 `EBUSY`），之后的请求得到 `IO_UNAVAILABLE`（应用 `EHOSTUNREACH`），`/health` 返回 503；追加失败时 `afs_meta_wal_failures_total` 加一。没有单独的日志事件 | 确认只有一个 Meta 应该运行，**重启它**；它服务的 Node 按上一行退出后重启 | `afs/src/meta/store/engine.rs`（`ensure_available`、`group_failure`）；`afs/src/error.rs` |
+| `local-file` Meta 目录 | 文件锁（`flock`）是写者互斥手段，term 只是兜底 | **目录必须在本机独占盘上**：不放 NFS 等网络文件系统，不让两台主机挂同一块盘或同一目录，运行中不删 `LOCK`。锁失效会丢失已确认的写，见上文"local-file 的写者互斥合同" | `afs/src/meta/store/local_log.rs` |
+| `redis` 后端 | Meta 启动时检查 `appendonly yes`、`appendfsync always`、`no-appendfsync-on-rewrite no`、`maxmemory-policy noeviction`，不满足拒绝启动 | 单实例 Redis 按上述配置；连接无 TLS 与认证，只部署在受信网络 | 见上文"Meta 操作日志的 Redis／etcd 后端" |
+| `etcd` 后端 | 配额低于"两份镜像 + 日志上限 + 1GiB"时 WARN `meta.log.etcd_quota_low`（读不到配额时 `meta.log.etcd_quota_unknown`），不拒绝启动；后端不自行 compact | `--quota-backend-bytes` 建议 8GiB，开启 `--auto-compaction-*`；`meta_etcd_max_request_bytes` 与服务端 `--max-request-bytes` 一致；连接无 TLS 与认证 | 同上 |
+| GC 停滞 | 删除后空间不回收 | 告警 `afs_meta_dfs_gc_generation_age_seconds` 持续增长（一代一直不结束）与 `afs_meta_dfs_gc_stalled_seconds`（有死 key 却没有进展，越过 60 秒打 `dfs.gc_stalled`）；见[架构文档的观测一节](../architecture/afs.md#观测) | `afs/src/meta/dfs/gc/metrics.rs` |
+
+### 协议与格式不兼容时的停机替换
+
+AFS 不支持滚动升级或新旧版本混跑。以下任一变化都要整集群停机替换（OwnerFs 部署同样适用）：
+
+- **集群线协议**：Node 注册带 `protocol_version`（当前 6，`afs_protocol::CLUSTER_PROTOCOL_VERSION`），Meta 严格比较，不符（含旧 Node 缺省的 0）返回 `META_NODE_PROTOCOL_VERSION`，Node 直接启动失败；Node 之间的通道不握手，依赖经 Meta 准入的同版本部署。
+- **持久格式**：Meta 数据目录（`CURRENT`、WAL 信封、记录决策、状态 image 等）、Redis／etcd key 布局、Node catalog、外部对象 key 前缀，版本不符一律 `STORAGE_FORMAT_INCOMPATIBLE`，不迁移、不自动删除（[规则](../architecture/afs.md#持久格式与协议版本规则)）。
+
+步骤：
+
+1. 停止应用写入，确认各文件 `fsync` 成功；卸载全部 FUSE 挂载，停止 SDK 客户端。
+2. 停止全部 `afs-node`，再停止 `afs-meta`。
+3. 备份旧数据，然后新建：local-file 用新的空 `data_dir`；Redis／etcd 用新的 `meta_store_prefix` 或清空旧前缀（前缀下已有数据而没有 layout 时 Meta 拒绝启动）；DFS 外部 S3 模式用新桶；各 Node 的 chunk 存储目录随新集群新建。
+4. 用 `--print-config` 检查新二进制下的 Meta 与 Node 配置（新增键、Node 上不能写的 Meta 存储键）。
+5. 用**同一版本**的二进制先启动 Meta，再启动全部 Node。
+
+回滚只能用旧二进制配旧的完整数据目录与旧桶，不得让旧二进制打开新目录。
+
+### 运维边界
 
 启动前一次性检查二进制身份、配置 SHA、端口、TLS、数据目录、运行目录、日志目录、挂载目录、FUSE 设备、`fusermount3`/`umount`、旧 PID、旧 UDS、旧挂载和磁盘余量。遇到环境阻塞时保存证据并停止受影响项，不把环境修补混入产品结论。
 
@@ -407,7 +437,7 @@ OwnerFs workspace bind 的 3 个键目前没有启动 WARN。
 
 ## DFS 外部 S3 连接
 
-这是实验接入，先验证小规模发布／回源闭环，尚不承诺性能或完整故障验收。
+外部 S3 后端在支持矩阵内，已验证的范围（故障场景、性能矩阵；e2e 套件不覆盖）见[支持边界](../architecture/afs-support-boundary.md#支持矩阵)。对象存储服务本身的持久性由其部署保证。
 在新 Meta 和参与的 Node 中添加相同的身份与后端连接配置；Node 另需凭据。
 保留默认 DFS 单副本计数，任何外部后端与多 Node 副本的组合均在启动前拒绝。
 
@@ -443,24 +473,19 @@ Meta 的 `meta_store` 是独立配置：默认 `local-file`，也可选择 `redi
 对象 key 身份不允许变更后重新使用同一 Meta 数据目录；配置错误及 GET/PUT
 错误向调用方传播。正常停机仍需先排空工作负载和 FUSE 引用。
 
-S3 适配层共用一个 worker、运行时和客户端，固定最多四个实际 PUT；完整
-4MiB 块可以提前上传，完成后滚动补位。最多32个活动命令和一个排队命令，
-队满等待回压；共享客户端最多保留四个空闲连接。空闲连接池大小本身不是并发限制。
+S3 适配层共用一个 worker、运行时和客户端，固定最多四个实际 PUT（`MAX_UPLOADS`）、
+最多32个活动命令（`afs/src/node/external_chunk.rs`）；共享客户端最多保留四个空闲连接，
+空闲连接池大小本身不是并发限制。
 
-顺序追加以64MiB为一个发布单元，冻结窗口上传期间可按预算余量接纳下一窗口；
-普通 write 返回表示已接纳，中间版本稍后发布。独立只读节点读取已发布版本，
-同挂载和已有 owner 代理的 dirty read 先完成读入口前已接纳序号的有序发布，
-发布失败报错，不能回退旧内容。fsync、fdatasync、可写 flush、同步写
-和必要排空必须等待有效对象回执及 Meta 持久确认，不能仅凭 PUT 成功返回。
-覆盖写、稀疏写和截断先收口相关窗口，再使用原有提交路径。Meta ACK 未知时保留
-原请求身份并阻挡后续 mutation；PUT 失败保留脏数据和可复用的成功回执。
-
-Node 写流水线采用分配前预算：普通数据128MiB，发布保留32MiB，总计160MiB；
-共享内容只计一次，失败、准备提交和未知 ACK 期间仍存活的内容不能提前退账。
-PUT 直接持有已封口的不可变载荷及其预算租约，不再复制整块 HTTP body；
-发布构块使用独立串行保护，仍存活的 transport／retry owner 释放前不得退还额度。
-这项预算与缓存容量、缓存 pending、读取缓冲及进程其它开销分开核算，不能作为
-总 RSS 上限。失败或超时可能留下未引用的不可变对象，由 S3 回收的列举发现并回收；不要手工删除桶内对象。S3 对象 key 前缀为 `afs/v2/`，旧桶需重建。
+S3 模式的写入与原生副本模式走**同一条原生写流水线**（`afs/src/node/assembly/dfs.rs`）：
+受同样的 `dfs_write_queue_bytes`、`dfs_dirty_budget_bytes`、`dfs_unpublished_descriptors`
+约束，`dfs_upload_inflight_chunks` 被压到 4（实际 PUT 许可数）。满 4MiB 块提前上传；
+S3 回执不是本机持久副本，所以正文保留到版本发布。普通 write 返回表示已接纳；fsync、fdatasync、
+可写 flush、同步写和必要排空等待有效对象回执及 Meta 持久确认，不能仅凭 PUT 成功返回。
+本节点读自己尚未提交的写入在本地完成，不触发提交（与原生模式相同）；其他节点只读已发布版本。
+Meta ACK 未知时保留原请求身份并阻挡后续修改；PUT 失败保留脏数据并在下一次屏障重传同一对象。
+失败或超时可能留下未引用的不可变对象，由 S3 回收的列举发现并回收；不要手工删除桶内对象。
+S3 对象 key 前缀为 `afs/v2/`，旧桶需重建。
 
 外部模式的当前恢复范围是读取已经发布的版本；写节点重启后重新取得写权
 另行验收。旧写租约有效时，新会话立即复写原文件可能返回 EBUSY，不能将
@@ -740,7 +765,7 @@ Tree不可用时移除root-only builder，由producer（同步入口为原checks
 文件身份变化使证明失效，未请求覆盖组的静默损坏在读取该组时检测。
 
 正常退出等待活动operation结束，停止后不接纳fill；可丢弃缓存不要求fsync，成功应用
-fsync依赖原持久副本与Meta屏障。S3原有窗口、载荷／descriptor预算独立保持，外部写不生成
+fsync依赖原持久副本与Meta屏障。S3 写入与原生共用写流水线的预算，但外部写不生成
 这份原生写proof；外部S3与Peer缓存协同仍后置，不同时配置两种后端缓存。
 这些是实现及部署边界，不表示本候选已完成运行、回归或性能验收。
 
@@ -749,9 +774,9 @@ fsync依赖原持久副本与Meta屏障。S3原有窗口、载荷／descriptor�
 `dfs_write_buffer_idle_bytes` 为 Node 顶层配置，默认134217728（128MiB），允许0..=1TiB；
 0禁用空闲保留。它只限制池中可复用的空闲实际容量，不预分配，也不是 live、RSS 或进程内存硬上限。
 未命中池时按需申请，最后引用释放才归还，超基线分配释放给 allocator；停止清空池。
-空闲池不改变 S3 的任何预算。原生写入另用下表的 Node live／描述符／上传三账，
+空闲池不提供额外的接纳额度。原生写入另用下表的 Node live／描述符／上传三账，
 原16MiB累计接纳发布阈值退出原生路径；4MiB满块只冻结并排队上传。
-原生区间索引仅保留最终可见范围，不保留每次覆盖的历史记录；S3／legacy 仍沿用原日志。
+原生区间索引仅保留最终可见范围，不保留每次覆盖的历史记录（S3 模式相同）。
 明确分配拒绝尽力返回 ENOMEM 或合法短写，Linux OOM 杀进程仍按崩溃合同处理，
 不能保证始终正常返回错误。
 
@@ -763,7 +788,7 @@ fsync依赖原持久副本与Meta屏障。S3原有窗口、载荷／descriptor�
 | `dfs_upload_inflight_chunks` | `8` | 1..8，整个Node的真实任务上限，共享live正文 |
 | `dfs_background_commit_ms` | `5000` | 1..60000ms，后台发布调度周期，非严格可见时间 |
 
-优先级 CLI＞TOML＞默认，非法值启动报错；仅无外部后端的 DFS 接入此流水线。
+优先级 CLI＞TOML＞默认，非法值启动报错；外部 S3 后端同样经此流水线写入，`dfs_upload_inflight_chunks` 在 S3 下被压到 4。
 固定4MiB元数据内预留64KiB给FIFO和进展，其余在接纳前覆盖描述符和新增发布工作区；
 每项实际保留与保守预留分列，字节满可能早于1024项。压力发布只用于描述符额度满，
 或本机没有持久副本、必须保留正文而使live满；不得借压力跳过未知提交精确重放。
@@ -825,7 +850,7 @@ dfs_read_diagnostics_enabled = true
 ## Meta 快照升级与回滚边界
 
 OwnerFs 与 DFS 共享 canonical Meta 操作日志，业务记录分开。local-file 持久确认后才发布应答；
-后台检查点和历史退休沿用本文件的有限策略。旧 JSON/AFSD 快照、etcd、Redis 后端不再接入，
+后台检查点和历史退休沿用本文件的有限策略。旧 JSON/AFSD 快照与旧的整份快照式 etcd、Redis 适配不再接入（当前 `redis`／`etcd` 是操作日志后端，格式不同），
 升级／回滚必须使用匹配的二进制和完整数据目录，参见 [Meta 操作日志有限策略](#meta-操作日志有限策略)。
 
 本版本新增 DFS durability policy、外部对象回执等持久化表示。旧二进制可能无法解析新快照；
@@ -864,7 +889,7 @@ Meta 注册回复提供实际已持久化租约的相对剩余期限 `lease_rema
 需配套升级 Meta 与 Node。旧 Meta 未返回相对期限时，新 Node 明确拒绝注册授权，
 不回退到跨机墙钟或任意30秒授权。Meta persistence readiness 的判定保持独立。
 
-注册请求携带集群线协议代际 `protocol_version`（当前为 3，涵盖 Node↔Meta 注册与 Node↔Node service
+注册请求携带集群线协议代际 `protocol_version`（当前为 6，`afs_protocol::CLUSTER_PROTOCOL_VERSION`，涵盖 Node↔Meta 注册与 Node↔Node service
 布局）。Meta 在登记会话前校验，
 不符或缺省（0，旧 Node）返回 `META_NODE_PROTOCOL_VERSION`（`0x03050001`，FailedPrecondition），
 不写入任何状态；该错误不属于首次注册的可重试类别，Node 直接启动失败。DFS 与 OwnerFs Node
@@ -973,17 +998,17 @@ counter以进程生命周期计，重启归零；恢复的当前状态会初始�
 
 ## 原生 DFS 回收
 
-NodeReplicated DFS 默认启动每 5 秒一次的安全回收；关闭引用有固定 60 秒保护期。
+NodeReplicated DFS 默认启动每 5 秒一次的安全回收；引用退休后数据再保护 `dfs_gc_grace_ms`（Meta 配置，默认 1 秒），退休记录作为防重放墓碑至少保留 120 秒（准入期限 60 秒加时钟差 60 秒，`afs/src/meta/dfs/gc.rs`），grace 更长时随 grace。
 运行中／COW／未完成上传引用仍保护数据。打开中的文件只保留 head、读者打开时固定的版本和在途写的基线版本，
 其余旧版本照常回收，所以长时间打开并反复提交的文件不会让 Meta 内存随提交数增长（R81）。
 失联 Node 不会被当作已删除数据；它恢复后继续确认删除批次。应答成功前本机 catalog 检查点与
 删除代次必须已同步落盘。不要在离线 Node 未完成磁盘处置时强行清空 Meta 删除屏障。
-外部对象持久化的 DFS 不执行这条物理回收协议。
+外部对象持久化（S3）的 DFS 不执行这条本机物理回收协议，对象由一个删除者删除、列举对账找回孤儿，见[架构文档](../architecture/afs.md#dfs-历史与数据块回收)。
 原生异步上传在接受新写入代次时取得引用，上传前登记块，直至版本发布及异步使用结束后才释放。
 本机回收先排空 catalog 安装，再独占执行检查点与 WAL 截断，避免覆盖尚未确认的写入。
 
 引用创建 RPC 使用固定期限；过期返回 `META_DFS_REFERENCE_ADMISSION_EXPIRED`。
-未知引用的释放也持久化 60 秒墓碑，阻止乱序的迟到创建。该期限不限制运行中文件／上传的寿命。
+未知引用的释放也持久化墓碑（同上，至少 120 秒），阻止乱序的迟到创建。该期限不限制运行中文件／上传的寿命。
 
 ## DFS 删除并发与诊断
 
@@ -1011,7 +1036,7 @@ NodeReplicated DFS 默认启动每 5 秒一次的安全回收；关闭引用有�
 
 可选BLAKE3 Peer驻留/proof及磁盘缓存不适用于CRC对象；CRC直接走分段验证的范围传输。gRPC与RDMA协议均携带CRC描述，RDMA硬件运行单独验收，不能用全feature编译替代。S3及其缓存策略不在本次变更范围。
 
-`security.capability`在原inode映射检查后本地返回既有不支持错误，其余xattr保留Meta权限与错误语义。Meta的`afs_requests_total`提供`dfs_gc_capture/register/retain/release/collect`、`dfs_commit_file_version`和`dfs_get_xattr`标签，用于核对真实访问次数；不增加逐chunk正文扫描或详细调度采集。
+`security.capability`在原inode映射检查后本地返回既有不支持错误，其余xattr保留Meta权限与错误语义。Meta的`afs_requests_total`提供`ping`、`register_node`、`dfs_gc_capture/retain/release/collect`、`dfs_commit_file_version`和`dfs_get_xattr`标签，用于核对真实访问次数；不增加逐chunk正文扫描或详细调度采集。
 
 ## OwnerFs 运行时开关
 
