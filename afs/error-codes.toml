@@ -458,6 +458,14 @@ subsystem = "Store"
 description = "Meta 操作日志已被更高 term 的新写者接管，旧写者句柄的追加被拒绝且未写入；Store 随即失效，需由新写者服务"
 
 [[error]]
+name = "META_STORE_BUSY"
+value = "0x03020003"
+kind = "ResourceExhausted"
+component = "Meta"
+subsystem = "Store"
+description = "Meta 输入队列持续满（等待 3 秒仍无容量）；请求未执行，可稍后重试，Node 映射为 EAGAIN"
+
+[[error]]
 name = "META_NODE_PROTOCOL_VERSION"
 value = "0x03050001"
 kind = "FailedPrecondition"
