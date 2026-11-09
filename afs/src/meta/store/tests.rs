@@ -3170,22 +3170,20 @@ async fn p3_root_deactivation_accepts_accumulated_grants_below_byte_budget() {
             .is_empty()
     );
     let recovered = log.recover().await.unwrap();
+    // The store's periodic authority cleanup may commit CleanupRootGrants for
+    // the dead holder sessions between `before` and the deactivation (Q07:
+    // about one run in five in a debug build), so find the deactivation by
+    // its operation rather than as the record right after `before`.
     let record = recovered
         .records
         .iter()
         .find(|record| {
-            matches!(record, log::Record::Decision { .. })
-                && record.revision_before() == before.revision
-                && record.revision_after() == before.revision.next()
+            matches!(record, log::Record::Decision { decision, .. }
+                if decision.facts().unwrap().operation == StoreOperation::DeactivateRoot)
+                && record.revision_before() >= before.revision
+                && record.revision_after() == record.revision_before().next()
         })
         .unwrap();
-    let log::Record::Decision { decision, .. } = record else {
-        unreachable!()
-    };
-    assert_eq!(
-        decision.facts().unwrap().operation,
-        StoreOperation::DeactivateRoot
-    );
     let framed = journal::frame_size(tip.at(1), record).unwrap();
     assert!(
         framed < 4096,
