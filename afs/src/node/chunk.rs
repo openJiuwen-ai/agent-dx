@@ -80,7 +80,7 @@ use peer_serve::*;
 pub use reader::PinnedChunkReader;
 pub(crate) use reader::VerifiedRangeCopy;
 use reader::*;
-#[cfg(any(feature = "dfs", test))]
+#[cfg(feature = "dfs")]
 pub(crate) use scrub::{ScrubItem, ScrubOutcome};
 use sidecar_install::*;
 #[cfg(feature = "dfs")]
