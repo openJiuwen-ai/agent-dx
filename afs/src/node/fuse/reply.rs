@@ -399,14 +399,28 @@ pub(super) fn fuse_failure_grade(op: FuseOp, errno: i32, error: &Error) -> Failu
     match errno {
         libc::EINTR => Debug,
         libc::ENOENT if op.enoent_is_answer() => Debug,
-        libc::EEXIST if op.creates_name() => Debug,
+        // R89: XATTR_CREATE on an existing name answers the caller as well.
+        libc::EEXIST if op.creates_name() || op == FuseOp::Setxattr => Debug,
         libc::ENOTEMPTY if matches!(op, FuseOp::Rmdir | FuseOp::Rename) => Debug,
         libc::ENOTDIR | libc::EISDIR | libc::ENAMETOOLONG | libc::ELOOP | libc::EXDEV
             if op.is_namespace() =>
         {
             Debug
         }
-        libc::ENODATA if matches!(op, FuseOp::Getxattr | FuseOp::Removexattr) => Debug,
+        // R89: Setxattr's ENODATA is XATTR_REPLACE on an absent name.
+        libc::ENODATA
+            if matches!(
+                op,
+                FuseOp::Getxattr | FuseOp::Removexattr | FuseOp::Setxattr
+            ) =>
+        {
+            Debug
+        }
+        // R89: arguments the caller chose. Rename answers EINVAL for
+        // unsupported flags (the backend's Unimplemented, see `reply_errno`)
+        // and for a move into its own subtree; Setattr for times DFS cannot
+        // store (before 1970).
+        libc::EINVAL if matches!(op, FuseOp::Rename | FuseOp::Setattr) => Debug,
         // J6: the kernel probes `security.capability` on every write and the
         // DFS backend answers EOPNOTSUPP. Only the log level changes here.
         libc::EOPNOTSUPP if op.is_xattr() => Debug,

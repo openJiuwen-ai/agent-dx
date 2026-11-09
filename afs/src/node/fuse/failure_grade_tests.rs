@@ -86,6 +86,8 @@ fn cases() -> Vec<(FuseOp, Error, i32, FailureGrade)> {
         (Symlink, coded(IO_ALREADY_EXISTS), libc::EEXIST, Debug),
         (Link, coded(IO_ALREADY_EXISTS), libc::EEXIST, Debug),
         (Rename, coded(IO_ALREADY_EXISTS), libc::EEXIST, Debug),
+        // R89: XATTR_CREATE on an existing name is the caller's answer.
+        (Setxattr, coded(IO_ALREADY_EXISTS), libc::EEXIST, Debug),
         (Unlink, coded(IO_ALREADY_EXISTS), libc::EEXIST, Fault),
         (Write, coded(IO_ALREADY_EXISTS), libc::EEXIST, Fault),
         // ENOTEMPTY.
@@ -115,7 +117,9 @@ fn cases() -> Vec<(FuseOp, Error, i32, FailureGrade)> {
         // xattr answers (J6: EOPNOTSUPP only changes the log level).
         (Getxattr, coded(IO_NO_DATA), libc::ENODATA, Debug),
         (Removexattr, coded(IO_NO_DATA), libc::ENODATA, Debug),
-        (Setxattr, coded(IO_NO_DATA), libc::ENODATA, Fault),
+        // R89: XATTR_REPLACE on an absent name is the caller's answer.
+        (Setxattr, coded(IO_NO_DATA), libc::ENODATA, Debug),
+        (Listxattr, coded(IO_NO_DATA), libc::ENODATA, Fault),
         (Getxattr, coded(IO_NOT_SUPPORTED), libc::EOPNOTSUPP, Debug),
         (Listxattr, coded(IO_NOT_SUPPORTED), libc::EOPNOTSUPP, Debug),
         (Setxattr, coded(IO_NOT_SUPPORTED), libc::EOPNOTSUPP, Debug),
@@ -168,6 +172,21 @@ fn cases() -> Vec<(FuseOp, Error, i32, FailureGrade)> {
             libc::EINVAL,
             Fault,
         ),
+        // R89: an argument the caller chose (a time before 1970, a rename
+        // into its own subtree) is answered, not a fault.
+        (
+            Setattr,
+            kind(ErrorKind::InvalidArgument),
+            libc::EINVAL,
+            Debug,
+        ),
+        (
+            Rename,
+            kind(ErrorKind::InvalidArgument),
+            libc::EINVAL,
+            Debug,
+        ),
+        (Write, kind(ErrorKind::InvalidArgument), libc::EINVAL, Fault),
         (
             Mkdir,
             kind(ErrorKind::FailedPrecondition),
@@ -244,4 +263,22 @@ fn supported_operations_never_answer_enosys_for_unsupported_arguments() {
             "{op:?}"
         );
     }
+}
+
+/// R89: an unsupported rename flag (RENAME_EXCHANGE, RENAME_WHITEOUT) is the
+/// caller's argument. The backend reports Unimplemented; the reply is EINVAL
+/// (R20) and the log is not an ERROR.
+#[test]
+fn unsupported_rename_flags_reply_einval_without_error_grade() {
+    let error = kind(ErrorKind::Unimplemented);
+    assert_eq!(crate::error::errno(&error), libc::ENOSYS);
+    let errno = reply_errno(FuseOp::Rename, &error);
+    assert_eq!(errno, libc::EINVAL);
+    assert_eq!(errno_in(FuseOp::Rename)(error.clone()), libc::EINVAL);
+    assert_eq!(fuse_failure_grade(FuseOp::Rename, errno, &error), Debug);
+    // ENOSYS for an operation that is never supported keeps its fault grade.
+    assert_eq!(
+        fuse_failure_grade(FuseOp::Open, libc::ENOSYS, &error),
+        Fault
+    );
 }
