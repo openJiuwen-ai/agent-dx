@@ -7,6 +7,52 @@ pub(super) struct NativeReadView {
     pub(super) deadline: Instant,
 }
 
+/// The inode version a handle reads, together with the GC reference that keeps
+/// that version (R94). Every holder of the `Arc` keeps the reference: the handle
+/// while the view is current, and each in-flight read that captured it until
+/// the read ends. Publishing a newer view therefore never releases a version a
+/// read still uses, and the last holder's drop queues the release.
+pub(super) struct OpenedView {
+    inode: InodeRecord,
+    gc_pin: Option<Arc<crate::node::gc::GcPin>>,
+}
+
+impl OpenedView {
+    pub(super) fn new(inode: InodeRecord, gc_pin: Option<Arc<crate::node::gc::GcPin>>) -> Self {
+        Self { inode, gc_pin }
+    }
+
+    /// Whether the handle protects its version with a GC reference. A handle
+    /// opened without one (no GC references, an owner-side handle, the
+    /// diagnostics unpinned reader) keeps moving without one.
+    pub(super) fn is_pinned(&self) -> bool {
+        self.gc_pin.is_some()
+    }
+}
+
+impl std::ops::Deref for OpenedView {
+    type Target = InodeRecord;
+
+    fn deref(&self) -> &InodeRecord {
+        &self.inode
+    }
+}
+
+/// A local view a handle should move to but could not protect yet: building
+/// its GC reference failed. The handle keeps reading its current, protected
+/// view; the next read or local commit tries again (R94).
+pub(super) struct PendingView {
+    pub(super) inode: Arc<InodeRecord>,
+    pub(super) retry_after: Instant,
+}
+
+/// Earliest retry after a failed GC reference for a pending view, so a Meta
+/// outage does not add a Meta round trip to every read.
+#[cfg(not(test))]
+const PENDING_VIEW_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const PENDING_VIEW_RETRY_INTERVAL: Duration = Duration::from_millis(0);
+
 pub(super) struct DfsFileHandle {
     pub(super) gc_pin: Option<Arc<crate::node::gc::GcPin>>,
     pub(super) inode_id: InodeId,
@@ -23,7 +69,6 @@ pub(super) struct DfsFileHandle {
 pub(super) struct DfsHandle {
     pub(super) direct_prefetch:
         std::sync::OnceLock<Arc<crate::node::read::direct_prefetch::Controller>>,
-    _gc_pin: Option<Arc<crate::node::gc::GcPin>>,
     pub(super) inode_id: InodeId,
     pub(super) flags: i32,
     pub(super) owner_scope: Option<DfsOwnerHandleScope>,
@@ -36,7 +81,10 @@ pub(super) struct DfsHandle {
 }
 
 pub(super) struct HandleMut {
-    pub(super) opened_inode: Arc<InodeRecord>,
+    /// The version this handle reads and its GC reference. Replaced only as a
+    /// whole: a new version is published only together with its reference.
+    pub(super) opened_inode: Arc<OpenedView>,
+    pub(super) pending_view: Option<PendingView>,
     pub(super) opened_page_identity: Option<PageCacheIdentity>,
     pub(super) native_read_view: Option<NativeReadView>,
     pub(super) native_read_generation: u64,
@@ -46,18 +94,18 @@ pub(super) struct HandleMut {
     pub(super) read_sequence: crate::node::read::object_fetch::ReadSequence,
 }
 
-pub(super) type PinnedReadView = Result<(Arc<InodeRecord>, NativeReadView)>;
+pub(super) type PinnedReadView = Result<(Arc<OpenedView>, NativeReadView)>;
 
 impl From<DfsFileHandle> for DfsHandle {
     fn from(opened: DfsFileHandle) -> Self {
         Self {
             direct_prefetch: std::sync::OnceLock::new(),
-            _gc_pin: opened.gc_pin,
             inode_id: opened.inode_id,
             flags: opened.flags,
             owner_scope: opened.owner_scope,
             state: Mutex::new(HandleMut {
-                opened_inode: Arc::new(opened.opened_inode),
+                opened_inode: Arc::new(OpenedView::new(opened.opened_inode, opened.gc_pin)),
+                pending_view: None,
                 opened_page_identity: opened.opened_page_identity,
                 native_read_view: opened.native_read_view,
                 native_read_generation: opened.native_read_generation,
@@ -186,28 +234,6 @@ impl DfsHandleTable {
             .collect())
     }
 
-    /// Move every open handle on the inode to `inode`, this Node's newest view
-    /// of it. Only this Node's own write activity calls this; other nodes'
-    /// commits reach a handle only through a new open (decision 4a).
-    pub(super) fn advance_to_local_view(&self, inode: &InodeRecord) -> Result<()> {
-        let opened = Arc::new(inode.clone());
-        for handle in self.for_inode(&inode.inode_id)? {
-            handle.dynamic_read_route.store(true, Ordering::Release);
-            let mut handle = handle
-                .state
-                .lock()
-                .map_err(|_| unavailable("DFS handle state is poisoned"))?;
-            handle.native_read_generation = handle
-                .native_read_generation
-                .checked_add(1)
-                .ok_or_else(|| unavailable("DFS native read generation exhausted"))?;
-            handle.native_read_view = None;
-            handle.opened_page_identity = None;
-            handle.opened_inode = opened.clone();
-        }
-        Ok(())
-    }
-
     pub(super) fn mark_dynamic(&self, inode_id: &InodeId) -> Result<()> {
         // Allocate holds the same index lock while checking the published
         // maps. Publishers must release their map guard before entering here.
@@ -316,7 +342,7 @@ impl DistributedFs {
 pub(super) struct DfsFileHandleSnapshot {
     pub(super) handle: Arc<DfsHandle>,
     pub(super) inode_id: InodeId,
-    pub(super) opened_inode: Arc<InodeRecord>,
+    pub(super) opened_inode: Arc<OpenedView>,
     pub(super) native_read_view: Option<NativeReadView>,
     pub(super) native_read_generation: u64,
     pub(super) native_denial_serial: u64,
@@ -388,7 +414,9 @@ impl DistributedFs {
             self.close_remote_write_session(&removed.inode_id, &session)?;
             return Ok(None);
         }
-        self.release_writer(&session.local)
+        let undelivered = self.release_writer(&session.local)?;
+        self.publish_deferred_views(&removed.inode_id)?;
+        Ok(undelivered)
     }
 
     /// What a sync barrier on this local handle has reached: this handle's
@@ -453,23 +481,269 @@ impl DistributedFs {
             .map_err(|_| unavailable("DFS inode write state is poisoned"))?
             .inode
             .clone();
-        for handle in self.handles.for_inode(inode_id)? {
-            let mut handle = handle
+        // This Node's commits are visible to every handle on it (4a).
+        self.advance_handles(&inode, Some(committed_seq), false)
+    }
+
+    /// Move every open handle on the inode to `inode`, this Node's newest view
+    /// of it. Only this Node's own write activity calls this; other nodes'
+    /// commits reach a handle only through a new open (decision 4a).
+    pub(super) fn advance_to_local_view(&self, inode: &InodeRecord) -> Result<()> {
+        self.advance_handles(inode, None, true)
+    }
+
+    /// Publish `inode` as the read view of every open handle on it.
+    ///
+    /// A handle that protects its version with a GC reference moves only
+    /// together with a reference for the new version (R94): the reference is
+    /// built first, outside every handle lock, and handles of one Node share it
+    /// per (inode, version), so one local commit costs at most one admission.
+    /// If the admission fails the handle keeps its current, still protected
+    /// view and records the new one as pending; the next read or commit tries
+    /// again. `committed_seq` is already durable and is recorded either way:
+    /// a failed reference never turns a committed write into an uncommitted one.
+    ///
+    /// While a local writer is open every read of the inode on this Node goes
+    /// through its write state, not a handle's view, and the newest local
+    /// version is the head under this Node's write lease. Publication then
+    /// waits as a pending view, without an admission, until the last local
+    /// writer closes (`publish_deferred_views`) or a read or commit after that.
+    fn advance_handles(
+        &self,
+        inode: &InodeRecord,
+        committed_seq: Option<u64>,
+        dynamic: bool,
+    ) -> Result<()> {
+        let handles = self.handles.for_inode(&inode.inode_id)?;
+        if handles.is_empty() {
+            return Ok(());
+        }
+        let target = Arc::new(inode.clone());
+        let deferred = self.local_writers_open(&inode.inode_id)?;
+        let mut needs_reference = false;
+        for handle in &handles {
+            let state = handle
                 .state
                 .lock()
                 .map_err(|_| unavailable("DFS handle state is poisoned"))?;
-            handle.native_read_generation = handle
-                .native_read_generation
-                .checked_add(1)
-                .ok_or_else(|| unavailable("DFS native read generation exhausted"))?;
-            handle.native_read_view = None;
-            handle.opened_page_identity = None;
-            // This Node's commits are visible to every handle on it (4a).
-            handle.opened_inode = Arc::new(inode.clone());
-            if let Some(session) = handle.write_session.as_mut() {
-                session.local.last_synced_seq = session.local.last_synced_seq.max(committed_seq);
-            }
+            needs_reference |= state.opened_inode.is_pinned();
         }
+        let protected = if needs_reference && !deferred {
+            match self.protected_view(&target) {
+                Ok(view) => Some(view),
+                Err(error) => {
+                    afs_logging::warn!("dfs.handle_view_reference_failed";
+                        "inode" => inode.inode_id.0.as_str(),
+                        "version" => inode.head_version.as_ref().map_or("", |version| version.0.as_str()),
+                        "handles" => handles.len(),
+                        "error" => error.to_string());
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let unprotected = Arc::new(OpenedView::new(inode.clone(), None));
+        let retry_after = if deferred {
+            Instant::now()
+        } else {
+            Instant::now() + PENDING_VIEW_RETRY_INTERVAL
+        };
+        for handle in handles {
+            if dynamic {
+                handle.dynamic_read_route.store(true, Ordering::Release);
+            }
+            let mut state = handle
+                .state
+                .lock()
+                .map_err(|_| unavailable("DFS handle state is poisoned"))?;
+            if let Some(seq) = committed_seq
+                && let Some(session) = state.write_session.as_mut()
+            {
+                session.local.last_synced_seq = session.local.last_synced_seq.max(seq);
+            }
+            let view = if !state.opened_inode.is_pinned() {
+                unprotected.clone()
+            } else if let Some(view) = &protected {
+                view.clone()
+            } else {
+                let newer = target.revision >= state.opened_inode.revision
+                    && state
+                        .pending_view
+                        .as_ref()
+                        .is_none_or(|pending| pending.inode.revision <= target.revision);
+                if newer {
+                    state.pending_view = Some(PendingView {
+                        inode: target.clone(),
+                        retry_after,
+                    });
+                }
+                continue;
+            };
+            let replaced = Self::publish_view(&mut state, view)?;
+            drop(state);
+            drop(replaced);
+        }
+        Ok(())
+    }
+
+    fn local_writers_open(&self, inode_id: &InodeId) -> Result<bool> {
+        let Some(state) = self.write_state(inode_id)? else {
+            return Ok(false);
+        };
+        let state = state
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?;
+        Ok(state.open_writers > 0)
+    }
+
+    /// After the last local writer of the inode closed: publish the views its
+    /// commits left pending, with one admission for the newest local version,
+    /// while that version is still the head under this Node's write lease.
+    pub(super) fn publish_deferred_views(&self, inode_id: &InodeId) -> Result<()> {
+        if self.local_writers_open(inode_id)? {
+            return Ok(());
+        }
+        let mut pending = false;
+        for handle in self.handles.for_inode(inode_id)? {
+            pending |= handle
+                .state
+                .lock()
+                .map_err(|_| unavailable("DFS handle state is poisoned"))?
+                .pending_view
+                .is_some();
+        }
+        if !pending {
+            return Ok(());
+        }
+        let Some(state) = self.write_state(inode_id)? else {
+            return Ok(());
+        };
+        let inode = state
+            .lock()
+            .map_err(|_| unavailable("DFS inode write state is poisoned"))?
+            .inode
+            .clone();
+        self.advance_handles(&inode, None, false)
+    }
+
+    /// A view of `inode` protected by this Node's GC reference for its version.
+    fn protected_view(&self, inode: &InodeRecord) -> Result<Arc<OpenedView>> {
+        let pin = match &self.gc.references {
+            Some(references) => Some(references.pin(&inode.inode_id, inode.head_version.as_ref())?),
+            None => None,
+        };
+        Ok(Arc::new(OpenedView::new(inode.clone(), pin)))
+    }
+
+    /// Install `view` as the handle's read view; returns the replaced view so
+    /// the caller drops it (and maybe its reference) outside the handle lock.
+    /// A handle never moves back to an older inode revision: two publishers
+    /// racing on one inode leave the newer view in place.
+    fn publish_view(
+        state: &mut HandleMut,
+        view: Arc<OpenedView>,
+    ) -> Result<Option<Arc<OpenedView>>> {
+        if view.revision < state.opened_inode.revision {
+            return Ok(None);
+        }
+        state.native_read_generation = state
+            .native_read_generation
+            .checked_add(1)
+            .ok_or_else(|| unavailable("DFS native read generation exhausted"))?;
+        state.native_read_view = None;
+        state.opened_page_identity = None;
+        if state
+            .pending_view
+            .as_ref()
+            .is_some_and(|pending| pending.inode.revision <= view.revision)
+        {
+            state.pending_view = None;
+        }
+        Ok(Some(std::mem::replace(&mut state.opened_inode, view)))
+    }
+
+    /// Whether the handle has a local view a read should try to publish now:
+    /// one waiting for its GC reference, with no local writer open (reads go
+    /// through the write state while one is).
+    pub(super) fn handle_view_pending(&self, handle: FileHandle) -> Result<bool> {
+        let Some(opened) = self.handles.get(handle.0)? else {
+            return Ok(false);
+        };
+        let pending = opened
+            .state
+            .lock()
+            .map_err(|_| unavailable("DFS handle state is poisoned"))?
+            .pending_view
+            .is_some();
+        Ok(pending && !self.local_writers_open(&opened.inode_id)?)
+    }
+
+    /// Try again to protect and publish the handle's pending view (R94). A
+    /// failure leaves the handle on its current, protected view; it is not an
+    /// error of the read that triggered the retry.
+    pub(super) fn retry_pending_view(&self, handle: FileHandle) -> Result<()> {
+        let Some(opened) = self.handles.get(handle.0)? else {
+            return Ok(());
+        };
+        let target = {
+            let mut state = opened
+                .state
+                .lock()
+                .map_err(|_| unavailable("DFS handle state is poisoned"))?;
+            let Some(pending) = state.pending_view.as_ref() else {
+                return Ok(());
+            };
+            if pending.inode.revision < state.opened_inode.revision {
+                state.pending_view = None;
+                return Ok(());
+            }
+            if pending.retry_after > Instant::now() {
+                return Ok(());
+            }
+            pending.inode.clone()
+        };
+        // Reads go through the write state while a local writer is open.
+        if self.local_writers_open(&opened.inode_id)? {
+            return Ok(());
+        }
+        let view = match self.protected_view(&target) {
+            Ok(view) => view,
+            Err(error) => {
+                afs_logging::debug!("dfs.handle_view_reference_retry_failed";
+                    "inode" => target.inode_id.0.as_str(),
+                    "error" => error.to_string());
+                let mut state = opened
+                    .state
+                    .lock()
+                    .map_err(|_| unavailable("DFS handle state is poisoned"))?;
+                if let Some(pending) = state.pending_view.as_mut()
+                    && Arc::ptr_eq(&pending.inode, &target)
+                {
+                    pending.retry_after = Instant::now() + PENDING_VIEW_RETRY_INTERVAL;
+                }
+                return Ok(());
+            }
+        };
+        if opened.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut state = opened
+            .state
+            .lock()
+            .map_err(|_| unavailable("DFS handle state is poisoned"))?;
+        // A newer publication or pending view replaced this one meanwhile;
+        // the reference just built drops with `view`.
+        if !state
+            .pending_view
+            .as_ref()
+            .is_some_and(|pending| Arc::ptr_eq(&pending.inode, &target))
+        {
+            return Ok(());
+        }
+        let replaced = Self::publish_view(&mut state, view)?;
+        drop(state);
+        drop(replaced);
         Ok(())
     }
 }

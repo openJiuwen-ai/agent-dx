@@ -812,7 +812,7 @@ impl DistributedFs {
         // A local writer starts write activity: open readers move to the view
         // its writes build on, so they never mix an older pinned version with
         // this Node's new data (kernel page cache included).
-        self.handles.advance_to_local_view(&inode)?;
+        self.advance_to_local_view(&inode)?;
         Ok(session)
     }
 

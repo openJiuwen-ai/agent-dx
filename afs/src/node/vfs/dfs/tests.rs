@@ -1813,6 +1813,7 @@ mod remote_provider;
 mod s3;
 mod unified;
 mod version_cache;
+mod view_references;
 mod write_pipeline_ops;
 mod write_semantics;
 mod write_state;

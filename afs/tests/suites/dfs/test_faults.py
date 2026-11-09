@@ -195,4 +195,7 @@ CASES = (
     _case("scrub_restores_bad_replica", ("LF22",), scrub),
     _case("meta_backend_redis", ("LF23",), meta_backend("redis")),
     _case("meta_backend_etcd", ("LF24",), meta_backend("etcd")),
+    # R94: a reader held across this Node's commit and another Node's keeps the version it moved to under GC.
+    _case("local_commit_reader_under_gc", ("LF25",), scenario(
+        "local-commit-reader", "phase-local-commit-reader.sh", env={"COPIES_R2": "1"})),
 )

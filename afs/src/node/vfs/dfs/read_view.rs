@@ -515,7 +515,11 @@ impl DistributedFs {
         }
         {
             let state = opened.state.lock().ok()?;
-            if state.write_session.is_some() || state.opened_inode.kind != InodeKind::Regular {
+            // A pending view is published by the regular read route (R94).
+            if state.write_session.is_some()
+                || state.opened_inode.kind != InodeKind::Regular
+                || state.pending_view.is_some()
+            {
                 return None;
             }
             // A stale optimization view must be refreshed in the async route,
@@ -532,6 +536,14 @@ impl DistributedFs {
             version_id: cached.version.as_ref().map(|version| version.id.0.clone()),
             length: cached.layout.file_length,
         })
+    }
+
+    /// The handle snapshot a read starts from. A local view still waiting for
+    /// its GC reference is retried first (R94); without one the read keeps the
+    /// handle's current, protected view.
+    pub(super) fn read_handle_snapshot(&self, handle: FileHandle) -> Result<DfsFileHandleSnapshot> {
+        self.retry_pending_view(handle)?;
+        self.handle_snapshot(handle)
     }
 
     pub(super) fn handle_snapshot(&self, handle: FileHandle) -> Result<DfsFileHandleSnapshot> {

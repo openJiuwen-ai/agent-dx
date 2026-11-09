@@ -129,7 +129,7 @@ impl Backend for DistributedFs {
         handle: Option<FileHandle>,
     ) -> Result<FileAttributes> {
         if let Some(handle) = handle {
-            let snapshot = self.handle_snapshot(handle)?;
+            let snapshot = self.read_handle_snapshot(handle)?;
             // A pinned reader reports the version it reads (decision 4a).
             if snapshot.flags & libc::O_ACCMODE == libc::O_RDONLY
                 && snapshot.write_session.is_none()
@@ -327,7 +327,7 @@ impl Backend for DistributedFs {
                 self.resize_dirty_inode(&snapshot.inode_id, length, options.kill_suidgid)?
             };
             (
-                snapshot.opened_inode.as_ref().clone(),
+                InodeRecord::clone(&snapshot.opened_inode),
                 Some((handle, accepted_seq)),
             )
         } else {
@@ -628,7 +628,7 @@ impl Backend for DistributedFs {
         offset: u64,
         out: &mut [u8],
     ) -> Result<usize> {
-        let snapshot = self.handle_snapshot(handle)?;
+        let snapshot = self.read_handle_snapshot(handle)?;
         if snapshot.flags & libc::O_ACCMODE == libc::O_WRONLY {
             return Err(bad_file_descriptor("DFS handle was not opened for reading"));
         }
@@ -674,7 +674,7 @@ impl Backend for DistributedFs {
         if self.read_engine.has_external_backend() {
             return self.read_owned(ctx, handle, offset, size).map(Into::into);
         }
-        let snapshot = self.handle_snapshot(handle)?;
+        let snapshot = self.read_handle_snapshot(handle)?;
         if snapshot.flags & libc::O_ACCMODE == libc::O_WRONLY {
             return Err(bad_file_descriptor("DFS handle was not opened for reading"));
         }
@@ -688,7 +688,7 @@ impl Backend for DistributedFs {
         offset: u64,
         size: usize,
     ) -> Result<Vec<u8>> {
-        let snapshot = self.handle_snapshot(handle)?;
+        let snapshot = self.read_handle_snapshot(handle)?;
         if snapshot.flags & libc::O_ACCMODE == libc::O_WRONLY {
             return Err(bad_file_descriptor("DFS handle was not opened for reading"));
         }

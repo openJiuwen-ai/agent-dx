@@ -1192,7 +1192,7 @@ impl RemoteProviderHost for DistributedFs {
             // Writes this Node proxied are visible to its handles (4a): once
             // the last proxy session ends they pin the version it produced.
             let inode = self.validate_inode(self.meta.get_inode(inode_id)?)?;
-            self.handles.advance_to_local_view(&inode)?;
+            self.advance_to_local_view(&inode)?;
         }
         Ok(())
     }

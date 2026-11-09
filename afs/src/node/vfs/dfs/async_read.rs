@@ -109,6 +109,21 @@ impl DistributedFs {
         if !self.read_engine.async_read_enabled() {
             return Ok(None);
         }
+        if self.handle_view_pending(handle)? {
+            // Publishing the pending view needs a Meta admission, which a
+            // runtime worker must not block on (R94).
+            return Ok(Some(Box::pin(async move {
+                let retry = self.clone();
+                crate::node::bridge::spawn_blocking(move || retry.retry_pending_view(handle))
+                    .await
+                    .map_err(|_| unavailable("DFS pending read view retry was cancelled"))??;
+                let snapshot = self.handle_snapshot(handle)?;
+                self.read_replicated_bytes_async(
+                    handle, &snapshot, offset, size, deadline, lifetime,
+                )
+                .await
+            })));
+        }
         let snapshot = self.handle_snapshot(handle)?;
         Ok(Some(Box::pin(async move {
             self.read_replicated_bytes_async(handle, &snapshot, offset, size, deadline, lifetime)
