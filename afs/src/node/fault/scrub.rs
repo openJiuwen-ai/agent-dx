@@ -150,9 +150,10 @@ fn worker_failed(error: tokio::task::JoinError) -> afs_error::Error {
     )
 }
 
-/// Byte pacing: `wait_for(n)` returns how long to wait so that the bytes
-/// accounted so far take at least `bytes / rate` seconds. Idle time is never
-/// banked into a later burst.
+/// Byte pacing: `account(n, started, now)` returns how long to wait at `now`
+/// so that copies started back to back take `bytes / rate` seconds each,
+/// their own verification time included. Idle time is never banked into a
+/// later burst.
 struct Pacer {
     bytes_per_second: u64,
     next: Instant,
@@ -166,9 +167,9 @@ impl Pacer {
         }
     }
 
-    fn account(&mut self, bytes: u64, now: Instant) -> Duration {
+    fn account(&mut self, bytes: u64, started: Instant, now: Instant) -> Duration {
         let cost = Duration::from_secs_f64(bytes as f64 / self.bytes_per_second.max(1) as f64);
-        self.next = self.next.max(now) + cost;
+        self.next = self.next.max(started) + cost;
         self.next.saturating_duration_since(now)
     }
 }
@@ -233,6 +234,7 @@ where
             };
             after = Some(last.chunk_id.clone());
             for item in items {
+                let copy_started = Instant::now();
                 let charged = match verify(item.chunk_id.clone()).await {
                     Ok(ScrubOutcome::Verified(bytes)) => {
                         totals.chunks += 1;
@@ -262,7 +264,7 @@ where
                         item.length
                     }
                 };
-                let delay = pacer.account(charged, Instant::now());
+                let delay = pacer.account(charged, copy_started, Instant::now());
                 if !wait(&mut shutdown, delay).await {
                     return Ok(());
                 }
@@ -443,9 +445,18 @@ mod tests {
     fn pacing_does_not_bank_idle_time() {
         let now = Instant::now();
         let mut pacer = Pacer::new(1 << 20, now);
-        assert_eq!(pacer.account(1 << 20, now), Duration::from_secs(1));
+        assert_eq!(pacer.account(1 << 20, now, now), Duration::from_secs(1));
+        // Verification time counts toward the copy's own cost.
+        let start = now + Duration::from_secs(1);
+        assert_eq!(
+            pacer.account(1 << 20, start, start + Duration::from_millis(100)),
+            Duration::from_millis(900)
+        );
         // Ten idle seconds later the next copy still waits its own cost.
-        let later = now + Duration::from_secs(11);
-        assert_eq!(pacer.account(1 << 19, later), Duration::from_millis(500));
+        let later = now + Duration::from_secs(12);
+        assert_eq!(
+            pacer.account(1 << 19, later, later),
+            Duration::from_millis(500)
+        );
     }
 }
