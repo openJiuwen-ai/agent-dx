@@ -25,7 +25,6 @@ services:
         root: /home/agentos/users
         endpoints:
           - http://127.0.0.1:18889
-        token_file: /etc/agentos/workspace-token
         timeout_seconds: 3
         on_error: fail_open
   - id: ingress

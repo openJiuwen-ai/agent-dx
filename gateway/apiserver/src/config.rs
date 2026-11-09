@@ -50,7 +50,6 @@ pub struct WorkspaceAffinity {
     /// Workspace directory endpoints, tried in order. Empty selects the local node.
     #[serde(default)]
     pub endpoints: Vec<String>,
-    pub token_file: PathBuf,
     #[serde(default = "workspace_affinity_timeout")]
     pub timeout_seconds: u64,
     /// Behavior when ownership lookup fails; defaults to `fail_open`.
@@ -150,8 +149,8 @@ impl Config {
             if !affinity.root.is_absolute() || affinity.root.as_os_str() == "/" {
                 return Err("Workspace affinity root must be a concrete absolute directory".into());
             }
-            if affinity.token_file.as_os_str().is_empty() || affinity.timeout_seconds == 0 {
-                return Err("Workspace affinity token file and positive timeout required".into());
+            if affinity.timeout_seconds == 0 {
+                return Err("Workspace affinity requires a positive timeout".into());
             }
             for endpoint in &affinity.endpoints {
                 let url = url::Url::parse(endpoint)?;

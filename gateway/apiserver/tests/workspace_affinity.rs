@@ -3,10 +3,7 @@ use adx_apiserver::{
     workspace_affinity::{derive_owner, enforce_node, WorkspaceAffinityResolver},
 };
 use adx_protocol::control as pb;
-use std::{
-    io::{Read, Write},
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::io::{Read, Write};
 use tonic::Code;
 
 const ROOT: &str = "/home/agentos/users";
@@ -339,22 +336,6 @@ fn explicit_node_constraints_must_admit_the_owner_node() {
     }
 }
 
-static TOKEN_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-fn token_path(label: &str) -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "adx-workspace-affinity-{label}-{}-{}.token",
-        std::process::id(),
-        TOKEN_COUNTER.fetch_add(1, Ordering::SeqCst)
-    ))
-}
-
-fn token_file() -> String {
-    let path = token_path("ready");
-    std::fs::write(&path, "test-token\n").unwrap();
-    path.to_string_lossy().into_owned()
-}
-
 fn resolver(endpoints: Vec<String>) -> WorkspaceAffinityResolver {
     resolver_with(WorkspaceAffinityErrorPolicy::FailClosed, endpoints)
 }
@@ -367,7 +348,6 @@ fn resolver_with(
     WorkspaceAffinityResolver::new(WorkspaceAffinity {
         root: ROOT.into(),
         endpoints,
-        token_file: token_file().into(),
         timeout_seconds: 2,
         on_error,
     })
@@ -582,51 +562,4 @@ async fn fail_closed_never_downgrades() {
     let resolver = resolver(vec![unreachable()]);
     let error = resolver.node_id("alice").await.unwrap_err();
     assert!(!resolver.may_fall_back(&error));
-}
-
-#[tokio::test]
-async fn an_unreadable_token_keeps_the_resolver_unavailable() {
-    adx_transport::install_crypto_provider();
-    let path = token_path("missing");
-    let _ = std::fs::remove_file(&path);
-    for on_error in [
-        WorkspaceAffinityErrorPolicy::FailClosed,
-        WorkspaceAffinityErrorPolicy::FailOpen,
-    ] {
-        let resolver = WorkspaceAffinityResolver::new(WorkspaceAffinity {
-            root: ROOT.into(),
-            endpoints: vec![unreachable()],
-            token_file: path.clone(),
-            timeout_seconds: 2,
-            on_error,
-        });
-        assert!(resolver.init_error().is_some());
-        let error = resolver.node_id("alice").await.unwrap_err();
-        assert_eq!(error.code(), Code::Unavailable);
-        assert_eq!(
-            resolver.may_fall_back(&error),
-            on_error == WorkspaceAffinityErrorPolicy::FailOpen,
-            "the configured policy must still decide the outcome"
-        );
-    }
-}
-
-#[tokio::test]
-async fn an_empty_token_file_is_unavailable() {
-    adx_transport::install_crypto_provider();
-    let path = token_path("empty");
-    std::fs::write(&path, " \n").unwrap();
-    let resolver = WorkspaceAffinityResolver::new(WorkspaceAffinity {
-        root: ROOT.into(),
-        endpoints: vec![unreachable()],
-        token_file: path,
-        timeout_seconds: 2,
-        on_error: WorkspaceAffinityErrorPolicy::FailClosed,
-    });
-    assert!(resolver.init_error().is_some());
-    assert_eq!(
-        resolver.node_id("alice").await.unwrap_err().code(),
-        Code::Unavailable
-    );
-    assert_eq!(resolver.root(), std::path::Path::new(ROOT));
 }

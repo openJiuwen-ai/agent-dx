@@ -243,38 +243,18 @@ struct Record {
 pub struct WorkspaceAffinityResolver {
     config: WorkspaceAffinity,
     http: Option<reqwest::Client>,
-    token: String,
     init_error: Option<String>,
 }
 
 impl WorkspaceAffinityResolver {
-    /// Build a resolver even when the token cannot be read. The failure is
-    /// reported per request so `fail_closed` keeps its guarantee and
+    /// Build a resolver even when the HTTP client cannot be created. The
+    /// failure is reported per request so `fail_closed` keeps its guarantee and
     /// `fail_open` records a fallback instead of silently disabling affinity.
     pub fn new(mut config: WorkspaceAffinity) -> Self {
         if config.endpoints.is_empty() {
             config.endpoints.push("http://127.0.0.1:18889".into());
         }
         let mut init_error = None;
-        let token = match std::fs::read_to_string(&config.token_file) {
-            Ok(token) => {
-                let token = token.trim().to_owned();
-                if token.is_empty() {
-                    init_error = Some(format!(
-                        "Workspace directory token file {} is empty",
-                        config.token_file.display()
-                    ));
-                }
-                token
-            }
-            Err(error) => {
-                init_error = Some(format!(
-                    "cannot read Workspace directory token file {}: {error}",
-                    config.token_file.display()
-                ));
-                String::new()
-            }
-        };
         let http = match reqwest::Client::builder()
             .timeout(Duration::from_secs(config.timeout_seconds))
             .build()
@@ -288,7 +268,6 @@ impl WorkspaceAffinityResolver {
         Self {
             config,
             http,
-            token,
             init_error,
         }
     }
@@ -344,7 +323,6 @@ impl WorkspaceAffinityResolver {
         }
         let response = http
             .get(url)
-            .bearer_auth(&self.token)
             .send()
             .await
             .map_err(|_| (Status::unavailable("Workspace directory unavailable"), true))?;

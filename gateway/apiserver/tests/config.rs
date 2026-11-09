@@ -91,7 +91,6 @@ fn affinity() -> Value {
     json!({
         "root":"/home/agentos/users",
         "endpoints":["http://127.0.0.1:18889","http://10.0.0.2:18889"],
-        "token_file":"/etc/adx/workspace/token",
         "timeout_seconds":3
     })
 }
@@ -111,7 +110,6 @@ fn workspace_affinity_is_optional_and_validated() {
     for (field, invalid) in [
         ("root", json!("relative/users")),
         ("root", json!("/")),
-        ("token_file", json!("")),
         ("timeout_seconds", json!(0)),
         ("endpoints", json!(["ftp://127.0.0.1:18889"])),
         ("endpoints", json!(["http://user:pass@127.0.0.1:18889"])),
