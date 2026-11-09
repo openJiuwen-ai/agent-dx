@@ -1,4 +1,5 @@
-//! Jiuwenbox process and Conch adapters. The external backends are unmodified.
+//! Jiuwenbox process and Conch adapters.
+mod cgroups;
 mod client;
 pub mod host;
 pub mod policy;
@@ -173,6 +174,15 @@ impl Config {
                     )));
                 }
             }
+            if name == "supervisor" {
+                if let Some(mode) = class.policy.get("cgroup").and_then(|c| c.get("backend")) {
+                    if !matches!(mode.as_str(), Some("auto" | "v1" | "v2")) {
+                        return Err(Error::Invalid(
+                            "supervisor cgroup.backend must be auto, v1 or v2".into(),
+                        ));
+                    }
+                }
+            }
             if name == "conch" && self.conch_socket.as_ref().is_none_or(|p| !absolute(p)) {
                 return Err(Error::Invalid("Conch recovery socket is required".into()));
             }
@@ -209,6 +219,11 @@ impl Config {
 
 impl Jiuwenbox {
     pub async fn connect(config: Config, launch: LaunchConfig) -> Result<Self> {
+        config.validate()?;
+        if let Some(class) = config.classes.get("supervisor") {
+            let mode = class.policy["cgroup"]["backend"].as_str().unwrap_or("auto");
+            cgroups::SupervisorCgroups::new("/sys/fs/cgroup").validate_mode(mode)?;
+        }
         let driver = Self::with_host(config, launch, Arc::new(LinuxHost)).await?;
         driver.prepare_bootstrap().await?;
         Ok(driver)
@@ -725,12 +740,15 @@ impl Jiuwenbox {
             .request(Method::POST, "/api/v1/sandboxes", Some(body), true)
             .await?;
         if response["phase"] == "error" {
-            // Jiuwenbox reports daemon startup failures in a successful HTTP
-            // response. Preserve that terminal rejection instead of rescheduling
-            // it until the queue deadline. Backend output can contain secrets.
+            // Jiuwenbox reports startup failures in a successful HTTP response.
+            // Its error_message is the caller-facing explanation, not daemon output.
+            let message = response["error_message"]
+                .as_str()
+                .filter(|message| !message.trim().is_empty())
+                .unwrap_or("Jiuwenbox backend create reported error");
             return Err(Error::BackendFailure {
                 code: adx_core::BackendFailureCode::FailedPrecondition,
-                message: "Jiuwenbox backend create reported error".into(),
+                message: message.into(),
             });
         }
         if response["phase"] != "ready" {
@@ -787,14 +805,14 @@ impl Jiuwenbox {
         lock: tokio::sync::OwnedMutexGuard<()>,
     ) -> tokio::task::JoinHandle<Result<()>> {
         let driver = self.clone();
-        tokio::spawn(async move {
+        tokio::spawn(adx_observability::trace::with_current_context(async move {
             let _lock = lock;
             let result = driver.cleanup(&id).await;
             if let Err(error) = &result {
                 adx_observability::warn!(runtime_id=%id, %error, "Jiuwenbox execution cleanup pending");
             }
             result
-        })
+        }))
     }
 
     async fn running_conch(&self) -> Result<BTreeSet<String>> {
@@ -923,6 +941,9 @@ fn sandbox_id(id: &str) -> String {
 
 #[async_trait]
 impl RuntimeDriver for Jiuwenbox {
+    async fn sandbox_id(&self, runtime_id: &str) -> Option<String> {
+        Some(sandbox_id(runtime_id))
+    }
     async fn start(
         &self,
         spec: &EnvironmentSpec,
@@ -992,12 +1013,14 @@ impl RuntimeDriver for Jiuwenbox {
         let owned_spec = spec.clone();
         let owned_id = id.to_owned();
         let owned_devices = devices.to_vec();
-        let task = tokio::spawn(async move {
+        // Keep the sandbox.create context on the start task so failure cleanup
+        // logs emitted by start_owned stay correlated.
+        let task = tokio::spawn(adx_observability::trace::with_current_context(async move {
             let _lock = lock;
             driver
                 .start_owned(owned_spec, owned_id, generation, owned_devices, deadline)
                 .await
-        });
+        }));
         match tokio::time::timeout_at(deadline, task).await {
             Ok(result) => result.map_err(unavailable)?,
             Err(_) => {

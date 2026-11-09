@@ -17,6 +17,15 @@ BINARIES = (
     "adx-ingress",
     "adx-relay",
 )
+SANDBOXD_BINARIES = ("sandboxd", "sbox", "runc", "runc-shim", "sandbox-logger", "redis-cli")
+SANDBOXD_DEPLOYMENT_FILES = (
+    "sandboxd.service",
+    "sandboxd.toml",
+    "oss.json",
+    "registry.json",
+    "oss_auths.json",
+    "registry_auths.json",
+)
 AFS_BINARIES = ("afs-meta", "afs-node")
 AFS_REQUIRED_FILES = {
     "etc/examples/afs/meta.toml",
@@ -61,6 +70,20 @@ def verify(directory: Path, *, enforce_host_architecture: bool = False) -> dict:
     target = manifest.get("target", "")
     if manifest.get("profile") == "release" and "linux" in target:
         required.add("runtime/adx-runtime-rootfs.img")
+    with_sandboxd = manifest.get("with_sandboxd", False)
+    if not isinstance(with_sandboxd, bool):
+        raise ValueError("with_sandboxd must be a boolean")
+    backend_prefix = "runtime/sandboxd/"
+    backend_files = {backend_prefix + name for name in (*SANDBOXD_BINARIES, "manifest.json")}
+    backend_files.update(
+        f"etc/examples/sandboxd/{name}" for name in SANDBOXD_DEPLOYMENT_FILES
+    )
+    backend_files.update({"lib/sandboxd_preflight.py", "runtime/sandboxd/runsc"})
+    if with_sandboxd:
+        required.update(backend_files)
+        required.add("third_party/sandboxd/source.json")
+    elif expected & backend_files:
+        raise ValueError("sandboxd artifacts are present without with_sandboxd")
     envd_artifacts = expected & ENVD_PROVENANCE_FILES
     if envd_artifacts and envd_artifacts != ENVD_PROVENANCE_FILES:
         raise ValueError("incomplete envd provenance")
@@ -89,6 +112,20 @@ def verify(directory: Path, *, enforce_host_architecture: bool = False) -> dict:
         relative = Path(name)
         if relative.is_absolute() or ".." in relative.parts or sha256(root / relative) != digest:
             raise ValueError(f"package integrity check failed: {name}")
+
+    if with_sandboxd:
+        backend = json.loads((root / backend_prefix / "manifest.json").read_text())
+        pin = json.loads((root / "third_party/sandboxd/source.json").read_text())
+        machine = {"x86_64-unknown-linux-gnu": 62, "aarch64-unknown-linux-gnu": 183}.get(target)
+        if machine is None or backend["target"] != target or backend["sandboxd_revision"] != pin["revision"]:
+            raise ValueError("sandboxd revision or target mismatch")
+        if backend["files"] != {name: files[backend_prefix + name] for name in SANDBOXD_BINARIES}:
+            raise ValueError("sandboxd file hashes differ from backend manifest")
+        for name in (*SANDBOXD_BINARIES, "runsc"):
+            with (root / backend_prefix / name).open("rb") as binary:
+                header = binary.read(20)
+            if header[:6] != b"\x7fELF\x02\x01" or int.from_bytes(header[18:20], "little") != machine:
+                raise ValueError(f"sandboxd executable architecture mismatch: {name}")
 
     commit = manifest.get("commit", "")
     if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):

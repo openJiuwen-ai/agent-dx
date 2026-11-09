@@ -2,6 +2,14 @@
 //! and final deletion update their Volume protections in the same transaction.
 use super::*;
 use adx_core::snapshots::{Reference, Snapshot, SnapshotState};
+
+struct SourceFence<'a> {
+    environment_field: &'a str,
+    environment_value: &'a str,
+    node_session_field: &'a str,
+    node_session_id: &'a str,
+}
+
 impl Session {
     pub(super) fn snapshots_key(&self) -> String {
         format!("{}:snapshots", self.store.key)
@@ -13,23 +21,15 @@ impl Session {
         command.arg(self.snapshots_key()).arg(id);
         self.store.query(command).await
     }
-    async fn snapshot_cas(
-        &self,
-        id: &str,
-        old: Option<&str>,
-        next: &Snapshot,
-        catalog: Option<&volumes::Catalog>,
-    ) -> Result<bool> {
-        self.snapshot_cas_with_source(id, old, next, catalog, None)
-            .await
+    async fn snapshot_cas(&self, id: &str, old: Option<&str>, next: &mut Snapshot) -> Result<bool> {
+        self.snapshot_cas_with_source(id, old, next, None).await
     }
     async fn snapshot_cas_with_source(
         &self,
         id: &str,
         old: Option<&str>,
-        next: &Snapshot,
-        catalog: Option<&volumes::Catalog>,
-        source: Option<(&str, &str)>,
+        next: &mut Snapshot,
+        source: Option<SourceFence<'_>>,
     ) -> Result<bool> {
         next.validate()?;
         let _access = if next.state == SnapshotState::Ready {
@@ -40,19 +40,33 @@ impl Session {
         } else {
             None
         };
-        let header_value = match catalog {
-            Some(catalog) => Some(catalog.header_value.clone()),
-            None => self.store.fields([HEADER.into()]).await?[0].clone(),
-        };
-        let mut current_header = self.header(&header_value)?;
-        let header = if let Some(catalog) = catalog {
-            Some(catalog.advanced_header()?)
-        } else if next.state == SnapshotState::Ready {
-            current_header.advance()?;
-            Some(current_header)
+        // Serialize committed inventory updates, including recovery after a
+        // cancelled or ambiguous write. Do not expose a speculative cache value.
+        let mut inventory = self.inspection.lock().await;
+        // Volume writes must be derived from the same fresh catalog as their
+        // compared header. Replacing only the header of a queued catalog could
+        // overwrite snapshot holds committed by an earlier writer.
+        let catalog = if volumes::has_volumes(&next.template)
+            && (old.is_none() || next.state == SnapshotState::Deleted)
+        {
+            let mut catalog = self.volume_catalog().await?;
+            if old.is_none() {
+                catalog.protect_snapshot(next)?;
+            } else {
+                catalog.release_snapshot(next)?;
+            }
+            Some(catalog)
         } else {
             None
         };
+        // No-volume snapshots have only object/source/session predicates.
+        // Artifact locks fence deletion; only Volume catalog writes require the
+        // global header CAS. Keep the inspection latch for ordered cache updates
+        // and invalidation after ambiguous/cancelled writes.
+        let header = catalog
+            .as_ref()
+            .map(|catalog| catalog.advanced_header())
+            .transpose()?;
         let mut command = redis::cmd("EVAL");
         command
             .arg(
@@ -60,14 +74,15 @@ impl Session {
             if redis.call('HGET', KEYS[1], 'epoch') ~= ARGV[1] then return 0 end
             if ARGV[6] ~= '' and redis.call('HGET',KEYS[1],'header') ~= ARGV[6] then return 0 end
             if ARGV[7] ~= '' and redis.call('HGET',KEYS[1],ARGV[7]) ~= ARGV[8] then return 0 end
+            if ARGV[9] ~= '' and redis.call('HGET',KEYS[1],ARGV[9]) ~= ARGV[10] then return 0 end
             local old = redis.call('HGET', KEYS[2], ARGV[2])
             if ARGV[3] == '' then
                 if old then return 0 end
             elseif old ~= ARGV[3] then return 0 end
             redis.call('HSET', KEYS[2], ARGV[2], ARGV[4])
             if ARGV[5] ~= '' then redis.call('HSET', KEYS[1], 'header', ARGV[5]) end
-            local cursor = 10
-            for _ = 1, tonumber(ARGV[9]) do
+            local cursor = 12
+            for _ = 1, tonumber(ARGV[11]) do
                 local key = ARGV[cursor]
                 local value = ARGV[cursor + 1]
                 if value == '' then redis.call('HDEL', KEYS[3], key)
@@ -86,16 +101,21 @@ impl Session {
             .arg(old.unwrap_or(""))
             .arg(encode(next)?)
             .arg(header.as_ref().map(encode).transpose()?.unwrap_or_default())
-            .arg(header_value.as_deref().unwrap_or(""));
+            .arg(
+                catalog
+                    .as_ref()
+                    .map_or("", |catalog| catalog.header_value.as_str()),
+            );
         command
-            .arg(source.map_or("", |(field, _)| field))
-            .arg(source.map_or("", |(_, value)| value));
-        if let Some(catalog) = catalog {
+            .arg(source.as_ref().map_or("", |f| f.environment_field))
+            .arg(source.as_ref().map_or("", |f| f.environment_value))
+            .arg(source.as_ref().map_or("", |f| f.node_session_field))
+            .arg(source.as_ref().map_or("", |f| f.node_session_id));
+        if let Some(catalog) = catalog.as_ref() {
             catalog.append_writes(&mut command)?;
         } else {
             command.arg(0);
         }
-        let mut inventory = self.inspection.lock().await;
         let mut committed = inventory.take();
         match self.store.query::<u64>(command).await {
             Ok(1) => {
@@ -131,15 +151,16 @@ impl Session {
         &self,
         record: Snapshot,
         assignment: &Assignment,
+        node_session_id: &str,
     ) -> Result<Snapshot> {
-        self.publish_snapshot_checked(record, Some(assignment))
+        self.publish_snapshot_checked(record, Some((assignment, node_session_id)))
             .await
     }
 
     async fn publish_snapshot_checked(
         &self,
         record: Snapshot,
-        assignment: Option<&Assignment>,
+        publisher: Option<(&Assignment, &str)>,
     ) -> Result<Snapshot> {
         record.validate()?;
         if record.state != SnapshotState::Ready
@@ -150,7 +171,16 @@ impl Session {
                 "new snapshot must be ready and unreferenced".into(),
             ));
         }
+        let node_session_field = format!("node-session:{}", record.source_node_id);
         for _ in 0..ATTEMPTS {
+            if let Some((assignment, session_id)) = publisher {
+                let [current_session] = self.store.fields([node_session_field.clone()]).await?;
+                if assignment.node_id != record.source_node_id
+                    || current_session.as_deref() != Some(session_id)
+                {
+                    return Err(Error::Conflict);
+                }
+            }
             if let Some(raw) = self.snapshot_raw(&record.id).await? {
                 let old: Snapshot = decode(&raw)?;
                 old.validate()?;
@@ -161,7 +191,7 @@ impl Session {
                 };
             }
             let source_field = format!("environment:{}", record.template.id);
-            let source = if let Some(assignment) = assignment {
+            let source = if let Some((assignment, _)) = publisher {
                 let [raw] = self.store.fields([source_field.clone()]).await?;
                 let raw = raw.ok_or(Error::Conflict)?;
                 let stored: StoredEnvironment = decode(&raw)?;
@@ -181,20 +211,17 @@ impl Session {
                 None
             };
             let mut next = record.clone();
-            let catalog = if volumes::has_volumes(&next.template) {
-                let mut catalog = self.volume_catalog().await?;
-                catalog.protect_snapshot(&mut next)?;
-                Some(catalog)
-            } else {
-                None
-            };
             if self
                 .snapshot_cas_with_source(
                     &record.id,
                     None,
-                    &next,
-                    catalog.as_ref(),
-                    source.as_deref().map(|raw| (source_field.as_str(), raw)),
+                    &mut next,
+                    source.as_deref().map(|raw| SourceFence {
+                        environment_field: source_field.as_str(),
+                        environment_value: raw,
+                        node_session_field: node_session_field.as_str(),
+                        node_session_id: publisher.map_or("", |(_, id)| id),
+                    }),
                 )
                 .await?
             {
@@ -230,6 +257,21 @@ impl Session {
     ) -> Result<Vec<Snapshot>> {
         let [header_value] = self.store.fields([HEADER.into()]).await?;
         self.header(&header_value)?;
+        // The active Coordinator maintains this committed view under the same
+        // latch as snapshot CAS. Filter before cloning so Deleted history is
+        // neither transferred from Redis nor copied for each catalog query.
+        // Standalone storage sessions without an initialized view retain their
+        // authoritative durable read, including validation of stored records.
+        if let Some(inventory) = self.inspection.lock().await.as_ref() {
+            let mut result: Vec<_> = inventory
+                .snapshots
+                .values()
+                .filter(|snapshot| include(snapshot))
+                .cloned()
+                .collect();
+            result.sort_by(|a, b| a.id.cmp(&b.id));
+            return Ok(result);
+        }
         let mut command = redis::cmd("HVALS");
         command.arg(self.snapshots_key());
         let raw: Vec<String> = self.store.query(command).await?;
@@ -258,18 +300,7 @@ impl Session {
             if next.revision == revision {
                 return Ok(next);
             }
-            let catalog =
-                if next.state == SnapshotState::Deleted && volumes::has_volumes(&next.template) {
-                    let mut catalog = self.volume_catalog().await?;
-                    catalog.release_snapshot(&next)?;
-                    Some(catalog)
-                } else {
-                    None
-                };
-            if self
-                .snapshot_cas(id, Some(&raw), &next, catalog.as_ref())
-                .await?
-            {
+            if self.snapshot_cas(id, Some(&raw), &mut next).await? {
                 return Ok(next);
             }
         }
@@ -286,6 +317,71 @@ impl Session {
     }
     pub async fn release_snapshot(&self, id: &str, reference: Reference) -> Result<Snapshot> {
         self.mutate_snapshot(id, |s| s.release(&reference)).await
+    }
+    /// Release a consumed input only while its exact durable owner is unchanged.
+    /// Maintenance can therefore wait for storage without the scheduler mutex.
+    pub(crate) async fn release_consumed_snapshot(
+        &self,
+        id: &str,
+        expected: &StoredEnvironment,
+    ) -> Result<bool> {
+        let field = format!("environment:{}", expected.spec.id);
+        for _ in 0..ATTEMPTS {
+            let [owner] = self.store.fields([field.clone()]).await?;
+            let Some(owner) = owner else { return Ok(false) };
+            let current: StoredEnvironment = decode(&owner)?;
+            current.validate()?;
+            if current != *expected {
+                return Ok(false);
+            }
+            let Some(raw) = self.snapshot_raw(id).await? else {
+                return Ok(false);
+            };
+            let mut next: Snapshot = decode(&raw)?;
+            next.validate()?;
+            if expected.spec.snapshot_id.as_deref() != Some(id)
+                || !expected.result.as_ref().is_some_and(|record| {
+                    !record.execution_artifacts.contains(&next.artifact)
+                        && record
+                            .snapshot_source
+                            .as_ref()
+                            .is_none_or(|p| p.artifact != next.artifact)
+                        && (record
+                            .checkpoint
+                            .as_ref()
+                            .is_some_and(|p| p.artifact != next.artifact)
+                            || record.state == EnvironmentState::Deleted)
+                })
+            {
+                return Ok(false);
+            }
+            let revision = next.revision;
+            next.release(&Reference::Restore {
+                environment_id: expected.spec.id.clone(),
+            })?;
+            if next.revision == revision {
+                return Ok(true);
+            }
+            if self
+                .snapshot_cas_with_source(
+                    id,
+                    Some(&raw),
+                    &mut next,
+                    Some(SourceFence {
+                        environment_field: &field,
+                        environment_value: &owner,
+                        node_session_field: "",
+                        node_session_id: "",
+                    }),
+                )
+                .await?
+            {
+                return Ok(true);
+            }
+        }
+        Err(Error::Unavailable(
+            "consumed snapshot owner changed; retry maintenance".into(),
+        ))
     }
     pub async fn delete_snapshot(&self, id: &str, tenant: &str) -> Result<Snapshot> {
         self.mutate_snapshot(id, |s| s.delete(tenant)).await

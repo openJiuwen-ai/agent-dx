@@ -140,6 +140,50 @@ def _validate_command_id(command_id: str) -> str:
     return command_id
 
 
+def _incomplete_terminal_result(snapshot: dict) -> bool:
+    if str(snapshot.get("status", "")).upper() not in ("SUCCEEDED", "FAILED"):
+        return False
+    return (
+        snapshot.get("exit_code") is None
+        and not snapshot.get("error_code")
+        and snapshot.get("exit_signal") is None
+    )
+
+
+def _raise_observation_error(
+    snapshot: dict, environment_id: str, command_id: str = "", request_id: Optional[str] = None
+) -> None:
+    if snapshot.get("error_code") == "COMMAND_STATE_UNAVAILABLE":
+        raise EnvironmentError(
+            str(snapshot.get("error") or snapshot.get("error_message") or "command state is unavailable"),
+            code="COMMAND_STATE_UNAVAILABLE",
+            retry="same_operation",
+            outcome="unknown",
+            operation_id=command_id or str(snapshot.get("operation_id") or snapshot.get("command_id") or ""),
+            environment_id=environment_id,
+            request_id=getattr(snapshot, "request_id", None) or request_id,
+        )
+
+
+def _invoke_command(
+    client: EnvironmentClient, environment_id: str, action: str, args: dict, **kwargs
+) -> dict:
+    try:
+        return client.invoke(environment_id, action, args, **kwargs)
+    except EnvironmentHTTPError as error:
+        if error.payload.get("error_code") == "COMMAND_STATE_UNAVAILABLE":
+            # Execd returns flat action errors on non-2xx responses. Preserve
+            # the original HTTP exception, payload and request identity while
+            # exposing the same semantics as a successful HTTP error body.
+            error.code = "COMMAND_STATE_UNAVAILABLE"
+            error.retry = "same_operation"
+            error.outcome = "unknown"
+            operation_id = args.get("command_id") or error.payload.get("operation_id")
+            error.operation_id = str(operation_id or error.payload.get("command_id") or "")
+            error.environment_id = environment_id
+        raise
+
+
 def _result(snapshot: dict) -> CommandResult:
     raw_status = snapshot.get("status")
     if raw_status is None:
@@ -246,9 +290,9 @@ class CommandHandle:
     def _snapshot(self) -> CommandInfo:
         return _info(self._raw_snapshot())
 
-    def _raw_snapshot(self) -> dict:
+    def _fetch_snapshot(self) -> dict:
         try:
-            snapshot = self._client.invoke(self._sid, "process.get", {"command_id": self.command_id})
+            snapshot = _invoke_command(self._client, self._sid, "process.get", {"command_id": self.command_id})
         except EnvironmentHTTPError as error:
             if error.status_code == 404:
                 raise CommandNotFound(
@@ -267,6 +311,30 @@ class CommandHandle:
                 command_id=self.command_id,
                 request_id=getattr(snapshot, "request_id", None),
             )
+        return snapshot
+
+    def _checked_snapshot(self, snapshot: dict) -> dict:
+        _raise_observation_error(snapshot, self._sid, self.command_id)
+        if _incomplete_terminal_result(snapshot):
+            # Older Execd can observe completion between copying the exit code
+            # and serializing status. Read the same stable command once more;
+            # never infer exit zero or submit the command again.
+            snapshot = self._fetch_snapshot()
+            _raise_observation_error(snapshot, self._sid, self.command_id)
+            if _incomplete_terminal_result(snapshot):
+                raise EnvironmentError(
+                    f"command {self.command_id} has a terminal status without an exit code after reread",
+                    code="COMMAND_RESULT_INCONSISTENT",
+                    retry="never",
+                    outcome="unknown",
+                    operation_id=self.command_id,
+                    environment_id=self._sid,
+                    request_id=getattr(snapshot, "request_id", None),
+                )
+        return snapshot
+
+    def _raw_snapshot(self) -> dict:
+        snapshot = self._checked_snapshot(self._fetch_snapshot())
         info = _info(snapshot)
         if info.pid:
             self.pid = info.pid
@@ -285,7 +353,8 @@ class CommandHandle:
                 connection = getattr(self._client, "_connection", None)
                 if connection is None:
                     try:
-                        snapshot = self._client.invoke(
+                        snapshot = _invoke_command(
+                            self._client,
                             self._sid,
                             "process.wait",
                             {"command_id": self.command_id, "timeout": timeout},
@@ -305,6 +374,7 @@ class CommandHandle:
                     snapshot = self._raw_snapshot()
                 if snapshot.get("error_code") == "WAIT_TIMEOUT":
                     return _wait_timeout_result(snapshot)
+                snapshot = self._checked_snapshot(snapshot)
             return _result(snapshot)
         finally:
             observe_wait(time.monotonic() - started)
@@ -364,17 +434,9 @@ class Commands:
     def _require_recovery_capability(self, command_id: str = "") -> None:
         if self._capabilities_checked:
             return
-        try:
-            response = self._client.invoke(self._sid, "process.capabilities", {})
-        except Exception as error:
-            if isinstance(error, EnvironmentError) and error.code == "ENVIRONMENT_OOM" and error.outcome == "terminal":
-                raise
-            raise UnsupportedFeature(
-                "environment runtime does not expose the recoverable command capability",
-                environment_id=self._sid,
-                command_id=command_id,
-                request_id=getattr(error, "request_id", None),
-            ) from error
+        # A failed query says nothing about runtime support. Keep the original
+        # transport/domain error and its retry, outcome and request metadata.
+        response = self._client.invoke(self._sid, "process.capabilities", {})
         capabilities = set(response.get("capabilities", ()))
         required = {"stable-command-id", "recoverable-command-result", "multiplexed-command-watch"}
         if response.get("protocol_version") != 1 or not required.issubset(capabilities):
@@ -451,7 +513,11 @@ class Commands:
                     ) from error
                 raise RuntimeError(str(error.payload.get("error", error))) from error
             except Exception as error:
-                if isinstance(error, EnvironmentError) and error.code == "ENVIRONMENT_OOM" and error.outcome == "terminal":
+                if (
+                    isinstance(error, EnvironmentError)
+                    and error.code in {"ENVIRONMENT_OOM", "ENVIRONMENT_FAILED"}
+                    and error.outcome == "terminal"
+                ):
                     raise
                 raise CommandSubmissionError(
                     f"command submission outcome is unknown: {error}",
@@ -489,12 +555,14 @@ class Commands:
         timeout = 60 if timeout is None else timeout
         if timeout > _POLL_THRESHOLD:
             return self._run_with_poll(cmd, envs, effective_cwd, timeout)
-        response = self._client.invoke(
+        response = _invoke_command(
+            self._client,
             self._sid,
             "process.exec",
             {"cmd": cmd, "envs": envs, "cwd": effective_cwd, "timeout": timeout},
             timeout=timeout,
         )
+        _raise_observation_error(response, self._sid)
         return _result(response)
 
     def _run_with_poll(
@@ -569,9 +637,14 @@ class Commands:
         return handle
 
     def list(self) -> List[CommandInfo]:
-        processes = self._client.invoke(self._sid, "process.list", {}).get("processes")
+        response = _invoke_command(self._client, self._sid, "process.list", {})
+        _raise_observation_error(response, self._sid)
+        processes = response.get("processes")
         if not isinstance(processes, list):
             return []
+        for item in processes:
+            if isinstance(item, dict):
+                _raise_observation_error(item, self._sid, request_id=getattr(response, "request_id", None))
         return [_info(item) for item in processes if isinstance(item, dict)]
 
     def kill(self, command: Union[str, int]) -> bool:

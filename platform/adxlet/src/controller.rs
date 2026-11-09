@@ -486,6 +486,7 @@ fn spawn_controller(
         timer_sequence: 0,
         next_run_timeout: None,
         capture_preparation: None,
+        snapshot_publication: None,
         intent_retry: None,
         recovery_files: None,
         execution_files: vec![],
@@ -618,15 +619,18 @@ fn spawn_controller(
                 trace.attribute("environment.id", controller.record.spec.id.clone());
             }
             let reconciliation = matches!(&command, Command::CheckAuthority(_, _));
+            let environment_id = controller.record.spec.id.clone();
+            let retry_count = controller.record.restart_attempts.to_string();
             // Keep the large command future out of the actor's tracing wrappers.
             // Commands still execute serially within this task.
             let dispatch = Box::pin(controller.dispatch(command, reply));
             if let Some(trace) = trace {
                 let work = trace.scope(|| {
                     adx_observability::trace::with_current_context(async {
-                        adx_observability::trace::Trace::child("environment.execute")
-                            .run(dispatch)
-                            .await;
+                        let execute = adx_observability::trace::Trace::child("environment.execute");
+                        execute.attribute("environment.id", environment_id.clone());
+                        execute.attribute("restart.count", retry_count.clone());
+                        execute.run(dispatch).await;
                     })
                 });
                 if reconciliation {
@@ -819,8 +823,6 @@ impl Controller {
         };
         if matches!(&command, Command::Delete) {
             self.operation_intent(adx_core::observation::OperationIntent::User);
-        } else if matches!(&command, Command::CollectFailed(_)) {
-            self.operation_intent(adx_core::observation::OperationIntent::Policy);
         }
         let result = match command {
             Command::RunControl(_)
@@ -899,6 +901,8 @@ impl Controller {
                 {
                     Err(Error::Conflict)
                 } else {
+                    // Rejected GC must not mutate a published record at the same revision.
+                    self.operation_intent(adx_core::observation::OperationIntent::Policy);
                     self.delete().await
                 }
             }
@@ -907,18 +911,23 @@ impl Controller {
         };
         if let Err(error) = &result {
             adx_observability::trace::error();
-            eprintln!(
-                "{}",
-                serde_json::json!({
-                    "event": "environment operation failed",
-                    "unix_seconds": crate::checkpoint::now().ok(),
-                    "environment_id": self.record.spec.id,
-                    "runtime_id": self.record.runtime.id,
-                    "revision": self.record.revision,
-                    "operation": operation,
-                    "error": error.to_string(),
-                })
-            );
+            // Direct stderr writes bypass the shared tracing writer; carry the
+            // active span identifiers explicitly so the failure stays linkable.
+            let (trace_id, span_id) = adx_observability::trace::log_context();
+            let mut event = serde_json::json!({
+                "event": "environment operation failed",
+                "unix_seconds": crate::checkpoint::now().ok(),
+                "environment_id": self.record.spec.id,
+                "runtime_id": self.record.runtime.id,
+                "revision": self.record.revision,
+                "operation": operation,
+                "error": error.to_string(),
+            });
+            if !trace_id.is_empty() {
+                event["trace_id"] = trace_id.into();
+                event["span_id"] = span_id.into();
+            }
+            eprintln!("{event}");
         }
         // Dropping the caller's reply never cancels an accepted operation.
         let _ = reply.send(result);
@@ -933,6 +942,7 @@ struct Controller {
     intent_retry: Option<adx_core::CompletedOperation>,
     stopped_runtime_ids: Vec<String>,
     capture_preparation: Option<(adx_core::CompletedOperation, std::path::PathBuf)>,
+    snapshot_publication: Option<snapshots::SnapshotPublication>,
     create_deadline: Option<tokio::time::Instant>,
     auto_pause_guard: Option<((String, u64, u64), u64)>,
     demand: Arc<std::sync::atomic::AtomicU64>,
@@ -1071,7 +1081,17 @@ impl Controller {
         {
             // Capture RPC outcome was not durably sealed. Stop the writer before dropping its reservation.
             self.cleanup().await?;
-            self.transition(Event::Fail)?;
+            self.record.runtime.ip = None;
+            if self.record.state == EnvironmentState::Failed {
+                // Coordinator may already have invalidated this execution. Its
+                // released terminal record can still retain an unsealed input;
+                // publish cleanup at a new revision without failing it again.
+                self.record.revision =
+                    self.record.revision.checked_add(1).ok_or(Error::Conflict)?;
+                self.durability = None;
+            } else {
+                self.transition(Event::Fail)?;
+            }
             return self.sync().await;
         }
         let observation = if self.record.state == EnvironmentState::Running {
@@ -1225,6 +1245,7 @@ impl Controller {
         let durability = timeout(
             self.services.operation_timeout,
             adx_observability::trace::Trace::child("environment.state.commit").run_result(async {
+                adx_observability::trace::attribute("environment.id", self.record.spec.id.clone());
                 if self.record.state == EnvironmentState::Deleted {
                     self.services
                         .sink
@@ -1397,6 +1418,14 @@ impl Controller {
             self.record.runtime.ip = Some(
                 adx_observability::trace::Trace::child("environment.runtime.start")
                     .run_result(async {
+                        adx_observability::trace::attribute(
+                            "environment.id",
+                            self.record.spec.id.clone(),
+                        );
+                        adx_observability::trace::attribute(
+                            "restart.count",
+                            self.record.restart_attempts.to_string(),
+                        );
                         if restore_checkpoint || self.record.spec.snapshot_id.is_some() {
                             let cp = self
                                 .record
@@ -1464,16 +1493,34 @@ impl Controller {
             self.create_stage(adx_core::observation::CreateStage::Readiness);
             stage = "Execd readiness";
             let runtime_ready_started = Instant::now();
-            adx_observability::trace::Trace::child("environment.runtime.ready")
-                .run_result(self.services.readiness.wait_ready(&self.record))
-                .await?;
+            let ready = adx_observability::trace::Trace::child("environment.runtime.ready");
+            ready.attribute("environment.id", self.record.spec.id.clone());
+            let ready_result = ready
+                .scope_result(self.services.readiness.wait_ready(&self.record))
+                .await;
+            if let Err(error) = &ready_result {
+                ready.attribute("result", "fail".into());
+                ready.attribute(
+                    "error.code",
+                    i32::from(adx_protocol::status(error.clone()).code()).to_string(),
+                );
+                ready.attribute("error.message", error.to_string());
+                ready.record_error("probe", error.to_string());
+            }
+            ready_result?;
             let runtime_ready_ms = runtime_ready_started.elapsed().as_secs_f64() * 1_000.0;
             awaiting_readiness = false;
             stage = "route activation";
             self.create_stage(adx_core::observation::CreateStage::RouteActivation);
             let route_started = Instant::now();
             adx_observability::trace::Trace::child("environment.route.activate")
-                .run_result(self.services.routes.activate(&self.record))
+                .run_result(async {
+                    adx_observability::trace::attribute(
+                        "environment.id",
+                        self.record.spec.id.clone(),
+                    );
+                    self.services.routes.activate(&self.record).await
+                })
                 .await?;
             Ok((
                 runtime_start_ms,
@@ -1638,6 +1685,7 @@ impl Controller {
         self.cleanup_pending
             .store(false, std::sync::atomic::Ordering::Release);
         self.capture_preparation = None;
+        self.snapshot_publication = None;
         self.recovery_files = None;
         self.execution_files.clear();
         self.record.execution_artifacts.clear();

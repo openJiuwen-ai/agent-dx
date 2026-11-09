@@ -389,7 +389,7 @@ class FullSDK(Acceptance):
     async def check_all(self, label, ids):
         for backend, environment_id in ids.items():
             value = await self.until(
-                lambda: self.sdk_rpc("check", backend), label + " public SDK recovery", 60
+                lambda backend=backend: self.sdk_rpc("check", backend), label + " public SDK recovery", 60
             )
             if not (value["id"] == environment_id):
                 raise AssertionError(value)
@@ -470,7 +470,10 @@ class FullSDK(Acceptance):
             await self.check_all("conchd-restart", ids)
         for backend, environment_id in ids.items():
             await self.sdk_rpc("delete", backend)
-            await self.until(lambda: self.record(environment_id) is None, "public deletion committed")
+            await self.until(
+                lambda environment_id=environment_id: self.record(environment_id) is None,
+                "public deletion committed",
+            )
             self.results.append({"case": backend + "-delete", "status": "passed"})
         await self.until(
             self.managed_backends_absent,
@@ -508,6 +511,8 @@ class FullSDK(Acceptance):
                             "--config",
                             str(self.config_path),
                             "stop",
+                            "--mode",
+                            "drain",
                         )
                     )
                     await asyncio.to_thread(self.deployment.wait, 120)

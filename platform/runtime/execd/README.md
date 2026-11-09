@@ -32,6 +32,19 @@ and `error_code=WAIT_TIMEOUT`; it does not stop the command. `process.kill`
 returns HTTP 200 with `killed=false` for a missing or already exited command.
 An actual signal failure remains an error.
 
+Command status, running flag, exit code/signal, completion time and state version
+come from one immutable observation of the per-command publication state. A child
+finishing while a response is formatted cannot produce `SUCCEEDED` without its
+zero exit code. Publication guards are released before output collection, and
+watch responses copy command references before acquiring a per-command guard so
+they do not retain the process-wide registry lock while waiting on publication.
+The inner exit-state locks are copied and released in separate statements; an
+observer never holds the spawn-error lock while waiting for the exit-code lock.
+If exit state cannot be observed, the response retains command identity and
+explicit error status (`FAILED`, or `error` for PID clients), nullable exit fields,
+`error_code=COMMAND_STATE_UNAVAILABLE`, `retry=same_operation` and `outcome=unknown`.
+This is an observation failure, not evidence that the child exited or succeeded.
+
 Finished command results are retained for `EXECD_COMMAND_RESULT_TTL_SECS`
 (default 3600). After that, an explicit command ID returns `status=EXPIRED`
 instead of `COMMAND_NOT_FOUND`. A repeated `process.start` with that ID returns

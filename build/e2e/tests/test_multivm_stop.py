@@ -70,6 +70,7 @@ class StopTests(unittest.TestCase):
                 return 'ID STATE\n' + ''.join(item + ' running\n' for item in ids
                                                if item.startswith(instance_id + '-'))
             if command[:4] == ('sudo', '-n', '/opt/adx/current/bin/adxctl', 'stop'):
+                self.assertEqual(command[4:6], ('--mode', 'drain'))
                 state['stopped'].add(role)
                 state['order'].append(role)
                 return '{}'

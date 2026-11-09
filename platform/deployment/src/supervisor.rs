@@ -1,5 +1,5 @@
 use crate::{
-    config::{Deployment, Process, Role},
+    config::{Deployment, Process, Role, ShutdownMode},
     Result,
 };
 use adx_protocol::relay as pb;
@@ -27,24 +27,73 @@ use tower::service_fn;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Request {
     Status,
-    Stop,
+    Stop { mode: Option<ShutdownMode> },
 }
 
 impl Request {
     fn as_str(self) -> &'static str {
         match self {
             Self::Status => "status",
-            Self::Stop => "stop",
+            Self::Stop { mode: None } => "stop",
+            Self::Stop {
+                mode: Some(ShutdownMode::Preserve),
+            } => "stop preserve",
+            Self::Stop {
+                mode: Some(ShutdownMode::Drain),
+            } => "stop drain",
         }
     }
 
     fn parse(value: &str) -> Option<Self> {
         match value {
             "status" => Some(Self::Status),
-            "stop" => Some(Self::Stop),
+            "stop" => Some(Self::Stop { mode: None }),
+            "stop preserve" => Some(Self::Stop {
+                mode: Some(ShutdownMode::Preserve),
+            }),
+            "stop drain" => Some(Self::Stop {
+                mode: Some(ShutdownMode::Drain),
+            }),
             _ => None,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShutdownPhase {
+    Drain,
+    Terminate,
+}
+
+/// A failed shutdown stage; remaining dependencies stay supervised for retry.
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub struct ShutdownFailure {
+    pub mode: ShutdownMode,
+    pub phase: ShutdownPhase,
+    pub service_id: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for ShutdownFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let phase = match self.phase {
+            ShutdownPhase::Drain => "drain",
+            ShutdownPhase::Terminate => "terminate",
+        };
+        write!(
+            formatter,
+            "supervisor operation failed: mode={}, phase={phase}, service={}: {}",
+            self.mode, self.service_id, self.message
+        )
+    }
+}
+
+impl std::error::Error for ShutdownFailure {}
+
+enum SignalTarget {
+    Process,
+    ProcessGroup,
 }
 
 struct ManagedService {
@@ -55,6 +104,7 @@ struct ManagedService {
     failed: bool,
     capture: Option<crate::logging::Capture>,
     finished_log: Option<crate::logging::Status>,
+    signal_target: SignalTarget,
 }
 impl ManagedService {
     fn is_afs(&self) -> bool {
@@ -86,6 +136,7 @@ impl ManagedService {
             None
         };
         self.child = Some(command.spawn()?);
+        self.signal_target = SignalTarget::ProcessGroup;
         self.capture = capture;
         self.failed = false;
         Ok(())
@@ -110,10 +161,14 @@ impl ManagedService {
     fn signal(&mut self, signal: i32) -> Result<()> {
         if let Some(child) = &mut self.child {
             if child.try_wait()?.is_none() {
-                let id = child.id() as i32;
-                // SAFETY: the child has not been reaped, so its process group cannot belong to a
-                // reused PID. kill does not retain the scalar process-group identifier.
-                if unsafe { libc::kill(-id, signal) } != 0 {
+                let id = i32::try_from(child.id())?;
+                let target = match self.signal_target {
+                    SignalTarget::Process => id,
+                    SignalTarget::ProcessGroup => -id,
+                };
+                // SAFETY: the child has not been reaped, so its PID (also its process-group ID)
+                // cannot have been reused. kill does not retain the scalar identifier.
+                if unsafe { libc::kill(target, signal) } != 0 {
                     let error = std::io::Error::last_os_error();
                     if error.raw_os_error() != Some(libc::ESRCH) {
                         return Err(error.into());
@@ -183,9 +238,23 @@ pub async fn request(root: &Path, request: Request, timeout: Duration) -> Result
         stream.take(1024 * 1024).read_to_end(&mut data).await?;
         let response: Value = serde_json::from_slice(&data)?;
         if response.get("ok") != Some(&Value::Bool(true)) {
-            return Err(
-                "supervisor operation failed; dependencies retained, inspect component logs".into(),
-            );
+            if let Some(error) = response.get("error") {
+                if let Ok(failure) = serde_json::from_value::<ShutdownFailure>(error.clone()) {
+                    return Err(Box::new(failure) as Box<dyn std::error::Error + Send + Sync>);
+                }
+                let message = error
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| error.to_string());
+                return Err(std::io::Error::other(format!(
+                    "supervisor operation failed: {message}"
+                ))
+                .into());
+            }
+            return Err(std::io::Error::other(
+                "supervisor operation failed: invalid action or response",
+            )
+            .into());
         }
         Ok(response)
     })
@@ -207,53 +276,97 @@ async fn drain(path: PathBuf, timeout: Duration) -> Result<()> {
     .await??;
     Ok(())
 }
-async fn stop(children: &mut [ManagedService], timeout: Duration) -> Result<()> {
-    // All node cleanup must succeed while Coordinator, Redis and local proxies remain alive.
-    for service in children.iter_mut() {
-        if let Some(path) = &service.config.admin_socket {
-            if service
-                .child
-                .as_mut()
-                .map(|child| child.try_wait())
-                .transpose()?
-                .flatten()
-                .is_some()
-                || service.child.is_none()
-            {
-                return Err("Adxlet unavailable for cleanup".into());
-            }
-            drain(path.clone(), timeout).await?;
-        }
+async fn drain_service(service: &mut ManagedService, timeout: Duration) -> Result<()> {
+    let Some(path) = &service.config.admin_socket else {
+        return Ok(());
+    };
+    if service
+        .child
+        .as_mut()
+        .map(|child| child.try_wait())
+        .transpose()?
+        .flatten()
+        .is_some()
+        || service.child.is_none()
+    {
+        return Err("Adxlet unavailable for cleanup".into());
     }
-    for service in children.iter_mut().rev() {
-        if service.is_afs() && service.child.is_none() && service.failed {
-            return Err("AFS service failed before stop".into());
-        }
-        service.signal(libc::SIGTERM)?;
-        let deadline = Instant::now() + timeout;
-        while let Some(child) = &mut service.child {
-            if let Some(status) = child.try_wait()? {
-                if service.is_afs() && !status.success() {
-                    service.child = None;
-                    service.failed = true;
-                    service.finish_logs().await?;
-                    return Err("AFS service exited unsuccessfully during stop".into());
-                }
-                break;
-            }
-            if Instant::now() >= deadline {
-                service.signal(libc::SIGKILL)?;
-                if let Some(child) = &mut service.child {
-                    child.wait()?;
-                }
+    drain(path.clone(), timeout).await
+}
+
+async fn terminate_service(
+    service: &mut ManagedService,
+    timeout: Duration,
+    mode: ShutdownMode,
+) -> Result<()> {
+    if service.is_afs() && service.child.is_none() && service.failed {
+        return Err("AFS service failed before stop".into());
+    }
+    let signal = if service.config.role == Role::Adxlet && mode == ShutdownMode::Preserve {
+        // Descendants may own retained execution. Keep SIGUSR1 and any subsequent
+        // timeout/Drop SIGKILL scoped to adxlet, even if they share its process group.
+        service.signal_target = SignalTarget::Process;
+        libc::SIGUSR1
+    } else {
+        service.signal_target = SignalTarget::ProcessGroup;
+        libc::SIGTERM
+    };
+    service.signal(signal)?;
+    let deadline = Instant::now() + timeout;
+    while let Some(child) = &mut service.child {
+        if let Some(status) = child.try_wait()? {
+            if service.is_afs() && !status.success() {
                 service.child = None;
                 service.failed = true;
                 service.finish_logs().await?;
-                return Err("service termination deadline exceeded".into());
+                return Err("AFS service exited unsuccessfully during stop".into());
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            break;
         }
-        service.finish_logs().await?;
+        if Instant::now() >= deadline {
+            service.signal(libc::SIGKILL)?;
+            if let Some(child) = &mut service.child {
+                child.wait()?;
+            }
+            service.child = None;
+            service.failed = true;
+            service.finish_logs().await?;
+            return Err("service termination deadline exceeded".into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    service.finish_logs().await?;
+    Ok(())
+}
+
+async fn stop(
+    children: &mut [ManagedService],
+    timeout: Duration,
+    mode: ShutdownMode,
+) -> std::result::Result<(), ShutdownFailure> {
+    eprintln!("stopping supervised services: mode={mode}");
+    if mode == ShutdownMode::Drain {
+        // All node cleanup must succeed while Coordinator, Redis and local proxies remain alive.
+        for service in children.iter_mut() {
+            drain_service(service, timeout)
+                .await
+                .map_err(|error| ShutdownFailure {
+                    mode,
+                    phase: ShutdownPhase::Drain,
+                    service_id: service.config.id.clone(),
+                    message: error.to_string(),
+                })?;
+        }
+    }
+    for service in children.iter_mut().rev() {
+        terminate_service(service, timeout, mode)
+            .await
+            .map_err(|error| ShutdownFailure {
+                mode,
+                phase: ShutdownPhase::Terminate,
+                service_id: service.config.id.clone(),
+                message: error.to_string(),
+            })?;
     }
     Ok(())
 }
@@ -299,7 +412,7 @@ async fn health_status(url: &str) -> Value {
     json!({"ready": ready, "status_line": status_line, "body": body})
 }
 
-async fn status(children: &[ManagedService]) -> Value {
+async fn status(children: &[ManagedService], shutdown_mode: ShutdownMode) -> Value {
     let mut services = Vec::new();
     for service in children {
         let health = if service.child.as_ref().is_some_and(|child| child.id() > 0) {
@@ -324,7 +437,7 @@ async fn status(children: &[ManagedService]) -> Value {
                 .or_else(|| service.finished_log.clone()),
         }));
     }
-    json!({"ok": true, "services": services})
+    json!({"ok": true, "shutdown_mode": shutdown_mode, "services": services})
 }
 
 fn stopped_status(children: &[ManagedService]) -> Value {
@@ -381,6 +494,7 @@ pub async fn run(deployment: Deployment) -> Result<()> {
             failed: false,
             capture: None,
             finished_log: None,
+            signal_target: SignalTarget::ProcessGroup,
         };
         if let Err(error) = service.start(&logs, &deployment.logging) {
             service.failed = true;
@@ -412,11 +526,13 @@ pub async fn run(deployment: Deployment) -> Result<()> {
 
                 let request = Request::parse(request_line.trim());
                 let response = match request {
-                    Some(Request::Status) => status(&children).await,
-                    Some(Request::Stop) => {
+                    Some(Request::Status) => status(&children, deployment.shutdown_mode).await,
+                    Some(Request::Stop { mode }) => {
+                        let mode = mode.unwrap_or(deployment.shutdown_mode);
                         match stop(
                             &mut children,
                             Duration::from_secs(deployment.stop_timeout_seconds),
+                            mode,
                         )
                         .await
                         {
@@ -428,18 +544,19 @@ pub async fn run(deployment: Deployment) -> Result<()> {
                                 json!({
                                     "ok": true,
                                     "stopped": true,
+                                    "shutdown_mode": mode,
                                     "services": service_status,
                                 })
                             }
                             Err(error) => {
-                                eprintln!("stop cleanup incomplete: {error}");
-                                json!({"ok": false, "error": "cleanup or termination failed"})
+                                eprintln!("stop incomplete: {error}");
+                                json!({"ok": false, "shutdown_mode": mode, "error": error})
                             }
                         }
                     }
                     None => json!({"ok": false, "error": "unknown action"}),
                 };
-                let should_exit = request == Some(Request::Stop)
+                let should_exit = matches!(request, Some(Request::Stop { .. }))
                     && response.get("ok") == Some(&Value::Bool(true));
 
                 let mut stream = reader.into_inner().into_inner();
@@ -450,28 +567,28 @@ pub async fn run(deployment: Deployment) -> Result<()> {
                 }
             }
             _ = term.recv() => {
-                if stop(
+                match stop(
                     &mut children,
                     Duration::from_secs(deployment.stop_timeout_seconds),
+                    deployment.shutdown_mode,
                 )
                 .await
-                .is_ok()
                 {
-                    return Ok(());
+                    Ok(()) => return Ok(()),
+                    Err(error) => eprintln!("stop incomplete; dependencies remain running: {error}"),
                 }
-                eprintln!("stop cleanup incomplete; dependencies remain running");
             }
             _ = interrupt.recv() => {
-                if stop(
+                match stop(
                     &mut children,
                     Duration::from_secs(deployment.stop_timeout_seconds),
+                    deployment.shutdown_mode,
                 )
                 .await
-                .is_ok()
                 {
-                    return Ok(());
+                    Ok(()) => return Ok(()),
+                    Err(error) => eprintln!("stop incomplete; dependencies remain running: {error}"),
                 }
-                eprintln!("stop cleanup incomplete; dependencies remain running");
             }
             _ = tick.tick() => {
                 for service in &mut children {

@@ -15,6 +15,60 @@ services:
     config: {}
 "#;
 
+#[test]
+fn shutdown_mode_defaults_to_preserve_and_explicit_modes_survive_configuration_roundtrip() {
+    let root = tempfile::tempdir().unwrap();
+    for (name, source, expected) in [
+        ("default", MINIMAL_YAML.to_owned(), "preserve"),
+        (
+            "default-profile",
+            "schema_version: 1\nprofile: coordinator\n".to_owned(),
+            "preserve",
+        ),
+        (
+            "drain",
+            format!("{MINIMAL_YAML}\nshutdown_mode: drain\n"),
+            "drain",
+        ),
+        (
+            "preserve",
+            format!("{MINIMAL_YAML}\nshutdown_mode: preserve\n"),
+            "preserve",
+        ),
+        (
+            "profile",
+            "schema_version: 1\nprofile: coordinator\nshutdown_mode: preserve\n".to_owned(),
+            "preserve",
+        ),
+    ] {
+        let path = root.path().join(format!("{name}.yaml"));
+        std::fs::write(&path, source).unwrap();
+        let deployment = Deployment::load(&path).unwrap();
+        let effective = deployment.effective_yaml().unwrap();
+        let value: serde_json::Value = serde_saphyr::from_str(&effective).unwrap();
+        assert_eq!(value["shutdown_mode"], expected);
+        std::fs::write(&path, effective).unwrap();
+        assert_eq!(
+            Deployment::load(&path).unwrap().effective_yaml().unwrap(),
+            deployment.effective_yaml().unwrap()
+        );
+    }
+}
+
+#[test]
+fn shutdown_mode_rejects_unknown_values_in_full_and_profile_configurations() {
+    let root = tempfile::tempdir().unwrap();
+    for source in [MINIMAL_YAML, "schema_version: 1\nprofile: coordinator\n"] {
+        let path = root.path().join("invalid.yaml");
+        std::fs::write(&path, format!("{source}\nshutdown_mode: presreve\n")).unwrap();
+        let error = Deployment::load(&path).err().unwrap().to_string();
+        assert!(
+            error.contains("preserve") && error.contains("drain"),
+            "{error}"
+        );
+    }
+}
+
 fn test_deployment(root: &std::path::Path) -> Deployment {
     serde_json::from_value(json!({"schema_version":1,"package_dir":root,"state_dir":root,"redis_url":"redis://localhost:6379/","namespace":"test","restart_delay_ms":20,"stop_timeout_seconds":3,"services":[{"id":"node","role":"adxlet","config":{"discovery":{"namespace":"wrong"},"proxy_socket":root.join("route.sock")},"env":{"ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR":root}},{"id":"coordinator","role":"coordinator","config":{}}]})).unwrap()
 }
@@ -35,6 +89,126 @@ fn load_accepts_yaml_and_rejects_json_deployment_files() {
         Err(error) => error.to_string(),
     };
     assert!(error.contains(".yaml or .yml"));
+}
+
+#[test]
+fn tracing_policy_renders_http_endpoint_for_services_and_executor() {
+    let root = tempfile::tempdir().unwrap();
+    let package = root.path().join("package");
+    let state = root.path().join("state");
+    let output = root.path().join("out");
+    let yaml = format!(
+        r#"
+schema_version: 1
+package_dir: {package}
+state_dir: {state}
+redis_url: redis://127.0.0.1:6379/
+namespace: test
+restart_delay_ms: 1000
+stop_timeout_seconds: 30
+tracing:
+  endpoints: ["10.0.0.1:4318", "10.0.0.2:4318"]
+services:
+  - id: coordinator
+    role: coordinator
+    config: {{}}
+  - id: adxlet
+    role: adxlet
+    config:
+      node_id: node-1
+      proxy_socket: /run/adx/test/route.sock
+    env:
+      ADX_DATA_PLANE_RELAY_ACTIVITY_UDS_DIR: /run/adx/test
+      ADX_ENV: staging
+"#,
+        package = package.display(),
+        state = state.display(),
+    );
+    let path = root.path().join("deployment.yaml");
+    std::fs::write(&path, yaml).unwrap();
+    let deployment = Deployment::load(&path).unwrap();
+    let processes = deployment.render(&output).unwrap();
+
+    for role in [Role::Coordinator, Role::Adxlet] {
+        let process = processes
+            .iter()
+            .find(|process| process.role == role)
+            .unwrap();
+        assert_eq!(
+            process.env.get("ADX_TRACE_ENABLED").map(String::as_str),
+            Some("true")
+        );
+        assert!(!process.env.contains_key("ADX_TRACE_SAMPLE_RATIO"));
+        assert_eq!(
+            process
+                .env
+                .get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT")
+                .map(String::as_str),
+            Some("http://10.0.0.1:4318/v1/traces")
+        );
+    }
+
+    let executor: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(output.join("adxlet.json")).unwrap()).unwrap();
+    let execd_env = executor["execd_env"].as_object().unwrap();
+    assert_eq!(execd_env["ADX_TRACE_ENABLED"], "true");
+    assert!(!execd_env.contains_key("ADX_TRACE_SAMPLE_RATIO"));
+    assert_eq!(
+        execd_env["OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"],
+        "http://10.0.0.1:4318/v1/traces"
+    );
+    assert_eq!(execd_env["ADX_NODE_ID"], "node-1");
+    assert_eq!(execd_env["ADX_ENV"], "staging");
+}
+
+#[test]
+fn tracing_without_endpoints_renders_no_trace_environment() {
+    let root = tempfile::tempdir().unwrap();
+    let yaml = MINIMAL_YAML.replace("services:", "tracing:\n  endpoints: []\nservices:");
+    let path = root.path().join("deployment.yaml");
+    std::fs::write(&path, yaml).unwrap();
+    let deployment = Deployment::load(&path).unwrap();
+    let processes = deployment.render(&root.path().join("out")).unwrap();
+    let coordinator = processes
+        .iter()
+        .find(|process| process.role == Role::Coordinator)
+        .unwrap();
+    assert!(!coordinator.env.contains_key("ADX_TRACE_ENABLED"));
+    assert!(!coordinator
+        .env
+        .contains_key("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"));
+}
+
+#[test]
+fn tracing_rejects_unsupported_schemes_bad_ports_and_removed_sample() {
+    let root = tempfile::tempdir().unwrap();
+    for (tracing, expected) in [
+        (
+            "tracing:\n  endpoints: [\"https://collector:4318\"]\n",
+            "https://",
+        ),
+        ("tracing:\n  endpoints: [\"collector:0\"]\n", "1..65535"),
+        (
+            "tracing:\n  endpoints: [\"collector:4318\"]\n  sample: \"on\"\n",
+            "unknown field",
+        ),
+        (
+            "tracing:\n  endpoints: [\"collector:4318/other\"]\n",
+            "path must be",
+        ),
+    ] {
+        let yaml = MINIMAL_YAML.replace("services:", &format!("{tracing}services:"));
+        let path = root.path().join("invalid-tracing.yaml");
+        std::fs::write(&path, yaml).unwrap();
+        let error = match Deployment::load(&path) {
+            Ok(_) => panic!("tracing configuration must be rejected: {tracing}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(
+            error.contains(expected),
+            "expected {expected:?} in {error:?}"
+        );
+    }
 }
 
 #[test]

@@ -2,6 +2,7 @@
 pub use adx_checkpoint_storage::*;
 use adx_core::{EnvironmentRecord, Error, Result};
 use async_trait::async_trait;
+use std::time::Duration;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PauseRequest {
     pub operation_id: String,
@@ -33,9 +34,12 @@ pub struct SnapshotResult {
 #[async_trait]
 pub trait SnapshotCatalog: Send + Sync {
     async fn get(&self, id: &str) -> Result<adx_core::snapshots::Snapshot>;
+    /// Publish the same immutable capture within its remaining operation budget.
+    /// A timeout does not prove that the catalog rejected the publication.
     async fn publish(
         &self,
         snapshot: adx_core::snapshots::Snapshot,
+        timeout: Duration,
     ) -> Result<adx_core::snapshots::Snapshot>;
 }
 

@@ -63,6 +63,18 @@ impl CoordinatorRpc {
         let mut failure = None;
         for (task, local_collector) in candidates {
             let result = async {
+                // Local deletion must exclude new references from the last
+                // authoritative check through the node ACK and task retirement.
+                // Descriptors with different size/scope may name the same local
+                // bytes, so acquire each location's write guard only once.
+                let mut local_deletions = Vec::new();
+                let mut local_locations = BTreeSet::new();
+                for artifact in task.artifacts.iter().filter(|a| a.storage == "local") {
+                    if local_locations.insert(&artifact.location) {
+                        local_deletions
+                            .push(session.claim_artifact_deletion(artifact, None).await?);
+                    }
+                }
                 if !session.checkpoint_cleanups().await?.contains(&task)
                     || !session.checkpoint_cleanup_unreferenced(&task, None).await?
                 {

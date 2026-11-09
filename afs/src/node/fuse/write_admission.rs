@@ -128,6 +128,15 @@ impl DispatchedWrite {
                 .with_label_values(&[filesystem, source, "execute"])
                 .observe(executing.elapsed().as_secs_f64());
         }
+        if super::fuse_trace_enabled() {
+            afs_logging::warn!(
+                "fuse.time";
+                "op" => "write",
+                "ino" => self.ino,
+                "us" => executing.elapsed().as_micros() as u64,
+                "q" => self.enqueue_at.elapsed().as_micros() as u64
+            );
+        }
         let reply = self.reply;
         match result {
             Ok(written) => match u32::try_from(written) {

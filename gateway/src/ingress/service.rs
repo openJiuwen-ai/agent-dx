@@ -163,6 +163,7 @@ impl IngressService {
         )
         .with_port_host_domain(config.port_host_domain.clone())
         .with_e2b_enabled(config.e2b_enabled)
+        .with_e2b_allow_http(config.e2b_allow_http)
         .with_backend_http_pool_config(config.backend_http_pool_config())
         .with_reverse_proxy_config(config.reverse_proxy.clone())
         .with_proxy_routes(config.proxy_routes.clone())
@@ -368,6 +369,7 @@ mod tests {
             default_tunnel_port: 8_765,
             port_host_domain: None,
             e2b_enabled: false,
+            e2b_allow_http: false,
             node_security_mode: IngressNodeSecurityMode::Network,
             node_tls_ca: String::new(),
             node_tls_server_name: String::new(),

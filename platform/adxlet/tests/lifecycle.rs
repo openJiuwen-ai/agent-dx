@@ -379,6 +379,7 @@ async fn failed_collection_is_fenced_and_keeps_metadata_until_cleanup_succeeds()
             .unwrap_err(),
         Error::Conflict
     );
+    assert_eq!(environment.sync().await.unwrap().record, running.record);
     assert!(deps.actual.load(std::sync::atomic::Ordering::SeqCst));
     deps.actual
         .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -392,6 +393,7 @@ async fn failed_collection_is_fenced_and_keeps_metadata_until_cleanup_succeeds()
             .unwrap_err(),
         Error::Conflict
     );
+    assert_eq!(environment.sync().await.unwrap().record, failed);
     deps.fail_cleanup
         .store(true, std::sync::atomic::Ordering::SeqCst);
     assert!(environment.collect_failed(failed.revision).await.is_err());
@@ -403,6 +405,10 @@ async fn failed_collection_is_fenced_and_keeps_metadata_until_cleanup_succeeds()
     assert_eq!(deleted.record.state, EnvironmentState::Deleted);
     assert_eq!(deleted.durability, Durability::Published);
     assert!(!deleted.record.resources_held);
+    assert_eq!(
+        deleted.record.observation.as_ref().and_then(|o| o.intent),
+        Some(adx_core::observation::OperationIntent::Policy)
+    );
 }
 
 #[tokio::test]
@@ -429,7 +435,7 @@ async fn failed_collection_does_not_cancel_pending_restart() {
             .unwrap_err(),
         Error::Conflict
     );
-    assert!(environment.sync().await.unwrap().record.restart_pending);
+    assert_eq!(environment.sync().await.unwrap().record, failed);
 }
 
 #[tokio::test]

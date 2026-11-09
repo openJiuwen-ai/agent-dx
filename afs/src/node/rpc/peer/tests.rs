@@ -130,7 +130,7 @@ use crate::node::rpc::data::{
 };
 #[cfg(feature = "ownerfs")]
 use crate::node::vfs::ownerfs::{
-    files::{FileIdentity, RemoteFile},
+    files::{FileIdentity, RemoteDirectory, RemoteFile},
     remote::RemoteFiles,
     root::{RootGrant, RootId, RootRight},
 };
@@ -140,7 +140,8 @@ use afs_protocol::node_data::{
 };
 #[cfg(feature = "ownerfs")]
 use afs_protocol::node_data::{
-    OwnerReadReply, OwnerReadRequest, OwnerReleaseReply, OwnerWriteReply, OwnerWriteRequest,
+    OwnerReadReply, OwnerReadRequest, OwnerReleaseDirReply, OwnerReleaseReply, OwnerWriteReply,
+    OwnerWriteRequest,
 };
 #[cfg(feature = "ownerfs")]
 use std::sync::atomic::{AtomicUsize as TestAtomicUsize, Ordering as TestOrdering};
@@ -1753,6 +1754,47 @@ async fn owner_release_treats_stale_handle_as_idempotent_success() {
     server.abort();
 }
 
+#[tokio::test]
+#[cfg(feature = "ownerfs")]
+async fn owner_releasedir_retries_transient_failure_until_home_releases() {
+    let handler = std::sync::Arc::new(ReleaseTestHandler::transient_failures(1));
+    let (channel, server) = spawn_owner_release_server(handler.clone()).await;
+    let client =
+        owner_files_client_from_channel_with_runtime(channel, tokio::runtime::Handle::current());
+
+    client
+        .releasedir(&test_grant(), test_remote_directory(b"dir-retry".to_vec()))
+        .unwrap();
+
+    wait_until(Duration::from_secs(2), || {
+        client.pending_releases.load(AtomicOrdering::Acquire) == 0
+    })
+    .await;
+    assert_eq!(handler.release_dir_calls(), 2);
+    assert_eq!(handler.seen_handles(), vec![b"dir-retry".to_vec(); 2]);
+    server.abort();
+}
+
+#[tokio::test]
+#[cfg(feature = "ownerfs")]
+async fn owner_releasedir_persistent_failure_stops_after_bounded_attempts() {
+    let handler = std::sync::Arc::new(ReleaseTestHandler::transient_failures(usize::MAX));
+    let (channel, server) = spawn_owner_release_server(handler.clone()).await;
+    let client =
+        owner_files_client_from_channel_with_runtime(channel, tokio::runtime::Handle::current());
+
+    client
+        .releasedir(&test_grant(), test_remote_directory(b"dir-down".to_vec()))
+        .unwrap();
+
+    wait_until(Duration::from_secs(2), || {
+        client.pending_releases.load(AtomicOrdering::Acquire) == 0
+    })
+    .await;
+    assert_eq!(handler.release_dir_calls(), RELEASE_MAX_ATTEMPTS);
+    server.abort();
+}
+
 #[cfg(all(feature = "ownerfs", feature = "rdma"))]
 #[tokio::test]
 async fn owner_rdma_client_admission_rejects_before_endpoint_open() {
@@ -2272,6 +2314,7 @@ struct ReleaseTestHandler {
     mode: ReleaseFailureMode,
     attempts: TestAtomicUsize,
     seen_handles: StdMutex<Vec<Vec<u8>>>,
+    release_dir_calls: TestAtomicUsize,
 }
 
 #[cfg(feature = "ownerfs")]
@@ -2283,6 +2326,7 @@ impl ReleaseTestHandler {
             },
             attempts: TestAtomicUsize::new(0),
             seen_handles: StdMutex::new(Vec::new()),
+            release_dir_calls: TestAtomicUsize::new(0),
         }
     }
 
@@ -2291,6 +2335,7 @@ impl ReleaseTestHandler {
             mode: ReleaseFailureMode::Stale,
             attempts: TestAtomicUsize::new(0),
             seen_handles: StdMutex::new(Vec::new()),
+            release_dir_calls: TestAtomicUsize::new(0),
         }
     }
 
@@ -2300,6 +2345,10 @@ impl ReleaseTestHandler {
 
     fn seen_handles(&self) -> Vec<Vec<u8>> {
         self.seen_handles.lock().unwrap().clone()
+    }
+
+    fn release_dir_calls(&self) -> usize {
+        self.release_dir_calls.load(TestOrdering::SeqCst)
     }
 }
 
@@ -2338,6 +2387,24 @@ impl OwnerFilesHandler for ReleaseTestHandler {
                 "stale release handle",
             )),
         }
+    }
+
+    fn release_dir(
+        &self,
+        authenticated_peer_node_id: &str,
+        request: OwnerReleaseDirRequest,
+    ) -> afs_error::Result<OwnerReleaseDirReply> {
+        self.release_dir_calls.fetch_add(1, TestOrdering::SeqCst);
+        self.release(
+            authenticated_peer_node_id,
+            OwnerReleaseRequest {
+                access: request.access,
+                handle: request.handle.map(|handle| OwnerHandle {
+                    opaque: handle.opaque,
+                }),
+            },
+        )?;
+        Ok(OwnerReleaseDirReply {})
     }
 }
 
@@ -2453,6 +2520,17 @@ fn test_grant() -> RootGrant {
 #[cfg(feature = "ownerfs")]
 fn test_remote_file(handle: Vec<u8>) -> RemoteFile {
     RemoteFile {
+        root_id: RootId("root-a".to_owned()),
+        owner_node_id: "node-a".to_owned(),
+        owner_session_id: "home-session-a".to_owned(),
+        identity: FileIdentity(b"identity-a".to_vec()),
+        handle,
+    }
+}
+
+#[cfg(feature = "ownerfs")]
+fn test_remote_directory(handle: Vec<u8>) -> RemoteDirectory {
+    RemoteDirectory {
         root_id: RootId("root-a".to_owned()),
         owner_node_id: "node-a".to_owned(),
         owner_session_id: "home-session-a".to_owned(),

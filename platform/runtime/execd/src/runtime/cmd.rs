@@ -41,6 +41,107 @@ struct ExitState {
     cond: Condvar,
 }
 
+struct ExitObservation {
+    code: Option<i64>,
+    signal: Option<i32>,
+    finished_at_ms: Option<u64>,
+    killed: bool,
+    timed_out: bool,
+    spawn_error: Option<String>,
+    state_version: u64,
+}
+
+impl ExitObservation {
+    fn status(&self, pid: i64) -> &'static str {
+        if self.spawn_error.is_some() {
+            "FAILED"
+        } else if pid < 0 {
+            "PENDING"
+        } else if self.code.is_none() {
+            "RUNNING"
+        } else if self.timed_out {
+            "TIMED_OUT"
+        } else if self.killed {
+            "KILLED"
+        } else if self.code == Some(0) {
+            "SUCCEEDED"
+        } else {
+            "FAILED"
+        }
+    }
+}
+
+fn observe_exit(exit: &ExitState) -> Result<ExitObservation, &'static str> {
+    // Completion/reaping and kill publication already share this per-command
+    // guard. Hold it only while copying scalar exit state, never while waiting
+    // for output readers or retaining the command-registry lock.
+    let _publication = exit
+        .signal_guard
+        .lock()
+        .map_err(|_| "command publication state is poisoned")?;
+    // Each inner guard must be dropped at its own statement boundary. A
+    // struct literal would retain temporaries and invert wait_exit's lock order.
+    let code = *exit
+        .code
+        .lock()
+        .map_err(|_| "command exit state is poisoned")?;
+    let spawn_error = exit
+        .spawn_error
+        .lock()
+        .map_err(|_| "command spawn state is poisoned")?
+        .clone();
+    let finished_at_ms = *exit
+        .finished_at_ms
+        .lock()
+        .map_err(|_| "command completion time is poisoned")?;
+    let signal = *exit
+        .signal
+        .lock()
+        .map_err(|_| "command exit signal is poisoned")?;
+    Ok(ExitObservation {
+        spawn_error,
+        code,
+        killed: exit.killed.load(Ordering::Acquire),
+        timed_out: exit.timed_out.load(Ordering::Acquire),
+        finished_at_ms,
+        signal,
+        state_version: exit.state_version.load(Ordering::Acquire),
+    })
+}
+
+fn observation_error(record: &CommandSnapshot, message: &'static str, legacy: bool) -> Value {
+    map_value(vec![
+        ("command_id", Value::from(record.command_id.clone())),
+        ("operation_id", Value::from(record.command_id.clone())),
+        ("pid", Value::from(record.pid)),
+        ("cmd", Value::from(record.cmd.clone())),
+        (
+            "status",
+            Value::from(if legacy { "error" } else { "FAILED" }),
+        ),
+        ("running", Value::from(false)),
+        (
+            "state_version",
+            Value::from(record.exit.state_version.load(Ordering::Acquire)),
+        ),
+        ("exit_code", Value::Nil),
+        ("exit_signal", Value::Nil),
+        ("stdout", Value::from("")),
+        ("stderr", Value::from("")),
+        ("created_at_ms", Value::from(record.created_at_ms)),
+        (
+            "started_at_ms",
+            record.started_at_ms.map(Value::from).unwrap_or(Value::Nil),
+        ),
+        ("finished_at_ms", Value::Nil),
+        ("error_code", Value::from("COMMAND_STATE_UNAVAILABLE")),
+        ("error", Value::from(message)),
+        ("error_message", Value::from(message)),
+        ("retry", Value::from("same_operation")),
+        ("outcome", Value::from("unknown")),
+    ])
+}
+
 struct BoundedBuffer {
     data: Vec<u8>,
     total_bytes: u64,
@@ -483,23 +584,28 @@ fn status(record: &CommandRecord) -> &'static str {
     command_status(record.pid, &record.exit)
 }
 
-fn snapshot_status(record: &CommandSnapshot) -> &'static str {
-    command_status(record.pid, &record.exit)
+fn record_value(record: &CommandSnapshot, include_output: bool) -> Value {
+    match observe_exit(&record.exit) {
+        Ok(exit) => record_value_observed(record, include_output, &exit),
+        Err(message) => observation_error(record, message, false),
+    }
 }
 
-fn record_value(record: &CommandSnapshot, include_output: bool) -> Value {
-    let spawn_error = record.exit.spawn_error.lock().unwrap().clone();
-    let raw_code = *record.exit.code.lock().unwrap();
-    let code = if spawn_error.is_some()
-        || record.exit.killed.load(Ordering::Acquire)
-        || record.exit.timed_out.load(Ordering::Acquire)
-    {
+fn record_value_observed(
+    record: &CommandSnapshot,
+    include_output: bool,
+    exit: &ExitObservation,
+) -> Value {
+    let spawn_error = exit.spawn_error.clone();
+    let raw_code = exit.code;
+    let code = if spawn_error.is_some() || exit.killed || exit.timed_out {
         None
     } else {
         raw_code
     };
-    let finished_at = *record.exit.finished_at_ms.lock().unwrap();
-    let terminal = !matches!(snapshot_status(record), "PENDING" | "RUNNING");
+    let finished_at = exit.finished_at_ms;
+    let status = exit.status(record.pid);
+    let terminal = !matches!(status, "PENDING" | "RUNNING");
     let (stdout, stdout_truncated, stderr, stderr_truncated) = if include_output && terminal {
         let (stdout, stdout_truncated) = collect_reader(&record.stdout);
         let (stderr, stderr_truncated) = collect_reader(&record.stderr);
@@ -519,24 +625,15 @@ fn record_value(record: &CommandSnapshot, include_output: bool) -> Value {
         ("command_id", Value::from(record.command_id.clone())),
         ("pid", Value::from(record.pid)),
         ("cmd", Value::from(record.cmd.clone())),
-        ("status", Value::from(snapshot_status(record))),
+        ("status", Value::from(status)),
         ("running", Value::from(!terminal)),
-        (
-            "state_version",
-            Value::from(record.exit.state_version.load(Ordering::Acquire)),
-        ),
+        ("state_version", Value::from(exit.state_version)),
         ("stdout", Value::from(stdout)),
         ("stderr", Value::from(stderr)),
         ("exit_code", code.map(Value::from).unwrap_or(Value::Nil)),
         (
             "exit_signal",
-            record
-                .exit
-                .signal
-                .lock()
-                .unwrap()
-                .map(Value::from)
-                .unwrap_or(Value::Nil),
+            exit.signal.map(Value::from).unwrap_or(Value::Nil),
         ),
         ("created_at_ms", Value::from(record.created_at_ms)),
         (
@@ -574,7 +671,11 @@ fn record_value(record: &CommandSnapshot, include_output: bool) -> Value {
 /// PID-based clients predate stable command identities and recognize only the
 /// running/done/error states. Keep their result and signal-exit-code contract.
 fn legacy_record_value(record: &CommandSnapshot, include_output: bool) -> Value {
-    let mut value = record_value(record, include_output);
+    let exit = match observe_exit(&record.exit) {
+        Ok(exit) => exit,
+        Err(message) => return observation_error(record, message, true),
+    };
+    let mut value = record_value_observed(record, include_output, &exit);
     let Value::Map(items) = &mut value else {
         unreachable!("command result is a map");
     };
@@ -583,32 +684,19 @@ fn legacy_record_value(record: &CommandSnapshot, include_output: bool) -> Value 
             Some("status") => {
                 *value = Value::from(match value.as_str() {
                     Some("PENDING" | "RUNNING") => "running",
-                    _ if record.exit.spawn_error.lock().unwrap().is_some() => "error",
+                    _ if exit.spawn_error.is_some() => "error",
                     _ => "done",
                 });
             }
             Some("exit_code") => {
-                *value = record
-                    .exit
-                    .code
-                    .lock()
-                    .unwrap()
-                    .map(Value::from)
-                    .unwrap_or(nil());
+                *value = exit.code.map(Value::from).unwrap_or(nil());
             }
             _ => {}
         }
     }
     items.push((
         Value::from("error"),
-        record
-            .exit
-            .spawn_error
-            .lock()
-            .unwrap()
-            .clone()
-            .map(Value::from)
-            .unwrap_or(nil()),
+        exit.spawn_error.map(Value::from).unwrap_or(nil()),
     ));
     value
 }
@@ -968,37 +1056,55 @@ pub fn command_metrics() -> CommandMetricSnapshot {
 }
 
 pub fn watch_snapshot(command_ids: &[String]) -> Vec<Value> {
-    let mut records = commands().lock().unwrap();
-    cleanup_expired(&mut records);
-    command_ids
-        .iter()
-        .map(|command_id| {
-            records
-                .get(command_id)
-                .map(|record| {
-                    map_value(vec![
-                        ("command_id", Value::from(command_id.clone())),
-                        ("status", Value::from(status(record))),
+    // Copy identities first. A command's publication guard must never be
+    // acquired while retaining the process-wide command-registry lock.
+    let observed = {
+        let mut records = commands().lock().unwrap();
+        cleanup_expired(&mut records);
+        command_ids
+            .iter()
+            .map(|id| {
+                let record = records
+                    .get(id)
+                    .map(|record| (record.pid, Arc::clone(&record.exit)));
+                let expired = record.is_none() && is_expired(id);
+                (id.clone(), record, expired)
+            })
+            .collect::<Vec<_>>()
+    };
+    observed
+        .into_iter()
+        .map(|(command_id, record, expired)| {
+            match record {
+                Some((pid, state)) => match observe_exit(&state) {
+                    Ok(exit) => map_value(vec![
+                        ("command_id", Value::from(command_id)),
+                        ("status", Value::from(exit.status(pid))),
+                        ("state_version", Value::from(exit.state_version)),
+                    ]),
+                    Err(message) => map_value(vec![
+                        ("command_id", Value::from(command_id)),
+                        // A watch is a hint: wake the waiter so its authoritative
+                        // get observes the structured error, never an invented exit.
+                        ("status", Value::from("FAILED")),
                         (
                             "state_version",
-                            Value::from(record.exit.state_version.load(Ordering::Acquire)),
+                            Value::from(state.state_version.load(Ordering::Acquire)),
                         ),
-                    ])
-                })
-                .unwrap_or_else(|| {
-                    map_value(vec![
-                        ("command_id", Value::from(command_id.clone())),
-                        (
-                            "status",
-                            Value::from(if is_expired(command_id) {
-                                "EXPIRED"
-                            } else {
-                                "NOT_FOUND"
-                            }),
-                        ),
-                        ("state_version", Value::from(0u64)),
-                    ])
-                })
+                        ("error_code", Value::from("COMMAND_STATE_UNAVAILABLE")),
+                        ("error", Value::from(message)),
+                        ("outcome", Value::from("unknown")),
+                    ]),
+                },
+                None => map_value(vec![
+                    ("command_id", Value::from(command_id)),
+                    (
+                        "status",
+                        Value::from(if expired { "EXPIRED" } else { "NOT_FOUND" }),
+                    ),
+                    ("state_version", Value::from(0u64)),
+                ]),
+            }
         })
         .collect()
 }
@@ -1132,6 +1238,141 @@ mod tests {
             .iter()
             .find_map(|(key, value)| (key.as_str() == Some(name)).then_some(value))
             .unwrap()
+    }
+
+    #[test]
+    fn observation_does_not_hold_spawn_lock_while_waiting_for_exit_code() {
+        let state = make_exit_state();
+        let code = state.code.lock().unwrap();
+        let observer_state = Arc::clone(&state);
+        let observer = std::thread::spawn(move || observe_exit(&observer_state));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut entered = false;
+        while Instant::now() < deadline {
+            if state.signal_guard.try_lock().is_err() {
+                entered = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let mut inverted = false;
+        while entered && Instant::now() < deadline {
+            if state.spawn_error.try_lock().is_err() {
+                inverted = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        // Release and join before asserting so the regression fails promptly,
+        // instead of leaving a permanently deadlocked waiter in the test suite.
+        drop(code);
+        assert!(observer.join().unwrap().is_ok());
+        assert!(entered, "observer did not enter the publication guard");
+        assert!(
+            !inverted,
+            "observer inverted wait_exit's code -> spawn lock order"
+        );
+    }
+
+    #[test]
+    fn completion_after_observation_does_not_tear_command_response() {
+        for code in [0, 17] {
+            let record = CommandSnapshot {
+                command_id: "observation-test".into(),
+                pid: 42,
+                cmd: "true".into(),
+                created_at_ms: 1,
+                started_at_ms: Some(2),
+                stdout: empty_reader("EXECD_COMMAND_STDOUT_LIMIT_BYTES"),
+                stderr: empty_reader("EXECD_COMMAND_STDERR_LIMIT_BYTES"),
+                exit: make_exit_state(),
+            };
+            let observed = observe_exit(&record.exit).unwrap();
+            {
+                let _publisher = record.exit.signal_guard.lock().unwrap();
+                *record.exit.code.lock().unwrap() = Some(code);
+                *record.exit.finished_at_ms.lock().unwrap() = Some(3);
+                record.exit.state_version.fetch_add(1, Ordering::AcqRel);
+            }
+            // Force the real interleaving: the child finishes after exit-code
+            // observation, before the response is formatted. Status and result
+            // must still describe the same observation.
+            let response = record_value_observed(&record, true, &observed);
+            assert_eq!(field(&response, "status").as_str(), Some("RUNNING"));
+            assert_eq!(field(&response, "running").as_bool(), Some(true));
+            assert!(field(&response, "exit_code").is_nil());
+            assert!(field(&response, "finished_at_ms").is_nil());
+            assert_eq!(field(&response, "state_version").as_u64(), Some(1));
+
+            let completed = record_value(&record, true);
+            assert_eq!(
+                field(&completed, "status").as_str(),
+                Some(if code == 0 { "SUCCEEDED" } else { "FAILED" })
+            );
+            assert_eq!(field(&completed, "exit_code").as_i64(), Some(code));
+            assert_eq!(field(&completed, "finished_at_ms").as_u64(), Some(3));
+            assert_eq!(field(&completed, "state_version").as_u64(), Some(2));
+        }
+    }
+
+    #[test]
+    fn command_observation_preserves_distinct_terminal_outcomes() {
+        let state = make_exit_state();
+        for (timed_out, killed, spawn_error, expected) in [
+            (false, false, None, "SUCCEEDED"),
+            (true, false, None, "TIMED_OUT"),
+            (false, true, None, "KILLED"),
+            (false, false, Some("spawn failed".to_string()), "FAILED"),
+        ] {
+            {
+                let _publisher = state.signal_guard.lock().unwrap();
+                *state.code.lock().unwrap() = Some(0);
+                state.timed_out.store(timed_out, Ordering::Release);
+                state.killed.store(killed, Ordering::Release);
+                *state.spawn_error.lock().unwrap() = spawn_error;
+            }
+            assert_eq!(observe_exit(&state).unwrap().status(42), expected);
+        }
+    }
+
+    #[test]
+    fn poisoned_command_observation_returns_structured_unknown_error() {
+        let record = CommandSnapshot {
+            command_id: "cmd-poisoned".into(),
+            pid: 42,
+            cmd: "true".into(),
+            created_at_ms: 1,
+            started_at_ms: Some(2),
+            stdout: empty_reader("EXECD_COMMAND_STDOUT_LIMIT_BYTES"),
+            stderr: empty_reader("EXECD_COMMAND_STDERR_LIMIT_BYTES"),
+            exit: make_exit_state(),
+        };
+        let result = std::panic::catch_unwind(|| {
+            let _guard = record.exit.code.lock().unwrap();
+            panic!("fixture poisons only this command's exit lock");
+        });
+        assert!(result.is_err());
+        for (error, expected_status) in [
+            (record_value(&record, true), "FAILED"),
+            (legacy_record_value(&record, true), "error"),
+        ] {
+            assert_eq!(field(&error, "status").as_str(), Some(expected_status));
+            assert_eq!(field(&error, "pid").as_i64(), Some(42));
+            assert_eq!(field(&error, "cmd").as_str(), Some("true"));
+            assert_eq!(field(&error, "running").as_bool(), Some(false));
+            assert_eq!(field(&error, "state_version").as_u64(), Some(1));
+            assert!(field(&error, "exit_code").is_nil());
+            assert!(field(&error, "exit_signal").is_nil());
+            assert_eq!(
+                field(&error, "error_code").as_str(),
+                Some("COMMAND_STATE_UNAVAILABLE")
+            );
+            assert_eq!(field(&error, "outcome").as_str(), Some("unknown"));
+            assert_eq!(field(&error, "retry").as_str(), Some("same_operation"));
+            assert_eq!(field(&error, "operation_id").as_str(), Some("cmd-poisoned"));
+            assert!(field(&error, "error").as_str().is_some());
+        }
     }
 
     #[test]

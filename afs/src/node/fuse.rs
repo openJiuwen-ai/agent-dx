@@ -37,7 +37,7 @@ use self::page_cache::{ActiveCachedViews, InodeCacheGates, PageCacheIdentities};
 use self::reply::{
     FuseOp, add_backend_entries, backend_cookie, backend_read_data, complete_read_reply, errno_in,
     errno_xattr, file_attr, fuse_errno, inline_local_read_data, native_open_reply_flags,
-    reply_empty, reply_statfs, reply_xattr,
+    reply_empty, reply_statfs, reply_xattr, return_inline_read_scratch, take_inline_read_scratch,
 };
 use self::request::{
     combine_empty_results, next_ingress_session_id, os_str_bytes, request_groups, sync_mode,
@@ -126,7 +126,6 @@ pub struct AfsFuse {
     page_cache_ids: Arc<Mutex<PageCacheIdentities>>,
     active_cached_views: Arc<Mutex<ActiveCachedViews>>,
     inode_cache_gates: Arc<InodeCacheGates>,
-    inline_local_read_scratch: Mutex<Vec<u8>>,
     state: Arc<Mutex<FuseState>>,
     file_handle_inodes: Arc<Mutex<HashMap<u64, u64>>>,
     dispatch: FuseDispatch,
@@ -168,7 +167,6 @@ impl AfsFuse {
             page_cache_ids: Arc::new(Mutex::new(PageCacheIdentities::default())),
             active_cached_views: Arc::new(Mutex::new(ActiveCachedViews::default())),
             inode_cache_gates: Arc::new(InodeCacheGates::default()),
-            inline_local_read_scratch: Mutex::new(Vec::new()),
             state,
             file_handle_inodes: Arc::new(Mutex::new(HashMap::new())),
             dispatch: FuseDispatch::with_capacity(
@@ -278,7 +276,7 @@ impl AfsFuse {
         >,
         reply: ReplyData,
     ) {
-        let mut scratch = self.inline_local_read_scratch.lock().unwrap();
+        let mut scratch = take_inline_read_scratch();
         let result = fuse_span.in_scope(|| {
             tracing::info_span!("node.fuse.read.execute").in_scope(|| {
                 fuse_span.record("queue_wait_us", 0_u64);
@@ -304,6 +302,7 @@ impl AfsFuse {
             request_span,
             reply,
         );
+        return_inline_read_scratch(scratch);
     }
 
     fn file_dispatch_key(&self, inode: u64, handle: u64) -> u64 {
@@ -364,6 +363,28 @@ impl AfsFuse {
         if let Some((metrics, filesystem)) = &self.requests {
             metrics.record(filesystem, operation);
         }
+    }
+
+    /// Diagnostic per-request trace, enabled with `AFS_FUSE_TRACE=1`.
+    fn trace_request(&self, operation: &'static str, ino: u64, fh: u64, name: &str) {
+        if !fuse_trace_enabled() {
+            return;
+        }
+        afs_logging::warn!("fuse.trace"; "op" => operation, "ino" => ino, "fh" => fh, "name" => name);
+    }
+
+    /// Diagnostic backend latency, enabled with `AFS_FUSE_TRACE=1`.
+    fn trace_elapsed(&self, operation: &'static str, ino: u64, started: std::time::Instant) {
+        if !fuse_trace_enabled() {
+            return;
+        }
+        afs_logging::warn!(
+            "fuse.time";
+            "op" => operation,
+            "ino" => ino,
+            "us" => started.elapsed().as_micros() as u64,
+            "q" => 0
+        );
     }
 
     fn record_io_request(&self, operation: &'static str, bytes: usize) {
@@ -484,6 +505,16 @@ impl Drop for AfsFuse {
     fn drop(&mut self) {
         self.finish_callbacks();
     }
+}
+
+/// `AFS_FUSE_TRACE=1` enables per-request diagnostic trace logs.
+pub(super) fn fuse_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("AFS_FUSE_TRACE")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
 }
 
 /// Replies with one synchronous read result. Success records the returned
@@ -622,6 +653,7 @@ impl Filesystem for AfsFuse {
             return;
         }
         self.record_request("lookup");
+        self.trace_request("lookup", parent.0, 0, &name.to_string_lossy());
         let Ok(parent_inode) = self.backend_inode(parent.0) else {
             reply.error(fuse_errno(libc::ESTALE));
             return;
@@ -636,9 +668,18 @@ impl Filesystem for AfsFuse {
         let mount_policy = self.policy.clone();
         let run = move || {
             let _front_guard = _front_guard;
+            let started = std::time::Instant::now();
             let result = backend
                 .lookup(&context, parent_inode, &name)
                 .map_err(errno_in(FuseOp::Lookup));
+            if fuse_trace_enabled() {
+                afs_logging::warn!(
+                    "fuse.time";
+                    "op" => "lookup",
+                    "ino" => parent_inode.value,
+                    "us" => started.elapsed().as_micros() as u64
+                );
+            }
             match result {
                 Ok(entry) => {
                     let ino = state.lock().unwrap().remember_lookup(&entry);
@@ -682,6 +723,7 @@ impl Filesystem for AfsFuse {
         self.record_request("getattr");
         let ino = ino.0;
         let fh = fh.map(|fh| fh.0);
+        self.trace_request("getattr", ino, fh.unwrap_or(0), "");
         let inline_local_read = fh.is_some_and(|fh| {
             self.state
                 .lock()
@@ -693,8 +735,10 @@ impl Filesystem for AfsFuse {
         let state = self.state.clone();
         let context = Self::context(req, 0);
         let mount_policy = self.policy.clone();
+        let entry_at = std::time::Instant::now();
         let run = move || {
             let _front_guard = _front_guard;
+            let started = std::time::Instant::now();
             let node = state.lock().unwrap().node(ino);
             let result = match node {
                 Some(FuseNode::Root(inode)) | Some(FuseNode::Backend(inode)) => {
@@ -710,11 +754,23 @@ impl Filesystem for AfsFuse {
                 }
                 None => Err(libc::ESTALE),
             };
+            if fuse_trace_enabled() {
+                afs_logging::warn!(
+                    "fuse.time";
+                    "op" => "getattr",
+                    "ino" => ino,
+                    "us" => started.elapsed().as_micros() as u64,
+                    "q" => started.duration_since(entry_at).as_micros() as u64
+                );
+            }
             let backend_inode = state.lock().unwrap().backend_inode(ino);
             match result {
                 Ok(attr) => match backend_inode {
                     Some(inode) => {
-                        policy::with_cache_policy(mount_policy.as_ref(), inode, |ttl, _| {
+                        policy::with_cache_policy(mount_policy.as_ref(), inode, |ttl, private| {
+                            if fuse_trace_enabled() {
+                                afs_logging::warn!("fuse.ttl"; "op" => "getattr", "ino" => ino, "ttl_ms" => ttl.as_millis() as u64, "private" => private);
+                            }
                             reply.attr(&ttl, &attr)
                         });
                     }
@@ -724,6 +780,10 @@ impl Filesystem for AfsFuse {
             }
         };
         if let Some(fh) = fh.filter(|_| !inline_local_read) {
+            // Every read that needs the per-handle turn goes through the worker
+            // queue. Running the turn on the receive thread would park it behind
+            // the copy and the backend read of an unrelated file, so there is no
+            // "private local root" shortcut here.
             self.dispatch
                 .submit_keyed(self.file_dispatch_key(ino, fh), run);
         } else {
@@ -1128,6 +1188,7 @@ impl Filesystem for AfsFuse {
         self.record_request("open");
         let ino = ino.0;
         let flags = flags.0;
+        self.trace_request("open", ino, 0, "");
         let Ok(inode) = self.backend_inode(ino) else {
             reply.error(fuse_errno(libc::ESTALE));
             return;
@@ -1456,6 +1517,7 @@ impl Filesystem for AfsFuse {
         self.record_io_request("write", data.len());
         let ino = ino.0;
         let fh = fh.0;
+        self.trace_request("write", ino, fh, "");
         let backend = self.backend.clone();
         let state = self.state.clone();
         let context = Self::context(req, 0);
@@ -1667,6 +1729,7 @@ impl Filesystem for AfsFuse {
         self.record_request("flush");
         let ino = ino.0;
         let fh = fh.0;
+        self.trace_request("flush", ino, fh, "");
         let inline_local_read = self
             .state
             .lock()
@@ -1682,6 +1745,7 @@ impl Filesystem for AfsFuse {
             normal_capacity: self.front_write.is_none().then_some(self.dispatch.capacity),
         };
         let dispatch_key = self.file_dispatch_key(ino, fh);
+        let entry_at = std::time::Instant::now();
         self.front_recover(ino, false, move |_front_guard, front_result| {
             if _front_guard.is_none()
                 && let Err(error) = front_result
@@ -1691,6 +1755,7 @@ impl Filesystem for AfsFuse {
             }
             let run = move || {
                 let _front_guard = _front_guard;
+                let started = std::time::Instant::now();
                 let file = state.lock().unwrap().file_handle(fh);
                 let result = file.ok_or(libc::ESTALE).and_then(|file| {
                     AfsFuse::validate_handle_inode_in(&state, ino)?;
@@ -1712,6 +1777,15 @@ impl Filesystem for AfsFuse {
                         .map_err(errno_in(FuseOp::Flush));
                     combine_empty_results(flushed, released)
                 });
+                if fuse_trace_enabled() {
+                    afs_logging::warn!(
+                        "fuse.time";
+                        "op" => "flush",
+                        "ino" => ino,
+                        "us" => started.elapsed().as_micros() as u64,
+                        "q" => started.duration_since(entry_at).as_micros() as u64
+                    );
+                }
                 reply_empty(reply, combine_empty_results(front_result, result));
             };
             if inline_local_read {
@@ -1735,6 +1809,7 @@ impl Filesystem for AfsFuse {
         self.record_request("release");
         let ino = ino.0;
         let fh = fh.0;
+        self.trace_request("release", ino, fh, "");
         let inline_local_read = self
             .state
             .lock()
@@ -1754,9 +1829,11 @@ impl Filesystem for AfsFuse {
         };
         let dispatch_key = self.file_dispatch_key(ino, fh);
         let front_queue = self.front_write.clone();
+        let entry_at = std::time::Instant::now();
         self.front_recover(ino, true, move |_front_guard, front_result| {
             let run = move || {
                 let _front_guard = _front_guard;
+                let started = std::time::Instant::now();
                 if let Some(queue) = &front_queue {
                     let last = file_handle_inodes
                         .lock()
@@ -1798,6 +1875,15 @@ impl Filesystem for AfsFuse {
                         .map_err(errno_in(FuseOp::Release));
                     combine_empty_results(released_flock, released_handle)
                 });
+                if fuse_trace_enabled() {
+                    afs_logging::warn!(
+                        "fuse.time";
+                        "op" => "release",
+                        "ino" => ino,
+                        "us" => started.elapsed().as_micros() as u64,
+                        "q" => started.duration_since(entry_at).as_micros() as u64
+                    );
+                }
                 reply_empty(reply, combine_empty_results(front_result, result));
             };
             if inline_local_read {
@@ -1819,12 +1905,6 @@ impl Filesystem for AfsFuse {
         self.record_request("fsync");
         let ino = ino.0;
         let fh = fh.0;
-        let inline_local_read = self
-            .state
-            .lock()
-            .unwrap()
-            .file_handle(fh)
-            .is_some_and(|file| file.inline_local_read);
         let backend = self.backend.clone();
         let state = self.state.clone();
         let context = Self::context(req, 0);
@@ -1833,6 +1913,13 @@ impl Filesystem for AfsFuse {
             normal_capacity: self.front_write.is_none().then_some(self.dispatch.capacity),
         };
         let dispatch_key = self.file_dispatch_key(ino, fh);
+        // fsync is a durability barrier: `sync_data`/`sync_all` can block for tens
+        // of milliseconds. It must never run on a receive thread, or the whole
+        // mount stops admitting requests (including the writeback that the fsync
+        // itself may be waiting for). A read-only handle is not exempt: an fsync
+        // on an O_RDONLY descriptor still flushes data dirtied by another writer of
+        // the same file. This is the rule `write_admission_mode` documents for
+        // writes ("anything that may wait stays on a worker") applied to fsync.
         self.front_recover(ino, false, move |_front_guard, front_result| {
             if _front_guard.is_none()
                 && let Err(error) = front_result
@@ -1855,11 +1942,7 @@ impl Filesystem for AfsFuse {
 
                 reply_empty(reply, combine_empty_results(front_result, result));
             };
-            if inline_local_read {
-                run();
-            } else {
-                dispatch.submit(dispatch_key, run);
-            }
+            dispatch.submit(dispatch_key, run);
         });
     }
 
@@ -2040,10 +2123,12 @@ impl Filesystem for AfsFuse {
         }
         self.record_request("create");
         afs_logging::info!("fuse.create"; "parent" => parent.0, "name" => name.to_string_lossy().into_owned());
+        self.trace_request("create", parent.0, 0, &name.to_string_lossy());
         let options = OpenOptions {
             kill_suidgid: false,
         };
         let context = Self::context(req, umask);
+        let started = std::time::Instant::now();
         let result = self.backend_inode(parent.0).and_then(|parent_inode| {
             Ok(self.backend.as_ref()).and_then(|backend| {
                 backend
@@ -2051,6 +2136,7 @@ impl Filesystem for AfsFuse {
                     .map_err(errno_in(FuseOp::Create))
             })
         });
+        self.trace_elapsed("create", parent.0, started);
         match result {
             Ok(created) => {
                 let ino = self.state.lock().unwrap().remember_lookup(&created.entry);

@@ -333,7 +333,7 @@ impl H2ConnectionPool {
         let physical_connections = self.physical_connections.clone();
         let keepalive_interval = self.config.keepalive_interval;
         let keepalive_timeout = self.config.keepalive_timeout;
-        tokio::spawn(async move {
+        tokio::spawn(adx_observability::trace::with_current_context(async move {
             let result = tokio::select! {
                 result = &mut connection => result,
                 result = keepalive_loop(&mut ping_pong, keepalive_interval, keepalive_timeout) => result,
@@ -342,7 +342,7 @@ impl H2ConnectionPool {
                 tracing::debug!(%node, %error, "Ingress-to-Relay H2 connection closed");
             }
             physical_connections.fetch_sub(1, Ordering::Relaxed);
-        });
+        }));
         Ok(sender)
     }
 }

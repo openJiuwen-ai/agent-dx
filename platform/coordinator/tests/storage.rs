@@ -2,6 +2,8 @@
 mod artifact_lifecycle;
 #[path = "storage/checkpoint_cleanup.rs"]
 mod checkpoint_cleanup;
+#[path = "storage/checkpoint_contention.rs"]
+mod checkpoint_contention;
 #[path = "storage/claims.rs"]
 mod claims;
 mod common;

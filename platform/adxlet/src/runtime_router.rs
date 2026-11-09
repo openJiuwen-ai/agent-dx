@@ -103,8 +103,31 @@ impl RuntimeDriver for RuntimeRouter {
         devices: &[DeviceAllocation],
         deadline: Instant,
     ) -> Result<IpAddr> {
-        self.class(&spec.runtime_class)?
-            .start_with_deadline(spec, id, generation, devices, deadline)
+        let trace = adx_observability::trace::Trace::child("sandbox.create");
+        trace.attribute("environment.id", spec.id.clone());
+        trace.attribute("runtime.id", id.to_owned());
+        trace.attribute("sandbox.backend", spec.runtime_class.clone());
+        trace
+            .run(async {
+                let driver = self.class(&spec.runtime_class)?;
+                let result = driver
+                    .start_with_deadline(spec, id, generation, devices, deadline)
+                    .await;
+                match &result {
+                    Ok(_) => {
+                        adx_observability::trace::attribute("result", "success".into());
+                        if let Some(sandbox_id) = driver.sandbox_id(id).await {
+                            adx_observability::trace::attribute("sandbox.id", sandbox_id);
+                        }
+                    }
+                    Err(error) => {
+                        adx_observability::trace::attribute("result", "fail".into());
+                        adx_observability::trace::attribute("error.message", error.to_string());
+                        adx_observability::trace::error_with(error.to_string());
+                    }
+                }
+                result
+            })
             .await
     }
     async fn is_running(&self, id: &str) -> Result<bool> {

@@ -81,6 +81,19 @@ HTTP 408 `DEADLINE_EXCEEDED`；错误响应的 entries 为空，不返回部分�
 不提供跨 Execd 重启的持久幂等保证。需要恢复命令结果时使用稳定 `command_id`；
 PID 可以在运行时被复用，不能作为长期恢复身份。
 
+命令的 status、exit_code、exit_signal、完成时间和版本来自同一次退出状态观测。
+观测失败时返回 `COMMAND_STATE_UNAVAILABLE`、`retry=same_operation`、`outcome=unknown`，
+保留 command_id／operation_id、PID 和明确的错误状态（稳定 ID 为 `FAILED`，PID 客户端为
+`error`），退出码与信号为 null。此错误状态不表示子进程已退出；SDK 抛出结构化异常，
+不会从字段缺省推断成功。`process.list` 中的单条观测错误也保留本次请求身份。
+HTTP 非 2xx 的观测错误在 SDK 中保留原 `EnvironmentHTTPError`、状态码、响应体和请求身份，
+并补齐同样的错误码、重试和未知结果字段。
+
+兼容旧服务端时，SDK 对 GET 或 HTTP wait 返回的普通终态缺失退出码，最多按同一
+command_id 再读一次；不得重启命令或推断 exit_code=0。再次不一致抛出
+`COMMAND_RESULT_INCONSISTENT`，`retry=never`、`outcome=unknown`。超时、信号和启动失败
+允许的 null 退出码不触发此修复。
+
 | 结果 | HTTP／业务表现 |
 |---|---|
 | 正常结果、命令非零退出、等待超时 | HTTP 200；读取 action 对应的状态及错误字段 |

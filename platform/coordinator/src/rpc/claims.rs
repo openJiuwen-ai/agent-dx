@@ -15,21 +15,38 @@ impl State {
         self.session.claim_barrier().await?;
         let mut saved = self.session.snapshot().await?;
         self.session.refresh_inspection_inventory().await?;
-        // An in-process catalog rebuild must retain local work already handed
-        // to an adxlet. Requeuing it would have no central task to start it.
-        // These reservations remain memory-only and keep their original expiry;
-        // a new Coordinator process recovers only the durable snapshot.
-        for (id, (assignment, _)) in &self.local_reservation_deadlines {
-            if !saved.environments.contains_key(id) {
-                if let Some(record) = self.environments.get(id).filter(|record| {
-                    record.assignment == *assignment
-                        && record.result.is_none()
-                        && !record.invalidated
-                        && record.recovery.is_none()
-                }) {
-                    saved.generation = saved.generation.max(assignment.generation);
-                    saved.environments.insert(id.clone(), record.clone());
-                }
+        // Both local and central assignments may already be executing before
+        // first-result publication. Preserve them during in-process repair;
+        // requeuing loses their owner and makes the node's commit NotFound.
+        // Never override durable ownership or retain a replaced/retired node
+        // session. Deadlines are not renewed, and a new process has no such
+        // volatile assignments to recover.
+        for (id, record) in &self.environments {
+            if saved.environments.contains_key(id)
+                || record.result.is_some()
+                || record.invalidated
+                || record.recovery.is_some()
+            {
+                continue;
+            }
+            let node_id = &record.assignment.node_id;
+            let same_session = saved.nodes.get(node_id).is_some_and(|saved_node| {
+                saved_node.retirement.is_none()
+                    && saved_node.shard_id == record.assignment.shard_id
+                    && saved_node.session.as_ref().is_some_and(|session| {
+                        self.nodes
+                            .get(node_id)
+                            .and_then(|node| node.session.as_ref())
+                            .is_some_and(|previous| previous.id == session.id)
+                            && self
+                                .live
+                                .get(node_id)
+                                .is_some_and(|live| !live.expired && live.session == session.id)
+                    })
+            });
+            if same_session {
+                saved.generation = saved.generation.max(record.assignment.generation);
+                saved.environments.insert(id.clone(), record.clone());
             }
         }
         let pending: Vec<_> = self

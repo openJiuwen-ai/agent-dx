@@ -25,13 +25,16 @@ Coordinator 另外记录已持久化的初次创建结果，首次权威 Running
 
 ### 成功新建调用耗时 P95
 
-API Server 从本次 create 应用服务调用开始计时，到确认 Published Running、路由目录已覆盖
-同一 assignment generation 和已发布 revision 后成功返回为止。包含本次调用内的排队、
-runtime 准备、配置的 readiness、路由激活、状态发布及目录确认；不承诺用户应用的任意业务健康。
+API Server 从本次 create 应用服务调用开始计时，截至确认 Published Running、路由目录已覆盖
+同一 assignment generation 和已发布 revision。包含本次调用内的排队、runtime 准备、配置的
+readiness、路由激活、状态发布及目录确认；不包含确认后的内部收尾等待，也不承诺用户应用的任意业务健康。
+确认时仅暂存耗时，完整 create 服务调用最终成功后，才与 success 结果在同一指标锁内提交样本。
+若在收尾阶段取消，只计 cancelled，不增加成功耗时样本。
 
 只有实际发起初次新建且成功返回的调用进入新直方图。Node 的 `newly_created` 响应标志区分
 实际新建和 Running 重放；API 另外排除 pending 重试、缓存重放、重复请求等待和已有 Running 复用。
 unknown、失败和取消不进入成功耗时样本；后续确认成功不补记最早起点，也不回填这份直方图。
+客户端断连不必然取消服务调用；SSE 后台任务若继续完成，仍按其最终服务结果统计。
 该指标正式名称是**成功新建调用耗时**，与跨重试、跨重启的逻辑创建首次受理耗时不同。
 没有成功样本时分位数无足够数据，不能显示为 0 秒或据此判定健康。
 
@@ -46,7 +49,7 @@ unknown、失败和取消不进入成功耗时样本；后续确认成功不补�
 | `adx_environment_create_responses_total` | counter/调用 | 原有 outcome=success、failure、unknown、cancelled；含重试与重放 | API Server create 完成/取消 |
 | `adx_environment_create_in_flight` | gauge/调用 | 原有；只表示活跃调用 | API Server |
 | `adx_environment_create_duration_seconds` | histogram/秒 | 原有混合结果调用耗时 | API Server |
-| `adx_environment_create_success_call_duration_seconds` | histogram/秒 | 新增，成功实际新建调用；无业务 ID 标签 | API Server 成功返回前 |
+| `adx_environment_create_success_call_duration_seconds` | histogram/秒 | 新增，成功实际新建调用；无业务 ID 标签 | API Server 完整 create 调用成功时 |
 | `adx_environment_create_errors_total` | counter/调用 | 新增 outcome=failure、unknown、cancelled；stage、reason 有限分类 | API Server 调用结束 |
 | `adx_environment_create_rejections_total` | counter/请求 | 新增 reason 有限分类；不属于 create 调用结果分母 | API Server HTTP/embedded 入口 |
 | `adx_environment_owned_creation_results_total` | counter/env | 新增 outcome=success、failure、timeout；已持久化的初次结果 | Coordinator 与 env 结果同 Redis CAS |
@@ -60,8 +63,8 @@ unknown、失败和取消不进入成功耗时样本；后续确认成功不补�
 | `adx_environment_operation_unknown` | gauge/env | 新增；操作意图已发布、节点随后失联的当前对象 | Coordinator 当前目录 |
 | `adx_environment_lifecycle_operations_total` | counter/操作调用 | 新增 operation=reload、delete、pause；intent=user、idle、policy；outcome=success、failure、unknown、cancelled | adxlet 操作结束 |
 | `adx_observability_snapshot_age_seconds` | gauge/秒 | 新增；距成功读取持久化累计数的本地时间 | Coordinator，约每秒刷新 |
-| `adx_observability_history_known` | gauge/布尔 | 新增；是否具有统计覆盖起点，旧 header 缺字段时为 0 | Coordinator |
-| `adx_observability_started_timestamp_seconds` | gauge/Unix 秒 | 新增；此 Redis 统计集的初始建立时间，未知时不导出 | Coordinator |
+| `adx_observability_history_known` | gauge/布尔 | 新增；是否具有可信统计覆盖起点，尚未确认起点时为 0 | Coordinator |
+| `adx_observability_started_timestamp_seconds` | gauge/Unix 秒 | 新增；可信统计覆盖起点，未知时不导出 | Coordinator |
 
 所有直方图共享边界：0.01、0.05、0.1、0.5、1、2、5、10、30、60、300、3600、+Inf 秒。
 API errors/rejections and adxlet lifecycle-operation producers export bounded
@@ -75,6 +78,9 @@ Coordinator 业务累计数与权威状态原子写入 Redis，重连、普通�
 源数据建立前的历史不补计。人工清库或重建 namespace 后计数重新开始；普通 Coordinator epoch
 变化只隔离旧写入。旧 exporter 被新 epoch 隔离后 `/metrics` 返回 503。
 Redis 读取失败时保留旧累计快照并增加 snapshot_age，不能将陈旧值视为恢复。
+旧 Header 的覆盖起点缺失或为 0 时，Coordinator 在当前 epoch 完整读取并校验统计后，
+通过 Header CAS 持久化当前时间 T0；仅从 T0 向后声明可信覆盖，不补齐此前历史，也不清空已有计数。
+已有非零起点保持不变。初始化暂时失败沿用统计刷新重试，不将未知历史宣称为已知，也不阻断业务启动。
 
 ### 失败分类
 

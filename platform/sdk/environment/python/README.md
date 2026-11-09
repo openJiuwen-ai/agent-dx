@@ -51,9 +51,22 @@ If the execution backend itself is OOM-killed, `environment.get_info().failure`
 contains an `EnvironmentFailure(reason="OomKilled", exit_code=..., message=...)`
 after the terminal state is committed. A failed direct invocation can raise
 `EnvironmentError` with `code="ENVIRONMENT_OOM"`, `retry="never"`, `outcome="terminal"`
-and `failure` details. Before publication, the caller may receive
-`OUTCOME_UNKNOWN`; query `get_info()` instead of interpreting route errors as
-OOM. Successful calls do not perform an additional catalog query.
+and `failure` details. A committed Failed record with another structured reason
+raises `ENVIRONMENT_FAILED` with the same terminal contract. These exceptions
+retain `request_id`, `operation_id`, `environment_id` and `first_error` (the first
+transport failure). An unavailable route known not to have accepted the operation
+raises `ENVIRONMENT_UNAVAILABLE` / `same_operation` / `not_started`. Otherwise,
+before failure publication the result can remain `OUTCOME_UNKNOWN`; query
+`get_info()` instead of interpreting route errors as OOM. Successful calls do
+not perform an additional catalog query.
+
+Background `commands.run(..., background=True)` preserves these confirmed
+`ENVIRONMENT_OOM` and `ENVIRONMENT_FAILED` exceptions directly, including their
+failure details and first error; it does not wrap them as an uncertain command
+submission. If a direct retry changes from `ENV_RESUMING` to a missing route,
+the SDK consults the current authenticated Environment catalog instead of
+reporting the earlier resuming state. A missing route alone still cannot prove
+backend failure or authorize a control-plane replay.
 
 ## Working directory
 
@@ -200,6 +213,16 @@ The source must have a valid lifecycle identity. In particular, an Environment w
 an active reverse tunnel cannot create a reusable Snapshot. A successful
 Snapshot leaves the source running and publishes an immutable artifact; the
 server records READY metadata only after that artifact is available.
+During a node snapshot attempt, a locally Journaled source state is republished
+until Coordinator accepts it or the attempt's checkpoint budget expires. This
+wait keeps the same record and revision and does not repeat backend capture.
+The backend receives the remaining budget, rather than a fresh full timeout.
+The Coordinator catalog-publication RPC receives that remaining budget too;
+the ordinary short control-RPC timeout does not truncate the snapshot attempt.
+This does not replay an uncertain publication or extend the original deadline.
+Publication conflicts and other errors still fail immediately. If publication
+times out after capture, local pending metadata and artifact references remain
+available for reconciliation; the SDK does not report a successful Snapshot.
 The SDK does not expose the reusable-Snapshot request ID and generates a fresh
 identity for each call. Raw HTTP clients that retry an uncertain request must
 reuse it only for the same source and name; they must not reuse one request ID
@@ -214,6 +237,17 @@ Use `Environment.create(snapshot_id, **kwargs)` with either a `SnapshotInfo` or 
 Snapshot ID string. It performs the normal environment create request with a
 `snapshotId`, so the result is a new `Environment` handle that reaches RUNNING in
 the usual way.
+
+Restoration retains the source environment's inherited-entrypoint setting and its managed image-process metadata mount. The captured workload resumes from memory; the entrypoint is not dispatched again. Callers still omit `inherit_entrypoint` when creating from a Snapshot rather than treating restoration as fresh initialization.
+
+Rootfs and readiness/healthcheck policies also inherit from the snapshot. Omit
+probe and `rootfs_readonly` options when restoring; they cannot replace captured
+configuration. Execd re-runs readiness and resets healthcheck counts through its
+existing resume protocol, and Adxlet continues handling terminal probe failures.
+`clone.wait_entrypoint()` (also on a handle returned by `Environment.from_id()`)
+polls the captured process and records its exit status. It does not launch an
+entrypoint; snapshots without one report an `EnvironmentError` from Execd.
+
 
 ```python
 clone = Environment.create(
@@ -332,9 +366,23 @@ forwarding, Ingress returns HTTP 503 with `X-ADX-Error-Code: ENV_RESUMING`,
 SDK retries retain the request ID and body; **each allowed retry gets the same
 configured timeout plus communication margin**. Retry count is configurable via
 `ConnectionConfig.request_max_attempts` / `ADX_REQUEST_MAX_ATTEMPTS` (default 3,
-including the first data-path attempt). Known-unsent connection failures and absent
-direct routes retain their existing single control-plane fallback; `ENV_RESUMING`
-never takes that fallback. Retry-After and jitter apply between demand retries.
+including the first data-path attempt). Connection failures and absent direct
+routes never trigger an implicit control-plane invoke: the current API Server
+does not implement that operation. After bounded direct retries, the SDK checks
+the authenticated Environment catalog and preserves a confirmed OOM or runtime
+failure, including the original operation identity and first transport failure.
+A terminal gateway `ENV_UNAVAILABLE` rejection also checks the catalog once for
+this cause without retrying the rejected operation. If no backend failure is
+confirmed, its HTTP status, error code and retry prohibition remain authoritative.
+If an earlier attempt may have executed, the SDK reports `outcome="unknown"`
+even when the last gateway response says `not_started` or `terminal`; the raw
+`payload` retains that last response for diagnosis. This does not enable another
+retry. The initial failure remains available as `first_error`, including when
+a later attempt receives an operation-level 404 or an HTTP error is wrapped.
+A still-running or unavailable catalog cannot confirm a terminal backend failure:
+known-unsent requests remain `not_started`, and ambiguous execution remains
+`unknown`. Neither case disables later direct calls. Retry-After and jitter apply
+between demand retries.
 Exhaustion raises `EnvironmentHTTPError` with the same `ENV_RESUMING` contract; callers
 can choose to try again. No sticky Ingress routing is required: replicas share the
 Coordinator intent and independently subscribe to the committed route.
@@ -686,6 +734,21 @@ fail explicitly.
 
 ## Recover a background command
 
+Command handles read the authoritative result by stable command ID. If an older
+runtime returns normal terminal status with a missing exit code, the SDK reads
+that same ID once more; it does not infer success or submit the command again.
+A second inconsistent response raises `COMMAND_RESULT_INCONSISTENT` with unknown
+outcome, preserving the environment and command operation identities. Legitimate
+signal, timeout and spawn-failure results retain their nullable exit-code contract.
+This check applies both to direct result reads and to the HTTP `process.wait`
+response. A runtime observation failure (`COMMAND_STATE_UNAVAILABLE`) raises
+`EnvironmentError` with `retry=same_operation` and `outcome=unknown`, preserving
+the command, environment and request identities; polling, listing and waiting do
+not turn an unavailable observation into a successful command result. Retry only
+the same read/wait operation, not command submission.
+For non-2xx responses this remains the original `EnvironmentHTTPError`, including
+its HTTP status, payload and request ID, with the same structured observation fields.
+
 Background commands run without an execution deadline by default. Pass
 `timeout` to set one explicitly; foreground commands default to 60 seconds.
 
@@ -754,9 +817,10 @@ as POSIX names or decimal IDs; Conch resolves names on the worker. The shared
 filesystem must already grant that UID/GID access; ADX does not recursively chown
 mounted data. Omitted fields preserve the runtime deployment's identity.
 
-This override currently requires Conch and `python3` in the guest template's PATH
-for its native privilege-drop wrapper. Other runtime backends reject it. It
-cannot be combined with `inherit_entrypoint=True` or a snapshot identity override;
+Conch requires `python3` in the guest template's PATH for its native privilege-drop
+wrapper. For sandboxd, adxlet logs that it ignored the pair and proceeds with the
+identity configured by the sandboxd runtime template. The pair cannot be combined
+with `inherit_entrypoint=True` or a snapshot identity override;
 image entrypoint `process.user` retains its separate meaning. Use matching API
 Server, Coordinator, adxlet, and SDK versions so the typed identity is preserved
 across the complete create path. Unknown account resolution fails creation.
@@ -789,3 +853,10 @@ storage/runtime acceptance remains in P7.
 Volume IDs accept 1–256 ASCII letters, digits, dots, underscores or hyphens;
 `.` and `..` are rejected because URL clients normalize those path segments.
 The SDK validates both definitions and lookup/deletion IDs before sending requests.
+
+
+Create retries retain the authoritative final error type/status, request identity,
+retry and outcome fields, and expose the initial failed attempt as `first_error`.
+An unsuccessful capability query preserves its transport/domain exception; only
+a confirmed response missing the required capabilities is `UnsupportedFeature`.
+These diagnostics do not change operation replay or source ownership rules.

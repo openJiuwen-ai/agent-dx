@@ -27,6 +27,61 @@ sudo adxctl config init
 
 将 Relay 的 `ADX_DATA_PLANE_ALLOWED_TARGET_CIDRS` 改为 sandboxd 实际实例网络；示例 `10.88.0.0/16` 是部署输入，不是后端网络探测结果。
 
+### 使用随包的 sandboxd
+
+构建时设置 `ADX_WITH_SANDBOXD=1`。x86_64 和 ARM64 都使用 Buildkite 的
+`build/e2e/download_backend.py` 校验并下载同一锁定版本的 OBS 后端包。
+部署时执行上面的 `install.sh`，它会一并验证和安装 `runtime/sandboxd/` 下的后端文件。
+
+在采用 runc 或 gVisor 的节点上，使用随包的 systemd unit 和配置示例。以下命令适用于默认安装路径
+`/opt/adx` 的新节点。主机需要 systemd、Python 3、iptables、iproute2、可写的 cgroup 和可用的
+overlayfs，以及与后端二进制匹配的 libseccomp 和 AppArmor 运行库。x86_64 后端需要
+glibc 2.34 或更高版本。即使只用 OCI 镜像，sandboxd 启动时也会加载随包的模板和空认证文件。
+使用 Nydus 或 OSS 镜像时还需准备 distill_fs 并配置镜像源。
+
+Buildkite 在启动 sandboxd 前检查 `net.bridge.bridge-nf-call-iptables=1`。需要准备的新节点上，
+先加载模块并持久化该设置：
+
+```sh
+if [ ! -e /proc/sys/net/bridge/bridge-nf-call-iptables ]; then
+    sudo modprobe br_netfilter
+fi
+printf '%s\n' br_netfilter | sudo tee /etc/modules-load.d/adx-br-netfilter.conf
+printf '%s\n' 'net.bridge.bridge-nf-call-iptables = 1' | sudo tee /etc/sysctl.d/99-adx-bridge-netfilter.conf
+sudo sysctl -p /etc/sysctl.d/99-adx-bridge-netfilter.conf
+test "$(sysctl -n net.bridge.bridge-nf-call-iptables)" = 1
+```
+
+使用包内 EROFS 根文件系统时，在主机启用 EROFS 和 loop 设备支持后，执行挂载探测：
+
+```sh
+sudo python3 /opt/adx/current/lib/sandboxd_preflight.py --erofs-image /opt/adx/current/runtime/adx-runtime-rootfs.img
+```
+
+`sandboxd.service` 在启动前使用同一个脚本检查桥接网络。安装配置、启动服务并验证 socket：
+
+```sh
+sudo install -d -m 0700 /etc/adx/sandboxd
+sudo install -m 0600 /opt/adx/current/etc/examples/sandboxd/sandboxd.toml /opt/adx/current/etc/examples/sandboxd/*.json /etc/adx/sandboxd/
+sudoedit /etc/adx/sandboxd/sandboxd.toml
+sudo install -m 0644 /opt/adx/current/etc/examples/sandboxd/sandboxd.service /etc/systemd/system/sandboxd.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now sandboxd.service
+sudo sbox list
+```
+
+在启动前为各节点分配不重叠的 IP 地址池，避开主机路由及其他运行时使用的网段。
+sandboxd 要求地址池至少包含 1000 个地址，可使用示例的 `/22` 或更大的网段。
+ADX Relay 的目标 CIDR 需要覆盖实际使用的地址池。私有 OCI 镜像的认证文件由部署方提供，配置中的默认位置是
+`/etc/adx/sandboxd/registry_auths.json`。unit 以 root 运行，默认 socket 仅供本机 root
+访问。已运行 sandboxd 的节点应沿用其原有配置和 socket，升级前先按现有流程排空节点。
+随包 unit 使用 `UMask=0022`，使非 root 的 runsc 进程可以遍历新解包的 OCI 镜像层目录。
+升级已安装的 unit 后，执行 `systemctl daemon-reload` 并重启 sandboxd 使设置生效。
+如果旧 OCI 层目录以 `0700` 创建，排空节点后可将 `sandboxd.toml` 的 `[plugin.image].root`
+指向新的缓存目录，让 sandboxd 在新 umask 下重新解包同一镜像。
+自定义 ADX 安装路径时需相应调整 unit 和配置中的二进制路径。sandboxd 就绪后按下文启动
+ADX，使用 `runtime="runc"` 或 `runtime="runsc"` 创建实例。随包 runsc 采用 AKernel 适配版本，ARM64 为 20260817.0-akernel.2，x86_64 为 20260817.0-akernel.4-3-g87e8441b6db1。
+
 ## 证书与初始密钥
 
 以下为默认 mTLS 模式的证书要求；network 模式只需要对外 HTTPS 证书与初始 API Key。证书由部署环境签发。内部证书需要合适的 serverAuth/clientAuth 用途，示例的内部服务名为 `adx.internal`，必须被服务端证书 SAN 覆盖。每个组件使用独立的证书和私钥。
@@ -119,7 +174,7 @@ SDK 中的 runtime 及资源数值应与已准备的 sandboxd 后端匹配。例
 
 配置和证书在进程启动时读取。更新证书时，同步更新引用它的 `peers` DER 文件和必要的 CA，再按部署维护流程重启相关组件。本期没有 `adxctl restart` 子命令，也不提供证书热重载或无中断轮换保证。
 
-`adxctl stop` 会先删除本机已管理实例，提交清理结果，然后退出服务；停止 supervisor 的 SIGTERM/SIGINT 也遵守该契约。它不适合作为保留现有实例的证书更新命令。需要保留实例时，由部署环境重启选定组件，待 adxlet 完成权威对账和路由同步后恢复使用。Coordinator 不可用时，adxlet 重启只能观察实际实例，需等待 Coordinator 对账后恢复生命周期操作。
+`shutdown_mode` 默认为 `preserve`：无参数 `adxctl stop` 和 supervisor 的 SIGTERM/SIGINT 跳过 Env drain，正常停止受管进程。adxlet 收到停止信号后关闭新准入，在内嵌 Relay 排水期间继续心跳和运行时控制，排水完成后退出，不主动注销节点。需要删除本机实例时显式选择 `drain`，先提交清理结果，再退出服务。`stop --mode preserve|drain` 只覆盖单次停止；信号退出始终使用启动时加载的配置。仅重启 adxlet 的维护可使用 preserve，前提是后端执行仍存活、节点 ID 和 RPC/Relay 地址保持不变，并在心跳期限内经 Coordinator 的 GetSession 校验接续会话，随后等待权威对账和路由同步。证书变更仍须满足身份信任校验；preserve 不延长心跳期限，超时或后端停止后不能保证接续。Coordinator 不可用时，adxlet 重启只能观察实际实例，需等待 Coordinator 对账后恢复生命周期操作；preserve 本身不保证恢复结果。
 
 Kubernetes 同样在 Pod 内运行进程，但部署与验收应使用独立的 [K8s 驱动](../../build/e2e/kubernetes/README.md)；其 namespace、镜像身份、用例结果与清理记录单独保存。
 
@@ -128,6 +183,6 @@ Kubernetes 同样在 Pod 内运行进程，但部署与验收应使用独立的 
 Coordinator 服务配置 `failed_retention_seconds` 默认600秒，必须大于零。终态 Failed 在保留期后自动清理；创建失败的资源预留立即释放。正在重启／恢复的记录不按普通终态回收，清理失败继续重试。具体契约见 [Failed Environment GC](../testing/failed-environment-gc.md)。
 
 Coordinator 的 `node_retention_seconds` 默认 1800 秒，控制已失联且无 Environment
-引用的节点注册保留期，必须大于零。优雅停止通过会话校验的 `UnregisterNode` 主动下线，
+引用的节点注册保留期，必须大于零。显式 drain 后的优雅停止通过会话校验的 `UnregisterNode` 主动下线，
 排空节点无需等待该保留期。仍有执行/恢复引用时保留必要上下文，待对象退役后清理。
 具体边界见 [离线节点退役与主动注销](../testing/recovery-discovery.md#离线节点退役与主动注销)。

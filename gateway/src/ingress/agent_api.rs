@@ -368,7 +368,11 @@ impl AgentApi {
         request
             .headers_mut()
             .remove(adx_agent_core::parameters::HEADER);
-        let scope = ManagedService::binding_scope(tenant, &access.target)?;
+        request
+            .headers_mut()
+            .remove(adx_agent_core::target::BINDING_ID_HEADER);
+        let scope =
+            ManagedService::binding_scope(tenant, &access.target, access.binding_id.as_deref())?;
         let notice = super::agent_access::BindingNotice::new(&scope)?;
         request.extensions_mut().insert(notice);
         let context = Arc::new(RequestContext::new(self.request_timeout));

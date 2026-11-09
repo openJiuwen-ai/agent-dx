@@ -1,5 +1,32 @@
 use super::*;
 
+pub(super) async fn business_header(
+    rig: &common::Redis,
+    edit: Option<fn(&mut serde_json::Value)>,
+) -> serde_json::Value {
+    let client = redis::Client::open(rig.url.as_str()).unwrap();
+    let mut connection = client.get_multiplexed_async_connection().await.unwrap();
+    let key = "adx:{test}:control:v1";
+    let raw: String = redis::cmd("HGET")
+        .arg(key)
+        .arg("header")
+        .query_async(&mut connection)
+        .await
+        .unwrap();
+    let mut header = serde_json::from_str(&raw).unwrap();
+    if let Some(edit) = edit {
+        edit(&mut header);
+        redis::cmd("HSET")
+            .arg(key)
+            .arg("header")
+            .arg(header.to_string())
+            .query_async::<()>(&mut connection)
+            .await
+            .unwrap();
+    }
+    header
+}
+
 #[tokio::test]
 #[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
 async fn creation_observation_is_durable_and_not_recounted_by_replay() {
@@ -30,6 +57,37 @@ async fn creation_observation_is_durable_and_not_recounted_by_replay() {
         restarted.business_counters().await.unwrap().creations,
         [1, 0, 0]
     );
+    assert_eq!(session.business_counters().await, Err(Error::Conflict));
+    let missing_starts: [fn(&mut serde_json::Value); 3] = [
+        |header| {
+            header.as_object_mut().unwrap().remove("observability");
+        },
+        |header| {
+            header["observability"]
+                .as_object_mut()
+                .unwrap()
+                .remove("started_at_unix_millis");
+        },
+        |header| header["observability"]["started_at_unix_millis"] = 0.into(),
+    ];
+    for edit in missing_starts {
+        business_header(&rig, Some(edit)).await;
+        let earliest = adx_core::observation::now_millis().unwrap();
+        let counters = restarted.business_counters().await.unwrap();
+        assert!(counters.started_at_unix_millis >= earliest);
+        assert!(counters.started_at_unix_millis <= adx_core::observation::now_millis().unwrap());
+        let persisted = business_header(&rig, None).await;
+        assert_eq!(
+            persisted["observability"]["started_at_unix_millis"],
+            counters.started_at_unix_millis
+        );
+        assert_eq!(
+            persisted["observability"]["creations"],
+            serde_json::json!([0, 0, 0])
+        );
+        assert_eq!(counters.creations, [1, 0, 0]);
+        assert_eq!(restarted.business_counters().await.unwrap(), counters);
+    }
 }
 
 fn interruption(

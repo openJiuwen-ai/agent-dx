@@ -669,6 +669,13 @@ pub fn create_spec_with_environment(
         root.r#type = "image".into();
     }
     let snapshot = (!r.snapshot_id.trim().is_empty()).then(|| r.snapshot_id.trim().to_string());
+    // Match the native SDK: this option starts a fresh image workload. Restore
+    // resumes captured processes and inherits their metadata from the snapshot.
+    if snapshot.is_some() && r.inherit {
+        return Err(invalid(
+            "inheritEntrypoint=true cannot be combined with snapshotId",
+        ));
+    }
     if snapshot.is_none()
         && runtime_profile.is_none()
         && root.imageurl.trim().is_empty()
@@ -747,22 +754,25 @@ pub fn create_spec_with_environment(
     // declaration validated while the originating SDK handle uses it to guard
     // get_port_url().
     let ports = validate_ports(&r.ports)?;
-    let cpu_limit = if r.cpu_limit == 0 {
+    let cpu_limit = if r.cpu_limit == 0 && snapshot.is_none() {
         cpu
     } else {
         positive(r.cpu_limit, 1)?
     };
-    let memory_limit = if r.mem_limit == 0 {
+    let memory_limit = if r.mem_limit == 0 && snapshot.is_none() {
         memory
     } else {
         positive(r.mem_limit, 1048576)?
     };
-    let disk_limit = if r.storage_limit_mb == 0 {
+    let disk_limit = if r.storage_limit_mb == 0 && snapshot.is_none() {
         disk
     } else {
         positive(r.storage_limit_mb, 1048576)?
     };
-    if cpu_limit < cpu || memory_limit < memory || disk_limit < disk {
+    if (cpu_limit != 0 && cpu_limit < cpu)
+        || (memory_limit != 0 && memory_limit < memory)
+        || (disk_limit != 0 && disk_limit < disk)
+    {
         return Err(invalid("resource limits cannot be below requests"));
     }
     let readonly = root

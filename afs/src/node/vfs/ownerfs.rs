@@ -28,7 +28,7 @@ use fuser::Notifier;
 
 use self::root::{PresentedRootAccess, RootGrant, RootId, RootManager, RootRight};
 use super::{
-    Backend,
+    Backend, WriteAdmissionMode,
     locks::{LockError, LockRequest, LockTable, LockTableLimits, LockWaiterId, LockWaiterOutcome},
     types::{
         AttributeChange, BackendInode, CreatedFile, DirectoryEntry, DirectoryHandle, Entry,
@@ -96,6 +96,19 @@ struct PrivateFuseCache {
 }
 
 impl PrivateFuseCache {
+    /// True only when this node is the sole observer of the root: it holds the
+    /// active local grant and no peer has ever been admitted to it.
+    ///
+    /// A local grant only says this node may write. A peer read grant is
+    /// admitted through `validate_peer`, which records the root here and never
+    /// reverts for the rest of the daemon session, so this is the conservative
+    /// answer to "could somebody else observe this file". Both the attribute TTL
+    /// and the close-time sync decision must use this one predicate: they used to
+    /// disagree, and that disagreement let a shared root skip the close sync.
+    fn root_is_exclusive(&self, roots: &RootManager, root_id: &RootId) -> bool {
+        roots.has_active_local_root(root_id) && !self.shared_roots.contains(root_id)
+    }
+
     fn new() -> Self {
         Self::with_native_home_eligibility(false)
     }
@@ -306,13 +319,22 @@ impl OwnerFs {
         if cache.native_home_eligible {
             return reply(Duration::ZERO, false);
         }
-        let private = self
-            .local
-            .as_ref()
-            .and_then(|local| local.private_root_for_inode(inode.value))
-            .is_some_and(|id| !cache.shared_roots.contains(&id));
+        // The synthetic mount root is not a materialised inode record, so the
+        // per-inode root lookup cannot classify it and every path walk would
+        // fall back to a zero attribute TTL. It is this node's own namespace
+        // directory, so give it the same one second freshness bound the
+        // workspace root directories already get.
+        let private = if inode.value == OWNERFS_ROOT_INODE {
+            true
+        } else {
+            self.local.as_ref().is_some_and(|local| {
+                local
+                    .private_root_for_inode(inode.value)
+                    .is_some_and(|id| cache.root_is_exclusive(&local.roots, &id))
+            })
+        };
         let ttl = if private {
-            Duration::from_secs(1)
+            ownerfs_cache_ttl()
         } else {
             Duration::ZERO
         };
@@ -1141,6 +1163,26 @@ impl Backend for OwnerFs {
     ) -> Result<usize> {
         self.require_local()?
             .write_with_options(handle, offset, data, options)
+    }
+
+    /// Every write is dispatched to a worker.
+    ///
+    /// The DFS policy this used to mirror admits a write to the receive thread
+    /// when it "cannot block". For OwnerFs that condition is not decidable up
+    /// front: a local write takes the per-handle lock and performs a synchronous
+    /// `pwrite`, and with `Borrowed` admission the receive thread first waits for
+    /// that handle's FIFO turn on `run_borrowed_keyed`. `try_lock` only removes
+    /// the wait on the lock probe; it cannot make the following write, or the
+    /// turn wait in front of it, non-blocking. A single slow write would
+    /// therefore stop the receive thread from admitting unrelated requests,
+    /// including the kernel writeback that a dirty-page workload depends on.
+    ///
+    /// Ordering, bounded memory and backpressure are all preserved by the keyed
+    /// worker queue: `submit_keyed` keeps the per-handle FIFO turn, and an owned
+    /// (copied) input buffer keeps the receiver's data lifetime independent of
+    /// the request.
+    fn write_admission_mode(&self, _handle: FileHandle) -> WriteAdmissionMode {
+        WriteAdmissionMode::Queued
     }
 
     fn flush(&self, _: &RequestContext, handle: FileHandle) -> Result<()> {
@@ -2160,6 +2202,25 @@ impl LocalOwnerFs {
         self.roots.has_active_local_root(&id).then_some(id)
     }
 
+    /// True only when this node is the sole party that can observe the root:
+    /// it holds the active local grant *and* no peer has ever validated access
+    /// to it.
+    ///
+    /// `has_active_local_root` alone only says this node may write; it says
+    /// nothing about concurrent readers. A peer read grant is admitted through
+    /// `validate_peer`, which records the root in `shared_roots` for the rest of
+    /// the daemon session, so that set is the conservative answer to "could
+    /// somebody else read this file through another path". Skipping the
+    /// close-time sync is only safe when the answer is no.
+    fn root_is_exclusive_local(&self, root_id: &RootId) -> bool {
+        match self.private_cache.lock() {
+            Ok(cache) => cache.root_is_exclusive(&self.roots, root_id),
+            // Poisoned cache: keep the durability guarantee rather than the
+            // optimisation.
+            Err(_) => false,
+        }
+    }
+
     fn remote_for_record(&self, record: &NodeRecord, right: RootRight) -> Result<RemoteRoot> {
         self.acquire_remote_root(&record.root_id, right)
     }
@@ -2405,6 +2466,21 @@ impl LocalOwnerFs {
         parent: &StoragePath,
         expected: &files::FileIdentity,
     ) -> Result<FileAttributes> {
+        self.namespace_parent_attributes_with_dir(data_dir, parent, expected)
+            .map(|(attributes, _dir)| attributes)
+    }
+
+    /// Same as [`Self::namespace_parent_attributes`] but keeps the open parent
+    /// directory so callers can resolve a child without re-walking the path.
+    fn namespace_parent_attributes_with_dir(
+        &self,
+        data_dir: &StoragePath,
+        parent: &StoragePath,
+        expected: &files::FileIdentity,
+    ) -> Result<(
+        FileAttributes,
+        <LocalFs as crate::node::storage::FileStore>::Directory,
+    )> {
         let physical = data_dir.join_path(parent).map_err(Error::from)?;
         let dir = self.disk.open_dir(&physical).map_err(Error::from)?;
         let metadata = dir.metadata().map_err(Error::from)?;
@@ -2412,7 +2488,7 @@ impl LocalOwnerFs {
             let actual = identity_from_metadata(&metadata)?;
             check_expected_identity(Some(expected), &actual)?;
         }
-        attributes_from_metadata(metadata)
+        Ok((attributes_from_metadata(metadata)?, dir))
     }
 
     fn peer_lookup(
@@ -3197,7 +3273,6 @@ impl LocalOwnerFs {
         access: &PresentedRootAccess,
         directory: files::RemoteDirectory,
     ) -> Result<()> {
-        self.validate_peer(access, peer_node_id, RootRight::Lookup)?;
         check_remote_directory_scope(access, &directory)?;
         self.check_peer_directory_handle(
             decode_directory_handle(&directory)?,
@@ -3390,12 +3465,12 @@ impl LocalOwnerFs {
         access: &PresentedRootAccess,
         file: files::RemoteFile,
     ) -> Result<()> {
-        self.validate_peer(access, peer_node_id, RootRight::Lookup)?;
+        // Same rule as peer_releasedir: the recorded open authorizes the close.
         check_remote_file_scope(access, &file)?;
         let handle = decode_file_handle(&file)?;
         // A retry after Home applied RELEASE but lost its ACK is successful.
         // Monotonic handle IDs are never reused; an existing handle still
-        // requires the full peer/root/session/identity check below.
+        // requires the full peer/root/session check below.
         if !self
             .state
             .lock()
@@ -3878,6 +3953,17 @@ impl LocalOwnerFs {
     }
 
     fn getxattr(&self, ctx: &RequestContext, inode: BackendInode, name: &OsStr) -> Result<Vec<u8>> {
+        // CORRECTNESS/PERF: OwnerFs only stores `user.*` xattrs. A probe for any
+        // other namespace (notably `security.capability`, which the kernel issues
+        // on nearly every create/open) means "this attribute is absent", so answer
+        // ENODATA via IO_NO_DATA. Returning ENOTSUP/FAILED_PRECONDITION here makes
+        // the kernel treat every file creation as a failed xattr lookup.
+        if !name.as_bytes().starts_with(b"user.") {
+            return Err(Error::coded(
+                afs_error::IO_NO_DATA,
+                "xattr namespace is not stored by OwnerFs",
+            ));
+        }
         validate_user_xattr_name(name)?;
         if let Some((record, remote)) = self.remote_entry_for_xattr(inode, RootRight::Read)? {
             return remote.files.getxattr(
@@ -4016,21 +4102,29 @@ impl LocalOwnerFs {
             .roots
             .enter_root(&parent_record.root_id, RootRight::Write)?;
         let _namespace_guard = self.namespace_lock.lock().map_err(|_| poisoned())?;
-        let parent_attributes = self.namespace_parent_attributes(
+        let create_trace = std::time::Instant::now();
+        let (parent_attributes, parent_dir) = self.namespace_parent_attributes_with_dir(
             root_use.data_dir(),
             &parent_record.relative,
             &parent_record.identity,
         )?;
+        let mark_parent_attrs = create_trace.elapsed();
         let physical = root_use.data_dir().join_path(&child).map_err(Error::from)?;
         let create_flags = create_open_flags_for_backend(flags) | libc::O_CREAT;
-        let created_new = path_missing_before_create(&self.disk, &physical)?;
+        // Resolve the child through the already-open parent directory: a
+        // path-based stat walks every component again.
+        let created_new = match parent_dir.child_present(name) {
+            Ok(present) => !present,
+            Err(_) => path_missing_before_create(&self.disk, &physical)?,
+        };
+        let mark_path_missing = create_trace.elapsed();
         if created_new {
             authorize_create_in_directory(ctx, &parent_attributes)?;
         }
-        let create_file = self
-            .disk
-            .open_file(&physical, OpenSpec::new(create_flags, mode))
-            .map_err(Error::from)?;
+        let create_file =
+            LocalFs::open_child_in(&parent_dir, name, OpenSpec::new(create_flags, mode))
+                .map_err(Error::from)?;
+        let mark_create_open = create_trace.elapsed();
         if created_new {
             apply_created_file_owner_and_mode(
                 &create_file,
@@ -4041,15 +4135,21 @@ impl LocalOwnerFs {
         }
         let created_metadata = create_file.metadata().map_err(Error::from)?;
         let created_identity = identity_from_metadata(&created_metadata)?;
+        let mark_owner_mode = create_trace.elapsed();
         drop(create_file);
-        let file = self
-            .disk
-            .open_file(&physical, OpenSpec::new(flags & !libc::O_CREAT, 0))
-            .map_err(Error::from)?;
+        // The reopened descriptor is what the client actually gets: it carries
+        // the access mode the caller asked for (and without O_CREAT). The create
+        // descriptor cannot be handed out directly, e.g. a read-only create
+        // (O_RDONLY|O_EXCL) must still yield a readable handle.
+        let file =
+            LocalFs::open_child_in(&parent_dir, name, OpenSpec::new(flags & !libc::O_CREAT, 0))
+                .map_err(Error::from)?;
+        drop(parent_dir);
         let reopened_identity = identity_from_metadata(&file.metadata().map_err(Error::from)?)?;
         if reopened_identity != created_identity {
             return Err(stale("created file was replaced before readonly reopen"));
         }
+        let mark_reopen = create_trace.elapsed();
         let write_sync = write_sync_mode_from_flags(flags);
         let needs_flush = flags & libc::O_TRUNC != 0 && write_sync == WriteSyncMode::None;
         if flags & libc::O_TRUNC != 0 {
@@ -4062,6 +4162,7 @@ impl LocalOwnerFs {
         let identity = identity_from_metadata(&metadata)?;
         let attributes = attributes_from_metadata(metadata)?;
         let mut state = self.state.lock().map_err(|_| poisoned())?;
+        let mark_state_lock = create_trace.elapsed();
         let inode = state.inode_for_path(
             parent_record.root_id,
             child,
@@ -4069,6 +4170,7 @@ impl LocalOwnerFs {
             attributes.clone(),
             attributes.kind,
         );
+        let mark_inode = create_trace.elapsed();
         let handle = state.insert_file_handle(
             files::LocalOpenFile {
                 #[cfg(test)]
@@ -4084,6 +4186,23 @@ impl LocalOwnerFs {
             write_sync,
             flags,
         );
+        let mark_handle = create_trace.elapsed();
+        if ownerfs_create_trace_enabled() {
+            let total = create_trace.elapsed();
+            afs_logging::warn!(
+                "ownerfs.create.stage";
+                "parent_attrs" => mark_parent_attrs.as_micros() as u64,
+                "path_missing" => (mark_path_missing - mark_parent_attrs).as_micros() as u64,
+                "create_open" => (mark_create_open - mark_path_missing).as_micros() as u64,
+                "owner_mode" => (mark_owner_mode - mark_create_open).as_micros() as u64,
+                "reopen" => (mark_reopen - mark_owner_mode).as_micros() as u64,
+                "state_lock" => (mark_state_lock - mark_reopen).as_micros() as u64,
+                "inode_for_path" => (mark_inode - mark_state_lock).as_micros() as u64,
+                "insert_handle" => (mark_handle - mark_inode).as_micros() as u64,
+                "tail" => (total - mark_reopen).as_micros() as u64,
+                "total" => total.as_micros() as u64
+            );
+        }
         Ok(CreatedFile {
             entry: Entry {
                 inode: backend_inode(inode),
@@ -4273,6 +4392,28 @@ impl LocalOwnerFs {
         match &mut file.file {
             OpenFileHandle::Local(file) if file.needs_flush => {
                 file.check_no_fatal_sync_error()?;
+                // Closing a handle needs no data sync only when this node is
+                // the sole observer of the root: the write already sits in the
+                // page cache and the kernel writeback thread persists it, just
+                // like a local filesystem that was never fsync'ed.
+                //
+                // The exclusivity test must cover readers, not just writers.
+                // Holding the local write grant does not stop a peer from
+                // taking a read grant on the same root and reading the file
+                // through a path that bypasses this node's page cache; in that
+                // case skipping the sync lets the peer observe a stale or short
+                // file after our close has returned. `root_is_exclusive_local`
+                // therefore also requires that no peer has ever been admitted
+                // to the root.
+                //
+                // AFS_OWNERFS_CLOSE_SYNC=1 restores the old behaviour.
+                if file.write_sync == WriteSyncMode::None
+                    && self.root_is_exclusive_local(&file.handle.root_id)
+                    && !ownerfs_close_sync_forced()
+                {
+                    file.needs_flush = false;
+                    return Ok(());
+                }
                 let sync_result = file.handle.file.sync_data().map_err(Error::from);
                 if let Err(error) = &sync_result {
                     file.remember_fatal_sync_error(error);
@@ -4475,26 +4616,58 @@ impl LocalOwnerFs {
                                         record.relative.as_path().as_os_str(),
                                         Some(&record.identity),
                                     )?;
-                                    let entries = remote.files.readdir(
+                                    let entries = match remote.files.readdir(
                                         &remote.grant,
                                         &directory,
                                         cookie,
                                         max_entries,
-                                    )?;
+                                    ) {
+                                        Ok(entries) => entries,
+                                        Err(error) => {
+                                            // Best effort: the original error must still
+                                            // drive the refresh retry.
+                                            let _ =
+                                                remote.files.releasedir(&remote.grant, directory);
+                                            return Err(error);
+                                        }
+                                    };
                                     refreshed_dir = Some(directory);
                                     Ok((remote.grant.clone(), remote.files.clone(), entries))
                                 },
                             )?;
-                            let mut state = self.state.lock().map_err(|_| poisoned())?;
-                            if let Some(directory) = state.dir_handles.get_mut(&handle) {
-                                directory.handle =
-                                    OpenLocalDirectory::Remote(OpenRemoteDirectory {
-                                        grant,
-                                        files,
-                                        handle: refreshed_dir.ok_or_else(|| {
-                                            stale("remote readdir did not reopen directory")
-                                        })?,
-                                    });
+                            let refreshed = OpenRemoteDirectory {
+                                grant,
+                                files,
+                                handle: refreshed_dir.ok_or_else(|| {
+                                    stale("remote readdir did not reopen directory")
+                                })?,
+                            };
+                            let previous = {
+                                let mut state = self.state.lock().map_err(|_| poisoned())?;
+                                state.dir_handles.get_mut(&handle).map(|slot| {
+                                    std::mem::replace(
+                                        &mut slot.handle,
+                                        OpenLocalDirectory::Remote(OpenRemoteDirectory {
+                                            grant: refreshed.grant.clone(),
+                                            files: refreshed.files.clone(),
+                                            handle: refreshed.handle.clone(),
+                                        }),
+                                    )
+                                })
+                            };
+                            match previous {
+                                Some(OpenLocalDirectory::Remote(previous)) => {
+                                    // The old grant just failed; the Home reclaims
+                                    // this cursor with the peer session.
+                                    let _ =
+                                        previous.files.releasedir(&previous.grant, previous.handle);
+                                }
+                                Some(_) => {}
+                                None => {
+                                    let _ = refreshed
+                                        .files
+                                        .releasedir(&refreshed.grant, refreshed.handle);
+                                }
                             }
                             entries
                         }
@@ -4544,12 +4717,18 @@ impl LocalOwnerFs {
     }
 
     fn releasedir(&self, handle: DirectoryHandle) -> Result<()> {
-        let mut state = self.state.lock().map_err(|_| poisoned())?;
-        state
-            .dir_handles
-            .remove(&handle)
-            .ok_or_else(|| stale("unknown directory handle"))?;
-        Ok(())
+        let directory = {
+            let mut state = self.state.lock().map_err(|_| poisoned())?;
+            state
+                .dir_handles
+                .remove(&handle)
+                .ok_or_else(|| stale("unknown directory handle"))?
+        };
+        // Release outside the state lock: a remote close is a network round trip.
+        match directory.handle {
+            OpenLocalDirectory::OwnerRoot | OpenLocalDirectory::Local(_) => Ok(()),
+            OpenLocalDirectory::Remote(open) => open.files.releasedir(&open.grant, open.handle),
+        }
     }
 
     // Local mkdir and remote preparation share the existing best-effort
@@ -7057,6 +7236,55 @@ fn poisoned() -> Error {
     Error::coded(afs_error::RUNTIME_INTERNAL, "OwnerFs state lock poisoned")
 }
 
+/// Whether per-create stage timing is logged.
+///
+/// Set `AFS_FUSE_TRACE=1` to emit the `create` stage breakdown; the same switch
+/// gates the per-request trace in the FUSE frontend.
+fn ownerfs_create_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("AFS_FUSE_TRACE")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+/// Attribute/entry TTL for an exclusively owned local root.
+///
+/// A private root is only ever mutated through this FUSE mount: the native Home
+/// path and bind mounts are not used at the same time, and a root with a peer
+/// writer is never classified private. The kernel therefore already invalidates
+/// its own dcache/attr cache on every create, unlink and rename this mount
+/// performs, and a longer TTL only saves the revalidation traffic of repeated
+/// lookups. Measured on a 4 KiB read workload the per-read FUSE LOOKUP count
+/// goes from 1.98 at 20k files (1 s TTL) to 0 (30 s TTL), which is the whole
+/// 31% scale degradation.
+///
+/// `AFS_OWNERFS_CACHE_TTL_MS` overrides the value; setting it to 0 restores the
+/// old "always revalidate" behaviour.
+fn ownerfs_cache_ttl() -> Duration {
+    static TTL: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TTL.get_or_init(|| {
+        let millis = std::env::var("AFS_OWNERFS_CACHE_TTL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1_000);
+        Duration::from_millis(millis)
+    })
+}
+
+/// Escape hatch for A/B measurement and for callers that need the old
+/// guarantee: `AFS_OWNERFS_CLOSE_SYNC=1` restores the per-close `fdatasync`
+/// that an exclusively owned local root skips by default.
+fn ownerfs_close_sync_forced() -> bool {
+    static FORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FORCED.get_or_init(|| {
+        std::env::var("AFS_OWNERFS_CLOSE_SYNC")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 fn release_owner_locks(table: &LockTable, owner: &FileLockOwner, kind: ReleaseKind) -> Result<()> {
     match kind {
         ReleaseKind::PosixOwner => table.release_posix_owner(owner),
@@ -7620,6 +7848,12 @@ mod tests {
         fail_statfs_permission: AtomicBool,
         open_calls: AtomicUsize,
         last_open_killpriv: AtomicBool,
+        opendir_calls: AtomicUsize,
+        readdir_calls: AtomicUsize,
+        releasedir_calls: AtomicUsize,
+        releasedir_handles: Mutex<Vec<Vec<u8>>>,
+        fail_readdir_once: AtomicBool,
+        fail_releasedir_once: AtomicBool,
     }
 
     impl RestartingRemoteFiles {
@@ -8317,11 +8551,18 @@ mod tests {
 
         fn opendir(
             &self,
-            _: &RootGrant,
+            grant: &RootGrant,
             _: &OsStr,
             _: Option<&files::FileIdentity>,
         ) -> Result<files::RemoteDirectory> {
-            Err(Error::coded(afs_error::NODE_VFS_UNIMPLEMENTED, "test"))
+            self.opendir_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(files::RemoteDirectory {
+                root_id: self.root_id.clone(),
+                owner_node_id: grant.home_node_id.clone(),
+                owner_session_id: grant.home_session_id.clone(),
+                identity: self.entry(FileKind::Directory).identity,
+                handle: vec![self.opendir_calls.load(Ordering::SeqCst) as u8],
+            })
         }
 
         fn readdir(
@@ -8331,14 +8572,32 @@ mod tests {
             _: u64,
             _: usize,
         ) -> Result<Vec<remote::RemoteDirectoryEntry>> {
-            Err(Error::coded(afs_error::NODE_VFS_UNIMPLEMENTED, "test"))
+            self.readdir_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_readdir_once.swap(false, Ordering::SeqCst) {
+                return Err(Error::coded(
+                    afs_error::NODE_OWNER_INVALID_GRANT,
+                    "injected remote readdir grant loss",
+                ));
+            }
+            Ok(Vec::new())
         }
 
         fn fsyncdir(&self, _: &RootGrant, _: &files::RemoteDirectory, _: bool) -> Result<()> {
             Err(Error::coded(afs_error::NODE_VFS_UNIMPLEMENTED, "test"))
         }
 
-        fn releasedir(&self, _: &RootGrant, _: files::RemoteDirectory) -> Result<()> {
+        fn releasedir(&self, _: &RootGrant, directory: files::RemoteDirectory) -> Result<()> {
+            self.releasedir_calls.fetch_add(1, Ordering::SeqCst);
+            self.releasedir_handles
+                .lock()
+                .map_err(|_| poisoned())?
+                .push(directory.handle);
+            if self.fail_releasedir_once.swap(false, Ordering::SeqCst) {
+                return Err(Error::coded(
+                    afs_error::IO_OTHER,
+                    "injected remote releasedir failure",
+                ));
+            }
             Ok(())
         }
     }
@@ -8383,6 +8642,12 @@ mod tests {
             fail_statfs_permission: AtomicBool::new(false),
             open_calls: AtomicUsize::new(0),
             last_open_killpriv: AtomicBool::new(false),
+            opendir_calls: AtomicUsize::new(0),
+            readdir_calls: AtomicUsize::new(0),
+            releasedir_calls: AtomicUsize::new(0),
+            releasedir_handles: Mutex::new(Vec::new()),
+            fail_readdir_once: AtomicBool::new(false),
+            fail_releasedir_once: AtomicBool::new(false),
         });
         let roots = Arc::new(RootManager::new(
             "node-b".into(),
@@ -8990,6 +9255,42 @@ mod tests {
             access_generation: grant.access_generation,
             fencing_token: grant.fencing_token.clone(),
         }
+    }
+
+    #[test]
+    fn close_sync_is_only_skipped_for_roots_no_peer_can_read() {
+        let (_temp, fs, ctx) = fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let workspace = fs
+            .mkdir(&ctx, root, OsStr::new("job-close-sync"), 0o755)
+            .unwrap();
+
+        let local = fs.require_local().unwrap();
+        let root_id = local.record(workspace.inode.value).unwrap().root_id.clone();
+
+        // A brand new private root: nobody else can observe it, so the close-time
+        // sync may be skipped.
+        assert!(local.root_is_exclusive_local(&root_id));
+
+        // Once a peer has been admitted to the root, a read grant can coexist
+        // with the local write grant and the peer may read through a path that
+        // bypasses this node's page cache. The close must sync again.
+        local
+            .private_cache
+            .lock()
+            .unwrap()
+            .shared_roots
+            .insert(root_id.clone());
+        assert!(
+            !local.root_is_exclusive_local(&root_id),
+            "a root a peer can read must keep the synchronous close"
+        );
+
+        // The attribute TTL predicate must agree with the close-sync predicate.
+        let cache = local.private_cache.lock().unwrap();
+        assert!(!cache.root_is_exclusive(&local.roots, &root_id));
     }
 
     #[test]
@@ -9761,10 +10062,13 @@ mod tests {
             .unwrap();
         let ctx = context_for_attrs(ctx, &created.entry.attributes);
 
-        let unsupported = fs
+        // OwnerFs stores only `user.*`. A probe for another namespace means the
+        // attribute is absent, so the answer is ENODATA; answering ENOTSUP made
+        // the kernel treat every create as a failed xattr lookup.
+        let absent = fs
             .getxattr(&ctx, created.entry.inode, OsStr::new("security.capability"))
             .unwrap_err();
-        assert_eq!(unsupported.code(), afs_error::IO_NOT_SUPPORTED);
+        assert_eq!(absent.code(), afs_error::IO_NO_DATA);
 
         fs.setxattr(
             &ctx,
@@ -11336,6 +11640,100 @@ mod tests {
     }
 
     #[test]
+    fn remote_directory_close_releases_home_handle() {
+        let (_temp, fs, ctx, _meta, remote, _root_id) = remote_fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let workspace = fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+        let handle = fs.opendir(&ctx, workspace.inode).unwrap();
+        assert_eq!(remote.opendir_calls.load(Ordering::SeqCst), 1);
+
+        fs.releasedir(&ctx, handle).unwrap();
+
+        assert_eq!(remote.releasedir_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            remote.releasedir_handles.lock().unwrap().as_slice(),
+            &[vec![1u8]]
+        );
+        let error = fs.releasedir(&ctx, handle).unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_OWNER_STALE_HANDLE);
+        assert_eq!(remote.releasedir_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn local_directory_close_never_calls_remote_release() {
+        let (_temp, fs, ctx, _meta, remote, _root_id) = remote_fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let handle = fs.opendir(&ctx, root).unwrap();
+        fs.releasedir(&ctx, handle).unwrap();
+        assert_eq!(remote.releasedir_calls.load(Ordering::SeqCst), 0);
+
+        let (_local_temp, local_fs, local_ctx) = fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let created = local_fs
+            .mkdir(&local_ctx, root, OsStr::new("local-dir"), 0o755)
+            .unwrap();
+        let handle = local_fs.opendir(&local_ctx, created.inode).unwrap();
+        local_fs.releasedir(&local_ctx, handle).unwrap();
+        let error = local_fs.releasedir(&local_ctx, handle).unwrap_err();
+        assert_eq!(error.code(), afs_error::NODE_OWNER_STALE_HANDLE);
+    }
+
+    #[test]
+    fn remote_directory_close_surfaces_home_release_failure() {
+        let (_temp, fs, ctx, _meta, remote, _root_id) = remote_fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let workspace = fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+        let handle = fs.opendir(&ctx, workspace.inode).unwrap();
+        remote.fail_releasedir_once.store(true, Ordering::SeqCst);
+
+        let error = fs.releasedir(&ctx, handle).unwrap_err();
+
+        assert_eq!(error.code(), afs_error::IO_OTHER);
+        assert_eq!(remote.releasedir_calls.load(Ordering::SeqCst), 1);
+        // A failed release still drops the handle, so a retry cannot mask it.
+        assert_eq!(
+            fs.releasedir(&ctx, handle).unwrap_err().code(),
+            afs_error::NODE_OWNER_STALE_HANDLE
+        );
+    }
+
+    #[test]
+    fn remote_readdir_refresh_releases_superseded_directory() {
+        let (_temp, fs, ctx, _meta, remote, _root_id) = remote_fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let workspace = fs.lookup(&ctx, root, OsStr::new("job-42")).unwrap();
+        let handle = fs.opendir(&ctx, workspace.inode).unwrap();
+        remote.fail_readdir_once.store(true, Ordering::SeqCst);
+        // The old grant is rejected, so the superseded cursor cannot be released.
+        remote.fail_releasedir_once.store(true, Ordering::SeqCst);
+
+        let entries = fs.readdir(&ctx, handle, 0, 16).unwrap();
+
+        assert!(entries.is_empty());
+        assert_eq!(remote.opendir_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(remote.readdir_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            remote.releasedir_handles.lock().unwrap().as_slice(),
+            &[vec![1u8]]
+        );
+        fs.releasedir(&ctx, handle).unwrap();
+        assert_eq!(
+            remote.releasedir_handles.lock().unwrap().as_slice(),
+            &[vec![1u8], vec![2u8]]
+        );
+    }
+
+    #[test]
     fn remote_open_receives_kernel_killpriv_cause() {
         let (_temp, fs, ctx, _meta, remote, root_id) = remote_fixture();
         let root = BackendInode {
@@ -12163,6 +12561,40 @@ mod tests {
         assert_eq!(&new, b"BBBB");
     }
 
+    /// Regression for the receive-thread blockage: a plain write used to be
+    /// admitted on the FUSE receive thread whenever the handle looked idle,
+    /// because `try_lock` made the probe non-blocking. That decision cannot see
+    /// the FIFO turn wait and the synchronous `pwrite` behind it, so it is gone
+    /// and every write must be dispatched to a worker.
+    #[test]
+    fn plain_write_is_never_admitted_on_the_receive_thread() {
+        let (_temp, fs, ctx) = fixture();
+        let root = BackendInode {
+            value: OWNERFS_ROOT_INODE,
+        };
+        let workspace = fs.mkdir(&ctx, root, OsStr::new("job-77"), 0o755).unwrap();
+        let created = fs
+            .create(
+                &ctx,
+                workspace.inode,
+                OsStr::new("plain.txt"),
+                0o644,
+                libc::O_RDWR,
+            )
+            .unwrap();
+
+        // A private local root with a non-syncing handle is exactly the shape the
+        // removed shortcut used to claim as "cannot block".
+        assert_eq!(
+            fs.write_admission_mode(created.handle),
+            WriteAdmissionMode::Queued
+        );
+
+        // A second idle handle on the same file must not reopen the shortcut.
+        let second = fs.open(&ctx, created.entry.inode, libc::O_WRONLY).unwrap();
+        assert_eq!(fs.write_admission_mode(second), WriteAdmissionMode::Queued);
+    }
+
     #[test]
     fn rename_no_replace_moves_when_destination_absent_and_preserves_existing_destination() {
         let (_temp, fs, ctx) = fixture();
@@ -12527,6 +12959,12 @@ mod tests {
             fail_statfs_permission: AtomicBool::new(false),
             open_calls: AtomicUsize::new(0),
             last_open_killpriv: AtomicBool::new(false),
+            opendir_calls: AtomicUsize::new(0),
+            readdir_calls: AtomicUsize::new(0),
+            releasedir_calls: AtomicUsize::new(0),
+            releasedir_handles: Mutex::new(Vec::new()),
+            fail_readdir_once: AtomicBool::new(false),
+            fail_releasedir_once: AtomicBool::new(false),
         });
         let (remote_file, _) = remote::RemoteFiles::open(
             remote.as_ref(),
@@ -12620,6 +13058,293 @@ mod tests {
             pf1_assert(&fs, &fence).owned_refs["peer_home_handles"],
             PrivatePf1Class::ObservedDrained
         );
+    }
+
+    #[test]
+    fn home_peer_releasedir_retry_is_stale_and_keeps_sibling_handles() {
+        let (_temp, fs, _ctx, _root, binding) = pf1_fixture();
+        let access = pf1_peer(&fs, &binding);
+        let local = fs.require_local().unwrap();
+        let closed = local
+            .peer_opendir("node-b", &access, OsStr::new(""), None)
+            .unwrap();
+        let sibling = local
+            .peer_opendir("node-b", &access, OsStr::new(""), None)
+            .unwrap();
+
+        local
+            .peer_releasedir("node-b", &access, closed.clone())
+            .unwrap();
+        // A retry after a lost ACK must see stale, not close another handle.
+        assert_eq!(
+            local
+                .peer_releasedir("node-b", &access, closed)
+                .unwrap_err()
+                .code(),
+            afs_error::NODE_OWNER_STALE_HANDLE
+        );
+        local
+            .peer_readdir("node-b", &access, &sibling, 0, 16)
+            .unwrap();
+        local.peer_releasedir("node-b", &access, sibling).unwrap();
+    }
+
+    fn assert_fenced(error: Error) {
+        assert_eq!(error.code(), afs_error::NODE_OWNER_GRANT_UNAVAILABLE);
+    }
+
+    fn peer_handle_counts(fs: &OwnerFs) -> (usize, usize) {
+        let state = fs.require_local().unwrap().state.lock().unwrap();
+        (state.dir_handles.len(), state.file_handles.len())
+    }
+
+    /// Real descriptors this process holds on `path` or below it.
+    fn open_fds_under(path: &std::path::Path) -> usize {
+        std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                std::fs::read_link(entry.path())
+                    .ok()
+                    .is_some_and(|target| target.starts_with(path))
+            })
+            .count()
+    }
+
+    /// The wire shape the OwnerFiles adapter rebuilds for `Release`: root, node
+    /// and session come from the presented access and the file identity is left
+    /// empty, so a production close never compares identity.
+    fn rpc_file(access: &PresentedRootAccess, handle: &[u8]) -> files::RemoteFile {
+        files::RemoteFile {
+            root_id: access.id.clone(),
+            owner_node_id: access.home_node_id.clone(),
+            owner_session_id: access.home_session_id.clone(),
+            identity: files::FileIdentity(Vec::new()),
+            handle: handle.to_vec(),
+        }
+    }
+
+    /// Same reconstruction for `ReleaseDir`.
+    fn rpc_dir(access: &PresentedRootAccess, handle: &[u8]) -> files::RemoteDirectory {
+        files::RemoteDirectory {
+            root_id: access.id.clone(),
+            owner_node_id: access.home_node_id.clone(),
+            owner_session_id: access.home_session_id.clone(),
+            identity: files::FileIdentity(Vec::new()),
+            handle: handle.to_vec(),
+        }
+    }
+
+    #[test]
+    fn peer_close_after_home_revoke_drops_file_and_directory_handles() {
+        let (temp, fs, ctx, root, binding) = pf1_fixture();
+        let access = pf1_peer(&fs, &binding);
+        let created = pf1_file(&fs, &ctx, &root, libc::O_RDWR);
+        fs.release(&ctx, created.handle).unwrap();
+        let executor = fs.peer_executor().unwrap();
+        let local = fs.require_local().unwrap();
+        let baseline = open_fds_under(temp.path());
+        let directory = local
+            .peer_opendir("node-b", &access, OsStr::new(""), None)
+            .unwrap();
+        let sibling = local
+            .peer_opendir("node-b", &access, OsStr::new(""), None)
+            .unwrap();
+        let (file, _, _) = executor
+            .open("node-b", &access, OsStr::new("file"), libc::O_RDONLY, None)
+            .unwrap();
+        // Close through the same wire shape the RPC adapter builds.
+        let directory = rpc_dir(&access, &directory.handle);
+        let sibling = rpc_dir(&access, &sibling.handle);
+        let file = rpc_file(&access, &file.handle);
+        assert_eq!(peer_handle_counts(&fs), (2, 1));
+        assert_eq!(open_fds_under(temp.path()), baseline + 3);
+
+        fs.require_local()
+            .unwrap()
+            .roots
+            .revoke_root(&binding.root_id);
+
+        // The revoked grant still fences everything that is not a close.
+        assert_fenced(
+            local
+                .peer_readdir("node-b", &access, &directory, 0, 16)
+                .unwrap_err(),
+        );
+        let mut byte = [0u8; 1];
+        assert_fenced(
+            local
+                .peer_read("node-b", &access, &file, 0, &mut byte)
+                .unwrap_err(),
+        );
+
+        executor.release("node-b", &access, file.clone()).unwrap();
+        assert_eq!(
+            peer_handle_counts(&fs),
+            (2, 0),
+            "close must drop the Home file handle"
+        );
+        local
+            .peer_releasedir("node-b", &access, directory.clone())
+            .unwrap();
+        assert_eq!(
+            peer_handle_counts(&fs),
+            (1, 0),
+            "close must drop the Home directory handle"
+        );
+
+        // A retry after Home applied RELEASE but lost its ACK is still a close:
+        // the file handle is absent (success) and the directory one is stale,
+        // which the client treats as success.
+        executor.release("node-b", &access, file).unwrap();
+        assert_eq!(
+            local
+                .peer_releasedir("node-b", &access, directory)
+                .unwrap_err()
+                .code(),
+            afs_error::NODE_OWNER_STALE_HANDLE
+        );
+        assert_eq!(peer_handle_counts(&fs), (1, 0));
+
+        // A close stays bound to the recorded owner even without a grant check.
+        assert_eq!(
+            local
+                .peer_releasedir("node-c", &access, sibling.clone())
+                .unwrap_err()
+                .code(),
+            afs_error::NODE_OWNER_STALE_HANDLE
+        );
+
+        local.peer_releasedir("node-b", &access, sibling).unwrap();
+        assert_eq!(peer_handle_counts(&fs), (0, 0));
+        assert_eq!(
+            open_fds_under(temp.path()),
+            baseline,
+            "closes must drop the real fds"
+        );
+    }
+
+    #[test]
+    fn peer_close_rejects_mismatched_access_and_keeps_handles() {
+        let (_temp, fs, ctx, root, binding) = pf1_fixture();
+        let access = pf1_peer(&fs, &binding);
+        let created = pf1_file(&fs, &ctx, &root, libc::O_RDWR);
+        fs.release(&ctx, created.handle).unwrap();
+        let executor = fs.peer_executor().unwrap();
+        let local = fs.require_local().unwrap();
+        let directory = local
+            .peer_opendir("node-b", &access, OsStr::new(""), None)
+            .unwrap();
+        let (file, _, _) = executor
+            .open("node-b", &access, OsStr::new("file"), libc::O_RDONLY, None)
+            .unwrap();
+        fs.require_local()
+            .unwrap()
+            .roots
+            .revoke_root(&binding.root_id);
+
+        let mut other_session = access.clone();
+        other_session.session_id = "other-session".into();
+        let mut other_generation = access.clone();
+        other_generation.access_generation += 1;
+        let mut other_token = access.clone();
+        other_token.fencing_token = "other-token".into();
+        for wrong in [other_session, other_generation, other_token] {
+            // The wire handle is rebuilt from the wrong access, as the RPC
+            // adapter does, so only the recorded scope can reject the close.
+            assert_eq!(
+                local
+                    .peer_releasedir("node-b", &wrong, rpc_dir(&wrong, &directory.handle))
+                    .unwrap_err()
+                    .code(),
+                afs_error::NODE_OWNER_STALE_HANDLE
+            );
+            assert_eq!(
+                executor
+                    .release("node-b", &wrong, rpc_file(&wrong, &file.handle))
+                    .unwrap_err()
+                    .code(),
+                afs_error::NODE_OWNER_STALE_HANDLE
+            );
+        }
+        assert_eq!(
+            peer_handle_counts(&fs),
+            (1, 1),
+            "a rejected close must keep the Home handle"
+        );
+
+        // The access the handle was opened with still closes it.
+        local
+            .peer_releasedir("node-b", &access, rpc_dir(&access, &directory.handle))
+            .unwrap();
+        executor
+            .release("node-b", &access, rpc_file(&access, &file.handle))
+            .unwrap();
+        assert_eq!(peer_handle_counts(&fs), (0, 0));
+    }
+
+    #[test]
+    fn peer_releasedir_after_workspace_delete_drops_handle() {
+        let (_temp, fs, _ctx, _root, binding) = pf1_fixture();
+        let access = pf1_peer(&fs, &binding);
+        let local = fs.require_local().unwrap();
+        let directory = local
+            .peer_opendir("node-b", &access, OsStr::new(""), None)
+            .unwrap();
+        fs.require_local()
+            .unwrap()
+            .roots
+            .delete_root(&binding.root_id)
+            .unwrap();
+
+        local
+            .peer_releasedir("node-b", &access, rpc_dir(&access, &directory.handle))
+            .unwrap();
+        assert_eq!(peer_handle_counts(&fs), (0, 0));
+    }
+
+    #[test]
+    fn peer_releasedir_after_workspace_recreate_drops_old_handle() {
+        let (_temp, fs, ctx, _root, binding) = pf1_fixture();
+        let access = pf1_peer(&fs, &binding);
+        let local = fs.require_local().unwrap();
+        let directory = local
+            .peer_opendir("node-b", &access, OsStr::new(""), None)
+            .unwrap();
+        fs.require_local()
+            .unwrap()
+            .roots
+            .delete_root(&binding.root_id)
+            .unwrap();
+
+        // Re-creating the workspace reuses the name-derived root id but issues a
+        // new grant contract; the old handle is still recorded against the old
+        // access, which is the "re-granted root, old handle" case.
+        native_home_tests::mkdir_root(&fs, &ctx, "pf1-root");
+        let recreated = fs
+            .require_local()
+            .unwrap()
+            .roots
+            .enter_root(&binding.root_id, RootRight::Lookup)
+            .unwrap();
+        let new_binding = root::PrivateRootBinding::from_grant(recreated.grant());
+        drop(recreated);
+        assert_ne!(new_binding.root_epoch, binding.root_epoch);
+
+        local
+            .peer_releasedir("node-b", &access, rpc_dir(&access, &directory.handle))
+            .unwrap();
+        assert_eq!(peer_handle_counts(&fs), (0, 0));
+
+        // The re-created workspace still serves and releases its own handles.
+        let new_access = pf1_peer(&fs, &new_binding);
+        let fresh = local
+            .peer_opendir("node-b", &new_access, OsStr::new(""), None)
+            .unwrap();
+        local
+            .peer_releasedir("node-b", &new_access, rpc_dir(&new_access, &fresh.handle))
+            .unwrap();
+        assert_eq!(peer_handle_counts(&fs), (0, 0));
     }
 
     #[test]

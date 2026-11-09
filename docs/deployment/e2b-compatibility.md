@@ -61,13 +61,13 @@ runc = "/opt/adx/current/etc/examples/e2b-runc-oci-spec.json"
 
 核查实际 OCI bundle 采用该配置；sandboxd 旧加载器读取失败会回退默认值。修改基线后，在无活动沙箱的隔离 worker 重启 sandboxd、创建新沙箱，旧容器不会自动取得权限。sticky `/tmp` 的 user 文件覆盖可能受 Linux protected_regular 限制，优先使用 `/home/user` 或非 sticky 子目录。
 
-Ingress 设置 `ADX_DATA_PLANE_INGRESS_E2B_ENABLED=true`、`ADX_DATA_PLANE_INGRESS_PORT_HOST_DOMAIN=sandbox.example.com`，配置正式 HTTPS 证书、源地址 ACL、API Server 和 Relay 目标 CIDR；独立/内嵌模式共用入口实现。升级配套使用同版 Coordinator、adxlet、API Server、Ingress 和对应工件，所有相关节点升级完成后再开启 E2B；旧节点不识别新增的 envd/run_policy 字段，不能承担该配置的执行。
+Ingress 设置 `ADX_DATA_PLANE_INGRESS_E2B_ENABLED=true`、`ADX_DATA_PLANE_INGRESS_PORT_HOST_DOMAIN=sandbox.example.com`，配置正式 HTTPS 证书、源地址 ACL、API Server 和 Relay 目标 CIDR；独立/内嵌模式共用入口实现。升级配套使用同版 Coordinator、adxlet、API Server、Ingress 和对应工件，首次从不识别E2B的旧版迁移时，所有相关节点升级完成后再开启 E2B；这些旧节点不识别新增的 envd/run_policy 字段，不能承担该配置的执行。纯Ingress传输策略修复不改变RPC/schema或RuntimeProfile：已支持E2B的运行版本可在固定工件下仅更新控制角色，保留worker运行时字节，但需先用该组合完成双协议及原有Snapshot资格验证。
 
 从 master `54efe5a` 存量前向升级的删除回执合同为：保留原有 600 秒有效期，旧回执仅允许 Environment ID、generation 和完整结果摘要相同、且未提交新增 cleanup artifacts 的删除重放；空 artifact scope 不改变旧结果的序列化字节。升级验收须覆盖旧格式 Redis/节点 journal、双版本进程切换、存量实例访问和生命周期，以及 AKernel 集成，不能以数据 fixture 回归代替完整升级验收。此前未发布 PR 的中间 schema 不提供迁移；新增 E2B 能力不得在旧节点混部期间启用。
 
 上述存量前向升级先更新 Coordinator，再更新 API Server 和 Ingress；旧 owner 在此阶段继续处理既有原生实例，新增 E2B 能力仍须等待相关节点全部升级后开启。控制面切换期间的请求和长连接可用性取决于副本及切换部署，不能由 guest 持续运行推导为入口零中断。
 
-节点或后端的计划升级先停止新分配，对需要保留的 Running 实例执行 Pause，确认权威 Paused 状态、恢复点可用、待补交结果已确认及活动 Runtime 已停止；其余实例迁移或删除，完成排空后再退出和升级。adxlet 收到 SIGTERM 会执行 planned unregister，使旧 owner 会话失效，不适用 crash 后未过期会话的进程接管条件。新节点注册并完成对账后，通过 Connect 恢复原 Paused 身份，必要时沿原生恢复调度重新分配。恢复节点须提供与原 Spec 一致的受信任 profile/bootstrap，并保留仍被引用的检查点和旧工件；停止控制面使 unregister 失败不属于计划滚动升级流程。
+节点或后端的计划升级先停止新分配，对需要保留的 Running 实例执行 Pause，确认权威 Paused 状态、恢复点可用、待补交结果已确认及活动 Runtime 已停止；其余实例迁移或删除，完成排空后再退出和升级。adxctl 默认 preserve 向 adxlet 发送 SIGUSR1，只关闭准入并停止进程，不主动注销；仅重启 adxlet 且后端仍存活时，可在心跳期限内经同节点 ID/RPC/Relay 地址与 GetSession 身份复核接管原执行。显式 drain 清理后发送 SIGTERM，执行 planned unregister，使旧 owner 会话失效；直接向 adxlet 发送 SIGTERM/SIGINT 也表示 planned departure。preserve 不延长期限，也不能代替后端升级前的 Pause 或排空。新节点注册并完成对账后，通过 Connect 恢复原 Paused 身份，必要时沿原生恢复调度重新分配。恢复节点须提供与原 Spec 一致的受信任 profile/bootstrap，并保留仍被引用的检查点和旧工件；停止控制面使 unregister 失败不属于计划滚动升级流程。
 
 回退 master 也需要单独验证：新 Snapshot 写入的 kind/created_at_unix_ms 字段会被旧版的严格反序列化拒绝。升级前验证备份与恢复方案；出现问题时按已验证的恢复流程或前向修复处理，不直接回退二进制并假定持久化数据兼容。
 
@@ -117,7 +117,7 @@ Sandbox.create(templateID[:tag]) → Ready snapshotId → 原生从快照创建
 
 ```mermaid
 flowchart LR
-  SDK[E2B SDK] -->|管理 HTTPS / X-API-Key| I[Ingress]
+  SDK[E2B SDK] -->|管理 TLS默认或HTTP显式开启 / X-API-Key| I[Ingress]
   I --> A[API Server E2B adapter]
   A -->|登记 / 启动 fromImage 构建| C[Coordinator / Redis]
   C -->|准备镜像 / seed / 拍快照| G[平台 Golden Snapshot]
@@ -174,7 +174,7 @@ E2B metadata 直接映射到原生 `EnvironmentSpec.scheduling.labels`，不另�
 
 E2B 入口保留最多 128 项、键 256 bytes、值 4096 bytes、总计 64KiB 的响应大小约束；内部执行继续使用原生 labels 校验。列表复用 `EnvironmentDirectory::page`，tenant、E2B 范围、state 和 labels 在分页前过滤，目录未同步时明确失败。每页 1～100、响应约 1MiB，游标绑定 tenant/范围/state/selector。时间字段按页通过公共 `BatchGetEnvironmentControl` 批量查询，列表专用 summary 直接投影所需字段；不逐条查询 control，不构造含 token 的详情后再删除凭据。实时目录分页不保证历史快照一致性。
 
-可选 `EnvironmentSpec.run_policy` 保存默认运行时长与 Pause/Delete 动作；当前 E2B 入口填写它，原生公共 HTTP 暂不开放，未配置的原生实例无额外期限。当前 owner adxlet 在首次 Running 或恢复接管时建立单调时钟 timer。进程 crash 后，仅在旧会话未过期且未退役、相同节点 ID 与 RPC/Relay 地址通过原生身份校验并成功接管现存 Runtime 时，才按 Spec 默认时长重建 timer；先前的动态续期不跨进程保存。SIGTERM 计划退役不适用该接管条件，节点计划升级须先 Pause 或排空。频繁更新不持久化绝对 deadline。Connect 只延长至 `max(当前截止, now + timeout)`；setTimeout 替换为 `now + timeout`，0 表示立即到期，均由 owner 接受后返回。owner 串行处理续期和到期，执行前复核 runtime、assignment generation 与 timer 更新序号；到期进入既有 Pause/Delete，失败保留重试。Coordinator 不保存动态 control、续期 CAS 或到期扫描/claim。
+可选 `EnvironmentSpec.run_policy` 保存默认运行时长与 Pause/Delete 动作；当前 E2B 入口填写它，原生公共 HTTP 暂不开放，未配置的原生实例无额外期限。当前 owner adxlet 在首次 Running 或恢复接管时建立单调时钟 timer。进程 crash 或 preserve 重启后，仅在旧会话未过期且未退役、相同节点 ID 与 RPC/Relay 地址通过原生身份校验并成功接管现存 Runtime 时，才按 Spec 默认时长重建 timer；先前的动态续期不跨进程保存。显式 Drain 后的计划退役不适用该接管条件，后端计划升级须先 Pause 或排空。频繁更新不持久化绝对 deadline。Connect 只延长至 `max(当前截止, now + timeout)`；setTimeout 替换为 `now + timeout`，0 表示立即到期，均由 owner 接受后返回。owner 串行处理续期和到期，执行前复核 runtime、assignment generation 与 timer 更新序号；到期进入既有 Pause/Delete，失败保留重试。Coordinator 不保存动态 control、续期 CAS 或到期扫描/claim。
 
 显式 Pause 停止当前 timer；Resume 开始新周期。E2B Connect 对暂停态先复用原生 EnsureRunning 恢复（包括可接管的离线 owner），再为本轮运行设置请求时长；运行态 Connect 仍只延长期限。Paused Connect 的请求时长随原生恢复意图保留，并传到最终 owner，在首次建立该运行期 timer 前消费；原 owner 不可用、替代调度及后台重试沿用同一恢复意图，RPC 等待预算不作为运行时长。合并到既有恢复意图的请求不改写其初始时长，恢复后的 Connect 续期只延长、不缩短，避免重试重置 timer；Spec 默认时长不变。暂停态独立更新的 nextDuration 只在下一次运行消费一次，不跨节点进程重启保存；Snapshot 临时暂停/源恢复保留原 deadline，capture 耗时计入本轮运行。普通 Running 重报不续期。`startedAt` 复用原生 CreationSummary 的首次成功 Running 时间，Pause/Resume 后保持；运行态 `endAt` 是 owner 剩余单调时长映射到当前墙钟的估计值。Paused `endAt` 来自 RestorePoint 的真实保留期限，Forever 映射为 `9999-12-31T23:59:59Z`。
 
@@ -259,3 +259,46 @@ Pod 内直接运行 envd 组件测试，若继承 oom_score_adj 高于 100，测
 已登记共享 checkpoint/capture 继续由原生 registry、Snapshot 引用、execution holds 和 GC 管理，不重复加入 cleanup outbox。本地或确实未登记制品在 Deleted 退役时原子保存最小 pending payload，逐项幂等清理并收到完整 ACK 后 HDEL；部分清理、ACK 丢失或组件重启保留待办，本地节点永久丢失也不因 TTL 自动确认成功。
 
 删除重试沿用 600 秒 DeletedReceipt，增加规范化 cleanup payload 摘要；完成后不保留独立永久 cleanup/artifact fence。journal 遇 NotFound/Conflict 时须读取 fresh assignment，确认旧归属已撤销才丢弃旧条目，不把丢弃当作原提交成功。正常 Snapshot 发布在同一 CAS 比较源记录，防止 source 已退役后的迟到发布；制品 UUID 不复用，scope 继续阻止 alias 改指 bucket/prefix 后删错物理目标。
+
+
+## 显式 HTTP 入口
+
+默认的 E2B 管理和 envd/应用路由要求 Ingress TLS listener，明文请求返回426。
+部署者可在已启用 E2B 的同一 Ingress 显式设置
+`ADX_DATA_PLANE_INGRESS_E2B_ALLOW_HTTP=true`，允许这些 E2B 路由使用现有明文
+listener。开关默认false；E2B未启用时设置它会导致配置校验失败。HTTP入口支持
+HTTP/1.1和明文HTTP/2，仍保留原生接口与现有HTTPS入口。
+
+开关只影响E2B管理路径和已发布的E2B服务路由；原生管理、管理员接口、Execd、
+Agent入口及opaque CONNECT的传输/认证规则保持原样。管理请求仍由API Server
+校验当前API key及租户，envd仍校验独立sandbox token，私有应用端口仍需要traffic
+token，执行/路由代次及Relay ACL继续校验。非规范管理路径（百分号转义、反斜杠、
+重复斜杠或点段）不允许通过HTTP边界。HTTP会明文传输API/envd凭据，须在部署者
+明确接受的网络与源地址ACL内使用；不是自动降级或TLS终止代理的信任Header。
+
+配置示例（复用现有deployment服务，不新增控制面）：
+
+```yaml
+service_overrides:
+  ingress:
+    env:
+      ADX_DATA_PLANE_INGRESS_E2B_ENABLED: "true"
+      ADX_DATA_PLANE_INGRESS_E2B_ALLOW_HTTP: "true"
+      ADX_DATA_PLANE_INGRESS_PORT_HOST_DOMAIN: sandbox.example.com
+```
+
+官方SDK使用同一HTTP origin：
+
+```python
+box = Sandbox.create("base", api_key=token, api_url="http://HOST",
+                     sandbox_url="http://HOST", timeout=600)
+try:
+    print(box.commands.run("id -u").stdout)
+finally:
+    box.kill()
+```
+
+HTTP调用不需要客户端CA配置；server的TLS listener、证书和已有native客户端不需删除
+或关闭。入口使用IP时按SDK selectors请求头转发应用端口，不由`get_host()`字符串
+推断wildcard DNS可访问。开关不改变RuntimeProfile或checkpoint输入；兼容升级仍须
+实测部署中的原有Snapshot和同一组节点。路由组件测试与真实SDK/集群验收分开记录。

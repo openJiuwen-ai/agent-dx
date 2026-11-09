@@ -1,5 +1,5 @@
 use adx_deployment::{
-    config::Deployment,
+    config::{Deployment, ShutdownMode},
     supervisor::{self, Request},
 };
 use adx_protocol::relay as pb;
@@ -15,7 +15,7 @@ use std::{
     time::Duration,
 };
 fn test_deployment(root: &Path, services: serde_json::Value) -> Deployment {
-    serde_json::from_value(json!({"schema_version":1,"with_afs":true,"package_dir":root,"state_dir":root.join("state"),"redis_url":"redis://localhost:6379/","namespace":"test","restart_delay_ms":20,"stop_timeout_seconds":1,"services":services})).unwrap()
+    serde_json::from_value(json!({"schema_version":1,"with_afs":true,"package_dir":root,"state_dir":root.join("state"),"redis_url":"redis://localhost:6379/","namespace":"test","restart_delay_ms":20,"stop_timeout_seconds":1,"shutdown_mode":"drain","services":services})).unwrap()
 }
 fn install_test_binary(root: &Path, name: &str, script: &str) {
     std::fs::create_dir_all(root.join("bin")).unwrap();
@@ -100,6 +100,31 @@ fn service_status<'a>(status: &'a serde_json::Value, service_id: &str) -> &'a se
 }
 
 #[tokio::test]
+async fn request_preserves_unstructured_supervisor_error_text() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let root = tempfile::tempdir().unwrap();
+    let listener = tokio::net::UnixListener::bind(root.path().join("supervisor.sock")).unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut command = [0; 7];
+        socket.read_exact(&mut command).await.unwrap();
+        assert_eq!(&command, b"status\n");
+        socket
+            .write_all(br#"{"ok":false,"error":"unknown action: status"}"#)
+            .await
+            .unwrap();
+    });
+    let error = supervisor::request(root.path(), Request::Status, Duration::from_secs(1))
+        .await
+        .unwrap_err();
+    server.await.unwrap();
+    assert!(
+        error.to_string().contains("unknown action: status"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn repeated_exits_keep_restarting_until_recovery_and_scoped_stop() {
     let temp_directory = tempfile::Builder::new()
         .prefix("adx-p-")
@@ -151,9 +176,13 @@ async fn repeated_exits_keep_restarting_until_recovery_and_scoped_stop() {
         }
     })
     .await;
-    supervisor::request(&state_directory, Request::Stop, Duration::from_secs(5))
-        .await
-        .unwrap();
+    supervisor::request(
+        &state_directory,
+        Request::Stop { mode: None },
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     supervisor_task.await.unwrap().unwrap();
     assert!(!state_directory.join("supervisor.sock").exists());
     recovery.expect("service must recover after more than six consecutive exits");
@@ -194,9 +223,13 @@ async fn spawn_failures_keep_retrying_and_clear_failure_after_recovery() {
         }
     })
     .await;
-    supervisor::request(&state_directory, Request::Stop, Duration::from_secs(5))
-        .await
-        .unwrap();
+    supervisor::request(
+        &state_directory,
+        Request::Stop { mode: None },
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     supervisor_task.await.unwrap().unwrap();
     recovery.expect("spawn retries must continue until the executable becomes runnable");
 }
@@ -215,6 +248,48 @@ impl pb::node_admin_service_server::NodeAdminService for NodeAdmin {
             deleted_environments: 1,
         }))
     }
+}
+
+#[tokio::test]
+async fn preserve_termination_timeout_identifies_the_failed_service() {
+    let root = tempfile::Builder::new()
+        .prefix("adx-timeout-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    install_test_binary(
+        root.path(),
+        "adxlet",
+        "#!/bin/sh\ntrap '' TERM USR1\nprintf ready > \"$0.ready\"\nexec sleep 100\n",
+    );
+    let deployment = test_deployment(
+        root.path(),
+        json!([
+            {"id": "node", "role": "adxlet", "config": {"proxy_mode": "standalone"}}
+        ]),
+    );
+    let state = deployment.state_dir.clone();
+    let task = tokio::spawn(supervisor::run(deployment));
+    wait_until_ready(&state).await;
+    wait_for_graceful_services(root.path(), &["adxlet"]).await;
+    let error = supervisor::request(
+        &state,
+        Request::Stop {
+            mode: Some(ShutdownMode::Preserve),
+        },
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap_err();
+    let failure = error.downcast_ref::<supervisor::ShutdownFailure>().unwrap();
+    assert_eq!(failure.mode, ShutdownMode::Preserve);
+    assert!(matches!(
+        failure.phase,
+        supervisor::ShutdownPhase::Terminate
+    ));
+    assert_eq!(failure.service_id, "node");
+    assert!(failure.message.contains("deadline"));
+    task.abort();
+    let _ = task.await;
 }
 #[tokio::test]
 async fn failed_environment_cleanup_keeps_dependencies_running_then_retries() {
@@ -247,17 +322,23 @@ async fn failed_environment_cleanup_keeps_dependencies_running_then_retries() {
     let supervisor_task = tokio::spawn(supervisor::run(deployment));
     let before = wait_until_ready(&state_directory).await;
     wait_for_graceful_services(root, &["adx-coordinator", "adxlet"]).await;
-    assert!(
-        supervisor::request(&state_directory, Request::Stop, Duration::from_secs(5))
-            .await
-            .is_err()
-    );
+    assert!(supervisor::request(
+        &state_directory,
+        Request::Stop { mode: None },
+        Duration::from_secs(5)
+    )
+    .await
+    .is_err());
     let after = wait_until_ready(&state_directory).await;
     assert_eq!(before.get("services"), after.get("services"));
     allow_drain.store(true, Ordering::Release);
-    supervisor::request(&state_directory, Request::Stop, Duration::from_secs(5))
-        .await
-        .unwrap();
+    supervisor::request(
+        &state_directory,
+        Request::Stop { mode: None },
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     supervisor_task.await.unwrap().unwrap();
     rpc_task.abort();
 }
@@ -289,9 +370,13 @@ async fn supervisor_drains_rotated_logs_on_stop() {
     wait_for_graceful_services(root, &["adx-coordinator"]).await;
     // Stop also drains and fsyncs every rotated archive. Shared CI disks can
     // need longer than the child termination budget; still verify every byte.
-    let stopped = supervisor::request(&state_directory, Request::Stop, Duration::from_secs(30))
-        .await
-        .unwrap();
+    let stopped = supervisor::request(
+        &state_directory,
+        Request::Stop { mode: None },
+        Duration::from_secs(30),
+    )
+    .await
+    .unwrap();
     supervisor_task.await.unwrap().unwrap();
     let logging = &service_status(&stopped, "coordinator")["logging"];
     assert_eq!(logging["error"], serde_json::Value::Null);
@@ -347,9 +432,13 @@ async fn afs_services_start_and_stop_under_supervisor() {
     wait_until_ready(&state_directory).await;
     wait_for_graceful_services(root, &["adx-coordinator", "afs-meta", "afs-node"]).await;
 
-    supervisor::request(&state_directory, Request::Stop, Duration::from_secs(5))
-        .await
-        .unwrap();
+    supervisor::request(
+        &state_directory,
+        Request::Stop { mode: None },
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     supervisor_task.await.unwrap().unwrap();
     assert!(!state_directory.join("supervisor.sock").exists());
 }
@@ -382,10 +471,14 @@ async fn afs_stop_timeout_fails_without_stopping_meta_or_restarting_node() {
     let supervisor_task = tokio::spawn(supervisor::run(deployment));
     wait_until_ready(&state_directory).await;
 
-    let stop_error = supervisor::request(&state_directory, Request::Stop, Duration::from_secs(3))
-        .await
-        .unwrap_err()
-        .to_string();
+    let stop_error = supervisor::request(
+        &state_directory,
+        Request::Stop { mode: None },
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
     assert!(
         stop_error.contains("supervisor operation failed"),
         "unexpected stop error: {stop_error}"
@@ -433,10 +526,14 @@ async fn afs_node_exit_124_on_sigterm_fails_stop_and_keeps_meta_running() {
     let supervisor_task = tokio::spawn(supervisor::run(deployment));
     wait_until_ready(&state_directory).await;
 
-    let stop_error = supervisor::request(&state_directory, Request::Stop, Duration::from_secs(3))
-        .await
-        .unwrap_err()
-        .to_string();
+    let stop_error = supervisor::request(
+        &state_directory,
+        Request::Stop { mode: None },
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
     assert!(
         stop_error.contains("supervisor operation failed"),
         "unexpected stop error: {stop_error}"
@@ -495,10 +592,14 @@ async fn afs_node_reaped_before_stop_fails_stop_and_keeps_meta_running() {
     .await
     .unwrap();
 
-    let stop_error = supervisor::request(&state_directory, Request::Stop, Duration::from_secs(3))
-        .await
-        .unwrap_err()
-        .to_string();
+    let stop_error = supervisor::request(
+        &state_directory,
+        Request::Stop { mode: None },
+        Duration::from_secs(3),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
     assert!(
         stop_error.contains("supervisor operation failed"),
         "unexpected stop error: {stop_error}"
@@ -556,9 +657,13 @@ async fn afs_status_reports_actual_http_health() {
         service_status(&status, "node")["health"]["ready"],
         serde_json::Value::Bool(true)
     );
-    supervisor::request(&state_directory, Request::Stop, Duration::from_secs(5))
-        .await
-        .unwrap();
+    supervisor::request(
+        &state_directory,
+        Request::Stop { mode: None },
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     supervisor_task.await.unwrap().unwrap();
     health_task.await.unwrap();
 }
@@ -606,9 +711,13 @@ async fn afs_status_does_not_treat_http_200_degraded_as_ready() {
         service_status(&status, "node")["health"]["ready"],
         serde_json::Value::Bool(false)
     );
-    supervisor::request(&state_directory, Request::Stop, Duration::from_secs(5))
-        .await
-        .unwrap();
+    supervisor::request(
+        &state_directory,
+        Request::Stop { mode: None },
+        Duration::from_secs(5),
+    )
+    .await
+    .unwrap();
     supervisor_task.await.unwrap().unwrap();
     health_task.await.unwrap();
 }

@@ -64,6 +64,14 @@ pub(super) async fn serve_until_shutdown(
         on_shutdown();
     };
     let mut shutdown_error = {
+        // Deployment identity: every test must confirm the running binary matches
+        // the expected source revision before trusting any measurement.
+        afs_logging::info!(
+            "build.info";
+            "git" => env!("AFS_BUILD_ID"),
+            "pkg_version" => env!("CARGO_PKG_VERSION"),
+            "exe" => std::env::current_exe().ok().map(|p| p.display().to_string()).unwrap_or_default()
+        );
         afs_logging::info!("node.ready";"grpc"=>cfg.grpc_listen.to_string(),"rest"=>cfg.rest_listen.to_string(),"uds"=>cfg.uds_path.display().to_string(),"ownerfs"=>cfg.ownerfs,"dfs"=>cfg.dfs);
         #[cfg(test)]
         record_shutdown_stage("serving");

@@ -21,7 +21,7 @@ API Server 仍保留原有九条 `/api/agent` 兼容转发路由，由 `agent_ad
 
 平台内部以 **Environment + Runtime** 建模。Environment 是跨节点、暂停恢复和故障接管期间保持不变的逻辑身份，持有期望规格、生命周期、归属和 checkpoint 引用；Runtime 是运行时后端在某个节点创建的一次物理执行，具有独立 `runtime_id`，重启、恢复或接管时可以替换。二者通过 `RuntimeIdentity { environment_id, runtime_id, ownership_generation }` 绑定，adxlet 只允许当前 generation 的 Runtime 对外提供服务。
 
-Coordinator 在启动或权威写入恢复时从 Redis 载入记录；正常节点对账使用提交后同步更新的缓存，只比较归属、版本及制品引用。节点启动／会话恢复执行完整运行时对账；进程 crash 后，旧会话未过期且未退役、相同节点 ID 与 RPC/Relay 地址经身份校验通过时，才可接管现存 Runtime。SIGTERM 执行 planned unregister 并使旧 owner 会话失效；节点或后端计划升级先 Pause 并确认持久化恢复点，或迁移／删除实例完成排空，再退出升级和恢复。正常生命周期由 Execd 主动控制流、Relay 活动增量、后端退出通知及 owner 内存中的每实例单调时钟推进；独立资源采样默认每 15 秒采集 CPU、内存，不推进生命周期。异常断流先等待重连，再按需确认后端状态；创建结果不明确时保留带退避的定向清理重试。部署要求配置 `runtime_control`，并同步更新 rootfs 中的 Execd。
+Coordinator 在启动或权威写入恢复时从 Redis 载入记录；正常节点对账使用提交后同步更新的缓存，只比较归属、版本及制品引用。节点启动／会话恢复执行完整运行时对账；进程 crash 或 preserve 重启后，旧会话未过期且未退役、相同节点 ID 与 RPC/Relay 地址经身份校验通过时，才可接管现存 Runtime。adxctl 默认 preserve 向 adxlet 发送 SIGUSR1，关闭准入并保留节点会话，Relay 排水期间继续心跳；显式 drain 清理成功后发送 SIGTERM，执行 planned unregister 并使旧 owner 会话失效；直接向 adxlet 发送 SIGTERM/SIGINT 同样表示 planned departure；节点或后端计划升级先 Pause 并确认持久化恢复点，或迁移／删除实例完成排空，再退出升级和恢复。正常生命周期由 Execd 主动控制流、Relay 活动增量、后端退出通知及 owner 内存中的每实例单调时钟推进；独立资源采样默认每 15 秒采集 CPU、内存，不推进生命周期。异常断流先等待重连，再按需确认后端状态；创建结果不明确时保留带退避的定向清理重试。部署要求配置 `runtime_control`，并同步更新 rootfs 中的 Execd。
 
 Environment 自动暂停复用 idle timeout，策略为 delete/pause；匿名恢复点可按配置发布到共享对象存储。Ingress 认证首请求后与 API Server 手动 resume 共用 Coordinator `EnsureRunning`。Coordinator 持久化恢复意图、优先原节点准入，仅在明确资源不足或执行已失效时调度兼容目标；adxlet 执行恢复并提交 Running。节点失效保留 Paused，等待需求或到期/删除。Ingress 获得该执行的已发布路由后才转发业务字节。详见 [节点生命周期](../testing/node-lifecycle.md)。
 
@@ -147,7 +147,7 @@ Proxy 首次启动关闭 Environment 准入，adxlet 完成权威对账与全量
 
 通用 HTTP/WS 接入的 `X-ADX-Parameters` 使用 URL 表单编码。Ingress 将原始字节交给共享解析/激活流程，只有 Binding 不存在时才解析、校验并原子保存参数；已有 Binding 忽略新输入，包括格式错误。并发首次访问复用成功落库的 Binding。Template.env 和 mounts.host_path 使用持久化参数渲染，挂载参数仍受路径约束；Binding 参数当前明文保存。内置 Jiuwen 通过共享流程按需提供业务参数，不再有独立 prepare 阶段、私有 launch 快照或模型专用覆盖逻辑。参数 Header 在转发前移除。
 
-模板发布定义不携带版本号；Agent 用同一持久化 CAS 事务推进 tenant/template 序列并保存数字版本快照。统一 template/binding URN 中的纯数字 reference 选择版本，非数字 reference 选择 Alias。内部 Scope 继续保存显式类型。Orbit 入口配置 `template_ref` 字符串并复用此解析，用户和 workspace 身份不变；其模板通过受管 Volume 挂载原目录。已有字符串模板转成同名 Alias 由独立的人工运维流程完成，不在运行时自动迁移。
+模板发布定义不携带版本号；Agent 用同一持久化 CAS 事务推进 tenant/template 序列并保存数字版本快照。统一 template URN 中的纯数字 reference 选择版本，非数字 reference 选择 Alias；Binding ID 独立放在 HTTP/WS 的 `X-ADX-Binding-Id` Header 或 SSH 的 `binding_id` 路由选项。内部 Scope 继续保存显式类型。Orbit 入口配置 `template_ref` 字符串并复用此解析，用户和 workspace 身份不变；其模板通过受管 Volume 挂载原目录。已有字符串模板转成同名 Alias 由独立的人工运维流程完成，不在运行时自动迁移。
 
 ## 协议与持久化
 
@@ -183,7 +183,7 @@ adxlet 使用 `CheckpointAccess` 捕获和取得恢复目录；Coordinator 使�
 
 E2B 入口复用 Platform Environment、可靠 fromImage → Golden Snapshot 准备和原生 Snapshot 查询，不经过 Agent Template/Activator。公共准备目录只保留单个 current preparation 与 latest-success 指针，同名准备串行；不保存多 build 历史或 tag 目录。E2B 仅接受 default tag，旧 buildID 不再是当前准备或 latest-success 时返回 404；`GET /v2/templates` 明确不支持，Golden 使用原生 Snapshot 列表。
 
-运行策略默认值保存在 EnvironmentSpec.run_policy，动态 timer 只属于当前 owner adxlet。Connect 只延长、setTimeout 替换（0 到期），由 owner 串行接受；crash 后成功接管现存 Runtime 时按默认时长重建 timer，SIGTERM 计划退役会使旧 owner 会话失效，不能视为透明滚动重启。节点计划升级先 Pause 并确认恢复点／结果持久化，或完成排空；升级后通过 Connect 恢复，恢复节点须保留匹配原 Spec 的 profile/bootstrap，必要时沿原生恢复调度重新分配。Pause 停 timer，Resume 新周期；暂停态更新仅影响下一周期一次，Snapshot 源流程保留原 deadline 并计入拍摄时间。Coordinator 转发读写到 owner，不保存动态 control、不扫描或 claim 运行到期；Gateway 只负责鉴权、执行身份和正常路由撤销，不承担运行 deadline 准入或逐流 expiry guard。`startedAt` 来自原生首次成功 Running，运行态 `endAt` 为估计，暂停态来自真实恢复点保留期限。
+运行策略默认值保存在 EnvironmentSpec.run_policy，动态 timer 只属于当前 owner adxlet。Connect 只延长、setTimeout 替换（0 到期），由 owner 串行接受；crash 或 preserve 重启后成功接管现存 Runtime 时按默认时长重建 timer；preserve 必须在心跳期限内通过同节点身份和地址复核，不延长存活期限。显式 drain 计划退役会使旧 owner 会话失效。节点计划升级先 Pause 并确认恢复点／结果持久化，或完成排空；升级后通过 Connect 恢复，恢复节点须保留匹配原 Spec 的 profile/bootstrap，必要时沿原生恢复调度重新分配。Pause 停 timer，Resume 新周期；暂停态更新仅影响下一周期一次，Snapshot 源流程保留原 deadline 并计入拍摄时间。Coordinator 转发读写到 owner，不保存动态 control、不扫描或 claim 运行到期；Gateway 只负责鉴权、执行身份和正常路由撤销，不承担运行 deadline 准入或逐流 expiry guard。`startedAt` 来自原生首次成功 Running，运行态 `endAt` 为估计，暂停态来自真实恢复点保留期限。
 
 E2B 列表沿 EnvironmentDirectory 的现有分页，在分页前过滤租户、兼容范围、状态和 labels；时间字段批量查询公共 control 摘要，专用 DTO 直接返回列表字段。目录未同步时失败，游标绑定查询条件；metadata 继续复用原生 labels。
 

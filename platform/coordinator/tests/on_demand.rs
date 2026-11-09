@@ -1,5 +1,7 @@
 //! Real Redis and gRPC; runtime memory and object storage are controlled fixtures.
 mod common;
+#[path = "common/mounts.rs"]
+mod mounts;
 use adx_checkpoint_storage::ObjectCheckpointStore;
 use adx_coordinator::{rpc::CoordinatorRpc, storage::Session, Placement};
 use adx_core::{EnvironmentRecord, EnvironmentSpec, Resources, Result};
@@ -1845,16 +1847,7 @@ async fn local_checkpoint_waits_for_volume_without_rejecting_its_owner_node() {
         .unwrap()
         .to_owned();
     std::fs::create_dir(directory.path().join("workspace")).unwrap();
-    let backend = std::fs::read_to_string("/proc/self/mountinfo")
-        .unwrap()
-        .lines()
-        .find_map(|line| {
-            let fields: Vec<_> = line.split_whitespace().collect();
-            (fields[4] == "/").then(|| {
-                fields[fields.iter().position(|field| *field == "-").unwrap() + 2].to_owned()
-            })
-        })
-        .unwrap();
+    let backend = mounts::backend_id(std::path::Path::new("/"));
     let domains = BTreeMap::from([(
         "test".into(),
         StorageDomain {

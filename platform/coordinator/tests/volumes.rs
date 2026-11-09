@@ -1765,3 +1765,205 @@ async fn volume_claim_batch_and_delete_preserve_request_identity_and_creation_su
     plain.id = "reused-request".into();
     assert!(session.claim(plain, &candidate).await.is_ok());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn concurrent_snapshot_catalog_updates_preserve_every_volume_hold() {
+    use adx_core::snapshots::SnapshotState;
+    use std::{collections::BTreeSet, sync::Arc};
+    const COUNT: usize = 64;
+    let rig = common::Redis::new().await;
+    let session = Arc::new(store(&rig).await.begin(1).await.unwrap());
+    let definition = session
+        .ensure_volume_for_owner(
+            volume("workspace", "workspaces/tenant/concurrent"),
+            &domains(),
+            "binding",
+        )
+        .await
+        .unwrap();
+    let source = environment("binding", "workspace");
+    session.pin_volumes(&source).await.unwrap();
+    let gate = Arc::new(tokio::sync::Barrier::new(COUNT));
+    let mut operations = tokio::task::JoinSet::new();
+    for index in 0..COUNT {
+        let session = session.clone();
+        let gate = gate.clone();
+        let source = source.clone();
+        operations.spawn(async move {
+            gate.wait().await;
+            session
+                .publish_snapshot(reusable_snapshot(&format!("concurrent-{index}"), source))
+                .await
+        });
+    }
+    let mut snapshots = vec![];
+    let mut errors = vec![];
+    while let Some(result) = operations.join_next().await {
+        match result.unwrap() {
+            Ok(snapshot) => snapshots.push(snapshot),
+            Err(error) => errors.push(error),
+        }
+    }
+    assert!(
+        errors.is_empty(),
+        "concurrent volume snapshot publication failed: {errors:?}"
+    );
+    assert_eq!(snapshots.len(), COUNT);
+    let expected: BTreeSet<_> = snapshots
+        .iter()
+        .map(|snapshot| snapshot.id.clone())
+        .collect();
+    let held = session.get_volume("tenant", "workspace").await.unwrap();
+    assert_eq!(held.volume.uid, definition.uid);
+    assert_eq!(held.snapshot_ids, expected);
+    for snapshot in &snapshots {
+        let MountSource::Volume(reference) = &snapshot.template.execution.mounts[0].source else {
+            panic!("snapshot lost its volume reference");
+        };
+        assert_eq!(reference.uid.as_deref(), Some(definition.uid.as_str()));
+    }
+    session.unpin_volumes(&source).await.unwrap();
+    session
+        .release_volume_owner("tenant", "binding")
+        .await
+        .unwrap();
+    let mut deleting = vec![];
+    for snapshot in snapshots {
+        deleting.push(
+            session
+                .delete_snapshot(&snapshot.id, "tenant")
+                .await
+                .unwrap(),
+        );
+    }
+    let gate = Arc::new(tokio::sync::Barrier::new(COUNT));
+    for snapshot in deleting {
+        let session = session.clone();
+        let gate = gate.clone();
+        operations.spawn(async move {
+            gate.wait().await;
+            session
+                .finish_snapshot_deletion(&snapshot.id, snapshot.revision)
+                .await
+        });
+    }
+    while let Some(result) = operations.join_next().await {
+        match result.unwrap() {
+            Ok(snapshot) => assert_eq!(snapshot.state, SnapshotState::Deleted),
+            Err(error) => errors.push(error),
+        }
+    }
+    assert!(
+        errors.is_empty(),
+        "concurrent volume snapshot deletion failed: {errors:?}"
+    );
+    assert!(matches!(
+        session.get_volume("tenant", "workspace").await,
+        Err(adx_core::Error::NotFound)
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires dedicated real Redis; build/ci/run.py storage"]
+async fn concurrent_initial_volume_publications_preserve_references_and_receipts() {
+    use adx_core::{EnvironmentRecord, EnvironmentState, Runtime};
+    use std::{sync::Arc, time::Duration};
+    const COUNT: usize = 64;
+    let rig = common::Redis::new().await;
+    let session = RedisStore::connect(&rig.url, "test", Duration::from_secs(5))
+        .await
+        .unwrap()
+        .begin(1)
+        .await
+        .unwrap();
+    let mut candidate = claimant(&session, "node-a").await;
+    let definition = session
+        .ensure_volume(volume("workspace", "workspaces/tenant/burst"), &domains())
+        .await
+        .unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(COUNT));
+    let mut tasks = vec![];
+    for index in 0..COUNT {
+        let mut spec = environment(&format!("volume-burst-{index}"), "workspace");
+        spec.resources.cpu_millis = 1;
+        spec.resources.memory_bytes = 1;
+        candidate.request_id = format!("volume-request-{index}");
+        session.pin_volumes(&spec).await.unwrap();
+        let stored = session
+            .claim(spec, &candidate)
+            .await
+            .unwrap()
+            .record()
+            .clone();
+        let mut record = EnvironmentRecord {
+            runtime: Runtime {
+                id: format!("{}-{}", stored.spec.id, stored.assignment.generation),
+                ip: None,
+            },
+            spec: stored.spec,
+            assignment: stored.assignment,
+            state: EnvironmentState::Starting,
+            revision: 1,
+            resources_held: true,
+            observation: None,
+            snapshot_source: None,
+            failure: None,
+            checkpoint: None,
+            last_operation: None,
+            restart_attempts: 0,
+            restart_pending: false,
+            execution_artifacts: vec![],
+        };
+        session
+            .authorize_volumes(&record, &record.runtime.id, &candidate.node_session_id)
+            .await
+            .unwrap();
+        record.state = EnvironmentState::Running;
+        record.runtime.ip = Some("127.0.0.1".parse().unwrap());
+        record.revision += 1;
+        let session = session.clone();
+        let barrier = barrier.clone();
+        let candidate = candidate.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let result = session
+                .publish_initial(
+                    record.clone(),
+                    &candidate.request_id,
+                    &candidate.node_session_id,
+                )
+                .await;
+            (record, candidate.request_id, result)
+        }));
+    }
+    let mut failures = vec![];
+    for task in tasks {
+        let (record, request, result) = task.await.unwrap();
+        match result {
+            Ok(published) => {
+                assert_eq!(published, record);
+                assert_eq!(
+                    session.get(&record.spec.id).await.unwrap().result,
+                    Some(record.clone())
+                );
+                assert_eq!(
+                    session.published_request("tenant", &request).await.unwrap(),
+                    Some(record)
+                );
+            }
+            Err(error) => failures.push(error),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "initial Volume publication failures: {failures:?}"
+    );
+    let held = session.get_volume("tenant", "workspace").await.unwrap();
+    assert_eq!(held.volume.uid, definition.uid);
+    assert_eq!(held.references.len(), COUNT);
+    assert!(held.occupancy.is_none());
+    for index in 0..COUNT {
+        assert!(held.references.contains(&format!("volume-burst-{index}")));
+    }
+}

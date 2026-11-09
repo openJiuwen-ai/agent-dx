@@ -335,7 +335,9 @@ except BaseException as error:
 finally:
     try:
         if any(n == 'supervisor' and p.poll() is None for n, p in children):
-            print(run([BASE / 'package/bin/adxctl', 'stop', '--config', RUN / 'deployment.yaml']), flush=True)
+            print(run([
+                BASE / 'package/bin/adxctl', 'stop', '--mode', 'drain', '--config', RUN / 'deployment.yaml',
+            ]), flush=True)
     except Exception as error:
         summary['stop_error'] = repr(error)
         summary['status'] = 'failed'

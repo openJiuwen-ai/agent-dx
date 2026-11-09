@@ -192,6 +192,13 @@ pub trait DirectoryHandle: Send + Sync {
     fn metadata(&self) -> std::io::Result<fs::Metadata>;
     fn read_dir(&self) -> std::io::Result<Vec<OsString>>;
     fn sync_all(&self) -> std::io::Result<()>;
+
+    /// Report whether one direct child exists, without re-walking the parent
+    /// path. Backends that cannot resolve a child relative to an open directory
+    /// return `Unsupported`, and callers fall back to a path-based stat.
+    fn child_present(&self, _name: &std::ffi::OsStr) -> std::io::Result<bool> {
+        Err(std::io::Error::from(std::io::ErrorKind::Unsupported))
+    }
 }
 
 /// Root-confined mutable file store used by OwnerFs and diagnostics.

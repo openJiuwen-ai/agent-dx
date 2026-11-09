@@ -20,6 +20,10 @@ Agent FS（AFS） 是 Agent DX 的可选文件系统组件。默认部署配置�
 
 发布包配置示例来自 [build/config/examples/afs/](../../build/config/examples/afs/)，这也是唯一的权威示例（`afs/tests/config_contract.rs` 直接解析它）。部署层只负责把 AFS TOML 交给 `afs-meta` 和 `afs-node`，以及进程启动、健康查询、正常停止和卸载；它不改写 AFS 自有配置 schema。
 
+### Trace 配置
+
+AFS 使用自有 TOML 的 `trace_enabled`、`trace_endpoint`、`trace_sample_ratio`，默认关闭；开启后经 OTLP/gRPC 导出（代码默认 4317）。AFS 不读取 ADX 的 `ADX_TRACE_*` / `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`，也不受部署级 `tracing` 策略控制。ADX Collector 默认只接收 OTLP/HTTP 4318，启用 AFS trace 时需为 Collector 增加 gRPC 接收端或调整 AFS endpoint。
+
 Meta 后端（`meta_store`）：
 
 1. `memory`：测试专用，重启不保留状态；
@@ -1008,3 +1012,17 @@ NodeReplicated DFS 默认启动每 5 秒一次的安全回收；关闭引用有�
 可选BLAKE3 Peer驻留/proof及磁盘缓存不适用于CRC对象；CRC直接走分段验证的范围传输。gRPC与RDMA协议均携带CRC描述，RDMA硬件运行单独验收，不能用全feature编译替代。S3及其缓存策略不在本次变更范围。
 
 `security.capability`在原inode映射检查后本地返回既有不支持错误，其余xattr保留Meta权限与错误语义。Meta的`afs_requests_total`提供`dfs_gc_capture/register/retain/release/collect`、`dfs_commit_file_version`和`dfs_get_xattr`标签，用于核对真实访问次数；不增加逐chunk正文扫描或详细调度采集。
+
+## OwnerFs 运行时开关
+
+以下环境变量由 `afs-node` 进程读取，部署脚本需要显式设置或在服务单元里声明。默认值
+即"不设置"时的行为，改动前请先读对应语义。
+
+| 变量 | 默认 | 作用与代价 |
+|---|---|---|
+| `AFS_OWNERFS_CLOSE_SYNC` | 未设置（关闭不同步） | 未设置时，独占本地 root 上的普通 `close`/`flush` 不执行 `fdatasync`，`close` 成功只表示数据进入本机页缓存，掉电或内核崩溃可能丢失最近写入。设为 `1`/`true` 恢复逐 handle 的 `fdatasync`。peer 共享的 root 始终同步，不受该开关影响。 |
+| `AFS_OWNERFS_CACHE_TTL_MS` | `1000` | 独占本地 root 的 attr/entry TTL（毫秒）。调大可减少 `getattr`/`lookup` 往返，代价是外部并发变更的可见延迟变长；该 root 一旦被 peer 校验过就不再算独占。 |
+| `AFS_FUSE_TRACE` | 未设置 | 设为 `1`/`true` 时打印逐请求 trace 与 `create` 阶段计时，仅用于诊断，不要在生产常开。 |
+
+关闭语义的完整说明见 `afs/README.md` 的「OwnerFs 关闭语义」一节，性能归因见
+`afs/docs/perf/ownerfs-perf-summary.md`。

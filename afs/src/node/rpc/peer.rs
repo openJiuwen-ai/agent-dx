@@ -420,6 +420,39 @@ impl OwnerPeerClient {
             .clone())
     }
 
+    /// Keeps a Home-side close in a bounded background job so a transient
+    /// transport failure does not leak the Home handle. `Ok` only means the
+    /// job took the close; after the last retry the Home reclaims the handle
+    /// with the peer session.
+    fn submit_release(&self, request: OwnerRelease) -> afs_error::Result<()> {
+        if let OwnerRuntime::Existing(runtime) = &self.runtime
+            && reserve_release_slot(&self.pending_releases)
+        {
+            let mut client = match self.cloned_client() {
+                Ok(client) => client,
+                Err(error) => {
+                    self.pending_releases.fetch_sub(1, AtomicOrdering::AcqRel);
+                    return Err(error.0);
+                }
+            };
+            let pending = self.pending_releases.clone();
+            let metrics = self.metrics.clone();
+            runtime.spawn(async move {
+                let _ = release_with_retry(&mut client, request, metrics).await;
+                pending.fetch_sub(1, AtomicOrdering::AcqRel);
+            });
+            return Ok(());
+        }
+        let mut client = self.cloned_client().map_err(|error| error.0)?;
+        self.runtime
+            .block_on(release_with_retry(
+                &mut client,
+                request,
+                self.metrics.clone(),
+            ))
+            .map_err(Into::into)
+    }
+
     #[cfg(feature = "rdma")]
     async fn negotiate_owner_rdma(&self, grant: &RootGrant) -> PeerResult<OwnerRdmaWindow> {
         let device = self.rdma_device.clone().ok_or_else(|| {
@@ -1600,50 +1633,15 @@ impl RemoteFiles for OwnerPeerClient {
             .lock()
             .map_err(|_| protocol_error("OwnerFiles prefetch cache lock poisoned"))?
             .remove(&file.handle);
-        let request = OwnerReleaseRequest {
+        // All writes and explicit sync/flush calls have already received their
+        // own result before this cleanup request. A FUSE RELEASE is not a
+        // durability barrier; waiting for its RPC only adds close latency.
+        self.submit_release(OwnerRelease::File(OwnerReleaseRequest {
             access: Some(root_access(grant)),
             handle: Some(OwnerHandle {
                 opaque: file.handle,
             }),
-        };
-        // All writes and explicit sync/flush calls have already received their
-        // own result before this cleanup request. A FUSE RELEASE is not a
-        // durability barrier; waiting for its RPC only adds close latency. We
-        // still keep the handle in a bounded background job so transient
-        // transport failures do not leak Home-side opens after a single packet
-        // loss or reconnect window.
-        if let OwnerRuntime::Existing(runtime) = &self.runtime
-            && reserve_release_slot(&self.pending_releases)
-        {
-            let mut client = match self.cloned_client() {
-                Ok(client) => client,
-                Err(error) => {
-                    self.pending_releases.fetch_sub(1, AtomicOrdering::AcqRel);
-                    return Err(error.0);
-                }
-            };
-            let pending = self.pending_releases.clone();
-            let metrics = self.metrics.clone();
-            runtime.spawn(async move {
-                if let Err(error) = release_with_retry(&mut client, request, metrics).await {
-                    afs_logging::warn!(
-                        "ownerfs.release_failed";
-                        "error" => error.to_string(),
-                        "code" => error.code().to_string()
-                    );
-                }
-                pending.fetch_sub(1, AtomicOrdering::AcqRel);
-            });
-            return Ok(());
-        }
-        let mut client = self.cloned_client().map_err(|error| error.0)?;
-        self.runtime
-            .block_on(release_with_retry(
-                &mut client,
-                request,
-                self.metrics.clone(),
-            ))
-            .map_err(Into::into)
+        }))
     }
 
     fn opendir(
@@ -1725,17 +1723,42 @@ impl RemoteFiles for OwnerPeerClient {
     }
 
     fn releasedir(&self, grant: &RootGrant, directory: RemoteDirectory) -> afs_error::Result<()> {
-        let _reply = owner_rpc!(
-            self,
-            release_dir,
-            OwnerReleaseDirRequest {
-                access: Some(root_access(grant)),
-                handle: Some(OwnerDirectoryHandle {
-                    opaque: directory.handle,
-                }),
-            }
-        );
-        Ok(())
+        self.submit_release(OwnerRelease::Directory(OwnerReleaseDirRequest {
+            access: Some(root_access(grant)),
+            handle: Some(OwnerDirectoryHandle {
+                opaque: directory.handle,
+            }),
+        }))
+    }
+}
+
+/// Retrying is safe: the Home answers a repeated close as a stale handle.
+#[cfg(feature = "ownerfs")]
+enum OwnerRelease {
+    File(OwnerReleaseRequest),
+    Directory(OwnerReleaseDirRequest),
+}
+
+#[cfg(feature = "ownerfs")]
+impl OwnerRelease {
+    fn method(&self) -> &'static str {
+        match self {
+            Self::File(_) => "release",
+            Self::Directory(_) => "release_dir",
+        }
+    }
+
+    async fn send(&self, client: &mut OwnerFilesClient<Channel>) -> Result<(), tonic::Status> {
+        match self {
+            Self::File(request) => client
+                .release(request_with_current_context(request.clone()))
+                .await
+                .map(|_| ()),
+            Self::Directory(request) => client
+                .release_dir(request_with_current_context(request.clone()))
+                .await
+                .map(|_| ()),
+        }
     }
 }
 
@@ -1751,19 +1774,15 @@ fn reserve_release_slot(pending: &AtomicUsize) -> bool {
 #[cfg(feature = "ownerfs")]
 async fn release_with_retry(
     client: &mut OwnerFilesClient<Channel>,
-    request: OwnerReleaseRequest,
+    request: OwnerRelease,
     metrics: Option<super::OwnerRpcMetrics>,
 ) -> PeerResult<()> {
     let mut backoff = RELEASE_INITIAL_BACKOFF;
     for attempt in 1..=RELEASE_MAX_ATTEMPTS {
         let started = Instant::now();
-        let result = client
-            .release(request_with_current_context(request.clone()))
-            .await
-            .map(|_| ())
-            .map_err(PeerError::from);
+        let result = request.send(client).await.map_err(PeerError::from);
         if let Some(metrics) = &metrics {
-            metrics.observe("client", "release", started.elapsed());
+            metrics.observe("client", request.method(), started.elapsed());
         }
         match result {
             Ok(()) => return Ok(()),
@@ -1772,7 +1791,17 @@ async fn release_with_retry(
                 tokio::time::sleep(backoff).await;
                 backoff = backoff.saturating_mul(2).min(RELEASE_MAX_BACKOFF);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                // Log here so the inline path is visible even when the caller
+                // only attempts the close.
+                afs_logging::warn!(
+                    "ownerfs.release_failed";
+                    "method" => request.method(),
+                    "error" => error.to_string(),
+                    "code" => error.code().to_string()
+                );
+                return Err(error);
+            }
         }
     }
     unreachable!("release retry loop always returns from its final attempt")

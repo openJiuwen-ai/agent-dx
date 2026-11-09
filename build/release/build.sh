@@ -7,7 +7,7 @@ for legacy_flag in ADX_WITH_DFS ADX_DFS_ALL_FEATURES; do
     exit 2
   fi
 done
-# Linux release builder. sandboxd is supplied independently by the runtime environment.
+# Native release builder with optional external sandboxd binaries.
 : "${CARGO_TARGET_DIR:?set persistent Cargo cache}"
 : "${ADX_REDIS_SERVER:?provide pinned Redis 7.2.5 binary}"
 : "${ADX_REDIS_CLI:?provide matching Redis 7.2.5 CLI binary}"
@@ -34,6 +34,11 @@ if [[ "$ADX_WITH_AFS" == "1" && "$host" != *-linux-gnu ]]; then
   echo 'ADX_WITH_AFS=1 requires a Linux release builder' >&2
   exit 2
 fi
+case "${ADX_WITH_SANDBOXD:-0}" in
+  0) ;;
+  1) [[ "$host" == *-linux-gnu ]] || { echo 'sandboxd requires a Linux release builder' >&2; exit 2; } ;;
+  *) echo 'ADX_WITH_SANDBOXD must be 0 or 1' >&2; exit 2 ;;
+esac
 stage=$(mktemp -d "${TMPDIR:-/tmp}/adx-build.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
 echo "--- :rust: Compile control plane, gateway and EXECD"
@@ -80,5 +85,11 @@ package_args=(
 )
 if [[ "$ADX_WITH_AFS" == "1" ]]; then
   package_args+=(--with-afs)
+fi
+if [[ "${ADX_WITH_SANDBOXD:-0}" == "1" ]]; then
+  echo "--- :package: Prepare pinned sandboxd backend"
+  "$PYTHON" build/e2e/download_backend.py --directory "$stage/sandboxd" --target "$host"
+  "$PYTHON" build/release/download_runsc.py --target "$host" --output "$stage/runsc"
+  package_args+=(--backend-dir "$stage/sandboxd" --runsc "$stage/runsc")
 fi
 "$PYTHON" "${package_args[@]}"

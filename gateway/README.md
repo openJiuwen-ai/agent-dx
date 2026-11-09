@@ -396,7 +396,18 @@ Template/Binding access keeps its existing activation behavior.
 
 ### Alias targets
 
-Managed HTTP/WS/SSH accepts `urn:adx:binding:<template>:<alias>:<binding_id>`.
+Managed HTTP/WS/SSH targets use `urn:adx:template:<template>:<reference>`;
+reference selects a numeric version or a named alias. HTTP/WS selects a binding
+with the optional `X-ADX-Binding-Id` header; SSH uses a separate `binding_id`
+route option. Omitting the selector generates a new ID. Binding URNs are not
+accepted. The ID is percent-encoded UTF-8 on the wire; invalid/empty/duplicate
+headers and binding headers on instance targets are rejected. Gateway consumes
+the request header and returns the selected `X-ADX-Binding-Id`, overriding backend
+values and removing the obsolete `X-ADX-Binding-Urn` response header. See the
+[Agent access contract](../agent/README.md#统一-httpws-访问).
+DigitalMate's application routes continue deriving the binding from the verified
+user; a client-supplied Binding header cannot override that selection and is
+stripped before application WS forwarding.
 The long-lived Binding scope stores an explicit version or alias reference; its
 current Environment carries the actual immutable template version and ID. Service
 validation and Alias version selection run inside Activator before Binding/Environment creation. Gateway forwards the scope/protocol/port and uses the returned target/port; a hot resolve requires one RPC for both numeric and Alias scopes. An unsent refresh can observe a newer current
@@ -531,7 +542,8 @@ use the new configuration before using this binary.
 
 The `digitalmategateway` business module loads `ADX_JIUWEN_CONFIG` with a
 shared top-level `tenant` and peer application blocks. The required `jiuwen` block configures `/ws` and file routes; the optional
-`orbit` block enables `GET /orbit/ws`. Each block owns its target and request timeout:
+`orbit` block enables `GET /orbit/ws`, and optional `digitalmate` enables
+`GET /digitalmate/ws`. Each block owns its target and request timeout:
 
 ```json
 {
@@ -546,32 +558,39 @@ shared top-level `tenant` and peer application blocks. The required `jiuwen` blo
     "template_ref": "production",
     "backend_path": "/ws",
     "service_port": 18092
+  },
+  "digitalmate": {
+    "template": "digitalmate",
+    "template_ref": "production",
+    "backend_path": "/digitalmate/ws",
+    "service_port": 18092,
+    "request_timeout_seconds": 180
   }
 }
 ```
 
-Both applications use the same `ADX_ACCOUNT_CONFIG`, Huawei/AGC login and
+All applications use the same `ADX_ACCOUNT_CONFIG`, Huawei/AGC login and
 business Bearer sessions. The gateway owns one fixed Platform tenant; accounts
 and sessions have no tenant field. They share account identities; the token
 is not bound to an application. Business and shared account routes do not
 restrict admission by Host or Origin. Deployment routing controls the public
 domains and paths; business routes still require a valid session.
 
-`jiuwen.request_timeout_seconds` and `orbit.request_timeout_seconds` each default
+Each application’s `request_timeout_seconds` defaults
 to 60 seconds (valid range 1–86400); Jiuwen's remaining queue and protocol timeout
 settings also live inside `jiuwen`. Environment direct-port host routing retains
-its existing precedence. Without `orbit`, `/orbit/ws` returns 404.
+its existing precedence. Without the corresponding optional block, `/orbit/ws` or `/digitalmate/ws` returns 404.
 Apply the configuration with its matching Ingress build. Existing Jiuwen
 binding IDs and workspace parameters stay unchanged.
 
-Both business applications support TLS termination at an external load balancer.
+All business applications support TLS termination at an external load balancer.
 Generic `/agent/http` and `/agent/ws` remain tenant API Key routes requiring the
 Ingress TLS listener; business sessions do not authorize them.
 
-Use `/orbit/ws` and `Authorization: Bearer <business-token>`.
-The binding is fixed per verified user: its internal ID is `orbit-` plus the
+Use `/orbit/ws` or `/digitalmate/ws` and `Authorization: Bearer <business-token>`.
+The binding is fixed per verified user: its internal ID is `orbit-` or `digitalmate-`, respectively, plus the
 full hexadecimal SHA-256 of compact JSON `[tenant,user_id]`. Template and
-`template_ref` remain separate scope fields. `orbit.template_ref` uses the shared
+`template_ref` remain separate scope fields. Each transparent application uses the shared
 reference parser: a canonical positive numeric string selects a version, and a
 non-numeric string selects an Alias; for example `"12"` or `"production"`.
 An Alias must exist before admission and its reconciliation requires configured
@@ -583,9 +602,9 @@ The target is selected solely from the gateway configuration and verified sessio
 Query parameters do not participate in gateway target or binding selection, even
 when named `target`, `template`, `port`, `user_id` or `binding_id`. Only the path is
 replaced by the configured backend path; the query string is forwarded unchanged,
-without parsing, re-encoding, name filtering or an Orbit-specific length limit.
+without parsing, re-encoding, name filtering or an application-specific length limit.
 This includes `token` and `authorization`: URL parameters never authenticate the
-gateway and may have application-defined meaning. Orbit interprets its own query
+gateway and may have application-defined meaning. Each application interprets its own query
 parameters. General HTTP request limits still apply.
 Authentication credentials (including Cookie), `X-User-Id` and `X-ADX-*`
 headers are removed before forwarding. The original Host and Origin headers are
@@ -595,12 +614,12 @@ WebSocket subprotocol negotiation and business frames remain opaque.
 
 The entrypoint uses shared Agent activation, declared-service validation,
 cold-start readiness and Gateway HTTP Upgrade/byte forwarding. It does not
-implement a separate Relay client or translate Jiuwen/Orbit messages. Only
+implement a separate Relay client or translate application messages. Only
 unsent connection admission may retry; sent requests and frames are not replayed.
 For a missing binding it obtains `model_api_key` and `model_api_base` from the
 same account model service as Jiuwen, and injects `workspace` using the shared
 Jiuwen rule: `w-` plus the full SHA-256 of compact JSON `[tenant,template,user_id]`,
-using Orbit's configured template. The value is stable across template versions
+using the selected application's configured template. The value is stable across template versions
 and distinct from a different user's or template's workspace. The
 [Orbit template example](../agent/activator/examples/orbit-sfs-template.json)
 omits the server-assigned version from its publish input and retains the same
@@ -654,8 +673,8 @@ For TLS termination at an external load balancer, bind the existing HTTP listene
 with `ADX_DATA_PLANE_INGRESS_PLAIN_BIND=0.0.0.0:8080`, route the business Service
 port 80 to port 8080 using HTTP, and retain HTTPS/WSS at the public listener.
 Restrict the HTTP port to the deployment's internal network and configure public
-domains and paths at the load balancer. This does not change the existing TLS-only
-management routes or Ingress-to-Node mTLS.
+domains and paths at the load balancer. This does not change native/Agent TLS-only management routes or Ingress-to-Node
+mTLS; the explicit E2B HTTP opt-in is documented separately below.
 
 `POST /api/v1/auth/huawei/login` exchanges an Account Kit authorization code and returns
 an opaque business token. `POST /api/v1/auth/agc/login` accepts
@@ -820,3 +839,14 @@ its `userId` without starting an Environment. It follows DigitalMateGateway's
 business authentication; management API keys remain separate from business sessions.
 
 命令状态订阅 `/api/environment/v1/commands/watch` 在已配置 Execd access 时，会在后端 WebSocket 握手前检查 Environment 归属并注入服务端 Execd 令牌；调用方的业务凭据不会转发给 Execd。该认证与 `/direct` HTTP 路径共用同一配置。
+
+
+### Explicit HTTP E2B deployments
+
+E2B management and envd/application routes require TLS by default. An operator
+may explicitly set `ADX_DATA_PLANE_INGRESS_E2B_ALLOW_HTTP=true` together with
+E2B enabled to admit those routes on the existing plaintext listener, including
+HTTP/2. API keys, sandbox envd tokens, private-port traffic credentials, route
+fencing and Relay restrictions remain enforced. Native control/administrator,
+Execd, Agent and CONNECT policies remain unchanged. No forwarded header can
+assert this opt-in. See the [configuration and limits](../docs/deployment/e2b-compatibility.md#显式-http-入口).

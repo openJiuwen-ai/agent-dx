@@ -9,11 +9,17 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from package_manifest import AFS_BINARIES, BINARIES  # noqa: E402
+from package_manifest import (  # noqa: E402
+    AFS_BINARIES,
+    BINARIES,
+    SANDBOXD_BINARIES,
+    SANDBOXD_DEPLOYMENT_FILES,
+)
 from package_manifest import verify as verify_manifest
 
 
@@ -21,7 +27,15 @@ def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target, profile, with_afs=False):
+@dataclass(frozen=True)
+class BuildIdentity:
+    commit: str
+    dirty: bool
+    target: str
+    profile: str
+
+
+def assemble(binary_dir, redis, redis_cli, wheel, output, identity, *, with_afs=False, backend_dir=None, runsc=None):
     if output.exists():
         raise ValueError("output already exists")
     inputs = {f"bin/{name}": binary_dir / name for name in BINARIES}
@@ -54,7 +68,7 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target,
     # Native Linux release builder supplies the EROFS payload. Debug/native macOS
     # packages retain binary-only development support.
     runtime_root = binary_dir / "adx-runtime-rootfs.img"
-    if profile == "release" and "linux" in target:
+    if identity.profile == "release" and "linux" in identity.target:
         inputs["runtime/adx-runtime-rootfs.img"] = runtime_root
     elif runtime_root.is_file():
         inputs["runtime/adx-runtime-rootfs.img"] = runtime_root
@@ -65,10 +79,19 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target,
     if not wheel.name.startswith("adx_environment-") or wheel.suffix != ".whl":
         raise ValueError("an adx_environment wheel is required")
     inputs[f"sdk/{wheel.name}"] = wheel
+    if (backend_dir is None) != (runsc is None):
+        raise ValueError("sandboxd and runsc must be packaged together")
+    if backend_dir is not None:
+        inputs["runtime/sandboxd/runsc"] = runsc
+        inputs["lib/sandboxd_preflight.py"] = ROOT / "build/e2e/preflight.py"
+        for name in (*SANDBOXD_BINARIES, "manifest.json"):
+            inputs[f"runtime/sandboxd/{name}"] = backend_dir / name
+        for name in SANDBOXD_DEPLOYMENT_FILES:
+            inputs[f"etc/examples/sandboxd/{name}"] = ROOT / "build/release/sandboxd" / name
     for source in inputs.values():
         if source.is_symlink() or not source.is_file():
             raise ValueError("a required artifact is missing or is a symlink")
-    if not target or profile not in ("debug", "release") or len(commit) != 40:
+    if not identity.target or identity.profile not in ("debug", "release") or len(identity.commit) != 40:
         raise ValueError("build identity required")
     version = subprocess.check_output([str(redis.resolve()), "--version"], text=True)
     if "v=7.2.5 " not in version:
@@ -118,18 +141,20 @@ def assemble(binary_dir, redis, redis_cli, wheel, output, commit, dirty, target,
                 dest.chmod(0o755)
         manifest = {
             "schema_version": 1,
-            "commit": commit,
-            "dirty": dirty,
-            "target": target,
-            "profile": profile,
+            "commit": identity.commit,
+            "dirty": identity.dirty,
+            "target": identity.target,
+            "profile": identity.profile,
             "redis_version": "7.2.5",
             "files": {name: sha(stage / name) for name in sorted(inputs)},
         }
+        if backend_dir is not None:
+            manifest["with_sandboxd"] = True
         if with_afs:
             manifest["with_afs"] = True
         (stage / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        verify(stage)
         stage.rename(output)
-    verify(output)
     return manifest
 
 
@@ -146,6 +171,8 @@ def main():
     p.add_argument("--target", required=True)
     p.add_argument("--profile", choices=("debug", "release"), required=True)
     p.add_argument("--with-afs", action="store_true", help="include OwnerFs and DistributedFs binaries")
+    p.add_argument("--backend-dir", type=Path)
+    p.add_argument("--runsc", type=Path)
     v = sub.add_parser("verify")
     v.add_argument("directory", type=Path)
     args = parser.parse_args()
@@ -169,11 +196,10 @@ def main():
             args.redis_cli,
             args.wheel,
             args.output,
-            commit,
-            dirty,
-            args.target,
-            args.profile,
-            args.with_afs,
+            BuildIdentity(commit, dirty, args.target, args.profile),
+            with_afs=args.with_afs,
+            backend_dir=args.backend_dir,
+            runsc=args.runsc,
         )
     print("package verified")
 

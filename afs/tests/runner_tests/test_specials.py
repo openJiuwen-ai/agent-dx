@@ -67,7 +67,7 @@ class ProfileTests(unittest.TestCase):
     def test_extended_and_performance_cases_do_not_enlarge_all_basic(self):
         cases = common.discover()
         basic = common.select(cases, suite="all-basic")
-        self.assertEqual(len(basic), 22)
+        self.assertEqual(len(basic), 23)
         self.assertTrue(all(c.profile is None and c.purpose == "functional" for c in basic))
         self.assertEqual(len(common.select(cases, suite="local-write-special")), 6)
         self.assertEqual(len(common.select(cases, suite="cluster-read-special")), 4)

@@ -112,7 +112,7 @@ class CacheEvidenceTests(unittest.TestCase):
             "dfs.visibility.real_cross_handle_cache", "dfs.cache.same_version_reopen",
             "dfs.cache.warm_permission_change",
         })
-        self.assertEqual(len(select(cases, suite="all-basic")), 22)
+        self.assertEqual(len(select(cases, suite="all-basic")), 23)
         self.assertEqual(len(select(cases, suite="all-special")), 20)
 
     def test_observation_is_boolean_and_dfs_only(self):

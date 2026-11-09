@@ -476,7 +476,8 @@ async fn managed_binding_management_and_protocol_forwarding() {
     assert_eq!(published["template"]["version"], "1");
     let path = "/api/agent/v2/templates/demo/versions/1/bindings/env";
     let mut traffic = Request::builder()
-        .uri("/agent/http/path?target=urn:adx:binding:demo:1:env&port=8080")
+        .uri("/agent/http/path?target=urn:adx:template:demo:1&port=8080")
+        .header("x-adx-binding-id", "env")
         .header("authorization", "Bearer tenant")
         .body(())
         .unwrap();
@@ -582,8 +583,9 @@ async fn managed_binding_management_and_protocol_forwarding() {
     for protocol in ["http", "ws"] {
         let mut builder = Request::builder()
             .uri(format!(
-                "/agent/{protocol}/path?target=urn:adx:binding:demo:1:env&port=8080&q=1"
+                "/agent/{protocol}/path?target=urn:adx:template:demo:1&port=8080&q=1"
             ))
+            .header("x-adx-binding-id", "env")
             .header("authorization", "Bearer tenant");
         if protocol == "ws" {
             builder = builder.header("upgrade", "websocket");
@@ -604,7 +606,8 @@ async fn managed_binding_management_and_protocol_forwarding() {
         assert!(!api.retry_data(&mut data).await.unwrap());
     }
     let mut pending = Request::builder()
-        .uri("/agent/http/path?target=urn:adx:binding:demo:1:env&port=8080")
+        .uri("/agent/http/path?target=urn:adx:template:demo:1&port=8080")
+        .header("x-adx-binding-id", "env")
         .header("authorization", "Bearer tenant")
         .body(())
         .unwrap();
@@ -777,7 +780,8 @@ async fn only_managed_data_entrypoint_resolves_and_reuses_authenticated_identity
     }
     assert_eq!(verifier.0.load(Ordering::SeqCst), 0);
     let mut request = Request::builder()
-        .uri("/agent/http/?target=urn:adx:binding:test:1:env&port=8080")
+        .uri("/agent/http/?target=urn:adx:template:test:1&port=8080")
+        .header("x-adx-binding-id", "env")
         .header("authorization", "Bearer tenant")
         .body(())
         .unwrap();
@@ -796,7 +800,8 @@ async fn only_managed_data_entrypoint_resolves_and_reuses_authenticated_identity
     assert_eq!(request.uri().path(), format!("/{id}/8080/"));
     assert_eq!(verifier.0.load(Ordering::SeqCst), 1);
     let mut wrong = Request::builder()
-        .uri("/agent/http/?target=urn:adx:binding:test:1:env&port=8080")
+        .uri("/agent/http/?target=urn:adx:template:test:1&port=8080")
+        .header("x-adx-binding-id", "env")
         .header("authorization", "Bearer other")
         .body(())
         .unwrap();
@@ -916,10 +921,7 @@ async fn managed_http_entry_authenticates_before_creating_binding() {
         .unwrap()
         .to_owned();
     uuid::Uuid::parse_str(&id).unwrap();
-    assert_eq!(
-        response.headers()["x-adx-binding-urn"],
-        format!("urn:adx:binding:demo:1:{id}")
-    );
+    assert!(!response.headers().contains_key("x-adx-binding-urn"));
     response.collect().await.unwrap();
     let page = state.list_bindings(&listing).await.unwrap();
     assert_eq!(page.bindings.len(), 2); // One new request, even though forwarding retries activation.
@@ -1016,7 +1018,7 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
         tenant: "tenant".into(),
         template: "demo".into(),
         template_ref: adx_agent_core::TemplateRef::Version("1".into()),
-        binding_id: "env".into(),
+        binding_id: "user:a/中文%2F".into(),
     };
     let binding = state.create_binding(scope).await.unwrap();
     for id in ["api", &binding.current.environment_id] {
@@ -1052,28 +1054,32 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
         vec![StaticRoute::Prefix("/api".into())],
     ));
     for (gateway, selector, binding_headers) in [
-        (gateway, "target=urn:adx:binding:demo:1:env", true),
+        (gateway, "target=urn:adx:template:demo:1", true),
         (fixed, "target=urn:adx:instance:api", false),
     ] {
         let (mut sender, server, client) = connection(gateway.clone(), IngressSecurity::Tls).await;
-        let req = Request::builder()
+        let mut req = Request::builder()
             .method("POST")
             .uri(format!("/agent/http/chat?{selector}&port={port}&q=a&q=b"))
             .header("host", "public.example")
             .header("x-business", "keep")
             .header("authorization", "Bearer tenant")
-            .header("x-adx-parameters", "%malformed")
+            .header("x-adx-parameters", "%malformed");
+        if binding_headers {
+            req = req.header("x-adx-binding-id", "user%3Aa%2F%E4%B8%AD%E6%96%87%252F");
+        }
+        let req = req
             .body(Full::new(Bytes::from_static(b"business-body")))
             .unwrap();
         let response = sender.send_request(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
         assert_eq!(response.headers()["x-business"], "kept");
         if binding_headers {
-            assert_eq!(response.headers()["x-adx-binding-id"], "env");
             assert_eq!(
-                response.headers()["x-adx-binding-urn"],
-                "urn:adx:binding:demo:1:env"
+                response.headers()["x-adx-binding-id"],
+                "user%3Aa%2F%E4%B8%AD%E6%96%87%252F"
             );
+            assert!(!response.headers().contains_key("x-adx-binding-urn"));
         }
         assert_eq!(
             response.collect().await.unwrap().to_bytes(),
@@ -1085,6 +1091,7 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
         assert_eq!(headers["x-business"], "keep");
         assert!(!headers.contains_key("authorization"));
         assert!(!headers.contains_key("x-adx-parameters"));
+        assert!(!headers.contains_key("x-adx-binding-id"));
         client.abort();
         server.abort();
 
@@ -1098,13 +1105,19 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
         {
             req = req.header("authorization", "Bearer tenant");
         }
+        if binding_headers {
+            req = req.header("x-adx-binding-id", "user%3Aa%2F%E4%B8%AD%E6%96%87%252F");
+        }
         let mut response = sender
             .send_request(req.body(Full::new(Bytes::new())).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
         if binding_headers {
-            assert_eq!(response.headers()["x-adx-binding-id"], "env");
+            assert_eq!(
+                response.headers()["x-adx-binding-id"],
+                "user%3Aa%2F%E4%B8%AD%E6%96%87%252F"
+            );
         }
         let mut upgraded = TokioIo::new(hyper::upgrade::on(&mut response).await.unwrap());
         upgraded.write_all(b"\x82\x03abc").await.unwrap();
@@ -1114,21 +1127,26 @@ async fn unified_access_forwards_payloads_and_returns_binding_headers() {
         let (uri, headers) = seen.recv().await.unwrap();
         assert_eq!(uri, "/");
         assert_eq!(headers["sec-websocket-protocol"], "chat");
+        assert!(!headers.contains_key("x-adx-binding-id"));
         client.abort();
         server.abort();
         for token in ["other", "invalid"] {
             let (mut sender, server, client) =
                 connection(gateway.clone(), IngressSecurity::Tls).await;
-            let response = sender
-                .send_request(request(
-                    "POST",
-                    &format!("/agent/http/chat?{selector}&port={port}"),
-                    token,
-                    "denied",
-                    serde_json::json!({}),
-                ))
-                .await
-                .unwrap();
+            let mut denied = request(
+                "POST",
+                &format!("/agent/http/chat?{selector}&port={port}"),
+                token,
+                "denied",
+                serde_json::json!({}),
+            );
+            if binding_headers {
+                denied.headers_mut().insert(
+                    "x-adx-binding-id",
+                    "user%3Aa%2F%E4%B8%AD%E6%96%87%252F".parse().unwrap(),
+                );
+            }
+            let response = sender.send_request(denied).await.unwrap();
             assert!(matches!(
                 response.status(),
                 StatusCode::FORBIDDEN | StatusCode::NOT_FOUND | StatusCode::UNAUTHORIZED
@@ -1165,9 +1183,9 @@ async fn managed_http_and_ws_activation_are_bounded_by_the_entry_deadline() {
         request_timeout: std::time::Duration::from_secs(1),
     };
     for protocol in ["http", "ws"] {
-        let mut builder = Request::builder().uri(format!(
-            "/agent/{protocol}?target=urn:adx:binding:demo:1:env"
-        ));
+        let mut builder = Request::builder()
+            .uri(format!("/agent/{protocol}?target=urn:adx:template:demo:1"))
+            .header("x-adx-binding-id", "env");
         if protocol == "ws" {
             builder = builder.header("upgrade", "websocket");
         }
@@ -1206,7 +1224,8 @@ async fn managed_target_retry_uses_the_original_deadline() {
         request_timeout: std::time::Duration::from_secs(1),
     };
     let mut request = Request::builder()
-        .uri("/agent/http?target=urn:adx:binding:demo:1:env")
+        .uri("/agent/http?target=urn:adx:template:demo:1")
+        .header("x-adx-binding-id", "env")
         .body(())
         .unwrap();
     let access = crate::ingress::agent_access::AccessRequest::parse(&request)
@@ -2032,7 +2051,8 @@ async fn managed_ws_consumes_parameters_only_for_the_first_activation() {
         Some("workspace=../../wrong"),
     ] {
         let mut request = Request::builder()
-            .uri("/agent/ws?target=urn:adx:binding:params:1:alice")
+            .uri("/agent/ws?target=urn:adx:template:params:1")
+            .header("x-adx-binding-id", "alice")
             .header("upgrade", "websocket")
             .body(())
             .unwrap();
@@ -2274,8 +2294,9 @@ async fn unified_reference_traffic_reuses_the_requested_version_or_alias_scope()
         let response = sender
             .send_request(
                 Request::get(format!(
-                    "/agent/http?target=urn:adx:binding:orbit:{reference}:user"
+                    "/agent/http?target=urn:adx:template:orbit:{reference}"
                 ))
+                .header("x-adx-binding-id", "user")
                 .header("authorization", "Bearer tenant")
                 .body(Full::new(Bytes::new()))
                 .unwrap(),

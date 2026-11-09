@@ -314,7 +314,7 @@ try:
     event(4)
     if not (len(inventory()) == 1):
         raise AssertionError()
-    call(cli('stop'), timeout=120)
+    call(cli('stop') + ['--mode', 'drain'], timeout=120)
     supervisor.wait(timeout=30)
     records = {k: v for k, v in catalog().items() if k.startswith('environment:')}
     if not (not records):
@@ -339,7 +339,7 @@ except BaseException as error:
 finally:
     if any(n == 'supervisor' and p.poll() is None for n, p in children):
         try:
-            call(cli('stop'), timeout=120)
+            call(cli('stop') + ['--mode', 'drain'], timeout=120)
         except Exception as error:
             result['cleanup_errors'].append(str(error))
     logs = pathlib.Path('/opt/adx/run/control/logs')

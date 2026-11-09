@@ -6,6 +6,34 @@
 共享回收接口 `ArtifactReclaimer`。adxlet 处理捕获、恢复和本机缓存；Coordinator
 管理 Environment/Snapshot 的保留关系并回收共享文件。默认 ADX 构建不依赖 AFS/FUSE。
 
+## 并发快照的元数据提交边界
+
+无 Volume 的已运行 Environment 在状态提交中新增 checkpoint / execution artifact 引用时，Redis 事务只比较
+Coordinator epoch、该 Environment 的旧记录与业务计数，不再比较并更新共享 control header 版本。
+无 Volume 的 Snapshot 发布也只比较快照、源 Environment 与节点 session；不同环境的
+快照引用不再因同一 header 版本变化而互相重试。Volume catalog 写入仍保留原有全局 CAS。
+
+这不是移除 GC 保护：所有引用（包括 local artifact）在提交期间持有对应 artifact 的读锁；
+共享 artifact 的物理 GC 和 Deleted cleanup 准入使用相同身份的写锁。本地 Snapshot 删除和本地 cleanup 也在最后一次权威引用检查前取得同一身份的写锁，并保留至节点 RPC 的 ACK 和目录／cleanup 任务提交完成；引用提交不会越过在途删除，无关 artifact 仍可并行。同一 local location 的不同 size／scope 描述只取得一次锁，避免自己与自己冲突。cleanup 准入从未引用检查到环境退役事务完成一直保留写锁；取消或失败会释放临时锁并保留未确认删除的持久待办，不持久化额外墓碑。共享 artifact 继续登记到
+共享回收目录；local artifact 只参与互斥，不加入共享目录。该互斥沿用单活 Coordinator
+合同，不能据此宣称支持多活 Coordinator。
+
+Snapshot inspection 目录仍以既有锁保护已提交视图，Redis 写入失败／取消后要求恢复目录；
+此次没有取消该锁，也没有改变 runsc 保存、fsync 或存储持久化语义。ADXlet catalog 发布
+使用快照操作的剩余 deadline，重试不能延长调用方预算。
+
+可用真实 Redis 回归验证上述边界（测试自行创建并清理隔离 Redis）：
+
+```bash
+export ADX_TEST_REDIS_SERVER=/absolute/path/to/redis-server
+cargo test --locked -p adx-coordinator --lib storage::checkpoint_contention_tests -- --ignored
+cargo test --locked -p adx-coordinator --test storage checkpoint_publication_rounds_1024 -- --ignored --nocapture
+```
+
+第二项运行两轮各 1024 个环境的引用登记、封装结果持有、目录发布和临时引用释放，并检查删除
+源 Environment 后仍可取得快照恢复引用；阶段计时只包含 Coordinator 元数据操作，不执行
+运行时捕获／恢复，不能作为集群端到端 checkpoint 延迟或持久化性能结果。
+
 ## 三种模式
 
 | 模式 | 捕获 | 恢复 | 物理回收 |
@@ -163,6 +191,30 @@ SDK 的 `EnvironmentHTTPError.sandbox_ids` / `template_ids` 提供这些列表�
 
 无使用者时，Redis CAS 将 Snapshot 置为 Deleting，关闭新引用。后台执行物理删除并提交 Deleted；
 存储失败或应答丢失会幂等重试。共享删除不要求源 adxlet 在线。
+
+同一 Coordinator Session 的 Snapshot 提交沿用 inspection 互斥保护已提交视图。无 Volume catalog 写入时只比较 epoch、完整 Snapshot 记录以及适用的来源记录和节点 session，不比较或推进全局 control header。涉及 Volume catalog 的提交仍在锁内读取完整 catalog 和对应 header，再进行全局 CAS。既有 32 次重试预算保持不变。
+
+带卷 Snapshot 的发布与最终删除也在取得 inspection 互斥后读取整份 Volume catalog，并从这份 catalog 计算卷保护增删及对应 header；不能只刷新 header 而保留排队前计算的卷写入，否则可能覆盖其他 Snapshot 的保护关系。普通 acquire/release 在 Snapshot 未进入 Deleted 时不修改 Volume catalog。相同 Session 的这些提交仍按既有互斥串行执行，锁内 Redis 往返属于当前正确性方案的成本；本改动不声称消除全局提交瓶颈或跨 Session 的全部竞争。
+
+节点 Inspect 从已提交缓存中先筛选来源节点并排除 Deleted，再复制要返回的 Snapshot；
+Deleting 仍返回，执行输入保护仍使用完整的 holds 视图。持久化 tombstone 与完整 catalog
+查询保持不变。这样单节点巡检不会为全部节点的历史 Deleted 记录复制模板环境等正文。
+Linux 回归 `storage::inspection::tests::node_inspection_clone_budget` 在独立子进程中构造
+64 个已删除、一个其他节点和两个本节点有效记录，每份携带 2 MiB 模板数据，限制巡检
+新增峰值小于 16 MiB；这验证复制范围，不代表 Coordinator 的总内存预算或集群容量。
+
+已初始化目录的 Session 在读取 Snapshot 列表、节点所有权和回收候选时，先校验当前
+epoch，再从同一个已提交目录筛选并复制结果；不会为每次操作通过 Redis HVALS 重读
+全部历史 tombstone。未初始化目录的独立存储 Session 保留原有持久化查询与数据校验。
+可复用快照发布只借用目录判断同 storage/location 是否已有非 Deleted 所有者，不复制
+全部保留记录；Deleting 仍占有制品。目录因取消或不确定写入而不可用时，此判断返回
+Unavailable，必须先恢复，不能把目录缺失解释为“无人使用”。来源记录、节点会话与
+最终提交的 epoch/CAS 校验保持不变。
+Redis 连接 lease 被替换时，旧目录即失效；成功重连或读取 header 不足以重新确认目录。
+在途写入不能重新发布旧 lease 下的视图，跨 lease 的目录恢复也会被拒绝并要求重试。
+真实 Redis 回归覆盖发布、列表和一次 GC 不重读历史目录，以及 Deleting/Deleted
+所有权、未恢复目录、旧 epoch 拒绝、Redis 重启后的重新确认和在途目录写入隔离；
+这不替代部署后的并发或故障验收。
 
 ## 共享回收与故障
 

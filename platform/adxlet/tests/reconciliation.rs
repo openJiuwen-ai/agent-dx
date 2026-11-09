@@ -540,6 +540,60 @@ async fn periodic_stale_network_policy_does_not_fence_delete() {
 }
 
 #[tokio::test]
+async fn rejected_stale_failed_collection_does_not_fence_reconciliation_or_delete() {
+    use adx_core::observation::OperationIntent;
+    use std::sync::atomic::Ordering;
+
+    let backend = Arc::new(Backend::default());
+    let node = manager(&backend);
+    let mut authority = authority::Fixture::new().await;
+    let mut failed = record("stale-collection", EnvironmentState::Failed);
+    failed.resources_held = false;
+    failed.runtime.ip = None;
+    authority
+        .authority
+        .records
+        .lock()
+        .unwrap()
+        .push(failed.clone().try_into().unwrap());
+    authority.cycle(&node).await.unwrap();
+    let handle = node.environment(failed.spec, failed.assignment).unwrap();
+    let before_delete = handle.sync().await.unwrap().record;
+
+    // A user deletion publishes a newer Failed result while GC is in flight.
+    backend.fail_remove.store(true, Ordering::SeqCst);
+    assert!(handle.delete().await.is_err());
+    let published = handle.sync().await.unwrap().record;
+    assert_eq!(published.state, EnvironmentState::Failed);
+    assert!(published.revision > before_delete.revision);
+    assert_eq!(
+        published.observation.as_ref().and_then(|o| o.intent),
+        Some(OperationIntent::User)
+    );
+    *authority.authority.records.lock().unwrap() = vec![published.clone().try_into().unwrap()];
+    backend.events.lock().unwrap().clear();
+
+    assert_eq!(
+        handle
+            .collect_failed(before_delete.revision)
+            .await
+            .unwrap_err(),
+        adx_core::Error::Conflict
+    );
+    assert!(backend.events.lock().unwrap().is_empty());
+    backend.fail_remove.store(false, Ordering::SeqCst);
+
+    // Compare before another sync could publish any accidental local mutation.
+    authority.cycle(&node).await.unwrap();
+    assert!(backend.events.lock().unwrap().is_empty());
+    assert_eq!(handle.sync().await.unwrap().record, published);
+    let deleted = handle.delete().await.unwrap();
+    assert_eq!(deleted.record.state, EnvironmentState::Deleted);
+    assert_eq!(deleted.durability, Durability::Published);
+    assert!(!deleted.record.resources_held);
+}
+
+#[tokio::test]
 async fn periodic_current_spec_conflict_remains_fenced_until_authority_matches() {
     let backend = Arc::new(Backend::default());
     *backend.actual.lock().unwrap() = vec![observed("kept")];
@@ -1094,6 +1148,133 @@ async fn missing_running_or_uncommitted_start_fails_without_recreation() {
     assert!(events.contains(&"retire:missing-7".into()));
     assert!(events.contains(&"retire:pending-7".into()));
     assert!(!events.iter().any(|event| event.starts_with("bind:")));
+}
+
+#[tokio::test]
+async fn failed_capture_reservation_does_not_block_node_reconciliation() {
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("lost")];
+    let node = manager(&backend);
+    let mut failed = record("lost", EnvironmentState::Failed);
+    failed.revision = 5;
+    failed.resources_held = false;
+    failed.runtime.ip = None;
+    failed.snapshot_source = Some(adx_core::RestorePoint {
+        origin: Some(adx_core::runtime::RuntimeIdentity {
+            environment_id: "source".into(),
+            runtime_id: "source-6".into(),
+            ownership_generation: 6,
+        }),
+        id: "source-snapshot".into(),
+        artifact: adx_core::CheckpointArtifact {
+            storage: "local".into(),
+            scope: String::new(),
+            location: "/checkpoints/source".into(),
+            size_bytes: 1024,
+        },
+        expires_at_unix_seconds: None,
+        source_runtime_id: "source-6".into(),
+    });
+    failed
+        .execution_artifacts
+        .push(adx_core::CheckpointArtifact {
+            storage: "local".into(),
+            scope: String::new(),
+            location: "/checkpoints/unsealed".into(),
+            size_bytes: 0,
+        });
+
+    node.reconcile(vec![failed.clone()]).await.unwrap();
+    assert!(node.accepting_allocations());
+    assert!(backend.actual.lock().unwrap().is_empty());
+    assert_eq!(node.used(), Resources::default());
+    let handle = node.environment(failed.spec, failed.assignment).unwrap();
+    let accepted = handle.sync().await.unwrap();
+    assert_eq!(accepted.durability, Durability::Published);
+    assert_eq!(accepted.record.state, EnvironmentState::Failed);
+    assert!(accepted.record.revision > failed.revision);
+    assert!(!accepted.record.resources_held);
+    assert!(accepted.record.runtime.ip.is_none());
+    assert!(accepted.record.execution_artifacts.is_empty());
+    assert_eq!(accepted.record.snapshot_source, failed.snapshot_source);
+    handle.delete().await.unwrap();
+    assert!(!backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| { event.starts_with("start:") || event.starts_with("bind:") }));
+}
+
+#[tokio::test]
+async fn unsealed_capture_cleanup_failure_keeps_node_admission_closed_until_retry() {
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("lost")];
+    backend
+        .fail_remove
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let node = manager(&backend);
+    let mut failed = record("lost", EnvironmentState::Failed);
+    failed.resources_held = false;
+    failed.runtime.ip = None;
+    failed
+        .execution_artifacts
+        .push(adx_core::CheckpointArtifact {
+            storage: "local".into(),
+            scope: String::new(),
+            location: "/checkpoints/unsealed".into(),
+            size_bytes: 0,
+        });
+    assert!(node.reconcile(vec![failed.clone()]).await.is_err());
+    assert!(!node.accepting_allocations());
+    assert!(!backend.actual.lock().unwrap().is_empty());
+    assert!(!backend
+        .events
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|event| event.starts_with("commit:")));
+    backend
+        .fail_remove
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    node.reconcile(vec![failed]).await.unwrap();
+    assert!(node.accepting_allocations());
+    assert!(backend.actual.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn running_unsealed_capture_retires_execution_before_failed_publication() {
+    let backend = Arc::new(Backend::default());
+    *backend.actual.lock().unwrap() = vec![observed("lost")];
+    let node = manager(&backend);
+    let mut running = record("lost", EnvironmentState::Running);
+    running
+        .execution_artifacts
+        .push(adx_core::CheckpointArtifact {
+            storage: "local".into(),
+            scope: String::new(),
+            location: "/checkpoints/unsealed".into(),
+            size_bytes: 0,
+        });
+    node.reconcile(vec![running.clone()]).await.unwrap();
+    let handle = node.environment(running.spec, running.assignment).unwrap();
+    let accepted = handle.sync().await.unwrap();
+    assert_eq!(accepted.record.state, EnvironmentState::Failed);
+    assert!(accepted.record.revision > running.revision);
+    assert!(!accepted.record.resources_held);
+    assert!(accepted.record.runtime.ip.is_none());
+    assert!(accepted.record.execution_artifacts.is_empty());
+    assert_eq!(node.used(), Resources::default());
+    let events = backend.events.lock().unwrap();
+    let removed = events
+        .iter()
+        .position(|event| event == "remove:lost-7")
+        .unwrap();
+    let committed = events
+        .iter()
+        .position(|event| event == "commit:Failed")
+        .unwrap();
+    assert!(removed < committed);
 }
 
 #[tokio::test]

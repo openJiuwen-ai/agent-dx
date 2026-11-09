@@ -208,11 +208,11 @@ impl BackendHttpPool {
                             .await
                             .map_err(BackendHttpPoolError::Handshake)?;
                     self.inner.opened_total.fetch_add(1, Ordering::Relaxed);
-                    tokio::spawn(async move {
+                    tokio::spawn(adx_observability::trace::with_current_context(async move {
                         if let Err(error) = connection.await {
                             tracing::debug!(%error, "pooled environment HTTP connection closed");
                         }
-                    });
+                    }));
                     break sender;
                 };
                 if idle.sender.ready().await.is_ok() {

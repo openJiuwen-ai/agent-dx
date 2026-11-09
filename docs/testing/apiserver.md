@@ -54,7 +54,7 @@ adxlet 装配 Sandboxd、ExecdReadiness、UdsRoutes 及带 SQLite 降级的 Stat
 
 Node 启动后先关闭生命周期入口，以本次进程身份注册并获取 Coordinator 完整目录，与 sandboxd 实际实例对账，恢复资源占用和本机绑定后再开放准入。Coordinator 暂不可用时不清理或重建。详细契约见 [发现与重启对账](recovery-discovery.md)。
 
-入口支持 Redis 注册发现，API Server 的 Coordinator／认证和目录客户端共用动态 resolver。Relay 全量同步、统一配置生成与 supervisor 已装配。`adxctl stop` 和 supervisor 的 SIGTERM/SIGINT 会执行本机实例清理；单独 adxlet 故障重启走权威对账。
+入口支持 Redis 注册发现，API Server 的 Coordinator／认证和目录客户端共用动态 resolver。Relay 全量同步、统一配置生成与 supervisor 已装配。`adxctl stop` 和 supervisor 的 SIGTERM/SIGINT 使用启动时加载的 `shutdown_mode`，默认 `preserve`：关闭 adxlet 准入，保持心跳至内嵌 Relay 排水结束，退出时不删除 Environment、不注销节点。需要本机实例清理时显式使用 `adxctl stop --mode drain`。单独 adxlet 故障重启走权威对账；会话接续条件见 [adxctl 退出策略](../deployment/adxctl.md)。
 
 ## 验证入口
 

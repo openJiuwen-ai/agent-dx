@@ -1,10 +1,14 @@
 schema_version: 1
+# Optional deployment-level tracing (OTLP/HTTP only, disabled by default):
+# tracing:
+#   endpoints: ["127.0.0.1:4318"]   # empty = disabled; non-empty = enabled (100%)
 package_dir: /opt/adx/current
 state_dir: /opt/adx/run/control
 redis_url: redis://127.0.0.1:6379/
 namespace: adx
 restart_delay_ms: 1000
 stop_timeout_seconds: 90
+shutdown_mode: preserve
 services:
   - id: coordinator
     role: coordinator

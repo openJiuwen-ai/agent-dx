@@ -1,5 +1,5 @@
 //! Shared Linux EROFS mount and supervisor resource discovery/cleanup.
-use super::{client::unavailable, Bootstrap};
+use super::{cgroups::SupervisorCgroups, client::unavailable, Bootstrap};
 use adx_core::{Error, Result};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
@@ -163,8 +163,11 @@ impl HostOperations for LinuxHost {
         Ok(root.to_path_buf())
     }
     async fn supervisor_inventory(&self) -> Result<Vec<String>> {
-        let mut ids = std::collections::BTreeSet::new();
-        for (directory, prefix) in [("/sys/fs/cgroup/jiuwenbox", ""), ("/run/netns", "jbx-")] {
+        let mut ids: std::collections::BTreeSet<_> = SupervisorCgroups::new("/sys/fs/cgroup")
+            .inventory()?
+            .into_iter()
+            .collect();
+        for (directory, prefix) in [("/run/netns", "jbx-")] {
             let entries = match std::fs::read_dir(directory) {
                 Ok(entries) => entries,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
@@ -183,39 +186,23 @@ impl HostOperations for LinuxHost {
         Ok(ids.into_iter().collect())
     }
     async fn supervisor_absent(&self, id: &str) -> Result<bool> {
-        let root = Path::new("/sys/fs/cgroup");
-        if !root.join("cgroup.controllers").is_file() {
-            return Err(unavailable("supervisor recovery requires cgroup v2"));
-        }
-        let group = root.join("jiuwenbox").join(id);
-        match std::fs::read_to_string(group.join("cgroup.procs")) {
-            Ok(pids) => Ok(pids.trim().is_empty()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(!group.exists()),
-            Err(e) => Err(unavailable(e)),
-        }
+        SupervisorCgroups::new("/sys/fs/cgroup").absent(id)
     }
     async fn cleanup_supervisor(&self, id: &str) -> Result<()> {
         if !super::managed_id(id) {
             return Err(Error::Invalid("invalid managed supervisor ID".into()));
         }
-        if !self.supervisor_absent(id).await? {
-            // cgroup.kill targets the entire owned group without PID reuse races.
-            std::fs::write(
-                Path::new("/sys/fs/cgroup/jiuwenbox")
-                    .join(id)
-                    .join("cgroup.kill"),
-                "1",
-            )
-            .map_err(unavailable)?;
-            tokio::time::timeout(Duration::from_secs(5), async {
-                while !self.supervisor_absent(id).await? {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                Ok::<(), Error>(())
-            })
-            .await
-            .map_err(|_| unavailable("supervisor processes remain"))??;
-        }
+        let cgroups = SupervisorCgroups::new("/sys/fs/cgroup");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !cgroups.absent(id)? {
+                cgroups.kill_once(id)?;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok::<(), Error>(())
+        })
+        .await
+        .map_err(|_| unavailable("supervisor processes remain"))??;
+        cgroups.remove_empty(id)?;
         let namespace = format!("jbx-{id}");
         if Path::new("/run/netns").join(&namespace).exists() {
             command("ip", &["netns", "delete", &namespace], None).await?;
@@ -225,12 +212,7 @@ impl HostOperations for LinuxHost {
         if Path::new("/sys/class/net").join(&interface).exists() {
             command("ip", &["link", "del", &interface], None).await?;
         }
-        let group = Path::new("/sys/fs/cgroup/jiuwenbox").join(id);
-        match std::fs::remove_dir(group) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(unavailable(e)),
-        }
+        Ok(())
     }
 }
 

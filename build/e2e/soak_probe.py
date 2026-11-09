@@ -15,6 +15,9 @@ STORAGE_SCOPE = 'allocated-backing-fs-v2'
 _SPEC = importlib.util.spec_from_file_location('soak_fd_probe', Path(__file__).with_name('soak_fd.py'))
 fd = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(fd)
+_MEMORY_SPEC = importlib.util.spec_from_file_location('soak_memory_probe', Path(__file__).with_name('soak_memory.py'))
+memory = importlib.util.module_from_spec(_MEMORY_SPEC)
+_MEMORY_SPEC.loader.exec_module(memory)
 
 
 def mount_paths(text):
@@ -133,14 +136,14 @@ def storage(directory):
     return total, logs
 
 
-def observe(environment_id=None, *, mode=None, cache_root=None):
+def observe(environment_id=None, *, mode=None, cache_root=None, full_memory=False, sdk_worker=None):
     processes = {}
     for path in Path('/proc').iterdir():
         if not path.name.isdigit():
             continue
         try:
             name = (path / 'comm').read_text().strip()
-            if name not in NAMES:
+            if name not in (NAMES + memory.EXTRA_NAMES if full_memory else NAMES):
                 continue
             processes[name + ':' + path.name] = persistent_process(int(path.name), name, mode, cache_root)
         except FileNotFoundError:
@@ -153,6 +156,7 @@ def observe(environment_id=None, *, mode=None, cache_root=None):
     backing = backing_storage(runtime, mounts)
     stream_backing = backing_storage('/opt/adx/logs/runtime', mounts)
     anchor = anchor_runtime(environment_id) if environment_id else None
+    census = memory.enrich(processes, anchor, sdk_worker=sdk_worker) if full_memory else None
     observed = {'processes': processes, 'anchor_runtime': anchor,
             'fds': sum(p['fds'] for p in processes.values()) + (anchor['fds'] if anchor else 0),
             'rss_bytes': sum(p['rss_bytes'] for p in processes.values()) + (anchor['rss_bytes'] if anchor else 0),
@@ -162,6 +166,8 @@ def observe(environment_id=None, *, mode=None, cache_root=None):
             'runtime_backing_bytes': backing['bytes'] + stream_backing['bytes'],
             'runtime_backing': backing, 'runtime_stream_backing': stream_backing, 'storage_scope': STORAGE_SCOPE,
             'runtime_disk_present': runtime.is_dir(), 'free_bytes': shutil.disk_usage('/a').free}
+    if full_memory:
+        observed.update(observation_scope=memory.SCOPE, process_census=census)
     return fd.attach(observed, mode) if mode else observed
 
 
@@ -170,8 +176,11 @@ if __name__ == '__main__':
     parser.add_argument('environment_id', nargs='?')
     parser.add_argument('--mode', choices=('ownerfs', 'dfs'))
     parser.add_argument('--cache-root')
+    parser.add_argument('--full-memory', action='store_true')
+    parser.add_argument('--sdk-worker')
     args = parser.parse_args()
     if args.cache_root and args.mode != 'dfs':
         parser.error('cache root is valid only for DFS')
     logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stdout, force=True)
-    logging.info('%s', json.dumps(observe(args.environment_id, mode=args.mode, cache_root=args.cache_root)))
+    logging.info('%s', json.dumps(observe(args.environment_id, mode=args.mode, cache_root=args.cache_root,
+                                         full_memory=args.full_memory, sdk_worker=args.sdk_worker)))

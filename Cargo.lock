@@ -291,6 +291,7 @@ dependencies = [
  "opentelemetry_sdk 0.31.0",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
  "tonic 0.12.3",

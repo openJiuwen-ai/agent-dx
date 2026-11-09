@@ -13,21 +13,26 @@ pub(super) async fn open(
     completion.set_nonblocking(true)?;
     let mut completion = tokio::net::UnixStream::from_std(completion)?;
     let (send, receive) = mpsc::sync_channel(1);
+    // The blocking pool does not inherit the request's OTel context; capture it
+    // so the checkpoint handoff logs stay correlated.
+    let context = adx_observability::trace::current_context();
     tokio::task::spawn_blocking(move || {
-        execd_info!(
-            "[checkpoint-control] handoff_open_started operation={}",
-            operation
-        );
-        let opened = hooks.open();
-        execd_info!(
-            "[checkpoint-control] handoff_open_completed operation={} success={}",
-            operation,
-            opened.is_ok()
-        );
-        // EOF notifies the I/O waiter after the result is available. Both ends
-        // close before Prepared, including when the caller has disconnected.
-        let _ = send.send(opened);
-        drop(notify);
+        adx_observability::trace::attach_context(&context, || {
+            execd_info!(
+                "[checkpoint-control] handoff_open_started operation={}",
+                operation
+            );
+            let opened = hooks.open();
+            execd_info!(
+                "[checkpoint-control] handoff_open_completed operation={} success={}",
+                operation,
+                opened.is_ok()
+            );
+            // EOF notifies the I/O waiter after the result is available. Both
+            // ends close before Prepared, including when the caller disconnected.
+            let _ = send.send(opened);
+            drop(notify);
+        });
     });
     let mut byte = [0];
     if completion.read(&mut byte).await? != 0 {

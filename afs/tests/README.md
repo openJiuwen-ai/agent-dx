@@ -225,7 +225,7 @@ python3 afs/tests/run.py run --suite all-basic \
 ```
 
 READY只代表预检满足，实际PASS看本次结果；退出2/BLOCKED须补环境或输入，不能当作通过。
-完整基础集合为单机13＋namespace9，不包含`--all`的可选扩展合同。
+完整基础集合为单机14＋namespace9，不包含`--all`的可选扩展合同。
 
 ### 5. 导出证据，再回收自己的环境
 
@@ -322,7 +322,7 @@ python3 afs/tests/run.py run --case 'ownerfs.basic.*' --case 'dfs.basic.*' \
 
 ## 真实断言与集合
 
-- `local-basic`：OwnerFs/DFS 启动和真实挂载，基本文件/目录/错误，OwnerFs双向读写，
+- `local-basic`：OwnerFs/DFS 启动和真实挂载，基本文件/目录/错误，OwnerFs双向读写及远端目录句柄回收（1000轮），
   非root/setid，DFS一写两读/版本/权限，正常停启恢复，FUSE顺序/真实DFS缓存及busy拒绝、正常清理。
 - `cluster-basic`：M/A/B独立namespace节点，OwnerFs跨节点读写/命名空间/旧FD/单Home/EXDEV/权限，
   DFS R1跨机发布/读回/新鲜度，Meta/Home正常进程重启及逐机清理。

@@ -69,6 +69,7 @@ impl UdsRoutes {
     fn request<T>(&self, message: T) -> tonic::Request<T> {
         let mut r = tonic::Request::new(message);
         r.set_timeout(self.timeout);
+        adx_observability::trace::inject_metadata(r.metadata_mut());
         r
     }
     async fn remote(&self, client: &mut RelayServiceClient<Channel>) -> Result<pb::BindingState> {

@@ -161,7 +161,7 @@ class PipelineContracts(unittest.TestCase):
             self.assertIn(f"--exclude {package}", makefile)
         self.assertIn("ADX_WITH_AFS ?= 0", makefile)
         self.assertIn("ADX_AFS_ALL_FEATURES ?= 0", makefile)
-        self.assertIn("afs-check: afs-build afs-lint afs-test", makefile)
+        self.assertIn("afs-check: afs-build afs-lint afs-build-identity afs-test", makefile)
         self.assertIn("afs-all-features-lint:", makefile)
         self.assertIn("pkg-config --exists libibverbs", makefile)
         self.assertIn("afs-build:\n\t$(CARGO) build --locked -p afs --bins", makefile)

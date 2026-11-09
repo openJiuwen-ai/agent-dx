@@ -224,9 +224,11 @@ impl Sandboxd {
         devices: &[adx_core::scheduling::DeviceAllocation],
     ) -> Result<Request<proto::StartRequest>> {
         if spec.execution.user.is_some() || spec.execution.group.is_some() {
-            return Err(Error::Invalid(
-                "this sandboxd backend does not support tool user/group overrides".into(),
-            ));
+            adx_observability::warn!(
+                environment_id = %spec.id,
+                runtime_class = %spec.runtime_class,
+                "sandboxd ignores tool user/group overrides and uses its configured identity"
+            );
         }
         let mut config = self.config.clone();
         // Runtime capability metadata owns the guest paths. Never inherit caller
@@ -320,7 +322,9 @@ impl Sandboxd {
         let mut client = self.client.clone();
         let backend_ids = self.backend_ids.clone();
         let logical_id = runtime_id.to_string();
-        tokio::spawn(async move {
+        // The spawned task starts with an empty task-local context; keep the
+        // sandbox.create trace on the identity-mapping log emitted below.
+        tokio::spawn(adx_observability::trace::with_current_context(async move {
             let response = match client.start(request).await {
                 Ok(response) => response.into_inner(),
                 Err(error) => {
@@ -385,7 +389,7 @@ impl Sandboxd {
             }
             *state = StartState::Started(ip);
             Ok(ip)
-        })
+        }))
         .await
         .map_err(unavailable)?
     }
@@ -1144,6 +1148,9 @@ fn runtime_control_peer(config: &Config) -> Result<Option<proto::NetworkEndpoint
 
 #[async_trait]
 impl RuntimeDriver for Sandboxd {
+    async fn sandbox_id(&self, runtime_id: &str) -> Option<String> {
+        self.physical_id(runtime_id).await.ok().flatten()
+    }
     // Keep RuntimeDriver's conservative input retention: sandboxd can enable
     // runsc background page loading independently of adxlet configuration.
     // Firecracker also retains its caller-owned incremental memory base.

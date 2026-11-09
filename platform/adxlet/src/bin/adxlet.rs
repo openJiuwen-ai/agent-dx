@@ -129,6 +129,8 @@ fn coordinator_channel(
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config: Config = read_config()?;
+    let mut preserve =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())?;
     if config.sandboxd_socket.is_none() && config.jiuwenbox.is_none() {
         return Err("configure sandboxd_socket and/or jiuwenbox".into());
     }
@@ -337,7 +339,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     manager.update_capacity(o.capacity, valid)?;
     manager.update_devices(o.devices.clone(), valid)?;
-    let mut embedded = if config.proxy_mode == adxlet::proxy::ProxyMode::Embedded {
+    let embedded = if config.proxy_mode == adxlet::proxy::ProxyMode::Embedded {
         adx_process::resource::raise_nofile_soft_limit_from_env()?;
         Some(
             adxlet::proxy::EmbeddedProxy::start(
@@ -538,26 +540,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Ok::<(), tonic::transport::Error>(())
     };
-    let proxy_failure = async {
-        match &mut embedded {
-            Some(proxy) => proxy.failed().await,
-            None => std::future::pending::<adx_core::Result<()>>().await,
+    let services = async {
+        tokio::select! {
+            result = control_server => result?,
+            result = &mut server => result?,
+            result = report => result?,
+            result = metrics => result?,
+            _ = claim_retries => {}
+            _ = monitoring => {}
+            _ = log_gc => {}
+            result = admin => result.map_err(|error| -> Box<dyn std::error::Error> { error })?,
+        }
+        Ok::<(), Box<dyn std::error::Error>>(())
+    };
+    let shutdown = async {
+        tokio::select! {
+            _ = preserve.recv() => adxlet::proxy::ShutdownMode::Preserve,
+            _ = shutdown() => adxlet::proxy::ShutdownMode::Drain,
         }
     };
-    tokio::select! {
-        result = proxy_failure => result?,
-        result = control_server => result?,
-        result = &mut server => result?,
-        result = report => result?,
-        result = metrics => result?,
-        _ = claim_retries => {}
-        _ = monitoring => {}
-        _ = log_gc => {}
-        result = admin => result.map_err(|error| -> Box<dyn std::error::Error> { error })?,
-        _ = shutdown() => {}
-    }
-    manager.set_maintenance(true);
-    if let Err(error) = adxlet::node_reconciliation::unregister_node(
+    let mode = adxlet::proxy::serve_until_shutdown(&manager, embedded, services, shutdown).await?;
+    if let Err(error) = adxlet::node_reconciliation::finish_shutdown(
+        mode,
         &mut coordinator,
         &registration,
         timeout.min(Duration::from_secs(5)),
@@ -565,9 +569,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await
     {
         adx_observability::warn!(%error, "planned node departure unconfirmed; heartbeat expiry remains active");
-    }
-    if let Some(proxy) = embedded {
-        proxy.shutdown().await?;
     }
     Ok(())
 }

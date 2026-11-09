@@ -50,7 +50,7 @@ impl Session {
         old: &StoredEnvironment,
         result: &EnvironmentRecord,
         artifacts: &[CheckpointArtifact],
-    ) -> Result<Option<CheckpointCleanup>> {
+    ) -> Result<Option<(CheckpointCleanup, Vec<ArtifactDeletionGuard>)>> {
         let mut artifacts = artifacts.to_vec();
         if let Some(cp) = old.result.as_ref().and_then(|r| r.checkpoint.as_ref()) {
             artifacts.push(cp.artifact.clone());
@@ -86,13 +86,16 @@ impl Session {
             artifacts,
         };
         task.validate()?;
+        // Replace the former global header dependency with exclusion only for
+        // these candidates. Callers retain the guards until retirement commits.
+        let guards = self.store.lock_artifact_deletions(&task.artifacts)?;
         if !self
             .checkpoint_cleanup_unreferenced(&task, Some(&result.spec.id))
             .await?
         {
             return Err(Error::Conflict);
         }
-        Ok(Some(task))
+        Ok(Some((task, guards)))
     }
 
     /// Defense against corrupt aliased ownership and incomplete catalog cleanup.

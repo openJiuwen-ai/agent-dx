@@ -26,7 +26,10 @@ use adx_protocol::{
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc, Mutex as StdMutex,
+    },
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot, watch, Mutex, Notify};
@@ -72,6 +75,93 @@ fn requires_node_reconciliation(environment: &StoredEnvironment) -> bool {
         // returning node cannot republish Running or reserve their resources.
         record.state != EnvironmentState::Deleted || record.resources_held || record.restart_pending
     })
+}
+
+/// Request-scoped scheduling observations. A schedule round may serve several
+/// requests, so these are attributes of the per-request
+/// `coordinator.schedule` span rather than round-level child spans.
+#[derive(Default)]
+struct ScheduleStats {
+    attempts: AtomicU32,
+    rounds: AtomicU32,
+    retries: AtomicU32,
+    first_error: StdMutex<Option<(String, String)>>,
+    submitted_at: StdMutex<Option<tokio::time::Instant>>,
+    assigned_at: StdMutex<Option<tokio::time::Instant>>,
+}
+impl ScheduleStats {
+    fn attempt(&self) {
+        self.attempts.fetch_add(1, Ordering::Relaxed);
+    }
+    fn round(&self) {
+        self.rounds.fetch_add(1, Ordering::Relaxed);
+    }
+    fn submitted(&self) {
+        let mut submitted = self
+            .submitted_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if submitted.is_none() {
+            *submitted = Some(tokio::time::Instant::now());
+        }
+    }
+    fn assigned(&self) {
+        let mut assigned = self
+            .assigned_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if assigned.is_none() {
+            *assigned = Some(tokio::time::Instant::now());
+        }
+    }
+    fn retry(&self, code: String, message: String) {
+        self.retries.fetch_add(1, Ordering::Relaxed);
+        let mut first = self
+            .first_error
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if first.is_none() {
+            *first = Some((code, message));
+        }
+    }
+    fn queue_wait_ms(&self) -> Option<u128> {
+        let submitted = (*self
+            .submitted_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))?;
+        let end = (*self
+            .assigned_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner))
+        .unwrap_or_else(tokio::time::Instant::now);
+        Some(end.saturating_duration_since(submitted).as_millis())
+    }
+}
+
+fn attach_retry_metadata(
+    error: &mut Status,
+    attempts: u32,
+    retries: u32,
+    first_error: Option<&(String, String)>,
+) {
+    let mut insert = |key: &'static str, value: &str| {
+        let value = value
+            .chars()
+            .filter(|c| c.is_ascii_graphic() || *c == ' ')
+            .take(512)
+            .collect::<String>();
+        if !value.is_empty() {
+            if let Ok(value) = tonic::metadata::MetadataValue::try_from(value.as_str()) {
+                error.metadata_mut().insert(key, value);
+            }
+        }
+    };
+    insert("adx-create-attempts", &attempts.to_string());
+    insert("adx-retry-count", &retries.to_string());
+    if let Some((code, message)) = first_error {
+        insert("adx-retry-first-error-code", code);
+        insert("adx-retry-first-error-message", message);
+    }
 }
 
 impl State {
@@ -214,6 +304,21 @@ impl State {
             };
             match saved {
                 Ok(record) => {
+                    if record
+                        .recovery
+                        .as_ref()
+                        .is_some_and(|recovery| recovery.pending)
+                    {
+                        if let Err(error) = self
+                            .scheduler
+                            .finish_recovery_placement(&record.spec, &record.assignment)
+                        {
+                            // Redis already owns the new assignment. Rebuild
+                            // before accepting claims or scheduling more work.
+                            self.needs_recovery = true;
+                            return Err(error);
+                        }
+                    }
                     if let Some(source) = record
                         .recovery
                         .as_ref()
@@ -755,6 +860,7 @@ impl CoordinatorRpc {
                 newly_created: false,
                 record: Some(record.try_into().map_err(status)?),
                 durability: pb::Durability::Published as i32,
+                ..Default::default()
             }));
         }
         let spec = match session.get(&raw.id).await {
@@ -777,6 +883,7 @@ impl CoordinatorRpc {
                     newly_created: false,
                     record: Some(record.try_into().map_err(status)?),
                     durability: pb::Durability::Published as i32,
+                    ..Default::default()
                 }));
             }
             Ok(_) | Err(Error::NotFound) => {
@@ -785,10 +892,12 @@ impl CoordinatorRpc {
             Err(error) => return Err(status(error)),
         };
         let service = self.clone();
+        let environment_id = spec.id.clone();
         // Keep the large creation future behind a pointer before adding trace wrappers.
         // The task remains detached from cancellation of the RPC response wait.
         let creation = Box::pin(async move {
-            service
+            adx_observability::trace::attribute("environment.id", environment_id);
+            let result = service
                 .create(
                     spec,
                     schedule_timeout,
@@ -797,11 +906,29 @@ impl CoordinatorRpc {
                     request_id,
                 )
                 .await
-                .map(Response::new)
+                .map(Response::new);
+            match &result {
+                Ok(_) => adx_observability::trace::attribute("result", "success".into()),
+                Err(error) => {
+                    adx_observability::trace::attribute("result", "fail".into());
+                    adx_observability::trace::attribute(
+                        "error.code",
+                        i32::from(error.code()).to_string(),
+                    );
+                    adx_observability::trace::attribute(
+                        "error.message",
+                        error.message().to_owned(),
+                    );
+                    adx_observability::trace::error_with(error.message().to_owned());
+                }
+            }
+            result
         });
-        tokio::spawn(adx_observability::trace::Trace::child("coordinator.create").run(creation))
-            .await
-            .map_err(|_| Status::internal("creation task failed"))?
+        tokio::spawn(
+            adx_observability::trace::Trace::child("coordinator.create").run_result(creation),
+        )
+        .await
+        .map_err(|_| Status::internal("creation task failed"))?
     }
 
     async fn create(
@@ -920,6 +1047,62 @@ impl CoordinatorRpc {
         create_deadline: adx_transport::deadline::Deadline,
         request_id: String,
     ) -> std::result::Result<pb::EnvironmentResult, Status> {
+        let stats = Arc::new(ScheduleStats::default());
+        let trace = adx_observability::trace::Trace::child("coordinator.schedule");
+        trace.attribute("environment.id", spec.id.clone());
+        let mut result = trace
+            .scope_result(self.create_attempt_inner(
+                spec,
+                schedule_timeout,
+                create_deadline,
+                request_id,
+                Arc::clone(&stats),
+            ))
+            .await;
+        let attempts = stats.attempts.load(Ordering::Relaxed);
+        let rounds = stats.rounds.load(Ordering::Relaxed);
+        let retries = stats.retries.load(Ordering::Relaxed);
+        trace.attribute("schedule.attempts", attempts.to_string());
+        trace.attribute("schedule.rounds", rounds.to_string());
+        trace.attribute("retry.count", retries.to_string());
+        let first_error = stats
+            .first_error
+            .lock()
+            .ok()
+            .and_then(|value| value.clone());
+        if let Some((code, message)) = &first_error {
+            trace.attribute("retry.first_error_code", code.clone());
+            trace.attribute("retry.first_error_message", message.clone());
+        }
+        if let Some(wait_ms) = stats.queue_wait_ms() {
+            trace.attribute("queue.wait_ms", wait_ms.to_string());
+        }
+        match &mut result {
+            Ok(value) => {
+                trace.attribute("result", "success".into());
+                value.create_attempts = attempts;
+                value.retry_count = retries;
+                if let Some((code, message)) = &first_error {
+                    value.retry_first_error_code = code.clone();
+                    value.retry_first_error_message = message.clone();
+                }
+            }
+            Err(error) => {
+                trace.attribute("result", "fail".into());
+                attach_retry_metadata(error, attempts, retries, first_error.as_ref());
+            }
+        }
+        result
+    }
+
+    async fn create_attempt_inner(
+        &self,
+        spec: EnvironmentSpec,
+        schedule_timeout: Duration,
+        create_deadline: adx_transport::deadline::Deadline,
+        request_id: String,
+        stats: Arc<ScheduleStats>,
+    ) -> std::result::Result<pb::EnvironmentResult, Status> {
         let inspection = self.create_guard(format!("publication:{}", spec.id)).await;
         let session = { self.0.state.lock().await.session.clone() };
         if let Some(record) = session
@@ -931,6 +1114,7 @@ impl CoordinatorRpc {
                 newly_created: false,
                 record: Some(record.try_into().map_err(status)?),
                 durability: pb::Durability::Published as i32,
+                ..Default::default()
             });
         }
         match session.get(&spec.id).await {
@@ -952,6 +1136,7 @@ impl CoordinatorRpc {
                     newly_created: false,
                     record: Some(record.try_into().map_err(status)?),
                     durability: pb::Durability::Published as i32,
+                    ..Default::default()
                 });
             }
             Err(Error::NotFound) => {
@@ -1015,6 +1200,7 @@ impl CoordinatorRpc {
         drop(inspection);
         let mut schedule_deadline = None;
         loop {
+            stats.attempt();
             create_deadline.remaining().map_err(|_| {
                 Status::deadline_exceeded("create deadline exceeded during central scheduling")
             })?;
@@ -1063,17 +1249,20 @@ impl CoordinatorRpc {
                     .map_err(status)?;
                 state.scheduler.submit(spec.clone()).map_err(status)?;
                 state.specs.insert(spec.id.clone(), spec.clone());
+                stats.submitted();
                 let deadline =
                     (tokio::time::Instant::now() + schedule_timeout).min(create_deadline.instant());
                 state.scheduling_deadlines.insert(spec.id.clone(), deadline);
                 schedule_deadline.get_or_insert(deadline);
             }
+            stats.round();
             let drive = state.drive().await;
             if drive.as_ref().is_err() || drive.as_ref().is_ok_and(|progress| *progress) {
                 self.0.changed.notify_waiters();
             }
             let progress = drive.map_err(status)?;
             if state.environments.contains_key(&spec.id) {
+                stats.assigned();
                 state.scheduling_deadlines.remove(&spec.id);
                 // Only successful publication is durable; this assignment is held in memory.
                 let stored = state
@@ -1105,6 +1294,7 @@ impl CoordinatorRpc {
                         newly_created: false,
                         record: Some(result.try_into().map_err(status)?),
                         durability: pb::Durability::Published as i32,
+                        ..Default::default()
                     });
                 }
                 let node = state
@@ -1118,6 +1308,10 @@ impl CoordinatorRpc {
                     })
                 {
                     drop(state);
+                    stats.retry(
+                        i32::from(tonic::Code::Unavailable).to_string(),
+                        "owner node not ready".into(),
+                    );
                     self.retry_initial(&spec.id, &stored.assignment).await?;
                     tokio::time::timeout_at(create_deadline.instant(), changed)
                         .await
@@ -1142,6 +1336,10 @@ impl CoordinatorRpc {
                 let channel = match endpoint.connect().await {
                     Ok(channel) => channel,
                     Err(_) => {
+                        stats.retry(
+                            i32::from(tonic::Code::Unavailable).to_string(),
+                            "node channel connect failed".into(),
+                        );
                         self.retry_initial(&spec.id, &stored.assignment).await?;
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         continue;
@@ -1180,6 +1378,10 @@ impl CoordinatorRpc {
                         // A node can hold an as-yet unconfirmed local attempt.
                         // Keep this confirmed owner; retry admission after that
                         // attempt resolves, never allocate another generation.
+                        stats.retry(
+                            i32::from(error.code()).to_string(),
+                            error.message().to_owned(),
+                        );
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         continue;
                     }
@@ -1188,6 +1390,13 @@ impl CoordinatorRpc {
                             && error
                                 .metadata()
                                 .get("adx-backend-failure")
+                                .is_none_or(|value| value != "true")
+                            // A confirmed terminal create failure (for example a
+                            // readiness probe failure) must not be retried as if
+                            // it were a transient transport error.
+                            && error
+                                .metadata()
+                                .get("adx-create-terminal")
                                 .is_none_or(|value| value != "true")
                             && matches!(
                                 error.code(),
@@ -1198,6 +1407,10 @@ impl CoordinatorRpc {
                                     | tonic::Code::DeadlineExceeded
                             ) =>
                     {
+                        stats.retry(
+                            i32::from(error.code()).to_string(),
+                            error.message().to_owned(),
+                        );
                         self.retry_initial(&spec.id, &stored.assignment).await?;
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         continue;
@@ -1913,8 +2126,26 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                     "live node session required for inspection",
                 ));
             }
-            let (cached_snapshots, holds) =
-                state.session.inspection_inventory().await.map_err(status)?;
+            let session = state.session.clone();
+            drop(state);
+            let (cached_snapshots, holds) = session
+                .node_inspection_inventory(&r.node_id)
+                .await
+                .map_err(status)?;
+            let mut state = self.0.state.lock().await;
+            state.healthy().map_err(status)?;
+            let live = state.live.get(&r.node_id).ok_or_else(|| {
+                Status::failed_precondition("node session changed during inspection")
+            })?;
+            if state.session.epoch() != session.epoch()
+                || live.session != r.session_id
+                || live.expired
+                || live.last_seen.elapsed() >= self.0.heartbeat_timeout
+            {
+                return Err(Status::failed_precondition(
+                    "node session changed during inspection",
+                ));
+            }
             let mut retained = BTreeMap::new();
             let mut retain = |artifact: &adx_core::CheckpointArtifact| {
                 if artifact.storage == "local" {
@@ -1955,10 +2186,6 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
                 .map_err(status)?;
             let snapshots = cached_snapshots
                 .into_iter()
-                .filter(|snapshot| {
-                    snapshot.source_node_id == r.node_id
-                        && snapshot.state != adx_core::snapshots::SnapshotState::Deleted
-                })
                 .map(TryInto::try_into)
                 .collect::<Result<Vec<_>>>()
                 .map_err(status)?;
@@ -2183,12 +2410,31 @@ impl pb::coordinator_service_server::CoordinatorService for CoordinatorRpc {
     ) -> std::result::Result<Response<pb::EnvironmentResult>, Status> {
         let trace =
             adx_observability::trace::Trace::rpc("coordinator.create_environment", &request);
+        if let Some(environment_id) = request.get_ref().spec.as_ref().map(|spec| spec.id.clone()) {
+            trace.attribute("environment.id", environment_id);
+        }
         trace
             .run_result(async {
                 if self.0.peers.authenticate(&request)? != Principal::ApiServer {
                     return Err(Status::permission_denied("Frontend caller required"));
                 }
-                Box::pin(self.create_from_request(request.into_inner())).await
+                let result = Box::pin(self.create_from_request(request.into_inner())).await;
+                match &result {
+                    Ok(_) => adx_observability::trace::attribute("result", "success".into()),
+                    Err(error) => {
+                        adx_observability::trace::attribute("result", "fail".into());
+                        adx_observability::trace::attribute(
+                            "error.code",
+                            i32::from(error.code()).to_string(),
+                        );
+                        adx_observability::trace::attribute(
+                            "error.message",
+                            error.message().to_owned(),
+                        );
+                        adx_observability::trace::error_with(error.message().to_owned());
+                    }
+                }
+                result
             })
             .await
     }
@@ -2548,4 +2794,8 @@ mod cancellation_tests {
 }
 
 #[cfg(test)]
+mod checkpoint_gc_tests;
+#[cfg(test)]
 mod publication_tests;
+#[cfg(test)]
+mod snapshot_publication_tests;

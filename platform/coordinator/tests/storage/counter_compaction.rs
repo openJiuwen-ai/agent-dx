@@ -295,6 +295,11 @@ async fn corrupt_history_does_not_block_startup_or_discard_repairable_facts() {
     let session = store.begin(1).await.unwrap();
     register(&session, "node").await;
     create(&session, "live", 1).await;
+    super::observability::business_header(
+        &rig,
+        Some(|header| header["observability"]["started_at_unix_millis"] = 0.into()),
+    )
+    .await;
     let client = redis::Client::open(rig.url.as_str()).unwrap();
     let mut connection = client.get_multiplexed_async_connection().await.unwrap();
     let historical = BusinessCounters {
@@ -316,6 +321,11 @@ async fn corrupt_history_does_not_block_startup_or_discard_repairable_facts() {
         EnvironmentState::Running
     );
     assert!(recovered.business_counters().await.is_err());
+    assert_eq!(
+        super::observability::business_header(&rig, None).await["observability"]
+            ["started_at_unix_millis"],
+        0
+    );
     let fields = business_fields(&rig).await;
     assert!(fields.iter().any(|field| field == "environment:corrupt"));
     assert!(!fields.iter().any(|field| field == "environment:healthy"));
@@ -347,6 +357,7 @@ async fn corrupt_history_does_not_block_startup_or_discard_repairable_facts() {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     let metrics = refreshed.expect("statistics did not refresh after history repair");
+    assert!(metrics.contains("adx_observability_history_known 1\n"));
     assert!(metrics.contains("adx_environment_owned_creation_results_total{outcome=\"success\"} 6"));
     let repaired = store.begin(1).await.unwrap();
     assert_eq!(
@@ -364,13 +375,19 @@ async fn corrupt_history_does_not_block_startup_or_discard_repairable_facts() {
 async fn configured_operation_budget_outlives_driver_default_and_remains_bounded() {
     let rig = common::Redis::new().await;
     let client = redis::Client::open(rig.url.as_str()).unwrap();
-    let mut control = client.get_multiplexed_async_connection().await.unwrap();
+    let control_config = redis::AsyncConnectionConfig::new()
+        .set_response_timeout(Some(std::time::Duration::from_secs(3)));
+    let mut control = client
+        .get_multiplexed_async_connection_with_config(&control_config)
+        .await
+        .unwrap();
     let long = RedisStore::connect(&rig.url, "test", std::time::Duration::from_secs(3))
         .await
         .unwrap();
     let session = long.begin(1).await.unwrap();
     register(&session, "node").await;
-    let short = RedisStore::connect(&rig.url, "test", std::time::Duration::from_millis(100))
+    // Keep the short budget below the pause while allowing shared CI AOF latency.
+    let short = RedisStore::connect(&rig.url, "test", std::time::Duration::from_millis(500))
         .await
         .unwrap();
     redis::cmd("CLIENT")
@@ -396,9 +413,16 @@ async fn configured_operation_budget_outlives_driver_default_and_remains_bounded
     let started = std::time::Instant::now();
     assert!(matches!(short.begin(1).await, Err(Error::Unavailable(_))));
     assert!(started.elapsed() < std::time::Duration::from_secs(1));
-    // The timed-out connection is replaced; a later operation can recover.
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    assert!(short.begin(1).await.is_ok());
+    // Wait for Redis to resume before testing replacement of the timed-out connection.
+    let pong = redis::cmd("PING")
+        .query_async::<String>(&mut control)
+        .await
+        .expect("Redis did not resume after CLIENT PAUSE");
+    assert_eq!(pong, "PONG");
+    short
+        .begin(1)
+        .await
+        .expect("Redis connection did not recover");
 }
 
 #[tokio::test]

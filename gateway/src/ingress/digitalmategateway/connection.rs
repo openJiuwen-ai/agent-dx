@@ -61,6 +61,7 @@ impl Connection {
             .map_err(|_| super::protocol::ProtocolError::Invalid("invalid backend Origin"))
             .map_err(DriverError::from)?;
         request.headers_mut().insert(http::header::ORIGIN, origin);
+        adx_observability::trace::inject_headers(request.headers_mut());
         let handshake = tokio_tungstenite::client_async_with_config(
             request,
             stream,

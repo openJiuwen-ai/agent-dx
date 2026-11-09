@@ -69,7 +69,7 @@ class Acceptance:
         self.base = f'/api/agent/v2/templates/activator-e2e/versions/{version}/bindings'
         self.binding = self.base + '/shared'
         self.data_path = '/agent/http/echo?' + urllib.parse.urlencode(
-            {'target': f'urn:adx:binding:activator-e2e:{version}:shared'}
+            {'target': f'urn:adx:template:activator-e2e:{version}'}
         )
 
     def save(self):
@@ -90,6 +90,8 @@ class Acceptance:
                 'Content-Type': 'application/json',
             },
         )
+        if path == self.data_path:
+            request.add_header('X-ADX-Binding-Id', 'shared')
         try:
             response = self.opener.open(request, timeout=130)
         except urllib.error.HTTPError as error:
@@ -190,7 +192,7 @@ class Acceptance:
         self.base = f'/api/agent/v2/templates/activator-e2e/versions/{version}/bindings'
         self.binding = self.base + '/shared'
         self.data_path = '/agent/http/echo?' + urllib.parse.urlencode(
-            {'target': f'urn:adx:binding:activator-e2e:{version}:shared'}
+            {'target': f'urn:adx:template:activator-e2e:{version}'}
         )
         observed = self.success(self.endpoints[1], f'/api/agent/v2/templates/activator-e2e/versions/{version}')[1][
             'template'

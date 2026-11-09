@@ -27,27 +27,23 @@ impl ManagedService {
     }
     /// Select an AgentBinding identity without creating product or Environment state.
     /// Returns Invalid for a direct instance target or invalid scope components.
-    pub fn binding_scope(tenant: &str, target: &AccessTarget) -> Result<Scope> {
-        let (name, template_ref, id) = match target {
-            AccessTarget::Template { name, template_ref } => {
-                (name, template_ref.clone(), uuid::Uuid::new_v4().to_string())
-            }
-            AccessTarget::Binding {
-                name,
-                template_ref,
-                id,
-            } => (name, template_ref.clone(), id.clone()),
-            AccessTarget::Instance(_) => {
-                return Err(Error::Invalid(
-                    "managed access requires a template or binding target".into(),
-                ));
-            }
+    pub fn binding_scope(
+        tenant: &str,
+        target: &AccessTarget,
+        binding_id: Option<&str>,
+    ) -> Result<Scope> {
+        let AccessTarget::Template { name, template_ref } = target else {
+            return Err(Error::Invalid(
+                "managed access requires a template target".into(),
+            ));
         };
         let scope = Scope {
             tenant: tenant.into(),
             template: name.clone(),
-            template_ref,
-            binding_id: id,
+            template_ref: template_ref.clone(),
+            binding_id: binding_id
+                .map(str::to_owned)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
         };
         scope.validate().map_err(Error::Invalid)?;
         Ok(scope)

@@ -2,6 +2,7 @@
 use crate::{
     clients::{authorize, Clients},
     contract,
+    metrics::Attempt,
     operations::{Kind, Operations},
     ownership::Cache,
 };
@@ -67,6 +68,8 @@ pub struct EnvironmentService {
     operations: Operations,
     creates: Mutex<CreateReplays>,
     names: Mutex<HashMap<String, CreateKey>>,
+    #[cfg(test)]
+    cleanup_started: [tokio::sync::Notify; 2],
 }
 
 impl EnvironmentService {
@@ -82,6 +85,8 @@ impl EnvironmentService {
             }),
             clients,
             names: Mutex::default(),
+            #[cfg(test)]
+            cleanup_started: Default::default(),
         });
         let weak = Arc::downgrade(&service);
         tokio::spawn(async move {
@@ -228,36 +233,63 @@ impl EnvironmentService {
     ) -> Result<Value, Status> {
         let trace = adx_observability::trace::Trace::child("environment.create");
         trace.attribute("environment.id", spec.id.clone());
-        trace.attribute("environment.create.outcome", "cancelled".into());
-        trace
-            .run_result(async {
-                let environment_id = spec.id.clone();
-                let mut attempt = self.creation_metrics.attempt();
-                let started = Instant::now();
-                let result = self
-                    .create_inner(spec, input, request_id, caller, started)
-                    .await;
-                attempt.finish(&result);
-                adx_observability::trace::attribute(
-                    "environment.create.outcome",
-                    attempt.outcome().into(),
-                );
-                adx_observability::info!(
-                    event = "environment_create_completed",
-                    request_id,
-                    environment_id,
-                    duration_ms = attempt.elapsed().as_secs_f64() * 1_000.0,
-                    outcome = attempt.outcome(),
-                    succeeded = result.is_ok(),
-                    status_code = result
-                        .as_ref()
-                        .err()
-                        .map_or("OK", |error| error.code().description()),
-                    "Environment create completed"
-                );
-                result
-            })
-            .await
+        // Single writer for the terminal outcome: `finish` records the actual
+        // value, while the guard records "cancelled" if this future is dropped
+        // before completion. The OTel SDK appends duplicate keys, so seeding a
+        // fallback attribute and overwriting it later is not an option.
+        let mut outcome_guard = trace.attribute_guard("environment.create.outcome", "cancelled");
+        let tenant_id = caller.tenant_id.clone();
+        let environment_id = spec.id.clone();
+        let mut attempt = self.creation_metrics.attempt();
+        let result = trace
+            .scope_result(self.create_inner(spec, input, request_id, caller, &mut attempt))
+            .await;
+        attempt.finish(&result);
+        outcome_guard.finish(attempt.outcome());
+        trace.attribute("user.id", tenant_id);
+        match &result {
+            Ok(value) => {
+                trace.attribute("result", "success".into());
+                if let Some(id) = value.get("environmentId").and_then(Value::as_str) {
+                    trace.attribute("instance_id", id.to_owned());
+                }
+                if let Some(newly) = value.get("newlyCreated").and_then(Value::as_bool) {
+                    trace.attribute("newly_created", newly.to_string());
+                }
+            }
+            Err(error) => {
+                trace.attribute("result", "fail".into());
+                trace.attribute("error.code", i32::from(error.code()).to_string());
+                trace.attribute("error.message", error.message().to_owned());
+                // Sets Error status and records the bounded `exception` event;
+                // the terminal attributes above stay unchanged.
+                trace.record_error("create", error.message().to_owned());
+                trace.scope(|| write_retry_status_attributes(error));
+            }
+        }
+        // Emit the completion log under the `environment.create` span. This
+        // keeps the terminal log attributed to the create span even when the
+        // caller (e.g. the activator) has no outer request span.
+        let duration_ms = attempt.elapsed().as_secs_f64() * 1_000.0;
+        let outcome = attempt.outcome();
+        let status_code = result
+            .as_ref()
+            .err()
+            .map_or("OK", |error| error.code().description());
+        trace.scope(|| {
+            adx_observability::info!(
+                event = "environment_create_completed",
+                request_id,
+                environment_id = %environment_id,
+                duration_ms,
+                outcome,
+                succeeded = result.is_ok(),
+                status_code,
+                status_message = result.as_ref().err().map_or("", |error| error.message()),
+                "Environment create completed"
+            );
+        });
+        result
     }
 
     async fn create_inner(
@@ -266,7 +298,7 @@ impl EnvironmentService {
         input: Value,
         request_id: &str,
         caller: &pb::CallerContext,
-        started: Instant,
+        attempt: &mut Attempt<'_>,
     ) -> Result<Value, Status> {
         if request_id.is_empty() || request_id.len() > 256 {
             return Err(Status::invalid_argument(
@@ -338,7 +370,7 @@ impl EnvironmentService {
                 request_id,
                 caller,
                 retry_pending,
-                started,
+                attempt,
             )),
         )
         .await
@@ -347,6 +379,8 @@ impl EnvironmentService {
                 "create response deadline exceeded while waiting for scheduling/node initialization result; query the same environment",
             ))
         });
+        #[cfg(test)]
+        self.cleanup_started[0].notify_one();
         self.names.lock().await.remove(&operation.spec.id);
         self.finish_create(&create_key, &mut operation, &result)
             .await;
@@ -366,6 +400,8 @@ impl EnvironmentService {
             return;
         }
         operation.result = Some(result.clone());
+        #[cfg(test)]
+        self.cleanup_started[1].notify_one();
         let mut creates = self.creates.lock().await;
         if let Some(shared) = creates.pending.remove(key) {
             creates
@@ -381,7 +417,7 @@ impl EnvironmentService {
         request_id: &str,
         caller: &pb::CallerContext,
         retry_pending: bool,
-        started: Instant,
+        attempt: &mut Attempt<'_>,
     ) -> Result<Value, Status> {
         let spec = &operation.spec;
         let deadline = operation.deadline;
@@ -401,6 +437,7 @@ impl EnvironmentService {
                             | pb::EnvironmentState::Running)
                     )
                 {
+                    write_create_target(&record, "replay");
                     return existing_running_response(spec, input, request_id, &record);
                 }
                 let assignment = record
@@ -419,7 +456,7 @@ impl EnvironmentService {
         })?;
         // The RPC future is large in debug builds; keep it off the nested
         // embedded HTTP/Activator polling stack while preserving cancellation.
-        let result = Box::pin(self.clients.create_environment(
+        let (result, source) = Box::pin(self.clients.create_environment(
             pb::CreateEnvironmentRequest {
                 request_id: request_id.to_owned(),
                 spec: Some(spec.clone()),
@@ -435,10 +472,14 @@ impl EnvironmentService {
         authorize(caller, result.record.as_ref())?;
         let record = result
             .record
+            .clone()
             .ok_or_else(|| Status::unavailable("create returned no environment record"))?;
         if result.durability != pb::Durability::Published as i32 {
             return Err(Status::unavailable("create is not durably confirmed"));
         }
+        let source = if retry_pending { "replay" } else { source };
+        write_create_target(&record, source);
+        write_retry_result_attributes(&result);
         let mut response = existing_running_response(spec, input, request_id, &record)?;
         // This bit comes from the node's creation result, never requestId echo
         // or a pre-create existence query. Cached retries retain the same bit.
@@ -474,7 +515,7 @@ impl EnvironmentService {
             Err(error) => return Err(error),
         }
         if result.newly_created && !retry_pending {
-            self.creation_metrics.successful_create(started.elapsed());
+            attempt.successful_create(attempt.elapsed());
         }
         Ok(response)
     }
@@ -549,6 +590,55 @@ fn existing_running_response(
         });
     }
     Ok(response)
+}
+
+/// Records which node owns the created environment and how the request was
+/// routed. Each key is written once per create span.
+fn write_create_target(record: &pb::EnvironmentRecord, source: &str) {
+    if let Some(assignment) = &record.assignment {
+        adx_observability::trace::attribute("node", assignment.node_id.clone());
+    }
+    adx_observability::trace::attribute("source", source.to_owned());
+}
+
+fn write_retry_result_attributes(result: &pb::EnvironmentResult) {
+    adx_observability::trace::attribute("schedule.attempts", result.create_attempts.to_string());
+    adx_observability::trace::attribute("retry.count", result.retry_count.to_string());
+    if !result.retry_first_error_code.is_empty() {
+        adx_observability::trace::attribute(
+            "retry.first_error_code",
+            result.retry_first_error_code.clone(),
+        );
+    }
+    if !result.retry_first_error_message.is_empty() {
+        adx_observability::trace::attribute(
+            "retry.first_error_message",
+            result.retry_first_error_message.clone(),
+        );
+    }
+}
+
+fn write_retry_status_attributes(status: &Status) {
+    let value = |key: &str| {
+        status
+            .metadata()
+            .get(key)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    };
+    if let Some(value) = value("adx-create-attempts") {
+        adx_observability::trace::attribute("schedule.attempts", value);
+    }
+    if let Some(value) = value("adx-retry-count") {
+        adx_observability::trace::attribute("retry.count", value);
+    }
+    if let Some(value) = value("adx-retry-first-error-code") {
+        adx_observability::trace::attribute("retry.first_error_code", value);
+    }
+    if let Some(value) = value("adx-retry-first-error-message") {
+        adx_observability::trace::attribute("retry.first_error_message", value);
+    }
 }
 
 fn owner_covers_create(
@@ -626,6 +716,94 @@ impl data_plane_gateway::ingress::environment_files::EnvironmentDirectory for En
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod create_cleanup {
+        use super::*;
+        use crate::{config::Config, http::Api};
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Mutex,
+        };
+        use tokio::sync::Notify;
+        use tonic::{Request, Response};
+
+        include!("../tests/support/create_fixture.rs");
+
+        #[tokio::test]
+        async fn confirmed_create_waits_for_cleanup_before_committing_success_latency() {
+            for (phase, cancel) in [(0, true), (1, true), (0, false), (1, false)] {
+                let fixture = Fixture::new().await;
+                fixture.state.block_response.store(true, Ordering::SeqCst);
+                let service = fixture.api.environment_service.clone();
+                let pending = tokio::spawn(async move {
+                    service
+                        .create(
+                            spec("cleanup"),
+                            json!({"name":"cleanup"}),
+                            "cleanup",
+                            &caller(),
+                        )
+                        .await
+                });
+                fixture.wait_starts(1).await;
+                let names = if phase == 0 {
+                    Some(fixture.service.names.lock().await)
+                } else {
+                    None
+                };
+                let creates = if phase == 1 {
+                    Some(fixture.service.creates.lock().await)
+                } else {
+                    None
+                };
+                fixture.state.block_response.store(false, Ordering::SeqCst);
+                fixture.state.release.notify_one();
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    fixture.service.cleanup_started[phase].notified(),
+                )
+                .await
+                .unwrap();
+                let count = |suffix: &str, n| {
+                    let metrics = fixture.service.metrics();
+                    assert!(
+                        metrics.contains(&format!("adx_environment_create_{suffix} {n}\n")),
+                        "{metrics}"
+                    );
+                };
+                count("success_call_duration_seconds_count", 0);
+                count("responses_total{outcome=\"success\"}", 0);
+                count("in_flight", 1);
+                if cancel {
+                    pending.abort();
+                    assert!(pending.await.unwrap_err().is_cancelled());
+                    drop((names, creates));
+                } else {
+                    drop((names, creates));
+                    pending.await.unwrap().unwrap();
+                }
+                count("responses_total{outcome=\"cancelled\"}", u64::from(cancel));
+                count("responses_total{outcome=\"success\"}", u64::from(!cancel));
+                count("duration_seconds_count", 1);
+                count("in_flight", 0);
+                assert_eq!(
+                    fixture
+                        .clients
+                        .owner("cleanup", &caller(), true)
+                        .await
+                        .unwrap()
+                        .record
+                        .unwrap()
+                        .state,
+                    pb::EnvironmentState::Running as i32
+                );
+                for request in ["cleanup", "other"] {
+                    fixture.create("cleanup", request).await.unwrap();
+                    count("success_call_duration_seconds_count", u64::from(!cancel));
+                }
+            }
+        }
+    }
 
     #[test]
     fn unknown_gc_preserves_waiters_and_collects_abandoned_contexts() {

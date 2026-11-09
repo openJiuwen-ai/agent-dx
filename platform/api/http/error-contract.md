@@ -90,6 +90,15 @@ API Server、Coordinator 和入口节点为创建错误回传预留最多 3 秒�
 `DEADLINE_EXCEEDED` 和原阶段文案，附带发布未确认说明；此时使用
 `outcome=unknown`、`retry=same_operation`，由后续对账补写，不能宣称已确认终态。
 
+### 沙箱后端创建失败
+
+Jiuwenbox 通过创建结果中的 `error_message` 提供可公开的失败原因。ADX 将它写入现有
+HTTP `message`，沿用现有状态码与错误详情。Jiuwenbox 通过内部响应头
+`X-Jiuwenbox-Public-Error: true` 确认该消息可公开。旧版响应仍使用通用文案。
+内部异常和进程输出保留在 Jiuwenbox 日志。
+sandboxd Start 的 gRPC 错误消息同样进入 HTTP `message`。创建完成日志同时记录错误消息
+和请求 ID。
+
 ### 调度队列到期
 
 调度队列继续等待至 `scheduleTimeoutSeconds`。Coordinator 只有在同一状态锁内确认
@@ -173,7 +182,9 @@ OOM 分为命令级与 Environment 级，不由 HTTP 502/503 或 exit_code=137 �
 - **用户进程**：Execd 只保留命令退出结果，不观测或判断 OOM。SDK `CommandResult.exit_signal` / `CommandInfo.exit_signal` 表示命令实际终止信号（如 SIGKILL=9），没有普通退出码时继续保留原来的 `exit_code=-1`。用户进程退出而 Execd/后端仍 Running 时，只是命令失败；普通 SIGKILL 不能证明 OOM。当前 sandboxd 接口没有单独的用户进程 OOM 事件，不提供 `PROCESS_OOM` 之类推断码。
 - **整个运行环境**：Adxlet 观察到后端 Exited 后、删除前调用 sandboxd `Wait`，仅将后端提供的 OOM message 转换为 `failure.reason=OomKilled`，同时保留后端 `exit_code`。原因与同一个 Environment 记录一起持久化、发布到订阅目录。`GET /api/instances?instance_id=...` 和 SDK `get_info().failure` 可读取；成功启动/恢复的新执行清除旧原因。
 - SDK direct invoke 重试耗尽后，在原 deadline 剩余时间内进行一次最长 2 秒的认证目录查询。仅当目录已经提交 `status=failed` 且 `failure.reason=OomKilled` 时返回 `EnvironmentError(code=ENVIRONMENT_OOM, retry=never, outcome=terminal)`，`failure` 属性保留详情。这是 SDK 对已确认 Environment 终态的分类，不是新的管理面 gRPC 状态，也不改变数据网关的通用 502/503 响应。
-- 原因尚未提交、API 暂不可用、普通退出或缺少 OOM 证据时保留 `OUTCOME_UNKNOWN` 等原分类；失败查询不会刷新 deadline。早于状态提交的首个调用仍可能收到 OUTCOME_UNKNOWN，之后用 `get_info()` 确認原因。不会在普通成功调用中增加目录查询。
+- 当目录已提交 `status=failed` 且存在其他结构化 `failure` 时，返回 `ENVIRONMENT_FAILED / never / terminal`，不把普通退出猜测成 OOM。异常保留 `request_id`、`operation_id`、`environment_id`、`failure` 与首次数据路径错误 `first_error`。
+- 网关直接拒绝 `ENV_UNAVAILABLE / never` 时，也会在剩余 deadline 内查询一次目录以补全已提交的后端失败原因，不重试被拒绝的操作。若目录没有确认后端失败，保持网关原错误及其 retry/outcome 语义。
+- 原因尚未提交或目录 API 暂不可用时，不自动重放到不支持 invoke 的控制面接口，也不永久禁用后续 direct 调用。仅有已确认未发送的连接错误、连接池超时或缺失路由时，返回 `ENVIRONMENT_UNAVAILABLE / same_operation / not_started`；存在执行歧义时继续保留 `OUTCOME_UNKNOWN / same_operation / unknown`。失败查询不会刷新 deadline。之后可用 `get_info()` 确认原因，普通成功调用不会增加目录查询。
 - 普通退出记录 `failure.reason=Exited`；后端已消失且没有可读取退出记录时为 `Missing`，不猜测 OOM。SDK 未知结果查询的权限与普通实例查询相同，不能跨租户读取原因。
 
 ### Confirmed creation failures
@@ -188,3 +199,14 @@ export bounded labels rather than raw error messages. See the
 ### Volume 管理错误
 
 Volume 管理沿用上述错误结构。ensure 与删除应答未知时用相同 tenant/Volume ID 或 owner ID 重试；不能从超时推断定义或关联未提交。删除有引用、关联或占用的卷返回 CONFLICT，数据目录始终保留。接口见 [Volume API](volumes.md)。
+
+自动跨节点恢复只在本地容量不足或后端 restore 之前的执行准入阶段对临时 `Unavailable`、`VolumeBusy`、`NoCapacity` 保留重试。相同错误若来自 checkpoint 读取或后端 restore/初始化/readiness/路由阶段，确认清理后进入 Failed。执行准入控制 RPC 的明确 `Unauthenticated`、`PermissionDenied` 保留认证/权限错误码及原因，清理确认后进入 Failed，不自动重试；`Internal` 保留诊断原因并沿用阶段重试策略。准入失败清理确认后保留 Paused、checkpoint 与待恢复计划；清理或结果发布未知时保留实际进度和必要占用。公开恢复请求等待超时仍使用原 `same_operation / unknown` 契约，不能从内部授权暂不可用推断 `never / not_started`，也不能换 Environment ID 重建。
+
+### E2B HTTP admission
+
+The Ingress returns426 for plaintext E2B management/service requests by default.
+The explicit `ADX_DATA_PLANE_INGRESS_E2B_ALLOW_HTTP=true` opt-in admits only E2B
+routes; missing or invalid credentials still produce401, and tenant/service
+policy violations retain403/404. Envd not-ready and unavailable routes retain
+the existing error mapping. Native control and administrator paths continue to
+require TLS. Noncanonical management paths cannot use the plaintext opt-in.

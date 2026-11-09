@@ -21,7 +21,7 @@ services:
 
 ## 清理与隔离契约
 
-- 所属节点健康时，Coordinator 调用 adxlet 删除接口，携带归属 generation、节点会话和期望 Failed revision。adxlet 在该 Environment 的串行控制任务中复核状态；已恢复为 Running、待重启、修订号或会话不匹配时拒绝 GC。
+- 所属节点健康时，Coordinator 调用 adxlet 删除接口，携带归属 generation、节点会话和期望 Failed revision。adxlet 在该 Environment 的串行控制任务中复核状态；已恢复为 Running、待重启、修订号或会话不匹配时拒绝 GC。只有校验通过后才写入 `observation.intent=policy` 并开始清理；被拒绝的回收请求不修改本地记录。否则，普通 DELETE 发布 `intent=user` 后到达的过期 GC 会造成相同 revision 的本地记录与权威记录内容不同，触发对账冲突并阻断后续删除。
 - Coordinator 删除请求必须恰好包含一种 fence：`failed_revision` 进入 Failed 回收，`expected_revision` 约束普通版本删除；运行期限改由 owner 内存 timer 进入既有 Delete，不携带 expiry_revision；API Server 不能携带这些内部 fence。删除回执保存原始 fence 的种类和 revision，不能用迁移后的 Deleted revision 替代；同一归属、会话和原始 fence 的重试返回同一回执，其他 revision 或 fence 种类拒绝。
 - 已受理的 Coordinator 删除由独立任务完成；RPC 调用方取消等待，不取消清理和原始 fence 的记录。任务持有节点生命周期读锁，删除完成前不能穿过重新对账的互斥边界。
 - 节点先清理后端，再发布 Deleted。提交携带待删除的 checkpoint 制品；Coordinator 从上一份权威结果补取当前 checkpoint，在同一次 Redis CAS 中写入本地/未登记制品的最小pending及删除短回执，再移除 Environment；已登记共享制品由原registry继续承接。公开 DELETE 成功表示后端已停止且剩余对象清理责任已保存，对象删除由后台最终完成。后端清理或提交失败仍保留节点串行控制任务；本地降级 journal 同时保存结果和待清理制品，不能只保存去掉 checkpoint 的 Deleted 结果。
@@ -46,9 +46,10 @@ GC 在 mTLS 模式下仅允许 Coordinator 服务身份调用受控删除；普�
 
 ## 验证
 
-组件用例使用真实 Redis 和 mTLS，覆盖在线清理、失败重试、同名重建、离线归属退役、迟到 Running 拒绝、失败年龄跨重试与重启保持。adxlet 生命周期用例覆盖 Running／待重启保护、revision fencing 和后端清理失败后重试。
+组件用例使用真实 Redis 和 mTLS，覆盖在线清理、失败重试、同名重建、离线归属退役、迟到 Running 拒绝、失败年龄跨重试与重启保持。adxlet 生命周期用例覆盖 Running／待重启保护、revision fencing 和后端清理失败后重试。生命周期用例还检查被拒绝的回收请求保持完整记录不变，受理后的回收仍记录 `intent=policy`。`reconciliation` 集成用例通过进程内权威服务和生产 gRPC 客户端，覆盖普通删除清理失败后拒绝旧 revision 的 GC、下一轮对账成功及再次删除成功；该用例使用模拟后端，不代表真实 runtime 或集群验证。
 
 ```sh
+cargo test --locked -p adxlet --test lifecycle --test reconciliation -j 2
 python3 build/ci/run.py storage --jobs 2 --output out/ci/failed-gc-storage
 python3 build/ci/run.py control-rpc --jobs 2 --output out/ci/failed-gc-rpc
 ```

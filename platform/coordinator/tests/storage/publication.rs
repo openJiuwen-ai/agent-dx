@@ -3,6 +3,89 @@ use std::sync::Arc;
 
 #[tokio::test]
 #[ignore = "requires isolated Redis; run storage suite"]
+async fn concurrent_initial_publications_with_artifacts_preserve_every_result() {
+    const COUNT: usize = 512;
+    let rig = common::Redis::new().await;
+    // Keep the fixture's 300ms default from masking CAS contention with Redis
+    // transport timeouts during this debug-build burst. Production is unchanged.
+    let store =
+        adx_coordinator::storage::RedisStore::connect(&rig.url, "test", Duration::from_secs(5))
+            .await
+            .unwrap();
+    let session = store.begin(1).await.unwrap();
+    register(&session, "node").await;
+    let barrier = Arc::new(tokio::sync::Barrier::new(COUNT));
+    let mut tasks = Vec::with_capacity(COUNT);
+    for index in 0..COUNT {
+        let id = format!("artifact-publication-{index}");
+        let request = format!("create-{index}");
+        let specification = spec(&id);
+        let assignment = Assignment {
+            environment_id: id,
+            node_id: "node".into(),
+            shard_id: 0,
+            generation: index as u64 + 1,
+            devices: vec![],
+        };
+        session
+            .reserve_with_request(specification.clone(), assignment.clone(), &request)
+            .await
+            .unwrap();
+        let mut record = running(specification, assignment);
+        record
+            .execution_artifacts
+            .push(adx_core::CheckpointArtifact {
+                storage: "shared".into(),
+                scope: String::new(),
+                location: format!("checkpoint-input-{index}"),
+                size_bytes: 64,
+            });
+        let session = session.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let result = session.publish_initial(record.clone(), &request, "").await;
+            (record, request, result)
+        }));
+    }
+    let mut published = Vec::with_capacity(COUNT);
+    let mut failures = Vec::new();
+    for task in tasks {
+        let (record, request, result) = task.await.unwrap();
+        match result {
+            Ok(result) => {
+                assert_eq!(result, record);
+                published.push((record, request));
+            }
+            Err(error) => failures.push(error.to_string()),
+        }
+    }
+    let mut failure_counts = std::collections::BTreeMap::new();
+    for error in &failures {
+        *failure_counts.entry(error).or_insert(0) += 1;
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {COUNT} initial artifact publications failed: {:?}",
+        failures.len(),
+        failure_counts
+    );
+    assert_eq!(published.len(), COUNT);
+    for (record, request) in published {
+        assert_eq!(
+            session.get(&record.spec.id).await.unwrap().result,
+            Some(record.clone())
+        );
+        assert_eq!(
+            session.published_request("tenant", &request).await.unwrap(),
+            Some(record)
+        );
+    }
+    assert_eq!(session.shared_artifacts().await.unwrap().len(), COUNT);
+}
+
+#[tokio::test]
+#[ignore = "requires isolated Redis; run storage suite"]
 async fn first_publication_preserves_native_labels_and_optional_run_policy() {
     let rig = common::Redis::new().await;
     let session = rig.store().await.begin(1).await.unwrap();

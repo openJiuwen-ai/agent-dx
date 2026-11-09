@@ -34,6 +34,8 @@ pub struct IngressConfig {
     pub default_tunnel_port: u16,
     pub port_host_domain: Option<String>,
     pub e2b_enabled: bool,
+    /// Explicit opt-in to unencrypted E2B routes; native policies are unchanged.
+    pub e2b_allow_http: bool,
     pub node_security_mode: IngressNodeSecurityMode,
     pub node_tls_ca: String,
     pub node_tls_server_name: String,
@@ -255,6 +257,12 @@ impl IngressConfig {
                     .into(),
             ));
         }
+        let e2b_allow_http = parse_bool_env("ADX_DATA_PLANE_INGRESS_E2B_ALLOW_HTTP", false)?;
+        if e2b_allow_http && !e2b_enabled {
+            return Err(ConfigError::Invalid(
+                "ADX_DATA_PLANE_INGRESS_E2B_ALLOW_HTTP requires E2B_ENABLED=true".into(),
+            ));
+        }
         let node_security_mode = parse_env("ADX_DATA_PLANE_INGRESS_NODE_SECURITY_MODE", "network")?;
         let node_tls_ca = env::var("ADX_DATA_PLANE_INGRESS_NODE_TLS_CA").unwrap_or_default();
         let node_tls_server_name =
@@ -401,6 +409,7 @@ impl IngressConfig {
             default_tunnel_port,
             port_host_domain,
             e2b_enabled,
+            e2b_allow_http,
             node_security_mode,
             node_tls_ca,
             node_tls_server_name,

@@ -50,6 +50,25 @@ impl Role {
         }
     }
 }
+
+/// Whether stopping the deployment first deletes its locally owned Environments.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShutdownMode {
+    #[default]
+    Preserve,
+    Drain,
+}
+
+impl std::fmt::Display for ShutdownMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Preserve => "preserve",
+            Self::Drain => "drain",
+        })
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Service {
@@ -60,6 +79,84 @@ pub struct Service {
     #[serde(default)]
     pub env: BTreeMap<String, String>,
 }
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Tracing {
+    /// OTLP/HTTP endpoints. Empty disables tracing. The first entry is used;
+    /// the remaining entries are deployment-level reserves.
+    pub endpoints: Vec<String>,
+}
+
+impl Tracing {
+    fn is_empty(&self) -> bool {
+        self.endpoints.is_empty()
+    }
+
+    fn enabled(&self) -> bool {
+        !self.endpoints.is_empty()
+    }
+
+    fn endpoint_url(&self) -> Option<String> {
+        self.endpoints.first().map(|endpoint| {
+            let endpoint = endpoint.trim();
+            let rest = endpoint.strip_prefix("http://").unwrap_or(endpoint);
+            let authority = rest.split('/').next().unwrap_or(rest);
+            format!("http://{authority}/v1/traces")
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.endpoints.len() > 8 {
+            return Err("tracing.endpoints accepts at most 8 entries".into());
+        }
+        for endpoint in &self.endpoints {
+            validate_trace_endpoint(endpoint)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_trace_endpoint(endpoint: &str) -> Result<()> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty()
+        || endpoint.len() > 512
+        || endpoint
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err("invalid tracing endpoint".into());
+    }
+    if endpoint.starts_with("https://") {
+        return Err(
+            "tracing endpoints use OTLP/HTTP without TLS; https:// is not supported".into(),
+        );
+    }
+    let rest = if let Some(rest) = endpoint.strip_prefix("http://") {
+        rest
+    } else if endpoint.contains("://") {
+        return Err("tracing endpoints must use http:// or host:port".into());
+    } else {
+        endpoint
+    };
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    if !path.is_empty() && path != "v1/traces" {
+        return Err("tracing endpoint path must be empty or /v1/traces".into());
+    }
+    let (host, port) = authority
+        .rsplit_once(':')
+        .ok_or("tracing endpoint must be host:port")?;
+    if host.is_empty() || host.contains(':') {
+        return Err("tracing endpoint host must be a hostname or IPv4 address".into());
+    }
+    let port: u16 = port
+        .parse()
+        .map_err(|_| "tracing endpoint port must be 1..65535")?;
+    if port == 0 {
+        return Err("tracing endpoint port must be 1..65535".into());
+    }
+    Ok(())
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Deployment {
@@ -67,6 +164,8 @@ pub struct Deployment {
     pub runtime_profile: Option<adx_core::runtime_profile::RuntimeProfile>,
     #[serde(default)]
     pub logging: crate::logging::Policy,
+    #[serde(default, skip_serializing_if = "Tracing::is_empty")]
+    pub tracing: Tracing,
     pub schema_version: u32,
     #[serde(default)]
     pub with_afs: bool,
@@ -76,6 +175,8 @@ pub struct Deployment {
     pub namespace: String,
     pub restart_delay_ms: u64,
     pub stop_timeout_seconds: u64,
+    #[serde(default)]
+    pub shutdown_mode: ShutdownMode,
     pub services: Vec<Service>,
 }
 
@@ -166,7 +267,11 @@ struct ProfileDeployment {
     #[serde(default)]
     stop_timeout_seconds: Option<u64>,
     #[serde(default)]
+    shutdown_mode: Option<ShutdownMode>,
+    #[serde(default)]
     logging: Option<Value>,
+    #[serde(default)]
+    tracing: Option<Value>,
     #[serde(default)]
     runtime_profile: Option<Value>,
     #[serde(default)]
@@ -340,6 +445,7 @@ impl Deployment {
     }
     pub fn validate(&self) -> Result<()> {
         self.logging.validate()?;
+        self.tracing.validate()?;
         if let Some(environment) = &self.runtime_profile {
             environment.validate()?;
         }
@@ -518,6 +624,60 @@ impl Deployment {
         std::time::Duration::from_secs(self.stop_timeout_seconds.saturating_mul(operation_count))
     }
 
+    fn apply_tracing(
+        &self,
+        role: Role,
+        environment: &mut BTreeMap<String, String>,
+        config: &mut Value,
+    ) -> Result<()> {
+        if self.tracing.is_empty() || matches!(role, Role::Redis | Role::AfsMeta | Role::AfsNode) {
+            return Ok(());
+        }
+        let enabled = self.tracing.enabled();
+        let endpoint = self.tracing.endpoint_url();
+        environment.insert("ADX_TRACE_ENABLED".into(), enabled.to_string());
+        if let Some(endpoint) = endpoint.as_ref() {
+            environment.insert(
+                "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT".into(),
+                endpoint.clone(),
+            );
+        }
+        if role == Role::Adxlet {
+            let node_id = config
+                .get("node_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let environment_name = environment.get("ADX_ENV").cloned();
+            if let Some(fields) = config.as_object_mut() {
+                let execd = fields
+                    .entry("execd_env".to_owned())
+                    .or_insert_with(|| Value::Object(Map::new()));
+                if execd.is_null() {
+                    *execd = Value::Object(Map::new());
+                }
+                if let Some(execd) = execd.as_object_mut() {
+                    execd.insert(
+                        "ADX_TRACE_ENABLED".into(),
+                        Value::String(enabled.to_string()),
+                    );
+                    if let Some(endpoint) = endpoint {
+                        execd.insert(
+                            "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT".into(),
+                            Value::String(endpoint),
+                        );
+                    }
+                    if let Some(node_id) = node_id {
+                        execd.insert("ADX_NODE_ID".into(), Value::String(node_id));
+                    }
+                    if let Some(environment_name) = environment_name {
+                        execd.insert("ADX_ENV".into(), Value::String(environment_name));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn render(&self, output_directory: &Path) -> Result<Vec<Process>> {
         self.validate()?;
         fs::create_dir(output_directory)?;
@@ -665,6 +825,7 @@ impl Deployment {
                     vec!["--config".into(), config.config_file.display().to_string()]
                 }
             };
+            self.apply_tracing(service.role, &mut environment, &mut config)?;
             if matches!(service.role, Role::AfsMeta | Role::AfsNode) {
                 // AFS owns its TOML schema. Deployment only wires the chosen file into lifecycle.
             } else if let Some(text) = redis_config_text {
@@ -722,11 +883,20 @@ fn resolve_profile(input: ProfileDeployment) -> Result<Deployment> {
     if let Some(value) = input.stop_timeout_seconds {
         deployment.stop_timeout_seconds = value;
     }
+    if let Some(value) = input.shutdown_mode {
+        deployment.shutdown_mode = value;
+    }
     if let Some(patch) = input.logging {
         let mut logging = serde_json::to_value(&deployment.logging)?;
         merge_value(&mut logging, patch);
         deployment.logging = serde_json::from_value(logging)
             .map_err(|error| format!("invalid logging override: {error}"))?;
+    }
+    if let Some(patch) = input.tracing {
+        let mut tracing = serde_json::to_value(&deployment.tracing)?;
+        merge_value(&mut tracing, patch);
+        deployment.tracing = serde_json::from_value(tracing)
+            .map_err(|error| format!("invalid tracing override: {error}"))?;
     }
     if let Some(patch) = input.runtime_profile {
         let mut environment = serde_json::to_value(&deployment.runtime_profile)?;

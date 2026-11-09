@@ -19,6 +19,38 @@ use std::time::UNIX_EPOCH;
 
 pub(super) const MAX_INLINE_LOCAL_READ_SCRATCH: usize = 1024 * 1024;
 
+thread_local! {
+    /// Per-thread scratch buffer for inline local reads.
+    ///
+    /// A single global `Mutex<Vec<u8>>` used to guard this buffer, and because
+    /// `inline_local_read_data` returns `Cow::Borrowed` over it the guard had to
+    /// stay alive until `reply.data()` finished. That serialised handle lookup,
+    /// the backend read and the `/dev/fuse` reply across *all* files on the
+    /// mount. Taking the buffer out of the thread-local and returning it after
+    /// the reply keeps the reuse without holding any lock across I/O.
+    static INLINE_READ_SCRATCH: std::cell::RefCell<Vec<u8>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Take this thread's scratch buffer, leaving an empty one behind.
+pub(super) fn take_inline_read_scratch() -> Vec<u8> {
+    INLINE_READ_SCRATCH.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+}
+
+/// Return the buffer, dropping it when it grew past the inline limit so a single
+/// oversized read cannot pin a big allocation per thread.
+pub(super) fn return_inline_read_scratch(buffer: Vec<u8>) {
+    if buffer.capacity() > MAX_INLINE_LOCAL_READ_SCRATCH {
+        return;
+    }
+    INLINE_READ_SCRATCH.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.capacity() < buffer.capacity() {
+            *slot = buffer;
+        }
+    });
+}
+
 pub(super) fn inline_local_read_data(
     scratch: &mut Vec<u8>,
     size: usize,
