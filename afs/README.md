@@ -47,6 +47,14 @@ Meta 默认使用唯一持久后端 `local-file`。`memory` 仅适合一次性�
 Operator 负责创建 namespace/root grant、配置挂载和回收引用；Environment 创建尚不会
 自动 provision/mount/reclaim AFS。
 
+顺序预读组由根配置 `dfs_read_group_mode` 控制，默认 `"off"`；设为 `"sequential"` 时，
+只读句柄把连续范围合并为一个 DFS 批次，只对 gRPC 或 HIXL
+路径生效，RDMA 数据面
+继续使用原逐批预算。字段与边界见[部署文档](../docs/deployment/afs.md#hixl-dfs-远端读)。
+
+HIXL 读取阶段墙钟由 `afs_dfs_read_phase_seconds{phase}` 按固定相位记录，只用于定位瓶颈，
+不参与成功判定。
+
 ## 构建入口
 
 默认入口保持 Agent DX 原行为：
@@ -71,6 +79,56 @@ python3 build/ci/run.py afs
 
 SHM 的 memfd、sealing 与原子 CLOEXEC FD 传递实现及对应运行测试只在 Linux 编译。macOS 上返回 `ShmError::Unsupported`，仅检查该不支持契约；这不代表 AFS/FUSE 在 macOS 可运行。
 
+HIXL 加速 DFS 已提交不可变 chunk 的远端读，并可选为 OwnerFs 远端只读打开提供预读窗口。默认不编译 native HIXL；
+支持要求为 CANN ≥ 9.1.0、HDK ≥ 25.5.0，CANN、HDK 与设备型号需使用配套组合。
+在已安装匹配 HIXL/ACL 头文件及共享库的 Linux 环境中，可运行
+`make afs-check ADX_WITH_AFS=1 ADX_AFS_WITH_HIXL=1 ADX_CANN_PATH=/opt/ascend/cann`。
+节点再通过 `[hixl].dfs_read_mode = "preferred" | "required"` 显式启用 DFS 远端读，通过
+`[hixl].ownerfs_read_mode = "preferred" | "required"` 启用 OwnerFs 远端只读打开的预读窗口，
+两者默认 `"off"`，共享同一 HIXL runtime、槽池与 quarantine 失败域。`[hixl].transport`
+默认 `"roce"`，可选 `"hccs-buffer-pool"` 接入 A3 同 super-pod 域的同步中转读取，
+`[[hixl.additional_devices]]` 可配置最多 16 个逻辑设备。DFS dirty-owner 读和复制写入仍使用
+原 `data_mode`。
+
+A3 吞吐对照在 212（Meta 与源节点）→ 217（reader）双机 HCCS 上测量：1 GiB BLAKE3 对象，
+单线程读端以 4 MiB 块读取并逐块计算 SHA-256，每轮清理 reader 数据目录，3 轮交替，读回内容全部一致。
+
+| 配置（FUSE 页缓存读取） | 中位 MiB/s [范围] |
+| --- | --- |
+| HIXL，128 MiB 组，`dfs_read_group_max_inflight = 2` | 950.0 [864.4–981.7] |
+| gRPC，组读关闭 | 711.4 [563.4–799.3] |
+| HIXL，128 MiB 组，`dfs_read_group_max_inflight = 1` | 568.0 [549.4–608.7] |
+| gRPC，128 MiB 组，`dfs_read_group_max_inflight = 2` | 519.7 [514.3–526.4] |
+| gRPC，128 MiB 组，`dfs_read_group_max_inflight = 1` | 367.2 [366.8–371.2] |
+| HIXL，组读关闭 | 118.9 [114.9–122.6] |
+
+- HIXL 组读（`max_inflight = 2`）在 3 轮中都高于同轮的 gRPC 最好配置（组读关闭）：
+  981.7 / 799.3、950.0 / 711.4、864.4 / 563.4 MiB/s。
+- HIXL 需要组读：每个 peer 同一时刻只准入一个逻辑读，组读关闭时约 1 MiB 的内核预读请求
+  逐个完成 prepare、传输与 release，吞吐降到约 120 MiB/s。
+- gRPC 宜保持组读关闭：组读路径同步填充窗口，不使用逐请求的异步读管线，内核预读的并发
+  请求被收敛为每句柄一个组批次。
+- 组窗口在页缓存读取下按网格对齐并保留上一窗口后，HIXL 与 gRPC 都恰好传输 1.00 倍文件字节
+  （HIXL 每 GiB 8 个组批次）；此前同一组被重复填充，实际传输 1.4–2.1 倍。
+- 上表二进制在删除 FUSE 读模式开关之前构建，显式设置页缓存读取与表中 `max_inflight`。删除开关
+  后的构建以默认配置（`max_inflight` 不设置，即 2）在同一对主机上复测 5 轮：HIXL 组读中位
+  884.9 [868.6–902.4]，gRPC 组读关闭 809.1 [658.9–873.6] MiB/s；HIXL 5 轮全胜，但配对中位只有
+  +7.8%（+1.3~+36.9），gRPC 轮间波动明显大于 HIXL。测试机为共享环境，只比较同轮结果。
+- 逐块 SHA-256 的读端本身是瓶颈：同一脚本读页缓存中的本地文件约 1230 MiB/s。换成只读取不计算
+  的读端（其余条件相同，5 轮交替）：HIXL 组读中位 1023.0 [992.7–1109.1]，gRPC 组读关闭
+  681.5 [614.1–797.4] MiB/s，HIXL 5 轮全胜、配对中位 +47.4%（+39.1~+66.6）。
+- 组内 wave 流水（下一个 wave 的源端导出与当前 wave 的传输重叠，`afs-node` sha256
+  `a90fc275…`）在同一会话对上一构建交替 6 轮（纯读取读端）：新 1388.9 [1259.5–1461.5]、
+  旧 1291.9 [1198.0–1317.2]（n=5，1 轮 reader 设备初始化失败）MiB/s，配对中位 +11.0%
+  （−4.4~+18.9，4/5 胜）；gRPC 组读关闭 674.5 [642.1–746.5]，HIXL 6 轮全胜、配对中位 +102.7%
+  （+86.6~+117.5）。计算 SHA-256 的读端 4 轮中新旧持平（−2.2%，−13.2~+20.2），HIXL 对 gRPC
+  4 轮全胜、中位 +53.8%。每组 wave 由 2 个加到 4 个（`dfs_read_group_max_descriptors = 8`）
+  无明显差别（−2.6%，1/4）。同一会话中纯读取读端的绝对值比前一批高约 25%，宿主负载不同，只比较同轮结果。
+
+配置、信任边界、指标与验收范围见[部署文档](../docs/deployment/afs.md#hixl-dfs-远端读)，
+协议与失败语义见[架构说明](../docs/architecture/afs.md)。A2 RoCE、多设备吞吐、并发 reader
+与故障恢复尚未验收。
+
 ## 当前能力边界
 
 - OwnerFs workspace bind mount 默认 OFF；当前实际试用场景需要显式配置 ON。
@@ -80,16 +138,6 @@ SHM 的 memfd、sealing 与原子 CLOEXEC FD 传递实现及对应运行测试�
 - 跨节点 `fcntl/flock`、阻塞锁取消、bind/native 与远端 FUSE 锁域协同后置，不能把本机 ext4 锁或单挂载内核回退宣传为分布式锁。
 
 必要正确性边界仍需保留：读写新鲜度、close-to-open、权限和 suid/sgid 清除、错误传播、持久化屏障、direct-I/O mmap 能力协商、正常卸载和受管引用排空。
-
-OwnerFs 的关闭语义与上一条边界的关系需要单独说明，因为默认行为已改变：
-
-- 独占本地 root（本节点持有 local grant 且没有任何 peer 校验过该 root）上的普通 `close`/`flush`
-  不再对文件执行 `fdatasync`。`close` 成功只表示数据已交给本机内核页缓存，掉电或内核崩溃可能丢失
-  最近写入；这不是"已落盘"的保证。
-- 需要"close 即持久"时设置 `AFS_OWNERFS_CLOSE_SYNC=1`，逐 handle 恢复同步；peer 共享的 root
-  始终保留 close 同步，不受该开关影响。
-- 显式 `fsync`/`fdatasync` 与 `O_SYNC`/`O_DSYNC` 句柄的持久保证不因该开关改变。
-- 跨节点可见性仍由 Meta 提交序列与 `validate_peer` 决定，不依赖 close 同步。
 
 原生DFS新open取得fresh状态，已打开读视图最多复用5秒、命中不续期；Node/session
 授权与版本视图分别检查，已知失效停止交付。A当前已验证对象单槽最多4MiB，与在途
@@ -266,9 +314,7 @@ cryptographic confidentiality or integrity. See
 有额度时接住正文后直接写reply；没有额度时保留正文并暂不回复，接收回调先返回，
 待额度恢复后回复。不额外经过独立回复队列或线程。队列满时背压，后台保留原 CRC、副本和 Meta 业务。
 写成功只代表内存接纳；`fsync`、`flush` 和关闭仍等待原同步语义，失败必须检查返回值。
-本节范围是 DFS 与远端 owner：OwnerFS 独占本地 root 的关闭语义不同，默认不再 `fdatasync`，
-见上文「OwnerFs 关闭语义」，需要旧保证时设 `AFS_OWNERFS_CLOSE_SYNC=1`。
-同步写、追加、远端 owner、内核 writeback 保留原返回点。
+同步写、追加、远端 owner、内核 writeback 和 OwnerFS 保留原返回点。
 按文件收窄等待；正文保留共享FIFO和单消费者。fsync/flush/release登记恢复任务，不占正文额度。
 后台失败按文件保留并报告，不关闭整个挂载；USRBIO交接前等待此前正文处理。
 完整内存、顺序、错误及历史性能口径见[写入接纳合同](../docs/performance/afs-write-owned-admission.md)。

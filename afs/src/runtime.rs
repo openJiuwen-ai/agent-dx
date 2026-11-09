@@ -61,7 +61,15 @@ impl ShutdownDeadline {
                             // No logging/disk flush on this thread: either could
                             // block at the boundary this guard must enforce.
                             // Exit 124 is deliberately not a clean-stop status.
+                            #[cfg(not(feature = "hixl"))]
                             std::process::exit(124);
+                            // SAFETY: `_exit` takes only an integer status and
+                            // accesses no borrowed memory. CANN exit handlers
+                            // can block on the teardown that just timed out.
+                            #[cfg(feature = "hixl")]
+                            unsafe {
+                                libc::_exit(124)
+                            };
                         }
                     }
                 }
@@ -293,6 +301,16 @@ impl Services {
 mod shutdown_deadline_tests {
     use super::*;
 
+    #[cfg(feature = "hixl")]
+    extern "C" fn blocking_c_atexit_handler() {
+        if let Ok(marker) = std::env::var("AFS_TEST_SHUTDOWN_ATEXIT_MARKER") {
+            let _ = std::fs::write(marker, b"handler-called");
+        }
+        loop {
+            std::thread::park();
+        }
+    }
+
     #[test]
     fn shutdown_deadline_child() {
         let Ok(mode) = std::env::var("AFS_TEST_SHUTDOWN_CHILD") else {
@@ -372,6 +390,12 @@ mod shutdown_deadline_tests {
             deadline.complete();
             return;
         }
+        #[cfg(feature = "hixl")]
+        if mode == "atexit-blocked" {
+            // SAFETY: this is a no-capture `extern "C"` callback with the
+            // signature required by `atexit`; the child process is isolated.
+            assert_eq!(unsafe { libc::atexit(blocking_c_atexit_handler) }, 0);
+        }
         let deadline = ShutdownDeadline::new(Duration::from_millis(150)).unwrap();
         let trigger = deadline.trigger();
         if mode == "complete" {
@@ -424,9 +448,50 @@ mod shutdown_deadline_tests {
         }
     }
 
+    #[cfg(feature = "hixl")]
+    fn child_with_atexit_marker(mode: &str) -> (std::process::ExitStatus, Duration, bool) {
+        let marker_dir = tempfile::tempdir().unwrap();
+        let marker = marker_dir.path().join("atexit-called");
+        let start = std::time::Instant::now();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::shutdown_deadline_tests::shutdown_deadline_child",
+                "--nocapture",
+            ])
+            .env("AFS_TEST_SHUTDOWN_CHILD", mode)
+            .env("AFS_TEST_SHUTDOWN_ATEXIT_MARKER", &marker)
+            .spawn()
+            .unwrap();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if start.elapsed() > Duration::from_secs(3) {
+                // This only kills the test's isolated local subprocess.
+                child.kill().unwrap();
+                break child.wait().unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        (status, start.elapsed(), marker.exists())
+    }
+
     #[test]
     fn shutdown_deadline_forces_failure_even_during_runtime_drop() {
         let (status, elapsed) = child("blocked");
+        assert_eq!(status.code(), Some(124));
+        assert!(elapsed < Duration::from_secs(2));
+    }
+
+    #[cfg(feature = "hixl")]
+    #[test]
+    fn shutdown_deadline_exit_skips_blocking_c_atexit_handlers() {
+        let (status, elapsed, handler_ran) = child_with_atexit_marker("atexit-blocked");
+        assert!(
+            !handler_ran,
+            "deadline exit invoked a blocking C atexit handler; child status {status} after {elapsed:?}"
+        );
         assert_eq!(status.code(), Some(124));
         assert!(elapsed < Duration::from_secs(2));
     }

@@ -50,6 +50,20 @@ const MAX_SOURCE_CACHE_BYTES: usize = 4 * 1024 * 1024;
 const SOURCE_GRANT_SAFETY_MS: u64 = 1_000;
 pub(super) const MAX_SOURCE_LOOKAHEAD_ID_BYTES: usize = 512;
 
+/// A ReadGroup may aggregate several small batches into one native submission.
+pub const MAX_DFS_GROUP_OPS: usize = 512;
+pub const MAX_DFS_GROUP_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Sequential read-ahead policy. `bytes` bounds one group; the legacy
+/// per-batch limit is unchanged for callers that keep group mode off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReadGroupPolicy {
+    pub bytes: usize,
+    pub max_inflight: usize,
+    pub max_descriptors: usize,
+    pub host_budget_bytes: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct DfsReadConfig {
     pub max_ops_per_batch: usize,
@@ -115,11 +129,32 @@ pub struct ReadBatch {
 impl ReadBatch {
     pub fn validate_for_output(&self, output_len: usize, config: &DfsReadConfig) -> Result<()> {
         config.validate()?;
+        self.validate_with_limits(
+            output_len,
+            config.max_ops_per_batch,
+            config.max_inflight_bytes,
+        )
+    }
+
+    /// Group batches keep their own budget so the small-batch limit stays intact.
+    pub fn validate_group_for_output(&self, output_len: usize, group_bytes: u64) -> Result<()> {
+        if group_bytes == 0 || group_bytes > MAX_DFS_GROUP_BYTES {
+            return Err(invalid("DFS read group byte budget is invalid"));
+        }
+        self.validate_with_limits(output_len, MAX_DFS_GROUP_OPS, group_bytes)
+    }
+
+    fn validate_with_limits(
+        &self,
+        output_len: usize,
+        max_ops: usize,
+        max_bytes: u64,
+    ) -> Result<()> {
         self.validate_lookahead()?;
         if self.layout_root_id.0.is_empty() {
             return Err(invalid("DFS read batch has no LayoutRoot"));
         }
-        if self.ops.len() > config.max_ops_per_batch {
+        if self.ops.len() > max_ops {
             return Err(invalid("DFS read batch contains too many ranges"));
         }
         let mut total = 0_u64;
@@ -140,7 +175,7 @@ impl ReadBatch {
                 return Err(invalid("DFS read output range exceeds buffer"));
             }
         }
-        if total > config.max_inflight_bytes {
+        if total > max_bytes {
             return Err(invalid("DFS read batch exceeds inflight byte budget"));
         }
         Ok(())
@@ -449,6 +484,10 @@ struct ExternalReadBackend {
 pub struct ResolvedReadOp {
     pub op: ChunkReadOp,
     pub source: SourceCandidate,
+    /// Meta-bound object descriptor for transports that must verify a range
+    /// against the object identity (CRC32C windows). None keeps BLAKE3-only
+    /// batches unchanged.
+    pub chunk: Option<ChunkObject>,
 }
 
 #[derive(Clone, Debug)]
@@ -460,17 +499,29 @@ pub struct PeerReadBatch {
 
 impl PeerReadBatch {
     pub fn validate(&self, output_len: usize) -> Result<()> {
+        self.validate_with(output_len, None)
+    }
+
+    /// Group transfers keep the same identity checks with the group budget.
+    pub fn validate_group(&self, output_len: usize, group_bytes: u64) -> Result<()> {
+        self.validate_with(output_len, Some(group_bytes))
+    }
+
+    fn validate_with(&self, output_len: usize, group_bytes: Option<u64>) -> Result<()> {
         let first = self
             .operations
             .first()
             .ok_or_else(|| invalid("empty peer read batch"))?;
-        ReadBatch {
+        let batch = ReadBatch {
             lookahead: Vec::new(),
             file_version_id: Some(self.file_version_id.clone()),
             layout_root_id: self.layout_root_id.clone(),
             ops: self.operations.iter().map(|item| item.op.clone()).collect(),
+        };
+        match group_bytes {
+            Some(group_bytes) => batch.validate_group_for_output(output_len, group_bytes)?,
+            None => batch.validate_for_output(output_len, &DfsReadConfig::default())?,
         }
-        .validate_for_output(output_len, &DfsReadConfig::default())?;
         for item in &self.operations {
             let grant = &item.source.read_grant;
             if item.op.length == 0
@@ -549,6 +600,13 @@ pub trait ChunkTransfer: Send + Sync {
     }
 
     fn supports_async_native_read(&self) -> bool {
+        false
+    }
+
+    /// Whether several CRC32C ranges may share one transport batch, each with
+    /// its own Meta-bound descriptor. The gRPC streaming decoder keeps one
+    /// range per request and stays `false`.
+    fn supports_batched_crc(&self) -> bool {
         false
     }
 
@@ -731,6 +789,45 @@ pub(super) fn validate_verified_peer_object_request(
         ));
     }
     Ok(())
+}
+
+/// Observation-only HIXL read stage timings. Labels are fixed phases, never
+/// node, chunk or address identities.
+#[derive(Clone)]
+pub struct DfsReadPhaseMetrics {
+    phase: afs_metrics::HistogramVec,
+}
+
+/// Fixed read stages; never node, chunk or address labels.
+pub(crate) const READ_PHASES: [&str; 6] = [
+    "prepare", "transfer", "scatter", "validate", "release", "buffers",
+];
+
+impl DfsReadPhaseMetrics {
+    pub fn register(
+        registry: &afs_metrics::Registry,
+    ) -> std::result::Result<Self, afs_metrics::MetricsError> {
+        registry.get_or_register(|registry| {
+            let phase = afs_metrics::HistogramVec::new(
+                afs_metrics::HistogramOpts::new(
+                    "afs_dfs_read_phase_seconds",
+                    "HIXL read stage wall time, by fixed phase.",
+                ),
+                &["phase"],
+            )?;
+            afs_metrics::register_collector(registry, &phase)?;
+            for phase_name in READ_PHASES {
+                phase.with_label_values(&[phase_name]);
+            }
+            Ok(Self { phase })
+        })
+    }
+
+    pub(crate) fn observe_phase(&self, phase: &'static str, elapsed: Duration) {
+        self.phase
+            .with_label_values(&[phase])
+            .observe(elapsed.as_secs_f64());
+    }
 }
 
 fn same_peer_context(left: &SourceCandidate, right: &SourceCandidate) -> bool {
@@ -1826,8 +1923,13 @@ impl DfsReadEngine {
                 "private native read cannot use an external backend",
             ));
         }
-        // Native layout operations are disjoint. Reject overlaps explicitly:
-        // direct local grouping must not change the old scatter precedence.
+        Self::validate_private_output_ranges(batch)?;
+        self.read_private_batch_checked(batch, out, deadline)
+    }
+
+    /// Native layout operations are disjoint. Reject overlaps explicitly:
+    /// direct local grouping must not change the old scatter precedence.
+    fn validate_private_output_ranges(batch: &ReadBatch) -> Result<()> {
         for (index, left) in batch.ops.iter().enumerate() {
             if left.length == 0 {
                 continue;
@@ -1841,6 +1943,37 @@ impl DfsReadEngine {
                 return Err(invalid("private native read output ranges overlap"));
             }
         }
+        Ok(())
+    }
+
+    /// Aggregated sequential read-ahead into a caller-owned, unpublished group
+    /// window. The group limit is separate from the legacy per-batch budget.
+    /// On error this private buffer may change and must be discarded. Range
+    /// offsets must already be packed from zero and must not overlap.
+    pub fn read_group_batch_native_into_private(
+        &self,
+        batch: &ReadBatch,
+        out: &mut [u8],
+        group_bytes: u64,
+    ) -> Result<()> {
+        batch.validate_group_for_output(out.len(), group_bytes)?;
+        if self.external_backend.is_some() {
+            return Err(invalid(
+                "private native read cannot use an external backend",
+            ));
+        }
+        Self::validate_private_output_ranges(batch)?;
+        self.read_private_batch_checked(batch, out, None)
+    }
+
+    /// Runs the native transfer into an unpublished private buffer and checks
+    /// that the read authority did not change while it was in flight.
+    fn read_private_batch_checked(
+        &self,
+        batch: &ReadBatch,
+        out: &mut [u8],
+        deadline: Option<Instant>,
+    ) -> Result<()> {
         let authority = self.capture_native_read_authority()?;
         self.read_batch_into_private(batch, out, true, deadline, None)
             .inspect_err(|error| {
@@ -4055,6 +4188,7 @@ impl DfsReadEngine {
                             output_offset: 0,
                         },
                         source: source.clone(),
+                        chunk: None,
                     }],
                 };
                 if use_stream {
@@ -4552,6 +4686,7 @@ impl DfsReadEngine {
                     output_offset: 0,
                 },
                 source: source.clone(),
+                chunk: None,
             }],
         };
         let mut empty = [];
@@ -4868,16 +5003,19 @@ impl DfsReadEngine {
                     return Err(last_error
                         .unwrap_or_else(|| corrupt("committed Chunk has no readable copy")));
                 };
+                let batched_crc = self.transfer.supports_batched_crc();
                 if let Some(group) = groups.iter_mut().find(|group| {
                     let first = group[0];
-                    !sources.iter().any(|set| {
-                        (set.chunk_id == batch.ops[index].chunk_id
-                            || set.chunk_id == batch.ops[first].chunk_id)
-                            && set
-                                .chunk
-                                .as_ref()
-                                .is_some_and(ChunkObject::is_segment_crc32c)
-                    }) && same_peer_context(&candidates[first][next[first]], source)
+                    (batched_crc
+                        || !sources.iter().any(|set| {
+                            (set.chunk_id == batch.ops[index].chunk_id
+                                || set.chunk_id == batch.ops[first].chunk_id)
+                                && set
+                                    .chunk
+                                    .as_ref()
+                                    .is_some_and(ChunkObject::is_segment_crc32c)
+                        }))
+                        && same_peer_context(&candidates[first][next[first]], source)
                 }) {
                     group.push(index);
                 } else {
@@ -4896,6 +5034,10 @@ impl DfsReadEngine {
                         ResolvedReadOp {
                             op,
                             source: candidates[index][next[index]].clone(),
+                            chunk: sources
+                                .iter()
+                                .find(|set| set.chunk_id == batch.ops[index].chunk_id)
+                                .and_then(|set| set.chunk.clone()),
                         }
                     })
                     .collect();
@@ -4913,11 +5055,18 @@ impl DfsReadEngine {
                     && batch.ops[0].output_offset == 0
                     && length == out.len();
                 let mut scratch = if direct { Vec::new() } else { vec![0; length] };
-                let integrity = sources
-                    .iter()
-                    .find(|set| set.chunk_id == batch.ops[group[0]].chunk_id)
-                    .and_then(|set| set.chunk.as_ref())
-                    .filter(|chunk| chunk.is_segment_crc32c());
+                // A single-range lane verifies CRC32C against the Meta-bound
+                // descriptor in the adapter; a batched-CRC transport carries
+                // each range's descriptor in the batch instead.
+                let integrity = if self.transfer.supports_batched_crc() {
+                    None
+                } else {
+                    sources
+                        .iter()
+                        .find(|set| set.chunk_id == batch.ops[group[0]].chunk_id)
+                        .and_then(|set| set.chunk.as_ref())
+                        .filter(|chunk| chunk.is_segment_crc32c())
+                };
                 let target = if direct { &mut *out } else { &mut scratch };
                 let result = if let Some(chunk) = integrity {
                     self.transfer
@@ -9672,6 +9821,7 @@ mod tests {
                     output_offset: 0,
                 },
                 source: candidate,
+                chunk: None,
             }],
         };
         let mut body = vec![0; fixture.chunk.length as usize];
@@ -9843,6 +9993,7 @@ mod tests {
                         output_offset: 0,
                     },
                     source: fixture.sources.reply.lock().unwrap().chunks[0].sources[0].clone(),
+                    chunk: None,
                 }],
             };
             let mut body = vec![0; fixture.chunk.length as usize];
@@ -10134,6 +10285,22 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn hixl_phase_metrics_use_bounded_phase_labels() {
+        let registry = afs_metrics::Registry::new();
+        let metrics = DfsReadPhaseMetrics::register(&registry).unwrap();
+        metrics.observe_phase("scatter", Duration::from_millis(3));
+        let text = afs_metrics::encode_text(&registry).unwrap();
+        assert!(
+            text.contains("afs_dfs_read_phase_seconds_count{phase=\"scatter\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("afs_dfs_read_phase_seconds_count{phase=\"buffers\"} 0"),
+            "{text}"
+        );
     }
 
     #[test]

@@ -52,6 +52,9 @@ dfs_catalog_commit_queue = 256
 # S3 and OwnerFs-only do not enable these native defaults.
 # dfs_crc32c_writes = true
 # dfs_optimistic_gc_commit = true
+# Sequential read aggregation: off (default) or sequential. See the AFS
+# deployment guide for dfs_read_group_bytes and the other group limits.
+dfs_read_group_mode = "off"
 timeout_ms = 5000
 log_level = "info"
 trace_enabled = false
@@ -121,3 +124,13 @@ node-a = "/opt/adx/config/afs/tls/node-a.pem"
 # Distinct from kernel/B look-ahead windows; B look-ahead remains opt-in.
 # [dfs_read_pipeline]
 # max_reply_bytes = 268435456
+
+[hixl]
+# Optional read transport for committed DFS chunks and read-only OwnerFs opens:
+# "off" (default), "preferred" or "required". "required" needs the hixl build;
+# active modes need a trusted network. The deployment guide lists every key.
+dfs_read_mode = "off"
+ownerfs_read_mode = "off"
+# transport = "hccs-buffer-pool" # default "roce"; peers must match
+# device_id = 0
+# engine_id = "192.0.2.10:7920" # replace with this node's reachable IP:port

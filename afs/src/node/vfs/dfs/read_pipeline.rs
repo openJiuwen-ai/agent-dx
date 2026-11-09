@@ -3,6 +3,7 @@
 use super::*;
 
 /// Stack-only read context shared by committed and refreshed views.
+#[derive(Clone)]
 struct NativeReadRequest<'a> {
     handle: FileHandle,
     snapshot: &'a DfsFileHandleSnapshot,
@@ -252,7 +253,7 @@ impl DistributedFs {
                     return Ok(prost::bytes::Bytes::new());
                 }
                 let count = (view.length - offset).min(size as u64) as usize;
-                let ops = self.layout_read_ops(&view.layout, offset, count)?;
+                let ops = Self::layout_read_ops(&view.layout, offset, count)?;
                 let batch = ReadBatch {
                     file_version_id: view.committed.clone(),
                     layout_root_id: view.layout.id.clone(),
@@ -274,19 +275,60 @@ impl DistributedFs {
             }
         }
         let (inode, view) = self.native_inode_for_read_async(handle, snapshot).await?;
+        match self
+            .read_committed_in_view(&inode, &view, request.clone())
+            .await
+        {
+            Err(error) if self.native_view_lapsed(&view, deadline, &error) => {}
+            result => return result,
+        }
+        // A handle view is reused until its deadline, so a read admitted near
+        // its end can outlive it. That is a normal lapse, not a revocation:
+        // read once more under a fresh Meta authorization. The lapsed view
+        // never delivers, and a denied or failed refresh still fails the read.
+        let (inode, view) = self.native_inode_for_read_async(handle, snapshot).await?;
+        self.read_committed_in_view(&inode, &view, request).await
+    }
+
+    async fn read_committed_in_view(
+        &self,
+        inode: &InodeRecord,
+        view: &NativeReadView,
+        request: NativeReadRequest<'_>,
+    ) -> Result<prost::bytes::Bytes> {
+        let deadline = request.deadline.min(view.deadline);
         let result = self
             .read_committed_async(
-                &inode,
+                inode,
                 NativeReadRequest {
-                    deadline: deadline.min(view.deadline),
+                    deadline,
                     ..request
                 },
                 None,
                 true,
             )
             .await?;
-        self.check_native_read_view(&view)?;
+        self.check_native_read_view(view)?;
         Ok(result)
+    }
+
+    /// Only a timeout caused by the view's own deadline, before the read's
+    /// deadline and under a live Node authority epoch, may be reauthorized.
+    pub(super) fn native_view_lapsed(
+        &self,
+        view: &NativeReadView,
+        deadline: Instant,
+        error: &Error,
+    ) -> bool {
+        matches!(
+            error.kind(),
+            afs_error::ErrorKind::Unavailable | afs_error::ErrorKind::DeadlineExceeded
+        ) && view.deadline < deadline
+            && Instant::now() >= view.deadline
+            && self
+                .read_engine
+                .check_open_read_epoch(&view.authority)
+                .is_ok()
     }
 
     async fn read_committed_async(

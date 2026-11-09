@@ -29,6 +29,8 @@ Environment 自动暂停复用 idle timeout，策略为 delete/pause；匿名恢
 
 AFS（Agent FS）是可选文件系统组件，源码、整体文档、构建、CI 和发布入口统一使用 `afs`。OwnerFs 与 DFS 是其内部平级模式；模式模块及 `ownerfs_*`／`dfs_*` 配置沿用各自名称。参见 [AFS 架构与关键时序图](afs.md)，其中包含 OwnerFs／DFS 总览、workspace bind 与远端路径、DFS 外部 S3 发布和读取流程。
 
+DFS 已提交不可变 chunk 的首版 HIXL rH2H 读由 `afs/common/transport` 的可选 native bridge 与 Node 的认证窗口协议组成。`ADX_AFS_WITH_HIXL=1` 和 `[hixl].dfs_read_mode` 分别控制构建与运行，默认关闭；A2 RoCE 与故障恢复尚待验收。详见 [AFS 部署](../deployment/afs.md) 与 [测试门禁](../testing/afs.md)。
+
 ## 可选 E2B 兼容链路
 
 E2B 管理协议适配属于 `gateway/apiserver/src/e2b`，直接调用平台镜像准备和快照能力，不经过 Agent Template/Activator。首版支持公开 OCI 镜像的 `fromImage` 构建：平台创建 seed、生成 Golden Snapshot 并清理 seed；适配层将 E2B templateID/标签解析为 snapshotID，创建复用 EnvironmentService 的快照创建路径。准备状态与恢复归 Coordinator，Golden 通过原生 Snapshot 查询和创建入口复用；部署 RuntimeProfile 提供受信任的 bootstrap/envd 配置，Pause/Snapshot 不回查当前模板别名；可选运行期限由平台 `EnvironmentSpec.run_policy` 配置默认时长和到期动作，当前 owner adxlet 使用单调内存 timer，仅在 crash 后满足原生同节点未过期会话接管条件时按默认时长重建，不持久化动态 deadline；内部不依赖 E2B 身份，复用原生 Pause/Delete 和操作重放，当前仅 E2B 公共入口启用；E2B metadata 直接映射到 `EnvironmentSpec.scheduling.labels`，复用原生校验、调度选择、快照继承和 LabelSelector 查询；创建时覆盖同名标签，不保留独立 metadata 存储。Ingress 读取平台发布的凭据摘要、envd Ready 与当前执行身份，经 Relay 将 commands/files/PTY 请求发往 guest envd 49983。Execd 管理固定 envd 的初始化和健康，adxlet 的 Ready 同时要求 Execd 与 envd 成功；原生 ADX 沙箱不启动 envd。E2B 入口由 Ingress 校验 SDK token 和文件签名，guest envd 不配置 token，跨沙箱隔离依赖后端入站 ACL；克隆时换发独立的网关凭据。profile 只配置受信任 rootfs/bootstrap，不成为第二个生命周期状态机。接口、配置、请求图与验证入口见 [E2B 能力文档](../deployment/e2b-compatibility.md)。

@@ -558,6 +558,7 @@ dependencies = [
  "blake3",
  "cc",
  "futures-util",
+ "getrandom 0.3.4",
  "hyper-util",
  "libc",
  "nix 0.29.0",
