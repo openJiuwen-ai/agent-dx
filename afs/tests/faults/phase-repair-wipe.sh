@@ -13,5 +13,5 @@ rm -rf "$ROOT/node-b/state"/*; echo "[node-b data wiped: its copies are gone]"; 
 RC=1
 for t in $(seq 1 150); do sleep 2; H=$(health); echo "[up t=$(( $(date +%s)-t1 ))s] $H"; case "$H" in *Under*|*Blocked*) ;; *) RC=0; echo "[all Satisfied at t=$(( $(date +%s)-t1 ))s after restart]"; break;; esac; done
 echo dump-state; for id in $IDS; do curl -fsS "http://127.0.0.1:7401/v1/dfs/chunks/$id/replication" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("chunk_id")[-8:], d.get("health"), [(c["record"]["state"],c["available"],c["record"]["location"].get("Node",{}).get("node_id")) for c in d.get("copies",[])], [(t["state"],t["attempt"],(t.get("claim") or {}).get("worker_node_id"),t.get("last_error")) for t in d.get("tasks",[])])' ; done
-curl -fsS http://127.0.0.1:7401/metrics | grep -E 'ClaimReplication|repair_placements' 
+curl -fsS http://127.0.0.1:7401/metrics | grep -E 'ClaimReplication|repair_placements'
 exit $RC
