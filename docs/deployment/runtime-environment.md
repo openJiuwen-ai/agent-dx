@@ -91,3 +91,8 @@ Jiuwenbox 的 Supervisor／Conch 节点盘点只读取后端清单和 cgroup 状
 启动恢复先排空未完成执行；无法关联 Environment 的原生资源通过独立的权威恢复步骤清理。
 未知归属、后端清单不可读或不完整时仍关闭节点准入，不能以空清单代替。后端部署约束见
 [Jiuwenbox 配置](../testing/jiuwenbox-runtime.md#启动和配置)。
+
+
+部署可在 API Server 和 adxlet 中配置同名 `local_rootfs_templates`，按名称选择已经准备的
+本地 rootfs；该配置独立于默认 RuntimeProfile。制品转换和分发由部署系统负责。
+创建参数及元数据语义见 [Environment create](../../platform/api/http/environment-create.md#deployment-registered-local-rootfs-templates)。

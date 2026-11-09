@@ -23,6 +23,7 @@ use proto::sandbox_service_client::SandboxServiceClient;
 #[derive(Clone)]
 pub struct Config {
     pub runtime_profile: Option<adx_core::runtime_profile::RuntimeProfile>,
+    pub local_rootfs_templates: BTreeMap<String, adx_core::local_rootfs::LocalRootfsTemplate>,
     pub command: Vec<String>,
     pub env: HashMap<String, String>,
     pub cwd: String,
@@ -39,6 +40,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             runtime_profile: None,
+            local_rootfs_templates: BTreeMap::new(),
             command: vec!["/usr/local/bin/adx-execd".into()],
             env: HashMap::from([("EXECD_HTTP_PORT".into(), "50090".into())]),
             cwd: "/".into(),
@@ -133,6 +135,13 @@ impl Sandboxd {
             return Err(Error::Invalid(
                 "sandboxd command and positive RPC timeout are required".into(),
             ));
+        }
+        for (name, template) in &config.local_rootfs_templates {
+            adx_core::local_rootfs::capability_label(name)?;
+            template.validate()?;
+            std::fs::metadata(&template.path).map_err(|error| {
+                Error::Invalid(format!("local rootfs template {name}: {error}"))
+            })?;
         }
         if let Some(e) = &config.runtime_profile {
             e.validate()?;
@@ -618,6 +627,22 @@ pub fn start_request(
     let mut envs: HashMap<String, String> = spec.env.clone().into_iter().collect();
     if let Some(e) = environment {
         envs.extend(e.env.clone());
+    }
+    if let Some(adx_core::execution::Rootfs {
+        source: adx_core::execution::StorageSource::Local(path),
+        ..
+    }) = &spec.execution.rootfs
+    {
+        let template = config
+            .local_rootfs_templates
+            .values()
+            .find(|value| &value.path == path);
+        if let Some(template) = template {
+            template.validate()?;
+            for (key, value) in &template.env {
+                envs.insert(key.clone(), spec.env.get(key).unwrap_or(value).clone());
+            }
+        }
     }
     // Deployment configuration owns control ports, tokens, and execution identity.
     envs.extend(config.env.clone());

@@ -860,3 +860,14 @@ retry and outcome fields, and expose the initial failed attempt as `first_error`
 An unsuccessful capability query preserves its transport/domain exception; only
 a confirmed response missing the required capabilities is `UnsupportedFeature`.
 These diagnostics do not change operation replay or source ownership rules.
+
+
+### Registered Local rootfs
+
+SDK 0.1.0rc5 adds `Environment(rootfs_template="local-tools-v1", ...)` for a
+Local artifact registered by the deployment. It is mutually exclusive with
+`image`, `rootfs` and `snapshot_id`; arbitrary host paths are not accepted.
+`inherit_entrypoint=True` may start the registered process metadata. Missing
+names fail before scheduling, with no registry fallback. The deployment must
+prepare matching artifacts and metadata on eligible nodes. Default creates
+without an image or template keep using the deployment's default rootfs.

@@ -216,6 +216,7 @@ struct Rootfs {
     runtime: String,
     r#type: String,
     imageurl: String,
+    name: String,
     readonly: Option<bool>,
     path: String,
     storage_info: Option<S3>,
@@ -389,6 +390,13 @@ fn validate_rootfs_object(
             .is_some_and(|value| !value.trim().is_empty())
     };
     match kind {
+        "template" => {
+            if has_source || !non_empty_string("name") {
+                return Err(invalid(
+                    "named rootfs requires a template name and no source fields",
+                ));
+            }
+        }
         "image" => {
             if fields.contains_key("path") || fields.contains_key("storageInfo") {
                 return Err(invalid("image rootfs cannot contain path or storageInfo"));
@@ -646,6 +654,15 @@ pub fn create_spec_with_environment(
     caller: &pb::CallerContext,
     runtime_profile: Option<&adx_core::runtime_profile::RuntimeProfile>,
 ) -> Result<pb::EnvironmentSpec, Status> {
+    create_spec_with_templates(body, caller, runtime_profile, &Default::default())
+}
+
+pub fn create_spec_with_templates(
+    body: Value,
+    caller: &pb::CallerContext,
+    runtime_profile: Option<&adx_core::runtime_profile::RuntimeProfile>,
+    templates: &std::collections::BTreeMap<String, adx_core::local_rootfs::LocalRootfsTemplate>,
+) -> Result<pb::EnvironmentSpec, Status> {
     if let Some(e) = runtime_profile {
         e.validate().map_err(|e| invalid(&e.to_string()))?;
     }
@@ -656,6 +673,48 @@ pub fn create_spec_with_environment(
     }
     let rootfs_value = std::mem::take(&mut r.rootfs);
     let mut root = rootfs(rootfs_value, &r.image)?;
+    let template = if root.r#type == "template" {
+        if !r.snapshot_id.trim().is_empty() {
+            return Err(invalid(
+                "rootfs template cannot be combined with snapshotId",
+            ));
+        }
+        let template = templates
+            .get(&root.name)
+            .ok_or_else(|| invalid("local rootfs template is not registered"))?;
+        template
+            .validate()
+            .map_err(|error| invalid(&error.to_string()))?;
+        let mut env: HashMap<_, _> = template.env.clone().into_iter().collect();
+        env.extend(std::mem::take(&mut r.env));
+        r.env = env;
+        if r.inherit {
+            let mut process = template.process.clone().unwrap_or_default();
+            if let Some(overrides) = r.process.take() {
+                if overrides.commands.is_some() {
+                    process.commands = overrides.commands;
+                }
+                if overrides.cwd.is_some() {
+                    process.cwd = overrides.cwd;
+                }
+                if overrides.user.is_some() {
+                    process.user = overrides.user;
+                }
+            }
+            if process
+                .commands
+                .as_ref()
+                .is_none_or(|commands| commands.is_empty())
+            {
+                return Err(invalid("local rootfs template has no workload commands"));
+            }
+            r.process = Some(process);
+            r.inherit = false;
+        }
+        Some(template)
+    } else {
+        None
+    };
     if !r.runtime.is_empty() && !root.runtime.is_empty() && r.runtime != root.runtime {
         return Err(invalid("conflicting runtime selections"));
     }
@@ -680,6 +739,7 @@ pub fn create_spec_with_environment(
         && runtime_profile.is_none()
         && root.imageurl.trim().is_empty()
         && root.r#type != "s3"
+        && template.is_none()
     {
         return Err(invalid("image required"));
     }
@@ -779,8 +839,14 @@ pub fn create_spec_with_environment(
         .readonly
         .or_else(|| runtime_profile.map(|value| value.rootfs.readonly))
         .unwrap_or(false);
-    let rootfs =
-        storage_source(&root)?.map(|source| adx_core::execution::Rootfs { readonly, source });
+    let rootfs = if let Some(template) = template {
+        Some(adx_core::execution::Rootfs {
+            readonly,
+            source: adx_core::execution::StorageSource::Local(template.path.clone()),
+        })
+    } else {
+        storage_source(&root)?.map(|source| adx_core::execution::Rootfs { readonly, source })
+    };
     let mounts = r
         .mounts
         .into_iter()
@@ -851,6 +917,21 @@ pub fn create_spec_with_environment(
         })
         .map_err(|error| invalid(&error.to_string()))?;
     let mut policy = policy;
+    if template.is_some() {
+        let key = adx_core::local_rootfs::capability_label(&root.name)
+            .map_err(|error| invalid(&error.to_string()))?;
+        if policy.required_node.is_empty() {
+            policy.required_node.push(pb::LabelSelector::default());
+        }
+        for selector in &mut policy.required_node {
+            selector.expressions.push(pb::LabelRequirement {
+                key: key.clone(),
+                op: pb::SelectorOp::In as i32,
+                values: vec!["ready".into()],
+            });
+        }
+    }
+
     if r.pause
         .as_ref()
         .is_some_and(|p| p.storage == adx_core::lifecycle::CheckpointStorage::Shared)

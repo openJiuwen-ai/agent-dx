@@ -76,6 +76,8 @@ struct Config {
     #[serde(default)]
     runtime_profile: Option<adx_core::runtime_profile::RuntimeProfile>,
     #[serde(default)]
+    local_rootfs_templates: BTreeMap<String, adx_core::local_rootfs::LocalRootfsTemplate>,
+    #[serde(default)]
     execd_command: Vec<String>,
     #[serde(default)]
     execd_env: HashMap<String, String>,
@@ -278,8 +280,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ))
         })
         .transpose()?;
+    let local_rootfs_labels = config
+        .local_rootfs_templates
+        .keys()
+        .map(|name| {
+            adx_core::local_rootfs::capability_label(name).map(|key| (key, "ready".to_owned()))
+        })
+        .collect::<adx_core::Result<HashMap<_, _>>>()?;
     let runtime_config = RuntimeConfig {
         runtime_profile: config.runtime_profile,
+        local_rootfs_templates: config.local_rootfs_templates,
         command: config.execd_command,
         env,
         cwd: "/".into(),
@@ -384,6 +394,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
     let mut labels = config.labels;
+    labels.extend(local_rootfs_labels);
     if let Some(alias) = manager.checkpoint_storage_alias() {
         labels.insert("ADX_CHECKPOINT_STORAGE".into(), alias.into());
     }

@@ -63,6 +63,9 @@ pub struct Config {
     pub e2b: Option<crate::e2b::Config>,
     #[serde(default)]
     pub runtime_profile: Option<adx_core::runtime_profile::RuntimeProfile>,
+    #[serde(default)]
+    pub local_rootfs_templates:
+        std::collections::BTreeMap<String, adx_core::local_rootfs::LocalRootfsTemplate>,
     pub listen: SocketAddr,
     /// Private Prometheus listener, independent of the public HTTP API.
     #[serde(default)]
@@ -107,6 +110,10 @@ impl Config {
             if let Err(error) = e2b.validate(self.runtime_profile.as_ref()) {
                 return Err(error.message.into());
             }
+        }
+        for (name, template) in &self.local_rootfs_templates {
+            adx_core::local_rootfs::capability_label(name)?;
+            template.validate()?;
         }
         if let Some(e) = &self.runtime_profile {
             e.validate()?;

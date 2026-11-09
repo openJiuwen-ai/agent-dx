@@ -238,10 +238,10 @@ default) or `testpypi`; successful readback is written to
 `out/buildkite/sdk-publish/publish.json`. OBS upload remains independent and is
 still controlled by `ADX_OBS_UPLOAD`.
 
-The Environment SDK version is `0.1.0rc4`, declared in its
+The Environment SDK version is `0.1.0rc5`, declared in its
 `pyproject.toml`. Its wheel is
-`adx_environment-0.1.0rc4-py3-none-any.whl`. One repository release tag, such
-as `v0.1.0rc4`, can publish both Python packages when their respective upload
+`adx_environment-0.1.0rc5-py3-none-any.whl`. One repository release tag, such
+as `v0.1.0rc5`, can publish both Python packages when their respective upload
 flags are enabled. Each package keeps the version declared in its own
 `pyproject.toml`; a repository tag does not overwrite that version. Wheel
 filenames use normalized Python package versions, which omit the optional
