@@ -22,6 +22,12 @@ services:
       auth_cache_ttl_seconds: 10
       agent_address: ''
       loopback_http: true
+      workspace_affinity:
+        root: /home/agentos/users
+        endpoints:
+          - http://127.0.0.1:18889
+        timeout_seconds: 3
+        on_error: fail_open
   - id: ingress
     role: ingress
     config:

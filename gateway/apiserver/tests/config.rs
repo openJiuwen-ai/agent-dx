@@ -1,4 +1,4 @@
-use adx_apiserver::config::{Config, IngressMode};
+use adx_apiserver::config::{Config, IngressMode, WorkspaceAffinityErrorPolicy};
 use serde_json::{json, Value};
 
 fn base() -> Value {
@@ -85,4 +85,75 @@ fn unknown_create_retention_is_positive_and_configurable() {
     value["create_unknown_retention_seconds"] = json!(0);
     let config: Config = serde_json::from_value(value).unwrap();
     assert!(config.validate().is_err());
+}
+
+fn affinity() -> Value {
+    json!({
+        "root":"/home/agentos/users",
+        "endpoints":["http://127.0.0.1:18889","http://10.0.0.2:18889"],
+        "timeout_seconds":3
+    })
+}
+
+#[test]
+fn workspace_affinity_is_optional_and_validated() {
+    let mut value = base();
+    value["ingress_mode"] = json!("standalone");
+    let config: Config = serde_json::from_value(value.clone()).unwrap();
+    assert!(config.workspace_affinity.is_none());
+    config.validate().unwrap();
+
+    value["workspace_affinity"] = affinity();
+    let config: Config = serde_json::from_value(value.clone()).unwrap();
+    config.validate().unwrap();
+
+    for (field, invalid) in [
+        ("root", json!("relative/users")),
+        ("root", json!("/")),
+        ("timeout_seconds", json!(0)),
+        ("endpoints", json!(["ftp://127.0.0.1:18889"])),
+        ("endpoints", json!(["http://user:pass@127.0.0.1:18889"])),
+    ] {
+        let mut invalid_value = value.clone();
+        invalid_value["workspace_affinity"][field] = invalid;
+        let config: Config = serde_json::from_value(invalid_value).unwrap();
+        assert!(
+            config.validate().is_err(),
+            "{field} should reject its invalid value"
+        );
+    }
+}
+
+#[test]
+fn workspace_affinity_error_policy_defaults_and_parses() {
+    let mut value = base();
+    value["ingress_mode"] = json!("standalone");
+    value["workspace_affinity"] = affinity();
+
+    let config: Config = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(
+        config.workspace_affinity.unwrap().on_error,
+        WorkspaceAffinityErrorPolicy::FailOpen
+    );
+
+    value["workspace_affinity"]["on_error"] = json!("fail_closed");
+    let config: Config = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(
+        config.workspace_affinity.unwrap().on_error,
+        WorkspaceAffinityErrorPolicy::FailClosed
+    );
+
+    value["workspace_affinity"]["on_error"] = json!("fail_open");
+    let config: Config = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(
+        config.workspace_affinity.unwrap().on_error,
+        WorkspaceAffinityErrorPolicy::FailOpen
+    );
+
+    let mut invalid = value;
+    invalid["workspace_affinity"]["on_error"] = json!("fallback");
+    assert!(
+        serde_json::from_value::<Config>(invalid).is_err(),
+        "unknown on_error values must be rejected"
+    );
 }

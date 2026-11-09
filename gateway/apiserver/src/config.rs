@@ -28,6 +28,34 @@ pub enum IngressMode {
     Embedded,
     Standalone,
 }
+fn workspace_affinity_timeout() -> u64 {
+    3
+}
+/// Behavior when the Workspace directory cannot answer ownership queries.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceAffinityErrorPolicy {
+    /// Reject the request instead of placing an Environment without affinity.
+    FailClosed,
+    /// Fall back to ordinary scheduling when ownership cannot be resolved.
+    #[default]
+    FailOpen,
+}
+/// Optional Workspace ownership affinity; disabled when the section is absent.
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkspaceAffinity {
+    /// Directory prefix that contains one child directory per Workspace owner.
+    pub root: PathBuf,
+    /// Workspace directory endpoints, tried in order. Empty selects the local node.
+    #[serde(default)]
+    pub endpoints: Vec<String>,
+    #[serde(default = "workspace_affinity_timeout")]
+    pub timeout_seconds: u64,
+    /// Behavior when ownership lookup fails; defaults to `fail_open`.
+    #[serde(default)]
+    pub on_error: WorkspaceAffinityErrorPolicy,
+}
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -70,6 +98,8 @@ pub struct Config {
     pub ingress_mode: IngressMode,
     #[serde(default)]
     pub ingress_control: Option<data_plane_gateway::ingress::coordinator_routes::ControlConfig>,
+    #[serde(default)]
+    pub workspace_affinity: Option<WorkspaceAffinity>,
 }
 impl Config {
     pub fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -112,6 +142,25 @@ impl Config {
                 || url.password().is_some()
             {
                 return Err("invalid Agent endpoint".into());
+            }
+        }
+        if let Some(affinity) = &self.workspace_affinity {
+            // A bare root would turn every absolute local mount into an owner.
+            if !affinity.root.is_absolute() || affinity.root.as_os_str() == "/" {
+                return Err("Workspace affinity root must be a concrete absolute directory".into());
+            }
+            if affinity.timeout_seconds == 0 {
+                return Err("Workspace affinity requires a positive timeout".into());
+            }
+            for endpoint in &affinity.endpoints {
+                let url = url::Url::parse(endpoint)?;
+                if !matches!(url.scheme(), "http" | "https")
+                    || url.host().is_none()
+                    || !url.username().is_empty()
+                    || url.password().is_some()
+                {
+                    return Err("invalid Workspace directory endpoint".into());
+                }
             }
         }
         Ok(())

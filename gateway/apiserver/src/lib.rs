@@ -12,6 +12,7 @@ pub mod ingress;
 pub mod metrics;
 pub mod operations;
 pub mod ownership;
+pub mod workspace_affinity;
 
 mod directory;
 mod environment_directory;
